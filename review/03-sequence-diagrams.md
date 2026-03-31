@@ -95,43 +95,43 @@ sequenceDiagram
     participant CALLER as 📞 调用方
     participant PRE as 🪝 preLLMCallHook
     participant CACHE as 💿 Response Cache
-    participant OPT as ⚡ Provider<br/>Optimizations
+    participant OPTIM as ⚡ Provider<br/>Optimizations
     participant LLM as 🤖 LLM API
-    participant POST as 🪝 postLLMCallHook
+    participant POSTHOOK as 🪝 postLLMCallHook
     participant RB as 🧠 ReasoningBank
     participant METRICS as 📊 Metrics
 
-    CALLER->>PRE: preLLMCallHook(payload, context)
+    CALLER->>PRE: preLLMCallHook payload context
 
-    PRE->>CACHE: generateCacheKey(provider, model, request)
+    PRE->>CACHE: generateCacheKey provider model request
     alt 缓存命中
         CACHE-->>PRE: cached response
-        PRE-->>CALLER: {continue: false,<br/>cachedResponse: ...}
+        PRE-->>CALLER: continue false cachedResponse
         Note over CALLER: 跳过 LLM 调用<br/>直接使用缓存
     else 缓存未命中
         CACHE-->>PRE: undefined
-        PRE->>OPT: loadProviderOptimizations(provider)
-        Note over OPT: anthropic: temperature=0.7<br/>openai: temperature=0.8<br/>"Be concise and direct"
-        OPT-->>PRE: optimized request
-        PRE->>METRICS: 记录 llm.calls.{provider}.{model}
-        PRE-->>CALLER: {continue: true, payload: optimized}
+        PRE->>OPTIM: loadProviderOptimizations
+        Note over OPTIM: anthropic temperature 0.7<br/>openai temperature 0.8<br/>Be concise and direct
+        OPTIM-->>PRE: optimized request
+        PRE->>METRICS: 记录 llm.calls.provider.model
+        PRE-->>CALLER: continue true payload optimized
     end
 
     CALLER->>LLM: actual API call
 
     LLM-->>CALLER: response
 
-    CALLER->>POST: postLLMCallHook(payload, context)
-    POST->>CACHE: setCache(key, response)
-    POST->>METRICS: 记录延迟、token 使用、成本
+    CALLER->>POSTHOOK: postLLMCallHook payload context
+    POSTHOOK->>CACHE: setCache key response
+    POSTHOOK->>METRICS: 记录延迟 token使用 成本
 
-    alt 响应长度 > 阈值
-        POST->>RB: extractPatternFromResponse(response)
-        RB->>RB: reasoningBank.storePattern()
+    alt 响应长度大于阈值
+        POSTHOOK->>RB: extractPatternFromResponse
+        RB->>RB: reasoningBank.storePattern
         Note over RB: 从长回复中提取<br/>有价值的模式<br/>存入向量数据库
     end
 
-    POST-->>CALLER: {continue: true, sideEffects}
+    POSTHOOK-->>CALLER: continue true sideEffects
 ```
 
 ## 4. Agent Swarm 编排流程
@@ -366,6 +366,175 @@ sequenceDiagram
     else 高复杂度 (>30%)
         ROUTER-->>HOOK: [TASK_MODEL_RECOMMENDATION]<br/>model: "sonnet" / "opus"
         HOOK-->>CC: Tier 3: 使用 Sonnet/Opus
-        CC->>T3: Task({model: "sonnet",...})<br/>$0.003-$0.015, 2-5s
+        CC->>T3: Task model sonnet<br/>$0.003-$0.015, 2-5s
     end
 ```
+
+## 9. 完整端到端流程：用户发送"开发一个数据库系统"
+
+这张图展示了从用户一句话到最终交付的 **全链路运作机制**，包括任务拆分、Agent 安排、协调检查、Worker 通信、LLM 调用、内存学习，以及用户反馈后的动态调整。
+
+> **核心原则**：用户的一句话 → Claude Code 识别复杂度 → 触发 Ruflo MCP 编排 → 并行 Agent 执行 → 持续学习 → 返回结果
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '12px', 'fontFamily': 'Arial', 'actorBkg': '#e8f4fd', 'actorTextColor': '#1a1a2e', 'actorBorder': '#4a90d9', 'noteBkgColor': '#fff5e6', 'noteTextColor': '#1a1a2e', 'noteBorderColor': '#d4a017'}}}%%
+sequenceDiagram
+    participant U as 👤 用户
+    participant CC as 🖥️ Claude Code
+    participant LLM as 🤖 Claude API
+    participant HOOK as 🪝 Hooks MCP
+    participant MEM as 🧠 Memory MCP
+    participant SW as 🐝 Swarm MCP
+    participant AG as 🤖 Agent MCP
+    participant QUEEN as 👑 Queen<br/>Coordinator
+    participant W1 as 💻 Architect<br/>Agent
+    participant W2 as 💻 Coder<br/>Agent
+    participant W3 as 🧪 Tester<br/>Agent
+    participant DISK as 💾 .claude-flow/
+
+    U->>CC: "开发一个数据库系统"
+
+    Note over CC: ❶ Claude Code 加载系统上下文<br/>CLAUDE.md 作为 system prompt<br/>MCP 工具列表作为 tools 定义
+
+    rect rgb(240, 247, 232)
+    Note over CC,MEM: ❷ 预处理阶段 — 搜索历史 + 路由评估
+    CC->>LLM: messages + tools 定义
+    LLM-->>CC: tool_use: hooks_pre-task
+    CC->>HOOK: hooks_pre-task description=开发数据库系统
+    HOOK->>HOOK: 复杂度评估: HIGH<br/>推荐 Agent: architect+coder+tester<br/>模型路由: Tier3 Sonnet
+    HOOK-->>CC: suggestedAgents complexity modelRouting
+
+    CC->>LLM: 钩子结果 + 继续推理
+    LLM-->>CC: tool_use: memory_search
+    CC->>MEM: memory_search query=数据库系统开发模式
+    MEM->>DISK: HNSW 向量搜索
+    DISK-->>MEM: 历史模式 相似度0.78
+    MEM-->>CC: 历史模式 B+Tree索引 WAL日志
+    end
+
+    rect rgb(232, 240, 247)
+    Note over CC,AG: ❸ Swarm 初始化 — 创建编排结构
+    CC->>LLM: 搜索结果 + 继续推理
+    LLM-->>CC: tool_use: swarm_init + agent_spawn x3
+
+    par 并行 MCP 调用
+        CC->>SW: swarm_init topology=hierarchical maxAgents=8
+        SW->>DISK: 写入 swarm-state.json
+        SW-->>CC: swarmId=sw-001
+    and
+        CC->>AG: agent_spawn type=architect
+        AG->>DISK: 写入 agents/store.json
+        AG-->>CC: agentId=arch-001
+    and
+        CC->>AG: agent_spawn type=coder
+        AG-->>CC: agentId=code-001
+    and
+        CC->>AG: agent_spawn type=tester
+        AG-->>CC: agentId=test-001
+    end
+    end
+
+    rect rgb(247, 232, 240)
+    Note over CC,W3: ❹ 任务拆分与并行执行
+    Note over CC: Claude Code 通过 Task 工具<br/>生成子 Agent 各自带完整提示词
+    CC->>LLM: 编排完成 决定任务拆分
+    LLM-->>CC: 执行计划: 3个并行子任务
+
+    par Claude Code Task 工具并行
+        CC->>W1: Task Architect: 设计存储引擎+索引+WAL
+        Note over W1: 子Agent 独立调用 LLM<br/>system prompt 含治理规则<br/>+ 内存搜索的历史模式
+        W1->>LLM: 设计方案请求
+        LLM-->>W1: B+Tree方案 + WAL设计
+        W1->>MEM: memory_store key=db-design<br/>value=B+Tree+WAL方案
+        W1-->>CC: 架构设计文档
+    and
+        CC->>W2: Task Coder: 按架构实现核心代码
+        W2->>MEM: memory_search query=db-design
+        MEM-->>W2: 架构师的设计方案
+        W2->>LLM: 根据设计生成代码
+        LLM-->>W2: 存储引擎实现代码
+        W2-->>CC: src/engine.ts src/index.ts
+    and
+        CC->>W3: Task Tester: 编写测试用例
+        W3->>MEM: memory_search query=数据库测试模式
+        MEM-->>W3: 历史测试模式
+        W3->>LLM: 生成测试代码
+        LLM-->>W3: 测试套件
+        W3-->>CC: tests/engine.test.ts
+    end
+    end
+
+    rect rgb(232, 247, 240)
+    Note over CC,DISK: ❺ Queen 协调检查
+    Note over QUEEN: 心跳检测 100ms 间隔<br/>检查 Agent 健康度<br/>任务超时监控<br/>队列深度告警
+
+    QUEEN->>QUEEN: monitorSwarmHealth<br/>检测瓶颈 生成建议
+    QUEEN->>SW: 状态正常 所有Agent完成
+    end
+
+    rect rgb(247, 247, 232)
+    Note over CC,DISK: ❻ 结果整合 + 学习
+    CC->>LLM: 3个Agent结果 整合推理
+    LLM-->>CC: 综合回答 + 代码文件
+
+    CC->>HOOK: hooks_post-task success=true
+    HOOK->>HOOK: SONA: recordTrajectory<br/>DISTILL: LoRA置信度更新
+    HOOK->>MEM: memory_store namespace=patterns<br/>key=pattern-db-system<br/>value=B+Tree+WAL成功方案
+    HOOK->>DISK: patterns.json 持久化
+
+    CC->>HOOK: hooks_post-edit train-neural=true
+    HOOK->>HOOK: EWC++ 防遗忘整合
+    end
+
+    CC-->>U: 完成! 已创建数据库系统<br/>包含存储引擎 B+Tree索引 WAL日志<br/>以及完整测试套件
+
+    Note over U,DISK: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━<br/>⬇ 用户发现问题 发送新消息 ⬇
+
+    U->>CC: "查询性能太差了 需要优化"
+
+    rect rgb(255, 243, 224)
+    Note over CC,DISK: ❼ 动态调整 — 反馈驱动
+
+    CC->>LLM: 用户反馈 + 上下文
+    LLM-->>CC: tool_use: hooks_route
+
+    CC->>HOOK: hooks_route task=优化查询性能
+    HOOK->>HOOK: ReasoningBank 路由<br/>匹配: performance-engineer<br/>confidence: 0.89
+    HOOK-->>CC: agent=performance-engineer
+
+    CC->>MEM: memory_search query=数据库性能优化
+    MEM-->>CC: 历史优化模式 缓存+索引优化
+
+    CC->>AG: agent_spawn type=performance-engineer
+    AG-->>CC: agentId=perf-001
+
+    Note over CC: 不中断现有 Agent<br/>新增性能工程师 Agent<br/>带历史优化模式上下文
+
+    CC->>W2: Task Perf-Engineer: 基于反馈优化查询<br/>历史模式: 缓存+索引优化
+    W2->>LLM: 优化查询性能请求
+    LLM-->>W2: 查询计划缓存+索引提示优化
+    W2-->>CC: 优化后的代码
+
+    CC->>HOOK: hooks_post-task success=true
+    HOOK->>MEM: memory_store pattern-db-perf-opt<br/>查询计划缓存有效提升3x
+    end
+
+    CC-->>U: 已优化! 添加了查询计划缓存<br/>预计提升3x查询性能
+```
+
+### 关键机制解析
+
+**一句话驱动整体流程**：用户只需说 "开发一个数据库系统"，Claude Code 基于 CLAUDE.md 系统提示中的编排规则，自动检测复杂度、查询历史、初始化 Swarm、拆分任务、并行执行、学习模式、返回结果。
+
+| 阶段 | 驱动者 | LLM 调用方式 | 内存操作 | 学习操作 |
+|------|--------|------------|---------|---------|
+| **预处理** | Claude Code | 主 LLM 推理 + tool_use | memory_search 查历史 | — |
+| **编排** | Claude Code via MCP | 主 LLM 决定拆分 | — | hooks_pre-task 路由 |
+| **并行执行** | 子 Agent (Task) | 每个子 Agent 独立调用 LLM | memory_search/store 共享 | — |
+| **协调检查** | Queen (定时器) | 不调用 LLM | 状态写入 swarm-state | 心跳+健康度 |
+| **结果整合** | Claude Code | 主 LLM 综合推理 | — | SONA+EWC++ 学习 |
+| **反馈调整** | Claude Code | 主 LLM 重新路由 | 搜索历史优化模式 | 存储新模式 |
+
+**Agent 间通信**：通过 **共享内存命名空间** 实现 — Architect 写入 `db-design`，Coder 读取 `db-design`；不是直接消息传递，而是 **内存总线模式**。
+
+**用户反馈调整**：不会销毁现有 Agent，而是 **新增专业 Agent** (performance-engineer) 并携带历史模式上下文，实现增量优化。

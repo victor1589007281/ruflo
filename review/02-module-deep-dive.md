@@ -410,8 +410,8 @@ graph TB
         OPT["Optimizer (优化)"]
     end
 
-    ORCH -->|spawn(command, '-p', prompt)| CLAUDE
-    ORCH -->|spawn(command, '-p', prompt)| CODEX_W
+    ORCH -->|"spawn(cmd, -p, prompt)"| CLAUDE
+    ORCH -->|"spawn(cmd, -p, prompt)"| CODEX_W
     CLAUDE --> MEM
     CODEX_W --> MEM
 
