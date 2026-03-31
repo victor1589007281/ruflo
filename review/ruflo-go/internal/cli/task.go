@@ -28,6 +28,12 @@ func taskCreateCmd() *cobra.Command {
 		Use:   "create",
 		Short: "Create a task (task_create)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if title == "" && description != "" {
+				title = description
+				if len(title) > 60 {
+					title = title[:60] + "..."
+				}
+			}
 			raw, err := CallTool(cmd.Context(), "task_create", map[string]any{
 				"type": typ, "title": title, "description": description, "priority": priority,
 			})
@@ -38,10 +44,10 @@ func taskCreateCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&typ, "type", "", "Task type (e.g. implementation)")
-	c.Flags().StringVar(&title, "title", "", "Task title (required)")
-	c.Flags().StringVar(&description, "description", "", "Description")
+	c.Flags().StringVar(&title, "title", "", "Task title (optional; defaults from description)")
+	c.Flags().StringVar(&description, "description", "", "Description (required)")
 	c.Flags().IntVar(&priority, "priority", 0, "Priority (higher = more urgent)")
-	_ = c.MarkFlagRequired("title")
+	_ = c.MarkFlagRequired("description")
 	return c
 }
 

@@ -79,6 +79,7 @@ func securityScanCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&root, "path", ".", "Root directory to scan")
+	c.Flags().StringVar(&root, "target", ".", "Alias for --path")
 	return c
 }
 

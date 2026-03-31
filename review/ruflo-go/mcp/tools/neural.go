@@ -108,6 +108,7 @@ func handleNeuralTrain(ctx context.Context, args json.RawMessage) (json.RawMessa
 	globalState.neural.Patterns = append(globalState.neural.Patterns, p)
 	globalState.neural.LastTrain = now()
 	globalState.mu.Unlock()
+	saveNeuralToDisk()
 	return jsonOK(map[string]any{"ok": true, "pattern": p})
 }
 
@@ -161,6 +162,7 @@ func handleNeuralCompress(ctx context.Context, args json.RawMessage) (json.RawMe
 	}
 	n := len(globalState.neural.Patterns)
 	globalState.mu.Unlock()
+	saveNeuralToDisk()
 	return jsonOK(map[string]any{"ok": true, "patterns": n})
 }
 
@@ -173,6 +175,7 @@ func handleNeuralOptimize(ctx context.Context, args json.RawMessage) (json.RawMe
 	globalState.neural.LastTrain = now()
 	n := len(globalState.neural.Patterns)
 	globalState.mu.Unlock()
+	saveNeuralToDisk()
 	return jsonOK(map[string]any{"ok": true, "optimized": true, "patterns": n})
 }
 

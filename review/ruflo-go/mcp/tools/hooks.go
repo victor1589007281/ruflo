@@ -273,7 +273,20 @@ func handleHooksWorkerList(ctx context.Context, args json.RawMessage) (json.RawM
 	_ = ctx
 	_ = args
 	ws := globalState.workerMgr.ListWorkers()
-	return jsonOK(map[string]any{"workers": ws, "count": len(ws)})
+	type workerInfo struct {
+		Name     string `json:"name"`
+		Priority string `json:"priority"`
+		Triggers int    `json:"trigger_count"`
+	}
+	out := make([]workerInfo, len(ws))
+	for i, w := range ws {
+		out[i] = workerInfo{
+			Name:     w.Name,
+			Priority: string(w.Priority),
+			Triggers: len(w.TriggerPatterns),
+		}
+	}
+	return jsonOK(map[string]any{"workers": out, "count": len(out)})
 }
 
 type dispatchArgs struct {

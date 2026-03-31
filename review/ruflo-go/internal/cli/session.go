@@ -12,12 +12,57 @@ func newSessionCmd() *cobra.Command {
 		Short: "Session persistence",
 	}
 	cmd.AddCommand(
+		sessionStartCmd(),
+		sessionEndCmd(),
 		sessionSaveCmd(),
 		sessionRestoreCmd(),
 		sessionListCmd(),
 		sessionDeleteCmd(),
 	)
 	return cmd
+}
+
+func sessionStartCmd() *cobra.Command {
+	var id string
+	c := &cobra.Command{
+		Use:   "start",
+		Short: "Start / create session (session_save)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			raw, err := CallTool(cmd.Context(), "session_save", map[string]any{
+				"session_id": id,
+				"data":       map[string]any{},
+			})
+			if err != nil {
+				return err
+			}
+			return FprintResult(Stdout(), raw)
+		},
+	}
+	c.Flags().StringVar(&id, "id", "", "Session id (optional; server may assign if empty)")
+	return c
+}
+
+func sessionEndCmd() *cobra.Command {
+	var id string
+	var exportMetrics bool
+	c := &cobra.Command{
+		Use:   "end",
+		Short: "End session (session_delete)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_ = exportMetrics // accepted for TS CLI parity; end is session_delete only
+			raw, err := CallTool(cmd.Context(), "session_delete", map[string]any{
+				"session_id": id,
+			})
+			if err != nil {
+				return err
+			}
+			return FprintResult(Stdout(), raw)
+		},
+	}
+	c.Flags().StringVar(&id, "id", "", "Session id")
+	c.Flags().BoolVar(&exportMetrics, "export-metrics", false, "Run session-end hook with metrics before delete")
+	_ = c.MarkFlagRequired("id")
+	return c
 }
 
 func sessionSaveCmd() *cobra.Command {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/spf13/cobra"
 )
@@ -69,6 +70,9 @@ func agentStatusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show agent status",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if id == "" && len(args) > 0 {
+				id = args[0]
+			}
 			raw, err := CallTool(context.Background(), "agent_status", map[string]any{
 				"id": id, "name": name,
 			})
@@ -89,6 +93,12 @@ func agentStopCmd() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop an agent",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if id == "" && len(args) > 0 {
+				id = args[0]
+			}
+			if id == "" {
+				return fmt.Errorf("agent id required: use --id or pass id as first argument")
+			}
 			raw, err := CallTool(context.Background(), "agent_terminate", map[string]any{
 				"id": id,
 			})
@@ -98,8 +108,7 @@ func agentStopCmd() *cobra.Command {
 			return FprintResult(Stdout(), raw)
 		},
 	}
-	c.Flags().StringVar(&id, "id", "", "Agent id (required)")
-	_ = c.MarkFlagRequired("id")
+	c.Flags().StringVar(&id, "id", "", "Agent id (or pass as first argument)")
 	return c
 }
 

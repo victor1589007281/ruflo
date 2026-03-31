@@ -100,6 +100,7 @@ func handleSessionSave(ctx context.Context, args json.RawMessage) (json.RawMessa
 	}
 	globalState.sessions[id] = rec
 	globalState.mu.Unlock()
+	saveSessionsToDisk()
 	return jsonOK(map[string]any{"ok": true, "session": rec})
 }
 
@@ -183,5 +184,8 @@ func handleSessionDelete(ctx context.Context, args json.RawMessage) (json.RawMes
 		delete(globalState.sessions, a.SessionID)
 	}
 	globalState.mu.Unlock()
+	if ok {
+		saveSessionsToDisk()
+	}
 	return jsonOK(map[string]any{"ok": ok, "deleted": ok})
 }

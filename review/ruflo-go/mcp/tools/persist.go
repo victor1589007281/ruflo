@@ -2,9 +2,11 @@ package tools
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ruflo/ruflo-go/api"
 )
@@ -161,8 +163,154 @@ func writeJSONFile(path string, v any) error {
 	return os.Rename(tmp, path)
 }
 
+// restoreAgentSeq sets agentSeq from the highest numeric suffix among loaded "agent-N" IDs
+// so new spawns do not collide after process restart.
+func restoreAgentSeq() {
+	globalState.mu.RLock()
+	defer globalState.mu.RUnlock()
+	var maxSeq int64
+	for id := range globalState.agents {
+		var n int64
+		if _, err := fmt.Sscanf(id, "agent-%d", &n); err == nil && n > maxSeq {
+			maxSeq = n
+		}
+	}
+	atomic.StoreInt64(&agentSeq, maxSeq)
+}
+
+type sessionsFile struct {
+	Sessions map[string]*sessionRecord `json:"sessions"`
+}
+
+func sessionsStorePath() string {
+	return filepath.Join(resolveDataDir(), "sessions", "store.json")
+}
+
+func loadSessionsFromDisk() {
+	p := sessionsStorePath()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var f sessionsFile
+	if json.Unmarshal(b, &f) != nil || f.Sessions == nil {
+		return
+	}
+	globalState.mu.Lock()
+	for id, s := range f.Sessions {
+		if s != nil {
+			globalState.sessions[id] = s
+		}
+	}
+	globalState.mu.Unlock()
+}
+
+func saveSessionsToDisk() {
+	globalState.mu.RLock()
+	cp := make(map[string]*sessionRecord, len(globalState.sessions))
+	for k, v := range globalState.sessions {
+		cp[k] = v
+	}
+	globalState.mu.RUnlock()
+	f := sessionsFile{Sessions: cp}
+	_ = writeJSONFile(sessionsStorePath(), f)
+}
+
+func neuralStorePath() string {
+	return filepath.Join(resolveDataDir(), "neural", "state.json")
+}
+
+func loadNeuralFromDisk() {
+	p := neuralStorePath()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var ns neuralState
+	if json.Unmarshal(b, &ns) != nil {
+		return
+	}
+	globalState.mu.Lock()
+	if len(ns.Patterns) > 0 {
+		globalState.neural.Patterns = ns.Patterns
+	}
+	if !ns.LastTrain.IsZero() {
+		globalState.neural.LastTrain = ns.LastTrain
+	}
+	globalState.mu.Unlock()
+}
+
+func saveNeuralToDisk() {
+	globalState.mu.RLock()
+	cp := neuralState{
+		Patterns:  append([]api.Pattern(nil), globalState.neural.Patterns...),
+		LastTrain: globalState.neural.LastTrain,
+	}
+	globalState.mu.RUnlock()
+	_ = writeJSONFile(neuralStorePath(), cp)
+}
+
+func restorePatternSeq() {
+	globalState.mu.RLock()
+	defer globalState.mu.RUnlock()
+	var maxSeq int64
+	for _, p := range globalState.neural.Patterns {
+		var n int64
+		if _, err := fmt.Sscanf(p.ID, "pat-%d", &n); err == nil && n > maxSeq {
+			maxSeq = n
+		}
+	}
+	atomic.StoreInt64(&patternSeq, maxSeq)
+}
+
+func restoreTaskSeq() {
+	globalState.mu.RLock()
+	defer globalState.mu.RUnlock()
+	var maxSeq int64
+	for id := range globalState.tasks {
+		var n int64
+		if _, err := fmt.Sscanf(id, "task-%d", &n); err == nil && n > maxSeq {
+			maxSeq = n
+		}
+	}
+	atomic.StoreInt64(&taskSeq, maxSeq)
+}
+
+func restoreSwarmSeq() {
+	globalState.mu.RLock()
+	defer globalState.mu.RUnlock()
+	var maxSeq int64
+	for id := range globalState.swarms {
+		var n int64
+		if _, err := fmt.Sscanf(id, "swarm-%d", &n); err == nil && n > maxSeq {
+			maxSeq = n
+		}
+	}
+	atomic.StoreInt64(&swarmSeq, maxSeq)
+}
+
+func restoreSessionSeq() {
+	globalState.mu.RLock()
+	defer globalState.mu.RUnlock()
+	var maxSeq int64
+	for id := range globalState.sessions {
+		var n int64
+		if _, err := fmt.Sscanf(id, "sess-%d", &n); err == nil && n > maxSeq {
+			maxSeq = n
+		}
+	}
+	atomic.StoreInt64(&sessionSeq, maxSeq)
+}
+
 func init() {
 	loadAgentsFromDisk()
+	restoreAgentSeq()
 	loadSwarmFromDisk()
+	restoreSwarmSeq()
 	loadTasksFromDisk()
+	restoreTaskSeq()
+	loadSessionsFromDisk()
+	restoreSessionSeq()
+	loadNeuralFromDisk()
+	restorePatternSeq()
 }
