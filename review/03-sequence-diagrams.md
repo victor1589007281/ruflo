@@ -214,7 +214,7 @@ sequenceDiagram
     participant GATES as 🚧 EnforcementGates
     participant RETRIEVER as 🔍 ShardRetriever
     participant LEDGER as 📔 RunLedger
-    participant OPT as 🔄 OptimizerLoop
+    participant OPTLOOP as 🔄 OptimizerLoop
 
     Note over CC: Claude Code 准备执行命令<br/>例如: rm -rf /important
 
@@ -243,11 +243,11 @@ sequenceDiagram
     CC->>HOOK_REG: PostTask 事件
     HOOK_REG->>LEDGER: finalizeEvent(runEvent)
     LEDGER->>LEDGER: 评估器打分<br/>(TestsPass, ForbiddenCmd, DiffQuality...)
-    LEDGER-->>OPT: 违规数据
+    LEDGER-->>OPTLOOP: 违规数据
 
-    OPT->>OPT: 分析违规排名
-    OPT->>OPT: 提升胜出的本地规则到根规则
-    Note over OPT: CLAUDE.local.md → CLAUDE.md<br/>规则自进化
+    OPTLOOP->>OPTLOOP: 分析违规排名
+    OPTLOOP->>OPTLOOP: 提升胜出的本地规则到根规则
+    Note over OPTLOOP: CLAUDE.local.md 到 CLAUDE.md<br/>规则自进化
 ```
 
 ## 6. 自进化学习循环（SONA Pipeline）
