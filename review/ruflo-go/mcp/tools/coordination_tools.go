@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/ruflo/ruflo-go/api"
@@ -13,41 +12,67 @@ import (
 
 // 本文件：通过 pkg/swarm.UnifiedSwarmCoordinator 暴露拓扑、负载、共识与任务提交的 MCP 桥接工具。
 //
-// 设计思路：ensureCoordinator 使用 sync.Once 单例初始化网格拓扑+Raft 配置，并注册 bootstrap 代理；各 handler
-// 在失败时返回 MCPToolResult 错误字段；共识调用 ProposeConsensus 与带超时的 AwaitConsensus。
+// 设计思路：ensureCoordinator 使用 globalState 单例；swarm_init 可预先写入 pendingCoordCfg 以指定拓扑/策略；
+// swarm_shutdown 在无活跃蜂群时 shutdownSwarmCoordinator 释放资源并允许重建。
 
-var (
-	coordOnce    sync.Once
-	coordInst    *swarm.UnifiedSwarmCoordinator
-	coordInitErr error
-)
+func defaultCoordinationConfig() swarm.CoordinatorConfig {
+	return swarm.CoordinatorConfig{
+		Topology:        api.TopologyMesh,
+		ConsensusAlgo:   api.ConsensusRaft,
+		AgentPoolMin:    2,
+		AgentPoolMax:    16,
+		HeartbeatMS:     500,
+		MetricsInterval: time.Second,
+	}
+}
 
-// ensureCoordinator 懒加载全局协调器：首次调用时构造 CoordinatorConfig、Initialize、注册 coord-bootstrap 代理；
-// 返回单例与首次初始化错误（若有）。
+// shutdownSwarmCoordinator 关闭并清空 globalState.coordinator，供 swarm_shutdown 在无活跃蜂群时调用。
+func shutdownSwarmCoordinator() {
+	globalState.coordMu.Lock()
+	c := globalState.coordinator
+	globalState.coordinator = nil
+	globalState.coordInitErr = nil
+	globalState.pendingCoordCfg = nil
+	globalState.coordMu.Unlock()
+	if c == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = c.Shutdown(ctx)
+}
+
+// ensureCoordinator 懒加载全局协调器：若已存在则复用；否则用 pendingCoordCfg（若有）或默认 mesh 配置初始化并注册 bootstrap。
 func ensureCoordinator() (*swarm.UnifiedSwarmCoordinator, error) {
-	coordOnce.Do(func() {
-		cfg := swarm.CoordinatorConfig{
-			Topology:        api.TopologyMesh,
-			ConsensusAlgo:   api.ConsensusRaft,
-			AgentPoolMin:    2,
-			AgentPoolMax:    16,
-			HeartbeatMS:     500,
-			MetricsInterval: time.Second,
-		}
-		coordInst = swarm.NewUnifiedSwarmCoordinator(cfg)
-		coordInitErr = coordInst.Initialize(context.Background())
-		if coordInitErr == nil {
-			boot := &api.Agent{
-				ID: "coord-bootstrap", Name: "bootstrap", Type: api.AgentTypeCoder,
-				Domain: api.AgentDomainCore, State: api.AgentStateIdle, Status: api.AgentStatusHealthy,
-				CreatedAt: now(), UpdatedAt: now(),
-			}
-			if err := coordInst.RegisterAgent(boot); err != nil {
-				coordInitErr = err
-			}
-		}
-	})
-	return coordInst, coordInitErr
+	globalState.coordMu.Lock()
+	defer globalState.coordMu.Unlock()
+	if globalState.coordinator != nil {
+		return globalState.coordinator, globalState.coordInitErr
+	}
+	cfg := defaultCoordinationConfig()
+	if globalState.pendingCoordCfg != nil {
+		cfg = *globalState.pendingCoordCfg
+	}
+	c := swarm.NewUnifiedSwarmCoordinator(cfg)
+	ctx := context.Background()
+	err := c.Initialize(ctx)
+	if err != nil {
+		globalState.coordInitErr = err
+		return nil, err
+	}
+	boot := &api.Agent{
+		ID: "coord-bootstrap", Name: "bootstrap", Type: api.AgentTypeCoder,
+		Domain: api.AgentDomainCore, State: api.AgentStateIdle, Status: api.AgentStatusHealthy,
+		CreatedAt: now(), UpdatedAt: now(),
+	}
+	if err = c.RegisterAgent(boot); err != nil {
+		_ = c.Shutdown(ctx)
+		globalState.coordInitErr = err
+		return nil, err
+	}
+	globalState.coordinator = c
+	globalState.coordInitErr = nil
+	return c, nil
 }
 
 // coordinationTools 注册 topology、load_balance、sync、node、consensus、orchestrate、metrics 工具。

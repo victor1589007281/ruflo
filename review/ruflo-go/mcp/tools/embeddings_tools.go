@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -93,7 +94,7 @@ func embeddingsTools() []*mcp.MCPTool {
 		{Name: "embeddings_init", Description: "Initialize embedding service", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}}, Handler: toolHandler(handleEmbeddingsInit)},
 		{Name: "embeddings_compare", Description: "Cosine similarity between two texts", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"a": map[string]any{"type": "string"}, "b": map[string]any{"type": "string"}}, "required": []string{"a", "b"}}, Handler: toolHandler(handleEmbeddingsCompare)},
 		{Name: "embeddings_neural", Description: "Link embedding store to neural pattern count", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}}, Handler: toolHandler(handleEmbeddingsNeural)},
-		{Name: "embeddings_hyperbolic", Description: "Hyperbolic embedding mode (stub)", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}}, Handler: toolHandler(handleEmbeddingsHyperbolic)},
+		{Name: "embeddings_hyperbolic", Description: "Poincaré ball mapping and hyperbolic distance (hash embeddings)", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}}, Handler: toolHandler(handleEmbeddingsHyperbolic)},
 		{Name: "embeddings_status", Description: "Embedding store status", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}}, Handler: toolHandler(handleEmbeddingsStatus)},
 	}
 }
@@ -214,20 +215,59 @@ func handleEmbeddingsCompare(_ context.Context, m map[string]any) mcp.MCPToolRes
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"similarity": cosineSim(va, vb)}}
 }
 
-// handleEmbeddingsNeural 返回当前嵌入条目数与 globalState 神经模式数，用于粗略关联展示。
+// handleEmbeddingsNeural 聚合嵌入仓库、SONA 与统一 memory（若已初始化）的统计。
 func handleEmbeddingsNeural(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	embMu.Lock()
 	nEmb := len(embStore.Entries)
+	seq := embStore.Seq
 	embMu.Unlock()
 	globalState.mu.RLock()
 	nPat := len(globalState.neural.Patterns)
 	globalState.mu.RUnlock()
-	return mcp.MCPToolResult{OK: true, Data: map[string]any{"embeddings": nEmb, "neural_patterns": nPat}}
+	data := map[string]any{
+		"embedding_store_entries": nEmb,
+		"embedding_store_seq":     seq,
+		"neural_patterns_mcp":     nPat,
+	}
+	if globalState.sona != nil {
+		st := globalState.sona.GetStats()
+		data["sona"] = map[string]any{
+			"total_patterns":       st.TotalPatterns,
+			"total_trajectories": st.TotalTrajectories,
+			"active_trajectories": st.ActiveTrajectories,
+			"avg_confidence":      st.AvgConfidence,
+			"signal_count":        st.SignalCount,
+		}
+	}
+	_ = InitDefaultMemory()
+	if u := getUnifiedMemory(); u != nil {
+		ms := u.Stats()
+		if ms != nil {
+			data["unified_memory"] = map[string]any{
+				"total_entries": ms.TotalEntries,
+				"index_size":    ms.IndexSize,
+				"cache_hits":    ms.CacheHits,
+				"cache_misses":  ms.CacheMisses,
+			}
+		}
+	}
+	return mcp.MCPToolResult{OK: true, Data: data}
 }
 
-// handleEmbeddingsHyperbolic 返回双曲嵌入模式占位信息（Go 运行时未启用实际双曲路径）。
+// handleEmbeddingsHyperbolic 使用 hash 嵌入经 EuclideanToHyperbolic 映射并计算 HyperbolicDistance。
 func handleEmbeddingsHyperbolic(_ context.Context, _ map[string]any) mcp.MCPToolResult {
-	return mcp.MCPToolResult{OK: true, Data: map[string]any{"mode": "poincare", "available": false, "note": "hyperbolic path not enabled in Go runtime"}}
+	const c = 1.0
+	va := embeddings.HashEmbed384("hyperbolic-anchor-a")
+	vb := embeddings.HashEmbed384("hyperbolic-anchor-b")
+	ha := embeddings.EuclideanToHyperbolic(va, c)
+	hb := embeddings.EuclideanToHyperbolic(vb, c)
+	dist := embeddings.HyperbolicDistance(ha, hb)
+	return mcp.MCPToolResult{OK: true, Data: map[string]any{
+		"mode": "poincare", "available": true, "curvature": c,
+		"dim": len(va),
+		"hyperbolic_distance": dist,
+		"distance_finite":     !math.IsNaN(dist) && !math.IsInf(dist, 0),
+	}}
 }
 
 // handleEmbeddingsStatus 返回 Ready、条目数、序号与后端标识 hash384。

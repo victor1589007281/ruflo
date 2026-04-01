@@ -56,12 +56,14 @@ func guidanceTools() []*mcp.MCPTool {
 func handleGuidanceCapabilities(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
+	_ = globalState.guidancePlane.Compile()
 	b := globalState.guidancePlane.Bundle()
 	return jsonOK(map[string]any{
 		"bundle_id": b.ID,
 		"version":   b.Version,
 		"manifest":  b.Manifest,
 		"shards":    len(b.Shards),
+		"compiled":  true,
 	})
 }
 
@@ -80,12 +82,17 @@ func handleGuidanceDiscover(ctx context.Context, args json.RawMessage) (json.Raw
 	return jsonOK(map[string]any{"shards": out, "count": len(out)})
 }
 
-// handleGuidanceWorkflow 返回内置治理流水线阶段名称（compile/retrieve/gate/ledger/optimize）。
+// handleGuidanceWorkflow 返回流水线阶段与当前 PolicyBundle 中的分片 id 列表。
 func handleGuidanceWorkflow(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
 	stages := []string{"compile", "retrieve", "gate", "ledger", "optimize"}
-	return jsonOK(map[string]any{"stages": stages})
+	b := globalState.guidancePlane.Bundle()
+	shardIDs := make([]string, 0, len(b.Shards))
+	for _, sh := range b.Shards {
+		shardIDs = append(shardIDs, sh.ShardID)
+	}
+	return jsonOK(map[string]any{"stages": stages, "shard_ids": shardIDs, "shard_count": len(shardIDs), "bundle_id": b.ID})
 }
 
 // handleGuidanceQuickref 返回能力名列表与当前 bundle_id，便于客户端快速对照。

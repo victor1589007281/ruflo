@@ -62,5 +62,6 @@ func RegisterAll(reg *mcp.ToolRegistry) error {
 			return err
 		}
 	}
+	globalToolRegistry = reg
 	return nil
 }

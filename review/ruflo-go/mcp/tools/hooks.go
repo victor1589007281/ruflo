@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/ruflo/ruflo-go/api"
 	"github.com/ruflo/ruflo-go/mcp"
 	"github.com/ruflo/ruflo-go/pkg/embeddings"
 	"github.com/ruflo/ruflo-go/pkg/hooks"
+	nlp "github.com/ruflo/ruflo-go/pkg/neural"
 )
 
 // hooksTools 构建 pre/post task、route、session、worker、model-route、metrics 等工具，并拼接 hooksMoreTools。
@@ -198,7 +200,44 @@ func handleHooksPostTask(ctx context.Context, args json.RawMessage) (json.RawMes
 	}
 	res := globalState.hookExec.Execute(hooks.HookEventPostTask, hc)
 	logHook("hooks_post-task", hc.Args, res)
-	return jsonOK(map[string]any{"result": res})
+
+	var trainMeta map[string]any
+	if a.Train {
+		trainMeta = map[string]any{}
+		if a.TaskID != "" {
+			if err := globalState.reasoningBank.RecordOutcome(a.TaskID, a.Success); err != nil {
+				trainMeta["reasoning_bank"] = map[string]any{"ok": false, "error": err.Error()}
+				if globalState.sona != nil {
+					globalState.sona.RecordSignal(nlp.Signal{
+						Kind: "post_task_train",
+						Payload: map[string]any{
+							"task_id": a.TaskID, "success": a.Success,
+							"reason": "reasoning_bank_record_outcome_failed", "detail": err.Error(),
+						},
+						Timestamp: time.Now().UTC(),
+					})
+					trainMeta["sona_signal"] = "recorded_fallback"
+				}
+			} else {
+				trainMeta["reasoning_bank"] = map[string]any{"ok": true, "pattern_id": a.TaskID}
+			}
+		} else if globalState.sona != nil {
+			globalState.sona.RecordSignal(nlp.Signal{
+				Kind:      "post_task_train",
+				Payload:   map[string]any{"success": a.Success, "reason": "no_task_id_for_outcome"},
+				Timestamp: time.Now().UTC(),
+			})
+			trainMeta["sona_signal"] = "recorded"
+		} else {
+			trainMeta["note"] = "train=true but no task_id and sona unavailable for signal"
+		}
+	}
+
+	out := map[string]any{"result": res}
+	if trainMeta != nil {
+		out["train"] = trainMeta
+	}
+	return jsonOK(out)
 }
 
 // routeArgs 描述待路由任务文本与可选复杂度，用于 ReasoningBank 与 tier 推断。
@@ -263,6 +302,7 @@ func handleHooksSessionStart(ctx context.Context, args json.RawMessage) (json.Ra
 		Args:    map[string]any{"phase": "start"},
 	}
 	res := globalState.hookExec.Execute(hooks.HookEventSessionStart, hc)
+	globalState.reasoningBank.OnSessionStart(a.SessionID)
 	logHook("hooks_session-start", hc.Args, res)
 	return jsonOK(map[string]any{"result": res})
 }
@@ -280,6 +320,7 @@ func handleHooksSessionEnd(ctx context.Context, args json.RawMessage) (json.RawM
 		},
 	}
 	res := globalState.hookExec.Execute(hooks.HookEventSessionEnd, hc)
+	globalState.reasoningBank.OnSessionEnd(a.SessionID)
 	logHook("hooks_session-end", hc.Args, res)
 	return jsonOK(map[string]any{"result": res})
 }
@@ -363,15 +404,45 @@ func handleHooksModelRoute(ctx context.Context, args json.RawMessage) (json.RawM
 	})
 }
 
-// handleHooksMetrics 返回 hooksLog 条数与 Worker 数量等粗粒度指标。
+// handleHooksMetrics 聚合注册表、推理银行、LLM 钩子、Worker 与 hooksLog 指标。
 func handleHooksMetrics(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
 	globalState.mu.RLock()
-	n := len(globalState.hooksLog)
+	nLog := len(globalState.hooksLog)
 	globalState.mu.RUnlock()
+
+	regSt := globalState.hookReg.GetStats()
+	rbSt := globalState.reasoningBank.GetStats()
+	eventCounts := make(map[string]int, len(regSt.EventCounts))
+	for ev, c := range regSt.EventCounts {
+		eventCounts[string(ev)] = c
+	}
+	workersSt := map[string]any{}
+	for _, w := range globalState.workerMgr.ListWorkers() {
+		s, err := globalState.workerMgr.GetStatus(w.Name)
+		if err != nil {
+			continue
+		}
+		workersSt[w.Name] = s
+	}
+
 	return jsonOK(map[string]any{
-		"invocations": n,
-		"workers":     len(globalState.workerMgr.ListWorkers()),
+		"hooks_log_entries": nLog,
+		"hook_registry": map[string]any{
+			"total_registered": regSt.TotalRegistered,
+			"enabled_count":    regSt.EnabledCount,
+			"disabled_count":   regSt.DisabledCount,
+			"event_counts":     eventCounts,
+		},
+		"reasoning_bank": map[string]any{
+			"total_patterns": rbSt.TotalPatterns,
+			"short_term":     rbSt.ShortTerm,
+			"long_term":      rbSt.LongTerm,
+			"avg_quality":    rbSt.AvgQuality,
+		},
+		"llm_hooks_metrics":  globalState.llmHooks.MetricsSnapshot(),
+		"workers":            workersSt,
+		"worker_definitions": len(globalState.workerMgr.ListWorkers()),
 	})
 }

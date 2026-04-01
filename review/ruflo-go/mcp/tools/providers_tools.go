@@ -4,18 +4,24 @@ package tools
 //
 // 设计思路：
 //   - providerRec 与 api.LLMProvider* 类型字符串对齐，默认种子含 anthropic/openai 占位条目。
-//   - Test 为合成检查（仅确认存在与类型），不发起真实网络探测；Configure 写入 api_key 字段（注意本地文件权限）。
-//   - 列表返回含敏感字段的完整结构，调用方应避免日志泄露。
+//   - providers_test：OpenAI 等走 ProviderManager.HealthCheck；Anthropic 使用 JSON 中的 api_key 对 Models 端点 GET 探活。
+//   - OpenAI 且配置了 api_key 时同步 Register 到 globalState.providerMgr；列表合并 JSON 与 manager_registered。
+//   - Configure 写入 api_key 字段（注意本地文件权限）；列表含敏感字段，调用方应避免日志泄露。
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/ruflo/ruflo-go/api"
 	"github.com/ruflo/ruflo-go/mcp"
+	"github.com/ruflo/ruflo-go/pkg/providers"
 )
 
 // providerRec 单条 Provider 记录：展示名、类型、可选 API Key 与扩展键值。
@@ -67,6 +73,68 @@ func provSave() error {
 	return writeJSONFile(providersStorePath(), cp)
 }
 
+// managerProviderNameForType 将 store 中的 type 字符串映射为 ProviderManager 注册名（与 LLMProvider.Name 一致）。
+func managerProviderNameForType(typ string) string {
+	t := strings.ToLower(strings.TrimSpace(typ))
+	switch t {
+	case string(api.LLMProviderAnthropic):
+		return "anthropic"
+	case string(api.LLMProviderOpenAI):
+		return string(api.LLMProviderOpenAI)
+	case string(api.LLMProviderGoogle):
+		return string(api.LLMProviderGoogle)
+	case string(api.LLMProviderCohere):
+		return string(api.LLMProviderCohere)
+	case string(api.LLMProviderRuvector):
+		return string(api.LLMProviderRuvector)
+	case string(api.LLMProviderOllama):
+		return string(api.LLMProviderOllama)
+	default:
+		return t
+	}
+}
+
+// applyJSONProvidersToManager 将 store 中带 API Key 的 OpenAI 条目注册进 ProviderManager（Anthropic 走独立探活，不经过 Register）。
+func applyJSONProvidersToManager() {
+	mgr := globalState.providerMgr
+	if mgr == nil {
+		return
+	}
+	provMu.Lock()
+	defer provMu.Unlock()
+	for _, p := range provList.Providers {
+		typ := strings.ToLower(strings.TrimSpace(p.Type))
+		key := strings.TrimSpace(p.APIKey)
+		if typ == string(api.LLMProviderOpenAI) && key != "" {
+			mgr.RegisterProvider(&providers.OpenAIProvider{APIKey: key})
+		}
+	}
+}
+
+// anthropicHealthFromStore 使用 store 中的 key 调用 Anthropic Models API（与 AnthropicProvider.HealthCheck 行为一致）。
+func anthropicHealthFromStore(ctx context.Context, apiKey string) error {
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		return fmt.Errorf("anthropic: no api key")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.anthropic.com/v1/models", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("x-api-key", key)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("anthropic: server error %s", resp.Status)
+	}
+	return nil
+}
+
 // providersTools 构造 providers_* MCP 工具定义。
 func providersTools() []*mcp.MCPTool {
 	provLoad()
@@ -89,12 +157,22 @@ func RegisterProvidersTools(reg *mcp.ToolRegistry) error {
 	return nil
 }
 
-// handleProvidersList 处理 providers_list：返回 providers 与 count。
+// handleProvidersList 处理 providers_list：返回 JSON 配置中的 providers、ProviderManager 已注册名与 count。
 func handleProvidersList(_ context.Context, _ map[string]any) mcp.MCPToolResult {
+	applyJSONProvidersToManager()
 	provMu.Lock()
 	out := append([]providerRec(nil), provList.Providers...)
 	provMu.Unlock()
-	return mcp.MCPToolResult{OK: true, Data: map[string]any{"providers": out, "count": len(out)}}
+	mgrNames := []string(nil)
+	if globalState.providerMgr != nil {
+		mgrNames = globalState.providerMgr.ListProviders()
+	}
+	return mcp.MCPToolResult{OK: true, Data: map[string]any{
+		"providers":            out,
+		"count":                len(out),
+		"manager_registered":   mgrNames,
+		"manager_register_count": len(mgrNames),
+	}}
 }
 
 // handleProvidersAdd 处理 providers_add：name、type 必填；追加记录并保存。
@@ -137,16 +215,19 @@ func handleProvidersRemove(_ context.Context, m map[string]any) mcp.MCPToolResul
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"removed": name}}
 }
 
-// handleProvidersTest 处理 providers_test：按 name 查找；返回 reachable=true 与 note 标明为合成检查。
+// handleProvidersTest 处理 providers_test：同步 JSON 后按类型执行 HealthCheck（Anthropic 使用 JSON key 直连探活）。
 func handleProvidersTest(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	name := strArg(m, "name")
+	applyJSONProvidersToManager()
 	provMu.Lock()
 	found := false
 	var typ string
+	var apiKey string
 	for _, p := range provList.Providers {
 		if p.Name == name {
 			found = true
 			typ = p.Type
+			apiKey = p.APIKey
 			break
 		}
 	}
@@ -154,7 +235,44 @@ func handleProvidersTest(_ context.Context, m map[string]any) mcp.MCPToolResult 
 	if !found {
 		return mcp.MCPToolResult{OK: false, Error: "provider not found"}
 	}
-	return mcp.MCPToolResult{OK: true, Data: map[string]any{"name": name, "type": typ, "reachable": true, "note": "synthetic check"}}
+	mgr := globalState.providerMgr
+	if mgr == nil {
+		return mcp.MCPToolResult{OK: false, Error: "provider manager unavailable"}
+	}
+	pn := managerProviderNameForType(typ)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if pn == "anthropic" {
+		err := anthropicHealthFromStore(ctx, apiKey)
+		reachable := err == nil
+		data := map[string]any{
+			"name": name, "type": typ, "manager_name": pn, "reachable": reachable,
+			"probe": "anthropic_models",
+		}
+		if err != nil {
+			data["error"] = err.Error()
+		}
+		return mcp.MCPToolResult{OK: true, Data: data}
+	}
+
+	p, ok := mgr.GetProvider(pn)
+	if !ok {
+		return mcp.MCPToolResult{OK: true, Data: map[string]any{
+			"name": name, "type": typ, "manager_name": pn,
+			"reachable": false,
+			"note":      "no provider registered for this type (configure api_key for openai in store, or set provider env vars)",
+		}}
+	}
+	err := p.HealthCheck(ctx)
+	reachable := err == nil
+	data := map[string]any{
+		"name": name, "type": typ, "manager_name": pn, "reachable": reachable,
+	}
+	if err != nil {
+		data["error"] = err.Error()
+	}
+	return mcp.MCPToolResult{OK: true, Data: data}
 }
 
 // handleProvidersConfigure 处理 providers_configure：按 name 匹配项写入 api_key，并确保 Extra 非 nil。

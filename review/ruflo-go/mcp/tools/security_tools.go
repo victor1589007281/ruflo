@@ -3,8 +3,11 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,7 +75,7 @@ func secSave() error {
 func securityTools() []*mcp.MCPTool {
 	secLoad()
 	return []*mcp.MCPTool{
-		{Name: "security_scan", Description: "Scan for vulnerabilities (heuristic)", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"target": map[string]any{"type": "string"}}}, Handler: toolHandler(handleSecurityScan)},
+		{Name: "security_scan", Description: "Scan for vulnerabilities (heuristic)", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"target": map[string]any{"type": "string"}, "path": map[string]any{"type": "string", "description": "Alias of target directory"}}}, Handler: toolHandler(handleSecurityScan)},
 		{Name: "security_audit", Description: "Run security audit summary", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"scope": map[string]any{"type": "string"}}}, Handler: toolHandler(handleSecurityAudit)},
 		{Name: "security_validate", Description: "Validate input string", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"field": map[string]any{"type": "string"}, "input": map[string]any{"type": "string"}}, "required": []string{"input"}}, Handler: toolHandler(handleSecurityValidate)},
 		{Name: "security_report", Description: "Generate security report", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}}, Handler: toolHandler(handleSecurityReportTool)},
@@ -89,17 +92,94 @@ func RegisterSecurityTools(reg *mcp.ToolRegistry) error {
 	return nil
 }
 
-// handleSecurityScan 对 target 目录（默认 "."）追加一条启发式扫描记录（含占位 findings），持久化后返回该条记录。
+func sensitiveBasename(name string) (string, bool) {
+	b := strings.ToLower(filepath.Base(name))
+	switch {
+	case b == ".env" || strings.HasPrefix(b, ".env.") || b == ".env.sample":
+		return "env_file", true
+	case strings.Contains(b, "credential") || b == "secrets.json" || b == "credentials.json":
+		return "credential_like_filename", true
+	case b == "id_rsa" || b == "id_dsa" || b == "id_ecdsa" || b == "id_ed25519":
+		return "private_key_filename", true
+	case strings.HasSuffix(b, ".pem") && (strings.Contains(b, "key") || strings.Contains(b, "private")):
+		return "pem_key_like", true
+	default:
+		return "", false
+	}
+}
+
+// handleSecurityScan 在 target/path 目录下用 PathValidator、InputValidator 与敏感文件名启发式做真实扫描。
 func handleSecurityScan(_ context.Context, m map[string]any) mcp.MCPToolResult {
-	target := strArg(m, "target")
+	target := strArg(m, "path")
+	if target == "" {
+		target = strArg(m, "target")
+	}
 	if target == "" {
 		target = "."
 	}
+	absRoot, err := filepath.Abs(target)
+	if err != nil {
+		return mcp.MCPToolResult{OK: false, Error: err.Error()}
+	}
+	st, err := os.Stat(absRoot)
+	if err != nil {
+		return mcp.MCPToolResult{OK: false, Error: err.Error()}
+	}
+	if !st.IsDir() {
+		return mcp.MCPToolResult{OK: false, Error: "target must be a directory"}
+	}
+	pv := security.NewPathValidator(absRoot)
+	iv := security.NewInputValidator()
+	findings := make([]map[string]any, 0, 16)
+	filesScanned := 0
+	const maxFiles = 8000
+	_ = filepath.WalkDir(absRoot, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			findings = append(findings, map[string]any{"id": "S-WALK", "severity": "warn", "path": path, "message": werr.Error()})
+			return nil
+		}
+		if filesScanned >= maxFiles {
+			return fs.SkipAll
+		}
+		if d.IsDir() {
+			return nil
+		}
+		filesScanned++
+		rel, _ := filepath.Rel(absRoot, path)
+		relSlash := filepath.ToSlash(rel)
+		if _, err := pv.Validate(path, false); err != nil {
+			findings = append(findings, map[string]any{"id": "S-PATH", "severity": "warn", "path": relSlash, "message": err.Error()})
+		}
+		if vr := iv.ValidateString("relpath", relSlash); !vr.OK {
+			findings = append(findings, map[string]any{"id": "S-INJECT", "severity": "info", "path": relSlash, "message": "path pattern issues", "issues": vr.Issues})
+		}
+		if kind, hit := sensitiveBasename(path); hit {
+			findings = append(findings, map[string]any{"id": "S-SENS", "severity": "warn", "path": relSlash, "message": "sensitive filename pattern", "kind": kind})
+		}
+		info, ierr := d.Info()
+		if ierr == nil && info.Size() > 0 && info.Size() <= 96*1024 {
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".go" || ext == ".json" || ext == ".yaml" || ext == ".yml" || ext == ".env" || ext == ".txt" || ext == ".md" || ext == "" {
+				buf := make([]byte, 768)
+				f, oerr := os.Open(path)
+				if oerr == nil {
+					n, _ := f.Read(buf)
+					_ = f.Close()
+					snippet := string(buf[:n])
+					if vr := iv.ValidateString("content", snippet); len(vr.Issues) > 0 {
+						findings = append(findings, map[string]any{"id": "S-CONTENT", "severity": "info", "path": relSlash, "issues": vr.Issues})
+					}
+				}
+			}
+		}
+		return nil
+	})
+	if len(findings) == 0 {
+		findings = append(findings, map[string]any{"id": "S-000", "severity": "info", "message": "no heuristic findings in scanned files"})
+	}
 	rec := map[string]any{
-		"target": target, "at": now(),
-		"findings": []map[string]any{
-			{"id": "S-001", "severity": "info", "message": "No CVE database attached; heuristic scan only"},
-		},
+		"target": target, "abs_root": absRoot, "at": now(),
+		"findings": findings, "files_scanned": filesScanned,
 	}
 	secMu.Lock()
 	secFile.Scans = append(secFile.Scans, rec)
@@ -110,13 +190,78 @@ func handleSecurityScan(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: rec}
 }
 
-// handleSecurityAudit 在 scope（默认 orchestration）下追加一条摘要审计记录，持久化后返回。
+// handleSecurityAudit 审计 pkg/security 各组件与 SafeExecutor / PathValidator 的真实行为。
 func handleSecurityAudit(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	scope := strArg(m, "scope")
 	if scope == "" {
 		scope = "orchestration"
 	}
-	rec := map[string]any{"scope": scope, "at": now(), "checks": 4, "passed": 4}
+	checks := make([]map[string]any, 0, 8)
+	passed := 0
+
+	iv := security.NewInputValidator()
+	if r := iv.ValidateString("audit_probe", "plain-safe-text"); r.OK {
+		passed++
+		checks = append(checks, map[string]any{"name": "input_validator", "ok": true})
+	} else {
+		checks = append(checks, map[string]any{"name": "input_validator", "ok": false, "issues": r.Issues})
+	}
+
+	td, err := os.MkdirTemp("", "ruflo-sec-audit-*")
+	if err != nil {
+		return mcp.MCPToolResult{OK: false, Error: err.Error()}
+	}
+	defer func() { _ = os.RemoveAll(td) }()
+	nested := filepath.Join(td, "allowed", "nested.txt")
+	if err := os.MkdirAll(filepath.Dir(nested), 0o755); err != nil {
+		return mcp.MCPToolResult{OK: false, Error: err.Error()}
+	}
+	if err := os.WriteFile(nested, []byte("ok"), 0o644); err != nil {
+		return mcp.MCPToolResult{OK: false, Error: err.Error()}
+	}
+	pv := security.NewPathValidator(td)
+	if _, err := pv.Validate(nested, false); err == nil {
+		passed++
+		checks = append(checks, map[string]any{"name": "path_validator_allowed_subpath", "ok": true})
+	} else {
+		checks = append(checks, map[string]any{"name": "path_validator_allowed_subpath", "ok": false, "error": err.Error()})
+	}
+	if _, err := pv.Validate("/nonexistent-ruflo-escape/etc/passwd", false); err != nil {
+		passed++
+		checks = append(checks, map[string]any{"name": "path_validator_rejects_outside", "ok": true})
+	} else {
+		checks = append(checks, map[string]any{"name": "path_validator_rejects_outside", "ok": false, "error": "expected rejection"})
+	}
+
+	trueExe, lookErr := exec.LookPath("true")
+	if lookErr != nil {
+		trueExe = "/usr/bin/true"
+	}
+	se := security.NewSafeExecutor(map[string]string{"true": trueExe})
+	if _, err := se.Run(context.Background(), "missing-cmd", nil); err != nil {
+		passed++
+		checks = append(checks, map[string]any{"name": "safe_executor_unknown_rejected", "ok": true})
+	} else {
+		checks = append(checks, map[string]any{"name": "safe_executor_unknown_rejected", "ok": false})
+	}
+	if _, err := se.Run(context.Background(), "true", []string{"x;rm -rf /"}); err != nil {
+		passed++
+		checks = append(checks, map[string]any{"name": "safe_executor_blocked_metachar", "ok": true})
+	} else {
+		checks = append(checks, map[string]any{"name": "safe_executor_blocked_metachar", "ok": false})
+	}
+	if _, err := se.Run(context.Background(), "true", []string{}); err == nil {
+		passed++
+		checks = append(checks, map[string]any{"name": "safe_executor_allowlisted_ok", "ok": true})
+	} else {
+		checks = append(checks, map[string]any{"name": "safe_executor_allowlisted_ok", "ok": false, "error": err.Error()})
+	}
+
+	rec := map[string]any{
+		"scope": scope, "at": now(),
+		"checks": len(checks), "passed": passed,
+		"results": checks,
+	}
 	secMu.Lock()
 	secFile.Audits = append(secFile.Audits, rec)
 	secMu.Unlock()

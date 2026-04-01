@@ -10,9 +10,13 @@ import (
 	"time"
 
 	"github.com/ruflo/ruflo-go/api"
+	"github.com/ruflo/ruflo-go/mcp"
 	"github.com/ruflo/ruflo-go/pkg/guidance"
 	"github.com/ruflo/ruflo-go/pkg/hooks"
 	nlp "github.com/ruflo/ruflo-go/pkg/neural"
+	"github.com/ruflo/ruflo-go/pkg/providers"
+	"github.com/ruflo/ruflo-go/pkg/swarm"
+	"github.com/ruflo/ruflo-go/pkg/swarm/consensus"
 )
 
 // agentSeq 为 agent_spawn 分配 agent-{N} 时使用的原子递增序列，进程重启后由 persist 恢复上限。
@@ -40,7 +44,21 @@ type sharedState struct {
 	llmHooks          *hooks.LLMHookBundle           // LLM 前后置钩子与指标
 	sona              *nlp.SONACoordinator           // SONA 轨迹与信号协调器
 	guidancePlane     *guidance.GuidanceControlPlane // 治理控制面（供扩展工具使用）
+	providerMgr       *providers.ProviderManager     // LLM Provider 注册与健康检查（与 JSON 配置层同步）
+
+	// Swarm MCP ↔ pkg/swarm.UnifiedSwarmCoordinator（与 coordination_* 共享）
+	coordinator     *swarm.UnifiedSwarmCoordinator
+	coordInitErr    error
+	pendingCoordCfg *swarm.CoordinatorConfig // 首次 ensureCoordinator 前由 swarm_init 写入
+	coordMu         sync.Mutex
+
+	// Hive Mind MCP ↔ QueenCoordinator + 独立共识引擎（懒初始化，见 hive_mind_tools.go）
+	queen           *swarm.QueenCoordinator
+	consensusEngine consensus.Engine
 }
+
+// globalToolRegistry 由 RegisterAll 在完成注册后赋值，供 workflow_run 等按名调用其它 MCP 工具。
+var globalToolRegistry *mcp.ToolRegistry
 
 // swarmRecord 表示一次 swarm_init 创建的蜂群元数据与生命周期状态。
 type swarmRecord struct {
@@ -108,6 +126,8 @@ func init() {
 	globalState.llmHooks = hooks.NewLLMHookBundle(globalState.reasoningBank)
 	patPath := filepath.Join(resolveDataDir(), "neural", "patterns.json")
 	globalState.sona = nlp.NewSONACoordinator(nlp.DefaultSONAConfig(), patPath)
+	globalState.providerMgr = providers.NewProviderManager()
+	_ = globalState.providerMgr.Initialize()
 }
 
 func now() time.Time { return time.Now().UTC().Truncate(time.Millisecond) }

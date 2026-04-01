@@ -6,8 +6,11 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -115,19 +118,59 @@ func handleHooksExplain(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	if topic == "" {
 		topic = "hooks"
 	}
+	guidance := globalState.reasoningBank.GenerateGuidance(topic)
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{
-		"topic": topic, "summary": "Hook chains run around edits, commands, tasks, and sessions via pkg/hooks executor.",
+		"topic": topic, "guidance": guidance,
 	}}
 }
 
 func handleHooksPretrain(_ context.Context, m map[string]any) mcp.MCPToolResult {
-	res := hooks.HookResult{Success: true, Message: "pretrain scheduled", Data: map[string]any{"mode": "noop"}}
+	th := 0.92
+	if v, ok := m["threshold"].(float64); ok && v > 0 && v <= 1 {
+		th = v
+	}
+	merged := 0
+	if globalState.sona != nil {
+		merged = globalState.sona.ConsolidatePatterns(th)
+	}
+	res := hooks.HookResult{
+		Success: true,
+		Message: "SONA pattern consolidation completed",
+		Data: map[string]any{
+			"threshold":               th,
+			"patterns_merged_removed": merged,
+			"sona_available":          globalState.sona != nil,
+		},
+	}
 	logHook("hooks_pretrain", m, res)
 	return hookRes(res)
 }
 
 func handleHooksBuildAgents(_ context.Context, m map[string]any) mcp.MCPToolResult {
-	res := hooks.HookResult{Success: true, Message: "agent templates refreshed", Data: map[string]any{"mode": "noop"}}
+	regs := globalState.hookReg.List()
+	ws := globalState.workerMgr.ListWorkers()
+	hookSumm := make([]map[string]any, 0, len(regs))
+	for _, r := range regs {
+		hookSumm = append(hookSumm, map[string]any{
+			"name": r.Name, "event": string(r.Event), "priority": r.Priority, "enabled": r.Enabled,
+		})
+	}
+	workerSumm := make([]map[string]any, 0, len(ws))
+	for _, w := range ws {
+		workerSumm = append(workerSumm, map[string]any{
+			"name": w.Name, "priority": string(w.Priority), "trigger_pattern_count": len(w.TriggerPatterns),
+		})
+	}
+	res := hooks.HookResult{
+		Success: true,
+		Message: "templates from hook registry and worker manager",
+		Data: map[string]any{
+			"registered_hooks": hookSumm,
+			"workers":          workerSumm,
+			"hook_count":       len(regs),
+			"worker_count":     len(ws),
+		},
+	}
 	logHook("hooks_build-agents", m, res)
 	return hookRes(res)
 }
@@ -152,13 +195,55 @@ func handleHooksSessionRestoreTool(_ context.Context, m map[string]any) mcp.MCPT
 }
 
 func handleHooksNotify(_ context.Context, m map[string]any) mcp.MCPToolResult {
-	res := hooks.HookResult{Success: true, Message: strArg(m, "message")}
+	msg := strArg(m, "message")
+	hc := hooks.HookContext{
+		Args:    map[string]any{"message": msg, "source": "mcp_hooks_notify"},
+		Command: msg,
+	}
+	res := globalState.hookExec.Execute(hooks.HookEventTaskProgress, hc)
 	logHook("hooks_notify", m, res)
 	return hookRes(res)
 }
 
 func handleHooksInit(_ context.Context, m map[string]any) mcp.MCPToolResult {
-	res := hooks.HookResult{Success: true, Message: "hooks ready", Data: map[string]any{"registry_hooks": len(globalState.hookReg.List())}}
+	ready := globalState.hookReg != nil && globalState.hookExec != nil &&
+		globalState.workerMgr != nil && globalState.reasoningBank != nil && globalState.llmHooks != nil
+	data := map[string]any{
+		"ready":          ready,
+		"hook_registry":  globalState.hookReg != nil,
+		"hook_executor":  globalState.hookExec != nil,
+		"worker_manager": globalState.workerMgr != nil,
+		"reasoning_bank": globalState.reasoningBank != nil,
+		"llm_hooks":      globalState.llmHooks != nil,
+		"sona":           globalState.sona != nil,
+	}
+	if globalState.hookReg != nil {
+		st := globalState.hookReg.GetStats()
+		data["registry_stats"] = map[string]any{
+			"total_registered": st.TotalRegistered,
+			"enabled":          st.EnabledCount,
+			"disabled":         st.DisabledCount,
+		}
+	}
+	if globalState.workerMgr != nil {
+		data["worker_definitions"] = len(globalState.workerMgr.ListWorkers())
+	}
+	if globalState.reasoningBank != nil {
+		rb := globalState.reasoningBank.GetStats()
+		data["reasoning_bank_stats"] = map[string]any{
+			"total_patterns": rb.TotalPatterns,
+			"short_term":     rb.ShortTerm,
+			"long_term":      rb.LongTerm,
+			"avg_quality":    rb.AvgQuality,
+		}
+	}
+	if globalState.llmHooks != nil {
+		data["llm_metrics"] = globalState.llmHooks.MetricsSnapshot()
+	}
+	res := hooks.HookResult{Success: ready, Message: "hooks subsystem status", Data: data}
+	if !ready {
+		res.Message = "hooks subsystem incomplete: one or more core components are nil"
+	}
 	logHook("hooks_init", m, res)
 	return hookRes(res)
 }
@@ -171,7 +256,16 @@ func handleHooksIntelligence(_ context.Context, _ map[string]any) mcp.MCPToolRes
 	if globalState.sona != nil {
 		sonaN = len(globalState.sona.Patterns())
 	}
-	return mcp.MCPToolResult{OK: true, Data: map[string]any{"intel_events": n, "sona_patterns": sonaN}}
+	rb := globalState.reasoningBank.GetStats()
+	return mcp.MCPToolResult{OK: true, Data: map[string]any{
+		"intel_events": n, "sona_patterns": sonaN,
+		"reasoning_bank": map[string]any{
+			"total_patterns": rb.TotalPatterns,
+			"short_term":     rb.ShortTerm,
+			"long_term":      rb.LongTerm,
+			"avg_quality":    rb.AvgQuality,
+		},
+	}}
 }
 
 // handleHooksIntelligenceReset 清空内存事件并重写空 intelligence.json。
@@ -253,6 +347,13 @@ func handleHooksIntelStats(_ context.Context, _ map[string]any) mcp.MCPToolResul
 	if globalState.sona != nil {
 		out["sona_patterns"] = len(globalState.sona.Patterns())
 	}
+	rb := globalState.reasoningBank.GetStats()
+	out["reasoning_bank"] = map[string]any{
+		"total_patterns": rb.TotalPatterns,
+		"short_term":     rb.ShortTerm,
+		"long_term":      rb.LongTerm,
+		"avg_quality":    rb.AvgQuality,
+	}
 	return mcp.MCPToolResult{OK: true, Data: out}
 }
 
@@ -265,10 +366,130 @@ func handleHooksIntelLearn(_ context.Context, m map[string]any) mcp.MCPToolResul
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"recorded": true}}
 }
 
-// handleHooksIntelAttention 返回固定权重向量占位（与 focus 回显）。
+// handleHooksIntelAttention 基于 SONA 模式与可选 focus 嵌入的余弦相似度（或置信度×用量）得到归一化权重。
 func handleHooksIntelAttention(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	f := strArg(m, "focus")
-	return mcp.MCPToolResult{OK: true, Data: map[string]any{"focus": f, "weights": []float64{0.5, 0.3, 0.2}}}
+	if globalState.sona == nil {
+		return mcp.MCPToolResult{OK: false, Error: "sona nil"}
+	}
+	pats := globalState.sona.Patterns()
+	if len(pats) == 0 {
+		return mcp.MCPToolResult{OK: true, Data: map[string]any{
+			"focus": f, "weights": []float64{1.0}, "labels": []string{"_empty_"}, "note": "no sona patterns",
+		}}
+	}
+
+	if strings.TrimSpace(f) != "" {
+		emb := embeddings.HashEmbed384(f)
+		type scored struct {
+			idx int
+			sim float64
+		}
+		var buf []scored
+		for i, p := range pats {
+			if p == nil || len(p.Embedding) != len(emb) || len(emb) == 0 {
+				continue
+			}
+			var dot, na, nb float64
+			for j := range emb {
+				dot += float64(emb[j]) * float64(p.Embedding[j])
+				na += float64(emb[j]) * float64(emb[j])
+				nb += float64(p.Embedding[j]) * float64(p.Embedding[j])
+			}
+			sim := 0.0
+			if na > 0 && nb > 0 {
+				sim = dot / (math.Sqrt(na) * math.Sqrt(nb))
+			}
+			if sim < 0 {
+				sim = 0
+			}
+			buf = append(buf, scored{idx: i, sim: sim})
+		}
+		sort.Slice(buf, func(i, j int) bool { return buf[i].sim > buf[j].sim })
+		topN := 3
+		if len(buf) < topN {
+			topN = len(buf)
+		}
+		if topN > 0 {
+			weights := make([]float64, topN)
+			labels := make([]string, topN)
+			for i := 0; i < topN; i++ {
+				weights[i] = buf[i].sim
+				p := pats[buf[i].idx]
+				lab := p.ID
+				if lab == "" {
+					lab = p.Content
+				}
+				if len(lab) > 48 {
+					lab = lab[:45] + "..."
+				}
+				labels[i] = lab
+			}
+			normalizeWeights(weights)
+			return mcp.MCPToolResult{OK: true, Data: map[string]any{
+				"focus": f, "weights": weights, "labels": labels, "source": "embedding_cosine",
+			}}
+		}
+	}
+
+	return sonaAttentionByConfidence(pats, f)
+}
+
+func normalizeWeights(w []float64) {
+	sum := 0.0
+	for _, x := range w {
+		sum += x
+	}
+	if sum <= 0 {
+		n := float64(len(w))
+		if n == 0 {
+			return
+		}
+		for i := range w {
+			w[i] = 1 / n
+		}
+		return
+	}
+	for i := range w {
+		w[i] /= sum
+	}
+}
+
+func sonaAttentionByConfidence(pats []*nlp.Pattern, focus string) mcp.MCPToolResult {
+	type scored struct {
+		idx int
+		s   float64
+	}
+	var buf []scored
+	for i, p := range pats {
+		if p == nil {
+			continue
+		}
+		buf = append(buf, scored{idx: i, s: p.Confidence * float64(1+p.UsageCount)})
+	}
+	sort.Slice(buf, func(i, j int) bool { return buf[i].s > buf[j].s })
+	topN := 3
+	if len(buf) < topN {
+		topN = len(buf)
+	}
+	weights := make([]float64, topN)
+	labels := make([]string, topN)
+	for i := 0; i < topN; i++ {
+		weights[i] = buf[i].s
+		p := pats[buf[i].idx]
+		lab := p.ID
+		if lab == "" {
+			lab = p.Content
+		}
+		if len(lab) > 48 {
+			lab = lab[:45] + "..."
+		}
+		labels[i] = lab
+	}
+	normalizeWeights(weights)
+	return mcp.MCPToolResult{OK: true, Data: map[string]any{
+		"focus": focus, "weights": weights, "labels": labels, "source": "confidence_times_usage",
+	}}
 }
 
 // handleHooksWorkerDetect 以 detect 上下文向 audit 触发器派发 Worker。
@@ -299,10 +520,31 @@ func handleHooksModelStats(_ context.Context, _ map[string]any) mcp.MCPToolResul
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"metrics": globalState.llmHooks.MetricsSnapshot()}}
 }
 
-// handleHooksWorkerCancel 占位：声明未跟踪可取消任务。
+// handleHooksWorkerCancel WorkerManager 未导出按名取消 API；仅能通过新 Dispatch 隐式取消同 Worker 的上一作业。
 func handleHooksWorkerCancel(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	w := strArg(m, "worker")
-	return mcp.MCPToolResult{OK: true, Data: map[string]any{"worker": w, "cancelled": false, "note": "no active cancellable job tracked"}}
+	if w == "" {
+		return mcp.MCPToolResult{OK: false, Error: "worker name is required"}
+	}
+	known := false
+	for _, cfg := range globalState.workerMgr.ListWorkers() {
+		if cfg.Name == w {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return mcp.MCPToolResult{OK: false, Error: "unknown worker: " + w}
+	}
+	st, err := globalState.workerMgr.GetStatus(w)
+	if err != nil {
+		return mcp.MCPToolResult{OK: false, Error: err.Error()}
+	}
+	busy, _ := st["busy"].(bool)
+	note := "WorkerManager has no public CancelJob API in pkg/hooks; an in-flight handler is cancelled only when Dispatch starts a new run for that same worker (see workers.go runOne)."
+	return mcp.MCPToolResult{OK: true, Data: map[string]any{
+		"worker": w, "busy": busy, "cancelled": false, "status": st, "note": note,
+	}}
 }
 
 // hookRes 将 hooks.HookResult 转为 MCPToolResult（Success 且 Error 空视为 OK）。

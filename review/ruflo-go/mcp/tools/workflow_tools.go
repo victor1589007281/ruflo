@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,16 +154,17 @@ func handleWorkflowCreate(_ context.Context, m map[string]any) mcp.MCPToolResult
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"id": id, "name": name, "steps": steps}}
 }
 
-// handleWorkflowRun 按 definition_id 创建 run，先存 running 再立即置为 completed 且 current_step=步骤总数（同步占位）。
-func handleWorkflowRun(_ context.Context, m map[string]any) mcp.MCPToolResult {
+// handleWorkflowRun 按 definition_id 创建 run，逐步将 step 视为 MCP 工具名经 globalToolRegistry 调用并记录结果。
+func handleWorkflowRun(ctx context.Context, m map[string]any) mcp.MCPToolResult {
 	did := strArg(m, "definition_id")
 	workflowMu.Lock()
-	defer workflowMu.Unlock()
 	wfEnsureLocked()
 	def, ok := workflowCache.Definitions[did]
 	if !ok || def == nil {
+		workflowMu.Unlock()
 		return mcp.MCPToolResult{OK: false, Error: "definition not found"}
 	}
+	steps := append([]string(nil), def.Steps...)
 	rid := workflowToolID("wf-run-")
 	run := &workflowRun{
 		ID:           rid,
@@ -174,15 +176,111 @@ func handleWorkflowRun(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	}
 	workflowCache.Runs[rid] = run
 	if err := wfSaveLocked(); err != nil {
+		workflowMu.Unlock()
 		return mcp.MCPToolResult{OK: false, Error: err.Error()}
 	}
-	run.CurrentStep = len(def.Steps)
-	run.Status = "completed"
-	run.UpdatedAt = now()
+	workflowMu.Unlock()
+
+	reg := globalToolRegistry
+	stepResults := make([]map[string]any, 0, len(steps))
+	failed := false
+	var failReason string
+	for i, step := range steps {
+		step = strings.TrimSpace(step)
+		t0 := time.Now()
+		sr := map[string]any{"index": i, "step": step, "elapsed_sec": 0.0}
+		if step == "" {
+			sr["ok"] = true
+			sr["skipped"] = true
+			sr["elapsed_sec"] = time.Since(t0).Seconds()
+			stepResults = append(stepResults, sr)
+			continue
+		}
+		if reg == nil {
+			failed = true
+			failReason = "tool registry not initialized"
+			sr["ok"] = false
+			sr["error"] = failReason
+			sr["elapsed_sec"] = time.Since(t0).Seconds()
+			stepResults = append(stepResults, sr)
+			break
+		}
+		raw, err := reg.Call(ctx, step, json.RawMessage("{}"))
+		elapsed := time.Since(t0).Seconds()
+		sr["elapsed_sec"] = elapsed
+		if err != nil {
+			failed = true
+			failReason = err.Error()
+			sr["ok"] = false
+			sr["error"] = err.Error()
+			stepResults = append(stepResults, sr)
+			break
+		}
+		var payload map[string]any
+		_ = json.Unmarshal(raw, &payload)
+		if okv, has := payload["ok"]; has {
+			if ob, okb := okv.(bool); okb && !ob {
+				failed = true
+				if es, _ := payload["error"].(string); es != "" {
+					failReason = es
+					sr["error"] = es
+				} else {
+					failReason = "tool returned ok=false"
+					sr["error"] = failReason
+				}
+				sr["ok"] = false
+				stepResults = append(stepResults, sr)
+				break
+			}
+		}
+		sr["ok"] = true
+		if len(raw) > 800 {
+			sr["result_preview"] = string(raw[:800]) + "…"
+		} else {
+			sr["result_preview"] = string(raw)
+		}
+		stepResults = append(stepResults, sr)
+	}
+
+	workflowMu.Lock()
+	defer workflowMu.Unlock()
+	wfEnsureLocked()
+	r := workflowCache.Runs[rid]
+	if r != nil {
+		if failed {
+			r.Status = "failed"
+			for j := range stepResults {
+				if stepResults[j]["ok"] == false {
+					if idx, ok := stepResults[j]["index"].(int); ok {
+						r.CurrentStep = idx
+					}
+					break
+				}
+			}
+		} else {
+			r.Status = "completed"
+			r.CurrentStep = len(steps)
+		}
+		r.UpdatedAt = now()
+	}
 	if err := wfSaveLocked(); err != nil {
 		return mcp.MCPToolResult{OK: false, Error: err.Error()}
 	}
-	return mcp.MCPToolResult{OK: true, Data: map[string]any{"run_id": rid, "status": run.Status, "steps_total": len(def.Steps)}}
+	out := map[string]any{
+		"run_id": rid, "steps_total": len(steps), "steps": stepResults,
+	}
+	if r != nil {
+		out["status"] = r.Status
+		out["current_step"] = r.CurrentStep
+	}
+	if failed {
+		out["failed"] = true
+		if failReason != "" {
+			out["error"] = failReason
+		}
+		return mcp.MCPToolResult{OK: false, Data: out, Error: failReason}
+	}
+	return mcp.MCPToolResult{OK: true, Data: out}
 }
 
 // handleWorkflowStatus 按 run_id 返回运行状态、当前步骤与时间戳字段。

@@ -6,13 +6,101 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/ruflo/ruflo-go/api"
 	"github.com/ruflo/ruflo-go/mcp"
+	"github.com/ruflo/ruflo-go/pkg/swarm"
 )
 
 var swarmSeq int64
+
+func parseTopologyString(s string) api.TopologyType {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "hierarchical", "":
+		return api.TopologyHierarchical
+	case "mesh":
+		return api.TopologyMesh
+	case "hierarchical-mesh", "hierarchical_mesh":
+		return api.TopologyHierarchicalMesh
+	case "ring":
+		return api.TopologyRing
+	case "star":
+		return api.TopologyStar
+	case "adaptive":
+		return api.TopologyAdaptive
+	case "centralized":
+		return api.TopologyCentralized
+	case "hybrid":
+		return api.TopologyHybrid
+	default:
+		return api.TopologyMesh
+	}
+}
+
+func parseConsensusStrategy(s string) api.ConsensusAlgorithm {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "byzantine", "bft":
+		return api.ConsensusByzantine
+	case "gossip":
+		return api.ConsensusGossip
+	case "crdt":
+		return api.ConsensusCRDT
+	case "quorum":
+		return api.ConsensusQuorum
+	default:
+		return api.ConsensusRaft
+	}
+}
+
+func buildSwarmCoordinatorConfig(a swarmInitArgs) swarm.CoordinatorConfig {
+	mx := a.MaxAgents
+	if mx <= 0 {
+		mx = 8
+	}
+	cfg := swarm.CoordinatorConfig{
+		Topology:        parseTopologyString(a.Topology),
+		ConsensusAlgo:   parseConsensusStrategy(a.Strategy),
+		AgentPoolMin:    2,
+		AgentPoolMax:    mx,
+		HeartbeatMS:     500,
+		MetricsInterval: time.Second,
+	}
+	if a.V3Mode && cfg.AgentPoolMax < 16 {
+		cfg.AgentPoolMax = 16
+	}
+	return cfg
+}
+
+func coordinatorSnapshotForMCP(c *swarm.UnifiedSwarmCoordinator) map[string]any {
+	st := c.GetState()
+	met := c.GetMetrics()
+	agents := c.GetAllAgents()
+	agentSummaries := make([]map[string]any, 0, len(agents))
+	for _, a := range agents {
+		if a == nil {
+			continue
+		}
+		agentSummaries = append(agentSummaries, map[string]any{
+			"id": a.ID, "name": a.Name, "type": a.Type, "state": a.State, "domain": a.Domain, "status": a.Status,
+		})
+	}
+	return map[string]any{
+		"healthy": c.IsHealthy(),
+		"state": map[string]any{
+			"status": st.Status, "topology": st.Topology, "agent_count": st.AgentCount,
+			"pending_tasks": st.PendingTasks, "last_election": st.LastElection, "started_at": st.StartedAt,
+		},
+		"metrics": map[string]any{
+			"tasks_submitted": met.TasksSubmitted, "tasks_assigned": met.TasksAssigned, "tasks_completed": met.TasksCompleted,
+			"consensus_proposals": met.ConsensusProposals, "health_recoveries": met.HealthRecoveries,
+			"messages_processed": met.MessagesProcessed, "updated_at": met.UpdatedAt,
+		},
+		"agents": agentSummaries,
+	}
+}
 
 func swarmTools() []*mcp.MCPTool {
 	return []*mcp.MCPTool{
@@ -100,6 +188,15 @@ func handleSwarmInit(ctx context.Context, args json.RawMessage) (json.RawMessage
 	globalState.mu.Lock()
 	globalState.swarms[id] = rec
 	globalState.mu.Unlock()
+
+	cfg := buildSwarmCoordinatorConfig(a)
+	globalState.coordMu.Lock()
+	globalState.pendingCoordCfg = &cfg
+	globalState.coordMu.Unlock()
+	if _, err := ensureCoordinator(); err != nil {
+		return nil, fmt.Errorf("swarm coordinator: %w", err)
+	}
+
 	saveSwarmToDisk()
 	return jsonOK(map[string]any{"ok": true, "swarm": rec})
 }
@@ -120,7 +217,14 @@ func handleSwarmStatus(ctx context.Context, args json.RawMessage) (json.RawMessa
 	defer globalState.mu.RUnlock()
 	if a.ID != "" {
 		if s, ok := globalState.swarms[a.ID]; ok {
-			return jsonOK(map[string]any{"swarm": s})
+			out := map[string]any{"swarm": s}
+			globalState.coordMu.Lock()
+			c := globalState.coordinator
+			globalState.coordMu.Unlock()
+			if c != nil {
+				out["coordinator"] = coordinatorSnapshotForMCP(c)
+			}
+			return jsonOK(out)
 		}
 		return nil, fmt.Errorf("swarm not found")
 	}
@@ -133,7 +237,14 @@ func handleSwarmStatus(ctx context.Context, args json.RawMessage) (json.RawMessa
 	if latest == nil {
 		return jsonOK(map[string]any{"swarm": nil, "message": "no swarms"})
 	}
-	return jsonOK(map[string]any{"swarm": latest})
+	out := map[string]any{"swarm": latest}
+	globalState.coordMu.Lock()
+	c := globalState.coordinator
+	globalState.coordMu.Unlock()
+	if c != nil {
+		out["coordinator"] = coordinatorSnapshotForMCP(c)
+	}
+	return jsonOK(out)
 }
 
 func handleSwarmShutdown(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
@@ -149,19 +260,33 @@ func handleSwarmShutdown(ctx context.Context, args json.RawMessage) (json.RawMes
 			s.UpdatedAt = now()
 			globalState.swarms[id] = s
 		}
-		globalState.mu.Unlock()
-		saveSwarmToDisk()
-		return jsonOK(map[string]any{"ok": true, "stopped": "all"})
+	} else {
+		s, ok := globalState.swarms[a.ID]
+		if !ok {
+			globalState.mu.Unlock()
+			return nil, fmt.Errorf("swarm not found")
+		}
+		s.Status = api.SwarmStatusStopped
+		s.UpdatedAt = now()
+		globalState.swarms[a.ID] = s
 	}
-	s, ok := globalState.swarms[a.ID]
-	if !ok {
-		globalState.mu.Unlock()
-		return nil, fmt.Errorf("swarm not found")
+	remainingActive := 0
+	for _, s := range globalState.swarms {
+		if s.Status == api.SwarmStatusActive {
+			remainingActive++
+		}
 	}
-	s.Status = api.SwarmStatusStopped
-	s.UpdatedAt = now()
 	globalState.mu.Unlock()
 	saveSwarmToDisk()
+	if remainingActive == 0 {
+		shutdownSwarmCoordinator()
+	}
+	if a.ID == "" {
+		return jsonOK(map[string]any{"ok": true, "stopped": "all"})
+	}
+	globalState.mu.RLock()
+	s := globalState.swarms[a.ID]
+	globalState.mu.RUnlock()
 	return jsonOK(map[string]any{"ok": true, "swarm": s})
 }
 
@@ -177,8 +302,15 @@ func handleSwarmHealth(ctx context.Context, args json.RawMessage) (json.RawMessa
 			active++
 		}
 	}
-	return jsonOK(map[string]any{
+	out := map[string]any{
 		"total":  len(globalState.swarms),
 		"active": active,
-	})
+	}
+	globalState.coordMu.Lock()
+	c := globalState.coordinator
+	globalState.coordMu.Unlock()
+	if c != nil {
+		out["coordinator_healthy"] = c.IsHealthy()
+	}
+	return jsonOK(out)
 }

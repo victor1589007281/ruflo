@@ -8,7 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ruflo/ruflo-go/api"
 	"github.com/ruflo/ruflo-go/mcp"
+	"github.com/ruflo/ruflo-go/pkg/swarm"
+	"github.com/ruflo/ruflo-go/pkg/swarm/consensus"
 )
 
 // 本文件：Hive Mind（蜂群心智）协调 MCP 工具，在内存+JSON 中模拟女王、工人、广播与共识记录。
@@ -31,7 +34,98 @@ type hiveMindState struct {
 var (
 	hiveMu   sync.Mutex
 	hiveData = &hiveMindState{}
+
+	hiveRuntimeMu    sync.Mutex
+	hiveRuntimeCoord *swarm.UnifiedSwarmCoordinator // Broadcast / RegisterAgent / RemoveAgent
 )
+
+func teardownHiveMindRuntime(ctx context.Context) error {
+	hiveRuntimeMu.Lock()
+	hc := hiveRuntimeCoord
+	hiveRuntimeCoord = nil
+	hiveRuntimeMu.Unlock()
+
+	var shutdownErr error
+	if hc != nil {
+		shutdownErr = hc.Shutdown(ctx)
+	}
+
+	globalState.mu.Lock()
+	q := globalState.queen
+	eng := globalState.consensusEngine
+	globalState.queen = nil
+	globalState.consensusEngine = nil
+	globalState.mu.Unlock()
+
+	if q != nil {
+		_ = q.Shutdown()
+	}
+	if eng != nil {
+		if err := eng.Close(); shutdownErr == nil {
+			shutdownErr = err
+		}
+	}
+	return shutdownErr
+}
+
+func initHiveMindRuntime(ctx context.Context, queenID string) error {
+	q := swarm.NewQueenCoordinator(nil)
+	if err := q.Initialize(ctx); err != nil {
+		return err
+	}
+	eng, err := consensus.NewEngine(consensus.Config{
+		Algorithm:    api.ConsensusRaft,
+		NodeID:       "hive-consensus-" + queenID,
+		ByzantineF:   1,
+		GossipFanout: 3,
+		GossipTTL:    12,
+	})
+	if err != nil {
+		_ = q.Shutdown()
+		return err
+	}
+	c := swarm.NewUnifiedSwarmCoordinator(swarm.CoordinatorConfig{
+		Topology:        api.TopologyStar,
+		ConsensusAlgo:   api.ConsensusRaft,
+		AgentPoolMin:    1,
+		AgentPoolMax:    128,
+		HeartbeatMS:     500,
+		MetricsInterval: time.Second,
+	})
+	if err = c.Initialize(ctx); err != nil {
+		_ = eng.Close()
+		_ = q.Shutdown()
+		return err
+	}
+	queenAg := &api.Agent{
+		ID: queenID, Name: "queen", Type: api.AgentTypeQueen,
+		Domain: api.AgentDomainQueen, State: api.AgentStateIdle, Status: api.AgentStatusHealthy,
+		CreatedAt: now(), UpdatedAt: now(),
+	}
+	q.RegisterAgent(queenAg)
+	if err = c.RegisterAgent(queenAg); err != nil {
+		_ = c.Shutdown(ctx)
+		_ = eng.Close()
+		_ = q.Shutdown()
+		return err
+	}
+	globalState.mu.Lock()
+	globalState.queen = q
+	globalState.consensusEngine = eng
+	globalState.mu.Unlock()
+	hiveRuntimeMu.Lock()
+	hiveRuntimeCoord = c
+	hiveRuntimeMu.Unlock()
+	return nil
+}
+
+func hiveWorkerAgent(id string) *api.Agent {
+	return &api.Agent{
+		ID: id, Name: id, Type: api.AgentTypeCoder,
+		Domain: api.AgentDomainCore, State: api.AgentStateIdle, Status: api.AgentStatusHealthy,
+		CreatedAt: now(), UpdatedAt: now(),
+	}
+}
 
 // hiveStatePath 返回 hive-mind/state.json 路径。
 func hiveStatePath() string {
@@ -160,17 +254,33 @@ func handleHiveMindStatus(_ context.Context, _ map[string]any) mcp.MCPToolResult
 	}}
 }
 
-// handleHiveMindConsensus 追加一条共识记录：topic（默认 default）、votes=工人数+1、时间戳。
-func handleHiveMindConsensus(_ context.Context, m map[string]any) mcp.MCPToolResult {
+// handleHiveMindConsensus 调用独立 consensus.Engine 的 Propose + AwaitConsensus，并写入 JSON 共识轨迹。
+func handleHiveMindConsensus(ctx context.Context, m map[string]any) mcp.MCPToolResult {
 	topic := strArg(m, "topic")
 	if topic == "" {
 		topic = "default"
+	}
+	rctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	globalState.mu.RLock()
+	eng := globalState.consensusEngine
+	globalState.mu.RUnlock()
+	if eng == nil {
+		return mcp.MCPToolResult{OK: false, Error: "hive mind not initialized"}
+	}
+	pid, err := eng.Propose(rctx, []byte(topic))
+	if err != nil {
+		return mcp.MCPToolResult{OK: false, Error: err.Error()}
+	}
+	res, awaitErr := eng.AwaitConsensus(rctx, pid, 2*time.Second)
+	rec := map[string]any{
+		"topic": topic, "proposal_id": pid, "committed": res.Committed, "term": res.Term,
+		"await_error": errString(awaitErr), "consensus_err": errString(res.Err), "at": now(),
 	}
 	hiveMu.Lock()
 	if hiveData.Consensus == nil {
 		hiveData.Consensus = make([]map[string]any, 0)
 	}
-	rec := map[string]any{"topic": topic, "votes": len(hiveData.Workers) + 1, "at": now()}
 	hiveData.Consensus = append(hiveData.Consensus, rec)
 	hiveMu.Unlock()
 	if err := hiveSave(); err != nil {
@@ -184,9 +294,15 @@ func handleHiveMindJoin(ctx context.Context, m map[string]any) mcp.MCPToolResult
 	return handleHiveMindSpawn(ctx, m)
 }
 
-// handleHiveMindLeave 从 Workers 中移除指定 worker_id（可不存在），返回剩余人数。
+// handleHiveMindLeave 从 Workers 中移除指定 worker_id（可不存在），并从 hive 协调器拓扑中 RemoveAgent。
 func handleHiveMindLeave(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	w := strArg(m, "worker_id")
+	hiveRuntimeMu.Lock()
+	hc := hiveRuntimeCoord
+	hiveRuntimeMu.Unlock()
+	if hc != nil && w != "" {
+		_ = hc.RemoveAgent(w)
+	}
 	hiveMu.Lock()
 	out := hiveData.Workers[:0]
 	for _, x := range hiveData.Workers {
@@ -227,8 +343,13 @@ func handleHiveMindMemory(_ context.Context, m map[string]any) mcp.MCPToolResult
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"key": k, "value": val}}
 }
 
-// handleHiveMindShutdown 将 Active 置为 false 并持久化，表示蜂群关闭（不清空历史数据）。
+// handleHiveMindShutdown 关闭 Queen、共识引擎与 hive 侧协调器，并将 Active 置为 false 后持久化。
 func handleHiveMindShutdown(_ context.Context, _ map[string]any) mcp.MCPToolResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := teardownHiveMindRuntime(ctx); err != nil {
+		return mcp.MCPToolResult{OK: false, Error: err.Error()}
+	}
 	hiveMu.Lock()
 	hiveData.Active = false
 	hiveMu.Unlock()
