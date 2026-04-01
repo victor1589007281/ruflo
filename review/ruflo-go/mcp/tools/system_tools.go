@@ -11,6 +11,12 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// 本文件：编排子系统与 MCP 运行时的只读/轻量维护工具（状态、健康、指标、路径、任务汇总等）。
+//
+// 设计思路：多数 handler 读取 globalState 或 runtime.MemStats；system_reset 仅清空 hooks 日志为软重置；
+// mcp_status 固定 transport 提示 stdio。
+
+// systemTools 注册 system_status、system_health、system_info、system_metrics、system_reset、mcp_status、task_summary。
 func systemTools() []*mcp.MCPTool {
 	return []*mcp.MCPTool{
 		{
@@ -58,6 +64,7 @@ func systemTools() []*mcp.MCPTool {
 	}
 }
 
+// handleSystemStatus 返回 agents/swarms/tasks/sessions/hooks_log 计数及跨 namespace 的 memory 条目总和。
 func handleSystemStatus(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -78,6 +85,7 @@ func handleSystemStatus(ctx context.Context, args json.RawMessage) (json.RawMess
 	return jsonOK(out)
 }
 
+// handleSystemHealth 检查 hookExec、reasoningBank 非 nil，以及 memory 是否已初始化或有数据，返回 healthy 与原因列表。
 func handleSystemHealth(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -100,6 +108,7 @@ func handleSystemHealth(ctx context.Context, args json.RawMessage) (json.RawMess
 	return jsonOK(map[string]any{"healthy": ok, "reasons": reasons, "memory_ready": memOk})
 }
 
+// handleSystemMetrics 读取 runtime.MemStats 与 NumGoroutine，返回堆分配与 GC 次数等原始计数。
 func handleSystemMetrics(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -114,6 +123,7 @@ func handleSystemMetrics(ctx context.Context, args json.RawMessage) (json.RawMes
 	})
 }
 
+// handleSystemReset 在写锁下清空 globalState.hooksLog（软重置，不影响其他状态）。
 func handleSystemReset(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -123,6 +133,7 @@ func handleSystemReset(ctx context.Context, args json.RawMessage) (json.RawMessa
 	return jsonOK(map[string]any{"ok": true, "hooks_log_cleared": true})
 }
 
+// handleMCPStatus 返回 MCP 侧快照：Go 版本、data_dir、transport 提示。
 func handleMCPStatus(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -134,6 +145,7 @@ func handleMCPStatus(ctx context.Context, args json.RawMessage) (json.RawMessage
 	})
 }
 
+// handleTaskSummary 按 TaskStatus 聚合 globalState.tasks 数量，返回 by_status 与 total。
 func handleTaskSummary(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -152,6 +164,7 @@ func handleTaskSummary(ctx context.Context, args json.RawMessage) (json.RawMessa
 	return jsonOK(map[string]any{"by_status": out, "total": len(globalState.tasks)})
 }
 
+// handleSystemInfo 返回 Go/OS、cwd、data_dir 及 agents/swarms/tasks 存储路径提示与 config_hint。
 func handleSystemInfo(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args

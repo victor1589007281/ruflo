@@ -1,3 +1,5 @@
+// 控制器注册表（memory 包）：登记多个 AgentDB/子系统控制器，统一 Initialize、HealthCheck、Close；initOrder 保证启动顺序与关闭逆序。
+// HealthCheckAll 按名称排序遍历，结果确定性便于对拍测试；GetController/ListControllers 用于运行时查找。
 package memory
 
 import (
@@ -143,7 +145,7 @@ func (r *ControllerRegistry) GetController(name string) (Controller, bool) {
 	return c, ok
 }
 
-// ListControllers returns sorted controller names.
+// ListControllers 返回字典序排序的全部注册名。
 func (r *ControllerRegistry) ListControllers() []string {
 	if r == nil {
 		return nil

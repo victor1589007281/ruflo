@@ -7,37 +7,40 @@ import (
 	"time"
 )
 
-// RunLedger records run lifecycle events for the control plane.
+// 本文件：运行账本（结构化审计日志）。StructuredRunLedger 内存存储 RunRecord 与按 runID 时间线事件；
+// mergeMetaIntoRecord 将控制面 meta 映射到记录字段；RankViolations 按频次×严重度权重排序违规；ComputeMetrics 聚合成功率等。
+
+// RunLedger 运行生命周期记录接口（可由 StructuredRunLedger 实现）。
 type RunLedger interface {
-	StartRun(runID string, meta map[string]any)
-	FinalizeRun(runID string, success bool, meta map[string]any)
+	StartRun(runID string, meta map[string]any)                  // 开始或继续一次 run
+	FinalizeRun(runID string, success bool, meta map[string]any) // 结束 run 并写入结果
 }
 
-// RunRecord captures a single orchestration run for auditing and metrics.
+// RunRecord 单次编排运行的审计快照，供合规检查与指标计算使用。
 type RunRecord struct {
-	RunID         string           `json:"run_id"`
-	ToolsUsed     []string         `json:"tools_used,omitempty"`
-	FilesModified []string         `json:"files_modified,omitempty"`
-	DiffSummary   string           `json:"diff_summary,omitempty"`
-	TestResults   string           `json:"test_results,omitempty"`
-	Violations    []Violation      `json:"violations,omitempty"`
-	Intent        TaskIntent       `json:"intent,omitempty"`
-	Duration      time.Duration    `json:"duration,omitempty"`
-	Success       bool             `json:"success"`
-	StartedAt     time.Time        `json:"started_at"`
-	FinishedAt    time.Time        `json:"finished_at,omitempty"`
-	Extra         map[string]any   `json:"extra,omitempty"`
+	RunID         string         `json:"run_id"`                   // 运行唯一 ID
+	ToolsUsed     []string       `json:"tools_used,omitempty"`     // 使用过的工具列表
+	FilesModified []string       `json:"files_modified,omitempty"` // 修改过的文件
+	DiffSummary   string         `json:"diff_summary,omitempty"`   // 变更摘要
+	TestResults   string         `json:"test_results,omitempty"`   // 测试结果文本
+	Violations    []Violation    `json:"violations,omitempty"`     // 关联违规
+	Intent        TaskIntent     `json:"intent,omitempty"`         // 任务意图
+	Duration      time.Duration  `json:"duration,omitempty"`       // 持续时间
+	Success       bool           `json:"success"`                  // 是否成功
+	StartedAt     time.Time      `json:"started_at"`               // 开始时间
+	FinishedAt    time.Time      `json:"finished_at,omitempty"`    // 结束时间
+	Extra         map[string]any `json:"extra,omitempty"`          // 其它元数据
 }
 
-// StructuredRunLedger stores run records and a timeline of events per run.
+// StructuredRunLedger 内存账本：runs 主表、events 时间线、order 插入顺序用于指标遍历。
 type StructuredRunLedger struct {
-	mu     sync.Mutex
-	runs   map[string]*RunRecord
-	events map[string][]RunEvent
-	order  []string
+	mu     sync.Mutex            // 保护 runs、events、order
+	runs   map[string]*RunRecord // runID -> 记录
+	events map[string][]RunEvent // runID -> 事件切片
+	order  []string              // runID 首次出现顺序
 }
 
-// NewStructuredRunLedger creates an in-memory ledger used by the control plane.
+// NewStructuredRunLedger 创建空内存账本。
 func NewStructuredRunLedger() *StructuredRunLedger {
 	return &StructuredRunLedger{
 		runs:   make(map[string]*RunRecord),
@@ -45,7 +48,7 @@ func NewStructuredRunLedger() *StructuredRunLedger {
 	}
 }
 
-// StartRun opens or continues a run record.
+// StartRun 若 run 不存在则创建并记录 order；合并 meta；追加 type=start 事件。
 func (l *StructuredRunLedger) StartRun(runID string, meta map[string]any) {
 	if l == nil || runID == "" {
 		return
@@ -62,7 +65,7 @@ func (l *StructuredRunLedger) StartRun(runID string, meta map[string]any) {
 	l.events[runID] = append(l.events[runID], RunEvent{Type: "start", Timestamp: time.Now().UTC(), Payload: meta})
 }
 
-// FinalizeRun closes a run and merges completion metadata.
+// FinalizeRun 设置 Success、FinishedAt、Duration，合并 meta（含 success 键），追加 finalize 事件。
 func (l *StructuredRunLedger) FinalizeRun(runID string, success bool, meta map[string]any) {
 	if l == nil || runID == "" {
 		return
@@ -87,7 +90,7 @@ func (l *StructuredRunLedger) FinalizeRun(runID string, success bool, meta map[s
 	l.events[runID] = append(l.events[runID], RunEvent{Type: "finalize", Timestamp: rec.FinishedAt, Payload: meta})
 }
 
-// GetRecord returns a snapshot of the run (nil if unknown).
+// GetRecord 返回 run 的深拷贝快照（切片与 Extra map 拷贝）；未知返回 nil。
 func (l *StructuredRunLedger) GetRecord(runID string) *RunRecord {
 	if l == nil {
 		return nil
@@ -111,7 +114,7 @@ func (l *StructuredRunLedger) GetRecord(runID string) *RunRecord {
 	return &cp
 }
 
-// Events returns timeline entries for a run id.
+// Events 返回指定 run 的事件时间线副本。
 func (l *StructuredRunLedger) Events(runID string) []RunEvent {
 	if l == nil {
 		return nil
@@ -121,6 +124,7 @@ func (l *StructuredRunLedger) Events(runID string) []RunEvent {
 	return append([]RunEvent(nil), l.events[runID]...)
 }
 
+// mergeMetaIntoRecord 将控制面 meta 键映射到 RunRecord 已知字段，其余落入 Extra。
 func mergeMetaIntoRecord(rec *RunRecord, meta map[string]any) {
 	if rec == nil || len(meta) == 0 {
 		return
@@ -164,6 +168,7 @@ func mergeMetaIntoRecord(rec *RunRecord, meta map[string]any) {
 	}
 }
 
+// stringifyAny 将任意值转为字符串（当前仅 string 有值）。
 func stringifyAny(v any) string {
 	switch t := v.(type) {
 	case string:
@@ -173,10 +178,10 @@ func stringifyAny(v any) string {
 	}
 }
 
-// TestsPassEvaluator interprets test result strings on run records.
+// TestsPassEvaluator 根据 TestResults 文本解释测试是否通过。
 type TestsPassEvaluator struct{}
 
-// Evaluate returns true when the record indicates tests passed.
+// Evaluate：无 TestResults 时退回 rec.Success；否则要求 Success 且文本含 pass/ok/success 且不含 fail/error。
 func (TestsPassEvaluator) Evaluate(rec *RunRecord) bool {
 	if rec == nil {
 		return false
@@ -189,6 +194,7 @@ func (TestsPassEvaluator) Evaluate(rec *RunRecord) bool {
 	return rec.Success && (containsAny(low, []string{"pass", "ok", "success"}) && !containsAny(low, []string{"fail", "error"}))
 }
 
+// containsAny 判断 s 是否包含 subs 中任一字串。
 func containsAny(s string, subs []string) bool {
 	for _, sub := range subs {
 		if sub != "" && strings.Contains(s, sub) {
@@ -198,7 +204,7 @@ func containsAny(s string, subs []string) bool {
 	return false
 }
 
-// RankViolations groups by rule id, scores frequency×severity weight, and sorts descending.
+// RankViolations 按 RuleID（空则用 Message）分组，score = 出现次数 × severityWeight(Severity)，按 score 降序输出每组代表 Violation。
 func RankViolations(violations []Violation) []Violation {
 	type agg struct {
 		v     Violation
@@ -239,6 +245,7 @@ func RankViolations(violations []Violation) []Violation {
 	return out
 }
 
+// severityWeight 将风险等级映射为数值权重（用于 RankViolations）。
 func severityWeight(r RiskClass) float64 {
 	switch r {
 	case RiskCritical:
@@ -256,15 +263,15 @@ func severityWeight(r RiskClass) float64 {
 	}
 }
 
-// LedgerMetrics summarizes ledger contents.
+// LedgerMetrics 账本聚合指标。
 type LedgerMetrics struct {
-	TotalRuns          int     `json:"total_runs"`
-	SuccessRate        float64 `json:"success_rate"`
-	AvgDuration        float64 `json:"avg_duration_sec"`
-	ViolationFrequency float64 `json:"violation_frequency"`
+	TotalRuns          int     `json:"total_runs"`          // 运行总数
+	SuccessRate        float64 `json:"success_rate"`        // 成功占比
+	AvgDuration        float64 `json:"avg_duration_sec"`    // 平均耗时（秒）
+	ViolationFrequency float64 `json:"violation_frequency"` // 每条 run 平均违规条数
 }
 
-// ComputeMetrics aggregates success rate, average duration, and violation frequency across stored runs.
+// ComputeMetrics 按 order 遍历 runs：统计成功率、平均 Duration、违规总数/运行数。
 func (l *StructuredRunLedger) ComputeMetrics() LedgerMetrics {
 	if l == nil {
 		return LedgerMetrics{}

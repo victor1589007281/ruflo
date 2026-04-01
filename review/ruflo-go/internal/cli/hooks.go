@@ -4,6 +4,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 hooks 命令组：任务前后钩子、路由、会话起止、后台 worker 及指标列举，映射到 hooks_* MCP 工具名（含连字符）。
+
+// newHooksCmd 构建「hooks」根子命令，聚合 pre-task、post-task、route、worker、session、dispatch、list。
 func newHooksCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hooks",
@@ -22,6 +25,7 @@ func newHooksCmd() *cobra.Command {
 	return cmd
 }
 
+// hooksPreTaskCmd 在任务开始前触发钩子，必填 description，调用 hooks_pre-task。
 func hooksPreTaskCmd() *cobra.Command {
 	var description string
 	c := &cobra.Command{
@@ -42,6 +46,7 @@ func hooksPreTaskCmd() *cobra.Command {
 	return c
 }
 
+// hooksPostTaskCmd 在任务结束后触发钩子，记录 task_id 与 success，调用 hooks_post-task。
 func hooksPostTaskCmd() *cobra.Command {
 	var taskID string
 	var success bool

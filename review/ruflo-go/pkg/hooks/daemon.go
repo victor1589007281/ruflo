@@ -59,7 +59,7 @@ func (m *DaemonManager) Register(name string, interval time.Duration, handler fu
 	return nil
 }
 
-// Start runs the daemon loop until Stop or context cancel.
+// Start 为指定 Daemon 启动后台循环：创建可取消 context，Ticker 触发 Handler，更新 LastRun；ctx.Done 时清除 Running。
 func (m *DaemonManager) Start(name string) error {
 	if m == nil {
 		return fmt.Errorf("hooks: nil DaemonManager")
@@ -109,7 +109,7 @@ func (m *DaemonManager) Start(name string) error {
 	return nil
 }
 
-// Stop cancels a single daemon.
+// Stop 取消单个 Daemon 的 context 并标记非运行（不 Wait wg，与 StartAll/StopAll 组合使用）。
 func (m *DaemonManager) Stop(name string) {
 	if m == nil {
 		return
@@ -128,7 +128,7 @@ func (m *DaemonManager) Stop(name string) {
 	m.mu.Unlock()
 }
 
-// StartAll starts every registered daemon.
+// StartAll 依次 Start 全部已注册名称，任一失败即返回（已启动的不回滚）。
 func (m *DaemonManager) StartAll() error {
 	if m == nil {
 		return fmt.Errorf("hooks: nil DaemonManager")
@@ -147,7 +147,7 @@ func (m *DaemonManager) StartAll() error {
 	return nil
 }
 
-// StopAll stops every daemon.
+// StopAll 停止全部 Daemon 并 wg.Wait 等待 goroutine 结束。
 func (m *DaemonManager) StopAll() {
 	if m == nil {
 		return
@@ -164,7 +164,7 @@ func (m *DaemonManager) StopAll() {
 	m.wg.Wait()
 }
 
-// Status returns a snapshot per daemon.
+// Status 返回各 Daemon 的 DaemonStatus 映射副本。
 func (m *DaemonManager) Status() map[string]DaemonStatus {
 	if m == nil {
 		return nil
@@ -186,7 +186,7 @@ func (m *DaemonManager) Status() map[string]DaemonStatus {
 	return out
 }
 
-// IsRunning reports whether a daemon ticker loop is active.
+// IsRunning 查询某 Daemon 是否处于 Running 状态。
 func (m *DaemonManager) IsRunning(name string) bool {
 	if m == nil {
 		return false

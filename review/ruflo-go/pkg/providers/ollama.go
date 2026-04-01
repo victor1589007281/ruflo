@@ -1,3 +1,4 @@
+// 本文件封装本地 Ollama /api/chat：适合离线推理，默认基址 localhost:11434，stream=false 取单条回复与 eval 计数作 Token 代理。
 package providers
 
 import (
@@ -15,14 +16,14 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
-// OllamaProvider calls the local Ollama /api/chat endpoint.
+// OllamaProvider 与单机 Ollama 守护进程通信。
 type OllamaProvider struct {
-	client  *http.Client
-	baseURL string
-	model   string
+	client  *http.Client // HTTP 客户端，较长超时以适配本地推理
+	baseURL string        // 去掉末尾 / 的基址
+	model   string        // 默认模型，如 llama3
 }
 
-// NewOllamaProvider uses OLLAMA_BASE_URL or http://localhost:11434.
+// NewOllamaProvider 从 OLLAMA_BASE_URL 读取基址，缺省为 http://localhost:11434。
 func NewOllamaProvider() *OllamaProvider {
 	base := os.Getenv("OLLAMA_BASE_URL")
 	if base == "" {
@@ -36,10 +37,10 @@ func NewOllamaProvider() *OllamaProvider {
 	}
 }
 
-// Name returns the provider id.
+// Name 返回 api.LLMProviderOllama。
 func (o *OllamaProvider) Name() string { return string(api.LLMProviderOllama) }
 
-// Complete performs a non-streaming chat completion.
+// Complete POST JSON，解析 message.content 与 prompt_eval_count/eval_count 填充 Usage。
 func (o *OllamaProvider) Complete(ctx context.Context, req api.LLMRequest) (*api.LLMResponse, error) {
 	msgs := make([]map[string]string, 0, len(req.Messages))
 	for _, m := range req.Messages {
@@ -109,14 +110,14 @@ func (o *OllamaProvider) Complete(ctx context.Context, req api.LLMRequest) (*api
 	}, nil
 }
 
-// StreamComplete is not implemented.
+// StreamComplete 未实现。
 func (o *OllamaProvider) StreamComplete(ctx context.Context, req api.LLMRequest) (io.ReadCloser, error) {
 	_ = ctx
 	_ = req
 	return nil, errors.New("ollama: use Complete; streaming not implemented")
 }
 
-// HealthCheck calls GET /api/tags.
+// HealthCheck GET /api/tags，非 200 返回错误。
 func (o *OllamaProvider) HealthCheck(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, o.baseURL+"/api/tags", nil)
 	if err != nil {
@@ -134,7 +135,7 @@ func (o *OllamaProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// EstimateCost returns zero for local inference.
+// EstimateCost 本地推理视为零美元，便于成本策略优先选本地。
 func (o *OllamaProvider) EstimateCost(req api.LLMRequest) float64 {
 	_ = req
 	return 0

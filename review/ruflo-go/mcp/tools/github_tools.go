@@ -1,5 +1,12 @@
 package tools
 
+// 本文件实现通过 GitHub CLI（gh）调用的 MCP 工具（github_*）。
+//
+// 设计思路：
+//   - 不直接使用 REST API，而是 exec gh，复用用户本机登录态（gh auth）。
+//   - 返回 stdout、exit_code 与 error 字符串，便于上层判断是否成功。
+//   - 依赖 PATH 中存在 gh，否则 runGh 会失败。
+
 import (
 	"context"
 	"os/exec"
@@ -9,6 +16,7 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// runGh 执行 gh 子命令；返回合并后的标准输出/错误输出、退出码及 Go 错误（含 ExitError 时解析 exit code）。
 func runGh(ctx context.Context, args ...string) (string, int, error) {
 	cmd := exec.CommandContext(ctx, "gh", args...)
 	out, err := cmd.CombinedOutput()
@@ -23,6 +31,7 @@ func runGh(ctx context.Context, args ...string) (string, int, error) {
 	return string(out), exit, nil
 }
 
+// githubTools 构造 github_* MCP 工具：仓库分析、PR、Issue、Workflow、可用性探测。
 func githubTools() []*mcp.MCPTool {
 	obj := map[string]any{"type": "object", "properties": map[string]any{}}
 	return []*mcp.MCPTool{
@@ -34,7 +43,7 @@ func githubTools() []*mcp.MCPTool {
 	}
 }
 
-// RegisterGitHubTools registers tools that shell out to the gh CLI.
+// RegisterGitHubTools 向注册表登记通过 shell 调用 gh 的 MCP 工具。
 func RegisterGitHubTools(reg *mcp.ToolRegistry) error {
 	for _, t := range githubTools() {
 		if err := reg.Register(t); err != nil {
@@ -44,6 +53,7 @@ func RegisterGitHubTools(reg *mcp.ToolRegistry) error {
 	return nil
 }
 
+// handleGitHubRepoAnalyze 处理 github_repo_analyze：可选 repo（owner/name）；gh repo view --json 基础字段。
 func handleGitHubRepoAnalyze(ctx context.Context, m map[string]any) mcp.MCPToolResult {
 	repo := strArg(m, "repo")
 	args := []string{"repo", "view", "--json", "name,description,url,defaultBranchRef"}
@@ -54,6 +64,7 @@ func handleGitHubRepoAnalyze(ctx context.Context, m map[string]any) mcp.MCPToolR
 	return mcp.MCPToolResult{OK: err == nil, Data: map[string]any{"stdout": out, "exit_code": code, "error": errString(err)}}
 }
 
+// handleGitHubPRManage 处理 github_pr_manage：action=view 时需 number；否则 gh pr list --limit 20。
 func handleGitHubPRManage(ctx context.Context, m map[string]any) mcp.MCPToolResult {
 	action := strings.ToLower(strArg(m, "action"))
 	if action == "view" {
@@ -71,6 +82,7 @@ func handleGitHubPRManage(ctx context.Context, m map[string]any) mcp.MCPToolResu
 	return mcp.MCPToolResult{OK: err == nil, Data: map[string]any{"stdout": out, "exit_code": code, "error": errString(err)}}
 }
 
+// handleGitHubIssueTrack 处理 github_issue_track：可选 state 传给 gh issue list。
 func handleGitHubIssueTrack(ctx context.Context, m map[string]any) mcp.MCPToolResult {
 	state := strArg(m, "state")
 	args := []string{"issue", "list", "--limit", "20"}
@@ -81,11 +93,13 @@ func handleGitHubIssueTrack(ctx context.Context, m map[string]any) mcp.MCPToolRe
 	return mcp.MCPToolResult{OK: err == nil, Data: map[string]any{"stdout": out, "exit_code": code, "error": errString(err)}}
 }
 
+// handleGitHubWorkflow 处理 github_workflow：gh workflow list --limit 30。
 func handleGitHubWorkflow(ctx context.Context, _ map[string]any) mcp.MCPToolResult {
 	out, code, err := runGh(ctx, "workflow", "list", "--limit", "30")
 	return mcp.MCPToolResult{OK: err == nil, Data: map[string]any{"stdout": out, "exit_code": code, "error": errString(err)}}
 }
 
+// handleGitHubMetrics 处理 github_metrics：运行 gh version，根据退出码设置 gh_available。
 func handleGitHubMetrics(ctx context.Context, _ map[string]any) mcp.MCPToolResult {
 	_, code, err := runGh(ctx, "version")
 	ok := err == nil && code == 0

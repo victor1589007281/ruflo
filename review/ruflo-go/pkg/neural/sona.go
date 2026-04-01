@@ -1,3 +1,16 @@
+// SONA（Self-Optimizing Neural Architecture，自优化神经架构）协调器实现（package neural）：
+// 将经验组织为轨迹（Trajectory）与模式（Pattern），在轨迹结束时执行类 RETRIEVE/JUDGE/DISTILL/CONSOLIDATE 管线。
+//
+// # 运行模式（与 sona_modes.go、SetMode 配合）
+//
+// 支持 real-time、balanced、research、edge、batch 等预设：通过 LearningRate、EWCLambda、缓冲上限等调节
+// 学习速度、巩固强度与资源占用。轨迹步上的置信度更新可视为对“模式价值”的在线估计；与 EWC++ 风格项配合，
+// 减轻新模式对旧模式置信度的冲击（灾难性遗忘的工程近似）。
+//
+// # 与 EWC++ 的关系
+//
+// EndTrajectory 在根据 verdict 调整置信度后，用 FisherDiagonal 近似对角 Fisher 信息，对置信度做二次型拉回，
+// 与 pkg/neural/ewc.go 中的弹性巩固思想一致（参数 λ 由 EWCLambda 控制）。
 package neural
 
 import (
@@ -10,7 +23,7 @@ import (
 	"time"
 )
 
-// SONAStats aggregates coordinator observability counters.
+// SONAStats 汇总协调器可观测指标：模式数、轨迹数、进行中的轨迹数、平均置信度、信号计数等。
 type SONAStats struct {
 	TotalPatterns      int
 	TotalTrajectories  int
@@ -19,7 +32,10 @@ type SONAStats struct {
 	SignalCount        int
 }
 
-// SONACoordinator implements RETRIEVE/JUDGE/DISTILL/CONSOLIDATE with optional JSON persistence.
+// SONACoordinator 实现轨迹采集、裁决、模式蒸馏与巩固，并可选用 PatternStore 做 JSON 持久化。
+//
+// 字段：mu 读写锁；cfg 超参；mode 当前模式名；signals/sigHead 环形缓冲实时信号；
+// trajectories 活跃轨迹；patterns 模式库；store 可选磁盘存储；ewc 巩固器（部分逻辑也在 EndTrajectory 内联）。
 type SONACoordinator struct {
 	mu           sync.RWMutex
 	cfg          SONAConfig
@@ -32,7 +48,8 @@ type SONACoordinator struct {
 	ewc          *EWCConsolidator
 }
 
-// NewSONACoordinator constructs coordinator; patternsPath may be empty to skip disk I/O.
+// NewSONACoordinator 构造协调器；patternsPath 为空则跳过磁盘 I/O。
+// 若 cfg 中 MaxSignals/MaxTrajectorySize 均未正，则回退 DefaultSONAConfig()。
 func NewSONACoordinator(cfg SONAConfig, patternsPath string) *SONACoordinator {
 	if cfg.MaxSignals <= 0 && cfg.MaxTrajectorySize <= 0 {
 		cfg = DefaultSONAConfig()
@@ -59,7 +76,7 @@ func max(a, b int) int {
 	return b
 }
 
-// RecordSignal pushes into a circular buffer.
+// RecordSignal 将信号写入环形缓冲（sigHead 递增取模）。用于实时遥测/事件流，O(1) 时间，O(cap) 空间。
 func (s *SONACoordinator) RecordSignal(sig Signal) {
 	if s == nil {
 		return
@@ -189,6 +206,7 @@ func (s *SONACoordinator) EndTrajectory(trajectoryID, verdict string) error {
 	return s.persist()
 }
 
+// judgeReward 将离散裁决映射为强化信号，驱动置信度更新方向与幅度。
 func judgeReward(verdict string) float64 {
 	switch verdict {
 	case "success", "succeeded", "ok":
@@ -538,7 +556,7 @@ func (s *SONACoordinator) GetStats() SONAStats {
 	return st
 }
 
-// Cleanup drops low-confidence patterns and completed trajectories.
+// Cleanup 删除置信度 < 0.05 的模式与已结束轨迹，并持久化。O(P+T)。
 func (s *SONACoordinator) Cleanup() {
 	if s == nil {
 		return
@@ -561,6 +579,7 @@ func (s *SONACoordinator) Cleanup() {
 	_ = s.persist()
 }
 
+// randomSONAID 生成带加密随机后缀的 id。O(1)。
 func randomSONAID(prefix string) string {
 	var b [6]byte
 	_, _ = rand.Read(b[:])

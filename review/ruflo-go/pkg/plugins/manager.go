@@ -1,3 +1,9 @@
+// Package plugins 提供基于 JSON 注册表的插件元数据管理（非动态加载 .so）。
+//
+// 设计思路：
+//   - 注册表文件默认位于 {baseDir}/.claude-flow/plugins/registry.json，与 Claude Flow 生态约定路径一致。
+//   - PluginManager 在每次 List/Install 等操作前后用互斥锁 + load/save 保证并发安全；缺失文件视为空注册表。
+//   - Install 按名称 upsert；Uninstall 过滤删除；Enable/Disable 切换 Enabled 标志。
 package plugins
 
 import (
@@ -10,25 +16,25 @@ import (
 	"sync"
 )
 
-// PluginInfo describes an installed or available plugin entry.
+// PluginInfo 描述已安装或登记的一条插件元数据（序列化至 registry.json）。
 type PluginInfo struct {
-	Name        string `json:"name"`
-	Version     string `json:"version"`
-	Description string `json:"description"`
-	Enabled     bool   `json:"enabled"`
+	Name        string `json:"name"`        // 插件唯一名称/ID
+	Version     string `json:"version"`     // 语义化版本字符串
+	Description string `json:"description"` // 人类可读说明
+	Enabled     bool   `json:"enabled"`     // 是否启用（CLI/业务可据此过滤）
 }
 
 type registryFile struct {
 	Plugins []PluginInfo `json:"plugins"`
 }
 
-// PluginManager performs file-backed plugin registry operations.
+// PluginManager 对磁盘上的插件注册表执行增删改查。
 type PluginManager struct {
-	path string
-	mu   sync.Mutex
+	path string       // registry.json 绝对路径
+	mu   sync.Mutex // 序列化 load/save 与列表遍历
 }
 
-// NewPluginManager uses .claude-flow/plugins/registry.json under baseDir (or cwd if empty).
+// NewPluginManager 在 baseDir/.claude-flow/plugins/registry.json 创建管理器；baseDir 空则使用当前工作目录。
 func NewPluginManager(baseDir string) *PluginManager {
 	if baseDir == "" {
 		baseDir, _ = os.Getwd()
@@ -37,11 +43,12 @@ func NewPluginManager(baseDir string) *PluginManager {
 	return &PluginManager{path: p}
 }
 
-// NewPluginManagerWithPath sets an explicit registry file path.
+// NewPluginManagerWithPath 使用显式注册表文件路径（便于测试或自定义布局）。
 func NewPluginManagerWithPath(registryPath string) *PluginManager {
 	return &PluginManager{path: registryPath}
 }
 
+// load 读取并反序列化注册表；文件不存在或空文件返回零值结构，不视为错误。
 func (m *PluginManager) load() (registryFile, error) {
 	var r registryFile
 	b, err := os.ReadFile(m.path)
@@ -60,6 +67,7 @@ func (m *PluginManager) load() (registryFile, error) {
 	return r, nil
 }
 
+// save 将注册表以缩进 JSON 写回 path，必要时创建父目录。
 func (m *PluginManager) save(r registryFile) error {
 	dir := filepath.Dir(m.path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -72,6 +80,7 @@ func (m *PluginManager) save(r registryFile) error {
 	return os.WriteFile(m.path, b, 0o644)
 }
 
+// indexByName 构建 插件名 → Plugins 切片下标，供 Install/Enable 等 O(1) 定位。
 func (m *PluginManager) indexByName(r registryFile) map[string]int {
 	out := make(map[string]int)
 	for i, p := range r.Plugins {
@@ -80,7 +89,7 @@ func (m *PluginManager) indexByName(r registryFile) map[string]int {
 	return out
 }
 
-// List returns all plugins from the registry file.
+// List 返回注册表中全部插件副本，按 Name 字典序排序。
 func (m *PluginManager) List() ([]PluginInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -94,7 +103,7 @@ func (m *PluginManager) List() ([]PluginInfo, error) {
 	return out, nil
 }
 
-// Install adds or updates a plugin entry (enabled by default).
+// Install 按名称新增或更新插件记录，默认 Enabled=true。
 func (m *PluginManager) Install(name, version, description string) error {
 	if name == "" {
 		return fmt.Errorf("plugins: name required")
@@ -115,7 +124,7 @@ func (m *PluginManager) Install(name, version, description string) error {
 	return m.save(r)
 }
 
-// Uninstall removes a plugin by name.
+// Uninstall 按名称从注册表移除插件（不存在则静默无操作于该条）。
 func (m *PluginManager) Uninstall(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -133,16 +142,17 @@ func (m *PluginManager) Uninstall(name string) error {
 	return m.save(r)
 }
 
-// Enable marks a plugin enabled.
+// Enable 将指定插件标记为启用。
 func (m *PluginManager) Enable(name string) error {
 	return m.setEnabled(name, true)
 }
 
-// Disable marks a plugin disabled.
+// Disable 将指定插件标记为禁用。
 func (m *PluginManager) Disable(name string) error {
 	return m.setEnabled(name, false)
 }
 
+// setEnabled 在持锁下查找名称并写入 Enabled 标志。
 func (m *PluginManager) setEnabled(name string, on bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -159,7 +169,7 @@ func (m *PluginManager) setEnabled(name string, on bool) error {
 	return m.save(r)
 }
 
-// DefaultPath is the conventional registry path relative to the project root.
+// DefaultPath 返回相对于项目根目录的约定注册表路径（.claude-flow/plugins/registry.json）。
 func DefaultPath() string {
 	return filepath.Join(".claude-flow", "plugins", "registry.json")
 }

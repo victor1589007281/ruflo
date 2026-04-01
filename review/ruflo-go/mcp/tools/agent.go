@@ -1,3 +1,5 @@
+// agent.go：agent_* MCP 工具，围绕 globalState.agents 与 agents/store.json 持久化。
+
 package tools
 
 import (
@@ -10,6 +12,7 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// agentTools 注册 spawn/list/status/terminate/health/pool/update 等代理相关工具。
 func agentTools() []*mcp.MCPTool {
 	return []*mcp.MCPTool{
 		{
@@ -204,6 +207,7 @@ func handleAgentTerminate(ctx context.Context, args json.RawMessage) (json.RawMe
 	return jsonOK(map[string]any{"ok": true, "agent": ag})
 }
 
+// handleAgentPool 按 State 聚合数量，返回总数与 by_state 分布。
 func handleAgentPool(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -220,12 +224,14 @@ func handleAgentPool(ctx context.Context, args json.RawMessage) (json.RawMessage
 	return jsonOK(map[string]any{"total": len(globalState.agents), "by_state": by})
 }
 
+// agentUpdateArgs 解析可变的 name/namespace（非空才更新）。
 type agentUpdateArgs struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	Namespace string `json:"namespace"`
 }
 
+// handleAgentUpdate 更新元数据并 saveAgentsToDisk。
 func handleAgentUpdate(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a agentUpdateArgs
@@ -253,6 +259,7 @@ func handleAgentUpdate(ctx context.Context, args json.RawMessage) (json.RawMessa
 	return jsonOK(map[string]any{"ok": true, "agent": ag})
 }
 
+// handleAgentHealth 汇总 healthy/degraded/unhealthy 数量。
 func handleAgentHealth(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args

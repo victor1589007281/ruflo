@@ -1,3 +1,6 @@
+// Package guidance 实现 Ruflo 治理（Guidance）控制面：将 CLAUDE.md 类 Markdown 编译为结构化 PolicyBundle，
+// 经 EnforcementGates 在命令/编辑/工具调用前做门控，RunLedger 记录运行审计，ProofChain 提供哈希链证明等。
+// 各子模块见 gates、ledger、optimizer、persistence、memory_gate、continue_gate、analyzer、trust、manifest_validator、evolution。
 package guidance
 
 import (
@@ -10,24 +13,26 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
+// Markdown 规则解析用正则：规则 ID、风险等级、领域标签、工具白名单片段、任务意图、路径 scope。
 var (
-	reRuleID = regexp.MustCompile(`(?m)^\s*(R\d{3})\s*:`)
-	reRisk   = regexp.MustCompile(`(?i)risk:\s*(critical|high|medium|low|info)\b`)
-	reDomain = regexp.MustCompile(`@([a-z][a-z0-9_-]*)`)
-	reTool   = regexp.MustCompile(`\[([a-z][a-z0-9_-]*)\]`)
-	reIntent = regexp.MustCompile(`#(bug-fix|feature|refactor|security|performance|testing|docs)\b`)
-	reScope  = regexp.MustCompile(`(?i)scope:\s*(\S+)`)
+	reRuleID = regexp.MustCompile(`(?m)^\s*(R\d{3})\s*:`)                                            // 形如 R001:
+	reRisk   = regexp.MustCompile(`(?i)risk:\s*(critical|high|medium|low|info)\b`)                   // risk: critical 等
+	reDomain = regexp.MustCompile(`@([a-z][a-z0-9_-]*)`)                                             // @security 类标签
+	reTool   = regexp.MustCompile(`\[([a-z][a-z0-9_-]*)\]`)                                          // [read] 工具名
+	reIntent = regexp.MustCompile(`#(bug-fix|feature|refactor|security|performance|testing|docs)\b`) // #feature
+	reScope  = regexp.MustCompile(`(?i)scope:\s*(\S+)`)                                              // scope: glob
 )
 
-// GuidanceCompiler parses CLAUDE.md-style markdown into a PolicyBundle.
+// GuidanceCompiler 无状态编译器：将根目录与本地 Markdown 合并为单一 PolicyBundle。
 type GuidanceCompiler struct{}
 
-// NewGuidanceCompiler returns a stateless compiler.
+// NewGuidanceCompiler 返回编译器实例（无内部可变状态）。
 func NewGuidanceCompiler() *GuidanceCompiler {
 	return &GuidanceCompiler{}
 }
 
-// Compile merges root and local markdown; local rules override on same ID.
+// Compile 解析 rootMD 与 localMD：按 R\d{3} 抽取规则块，local 同 ID 覆盖 root；前 60 行非空行并入 Constitution；
+// 生成 default 分片、Manifest 统计与基于全文哈希的 bundle ID。
 func (c *GuidanceCompiler) Compile(rootMD, localMD string) PolicyBundle {
 	rootRules, rootConst := parseMarkdownRules(rootMD, "root")
 	localRules, localConst := parseMarkdownRules(localMD, "local")
@@ -64,6 +69,8 @@ func (c *GuidanceCompiler) Compile(rootMD, localMD string) PolicyBundle {
 	}
 }
 
+// parseMarkdownRules 扫描 md：前 60 行构建 Constitution；按 "\n## " 分块，块内需含 R\d{3} 才视为规则；
+// 从正文提取 Risk、Domain、Tools、Intent、ScopeGlob，并生成 api.GuidanceRule（严重度由 body 关键字 block/warn 推断）。
 func parseMarkdownRules(md, source string) ([]GuidanceRule, Constitution) {
 	lines := strings.Split(md, "\n")
 	var constLines []string
@@ -121,6 +128,7 @@ func parseMarkdownRules(md, source string) ([]GuidanceRule, Constitution) {
 	return rules, Constitution{Lines: constLines, Source: source}
 }
 
+// apiRule 构造 API 层 GuidanceRule：Metadata.source 标记来源，Severity 由 body 是否含 block/warn 决定。
 func apiRule(id, title, body, source string) api.GuidanceRule {
 	sev := "info"
 	if strings.Contains(strings.ToLower(body), "block") {
@@ -137,6 +145,7 @@ func apiRule(id, title, body, source string) api.GuidanceRule {
 	}
 }
 
+// buildManifest 遍历分片统计 RuleCount、按 RiskClass 与 Intent 聚合计数，并写入创建时间。
 func buildManifest(bundleID, ver string, shards []RuleShard) RuleManifest {
 	m := RuleManifest{
 		BundleID:   bundleID,
@@ -160,11 +169,13 @@ func buildManifest(bundleID, ver string, shards []RuleShard) RuleManifest {
 	return m
 }
 
+// hashID 对输入字符串做 SHA256 并取前 12 字节十六进制作为短 ID。
 func hashID(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:12])
 }
 
+// uniqueStrings 保持首次出现顺序去重。
 func uniqueStrings(in []string) []string {
 	seen := make(map[string]struct{})
 	var out []string

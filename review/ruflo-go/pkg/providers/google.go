@@ -1,3 +1,4 @@
+// 本文件封装 Google Gemini generateContent：将 chat 角色映射为 user/model，system 合并为 systemInstruction，查询参数带 key。
 package providers
 
 import (
@@ -32,10 +33,10 @@ func NewGoogleProvider() *GoogleProvider {
 	}
 }
 
-// Name returns the provider id.
+// Name 返回 api.LLMProviderGoogle。
 func (g *GoogleProvider) Name() string { return string(api.LLMProviderGoogle) }
 
-// Complete performs a non-streaming completion.
+// Complete 组装 contents 与可选 generationConfig，POST models/{model}:generateContent。
 func (g *GoogleProvider) Complete(ctx context.Context, req api.LLMRequest) (*api.LLMResponse, error) {
 	if g.apiKey == "" {
 		return nil, errors.New("google: GOOGLE_API_KEY not set")
@@ -142,14 +143,14 @@ func (g *GoogleProvider) Complete(ctx context.Context, req api.LLMRequest) (*api
 	}, nil
 }
 
-// StreamComplete is not implemented.
+// StreamComplete 未实现。
 func (g *GoogleProvider) StreamComplete(ctx context.Context, req api.LLMRequest) (io.ReadCloser, error) {
 	_ = ctx
 	_ = req
 	return nil, errors.New("google: use Complete; streaming not implemented")
 }
 
-// HealthCheck verifies an API key is configured.
+// HealthCheck 仅检查 apiKey 非空（不发网络请求）。
 func (g *GoogleProvider) HealthCheck(ctx context.Context) error {
 	_ = ctx
 	if g.apiKey == "" {
@@ -158,7 +159,7 @@ func (g *GoogleProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// EstimateCost returns a rough USD estimate using placeholder rates.
+// EstimateCost 按内容长度/4 估输入 Token，结合 maxOutputTokens 用占位单价估算美元。
 func (g *GoogleProvider) EstimateCost(req api.LLMRequest) float64 {
 	tokens := 0
 	for _, m := range req.Messages {

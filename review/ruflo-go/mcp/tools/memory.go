@@ -1,3 +1,6 @@
+// memory.go：memory_* MCP 工具实现；在统一后端（SQLite+HNSW）可用时优先使用，否则回退到
+// globalState.memory 的进程内命名空间 map；search 在后端走向量检索，回退时为轻量子串打分。
+
 package tools
 
 import (
@@ -16,6 +19,7 @@ import (
 	"github.com/ruflo/ruflo-go/pkg/memory"
 )
 
+// memoryTools 构建 memory_store/retrieve/search/delete/list/stats/init/migrate 等工具的 MCPTool 描述与 Handler。
 func memoryTools() []*mcp.MCPTool {
 	return []*mcp.MCPTool{
 		{
@@ -118,6 +122,7 @@ func memoryTools() []*mcp.MCPTool {
 	}
 }
 
+// nsKey 将空命名空间规范为 "default"，与存储键一致。
 func nsKey(namespace string) string {
 	if namespace == "" {
 		return "default"
@@ -125,12 +130,14 @@ func nsKey(namespace string) string {
 	return namespace
 }
 
+// memStoreArgs 解析 memory_store 参数。
 type memStoreArgs struct {
 	Key       string `json:"key"`
 	Value     string `json:"value"`
 	Namespace string `json:"namespace"`
 }
 
+// handleMemoryStore 写入一条记忆：统一后端则调用 UnifiedMemoryService.Store；否则写入 globalState.memory。
 func handleMemoryStore(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a memStoreArgs
@@ -171,11 +178,13 @@ func handleMemoryStore(ctx context.Context, args json.RawMessage) (json.RawMessa
 	return jsonOK(map[string]any{"ok": true, "entry": entry})
 }
 
+// memKeyArgs 解析按 key 操作的参数（retrieve/delete）。
 type memKeyArgs struct {
 	Key       string `json:"key"`
 	Namespace string `json:"namespace"`
 }
 
+// handleMemoryRetrieve 按键读取条目；统一后端未命中返回错误，map 回退返回 not found。
 func handleMemoryRetrieve(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a memKeyArgs
@@ -211,6 +220,7 @@ func handleMemoryRetrieve(ctx context.Context, args json.RawMessage) (json.RawMe
 	return jsonOK(map[string]any{"entry": e})
 }
 
+// memSearchArgs 解析 memory_search 参数；Limit/Threshold 有默认值。
 type memSearchArgs struct {
 	Query     string  `json:"query"`
 	Namespace string  `json:"namespace"`
@@ -218,6 +228,7 @@ type memSearchArgs struct {
 	Threshold float64 `json:"threshold"`
 }
 
+// handleMemorySearch 按查询检索：后端走向量搜索；回退时对 key+value 做子串与分词匹配并排序截断。
 func handleMemorySearch(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a memSearchArgs
@@ -274,6 +285,7 @@ func handleMemorySearch(ctx context.Context, args json.RawMessage) (json.RawMess
 	return jsonOK(map[string]any{"results": res, "count": len(res)})
 }
 
+// substringScore 为回退搜索提供 0~1 的简单相关性：整句包含为 1，否则按分词命中比例。
 func substringScore(query, hay string) float64 {
 	if query == "" {
 		return 1
@@ -294,6 +306,7 @@ func substringScore(query, hay string) float64 {
 	return float64(matched) / float64(len(parts))
 }
 
+// handleMemoryDelete 删除指定 key；统一后端或 map 回退均支持。
 func handleMemoryDelete(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a memKeyArgs
@@ -325,11 +338,13 @@ func handleMemoryDelete(ctx context.Context, args json.RawMessage) (json.RawMess
 	return jsonOK(map[string]any{"ok": ok, "deleted": ok})
 }
 
+// memListArgs 解析 memory_list 的分页与命名空间。
 type memListArgs struct {
 	Namespace string `json:"namespace"`
 	Limit     int    `json:"limit"`
 }
 
+// handleMemoryList 列出命名空间下的 key 列表（有序截断）。
 func handleMemoryList(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a memListArgs
@@ -366,6 +381,7 @@ func handleMemoryList(ctx context.Context, args json.RawMessage) (json.RawMessag
 	return jsonOK(map[string]any{"keys": keys, "count": len(keys)})
 }
 
+// handleMemoryStats 返回统一后端统计或进程内 map 的条目/命名空间概览。
 func handleMemoryStats(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -395,10 +411,12 @@ func handleMemoryStats(ctx context.Context, args json.RawMessage) (json.RawMessa
 	})
 }
 
+// memInitArgs 解析 memory_init 的 force 标志。
 type memInitArgs struct {
 	Force bool `json:"force"`
 }
 
+// handleMemoryInit 调用 ReopenMemory 重建统一后端，并清空进程内 memory map、标记已初始化。
 func handleMemoryInit(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a memInitArgs
@@ -413,10 +431,12 @@ func handleMemoryInit(ctx context.Context, args json.RawMessage) (json.RawMessag
 	return jsonOK(map[string]any{"ok": true, "initialized": true, "force": a.Force, "backend": "sqlite+hnsw"})
 }
 
+// memMigrateArgs 控制是否将导出 JSON 再导入统一后端。
 type memMigrateArgs struct {
 	ImportUnified bool `json:"import_unified"`
 }
 
+// handleMemoryMigrate 将当前进程内 memory map 导出到 dataDir/memory/migrate-export.json；可选导入 unified。
 func handleMemoryMigrate(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a memMigrateArgs

@@ -1,5 +1,11 @@
 package tools
 
+// 本文件实现 DAA（Dynamic Agent Architecture）相关的文件持久化 MCP 工具（daa_*）。
+//
+// 设计思路：
+//   - 将代理元数据、工作流记录、知识片段与指标聚合存入 daa/state.json，供编排层做轻量审计与学习状态展示。
+//   - 执行为追加/更新式记录，非完整多代理运行时；工作流 execute 通过 id 线性扫描更新状态字段。
+
 import (
 	"context"
 	"encoding/json"
@@ -12,6 +18,7 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// daaStateFile 为 DAA 持久化文件的 JSON 结构：代理列表、工作流、知识与指标。
 type daaStateFile struct {
 	Agents    []map[string]any `json:"agents"`
 	Workflows []map[string]any `json:"workflows"`
@@ -21,14 +28,17 @@ type daaStateFile struct {
 }
 
 var (
-	daaMu   sync.Mutex
+	daaMu sync.Mutex
+	// daaData 进程内 DAA 状态；Metrics 默认非 nil。
 	daaData = &daaStateFile{Metrics: map[string]any{}}
 )
 
+// daaPath 返回 DAA 状态文件路径。
 func daaPath() string {
 	return filepath.Join(resolveDataDir(), "daa", "state.json")
 }
 
+// daaLoad 从磁盘加载 DAA 状态；失败时保留内存现状。
 func daaLoad() {
 	daaMu.Lock()
 	defer daaMu.Unlock()
@@ -45,6 +55,7 @@ func daaLoad() {
 	}
 }
 
+// daaSave 将 Agents/Workflows/Knowledge/Metrics 快照写入磁盘。
 func daaSave() error {
 	daaMu.Lock()
 	daaData.UpdatedAt = now()
@@ -62,6 +73,7 @@ func daaSave() error {
 	return writeJSONFile(daaPath(), cp)
 }
 
+// daaTools 构造 daa_* MCP 工具定义。
 func daaTools() []*mcp.MCPTool {
 	daaLoad()
 	return []*mcp.MCPTool{
@@ -76,7 +88,7 @@ func daaTools() []*mcp.MCPTool {
 	}
 }
 
-// RegisterDAATools registers Dynamic Agent Architecture file-backed tools.
+// RegisterDAATools 向注册表登记 DAA 文件持久化 MCP 工具。
 func RegisterDAATools(reg *mcp.ToolRegistry) error {
 	for _, t := range daaTools() {
 		if err := reg.Register(t); err != nil {
@@ -86,6 +98,7 @@ func RegisterDAATools(reg *mcp.ToolRegistry) error {
 	return nil
 }
 
+// handleDAAAgentCreate 处理 daa_agent_create：name、role 为代理标识；name 默认 agent，写入 Agents 并保存。
 func handleDAAAgentCreate(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	name := strArg(m, "name")
 	if name == "" {
@@ -99,6 +112,7 @@ func handleDAAAgentCreate(_ context.Context, m map[string]any) mcp.MCPToolResult
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"agent": rec}}
 }
 
+// handleDAAAgentAdapt 处理 daa_agent_adapt：记录 agent 与 delta 到 Metrics（最近适应事件）。
 func handleDAAAgentAdapt(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	daaMu.Lock()
 	daaData.Metrics["last_adapt_agent"] = strArg(m, "agent")
@@ -108,6 +122,7 @@ func handleDAAAgentAdapt(_ context.Context, m map[string]any) mcp.MCPToolResult 
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"adapted": true}}
 }
 
+// handleDAAWorkflowCreate 处理 daa_workflow_create：name 默认 workflow，生成纳秒级 id，状态 created。
 func handleDAAWorkflowCreate(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	name := strArg(m, "name")
 	if name == "" {
@@ -122,6 +137,7 @@ func handleDAAWorkflowCreate(_ context.Context, m map[string]any) mcp.MCPToolRes
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"workflow": rec}}
 }
 
+// handleDAAWorkflowExecute 处理 daa_workflow_execute：参数 id，将匹配工作流 status 置为 executed 并写 executed_at。
 func handleDAAWorkflowExecute(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	id := strArg(m, "id")
 	daaMu.Lock()
@@ -136,6 +152,7 @@ func handleDAAWorkflowExecute(_ context.Context, m map[string]any) mcp.MCPToolRe
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"id": id, "executed": true}}
 }
 
+// handleDAAKnowledgeShare 处理 daa_knowledge_share：topic、content 写入 Knowledge，超长裁剪至 500 条。
 func handleDAAKnowledgeShare(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	rec := map[string]any{"topic": strArg(m, "topic"), "content": strArg(m, "content"), "at": now()}
 	daaMu.Lock()
@@ -148,6 +165,7 @@ func handleDAAKnowledgeShare(_ context.Context, m map[string]any) mcp.MCPToolRes
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"shared": true}}
 }
 
+// handleDAALearningStatus 处理 daa_learning_status：返回 agents/workflows/knowledge 数量统计。
 func handleDAALearningStatus(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	daaMu.Lock()
 	nA, nW, nK := len(daaData.Agents), len(daaData.Workflows), len(daaData.Knowledge)
@@ -155,6 +173,7 @@ func handleDAALearningStatus(_ context.Context, _ map[string]any) mcp.MCPToolRes
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"agents": nA, "workflows": nW, "knowledge": nK}}
 }
 
+// handleDAACognitivePattern 处理 daa_cognitive_pattern：参数 pattern（必填）写入 Metrics.last_cognitive_pattern。
 func handleDAACognitivePattern(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	p := strArg(m, "pattern")
 	if p == "" {
@@ -170,6 +189,7 @@ func handleDAACognitivePattern(_ context.Context, m map[string]any) mcp.MCPToolR
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"pattern": p}}
 }
 
+// handleDAAPerformanceMetrics 处理 daa_performance_metrics：可选 key/value 写入指标；始终返回 metrics 全量副本；有 key 时保存。
 func handleDAAPerformanceMetrics(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	key := strArg(m, "key")
 	daaMu.Lock()

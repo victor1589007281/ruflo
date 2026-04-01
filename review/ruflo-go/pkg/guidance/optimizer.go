@@ -6,21 +6,24 @@ import (
 	"sync"
 )
 
-// OptimizerLoop ranks violations, proposes rule tweaks, scores rules, and promotes locals to root.
+// 本文件：规则优化器。基于违规反馈生成 Markdown 风格规则补丁建议；EvaluateRule 用子串覆盖度打分；
+// PromoteRule 累计本地规则“获胜”次数与分数，满足阈值后建议提升到根策略（由上层持久化）。
+
+// OptimizerLoop 维护规则得分与晋升计数，与 RankViolations 排序一致。
 type OptimizerLoop struct {
-	mu               sync.Mutex
-	promoteThreshold float64
-	winsNeeded       int
-	ruleWins         map[string]int
-	ruleScores       map[string]float64
+	mu               sync.Mutex         // 保护阈值与 map
+	promoteThreshold float64            // PromoteRule 单次得分达标阈值
+	winsNeeded       int                // 达标次数达到此值且最新分仍 > 阈值则建议晋升
+	ruleWins         map[string]int     // 规则 ID -> 达标触发次数
+	ruleScores       map[string]float64 // 规则 ID -> 最近得分
 }
 
-// ViolationPrioritySort applies the same frequency×severity ordering as the package-level RankViolations function.
+// ViolationPrioritySort 委托包级 RankViolations，保持与账本相同的违规排序。
 func (*OptimizerLoop) ViolationPrioritySort(violations []Violation) []Violation {
 	return RankViolations(violations)
 }
 
-// NewOptimizerLoop returns a loop with default promotion gates (score > 0.85 after 5 wins).
+// NewOptimizerLoop 默认 promoteThreshold=0.85、winsNeeded=5。
 func NewOptimizerLoop() *OptimizerLoop {
 	return &OptimizerLoop{
 		promoteThreshold: 0.85,
@@ -30,7 +33,7 @@ func NewOptimizerLoop() *OptimizerLoop {
 	}
 }
 
-// ProposeRuleChange suggests a markdown-style rule adjustment for a recurring violation.
+// ProposeRuleChange 根据违规生成可粘贴的 Markdown 规则草案（含 severity、description、expression 占位）。
 func (o *OptimizerLoop) ProposeRuleChange(v Violation) string {
 	sev := string(v.Severity)
 	if sev == "" {
@@ -40,6 +43,7 @@ func (o *OptimizerLoop) ProposeRuleChange(v Violation) string {
 		sanitizeID(v.RuleID), sev, shorten(v.Message, 80), v.RuleID, shorten(v.Message, 40))
 }
 
+// sanitizeID 将 ID 规范为字母数字与连字符。
 func sanitizeID(s string) string {
 	s = strings.Map(func(r rune) rune {
 		switch {
@@ -56,6 +60,7 @@ func sanitizeID(s string) string {
 	return s
 }
 
+// shorten 截断并加省略号。
 func shorten(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= n {
@@ -64,7 +69,7 @@ func shorten(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// EvaluateRule scores how well a rule's text covers the given test case strings (0–1).
+// EvaluateRule 将规则 Name/Description/Expression 拼接为小写文本，统计 testCases 中有多少子串被包含；无用例时返回 0.5。
 func (*OptimizerLoop) EvaluateRule(rule GuidanceRule, testCases []string) float64 {
 	if len(testCases) == 0 {
 		return 0.5
@@ -83,7 +88,7 @@ func (*OptimizerLoop) EvaluateRule(rule GuidanceRule, testCases []string) float6
 	return float64(hits) / float64(len(testCases))
 }
 
-// PromoteRule records a win for a local rule id; returns true if it should be promoted to root.
+// PromoteRule 当 score≥promoteThreshold 时递增 ruleWins 并记录 ruleScores；若 wins≥winsNeeded 且分仍>阈值则返回 true 表示建议晋升。
 func (o *OptimizerLoop) PromoteRule(localRuleID string, score float64) bool {
 	if localRuleID == "" {
 		return false
@@ -97,7 +102,7 @@ func (o *OptimizerLoop) PromoteRule(localRuleID string, score float64) bool {
 	return o.ruleWins[localRuleID] >= o.winsNeeded && o.ruleScores[localRuleID] > o.promoteThreshold
 }
 
-// SetPromotionPolicy updates thresholds used by PromoteRule.
+// SetPromotionPolicy 更新晋升策略（仅接受正数参数）。
 func (o *OptimizerLoop) SetPromotionPolicy(minScore float64, wins int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()

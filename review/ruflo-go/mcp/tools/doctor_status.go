@@ -12,6 +12,13 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// 本文件：Doctor 环境检查与编排运行时状态概览 MCP 工具。
+//
+// 设计思路：doctor_check 通过子进程探测 node/git、配置文件存在性、内存占位、当前工作目录可用磁盘空间（依赖
+// diskFreeBytes 平台实现）、Go 运行时版本；daemon 项为进程内占位说明。status_overview 聚合 globalState
+// 中代理、蜂群、会话、记忆条目与神经模式数量，并提示配置路径线索。
+
+// doctorTool 注册 doctor_check：可选 config_path，执行本地多维度健康检查并返回 checks 数组。
 func doctorTool() *mcp.MCPTool {
 	return &mcp.MCPTool{
 		Name:        "doctor_check",
@@ -26,6 +33,7 @@ func doctorTool() *mcp.MCPTool {
 	}
 }
 
+// statusTool 注册 status_overview：无入参，返回编排运行时聚合计数与路径提示。
 func statusTool() *mcp.MCPTool {
 	return &mcp.MCPTool{
 		Name:        "status_overview",
@@ -38,10 +46,13 @@ func statusTool() *mcp.MCPTool {
 	}
 }
 
+// doctorArgs 为 doctor_check 的可选 JSON 入参：config_path 指定要检查的配置文件路径，空则默认 claude-flow.config.json。
 type doctorArgs struct {
 	ConfigPath string `json:"config_path"`
 }
 
+// handleDoctorCheck 逐项收集检查结果（node、git、config_file、daemon、memory_db、disk、go_runtime），
+// 解析失败不中断；config_path 空时使用默认文件名；磁盘检查基于 Getwd 与 diskFreeBytes。
 func handleDoctorCheck(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a doctorArgs
@@ -111,6 +122,7 @@ func handleDoctorCheck(ctx context.Context, args json.RawMessage) (json.RawMessa
 	return jsonOK(map[string]any{"checks": checks})
 }
 
+// errString 将 error 转为字符串，nil 时返回空串，供检查结果 detail 字段使用。
 func errString(err error) string {
 	if err == nil {
 		return ""
@@ -118,6 +130,8 @@ func errString(err error) string {
 	return err.Error()
 }
 
+// handleStatusOverview 在读锁下统计 agents/swarms/sessions、跨 namespace 的 memory 条目总数、
+// neural.Patterns 数量，并返回 cwd 与 claude-flow.config.json 的拼接提示路径。
 func handleStatusOverview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args

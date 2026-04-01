@@ -8,6 +8,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 cleanup 命令：删除当前项目下 .claude-flow 目录（可选 dry-run 仅打印将删除路径）。
+
+// newCleanupCmd 构建「cleanup」命令，支持 --dry-run。
 func newCleanupCmd() *cobra.Command {
 	var dryRun bool
 	c := &cobra.Command{

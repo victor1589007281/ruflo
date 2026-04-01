@@ -1,89 +1,91 @@
+// 查询构建器（memory 包）：Fluent API 链式调用组装 api.SearchOptions，与 MemoryService.Search 配合；
+// Build 复制 map/slice 避免外部篡改；QueryTemplates 预置 patterns/代码相似度等常用查询形态。
 package memory
 
 import "github.com/ruflo/ruflo-go/api"
 
-// QueryBuilder is a fluent helper for api.SearchOptions used with MemoryService.Search.
+// QueryBuilder 累积检索条件，最终 Build 为 api.SearchOptions。
 type QueryBuilder struct {
-	namespace  string
-	query      string
-	tags       []string
-	limit      int
-	offset     int
-	minScore   float64
-	orderBy    string
-	descending bool
-	filters    map[string]string
+	namespace  string            // 命名空间过滤
+	query      string            // 语义检索文本（传给 Search 的首参）
+	tags       []string          // 要求条目包含的标签（AND）
+	limit      int               // 对应 SearchOptions.K
+	offset     int               // 分页偏移
+	minScore   float64           // 最低相似度阈值
+	orderBy    string            // 排序字段：updated_at/created_at/score 等
+	descending bool              // 是否降序
+	filters    map[string]string // 元数据等值过滤
 }
 
-// Query starts a new builder with defaults (limit 10, minScore 0).
+// Query 新建构建器，默认 limit=10、minScore=0。
 func Query() *QueryBuilder {
 	return &QueryBuilder{limit: 10, minScore: 0.0}
 }
 
-// NewQueryBuilder is an alias for Query for fluent construction.
+// NewQueryBuilder 与 Query 等价，便于命名风格统一。
 func NewQueryBuilder() *QueryBuilder {
 	return Query()
 }
 
-// DefaultMemoryQuery returns a builder for the default namespace with limit 50.
+// DefaultMemoryQuery 预置 namespace=default、limit=50。
 func DefaultMemoryQuery() *QueryBuilder {
 	return Query().Namespace("default").Limit(50).Offset(0)
 }
 
-// Namespace sets the memory namespace filter.
+// Namespace 设置命名空间并返回自身以链式调用。
 func (q *QueryBuilder) Namespace(ns string) *QueryBuilder {
 	q.namespace = ns
 	return q
 }
 
-// Text sets the semantic search query text (use QueryText with Search).
+// Text 设置语义查询字符串；实际检索时与 QueryText 配合传入 Search。
 func (q *QueryBuilder) Text(query string) *QueryBuilder {
 	q.query = query
 	return q
 }
 
-// QueryText returns the text set by Text for use as the first argument to Search.
+// QueryText 取出 Text 保存的查询串。
 func (q *QueryBuilder) QueryText() string {
 	return q.query
 }
 
-// WithTags requires all listed tags on matching entries.
+// WithTags 追加标签约束（条目须同时包含所给标签）。
 func (q *QueryBuilder) WithTags(tags ...string) *QueryBuilder {
 	q.tags = append(q.tags, tags...)
 	return q
 }
 
-// WithTag appends a single tag (alias for WithTags).
+// WithTag 单标签便捷方法。
 func (q *QueryBuilder) WithTag(tag string) *QueryBuilder {
 	return q.WithTags(tag)
 }
 
-// Limit sets the maximum number of results (maps to SearchOptions.K).
+// Limit 设置返回条数上限 K。
 func (q *QueryBuilder) Limit(n int) *QueryBuilder {
 	q.limit = n
 	return q
 }
 
-// Offset skips the first n results after filtering and ordering.
+// Offset 在过滤与排序后跳过前 n 条。
 func (q *QueryBuilder) Offset(n int) *QueryBuilder {
 	q.offset = n
 	return q
 }
 
-// MinScore sets the minimum vector similarity score (0–1).
+// MinScore 设置向量相似度下限（实现中为 1-距离）。
 func (q *QueryBuilder) MinScore(s float64) *QueryBuilder {
 	q.minScore = s
 	return q
 }
 
-// OrderBy sets sort field (e.g. updated_at, created_at, score) and direction.
+// OrderBy 指定排序字段与升降序，交由 Search 内 sort.SliceStable 解释。
 func (q *QueryBuilder) OrderBy(field string, desc bool) *QueryBuilder {
 	q.orderBy = field
 	q.descending = desc
 	return q
 }
 
-// Filter adds a metadata equality constraint.
+// Filter 增加一条元数据等值条件（懒创建 filters map）。
 func (q *QueryBuilder) Filter(key, value string) *QueryBuilder {
 	if q.filters == nil {
 		q.filters = map[string]string{}
@@ -92,7 +94,7 @@ func (q *QueryBuilder) Filter(key, value string) *QueryBuilder {
 	return q
 }
 
-// Build produces api.SearchOptions for MemoryService.Search(query, opts).
+// Build 拷贝内部状态到值类型 SearchOptions，避免外部持有内部 map 引用。
 func (q *QueryBuilder) Build() api.SearchOptions {
 	k := q.limit
 	if k <= 0 {

@@ -8,6 +8,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 plugins 命令组：管理 .claude-flow/plugins/ 下的插件清单，封装 PluginManager 的列表、安装、卸载、启用、禁用。
+
+// newPluginsCmd 构建「plugins」根子命令，创建默认 PluginManager 并挂载 list/install/uninstall/enable/disable。
 func newPluginsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plugins",
@@ -24,6 +27,7 @@ func newPluginsCmd() *cobra.Command {
 	return cmd
 }
 
+// pluginsListCmd 列出已安装插件，JSON 或制表文本，含启用状态与描述。
 func pluginsListCmd(mgr *plugins.PluginManager) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -54,6 +58,7 @@ func pluginsListCmd(mgr *plugins.PluginManager) *cobra.Command {
 	}
 }
 
+// pluginsInstallCmd 安装或更新插件元数据，缺省版本号为 0.0.0。
 func pluginsInstallCmd(mgr *plugins.PluginManager) *cobra.Command {
 	var name, version, desc string
 	c := &cobra.Command{
@@ -75,6 +80,7 @@ func pluginsInstallCmd(mgr *plugins.PluginManager) *cobra.Command {
 	return c
 }
 
+// pluginsUninstallCmd 按名称卸载插件。
 func pluginsUninstallCmd(mgr *plugins.PluginManager) *cobra.Command {
 	var name string
 	c := &cobra.Command{
@@ -91,6 +97,7 @@ func pluginsUninstallCmd(mgr *plugins.PluginManager) *cobra.Command {
 	return c
 }
 
+// pluginsEnableCmd 启用指定插件。
 func pluginsEnableCmd(mgr *plugins.PluginManager) *cobra.Command {
 	var name string
 	c := &cobra.Command{
@@ -107,6 +114,7 @@ func pluginsEnableCmd(mgr *plugins.PluginManager) *cobra.Command {
 	return c
 }
 
+// pluginsDisableCmd 禁用指定插件。
 func pluginsDisableCmd(mgr *plugins.PluginManager) *cobra.Command {
 	var name string
 	c := &cobra.Command{

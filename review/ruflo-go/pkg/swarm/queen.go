@@ -1,3 +1,5 @@
+// 蜂后协调器（swarm 包）：类比蜂群中的 Queen，负责任务类型驱动的子任务拆解、候选 Agent 多因子加权排序、
+// 周期性瓶颈扫描与共识模式（全票/多数/加权等）聚合；可注入 consensusFn 自定义投票结算逻辑。
 package swarm
 
 import (
@@ -11,41 +13,41 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
-// QueenMode selects how the queen resolves collective decisions.
+// QueenMode 蜂后聚合投票时的策略枚举。
 type QueenMode string
 
 const (
-	QueenOverride   QueenMode = "queen-override"
-	QueenUnanimous  QueenMode = "unanimous"
-	QueenSuperMajor QueenMode = "supermajority"
-	QueenMajority   QueenMode = "majority"
-	QueenWeighted   QueenMode = "weighted"
+	QueenOverride   QueenMode = "queen-override" // 强制通过（忽略票型）
+	QueenUnanimous  QueenMode = "unanimous"      // 全票赞成
+	QueenSuperMajor QueenMode = "supermajority"  // ≥66% 赞成
+	QueenMajority   QueenMode = "majority"       // >50% 赞成
+	QueenWeighted   QueenMode = "weighted"       // 按权重比例
 )
 
-// OutcomeRecord is one queen-tracked task outcome for analytics.
+// OutcomeRecord 单次任务结果审计：关联模式键与成功标记。
 type OutcomeRecord struct {
-	Task       api.TaskDefinition
-	PatternKey string
-	Success    bool
-	RecordedAt time.Time
+	Task       api.TaskDefinition // 任务快照
+	PatternKey string             // 学习/模式索引键
+	Success    bool               // 是否成功
+	RecordedAt time.Time          // UTC 记录时间
 }
 
-// QueenCoordinator performs hierarchical task decomposition and delegation.
+// QueenCoordinator 维护 agents 视图、历史任务、模式计数与健康摘要。
 type QueenCoordinator struct {
 	mu sync.RWMutex
 
-	agents   map[string]*api.Agent
-	history  []api.TaskDefinition
-	patterns map[string]int
+	agents   map[string]*api.Agent // id -> Agent
+	history  []api.TaskDefinition  // 时间序任务历史
+	patterns map[string]int        // 模式键出现频次
 
-	outcomes         []OutcomeRecord
-	lastHealthReport map[string]any
-	initialized      bool
+	outcomes         []OutcomeRecord // 结构化结果轨迹
+	lastHealthReport map[string]any  // 最近一次瓶颈扫描摘要
+	initialized      bool            // Initialize 幂等标记
 
-	consensusFn func(ctx context.Context, mode QueenMode, weights map[string]float64, votes map[string]bool) (bool, error)
+	consensusFn func(ctx context.Context, mode QueenMode, weights map[string]float64, votes map[string]bool) (bool, error) // 可插拔结算
 }
 
-// NewQueenCoordinator constructs a queen with optional consensus hook.
+// NewQueenCoordinator consensusFn 为空时使用 defaultQueenConsensus。
 func NewQueenCoordinator(consensusFn func(ctx context.Context, mode QueenMode, weights map[string]float64, votes map[string]bool) (bool, error)) *QueenCoordinator {
 	if consensusFn == nil {
 		consensusFn = defaultQueenConsensus
@@ -60,7 +62,7 @@ func NewQueenCoordinator(consensusFn func(ctx context.Context, mode QueenMode, w
 	}
 }
 
-// Initialize marks the queen ready for coordination (idempotent).
+// Initialize 置 initialized 并确保 lastHealthReport 非 nil。
 func (q *QueenCoordinator) Initialize(ctx context.Context) error {
 	_ = ctx
 	q.mu.Lock()
@@ -72,7 +74,7 @@ func (q *QueenCoordinator) Initialize(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown clears runtime state; consensus hook is left intact.
+// Shutdown 清空 agents 与 initialized；不替换 consensusFn。
 func (q *QueenCoordinator) Shutdown() error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -81,7 +83,7 @@ func (q *QueenCoordinator) Shutdown() error {
 	return nil
 }
 
-// GetLastHealthReport returns the most recent bottleneck scan summary.
+// GetLastHealthReport 浅拷贝 map 供外部只读遍历。
 func (q *QueenCoordinator) GetLastHealthReport() map[string]any {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -92,7 +94,7 @@ func (q *QueenCoordinator) GetLastHealthReport() map[string]any {
 	return out
 }
 
-// GetOutcomeHistory returns recorded outcomes (newest last).
+// GetOutcomeHistory 拷贝 outcomes 切片。
 func (q *QueenCoordinator) GetOutcomeHistory() []OutcomeRecord {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -101,7 +103,7 @@ func (q *QueenCoordinator) GetOutcomeHistory() []OutcomeRecord {
 	return cp
 }
 
-// GetPerformanceStats summarizes pattern usage and swarm size.
+// GetPerformanceStats 返回规模与 pattern 键数量等粗粒度指标。
 func (q *QueenCoordinator) GetPerformanceStats() map[string]any {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -114,14 +116,14 @@ func (q *QueenCoordinator) GetPerformanceStats() map[string]any {
 	return stats
 }
 
-// RegisterAgent adds an agent visible to the queen.
+// RegisterAgent 以 Agent.ID 为主键覆盖写入。
 func (q *QueenCoordinator) RegisterAgent(a *api.Agent) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.agents[a.ID] = a
 }
 
-// AnalyzeTask decomposes a task into subtasks by type.
+// AnalyzeTask 按父任务类型生成子任务 DAG 的扁平列表（固定模板：编码/测试/安全等分支）。
 func (q *QueenCoordinator) AnalyzeTask(parent *api.TaskDefinition) []*api.TaskDefinition {
 	if parent == nil {
 		return nil
@@ -151,6 +153,7 @@ func (q *QueenCoordinator) AnalyzeTask(parent *api.TaskDefinition) []*api.TaskDe
 	}
 }
 
+// cloneLabels 深拷贝标签 map。
 func cloneLabels(m map[string]string) map[string]string {
 	if m == nil {
 		return nil
@@ -162,7 +165,7 @@ func cloneLabels(m map[string]string) map[string]string {
 	return out
 }
 
-// DelegateToAgents ranks agents: capability 0.30, load 0.20, performance 0.25, health 0.15, availability 0.10.
+// DelegateToAgents 对 candidates 计算加权分：能力0.30、负载0.20、绩效0.25、健康0.15、可用性0.10，降序返回 id。
 func (q *QueenCoordinator) DelegateToAgents(task *api.TaskDefinition, candidates []string) ([]string, error) {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -198,6 +201,7 @@ func (q *QueenCoordinator) DelegateToAgents(task *api.TaskDefinition, candidates
 	return ids, nil
 }
 
+// matchCapabilityScore 精确技能匹配 1.0，域级弱匹配 0.6，否则 0.2。
 func matchCapabilityScore(ag *api.Agent, task *api.TaskDefinition) float64 {
 	ts := string(task.Type)
 	for _, c := range agentCapabilities(ag) {
@@ -211,6 +215,7 @@ func matchCapabilityScore(ag *api.Agent, task *api.TaskDefinition) float64 {
 	return 0.2
 }
 
+// performanceScore 用完成任务占比估计成功率，无历史返回 0.5。
 func performanceScore(ag *api.Agent) float64 {
 	t := float64(ag.Metrics.TasksCompleted + ag.Metrics.TasksFailed)
 	if t == 0 {
@@ -219,6 +224,7 @@ func performanceScore(ag *api.Agent) float64 {
 	return float64(ag.Metrics.TasksCompleted) / t
 }
 
+// availabilityScore Idle=1，Busy/Running=0.5，其余 0.1。
 func availabilityScore(ag *api.Agent) float64 {
 	switch ag.State {
 	case api.AgentStateIdle:
@@ -230,7 +236,7 @@ func availabilityScore(ag *api.Agent) float64 {
 	}
 }
 
-// MonitorHealth runs on interval; returns alerts for bottlenecks (blocking until ctx done).
+// MonitorHealth 定时调用 scanBottlenecks，ctx 取消时返回累积 alerts（阻塞型循环）。
 func (q *QueenCoordinator) MonitorHealth(ctx context.Context, interval time.Duration) []string {
 	if interval <= 0 {
 		interval = 10 * time.Second
@@ -248,6 +254,7 @@ func (q *QueenCoordinator) MonitorHealth(ctx context.Context, interval time.Dura
 	}
 }
 
+// scanBottlenecks 统计高负载 Agent 与全局忙碌比例，写入 lastHealthReport。
 func (q *QueenCoordinator) scanBottlenecks() []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -272,11 +279,12 @@ func (q *QueenCoordinator) scanBottlenecks() []string {
 	return alerts
 }
 
-// CoordinateConsensus applies queen-selected aggregation mode.
+// CoordinateConsensus 转调注入的 consensusFn。
 func (q *QueenCoordinator) CoordinateConsensus(ctx context.Context, mode QueenMode, weights map[string]float64, votes map[string]bool) (bool, error) {
 	return q.consensusFn(ctx, mode, weights, votes)
 }
 
+// defaultQueenConsensus 内置 QueenOverride/全票/超多数/简单多数/加权多数逻辑。
 func defaultQueenConsensus(_ context.Context, mode QueenMode, weights map[string]float64, votes map[string]bool) (bool, error) {
 	switch mode {
 	case QueenOverride:
@@ -309,6 +317,7 @@ func defaultQueenConsensus(_ context.Context, mode QueenMode, weights map[string
 	}
 }
 
+// ratioApproved 赞成票占比。
 func ratioApproved(votes map[string]bool) float64 {
 	if len(votes) == 0 {
 		return 0
@@ -322,7 +331,7 @@ func ratioApproved(votes map[string]bool) float64 {
 	return float64(n) / float64(len(votes))
 }
 
-// RecordOutcome appends history and increments pattern key frequency.
+// RecordOutcome 追加 history/outcomes，并 patterns[patternKey]++，成功额外 patterns[patternKey+":ok"]++。
 func (q *QueenCoordinator) RecordOutcome(task api.TaskDefinition, patternKey string, success bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -341,7 +350,7 @@ func (q *QueenCoordinator) RecordOutcome(task api.TaskDefinition, patternKey str
 	}
 }
 
-// HistorySnapshot returns recent tasks up to n.
+// HistorySnapshot 取 history 尾部 n 条（n 非法时取全长）。
 func (q *QueenCoordinator) HistorySnapshot(n int) []api.TaskDefinition {
 	q.mu.RLock()
 	defer q.mu.RUnlock()

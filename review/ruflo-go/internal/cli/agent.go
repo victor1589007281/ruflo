@@ -7,6 +7,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 agent 命令组：编排代理的注册、列举、状态查询、停止与健康汇总，均通过 MCP 工具 agent_* 与后端交互。
+
+// newAgentCmd 构建「agent」根子命令，挂载 spawn、list、status、stop、health。
 func newAgentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agent",
@@ -22,6 +25,7 @@ func newAgentCmd() *cobra.Command {
 	return cmd
 }
 
+// agentSpawnCmd 注册新代理：调用 agent_spawn，要求 --type 与 --name，可选 namespace。
 func agentSpawnCmd() *cobra.Command {
 	var typ, name, namespace string
 	c := &cobra.Command{
@@ -45,6 +49,7 @@ func agentSpawnCmd() *cobra.Command {
 	return c
 }
 
+// agentListCmd 列出代理，支持 --filter 按状态等过滤，对应 agent_list。
 func agentListCmd() *cobra.Command {
 	var filter string
 	c := &cobra.Command{
@@ -87,6 +92,7 @@ func agentStatusCmd() *cobra.Command {
 	return c
 }
 
+// agentStopCmd 终止代理：必须提供 id（--id 或首参），调用 agent_terminate。
 func agentStopCmd() *cobra.Command {
 	var id string
 	c := &cobra.Command{
@@ -112,6 +118,7 @@ func agentStopCmd() *cobra.Command {
 	return c
 }
 
+// agentHealthCmd 输出代理子系统健康摘要，调用 agent_health。
 func agentHealthCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "health",

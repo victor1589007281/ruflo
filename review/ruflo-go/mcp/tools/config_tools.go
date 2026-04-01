@@ -22,14 +22,17 @@ var (
 	}
 )
 
+// configStorePath 返回 dataDir/config/mcp-config.json。
 func configStorePath() string {
 	return filepath.Join(resolveDataDir(), "config", "mcp-config.json")
 }
 
+// configFile 为落盘的 JSON 结构，仅包含 string 键值对 Values。
 type configFile struct {
 	Values map[string]string `json:"values"`
 }
 
+// loadMCPConfig 在首次调用时从 configStorePath 合并键值到 configVals；已加载则直接返回。
 func loadMCPConfig() {
 	configMu.Lock()
 	defer configMu.Unlock()
@@ -50,6 +53,7 @@ func loadMCPConfig() {
 	}
 }
 
+// saveMCPConfig 将当前 configVals 快照写入 configStorePath。
 func saveMCPConfig() error {
 	configMu.Lock()
 	cp := make(map[string]string, len(configVals))
@@ -61,6 +65,7 @@ func saveMCPConfig() error {
 	return writeJSONFile(configStorePath(), f)
 }
 
+// configTools 先 loadMCPConfig，再注册 get/set/list/reset/export/import。
 func configTools() []*mcp.MCPTool {
 	loadMCPConfig()
 	schema := map[string]any{
@@ -77,6 +82,7 @@ func configTools() []*mcp.MCPTool {
 	}
 }
 
+// RegisterConfigTools 注册配置相关 MCP 工具。
 func RegisterConfigTools(reg *mcp.ToolRegistry) error {
 	for _, t := range configTools() {
 		if err := reg.Register(t); err != nil {
@@ -115,6 +121,7 @@ func handleConfigSet(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"key": k, "value": val}}
 }
 
+// handleConfigList 返回当前全部 config 键值快照。
 func handleConfigList(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	configMu.Lock()
 	cp := make(map[string]string, len(configVals))
@@ -125,6 +132,7 @@ func handleConfigList(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"config": cp}}
 }
 
+// handleConfigExport 将 config 写入 path（空则默认 dataDir/config/export.json），格式为缩进 JSON。
 func handleConfigExport(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	p := strArg(m, "path")
 	if p == "" {
@@ -150,6 +158,7 @@ func handleConfigExport(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"path": p}}
 }
 
+// handleConfigImport 从 path 读取 configFile，将非空键（trim 后）合并入 configVals 并保存。
 func handleConfigImport(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	p := strArg(m, "path")
 	if p == "" {
@@ -177,6 +186,7 @@ func handleConfigImport(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"imported": true, "keys": len(f.Values)}}
 }
 
+// handleConfigReset 将 configVals 恢复为内置默认值并写入磁盘。
 func handleConfigReset(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	configMu.Lock()
 	configVals = map[string]string{

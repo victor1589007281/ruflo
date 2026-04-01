@@ -1,5 +1,11 @@
 package tools
 
+// 本文件实现任务/流水线「进度」快照的 MCP 工具（progress_*），状态写入 progress/state.json。
+//
+// 设计思路：
+//   - Summary 为任意键值摘要（字符串值），Watchers 为关注目标字符串列表，Tasks 字段在结构中预留（持久化兼容）。
+//   - 提供只读检查、强制落盘、合并摘要与注册 watcher，适合多 Agent 协作时写入轻量状态。
+
 import (
 	"context"
 	"encoding/json"
@@ -11,6 +17,7 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// progressState 进度持久化结构：关注列表、摘要映射、同步时间与任务映射（JSON 兼容字段）。
 type progressState struct {
 	Watchers []string          `json:"watchers"`
 	Summary  map[string]any    `json:"summary"`
@@ -19,14 +26,17 @@ type progressState struct {
 }
 
 var (
-	progressMu   sync.Mutex
+	progressMu sync.Mutex
+	// progressData 内存中的进度状态，Summary 与 Tasks 默认非 nil。
 	progressData = &progressState{Summary: map[string]any{}, Tasks: map[string]string{}}
 )
 
+// progressPath 返回进度状态文件路径。
 func progressPath() string {
 	return filepath.Join(resolveDataDir(), "progress", "state.json")
 }
 
+// progressLoad 从磁盘加载进度；解析失败则保持内存状态。
 func progressLoad() {
 	progressMu.Lock()
 	defer progressMu.Unlock()
@@ -46,6 +56,7 @@ func progressLoad() {
 	}
 }
 
+// progressSave 将 Watchers、Summary、Tasks 写入磁盘并更新 SyncedAt。
 func progressSave() error {
 	progressMu.Lock()
 	progressData.SyncedAt = now()
@@ -65,6 +76,7 @@ func progressSave() error {
 	return writeJSONFile(progressPath(), cp)
 }
 
+// progressTools 构造 progress_* MCP 工具。
 func progressTools() []*mcp.MCPTool {
 	progressLoad()
 	obj := map[string]any{"type": "object", "properties": map[string]any{}}
@@ -76,7 +88,7 @@ func progressTools() []*mcp.MCPTool {
 	}
 }
 
-// RegisterProgressTools registers file-backed progress helpers.
+// RegisterProgressTools 向注册表登记基于文件的进度辅助 MCP 工具。
 func RegisterProgressTools(reg *mcp.ToolRegistry) error {
 	for _, t := range progressTools() {
 		if err := reg.Register(t); err != nil {

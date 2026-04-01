@@ -1,6 +1,8 @@
+// 本文件定义 SONA 运行模式枚举及每种模式对应的 SONAConfig 数值预设（学习率、LoRA 秩、EWC λ、缓冲与模式上限等）。
+// 与 sona.go 中 SetMode 字符串分支互补：SONAConfigForMode 供需要显式枚举 API 的调用方使用。
 package neural
 
-// SONAMode selects preset SONA tuning profiles.
+// SONAMode 为 SONA 预设调参配置的逻辑名称。
 type SONAMode string
 
 const (
@@ -11,7 +13,8 @@ const (
 	SONAModeBatch    SONAMode = "batch"
 )
 
-// SONAConfigForMode returns parameters for the named mode; unknown modes fall back to balanced.
+// SONAConfigForMode 返回模式对应超参；未知模式回退 DefaultSONAConfig()（balanced）。
+// real-time：快反应、较小轨迹、中等信号缓冲；research：低学习率、强 EWC、大缓冲；edge：强资源约束；batch：大批次友好。
 func SONAConfigForMode(mode SONAMode) SONAConfig {
 	switch mode {
 	case SONAModeRealTime:

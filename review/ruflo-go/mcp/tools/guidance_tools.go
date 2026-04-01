@@ -8,6 +8,12 @@ import (
 	"github.com/ruflo/ruflo-go/pkg/guidance"
 )
 
+// 本文件：治理（Guidance）平面 MCP 工具，暴露清单、分片检索、工作流阶段说明等只读能力。
+//
+// 设计思路：读路径均委托 globalState.guidancePlane（已编译的 Bundle）；recommend 将字符串 intent 转为
+// TaskIntent 后调用 RetrieveForTask。CompileGuidanceMarkdown / EvaluateCommandMCP 供测试与 CLI 注入 Markdown 与命令评估。
+
+// guidanceTools 注册 capabilities、recommend、discover、workflow、quickref 五个治理相关 MCP 工具。
 func guidanceTools() []*mcp.MCPTool {
 	return []*mcp.MCPTool{
 		{
@@ -74,6 +80,7 @@ func handleGuidanceDiscover(ctx context.Context, args json.RawMessage) (json.Raw
 	return jsonOK(map[string]any{"shards": out, "count": len(out)})
 }
 
+// handleGuidanceWorkflow 返回内置治理流水线阶段名称（compile/retrieve/gate/ledger/optimize）。
 func handleGuidanceWorkflow(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -81,6 +88,7 @@ func handleGuidanceWorkflow(ctx context.Context, args json.RawMessage) (json.Raw
 	return jsonOK(map[string]any{"stages": stages})
 }
 
+// handleGuidanceQuickref 返回能力名列表与当前 bundle_id，便于客户端快速对照。
 func handleGuidanceQuickref(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args

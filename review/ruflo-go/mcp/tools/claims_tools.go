@@ -10,19 +10,28 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// 本文件：基于声明（claims）的轻量授权 MCP 工具，按 agent_id 维护字符串声明列表并持久化到 store.json。
+//
+// 设计思路：claimsData.ByAgent 为内存真源，claimsLoad/claimsSave 与磁盘同步；grant 去重追加，revoke 过滤移除，
+// list 支持按 agent 或返回全体映射。
+
 type claimsFile struct {
 	ByAgent map[string][]string `json:"by_agent"`
 }
+
+// claimsFile 持久化结构：键为 agent_id，值为该代理持有的 claim 字符串列表。
 
 var (
 	claimsMu   sync.Mutex
 	claimsData = &claimsFile{ByAgent: make(map[string][]string)}
 )
 
+// claimsStorePath 返回 dataDir/claims/store.json 路径。
 func claimsStorePath() string {
 	return filepath.Join(resolveDataDir(), "claims", "store.json")
 }
 
+// claimsLoad 从磁盘加载声明数据；解析成功且 ByAgent 非 nil 时替换 claimsData。
 func claimsLoad() {
 	claimsMu.Lock()
 	defer claimsMu.Unlock()
@@ -36,6 +45,7 @@ func claimsLoad() {
 	}
 }
 
+// claimsSave 深拷贝 ByAgent 后写入 claimsStorePath。
 func claimsSave() error {
 	claimsMu.Lock()
 	cp := claimsFile{ByAgent: make(map[string][]string)}
@@ -46,6 +56,7 @@ func claimsSave() error {
 	return writeJSONFile(claimsStorePath(), cp)
 }
 
+// claimsTools 先 claimsLoad，再注册 check/grant/revoke/list。
 func claimsTools() []*mcp.MCPTool {
 	claimsLoad()
 	return []*mcp.MCPTool{
@@ -102,6 +113,7 @@ func handleClaimsGrant(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"agent_id": agent, "claim": claim, "granted": !found}}
 }
 
+// handleClaimsRevoke 从 agent 的列表中移除指定 claim；revoked 表示是否确实移除过。
 func handleClaimsRevoke(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	agent := strArg(m, "agent_id")
 	claim := strArg(m, "claim")
@@ -124,6 +136,7 @@ func handleClaimsRevoke(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"agent_id": agent, "claim": claim, "revoked": removed}}
 }
 
+// handleClaimsList 若提供 agent_id 则返回该代理的 claims；否则返回 by_agent 全表拷贝。
 func handleClaimsList(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	agent := strArg(m, "agent_id")
 	claimsMu.Lock()

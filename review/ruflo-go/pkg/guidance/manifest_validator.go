@@ -5,12 +5,15 @@ import (
 	"strings"
 )
 
-// ValidationError records a manifest or bundle issue.
+// 本文件：策略清单与 PolicyBundle 一致性校验。ValidateManifest 检查必填与计数非负；ValidateBundle 核对分片数、规则总数与 Manifest 声明。
+
+// ValidationError 描述校验失败的字段与原因。
 type ValidationError struct {
-	Field   string `json:"field,omitempty"`
-	Message string `json:"message"`
+	Field   string `json:"field,omitempty"` // 字段路径，如 manifest.shard_count
+	Message string `json:"message"`         // 错误说明
 }
 
+// Error 实现 error 接口。
 func (e ValidationError) Error() string {
 	if e.Field != "" {
 		return e.Field + ": " + e.Message
@@ -18,7 +21,7 @@ func (e ValidationError) Error() string {
 	return e.Message
 }
 
-// ValidateManifest checks manifest fields for consistency.
+// ValidateManifest 校验 BundleID、Version 非空，ShardCount/RuleCount 非负，ByRisk 计数和与 RuleCount 一致（在 RuleCount>0 且 sum>0 时）。
 func ValidateManifest(manifest RuleManifest) []ValidationError {
 	var errs []ValidationError
 	if strings.TrimSpace(manifest.BundleID) == "" {
@@ -49,7 +52,7 @@ func ValidateManifest(manifest RuleManifest) []ValidationError {
 	return errs
 }
 
-// ValidateBundle checks bundle structure and manifest alignment.
+// ValidateBundle 校验 bundle.ID/Version、每分片 ShardID、Manifest 中 ShardCount/RuleCount 与实际切片/规则数一致，并附加 ValidateManifest 结果。
 func ValidateBundle(bundle PolicyBundle) []ValidationError {
 	var errs []ValidationError
 	if strings.TrimSpace(bundle.ID) == "" {

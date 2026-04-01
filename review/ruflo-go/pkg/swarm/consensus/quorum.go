@@ -1,3 +1,9 @@
+// 本文件实现基于法定人数（Quorum）投票的共识演示：提案需获得足够多的节点接受方可提交。
+//
+// # Quorum 与读写一致性（经典多数派）
+//
+// 设副本数为 n，常见写法定人数 W 与读法定人数 R 满足 W + R > n 且 W,R ≥ ⌈(n+1)/2⌉ 时，任意读与写副本集合相交，
+// 从而可保证读到最新已提交写入（在同步更新假设下）。本实现默认 need = ⌊n/2⌋+1，即严格多数派。
 package consensus
 
 import (
@@ -8,6 +14,7 @@ import (
 	"time"
 )
 
+// quorumProposal 单笔提案的投票统计：votes 记录各节点是否接受；accepts/rejects 计数；quorumNeed 为通过阈值。
 type quorumProposal struct {
 	value      []byte
 	votes      map[string]bool
@@ -18,6 +25,7 @@ type quorumProposal struct {
 	created    time.Time
 }
 
+// quorumConsensus Quorum 引擎：nodes 为选民集合；可配置 QuorumSize 覆盖默认多数。
 type quorumConsensus struct {
 	mu sync.RWMutex
 
@@ -26,6 +34,7 @@ type quorumConsensus struct {
 	proposals map[string]*quorumProposal
 }
 
+// newQuorumConsensus 构造 Quorum 引擎。
 func newQuorumConsensus(cfg Config) Engine {
 	nodes := append([]string(nil), cfg.Peers...)
 	if !stringSliceContains(nodes, cfg.NodeID) {
@@ -39,6 +48,7 @@ func newQuorumConsensus(cfg Config) Engine {
 	}
 }
 
+// quorumThreshold 返回通过所需接受票数：默认 ⌊n/2⌋+1 = ⌈(n+1)/2⌉；若配置 QuorumSize 则裁剪到 [1,n]。O(1)。
 func (q *quorumConsensus) quorumThreshold() int {
 	n := len(q.nodes)
 	if n == 0 {
@@ -53,11 +63,12 @@ func (q *quorumConsensus) quorumThreshold() int {
 	return n/2 + 1
 }
 
-// quorumVote decides accept/reject from local policy (non-empty payload accepts).
+// quorumVote 本地策略：非空 payload 视为接受（演示用）。O(1)。
 func (q *quorumConsensus) quorumVote(value []byte) bool {
 	return len(value) > 0
 }
 
+// AddNode 加入选民。O(n log n)。
 func (q *quorumConsensus) AddNode(id string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -68,6 +79,7 @@ func (q *quorumConsensus) AddNode(id string) error {
 	return nil
 }
 
+// RemoveNode 移除选民。O(n)。
 func (q *quorumConsensus) RemoveNode(id string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -75,6 +87,7 @@ func (q *quorumConsensus) RemoveNode(id string) error {
 	return nil
 }
 
+// Propose 向每个节点征询 quorumVote，accepts ≥ quorumThreshold 则 committed。O(n)；空间 O(n)。
 func (q *quorumConsensus) Propose(ctx context.Context, value []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -116,6 +129,7 @@ func (q *quorumConsensus) Propose(ctx context.Context, value []byte) (string, er
 	return propID, nil
 }
 
+// AwaitConsensus 轮询直至 committed 或超时。O(超时/间隔)。
 func (q *quorumConsensus) AwaitConsensus(ctx context.Context, proposalID string, timeout time.Duration) (Result, error) {
 	wait := timeout
 	if wait <= 0 {
@@ -144,8 +158,10 @@ func (q *quorumConsensus) AwaitConsensus(ctx context.Context, proposalID string,
 	}
 }
 
+// NodeID 本节点。O(1)。
 func (q *quorumConsensus) NodeID() string { return q.cfg.NodeID }
 
+// GetState 排序后首节点视为 leader 占位，其余 follower。O(1)。
 func (q *quorumConsensus) GetState() string {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -158,12 +174,14 @@ func (q *quorumConsensus) GetState() string {
 	return "follower"
 }
 
+// IsLeader 当本节点为排序后首节点时为 true（演示 leader 标签）。O(1)。
 func (q *quorumConsensus) IsLeader() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return len(q.nodes) > 0 && q.nodes[0] == q.cfg.NodeID
 }
 
+// GetLeaderID 返回排序后首个节点 id。O(1)。
 func (q *quorumConsensus) GetLeaderID() string {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -173,4 +191,5 @@ func (q *quorumConsensus) GetLeaderID() string {
 	return q.nodes[0]
 }
 
+// Close 无资源。O(1)。
 func (q *quorumConsensus) Close() error { return nil }

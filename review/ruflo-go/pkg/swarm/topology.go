@@ -1,3 +1,5 @@
+// 拓扑管理器（swarm 包）：在 Agent 图上维护无向邻接关系，支持 Mesh/层次/中心化/混合等建边策略；
+// FindOptimalPath 为 BFS 最短路径；ElectLeader 按角色优先级字典选举；Rebalance 带 5s 节流全图重连。
 package swarm
 
 import (
@@ -14,18 +16,18 @@ import (
 
 const maxMeshDegreeDefault = 10
 
-// TopologyManager maintains graph edges for swarm coordination.
+// TopologyManager 进程内协调图：顶点是 Agent，边用于消息路由与连通性分析。
 type TopologyManager struct {
 	mu sync.RWMutex
 
-	cfg           TopologyConfig
-	nodes         map[string]*TopologyNode
-	rebalanceMu   sync.Mutex
-	lastRebalance time.Time
-	rng           *rand.Rand
+	cfg           TopologyConfig           // 拓扑类型、网格度、混合随机边数、角色优先级
+	nodes         map[string]*TopologyNode // agentId -> 结点
+	rebalanceMu   sync.Mutex               // 重平衡节流锁
+	lastRebalance time.Time                // 上次全图重建时间
+	rng           *rand.Rand               // 洗牌连边用 PRNG
 }
 
-// NewTopologyManager creates a manager with config.
+// NewTopologyManager 修正 cfg 默认值并播种 rng。
 func NewTopologyManager(cfg TopologyConfig) *TopologyManager {
 	if cfg.MaxMeshDegree <= 0 {
 		cfg.MaxMeshDegree = maxMeshDegreeDefault
@@ -43,11 +45,12 @@ func NewTopologyManager(cfg TopologyConfig) *TopologyManager {
 	}
 }
 
+// topologySeed 用纳秒时间戳作为 PCG 种子来源。
 func topologySeed() uint64 {
 	return uint64(time.Now().UnixNano())
 }
 
-// AddNode adds an agent with role and wires edges per topology.
+// AddNode 新建 TopologyNode 后按 cfg.Type 调用 connect*Unlocked 与已有结点连边。
 func (t *TopologyManager) AddNode(agentID, role string) error {
 	if agentID == "" {
 		return errors.New("topology: empty agent id")
@@ -81,6 +84,7 @@ func (t *TopologyManager) AddNode(agentID, role string) error {
 	return nil
 }
 
+// agentIDsUnlocked 返回排序后的结点 id 列表（已持锁）。
 func (t *TopologyManager) agentIDsUnlocked() []string {
 	out := make([]string, 0, len(t.nodes))
 	for id := range t.nodes {
@@ -90,6 +94,7 @@ func (t *TopologyManager) agentIDsUnlocked() []string {
 	return out
 }
 
+// connectMeshUnlocked 随机选至多 MaxMeshDegree 个邻居与 newID 互连。
 func (t *TopologyManager) connectMeshUnlocked(newID string, all []string) {
 	maxDeg := t.cfg.MaxMeshDegree
 	candidates := make([]string, 0, len(all))
@@ -108,6 +113,7 @@ func (t *TopologyManager) connectMeshUnlocked(newID string, all []string) {
 	}
 }
 
+// connectHierarchicalUnlocked 将新结点只连到 rootRole 根（无根则取最小 id），形成星型层次。
 func (t *TopologyManager) connectHierarchicalUnlocked(newID string, all []string, rootRole string) {
 	var root string
 	for id, node := range t.nodes {
@@ -130,6 +136,7 @@ func (t *TopologyManager) connectHierarchicalUnlocked(newID string, all []string
 	t.nodes[root].Neighbors[newID] = struct{}{}
 }
 
+// connectCentralizedUnlocked 星型：所有结点连接首个 coordinator 或第一个 id。
 func (t *TopologyManager) connectCentralizedUnlocked(newID string, all []string) {
 	var coord string
 	for id, node := range t.nodes {
@@ -151,6 +158,7 @@ func (t *TopologyManager) connectCentralizedUnlocked(newID string, all []string)
 	t.nodes[coord].Neighbors[newID] = struct{}{}
 }
 
+// connectHybridUnlocked 先连 hub（queen/coordinator），再随机连 HybridRandomPeers 条横向边。
 func (t *TopologyManager) connectHybridUnlocked(newID string, all []string) {
 	var hub string
 	for id, node := range t.nodes {
@@ -185,7 +193,7 @@ func (t *TopologyManager) connectHybridUnlocked(newID string, all []string) {
 	}
 }
 
-// RemoveNode removes an agent and its edges.
+// RemoveNode 删除结点并从所有邻居的 Neighbors 中摘除该 id。
 func (t *TopologyManager) RemoveNode(agentID string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -202,7 +210,7 @@ func (t *TopologyManager) RemoveNode(agentID string) error {
 	return nil
 }
 
-// GetNeighbors returns neighbor ids.
+// GetNeighbors 返回无向邻接 id 排序切片。
 func (t *TopologyManager) GetNeighbors(agentID string) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -218,7 +226,7 @@ func (t *TopologyManager) GetNeighbors(agentID string) []string {
 	return out
 }
 
-// FindOptimalPath BFS shortest path from -> to.
+// FindOptimalPath 无权 BFS，返回结点 id 路径；不可达返回错误。
 func (t *TopologyManager) FindOptimalPath(from, to string) ([]string, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -255,14 +263,14 @@ func (t *TopologyManager) FindOptimalPath(from, to string) ([]string, error) {
 	return nil, errors.New("topology: no path")
 }
 
-// ElectLeader returns agent id with highest role priority among nodes.
+// ElectLeader 在 RolePriorityOrder 中索引越小优先级越高，同分取更小 agent id。
 func (t *TopologyManager) ElectLeader() (string, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.electLeaderUnlocked()
 }
 
-// Rebalance rewires with 5s throttle.
+// Rebalance 若距上次不足 5s 返回节流错误；否则清空边并按当前拓扑策略 rebuildGraphUnlocked。
 func (t *TopologyManager) Rebalance(ctx context.Context) error {
 	t.rebalanceMu.Lock()
 	if time.Since(t.lastRebalance) < 5*time.Second {
@@ -282,6 +290,7 @@ func (t *TopologyManager) Rebalance(ctx context.Context) error {
 	return nil
 }
 
+// rebuildGraphUnlocked 清空所有 Neighbors 后按类型整体重连（Mesh 为每点随机 maxDeg 条）。
 func (t *TopologyManager) rebuildGraphUnlocked() {
 	ids := t.agentIDsUnlocked()
 	for _, id := range ids {
@@ -383,6 +392,7 @@ func (t *TopologyManager) rebuildGraphUnlocked() {
 	}
 }
 
+// topologyRoleString Queen 类型映射为 "queen" 字符串。
 func topologyRoleString(agentType api.AgentType) string {
 	if agentType == api.AgentTypeQueen {
 		return "queen"
@@ -390,11 +400,12 @@ func topologyRoleString(agentType api.AgentType) string {
 	return string(agentType)
 }
 
+// roleMatches 比较规范化后的角色串。
 func (t *TopologyManager) roleMatches(nodeRole string, want api.AgentType) bool {
 	return nodeRole == topologyRoleString(want) || nodeRole == string(want)
 }
 
-// GetState returns topology type, counts, and current elected leader id.
+// GetState 统计结点数与无向边数（边数=邻接和/2），Leader 为 electLeaderUnlocked。
 func (t *TopologyManager) GetState() TopologyState {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -413,6 +424,7 @@ func (t *TopologyManager) GetState() TopologyState {
 	}
 }
 
+// electLeaderUnlocked 在持读锁前提下选举领导者。
 func (t *TopologyManager) electLeaderUnlocked() (string, error) {
 	if len(t.nodes) == 0 {
 		return "", errors.New("topology: no nodes")
@@ -436,7 +448,7 @@ func (t *TopologyManager) electLeaderUnlocked() (string, error) {
 	return bestID, nil
 }
 
-// UpdateNode changes the role associated with an existing node.
+// UpdateNode 修改已有结点 Role 字符串，不自动重连。
 func (t *TopologyManager) UpdateNode(agentID string, role api.AgentType) error {
 	if agentID == "" {
 		return errors.New("topology: empty agent id")
@@ -451,7 +463,7 @@ func (t *TopologyManager) UpdateNode(agentID string, role api.AgentType) error {
 	return nil
 }
 
-// GetNode returns a defensive copy of a topology node.
+// GetNode 拷贝 Neighbors map 与标量字段。
 func (t *TopologyManager) GetNode(agentID string) (*TopologyNode, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -471,7 +483,7 @@ func (t *TopologyManager) GetNode(agentID string) (*TopologyNode, bool) {
 	}, true
 }
 
-// GetNodesByRole returns nodes whose role matches the agent type.
+// GetNodesByRole 过滤 roleMatches 为真的结点，按 AgentID 排序。
 func (t *TopologyManager) GetNodesByRole(role api.AgentType) []*TopologyNode {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -495,7 +507,7 @@ func (t *TopologyManager) GetNodesByRole(role api.AgentType) []*TopologyNode {
 	return out
 }
 
-// GetActiveNodes returns all nodes (present in the live graph).
+// GetActiveNodes 返回全量结点防御性拷贝列表。
 func (t *TopologyManager) GetActiveNodes() []*TopologyNode {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -520,7 +532,7 @@ func (t *TopologyManager) GetActiveNodes() []*TopologyNode {
 	return out
 }
 
-// IsConnected is true when the graph is empty, a singleton, or one BFS component.
+// IsConnected 空图或单点视为连通；否则从最小 id 出发 BFS 应覆盖全部结点。
 func (t *TopologyManager) IsConnected() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -545,7 +557,7 @@ func (t *TopologyManager) IsConnected() bool {
 	return len(seen) == len(t.nodes)
 }
 
-// GetConnectionCount returns the number of undirected edges.
+// GetConnectionCount 无向边数 = 邻接度数和 / 2。
 func (t *TopologyManager) GetConnectionCount() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -556,7 +568,7 @@ func (t *TopologyManager) GetConnectionCount() int {
 	return sum / 2
 }
 
-// GetAverageConnections returns mean degree (0 if no nodes).
+// GetAverageConnections 平均度数 = 度数和 / 结点数。
 func (t *TopologyManager) GetAverageConnections() float64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

@@ -41,16 +41,19 @@ var (
 	workflowCache *workflowStoreFile
 )
 
+// workflowToolID 使用 crypto/rand 生成 prefix+16 位十六进制随机后缀，作为定义或运行 ID。
 func workflowToolID(prefix string) string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
 	return prefix + hex.EncodeToString(b[:])
 }
 
+// workflowStorePath 返回 workflows/store.json 路径。
 func workflowStorePath() string {
 	return filepath.Join(resolveDataDir(), "workflows", "store.json")
 }
 
+// wfEnsureLocked 在已持有 workflowMu 的前提下懒加载缓存：若 nil 则初始化并从磁盘合并 Definitions/Runs。
 func wfEnsureLocked() {
 	if workflowCache != nil {
 		return
@@ -75,6 +78,7 @@ func wfEnsureLocked() {
 	}
 }
 
+// wfSaveLocked 在已持有锁时将 workflowCache 深拷贝写入 workflowStorePath。
 func wfSaveLocked() error {
 	f := workflowStoreFile{
 		Definitions: make(map[string]*workflowDef),
@@ -89,6 +93,7 @@ func wfSaveLocked() error {
 	return writeJSONFile(workflowStorePath(), f)
 }
 
+// workflowTools 注册创建、运行、状态、列表、停止/取消、暂停、恢复、删除与模板列举等工具。
 func workflowTools() []*mcp.MCPTool {
 	return []*mcp.MCPTool{
 		{Name: "workflow_create", Description: "Create a workflow definition", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string"}, "steps": map[string]any{"type": "array"}}}, Handler: toolHandler(handleWorkflowCreate)},
@@ -105,6 +110,7 @@ func workflowTools() []*mcp.MCPTool {
 	}
 }
 
+// RegisterWorkflowTools 注册工作流相关 MCP 工具。
 func RegisterWorkflowTools(reg *mcp.ToolRegistry) error {
 	for _, t := range workflowTools() {
 		if err := reg.Register(t); err != nil {
@@ -114,6 +120,7 @@ func RegisterWorkflowTools(reg *mcp.ToolRegistry) error {
 	return nil
 }
 
+// handleWorkflowCreate 解析 name（默认 workflow）与 steps 数组，生成新定义 ID 并落盘。
 func handleWorkflowCreate(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	name := strArg(m, "name")
 	if name == "" {
@@ -146,6 +153,7 @@ func handleWorkflowCreate(_ context.Context, m map[string]any) mcp.MCPToolResult
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"id": id, "name": name, "steps": steps}}
 }
 
+// handleWorkflowRun 按 definition_id 创建 run，先存 running 再立即置为 completed 且 current_step=步骤总数（同步占位）。
 func handleWorkflowRun(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	did := strArg(m, "definition_id")
 	workflowMu.Lock()
@@ -177,6 +185,7 @@ func handleWorkflowRun(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"run_id": rid, "status": run.Status, "steps_total": len(def.Steps)}}
 }
 
+// handleWorkflowStatus 按 run_id 返回运行状态、当前步骤与时间戳字段。
 func handleWorkflowStatus(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	rid := strArg(m, "run_id")
 	workflowMu.Lock()
@@ -193,6 +202,7 @@ func handleWorkflowStatus(_ context.Context, m map[string]any) mcp.MCPToolResult
 	}}
 }
 
+// handleWorkflowList 返回定义数、运行数及全部 definition_ids、run_ids 列表。
 func handleWorkflowList(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	workflowMu.Lock()
 	defer workflowMu.Unlock()
@@ -213,6 +223,7 @@ func handleWorkflowList(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	}}
 }
 
+// handleWorkflowPause 将指定 run 标记为 paused。
 func handleWorkflowPause(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	rid := strArg(m, "run_id")
 	workflowMu.Lock()
@@ -230,6 +241,7 @@ func handleWorkflowPause(_ context.Context, m map[string]any) mcp.MCPToolResult 
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"run_id": rid, "status": r.Status}}
 }
 
+// handleWorkflowResume 将指定 run 标记为 running。
 func handleWorkflowResume(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	rid := strArg(m, "run_id")
 	workflowMu.Lock()
@@ -247,6 +259,7 @@ func handleWorkflowResume(_ context.Context, m map[string]any) mcp.MCPToolResult
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"run_id": rid, "status": r.Status}}
 }
 
+// handleWorkflowDelete 按 definition_id 删除定义（若不存在则报错）。
 func handleWorkflowDelete(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	did := strArg(m, "definition_id")
 	workflowMu.Lock()
@@ -262,12 +275,14 @@ func handleWorkflowDelete(_ context.Context, m map[string]any) mcp.MCPToolResult
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"deleted": did}}
 }
 
+// handleWorkflowTemplate 返回内置模板 id 列表（feature/security/refactor/bugfix/docs）。
 func handleWorkflowTemplate(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{
 		"templates": []string{"feature", "security", "refactor", "bugfix", "docs"},
 	}}
 }
 
+// handleWorkflowStop 将 run 状态设为 stopped（workflow_cancel 与此共用）。
 func handleWorkflowStop(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	rid := strArg(m, "run_id")
 	workflowMu.Lock()

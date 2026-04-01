@@ -1,3 +1,5 @@
+// Agent 池（swarm 包）：类比连接池，维护 available/inUse 两套槽位与全局 byID 索引；Acquire 优先复用空闲，否则在 MaxSize 内新建。
+// CheckScaling 按利用率阈值扩容（≥0.8）或缩容（≤0.2 且高于 MinSize），带 ScaleCooldown；healthLoop 对超时心跳衰减健康并替换不健康 inUse Agent。
 package swarm
 
 import (
@@ -10,16 +12,16 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
-// AgentPool manages bounded agent instances with scaling and health.
+// AgentPool 有界池：跟踪空闲列表、占用表与 LRU 顺序用于缩容选牺牲者。
 type AgentPool struct {
 	mu sync.RWMutex
 
 	cfg AgentPoolConfig
 
-	available []*api.Agent
-	inUse     map[string]*api.Agent
-	byID      map[string]*api.Agent
-	lru       []string
+	available []*api.Agent          // 空闲可分配
+	inUse     map[string]*api.Agent // 已借出
+	byID      map[string]*api.Agent // 全量索引
+	lru       []string              // 最近使用顺序（用于 pickLRUIdleUnlocked）
 
 	scaleMu      sync.Mutex
 	idMu         sync.Mutex
@@ -30,7 +32,7 @@ type AgentPool struct {
 	healthWg     sync.WaitGroup
 }
 
-// NewAgentPool creates a pool.
+// NewAgentPool 修正 cfg 并启动 healthLoop。
 func NewAgentPool(cfg AgentPoolConfig) *AgentPool {
 	if cfg.MinSize < 0 {
 		cfg.MinSize = 0
@@ -60,6 +62,7 @@ func NewAgentPool(cfg AgentPoolConfig) *AgentPool {
 	return p
 }
 
+// genID 时间戳+单调序列，避免碰撞。
 func (p *AgentPool) genID() string {
 	p.idMu.Lock()
 	p.nextSerial++
@@ -68,7 +71,7 @@ func (p *AgentPool) genID() string {
 	return fmt.Sprintf("agent-%d-%d", time.Now().UnixNano(), n)
 }
 
-// Initialize pre-warms up to min agents.
+// Initialize 创建 MinSize 个默认 Coder/Core Agent 放入 available。
 func (p *AgentPool) Initialize(ctx context.Context) error {
 	for i := 0; i < p.cfg.MinSize; i++ {
 		select {
@@ -85,6 +88,7 @@ func (p *AgentPool) Initialize(ctx context.Context) error {
 	return nil
 }
 
+// newAgent 构造带健康/负载 Extra 指标的初始 Agent。
 func (p *AgentPool) newAgent(t api.AgentType, d api.AgentDomain) *api.Agent {
 	now := time.Now()
 	return &api.Agent{
@@ -106,7 +110,7 @@ func (p *AgentPool) newAgent(t api.AgentType, d api.AgentDomain) *api.Agent {
 	}
 }
 
-// Acquire returns an idle agent or creates until max; nil if saturated.
+// Acquire 从 available 弹栈或 newAgent，标记 Busy 并登记 inUse；池满返回 nil。
 func (p *AgentPool) Acquire() *api.Agent {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -134,6 +138,7 @@ func (p *AgentPool) Acquire() *api.Agent {
 	return a
 }
 
+// touchLRU 将 id 移到 lru 末尾表示最近使用。
 func (p *AgentPool) touchLRU(id string) {
 	for i, x := range p.lru {
 		if x == id {
@@ -144,7 +149,7 @@ func (p *AgentPool) touchLRU(id string) {
 	p.lru = append(p.lru, id)
 }
 
-// Release returns an agent to the pool.
+// Release 将 Busy Agent 置 Idle、负载清零并放回 available。
 func (p *AgentPool) Release(agentID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -242,6 +247,7 @@ func (p *AgentPool) evictIdleUnlocked(id string) {
 	}
 }
 
+// removeLRU 从 lru 切片删除 id。
 func (p *AgentPool) removeLRU(id string) {
 	for i, x := range p.lru {
 		if x == id {
@@ -251,6 +257,7 @@ func (p *AgentPool) removeLRU(id string) {
 	}
 }
 
+// healthLoop 每秒 runHealthTick。
 func (p *AgentPool) healthLoop() {
 	defer p.healthWg.Done()
 	ticker := time.NewTicker(1 * time.Second)
@@ -265,6 +272,7 @@ func (p *AgentPool) healthLoop() {
 	}
 }
 
+// runHealthTick 对 inUse 中超时未心跳者衰减健康，过低则从池中移除并 replaceUnhealthyUnlocked。
 func (p *AgentPool) runHealthTick() {
 	now := time.Now()
 	p.mu.Lock()
@@ -290,6 +298,7 @@ func (p *AgentPool) runHealthTick() {
 	}
 }
 
+// replaceUnhealthyUnlocked 优先从 available 取替身继承类型/域，否则在未满时新建。
 func (p *AgentPool) replaceUnhealthyUnlocked(old *api.Agent) *api.Agent {
 	delete(p.byID, old.ID)
 	p.removeLRU(old.ID)
@@ -316,20 +325,20 @@ func (p *AgentPool) replaceUnhealthyUnlocked(old *api.Agent) *api.Agent {
 	return nil
 }
 
-// Shutdown stops health loop.
+// Shutdown 取消 healthCtx 并等待 healthLoop 退出。
 func (p *AgentPool) Shutdown() {
 	p.healthCancel()
 	p.healthWg.Wait()
 }
 
-// Size returns total tracked agents.
+// Size 返回 inUse 与 available 总和。
 func (p *AgentPool) Size() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.inUse) + len(p.available)
 }
 
-// Get returns agent by id.
+// Get 从 byID 查找（不拷贝）。
 func (p *AgentPool) Get(agentID string) (*api.Agent, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -340,7 +349,7 @@ func (p *AgentPool) Get(agentID string) (*api.Agent, error) {
 	return a, nil
 }
 
-// List returns a snapshot sorted by id.
+// List 返回 byID 中所有指针，按 ID 排序。
 func (p *AgentPool) List() []*api.Agent {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

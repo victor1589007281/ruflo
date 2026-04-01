@@ -1,3 +1,12 @@
+// 本文件实现双模编排的执行与记忆汇聚：管理 Claude / Codex / ruflo 无头进程的完整调用生命周期。
+//
+// 设计要点：
+//   - SpawnHeadlessWorker：按 platform 选择可执行文件与参数（claude -p / codex -p / ruflo -p），
+//     环境变量 RUFL_CLAUDE_BIN、RUFL_CODEX_BIN、RUFL_BIN 可覆盖默认命令名；RUFL_NAMESPACE 传递命名空间。
+//   - RunCollaboration：根据 WorkerConfig.DependsOn 构建有向依赖图，按拓扑深度分「波次」；
+//     同一波内 goroutine 并行，波次间顺序执行；任一 worker 非零退出或 Error 则整体失败返回。
+//   - StoreTaskContext / CollectSharedMemory：通过 ruflo memory store/list/retrieve --format json 与 CLI 交互，
+//     实现跨平台共享键值上下文（与 orchestrator 中的 Namespace 默认 collaboration 对齐）。
 package codex
 
 import (
@@ -12,28 +21,28 @@ import (
 	"time"
 )
 
-// WorkerConfig describes one dual-mode worker with dependency edges by role name.
+// WorkerConfig 描述双模流水线中的一个工作者：依赖边通过角色名 DependsOn 指向其他 Worker 的 Role。
 type WorkerConfig struct {
-	Platform    string   // "claude", "codex", or "ruflo"
-	Role        string
-	Prompt      string
-	DependsOn   []string
-	Namespace   string
+	Platform  string   // 平台："claude"、"codex" 或 "ruflo"
+	Role      string   // 角色名，用于 workerKey 与依赖解析；空则运行时会生成占位名
+	Prompt    string   // 传给无头进程的完整自然语言任务描述
+	DependsOn []string // 必须先完成的角色名列表（用于拓扑分层）
+	Namespace string   // 非空时覆盖编排器默认 Namespace，仅该 worker 使用
 }
 
-// WorkerResult captures the outcome of a headless worker invocation.
+// WorkerResult 记录一次无头调用的输出、退出码、耗时与错误（Error 不序列化到 JSON）。
 type WorkerResult struct {
-	WorkerID string        `json:"worker_id"`
+	WorkerID string        `json:"worker_id"` // 通常为 platform:role
 	Platform string        `json:"platform"`
 	Role     string        `json:"role"`
-	Output   string        `json:"output"`
+	Output   string        `json:"output"`    // 合并 stdout+stderr
 	ExitCode int           `json:"exit_code"`
 	Duration time.Duration `json:"duration"`
 	Error    error         `json:"-"`
 }
 
-// SpawnHeadlessWorker runs `claude -p`, `codex -p`, or `ruflo -p` depending on platform.
-// Environment: RUFL_CLAUDE_BIN, RUFL_CODEX_BIN, RUFL_BIN override command names.
+// SpawnHeadlessWorker 根据 platform 执行 `claude -p`、`codex -p` 或 `ruflo -p`；提示词带 [platform:role] 前缀。
+// 环境变量 RUFL_CLAUDE_BIN、RUFL_CODEX_BIN、RUFL_BIN 可覆盖默认可执行文件名。
 func (o *DualModeOrchestrator) SpawnHeadlessWorker(platform, role, prompt string) (*WorkerResult, error) {
 	if o == nil {
 		return nil, fmt.Errorf("codex: nil orchestrator")
@@ -70,6 +79,7 @@ func (o *DualModeOrchestrator) SpawnHeadlessWorker(platform, role, prompt string
 	return res, nil
 }
 
+// headlessArgv 返回 [可执行文件, 参数...]：codex → -p；ruflo → -p；默认 claude → -p。
 func headlessArgv(platform, prompt, rufloDefault string) (bin string, args []string) {
 	p := strings.ToLower(strings.TrimSpace(platform))
 	switch p {
@@ -94,7 +104,7 @@ func headlessArgv(platform, prompt, rufloDefault string) (bin string, args []str
 	}
 }
 
-// RunCollaboration executes workers in topological waves; within each wave, workers run in parallel.
+// RunCollaboration 将 workers 按依赖拓扑分成多层波次：同层并行，层间串行；遇错短路返回已收集结果。
 func (o *DualModeOrchestrator) RunCollaboration(workers []WorkerConfig) ([]WorkerResult, error) {
 	if o == nil {
 		return nil, fmt.Errorf("codex: nil orchestrator")
@@ -149,6 +159,7 @@ func (o *DualModeOrchestrator) RunCollaboration(workers []WorkerConfig) ([]Worke
 	return acc, nil
 }
 
+// workerKey 生成工作者唯一键：platform:role（role 空时为 anon）。
 func workerKey(w WorkerConfig) string {
 	r := strings.TrimSpace(w.Role)
 	if r == "" {
@@ -157,6 +168,7 @@ func workerKey(w WorkerConfig) string {
 	return strings.TrimSpace(w.Platform) + ":" + r
 }
 
+// topoLevels 将 WorkerConfig 列表按依赖深度分桶：先为每个 role 建索引，再对每个节点计算 roleDepth（记忆化+环检测），最后按深度聚合为非空桶序列。
 func topoLevels(workers []WorkerConfig) [][]WorkerConfig {
 	byRole := make(map[string]WorkerConfig)
 	order := make([]string, 0, len(workers))
@@ -202,6 +214,7 @@ func topoLevels(workers []WorkerConfig) [][]WorkerConfig {
 	return out
 }
 
+// roleDepth 递归计算某角色在依赖 DAG 中的最大深度：memo 缓存结果，visiting 检测环（环上节点深度视为 0 分支）。
 func roleDepth(w WorkerConfig, byRole map[string]WorkerConfig, memo map[string]int, visiting map[string]bool) int {
 	k := strings.TrimSpace(w.Role)
 	if k == "" {
@@ -234,7 +247,7 @@ func roleDepth(w WorkerConfig, byRole map[string]WorkerConfig, memo map[string]i
 	return maxD
 }
 
-// StoreTaskContext writes a key into the shared memory namespace via the ruflo CLI.
+// StoreTaskContext 通过 ruflo memory store 将键值写入共享命名空间（Namespace 空时默认 "collaboration"）。
 func (o *DualModeOrchestrator) StoreTaskContext(key, value string) error {
 	if o == nil {
 		return fmt.Errorf("codex: nil orchestrator")
@@ -266,7 +279,7 @@ type memRetrieveJSON struct {
 	} `json:"entry"`
 }
 
-// CollectSharedMemory lists keys in the orchestrator namespace and retrieves each value.
+// CollectSharedMemory 列出命名空间下键（limit 500）并逐个 retrieve，返回 key→value 映射（解析失败键跳过）。
 func (o *DualModeOrchestrator) CollectSharedMemory() (map[string]string, error) {
 	if o == nil {
 		return nil, fmt.Errorf("codex: nil orchestrator")
@@ -307,7 +320,7 @@ func (o *DualModeOrchestrator) CollectSharedMemory() (map[string]string, error) 
 	return res, nil
 }
 
-// WaitForAll drains one result per channel in order.
+// WaitForAll 按参数顺序从每个 channel 读取一个 WorkerResult（nil channel 对应零值）。
 func WaitForAll(chs ...<-chan WorkerResult) []WorkerResult {
 	out := make([]WorkerResult, len(chs))
 	for i, ch := range chs {

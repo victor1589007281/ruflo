@@ -11,23 +11,27 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
+// 本文件：LLM 调用拦截器（Pre/Post/Error）。Pre 查 LRU+TTL 缓存、未命中时按提供商补默认 temperature；
+// Post 写回缓存并累计延迟/Token/费用，长文本可抽取粗粒度模式写入 ReasoningBank。
+
 const (
-	llmCacheMaxEntries = 1000
-	llmCacheTTL        = time.Hour
+	llmCacheMaxEntries = 1000      // 响应 LRU 最大条目数
+	llmCacheTTL        = time.Hour // 缓存条目存活时间
 )
 
-// LLMMetrics aggregates call observability.
+// LLMMetrics LLM 调用可观测性聚合：调用次数、缓存命中、错误、累计延迟与成本。
 type LLMMetrics struct {
-	mu           sync.Mutex
-	Calls        int64
-	CacheHits    int64
-	CacheMisses  int64
-	ErrorCalls   int64
-	TotalLatency time.Duration
-	TotalTokens  int64
-	TotalCostUSD float64
+	mu           sync.Mutex    // 保护以下字段
+	Calls        int64         // 总调用次数（含缓存命中在 record 中的计数策略：Pre 中 hit/miss 各算）
+	CacheHits    int64         // 缓存命中次数
+	CacheMisses  int64         // 缓存未命中次数
+	ErrorCalls   int64         // ErrorLLMCallHook 记录的错误次数
+	TotalLatency time.Duration // 累计延迟（Post 与 Pre 命中路径分别贡献）
+	TotalTokens  int64         // 累计 Token
+	TotalCostUSD float64       // 累计费用（美元）
 }
 
+// record 在锁内更新一次调用统计；hit 为 true 时增加 CacheHits，否则 CacheMisses。
 func (m *LLMMetrics) record(hit bool, lat time.Duration, tokens int, cost float64) {
 	if m == nil {
 		return
@@ -72,31 +76,35 @@ func (m *LLMMetrics) Snapshot() map[string]any {
 	}
 }
 
+// llmCacheEntry 单条缓存：响应体与过期时间。
 type llmCacheEntry struct {
-	resp      *api.LLMResponse
-	expiresAt time.Time
+	resp      *api.LLMResponse // 缓存的 LLM 响应
+	expiresAt time.Time        // 绝对过期时刻
 }
 
-// responseLRU is a simple LRU with TTL (capacity llmCacheMaxEntries).
+// responseLRU 带 TTL 的简单 LRU：哈希表 + 双向链表头尾，容量上限 llmCacheMaxEntries。
 type responseLRU struct {
-	mu    sync.Mutex
-	m     map[string]*listNode
-	head  *listNode
-	tail  *listNode
-	count int
+	mu    sync.Mutex           // 保护结构与 map
+	m     map[string]*listNode // key -> 链表节点
+	head  *listNode            // 最近使用端
+	tail  *listNode            // 最久未使用端
+	count int                  // 当前节点数
 }
 
+// listNode LRU 链表节点。
 type listNode struct {
-	key   string
-	entry llmCacheEntry
+	key   string        // 缓存键
+	entry llmCacheEntry // 条目
 	prev  *listNode
 	next  *listNode
 }
 
+// newResponseLRU 创建空 LRU。
 func newResponseLRU() *responseLRU {
 	return &responseLRU{m: make(map[string]*listNode)}
 }
 
+// get 若命中且未过期则移到链表头并返回响应；过期则摘除节点。
 func (c *responseLRU) get(key string) (*api.LLMResponse, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -114,6 +122,7 @@ func (c *responseLRU) get(key string) (*api.LLMResponse, bool) {
 	return resp, true
 }
 
+// set 插入或更新键：更新过期时间并移到头；超容量时逐出 tail。
 func (c *responseLRU) set(key string, resp *api.LLMResponse) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -131,6 +140,7 @@ func (c *responseLRU) set(key string, resp *api.LLMResponse) {
 	c.pushFront(n)
 }
 
+// pushFront 将节点插到链表头部并递增 count。
 func (c *responseLRU) pushFront(n *listNode) {
 	n.prev = nil
 	n.next = c.head
@@ -145,6 +155,7 @@ func (c *responseLRU) pushFront(n *listNode) {
 	c.count++
 }
 
+// removeNode 从双向链表中摘除节点并递减 count。
 func (c *responseLRU) removeNode(n *listNode) {
 	if n.prev != nil {
 		n.prev.next = n.next
@@ -161,6 +172,7 @@ func (c *responseLRU) removeNode(n *listNode) {
 	c.count--
 }
 
+// moveFront 将已存在节点移到头部（先 remove 再 pushFront）。
 func (c *responseLRU) moveFront(n *listNode) {
 	if c.head == n {
 		return
@@ -169,6 +181,7 @@ func (c *responseLRU) moveFront(n *listNode) {
 	c.pushFront(n)
 }
 
+// clear 清空全部缓存条目。
 func (c *responseLRU) clear() {
 	if c == nil {
 		return
@@ -180,14 +193,14 @@ func (c *responseLRU) clear() {
 	c.count = 0
 }
 
-// LLMHookBundle wires pre/post LLM hooks with shared cache and metrics.
+// LLMHookBundle 聚合 Pre/Post/Error 钩子共享的 LRU 缓存、指标与可选 ReasoningBank。
 type LLMHookBundle struct {
-	cache   *responseLRU
-	metrics *LLMMetrics
-	bank    *ReasoningBank
+	cache   *responseLRU   // 响应 LRU 缓存
+	metrics *LLMMetrics    // 调用指标
+	bank    *ReasoningBank // 可选：长响应写入粗粒度模式
 }
 
-// NewLLMHookBundle constructs hooks with optional reasoning bank for pattern extraction.
+// NewLLMHookBundle 构造钩子束；bank 可为 nil。
 func NewLLMHookBundle(bank *ReasoningBank) *LLMHookBundle {
 	return &LLMHookBundle{
 		cache:   newResponseLRU(),
@@ -196,7 +209,7 @@ func NewLLMHookBundle(bank *ReasoningBank) *LLMHookBundle {
 	}
 }
 
-// generateCacheKey builds a stable base64 key from provider, model, and messages.
+// generateCacheKey 对 provider、model、messages 的 JSON 序列化做 SHA256，再 Base64 编码为缓存键。
 func generateCacheKey(provider api.LLMProvider, model string, messages []api.LLMMessage) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(string(provider)))
@@ -208,6 +221,7 @@ func generateCacheKey(provider api.LLMProvider, model string, messages []api.LLM
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
+// getCached 从 bundle 的 LRU 读取缓存响应。
 func getCached(b *LLMHookBundle, key string) (*api.LLMResponse, bool) {
 	if b == nil || b.cache == nil {
 		return nil, false
@@ -215,6 +229,7 @@ func getCached(b *LLMHookBundle, key string) (*api.LLMResponse, bool) {
 	return b.cache.get(key)
 }
 
+// setCache 写入响应副本到 LRU（避免外部修改共享指针）。
 func setCache(b *LLMHookBundle, key string, resp *api.LLMResponse) {
 	if b == nil || b.cache == nil || resp == nil {
 		return
@@ -223,7 +238,8 @@ func setCache(b *LLMHookBundle, key string, resp *api.LLMResponse) {
 	b.cache.set(key, &cp)
 }
 
-// PreLLMCallHook checks cache, applies provider default optimizations, updates metrics on cache hit.
+// PreLLMCallHook 调用前拦截：生成 key，命中则更新指标并返回 (req, cached, true)；
+// 未命中则按 Provider 为 Temperature==0 填默认温度，并 record miss。
 func (b *LLMHookBundle) PreLLMCallHook(req *api.LLMRequest) (*api.LLMRequest, *api.LLMResponse, bool) {
 	if req == nil {
 		return nil, nil, false
@@ -251,7 +267,7 @@ func (b *LLMHookBundle) PreLLMCallHook(req *api.LLMRequest) (*api.LLMRequest, *a
 	return req, nil, false
 }
 
-// MetricsSnapshot returns LLM hook counters for observability.
+// MetricsSnapshot 返回 LLM 指标快照。
 func (b *LLMHookBundle) MetricsSnapshot() map[string]any {
 	if b == nil || b.metrics == nil {
 		return map[string]any{}
@@ -259,7 +275,7 @@ func (b *LLMHookBundle) MetricsSnapshot() map[string]any {
 	return b.metrics.Snapshot()
 }
 
-// ErrorLLMCallHook records failed LLM call metrics (provider/model for future tagging).
+// ErrorLLMCallHook 记录失败调用次数（provider/model/err 预留扩展，当前仅 err 未使用）。
 func (b *LLMHookBundle) ErrorLLMCallHook(provider, model string, err error) {
 	_ = provider
 	_ = model
@@ -270,7 +286,7 @@ func (b *LLMHookBundle) ErrorLLMCallHook(provider, model string, err error) {
 	b.metrics.recordErrorCall()
 }
 
-// ClearCache drops all cached LLM responses.
+// ClearCache 清空 LRU 中所有 LLM 响应缓存。
 func (b *LLMHookBundle) ClearCache() {
 	if b == nil || b.cache == nil {
 		return
@@ -278,7 +294,8 @@ func (b *LLMHookBundle) ClearCache() {
 	b.cache.clear()
 }
 
-// PostLLMCallHook stores response in LRU cache, records latency/tokens/cost, extracts coarse patterns from long text.
+// PostLLMCallHook 在调用成功后：累加 Calls/延迟/Token/费用，写入 LRU（key 通常与 Pre 中 generateCacheKey 一致）；
+// 若绑定 bank 且响应文本超过 2048 字符，则 StorePattern 一条粗粒度 long-response 模式。
 func (b *LLMHookBundle) PostLLMCallHook(key string, resp *api.LLMResponse, latency time.Duration, costUSD float64) {
 	if b == nil || resp == nil {
 		return
@@ -305,7 +322,7 @@ func (b *LLMHookBundle) PostLLMCallHook(key string, resp *api.LLMResponse, laten
 	}
 }
 
-// ExtractSnippetPatterns splits long assistant outputs into lightweight text patterns (line-based).
+// ExtractSnippetPatterns 将长文本按行切分，取长度≥20 的非空行最多 12 条，作为轻量级模式片段。
 func ExtractSnippetPatterns(text string) []string {
 	const maxLines = 12
 	lines := strings.Split(text, "\n")

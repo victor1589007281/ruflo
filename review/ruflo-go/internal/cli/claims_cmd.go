@@ -6,6 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 claims 命令组：基于声明的协调（授予、撤销、查询、列表）；部分子命令为占位，核心路径通过 claims_* MCP 工具。
+
+// newClaimsCmd 构建「claims」根子命令，挂载 claim、release、handoff、accept-handoff、status、list、board、rebalance。
 func newClaimsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "claims",
@@ -121,6 +124,7 @@ func claimsBoardCmd() *cobra.Command {
 	}
 }
 
+// claimsRebalanceCmd 占位：重新平衡各代理持有的声明。
 func claimsRebalanceCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "rebalance",

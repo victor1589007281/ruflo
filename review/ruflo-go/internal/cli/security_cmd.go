@@ -12,6 +12,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 security 命令组：scan 在本地仓库 Walk 查找疑似密钥与路径遍历片段；audit/report 调用 pkg/security 校验器做示例校验并输出占位说明。
+
+// newSecurityCmd 构建「security」根子命令，挂载 scan、audit、report。
 func newSecurityCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "security",
@@ -21,6 +24,7 @@ func newSecurityCmd() *cobra.Command {
 	return cmd
 }
 
+// securityScanCmd 从 root 目录递归扫描源码/配置扩展名，跳过 .git、vendor、node_modules，汇总可疑密钥与 ../ 序列。
 func securityScanCmd() *cobra.Command {
 	var root string
 	c := &cobra.Command{

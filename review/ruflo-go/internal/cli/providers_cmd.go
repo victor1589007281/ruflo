@@ -12,6 +12,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 providers 命令组：列举各 LLM 提供商在配置文件与环境变量中的密钥配置情况，支持写入/清除 claude-flow.config.json 中的密钥，并对各 provider 做 HealthCheck。
+
+// projectConfigPath 返回当前应使用的配置文件路径：优先全局 ConfigPath，否则为工作目录下 claude-flow.config.json。
 func projectConfigPath() (string, error) {
 	if ConfigPath != "" {
 		return ConfigPath, nil
@@ -32,6 +35,7 @@ func newProvidersCmd() *cobra.Command {
 	return cmd
 }
 
+// providersListCmd 读取项目配置与环境变量，表格或 JSON 输出各提供商是否「像已配置」。
 func providersListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -62,6 +66,7 @@ func providersListCmd() *cobra.Command {
 	}
 }
 
+// truth 将布尔值格式化为 yes/no 供列表展示。
 func truth(v bool) string {
 	if v {
 		return "yes"
@@ -69,6 +74,7 @@ func truth(v bool) string {
 	return "no"
 }
 
+// loadProjectConfig 通过 projectConfigPath 加载配置，不存在时使用 config.Load 的宽容行为。
 func loadProjectConfig() (config.RufloConfig, error) {
 	p, err := projectConfigPath()
 	if err != nil {
@@ -77,6 +83,7 @@ func loadProjectConfig() (config.RufloConfig, error) {
 	return config.Load(p, true)
 }
 
+// providersAddCmd 将 API 密钥写入配置文件对应字段（anthropic/openai/google），并确保目录存在。
 func providersAddCmd() *cobra.Command {
 	var name, key string
 	c := &cobra.Command{
@@ -115,6 +122,7 @@ func providersAddCmd() *cobra.Command {
 	return c
 }
 
+// providersRemoveCmd 清空指定提供商在配置文件中的密钥字段。
 func providersRemoveCmd() *cobra.Command {
 	var name string
 	c := &cobra.Command{

@@ -65,6 +65,7 @@ func embeddingsSearchCmd() *cobra.Command {
 	return c
 }
 
+// embeddingsCompareCmd 占位：需两段文本参数，提示通过 MCP 完整流水线完成相似度比较。
 func embeddingsCompareCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "compare",
@@ -79,6 +80,7 @@ func embeddingsCompareCmd() *cobra.Command {
 	}
 }
 
+// embeddingsStatusCmd 触发嵌入服务初始化/状态探活，调用 embeddings_init。
 func embeddingsStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",

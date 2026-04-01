@@ -1,3 +1,6 @@
+// hooks.go：hooks_* 核心 MCP 工具，串联 HookExecutor、ReasoningBank、WorkerManager 与 LLMHookBundle；
+// hooksMoreTools 的扩展定义在 hooks_more.go。
+
 package tools
 
 import (
@@ -12,6 +15,7 @@ import (
 	"github.com/ruflo/ruflo-go/pkg/hooks"
 )
 
+// hooksTools 构建 pre/post task、route、session、worker、model-route、metrics 等工具，并拼接 hooksMoreTools。
 func hooksTools() []*mcp.MCPTool {
 	base := []*mcp.MCPTool{
 		{
@@ -132,6 +136,7 @@ func hooksTools() []*mcp.MCPTool {
 	return append(base, hooksMoreTools()...)
 }
 
+// logHook 将一次钩子调用追加到 globalState.hooksLog，超过 500 条时保留尾部窗口。
 func logHook(name string, args map[string]any, res hooks.HookResult) {
 	globalState.mu.Lock()
 	globalState.hooksLog = append(globalState.hooksLog, hookInvocation{
@@ -146,12 +151,14 @@ func logHook(name string, args map[string]any, res hooks.HookResult) {
 	globalState.mu.Unlock()
 }
 
+// preTaskArgs 解析任务开始前钩子上下文。
 type preTaskArgs struct {
 	Description string `json:"description"`
 	SessionID   string `json:"session_id"`
 	AgentID     string `json:"agent_id"`
 }
 
+// handleHooksPreTask 执行 HookEventPreTask 并记录日志。
 func handleHooksPreTask(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a preTaskArgs
 	_ = parseArgs(args, &a)
@@ -168,12 +175,14 @@ func handleHooksPreTask(ctx context.Context, args json.RawMessage) (json.RawMess
 	return jsonOK(map[string]any{"result": res})
 }
 
+// postTaskArgs 解析任务结束后钩子参数。
 type postTaskArgs struct {
 	TaskID  string `json:"task_id"`
 	Success bool   `json:"success"`
 	Train   bool   `json:"train"`
 }
 
+// handleHooksPostTask 执行 HookEventPostTask，可选附带 Task 引用。
 func handleHooksPostTask(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a postTaskArgs
 	_ = parseArgs(args, &a)
@@ -192,12 +201,15 @@ func handleHooksPostTask(ctx context.Context, args json.RawMessage) (json.RawMes
 	return jsonOK(map[string]any{"result": res})
 }
 
+// routeArgs 描述待路由任务文本与可选复杂度，用于 ReasoningBank 与 tier 推断。
 type routeArgs struct {
 	Task        string  `json:"task"`
 	Description string  `json:"description"`
 	Complexity  float64 `json:"complexity"`
 }
 
+// handleHooksRouteTool：对描述做 HashEmbed384，调用 ReasoningBank.RouteTask；再跑 PreRoute/PostRoute，
+// 并按 complexity 写入 tier（1/2/3）到 pre_route.Data。
 func handleHooksRouteTool(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a routeArgs
 	_ = parseArgs(args, &a)
@@ -236,11 +248,13 @@ func handleHooksRouteTool(ctx context.Context, args json.RawMessage) (json.RawMe
 	})
 }
 
+// sessHookArgs 会话起止钩子共用参数。
 type sessHookArgs struct {
 	SessionID     string `json:"session_id"`
 	ExportMetrics bool   `json:"export_metrics"`
 }
 
+// handleHooksSessionStart 触发 HookEventSessionStart。
 func handleHooksSessionStart(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a sessHookArgs
 	_ = parseArgs(args, &a)
@@ -253,6 +267,7 @@ func handleHooksSessionStart(ctx context.Context, args json.RawMessage) (json.Ra
 	return jsonOK(map[string]any{"result": res})
 }
 
+// handleHooksSessionEnd 触发 HookEventSessionEnd，并传入 export_metrics。
 func handleHooksSessionEnd(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a sessHookArgs
 	_ = parseArgs(args, &a)
@@ -269,6 +284,7 @@ func handleHooksSessionEnd(ctx context.Context, args json.RawMessage) (json.RawM
 	return jsonOK(map[string]any{"result": res})
 }
 
+// handleHooksWorkerList 枚举 WorkerManager 中已注册 Worker 的摘要信息。
 func handleHooksWorkerList(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -289,10 +305,12 @@ func handleHooksWorkerList(ctx context.Context, args json.RawMessage) (json.RawM
 	return jsonOK(map[string]any{"workers": out, "count": len(out)})
 }
 
+// dispatchArgs 指定 Worker 派发触发器字符串。
 type dispatchArgs struct {
 	Trigger string `json:"trigger"`
 }
 
+// handleHooksWorkerDispatch 调用 WorkerManager.Dispatch 并包装为 HookResult 记录日志。
 func handleHooksWorkerDispatch(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a dispatchArgs
 	if err := parseArgs(args, &a); err != nil {
@@ -308,6 +326,7 @@ func handleHooksWorkerDispatch(ctx context.Context, args json.RawMessage) (json.
 	return jsonOK(map[string]any{"result": res})
 }
 
+// handleHooksWorkerStatus 逐个 Worker 查询 GetStatus，跳过查询失败的项。
 func handleHooksWorkerStatus(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -322,12 +341,14 @@ func handleHooksWorkerStatus(ctx context.Context, args json.RawMessage) (json.Ra
 	return jsonOK(map[string]any{"workers": st})
 }
 
+// modelRouteArgs 解析 LLM 预钩子所需的请求轮廓。
 type modelRouteArgs struct {
 	Provider string           `json:"provider"`
 	Model    string           `json:"model"`
 	Messages []api.LLMMessage `json:"messages"`
 }
 
+// handleHooksModelRoute 调用 PreLLMCallHook，返回缓存命中与指标快照。
 func handleHooksModelRoute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a modelRouteArgs
@@ -342,6 +363,7 @@ func handleHooksModelRoute(ctx context.Context, args json.RawMessage) (json.RawM
 	})
 }
 
+// handleHooksMetrics 返回 hooksLog 条数与 Worker 数量等粗粒度指标。
 func handleHooksMetrics(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args

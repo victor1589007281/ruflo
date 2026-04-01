@@ -11,12 +11,19 @@ import (
 	"github.com/ruflo/ruflo-go/pkg/swarm"
 )
 
+// 本文件：通过 pkg/swarm.UnifiedSwarmCoordinator 暴露拓扑、负载、共识与任务提交的 MCP 桥接工具。
+//
+// 设计思路：ensureCoordinator 使用 sync.Once 单例初始化网格拓扑+Raft 配置，并注册 bootstrap 代理；各 handler
+// 在失败时返回 MCPToolResult 错误字段；共识调用 ProposeConsensus 与带超时的 AwaitConsensus。
+
 var (
 	coordOnce    sync.Once
 	coordInst    *swarm.UnifiedSwarmCoordinator
 	coordInitErr error
 )
 
+// ensureCoordinator 懒加载全局协调器：首次调用时构造 CoordinatorConfig、Initialize、注册 coord-bootstrap 代理；
+// 返回单例与首次初始化错误（若有）。
 func ensureCoordinator() (*swarm.UnifiedSwarmCoordinator, error) {
 	coordOnce.Do(func() {
 		cfg := swarm.CoordinatorConfig{
@@ -43,6 +50,7 @@ func ensureCoordinator() (*swarm.UnifiedSwarmCoordinator, error) {
 	return coordInst, coordInitErr
 }
 
+// coordinationTools 注册 topology、load_balance、sync、node、consensus、orchestrate、metrics 工具。
 func coordinationTools() []*mcp.MCPTool {
 	obj := map[string]any{"type": "object", "properties": map[string]any{}}
 	return []*mcp.MCPTool{
@@ -56,7 +64,7 @@ func coordinationTools() []*mcp.MCPTool {
 	}
 }
 
-// RegisterCoordinationTools registers pkg/swarm coordination bridges.
+// RegisterCoordinationTools 将 pkg/swarm 协调桥接相关 MCP 工具注册到 ToolRegistry。
 func RegisterCoordinationTools(reg *mcp.ToolRegistry) error {
 	for _, t := range coordinationTools() {
 		if err := reg.Register(t); err != nil {
@@ -66,6 +74,7 @@ func RegisterCoordinationTools(reg *mcp.ToolRegistry) error {
 	return nil
 }
 
+// handleCoordinationTopology 确认协调器与 Topology 非 nil，返回固定 mesh 摘要（backend 标识 pkg/swarm）。
 func handleCoordinationTopology(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	c, err := ensureCoordinator()
 	if err != nil {
@@ -77,6 +86,7 @@ func handleCoordinationTopology(_ context.Context, _ map[string]any) mcp.MCPTool
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"backend": "pkg/swarm", "topology": "mesh"}}
 }
 
+// handleCoordinationLoadBalance 列举池内代理，累加 Metrics.Extra["load"] 作为 aggregate_load，并返回池大小与代理数。
 func handleCoordinationLoadBalance(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	c, err := ensureCoordinator()
 	if err != nil {
@@ -96,6 +106,7 @@ func handleCoordinationLoadBalance(_ context.Context, _ map[string]any) mcp.MCPT
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"pool_size": p.Size(), "agents": len(agents), "aggregate_load": load}}
 }
 
+// handleCoordinationSync 确保协调器已初始化，返回占位同步成功与时间戳。
 func handleCoordinationSync(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	if _, err := ensureCoordinator(); err != nil {
 		return mcp.MCPToolResult{OK: false, Error: err.Error()}
@@ -103,6 +114,7 @@ func handleCoordinationSync(_ context.Context, _ map[string]any) mcp.MCPToolResu
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"synced": true, "at": now()}}
 }
 
+// handleCoordinationNode 向拓扑添加节点：agent_id 必填，role 默认 worker，调用 Topology().AddNode。
 func handleCoordinationNode(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	aid := strArg(m, "agent_id")
 	if aid == "" {
@@ -122,6 +134,7 @@ func handleCoordinationNode(_ context.Context, m map[string]any) mcp.MCPToolResu
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"agent_id": aid, "role": role}}
 }
 
+// handleCoordinationConsensus 提交 value（默认 "ok"）的字节提案，等待最多 2s，返回 proposal_id、committed 与 await 错误字符串。
 func handleCoordinationConsensus(ctx context.Context, m map[string]any) mcp.MCPToolResult {
 	v := strArg(m, "value")
 	if v == "" {
@@ -141,6 +154,7 @@ func handleCoordinationConsensus(ctx context.Context, m map[string]any) mcp.MCPT
 	}}
 }
 
+// handleCoordinationOrchestrate 构造 TaskDefinition（默认标题 mcp-task）并 SubmitTask，返回 task_id 与初始 status。
 func handleCoordinationOrchestrate(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	title := strArg(m, "title")
 	if title == "" {
@@ -166,6 +180,7 @@ func handleCoordinationOrchestrate(_ context.Context, m map[string]any) mcp.MCPT
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"task_id": t.ID, "status": t.Status}}
 }
 
+// handleCoordinationMetrics 返回消息总线 Stats（处理量、每秒消息）与当前池大小。
 func handleCoordinationMetrics(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	c, err := ensureCoordinator()
 	if err != nil {

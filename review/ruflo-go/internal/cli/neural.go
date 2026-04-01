@@ -42,6 +42,7 @@ func neuralTrainCmd() *cobra.Command {
 	return c
 }
 
+// neuralPredictCmd 根据 query 做模式预测/检索，调用 neural_predict。
 func neuralPredictCmd() *cobra.Command {
 	var query string
 	c := &cobra.Command{
@@ -61,6 +62,7 @@ func neuralPredictCmd() *cobra.Command {
 	return c
 }
 
+// neuralPatternsCmd 列出已学习或已注册的模式，调用 neural_patterns。
 func neuralPatternsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "patterns",
@@ -75,6 +77,7 @@ func neuralPatternsCmd() *cobra.Command {
 	}
 }
 
+// neuralStatusCmd 输出神经子系统运行状态，调用 neural_status。
 func neuralStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",

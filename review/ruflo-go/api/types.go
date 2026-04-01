@@ -1,11 +1,13 @@
-// Package api defines shared domain types for Ruflo orchestration (agents, tasks, memory, MCP, LLM, guidance, learning).
+// Package api 定义 Ruflo 编排跨模块共享的领域类型：代理、任务、记忆、消息、蜂群、钩子、LLM、治理与学习等。
+//
+// 设计思路：JSON 标签与 CLI/MCP 交换格式对齐；部分运行态字段（如 Embedding、TTL）用 json:"-" 避免无谓序列化。
 package api
 
 import "time"
 
-// --- Agent -------------------------------------------------------------------
+// --- Agent（代理）------------------------------------------------------------
 
-// AgentState is the lifecycle state of an agent process or registration.
+// AgentState 表示代理进程或注册项的生命周期状态。
 type AgentState string
 
 const (
@@ -20,7 +22,7 @@ const (
 	AgentStateSuspended AgentState = "suspended"
 )
 
-// AgentType classifies the role of an agent in a swarm.
+// AgentType 区分蜂群中代理承担的角色类型。
 type AgentType string
 
 const (
@@ -40,7 +42,7 @@ const (
 	AgentTypeQueen               AgentType = "queen"
 )
 
-// AgentDomain is a bounded context label for routing and policy.
+// AgentDomain 有界上下文标签，用于路由、配额与策略绑定。
 type AgentDomain string
 
 const (
@@ -57,7 +59,7 @@ const (
 	AgentDomainSupport     AgentDomain = "support"
 )
 
-// AgentStatus is a coarse health/availability signal.
+// AgentStatus 粗粒度健康与可用性信号（与 State 互补：State 偏流程，Status 偏观测）。
 type AgentStatus string
 
 const (
@@ -70,45 +72,45 @@ const (
 	AgentStatusTerminated AgentStatus = "terminated"
 )
 
-// AgentCapabilities describes what an agent can do.
+// AgentCapabilities 描述代理可调用的工具、技能与并发能力上限等。
 type AgentCapabilities struct {
-	Tools       []string          `json:"tools,omitempty"`
-	Skills      []string          `json:"skills,omitempty"`
-	MaxParallel int               `json:"max_parallel,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	Tools       []string          `json:"tools,omitempty"`        // 工具名或 MCP 工具 ID 列表
+	Skills      []string          `json:"skills,omitempty"`       // 技能/工作流标识
+	MaxParallel int               `json:"max_parallel,omitempty"` // 最大并行任务数
+	Metadata    map[string]string `json:"metadata,omitempty"`     // 扩展键值
 }
 
-// AgentMetrics captures runtime counters for an agent.
+// AgentMetrics 聚合代理运行期计数与延迟分位数，用于调度与容量规划。
 type AgentMetrics struct {
-	TasksCompleted   int64              `json:"tasks_completed"`
-	TasksFailed      int64              `json:"tasks_failed"`
-	CPUMillis        int64              `json:"cpu_millis,omitempty"`
-	MemoryBytes      int64              `json:"memory_bytes,omitempty"`
+	TasksCompleted   int64              `json:"tasks_completed"`         // 成功完成任务数
+	TasksFailed      int64              `json:"tasks_failed"`            // 失败任务数
+	CPUMillis        int64              `json:"cpu_millis,omitempty"`    // 累计 CPU 毫秒（可选）
+	MemoryBytes      int64              `json:"memory_bytes,omitempty"`  // 常驻内存估算
 	LatencyP50Millis float64            `json:"latency_p50_millis,omitempty"`
 	LatencyP99Millis float64            `json:"latency_p99_millis,omitempty"`
 	LastHeartbeat    time.Time          `json:"last_heartbeat,omitempty"`
-	Extra            map[string]float64 `json:"extra,omitempty"`
+	Extra            map[string]float64 `json:"extra,omitempty"` // 自定义浮点指标
 }
 
-// Agent describes a registered orchestration agent.
+// Agent 描述已注册的一条编排代理实例（可持久化或经 API 返回）。
 type Agent struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	Type         AgentType         `json:"type"`
-	Domain       AgentDomain       `json:"domain"`
-	State        AgentState        `json:"state"`
-	Status       AgentStatus       `json:"status"`
+	ID           string            `json:"id"`           // 唯一 ID
+	Name         string            `json:"name"`         // 显示名
+	Type         AgentType         `json:"type"`         // 角色类型
+	Domain       AgentDomain       `json:"domain"`       // 所属领域
+	State        AgentState        `json:"state"`        // 生命周期状态
+	Status       AgentStatus       `json:"status"`       // 健康/可用摘要
 	Capabilities AgentCapabilities `json:"capabilities"`
 	Metrics      AgentMetrics      `json:"metrics"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
-	Namespace    string            `json:"namespace,omitempty"`
-	Labels       map[string]string `json:"labels,omitempty"`
+	Namespace    string            `json:"namespace,omitempty"` // 记忆/隔离命名空间
+	Labels       map[string]string `json:"labels,omitempty"`    // 调度与筛选标签
 }
 
-// --- Task --------------------------------------------------------------------
+// --- Task（任务）------------------------------------------------------------
 
-// TaskType categorizes work units.
+// TaskType 对工作单元做语义分类，便于路由到专门代理或策略。
 type TaskType string
 
 const (
@@ -125,7 +127,7 @@ const (
 	TaskTypeDeployment     TaskType = "deployment"
 )
 
-// TaskStatus is task lifecycle.
+// TaskStatus 任务生命周期状态（队列、执行、终态等）。
 type TaskStatus string
 
 const (
@@ -142,7 +144,7 @@ const (
 	TaskStatusCompleted TaskStatus = "completed"
 )
 
-// TaskPriority is relative scheduling weight (higher = more urgent).
+// TaskPriority 相对调度权重，数值越大越优先（与具体调度算法结合使用）。
 type TaskPriority int
 
 const (
@@ -226,9 +228,9 @@ const (
 	MemoryTypePattern    MemoryType = "pattern"
 )
 
-// --- Messaging ---------------------------------------------------------------
+// --- Messaging（消息）--------------------------------------------------------
 
-// MessageType classifies inter-agent or system messages.
+// MessageType 区分代理间或系统消息的语义类别。
 type MessageType string
 
 const (
@@ -244,7 +246,7 @@ const (
 	MessageTypeACK       MessageType = "ack"
 )
 
-// MessagePriority for delivery ordering hints.
+// MessagePriority 投递优先级提示（总线可实现抢占或加权队列）。
 type MessagePriority int
 
 const (
@@ -303,7 +305,7 @@ const (
 	SwarmStatusShuttingDown SwarmStatus = "shutting_down"
 )
 
-// SwarmEvent is emitted by the orchestrator.
+// SwarmEvent 由编排器发出的事件负载，供日志、订阅与回放。
 type SwarmEvent struct {
 	Type      SwarmEventType `json:"type"`
 	SwarmID   string         `json:"swarm_id"`
@@ -314,9 +316,9 @@ type SwarmEvent struct {
 	Timestamp time.Time      `json:"timestamp"`
 }
 
-// --- Hooks -------------------------------------------------------------------
+// --- Hooks（钩子）------------------------------------------------------------
 
-// HookPriority orders hook execution.
+// HookPriority 钩子执行顺序权重（数值大者优先或靠后由实现约定，此处为排序键）。
 type HookPriority int
 
 const (
@@ -325,7 +327,7 @@ const (
 	HookPriorityHigh   HookPriority = 90
 )
 
-// HookContext is passed into hook handlers.
+// HookContext 传入钩子处理器的上下文：会话、任务、代理与环境快照。
 type HookContext struct {
 	HookName  string            `json:"hook_name"`
 	SessionID string            `json:"session_id,omitempty"`
@@ -335,7 +337,7 @@ type HookContext struct {
 	Args      map[string]any    `json:"args,omitempty"`
 }
 
-// HookEvent classifies hook invocations.
+// HookEvent 钩子调用种类（任务前后、编辑前后、会话等）。
 type HookEvent string
 
 const (
@@ -354,7 +356,7 @@ const (
 	HookEventAgentTerminate HookEvent = "agent_terminate"
 )
 
-// HookResult is the outcome of a hook.
+// HookResult 单次钩子执行结果与可选结构化数据。
 type HookResult struct {
 	OK       bool           `json:"ok"`
 	Message  string         `json:"message,omitempty"`
@@ -362,9 +364,9 @@ type HookResult struct {
 	Duration time.Duration  `json:"-"`
 }
 
-// --- LLM ---------------------------------------------------------------------
+// --- LLM（大语言模型）--------------------------------------------------------
 
-// LLMProvider names a model backend.
+// LLMProvider 模型后端标识枚举（与 pkg/providers 注册名对齐）。
 type LLMProvider string
 
 const (
@@ -381,14 +383,14 @@ const (
 	LLMProviderLiteLLM    LLMProvider = "litellm"
 )
 
-// LLMMessage is one chat turn.
+// LLMMessage 多轮对话中的单条消息（OpenAI/类 Chat 语义）。
 type LLMMessage struct {
-	Role    string `json:"role"` // system, user, assistant, tool
+	Role    string `json:"role"` // system、user、assistant、tool 等
 	Content string `json:"content,omitempty"`
-	Name    string `json:"name,omitempty"`
+	Name    string `json:"name,omitempty"` // 工具调用等场景下的名称
 }
 
-// LLMRequest is a unified completion request.
+// LLMRequest 统一补全请求：各 Provider 适配层负责映射到厂商 JSON。
 type LLMRequest struct {
 	Provider    LLMProvider       `json:"provider"`
 	Model       string            `json:"model"`
@@ -397,18 +399,18 @@ type LLMRequest struct {
 	Temperature float64           `json:"temperature,omitempty"`
 	TopP        float64           `json:"top_p,omitempty"`
 	Stop        []string          `json:"stop,omitempty"`
-	Tools       []map[string]any  `json:"tools,omitempty"`
+	Tools       []map[string]any  `json:"tools,omitempty"` // 工具 schema
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
-// LLMUsage reports token accounting when available.
+// LLMUsage Token 用量统计（输入/输出/合计）。
 type LLMUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
 }
 
-// LLMResponse is a normalized model output.
+// LLMResponse 归一化后的模型输出（文本、工具调用、用量与原始片段）。
 type LLMResponse struct {
 	Provider     LLMProvider    `json:"provider"`
 	Model        string         `json:"model"`
@@ -419,7 +421,7 @@ type LLMResponse struct {
 	Raw          map[string]any `json:"raw,omitempty"`
 }
 
-// LLMToolCall is a structured tool invocation from the model.
+// LLMToolCall 模型发起的结构化工具调用（参数可解析为 map，RawJSON 保留原文）。
 type LLMToolCall struct {
 	ID        string         `json:"id"`
 	Name      string         `json:"name"`
@@ -427,26 +429,26 @@ type LLMToolCall struct {
 	RawJSON   string         `json:"raw_json,omitempty"`
 }
 
-// --- Guidance / policy -------------------------------------------------------
+// --- Guidance / policy（治理与策略）----------------------------------------
 
-// GuidanceRule is a single enforceable rule.
+// GuidanceRule 单条可执行规则：严重级别与表达式由上层引擎解释。
 type GuidanceRule struct {
 	ID          string            `json:"id"`
 	Name        string            `json:"name"`
 	Description string            `json:"description,omitempty"`
-	Severity    string            `json:"severity,omitempty"` // info, warn, block
+	Severity    string            `json:"severity,omitempty"` // info、warn、block
 	Expression  string            `json:"expression,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
-// RuleShard partitions rules for distribution.
+// RuleShard 规则分片，用于大规模规则集的分发与增量同步。
 type RuleShard struct {
 	ShardID string         `json:"shard_id"`
 	Rules   []GuidanceRule `json:"rules"`
 	Version string         `json:"version"`
 }
 
-// PolicyBundle is a versioned set of shards.
+// PolicyBundle 版本化的分片集合（一次策略发布的快照）。
 type PolicyBundle struct {
 	ID        string      `json:"id"`
 	Version   string      `json:"version"`
@@ -454,9 +456,9 @@ type PolicyBundle struct {
 	CreatedAt time.Time   `json:"created_at"`
 }
 
-// --- Learning (ReasoningBank-style) -----------------------------------------
+// --- Learning（ReasoningBank 风格学习）--------------------------------------
 
-// Pattern is a distilled reusable outcome.
+// Pattern 蒸馏后的可复用模式（可挂向量用于相似检索）。
 type Pattern struct {
 	ID          string            `json:"id"`
 	Name        string            `json:"name"`
@@ -467,7 +469,7 @@ type Pattern struct {
 	CreatedAt   time.Time         `json:"created_at"`
 }
 
-// TrajectoryStep is one step in an agent trajectory.
+// TrajectoryStep 代理轨迹中的单步：动作、奖励与观测。
 type TrajectoryStep struct {
 	StepIndex int               `json:"step_index"`
 	Action    string            `json:"action"`
@@ -477,17 +479,17 @@ type TrajectoryStep struct {
 	Timestamp time.Time         `json:"timestamp"`
 }
 
-// Trajectory is a full episode.
+// Trajectory 完整一条回合（episode）及总体裁决。
 type Trajectory struct {
 	ID        string           `json:"id"`
 	Steps     []TrajectoryStep `json:"steps"`
-	Verdict   string           `json:"verdict,omitempty"` // success, failure, partial
+	Verdict   string           `json:"verdict,omitempty"` // success、failure、partial
 	CreatedAt time.Time        `json:"created_at"`
 }
 
-// --- Swarm topology / consensus (pkg/swarm) -----------------------------------
+// --- Swarm topology / consensus（与 pkg/swarm 对应）-------------------------
 
-// TopologyType names coordination graph shape.
+// TopologyType 协调拓扑图形状名称。
 type TopologyType string
 
 const (
@@ -501,7 +503,7 @@ const (
 	TopologyHybrid           TopologyType = "hybrid"
 )
 
-// ConsensusAlgorithm selects agreement strategy.
+// ConsensusAlgorithm 多代理达成一致所采用的算法标识。
 type ConsensusAlgorithm string
 
 const (

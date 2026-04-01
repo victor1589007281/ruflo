@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 )
 
-// Save writes bundle to path as JSON using an atomic rename.
+// 本文件：PolicyBundle 磁盘持久化。Save 采用临时文件写入、fsync、close 后 rename 实现近似原子替换；Load 反序列化 JSON。
+
+// Save 将 bundle 以缩进 JSON 写入 path：创建临时文件、Write、Sync、Close、Rename，失败时清理临时路径。
 func Save(bundle PolicyBundle, path string) error {
 	if path == "" {
 		return fmt.Errorf("guidance: empty path")
@@ -46,7 +48,7 @@ func Save(bundle PolicyBundle, path string) error {
 	return nil
 }
 
-// Load reads a PolicyBundle from JSON at path.
+// Load 从 path 读取 JSON 并反序列化为 PolicyBundle。
 func Load(path string) (PolicyBundle, error) {
 	var b PolicyBundle
 	if path == "" {

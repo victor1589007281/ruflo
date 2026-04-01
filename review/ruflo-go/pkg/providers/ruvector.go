@@ -1,3 +1,11 @@
+// 本文件封装 RuVector 或兼容 OpenAI「传统 Completions」形态的本地/自研推理端点（POST {BaseURL}/v1/completions）。
+//
+// 消息格式转换（统一多轮对话 → 单 prompt 补全）：
+//   - Chat 风格的 Messages 列表无法直接传入 completions API，故将每条消息格式化为「ROLE: 内容」行（role 转大写），
+//     多行拼接为单一 prompt 字符串；空 prompt 报错。
+//   - 请求体使用 model、prompt、max_tokens（默认 256）、可选 temperature。
+// 响应侧：parseCompletionsResponse 兼容 OpenAI 风格 choices[0].text 或 choices[0].message.content，并读取 finish_reason。
+// 与 Chat Completions 相比：不进行逐条 message 结构映射，适合 RuVector 侧只暴露 completions 路由的部署。
 package providers
 
 import (
@@ -15,14 +23,14 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
-// RuVectorProvider calls a local RuVector/OpenAI-compatible completions endpoint.
+// RuVectorProvider 调用本地或自托管的 RuVector（OpenAI completions 兼容）端点。
 type RuVectorProvider struct {
-	BaseURL    string
-	HTTPClient *http.Client
-	Model      string
+	BaseURL    string       // 服务根 URL，默认来自环境 RUVECTOR_BASE_URL 或 localhost:8080
+	HTTPClient *http.Client // 可注入；nil 为默认超时
+	Model      string       // 默认模型名，请求未指定时使用
 }
 
-// NewRuVectorProviderFromEnv uses RUVECTOR_BASE_URL (default http://localhost:8080).
+// NewRuVectorProviderFromEnv 从 RUVECTOR_BASE_URL 构造 Provider；空则默认 http://localhost:8080。
 func NewRuVectorProviderFromEnv() *RuVectorProvider {
 	base := os.Getenv("RUVECTOR_BASE_URL")
 	if strings.TrimSpace(base) == "" {
@@ -35,10 +43,10 @@ func NewRuVectorProviderFromEnv() *RuVectorProvider {
 	}
 }
 
-// Name returns the provider id.
+// Name 返回 api.LLMProviderRuvector 标识。
 func (p *RuVectorProvider) Name() string { return string(api.LLMProviderRuvector) }
 
-// Complete POSTs /v1/completions with a prompt built from messages.
+// Complete 向 /v1/completions 发送由 Messages 拼装的 prompt；转换规则见文件头。
 func (p *RuVectorProvider) Complete(ctx context.Context, req api.LLMRequest) (*api.LLMResponse, error) {
 	base := p.BaseURL
 	if base == "" {
@@ -119,6 +127,7 @@ func (p *RuVectorProvider) Complete(ctx context.Context, req api.LLMRequest) (*a
 	}, nil
 }
 
+// parseCompletionsResponse 解析类 OpenAI completions JSON：优先 choices[0].text，否则 choices[0].message.content。
 func parseCompletionsResponse(b []byte) (text, finish string) {
 	var openaiStyle struct {
 		Choices []struct {
@@ -142,12 +151,12 @@ func parseCompletionsResponse(b []byte) (text, finish string) {
 	return ch.Message.Content, ch.FinishReason
 }
 
-// StreamComplete is not implemented.
+// StreamComplete 未实现。
 func (p *RuVectorProvider) StreamComplete(ctx context.Context, req api.LLMRequest) (io.ReadCloser, error) {
 	return nil, errors.New("ruvector: streaming not implemented")
 }
 
-// HealthCheck probes the base URL.
+// HealthCheck 对 BaseURL+"/" 发 GET，能连通即视为健康（轻量探活）。
 func (p *RuVectorProvider) HealthCheck(ctx context.Context) error {
 	base := p.BaseURL
 	if base == "" {
@@ -172,7 +181,7 @@ func (p *RuVectorProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// EstimateCost returns a low synthetic score for local routing.
+// EstimateCost 返回与消息条数成正比的极小分值，便于在混合路由中倾向本地/低成本后端。
 func (p *RuVectorProvider) EstimateCost(req api.LLMRequest) float64 {
 	return float64(len(req.Messages)) * 1e-6
 }

@@ -1,3 +1,6 @@
+// hooks_more.go：扩展 hooks 与 intelligence 相关 MCP 工具（pre/post edit/command、SONA 轨迹、
+// ReasoningBank 模式存储/检索、telemetry 文件 intelligence.json）；与 hooks.go 中 hooksTools 组合使用。
+
 package tools
 
 import (
@@ -15,7 +18,7 @@ import (
 	nlp "github.com/ruflo/ruflo-go/pkg/neural"
 )
 
-// hooksMoreTools returns additional hook and intelligence MCP tools.
+// hooksMoreTools 返回附加的一大批工具定义（多数通过 toolHandler 绑定 map 风格处理函数）。
 func hooksMoreTools() []*mcp.MCPTool {
 	obj := map[string]any{"type": "object", "properties": map[string]any{}}
 	return []*mcp.MCPTool{
@@ -49,7 +52,7 @@ func hooksMoreTools() []*mcp.MCPTool {
 }
 
 var (
-	intelMu sync.Mutex
+	intelMu     sync.Mutex
 	intelEvents []map[string]any
 )
 
@@ -81,6 +84,7 @@ func handleHooksPostEdit(_ context.Context, m map[string]any) mcp.MCPToolResult 
 	return hookRes(res)
 }
 
+// handleHooksPreCommand 在命令执行前运行钩子（Command 字段）。
 func handleHooksPreCommand(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	cmd := strArg(m, "command")
 	hc := hooks.HookContext{Command: cmd, Args: m}
@@ -170,6 +174,7 @@ func handleHooksIntelligence(_ context.Context, _ map[string]any) mcp.MCPToolRes
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"intel_events": n, "sona_patterns": sonaN}}
 }
 
+// handleHooksIntelligenceReset 清空内存事件并重写空 intelligence.json。
 func handleHooksIntelligenceReset(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	intelMu.Lock()
 	intelEvents = nil
@@ -178,6 +183,7 @@ func handleHooksIntelligenceReset(_ context.Context, _ map[string]any) mcp.MCPTo
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"reset": true}}
 }
 
+// handleHooksIntelTrajStart 调用 SONA BeginTrajectory 并 intelAppend 记录。
 func handleHooksIntelTrajStart(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	if globalState.sona == nil {
 		return mcp.MCPToolResult{OK: false, Error: "sona nil"}
@@ -187,6 +193,7 @@ func handleHooksIntelTrajStart(_ context.Context, m map[string]any) mcp.MCPToolR
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"trajectory_id": id}}
 }
 
+// handleHooksIntelTrajStep 向轨迹追加 Observation 步骤。
 func handleHooksIntelTrajStep(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	tid := strArg(m, "trajectory_id")
 	if globalState.sona == nil {
@@ -200,6 +207,7 @@ func handleHooksIntelTrajStep(_ context.Context, m map[string]any) mcp.MCPToolRe
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"trajectory_id": tid}}
 }
 
+// handleHooksIntelTrajEnd 结束轨迹并传入 verdict 字符串。
 func handleHooksIntelTrajEnd(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	tid := strArg(m, "trajectory_id")
 	if globalState.sona == nil {
@@ -210,6 +218,7 @@ func handleHooksIntelTrajEnd(_ context.Context, m map[string]any) mcp.MCPToolRes
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"trajectory_id": tid}}
 }
 
+// handleHooksIntelPatternStore 将 strategy/domain 写入 ReasoningBank。
 func handleHooksIntelPatternStore(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	p := &hooks.GuidancePattern{
 		Strategy: strArg(m, "strategy"),
@@ -223,6 +232,7 @@ func handleHooksIntelPatternStore(_ context.Context, m map[string]any) mcp.MCPTo
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"id": stored.ID}}
 }
 
+// handleHooksIntelPatternSearch 对 query 做 HashEmbed384 后在 ReasoningBank 中 Top-K 搜索。
 func handleHooksIntelPatternSearch(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	q := strArg(m, "query")
 	k := 5
@@ -234,6 +244,7 @@ func handleHooksIntelPatternSearch(_ context.Context, m map[string]any) mcp.MCPT
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"patterns": hits}}
 }
 
+// handleHooksIntelStats 汇总 hooksLog 条数与 SONA 模式数。
 func handleHooksIntelStats(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	globalState.mu.RLock()
 	nLog := len(globalState.hooksLog)
@@ -245,6 +256,7 @@ func handleHooksIntelStats(_ context.Context, _ map[string]any) mcp.MCPToolResul
 	return mcp.MCPToolResult{OK: true, Data: out}
 }
 
+// handleHooksIntelLearn 向 SONA 记录一条 Signal（kind + 全参负载）。
 func handleHooksIntelLearn(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	if globalState.sona == nil {
 		return mcp.MCPToolResult{OK: false, Error: "sona nil"}
@@ -253,17 +265,20 @@ func handleHooksIntelLearn(_ context.Context, m map[string]any) mcp.MCPToolResul
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"recorded": true}}
 }
 
+// handleHooksIntelAttention 返回固定权重向量占位（与 focus 回显）。
 func handleHooksIntelAttention(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	f := strArg(m, "focus")
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"focus": f, "weights": []float64{0.5, 0.3, 0.2}}}
 }
 
+// handleHooksWorkerDetect 以 detect 上下文向 audit 触发器派发 Worker。
 func handleHooksWorkerDetect(ctx context.Context, m map[string]any) mcp.MCPToolResult {
 	wctx := hooks.WorkerContext{Trigger: "detect", Args: m}
 	results := globalState.workerMgr.Dispatch(ctx, "audit", wctx)
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"results": results}}
 }
 
+// handleHooksModelOutcome 构造桩 LLMResponse 并调用 PostLLMCallHook 记录 token 用量。
 func handleHooksModelOutcome(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	tok := 0
 	if v, ok := m["tokens"].(float64); ok {
@@ -279,21 +294,25 @@ func handleHooksModelOutcome(_ context.Context, m map[string]any) mcp.MCPToolRes
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"recorded": true}}
 }
 
+// handleHooksModelStats 返回 LLMHookBundle.MetricsSnapshot。
 func handleHooksModelStats(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"metrics": globalState.llmHooks.MetricsSnapshot()}}
 }
 
+// handleHooksWorkerCancel 占位：声明未跟踪可取消任务。
 func handleHooksWorkerCancel(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	w := strArg(m, "worker")
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"worker": w, "cancelled": false, "note": "no active cancellable job tracked"}}
 }
 
+// hookRes 将 hooks.HookResult 转为 MCPToolResult（Success 且 Error 空视为 OK）。
 func hookRes(res hooks.HookResult) mcp.MCPToolResult {
 	ok := res.Success && res.Error == ""
 	return mcp.MCPToolResult{OK: ok, Data: map[string]any{"result": res}, Error: res.Error}
 }
 
 func init() {
+	// 启动时尝试从 intelligence.json 恢复 intelEvents，供 hooks_intelligence 系列读取。
 	b, err := os.ReadFile(intelPath())
 	if err != nil {
 		return

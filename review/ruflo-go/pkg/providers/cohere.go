@@ -1,3 +1,4 @@
+// 本文件封装 Cohere Chat API v2：角色映射、解析 message.content（字符串或块数组），兼容多种响应形状。
 package providers
 
 import (
@@ -17,14 +18,14 @@ import (
 
 const cohereChatV2 = "https://api.cohere.ai/v2/chat"
 
-// CohereProvider calls Cohere chat API v2.
+// CohereProvider 使用 Bearer 调用 https://api.cohere.ai/v2/chat。
 type CohereProvider struct {
-	APIKey     string
-	HTTPClient *http.Client
-	Model      string
+	APIKey     string       // API 密钥，可运行时从环境再读
+	HTTPClient *http.Client // 可注入客户端
+	Model      string       // 默认 command-r 系列等
 }
 
-// NewCohereProviderFromEnv uses COHERE_API_KEY and optional model override.
+// NewCohereProviderFromEnv 从 COHERE_API_KEY 初始化。
 func NewCohereProviderFromEnv() *CohereProvider {
 	return &CohereProvider{
 		APIKey: os.Getenv("COHERE_API_KEY"),
@@ -32,9 +33,10 @@ func NewCohereProviderFromEnv() *CohereProvider {
 	}
 }
 
-// Name returns the provider id.
+// Name 返回 api.LLMProviderCohere。
 func (p *CohereProvider) Name() string { return string(api.LLMProviderCohere) }
 
+// mapCohereRole 将通用 role 映射为 Cohere 接受的 system/user/assistant/tool。
 func mapCohereRole(role string) string {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case "system":
@@ -48,7 +50,7 @@ func mapCohereRole(role string) string {
 	}
 }
 
-// Complete performs a chat completion.
+// Complete 发送 messages 数组，extractCohereMessageText 聚合文本与 finish_reason。
 func (p *CohereProvider) Complete(ctx context.Context, req api.LLMRequest) (*api.LLMResponse, error) {
 	key := p.APIKey
 	if key == "" {
@@ -127,6 +129,7 @@ func (p *CohereProvider) Complete(ctx context.Context, req api.LLMRequest) (*api
 	}, nil
 }
 
+// extractCohereMessageText 先尝试 message.content 为字符串，再尝试 [{type,text}] 块数组，最后退回顶层 text 字段。
 func extractCohereMessageText(b []byte) (text string, finish string) {
 	var outer struct {
 		Message struct {
@@ -164,12 +167,12 @@ func extractCohereMessageText(b []byte) (text string, finish string) {
 	return text, finish
 }
 
-// StreamComplete is not implemented.
+// StreamComplete 未实现。
 func (p *CohereProvider) StreamComplete(ctx context.Context, req api.LLMRequest) (io.ReadCloser, error) {
 	return nil, errors.New("cohere: streaming not implemented")
 }
 
-// HealthCheck lists models (lightweight auth check).
+// HealthCheck GET /v1/models，401/403 视为鉴权失败。
 func (p *CohereProvider) HealthCheck(ctx context.Context) error {
 	key := p.APIKey
 	if key == "" {
@@ -201,7 +204,7 @@ func (p *CohereProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// EstimateCost returns a rough score for load balancing.
+// EstimateCost 用消息条数粗估 Token 再乘系数，供策略比较。
 func (p *CohereProvider) EstimateCost(req api.LLMRequest) float64 {
 	tok := len(req.Messages) * 200
 	return float64(tok) * 8e-7

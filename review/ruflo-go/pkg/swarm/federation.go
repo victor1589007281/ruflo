@@ -1,3 +1,5 @@
+// 联邦中心（swarm 包）：跨多个子 Swarm 注册表、消息路由与临时 Agent（TTL）；SelectOptimalSwarm 按容量、心跳新鲜度与能力重叠打分；
+// Vote/Propose 维护 proposalID -> swarmID -> 票的映射实现联邦级法定人数；无 Bus 时消息暂存 messages 内存队列。
 package swarm
 
 import (
@@ -10,35 +12,35 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
-// FederationSwarm is a registrable swarm participant.
+// FederationSwarm 联邦中的一个蜂群参与者，可挂接本地总线与协调器。
 type FederationSwarm struct {
-	ID            string
-	Capabilities  []string
-	Capacity      float64
-	LastHeartbeat time.Time
-	Bus           *MessageBus
-	Coordinator   *UnifiedSwarmCoordinator
+	ID            string                   // 蜂群唯一 id
+	Capabilities  []string                 // 能力标签供路由打分
+	Capacity      float64                  // 容量权重（≤0 时按 1 处理）
+	LastHeartbeat time.Time                // 最后存活时间
+	Bus           *MessageBus              // 可选：直连投递
+	Coordinator   *UnifiedSwarmCoordinator // 可选：与单群协调器绑定
 }
 
-// EphemeralAgent is short-lived cross-swarm worker.
+// EphemeralAgent 跨群短期工人，到期应由 PruneEphemeral 清理。
 type EphemeralAgent struct {
-	ID        string
-	SwarmID   string
-	ExpiresAt time.Time
+	ID        string    // 全局临时 id
+	SwarmID   string    // 所属蜂群
+	ExpiresAt time.Time // 绝对过期时间
 }
 
-// FederationHub coordinates multiple swarms and ephemeral agents.
+// FederationHub 进程内联邦注册表与投票状态机。
 type FederationHub struct {
 	mu sync.RWMutex
 
 	swarms    map[string]*FederationSwarm
 	ephemeral map[string]*EphemeralAgent
-	messages  map[string][]api.Message
+	messages  map[string][]api.Message // Bus 为空时的退避队列
 
-	quorumVotes map[string]map[string]bool
+	quorumVotes map[string]map[string]bool // proposalID -> swarmID -> 赞成与否
 }
 
-// NewFederationHub constructs an empty hub.
+// NewFederationHub 创建空 Hub。
 func NewFederationHub() *FederationHub {
 	return &FederationHub{
 		swarms:      make(map[string]*FederationSwarm),
@@ -48,7 +50,7 @@ func NewFederationHub() *FederationHub {
 	}
 }
 
-// RegisterSwarm adds or replaces a swarm entry.
+// RegisterSwarm 写入/覆盖 swarms 并刷新 LastHeartbeat。
 func (h *FederationHub) RegisterSwarm(s *FederationSwarm) error {
 	if s == nil || s.ID == "" {
 		return fmt.Errorf("federation: invalid swarm")
@@ -60,7 +62,7 @@ func (h *FederationHub) RegisterSwarm(s *FederationSwarm) error {
 	return nil
 }
 
-// SpawnEphemeralAgent registers a TTL-bound agent id under a swarm.
+// SpawnEphemeralAgent 校验 swarm 存在后生成 eph-{swarm}-{nano} 并登记过期时间。
 func (h *FederationHub) SpawnEphemeralAgent(swarmID string, ttl time.Duration) (*EphemeralAgent, error) {
 	if ttl <= 0 {
 		ttl = time.Minute
@@ -76,7 +78,7 @@ func (h *FederationHub) SpawnEphemeralAgent(swarmID string, ttl time.Duration) (
 	return e, nil
 }
 
-// TerminateAgent removes an ephemeral agent.
+// TerminateAgent 主动删除临时 Agent。
 func (h *FederationHub) TerminateAgent(agentID string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -84,7 +86,7 @@ func (h *FederationHub) TerminateAgent(agentID string) error {
 	return nil
 }
 
-// SelectOptimalSwarm picks swarm by capacity, heartbeat freshness, capability overlap.
+// SelectOptimalSwarm 线性组合 score=0.5*Capacity+0.35*exp(-Δt/30)+0.15*overlap，取最高分。
 func (h *FederationHub) SelectOptimalSwarm(required []string) (string, error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -111,6 +113,7 @@ func (h *FederationHub) SelectOptimalSwarm(required []string) (string, error) {
 	return list[0].id, nil
 }
 
+// capabilityOverlap need 为空视为完全匹配；否则为交集比例。
 func capabilityOverlap(have, need []string) float64 {
 	if len(need) == 0 {
 		return 1
@@ -128,7 +131,7 @@ func capabilityOverlap(have, need []string) float64 {
 	return float64(n) / float64(len(need))
 }
 
-// SendMessage routes to a swarm bus if present.
+// SendMessage 优先 FederationSwarm.Bus.Send；否则追加到 messages[swarmID]。
 func (h *FederationHub) SendMessage(swarmID string, msg api.Message) error {
 	h.mu.RLock()
 	s := h.swarms[swarmID]
@@ -145,7 +148,7 @@ func (h *FederationHub) SendMessage(swarmID string, msg api.Message) error {
 	return nil
 }
 
-// Broadcast fans out to all swarms except excluded id.
+// Broadcast 对每个已注册 swarm 调用 SendMessage。
 func (h *FederationHub) Broadcast(msg api.Message, excludeSwarmID string) {
 	h.mu.RLock()
 	ids := make([]string, 0, len(h.swarms))
@@ -162,7 +165,7 @@ func (h *FederationHub) Broadcast(msg api.Message, excludeSwarmID string) {
 	}
 }
 
-// Propose starts federation-level quorum tracking for a proposal id.
+// Propose 懒创建 quorumVotes[proposalID] map。
 func (h *FederationHub) Propose(proposalID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -171,7 +174,7 @@ func (h *FederationHub) Propose(proposalID string) {
 	}
 }
 
-// Vote records a swarm vote; returns committed if quorum reached.
+// Vote 记录 swarmID 的票；quorum 默认 len(swarms)/2+1，yes>=quorum 返回 true。
 func (h *FederationHub) Vote(proposalID, swarmID string, approve bool, quorum int) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -193,7 +196,7 @@ func (h *FederationHub) Vote(proposalID, swarmID string, approve bool, quorum in
 	return yes >= quorum, nil
 }
 
-// PruneEphemeral removes expired agents (call periodically).
+// PruneEphemeral 扫描 ephemeral 删除过期项，返回清除数量。
 func (h *FederationHub) PruneEphemeral() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -208,7 +211,7 @@ func (h *FederationHub) PruneEphemeral() int {
 	return n
 }
 
-// TouchHeartbeat updates swarm liveness.
+// TouchHeartbeat 更新指定 FederationSwarm 的 LastHeartbeat。
 func (h *FederationHub) TouchHeartbeat(swarmID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

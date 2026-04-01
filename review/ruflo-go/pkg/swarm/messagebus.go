@@ -1,3 +1,6 @@
+// 消息总线（swarm 包）：每个 Agent 对应一条按优先级排序的切片队列（数字越小优先级越高），
+// 后台 processLoop 周期性 drainOnce 批量出队并调用订阅回调；支持 RequiresACK 与 2s 等待、失败重投（上限 maxRetry）。
+// Subscribe 实现主题式过滤；队列满时驱逐最低优先级最老消息。
 package swarm
 
 import (
@@ -247,6 +250,7 @@ func (b *MessageBus) tickStats(window time.Duration, now time.Time) {
 	b.statsMu.Unlock()
 }
 
+// drainOnce 对每个 agent 最多处理 ProcessBatchMax 条：出队、过期丢弃、deliver 或重入队。
 func (b *MessageBus) drainOnce() {
 	b.mu.Lock()
 	agents := make([]string, 0, len(b.queues))
@@ -295,6 +299,7 @@ func (b *MessageBus) drainOnce() {
 	b.statsMu.Unlock()
 }
 
+// deliver 顺序调用订阅者；RequiresACK 时注册 pending 并等待 ACK 或 2s 超时（超时视为失败）。
 func (b *MessageBus) deliver(agentID string, msg api.Message) bool {
 	b.subMu.RLock()
 	subs := append([]subscription(nil), b.subs[agentID]...)
@@ -332,7 +337,7 @@ func (b *MessageBus) deliver(agentID string, msg api.Message) bool {
 	return ok
 }
 
-// Stats snapshot.
+// Stats 返回计数器快照（持 statsMu）。
 func (b *MessageBus) Stats() MessageBusStats {
 	b.statsMu.Lock()
 	defer b.statsMu.Unlock()
@@ -348,12 +353,13 @@ func (b *MessageBus) Stats() MessageBusStats {
 	}
 }
 
-// Shutdown stops the process loop.
+// Shutdown cancel 处理循环并 Wait 其退出。
 func (b *MessageBus) Shutdown() {
 	b.processCancel()
 	b.processWg.Wait()
 }
 
+// randomMsgID 12 字节加密随机转 hex。
 func randomMsgID() string {
 	var buf [12]byte
 	_, _ = rand.Read(buf[:])

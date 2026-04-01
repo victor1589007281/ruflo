@@ -1,3 +1,5 @@
+// register.go：批量注册入口，将核心域工具与扩展工具包依次写入 mcp.ToolRegistry（合计 250+ 工具名）。
+
 package tools
 
 import (
@@ -7,7 +9,8 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
-// RegisterAll registers every MCP tool used by the CLI and external clients.
+// RegisterAll 向 reg 注册 CLI 与外部 MCP 客户端所需的全部工具：先 InitDefaultMemory（失败仅告警），
+// 再追加 agent/swarm/memory/hooks 等内置切片，最后调用各 Register*Tools 扩展注册函数。
 func RegisterAll(reg *mcp.ToolRegistry) error {
 	if reg == nil {
 		return fmt.Errorf("tools: nil registry")

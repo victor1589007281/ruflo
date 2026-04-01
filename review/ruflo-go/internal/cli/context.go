@@ -20,7 +20,7 @@ var (
 	ToolRegistry *mcp.ToolRegistry
 )
 
-// RunTool invokes an MCP tool and prints the result using the global output format.
+// RunTool 调用指定名称的 MCP 工具并将原始 JSON 结果交给 FprintResult，使用当前全局 OutputFormat 输出。
 func RunTool(ctx context.Context, name string, args map[string]any) error {
 	raw, err := CallTool(ctx, name, args)
 	if err != nil {
@@ -29,7 +29,7 @@ func RunTool(ctx context.Context, name string, args map[string]any) error {
 	return FprintResult(Stdout(), raw)
 }
 
-// CallTool invokes a registered MCP tool with JSON-object arguments.
+// CallTool 将 args 编码为 JSON，经全局 ToolRegistry 分发给已注册工具并返回原始 JSON 字节；未初始化注册表时返回错误。
 func CallTool(ctx context.Context, name string, args map[string]any) (json.RawMessage, error) {
 	if ToolRegistry == nil {
 		return nil, fmt.Errorf("cli: tool registry not initialized")
@@ -79,6 +79,7 @@ func fprintText(w io.Writer, raw json.RawMessage) error {
 	}
 }
 
+// prettyCompact 尝试将 JSON 美化缩进，失败则退回原始字符串。
 func prettyCompact(raw json.RawMessage) string {
 	var v any
 	if json.Unmarshal(raw, &v) != nil {
@@ -91,6 +92,7 @@ func prettyCompact(raw json.RawMessage) string {
 	return string(b)
 }
 
+// printAgentsTable 解析含 agents 数组的响应并以制表符对齐列输出 ID/NAME/TYPE/STATE/STATUS。
 func printAgentsTable(w io.Writer, raw json.RawMessage) error {
 	var wrap struct {
 		Agents []struct {
@@ -116,6 +118,7 @@ func printAgentsTable(w io.Writer, raw json.RawMessage) error {
 	return err
 }
 
+// printChecksTable 将 doctor 类检查结果渲染为 CHECK/OK/DETAIL 表格。
 func printChecksTable(w io.Writer, raw json.RawMessage) error {
 	var checks []struct {
 		Name   string `json:"name"`
@@ -142,5 +145,5 @@ func printChecksTable(w io.Writer, raw json.RawMessage) error {
 	return tw.Flush()
 }
 
-// Stdout is the default writer for commands.
+// Stdout 返回命令默认标准输出 Writer，便于测试或替换。
 func Stdout() io.Writer { return os.Stdout }

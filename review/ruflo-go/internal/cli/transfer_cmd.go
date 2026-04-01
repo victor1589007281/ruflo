@@ -6,6 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 transfer 命令组：Transfer 商店与插件目录的搜索、详情与下载计数等，映射 transfer_* MCP 工具（含连字符工具名）。
+
+// newTransferCmd 构建「transfer」根子命令，挂载 store-search、store-info、store-download、plugin-search、plugin-info。
 func newTransferCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "transfer",
@@ -21,6 +24,7 @@ func newTransferCmd() *cobra.Command {
 	return cmd
 }
 
+// transferStoreSearchCmd 按 query 搜索商店目录，调用 transfer_store-search。
 func transferStoreSearchCmd() *cobra.Command {
 	var query string
 	c := &cobra.Command{
@@ -34,6 +38,7 @@ func transferStoreSearchCmd() *cobra.Command {
 	return c
 }
 
+// transferStoreInfoCmd 按 id（--id 或首参）获取商店条目详情，调用 transfer_store-info。
 func transferStoreInfoCmd() *cobra.Command {
 	var id string
 	c := &cobra.Command{
@@ -53,6 +58,7 @@ func transferStoreInfoCmd() *cobra.Command {
 	return c
 }
 
+// transferStoreDownloadCmd 记录某商店条目的下载行为，调用 transfer_store-download。
 func transferStoreDownloadCmd() *cobra.Command {
 	var id string
 	c := &cobra.Command{
@@ -72,6 +78,7 @@ func transferStoreDownloadCmd() *cobra.Command {
 	return c
 }
 
+// transferPluginSearchCmd 搜索插件目录，调用 transfer_plugin-search。
 func transferPluginSearchCmd() *cobra.Command {
 	var query string
 	c := &cobra.Command{
@@ -85,6 +92,7 @@ func transferPluginSearchCmd() *cobra.Command {
 	return c
 }
 
+// transferPluginInfoCmd 按 id 获取插件元数据，调用 transfer_plugin-info。
 func transferPluginInfoCmd() *cobra.Command {
 	var id string
 	c := &cobra.Command{

@@ -78,10 +78,12 @@ func NewWorkerManager() *WorkerManager {
 	return m
 }
 
+// mustRE 编译正则，非法模式会在启动时 panic（仅用于包内常量模式字符串）。
 func mustRE(s string) *regexp.Regexp {
 	return regexp.MustCompile(s)
 }
 
+// defaultWorkerConfigs 返回 12 个预置 Worker 的配置（名称、优先级、触发正则），并附加真实 Handler。
 func defaultWorkerConfigs() []WorkerConfig {
 	cfgs := []WorkerConfig{
 		{Name: "ultralearn", Priority: WorkerPriorityNormal, TriggerPatterns: []*regexp.Regexp{mustRE(`(?i)ultralearn|learn`)}},
@@ -100,7 +102,8 @@ func defaultWorkerConfigs() []WorkerConfig {
 	return attachRealHandlers(cfgs)
 }
 
-// Dispatch runs matching workers for trigger string (priority order: critical > high > normal > low).
+// Dispatch 根据 trigger 匹配所有 Worker：先按 WorkerPriority 稳定排序，再对每个匹配项调用 runOne。
+// 算法：matchesTrigger 对正则列表做 MatchString；无模式时仅当 trigger 去空白后为空则匹配。
 func (m *WorkerManager) Dispatch(ctx context.Context, trigger string, wctx WorkerContext) []WorkerResult {
 	if wctx.Args == nil {
 		wctx.Args = map[string]any{}
@@ -129,6 +132,7 @@ func (m *WorkerManager) Dispatch(ctx context.Context, trigger string, wctx Worke
 	return results
 }
 
+// matchesTrigger 判断触发字符串是否命中任一模式；pats 为空时要求 trigger 空白为空。
 func matchesTrigger(pats []*regexp.Regexp, trigger string) bool {
 	if len(pats) == 0 {
 		return strings.TrimSpace(trigger) == ""
@@ -141,6 +145,8 @@ func matchesTrigger(pats []*regexp.Regexp, trigger string) bool {
 	return false
 }
 
+// runOne 在信号量限流下执行单个 Worker：为新任务创建可取消子上下文，若同 Worker 已有任务则先 cancel 旧任务；
+// 更新 lastRun、runCount、errCount 等统计后返回结果。
 func (m *WorkerManager) runOne(parent context.Context, wr *workerRuntime, wctx WorkerContext) WorkerResult {
 	m.sem <- struct{}{}
 	defer func() { <-m.sem }()
@@ -178,7 +184,7 @@ func (m *WorkerManager) runOne(parent context.Context, wr *workerRuntime, wctx W
 	return res
 }
 
-// ListWorkers returns configs sorted by name.
+// ListWorkers 按内部 order 顺序返回各 Worker 的 WorkerConfig 副本。
 func (m *WorkerManager) ListWorkers() []WorkerConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -191,7 +197,7 @@ func (m *WorkerManager) ListWorkers() []WorkerConfig {
 	return out
 }
 
-// GetStatus returns runtime stats for a worker id.
+// GetStatus 返回指定 Worker 的运行期统计 map（busy 由 cancel!=nil 推断）。
 func (m *WorkerManager) GetStatus(workerID string) (map[string]any, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -212,7 +218,7 @@ func (m *WorkerManager) GetStatus(workerID string) (map[string]any, error) {
 	}, nil
 }
 
-// SetPoolSize updates the goroutine pool limit (best-effort; does not kill in-flight).
+// SetPoolSize 更新并发池容量：重建 sem channel，已在执行的 goroutine 不会被强行终止。
 func (m *WorkerManager) SetPoolSize(n int) {
 	if n <= 0 {
 		n = 1

@@ -1,3 +1,18 @@
+// 推理银行（ReasoningBank）：存储从历史任务中提取的经验模式（GuidancePattern），
+// 用于任务路由（RouteTask）、指导生成（GenerateGuidance）以及模式检索（SearchPatterns）。
+//
+// # 设计思路
+//
+// ReasoningBank 是 Ruflo 自学习闭环的核心组件之一，与 SONA 和 EWC 配合：
+//   - SONA 收集轨迹 → 产出模式 → 存入 ReasoningBank
+//   - ReasoningBank 根据模式的 Embedding 向量做余弦相似度检索（类 HNSW 线性扫描）
+//   - 路由时优先匹配正则规则（AGENT_PATTERNS），其次用 Embedding 近邻补充
+//   - 去重机制：新模式入库时若与已有模式余弦相似度 ≥ 0.95，合并使用计数
+//   - 晋升机制：UsageCount ≥ 3 且 Quality ≥ 0.6 的模式晋升为长期模式（LongTerm）
+//
+// # 会话边界
+//
+// OnSessionStart/OnSessionEnd 追踪当前会话的变更次数，会话结束时对所有模式尝试晋升。
 package hooks
 
 import (
@@ -12,9 +27,18 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
+// dedupSimilarityThreshold 去重相似度阈值：余弦相似度 ≥ 0.95 视为同一模式，合并而非新增。
 const dedupSimilarityThreshold = 0.95
 
-// GuidancePattern is a learnable routing / guidance unit with optional embedding for HNSW-like retrieval.
+// GuidancePattern 可学习的路由/指导模式单元。
+//   - ID: 唯一标识符（"pat_" + 16 位十六进制）
+//   - Strategy: 关联的策略名称（可用于存储推荐的 Agent 类型）
+//   - Domain: 所属领域（如 "security"、"memory"、"swarm"）
+//   - Embedding: 可选的向量嵌入，用于语义相似度检索
+//   - Quality: 模式质量评分 [0, 1]
+//   - UsageCount: 被引用次数（越高 → Fisher 信息越大 → EWC 保护越强）
+//   - SuccessCount: 成功应用次数
+//   - LongTerm: 是否已晋升为长期模式
 type GuidancePattern struct {
 	ID           string    `json:"id"`
 	Strategy     string    `json:"strategy"`
@@ -26,7 +50,7 @@ type GuidancePattern struct {
 	LongTerm     bool      `json:"long_term"`
 }
 
-// RoutingResult is produced by task routing heuristics.
+// RoutingResult 任务路由结果：推荐的 Agent 类型、置信度、备选方案和决策原因。
 type RoutingResult struct {
 	Agent        api.AgentType   `json:"agent"`
 	Confidence   float64         `json:"confidence"`
@@ -34,7 +58,8 @@ type RoutingResult struct {
 	Reason       string          `json:"reason,omitempty"`
 }
 
-// AGENT_PATTERNS maps task-description regexes to preferred agent types.
+// AGENT_PATTERNS 任务描述正则 → 推荐 Agent 类型的静态路由表。
+// RouteTask 优先使用此表做规则匹配（置信度 0.75），未命中再用 Embedding 近邻补充。
 var AGENT_PATTERNS = map[string]api.AgentType{
 	`(?i)\bsecurity\b|\baudit\b|\bcve\b|\bvulnerabilit`:  api.AgentTypeSecurityArchitect,
 	`(?i)\btest\b|\bqa\b|\bcoverage\b|\bspec\b`:          api.AgentType("test-architect"),
@@ -45,7 +70,7 @@ var AGENT_PATTERNS = map[string]api.AgentType{
 	`(?i)\breview\b|\bpr\b|\bpull request\b`:             api.AgentTypeReviewer,
 }
 
-// DOMAIN_GUIDANCE holds domain-specific template strings keyed by domain label.
+// DOMAIN_GUIDANCE 领域关键字 → 指导文案模板。GenerateGuidance 按子串包含匹配，拼接对应文案。
 var DOMAIN_GUIDANCE = map[string]string{
 	"security": "Apply least privilege, validate inputs, avoid secrets in code, and document threat assumptions.",
 	"memory":   "Prefer namespaces, TTL for ephemeral data, and embed for semantic recall when available.",
@@ -54,7 +79,7 @@ var DOMAIN_GUIDANCE = map[string]string{
 	"default":  "Validate at system boundaries; keep changes minimal and test-critical paths.",
 }
 
-// ReasoningBankStats summarizes stored guidance patterns.
+// ReasoningBankStats 推理银行的统计指标：模式总数、短期/长期数量、平均质量。
 type ReasoningBankStats struct {
 	TotalPatterns int
 	ShortTerm     int
@@ -62,7 +87,10 @@ type ReasoningBankStats struct {
 	AvgQuality    float64
 }
 
-// ReasoningBank stores and retrieves guidance patterns with vector similarity (cosine; pluggable HNSW).
+// ReasoningBank 经验模式库，支持基于余弦相似度的向量检索和基于正则的任务路由。
+//   - patterns: 模式存储（线性扫描，适用于中等规模；大规模可替换为 HNSW 索引）
+//   - compiled/keys: AGENT_PATTERNS 正则的预编译缓存
+//   - activeSession/sessionMutations: 当前会话追踪
 type ReasoningBank struct {
 	mu               sync.RWMutex
 	patterns         []*GuidancePattern
@@ -72,7 +100,7 @@ type ReasoningBank struct {
 	sessionMutations int
 }
 
-// NewReasoningBank returns an empty bank with compiled regex keys.
+// NewReasoningBank 构造空的推理银行，并预编译 AGENT_PATTERNS 中的所有正则表达式。
 func NewReasoningBank() *ReasoningBank {
 	rb := &ReasoningBank{}
 	for pat := range AGENT_PATTERNS {
@@ -86,7 +114,7 @@ func NewReasoningBank() *ReasoningBank {
 	return rb
 }
 
-// StorePattern inserts or deduplicates by embedding similarity (>= dedup threshold merges usage).
+// StorePattern 插入新模式或按 Embedding 余弦相似度去重（≥ 0.95 时合并到已有模式的使用计数和质量中）。
 func (rb *ReasoningBank) StorePattern(p *GuidancePattern) (*GuidancePattern, error) {
 	if p == nil {
 		return nil, ErrInvalidRegistration
@@ -123,7 +151,8 @@ func (rb *ReasoningBank) maybePromoteLocked(p *GuidancePattern) {
 	}
 }
 
-// SearchPatterns returns top-K patterns by cosine similarity to queryEmbedding (HNSW-like linear scan).
+// SearchPatterns 按 Embedding 余弦相似度检索 top-K 模式（当前为线性扫描，可替换为 HNSW 加速）。
+// 返回深拷贝切片，按相似度降序排列。时间复杂度 O(N·d)，N 为模式数，d 为向量维度。
 func (rb *ReasoningBank) SearchPatterns(queryEmbedding []float32, topK int) []*GuidancePattern {
 	if topK <= 0 {
 		topK = 8
@@ -153,7 +182,10 @@ func (rb *ReasoningBank) SearchPatterns(queryEmbedding []float32, topK int) []*G
 	return out
 }
 
-// RouteTask picks an agent type from description regexes and optional embedding neighbors.
+// RouteTask 根据任务描述选择推荐的 Agent 类型。
+// 路由策略：先用 AGENT_PATTERNS 正则匹配（置信度 0.75）；若未命中或有 Embedding，
+// 则用 SearchPatterns 检索近邻的 Strategy 字段补充（置信度 0.72）。
+// 默认回退到 Coder（置信度 0.4）。
 func (rb *ReasoningBank) RouteTask(description string, queryEmb []float32) RoutingResult {
 	desc := strings.TrimSpace(description)
 	var best api.AgentType
@@ -194,7 +226,7 @@ func (rb *ReasoningBank) RouteTask(description string, queryEmb []float32) Routi
 	}
 }
 
-// PromotePattern marks short-term patterns as long-term when thresholds met (also applied in StorePattern).
+// PromotePattern 手动晋升指定模式为长期模式（条件：UsageCount ≥ 3 且 Quality ≥ 0.6）。
 func (rb *ReasoningBank) PromotePattern(id string) bool {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -210,6 +242,8 @@ func (rb *ReasoningBank) PromotePattern(id string) bool {
 	return false
 }
 
+// cosine32 计算两个 float32 向量的余弦相似度：dot(a,b) / (||a|| · ||b||)，返回值范围 [-1, 1]。
+// 时间复杂度 O(d)。
 func cosine32(a, b []float32) float64 {
 	if len(a) != len(b) || len(a) == 0 {
 		return 0
@@ -232,7 +266,7 @@ func randomPatternID() string {
 	return "pat_" + hex.EncodeToString(b[:])
 }
 
-// RecordOutcome updates usage and success tallies for a pattern id.
+// RecordOutcome 记录模式的使用结果（成功/失败），递增使用和成功计数，并尝试晋升。
 func (rb *ReasoningBank) RecordOutcome(patternID string, success bool) error {
 	if patternID == "" {
 		return ErrInvalidRegistration
@@ -255,7 +289,7 @@ func (rb *ReasoningBank) RecordOutcome(patternID string, success bool) error {
 	return ErrPatternNotFound
 }
 
-// Consolidate merges embedding-similar patterns (cosine >= threshold); returns number of merges performed.
+// Consolidate 双重循环合并：对每对 Embedding 维度相同且余弦≥threshold 的模式，将后者计数合并入前者并删除后者；返回合并次数。
 func (rb *ReasoningBank) Consolidate(threshold float64) int {
 	if threshold <= 0 {
 		threshold = dedupSimilarityThreshold
@@ -296,7 +330,7 @@ func (rb *ReasoningBank) Consolidate(threshold float64) int {
 	return merged
 }
 
-// GenerateGuidance returns domain-specific guidance text inferred from the task description.
+// GenerateGuidance 将描述转小写后按子串包含匹配 DOMAIN_GUIDANCE 键，去重拼接；无命中返回 default 文案。
 func (rb *ReasoningBank) GenerateGuidance(taskDescription string) string {
 	desc := strings.ToLower(strings.TrimSpace(taskDescription))
 	var parts []string
@@ -319,7 +353,7 @@ func (rb *ReasoningBank) GenerateGuidance(taskDescription string) string {
 	return strings.Join(parts, " ")
 }
 
-// GetStats returns aggregate pattern statistics.
+// GetStats 遍历 patterns 计算总量、长期数量与平均质量。
 func (rb *ReasoningBank) GetStats() ReasoningBankStats {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
@@ -347,7 +381,7 @@ func (rb *ReasoningBank) GetStats() ReasoningBankStats {
 	}
 }
 
-// ExportPatterns returns a deep copy of all patterns.
+// ExportPatterns 深拷贝导出全部模式（含 Embedding 切片拷贝）。
 func (rb *ReasoningBank) ExportPatterns() []GuidancePattern {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
@@ -365,7 +399,8 @@ func (rb *ReasoningBank) ExportPatterns() []GuidancePattern {
 	return out
 }
 
-// ImportPatterns inserts patterns with deduplication by embedding similarity; returns count of newly stored rows.
+// ImportPatterns 批量导入外部模式：逐条加锁检查 Embedding 相似度；
+// 相似度 ≥ 阈值时合并到已有模式（计数+质量取 max），否则追加新模式。返回新插入条数。
 func (rb *ReasoningBank) ImportPatterns(patterns []GuidancePattern) int {
 	n := 0
 	for i := range patterns {
@@ -403,7 +438,7 @@ func (rb *ReasoningBank) ImportPatterns(patterns []GuidancePattern) int {
 	return n
 }
 
-// OnSessionStart resets session-scoped bookkeeping.
+// OnSessionStart 记录当前会话并重置 sessionMutations。
 func (rb *ReasoningBank) OnSessionStart(sessionID string) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -411,7 +446,7 @@ func (rb *ReasoningBank) OnSessionStart(sessionID string) {
 	rb.sessionMutations = 0
 }
 
-// OnSessionEnd finalizes session bookkeeping and attempts promotion passes.
+// OnSessionEnd 若 sessionID 匹配当前会话则对所有模式尝试晋升并清空会话状态。
 func (rb *ReasoningBank) OnSessionEnd(sessionID string) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()

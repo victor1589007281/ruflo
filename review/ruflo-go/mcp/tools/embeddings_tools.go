@@ -13,6 +13,11 @@ import (
 	"github.com/ruflo/ruflo-go/pkg/embeddings"
 )
 
+// 本文件：向量嵌入 MCP 工具，使用 pkg/embeddings.HashEmbed384 生成确定性伪嵌入并存入 JSON 仓库。
+//
+// 设计思路：generate/batch 追加条目并分配递增 id；search 对查询向量与库内向量做点积（与 hash 嵌入配合的相似度代理）；
+// compare 计算两文本嵌入的点积；无外部模型调用，backend 标识为 hash384。
+
 type embEntry struct {
 	ID   string    `json:"id"`
 	Text string    `json:"text"`
@@ -25,15 +30,19 @@ type embStoreFile struct {
 	Seq     int        `json:"seq"`
 }
 
+// embStoreFile 持久化嵌入仓库：条目列表、就绪标志与序号发生器。
+
 var (
 	embMu    sync.Mutex
 	embStore = &embStoreFile{Entries: make([]embEntry, 0)}
 )
 
+// embStorePath 返回 embeddings/store.json 路径。
 func embStorePath() string {
 	return filepath.Join(resolveDataDir(), "embeddings", "store.json")
 }
 
+// embLoad 从磁盘加载嵌入仓库；Entries 为 nil 时初始化为空切片。
 func embLoad() {
 	embMu.Lock()
 	defer embMu.Unlock()
@@ -50,6 +59,7 @@ func embLoad() {
 	}
 }
 
+// embSave 拷贝当前 Entries/Ready/Seq 后写入 embStorePath。
 func embSave() error {
 	embMu.Lock()
 	cp := embStoreFile{
@@ -61,6 +71,7 @@ func embSave() error {
 	return writeJSONFile(embStorePath(), cp)
 }
 
+// cosineSim 对等长向量计算点积（此处未做 L2 归一化，与 HashEmbed384 输出配合作为相似度分数）。
 func cosineSim(a, b []float32) float64 {
 	if len(a) != len(b) || len(a) == 0 {
 		return 0
@@ -72,6 +83,7 @@ func cosineSim(a, b []float32) float64 {
 	return dot
 }
 
+// embeddingsTools 先 embLoad，再注册生成、批量、搜索、初始化、比较、神经联动、双曲桩与状态工具。
 func embeddingsTools() []*mcp.MCPTool {
 	embLoad()
 	return []*mcp.MCPTool{
@@ -146,6 +158,7 @@ func handleEmbeddingsBatch(_ context.Context, m map[string]any) mcp.MCPToolResul
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"count": len(out), "items": out}}
 }
 
+// handleEmbeddingsSearch 对 query 生成查询向量，与库内所有条目计算 cosineSim，按分数降序取前 k（默认 5）条。
 func handleEmbeddingsSearch(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	q := strArg(m, "query")
 	if q == "" {
@@ -201,6 +214,7 @@ func handleEmbeddingsCompare(_ context.Context, m map[string]any) mcp.MCPToolRes
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"similarity": cosineSim(va, vb)}}
 }
 
+// handleEmbeddingsNeural 返回当前嵌入条目数与 globalState 神经模式数，用于粗略关联展示。
 func handleEmbeddingsNeural(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	embMu.Lock()
 	nEmb := len(embStore.Entries)
@@ -211,10 +225,12 @@ func handleEmbeddingsNeural(_ context.Context, _ map[string]any) mcp.MCPToolResu
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"embeddings": nEmb, "neural_patterns": nPat}}
 }
 
+// handleEmbeddingsHyperbolic 返回双曲嵌入模式占位信息（Go 运行时未启用实际双曲路径）。
 func handleEmbeddingsHyperbolic(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"mode": "poincare", "available": false, "note": "hyperbolic path not enabled in Go runtime"}}
 }
 
+// handleEmbeddingsStatus 返回 Ready、条目数、序号与后端标识 hash384。
 func handleEmbeddingsStatus(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	embMu.Lock()
 	cp := embStore
@@ -222,6 +238,7 @@ func handleEmbeddingsStatus(_ context.Context, _ map[string]any) mcp.MCPToolResu
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"ready": cp.Ready, "entries": len(cp.Entries), "seq": cp.Seq, "backend": "hash384"}}
 }
 
+// handleEmbeddingsInit 将嵌入服务标记为就绪（Ready=true）并持久化，表示可对外提供嵌入能力。
 func handleEmbeddingsInit(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	embMu.Lock()
 	embStore.Ready = true

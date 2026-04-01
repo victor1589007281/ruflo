@@ -145,6 +145,7 @@ func handleNeuralPatterns(ctx context.Context, args json.RawMessage) (json.RawMe
 	return jsonOK(map[string]any{"patterns": list, "count": len(list)})
 }
 
+// handleNeuralCompress 按 Score 降序保留最多 max 条，默认 64，并持久化。
 func handleNeuralCompress(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var in struct {
@@ -166,6 +167,7 @@ func handleNeuralCompress(ctx context.Context, args json.RawMessage) (json.RawMe
 	return jsonOK(map[string]any{"ok": true, "patterns": n})
 }
 
+// handleNeuralOptimize 按 Score 重排模式并更新 LastTrain。
 func handleNeuralOptimize(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args
@@ -179,6 +181,7 @@ func handleNeuralOptimize(ctx context.Context, args json.RawMessage) (json.RawMe
 	return jsonOK(map[string]any{"ok": true, "optimized": true, "patterns": n})
 }
 
+// handleNeuralStatus 返回模式数量、上次训练时间与后端标识（进程内）。
 func handleNeuralStatus(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args

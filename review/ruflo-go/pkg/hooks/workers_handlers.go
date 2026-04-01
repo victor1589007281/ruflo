@@ -19,17 +19,22 @@ import (
 	"github.com/ruflo/ruflo-go/pkg/security"
 )
 
+// 本文件为 12 个后台 Worker 的真实 Handler 实现与依赖注入。
+// ultralearn/optimize/audit 等各自扫描内存、文件系统或索引；未注入 Memory/SONA 时退化为启发式或空结果。
+
+// workerDeps 包级可选依赖：由 SetHookWorkerDeps 注入，供各 worker 使用。
 var workerDeps struct {
-	Memory memory.MemoryService
-	SONA   *neural.SONACoordinator
+	Memory memory.MemoryService    // 向量记忆检索（Search）
+	SONA   *neural.SONACoordinator // 模式合并与相似模式查找
 }
 
-// SetHookWorkerDeps wires optional memory and SONA instances used by background workers.
+// SetHookWorkerDeps 注入 Memory 与 SONA，供后台 Worker 使用（线程安全由调用方在适当时机一次性设置）。
 func SetHookWorkerDeps(mem memory.MemoryService, sona *neural.SONACoordinator) {
 	workerDeps.Memory = mem
 	workerDeps.SONA = sona
 }
 
+// attachRealHandlers 将具名 Worker 的 Handler 字段替换为本文件中的具体实现。
 func attachRealHandlers(cfgs []WorkerConfig) []WorkerConfig {
 	handlers := map[string]func(context.Context, WorkerContext) WorkerResult{
 		"ultralearn":  workerUltralearn,
@@ -53,6 +58,7 @@ func attachRealHandlers(cfgs []WorkerConfig) []WorkerConfig {
 	return cfgs
 }
 
+// argString 从 Args map 中读取字符串键，支持 string 或 fmt.Sprint 回退。
 func argString(m map[string]any, key string) string {
 	if m == nil {
 		return ""
@@ -69,6 +75,7 @@ func argString(m map[string]any, key string) string {
 	}
 }
 
+// workerRoot 解析工作目录：优先 Args["root"]，否则当前工作目录，失败则 "."。
 func workerRoot(wc WorkerContext) string {
 	r := argString(wc.Args, "root")
 	if r != "" {
@@ -81,6 +88,7 @@ func workerRoot(wc WorkerContext) string {
 	return wd
 }
 
+// workerUltralearn 深度学习/模式建议：有 Memory 时做向量检索返回命中摘要；否则根据关键词给出固定启发式 tips。
 func workerUltralearn(ctx context.Context, wc WorkerContext) WorkerResult {
 	query := argString(wc.Args, "query")
 	if query == "" {
@@ -117,6 +125,7 @@ func workerUltralearn(ctx context.Context, wc WorkerContext) WorkerResult {
 	return WorkerResult{OK: true, Message: "learning suggestions (no memory backend)", Data: data}
 }
 
+// truncate 截断字符串并加省略号，用于展示。
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= n {
@@ -125,6 +134,7 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// workerOptimize 遍历 root 下文件（跳过常见大目录与二进制扩展名），统计文件数、总字节、最大文件路径。
 func workerOptimize(ctx context.Context, wc WorkerContext) WorkerResult {
 	root := workerRoot(wc)
 	var files int64
@@ -169,6 +179,7 @@ func workerOptimize(ctx context.Context, wc WorkerContext) WorkerResult {
 	}}
 }
 
+// skipDir 判断是否跳过目录名（vendor、node_modules 等）。
 func skipDir(name string) bool {
 	switch name {
 	case ".git", "node_modules", "vendor", "dist", "build":
@@ -178,6 +189,7 @@ func skipDir(name string) bool {
 	}
 }
 
+// skipExt 判断是否跳过该扩展名（图片、压缩包等）。
 func skipExt(ext string) bool {
 	switch strings.ToLower(ext) {
 	case ".png", ".jpg", ".jpeg", ".gif", ".zip", ".tar", ".gz":
@@ -187,6 +199,7 @@ func skipExt(ext string) bool {
 	}
 }
 
+// workerConsolidate 调用 SONA.ConsolidatePatterns(0.92) 合并近似重复模式；无 SONA 时返回 merged=0。
 func workerConsolidate(ctx context.Context, wc WorkerContext) WorkerResult {
 	if workerDeps.SONA == nil {
 		return WorkerResult{OK: true, Message: "no SONA coordinator configured", Data: map[string]any{"merged": 0}}
@@ -195,6 +208,7 @@ func workerConsolidate(ctx context.Context, wc WorkerContext) WorkerResult {
 	return WorkerResult{OK: true, Message: fmt.Sprintf("merged %d duplicate pattern(s)", n), Data: map[string]any{"merged": n}}
 }
 
+// workerPredict 基于 query/trigger：优先 Memory.Search；否则 SONA.FindSimilarPatterns(HashEmbed384)；再否则占位提示。
 func workerPredict(ctx context.Context, wc WorkerContext) WorkerResult {
 	query := argString(wc.Args, "query")
 	if query == "" {
@@ -229,6 +243,7 @@ func workerPredict(ctx context.Context, wc WorkerContext) WorkerResult {
 	return WorkerResult{OK: true, Message: "fallback prediction stub", Data: data}
 }
 
+// workerAudit 在 root 下扫描 .go/.md/.json：PathValidator 校验路径、正则检测疑似硬编码密钥、InputValidator 对文件头 8KB 做阻断级校验。
 func workerAudit(ctx context.Context, wc WorkerContext) WorkerResult {
 	root := workerRoot(wc)
 	absRoot, err := filepath.Abs(root)
@@ -329,6 +344,7 @@ func workerMap(ctx context.Context, wc WorkerContext) WorkerResult {
 	return WorkerResult{OK: true, Message: "code map", Data: map[string]any{"root": root, "files": entries, "count": len(entries)}}
 }
 
+// workerPreload 列出 root/.claude-flow 目录条目名（预加载清单），不存在则返回空列表。
 func workerPreload(ctx context.Context, wc WorkerContext) WorkerResult {
 	root := workerRoot(wc)
 	dir := filepath.Join(root, ".claude-flow")
@@ -344,6 +360,7 @@ func workerPreload(ctx context.Context, wc WorkerContext) WorkerResult {
 	return WorkerResult{OK: true, Message: "preload manifest", Data: map[string]any{"dir": dir, "entries": names}}
 }
 
+// workerDeepdive 对单文件做轻量复杂度快照：行数、func 声明数、超长行数（>120）。
 func workerDeepdive(ctx context.Context, wc WorkerContext) WorkerResult {
 	path := argString(wc.Args, "file")
 	if path == "" {
@@ -373,6 +390,7 @@ func workerDeepdive(ctx context.Context, wc WorkerContext) WorkerResult {
 
 var goFuncSigRE = regexp.MustCompile(`(?m)^func\s+(\([^)]*\)\s+)?(\w+)\s*\([^)]*\)`)
 
+// workerDocument 扫描非测试 .go 文件，用正则提取函数签名，最多保留 200 条。
 func workerDocument(ctx context.Context, wc WorkerContext) WorkerResult {
 	root := workerRoot(wc)
 	var sigs []string
@@ -408,6 +426,7 @@ func workerDocument(ctx context.Context, wc WorkerContext) WorkerResult {
 	return WorkerResult{OK: true, Message: "signatures", Data: map[string]any{"signatures": sigs, "count": len(sigs)}}
 }
 
+// workerRefactor 启发式重构提示：超长 if、长参数列表、interface{} 使用等。
 func workerRefactor(ctx context.Context, wc WorkerContext) WorkerResult {
 	root := workerRoot(wc)
 	ifPat := regexp.MustCompile(`\bif\b[^\n]{200,}`)
@@ -447,6 +466,7 @@ func workerRefactor(ctx context.Context, wc WorkerContext) WorkerResult {
 	return WorkerResult{OK: true, Message: "refactor hints", Data: map[string]any{"hints": hints}}
 }
 
+// workerBenchmark 向内存 HNSW 索引插入 n 条 HashEmbed384 向量并做一次 Search，测量延迟（Args["vectors"] 可调规模）。
 func workerBenchmark(ctx context.Context, wc WorkerContext) WorkerResult {
 	dim := embeddings.HashEmbeddingDim
 	idx := memory.NewHNSWIndex(dim, memory.CosineDistance)
@@ -478,6 +498,7 @@ func workerBenchmark(ctx context.Context, wc WorkerContext) WorkerResult {
 	}}
 }
 
+// workerTestGaps 扫描所有 .go 文件，找出缺少同 stem 的 *_test.go 的源文件列表。
 func workerTestGaps(ctx context.Context, wc WorkerContext) WorkerResult {
 	root := workerRoot(wc)
 	allGo := map[string]bool{}

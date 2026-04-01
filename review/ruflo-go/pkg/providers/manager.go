@@ -1,3 +1,15 @@
+// Package providers 的 manager 子模块实现 ProviderManager。
+//
+// 设计思路（策略模式 + 故障转移 + 近似负载均衡）：
+//   - 各厂商后端实现统一的 LLMProvider 接口，管理器只依赖接口，便于插拔与测试替身。
+//   - SelectProvider 按策略在「已注册集合」中选一个后端：轮询保证公平；least-loaded 用原子计数近似
+//     在途请求数，选当前最闲节点；cost-based 对每个后端调用 EstimateCost，选估算成本最低者（相对排序用）。
+//   - CompleteWithFallback 沿 fallback 链（未配置则用注册顺序）顺序尝试 Complete：任一成功即返回，
+//     否则携带最后一次错误，实现链式故障转移。
+//   - recordAttempt 聚合各 Provider 的请求次数、Token、估算费用与错误次数，供监控与策略调优。
+//
+// 本文件实现 ProviderManager：维护名称→实现映射、注册顺序、可选 fallback 链、轮询/最小负载/成本三种选型策略，
+// CompleteWithFallback 按链依次尝试并记录请求/Token/错误；并发用原子计数近似负载。
 package providers
 
 import (
@@ -13,35 +25,35 @@ import (
 	"github.com/ruflo/ruflo-go/api"
 )
 
-// SelectionStrategy picks how the manager chooses a backend.
+// SelectionStrategy 定义管理器在多个已注册后端之间的选择策略别名。
 type SelectionStrategy string
 
 const (
-	StrategyRoundRobin  SelectionStrategy = "round-robin"
-	StrategyLeastLoaded SelectionStrategy = "least-loaded"
-	StrategyCostBased   SelectionStrategy = "cost-based"
+	StrategyRoundRobin  SelectionStrategy = "round-robin"  // 轮询
+	StrategyLeastLoaded SelectionStrategy = "least-loaded" // 当前进行中请求数最少
+	StrategyCostBased   SelectionStrategy = "cost-based" // EstimateCost 最低
 )
 
-// ProviderUsage tracks per-provider call volume and spend (best-effort from responses).
+// ProviderUsage 按提供方聚合调用次数、Token、估算费用与错误次数（尽力从响应填充）。
 type ProviderUsage struct {
-	Requests int64
-	Tokens   int64
-	Cost     float64
-	Errors   int64
+	Requests int64   // 总请求次数（含失败）
+	Tokens   int64   // 累计 Token（输入+输出或 Total）
+	Cost     float64 // 累计估算费用
+	Errors   int64   // 失败次数
 }
 
-// ProviderManager registers LLM backends, selects among them, and runs a fallback chain.
+// ProviderManager 线程安全地注册多个 LLMProvider，并支持选型与按链故障转移。
 type ProviderManager struct {
-	mu         sync.RWMutex
-	byName     map[string]LLMProvider
-	order      []string
-	fallback   []string
-	load       map[string]*atomic.Int64
-	roundRobin atomic.Uint64
-	usage      map[string]*ProviderUsage
+	mu         sync.RWMutex              // 保护映射与配置
+	byName     map[string]LLMProvider    // 名称到实现
+	order      []string                  // 注册顺序（轮询与默认链）
+	fallback   []string                  // 显式 fallback 顺序；空则用 order
+	load       map[string]*atomic.Int64    // 进行中的 Complete 近似计数
+	roundRobin atomic.Uint64             // 轮询游标
+	usage      map[string]*ProviderUsage   // 名称到用量聚合
 }
 
-// NewProviderManager returns an empty manager.
+// NewProviderManager 创建空管理器。
 func NewProviderManager() *ProviderManager {
 	return &ProviderManager{
 		byName: make(map[string]LLMProvider),
@@ -50,6 +62,7 @@ func NewProviderManager() *ProviderManager {
 	}
 }
 
+// ensureUsageLocked 在已持锁下获取或创建某名称的用量结构。
 func (m *ProviderManager) ensureUsageLocked(name string) *ProviderUsage {
 	u := m.usage[name]
 	if u == nil {
@@ -59,6 +72,7 @@ func (m *ProviderManager) ensureUsageLocked(name string) *ProviderUsage {
 	return u
 }
 
+// recordAttempt 记录一次调用：Requests++；若 err!=nil 则 Errors++；否则累加 Token 与 estCost。
 func (m *ProviderManager) recordAttempt(name string, resp *api.LLMResponse, err error, estCost float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -78,7 +92,7 @@ func (m *ProviderManager) recordAttempt(name string, resp *api.LLMResponse, err 
 	}
 }
 
-// Initialize auto-registers providers when standard API keys are present in the environment.
+// Initialize 根据环境变量自动注册 OpenAI、Google、Cohere、RuVector 等（Anthropic 需调用方自行注册）。
 func (m *ProviderManager) Initialize() error {
 	if k := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); k != "" {
 		m.RegisterProvider(&OpenAIProvider{APIKey: k})
@@ -95,7 +109,7 @@ func (m *ProviderManager) Initialize() error {
 	return nil
 }
 
-// GetUsage returns a snapshot of usage counters per provider name.
+// GetUsage 返回各 Provider 用量结构的浅拷贝快照。
 func (m *ProviderManager) GetUsage() map[string]ProviderUsage {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -114,7 +128,7 @@ func (m *ProviderManager) GetUsage() map[string]ProviderUsage {
 	return out
 }
 
-// ClearCache resets usage accounting and the round-robin cursor.
+// ClearCache 清空用量统计并将轮询游标归零。
 func (m *ProviderManager) ClearCache() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -122,7 +136,7 @@ func (m *ProviderManager) ClearCache() {
 	m.roundRobin.Store(0)
 }
 
-// Destroy unregisters all providers and clears internal state.
+// Destroy 注销全部 Provider 并清空内部状态（映射、顺序、fallback、负载计数、用量、轮询游标）。
 func (m *ProviderManager) Destroy() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -134,7 +148,7 @@ func (m *ProviderManager) Destroy() {
 	m.roundRobin.Store(0)
 }
 
-// RegisterProvider adds or replaces a provider keyed by Name().
+// RegisterProvider 按 p.Name() 注册或替换实现；新名称追加到 order，并为该名称初始化负载原子量。
 func (m *ProviderManager) RegisterProvider(p LLMProvider) {
 	if p == nil {
 		return
@@ -151,7 +165,7 @@ func (m *ProviderManager) RegisterProvider(p LLMProvider) {
 	}
 }
 
-// GetProvider returns a registered provider by name.
+// GetProvider 按名称返回已注册的 Provider；名称经 TrimSpace 匹配。
 func (m *ProviderManager) GetProvider(name string) (LLMProvider, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -159,7 +173,7 @@ func (m *ProviderManager) GetProvider(name string) (LLMProvider, bool) {
 	return p, ok
 }
 
-// ListProviders returns registered names in registration order.
+// ListProviders 返回已注册名称列表，顺序与首次注册顺序一致。
 func (m *ProviderManager) ListProviders() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -168,21 +182,22 @@ func (m *ProviderManager) ListProviders() []string {
 	return out
 }
 
-// SetFallbackChain defines the order used by CompleteWithFallback (names must be registered).
+// SetFallbackChain 设置 CompleteWithFallback 使用的 Provider 名称顺序（链中名称应在后续调用时已注册）。
 func (m *ProviderManager) SetFallbackChain(names []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.fallback = append([]string(nil), names...)
 }
 
-// FallbackChain returns a copy of the configured fallback order.
+// FallbackChain 返回当前配置的 fallback 顺序副本。
 func (m *ProviderManager) FallbackChain() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return append([]string(nil), m.fallback...)
 }
 
-// SelectProvider picks one backend using strategy; req is used for cost-based selection.
+// SelectProvider 根据 strategy 从已注册后端中选一个；当策略为 cost-based 时用 req 调用各后端的 EstimateCost 比较。
+// 算法要点：轮询用原子自增取模 order；least-loaded 遍历 order 比较 load 原子值；cost-based 全量扫描取最小估算成本。
 func (m *ProviderManager) SelectProvider(strategy string, req api.LLMRequest) (LLMProvider, error) {
 	s := SelectionStrategy(strings.ToLower(strings.TrimSpace(strategy)))
 	if s == "" {
@@ -227,7 +242,8 @@ func (m *ProviderManager) SelectProvider(strategy string, req api.LLMRequest) (L
 	}
 }
 
-// CompleteWithFallback tries providers in FallbackChain order (or all registered if unset).
+// CompleteWithFallback 按 FallbackChain（若为空则按注册顺序）依次调用 Complete。
+// 算法：对链中每个名称在调用前后对 load 做 +1/-1，避免长时间占用计数；成功则立即返回；失败则记录用量并尝试下一节点。
 func (m *ProviderManager) CompleteWithFallback(ctx context.Context, req api.LLMRequest) (*api.LLMResponse, error) {
 	m.mu.RLock()
 	chain := append([]string(nil), m.fallback...)
@@ -270,7 +286,7 @@ func (m *ProviderManager) CompleteWithFallback(ctx context.Context, req api.LLMR
 	return nil, errors.New("providers: fallback exhausted")
 }
 
-// HealthCheckAll runs HealthCheck on every registered provider.
+// HealthCheckAll 对每个已注册 Provider 并发无关地顺序调用 HealthCheck，返回 name→error 映射。
 func (m *ProviderManager) HealthCheckAll(ctx context.Context) map[string]error {
 	m.mu.RLock()
 	names := append([]string(nil), m.order...)

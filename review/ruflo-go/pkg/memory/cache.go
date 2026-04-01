@@ -1,3 +1,5 @@
+// LRU 热缓存（memory 包）：双向链表表示 LRU 顺序，map[string]*Element 指向链表结点，读写删除均摊 O(1)。
+// 可配置条目 TTL：Set 时写入 expiresAt，Get/evictExpiredLocked 剔除过期；超容量时从尾部驱逐最久未访问键。
 package memory
 
 import (
@@ -6,22 +8,23 @@ import (
 	"time"
 )
 
+// cacheEntry 为链表结点承载的业务数据：键、值与可选绝对过期时间。
 type cacheEntry struct {
-	key       string
-	value     any
-	expiresAt time.Time
+	key       string    // 缓存键
+	value     any       // 任意缓存值（如 *api.MemoryEntry）
+	expiresAt time.Time // 零值表示永不过期（仅 LRU）
 }
 
-// LRUCache is a fixed-capacity cache with optional per-entry TTL.
+// LRUCache 定容 LRU；ttl>0 时新写入条目带统一存活时长。
 type LRUCache struct {
-	mu       sync.Mutex
-	capacity int
-	ttl      time.Duration
-	items    map[string]*list.Element
-	order    *list.List
+	mu       sync.Mutex               // 保护 map 与链表
+	capacity int                      // 最大条目数
+	ttl      time.Duration            // 全局默认 TTL，<=0 则仅按容量驱逐
+	items    map[string]*list.Element // 键到链表结点指针
+	order    *list.List               // 前端为最近使用，后端为最久未使用
 }
 
-// NewLRUCache creates a cache. ttl <= 0 means entries do not expire by time (only LRU).
+// NewLRUCache 创建缓存；capacity 最小为 1。
 func NewLRUCache(capacity int, ttl time.Duration) *LRUCache {
 	if capacity < 1 {
 		capacity = 1
@@ -34,6 +37,7 @@ func NewLRUCache(capacity int, ttl time.Duration) *LRUCache {
 	}
 }
 
+// evictExpiredLocked 从链表尾部向头部扫描，移除已过期结点（调用方已持锁）。
 func (c *LRUCache) evictExpiredLocked() {
 	now := time.Now()
 	for e := c.order.Back(); e != nil; {
@@ -47,7 +51,7 @@ func (c *LRUCache) evictExpiredLocked() {
 	}
 }
 
-// Get returns a value and true if present and not expired.
+// Get 若命中且未过期则将结点移到表头并返回值；过期则摘除并返回 false。
 func (c *LRUCache) Get(key string) (any, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -66,7 +70,7 @@ func (c *LRUCache) Get(key string) (any, bool) {
 	return ce.value, true
 }
 
-// Set inserts or updates a key. Uses default TTL when configured.
+// Set 更新已存在键或 PushFront 新结点；超容量时反复移除 Back 直至满足上限。
 func (c *LRUCache) Set(key string, value any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -96,7 +100,7 @@ func (c *LRUCache) Set(key string, value any) {
 	}
 }
 
-// Delete removes a key.
+// Delete O(1) 从 map 与链表中摘除指定键。
 func (c *LRUCache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

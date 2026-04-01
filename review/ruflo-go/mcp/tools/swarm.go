@@ -1,3 +1,5 @@
+// swarm.go：swarm_* MCP 工具，维护 globalState.swarms 与 swarm-state.json。
+
 package tools
 
 import (
@@ -60,6 +62,7 @@ func swarmTools() []*mcp.MCPTool {
 	}
 }
 
+// swarmInitArgs 解析蜂群初始化参数；拓扑/容量/策略有空缺默认值。
 type swarmInitArgs struct {
 	Topology  string `json:"topology"`
 	MaxAgents int    `json:"max_agents"`
@@ -67,6 +70,7 @@ type swarmInitArgs struct {
 	V3Mode    bool   `json:"v3_mode"`
 }
 
+// handleSwarmInit 创建 Active 状态蜂群记录并 saveSwarmToDisk。
 func handleSwarmInit(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a swarmInitArgs
@@ -100,10 +104,12 @@ func handleSwarmInit(ctx context.Context, args json.RawMessage) (json.RawMessage
 	return jsonOK(map[string]any{"ok": true, "swarm": rec})
 }
 
+// swarmIDArgs 可选蜂群 id；空表示取最近更新的一个。
 type swarmIDArgs struct {
 	ID string `json:"id"`
 }
 
+// handleSwarmStatus 按 id 精确查询，或返回 UpdatedAt 最新的一条；无数据时 swarm 为 nil。
 func handleSwarmStatus(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var a swarmIDArgs
@@ -159,6 +165,7 @@ func handleSwarmShutdown(ctx context.Context, args json.RawMessage) (json.RawMes
 	return jsonOK(map[string]any{"ok": true, "swarm": s})
 }
 
+// handleSwarmHealth 返回蜂群总数与 Active 数量。
 func handleSwarmHealth(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	_ = args

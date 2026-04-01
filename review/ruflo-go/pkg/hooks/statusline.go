@@ -11,16 +11,16 @@ import (
 
 // StatuslineData aggregates counters shown in the terminal status bar.
 type StatuslineData struct {
-	ActiveAgents   int           `json:"active_agents"`
-	RunningTasks   int           `json:"running_tasks"`
-	MemoryEntries  int           `json:"memory_entries"`
-	PatternsCount  int           `json:"patterns_count"`
-	HooksFired     int           `json:"hooks_fired"`
-	WorkersActive  int           `json:"workers_active"`
-	SwarmStatus    string        `json:"swarm_status"`
-	LastHookEvent  string        `json:"last_hook_event"`
-	Uptime         time.Duration `json:"uptime"`
-	StartTime      time.Time     `json:"start_time"`
+	ActiveAgents  int           `json:"active_agents"`
+	RunningTasks  int           `json:"running_tasks"`
+	MemoryEntries int           `json:"memory_entries"`
+	PatternsCount int           `json:"patterns_count"`
+	HooksFired    int           `json:"hooks_fired"`
+	WorkersActive int           `json:"workers_active"`
+	SwarmStatus   string        `json:"swarm_status"`
+	LastHookEvent string        `json:"last_hook_event"`
+	Uptime        time.Duration `json:"uptime"`
+	StartTime     time.Time     `json:"start_time"`
 }
 
 // StatuslineGenerator builds a compact status line and JSON snapshot.

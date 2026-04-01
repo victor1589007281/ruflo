@@ -1,5 +1,11 @@
 package tools
 
+// 本文件实现「终端会话」MCP 工具（terminal_*）：在内存中跟踪工作目录与命令历史，通过 sh -c 执行命令。
+//
+// 设计思路：
+//   - 会话仅驻留进程生命周期，重启后丢失；session_id 为随机 hex，避免与真实 shell PTY 绑定以降低实现复杂度。
+//   - 执行使用 CombinedOutput，在 history 中记录命令与错误摘要；适合受控环境下的短命令，非交互式长运行进程。
+
 import (
 	"context"
 	"crypto/rand"
@@ -14,6 +20,7 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// termSession 表示一个逻辑终端会话：ID、工作目录、创建时间与命令历史行。
 type termSession struct {
 	ID        string    `json:"id"`
 	CWD       string    `json:"cwd"`
@@ -26,16 +33,19 @@ var (
 	termSessions = make(map[string]*termSession)
 )
 
+// termStateDir 返回终端状态目录（当前仅用于 MkdirAll，会话不落盘）。
 func termStateDir() string {
 	return filepath.Join(resolveDataDir(), "terminal")
 }
 
+// newTermID 生成带 term- 前缀的随机会话 ID。
 func newTermID() string {
 	var b [6]byte
 	_, _ = rand.Read(b[:])
 	return "term-" + hex.EncodeToString(b[:])
 }
 
+// terminalTools 构造 terminal_* MCP 工具定义。
 func terminalTools() []*mcp.MCPTool {
 	obj := map[string]any{"type": "object", "properties": map[string]any{}}
 	return []*mcp.MCPTool{
@@ -47,7 +57,7 @@ func terminalTools() []*mcp.MCPTool {
 	}
 }
 
-// RegisterTerminalTools registers local command execution tools.
+// RegisterTerminalTools 向注册表登记本地命令执行类 MCP 工具。
 func RegisterTerminalTools(reg *mcp.ToolRegistry) error {
 	for _, t := range terminalTools() {
 		if err := reg.Register(t); err != nil {
@@ -57,6 +67,7 @@ func RegisterTerminalTools(reg *mcp.ToolRegistry) error {
 	return nil
 }
 
+// handleTerminalCreate 处理 terminal_create：cwd 默认当前工作目录；注册新会话并返回 session_id。
 func handleTerminalCreate(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	cwd := strArg(m, "cwd")
 	if cwd == "" {
@@ -71,6 +82,7 @@ func handleTerminalCreate(_ context.Context, m map[string]any) mcp.MCPToolResult
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"session_id": id, "cwd": cwd}}
 }
 
+// handleTerminalExecute 处理 terminal_execute：session_id 与 command 必填；在会话 CWD 下执行 sh -c，返回 stdout 合并输出与 exit_code。
 func handleTerminalExecute(ctx context.Context, m map[string]any) mcp.MCPToolResult {
 	sid := strArg(m, "session_id")
 	cmdStr := strArg(m, "command")
@@ -112,6 +124,7 @@ func handleTerminalExecute(ctx context.Context, m map[string]any) mcp.MCPToolRes
 	}}
 }
 
+// handleTerminalList 处理 terminal_list：返回全部 session_id 与数量。
 func handleTerminalList(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	termMu.Lock()
 	ids := make([]string, 0, len(termSessions))
@@ -122,6 +135,7 @@ func handleTerminalList(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: true, Data: map[string]any{"sessions": ids, "count": len(ids)}}
 }
 
+// handleTerminalClose 处理 terminal_close：按 session_id 删除会话；closed 表示是否曾存在。
 func handleTerminalClose(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	sid := strArg(m, "session_id")
 	termMu.Lock()
@@ -133,6 +147,7 @@ func handleTerminalClose(_ context.Context, m map[string]any) mcp.MCPToolResult 
 	return mcp.MCPToolResult{OK: ok, Data: map[string]any{"session_id": sid, "closed": ok}}
 }
 
+// handleTerminalHistory 处理 terminal_history：返回指定会话的命令历史副本。
 func handleTerminalHistory(_ context.Context, m map[string]any) mcp.MCPToolResult {
 	sid := strArg(m, "session_id")
 	termMu.Lock()

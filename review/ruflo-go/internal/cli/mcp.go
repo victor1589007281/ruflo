@@ -10,10 +10,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// MCPServeFunc is the stdio transport entry (injectable for tests).
+// 本文件实现 MCP 相关入口：main 在无子命令管道模式下直接调用 RunMCPServer；CLI 提供 mcp start 显式启动 stdio 服务。
+// 使用全局 ToolRegistry 构造 MCPServer，经可注入的 MCPServeFunc（默认 ServeStdioOS）对外提供 JSON-RPC。
+
+// MCPServeFunc 为 stdio 传输入口，测试时可替换为 mock。
 var MCPServeFunc = transport.ServeStdioOS
 
-// RunMCPServer serves MCP over stdio using ToolRegistry with optional verbose logging.
+// RunMCPServer 基于全局 ToolRegistry 创建 MCP 服务实例，在 Verbose 时向 stderr 打日志，并阻塞服务直至 ctx 取消或传输错误。
 func RunMCPServer(ctx context.Context) error {
 	if ToolRegistry == nil {
 		return fmt.Errorf("cli: ToolRegistry not initialized")
@@ -29,6 +32,7 @@ func RunMCPServer(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// newMCPCmd 构建「mcp」根子命令，当前仅含 start。
 func newMCPCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mcp",
@@ -38,6 +42,7 @@ func newMCPCmd() *cobra.Command {
 	return cmd
 }
 
+// mcpStartCmd 显式启动 MCP stdio 服务器（与 main 自动模式行为一致），RunE 委托 RunMCPServer。
 func mcpStartCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start",

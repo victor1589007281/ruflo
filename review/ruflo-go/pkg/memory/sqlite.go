@@ -1,3 +1,5 @@
+// SQLite 持久化后端（memory 包）：使用 modernc.org/sqlite 纯 Go 实现，零 CGO、跨平台一致；DSN 含 busy_timeout 与外键。
+// 表 memory_entries 存键值、命名空间、标签/元数据 JSON、embedding 小端 BLOB、时间戳与 TTL；OpenSQLite 时 migrate 建表与索引。
 package memory
 
 import (
@@ -14,12 +16,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// SQLiteBackend persists memory entries and embeddings.
+// SQLiteBackend 封装标准库 sql.DB，负责 memory_entries 的 CRUD 与向量 BLOB 编解码。
 type SQLiteBackend struct {
-	db *sql.DB
+	db *sql.DB // 单连接池（SetMaxOpenConns(1)）适配 SQLite 锁模型
 }
 
-// OpenSQLite opens or creates a SQLite database at path.
+// OpenSQLite 打开或创建库文件并执行 migrate；DSN 启用 busy_timeout 与 foreign_keys。
 func OpenSQLite(path string) (*SQLiteBackend, error) {
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
@@ -35,6 +37,7 @@ func OpenSQLite(path string) (*SQLiteBackend, error) {
 	return b, nil
 }
 
+// migrate 幂等创建表与索引，启动时调用。
 func (b *SQLiteBackend) migrate() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS memory_entries (
@@ -145,7 +148,7 @@ func metaFromJSON(s string) (map[string]string, error) {
 	return m, nil
 }
 
-// UpsertEntry inserts or updates a row by (key, namespace).
+// UpsertEntry 在事务内按 (key,namespace) 查询，存在则 UPDATE 否则 INSERT，提交后返回完整行。
 func (b *SQLiteBackend) UpsertEntry(in MemoryEntryInput, embedding []float32) (*api.MemoryEntry, error) {
 	now := time.Now().Unix()
 	tagsJSON, err := tagsToJSON(in.Tags)
@@ -212,7 +215,7 @@ func (b *SQLiteBackend) UpdateEntryByID(id int64, value string, embedding []floa
 	return err
 }
 
-// ListIDKeysInNamespace returns id and key for all rows in a namespace.
+// ListIDKeysInNamespace 列出某命名空间下所有行的 id 与 key，用于批量删索引/缓存。
 func (b *SQLiteBackend) ListIDKeysInNamespace(namespace string) ([]struct {
 	ID  int64
 	Key string
@@ -246,7 +249,7 @@ func (b *SQLiteBackend) ListIDKeysInNamespace(namespace string) ([]struct {
 	return out, rows.Err()
 }
 
-// ListIDKeysForKeys returns id and key for rows matching namespace and keys.
+// ListIDKeysForKeys 对给定 key 列表在命名空间内解析 id，用于 BulkDelete。
 func (b *SQLiteBackend) ListIDKeysForKeys(namespace string, keys []string) ([]struct {
 	ID  int64
 	Key string
@@ -288,7 +291,7 @@ func (b *SQLiteBackend) ListIDKeysForKeys(namespace string, keys []string) ([]st
 	return out, rows.Err()
 }
 
-// BulkDeleteKeys removes rows for keys in namespace; returns rows deleted.
+// BulkDeleteKeys 执行 IN 删除并返回影响行数。
 func (b *SQLiteBackend) BulkDeleteKeys(namespace string, keys []string) (int64, error) {
 	if b == nil || b.db == nil {
 		return 0, errors.New("memory sqlite: nil db")
@@ -311,7 +314,7 @@ func (b *SQLiteBackend) BulkDeleteKeys(namespace string, keys []string) (int64, 
 	return res.RowsAffected()
 }
 
-// DeleteAllInNamespace removes every row in a namespace; returns rows deleted.
+// DeleteAllInNamespace 删除命名空间内全部行。
 func (b *SQLiteBackend) DeleteAllInNamespace(namespace string) (int64, error) {
 	if b == nil || b.db == nil {
 		return 0, errors.New("memory sqlite: nil db")
@@ -323,31 +326,31 @@ func (b *SQLiteBackend) DeleteAllInNamespace(namespace string) (int64, error) {
 	return res.RowsAffected()
 }
 
-// GetByID loads one row.
+// GetByID 扫描单行并组装 api.MemoryEntry（含解析 JSON 与向量）。
 func (b *SQLiteBackend) GetByID(id int64) (*api.MemoryEntry, error) {
 	row := b.db.QueryRow(`SELECT id, key, value, namespace, tags, embedding, metadata, created_at, updated_at, ttl_seconds FROM memory_entries WHERE id=?`, id)
 	return scanEntry(row)
 }
 
-// GetByKey loads by composite key.
+// GetByKey 按复合唯一键 (key, namespace) 读取。
 func (b *SQLiteBackend) GetByKey(key, namespace string) (*api.MemoryEntry, error) {
 	row := b.db.QueryRow(`SELECT id, key, value, namespace, tags, embedding, metadata, created_at, updated_at, ttl_seconds FROM memory_entries WHERE key=? AND namespace=?`, key, namespace)
 	return scanEntry(row)
 }
 
-// DeleteKey removes a row.
+// DeleteKey 按复合键删除一行。
 func (b *SQLiteBackend) DeleteKey(key, namespace string) error {
 	_, err := b.db.Exec(`DELETE FROM memory_entries WHERE key=? AND namespace=?`, key, namespace)
 	return err
 }
 
-// DeleteID removes by id.
+// DeleteID 按主键删除。
 func (b *SQLiteBackend) DeleteID(id int64) error {
 	_, err := b.db.Exec(`DELETE FROM memory_entries WHERE id=?`, id)
 	return err
 }
 
-// List returns paginated rows for a namespace.
+// List namespace 为空时跨全表分页，否则过滤命名空间，按 updated_at DESC。
 func (b *SQLiteBackend) List(namespace string, limit, offset int) ([]api.MemoryEntry, error) {
 	if limit <= 0 {
 		limit = 100
@@ -379,7 +382,7 @@ func (b *SQLiteBackend) List(namespace string, limit, offset int) ([]api.MemoryE
 	return out, rows.Err()
 }
 
-// ListDistinctNamespaces returns sorted unique namespaces, optionally limited to those starting with prefix.
+// ListDistinctNamespaces DISTINCT 查询并按名字排序；prefix 用于前缀匹配。
 func (b *SQLiteBackend) ListDistinctNamespaces(prefix string) ([]string, error) {
 	if b == nil || b.db == nil {
 		return nil, errors.New("memory sqlite: nil db")
@@ -408,7 +411,7 @@ func (b *SQLiteBackend) ListDistinctNamespaces(prefix string) ([]string, error) 
 	return out, rows.Err()
 }
 
-// Count returns total rows (optionally by namespace).
+// Count 可选按命名空间过滤的 COUNT(1)。
 func (b *SQLiteBackend) Count(namespace string) (int64, error) {
 	q := `SELECT COUNT(1) FROM memory_entries`
 	var args []any
@@ -423,7 +426,7 @@ func (b *SQLiteBackend) Count(namespace string) (int64, error) {
 	return n, nil
 }
 
-// ListEmbeddings returns all rows that have embeddings (for index rebuild).
+// ListEmbeddings 返回所有非空 embedding 的 id 与向量，供 HNSW 冷启动重建。
 func (b *SQLiteBackend) ListEmbeddings() ([]struct {
 	ID        int64
 	Embedding []float32
@@ -455,7 +458,7 @@ func (b *SQLiteBackend) ListEmbeddings() ([]struct {
 	return out, rows.Err()
 }
 
-// FilterByTags searches by tag overlap using JSON substring match.
+// FilterByTags 通过 tags JSON 列的 LIKE 子串匹配近似「包含标签」（非严格 JSON 解析）。
 func (b *SQLiteBackend) FilterByTags(namespace string, tags []string, limit int) ([]api.MemoryEntry, error) {
 	if limit <= 0 {
 		limit = 50
@@ -492,6 +495,7 @@ func (b *SQLiteBackend) FilterByTags(namespace string, tags []string, limit int)
 	return out, rows.Err()
 }
 
+// scanEntry 将 QueryRow 结果解码为业务结构体。
 func scanEntry(row *sql.Row) (*api.MemoryEntry, error) {
 	var id int64
 	var key, val, ns, tagsJSON, metaJSON string
@@ -504,6 +508,7 @@ func scanEntry(row *sql.Row) (*api.MemoryEntry, error) {
 	return buildEntry(id, key, val, ns, tagsJSON, blob, metaJSON, created, updated, ttl)
 }
 
+// scanEntryRows 与 scanEntry 相同，用于多行迭代。
 func scanEntryRows(rows *sql.Rows) (*api.MemoryEntry, error) {
 	var id int64
 	var key, val, ns, tagsJSON, metaJSON string
@@ -516,6 +521,7 @@ func scanEntryRows(rows *sql.Rows) (*api.MemoryEntry, error) {
 	return buildEntry(id, key, val, ns, tagsJSON, blob, metaJSON, created, updated, ttl)
 }
 
+// buildEntry 统一解析 tags/metadata/embedding 与时间戳字段。
 func buildEntry(id int64, key, val, ns, tagsJSON string, blob []byte, metaJSON string, created, updated int64, ttl sql.NullInt64) (*api.MemoryEntry, error) {
 	tags, err := tagsFromJSON(tagsJSON)
 	if err != nil {

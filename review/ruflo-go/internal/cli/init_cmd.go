@@ -13,6 +13,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 init 命令：在当前仓库生成 Claude Flow / Ruflo 目录布局与 claude-flow.config.json，可选向导式读取 stdin 覆盖拓扑等字段。
+
+// newInitCmd 构建「init」命令；--wizard 时交互询问 topology、maxAgents、memoryBackend，并创建 .claude-flow 子目录与配置文件。
 func newInitCmd() *cobra.Command {
 	var wizard bool
 	c := &cobra.Command{

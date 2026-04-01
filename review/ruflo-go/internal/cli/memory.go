@@ -6,6 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 memory 命令组：代理记忆的存取、检索、删除、列举、统计与初始化，对应 memory_* MCP 工具。
+
+// newMemoryCmd 构建「memory」根子命令，挂载 store、retrieve、search、delete、list、stats、init。
 func newMemoryCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "memory",
@@ -23,6 +26,7 @@ func newMemoryCmd() *cobra.Command {
 	return cmd
 }
 
+// memoryStoreCmd 写入键值，可选 namespace，调用 memory_store。
 func memoryStoreCmd() *cobra.Command {
 	var key, value, namespace string
 	c := &cobra.Command{
@@ -46,6 +50,7 @@ func memoryStoreCmd() *cobra.Command {
 	return c
 }
 
+// memoryRetrieveCmd 按键精确读取，调用 memory_retrieve。
 func memoryRetrieveCmd() *cobra.Command {
 	var key, namespace string
 	c := &cobra.Command{
@@ -67,6 +72,7 @@ func memoryRetrieveCmd() *cobra.Command {
 	return c
 }
 
+// memorySearchCmd 语义/向量检索，支持 limit 与相似度 threshold，调用 memory_search。
 func memorySearchCmd() *cobra.Command {
 	var query, namespace string
 	var limit int
@@ -91,6 +97,7 @@ func memorySearchCmd() *cobra.Command {
 	return c
 }
 
+// memoryDeleteCmd 删除指定 key，调用 memory_delete。
 func memoryDeleteCmd() *cobra.Command {
 	var key, namespace string
 	c := &cobra.Command{
@@ -112,6 +119,7 @@ func memoryDeleteCmd() *cobra.Command {
 	return c
 }
 
+// memoryListCmd 列举命名空间下键名，受 limit 约束，调用 memory_list。
 func memoryListCmd() *cobra.Command {
 	var namespace string
 	var limit int
@@ -133,6 +141,7 @@ func memoryListCmd() *cobra.Command {
 	return c
 }
 
+// memoryStatsCmd 输出记忆存储统计信息，调用 memory_stats。
 func memoryStatsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stats",
@@ -147,6 +156,7 @@ func memoryStatsCmd() *cobra.Command {
 	}
 }
 
+// memoryInitCmd 初始化或重置记忆后端，--force 时强制重建，调用 memory_init。
 func memoryInitCmd() *cobra.Command {
 	var force bool
 	c := &cobra.Command{

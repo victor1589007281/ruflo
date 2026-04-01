@@ -12,35 +12,35 @@ import (
 	"github.com/ruflo/ruflo-go/pkg/swarm/consensus"
 )
 
-// UnifiedSwarmCoordinator consolidates topology, bus, pool, and consensus.
+// UnifiedSwarmCoordinator 将拓扑、消息、池化 Worker 与共识合成为单一编排入口。
 type UnifiedSwarmCoordinator struct {
-	mu sync.RWMutex
+	mu sync.RWMutex // 保护 agents/tasks 等内存状态
 
-	cfg CoordinatorConfig
+	cfg CoordinatorConfig // 拓扑类型、共识算法、池上下限、心跳与指标周期
 
-	topology *TopologyManager
-	bus      *MessageBus
-	pool     *AgentPool
-	engine   consensus.Engine
+	topology *TopologyManager // 节点与边：路由与领导者选举
+	bus      *MessageBus      // 每 Agent 优先级队列 + 订阅投递
+	pool     *AgentPool       // 可伸缩执行体槽位（与注册 Agent 概念并行存在）
+	engine   consensus.Engine // Raft/Gossip 等共识抽象
 
-	domainConfigs []DomainConfig
-	domainAgents  map[api.AgentDomain][]string
-	tasks         map[string]*api.TaskDefinition
-	assignments   map[string]TaskAssignment
-	agents        map[string]*api.Agent
+	domainConfigs []DomainConfig                 // 默认 15 Agent 域划分模板
+	domainAgents  map[api.AgentDomain][]string   // 域 -> 已注册 Agent id 列表
+	tasks         map[string]*api.TaskDefinition // 任务 id -> 定义
+	assignments   map[string]TaskAssignment      // 任务 id -> 指派记录
+	agents        map[string]*api.Agent          // Agent id -> 快照指针
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx    context.Context    // 协调器生命周期
+	cancel context.CancelFunc // 取消后台循环
+	wg     sync.WaitGroup     // 等待 health/metrics 退出
 
-	state   CoordinatorState
-	metrics CoordinatorMetrics
+	state   CoordinatorState   // 运行态摘要
+	metrics CoordinatorMetrics // 累计 KPI
 
-	heartbeat time.Duration
-	paused    bool
+	heartbeat time.Duration // 健康检查节拍
+	paused    bool          // Pause 时拒绝新任务
 }
 
-// NewUnifiedSwarmCoordinator builds a coordinator with defaults.
+// NewUnifiedSwarmCoordinator 填充 cfg 默认值，创建可取消的根 context，不自动 Initialize。
 func NewUnifiedSwarmCoordinator(cfg CoordinatorConfig) *UnifiedSwarmCoordinator {
 	if cfg.AgentPoolMin <= 0 {
 		cfg.AgentPoolMin = 1
@@ -339,7 +339,7 @@ func (c *UnifiedSwarmCoordinator) AssignTaskToDomain(taskID string, domain api.A
 	})
 }
 
-// ExecuteParallel runs multiple task definitions concurrently.
+// ExecuteParallel 对每个任务启 goroutine 调用 SubmitTask，WaitGroup 收敛后返回各任务结果片段。
 func (c *UnifiedSwarmCoordinator) ExecuteParallel(tasks []*api.TaskDefinition) []ParallelExecutionResult {
 	results := make([]ParallelExecutionResult, len(tasks))
 	var wg sync.WaitGroup
@@ -363,6 +363,7 @@ func (c *UnifiedSwarmCoordinator) ExecuteParallel(tasks []*api.TaskDefinition) [
 	return results
 }
 
+// healthMonitorLoop 周期 tickHealth：心跳超时则衰减健康并在过低时尝试“恢复”计数。
 func (c *UnifiedSwarmCoordinator) healthMonitorLoop() {
 	defer c.wg.Done()
 	ticker := time.NewTicker(c.heartbeat)
@@ -377,6 +378,7 @@ func (c *UnifiedSwarmCoordinator) healthMonitorLoop() {
 	}
 }
 
+// tickHealth 扫描所有 Agent 上次心跳，触发池 CheckScaling。
 func (c *UnifiedSwarmCoordinator) tickHealth() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -440,7 +442,7 @@ func (c *UnifiedSwarmCoordinator) ProposeConsensus(ctx context.Context, value []
 	return id, nil
 }
 
-// AwaitConsensus waits for a proposal outcome.
+// AwaitConsensus 阻塞等待提案提交结果并映射为 Coordinator 使用的 ConsensusResult。
 func (c *UnifiedSwarmCoordinator) AwaitConsensus(ctx context.Context, proposalID string, timeout time.Duration) (ConsensusResult, error) {
 	c.mu.RLock()
 	eng := c.engine
@@ -459,12 +461,12 @@ func (c *UnifiedSwarmCoordinator) AwaitConsensus(ctx context.Context, proposalID
 	}, err
 }
 
-// DefaultDomainConfigs returns the 15-agent layout.
+// DefaultDomainConfigs 返回内置 15 Agent 域切片副本引用（与内部 domainConfigs 同源）。
 func (c *UnifiedSwarmCoordinator) DefaultDomainConfigs() []DomainConfig {
 	return c.domainConfigs
 }
 
-// Shutdown stops background work and closes resources.
+// Shutdown cancel 上下文、等待协程、关闭总线/池/共识引擎。
 func (c *UnifiedSwarmCoordinator) Shutdown(ctx context.Context) error {
 	c.cancel()
 	done := make(chan struct{})
@@ -492,28 +494,28 @@ func (c *UnifiedSwarmCoordinator) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// Topology exposes the topology manager.
+// Topology 返回拓扑管理器指针（调用方勿并发修改内部状态，应通过其方法访问）。
 func (c *UnifiedSwarmCoordinator) Topology() *TopologyManager {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.topology
 }
 
-// Bus exposes the message bus.
+// Bus 返回消息总线实例。
 func (c *UnifiedSwarmCoordinator) Bus() *MessageBus {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.bus
 }
 
-// Pool exposes the agent pool.
+// Pool 返回 Agent 池实例。
 func (c *UnifiedSwarmCoordinator) Pool() *AgentPool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.pool
 }
 
-// Pause stops new task submissions until Resume.
+// Pause 设置 draining 状态并阻止 SubmitTask/AssignTaskToDomain。
 func (c *UnifiedSwarmCoordinator) Pause() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -521,7 +523,7 @@ func (c *UnifiedSwarmCoordinator) Pause() {
 	c.state.Status = api.SwarmStatusDraining
 }
 
-// Resume allows task submissions again.
+// Resume 清除暂停标志并在原 draining 时恢复健康状态枚举。
 func (c *UnifiedSwarmCoordinator) Resume() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -531,7 +533,7 @@ func (c *UnifiedSwarmCoordinator) Resume() {
 	}
 }
 
-// GetAgent returns a registered agent by id.
+// GetAgent 返回 Agent 值拷贝，避免外部长期持有内部指针。
 func (c *UnifiedSwarmCoordinator) GetAgent(id string) (*api.Agent, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -543,7 +545,7 @@ func (c *UnifiedSwarmCoordinator) GetAgent(id string) (*api.Agent, bool) {
 	return &cp, true
 }
 
-// GetAllAgents returns a snapshot of all registered agents.
+// GetAllAgents 返回当前注册 Agent 的浅拷贝切片。
 func (c *UnifiedSwarmCoordinator) GetAllAgents() []*api.Agent {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -558,7 +560,7 @@ func (c *UnifiedSwarmCoordinator) GetAllAgents() []*api.Agent {
 	return out
 }
 
-// GetAgentsByType returns agents matching the given role type.
+// GetAgentsByType 过滤 Type 相等的 Agent。
 func (c *UnifiedSwarmCoordinator) GetAgentsByType(agentType api.AgentType) []*api.Agent {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -573,7 +575,7 @@ func (c *UnifiedSwarmCoordinator) GetAgentsByType(agentType api.AgentType) []*ap
 	return out
 }
 
-// GetAvailableAgents returns agents in idle (assignable) state.
+// GetAvailableAgents 仅 State==Idle 的 Agent。
 func (c *UnifiedSwarmCoordinator) GetAvailableAgents() []*api.Agent {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -588,7 +590,7 @@ func (c *UnifiedSwarmCoordinator) GetAvailableAgents() []*api.Agent {
 	return out
 }
 
-// CancelTask marks a task cancelled and clears its assignment.
+// CancelTask 将任务标为取消并删除 assignments 项。
 func (c *UnifiedSwarmCoordinator) CancelTask(taskID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -603,7 +605,7 @@ func (c *UnifiedSwarmCoordinator) CancelTask(taskID string) error {
 	return nil
 }
 
-// GetTask returns a task definition by id.
+// GetTask 返回值拷贝的任务定义。
 func (c *UnifiedSwarmCoordinator) GetTask(taskID string) (*api.TaskDefinition, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -615,7 +617,7 @@ func (c *UnifiedSwarmCoordinator) GetTask(taskID string) (*api.TaskDefinition, b
 	return &cp, true
 }
 
-// BroadcastMessage delivers a copy of msg to every registered agent queue.
+// BroadcastMessage 为每个已注册 Agent 克隆消息（新 ID）并 bus.Send，id 排序保证顺序稳定。
 func (c *UnifiedSwarmCoordinator) BroadcastMessage(msg *api.Message) error {
 	if msg == nil {
 		return fmt.Errorf("coordinator: nil message")
@@ -645,7 +647,7 @@ func (c *UnifiedSwarmCoordinator) BroadcastMessage(msg *api.Message) error {
 	return nil
 }
 
-// GetState returns a snapshot of coordinator state (mutex field is unused in the copy).
+// GetState 拷贝轻量状态字段（不含内部互斥量语义）。
 func (c *UnifiedSwarmCoordinator) GetState() CoordinatorState {
 	c.mu.RLock()
 	st := c.state.Status
@@ -665,7 +667,7 @@ func (c *UnifiedSwarmCoordinator) GetState() CoordinatorState {
 	}
 }
 
-// GetMetrics returns a point-in-time metrics snapshot.
+// GetMetrics 在锁内复制计数器快照。
 func (c *UnifiedSwarmCoordinator) GetMetrics() CoordinatorMetrics {
 	c.metrics.mu.Lock()
 	defer c.metrics.mu.Unlock()
@@ -680,7 +682,7 @@ func (c *UnifiedSwarmCoordinator) GetMetrics() CoordinatorMetrics {
 	}
 }
 
-// IsHealthy reports whether the swarm is considered operational.
+// IsHealthy 非 Pause 且状态为 Healthy 或 Active 时视为可用。
 func (c *UnifiedSwarmCoordinator) IsHealthy() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -690,7 +692,7 @@ func (c *UnifiedSwarmCoordinator) IsHealthy() bool {
 	return c.state.Status == api.SwarmStatusHealthy || c.state.Status == api.SwarmStatusActive
 }
 
-// GetAgentsByDomain returns agents in the given domain.
+// GetAgentsByDomain 过滤 Domain 字段。
 func (c *UnifiedSwarmCoordinator) GetAgentsByDomain(domain api.AgentDomain) []*api.Agent {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -705,6 +707,7 @@ func (c *UnifiedSwarmCoordinator) GetAgentsByDomain(domain api.AgentDomain) []*a
 	return out
 }
 
+// stringSliceRemoveCopy 返回去除 x 后的新切片，全删尽则 nil。
 func stringSliceRemoveCopy(ss []string, x string) []string {
 	var out []string
 	for _, s := range ss {

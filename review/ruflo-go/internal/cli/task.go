@@ -6,6 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 task 命令组：编排任务的创建、列表、状态、指派与取消，对应 MCP 工具 task_*。
+
+// newTaskCmd 构建「task」根子命令，挂载 create、list、status、assign、cancel。
 func newTaskCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "task",
@@ -21,6 +24,7 @@ func newTaskCmd() *cobra.Command {
 	return cmd
 }
 
+// taskCreateCmd 创建任务：必填 description；若未给 title 则从 description 截断生成；调用 task_create。
 func taskCreateCmd() *cobra.Command {
 	var typ, title, description string
 	var priority int
@@ -51,6 +55,7 @@ func taskCreateCmd() *cobra.Command {
 	return c
 }
 
+// taskListCmd 列出当前任务集合，调用 task_list。
 func taskListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -65,6 +70,7 @@ func taskListCmd() *cobra.Command {
 	}
 }
 
+// taskStatusCmd 按 --id 查询任务状态，调用 task_status。
 func taskStatusCmd() *cobra.Command {
 	var id string
 	c := &cobra.Command{
@@ -83,6 +89,7 @@ func taskStatusCmd() *cobra.Command {
 	return c
 }
 
+// taskAssignCmd 将任务指派给代理，需 --id 与 --agent-id，调用 task_assign。
 func taskAssignCmd() *cobra.Command {
 	var id, agentID string
 	c := &cobra.Command{
@@ -105,6 +112,7 @@ func taskAssignCmd() *cobra.Command {
 	return c
 }
 
+// taskCancelCmd 取消指定 id 的任务，调用 task_cancel。
 func taskCancelCmd() *cobra.Command {
 	var id string
 	c := &cobra.Command{

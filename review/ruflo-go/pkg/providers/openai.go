@@ -1,3 +1,11 @@
+// 本文件封装 OpenAI Chat Completions API（POST /v1/chat/completions）。
+//
+// 消息格式转换（统一多轮对话 → OpenAI Chat）：
+//   - 每条 LLMMessage 映射为 messages[] 元素：role、content 必填；若 Name 非空则增加 name 字段（函数调用等场景）。
+//   - 与 Anthropic 不同：system 通常作为 messages 中 role=system 的一条，本实现不做拆分，与 Chat Completions 一致。
+//   - tools 数组原样传入 body["tools"]，供工具调用。
+// 响应侧：取 choices[0]；将 message.tool_calls 解析为 api.LLMToolCall（arguments 尝试 JSON 反序列化，并保留 RawJSON）；
+// usage 映射 prompt_tokens / completion_tokens / total_tokens。
 package providers
 
 import (
@@ -16,17 +24,17 @@ import (
 
 const openaiChatAPI = "https://api.openai.com/v1/chat/completions"
 
-// OpenAIProvider calls OpenAI chat completions.
+// OpenAIProvider 使用 Bearer 令牌调用 OpenAI Chat Completions。
 type OpenAIProvider struct {
-	APIKey     string
-	HTTPClient *http.Client
-	Model      string
+	APIKey     string       // OpenAI API 密钥
+	HTTPClient *http.Client // 可注入；nil 为默认超时客户端
+	Model      string       // 请求未指定模型时的默认模型（如 gpt-4o-mini）
 }
 
-// Name returns the provider id.
+// Name 返回 api.LLMProviderOpenAI 字符串标识。
 func (p *OpenAIProvider) Name() string { return string(api.LLMProviderOpenAI) }
 
-// Complete performs a chat completion.
+// Complete 执行聊天补全；转换规则见文件头说明。
 func (p *OpenAIProvider) Complete(ctx context.Context, req api.LLMRequest) (*api.LLMResponse, error) {
 	if p.APIKey == "" {
 		return nil, errors.New("openai: missing API key")
@@ -158,12 +166,12 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req api.LLMRequest) (*api
 	}, nil
 }
 
-// StreamComplete is not implemented for OpenAI in this build.
+// StreamComplete 未实现。
 func (p *OpenAIProvider) StreamComplete(ctx context.Context, req api.LLMRequest) (io.ReadCloser, error) {
 	return nil, errors.New("openai: use Complete; streaming not implemented")
 }
 
-// HealthCheck calls models list.
+// HealthCheck 请求 /v1/models，5xx 视为错误。
 func (p *OpenAIProvider) HealthCheck(ctx context.Context) error {
 	if p.APIKey == "" {
 		return errors.New("openai: no api key")
@@ -188,7 +196,7 @@ func (p *OpenAIProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// EstimateCost returns a rough relative cost score for load balancing.
+// EstimateCost 用消息条数×256 的粗 Token 近似再乘系数，供策略比较相对成本。
 func (p *OpenAIProvider) EstimateCost(req api.LLMRequest) float64 {
 	tok := len(req.Messages) * 256
 	return float64(tok) * 1e-6

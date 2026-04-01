@@ -1,3 +1,28 @@
+// Gossip（流行病式/流言传播）共识协议实现。
+//
+// # 算法原理（Demers et al., 1987; Kermarrec et al., 2003）
+//
+// Gossip 协议受流行病传播启发：每一轮（round），每个节点随机选择 fanout 个邻居传播信息。
+// 通过多轮传播，信息最终到达所有节点。收敛时间约 O(log N) 轮（N 为节点数）。
+//
+// # 传播模型
+//
+// 本实现采用 Push 模式：
+//  1. 发起者(originator)创建提案并自行投票
+//  2. 每轮随机选 fanout 个邻居传播（Fisher-Yates 洗牌取前 k 个）
+//  3. 收到的节点也投赞成票（模拟诚实多数假设）
+//  4. 当 ≥90% 节点参与且 ≥2/3 赞成时，视为已收敛并提交
+//  5. TTL 限制最大传播轮数（防止无限传播）
+//
+// # Anti-Entropy
+//
+// antiEntropy 字段记录每个节点最后看到的序号，用于检测信息滞后、驱动补偿同步
+// （本实现中仅记录，未做主动拉取）。
+//
+// # 一致性保证
+//
+// Gossip 只提供最终一致性（eventual consistency），不保证全序；适合对一致性要求较低、
+// 但对可用性和分区容错要求高的场景（如状态广播、心跳汇聚）。
 package consensus
 
 import (
@@ -10,6 +35,11 @@ import (
 	"time"
 )
 
+// gossipProposal 单笔 Gossip 提案的状态。
+//   - hops: 已经过的传播轮数
+//   - ttl: 最大传播轮数
+//   - votes: 各节点的投票结果（true=赞成）
+//   - antiEntropy: 各节点最后观察到的传播序号（用于数据修复）
 type gossipProposal struct {
 	value       []byte
 	hops        int
@@ -18,9 +48,10 @@ type gossipProposal struct {
 	round       int
 	created     time.Time
 	committed   bool
-	antiEntropy map[string]uint64 // node -> last seq seen (anti-entropy)
+	antiEntropy map[string]uint64
 }
 
+// gossipConsensus Gossip 引擎：无 Leader，所有节点对等，靠随机传播达成最终一致。
 type gossipConsensus struct {
 	mu sync.RWMutex
 
@@ -30,6 +61,7 @@ type gossipConsensus struct {
 	rng       *mrand.Rand
 }
 
+// newGossipConsensus 构造 Gossip 引擎，默认 TTL=16（即最多 16 轮传播）。
 func newGossipConsensus(cfg Config) Engine {
 	nodes := append([]string(nil), cfg.Peers...)
 	if !stringSliceContains(nodes, cfg.NodeID) {
@@ -61,6 +93,7 @@ func (g *gossipConsensus) fanout() int {
 	return f
 }
 
+// AddNode 加入集群并排序。O(n log n)。
 func (g *gossipConsensus) AddNode(id string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -71,6 +104,7 @@ func (g *gossipConsensus) AddNode(id string) error {
 	return nil
 }
 
+// RemoveNode 移除节点。O(n)。
 func (g *gossipConsensus) RemoveNode(id string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -100,17 +134,17 @@ func (g *gossipConsensus) Propose(ctx context.Context, value []byte) (string, er
 		created:     time.Now(),
 		antiEntropy: make(map[string]uint64),
 	}
-	// Originator approves.
+	// 发起者自己投赞成票
 	p.votes[g.cfg.NodeID] = true
 	p.antiEntropy[g.cfg.NodeID] = 1
 
 	total := len(g.nodes)
-	// Epidemic rounds until TTL exhausted or convergence.
+	// 流行病传播循环：每轮随机选 fanout 个邻居传播，直到 TTL 用尽或收敛
 	for hop := 0; hop < p.ttl; hop++ {
 		p.hops = hop
 		neighbors := g.randomNeighborsUnlocked(g.cfg.NodeID, g.fanout())
 		for _, n := range neighbors {
-			// Gossip receive: node adopts and votes approve (honest majority).
+			// 模拟 Gossip 接收：诚实节点收到信息后投赞成票
 			p.votes[n] = true
 			p.antiEntropy[n] = uint64(hop + 1)
 		}
@@ -175,6 +209,7 @@ func (g *gossipConsensus) randomNeighborsUnlocked(exclude string, k int) []strin
 	return append([]string(nil), candidates[:k]...)
 }
 
+// AwaitConsensus 轮询直至 committed 或超时。O(超时/间隔)。
 func (g *gossipConsensus) AwaitConsensus(ctx context.Context, proposalID string, timeout time.Duration) (Result, error) {
 	wait := timeout
 	if wait <= 0 {

@@ -6,6 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 session 命令组：会话的创建、结束、保存、恢复、列举与删除，对应 session_save/delete/restore/list 等 MCP 工具。
+
+// newSessionCmd 构建「session」根子命令，挂载 start、end、save、restore、list、delete。
 func newSessionCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "session",

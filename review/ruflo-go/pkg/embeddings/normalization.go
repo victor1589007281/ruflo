@@ -1,8 +1,9 @@
+// 本文件提供常用向量归一化：L2（单位球面）、L1（概率单纯形）、Min-Max 到 [0,1]、以及给定均值方差的 Z-Score。
 package embeddings
 
 import "math"
 
-// NormalizeL2 returns an L2-normalized copy of vec (zero vector maps to e1).
+// NormalizeL2 返回 L2 范数为 1 的拷贝；零向量时置第一维为 1 其余为 0（与哈希嵌入内部 normalizeL2 行为对齐思路）。
 func NormalizeL2(vec []float32) []float32 {
 	if len(vec) == 0 {
 		return nil
@@ -26,7 +27,7 @@ func NormalizeL2(vec []float32) []float32 {
 	return out
 }
 
-// NormalizeL1 returns an L1-normalized copy (sum of absolute values = 1).
+// NormalizeL1 将各分量按绝对值之和缩放，使 ||v||_1=1；全零时仅 v[0]=1。
 func NormalizeL1(vec []float32) []float32 {
 	if len(vec) == 0 {
 		return nil
@@ -49,7 +50,7 @@ func NormalizeL1(vec []float32) []float32 {
 	return out
 }
 
-// NormalizeMinMax scales each element to [0,1] using min/max of the slice.
+// NormalizeMinMax 用切片内 min/max 做线性仿射映射到 [0,1]；极差为 0 时全置 0。
 func NormalizeMinMax(vec []float32) []float32 {
 	if len(vec) == 0 {
 		return nil
@@ -77,7 +78,7 @@ func NormalizeMinMax(vec []float32) []float32 {
 	return out
 }
 
-// NormalizeZScore returns (vec-mean)/std per element; if std==0, returns a copy unchanged.
+// NormalizeZScore 逐元素减 mean 再除以 std；std==0 时直接返回拷贝，避免 NaN。mean/std 通常来自训练集统计量。
 func NormalizeZScore(vec []float32, mean, std float32) []float32 {
 	if len(vec) == 0 {
 		return nil

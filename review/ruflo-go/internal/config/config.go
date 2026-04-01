@@ -1,4 +1,10 @@
-// Package config loads Ruflo orchestration settings from defaults, environment, and JSON files.
+// Package config 负责加载与合并 Ruflo 编排相关配置：默认值、JSON 文件与环境变量覆盖。
+//
+// 设计思路：
+//   - Default() 给出与 Claude Flow v3 文档一致的基线（拓扑 hierarchical、策略 specialized、共识 raft、混合记忆等）。
+//   - Load 先反序列化 JSON 再 applyEnv，使环境变量成为覆盖层（便于容器与本地开发）。
+//   - ConfigFilePath 解析顺序：RUFLO_CONFIG → CLAUDE_FLOW_CONFIG → ~/.claude-flow/config.json。
+//   - ResolveMemoryPath 将 MemoryPath 规范为具体 SQLite 文件路径（目录则拼接 memory.db / unified.db）。
 package config
 
 import (
@@ -114,6 +120,7 @@ func LoadDefault() (RufloConfig, error) {
 	return Load(p, true)
 }
 
+// applyEnv 用常见 CLAUDE_FLOW_* 与 *API_KEY 环境变量覆盖配置字段（后写覆盖先写）。
 func applyEnv(c *RufloConfig) {
 	if v := os.Getenv("CLAUDE_FLOW_LOG_LEVEL"); v != "" {
 		c.LogLevel = v
@@ -143,7 +150,7 @@ func applyEnv(c *RufloConfig) {
 	}
 }
 
-// Save writes configuration as JSON to path (parent dirs must exist).
+// Save 将配置以缩进 JSON 写入 path（父目录须已存在）。
 func Save(path string, c RufloConfig) error {
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
@@ -155,7 +162,7 @@ func Save(path string, c RufloConfig) error {
 	return nil
 }
 
-// ResolveMemoryPath returns the SQLite path for unified memory.
+// ResolveMemoryPath 返回统一记忆 SQLite 数据库文件绝对路径：显式 .db/.sqlite 直接用；目录则拼接 memory.db；空则 dataDir/memory/unified.db。
 func (c RufloConfig) ResolveMemoryPath() (string, error) {
 	if c.MemoryPath != "" {
 		if strings.HasSuffix(c.MemoryPath, ".db") || strings.HasSuffix(c.MemoryPath, ".sqlite") {

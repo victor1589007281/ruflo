@@ -6,6 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// 本文件实现 swarm 命令组：蜂群/编排拓扑的初始化、状态、关闭与健康检查，对应 swarm_* MCP 工具。
+
+// newSwarmCmd 构建「swarm」根子命令，挂载 init、status、stop、health。
 func newSwarmCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "swarm",
@@ -20,6 +23,7 @@ func newSwarmCmd() *cobra.Command {
 	return cmd
 }
 
+// swarmInitCmd 初始化蜂群：拓扑、最大代理数、策略及可选 v3-mode，调用 swarm_init。
 func swarmInitCmd() *cobra.Command {
 	var topology, strategy string
 	var maxAgents int

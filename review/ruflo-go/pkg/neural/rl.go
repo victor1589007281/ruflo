@@ -1,3 +1,32 @@
+// 本文件提供离散动作空间上的多种强化学习策略与值函数更新规则（表格/线性近似/策略梯度类简化实现）。
+//
+// # Q-Learning（Watkins 1989；离策略 TD 控制）
+//
+// 更新：Q(s,a) ← Q(s,a) + α [ r + γ max_a' Q(s',a') − Q(s,a) ]。目标策略贪心，行为策略可带探索（如 ε-greedy）。
+//
+// # SARSA（Rummery & Niranjan 1994；在策略 TD）
+//
+// 更新：Q(s,a) ← Q(s,a) + α [ r + γ Q(s',a') − Q(s,a) ]，其中 a' 为在 s' 实际执行的动作，与行为策略一致。
+//
+// # DQN（Mnih et al., Nature 2015；本实现为线性函数近似）
+//
+// 思想：用神经网络（此处为每动作一组权重 w_a）近似 Q(s,a)≈w_a·s；标准 DQN 含经验回放与目标网络，本代码用同步更新简化。
+//
+// # A2C / Actor-Critic（优势 Actor-Critic 族）
+//
+// Critic 估计 V(s)，优势 A = r + γV(s') − V(s)；Actor 用策略梯度 ∂log π(a|s)·A 更新（此处 softmax 偏好 + 线性价值）。
+//
+// # PPO（Schulman et al., 2017；近端策略优化）
+//
+// 裁剪目标 L^CLIP = E[ min( r_t(θ) A_t, clip(r_t,1−ε,1+ε) A_t ) ]，抑制策略步长过大；本实现为表格偏好上的比率裁剪近似。
+//
+// # Decision Transformer（Chen et al., 2021 思想）
+//
+// 将回报与历史轨迹编码为序列，用自回归模型产生动作；此处用固定历史窗口拼接状态 + 线性打分简化。
+//
+// # Curiosity-Driven（如 Pathak et al., ICM 等内在动机线）
+//
+// 用前向模型预测误差等作为内在奖励，鼓励探索；此处用线性逐维预测误差范数加权到外在奖励上。
 package neural
 
 import (
@@ -217,6 +246,7 @@ func (s *SARSA) Update(state []float32, action string, reward float64, nextState
 	return nil
 }
 
+// GetPolicy 同 QLearning 语义。O(S·A)。
 func (s *SARSA) GetPolicy() map[string]float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -265,6 +295,7 @@ func NewDQN(stateDim int, alpha, gamma, epsilon float64) *DQN {
 	}
 }
 
+// qval 计算 w_a·s。O(d)。
 func (d *DQN) qval(state []float32, action string) float64 {
 	w := d.weights[action]
 	if len(w) != len(state) {
@@ -338,7 +369,7 @@ func (d *DQN) GetPolicy() map[string]float64 {
 
 // --- A2C ------------------------------------------------------------------------
 
-// A2C is a one-step actor–critic with softmax actor and linear critic.
+// A2C 单步 Actor-Critic：Actor 为状态线性 logits + softmax；Critic 为线性 V(s)；用优势 A 同时更新两边。
 type A2C struct {
 	mu      sync.Mutex
 	rng     *rand.Rand
@@ -351,7 +382,7 @@ type A2C struct {
 	actions []string
 }
 
-// NewA2C constructs actor-critic; actions list defines the discrete set.
+// NewA2C 构造 A2C；actions 为离散动作全集。O(|A|·d)。
 func NewA2C(stateDim int, actions []string, alphaPi, alphaV, gamma float64) *A2C {
 	if stateDim <= 0 {
 		stateDim = 4
@@ -376,6 +407,7 @@ func NewA2C(stateDim int, actions []string, alphaPi, alphaV, gamma float64) *A2C
 
 func (a *A2C) Name() string { return "a2c" }
 
+// probs 数值稳定 softmax：减去 max logit 再 exp。O(|A|·d)。
 func (a *A2C) probs(state []float32) map[string]float64 {
 	logits := make(map[string]float64)
 	var maxL float64 = -1e9
@@ -403,6 +435,7 @@ func (a *A2C) probs(state []float32) map[string]float64 {
 	return exp
 }
 
+// value 线性 Critic V(s)=w·s。O(d)。
 func (a *A2C) value(state []float32) float64 {
 	var s float64
 	for i := 0; i < len(state) && i < len(a.criticW); i++ {
@@ -411,6 +444,7 @@ func (a *A2C) value(state []float32) float64 {
 	return s
 }
 
+// SelectAction 按 probs 累积分布采样。O(|A|·d)。
 func (a *A2C) SelectAction(state []float32, actions []string) (string, float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -432,6 +466,7 @@ func (a *A2C) SelectAction(state []float32, actions []string) (string, float64) 
 	return chosen, p[chosen]
 }
 
+// Update TD(0) Critic：w_V += α_V · A · s；Actor：对 softmax 用策略梯度 ∂logπ/∂θ·A。O(|A|·d)。
 func (a *A2C) Update(state []float32, action string, reward float64, nextState []float32) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -457,6 +492,7 @@ func (a *A2C) Update(state []float32, action string, reward float64, nextState [
 	return nil
 }
 
+// GetPolicy 返回零状态下的动作分布。O(|A|·d)。
 func (a *A2C) GetPolicy() map[string]float64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -466,7 +502,7 @@ func (a *A2C) GetPolicy() map[string]float64 {
 
 // --- PPO ------------------------------------------------------------------------
 
-// PPO clips probability ratio for stable policy updates (tabular prefs).
+// PPO 在 softmax 偏好参数上做裁剪比率更新；SelectAction 前快照 oldPref 供 ratio = π_new/π_old。
 type PPO struct {
 	mu       sync.Mutex
 	rng      *rand.Rand
@@ -479,7 +515,7 @@ type PPO struct {
 	baseline float64
 }
 
-// NewPPO constructs PPO with clipped objective on softmax preferences.
+// NewPPO clip 为 ε，默认 0.2。O(|A|·d)。
 func NewPPO(stateDim int, actions []string, lr, clip float64) *PPO {
 	if stateDim <= 0 {
 		stateDim = 4
@@ -506,16 +542,19 @@ func NewPPO(stateDim int, actions []string, lr, clip float64) *PPO {
 
 func (p *PPO) Name() string { return "ppo" }
 
+// softmaxActionProbs 复用 A2C 的 softmax 逻辑。O(|A|·d)。
 func (p *PPO) softmaxActionProbs(state []float32) map[string]float64 {
 	a := &A2C{pref: p.pref, criticW: make([]float32, p.dim), dim: p.dim, actions: p.actions}
 	return a.probs(state)
 }
 
+// oldProbs 基于快照 oldPref 的 softmax。O(|A|·d)。
 func (p *PPO) oldProbs(state []float32) map[string]float64 {
 	a := &A2C{pref: p.oldPref, criticW: make([]float32, p.dim), dim: p.dim, actions: p.actions}
 	return a.probs(state)
 }
 
+// SelectAction 拷贝旧策略后按新策略采样。O(|A|·d)。
 func (p *PPO) SelectAction(state []float32, actions []string) (string, float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -541,6 +580,8 @@ func (p *PPO) SelectAction(state []float32, actions []string) (string, float64) 
 	return chosen, pr[chosen]
 }
 
+// Update 用基线减回报得优势 A，ratio=π_new(a|s)/π_old，surrogate=min(rA, clip(r)A)，再反传梯度到偏好向量（缩放系数含 0.1）。
+// 时间复杂度 O(|A|·d)。
 func (p *PPO) Update(state []float32, action string, reward float64, _ []float32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -568,6 +609,7 @@ func (p *PPO) Update(state []float32, action string, reward float64, _ []float32
 	return nil
 }
 
+// GetPolicy 零状态下新策略分布。O(|A|·d)。
 func (p *PPO) GetPolicy() map[string]float64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -577,7 +619,7 @@ func (p *PPO) GetPolicy() map[string]float64 {
 
 // --- Decision Transformer (simplified) -----------------------------------------
 
-// DecisionTransformer maps fixed-length recent state windows to action logits.
+// DecisionTransformer 将最近 maxHist 步状态拼接为固定长向量，再与每动作一组权重打分（极简序列决策近似 DT）。
 type DecisionTransformer struct {
 	mu       sync.Mutex
 	rng      *rand.Rand
@@ -589,7 +631,7 @@ type DecisionTransformer struct {
 	actions  []string
 }
 
-// NewDecisionTransformer keeps up to maxHist prior states for sequence conditioning.
+// NewDecisionTransformer 初始化历史窗口与权重。O(maxHist·d)。
 func NewDecisionTransformer(stateDim int, actions []string, maxHist int, lr float64) *DecisionTransformer {
 	if maxHist <= 0 {
 		maxHist = 8
@@ -615,6 +657,7 @@ func NewDecisionTransformer(stateDim int, actions []string, maxHist int, lr floa
 
 func (d *DecisionTransformer) Name() string { return "decision_transformer" }
 
+// flatState 追加当前状态到 history，输出长度 maxHist·d 的拼接（前部不足补零语义由布局实现）。O(maxHist·d)。
 func (d *DecisionTransformer) flatState(state []float32) []float32 {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -643,6 +686,7 @@ func (d *DecisionTransformer) flatState(state []float32) []float32 {
 	return out
 }
 
+// SelectAction 对每动作用 flatState 与权重及动作哈希扰动项打分，取 argmax。O(|A|·maxHist·d)。
 func (d *DecisionTransformer) SelectAction(state []float32, actions []string) (string, float64) {
 	fs := d.flatState(state)
 	d.mu.Lock()
@@ -663,6 +707,7 @@ func (d *DecisionTransformer) SelectAction(state []float32, actions []string) (s
 	return best, bestS
 }
 
+// Update 简单 REINFORCE 式：权重 += lr · reward · flatState（与具体选中动作弱相关，教学化简化）。O(maxHist·d)。
 func (d *DecisionTransformer) Update(state []float32, action string, reward float64, nextState []float32) error {
 	fs := d.flatState(state)
 	d.mu.Lock()
@@ -673,6 +718,7 @@ func (d *DecisionTransformer) Update(state []float32, action string, reward floa
 	return nil
 }
 
+// GetPolicy 返回动作名到哈希标量（占位诊断）。O(|A|)。
 func (d *DecisionTransformer) GetPolicy() map[string]float64 {
 	out := make(map[string]float64)
 	for _, a := range d.actions {
@@ -681,6 +727,7 @@ func (d *DecisionTransformer) GetPolicy() map[string]float64 {
 	return out
 }
 
+// fnvString FNV-1a 64 哈希，用于 DecisionTransformer 中动作相关扰动。O(len(s))。
 func fnvString(s string) uint64 {
 	var h uint64 = 14695981039346656037
 	for i := 0; i < len(s); i++ {
@@ -692,7 +739,7 @@ func fnvString(s string) uint64 {
 
 // --- Curiosity ------------------------------------------------------------------
 
-// CuriosityDriven adds intrinsic reward from predicted next-state error.
+// CuriosityDriven 包装基算法，在 Update 中把下一步预测误差范数（经 β 缩放）加到奖励上，鼓励访问难预测状态。
 type CuriosityDriven struct {
 	mu        sync.Mutex
 	base      RLAlgorithm
@@ -702,7 +749,7 @@ type CuriosityDriven struct {
 	lastState []float32
 }
 
-// NewCuriosityDriven wraps an algorithm and adds curiosity bonus on Update.
+// NewCuriosityDriven inner 为外在 RL；wModel 为逐维线性预测参数。O(d)。
 func NewCuriosityDriven(inner RLAlgorithm, stateDim int, lrModel, beta float64) *CuriosityDriven {
 	if stateDim <= 0 {
 		stateDim = 4
@@ -713,6 +760,7 @@ func NewCuriosityDriven(inner RLAlgorithm, stateDim int, lrModel, beta float64) 
 
 func (c *CuriosityDriven) Name() string { return "curiosity_" + c.base.Name() }
 
+// predictNext 简化前向：pred_i = s_i * w_i。O(d)。
 func (c *CuriosityDriven) predictNext(state []float32) []float32 {
 	out := make([]float32, len(state))
 	for i := range state {
@@ -723,6 +771,7 @@ func (c *CuriosityDriven) predictNext(state []float32) []float32 {
 	return out
 }
 
+// SelectAction 委托 base并缓存 lastState。O(基算法)。
 func (c *CuriosityDriven) SelectAction(state []float32, actions []string) (string, float64) {
 	c.mu.Lock()
 	c.lastState = append([]float32(nil), state...)
@@ -730,6 +779,8 @@ func (c *CuriosityDriven) SelectAction(state []float32, actions []string) (strin
 	return c.base.SelectAction(state, actions)
 }
 
+// Update 计算预测误差 ||next - pred||² 的平方根加权 β 作为内在奖励，再调用 base.Update(..., reward+intrinsic, ...)；
+// 并用梯度式规则更新 wModel。O(d)。
 func (c *CuriosityDriven) Update(state []float32, action string, reward float64, nextState []float32) error {
 	c.mu.Lock()
 	pred := c.predictNext(state)
@@ -746,6 +797,7 @@ func (c *CuriosityDriven) Update(state []float32, action string, reward float64,
 	return c.base.Update(state, action, reward+intrinsic, nextState)
 }
 
+// GetPolicy 委托内层。O(基算法)。
 func (c *CuriosityDriven) GetPolicy() map[string]float64 {
 	return c.base.GetPolicy()
 }

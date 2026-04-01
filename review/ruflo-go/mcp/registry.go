@@ -7,18 +7,19 @@ import (
 	"sync"
 )
 
-// ToolRegistry stores MCP tools by name and dispatches calls.
+// ToolRegistry 是 MCP 工具注册中心：按名称索引元数据与 Handler，
+// 供 tools/list 枚举、tools/call 按名路由到具体处理函数。
 type ToolRegistry struct {
 	mu    sync.RWMutex
-	tools map[string]*MCPTool
+	tools map[string]*MCPTool // 工具名 -> 工具定义（含 InputSchema 与 Handler）
 }
 
-// NewToolRegistry returns an empty registry.
+// NewToolRegistry 返回空的工具表，可逐步 Register 填充。
 func NewToolRegistry() *ToolRegistry {
 	return &ToolRegistry{tools: make(map[string]*MCPTool)}
 }
 
-// Register adds or replaces a tool. Name must be non-empty.
+// Register 注册或覆盖同名工具；Name 非空且 Handler 非 nil，否则返回错误。
 func (r *ToolRegistry) Register(tool *MCPTool) error {
 	if tool == nil || tool.Name == "" {
 		return fmt.Errorf("mcp: invalid tool")
@@ -32,7 +33,7 @@ func (r *ToolRegistry) Register(tool *MCPTool) error {
 	return nil
 }
 
-// Get returns a tool by name.
+// Get 按名称查找工具，第二个返回值为是否命中。
 func (r *ToolRegistry) Get(name string) (*MCPTool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -40,7 +41,7 @@ func (r *ToolRegistry) Get(name string) (*MCPTool, bool) {
 	return t, ok
 }
 
-// List returns all registered tools (copy of slice, stable order by name sort would be nice - we sort).
+// List 返回当前已注册全部工具的切片副本；按 Name 字典序排序，保证 tools/list 输出稳定。
 func (r *ToolRegistry) List() []*MCPTool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -59,7 +60,7 @@ func (r *ToolRegistry) List() []*MCPTool {
 	return out
 }
 
-// Call invokes a tool by name with JSON arguments (object or null).
+// Call 根据工具名调用对应 Handler，args 通常为 JSON 对象或 null（由传输层规范化为 {}）。
 func (r *ToolRegistry) Call(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) {
 	t, ok := r.Get(name)
 	if !ok {

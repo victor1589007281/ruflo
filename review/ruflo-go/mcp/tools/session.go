@@ -1,3 +1,5 @@
+// session.go：session_* MCP 工具，管理 globalState.sessions 与会话 store.json 持久化。
+
 package tools
 
 import (
@@ -10,8 +12,10 @@ import (
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// sessionSeq 在 session_id 省略时用于生成 sess-{N}，重启后由 persist 恢复。
 var sessionSeq int64
 
+// sessionTools 注册 save/restore/list/delete/info 会话工具。
 func sessionTools() []*mcp.MCPTool {
 	return []*mcp.MCPTool{
 		{

@@ -1,3 +1,5 @@
+// 后端迁移（memory 包）：MemoryMigrator 持有 source/target 两个 MemoryService，按命名空间分页拉取再写入，实现存储后端互换或升级。
+// ExportJSON/ImportJSON 将条目序列化为版本化信封，便于审计与灾备；ctx 可取消长时迁移。
 package memory
 
 import (
@@ -8,30 +10,30 @@ import (
 	"time"
 )
 
-// MigrationResult summarizes a migration run.
+// MigrationResult 单次迁移或聚合迁移的统计与错误摘要。
 type MigrationResult struct {
-	Total     int
-	Migrated  int
-	Failed    int
-	Skipped   int
-	Duration  time.Duration
-	Errors    []string
+	Total    int           // 处理条目总数（遍历计数）
+	Migrated int           // 成功写入目标数
+	Failed   int           // 失败数
+	Skipped  int           // 预留/未使用场景
+	Duration time.Duration // 耗时
+	Errors   []string      // 采样错误信息（有上限避免爆内存）
 }
 
-// MemoryMigrator copies entries between MemoryService implementations.
+// MemoryMigrator 持有源与目标 MemoryService，执行复制或 JSON 导入导出。
 type MemoryMigrator struct {
-	source MemoryService
-	target MemoryService
+	source MemoryService // 读取侧
+	target MemoryService // 写入侧
 }
 
-// NewMigrator constructs a migrator from src to dst.
+// NewMigrator 构造迁移器，二者均不可为 nil（方法内会校验）。
 func NewMigrator(src, dst MemoryService) *MemoryMigrator {
 	return &MemoryMigrator{source: src, target: dst}
 }
 
 type exportEnvelope struct {
-	Version int                `json:"version"`
-	Entries []exportEntry      `json:"entries"`
+	Version int           `json:"version"`
+	Entries []exportEntry `json:"entries"`
 }
 
 type exportEntry struct {

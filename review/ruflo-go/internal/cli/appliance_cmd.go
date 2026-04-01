@@ -12,6 +12,7 @@ func newApplianceCmd() *cobra.Command {
 		Short: "Appliance image build / run (placeholder)",
 	}
 	cmd.AddCommand(
+		// build：占位，构建设备镜像。
 		&cobra.Command{
 			Use:   "build",
 			Short: "Build appliance image",
@@ -20,6 +21,7 @@ func newApplianceCmd() *cobra.Command {
 				return err
 			},
 		},
+		// inspect：占位，检查清单。
 		&cobra.Command{
 			Use:   "inspect",
 			Short: "Inspect appliance manifest",
@@ -28,6 +30,7 @@ func newApplianceCmd() *cobra.Command {
 				return err
 			},
 		},
+		// verify：占位，校验签名。
 		&cobra.Command{
 			Use:   "verify",
 			Short: "Verify appliance signature",
@@ -36,6 +39,7 @@ func newApplianceCmd() *cobra.Command {
 				return err
 			},
 		},
+		// extract：占位，解压层文件。
 		&cobra.Command{
 			Use:   "extract",
 			Short: "Extract appliance layers",
@@ -44,6 +48,7 @@ func newApplianceCmd() *cobra.Command {
 				return err
 			},
 		},
+		// run：占位，运行容器。
 		&cobra.Command{
 			Use:   "run",
 			Short: "Run appliance container",

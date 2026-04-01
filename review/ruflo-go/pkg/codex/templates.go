@@ -1,8 +1,12 @@
+// 本文件提供预定义的跨平台协作模板（WorkerConfig 流水线）。
+//
+// 设计思路：将常见研发场景固化为「角色 × 平台 × 依赖」有向图，默认命名空间 collaboration，
+// 与 DualModeOrchestrator.RunCollaboration 及共享记忆约定一致；Claude 侧重架构/测试/分析，Codex 侧重实现与扫描类自动化。
 package codex
 
 const defaultCollabNS = "collaboration"
 
-// FeatureTemplate is architect → coder → tester → reviewer across Claude and Codex.
+// FeatureTemplate 特性开发：architect(Claude) → coder(Codex) → tester(Claude) → reviewer(Codex)。
 func FeatureTemplate(task string) []WorkerConfig {
 	ns := defaultCollabNS
 	return []WorkerConfig{
@@ -13,7 +17,7 @@ func FeatureTemplate(task string) []WorkerConfig {
 	}
 }
 
-// SecurityTemplate runs analysis → automated scan → report.
+// SecurityTemplate 安全审计：analyst(Claude) → scanner(Codex) → reporter(Claude)。
 func SecurityTemplate(target string) []WorkerConfig {
 	ns := defaultCollabNS
 	return []WorkerConfig{
@@ -23,7 +27,7 @@ func SecurityTemplate(target string) []WorkerConfig {
 	}
 }
 
-// RefactorTemplate plans → refactors → verifies.
+// RefactorTemplate 重构：architect 规划 → refactorer(Codex) 落地 → tester 验证。
 func RefactorTemplate(target string) []WorkerConfig {
 	ns := defaultCollabNS
 	return []WorkerConfig{
@@ -33,7 +37,7 @@ func RefactorTemplate(target string) []WorkerConfig {
 	}
 }
 
-// BugfixTemplate investigates → fixes → regression-tests.
+// BugfixTemplate 缺陷修复：researcher 定位 → coder 修复 → tester 回归验证。
 func BugfixTemplate(bug string) []WorkerConfig {
 	ns := defaultCollabNS
 	return []WorkerConfig{
@@ -43,14 +47,21 @@ func BugfixTemplate(bug string) []WorkerConfig {
 	}
 }
 
-// CollaborationTemplates provides the same pipelines as package-level template functions.
+// CollaborationTemplates 方法集与包级模板函数等价，便于以值接收者方式注入或满足接口。
 type CollaborationTemplates struct{}
 
+// Feature 同 FeatureTemplate。
 func (CollaborationTemplates) Feature(task string) []WorkerConfig { return FeatureTemplate(task) }
+
+// Security 同 SecurityTemplate。
 func (CollaborationTemplates) Security(target string) []WorkerConfig {
 	return SecurityTemplate(target)
 }
+
+// Refactor 同 RefactorTemplate。
 func (CollaborationTemplates) Refactor(target string) []WorkerConfig {
 	return RefactorTemplate(target)
 }
+
+// Bugfix 同 BugfixTemplate。
 func (CollaborationTemplates) Bugfix(bug string) []WorkerConfig { return BugfixTemplate(bug) }

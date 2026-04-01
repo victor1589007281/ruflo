@@ -1,17 +1,26 @@
 package tools
 
+// 本文件注册「浏览器自动化」相关 MCP 工具名称与 Schema，与 Node/Playwright 等实现对齐的 API 表面。
+//
+// 设计思路：
+//   - 当前 Go 运行时未嵌入真实浏览器驱动，所有工具统一走 browserPlaceholderHandler，返回固定不可用错误，避免客户端因缺工具而崩溃。
+//   - 保留完整工具清单便于协议兼容与未来接入真实实现时替换 Handler。
+
 import (
 	"context"
 
 	"github.com/ruflo/ruflo-go/mcp"
 )
 
+// browserUnavailable 为占位实现返回给调用方的错误文案（英文便于与既有客户端匹配）。
 const browserUnavailable = "browser automation not available in Go runtime"
 
+// browserPlaceholderHandler 统一拒绝浏览器类调用，说明当前运行时未提供自动化能力。
 func browserPlaceholderHandler(_ context.Context, _ map[string]any) mcp.MCPToolResult {
 	return mcp.MCPToolResult{OK: false, Error: browserUnavailable}
 }
 
+// browserTools 构建浏览器相关 MCP 工具切片：名称、英文描述、输入 Schema 均预定义，Handler 指向占位实现。
 func browserTools() []*mcp.MCPTool {
 	empty := map[string]any{"type": "object", "properties": map[string]any{}}
 	with := func(props map[string]any) map[string]any {
@@ -57,7 +66,7 @@ func browserTools() []*mcp.MCPTool {
 	return out
 }
 
-// RegisterBrowserTools registers placeholder browser automation tools.
+// RegisterBrowserTools 向注册表登记浏览器自动化占位工具（接口齐全、实现为空）。
 func RegisterBrowserTools(reg *mcp.ToolRegistry) error {
 	for _, t := range browserTools() {
 		if err := reg.Register(t); err != nil {

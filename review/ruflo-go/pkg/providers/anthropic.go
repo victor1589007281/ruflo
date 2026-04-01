@@ -1,3 +1,12 @@
+// 本文件封装 Anthropic Messages API（POST https://api.anthropic.com/v1/messages）。
+//
+// 消息格式转换（统一多轮对话 → Anthropic）：
+//   - role 为 system 的消息：不进入 messages 数组，多条 system 的文本用换行拼接为顶层字段 system（Anthropic 单独字段）。
+//   - 其余 role：原样写入 messages[].role 与 messages[].content（字符串形式）。
+//   - max_tokens、temperature、stop_sequences 由 LLMRequest 映射；max_tokens 缺省填 1024。
+// 响应侧：解析 content 数组中 type=="text" 的块拼接为单一 Text；usage 映射 input/output 并求和为 TotalTokens。
+//
+// 为避免与 api 包循环依赖，方法签名使用文件内 apiLLMRequest / apiLLMResponse 等类型别名；与 api 包类型布局一致，可由薄适配层转换。
 package providers
 
 import (
@@ -17,17 +26,17 @@ const (
 	anthropicVersion = "2023-06-01"
 )
 
-// AnthropicProvider calls the Anthropic Messages API.
+// AnthropicProvider 使用 x-api-key 与 anthropic-version 请求头调用 Anthropic Messages API。
 type AnthropicProvider struct {
-	APIKey     string
-	HTTPClient *http.Client
-	Model      string
+	APIKey     string       // Anthropic API 密钥
+	HTTPClient *http.Client // 可注入 HTTP 客户端；nil 时使用默认超时
+	Model      string       // 当请求未指定模型时的默认模型 ID
 }
 
-// Name returns the provider id.
+// Name 返回 Provider 标识 "anthropic"。
 func (p *AnthropicProvider) Name() string { return "anthropic" }
 
-// Complete performs a non-streaming completion.
+// Complete 执行非流式补全：见文件头「消息格式转换」说明。
 func (p *AnthropicProvider) Complete(ctx context.Context, req apiLLMRequest) (*apiLLMResponse, error) {
 	return p.complete(ctx, req, false)
 }

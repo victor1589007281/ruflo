@@ -13,6 +13,7 @@ func newRouteCmd() *cobra.Command {
 	return cmd
 }
 
+// routeTaskCmd 提交任务标签、描述与复杂度 hint，调用 hooks_route 完成路由决策输出。
 func routeTaskCmd() *cobra.Command {
 	var task, description string
 	var complexity float64

@@ -1,34 +1,36 @@
+// 知识图谱（memory 包）：邻接表 edges[from][]*GraphEdge 表示有向边，nodes 存顶点；边上 Relation/Weight 表达语义关系与强度。
+// FindPath 用 BFS 求最短 hop 路径；GetSubgraph/Traverse 限制深度，并沿入边反向扩展使子图在无向意义上连通。
 package memory
 
 import (
 	"sync"
 )
 
-// MemoryGraph is an in-memory directed graph over memory-related nodes.
+// MemoryGraph 进程内图结构：nodes 为顶点表，edges 为邻接表（出边列表）。
 type MemoryGraph struct {
-	mu    sync.RWMutex
-	nodes map[string]*GraphNode
-	edges map[string][]*GraphEdge
+	mu    sync.RWMutex            // 读写锁隔离并发
+	nodes map[string]*GraphNode   // 顶点 id -> 结点
+	edges map[string][]*GraphEdge // 起点 id -> 出边切片
 }
 
-// GraphNode is a vertex in the memory graph.
+// GraphNode 表示与某条记忆或实体绑定的顶点。
 type GraphNode struct {
-	ID         string
-	EntryKey   string
-	Namespace  string
-	Label      string
-	Properties map[string]string
+	ID         string            // 顶点全局唯一 id
+	EntryKey   string            // 可选：关联的记忆键
+	Namespace  string            // 可选：记忆命名空间
+	Label      string            // 人类可读标签
+	Properties map[string]string // 任意字符串属性
 }
 
-// GraphEdge is a directed labeled edge.
+// GraphEdge 有向边，表达主体-关系-客体三元组的一部分语义。
 type GraphEdge struct {
-	From     string
-	To       string
-	Relation string
-	Weight   float64
+	From     string  // 起点顶点 id
+	To       string  // 终点顶点 id
+	Relation string  // 关系类型/谓词
+	Weight   float64 // 边权（可选，用于排序或衰减）
 }
 
-// NewMemoryGraph constructs an empty graph.
+// NewMemoryGraph 创建空图。
 func NewMemoryGraph() *MemoryGraph {
 	return &MemoryGraph{
 		nodes: make(map[string]*GraphNode),
@@ -71,7 +73,7 @@ func (g *MemoryGraph) AddEdge(e *GraphEdge) {
 	g.edges[e.From] = append(g.edges[e.From], &ec)
 }
 
-// RemoveNode deletes a node and edges touching it.
+// RemoveNode 删除顶点并清扫所有指向该点的入边。
 func (g *MemoryGraph) RemoveNode(id string) {
 	if g == nil || id == "" {
 		return
@@ -95,7 +97,7 @@ func (g *MemoryGraph) RemoveNode(id string) {
 	}
 }
 
-// GetNode returns a copy of the node, or nil.
+// GetNode 返回结点防御性拷贝，不存在则 nil。
 func (g *MemoryGraph) GetNode(id string) *GraphNode {
 	if g == nil {
 		return nil
