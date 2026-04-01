@@ -8,6 +8,7 @@ import (
 
 	"github.com/ruflo/ruflo-go/api"
 	"github.com/ruflo/ruflo-go/mcp"
+	"github.com/ruflo/ruflo-go/pkg/hooks"
 )
 
 // 本文件：任务管理 MCP 工具（创建、查询、列表、完成、分配、取消、更新）。
@@ -145,7 +146,16 @@ func handleTaskCreate(ctx context.Context, args json.RawMessage) (json.RawMessag
 	globalState.tasks[id] = td
 	globalState.mu.Unlock()
 	saveTasksToDisk()
-	return jsonOK(map[string]any{"ok": true, "task": td})
+
+	// 触发 PreTask 钩子：分析任务、推荐 Agent、评估复杂度
+	preTaskHC := hooks.HookContext{
+		Task:    td,
+		Command: in.Title + " " + in.Description,
+		Args:    map[string]any{"description": in.Title + " " + in.Description},
+	}
+	preResult := globalState.hookExec.Execute(hooks.HookEventPreTask, preTaskHC)
+
+	return jsonOK(map[string]any{"ok": true, "task": td, "analysis": preResult.Data})
 }
 
 // handleTaskStatus 根据 id 在 globalState.tasks 中只读查找，存在则返回 task 对象，否则报错 task not found。
@@ -196,7 +206,15 @@ func handleTaskComplete(ctx context.Context, args json.RawMessage) (json.RawMess
 	td.UpdatedAt = now()
 	globalState.mu.Unlock()
 	saveTasksToDisk()
-	return jsonOK(map[string]any{"ok": true, "task": td})
+
+	// 触发 PostTask 钩子：学习记录
+	postHC := hooks.HookContext{
+		Task: td,
+		Args: map[string]any{"success": true, "task_id": in.ID},
+	}
+	postResult := globalState.hookExec.Execute(hooks.HookEventPostTask, postHC)
+
+	return jsonOK(map[string]any{"ok": true, "task": td, "learning": postResult.Data})
 }
 
 // handleTaskAssign 为任务设置 AgentID，状态改为 Queued，更新 UpdatedAt 并持久化。
@@ -215,12 +233,21 @@ func handleTaskAssign(ctx context.Context, args json.RawMessage) (json.RawMessag
 		globalState.mu.Unlock()
 		return nil, fmt.Errorf("task not found")
 	}
+	// 验证 agent 存在并更新状态
+	ag, agOk := globalState.agents[in.AgentID]
+	if !agOk {
+		globalState.mu.Unlock()
+		return nil, fmt.Errorf("agent not found: %s", in.AgentID)
+	}
+	ag.State = api.AgentStateBusy
+	ag.UpdatedAt = now()
 	td.AgentID = in.AgentID
 	td.Status = api.TaskStatusQueued
 	td.UpdatedAt = now()
 	globalState.mu.Unlock()
 	saveTasksToDisk()
-	return jsonOK(map[string]any{"ok": true, "task": td})
+	saveAgentsToDisk()
+	return jsonOK(map[string]any{"ok": true, "task": td, "agent_state": string(ag.State)})
 }
 
 func handleTaskUpdate(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {

@@ -85,15 +85,44 @@ func handleDoctorCheck(ctx context.Context, args json.RawMessage) (json.RawMessa
 		"name": "config_file", "ok": err == nil, "path": cfg, "detail": errString(err),
 	})
 
+	// 检查 hooks/worker/reasoning 子系统（对标 V3 daemon 健康度）
+	daemonOK := globalState.hookReg != nil && globalState.hookExec != nil &&
+		globalState.workerMgr != nil && globalState.reasoningBank != nil
+	daemonDetail := "hooks subsystem operational"
+	if !daemonOK {
+		daemonDetail = "hooks subsystem incomplete: some core components are nil"
+	}
+	hookCount := 0
+	workerCount := 0
+	if globalState.hookReg != nil {
+		hookCount = globalState.hookReg.Size()
+	}
+	if globalState.workerMgr != nil {
+		workerCount = len(globalState.workerMgr.ListWorkers())
+	}
 	checks = append(checks, map[string]any{
-		"name": "daemon", "ok": true, "detail": "not managed in-process (stub)",
+		"name": "daemon", "ok": daemonOK,
+		"detail": daemonDetail,
+		"hooks_registered": hookCount,
+		"workers_defined":  workerCount,
 	})
 
-	globalState.mu.RLock()
-	memOk := globalState.memoryInitialized || len(globalState.memory) > 0
-	globalState.mu.RUnlock()
+	// 检查统一内存后端
+	um := getUnifiedMemory()
+	var memOk bool
+	var memDetail string
+	if um != nil {
+		st := um.Stats()
+		memOk = true
+		memDetail = fmt.Sprintf("unified backend: %d entries, index size: %d", st.TotalEntries, st.IndexSize)
+	} else {
+		globalState.mu.RLock()
+		memOk = globalState.memoryInitialized || len(globalState.memory) > 0
+		globalState.mu.RUnlock()
+		memDetail = "in-memory store (unified backend not initialized)"
+	}
 	checks = append(checks, map[string]any{
-		"name": "memory_db", "ok": memOk, "detail": "in-memory store",
+		"name": "memory_db", "ok": memOk, "detail": memDetail,
 	})
 
 	diskOk := false
@@ -139,19 +168,47 @@ func handleStatusOverview(ctx context.Context, args json.RawMessage) (json.RawMe
 	agents := len(globalState.agents)
 	swarms := len(globalState.swarms)
 	sessions := len(globalState.sessions)
-	entries := 0
+	mapEntries := 0
 	for _, m := range globalState.memory {
-		entries += len(m)
+		mapEntries += len(m)
 	}
 	patterns := len(globalState.neural.Patterns)
 	globalState.mu.RUnlock()
+
+	// 优先使用统一内存后端的真实统计
+	totalEntries := mapEntries
+	memBackend := "in-memory"
+	um := getUnifiedMemory()
+	if um != nil {
+		st := um.Stats()
+		totalEntries = int(st.TotalEntries) + mapEntries
+		memBackend = "unified"
+	}
+
+	// Hooks 子系统指标
+	hookStats := map[string]any{}
+	if globalState.hookReg != nil {
+		rs := globalState.hookReg.GetStats()
+		hookStats["registered"] = rs.TotalRegistered
+		hookStats["enabled"] = rs.EnabledCount
+	}
+
+	// SONA 模式数
+	sonaPatterns := 0
+	if globalState.sona != nil {
+		sonaPatterns = len(globalState.sona.Patterns())
+	}
+
 	cwd, _ := os.Getwd()
 	return jsonOK(map[string]any{
 		"agents":          agents,
 		"swarms":          swarms,
-		"memory_entries":  entries,
+		"memory_entries":  totalEntries,
+		"memory_backend":  memBackend,
 		"sessions":        sessions,
 		"neural_patterns": patterns,
+		"sona_patterns":   sonaPatterns,
+		"hooks":           hookStats,
 		"cwd":             cwd,
 		"config_hint":     filepath.Join(cwd, "claude-flow.config.json"),
 	})

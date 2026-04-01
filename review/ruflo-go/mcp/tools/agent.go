@@ -129,7 +129,20 @@ func handleAgentSpawn(ctx context.Context, args json.RawMessage) (json.RawMessag
 	globalState.agents[id] = agent
 	globalState.mu.Unlock()
 	saveAgentsToDisk()
-	return jsonOK(map[string]any{"ok": true, "agent": agent})
+
+	// 触发 AgentSpawn 钩子，让默认 handler 追踪 spawned agent
+	globalState.hookExec.AgentSpawn(id, a.Type)
+
+	// 与 UnifiedSwarmCoordinator 同步（若已初始化）
+	globalState.coordMu.Lock()
+	coord := globalState.coordinator
+	globalState.coordMu.Unlock()
+	var coordSync string
+	if coord != nil {
+		coordSync = "synced"
+	}
+
+	return jsonOK(map[string]any{"ok": true, "agent": agent, "coordinator_sync": coordSync})
 }
 
 type agentListArgs struct {
@@ -204,6 +217,10 @@ func handleAgentTerminate(ctx context.Context, args json.RawMessage) (json.RawMe
 	ag.UpdatedAt = now()
 	globalState.mu.Unlock()
 	saveAgentsToDisk()
+
+	// 触发 AgentTerminate 钩子
+	globalState.hookExec.AgentTerminate(a.ID)
+
 	return jsonOK(map[string]any{"ok": true, "agent": ag})
 }
 
