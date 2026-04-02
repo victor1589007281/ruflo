@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sync/atomic"
 
 	"github.com/ruflo/ruflo-go/api"
@@ -29,10 +30,11 @@ func taskTools() []*mcp.MCPTool {
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"type":        map[string]any{"type": "string"},
-					"title":       map[string]any{"type": "string"},
-					"description": map[string]any{"type": "string"},
-					"priority":    map[string]any{"type": "number"},
+					"type":         map[string]any{"type": "string"},
+					"title":        map[string]any{"type": "string"},
+					"description":  map[string]any{"type": "string"},
+					"priority":     map[string]any{"type": "number"},
+					"depends_on":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 				},
 				"required": []string{"title"},
 			},
@@ -98,6 +100,7 @@ func taskTools() []*mcp.MCPTool {
 					"description": map[string]any{"type": "string"},
 					"priority":    map[string]any{"type": "number"},
 					"status":      map[string]any{"type": "string"},
+					"progress":    map[string]any{"type": "number", "description": "0-100"},
 				},
 				"required": []string{"id"},
 			},
@@ -111,10 +114,11 @@ func taskTools() []*mcp.MCPTool {
 func handleTaskCreate(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var in struct {
-		Type        string `json:"type"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Priority    int    `json:"priority"`
+		Type        string   `json:"type"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Priority    int      `json:"priority"`
+		DependsOn   []string `json:"depends_on"`
 	}
 	if err := parseArgs(args, &in); err != nil {
 		return nil, err
@@ -132,6 +136,7 @@ func handleTaskCreate(ctx context.Context, args json.RawMessage) (json.RawMessag
 	}
 	id := fmt.Sprintf("task-%d", atomic.AddInt64(&taskSeq, 1))
 	t := now()
+	deps := append([]string(nil), in.DependsOn...)
 	td := &api.TaskDefinition{
 		ID:          id,
 		Type:        tt,
@@ -139,6 +144,8 @@ func handleTaskCreate(ctx context.Context, args json.RawMessage) (json.RawMessag
 		Priority:    pr,
 		Title:       in.Title,
 		Description: in.Description,
+		DependsOn:   deps,
+		Progress:    0,
 		CreatedAt:   t,
 		UpdatedAt:   t,
 	}
@@ -204,8 +211,15 @@ func handleTaskComplete(ctx context.Context, args json.RawMessage) (json.RawMess
 	}
 	td.Status = api.TaskStatusSucceeded
 	td.UpdatedAt = now()
+	if td.AgentID != "" {
+		if ag, ok := globalState.agents[td.AgentID]; ok && ag != nil {
+			ag.State = api.AgentStateIdle
+			ag.UpdatedAt = now()
+		}
+	}
 	globalState.mu.Unlock()
 	saveTasksToDisk()
+	saveAgentsToDisk()
 
 	// 触发 PostTask 钩子：学习记录
 	postHC := hooks.HookContext{
@@ -233,6 +247,32 @@ func handleTaskAssign(ctx context.Context, args json.RawMessage) (json.RawMessag
 		globalState.mu.Unlock()
 		return nil, fmt.Errorf("task not found")
 	}
+	var pendingDeps []string
+	var missingDeps []string
+	for _, depID := range td.DependsOn {
+		if depID == "" {
+			continue
+		}
+		dep, depOk := globalState.tasks[depID]
+		if !depOk {
+			missingDeps = append(missingDeps, depID)
+			continue
+		}
+		if dep.Status != api.TaskStatusSucceeded {
+			pendingDeps = append(pendingDeps, depID)
+		}
+	}
+	if len(missingDeps) > 0 || len(pendingDeps) > 0 {
+		globalState.mu.Unlock()
+		return jsonOK(map[string]any{
+			"ok":                 false,
+			"blocked":            true,
+			"message":            "dependencies not satisfied",
+			"pending_task_ids":   pendingDeps,
+			"missing_task_ids":   missingDeps,
+			"task":               td,
+		})
+	}
 	// 验证 agent 存在并更新状态
 	ag, agOk := globalState.agents[in.AgentID]
 	if !agOk {
@@ -253,11 +293,12 @@ func handleTaskAssign(ctx context.Context, args json.RawMessage) (json.RawMessag
 func handleTaskUpdate(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	_ = ctx
 	var in struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Priority    int    `json:"priority"`
-		Status      string `json:"status"`
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Priority    int      `json:"priority"`
+		Status      string   `json:"status"`
+		Progress    *float64 `json:"progress"`
 	}
 	if err := parseArgs(args, &in); err != nil {
 		return nil, err
@@ -283,6 +324,9 @@ func handleTaskUpdate(ctx context.Context, args json.RawMessage) (json.RawMessag
 	if in.Status != "" {
 		td.Status = api.TaskStatus(in.Status)
 	}
+	if in.Progress != nil {
+		td.Progress = clampTaskProgress(*in.Progress)
+	}
 	td.UpdatedAt = now()
 	globalState.mu.Unlock()
 	saveTasksToDisk()
@@ -305,7 +349,27 @@ func handleTaskCancel(ctx context.Context, args json.RawMessage) (json.RawMessag
 	}
 	td.Status = api.TaskStatusCancelled
 	td.UpdatedAt = now()
+	if td.AgentID != "" {
+		if ag, ok := globalState.agents[td.AgentID]; ok && ag != nil {
+			ag.State = api.AgentStateIdle
+			ag.UpdatedAt = now()
+		}
+	}
 	globalState.mu.Unlock()
 	saveTasksToDisk()
+	saveAgentsToDisk()
 	return jsonOK(map[string]any{"ok": true, "task": td})
+}
+
+func clampTaskProgress(p float64) float64 {
+	if math.IsNaN(p) || math.IsInf(p, 0) {
+		return 0
+	}
+	if p < 0 {
+		return 0
+	}
+	if p > 100 {
+		return 100
+	}
+	return p
 }

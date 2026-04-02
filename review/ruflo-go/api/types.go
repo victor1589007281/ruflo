@@ -168,6 +168,8 @@ type TaskDefinition struct {
 	Namespace   string            `json:"namespace,omitempty"`
 	Payload     map[string]any    `json:"payload,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
+	DependsOn   []string          `json:"depends_on,omitempty"`
+	Progress    float64           `json:"progress"` // 0–100 completion hint
 	CreatedAt   time.Time         `json:"created_at"`
 	UpdatedAt   time.Time         `json:"updated_at"`
 	DueAt       *time.Time        `json:"due_at,omitempty"`

@@ -280,6 +280,17 @@ func defaultPreTaskHandler(_ context.Context, hc hooks.HookContext) hooks.HookRe
 		}
 	}
 
+	// ADR-026 风格模型路由：按复杂度分档
+	var modelRouting map[string]any
+	switch {
+	case complexity > 0.7:
+		modelRouting = map[string]any{"tier": 3, "model": "sonnet/opus"}
+	case complexity >= 0.2:
+		modelRouting = map[string]any{"tier": 2, "model": "haiku"}
+	default:
+		modelRouting = map[string]any{"tier": 1, "model": "agent_booster"}
+	}
+
 	return hooks.HookResult{
 		Success: true,
 		Message: "task analyzed",
@@ -292,6 +303,7 @@ func defaultPreTaskHandler(_ context.Context, hc hooks.HookContext) hooks.HookRe
 			"risk_count":        len(risks),
 			"patterns":          patterns,
 			"description":       desc,
+			"model_routing":     modelRouting,
 		},
 	}
 }

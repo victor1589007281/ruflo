@@ -133,16 +133,25 @@ func handleAgentSpawn(ctx context.Context, args json.RawMessage) (json.RawMessag
 	// 触发 AgentSpawn 钩子，让默认 handler 追踪 spawned agent
 	globalState.hookExec.AgentSpawn(id, a.Type)
 
-	// 与 UnifiedSwarmCoordinator 同步（若已初始化）
+	// 与 UnifiedSwarmCoordinator 同步（若已初始化且 topology 可用）
 	globalState.coordMu.Lock()
 	coord := globalState.coordinator
 	globalState.coordMu.Unlock()
-	var coordSync string
+	coordSync := "skipped"
+	var coordErr string
 	if coord != nil {
-		coordSync = "synced"
+		if err := coord.RegisterAgent(agent); err != nil {
+			coordSync = "failed"
+			coordErr = err.Error()
+		} else {
+			coordSync = "synced"
+		}
 	}
-
-	return jsonOK(map[string]any{"ok": true, "agent": agent, "coordinator_sync": coordSync})
+	out := map[string]any{"ok": true, "agent": agent, "coordinator_sync": coordSync}
+	if coordErr != "" {
+		out["coordinator_error"] = coordErr
+	}
+	return jsonOK(out)
 }
 
 type agentListArgs struct {
