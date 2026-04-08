@@ -223,37 +223,179 @@ func mustMarshal(v interface{}) json.RawMessage {
 	return data
 }
 
-// ExtractKeyFacts 从即将被压缩的消息中提取关键事实。
-// 对应 TS: extractMemories 在 compact 前运行的隐式行为。
+// SmartExtractKeyFacts 使用 LLM 智能提取关键事实 (Anchored Iterative Summarization)。
+// 业界最佳实践: 仅对新增消息段做增量摘要, 合并到持久化状态。
+// 参考: Mem0 fact-extraction + Letta sliding-window compaction
 //
-// 提取规则:
-//   - assistant 文本回复 > 100 字符
-//   - 包含文件路径或代码相关关键词的内容
-//   - 用户的明确需求/决策
-//
-// 返回: 提取的关键文本片段列表
+// 如果 LLM 调用失败, 自动回退到 ExtractKeyFacts 启发式提取。
+func (c *Compactor) SmartExtractKeyFacts(ctx context.Context, messages []types.Message) []string {
+	if c.apiClient == nil {
+		return ExtractKeyFacts(messages)
+	}
+
+	var sb strings.Builder
+	count := 0
+	for _, msg := range messages {
+		text := extractText(msg)
+		if text == "" || msg.IsApiErrorMessage || msg.IsMeta {
+			continue
+		}
+		role := string(msg.Type)
+		sb.WriteString(fmt.Sprintf("[%s]: %s\n\n", role, truncate(text, 800)))
+		count++
+	}
+	if count < 2 || sb.Len() < 100 {
+		return ExtractKeyFacts(messages)
+	}
+
+	systemPrompt := `You are a memory extraction agent. Extract key facts from the conversation that are worth remembering for future sessions.
+
+Output a JSON array of strings. Each string is one concise fact (1-2 sentences).
+
+Focus on:
+- Important decisions made and their rationale
+- Files created/modified/deleted and why
+- Technical patterns, architectures, or tools used
+- User preferences and working style
+- Errors encountered and how they were resolved
+- Key conclusions or outcomes
+
+Exclude: trivial acknowledgments, repeated info, generic advice.
+Maximum 10 facts. Output ONLY valid JSON array, nothing else.`
+
+	resp, err := c.apiClient.SimpleComplete(ctx, systemPrompt, "Extract key facts:\n\n"+sb.String())
+	if err != nil {
+		return ExtractKeyFacts(messages)
+	}
+
+	var facts []string
+	resp = strings.TrimSpace(resp)
+	// 尝试直接解析 JSON
+	if err := json.Unmarshal([]byte(resp), &facts); err != nil {
+		// 尝试从 markdown code block 中提取
+		if idx := strings.Index(resp, "["); idx >= 0 {
+			if end := strings.LastIndex(resp, "]"); end > idx {
+				_ = json.Unmarshal([]byte(resp[idx:end+1]), &facts)
+			}
+		}
+	}
+	if len(facts) == 0 {
+		return ExtractKeyFacts(messages)
+	}
+	return facts
+}
+
+// ExtractKeyFacts 启发式提取关键事实 (LLM 不可用时的回退方案)。
+// 比原版更智能: 识别文件路径、决策语句、错误-解决对。
 func ExtractKeyFacts(messages []types.Message) []string {
 	var facts []string
 	for _, msg := range messages {
 		text := extractText(msg)
-		if text == "" {
+		if text == "" || msg.IsApiErrorMessage || msg.IsMeta {
 			continue
 		}
 
 		switch msg.Type {
 		case types.MessageTypeAssistant:
-			if len(text) > 100 && !msg.IsApiErrorMessage {
-				summary := truncate(text, 500)
-				facts = append(facts, summary)
-			}
+			facts = append(facts, extractStructuredFacts(text)...)
 		case types.MessageTypeUser:
-			if len(text) > 50 && !msg.IsMeta {
-				summary := truncate(text, 300)
-				facts = append(facts, "用户: "+summary)
+			if len(text) > 30 {
+				facts = append(facts, "用户: "+truncate(text, 200))
 			}
 		}
 	}
+
+	seen := make(map[string]bool)
+	var unique []string
+	for _, f := range facts {
+		f = strings.TrimSpace(f)
+		if f != "" && !seen[f] && len(f) > 10 {
+			seen[f] = true
+			unique = append(unique, f)
+		}
+	}
+	if len(unique) > 15 {
+		unique = unique[:15]
+	}
+	return unique
+}
+
+// extractStructuredFacts 从 assistant 回复中提取结构化事实
+func extractStructuredFacts(text string) []string {
+	var facts []string
+
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// 文件操作: 包含路径模式的行
+		if containsFilePath(line) && len(line) < 300 {
+			facts = append(facts, truncate(line, 200))
+			continue
+		}
+		// 决策语句
+		if isDecisionStatement(line) && len(line) < 300 {
+			facts = append(facts, truncate(line, 200))
+			continue
+		}
+		// 错误和解决方案
+		if isErrorSolution(line) && len(line) < 300 {
+			facts = append(facts, truncate(line, 200))
+		}
+	}
+
+	// 补充: 如果结构化提取太少, 加入整体摘要
+	if len(facts) < 2 && len(text) > 200 {
+		facts = append(facts, truncate(text, 300))
+	}
 	return facts
+}
+
+// containsFilePath 检查是否包含文件路径
+func containsFilePath(s string) bool {
+	pathPatterns := []string{"/", ".go", ".ts", ".js", ".py", ".rs", ".java", ".md", ".json", ".yaml", ".toml"}
+	for _, p := range pathPatterns {
+		if strings.Contains(s, p) && (strings.Contains(s, "pkg/") || strings.Contains(s, "src/") ||
+			strings.Contains(s, "创建") || strings.Contains(s, "修改") || strings.Contains(s, "删除") ||
+			strings.Contains(s, "create") || strings.Contains(s, "modify") || strings.Contains(s, "wrote") ||
+			strings.Contains(s, "updated")) {
+			return true
+		}
+	}
+	return false
+}
+
+// isDecisionStatement 检查是否是决策/结论语句
+func isDecisionStatement(s string) bool {
+	lower := strings.ToLower(s)
+	markers := []string{
+		"决定", "选择", "采用", "使用", "方案", "结论", "建议",
+		"decided", "chose", "using", "approach", "conclusion", "recommend",
+		"should", "will use", "best practice", "pattern",
+	}
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// isErrorSolution 检查是否是错误-解决对
+func isErrorSolution(s string) bool {
+	lower := strings.ToLower(s)
+	markers := []string{
+		"error", "错误", "bug", "fix", "修复", "解决", "solution",
+		"问题", "原因", "cause", "resolved", "workaround",
+	}
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // ExtractText 导出 extractText 供外部使用

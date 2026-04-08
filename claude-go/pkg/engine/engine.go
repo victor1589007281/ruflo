@@ -193,16 +193,19 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		if e.Compactor != nil {
 			compacted, err := e.Compactor.AutoCompact(ctx, messages, currentModel)
 			if err == nil && compacted != nil {
-				// [NEW] 压缩前提取关键事实到 Episodic Memory
-				// 对应 TS: extractMemories 隐式在 compact 前运行
+				// [NEW] 压缩前智能提取关键事实到 Episodic Memory
+				// 使用 LLM Anchored Iterative Summarization (回退到启发式)
 				if e.MemoryStore != nil {
-					facts := compact.ExtractKeyFacts(messages[:len(messages)-4])
-					for _, fact := range facts {
-						e.MemoryStore.Add(&memory.MemoryEntry{
-							Content:    fact,
-							Source:     "pre_compact",
-							Importance: 0.7,
-						})
+					cutoff := len(messages) - 4
+					if cutoff > 0 {
+						facts := e.Compactor.SmartExtractKeyFacts(ctx, messages[:cutoff])
+						for _, fact := range facts {
+							e.MemoryStore.Add(&memory.MemoryEntry{
+								Content:    fact,
+								Source:     "pre_compact",
+								Importance: 0.7,
+							})
+						}
 					}
 				}
 				messages = compacted

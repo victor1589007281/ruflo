@@ -79,15 +79,10 @@ type SessionManager struct {
 	apiClient      *api.Client
 	maxSessions    int
 	sessionTimeout time.Duration
-	// mcpMgr 动态 MCP 管理器 (进程级别共享)
 	mcpMgr         *dynmcp.Manager
-	// skillReg 技能注册表 (进程级别共享)
 	skillReg       *skills.Registry
-	// dreamer 记忆整理引擎
 	dreamer        *dreaming.Dreamer
-	// memoryStore 多层记忆存储 (进程级共享)
 	memoryStore    *memory.TieredStore
-	// hookConfigs hook 配置
 	hookConfigs    []types.HookConfig
 }
 
@@ -378,8 +373,7 @@ func (sm *SessionManager) ProcessMessage(ctx context.Context, chatID, userText s
 		response = "(无回复内容)"
 	}
 
-	// [NEW] 提取关键事实到 Episodic Memory
-	// 对应 TS: extractMemories → 每轮 query 后自动提取
+	// 提取关键事实到 Episodic Memory
 	if sm.memoryStore != nil && response != "" && response != "(无回复内容)" {
 		sm.memoryStore.Add(&memory.MemoryEntry{
 			Content:    truncateForDream(response),
@@ -432,6 +426,75 @@ func extractTopics(text string) []string {
 		topics = topics[:5]
 	}
 	return topics
+}
+
+// CreateAgentRunner 为 Agent Teams 提供的工厂方法。
+// 创建一个独立的 QueryEngine 作为后台 Agent 执行器。
+// 实现 agent.CreateAgentFunc 签名, 由 ProductionTeamManager 调用。
+func (sm *SessionManager) CreateAgentRunner(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
+	return &sessionAgentRunner{sm: sm, role: role, systemPrompt: systemPrompt}, nil
+}
+
+// sessionAgentRunner 基于 SessionManager 的 Agent 执行器
+type sessionAgentRunner struct {
+	sm           *SessionManager
+	role         string
+	systemPrompt string
+}
+
+// Execute 执行 agent 任务 (创建独立 QueryEngine)
+func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
+	nestedReg := tool.NewRegistry()
+	builtin.RegisterBaseTools(nestedReg)
+	if r.sm.mcpMgr != nil {
+		r.sm.mcpMgr.RefreshToolsForRegistry(nestedReg)
+	}
+	if r.sm.skillReg != nil && r.sm.skillReg.Count() > 0 {
+		nestedReg.Register(skills.NewSkillTool(r.sm.skillReg))
+	}
+
+	// 注册 Agent 工具 (子 agent 也可以派生子 agent)
+	var runAgentFn agent.RunAgentFunc
+	runAgentFn = func(aCtx context.Context, prompt string, opts agent.RunOptions) (string, error) {
+		return r.sm.runNestedAgent(aCtx, runAgentFn, prompt, opts)
+	}
+	nestedReg.Register(agent.NewAgentTool(runAgentFn))
+
+	permMode := types.PermissionMode(r.sm.config.PermissionMode)
+	permChecker := permissions.NewChecker(permMode)
+	hookRunner := hooks.NewRunner(r.sm.hookConfigs, "")
+	compactor := compact.NewCompactor(r.sm.apiClient, 200000)
+	promptMgr := prompt.NewManager(r.sm.config.Cwd)
+	promptMgr.Model = r.sm.config.Model
+
+	if r.systemPrompt != "" {
+		promptMgr.CustomPrompt = r.systemPrompt
+	}
+
+	cfg := &engine.Config{
+		Model:            r.sm.config.Model,
+		MaxTokens:        r.sm.config.MaxTokens,
+		MaxTurns:         r.sm.config.MaxTurns,
+		Cwd:              r.sm.config.Cwd,
+		PermissionMode:   permMode,
+		IsNonInteractive: true,
+		Debug:            r.sm.config.Debug,
+	}
+
+	eng := engine.NewQueryEngine(cfg, r.sm.apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
+
+	var sb strings.Builder
+	for msg := range eng.SubmitMessage(ctx, userPrompt) {
+		if msg.Type != types.MessageTypeAssistant {
+			continue
+		}
+		for _, b := range msg.Content {
+			if b.Type == types.ContentBlockText {
+				sb.WriteString(b.Text)
+			}
+		}
+	}
+	return sb.String(), nil
 }
 
 // extractMessageText 从 Message 中提取文本内容

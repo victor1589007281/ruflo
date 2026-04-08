@@ -14,6 +14,7 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
+	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/dynmcp"
@@ -53,12 +54,13 @@ type Bot struct {
 	wsClient   *larkws.Client     // WebSocket 长连接客户端
 	sessions   *SessionManager    // 会话管理器
 	apiClient  *api.Client        // AI API 客户端
-	mcpMgr      *dynmcp.Manager     // 动态 MCP 管理器 (进程级别共享)
-	skillReg    *skills.Registry    // 技能注册表 (进程级别共享)
-	dreamer     *dreaming.Dreamer   // Dreaming 记忆整理引擎
-	memStore    *memory.TieredStore // 多层记忆存储 (进程级别共享)
-	cfgWatcher  *hotreload.Watcher  // 配置热加载监控器
-	startTime   time.Time           // 启动时间
+	mcpMgr      *dynmcp.Manager             // 动态 MCP 管理器 (进程级别共享)
+	skillReg    *skills.Registry            // 技能注册表 (进程级别共享)
+	dreamer     *dreaming.Dreamer           // Dreaming 记忆整理引擎
+	memStore    *memory.TieredStore         // 多层记忆存储 (进程级别共享)
+	teamMgr     *agent.ProductionTeamManager // 生产级 Agent Teams 管理器
+	cfgWatcher  *hotreload.Watcher          // 配置热加载监控器
+	startTime   time.Time                   // 启动时间
 }
 
 // NewBot 创建飞书机器人。
@@ -127,6 +129,12 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 6. 创建会话管理器 (传入共享组件)
 	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs)
+
+	// 7. 初始化 Agent Teams 管理器
+	teamsDir := config.Cwd + "/.claude/teams"
+	bot.teamMgr = agent.NewProductionTeamManager(teamsDir, bot.sessions.CreateAgentRunner, func(chatID, msg string) {
+		bot.sendLongMessage(context.Background(), chatID, msg)
+	})
 
 	// 6. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {
@@ -212,16 +220,11 @@ func (b *Bot) initDreaming(config *BotConfig) {
 	if config.DreamMinSessions > 0 {
 		dreamCfg.MinSessions = config.DreamMinSessions
 	}
-	if config.DreamConsolidateMode != "" {
-		dreamCfg.ConsolidateMode = config.DreamConsolidateMode
-	}
 	dreamCfg.MemoryDir = config.Cwd + "/.claude/memory"
 	b.dreamer = dreaming.NewDreamer(dreamCfg, config.Cwd)
 
-	// 注入 LLM API 客户端 (用于 LLM 模式整理)
-	if dreamCfg.ConsolidateMode == "llm" {
-		b.dreamer.SetAPIClient(b.apiClient)
-	}
+	// 始终注入 LLM API 客户端，dreamer 自动判断: 有 APIClient 则 LLM 整理, 否则本地整理
+	b.dreamer.SetAPIClient(b.apiClient)
 }
 
 // parseHookConfigs 解析 Hook 配置
@@ -438,7 +441,15 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- /skill uninstall <名称> - 卸载技能\n" +
 			"- /skill reload - 重新加载技能\n\n" +
 			"**Dreaming:**\n" +
-			"- /dream - 手动触发记忆整理"
+			"- /dream - 手动触发记忆整理\n\n" +
+			"**Agent Teams (多Agent协作):**\n" +
+			"- /team create <名称> <工作流> - 创建团队 (development/research/debate)\n" +
+			"- /team run <名称> <目标> - 启动团队执行\n" +
+			"- /team status [名称] - 查看团队状态\n" +
+			"- /team stop <名称> - 停止团队\n" +
+			"- /team list - 列出所有团队\n" +
+			"- /team delete <名称> - 删除团队\n" +
+			"- /team workflows - 查看可用工作流"
 		b.sendTextReply(ctx, messageID, help)
 		return true
 
@@ -488,6 +499,10 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 
 	case lower == "/dream":
 		b.handleDreamCommand(ctx, messageID)
+		return true
+
+	case strings.HasPrefix(lower, "/team"):
+		b.handleTeamCommand(ctx, chatID, messageID, text)
 		return true
 
 	case lower == "/reload":
@@ -625,6 +640,144 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 
 	default:
 		b.sendTextReply(ctx, messageID, "未知 /skill 子命令。用法: /skill [list|reload|install|uninstall]")
+	}
+}
+
+// handleTeamCommand 处理 /team 命令族
+// 支持: create, run, status, stop, list, delete, msg, workflows
+func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text string) {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		b.sendTextReply(ctx, messageID, "用法: /team [create|run|status|stop|list|delete|workflows]")
+		return
+	}
+
+	sub := strings.ToLower(parts[1])
+	switch sub {
+	case "create":
+		if len(parts) < 4 {
+			b.sendTextReply(ctx, messageID, "用法: /team create <名称> <工作流>\n工作流: development, research, debate")
+			return
+		}
+		name, workflow := parts[2], parts[3]
+		desc := ""
+		if len(parts) > 4 {
+			desc = strings.Join(parts[4:], " ")
+		}
+		team, err := b.teamMgr.CreateTeam(name, workflow, desc, chatID)
+		if err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("创建失败: %v", err))
+			return
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("✅ 团队 **%s** 已创建\n工作流: %s\nAgent: %d\n\n发送 `/team run %s <目标>` 启动执行",
+			team.Name, team.Workflow, len(team.Agents), team.Name))
+
+	case "run":
+		if len(parts) < 4 {
+			b.sendTextReply(ctx, messageID, "用法: /team run <名称> <目标描述>")
+			return
+		}
+		name := parts[2]
+		objective := strings.Join(parts[3:], " ")
+		if err := b.teamMgr.RunTeam(name, objective); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("启动失败: %v", err))
+			return
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("🚀 团队 **%s** 已启动, 后台执行中...\n发送 `/team status %s` 查看进度", name, name))
+
+	case "status":
+		if len(parts) >= 3 {
+			team := b.teamMgr.GetTeam(parts[2])
+			if team == nil {
+				b.sendTextReply(ctx, messageID, fmt.Sprintf("团队 %q 不存在", parts[2]))
+				return
+			}
+			b.sendTextReply(ctx, messageID, team.FormatStatus())
+		} else {
+			teams := b.teamMgr.ListAllTeams()
+			if len(teams) == 0 {
+				b.sendTextReply(ctx, messageID, "无活跃团队。发送 `/team create <名称> <工作流>` 创建。")
+				return
+			}
+			var sb strings.Builder
+			sb.WriteString("**所有团队:**\n")
+			for _, t := range teams {
+				sb.WriteString(fmt.Sprintf("- **%s** [%s] 工作流=%s", t.Name, t.Status, t.Workflow))
+				if t.Objective != "" {
+					sb.WriteString(fmt.Sprintf(" 目标=%s", truncateForDream(t.Objective)))
+				}
+				sb.WriteString("\n")
+			}
+			b.sendTextReply(ctx, messageID, sb.String())
+		}
+
+	case "stop":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /team stop <名称>")
+			return
+		}
+		if err := b.teamMgr.StopTeam(parts[2]); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("停止失败: %v", err))
+		} else {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("⏹️ 团队 **%s** 已停止", parts[2]))
+		}
+
+	case "delete":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /team delete <名称>")
+			return
+		}
+		if err := b.teamMgr.DeleteTeam(parts[2]); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("删除失败: %v", err))
+		} else {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("🗑️ 团队 **%s** 已删除", parts[2]))
+		}
+
+	case "list":
+		teams := b.teamMgr.ListAllTeams()
+		if len(teams) == 0 {
+			b.sendTextReply(ctx, messageID, "无团队。发送 `/team create <名称> <工作流>` 创建。")
+			return
+		}
+		var sb strings.Builder
+		sb.WriteString("**团队列表:**\n")
+		for _, t := range teams {
+			sb.WriteString(fmt.Sprintf("- **%s** [%s] %s\n", t.Name, t.Status, t.Workflow))
+		}
+		b.sendTextReply(ctx, messageID, sb.String())
+
+	case "msg":
+		if len(parts) < 5 {
+			b.sendTextReply(ctx, messageID, "用法: /team msg <团队> <Agent> <消息>")
+			return
+		}
+		teamName, agentName := parts[2], parts[3]
+		content := strings.Join(parts[4:], " ")
+		if err := b.teamMgr.SendMailMessage(teamName, "user", agentName, content); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("发送失败: %v", err))
+		} else {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("📨 已发送消息给 %s/%s", teamName, agentName))
+		}
+
+	case "workflows":
+		wfs := agent.ListWorkflows()
+		var sb strings.Builder
+		sb.WriteString("**可用工作流:**\n\n")
+		for _, wf := range wfs {
+			sb.WriteString(fmt.Sprintf("**%s** — %s\n", wf.Name, wf.Description))
+			sb.WriteString("  阶段: ")
+			for i, s := range wf.Stages {
+				if i > 0 {
+					sb.WriteString(" → ")
+				}
+				sb.WriteString(s.Role)
+			}
+			sb.WriteString("\n\n")
+		}
+		b.sendTextReply(ctx, messageID, sb.String())
+
+	default:
+		b.sendTextReply(ctx, messageID, "未知子命令。用法: /team [create|run|status|stop|list|delete|msg|workflows]")
 	}
 }
 

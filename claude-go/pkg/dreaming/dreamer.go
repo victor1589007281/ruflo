@@ -64,16 +64,6 @@ type DreamConfig struct {
 
 	// ConsolidationModel 整理使用的模型 (可选, 空则使用主模型)
 	ConsolidationModel string `json:"consolidationModel,omitempty"`
-
-	// ConsolidateMode 整理模式: "local" (纯文本去重) 或 "llm" (LLM 驱动)
-	// 默认 "local"; 设为 "llm" 需要配合 APIClient
-	ConsolidateMode string `json:"consolidateMode,omitempty"`
-
-	// APIBaseURL LLM API 基础地址 (ConsolidateMode="llm" 时必需)
-	APIBaseURL string `json:"apiBaseUrl,omitempty"`
-
-	// APIKey LLM API 密钥
-	APIKey string `json:"apiKey,omitempty"`
 }
 
 // DefaultDreamConfig 返回默认配置
@@ -242,7 +232,7 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 	var err error
 	if d.ConsolidateFn != nil {
 		err = d.ConsolidateFn(ctx, sessions, d.config.MemoryDir)
-	} else if d.config.ConsolidateMode == "llm" && d.APIClient != nil {
+	} else if d.APIClient != nil {
 		err = d.llmConsolidate(ctx, sessions)
 	} else {
 		err = d.localConsolidate(ctx, sessions)

@@ -122,11 +122,15 @@ func itoa(n int) string {
 	return itoa(n/10) + string(rune('0'+n%10))
 }
 
-// Retrieve 按相关性检索记忆 (TF-IDF 风格的关键词匹配 + 遗忘曲线加权)。
-// query: 用户查询文本
-// topK: 返回最相关的 K 条记忆
+// Retrieve 按相关性检索记忆 (BM25 Okapi + 遗忘曲线 + 近因加权)。
+// 业界标准: BM25 是信息检索领域最成熟的算法, 比 Jaccard 更准确。
 //
-// 评分公式: score = keywordRelevance × retention × recencyBoost
+// 评分公式: score = BM25(query, doc) × retention × (1 + recencyBoost)
+//
+// BM25 Okapi:
+//
+//	score(D,Q) = Σ IDF(qi) × f(qi,D)×(k1+1) / (f(qi,D) + k1×(1 - b + b×|D|/avgdl))
+//	IDF(qi) = ln((N - n(qi) + 0.5) / (n(qi) + 0.5) + 1)
 func (s *TieredStore) Retrieve(query string, topK int) []*MemoryEntry {
 	if topK <= 0 {
 		topK = 5
@@ -137,32 +141,87 @@ func (s *TieredStore) Retrieve(query string, topK int) []*MemoryEntry {
 	}
 
 	s.mu.RLock()
+
+	// Pass 1: 构建 BM25 所需的全局统计
+	totalDocs := len(s.episodic)
+	if totalDocs == 0 {
+		s.mu.RUnlock()
+		return nil
+	}
+
+	type docInfo struct {
+		entry *MemoryEntry
+		terms []string
+	}
+	docs := make([]docInfo, 0, totalDocs)
+	docFreq := make(map[string]int) // term → 含该词的文档数
+	totalTerms := 0
+
+	for _, entry := range s.episodic {
+		if entry.Retention() < s.ForgetThreshold*0.5 {
+			continue
+		}
+		contentTerms := tokenize(entry.Content)
+		topicTerms := tokenize(strings.Join(entry.Topics, " "))
+		allTerms := append(contentTerms, topicTerms...)
+		docs = append(docs, docInfo{entry: entry, terms: allTerms})
+		totalTerms += len(allTerms)
+
+		seen := make(map[string]bool)
+		for _, t := range allTerms {
+			if !seen[t] {
+				seen[t] = true
+				docFreq[t]++
+			}
+		}
+	}
+
+	if len(docs) == 0 {
+		s.mu.RUnlock()
+		return nil
+	}
+	avgDocLen := float64(totalTerms) / float64(len(docs))
+
+	// Pass 2: BM25 评分
+	const k1 = 1.5
+	const b = 0.75
+	N := float64(len(docs))
+
 	type scored struct {
 		entry *MemoryEntry
 		score float64
 	}
 	var candidates []scored
 
-	for _, entry := range s.episodic {
-		retention := entry.Retention()
-		if retention < s.ForgetThreshold*0.5 {
-			continue // 几乎已遗忘
+	for _, doc := range docs {
+		// 计算词频
+		tf := make(map[string]int)
+		for _, t := range doc.terms {
+			tf[t]++
+		}
+		docLen := float64(len(doc.terms))
+
+		bm25 := 0.0
+		for _, qt := range queryTerms {
+			if tf[qt] == 0 {
+				continue
+			}
+			n := float64(docFreq[qt])
+			idf := math.Log((N-n+0.5)/(n+0.5) + 1)
+			tfNorm := (float64(tf[qt]) * (k1 + 1)) / (float64(tf[qt]) + k1*(1-b+b*docLen/avgDocLen))
+			bm25 += idf * tfNorm
 		}
 
-		contentTerms := tokenize(entry.Content)
-		topicTerms := tokenize(strings.Join(entry.Topics, " "))
-		allTerms := append(contentTerms, topicTerms...)
-
-		relevance := computeRelevance(queryTerms, allTerms)
-		if relevance < 0.01 {
+		if bm25 < 0.01 {
 			continue
 		}
 
-		recencyHours := time.Since(entry.LastAccess).Hours()
+		retention := doc.entry.Retention()
+		recencyHours := time.Since(doc.entry.LastAccess).Hours()
 		recencyBoost := 1.0 / (1.0 + recencyHours/168.0) // 一周半衰期
 
-		score := relevance * retention * (1.0 + recencyBoost)
-		candidates = append(candidates, scored{entry, score})
+		score := bm25 * retention * (1.0 + recencyBoost)
+		candidates = append(candidates, scored{doc.entry, score})
 	}
 	s.mu.RUnlock()
 
@@ -174,7 +233,6 @@ func (s *TieredStore) Retrieve(query string, topK int) []*MemoryEntry {
 		candidates = candidates[:topK]
 	}
 
-	// Touch retrieved entries
 	s.mu.Lock()
 	result := make([]*MemoryEntry, len(candidates))
 	for i, c := range candidates {
@@ -266,25 +324,3 @@ func tokenize(text string) []string {
 	return tokens
 }
 
-// computeRelevance 计算查询与文档的相关性 (Jaccard 相似度变体)
-func computeRelevance(queryTerms, docTerms []string) float64 {
-	if len(queryTerms) == 0 || len(docTerms) == 0 {
-		return 0
-	}
-	docSet := make(map[string]int)
-	for _, t := range docTerms {
-		docSet[t]++
-	}
-
-	matchCount := 0
-	for _, qt := range queryTerms {
-		if docSet[qt] > 0 {
-			matchCount++
-		}
-	}
-
-	if matchCount == 0 {
-		return 0
-	}
-	return float64(matchCount) / float64(len(queryTerms))
-}
