@@ -164,14 +164,12 @@ func runCmd() *cobra.Command {
 // 通过 WebSocket 与飞书服务器建立持久连接，
 // 接收消息事件，桥接到 QueryEngine 处理，回复结果。
 //
-// 使用方式:
+// 支持两种配置方式:
+//  1. CLI 参数: claude-go feishu --app-id=xxx --app-secret=xxx
+//  2. JSON 配置: claude-go feishu --config=claude-go.json
 //
-//	claude-go feishu --app-id=xxx --app-secret=xxx
-//	claude-go feishu --app-id=xxx --app-secret=xxx --domain=lark  # 国际版
-//
-// 环境变量:
-//
-//	FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_DOMAIN
+// JSON 配置文件会先加载，CLI 参数会覆盖 JSON 中的值。
+// 环境变量优先级最低: FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_DOMAIN
 func feishuCmd() *cobra.Command {
 	var (
 		appID          string
@@ -181,22 +179,57 @@ func feishuCmd() *cobra.Command {
 		maxSessions    int
 		mentionOnly    bool
 		cwd            string
+		configPath     string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "feishu",
 		Short: "飞书长连接后台守护模式 (WebSocket)",
 		Long: `启动飞书机器人守护进程，通过 WebSocket 长连接接收飞书消息。
-每个对话(chat_id)维护独立的 AI 会话，支持多轮对话、工具执行等完整能力。
+每个对话(chat_id)维护独立的 AI 会话，支持多轮对话、工具执行、MCP 调用等完整能力。
 
 需要在飞书开发者后台创建企业自建应用，获取 App ID 和 App Secret。
 应用需要订阅 im.message.receive_v1 事件，并开启长连接模式。
 
-示例:
-  claude-go feishu --app-id=cli_xxx --app-secret=xxx
-  FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx claude-go feishu`,
+支持两种配置方式:
+  1. CLI 参数:    claude-go feishu --app-id=cli_xxx --app-secret=xxx
+  2. JSON 配置:   claude-go feishu --config=claude-go.json
+  3. 环境变量:    FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx claude-go feishu
+
+JSON 配置文件示例:
+  {
+    "feishu": { "appId": "cli_xxx", "appSecret": "xxx" },
+    "ai": { "model": "qwen3.5-plus", "apiKey": "sk-xxx", "baseUrl": "https://..." },
+    "mcpServers": {
+      "my-server": { "command": "npx", "args": ["-y", "some-mcp-server"] }
+    },
+    "hooks": [{ "event": "PreToolUse", "command": "echo pre" }],
+    "permissionMode": "bypass"
+  }`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// 从环境变量补全参数
+			// 1. 构建默认配置
+			config := feishu.DefaultBotConfig()
+
+			// 2. 加载 JSON 配置 (优先级低于 CLI 参数)
+			jsonCfg, err := feishu.LoadJSONConfig(configPath)
+			if err != nil {
+				return fmt.Errorf("加载配置文件失败: %w", err)
+			}
+			if jsonCfg != nil {
+				jsonCfg.ApplyToBot(config)
+				// JSON config 中的 mcpServers 和 hooks
+				if len(jsonCfg.MCPServers) > 0 {
+					config.MCPServers = jsonCfg.MCPServers
+				}
+				if len(jsonCfg.Hooks) > 0 {
+					config.Hooks = jsonCfg.Hooks
+				}
+				if configPath != "" {
+					fmt.Printf("[飞书Bot] 已加载配置文件: %s\n", configPath)
+				}
+			}
+
+			// 3. CLI 参数覆盖 JSON 配置
 			if appID == "" {
 				appID = os.Getenv("FEISHU_APP_ID")
 			}
@@ -208,38 +241,67 @@ func feishuCmd() *cobra.Command {
 					domain = d
 				}
 			}
-			if appID == "" || appSecret == "" {
-				return fmt.Errorf("需要飞书应用凭证: 使用 --app-id/--app-secret 或设置 FEISHU_APP_ID/FEISHU_APP_SECRET 环境变量")
+			if appID != "" {
+				config.AppID = appID
+			}
+			if appSecret != "" {
+				config.AppSecret = appSecret
+			}
+			if domain != "" && domain != "feishu" {
+				config.Domain = domain
+			}
+
+			if config.AppID == "" || config.AppSecret == "" {
+				return fmt.Errorf("需要飞书应用凭证: 使用 --app-id/--app-secret 或 --config 或设置 FEISHU_APP_ID/FEISHU_APP_SECRET")
 			}
 
 			apiKey := getAPIKey()
-			if apiKey == "" {
-				return fmt.Errorf("需要 AI API Key: 设置 ANTHROPIC_API_KEY 环境变量或使用 --api-key 参数")
+			if apiKey != "" {
+				config.APIKey = apiKey
+			}
+			if config.APIKey == "" {
+				return fmt.Errorf("需要 AI API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数或 --config 中的 ai.apiKey")
 			}
 
 			if cwd == "" {
 				cwd, _ = os.Getwd()
 			}
+			if config.Cwd == "" {
+				config.Cwd = cwd
+			}
 
-			config := feishu.DefaultBotConfig()
-			config.AppID = appID
-			config.AppSecret = appSecret
-			config.Domain = domain
-			config.Model = flagModel
-			config.APIKey = apiKey
-			config.BaseURL = flagBaseURL
-			config.Cwd = cwd
-			config.MaxTokens = flagMaxTokens
-			config.MaxTurns = flagMaxTurns
-			config.SystemPrompt = flagSystemPrompt
-			config.Debug = flagDebug
-			config.PermissionMode = flagPermission
-			config.MentionOnly = mentionOnly
-			config.MCPConfigPath = flagMCPConfig
-			if sessionTimeout > 0 {
+			// CLI 参数覆盖
+			if cmd.Flags().Changed("model") {
+				config.Model = flagModel
+			}
+			if cmd.Flags().Changed("base-url") {
+				config.BaseURL = flagBaseURL
+			}
+			if cmd.Flags().Changed("max-tokens") {
+				config.MaxTokens = flagMaxTokens
+			}
+			if cmd.Flags().Changed("max-turns") {
+				config.MaxTurns = flagMaxTurns
+			}
+			if cmd.Flags().Changed("system-prompt") {
+				config.SystemPrompt = flagSystemPrompt
+			}
+			if cmd.Flags().Changed("debug") {
+				config.Debug = flagDebug
+			}
+			if cmd.Flags().Changed("permission-mode") {
+				config.PermissionMode = flagPermission
+			}
+			if cmd.Flags().Changed("mention-only") {
+				config.MentionOnly = mentionOnly
+			}
+			if cmd.Flags().Changed("mcp-config") {
+				config.MCPConfigPath = flagMCPConfig
+			}
+			if sessionTimeout > 0 && cmd.Flags().Changed("session-timeout") {
 				config.SessionTimeout = time.Duration(sessionTimeout) * time.Minute
 			}
-			if maxSessions > 0 {
+			if maxSessions > 0 && cmd.Flags().Changed("max-sessions") {
 				config.MaxSessions = maxSessions
 			}
 
@@ -257,18 +319,25 @@ func feishuCmd() *cobra.Command {
 			go func() {
 				sig := <-sigCh
 				fmt.Printf("\n[飞书Bot] 收到信号 %v，正在关闭...\n", sig)
+				bot.Shutdown()
 				cancel()
 			}()
 
 			fmt.Println("========================================")
 			fmt.Println("  Claude Code (Go) - 飞书长连接模式")
 			fmt.Println("========================================")
-			fmt.Printf("  App ID:    %s\n", appID)
-			fmt.Printf("  Domain:    %s\n", domain)
-			fmt.Printf("  Model:     %s\n", flagModel)
-			fmt.Printf("  Cwd:       %s\n", cwd)
+			fmt.Printf("  App ID:    %s\n", config.AppID)
+			fmt.Printf("  Domain:    %s\n", config.Domain)
+			fmt.Printf("  Model:     %s\n", config.Model)
+			fmt.Printf("  Cwd:       %s\n", config.Cwd)
 			fmt.Printf("  Sessions:  max=%d, timeout=%dm\n", config.MaxSessions, int(config.SessionTimeout.Minutes()))
-			fmt.Printf("  @Only:     %v\n", mentionOnly)
+			fmt.Printf("  @Only:     %v\n", config.MentionOnly)
+			if len(config.MCPServers) > 0 || config.MCPConfigPath != "" {
+				fmt.Printf("  MCP:       配置文件=%s, 内联=%d个\n", config.MCPConfigPath, len(config.MCPServers))
+			}
+			if len(config.Hooks) > 0 {
+				fmt.Printf("  Hooks:     %d 条规则\n", len(config.Hooks))
+			}
 			fmt.Println("========================================")
 			fmt.Println("正在连接飞书服务器...")
 
@@ -283,6 +352,7 @@ func feishuCmd() *cobra.Command {
 	cmd.Flags().IntVar(&maxSessions, "max-sessions", 100, "最大并发会话数")
 	cmd.Flags().BoolVar(&mentionOnly, "mention-only", true, "群聊中仅响应 @机器人 的消息")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "工作目录 (默认当前目录)")
+	cmd.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (包含 feishu/ai/mcpServers/hooks 等)")
 
 	return cmd
 }

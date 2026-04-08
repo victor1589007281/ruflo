@@ -15,6 +15,8 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/mcp"
+	"github.com/anthropic/claude-go/pkg/types"
 )
 
 // 飞书消息长度限制 (富文本卡片约 30KB, 普通文本约 4000 字符)
@@ -46,6 +48,7 @@ type Bot struct {
 	wsClient  *larkws.Client     // WebSocket 长连接客户端
 	sessions  *SessionManager    // 会话管理器
 	apiClient *api.Client        // AI API 客户端
+	mcpConns  []*mcp.Connection  // 共享的 MCP 连接 (进程级别)
 	startTime time.Time          // 启动时间
 }
 
@@ -96,8 +99,13 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		startTime: time.Now(),
 	}
 
-	// 创建会话管理器
-	bot.sessions = NewSessionManager(config, aiClient)
+	// 连接 MCP 服务器 (进程级别, 共享给所有 session)
+	// 对应 TS: getMcpToolsCommandsAndResources() → connectToServer() (memoized)
+	mcpConns, hookConfigs := bot.initMCPAndHooks(config)
+	bot.mcpConns = mcpConns
+
+	// 创建会话管理器 (传入共享的 MCP 连接)
+	bot.sessions = NewSessionManager(config, aiClient, mcpConns, hookConfigs)
 
 	// 注册飞书事件处理器
 	// dispatcher.NewEventDispatcher 的两个参数(verificationToken, encryptKey)
@@ -127,6 +135,80 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	return bot, nil
 }
 
+// initMCPAndHooks 初始化 MCP 连接和 Hook 配置。
+// 对应 TS: main.tsx 中的 getMcpToolsCommandsAndResources() 调用链
+//
+// MCP 连接来源:
+//  1. BotConfig.MCPConfigPath 指向的 JSON 配置文件 (mcpServers 段)
+//  2. JSON config 中的 mcpServers 段 (已由 LoadJSONConfig 解析)
+//
+// 所有 MCP 连接在 Bot 启动时建立, 进程级别共享给所有 session。
+// 对应 TS 中 connectToServer 的 memoize 行为。
+func (b *Bot) initMCPAndHooks(config *BotConfig) ([]*mcp.Connection, []types.HookConfig) {
+	var mcpConns []*mcp.Connection
+	var hookConfigs []types.HookConfig
+
+	// 从 MCPConfigPath 加载 MCP 服务器配置
+	if config.MCPConfigPath != "" {
+		configs, err := mcp.LoadServerConfigsFromFile(config.MCPConfigPath)
+		if err != nil {
+			log.Printf("[飞书Bot] 加载 MCP 配置失败 (%s): %v", config.MCPConfigPath, err)
+		} else {
+			mcpClient := mcp.NewClient()
+			ctx := context.Background()
+			for _, sc := range configs {
+				conn, err := mcpClient.Connect(ctx, sc)
+				if err != nil {
+					log.Printf("[飞书Bot] MCP 连接失败 (%s): %v", sc.Name, err)
+					continue
+				}
+				mcpConns = append(mcpConns, conn)
+				log.Printf("[飞书Bot] MCP 已连接: %s (%d 个工具)", sc.Name, len(conn.Tools))
+			}
+		}
+	}
+
+	// 从 BotConfig.MCPServers 加载 (来自 JSON config)
+	if len(config.MCPServers) > 0 {
+		mcpClient := mcp.NewClient()
+		ctx := context.Background()
+		for name, entry := range config.MCPServers {
+			sc := mcp.ServerConfig{
+				Name:      name,
+				Transport: entry.Transport,
+				Command:   entry.Command,
+				Args:      entry.Args,
+				URL:       entry.URL,
+				Env:       entry.Env,
+			}
+			if sc.Transport == "" {
+				sc.Transport = "stdio"
+			}
+			conn, err := mcpClient.Connect(ctx, sc)
+			if err != nil {
+				log.Printf("[飞书Bot] MCP 连接失败 (%s): %v", name, err)
+				continue
+			}
+			mcpConns = append(mcpConns, conn)
+			log.Printf("[飞书Bot] MCP 已连接: %s (%d 个工具)", name, len(conn.Tools))
+		}
+	}
+
+	// 解析 Hook 配置 (将 HookEntry → types.HookConfig)
+	if len(config.Hooks) > 0 {
+		for _, h := range config.Hooks {
+			hookConfigs = append(hookConfigs, types.HookConfig{
+				Event:   types.HookEvent(h.Event),
+				Command: h.Command,
+				Timeout: h.Timeout,
+				If:      h.If,
+			})
+		}
+	}
+
+	return mcpConns, hookConfigs
+}
+
 // Start 启动飞书机器人 (阻塞)。
 // 建立 WebSocket 长连接，开始接收事件。
 // 连接成功后会打印 "connected to wss://..."
@@ -137,8 +219,23 @@ func (b *Bot) Start(ctx context.Context) error {
 	log.Printf("[飞书Bot] 工作目录: %s", b.config.Cwd)
 	log.Printf("[飞书Bot] 会话超时: %v, 最大会话数: %d",
 		b.config.SessionTimeout, b.config.MaxSessions)
+	if len(b.mcpConns) > 0 {
+		log.Printf("[飞书Bot] MCP 服务器: %d 个连接", len(b.mcpConns))
+		for _, conn := range b.mcpConns {
+			log.Printf("[飞书Bot]   - %s: %d 个工具, 状态=%s", conn.Config.Name, len(conn.Tools), conn.Status)
+		}
+	}
 
 	return b.wsClient.Start(ctx)
+}
+
+// Shutdown 关闭 MCP 连接并清理资源
+func (b *Bot) Shutdown() {
+	for _, conn := range b.mcpConns {
+		if err := conn.Close(); err != nil {
+			log.Printf("[飞书Bot] 关闭 MCP 连接失败 (%s): %v", conn.Config.Name, err)
+		}
+	}
 }
 
 // onMessageReceive 处理飞书消息接收事件。
@@ -252,13 +349,24 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 	case lower == "/status":
 		total, active := b.sessions.Stats()
 		uptime := time.Since(b.startTime).Round(time.Second)
+		mcpInfo := "无"
+		if len(b.mcpConns) > 0 {
+			var mcpNames []string
+			totalTools := 0
+			for _, conn := range b.mcpConns {
+				mcpNames = append(mcpNames, fmt.Sprintf("%s(%d)", conn.Config.Name, len(conn.Tools)))
+				totalTools += len(conn.Tools)
+			}
+			mcpInfo = fmt.Sprintf("%d 个服务器, %d 个工具\n  %s", len(b.mcpConns), totalTools, strings.Join(mcpNames, ", "))
+		}
 		status := fmt.Sprintf("**运行状态**\n"+
 			"- 运行时长: %v\n"+
 			"- 总会话数: %d\n"+
 			"- 活跃处理: %d\n"+
 			"- AI 模型: %s\n"+
+			"- MCP: %s\n"+
 			"- 工作目录: %s",
-			uptime, total, active, b.config.Model, b.config.Cwd)
+			uptime, total, active, b.config.Model, mcpInfo, b.config.Cwd)
 		b.sendTextReply(ctx, messageID, status)
 		return true
 	}

@@ -28,6 +28,9 @@
 package feishu
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"time"
 )
 
@@ -91,8 +94,14 @@ type BotConfig struct {
 	// ThinkingMessage 处理中的提示消息
 	ThinkingMessage string
 
-	// MCPConfigPath MCP 配置文件路径
+	// MCPConfigPath MCP 配置文件路径 (mcpServers JSON 格式)
 	MCPConfigPath string
+
+	// MCPServers MCP 服务器配置 (从 JSON config 加载)
+	MCPServers map[string]MCPServerEntry
+
+	// Hooks Hook 配置 (从 JSON config 加载)
+	Hooks []HookEntry
 }
 
 // DefaultBotConfig 返回默认配置
@@ -144,4 +153,222 @@ type CardElement struct {
 	Tag     string    `json:"tag"`
 	Content string    `json:"content,omitempty"`
 	Text    *CardText `json:"text,omitempty"`
+}
+
+// ============================================================================
+// JSON 配置文件支持
+// 对应 TS: .claude/settings.json 中的配置结构
+// ============================================================================
+
+// JSONConfig JSON 配置文件的完整结构。
+// 支持通过 --config 参数或 CLAUDE_GO_CONFIG 环境变量指定。
+//
+// 示例配置文件:
+//
+//	{
+//	  "feishu": {
+//	    "appId": "cli_xxx",
+//	    "appSecret": "xxx",
+//	    "domain": "feishu",
+//	    "mentionOnly": true,
+//	    "sessionTimeout": 30,
+//	    "maxSessions": 100,
+//	    "welcomeMessage": "你好！",
+//	    "thinkingMessage": "思考中..."
+//	  },
+//	  "ai": {
+//	    "model": "qwen3.5-plus",
+//	    "apiKey": "sk-xxx",
+//	    "baseUrl": "https://...",
+//	    "maxTokens": 16384,
+//	    "maxTurns": 0
+//	  },
+//	  "mcpServers": {
+//	    "my-server": {
+//	      "command": "npx",
+//	      "args": ["-y", "some-mcp-server"],
+//	      "env": {"KEY": "VALUE"}
+//	    }
+//	  },
+//	  "hooks": [
+//	    {"event": "PreToolUse", "command": "echo pre"}
+//	  ],
+//	  "systemPrompt": "你是一个编程助手",
+//	  "permissionMode": "bypass",
+//	  "cwd": "/path/to/work",
+//	  "debug": false
+//	}
+type JSONConfig struct {
+	// Feishu 飞书应用配置
+	Feishu *FeishuSection `json:"feishu,omitempty"`
+
+	// AI AI 模型配置
+	AI *AISection `json:"ai,omitempty"`
+
+	// MCPServers MCP 服务器配置 (key=名称, value=服务器配置)
+	// 对应 TS: .claude/settings.json 中的 mcpServers
+	MCPServers map[string]MCPServerEntry `json:"mcpServers,omitempty"`
+
+	// Hooks Hook 配置列表
+	Hooks []HookEntry `json:"hooks,omitempty"`
+
+	// SystemPrompt 自定义系统提示词
+	SystemPrompt string `json:"systemPrompt,omitempty"`
+
+	// PermissionMode 权限模式 (default/auto/plan/bypass)
+	PermissionMode string `json:"permissionMode,omitempty"`
+
+	// Cwd 工作目录
+	Cwd string `json:"cwd,omitempty"`
+
+	// Debug 调试模式
+	Debug bool `json:"debug,omitempty"`
+}
+
+// FeishuSection 飞书配置段
+type FeishuSection struct {
+	AppID           string `json:"appId"`
+	AppSecret       string `json:"appSecret"`
+	Domain          string `json:"domain,omitempty"`
+	MentionOnly     *bool  `json:"mentionOnly,omitempty"`
+	SessionTimeout  int    `json:"sessionTimeout,omitempty"`  // 分钟
+	MaxSessions     int    `json:"maxSessions,omitempty"`
+	WelcomeMessage  string `json:"welcomeMessage,omitempty"`
+	ThinkingMessage string `json:"thinkingMessage,omitempty"`
+}
+
+// AISection AI 模型配置段
+type AISection struct {
+	Model     string `json:"model,omitempty"`
+	APIKey    string `json:"apiKey,omitempty"`
+	BaseURL   string `json:"baseUrl,omitempty"`
+	MaxTokens int    `json:"maxTokens,omitempty"`
+	MaxTurns  int    `json:"maxTurns,omitempty"`
+}
+
+// MCPServerEntry MCP 服务器条目
+type MCPServerEntry struct {
+	Command   string            `json:"command"`
+	Args      []string          `json:"args,omitempty"`
+	URL       string            `json:"url,omitempty"`
+	Transport string            `json:"transport,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+}
+
+// HookEntry Hook 配置条目
+type HookEntry struct {
+	Event   string `json:"event"`
+	Command string `json:"command"`
+	Timeout int    `json:"timeout,omitempty"`
+	If      string `json:"if,omitempty"`
+}
+
+// LoadJSONConfig 从文件加载 JSON 配置。
+// 如果 path 为空，尝试以下路径:
+//  1. CLAUDE_GO_CONFIG 环境变量
+//  2. ./claude-go.json (当前目录)
+//  3. ~/.claude-go/config.json (用户目录)
+func LoadJSONConfig(path string) (*JSONConfig, error) {
+	if path == "" {
+		path = os.Getenv("CLAUDE_GO_CONFIG")
+	}
+	if path == "" {
+		candidates := []string{
+			"claude-go.json",
+			"config/claude-go.json",
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			candidates = append(candidates, home+"/.claude-go/config.json")
+		}
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				path = c
+				break
+			}
+		}
+	}
+	if path == "" {
+		return nil, nil // 无配置文件，使用默认值
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取配置文件 %s 失败: %w", path, err)
+	}
+
+	var cfg JSONConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("解析配置文件 %s 失败: %w", path, err)
+	}
+
+	return &cfg, nil
+}
+
+// ApplyToBot 将 JSON 配置应用到 BotConfig (合并, 不覆盖已有非零值)
+func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
+	if jc == nil {
+		return
+	}
+
+	if jc.Feishu != nil {
+		if bc.AppID == "" {
+			bc.AppID = jc.Feishu.AppID
+		}
+		if bc.AppSecret == "" {
+			bc.AppSecret = jc.Feishu.AppSecret
+		}
+		if bc.Domain == "" || bc.Domain == "feishu" {
+			if jc.Feishu.Domain != "" {
+				bc.Domain = jc.Feishu.Domain
+			}
+		}
+		if jc.Feishu.MentionOnly != nil {
+			bc.MentionOnly = *jc.Feishu.MentionOnly
+		}
+		if jc.Feishu.SessionTimeout > 0 && bc.SessionTimeout == 30*time.Minute {
+			bc.SessionTimeout = time.Duration(jc.Feishu.SessionTimeout) * time.Minute
+		}
+		if jc.Feishu.MaxSessions > 0 && bc.MaxSessions == 100 {
+			bc.MaxSessions = jc.Feishu.MaxSessions
+		}
+		if jc.Feishu.WelcomeMessage != "" && bc.WelcomeMessage == DefaultBotConfig().WelcomeMessage {
+			bc.WelcomeMessage = jc.Feishu.WelcomeMessage
+		}
+		if jc.Feishu.ThinkingMessage != "" && bc.ThinkingMessage == DefaultBotConfig().ThinkingMessage {
+			bc.ThinkingMessage = jc.Feishu.ThinkingMessage
+		}
+	}
+
+	if jc.AI != nil {
+		if bc.Model == "" || bc.Model == "qwen3.5-plus" {
+			if jc.AI.Model != "" {
+				bc.Model = jc.AI.Model
+			}
+		}
+		if bc.APIKey == "" {
+			bc.APIKey = jc.AI.APIKey
+		}
+		if bc.BaseURL == "" {
+			bc.BaseURL = jc.AI.BaseURL
+		}
+		if jc.AI.MaxTokens > 0 && bc.MaxTokens == 16384 {
+			bc.MaxTokens = jc.AI.MaxTokens
+		}
+		if jc.AI.MaxTurns > 0 && bc.MaxTurns == 0 {
+			bc.MaxTurns = jc.AI.MaxTurns
+		}
+	}
+
+	if jc.SystemPrompt != "" && bc.SystemPrompt == "" {
+		bc.SystemPrompt = jc.SystemPrompt
+	}
+	if jc.PermissionMode != "" && bc.PermissionMode == "bypass" {
+		bc.PermissionMode = jc.PermissionMode
+	}
+	if jc.Cwd != "" && bc.Cwd == "" {
+		bc.Cwd = jc.Cwd
+	}
+	if jc.Debug {
+		bc.Debug = true
+	}
 }

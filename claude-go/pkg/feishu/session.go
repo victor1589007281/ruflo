@@ -2,13 +2,16 @@ package feishu
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/hooks"
+	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/tool"
@@ -73,10 +76,17 @@ type SessionManager struct {
 	apiClient      *api.Client
 	maxSessions    int
 	sessionTimeout time.Duration
+	// mcpConns 进程级别共享的 MCP 连接 (Bot 启动时建立)
+	// 对应 TS: AppState.mcp.clients — 所有 session/agent 共享同一组连接
+	mcpConns       []*mcp.Connection
+	// hookConfigs hook 配置 (从 JSON config 加载)
+	hookConfigs    []types.HookConfig
 }
 
-// NewSessionManager 创建会话管理器
-func NewSessionManager(config *BotConfig, apiClient *api.Client) *SessionManager {
+// NewSessionManager 创建会话管理器。
+// mcpConns 是 Bot 启动时建立的 MCP 连接，所有 session 共享。
+// hookConfigs 是从 JSON config 加载的 hook 配置。
+func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpConns []*mcp.Connection, hookConfigs []types.HookConfig) *SessionManager {
 	maxSessions := config.MaxSessions
 	if maxSessions <= 0 {
 		maxSessions = 100
@@ -92,6 +102,8 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client) *SessionManager
 		apiClient:      apiClient,
 		maxSessions:    maxSessions,
 		sessionTimeout: timeout,
+		mcpConns:       mcpConns,
+		hookConfigs:    hookConfigs,
 	}
 
 	// 启动后台清理 goroutine
@@ -123,20 +135,36 @@ func (sm *SessionManager) GetOrCreate(chatID string) *Session {
 }
 
 // createSession 创建新会话 (内部方法, 需在锁内调用)。
+// 对应 TS: REPL.tsx 中 getToolUseContext → assembleToolPool(permCtx, mcp.tools)
+//
 // 为每个会话创建独立的:
-//   - tool.Registry (工具注册表)
+//   - tool.Registry (工具注册表) — 包含内置工具 + MCP 工具 + Agent 工具
 //   - permissions.Checker (权限检查器)
-//   - hooks.Runner (Hook 运行器)
+//   - hooks.Runner (Hook 运行器，加载配置中的 hooks)
 //   - compact.Compactor (上下文压缩器)
 //   - prompt.Manager (提示词管理器)
 //   - engine.QueryEngine (查询引擎)
+//
+// MCP 工具注册流程 (对应 TS: assembleToolPool):
+//  1. 注册内置工具 (RegisterBaseTools)
+//  2. 从共享的 MCP 连接中获取工具列表 (RegisterMCPTools)
+//  3. 注册 Agent 工具 (支持嵌套 queryLoop)
 func (sm *SessionManager) createSession(chatID string) *Session {
 	reg := tool.NewRegistry()
 	builtin.RegisterBaseTools(reg)
 
+	// 注册 MCP 工具 (对应 TS: assembleToolPool 中合并 mcpTools)
+	// MCP 连接在 Bot 启动时建立并共享给所有 session
+	if len(sm.mcpConns) > 0 {
+		mcp.RegisterMCPTools(reg, sm.mcpConns)
+	}
+
 	permMode := types.PermissionMode(sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)
-	hookRunner := hooks.NewRunner(nil, "")
+
+	// Hook 配置 (从 JSON config 加载)
+	hookRunner := hooks.NewRunner(sm.hookConfigs, "")
+
 	compactor := compact.NewCompactor(sm.apiClient, 200000)
 	promptMgr := prompt.NewManager(sm.config.Cwd)
 	if sm.config.SystemPrompt != "" {
@@ -144,6 +172,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	}
 	promptMgr.Model = sm.config.Model
 	promptMgr.ProductName = "Claude Code (Go) - Feishu Bot"
+	promptMgr.HookConfigs = sm.hookConfigs
 
 	cfg := &engine.Config{
 		Model:            sm.config.Model,
@@ -155,6 +184,14 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		Debug:            sm.config.Debug,
 	}
 
+	// 注册 Agent 工具 (对应 TS: AgentTool → runAgent → 嵌套 queryLoop)
+	// Agent 需要能创建嵌套 QueryEngine, 因此使用闭包注入 runAgent 函数
+	var runAgentFn agent.RunAgentFunc
+	runAgentFn = func(ctx context.Context, agentPrompt string, opts agent.RunOptions) (string, error) {
+		return sm.runNestedAgent(ctx, runAgentFn, agentPrompt, opts)
+	}
+	reg.Register(agent.NewAgentTool(runAgentFn))
+
 	eng := engine.NewQueryEngine(cfg, sm.apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
 
 	return &Session{
@@ -162,6 +199,66 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		Engine:     eng,
 		LastActive: time.Now(),
 	}
+}
+
+// runNestedAgent 创建嵌套 QueryEngine 执行子代理。
+// 对应 TS: tools/AgentTool/runAgent.ts 中的 runAgent()
+//
+// 流程:
+//  1. 创建新的 tool.Registry (共享 MCP 连接)
+//  2. 递归注册 Agent 工具 (子代理也能派生子代理)
+//  3. 创建独立的 QueryEngine
+//  4. 执行查询循环，收集所有 assistant 文本
+//  5. 返回合并后的结果
+func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
+	nestedReg := tool.NewRegistry()
+	builtin.RegisterBaseTools(nestedReg)
+	if len(sm.mcpConns) > 0 {
+		mcp.RegisterMCPTools(nestedReg, sm.mcpConns)
+	}
+	nestedReg.Register(agent.NewAgentTool(runAgentFn))
+
+	permMode := types.PermissionMode(sm.config.PermissionMode)
+	permChecker := permissions.NewChecker(permMode)
+	if opts.ReadOnly {
+		permMode = types.PermissionModePlan
+		permChecker = permissions.NewChecker(permMode)
+	}
+
+	hookRunner := hooks.NewRunner(sm.hookConfigs, "")
+	compactor := compact.NewCompactor(sm.apiClient, 200000)
+	promptMgr := prompt.NewManager(sm.config.Cwd)
+	promptMgr.Model = sm.config.Model
+
+	model := sm.config.Model
+	if opts.Model != "" {
+		model = opts.Model
+	}
+
+	cfg := &engine.Config{
+		Model:            model,
+		MaxTokens:        sm.config.MaxTokens,
+		MaxTurns:         sm.config.MaxTurns,
+		Cwd:              sm.config.Cwd,
+		PermissionMode:   permMode,
+		IsNonInteractive: true,
+		Debug:            sm.config.Debug,
+	}
+
+	nested := engine.NewQueryEngine(cfg, sm.apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
+
+	var sb strings.Builder
+	for msg := range nested.SubmitMessage(ctx, agentPrompt) {
+		if msg.Type != types.MessageTypeAssistant {
+			continue
+		}
+		for _, b := range msg.Content {
+			if b.Type == types.ContentBlockText {
+				sb.WriteString(b.Text)
+			}
+		}
+	}
+	return sb.String(), nil
 }
 
 // evictOldest 淘汰最早活跃的会话 (需在锁内调用)
