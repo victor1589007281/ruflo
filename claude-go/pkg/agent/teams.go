@@ -95,11 +95,15 @@ type ProductionTeamManager struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	taskTracker TaskTracker // 复用 V2 Task 系统
+	pool        *AgentPool  // Agent 池 (动态扩缩)
+	llm         LLMClient   // LLM 客户端 (蜂群分解)
 }
 
 // NewProductionTeamManager 创建生产级团队管理器。
 // taskTracker 可为 nil (降级: 不创建 V2 Task)。
-func NewProductionTeamManager(baseDir string, factory CreateAgentFunc, notify NotifyFunc, taskTracker TaskTracker) *ProductionTeamManager {
+// pool 可为 nil (降级: 不使用池化)。
+// llm 可为 nil (降级: 蜂群模式使用 fallback 分解)。
+func NewProductionTeamManager(baseDir string, factory CreateAgentFunc, notify NotifyFunc, taskTracker TaskTracker, pool *AgentPool, llm LLMClient) *ProductionTeamManager {
 	if notify == nil {
 		notify = func(_, _ string) {}
 	}
@@ -109,6 +113,8 @@ func NewProductionTeamManager(baseDir string, factory CreateAgentFunc, notify No
 		factory:     factory,
 		notify:      notify,
 		taskTracker: taskTracker,
+		pool:        pool,
+		llm:         llm,
 	}
 	ptm.loadPersistedTeams()
 	return ptm
@@ -177,9 +183,13 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 		return nil, fmt.Errorf("团队 %q 已存在", name)
 	}
 
-	wf := GetWorkflow(workflow)
-	if wf == nil {
-		return nil, fmt.Errorf("未知工作流 %q, 可选: development, research, debate", workflow)
+	// 蜂群模式不需要预定义工作流
+	if workflow != "swarm" {
+		wf := GetWorkflow(workflow)
+		if wf == nil {
+			return nil, fmt.Errorf("未知工作流 %q, 可选: development, research, debate, swarm", workflow)
+		}
+		_ = wf
 	}
 
 	dataDir := filepath.Join(ptm.baseDir, name)
@@ -199,11 +209,17 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 		dataDir:    dataDir,
 	}
 
-	for _, stage := range wf.Stages {
-		team.Agents[stage.Role] = &BGAgent{
-			Name:   stage.Role,
-			Role:   stage.Role,
-			Status: AgentStatusIdle,
+	// 蜂群模式: 初始 Agent 由 LLM 动态决定
+	if workflow != "swarm" {
+		wf := GetWorkflow(workflow)
+		if wf != nil {
+			for _, stage := range wf.Stages {
+				team.Agents[stage.Role] = &BGAgent{
+					Name:   stage.Role,
+					Role:   stage.Role,
+					Status: AgentStatusIdle,
+				}
+			}
 		}
 	}
 
@@ -251,6 +267,12 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 
 // executeWorkflow 在后台执行工作流
 func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *ProductionTeam) {
+	// 蜂群模式: 使用 SwarmOrchestrator
+	if team.Workflow == "swarm" {
+		ptm.executeSwarm(ctx, team)
+		return
+	}
+
 	wf := GetWorkflow(team.Workflow)
 	if wf == nil {
 		ptm.failTeam(team, "未知工作流: "+team.Workflow)
@@ -264,7 +286,16 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		taskTracker: ptm.taskTracker,
 	}
 
-	results, err := executor.Execute(ctx, wf, team.Objective, team)
+	// 使用 Coordinator 带重试和检查点执行
+	coord := NewCoordinator(ptm.pool, ptm.taskTracker, ptm.notify, CoordinatorConfig{
+		MaxRetries:    2,
+		HeartbeatFreq: 30 * time.Second,
+		DataDir:       team.dataDir,
+		ChatID:        team.ChatID,
+	})
+	coord.ClearCheckpoints()
+
+	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)
 	if err != nil {
 		if ctx.Err() != nil {
 			ptm.failTeam(team, "用户停止")
@@ -288,6 +319,37 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		}
 	}
 	ptm.notify(team.ChatID, fmt.Sprintf("✅ 团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s",
+		team.Name, time.Since(team.StartedAt).Round(time.Second), summary))
+}
+
+// executeSwarm 蜂群模式执行
+func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *ProductionTeam) {
+	swarm := NewSwarmOrchestrator(ptm.llm, ptm.pool, ptm.taskTracker, ptm.notify, team.ChatID, 8)
+
+	results, err := swarm.Execute(ctx, team, team.Objective)
+	if err != nil {
+		if ctx.Err() != nil {
+			ptm.failTeam(team, "用户停止")
+			return
+		}
+		ptm.failTeam(team, err.Error())
+		return
+	}
+
+	team.mu.Lock()
+	team.Status = TeamStatusCompleted
+	team.FinishedAt = time.Now()
+	team.Stages = results
+	team.mu.Unlock()
+	team.persist()
+
+	var summary string
+	for _, r := range results {
+		if r.Output != "" {
+			summary += fmt.Sprintf("\n\n**[%s] %s**\n%s", r.Role, r.Name, truncateResult(r.Output, 500))
+		}
+	}
+	ptm.notify(team.ChatID, fmt.Sprintf("🐝 蜂群团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s",
 		team.Name, time.Since(team.StartedAt).Round(time.Second), summary))
 }
 

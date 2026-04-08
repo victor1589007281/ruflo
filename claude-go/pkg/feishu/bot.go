@@ -137,16 +137,19 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 7. 创建会话管理器 (传入共享组件, 包括 TaskStore)
 	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore)
 
-	// 8. 初始化 Agent Teams 管理器 (注入 TaskTracker 复用 V2 Task 系统)
+	// 8. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
+	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)
+
+	// 9. 初始化 Agent Teams 管理器 (注入 TaskTracker + Pool + LLM)
 	teamsDir := config.Cwd + "/.claude/teams"
 	bot.teamMgr = agent.NewProductionTeamManager(teamsDir, bot.sessions.CreateAgentRunner, func(chatID, msg string) {
 		bot.sendLongMessage(context.Background(), chatID, msg)
-	}, bot.taskStore)
+	}, bot.taskStore, agentPool, aiClient)
 
-	// 9. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
+	// 10. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
 	bot.intentRec = agent.NewIntentRecognizer(aiClient)
 
-	// 10. 启动配置热加载 (如果有配置文件)
+	// 11. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {
 		bot.startConfigWatcher(config.MCPConfigPath)
 	}
@@ -463,6 +466,7 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- 直接说「帮我调研XXX」→ 自动创建 research 团队\n" +
 			"- 直接说「帮我开发XXX」→ 自动创建 development 团队\n" +
 			"- 直接说「帮我辩论XXX」→ 自动创建 debate 团队\n" +
+			"- 说「蜂群模式分析XXX」→ 自动创建 swarm 团队 (Kimi K2.5 蜂群)\n" +
 			"- 说「团队进展如何」→ 查看所有团队状态\n" +
 			"- 说「停止团队」→ 停止执行中的团队\n\n" +
 			"*命令模式:*\n" +

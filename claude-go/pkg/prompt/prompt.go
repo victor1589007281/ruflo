@@ -160,6 +160,17 @@ func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 	sb.WriteString("- Execute risky operations (delete, overwrite, git push) only with confirmation\n")
 	sb.WriteString("</guidelines>\n\n")
 
+	// Plan Mode 自动切换引导
+	// 对应 TS: planModeV2.ts 中的 auto-plan 行为
+	sb.WriteString("<plan_mode>\n")
+	sb.WriteString("For complex tasks (multi-file changes, architectural decisions, large refactors):\n")
+	sb.WriteString("1. Call EnterPlanMode first to enter read-only exploration mode\n")
+	sb.WriteString("2. Read relevant files, analyze the codebase, design your approach\n")
+	sb.WriteString("3. Call ExitPlanMode with a clear plan summary\n")
+	sb.WriteString("4. Then execute the plan step by step\n")
+	sb.WriteString("Skip plan mode for simple, single-file changes.\n")
+	sb.WriteString("</plan_mode>\n\n")
+
 	// CLAUDE.md 记忆内容
 	// 对应 TS: prompts.ts 中整合 claudemd 的部分
 	memoryFiles := m.MemoryLoader.LoadAll()

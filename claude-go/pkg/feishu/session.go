@@ -196,6 +196,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		PermissionMode:   permMode,
 		IsNonInteractive: true, // 飞书模式始终为非交互式
 		Debug:            sm.config.Debug,
+		DynamicPlanCheck: builtin.PlanModeActive,
 	}
 
 	// 注册 Agent 工具 (对应 TS: AgentTool → runAgent → 嵌套 queryLoop)

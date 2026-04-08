@@ -44,6 +44,8 @@ func GetWorkflow(name string) *WorkflowDef {
 		return researchWorkflow()
 	case "debate":
 		return debateWorkflow()
+	case "swarm":
+		return swarmWorkflow()
 	default:
 		return nil
 	}
@@ -55,6 +57,15 @@ func ListWorkflows() []WorkflowDef {
 		*developmentWorkflow(),
 		*researchWorkflow(),
 		*debateWorkflow(),
+		*swarmWorkflow(),
+	}
+}
+
+func swarmWorkflow() *WorkflowDef {
+	return &WorkflowDef{
+		Name:        "swarm",
+		Description: "蜂群模式: LLM 动态拆解 → 并行执行 → 结果汇聚 (Kimi K2.5 启发)",
+		Mode:        "swarm",
 	}
 }
 
@@ -448,6 +459,11 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 	allResults = append(allResults, sr)
 
 	return allResults, nil
+}
+
+// ExecuteSingleStage 公开的单阶段执行 (供 Coordinator 调用)。
+func (we *WorkflowExecutor) ExecuteSingleStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
+	return we.executeStage(ctx, stage, objective, prevResults, team)
 }
 
 // executeStage 执行单个阶段。

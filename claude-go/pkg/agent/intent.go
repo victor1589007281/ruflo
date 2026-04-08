@@ -84,6 +84,7 @@ var wfDetect = map[string][]string{
 	"development": {"开发", "实现", "编码", "构建", "写代码", "搭建", "编程", "重构"},
 	"research":    {"调研", "研究", "调查", "分析", "探索", "对比分析", "了解", "评估"},
 	"debate":      {"辩论", "讨论", "对比", "权衡", "利弊", "优劣", "pk", "vs", "还是"},
+	"swarm":       {"蜂群", "swarm", "并行分析", "全面调研", "深度分析", "多角度", "自动拆解"},
 }
 
 // Recognize 从用户文本中识别团队协作意图。
@@ -164,12 +165,13 @@ func (ir *IntentRecognizer) keywordDetect(lower, original string) *TeamIntent {
 const extractSysPrompt = `你是命令解析器。给定用户的中文消息，提取多Agent协作任务的参数。
 
 输出 JSON（仅JSON，不要解释）:
-{"workflow":"development|research|debate","objective":"简洁的任务目标","teamName":"kebab-case英文短名"}
+{"workflow":"development|research|debate|swarm","objective":"简洁的任务目标","teamName":"kebab-case英文短名"}
 
 判断规则:
 - development: 编写代码/实现功能/构建系统
 - research: 调研/分析/探索/对比方案
-- debate: 辩论/讨论利弊/权衡选择`
+- debate: 辩论/讨论利弊/权衡选择
+- swarm: 复杂任务需要多角度并行分析/全面调研/自动拆解子任务`
 
 func (ir *IntentRecognizer) extractWithLLM(ctx context.Context, text string, intent *TeamIntent) {
 	resp, err := ir.llm.SimpleComplete(ctx, extractSysPrompt, text)

@@ -75,6 +75,10 @@ type Config struct {
 	IsNonInteractive bool
 	Debug            bool
 	SessionID        string
+	// DynamicPlanCheck 动态计划模式检查。
+	// 当 LLM 调用 EnterPlanMode 时返回 true, 引擎自动切换到只读权限。
+	// 对应 TS: QueryEngine 中 permissionMode 与 PlanModeActive 联动。
+	DynamicPlanCheck func() bool
 }
 
 // NewQueryEngine 创建查询引擎
@@ -487,9 +491,15 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			return messages, types.Terminal{Reason: "max_turns"}
 		}
 
+		// 动态 Plan Mode 联动: LLM 调用 EnterPlanMode → 自动切换只读
+		effectivePerm := e.Config.PermissionMode
+		if e.Config.DynamicPlanCheck != nil && e.Config.DynamicPlanCheck() {
+			effectivePerm = types.PermissionModePlan
+		}
+
 		tctx := &tool.ToolContext{
 			Cwd:              e.Config.Cwd,
-			PermissionMode:   e.Config.PermissionMode,
+			PermissionMode:   effectivePerm,
 			MainLoopModel:    currentModel,
 			IsNonInteractive: e.Config.IsNonInteractive,
 			Debug:            e.Config.Debug,
