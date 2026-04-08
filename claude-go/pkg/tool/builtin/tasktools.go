@@ -2,7 +2,7 @@
 // 对应 Claude Code Agent Teams 风格的共享任务列表，数据持久化到系统临时目录下的 JSON 文件。
 //
 // 设计要点:
-//   - 所有工具共享同一 taskStore，内部 sync.Mutex 保证并发安全；
+//   - 所有工具共享同一 TaskStore，内部 sync.Mutex 保证并发安全；
 //   - 任务以 UUID 为主键，创建/更新后落盘，进程间可复用同一路径（默认固定文件名）；
 //   - TaskCreate、TaskUpdate 为写入类工具；TaskGet、TaskList 为只读工具。
 package builtin
@@ -47,19 +47,19 @@ type taskFilePayload struct {
 	Tasks map[string]v2TaskRecord `json:"tasks"`
 }
 
-// taskStore 任务存储：内存索引 + JSON 文件持久化。
-type taskStore struct {
+// TaskStore 任务存储：内存索引 + JSON 文件持久化。
+type TaskStore struct {
 	mu   sync.Mutex
 	path string
 	byID map[string]v2TaskRecord
 }
 
 // NewTaskStore 创建任务存储。若 path 为空，则使用 os.TempDir() 下的默认文件名。
-func NewTaskStore(path string) *taskStore {
+func NewTaskStore(path string) *TaskStore {
 	if path == "" {
 		path = filepath.Join(os.TempDir(), defaultTaskStoreFile)
 	}
-	s := &taskStore{
+	s := &TaskStore{
 		path: path,
 		byID: make(map[string]v2TaskRecord),
 	}
@@ -67,7 +67,7 @@ func NewTaskStore(path string) *taskStore {
 	return s
 }
 
-func (s *taskStore) load() error {
+func (s *TaskStore) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	data, err := os.ReadFile(s.path)
@@ -87,7 +87,7 @@ func (s *taskStore) load() error {
 	return nil
 }
 
-func (s *taskStore) saveLocked() error {
+func (s *TaskStore) saveLocked() error {
 	if s.byID == nil {
 		s.byID = make(map[string]v2TaskRecord)
 	}
@@ -126,11 +126,11 @@ type taskCreateInput struct {
 
 // TaskCreateTool 创建任务并分配 UUID，写入存储。
 type TaskCreateTool struct {
-	store *taskStore
+	store *TaskStore
 }
 
 // NewTaskCreateTool 构造 TaskCreate 工具。
-func NewTaskCreateTool(store *taskStore) *TaskCreateTool {
+func NewTaskCreateTool(store *TaskStore) *TaskCreateTool {
 	return &TaskCreateTool{store: store}
 }
 
@@ -205,11 +205,11 @@ type taskGetInput struct {
 
 // TaskGetTool 按 ID 读取单条任务。
 type TaskGetTool struct {
-	store *taskStore
+	store *TaskStore
 }
 
 // NewTaskGetTool 构造 TaskGet 工具。
-func NewTaskGetTool(store *taskStore) *TaskGetTool {
+func NewTaskGetTool(store *TaskStore) *TaskGetTool {
 	return &TaskGetTool{store: store}
 }
 
@@ -266,11 +266,11 @@ type taskUpdateInput struct {
 
 // TaskUpdateTool 更新已有任务的字段。
 type TaskUpdateTool struct {
-	store *taskStore
+	store *TaskStore
 }
 
 // NewTaskUpdateTool 构造 TaskUpdate 工具。
-func NewTaskUpdateTool(store *taskStore) *TaskUpdateTool {
+func NewTaskUpdateTool(store *TaskStore) *TaskUpdateTool {
 	return &TaskUpdateTool{store: store}
 }
 
@@ -343,11 +343,11 @@ func (t *TaskUpdateTool) Call(_ context.Context, input json.RawMessage, _ *tool.
 
 // TaskListTool 列出当前存储中的全部任务。
 type TaskListTool struct {
-	store *taskStore
+	store *TaskStore
 }
 
 // NewTaskListTool 构造 TaskList 工具。
-func NewTaskListTool(store *taskStore) *TaskListTool {
+func NewTaskListTool(store *TaskStore) *TaskListTool {
 	return &TaskListTool{store: store}
 }
 
@@ -384,4 +384,67 @@ func (t *TaskListTool) Call(_ context.Context, _ json.RawMessage, _ *tool.ToolCo
 		return &tool.ToolResult{Content: fmt.Sprintf("序列化失败: %v", err), IsError: true}, nil
 	}
 	return &tool.ToolResult{Content: string(out)}, nil
+}
+
+// --- Team Integration API ---
+// 以下方法供 Agent Teams 系统复用 V2 任务管理, 避免重复建设。
+
+// TaskSummary 面向外部消费者的任务摘要视图。
+type TaskSummary struct {
+	ID          string `json:"id"`
+	Subject     string `json:"subject"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	Owner       string `json:"owner"`
+	CreatedAt   string `json:"createdAt"`
+	UpdatedAt   string `json:"updatedAt"`
+}
+
+// AddTask 创建任务并返回其 ID (供团队编排使用)。
+func (s *TaskStore) AddTask(subject, description, owner string) (string, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	id := genTaskUUID()
+	rec := v2TaskRecord{
+		ID: id, Subject: subject, Description: description,
+		Status: "pending", Owner: owner, CreatedAt: now, UpdatedAt: now,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byID == nil {
+		s.byID = make(map[string]v2TaskRecord)
+	}
+	s.byID[id] = rec
+	if err := s.saveLocked(); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// SetTaskStatus 按 ID 更新任务状态 (供团队编排使用)。
+func (s *TaskStore) SetTaskStatus(id, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.byID[id]
+	if !ok {
+		return fmt.Errorf("task not found: %s", id)
+	}
+	rec.Status = status
+	rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	s.byID[id] = rec
+	return s.saveLocked()
+}
+
+// GetAllTasks 返回所有任务的摘要列表。
+func (s *TaskStore) GetAllTasks() []TaskSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]TaskSummary, 0, len(s.byID))
+	for _, r := range s.byID {
+		result = append(result, TaskSummary{
+			ID: r.ID, Subject: r.Subject, Description: r.Description,
+			Status: r.Status, Owner: r.Owner,
+			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		})
+	}
+	return result
 }

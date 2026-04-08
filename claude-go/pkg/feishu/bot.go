@@ -17,6 +17,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/dreaming"
+	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/mcp"
@@ -59,6 +60,8 @@ type Bot struct {
 	dreamer     *dreaming.Dreamer           // Dreaming 记忆整理引擎
 	memStore    *memory.TieredStore         // 多层记忆存储 (进程级别共享)
 	teamMgr     *agent.ProductionTeamManager // 生产级 Agent Teams 管理器
+	intentRec   *agent.IntentRecognizer     // 自然语言意图识别器
+	taskStore   *builtin.TaskStore          // 共享 V2 Task 存储
 	cfgWatcher  *hotreload.Watcher          // 配置热加载监控器
 	startTime   time.Time                   // 启动时间
 }
@@ -127,16 +130,23 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 5. 解析 Hook 配置
 	hookConfigs := bot.parseHookConfigs(config)
 
-	// 6. 创建会话管理器 (传入共享组件)
-	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs)
+	// 6. 创建共享 V2 Task 存储 (Teams + LLM 工具共用同一实例)
+	taskStorePath := config.Cwd + "/.claude/tasks.json"
+	bot.taskStore = builtin.NewTaskStore(taskStorePath)
 
-	// 7. 初始化 Agent Teams 管理器
+	// 7. 创建会话管理器 (传入共享组件, 包括 TaskStore)
+	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore)
+
+	// 8. 初始化 Agent Teams 管理器 (注入 TaskTracker 复用 V2 Task 系统)
 	teamsDir := config.Cwd + "/.claude/teams"
 	bot.teamMgr = agent.NewProductionTeamManager(teamsDir, bot.sessions.CreateAgentRunner, func(chatID, msg string) {
 		bot.sendLongMessage(context.Background(), chatID, msg)
-	})
+	}, bot.taskStore)
 
-	// 6. 启动配置热加载 (如果有配置文件)
+	// 9. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
+	bot.intentRec = agent.NewIntentRecognizer(aiClient)
+
+	// 10. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {
 		bot.startConfigWatcher(config.MCPConfigPath)
 	}
@@ -398,6 +408,12 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
+	// 意图识别: 中文自然语言 → 自动拆解为团队操作 (零侵入, 不匹配则透传)
+	if intent := b.intentRec.Recognize(ctx, userText); intent != nil && intent.Confidence >= 0.7 {
+		go b.handleTeamIntent(chatID, messageID, intent)
+		return nil
+	}
+
 	// 异步处理消息 (避免阻塞飞书回调的 3 秒超时)
 	go b.processAndReply(chatID, messageID, userText)
 
@@ -443,13 +459,20 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"**Dreaming:**\n" +
 			"- /dream - 手动触发记忆整理\n\n" +
 			"**Agent Teams (多Agent协作):**\n" +
-			"- /team create <名称> <工作流> - 创建团队 (development/research/debate)\n" +
-			"- /team run <名称> <目标> - 启动团队执行\n" +
-			"- /team status [名称] - 查看团队状态\n" +
-			"- /team stop <名称> - 停止团队\n" +
-			"- /team list - 列出所有团队\n" +
-			"- /team delete <名称> - 删除团队\n" +
-			"- /team workflows - 查看可用工作流"
+			"*自然语言模式 (推荐):*\n" +
+			"- 直接说「帮我调研XXX」→ 自动创建 research 团队\n" +
+			"- 直接说「帮我开发XXX」→ 自动创建 development 团队\n" +
+			"- 直接说「帮我辩论XXX」→ 自动创建 debate 团队\n" +
+			"- 说「团队进展如何」→ 查看所有团队状态\n" +
+			"- 说「停止团队」→ 停止执行中的团队\n\n" +
+			"*命令模式:*\n" +
+			"- /team create <名称> <工作流> - 创建团队\n" +
+			"- /team run <名称> <目标> - 启动执行\n" +
+			"- /team status [名称] - 查看状态\n" +
+			"- /team stop <名称> - 停止\n" +
+			"- /team list - 列出所有\n" +
+			"- /team delete <名称> - 删除\n" +
+			"- /team workflows - 查看工作流"
 		b.sendTextReply(ctx, messageID, help)
 		return true
 
@@ -778,6 +801,64 @@ func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text str
 
 	default:
 		b.sendTextReply(ctx, messageID, "未知子命令。用法: /team [create|run|status|stop|list|delete|msg|workflows]")
+	}
+}
+
+// handleTeamIntent 处理意图识别结果 — 中文自然语言自动驱动团队操作。
+func (b *Bot) handleTeamIntent(chatID, messageID string, intent *agent.TeamIntent) {
+	ctx := context.Background()
+	switch intent.Action {
+	case "create_and_run":
+		team, err := b.teamMgr.CreateTeam(intent.TeamName, intent.Workflow, intent.Objective, chatID)
+		if err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("自动创建团队失败: %v", err))
+			return
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf(
+			"🤖 已识别为多Agent协作任务, 自动创建并启动:\n"+
+				"- 团队: **%s**\n"+
+				"- 工作流: %s\n"+
+				"- 目标: %s\n"+
+				"- Agent数: %d\n\n"+
+				"后台执行中, 完成后自动通知。发送「团队进展如何」查看进度。",
+			team.Name, team.Workflow, truncateForDream(intent.Objective), len(team.Agents)))
+		if err := b.teamMgr.RunTeam(intent.TeamName, intent.Objective); err != nil {
+			b.sendTextMessage(ctx, chatID, fmt.Sprintf("启动失败: %v", err))
+		}
+
+	case "check_status":
+		teams := b.teamMgr.ListAllTeams()
+		if len(teams) == 0 {
+			b.sendTextReply(ctx, messageID, "当前没有活跃的团队。")
+			return
+		}
+		var sb strings.Builder
+		for _, t := range teams {
+			sb.WriteString(t.FormatStatus())
+			sb.WriteString("\n---\n")
+		}
+		b.sendTextReply(ctx, messageID, sb.String())
+
+	case "stop":
+		name, err := b.teamMgr.StopFirstRunning()
+		if err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("停止失败: %v", err))
+		} else {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("⏹️ 已停止团队 **%s**", name))
+		}
+
+	case "list":
+		teams := b.teamMgr.ListAllTeams()
+		if len(teams) == 0 {
+			b.sendTextReply(ctx, messageID, "无团队。")
+			return
+		}
+		var sb strings.Builder
+		sb.WriteString("**团队列表:**\n")
+		for _, t := range teams {
+			sb.WriteString(fmt.Sprintf("- **%s** [%s] %s\n", t.Name, t.Status, t.Workflow))
+		}
+		b.sendTextReply(ctx, messageID, sb.String())
 	}
 }
 

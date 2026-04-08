@@ -271,11 +271,13 @@ Render your verdict:
 	}
 }
 
-// WorkflowExecutor 工作流执行器
+// WorkflowExecutor 工作流执行器。
+// 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff。
 type WorkflowExecutor struct {
-	factory CreateAgentFunc
-	notify  NotifyFunc
-	chatID  string
+	factory     CreateAgentFunc
+	notify      NotifyFunc
+	chatID      string
+	taskTracker TaskTracker // 复用 V2 Task 系统 (可为 nil)
 }
 
 // Execute 执行工作流, 返回所有阶段结果
@@ -386,6 +388,11 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 	var debateTranscript strings.Builder
 	debateTranscript.WriteString("# Debate Transcript\n\n")
 
+	// 在黑板上写入辩论主题
+	if team.Blackboard != nil {
+		team.Blackboard.Write("debate-topic", objective, "system", "context")
+	}
+
 	for round := 1; round <= rounds; round++ {
 		if ctx.Err() != nil {
 			return allResults, ctx.Err()
@@ -409,6 +416,9 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 			return allResults, fmt.Errorf("正方第 %d 轮失败: %s", round, sr.Error)
 		}
 		debateTranscript.WriteString(fmt.Sprintf("## Round %d — Proposer\n%s\n\n", round, sr.Output))
+		if team.Blackboard != nil {
+			team.Blackboard.Write(fmt.Sprintf("round%d-proposer", round), sr.Output, "proposer", "result")
+		}
 
 		// 反方发言
 		opponentPrompt := strings.ReplaceAll(opponentStage.Prompt, "{objective}", objective)
@@ -423,6 +433,9 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 			return allResults, fmt.Errorf("反方第 %d 轮失败: %s", round, sr.Error)
 		}
 		debateTranscript.WriteString(fmt.Sprintf("## Round %d — Opponent\n%s\n\n", round, sr.Output))
+		if team.Blackboard != nil {
+			team.Blackboard.Write(fmt.Sprintf("round%d-opponent", round), sr.Output, "opponent", "result")
+		}
 	}
 
 	// 裁判裁决
@@ -437,15 +450,61 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 	return allResults, nil
 }
 
-// executeStage 执行单个阶段
+// executeStage 执行单个阶段。
+// 集成 Blackboard 读/写 + V2 Task 创建/更新 + Structured Handoff。
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
+	// 1. 构建 prompt: 原有模板 + Blackboard 上下文 + Handoff 信息
+	bbContext := ""
+	if team.Blackboard != nil {
+		var completedStages []string
+		for name := range prevResults {
+			completedStages = append(completedStages, name)
+		}
+		bbContext = team.Blackboard.HandoffContext(completedStages, stage.Role)
+	}
 	prompt := buildStagePrompt(stage, objective, prevResults)
+	if bbContext != "" {
+		prompt = bbContext + "\n\n---\n\n" + prompt
+	}
+
+	// 2. 创建 V2 Task (LLM 可通过 TaskList 看到团队进度)
+	var v2TaskID string
+	if we.taskTracker != nil {
+		taskSubject := fmt.Sprintf("[%s] %s", team.Name, stage.Name)
+		id, err := we.taskTracker.AddTask(taskSubject, objective, stage.Role)
+		if err == nil {
+			v2TaskID = id
+			_ = we.taskTracker.SetTaskStatus(id, "in_progress")
+		}
+	}
 
 	we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 开始执行...", stage.Name, stage.Role))
 
+	// 3. 执行 Agent
 	sr := we.runAgent(ctx, stage.Role, prompt, team)
 	sr.Name = stage.Name
 	sr.Role = stage.Role
+	sr.V2TaskID = v2TaskID
+
+	// 4. 将结果写入 Blackboard (bMAS 核心: Agent 执行后写回黑板)
+	if team.Blackboard != nil {
+		if sr.Status == TaskCompleted {
+			team.Blackboard.Write(stage.Name+"-result", sr.Output, stage.Role, "result")
+			team.Blackboard.Write(stage.Name+"-status", "completed", "system", "progress")
+		} else {
+			team.Blackboard.Write(stage.Name+"-status", "failed: "+sr.Error, "system", "progress")
+		}
+	}
+
+	// 5. 更新 V2 Task 状态
+	if we.taskTracker != nil && v2TaskID != "" {
+		if sr.Status == TaskCompleted {
+			_ = we.taskTracker.SetTaskStatus(v2TaskID, "completed")
+		} else {
+			_ = we.taskTracker.SetTaskStatus(v2TaskID, "failed")
+		}
+	}
+
 	return sr
 }
 

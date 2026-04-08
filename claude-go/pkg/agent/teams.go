@@ -1,27 +1,31 @@
-// Production Agent Teams — 生产级多 Agent 协作系统。
+// Production Agent Teams — 生产级多 Agent 协作系统 (v2)。
 //
-// 架构 (参考 CrewAI 角色编排 + LangGraph 状态机 + AutoGen 对话协议):
+// 架构改进 (参考业界最佳实践):
 //
-//	┌─────────────────────────────────────────────────┐
-//	│ ProductionTeamManager (进程级单例)               │
-//	│  - 管理所有 Team 的生命周期                      │
-//	│  - 文件持久化: .claude/teams/{name}/team.json    │
-//	│  - 通知回调: 向飞书推送进度                      │
-//	├─────────────────────────────────────────────────┤
-//	│ ProductionTeam                                  │
-//	│  - Workflow: 定义协作模式 (pipeline/fan-out/debate)│
-//	│  - Agents: 后台 goroutine, 独立 QueryEngine      │
-//	│  - Tasks: 状态机 (pending→running→completed)     │
-//	│  - Mailbox: 文件持久化, per-agent 收件箱          │
-//	└─────────────────────────────────────────────────┘
+//  1. TaskTracker 集成 — 复用 claude-go V2 Task 系统, 不重复造轮子。
+//     阶段状态通过 TaskCreate/TaskUpdate 管理, LLM 可见。
 //
-// 飞书遥控命令:
-//   /team create <name> --workflow <type> — 创建团队
-//   /team run <name> <objective>          — 启动执行
-//   /team status [name]                   — 查看状态
-//   /team stop [name]                     — 停止团队
-//   /team msg <team> <agent> <message>    — 发送消息
-//   /team list                            — 列出所有团队
+//  2. Blackboard 共享上下文 (bMAS 架构) — Agent 间通过黑板间接通信,
+//     所有 Agent 执行前读取完整黑板, 执行后写回结果。
+//     参考: "bMAS: Blackboard LLM Multi-Agent System" (2025)
+//
+//  3. Structured Handoff — 阶段间传递结构化上下文而非原始文本。
+//     参考: AG2 Framework (2026), Anthropic Harness Design (2026)
+//
+//  4. 意图识别层 — 用户发送中文自然语言即可驱动团队,
+//     无需记忆 /team 命令。IntentRecognizer 自动拆解执行。
+//
+//	┌────────────────────────────────────────────────────┐
+//	│ ProductionTeamManager (进程级单例)                  │
+//	│  - TaskTracker: 复用 V2 Task (LLM 可通过 TaskList 看到)│
+//	│  - 文件持久化: .claude/teams/{name}/                │
+//	│  - 通知回调: 向飞书推送进度                         │
+//	├────────────────────────────────────────────────────┤
+//	│ ProductionTeam                                     │
+//	│  - Blackboard: 共享黑板 (bMAS 架构)                 │
+//	│  - Workflow: pipeline / fanout / adversarial        │
+//	│  - V2 TaskIDs: 每个阶段对应一个 V2 Task             │
+//	└────────────────────────────────────────────────────┘
 package agent
 
 import (
@@ -35,8 +39,13 @@ import (
 	"time"
 )
 
+// TaskTracker 抽象 V2 任务管理, 与 builtin.TaskStore 通过 duck typing 对接。
+type TaskTracker interface {
+	AddTask(subject, description, owner string) (string, error)
+	SetTaskStatus(id, status string) error
+}
+
 // CreateAgentFunc 创建 Agent 运行器的工厂函数。
-// 由 feishu SessionManager 注入, 避免循环依赖。
 type CreateAgentFunc func(ctx context.Context, role, systemPrompt string) (AgentRunner, error)
 
 // AgentRunner 后台 Agent 执行接口
@@ -80,23 +89,26 @@ const (
 
 // ProductionTeamManager 生产级团队管理器
 type ProductionTeamManager struct {
-	teams   map[string]*ProductionTeam
-	mu      sync.RWMutex
-	baseDir string          // .claude/teams/
-	factory CreateAgentFunc // Agent 工厂
-	notify  NotifyFunc      // 飞书通知回调
+	teams       map[string]*ProductionTeam
+	mu          sync.RWMutex
+	baseDir     string
+	factory     CreateAgentFunc
+	notify      NotifyFunc
+	taskTracker TaskTracker // 复用 V2 Task 系统
 }
 
-// NewProductionTeamManager 创建生产级团队管理器
-func NewProductionTeamManager(baseDir string, factory CreateAgentFunc, notify NotifyFunc) *ProductionTeamManager {
+// NewProductionTeamManager 创建生产级团队管理器。
+// taskTracker 可为 nil (降级: 不创建 V2 Task)。
+func NewProductionTeamManager(baseDir string, factory CreateAgentFunc, notify NotifyFunc, taskTracker TaskTracker) *ProductionTeamManager {
 	if notify == nil {
 		notify = func(_, _ string) {}
 	}
 	ptm := &ProductionTeamManager{
-		teams:   make(map[string]*ProductionTeam),
-		baseDir: baseDir,
-		factory: factory,
-		notify:  notify,
+		teams:       make(map[string]*ProductionTeam),
+		baseDir:     baseDir,
+		factory:     factory,
+		notify:      notify,
+		taskTracker: taskTracker,
 	}
 	ptm.loadPersistedTeams()
 	return ptm
@@ -104,24 +116,25 @@ func NewProductionTeamManager(baseDir string, factory CreateAgentFunc, notify No
 
 // ProductionTeam 生产级团队
 type ProductionTeam struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Workflow    string            `json:"workflow"` // development, research, debate, custom
-	Objective   string            `json:"objective"`
-	ChatID      string            `json:"chatId"`
-	Status      TeamStatus        `json:"status"`
-	Agents      map[string]*BGAgent `json:"agents"`
-	Stages      []StageResult     `json:"stages"`
-	CreatedAt   time.Time         `json:"createdAt"`
-	StartedAt   time.Time         `json:"startedAt,omitempty"`
-	FinishedAt  time.Time         `json:"finishedAt,omitempty"`
-	Mailbox     []MailMessage     `json:"mailbox,omitempty"`
-	Error       string            `json:"error,omitempty"`
+	Name       string              `json:"name"`
+	Workflow   string              `json:"workflow"`
+	Objective  string              `json:"objective"`
+	ChatID     string              `json:"chatId"`
+	Status     TeamStatus          `json:"status"`
+	Agents     map[string]*BGAgent `json:"agents"`
+	Stages     []StageResult       `json:"stages"`
+	TaskIDs    map[string]string   `json:"taskIds,omitempty"` // stageName → V2 taskID
+	CreatedAt  time.Time           `json:"createdAt"`
+	StartedAt  time.Time           `json:"startedAt,omitempty"`
+	FinishedAt time.Time           `json:"finishedAt,omitempty"`
+	Mailbox    []MailMessage       `json:"mailbox,omitempty"`
+	Error      string              `json:"error,omitempty"`
 
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	mgr     *ProductionTeamManager
-	dataDir string
+	Blackboard *Blackboard `json:"-"` // 共享黑板 (不序列化, 独立持久化)
+	mu         sync.Mutex
+	cancel     context.CancelFunc
+	mgr        *ProductionTeamManager
+	dataDir    string
 }
 
 // BGAgent 后台 Agent
@@ -141,6 +154,7 @@ type StageResult struct {
 	Input     string     `json:"input,omitempty"`
 	Output    string     `json:"output,omitempty"`
 	Error     string     `json:"error,omitempty"`
+	V2TaskID  string     `json:"v2TaskId,omitempty"` // 关联的 V2 Task ID
 	StartedAt time.Time  `json:"startedAt,omitempty"`
 	Duration  string     `json:"duration,omitempty"`
 }
@@ -150,12 +164,12 @@ type MailMessage struct {
 	From      string    `json:"from"`
 	To        string    `json:"to"`
 	Content   string    `json:"content"`
-	Type      string    `json:"type"` // message, result, error, shutdown
+	Type      string    `json:"type"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
 // CreateTeam 创建团队
-func (ptm *ProductionTeamManager) CreateTeam(name, workflow, description, chatID string) (*ProductionTeam, error) {
+func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID string) (*ProductionTeam, error) {
 	ptm.mu.Lock()
 	defer ptm.mu.Unlock()
 
@@ -172,18 +186,19 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, description, chatID
 	os.MkdirAll(dataDir, 0755)
 
 	team := &ProductionTeam{
-		Name:        name,
-		Description: description,
-		Workflow:    workflow,
-		ChatID:      chatID,
-		Status:      TeamStatusCreated,
-		Agents:      make(map[string]*BGAgent),
-		CreatedAt:   time.Now(),
-		mgr:         ptm,
-		dataDir:     dataDir,
+		Name:       name,
+		Workflow:   workflow,
+		Objective:  objective,
+		ChatID:     chatID,
+		Status:     TeamStatusCreated,
+		Agents:     make(map[string]*BGAgent),
+		TaskIDs:    make(map[string]string),
+		CreatedAt:  time.Now(),
+		Blackboard: NewBlackboard(name, dataDir),
+		mgr:        ptm,
+		dataDir:    dataDir,
 	}
 
-	// 根据 workflow 预创建 agent 角色
 	for _, stage := range wf.Stages {
 		team.Agents[stage.Role] = &BGAgent{
 			Name:   stage.Role,
@@ -191,6 +206,10 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, description, chatID
 			Status: AgentStatusIdle,
 		}
 	}
+
+	// 在黑板上写入初始上下文
+	team.Blackboard.Write("objective", objective, "system", "context")
+	team.Blackboard.Write("workflow", workflow, "system", "context")
 
 	ptm.teams[name] = team
 	team.persist()
@@ -221,6 +240,8 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 	team.cancel = cancel
 	team.mu.Unlock()
 
+	// 更新黑板上的目标
+	team.Blackboard.Write("objective", objective, "system", "context")
 	team.persist()
 	ptm.notify(team.ChatID, fmt.Sprintf("🚀 团队 **%s** 开始执行\n目标: %s\n工作流: %s", name, objective, team.Workflow))
 
@@ -237,9 +258,10 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	}
 
 	executor := &WorkflowExecutor{
-		factory: ptm.factory,
-		notify:  ptm.notify,
-		chatID:  team.ChatID,
+		factory:     ptm.factory,
+		notify:      ptm.notify,
+		chatID:      team.ChatID,
+		taskTracker: ptm.taskTracker,
 	}
 
 	results, err := executor.Execute(ctx, wf, team.Objective, team)
@@ -259,7 +281,6 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	team.mu.Unlock()
 	team.persist()
 
-	// 汇总最终结果
 	var summary string
 	for _, r := range results {
 		if r.Output != "" {
@@ -292,7 +313,6 @@ func (ptm *ProductionTeamManager) StopTeam(name string) error {
 
 	team.mu.Lock()
 	defer team.mu.Unlock()
-
 	if team.cancel != nil {
 		team.cancel()
 	}
@@ -300,6 +320,23 @@ func (ptm *ProductionTeamManager) StopTeam(name string) error {
 	team.FinishedAt = time.Now()
 	team.persist()
 	return nil
+}
+
+// StopFirstRunning 停止第一个正在运行的团队 (意图识别用)
+func (ptm *ProductionTeamManager) StopFirstRunning() (string, error) {
+	ptm.mu.RLock()
+	defer ptm.mu.RUnlock()
+
+	for _, team := range ptm.teams {
+		if team.Status == TeamStatusRunning {
+			name := team.Name
+			ptm.mu.RUnlock()
+			err := ptm.StopTeam(name)
+			ptm.mu.RLock()
+			return name, err
+		}
+	}
+	return "", fmt.Errorf("无正在运行的团队")
 }
 
 // DeleteTeam 删除团队
@@ -311,10 +348,8 @@ func (ptm *ProductionTeamManager) DeleteTeam(name string) error {
 	if !ok {
 		return fmt.Errorf("团队 %q 不存在", name)
 	}
-	if team.Status == TeamStatusRunning {
-		if team.cancel != nil {
-			team.cancel()
-		}
+	if team.Status == TeamStatusRunning && team.cancel != nil {
+		team.cancel()
 	}
 	delete(ptm.teams, name)
 	os.RemoveAll(filepath.Join(ptm.baseDir, name))
@@ -337,6 +372,13 @@ func (ptm *ProductionTeamManager) SendMailMessage(teamName, from, to, content st
 		Type: "message", Timestamp: time.Now(),
 	})
 	team.mu.Unlock()
+
+	// 同时写入黑板, 使消息对所有 Agent 可见
+	team.Blackboard.Write(
+		fmt.Sprintf("msg-%s-%d", to, time.Now().UnixMilli()),
+		fmt.Sprintf("From %s: %s", from, content),
+		from, "context",
+	)
 	team.persist()
 	return nil
 }
@@ -348,7 +390,7 @@ func (ptm *ProductionTeamManager) GetTeam(name string) *ProductionTeam {
 	return ptm.teams[name]
 }
 
-// ListTeams 列出所有团队
+// ListAllTeams 列出所有团队
 func (ptm *ProductionTeamManager) ListAllTeams() []*ProductionTeam {
 	ptm.mu.RLock()
 	defer ptm.mu.RUnlock()
@@ -392,7 +434,7 @@ func (ptm *ProductionTeamManager) loadPersistedTeams() {
 		if json.Unmarshal(data, &team) == nil {
 			team.mgr = ptm
 			team.dataDir = filepath.Join(ptm.baseDir, entry.Name())
-			// 运行中的团队重启后标记为 failed
+			team.Blackboard = NewBlackboard(team.Name, team.dataDir)
 			if team.Status == TeamStatusRunning {
 				team.Status = TeamStatusFailed
 				team.Error = "进程重启"

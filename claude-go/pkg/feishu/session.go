@@ -84,11 +84,12 @@ type SessionManager struct {
 	dreamer        *dreaming.Dreamer
 	memoryStore    *memory.TieredStore
 	hookConfigs    []types.HookConfig
+	taskStore      *builtin.TaskStore // 共享 V2 Task 存储 (Teams + LLM 工具共用)
 }
 
 // NewSessionManager 创建会话管理器。
 // 所有共享组件由 Bot 创建并传入。
-func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, memStore *memory.TieredStore, hookConfigs []types.HookConfig) *SessionManager {
+func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, memStore *memory.TieredStore, hookConfigs []types.HookConfig, taskStore *builtin.TaskStore) *SessionManager {
 	maxSessions := config.MaxSessions
 	if maxSessions <= 0 {
 		maxSessions = 100
@@ -109,6 +110,7 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 		dreamer:        dreamer,
 		memoryStore:    memStore,
 		hookConfigs:    hookConfigs,
+		taskStore:      taskStore,
 	}
 
 	// 启动后台清理 goroutine
@@ -156,7 +158,7 @@ func (sm *SessionManager) GetOrCreate(chatID string) *Session {
 //  3. 注册 Agent 工具 (支持嵌套 queryLoop)
 func (sm *SessionManager) createSession(chatID string) *Session {
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseTools(reg)
+	builtin.RegisterBaseToolsWithStore(reg, sm.taskStore)
 
 	// 注册 MCP 工具 (动态, 对应 TS: assembleToolPool + refreshTools)
 	if sm.mcpMgr != nil {
@@ -225,7 +227,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 //  5. 返回合并后的结果
 func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
 	nestedReg := tool.NewRegistry()
-	builtin.RegisterBaseTools(nestedReg)
+	builtin.RegisterBaseToolsWithStore(nestedReg, sm.taskStore)
 	if sm.mcpMgr != nil {
 		sm.mcpMgr.RefreshToolsForRegistry(nestedReg)
 	}
@@ -445,7 +447,7 @@ type sessionAgentRunner struct {
 // Execute 执行 agent 任务 (创建独立 QueryEngine)
 func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
 	nestedReg := tool.NewRegistry()
-	builtin.RegisterBaseTools(nestedReg)
+	builtin.RegisterBaseToolsWithStore(nestedReg, r.sm.taskStore)
 	if r.sm.mcpMgr != nil {
 		r.sm.mcpMgr.RefreshToolsForRegistry(nestedReg)
 	}
