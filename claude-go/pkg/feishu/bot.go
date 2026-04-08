@@ -15,7 +15,11 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/dreaming"
+	"github.com/anthropic/claude-go/pkg/dynmcp"
+	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/mcp"
+	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -43,13 +47,16 @@ const (
 //   - 群聊中默认仅响应 @机器人 的消息
 //   - 支持 /clear 和 /help 等斜杠命令
 type Bot struct {
-	config    *BotConfig
-	client    *lark.Client       // 飞书 API 客户端 (用于发送消息)
-	wsClient  *larkws.Client     // WebSocket 长连接客户端
-	sessions  *SessionManager    // 会话管理器
-	apiClient *api.Client        // AI API 客户端
-	mcpConns  []*mcp.Connection  // 共享的 MCP 连接 (进程级别)
-	startTime time.Time          // 启动时间
+	config     *BotConfig
+	client     *lark.Client       // 飞书 API 客户端 (用于发送消息)
+	wsClient   *larkws.Client     // WebSocket 长连接客户端
+	sessions   *SessionManager    // 会话管理器
+	apiClient  *api.Client        // AI API 客户端
+	mcpMgr     *dynmcp.Manager    // 动态 MCP 管理器 (进程级别共享)
+	skillReg   *skills.Registry   // 技能注册表 (进程级别共享)
+	dreamer    *dreaming.Dreamer  // Dreaming 记忆整理引擎
+	cfgWatcher *hotreload.Watcher // 配置热加载监控器
+	startTime  time.Time          // 启动时间
 }
 
 // NewBot 创建飞书机器人。
@@ -99,13 +106,27 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		startTime: time.Now(),
 	}
 
-	// 连接 MCP 服务器 (进程级别, 共享给所有 session)
-	// 对应 TS: getMcpToolsCommandsAndResources() → connectToServer() (memoized)
-	mcpConns, hookConfigs := bot.initMCPAndHooks(config)
-	bot.mcpConns = mcpConns
+	// 1. 初始化动态 MCP 管理器 (进程级别共享)
+	bot.mcpMgr = dynmcp.NewManager()
+	bot.initMCPServers(config)
 
-	// 创建会话管理器 (传入共享的 MCP 连接)
-	bot.sessions = NewSessionManager(config, aiClient, mcpConns, hookConfigs)
+	// 2. 初始化 Skills 注册表 (进程级别共享)
+	bot.skillReg = skills.NewRegistry()
+	bot.initSkills(config)
+
+	// 3. 初始化 Dreaming 引擎
+	bot.initDreaming(config)
+
+	// 4. 解析 Hook 配置
+	hookConfigs := bot.parseHookConfigs(config)
+
+	// 5. 创建会话管理器 (传入共享组件)
+	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, hookConfigs)
+
+	// 6. 启动配置热加载 (如果有配置文件)
+	if config.MCPConfigPath != "" {
+		bot.startConfigWatcher(config.MCPConfigPath)
+	}
 
 	// 注册飞书事件处理器
 	// dispatcher.NewEventDispatcher 的两个参数(verificationToken, encryptKey)
@@ -135,78 +156,121 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	return bot, nil
 }
 
-// initMCPAndHooks 初始化 MCP 连接和 Hook 配置。
-// 对应 TS: main.tsx 中的 getMcpToolsCommandsAndResources() 调用链
-//
-// MCP 连接来源:
-//  1. BotConfig.MCPConfigPath 指向的 JSON 配置文件 (mcpServers 段)
-//  2. JSON config 中的 mcpServers 段 (已由 LoadJSONConfig 解析)
-//
-// 所有 MCP 连接在 Bot 启动时建立, 进程级别共享给所有 session。
-// 对应 TS 中 connectToServer 的 memoize 行为。
-func (b *Bot) initMCPAndHooks(config *BotConfig) ([]*mcp.Connection, []types.HookConfig) {
-	var mcpConns []*mcp.Connection
-	var hookConfigs []types.HookConfig
+// initMCPServers 通过动态 MCP 管理器初始化所有 MCP 连接。
+func (b *Bot) initMCPServers(config *BotConfig) {
+	ctx := context.Background()
 
-	// 从 MCPConfigPath 加载 MCP 服务器配置
+	// 从 MCPConfigPath 加载
 	if config.MCPConfigPath != "" {
 		configs, err := mcp.LoadServerConfigsFromFile(config.MCPConfigPath)
 		if err != nil {
 			log.Printf("[飞书Bot] 加载 MCP 配置失败 (%s): %v", config.MCPConfigPath, err)
 		} else {
-			mcpClient := mcp.NewClient()
-			ctx := context.Background()
-			for _, sc := range configs {
-				conn, err := mcpClient.Connect(ctx, sc)
-				if err != nil {
-					log.Printf("[飞书Bot] MCP 连接失败 (%s): %v", sc.Name, err)
-					continue
-				}
-				mcpConns = append(mcpConns, conn)
-				log.Printf("[飞书Bot] MCP 已连接: %s (%d 个工具)", sc.Name, len(conn.Tools))
+			b.mcpMgr.InitFromConfigs(ctx, configs)
+		}
+	}
+
+	// 从内联 MCPServers 加载
+	for name, entry := range config.MCPServers {
+		sc := mcp.ServerConfig{
+			Name: name, Transport: entry.Transport,
+			Command: entry.Command, Args: entry.Args,
+			URL: entry.URL, Env: entry.Env,
+		}
+		if sc.Transport == "" {
+			sc.Transport = "stdio"
+		}
+		if err := b.mcpMgr.AddServer(ctx, sc); err != nil {
+			log.Printf("[飞书Bot] MCP 连接失败 (%s): %v", name, err)
+		}
+	}
+}
+
+// initSkills 加载技能
+func (b *Bot) initSkills(config *BotConfig) {
+	loaded := b.skillReg.LoadDefaults(config.Cwd)
+	if len(config.SkillDirs) > 0 {
+		loaded += b.skillReg.LoadFromDirs(config.SkillDirs, "config")
+	}
+	if loaded > 0 {
+		log.Printf("[飞书Bot] Skills: 已加载 %d 个技能", loaded)
+	}
+}
+
+// initDreaming 初始化 Dreaming 引擎
+func (b *Bot) initDreaming(config *BotConfig) {
+	dreamCfg := dreaming.DefaultDreamConfig()
+	dreamCfg.Enabled = config.DreamEnabled
+	if config.DreamMinHours > 0 {
+		dreamCfg.MinHours = config.DreamMinHours
+	}
+	if config.DreamMinSessions > 0 {
+		dreamCfg.MinSessions = config.DreamMinSessions
+	}
+	dreamCfg.MemoryDir = config.Cwd + "/.claude/memory"
+	b.dreamer = dreaming.NewDreamer(dreamCfg, config.Cwd)
+}
+
+// parseHookConfigs 解析 Hook 配置
+func (b *Bot) parseHookConfigs(config *BotConfig) []types.HookConfig {
+	var hookConfigs []types.HookConfig
+	for _, h := range config.Hooks {
+		hookConfigs = append(hookConfigs, types.HookConfig{
+			Event: types.HookEvent(h.Event), Command: h.Command,
+			Timeout: h.Timeout, If: h.If,
+		})
+	}
+	return hookConfigs
+}
+
+// startConfigWatcher 启动配置文件热加载监控
+func (b *Bot) startConfigWatcher(configPath string) {
+	b.cfgWatcher = hotreload.NewWatcher(configPath, 5*time.Second)
+	b.cfgWatcher.OnChange(func(path string) {
+		log.Printf("[HotReload] 配置文件变更: %s", path)
+		b.reloadConfig(path)
+	})
+	b.cfgWatcher.Start()
+}
+
+// reloadConfig 热加载配置文件。
+// 重新加载 MCP 连接和技能，但不重启飞书 WebSocket。
+func (b *Bot) reloadConfig(path string) {
+	configs, err := mcp.LoadServerConfigsFromFile(path)
+	if err != nil {
+		log.Printf("[HotReload] MCP 配置解析失败: %v", err)
+		return
+	}
+
+	ctx := context.Background()
+
+	// 比较当前连接和新配置，增删差异
+	currentServers := make(map[string]bool)
+	for _, info := range b.mcpMgr.ListServers() {
+		currentServers[info.Name] = true
+	}
+
+	newServers := make(map[string]bool)
+	for _, cfg := range configs {
+		newServers[cfg.Name] = true
+		if !currentServers[cfg.Name] {
+			if err := b.mcpMgr.AddServer(ctx, cfg); err != nil {
+				log.Printf("[HotReload] 添加 MCP %s 失败: %v", cfg.Name, err)
 			}
 		}
 	}
 
-	// 从 BotConfig.MCPServers 加载 (来自 JSON config)
-	if len(config.MCPServers) > 0 {
-		mcpClient := mcp.NewClient()
-		ctx := context.Background()
-		for name, entry := range config.MCPServers {
-			sc := mcp.ServerConfig{
-				Name:      name,
-				Transport: entry.Transport,
-				Command:   entry.Command,
-				Args:      entry.Args,
-				URL:       entry.URL,
-				Env:       entry.Env,
-			}
-			if sc.Transport == "" {
-				sc.Transport = "stdio"
-			}
-			conn, err := mcpClient.Connect(ctx, sc)
-			if err != nil {
-				log.Printf("[飞书Bot] MCP 连接失败 (%s): %v", name, err)
-				continue
-			}
-			mcpConns = append(mcpConns, conn)
-			log.Printf("[飞书Bot] MCP 已连接: %s (%d 个工具)", name, len(conn.Tools))
+	for name := range currentServers {
+		if !newServers[name] {
+			b.mcpMgr.RemoveServer(name)
 		}
 	}
 
-	// 解析 Hook 配置 (将 HookEntry → types.HookConfig)
-	if len(config.Hooks) > 0 {
-		for _, h := range config.Hooks {
-			hookConfigs = append(hookConfigs, types.HookConfig{
-				Event:   types.HookEvent(h.Event),
-				Command: h.Command,
-				Timeout: h.Timeout,
-				If:      h.If,
-			})
-		}
+	// 重新加载技能
+	reloaded := b.skillReg.Reload()
+	if reloaded > 0 {
+		log.Printf("[HotReload] 重新加载 %d 个技能", reloaded)
 	}
-
-	return mcpConns, hookConfigs
 }
 
 // Start 启动飞书机器人 (阻塞)。
@@ -219,23 +283,29 @@ func (b *Bot) Start(ctx context.Context) error {
 	log.Printf("[飞书Bot] 工作目录: %s", b.config.Cwd)
 	log.Printf("[飞书Bot] 会话超时: %v, 最大会话数: %d",
 		b.config.SessionTimeout, b.config.MaxSessions)
-	if len(b.mcpConns) > 0 {
-		log.Printf("[飞书Bot] MCP 服务器: %d 个连接", len(b.mcpConns))
-		for _, conn := range b.mcpConns {
-			log.Printf("[飞书Bot]   - %s: %d 个工具, 状态=%s", conn.Config.Name, len(conn.Tools), conn.Status)
+	servers := b.mcpMgr.ListServers()
+	if len(servers) > 0 {
+		log.Printf("[飞书Bot] MCP 服务器: %d 个连接", len(servers))
+		for _, s := range servers {
+			log.Printf("[飞书Bot]   - %s: %d 个工具, 状态=%s", s.Name, s.ToolCount, s.Status)
 		}
+	}
+	if b.skillReg.Count() > 0 {
+		log.Printf("[飞书Bot] Skills: %d 个已加载", b.skillReg.Count())
+	}
+	if b.dreamer != nil && b.config.DreamEnabled {
+		log.Printf("[飞书Bot] Dreaming: 已启用")
 	}
 
 	return b.wsClient.Start(ctx)
 }
 
-// Shutdown 关闭 MCP 连接并清理资源
+// Shutdown 关闭所有资源
 func (b *Bot) Shutdown() {
-	for _, conn := range b.mcpConns {
-		if err := conn.Close(); err != nil {
-			log.Printf("[飞书Bot] 关闭 MCP 连接失败 (%s): %v", conn.Config.Name, err)
-		}
+	if b.cfgWatcher != nil {
+		b.cfgWatcher.Stop()
 	}
+	b.mcpMgr.Shutdown()
 }
 
 // onMessageReceive 处理飞书消息接收事件。
@@ -338,11 +408,24 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- 编写和分析代码\n" +
 			"- 执行 Shell 命令\n" +
 			"- 读写和编辑文件\n" +
-			"- 搜索代码库\n\n" +
-			"**命令:**\n" +
+			"- 搜索代码库\n" +
+			"- 调用 MCP 工具\n\n" +
+			"**基础命令:**\n" +
 			"- /clear - 清除对话历史\n" +
 			"- /help - 显示此帮助\n" +
-			"- /status - 查看运行状态"
+			"- /status - 查看运行状态\n" +
+			"- /reload - 热加载配置\n\n" +
+			"**MCP 管理:**\n" +
+			"- /mcp list - 列出 MCP 服务器\n" +
+			"- /mcp add <名称> <命令> [参数] - 动态添加\n" +
+			"- /mcp remove <名称> - 动态移除\n\n" +
+			"**技能管理:**\n" +
+			"- /skill list - 列出已加载技能\n" +
+			"- /skill install <名称> - 创建技能模板\n" +
+			"- /skill uninstall <名称> - 卸载技能\n" +
+			"- /skill reload - 重新加载技能\n\n" +
+			"**Dreaming:**\n" +
+			"- /dream - 手动触发记忆整理"
 		b.sendTextReply(ctx, messageID, help)
 		return true
 
@@ -350,14 +433,24 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 		total, active := b.sessions.Stats()
 		uptime := time.Since(b.startTime).Round(time.Second)
 		mcpInfo := "无"
-		if len(b.mcpConns) > 0 {
+		servers := b.mcpMgr.ListServers()
+		if len(servers) > 0 {
 			var mcpNames []string
 			totalTools := 0
-			for _, conn := range b.mcpConns {
-				mcpNames = append(mcpNames, fmt.Sprintf("%s(%d)", conn.Config.Name, len(conn.Tools)))
-				totalTools += len(conn.Tools)
+			for _, s := range servers {
+				mcpNames = append(mcpNames, fmt.Sprintf("%s(%d)", s.Name, s.ToolCount))
+				totalTools += s.ToolCount
 			}
-			mcpInfo = fmt.Sprintf("%d 个服务器, %d 个工具\n  %s", len(b.mcpConns), totalTools, strings.Join(mcpNames, ", "))
+			mcpInfo = fmt.Sprintf("%d 个服务器, %d 个工具\n  %s", len(servers), totalTools, strings.Join(mcpNames, ", "))
+		}
+		skillInfo := fmt.Sprintf("%d 个已加载", b.skillReg.Count())
+		dreamInfo := "未启用"
+		if b.dreamer != nil {
+			ds := b.dreamer.Stats()
+			if ds.Enabled {
+				dreamInfo = fmt.Sprintf("已启用 (上次: %s, 待整理会话: %d, 正在整理: %v)",
+					formatTimeSince(ds.LastDreamTime), ds.SessionsSinceDream, ds.IsDreaming)
+			}
 		}
 		status := fmt.Sprintf("**运行状态**\n"+
 			"- 运行时长: %v\n"+
@@ -365,13 +458,197 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- 活跃处理: %d\n"+
 			"- AI 模型: %s\n"+
 			"- MCP: %s\n"+
+			"- Skills: %s\n"+
+			"- Dreaming: %s\n"+
 			"- 工作目录: %s",
-			uptime, total, active, b.config.Model, mcpInfo, b.config.Cwd)
+			uptime, total, active, b.config.Model, mcpInfo, skillInfo, dreamInfo, b.config.Cwd)
 		b.sendTextReply(ctx, messageID, status)
+		return true
+
+	case strings.HasPrefix(lower, "/mcp"):
+		b.handleMCPCommand(ctx, chatID, messageID, text)
+		return true
+
+	case strings.HasPrefix(lower, "/skill"):
+		b.handleSkillCommand(ctx, chatID, messageID, text)
+		return true
+
+	case lower == "/dream":
+		b.handleDreamCommand(ctx, messageID)
+		return true
+
+	case lower == "/reload":
+		if b.cfgWatcher != nil {
+			b.cfgWatcher.ForceReload()
+			b.sendTextReply(ctx, messageID, "配置已重新加载。")
+		} else {
+			b.sendTextReply(ctx, messageID, "未配置热加载 (启动时无 --config 参数)。")
+		}
 		return true
 	}
 
 	return false
+}
+
+// handleMCPCommand 处理 /mcp 命令
+// 支持: /mcp list, /mcp add <name> <command> [args...], /mcp remove <name>
+func (b *Bot) handleMCPCommand(ctx context.Context, chatID, messageID, text string) {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		b.sendTextReply(ctx, messageID, "/mcp list - 列出 MCP 服务器\n/mcp add <name> <command> [args] - 添加\n/mcp remove <name> - 移除")
+		return
+	}
+
+	sub := strings.ToLower(parts[1])
+	switch sub {
+	case "list":
+		servers := b.mcpMgr.ListServers()
+		if len(servers) == 0 {
+			b.sendTextReply(ctx, messageID, "无活跃 MCP 服务器。")
+			return
+		}
+		var sb strings.Builder
+		sb.WriteString("**MCP 服务器列表:**\n")
+		for _, s := range servers {
+			sb.WriteString(fmt.Sprintf("- **%s** [%s] %d 个工具: %s\n", s.Name, s.Status, s.ToolCount, strings.Join(s.Tools, ", ")))
+		}
+		b.sendTextReply(ctx, messageID, sb.String())
+
+	case "add":
+		if len(parts) < 4 {
+			b.sendTextReply(ctx, messageID, "用法: /mcp add <name> <command> [args...]")
+			return
+		}
+		name := parts[2]
+		cmd := parts[3]
+		args := parts[4:]
+		cfg := mcp.ServerConfig{Name: name, Transport: "stdio", Command: cmd, Args: args}
+		if err := b.mcpMgr.AddServer(context.Background(), cfg); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("添加失败: %v", err))
+		} else {
+			s := b.mcpMgr.ListServers()
+			for _, si := range s {
+				if si.Name == name {
+					b.sendTextReply(ctx, messageID, fmt.Sprintf("已添加 MCP: %s (%d 个工具)", name, si.ToolCount))
+					return
+				}
+			}
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("已添加 MCP: %s", name))
+		}
+
+	case "remove":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /mcp remove <name>")
+			return
+		}
+		name := parts[2]
+		if err := b.mcpMgr.RemoveServer(name); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("移除失败: %v", err))
+		} else {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("已移除 MCP: %s", name))
+		}
+
+	default:
+		b.sendTextReply(ctx, messageID, "未知 /mcp 子命令。用法: /mcp [list|add|remove]")
+	}
+}
+
+// handleSkillCommand 处理 /skill 命令
+// 支持: /skill list, /skill install <name> <content>, /skill uninstall <name>, /skill reload
+func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text string) {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		b.sendTextReply(ctx, messageID, "/skill list - 列出技能\n/skill reload - 重载技能\n/skill install <name> - 安装\n/skill uninstall <name> - 卸载")
+		return
+	}
+
+	sub := strings.ToLower(parts[1])
+	switch sub {
+	case "list":
+		allSkills := b.skillReg.All()
+		if len(allSkills) == 0 {
+			b.sendTextReply(ctx, messageID, "无已加载技能。在 .claude/skills/<name>/SKILL.md 中添加。")
+			return
+		}
+		var sb strings.Builder
+		sb.WriteString("**已加载技能:**\n")
+		for _, s := range allSkills {
+			sb.WriteString(fmt.Sprintf("- **%s**: %s (来源: %s)\n", s.Name, s.Description, s.LoadedFrom))
+		}
+		b.sendTextReply(ctx, messageID, sb.String())
+
+	case "reload":
+		count := b.skillReg.Reload()
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("已重载 %d 个技能。", count))
+
+	case "install":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /skill install <name>\n(在 .claude/skills/<name>/SKILL.md 中创建文件)")
+			return
+		}
+		name := parts[2]
+		baseDir := b.config.Cwd + "/.claude/skills"
+		defaultContent := fmt.Sprintf("---\nname: %s\ndescription: (描述你的技能)\nwhen_to_use: (何时使用)\n---\n# %s\n\n(技能内容)\n", name, name)
+		if err := skills.InstallSkill(baseDir, name, defaultContent); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("安装失败: %v", err))
+		} else {
+			b.skillReg.Reload()
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("已创建技能模板: .claude/skills/%s/SKILL.md\n请编辑内容后发送 /skill reload。", name))
+		}
+
+	case "uninstall":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /skill uninstall <name>")
+			return
+		}
+		name := parts[2]
+		baseDir := b.config.Cwd + "/.claude/skills"
+		if err := skills.UninstallSkill(baseDir, name); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("卸载失败: %v", err))
+		} else {
+			b.skillReg.Unregister(name)
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("已卸载技能: %s", name))
+		}
+
+	default:
+		b.sendTextReply(ctx, messageID, "未知 /skill 子命令。用法: /skill [list|reload|install|uninstall]")
+	}
+}
+
+// handleDreamCommand 处理 /dream 命令
+func (b *Bot) handleDreamCommand(ctx context.Context, messageID string) {
+	if b.dreamer == nil {
+		b.sendTextReply(ctx, messageID, "Dreaming 未启用。在配置中设置 dreaming.enabled=true。")
+		return
+	}
+	stats := b.dreamer.Stats()
+	if stats.IsDreaming {
+		b.sendTextReply(ctx, messageID, "正在进行记忆整理中...")
+		return
+	}
+	if err := b.dreamer.ForceDream(context.Background()); err != nil {
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("触发 Dreaming 失败: %v", err))
+	} else {
+		b.sendTextReply(ctx, messageID, "已触发记忆整理 (后台执行)。")
+	}
+}
+
+// formatTimeSince 格式化距今时间
+func formatTimeSince(t time.Time) string {
+	if t.IsZero() {
+		return "从未"
+	}
+	d := time.Since(t)
+	if d < time.Minute {
+		return "刚才"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%d 分钟前", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%.1f 小时前", d.Hours())
+	}
+	return fmt.Sprintf("%.1f 天前", d.Hours()/24)
 }
 
 // processAndReply 异步处理消息并发送回复。

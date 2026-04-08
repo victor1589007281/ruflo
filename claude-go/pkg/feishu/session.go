@@ -9,11 +9,13 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
+	"github.com/anthropic/claude-go/pkg/dreaming"
+	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/hooks"
-	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
+	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -76,17 +78,19 @@ type SessionManager struct {
 	apiClient      *api.Client
 	maxSessions    int
 	sessionTimeout time.Duration
-	// mcpConns 进程级别共享的 MCP 连接 (Bot 启动时建立)
-	// 对应 TS: AppState.mcp.clients — 所有 session/agent 共享同一组连接
-	mcpConns       []*mcp.Connection
-	// hookConfigs hook 配置 (从 JSON config 加载)
+	// mcpMgr 动态 MCP 管理器 (进程级别共享)
+	mcpMgr         *dynmcp.Manager
+	// skillReg 技能注册表 (进程级别共享)
+	skillReg       *skills.Registry
+	// dreamer 记忆整理引擎
+	dreamer        *dreaming.Dreamer
+	// hookConfigs hook 配置
 	hookConfigs    []types.HookConfig
 }
 
 // NewSessionManager 创建会话管理器。
-// mcpConns 是 Bot 启动时建立的 MCP 连接，所有 session 共享。
-// hookConfigs 是从 JSON config 加载的 hook 配置。
-func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpConns []*mcp.Connection, hookConfigs []types.HookConfig) *SessionManager {
+// 所有共享组件 (mcpMgr, skillReg, dreamer) 由 Bot 创建并传入。
+func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, hookConfigs []types.HookConfig) *SessionManager {
 	maxSessions := config.MaxSessions
 	if maxSessions <= 0 {
 		maxSessions = 100
@@ -102,7 +106,9 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpConns []*mcp
 		apiClient:      apiClient,
 		maxSessions:    maxSessions,
 		sessionTimeout: timeout,
-		mcpConns:       mcpConns,
+		mcpMgr:         mcpMgr,
+		skillReg:       skillReg,
+		dreamer:        dreamer,
 		hookConfigs:    hookConfigs,
 	}
 
@@ -153,10 +159,14 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	reg := tool.NewRegistry()
 	builtin.RegisterBaseTools(reg)
 
-	// 注册 MCP 工具 (对应 TS: assembleToolPool 中合并 mcpTools)
-	// MCP 连接在 Bot 启动时建立并共享给所有 session
-	if len(sm.mcpConns) > 0 {
-		mcp.RegisterMCPTools(reg, sm.mcpConns)
+	// 注册 MCP 工具 (动态, 对应 TS: assembleToolPool + refreshTools)
+	if sm.mcpMgr != nil {
+		sm.mcpMgr.RefreshToolsForRegistry(reg)
+	}
+
+	// 注册 Skill 工具 (如果有已加载技能)
+	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
+		reg.Register(skills.NewSkillTool(sm.skillReg))
 	}
 
 	permMode := types.PermissionMode(sm.config.PermissionMode)
@@ -213,8 +223,11 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
 	nestedReg := tool.NewRegistry()
 	builtin.RegisterBaseTools(nestedReg)
-	if len(sm.mcpConns) > 0 {
-		mcp.RegisterMCPTools(nestedReg, sm.mcpConns)
+	if sm.mcpMgr != nil {
+		sm.mcpMgr.RefreshToolsForRegistry(nestedReg)
+	}
+	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
+		nestedReg.Register(skills.NewSkillTool(sm.skillReg))
 	}
 	nestedReg.Register(agent.NewAgentTool(runAgentFn))
 
@@ -357,7 +370,25 @@ func (sm *SessionManager) ProcessMessage(ctx context.Context, chatID, userText s
 		response = "(无回复内容)"
 	}
 
+	// 触发 Dreaming 检查 (对应 TS: stopHooks.ts → executeAutoDream)
+	if sm.dreamer != nil {
+		sm.dreamer.RecordSession(dreaming.SessionRecord{
+			ChatID:  chatID,
+			EndTime: time.Now(),
+			Summary: truncateForDream(response),
+		})
+		sm.dreamer.AfterQuery(ctx)
+	}
+
 	return response, nil
+}
+
+// truncateForDream 截断响应用于 Dreaming 记录
+func truncateForDream(s string) string {
+	if len(s) > 500 {
+		return s[:500] + "..."
+	}
+	return s
 }
 
 // extractMessageText 从 Message 中提取文本内容

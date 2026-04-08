@@ -102,6 +102,18 @@ type BotConfig struct {
 
 	// Hooks Hook 配置 (从 JSON config 加载)
 	Hooks []HookEntry
+
+	// SkillDirs 额外的 Skills 目录 (除默认的 .claude/skills/)
+	SkillDirs []string
+
+	// DreamEnabled 是否启用 Dreaming 记忆整理
+	DreamEnabled bool
+
+	// DreamMinHours 距上次整理的最小间隔 (小时, 默认 24)
+	DreamMinHours int
+
+	// DreamMinSessions 触发整理所需的最小会话数 (默认 5)
+	DreamMinSessions int
 }
 
 // DefaultBotConfig 返回默认配置
@@ -223,6 +235,24 @@ type JSONConfig struct {
 
 	// Debug 调试模式
 	Debug bool `json:"debug,omitempty"`
+
+	// Skills 技能配置
+	Skills *SkillsSection `json:"skills,omitempty"`
+
+	// Dreaming 记忆整理配置
+	Dreaming *DreamingSection `json:"dreaming,omitempty"`
+}
+
+// SkillsSection 技能配置段
+type SkillsSection struct {
+	Dirs []string `json:"dirs,omitempty"` // 额外技能目录
+}
+
+// DreamingSection Dreaming 配置段
+type DreamingSection struct {
+	Enabled     *bool `json:"enabled,omitempty"`
+	MinHours    int   `json:"minHours,omitempty"`
+	MinSessions int   `json:"minSessions,omitempty"`
 }
 
 // FeishuSection 飞书配置段
@@ -370,5 +400,23 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 	}
 	if jc.Debug {
 		bc.Debug = true
+	}
+
+	if jc.Skills != nil {
+		if len(jc.Skills.Dirs) > 0 {
+			bc.SkillDirs = append(bc.SkillDirs, jc.Skills.Dirs...)
+		}
+	}
+
+	if jc.Dreaming != nil {
+		if jc.Dreaming.Enabled != nil {
+			bc.DreamEnabled = *jc.Dreaming.Enabled
+		}
+		if jc.Dreaming.MinHours > 0 {
+			bc.DreamMinHours = jc.Dreaming.MinHours
+		}
+		if jc.Dreaming.MinSessions > 0 {
+			bc.DreamMinSessions = jc.Dreaming.MinSessions
+		}
 	}
 }
