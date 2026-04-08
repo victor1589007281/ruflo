@@ -1,0 +1,81 @@
+// filewrite.go 实现 FileWrite 工具 (写入/非并发安全)。
+// 对应 TS 源码: review/claude/src/tools/FileWriteTool/FileWriteTool.ts
+//
+// 功能:
+//   - 将内容写入指定路径 (覆盖或创建新文件)
+//   - 自动创建父目录
+//   - 返回写入的字节数
+package builtin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/anthropic/claude-go/pkg/tool"
+	"github.com/anthropic/claude-go/pkg/types"
+)
+
+const FileWriteToolName = "Write"
+
+type fileWriteInput struct {
+	Path     string `json:"path"`
+	Contents string `json:"contents"`
+}
+
+type FileWriteTool struct{}
+
+func NewFileWriteTool() *FileWriteTool { return &FileWriteTool{} }
+
+func (t *FileWriteTool) Name() string { return FileWriteToolName }
+
+func (t *FileWriteTool) Description() string {
+	return `Writes a file to the local filesystem. This tool will overwrite the existing file if there is one at the provided path.`
+}
+
+func (t *FileWriteTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"path": {"type": "string", "description": "The absolute path to the file to write."},
+			"contents": {"type": "string", "description": "The contents to write to the file."}
+		},
+		"required": ["path", "contents"]
+	}`)
+}
+
+func (t *FileWriteTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *FileWriteTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+
+func (t *FileWriteTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
+	if tctx.PermissionMode == types.PermissionModePlan {
+		return &types.PermissionResult{
+			Behavior: types.PermissionDeny,
+			Reason:   "Plan mode: 写入操作不可用",
+		}
+	}
+	return nil
+}
+
+// Call 执行文件写入。
+// 对应 TS: FileWriteTool.ts 中的 call()
+func (t *FileWriteTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
+	var in fileWriteInput
+	if err := json.Unmarshal(input, &in); err != nil {
+		return &tool.ToolResult{Content: fmt.Sprintf("输入解析错误: %v", err), IsError: true}, nil
+	}
+
+	filePath := expandPath(in.Path, tctx.Cwd)
+
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		return &tool.ToolResult{Content: fmt.Sprintf("创建目录失败: %v", err), IsError: true}, nil
+	}
+
+	if err := os.WriteFile(filePath, []byte(in.Contents), 0o644); err != nil {
+		return &tool.ToolResult{Content: fmt.Sprintf("写入文件失败: %v", err), IsError: true}, nil
+	}
+
+	return &tool.ToolResult{Content: fmt.Sprintf("Successfully wrote %d bytes to %s", len(in.Contents), filePath)}, nil
+}
