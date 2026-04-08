@@ -19,6 +19,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/mcp"
+	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -52,11 +53,12 @@ type Bot struct {
 	wsClient   *larkws.Client     // WebSocket 长连接客户端
 	sessions   *SessionManager    // 会话管理器
 	apiClient  *api.Client        // AI API 客户端
-	mcpMgr     *dynmcp.Manager    // 动态 MCP 管理器 (进程级别共享)
-	skillReg   *skills.Registry   // 技能注册表 (进程级别共享)
-	dreamer    *dreaming.Dreamer  // Dreaming 记忆整理引擎
-	cfgWatcher *hotreload.Watcher // 配置热加载监控器
-	startTime  time.Time          // 启动时间
+	mcpMgr      *dynmcp.Manager     // 动态 MCP 管理器 (进程级别共享)
+	skillReg    *skills.Registry    // 技能注册表 (进程级别共享)
+	dreamer     *dreaming.Dreamer   // Dreaming 记忆整理引擎
+	memStore    *memory.TieredStore // 多层记忆存储 (进程级别共享)
+	cfgWatcher  *hotreload.Watcher  // 配置热加载监控器
+	startTime   time.Time           // 启动时间
 }
 
 // NewBot 创建飞书机器人。
@@ -117,11 +119,14 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 3. 初始化 Dreaming 引擎
 	bot.initDreaming(config)
 
-	// 4. 解析 Hook 配置
+	// 4. 初始化多层记忆存储
+	bot.memStore = memory.NewTieredStore()
+
+	// 5. 解析 Hook 配置
 	hookConfigs := bot.parseHookConfigs(config)
 
-	// 5. 创建会话管理器 (传入共享组件)
-	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, hookConfigs)
+	// 6. 创建会话管理器 (传入共享组件)
+	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs)
 
 	// 6. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {
@@ -207,8 +212,16 @@ func (b *Bot) initDreaming(config *BotConfig) {
 	if config.DreamMinSessions > 0 {
 		dreamCfg.MinSessions = config.DreamMinSessions
 	}
+	if config.DreamConsolidateMode != "" {
+		dreamCfg.ConsolidateMode = config.DreamConsolidateMode
+	}
 	dreamCfg.MemoryDir = config.Cwd + "/.claude/memory"
 	b.dreamer = dreaming.NewDreamer(dreamCfg, config.Cwd)
+
+	// 注入 LLM API 客户端 (用于 LLM 模式整理)
+	if dreamCfg.ConsolidateMode == "llm" {
+		b.dreamer.SetAPIClient(b.apiClient)
+	}
 }
 
 // parseHookConfigs 解析 Hook 配置

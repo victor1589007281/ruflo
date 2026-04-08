@@ -30,6 +30,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/hooks"
+	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/tool"
@@ -51,15 +52,16 @@ const (
 //   resultCh := engine.SubmitMessage(ctx, userMessage)
 //   for msg := range resultCh { ... }
 type QueryEngine struct {
-	Config     *Config
-	Messages   []types.Message
-	Tools      *tool.Registry
-	APIClient  *api.Client
-	HookRunner *hooks.Runner
+	Config      *Config
+	Messages    []types.Message
+	Tools       *tool.Registry
+	APIClient   *api.Client
+	HookRunner  *hooks.Runner
 	PermChecker *permissions.Checker
-	Compactor  *compact.Compactor
-	PromptMgr  *prompt.Manager
-	mu         sync.Mutex
+	Compactor   *compact.Compactor
+	PromptMgr   *prompt.Manager
+	MemoryStore *memory.TieredStore // 多层记忆存储 (可选, nil 则不启用)
+	mu          sync.Mutex
 }
 
 // Config 引擎配置
@@ -124,8 +126,16 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 
 	go func() {
 		defer close(ch)
-		terminal := e.queryLoop(ctx, messages, ch)
+		finalMsgs, terminal := e.queryLoop(ctx, messages, ch)
 		_ = terminal
+
+		// [BUG FIX] 将 queryLoop 中产生的完整对话历史 (包括 assistant 回复
+		// 和 tool 结果) 持久化回 e.Messages，否则下一次 SubmitMessage 会丢失
+		// 之前的 assistant/tool 消息。
+		// 对应 TS: QueryEngine 在 query.ts 结束后保存完整 messages 列表。
+		e.mu.Lock()
+		e.Messages = finalMsgs
+		e.mu.Unlock()
 	}()
 
 	return ch
@@ -161,7 +171,7 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 //     toolResults = runTools(toolUseBlocks, registry, context)
 //     messages = append(messages, assistantMsgs, toolResults)
 //   }
-func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message) types.Terminal {
+func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message) ([]types.Message, types.Terminal) {
 	turnCount := 0
 	currentModel := e.Config.Model
 	consecutiveErrors := 0 // 断路器: 连续错误计数
@@ -173,7 +183,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 对应 TS: queryLoop 顶部 if (abortController.signal.aborted)
 		// ============================================================
 		if ctx.Err() != nil {
-			return types.Terminal{Reason: "aborted"}
+			return messages, types.Terminal{Reason: "aborted"}
 		}
 
 		// ============================================================
@@ -183,6 +193,18 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		if e.Compactor != nil {
 			compacted, err := e.Compactor.AutoCompact(ctx, messages, currentModel)
 			if err == nil && compacted != nil {
+				// [NEW] 压缩前提取关键事实到 Episodic Memory
+				// 对应 TS: extractMemories 隐式在 compact 前运行
+				if e.MemoryStore != nil {
+					facts := compact.ExtractKeyFacts(messages[:len(messages)-4])
+					for _, fact := range facts {
+						e.MemoryStore.Add(&memory.MemoryEntry{
+							Content:    fact,
+							Source:     "pre_compact",
+							Importance: 0.7,
+						})
+					}
+				}
 				messages = compacted
 			}
 		}
@@ -199,6 +221,32 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// Phase 2: 组装系统提示词
 		// ============================================================
 		systemPrompt := e.PromptMgr.BuildEffectiveSystemPrompt(e.Tools)
+
+		// [NEW] 注入相关记忆到系统提示词
+		// 对应 TS: getRelevantMemoryAttachments → <system-reminder> 注入
+		if e.MemoryStore != nil && e.MemoryStore.Count() > 0 && len(messages) > 0 {
+			lastUserText := ""
+			for i := len(messages) - 1; i >= 0; i-- {
+				if messages[i].Type == types.MessageTypeUser {
+					for _, b := range messages[i].Content {
+						if b.Text != "" {
+							lastUserText = b.Text
+							break
+						}
+					}
+					break
+				}
+			}
+			if lastUserText != "" {
+				relevant := e.MemoryStore.Retrieve(lastUserText, 5)
+				if len(relevant) > 0 {
+					memPrompt := memory.FormatForPrompt(relevant)
+					if len(systemPrompt) > 0 {
+						systemPrompt[0] += "\n" + memPrompt
+					}
+				}
+			}
+		}
 
 		// ============================================================
 		// Phase 3: 调用模型 API (流式)
@@ -327,7 +375,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					CreatedAt:         time.Now(),
 				}
 				ch <- errMsg
-				return types.Terminal{Reason: "circuit_breaker", Error: streamErr}
+				return messages, types.Terminal{Reason: "circuit_breaker", Error: streamErr}
 			}
 
 			// Withheld error: 将错误作为 assistant 消息暂存, 继续循环等待恢复
@@ -351,7 +399,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				continue
 			}
 
-			return types.Terminal{Reason: "model_error", Error: streamErr}
+			return messages, types.Terminal{Reason: "model_error", Error: streamErr}
 		}
 
 		// 成功收到响应, 重置断路器
@@ -359,7 +407,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 
 		// 检查 context 是否被取消
 		if ctx.Err() != nil {
-			return types.Terminal{Reason: "aborted_streaming"}
+			return messages, types.Terminal{Reason: "aborted_streaming"}
 		}
 
 		// ============================================================
@@ -423,7 +471,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					continue
 				}
 			}
-			return types.Terminal{Reason: "completed"}
+			return messages, types.Terminal{Reason: "completed"}
 		}
 
 		// ============================================================
@@ -433,7 +481,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// maxTurns 检查 (在 tool 执行后检查, 对应 TS)
 		turnCount++
 		if e.Config.MaxTurns > 0 && turnCount > e.Config.MaxTurns {
-			return types.Terminal{Reason: "max_turns"}
+			return messages, types.Terminal{Reason: "max_turns"}
 		}
 
 		tctx := &tool.ToolContext{

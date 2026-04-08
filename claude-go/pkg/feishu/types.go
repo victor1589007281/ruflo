@@ -114,6 +114,9 @@ type BotConfig struct {
 
 	// DreamMinSessions 触发整理所需的最小会话数 (默认 5)
 	DreamMinSessions int
+
+	// DreamConsolidateMode 整理模式: "local" (默认) 或 "llm"
+	DreamConsolidateMode string
 }
 
 // DefaultBotConfig 返回默认配置
@@ -250,9 +253,10 @@ type SkillsSection struct {
 
 // DreamingSection Dreaming 配置段
 type DreamingSection struct {
-	Enabled     *bool `json:"enabled,omitempty"`
-	MinHours    int   `json:"minHours,omitempty"`
-	MinSessions int   `json:"minSessions,omitempty"`
+	Enabled          *bool  `json:"enabled,omitempty"`
+	MinHours         int    `json:"minHours,omitempty"`
+	MinSessions      int    `json:"minSessions,omitempty"`
+	ConsolidateMode  string `json:"consolidateMode,omitempty"` // "local" or "llm"
 }
 
 // FeishuSection 飞书配置段
@@ -417,6 +421,9 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		}
 		if jc.Dreaming.MinSessions > 0 {
 			bc.DreamMinSessions = jc.Dreaming.MinSessions
+		}
+		if jc.Dreaming.ConsolidateMode != "" {
+			bc.DreamConsolidateMode = jc.Dreaming.ConsolidateMode
 		}
 	}
 }

@@ -45,6 +45,9 @@ type Manager struct {
 	AgentPrompt       string // 代理定义的提示词
 	// HookConfigs 非空时在默认提示词中追加已配置 hooks 列表
 	HookConfigs []types.HookConfig
+	// DreamMemoryDir dream 记忆目录 (.claude/memory/)
+	// 非空时，加载 consolidated.md 和 index.md 到系统提示词
+	DreamMemoryDir string
 	// Model 当前主循环模型名 (可选，供环境块展示)
 	Model string
 	// ProductName 产品显示名 (空则默认 "Claude Code (Go)")
@@ -165,6 +168,18 @@ func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 		sb.WriteString(memoryPrompt)
 	}
 
+	// [NEW] Dream 长期记忆
+	// 对应 TS: getAutoMemoryContent → MEMORY.md 注入到 user context
+	if m.DreamMemoryDir != "" {
+		dreamContent := loadDreamMemories(m.DreamMemoryDir)
+		if dreamContent != "" {
+			sb.WriteString("<long_term_memory>\n")
+			sb.WriteString("The following is consolidated knowledge from past sessions:\n\n")
+			sb.WriteString(dreamContent)
+			sb.WriteString("</long_term_memory>\n\n")
+		}
+	}
+
 	return sb.String()
 }
 
@@ -270,6 +285,49 @@ func firstLine(s string) string {
 		return s[:idx]
 	}
 	return s
+}
+
+// loadDreamMemories 加载 dream 记忆文件
+// 优先读 consolidated.md (LLM 整理结果)，否则读所有 memory-*.md
+func loadDreamMemories(dir string) string {
+	// 优先读取 LLM 整理的结果
+	consolidated := filepath.Join(dir, "consolidated.md")
+	if data, err := os.ReadFile(consolidated); err == nil {
+		content := string(data)
+		if len(content) > 25000 {
+			content = content[:25000] + "\n...(truncated)"
+		}
+		return content
+	}
+
+	// 回退到读取 memory-*.md 文件
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	totalBytes := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") || entry.Name() == "index.md" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		if len(content) > 2000 {
+			content = content[:2000] + "..."
+		}
+		if totalBytes+len(content) > 25000 {
+			break
+		}
+		sb.WriteString(content)
+		sb.WriteString("\n\n")
+		totalBytes += len(content)
+	}
+	return sb.String()
 }
 
 // getGitBranch 获取当前 git 分支名

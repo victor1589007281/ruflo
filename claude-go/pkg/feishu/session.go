@@ -13,6 +13,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/hooks"
+	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/skills"
@@ -84,13 +85,15 @@ type SessionManager struct {
 	skillReg       *skills.Registry
 	// dreamer 记忆整理引擎
 	dreamer        *dreaming.Dreamer
+	// memoryStore 多层记忆存储 (进程级共享)
+	memoryStore    *memory.TieredStore
 	// hookConfigs hook 配置
 	hookConfigs    []types.HookConfig
 }
 
 // NewSessionManager 创建会话管理器。
-// 所有共享组件 (mcpMgr, skillReg, dreamer) 由 Bot 创建并传入。
-func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, hookConfigs []types.HookConfig) *SessionManager {
+// 所有共享组件由 Bot 创建并传入。
+func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, memStore *memory.TieredStore, hookConfigs []types.HookConfig) *SessionManager {
 	maxSessions := config.MaxSessions
 	if maxSessions <= 0 {
 		maxSessions = 100
@@ -109,6 +112,7 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 		mcpMgr:         mcpMgr,
 		skillReg:       skillReg,
 		dreamer:        dreamer,
+		memoryStore:    memStore,
 		hookConfigs:    hookConfigs,
 	}
 
@@ -183,6 +187,9 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	promptMgr.Model = sm.config.Model
 	promptMgr.ProductName = "Claude Code (Go) - Feishu Bot"
 	promptMgr.HookConfigs = sm.hookConfigs
+	if sm.dreamer != nil {
+		promptMgr.DreamMemoryDir = sm.dreamer.Stats().MemoryDir
+	}
 
 	cfg := &engine.Config{
 		Model:            sm.config.Model,
@@ -203,6 +210,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	reg.Register(agent.NewAgentTool(runAgentFn))
 
 	eng := engine.NewQueryEngine(cfg, sm.apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
+	eng.MemoryStore = sm.memoryStore
 
 	return &Session{
 		ChatID:     chatID,
@@ -370,6 +378,18 @@ func (sm *SessionManager) ProcessMessage(ctx context.Context, chatID, userText s
 		response = "(无回复内容)"
 	}
 
+	// [NEW] 提取关键事实到 Episodic Memory
+	// 对应 TS: extractMemories → 每轮 query 后自动提取
+	if sm.memoryStore != nil && response != "" && response != "(无回复内容)" {
+		sm.memoryStore.Add(&memory.MemoryEntry{
+			Content:    truncateForDream(response),
+			Source:     "extraction",
+			Importance: 0.6,
+			ChatID:     chatID,
+			Topics:     extractTopics(response),
+		})
+	}
+
 	// 触发 Dreaming 检查 (对应 TS: stopHooks.ts → executeAutoDream)
 	if sm.dreamer != nil {
 		sm.dreamer.RecordSession(dreaming.SessionRecord{
@@ -389,6 +409,29 @@ func truncateForDream(s string) string {
 		return s[:500] + "..."
 	}
 	return s
+}
+
+// extractTopics 从文本中提取主题关键词 (简单实现)
+func extractTopics(text string) []string {
+	keywords := map[string]bool{
+		"api": true, "database": true, "auth": true, "test": true,
+		"bug": true, "error": true, "config": true, "deploy": true,
+		"file": true, "function": true, "class": true, "module": true,
+		"security": true, "performance": true, "refactor": true,
+	}
+	lower := strings.ToLower(text)
+	var topics []string
+	seen := make(map[string]bool)
+	for word := range keywords {
+		if strings.Contains(lower, word) && !seen[word] {
+			topics = append(topics, word)
+			seen[word] = true
+		}
+	}
+	if len(topics) > 5 {
+		topics = topics[:5]
+	}
+	return topics
 }
 
 // extractMessageText 从 Message 中提取文本内容

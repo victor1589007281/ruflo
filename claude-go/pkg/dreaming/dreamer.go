@@ -36,6 +36,12 @@ import (
 	"time"
 )
 
+// LLMClient LLM API 客户端接口 (解耦 api.Client 依赖)
+type LLMClient interface {
+	// SimpleComplete 简单文本补全: 发送 prompt, 返回回复文本
+	SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+}
+
 // DreamConfig Dreaming 配置
 type DreamConfig struct {
 	// Enabled 是否启用 Dreaming
@@ -58,6 +64,16 @@ type DreamConfig struct {
 
 	// ConsolidationModel 整理使用的模型 (可选, 空则使用主模型)
 	ConsolidationModel string `json:"consolidationModel,omitempty"`
+
+	// ConsolidateMode 整理模式: "local" (纯文本去重) 或 "llm" (LLM 驱动)
+	// 默认 "local"; 设为 "llm" 需要配合 APIClient
+	ConsolidateMode string `json:"consolidateMode,omitempty"`
+
+	// APIBaseURL LLM API 基础地址 (ConsolidateMode="llm" 时必需)
+	APIBaseURL string `json:"apiBaseUrl,omitempty"`
+
+	// APIKey LLM API 密钥
+	APIKey string `json:"apiKey,omitempty"`
 }
 
 // DefaultDreamConfig 返回默认配置
@@ -100,8 +116,12 @@ type Dreamer struct {
 	lockFile          string
 
 	// ConsolidateFn 整理函数 (可注入, 用于测试或自定义整理逻辑)
-	// 如果为 nil, 使用默认的 localConsolidate
+	// 如果为 nil, 根据 config.ConsolidateMode 选择内置方法
 	ConsolidateFn func(ctx context.Context, sessions []SessionRecord, memoryDir string) error
+
+	// APIClient LLM API 客户端 (用于 LLM 模式整理)
+	// 通过 SetAPIClient 注入，避免循环依赖
+	APIClient LLMClient
 }
 
 // NewDreamer 创建 Dreamer 实例
@@ -127,6 +147,17 @@ func NewDreamer(config *DreamConfig, cwd string) *Dreamer {
 		cwd:      cwd,
 		lockFile: filepath.Join(config.MemoryDir, ".dream-lock"),
 	}
+}
+
+// SetConsolidateFn 设置自定义整理函数 (配置入口)。
+// 如果设置，将替代内置的 local/LLM 整理逻辑。
+func (d *Dreamer) SetConsolidateFn(fn func(ctx context.Context, sessions []SessionRecord, memoryDir string) error) {
+	d.ConsolidateFn = fn
+}
+
+// SetAPIClient 注入 LLM API 客户端 (用于 LLM 模式整理)
+func (d *Dreamer) SetAPIClient(client LLMClient) {
+	d.APIClient = client
 }
 
 // RecordSession 记录一个已完成的会话。
@@ -211,6 +242,8 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 	var err error
 	if d.ConsolidateFn != nil {
 		err = d.ConsolidateFn(ctx, sessions, d.config.MemoryDir)
+	} else if d.config.ConsolidateMode == "llm" && d.APIClient != nil {
+		err = d.llmConsolidate(ctx, sessions)
 	} else {
 		err = d.localConsolidate(ctx, sessions)
 	}
@@ -425,6 +458,108 @@ type DreamStats struct {
 	MemoryDir          string    `json:"memoryDir"`
 	MinHours           int       `json:"minHours"`
 	MinSessions        int       `json:"minSessions"`
+}
+
+// llmConsolidate LLM 驱动的记忆整理。
+// 对应 TS: consolidationPrompt.ts — buildConsolidationPrompt 的 4 阶段
+//
+// 向 LLM 发送整理指令，包含:
+//   - 现有记忆文件列表
+//   - 近期会话摘要
+//   - 4 阶段整理指令 (Orient → Gather → Consolidate → Prune)
+//
+// LLM 返回整理后的记忆文本，写入 memory/consolidated.md
+func (d *Dreamer) llmConsolidate(ctx context.Context, sessions []SessionRecord) error {
+	memDir := d.config.MemoryDir
+
+	// 读取现有记忆
+	existingContent := ""
+	entries, _ := os.ReadDir(memDir)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(memDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		if len(content) > 2000 {
+			content = content[:2000] + "..."
+		}
+		existingContent += fmt.Sprintf("### %s\n%s\n\n", e.Name(), content)
+	}
+
+	// 构建会话摘要
+	var sessionsSummary strings.Builder
+	for _, s := range sessions {
+		sessionsSummary.WriteString(fmt.Sprintf("- [%s] %s", s.ChatID, s.Summary))
+		if len(s.Topics) > 0 {
+			sessionsSummary.WriteString(fmt.Sprintf(" (topics: %s)", strings.Join(s.Topics, ", ")))
+		}
+		sessionsSummary.WriteString("\n")
+	}
+
+	// 构建整理提示词 (对应 TS: buildConsolidationPrompt 的 4 阶段)
+	systemPrompt := `You are a memory consolidation agent. Your job is to organize and consolidate memory files.
+Output ONLY the consolidated memory content in markdown format. No explanations or meta-commentary.`
+
+	userPrompt := fmt.Sprintf(`# Dream: Memory Consolidation
+
+## Existing Memories
+%s
+
+## Recent Sessions
+%s
+
+## Instructions
+
+Execute these 4 phases:
+
+### Phase 1 — Orient
+Review the existing memories above. Understand what's already stored.
+
+### Phase 2 — Gather  
+From the recent sessions, identify key facts worth remembering:
+- Important decisions made
+- Files modified and why
+- User preferences learned
+- Technical patterns discovered
+- Errors encountered and solutions found
+
+### Phase 3 — Consolidate
+Merge new information into existing memories:
+- Update outdated entries
+- Remove contradictions (newer info wins)
+- Group related items by topic
+- Use absolute dates, not relative ("2026-04-08", not "today")
+
+### Phase 4 — Prune
+- Remove duplicates
+- Remove trivially obvious information
+- Keep entries concise (1-2 sentences each)
+- Maximum 50 entries total
+
+Output the consolidated memory as a clean markdown document with topic headers.`,
+		existingContent, sessionsSummary.String())
+
+	result, err := d.APIClient.SimpleComplete(ctx, systemPrompt, userPrompt)
+	if err != nil {
+		log.Printf("[Dreaming/LLM] API 调用失败, 回退到本地整理: %v", err)
+		return d.localConsolidate(ctx, sessions)
+	}
+
+	// 写入整理结果
+	consolidated := filepath.Join(memDir, "consolidated.md")
+	header := fmt.Sprintf("<!-- Auto-consolidated: %s -->\n", time.Now().Format(time.RFC3339))
+	if err := os.WriteFile(consolidated, []byte(header+result), 0644); err != nil {
+		return fmt.Errorf("写入整理结果失败: %w", err)
+	}
+
+	// 更新索引
+	indexContent := fmt.Sprintf("# Memory Index\n\nLast consolidated: %s (LLM mode)\nSessions processed: %d\n\nSee [consolidated.md](consolidated.md) for full content.\n",
+		time.Now().Format(time.RFC3339), len(sessions))
+	return os.WriteFile(filepath.Join(memDir, "index.md"), []byte(indexContent), 0644)
 }
 
 // ForceDream 强制触发一次记忆整理 (忽略门控条件)

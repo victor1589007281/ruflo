@@ -307,3 +307,28 @@ func (c *Client) SendMessage(
 
 	return &result, nil
 }
+
+// SimpleComplete 简单文本补全: 发送 system+user prompt, 返回回复文本。
+// 实现 dreaming.LLMClient 接口。
+func (c *Client) SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	messages := []types.APIMessage{{
+		Role:    "user",
+		Content: json.RawMessage(`[{"type":"text","text":` + string(mustMarshalString(userPrompt)) + `}]`),
+	}}
+	resp, err := c.SendMessage(ctx, messages, []string{systemPrompt}, nil, 4096)
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for _, block := range resp.Content {
+		if block.Type == types.ContentBlockText {
+			sb.WriteString(block.Text)
+		}
+	}
+	return sb.String(), nil
+}
+
+func mustMarshalString(s string) json.RawMessage {
+	data, _ := json.Marshal(s)
+	return data
+}

@@ -222,3 +222,41 @@ func mustMarshal(v interface{}) json.RawMessage {
 	data, _ := json.Marshal(v)
 	return data
 }
+
+// ExtractKeyFacts 从即将被压缩的消息中提取关键事实。
+// 对应 TS: extractMemories 在 compact 前运行的隐式行为。
+//
+// 提取规则:
+//   - assistant 文本回复 > 100 字符
+//   - 包含文件路径或代码相关关键词的内容
+//   - 用户的明确需求/决策
+//
+// 返回: 提取的关键文本片段列表
+func ExtractKeyFacts(messages []types.Message) []string {
+	var facts []string
+	for _, msg := range messages {
+		text := extractText(msg)
+		if text == "" {
+			continue
+		}
+
+		switch msg.Type {
+		case types.MessageTypeAssistant:
+			if len(text) > 100 && !msg.IsApiErrorMessage {
+				summary := truncate(text, 500)
+				facts = append(facts, summary)
+			}
+		case types.MessageTypeUser:
+			if len(text) > 50 && !msg.IsMeta {
+				summary := truncate(text, 300)
+				facts = append(facts, "用户: "+summary)
+			}
+		}
+	}
+	return facts
+}
+
+// ExtractText 导出 extractText 供外部使用
+func ExtractText(msg types.Message) string {
+	return extractText(msg)
+}
