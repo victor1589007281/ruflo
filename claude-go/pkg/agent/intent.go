@@ -91,6 +91,22 @@ var wfDetect = map[string][]string{
 	"techblog":    {"写文章", "写博客", "公众号", "技术文章", "源码分析", "写作", "排版", "发文", "文章创作"},
 }
 
+// CronIntent cron 定时任务意图。
+type CronIntent struct {
+	Action   string `json:"action"`   // add_cron, list_cron, remove_cron
+	Schedule string `json:"schedule"` // cron 表达式
+	SchedDesc string `json:"schedDesc"` // 调度描述
+	JobType  string `json:"jobType"`  // workflow, query
+	Workflow string `json:"workflow"` // 工作流类型
+	Payload  string `json:"payload"`  // 执行内容
+}
+
+var cronKW = []string{
+	"定时", "每天", "每周", "每小时", "每分钟", "定期", "周期性",
+	"工作日", "每日", "每月", "早上", "下午", "晚上",
+	"自动执行", "定时执行", "设个闹钟", "定时提醒",
+}
+
 // Recognize 从用户文本中识别团队协作意图。
 // 返回 nil 表示无团队相关意图, 应走正常对话流程。
 func (ir *IntentRecognizer) Recognize(ctx context.Context, text string) *TeamIntent {
@@ -111,6 +127,61 @@ func (ir *IntentRecognizer) Recognize(ctx context.Context, text string) *TeamInt
 	}
 
 	return intent
+}
+
+// RecognizeCron 识别 cron 定时任务意图。
+func (ir *IntentRecognizer) RecognizeCron(ctx context.Context, text string) *CronIntent {
+	lower := strings.ToLower(text)
+
+	hasCron := false
+	for _, kw := range cronKW {
+		if strings.Contains(lower, kw) {
+			hasCron = true
+			break
+		}
+	}
+	if !hasCron {
+		return nil
+	}
+
+	// 还需要有明确的任务内容
+	hasTask := false
+	for _, kw := range createKW {
+		if strings.Contains(lower, kw) {
+			hasTask = true
+			break
+		}
+	}
+	if !hasTask {
+		return nil
+	}
+
+	schedule, schedDesc := ParseNaturalSchedule(text)
+
+	// 检测工作流类型
+	workflow := "research"
+	maxScore := 0
+	for wf, kws := range wfDetect {
+		score := 0
+		for _, kw := range kws {
+			if strings.Contains(lower, kw) {
+				score++
+			}
+		}
+		if score > maxScore {
+			maxScore = score
+			workflow = wf
+		}
+	}
+
+	return &CronIntent{
+		Action:    "add_cron",
+		Schedule:  schedule,
+		SchedDesc: schedDesc,
+		JobType:   "workflow",
+		Workflow:  workflow,
+		Payload:   text,
+	}
 }
 
 func (ir *IntentRecognizer) keywordDetect(lower, original string) *TeamIntent {

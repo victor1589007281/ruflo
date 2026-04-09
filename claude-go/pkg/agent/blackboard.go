@@ -138,6 +138,140 @@ func (bb *Blackboard) Snapshot() string {
 	return sb.String()
 }
 
+// SnapshotForRole 为特定角色生成精简快照。
+// 对 result 类条目做智能截断: 保留结构化摘要 + 关键代码块。
+func (bb *Blackboard) SnapshotForRole(role string, maxSize int) string {
+	bb.mu.RLock()
+	defer bb.mu.RUnlock()
+
+	if len(bb.entries) == 0 {
+		return ""
+	}
+	if maxSize <= 0 {
+		maxSize = 4000
+	}
+
+	var sb strings.Builder
+	sb.WriteString("## Shared Blackboard\n\n")
+
+	budget := maxSize
+	// context 和 decision 优先给全量
+	for _, cat := range []string{"context", "decision"} {
+		for _, e := range bb.entries {
+			if e.Category != cat {
+				continue
+			}
+			chunk := fmt.Sprintf("**[%s]** (%s): %s\n", e.Key, e.Author, smartTruncate(e.Value, 500))
+			if budget-len(chunk) < 0 {
+				break
+			}
+			sb.WriteString(chunk)
+			budget -= len(chunk)
+		}
+	}
+
+	// result/artifact: 提取关键部分 (代码块 + 首尾段落)
+	for _, e := range bb.entries {
+		if e.Category != "result" && e.Category != "artifact" {
+			continue
+		}
+		if budget < 200 {
+			sb.WriteString("\n...(更多结果已省略, 请使用黑板 key 读取)\n")
+			break
+		}
+		perEntry := budget / 2
+		if perEntry > 1500 {
+			perEntry = 1500
+		}
+		chunk := fmt.Sprintf("\n**[%s]** (%s):\n%s\n", e.Key, e.Author, extractKeyContent(e.Value, perEntry))
+		sb.WriteString(chunk)
+		budget -= len(chunk)
+	}
+
+	return sb.String()
+}
+
+// extractKeyContent 从长文本中提取关键内容: 保留代码块 + 首尾段落。
+func extractKeyContent(text string, maxLen int) string {
+	if len(text) <= maxLen {
+		return text
+	}
+
+	var parts []string
+	remaining := maxLen
+
+	// 提取代码块
+	codeBlocks := extractCodeBlocks(text)
+	for _, cb := range codeBlocks {
+		if remaining < 100 {
+			break
+		}
+		truncated := smartTruncate(cb, remaining/2)
+		parts = append(parts, truncated)
+		remaining -= len(truncated)
+	}
+
+	// 提取首段 (通常含摘要)
+	firstPara := extractFirstParagraph(text)
+	if firstPara != "" && remaining > 100 {
+		truncated := smartTruncate(firstPara, remaining/2)
+		parts = append([]string{truncated}, parts...)
+		remaining -= len(truncated)
+	}
+
+	if len(parts) == 0 {
+		return text[:maxLen] + "..."
+	}
+	return strings.Join(parts, "\n\n---\n\n")
+}
+
+func extractCodeBlocks(text string) []string {
+	var blocks []string
+	rest := text
+	for {
+		start := strings.Index(rest, "```")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(rest[start+3:], "```")
+		if end < 0 {
+			break
+		}
+		block := rest[start : start+3+end+3]
+		if len(block) > 50 {
+			blocks = append(blocks, block)
+		}
+		rest = rest[start+3+end+3:]
+	}
+	return blocks
+}
+
+func extractFirstParagraph(text string) string {
+	idx := strings.Index(text, "\n\n")
+	if idx > 0 && idx < 500 {
+		return text[:idx]
+	}
+	if len(text) > 300 {
+		return text[:300]
+	}
+	return text
+}
+
+func smartTruncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max - 20
+	if cut < 0 {
+		cut = max
+	}
+	// 尝试在换行处截断
+	if idx := strings.LastIndex(s[:cut], "\n"); idx > cut/2 {
+		return s[:idx] + "\n...(truncated)"
+	}
+	return s[:cut] + "...(truncated)"
+}
+
 // HandoffContext 构建结构化的阶段交接上下文。
 // 参考 Anthropic "Harness Design for Long-Running Apps" (2026):
 // 在上下文重置之间传递状态, 解决 "context anxiety"。

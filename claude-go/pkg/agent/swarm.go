@@ -336,14 +336,10 @@ func (s *SwarmOrchestrator) executeSubTask(
 		sb.WriteString("\n")
 	}
 
-	// 注入黑板上下文 (限制大小防止 prompt 膨胀)
+	// 注入黑板上下文 (使用角色感知的智能截断)
 	if team.Blackboard != nil {
-		snapshot := team.Blackboard.Snapshot()
+		snapshot := team.Blackboard.SnapshotForRole(task.Role, 4000)
 		if len(snapshot) > 0 {
-			maxBBSize := 3000
-			if len(snapshot) > maxBBSize {
-				snapshot = snapshot[:maxBBSize] + "\n...(黑板内容过长, 已截断)"
-			}
 			sb.WriteString("\n共享知识库:\n")
 			sb.WriteString(snapshot)
 			sb.WriteString("\n")
@@ -377,6 +373,14 @@ func (s *SwarmOrchestrator) executeSubTask(
 	}
 	defer s.pool.Release(agent)
 
+	// 子任务级别超时保护 (防止单个子任务卡死拖垮整体)
+	taskTimeout := 5 * time.Minute
+	if task.Priority >= 2 {
+		taskTimeout = 10 * time.Minute
+	}
+	taskCtx, taskCancel := context.WithTimeout(ctx, taskTimeout)
+	defer taskCancel()
+
 	// V2 Task 追踪
 	var v2ID string
 	if s.taskTracker != nil {
@@ -393,7 +397,7 @@ func (s *SwarmOrchestrator) executeSubTask(
 		team.mu.Unlock()
 	}
 
-	result, execErr := agent.Runner.Execute(ctx, prompt)
+	result, execErr := agent.Runner.Execute(taskCtx, prompt)
 	duration := time.Since(start)
 
 	// 更新状态

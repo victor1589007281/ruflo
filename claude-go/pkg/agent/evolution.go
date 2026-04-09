@@ -137,6 +137,17 @@ func (ee *EvolutionEngine) RecordTrajectory(t Trajectory) {
 
 // --- DISTILL: LLM 提炼经验 ---
 
+// LearnFromTeamSync 同步版本: 阻塞直到经验提炼完成。
+// 适用于需要保证后续操作能立即使用新经验的场景 (如测试、连续工作流)。
+func (ee *EvolutionEngine) LearnFromTeamSync(ctx context.Context, teamName string) int {
+	before := len(ee.experiences)
+	ee.LearnFromTeam(ctx, teamName)
+	ee.mu.RLock()
+	after := len(ee.experiences)
+	ee.mu.RUnlock()
+	return after - before
+}
+
 // LearnFromTeam 团队执行完成后, 从轨迹中提炼经验。
 // 参考: EvolveR 离线自蒸馏 + ruflo v3 SONA runBackgroundLoop
 func (ee *EvolutionEngine) LearnFromTeam(ctx context.Context, teamName string) {

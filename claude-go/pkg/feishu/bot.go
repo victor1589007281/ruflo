@@ -80,6 +80,7 @@ type Bot struct {
 	taskStore   *builtin.TaskStore          // 共享 V2 Task 存储
 	evolution   *agent.EvolutionEngine      // 自动进化引擎
 	cfgWatcher  *hotreload.Watcher          // 配置热加载监控器
+	cronSched   *agent.CronScheduler       // 定时任务调度器
 	startTime   time.Time                   // 启动时间
 }
 
@@ -178,7 +179,12 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 11. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
 	bot.intentRec = agent.NewIntentRecognizer(aiClient)
 
-	// 12. 启动配置热加载 (如果有配置文件)
+	// 12. 初始化 Cron 定时任务调度器
+	cronDir := config.Cwd + "/.claude/cron"
+	bot.cronSched = agent.NewCronScheduler(cronDir, &botCronExecutor{bot: bot})
+	bot.cronSched.Start()
+
+	// 13. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {
 		bot.startConfigWatcher(config.MCPConfigPath)
 	}
@@ -354,16 +360,52 @@ func (b *Bot) Start(ctx context.Context) error {
 	if b.dreamer != nil && b.config.DreamEnabled {
 		log.Printf("[飞书Bot] Dreaming: 已启用")
 	}
+	if b.cronSched != nil {
+		ct, ce, _ := b.cronSched.Stats()
+		if ct > 0 {
+			log.Printf("[飞书Bot] Cron: %d 个定时任务 (%d 启用)", ct, ce)
+		}
+	}
 
 	return b.wsClient.Start(ctx)
 }
 
 // Shutdown 关闭所有资源
 func (b *Bot) Shutdown() {
+	if b.cronSched != nil {
+		b.cronSched.Stop()
+	}
 	if b.cfgWatcher != nil {
 		b.cfgWatcher.Stop()
 	}
 	b.mcpMgr.Shutdown()
+}
+
+// --- Cron 执行器适配器 ---
+
+type botCronExecutor struct {
+	bot *Bot
+}
+
+func (e *botCronExecutor) RunWorkflow(ctx context.Context, name, workflow, objective, chatID string) error {
+	_, err := e.bot.teamMgr.CreateTeam(name, workflow, objective, chatID)
+	if err != nil {
+		return err
+	}
+	return e.bot.teamMgr.RunTeam(name, objective)
+}
+
+func (e *botCronExecutor) SendQuery(ctx context.Context, chatID, message string) (string, error) {
+	return e.bot.sessions.ProcessMessage(ctx, chatID, message)
+}
+
+func (e *botCronExecutor) RunCommand(ctx context.Context, chatID, command string) error {
+	_, err := e.bot.sessions.ProcessMessage(ctx, chatID, command)
+	return err
+}
+
+func (e *botCronExecutor) Notify(chatID, message string) {
+	e.bot.sendLongMessage(context.Background(), chatID, message)
 }
 
 // onMessageReceive 处理飞书消息接收事件。
@@ -440,6 +482,12 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
+	// Cron 意图识别: 自然语言定时任务 (优先于团队意图)
+	if cronIntent := b.intentRec.RecognizeCron(ctx, userText); cronIntent != nil {
+		go b.handleCronIntent(chatID, messageID, cronIntent)
+		return nil
+	}
+
 	// 意图识别: 中文自然语言 → 自动拆解为团队操作 (零侵入, 不匹配则透传)
 	if intent := b.intentRec.Recognize(ctx, userText); intent != nil && intent.Confidence >= 0.7 {
 		go b.handleTeamIntent(chatID, messageID, intent)
@@ -490,6 +538,12 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- /skill reload - 重新加载技能\n\n" +
 			"**Dreaming:**\n" +
 			"- /dream - 手动触发记忆整理\n\n" +
+			"**定时任务 (Cron):**\n" +
+			"- /cron list - 列出所有定时任务\n" +
+			"- /cron add <表达式> <类型> <内容> - 添加\n" +
+			"- /cron remove <ID> - 删除\n" +
+			"- /cron pause/resume <ID> - 暂停/恢复\n" +
+			"- 直接说「每天9点帮我分析XXX」自动创建\n\n" +
 			"**Agent Teams (多Agent协作):**\n" +
 			"*自然语言模式 (推荐):*\n" +
 			"- 直接说「帮我调研XXX」→ 自动创建 research 团队\n" +
@@ -538,6 +592,11 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			evoInfo = fmt.Sprintf("经验 %d 条 (角色:%d, 错误:%d, 通用:%d), 轨迹 %d 条",
 				es.TotalExperiences, es.RoleExperiences, es.ErrorPatterns, es.GeneralPrinciples, es.TotalTrajectories)
 		}
+		cronInfo := "未初始化"
+		if b.cronSched != nil {
+			ct, ce, cr := b.cronSched.Stats()
+			cronInfo = fmt.Sprintf("%d 个任务 (%d 启用), 已执行 %d 次", ct, ce, cr)
+		}
 		status := fmt.Sprintf("**运行状态**\n"+
 			"- 运行时长: %v\n"+
 			"- 总会话数: %d\n"+
@@ -547,8 +606,9 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- Skills: %s\n"+
 			"- Dreaming: %s\n"+
 			"- Evolution: %s\n"+
+			"- Cron: %s\n"+
 			"- 工作目录: %s",
-			uptime, total, active, b.config.Model, mcpInfo, skillInfo, dreamInfo, evoInfo, b.config.Cwd)
+			uptime, total, active, b.config.Model, mcpInfo, skillInfo, dreamInfo, evoInfo, cronInfo, b.config.Cwd)
 		b.sendTextReply(ctx, messageID, status)
 		return true
 
@@ -566,6 +626,10 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 
 	case strings.HasPrefix(lower, "/team"):
 		b.handleTeamCommand(ctx, chatID, messageID, text)
+		return true
+
+	case strings.HasPrefix(lower, "/cron"):
+		b.handleCronCommand(ctx, chatID, messageID, text)
 		return true
 
 	case lower == "/reload":
@@ -900,6 +964,156 @@ func (b *Bot) handleTeamIntent(chatID, messageID string, intent *agent.TeamInten
 		}
 		b.sendTextReply(ctx, messageID, sb.String())
 	}
+}
+
+// handleCronCommand 处理 /cron 命令族。
+// 支持: list, add, remove, pause, resume, status
+func (b *Bot) handleCronCommand(ctx context.Context, chatID, messageID, text string) {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		b.sendTextReply(ctx, messageID, "**定时任务管理:**\n"+
+			"- /cron list — 列出所有定时任务\n"+
+			"- /cron add <cron表达式> <类型> <内容> — 添加任务\n"+
+			"- /cron remove <ID> — 删除任务\n"+
+			"- /cron pause <ID> — 暂停任务\n"+
+			"- /cron resume <ID> — 恢复任务\n"+
+			"- /cron status — 调度器状态\n\n"+
+			"**类型:** workflow:<工作流>, query, command\n"+
+			"**示例:** `/cron add \"0 9 * * 1-5\" workflow:finance 分析AAPL和TSLA行情`\n\n"+
+			"**自然语言:** 直接说「每天早上9点帮我分析AAPL股票」即可自动创建")
+		return
+	}
+
+	sub := strings.ToLower(parts[1])
+	switch sub {
+	case "list":
+		b.sendTextReply(ctx, messageID, b.cronSched.FormatJobList())
+
+	case "add":
+		if len(parts) < 5 {
+			b.sendTextReply(ctx, messageID, "用法: /cron add <cron表达式> <类型> <内容>\n"+
+				"示例: /cron add \"0 9 * * 1-5\" workflow:finance 分析AAPL\n"+
+				"类型: workflow:<name>, query, command")
+			return
+		}
+		schedule := strings.Trim(parts[2], "\"")
+		// 如果 cron 表达式被拆分为多个 part (因未加引号), 尝试合并
+		typeIdx := 3
+		for i := 3; i < len(parts); i++ {
+			if strings.Contains(parts[i], ":") || parts[i] == "query" || parts[i] == "command" {
+				typeIdx = i
+				break
+			}
+			schedule += " " + parts[i]
+		}
+		if typeIdx >= len(parts) {
+			b.sendTextReply(ctx, messageID, "缺少任务类型。用法: /cron add <表达式> <类型> <内容>")
+			return
+		}
+
+		jobType := "query"
+		workflow := ""
+		typePart := parts[typeIdx]
+		if strings.HasPrefix(typePart, "workflow:") {
+			jobType = "workflow"
+			workflow = strings.TrimPrefix(typePart, "workflow:")
+		} else if typePart == "command" {
+			jobType = "command"
+		}
+
+		payload := strings.Join(parts[typeIdx+1:], " ")
+		if payload == "" {
+			b.sendTextReply(ctx, messageID, "缺少任务内容。")
+			return
+		}
+
+		job := &agent.CronJob{
+			Name:     fmt.Sprintf("cron-%d", time.Now().Unix()%10000),
+			Schedule: schedule,
+			JobType:  jobType,
+			Workflow: workflow,
+			Payload:  payload,
+			ChatID:   chatID,
+		}
+		if err := b.cronSched.AddJob(job); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("添加失败: %v", err))
+			return
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("✅ 已添加定时任务:\n"+
+			"- ID: `%s`\n"+
+			"- 调度: `%s`\n"+
+			"- 类型: %s\n"+
+			"- 内容: %s",
+			job.ID, job.Schedule, job.JobType, truncateForDream(job.Payload)))
+
+	case "remove", "delete":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /cron remove <ID>")
+			return
+		}
+		if err := b.cronSched.RemoveJob(parts[2]); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("删除失败: %v", err))
+		} else {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("🗑️ 已删除定时任务: %s", parts[2]))
+		}
+
+	case "pause":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /cron pause <ID>")
+			return
+		}
+		if err := b.cronSched.PauseJob(parts[2]); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("暂停失败: %v", err))
+		} else {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("⏸️ 已暂停: %s", parts[2]))
+		}
+
+	case "resume":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /cron resume <ID>")
+			return
+		}
+		if err := b.cronSched.ResumeJob(parts[2]); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("恢复失败: %v", err))
+		} else {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("▶️ 已恢复: %s", parts[2]))
+		}
+
+	case "status":
+		total, enabled, totalRuns := b.cronSched.Stats()
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("**Cron 调度器状态:**\n"+
+			"- 总任务数: %d\n"+
+			"- 启用中: %d\n"+
+			"- 总执行次数: %d", total, enabled, totalRuns))
+
+	default:
+		b.sendTextReply(ctx, messageID, "未知 /cron 子命令。用法: /cron [list|add|remove|pause|resume|status]")
+	}
+}
+
+// handleCronIntent 处理自然语言 cron 意图。
+func (b *Bot) handleCronIntent(chatID, messageID string, intent *agent.CronIntent) {
+	ctx := context.Background()
+
+	job := &agent.CronJob{
+		Name:     fmt.Sprintf("auto-%d", time.Now().Unix()%10000),
+		Schedule: intent.Schedule,
+		JobType:  intent.JobType,
+		Workflow: intent.Workflow,
+		Payload:  intent.Payload,
+		ChatID:   chatID,
+	}
+	if err := b.cronSched.AddJob(job); err != nil {
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("创建定时任务失败: %v", err))
+		return
+	}
+	b.sendTextReply(ctx, messageID, fmt.Sprintf("⏰ 已识别为定时任务, 自动创建:\n"+
+		"- ID: `%s`\n"+
+		"- 调度: **%s** (`%s`)\n"+
+		"- 类型: %s\n"+
+		"- 内容: %s\n\n"+
+		"发送 `/cron list` 查看所有定时任务, `/cron remove %s` 删除。",
+		job.ID, intent.SchedDesc, intent.Schedule, intent.JobType, truncateForDream(intent.Payload), job.ID))
 }
 
 // handleDreamCommand 处理 /dream 命令

@@ -9,6 +9,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -520,6 +521,170 @@ func TestWorkflowWithEvolution(t *testing.T) {
 				t.Logf("  等待中... 状态=%s", team.Status)
 			}
 		}
+	}
+}
+
+// TestCronScheduler 测试 Cron 调度器核心逻辑 (无需 API)
+func TestCronScheduler(t *testing.T) {
+	cwd := t.TempDir()
+
+	var executed []string
+	var mu sync.Mutex
+	executor := &testCronExecutor{
+		onNotify: func(chatID, msg string) {
+			mu.Lock()
+			executed = append(executed, msg)
+			mu.Unlock()
+		},
+	}
+
+	sched := agent.NewCronScheduler(cwd+"/.claude/cron", executor)
+
+	// 1. 添加任务
+	job := &agent.CronJob{
+		Name:     "test-job",
+		Schedule: "*/5 * * * *",
+		JobType:  "query",
+		Payload:  "你好",
+		ChatID:   "test-chat",
+	}
+	if err := sched.AddJob(job); err != nil {
+		t.Fatalf("添加任务失败: %v", err)
+	}
+	t.Logf("✓ 添加任务: %s (%s)", job.Name, job.ID)
+
+	// 2. 列出任务
+	jobs := sched.ListJobs()
+	if len(jobs) != 1 {
+		t.Fatalf("期望 1 个任务, 得到 %d", len(jobs))
+	}
+	t.Log("✓ 列出任务: 1 个")
+
+	// 3. 暂停/恢复
+	if err := sched.PauseJob(job.ID); err != nil {
+		t.Fatalf("暂停失败: %v", err)
+	}
+	j := sched.GetJob(job.ID)
+	if j.Enabled {
+		t.Fatal("暂停后应为 disabled")
+	}
+	t.Log("✓ 暂停任务")
+
+	if err := sched.ResumeJob(job.ID); err != nil {
+		t.Fatalf("恢复失败: %v", err)
+	}
+	j = sched.GetJob(job.ID)
+	if !j.Enabled {
+		t.Fatal("恢复后应为 enabled")
+	}
+	t.Log("✓ 恢复任务")
+
+	// 4. Stats
+	total, enabled, _ := sched.Stats()
+	if total != 1 || enabled != 1 {
+		t.Fatalf("Stats 异常: total=%d, enabled=%d", total, enabled)
+	}
+	t.Log("✓ Stats: 1 total, 1 enabled")
+
+	// 5. 持久化: 重新加载
+	sched2 := agent.NewCronScheduler(cwd+"/.claude/cron", executor)
+	jobs2 := sched2.ListJobs()
+	if len(jobs2) != 1 {
+		t.Fatalf("持久化恢复失败: 期望 1, 得到 %d", len(jobs2))
+	}
+	t.Log("✓ 持久化恢复正常")
+
+	// 6. 格式化输出
+	output := sched.FormatJobList()
+	if !strings.Contains(output, "test-job") {
+		t.Fatal("格式化输出应包含任务名")
+	}
+	t.Log("✓ 格式化输出正常")
+
+	// 7. 删除任务
+	if err := sched.RemoveJob(job.ID); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	if len(sched.ListJobs()) != 0 {
+		t.Fatal("删除后应为空")
+	}
+	t.Log("✓ 删除任务")
+
+	// 8. 无效 cron 表达式
+	badJob := &agent.CronJob{Schedule: "invalid", JobType: "query", Payload: "x", ChatID: "c"}
+	if err := sched.AddJob(badJob); err == nil {
+		t.Fatal("应拒绝无效 cron 表达式")
+	}
+	t.Log("✓ 无效 cron 表达式被正确拒绝")
+}
+
+// TestNaturalScheduleParse 测试自然语言时间解析
+func TestNaturalScheduleParse(t *testing.T) {
+	cases := []struct {
+		input    string
+		wantExpr string
+		wantDesc string
+	}{
+		{"每天9点帮我分析AAPL", "0 9 * * *", "每天9点"},
+		{"工作日早上10点盯盘", "0 10 * * 1-5", "工作日10点"},
+		{"每小时查看一下行情", "0 * * * *", "每小时"},
+		{"每5分钟检查", "*/5 * * * *", "每5分钟"},
+		{"每周一9点发报告", "0 9 * * 1", "每周一9点"},
+	}
+	for _, c := range cases {
+		expr, desc := agent.ParseNaturalSchedule(c.input)
+		if expr != c.wantExpr {
+			t.Errorf("输入 %q: 期望表达式 %q, 得到 %q", c.input, c.wantExpr, expr)
+		}
+		if desc != c.wantDesc {
+			t.Errorf("输入 %q: 期望描述 %q, 得到 %q", c.input, c.wantDesc, desc)
+		}
+		t.Logf("✓ %q → %s (%s)", c.input, expr, desc)
+	}
+}
+
+// TestBlackboardSnapshotForRole 测试角色感知黑板快照
+func TestBlackboardSnapshotForRole(t *testing.T) {
+	cwd := t.TempDir()
+	bb := agent.NewBlackboard("test-team", cwd)
+
+	bb.Write("objective", "构建 REST API", "system", "context")
+	bb.Write("design-decision", "使用 Gin 框架", "architect", "decision")
+	bb.Write("t1-result", "```go\npackage main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n```\n\n完成了基础框架搭建。", "coder", "result")
+	bb.Write("t2-result", strings.Repeat("很长的分析报告。", 200), "researcher", "result")
+
+	snapshot := bb.SnapshotForRole("coder", 2000)
+	if snapshot == "" {
+		t.Fatal("快照不应为空")
+	}
+	if !strings.Contains(snapshot, "objective") {
+		t.Error("快照应包含 context")
+	}
+	if !strings.Contains(snapshot, "Gin") {
+		t.Error("快照应包含 decision")
+	}
+	if len(snapshot) > 2500 {
+		t.Errorf("快照超出预算: %d chars", len(snapshot))
+	}
+	t.Logf("✓ SnapshotForRole: %d chars (budget 2000)", len(snapshot))
+}
+
+type testCronExecutor struct {
+	onNotify func(chatID, msg string)
+}
+
+func (e *testCronExecutor) RunWorkflow(ctx context.Context, name, workflow, objective, chatID string) error {
+	return nil
+}
+func (e *testCronExecutor) SendQuery(ctx context.Context, chatID, message string) (string, error) {
+	return "test result", nil
+}
+func (e *testCronExecutor) RunCommand(ctx context.Context, chatID, command string) error {
+	return nil
+}
+func (e *testCronExecutor) Notify(chatID, message string) {
+	if e.onNotify != nil {
+		e.onNotify(chatID, message)
 	}
 }
 
