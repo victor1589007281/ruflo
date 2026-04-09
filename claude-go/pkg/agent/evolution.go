@@ -155,15 +155,43 @@ func (ee *EvolutionEngine) LearnFromTeam(ctx context.Context, teamName string) {
 
 	log.Printf("[Evolution] 从团队 %s 的 %d 条轨迹中提炼经验...", teamName, len(teamTrajs))
 
-	// LLM 驱动的经验提炼
+	// LLM 驱动的经验提炼 (带超时保护)
 	if ee.llm != nil {
-		ee.llmDistill(ctx, teamTrajs, teamName)
+		distillCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		ee.llmDistill(distillCtx, teamTrajs, teamName)
 	} else {
 		ee.heuristicDistill(teamTrajs, teamName)
 	}
 
 	ee.persistExperiences()
 	log.Printf("[Evolution] 经验提炼完成, 当前共 %d 条经验", len(ee.experiences))
+}
+
+// LearnFromStage 单阶段增量学习 (阶段完成后立即调用, 不等团队结束)。
+// 使用启发式快速提炼, 减少 LLM 延迟对后续阶段的影响。
+func (ee *EvolutionEngine) LearnFromStage(traj Trajectory) {
+	ee.mu.Lock()
+	defer ee.mu.Unlock()
+
+	if traj.Error != "" && !traj.Success {
+		content := fmt.Sprintf("[%s] 执行「%s」失败: %s → 建议: 检查参数和前置依赖",
+			traj.Role, truncateResult(traj.Objective, 80), truncateResult(traj.Error, 150))
+		if !ee.isDuplicate(content) {
+			ee.nextID++
+			ee.experiences = append(ee.experiences, &Experience{
+				ID:        fmt.Sprintf("exp-inc-%d-%d", time.Now().Unix(), ee.nextID),
+				Category:  "error",
+				Role:      traj.Role,
+				Content:   content,
+				Quality:   0.4,
+				Source:    traj.TeamName + "/" + traj.StageName,
+				Tags:      []string{traj.Role, "incremental"},
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			})
+		}
+	}
 }
 
 func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, teamName string) {
@@ -585,6 +613,7 @@ func (ee *EvolutionEngine) Stats() EvolutionStats {
 		TotalTrajectories: len(ee.trajectories),
 	}
 
+	totalQ := 0.0
 	for _, exp := range ee.experiences {
 		switch exp.Category {
 		case "role":
@@ -594,6 +623,11 @@ func (ee *EvolutionEngine) Stats() EvolutionStats {
 		case "general":
 			stats.GeneralPrinciples++
 		}
+		stats.TotalUsageCount += exp.UsageCount
+		totalQ += exp.Quality
+	}
+	if len(ee.experiences) > 0 {
+		stats.AvgQuality = totalQ / float64(len(ee.experiences))
 	}
 
 	return stats
@@ -606,6 +640,8 @@ type EvolutionStats struct {
 	RoleExperiences   int `json:"roleExperiences"`
 	ErrorPatterns     int `json:"errorPatterns"`
 	GeneralPrinciples int `json:"generalPrinciples"`
+	TotalUsageCount   int `json:"totalUsageCount"`   // 经验被注入的总次数
+	AvgQuality        float64 `json:"avgQuality"`    // 平均质量分
 }
 
 // --- 工具函数 ---
@@ -663,12 +699,35 @@ func simpleBM25(queryTerms, docTerms []string) float64 {
 		tf[t]++
 	}
 
+	k1 := 1.5
+	b := 0.75
+	avgDL := 30.0
+	dl := float64(len(docTerms))
+
 	score := 0.0
+	queryTF := make(map[string]int)
 	for _, qt := range queryTerms {
+		queryTF[qt]++
+	}
+
+	matchedTerms := 0
+	for qt, qtf := range queryTF {
 		if tf[qt] > 0 {
-			score += float64(tf[qt]) / (float64(tf[qt]) + 1.5)
+			matchedTerms++
+			dtf := float64(tf[qt])
+			// BM25 TF saturation with doc length normalization
+			tfScore := (dtf * (k1 + 1)) / (dtf + k1*(1-b+b*(dl/avgDL)))
+			// query term frequency boost
+			score += tfScore * float64(qtf)
 		}
 	}
+
+	// coverage bonus: reward documents that match more query terms
+	if len(queryTF) > 0 {
+		coverage := float64(matchedTerms) / float64(len(queryTF))
+		score *= (1.0 + coverage)
+	}
+
 	return score
 }
 

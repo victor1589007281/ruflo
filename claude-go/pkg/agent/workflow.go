@@ -46,6 +46,10 @@ func GetWorkflow(name string) *WorkflowDef {
 		return debateWorkflow()
 	case "swarm":
 		return swarmWorkflow()
+	case "finance", "trading":
+		return financeWorkflow()
+	case "techblog", "article", "blog":
+		return techBlogWorkflow()
 	default:
 		return nil
 	}
@@ -58,6 +62,8 @@ func ListWorkflows() []WorkflowDef {
 		*researchWorkflow(),
 		*debateWorkflow(),
 		*swarmWorkflow(),
+		*financeWorkflow(),
+		*techBlogWorkflow(),
 	}
 }
 
@@ -535,9 +541,9 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		}
 	}
 
-	// 6. 记录执行轨迹 (RECORD) + 经验反馈 (EVOLVE)
+	// 6. 记录执行轨迹 (RECORD) + 经验反馈 (EVOLVE) + 增量学习
 	if we.evolution != nil {
-		we.evolution.RecordTrajectory(Trajectory{
+		traj := Trajectory{
 			TeamName:  team.Name,
 			StageName: stage.Name,
 			Role:      stage.Role,
@@ -548,7 +554,12 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			Success:   sr.Status == TaskCompleted,
 			Duration:  sr.Duration,
 			Timestamp: time.Now(),
-		})
+		}
+		we.evolution.RecordTrajectory(traj)
+		// 增量学习: 失败阶段立即提炼 error pattern，不等团队结束
+		if sr.Status == TaskFailed {
+			we.evolution.LearnFromStage(traj)
+		}
 		if len(injectedExpIDs) > 0 {
 			we.evolution.RecordBatchFeedback(injectedExpIDs, sr.Status == TaskCompleted)
 		}
@@ -644,6 +655,292 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 	prompt = strings.ReplaceAll(prompt, "{objective}", objective)
 	prompt = strings.ReplaceAll(prompt, "{prev_result}", prevOutput.String())
 	return prompt
+}
+
+// --- 金融专家团队工作流 ---
+
+func financeWorkflow() *WorkflowDef {
+	return &WorkflowDef{
+		Name:        "finance",
+		Description: "金融分析专家团队: 盯盘→情绪→财报→新闻→风险评估→交易建议",
+		Mode:        "pipeline",
+		Stages: []StageDef{
+			{
+				Name: "market-analysis", Role: "market-analyst",
+				Prompt: `你是资深量化交易分析师。对给定标的进行全面技术分析。
+
+分析标的: {objective}
+
+请输出:
+## 技术面分析
+1. **价格趋势**: 当前价位、近期高低点、趋势方向 (上升/下降/震荡)
+2. **关键技术指标**: MA5/MA20/MA60 均线排列, MACD 金叉/死叉, RSI 超买/超卖, 布林带位置
+3. **成交量分析**: 量价配合情况, 是否放量/缩量
+4. **支撑/阻力位**: 近期关键价格位
+5. **形态分析**: K线组合形态 (头肩顶/双底/三角收敛等)
+
+## 技术面评分: X/10 (给出明确评分和理由)
+
+请基于公开可得的市场知识进行分析。如果是具体股票，请根据你对该公司的了解给出分析。`,
+				Parallel: true,
+			},
+			{
+				Name: "sentiment-analysis", Role: "sentiment-analyst",
+				Prompt: `你是金融情绪分析专家，擅长从多维度解读市场情绪。
+
+分析标的: {objective}
+
+请输出:
+## 市场情绪分析
+1. **整体市场情绪**: 贪婪/恐惧指数估计, 市场氛围 (乐观/中性/悲观)
+2. **投资者情绪**: 散户 vs 机构的态度差异, 融资融券余额趋势
+3. **社交媒体情绪**: 讨论热度, 正面/负面情绪比例, 关键观点摘要
+4. **分析师共识**: 买入/持有/卖出评级分布, 目标价区间
+5. **资金流向**: 北向资金/南向资金、主力资金净流入流出
+
+## 情绪评分: X/10 (1=极度恐惧, 10=极度贪婪)
+## 情绪结论: 一句话总结当前情绪状态`,
+				Parallel: true,
+			},
+			{
+				Name: "financial-report", Role: "financial-analyst",
+				Prompt: `你是高级财务分析师 (CFA)，擅长财报深度解读。
+
+分析标的: {objective}
+
+请输出:
+## 财务基本面分析
+1. **盈利能力**: 营收增长率、净利润率、ROE、ROA, 与行业平均对比
+2. **估值水平**: P/E (TTM & Forward)、P/B、P/S、PEG, 是否高估/低估
+3. **成长性**: 营收/利润增速趋势, 研发投入占比, 新业务增长点
+4. **财务健康**: 资产负债率、流动比率、现金流情况、商誉减值风险
+5. **分红与回购**: 股息率、回购计划、对股东的回报
+
+## 同业对比: 列出 2-3 个竞品的关键指标对比表格
+## 基本面评分: X/10 (给出明确评分和理由)`,
+				Parallel: true,
+			},
+			{
+				Name: "news-tracking", Role: "news-tracker",
+				Prompt: `你是金融新闻追踪专家，擅长从新闻事件中提取投资信号。
+
+分析标的: {objective}
+
+请输出:
+## 新闻与事件分析
+1. **近期重大事件**: 列出近期影响股价的关键事件 (财报发布、并购、管理层变动、政策等)
+2. **行业动态**: 所在行业的最新趋势、政策变化、竞争格局变化
+3. **宏观因素**: 利率环境、汇率影响、地缘政治风险
+4. **监管风险**: 反垄断、数据安全、行业合规等潜在风险
+5. **催化剂/风险事件**: 未来 1-3 个月可预见的重要事件 (财报日、政策节点等)
+
+## 事件影响评估表
+| 事件 | 影响方向 | 影响程度 | 概率 |
+|------|---------|---------|------|
+| ... | 利多/利空 | 高/中/低 | X% |
+
+## 事件面评分: X/10`,
+				Parallel: true,
+			},
+			{
+				Name: "risk-assessment", Role: "risk-assessor",
+				DependsOn: []string{"market-analysis", "sentiment-analysis", "financial-report", "news-tracking"},
+				Prompt: `你是高级风险管理专家 (FRM)。综合前置分析，进行全面风险评估。
+
+分析标的: {objective}
+
+前置研究成果:
+{prev_result}
+
+请输出:
+## 综合风险评估
+1. **系统性风险**: 宏观经济、市场整体风险暴露
+2. **个股风险**: 基于前面技术面/基本面/情绪面/事件面的综合风险
+3. **下行风险**: 最大回撤估计, 止损位建议
+4. **上行空间**: 目标价预期, 盈亏比
+5. **仓位建议**: 根据风险等级建议的仓位比例
+
+## 风险矩阵
+| 风险类型 | 概率 | 影响 | 等级 | 缓解策略 |
+|---------|------|------|------|---------|
+| ... | 高/中/低 | 高/中/低 | 🔴🟡🟢 | ... |
+
+## 综合风险等级: 🔴高风险 / 🟡中风险 / 🟢低风险`,
+			},
+			{
+				Name: "trade-recommendation", Role: "trade-advisor",
+				DependsOn: []string{"risk-assessment"},
+				Prompt: `你是首席投资策略师。综合所有分析，给出最终交易建议。
+
+分析标的: {objective}
+
+完整分析报告:
+{prev_result}
+
+请输出最终投资建议:
+
+## 📊 投资评级: 【强烈买入/买入/持有/减持/卖出】
+
+## 核心逻辑 (3-5 条)
+1. ...
+
+## 交易策略
+- **建仓时机**: 具体价位或条件
+- **目标价位**: 短期(1周)/中期(1月)/长期(3月)
+- **止损位**: 具体价位和原因
+- **仓位建议**: 占总仓位的 X%
+- **盈亏比**: X:X
+
+## 综合评分
+| 维度 | 评分 | 权重 | 加权分 |
+|------|------|------|--------|
+| 技术面 | X/10 | 20% | |
+| 情绪面 | X/10 | 15% | |
+| 基本面 | X/10 | 30% | |
+| 事件面 | X/10 | 15% | |
+| 风险面 | X/10 | 20% | |
+| **综合** | | 100% | **X/10** |
+
+## ⚠️ 风险提示
+投资有风险，本分析仅供参考，不构成投资建议。请根据自身风险承受能力做出决策。`,
+			},
+		},
+	}
+}
+
+// --- 技术博客/公众号写作专家团队 ---
+
+func techBlogWorkflow() *WorkflowDef {
+	return &WorkflowDef{
+		Name:        "techblog",
+		Description: "技术博客/公众号写作专家团队: 源码分析→信息调查→事实核验→专业撰写→排版优化",
+		Mode:        "pipeline",
+		Stages: []StageDef{
+			{
+				Name: "source-analysis", Role: "source-analyst",
+				Prompt: `你是资深源码分析专家，擅长深入阅读和分析开源项目代码。
+
+写作主题: {objective}
+
+请进行深度源码/技术分析:
+
+## 技术深度分析
+1. **核心架构**: 整体架构设计, 关键模块和它们的职责
+2. **核心算法/实现**: 最核心的算法或实现逻辑 (含关键代码片段)
+3. **设计模式**: 用到了哪些设计模式, 为什么这样选择
+4. **性能考量**: 性能关键路径, 优化手段
+5. **核心数据结构**: 关键数据结构的设计和选择理由
+
+## 可以写入文章的代码片段 (标注清楚来源和说明)
+## 技术亮点 (适合在文章中重点展开的 2-3 个点)
+## 对比分析 (如果适用: 与同类方案的对比)`,
+				Parallel: true,
+			},
+			{
+				Name: "investigation", Role: "tech-investigator",
+				Prompt: `你是技术调查记者，擅长全方位搜集和整理技术信息。
+
+写作主题: {objective}
+
+请进行全方位信息调查:
+
+## 背景调查
+1. **项目/技术背景**: 起源、发展历程、关键里程碑
+2. **作者/团队**: 核心贡献者, 背后的组织/公司
+3. **社区生态**: Star 数, 贡献者数, 使用案例
+4. **行业影响**: 该技术在行业中的地位和影响
+5. **最新动态**: 最近的版本更新、重要 PR、Roadmap
+
+## 相关引用和参考资料 (论文、官方文档、博客)
+## 有价值的引用语句 (可直接用于文章)
+## 常见误解或争议点 (增加文章深度)`,
+				Parallel: true,
+			},
+			{
+				Name: "fact-checking", Role: "fact-checker",
+				DependsOn: []string{"source-analysis", "investigation"},
+				Prompt: `你是严谨的技术事实核验专家。验证前面调研的准确性。
+
+写作主题: {objective}
+
+前置调研成果:
+{prev_result}
+
+请进行事实核验:
+
+## 核验清单
+对前面分析中的每个关键论断逐一核验:
+1. **技术准确性**: 代码分析是否正确? API 描述是否准确?
+2. **数据准确性**: 引用的数据/数字是否可靠?
+3. **版本时效性**: 是否是最新版本? 有无过时信息?
+4. **观点客观性**: 是否有主观偏见? 是否遗漏了重要观点?
+5. **完整性**: 是否有重要遗漏需要补充?
+
+## 核验结果
+| 论断 | 核验结果 | 修正建议 |
+|------|---------|---------|
+| ... | ✅正确/⚠️需修正/❌错误 | ... |
+
+## 建议补充的内容
+## 建议删除/修改的内容`,
+			},
+			{
+				Name: "article-writing", Role: "tech-writer",
+				DependsOn: []string{"fact-checking"},
+				Prompt: `你是顶级技术自媒体作者 (10万+阅读量级)。基于经过核验的素材撰写专业文章。
+
+写作主题: {objective}
+
+已核验素材:
+{prev_result}
+
+请撰写一篇高质量的技术文章:
+
+## 写作要求
+1. **标题**: 吸引眼球但不标题党, 准确反映内容, 适合微信公众号传播
+2. **开头**: 用一个引人入胜的场景/问题/数据开头, 前100字决定读者是否继续
+3. **结构**: 清晰的层次, 每个小节有明确主题, 段落间自然过渡
+4. **深度**: 不是肤浅的介绍, 而是有独到见解的深度分析
+5. **代码**: 必要的代码片段 (控制在文章的 20% 以内), 配详细注释
+6. **图文**: 在需要图表的地方用 [图: 描述] 标注 (后续排版阶段处理)
+7. **结尾**: 总结 + 思考 + 引导讨论的问题
+
+## 文章风格
+- 专业但不晦涩, 用类比帮助理解复杂概念
+- 有自己的观点和态度, 不是纯搬运
+- 中文行文流畅, 适合中国技术人阅读习惯
+- 适当使用 emoji 增加可读性 (但不过度)
+
+## 目标: 3000-5000 字的深度技术文章`,
+			},
+			{
+				Name: "formatting", Role: "article-formatter",
+				DependsOn: []string{"article-writing"},
+				Prompt: `你是微信公众号排版和视觉设计专家。将文章优化为适合公众号发布的格式。
+
+原始文章:
+{prev_result}
+
+请进行排版优化:
+
+## 排版优化
+1. **标题优化**: 适合公众号的标题 (主标题 + 副标题), 考虑搜索关键词
+2. **摘要**: 120 字以内的文章摘要 (显示在公众号列表)
+3. **封面图建议**: 描述适合的封面图风格和内容, 标注 [封面图: 描述]
+4. **正文排版**:
+   - 重要语句加粗
+   - 关键概念用 「」 强调
+   - 代码块用适当语言标记
+   - 每 3-4 段插入一个视觉化元素 (表格/列表/引用/分割线)
+   - 在适当位置插入 [配图: 描述] 标注
+5. **SEO 优化**: 添加关键词标签 (5-8 个)
+6. **互动引导**: 文末添加互动话题/投票/留言引导
+7. **相关推荐**: 建议 2-3 篇可关联的延伸阅读主题
+
+## 最终输出: 排版完成的公众号文章 (Markdown 格式, 含所有标注)`,
+			},
+		},
+	}
 }
 
 func filterParallel(stages []StageDef) []StageDef {

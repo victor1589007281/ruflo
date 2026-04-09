@@ -344,6 +344,67 @@ Render your verdict:
 - Final recommendation with caveats`,
 	}
 
+	// ========== 金融专家团队角色 ==========
+
+	rr.roles["market-analyst"] = &RoleDef{
+		Name: "market-analyst", Category: "workflow",
+		Description: "量化交易分析师: 技术指标、价格趋势、成交量分析",
+		Tags:        []string{"finance", "trading", "technical-analysis"},
+	}
+	rr.roles["sentiment-analyst"] = &RoleDef{
+		Name: "sentiment-analyst", Category: "workflow",
+		Description: "金融情绪分析师: 市场情绪、资金流向、分析师共识",
+		Tags:        []string{"finance", "sentiment", "market-mood"},
+	}
+	rr.roles["financial-analyst"] = &RoleDef{
+		Name: "financial-analyst", Category: "workflow",
+		Description: "高级财务分析师 (CFA): 财报分析、估值、同业对比",
+		Tags:        []string{"finance", "fundamental", "valuation"},
+	}
+	rr.roles["news-tracker"] = &RoleDef{
+		Name: "news-tracker", Category: "workflow",
+		Description: "金融新闻追踪专家: 事件分析、行业动态、宏观因素",
+		Tags:        []string{"finance", "news", "events"},
+	}
+	rr.roles["risk-assessor"] = &RoleDef{
+		Name: "risk-assessor", Category: "workflow",
+		Description: "高级风险管理专家 (FRM): 风险矩阵、仓位建议、止损策略",
+		Tags:        []string{"finance", "risk", "management"},
+	}
+	rr.roles["trade-advisor"] = &RoleDef{
+		Name: "trade-advisor", Category: "workflow",
+		Description: "首席投资策略师: 综合评分、交易策略、投资建议",
+		Tags:        []string{"finance", "strategy", "recommendation"},
+	}
+
+	// ========== 技术博客/公众号写作团队角色 ==========
+
+	rr.roles["source-analyst"] = &RoleDef{
+		Name: "source-analyst", Category: "workflow",
+		Description: "资深源码分析专家: 深入分析开源代码架构和核心实现",
+		Tags:        []string{"writing", "source-code", "analysis"},
+	}
+	rr.roles["tech-investigator"] = &RoleDef{
+		Name: "tech-investigator", Category: "workflow",
+		Description: "技术调查记者: 全方位搜集背景信息、社区生态、行业影响",
+		Tags:        []string{"writing", "investigation", "research"},
+	}
+	rr.roles["fact-checker"] = &RoleDef{
+		Name: "fact-checker", Category: "workflow",
+		Description: "技术事实核验专家: 验证技术准确性、数据可靠性、时效性",
+		Tags:        []string{"writing", "verification", "accuracy"},
+	}
+	rr.roles["tech-writer"] = &RoleDef{
+		Name: "tech-writer", Category: "workflow",
+		Description: "顶级技术自媒体作者: 撰写深度技术分析文章",
+		Tags:        []string{"writing", "content", "article"},
+	}
+	rr.roles["article-formatter"] = &RoleDef{
+		Name: "article-formatter", Category: "workflow",
+		Description: "公众号排版专家: 视觉优化、SEO、互动设计",
+		Tags:        []string{"writing", "formatting", "design"},
+	}
+
 	// ========== Standalone 角色 ==========
 
 	rr.roles["intent-recognizer"] = &RoleDef{

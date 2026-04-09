@@ -55,6 +55,7 @@ type SwarmOrchestrator struct {
 	chatID      string
 	maxAgents   int
 	evolution   *EvolutionEngine
+	roles       *RoleRegistry
 }
 
 // NewSwarmOrchestrator 创建蜂群编排器。
@@ -308,9 +309,19 @@ func (s *SwarmOrchestrator) executeSubTask(
 ) StageResult {
 	start := time.Now()
 
-	// 构建子任务 prompt
+	// 构建子任务 prompt (优先从 RoleRegistry 获取角色系统提示词)
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("你的角色: %s\n\n", task.Role))
+	rolePromptInjected := false
+	if s.roles != nil {
+		if rp := s.roles.MergedPrompt(task.Role, objective, ""); rp != "" {
+			sb.WriteString(rp)
+			sb.WriteString("\n\n")
+			rolePromptInjected = true
+		}
+	}
+	if !rolePromptInjected {
+		sb.WriteString(fmt.Sprintf("你的角色: %s\n\n", task.Role))
+	}
 	sb.WriteString(fmt.Sprintf("整体目标: %s\n\n", objective))
 	sb.WriteString(fmt.Sprintf("你的具体任务: %s\n\n", task.Description))
 
@@ -325,10 +336,14 @@ func (s *SwarmOrchestrator) executeSubTask(
 		sb.WriteString("\n")
 	}
 
-	// 注入黑板上下文
+	// 注入黑板上下文 (限制大小防止 prompt 膨胀)
 	if team.Blackboard != nil {
 		snapshot := team.Blackboard.Snapshot()
-		if len(snapshot) > 0 && len(snapshot) < 5000 {
+		if len(snapshot) > 0 {
+			maxBBSize := 3000
+			if len(snapshot) > maxBBSize {
+				snapshot = snapshot[:maxBBSize] + "\n...(黑板内容过长, 已截断)"
+			}
 			sb.WriteString("\n共享知识库:\n")
 			sb.WriteString(snapshot)
 			sb.WriteString("\n")
@@ -414,9 +429,9 @@ func (s *SwarmOrchestrator) executeSubTask(
 		}
 	}
 
-	// 记录轨迹 + 经验反馈
+	// 记录轨迹 + 经验反馈 + 增量学习
 	if s.evolution != nil {
-		s.evolution.RecordTrajectory(Trajectory{
+		traj := Trajectory{
 			TeamName:  team.Name,
 			StageName: task.ID,
 			Role:      task.Role,
@@ -432,7 +447,11 @@ func (s *SwarmOrchestrator) executeSubTask(
 			Success:   execErr == nil,
 			Duration:  duration.Round(time.Second).String(),
 			Timestamp: time.Now(),
-		})
+		}
+		s.evolution.RecordTrajectory(traj)
+		if execErr != nil {
+			s.evolution.LearnFromStage(traj)
+		}
 		if len(injectedExpIDs) > 0 {
 			s.evolution.RecordBatchFeedback(injectedExpIDs, execErr == nil)
 		}

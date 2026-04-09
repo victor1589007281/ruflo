@@ -62,6 +62,8 @@ var createKW = []string{
 	"帮我调研", "帮我研究", "帮我开发", "帮我实现",
 	"帮我辩论", "帮我分析", "帮我讨论", "帮我构建",
 	"组织调研", "安排开发", "发起辩论", "帮我对比",
+	"帮我盯盘", "分析下", "帮我写文章", "帮我写博客",
+	"帮我分析股票", "帮我看看", "帮我写公众号",
 }
 
 var statusKW = []string{
@@ -85,6 +87,8 @@ var wfDetect = map[string][]string{
 	"research":    {"调研", "研究", "调查", "分析", "探索", "对比分析", "了解", "评估"},
 	"debate":      {"辩论", "讨论", "对比", "权衡", "利弊", "优劣", "pk", "vs", "还是"},
 	"swarm":       {"蜂群", "swarm", "并行分析", "全面调研", "深度分析", "多角度", "自动拆解"},
+	"finance":     {"股票", "股价", "盯盘", "交易", "买入", "卖出", "持仓", "行情", "大盘", "a股", "美股", "港股", "基金", "投资建议", "财报", "估值"},
+	"techblog":    {"写文章", "写博客", "公众号", "技术文章", "源码分析", "写作", "排版", "发文", "文章创作"},
 }
 
 // Recognize 从用户文本中识别团队协作意图。
@@ -165,13 +169,15 @@ func (ir *IntentRecognizer) keywordDetect(lower, original string) *TeamIntent {
 const extractSysPrompt = `你是命令解析器。给定用户的中文消息，提取多Agent协作任务的参数。
 
 输出 JSON（仅JSON，不要解释）:
-{"workflow":"development|research|debate|swarm","objective":"简洁的任务目标","teamName":"kebab-case英文短名"}
+{"workflow":"development|research|debate|swarm|finance|techblog","objective":"简洁的任务目标","teamName":"kebab-case英文短名"}
 
 判断规则:
 - development: 编写代码/实现功能/构建系统
 - research: 调研/分析/探索/对比方案
 - debate: 辩论/讨论利弊/权衡选择
-- swarm: 复杂任务需要多角度并行分析/全面调研/自动拆解子任务`
+- swarm: 复杂任务需要多角度并行分析/全面调研/自动拆解子任务
+- finance: 股票分析/盯盘/交易建议/财报分析/投资评估
+- techblog: 写技术文章/公众号文章/博客/源码分析文章`
 
 func (ir *IntentRecognizer) extractWithLLM(ctx context.Context, text string, intent *TeamIntent) {
 	resp, err := ir.llm.SimpleComplete(ctx, extractSysPrompt, text)

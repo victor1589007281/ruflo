@@ -376,6 +376,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *ProductionTeam) {
 	swarm := NewSwarmOrchestrator(ptm.llm, ptm.pool, ptm.taskTracker, ptm.notify, team.ChatID, 8)
 	swarm.evolution = ptm.evolution
+	swarm.roles = ptm.roles
 
 	results, err := swarm.Execute(ctx, team, team.Objective)
 	if err != nil {
