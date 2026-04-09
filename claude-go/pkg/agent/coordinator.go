@@ -163,6 +163,11 @@ func (c *Coordinator) runPipelineWithRecovery(
 			return allResults, fmt.Errorf("工作流死锁: 无可执行阶段")
 		}
 
+		// 自动扩缩池
+		if c.pool != nil {
+			c.pool.AutoScale(len(ready))
+		}
+
 		parallelGroup := filterParallel(ready)
 		if len(parallelGroup) > 1 {
 			stageResults := c.executeParallelWithRetry(ctx, parallelGroup, objective, results, team, executor)

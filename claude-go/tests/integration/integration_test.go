@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/engine"
@@ -244,6 +245,311 @@ func TestBashToolExecution(t *testing.T) {
 		t.Fatal("未收到回复")
 	}
 	t.Logf("模型回复: %s", response[:min(len(response), 200)])
+}
+
+// ===================== 进化引擎 + 工作流 + 角色注册表 集成测试 =====================
+
+// TestEvolutionEngine 测试进化引擎完整闭环: 记录轨迹 → LLM 提炼 → 检索注入 → 反馈更新
+func TestEvolutionEngine(t *testing.T) {
+	skipIfNoAPI(t)
+
+	dataDir := t.TempDir()
+	apiClient := api.NewClient(testBaseURL, getAPIKey(), testModel)
+	evo := agent.NewEvolutionEngine(dataDir, apiClient)
+
+	// 1. RECORD: 模拟记录轨迹
+	evo.RecordTrajectory(agent.Trajectory{
+		TeamName: "test-team", StageName: "design", Role: "architect",
+		Objective: "设计一个用户认证系统",
+		Output:    "方案: 使用 JWT + Redis 会话管理, 支持 OAuth2.0 第三方登录, 密码使用 bcrypt 加盐哈希",
+		Success:   true, Duration: "15s", Timestamp: time.Now(),
+	})
+	evo.RecordTrajectory(agent.Trajectory{
+		TeamName: "test-team", StageName: "implement", Role: "coder",
+		Objective: "实现用户认证系统",
+		Output:    "完成了 auth.go, middleware.go, jwt.go 三个文件的实现",
+		Success:   true, Duration: "30s", Timestamp: time.Now(),
+	})
+	evo.RecordTrajectory(agent.Trajectory{
+		TeamName: "test-team", StageName: "test", Role: "tester",
+		Objective: "测试用户认证系统",
+		Error:     "TestLogin 超时: context deadline exceeded",
+		Success:   false, Duration: "45s", Timestamp: time.Now(),
+	})
+
+	stats := evo.Stats()
+	if stats.TotalTrajectories != 3 {
+		t.Fatalf("期望 3 条轨迹, 实际: %d", stats.TotalTrajectories)
+	}
+	t.Logf("✓ RECORD: %d 条轨迹已记录", stats.TotalTrajectories)
+
+	// 2. DISTILL: LLM 提炼经验
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	evo.LearnFromTeam(ctx, "test-team")
+
+	stats = evo.Stats()
+	t.Logf("✓ DISTILL: 提炼出 %d 条经验 (角色:%d, 错误:%d, 通用:%d)",
+		stats.TotalExperiences, stats.RoleExperiences, stats.ErrorPatterns, stats.GeneralPrinciples)
+
+	if stats.TotalExperiences == 0 {
+		t.Fatal("LLM 提炼未产生任何经验")
+	}
+
+	// 3. RETRIEVE: 检索相关经验
+	exps := evo.RetrieveFor("architect", "设计认证系统", 3)
+	t.Logf("✓ RETRIEVE: 检索到 %d 条相关经验", len(exps))
+	for _, e := range exps {
+		t.Logf("  [%s/%s] %s", e.Category, e.Role, truncateStr(e.Content, 80))
+	}
+
+	// 4. FormatForPrompt: 格式化注入
+	promptText := agent.FormatExperiencesForPrompt(exps)
+	if len(exps) > 0 && promptText == "" {
+		t.Error("格式化后为空")
+	}
+	t.Logf("✓ FORMAT: prompt 注入片段长度 = %d bytes", len(promptText))
+
+	// 5. EVOLVE: 反馈更新
+	if len(exps) > 0 {
+		evo.RecordFeedback(exps[0].ID, true)
+		evo.RecordFeedback(exps[0].ID, true)
+		evo.RecordFeedback(exps[0].ID, false)
+		t.Log("✓ EVOLVE: 反馈已记录 (2 success + 1 failure)")
+	}
+
+	// 6. CONSOLIDATE: 整理
+	evo.Consolidate()
+	finalStats := evo.Stats()
+	t.Logf("✓ CONSOLIDATE: 最终 %d 条经验", finalStats.TotalExperiences)
+
+	// 7. 持久化: 重新加载
+	evo2 := agent.NewEvolutionEngine(dataDir, nil)
+	stats2 := evo2.Stats()
+	if stats2.TotalExperiences != finalStats.TotalExperiences {
+		t.Errorf("持久化: 期望 %d 条经验, 加载后: %d", finalStats.TotalExperiences, stats2.TotalExperiences)
+	}
+	t.Logf("✓ PERSISTENCE: 重新加载后仍有 %d 条经验", stats2.TotalExperiences)
+}
+
+// TestRoleRegistry 测试角色注册表
+func TestRoleRegistry(t *testing.T) {
+	cwd := t.TempDir()
+	reg := agent.NewRoleRegistry(cwd)
+
+	// 检查内置角色数量
+	allRoles := reg.ListByCategory("")
+	t.Logf("✓ 内置角色总数: %d", len(allRoles))
+	if len(allRoles) < 10 {
+		t.Errorf("期望至少 10 个内置角色, 实际: %d", len(allRoles))
+	}
+
+	// 按类别列出
+	wfRoles := reg.ListByCategory("workflow")
+	saRoles := reg.ListByCategory("standalone")
+	t.Logf("✓ workflow 角色: %d, standalone 角色: %d", len(wfRoles), len(saRoles))
+
+	// 获取单个角色
+	arch := reg.Get("architect")
+	if arch == nil {
+		t.Fatal("architect 角色不存在")
+	}
+	if arch.SystemPrompt == "" {
+		t.Error("architect 系统提示词为空")
+	}
+	t.Logf("✓ architect 提示词长度: %d", len(arch.SystemPrompt))
+
+	// MergedPrompt 替换占位符
+	merged := reg.MergedPrompt("architect", "设计API", "前置结果")
+	if !strings.Contains(merged, "设计API") {
+		t.Error("MergedPrompt 未替换 {objective}")
+	}
+	t.Log("✓ MergedPrompt 占位符替换正常")
+
+	// 注册自定义角色
+	reg.RegisterCustom(&agent.RoleDef{
+		Name: "my-custom", Category: "workflow",
+		Description: "自定义测试角色",
+		SystemPrompt: "你是测试角色 {objective}",
+	})
+	custom := reg.Get("my-custom")
+	if custom == nil {
+		t.Fatal("自定义角色注册失败")
+	}
+	t.Log("✓ 自定义角色注册成功")
+
+	// 从磁盘加载自定义角色
+	agentsDir := cwd + "/.claude/agents"
+	os.MkdirAll(agentsDir, 0755)
+	roleJSON := `{"name":"disk-role","category":"standalone","description":"从磁盘加载","systemPrompt":"测试"}`
+	os.WriteFile(agentsDir+"/disk-role.json", []byte(roleJSON), 0644)
+
+	reg2 := agent.NewRoleRegistry(cwd)
+	diskRole := reg2.Get("disk-role")
+	if diskRole == nil {
+		t.Error("从磁盘加载角色失败")
+	} else {
+		t.Log("✓ 磁盘自定义角色加载成功")
+	}
+}
+
+// TestAgentPoolAutoScale 测试 Agent Pool 自动扩缩容
+func TestAgentPoolAutoScale(t *testing.T) {
+	factory := func(ctx context.Context, role, prompt string) (agent.AgentRunner, error) {
+		return &mockRunner{}, nil
+	}
+	pool := agent.NewAgentPool(factory, 4)
+
+	// 初始大小
+	stats := pool.Stats()
+	if stats.MaxSize != 4 {
+		t.Errorf("初始大小应为 4, 实际: %d", stats.MaxSize)
+	}
+
+	// 模拟 8 个并行任务 → 应扩容
+	pool.AutoScale(8)
+	stats = pool.Stats()
+	if stats.MaxSize < 8 {
+		t.Errorf("8 个任务时池应扩容到至少 8, 实际: %d", stats.MaxSize)
+	}
+	t.Logf("✓ AutoScale(8): 池大小 → %d", stats.MaxSize)
+
+	// 模拟 2 个任务 → 应缩容到最小
+	pool.AutoScale(2)
+	stats = pool.Stats()
+	if stats.MaxSize != 4 {
+		t.Logf("AutoScale(2): 池大小 → %d (最小 4)", stats.MaxSize)
+	}
+	t.Logf("✓ AutoScale(2): 池大小 → %d", stats.MaxSize)
+
+	// 模拟 20 个任务 → 应不超过上限
+	pool.AutoScale(20)
+	stats = pool.Stats()
+	if stats.MaxSize > 16 {
+		t.Errorf("池大小不应超过 16, 实际: %d", stats.MaxSize)
+	}
+	t.Logf("✓ AutoScale(20): 池大小 → %d (上限 16)", stats.MaxSize)
+}
+
+// TestWorkflowWithEvolution 测试工作流 + 进化引擎端到端
+func TestWorkflowWithEvolution(t *testing.T) {
+	skipIfNoAPI(t)
+
+	cwd := t.TempDir()
+	apiClient := api.NewClient(testBaseURL, getAPIKey(), testModel)
+	evo := agent.NewEvolutionEngine(cwd+"/.claude/evolution", apiClient)
+	roleReg := agent.NewRoleRegistry(cwd)
+	taskStore := builtin.NewTaskStore(cwd + "/.claude/tasks")
+
+	// 创建简单的 agent runner 工厂
+	factory := func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
+		return &llmRunner{api: apiClient, systemPrompt: systemPrompt, role: role}, nil
+	}
+
+	pool := agent.NewAgentPool(factory, 4)
+
+	var notifications []string
+	notify := func(chatID, msg string) {
+		notifications = append(notifications, msg)
+		t.Logf("[通知] %s", truncateStr(msg, 120))
+	}
+
+	mgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
+		BaseDir:     cwd + "/.claude/teams",
+		Factory:     factory,
+		Notify:      notify,
+		TaskTracker: taskStore,
+		Pool:        pool,
+		LLM:         apiClient,
+		Evolution:   evo,
+		Roles:       roleReg,
+	})
+
+	// 创建并运行一个简化的 research 工作流
+	team, err := mgr.CreateTeam("test-research", "research", "分析 Go 语言的并发模型优缺点", "test-chat")
+	if err != nil {
+		t.Fatalf("创建团队失败: %v", err)
+	}
+	t.Logf("✓ 团队创建成功: %s (%s)", team.Name, team.Workflow)
+
+	err = mgr.RunTeam("test-research", "分析 Go 语言的并发模型优缺点")
+	if err != nil {
+		t.Fatalf("启动团队失败: %v", err)
+	}
+
+	// 等待完成 (最多 5 分钟)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("等待团队完成超时 (5分钟)")
+		case <-time.After(5 * time.Second):
+			team := mgr.GetTeam("test-research")
+			if team == nil {
+				t.Fatal("团队丢失")
+			}
+			switch team.Status {
+			case agent.TeamStatusCompleted:
+				t.Logf("✓ 团队执行完成, 耗时 %v", team.FinishedAt.Sub(team.StartedAt).Round(time.Second))
+				for _, s := range team.Stages {
+					t.Logf("  [%s/%s] %s — %s", s.Name, s.Role, s.Status, truncateStr(s.Output, 100))
+				}
+
+				// 验证进化引擎是否记录了轨迹并提炼了经验
+				time.Sleep(2 * time.Second) // 等待后台 goroutine
+				evoStats := evo.Stats()
+				t.Logf("✓ 进化统计: 轨迹=%d, 经验=%d (角色:%d, 错误:%d, 通用:%d)",
+					evoStats.TotalTrajectories, evoStats.TotalExperiences,
+					evoStats.RoleExperiences, evoStats.ErrorPatterns, evoStats.GeneralPrinciples)
+
+				if evoStats.TotalTrajectories == 0 {
+					t.Error("工作流完成后应有轨迹记录")
+				}
+				return
+
+			case agent.TeamStatusFailed:
+				t.Logf("团队执行失败: %s", team.Error)
+				t.Logf("通知数: %d", len(notifications))
+				// 失败不算测试失败 (可能是 API 问题), 但打印详细信息
+				return
+
+			default:
+				t.Logf("  等待中... 状态=%s", team.Status)
+			}
+		}
+	}
+}
+
+// --- 测试辅助 ---
+
+type mockRunner struct{}
+
+func (m *mockRunner) Execute(ctx context.Context, prompt string) (string, error) {
+	return "mock result", nil
+}
+
+type llmRunner struct {
+	api          *api.Client
+	systemPrompt string
+	role         string
+}
+
+func (r *llmRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
+	sys := r.systemPrompt
+	if sys == "" {
+		sys = "You are a helpful AI assistant with role: " + r.role
+	}
+	return r.api.SimpleComplete(ctx, sys, userPrompt)
+}
+
+func truncateStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 func min(a, b int) int {

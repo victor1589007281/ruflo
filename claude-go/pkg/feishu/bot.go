@@ -151,15 +151,16 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	taskStorePath := config.Cwd + "/.claude/tasks.json"
 	bot.taskStore = builtin.NewTaskStore(taskStorePath)
 
-	// 7. 创建会话管理器 (传入共享组件, 包括 TaskStore)
-	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore)
-
-	// 8. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
-	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)
-
-	// 9. 创建 Evolution 自动进化引擎
+	// 7. 创建 Evolution 自动进化引擎 + Role Registry
 	evoDir := config.Cwd + "/.claude/evolution"
 	bot.evolution = agent.NewEvolutionEngine(evoDir, aiClient)
+	roleReg := agent.NewRoleRegistry(config.Cwd)
+
+	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles)
+	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore, bot.evolution, roleReg)
+
+	// 9. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
+	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)
 
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
@@ -171,6 +172,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		LLM:         aiClient,
 		Evolution:   bot.evolution,
 		Dreamer:     &dreamAdapter{dreamer: bot.dreamer},
+		Roles:       roleReg,
 	})
 
 	// 11. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)

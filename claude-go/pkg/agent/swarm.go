@@ -278,6 +278,11 @@ func (s *SwarmOrchestrator) executeLevel(
 	prevResults map[string]string,
 	team *ProductionTeam,
 ) []StageResult {
+	// 自动扩缩池: 根据本层并发任务数调整
+	if s.pool != nil {
+		s.pool.AutoScale(len(level))
+	}
+
 	results := make([]StageResult, len(level))
 	var wg sync.WaitGroup
 

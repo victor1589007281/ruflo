@@ -283,13 +283,14 @@ Render your verdict:
 }
 
 // WorkflowExecutor 工作流执行器。
-// 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff + Evolution。
+// 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff + Evolution + Roles。
 type WorkflowExecutor struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	chatID      string
 	taskTracker TaskTracker      // 复用 V2 Task 系统 (可为 nil)
 	evolution   *EvolutionEngine // 自动进化引擎 (可为 nil)
+	roles       *RoleRegistry    // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
 }
 
 // Execute 执行工作流, 返回所有阶段结果
@@ -479,7 +480,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		}
 		bbContext = team.Blackboard.HandoffContext(completedStages, stage.Role)
 	}
-	prompt := buildStagePrompt(stage, objective, prevResults)
+	prompt := buildStagePromptWithRoles(stage, objective, prevResults, we.roles)
 	if bbContext != "" {
 		prompt = bbContext + "\n\n---\n\n" + prompt
 	}
@@ -622,17 +623,25 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	}
 }
 
-func buildStagePrompt(stage StageDef, objective string, prevResults map[string]string) string {
-	prompt := stage.Prompt
-	prompt = strings.ReplaceAll(prompt, "{objective}", objective)
-
-	// 合并所有依赖阶段的输出
+// buildStagePromptWithRoles 优先从 RoleRegistry 获取提示词，降级用 StageDef.Prompt。
+func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map[string]string, roles *RoleRegistry) string {
 	var prevOutput strings.Builder
 	for _, dep := range stage.DependsOn {
 		if r, ok := prevResults[dep]; ok {
 			prevOutput.WriteString(fmt.Sprintf("### Output from %s:\n%s\n\n", dep, r))
 		}
 	}
+
+	// 优先从角色注册表获取 (包含专属 Skills)
+	if roles != nil {
+		if merged := roles.MergedPrompt(stage.Role, objective, prevOutput.String()); merged != "" {
+			return merged
+		}
+	}
+
+	// 降级: 使用 StageDef 中的内联 Prompt
+	prompt := stage.Prompt
+	prompt = strings.ReplaceAll(prompt, "{objective}", objective)
 	prompt = strings.ReplaceAll(prompt, "{prev_result}", prevOutput.String())
 	return prompt
 }

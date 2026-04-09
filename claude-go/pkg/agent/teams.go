@@ -112,6 +112,7 @@ type ProductionTeamManager struct {
 	llm         LLMClient        // LLM 客户端 (蜂群分解)
 	evolution   *EvolutionEngine // 自动进化引擎
 	dreamer     DreamRecorder    // Dreaming 接口 (覆盖 team agent 会话)
+	roles       *RoleRegistry    // 角色注册表
 }
 
 // TeamManagerConfig 团队管理器配置。
@@ -124,6 +125,7 @@ type TeamManagerConfig struct {
 	LLM         LLMClient
 	Evolution   *EvolutionEngine
 	Dreamer     DreamRecorder
+	Roles       *RoleRegistry
 }
 
 // NewProductionTeamManager 创建生产级团队管理器。
@@ -141,6 +143,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		llm:         cfg.LLM,
 		evolution:   cfg.Evolution,
 		dreamer:     cfg.Dreamer,
+		roles:       cfg.Roles,
 	}
 	ptm.loadPersistedTeams()
 	return ptm
@@ -311,6 +314,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		chatID:      team.ChatID,
 		taskTracker: ptm.taskTracker,
 		evolution:   ptm.evolution,
+		roles:       ptm.roles,
 	}
 
 	// 使用 Coordinator 带重试和检查点执行

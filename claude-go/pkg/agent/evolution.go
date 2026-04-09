@@ -610,23 +610,47 @@ type EvolutionStats struct {
 
 // --- 工具函数 ---
 
+// evolutionTokenize 中英文混合分词。
+// 英文: 按空格/标点分割为单词。
+// 中文: 无天然分隔符, 使用字符 unigram + bigram 策略 (无需分词器也能有效检索)。
 func evolutionTokenize(text string) []string {
 	text = strings.ToLower(text)
 	var tokens []string
-	var current strings.Builder
+	var latin strings.Builder
+	var cjkChars []rune
+
+	flushLatin := func() {
+		if latin.Len() > 1 {
+			tokens = append(tokens, latin.String())
+		}
+		latin.Reset()
+	}
+	flushCJK := func() {
+		// CJK unigrams
+		for _, c := range cjkChars {
+			tokens = append(tokens, string(c))
+		}
+		// CJK bigrams (更有意义的中文匹配)
+		for i := 0; i+1 < len(cjkChars); i++ {
+			tokens = append(tokens, string(cjkChars[i])+string(cjkChars[i+1]))
+		}
+		cjkChars = cjkChars[:0]
+	}
+
 	for _, r := range text {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r >= 0x4e00 && r <= 0x9fff {
-			current.WriteRune(r)
+		if r >= 0x4e00 && r <= 0x9fff {
+			flushLatin()
+			cjkChars = append(cjkChars, r)
+		} else if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			flushCJK()
+			latin.WriteRune(r)
 		} else {
-			if current.Len() > 1 {
-				tokens = append(tokens, current.String())
-			}
-			current.Reset()
+			flushLatin()
+			flushCJK()
 		}
 	}
-	if current.Len() > 1 {
-		tokens = append(tokens, current.String())
-	}
+	flushLatin()
+	flushCJK()
 	return tokens
 }
 

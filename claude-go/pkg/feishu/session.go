@@ -84,12 +84,14 @@ type SessionManager struct {
 	dreamer        *dreaming.Dreamer
 	memoryStore    *memory.TieredStore
 	hookConfigs    []types.HookConfig
-	taskStore      *builtin.TaskStore // 共享 V2 Task 存储 (Teams + LLM 工具共用)
+	taskStore      *builtin.TaskStore     // 共享 V2 Task 存储 (Teams + LLM 工具共用)
+	evolution      *agent.EvolutionEngine // 进化引擎 (注入 agent runner hooks)
+	roleRegistry   *agent.RoleRegistry    // 角色注册表
 }
 
 // NewSessionManager 创建会话管理器。
 // 所有共享组件由 Bot 创建并传入。
-func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, memStore *memory.TieredStore, hookConfigs []types.HookConfig, taskStore *builtin.TaskStore) *SessionManager {
+func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, memStore *memory.TieredStore, hookConfigs []types.HookConfig, taskStore *builtin.TaskStore, evolution *agent.EvolutionEngine, roleRegistry *agent.RoleRegistry) *SessionManager {
 	maxSessions := config.MaxSessions
 	if maxSessions <= 0 {
 		maxSessions = 100
@@ -111,6 +113,8 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 		memoryStore:    memStore,
 		hookConfigs:    hookConfigs,
 		taskStore:      taskStore,
+		evolution:      evolution,
+		roleRegistry:   roleRegistry,
 	}
 
 	// 启动后台清理 goroutine
@@ -445,7 +449,8 @@ type sessionAgentRunner struct {
 	systemPrompt string
 }
 
-// Execute 执行 agent 任务 (创建独立 QueryEngine)
+// Execute 执行 agent 任务 (创建独立 QueryEngine, 复用主会话运行模式)。
+// 集成: Role Skills + Evolution 经验 + Dreaming 记录 (通过 Hook 注入)。
 func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
 	nestedReg := tool.NewRegistry()
 	builtin.RegisterBaseToolsWithStore(nestedReg, r.sm.taskStore)
@@ -456,7 +461,6 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		nestedReg.Register(skills.NewSkillTool(r.sm.skillReg))
 	}
 
-	// 注册 Agent 工具 (子 agent 也可以派生子 agent)
 	var runAgentFn agent.RunAgentFunc
 	runAgentFn = func(aCtx context.Context, prompt string, opts agent.RunOptions) (string, error) {
 		return r.sm.runNestedAgent(aCtx, runAgentFn, prompt, opts)
@@ -470,8 +474,25 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	promptMgr := prompt.NewManager(r.sm.config.Cwd)
 	promptMgr.Model = r.sm.config.Model
 
-	if r.systemPrompt != "" {
-		promptMgr.CustomPrompt = r.systemPrompt
+	// 角色提示词: 优先使用外部传入的, 再尝试从 RoleRegistry 获取 (含专属 Skills)
+	effectivePrompt := r.systemPrompt
+	if effectivePrompt == "" && r.sm.roleRegistry != nil {
+		effectivePrompt = r.sm.roleRegistry.MergedPrompt(r.role, "", "")
+	}
+	if effectivePrompt != "" {
+		promptMgr.CustomPrompt = effectivePrompt
+	}
+
+	// Hook 注入: Evolution 经验检索 (SessionStart 时注入到 PostSampling)
+	if r.sm.evolution != nil {
+		exps := r.sm.evolution.RetrieveFor(r.role, userPrompt, 3)
+		if len(exps) > 0 {
+			expContext := agent.FormatExperiencesForPrompt(exps)
+			hookRunner.RegisterPostSamplingHook(func(_ []types.Message) {
+				// 经验 ID 记录, 后续由 workflow/swarm 层面反馈
+			})
+			promptMgr.CustomPrompt = expContext + "\n" + promptMgr.CustomPrompt
+		}
 	}
 
 	cfg := &engine.Config{
@@ -485,7 +506,9 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	}
 
 	eng := engine.NewQueryEngine(cfg, r.sm.apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
+	eng.MemoryStore = r.sm.memoryStore
 
+	start := time.Now()
 	var sb strings.Builder
 	for msg := range eng.SubmitMessage(ctx, userPrompt) {
 		if msg.Type != types.MessageTypeAssistant {
@@ -497,7 +520,29 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 			}
 		}
 	}
-	return sb.String(), nil
+	result := sb.String()
+
+	// Hook: Dreaming 记录 (覆盖 team agent 会话)
+	if r.sm.dreamer != nil && result != "" {
+		r.sm.dreamer.RecordSession(dreaming.SessionRecord{
+			ChatID:  "agent:" + r.role,
+			EndTime: time.Now(),
+			Summary: truncateForDream(result),
+		})
+	}
+
+	// Hook: 记忆提取 (复用主会话的 Episodic Memory 逻辑)
+	if r.sm.memoryStore != nil && result != "" {
+		r.sm.memoryStore.Add(&memory.MemoryEntry{
+			Content:    truncateForDream(result),
+			Source:     "agent:" + r.role,
+			Importance: 0.5,
+			Topics:     extractTopics(result),
+		})
+	}
+
+	_ = start // used by evolution trajectory in workflow layer
+	return result, nil
 }
 
 // extractMessageText 从 Message 中提取文本内容

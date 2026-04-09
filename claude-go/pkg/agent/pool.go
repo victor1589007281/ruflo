@@ -25,6 +25,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -177,6 +178,33 @@ func (p *AgentPool) ActiveCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.agents)
+}
+
+// AutoScale 根据待执行任务数自动调整池大小。
+// 策略: 池大小 = clamp(pendingTasks + 2, minSize, maxCap)
+// 确保有足够并发槽位，同时不过度分配。
+func (p *AgentPool) AutoScale(pendingTasks int) {
+	p.mu.Lock()
+	currentActive := len(p.agents)
+	currentMax := p.maxSize
+	p.mu.Unlock()
+
+	const minSize = 4
+	const maxCap = 16
+
+	desired := pendingTasks + 2 // 额外预留 2 个缓冲槽位
+	if desired < minSize {
+		desired = minSize
+	}
+	if desired > maxCap {
+		desired = maxCap
+	}
+
+	if desired != currentMax {
+		log.Printf("[AgentPool] AutoScale: active=%d, pending=%d, %d → %d",
+			currentActive, pendingTasks, currentMax, desired)
+		p.Scale(desired)
+	}
 }
 
 // Stats 返回池统计。
