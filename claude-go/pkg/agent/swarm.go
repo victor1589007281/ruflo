@@ -54,6 +54,7 @@ type SwarmOrchestrator struct {
 	notify      NotifyFunc
 	chatID      string
 	maxAgents   int
+	evolution   *EvolutionEngine
 }
 
 // NewSwarmOrchestrator 创建蜂群编排器。
@@ -333,6 +334,18 @@ func (s *SwarmOrchestrator) executeSubTask(
 
 	prompt := sb.String()
 
+	// 注入进化经验
+	var injectedExpIDs []string
+	if s.evolution != nil {
+		exps := s.evolution.RetrieveFor(task.Role, task.Description, 3)
+		if len(exps) > 0 {
+			prompt = FormatExperiencesForPrompt(exps) + "\n" + prompt
+			for _, e := range exps {
+				injectedExpIDs = append(injectedExpIDs, e.ID)
+			}
+		}
+	}
+
 	// 通过 AgentPool 获取 agent
 	if s.pool == nil {
 		return StageResult{Name: task.ID, Role: task.Role, Status: TaskFailed, Error: "agent pool 未初始化"}
@@ -393,6 +406,30 @@ func (s *SwarmOrchestrator) executeSubTask(
 			_ = s.taskTracker.SetTaskStatus(v2ID, "failed")
 		} else {
 			_ = s.taskTracker.SetTaskStatus(v2ID, "completed")
+		}
+	}
+
+	// 记录轨迹 + 经验反馈
+	if s.evolution != nil {
+		s.evolution.RecordTrajectory(Trajectory{
+			TeamName:  team.Name,
+			StageName: task.ID,
+			Role:      task.Role,
+			Objective: task.Description,
+			Input:     prompt,
+			Output:    result,
+			Error: func() string {
+				if execErr != nil {
+					return execErr.Error()
+				}
+				return ""
+			}(),
+			Success:   execErr == nil,
+			Duration:  duration.Round(time.Second).String(),
+			Timestamp: time.Now(),
+		})
+		if len(injectedExpIDs) > 0 {
+			s.evolution.RecordBatchFeedback(injectedExpIDs, execErr == nil)
 		}
 	}
 

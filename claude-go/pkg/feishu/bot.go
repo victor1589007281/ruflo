@@ -32,6 +32,22 @@ const (
 	maxCardContentLen = 28000
 )
 
+// dreamAdapter 适配 dreaming.Dreamer 到 agent.DreamRecorder 接口。
+type dreamAdapter struct {
+	dreamer *dreaming.Dreamer
+}
+
+func (da *dreamAdapter) RecordSession(record agent.DreamSessionRecord) {
+	if da.dreamer == nil {
+		return
+	}
+	da.dreamer.RecordSession(dreaming.SessionRecord{
+		ChatID:  record.ChatID,
+		EndTime: record.EndTime,
+		Summary: record.Summary,
+	})
+}
+
 // Bot 飞书机器人。
 // 通过 WebSocket 长连接接收飞书消息事件，
 // 将用户消息桥接到 claude-go 的 QueryEngine，
@@ -62,6 +78,7 @@ type Bot struct {
 	teamMgr     *agent.ProductionTeamManager // 生产级 Agent Teams 管理器
 	intentRec   *agent.IntentRecognizer     // 自然语言意图识别器
 	taskStore   *builtin.TaskStore          // 共享 V2 Task 存储
+	evolution   *agent.EvolutionEngine      // 自动进化引擎
 	cfgWatcher  *hotreload.Watcher          // 配置热加载监控器
 	startTime   time.Time                   // 启动时间
 }
@@ -140,16 +157,26 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 8. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
 	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)
 
-	// 9. 初始化 Agent Teams 管理器 (注入 TaskTracker + Pool + LLM)
-	teamsDir := config.Cwd + "/.claude/teams"
-	bot.teamMgr = agent.NewProductionTeamManager(teamsDir, bot.sessions.CreateAgentRunner, func(chatID, msg string) {
-		bot.sendLongMessage(context.Background(), chatID, msg)
-	}, bot.taskStore, agentPool, aiClient)
+	// 9. 创建 Evolution 自动进化引擎
+	evoDir := config.Cwd + "/.claude/evolution"
+	bot.evolution = agent.NewEvolutionEngine(evoDir, aiClient)
 
-	// 10. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
+	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
+	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
+		BaseDir:     config.Cwd + "/.claude/teams",
+		Factory:     bot.sessions.CreateAgentRunner,
+		Notify:      func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
+		TaskTracker: bot.taskStore,
+		Pool:        agentPool,
+		LLM:         aiClient,
+		Evolution:   bot.evolution,
+		Dreamer:     &dreamAdapter{dreamer: bot.dreamer},
+	})
+
+	// 11. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
 	bot.intentRec = agent.NewIntentRecognizer(aiClient)
 
-	// 11. 启动配置热加载 (如果有配置文件)
+	// 12. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {
 		bot.startConfigWatcher(config.MCPConfigPath)
 	}
@@ -503,6 +530,12 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 					formatTimeSince(ds.LastDreamTime), ds.SessionsSinceDream, ds.IsDreaming)
 			}
 		}
+		evoInfo := "未启用"
+		if b.evolution != nil {
+			es := b.evolution.Stats()
+			evoInfo = fmt.Sprintf("经验 %d 条 (角色:%d, 错误:%d, 通用:%d), 轨迹 %d 条",
+				es.TotalExperiences, es.RoleExperiences, es.ErrorPatterns, es.GeneralPrinciples, es.TotalTrajectories)
+		}
 		status := fmt.Sprintf("**运行状态**\n"+
 			"- 运行时长: %v\n"+
 			"- 总会话数: %d\n"+
@@ -511,8 +544,9 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- MCP: %s\n"+
 			"- Skills: %s\n"+
 			"- Dreaming: %s\n"+
+			"- Evolution: %s\n"+
 			"- 工作目录: %s",
-			uptime, total, active, b.config.Model, mcpInfo, skillInfo, dreamInfo, b.config.Cwd)
+			uptime, total, active, b.config.Model, mcpInfo, skillInfo, dreamInfo, evoInfo, b.config.Cwd)
 		b.sendTextReply(ctx, messageID, status)
 		return true
 

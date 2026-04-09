@@ -45,6 +45,19 @@ type TaskTracker interface {
 	SetTaskStatus(id, status string) error
 }
 
+// DreamRecorder Dreaming 记录接口, 解耦 dreaming 包依赖。
+// 实现者: dreaming.Dreamer (通过 duck typing)。
+type DreamRecorder interface {
+	RecordSession(record DreamSessionRecord)
+}
+
+// DreamSessionRecord 与 dreaming.SessionRecord 结构对齐。
+type DreamSessionRecord struct {
+	ChatID  string
+	EndTime time.Time
+	Summary string
+}
+
 // CreateAgentFunc 创建 Agent 运行器的工厂函数。
 type CreateAgentFunc func(ctx context.Context, role, systemPrompt string) (AgentRunner, error)
 
@@ -95,26 +108,39 @@ type ProductionTeamManager struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	taskTracker TaskTracker // 复用 V2 Task 系统
-	pool        *AgentPool  // Agent 池 (动态扩缩)
-	llm         LLMClient   // LLM 客户端 (蜂群分解)
+	pool        *AgentPool       // Agent 池 (动态扩缩)
+	llm         LLMClient        // LLM 客户端 (蜂群分解)
+	evolution   *EvolutionEngine // 自动进化引擎
+	dreamer     DreamRecorder    // Dreaming 接口 (覆盖 team agent 会话)
+}
+
+// TeamManagerConfig 团队管理器配置。
+type TeamManagerConfig struct {
+	BaseDir     string
+	Factory     CreateAgentFunc
+	Notify      NotifyFunc
+	TaskTracker TaskTracker
+	Pool        *AgentPool
+	LLM         LLMClient
+	Evolution   *EvolutionEngine
+	Dreamer     DreamRecorder
 }
 
 // NewProductionTeamManager 创建生产级团队管理器。
-// taskTracker 可为 nil (降级: 不创建 V2 Task)。
-// pool 可为 nil (降级: 不使用池化)。
-// llm 可为 nil (降级: 蜂群模式使用 fallback 分解)。
-func NewProductionTeamManager(baseDir string, factory CreateAgentFunc, notify NotifyFunc, taskTracker TaskTracker, pool *AgentPool, llm LLMClient) *ProductionTeamManager {
-	if notify == nil {
-		notify = func(_, _ string) {}
+func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
+	if cfg.Notify == nil {
+		cfg.Notify = func(_, _ string) {}
 	}
 	ptm := &ProductionTeamManager{
 		teams:       make(map[string]*ProductionTeam),
-		baseDir:     baseDir,
-		factory:     factory,
-		notify:      notify,
-		taskTracker: taskTracker,
-		pool:        pool,
-		llm:         llm,
+		baseDir:     cfg.BaseDir,
+		factory:     cfg.Factory,
+		notify:      cfg.Notify,
+		taskTracker: cfg.TaskTracker,
+		pool:        cfg.Pool,
+		llm:         cfg.LLM,
+		evolution:   cfg.Evolution,
+		dreamer:     cfg.Dreamer,
 	}
 	ptm.loadPersistedTeams()
 	return ptm
@@ -284,6 +310,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		notify:      ptm.notify,
 		chatID:      team.ChatID,
 		taskTracker: ptm.taskTracker,
+		evolution:   ptm.evolution,
 	}
 
 	// 使用 Coordinator 带重试和检查点执行
@@ -312,6 +339,25 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	team.mu.Unlock()
 	team.persist()
 
+	// 触发进化学习 (DISTILL: 从轨迹中提炼经验)
+	if ptm.evolution != nil {
+		go func() {
+			ptm.evolution.LearnFromTeam(context.Background(), team.Name)
+			ptm.evolution.Consolidate()
+		}()
+	}
+
+	// 触发 Dreaming 记录 (覆盖 team agent 会话盲区)
+	if ptm.dreamer != nil {
+		for _, r := range results {
+			ptm.dreamer.RecordSession(DreamSessionRecord{
+				ChatID:  team.ChatID,
+				EndTime: time.Now(),
+				Summary: fmt.Sprintf("[Team:%s] [%s/%s] %s", team.Name, r.Name, r.Role, truncateResult(r.Output, 300)),
+			})
+		}
+	}
+
 	var summary string
 	for _, r := range results {
 		if r.Output != "" {
@@ -325,6 +371,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 // executeSwarm 蜂群模式执行
 func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *ProductionTeam) {
 	swarm := NewSwarmOrchestrator(ptm.llm, ptm.pool, ptm.taskTracker, ptm.notify, team.ChatID, 8)
+	swarm.evolution = ptm.evolution
 
 	results, err := swarm.Execute(ctx, team, team.Objective)
 	if err != nil {
@@ -342,6 +389,23 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 	team.Stages = results
 	team.mu.Unlock()
 	team.persist()
+
+	// 触发进化学习 + Dreaming
+	if ptm.evolution != nil {
+		go func() {
+			ptm.evolution.LearnFromTeam(context.Background(), team.Name)
+			ptm.evolution.Consolidate()
+		}()
+	}
+	if ptm.dreamer != nil {
+		for _, r := range results {
+			ptm.dreamer.RecordSession(DreamSessionRecord{
+				ChatID:  team.ChatID,
+				EndTime: time.Now(),
+				Summary: fmt.Sprintf("[Swarm:%s] [%s/%s] %s", team.Name, r.Name, r.Role, truncateResult(r.Output, 300)),
+			})
+		}
+	}
 
 	var summary string
 	for _, r := range results {

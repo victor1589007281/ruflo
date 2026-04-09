@@ -283,12 +283,13 @@ Render your verdict:
 }
 
 // WorkflowExecutor 工作流执行器。
-// 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff。
+// 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff + Evolution。
 type WorkflowExecutor struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	chatID      string
-	taskTracker TaskTracker // 复用 V2 Task 系统 (可为 nil)
+	taskTracker TaskTracker      // 复用 V2 Task 系统 (可为 nil)
+	evolution   *EvolutionEngine // 自动进化引擎 (可为 nil)
 }
 
 // Execute 执行工作流, 返回所有阶段结果
@@ -467,7 +468,7 @@ func (we *WorkflowExecutor) ExecuteSingleStage(ctx context.Context, stage StageD
 }
 
 // executeStage 执行单个阶段。
-// 集成 Blackboard 读/写 + V2 Task 创建/更新 + Structured Handoff。
+// 集成 Blackboard 读/写 + V2 Task 创建/更新 + Structured Handoff + Evolution。
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
 	// 1. 构建 prompt: 原有模板 + Blackboard 上下文 + Handoff 信息
 	bbContext := ""
@@ -481,6 +482,18 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	prompt := buildStagePrompt(stage, objective, prevResults)
 	if bbContext != "" {
 		prompt = bbContext + "\n\n---\n\n" + prompt
+	}
+
+	// 1b. 注入进化经验 (RETRIEVE: 执行前检索相关经验)
+	var injectedExpIDs []string
+	if we.evolution != nil {
+		exps := we.evolution.RetrieveFor(stage.Role, objective, 3)
+		if len(exps) > 0 {
+			prompt = FormatExperiencesForPrompt(exps) + "\n" + prompt
+			for _, e := range exps {
+				injectedExpIDs = append(injectedExpIDs, e.ID)
+			}
+		}
 	}
 
 	// 2. 创建 V2 Task (LLM 可通过 TaskList 看到团队进度)
@@ -518,6 +531,25 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			_ = we.taskTracker.SetTaskStatus(v2TaskID, "completed")
 		} else {
 			_ = we.taskTracker.SetTaskStatus(v2TaskID, "failed")
+		}
+	}
+
+	// 6. 记录执行轨迹 (RECORD) + 经验反馈 (EVOLVE)
+	if we.evolution != nil {
+		we.evolution.RecordTrajectory(Trajectory{
+			TeamName:  team.Name,
+			StageName: stage.Name,
+			Role:      stage.Role,
+			Objective: objective,
+			Input:     prompt,
+			Output:    sr.Output,
+			Error:     sr.Error,
+			Success:   sr.Status == TaskCompleted,
+			Duration:  sr.Duration,
+			Timestamp: time.Now(),
+		})
+		if len(injectedExpIDs) > 0 {
+			we.evolution.RecordBatchFeedback(injectedExpIDs, sr.Status == TaskCompleted)
 		}
 	}
 
