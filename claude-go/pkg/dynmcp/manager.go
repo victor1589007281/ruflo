@@ -17,10 +17,10 @@ package dynmcp
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 
+	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/tool"
 )
@@ -79,7 +79,7 @@ func (m *Manager) AddServer(ctx context.Context, config mcp.ServerConfig) error 
 	copy(callbacks, m.onChange)
 	m.mu.Unlock()
 
-	log.Printf("[DynMCP] 已添加: %s (%d 个工具)", config.Name, len(conn.Tools))
+	logging.For("dynmcp").Info("已添加", "server", config.Name, "tools", len(conn.Tools))
 
 	for _, cb := range callbacks {
 		cb()
@@ -103,10 +103,10 @@ func (m *Manager) RemoveServer(name string) error {
 	m.mu.Unlock()
 
 	if err := conn.Close(); err != nil {
-		log.Printf("[DynMCP] 关闭 %s 失败: %v", name, err)
+		logging.For("dynmcp").Warn("关闭失败", "server", name, "err", err)
 	}
 
-	log.Printf("[DynMCP] 已移除: %s", name)
+	logging.For("dynmcp").Info("已移除", "server", name)
 
 	for _, cb := range callbacks {
 		cb()
@@ -193,7 +193,7 @@ func (m *Manager) Shutdown() {
 	defer m.mu.Unlock()
 	for name, conn := range m.connections {
 		if err := conn.Close(); err != nil {
-			log.Printf("[DynMCP] 关闭 %s 失败: %v", name, err)
+			logging.For("dynmcp").Warn("关闭失败", "server", name, "err", err)
 		}
 	}
 	m.connections = make(map[string]*mcp.Connection)
@@ -203,7 +203,7 @@ func (m *Manager) Shutdown() {
 func (m *Manager) InitFromConfigs(ctx context.Context, configs []mcp.ServerConfig) {
 	for _, cfg := range configs {
 		if err := m.AddServer(ctx, cfg); err != nil {
-			log.Printf("[DynMCP] 初始化 %s 失败: %v", cfg.Name, err)
+			logging.For("dynmcp").Warn("初始化失败", "server", cfg.Name, "err", err)
 		}
 	}
 }

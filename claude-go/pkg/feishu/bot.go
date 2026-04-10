@@ -488,8 +488,9 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
-	// 意图识别: 中文自然语言 → 自动拆解为团队操作 (零侵入, 不匹配则透传)
-	if intent := b.intentRec.Recognize(ctx, userText); intent != nil && intent.Confidence >= 0.7 {
+	// 意图识别: 中文自然语言 → 自动拆解为团队操作 (MCP 感知, 零侵入, 不匹配则透传)
+	hasMCP := len(b.mcpMgr.ListServers()) > 0
+	if intent := b.intentRec.RecognizeWithMCPAwareness(ctx, userText, hasMCP); intent != nil && intent.Confidence >= 0.7 {
 		go b.handleTeamIntent(chatID, messageID, intent)
 		return nil
 	}

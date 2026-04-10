@@ -117,13 +117,9 @@ func (ee *EvolutionEngine) RecordTrajectory(t Trajectory) {
 	if t.Timestamp.IsZero() {
 		t.Timestamp = time.Now()
 	}
-	// 截断防止过大
-	if len(t.Input) > 2000 {
-		t.Input = t.Input[:2000] + "...(truncated)"
-	}
-	if len(t.Output) > 3000 {
-		t.Output = t.Output[:3000] + "...(truncated)"
-	}
+	// 智能截断: 保留前部 + 后部关键上下文，避免丢失重要信息
+	t.Input = smartTruncateEvolution(t.Input, 4000)
+	t.Output = smartTruncateEvolution(t.Output, 6000)
 
 	ee.trajectories = append(ee.trajectories, t)
 
@@ -364,7 +360,7 @@ func (ee *EvolutionEngine) isDuplicate(content string) bool {
 // --- RETRIEVE: 检索相关经验 ---
 
 // RetrieveFor 按角色和目标检索相关经验。
-// 使用 BM25 + 角色匹配 + 质量加权。
+// 使用 BM25+IDF + 角色匹配 + 质量加权 + 成功率 + 结果去重。
 func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Experience {
 	if topK <= 0 {
 		topK = 5
@@ -382,21 +378,37 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 		return nil
 	}
 
+	// 构建 IDF: 统计每个 term 在多少文档中出现
+	docCount := float64(len(ee.experiences))
+	docFreq := make(map[string]int)
+	allDocTerms := make([][]string, len(ee.experiences))
+	for i, exp := range ee.experiences {
+		terms := evolutionTokenize(exp.Content + " " + strings.Join(exp.Tags, " "))
+		allDocTerms[i] = terms
+		seen := make(map[string]bool)
+		for _, t := range terms {
+			if !seen[t] {
+				docFreq[t]++
+				seen[t] = true
+			}
+		}
+	}
+
 	type scored struct {
 		exp   *Experience
 		score float64
 	}
 	var candidates []scored
 
-	for _, exp := range ee.experiences {
-		if exp.Quality < 0.2 {
+	for i, exp := range ee.experiences {
+		if exp.Quality < 0.15 {
 			continue
 		}
 
-		expTerms := evolutionTokenize(exp.Content + " " + strings.Join(exp.Tags, " "))
+		expTerms := allDocTerms[i]
 
-		// BM25 简化版
-		bm25 := simpleBM25(queryTerms, expTerms)
+		// BM25 + IDF 加权
+		bm25 := bm25WithIDF(queryTerms, expTerms, docFreq, docCount)
 		if bm25 < 0.01 {
 			continue
 		}
@@ -413,11 +425,14 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 		// 质量加权 (参考 Live-Evo: 有效经验增强)
 		qualityWeight := 0.5 + exp.Quality*0.5
 
+		// 成功率加权: 高成功率的经验更有价值
+		successBoost := 1.0 + exp.SuccessRate()*0.5
+
 		// 新鲜度衰减
 		hoursSince := time.Since(exp.UpdatedAt).Hours()
 		freshness := 1.0 / (1.0 + hoursSince/720.0) // 30天半衰期
 
-		score := bm25 * roleBoost * qualityWeight * (1.0 + freshness)
+		score := bm25 * roleBoost * qualityWeight * successBoost * (1.0 + freshness)
 		candidates = append(candidates, scored{exp, score})
 	}
 
@@ -425,12 +440,29 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 		return candidates[i].score > candidates[j].score
 	})
 
-	if len(candidates) > topK {
-		candidates = candidates[:topK]
+	// 去重: 移除内容高度相似的经验（保留分数更高的）
+	var deduped []scored
+	for _, c := range candidates {
+		isDup := false
+		for _, d := range deduped {
+			if jaccardSimilarity(strings.ToLower(c.exp.Content), strings.ToLower(d.exp.Content)) > 0.6 {
+				isDup = true
+				break
+			}
+		}
+		if !isDup {
+			deduped = append(deduped, c)
+		}
+		if len(deduped) >= topK {
+			break
+		}
 	}
 
-	result := make([]*Experience, len(candidates))
-	for i, c := range candidates {
+	// 更新使用计数 (EVOLVE: 标记被检索的经验)
+	result := make([]*Experience, len(deduped))
+	for i, c := range deduped {
+		c.exp.UsageCount++
+		c.exp.UpdatedAt = time.Now()
 		result[i] = c.exp
 	}
 	return result
@@ -701,6 +733,48 @@ func evolutionTokenize(text string) []string {
 	return tokens
 }
 
+// bm25WithIDF BM25 with proper IDF weighting (replaces simpleBM25 for retrieval).
+func bm25WithIDF(queryTerms, docTerms []string, docFreq map[string]int, totalDocs float64) float64 {
+	if len(docTerms) == 0 {
+		return 0
+	}
+	tf := make(map[string]int)
+	for _, t := range docTerms {
+		tf[t]++
+	}
+
+	k1 := 1.5
+	b := 0.75
+	avgDL := 30.0
+	dl := float64(len(docTerms))
+
+	score := 0.0
+	queryTF := make(map[string]int)
+	for _, qt := range queryTerms {
+		queryTF[qt]++
+	}
+
+	matchedTerms := 0
+	for qt, qtf := range queryTF {
+		if tf[qt] > 0 {
+			matchedTerms++
+			dtf := float64(tf[qt])
+			tfScore := (dtf * (k1 + 1)) / (dtf + k1*(1-b+b*(dl/avgDL)))
+			// IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+			df := float64(docFreq[qt])
+			idf := math.Log((totalDocs-df+0.5)/(df+0.5) + 1.0)
+			score += tfScore * idf * float64(qtf)
+		}
+	}
+
+	if len(queryTF) > 0 {
+		coverage := float64(matchedTerms) / float64(len(queryTF))
+		score *= (1.0 + coverage)
+	}
+
+	return score
+}
+
 func simpleBM25(queryTerms, docTerms []string) float64 {
 	if len(docTerms) == 0 {
 		return 0
@@ -740,6 +814,21 @@ func simpleBM25(queryTerms, docTerms []string) float64 {
 	}
 
 	return score
+}
+
+// smartTruncateEvolution 智能截断: 保留前部+后部，中间用省略号连接。
+// 避免只保留开头导致丢失关键的输出/错误信息。
+func smartTruncateEvolution(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	headLen := maxLen * 2 / 3
+	tailLen := maxLen - headLen - 30
+	if tailLen < 100 {
+		tailLen = 100
+		headLen = maxLen - tailLen - 30
+	}
+	return s[:headLen] + "\n...(truncated middle)...\n" + s[len(s)-tailLen:]
 }
 
 func jaccardSimilarity(a, b string) float64 {

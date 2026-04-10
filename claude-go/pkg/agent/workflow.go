@@ -585,7 +585,10 @@ func (we *WorkflowExecutor) executeParallel(ctx context.Context, stages []StageD
 	return results
 }
 
-// runAgent 创建并运行一个 agent
+// stageTimeout 单阶段执行超时 (防止 agent 无限循环)
+const stageTimeout = 10 * time.Minute
+
+// runAgent 创建并运行一个 agent (带超时保护)
 func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, team *ProductionTeam) StageResult {
 	start := time.Now()
 
@@ -601,12 +604,16 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	team.mu.Unlock()
 	team.persist()
 
-	runner, err := we.factory(ctx, role, "")
+	// 单阶段超时保护: 防止 agent 陷入死循环
+	stageCtx, stageCancel := context.WithTimeout(ctx, stageTimeout)
+	defer stageCancel()
+
+	runner, err := we.factory(stageCtx, role, "")
 	if err != nil {
 		return StageResult{Role: role, Status: TaskFailed, Error: err.Error(), StartedAt: start, Duration: time.Since(start).String()}
 	}
 
-	result, err := runner.Execute(ctx, prompt)
+	result, err := runner.Execute(stageCtx, prompt)
 	duration := time.Since(start)
 
 	// 更新 agent 状态
@@ -634,6 +641,18 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	}
 }
 
+// antiLoopDirective 防死循环指令，注入到所有 agent prompt 中
+const antiLoopDirective = `
+
+<execution_constraints>
+CRITICAL: You MUST follow these execution rules strictly:
+1. Do NOT search for the same file or pattern more than 3 times.
+2. If a tool call fails twice with the same error, STOP and report the failure.
+3. Do NOT enter infinite loops of reading/searching. If you cannot find what you need after reasonable attempts, summarize what you found and move on.
+4. Complete your task within a reasonable scope. Produce your output and STOP.
+5. If you are stuck, output your partial findings rather than continuing to retry.
+</execution_constraints>`
+
 // buildStagePromptWithRoles 优先从 RoleRegistry 获取提示词，降级用 StageDef.Prompt。
 func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map[string]string, roles *RoleRegistry) string {
 	var prevOutput strings.Builder
@@ -646,7 +665,7 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 	// 优先从角色注册表获取 (包含专属 Skills)
 	if roles != nil {
 		if merged := roles.MergedPrompt(stage.Role, objective, prevOutput.String()); merged != "" {
-			return merged
+			return merged + antiLoopDirective
 		}
 	}
 
@@ -654,7 +673,7 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 	prompt := stage.Prompt
 	prompt = strings.ReplaceAll(prompt, "{objective}", objective)
 	prompt = strings.ReplaceAll(prompt, "{prev_result}", prevOutput.String())
-	return prompt
+	return prompt + antiLoopDirective
 }
 
 // --- 金融专家团队工作流 ---

@@ -109,6 +109,9 @@ var cronKW = []string{
 
 // Recognize 从用户文本中识别团队协作意图。
 // 返回 nil 表示无团队相关意图, 应走正常对话流程。
+//
+// 优化: 当有 MCP 工具加载时, 提高 create_and_run 的置信度阈值,
+// 避免与 MCP 工具调用冲突。通过多关键词匹配强度来区分。
 func (ir *IntentRecognizer) Recognize(ctx context.Context, text string) *TeamIntent {
 	lower := strings.ToLower(text)
 
@@ -127,6 +130,58 @@ func (ir *IntentRecognizer) Recognize(ctx context.Context, text string) *TeamInt
 	}
 
 	return intent
+}
+
+// RecognizeWithMCPAwareness 在有 MCP 工具的场景下做意图识别。
+// 当 LLM 可能将任务路由到 MCP 工具时, 提高 team 意图检测的灵敏度。
+// hasMCP 表示是否有活跃的 MCP 连接。
+func (ir *IntentRecognizer) RecognizeWithMCPAwareness(ctx context.Context, text string, hasMCP bool) *TeamIntent {
+	intent := ir.Recognize(ctx, text)
+	if intent == nil {
+		return nil
+	}
+
+	// 当有 MCP 时, 对 create_and_run 要求更高的匹配强度
+	if hasMCP && intent.Action == "create_and_run" {
+		lower := strings.ToLower(text)
+		matchStrength := ir.calcMatchStrength(lower)
+		// 多关键词强匹配才走 team, 否则让 LLM 自行决定
+		if matchStrength < 2 && intent.Confidence < 0.85 {
+			return nil
+		}
+	}
+
+	return intent
+}
+
+// calcMatchStrength 计算文本匹配关键词的总强度 (匹配的类别数)
+func (ir *IntentRecognizer) calcMatchStrength(lower string) int {
+	strength := 0
+	// 检查创建关键词
+	for _, kw := range createKW {
+		if strings.Contains(lower, kw) {
+			strength++
+			break
+		}
+	}
+	// 检查工作流关键词
+	for _, kws := range wfDetect {
+		for _, kw := range kws {
+			if strings.Contains(lower, kw) {
+				strength++
+				break
+			}
+		}
+	}
+	// 检查明确的团队相关词
+	teamExplicit := []string{"团队", "agent", "多agent", "协作", "并行", "蜂群"}
+	for _, kw := range teamExplicit {
+		if strings.Contains(lower, kw) {
+			strength += 2
+			break
+		}
+	}
+	return strength
 }
 
 // RecognizeCron 识别 cron 定时任务意图。

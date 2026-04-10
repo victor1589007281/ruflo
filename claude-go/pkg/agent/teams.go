@@ -32,11 +32,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/logging"
 )
 
 // TaskTracker 抽象 V2 任务管理, 与 builtin.TaskStore 通过 duck typing 对接。
@@ -453,21 +454,23 @@ func (ptm *ProductionTeamManager) StopTeam(name string) error {
 	return nil
 }
 
-// StopFirstRunning 停止第一个正在运行的团队 (意图识别用)
+// StopFirstRunning 停止第一个正在运行的团队 (意图识别用)。
 func (ptm *ProductionTeamManager) StopFirstRunning() (string, error) {
 	ptm.mu.RLock()
-	defer ptm.mu.RUnlock()
-
+	var targetName string
 	for _, team := range ptm.teams {
 		if team.Status == TeamStatusRunning {
-			name := team.Name
-			ptm.mu.RUnlock()
-			err := ptm.StopTeam(name)
-			ptm.mu.RLock()
-			return name, err
+			targetName = team.Name
+			break
 		}
 	}
-	return "", fmt.Errorf("无正在运行的团队")
+	ptm.mu.RUnlock()
+
+	if targetName == "" {
+		return "", fmt.Errorf("无正在运行的团队")
+	}
+	err := ptm.StopTeam(targetName)
+	return targetName, err
 }
 
 // DeleteTeam 删除团队
@@ -539,7 +542,7 @@ func (t *ProductionTeam) persist() {
 	}
 	data, err := json.MarshalIndent(t, "", "  ")
 	if err != nil {
-		log.Printf("[Teams] 持久化失败 (%s): %v", t.Name, err)
+		logging.For("teams").Warn("持久化失败", "team", t.Name, "err", err)
 		return
 	}
 	os.MkdirAll(t.dataDir, 0755)

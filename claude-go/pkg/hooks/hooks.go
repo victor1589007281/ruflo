@@ -27,7 +27,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os/exec"
 	"path"
@@ -35,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -147,7 +147,7 @@ func (r *Runner) ExecutePostSamplingHooks(messages []types.Message) {
 		func(idx int, f func([]types.Message)) {
 			defer func() {
 				if rec := recover(); rec != nil {
-					log.Printf("hooks: post-sampling callback[%d] panic: %v", idx, rec)
+					logging.For("hooks").Error("post-sampling callback panic", "index", idx, "recover", rec)
 				}
 			}()
 			if f == nil {

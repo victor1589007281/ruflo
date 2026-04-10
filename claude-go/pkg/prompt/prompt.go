@@ -129,14 +129,22 @@ func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 	}
 
 	// 工具列表
+	var mcpTools []string
+	var builtinTools []string
 	sb.WriteString("<available_tools>\n")
 	for _, t := range tools.All() {
-		sb.WriteString(fmt.Sprintf("- %s: %s\n", t.Name(), firstLine(t.Description())))
+		name := t.Name()
+		desc := firstLine(t.Description())
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", name, desc))
+		if strings.HasPrefix(name, "mcp_") {
+			mcpTools = append(mcpTools, name)
+		} else {
+			builtinTools = append(builtinTools, name)
+		}
 	}
 	sb.WriteString("</available_tools>\n\n")
 
 	// 工具使用指南
-	// 对应 TS: prompts.ts 中的 getUsingYourToolsSection()
 	sb.WriteString("<tool_usage>\n")
 	sb.WriteString("- Use Read to read files, not shell cat/head/tail\n")
 	sb.WriteString("- Use Write to create files, not shell echo/cat heredoc\n")
@@ -145,6 +153,23 @@ func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 	sb.WriteString("- Use Glob to find files by pattern, not shell find\n")
 	sb.WriteString("- Multiple parallel tool calls are encouraged when independent\n")
 	sb.WriteString("</tool_usage>\n\n")
+
+	// MCP 工具使用引导 (当有 MCP 工具时)
+	if len(mcpTools) > 0 {
+		sb.WriteString("<mcp_tool_guidance>\n")
+		sb.WriteString("You have MCP (Model Context Protocol) tools available. These are EXTERNAL tools from connected servers.\n\n")
+		sb.WriteString("IMPORTANT rules for using MCP tools:\n")
+		sb.WriteString("1. MCP tools are for COORDINATION and EXTERNAL services, not for replacing built-in tools.\n")
+		sb.WriteString("2. For complex tasks that involve MCP tools, DECOMPOSE the task into steps:\n")
+		sb.WriteString("   - First understand what needs to be done\n")
+		sb.WriteString("   - Use MCP tools to coordinate or fetch external data\n")
+		sb.WriteString("   - Use built-in tools (Read, Write, Shell, etc.) for actual file/code operations\n")
+		sb.WriteString("3. Do NOT just call one MCP tool and stop. Follow through with the complete workflow.\n")
+		sb.WriteString("4. When using swarm/agent MCP tools, you still need to do the actual implementation work.\n")
+		sb.WriteString("5. Prefer built-in tools for: file I/O, code search, shell commands, editing.\n")
+		sb.WriteString("6. Use MCP tools for: external service integration, swarm coordination, memory retrieval.\n")
+		sb.WriteString("</mcp_tool_guidance>\n\n")
+	}
 
 	sb.WriteString(buildSessionToolHints(tools))
 

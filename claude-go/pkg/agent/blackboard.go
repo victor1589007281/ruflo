@@ -27,10 +27,13 @@ import (
 
 // Blackboard 共享黑板 — Agent 间接通信的中枢。
 type Blackboard struct {
-	teamName string
-	entries  []*BoardEntry
-	mu       sync.RWMutex
-	dataDir  string
+	teamName  string
+	entries   []*BoardEntry
+	mu        sync.RWMutex
+	dataDir   string
+	dirty     bool          // 延迟写标记
+	flushOnce sync.Once
+	flushCh   chan struct{} // 触发异步持久化
 }
 
 // BoardEntry 黑板上的一条记录。
@@ -48,9 +51,39 @@ func NewBlackboard(teamName, dataDir string) *Blackboard {
 		teamName: teamName,
 		entries:  make([]*BoardEntry, 0),
 		dataDir:  dataDir,
+		flushCh:  make(chan struct{}, 1),
 	}
 	bb.load()
+	bb.startFlusher()
 	return bb
+}
+
+// startFlusher 启动异步持久化协程 — debounce 合并高频写入。
+func (bb *Blackboard) startFlusher() {
+	bb.flushOnce.Do(func() {
+		go func() {
+			for range bb.flushCh {
+				time.Sleep(500 * time.Millisecond)
+				bb.mu.RLock()
+				if !bb.dirty {
+					bb.mu.RUnlock()
+					continue
+				}
+				data, err := json.MarshalIndent(bb.entries, "", "  ")
+				bb.mu.RUnlock()
+				if err != nil {
+					continue
+				}
+				bb.mu.Lock()
+				bb.dirty = false
+				bb.mu.Unlock()
+				if bb.dataDir != "" {
+					os.MkdirAll(bb.dataDir, 0755)
+					_ = os.WriteFile(filepath.Join(bb.dataDir, "blackboard.json"), data, 0644)
+				}
+			}
+		}()
+	})
 }
 
 // Write 向黑板写入/更新条目。相同 key 会覆盖。
@@ -64,7 +97,7 @@ func (bb *Blackboard) Write(key, value, author, category string) {
 			e.Author = author
 			e.Category = category
 			e.Timestamp = time.Now()
-			bb.persistLocked()
+			bb.markDirty()
 			return
 		}
 	}
@@ -73,7 +106,7 @@ func (bb *Blackboard) Write(key, value, author, category string) {
 		Key: key, Value: value, Author: author,
 		Category: category, Timestamp: time.Now(),
 	})
-	bb.persistLocked()
+	bb.markDirty()
 }
 
 // Read 读取指定 key 的值。
@@ -321,16 +354,28 @@ func (bb *Blackboard) filterLocked(category string) []*BoardEntry {
 	return result
 }
 
-func (bb *Blackboard) persistLocked() {
-	if bb.dataDir == "" {
-		return
+// markDirty 标记需要持久化，通知 flusher 协程（非阻塞）。
+func (bb *Blackboard) markDirty() {
+	bb.dirty = true
+	select {
+	case bb.flushCh <- struct{}{}:
+	default:
 	}
+}
+
+// Flush 强制同步持久化（关闭前调用）。
+func (bb *Blackboard) Flush() {
+	bb.mu.RLock()
 	data, err := json.MarshalIndent(bb.entries, "", "  ")
-	if err != nil {
+	bb.mu.RUnlock()
+	if err != nil || bb.dataDir == "" {
 		return
 	}
 	os.MkdirAll(bb.dataDir, 0755)
 	_ = os.WriteFile(filepath.Join(bb.dataDir, "blackboard.json"), data, 0644)
+	bb.mu.Lock()
+	bb.dirty = false
+	bb.mu.Unlock()
 }
 
 func (bb *Blackboard) load() {

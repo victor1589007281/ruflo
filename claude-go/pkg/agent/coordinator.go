@@ -212,7 +212,10 @@ func (c *Coordinator) executeStageWithRetry(
 
 		c.saveCheckpoint(stage.Name, "running", attempt, "")
 
-		sr := executor.ExecuteSingleStage(ctx, stage, objective, prevResults, team)
+		// 每次重试也有独立超时保护
+		stageCtx, stageCancel := context.WithTimeout(ctx, stageTimeout)
+		sr := executor.ExecuteSingleStage(stageCtx, stage, objective, prevResults, team)
+		stageCancel()
 
 		if sr.Status == TaskCompleted {
 			c.saveCheckpoint(stage.Name, "completed", attempt, sr.Output)

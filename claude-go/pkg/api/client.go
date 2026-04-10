@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -60,7 +61,9 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		Model:   model,
-		Client:  http.DefaultClient,
+		Client: &http.Client{
+			Timeout: 5 * time.Minute,
+		},
 	}
 }
 

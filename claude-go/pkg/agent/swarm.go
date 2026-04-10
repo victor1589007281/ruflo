@@ -453,9 +453,7 @@ func (s *SwarmOrchestrator) executeSubTask(
 			Timestamp: time.Now(),
 		}
 		s.evolution.RecordTrajectory(traj)
-		if execErr != nil {
-			s.evolution.LearnFromStage(traj)
-		}
+		s.evolution.LearnFromStage(traj)
 		if len(injectedExpIDs) > 0 {
 			s.evolution.RecordBatchFeedback(injectedExpIDs, execErr == nil)
 		}

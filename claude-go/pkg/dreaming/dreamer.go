@@ -176,6 +176,7 @@ func (d *Dreamer) AfterQuery(ctx context.Context) {
 	if !d.config.Enabled {
 		return
 	}
+	// CAS 防止并发触发: 仅当 dreaming 从 false → true 时通过
 	if d.dreaming.Load() {
 		return
 	}
@@ -201,8 +202,14 @@ func (d *Dreamer) AfterQuery(ctx context.Context) {
 	d.lastScanTime = now
 	d.mu.Unlock()
 
+	// CAS 原子抢占: 多个并发 goroutine 只有一个能成功
+	if !d.dreaming.CompareAndSwap(false, true) {
+		return
+	}
+
 	// 尝试获取文件锁
 	if !d.acquireLock() {
+		d.dreaming.Store(false)
 		return
 	}
 
@@ -212,7 +219,7 @@ func (d *Dreamer) AfterQuery(ctx context.Context) {
 // executeDream 执行记忆整理 (在独立 goroutine 中运行)。
 // 对应 TS: autoDream.ts 中的 executeAutoDream → runForkedAgent(consolidationPrompt)
 func (d *Dreamer) executeDream(ctx context.Context) {
-	d.dreaming.Store(true)
+	// dreaming 已由调用方 CAS 设置为 true，这里仅负责清理
 	defer d.dreaming.Store(false)
 	defer d.releaseLock()
 
@@ -554,10 +561,11 @@ Output the consolidated memory as a clean markdown document with topic headers.`
 
 // ForceDream 强制触发一次记忆整理 (忽略门控条件)
 func (d *Dreamer) ForceDream(ctx context.Context) error {
-	if d.dreaming.Load() {
+	if !d.dreaming.CompareAndSwap(false, true) {
 		return fmt.Errorf("已在整理中")
 	}
 	if !d.acquireLock() {
+		d.dreaming.Store(false)
 		return fmt.Errorf("无法获取锁（可能其他进程正在整理）")
 	}
 	go d.executeDream(ctx)

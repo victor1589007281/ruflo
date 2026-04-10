@@ -25,10 +25,11 @@ package agent
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/logging"
 )
 
 // PooledAgent 池化 Agent 实例, 追踪生命周期。
@@ -65,23 +66,43 @@ type AgentPool struct {
 	totalFailed int64
 }
 
+// poolMaxCap 池信号量的固定容量上限 — 预分配后不再替换 channel，消除 Scale 竞态。
+const poolMaxCap = 16
+
 // NewAgentPool 创建 Agent 池。
 // maxSize 控制最大并发 Agent 数 (推荐 4-12)。
 func NewAgentPool(factory CreateAgentFunc, maxSize int) *AgentPool {
 	if maxSize <= 0 {
 		maxSize = 8
 	}
+	if maxSize > poolMaxCap {
+		maxSize = poolMaxCap
+	}
 	return &AgentPool{
 		factory:   factory,
-		semaphore: make(chan struct{}, maxSize),
+		semaphore: make(chan struct{}, poolMaxCap),
 		agents:    make(map[string]*PooledAgent),
 		maxSize:   maxSize,
 	}
 }
 
 // Acquire 从池中获取一个执行槽位并创建 Agent。
-// 如果池已满则阻塞等待, 或在 ctx 取消时返回错误。
+// 通过自旋检测 maxSize 限制并发，不替换 channel。
 func (p *AgentPool) Acquire(ctx context.Context, role, systemPrompt string) (*PooledAgent, error) {
+	for {
+		p.mu.Lock()
+		active := len(p.agents)
+		limit := p.maxSize
+		p.mu.Unlock()
+		if active < limit {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("agent pool: 等待槽位超时 (%v)", ctx.Err())
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 	select {
 	case p.semaphore <- struct{}{}:
 	case <-ctx.Done():
@@ -144,33 +165,18 @@ func (p *AgentPool) MarkFailed(agent *PooledAgent) {
 	<-p.semaphore
 }
 
-// Scale 动态调整池大小。
-// 新大小立即生效: 缩小时等待多余 Agent 自然完成, 扩大时立即可用。
+// Scale 动态调整逻辑池大小 (不替换 channel，避免竞态)。
+// 缩容时已有 agent 自然完成后受新限制约束。
 func (p *AgentPool) Scale(newMax int) {
 	if newMax <= 0 || newMax == p.maxSize {
 		return
 	}
+	if newMax > poolMaxCap {
+		newMax = poolMaxCap
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	oldSem := p.semaphore
-	p.semaphore = make(chan struct{}, newMax)
-
-	// 迁移已占用的槽位
-	activeCount := len(p.agents)
-	for i := 0; i < activeCount && i < newMax; i++ {
-		p.semaphore <- struct{}{}
-	}
-
 	p.maxSize = newMax
-
-	// 释放旧信号量中的空闲槽位
-	for i := 0; i < cap(oldSem)-activeCount; i++ {
-		select {
-		case <-oldSem:
-		default:
-		}
-	}
+	p.mu.Unlock()
 }
 
 // ActiveCount 返回当前活跃 Agent 数。
@@ -201,8 +207,7 @@ func (p *AgentPool) AutoScale(pendingTasks int) {
 	}
 
 	if desired != currentMax {
-		log.Printf("[AgentPool] AutoScale: active=%d, pending=%d, %d → %d",
-			currentActive, pendingTasks, currentMax, desired)
+		logging.For("agent-pool").Info("AutoScale", "active", currentActive, "pending", pendingTasks, "old", currentMax, "new", desired)
 		p.Scale(desired)
 	}
 }

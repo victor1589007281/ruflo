@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/api"
@@ -36,6 +37,8 @@ import (
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
+
+var uuidCounter atomic.Int64
 
 // 断路器常量 (Circuit Breaker)
 // 对应 TS: query.ts 中 consecutiveErrorCount 相关逻辑
@@ -555,9 +558,10 @@ func messagesToAPI(messages []types.Message) []types.APIMessage {
 	return result
 }
 
-// generateUUID 生成简单唯一标识
+// generateUUID 生成唯一标识 (时间戳 + 全局原子计数器，避免并发碰撞)。
 func generateUUID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	seq := uuidCounter.Add(1)
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), seq)
 }
 
 // GetMessages 返回当前对话消息列表

@@ -42,6 +42,63 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// fullHelpGuide 由 help 子命令打印，与 README/文档中的完整用法保持一致。
+const fullHelpGuide = `Claude Code (Go) - AI 编程助手
+
+基础用法:
+  claude-go chat                    交互式对话模式
+  claude-go run "你的问题"          一次性执行模式
+  claude-go feishu --config=xxx     飞书长连接模式
+  claude-go doctor                  系统诊断
+  claude-go tools                   列出可用工具
+  claude-go help                    查看完整帮助
+
+飞书模式详细配置:
+  # 使用配置文件 (推荐)
+  claude-go feishu --config=claude-go.json
+
+  # 使用命令行参数
+  claude-go feishu --app-id=cli_xxx --app-secret=xxx --api-key=sk-xxx
+
+  # 环境变量
+  FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx ANTHROPIC_API_KEY=sk-xxx claude-go feishu
+
+配置文件示例 (claude-go.json):
+  {
+    "feishu": { "appId": "cli_xxx", "appSecret": "xxx" },
+    "ai": { "model": "qwen3.5-plus", "apiKey": "sk-xxx" },
+    "mcpServers": { "ruflo": { "command": "npx", "args": ["ruflo@latest", "mcp", "start"] } },
+    "dreaming": { "enabled": true, "minHours": 12 }
+  }
+
+通用参数:
+  --model           AI 模型名 (默认 qwen3.5-plus)
+  --api-key         API Key (或 ANTHROPIC_API_KEY 环境变量)
+  --base-url        API 地址 (默认 DashScope)
+  --max-tokens      最大输出 token (默认 16384)
+  --max-turns       最大循环次数 (0=无限)
+  --permission-mode 权限模式 bypass/default/plan/auto
+  --system-prompt   自定义系统提示词
+  --debug           调试模式
+  --mcp-config      MCP 配置 JSON 路径
+
+飞书机器人命令:
+  /help             查看帮助
+  /status           运行状态
+  /clear            清除对话
+  /team workflows   查看工作流
+  /cron list        查看定时任务
+  /mcp list         查看 MCP 服务器
+  /skill list       查看技能
+  /dream            手动整理记忆
+
+多Agent协作 (自然语言):
+  "帮我调研 Kubernetes 部署最佳实践"     → 自动创建 research 团队
+  "帮我开发一个用户管理模块"             → 自动创建 development 团队
+  "帮我辩论 Go vs Rust 哪个更适合后端"  → 自动创建 debate 团队
+  "蜂群模式全面分析 AI Agent 技术栈"    → 自动创建 swarm 团队
+`
+
 var (
 	flagModel        string
 	flagAPIKey       string
@@ -58,11 +115,41 @@ var (
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "claude-go",
-		Short: "Claude Code client - Go implementation",
-		Long: `Claude Code 客户端的 Go 实现。
-对标 review/claude/ 源码 (Tengu)，
-复刻了 QueryEngine、Tool 系统、MCP 客户端、Agent Teams、
-记忆系统、Hook 系统、权限系统、Compact 系统等核心能力。`,
+		Short: "Claude Code (Go) - AI 编程助手",
+		Long: `Claude Code (Go) 是 Claude Code 客户端的 Go 实现，对标 review/claude/ (Tengu)，
+提供交互对话、一次性执行、飞书长连接、系统诊断与工具列表等能力。
+
+核心能力包括 QueryEngine、Tool 系统、MCP 客户端、Agent Teams、记忆与 Hook、
+权限与 Compact 等。子命令：
+
+  chat    交互式 REPL，适合本地反复调试
+  run     单次执行（类似 claude -p），适合脚本与自动化
+  feishu  WebSocket 长连接，企业飞书/Lark 机器人后台
+  doctor  检查 API Key、rg/git/shell、CLAUDE.md 等环境
+  tools   列出当前注册的内置与 MCP 工具
+
+全局标志（所有子命令可用，部分会被 feishu 的配置文件合并/覆盖）：
+  --model、--api-key、--base-url、--max-tokens、--max-turns、
+  --permission-mode、--system-prompt、--debug、--mcp-config
+
+更完整的用法、飞书配置示例与机器人斜杠命令说明请执行：
+
+  claude-go help`,
+		Example: `  # 交互式对话
+  claude-go chat
+
+  # 一次性提问（可叠加全局参数）
+  claude-go run "解释这段 Go 代码" --model qwen3.5-plus
+
+  # 飞书机器人（推荐配置文件）
+  claude-go feishu --config=claude-go.json
+
+  # 环境与工具
+  claude-go doctor
+  claude-go tools
+
+  # 完整使用指南（含飞书、配置 JSON、斜杠命令）
+  claude-go help`,
 	}
 
 	rootCmd.PersistentFlags().StringVar(&flagModel, "model", "qwen3.5-plus", "模型名称")
@@ -81,9 +168,22 @@ func main() {
 	rootCmd.AddCommand(feishuCmd())
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.AddCommand(toolsCmd())
+	rootCmd.AddCommand(helpCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
+	}
+}
+
+func helpCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "help",
+		Short: "查看完整使用指南",
+		Long:  "打印包含基础用法、飞书配置、通用参数、机器人命令与多 Agent 协作说明的完整指南。",
+		Example: `  claude-go help`,
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Print(fullHelpGuide)
+		},
 	}
 }
 
@@ -93,6 +193,10 @@ func chatCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "chat",
 		Short: "交互式对话 (REPL 模式)",
+		Example: `  claude-go chat
+
+  # 指定模型与调试输出
+  claude-go chat --model qwen3.5-plus --debug`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			eng, err := buildEngine()
 			if err != nil {
@@ -142,6 +246,10 @@ func runCmd() *cobra.Command {
 		Use:   "run [prompt]",
 		Short: "一次性执行 (Print 模式)",
 		Args:  cobra.MinimumNArgs(1),
+		Example: `  claude-go run "你的问题"
+
+  # 限制输出长度与权限模式
+  claude-go run "总结 main.go" --max-tokens 8192 --permission-mode plan`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			eng, err := buildEngine()
 			if err != nil {
@@ -191,10 +299,27 @@ func feishuCmd() *cobra.Command {
 需要在飞书开发者后台创建企业自建应用，获取 App ID 和 App Secret。
 应用需要订阅 im.message.receive_v1 事件，并开启长连接模式。
 
-支持两种配置方式:
-  1. CLI 参数:    claude-go feishu --app-id=cli_xxx --app-secret=xxx
-  2. JSON 配置:   claude-go feishu --config=claude-go.json
-  3. 环境变量:    FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx claude-go feishu
+配置优先级（后者覆盖前者）: 环境变量 < JSON 配置文件 < 本命令标志与全局标志。
+AI Key 可来自 --api-key、ANTHROPIC_API_KEY / DASHSCOPE_API_KEY，或 JSON 中 ai.apiKey。
+
+飞书专用参数:
+  --config          JSON 配置文件路径，可包含 feishu、ai、mcpServers、hooks、permissionMode 等
+  --app-id          飞书应用 App ID；未填时使用 FEISHU_APP_ID
+  --app-secret      飞书应用 App Secret；未填时使用 FEISHU_APP_SECRET
+  --domain          飞书域名: feishu (国内，默认) 或 lark (国际)；可用 FEISHU_DOMAIN
+  --session-timeout 单会话空闲超时，单位分钟 (默认 30)
+  --max-sessions    最大并发会话数 (默认 100)
+  --mention-only    群聊是否仅响应 @机器人 (默认 true)
+  --cwd             工作目录，影响工具与 CLAUDE.md 加载 (默认当前目录)
+
+与根命令相同的全局参数在显式传入时会覆盖 JSON 中的 ai.* 等对应项，例如:
+  --model、--api-key、--base-url、--max-tokens、--max-turns、
+  --permission-mode、--system-prompt、--debug、--mcp-config
+
+推荐用法示例:
+  claude-go feishu --config=claude-go.json
+  claude-go feishu --app-id=cli_xxx --app-secret=xxx --api-key=sk-xxx
+  FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx ANTHROPIC_API_KEY=sk-xxx claude-go feishu
 
 JSON 配置文件示例:
   {
@@ -206,6 +331,17 @@ JSON 配置文件示例:
     "hooks": [{ "event": "PreToolUse", "command": "echo pre" }],
     "permissionMode": "bypass"
   }`,
+		Example: `  # 使用配置文件 (推荐)
+  claude-go feishu --config=claude-go.json
+
+  # 使用命令行参数（需同时提供 AI Key）
+  claude-go feishu --app-id=cli_xxx --app-secret=xxx --api-key=sk-xxx
+
+  # 环境变量
+  FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx ANTHROPIC_API_KEY=sk-xxx claude-go feishu
+
+  # 国际版 Lark + 自定义工作目录
+  claude-go feishu --config=claude-go.json --domain=lark --cwd=/path/to/project`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// 1. 构建默认配置
 			config := feishu.DefaultBotConfig()
@@ -362,6 +498,7 @@ func doctorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
 		Short: "系统诊断",
+		Example: `  claude-go doctor`,
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Println("Claude Code (Go) - System Diagnostics")
 			fmt.Println("=====================================")
@@ -393,6 +530,7 @@ func toolsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "tools",
 		Short: "列出所有可用工具",
+		Example: `  claude-go tools`,
 		Run: func(cmd *cobra.Command, args []string) {
 			reg := tool.NewRegistry()
 			builtin.RegisterBaseTools(reg)

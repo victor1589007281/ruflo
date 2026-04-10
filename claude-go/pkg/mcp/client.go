@@ -226,6 +226,12 @@ func (c *Client) connectStdio(ctx context.Context, conn *Connection) error {
 
 // sendRequest 发送 JSON-RPC 请求并等待响应
 func (conn *Connection) sendRequest(method string, params interface{}) (json.RawMessage, error) {
+	return conn.sendRequestCtx(context.Background(), method, params)
+}
+
+// sendRequestCtx 发送 JSON-RPC 请求 (支持 context 取消/超时)。
+// 内部通过 goroutine 包装阻塞 I/O，使 ctx 能够中断挂起的读写。
+func (conn *Connection) sendRequestCtx(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
@@ -246,20 +252,39 @@ func (conn *Connection) sendRequest(method string, params interface{}) (json.Raw
 		return nil, err
 	}
 
-	if !conn.stdout.Scan() {
-		return nil, fmt.Errorf("读取响应失败")
+	type scanResult struct {
+		data []byte
+		ok   bool
 	}
+	ch := make(chan scanResult, 1)
+	go func() {
+		ok := conn.stdout.Scan()
+		if ok {
+			raw := conn.stdout.Bytes()
+			cp := make([]byte, len(raw))
+			copy(cp, raw)
+			ch <- scanResult{data: cp, ok: true}
+		} else {
+			ch <- scanResult{ok: false}
+		}
+	}()
 
-	var resp jsonrpcResponse
-	if err := json.Unmarshal(conn.stdout.Bytes(), &resp); err != nil {
-		return nil, err
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("MCP 请求超时或被取消: %w", ctx.Err())
+	case sr := <-ch:
+		if !sr.ok {
+			return nil, fmt.Errorf("读取响应失败")
+		}
+		var resp jsonrpcResponse
+		if err := json.Unmarshal(sr.data, &resp); err != nil {
+			return nil, err
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("RPC 错误 %d: %s", resp.Error.Code, resp.Error.Message)
+		}
+		return resp.Result, nil
 	}
-
-	if resp.Error != nil {
-		return nil, fmt.Errorf("RPC 错误 %d: %s", resp.Error.Code, resp.Error.Message)
-	}
-
-	return resp.Result, nil
 }
 
 // sendNotification 发送 JSON-RPC 通知 (无 ID, 不期望响应)
@@ -286,7 +311,7 @@ func (conn *Connection) sendNotification(method string, params interface{}) erro
 // CallTool 调用 MCP 工具。
 // 对应 TS: services/mcp/client.ts 中的 callMCPToolWithUrlElicitationRetry()
 func (conn *Connection) CallTool(ctx context.Context, name string, arguments json.RawMessage) (string, error) {
-	result, err := conn.sendRequest("tools/call", map[string]interface{}{
+	result, err := conn.sendRequestCtx(ctx, "tools/call", map[string]interface{}{
 		"name":      name,
 		"arguments": json.RawMessage(arguments),
 	})
