@@ -58,6 +58,7 @@ func NewIntentRecognizer(llm LLMClient) *IntentRecognizer {
 
 var createKW = []string{
 	"组建团队", "创建团队", "启动团队", "组织团队",
+	"组建一个", "创建一个团队", "组一个",
 	"agent协作", "多agent", "多个agent",
 	"帮我调研", "帮我研究", "帮我开发", "帮我实现",
 	"帮我辩论", "帮我分析", "帮我讨论", "帮我构建",
@@ -76,10 +77,16 @@ var stopKW = []string{
 	"停止团队", "终止团队", "取消团队", "停止执行",
 	"别做了", "不用做了", "取消任务", "停止调研",
 	"停止开发", "停止辩论",
+	"停止当前", "终止当前", "取消当前",
 }
 
 var listKW = []string{
 	"有哪些团队", "团队列表", "所有团队", "列出团队",
+}
+
+var deleteKW = []string{
+	"删除团队", "移除团队", "清除团队", "解散团队",
+	"删除研究团队", "删除开发团队",
 }
 
 var wfDetect = map[string][]string{
@@ -255,6 +262,12 @@ func (ir *IntentRecognizer) keywordDetect(lower, original string) *TeamIntent {
 	for _, kw := range listKW {
 		if strings.Contains(lower, kw) {
 			return &TeamIntent{Action: "list", Confidence: 0.8}
+		}
+	}
+
+	for _, kw := range deleteKW {
+		if strings.Contains(lower, kw) {
+			return &TeamIntent{Action: "delete", Confidence: 0.8}
 		}
 	}
 

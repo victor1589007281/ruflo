@@ -194,7 +194,6 @@ func (s *TieredStore) Retrieve(query string, topK int) []*MemoryEntry {
 	var candidates []scored
 
 	for _, doc := range docs {
-		// 计算词频
 		tf := make(map[string]int)
 		for _, t := range doc.terms {
 			tf[t]++
@@ -202,17 +201,22 @@ func (s *TieredStore) Retrieve(query string, topK int) []*MemoryEntry {
 		docLen := float64(len(doc.terms))
 
 		bm25 := 0.0
+		matchedTerms := 0
 		for _, qt := range queryTerms {
 			if tf[qt] == 0 {
 				continue
 			}
+			matchedTerms++
 			n := float64(docFreq[qt])
 			idf := math.Log((N-n+0.5)/(n+0.5) + 1)
+			if idf < 0.01 {
+				idf = 0.01 // IDF 下限: 防止所有文档包含该词时分数归零
+			}
 			tfNorm := (float64(tf[qt]) * (k1 + 1)) / (float64(tf[qt]) + k1*(1-b+b*docLen/avgDocLen))
 			bm25 += idf * tfNorm
 		}
 
-		if bm25 < 0.01 {
+		if matchedTerms == 0 {
 			continue
 		}
 
@@ -303,24 +307,45 @@ func FormatForPrompt(entries []*MemoryEntry) string {
 	return sb.String()
 }
 
-// tokenize 简单分词 (小写 + 按空格/标点分割)
+// tokenize 中英文混合分词。
+// 英文: 按空格/标点分割。中文: unigram + bigram (无分词器也可有效检索)。
+// 关键: CJK 和 Latin 必须分开，否则会形成跨语言巨型 token 导致 BM25 失效。
 func tokenize(text string) []string {
 	text = strings.ToLower(text)
 	var tokens []string
-	var current strings.Builder
+	var latin strings.Builder
+	var cjkChars []rune
+
+	flushLatin := func() {
+		if latin.Len() > 1 {
+			tokens = append(tokens, latin.String())
+		}
+		latin.Reset()
+	}
+	flushCJK := func() {
+		for _, c := range cjkChars {
+			tokens = append(tokens, string(c))
+		}
+		for i := 0; i+1 < len(cjkChars); i++ {
+			tokens = append(tokens, string(cjkChars[i])+string(cjkChars[i+1]))
+		}
+		cjkChars = cjkChars[:0]
+	}
+
 	for _, r := range text {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r >= 0x4e00 && r <= 0x9fff {
-			current.WriteRune(r)
+		if r >= 0x4e00 && r <= 0x9fff {
+			flushLatin()
+			cjkChars = append(cjkChars, r)
+		} else if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			flushCJK()
+			latin.WriteRune(r)
 		} else {
-			if current.Len() > 1 {
-				tokens = append(tokens, current.String())
-			}
-			current.Reset()
+			flushLatin()
+			flushCJK()
 		}
 	}
-	if current.Len() > 1 {
-		tokens = append(tokens, current.String())
-	}
+	flushLatin()
+	flushCJK()
 	return tokens
 }
 
