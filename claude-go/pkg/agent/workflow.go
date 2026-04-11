@@ -78,8 +78,9 @@ func swarmWorkflow() *WorkflowDef {
 func developmentWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "development",
-		Description: "软件开发流水线: 设计 → 实现 → 审查 → 测试",
-		Mode:        "pipeline",
+		Description: "对抗式开发流水线: 设计 → [Generator↔Evaluator 对抗实现] → 测试 (3层Harness)",
+		Mode:        "adversarial_dev",
+		Rounds:      3,
 		Stages: []StageDef{
 			{
 				Name: "design", Role: "architect",
@@ -98,34 +99,39 @@ Be specific about implementation details. Output in markdown.`,
 			},
 			{
 				Name: "implement", Role: "coder", DependsOn: []string{"design"},
-				Prompt: `You are an expert software developer. Implement the solution based on the architecture design.
+				Prompt: `You are an expert software developer (Generator role in adversarial harness).
+Implement the solution based on the architecture design.
 
 Objective: {objective}
 
 Architecture Design:
 {prev_result}
 
+{adversarial_feedback}
+
 Write clean, production-quality code. Include proper error handling, logging, and documentation.
-Create all necessary files. Use the tools available to write files and run commands.`,
+Create all necessary files. Use the tools available to write files and run commands.
+If you received Evaluator feedback, address EVERY point before re-submitting.`,
 			},
 			{
-				Name: "review", Role: "reviewer", DependsOn: []string{"implement"},
-				Prompt: `You are a senior code reviewer. Review the implementation for quality, security, and best practices.
+				Name: "evaluate", Role: "reviewer", DependsOn: []string{"implement"},
+				Prompt: `You are the Evaluator in an adversarial development harness (read-only, skeptical reviewer).
+Your independent context CANNOT see the Generator's tool calls — only the output summary.
 
 Objective: {objective}
 
-Implementation summary:
+Generator Output (attempt #{adversarial_round}):
 {prev_result}
 
-Review checklist:
-1. Code correctness and logic errors
-2. Security vulnerabilities (injection, auth bypass, data leak)
-3. Performance issues (N+1 queries, memory leaks, blocking calls)
-4. Error handling completeness
-5. API design and naming conventions
-6. Documentation quality
+Score each dimension 0-10. Output STRICTLY as JSON:
+{"correctness": N, "completeness": N, "security": N, "code_quality": N, "pass": bool, "feedback": "..."}
 
-Provide specific, actionable feedback with file paths and line references.`,
+Hard pass threshold: ALL dimensions >= 6 AND pass == true.
+Be rigorous. Check for:
+- Logic errors, off-by-one, race conditions
+- Missing edge cases, incomplete API coverage
+- Hardcoded secrets, injection vectors, missing auth
+- Code smell, naming, documentation gaps`,
 			},
 			{
 				Name: "test", Role: "tester", DependsOn: []string{"implement"},
@@ -308,9 +314,134 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		return we.executeFanOut(ctx, wf, objective, team)
 	case "adversarial":
 		return we.executeAdversarial(ctx, wf, objective, team)
+	case "adversarial_dev":
+		return we.executeAdversarialDev(ctx, wf, objective, team)
 	default:
 		return we.executePipeline(ctx, wf, objective, team)
 	}
+}
+
+// executeAdversarialDev 对抗式开发流水线:
+// design → [implement ↔ evaluate 对抗循环, 最多 N 轮] → test
+// 融合3层Harness: L1 Generator/Evaluator, L2 RuleEngine 内置检查, L3 上下文管理。
+func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
+	var allResults []StageResult
+	prevResults := make(map[string]string)
+
+	maxRounds := wf.Rounds
+	if maxRounds <= 0 {
+		maxRounds = 3
+	}
+
+	// 找到各阶段定义
+	var designStage, implStage, evalStage *StageDef
+	var parallelStages []StageDef
+	for i := range wf.Stages {
+		switch wf.Stages[i].Name {
+		case "design":
+			designStage = &wf.Stages[i]
+		case "implement":
+			implStage = &wf.Stages[i]
+		case "evaluate":
+			evalStage = &wf.Stages[i]
+		default:
+			if wf.Stages[i].Parallel {
+				parallelStages = append(parallelStages, wf.Stages[i])
+			}
+		}
+	}
+
+	// Phase 1: Design
+	if designStage != nil {
+		we.notify(we.chatID, "📐 Phase 1: 架构设计...")
+		sr := we.executeStage(ctx, *designStage, objective, prevResults, team)
+		allResults = append(allResults, sr)
+		if sr.Status != TaskCompleted {
+			return allResults, fmt.Errorf("设计阶段失败: %s", sr.Error)
+		}
+		prevResults["design"] = sr.Output
+	}
+
+	// Phase 2: Adversarial Implement ↔ Evaluate loop
+	we.notify(we.chatID, fmt.Sprintf("⚔️ Phase 2: 对抗式开发 (最多 %d 轮)...", maxRounds))
+	var lastImplOutput string
+	var lastEvalFeedback string
+
+	for round := 1; round <= maxRounds; round++ {
+		if ctx.Err() != nil {
+			return allResults, ctx.Err()
+		}
+
+		// Generator: implement
+		if implStage != nil {
+			feedbackSection := ""
+			if lastEvalFeedback != "" {
+				feedbackSection = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastEvalFeedback)
+			}
+			modifiedPrompt := strings.ReplaceAll(implStage.Prompt, "{adversarial_feedback}", feedbackSection)
+			tempStage := *implStage
+			tempStage.Prompt = modifiedPrompt
+			tempStage.Name = fmt.Sprintf("implement-round%d", round)
+
+			we.notify(we.chatID, fmt.Sprintf("🔨 对抗第 %d/%d 轮 — Generator 实现中...", round, maxRounds))
+			sr := we.executeStage(ctx, tempStage, objective, prevResults, team)
+			sr.Name = fmt.Sprintf("implement-round%d", round)
+			allResults = append(allResults, sr)
+			if sr.Status != TaskCompleted {
+				return allResults, fmt.Errorf("实现阶段第 %d 轮失败: %s", round, sr.Error)
+			}
+			lastImplOutput = sr.Output
+			prevResults["implement"] = sr.Output
+		}
+
+		// Evaluator: evaluate
+		if evalStage != nil {
+			evalPrevResults := map[string]string{"implement": lastImplOutput}
+			modifiedPrompt := strings.ReplaceAll(evalStage.Prompt, "{adversarial_round}", fmt.Sprintf("%d", round))
+			tempStage := *evalStage
+			tempStage.Prompt = modifiedPrompt
+			tempStage.Name = fmt.Sprintf("evaluate-round%d", round)
+
+			we.notify(we.chatID, fmt.Sprintf("🔍 对抗第 %d/%d 轮 — Evaluator 审查中...", round, maxRounds))
+			sr := we.runAgent(ctx, evalStage.Role, buildStagePromptWithRoles(tempStage, objective, evalPrevResults, we.roles), team)
+			sr.Name = fmt.Sprintf("evaluate-round%d", round)
+			allResults = append(allResults, sr)
+
+			if sr.Status == TaskCompleted {
+				score, _ := ParseEvalScoreJSON([]byte(sr.Output))
+				if team.Blackboard != nil {
+					team.Blackboard.Write(fmt.Sprintf("eval-round%d-score", round),
+						fmt.Sprintf("正确性:%.0f 完整性:%.0f 安全性:%.0f 代码质量:%.0f 通过:%v",
+							score.Correctness, score.Completeness, score.Security, score.CodeQuality, score.Pass),
+						"evaluator", "score")
+				}
+
+				we.notify(we.chatID, fmt.Sprintf("📊 第 %d 轮评分: 正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f | %s",
+					round, score.Correctness, score.Completeness, score.Security, score.CodeQuality,
+					map[bool]string{true: "✅ 通过", false: "❌ 未通过"}[score.MeetsHardPassThreshold()]))
+
+				if score.MeetsHardPassThreshold() {
+					we.notify(we.chatID, fmt.Sprintf("✅ 对抗通过！第 %d 轮评审达标。", round))
+					break
+				}
+				lastEvalFeedback = score.Feedback
+				if lastEvalFeedback == "" {
+					lastEvalFeedback = sr.Output
+				}
+			} else {
+				lastEvalFeedback = "评估器未能正常返回结果，请全面检查代码质量。"
+			}
+		}
+	}
+
+	// Phase 3: Parallel stages (test, etc.)
+	if len(parallelStages) > 0 {
+		we.notify(we.chatID, "🧪 Phase 3: 测试...")
+		testResults := we.executeParallel(ctx, parallelStages, objective, prevResults, team)
+		allResults = append(allResults, testResults...)
+	}
+
+	return allResults, nil
 }
 
 // executePipeline 串行流水线执行

@@ -578,7 +578,7 @@ func (b *Bot) handleImageMessage(chatID, messageID string, msg *larkim.EventMess
 		return
 	}
 
-	response, err := vision.Understand(ctx, b.config.APIKey, "qwen-vl-plus", imageKey,
+	response, err := b.visionCli.Understand(ctx, imageKey,
 		"请详细描述这张图片的内容，包括文字、图表、数据等所有关键信息。")
 	if err != nil {
 		b.sendTextMessage(ctx, chatID, fmt.Sprintf("图片分析失败: %v", err))
@@ -1275,12 +1275,14 @@ func formatTimeSince(t time.Time) string {
 func (b *Bot) processAndReply(chatID, messageID, userText string) {
 	ctx := context.Background()
 
-	// Auto Plan: 复杂任务自动注入规划指令
-	if detectComplexity(userText) {
-		userText = "[Auto Plan] 这是一个复杂任务，请先进入 Plan 模式进行分析和规划，" +
-			"调用 EnterPlanMode，分析需求、设计方案，然后调用 ExitPlanMode 附带完整计划，再逐步执行。\n\n" +
+	// Auto Plan: LLM 判断复杂度 → 自动注入 Plan+Build 指令
+	if b.llmDetectComplexity(ctx, userText) {
+		userText = "[Auto Plan+Build] 这是一个复杂任务。\n" +
+			"阶段1(Plan): 调用 EnterPlanMode，深入分析需求，设计详细方案(架构、模块拆分、接口定义、风险点)。\n" +
+			"阶段2(Switch): 调用 ExitPlanMode 附带完整计划摘要。\n" +
+			"阶段3(Build): 按计划逐步执行实现(编写代码、创建文件、运行命令)，每完成一步验证结果。\n\n" +
 			"原始任务:\n" + userText
-		b.sendTextReply(ctx, messageID, "🧠 检测到复杂任务，自动启用 Plan 模式进行规划...")
+		b.sendTextReply(ctx, messageID, "🧠 LLM 判定为复杂任务，自动启用 Plan→Build 流程...")
 	}
 
 	// 发送「正在思考」提示
@@ -1300,47 +1302,70 @@ func (b *Bot) processAndReply(chatID, messageID, userText string) {
 	b.sendLongMessage(ctx, chatID, response)
 }
 
-// detectComplexity 检测用户消息是否为复杂任务。
-// 满足以下任一条件即视为复杂:
-//   - 文本长度 > 200 字符
-//   - 包含多个子任务连接词 (并且/然后/同时/另外/还需要/以及/第一/第二)
-//   - 包含多个技术关键词组合 (架构+设计, 重构+测试, API+数据库 等)
-func detectComplexity(text string) bool {
-	if len([]rune(text)) > 200 {
+// llmDetectComplexity 使用 LLM 判断任务复杂度。
+// 先做快速启发式筛选(极短消息直接跳过)，再调用 LLM 做精确判断。
+func (b *Bot) llmDetectComplexity(ctx context.Context, text string) bool {
+	runeLen := len([]rune(text))
+	if runeLen < 15 {
+		return false
+	}
+
+	sysPrompt := `你是一个任务复杂度分类器。用户发来一条消息，你需要判断它是"简单任务"还是"复杂任务"。
+
+复杂任务的特征(满足任一即可):
+- 涉及多个步骤或子任务(>2步)
+- 需要架构设计、方案评估
+- 涉及多文件或多模块改动
+- 需要调研、对比、分析
+- 包含明确的编号列表(1.2.3.)
+- 同时涉及编码+测试+部署等多阶段
+- 需要协作(多角色参与)
+
+简单任务: 单一查询、简单指令、一句话修改、翻译、问答等。
+
+只回复一个单词: COMPLEX 或 SIMPLE`
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	resp, err := b.apiClient.SimpleComplete(timeoutCtx, sysPrompt, text)
+	if err != nil {
+		return heuristicComplexity(text)
+	}
+
+	resp = strings.TrimSpace(strings.ToUpper(resp))
+	if strings.Contains(resp, "COMPLEX") {
+		return true
+	}
+	if strings.Contains(resp, "SIMPLE") {
+		return false
+	}
+	return heuristicComplexity(text)
+}
+
+// heuristicComplexity 启发式降级: LLM 不可用时的快速判断。
+func heuristicComplexity(text string) bool {
+	runeLen := len([]rune(text))
+	if runeLen > 300 {
 		return true
 	}
 	conjunctions := []string{"并且", "然后", "同时", "另外", "还需要", "以及", "此外", "接着"}
 	conjCount := 0
-	lower := strings.ToLower(text)
 	for _, c := range conjunctions {
-		if strings.Contains(lower, c) {
+		if strings.Contains(text, c) {
 			conjCount++
 		}
 	}
 	if conjCount >= 2 {
 		return true
 	}
-	// 数字编号列表 (1. xxx 2. xxx)
 	numberedItems := 0
-	for _, prefix := range []string{"1.", "2.", "3.", "4.", "5.", "1、", "2、", "3、", "4、", "一、", "二、", "三、"} {
+	for _, prefix := range []string{"1.", "2.", "3.", "4.", "5.", "1、", "2、", "3、"} {
 		if strings.Contains(text, prefix) {
 			numberedItems++
 		}
 	}
-	if numberedItems >= 3 {
-		return true
-	}
-	techKW := []string{"架构", "重构", "迁移", "设计", "实现", "开发", "部署", "优化", "分析", "测试"}
-	techCount := 0
-	for _, kw := range techKW {
-		if strings.Contains(text, kw) {
-			techCount++
-		}
-	}
-	if techCount >= 3 {
-		return true
-	}
-	return false
+	return numberedItems >= 3
 }
 
 // sendTextReply 回复指定消息 (引用回复)
