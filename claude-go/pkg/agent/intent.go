@@ -96,6 +96,7 @@ var wfDetect = map[string][]string{
 	"swarm":       {"蜂群", "swarm", "并行分析", "全面调研", "深度分析", "多角度", "自动拆解"},
 	"finance":     {"股票", "股价", "盯盘", "交易", "买入", "卖出", "持仓", "行情", "大盘", "a股", "美股", "港股", "基金", "投资建议", "财报", "估值"},
 	"techblog":    {"写文章", "写博客", "公众号", "技术文章", "源码分析", "写作", "排版", "发文", "文章创作"},
+	"creative":    {"画图", "生图", "做图", "设计图", "海报", "logo", "封面", "插画", "视觉设计", "图片创作", "视频创作", "做视频", "生成视频", "做个图", "画一个", "帮我画", "创意设计", "视觉创作", "分镜", "动画", "宣传视频", "宣传图", "做个"},
 }
 
 // CronIntent cron 定时任务意图。
@@ -278,9 +279,6 @@ func (ir *IntentRecognizer) keywordDetect(lower, original string) *TeamIntent {
 			break
 		}
 	}
-	if !hasCreate {
-		return nil
-	}
 
 	workflow := "research"
 	maxScore := 0
@@ -291,24 +289,47 @@ func (ir *IntentRecognizer) keywordDetect(lower, original string) *TeamIntent {
 				score++
 			}
 		}
+		// 专业团队关键词优先: 当 finance/techblog/creative 有匹配时
+		// 给予额外权重，避免被 research 的泛化关键词（如 "分析"）覆盖
+		if score > 0 {
+			switch wf {
+			case "finance", "techblog", "creative":
+				score += 1
+			}
+		}
 		if score > maxScore {
 			maxScore = score
 			workflow = wf
 		}
 	}
 
+	// 即使没有 createKW，当 wfDetect 强匹配专业团队关键词时也触发
+	if !hasCreate {
+		specialWorkflows := map[string]bool{"finance": true, "techblog": true, "creative": true}
+		if maxScore >= 1 && specialWorkflows[workflow] {
+			hasCreate = true
+		}
+	}
+	if !hasCreate {
+		return nil
+	}
+
+	conf := 0.7
+	if maxScore >= 2 {
+		conf = 0.8
+	}
 	return &TeamIntent{
 		Action:     "create_and_run",
 		Workflow:   workflow,
 		Objective:  original,
-		Confidence: 0.7,
+		Confidence: conf,
 	}
 }
 
 const extractSysPrompt = `你是命令解析器。给定用户的中文消息，提取多Agent协作任务的参数。
 
 输出 JSON（仅JSON，不要解释）:
-{"workflow":"development|research|debate|swarm|finance|techblog","objective":"简洁的任务目标","teamName":"kebab-case英文短名"}
+{"workflow":"development|research|debate|swarm|finance|techblog|creative","objective":"简洁的任务目标","teamName":"kebab-case英文短名"}
 
 判断规则:
 - development: 编写代码/实现功能/构建系统
@@ -316,7 +337,8 @@ const extractSysPrompt = `你是命令解析器。给定用户的中文消息，
 - debate: 辩论/讨论利弊/权衡选择
 - swarm: 复杂任务需要多角度并行分析/全面调研/自动拆解子任务
 - finance: 股票分析/盯盘/交易建议/财报分析/投资评估
-- techblog: 写技术文章/公众号文章/博客/源码分析文章`
+- techblog: 写技术文章/公众号文章/博客/源码分析文章
+- creative: 画图/做图/海报/Logo/封面/视频创作/视觉设计/动画`
 
 func (ir *IntentRecognizer) extractWithLLM(ctx context.Context, text string, intent *TeamIntent) {
 	resp, err := ir.llm.SimpleComplete(ctx, extractSysPrompt, text)

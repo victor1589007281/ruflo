@@ -1,10 +1,14 @@
 package feishu
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -488,14 +492,31 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 			chatID, senderID, msgType, chatType)
 	}
 
-	// 支持文本和图片消息
-	if msgType != "text" && msgType != "image" {
-		return nil
-	}
-
-	// 图片消息: 使用 Vision 能力进行理解
-	if msgType == "image" {
+	// 多模态消息路由
+	switch msgType {
+	case "image":
 		go b.handleImageMessage(chatID, messageID, msg)
+		return nil
+	case "file":
+		go b.handleFileMessage(chatID, messageID, msg)
+		return nil
+	case "video", "media":
+		go b.handleVideoMessage(chatID, messageID, msg)
+		return nil
+	case "audio":
+		go b.handleAudioMessage(chatID, messageID)
+		return nil
+	case "post": // 富文本消息: 提取纯文本后走正常流程
+		userText := ExtractPostText(deref(msg.Content))
+		if userText == "" {
+			return nil
+		}
+		go b.processAndReply(chatID, messageID, userText)
+		return nil
+	case "text":
+		// 继续下面的文本处理逻辑
+	default:
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("暂不支持 %s 类型消息，支持: 文本/图片/文件/视频/富文本。", msgType))
 		return nil
 	}
 
@@ -558,34 +579,299 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 	return nil
 }
 
-// handleImageMessage 处理图片消息，使用 Vision 能力进行理解。
+// handleImageMessage 处理图片消息：下载为 base64 → Vision 理解。
 func (b *Bot) handleImageMessage(chatID, messageID string, msg *larkim.EventMessage) {
 	ctx := context.Background()
 	b.sendTextReply(ctx, messageID, "🔍 正在分析图片...")
 
-	// 获取图片内容 (飞书图片需要通过 API 下载)
-	imageKey := ""
 	content := deref(msg.Content)
 	var imgContent struct {
 		ImageKey string `json:"image_key"`
 	}
-	if json.Unmarshal([]byte(content), &imgContent) == nil {
-		imageKey = imgContent.ImageKey
+	if json.Unmarshal([]byte(content), &imgContent) != nil || imgContent.ImageKey == "" {
+		b.sendTextMessage(ctx, chatID, "无法获取图片 key。")
+		return
 	}
-
-	if imageKey == "" || b.visionCli == nil {
-		b.sendTextMessage(ctx, chatID, "无法获取图片内容或视觉能力未初始化。")
+	if b.visionCli == nil {
+		b.sendTextMessage(ctx, chatID, "视觉能力未初始化。")
 		return
 	}
 
-	response, err := b.visionCli.Understand(ctx, imageKey,
-		"请详细描述这张图片的内容，包括文字、图表、数据等所有关键信息。")
+	b64, err := b.downloadImageAsBase64(ctx, messageID, imgContent.ImageKey)
+	if err != nil {
+		b.sendTextMessage(ctx, chatID, fmt.Sprintf("下载图片失败: %v", err))
+		return
+	}
+
+	response, err := b.visionCli.Understand(ctx, b64,
+		"请详细描述这张图片的内容，包括文字、图表、数据等所有关键信息。如果有代码、公式、表格等结构化内容，请按原始格式呈现。")
 	if err != nil {
 		b.sendTextMessage(ctx, chatID, fmt.Sprintf("图片分析失败: %v", err))
 		return
 	}
 
 	b.sendLongMessage(ctx, chatID, "🖼️ **图片分析结果:**\n\n"+response)
+}
+
+// handleFileMessage 处理文件消息：提取文件信息并提供说明。
+func (b *Bot) handleFileMessage(chatID, messageID string, msg *larkim.EventMessage) {
+	ctx := context.Background()
+	content := deref(msg.Content)
+	var fileContent struct {
+		FileKey  string `json:"file_key"`
+		FileName string `json:"file_name"`
+	}
+	if json.Unmarshal([]byte(content), &fileContent) != nil || fileContent.FileKey == "" {
+		b.sendTextReply(ctx, messageID, "无法获取文件信息。")
+		return
+	}
+	b.sendTextReply(ctx, messageID, fmt.Sprintf("📄 收到文件: **%s**\n\n正在处理...", fileContent.FileName))
+
+	ext := strings.ToLower(fileContent.FileName)
+	switch {
+	case strings.HasSuffix(ext, ".png") || strings.HasSuffix(ext, ".jpg") ||
+		strings.HasSuffix(ext, ".jpeg") || strings.HasSuffix(ext, ".gif") ||
+		strings.HasSuffix(ext, ".webp"):
+		if b.visionCli != nil {
+			b64, err := b.downloadFileAsBase64(ctx, messageID, fileContent.FileKey)
+			if err == nil {
+				resp, err := b.visionCli.Understand(ctx, b64, "请详细分析这张图片的内容。")
+				if err == nil {
+					b.sendLongMessage(ctx, chatID, "🖼️ **图片文件分析:**\n\n"+resp)
+					return
+				}
+			}
+		}
+		b.sendTextMessage(ctx, chatID, fmt.Sprintf("已收到图片文件 %s，但视觉分析暂不可用。", fileContent.FileName))
+	default:
+		b.sendTextMessage(ctx, chatID,
+			fmt.Sprintf("📄 已收到文件: **%s** (file_key: %s)\n\n"+
+				"目前支持图片文件的自动分析。其他类型文件请描述需求，我会尽力协助。",
+				fileContent.FileName, fileContent.FileKey))
+	}
+}
+
+// handleVideoMessage 处理视频消息：提取关键帧或描述。
+func (b *Bot) handleVideoMessage(chatID, messageID string, msg *larkim.EventMessage) {
+	ctx := context.Background()
+	content := deref(msg.Content)
+	var vidContent struct {
+		FileKey  string `json:"file_key"`
+		ImageKey string `json:"image_key"` // 视频封面图
+	}
+	if json.Unmarshal([]byte(content), &vidContent) != nil {
+		b.sendTextReply(ctx, messageID, "无法解析视频消息。")
+		return
+	}
+
+	// 如果有封面图，用 Vision 分析
+	if vidContent.ImageKey != "" && b.visionCli != nil {
+		b.sendTextReply(ctx, messageID, "🎬 收到视频，正在分析封面图...")
+		b64, err := b.downloadImageAsBase64(ctx, messageID, vidContent.ImageKey)
+		if err == nil {
+			resp, err := b.visionCli.Understand(ctx, b64, "这是一个视频的封面图/缩略图，请描述画面内容，推测视频的可能主题。")
+			if err == nil {
+				b.sendLongMessage(ctx, chatID, "🎬 **视频封面分析:**\n\n"+resp)
+				return
+			}
+		}
+	}
+
+	b.sendTextMessage(ctx, chatID, "🎬 已收到视频消息。目前支持通过封面图分析视频内容。请描述你对该视频的具体需求。")
+}
+
+// handleAudioMessage 处理音频消息。
+func (b *Bot) handleAudioMessage(chatID, messageID string) {
+	ctx := context.Background()
+	b.sendTextReply(ctx, messageID, "🎵 已收到音频消息。目前暂不支持音频转写，请将内容转为文字发送。")
+}
+
+// downloadImageAsBase64 通过飞书 API 下载消息中的图片并转为 base64。
+func (b *Bot) downloadImageAsBase64(ctx context.Context, messageID, imageKey string) (string, error) {
+	req := larkim.NewGetMessageResourceReqBuilder().
+		MessageId(messageID).
+		FileKey(imageKey).
+		Type("image").
+		Build()
+
+	resp, err := b.client.Im.MessageResource.Get(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("飞书图片下载 API 失败: %w", err)
+	}
+	if !resp.Success() {
+		return "", fmt.Errorf("飞书图片下载失败: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+
+	if resp.File == nil {
+		return "", fmt.Errorf("图片数据为空")
+	}
+	data, err := io.ReadAll(resp.File)
+	if err != nil {
+		return "", fmt.Errorf("读取图片数据失败: %w", err)
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("图片数据为空")
+	}
+
+	mediaType := http.DetectContentType(data)
+	b64 := "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return b64, nil
+}
+
+// downloadFileAsBase64 通过飞书 API 下载文件并转为 base64。
+func (b *Bot) downloadFileAsBase64(ctx context.Context, messageID, fileKey string) (string, error) {
+	req := larkim.NewGetMessageResourceReqBuilder().
+		MessageId(messageID).
+		FileKey(fileKey).
+		Type("file").
+		Build()
+
+	resp, err := b.client.Im.MessageResource.Get(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("飞书文件下载 API 失败: %w", err)
+	}
+	if !resp.Success() {
+		return "", fmt.Errorf("飞书文件下载失败: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+
+	if resp.File == nil {
+		return "", fmt.Errorf("文件数据为空")
+	}
+	data, err := io.ReadAll(resp.File)
+	if err != nil {
+		return "", fmt.Errorf("读取文件数据失败: %w", err)
+	}
+
+	mediaType := http.DetectContentType(data)
+	b64 := "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return b64, nil
+}
+
+// sendImageMessage 发送图片消息到飞书（需先上传图片获取 image_key）。
+func (b *Bot) sendImageMessage(ctx context.Context, chatID string, imageData []byte, filename string) error {
+	imgReq := larkim.NewCreateImageReqBuilder().
+		Body(larkim.NewCreateImageReqBodyBuilder().
+			ImageType("message").
+			Image(bytes.NewReader(imageData)).
+			Build()).
+		Build()
+
+	imgResp, err := b.client.Im.Image.Create(ctx, imgReq)
+	if err != nil {
+		return fmt.Errorf("上传图片失败: %w", err)
+	}
+	if !imgResp.Success() {
+		return fmt.Errorf("上传图片失败: code=%d, msg=%s", imgResp.Code, imgResp.Msg)
+	}
+
+	imageKey := deref(imgResp.Data.ImageKey)
+	content, _ := json.Marshal(map[string]string{"image_key": imageKey})
+
+	msgReq := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType("chat_id").
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			MsgType("image").
+			ReceiveId(chatID).
+			Content(string(content)).
+			Build()).
+		Build()
+
+	resp, err := b.client.Im.Message.Create(ctx, msgReq)
+	if err != nil {
+		return fmt.Errorf("发送图片消息失败: %w", err)
+	}
+	if !resp.Success() {
+		return fmt.Errorf("发送图片消息失败: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+	return nil
+}
+
+// sendFileMessage 发送文件消息到飞书。
+func (b *Bot) sendFileMessage(ctx context.Context, chatID string, fileData []byte, filename, fileType string) error {
+	if fileType == "" {
+		fileType = "stream"
+	}
+	fileReq := larkim.NewCreateFileReqBuilder().
+		Body(larkim.NewCreateFileReqBodyBuilder().
+			FileType(fileType).
+			FileName(filename).
+			File(bytes.NewReader(fileData)).
+			Build()).
+		Build()
+
+	fileResp, err := b.client.Im.File.Create(ctx, fileReq)
+	if err != nil {
+		return fmt.Errorf("上传文件失败: %w", err)
+	}
+	if !fileResp.Success() {
+		return fmt.Errorf("上传文件失败: code=%d, msg=%s", fileResp.Code, fileResp.Msg)
+	}
+
+	fileKey := deref(fileResp.Data.FileKey)
+	content, _ := json.Marshal(map[string]string{"file_key": fileKey})
+
+	msgReq := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType("chat_id").
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			MsgType("file").
+			ReceiveId(chatID).
+			Content(string(content)).
+			Build()).
+		Build()
+
+	resp, err := b.client.Im.Message.Create(ctx, msgReq)
+	if err != nil {
+		return fmt.Errorf("发送文件消息失败: %w", err)
+	}
+	if !resp.Success() {
+		return fmt.Errorf("发送文件消息失败: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+	return nil
+}
+
+// ExtractPostText 从飞书富文本(post)消息中提取纯文本。
+func ExtractPostText(content string) string {
+	var post struct {
+		Title   string `json:"title"`
+		Content [][]struct {
+			Tag  string `json:"tag"`
+			Text string `json:"text,omitempty"`
+			Href string `json:"href,omitempty"`
+		} `json:"content"`
+	}
+
+	// post 消息可能包裹在 locale key 下
+	var wrapper map[string]json.RawMessage
+	if json.Unmarshal([]byte(content), &wrapper) == nil {
+		for _, locale := range []string{"zh_cn", "en_us", "ja_jp"} {
+			if raw, ok := wrapper[locale]; ok {
+				if json.Unmarshal(raw, &post) == nil && len(post.Content) > 0 {
+					break
+				}
+			}
+		}
+	}
+
+	var sb strings.Builder
+	if post.Title != "" {
+		sb.WriteString(post.Title)
+		sb.WriteString("\n")
+	}
+	for _, line := range post.Content {
+		for _, elem := range line {
+			switch elem.Tag {
+			case "text":
+				sb.WriteString(elem.Text)
+			case "a":
+				sb.WriteString(elem.Text)
+				if elem.Href != "" {
+					sb.WriteString(" (" + elem.Href + ")")
+				}
+			}
+		}
+		sb.WriteString("\n")
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 // handleWikiIngest 自动将 URL 内容提取到 Wiki 知识库。
