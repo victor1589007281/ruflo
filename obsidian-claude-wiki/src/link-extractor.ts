@@ -1,11 +1,12 @@
 import { normalizePath, requestUrl, type TFile, type Vault } from "obsidian";
 
 /**
- * 从网页拉取正文并落盘到 Vault `raw/` 目录，供后续管线或 Claude-Go 处理。
+ * 从网页 URL 拉取 (fetch) 正文并落盘为 markdown 到 Vault `raw/` 目录，
+ * 供后续管线或 Claude-Go 处理。
  */
 export class LinkExtractor {
   /**
-   * 抓取 URL，解析 HTML 并抽取可读正文（去 script/style，取 body 文本）。
+   * 抓取 URL (fetch via requestUrl)，解析 HTML 并抽取可读正文为 markdown 格式。
    * 使用 Obsidian `requestUrl` 以适配桌面与移动端网络栈。
    */
   async extractFromUrl(url: string): Promise<{ title: string; content: string }> {

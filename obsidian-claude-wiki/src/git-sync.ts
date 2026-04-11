@@ -68,6 +68,22 @@ export class GitSync {
     };
   }
 
+  /** 克隆远程仓库到本地路径 */
+  async clone(remoteUrl: string): Promise<void> {
+    const fs = GitSync.tryGetNodeFS();
+    this.assertFs(fs);
+    const git = await this.loadGit();
+    const http = await this.loadHttpClient();
+    await git.clone({
+      fs,
+      http,
+      dir: this.repoPath,
+      url: remoteUrl,
+      singleBranch: true,
+      depth: 1,
+    });
+  }
+
   async pull(): Promise<void> {
     const fs = GitSync.tryGetNodeFS();
     this.assertFs(fs);

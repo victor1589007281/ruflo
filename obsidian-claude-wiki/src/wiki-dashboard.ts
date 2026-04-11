@@ -36,7 +36,8 @@ export class WikiDashboardView extends ItemView {
 
   /** 外部触发重绘（同步、抓取、lint 后调用） */
   async render(): Promise<void> {
-    const root = this.contentEl;
+    const container = this.contentEl;
+    const root = container;
     root.empty();
     root.addClass("claude-wiki-dashboard");
 

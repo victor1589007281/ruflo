@@ -335,3 +335,27 @@ func mustMarshalString(s string) json.RawMessage {
 	data, _ := json.Marshal(s)
 	return data
 }
+
+// RawComplete 发送原始 content blocks 并返回文本结果。
+// contentJSON 为 Anthropic Messages API content 数组的 JSON (如 [{"type":"text","text":"..."}])。
+// 支持多模态消息(图文混排)。
+func (c *Client) RawComplete(ctx context.Context, contentJSON json.RawMessage, maxTokens int) (string, error) {
+	if maxTokens <= 0 {
+		maxTokens = 8192
+	}
+	messages := []types.APIMessage{{
+		Role:    "user",
+		Content: contentJSON,
+	}}
+	resp, err := c.SendMessage(ctx, messages, nil, nil, maxTokens)
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for _, block := range resp.Content {
+		if block.Type == types.ContentBlockText {
+			sb.WriteString(block.Text)
+		}
+	}
+	return sb.String(), nil
+}

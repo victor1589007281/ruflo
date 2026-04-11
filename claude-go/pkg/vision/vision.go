@@ -1,42 +1,34 @@
-// Package vision 基于阿里百炼 Coding Plan API (OpenAI 兼容) 的多模态视觉能力。
-// 完全通过 qwen3.6-plus / kimi-k2.5 的视觉理解 + 文本生成能力实现：
+// Package vision 基于阿里百炼 Coding Plan API 的多模态视觉能力。
+// 完全复用 claude-go 的 api.Client，不独立管理 HTTP 连接。
+// 通过 qwen3.6-plus / kimi-k2.5 的视觉理解 + 文本生成能力实现：
 //   - 图片理解: 发送 base64 图片 → LLM 返回描述/分析
-//   - 文生图: LLM 生成 SVG/HTML 源码 → 调用方可渲染为图片
-//   - 图生图: 理解原图 → LLM 生成改造后的 SVG/HTML
-//   - 图生视频: 理解图片 → LLM 设计运镜脚本(关键帧描述) → 生成多帧 SVG → 组装为动画
+//   - 文生图: LLM 生成 SVG 源码 → 调用方可渲染为图片
+//   - 图生图: 理解原图 → LLM 生成改造后的 SVG
+//   - 图生视频: LLM 设计运镜脚本 → 逐帧生成 SVG → CSS 关键帧动画 HTML
 package vision
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"time"
 )
 
-const defaultBaseURL = "https://coding.dashscope.aliyuncs.com/apps/anthropic"
-
-// Client 封装阿里百炼 Coding Plan API 调用。
-type Client struct {
-	APIKey     string
-	BaseURL    string
-	Model      string
-	HTTPClient *http.Client
+// LLMClient 对 api.Client 的最小依赖接口。
+type LLMClient interface {
+	SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+	RawComplete(ctx context.Context, contentJSON json.RawMessage, maxTokens int) (string, error)
 }
 
-// NewClient 使用阿里百炼 Coding Plan API。
-func NewClient(apiKey string) *Client {
-	return &Client{
-		APIKey:  apiKey,
-		BaseURL: defaultBaseURL,
-		Model:   "qwen3.6-plus",
-		HTTPClient: &http.Client{
-			Timeout: 120 * time.Second,
-		},
-	}
+// Client 封装视觉能力，复用 claude-go 的 api.Client。
+type Client struct {
+	LLM   LLMClient
+	Model string
+}
+
+// NewClient 使用已有的 api.Client 构造 Vision 客户端。
+func NewClient(llm LLMClient) *Client {
+	return &Client{LLM: llm, Model: "qwen3.6-plus"}
 }
 
 // ImageResult 图像生成结果。
@@ -51,117 +43,8 @@ type ImageResult struct {
 type VideoResult struct {
 	Frames     []string `json:"frames"`
 	Script     string   `json:"script"`
-	AnimCSS    string   `json:"anim_css"`
 	HTMLPlayer string   `json:"html_player"`
 	RawReply   string   `json:"raw_reply"`
-}
-
-// doPost 底层 HTTP POST 调用，返回响应体。
-func (c *Client) doPost(ctx context.Context, payload map[string]any) ([]byte, error) {
-	baseURL := c.BaseURL
-	if baseURL == "" {
-		baseURL = defaultBaseURL
-	}
-	endpoint := strings.TrimRight(baseURL, "/") + "/v1/messages"
-
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("序列化请求失败: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
-	if err != nil {
-		return nil, fmt.Errorf("构造请求失败: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", c.APIKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(body, 512))
-	}
-	return body, nil
-}
-
-// parseTextResponse 从 Anthropic Messages 响应中提取文本。
-func parseTextResponse(body []byte) (string, error) {
-	var parsed struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("解析响应失败: %w (body=%s)", err, truncate(body, 256))
-	}
-	if parsed.Error != nil {
-		return "", fmt.Errorf("API 错误: %s", parsed.Error.Message)
-	}
-
-	var sb strings.Builder
-	for _, block := range parsed.Content {
-		if block.Type == "text" {
-			sb.WriteString(block.Text)
-		}
-	}
-	if sb.Len() == 0 {
-		return "", fmt.Errorf("响应中无文本内容")
-	}
-	return sb.String(), nil
-}
-
-// callText 纯文本对话调用（content 为字符串）。
-func (c *Client) callText(ctx context.Context, userText string) (string, error) {
-	model := c.Model
-	if model == "" {
-		model = "qwen3.6-plus"
-	}
-	payload := map[string]any{
-		"model":      model,
-		"max_tokens": 8192,
-		"messages": []map[string]any{
-			{"role": "user", "content": userText},
-		},
-	}
-	body, err := c.doPost(ctx, payload)
-	if err != nil {
-		return "", err
-	}
-	return parseTextResponse(body)
-}
-
-// callMultimodal 多模态调用（content 为 Anthropic content blocks 数组）。
-func (c *Client) callMultimodal(ctx context.Context, contentBlocks []map[string]any) (string, error) {
-	model := c.Model
-	if model == "" {
-		model = "qwen3.6-plus"
-	}
-	payload := map[string]any{
-		"model":      model,
-		"max_tokens": 8192,
-		"messages": []map[string]any{
-			{"role": "user", "content": contentBlocks},
-		},
-	}
-	body, err := c.doPost(ctx, payload)
-	if err != nil {
-		return "", err
-	}
-	return parseTextResponse(body)
 }
 
 // Understand 图片理解: 发送 base64 图片，LLM 返回分析。
@@ -173,16 +56,21 @@ func (c *Client) Understand(ctx context.Context, imageBase64, prompt string) (st
 		prompt = "请详细描述这张图片的内容。"
 	}
 
-	dataURL := imageBase64
-	if !strings.HasPrefix(dataURL, "data:") {
-		dataURL = "data:image/jpeg;base64," + dataURL
-	}
+	b64, mediaType := parseImageInput(imageBase64)
 
 	contentBlocks := []map[string]any{
-		{"type": "image", "source": map[string]any{"type": "url", "url": dataURL}},
+		{"type": "image", "source": map[string]any{
+			"type":       "base64",
+			"media_type": mediaType,
+			"data":       b64,
+		}},
 		{"type": "text", "text": prompt},
 	}
-	return c.callMultimodal(ctx, contentBlocks)
+	raw, err := json.Marshal(contentBlocks)
+	if err != nil {
+		return "", fmt.Errorf("序列化内容失败: %w", err)
+	}
+	return c.LLM.RawComplete(ctx, raw, 4096)
 }
 
 // GenerateImage 文生图: LLM 根据提示词生成 SVG 源码。
@@ -194,32 +82,19 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, style string)
 		style = "现代扁平设计"
 	}
 
-	userText := fmt.Sprintf(`你是一位专业的 SVG 图像设计师。根据用户描述生成高质量 SVG 图像。
+	sysPrompt := "你是一位专业的 SVG 图像设计师。根据用户描述生成高质量 SVG 图像。" +
+		"要求: 1.输出完整SVG代码,以<svg>开头</svg>结尾 2.使用viewBox=\"0 0 800 600\" " +
+		"3.色彩丰富、细节精致 4.不要输出任何解释文字,只输出SVG代码"
 
-要求:
-1. 输出完整的 SVG 代码，以 <svg> 开头 </svg> 结尾
-2. 使用 viewBox="0 0 800 600"
-3. 风格: %s
-4. 色彩丰富、细节精致
-5. 不要输出任何解释文字，只输出 SVG 代码
+	userText := fmt.Sprintf("风格: %s\n描述: %s", style, prompt)
 
-用户描述: %s`, style, prompt)
-
-	reply, err := c.callText(ctx, userText)
+	reply, err := c.LLM.SimpleComplete(ctx, sysPrompt, userText)
 	if err != nil {
 		return nil, err
 	}
 
-	svg := extractBetween(reply, "<svg", "</svg>")
-	if svg != "" {
-		svg = "<svg" + svg + "</svg>"
-	}
-
-	return &ImageResult{
-		SVG:      svg,
-		RawReply: reply,
-		Desc:     prompt,
-	}, nil
+	svg := extractSVG(reply)
+	return &ImageResult{SVG: svg, RawReply: reply, Desc: prompt}, nil
 }
 
 // TransformImage 图生图: 理解原图 → 按指令改造 → 生成新 SVG。
@@ -231,13 +106,14 @@ func (c *Client) TransformImage(ctx context.Context, imageBase64, instruction st
 		instruction = "在保持原图构图的基础上，转换为矢量插画风格"
 	}
 
-	dataURL := imageBase64
-	if !strings.HasPrefix(dataURL, "data:") {
-		dataURL = "data:image/jpeg;base64," + dataURL
-	}
+	b64, mediaType := parseImageInput(imageBase64)
 
 	contentBlocks := []map[string]any{
-		{"type": "image", "source": map[string]any{"type": "url", "url": dataURL}},
+		{"type": "image", "source": map[string]any{
+			"type":       "base64",
+			"media_type": mediaType,
+			"data":       b64,
+		}},
 		{"type": "text", "text": fmt.Sprintf(`你是一位图像改造专家。请仔细观察这张图片，然后按照以下指令生成一张新的 SVG 图像:
 
 改造指令: %s
@@ -250,104 +126,81 @@ func (c *Client) TransformImage(ctx context.Context, imageBase64, instruction st
 5. 只输出 SVG 代码，不要解释`, instruction)},
 	}
 
-	reply, err := c.callMultimodal(ctx, contentBlocks)
+	raw, err := json.Marshal(contentBlocks)
+	if err != nil {
+		return nil, fmt.Errorf("序列化内容失败: %w", err)
+	}
+
+	reply, err := c.LLM.RawComplete(ctx, raw, 8192)
 	if err != nil {
 		return nil, err
 	}
 
-	svg := extractBetween(reply, "<svg", "</svg>")
-	if svg != "" {
-		svg = "<svg" + svg + "</svg>"
-	}
-
-	return &ImageResult{
-		SVG:      svg,
-		RawReply: reply,
-		Desc:     instruction,
-	}, nil
+	svg := extractSVG(reply)
+	return &ImageResult{SVG: svg, RawReply: reply, Desc: instruction}, nil
 }
 
-// GenerateVideo 图生视频: 理解图片 → 设计运镜脚本 → 生成多帧+CSS动画 → 输出 HTML Player。
+// GenerateVideo 图生视频: LLM 设计运镜脚本 → 逐帧生成 SVG → CSS 关键帧动画 HTML Player。
 func (c *Client) GenerateVideo(ctx context.Context, imageBase64, prompt string, frames int) (*VideoResult, error) {
 	if frames <= 0 {
-		frames = 6
+		frames = 4
 	}
 	if strings.TrimSpace(prompt) == "" {
 		prompt = "从左到右缓慢平移，带有缩放效果"
 	}
 
-	// Step 1: 理解图片 + 设计运镜脚本
-	scriptPrompt := fmt.Sprintf(`你是一位动画导演。请根据以下指令设计一个 %d 帧的运镜脚本。
-
+	// Step 1: 设计运镜脚本
+	scriptSys := "你是一位动画导演。设计运镜脚本，输出JSON格式。"
+	scriptUser := fmt.Sprintf(`设计一个 %d 帧的运镜脚本。
 运镜指令: %s
-
-输出 JSON 格式的运镜脚本:
-{
-  "title": "动画标题",
-  "duration_seconds": 总时长,
-  "frames": [
-    {
-      "frame_id": 1,
-      "time_offset": "0s",
-      "camera": "描述镜头位置和角度",
-      "scene_description": "这一帧的画面描述",
-      "transition": "切换效果(fade/slide/zoom)"
-    }
-  ]
-}
-
-只输出 JSON，不要解释。`, frames, prompt)
+输出JSON:
+{"title":"标题","frames":[{"frame_id":1,"camera":"镜头描述","scene":"画面描述","transition":"fade/zoom/slide"}]}
+只输出JSON。`, frames, prompt)
 
 	var scriptReply string
 	var err error
 	if strings.TrimSpace(imageBase64) != "" {
-		dataURL := imageBase64
-		if !strings.HasPrefix(dataURL, "data:") {
-			dataURL = "data:image/jpeg;base64," + dataURL
-		}
+		b64, mediaType := parseImageInput(imageBase64)
 		contentBlocks := []map[string]any{
-			{"type": "image", "source": map[string]any{"type": "url", "url": dataURL}},
-			{"type": "text", "text": scriptPrompt},
+			{"type": "image", "source": map[string]any{
+				"type":       "base64",
+				"media_type": mediaType,
+				"data":       b64,
+			}},
+			{"type": "text", "text": scriptUser},
 		}
-		scriptReply, err = c.callMultimodal(ctx, contentBlocks)
+		raw, _ := json.Marshal(contentBlocks)
+		scriptReply, err = c.LLM.RawComplete(ctx, raw, 4096)
 	} else {
-		scriptReply, err = c.callText(ctx, scriptPrompt)
+		scriptReply, err = c.LLM.SimpleComplete(ctx, scriptSys, scriptUser)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("运镜脚本生成失败: %w", err)
 	}
 
-	// Step 2: 根据运镜脚本，逐帧生成 SVG
+	// Step 2: 逐帧生成 SVG
+	frameSys := "你是SVG动画帧设计师。根据运镜脚本为指定帧生成SVG。" +
+		"要求: viewBox=\"0 0 800 600\"，只输出SVG代码。"
+
 	svgFrames := make([]string, 0, frames)
 	for i := 1; i <= frames; i++ {
-		framePrompt := fmt.Sprintf(`根据以下运镜脚本，生成第 %d/%d 帧的 SVG 图像。
+		frameUser := fmt.Sprintf("运镜脚本:\n%s\n\n生成第 %d/%d 帧的SVG。与前后帧保持视觉连贯。只输出SVG代码。",
+			scriptReply, i, frames)
 
-运镜脚本:
-%s
-
-要求:
-1. 输出完整 SVG 代码 (viewBox="0 0 800 600")
-2. 该帧反映脚本中 frame_id=%d 的镜头描述
-3. 与前后帧保持视觉连贯性
-4. 只输出 SVG 代码`, i, frames, scriptReply, i)
-
-		frameReply, err := c.callText(ctx, framePrompt)
-		if err != nil {
-			svgFrames = append(svgFrames, fmt.Sprintf(`<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><text x="400" y="300" text-anchor="middle">Frame %d (error)</text></svg>`, i))
+		frameReply, fErr := c.LLM.SimpleComplete(ctx, frameSys, frameUser)
+		if fErr != nil {
+			svgFrames = append(svgFrames,
+				fmt.Sprintf(`<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><rect fill="#333" width="800" height="600"/><text x="400" y="300" text-anchor="middle" fill="#fff" font-size="24">Frame %d (error: %s)</text></svg>`, i, fErr.Error()))
 			continue
 		}
-
-		svg := extractBetween(frameReply, "<svg", "</svg>")
-		if svg != "" {
-			svg = "<svg" + svg + "</svg>"
-		} else {
-			svg = fmt.Sprintf(`<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><text x="400" y="300" text-anchor="middle">Frame %d</text></svg>`, i)
+		svg := extractSVG(frameReply)
+		if svg == "" {
+			svg = fmt.Sprintf(`<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><rect fill="#555" width="800" height="600"/><text x="400" y="300" text-anchor="middle" fill="#fff" font-size="20">Frame %d</text></svg>`, i)
 		}
 		svgFrames = append(svgFrames, svg)
 	}
 
-	// Step 3: 生成 HTML Player（CSS 关键帧动画拼接所有帧）
-	htmlPlayer := buildHTMLPlayer(svgFrames, frames)
+	htmlPlayer := buildHTMLPlayer(svgFrames)
 
 	return &VideoResult{
 		Frames:     svgFrames,
@@ -357,8 +210,36 @@ func (c *Client) GenerateVideo(ctx context.Context, imageBase64, prompt string, 
 	}, nil
 }
 
-// buildHTMLPlayer 将多个 SVG 帧拼接为 CSS 动画 HTML。
-func buildHTMLPlayer(svgFrames []string, totalFrames int) string {
+// parseImageInput 从 data URL 或纯 base64 中提取 base64 数据和 media type。
+func parseImageInput(input string) (b64 string, mediaType string) {
+	if strings.HasPrefix(input, "data:") {
+		// data:image/png;base64,xxxxx
+		if idx := strings.Index(input, ";base64,"); idx > 0 {
+			mediaType = input[5:idx] // "image/png"
+			b64 = input[idx+8:]     // raw base64
+			return
+		}
+	}
+	return input, "image/png"
+}
+
+// extractSVG 从 LLM 输出中提取 <svg>...</svg> 块。
+func extractSVG(s string) string {
+	lower := strings.ToLower(s)
+	startIdx := strings.Index(lower, "<svg")
+	if startIdx < 0 {
+		return ""
+	}
+	after := s[startIdx:]
+	endIdx := strings.Index(strings.ToLower(after), "</svg>")
+	if endIdx < 0 {
+		return ""
+	}
+	return after[:endIdx+len("</svg>")]
+}
+
+// buildHTMLPlayer 将多个 SVG 帧拼接为 CSS 关键帧动画 HTML。
+func buildHTMLPlayer(svgFrames []string) string {
 	n := len(svgFrames)
 	if n == 0 {
 		return "<html><body><p>No frames</p></body></html>"
@@ -407,27 +288,4 @@ body { margin:0; background:#000; display:flex; justify-content:center; align-it
 %s</div>
 </body>
 </html>`, n, totalDuration, keyframes.String(), framesDivs.String())
-}
-
-// extractBetween 提取 startTag 和 endTag 之间的内容（不含 startTag 本身但含 endTag 之前的所有内容）。
-func extractBetween(s, startTag, endTag string) string {
-	lower := strings.ToLower(s)
-	startIdx := strings.Index(lower, strings.ToLower(startTag))
-	if startIdx < 0 {
-		return ""
-	}
-	after := s[startIdx+len(startTag):]
-	endIdx := strings.Index(strings.ToLower(after), strings.ToLower(endTag))
-	if endIdx < 0 {
-		return ""
-	}
-	return after[:endIdx]
-}
-
-func truncate(b []byte, max int) string {
-	s := string(b)
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
 }

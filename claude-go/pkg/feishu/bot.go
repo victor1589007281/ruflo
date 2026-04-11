@@ -209,8 +209,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	bot.cronSched = agent.NewCronScheduler(layout.Cron, &botCronExecutor{bot: bot})
 	bot.cronSched.Start()
 
-	// 13. 初始化 Vision 客户端
-	bot.visionCli = vision.NewClient(config.APIKey)
+	// 13. 初始化 Vision 客户端 (复用 api.Client)
+	bot.visionCli = vision.NewClient(aiClient)
 
 	// 14. 初始化 Wiki 引擎 (独立 git 仓库)
 	wikiRepoDir := layout.Wiki
@@ -221,7 +221,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	if baseURL == "" {
 		baseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 	}
-	bot.wikiEngine = wiki.NewEngine(wikiRepoDir, config.APIKey, baseURL, config.Model)
+	bot.wikiEngine = wiki.NewEngineWithLLM(wikiRepoDir, aiClient)
 
 	// 15. 初始化技能自动创建器 (Hermes-agent 特性吸收)
 	bot.skillAuto = skills.NewAutoCreator(layout.Skills, aiClient, config.Model, bot.skillReg)

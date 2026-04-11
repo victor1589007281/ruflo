@@ -69,13 +69,19 @@ var (
 	reSlugUnsafe = regexp.MustCompile(`[^\p{L}\p{N}]+`)
 )
 
+// LLMClient 定义 Wiki 引擎对 LLM 的最小依赖，与 api.Client.SimpleComplete 兼容。
+type LLMClient interface {
+	SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+}
+
 // Engine 是 LLM Wiki 知识库的运行时入口，负责摄取、查询与质检。
 // 同一 Engine 实例上的公开方法使用互斥锁序列化，避免并发写盘与 git 提交交错。
 type Engine struct {
 	RepoDir    string // Git 仓库根目录，例如 ~/knowledge-wiki
-	APIKey     string // OpenAI 兼容 API 的 Bearer Token
-	BaseURL    string // API 根路径，例如 https://api.openai.com/v1 或 DashScope 兼容地址
-	Model      string // 模型名称，写入 chat/completions 请求体
+	APIKey     string // 保留用于 HTTP 拉取 URL (非 LLM)
+	BaseURL    string // 保留向后兼容
+	Model      string // 保留向后兼容
+	llm        LLMClient
 	httpClient *http.Client
 	mu         sync.Mutex
 }
@@ -125,6 +131,7 @@ type ingestLLMResult struct {
 }
 
 // NewEngine 构造引擎实例，不自动初始化仓库；首次操作前可调用 EnsureRepo。
+// 保留旧签名的向后兼容：若不传 LLM client，Engine 将在调用 LLM 时报错。
 func NewEngine(repoDir, apiKey, baseURL, model string) *Engine {
 	return &Engine{
 		RepoDir: strings.TrimSpace(repoDir),
@@ -135,6 +142,30 @@ func NewEngine(repoDir, apiKey, baseURL, model string) *Engine {
 			Timeout: 120 * time.Second,
 		},
 	}
+}
+
+// NewEngineWithLLM 构造引擎实例，使用已有的 LLM client (推荐)。
+func NewEngineWithLLM(repoDir string, llm LLMClient) *Engine {
+	return &Engine{
+		RepoDir: strings.TrimSpace(repoDir),
+		llm:     llm,
+		httpClient: &http.Client{
+			Timeout: 120 * time.Second,
+		},
+	}
+}
+
+// SetLLM 设置 LLM 客户端。
+func (e *Engine) SetLLM(llm LLMClient) {
+	e.llm = llm
+}
+
+// completeLLM 统一 LLM 调用入口：优先用注入的 LLMClient，降级用旧的 HTTP callLLM。
+func (e *Engine) completeLLM(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	if e.llm != nil {
+		return e.llm.SimpleComplete(ctx, systemPrompt, userPrompt)
+	}
+	return callLLM(ctx, e.httpClient, e.APIKey, e.BaseURL, e.Model, systemPrompt, userPrompt)
 }
 
 // EnsureRepo 若目录或 Git 结构不完整则初始化：创建 raw/wiki/schema、写入默认 schema.yaml，并在需要时 git init。
@@ -225,7 +256,7 @@ func (e *Engine) Ingest(ctx context.Context, url string) error {
 	}
 
 	userPrompt := fmt.Sprintf("来源 URL: %s\n标题: %s\n\n正文:\n%s", url, title, truncateRunes(text, 24000))
-	rawJSON, err := callLLM(ctx, e.httpClient, e.APIKey, e.BaseURL, e.Model, ingestSystemPrompt, userPrompt)
+	rawJSON, err := e.completeLLM(ctx, ingestSystemPrompt, userPrompt)
 	if err != nil {
 		return fmt.Errorf("wiki: LLM 摄取: %w", err)
 	}
@@ -277,7 +308,7 @@ func (e *Engine) Query(ctx context.Context, question string) (string, error) {
 		return "", err
 	}
 	user := fmt.Sprintf("用户问题:\n%s\n\n---\n目录与摘录:\n%s", q, bundle)
-	return callLLM(ctx, e.httpClient, e.APIKey, e.BaseURL, e.Model, querySystemPrompt, user)
+	return e.completeLLM(ctx, querySystemPrompt, user)
 }
 
 // Lint 检查 wiki 页之间的 [[slug]] 回链是否指向存在的文件，并找出无任何入链的孤立页。
