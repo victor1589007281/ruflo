@@ -12,7 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync/atomic"
+	"sync"
 
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -23,22 +23,53 @@ const (
 	ExitPlanModeToolName  = "ExitPlanMode"
 )
 
-// planModeOn 全局计划模式开关（1 = 开启，0 = 关闭）。
-// 使用 uint32 配合 atomic 保证并发下查询/切换的可见性。
-var planModeOn uint32
+// planSessions 会话级计划模式开关。
+// Key = sessionID (chatID)，避免全局标志在多会话进程中泄露。
+var (
+	planSessions   = make(map[string]bool)
+	planSessionsMu sync.RWMutex
+)
 
-// PlanModeActive 返回当前是否处于计划模式。
-// 供引擎、测试或 Hook 在调度工具前查询。
+// PlanModeActive 兼容旧接口（检查是否有任何会话处于计划模式）。
+// 新代码应使用 PlanModeActiveForSession。
 func PlanModeActive() bool {
-	return atomic.LoadUint32(&planModeOn) != 0
+	planSessionsMu.RLock()
+	defer planSessionsMu.RUnlock()
+	for _, v := range planSessions {
+		if v {
+			return true
+		}
+	}
+	return false
+}
+
+// PlanModeActiveForSession 返回指定会话是否处于计划模式。
+func PlanModeActiveForSession(sessionID string) bool {
+	planSessionsMu.RLock()
+	defer planSessionsMu.RUnlock()
+	return planSessions[sessionID]
+}
+
+// NewPlanModeChecker 返回一个绑定到指定会话的 plan 检查函数，
+// 用于 engine.Config.DynamicPlanCheck。
+func NewPlanModeChecker(sessionID string) func() bool {
+	return func() bool {
+		return PlanModeActiveForSession(sessionID)
+	}
 }
 
 func setPlanMode(on bool) {
+	setPlanModeForSession("_global", on)
+}
+
+func setPlanModeForSession(sessionID string, on bool) {
+	planSessionsMu.Lock()
+	defer planSessionsMu.Unlock()
 	if on {
-		atomic.StoreUint32(&planModeOn, 1)
-		return
+		planSessions[sessionID] = true
+	} else {
+		delete(planSessions, sessionID)
 	}
-	atomic.StoreUint32(&planModeOn, 0)
 }
 
 // --- EnterPlanModeTool ---

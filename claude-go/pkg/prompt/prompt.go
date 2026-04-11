@@ -92,6 +92,10 @@ func (m *Manager) BuildEffectiveSystemPrompt(tools *tool.Registry) []string {
 
 	if m.CustomPrompt != "" {
 		result := []string{m.CustomPrompt}
+		mcpGuidance := m.buildMCPGuidance(tools)
+		if mcpGuidance != "" {
+			result = append(result, mcpGuidance)
+		}
 		if m.AppendPrompt != "" {
 			result = append(result, m.AppendPrompt)
 		}
@@ -312,6 +316,34 @@ func buildSessionToolHints(tools *tool.Registry) string {
 		sb.WriteString("- Follow <tool_usage> and <available_tools> for this session.\n")
 	}
 	sb.WriteString("</session_tool_hints>\n\n")
+	return sb.String()
+}
+
+// buildMCPGuidance 提取 MCP 工具引导段，供 CustomPrompt 模式追加。
+func (m *Manager) buildMCPGuidance(tools *tool.Registry) string {
+	if tools == nil {
+		return ""
+	}
+	var mcpTools []string
+	for _, t := range tools.All() {
+		if strings.HasPrefix(t.Name(), "mcp_") {
+			mcpTools = append(mcpTools, t.Name())
+		}
+	}
+	if len(mcpTools) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("<mcp_tool_guidance>\n")
+	sb.WriteString("You have MCP (Model Context Protocol) tools available. These are EXTERNAL tools from connected servers.\n\n")
+	sb.WriteString("IMPORTANT rules for using MCP tools:\n")
+	sb.WriteString("1. MCP tools are for COORDINATION and EXTERNAL services, not for replacing built-in tools.\n")
+	sb.WriteString("2. For complex tasks that involve MCP tools, DECOMPOSE the task into steps.\n")
+	sb.WriteString("3. Do NOT just call one MCP tool and stop. Follow through with the complete workflow.\n")
+	sb.WriteString("4. When using swarm/agent MCP tools, you still need to do the actual implementation work.\n")
+	sb.WriteString("5. Prefer built-in tools for: file I/O, code search, shell commands, editing.\n")
+	sb.WriteString("6. Use MCP tools for: external service integration, swarm coordination, memory retrieval.\n")
+	sb.WriteString("</mcp_tool_guidance>\n")
 	return sb.String()
 }
 

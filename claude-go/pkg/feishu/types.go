@@ -115,6 +115,9 @@ type BotConfig struct {
 	// DreamMinSessions 触发整理所需的最小会话数 (默认 5)
 	DreamMinSessions int
 
+	// StateDir 数据根目录，所有模块的数据/日志都存储在此下。
+	// 默认为 Cwd/.claude-go。若为空且 Cwd 也为空，程序拒绝启动。
+	StateDir string
 }
 
 // DefaultBotConfig 返回默认配置
@@ -242,6 +245,9 @@ type JSONConfig struct {
 
 	// Dreaming 记忆整理配置
 	Dreaming *DreamingSection `json:"dreaming,omitempty"`
+
+	// StateDir 数据根目录
+	StateDir string `json:"stateDir,omitempty"`
 }
 
 // SkillsSection 技能配置段
@@ -419,5 +425,9 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		if jc.Dreaming.MinSessions > 0 {
 			bc.DreamMinSessions = jc.Dreaming.MinSessions
 		}
+	}
+
+	if jc.StateDir != "" && bc.StateDir == "" {
+		bc.StateDir = jc.StateDir
 	}
 }

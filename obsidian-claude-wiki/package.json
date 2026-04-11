@@ -1,0 +1,22 @@
+{
+  "name": "obsidian-claude-wiki",
+  "version": "1.0.0",
+  "description": "Claude-Go Wiki integration for Obsidian",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": ["obsidian", "wiki", "claude-go", "knowledge-base"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "obsidian": "latest",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "isomorphic-git": "^1.25.0",
+    "@nicolo-ribaudo/chokidar-2": "^2.1.8-no-fsevents.3"
+  }
+}

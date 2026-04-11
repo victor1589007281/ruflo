@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-claude-wiki",
+  "name": "Claude Wiki",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Git-synced LLM Wiki knowledge base with link extraction, dashboard, and linting. Integrates with claude-go API.",
+  "author": "Claude Flow Team",
+  "isDesktopOnly": false
+}

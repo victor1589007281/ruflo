@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,7 +18,9 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/dreaming"
+	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/hotreload"
@@ -24,6 +28,8 @@ import (
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/types"
+	"github.com/anthropic/claude-go/pkg/vision"
+	"github.com/anthropic/claude-go/pkg/wiki"
 )
 
 // 飞书消息长度限制 (富文本卡片约 30KB, 普通文本约 4000 字符)
@@ -81,6 +87,10 @@ type Bot struct {
 	evolution   *agent.EvolutionEngine      // 自动进化引擎
 	cfgWatcher  *hotreload.Watcher          // 配置热加载监控器
 	cronSched   *agent.CronScheduler       // 定时任务调度器
+	layout      *basedir.Layout             // 统一目录布局
+	wikiEngine  *wiki.Engine               // LLM Wiki 知识库引擎
+	visionCli   *vision.Client             // 视觉能力客户端
+	skillAuto   *skills.AutoCreator        // 技能自动创建器
 	startTime   time.Time                   // 启动时间
 }
 
@@ -124,10 +134,28 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		aiClient = api.NewDashScopeClient(config.APIKey, config.Model)
 	}
 
+	// 初始化统一目录布局
+	stateRoot := basedir.ResolveDefault(config.StateDir, config.Cwd)
+	layout, err := basedir.NewLayout(stateRoot)
+	if err != nil {
+		return nil, fmt.Errorf("初始化目录布局失败: %w", err)
+	}
+	if err := layout.EnsureAll(); err != nil {
+		return nil, fmt.Errorf("创建数据目录失败: %w", err)
+	}
+
+	// 初始化统一日志系统
+	_ = logging.Init(&logging.LogConfig{
+		Dir:     layout.Logs,
+		Level:   "info",
+		Console: true,
+	})
+
 	bot := &Bot{
 		config:    config,
 		client:    larkClient,
 		apiClient: aiClient,
+		layout:    layout,
 		startTime: time.Now(),
 	}
 
@@ -149,12 +177,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	hookConfigs := bot.parseHookConfigs(config)
 
 	// 6. 创建共享 V2 Task 存储 (Teams + LLM 工具共用同一实例)
-	taskStorePath := config.Cwd + "/.claude/tasks.json"
-	bot.taskStore = builtin.NewTaskStore(taskStorePath)
+	bot.taskStore = builtin.NewTaskStore(layout.TasksFilePath())
 
 	// 7. 创建 Evolution 自动进化引擎 + Role Registry
-	evoDir := config.Cwd + "/.claude/evolution"
-	bot.evolution = agent.NewEvolutionEngine(evoDir, aiClient)
+	bot.evolution = agent.NewEvolutionEngine(layout.Evolution, aiClient)
 	roleReg := agent.NewRoleRegistry(config.Cwd)
 
 	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles)
@@ -165,7 +191,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
-		BaseDir:     config.Cwd + "/.claude/teams",
+		BaseDir:     layout.Teams,
 		Factory:     bot.sessions.CreateAgentRunner,
 		Notify:      func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
 		TaskTracker: bot.taskStore,
@@ -180,11 +206,27 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	bot.intentRec = agent.NewIntentRecognizer(aiClient)
 
 	// 12. 初始化 Cron 定时任务调度器
-	cronDir := config.Cwd + "/.claude/cron"
-	bot.cronSched = agent.NewCronScheduler(cronDir, &botCronExecutor{bot: bot})
+	bot.cronSched = agent.NewCronScheduler(layout.Cron, &botCronExecutor{bot: bot})
 	bot.cronSched.Start()
 
-	// 13. 启动配置热加载 (如果有配置文件)
+	// 13. 初始化 Vision 客户端
+	bot.visionCli = vision.NewClient(config.APIKey)
+
+	// 14. 初始化 Wiki 引擎 (独立 git 仓库)
+	wikiRepoDir := layout.Wiki
+	if home, err := os.UserHomeDir(); err == nil {
+		wikiRepoDir = home + "/knowledge-wiki"
+	}
+	baseURL := config.BaseURL
+	if baseURL == "" {
+		baseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+	}
+	bot.wikiEngine = wiki.NewEngine(wikiRepoDir, config.APIKey, baseURL, config.Model)
+
+	// 15. 初始化技能自动创建器 (Hermes-agent 特性吸收)
+	bot.skillAuto = skills.NewAutoCreator(layout.Skills, aiClient, config.Model, bot.skillReg)
+
+	// 16. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {
 		bot.startConfigWatcher(config.MCPConfigPath)
 	}
@@ -268,7 +310,11 @@ func (b *Bot) initDreaming(config *BotConfig) {
 	if config.DreamMinSessions > 0 {
 		dreamCfg.MinSessions = config.DreamMinSessions
 	}
-	dreamCfg.MemoryDir = config.Cwd + "/.claude/memory"
+	if b.layout != nil {
+		dreamCfg.MemoryDir = b.layout.Memory
+	} else {
+		dreamCfg.MemoryDir = config.Cwd + "/.claude/memory"
+	}
 	b.dreamer = dreaming.NewDreamer(dreamCfg, config.Cwd)
 
 	// 始终注入 LLM API 客户端，dreamer 自动判断: 有 APIClient 则 LLM 整理, 否则本地整理
@@ -442,8 +488,14 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 			chatID, senderID, msgType, chatType)
 	}
 
-	// 仅处理文本消息
-	if msgType != "text" {
+	// 支持文本和图片消息
+	if msgType != "text" && msgType != "image" {
+		return nil
+	}
+
+	// 图片消息: 使用 Vision 能力进行理解
+	if msgType == "image" {
+		go b.handleImageMessage(chatID, messageID, msg)
 		return nil
 	}
 
@@ -495,10 +547,64 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
+	// Wiki URL 自动检测: 消息中的 URL 自动 Ingest 到知识库
+	if urls := extractURLs(userText); len(urls) > 0 && b.wikiEngine != nil {
+		go b.handleWikiIngest(chatID, messageID, urls)
+	}
+
 	// 异步处理消息 (避免阻塞飞书回调的 3 秒超时)
 	go b.processAndReply(chatID, messageID, userText)
 
 	return nil
+}
+
+// handleImageMessage 处理图片消息，使用 Vision 能力进行理解。
+func (b *Bot) handleImageMessage(chatID, messageID string, msg *larkim.EventMessage) {
+	ctx := context.Background()
+	b.sendTextReply(ctx, messageID, "🔍 正在分析图片...")
+
+	// 获取图片内容 (飞书图片需要通过 API 下载)
+	imageKey := ""
+	content := deref(msg.Content)
+	var imgContent struct {
+		ImageKey string `json:"image_key"`
+	}
+	if json.Unmarshal([]byte(content), &imgContent) == nil {
+		imageKey = imgContent.ImageKey
+	}
+
+	if imageKey == "" || b.visionCli == nil {
+		b.sendTextMessage(ctx, chatID, "无法获取图片内容或视觉能力未初始化。")
+		return
+	}
+
+	response, err := vision.Understand(ctx, b.config.APIKey, "qwen-vl-plus", imageKey,
+		"请详细描述这张图片的内容，包括文字、图表、数据等所有关键信息。")
+	if err != nil {
+		b.sendTextMessage(ctx, chatID, fmt.Sprintf("图片分析失败: %v", err))
+		return
+	}
+
+	b.sendLongMessage(ctx, chatID, "🖼️ **图片分析结果:**\n\n"+response)
+}
+
+// handleWikiIngest 自动将 URL 内容提取到 Wiki 知识库。
+func (b *Bot) handleWikiIngest(chatID, messageID string, urls []string) {
+	ctx := context.Background()
+	for _, u := range urls {
+		if err := b.wikiEngine.Ingest(ctx, u); err != nil {
+			logging.For("wiki").Warn("URL Ingest 失败", "url", u, "error", err)
+			continue
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("📚 已自动提取到知识库: %s", u))
+	}
+}
+
+// extractURLs 从文本中提取 HTTP(S) URL。
+var urlRegexp = regexp.MustCompile(`https?://[^\s<>"{}|\\^` + "`" + `\[\]]+`)
+
+func extractURLs(text string) []string {
+	return urlRegexp.FindAllString(text, -1)
 }
 
 // handleSlashCommand 处理斜杠命令
@@ -743,9 +849,12 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 			return
 		}
 		name := parts[2]
-		baseDir := b.config.Cwd + "/.claude/skills"
+		skillDir := b.config.Cwd + "/.claude/skills"
+		if b.layout != nil {
+			skillDir = b.layout.Skills
+		}
 		defaultContent := fmt.Sprintf("---\nname: %s\ndescription: (描述你的技能)\nwhen_to_use: (何时使用)\n---\n# %s\n\n(技能内容)\n", name, name)
-		if err := skills.InstallSkill(baseDir, name, defaultContent); err != nil {
+		if err := skills.InstallSkill(skillDir, name, defaultContent); err != nil {
 			b.sendTextReply(ctx, messageID, fmt.Sprintf("安装失败: %v", err))
 		} else {
 			b.skillReg.Reload()
@@ -758,8 +867,11 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 			return
 		}
 		name := parts[2]
-		baseDir := b.config.Cwd + "/.claude/skills"
-		if err := skills.UninstallSkill(baseDir, name); err != nil {
+		uninstallDir := b.config.Cwd + "/.claude/skills"
+		if b.layout != nil {
+			uninstallDir = b.layout.Skills
+		}
+		if err := skills.UninstallSkill(uninstallDir, name); err != nil {
 			b.sendTextReply(ctx, messageID, fmt.Sprintf("卸载失败: %v", err))
 		} else {
 			b.skillReg.Unregister(name)
@@ -1155,12 +1267,21 @@ func formatTimeSince(t time.Time) string {
 
 // processAndReply 异步处理消息并发送回复。
 // 此方法运行在独立的 goroutine 中:
-//  1. 发送「正在思考」提示消息
-//  2. 调用 SessionManager.ProcessMessage() 执行 AI 推理
-//  3. 将结果分段发送回飞书 (考虑消息长度限制)
-//  4. 如果出错，发送错误提示
+//  1. 检测任务复杂度，复杂任务自动注入 Plan 指令
+//  2. 发送「正在思考」提示消息
+//  3. 调用 SessionManager.ProcessMessage() 执行 AI 推理
+//  4. 将结果分段发送回飞书 (考虑消息长度限制)
+//  5. 如果出错，发送错误提示
 func (b *Bot) processAndReply(chatID, messageID, userText string) {
 	ctx := context.Background()
+
+	// Auto Plan: 复杂任务自动注入规划指令
+	if detectComplexity(userText) {
+		userText = "[Auto Plan] 这是一个复杂任务，请先进入 Plan 模式进行分析和规划，" +
+			"调用 EnterPlanMode，分析需求、设计方案，然后调用 ExitPlanMode 附带完整计划，再逐步执行。\n\n" +
+			"原始任务:\n" + userText
+		b.sendTextReply(ctx, messageID, "🧠 检测到复杂任务，自动启用 Plan 模式进行规划...")
+	}
 
 	// 发送「正在思考」提示
 	if b.config.ThinkingMessage != "" {
@@ -1177,6 +1298,49 @@ func (b *Bot) processAndReply(chatID, messageID, userText string) {
 
 	// 分段发送 (飞书文本消息有长度限制)
 	b.sendLongMessage(ctx, chatID, response)
+}
+
+// detectComplexity 检测用户消息是否为复杂任务。
+// 满足以下任一条件即视为复杂:
+//   - 文本长度 > 200 字符
+//   - 包含多个子任务连接词 (并且/然后/同时/另外/还需要/以及/第一/第二)
+//   - 包含多个技术关键词组合 (架构+设计, 重构+测试, API+数据库 等)
+func detectComplexity(text string) bool {
+	if len([]rune(text)) > 200 {
+		return true
+	}
+	conjunctions := []string{"并且", "然后", "同时", "另外", "还需要", "以及", "此外", "接着"}
+	conjCount := 0
+	lower := strings.ToLower(text)
+	for _, c := range conjunctions {
+		if strings.Contains(lower, c) {
+			conjCount++
+		}
+	}
+	if conjCount >= 2 {
+		return true
+	}
+	// 数字编号列表 (1. xxx 2. xxx)
+	numberedItems := 0
+	for _, prefix := range []string{"1.", "2.", "3.", "4.", "5.", "1、", "2、", "3、", "4、", "一、", "二、", "三、"} {
+		if strings.Contains(text, prefix) {
+			numberedItems++
+		}
+	}
+	if numberedItems >= 3 {
+		return true
+	}
+	techKW := []string{"架构", "重构", "迁移", "设计", "实现", "开发", "部署", "优化", "分析", "测试"}
+	techCount := 0
+	for _, kw := range techKW {
+		if strings.Contains(text, kw) {
+			techCount++
+		}
+	}
+	if techCount >= 3 {
+		return true
+	}
+	return false
 }
 
 // sendTextReply 回复指定消息 (引用回复)

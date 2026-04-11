@@ -382,7 +382,20 @@ func (t *MCPTool) Name() string {
 
 func (t *MCPTool) Description() string { return t.info.Description }
 func (t *MCPTool) InputSchema() json.RawMessage { return t.info.InputSchema }
-func (t *MCPTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *MCPTool) IsReadOnly(_ json.RawMessage) bool {
+	lower := strings.ToLower(t.info.Name)
+	for _, prefix := range []string{"read", "get", "list", "search", "query", "fetch", "describe", "show", "status", "info", "check", "view"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	for _, suffix := range []string{"_list", "_get", "_read", "_search", "_status", "_info"} {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
+}
 func (t *MCPTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 func (t *MCPTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
