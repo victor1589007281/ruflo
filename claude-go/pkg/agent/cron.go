@@ -54,6 +54,10 @@ type CronExecutor interface {
 	SendQuery(ctx context.Context, chatID, message string) (string, error)
 	RunCommand(ctx context.Context, chatID, command string) error
 	Notify(chatID, message string)
+	// Wiki 操作
+	WikiOrganize(ctx context.Context, mode string) (string, error)
+	WikiHealthCheck(ctx context.Context) (string, error)
+	WikiLint(ctx context.Context) (string, error)
 }
 
 // CronScheduler 定时任务调度器。
@@ -273,6 +277,34 @@ func (cs *CronScheduler) executeJob(job *CronJob) {
 
 	case "command":
 		execErr = cs.executor.RunCommand(ctx, job.ChatID, job.Payload)
+
+	case "wiki-organize":
+		mode := job.Payload
+		if mode == "" {
+			mode = "full"
+		}
+		result, err := cs.executor.WikiOrganize(ctx, mode)
+		if err != nil {
+			execErr = err
+		} else {
+			cs.executor.Notify(job.ChatID, fmt.Sprintf("📝 Wiki 整理完成:\n%s", result))
+		}
+
+	case "wiki-health-check":
+		result, err := cs.executor.WikiHealthCheck(ctx)
+		if err != nil {
+			execErr = err
+		} else {
+			cs.executor.Notify(job.ChatID, fmt.Sprintf("🏥 Wiki 健康检查:\n%s", result))
+		}
+
+	case "wiki-lint":
+		result, err := cs.executor.WikiLint(ctx)
+		if err != nil {
+			execErr = err
+		} else {
+			cs.executor.Notify(job.ChatID, fmt.Sprintf("🔍 Wiki Lint:\n%s", result))
+		}
 
 	default:
 		execErr = fmt.Errorf("未知任务类型: %s", job.JobType)

@@ -216,16 +216,42 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 13. 初始化 Vision 客户端 (复用 api.Client)
 	bot.visionCli = vision.NewClient(aiClient)
 
-	// 14. 初始化 Wiki 引擎 (独立 git 仓库)
-	wikiRepoDir := layout.Wiki
-	if home, err := os.UserHomeDir(); err == nil {
-		wikiRepoDir = home + "/knowledge-wiki"
+	// 14. 初始化 Wiki 引擎 (独立 git 仓库, 从配置加载)
+	if config.Wiki.Enabled {
+		wikiRepoDir := ""
+		if len(config.Wiki.Repos) > 0 {
+			wikiRepoDir = config.Wiki.Repos[0]
+		}
+		if wikiRepoDir == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				wikiRepoDir = home + "/knowledge-wiki"
+			} else {
+				wikiRepoDir = layout.Wiki
+			}
+		}
+		bot.wikiEngine = wiki.NewEngineWithLLM(wikiRepoDir, aiClient)
+		if err := wiki.EnsureRepo(wikiRepoDir); err != nil {
+			log.Printf("[Wiki] 初始化仓库失败: %v", err)
+		}
+		// 启动 raw 目录变化监控 (自动触发增量整理)
+		bot.wikiEngine.WatchRaw(context.Background(), func(newFiles []string) {
+			logging.For("wiki").Info("raw 目录新增文件", "count", len(newFiles))
+			if config.Wiki.AutoOrganize {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
+				if result, err := bot.wikiEngine.IncrementalOrganize(ctx); err == nil {
+					logging.For("wiki").Info("自动增量整理完成", "updated", result.UpdatedPages)
+				}
+			}
+		})
+		// 启动 Wiki HTTP API (供 Obsidian 插件调用)
+		if config.Wiki.APIPort > 0 {
+			wikiAPI := wiki.NewAPIServer(bot.wikiEngine, config.Wiki.APISecret)
+			if err := wikiAPI.Start(config.Wiki.APIPort); err != nil {
+				log.Printf("[Wiki API] 启动失败: %v", err)
+			}
+		}
 	}
-	baseURL := config.BaseURL
-	if baseURL == "" {
-		baseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-	}
-	bot.wikiEngine = wiki.NewEngineWithLLM(wikiRepoDir, aiClient)
 
 	// 15. 初始化技能自动创建器 (Hermes-agent 特性吸收)
 	bot.skillAuto = skills.NewAutoCreator(layout.Skills, aiClient, config.Model, bot.skillReg)
@@ -458,6 +484,46 @@ func (e *botCronExecutor) Notify(chatID, message string) {
 	e.bot.sendLongMessage(context.Background(), chatID, message)
 }
 
+func (e *botCronExecutor) WikiOrganize(ctx context.Context, mode string) (string, error) {
+	if e.bot.wikiEngine == nil {
+		return "", fmt.Errorf("wiki 引擎未初始化")
+	}
+	var result *wiki.OrganizeResult
+	var err error
+	if mode == "incremental" {
+		result, err = e.bot.wikiEngine.IncrementalOrganize(ctx)
+	} else {
+		result, err = e.bot.wikiEngine.Organize(ctx)
+	}
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("更新 %d 个页面\n%s", result.UpdatedPages, result.Log), nil
+}
+
+func (e *botCronExecutor) WikiHealthCheck(ctx context.Context) (string, error) {
+	if e.bot.wikiEngine == nil {
+		return "", fmt.Errorf("wiki 引擎未初始化")
+	}
+	report, err := e.bot.wikiEngine.HealthCheck(ctx)
+	if err != nil {
+		return "", err
+	}
+	return report.Summary, nil
+}
+
+func (e *botCronExecutor) WikiLint(ctx context.Context) (string, error) {
+	if e.bot.wikiEngine == nil {
+		return "", fmt.Errorf("wiki 引擎未初始化")
+	}
+	report, err := e.bot.wikiEngine.Lint(ctx)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Wiki 页面: %d, Raw 文件: %d, 坏链: %d, 孤立页: %d",
+		report.TotalPages, report.TotalRaw, len(report.BrokenLinks), len(report.OrphanedPages)), nil
+}
+
 // onMessageReceive 处理飞书消息接收事件。
 // 对应事件: im.message.receive_v1
 //
@@ -506,6 +572,12 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 	case "audio":
 		go b.handleAudioMessage(chatID, messageID)
 		return nil
+	case "interactive":
+		go b.handleInteractiveMessage(chatID, messageID, msg)
+		return nil
+	case "share_chat", "share_user":
+		go b.handleShareMessage(chatID, messageID, msg, msgType)
+		return nil
 	case "post": // 富文本消息: 提取纯文本后走正常流程
 		userText := ExtractPostText(deref(msg.Content))
 		if userText == "" {
@@ -516,7 +588,7 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 	case "text":
 		// 继续下面的文本处理逻辑
 	default:
-		b.sendTextReply(ctx, messageID, fmt.Sprintf("暂不支持 %s 类型消息，支持: 文本/图片/文件/视频/富文本。", msgType))
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("暂不支持 %s 类型消息，支持: 文本/图片/文件/视频/富文本/卡片/分享。", msgType))
 		return nil
 	}
 
@@ -568,9 +640,57 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
-	// Wiki URL 自动检测: 消息中的 URL 自动 Ingest 到知识库
-	if urls := extractURLs(userText); len(urls) > 0 && b.wikiEngine != nil {
-		go b.handleWikiIngest(chatID, messageID, urls)
+	// Wiki 自然语言命令检测 + URL 自动检测
+	if b.wikiEngine != nil && b.config.Wiki.Enabled {
+		wikiAction := DetectWikiIntent(userText)
+		urls := extractURLs(userText)
+
+		switch wikiAction {
+		case "ingest":
+			if len(urls) > 0 {
+				go b.handleWikiIngest(chatID, messageID, urls)
+				return nil
+			}
+			textToIngest := removeWikiKeywords(userText)
+			if textToIngest != "" {
+				go func() {
+					if err := b.wikiEngine.IngestText(context.Background(), "飞书笔记", textToIngest, "feishu-manual"); err != nil {
+						b.sendTextMessage(context.Background(), chatID, fmt.Sprintf("Wiki 收藏失败: %v", err))
+						return
+					}
+					b.sendTextReply(context.Background(), messageID, "📚 已收藏到知识库 wiki")
+				}()
+				return nil
+			}
+		case "organize":
+			go func() {
+				b.sendTextReply(context.Background(), messageID, "📝 开始整理知识库...")
+				oCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
+				if result, err := b.wikiEngine.Organize(oCtx); err == nil {
+					b.sendLongMessage(context.Background(), chatID,
+						fmt.Sprintf("✅ Wiki 整理完成: 更新 %d 个页面\n%s", result.UpdatedPages, result.Log))
+				}
+			}()
+			return nil
+		case "query":
+			question := removeWikiQueryKeywords(userText)
+			if question != "" {
+				go func() {
+					qCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					defer cancel()
+					answer, _, _ := b.wikiEngine.QueryAndArchive(qCtx, question)
+					if answer != "" {
+						b.sendLongMessage(context.Background(), chatID, "📖 **知识库:**\n\n"+answer)
+					}
+				}()
+				return nil
+			}
+		}
+
+		if b.config.Wiki.AutoIngestURL && len(urls) > 0 {
+			go b.handleWikiIngest(chatID, messageID, urls)
+		}
 	}
 
 	// 异步处理消息 (避免阻塞飞书回调的 3 秒超时)
@@ -884,6 +1004,170 @@ func (b *Bot) handleWikiIngest(chatID, messageID string, urls []string) {
 		}
 		b.sendTextReply(ctx, messageID, fmt.Sprintf("📚 已自动提取到知识库: %s", u))
 	}
+
+	if b.config.Wiki.AutoOrganize {
+		go func() {
+			orgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			if result, err := b.wikiEngine.IncrementalOrganize(orgCtx); err == nil && result.UpdatedPages > 0 {
+				b.sendTextMessage(context.Background(), chatID,
+					fmt.Sprintf("📝 Wiki 增量整理完成: 更新 %d 个页面\n%s", result.UpdatedPages, result.Log))
+			}
+		}()
+	}
+}
+
+// handleInteractiveMessage 处理 interactive 类型消息（飞书卡片消息、第三方分享卡片如今日头条等）。
+func (b *Bot) handleInteractiveMessage(chatID, messageID string, msg *larkim.EventMessage) {
+	ctx := context.Background()
+	content := deref(msg.Content)
+	if content == "" {
+		return
+	}
+
+	text, urls := ExtractInteractiveContent(content)
+	if text == "" && len(urls) == 0 {
+		b.sendTextReply(ctx, messageID, "收到卡片消息，但未能提取到有效内容。")
+		return
+	}
+
+	if len(urls) > 0 && b.wikiEngine != nil && b.config.Wiki.Enabled {
+		b.sendTextReply(ctx, messageID, "📚 检测到链接，正在提取到知识库...")
+		go b.handleWikiIngest(chatID, messageID, urls)
+	}
+
+	if text != "" {
+		go b.processAndReply(chatID, messageID, text)
+	}
+}
+
+// handleShareMessage 处理 share_chat / share_user 类型消息。
+func (b *Bot) handleShareMessage(chatID, messageID string, msg *larkim.EventMessage, shareType string) {
+	ctx := context.Background()
+	content := deref(msg.Content)
+	b.sendTextReply(ctx, messageID, fmt.Sprintf("收到 %s 分享，内容: %s", shareType, truncateResult(content, 200)))
+}
+
+// 飞书 interactive 消息格式复杂，支持卡片、审批流、第三方分享等。
+// ExtractInteractiveContent 从 interactive 消息 JSON 提取文本和 URL (导出供测试)。
+func ExtractInteractiveContent(content string) (text string, urls []string) {
+	var sb strings.Builder
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &raw); err != nil {
+		return content, extractURLs(content)
+	}
+
+	// 递归提取文本和 URL
+	extractFromJSON(raw, &sb, &urls)
+
+	// 同时从原始 JSON 字符串中提取 URL
+	for _, u := range extractURLs(content) {
+		found := false
+		for _, existing := range urls {
+			if existing == u {
+				found = true
+				break
+			}
+		}
+		if !found {
+			urls = append(urls, u)
+		}
+	}
+
+	return strings.TrimSpace(sb.String()), urls
+}
+
+func extractFromJSON(m map[string]json.RawMessage, sb *strings.Builder, urls *[]string) {
+	textKeys := []string{"title", "content", "text", "value", "label", "tag_content", "alt", "description", "summary"}
+	urlKeys := []string{"url", "href", "multi_url", "android_url", "ios_url", "pc_url"}
+
+	for key, val := range m {
+		var s string
+		if json.Unmarshal(val, &s) == nil {
+			for _, tk := range textKeys {
+				if key == tk && s != "" {
+					sb.WriteString(s)
+					sb.WriteString("\n")
+				}
+			}
+			for _, uk := range urlKeys {
+				if key == uk && (strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")) {
+					*urls = append(*urls, s)
+				}
+			}
+			continue
+		}
+
+		var subMap map[string]json.RawMessage
+		if json.Unmarshal(val, &subMap) == nil {
+			extractFromJSON(subMap, sb, urls)
+			continue
+		}
+
+		var arr []json.RawMessage
+		if json.Unmarshal(val, &arr) == nil {
+			for _, item := range arr {
+				var itemMap map[string]json.RawMessage
+				if json.Unmarshal(item, &itemMap) == nil {
+					extractFromJSON(itemMap, sb, urls)
+				} else {
+					var itemStr string
+					if json.Unmarshal(item, &itemStr) == nil && itemStr != "" {
+						sb.WriteString(itemStr)
+						sb.WriteString("\n")
+					}
+				}
+			}
+		}
+	}
+}
+
+func truncateResult(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "..."
+}
+
+// DetectWikiIntent 检测消息中的 wiki 意图 (导出供测试)。
+func DetectWikiIntent(text string) string {
+	lower := strings.ToLower(text)
+	ingestKW := []string{"收藏到wiki", "收藏到知识库", "保存到wiki", "保存到知识库", "存到wiki", "添加到wiki", "加入wiki", "wiki收藏"}
+	for _, kw := range ingestKW {
+		if strings.Contains(lower, kw) {
+			return "ingest"
+		}
+	}
+	organizeKW := []string{"整理wiki", "整理知识库", "wiki整理", "知识库整理", "维护wiki", "维护知识库"}
+	for _, kw := range organizeKW {
+		if strings.Contains(lower, kw) {
+			return "organize"
+		}
+	}
+	queryKW := []string{"从wiki查", "从知识库查", "wiki查询", "知识库查询", "问问wiki", "问下知识库", "wiki里有没有"}
+	for _, kw := range queryKW {
+		if strings.Contains(lower, kw) {
+			return "query"
+		}
+	}
+	return ""
+}
+
+func removeWikiKeywords(text string) string {
+	lower := strings.ToLower(text)
+	for _, kw := range []string{"收藏到wiki", "收藏到知识库", "保存到wiki", "保存到知识库", "存到wiki", "添加到wiki", "加入wiki", "wiki收藏"} {
+		lower = strings.ReplaceAll(lower, kw, "")
+	}
+	return strings.TrimSpace(lower)
+}
+
+func removeWikiQueryKeywords(text string) string {
+	lower := strings.ToLower(text)
+	for _, kw := range []string{"从wiki查", "从知识库查", "wiki查询", "知识库查询", "问问wiki", "问下知识库", "wiki里有没有"} {
+		lower = strings.ReplaceAll(lower, kw, "")
+	}
+	return strings.TrimSpace(lower)
 }
 
 // extractURLs 从文本中提取 HTTP(S) URL。
@@ -937,6 +1221,15 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- /cron remove <ID> - 删除\n" +
 			"- /cron pause/resume <ID> - 暂停/恢复\n" +
 			"- 直接说「每天9点帮我分析XXX」自动创建\n\n" +
+			"**Wiki 知识库:**\n" +
+			"- /wiki status - 查看知识库状态\n" +
+			"- /wiki query <问题> - 查询知识库\n" +
+			"- /wiki organize - 全量整理知识库\n" +
+			"- /wiki organize inc - 增量整理\n" +
+			"- /wiki lint - 检查链接健康\n" +
+			"- /wiki health - LLM 健康检查\n" +
+			"- 发送链接 → 自动提取到 raw 层\n" +
+			"- 说「收藏到wiki」→ 提取并整理\n\n" +
 			"**Agent Teams (多Agent协作):**\n" +
 			"*自然语言模式 (推荐):*\n" +
 			"- 直接说「帮我调研XXX」→ 自动创建 research 团队\n" +
@@ -1023,6 +1316,10 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 
 	case strings.HasPrefix(lower, "/cron"):
 		b.handleCronCommand(ctx, chatID, messageID, text)
+		return true
+
+	case strings.HasPrefix(lower, "/wiki"):
+		b.handleWikiCommand(ctx, chatID, messageID, text)
 		return true
 
 	case lower == "/reload":
@@ -1362,6 +1659,128 @@ func (b *Bot) handleTeamIntent(chatID, messageID string, intent *agent.TeamInten
 			sb.WriteString(fmt.Sprintf("- **%s** [%s] %s\n", t.Name, t.Status, t.Workflow))
 		}
 		b.sendTextReply(ctx, messageID, sb.String())
+	}
+}
+
+// handleWikiCommand 处理 /wiki 命令族。
+func (b *Bot) handleWikiCommand(ctx context.Context, chatID, messageID, text string) {
+	if b.wikiEngine == nil {
+		b.sendTextReply(ctx, messageID, "Wiki 引擎未初始化。请在配置中启用 wiki 功能。")
+		return
+	}
+	parts := strings.Fields(text)
+	sub := "status"
+	if len(parts) >= 2 {
+		sub = strings.ToLower(parts[1])
+	}
+
+	switch sub {
+	case "status":
+		st := b.wikiEngine.Status()
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("📚 **Wiki 状态**\n"+
+			"- 仓库: %v\n- Raw 文件: %v\n- Wiki 页面: %v\n- LLM 就绪: %v",
+			st["repoDir"], st["rawCount"], st["wikiCount"], st["hasLLM"]))
+
+	case "query":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /wiki query <问题>")
+			return
+		}
+		question := strings.Join(parts[2:], " ")
+		b.sendTextReply(ctx, messageID, "🔍 正在查询知识库...")
+		go func() {
+			qCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			answer, archived, err := b.wikiEngine.QueryAndArchive(qCtx, question)
+			if err != nil {
+				b.sendTextMessage(context.Background(), chatID, fmt.Sprintf("查询失败: %v", err))
+				return
+			}
+			suffix := ""
+			if archived {
+				suffix = "\n\n_📝 此回答已自动归档到 wiki_"
+			}
+			b.sendLongMessage(context.Background(), chatID, "📖 **知识库回答:**\n\n"+answer+suffix)
+		}()
+
+	case "organize":
+		mode := "full"
+		if len(parts) >= 3 && (parts[2] == "inc" || parts[2] == "incremental") {
+			mode = "incremental"
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("📝 开始 %s 整理...", mode))
+		go func() {
+			oCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			var result *wiki.OrganizeResult
+			var err error
+			if mode == "incremental" {
+				result, err = b.wikiEngine.IncrementalOrganize(oCtx)
+			} else {
+				result, err = b.wikiEngine.Organize(oCtx)
+			}
+			if err != nil {
+				b.sendTextMessage(context.Background(), chatID, fmt.Sprintf("整理失败: %v", err))
+				return
+			}
+			b.sendLongMessage(context.Background(), chatID,
+				fmt.Sprintf("✅ Wiki 整理完成\n- 更新页面: %d\n- 日志: %s", result.UpdatedPages, result.Log))
+		}()
+
+	case "lint":
+		go func() {
+			lCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			report, err := b.wikiEngine.Lint(lCtx)
+			if err != nil {
+				b.sendTextMessage(context.Background(), chatID, fmt.Sprintf("Lint 失败: %v", err))
+				return
+			}
+			var sb strings.Builder
+			sb.WriteString("🔗 **Wiki Lint 报告**\n")
+			sb.WriteString(fmt.Sprintf("- Wiki 页面: %d\n- Raw 文件: %d\n", report.TotalPages, report.TotalRaw))
+			if len(report.BrokenLinks) > 0 {
+				sb.WriteString(fmt.Sprintf("- ⚠️ 坏链: %d\n", len(report.BrokenLinks)))
+				for _, bl := range report.BrokenLinks {
+					sb.WriteString(fmt.Sprintf("  %s → [[%s]]\n", bl.SourcePage, bl.TargetPage))
+				}
+			}
+			if len(report.OrphanedPages) > 0 {
+				sb.WriteString(fmt.Sprintf("- 🏝️ 孤立页: %d\n", len(report.OrphanedPages)))
+			}
+			b.sendTextMessage(context.Background(), chatID, sb.String())
+		}()
+
+	case "health":
+		b.sendTextReply(ctx, messageID, "🏥 正在进行 Wiki 健康检查...")
+		go func() {
+			hCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			report, err := b.wikiEngine.HealthCheck(hCtx)
+			if err != nil {
+				b.sendTextMessage(context.Background(), chatID, fmt.Sprintf("健康检查失败: %v", err))
+				return
+			}
+			var sb strings.Builder
+			sb.WriteString("🏥 **Wiki 健康检查报告**\n\n")
+			sb.WriteString(report.Summary)
+			if len(report.Contradictions) > 0 {
+				sb.WriteString(fmt.Sprintf("\n\n⚠️ **矛盾数据**: %d 处", len(report.Contradictions)))
+			}
+			if len(report.MissingConcepts) > 0 {
+				sb.WriteString(fmt.Sprintf("\n📝 **缺失概念**: %s", strings.Join(report.MissingConcepts, ", ")))
+			}
+			if len(report.ResearchSuggestions) > 0 {
+				sb.WriteString("\n\n💡 **建议研究方向**:")
+				for _, s := range report.ResearchSuggestions {
+					sb.WriteString("\n- " + s)
+				}
+			}
+			b.sendLongMessage(context.Background(), chatID, sb.String())
+		}()
+
+	default:
+		b.sendTextReply(ctx, messageID, "Wiki 命令: status | query <问题> | organize [inc] | lint | health")
 	}
 }
 

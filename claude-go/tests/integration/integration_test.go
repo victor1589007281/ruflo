@@ -682,6 +682,9 @@ func (e *testCronExecutor) SendQuery(ctx context.Context, chatID, message string
 func (e *testCronExecutor) RunCommand(ctx context.Context, chatID, command string) error {
 	return nil
 }
+func (e *testCronExecutor) WikiOrganize(_ context.Context, _ string) (string, error) { return "", nil }
+func (e *testCronExecutor) WikiHealthCheck(_ context.Context) (string, error) { return "", nil }
+func (e *testCronExecutor) WikiLint(_ context.Context) (string, error) { return "", nil }
 func (e *testCronExecutor) Notify(chatID, message string) {
 	if e.onNotify != nil {
 		e.onNotify(chatID, message)

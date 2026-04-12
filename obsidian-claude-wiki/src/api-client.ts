@@ -71,4 +71,58 @@ export class ApiClient {
     });
     return this.parseJson<WikiStatus>(res);
   }
+
+  /** 查询知识库 */
+  async query(question: string, archive = false): Promise<{ answer: string; archived?: boolean }> {
+    const u = `${this.baseUrl}/wiki/query`;
+    const res = await fetch(u, {
+      method: "POST",
+      headers: this.headers(true),
+      body: JSON.stringify({ question, archive }),
+    });
+    return this.parseJson<{ answer: string; archived?: boolean }>(res);
+  }
+
+  /** 触发 wiki 全量/增量整理 */
+  async organize(mode: "full" | "incremental" = "full"): Promise<{ updated_pages: number; log: string }> {
+    const u = `${this.baseUrl}/wiki/organize`;
+    const res = await fetch(u, {
+      method: "POST",
+      headers: this.headers(true),
+      body: JSON.stringify({ mode }),
+    });
+    return this.parseJson<{ updated_pages: number; log: string }>(res);
+  }
+
+  /** 触发 LLM 健康检查 */
+  async healthCheck(): Promise<HealthCheckResult> {
+    const u = `${this.baseUrl}/wiki/health-check`;
+    const res = await fetch(u, {
+      method: "POST",
+      headers: this.headers(true),
+      body: "{}",
+    });
+    return this.parseJson<HealthCheckResult>(res);
+  }
+
+  /** 摄取纯文本到 wiki */
+  async ingestText(title: string, text: string): Promise<void> {
+    const u = `${this.baseUrl}/wiki/ingest`;
+    const res = await fetch(u, {
+      method: "POST",
+      headers: this.headers(true),
+      body: JSON.stringify({ title, text }),
+    });
+    await this.parseJson<unknown>(res);
+  }
+}
+
+export interface HealthCheckResult {
+  contradictions?: { page1: string; page2: string; issue: string }[];
+  outdated?: { page: string; issue: string }[];
+  missing_concepts?: string[];
+  orphaned_pages?: string[];
+  missing_refs?: { source: string; should_link_to: string }[];
+  research_suggestions?: string[];
+  summary: string;
 }

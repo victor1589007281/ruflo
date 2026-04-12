@@ -118,6 +118,25 @@ type BotConfig struct {
 	// StateDir 数据根目录，所有模块的数据/日志都存储在此下。
 	// 默认为 Cwd/.claude-go。若为空且 Cwd 也为空，程序拒绝启动。
 	StateDir string
+
+	// Wiki LLM Wiki 知识库配置
+	Wiki WikiConfig
+}
+
+// WikiConfig LLM Wiki 知识库配置。
+type WikiConfig struct {
+	// Enabled 是否启用 Wiki 功能 (默认 true)
+	Enabled bool
+	// Repos Wiki 仓库目录列表 (支持多个知识库)，第一个为主仓库
+	Repos []string
+	// AutoIngestURL 是否自动从消息中提取 URL 并摄取到 wiki (默认 true)
+	AutoIngestURL bool
+	// AutoOrganize 是否自动在 Ingest 后触发增量整理 (默认 false)
+	AutoOrganize bool
+	// APIPort Wiki HTTP API 端口 (供 Obsidian 等外部客户端调用, 0=不启动)
+	APIPort int
+	// APISecret API 鉴权密钥 (Bearer token)
+	APISecret string
 }
 
 // DefaultBotConfig 返回默认配置
@@ -132,6 +151,10 @@ func DefaultBotConfig() *BotConfig {
 		MentionOnly:     true,
 		WelcomeMessage:  "你好！我是 Claude Code (Go) 机器人。发送消息与我对话，我可以帮你编程、分析代码、执行命令等。",
 		ThinkingMessage: "正在思考中...",
+		Wiki: WikiConfig{
+			Enabled:       true,
+			AutoIngestURL: true,
+		},
 	}
 }
 
@@ -246,8 +269,21 @@ type JSONConfig struct {
 	// Dreaming 记忆整理配置
 	Dreaming *DreamingSection `json:"dreaming,omitempty"`
 
+	// Wiki LLM Wiki 知识库配置
+	Wiki *WikiSection `json:"wiki,omitempty"`
+
 	// StateDir 数据根目录
 	StateDir string `json:"stateDir,omitempty"`
+}
+
+// WikiSection Wiki 配置段 (JSON)
+type WikiSection struct {
+	Enabled       *bool    `json:"enabled,omitempty"`
+	Repos         []string `json:"repos,omitempty"`
+	AutoIngestURL *bool    `json:"autoIngestUrl,omitempty"`
+	AutoOrganize  *bool    `json:"autoOrganize,omitempty"`
+	APIPort       int      `json:"apiPort,omitempty"`
+	APISecret     string   `json:"apiSecret,omitempty"`
 }
 
 // SkillsSection 技能配置段
@@ -429,5 +465,26 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 
 	if jc.StateDir != "" && bc.StateDir == "" {
 		bc.StateDir = jc.StateDir
+	}
+
+	if jc.Wiki != nil {
+		if jc.Wiki.Enabled != nil {
+			bc.Wiki.Enabled = *jc.Wiki.Enabled
+		}
+		if len(jc.Wiki.Repos) > 0 {
+			bc.Wiki.Repos = jc.Wiki.Repos
+		}
+		if jc.Wiki.AutoIngestURL != nil {
+			bc.Wiki.AutoIngestURL = *jc.Wiki.AutoIngestURL
+		}
+		if jc.Wiki.AutoOrganize != nil {
+			bc.Wiki.AutoOrganize = *jc.Wiki.AutoOrganize
+		}
+		if jc.Wiki.APIPort > 0 {
+			bc.Wiki.APIPort = jc.Wiki.APIPort
+		}
+		if jc.Wiki.APISecret != "" {
+			bc.Wiki.APISecret = jc.Wiki.APISecret
+		}
 	}
 }
