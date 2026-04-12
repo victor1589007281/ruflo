@@ -213,6 +213,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles)
 	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore, bot.evolution, roleReg)
+	// 注入飞书媒体发送回调，让 LLM 在飞书对话中能直接调用 FeishuSendFile 工具发送图片/文件
+	bot.sessions.SetMediaSendFn(bot.SendMediaToChat)
 
 	// 9. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
 	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)
@@ -734,16 +736,15 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
-	// Cron 意图识别: 自然语言定时任务 (优先于团队意图)
+	// Cron 意图识别: 自然语言定时任务
 	if cronIntent := b.intentRec.RecognizeCron(ctx, userText); cronIntent != nil {
 		go b.handleCronIntent(chatID, messageID, cronIntent)
 		return nil
 	}
 
-	// 意图识别: 中文自然语言 → 自动拆解为团队操作 (MCP 感知, 零侵入, 不匹配则透传)
-	// 每条消息只允许创建一个团队，通过去重保证
-	hasMCP := len(b.mcpMgr.ListServers()) > 0
-	if intent := b.intentRec.RecognizeWithMCPAwareness(ctx, userText, hasMCP); intent != nil && intent.Confidence >= 0.7 {
+	// 团队状态/停止: 仅保留低风险的 NL 检测（查询和停止操作不会创建资源）
+	// 团队创建一律走 /team 或 /go 命令，避免 NL 误触发
+	if intent := b.intentRec.RecognizeSafeOnly(ctx, userText); intent != nil {
 		go b.handleTeamIntent(chatID, messageID, intent)
 		return nil
 	}
@@ -1057,6 +1058,17 @@ func (b *Bot) sendFileMessage(ctx context.Context, chatID string, fileData []byt
 	return nil
 }
 
+// SendMediaToChat 统一的媒体发送方法，供 FeishuSendFileTool 调用。
+// mediaType: "image" 走图片消息, "file" 走文件消息。
+func (b *Bot) SendMediaToChat(ctx context.Context, chatID string, data []byte, filename, mediaType string) error {
+	switch mediaType {
+	case "image":
+		return b.sendImageMessage(ctx, chatID, data, filename)
+	default:
+		return b.sendFileMessage(ctx, chatID, data, filename, "stream")
+	}
+}
+
 // ExtractPostText 从飞书富文本(post)消息中提取纯文本。
 func ExtractPostText(content string) string {
 	var post struct {
@@ -1339,25 +1351,22 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- 发送链接 → 自动提取到 raw 层\n" +
 			"- 说「收藏到wiki」→ 提取并整理\n\n" +
 			"**Agent Teams (多Agent协作):**\n" +
-			"*自然语言模式 (推荐):*\n" +
-			"- 直接说「帮我调研XXX」→ 自动创建 research 团队\n" +
-			"- 直接说「帮我开发XXX」→ 自动创建 development 团队\n" +
-			"- 直接说「帮我辩论XXX」→ 自动创建 debate 团队\n" +
-			"- 说「蜂群模式分析XXX」→ 自动创建 swarm 团队 (Kimi K2.5 蜂群)\n" +
-			"- 说「团队进展如何」→ 查看所有团队状态\n" +
-			"- 说「停止团队」→ 停止执行中的团队\n\n" +
 			"*快捷命令 (推荐):*\n" +
 			"- /go <工作流> <目标> — 一键创建启动团队\n" +
 			"  例: /go research 调研k8s最佳实践\n" +
-			"  例: /go creative 画一个日落海报\n\n" +
-			"*精确命令:*\n" +
+			"  例: /go creative 画一个日落海报\n" +
+			"  例: /go finance 分析特斯拉股票\n\n" +
+			"*管理命令:*\n" +
 			"- /team create <名称> <工作流> - 创建团队\n" +
 			"- /team run <名称> <目标> - 启动执行\n" +
 			"- /team status [名称] - 查看状态\n" +
 			"- /team stop <名称> - 停止\n" +
 			"- /team list - 列出所有\n" +
 			"- /team delete <名称> - 删除\n" +
-			"- /team workflows - 查看工作流"
+			"- /team workflows - 查看可用工作流\n\n" +
+			"*自然语言 (仅查询/停止):*\n" +
+			"- 说「团队进展如何」→ 查看状态\n" +
+			"- 说「停止团队」→ 停止执行"
 		b.sendTextReply(ctx, messageID, help)
 		return true
 

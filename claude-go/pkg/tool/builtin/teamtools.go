@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	sendMessageToolName = "SendMessage"
+	sendMessageToolName = "TeamMailbox"
 	teamCreateToolName  = "TeamCreate"
 	teamDeleteToolName  = "TeamDelete"
 )
@@ -74,7 +74,7 @@ func NewSendMessageTool(store *teamStore) *SendMessageTool {
 func (t *SendMessageTool) Name() string { return sendMessageToolName }
 
 func (t *SendMessageTool) Description() string {
-	return `向当前团队内某成员的“信箱”发送一条消息，可选摘要字段便于检索。`
+	return `[团队内部工具] 向当前团队内某 Agent 成员的信箱投递消息。仅用于 Agent 间通信，不能用于向用户发送消息或文件。`
 }
 
 func (t *SendMessageTool) InputSchema() json.RawMessage {

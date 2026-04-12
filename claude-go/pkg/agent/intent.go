@@ -162,6 +162,36 @@ func (ir *IntentRecognizer) RecognizeWithMCPAwareness(ctx context.Context, text 
 	return intent
 }
 
+// RecognizeSafeOnly 仅识别低风险的团队操作意图（查询、列表、停止、删除）。
+// 绝不触发 create_and_run。团队创建只能通过 /team 或 /go 命令。
+// 用于飞书对话主流程，避免自然语言误触发创建团队。
+func (ir *IntentRecognizer) RecognizeSafeOnly(_ context.Context, text string) *TeamIntent {
+	lower := strings.ToLower(text)
+
+	for _, kw := range stopKW {
+		if strings.Contains(lower, kw) {
+			return &TeamIntent{Action: "stop", Confidence: 0.8}
+		}
+	}
+	for _, kw := range statusKW {
+		if strings.Contains(lower, kw) {
+			return &TeamIntent{Action: "check_status", Confidence: 0.8}
+		}
+	}
+	for _, kw := range listKW {
+		if strings.Contains(lower, kw) {
+			return &TeamIntent{Action: "list", Confidence: 0.8}
+		}
+	}
+	for _, kw := range deleteKW {
+		if strings.Contains(lower, kw) {
+			return &TeamIntent{Action: "delete", Confidence: 0.8}
+		}
+	}
+
+	return nil
+}
+
 // calcMatchStrength 计算文本匹配关键词的总强度 (匹配的类别数)
 func (ir *IntentRecognizer) calcMatchStrength(lower string) int {
 	strength := 0

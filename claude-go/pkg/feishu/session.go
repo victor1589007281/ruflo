@@ -72,6 +72,9 @@ func (s *Session) Touch() {
 //	  create new Session with fresh QueryEngine
 //	  sessions[chatID] = newSession
 //	  return newSession
+// MediaSendFunc 飞书媒体发送回调（图片/文件）。
+type MediaSendFunc func(ctx context.Context, chatID string, data []byte, filename, mediaType string) error
+
 type SessionManager struct {
 	sessions       map[string]*Session
 	mu             sync.RWMutex
@@ -87,6 +90,7 @@ type SessionManager struct {
 	taskStore      *builtin.TaskStore     // 共享 V2 Task 存储 (Teams + LLM 工具共用)
 	evolution      *agent.EvolutionEngine // 进化引擎 (注入 agent runner hooks)
 	roleRegistry   *agent.RoleRegistry    // 角色注册表
+	mediaSendFn    MediaSendFunc          // 飞书发送图片/文件的回调
 }
 
 // NewSessionManager 创建会话管理器。
@@ -121,6 +125,11 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 	go sm.cleanupLoop()
 
 	return sm
+}
+
+// SetMediaSendFn 注入飞书媒体发送回调。在 Bot 初始化完成后调用。
+func (sm *SessionManager) SetMediaSendFn(fn MediaSendFunc) {
+	sm.mediaSendFn = fn
 }
 
 // GetOrCreate 获取或创建会话。
@@ -164,6 +173,11 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	reg := tool.NewRegistry()
 	builtin.RegisterBaseToolsWithStore(reg, sm.taskStore)
 
+	// 注册飞书发送工具: 让 LLM 能直接通过飞书 SDK 发送图片/文件给用户
+	if sm.mediaSendFn != nil {
+		reg.Register(NewFeishuSendFileTool(chatID, sm.mediaSendFn))
+	}
+
 	// 注册 MCP 工具 (动态, 对应 TS: assembleToolPool + refreshTools)
 	if sm.mcpMgr != nil {
 		sm.mcpMgr.RefreshToolsForRegistry(reg)
@@ -201,12 +215,14 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		IsNonInteractive: true, // 飞书模式始终为非交互式
 		Debug:            sm.config.Debug,
 		DynamicPlanCheck: builtin.PlanModeActive,
-		// 飞书会话中禁止 LLM 自主调用团队工具。
-		// 团队操作只能通过意图识别层或 /team 命令触发，
-		// 防止 LLM 基于历史上下文自主创建"幽灵团队"。
+		// 飞书会话中禁止 LLM 自主调用团队内部工具。
+		// 团队操作只能通过 /team、/go 命令触发。
+		// TeamMailbox/TeamCreate/TeamDelete 是团队内部 Agent 间通信工具，
+		// 在飞书对话中无意义，且会被 LLM 误用（如把 TeamMailbox 当成"发消息给用户"）。
 		DisabledTools: map[string]bool{
-			"TeamCreate": true,
-			"TeamDelete": true,
+			"TeamCreate":  true,
+			"TeamDelete":  true,
+			"TeamMailbox": true,
 		},
 	}
 
