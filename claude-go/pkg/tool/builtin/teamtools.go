@@ -43,6 +43,7 @@ type teamStore struct {
 	mu          sync.Mutex
 	teams       map[string]*teamEntity
 	currentTeam string
+	lastCreate  time.Time // 团队创建限流
 }
 
 // NewTeamStore 构造空的团队存储。
@@ -185,6 +186,12 @@ func (t *TeamCreateTool) Call(_ context.Context, input json.RawMessage, _ *tool.
 
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
+
+	// 限流: 30秒内只允许创建一个团队，防止 LLM 基于历史上下文重复创建
+	if !t.store.lastCreate.IsZero() && time.Since(t.store.lastCreate) < 30*time.Second {
+		return &tool.ToolResult{Content: "团队创建过于频繁，请稍后再试（30秒冷却）", IsError: true}, nil
+	}
+
 	key := in.TeamName
 	if _, exists := t.store.teams[key]; exists {
 		return &tool.ToolResult{Content: fmt.Sprintf("团队已存在: %q", key), IsError: true}, nil
@@ -196,6 +203,7 @@ func (t *TeamCreateTool) Call(_ context.Context, input json.RawMessage, _ *tool.
 	}
 	t.store.teams[key] = ent
 	t.store.currentTeam = key
+	t.store.lastCreate = time.Now()
 
 	resp := map[string]string{
 		"team_name": key,

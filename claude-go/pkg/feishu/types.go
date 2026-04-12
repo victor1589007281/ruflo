@@ -121,6 +121,17 @@ type BotConfig struct {
 
 	// Wiki LLM Wiki 知识库配置
 	Wiki WikiConfig
+
+	// Browser 浏览器自动化配置 (CDP)
+	Browser BrowserConfig
+}
+
+// BrowserConfig 浏览器抓取配置。
+type BrowserConfig struct {
+	// ChromePath Chrome/Chromium 可执行文件路径 (空=自动查找)
+	ChromePath string `json:"chromePath,omitempty"`
+	// ProxyURL 代理 URL
+	ProxyURL string `json:"proxyUrl,omitempty"`
 }
 
 // WikiConfig LLM Wiki 知识库配置。

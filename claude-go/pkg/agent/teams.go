@@ -32,8 +32,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,6 +72,9 @@ type AgentRunner interface {
 
 // NotifyFunc 通知回调 (向飞书推送消息)
 type NotifyFunc func(chatID, message string)
+
+// MediaNotifyFunc 多媒体通知回调 (发送图片/文件到飞书)
+type MediaNotifyFunc func(chatID string, mediaData []byte, filename, mediaType string) error
 
 // TeamStatus 团队状态
 type TeamStatus string
@@ -108,6 +114,7 @@ type ProductionTeamManager struct {
 	baseDir     string
 	factory     CreateAgentFunc
 	notify      NotifyFunc
+	mediaNotify MediaNotifyFunc
 	taskTracker TaskTracker // 复用 V2 Task 系统
 	pool        *AgentPool       // Agent 池 (动态扩缩)
 	llm         LLMClient        // LLM 客户端 (蜂群分解)
@@ -121,6 +128,7 @@ type TeamManagerConfig struct {
 	BaseDir     string
 	Factory     CreateAgentFunc
 	Notify      NotifyFunc
+	MediaNotify MediaNotifyFunc
 	TaskTracker TaskTracker
 	Pool        *AgentPool
 	LLM         LLMClient
@@ -139,6 +147,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		baseDir:     cfg.BaseDir,
 		factory:     cfg.Factory,
 		notify:      cfg.Notify,
+		mediaNotify: cfg.MediaNotify,
 		taskTracker: cfg.TaskTracker,
 		pool:        cfg.Pool,
 		llm:         cfg.LLM,
@@ -371,6 +380,11 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	}
 	ptm.notify(team.ChatID, fmt.Sprintf("✅ 团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s",
 		team.Name, time.Since(team.StartedAt).Round(time.Second), summary))
+
+	// Creative 工作流: 提取 SVG/HTML 多媒体资产，通过媒体通道发送
+	if ptm.mediaNotify != nil && (team.Workflow == "creative") {
+		ptm.sendMediaAssets(team, results)
+	}
 }
 
 // executeSwarm 蜂群模式执行
@@ -421,6 +435,74 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 	}
 	ptm.notify(team.ChatID, fmt.Sprintf("🐝 蜂群团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s",
 		team.Name, time.Since(team.StartedAt).Round(time.Second), summary))
+}
+
+// sendMediaAssets 从工作流输出中提取 SVG 并转换为 PNG 发送。
+func (ptm *ProductionTeamManager) sendMediaAssets(team *ProductionTeam, results []StageResult) {
+	for _, r := range results {
+		if r.Output == "" {
+			continue
+		}
+		svgData := extractSVGFromOutput(r.Output)
+		if svgData == "" {
+			continue
+		}
+		pngData := svgToPNG(svgData)
+		if len(pngData) == 0 {
+			// 无法转换时发送原始 SVG 文件
+			if err := ptm.mediaNotify(team.ChatID, []byte(svgData), team.Name+".svg", "file"); err != nil {
+				log.Printf("[Teams] 发送 SVG 文件失败: %v", err)
+			}
+			continue
+		}
+		if err := ptm.mediaNotify(team.ChatID, pngData, team.Name+".png", "image"); err != nil {
+			log.Printf("[Teams] 发送图片失败: %v", err)
+		}
+	}
+}
+
+// extractSVGFromOutput 从阶段输出中提取 SVG 代码块。
+func extractSVGFromOutput(s string) string {
+	lower := strings.ToLower(s)
+	start := strings.Index(lower, "<svg")
+	if start < 0 {
+		return ""
+	}
+	after := s[start:]
+	end := strings.Index(strings.ToLower(after), "</svg>")
+	if end < 0 {
+		return ""
+	}
+	return after[:end+len("</svg>")]
+}
+
+// svgToPNG 将 SVG 转换为 PNG（使用系统工具 rsvg-convert 或 inkscape）。
+// 返回空切片表示无可用转换工具。
+func svgToPNG(svg string) []byte {
+	// 尝试 rsvg-convert
+	converters := []struct {
+		cmd  string
+		args []string
+	}{
+		{"rsvg-convert", []string{"-f", "png", "-w", "800"}},
+		{"inkscape", []string{"--export-type=png", "--export-width=800", "--pipe"}},
+	}
+
+	for _, c := range converters {
+		path, err := exec.LookPath(c.cmd)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := exec.CommandContext(ctx, path, c.args...)
+		cmd.Stdin = strings.NewReader(svg)
+		out, err := cmd.Output()
+		cancel()
+		if err == nil && len(out) > 0 {
+			return out
+		}
+	}
+	return nil
 }
 
 func (ptm *ProductionTeamManager) failTeam(team *ProductionTeam, reason string) {

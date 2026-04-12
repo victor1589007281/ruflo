@@ -23,112 +23,276 @@ const (
 	defaultSchemaYAML = `# LLM Wiki Schema — 指导 LLM 如何维护此知识库
 # 这是整个系统的关键配置文件，它让 LLM 从通用聊天模型变成有纪律的 wiki 维护者。
 # 随着你在具体领域中不断实践，此文件也会与你和 LLM 一起持续演化。
-version: 2
+version: 3
 
 # === 三层架构 ===
 # Raw 层: 原始资料集合（文章、论文、笔记等）— 不可变的事实来源，LLM 只读不写
 # Wiki 层: LLM 生成的 Markdown 概念页 — LLM 负责创建、更新、维护交叉引用
 # Schema 层: 本文件 — 指导 LLM 的工作流程和规范
 
-wiki:
-  link_syntax: "[[slug]]"
-  max_concept_body_chars: 32000
-  # 页面模板: 每个 wiki 页面的推荐结构
-  page_template: |
+# ============================================================
+# 页面模板 (Page Templates)
+# ============================================================
+# 所有新建 wiki 页面必须遵循此模板，保证结构一致性。
+# LLM 在整理(Organize)和摄取(Ingest)时必须严格按此结构输出。
+page_templates:
+  concept: |
     # {title}
     
-    > 摘要: 一句话概括此概念
+    > **分类**: {category}  |  **标签**: {tags}
+    > **摘要**: 一句话概括此概念
+    > **更新时间**: {date}
     
     ## 核心内容
-    (主体知识)
+    (主体知识，保留关键事实，简洁可检索)
+    
+    ## 关键要点
+    - 要点1
+    - 要点2
+    - 要点3
     
     ## 关联概念
-    - [[related-slug-1]]
-    - [[related-slug-2]]
+    - [[related-slug-1]] — 关联原因
+    - [[related-slug-2]] — 关联原因
     
     ## 来源
     - 来自: raw/{source-file}
-  # 索引页: wiki/_index.md 作为知识库总入口
-  index_page: "_index"
-  # 分类: 按主题对页面进行逻辑分组
-  categories:
-    - name: "技术"
-      tags: ["programming", "ai", "ml", "system"]
-    - name: "产品"
-      tags: ["product", "design", "ux"]
-    - name: "商业"
-      tags: ["business", "finance", "market"]
-    - name: "通用"
-      tags: ["general"]
+    - 原始链接: {url}
+  
+  comparison: |
+    # {title}: A vs B
+    
+    > **分类**: {category}  |  **对比主题**: {topic}
+    
+    | 维度 | A | B |
+    |------|---|---|
+    | ... | ... | ... |
+    
+    ## 结论
+    (对比总结)
+    
+    ## 来源
+    - [[source-a]], [[source-b]]
+  
+  timeline: |
+    # {title} 时间线
+    
+    > **分类**: {category}
+    
+    ## 时间线
+    - **{date1}**: 事件1
+    - **{date2}**: 事件2
+    
+    ## 关联概念
+    - [[related-slug]]
 
+# ============================================================
+# 分类系统 (Classification System)
+# ============================================================
+# 每个页面必须归属一个主分类，可有多个标签。
+# LLM 在创建/整理页面时必须从此列表中选择分类和标签。
+categories:
+  - name: "技术"
+    slug: "tech"
+    tags: ["programming", "ai", "ml", "system", "devops", "database", "security", "algorithm"]
+    description: "技术相关知识：编程、AI、系统架构、安全等"
+  - name: "产品"
+    slug: "product"
+    tags: ["product", "design", "ux", "feature", "roadmap", "user-research"]
+    description: "产品设计、用户体验、功能规划"
+  - name: "商业"
+    slug: "business"
+    tags: ["business", "finance", "market", "strategy", "investment", "startup"]
+    description: "商业模式、金融、市场分析、投资"
+  - name: "研究"
+    slug: "research"
+    tags: ["research", "paper", "experiment", "methodology", "data-analysis"]
+    description: "学术研究、论文、实验方法"
+  - name: "人文"
+    slug: "humanities"
+    tags: ["history", "philosophy", "culture", "education", "language"]
+    description: "人文社科、历史、哲学、文化"
+  - name: "通用"
+    slug: "general"
+    tags: ["general", "note", "todo", "misc"]
+    description: "未分类或通用内容"
+
+wiki:
+  link_syntax: "[[slug]]"
+  max_concept_body_chars: 32000
+  index_page: "_index"
+  # 命名规范: slug 使用小写字母 + 短横线，支持中文拼音
+  slug_convention: "lowercase-hyphenated"
+  # 页面元数据: 每个页面顶部必须包含 YAML frontmatter
+  frontmatter_required:
+    - "title"
+    - "category"
+    - "tags"
+    - "created"
+    - "updated"
+    - "sources"
+
+# ============================================================
+# 摄取工作流 (Ingest Workflow)
+# ============================================================
+# LLM 摄取原始资料时必须严格按此步骤执行。
 ingest:
   merge_strategy: "llm_full_replace"
-  # 摄取工作流: LLM 读取资料 → 抽取概念 → 写摘要页 → 更新索引 → 更新关联页 → 追加日志
   workflow:
-    - "读取原始资料"
-    - "抽取关键概念和实体"
-    - "为每个概念撰写或更新 wiki 页面"
-    - "使用 [[slug]] 建立交叉引用"
-    - "更新 _index.md 目录"
-    - "在变更日志中追加记录"
+    step_1: "通读原始资料，理解主题和核心内容"
+    step_2: "抽取 3-10 个关键概念和实体（人名、技术名词、事件等）"
+    step_3: "为每个概念确定 slug（检查是否已有同名页面，有则更新）"
+    step_4: "从 categories 列表中为每个概念选择最合适的分类和标签"
+    step_5: "使用 page_templates.concept 模板撰写/更新每个概念的 wiki 页面"
+    step_6: "建立充分的 [[slug]] 交叉引用（一篇资料通常影响 5-15 个页面）"
+    step_7: "更新 _index.md 目录（按分类分组列出所有页面）"
+    step_8: "检查已有页面是否需要因新资料而更新（补充关联、修正信息）"
+  quality_rules:
+    - "每个概念页不少于 200 字核心内容"
+    - "每个概念页至少 2 个 [[交叉引用]]"
+    - "严禁编造原始资料中不存在的事实"
+    - "保留原始数据（数字、日期、引用）的精确性"
+    - "分类和标签必须从 categories 列表中选择"
 
+# ============================================================
+# 查询配置 (Query Configuration)
+# ============================================================
 query:
   navigation_mode: "snapshot"
-  # 查询结果如果具有归档价值（分析、对比、推理），自动归档到 wiki
   auto_archive: true
-  # 回答格式: 可以是 markdown、对比表、图表描述等
   flexible_format: true
+  # 查询回答的质量要求
+  answer_rules:
+    - "仅基于 wiki 现有内容回答，不臆造"
+    - "不足时明确说明哪些信息缺失"
+    - "引用具体页面: 参见 [[slug]]"
+    - "如果查询具有归档价值，自动生成概念页"
+  # 归档条件: 满足以下任一条件时将查询结果归档
+  archive_triggers:
+    - "包含深度分析或推理"
+    - "包含对比或总结"
+    - "用户明确要求保存"
+    - "涉及多个概念的综合"
 
+# ============================================================
+# Lint 检查项 (Quality Checks)
+# ============================================================
+# 定期运行的健康检查，每项有明确的修复建议。
 lint:
-  # 定期健康检查项目
   checks:
-    - "broken_links"       # 坏链检测
-    - "orphaned_pages"     # 孤立页检测  
-    - "contradictions"     # 矛盾数据检测
-    - "outdated_content"   # 过时内容检测
-    - "missing_concepts"   # 缺失概念检测
-    - "missing_cross_refs" # 缺失交叉引用
-    - "research_gaps"      # 研究空缺
-  
+    broken_links:
+      description: "检测 [[slug]] 指向不存在的页面"
+      severity: "error"
+      auto_fix: "创建缺失的目标页面（包含占位内容）"
+    orphaned_pages:
+      description: "没有任何其他页面引用的孤立页"
+      severity: "warning"
+      auto_fix: "在相关主题页面中添加引用"
+    missing_frontmatter:
+      description: "缺少必要的 YAML frontmatter 字段"
+      severity: "error"
+      auto_fix: "根据内容推断并补充 frontmatter"
+    missing_category:
+      description: "页面未分类或使用了不存在的分类"
+      severity: "error"
+      auto_fix: "根据内容自动分类到最合适的类别"
+    missing_cross_refs:
+      description: "内容提到了其他概念但未使用 [[slug]] 引用"
+      severity: "warning"
+      auto_fix: "自动添加交叉引用链接"
+    contradictions:
+      description: "不同页面中的矛盾信息"
+      severity: "critical"
+      auto_fix: "标记矛盾并在两个页面中添加警告"
+    outdated_content:
+      description: "超过 90 天未更新且有新相关资料的页面"
+      severity: "info"
+      auto_fix: "标记为待更新"
+    empty_sections:
+      description: "页面中存在空的章节（只有标题没有内容）"
+      severity: "warning"
+      auto_fix: "填充内容或删除空章节"
+    duplicate_concepts:
+      description: "不同 slug 描述相同概念"
+      severity: "warning"
+      auto_fix: "合并为一个页面，另一个重定向"
+    research_gaps:
+      description: "概念提及但缺乏深入内容的领域"
+      severity: "info"
+      auto_fix: "标记为待研究"
+
+# ============================================================
+# 整理任务 (Organize Tasks)
+# ============================================================
+# LLM 执行全量/增量整理时必须按此优先级执行。
 organize:
-  # 整理触发条件
   triggers:
     - "new_raw_files"      # 新增 raw 文件时自动触发增量整理
     - "manual"             # 手动触发
-    - "scheduled"          # 定时触发
-  # 整理任务
+    - "scheduled"          # 定时触发（默认每日一次）
+  # 整理任务按优先级排序（从高到低）
   tasks:
-    - "summarize"          # 补充摘要
-    - "cross_reference"    # 建立交叉引用
-    - "categorize"         # 分类归档
-    - "update_index"       # 更新索引
-    - "deduplicate"        # 去重
-    - "fill_gaps"          # 填补空缺
+    - name: "classify"
+      priority: 1
+      description: "为所有缺少分类的页面分配 category 和 tags"
+    - name: "apply_template"
+      priority: 2
+      description: "检查页面结构，不符合 page_template 的重新格式化"
+    - name: "cross_reference"
+      priority: 3
+      description: "扫描所有页面内容，补充缺失的 [[slug]] 交叉引用"
+    - name: "update_index"
+      priority: 4
+      description: "重建 _index.md，按分类分组列出所有页面及摘要"
+    - name: "summarize"
+      priority: 5
+      description: "为缺少摘要的页面生成一句话概括"
+    - name: "deduplicate"
+      priority: 6
+      description: "合并重复概念页面"
+    - name: "fill_gaps"
+      priority: 7
+      description: "基于现有页面间的关联，识别并标记知识空缺"
+    - name: "archive_stale"
+      priority: 8
+      description: "将长期未更新且无引用的页面移入 wiki/_archive/"
+  # 整理质量检查: 每次整理后自动运行
+  post_organize_lint: true
+  # 增量整理: 每批处理的 raw 文件数
+  incremental_batch_size: 5
+  # 全量整理: 每批处理的 wiki 页面数
+  full_batch_size: 20
 `
 
-	ingestSystemPrompt = `你是「LLM Wiki」的策展助手，遵循三层架构(Raw/Wiki/Schema)规范。
-用户会提供一篇刚从网页摘录的纯文本（可能附带标题与来源）。
+	ingestSystemPrompt = `你是「LLM Wiki」的策展助手，严格遵循 Schema 层规范。
+用户会提供一篇原始资料（可能附带标题与来源）和 schema.yaml 配置。
 
-你的任务（参照 Karpathy LLM Wiki 摄取工作流）：
-1. 读取原始资料，抽取关键概念和实体
-2. 每个概念对应一个 slug（小写、短横线、英文或拼音均可，需稳定、可复用）
-3. 为每个概念撰写或更新 Markdown 正文，遵循以下页面结构:
-   - # 标题
-   - > 摘要: 一句话概括
-   - ## 核心内容 (主体知识)
-   - ## 关联概念 (使用 [[slug]] 交叉引用)
+按 schema.ingest.workflow 步骤执行:
+1. 通读原始资料，理解主题和核心内容
+2. 抽取 3-10 个关键概念和实体（人名、技术名词、事件等）
+3. 为每个概念确定 slug（小写短横线，检查是否已有同名页面）
+4. 从 schema.categories 中为每个概念选择最合适的分类和标签
+5. 使用 schema.page_templates.concept 结构撰写 wiki 页面:
+   - # {title}
+   - > **分类**: {category}  |  **标签**: {tags}
+   - > **摘要**: 一句话概括此概念
+   - ## 核心内容 (不少于200字，保留关键事实)
+   - ## 关键要点 (3-5个要点)
+   - ## 关联概念 (使用 [[slug]]，至少2个交叉引用)
    - ## 来源 (标注来自哪个 raw 文件)
-4. 建立充分的 [[slug]] 交叉引用（一个来源通常影响 10-15 个 wiki 页面）
-5. 如果概念属于已有的相关页面，也输出更新后的该页面
+6. 建立充分的 [[slug]] 交叉引用（一个来源通常影响 5-15 个 wiki 页面）
+7. 如果概念属于已有的相关页面，也输出更新后的该页面
+8. 检查已有页面是否需要因新资料而更新
 
 输出必须是单一 JSON 对象，不要代码围栏：
 {"pages":[{"slug":"...","title":"...","body_markdown":"..."}]}
 
-要求：
+强制质量规则:
 - pages 非空
 - body_markdown 使用 [[slug]] 表示指向 wiki/<slug>.md 的链接
 - 不同 page 的 slug 必须唯一
-- 正文简洁、可检索，保留关键事实，不要编造
+- 正文简洁、可检索，保留关键事实，严禁编造
+- 分类和标签必须从 schema.categories 中选择
 - 尽量多地建立概念间的关联`
 
 	querySystemPrompt = `你是「LLM Wiki」的问答助手。下面提供 wiki 目录中页面列表及部分正文摘录。
@@ -155,6 +319,12 @@ type LLMClient interface {
 	RawComplete(ctx context.Context, contentJSON json.RawMessage, maxTokens int) (string, error)
 }
 
+// BrowserFetcher 浏览器抓取接口，用于绕过防爬虫。
+type BrowserFetcher interface {
+	Available() bool
+	Fetch(ctx context.Context, url string) (title, text, html string, err error)
+}
+
 // Engine 是 LLM Wiki 知识库的运行时入口，负责摄取、查询与质检。
 // 同一 Engine 实例上的公开方法使用互斥锁序列化，避免并发写盘与 git 提交交错。
 type Engine struct {
@@ -163,8 +333,14 @@ type Engine struct {
 	BaseURL    string // 保留向后兼容
 	Model      string // 保留向后兼容
 	llm        LLMClient
+	browser    BrowserFetcher
 	httpClient *http.Client
 	mu         sync.Mutex
+}
+
+// SetBrowser 设置浏览器抓取器（用于绕过防爬虫）。
+func (e *Engine) SetBrowser(b BrowserFetcher) {
+	e.browser = b
 }
 
 // BrokenLink 表示从源页指向不存在目标页的坏链。
@@ -263,7 +439,12 @@ func mustMarshalString(s string) json.RawMessage {
 	return data
 }
 
+// schemaVersion 内置 Schema 版本号，升级时递增。
+// EnsureRepo 会比较文件中的 version 字段，若低于此值则自动升级。
+const schemaVersion = 3
+
 // EnsureRepo 若目录或 Git 结构不完整则初始化：创建 raw/wiki/schema、写入默认 schema.yaml，并在需要时 git init。
+// 如果 schema.yaml 已存在但版本低于内置版本，会自动升级。
 func EnsureRepo(repoDir string) error {
 	if repoDir == "" {
 		return fmt.Errorf("wiki: repoDir 为空")
@@ -278,12 +459,23 @@ func EnsureRepo(repoDir string) error {
 		}
 	}
 	schemaPath := filepath.Join(repoDir, "schema", "schema.yaml")
+	needWrite := false
 	if _, err := os.Stat(schemaPath); os.IsNotExist(err) {
+		needWrite = true
+	} else if err != nil {
+		return fmt.Errorf("wiki: 检查 schema: %w", err)
+	} else {
+		// 检查版本号，低于内置版本则升级
+		if existing, err := os.ReadFile(schemaPath); err == nil {
+			if !strings.Contains(string(existing), fmt.Sprintf("version: %d", schemaVersion)) {
+				needWrite = true
+			}
+		}
+	}
+	if needWrite {
 		if err := os.WriteFile(schemaPath, []byte(defaultSchemaYAML), 0o644); err != nil {
 			return fmt.Errorf("wiki: 写入默认 schema: %w", err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("wiki: 检查 schema: %w", err)
 	}
 	gitDir := filepath.Join(repoDir, ".git")
 	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
@@ -313,31 +505,48 @@ func (e *Engine) Ingest(ctx context.Context, url string) error {
 		return fmt.Errorf("wiki: URL 为空")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("wiki: 构造请求: %w", err)
-	}
-	req.Header.Set("User-Agent", "claude-go-wiki/1.0")
+	var title, text string
 
-	resp, err := e.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("wiki: 获取 URL: %w", err)
+	// 优先使用浏览器抓取（绕过防爬虫/JS渲染）
+	if e.browser != nil && e.browser.Available() {
+		bTitle, bText, _, bErr := e.browser.Fetch(ctx, url)
+		if bErr == nil && strings.TrimSpace(bText) != "" {
+			title = bTitle
+			text = bText
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("wiki: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+
+	// 降级: HTTP 直接抓取
+	if text == "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return fmt.Errorf("wiki: 构造请求: %w", err)
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+
+		resp, err := e.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("wiki: 获取 URL: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			return fmt.Errorf("wiki: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		htmlBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("wiki: 读取响应体: %w", err)
+		}
+		htmlStr := string(htmlBytes)
+		title = pickTitle(htmlStr)
+		text = extractContent(htmlStr)
 	}
-	htmlBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("wiki: 读取响应体: %w", err)
-	}
-	htmlStr := string(htmlBytes)
-	title := pickTitle(htmlStr)
+
 	if strings.TrimSpace(title) == "" {
 		title = "untitled"
 	}
-	text := extractContent(htmlStr)
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("wiki: 未能从页面抽取有效正文")
 	}
@@ -762,29 +971,60 @@ func truncateRunes(s string, n int) string {
 // ══════════════════════════════════════════════════════════
 
 const (
-	organizeSystemPrompt = `你是「LLM Wiki」的策展维护者。下面是当前 wiki 的全部页面目录与部分内容。
-你的任务是对整个 wiki 进行全面整理和优化:
+	organizeSystemPrompt = `你是「LLM Wiki」的策展维护者。你必须严格遵循下方 schema.yaml 中定义的所有规则。
 
-1. **总结与摘要**: 检查每个页面是否有清晰的摘要段落，没有的补充
-2. **建立关联**: 审查所有页面之间的概念关联，添加缺失的 [[slug]] 交叉引用
-3. **归档整理**: 按主题对页面进行逻辑分组，在每个页面添加相关页面链接
-4. **维护结构**: 创建或更新 _index.md 作为 wiki 的目录入口页面
-5. **去重与合并**: 如果有重复或高度相似的页面，标注合并建议
-6. **填补空缺**: 识别被引用但不存在的概念页，为其创建基础框架
+## 整理任务（按 organize.tasks 优先级从高到低执行）:
 
-重要：请输出紧凑的 JSON（无多余空格和换行），确保能在输出限制内完成：
+1. **分类(classify)** [P1]: 为每个页面分配 category（从 categories 列表选择）和 tags
+2. **套用模板(apply_template)** [P2]: 每个页面必须符合 page_templates.concept 结构:
+   - 必须有 > **分类** 和 > **摘要** 行
+   - 必须有 ## 核心内容、## 关键要点、## 关联概念、## 来源 四个章节
+   - 不符合的页面必须重写为正确结构
+3. **交叉引用(cross_reference)** [P3]: 扫描页面正文中提到的概念，添加 [[slug]] 链接
+   - 每个页面至少 2 个交叉引用
+   - 一个概念通常影响 5-15 个相关页面
+4. **更新索引(update_index)** [P4]: 创建/更新 _index.md，按分类分组列出所有页面
+5. **补充摘要(summarize)** [P5]: 缺摘要的页面生成一句话概括
+6. **去重(deduplicate)** [P6]: 高度相似的页面合并
+7. **填补空缺(fill_gaps)** [P7]: 被 [[slug]] 引用但不存在的概念，创建框架页
+8. **归档(archive_stale)** [P8]: 长期无更新无引用的页面标记为归档
+
+## 强制质量规则:
+- 每个 slug 全局唯一，小写短横线格式
+- 核心内容不少于 200 字
+- 不编造 raw 中不存在的事实
+- 分类和标签只能从 schema.categories 中选择
+- 输出紧凑 JSON，确保在输出限制内完成
+- 如果页面过多，分批返回最需要更新的（优先级: P1 > P2 > P3）
+
+输出:
 {"pages":[{"slug":"...","title":"...","body_markdown":"..."}],"log":"整理日志摘要"}`
 
-	incrementalOrganizePrompt = `你是「LLM Wiki」的增量维护者。以下是最近新增的 raw 文件和当前 wiki 的页面目录。
-你的任务是仅针对新增内容进行增量更新:
+	incrementalOrganizePrompt = `你是「LLM Wiki」的增量维护者。你必须严格遵循 schema.yaml 中的所有规则。
 
-1. 将新增 raw 内容与现有 wiki 概念页关联
-2. 更新受影响的现有页面（添加新的交叉引用）
-3. 如果新内容引入了新概念，创建对应的 wiki 页面
-4. 更新 _index.md 目录
+## 增量更新任务（按 ingest.workflow 步骤执行）:
 
-仅输出需要创建或更新的页面（不要输出未变更的页面）。
-输出 JSON:
+1. **通读原始资料**，理解主题和核心内容
+2. **抽取 3-10 个关键概念和实体**（人名、技术名词、事件等）
+3. **确定每个概念的 slug**（检查是否已有同名页面，有则更新）
+4. **从 categories 列表中选择**最合适的分类和标签
+5. **使用 page_templates.concept 模板**撰写/更新每个概念页:
+   - 必须有 > **分类**: {category}  |  **标签**: {tags}
+   - 必须有 > **摘要**: 一句话概括
+   - 必须有 ## 核心内容、## 关键要点、## 关联概念、## 来源
+6. **建立充分的 [[slug]] 交叉引用**（每个页面至少 2 个）
+7. **更新 _index.md** 目录
+8. **检查已有页面**是否需要补充关联或修正
+
+## 强制质量规则:
+- 每个概念页核心内容不少于 200 字
+- 每个页面至少 2 个 [[交叉引用]]
+- 严禁编造原始资料中不存在的事实
+- 分类和标签必须从 categories 列表中选择
+- 保留原始数据（数字、日期、引用）的精确性
+
+仅输出需要创建或更新的页面。
+输出:
 {"pages":[{"slug":"...","title":"...","body_markdown":"..."}],"log":"增量更新日志"}`
 
 	healthCheckPrompt = `你是「LLM Wiki」的健康检查专家。以下是当前 wiki 的全部页面目录与部分内容。
@@ -899,7 +1139,18 @@ func (e *Engine) IngestText(ctx context.Context, title, text, source string) err
 	return gitCommit(e.RepoDir, fmt.Sprintf("wiki: ingest-text %s (%s)", slug, dateStr))
 }
 
+// loadSchemaContext 读取 schema.yaml 内容，供 LLM 参考。
+func (e *Engine) loadSchemaContext() string {
+	schemaPath := filepath.Join(e.RepoDir, "schema", "schema.yaml")
+	data, err := os.ReadFile(schemaPath)
+	if err != nil {
+		return ""
+	}
+	return truncateRunes(string(data), 4000)
+}
+
 // Organize 对整个 wiki 进行全量整理: 总结、建立关联、归档、维护结构。
+// 当页面数量较多时分批处理，每批最多 20 个页面。
 func (e *Engine) Organize(ctx context.Context) (*OrganizeResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -910,20 +1161,69 @@ func (e *Engine) Organize(ctx context.Context) (*OrganizeResult, error) {
 		return nil, err
 	}
 
-	// 使用仅目录模式减少输入，给 LLM 输出留更多空间
-	bundle, err := buildWikiIndexOnly(e.RepoDir)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := e.completeLLMWithMaxTokens(ctx, organizeSystemPrompt, bundle, 16384)
-	if err != nil {
-		return nil, fmt.Errorf("wiki: LLM 整理: %w", err)
+	schemaCtx := e.loadSchemaContext()
+	wikiDir := filepath.Join(e.RepoDir, "wiki")
+	pages, _ := filepath.Glob(filepath.Join(wikiDir, "*.md"))
+
+	totalUpdated := 0
+	var logBuf strings.Builder
+
+	const batchSize = 20
+
+	if len(pages) <= batchSize {
+		bundle, err := buildWikiContextBundle(e.RepoDir, 16000)
+		if err != nil {
+			return nil, err
+		}
+		userPrompt := "Schema 配置:\n" + schemaCtx + "\n---\n当前 wiki:\n" + bundle
+		resp, err := e.completeLLMWithMaxTokens(ctx, organizeSystemPrompt, userPrompt, 16384)
+		if err != nil {
+			return nil, fmt.Errorf("wiki: LLM 整理: %w", err)
+		}
+		return e.applyOrganizeResult(resp)
 	}
 
-	return e.applyOrganizeResult(resp)
+	// 分批处理
+	for i := 0; i < len(pages); i += batchSize {
+		select {
+		case <-ctx.Done():
+			return &OrganizeResult{UpdatedPages: totalUpdated, Log: logBuf.String() + "\n(中断)"}, ctx.Err()
+		default:
+		}
+
+		end := i + batchSize
+		if end > len(pages) {
+			end = len(pages)
+		}
+		batch := pages[i:end]
+
+		var batchContent strings.Builder
+		batchContent.WriteString(fmt.Sprintf("Schema:\n%s\n---\n批次 %d/%d 的页面:\n\n", schemaCtx, i/batchSize+1, (len(pages)+batchSize-1)/batchSize))
+		for _, p := range batch {
+			data, _ := os.ReadFile(p)
+			batchContent.WriteString(fmt.Sprintf("### %s\n%s\n\n", filepath.Base(p), truncateRunes(string(data), 4000)))
+		}
+
+		resp, err := e.completeLLMWithMaxTokens(ctx, organizeSystemPrompt, batchContent.String(), 16384)
+		if err != nil {
+			logBuf.WriteString(fmt.Sprintf("批次 %d 失败: %v\n", i/batchSize+1, err))
+			continue
+		}
+
+		result, err := e.applyOrganizeResult(resp)
+		if err != nil {
+			logBuf.WriteString(fmt.Sprintf("批次 %d 应用失败: %v\n", i/batchSize+1, err))
+			continue
+		}
+		totalUpdated += result.UpdatedPages
+		logBuf.WriteString(result.Log + "\n")
+	}
+
+	return &OrganizeResult{UpdatedPages: totalUpdated, Log: logBuf.String()}, nil
 }
 
 // IncrementalOrganize 增量整理: 仅处理新增 raw 文件影响的页面。
+// 当 raw 文件较多时并发分批处理，每批最多 5 个 raw 文件。
 func (e *Engine) IncrementalOrganize(ctx context.Context) (*OrganizeResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -942,22 +1242,51 @@ func (e *Engine) IncrementalOrganize(ctx context.Context) (*OrganizeResult, erro
 		return &OrganizeResult{Log: "无近期新增 raw 文件，跳过增量整理"}, nil
 	}
 
-	var rawContent strings.Builder
-	rawContent.WriteString("近期新增 raw 文件:\n\n")
-	for _, rf := range recentRaw {
-		data, _ := os.ReadFile(rf)
-		rawContent.WriteString(fmt.Sprintf("### %s\n%s\n\n", filepath.Base(rf), truncateRunes(string(data), 6000)))
+	schemaCtx := e.loadSchemaContext()
+	wikiIndex, _ := buildWikiIndexOnly(e.RepoDir)
+
+	const batchSize = 5
+	totalUpdated := 0
+	var logBuf strings.Builder
+
+	// 分批处理 raw 文件
+	for i := 0; i < len(recentRaw); i += batchSize {
+		select {
+		case <-ctx.Done():
+			return &OrganizeResult{UpdatedPages: totalUpdated, Log: logBuf.String() + "\n(中断)"}, ctx.Err()
+		default:
+		}
+
+		end := i + batchSize
+		if end > len(recentRaw) {
+			end = len(recentRaw)
+		}
+		batch := recentRaw[i:end]
+
+		var rawContent strings.Builder
+		rawContent.WriteString(fmt.Sprintf("Schema:\n%s\n---\n新增 raw 文件 (批次 %d):\n\n", schemaCtx, i/batchSize+1))
+		for _, rf := range batch {
+			data, _ := os.ReadFile(rf)
+			rawContent.WriteString(fmt.Sprintf("### %s\n%s\n\n", filepath.Base(rf), truncateRunes(string(data), 8000)))
+		}
+		rawContent.WriteString("---\n当前 wiki 索引:\n" + wikiIndex)
+
+		resp, err := e.completeLLMWithMaxTokens(ctx, incrementalOrganizePrompt, rawContent.String(), 16384)
+		if err != nil {
+			logBuf.WriteString(fmt.Sprintf("批次 %d 失败: %v\n", i/batchSize+1, err))
+			continue
+		}
+
+		result, err := e.applyOrganizeResult(resp)
+		if err != nil {
+			logBuf.WriteString(fmt.Sprintf("批次 %d 应用失败: %v\n", i/batchSize+1, err))
+			continue
+		}
+		totalUpdated += result.UpdatedPages
+		logBuf.WriteString(result.Log + "\n")
 	}
 
-	bundle, _ := buildWikiContextBundle(e.RepoDir, 12000)
-	userPrompt := rawContent.String() + "\n---\n当前 wiki 状态:\n" + bundle
-
-	resp, err := e.completeLLM(ctx, incrementalOrganizePrompt, userPrompt)
-	if err != nil {
-		return nil, fmt.Errorf("wiki: LLM 增量整理: %w", err)
-	}
-
-	return e.applyOrganizeResult(resp)
+	return &OrganizeResult{UpdatedPages: totalUpdated, Log: logBuf.String()}, nil
 }
 
 // HealthCheck 对 wiki 进行 LLM 驱动的健康检查。

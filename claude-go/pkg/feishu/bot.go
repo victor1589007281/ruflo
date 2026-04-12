@@ -10,8 +10,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
@@ -23,6 +26,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/basedir"
+	"github.com/anthropic/claude-go/pkg/browser"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
@@ -45,6 +49,23 @@ const (
 // dreamAdapter 适配 dreaming.Dreamer 到 agent.DreamRecorder 接口。
 type dreamAdapter struct {
 	dreamer *dreaming.Dreamer
+}
+
+// wikiBrowserAdapter 适配 browser.Client 到 wiki.BrowserFetcher 接口。
+type wikiBrowserAdapter struct {
+	client *browser.Client
+}
+
+func (w *wikiBrowserAdapter) Available() bool {
+	return w.client.Available()
+}
+
+func (w *wikiBrowserAdapter) Fetch(ctx context.Context, url string) (title, text, html string, err error) {
+	result, err := w.client.Fetch(ctx, url)
+	if err != nil {
+		return "", "", "", err
+	}
+	return result.Title, result.Text, result.HTML, nil
 }
 
 func (da *dreamAdapter) RecordSession(record agent.DreamSessionRecord) {
@@ -96,6 +117,9 @@ type Bot struct {
 	visionCli   *vision.Client             // 视觉能力客户端
 	skillAuto   *skills.AutoCreator        // 技能自动创建器
 	startTime   time.Time                   // 启动时间
+
+	// 消息去重: 防止同一条消息触发多个团队
+	processedMsgs sync.Map // messageID → timestamp
 }
 
 // NewBot 创建飞书机器人。
@@ -198,6 +222,15 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		BaseDir:     layout.Teams,
 		Factory:     bot.sessions.CreateAgentRunner,
 		Notify:      func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
+		MediaNotify: func(chatID string, data []byte, filename, mediaType string) error {
+			ctx := context.Background()
+			switch mediaType {
+			case "image":
+				return bot.sendImageMessage(ctx, chatID, data, filename)
+			default:
+				return bot.sendFileMessage(ctx, chatID, data, filename, "stream")
+			}
+		},
 		TaskTracker: bot.taskStore,
 		Pool:        agentPool,
 		LLM:         aiClient,
@@ -230,8 +263,39 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			}
 		}
 		bot.wikiEngine = wiki.NewEngineWithLLM(wikiRepoDir, aiClient)
-		if err := wiki.EnsureRepo(wikiRepoDir); err != nil {
-			log.Printf("[Wiki] 初始化仓库失败: %v", err)
+		// 设置浏览器抓取器（绕过防爬虫）
+		browserCfg := browser.DefaultConfig()
+		if config.Browser.ChromePath != "" {
+			browserCfg.ChromePath = config.Browser.ChromePath
+		}
+		if config.Browser.ProxyURL != "" {
+			browserCfg.ProxyURL = config.Browser.ProxyURL
+		}
+		browserClient := browser.NewClient(browserCfg)
+		bot.wikiEngine.SetBrowser(&wikiBrowserAdapter{client: browserClient})
+
+		// 对所有注册的 Wiki 仓库内置 Schema（页面模板、分类、摄取工作流、Lint、整理任务）
+		allRepos := config.Wiki.Repos
+		if len(allRepos) == 0 {
+			allRepos = []string{wikiRepoDir}
+		} else {
+			found := false
+			for _, r := range allRepos {
+				if r == wikiRepoDir {
+					found = true
+					break
+				}
+			}
+			if !found {
+				allRepos = append(allRepos, wikiRepoDir)
+			}
+		}
+		for _, repoPath := range allRepos {
+			if err := wiki.EnsureRepo(repoPath); err != nil {
+				log.Printf("[Wiki] 初始化仓库失败 (%s): %v", repoPath, err)
+			} else {
+				log.Printf("[Wiki] 仓库已初始化 (含内置Schema): %s", repoPath)
+			}
 		}
 		// 启动 raw 目录变化监控 (自动触发增量整理)
 		bot.wikiEngine.WatchRaw(context.Background(), func(newFiles []string) {
@@ -622,7 +686,50 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
-	// 处理斜杠命令
+	// === 三层消息去重，防止幽灵团队创建 ===
+
+	// 防护1: messageID 精确去重 (防止飞书 webhook 重试)
+	if _, loaded := b.processedMsgs.LoadOrStore(messageID, time.Now().Unix()); loaded {
+		if b.config.Debug {
+			log.Printf("[飞书Bot] 消息去重(messageID): %s", messageID)
+		}
+		return nil
+	}
+
+	// 防护2: 消息时间戳检查 — 忽略超过10分钟的旧消息（防止飞书延迟投递）
+	if createTimeStr := deref(msg.CreateTime); createTimeStr != "" {
+		if createTimeMS, err := strconv.ParseInt(createTimeStr, 10, 64); err == nil {
+			msgAge := time.Since(time.UnixMilli(createTimeMS))
+			if msgAge > 10*time.Minute {
+				if b.config.Debug {
+					log.Printf("[飞书Bot] 丢弃过期消息(%.0f分钟前): %s", msgAge.Minutes(), messageID)
+				}
+				return nil
+			}
+		}
+	}
+
+	// 防护3: 内容指纹去重 — 同一chatID+相同内容30秒内不重复处理
+	contentFingerprint := chatID + ":" + userText
+	if _, loaded := b.processedMsgs.LoadOrStore("fp:"+contentFingerprint, time.Now().Unix()); loaded {
+		if b.config.Debug {
+			log.Printf("[飞书Bot] 消息去重(内容指纹): %s", messageID)
+		}
+		return nil
+	}
+
+	// 定期清理 (保留 30 分钟，覆盖飞书最大重试窗口)
+	go func() {
+		now := time.Now().Unix()
+		b.processedMsgs.Range(func(k, v interface{}) bool {
+			if ts, ok := v.(int64); ok && now-ts > 1800 {
+				b.processedMsgs.Delete(k)
+			}
+			return true
+		})
+	}()
+
+	// 处理斜杠命令 (包括 /team 精确命令)
 	if handled := b.handleSlashCommand(ctx, chatID, messageID, userText); handled {
 		return nil
 	}
@@ -634,6 +741,7 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 	}
 
 	// 意图识别: 中文自然语言 → 自动拆解为团队操作 (MCP 感知, 零侵入, 不匹配则透传)
+	// 每条消息只允许创建一个团队，通过去重保证
 	hasMCP := len(b.mcpMgr.ListServers()) > 0
 	if intent := b.intentRec.RecognizeWithMCPAwareness(ctx, userText, hasMCP); intent != nil && intent.Confidence >= 0.7 {
 		go b.handleTeamIntent(chatID, messageID, intent)
@@ -1238,7 +1346,11 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- 说「蜂群模式分析XXX」→ 自动创建 swarm 团队 (Kimi K2.5 蜂群)\n" +
 			"- 说「团队进展如何」→ 查看所有团队状态\n" +
 			"- 说「停止团队」→ 停止执行中的团队\n\n" +
-			"*命令模式:*\n" +
+			"*快捷命令 (推荐):*\n" +
+			"- /go <工作流> <目标> — 一键创建启动团队\n" +
+			"  例: /go research 调研k8s最佳实践\n" +
+			"  例: /go creative 画一个日落海报\n\n" +
+			"*精确命令:*\n" +
 			"- /team create <名称> <工作流> - 创建团队\n" +
 			"- /team run <名称> <目标> - 启动执行\n" +
 			"- /team status [名称] - 查看状态\n" +
@@ -1308,6 +1420,11 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 
 	case lower == "/dream":
 		b.handleDreamCommand(ctx, messageID)
+		return true
+
+	case strings.HasPrefix(lower, "/go "):
+		// 快捷命令: /go <工作流> <目标> — 一键创建并启动团队
+		b.handleGoCommand(ctx, chatID, messageID, text)
 		return true
 
 	case strings.HasPrefix(lower, "/team"):
@@ -1466,6 +1583,38 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 	}
 }
 
+// handleGoCommand 一键创建并启动团队: /go <工作流> <目标>
+// 示例:
+//   /go research 调研 kubernetes 最佳实践
+//   /go creative 画一个日落风景
+//   /go finance 分析特斯拉财报
+func (b *Bot) handleGoCommand(ctx context.Context, chatID, messageID, text string) {
+	parts := strings.Fields(text)
+	if len(parts) < 3 {
+		b.sendTextReply(ctx, messageID, "用法: /go <工作流> <目标>\n"+
+			"工作流: research, development, debate, creative, finance, techblog, swarm\n"+
+			"示例: /go research 调研 kubernetes 最佳实践")
+		return
+	}
+
+	workflow := strings.ToLower(parts[1])
+	objective := strings.Join(parts[2:], " ")
+	teamName := fmt.Sprintf("go-%s-%d", workflow, time.Now().Unix()%10000)
+
+	team, err := b.teamMgr.CreateTeam(teamName, workflow, objective, chatID)
+	if err != nil {
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("创建失败: %v", err))
+		return
+	}
+	b.sendTextReply(ctx, messageID, fmt.Sprintf(
+		"🚀 快速启动:\n- 团队: **%s**\n- 工作流: %s\n- Agent数: %d\n- 目标: %s",
+		team.Name, workflow, len(team.Agents), objective))
+
+	if err := b.teamMgr.RunTeam(teamName, objective); err != nil {
+		b.sendTextMessage(ctx, chatID, fmt.Sprintf("启动失败: %v", err))
+	}
+}
+
 // handleTeamCommand 处理 /team 命令族
 // 支持: create, run, status, stop, list, delete, msg, workflows
 func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text string) {
@@ -1609,6 +1758,16 @@ func (b *Bot) handleTeamIntent(chatID, messageID string, intent *agent.TeamInten
 	ctx := context.Background()
 	switch intent.Action {
 	case "create_and_run":
+		// 检查是否有相同工作流的团队在运行中（防止重复创建）
+		for _, t := range b.teamMgr.ListAllTeams() {
+			if t.Workflow == intent.Workflow && t.Status == agent.TeamStatusRunning {
+				b.sendTextReply(ctx, messageID, fmt.Sprintf(
+					"⚠️ 已有同类型的 **%s** 团队(%s)正在运行。\n发送「团队进展如何」查看进度，或「停止团队」后重新创建。",
+					intent.Workflow, t.Name))
+				return
+			}
+		}
+
 		team, err := b.teamMgr.CreateTeam(intent.TeamName, intent.Workflow, intent.Objective, chatID)
 		if err != nil {
 			b.sendTextReply(ctx, messageID, fmt.Sprintf("自动创建团队失败: %v", err))
@@ -2003,8 +2162,91 @@ func (b *Bot) processAndReply(chatID, messageID, userText string) {
 		return
 	}
 
+	// 检测输出中是否包含 SVG（vision 生成结果）→ 自动转为图片发回
+	if svgContent := ExtractSVGFromResponse(response); svgContent != "" {
+		textPart := RemoveSVGFromResponse(response)
+		if textPart != "" {
+			b.sendLongMessage(ctx, chatID, textPart)
+		}
+		pngData := svgToPNGData(svgContent)
+		if len(pngData) > 0 {
+			if err := b.sendImageMessage(ctx, chatID, pngData, "generated.png"); err != nil {
+				log.Printf("[飞书Bot] 发送生成图片失败: %v, 回退到文本", err)
+				b.sendLongMessage(ctx, chatID, response)
+			}
+		} else {
+			// 无转换工具，发送 SVG 文件
+			if err := b.sendFileMessage(ctx, chatID, []byte(svgContent), "generated.svg", "stream"); err != nil {
+				b.sendLongMessage(ctx, chatID, response)
+			}
+		}
+		return
+	}
+
 	// 分段发送 (飞书文本消息有长度限制)
 	b.sendLongMessage(ctx, chatID, response)
+}
+
+// ExtractSVGFromResponse 从 AI 回复中提取 SVG 内容 (导出供测试)。
+func ExtractSVGFromResponse(s string) string {
+	lower := strings.ToLower(s)
+	start := strings.Index(lower, "<svg")
+	if start < 0 {
+		return ""
+	}
+	after := s[start:]
+	end := strings.Index(strings.ToLower(after), "</svg>")
+	if end < 0 {
+		return ""
+	}
+	return after[:end+len("</svg>")]
+}
+
+// RemoveSVGFromResponse 移除回复中的 SVG 代码块，保留文本说明 (导出供测试)。
+func RemoveSVGFromResponse(s string) string {
+	lower := strings.ToLower(s)
+	start := strings.Index(lower, "<svg")
+	if start < 0 {
+		return s
+	}
+	endTag := strings.Index(lower[start:], "</svg>")
+	if endTag < 0 {
+		return s
+	}
+	before := strings.TrimSpace(s[:start])
+	after := strings.TrimSpace(s[start+endTag+len("</svg>"):])
+	result := before
+	if after != "" {
+		result += "\n" + after
+	}
+	return strings.TrimSpace(result)
+}
+
+// svgToPNGData 使用系统工具将 SVG 转为 PNG。
+func svgToPNGData(svg string) []byte {
+	type converter struct {
+		cmd  string
+		args []string
+	}
+	converters := []converter{
+		{"rsvg-convert", []string{"-f", "png", "-w", "800"}},
+		{"inkscape", []string{"--export-type=png", "--export-width=800", "--pipe"}},
+	}
+	for _, c := range converters {
+		path, err := exec.LookPath(c.cmd)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := exec.CommandContext(ctx, path, c.args...)
+		cmd.Stdin = strings.NewReader(svg)
+		out, err := cmd.Output()
+		cancel()
+		if err == nil && len(out) > 0 {
+			return out
+		}
+	}
+	return nil
 }
 
 // llmDetectComplexity 使用 LLM 判断任务复杂度。
