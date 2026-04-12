@@ -132,6 +132,13 @@ func (sm *SessionManager) SetMediaSendFn(fn MediaSendFunc) {
 	sm.mediaSendFn = fn
 }
 
+// Get 获取已有会话（不创建）。如果不存在返回 nil。
+func (sm *SessionManager) Get(chatID string) *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.sessions[chatID]
+}
+
 // GetOrCreate 获取或创建会话。
 // 如果 chat_id 已存在会话则返回；否则创建新的 QueryEngine 会话。
 // 当会话数达到上限时，淘汰最早活跃的会话 (LRU 策略)。

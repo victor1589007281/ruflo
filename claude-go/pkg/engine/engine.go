@@ -622,6 +622,22 @@ func (e *QueryEngine) GetMessages() []types.Message {
 	return result
 }
 
+// RecentMessages 返回最近 N 条消息（从尾部取）。
+func (e *QueryEngine) RecentMessages(n int) []types.Message {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if n <= 0 || len(e.Messages) == 0 {
+		return nil
+	}
+	start := len(e.Messages) - n
+	if start < 0 {
+		start = 0
+	}
+	result := make([]types.Message, len(e.Messages)-start)
+	copy(result, e.Messages[start:])
+	return result
+}
+
 // ClearMessages 清空对话历史
 func (e *QueryEngine) ClearMessages() {
 	e.mu.Lock()

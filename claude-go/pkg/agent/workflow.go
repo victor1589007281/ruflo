@@ -324,9 +324,18 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 	}
 }
 
-// executeAdversarialDev 对抗式开发流水线:
-// design → [implement ↔ evaluate 对抗循环, 最多 N 轮] → test
-// 融合3层Harness: L1 Generator/Evaluator, L2 RuleEngine 内置检查, L3 上下文管理。
+// executeAdversarialDev 对抗式开发流水线 (泛化版，适用于 development 和 creative 等):
+//
+// 三阶段模型:
+//   Phase 1: 设计阶段 (无依赖的起始阶段)
+//   Phase 2: [Generator ↔ Evaluator] 对抗循环，最多 N 轮
+//   Phase 3: 并行收尾阶段 (test, post-production 等)
+//
+// 阶段角色通过结构特征自动发现，不硬编码阶段名:
+//   - Design  = 无依赖的第一个阶段
+//   - Generator = 依赖 design 的中间阶段 (可能多个，按依赖链排序)
+//   - Evaluator = prompt 中包含 JSON 评分格式的阶段
+//   - Parallel = Parallel: true 的收尾阶段
 func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	var allResults []StageResult
 	prevResults := make(map[string]string)
@@ -336,115 +345,179 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 		maxRounds = 3
 	}
 
-	// 找到各阶段定义
-	var designStage, implStage, evalStage *StageDef
-	var parallelStages []StageDef
-	for i := range wf.Stages {
-		switch wf.Stages[i].Name {
-		case "design":
-			designStage = &wf.Stages[i]
-		case "implement":
-			implStage = &wf.Stages[i]
-		case "evaluate":
-			evalStage = &wf.Stages[i]
-		default:
-			if wf.Stages[i].Parallel {
-				parallelStages = append(parallelStages, wf.Stages[i])
-			}
-		}
-	}
+	// === 动态发现阶段角色 ===
+	designStages, generatorStages, evalStage, parallelStages := classifyStages(wf.Stages)
 
-	// Phase 1: Design
-	if designStage != nil {
-		we.notify(we.chatID, "📐 Phase 1: 架构设计...")
-		sr := we.executeStage(ctx, *designStage, objective, prevResults, team)
-		allResults = append(allResults, sr)
-		if sr.Status != TaskCompleted {
-			return allResults, fmt.Errorf("设计阶段失败: %s", sr.Error)
-		}
-		prevResults["design"] = sr.Output
-	}
-
-	// Phase 2: Adversarial Implement ↔ Evaluate loop
-	we.notify(we.chatID, fmt.Sprintf("⚔️ Phase 2: 对抗式开发 (最多 %d 轮)...", maxRounds))
-	var lastImplOutput string
-	var lastEvalFeedback string
-
-	for round := 1; round <= maxRounds; round++ {
-		if ctx.Err() != nil {
-			return allResults, ctx.Err()
-		}
-
-		// Generator: implement
-		if implStage != nil {
-			feedbackSection := ""
-			if lastEvalFeedback != "" {
-				feedbackSection = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastEvalFeedback)
-			}
-			modifiedPrompt := strings.ReplaceAll(implStage.Prompt, "{adversarial_feedback}", feedbackSection)
-			tempStage := *implStage
-			tempStage.Prompt = modifiedPrompt
-			tempStage.Name = fmt.Sprintf("implement-round%d", round)
-
-			we.notify(we.chatID, fmt.Sprintf("🔨 对抗第 %d/%d 轮 — Generator 实现中...", round, maxRounds))
-			sr := we.executeStage(ctx, tempStage, objective, prevResults, team)
-			sr.Name = fmt.Sprintf("implement-round%d", round)
+	// Phase 1: 设计阶段 (可能有多个串行 design 阶段，如 creative-brief → prompt-engineer)
+	if len(designStages) > 0 {
+		we.notify(we.chatID, fmt.Sprintf("📐 Phase 1: 设计/策划 (%d 阶段)...", len(designStages)))
+		for _, ds := range designStages {
+			sr := we.executeStage(ctx, ds, objective, prevResults, team)
 			allResults = append(allResults, sr)
 			if sr.Status != TaskCompleted {
-				return allResults, fmt.Errorf("实现阶段第 %d 轮失败: %s", round, sr.Error)
+				return allResults, fmt.Errorf("设计阶段 %s 失败: %s", ds.Name, sr.Error)
 			}
-			lastImplOutput = sr.Output
-			prevResults["implement"] = sr.Output
+			prevResults[ds.Name] = sr.Output
 		}
+	}
 
-		// Evaluator: evaluate
-		if evalStage != nil {
-			evalPrevResults := map[string]string{"implement": lastImplOutput}
-			modifiedPrompt := strings.ReplaceAll(evalStage.Prompt, "{adversarial_round}", fmt.Sprintf("%d", round))
-			tempStage := *evalStage
-			tempStage.Prompt = modifiedPrompt
-			tempStage.Name = fmt.Sprintf("evaluate-round%d", round)
+	// Phase 2: Adversarial Generator ↔ Evaluator 对抗循环
+	if len(generatorStages) == 0 {
+		we.notify(we.chatID, "⚠️ 未发现 Generator 阶段，跳过对抗循环")
+	} else {
+		we.notify(we.chatID, fmt.Sprintf("⚔️ Phase 2: 对抗循环 (最多 %d 轮)...", maxRounds))
+		var lastGenOutput string
+		var lastEvalFeedback string
 
-			we.notify(we.chatID, fmt.Sprintf("🔍 对抗第 %d/%d 轮 — Evaluator 审查中...", round, maxRounds))
-			sr := we.runAgent(ctx, evalStage.Role, buildStagePromptWithRoles(tempStage, objective, evalPrevResults, we.roles), team)
-			sr.Name = fmt.Sprintf("evaluate-round%d", round)
-			allResults = append(allResults, sr)
+		for round := 1; round <= maxRounds; round++ {
+			if ctx.Err() != nil {
+				return allResults, ctx.Err()
+			}
 
-			if sr.Status == TaskCompleted {
-				score, _ := ParseEvalScoreJSON([]byte(sr.Output))
-				if team.Blackboard != nil {
-					team.Blackboard.Write(fmt.Sprintf("eval-round%d-score", round),
-						fmt.Sprintf("正确性:%.0f 完整性:%.0f 安全性:%.0f 代码质量:%.0f 通过:%v",
-							score.Correctness, score.Completeness, score.Security, score.CodeQuality, score.Pass),
-						"evaluator", "score")
+			// Generator: 执行所有 generator 阶段
+			for _, genStage := range generatorStages {
+				feedbackSection := ""
+				if lastEvalFeedback != "" {
+					feedbackSection = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastEvalFeedback)
 				}
+				modifiedPrompt := strings.ReplaceAll(genStage.Prompt, "{adversarial_feedback}", feedbackSection)
+				tempStage := genStage
+				tempStage.Prompt = modifiedPrompt
+				tempStage.Name = fmt.Sprintf("%s-round%d", genStage.Name, round)
 
-				we.notify(we.chatID, fmt.Sprintf("📊 第 %d 轮评分: 正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f | %s",
-					round, score.Correctness, score.Completeness, score.Security, score.CodeQuality,
-					map[bool]string{true: "✅ 通过", false: "❌ 未通过"}[score.MeetsHardPassThreshold()]))
+				we.notify(we.chatID, fmt.Sprintf("🔨 对抗第 %d/%d 轮 — %s (%s) 执行中...", round, maxRounds, genStage.Name, genStage.Role))
+				sr := we.executeStage(ctx, tempStage, objective, prevResults, team)
+				sr.Name = tempStage.Name
+				allResults = append(allResults, sr)
+				if sr.Status != TaskCompleted {
+					return allResults, fmt.Errorf("%s 第 %d 轮失败: %s", genStage.Name, round, sr.Error)
+				}
+				lastGenOutput = sr.Output
+				prevResults[genStage.Name] = sr.Output
+			}
 
-				if score.MeetsHardPassThreshold() {
-					we.notify(we.chatID, fmt.Sprintf("✅ 对抗通过！第 %d 轮评审达标。", round))
-					break
+			// Evaluator
+			if evalStage != nil {
+				genName := generatorStages[len(generatorStages)-1].Name
+				evalPrevResults := map[string]string{genName: lastGenOutput}
+				for k, v := range prevResults {
+					evalPrevResults[k] = v
 				}
-				lastEvalFeedback = score.Feedback
-				if lastEvalFeedback == "" {
-					lastEvalFeedback = sr.Output
+				modifiedPrompt := strings.ReplaceAll(evalStage.Prompt, "{adversarial_round}", fmt.Sprintf("%d", round))
+				tempStage := *evalStage
+				tempStage.Prompt = modifiedPrompt
+				tempStage.Name = fmt.Sprintf("%s-round%d", evalStage.Name, round)
+
+				we.notify(we.chatID, fmt.Sprintf("🔍 对抗第 %d/%d 轮 — %s (%s) 审查中...", round, maxRounds, evalStage.Name, evalStage.Role))
+				sr := we.runAgent(ctx, evalStage.Role, buildStagePromptWithRoles(tempStage, objective, evalPrevResults, we.roles), team)
+				sr.Name = tempStage.Name
+				allResults = append(allResults, sr)
+
+				if sr.Status == TaskCompleted {
+					score, _ := ParseEvalScoreJSON([]byte(sr.Output))
+					if team.Blackboard != nil {
+						team.Blackboard.Write(fmt.Sprintf("eval-round%d-score", round),
+							fmt.Sprintf("正确性:%.0f 完整性:%.0f 安全性:%.0f 代码质量:%.0f 通过:%v",
+								score.Correctness, score.Completeness, score.Security, score.CodeQuality, score.Pass),
+							"evaluator", "score")
+					}
+
+					we.notify(we.chatID, fmt.Sprintf("📊 第 %d 轮评分: 正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f | %s",
+						round, score.Correctness, score.Completeness, score.Security, score.CodeQuality,
+						map[bool]string{true: "✅ 通过", false: "❌ 未通过"}[score.MeetsHardPassThreshold()]))
+
+					if score.MeetsHardPassThreshold() {
+						we.notify(we.chatID, fmt.Sprintf("✅ 对抗通过！第 %d 轮评审达标。", round))
+						break
+					}
+					lastEvalFeedback = score.Feedback
+					if lastEvalFeedback == "" {
+						lastEvalFeedback = sr.Output
+					}
+				} else {
+					lastEvalFeedback = "评估器未能正常返回结果，请全面检查输出质量。"
 				}
-			} else {
-				lastEvalFeedback = "评估器未能正常返回结果，请全面检查代码质量。"
 			}
 		}
 	}
 
-	// Phase 3: Parallel stages (test, etc.)
+	// Phase 3: 并行收尾阶段 (test, post-production 等)
 	if len(parallelStages) > 0 {
-		we.notify(we.chatID, "🧪 Phase 3: 测试...")
+		we.notify(we.chatID, fmt.Sprintf("🧪 Phase 3: 收尾阶段 (%d)...", len(parallelStages)))
 		testResults := we.executeParallel(ctx, parallelStages, objective, prevResults, team)
 		allResults = append(allResults, testResults...)
 	}
 
 	return allResults, nil
+}
+
+// classifyStages 根据工作流结构自动发现阶段角色。
+// 返回: design阶段列表, generator阶段列表, evaluator阶段(可为nil), parallel阶段列表。
+//
+// 分类算法:
+//  1. Evaluator = prompt 中包含 JSON 评分格式 ("correctness".*"pass") 的阶段
+//  2. Parallel = 标记 Parallel:true 且不是 Evaluator 的阶段
+//  3. Generator = 被 Evaluator 依赖且不是 design/parallel 的阶段
+//  4. Design = 其余阶段 (按依赖链拓扑排序，从无依赖到 generator 之前)
+// ClassifyStages 导出版本，供测试和外部调用。
+func ClassifyStages(stages []StageDef) (design []StageDef, generators []StageDef, eval *StageDef, parallel []StageDef) {
+	return classifyStages(stages)
+}
+
+func classifyStages(stages []StageDef) (design []StageDef, generators []StageDef, eval *StageDef, parallel []StageDef) {
+	isEval := make(map[string]bool)
+	isParallel := make(map[string]bool)
+	isGenerator := make(map[string]bool)
+
+	// Pass 1: 找 evaluator (prompt 中包含 JSON 评分格式)
+	for i := range stages {
+		if strings.Contains(stages[i].Prompt, `"correctness"`) && strings.Contains(stages[i].Prompt, `"pass"`) {
+			eval = &stages[i]
+			isEval[stages[i].Name] = true
+			break
+		}
+	}
+
+	// Pass 2: 找 parallel 收尾阶段
+	for i := range stages {
+		if stages[i].Parallel && !isEval[stages[i].Name] {
+			parallel = append(parallel, stages[i])
+			isParallel[stages[i].Name] = true
+		}
+	}
+
+	// Pass 3: 找 generator (被 evaluator 直接或间接依赖，且包含 {adversarial_feedback})
+	if eval != nil {
+		for _, dep := range eval.DependsOn {
+			for i := range stages {
+				if stages[i].Name == dep && !isEval[dep] && !isParallel[dep] {
+					isGenerator[dep] = true
+				}
+			}
+		}
+	}
+	// 也检查 prompt 中包含 {adversarial_feedback} 的阶段
+	for i := range stages {
+		if !isEval[stages[i].Name] && !isParallel[stages[i].Name] {
+			if strings.Contains(stages[i].Prompt, "{adversarial_feedback}") {
+				isGenerator[stages[i].Name] = true
+			}
+		}
+	}
+
+	// Pass 4: 分类 — 既不是 eval/parallel/generator 的就是 design
+	for _, s := range stages {
+		switch {
+		case isEval[s.Name], isParallel[s.Name]:
+			continue
+		case isGenerator[s.Name]:
+			generators = append(generators, s)
+		default:
+			design = append(design, s)
+		}
+	}
+
+	return
 }
 
 // executePipeline 串行流水线执行
@@ -768,11 +841,80 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 		return StageResult{Role: role, Status: TaskFailed, Error: err.Error(), StartedAt: start, Duration: duration.Round(time.Second).String()}
 	}
 
+	// 产出验证: 防止 Agent "角色扮演空转"（仅声明就绪但无实际产出）
+	if reason := validateAgentOutput(result, role); reason != "" {
+		we.notify(we.chatID, fmt.Sprintf("⚠️ Agent **%s** 产出不合格: %s — 标记为失败并重试", role, reason))
+		return StageResult{
+			Role: role, Status: TaskFailed,
+			Error:   fmt.Sprintf("产出验证失败: %s", reason),
+			Output:  result,
+			StartedAt: start, Duration: duration.Round(time.Second).String(),
+		}
+	}
+
 	return StageResult{
 		Role: role, Status: TaskCompleted,
 		Output: result, StartedAt: start,
 		Duration: duration.Round(time.Second).String(),
 	}
+}
+
+// validateAgentOutput 检查 Agent 产出是否有实质内容。
+// 返回 "" 表示通过，非空字符串为失败原因。
+// ValidateAgentOutput 导出版本，供测试和外部调用。
+func ValidateAgentOutput(output, role string) string {
+	return validateAgentOutput(output, role)
+}
+
+func validateAgentOutput(output, role string) string {
+	trimmed := strings.TrimSpace(output)
+
+	// 1. 基本长度检查 (有效产出通常 > 100 字符)
+	if len(trimmed) < 50 {
+		return "产出过短 (< 50 字符)，可能未实际执行任务"
+	}
+
+	// 2. 空转模式检测: 仅声明角色就绪、未提供实质内容
+	lower := strings.ToLower(trimmed)
+	idlePatterns := []string{
+		"i am ready", "i'm ready", "已就位", "已准备", "准备就绪",
+		"i understand my role", "i have been assigned",
+		"please provide", "please tell me", "请告诉我",
+		"waiting for", "等待指令", "等待进一步",
+		"now i have full understanding", "let me write",
+	}
+	idleCount := 0
+	for _, pat := range idlePatterns {
+		if strings.Contains(lower, pat) {
+			idleCount++
+		}
+	}
+
+	// 产出中 >50% 是角色声明/等待指令 → 空转
+	hasSubstantiveContent := false
+	substantiveMarkers := []string{
+		"```", "##", "func ", "class ", "def ", "import ", "const ", "var ",
+		"<svg", "<html", "<div", "export ", "package ", "module ",
+		"CREATE TABLE", "SELECT ", "INSERT ",
+		"步骤", "方案", "分析", "结论", "建议", "设计", "实现",
+	}
+	for _, marker := range substantiveMarkers {
+		if strings.Contains(trimmed, marker) {
+			hasSubstantiveContent = true
+			break
+		}
+	}
+
+	if idleCount >= 2 && !hasSubstantiveContent {
+		return "检测到角色扮演空转 (仅声明就绪/等待指令，无实质产出)"
+	}
+
+	// 3. 过短且无代码/结构化内容
+	if len(trimmed) < 200 && !hasSubstantiveContent {
+		return "产出过短且无结构化内容 (代码、文档、分析等)"
+	}
+
+	return ""
 }
 
 // antiLoopDirective 防死循环指令，注入到所有 agent prompt 中

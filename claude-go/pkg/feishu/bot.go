@@ -1615,6 +1615,10 @@ func (b *Bot) handleGoCommand(ctx context.Context, chatID, messageID, text strin
 		b.sendTextReply(ctx, messageID, fmt.Sprintf("创建失败: %v", err))
 		return
 	}
+
+	// 将当前会话的近期上下文注入团队 Blackboard，确保 Agent 有完整背景
+	b.injectSessionContext(chatID, team)
+
 	b.sendTextReply(ctx, messageID, fmt.Sprintf(
 		"🚀 快速启动:\n- 团队: **%s**\n- 工作流: %s\n- Agent数: %d\n- 目标: %s",
 		team.Name, workflow, len(team.Agents), objective))
@@ -1622,6 +1626,43 @@ func (b *Bot) handleGoCommand(ctx context.Context, chatID, messageID, text strin
 	if err := b.teamMgr.RunTeam(teamName, objective); err != nil {
 		b.sendTextMessage(ctx, chatID, fmt.Sprintf("启动失败: %v", err))
 	}
+}
+
+// injectSessionContext 从当前会话中提取近期对话上下文，写入团队 Blackboard。
+// 确保 Agent 能看到用户的完整背景（包括最近的对话历史摘要）。
+func (b *Bot) injectSessionContext(chatID string, team *agent.ProductionTeam) {
+	if team.Blackboard == nil {
+		return
+	}
+	sess := b.sessions.Get(chatID)
+	if sess == nil {
+		return
+	}
+
+	eng := sess.Engine
+	if eng == nil {
+		return
+	}
+	recentMsgs := eng.RecentMessages(5)
+	if len(recentMsgs) == 0 {
+		return
+	}
+
+	var sessionCtx strings.Builder
+	sessionCtx.WriteString("### 用户近期对话上下文 (团队启动前的对话)\n")
+	for _, m := range recentMsgs {
+		role := string(m.Type)
+		for _, block := range m.Content {
+			if block.Text != "" {
+				text := block.Text
+				if len(text) > 500 {
+					text = text[:500] + "...(截断)"
+				}
+				sessionCtx.WriteString(fmt.Sprintf("[%s]: %s\n", role, text))
+			}
+		}
+	}
+	team.Blackboard.Write("session-context", sessionCtx.String(), "system", "context")
 }
 
 // handleTeamCommand 处理 /team 命令族

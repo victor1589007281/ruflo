@@ -107,6 +107,8 @@ func (c *Coordinator) RunWithRecovery(
 	switch wf.Mode {
 	case "adversarial":
 		return executor.Execute(ctx, wf, objective, team)
+	case "adversarial_dev":
+		return executor.Execute(ctx, wf, objective, team)
 	default:
 		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 	}

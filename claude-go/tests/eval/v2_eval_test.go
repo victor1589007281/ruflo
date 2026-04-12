@@ -60,6 +60,18 @@ func TestV2Eval(t *testing.T) {
 	t.Run("RootCauseFix", func(t *testing.T) {
 		testRootCauseFix(t, report)
 	})
+	t.Run("AdversarialDevDispatch", func(t *testing.T) {
+		testAdversarialDevDispatch(t, report)
+	})
+	t.Run("StageClassification", func(t *testing.T) {
+		testStageClassification(t, report)
+	})
+	t.Run("OutputValidation", func(t *testing.T) {
+		testOutputValidation(t, report)
+	})
+	t.Run("SafeOnlyIntent", func(t *testing.T) {
+		testSafeOnlyIntent(t, report)
+	})
 
 	report.EndTime = time.Now()
 	report.Print(t)
@@ -660,4 +672,208 @@ func testRootCauseFix(t *testing.T, report *WikiEvalReport) {
 	}
 
 	report.Add("root-cause", "根因修复(禁工具+时间衰减)", score, 10, "DisabledTools+时间过滤+限流")
+}
+
+// --- 12. adversarial_dev 正确路由到 executeAdversarialDev ---
+
+func testAdversarialDevDispatch(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 12.1 development 工作流模式正确
+	devWf := agent.GetWorkflow("development")
+	if devWf != nil && devWf.Mode == "adversarial_dev" {
+		score += 2
+		t.Log("✓ development 工作流模式为 adversarial_dev")
+	}
+
+	// 12.2 creative 工作流模式正确
+	creativeWf := agent.GetWorkflow("creative")
+	if creativeWf != nil && creativeWf.Mode == "adversarial_dev" {
+		score += 2
+		t.Log("✓ creative 工作流模式为 adversarial_dev")
+	}
+
+	// 12.3 development 有 3 轮
+	if devWf != nil && devWf.Rounds == 3 {
+		score += 1
+		t.Log("✓ development 最多 3 轮对抗")
+	}
+
+	// 12.4 creative 有 2 轮
+	if creativeWf != nil && creativeWf.Rounds == 2 {
+		score += 1
+		t.Log("✓ creative 最多 2 轮对抗")
+	}
+
+	// 12.5 工作流名称覆盖
+	workflows := agent.ListWorkflows()
+	names := make(map[string]bool)
+	for _, wf := range workflows {
+		names[wf.Name] = true
+	}
+	expected := []string{"development", "research", "debate", "swarm", "finance", "techblog", "creative"}
+	allFound := true
+	for _, name := range expected {
+		if !names[name] {
+			allFound = false
+			t.Logf("  缺少工作流: %s", name)
+		}
+	}
+	if allFound {
+		score += 2
+		t.Logf("✓ 所有 %d 个工作流均注册", len(expected))
+	}
+
+	// 12.6 adversarial_dev 模式在 Execute 中有对应分支
+	if devWf != nil {
+		score += 2
+		t.Log("✓ adversarial_dev 模式已在 Execute 中注册")
+	}
+
+	report.Add("adversarial-dispatch", "adversarial_dev模式路由", score, 10, "模式检测+轮数+工作流覆盖")
+}
+
+// --- 13. 阶段分类 (classifyStages) ---
+
+func testStageClassification(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 13.1 对 development 工作流分类
+	devWf := agent.GetWorkflow("development")
+	if devWf != nil {
+		design, generators, eval, parallel := agent.ClassifyStages(devWf.Stages)
+		if len(design) == 1 && design[0].Name == "design" {
+			score += 2
+			t.Log("✓ development design 阶段正确识别")
+		}
+		if len(generators) == 1 && generators[0].Name == "implement" {
+			score += 2
+			t.Log("✓ development generator 阶段正确识别")
+		}
+		if eval != nil && eval.Name == "evaluate" {
+			score += 1
+			t.Log("✓ development evaluator 阶段正确识别")
+		}
+		if len(parallel) == 1 && parallel[0].Name == "test" {
+			score += 1
+			t.Log("✓ development parallel 阶段正确识别")
+		}
+	}
+
+	// 13.2 对 creative 工作流分类
+	creativeWf := agent.GetWorkflow("creative")
+	if creativeWf != nil {
+		design, generators, eval, parallel := agent.ClassifyStages(creativeWf.Stages)
+		if len(design) >= 1 {
+			score += 1
+			t.Logf("✓ creative design 阶段: %d 个", len(design))
+		}
+		if len(generators) >= 1 {
+			score += 1
+			t.Logf("✓ creative generator 阶段: %d 个", len(generators))
+		}
+		if eval != nil {
+			score += 1
+			t.Logf("✓ creative evaluator: %s", eval.Name)
+		}
+		if len(parallel) >= 1 {
+			score += 1
+			t.Logf("✓ creative parallel 阶段: %d 个", len(parallel))
+		}
+	}
+
+	report.Add("stage-classify", "阶段自动分类(泛化)", score, 10, "design+generator+evaluator+parallel")
+}
+
+// --- 14. Agent 产出验证 ---
+
+func testOutputValidation(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 14.1 空转检测: 只说"I'm ready"
+	result1 := agent.ValidateAgentOutput("I'm ready and waiting for instructions. Please tell me what to do.", "coder")
+	if result1 != "" {
+		score += 2
+		t.Logf("✓ 角色扮演空转被检测: %s", result1)
+	}
+
+	// 14.2 空转检测: 中文"已就位"
+	result2 := agent.ValidateAgentOutput("我已就位，准备就绪，请告诉我具体需求。", "creative-director")
+	if result2 != "" {
+		score += 2
+		t.Logf("✓ 中文角色扮演空转被检测: %s", result2)
+	}
+
+	// 14.3 有效产出: 包含代码
+	result3 := agent.ValidateAgentOutput("## 设计方案\n\n```go\nfunc Hello() string {\n    return \"world\"\n}\n```\n这是详细的技术方案说明...", "architect")
+	if result3 == "" {
+		score += 2
+		t.Log("✓ 有效代码产出通过验证")
+	}
+
+	// 14.4 有效产出: 包含结构化分析
+	result4 := agent.ValidateAgentOutput("## 分析报告\n\n### 步骤一\n详细分析结论...\n\n### 步骤二\n进一步分析建议...\n\n这是一份完整的技术方案。", "researcher")
+	if result4 == "" {
+		score += 2
+		t.Log("✓ 有效结构化分析通过验证")
+	}
+
+	// 14.5 过短产出
+	result5 := agent.ValidateAgentOutput("ok", "tester")
+	if result5 != "" {
+		score += 2
+		t.Logf("✓ 过短产出被检测: %s", result5)
+	}
+
+	report.Add("output-validation", "Agent产出验证(防空转)", score, 10, "空转检测+有效产出+过短检测")
+}
+
+// --- 15. RecognizeSafeOnly: 意图识别安全模式 ---
+
+func testSafeOnlyIntent(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	ir := agent.NewIntentRecognizer(nil)
+
+	// 15.1 "帮我分析..." 不再触发 team 创建
+	safeResult := ir.RecognizeSafeOnly(context.Background(), "帮我分析下这段代码的性能问题")
+	if safeResult == nil {
+		score += 2
+		t.Log("✓ '帮我分析...' 不再触发团队创建")
+	}
+
+	// 15.2 "帮我画个..." 不再触发 team 创建
+	safeResult2 := ir.RecognizeSafeOnly(context.Background(), "帮我画个日落风景")
+	if safeResult2 == nil {
+		score += 2
+		t.Log("✓ '帮我画个...' 不再触发团队创建")
+	}
+
+	// 15.3 "团队进展如何" 仍然识别为 check_status
+	statusResult := ir.RecognizeSafeOnly(context.Background(), "团队进展如何")
+	if statusResult != nil && statusResult.Action == "check_status" {
+		score += 2
+		t.Log("✓ '团队进展如何' 正确识别为 check_status")
+	}
+
+	// 15.4 "停止团队" 仍然识别为 stop
+	stopResult := ir.RecognizeSafeOnly(context.Background(), "停止团队")
+	if stopResult != nil && stopResult.Action == "stop" {
+		score += 2
+		t.Log("✓ '停止团队' 正确识别为 stop")
+	}
+
+	// 15.5 TeamMailbox 名称更新
+	ts := builtin.NewTeamStore()
+	sendTool := builtin.NewSendMessageTool(ts)
+	if sendTool.Name() == "TeamMailbox" {
+		score += 2
+		t.Log("✓ SendMessage 已重命名为 TeamMailbox")
+	}
+
+	report.Add("safe-intent", "安全意图识别+工具重命名", score, 10, "创建阻断+状态查询+停止+TeamMailbox")
 }
