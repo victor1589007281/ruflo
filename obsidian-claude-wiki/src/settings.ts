@@ -4,6 +4,8 @@ import type { LintResult } from "./lint-runner";
 /** 插件持久化配置：Git 路径、同步策略、Claude-Go API、提交身份 */
 export interface ClaudeWikiSettings {
   gitRepoPath: string;
+  gitUsername: string;
+  gitToken: string;
   autoSync: boolean;
   syncIntervalMinutes: number;
   claudeGoApiUrl: string;
@@ -15,6 +17,8 @@ export interface ClaudeWikiSettings {
 
 export const DEFAULT_SETTINGS: ClaudeWikiSettings = {
   gitRepoPath: "",
+  gitUsername: "",
+  gitToken: "",
   autoSync: false,
   syncIntervalMinutes: 30,
   claudeGoApiUrl: "http://127.0.0.1:8080",
@@ -46,6 +50,8 @@ export interface ClaudeWikiPluginApi {
   runVaultLint(): Promise<LintResult>;
   runApiLint(): Promise<LintResult | null>;
   syncWikiRepo(): Promise<void>;
+  organizeWiki(mode: "full" | "incremental"): Promise<{ updated_pages: number; log: string }>;
+  openIngestUrlModal(): void;
   recordSyncSuccess(): Promise<void>;
   recordIngest(entry: WikiIngestRecord): Promise<void>;
   openDashboard(): Promise<void>;
@@ -79,6 +85,31 @@ export class ClaudeWikiSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
+
+    new Setting(containerEl)
+      .setName("Git 用户名")
+      .setDesc("Gitee/GitHub 用户名（用于 HTTPS 认证）")
+      .addText((text) =>
+        text
+          .setPlaceholder("your-username")
+          .setValue(this.plugin.settings.gitUsername)
+          .onChange(async (v) => {
+            this.plugin.settings.gitUsername = v.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Git Token/密码")
+      .setDesc("Gitee 私人令牌 或 GitHub Personal Access Token")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text.setValue(this.plugin.settings.gitToken);
+        return text.onChange(async (v) => {
+          this.plugin.settings.gitToken = v;
+          await this.plugin.saveSettings();
+        });
+      });
 
     new Setting(containerEl)
       .setName("自动同步")

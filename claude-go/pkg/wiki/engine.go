@@ -152,6 +152,7 @@ var (
 // LLMClient 定义 Wiki 引擎对 LLM 的最小依赖，与 api.Client.SimpleComplete 兼容。
 type LLMClient interface {
 	SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+	RawComplete(ctx context.Context, contentJSON json.RawMessage, maxTokens int) (string, error)
 }
 
 // Engine 是 LLM Wiki 知识库的运行时入口，负责摄取、查询与质检。
@@ -246,6 +247,20 @@ func (e *Engine) completeLLM(ctx context.Context, systemPrompt, userPrompt strin
 		return e.llm.SimpleComplete(ctx, systemPrompt, userPrompt)
 	}
 	return callLLM(ctx, e.httpClient, e.APIKey, e.BaseURL, e.Model, systemPrompt, userPrompt)
+}
+
+// completeLLMWithMaxTokens 使用指定的 maxTokens 调用 LLM。
+func (e *Engine) completeLLMWithMaxTokens(ctx context.Context, systemPrompt, userPrompt string, maxTokens int) (string, error) {
+	if e.llm != nil {
+		contentJSON := json.RawMessage(`[{"type":"text","text":` + string(mustMarshalString(userPrompt)) + `}]`)
+		return e.llm.RawComplete(ctx, contentJSON, maxTokens)
+	}
+	return callLLM(ctx, e.httpClient, e.APIKey, e.BaseURL, e.Model, systemPrompt, userPrompt)
+}
+
+func mustMarshalString(s string) json.RawMessage {
+	data, _ := json.Marshal(s)
+	return data
 }
 
 // EnsureRepo 若目录或 Git 结构不完整则初始化：创建 raw/wiki/schema、写入默认 schema.yaml，并在需要时 git init。
@@ -705,6 +720,35 @@ func buildWikiContextBundle(repoDir string, maxRunes int) (string, error) {
 	return b.String(), nil
 }
 
+// buildWikiIndexOnly 只返回 wiki 页面目录列表，不包含内容。
+func buildWikiIndexOnly(repoDir string) (string, error) {
+	wikiDir := filepath.Join(repoDir, "wiki")
+	ents, err := os.ReadDir(wikiDir)
+	if err != nil {
+		return "", fmt.Errorf("wiki: 读取 wiki: %w", err)
+	}
+	var names []string
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(e.Name()), ".md") {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) == 0 {
+		return "（当前 wiki 目录为空）", nil
+	}
+	var b strings.Builder
+	b.WriteString("页面列表:\n")
+	for _, n := range names {
+		b.WriteString("- ")
+		b.WriteString(n)
+		b.WriteByte('\n')
+	}
+	return b.String(), nil
+}
+
 func truncateRunes(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
@@ -728,7 +772,7 @@ const (
 5. **去重与合并**: 如果有重复或高度相似的页面，标注合并建议
 6. **填补空缺**: 识别被引用但不存在的概念页，为其创建基础框架
 
-输出 JSON:
+重要：请输出紧凑的 JSON（无多余空格和换行），确保能在输出限制内完成：
 {"pages":[{"slug":"...","title":"...","body_markdown":"..."}],"log":"整理日志摘要"}`
 
 	incrementalOrganizePrompt = `你是「LLM Wiki」的增量维护者。以下是最近新增的 raw 文件和当前 wiki 的页面目录。
@@ -866,11 +910,12 @@ func (e *Engine) Organize(ctx context.Context) (*OrganizeResult, error) {
 		return nil, err
 	}
 
-	bundle, err := buildWikiContextBundle(e.RepoDir, 20000)
+	// 使用仅目录模式减少输入，给 LLM 输出留更多空间
+	bundle, err := buildWikiIndexOnly(e.RepoDir)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := e.completeLLM(ctx, organizeSystemPrompt, bundle)
+	resp, err := e.completeLLMWithMaxTokens(ctx, organizeSystemPrompt, bundle, 16384)
 	if err != nil {
 		return nil, fmt.Errorf("wiki: LLM 整理: %w", err)
 	}
@@ -926,11 +971,11 @@ func (e *Engine) HealthCheck(ctx context.Context) (*HealthReport, error) {
 		return nil, err
 	}
 
-	bundle, err := buildWikiContextBundle(e.RepoDir, 20000)
+	bundle, err := buildWikiContextBundle(e.RepoDir, 4000)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := e.completeLLM(ctx, healthCheckPrompt, bundle)
+	resp, err := e.completeLLMWithMaxTokens(ctx, healthCheckPrompt, bundle, 8192)
 	if err != nil {
 		return nil, fmt.Errorf("wiki: LLM 健康检查: %w", err)
 	}

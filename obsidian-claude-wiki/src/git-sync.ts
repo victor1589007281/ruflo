@@ -13,26 +13,36 @@ function unwrapGitMod(m: unknown): GitModule {
 }
 
 /**
- * 将 SSH Git URL 转换为 HTTPS URL。
+ * 将 SSH Git URL 转换为 HTTPS URL，并可选嵌入认证信息。
  * isomorphic-git 不支持 SSH 协议，必须转换。
  *
  * 例: git@github.com:user/repo.git → https://github.com/user/repo.git
  * 例: ssh://git@github.com/user/repo.git → https://github.com/user/repo.git
+ * 例: 带认证: https://username:token@gitee.com/user/repo.git
  */
-function sshToHttps(url: string): string {
+function sshToHttps(url: string, username?: string, token?: string): string {
+  let httpsUrl = url;
+
   // ssh://git@github.com/user/repo.git
   const sshProtoRe = /^ssh:\/\/(?:[^@]+@)?([^/]+)\/(.*)/;
   const sshProtoMatch = url.match(sshProtoRe);
   if (sshProtoMatch) {
-    return `https://${sshProtoMatch[1]}/${sshProtoMatch[2]}`;
+    httpsUrl = `https://${sshProtoMatch[1]}/${sshProtoMatch[2]}`;
+  } else {
+    // git@github.com:user/repo.git
+    const scpRe = /^(?:[^@]+@)?([^:]+):(.+)/;
+    const scpMatch = url.match(scpRe);
+    if (scpMatch && !url.includes("://")) {
+      httpsUrl = `https://${scpMatch[1]}/${scpMatch[2]}`;
+    }
   }
-  // git@github.com:user/repo.git
-  const scpRe = /^(?:[^@]+@)?([^:]+):(.+)/;
-  const scpMatch = url.match(scpRe);
-  if (scpMatch && !url.includes("://")) {
-    return `https://${scpMatch[1]}/${scpMatch[2]}`;
+
+  // 如果有用户名和 token，嵌入到 URL 中
+  if (username && token) {
+    httpsUrl = httpsUrl.replace(/^https:\/\//, `https://${encodeURIComponent(username)}:${encodeURIComponent(token)}@`);
   }
-  return url;
+
+  return httpsUrl;
 }
 
 /**
@@ -138,14 +148,23 @@ export class GitSync {
   }
 
   /**
-   * 解析 remote URL，自动将 SSH 转换为 HTTPS。
+   * 解析 remote URL，自动将 SSH 转换为 HTTPS，并嵌入认证信息。
    */
   private resolveUrl(url: string): string {
     if (isSshUrl(url)) {
+      const converted = sshToHttps(url, this.settings.gitUsername, this.settings.gitToken);
       console.warn(
-        `[Claude Wiki] SSH URL 不被 isomorphic-git 支持，自动转换为 HTTPS: ${url} → ${sshToHttps(url)}`
+        `[Claude Wiki] SSH URL 不被 isomorphic-git 支持，自动转换为 HTTPS: ${url} → ${converted.replace(/:\w+@/, ':****@')}`
       );
-      return sshToHttps(url);
+      return converted;
+    }
+    // 如果已经是 HTTPS URL 但有认证信息需要嵌入
+    if (this.settings.gitUsername && this.settings.gitToken && url.startsWith("https://")) {
+      // 检查是否已经有认证信息
+      if (!url.match(/^https:\/\/[^@]+@/)) {
+        const converted = url.replace(/^https:\/\//, `https://${encodeURIComponent(this.settings.gitUsername)}:${encodeURIComponent(this.settings.gitToken)}@`);
+        return converted;
+      }
     }
     return url;
   }
@@ -173,13 +192,16 @@ export class GitSync {
     const dir = this.repoPath;
     const ref = this.settings.defaultBranch || "main";
 
-    // 读取并转换 remote URL
+    // 读取并转换 remote URL (SSH -> HTTPS)
     let remoteUrl: string | undefined;
     try {
       const remotes = await git.listRemotes({ fs, dir });
       const origin = remotes.find(r => r.remote === "origin");
-      if (origin && isSshUrl(origin.url)) {
-        remoteUrl = sshToHttps(origin.url);
+      if (origin) {
+        remoteUrl = this.resolveUrl(origin.url);
+        if (isSshUrl(origin.url)) {
+          console.warn(`[Claude Wiki] SSH URL 自动转换为 HTTPS: ${origin.url} → ${remoteUrl.replace(/:\w+@/, ':****@')}`);
+        }
       }
     } catch { /* 忽略 */ }
 
@@ -216,13 +238,16 @@ export class GitSync {
       if (!/nothing to commit|No changes/i.test(msg)) throw e;
     }
 
-    // 读取并转换 remote URL
+    // 读取并转换 remote URL (SSH -> HTTPS)
     let remoteUrl: string | undefined;
     try {
       const remotes = await git.listRemotes({ fs, dir });
       const origin = remotes.find(r => r.remote === "origin");
-      if (origin && isSshUrl(origin.url)) {
-        remoteUrl = sshToHttps(origin.url);
+      if (origin) {
+        remoteUrl = this.resolveUrl(origin.url);
+        if (isSshUrl(origin.url)) {
+          console.warn(`[Claude Wiki] SSH URL 自动转换为 HTTPS: ${origin.url} → ${remoteUrl.replace(/:\w+@/, ':****@')}`);
+        }
       }
     } catch { /* 忽略 */ }
 

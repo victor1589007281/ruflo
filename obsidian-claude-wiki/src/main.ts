@@ -74,12 +74,7 @@ export default class ClaudeWikiPlugin extends Plugin implements ClaudeWikiPlugin
     this.addCommand({
       id: "extract-link-to-raw",
       name: "Extract Link to Raw",
-      callback: () => {
-        const modal = new IngestUrlModal(this.app, (url) => {
-          void this.runExtractToRaw(url);
-        });
-        modal.open();
-      },
+      callback: () => this.openIngestUrlModal(),
     });
 
     this.addCommand({
@@ -117,6 +112,28 @@ export default class ClaudeWikiPlugin extends Plugin implements ClaudeWikiPlugin
       id: "trigger-wiki-maintenance",
       name: "Trigger Wiki Maintenance",
       callback: () => void this.triggerWikiMaintenance(),
+    });
+
+    this.addCommand({
+      id: "organize-wiki-full",
+      name: "Organize Wiki (Full)",
+      callback: () => {
+        void this.organizeWiki("full").then(
+          (r) => new Notice(`Wiki 全量整理完成: 更新 ${r.updated_pages} 个页面`),
+          (e) => new Notice(`整理失败：${e instanceof Error ? e.message : String(e)}`)
+        );
+      },
+    });
+
+    this.addCommand({
+      id: "organize-wiki-incremental",
+      name: "Organize Wiki (Incremental)",
+      callback: () => {
+        void this.organizeWiki("incremental").then(
+          (r) => new Notice(`Wiki 增量整理完成: 更新 ${r.updated_pages} 个页面`),
+          (e) => new Notice(`整理失败：${e instanceof Error ? e.message : String(e)}`)
+        );
+      },
     });
 
     await this.applyAutoSyncFromSettings();
@@ -186,6 +203,24 @@ export default class ClaudeWikiPlugin extends Plugin implements ClaudeWikiPlugin
     this.recentIngests = [entry, ...this.recentIngests].slice(0, 50);
     await this.persistAll();
     this.refreshDashboardView();
+  }
+
+  async organizeWiki(mode: "full" | "incremental"): Promise<{ updated_pages: number; log: string }> {
+    const base = this.settings.claudeGoApiUrl?.trim();
+    if (!base) {
+      throw new Error("请配置 Claude-Go API 地址");
+    }
+    const client = new ApiClient(base, this.settings.claudeGoApiKey);
+    const result = await client.organize(mode);
+    this.refreshDashboardView();
+    return result;
+  }
+
+  openIngestUrlModal(): void {
+    const modal = new IngestUrlModal(this.app, (url) => {
+      void this.runExtractToRaw(url);
+    });
+    modal.open();
   }
 
   async openDashboard(): Promise<void> {

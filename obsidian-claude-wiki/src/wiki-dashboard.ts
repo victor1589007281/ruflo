@@ -100,6 +100,10 @@ export class WikiDashboardView extends ItemView {
       );
     });
 
+    row.createEl("button", { text: "抓取链接" }).addEventListener("click", () => {
+      this.plugin.openIngestUrlModal();
+    });
+
     row.createEl("button", { text: "同步 Wiki（Git）" }).addEventListener("click", () => {
       void this.plugin.syncWikiRepo().then(
         () => {
@@ -107,6 +111,26 @@ export class WikiDashboardView extends ItemView {
           void this.render();
         },
         (e) => new Notice(`同步失败：${e instanceof Error ? e.message : String(e)}`)
+      );
+    });
+
+    row.createEl("button", { text: "整理 Wiki（全量）" }).addEventListener("click", () => {
+      void this.plugin.organizeWiki("full").then(
+        (r) => {
+          new Notice(`全量整理完成：更新 ${r.updated_pages} 个页面`);
+          void this.render();
+        },
+        (e) => new Notice(`整理失败：${e instanceof Error ? e.message : String(e)}`)
+      );
+    });
+
+    row.createEl("button", { text: "整理 Wiki（增量）" }).addEventListener("click", () => {
+      void this.plugin.organizeWiki("incremental").then(
+        (r) => {
+          new Notice(`增量整理完成：更新 ${r.updated_pages} 个页面`);
+          void this.render();
+        },
+        (e) => new Notice(`整理失败：${e instanceof Error ? e.message : String(e)}`)
       );
     });
   }
