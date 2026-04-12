@@ -201,6 +201,13 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		IsNonInteractive: true, // 飞书模式始终为非交互式
 		Debug:            sm.config.Debug,
 		DynamicPlanCheck: builtin.PlanModeActive,
+		// 飞书会话中禁止 LLM 自主调用团队工具。
+		// 团队操作只能通过意图识别层或 /team 命令触发，
+		// 防止 LLM 基于历史上下文自主创建"幽灵团队"。
+		DisabledTools: map[string]bool{
+			"TeamCreate": true,
+			"TeamDelete": true,
+		},
 	}
 
 	// 注册 Agent 工具 (对应 TS: AgentTool → runAgent → 嵌套 queryLoop)

@@ -82,6 +82,10 @@ type Config struct {
 	// 当 LLM 调用 EnterPlanMode 时返回 true, 引擎自动切换到只读权限。
 	// 对应 TS: QueryEngine 中 permissionMode 与 PlanModeActive 联动。
 	DynamicPlanCheck func() bool
+	// DisabledTools 禁用的工具名列表。
+	// queryLoop 在构建 API 请求时过滤掉这些工具，防止 LLM 自主调用。
+	// 用途: 飞书 processAndReply 场景下禁止 LLM 自主创建/删除团队。
+	DisabledTools map[string]bool
 }
 
 // NewQueryEngine 创建查询引擎
@@ -232,9 +236,8 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// ============================================================
 		systemPrompt := e.PromptMgr.BuildEffectiveSystemPrompt(e.Tools)
 
-		// [NEW] 注入相关记忆到系统提示词
-		// 对应 TS: getRelevantMemoryAttachments → <system-reminder> 注入
-		if e.MemoryStore != nil && e.MemoryStore.Count() > 0 && len(messages) > 0 {
+		// 仅在首轮注入相关记忆（避免多轮 tool_use 循环中反复注入膨胀上下文）
+		if turnCount == 0 && e.MemoryStore != nil && e.MemoryStore.Count() > 0 && len(messages) > 0 {
 			lastUserText := ""
 			for i := len(messages) - 1; i >= 0; i-- {
 				if messages[i].Type == types.MessageTypeUser {
@@ -249,8 +252,15 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 			if lastUserText != "" {
 				relevant := e.MemoryStore.Retrieve(lastUserText, 5)
-				if len(relevant) > 0 {
-					memPrompt := memory.FormatForPrompt(relevant)
+				// 过滤超过 2 小时的记忆，降低历史上下文对当前对话的干扰
+				var fresh []*memory.MemoryEntry
+				for _, m := range relevant {
+					if time.Since(m.CreatedAt) < 2*time.Hour {
+						fresh = append(fresh, m)
+					}
+				}
+				if len(fresh) > 0 {
+					memPrompt := memory.FormatForPrompt(fresh)
 					if len(systemPrompt) > 0 {
 						systemPrompt[0] += "\n" + memPrompt
 					}
@@ -263,7 +273,17 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 对应 TS: while(attemptWithFallback) + for await(callModel(...))
 		// ============================================================
 		apiMessages := messagesToAPI(messages)
-		apiTools := e.Tools.APITools()
+		allTools := e.Tools.APITools()
+		var apiTools []types.APITool
+		if len(e.Config.DisabledTools) > 0 {
+			for _, t := range allTools {
+				if !e.Config.DisabledTools[t.Name] {
+					apiTools = append(apiTools, t)
+				}
+			}
+		} else {
+			apiTools = allTools
+		}
 
 		eventCh, errCh := e.APIClient.StreamMessage(ctx, apiMessages, systemPrompt, apiTools, e.Config.MaxTokens)
 
@@ -487,6 +507,35 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// ============================================================
 		// Phase 5b: 有 tool_use → 执行工具
 		// ============================================================
+
+		// 拦截被禁用的工具调用 — 将其替换为错误结果，不实际执行
+		if len(e.Config.DisabledTools) > 0 {
+			var allowedToolUse []types.ContentBlock
+			for _, block := range toolUseBlocks {
+				if e.Config.DisabledTools[block.Name] {
+					// 返回错误结果给 LLM，让它知道此工具不可用
+					errResult := types.Message{
+						Type: types.MessageTypeUser,
+						UUID: generateUUID(),
+						Content: []types.ContentBlock{{
+							Type:      types.ContentBlockToolResult,
+							ToolUseID: block.ID,
+							Content:   fmt.Sprintf("工具 %s 在当前会话中不可用。团队操作请通过 /team 命令或意图识别完成。", block.Name),
+							IsError:   true,
+						}},
+						CreatedAt: time.Now(),
+					}
+					ch <- errResult
+					messages = append(messages, errResult)
+				} else {
+					allowedToolUse = append(allowedToolUse, block)
+				}
+			}
+			toolUseBlocks = allowedToolUse
+			if len(toolUseBlocks) == 0 {
+				continue // 所有工具都被禁用，回到循环让 LLM 重新回复
+			}
+		}
 
 		// maxTurns 检查 (在 tool 执行后检查, 对应 TS)
 		turnCount++

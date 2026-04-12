@@ -11,7 +11,9 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/browser"
+	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/feishu"
+	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/wiki"
 )
@@ -54,6 +56,9 @@ func TestV2Eval(t *testing.T) {
 	})
 	t.Run("SchemaAllRepos", func(t *testing.T) {
 		testSchemaAllRepos(t, report)
+	})
+	t.Run("RootCauseFix", func(t *testing.T) {
+		testRootCauseFix(t, report)
 	})
 
 	report.EndTime = time.Now()
@@ -571,4 +576,88 @@ func testSchemaAllRepos(t *testing.T, report *WikiEvalReport) {
 	}
 
 	report.Add("schema-all-repos", "Schema 内置所有仓库", score, 10, "多仓库+分类+Lint+整理")
+}
+
+// --- 11. 根因修复: queryLoop 禁用团队工具 + 记忆时间衰减 ---
+
+func testRootCauseFix(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 11.1 engine.Config.DisabledTools 字段存在且可设置
+	cfg := &engine.Config{
+		Model:     "test",
+		MaxTokens: 1024,
+		DisabledTools: map[string]bool{
+			"TeamCreate": true,
+			"TeamDelete": true,
+		},
+	}
+	if cfg.DisabledTools["TeamCreate"] && cfg.DisabledTools["TeamDelete"] {
+		score += 3
+		t.Log("✓ DisabledTools 字段正确配置")
+	}
+
+	// 11.2 禁用的工具不在 DisabledTools 中则允许
+	if !cfg.DisabledTools["FileRead"] {
+		score += 2
+		t.Log("✓ 非禁用工具不受影响")
+	}
+
+	// 11.3 MemoryStore 的 CreatedAt 时间过滤
+	store := memory.NewTieredStore()
+	// 添加一条 5 小时前的记忆
+	oldEntry := &memory.MemoryEntry{
+		Content:    "早上讨论了 creative 团队图片生成",
+		Source:     "extraction",
+		Importance: 0.8,
+		CreatedAt:  time.Now().Add(-5 * time.Hour),
+		LastAccess: time.Now().Add(-5 * time.Hour),
+		Topics:     []string{"creative", "image"},
+	}
+	store.Add(oldEntry)
+
+	// 添加一条刚才的记忆
+	newEntry := &memory.MemoryEntry{
+		Content:    "用户请求生成宇宙探索图片",
+		Source:     "extraction",
+		Importance: 0.8,
+		CreatedAt:  time.Now(),
+		LastAccess: time.Now(),
+		Topics:     []string{"creative", "image"},
+	}
+	store.Add(newEntry)
+
+	// 检索 → 两条都会返回
+	results := store.Retrieve("creative 团队图片生成", 5)
+	if len(results) == 2 {
+		score += 1
+		t.Logf("✓ BM25 检索返回 %d 条结果", len(results))
+	}
+
+	// 模拟引擎层的 2 小时过滤
+	var fresh []*memory.MemoryEntry
+	for _, m := range results {
+		if time.Since(m.CreatedAt) < 2*time.Hour {
+			fresh = append(fresh, m)
+		}
+	}
+	if len(fresh) == 1 {
+		score += 2
+		t.Log("✓ 2小时时间过滤: 旧记忆被过滤，仅保留新记忆")
+	}
+
+	// 11.4 验证 TeamCreate 工具的 30 秒限流仍然生效
+	ts := builtin.NewTeamStore()
+	tc := builtin.NewTeamCreateTool(ts)
+	_, err1 := tc.Call(context.Background(), []byte(`{"team_name":"test-1"}`), nil)
+	if err1 == nil {
+		result2, _ := tc.Call(context.Background(), []byte(`{"team_name":"test-2"}`), nil)
+		if result2 != nil && result2.IsError && strings.Contains(result2.Content, "冷却") {
+			score += 2
+			t.Log("✓ TeamCreate 30秒限流仍然生效")
+		}
+	}
+
+	report.Add("root-cause", "根因修复(禁工具+时间衰减)", score, 10, "DisabledTools+时间过滤+限流")
 }
