@@ -283,6 +283,9 @@ type JSONConfig struct {
 	// Wiki LLM Wiki 知识库配置
 	Wiki *WikiSection `json:"wiki,omitempty"`
 
+	// Browser 浏览器自动化配置 (CDP)
+	Browser *BrowserSection `json:"browser,omitempty"`
+
 	// StateDir 数据根目录
 	StateDir string `json:"stateDir,omitempty"`
 }
@@ -307,6 +310,12 @@ type DreamingSection struct {
 	Enabled     *bool `json:"enabled,omitempty"`
 	MinHours    int   `json:"minHours,omitempty"`
 	MinSessions int   `json:"minSessions,omitempty"`
+}
+
+// BrowserSection 浏览器抓取配置段 (JSON)
+type BrowserSection struct {
+	ChromePath string `json:"chromePath,omitempty"`
+	ProxyURL   string `json:"proxyUrl,omitempty"`
 }
 
 // FeishuSection 飞书配置段
@@ -496,6 +505,15 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		}
 		if jc.Wiki.APISecret != "" {
 			bc.Wiki.APISecret = jc.Wiki.APISecret
+		}
+	}
+
+	if jc.Browser != nil {
+		if jc.Browser.ChromePath != "" {
+			bc.Browser.ChromePath = jc.Browser.ChromePath
+		}
+		if jc.Browser.ProxyURL != "" {
+			bc.Browser.ProxyURL = jc.Browser.ProxyURL
 		}
 	}
 }

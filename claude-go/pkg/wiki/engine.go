@@ -994,11 +994,7 @@ const (
 - 核心内容不少于 200 字
 - 不编造 raw 中不存在的事实
 - 分类和标签只能从 schema.categories 中选择
-- 输出紧凑 JSON，确保在输出限制内完成
-- 如果页面过多，分批返回最需要更新的（优先级: P1 > P2 > P3）
-
-输出:
-{"pages":[{"slug":"...","title":"...","body_markdown":"..."}],"log":"整理日志摘要"}`
+- 如果页面过多，分批返回最需要更新的（优先级: P1 > P2 > P3）`
 
 	incrementalOrganizePrompt = `你是「LLM Wiki」的增量维护者。你必须严格遵循 schema.yaml 中的所有规则。
 
@@ -1024,8 +1020,13 @@ const (
 - 保留原始数据（数字、日期、引用）的精确性
 
 仅输出需要创建或更新的页面。
-输出:
-{"pages":[{"slug":"...","title":"...","body_markdown":"..."}],"log":"增量更新日志"}`
+按以下格式输出每个页面：
+
+---PAGE: <slug>
+---TITLE: <页面标题>
+---BODY:
+<完整的 markdown 页面内容>
+===END===`
 
 	healthCheckPrompt = `你是「LLM Wiki」的健康检查专家。以下是当前 wiki 的全部页面目录与部分内容。
 请进行全面的健康检查:
@@ -1175,7 +1176,7 @@ func (e *Engine) Organize(ctx context.Context) (*OrganizeResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		userPrompt := "Schema 配置:\n" + schemaCtx + "\n---\n当前 wiki:\n" + bundle
+		userPrompt := "Schema 配置:\n" + schemaCtx + "\n---\n当前 wiki:\n" + bundle + "\n\n---\n## 输出格式（严格按此格式输出每个需要更新的页面）\n对每个需要更新/创建的页面，按以下格式输出：\n\n---PAGE: <slug>\n---TITLE: <页面标题>\n---BODY:\n<完整的 markdown 页面内容>\n===END===\n\n规则：\n- 每个页面以 ---PAGE: 开头，以 ===END=== 结尾\n- 页面内容必须包含完整正文，不要省略号\n- 不需要更新的页面不要输出\n- 页面之间可以有任意数量的空行和说明文字\n- 最后可输出 ===LOG=== 后跟整理日志摘要"
 		resp, err := e.completeLLMWithMaxTokens(ctx, organizeSystemPrompt, userPrompt, 16384)
 		if err != nil {
 			return nil, fmt.Errorf("wiki: LLM 整理: %w", err)
@@ -1203,6 +1204,7 @@ func (e *Engine) Organize(ctx context.Context) (*OrganizeResult, error) {
 			data, _ := os.ReadFile(p)
 			batchContent.WriteString(fmt.Sprintf("### %s\n%s\n\n", filepath.Base(p), truncateRunes(string(data), 4000)))
 		}
+		batchContent.WriteString("\n---\n## 输出格式（严格按此格式输出每个需要更新的页面）\n对每个需要更新/创建的页面，按以下格式输出：\n\n---PAGE: <slug>\n---TITLE: <页面标题>\n---BODY:\n<完整的 markdown 页面内容>\n===END===\n\n规则：\n- 每个页面以 ---PAGE: 开头，以 ===END=== 结尾\n- 页面内容必须包含完整正文，不要省略号\n- 不需要更新的页面不要输出\n- 最后可输出 ===LOG=== 后跟整理日志摘要")
 
 		resp, err := e.completeLLMWithMaxTokens(ctx, organizeSystemPrompt, batchContent.String(), 16384)
 		if err != nil {
@@ -1477,33 +1479,99 @@ func (e *Engine) listRecentRawFiles(duration time.Duration) ([]string, error) {
 	return result, nil
 }
 
-// applyOrganizeResult 解析 LLM 整理结果并写入 wiki。
+// applyOrganizeResult 解析 LLM 整理结果（分隔符格式）并写入 wiki。
+// 格式: ---PAGE: slug / ---TITLE: title / ---BODY: / ...内容... / ===END===
 func (e *Engine) applyOrganizeResult(resp string) (*OrganizeResult, error) {
-	s := strings.TrimSpace(resp)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	s = strings.TrimSpace(s)
-
-	var parsed struct {
-		Pages []ingestLLMPage `json:"pages"`
-		Log   string          `json:"log"`
+	type wikiPage struct {
+		Slug       string
+		Title      string
+		Body       string
 	}
-	if err := json.Unmarshal([]byte(s), &parsed); err != nil {
-		return nil, fmt.Errorf("wiki: 解析整理结果: %w: %s", err, truncateRunes(resp, 500))
+
+	var pages []wikiPage
+	var logText string
+
+	// 提取 ===LOG=== 后的日志摘要
+	if logIdx := strings.Index(resp, "===LOG==="); logIdx >= 0 {
+		logText = strings.TrimSpace(resp[logIdx+9:])
+		resp = resp[:logIdx]
+	}
+
+	// 按 ---PAGE: 分割
+	const pageStart = "---PAGE:"
+	const bodyStart = "---BODY:"
+	const pageEnd = "===END==="
+
+	pos := 0
+	for {
+		idx := strings.Index(resp[pos:], pageStart)
+		if idx < 0 {
+			break
+		}
+		pagePos := pos + idx + len(pageStart)
+		lineEnd := strings.Index(resp[pagePos:], "\n")
+		if lineEnd < 0 {
+			lineEnd = len(resp) - pagePos
+		}
+		slug := strings.TrimSpace(resp[pagePos : pagePos+lineEnd])
+		if slug == "" {
+			pos = pagePos
+			continue
+		}
+
+		// 找 ---TITLE:
+		title := ""
+		titleIdx := strings.Index(resp[pagePos:], "---TITLE:")
+		if titleIdx >= 0 {
+			tStart := pagePos + titleIdx + 9
+			tEnd := strings.Index(resp[tStart:], "\n")
+			if tEnd < 0 {
+				tEnd = len(resp) - tStart
+			}
+			title = strings.TrimSpace(resp[tStart : tStart+tEnd])
+		}
+
+		// 找 ---BODY:
+		bodyIdx := strings.Index(resp[pagePos:], bodyStart)
+		if bodyIdx < 0 {
+			pos = pagePos
+			continue
+		}
+		bodyStartPos := pagePos + bodyIdx + len(bodyStart)
+		// 跳过 ---BODY: 后面的换行
+		for bodyStartPos < len(resp) && resp[bodyStartPos] == '\n' {
+			bodyStartPos++
+		}
+
+		// 找 ===END===
+		endIdx := strings.Index(resp[bodyStartPos:], pageEnd)
+		var body string
+		if endIdx >= 0 {
+			body = resp[bodyStartPos : bodyStartPos+endIdx]
+			pos = bodyStartPos + endIdx + len(pageEnd)
+		} else {
+			// 没有 ===END===，取到末尾
+			body = resp[bodyStartPos:]
+			pos = len(resp)
+		}
+		body = strings.TrimRight(body, "\n\r")
+
+		pages = append(pages, wikiPage{Slug: slug, Title: title, Body: body})
+	}
+
+	if len(pages) == 0 {
+		// 没有页面需要更新，但仍返回日志
+		return &OrganizeResult{UpdatedPages: 0, Log: logText}, nil
 	}
 
 	wikiDir := filepath.Join(e.RepoDir, "wiki")
 	count := 0
-	for _, p := range parsed.Pages {
+	for _, p := range pages {
 		slug := strings.TrimSpace(p.Slug)
 		if slug == "" {
 			continue
 		}
-		body := strings.TrimSpace(p.BodyMarkdown)
-		if body == "" {
-			body = strings.TrimSpace(p.BodyMarkdown2)
-		}
+		body := strings.TrimSpace(p.Body)
 		if body == "" {
 			continue
 		}
@@ -1523,6 +1591,6 @@ func (e *Engine) applyOrganizeResult(resp string) (*OrganizeResult, error) {
 
 	return &OrganizeResult{
 		UpdatedPages: count,
-		Log:          parsed.Log,
+		Log:          logText,
 	}, nil
 }
