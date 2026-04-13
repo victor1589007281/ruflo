@@ -30,6 +30,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,14 +77,19 @@ func DefaultDreamConfig() *DreamConfig {
 	}
 }
 
-// SessionRecord 已完成会话的摘要记录
+// SessionRecord 已完成会话的摘要记录 (v2: 增加重要性评分)
 type SessionRecord struct {
-	ChatID    string    `json:"chatId"`
-	StartTime time.Time `json:"startTime"`
-	EndTime   time.Time `json:"endTime"`
-	Turns     int       `json:"turns"`
-	Summary   string    `json:"summary"`
-	Topics    []string  `json:"topics"`
+	ChatID     string    `json:"chatId"`
+	StartTime  time.Time `json:"startTime"`
+	EndTime    time.Time `json:"endTime"`
+	Turns      int       `json:"turns"`
+	Summary    string    `json:"summary"`
+	Topics     []string  `json:"topics"`
+	// v2: 重要性评分 (0-1), 参考人脑海马体对事件的情感标记
+	// 高分: 团队结果、用户明确指令、错误修复; 低分: 闲聊、重复问题
+	Importance float64 `json:"importance,omitempty"`
+	// v2: 来源类型 (user_chat, team_stage, agent_nested, team_result)
+	Source string `json:"source,omitempty"`
 }
 
 // Dreamer 自动记忆整理引擎。
@@ -153,6 +159,14 @@ func (d *Dreamer) SetAPIClient(client LLMClient) {
 // RecordSession 记录一个已完成的会话。
 // 在每次 ProcessMessage 完成后调用。
 func (d *Dreamer) RecordSession(record SessionRecord) {
+	// v2: 自动评估重要性 (如果调用方未设置)
+	if record.Importance == 0 {
+		record.Importance = d.estimateImportance(record)
+	}
+	if record.Source == "" {
+		record.Source = "user_chat"
+	}
+
 	d.mu.Lock()
 	d.recentSessions = append(d.recentSessions, record)
 	if len(d.recentSessions) > 100 {
@@ -160,6 +174,36 @@ func (d *Dreamer) RecordSession(record SessionRecord) {
 	}
 	d.mu.Unlock()
 	d.sessionsSinceDream.Add(1)
+}
+
+// estimateImportance 自动评估会话重要性 (参考情感标记假说)。
+// 团队结果、错误修复、明确指令 → 高重要性; 闲聊、重复 → 低重要性。
+func (d *Dreamer) estimateImportance(record SessionRecord) float64 {
+	score := 0.5 // 基础分
+	summary := strings.ToLower(record.Summary)
+
+	// 团队相关 → 高重要性
+	if strings.Contains(summary, "团队") || strings.Contains(summary, "team") ||
+		record.Source == "team_result" || record.Source == "team_stage" {
+		score = 0.8
+	}
+	// 错误/修复 → 高重要性 (负面情绪标记)
+	if strings.Contains(summary, "error") || strings.Contains(summary, "错误") ||
+		strings.Contains(summary, "修复") || strings.Contains(summary, "bug") {
+		score = max(score, 0.7)
+	}
+	// 内容长度反映信息密度
+	if len(record.Summary) > 500 {
+		score = max(score, 0.6)
+	}
+	return score
+}
+
+func max(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // AfterQuery 在每次 query 完成后调用，检查是否应触发 Dreaming。
@@ -216,14 +260,18 @@ func (d *Dreamer) AfterQuery(ctx context.Context) {
 	go d.executeDream(ctx)
 }
 
-// executeDream 执行记忆整理 (在独立 goroutine 中运行)。
-// 对应 TS: autoDream.ts 中的 executeAutoDream → runForkedAgent(consolidationPrompt)
+// executeDream 执行记忆整理 (v2: 人脑睡眠机制启发)。
+//
+// 参考:
+//   - 海马体重放 (Hippocampal Replay): 重要经历按重要性排序优先整理
+//   - SWS 慢波睡眠: 强化重要记忆，衰减琐碎记忆
+//   - REM 梦境: LLM 发现跨会话模式和关联
+//   - 突触缩放: 防止记忆无限增长，低价值记忆被遗忘
 func (d *Dreamer) executeDream(ctx context.Context) {
-	// dreaming 已由调用方 CAS 设置为 true，这里仅负责清理
 	defer d.dreaming.Store(false)
 	defer d.releaseLock()
 
-	log.Printf("[Dreaming] 开始记忆整理...")
+	log.Printf("[Dreaming] 开始记忆整理 (v2: 重要性+时间衰减)...")
 	start := time.Now()
 
 	d.mu.Lock()
@@ -235,6 +283,15 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 		log.Printf("[Dreaming] 创建记忆目录失败: %v", err)
 		return
 	}
+
+	// v2: 创建 dreaming/ 子目录存放本次整理的产出文件
+	dreamingDir := filepath.Join(d.config.MemoryDir, "dreaming")
+	os.MkdirAll(dreamingDir, 0755)
+
+	// v2: 按重要性排序 (海马体重放: 高情感标记的记忆优先处理)
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].Importance > sessions[j].Importance
+	})
 
 	var err error
 	if d.ConsolidateFn != nil {
@@ -250,6 +307,9 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 		return
 	}
 
+	// v2: 保存本次 dreaming 产出文件 (解决 dreaming/ 目录为空的问题)
+	d.saveDreamLog(dreamingDir, sessions, time.Since(start))
+
 	d.lastDreamTime = time.Now()
 	d.sessionsSinceDream.Store(0)
 	d.mu.Lock()
@@ -257,7 +317,39 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 	d.mu.Unlock()
 
 	elapsed := time.Since(start)
-	log.Printf("[Dreaming] 整理完成 (耗时 %v)", elapsed)
+	log.Printf("[Dreaming] 整理完成 (耗时 %v, 处理 %d 条会话)", elapsed, len(sessions))
+}
+
+// saveDreamLog 保存每次 dreaming 的产出日志 (解决 dreaming/ 目录为空的问题)。
+// 参考人脑: 每次睡眠周期都有可追溯的记忆巩固记录。
+func (d *Dreamer) saveDreamLog(dir string, sessions []SessionRecord, elapsed time.Duration) {
+	filename := fmt.Sprintf("dream-%s.md", time.Now().Format("20060102-150405"))
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# Dream Log: %s\n\n", time.Now().Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("- 耗时: %v\n", elapsed.Round(time.Second)))
+	sb.WriteString(fmt.Sprintf("- 处理会话数: %d\n\n", len(sessions)))
+
+	sb.WriteString("## 整理的会话记录\n\n")
+	for i, s := range sessions {
+		importance := "普通"
+		if s.Importance >= 0.8 {
+			importance = "高"
+		} else if s.Importance >= 0.5 {
+			importance = "中"
+		}
+		sb.WriteString(fmt.Sprintf("%d. [%s] (重要性:%s, 来源:%s)\n   %s\n",
+			i+1, s.EndTime.Format("15:04"), importance, s.Source,
+			truncateDream(s.Summary, 200)))
+	}
+	os.WriteFile(filepath.Join(dir, filename), []byte(sb.String()), 0644)
+}
+
+func truncateDream(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
 }
 
 // localConsolidate 本地记忆整理 (不依赖 LLM)。

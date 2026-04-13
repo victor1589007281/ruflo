@@ -51,6 +51,29 @@ type dreamAdapter struct {
 	dreamer *dreaming.Dreamer
 }
 
+// memoryAdapter 适配 memory.TieredStore 到 agent.MemoryWriter 接口。
+// 团队完成后写入高权重记忆，确保团队名+目标可被 BM25 检索到。
+type memoryAdapter struct {
+	store *memory.TieredStore
+}
+
+func (ma *memoryAdapter) AddTeamMemory(teamName, workflow, objective, summary string) {
+	if ma.store == nil {
+		return
+	}
+	content := fmt.Sprintf("团队 %s (工作流: %s) 执行完成。\n目标: %s\n\n结果摘要:\n%s",
+		teamName, workflow, objective, summary)
+	if len(content) > 3000 {
+		content = content[:3000] + "...(截断)"
+	}
+	ma.store.Add(&memory.MemoryEntry{
+		Content:    content,
+		Topics:     []string{teamName, workflow, "team_result"},
+		Source:     "team_result",
+		Importance: 0.9, // 高权重: 团队产出是重要的长期记忆
+	})
+}
+
 // wikiBrowserAdapter 适配 browser.Client 到 wiki.BrowserFetcher 接口。
 type wikiBrowserAdapter struct {
 	client *browser.Client
@@ -198,8 +221,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 3. 初始化 Dreaming 引擎
 	bot.initDreaming(config)
 
-	// 4. 初始化多层记忆存储
-	bot.memStore = memory.NewTieredStore()
+	// 4. 初始化多层记忆存储 (v2: 磁盘持久化, 解决重启后失忆)
+	bot.memStore = memory.NewTieredStoreWithPersist(bot.layout.Memory)
 
 	// 5. 解析 Hook 配置
 	hookConfigs := bot.parseHookConfigs(config)
@@ -242,6 +265,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		Dreamer:     &dreamAdapter{dreamer: bot.dreamer},
 		Roles:       roleReg,
 	})
+
+	// 10b. 注入记忆写入 (团队完成后高权重记忆可被检索)
+	bot.teamMgr.SetMemoryWriter(&memoryAdapter{store: bot.memStore})
 
 	// 11. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
 	bot.intentRec = agent.NewIntentRecognizer(aiClient)

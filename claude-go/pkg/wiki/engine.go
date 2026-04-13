@@ -684,14 +684,41 @@ func (e *Engine) Lint(ctx context.Context) (*LintReport, error) {
 	return report, nil
 }
 
-// extractContent 从 HTML 字符串中剥离 script/style 与标签，保留主要可读文本。
+// ExtractContentForTest 导出 extractContent 用于测试。
+func ExtractContentForTest(html string) string { return extractContent(html) }
+
+// extractContent 从 HTML 中提取正文 (v2: 文本密度分析 + 噪声过滤)。
+// 对动态渲染页面 (今日头条等) 过滤评论、推荐、热榜等噪声区域。
 func extractContent(htmlBody string) string {
-	s := reScript.ReplaceAllString(htmlBody, " ")
-	s = reStyle.ReplaceAllString(s, " ")
+	// 移除 script/style
+	s := reScript.ReplaceAllString(htmlBody, "")
+	s = reStyle.ReplaceAllString(s, "")
+	// 移除已知噪声容器
+	s = reNoiseContainer.ReplaceAllString(s, "")
+	// 移除导航/页脚
+	s = reNavFooter.ReplaceAllString(s, "")
+
+	// 尝试 <article> 精确提取
+	if m := reArticle.FindStringSubmatch(s); len(m) > 1 {
+		text := reTags.ReplaceAllString(m[1], " ")
+		text = reWS.ReplaceAllString(text, " ")
+		text = strings.TrimSpace(text)
+		if len([]rune(text)) > 200 {
+			return text
+		}
+	}
+
+	// 降级: 全文剥离
 	s = reTags.ReplaceAllString(s, " ")
 	s = reWS.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
 }
+
+var (
+	reNoiseContainer = regexp.MustCompile(`(?is)<(?:div|section)[^>]*(?:class|id)\s*=\s*"[^"]*(?:comment|recommend|sidebar|related|trending|hotlist|ad-|advertisement|social-share|breadcrumb)[^"]*"[^>]*>.*?</(?:div|section)>`)
+	reNavFooter      = regexp.MustCompile(`(?is)<(?:nav|header|footer|aside)[^>]*>.*?</(?:nav|header|footer|aside)>`)
+	reArticle        = regexp.MustCompile(`(?is)<article[^>]*>(.*?)</article>`)
+)
 
 // slugify 将标题转为适合文件名的短横线 slug（Unicode 友好，小写、空白与标点转为 -）。
 func slugify(title string) string {

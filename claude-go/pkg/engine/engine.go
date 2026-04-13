@@ -251,16 +251,13 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				}
 			}
 			if lastUserText != "" {
-				relevant := e.MemoryStore.Retrieve(lastUserText, 5)
-				// 过滤超过 2 小时的记忆，降低历史上下文对当前对话的干扰
-				var fresh []*memory.MemoryEntry
-				for _, m := range relevant {
-					if time.Since(m.CreatedAt) < 2*time.Hour {
-						fresh = append(fresh, m)
-					}
-				}
-				if len(fresh) > 0 {
-					memPrompt := memory.FormatForPrompt(fresh)
+				// v2: 移除 2h CreatedAt 硬截断，完全依赖 Ebbinghaus Retention() 自然衰减。
+				// 根因: 硬截断导致凌晨存的团队结果到早上完全不可见，即使 BM25 高度相关。
+				// 参考: Generative Agents (Park et al. 2023) — recency × importance × relevance
+				// Retrieve 内部已集成 retention 衰减 + recency boost，无需额外过滤。
+				relevant := e.MemoryStore.Retrieve(lastUserText, 7)
+				if len(relevant) > 0 {
+					memPrompt := memory.FormatForPrompt(relevant)
 					if len(systemPrompt) > 0 {
 						systemPrompt[0] += "\n" + memPrompt
 					}

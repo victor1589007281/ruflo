@@ -299,15 +299,20 @@ func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, t
 	}
 }
 
-// heuristicDistill 启发式经验提炼 (LLM 不可用时的降级方案)。
+// heuristicDistill 启发式经验提炼 (v2: 增强失败记录 + 模式提取)。
+// 参考: 人类从错误中学习比从成功中学习更高效 (负强化学习)。
 func (ee *EvolutionEngine) heuristicDistill(trajs []Trajectory, teamName string) {
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
 
 	for _, t := range trajs {
-		if t.Error != "" && !t.Success {
-			content := fmt.Sprintf("[%s] 执行目标「%s」时失败: %s",
-				t.Role, truncateResult(t.Objective, 100), truncateResult(t.Error, 200))
+		// v2: 失败轨迹增强 — 提取具体错误类型并记录上下文
+		if t.Error != "" || !t.Success {
+			errorType := classifyError(t.Error)
+			content := fmt.Sprintf("[%s/%s] 执行「%s」失败 (%s): %s\n建议: %s",
+				t.Role, t.StageName, truncateResult(t.Objective, 80),
+				errorType, truncateResult(t.Error, 150),
+				suggestFix(errorType, t.Error))
 			if !ee.isDuplicate(content) {
 				ee.nextID++
 				ee.experiences = append(ee.experiences, &Experience{
@@ -317,7 +322,7 @@ func (ee *EvolutionEngine) heuristicDistill(trajs []Trajectory, teamName string)
 					Content:   content,
 					Quality:   0.4,
 					Source:    teamName,
-					Tags:      []string{t.Role, "error"},
+					Tags:      []string{t.Role, "error", errorType},
 					CreatedAt: time.Now(),
 					UpdatedAt: time.Now(),
 				})
@@ -325,8 +330,8 @@ func (ee *EvolutionEngine) heuristicDistill(trajs []Trajectory, teamName string)
 		}
 
 		if t.Success && t.Output != "" {
-			content := fmt.Sprintf("[%s] 成功完成「%s」, 耗时 %s",
-				t.Role, truncateResult(t.Objective, 100), t.Duration)
+			content := fmt.Sprintf("[%s/%s] 成功完成「%s」(耗时 %s)",
+				t.Role, t.StageName, truncateResult(t.Objective, 100), t.Duration)
 			if !ee.isDuplicate(content) {
 				ee.nextID++
 				ee.experiences = append(ee.experiences, &Experience{
@@ -342,6 +347,41 @@ func (ee *EvolutionEngine) heuristicDistill(trajs []Trajectory, teamName string)
 				})
 			}
 		}
+	}
+}
+
+// classifyError 分类错误类型 (v2: 用于精准检索和学习)。
+func classifyError(errStr string) string {
+	lower := strings.ToLower(errStr)
+	switch {
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline"):
+		return "timeout"
+	case strings.Contains(lower, "compile") || strings.Contains(lower, "syntax") || strings.Contains(lower, "import"):
+		return "compilation"
+	case strings.Contains(lower, "permission") || strings.Contains(lower, "denied"):
+		return "permission"
+	case strings.Contains(lower, "not found") || strings.Contains(lower, "undefined"):
+		return "not_found"
+	case strings.Contains(lower, "空转") || strings.Contains(lower, "角色扮演"):
+		return "idle_output"
+	default:
+		return "runtime"
+	}
+}
+
+// suggestFix 根据错误类型生成修复建议。
+func suggestFix(errorType, _ string) string {
+	switch errorType {
+	case "timeout":
+		return "增加超时时间或拆分任务为更小的子任务"
+	case "compilation":
+		return "检查导入声明和类型定义是否完整"
+	case "idle_output":
+		return "Agent可能未理解任务，需要更明确的prompt和示例"
+	case "not_found":
+		return "检查依赖项和引用路径是否正确"
+	default:
+		return "检查日志详情，考虑重试或调整策略"
 	}
 }
 
@@ -401,7 +441,9 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 	var candidates []scored
 
 	for i, exp := range ee.experiences {
-		if exp.Quality < 0.15 {
+		// v2: 降低质量门槛 (0.15→0.05), 让更多经验有被检索的机会
+		// 参考: 人类学习中"看似无用的经验"在新情境下可能变得有价值
+		if exp.Quality < 0.05 {
 			continue
 		}
 
@@ -409,7 +451,7 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 
 		// BM25 + IDF 加权
 		bm25 := bm25WithIDF(queryTerms, expTerms, docFreq, docCount)
-		if bm25 < 0.01 {
+		if bm25 < 0.005 { // v2: 降低 BM25 门槛
 			continue
 		}
 
@@ -500,8 +542,9 @@ func FormatExperiencesForPrompt(experiences []*Experience) string {
 
 // --- EVOLVE: 反馈 + 质量更新 ---
 
-// RecordFeedback 记录经验使用反馈。
-// 使用 EMA (指数移动平均) 更新质量分, 参考 ruflo v3 recordPatternUsage。
+// RecordFeedback 记录经验使用反馈 (v2: 质量可降)。
+// 使用 EMA 更新质量分。失败时 reward=0 会降低质量，多次失败会快速淘汰低质经验。
+// 参考: 人类学习中的"负强化" — 错误经验反复验证为无效时应被遗忘。
 func (ee *EvolutionEngine) RecordFeedback(expID string, success bool) {
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
@@ -512,13 +555,16 @@ func (ee *EvolutionEngine) RecordFeedback(expID string, success bool) {
 			if success {
 				exp.SuccessCount++
 			}
-			// EMA 更新 Quality
+			// EMA: 成功 reward=1.0, 失败 reward=-0.1 (允许质量下降到 0 以下被剪枝)
 			alpha := 0.3
-			reward := 0.0
+			reward := -0.1 // v2: 失败惩罚 (原来是 0，质量几乎不降)
 			if success {
 				reward = 1.0
 			}
 			exp.Quality = (1-alpha)*exp.Quality + alpha*reward
+			if exp.Quality < 0 {
+				exp.Quality = 0
+			}
 			exp.UpdatedAt = time.Now()
 			break
 		}
@@ -546,15 +592,26 @@ func (ee *EvolutionEngine) Consolidate() {
 
 	before := len(ee.experiences)
 
-	// 1. 剪枝: 删除低质量 + 长期未使用的经验
+	// 1. 剪枝 + 时间衰减 (v2: 参考人类遗忘曲线 — 未强化的记忆自然衰减)
 	var kept []*Experience
 	for _, exp := range ee.experiences {
 		ageDays := time.Since(exp.CreatedAt).Hours() / 24
-		if exp.Quality < 0.15 && ageDays > 7 {
-			continue // 淘汰
+
+		// v2: 未使用经验的质量随时间自然衰减 (Ebbinghaus)
+		// 每过 7 天未使用，质量下降 5%
+		if exp.UsageCount == 0 && ageDays > 7 {
+			decay := 0.05 * (ageDays / 7)
+			exp.Quality -= decay
+			if exp.Quality < 0 {
+				exp.Quality = 0
+			}
 		}
-		if exp.UsageCount == 0 && ageDays > 30 {
-			continue // 30天未被使用
+
+		if exp.Quality < 0.05 && ageDays > 3 {
+			continue // 淘汰 (v2: 更激进的淘汰, 3天而非7天)
+		}
+		if exp.UsageCount == 0 && ageDays > 14 {
+			continue // v2: 14天未使用就淘汰 (原30天)
 		}
 		kept = append(kept, exp)
 	}

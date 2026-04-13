@@ -107,6 +107,11 @@ const (
 	TaskFailed    TaskStatus = "failed"
 )
 
+// MemoryWriter 写入记忆的抽象接口 (解耦对 memory 包的依赖)。
+type MemoryWriter interface {
+	AddTeamMemory(teamName, workflow, objective, summary string)
+}
+
 // ProductionTeamManager 生产级团队管理器
 type ProductionTeamManager struct {
 	teams       map[string]*ProductionTeam
@@ -115,12 +120,13 @@ type ProductionTeamManager struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	mediaNotify MediaNotifyFunc
-	taskTracker TaskTracker // 复用 V2 Task 系统
+	taskTracker TaskTracker      // 复用 V2 Task 系统
 	pool        *AgentPool       // Agent 池 (动态扩缩)
 	llm         LLMClient        // LLM 客户端 (蜂群分解)
 	evolution   *EvolutionEngine // 自动进化引擎
 	dreamer     DreamRecorder    // Dreaming 接口 (覆盖 team agent 会话)
 	roles       *RoleRegistry    // 角色注册表
+	memWriter   MemoryWriter     // 记忆写入 (团队完成后写入高权重记忆)
 }
 
 // TeamManagerConfig 团队管理器配置。
@@ -135,6 +141,12 @@ type TeamManagerConfig struct {
 	Evolution   *EvolutionEngine
 	Dreamer     DreamRecorder
 	Roles       *RoleRegistry
+	MemWriter   MemoryWriter
+}
+
+// SetMemoryWriter 注入记忆写入器 (在 Bot 初始化后调用)。
+func (ptm *ProductionTeamManager) SetMemoryWriter(mw MemoryWriter) {
+	ptm.memWriter = mw
 }
 
 // NewProductionTeamManager 创建生产级团队管理器。
@@ -375,6 +387,17 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	// 持久化完整报告文件 (解决产出散落、无法检索的问题)
 	reportPath := ptm.saveTeamReport(team, results)
 
+	// 写入高权重记忆 (解决"失忆"问题: 团队名+目标+结果摘要可被 BM25 检索)
+	if ptm.memWriter != nil {
+		var stageSummary string
+		for _, r := range results {
+			if r.Output != "" {
+				stageSummary += fmt.Sprintf("[%s/%s] %s\n", r.Name, r.Role, truncateResult(r.Output, 200))
+			}
+		}
+		ptm.memWriter.AddTeamMemory(team.Name, team.Workflow, team.Objective, stageSummary)
+	}
+
 	var summary string
 	for _, r := range results {
 		if r.Output != "" {
@@ -436,6 +459,17 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 
 	// 持久化完整报告文件
 	reportPath := ptm.saveTeamReport(team, results)
+
+	// 写入高权重记忆
+	if ptm.memWriter != nil {
+		var stageSummary string
+		for _, r := range results {
+			if r.Output != "" {
+				stageSummary += fmt.Sprintf("[%s/%s] %s\n", r.Name, r.Role, truncateResult(r.Output, 200))
+			}
+		}
+		ptm.memWriter.AddTeamMemory(team.Name, team.Workflow, team.Objective, stageSummary)
+	}
 
 	var summary string
 	for _, r := range results {

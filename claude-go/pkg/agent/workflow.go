@@ -410,13 +410,26 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 				if lastEvalFeedback != "" {
 					feedbackSection = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastEvalFeedback)
 				}
+				// v2: 确保对抗反馈无论 prompt 来源(StageDef 或 RoleRegistry)都能注入
 				modifiedPrompt := strings.ReplaceAll(genStage.Prompt, "{adversarial_feedback}", feedbackSection)
 				tempStage := genStage
 				tempStage.Prompt = modifiedPrompt
 				tempStage.Name = fmt.Sprintf("%s-round%d", genStage.Name, round)
+				// 临时替换 RoleRegistry 中的占位符, 执行后恢复
+				var roleRestore func()
+				if we.roles != nil {
+					if role := we.roles.Get(genStage.Role); role != nil && strings.Contains(role.SystemPrompt, "{adversarial_feedback}") {
+						orig := role.SystemPrompt
+						role.SystemPrompt = strings.ReplaceAll(role.SystemPrompt, "{adversarial_feedback}", feedbackSection)
+						roleRestore = func() { role.SystemPrompt = orig }
+					}
+				}
 
 				we.notify(we.chatID, fmt.Sprintf("🔨 对抗第 %d/%d 轮 — %s (%s) 执行中...", round, maxRounds, genStage.Name, genStage.Role))
 				sr := we.executeStage(ctx, tempStage, objective, prevResults, team)
+				if roleRestore != nil {
+					roleRestore()
+				}
 				sr.Name = tempStage.Name
 				allResults = append(allResults, sr)
 				if sr.Status != TaskCompleted {

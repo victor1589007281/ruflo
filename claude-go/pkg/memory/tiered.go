@@ -1,46 +1,41 @@
-// Package memory — 多层记忆架构。
-// 对应 TS: memdir/ (auto-memory) + extractMemories + autoDream
+// Package memory — 多层记忆架构 (v2: 持久化 + 衰减召回)。
 //
-// 三层记忆模型 (业界最佳实践 — MemGPT / Letta 架构):
+// 设计参考:
+//   - MemGPT / Letta: 三层记忆模型 (Working → Episodic → Semantic)
+//   - Ebbinghaus 遗忘曲线 + 间隔重复: 自然衰减，复习增强
+//   - Generative Agents (Park et al. 2023): 重要性 × 近因 × 相关性 三因子召回
+//   - RAPTOR (Sarthi et al. 2024): 递归抽象 + 树状检索
+//
+// v2 改进 (解决"失忆"根因):
+//   1. 移除 2h CreatedAt 硬截断 → 完全依赖 Ebbinghaus Retention() 做软衰减
+//   2. 新增磁盘持久化 (JSON) → 进程重启后恢复记忆
+//   3. 团队产出写入高权重 (Importance=0.9) 记忆 → 团队名可被检索
+//   4. 多路检索: BM25 + 实体匹配 bonus → 提高召回质量
+//   5. 重要性分级: team_result(0.9) > pre_compact(0.7) > extraction(0.6) > agent(0.5)
 //
 //	┌──────────────────────────────────────────────────┐
 //	│  Working Memory (工作记忆 / 短期)                 │
 //	│  = QueryEngine.Messages (当前对话上下文)          │
-//	│  容量: 模型 context window                        │
-//	│  生命期: 单次对话                                 │
 //	└──────────────────┬───────────────────────────────┘
-//	                   │ 压缩时 extractBeforeCompact
+//	                   │ compact → extractKeyFacts
 //	┌──────────────────▼───────────────────────────────┐
-//	│  Episodic Memory (情景记忆 / 中期)                │
-//	│  = 每轮对话提取的关键事实                         │
-//	│  容量: 内存 (per-session, 可持久化)               │
-//	│  生命期: 跨多轮对话, 受遗忘曲线衰减              │
-//	│  触发: 每轮 query 结束时自动提取                   │
+//	│  Episodic Memory (情景记忆 / 中期)  ← 本文件     │
+//	│  = TieredStore (BM25 + Ebbinghaus)               │
+//	│  持久化: episodic_memory.json                     │
 //	└──────────────────┬───────────────────────────────┘
 //	                   │ Dreaming 整理
 //	┌──────────────────▼───────────────────────────────┐
 //	│  Semantic Memory (语义记忆 / 长期)                │
-//	│  = .claude/memory/*.md 文件                       │
-//	│  容量: 磁盘 (索引 + 主题文件)                     │
-//	│  生命期: 永久, 由 Dreaming 定期整理               │
-//	│  召回: 每轮 query 开始时按相关性加载              │
+//	│  = .claude/memory/*.md                            │
 //	└──────────────────────────────────────────────────┘
-//
-// 遗忘曲线 (Ebbinghaus + 间隔重复):
-//
-//	retention(t) = importance × e^(-λ×t / (1 + ln(accessCount+1)))
-//
-//	- importance: 记忆重要性 (0.0-1.0)
-//	- λ: 衰减速率 (默认 0.1)
-//	- t: 距上次访问的小时数
-//	- accessCount: 被召回的次数 (间隔重复效应)
-//
-//	每次被召回时 accessCount++, 衰减变慢。
-//	retention < threshold (默认 0.3) 时, 记忆在下次 Dreaming 时被清理。
 package memory
 
 import (
+	"encoding/json"
+	"log"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -77,7 +72,7 @@ func (e *MemoryEntry) Touch() {
 	e.LastAccess = time.Now()
 }
 
-// TieredStore 多层记忆存储。
+// TieredStore 多层记忆存储 (v2: 含磁盘持久化)。
 // 进程级共享，所有 Session 共享同一个实例。
 type TieredStore struct {
 	mu       sync.RWMutex
@@ -85,6 +80,10 @@ type TieredStore struct {
 	idSeq    int
 	// ForgetThreshold 低于此保留度的记忆将被标记为可清理
 	ForgetThreshold float64
+	// persistPath 记忆持久化文件路径 (空则不持久化)
+	persistPath string
+	// dirty 标记是否有未持久化的变更
+	dirty bool
 }
 
 // NewTieredStore 创建多层记忆存储
@@ -93,6 +92,74 @@ func NewTieredStore() *TieredStore {
 		episodic:        make(map[string]*MemoryEntry),
 		ForgetThreshold: 0.3,
 	}
+}
+
+// NewTieredStoreWithPersist 创建带磁盘持久化的记忆存储。
+// 启动时自动从文件加载历史记忆。
+func NewTieredStoreWithPersist(dir string) *TieredStore {
+	s := &TieredStore{
+		episodic:        make(map[string]*MemoryEntry),
+		ForgetThreshold: 0.3,
+	}
+	if dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+		s.persistPath = filepath.Join(dir, "episodic_memory.json")
+		s.loadFromDisk()
+	}
+	return s
+}
+
+// loadFromDisk 从磁盘加载记忆 (启动时调用)。
+func (s *TieredStore) loadFromDisk() {
+	if s.persistPath == "" {
+		return
+	}
+	data, err := os.ReadFile(s.persistPath)
+	if err != nil {
+		return // 文件不存在是正常情况
+	}
+	var entries []*MemoryEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Printf("[Memory] 加载记忆文件失败: %v", err)
+		return
+	}
+	for _, e := range entries {
+		if e.Retention() >= s.ForgetThreshold*0.5 {
+			s.episodic[e.ID] = e
+			s.idSeq++
+		}
+	}
+	log.Printf("[Memory] 从磁盘恢复 %d 条记忆 (跳过 %d 条已遗忘)", len(s.episodic), len(entries)-len(s.episodic))
+}
+
+// PersistToDisk 将记忆持久化到磁盘。定期调用或在写入高权重记忆后调用。
+func (s *TieredStore) PersistToDisk() {
+	if s.persistPath == "" {
+		return
+	}
+	s.mu.RLock()
+	if !s.dirty {
+		s.mu.RUnlock()
+		return
+	}
+	entries := make([]*MemoryEntry, 0, len(s.episodic))
+	for _, e := range s.episodic {
+		entries = append(entries, e)
+	}
+	s.mu.RUnlock()
+
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		log.Printf("[Memory] 序列化失败: %v", err)
+		return
+	}
+	if err := os.WriteFile(s.persistPath, data, 0644); err != nil {
+		log.Printf("[Memory] 持久化失败: %v", err)
+		return
+	}
+	s.mu.Lock()
+	s.dirty = false
+	s.mu.Unlock()
 }
 
 // Add 添加一条记忆
@@ -113,6 +180,12 @@ func (s *TieredStore) Add(entry *MemoryEntry) {
 		entry.Importance = 0.5
 	}
 	s.episodic[entry.ID] = entry
+	s.dirty = true
+
+	// 高权重记忆立即持久化 (team_result, manual)
+	if entry.Importance >= 0.8 {
+		go s.PersistToDisk()
+	}
 }
 
 func itoa(n int) string {
