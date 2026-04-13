@@ -163,12 +163,25 @@ func (s *SwarmOrchestrator) decompose(ctx context.Context, objective string) (*D
 
 	sysPrompt := fmt.Sprintf(`你是任务分解引擎。将复杂任务拆解为可并行执行的子任务。
 
-规则:
+## 拆解规则
 1. 每个子任务应是独立可执行的工作单元
 2. 标注依赖关系 (dependsOn): 哪些子任务必须在其之前完成
 3. 无依赖的子任务会自动并行执行
 4. 最多拆解 %d 个子任务
 5. role 可选: researcher, coder, reviewer, tester, architect, analyst
+
+## 优化规则 (重要!)
+6. **最小依赖原则**: 只依赖真正需要的前置任务，不要过度串行化。
+   例: 如果 t6(优化方案) 只需要 t3(架构) 和 t4(最佳实践)，不要额外依赖 t5(差距分析)
+7. **负载均衡**: 平衡各角色的任务数量和复杂度，避免某个角色过载
+   - reviewer 任务不应超过 2 个
+   - 将重型任务拆分为多个子任务分配给不同角色
+8. **量化要求**: 在需要评估/审计类任务的 description 中，明确要求输出量化指标
+   (如: 代码行数、测试覆盖率、圈复杂度、依赖数量、安全评分等)
+9. **最终汇总**: 最后一个任务必须是综合汇总，它的 description 中应要求:
+   - 生成结构化的最终报告
+   - 包含量化指标汇总表
+   - 给出明确的结论和建议
 
 输出严格JSON (不要解释):
 {
@@ -177,7 +190,7 @@ func (s *SwarmOrchestrator) decompose(ctx context.Context, objective string) (*D
     {"id": "t2", "description": "另一个任务", "role": "coder", "dependsOn": ["t1"]}
   ],
   "strategy": "parallel|pipeline|hybrid",
-  "rationale": "简述拆解理由"
+  "rationale": "简述拆解理由 (含依赖优化和负载均衡说明)"
 }`, s.maxAgents)
 
 	resp, err := s.llm.SimpleComplete(ctx, sysPrompt, objective)
@@ -490,12 +503,20 @@ func (s *SwarmOrchestrator) merge(ctx context.Context, results []StageResult, ob
 
 	sysPrompt := `你是结果综合专家。将多个子任务的结果汇总为一份连贯、完整的最终报告。
 
-要求:
-1. 提炼核心发现, 去除冗余
-2. 保留关键细节和代码 (如果有)
-3. 指出各子任务间的关联和矛盾
-4. 给出明确的结论和建议
-5. 结构化输出 (使用 Markdown)`
+## 报告结构 (必须包含)
+1. **执行摘要** — 3-5 条关键发现
+2. **各任务产出综合** — 提炼核心发现，去除冗余，保留关键细节和代码
+3. **量化指标汇总表** — 如果子任务中有量化数据，必须汇总为表格
+   | 指标 | 值 | 来源 | 备注 |
+   |------|----|------|------|
+4. **矛盾点分析** — 指出各子任务间的数据分歧和结论矛盾
+5. **结论与建议** — 分优先级的可操作建议
+6. **附录** — 各子任务耗时统计
+
+## 要求
+- 结构化 Markdown 输出
+- 不要遗漏任何子任务的关键产出
+- 如果子任务产出了代码或文件，明确列出文件路径`
 
 	return s.llm.SimpleComplete(ctx, sysPrompt, sb.String())
 }

@@ -161,73 +161,103 @@ Use the project's testing framework. Ensure tests are deterministic and independ
 func researchWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "research",
-		Description: "调研汇总: 多路并行调研 → 综合分析",
+		Description: "调研汇总: 技术专家+市场分析师+风险审计员 并行调研 → 综合分析",
 		Mode:        "fanout",
 		Stages: []StageDef{
 			{
-				Name: "research-tech", Role: "researcher",
-				Prompt: `You are a technical researcher. Investigate the TECHNICAL aspects of the topic.
+				Name: "research-tech", Role: "tech-researcher",
+				Prompt: `你是**技术深度研究员** (专注技术架构和实现)。对以下主题进行技术层面的深度调研。
 
-Topic: {objective}
+调研主题: {objective}
 
-Focus on:
-- Current state of the art and recent developments
-- Key technologies, frameworks, and tools
-- Technical trade-offs and limitations
-- Code examples and implementation patterns
+## 强制要求
+1. **使用 WebSearch 工具**验证关键技术数据 (版本号、性能指标、API 变更等), 不要仅依赖训练知识
+2. 必须包含**负面案例**: 至少 2 个选型失败/踩坑案例及原因分析
 
-Provide detailed findings with references where possible. Output in structured markdown.`,
+## 调研维度
+- 核心技术架构和设计理念
+- 最新版本特性和 Roadmap (通过 WebSearch 验证)
+- 性能基准数据 (注明数据来源和测试条件)
+- 代码示例和实现模式
+- 技术局限性和已知问题
+- **踩坑案例**: 社区中报告的常见问题和解决方案
+
+## 输出格式
+结构化 Markdown，每个数据点注明来源 (官方文档/社区/实测)。`,
 				Parallel: true,
 			},
 			{
-				Name: "research-market", Role: "researcher",
-				Prompt: `You are a market researcher. Investigate the MARKET and ADOPTION aspects of the topic.
+				Name: "research-market", Role: "market-analyst",
+				Prompt: `你是**市场与商业分析师** (专注商业价值和竞争格局)。对以下主题进行市场和商业层面的调研。
 
-Topic: {objective}
+调研主题: {objective}
 
-Focus on:
-- Industry adoption and market trends
-- Key players and their approaches
-- Cost analysis and ROI considerations
-- Case studies and success stories
+## 强制要求
+1. **使用 WebSearch 工具**查询最新的市场数据和采用案例
+2. 必须包含**量化数据**: 成本对比表、性能对比表、市场份额等
+3. 必须包含**失败案例**: 至少 1 个迁移/采用失败的真实案例
 
-Provide detailed findings with data points where possible. Output in structured markdown.`,
+## 调研维度
+- 行业采用情况和市场趋势 (通过 WebSearch 获取最新数据)
+- 竞品对比分析 (功能矩阵表)
+- TCO 总拥有成本分析 (含运维、人力、迁移成本)
+- 成功案例 AND 失败案例 (各至少 1 个)
+- ROI 评估模型
+
+## 输出格式
+结构化 Markdown，数据密集，使用表格对比。`,
 				Parallel: true,
 			},
 			{
-				Name: "research-risk", Role: "researcher",
-				Prompt: `You are a risk analyst. Investigate the RISKS and CHALLENGES of the topic.
+				Name: "research-risk", Role: "risk-auditor",
+				Prompt: `你是**风险审计员** (专注风险评估和合规)。对以下主题进行风险和安全层面的深度审计。
 
-Topic: {objective}
+调研主题: {objective}
 
-Focus on:
-- Technical risks and failure modes
-- Security and compliance concerns
-- Scalability and maintenance challenges
-- Migration and integration difficulties
+## 强制要求
+1. **使用 WebSearch 工具**搜索相关 CVE、安全公告、故障报告
+2. 必须给出**量化风险评分** (影响 × 概率 矩阵)
+3. 每个风险必须给出**具体缓解措施**
 
-Provide detailed risk assessment with mitigation strategies. Output in structured markdown.`,
+## 调研维度
+- 安全风险 (CVE 历史、攻击面分析、合规要求)
+- 技术风险 (单点故障、性能瓶颈、扩展性上限)
+- 运维风险 (升级路径、向后兼容、社区活跃度)
+- 迁移风险 (数据迁移方案、回滚计划、停机时间)
+- 供应链风险 (依赖健康度、维护者活跃度)
+
+## 风险评分矩阵
+| 风险项 | 影响 (1-5) | 概率 (1-5) | 综合评分 | 缓解措施 |
+|--------|-----------|-----------|---------|---------|
+
+## 输出格式
+结构化 Markdown，表格化风险矩阵，每个缓解措施需具体可操作。`,
 				Parallel: true,
 			},
 			{
 				Name: "synthesize", Role: "synthesizer",
 				DependsOn: []string{"research-tech", "research-market", "research-risk"},
-				Prompt: `You are a senior analyst. Synthesize all research findings into a comprehensive report.
+				Prompt: `你是**首席分析师**，负责综合所有调研结果并撰写最终报告。
 
-Topic: {objective}
+调研主题: {objective}
 
-Research Findings:
+调研团队产出:
 {prev_result}
 
-Produce a final report with:
-1. Executive Summary (key findings in 3-5 bullets)
-2. Technical Analysis (synthesized from all researchers)
-3. Market Analysis
-4. Risk Assessment
-5. Recommendations (prioritized, actionable)
-6. Conclusion
+## 综合报告要求
 
-Be concise but thorough. Highlight agreements and contradictions between researchers.`,
+1. **执行摘要** (3-5 条关键发现)
+2. **技术分析** (综合技术研究员的发现，标注数据矛盾点)
+3. **市场分析** (含竞品对比表和成本分析)
+4. **风险评估** (综合风险评分，Top 5 风险列表)
+5. **失败案例与教训** (综合各路调研中的负面案例)
+6. **建议方案** (分优先级，含实施路线图和时间表)
+7. **结论**
+
+## 特别注意
+- 当不同研究员给出矛盾数据时（如性能指标），必须**标注分歧**并分析原因
+- 明确区分"基于实时搜索验证的数据"和"基于训练知识的推测"
+- 最终报告应可直接作为决策参考文档`,
 			},
 		},
 	}

@@ -372,14 +372,21 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		}
 	}
 
+	// 持久化完整报告文件 (解决产出散落、无法检索的问题)
+	reportPath := ptm.saveTeamReport(team, results)
+
 	var summary string
 	for _, r := range results {
 		if r.Output != "" {
 			summary += fmt.Sprintf("\n\n**[%s]**\n%s", r.Role, truncateResult(r.Output, 500))
 		}
 	}
-	ptm.notify(team.ChatID, fmt.Sprintf("✅ 团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s",
-		team.Name, time.Since(team.StartedAt).Round(time.Second), summary))
+	reportNote := ""
+	if reportPath != "" {
+		reportNote = fmt.Sprintf("\n\n📄 **完整报告**: `%s`", reportPath)
+	}
+	ptm.notify(team.ChatID, fmt.Sprintf("✅ 团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s%s",
+		team.Name, time.Since(team.StartedAt).Round(time.Second), summary, reportNote))
 
 	// Creative 工作流: 提取 SVG/HTML 多媒体资产，通过媒体通道发送
 	if ptm.mediaNotify != nil && (team.Workflow == "creative") {
@@ -427,14 +434,21 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 		}
 	}
 
+	// 持久化完整报告文件
+	reportPath := ptm.saveTeamReport(team, results)
+
 	var summary string
 	for _, r := range results {
 		if r.Output != "" {
 			summary += fmt.Sprintf("\n\n**[%s] %s**\n%s", r.Role, r.Name, truncateResult(r.Output, 500))
 		}
 	}
-	ptm.notify(team.ChatID, fmt.Sprintf("🐝 蜂群团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s",
-		team.Name, time.Since(team.StartedAt).Round(time.Second), summary))
+	reportNote := ""
+	if reportPath != "" {
+		reportNote = fmt.Sprintf("\n\n📄 **完整报告**: `%s`", reportPath)
+	}
+	ptm.notify(team.ChatID, fmt.Sprintf("🐝 蜂群团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s%s",
+		team.Name, time.Since(team.StartedAt).Round(time.Second), summary, reportNote))
 }
 
 // sendMediaAssets 从工作流输出中提取 SVG 并转换为 PNG 发送。
@@ -615,6 +629,64 @@ func (ptm *ProductionTeamManager) ListAllTeams() []*ProductionTeam {
 		result = append(result, t)
 	}
 	return result
+}
+
+// saveTeamReport 将团队完整执行结果保存为 Markdown 报告文件。
+// 解决"产出散落在 blackboard/team.json 中无法检索"的问题。
+func (ptm *ProductionTeamManager) saveTeamReport(team *ProductionTeam, results []StageResult) string {
+	if team.dataDir == "" {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# 团队报告: %s\n\n", team.Name))
+	sb.WriteString(fmt.Sprintf("- **工作流**: %s\n", team.Workflow))
+	sb.WriteString(fmt.Sprintf("- **目标**: %s\n", team.Objective))
+	sb.WriteString(fmt.Sprintf("- **状态**: %s\n", team.Status))
+	sb.WriteString(fmt.Sprintf("- **开始时间**: %s\n", team.StartedAt.Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("- **完成时间**: %s\n", team.FinishedAt.Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("- **耗时**: %v\n", team.FinishedAt.Sub(team.StartedAt).Round(time.Second)))
+	sb.WriteString(fmt.Sprintf("- **Agent数**: %d\n\n", len(team.Agents)))
+
+	// 各阶段产出（完整版，不截断）
+	sb.WriteString("---\n\n## 各阶段产出\n\n")
+	for i, r := range results {
+		sb.WriteString(fmt.Sprintf("### %d. %s (%s) — %s\n\n", i+1, r.Name, r.Role, r.Status))
+		if r.Duration != "" {
+			sb.WriteString(fmt.Sprintf("**耗时**: %s\n\n", r.Duration))
+		}
+		if r.Error != "" {
+			sb.WriteString(fmt.Sprintf("**错误**: %s\n\n", r.Error))
+		}
+		if r.Output != "" {
+			sb.WriteString(r.Output)
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("---\n\n")
+	}
+
+	reportPath := filepath.Join(team.dataDir, "REPORT.md")
+	if err := os.WriteFile(reportPath, []byte(sb.String()), 0644); err != nil {
+		log.Printf("[Teams] 保存报告失败: %v", err)
+		return ""
+	}
+	log.Printf("[Teams] 报告已保存: %s", reportPath)
+	return reportPath
+}
+
+// GetTeamReport 读取团队的完整报告文件。
+// 返回报告内容和路径，找不到时返回空字符串。
+func (ptm *ProductionTeamManager) GetTeamReport(name string) (content string, path string) {
+	team := ptm.GetTeam(name)
+	if team == nil || team.dataDir == "" {
+		return "", ""
+	}
+	reportPath := filepath.Join(team.dataDir, "REPORT.md")
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		return "", ""
+	}
+	return string(data), reportPath
 }
 
 // persist 持久化团队状态到文件

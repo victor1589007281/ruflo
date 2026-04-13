@@ -215,6 +215,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore, bot.evolution, roleReg)
 	// 注入飞书媒体发送回调，让 LLM 在飞书对话中能直接调用 FeishuSendFile 工具发送图片/文件
 	bot.sessions.SetMediaSendFn(bot.SendMediaToChat)
+	// 注入团队管理器，让 LLM 能通过 TeamQuery 工具查询团队状态和报告
+	bot.sessions.SetTeamManager(bot.teamMgr)
 
 	// 9. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
 	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)

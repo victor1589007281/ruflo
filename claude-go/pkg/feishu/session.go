@@ -90,7 +90,8 @@ type SessionManager struct {
 	taskStore      *builtin.TaskStore     // 共享 V2 Task 存储 (Teams + LLM 工具共用)
 	evolution      *agent.EvolutionEngine // 进化引擎 (注入 agent runner hooks)
 	roleRegistry   *agent.RoleRegistry    // 角色注册表
-	mediaSendFn    MediaSendFunc          // 飞书发送图片/文件的回调
+	mediaSendFn    MediaSendFunc                  // 飞书发送图片/文件的回调
+	teamMgr        *agent.ProductionTeamManager   // 团队管理器 (供 TeamQuery 工具使用)
 }
 
 // NewSessionManager 创建会话管理器。
@@ -130,6 +131,11 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 // SetMediaSendFn 注入飞书媒体发送回调。在 Bot 初始化完成后调用。
 func (sm *SessionManager) SetMediaSendFn(fn MediaSendFunc) {
 	sm.mediaSendFn = fn
+}
+
+// SetTeamManager 注入团队管理器，让 LLM 能通过 TeamQuery 工具查询团队信息。
+func (sm *SessionManager) SetTeamManager(mgr *agent.ProductionTeamManager) {
+	sm.teamMgr = mgr
 }
 
 // Get 获取已有会话（不创建）。如果不存在返回 nil。
@@ -183,6 +189,11 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	// 注册飞书发送工具: 让 LLM 能直接通过飞书 SDK 发送图片/文件给用户
 	if sm.mediaSendFn != nil {
 		reg.Register(NewFeishuSendFileTool(chatID, sm.mediaSendFn))
+	}
+
+	// 注册团队查询工具: 让 LLM 能查询团队状态和报告（解决"找不到团队"的问题）
+	if sm.teamMgr != nil {
+		reg.Register(NewTeamQueryTool(sm.teamMgr))
 	}
 
 	// 注册 MCP 工具 (动态, 对应 TS: assembleToolPool + refreshTools)
