@@ -12,6 +12,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -410,7 +411,19 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 				if lastEvalFeedback != "" {
 					feedbackSection = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastEvalFeedback)
 				}
-				// v2: 确保对抗反馈无论 prompt 来源(StageDef 或 RoleRegistry)都能注入
+
+				// 修复: 将 coder 上轮输出注入 prevResults, 确保 {prev_result} 包含上轮代码
+				// 根因: implement DependsOn=["design"], 所以 {prev_result} 只有架构设计,
+				// coder 每轮都从零开始而非增量修改, 导致 round3 覆盖 round2 的修复。
+				if round > 1 && lastGenOutput != "" {
+					prevSummary := lastGenOutput
+					if len(prevSummary) > 6000 {
+						prevSummary = prevSummary[:6000] + "\n...(上轮输出已截断)"
+					}
+					feedbackSection = fmt.Sprintf("### 你的第 %d 轮代码输出 (在此基础上增量修改, 不要从零重写):\n%s\n\n%s",
+						round-1, prevSummary, feedbackSection)
+				}
+
 				modifiedPrompt := strings.ReplaceAll(genStage.Prompt, "{adversarial_feedback}", feedbackSection)
 				tempStage := genStage
 				tempStage.Prompt = modifiedPrompt
@@ -439,12 +452,35 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 				prevResults[genStage.Name] = sr.Output
 			}
 
-			// Evaluator
+			// 测试左移: 每轮 implement 后立即运行 test, 将结果反馈给 evaluator
+			var inLoopTestOutput string
+			if len(parallelStages) > 0 && round <= maxRounds {
+				for _, ps := range parallelStages {
+					if ps.Role == "tester" {
+						we.notify(we.chatID, fmt.Sprintf("🧪 第 %d 轮快速验证 — %s 运行中...", round, ps.Name))
+						testTemp := ps
+						testTemp.Name = fmt.Sprintf("%s-round%d", ps.Name, round)
+						testResult := we.executeStage(ctx, testTemp, objective, prevResults, team)
+						testResult.Name = testTemp.Name
+						allResults = append(allResults, testResult)
+						if testResult.Status == TaskCompleted {
+							inLoopTestOutput = testResult.Output
+							prevResults[ps.Name] = testResult.Output
+						}
+						break
+					}
+				}
+			}
+
+			// Evaluator (接收 implement + test 的输出)
 			if evalStage != nil {
 				genName := generatorStages[len(generatorStages)-1].Name
 				evalPrevResults := map[string]string{genName: lastGenOutput}
 				for k, v := range prevResults {
 					evalPrevResults[k] = v
+				}
+				if inLoopTestOutput != "" {
+					evalPrevResults["test"] = inLoopTestOutput
 				}
 				modifiedPrompt := strings.ReplaceAll(evalStage.Prompt, "{adversarial_round}", fmt.Sprintf("%d", round))
 				tempStage := *evalStage
@@ -457,7 +493,10 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 				allResults = append(allResults, sr)
 
 				if sr.Status == TaskCompleted {
-					score, _ := ParseEvalScoreJSON([]byte(sr.Output))
+					score, scoreErr := ParseEvalScoreJSON([]byte(sr.Output))
+					if scoreErr != nil {
+						log.Printf("[对抗] 第 %d 轮评分解析失败: %v (原文前200字: %s)", round, scoreErr, truncateResult(sr.Output, 200))
+					}
 					if team.Blackboard != nil {
 						team.Blackboard.Write(fmt.Sprintf("eval-round%d-score", round),
 							fmt.Sprintf("正确性:%.0f 完整性:%.0f 安全性:%.0f 代码质量:%.0f 通过:%v",
@@ -484,10 +523,17 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 		}
 	}
 
-	// Phase 3: 并行收尾阶段 (test, post-production 等)
-	if len(parallelStages) > 0 {
-		we.notify(we.chatID, fmt.Sprintf("🧪 Phase 3: 收尾阶段 (%d)...", len(parallelStages)))
-		testResults := we.executeParallel(ctx, parallelStages, objective, prevResults, team)
+	// Phase 3: 并行收尾阶段 — 跳过已在 Phase 2 循环中运行的 tester
+	var phase3Stages []StageDef
+	for _, ps := range parallelStages {
+		if ps.Role == "tester" {
+			continue // 测试左移: tester 已在每轮循环中运行
+		}
+		phase3Stages = append(phase3Stages, ps)
+	}
+	if len(phase3Stages) > 0 {
+		we.notify(we.chatID, fmt.Sprintf("🧪 Phase 3: 收尾阶段 (%d)...", len(phase3Stages)))
+		testResults := we.executeParallel(ctx, phase3Stages, objective, prevResults, team)
 		allResults = append(allResults, testResults...)
 	}
 

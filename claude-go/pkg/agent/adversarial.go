@@ -70,13 +70,140 @@ func BuildSkepticalEvaluatorUserPrompt(objective, generatorOutput string) string
 	return b.String()
 }
 
-// ParseEvalScoreJSON 从模型返回的 JSON 解析 EvalScore（字段别名兼容）。
+// ParseEvalScoreJSON 从模型返回的文本中提取并解析 EvalScore。
+// 支持多种格式: 纯 JSON、```json 代码块包裹、markdown 前后包含说明文本。
+// 根因修复: reviewer 倾向于输出详细的 markdown 审查报告后附带 JSON，
+// 原实现只做 json.Unmarshal(全文) 导致解析失败, 所有评分变为 0/0/0/0。
 func ParseEvalScoreJSON(raw []byte) (EvalScore, error) {
+	text := string(raw)
+
+	// 策略 1: 直接解析全文 (纯 JSON 输出)
 	var s EvalScore
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return EvalScore{}, err
+	if err := json.Unmarshal(raw, &s); err == nil && (s.Correctness > 0 || s.Completeness > 0) {
+		return s, nil
 	}
-	return s, nil
+
+	// 策略 2: 提取 ```json ... ``` 代码块中的 JSON
+	if idx := strings.Index(text, "```json"); idx >= 0 {
+		start := idx + 7
+		if end := strings.Index(text[start:], "```"); end >= 0 {
+			block := strings.TrimSpace(text[start : start+end])
+			if err := json.Unmarshal([]byte(block), &s); err == nil {
+				return s, nil
+			}
+		}
+	}
+	// 也尝试 ``` 无语言标记的代码块
+	if idx := strings.Index(text, "```\n{"); idx >= 0 {
+		start := idx + 4
+		if end := strings.Index(text[start:], "```"); end >= 0 {
+			block := strings.TrimSpace(text[start : start+end])
+			if err := json.Unmarshal([]byte(block), &s); err == nil {
+				return s, nil
+			}
+		}
+	}
+
+	// 策略 3: 找到最后一个 {...} JSON 对象 (reviewer 通常在末尾输出 JSON)
+	lastBrace := strings.LastIndex(text, "}")
+	if lastBrace >= 0 {
+		// 从 lastBrace 往前找匹配的 {
+		depth := 0
+		for i := lastBrace; i >= 0; i-- {
+			if text[i] == '}' {
+				depth++
+			} else if text[i] == '{' {
+				depth--
+				if depth == 0 {
+					candidate := text[i : lastBrace+1]
+					if err := json.Unmarshal([]byte(candidate), &s); err == nil && (s.Correctness > 0 || s.Completeness > 0) {
+						return s, nil
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// 策略 4: 用正则提取各维度数值 (兜底: reviewer 输出了表格或非标准格式)
+	s = extractScoreFromText(text)
+	if s.Correctness > 0 || s.Completeness > 0 || s.Security > 0 || s.CodeQuality > 0 {
+		return s, nil
+	}
+
+	return EvalScore{}, fmt.Errorf("无法从 evaluator 输出中提取评分 (长度: %d)", len(raw))
+}
+
+// extractScoreFromText 从非 JSON 文本中提取评分 (正则兜底)。
+// 匹配模式: "correctness: 8" "正确性: 8/10" "security = 9" 等。
+func extractScoreFromText(text string) EvalScore {
+	text = strings.ToLower(text)
+	var s EvalScore
+
+	// 有序匹配: 长关键词优先, 避免 "正确" 匹配到 "正确性" 的中间位置
+	type kv struct {
+		keyword string
+		target  *float64
+	}
+	patterns := []kv{
+		{"correctness", &s.Correctness},
+		{"正确性", &s.Correctness},
+		{"正确", &s.Correctness},
+		{"completeness", &s.Completeness},
+		{"完整性", &s.Completeness},
+		{"完整", &s.Completeness},
+		{"security", &s.Security},
+		{"安全性", &s.Security},
+		{"安全", &s.Security},
+		{"code_quality", &s.CodeQuality},
+		{"代码质量", &s.CodeQuality},
+		{"质量", &s.CodeQuality},
+	}
+
+	for _, p := range patterns {
+		if *p.target > 0 {
+			continue // 已被更长的关键词匹配
+		}
+		idx := strings.Index(text, p.keyword)
+		if idx < 0 {
+			continue
+		}
+		after := text[idx+len(p.keyword):]
+		// 跳过分隔符和非数字字符 (: = 空格 中文标点等)
+		for len(after) > 0 {
+			r := rune(after[0])
+			if (r >= '0' && r <= '9') || r == '.' {
+				break
+			}
+			after = after[1:]
+			if len(after) == 0 {
+				break
+			}
+		}
+		var numStr string
+		for _, ch := range after {
+			if ch >= '0' && ch <= '9' || ch == '.' {
+				numStr += string(ch)
+			} else {
+				break
+			}
+		}
+		if numStr != "" {
+			val := 0.0
+			fmt.Sscanf(numStr, "%f", &val)
+			if val > 0 && val <= 10 {
+				*p.target = val
+			}
+		}
+	}
+
+	// pass 判断
+	if strings.Contains(text, "\"pass\": true") || strings.Contains(text, "\"pass\":true") ||
+		strings.Contains(text, "pass: true") || strings.Contains(text, "通过: true") {
+		s.Pass = true
+	}
+
+	return s
 }
 
 // -----------------------------------------------------------------------------

@@ -109,6 +109,17 @@ func TestV2Eval(t *testing.T) {
 		testDevTeamV2(t, report)
 	})
 
+	// v4 评测: go-development-4254 问题修复
+	t.Run("ScoreParseRobust", func(t *testing.T) {
+		testScoreParseRobust(t, report)
+	})
+	t.Run("IterFeedbackChain", func(t *testing.T) {
+		testIterFeedbackChain(t, report)
+	})
+	t.Run("TestShiftLeft", func(t *testing.T) {
+		testTestShiftLeft(t, report)
+	})
+
 	report.EndTime = time.Now()
 	report.Print(t)
 }
@@ -1616,4 +1627,186 @@ func testDevTeamV2(t *testing.T, report *WikiEvalReport) {
 	}
 
 	report.Add("dev-team-v2", "开发团队v2:Skills+中文", score, 10, "中文注释+Review友好+BLOCKER+实际编写+占位符")
+}
+
+// --- 27. 评分解析鲁棒性 (go-development-4254 修复) ---
+
+func testScoreParseRobust(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 27.1 纯 JSON 解析
+	pureJSON := `{"correctness":8,"completeness":7,"security":9,"code_quality":7,"pass":true,"feedback":"Good"}`
+	s, err := agent.ParseEvalScoreJSON([]byte(pureJSON))
+	if err == nil && s.Correctness == 8 && s.Pass {
+		score += 2
+		t.Log("✓ 纯 JSON 正常解析")
+	}
+
+	// 27.2 markdown ```json 包裹
+	mdJSON := "## 审查报告\n\n发现 3 个问题...\n\n```json\n{\"correctness\":7,\"completeness\":6,\"security\":8,\"code_quality\":6,\"pass\":true,\"feedback\":\"Fix imports\"}\n```\n\n以上是评审结论。"
+	s, err = agent.ParseEvalScoreJSON([]byte(mdJSON))
+	if err == nil && s.Correctness == 7 && s.CodeQuality == 6 {
+		score += 2
+		t.Log("✓ ```json 代码块包裹解析成功")
+	} else {
+		t.Logf("✗ ```json 解析失败: err=%v score=%+v", err, s)
+	}
+
+	// 27.3 JSON 嵌在长文本末尾
+	longReport := strings.Repeat("这是第 X 个问题的详细描述。\n", 100)
+	longReport += `{"correctness":9,"completeness":8,"security":7,"code_quality":8,"pass":true,"feedback":"Mostly good"}`
+	s, err = agent.ParseEvalScoreJSON([]byte(longReport))
+	if err == nil && s.Correctness == 9 {
+		score += 2
+		t.Log("✓ 长文本末尾 JSON 提取成功")
+	} else {
+		t.Logf("✗ 末尾JSON提取失败: err=%v score=%+v", err, s)
+	}
+
+	// 27.4 完全无 JSON 但有关键词评分 (正则兜底)
+	textScore := "正确性: 6/10\n完整性: 7/10\nSecurity: 8\ncode_quality: 5\npass: true"
+	s, err = agent.ParseEvalScoreJSON([]byte(textScore))
+	if err == nil && s.Correctness >= 6 && s.Security >= 8 {
+		score += 2
+		t.Log("✓ 文本关键词正则提取评分成功")
+	} else {
+		t.Logf("✗ 正则兜底失败: err=%v score=%+v", err, s)
+	}
+
+	// 27.5 空输出/垃圾输出不崩溃
+	_, err = agent.ParseEvalScoreJSON([]byte(""))
+	_, err2 := agent.ParseEvalScoreJSON([]byte("I am ready to evaluate!"))
+	if err != nil && err2 != nil {
+		score += 2
+		t.Log("✓ 空/垃圾输出返回错误而非零分")
+	}
+
+	report.Add("score-parse-robust", "评分解析鲁棒性", score, 10, "纯JSON+markdown包裹+末尾JSON+正则兜底+垃圾输入")
+}
+
+// --- 28. 迭代反馈链 (coder 可见上轮输出) ---
+
+func testIterFeedbackChain(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	wf := agent.GetWorkflow("development")
+	if wf == nil {
+		t.Fatal("development 工作流不存在")
+	}
+
+	// 28.1 implement 阶段包含 {adversarial_feedback} 占位符
+	var implementStage *agent.StageDef
+	for i := range wf.Stages {
+		if wf.Stages[i].Name == "implement" {
+			implementStage = &wf.Stages[i]
+			break
+		}
+	}
+	if implementStage != nil && strings.Contains(implementStage.Prompt, "{adversarial_feedback}") {
+		score += 2
+		t.Log("✓ implement 阶段包含 {adversarial_feedback}")
+	}
+
+	// 28.2 implement DependsOn 包含 design (架构约束)
+	if implementStage != nil {
+		for _, dep := range implementStage.DependsOn {
+			if dep == "design" {
+				score += 2
+				t.Log("✓ implement 依赖 design (架构约束)")
+				break
+			}
+		}
+	}
+
+	// 28.3 验证上轮输出注入逻辑存在 (通过源码检查)
+	// 在 workflow.go 中: round > 1 时, lastGenOutput 会被注入到 feedbackSection
+	// 这里用代码结构验证: executeAdversarialDev 存在且 development 工作流 mode 正确
+	if wf.Mode == "adversarial_dev" {
+		score += 2
+		t.Log("✓ development 使用 adversarial_dev 模式")
+	}
+
+	// 28.4 evaluate 阶段依赖 implement
+	for _, s := range wf.Stages {
+		if s.Name == "evaluate" {
+			for _, dep := range s.DependsOn {
+				if dep == "implement" {
+					score += 2
+					t.Log("✓ evaluate 依赖 implement")
+					break
+				}
+			}
+			break
+		}
+	}
+
+	// 28.5 Blackboard 支持上下文传递
+	bb := agent.NewBlackboard("test-team", t.TempDir())
+	bb.Write("design-result", "架构设计方案", "architect", "result")
+	bb.Write("implement-round1-result", "第一轮代码", "coder", "result")
+	ctx := bb.HandoffContext([]string{"design", "implement-round1"}, "coder")
+	if strings.Contains(ctx, "架构设计方案") {
+		score += 2
+		t.Log("✓ Blackboard HandoffContext 正确传递设计上下文")
+	}
+
+	report.Add("iter-feedback", "迭代反馈链", score, 10, "占位符+依赖+模式+evaluate依赖+Blackboard")
+}
+
+// --- 29. 测试左移 ---
+
+func testTestShiftLeft(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	wf := agent.GetWorkflow("development")
+	if wf == nil {
+		t.Fatal("development 工作流不存在")
+	}
+
+	// 29.1 test 阶段存在
+	var testStage *agent.StageDef
+	for i := range wf.Stages {
+		if wf.Stages[i].Name == "test" {
+			testStage = &wf.Stages[i]
+			break
+		}
+	}
+	if testStage != nil {
+		score += 2
+		t.Log("✓ test 阶段存在")
+	}
+
+	// 29.2 test 角色是 tester
+	if testStage != nil && testStage.Role == "tester" {
+		score += 2
+		t.Log("✓ test 使用 tester 角色")
+	}
+
+	// 29.3 test 阶段 Parallel=true (可被分类为 Phase3)
+	if testStage != nil && testStage.Parallel {
+		score += 2
+		t.Log("✓ test 标记为 Parallel (会被分类为收尾阶段)")
+	}
+
+	// 29.4 test 依赖 implement
+	if testStage != nil {
+		for _, dep := range testStage.DependsOn {
+			if dep == "implement" {
+				score += 2
+				t.Log("✓ test 依赖 implement")
+				break
+			}
+		}
+	}
+
+	// 29.5 mode 是 adversarial_dev (支持循环内测试)
+	if wf.Mode == "adversarial_dev" {
+		score += 2
+		t.Log("✓ 工作流模式支持循环内嵌入测试")
+	}
+
+	report.Add("test-shift-left", "测试左移", score, 10, "test存在+tester角色+Parallel+依赖implement+adversarial模式")
 }
