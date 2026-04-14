@@ -490,6 +490,16 @@ func (s *SwarmOrchestrator) executeSubTask(
 		}
 	}
 
+	// 蜂群输出验证: 与工作流路径一致, 防止 Agent 空转
+	if reason := validateAgentOutput(result, task.Role); reason != "" {
+		return StageResult{
+			Name: task.ID, Role: task.Role, Status: TaskFailed,
+			Error:   fmt.Sprintf("产出验证失败: %s", reason),
+			Output:  result,
+			StartedAt: start, Duration: duration.Round(time.Second).String(),
+		}
+	}
+
 	return StageResult{
 		Name: task.ID, Role: task.Role, Status: TaskCompleted,
 		Output: result, V2TaskID: v2ID, StartedAt: start,

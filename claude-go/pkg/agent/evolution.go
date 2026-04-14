@@ -744,6 +744,57 @@ type EvolutionStats struct {
 	AvgQuality        float64 `json:"avgQuality"`    // 平均质量分
 }
 
+// CollectMetrics 采集进化引擎的持续观测指标, 写入 Collector。
+// 设计为定期调用 (如每次团队完成后), 用于跟踪进化质量趋势。
+func (ee *EvolutionEngine) CollectMetrics(c interface{ Record(module, name string, value float64) }) {
+	if c == nil {
+		return
+	}
+	ee.mu.RLock()
+	defer ee.mu.RUnlock()
+
+	c.Record("evolution", "evo_experience_count", float64(len(ee.experiences)))
+	c.Record("evolution", "evo_trajectory_count", float64(len(ee.trajectories)))
+
+	// 成功率
+	succCount, failCount := 0, 0
+	for _, t := range ee.trajectories {
+		if t.Success {
+			succCount++
+		} else {
+			failCount++
+		}
+	}
+	total := succCount + failCount
+	if total > 0 {
+		c.Record("evolution", "evo_success_rate", float64(succCount)/float64(total))
+		c.Record("evolution", "evo_fail_trajectory_pct", float64(failCount)/float64(total))
+	}
+
+	// 使用率和质量分布
+	usedCount := 0
+	var qualSum, qualMin, qualMax float64
+	qualMin = 1.0
+	for i, exp := range ee.experiences {
+		if exp.UsageCount > 0 {
+			usedCount++
+		}
+		qualSum += exp.Quality
+		if i == 0 || exp.Quality < qualMin {
+			qualMin = exp.Quality
+		}
+		if exp.Quality > qualMax {
+			qualMax = exp.Quality
+		}
+	}
+	if len(ee.experiences) > 0 {
+		c.Record("evolution", "evo_utilization_rate", float64(usedCount)/float64(len(ee.experiences)))
+		c.Record("evolution", "evo_avg_quality", qualSum/float64(len(ee.experiences)))
+		c.Record("evolution", "evo_quality_min", qualMin)
+		c.Record("evolution", "evo_quality_max", qualMax)
+	}
+}
+
 // --- 工具函数 ---
 
 // evolutionTokenize 中英文混合分词。

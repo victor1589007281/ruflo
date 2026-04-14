@@ -118,6 +118,11 @@ type Dreamer struct {
 	// APIClient LLM API 客户端 (用于 LLM 模式整理)
 	// 通过 SetAPIClient 注入，避免循环依赖
 	APIClient LLMClient
+
+	// MetricsRecorder 指标采集 (通过 SetMetrics 注入)
+	MetricsRecorder interface {
+		Record(module, name string, value float64)
+	}
 }
 
 // NewDreamer 创建 Dreamer 实例
@@ -304,6 +309,9 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 
 	if err != nil {
 		log.Printf("[Dreaming] 整理失败: %v", err)
+		if d.MetricsRecorder != nil {
+			d.MetricsRecorder.Record("dreaming", "dream_error_count", 1)
+		}
 		return
 	}
 
@@ -318,6 +326,25 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 
 	elapsed := time.Since(start)
 	log.Printf("[Dreaming] 整理完成 (耗时 %v, 处理 %d 条会话)", elapsed, len(sessions))
+
+	// 持续观测指标
+	if d.MetricsRecorder != nil {
+		d.MetricsRecorder.Record("dreaming", "dream_count", 1)
+		d.MetricsRecorder.Record("dreaming", "dream_sessions_input", float64(len(sessions)))
+		d.MetricsRecorder.Record("dreaming", "dream_duration_sec", elapsed.Seconds())
+		// 压缩率: 输入会话总字符 / 输出整理结果字符
+		inputSize := 0
+		for _, s := range sessions {
+			inputSize += len(s.Summary)
+		}
+		if outputData, readErr := os.ReadFile(filepath.Join(d.config.MemoryDir, "consolidated.md")); readErr == nil {
+			outputSize := len(outputData)
+			d.MetricsRecorder.Record("dreaming", "dream_output_size", float64(outputSize))
+			if outputSize > 0 {
+				d.MetricsRecorder.Record("dreaming", "dream_compression_ratio", float64(inputSize)/float64(outputSize))
+			}
+		}
+	}
 }
 
 // saveDreamLog 保存每次 dreaming 的产出日志 (解决 dreaming/ 目录为空的问题)。

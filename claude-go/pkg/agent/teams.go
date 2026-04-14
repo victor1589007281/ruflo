@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/logging"
+	"github.com/anthropic/claude-go/pkg/metrics"
 )
 
 // TaskTracker 抽象 V2 任务管理, 与 builtin.TaskStore 通过 duck typing 对接。
@@ -117,6 +118,7 @@ type ProductionTeamManager struct {
 	teams       map[string]*ProductionTeam
 	mu          sync.RWMutex
 	baseDir     string
+	cwd         string // 项目工作目录 (传递给团队, 用于编译验证)
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	mediaNotify MediaNotifyFunc
@@ -127,11 +129,13 @@ type ProductionTeamManager struct {
 	dreamer     DreamRecorder    // Dreaming 接口 (覆盖 team agent 会话)
 	roles       *RoleRegistry    // 角色注册表
 	memWriter   MemoryWriter     // 记忆写入 (团队完成后写入高权重记忆)
+	metrics     *metrics.Collector // 持续观测指标采集器
 }
 
 // TeamManagerConfig 团队管理器配置。
 type TeamManagerConfig struct {
 	BaseDir     string
+	Cwd         string // 项目工作目录 (用于编译验证)
 	Factory     CreateAgentFunc
 	Notify      NotifyFunc
 	MediaNotify MediaNotifyFunc
@@ -149,14 +153,22 @@ func (ptm *ProductionTeamManager) SetMemoryWriter(mw MemoryWriter) {
 	ptm.memWriter = mw
 }
 
+// Metrics 返回内部指标采集器 (供外部模块注入使用)。
+func (ptm *ProductionTeamManager) Metrics() *metrics.Collector {
+	return ptm.metrics
+}
+
 // NewProductionTeamManager 创建生产级团队管理器。
 func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 	if cfg.Notify == nil {
 		cfg.Notify = func(_, _ string) {}
 	}
+	// 指标采集器: 从 BaseDir 推导 stateDir (teams 目录的父目录)
+	stateDir := filepath.Dir(cfg.BaseDir)
 	ptm := &ProductionTeamManager{
 		teams:       make(map[string]*ProductionTeam),
 		baseDir:     cfg.BaseDir,
+		cwd:         cfg.Cwd,
 		factory:     cfg.Factory,
 		notify:      cfg.Notify,
 		mediaNotify: cfg.MediaNotify,
@@ -166,6 +178,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		evolution:   cfg.Evolution,
 		dreamer:     cfg.Dreamer,
 		roles:       cfg.Roles,
+		metrics:     metrics.NewCollector(stateDir),
 	}
 	ptm.loadPersistedTeams()
 	return ptm
@@ -186,6 +199,7 @@ type ProductionTeam struct {
 	FinishedAt time.Time           `json:"finishedAt,omitempty"`
 	Mailbox    []MailMessage       `json:"mailbox,omitempty"`
 	Error      string              `json:"error,omitempty"`
+	Cwd        string              `json:"cwd,omitempty"` // 工作目录 (用于编译验证和文件清单)
 
 	Blackboard *Blackboard `json:"-"` // 共享黑板 (不序列化, 独立持久化)
 	mu         sync.Mutex
@@ -255,6 +269,7 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 		Agents:     make(map[string]*BGAgent),
 		TaskIDs:    make(map[string]string),
 		CreatedAt:  time.Now(),
+		Cwd:        ptm.cwd,
 		Blackboard: NewBlackboard(name, dataDir),
 		mgr:        ptm,
 		dataDir:    dataDir,
@@ -344,6 +359,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		taskTracker: ptm.taskTracker,
 		evolution:   ptm.evolution,
 		roles:       ptm.roles,
+		metrics:     ptm.metrics,
 	}
 
 	// 使用 Coordinator 带重试和检查点执行
@@ -392,11 +408,41 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	logging.LogTeamRun(ctx, report)
 	logging.IncrCounter("team.complete." + team.Workflow)
 
-	// 触发进化学习 (DISTILL: 从轨迹中提炼经验)
+	// 持续观测指标: 团队运行质量
+	if ptm.metrics != nil {
+		labels := map[string]string{"workflow": team.Workflow}
+		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
+		ptm.metrics.RecordRun("team", metrics.MTeamDurationSec, report.DurationSec, team.Name, labels)
+		if team.Status == TeamStatusCompleted {
+			ptm.metrics.RecordRun("team", metrics.MTeamSuccessCount, 1, team.Name, labels)
+		} else {
+			ptm.metrics.RecordRun("team", metrics.MTeamFailCount, 1, team.Name, labels)
+		}
+		// 阶段通过率
+		total, passed := 0, 0
+		totalOutLen := 0
+		for _, s := range report.Stages {
+			total++
+			if s.Status == string(TaskCompleted) {
+				passed++
+			}
+			totalOutLen += s.OutputLen
+		}
+		if total > 0 {
+			ptm.metrics.RecordRun("team", metrics.MTeamStagePassRate, float64(passed)/float64(total), team.Name, labels)
+			ptm.metrics.RecordRun("team", metrics.MTeamOutputAvgLen, float64(totalOutLen)/float64(total), team.Name, labels)
+		}
+	}
+
+	// 触发进化学习 (DISTILL: 从轨迹中提炼经验) + 采集进化指标
 	if ptm.evolution != nil {
+		mc := ptm.metrics
 		go func() {
 			ptm.evolution.LearnFromTeam(context.Background(), team.Name)
 			ptm.evolution.Consolidate()
+			if mc != nil {
+				ptm.evolution.CollectMetrics(mc)
+			}
 		}()
 	}
 
@@ -467,11 +513,34 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 	team.mu.Unlock()
 	team.persist()
 
-	// 触发进化学习 + Dreaming
+	// 蜂群持续观测指标
+	if ptm.metrics != nil {
+		labels := map[string]string{"workflow": "swarm"}
+		dur := team.FinishedAt.Sub(team.StartedAt).Seconds()
+		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
+		ptm.metrics.RecordRun("team", metrics.MTeamDurationSec, dur, team.Name, labels)
+		ptm.metrics.RecordRun("team", metrics.MTeamSuccessCount, 1, team.Name, labels)
+		total, passed := 0, 0
+		for _, s := range results {
+			total++
+			if s.Status == TaskCompleted {
+				passed++
+			}
+		}
+		if total > 0 {
+			ptm.metrics.RecordRun("team", metrics.MTeamStagePassRate, float64(passed)/float64(total), team.Name, labels)
+		}
+	}
+
+	// 触发进化学习 + Dreaming + 进化指标采集
 	if ptm.evolution != nil {
+		mc := ptm.metrics
 		go func() {
 			ptm.evolution.LearnFromTeam(context.Background(), team.Name)
 			ptm.evolution.Consolidate()
+			if mc != nil {
+				ptm.evolution.CollectMetrics(mc)
+			}
 		}()
 	}
 	if ptm.dreamer != nil {

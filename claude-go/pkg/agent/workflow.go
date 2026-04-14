@@ -13,11 +13,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/logging"
+	"github.com/anthropic/claude-go/pkg/metrics"
 )
 
 // WorkflowDef 工作流定义
@@ -365,6 +369,7 @@ type WorkflowExecutor struct {
 	taskTracker TaskTracker      // 复用 V2 Task 系统 (可为 nil)
 	evolution   *EvolutionEngine // 自动进化引擎 (可为 nil)
 	roles       *RoleRegistry    // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
+	metrics     *metrics.Collector // 持续观测指标 (可为 nil)
 }
 
 // Execute 执行工作流, 返回所有阶段结果
@@ -440,17 +445,29 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 					feedbackSection = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastEvalFeedback)
 				}
 
-				// 修复: 将 coder 上轮输出注入 prevResults, 确保 {prev_result} 包含上轮代码
-				// 根因: implement DependsOn=["design"], 所以 {prev_result} 只有架构设计,
-				// coder 每轮都从零开始而非增量修改, 导致 round3 覆盖 round2 的修复。
-				if round > 1 && lastGenOutput != "" {
-					prevSummary := lastGenOutput
-					if len(prevSummary) > 6000 {
-						prevSummary = prevSummary[:6000] + "\n...(上轮输出已截断)"
-					}
-					feedbackSection = fmt.Sprintf("### 你的第 %d 轮代码输出 (在此基础上增量修改, 不要从零重写):\n%s\n\n%s",
-						round-1, prevSummary, feedbackSection)
+				// 跨轮上下文增强:
+			// 根因: implement DependsOn=["design"], {prev_result} 只有架构设计,
+			// 且每轮创建新 Agent (无对话记忆), 导致 round3 从零重写覆盖 round2 修复。
+			// 修复策略:
+			//   a) 上轮输出注入 (提升到 16k 字符, 覆盖更多代码上下文)
+			//   b) 工作区文件清单注入 (让 coder 知道磁盘上已有哪些文件)
+			//   c) 上轮输出同时写入 prevResults[genStage.Name] (确保 {prev_result} 包含上轮代码)
+			if round > 1 && lastGenOutput != "" {
+				prevSummary := lastGenOutput
+				if len(prevSummary) > 16000 {
+					prevSummary = prevSummary[:16000] + "\n...(上轮输出已截断)"
 				}
+				feedbackSection = fmt.Sprintf("### 你的第 %d 轮代码输出 (严禁从零重写, 仅针对反馈做增量修改):\n%s\n\n%s",
+					round-1, prevSummary, feedbackSection)
+
+				// 注入工作区文件清单, 让 coder 知道前几轮在磁盘上创建了哪些文件
+				if team.StartedAt.Unix() > 0 {
+					manifest := workspaceFileManifest(team.Cwd, team.StartedAt)
+					if manifest != "" {
+						feedbackSection = manifest + "\n" + feedbackSection
+					}
+				}
+			}
 
 				modifiedPrompt := strings.ReplaceAll(genStage.Prompt, "{adversarial_feedback}", feedbackSection)
 				tempStage := genStage
@@ -478,6 +495,30 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 				}
 				lastGenOutput = sr.Output
 				prevResults[genStage.Name] = sr.Output
+			}
+
+			// 编译验证门禁: 每轮 implement 后自动运行 go build/vet
+			// 根因: 之前无编译检查, coder 可以产出无法编译的代码并标记 "completed"
+			if team.Cwd != "" {
+				buildErrors := runBuildCheck(team.Cwd)
+				if buildErrors != "" {
+					we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译检查失败, 错误将注入下轮反馈", round))
+					logging.Event(ctx, "adversarial.build_fail", "round", round, "errors_len", len(buildErrors))
+					if we.metrics != nil {
+						we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+					}
+					if lastEvalFeedback == "" {
+						lastEvalFeedback = "### 编译错误 (必须优先修复):\n" + buildErrors
+					} else {
+						lastEvalFeedback = "### 编译错误 (必须优先修复):\n" + buildErrors + "\n\n" + lastEvalFeedback
+					}
+				} else {
+					we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译检查通过", round))
+					logging.Event(ctx, "adversarial.build_pass", "round", round)
+					if we.metrics != nil {
+						we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+					}
+				}
 			}
 
 			// 测试左移: 每轮 implement 后立即运行 test, 将结果反馈给 evaluator
@@ -538,6 +579,10 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 
 					if score.MeetsHardPassThreshold() {
 						we.notify(we.chatID, fmt.Sprintf("✅ 对抗通过！第 %d 轮评审达标。", round))
+						if we.metrics != nil {
+							we.metrics.RecordRun("team", metrics.MTeamEvalPassRate, 1.0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+							we.metrics.RecordRun("team", metrics.MTeamRoundCount, float64(round), team.Name, nil)
+						}
 						break
 					}
 					lastEvalFeedback = score.Feedback
@@ -855,6 +900,11 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		if sr.Status == TaskCompleted {
 			team.Blackboard.Write(stage.Name+"-result", sr.Output, stage.Role, "result")
 			team.Blackboard.Write(stage.Name+"-status", "completed", "system", "progress")
+			// 修复 handoff key 不匹配: 对抗轮次阶段 (如 implement-round3) 同时写入
+			// 基础名 (如 implement-result), 确保 HandoffContext 能正确查找。
+			if baseName := stripRoundSuffix(stage.Name); baseName != stage.Name {
+				team.Blackboard.Write(baseName+"-result", sr.Output, stage.Role, "result")
+			}
 		} else {
 			team.Blackboard.Write(stage.Name+"-status", "failed: "+sr.Error, "system", "progress")
 		}
@@ -1554,6 +1604,84 @@ Hard pass threshold: ALL ≥ 7 AND pass == true.
 			},
 		},
 	}
+}
+
+// stripRoundSuffix 从 "implement-round3" 提取基础名 "implement"。
+// 如果不含 -round 后缀, 返回原名。
+func stripRoundSuffix(name string) string {
+	for i := 1; i <= 20; i++ {
+		suffix := fmt.Sprintf("-round%d", i)
+		if strings.HasSuffix(name, suffix) {
+			return name[:len(name)-len(suffix)]
+		}
+	}
+	return name
+}
+
+// workspaceFileManifest 扫描工作区中最近修改的文件, 生成清单注入 coder prompt。
+// 让每轮 coder 知道前几轮在磁盘上创建/修改了哪些文件, 避免从零重写。
+func workspaceFileManifest(cwd string, since time.Time) string {
+	if cwd == "" {
+		return ""
+	}
+	var files []string
+	_ = filepath.Walk(cwd, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		name := info.Name()
+		if info.IsDir() {
+			if name == ".git" || name == "node_modules" || name == ".claude-go" || name == "__pycache__" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.ModTime().After(since) {
+			rel, _ := filepath.Rel(cwd, path)
+			files = append(files, rel)
+		}
+		return nil
+	})
+	if len(files) == 0 {
+		return ""
+	}
+	if len(files) > 50 {
+		files = files[:50]
+	}
+	return fmt.Sprintf("### 工作区中已创建/修改的文件 (%d 个, 必须在这些文件基础上增量修改):\n```\n%s\n```\n",
+		len(files), strings.Join(files, "\n"))
+}
+
+// runBuildCheck 在工作区运行 go build + go vet, 返回错误输出。
+// 空字符串表示编译通过。
+func runBuildCheck(cwd string) string {
+	if cwd == "" {
+		return ""
+	}
+	// 快速检查: 是否有 go.mod
+	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var errors []string
+	for _, args := range [][]string{{"build", "./..."}, {"vet", "./..."}} {
+		cmd := exec.CommandContext(ctx, "go", args...)
+		cmd.Dir = cwd
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("go %s 失败:\n%s", args[0], string(out)))
+		}
+	}
+	if len(errors) == 0 {
+		return ""
+	}
+	result := strings.Join(errors, "\n\n")
+	if len(result) > 3000 {
+		result = result[:3000] + "\n...(截断)"
+	}
+	return result
 }
 
 func filterParallel(stages []StageDef) []StageDef {

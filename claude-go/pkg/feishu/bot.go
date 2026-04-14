@@ -247,6 +247,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
 		BaseDir:     layout.Teams,
+		Cwd:         config.Cwd,
 		Factory:     bot.sessions.CreateAgentRunner,
 		Notify:      func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
 		MediaNotify: func(chatID string, data []byte, filename, mediaType string) error {
@@ -268,6 +269,11 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 10b. 注入记忆写入 (团队完成后高权重记忆可被检索)
 	bot.teamMgr.SetMemoryWriter(&memoryAdapter{store: bot.memStore})
+
+	// 10c. 注入持续观测指标到 Dreamer (复用 teamMgr 的 Collector)
+	if bot.dreamer != nil && bot.teamMgr.Metrics() != nil {
+		bot.dreamer.MetricsRecorder = bot.teamMgr.Metrics()
+	}
 
 	// 11. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
 	bot.intentRec = agent.NewIntentRecognizer(aiClient)
