@@ -318,6 +318,13 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 
 // executeWorkflow 在后台执行工作流
 func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *ProductionTeam) {
+	// 注入 trace, 确保团队全生命周期有唯一 traceID
+	ctx = logging.WithTrace(ctx)
+	ctx, endSpan := logging.WithSpan(ctx, "team."+team.Name+".execute")
+	defer endSpan()
+	logging.Event(ctx, "team.start", "team", team.Name, "workflow", team.Workflow, "objective", team.Objective)
+	logging.IncrCounter("team.start." + team.Workflow)
+
 	// 蜂群模式: 使用 SwarmOrchestrator
 	if team.Workflow == "swarm" {
 		ptm.executeSwarm(ctx, team)
@@ -364,6 +371,26 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	team.Stages = results
 	team.mu.Unlock()
 	team.persist()
+
+	// 结构化运行报告 (可观测性: 供后续 AI 分析团队运行效果)
+	report := logging.TeamRunReport{
+		TeamName: team.Name, Workflow: team.Workflow, Objective: team.Objective,
+		StartTime: team.StartedAt, EndTime: team.FinishedAt,
+		DurationSec: team.FinishedAt.Sub(team.StartedAt).Seconds(),
+		Status: string(team.Status),
+	}
+	for _, r := range results {
+		durSec := 0.0
+		if d, err := time.ParseDuration(r.Duration); err == nil {
+			durSec = d.Seconds()
+		}
+		report.Stages = append(report.Stages, logging.StageReport{
+			Name: r.Name, Role: r.Role, DurationSec: durSec,
+			Status: string(r.Status), OutputLen: len(r.Output), Error: r.Error,
+		})
+	}
+	logging.LogTeamRun(ctx, report)
+	logging.IncrCounter("team.complete." + team.Workflow)
 
 	// 触发进化学习 (DISTILL: 从轨迹中提炼经验)
 	if ptm.evolution != nil {

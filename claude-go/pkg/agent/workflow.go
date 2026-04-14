@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/logging"
 )
 
 // WorkflowDef 工作流定义
@@ -82,77 +84,95 @@ func swarmWorkflow() *WorkflowDef {
 func developmentWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "development",
-		Description: "对抗式开发流水线: 设计 → [Generator↔Evaluator 对抗实现] → 测试 (3层Harness)",
+		Description: "对抗式开发流水线: 设计 → [Generator↔Evaluator 对抗循环] → 测试 (质量门禁+编译检查)",
 		Mode:        "adversarial_dev",
 		Rounds:      3,
 		Stages: []StageDef{
 			{
 				Name: "design", Role: "architect",
-				Prompt: `You are a senior software architect. Analyze the requirement and produce a detailed technical design.
+				Prompt: `你是高级软件架构师。分析需求并产出详细的技术设计文档。
 
-Requirement: {objective}
+需求: {objective}
 
-Output a design document with:
-1. Architecture overview and key design decisions
-2. Component breakdown with interfaces
-3. Data flow and state management
-4. File structure and naming conventions
-5. Edge cases and error handling strategy
+输出设计文档必须包含:
+1. **架构总览**: 分层架构图(如 CLI→Service→Repository→DB)，标注依赖方向
+2. **模块拆分**: 每个模块的职责、公共接口定义(含方法签名和错误类型)
+3. **数据流**: 核心数据结构定义(struct)、状态机、数据库 Schema
+4. **文件结构**: 完整的目录树，每个文件标注用途和预估行数
+5. **错误处理策略**: 统一错误类型、重试逻辑、边界条件
+6. **关键约束**: 不允许的实现方式(如不允许 Mock/Stub 核心模块、不允许硬编码配置)
 
-Be specific about implementation details. Output in markdown.`,
+重要约束:
+- 核心业务模块不允许使用 Mock/Stub 实现,必须提供真实的工作代码
+- 所有外部依赖(数据库、API)必须有真实的集成代码
+- 配置管理必须集中化(不允许散落的 os.Getenv)
+- 此设计文档是后续 Coder 和 Tester 的约束性参考,他们必须严格遵循
+
+输出格式: Markdown`,
 			},
 			{
 				Name: "implement", Role: "coder", DependsOn: []string{"design"},
-				Prompt: `You are an expert software developer (Generator role in adversarial harness).
-Implement the solution based on the architecture design.
+				Prompt: `你是高级软件工程师(对抗式开发中的 Generator 角色)。
+严格按照架构设计实现完整的可编译、可运行的代码。
 
-Objective: {objective}
+目标: {objective}
 
-Architecture Design:
+架构设计:
 {prev_result}
 
 {adversarial_feedback}
 
-Write clean, production-quality code. Include proper error handling, logging, and documentation.
-Create all necessary files. Use the tools available to write files and run commands.
-If you received Evaluator feedback, address EVERY point before re-submitting.`,
+关键质量要求:
+1. 【禁止空壳】核心模块必须有真实实现,不允许 Mock/Stub/TODO
+2. 【编译通过】每创建/修改一个文件后,立即运行 go build/go vet 验证
+3. 【配置集中】使用统一的 config 包管理配置,不允许散落的 os.Getenv
+4. 【中文注释】关键函数和算法必须有中文注释说明意图
+5. 【增量修改】如果收到 Evaluator 反馈,在上一轮代码基础上修改,不要从零重写
+6. 【错误处理】每个可能失败的操作都要有 error 处理,不允许 _ = err
+
+修复反馈时: 必须逐条处理 Evaluator 的每个 BLOCKER 和 HIGH 问题。`,
 			},
 			{
 				Name: "evaluate", Role: "reviewer", DependsOn: []string{"implement"},
-				Prompt: `You are the Evaluator in an adversarial development harness (read-only, skeptical reviewer).
-Your independent context CANNOT see the Generator's tool calls — only the output summary.
+				Prompt: `你是对抗式开发中的 Evaluator(只读、多疑的审查者)。
 
-Objective: {objective}
+目标: {objective}
 
-Generator Output (attempt #{adversarial_round}):
+Generator 第 {adversarial_round} 轮产出:
 {prev_result}
 
-Score each dimension 0-10. Output STRICTLY as JSON:
-{"correctness": N, "completeness": N, "security": N, "code_quality": N, "pass": bool, "feedback": "..."}
+审查清单(按优先级):
+1. BLOCKER: 编译错误、缺少 import、语法错误 → 必须标注具体文件和行号
+2. CRITICAL: 核心功能未实现(Mock/Stub)、安全漏洞(SQL注入、硬编码密码)
+3. HIGH: 逻辑错误、竞态条件、资源泄漏、缺少错误处理
+4. MEDIUM: 代码规范、命名不当、缺少注释
+5. LOW: 文档补充、测试建议
 
-Hard pass threshold: ALL dimensions >= 6 AND pass == true.
-Be rigorous. Check for:
-- Logic errors, off-by-one, race conditions
-- Missing edge cases, incomplete API coverage
-- Hardcoded secrets, injection vectors, missing auth
-- Code smell, naming, documentation gaps`,
+输出 STRICTLY as JSON (不要在 JSON 前后添加其他文本):
+{"correctness": N, "completeness": N, "security": N, "code_quality": N, "pass": bool, "feedback": "具体的问题列表和修复建议"}
+
+评分标准: 0-10 分。有 BLOCKER → correctness 不超过 3。有未实现的 Stub → completeness 不超过 4。
+通过门槛: ALL dimensions >= 6 AND pass == true。`,
 			},
 			{
 				Name: "test", Role: "tester", DependsOn: []string{"implement"},
-				Prompt: `You are a quality engineer. Write comprehensive tests for the implementation.
+				Prompt: `你是质量工程师。为实现的代码编写完整的测试。
 
-Objective: {objective}
+目标: {objective}
 
-Implementation summary:
+实现摘要:
 {prev_result}
 
-Write tests covering:
-1. Unit tests for all public functions
-2. Edge cases and error paths
-3. Integration tests if applicable
-4. Test data setup and cleanup
+必须实际编写测试代码(不能只说"我准备好了"):
+1. 单元测试: 覆盖所有公共函数,包括正常路径和错误路径
+2. 边界测试: 空输入、超大输入、并发安全
+3. 集成测试: 如果有数据库/外部依赖,编写集成测试
+4. 编译验证: 写完后运行 go test ./... 确保所有测试通过
 
-Use the project's testing framework. Ensure tests are deterministic and independent.`,
+如果测试发现 Bug,详细记录:
+- 失败的测试用例名
+- 期望值 vs 实际值
+- 推测的根因和修复建议`,
 				Parallel: true,
 			},
 		},
@@ -238,27 +258,35 @@ func researchWorkflow() *WorkflowDef {
 			{
 				Name: "synthesize", Role: "synthesizer",
 				DependsOn: []string{"research-tech", "research-market", "research-risk"},
-				Prompt: `你是**首席分析师**，负责综合所有调研结果并撰写最终报告。
+				Prompt: `你是**首席分析师**，负责深度综合所有调研结果并撰写最终报告。
 
 调研主题: {objective}
 
 调研团队产出:
 {prev_result}
 
-## 综合报告要求
+## 综合报告要求 (逐条完成, 不允许偷工减料)
 
-1. **执行摘要** (3-5 条关键发现)
-2. **技术分析** (综合技术研究员的发现，标注数据矛盾点)
-3. **市场分析** (含竞品对比表和成本分析)
-4. **风险评估** (综合风险评分，Top 5 风险列表)
-5. **失败案例与教训** (综合各路调研中的负面案例)
-6. **建议方案** (分优先级，含实施路线图和时间表)
-7. **结论**
+1. **执行摘要** (5-8 条关键发现, 按重要性排序)
+2. **技术深度分析**
+   - 综合技术研究员的发现
+   - **矛盾数据对比表**: 当不同研究员给出不同数据时,列表对比并分析原因
+   - 技术可行性评分 (1-10, 含评分依据)
+3. **市场分析** (竞品对比表、成本分析、ROI)
+4. **风险热力图** (影响×概率矩阵, 标红 Top 5)
+5. **失败案例专题** (综合所有负面案例, 提炼共性教训)
+6. **实施路线图** (分阶段: MVP→Beta→GA, 含里程碑和交付物)
+7. **CVE/安全验证** 
+   - 核查风险审计员引用的每个 CVE 编号
+   - 对无法验证的 CVE 标注 "⚠️ 待人工验证(AI推断)"
+8. **结论与决策建议** (给出明确的"推荐/谨慎推荐/不推荐"评级)
 
-## 特别注意
-- 当不同研究员给出矛盾数据时（如性能指标），必须**标注分歧**并分析原因
-- 明确区分"基于实时搜索验证的数据"和"基于训练知识的推测"
-- 最终报告应可直接作为决策参考文档`,
+## 质量红线
+- 三位研究员的产出必须逐篇阅读、逐条交叉验证, 不允许简单拼接
+- CVE 引用必须标注来源 (NVD URL 或 "AI 推断")
+- 性能数据必须标注测试条件 (如有多个来源给出不同数据, 必须注明差异)
+- 报告长度不少于 500 行 (确保深度整合, 非简单提取)
+- 将报告保存为独立 Markdown 文件`,
 			},
 		},
 	}
@@ -773,6 +801,10 @@ func (we *WorkflowExecutor) ExecuteSingleStage(ctx context.Context, stage StageD
 // executeStage 执行单个阶段。
 // 集成 Blackboard 读/写 + V2 Task 创建/更新 + Structured Handoff + Evolution。
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
+	ctx, endSpan := logging.WithSpan(ctx, "stage."+stage.Name)
+	defer endSpan()
+	logging.Event(ctx, "stage.start", "stage", stage.Name, "role", stage.Role, "team", team.Name)
+
 	// 1. 构建 prompt: 原有模板 + Blackboard 上下文 + Handoff 信息
 	bbContext := ""
 	if team.Blackboard != nil {
@@ -1046,7 +1078,7 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 func financeWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "finance",
-		Description: "金融分析专家团队: 盯盘→情绪→财报→新闻→风险评估→交易建议",
+		Description: "金融分析专家团队: 盯盘→情绪→财报→新闻→风险评估→交易建议 (实时数据驱动)",
 		Mode:        "pipeline",
 		Stages: []StageDef{
 			{
@@ -1055,17 +1087,25 @@ func financeWorkflow() *WorkflowDef {
 
 分析标的: {objective}
 
+⚠️ 关键要求: 
+1. **必须使用 WebSearch 工具**搜索标的的最新价格、市值、交易数据
+2. 分析日期统一使用今天的日期
+3. 所有数据标注来源: 【实时搜索】 vs 【AI估算】 vs 【待确认】
+
 请输出:
 ## 技术面分析
-1. **价格趋势**: 当前价位、近期高低点、趋势方向 (上升/下降/震荡)
-2. **关键技术指标**: MA5/MA20/MA60 均线排列, MACD 金叉/死叉, RSI 超买/超卖, 布林带位置
-3. **成交量分析**: 量价配合情况, 是否放量/缩量
+1. **价格趋势**: 当前价位(WebSearch获取)、近期高低点、趋势方向
+2. **关键技术指标**: MA5/MA20/MA60 均线排列, MACD, RSI, 布林带
+3. **成交量分析**: 量价配合情况
 4. **支撑/阻力位**: 近期关键价格位
-5. **形态分析**: K线组合形态 (头肩顶/双底/三角收敛等)
+5. **形态分析**: K线组合形态
 
-## 技术面评分: X/10 (给出明确评分和理由)
+## 基准假设 (后续分析师必须使用这些统一数值)
+- 当前股价/估值: ¥XXX (标注数据来源和日期)
+- 当前市值: $XXX (标注数据来源)
+- 最新融资轮次: XXX
 
-请基于公开可得的市场知识进行分析。如果是具体股票，请根据你对该公司的了解给出分析。`,
+## 技术面评分: X/10`,
 				Parallel: true,
 			},
 			{
@@ -1074,16 +1114,21 @@ func financeWorkflow() *WorkflowDef {
 
 分析标的: {objective}
 
+⚠️ 关键要求:
+1. **必须使用 WebSearch 工具**搜索最新的新闻、社交媒体讨论、分析师评级
+2. 所有情绪判断必须有真实新闻/事件支撑,不允许凭空推测
+3. **必须将分析结果保存为独立文件** (如 sentiment_report.md)
+
 请输出:
 ## 市场情绪分析
-1. **整体市场情绪**: 贪婪/恐惧指数估计, 市场氛围 (乐观/中性/悲观)
-2. **投资者情绪**: 散户 vs 机构的态度差异, 融资融券余额趋势
-3. **社交媒体情绪**: 讨论热度, 正面/负面情绪比例, 关键观点摘要
-4. **分析师共识**: 买入/持有/卖出评级分布, 目标价区间
-5. **资金流向**: 北向资金/南向资金、主力资金净流入流出
+1. **最新新闻** (WebSearch获取): 近7天的关键新闻事件及其影响
+2. **整体市场情绪**: 贪婪/恐惧指数估计, 市场氛围
+3. **投资者情绪**: 散户 vs 机构, 融资融券趋势
+4. **社交媒体情绪**: 讨论热度, 关键观点
+5. **分析师共识**: 买入/持有/卖出评级 (WebSearch获取)
+6. **资金流向**: 主力资金净流入流出
 
-## 情绪评分: X/10 (1=极度恐惧, 10=极度贪婪)
-## 情绪结论: 一句话总结当前情绪状态`,
+## 情绪评分: X/10 (含评分依据)`,
 				Parallel: true,
 			},
 			{
@@ -1288,14 +1333,21 @@ func techBlogWorkflow() *WorkflowDef {
 5. **代码**: 必要的代码片段 (控制在文章的 20% 以内), 配详细注释
 6. **图文**: 在需要图表的地方用 [图: 描述] 标注 (后续排版阶段处理)
 7. **结尾**: 总结 + 思考 + 引导讨论的问题
+8. **版本演进**: 如果是分析某个技术/框架, 必须包含版本演进时间线
+9. **性能数据**: 至少使用 WebSearch 搜索 1 组真实的 benchmark 数据
+
+## 内容差异化 (如果同主题输出多篇)
+- 入门篇: 完整的基础概念和原理
+- 深度篇: 假设读者已读入门篇, 不重复基础概念, 专注源码和内部实现
+- 思辨篇: 假设读者已读前两篇, 专注设计哲学和行业对比
 
 ## 文章风格
 - 专业但不晦涩, 用类比帮助理解复杂概念
 - 有自己的观点和态度, 不是纯搬运
 - 中文行文流畅, 适合中国技术人阅读习惯
-- 适当使用 emoji 增加可读性 (但不过度)
 
-## 目标: 3000-5000 字的深度技术文章`,
+## 目标: 3000-5000 字的深度技术文章
+## 必须包含: 至少 1 个 benchmark 或性能数据 + 至少 1 个生产环境案例`,
 			},
 			{
 				Name: "formatting", Role: "article-formatter",
@@ -1414,13 +1466,19 @@ func creativeWorkflow() *WorkflowDef {
 
 {adversarial_feedback}
 
-## 生成要求
+## 生成要求 (必须实际输出代码, 禁止角色扮演!)
 请按照创作指令，为每个素材生成完整的 SVG 或 HTML+CSS 代码:
 
 1. **SVG 素材**: 输出完整的 <svg> 代码，包含所有图形元素、渐变、滤镜
 2. **HTML 素材**: 输出完整的 HTML+CSS 代码块，可直接在浏览器中渲染
 3. **动画素材**: 使用 CSS @keyframes 或 SVG SMIL 动画
 4. **视频帧**: 如果是多帧场景，每帧一个独立 SVG/HTML 块
+
+⚠️ 绝对禁止:
+- 不允许只说"我是视觉艺术家，我已就位"然后标记完成
+- 不允许只输出模板或说明文字而不生成实际代码
+- 你的输出中必须包含至少一个完整的 <svg> 或 <html> 代码块
+- 如果无法生成请求的内容，必须生成一个替代方案而非空手而归
 
 ## 质量标准
 - 视觉美观、配色协调
@@ -1429,7 +1487,9 @@ func creativeWorkflow() *WorkflowDef {
 - 文字排版优美、字体选择恰当
 - 响应式设计 (如 viewBox 正确设置)
 
-输出每个素材的完整代码块和渲染说明。`,
+## 输出验证
+- 将生成的素材保存为文件 (使用 Write 工具)
+- 输出每个素材的完整代码块和渲染说明`,
 			},
 			{
 				Name: "visual-review", Role: "art-director",

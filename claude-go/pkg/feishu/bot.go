@@ -739,20 +739,33 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		}
 	}
 
-	// 防护3: 内容指纹去重 — 同一chatID+相同内容30秒内不重复处理
+	// 防护3: 内容指纹去重 — 同一chatID+相同内容 5 秒内不重复处理
+	// 注意: 仅防止飞书 webhook 秒级重复投递, 不阻止用户主动重发相同消息
 	contentFingerprint := chatID + ":" + userText
-	if _, loaded := b.processedMsgs.LoadOrStore("fp:"+contentFingerprint, time.Now().Unix()); loaded {
-		if b.config.Debug {
-			log.Printf("[飞书Bot] 消息去重(内容指纹): %s", messageID)
+	fpKey := "fp:" + contentFingerprint
+	if _, loaded := b.processedMsgs.LoadOrStore(fpKey, time.Now().Unix()); loaded {
+		fpTS, _ := b.processedMsgs.Load(fpKey)
+		if ts, ok := fpTS.(int64); ok && time.Now().Unix()-ts < 5 {
+			if b.config.Debug {
+				log.Printf("[飞书Bot] 消息去重(内容指纹,5s内): %s", messageID)
+			}
+			return nil
 		}
-		return nil
+		// 超过 5 秒的相同内容视为用户主动重发, 允许处理
+		b.processedMsgs.Store(fpKey, time.Now().Unix())
 	}
 
-	// 定期清理 (保留 30 分钟，覆盖飞书最大重试窗口)
+	// 定期清理 (messageID 保留 30 分钟覆盖飞书重试窗口, 指纹仅保留 60 秒)
 	go func() {
 		now := time.Now().Unix()
 		b.processedMsgs.Range(func(k, v interface{}) bool {
-			if ts, ok := v.(int64); ok && now-ts > 1800 {
+			key, _ := k.(string)
+			ts, _ := v.(int64)
+			if strings.HasPrefix(key, "fp:") {
+				if now-ts > 60 {
+					b.processedMsgs.Delete(k)
+				}
+			} else if now-ts > 1800 {
 				b.processedMsgs.Delete(k)
 			}
 			return true
@@ -2232,11 +2245,16 @@ func (b *Bot) processAndReply(chatID, messageID, userText string) {
 		b.sendTextReply(ctx, messageID, b.config.ThinkingMessage)
 	}
 
-	// 处理消息
-	response, err := b.sessions.ProcessMessage(ctx, chatID, userText)
+	// 处理消息 (支持排队: 会话繁忙时消息入队, 处理完自动消费)
+	replyFn := func(resp string) { b.sendLongMessage(context.Background(), chatID, resp) }
+	response, queued, err := b.sessions.ProcessMessageWithQueue(ctx, chatID, userText, replyFn)
 	if err != nil {
 		log.Printf("[飞书Bot] 处理消息失败: chat=%s, err=%v", chatID, err)
 		b.sendTextMessage(ctx, chatID, fmt.Sprintf("处理失败: %v", err))
+		return
+	}
+	if queued {
+		b.sendTextReply(ctx, messageID, response)
 		return
 	}
 

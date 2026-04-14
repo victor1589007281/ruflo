@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ import (
 //   - 独立的 QueryEngine (维护对话历史)
 //   - 独立的工具注册表
 //   - 活跃时间追踪 (用于超时清理)
+//   - 消息队列 (排队等待, 防止消息丢失)
 //
 // 对应概念: 类似 Claude Code 中每个 terminal tab 的独立会话。
 type Session struct {
@@ -35,6 +37,10 @@ type Session struct {
 	LastActive time.Time
 	mu         sync.Mutex
 	processing bool // 是否正在处理消息 (防止并发请求)
+
+	// 消息队列: 当 processing=true 时, 后续消息入队等待, 处理完自动消费
+	pendingMsg   *string // 最多缓存 1 条待处理消息 (最新的覆盖旧的)
+	pendingReply func(string) // 队列消息的回复回调
 }
 
 // IsProcessing 检查当前会话是否正在处理消息
@@ -49,6 +55,25 @@ func (s *Session) SetProcessing(v bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.processing = v
+}
+
+// EnqueuePending 将消息加入等待队列 (仅保留最新一条, 覆盖旧消息)
+func (s *Session) EnqueuePending(text string, reply func(string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingMsg = &text
+	s.pendingReply = reply
+}
+
+// DequeuePending 取出并清空等待队列, 返回 nil 表示队列为空
+func (s *Session) DequeuePending() (*string, func(string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msg := s.pendingMsg
+	reply := s.pendingReply
+	s.pendingMsg = nil
+	s.pendingReply = nil
+	return msg, reply
 }
 
 // Touch 更新最后活跃时间
@@ -397,6 +422,22 @@ func (sm *SessionManager) Stats() (total int, active int) {
 //  4. 收集所有响应
 //  5. 返回格式化的文本
 func (sm *SessionManager) ProcessMessage(ctx context.Context, chatID, userText string) (string, error) {
+	return sm.processMessageInternal(ctx, chatID, userText)
+}
+
+// ProcessMessageWithQueue 处理消息, 如果会话繁忙则排队等待
+// reply 回调用于异步发送排队消息的回复
+func (sm *SessionManager) ProcessMessageWithQueue(ctx context.Context, chatID, userText string, reply func(string)) (string, bool, error) {
+	session := sm.GetOrCreate(chatID)
+	if session.IsProcessing() {
+		session.EnqueuePending(userText, reply)
+		return "上一条消息还在处理中，你的消息已排队，处理完后会自动继续。", true, nil
+	}
+	resp, err := sm.processMessageInternal(ctx, chatID, userText)
+	return resp, false, err
+}
+
+func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, userText string) (string, error) {
 	session := sm.GetOrCreate(chatID)
 
 	if session.IsProcessing() {
@@ -404,7 +445,20 @@ func (sm *SessionManager) ProcessMessage(ctx context.Context, chatID, userText s
 	}
 
 	session.SetProcessing(true)
-	defer session.SetProcessing(false)
+	defer func() {
+		session.SetProcessing(false)
+		// 自动消费队列中的下一条消息
+		if pendingText, pendingReply := session.DequeuePending(); pendingText != nil && pendingReply != nil {
+			go func() {
+				resp, err := sm.processMessageInternal(context.Background(), chatID, *pendingText)
+				if err != nil {
+					pendingReply(fmt.Sprintf("处理排队消息失败: %v", err))
+				} else {
+					pendingReply(resp)
+				}
+			}()
+		}
+	}()
 	session.Touch()
 
 	ch := session.Engine.SubmitMessage(ctx, userText)
