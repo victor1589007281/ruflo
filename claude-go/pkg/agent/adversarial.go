@@ -19,26 +19,142 @@ import (
 
 // EvalScore 评估器对生成结果的多维评分（0–10）与结论。
 // Pass 表示评估器给出的总通过标志；硬门槛另见 MeetsHardPassThreshold。
+//
+// 新增: DesignAlignment (方案对齐度) — 参考 VERIMAP (EACL 2026)
+// 检测实现与架构设计之间的偏差, 而非仅检查代码质量。
 type EvalScore struct {
-	Correctness   float64 `json:"correctness"`
-	Completeness  float64 `json:"completeness"`
-	Security      float64 `json:"security"`
-	CodeQuality   float64 `json:"code_quality"`
-	Feedback      string  `json:"feedback"`
-	Pass          bool    `json:"pass"`
+	Correctness     float64 `json:"correctness"`
+	Completeness    float64 `json:"completeness"`
+	Security        float64 `json:"security"`
+	CodeQuality     float64 `json:"code_quality"`
+	DesignAlignment float64 `json:"design_alignment,omitempty"` // 方案对齐度 (0-10)
+	Feedback        string  `json:"feedback"`
+	Pass            bool    `json:"pass"`
 }
 
 const hardPassMinScore = 6.0
 
 // MeetsHardPassThreshold 若各维度均不低于 6/10 且 Pass 为真，则认为通过硬门槛。
+// DesignAlignment > 0 时也纳入硬门槛 (方案对齐度不达标 = 不通过)
 func (e EvalScore) MeetsHardPassThreshold() bool {
 	if !e.Pass {
+		return false
+	}
+	if e.DesignAlignment > 0 && e.DesignAlignment < hardPassMinScore {
 		return false
 	}
 	return e.Correctness >= hardPassMinScore &&
 		e.Completeness >= hardPassMinScore &&
 		e.Security >= hardPassMinScore &&
 		e.CodeQuality >= hardPassMinScore
+}
+
+// AvgScore 返回所有非零维度的平均分 (用于自适应终止判断)
+func (e EvalScore) AvgScore() float64 {
+	sum, count := 0.0, 0.0
+	for _, v := range []float64{e.Correctness, e.Completeness, e.Security, e.CodeQuality} {
+		sum += v
+		count++
+	}
+	if e.DesignAlignment > 0 {
+		sum += e.DesignAlignment
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return sum / count
+}
+
+// AdaptiveTerminator 自适应对抗终止器。
+// 参考:
+//   - MAgICoRe (EMNLP 2025): 外部 reward model 评分驱动的自适应迭代
+//   - CaRT (2025): 反事实轨迹对比, 教模型判断"何时够了"
+//   - MiCP (2025): 多轮推理的置信度预测 + 覆盖率保证
+//
+// 核心策略: 跟踪评分趋势, 检测收敛/震荡/退化, 动态决定继续或停止。
+type AdaptiveTerminator struct {
+	MinRounds     int       // 最少轮数 (保证充分迭代)
+	MaxRounds     int       // 最多轮数 (硬上限)
+	ScoreHistory  []float64 // 每轮平均分历史
+	PassThreshold float64   // 通过门槛 (默认 6.0)
+
+	// 收敛检测参数
+	ConvergeEpsilon float64 // 相邻两轮评分差小于此值视为收敛
+	DegradeCount    int     // 连续退化轮数
+}
+
+// NewAdaptiveTerminator 创建自适应终止器。
+// 参考 MAgICoRe: 简单问题 1-2 轮, 复杂问题最多 maxRounds 轮
+func NewAdaptiveTerminator(minRounds, maxRounds int) *AdaptiveTerminator {
+	if minRounds <= 0 {
+		minRounds = 1
+	}
+	if maxRounds <= 0 {
+		maxRounds = 5
+	}
+	return &AdaptiveTerminator{
+		MinRounds:       minRounds,
+		MaxRounds:       maxRounds,
+		PassThreshold:   hardPassMinScore,
+		ConvergeEpsilon: 0.5,
+	}
+}
+
+// TerminationDecision 终止决策
+type TerminationDecision struct {
+	ShouldStop bool
+	Reason     string
+	RoundsUsed int
+	MaxRounds  int
+}
+
+// ShouldTerminate 根据当前轮评分决定是否终止。
+// 策略 (参考 MAgICoRe + CaRT):
+//  1. 通过硬门槛 → 立即停止 (质量达标)
+//  2. 未达最小轮数 → 继续 (保证充分探索)
+//  3. 达到最大轮数 → 强制停止
+//  4. 连续2轮评分下降(退化) → 提前停止 (避免过度修正, MAgICoRe "excessive refinement")
+//  5. 相邻评分差 < epsilon (收敛/震荡) → 停止 (改进已饱和)
+func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) TerminationDecision {
+	avg := score.AvgScore()
+	at.ScoreHistory = append(at.ScoreHistory, avg)
+	n := len(at.ScoreHistory)
+
+	// 1. 通过硬门槛
+	if score.MeetsHardPassThreshold() {
+		return TerminationDecision{ShouldStop: true, Reason: "quality_pass", RoundsUsed: round, MaxRounds: at.MaxRounds}
+	}
+
+	// 2. 未达最小轮数
+	if round < at.MinRounds {
+		return TerminationDecision{ShouldStop: false, Reason: "min_rounds", RoundsUsed: round, MaxRounds: at.MaxRounds}
+	}
+
+	// 3. 达到最大轮数
+	if round >= at.MaxRounds {
+		return TerminationDecision{ShouldStop: true, Reason: "max_rounds", RoundsUsed: round, MaxRounds: at.MaxRounds}
+	}
+
+	// 4. 连续退化检测 (MAgICoRe: 避免 excessive refinement)
+	if n >= 2 && at.ScoreHistory[n-1] < at.ScoreHistory[n-2] {
+		at.DegradeCount++
+	} else {
+		at.DegradeCount = 0
+	}
+	if at.DegradeCount >= 2 {
+		return TerminationDecision{ShouldStop: true, Reason: "degradation", RoundsUsed: round, MaxRounds: at.MaxRounds}
+	}
+
+	// 5. 收敛/震荡检测 (改进已饱和)
+	if n >= 2 {
+		delta := at.ScoreHistory[n-1] - at.ScoreHistory[n-2]
+		if delta >= 0 && delta < at.ConvergeEpsilon {
+			return TerminationDecision{ShouldStop: true, Reason: "converged", RoundsUsed: round, MaxRounds: at.MaxRounds}
+		}
+	}
+
+	return TerminationDecision{ShouldStop: false, Reason: "improving", RoundsUsed: round, MaxRounds: at.MaxRounds}
 }
 
 // SkepticalReviewerPersona 用于评估器系统提示的「多疑评审者」人设（硬门槛：各维度 ≥6/10）。

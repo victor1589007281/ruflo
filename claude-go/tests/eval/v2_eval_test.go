@@ -161,6 +161,20 @@ func TestV2Eval(t *testing.T) {
 		testDesignConstraintEnforcement(t, report)
 	})
 
+	// v7 评测: 对抗自适应+偏差检测+职能拆分+Planner抽离
+	t.Run("AdaptiveTermination", func(t *testing.T) {
+		testAdaptiveTermination(t, report)
+	})
+	t.Run("DesignDriftDetection", func(t *testing.T) {
+		testDesignDriftDetection(t, report)
+	})
+	t.Run("RoleSeparation", func(t *testing.T) {
+		testRoleSeparation(t, report)
+	})
+	t.Run("PlannerAgent", func(t *testing.T) {
+		testPlannerAgent(t, report)
+	})
+
 	report.EndTime = time.Now()
 	report.Print(t)
 }
@@ -2460,4 +2474,258 @@ func testDesignConstraintEnforcement(t *testing.T, report *WikiEvalReport) {
 	}
 
 	report.Add("constraint-enforce", "设计约束传递与执行", score, 10, "约束清单+Coder检查+Reviewer审查+Pool集成+检查点")
+}
+
+// === v7 评测: 对抗自适应+偏差检测+职能拆分+Planner ===
+
+// --- 42. 自适应对抗终止 ---
+
+func testAdaptiveTermination(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 42.1 development 工作流使用自适应模式 (Rounds=0)
+	wf := agent.GetWorkflow("development")
+	if wf != nil && wf.Rounds == 0 {
+		score += 2
+		t.Log("✓ development 工作流 Rounds=0 (自适应模式)")
+	}
+
+	// 42.2 AdaptiveTerminator 创建
+	at := agent.NewAdaptiveTerminator(2, 5)
+	if at != nil && at.MinRounds == 2 && at.MaxRounds == 5 {
+		score += 1
+		t.Log("✓ AdaptiveTerminator 创建成功 (min=2, max=5)")
+	}
+
+	// 42.3 通过硬门槛 → 立即停止
+	passScore := agent.EvalScore{Correctness: 8, Completeness: 8, Security: 7, CodeQuality: 7, Pass: true}
+	d := at.ShouldTerminate(3, passScore)
+	if d.ShouldStop && d.Reason == "quality_pass" {
+		score += 2
+		t.Log("✓ 质量达标时立即终止")
+	}
+
+	// 42.4 连续退化 → 提前停止 (MAgICoRe: excessive refinement)
+	at2 := agent.NewAdaptiveTerminator(1, 5)
+	at2.ShouldTerminate(1, agent.EvalScore{Correctness: 5, Completeness: 5, Security: 5, CodeQuality: 5, Pass: false})
+	at2.ShouldTerminate(2, agent.EvalScore{Correctness: 4, Completeness: 4, Security: 4, CodeQuality: 4, Pass: false})
+	d3 := at2.ShouldTerminate(3, agent.EvalScore{Correctness: 3, Completeness: 3, Security: 3, CodeQuality: 3, Pass: false})
+	if d3.ShouldStop && d3.Reason == "degradation" {
+		score += 2
+		t.Log("✓ 连续退化时提前终止 (避免过度修正)")
+	}
+
+	// 42.5 AvgScore 计算 (含 DesignAlignment)
+	s := agent.EvalScore{Correctness: 8, Completeness: 6, Security: 7, CodeQuality: 9, DesignAlignment: 5}
+	avg := s.AvgScore()
+	if avg > 6 && avg < 8 {
+		score += 1
+		t.Logf("✓ AvgScore 计算正确 (含对齐度): %.1f", avg)
+	}
+
+	// 42.6 收敛检测
+	at3 := agent.NewAdaptiveTerminator(1, 5)
+	at3.ShouldTerminate(1, agent.EvalScore{Correctness: 5, Completeness: 5, Security: 5, CodeQuality: 5, Pass: false})
+	d4 := at3.ShouldTerminate(2, agent.EvalScore{Correctness: 5, Completeness: 5, Security: 5.2, CodeQuality: 5, Pass: false})
+	if d4.ShouldStop && d4.Reason == "converged" {
+		score += 2
+		t.Log("✓ 评分收敛时终止 (改进已饱和)")
+	}
+
+	report.Add("adaptive-term", "自适应对抗终止(MAgICoRe)", score, 10, "自适应模式+创建+质量通过+退化停止+均分+收敛")
+}
+
+// --- 43. 方案偏差检测 (VERIMAP) ---
+
+func testDesignDriftDetection(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 43.1 EvalScore 包含 DesignAlignment 字段
+	s := agent.EvalScore{
+		Correctness: 8, Completeness: 7, Security: 7,
+		CodeQuality: 8, DesignAlignment: 4, Pass: true,
+	}
+	// DesignAlignment < 6 时即使其他达标也不通过
+	if !s.MeetsHardPassThreshold() {
+		score += 2
+		t.Log("✓ DesignAlignment<6 → 硬门槛不通过 (偏差阻断)")
+	}
+
+	// 43.2 DesignAlignment >= 6 时正常通过
+	s2 := agent.EvalScore{
+		Correctness: 7, Completeness: 7, Security: 7,
+		CodeQuality: 7, DesignAlignment: 8, Pass: true,
+	}
+	if s2.MeetsHardPassThreshold() {
+		score += 2
+		t.Log("✓ DesignAlignment>=6 → 正常通过")
+	}
+
+	// 43.3 DesignAlignment=0 时向后兼容 (不影响旧逻辑)
+	s3 := agent.EvalScore{
+		Correctness: 7, Completeness: 7, Security: 7,
+		CodeQuality: 7, Pass: true,
+	}
+	if s3.MeetsHardPassThreshold() {
+		score += 2
+		t.Log("✓ DesignAlignment=0 向后兼容")
+	}
+
+	// 43.4 Reviewer prompt 包含 design_alignment 维度
+	wf := agent.GetWorkflow("development")
+	if wf != nil {
+		for _, s := range wf.Stages {
+			if s.Role == "reviewer" {
+				if strings.Contains(s.Prompt, "design_alignment") {
+					score += 2
+					t.Log("✓ Reviewer prompt 包含 design_alignment 评分维度")
+				}
+				break
+			}
+		}
+	}
+
+	// 43.5 Reviewer role 描述包含偏差检测
+	rr := agent.NewRoleRegistry("")
+	reviewerRole := rr.Get("reviewer")
+	if reviewerRole != nil && strings.Contains(reviewerRole.Description, "偏差") {
+		score += 2
+		t.Log("✓ Reviewer 角色描述包含偏差检测")
+	}
+
+	report.Add("drift-detect", "方案偏差检测(VERIMAP)", score, 10, "偏差阻断+正常通过+向后兼容+Reviewer维度+角色描述")
+}
+
+// --- 44. 职能拆分 (研究+设计+计划) ---
+
+func testRoleSeparation(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	wf := agent.GetWorkflow("development")
+	if wf == nil {
+		t.Fatal("development 工作流不存在")
+	}
+
+	// 44.1 工作流包含 research 阶段
+	hasResearch := false
+	for _, s := range wf.Stages {
+		if s.Name == "research" && s.Role == "researcher" {
+			hasResearch = true
+			score += 2
+			t.Log("✓ development 包含独立的 research 阶段")
+			break
+		}
+	}
+	if !hasResearch {
+		t.Log("✗ research 阶段缺失")
+	}
+
+	// 44.2 design 依赖 research
+	for _, s := range wf.Stages {
+		if s.Name == "design" {
+			for _, dep := range s.DependsOn {
+				if dep == "research" {
+					score += 2
+					t.Log("✓ design 依赖 research (职能拆分)")
+					break
+				}
+			}
+			break
+		}
+	}
+
+	// 44.3 plan 阶段存在且依赖 design
+	for _, s := range wf.Stages {
+		if s.Name == "plan" && s.Role == "planner" {
+			for _, dep := range s.DependsOn {
+				if dep == "design" {
+					score += 2
+					t.Log("✓ plan 依赖 design (Planner 独立评估设计)")
+					break
+				}
+			}
+			break
+		}
+	}
+
+	// 44.4 implement 依赖 plan (而非直接依赖 design)
+	for _, s := range wf.Stages {
+		if s.Name == "implement" {
+			for _, dep := range s.DependsOn {
+				if dep == "plan" {
+					score += 2
+					t.Log("✓ implement 依赖 plan (经过独立评估的计划)")
+					break
+				}
+			}
+			break
+		}
+	}
+
+	// 44.5 阶段链: research → design → plan → implement → evaluate → test
+	stageNames := make([]string, 0)
+	for _, s := range wf.Stages {
+		stageNames = append(stageNames, s.Name)
+	}
+	nameStr := strings.Join(stageNames, ",")
+	if strings.Contains(nameStr, "research") && strings.Contains(nameStr, "plan") {
+		score += 2
+		t.Logf("✓ 完整阶段链: %s", nameStr)
+	}
+
+	report.Add("role-separation", "职能拆分(MetaGPT SOP)", score, 10, "research独立+design依赖research+plan依赖design+implement依赖plan+完整链")
+}
+
+// --- 45. 独立 Planner Agent ---
+
+func testPlannerAgent(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 45.1 planner 角色在 RoleRegistry 中注册
+	rr := agent.NewRoleRegistry("")
+	plannerRole := rr.Get("planner")
+	if plannerRole != nil {
+		score += 2
+		t.Log("✓ planner 角色已注册")
+	}
+
+	// 45.2 planner 描述包含"评估设计完整性"
+	if plannerRole != nil && strings.Contains(plannerRole.Description, "评估") {
+		score += 2
+		t.Log("✓ planner 描述包含评估设计完整性")
+	}
+
+	// 45.3 planner SystemPrompt 包含偏差检测点定义
+	if plannerRole != nil && strings.Contains(plannerRole.SystemPrompt, "偏差检测") {
+		score += 2
+		t.Log("✓ planner 定义偏差检测点 (Drift Checkpoints)")
+	}
+
+	// 45.4 planner 在 development workflow 中被使用
+	wf := agent.GetWorkflow("development")
+	found := false
+	if wf != nil {
+		for _, s := range wf.Stages {
+			if s.Role == "planner" {
+				found = true
+				break
+			}
+		}
+	}
+	if found {
+		score += 2
+		t.Log("✓ planner 在 development 工作流中被使用")
+	}
+
+	// 45.5 planner 的 SystemPrompt 引用 Plan-then-Execute 范式
+	if plannerRole != nil && strings.Contains(plannerRole.SystemPrompt, "Plan-then-Execute") {
+		score += 2
+		t.Log("✓ planner 引用 Plan-then-Execute 学术范式")
+	}
+
+	report.Add("planner-agent", "独立Planner Agent(P-t-E)", score, 10, "角色注册+评估设计+偏差检测+工作流集成+学术引用")
 }

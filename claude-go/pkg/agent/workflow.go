@@ -87,55 +87,131 @@ func swarmWorkflow() *WorkflowDef {
 
 func developmentWorkflow() *WorkflowDef {
 	return &WorkflowDef{
-		Name:        "development",
-		Description: "对抗式开发流水线: 设计 → [Generator↔Evaluator 对抗循环] → 测试 (质量门禁+编译检查)",
-		Mode:        "adversarial_dev",
-		Rounds:      3,
+		Name: "development",
+		Description: "研发流水线: 调研→架构→计划→[Generator↔Evaluator 自适应对抗]→测试 (VERIMAP偏差检测)",
+		Mode: "adversarial_dev",
+		// Rounds=0 表示使用自适应终止 (AdaptiveTerminator)
+		// 参考 MAgICoRe: 简单任务1-2轮, 复杂任务最多5轮
+		Rounds: 0,
 		Stages: []StageDef{
+			// === Phase 0: 技术调研 (原架构师的调研职能拆出) ===
+			// 参考 MetaGPT SOP: Product Manager → Architect → Engineer
+			// 改进: 调研由专门角色完成, 架构师聚焦设计决策
 			{
-				Name: "design", Role: "architect",
-				Prompt: `你是高级软件架构师兼开发计划制定者。分析需求并产出技术设计文档 + 开发任务计划。
+				Name: "research", Role: "researcher",
+				Prompt: `你是技术调研专家。深入调研需求涉及的技术方案、最佳实践和已有实现。
 
 需求: {objective}
 
-## Part 1: 技术设计文档 (DESIGN.md)
+## 调研要求
+1. **技术选型**: 列出可选的技术栈、框架、库, 对比优劣
+2. **已有方案**: 搜索 GitHub/业界类似项目, 分析其架构和设计模式
+3. **关键挑战**: 识别技术难点、潜在风险、性能瓶颈
+4. **最佳实践**: 参考业界标准 (如 Go 项目结构、错误处理、测试策略)
+5. **技术约束**: 明确不可行的方案 (如 Go 不支持泛型继承)
 
-输出设计文档必须包含:
-1. **架构总览**: 分层架构图(如 CLI→Service→Repository→DB)，标注依赖方向
-2. **模块拆分**: 每个模块的职责、公共接口定义(含方法签名和错误类型)
+输出:
+- 技术选型对比表 (带推荐理由)
+- 关键技术难点及解决方案
+- 推荐的项目结构和设计模式
+- 参考项目/文章链接`,
+			},
+			// === Phase 1: 架构设计 (聚焦设计决策, 不再兼顾调研) ===
+			{
+				Name: "design", Role: "architect", DependsOn: []string{"research"},
+				Prompt: `你是高级软件架构师。基于调研结果, 产出详细的技术设计文档。
+
+需求: {objective}
+
+技术调研结果:
+{prev_result}
+
+## 设计文档 (DESIGN.md) 必须包含:
+1. **架构总览**: 分层架构图, 标注依赖方向
+2. **模块拆分**: 每个模块的职责、公共接口定义 (含方法签名和错误类型)
 3. **数据流**: 核心数据结构定义(struct)、状态机、数据库 Schema
-4. **文件结构**: 完整的目录树，每个文件标注用途和预估行数
+4. **文件结构**: 完整的目录树, 每个文件标注用途和预估行数
 5. **错误处理策略**: 统一错误类型、重试逻辑、边界条件
-6. **关键约束**: 不允许的实现方式(如不允许 Mock/Stub 核心模块、不允许硬编码配置)
+6. **关键约束清单** (编号 C1, C2, C3...): 
+   - C1: 核心模块禁止 Mock/Stub
+   - C2: 配置集中化 (禁止散落 os.Getenv)
+   - C3: (根据需求补充更多约束)
 
-## Part 2: 开发任务计划 (TASKS.md)
+## 设计验收检查清单 (供 Planner 和 Reviewer 验证):
+- [ ] 所有模块有接口定义
+- [ ] 依赖方向单一 (不存在循环依赖)
+- [ ] 每个接口有错误返回值定义
+- [ ] 文件结构完整且无遗漏`,
+			},
+			// === Phase 2: 独立 Planner 制定开发计划 ===
+			// 参考: Plan-then-Execute (P-t-E) 范式 (arXiv:2510.08517)
+			// 分离"规划"与"设计", Planner 评估设计完整性 + 分解任务
+			{
+				Name: "plan", Role: "planner", DependsOn: []string{"design"},
+				Prompt: `你是开发计划制定者 (独立于架构师的第三方视角)。
 
-将设计文档分解为具体的开发任务, 使用 TaskCreate 工具创建每个任务。
-任务分解原则 (参考: Work Breakdown Structure, WBS):
-1. **原子性**: 每个任务由一个角色在一轮内可完成
-2. **可验证**: 每个任务有明确的验收标准 (如 "go build 通过", "覆盖率>80%")
-3. **依赖清晰**: 标注前置依赖 (如 "依赖任务: 数据层实现")
+需求: {objective}
 
-必须为 Coder 创建的任务:
-- 按模块拆分, 每个模块一个任务
-- 标注该任务对应设计文档的哪个章节
-- 标注验收标准 (编译通过 + 接口对齐)
+架构设计文档:
+{prev_result}
 
-必须为 Tester 创建的任务:
-- 单元测试 (按模块)
-- 集成测试 (跨模块交互)
-- 端到端测试 (完整流程验证)
+## 职责 1: 评估设计完整性 (Design Review)
 
-输出格式:
-### 任务列表
-| # | 任务 | 负责人 | 依赖 | 验收标准 | 优先级 |
-|---|------|--------|------|---------|--------|
+对照需求, 检查架构设计是否有遗漏:
+- [ ] 需求中的每个功能点都有对应模块
+- [ ] 非功能需求 (性能/安全/可靠性) 有对应设计
+- [ ] 接口定义完整 (输入/输出/错误)
+- [ ] 边界条件和异常场景有考虑
+- [ ] 约束清单是否充分
 
-重要约束:
-- 核心业务模块不允许使用 Mock/Stub 实现,必须提供真实的工作代码
-- 所有外部依赖(数据库、API)必须有真实的集成代码
-- 配置管理必须集中化(不允许散落的 os.Getenv)
-- 此设计文档和任务计划是后续 Coder 和 Tester 的约束性参考,他们必须严格遵循`,
+如发现遗漏, 在计划中标注 "⚠️ 设计补充" 项。
+
+## 职责 2: 制定开发计划 (WBS)
+
+将设计分解为可执行任务:
+
+| # | 任务 | 角色 | 依赖 | 设计章节 | 验收标准 | 优先级 |
+|---|------|------|------|---------|---------|--------|
+
+原则:
+1. **原子性**: 每个任务在一轮内可完成
+2. **可追溯**: 每个任务标注对应的设计章节和约束编号
+3. **验收标准**: 具体、可执行 (如 "go build通过 + 接口签名与设计一致")
+4. **依赖拓扑**: 标注前置任务编号, 形成 DAG
+
+## 职责 3: 定义偏差检测点 (Drift Checkpoints)
+
+为 Reviewer 列出关键检测点:
+- 接口签名是否与设计一致?
+- 文件结构是否与设计一致?
+- 约束清单是否全部遵守?
+- 数据结构是否与设计一致?`,
+			},
+			// === Phase 3: 对抗循环 (Coder + Reviewer 含偏差检测) ===
+			{
+				Name: "implement", Role: "coder", DependsOn: []string{"plan"},
+				Prompt: `你是高级软件工程师(对抗式开发中的 Generator 角色)。
+严格按照架构设计和开发计划实现完整的可编译、可运行的代码。
+
+目标: {objective}
+
+开发计划与架构设计:
+{prev_result}
+
+{adversarial_feedback}
+
+关键质量要求:
+1. 【禁止空壳】核心模块必须有真实实现,不允许 Mock/Stub/TODO
+2. 【编译通过】每创建/修改一个文件后,立即运行 go build/go vet 验证
+3. 【配置集中】使用统一的 config 包管理配置,不允许散落的 os.Getenv
+4. 【中文注释】关键函数和算法必须有中文注释说明意图
+5. 【增量修改】如果收到 Evaluator 反馈,在上一轮代码基础上修改,不要从零重写
+6. 【错误处理】每个可能失败的操作都要有 error 处理,不允许 _ = err
+7. 【方案对齐】每个模块实现前, 先检查设计文档的接口定义和约束清单
+
+修复反馈时: 必须逐条处理 Evaluator 的每个 BLOCKER 和 HIGH 问题。
+实现完毕后, 在输出末尾附上:
+**约束检查:** C1 ✅ | C2 ✅ | ... (逐项确认)`,
 			},
 			{
 				Name: "implement", Role: "coder", DependsOn: []string{"design"},
@@ -162,24 +238,44 @@ func developmentWorkflow() *WorkflowDef {
 			{
 				Name: "evaluate", Role: "reviewer", DependsOn: []string{"implement"},
 				Prompt: `你是对抗式开发中的 Evaluator(只读、多疑的审查者)。
+你的核心使命不仅是审查代码质量, 更要检测实现与设计方案的偏差。
 
 目标: {objective}
 
 Generator 第 {adversarial_round} 轮产出:
 {prev_result}
 
-审查清单(按优先级):
-1. BLOCKER: 编译错误、缺少 import、语法错误 → 必须标注具体文件和行号
-2. CRITICAL: 核心功能未实现(Mock/Stub)、安全漏洞(SQL注入、硬编码密码)
-3. HIGH: 逻辑错误、竞态条件、资源泄漏、缺少错误处理
-4. MEDIUM: 代码规范、命名不当、缺少注释
-5. LOW: 文档补充、测试建议
+## 审查维度 (5维度, 每项0-10分):
 
-输出 STRICTLY as JSON (不要在 JSON 前后添加其他文本):
-{"correctness": N, "completeness": N, "security": N, "code_quality": N, "pass": bool, "feedback": "具体的问题列表和修复建议"}
+### 1. correctness (正确性)
+- BLOCKER: 编译错误、缺少 import、语法错误 → 标注文件和行号
+- 逻辑错误、竞态条件、资源泄漏
 
-评分标准: 0-10 分。有 BLOCKER → correctness 不超过 3。有未实现的 Stub → completeness 不超过 4。
-通过门槛: ALL dimensions >= 6 AND pass == true。`,
+### 2. completeness (完整性)
+- 是否覆盖设计文档中所有模块?
+- CRITICAL: 核心功能未实现 (Mock/Stub)
+
+### 3. security (安全性)
+- SQL注入、硬编码密码、敏感数据泄露
+
+### 4. code_quality (代码质量)
+- 命名、结构、中文注释、错误处理
+
+### 5. design_alignment (方案对齐度) ← 关键新增维度
+参考 VERIMAP (EACL 2026) 的偏差检测:
+- 接口签名是否与设计文档一致? (方法名/参数/返回值)
+- 文件结构是否与设计文档一致? (目录树对比)
+- 约束清单 C1/C2/C3... 是否全部遵守?
+- 数据结构 (struct) 是否与设计一致?
+- 依赖方向是否与设计一致? (不存在设计中未声明的依赖)
+偏差不一定是错误, 但必须标注并给出理由 (如 "设计遗漏, 运行时需要此依赖")。
+
+输出 STRICTLY as JSON:
+{"correctness": N, "completeness": N, "security": N, "code_quality": N, "design_alignment": N, "pass": bool, "feedback": "问题列表+修复建议+偏差说明"}
+
+评分标准: 0-10 分。有 BLOCKER → correctness ≤ 3。有 Stub → completeness ≤ 4。
+有严重偏差(如设计中定义的接口未实现/签名不一致) → design_alignment ≤ 4。
+通过门槛: ALL 5 dimensions >= 6 AND pass == true。`,
 			},
 			{
 				Name: "test", Role: "tester", DependsOn: []string{"implement"},
@@ -445,9 +541,16 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	var allResults []StageResult
 	prevResults := make(map[string]string)
 
+	// 自适应轮数: Rounds=0 时使用 AdaptiveTerminator (参考 MAgICoRe)
+	// Rounds>0 时保持向后兼容, 用固定轮数
 	maxRounds := wf.Rounds
-	if maxRounds <= 0 {
-		maxRounds = 3
+	useAdaptive := maxRounds <= 0
+	if useAdaptive {
+		maxRounds = 5 // AdaptiveTerminator 的硬上限
+	}
+	var terminator *AdaptiveTerminator
+	if useAdaptive {
+		terminator = NewAdaptiveTerminator(2, maxRounds)
 	}
 
 	// === 动态发现阶段角色 ===
@@ -633,18 +736,45 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 					if scoreErr != nil {
 						log.Printf("[对抗] 第 %d 轮评分解析失败: %v (原文前200字: %s)", round, scoreErr, truncateResult(sr.Output, 200))
 					}
+
+					// 格式化包含方案对齐度的评分
+					scoreMsg := fmt.Sprintf("正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f",
+						score.Correctness, score.Completeness, score.Security, score.CodeQuality)
+					if score.DesignAlignment > 0 {
+						scoreMsg += fmt.Sprintf(" 对齐=%.0f", score.DesignAlignment)
+					}
+
 					if team.Blackboard != nil {
 						team.Blackboard.Write(fmt.Sprintf("eval-round%d-score", round),
-							fmt.Sprintf("正确性:%.0f 完整性:%.0f 安全性:%.0f 代码质量:%.0f 通过:%v",
-								score.Correctness, score.Completeness, score.Security, score.CodeQuality, score.Pass),
+							scoreMsg+fmt.Sprintf(" 通过:%v", score.Pass),
 							"evaluator", "score")
 					}
 
-					we.notify(we.chatID, fmt.Sprintf("📊 第 %d 轮评分: 正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f | %s",
-						round, score.Correctness, score.Completeness, score.Security, score.CodeQuality,
-						map[bool]string{true: "✅ 通过", false: "❌ 未通过"}[score.MeetsHardPassThreshold()]))
+					passLabel := map[bool]string{true: "✅ 通过", false: "❌ 未通过"}[score.MeetsHardPassThreshold()]
+					we.notify(we.chatID, fmt.Sprintf("📊 第 %d 轮评分: %s | %s", round, scoreMsg, passLabel))
 
-					if score.MeetsHardPassThreshold() {
+					// 自适应终止判断 (MAgICoRe + CaRT)
+					if terminator != nil {
+						decision := terminator.ShouldTerminate(round, score)
+						if decision.ShouldStop {
+							reasonCN := map[string]string{
+								"quality_pass": "质量达标",
+								"max_rounds":   fmt.Sprintf("达到最大轮数(%d)", maxRounds),
+								"degradation":  "连续退化(过度修正)",
+								"converged":    "改进已饱和(收敛)",
+							}[decision.Reason]
+							we.notify(we.chatID, fmt.Sprintf("🏁 自适应终止: %s (第%d轮, 原因: %s)", passLabel, round, reasonCN))
+							if we.metrics != nil {
+								we.metrics.RecordRun("team", metrics.MTeamEvalPassRate,
+									map[bool]float64{true: 1.0, false: 0.0}[score.MeetsHardPassThreshold()],
+									team.Name, map[string]string{"round": fmt.Sprint(round), "termination": decision.Reason})
+								we.metrics.RecordRun("team", metrics.MTeamRoundCount, float64(round), team.Name, nil)
+							}
+							break
+						}
+						we.notify(we.chatID, fmt.Sprintf("🔄 自适应继续: 评分趋势=%s, 已用%d/%d轮", decision.Reason, round, maxRounds))
+					} else if score.MeetsHardPassThreshold() {
+						// 固定轮数模式: 通过即停
 						we.notify(we.chatID, fmt.Sprintf("✅ 对抗通过！第 %d 轮评审达标。", round))
 						if we.metrics != nil {
 							we.metrics.RecordRun("team", metrics.MTeamEvalPassRate, 1.0, team.Name, map[string]string{"round": fmt.Sprint(round)})
@@ -652,6 +782,7 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 						}
 						break
 					}
+
 					lastEvalFeedback = score.Feedback
 					if lastEvalFeedback == "" {
 						lastEvalFeedback = sr.Output
