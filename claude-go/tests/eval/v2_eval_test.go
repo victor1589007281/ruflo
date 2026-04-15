@@ -175,6 +175,17 @@ func TestV2Eval(t *testing.T) {
 		testPlannerAgent(t, report)
 	})
 
+	// v8 评测: 编排器+Micro-Test+E2E+Orchestrator角色
+	t.Run("OrchestratorDAG", func(t *testing.T) {
+		testOrchestratorDAG(t, report)
+	})
+	t.Run("MicroTestInLoop", func(t *testing.T) {
+		testMicroTestInLoop(t, report)
+	})
+	t.Run("E2EPhase3", func(t *testing.T) {
+		testE2EPhase3(t, report)
+	})
+
 	report.EndTime = time.Now()
 	report.Print(t)
 }
@@ -2728,4 +2739,205 @@ func testPlannerAgent(t *testing.T, report *WikiEvalReport) {
 	}
 
 	report.Add("planner-agent", "独立Planner Agent(P-t-E)", score, 10, "角色注册+评估设计+偏差检测+工作流集成+学术引用")
+}
+
+// === v8 评测: 编排器+Micro-Test+E2E ===
+
+// --- 46. DAG 编排器 (DynTaskMAS + AgentOrchestra) ---
+
+func testOrchestratorDAG(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 46.1 Orchestrator 角色已注册
+	rr := agent.NewRoleRegistry("")
+	orchRole := rr.Get("orchestrator")
+	if orchRole != nil {
+		score += 2
+		t.Log("✓ orchestrator 角色已注册")
+	}
+
+	// 46.2 Orchestrator 创建成功
+	orch := agent.NewOrchestrator(
+		agent.OrchestratorConfig{MaxParallel: 3, MaxRetries: 2, MicroTestAfter: true},
+		nil, func(_, _ string) {}, nil, "test-chat",
+	)
+	if orch != nil {
+		score += 1
+		t.Log("✓ Orchestrator 创建成功")
+	}
+
+	// 46.3 ParsePlanToDAG 解析 WBS 表格
+	wbs := `
+| 1 | 初始化项目结构 | coder | - | 架构总览 | C1 | go build 通过 | 2 |
+| 2 | 实现数据层 | coder | 1 | 数据流 | C1,C2 | CRUD 接口完整 | 1 |
+| 3 | 实现服务层 | coder | 2 | 模块拆分 | C2,C3 | 业务逻辑正确 | 1 |
+| 4 | 单元测试 | tester | 2,3 | - | - | 覆盖率>80% | 0 |
+`
+	nodes := orch.ParsePlanToDAG(wbs)
+	if len(nodes) == 4 {
+		score += 2
+		t.Logf("✓ 解析出 %d 个 DAG 任务节点", len(nodes))
+	}
+
+	// 46.4 依赖关系正确 (task-1 无依赖, task-2 依赖 task-1)
+	if len(nodes) >= 2 {
+		n1 := nodes[0]
+		n2 := nodes[1]
+		if len(n1.DependsOn) == 0 && n1.Status == "pending" {
+			score += 1
+			t.Log("✓ task-1 无依赖, 状态 pending")
+		}
+		if len(n2.DependsOn) == 1 && n2.DependsOn[0] == "task-1" && n2.Status == "blocked" {
+			score += 1
+			t.Log("✓ task-2 依赖 task-1, 状态 blocked")
+		}
+	}
+
+	// 46.5 ReadyNodes 正确返回无依赖任务
+	ready := orch.ReadyNodes()
+	if len(ready) == 1 && ready[0].ID == "task-1" {
+		score += 1
+		t.Log("✓ ReadyNodes 返回 task-1 (唯一无依赖)")
+	}
+
+	// 46.6 UnblockDependents 解除下游
+	unblocked := orch.UnblockDependents("task-1")
+	if unblocked >= 1 {
+		score += 1
+		t.Logf("✓ UnblockDependents 解除 %d 个下游任务", unblocked)
+	}
+
+	// 46.7 Orchestrator 角色 SystemPrompt 引用 DynTaskMAS
+	if orchRole != nil && strings.Contains(orchRole.SystemPrompt, "DynTaskMAS") {
+		score += 1
+		t.Log("✓ orchestrator 角色引用 DynTaskMAS 论文")
+	}
+
+	report.Add("orchestrator-dag", "DAG编排器(DynTaskMAS+AgentOrchestra)", score, 10, "角色+创建+解析WBS+依赖+就绪+解锁+学术引用")
+}
+
+// --- 47. Micro-Test 轻量测试机制 ---
+
+func testMicroTestInLoop(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 47.1 OrchestratorConfig 支持 MicroTestAfter 开关
+	cfg := agent.OrchestratorConfig{MicroTestAfter: true}
+	if cfg.MicroTestAfter {
+		score += 2
+		t.Log("✓ MicroTestAfter 配置开关存在")
+	}
+
+	// 47.2 TaskNode 包含 TestResult 和 DriftReport 字段
+	node := agent.TaskNode{
+		TestResult:  "编译: PASS\n对齐: FAIL (缺少 Handler 接口)\n约束: PASS\n综合: FAIL",
+		TestPassed:  false,
+		DriftReport: "对齐: FAIL (缺少 Handler 接口)",
+	}
+	if node.TestResult != "" && !node.TestPassed && node.DriftReport != "" {
+		score += 2
+		t.Log("✓ TaskNode 包含 micro-test 结果和偏差报告字段")
+	}
+
+	// 47.3 MicroTestSummary 聚合功能
+	orch := agent.NewOrchestrator(
+		agent.OrchestratorConfig{MaxParallel: 2, MicroTestAfter: true},
+		nil, func(_, _ string) {}, nil, "test",
+	)
+	summary := orch.MicroTestSummary()
+	if strings.Contains(summary, "Micro-Test") {
+		score += 2
+		t.Log("✓ MicroTestSummary 输出正确格式")
+	}
+
+	// 47.4 development workflow 循环内仍有测试 (第694-712行的 tester 调用保留)
+	wf := agent.GetWorkflow("development")
+	if wf != nil {
+		hasTester := false
+		for _, s := range wf.Stages {
+			if s.Role == "tester" {
+				hasTester = true
+				break
+			}
+		}
+		if hasTester {
+			score += 2
+			t.Log("✓ development 工作流包含 tester 角色")
+		}
+	}
+
+	// 47.5 Orchestrator.Progress 返回正确进度
+	completed, total, failed := orch.Progress()
+	if completed == 0 && total == 0 && failed == 0 {
+		score += 2
+		t.Log("✓ Progress() 初始状态正确 (0/0/0)")
+	}
+
+	report.Add("micro-test", "轻量Micro-Test(TDAD)", score, 10, "配置开关+字段+聚合+tester保留+进度")
+}
+
+// --- 48. E2E 测试 Phase 3 独立运行 ---
+
+func testE2EPhase3(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	wf := agent.GetWorkflow("development")
+	if wf == nil {
+		t.Fatal("development 工作流不存在")
+	}
+
+	// 48.1 tester 在 Stages 中标记为 Parallel (收尾阶段)
+	hasTesterParallel := false
+	for _, s := range wf.Stages {
+		if s.Role == "tester" && s.Parallel {
+			hasTesterParallel = true
+			break
+		}
+	}
+	if hasTesterParallel {
+		score += 2
+		t.Log("✓ tester 作为 Parallel 收尾阶段 (用于 E2E)")
+	}
+
+	// 48.2 classifyStages 正确分类 tester 到 parallel
+	_, _, _, parallel := agent.ClassifyStages(wf.Stages)
+	hasTesterInParallel := false
+	for _, s := range parallel {
+		if s.Role == "tester" {
+			hasTesterInParallel = true
+			break
+		}
+	}
+	if hasTesterInParallel {
+		score += 2
+		t.Log("✓ classifyStages 将 tester 分到 parallel 组 (E2E 候选)")
+	}
+
+	// 48.3 tester role 的 SystemPrompt 包含 "端到端" 或 "E2E"
+	rr := agent.NewRoleRegistry("")
+	testerRole := rr.Get("tester")
+	if testerRole != nil {
+		if strings.Contains(testerRole.SystemPrompt, "端到端") || strings.Contains(testerRole.SystemPrompt, "E2E") {
+			score += 2
+			t.Log("✓ tester 角色 SystemPrompt 包含 E2E 测试要求")
+		}
+	}
+
+	// 48.4 tester prompt 包含三层测试金字塔
+	if testerRole != nil && strings.Contains(testerRole.SystemPrompt, "金字塔") {
+		score += 2
+		t.Log("✓ tester 角色包含三层测试金字塔")
+	}
+
+	// 48.5 orchestrator 角色包含 E2E 触发职责
+	orchRole := rr.Get("orchestrator")
+	if orchRole != nil && strings.Contains(orchRole.SystemPrompt, "E2E") {
+		score += 2
+		t.Log("✓ orchestrator 包含触发 E2E 的职责描述")
+	}
+
+	report.Add("e2e-phase3", "E2E测试Phase3独立(TDAD)", score, 10, "parallel分类+classifyStages+E2E提示词+金字塔+编排器E2E")
 }

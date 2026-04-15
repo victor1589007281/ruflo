@@ -794,16 +794,76 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 		}
 	}
 
-	// Phase 3: 并行收尾阶段 — 跳过已在 Phase 2 循环中运行的 tester
+	// Phase 3: E2E 测试 + 非 tester 的并行收尾阶段
+	// 改进: tester 在 Phase 2 循环内以 micro-test 模式运行 (轻量、每轮),
+	// Phase 3 单独运行 E2E 全量测试 + 其他收尾阶段。
+	// 参考 TDAD (2026): 循环内选择性测试 (轻量), Phase 3 全量集成测试。
 	var phase3Stages []StageDef
-	for _, ps := range parallelStages {
+	var e2eStage *StageDef
+	for i, ps := range parallelStages {
 		if ps.Role == "tester" {
-			continue // 测试左移: tester 已在每轮循环中运行
+			e2eStage = &parallelStages[i]
+			continue
 		}
 		phase3Stages = append(phase3Stages, ps)
 	}
+
+	// E2E 全量测试 (独立于对抗循环内的 micro-test)
+	if e2eStage != nil {
+		we.notify(we.chatID, "🧪 Phase 3: 端到端全量测试 (E2E)...")
+		e2ePrompt := fmt.Sprintf(`你是高级质量工程师 (E2E 全量测试模式)。
+所有编码任务已完成, 现在进行跨模块端到端测试。
+
+目标: %s
+
+所有阶段的产出:
+%s
+
+## E2E 测试要求 (区别于循环内 micro-test)
+循环内 micro-test 已验证每个任务的编译+接口对齐。
+你的职责是更高层次的集成测试:
+
+### 1. 跨模块集成测试
+- 模块间接口调用链路是否正确连通
+- 数据在模块间传递的完整性和正确性
+- 错误从底层到上层的正确传播
+
+### 2. 端到端流程测试
+- 从用户输入到最终输出的完整 Happy Path
+- 关键 Error Path (非法输入、异常状态)
+- 如果是 CLI: 命令行参数→执行→输出 完整链路
+- 如果是 API: HTTP 请求→处理→响应 完整链路
+
+### 3. 整体一致性验证
+- go build ./... && go vet ./... 必须通过
+- go test -race ./... 检查竞态条件
+
+## 如发现 Bug, 详细记录并建议修复方案。
+必须实际编写测试代码并运行。`,
+			objective, buildPrevResultsSummary(prevResults))
+		e2eStageDef := StageDef{Name: "e2e-test", Role: "tester", Prompt: e2ePrompt}
+		e2eResult := we.executeStage(ctx, e2eStageDef, objective, prevResults, team)
+		e2eResult.Name = "e2e-test"
+		allResults = append(allResults, e2eResult)
+		prevResults["e2e-test"] = e2eResult.Output
+
+		// E2E 测试发现 Bug → 驱动 coder 修复 (最多1轮修复)
+		if e2eResult.Status == TaskCompleted && strings.Contains(strings.ToLower(e2eResult.Output), "bug") {
+			we.notify(we.chatID, "🔧 E2E 发现问题, 驱动 coder 修复...")
+			fixPrompt := fmt.Sprintf(`E2E 测试发现以下问题, 请修复:
+
+%s
+
+请逐一修复所有发现的 Bug, 确保 go build 和 go test 通过。`, e2eResult.Output)
+			fixStage := StageDef{Name: "e2e-fix", Role: "coder", Prompt: fixPrompt}
+			fixResult := we.executeStage(ctx, fixStage, objective, prevResults, team)
+			fixResult.Name = "e2e-fix"
+			allResults = append(allResults, fixResult)
+		}
+	}
+
 	if len(phase3Stages) > 0 {
-		we.notify(we.chatID, fmt.Sprintf("🧪 Phase 3: 收尾阶段 (%d)...", len(phase3Stages)))
+		we.notify(we.chatID, fmt.Sprintf("📦 Phase 3: 收尾阶段 (%d)...", len(phase3Stages)))
 		testResults := we.executeParallel(ctx, phase3Stages, objective, prevResults, team)
 		allResults = append(allResults, testResults...)
 	}
@@ -1880,6 +1940,19 @@ func runBuildCheck(cwd string) string {
 		result = result[:3000] + "\n...(截断)"
 	}
 	return result
+}
+
+// buildPrevResultsSummary 将 prevResults map 构建为 summary 字符串 (用于 E2E prompt)
+func buildPrevResultsSummary(prevResults map[string]string) string {
+	var b strings.Builder
+	for name, output := range prevResults {
+		summary := output
+		if len(summary) > 3000 {
+			summary = summary[:3000] + "\n...(已截断)"
+		}
+		b.WriteString(fmt.Sprintf("### %s:\n%s\n\n", name, summary))
+	}
+	return b.String()
 }
 
 func filterParallel(stages []StageDef) []StageDef {
