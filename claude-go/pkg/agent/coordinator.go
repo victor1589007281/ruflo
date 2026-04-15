@@ -110,33 +110,13 @@ func (c *Coordinator) RunWithRecovery(
 	case "adversarial":
 		return executor.Execute(ctx, wf, objective, team)
 	case "adversarial_dev":
-		// 检查点恢复: 如果 design 阶段已有检查点, 注入已完成的设计结果
-		designCP := c.getDesignCheckpoint(wf)
-		if designCP != "" {
-			c.notify(c.chatID, "♻️ 设计阶段从检查点恢复 (跳过)")
-		}
-		results, err := executor.Execute(ctx, wf, objective, team)
-		// 保存最终检查点
-		for _, r := range results {
-			if r.Status == TaskCompleted {
-				c.saveCheckpoint(r.Name, "completed", 0, r.Output)
-			}
-		}
-		return results, err
+		// 检查点恢复和保存由 executor 内部细粒度处理 (每个 phase / 每个 task)
+		return executor.Execute(ctx, wf, objective, team)
 	default:
 		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 	}
 }
 
-// getDesignCheckpoint 从检查点中恢复 design 阶段的输出。
-func (c *Coordinator) getDesignCheckpoint(wf *WorkflowDef) string {
-	for _, stage := range wf.Stages {
-		if cp, ok := c.checkpoints[stage.Name]; ok && cp.Status == "completed" && cp.Output != "" {
-			return cp.Output
-		}
-	}
-	return ""
-}
 
 func (c *Coordinator) runPipelineWithRecovery(
 	ctx context.Context,
@@ -334,6 +314,25 @@ func (c *Coordinator) checkTeamHealth(team *ProductionTeam) {
 }
 
 // --- 检查点持久化 ---
+
+// CheckpointStore 检查点存取接口, 供 WorkflowExecutor / Orchestrator 在执行过程中细粒度存取。
+// Coordinator 隐式实现此接口。
+type CheckpointStore interface {
+	SaveCheckpoint(stageName, status string, attempt int, output string)
+	GetCheckpoint(stageName string) *Checkpoint
+}
+
+// SaveCheckpoint 保存阶段检查点 (导出, 供 WorkflowExecutor 调用)。
+func (c *Coordinator) SaveCheckpoint(stageName, status string, attempt int, output string) {
+	c.saveCheckpoint(stageName, status, attempt, output)
+}
+
+// GetCheckpoint 获取指定阶段的检查点 (导出, 供恢复逻辑使用)。
+func (c *Coordinator) GetCheckpoint(stageName string) *Checkpoint {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.checkpoints[stageName]
+}
 
 func (c *Coordinator) saveCheckpoint(stageName, status string, attempt int, output string) {
 	c.mu.Lock()

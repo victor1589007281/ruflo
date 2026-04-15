@@ -508,6 +508,7 @@ type WorkflowExecutor struct {
 	roles       *RoleRegistry      // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
 	metrics     *metrics.Collector // 持续观测指标 (可为 nil)
 	pool        *AgentPool         // Agent 池 (动态扩缩, 可为 nil)
+	checkpoints CheckpointStore    // 检查点存取 (由 Coordinator 注入, 可为 nil)
 }
 
 // tryInitDAG 从 taskTracker 检测 DAG 能力
@@ -551,9 +552,13 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	maxRounds, terminator := we.initAdaptiveTerminator(wf)
 	we.tryInitDAG()
 
+	// 恢复检查点: 如果有已完成的阶段, 跳过并注入 prevResults
+	we.restoreCheckpoints(wf.Stages, prevResults, &allResults)
+
 	// Phase 1: 设计阶段
 	designResults, err := we.runDesignPhase(ctx, designStages, objective, prevResults, team)
 	allResults = append(allResults, designResults...)
+	we.savePhaseCheckpoints(designResults)
 	if err != nil {
 		return allResults, err
 	}
@@ -565,6 +570,7 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 		orchResults, orchErr := we.runOrchestratedPhase(ctx, planOutput, objective, prevResults, team)
 		if orchErr == nil && len(orchResults) > 0 {
 			allResults = append(allResults, orchResults...)
+			we.savePhaseCheckpoints(orchResults)
 			orchUsed = true
 		} else if orchErr != nil {
 			we.notify(we.chatID, fmt.Sprintf("⚠️ Orchestrator 启动失败, fallback 对抗循环: %v", orchErr))
@@ -572,24 +578,70 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	}
 
 	if !orchUsed {
-		// 仅 fallback 路径使用粗糙 pool 扩缩
 		we.autoScalePool(wf, designStages, generatorStages, evalStage, parallelStages, maxRounds)
 		advResults, err := we.runAdversarialLoop(ctx, generatorStages, evalStage, maxRounds, terminator, objective, prevResults, team)
 		allResults = append(allResults, advResults...)
+		we.savePhaseCheckpoints(advResults)
 		if err != nil {
 			return allResults, err
 		}
 	}
 
-	// Phase 3: E2E 对抗测试 (tester↔coder 自适应循环)
+	// Phase 3: E2E 对抗测试
 	e2eResults := we.runE2EAdversarial(ctx, parallelStages, objective, prevResults, team)
 	allResults = append(allResults, e2eResults...)
+	we.savePhaseCheckpoints(e2eResults)
 
-	// Phase 4: 非测试的收尾阶段
+	// Phase 4: 收尾阶段
 	finishResults := we.runFinishPhase(ctx, parallelStages, objective, prevResults, team)
 	allResults = append(allResults, finishResults...)
+	we.savePhaseCheckpoints(finishResults)
 
 	return allResults, nil
+}
+
+// savePhaseCheckpoints 批量保存一个 phase 内所有阶段的检查点。
+func (we *WorkflowExecutor) savePhaseCheckpoints(results []StageResult) {
+	if we.checkpoints == nil {
+		return
+	}
+	for _, r := range results {
+		if r.Name == "" {
+			continue
+		}
+		if r.Status == TaskCompleted {
+			we.checkpoints.SaveCheckpoint(r.Name, "completed", 0, r.Output)
+		} else if r.Status == TaskFailed {
+			we.checkpoints.SaveCheckpoint(r.Name, "failed", 0, r.Error)
+		}
+	}
+}
+
+// restoreCheckpoints 从检查点恢复已完成阶段, 注入 prevResults + allResults。
+func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults map[string]string, allResults *[]StageResult) {
+	if we.checkpoints == nil {
+		return
+	}
+	restored := 0
+	for _, stage := range stages {
+		cp := we.checkpoints.GetCheckpoint(stage.Name)
+		if cp == nil || cp.Status != "completed" || cp.Output == "" {
+			continue
+		}
+		prevResults[stage.Name] = cp.Output
+		// 角色别名也注入 (design 阶段的 key 可能是 role name)
+		if stage.Role != "" {
+			prevResults[stage.Role] = cp.Output
+		}
+		*allResults = append(*allResults, StageResult{
+			Name: stage.Name, Role: stage.Role, Status: TaskCompleted,
+			Output: cp.Output, StartedAt: cp.SavedAt,
+		})
+		restored++
+	}
+	if restored > 0 {
+		we.notify(we.chatID, fmt.Sprintf("♻️ 从检查点恢复 %d 个已完成阶段", restored))
+	}
 }
 
 // runOrchestratedPhase 使用 Orchestrator + V2 DAG 执行开发任务。
@@ -600,6 +652,9 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 		we.dagTracker, we.factory, we.notify, we.pool, we.chatID,
 	)
 
+	if we.checkpoints != nil {
+		orch.SetCheckpointStore(we.checkpoints)
+	}
 	if designDoc, ok := prevResults["design"]; ok {
 		orch.SetDesignContext(designDoc, planOutput)
 	}
@@ -676,6 +731,12 @@ func (we *WorkflowExecutor) runDesignPhase(ctx context.Context, designStages []S
 	var results []StageResult
 	we.notify(we.chatID, fmt.Sprintf("📐 Phase 1: 设计/策划 (%d 阶段)...", len(designStages)))
 	for _, ds := range designStages {
+		// 检查点恢复: 如果该阶段已有 completed checkpoint, 跳过
+		if _, restored := prevResults[ds.Name]; restored {
+			we.notify(we.chatID, fmt.Sprintf("  ♻️ %s 已从检查点恢复, 跳过", ds.Name))
+			continue
+		}
+
 		sr := we.executeStage(ctx, ds, objective, prevResults, team)
 		results = append(results, sr)
 		if sr.Status != TaskCompleted {

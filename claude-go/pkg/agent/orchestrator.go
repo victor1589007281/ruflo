@@ -62,17 +62,18 @@ type Orchestrator struct {
 	nodes  map[string]*TaskNode
 	mu     sync.Mutex
 
-	factory   CreateAgentFunc
-	notify    NotifyFunc
-	pool      *AgentPool
-	chatID    string
-	designDoc string
-	planDoc   string
+	factory     CreateAgentFunc
+	notify      NotifyFunc
+	pool        *AgentPool
+	chatID      string
+	designDoc   string
+	planDoc     string
+	checkpoints CheckpointStore // 检查点 (从 WorkflowExecutor 传入, 可为 nil)
 
 	completedCount int
 	failedCount    int
 	totalCount     int
-	dagMaxWidth    int // DAG 拓扑最大宽度 (控制并发上限)
+	dagMaxWidth    int
 }
 
 // rawTask ParsePlanToDAG 内部用的中间表示
@@ -107,6 +108,13 @@ func NewOrchestrator(cfg OrchestratorConfig, dag DAGTaskTracker, factory CreateA
 		pool:    pool,
 		chatID:  chatID,
 	}
+}
+
+// SetCheckpointStore 注入检查点存取 (供每个 task 完成后持久化)。
+func (o *Orchestrator) SetCheckpointStore(cs CheckpointStore) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.checkpoints = cs
 }
 
 // SetDesignContext 注入设计文档 (供 micro-test 偏差检测)
@@ -459,6 +467,11 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 	o.completedCount++
 	o.mu.Unlock()
 
+	// 检查点: task 完成后持久化 (断点续作)
+	if o.checkpoints != nil {
+		o.checkpoints.SaveCheckpoint(node.V2TaskID, "completed", 0, lastOutput)
+	}
+
 	passLabel := "⚠️未达标"
 	if lastScore.MeetsHardPassThreshold() && node.TestPassed {
 		passLabel = "✅全通过"
@@ -508,6 +521,11 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 	o.mu.Lock()
 	o.completedCount++
 	o.mu.Unlock()
+
+	if o.checkpoints != nil {
+		o.checkpoints.SaveCheckpoint(node.V2TaskID, "completed", 0, result)
+	}
+
 	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s)", node.Title, duration.Round(time.Second)))
 
 	if team.Blackboard != nil {

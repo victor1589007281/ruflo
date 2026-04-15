@@ -373,6 +373,15 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		return
 	}
 
+	// 使用 Coordinator 带重试和检查点执行
+	coord := NewCoordinator(ptm.pool, ptm.taskTracker, ptm.notify, CoordinatorConfig{
+		MaxRetries:    2,
+		HeartbeatFreq: 30 * time.Second,
+		DataDir:       team.dataDir,
+		ChatID:        team.ChatID,
+	})
+	coord.ClearCheckpoints()
+
 	executor := &WorkflowExecutor{
 		factory:     ptm.factory,
 		notify:      ptm.notify,
@@ -382,16 +391,8 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		roles:       ptm.roles,
 		metrics:     ptm.metrics,
 		pool:        ptm.pool,
+		checkpoints: coord, // 注入 Coordinator 作为 CheckpointStore
 	}
-
-	// 使用 Coordinator 带重试和检查点执行
-	coord := NewCoordinator(ptm.pool, ptm.taskTracker, ptm.notify, CoordinatorConfig{
-		MaxRetries:    2,
-		HeartbeatFreq: 30 * time.Second,
-		DataDir:       team.dataDir,
-		ChatID:        team.ChatID,
-	})
-	coord.ClearCheckpoints()
 
 	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)
 	if err != nil {
