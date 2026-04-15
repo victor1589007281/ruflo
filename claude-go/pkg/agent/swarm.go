@@ -73,9 +73,8 @@ func NewSwarmOrchestrator(llm LLMClient, pool *AgentPool, taskTracker TaskTracke
 	}
 }
 
-// Execute 蜂群执行: 动态分解 → 并行调度 → 结果汇聚。
-// 优先使用 V2 TaskStore DAG (与 Orchestrator 共享调度基础设施),
-// fallback 到自建 topologicalLevels。
+// Execute 蜂群执行: 动态分解 → 拓扑排序 → 逐层并行 → 结果汇聚。
+// 蜂群沿用自身的 topologicalLevels 波次调度 (不走 V2 DAG)。
 func (s *SwarmOrchestrator) Execute(ctx context.Context, team *ProductionTeam, objective string) ([]StageResult, error) {
 	s.notify(s.chatID, "🐝 **蜂群模式启动** — 正在分析任务并拆解子任务...")
 
@@ -96,117 +95,6 @@ func (s *SwarmOrchestrator) Execute(ctx context.Context, team *ProductionTeam, o
 	s.notify(s.chatID, fmt.Sprintf("📋 拆解为 **%d** 个子任务 (策略: %s)\n%s",
 		len(plan.SubTasks), plan.Strategy, s.formatPlan(plan)))
 
-	// 优先: V2 DAG 调度 (与 Orchestrator 共享基础设施)
-	if dag, ok := s.taskTracker.(DAGTaskTracker); ok {
-		return s.executeViaV2DAG(ctx, dag, plan, team, objective)
-	}
-
-	// Fallback: 自建拓扑排序
-	return s.executeViaTopological(ctx, plan, team, objective)
-}
-
-// executeViaV2DAG 使用 V2 TaskStore 的 DAG 能力调度蜂群子任务。
-// 与 Orchestrator 共享 ReadyTasks/SetTaskStatusAndUnblock 逻辑。
-func (s *SwarmOrchestrator) executeViaV2DAG(ctx context.Context, dag DAGTaskTracker, plan *DecompositionPlan, team *ProductionTeam, objective string) ([]StageResult, error) {
-	s.notify(s.chatID, "📊 使用 V2 DAG 调度 (统一调度器)...")
-
-	// 将 SubTasks 写入 V2 TaskStore
-	idMap := make(map[string]string) // subtask.ID → v2 task ID
-	for _, st := range plan.SubTasks {
-		var depV2IDs []string
-		for _, dep := range st.DependsOn {
-			if v2id, ok := idMap[dep]; ok {
-				depV2IDs = append(depV2IDs, v2id)
-			}
-		}
-		v2ID, err := dag.AddTaskWithDeps(
-			fmt.Sprintf("[swarm] %s", st.ID), st.Description, st.Role,
-			depV2IDs, st.Priority,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("V2 DAG 任务创建失败: %w", err)
-		}
-		idMap[st.ID] = v2ID
-	}
-
-	// ReadyTasks 循环调度 (与 Orchestrator.Execute 相同模式)
-	var allResults []StageResult
-	resultMap := make(map[string]string)
-	maxParallel := s.maxAgents
-	if maxParallel <= 0 {
-		maxParallel = 4
-	}
-	completed, total := 0, len(plan.SubTasks)
-
-	// 反向映射: v2ID → SubTask
-	v2ToSub := make(map[string]SubTask)
-	for _, st := range plan.SubTasks {
-		if v2id, ok := idMap[st.ID]; ok {
-			v2ToSub[v2id] = st
-		}
-	}
-
-	for completed < total {
-		if ctx.Err() != nil {
-			return allResults, ctx.Err()
-		}
-		ready := dag.ReadyTasks()
-		if len(ready) == 0 {
-			select {
-			case <-time.After(2 * time.Second):
-				continue
-			case <-ctx.Done():
-				return allResults, ctx.Err()
-			}
-		}
-		batch := ready
-		if len(batch) > maxParallel {
-			batch = batch[:maxParallel]
-		}
-
-		if s.pool != nil {
-			s.pool.AutoScale(len(batch))
-		}
-
-		results := make([]StageResult, len(batch))
-		var wg sync.WaitGroup
-		for i, task := range batch {
-			_ = dag.SetTaskStatus(task.ID, "in_progress")
-			sub, ok := v2ToSub[task.ID]
-			if !ok {
-				sub = SubTask{ID: task.Subject, Description: task.Description, Role: task.Owner}
-			}
-			wg.Add(1)
-			go func(idx int, t SubTask, v2id string) {
-				defer wg.Done()
-				sr := s.executeSubTask(ctx, t, objective, resultMap, team)
-				results[idx] = sr
-				if sr.Status == TaskCompleted {
-					dag.SetTaskStatusAndUnblock(v2id, "completed")
-				} else {
-					_ = dag.SetTaskStatus(v2id, "failed")
-				}
-			}(i, sub, task.ID)
-		}
-		wg.Wait()
-
-		for _, sr := range results {
-			allResults = append(allResults, sr)
-			if sr.Status == TaskCompleted {
-				resultMap[sr.Name] = sr.Output
-				completed++
-			} else {
-				completed++ // 失败也算处理完毕
-				s.notify(s.chatID, fmt.Sprintf("⚠️ 子任务 **%s** 失败: %s", sr.Name, sr.Error))
-			}
-		}
-	}
-
-	return s.mergeAndReturn(ctx, allResults, team, objective)
-}
-
-// executeViaTopological Fallback: 自建拓扑排序 (DAGTaskTracker 不可用时)
-func (s *SwarmOrchestrator) executeViaTopological(ctx context.Context, plan *DecompositionPlan, team *ProductionTeam, objective string) ([]StageResult, error) {
 	levels, err := s.topologicalLevels(plan.SubTasks)
 	if err != nil {
 		return nil, fmt.Errorf("拓扑排序失败: %w", err)
@@ -219,8 +107,10 @@ func (s *SwarmOrchestrator) executeViaTopological(ctx context.Context, plan *Dec
 		if ctx.Err() != nil {
 			return allResults, ctx.Err()
 		}
-		s.notify(s.chatID, fmt.Sprintf("🔄 执行第 %d/%d 层 (%d 个并行)...",
+
+		s.notify(s.chatID, fmt.Sprintf("🔄 执行第 %d/%d 层 (%d 个子任务并行)...",
 			levelIdx+1, len(levels), len(level)))
+
 		levelResults := s.executeLevel(ctx, level, objective, resultMap, team)
 		for _, sr := range levelResults {
 			allResults = append(allResults, sr)
@@ -232,11 +122,7 @@ func (s *SwarmOrchestrator) executeViaTopological(ctx context.Context, plan *Dec
 		}
 	}
 
-	return s.mergeAndReturn(ctx, allResults, team, objective)
-}
-
-// mergeAndReturn LLM 汇总蜂群结果
-func (s *SwarmOrchestrator) mergeAndReturn(ctx context.Context, allResults []StageResult, team *ProductionTeam, objective string) ([]StageResult, error) {
+	// LLM 汇聚
 	successCount := 0
 	for _, r := range allResults {
 		if r.Status == TaskCompleted {
@@ -256,6 +142,7 @@ func (s *SwarmOrchestrator) mergeAndReturn(ctx context.Context, allResults []Sta
 			}
 		}
 	}
+
 	return allResults, nil
 }
 

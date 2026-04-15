@@ -49,15 +49,16 @@ type TaskNode struct {
 
 // OrchestratorConfig 编排器配置
 type OrchestratorConfig struct {
-	MaxParallel    int
-	MaxRetries     int
-	MicroTestAfter bool
+	MaxParallel      int
+	MaxRetries       int
+	MicroTestAfter   bool
+	AdversarialRound int // 每个 task 内 mini 对抗轮数 (0=不启用, 默认2)
 }
 
 // Orchestrator 复用 V2 TaskStore 的 DAG 编排器
 type Orchestrator struct {
 	config OrchestratorConfig
-	dag    DAGTaskTracker // 复用 V2 TaskStore 而非自建 DAG
+	dag    DAGTaskTracker
 	nodes  map[string]*TaskNode
 	mu     sync.Mutex
 
@@ -71,6 +72,18 @@ type Orchestrator struct {
 	completedCount int
 	failedCount    int
 	totalCount     int
+	dagMaxWidth    int // DAG 拓扑最大宽度 (控制并发上限)
+}
+
+// rawTask ParsePlanToDAG 内部用的中间表示
+type rawTask struct {
+	num            string
+	title, role    string
+	depNums        []string
+	designRef      string
+	constraintRefs []string
+	accept         string
+	priority       int
 }
 
 // NewOrchestrator 创建编排器 (需要 DAGTaskTracker, 不再自建 DAG)
@@ -80,6 +93,9 @@ func NewOrchestrator(cfg OrchestratorConfig, dag DAGTaskTracker, factory CreateA
 	}
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 2
+	}
+	if cfg.AdversarialRound <= 0 {
+		cfg.AdversarialRound = 2
 	}
 	return &Orchestrator{
 		config: cfg,
@@ -114,17 +130,6 @@ func (o *Orchestrator) ParsePlanToDAG(planOutput, teamName string) ([]*TaskNode,
 	var nodes []*TaskNode
 	lines := strings.Split(planOutput, "\n")
 	tableRe := regexp.MustCompile(`^\|\s*(\d+)\s*\|`)
-
-	// 第一遍: 解析表格, 收集任务信息 (需要两遍因为依赖用序号而非 V2 ID)
-	type rawTask struct {
-		num            string
-		title, role    string
-		depNums        []string
-		designRef      string
-		constraintRefs []string
-		accept         string
-		priority       int
-	}
 	var rawTasks []rawTask
 
 	for _, line := range lines {
@@ -213,7 +218,62 @@ func (o *Orchestrator) ParsePlanToDAG(planOutput, teamName string) ([]*TaskNode,
 	}
 
 	o.totalCount = len(nodes)
+
+	// 计算 DAG 拓扑宽度 (Kahn 分层后每层最大任务数)
+	o.dagMaxWidth = o.computeDAGWidth(rawTasks)
+	if o.dagMaxWidth > 0 && (o.config.MaxParallel <= 0 || o.config.MaxParallel > o.dagMaxWidth) {
+		o.config.MaxParallel = o.dagMaxWidth
+	}
+
 	return nodes, nil
+}
+
+// computeDAGWidth Kahn 算法计算拓扑分层的最大宽度 (用于 pool 精确扩缩)。
+func (o *Orchestrator) computeDAGWidth(tasks []rawTask) int {
+	inDeg := make(map[string]int)
+	graph := make(map[string][]string) // num → downstream nums
+	for _, t := range tasks {
+		inDeg[t.num] = 0
+	}
+	for _, t := range tasks {
+		for _, d := range t.depNums {
+			graph[d] = append(graph[d], t.num)
+			inDeg[t.num]++
+		}
+	}
+
+	maxWidth := 0
+	processed := 0
+	total := len(tasks)
+	for processed < total {
+		var level []string
+		for _, t := range tasks {
+			if inDeg[t.num] == 0 {
+				level = append(level, t.num)
+			}
+		}
+		if len(level) == 0 {
+			break // 循环依赖保护
+		}
+		if len(level) > maxWidth {
+			maxWidth = len(level)
+		}
+		for _, num := range level {
+			inDeg[num] = -1 // 标记已处理
+			for _, next := range graph[num] {
+				inDeg[next]--
+			}
+			processed++
+		}
+	}
+	return maxWidth
+}
+
+// DAGMaxWidth 返回 DAG 拓扑最大宽度 (供 pool 扩缩参考)
+func (o *Orchestrator) DAGMaxWidth() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.dagMaxWidth
 }
 
 // Execute 从 V2 TaskStore 的就绪队列循环调度, 直到所有任务完成。
@@ -225,9 +285,14 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 		return nil, nil
 	}
 
-	o.notify(o.chatID, fmt.Sprintf("🎯 编排器启动: %d 个任务, 最大并发 %d (V2 DAG 驱动)",
-		o.totalCount, o.config.MaxParallel))
-	logging.Event(ctx, "orchestrator.start", "tasks", o.totalCount, "maxParallel", o.config.MaxParallel)
+	// 基于 DAG 拓扑宽度精确调整 pool (不再用粗糙复杂度乘数)
+	if o.pool != nil && o.dagMaxWidth > 0 {
+		o.pool.AutoScale(o.dagMaxWidth)
+	}
+
+	o.notify(o.chatID, fmt.Sprintf("🎯 编排器启动: %d 个任务, 最大并发 %d (DAG 宽度: %d)",
+		o.totalCount, o.config.MaxParallel, o.dagMaxWidth))
+	logging.Event(ctx, "orchestrator.start", "tasks", o.totalCount, "maxParallel", o.config.MaxParallel, "dagWidth", o.dagMaxWidth)
 
 	for {
 		if ctx.Err() != nil {
@@ -282,43 +347,76 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 	return allResults, nil
 }
 
-// executeTaskNode 执行单个任务 + micro-test + 重试
+// executeTaskNode 执行单个任务, 内置 mini 对抗循环:
+//
+//	round 1: coder 执行 → micro-test → 如果 PASS 则完成
+//	round 2: coder 修复 (注入 micro-test 反馈) → micro-test → ...
+//	最多 AdversarialRound 轮
 func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam) StageResult {
 	start := time.Now()
-	prompt := o.buildTaskPrompt(node, objective)
+	maxAdvRounds := o.config.AdversarialRound
+	if maxAdvRounds <= 0 {
+		maxAdvRounds = 1
+	}
 
 	o.notify(o.chatID, fmt.Sprintf("▶️ %s (%s) 执行中...", node.Title, node.Role))
 
-	runner, err := o.factory(ctx, node.Role, "")
-	if err != nil {
-		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
-				StartedAt: start, Duration: time.Since(start).String()})
+	var lastOutput string
+	var lastTestFeedback string
+
+	for round := 1; round <= maxAdvRounds; round++ {
+		prompt := o.buildTaskPrompt(node, objective)
+		if round > 1 && lastTestFeedback != "" {
+			prompt = fmt.Sprintf("%s\n\n### ⚠️ 第 %d 轮修复 (micro-test 反馈):\n%s\n\n### 上轮产出 (请增量修改, 不要从零重写):\n%s",
+				prompt, round, lastTestFeedback, truncateResult(lastOutput, 12000))
+		}
+
+		runner, err := o.factory(ctx, node.Role, "")
+		if err != nil {
+			return o.handleTaskFailure(ctx, node, objective, team,
+				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+					StartedAt: start, Duration: time.Since(start).String()})
+		}
+
+		result, err := runner.Execute(ctx, prompt)
+		if err != nil {
+			return o.handleTaskFailure(ctx, node, objective, team,
+				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+					StartedAt: start, Duration: time.Since(start).String()})
+		}
+
+		if reason := validateAgentOutput(result, node.Role); reason != "" {
+			return o.handleTaskFailure(ctx, node, objective, team,
+				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed,
+					Error: "产出验证失败: " + reason, Output: result,
+					StartedAt: start, Duration: time.Since(start).String()})
+		}
+
+		lastOutput = result
+		node.Output = result
+
+		// micro-test 验证
+		if !o.config.MicroTestAfter {
+			break // 不启用 micro-test 则跳过对抗
+		}
+
+		o.runMicroTest(ctx, node)
+		if node.TestPassed || round == maxAdvRounds {
+			if !node.TestPassed {
+				o.notify(o.chatID, fmt.Sprintf("⚠️ %s micro-test 未通过 (已达 %d 轮上限)", node.Title, maxAdvRounds))
+			}
+			break
+		}
+
+		// micro-test 未通过, 注入反馈进入下一轮
+		lastTestFeedback = node.TestResult
+		o.notify(o.chatID, fmt.Sprintf("🔄 %s micro-test 未通过, 对抗修复 (第 %d/%d 轮)...",
+			node.Title, round+1, maxAdvRounds))
 	}
 
-	result, err := runner.Execute(ctx, prompt)
 	duration := time.Since(start)
 
-	if err != nil {
-		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
-				StartedAt: start, Duration: duration.String()})
-	}
-
-	if reason := validateAgentOutput(result, node.Role); reason != "" {
-		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed,
-				Error: "产出验证失败: " + reason, Output: result,
-				StartedAt: start, Duration: duration.String()})
-	}
-
-	node.Output = result
-
-	if o.config.MicroTestAfter {
-		o.runMicroTest(ctx, node)
-	}
-
-	// 通过 V2 TaskStore 标记完成 + 自动解除下游依赖
+	// 标记完成 + 解除下游依赖
 	o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")
 	o.mu.Lock()
 	o.completedCount++
@@ -332,16 +430,15 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			testInfo = " ⚠️micro-test偏差"
 		}
 	}
-	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s)%s",
-		node.Title, duration.Round(time.Second), testInfo))
+	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s)%s", node.Title, duration.Round(time.Second), testInfo))
 
 	if team.Blackboard != nil {
-		team.Blackboard.Write(node.V2TaskID+"-result", result, node.Role, "result")
+		team.Blackboard.Write(node.V2TaskID+"-result", lastOutput, node.Role, "result")
 	}
 
 	return StageResult{
 		Name: node.V2TaskID, Role: node.Role, Status: TaskCompleted,
-		Output: result, StartedAt: start, Duration: duration.Round(time.Second).String(),
+		Output: lastOutput, StartedAt: start, Duration: duration.Round(time.Second).String(),
 	}
 }
 

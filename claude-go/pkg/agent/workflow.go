@@ -549,7 +549,6 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 
 	designStages, generatorStages, evalStage, parallelStages := classifyStages(wf.Stages)
 	maxRounds, terminator := we.initAdaptiveTerminator(wf)
-	we.autoScalePool(wf, designStages, generatorStages, evalStage, parallelStages, maxRounds)
 	we.tryInitDAG()
 
 	// Phase 1: 设计阶段
@@ -559,8 +558,8 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 		return allResults, err
 	}
 
-	// Phase 2: 如果 Planner 输出了 WBS 且 DAG 可用 → 用 Orchestrator (V2 DAG 驱动)
-	//          否则 fallback 到经典对抗循环
+	// Phase 2: Orchestrator (DAG 驱动, pool 由 DAG 宽度精确控制)
+	//          fallback: 经典对抗循环 (pool 用粗糙 autoScalePool)
 	orchUsed := false
 	if planOutput, hasPlan := prevResults["plan"]; hasPlan && we.dagTracker != nil {
 		orchResults, orchErr := we.runOrchestratedPhase(ctx, planOutput, objective, prevResults, team)
@@ -573,6 +572,8 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	}
 
 	if !orchUsed {
+		// 仅 fallback 路径使用粗糙 pool 扩缩
+		we.autoScalePool(wf, designStages, generatorStages, evalStage, parallelStages, maxRounds)
 		advResults, err := we.runAdversarialLoop(ctx, generatorStages, evalStage, maxRounds, terminator, objective, prevResults, team)
 		allResults = append(allResults, advResults...)
 		if err != nil {
