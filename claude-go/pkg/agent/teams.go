@@ -50,6 +50,27 @@ type TaskTracker interface {
 	SetTaskStatus(id, status string) error
 }
 
+// DAGTaskTracker 扩展 TaskTracker, 暴露 V2 TaskStore 的 DAG 调度能力。
+// 统一 Orchestrator 和 Swarm 的 DAG 实现, 消除三套重复的拓扑排序/就绪队列。
+// 实现者: builtin.TaskStore (已有全部方法)
+type DAGTaskTracker interface {
+	TaskTracker
+	AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
+	ReadyTasks() []DAGTaskSummary
+	SetTaskStatusAndUnblock(id, status string) (int, error)
+}
+
+// DAGTaskSummary 面向调度器的任务摘要 (与 builtin.TaskSummary 结构对齐)。
+type DAGTaskSummary struct {
+	ID          string   `json:"id"`
+	Subject     string   `json:"subject"`
+	Description string   `json:"description"`
+	Status      string   `json:"status"`
+	Owner       string   `json:"owner"`
+	DependsOn   []string `json:"dependsOn,omitempty"`
+	Priority    int      `json:"priority,omitempty"`
+}
+
 // DreamRecorder Dreaming 记录接口, 解耦 dreaming 包依赖。
 // 实现者: dreaming.Dreamer (通过 duck typing)。
 type DreamRecorder interface {

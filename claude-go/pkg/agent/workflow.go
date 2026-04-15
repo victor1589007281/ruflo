@@ -503,10 +503,21 @@ type WorkflowExecutor struct {
 	notify      NotifyFunc
 	chatID      string
 	taskTracker TaskTracker        // 复用 V2 Task 系统 (可为 nil)
+	dagTracker  DAGTaskTracker     // V2 DAG 能力 (运行时从 taskTracker 检测)
 	evolution   *EvolutionEngine   // 自动进化引擎 (可为 nil)
 	roles       *RoleRegistry      // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
 	metrics     *metrics.Collector // 持续观测指标 (可为 nil)
 	pool        *AgentPool         // Agent 池 (动态扩缩, 可为 nil)
+}
+
+// tryInitDAG 从 taskTracker 检测 DAG 能力
+func (we *WorkflowExecutor) tryInitDAG() {
+	if we.dagTracker != nil || we.taskTracker == nil {
+		return
+	}
+	if dag, ok := we.taskTracker.(DAGTaskTracker); ok {
+		we.dagTracker = dag
+	}
 }
 
 // Execute 执行工作流, 返回所有阶段结果
@@ -525,350 +536,497 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 	}
 }
 
-// executeAdversarialDev 对抗式开发流水线 (泛化版，适用于 development 和 creative 等):
+// executeAdversarialDev 对抗式开发流水线。
+// 四阶段模型 (拆分为可读的小函数):
 //
-// 三阶段模型:
-//   Phase 1: 设计阶段 (无依赖的起始阶段)
-//   Phase 2: [Generator ↔ Evaluator] 对抗循环，最多 N 轮
-//   Phase 3: 并行收尾阶段 (test, post-production 等)
-//
-// 阶段角色通过结构特征自动发现，不硬编码阶段名:
-//   - Design  = 无依赖的第一个阶段
-//   - Generator = 依赖 design 的中间阶段 (可能多个，按依赖链排序)
-//   - Evaluator = prompt 中包含 JSON 评分格式的阶段
-//   - Parallel = Parallel: true 的收尾阶段
+//	Phase 1: 设计阶段 (research → design → plan)
+//	Phase 2: [Generator ↔ Evaluator] 对抗循环
+//	Phase 3: E2E 对抗测试 (tester↔coder 自适应)
+//	Phase 4: 非测试的收尾阶段
 func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	var allResults []StageResult
 	prevResults := make(map[string]string)
 
-	// 自适应轮数: Rounds=0 时使用 AdaptiveTerminator (参考 MAgICoRe)
-	// Rounds>0 时保持向后兼容, 用固定轮数
-	maxRounds := wf.Rounds
+	designStages, generatorStages, evalStage, parallelStages := classifyStages(wf.Stages)
+	maxRounds, terminator := we.initAdaptiveTerminator(wf)
+	we.autoScalePool(wf, designStages, generatorStages, evalStage, parallelStages, maxRounds)
+	we.tryInitDAG()
+
+	// Phase 1: 设计阶段
+	designResults, err := we.runDesignPhase(ctx, designStages, objective, prevResults, team)
+	allResults = append(allResults, designResults...)
+	if err != nil {
+		return allResults, err
+	}
+
+	// Phase 2: 如果 Planner 输出了 WBS 且 DAG 可用 → 用 Orchestrator (V2 DAG 驱动)
+	//          否则 fallback 到经典对抗循环
+	orchUsed := false
+	if planOutput, hasPlan := prevResults["plan"]; hasPlan && we.dagTracker != nil {
+		orchResults, orchErr := we.runOrchestratedPhase(ctx, planOutput, objective, prevResults, team)
+		if orchErr == nil && len(orchResults) > 0 {
+			allResults = append(allResults, orchResults...)
+			orchUsed = true
+		} else if orchErr != nil {
+			we.notify(we.chatID, fmt.Sprintf("⚠️ Orchestrator 启动失败, fallback 对抗循环: %v", orchErr))
+		}
+	}
+
+	if !orchUsed {
+		advResults, err := we.runAdversarialLoop(ctx, generatorStages, evalStage, maxRounds, terminator, objective, prevResults, team)
+		allResults = append(allResults, advResults...)
+		if err != nil {
+			return allResults, err
+		}
+	}
+
+	// Phase 3: E2E 对抗测试 (tester↔coder 自适应循环)
+	e2eResults := we.runE2EAdversarial(ctx, parallelStages, objective, prevResults, team)
+	allResults = append(allResults, e2eResults...)
+
+	// Phase 4: 非测试的收尾阶段
+	finishResults := we.runFinishPhase(ctx, parallelStages, objective, prevResults, team)
+	allResults = append(allResults, finishResults...)
+
+	return allResults, nil
+}
+
+// runOrchestratedPhase 使用 Orchestrator + V2 DAG 执行开发任务。
+// 当 Planner 输出了 WBS 表格时, Orchestrator 解析并通过 V2 TaskStore 调度。
+func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput, objective string, prevResults map[string]string, team *ProductionTeam) ([]StageResult, error) {
+	orch := NewOrchestrator(
+		OrchestratorConfig{MaxParallel: 3, MaxRetries: 2, MicroTestAfter: true},
+		we.dagTracker, we.factory, we.notify, we.pool, we.chatID,
+	)
+
+	if designDoc, ok := prevResults["design"]; ok {
+		orch.SetDesignContext(designDoc, planOutput)
+	}
+
+	nodes, err := orch.ParsePlanToDAG(planOutput, team.Name)
+	if err != nil || len(nodes) == 0 {
+		return nil, fmt.Errorf("WBS 解析失败或无任务: %v", err)
+	}
+
+	we.notify(we.chatID, fmt.Sprintf("🎯 Orchestrator 接管: %d 个任务 (V2 DAG 驱动, micro-test 启用)", len(nodes)))
+	results, err := orch.Execute(ctx, objective, team)
+
+	// 将 Orchestrator 的产出写入 prevResults (供后续 E2E 使用)
+	for _, sr := range results {
+		if sr.Status == TaskCompleted {
+			prevResults[sr.Name] = sr.Output
+		}
+	}
+
+	// 写入 micro-test 汇总到 blackboard
+	if team.Blackboard != nil {
+		team.Blackboard.Write("micro-test-summary", orch.MicroTestSummary(), "orchestrator", "summary")
+	}
+
+	return results, err
+}
+
+// initAdaptiveTerminator 初始化自适应终止器
+func (we *WorkflowExecutor) initAdaptiveTerminator(wf *WorkflowDef) (maxRounds int, terminator *AdaptiveTerminator) {
+	maxRounds = wf.Rounds
 	useAdaptive := maxRounds <= 0
 	if useAdaptive {
-		maxRounds = 5 // AdaptiveTerminator 的硬上限
+		maxRounds = 5
 	}
-	var terminator *AdaptiveTerminator
 	if useAdaptive {
 		terminator = NewAdaptiveTerminator(2, maxRounds)
 	}
+	return
+}
 
-	// === 动态发现阶段角色 ===
-	designStages, generatorStages, evalStage, parallelStages := classifyStages(wf.Stages)
-
-	// === 动态 Agent Pool 扩缩 (按角色+复杂度) ===
-	// 参考: K8s HPA 按 Deployment 独立扩缩; MRKL 系统按 module 动态分配 expert
-	if we.pool != nil {
-		roleNeeds := make(map[string]int)
-		for _, s := range designStages {
-			roleNeeds[s.Role]++
-		}
-		for _, s := range generatorStages {
-			roleNeeds[s.Role] += maxRounds
-		}
-		if evalStage != nil {
-			roleNeeds[evalStage.Role] += maxRounds
-		}
-		for _, s := range parallelStages {
-			roleNeeds[s.Role]++
-		}
-		complexity := 0
-		if maxRounds >= 3 {
-			complexity = 1
-		}
-		if len(wf.Stages) > 5 || maxRounds >= 5 {
-			complexity = 2
-		}
-		we.pool.AutoScaleByRoles(roleNeeds, complexity)
+// autoScalePool 动态扩缩 Agent Pool
+func (we *WorkflowExecutor) autoScalePool(wf *WorkflowDef, design, generators []StageDef, eval *StageDef, parallel []StageDef, maxRounds int) {
+	if we.pool == nil {
+		return
 	}
-
-	// Phase 1: 设计阶段 (可能有多个串行 design 阶段，如 creative-brief → prompt-engineer)
-	if len(designStages) > 0 {
-		we.notify(we.chatID, fmt.Sprintf("📐 Phase 1: 设计/策划 (%d 阶段)...", len(designStages)))
-		for _, ds := range designStages {
-			sr := we.executeStage(ctx, ds, objective, prevResults, team)
-			allResults = append(allResults, sr)
-			if sr.Status != TaskCompleted {
-				return allResults, fmt.Errorf("设计阶段 %s 失败: %s", ds.Name, sr.Error)
-			}
-			prevResults[ds.Name] = sr.Output
-		}
+	roleNeeds := make(map[string]int)
+	for _, s := range design {
+		roleNeeds[s.Role]++
 	}
+	for _, s := range generators {
+		roleNeeds[s.Role] += maxRounds
+	}
+	if eval != nil {
+		roleNeeds[eval.Role] += maxRounds
+	}
+	for _, s := range parallel {
+		roleNeeds[s.Role]++
+	}
+	complexity := 0
+	if maxRounds >= 3 {
+		complexity = 1
+	}
+	if len(wf.Stages) > 5 || maxRounds >= 5 {
+		complexity = 2
+	}
+	we.pool.AutoScaleByRoles(roleNeeds, complexity)
+}
 
-	// Phase 2: Adversarial Generator ↔ Evaluator 对抗循环
+// runDesignPhase Phase 1: 串行执行设计阶段
+func (we *WorkflowExecutor) runDesignPhase(ctx context.Context, designStages []StageDef, objective string, prevResults map[string]string, team *ProductionTeam) ([]StageResult, error) {
+	if len(designStages) == 0 {
+		return nil, nil
+	}
+	var results []StageResult
+	we.notify(we.chatID, fmt.Sprintf("📐 Phase 1: 设计/策划 (%d 阶段)...", len(designStages)))
+	for _, ds := range designStages {
+		sr := we.executeStage(ctx, ds, objective, prevResults, team)
+		results = append(results, sr)
+		if sr.Status != TaskCompleted {
+			return results, fmt.Errorf("设计阶段 %s 失败: %s", ds.Name, sr.Error)
+		}
+		prevResults[ds.Name] = sr.Output
+	}
+	return results, nil
+}
+
+// runAdversarialLoop Phase 2: Generator ↔ Evaluator 对抗循环
+func (we *WorkflowExecutor) runAdversarialLoop(
+	ctx context.Context,
+	generatorStages []StageDef, evalStage *StageDef,
+	maxRounds int, terminator *AdaptiveTerminator,
+	objective string, prevResults map[string]string, team *ProductionTeam,
+) ([]StageResult, error) {
 	if len(generatorStages) == 0 {
 		we.notify(we.chatID, "⚠️ 未发现 Generator 阶段，跳过对抗循环")
-	} else {
-		we.notify(we.chatID, fmt.Sprintf("⚔️ Phase 2: 对抗循环 (最多 %d 轮)...", maxRounds))
-		var lastGenOutput string
-		var lastEvalFeedback string
+		return nil, nil
+	}
 
-		for round := 1; round <= maxRounds; round++ {
-			if ctx.Err() != nil {
-				return allResults, ctx.Err()
+	var allResults []StageResult
+	we.notify(we.chatID, fmt.Sprintf("⚔️ Phase 2: 对抗循环 (最多 %d 轮)...", maxRounds))
+	var lastGenOutput, lastEvalFeedback string
+
+	for round := 1; round <= maxRounds; round++ {
+		if ctx.Err() != nil {
+			return allResults, ctx.Err()
+		}
+
+		// Generator 执行
+		genResults, genOutput := we.runGeneratorRound(ctx, generatorStages, round, maxRounds, lastGenOutput, lastEvalFeedback, objective, prevResults, team)
+		allResults = append(allResults, genResults...)
+		if len(genResults) > 0 && genResults[len(genResults)-1].Status != TaskCompleted {
+			return allResults, fmt.Errorf("generator 第 %d 轮失败", round)
+		}
+		lastGenOutput = genOutput
+
+		// 编译门禁
+		lastEvalFeedback = we.runBuildGate(ctx, team, round, lastEvalFeedback)
+
+		// Evaluator 审查
+		evalResult, shouldBreak := we.runEvaluatorRound(ctx, evalStage, generatorStages, round, maxRounds, lastGenOutput, terminator, objective, prevResults, team, &lastEvalFeedback)
+		allResults = append(allResults, evalResult...)
+		if shouldBreak {
+			break
+		}
+	}
+	return allResults, nil
+}
+
+// runGeneratorRound 执行一轮 Generator
+func (we *WorkflowExecutor) runGeneratorRound(
+	ctx context.Context, genStages []StageDef,
+	round, maxRounds int, lastOutput, lastFeedback string,
+	objective string, prevResults map[string]string, team *ProductionTeam,
+) (results []StageResult, finalOutput string) {
+	for _, genStage := range genStages {
+		feedbackSection := we.buildFeedbackSection(round, lastOutput, lastFeedback, team)
+		modifiedPrompt := strings.ReplaceAll(genStage.Prompt, "{adversarial_feedback}", feedbackSection)
+		tempStage := genStage
+		tempStage.Prompt = modifiedPrompt
+		tempStage.Name = fmt.Sprintf("%s-round%d", genStage.Name, round)
+
+		var roleRestore func()
+		if we.roles != nil {
+			if role := we.roles.Get(genStage.Role); role != nil && strings.Contains(role.SystemPrompt, "{adversarial_feedback}") {
+				orig := role.SystemPrompt
+				role.SystemPrompt = strings.ReplaceAll(role.SystemPrompt, "{adversarial_feedback}", feedbackSection)
+				roleRestore = func() { role.SystemPrompt = orig }
 			}
+		}
 
-			// Generator: 执行所有 generator 阶段
-			for _, genStage := range generatorStages {
-				feedbackSection := ""
-				if lastEvalFeedback != "" {
-					feedbackSection = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastEvalFeedback)
-				}
+		we.notify(we.chatID, fmt.Sprintf("🔨 对抗第 %d/%d 轮 — %s (%s)...", round, maxRounds, genStage.Name, genStage.Role))
+		sr := we.executeStage(ctx, tempStage, objective, prevResults, team)
+		if roleRestore != nil {
+			roleRestore()
+		}
+		sr.Name = tempStage.Name
+		results = append(results, sr)
+		if sr.Status == TaskCompleted {
+			finalOutput = sr.Output
+			prevResults[genStage.Name] = sr.Output
+		}
+	}
+	return
+}
 
-				// 跨轮上下文增强:
-			// 根因: implement DependsOn=["design"], {prev_result} 只有架构设计,
-			// 且每轮创建新 Agent (无对话记忆), 导致 round3 从零重写覆盖 round2 修复。
-			// 修复策略:
-			//   a) 上轮输出注入 (提升到 16k 字符, 覆盖更多代码上下文)
-			//   b) 工作区文件清单注入 (让 coder 知道磁盘上已有哪些文件)
-			//   c) 上轮输出同时写入 prevResults[genStage.Name] (确保 {prev_result} 包含上轮代码)
-			if round > 1 && lastGenOutput != "" {
-				prevSummary := lastGenOutput
-				if len(prevSummary) > 16000 {
-					prevSummary = prevSummary[:16000] + "\n...(上轮输出已截断)"
-				}
-				feedbackSection = fmt.Sprintf("### 你的第 %d 轮代码输出 (严禁从零重写, 仅针对反馈做增量修改):\n%s\n\n%s",
-					round-1, prevSummary, feedbackSection)
-
-				// 注入工作区文件清单, 让 coder 知道前几轮在磁盘上创建了哪些文件
-				if team.StartedAt.Unix() > 0 {
-					manifest := workspaceFileManifest(team.Cwd, team.StartedAt)
-					if manifest != "" {
-						feedbackSection = manifest + "\n" + feedbackSection
-					}
-				}
-			}
-
-				modifiedPrompt := strings.ReplaceAll(genStage.Prompt, "{adversarial_feedback}", feedbackSection)
-				tempStage := genStage
-				tempStage.Prompt = modifiedPrompt
-				tempStage.Name = fmt.Sprintf("%s-round%d", genStage.Name, round)
-				// 临时替换 RoleRegistry 中的占位符, 执行后恢复
-				var roleRestore func()
-				if we.roles != nil {
-					if role := we.roles.Get(genStage.Role); role != nil && strings.Contains(role.SystemPrompt, "{adversarial_feedback}") {
-						orig := role.SystemPrompt
-						role.SystemPrompt = strings.ReplaceAll(role.SystemPrompt, "{adversarial_feedback}", feedbackSection)
-						roleRestore = func() { role.SystemPrompt = orig }
-					}
-				}
-
-				we.notify(we.chatID, fmt.Sprintf("🔨 对抗第 %d/%d 轮 — %s (%s) 执行中...", round, maxRounds, genStage.Name, genStage.Role))
-				sr := we.executeStage(ctx, tempStage, objective, prevResults, team)
-				if roleRestore != nil {
-					roleRestore()
-				}
-				sr.Name = tempStage.Name
-				allResults = append(allResults, sr)
-				if sr.Status != TaskCompleted {
-					return allResults, fmt.Errorf("%s 第 %d 轮失败: %s", genStage.Name, round, sr.Error)
-				}
-				lastGenOutput = sr.Output
-				prevResults[genStage.Name] = sr.Output
-			}
-
-			// 编译验证门禁: 每轮 implement 后自动运行 go build/vet
-			// 根因: 之前无编译检查, coder 可以产出无法编译的代码并标记 "completed"
-			if team.Cwd != "" {
-				buildErrors := runBuildCheck(team.Cwd)
-				if buildErrors != "" {
-					we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译检查失败, 错误将注入下轮反馈", round))
-					logging.Event(ctx, "adversarial.build_fail", "round", round, "errors_len", len(buildErrors))
-					if we.metrics != nil {
-						we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
-					}
-					if lastEvalFeedback == "" {
-						lastEvalFeedback = "### 编译错误 (必须优先修复):\n" + buildErrors
-					} else {
-						lastEvalFeedback = "### 编译错误 (必须优先修复):\n" + buildErrors + "\n\n" + lastEvalFeedback
-					}
-				} else {
-					we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译检查通过", round))
-					logging.Event(ctx, "adversarial.build_pass", "round", round)
-					if we.metrics != nil {
-						we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
-					}
-				}
-			}
-
-			// 测试左移: 每轮 implement 后立即运行 test, 将结果反馈给 evaluator
-			var inLoopTestOutput string
-			if len(parallelStages) > 0 && round <= maxRounds {
-				for _, ps := range parallelStages {
-					if ps.Role == "tester" {
-						we.notify(we.chatID, fmt.Sprintf("🧪 第 %d 轮快速验证 — %s 运行中...", round, ps.Name))
-						testTemp := ps
-						testTemp.Name = fmt.Sprintf("%s-round%d", ps.Name, round)
-						testResult := we.executeStage(ctx, testTemp, objective, prevResults, team)
-						testResult.Name = testTemp.Name
-						allResults = append(allResults, testResult)
-						if testResult.Status == TaskCompleted {
-							inLoopTestOutput = testResult.Output
-							prevResults[ps.Name] = testResult.Output
-						}
-						break
-					}
-				}
-			}
-
-			// Evaluator (接收 implement + test 的输出)
-			if evalStage != nil {
-				genName := generatorStages[len(generatorStages)-1].Name
-				evalPrevResults := map[string]string{genName: lastGenOutput}
-				for k, v := range prevResults {
-					evalPrevResults[k] = v
-				}
-				if inLoopTestOutput != "" {
-					evalPrevResults["test"] = inLoopTestOutput
-				}
-				modifiedPrompt := strings.ReplaceAll(evalStage.Prompt, "{adversarial_round}", fmt.Sprintf("%d", round))
-				tempStage := *evalStage
-				tempStage.Prompt = modifiedPrompt
-				tempStage.Name = fmt.Sprintf("%s-round%d", evalStage.Name, round)
-
-				we.notify(we.chatID, fmt.Sprintf("🔍 对抗第 %d/%d 轮 — %s (%s) 审查中...", round, maxRounds, evalStage.Name, evalStage.Role))
-				sr := we.runAgent(ctx, evalStage.Role, buildStagePromptWithRoles(tempStage, objective, evalPrevResults, we.roles), team)
-				sr.Name = tempStage.Name
-				allResults = append(allResults, sr)
-
-				if sr.Status == TaskCompleted {
-					score, scoreErr := ParseEvalScoreJSON([]byte(sr.Output))
-					if scoreErr != nil {
-						log.Printf("[对抗] 第 %d 轮评分解析失败: %v (原文前200字: %s)", round, scoreErr, truncateResult(sr.Output, 200))
-					}
-
-					// 格式化包含方案对齐度的评分
-					scoreMsg := fmt.Sprintf("正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f",
-						score.Correctness, score.Completeness, score.Security, score.CodeQuality)
-					if score.DesignAlignment > 0 {
-						scoreMsg += fmt.Sprintf(" 对齐=%.0f", score.DesignAlignment)
-					}
-
-					if team.Blackboard != nil {
-						team.Blackboard.Write(fmt.Sprintf("eval-round%d-score", round),
-							scoreMsg+fmt.Sprintf(" 通过:%v", score.Pass),
-							"evaluator", "score")
-					}
-
-					passLabel := map[bool]string{true: "✅ 通过", false: "❌ 未通过"}[score.MeetsHardPassThreshold()]
-					we.notify(we.chatID, fmt.Sprintf("📊 第 %d 轮评分: %s | %s", round, scoreMsg, passLabel))
-
-					// 自适应终止判断 (MAgICoRe + CaRT)
-					if terminator != nil {
-						decision := terminator.ShouldTerminate(round, score)
-						if decision.ShouldStop {
-							reasonCN := map[string]string{
-								"quality_pass": "质量达标",
-								"max_rounds":   fmt.Sprintf("达到最大轮数(%d)", maxRounds),
-								"degradation":  "连续退化(过度修正)",
-								"converged":    "改进已饱和(收敛)",
-							}[decision.Reason]
-							we.notify(we.chatID, fmt.Sprintf("🏁 自适应终止: %s (第%d轮, 原因: %s)", passLabel, round, reasonCN))
-							if we.metrics != nil {
-								we.metrics.RecordRun("team", metrics.MTeamEvalPassRate,
-									map[bool]float64{true: 1.0, false: 0.0}[score.MeetsHardPassThreshold()],
-									team.Name, map[string]string{"round": fmt.Sprint(round), "termination": decision.Reason})
-								we.metrics.RecordRun("team", metrics.MTeamRoundCount, float64(round), team.Name, nil)
-							}
-							break
-						}
-						we.notify(we.chatID, fmt.Sprintf("🔄 自适应继续: 评分趋势=%s, 已用%d/%d轮", decision.Reason, round, maxRounds))
-					} else if score.MeetsHardPassThreshold() {
-						// 固定轮数模式: 通过即停
-						we.notify(we.chatID, fmt.Sprintf("✅ 对抗通过！第 %d 轮评审达标。", round))
-						if we.metrics != nil {
-							we.metrics.RecordRun("team", metrics.MTeamEvalPassRate, 1.0, team.Name, map[string]string{"round": fmt.Sprint(round)})
-							we.metrics.RecordRun("team", metrics.MTeamRoundCount, float64(round), team.Name, nil)
-						}
-						break
-					}
-
-					lastEvalFeedback = score.Feedback
-					if lastEvalFeedback == "" {
-						lastEvalFeedback = sr.Output
-					}
-				} else {
-					lastEvalFeedback = "评估器未能正常返回结果，请全面检查输出质量。"
-				}
+// buildFeedbackSection 构建跨轮反馈上下文
+func (we *WorkflowExecutor) buildFeedbackSection(round int, lastOutput, lastFeedback string, team *ProductionTeam) string {
+	section := ""
+	if lastFeedback != "" {
+		section = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastFeedback)
+	}
+	if round > 1 && lastOutput != "" {
+		prevSummary := lastOutput
+		if len(prevSummary) > 16000 {
+			prevSummary = prevSummary[:16000] + "\n...(上轮输出已截断)"
+		}
+		section = fmt.Sprintf("### 你的第 %d 轮代码输出 (严禁从零重写, 仅做增量修改):\n%s\n\n%s",
+			round-1, prevSummary, section)
+		if team.StartedAt.Unix() > 0 {
+			if manifest := workspaceFileManifest(team.Cwd, team.StartedAt); manifest != "" {
+				section = manifest + "\n" + section
 			}
 		}
 	}
+	return section
+}
 
-	// Phase 3: E2E 测试 + 非 tester 的并行收尾阶段
-	// 改进: tester 在 Phase 2 循环内以 micro-test 模式运行 (轻量、每轮),
-	// Phase 3 单独运行 E2E 全量测试 + 其他收尾阶段。
-	// 参考 TDAD (2026): 循环内选择性测试 (轻量), Phase 3 全量集成测试。
-	var phase3Stages []StageDef
-	var e2eStage *StageDef
+// runBuildGate 编译验证门禁
+func (we *WorkflowExecutor) runBuildGate(ctx context.Context, team *ProductionTeam, round int, prevFeedback string) string {
+	if team.Cwd == "" {
+		return prevFeedback
+	}
+	buildErrors := runBuildCheck(team.Cwd)
+	if buildErrors != "" {
+		we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译检查失败", round))
+		logging.Event(ctx, "adversarial.build_fail", "round", round)
+		if we.metrics != nil {
+			we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		}
+		buildPrefix := "### 编译错误 (必须优先修复):\n" + buildErrors
+		if prevFeedback == "" {
+			return buildPrefix
+		}
+		return buildPrefix + "\n\n" + prevFeedback
+	}
+	we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译检查通过", round))
+	if we.metrics != nil {
+		we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+	}
+	return prevFeedback
+}
+
+// runEvaluatorRound 执行一轮 Evaluator
+func (we *WorkflowExecutor) runEvaluatorRound(
+	ctx context.Context, evalStage *StageDef, genStages []StageDef,
+	round, maxRounds int, lastGenOutput string,
+	terminator *AdaptiveTerminator,
+	objective string, prevResults map[string]string, team *ProductionTeam,
+	lastEvalFeedback *string,
+) (results []StageResult, shouldBreak bool) {
+	if evalStage == nil {
+		return nil, false
+	}
+
+	genName := genStages[len(genStages)-1].Name
+	evalPrevResults := map[string]string{genName: lastGenOutput}
+	for k, v := range prevResults {
+		evalPrevResults[k] = v
+	}
+
+	modifiedPrompt := strings.ReplaceAll(evalStage.Prompt, "{adversarial_round}", fmt.Sprintf("%d", round))
+	tempStage := *evalStage
+	tempStage.Prompt = modifiedPrompt
+	tempStage.Name = fmt.Sprintf("%s-round%d", evalStage.Name, round)
+
+	we.notify(we.chatID, fmt.Sprintf("🔍 对抗第 %d/%d 轮 — 审查中...", round, maxRounds))
+	sr := we.runAgent(ctx, evalStage.Role, buildStagePromptWithRoles(tempStage, objective, evalPrevResults, we.roles), team)
+	sr.Name = tempStage.Name
+	results = append(results, sr)
+
+	if sr.Status != TaskCompleted {
+		*lastEvalFeedback = "评估器未能正常返回结果，请全面检查输出质量。"
+		return results, false
+	}
+
+	score, scoreErr := ParseEvalScoreJSON([]byte(sr.Output))
+	if scoreErr != nil {
+		log.Printf("[对抗] 第 %d 轮评分解析失败: %v", round, scoreErr)
+	}
+
+	scoreMsg := fmt.Sprintf("正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f",
+		score.Correctness, score.Completeness, score.Security, score.CodeQuality)
+	if score.DesignAlignment > 0 {
+		scoreMsg += fmt.Sprintf(" 对齐=%.0f", score.DesignAlignment)
+	}
+	if team.Blackboard != nil {
+		team.Blackboard.Write(fmt.Sprintf("eval-round%d-score", round),
+			scoreMsg+fmt.Sprintf(" 通过:%v", score.Pass), "evaluator", "score")
+	}
+
+	passLabel := map[bool]string{true: "✅ 通过", false: "❌ 未通过"}[score.MeetsHardPassThreshold()]
+	we.notify(we.chatID, fmt.Sprintf("📊 第 %d 轮评分: %s | %s", round, scoreMsg, passLabel))
+
+	// 自适应终止判断
+	if terminator != nil {
+		decision := terminator.ShouldTerminate(round, score)
+		if decision.ShouldStop {
+			reasonCN := map[string]string{
+				"quality_pass": "质量达标", "max_rounds": "达到最大轮数",
+				"degradation": "连续退化", "converged": "改进已饱和",
+			}[decision.Reason]
+			we.notify(we.chatID, fmt.Sprintf("🏁 自适应终止: %s (原因: %s)", passLabel, reasonCN))
+			we.recordEvalMetrics(team, round, score, decision.Reason)
+			return results, true
+		}
+		we.notify(we.chatID, fmt.Sprintf("🔄 自适应继续: %s, %d/%d轮", decision.Reason, round, maxRounds))
+	} else if score.MeetsHardPassThreshold() {
+		we.notify(we.chatID, fmt.Sprintf("✅ 对抗通过！第 %d 轮评审达标。", round))
+		we.recordEvalMetrics(team, round, score, "pass")
+		return results, true
+	}
+
+	*lastEvalFeedback = score.Feedback
+	if *lastEvalFeedback == "" {
+		*lastEvalFeedback = sr.Output
+	}
+	return results, false
+}
+
+// recordEvalMetrics 记录评估指标
+func (we *WorkflowExecutor) recordEvalMetrics(team *ProductionTeam, round int, score EvalScore, reason string) {
+	if we.metrics == nil {
+		return
+	}
+	val := 0.0
+	if score.MeetsHardPassThreshold() {
+		val = 1.0
+	}
+	we.metrics.RecordRun("team", metrics.MTeamEvalPassRate, val, team.Name,
+		map[string]string{"round": fmt.Sprint(round), "termination": reason})
+	we.metrics.RecordRun("team", metrics.MTeamRoundCount, float64(round), team.Name, nil)
+}
+
+// runE2EAdversarial Phase 3: E2E 对抗测试 (tester↔coder 自适应循环)。
+// 不再是1轮 E2E + 1轮修复, 而是完整的对抗循环:
+// E2E-tester 发现问题 → coder 修复 → E2E-tester 回归验证 → 直到通过或达到上限。
+// 参考 TDAD (2026): E2E 作为质量门禁, 驱动增量修复。
+func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStages []StageDef, objective string, prevResults map[string]string, team *ProductionTeam) []StageResult {
+	var testerStage *StageDef
 	for i, ps := range parallelStages {
 		if ps.Role == "tester" {
-			e2eStage = &parallelStages[i]
-			continue
+			testerStage = &parallelStages[i]
+			break
 		}
-		phase3Stages = append(phase3Stages, ps)
+	}
+	if testerStage == nil {
+		return nil
 	}
 
-	// E2E 全量测试 (独立于对抗循环内的 micro-test)
-	if e2eStage != nil {
-		we.notify(we.chatID, "🧪 Phase 3: 端到端全量测试 (E2E)...")
-		e2ePrompt := fmt.Sprintf(`你是高级质量工程师 (E2E 全量测试模式)。
-所有编码任务已完成, 现在进行跨模块端到端测试。
+	var results []StageResult
+	e2eTerminator := NewAdaptiveTerminator(1, 3) // E2E: 最少1轮, 最多3轮
+	we.notify(we.chatID, "🧪 Phase 3: E2E 对抗测试 (tester↔coder 自适应)...")
+
+	var lastE2EOutput string
+	for round := 1; round <= 3; round++ {
+		if ctx.Err() != nil {
+			break
+		}
+
+		// E2E Tester
+		e2ePrompt := we.buildE2EPrompt(objective, prevResults, lastE2EOutput, round)
+		e2eStageDef := StageDef{Name: fmt.Sprintf("e2e-round%d", round), Role: "tester", Prompt: e2ePrompt}
+		e2eResult := we.executeStage(ctx, e2eStageDef, objective, prevResults, team)
+		e2eResult.Name = e2eStageDef.Name
+		results = append(results, e2eResult)
+
+		if e2eResult.Status != TaskCompleted {
+			break
+		}
+		lastE2EOutput = e2eResult.Output
+		prevResults["e2e-test"] = e2eResult.Output
+
+		// 评估 E2E 结果: 无 Bug/FAIL 则通过
+		hasBugs := strings.Contains(strings.ToLower(e2eResult.Output), "bug") ||
+			strings.Contains(strings.ToLower(e2eResult.Output), "fail") ||
+			strings.Contains(strings.ToLower(e2eResult.Output), "错误")
+
+		e2eScore := EvalScore{Correctness: 8, Completeness: 8, Security: 7, CodeQuality: 7, Pass: !hasBugs}
+		if hasBugs {
+			e2eScore = EvalScore{Correctness: 4, Completeness: 5, Security: 7, CodeQuality: 6, Pass: false}
+		}
+
+		decision := e2eTerminator.ShouldTerminate(round, e2eScore)
+		if decision.ShouldStop && !hasBugs {
+			we.notify(we.chatID, fmt.Sprintf("✅ E2E 第 %d 轮通过, 无阻断性问题", round))
+			break
+		}
+
+		if !hasBugs {
+			we.notify(we.chatID, fmt.Sprintf("✅ E2E 第 %d 轮未发现严重问题", round))
+			break
+		}
+
+		// Coder 修复
+		we.notify(we.chatID, fmt.Sprintf("🔧 E2E 第 %d 轮发现问题, 驱动 coder 修复...", round))
+		fixPrompt := fmt.Sprintf(`E2E 测试第 %d 轮发现以下问题, 请逐一修复:
+
+%s
+
+修复后确保 go build ./... && go test ./... 通过。
+`, round, e2eResult.Output)
+		fixStage := StageDef{Name: fmt.Sprintf("e2e-fix-round%d", round), Role: "coder", Prompt: fixPrompt}
+		fixResult := we.executeStage(ctx, fixStage, objective, prevResults, team)
+		fixResult.Name = fixStage.Name
+		results = append(results, fixResult)
+		if fixResult.Status == TaskCompleted {
+			prevResults["implement"] = fixResult.Output
+		}
+
+		if decision.ShouldStop {
+			we.notify(we.chatID, fmt.Sprintf("🏁 E2E 对抗终止 (原因: %s)", decision.Reason))
+			break
+		}
+	}
+	return results
+}
+
+// buildE2EPrompt 构建 E2E 测试 prompt
+func (we *WorkflowExecutor) buildE2EPrompt(objective string, prevResults map[string]string, lastE2E string, round int) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf(`你是高级质量工程师 (E2E 全量测试, 第 %d 轮)。
 
 目标: %s
 
-所有阶段的产出:
-%s
+`, round, objective))
 
-## E2E 测试要求 (区别于循环内 micro-test)
-循环内 micro-test 已验证每个任务的编译+接口对齐。
-你的职责是更高层次的集成测试:
+	if round > 1 && lastE2E != "" {
+		b.WriteString("### 上轮 E2E 发现的问题 (需验证是否已修复):\n")
+		b.WriteString(truncateResult(lastE2E, 4000))
+		b.WriteString("\n\n")
+	}
 
-### 1. 跨模块集成测试
-- 模块间接口调用链路是否正确连通
-- 数据在模块间传递的完整性和正确性
-- 错误从底层到上层的正确传播
+	b.WriteString("### 实现产出摘要:\n")
+	b.WriteString(buildPrevResultsSummary(prevResults))
+	b.WriteString(`
+## E2E 测试要求
+1. **跨模块集成测试**: 模块间接口连通性、数据传递、错误传播
+2. **端到端流程测试**: Happy Path + Error Path 完整链路
+3. **回归验证**: 确认之前发现的问题是否已修复
+4. **编译验证**: go build ./... && go vet ./... && go test -race ./...
 
-### 2. 端到端流程测试
-- 从用户输入到最终输出的完整 Happy Path
-- 关键 Error Path (非法输入、异常状态)
-- 如果是 CLI: 命令行参数→执行→输出 完整链路
-- 如果是 API: HTTP 请求→处理→响应 完整链路
+必须实际编写测试代码并运行。`)
+	return b.String()
+}
 
-### 3. 整体一致性验证
-- go build ./... && go vet ./... 必须通过
-- go test -race ./... 检查竞态条件
-
-## 如发现 Bug, 详细记录并建议修复方案。
-必须实际编写测试代码并运行。`,
-			objective, buildPrevResultsSummary(prevResults))
-		e2eStageDef := StageDef{Name: "e2e-test", Role: "tester", Prompt: e2ePrompt}
-		e2eResult := we.executeStage(ctx, e2eStageDef, objective, prevResults, team)
-		e2eResult.Name = "e2e-test"
-		allResults = append(allResults, e2eResult)
-		prevResults["e2e-test"] = e2eResult.Output
-
-		// E2E 测试发现 Bug → 驱动 coder 修复 (最多1轮修复)
-		if e2eResult.Status == TaskCompleted && strings.Contains(strings.ToLower(e2eResult.Output), "bug") {
-			we.notify(we.chatID, "🔧 E2E 发现问题, 驱动 coder 修复...")
-			fixPrompt := fmt.Sprintf(`E2E 测试发现以下问题, 请修复:
-
-%s
-
-请逐一修复所有发现的 Bug, 确保 go build 和 go test 通过。`, e2eResult.Output)
-			fixStage := StageDef{Name: "e2e-fix", Role: "coder", Prompt: fixPrompt}
-			fixResult := we.executeStage(ctx, fixStage, objective, prevResults, team)
-			fixResult.Name = "e2e-fix"
-			allResults = append(allResults, fixResult)
+// runFinishPhase Phase 4: 非测试的收尾阶段
+func (we *WorkflowExecutor) runFinishPhase(ctx context.Context, parallelStages []StageDef, objective string, prevResults map[string]string, team *ProductionTeam) []StageResult {
+	var nonTestStages []StageDef
+	for _, ps := range parallelStages {
+		if ps.Role != "tester" {
+			nonTestStages = append(nonTestStages, ps)
 		}
 	}
-
-	if len(phase3Stages) > 0 {
-		we.notify(we.chatID, fmt.Sprintf("📦 Phase 3: 收尾阶段 (%d)...", len(phase3Stages)))
-		testResults := we.executeParallel(ctx, phase3Stages, objective, prevResults, team)
-		allResults = append(allResults, testResults...)
+	if len(nonTestStages) == 0 {
+		return nil
 	}
-
-	return allResults, nil
+	we.notify(we.chatID, fmt.Sprintf("📦 Phase 4: 收尾 (%d 阶段)...", len(nonTestStages)))
+	return we.executeParallel(ctx, nonTestStages, objective, prevResults, team)
 }
 
 // classifyStages 根据工作流结构自动发现阶段角色。

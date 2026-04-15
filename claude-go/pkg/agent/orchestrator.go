@@ -1,26 +1,20 @@
-// Orchestrator — DAG 驱动的任务编排器。
+// Orchestrator — 复用 V2 TaskStore DAG 的任务编排器。
 //
 // 参考论文/方案:
-//   - DynTaskMAS (ICAPS 2025): 动态任务图 + 异步并行执行引擎, 21-33% 执行时间缩减
-//   - AgentOrchestra (2025): 层级化编排 + MCP Manager Agent
-//   - Gradientsys (2025): ReAct 编排 + 重试重规划机制
-//   - MetaGPT SOP: 标准化操作流程 + 中间结果验证
+//   - DynTaskMAS (ICAPS 2025): 动态任务图 + 异步并行执行引擎
+//   - AgentOrchestra (2025): 层级化编排 + 监督协议
+//   - Gradientsys (2025): 失败重试 + 上下文累积 Phoenix protocol
 //
-// 核心职责 (区别于 Planner):
+// 关键设计决策:
+//   删除自建的 DAG (ParsePlanToDAG/ReadyNodes/UnblockDependents),
+//   直接复用 V2 TaskStore 已有的 DAG 能力 (AddTaskWithDeps/ReadyTasks/SetTaskStatusAndUnblock)。
+//   Swarm 的 topologicalLevels 也应迁移到 V2 TaskStore (统一调度器)。
 //
-//	Planner:      输出 WBS (任务分解 + 依赖图 + 验收标准)
-//	Orchestrator:  消费 WBS → 创建 DAG 任务 → 调度并发 → 失败重试 → 监督收尾
+// 职责分工:
 //
-// 设计模式: Supervisor + DAG Scheduler
-//
-//	┌─────────────────────────────────────────────────────────────┐
-//	│ Orchestrator                                                │
-//	│  1. ParsePlan()  → 解析 Planner 输出为 TaskNode DAG        │
-//	│  2. Schedule()   → 拓扑排序 + ReadyNodes → 并发调度        │
-//	│  3. MicroTest()  → 每个 task 完成后轻量测试                │
-//	│  4. Retry()      → 失败 task 重试 (最多 N 次)              │
-//	│  5. Supervise()  → 监控进度 + 驱动下游 + 触发 E2E          │
-//	└─────────────────────────────────────────────────────────────┘
+//	Planner:      输出 WBS (任务分解 + 依赖图)
+//	Orchestrator:  消费 WBS → 写入 V2 DAG → 调度 → micro-test → 重试 → E2E
+//	V2 TaskStore: 提供 DAG 存储 + 就绪队列 + 依赖解除 (单一数据源)
 package agent
 
 import (
@@ -35,25 +29,19 @@ import (
 	"github.com/anthropic/claude-go/pkg/logging"
 )
 
-// TaskNode 编排器内部的任务节点 (DAG 中的一个顶点)
+// TaskNode 编排器的任务元数据 (与 V2 TaskStore 中的 task ID 关联)
 type TaskNode struct {
-	ID             string   `json:"id"`
+	V2TaskID       string   `json:"v2TaskId"`
 	Title          string   `json:"title"`
 	Role           string   `json:"role"`
-	DependsOn      []string `json:"dependsOn"`
 	DesignRef      string   `json:"designRef"`
 	ConstraintRefs []string `json:"constraintRefs"`
 	AcceptCriteria string   `json:"acceptCriteria"`
-	Priority       int      `json:"priority"`
 	MaxRetries     int      `json:"maxRetries"`
 
-	Status    string    `json:"status"` // pending, blocked, running, completed, failed, retrying
-	Output    string    `json:"output"`
-	Error     string    `json:"error"`
-	Retries   int       `json:"retries"`
-	StartedAt time.Time `json:"startedAt"`
-	Duration  string    `json:"duration"`
-
+	Output      string `json:"output"`
+	Error       string `json:"error"`
+	Retries     int    `json:"retries"`
 	TestResult  string `json:"testResult,omitempty"`
 	TestPassed  bool   `json:"testPassed"`
 	DriftReport string `json:"driftReport,omitempty"`
@@ -66,9 +54,10 @@ type OrchestratorConfig struct {
 	MicroTestAfter bool
 }
 
-// Orchestrator DAG 任务编排器
+// Orchestrator 复用 V2 TaskStore 的 DAG 编排器
 type Orchestrator struct {
 	config OrchestratorConfig
+	dag    DAGTaskTracker // 复用 V2 TaskStore 而非自建 DAG
 	nodes  map[string]*TaskNode
 	mu     sync.Mutex
 
@@ -81,10 +70,11 @@ type Orchestrator struct {
 
 	completedCount int
 	failedCount    int
+	totalCount     int
 }
 
-// NewOrchestrator 创建编排器
-func NewOrchestrator(cfg OrchestratorConfig, factory CreateAgentFunc, notify NotifyFunc, pool *AgentPool, chatID string) *Orchestrator {
+// NewOrchestrator 创建编排器 (需要 DAGTaskTracker, 不再自建 DAG)
+func NewOrchestrator(cfg OrchestratorConfig, dag DAGTaskTracker, factory CreateAgentFunc, notify NotifyFunc, pool *AgentPool, chatID string) *Orchestrator {
 	if cfg.MaxParallel <= 0 {
 		cfg.MaxParallel = 3
 	}
@@ -92,8 +82,10 @@ func NewOrchestrator(cfg OrchestratorConfig, factory CreateAgentFunc, notify Not
 		cfg.MaxRetries = 2
 	}
 	return &Orchestrator{
-		config:  cfg,
-		nodes:   make(map[string]*TaskNode),
+		config: cfg,
+		dag:    dag,
+		nodes:  make(map[string]*TaskNode),
+
 		factory: factory,
 		notify:  notify,
 		pool:    pool,
@@ -101,7 +93,7 @@ func NewOrchestrator(cfg OrchestratorConfig, factory CreateAgentFunc, notify Not
 	}
 }
 
-// SetDesignContext 注入设计文档和计划文档 (供偏差检测使用)
+// SetDesignContext 注入设计文档 (供 micro-test 偏差检测)
 func (o *Orchestrator) SetDesignContext(designDoc, planDoc string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -109,16 +101,32 @@ func (o *Orchestrator) SetDesignContext(designDoc, planDoc string) {
 	o.planDoc = planDoc
 }
 
-// ParsePlanToDAG 从 Planner 的 WBS 输出解析任务 DAG。
-// 表格格式: | # | 任务 | 角色 | 依赖 | 设计章节 | 约束编号 | 验收标准 | 优先级 |
-func (o *Orchestrator) ParsePlanToDAG(planOutput string) []*TaskNode {
+// ParsePlanToDAG 解析 Planner WBS → 写入 V2 TaskStore (DAG 单一数据源)。
+// 返回任务节点列表 (元数据保存在内存, DAG 关系在 TaskStore)。
+func (o *Orchestrator) ParsePlanToDAG(planOutput, teamName string) ([]*TaskNode, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	if o.dag == nil {
+		return nil, fmt.Errorf("DAGTaskTracker 未配置")
+	}
+
 	var nodes []*TaskNode
 	lines := strings.Split(planOutput, "\n")
-
 	tableRe := regexp.MustCompile(`^\|\s*(\d+)\s*\|`)
+
+	// 第一遍: 解析表格, 收集任务信息 (需要两遍因为依赖用序号而非 V2 ID)
+	type rawTask struct {
+		num            string
+		title, role    string
+		depNums        []string
+		designRef      string
+		constraintRefs []string
+		accept         string
+		priority       int
+	}
+	var rawTasks []rawTask
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if !tableRe.MatchString(line) {
@@ -128,9 +136,12 @@ func (o *Orchestrator) ParsePlanToDAG(planOutput string) []*TaskNode {
 		if len(cells) < 9 {
 			continue
 		}
+		title := strings.TrimSpace(cells[2])
+		if title == "" || title == "任务" {
+			continue
+		}
 
 		num := strings.TrimSpace(cells[1])
-		title := strings.TrimSpace(cells[2])
 		role := strings.TrimSpace(cells[3])
 		deps := strings.TrimSpace(cells[4])
 		designRef := strings.TrimSpace(cells[5])
@@ -138,28 +149,23 @@ func (o *Orchestrator) ParsePlanToDAG(planOutput string) []*TaskNode {
 		accept := strings.TrimSpace(cells[7])
 		priStr := strings.TrimSpace(cells[8])
 
-		if title == "" || title == "任务" {
-			continue
-		}
-
-		nodeID := fmt.Sprintf("task-%s", num)
-		var depIDs []string
+		var depNums []string
 		if deps != "" && deps != "-" && deps != "无" {
 			for _, d := range strings.Split(deps, ",") {
 				d = strings.TrimSpace(d)
 				d = strings.TrimPrefix(d, "#")
 				if d != "" {
-					depIDs = append(depIDs, "task-"+d)
+					depNums = append(depNums, d)
 				}
 			}
 		}
 
-		var constraintRefs []string
+		var cRefs []string
 		if constraints != "" && constraints != "-" {
 			for _, c := range strings.Split(constraints, ",") {
 				c = strings.TrimSpace(c)
 				if c != "" {
-					constraintRefs = append(constraintRefs, c)
+					cRefs = append(cRefs, c)
 				}
 			}
 		}
@@ -169,28 +175,278 @@ func (o *Orchestrator) ParsePlanToDAG(planOutput string) []*TaskNode {
 			priority = p
 		}
 
-		status := "pending"
-		if len(depIDs) > 0 {
-			status = "blocked"
-		}
-
-		node := &TaskNode{
-			ID:             nodeID,
-			Title:          title,
-			Role:           orchNormalizeRole(role),
-			DependsOn:      depIDs,
-			DesignRef:      designRef,
-			ConstraintRefs: constraintRefs,
-			AcceptCriteria: accept,
-			Priority:       priority,
-			MaxRetries:     o.config.MaxRetries,
-			Status:         status,
-		}
-		nodes = append(nodes, node)
-		o.nodes[nodeID] = node
+		rawTasks = append(rawTasks, rawTask{
+			num: num, title: title, role: orchNormalizeRole(role),
+			depNums: depNums, designRef: designRef,
+			constraintRefs: cRefs, accept: accept, priority: priority,
+		})
 	}
 
-	return nodes
+	// 第二遍: 按序号创建 V2 任务, 建立 num→v2ID 映射
+	numToV2ID := make(map[string]string)
+	for _, rt := range rawTasks {
+		var depV2IDs []string
+		for _, dn := range rt.depNums {
+			if v2id, ok := numToV2ID[dn]; ok {
+				depV2IDs = append(depV2IDs, v2id)
+			}
+		}
+
+		subject := fmt.Sprintf("[%s] %s", teamName, rt.title)
+		v2ID, err := o.dag.AddTaskWithDeps(subject, rt.accept, rt.role, depV2IDs, rt.priority)
+		if err != nil {
+			return nodes, fmt.Errorf("创建V2 DAG任务失败: %w", err)
+		}
+		numToV2ID[rt.num] = v2ID
+
+		node := &TaskNode{
+			V2TaskID:       v2ID,
+			Title:          rt.title,
+			Role:           rt.role,
+			DesignRef:      rt.designRef,
+			ConstraintRefs: rt.constraintRefs,
+			AcceptCriteria: rt.accept,
+			MaxRetries:     o.config.MaxRetries,
+		}
+		nodes = append(nodes, node)
+		o.nodes[v2ID] = node
+	}
+
+	o.totalCount = len(nodes)
+	return nodes, nil
+}
+
+// Execute 从 V2 TaskStore 的就绪队列循环调度, 直到所有任务完成。
+func (o *Orchestrator) Execute(ctx context.Context, objective string, team *ProductionTeam) ([]StageResult, error) {
+	var allResults []StageResult
+	var resultsMu sync.Mutex
+
+	if o.totalCount == 0 {
+		return nil, nil
+	}
+
+	o.notify(o.chatID, fmt.Sprintf("🎯 编排器启动: %d 个任务, 最大并发 %d (V2 DAG 驱动)",
+		o.totalCount, o.config.MaxParallel))
+	logging.Event(ctx, "orchestrator.start", "tasks", o.totalCount, "maxParallel", o.config.MaxParallel)
+
+	for {
+		if ctx.Err() != nil {
+			return allResults, ctx.Err()
+		}
+
+		// 从 V2 TaskStore 获取就绪任务 (单一数据源)
+		readyV2 := o.dag.ReadyTasks()
+		if len(readyV2) == 0 {
+			if o.completedCount+o.failedCount >= o.totalCount {
+				break
+			}
+			select {
+			case <-time.After(2 * time.Second):
+				continue
+			case <-ctx.Done():
+				return allResults, ctx.Err()
+			}
+		}
+
+		batch := readyV2
+		if len(batch) > o.config.MaxParallel {
+			batch = batch[:o.config.MaxParallel]
+		}
+
+		var wg sync.WaitGroup
+		for _, task := range batch {
+			o.mu.Lock()
+			node, ok := o.nodes[task.ID]
+			o.mu.Unlock()
+			if !ok {
+				continue
+			}
+
+			// 标记为 running
+			_ = o.dag.SetTaskStatus(task.ID, "in_progress")
+
+			wg.Add(1)
+			go func(n *TaskNode, taskID string) {
+				defer wg.Done()
+				sr := o.executeTaskNode(ctx, n, objective, team)
+				resultsMu.Lock()
+				allResults = append(allResults, sr)
+				resultsMu.Unlock()
+			}(node, task.ID)
+		}
+		wg.Wait()
+	}
+
+	o.notify(o.chatID, fmt.Sprintf("🏁 编排完成: %d/%d 成功, %d 失败",
+		o.completedCount, o.totalCount, o.failedCount))
+	return allResults, nil
+}
+
+// executeTaskNode 执行单个任务 + micro-test + 重试
+func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam) StageResult {
+	start := time.Now()
+	prompt := o.buildTaskPrompt(node, objective)
+
+	o.notify(o.chatID, fmt.Sprintf("▶️ %s (%s) 执行中...", node.Title, node.Role))
+
+	runner, err := o.factory(ctx, node.Role, "")
+	if err != nil {
+		return o.handleTaskFailure(ctx, node, objective, team,
+			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+				StartedAt: start, Duration: time.Since(start).String()})
+	}
+
+	result, err := runner.Execute(ctx, prompt)
+	duration := time.Since(start)
+
+	if err != nil {
+		return o.handleTaskFailure(ctx, node, objective, team,
+			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+				StartedAt: start, Duration: duration.String()})
+	}
+
+	if reason := validateAgentOutput(result, node.Role); reason != "" {
+		return o.handleTaskFailure(ctx, node, objective, team,
+			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed,
+				Error: "产出验证失败: " + reason, Output: result,
+				StartedAt: start, Duration: duration.String()})
+	}
+
+	node.Output = result
+
+	if o.config.MicroTestAfter {
+		o.runMicroTest(ctx, node)
+	}
+
+	// 通过 V2 TaskStore 标记完成 + 自动解除下游依赖
+	o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")
+	o.mu.Lock()
+	o.completedCount++
+	o.mu.Unlock()
+
+	testInfo := ""
+	if node.TestResult != "" {
+		if node.TestPassed {
+			testInfo = " ✅micro-test"
+		} else {
+			testInfo = " ⚠️micro-test偏差"
+		}
+	}
+	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s)%s",
+		node.Title, duration.Round(time.Second), testInfo))
+
+	if team.Blackboard != nil {
+		team.Blackboard.Write(node.V2TaskID+"-result", result, node.Role, "result")
+	}
+
+	return StageResult{
+		Name: node.V2TaskID, Role: node.Role, Status: TaskCompleted,
+		Output: result, StartedAt: start, Duration: duration.Round(time.Second).String(),
+	}
+}
+
+// handleTaskFailure 失败处理 + Phoenix 重试
+func (o *Orchestrator) handleTaskFailure(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, sr StageResult) StageResult {
+	node.Retries++
+	if node.Retries <= node.MaxRetries {
+		o.notify(o.chatID, fmt.Sprintf("🔄 %s 重试 %d/%d: %s",
+			node.Title, node.Retries, node.MaxRetries, sr.Error))
+		node.Error = sr.Error
+		_ = o.dag.SetTaskStatus(node.V2TaskID, "pending") // 重置为 pending 允许重调度
+		return o.executeTaskNode(ctx, node, objective, team)
+	}
+
+	_ = o.dag.SetTaskStatus(node.V2TaskID, "failed")
+	o.mu.Lock()
+	o.failedCount++
+	o.mu.Unlock()
+	o.notify(o.chatID, fmt.Sprintf("❌ %s 最终失败 (重试 %d 次)", node.Title, node.MaxRetries))
+	return sr
+}
+
+// runMicroTest 轻量级验证 (参考 TDAD 2026)
+func (o *Orchestrator) runMicroTest(ctx context.Context, node *TaskNode) {
+	if o.factory == nil {
+		return
+	}
+	designCtx := o.orchDesignRefContext(node.DesignRef)
+	prompt := fmt.Sprintf(`你是轻量级验证工程师 (Micro-Tester)。仅对单个任务做快速验证。
+
+## 被验证的任务
+- 任务: %s | 角色: %s | 设计章节: %s
+- 约束: %s | 验收标准: %s
+
+## 任务产出 (截取)
+%s
+
+## 快速验证 (3项, 每项 PASS/FAIL):
+1. **编译完整性**: 语法正确? import 完整?
+2. **接口对齐**: %s
+3. **约束遵守**: %s 是否被遵守?
+
+输出格式: 编译: PASS/FAIL | 对齐: PASS/FAIL | 约束: PASS/FAIL | 综合: PASS/FAIL`,
+		node.Title, node.Role, node.DesignRef,
+		strings.Join(node.ConstraintRefs, ","), node.AcceptCriteria,
+		truncateResult(node.Output, 6000),
+		designCtx,
+		strings.Join(node.ConstraintRefs, ","))
+
+	testCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	runner, err := o.factory(testCtx, "tester", "")
+	if err != nil {
+		return
+	}
+	result, err := runner.Execute(testCtx, prompt)
+	if err != nil {
+		return
+	}
+
+	node.TestResult = result
+	node.TestPassed = !strings.Contains(strings.ToUpper(result), "FAIL")
+	if !node.TestPassed {
+		node.DriftReport = orchExtractDriftInfo(result)
+	}
+}
+
+func (o *Orchestrator) orchDesignRefContext(ref string) string {
+	o.mu.Lock()
+	doc := o.designDoc
+	o.mu.Unlock()
+	if doc == "" || ref == "" || ref == "-" {
+		return "无设计文档参考"
+	}
+	lower := strings.ToLower(ref)
+	lines := strings.Split(doc, "\n")
+	var section []string
+	capturing := false
+	for _, line := range lines {
+		if strings.Contains(strings.ToLower(line), lower) {
+			capturing = true
+		}
+		if capturing {
+			section = append(section, line)
+			if len(section) > 30 || (len(section) > 2 && strings.HasPrefix(line, "## ")) {
+				break
+			}
+		}
+	}
+	if len(section) > 0 {
+		return "设计文档相关章节:\n" + strings.Join(section, "\n")
+	}
+	return "设计文档参考: " + ref
+}
+
+func orchExtractDriftInfo(testResult string) string {
+	var drifts []string
+	for _, line := range strings.Split(testResult, "\n") {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "fail") || strings.Contains(lower, "偏差") {
+			drifts = append(drifts, strings.TrimSpace(line))
+		}
+	}
+	return strings.Join(drifts, "; ")
 }
 
 func orchNormalizeRole(role string) string {
@@ -207,407 +463,25 @@ func orchNormalizeRole(role string) string {
 	}
 }
 
-// ReadyNodes 返回所有可执行的任务节点 (依赖已满足), 按优先级降序。
-func (o *Orchestrator) ReadyNodes() []*TaskNode {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	var ready []*TaskNode
-	for _, node := range o.nodes {
-		if node.Status != "pending" {
-			continue
-		}
-		allDepsOK := true
-		for _, dep := range node.DependsOn {
-			if d, ok := o.nodes[dep]; !ok || d.Status != "completed" {
-				allDepsOK = false
-				break
-			}
-		}
-		if allDepsOK {
-			ready = append(ready, node)
-		}
-	}
-
-	for i := 1; i < len(ready); i++ {
-		for j := i; j > 0 && ready[j].Priority > ready[j-1].Priority; j-- {
-			ready[j], ready[j-1] = ready[j-1], ready[j]
-		}
-	}
-	return ready
-}
-
-// UnblockDependents 完成一个任务后,解除下游任务的阻塞。
-// completedID 指定刚完成的节点 (即使其 Status 字段尚未更新,也视为 completed)。
-func (o *Orchestrator) UnblockDependents(completedID string) int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	unblocked := 0
-	for _, node := range o.nodes {
-		if node.Status != "blocked" {
-			continue
-		}
-		allDone := true
-		for _, dep := range node.DependsOn {
-			if dep == completedID {
-				continue // 参数指定已完成
-			}
-			d, ok := o.nodes[dep]
-			if !ok || d.Status != "completed" {
-				allDone = false
-				break
-			}
-		}
-		if allDone {
-			node.Status = "pending"
-			unblocked++
-		}
-	}
-	return unblocked
-}
-
-// Execute 执行编排: 循环调度就绪任务直到全部完成或达到终止条件。
-// 核心循环 (DynTaskMAS 异步并行引擎):
-//  1. 查询 ReadyNodes
-//  2. 并发调度 (受 MaxParallel 限制)
-//  3. 等待完成 → 解除下游依赖 → micro-test → 更新状态
-//  4. 失败重试 (Gradientsys Phoenix protocol)
-//  5. 重复直到所有任务完成
-func (o *Orchestrator) Execute(ctx context.Context, objective string, team *ProductionTeam) ([]StageResult, error) {
-	var allResults []StageResult
-	var resultsMu sync.Mutex
-	totalTasks := len(o.nodes)
-	if totalTasks == 0 {
-		return nil, nil
-	}
-
-	o.notify(o.chatID, fmt.Sprintf("🎯 编排器启动: %d 个任务, 最大并发 %d", totalTasks, o.config.MaxParallel))
-	logging.Event(ctx, "orchestrator.start", "tasks", totalTasks, "maxParallel", o.config.MaxParallel)
-
-	for {
-		if ctx.Err() != nil {
-			return allResults, ctx.Err()
-		}
-
-		ready := o.ReadyNodes()
-		if len(ready) == 0 {
-			if o.completedCount+o.failedCount >= totalTasks {
-				break
-			}
-			o.mu.Lock()
-			hasRunning := false
-			for _, n := range o.nodes {
-				if n.Status == "running" || n.Status == "retrying" {
-					hasRunning = true
-					break
-				}
-			}
-			o.mu.Unlock()
-			if !hasRunning {
-				break
-			}
-			select {
-			case <-time.After(2 * time.Second):
-				continue
-			case <-ctx.Done():
-				return allResults, ctx.Err()
-			}
-		}
-
-		batch := ready
-		if len(batch) > o.config.MaxParallel {
-			batch = batch[:o.config.MaxParallel]
-		}
-
-		var wg sync.WaitGroup
-		for _, node := range batch {
-			o.mu.Lock()
-			node.Status = "running"
-			node.StartedAt = time.Now()
-			o.mu.Unlock()
-
-			wg.Add(1)
-			go func(n *TaskNode) {
-				defer wg.Done()
-				sr := o.executeTaskNode(ctx, n, objective, team)
-				resultsMu.Lock()
-				allResults = append(allResults, sr)
-				resultsMu.Unlock()
-			}(node)
-		}
-
-		wg.Wait()
-	}
-
-	o.notify(o.chatID, fmt.Sprintf("🏁 编排完成: %d/%d 成功, %d 失败",
-		o.completedCount, totalTasks, o.failedCount))
-	logging.Event(ctx, "orchestrator.done",
-		"completed", o.completedCount, "failed", o.failedCount, "total", totalTasks)
-
-	return allResults, nil
-}
-
-// executeTaskNode 执行单个任务节点 (含 micro-test + 偏差检测 + 重试)
-func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam) StageResult {
-	start := time.Now()
-	prompt := o.buildTaskPrompt(node, objective)
-
-	o.notify(o.chatID, fmt.Sprintf("▶️ [%s] %s (%s) 执行中...", node.ID, node.Title, node.Role))
-	logging.Event(ctx, "orchestrator.task.start", "taskID", node.ID, "role", node.Role, "title", node.Title)
-
-	runner, err := o.factory(ctx, node.Role, "")
-	if err != nil {
-		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.ID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
-				StartedAt: start, Duration: time.Since(start).String()})
-	}
-
-	result, err := runner.Execute(ctx, prompt)
-	duration := time.Since(start)
-
-	if err != nil {
-		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.ID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
-				StartedAt: start, Duration: duration.String()})
-	}
-
-	if reason := validateAgentOutput(result, node.Role); reason != "" {
-		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.ID, Role: node.Role, Status: TaskFailed,
-				Error: fmt.Sprintf("产出验证失败: %s", reason), Output: result,
-				StartedAt: start, Duration: duration.String()})
-	}
-
-	o.mu.Lock()
-	node.Output = result
-	o.mu.Unlock()
-
-	if o.config.MicroTestAfter {
-		o.runMicroTest(ctx, node, team)
-	}
-
-	o.mu.Lock()
-	node.Status = "completed"
-	node.Duration = duration.Round(time.Second).String()
-	o.completedCount++
-	o.mu.Unlock()
-	o.UnblockDependents(node.ID)
-
-	testInfo := ""
-	if node.TestResult != "" {
-		if node.TestPassed {
-			testInfo = " ✅micro-test"
-		} else {
-			testInfo = " ⚠️micro-test异常"
-		}
-	}
-	o.notify(o.chatID, fmt.Sprintf("✅ [%s] %s 完成 (%s)%s", node.ID, node.Title, node.Duration, testInfo))
-
-	if team.Blackboard != nil {
-		team.Blackboard.Write(node.ID+"-result", result, node.Role, "result")
-	}
-
-	return StageResult{
-		Name: node.ID, Role: node.Role, Status: TaskCompleted,
-		Output: result, StartedAt: start, Duration: duration.Round(time.Second).String(),
-	}
-}
-
-// handleTaskFailure 处理任务失败 (含重试逻辑, 参考 Gradientsys Phoenix protocol)
-func (o *Orchestrator) handleTaskFailure(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, sr StageResult) StageResult {
-	o.mu.Lock()
-	node.Retries++
-	canRetry := node.Retries <= node.MaxRetries
-	o.mu.Unlock()
-
-	if canRetry {
-		o.notify(o.chatID, fmt.Sprintf("🔄 [%s] %s 失败 (重试 %d/%d): %s",
-			node.ID, node.Title, node.Retries, node.MaxRetries, sr.Error))
-		logging.Event(ctx, "orchestrator.task.retry",
-			"taskID", node.ID, "retry", node.Retries, "error", sr.Error)
-
-		o.mu.Lock()
-		node.Status = "retrying"
-		node.Error = sr.Error
-		o.mu.Unlock()
-
-		return o.executeTaskNode(ctx, node, objective, team)
-	}
-
-	o.mu.Lock()
-	node.Status = "failed"
-	node.Error = sr.Error
-	o.failedCount++
-	o.mu.Unlock()
-
-	o.notify(o.chatID, fmt.Sprintf("❌ [%s] %s 最终失败 (已重试 %d 次): %s",
-		node.ID, node.Title, node.MaxRetries, sr.Error))
-
-	return sr
-}
-
-// runMicroTest 轻量级测试: 针对单个任务的快速验证。
-// 参考 TDAD (2026): 基于影响图分析选择性运行测试, 而非全量测试。
-func (o *Orchestrator) runMicroTest(ctx context.Context, node *TaskNode, _ *ProductionTeam) {
-	if o.factory == nil {
-		return
-	}
-
-	designCtx := o.orchDesignRefContext(node.DesignRef)
-	prompt := fmt.Sprintf(`你是轻量级验证工程师 (Micro-Tester)。
-仅对以下单个任务的产出做快速验证, 不需要写完整测试代码。
-
-## 被验证的任务
-- 任务: %s
-- 角色: %s
-- 设计章节: %s
-- 关联约束: %s
-- 验收标准: %s
-
-## 任务产出
-%s
-
-## 快速验证 (3项检查, 每项 PASS/FAIL):
-
-### 1. 编译完整性
-产出的代码片段是否语法正确? 是否有明显的 import 缺失或类型错误?
-
-### 2. 接口对齐
-%s
-
-### 3. 约束遵守
-检查约束 %s 在本任务产出中是否被遵守。
-
-## 输出格式 (简洁):
-编译: PASS/FAIL (原因)
-对齐: PASS/FAIL (偏差说明)
-约束: PASS/FAIL (违反项)
-综合: PASS/FAIL`,
-		node.Title, node.Role, node.DesignRef,
-		strings.Join(node.ConstraintRefs, ","), node.AcceptCriteria,
-		truncateResult(node.Output, 8000),
-		designCtx,
-		strings.Join(node.ConstraintRefs, ","))
-
-	testCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-
-	runner, err := o.factory(testCtx, "tester", "")
-	if err != nil {
-		node.TestResult = "micro-test 创建失败: " + err.Error()
-		node.TestPassed = false
-		return
-	}
-
-	result, err := runner.Execute(testCtx, prompt)
-	if err != nil {
-		node.TestResult = "micro-test 执行失败: " + err.Error()
-		node.TestPassed = false
-		return
-	}
-
-	node.TestResult = result
-	node.TestPassed = !strings.Contains(strings.ToUpper(result), "FAIL")
-
-	if !node.TestPassed {
-		node.DriftReport = orchExtractDriftInfo(result)
-		logging.Event(ctx, "orchestrator.microtest.fail",
-			"taskID", node.ID, "drift", node.DriftReport != "")
-	}
-}
-
-func (o *Orchestrator) orchDesignRefContext(ref string) string {
-	o.mu.Lock()
-	doc := o.designDoc
-	o.mu.Unlock()
-
-	if doc == "" || ref == "" || ref == "-" {
-		return "无设计文档参考"
-	}
-	lower := strings.ToLower(ref)
-	lines := strings.Split(doc, "\n")
-	var section []string
-	capturing := false
-	for _, line := range lines {
-		if strings.Contains(strings.ToLower(line), lower) {
-			capturing = true
-		}
-		if capturing {
-			section = append(section, line)
-			if len(section) > 30 {
-				break
-			}
-			if len(section) > 2 && strings.HasPrefix(line, "## ") {
-				break
-			}
-		}
-	}
-	if len(section) > 0 {
-		return "设计文档相关章节:\n" + strings.Join(section, "\n")
-	}
-	return "设计文档参考: " + ref
-}
-
-func orchExtractDriftInfo(testResult string) string {
-	var drifts []string
-	for _, line := range strings.Split(testResult, "\n") {
-		lower := strings.ToLower(line)
-		if strings.Contains(lower, "fail") || strings.Contains(lower, "偏差") || strings.Contains(lower, "不一致") {
-			drifts = append(drifts, strings.TrimSpace(line))
-		}
-	}
-	if len(drifts) > 0 {
-		return strings.Join(drifts, "; ")
-	}
-	return ""
-}
-
-// buildTaskPrompt 构建任务执行 prompt (包含依赖输出 + 设计约束 + 重试上下文)
 func (o *Orchestrator) buildTaskPrompt(node *TaskNode, objective string) string {
 	var b strings.Builder
-
-	b.WriteString(fmt.Sprintf("## 任务: %s\n\n", node.Title))
-	b.WriteString(fmt.Sprintf("项目目标: %s\n\n", objective))
-
-	if len(node.DependsOn) > 0 {
-		b.WriteString("### 前置任务产出\n")
-		o.mu.Lock()
-		for _, depID := range node.DependsOn {
-			if dep, ok := o.nodes[depID]; ok && dep.Output != "" {
-				output := dep.Output
-				if len(output) > 6000 {
-					output = output[:6000] + "\n...(已截断)"
-				}
-				b.WriteString(fmt.Sprintf("#### %s: %s\n%s\n\n", depID, dep.Title, output))
-			}
-		}
-		o.mu.Unlock()
-	}
+	b.WriteString(fmt.Sprintf("## 任务: %s\n项目目标: %s\n\n", node.Title, objective))
 
 	if node.DesignRef != "" && node.DesignRef != "-" {
-		b.WriteString(fmt.Sprintf("### 设计参考 (章节: %s)\n", node.DesignRef))
-		b.WriteString(o.orchDesignRefContext(node.DesignRef))
-		b.WriteString("\n\n")
+		b.WriteString("### 设计参考\n" + o.orchDesignRefContext(node.DesignRef) + "\n\n")
 	}
-
 	if len(node.ConstraintRefs) > 0 {
-		b.WriteString(fmt.Sprintf("### 必须遵守的约束: %s\n", strings.Join(node.ConstraintRefs, ", ")))
-		b.WriteString("完成后请附上: **约束检查:** " + strings.Join(node.ConstraintRefs, " ✅ | ") + " ✅\n\n")
+		b.WriteString("### 必须遵守的约束: " + strings.Join(node.ConstraintRefs, ", ") + "\n\n")
 	}
-
 	if node.AcceptCriteria != "" && node.AcceptCriteria != "-" {
-		b.WriteString(fmt.Sprintf("### 验收标准\n%s\n\n", node.AcceptCriteria))
+		b.WriteString("### 验收标准\n" + node.AcceptCriteria + "\n\n")
 	}
-
 	if node.Retries > 0 {
-		b.WriteString(fmt.Sprintf("### ⚠️ 重试 (第 %d 次, 上次失败原因: %s)\n", node.Retries, node.Error))
+		b.WriteString(fmt.Sprintf("### ⚠️ 重试 (第 %d 次)\n上次失败: %s\n", node.Retries, node.Error))
 		if node.TestResult != "" {
-			b.WriteString(fmt.Sprintf("上次 Micro-Test 结果:\n%s\n\n", node.TestResult))
+			b.WriteString("Micro-Test 结果:\n" + node.TestResult + "\n")
 		}
-		b.WriteString("请修复上述问题后重新执行。\n\n")
 	}
-
 	return b.String()
 }
 
@@ -615,14 +489,13 @@ func (o *Orchestrator) buildTaskPrompt(node *TaskNode, objective string) string 
 func (o *Orchestrator) Progress() (completed, total, failed int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.completedCount, len(o.nodes), o.failedCount
+	return o.completedCount, o.totalCount, o.failedCount
 }
 
-// MicroTestSummary 返回所有 micro-test 的汇总 (供 evaluator 参考)
+// MicroTestSummary 返回 micro-test 汇总
 func (o *Orchestrator) MicroTestSummary() string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-
 	var passed, failed int
 	var drifts []string
 	for _, node := range o.nodes {
@@ -634,18 +507,14 @@ func (o *Orchestrator) MicroTestSummary() string {
 		} else {
 			failed++
 			if node.DriftReport != "" {
-				drifts = append(drifts, fmt.Sprintf("[%s] %s: %s", node.ID, node.Title, node.DriftReport))
+				drifts = append(drifts, fmt.Sprintf("%s: %s", node.Title, node.DriftReport))
 			}
 		}
 	}
-
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("### Micro-Test 汇总: %d 通过, %d 失败\n", passed, failed))
-	if len(drifts) > 0 {
-		b.WriteString("### 偏差报告:\n")
-		for _, d := range drifts {
-			b.WriteString("- " + d + "\n")
-		}
+	for _, d := range drifts {
+		b.WriteString("- " + d + "\n")
 	}
 	return b.String()
 }
@@ -654,5 +523,5 @@ func (o *Orchestrator) MicroTestSummary() string {
 func (o *Orchestrator) NodeCount() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return len(o.nodes)
+	return o.totalCount
 }

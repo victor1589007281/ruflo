@@ -51,6 +51,37 @@ type dreamAdapter struct {
 	dreamer *dreaming.Dreamer
 }
 
+// dagTaskAdapter 适配 builtin.TaskStore 到 agent.DAGTaskTracker 接口。
+// 桥接 builtin.TaskSummary → agent.DAGTaskSummary 类型差异。
+type dagTaskAdapter struct {
+	store *builtin.TaskStore
+}
+
+func (d *dagTaskAdapter) AddTask(subject, description, owner string) (string, error) {
+	return d.store.AddTask(subject, description, owner)
+}
+func (d *dagTaskAdapter) SetTaskStatus(id, status string) error {
+	return d.store.SetTaskStatus(id, status)
+}
+func (d *dagTaskAdapter) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
+	return d.store.AddTaskWithDeps(subject, description, owner, dependsOn, priority)
+}
+func (d *dagTaskAdapter) ReadyTasks() []agent.DAGTaskSummary {
+	v2Tasks := d.store.ReadyTasks()
+	result := make([]agent.DAGTaskSummary, len(v2Tasks))
+	for i, t := range v2Tasks {
+		result[i] = agent.DAGTaskSummary{
+			ID: t.ID, Subject: t.Subject, Description: t.Description,
+			Status: t.Status, Owner: t.Owner, DependsOn: t.DependsOn,
+			Priority: t.Priority,
+		}
+	}
+	return result
+}
+func (d *dagTaskAdapter) SetTaskStatusAndUnblock(id, status string) (int, error) {
+	return d.store.SetTaskStatusAndUnblock(id, status)
+}
+
 // memoryAdapter 适配 memory.TieredStore 到 agent.MemoryWriter 接口。
 // 团队完成后写入高权重记忆，确保团队名+目标可被 BM25 检索到。
 type memoryAdapter struct {
@@ -259,7 +290,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				return bot.sendFileMessage(ctx, chatID, data, filename, "stream")
 			}
 		},
-		TaskTracker: bot.taskStore,
+		TaskTracker: &dagTaskAdapter{store: bot.taskStore},
 		Pool:        agentPool,
 		LLM:         aiClient,
 		Evolution:   bot.evolution,
