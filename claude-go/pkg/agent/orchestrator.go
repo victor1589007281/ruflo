@@ -95,7 +95,7 @@ func NewOrchestrator(cfg OrchestratorConfig, dag DAGTaskTracker, factory CreateA
 		cfg.MaxRetries = 2
 	}
 	if cfg.AdversarialRound <= 0 {
-		cfg.AdversarialRound = 2
+		cfg.AdversarialRound = 5 // 与 AdaptiveTerminator 默认 MaxRounds 对齐
 	}
 	return &Orchestrator{
 		config: cfg,
@@ -349,26 +349,32 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 
 // executeTaskNode 执行单个任务, 内置 mini 对抗循环:
 //
-//	round 1: coder 执行 → micro-test → 如果 PASS 则完成
-//	round 2: coder 修复 (注入 micro-test 反馈) → micro-test → ...
-//	最多 AdversarialRound 轮
+//	每轮: coder 执行 → reviewer 审查 (SkepticalReviewerPersona + ParseEvalScoreJSON)
+//	      → tester micro-test → AdaptiveTerminator 决定继续/停止
+//
+// 完全复用 adversarial.go 已有基础设施, 不重复实现。
 func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam) StageResult {
 	start := time.Now()
-	maxAdvRounds := o.config.AdversarialRound
-	if maxAdvRounds <= 0 {
-		maxAdvRounds = 1
-	}
 
 	o.notify(o.chatID, fmt.Sprintf("▶️ %s (%s) 执行中...", node.Title, node.Role))
 
-	var lastOutput string
-	var lastTestFeedback string
+	if !o.config.MicroTestAfter {
+		return o.executeTaskOnce(ctx, node, objective, team, start)
+	}
 
-	for round := 1; round <= maxAdvRounds; round++ {
+	// 使用已有 AdaptiveTerminator 控制对抗轮数 (MAgICoRe + CaRT)
+	terminator := NewAdaptiveTerminator(1, o.config.AdversarialRound)
+
+	var lastOutput string
+	var lastFeedback string
+	var lastScore EvalScore
+
+	for round := 1; round <= terminator.MaxRounds; round++ {
+		// === Step 1: Coder 生成/修复 ===
 		prompt := o.buildTaskPrompt(node, objective)
-		if round > 1 && lastTestFeedback != "" {
-			prompt = fmt.Sprintf("%s\n\n### ⚠️ 第 %d 轮修复 (micro-test 反馈):\n%s\n\n### 上轮产出 (请增量修改, 不要从零重写):\n%s",
-				prompt, round, lastTestFeedback, truncateResult(lastOutput, 12000))
+		if round > 1 && lastFeedback != "" {
+			prompt = fmt.Sprintf("%s\n\n### ⚠️ 第 %d 轮修复 (reviewer 反馈, 必须全部修复):\n%s\n\n### 上轮产出 (增量修改, 不要从零重写):\n%s",
+				prompt, round, lastFeedback, truncateResult(lastOutput, 12000))
 		}
 
 		runner, err := o.factory(ctx, node.Role, "")
@@ -377,14 +383,12 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 					StartedAt: start, Duration: time.Since(start).String()})
 		}
-
 		result, err := runner.Execute(ctx, prompt)
 		if err != nil {
 			return o.handleTaskFailure(ctx, node, objective, team,
 				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 					StartedAt: start, Duration: time.Since(start).String()})
 		}
-
 		if reason := validateAgentOutput(result, node.Role); reason != "" {
 			return o.handleTaskFailure(ctx, node, objective, team,
 				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed,
@@ -395,42 +399,75 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		lastOutput = result
 		node.Output = result
 
-		// micro-test 验证
-		if !o.config.MicroTestAfter {
-			break // 不启用 micro-test 则跳过对抗
+		// === Step 2: Reviewer 审查 (复用 SkepticalReviewerPersona + ParseEvalScoreJSON) ===
+		score := o.runSkepticalReview(ctx, node, objective)
+		lastScore = score
+
+		// === Step 3: Tester micro-test ===
+		o.runMicroTest(ctx, node)
+
+		// 评分日志
+		scoreMsg := fmt.Sprintf("正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f",
+			score.Correctness, score.Completeness, score.Security, score.CodeQuality)
+		if score.DesignAlignment > 0 {
+			scoreMsg += fmt.Sprintf(" 对齐=%.0f", score.DesignAlignment)
+		}
+		testLabel := map[bool]string{true: "✅", false: "⚠️"}[node.TestPassed]
+		o.notify(o.chatID, fmt.Sprintf("📊 %s 第 %d 轮: %s | micro-test: %s",
+			node.Title, round, scoreMsg, testLabel))
+
+		if team.Blackboard != nil {
+			team.Blackboard.Write(fmt.Sprintf("%s-eval-round%d", node.V2TaskID, round),
+				scoreMsg+fmt.Sprintf(" test:%v", node.TestPassed), "evaluator", "score")
 		}
 
-		o.runMicroTest(ctx, node)
-		if node.TestPassed || round == maxAdvRounds {
-			if !node.TestPassed {
-				o.notify(o.chatID, fmt.Sprintf("⚠️ %s micro-test 未通过 (已达 %d 轮上限)", node.Title, maxAdvRounds))
+		// === Step 4: AdaptiveTerminator 决定继续/停止 ===
+		decision := terminator.ShouldTerminate(round, score)
+		if decision.ShouldStop {
+			reasonCN := map[string]string{
+				"quality_pass": "质量达标", "max_rounds": "达到轮数上限",
+				"degradation": "连续退化", "converged": "改进已饱和",
+			}[decision.Reason]
+			if reasonCN == "" {
+				reasonCN = decision.Reason
 			}
+			o.notify(o.chatID, fmt.Sprintf("🏁 %s 对抗终止: %s (第 %d 轮)", node.Title, reasonCN, round))
 			break
 		}
 
-		// micro-test 未通过, 注入反馈进入下一轮
-		lastTestFeedback = node.TestResult
-		o.notify(o.chatID, fmt.Sprintf("🔄 %s micro-test 未通过, 对抗修复 (第 %d/%d 轮)...",
-			node.Title, round+1, maxAdvRounds))
+		// 汇总 reviewer feedback + tester feedback 给下一轮 coder
+		var parts []string
+		if score.Feedback != "" {
+			parts = append(parts, "### Reviewer 审查 (EvalScore):\n"+score.Feedback)
+		}
+		if !node.TestPassed && node.TestResult != "" {
+			parts = append(parts, "### Tester Micro-Test:\n"+node.TestResult)
+		}
+		lastFeedback = strings.Join(parts, "\n\n")
+		if lastFeedback == "" {
+			lastFeedback = "上一轮未通过硬门槛，请全面改进。"
+		}
+
+		o.notify(o.chatID, fmt.Sprintf("🔄 %s 继续对抗 (第 %d/%d 轮)...",
+			node.Title, round+1, terminator.MaxRounds))
 	}
 
 	duration := time.Since(start)
 
-	// 标记完成 + 解除下游依赖
 	o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")
 	o.mu.Lock()
 	o.completedCount++
 	o.mu.Unlock()
 
-	testInfo := ""
-	if node.TestResult != "" {
-		if node.TestPassed {
-			testInfo = " ✅micro-test"
-		} else {
-			testInfo = " ⚠️micro-test偏差"
-		}
+	passLabel := "⚠️未达标"
+	if lastScore.MeetsHardPassThreshold() && node.TestPassed {
+		passLabel = "✅全通过"
+	} else if lastScore.MeetsHardPassThreshold() {
+		passLabel = "✅review通过 ⚠️test偏差"
+	} else if node.TestPassed {
+		passLabel = "⚠️review未达标 ✅test通过"
 	}
-	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s)%s", node.Title, duration.Round(time.Second), testInfo))
+	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s) %s", node.Title, duration.Round(time.Second), passLabel))
 
 	if team.Blackboard != nil {
 		team.Blackboard.Write(node.V2TaskID+"-result", lastOutput, node.Role, "result")
@@ -440,6 +477,83 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		Name: node.V2TaskID, Role: node.Role, Status: TaskCompleted,
 		Output: lastOutput, StartedAt: start, Duration: duration.Round(time.Second).String(),
 	}
+}
+
+// executeTaskOnce 非对抗模式: 单轮执行
+func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, start time.Time) StageResult {
+	prompt := o.buildTaskPrompt(node, objective)
+	runner, err := o.factory(ctx, node.Role, "")
+	if err != nil {
+		return o.handleTaskFailure(ctx, node, objective, team,
+			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+				StartedAt: start, Duration: time.Since(start).String()})
+	}
+	result, err := runner.Execute(ctx, prompt)
+	if err != nil {
+		return o.handleTaskFailure(ctx, node, objective, team,
+			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+				StartedAt: start, Duration: time.Since(start).String()})
+	}
+	if reason := validateAgentOutput(result, node.Role); reason != "" {
+		return o.handleTaskFailure(ctx, node, objective, team,
+			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed,
+				Error: "产出验证失败: " + reason, Output: result,
+				StartedAt: start, Duration: time.Since(start).String()})
+	}
+
+	node.Output = result
+	duration := time.Since(start)
+
+	o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")
+	o.mu.Lock()
+	o.completedCount++
+	o.mu.Unlock()
+	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s)", node.Title, duration.Round(time.Second)))
+
+	if team.Blackboard != nil {
+		team.Blackboard.Write(node.V2TaskID+"-result", result, node.Role, "result")
+	}
+	return StageResult{
+		Name: node.V2TaskID, Role: node.Role, Status: TaskCompleted,
+		Output: result, StartedAt: start, Duration: duration.Round(time.Second).String(),
+	}
+}
+
+// runSkepticalReview 复用 SkepticalReviewerPersona + BuildSkepticalEvaluatorUserPrompt + ParseEvalScoreJSON。
+// 与 workflow 层 runEvaluatorRound 使用完全相同的 reviewer 基础设施。
+func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, objective string) EvalScore {
+	if o.factory == nil {
+		return EvalScore{Pass: true, Correctness: 8, Completeness: 8, Security: 8, CodeQuality: 8}
+	}
+
+	// 构建带设计上下文的 objective
+	taskObjective := fmt.Sprintf("任务: %s | 角色: %s | 验收标准: %s\n目标: %s",
+		node.Title, node.Role, node.AcceptCriteria, objective)
+	if node.DesignRef != "" && node.DesignRef != "-" {
+		designCtx := o.orchDesignRefContext(node.DesignRef)
+		taskObjective += "\n\n设计参考:\n" + designCtx
+	}
+
+	// 复用 adversarial.go 的标准 prompt
+	userPrompt := BuildSkepticalEvaluatorUserPrompt(taskObjective, node.Output)
+
+	reviewCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	runner, err := o.factory(reviewCtx, "reviewer", SkepticalReviewerPersona)
+	if err != nil {
+		return EvalScore{Pass: true, Correctness: 6, Completeness: 6, Security: 6, CodeQuality: 6}
+	}
+	result, err := runner.Execute(reviewCtx, userPrompt)
+	if err != nil {
+		return EvalScore{Pass: true, Correctness: 6, Completeness: 6, Security: 6, CodeQuality: 6}
+	}
+
+	score, parseErr := ParseEvalScoreJSON([]byte(result))
+	if parseErr != nil {
+		return EvalScore{Feedback: result}
+	}
+	return score
 }
 
 // handleTaskFailure 失败处理 + Phoenix 重试

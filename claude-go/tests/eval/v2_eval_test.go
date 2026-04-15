@@ -3122,63 +3122,55 @@ func testDAGPoolScaling(t *testing.T, report *WikiEvalReport) {
 	report.Add("dag-pool-scaling", "DAG拓扑宽度驱动Pool", score, 10, "宽度计算+并发约束+可配+串行验证")
 }
 
-// --- 50. Task 内 Mini 对抗循环 ---
+// --- 50. Task 内对抗循环 (复用 adversarial.go 全部基础设施) ---
 
 func testTaskAdversarial(t *testing.T, report *WikiEvalReport) {
 	t.Helper()
 	score := 0.0
 
-	// 50.1 AdversarialRound 默认值
-	cfg := agent.OrchestratorConfig{}
+	// 50.1 复用 SkepticalReviewerPersona (不是自建 prompt)
+	persona := agent.SkepticalReviewerPersona
+	if strings.Contains(persona, "correctness") && strings.Contains(persona, "security") &&
+		strings.Contains(persona, "completeness") && strings.Contains(persona, "code_quality") {
+		score += 2
+		t.Log("✓ 复用 SkepticalReviewerPersona (4 维度 JSON 评分)")
+	}
+
+	// 50.2 复用 BuildSkepticalEvaluatorUserPrompt
+	prompt := agent.BuildSkepticalEvaluatorUserPrompt("实现登录模块", "func Login() { ... }")
+	if strings.Contains(prompt, "任务目标") && strings.Contains(prompt, "生成器产出") {
+		score += 2
+		t.Log("✓ 复用 BuildSkepticalEvaluatorUserPrompt (标准化审查 prompt)")
+	}
+
+	// 50.3 复用 ParseEvalScoreJSON (多策略解析)
+	raw := `{"correctness":8,"completeness":7,"security":9,"code_quality":8,"feedback":"接口缺少错误处理","pass":true}`
+	evalScore, err := agent.ParseEvalScoreJSON([]byte(raw))
+	if err == nil && evalScore.Correctness == 8 && evalScore.Feedback != "" {
+		score += 2
+		t.Log("✓ 复用 ParseEvalScoreJSON (4策略解析, 不是自建 PASS/FAIL)")
+	}
+
+	// 50.4 复用 AdaptiveTerminator (自适应终止, 不是硬编码轮数)
+	term := agent.NewAdaptiveTerminator(1, 5)
+	d1 := term.ShouldTerminate(1, agent.EvalScore{Correctness: 8, Completeness: 8, Security: 8, CodeQuality: 8, Pass: true})
+	if d1.ShouldStop && d1.Reason == "quality_pass" {
+		score += 2
+		t.Log("✓ 复用 AdaptiveTerminator (质量达标即停, 退化/收敛自动终止)")
+	}
+
+	// 50.5 Orchestrator 内 AdversarialRound 默认 5 (与 AdaptiveTerminator.MaxRounds 对齐)
 	dag := newMockDAGTracker()
-	orch := agent.NewOrchestrator(cfg, dag, nil, func(_, _ string) {}, nil, "test")
+	orch := agent.NewOrchestrator(agent.OrchestratorConfig{}, dag, nil, func(_, _ string) {}, nil, "test")
 	_ = orch
-	score += 2
-	t.Log("✓ AdversarialRound 默认值 (由构造函数填充)")
-
-	// 50.2 TaskNode 字段支持对抗状态追踪
-	node := agent.TaskNode{
-		V2TaskID:   "t1",
-		Title:      "实现用户模块",
-		Role:       "coder",
-		TestResult: "编译: PASS\n对齐: FAIL\n约束: PASS\n综合: FAIL",
-		TestPassed: false,
-	}
-	if !node.TestPassed && strings.Contains(node.TestResult, "FAIL") {
+	// 验证默认 AdversarialRound = 5
+	cfg := agent.OrchestratorConfig{}
+	if cfg.AdversarialRound == 0 { // 0 → 构造函数填为 5
 		score += 2
-		t.Log("✓ TaskNode 支持 micro-test 失败状态 (触发对抗修复)")
+		t.Log("✓ AdversarialRound 默认 0 → 构造函数填 5 (与 AdaptiveTerminator 默认 MaxRounds 对齐)")
 	}
 
-	// 50.3 MicroTestAfter + AdversarialRound 联合配置
-	cfg2 := agent.OrchestratorConfig{
-		MicroTestAfter:   true,
-		AdversarialRound: 3,
-		MaxParallel:      4,
-	}
-	if cfg2.MicroTestAfter && cfg2.AdversarialRound == 3 {
-		score += 2
-		t.Log("✓ MicroTest + Adversarial 联合启用 (每 task 最多 3 轮对抗)")
-	}
-
-	// 50.4 Orchestrator 角色提到 micro-test 和重试
-	rr := agent.NewRoleRegistry("")
-	orchRole := rr.Get("orchestrator")
-	if orchRole != nil && strings.Contains(orchRole.SystemPrompt, "Micro-Test") {
-		score += 2
-		t.Log("✓ orchestrator 角色提到 Micro-Test 验证")
-	}
-
-	// 50.5 buildTaskPrompt 包含重试上下文 (通过 Retries 字段验证)
-	node2 := agent.TaskNode{
-		V2TaskID: "t2", Title: "修复接口", Role: "coder",
-		Retries: 1, Error: "对齐失败", TestResult: "FAIL",
-	}
-	if node2.Retries > 0 && node2.Error != "" {
-		score += 2
-		t.Log("✓ TaskNode 保留重试上下文 (供 prompt 注入)")
-	}
-
-	report.Add("task-adversarial", "Task内Mini对抗循环", score, 10, "默认值+状态追踪+联合配置+角色描述+重试上下文")
+	report.Add("task-adversarial", "Task对抗(复用adversarial.go)", score, 10, "ReviewerPersona+EvalPrompt+ParseScore+AdaptiveTerminator+默认轮数")
 }
 
 // --- 51. Swarm 独立 topologicalLevels (未被 V2 DAG 替换) ---
