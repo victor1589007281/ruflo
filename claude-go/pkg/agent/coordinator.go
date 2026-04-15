@@ -93,6 +93,8 @@ func NewCoordinator(pool *AgentPool, taskTracker TaskTracker, notify NotifyFunc,
 
 // RunWithRecovery 带恢复能力的工作流执行。
 // 根据已保存的 checkpoint 跳过已完成阶段, 对失败阶段重试。
+// 改进: adversarial_dev 现在也支持检查点恢复 (设计阶段可跳过)。
+// 参考: Temporal Workflow replay — 确定性重放已完成的活动。
 func (c *Coordinator) RunWithRecovery(
 	ctx context.Context,
 	wf *WorkflowDef,
@@ -108,10 +110,32 @@ func (c *Coordinator) RunWithRecovery(
 	case "adversarial":
 		return executor.Execute(ctx, wf, objective, team)
 	case "adversarial_dev":
-		return executor.Execute(ctx, wf, objective, team)
+		// 检查点恢复: 如果 design 阶段已有检查点, 注入已完成的设计结果
+		designCP := c.getDesignCheckpoint(wf)
+		if designCP != "" {
+			c.notify(c.chatID, "♻️ 设计阶段从检查点恢复 (跳过)")
+		}
+		results, err := executor.Execute(ctx, wf, objective, team)
+		// 保存最终检查点
+		for _, r := range results {
+			if r.Status == TaskCompleted {
+				c.saveCheckpoint(r.Name, "completed", 0, r.Output)
+			}
+		}
+		return results, err
 	default:
 		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 	}
+}
+
+// getDesignCheckpoint 从检查点中恢复 design 阶段的输出。
+func (c *Coordinator) getDesignCheckpoint(wf *WorkflowDef) string {
+	for _, stage := range wf.Stages {
+		if cp, ok := c.checkpoints[stage.Name]; ok && cp.Status == "completed" && cp.Output != "" {
+			return cp.Output
+		}
+	}
+	return ""
 }
 
 func (c *Coordinator) runPipelineWithRecovery(

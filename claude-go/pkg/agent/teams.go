@@ -360,6 +360,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		evolution:   ptm.evolution,
 		roles:       ptm.roles,
 		metrics:     ptm.metrics,
+		pool:        ptm.pool,
 	}
 
 	// 使用 Coordinator 带重试和检查点执行

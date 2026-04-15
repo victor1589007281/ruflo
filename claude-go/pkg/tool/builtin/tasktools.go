@@ -32,15 +32,19 @@ const (
 )
 
 // v2TaskRecord 表示持久化的一条任务记录（与 types.Task 语义相近，独立定义以避免与全局类型耦合）。
+// DAG 支持: DependsOn 字段存储前置依赖的 task ID 列表, 形成有向无环图。
+// 参考: Temporal Workflow DAG, Airflow TaskInstance dependencies
 type v2TaskRecord struct {
-	ID          string `json:"id"`
-	Subject     string `json:"subject"`
-	Description string `json:"description"`
-	ActiveForm  string `json:"activeForm,omitempty"`
-	Status      string `json:"status"`
-	Owner       string `json:"owner,omitempty"`
-	CreatedAt   string `json:"createdAt"`
-	UpdatedAt   string `json:"updatedAt"`
+	ID          string   `json:"id"`
+	Subject     string   `json:"subject"`
+	Description string   `json:"description"`
+	ActiveForm  string   `json:"activeForm,omitempty"`
+	Status      string   `json:"status"`
+	Owner       string   `json:"owner,omitempty"`
+	DependsOn   []string `json:"dependsOn,omitempty"` // DAG: 前置依赖的 task ID 列表
+	Priority    int      `json:"priority,omitempty"`   // 0=normal, 1=high, 2=critical
+	CreatedAt   string   `json:"createdAt"`
+	UpdatedAt   string   `json:"updatedAt"`
 }
 
 type taskFilePayload struct {
@@ -391,22 +395,36 @@ func (t *TaskListTool) Call(_ context.Context, _ json.RawMessage, _ *tool.ToolCo
 
 // TaskSummary 面向外部消费者的任务摘要视图。
 type TaskSummary struct {
-	ID          string `json:"id"`
-	Subject     string `json:"subject"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
-	Owner       string `json:"owner"`
-	CreatedAt   string `json:"createdAt"`
-	UpdatedAt   string `json:"updatedAt"`
+	ID          string   `json:"id"`
+	Subject     string   `json:"subject"`
+	Description string   `json:"description"`
+	Status      string   `json:"status"`
+	Owner       string   `json:"owner"`
+	DependsOn   []string `json:"dependsOn,omitempty"`
+	Priority    int      `json:"priority,omitempty"`
+	CreatedAt   string   `json:"createdAt"`
+	UpdatedAt   string   `json:"updatedAt"`
 }
 
 // AddTask 创建任务并返回其 ID (供团队编排使用)。
 func (s *TaskStore) AddTask(subject, description, owner string) (string, error) {
+	return s.AddTaskWithDeps(subject, description, owner, nil, 0)
+}
+
+// AddTaskWithDeps 创建带依赖的任务 (DAG 支持)。
+// dependsOn: 前置依赖的 task ID 列表, priority: 0=normal, 1=high, 2=critical
+func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	id := genTaskUUID()
+	// 如果有依赖但前置任务未完成, 状态设为 blocked
+	status := "pending"
+	if len(dependsOn) > 0 {
+		status = "blocked"
+	}
 	rec := v2TaskRecord{
 		ID: id, Subject: subject, Description: description,
-		Status: "pending", Owner: owner, CreatedAt: now, UpdatedAt: now,
+		Status: status, Owner: owner, DependsOn: dependsOn,
+		Priority: priority, CreatedAt: now, UpdatedAt: now,
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -418,6 +436,72 @@ func (s *TaskStore) AddTask(subject, description, owner string) (string, error) 
 		return "", err
 	}
 	return id, nil
+}
+
+// UnblockDependents 当一个任务完成时, 检查并解除其依赖者的阻塞状态。
+// 参考: Airflow trigger_rule="all_success", 只有当所有依赖都完成时才解除阻塞。
+func (s *TaskStore) UnblockDependents(completedID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	unblocked := 0
+	for id, rec := range s.byID {
+		if rec.Status != "blocked" {
+			continue
+		}
+		allDone := true
+		for _, dep := range rec.DependsOn {
+			if d, ok := s.byID[dep]; !ok || (d.Status != "completed" && d.ID != completedID) {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			rec.Status = "pending"
+			rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			s.byID[id] = rec
+			unblocked++
+		}
+	}
+	if unblocked > 0 {
+		_ = s.saveLocked()
+	}
+	return unblocked
+}
+
+// ReadyTasks 返回所有可执行的任务 (pending 且依赖已满足), 按优先级排序。
+// 这是 DAG 调度器的核心: 拓扑排序的"就绪队列"。
+func (s *TaskStore) ReadyTasks() []TaskSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var ready []TaskSummary
+	for _, r := range s.byID {
+		if r.Status != "pending" {
+			continue
+		}
+		allDepsOK := true
+		for _, dep := range r.DependsOn {
+			if d, ok := s.byID[dep]; !ok || d.Status != "completed" {
+				allDepsOK = false
+				break
+			}
+		}
+		if allDepsOK {
+			ready = append(ready, TaskSummary{
+				ID: r.ID, Subject: r.Subject, Description: r.Description,
+				Status: r.Status, Owner: r.Owner, DependsOn: r.DependsOn,
+				Priority: r.Priority, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+			})
+		}
+	}
+	// 按优先级降序排序 (critical > high > normal)
+	for i := 1; i < len(ready); i++ {
+		for j := i; j > 0 && ready[j].Priority > ready[j-1].Priority; j-- {
+			ready[j], ready[j-1] = ready[j-1], ready[j]
+		}
+	}
+	return ready
 }
 
 // SetTaskStatus 按 ID 更新任务状态 (供团队编排使用)。
@@ -442,9 +526,20 @@ func (s *TaskStore) GetAllTasks() []TaskSummary {
 	for _, r := range s.byID {
 		result = append(result, TaskSummary{
 			ID: r.ID, Subject: r.Subject, Description: r.Description,
-			Status: r.Status, Owner: r.Owner,
-			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+			Status: r.Status, Owner: r.Owner, DependsOn: r.DependsOn,
+			Priority: r.Priority, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		})
 	}
 	return result
+}
+
+// SetTaskStatusAndUnblock 更新状态并自动解除下游依赖 (DAG 联动)。
+func (s *TaskStore) SetTaskStatusAndUnblock(id, status string) (int, error) {
+	if err := s.SetTaskStatus(id, status); err != nil {
+		return 0, err
+	}
+	if status == "completed" {
+		return s.UnblockDependents(id), nil
+	}
+	return 0, nil
 }

@@ -94,9 +94,11 @@ func developmentWorkflow() *WorkflowDef {
 		Stages: []StageDef{
 			{
 				Name: "design", Role: "architect",
-				Prompt: `你是高级软件架构师。分析需求并产出详细的技术设计文档。
+				Prompt: `你是高级软件架构师兼开发计划制定者。分析需求并产出技术设计文档 + 开发任务计划。
 
 需求: {objective}
+
+## Part 1: 技术设计文档 (DESIGN.md)
 
 输出设计文档必须包含:
 1. **架构总览**: 分层架构图(如 CLI→Service→Repository→DB)，标注依赖方向
@@ -106,13 +108,34 @@ func developmentWorkflow() *WorkflowDef {
 5. **错误处理策略**: 统一错误类型、重试逻辑、边界条件
 6. **关键约束**: 不允许的实现方式(如不允许 Mock/Stub 核心模块、不允许硬编码配置)
 
+## Part 2: 开发任务计划 (TASKS.md)
+
+将设计文档分解为具体的开发任务, 使用 TaskCreate 工具创建每个任务。
+任务分解原则 (参考: Work Breakdown Structure, WBS):
+1. **原子性**: 每个任务由一个角色在一轮内可完成
+2. **可验证**: 每个任务有明确的验收标准 (如 "go build 通过", "覆盖率>80%")
+3. **依赖清晰**: 标注前置依赖 (如 "依赖任务: 数据层实现")
+
+必须为 Coder 创建的任务:
+- 按模块拆分, 每个模块一个任务
+- 标注该任务对应设计文档的哪个章节
+- 标注验收标准 (编译通过 + 接口对齐)
+
+必须为 Tester 创建的任务:
+- 单元测试 (按模块)
+- 集成测试 (跨模块交互)
+- 端到端测试 (完整流程验证)
+
+输出格式:
+### 任务列表
+| # | 任务 | 负责人 | 依赖 | 验收标准 | 优先级 |
+|---|------|--------|------|---------|--------|
+
 重要约束:
 - 核心业务模块不允许使用 Mock/Stub 实现,必须提供真实的工作代码
 - 所有外部依赖(数据库、API)必须有真实的集成代码
 - 配置管理必须集中化(不允许散落的 os.Getenv)
-- 此设计文档是后续 Coder 和 Tester 的约束性参考,他们必须严格遵循
-
-输出格式: Markdown`,
+- 此设计文档和任务计划是后续 Coder 和 Tester 的约束性参考,他们必须严格遵循`,
 			},
 			{
 				Name: "implement", Role: "coder", DependsOn: []string{"design"},
@@ -160,7 +183,7 @@ Generator 第 {adversarial_round} 轮产出:
 			},
 			{
 				Name: "test", Role: "tester", DependsOn: []string{"implement"},
-				Prompt: `你是质量工程师。为实现的代码编写完整的测试。
+				Prompt: `你是高级质量工程师。为实现的代码编写多层次的完整测试体系。
 
 目标: {objective}
 
@@ -168,15 +191,32 @@ Generator 第 {adversarial_round} 轮产出:
 {prev_result}
 
 必须实际编写测试代码(不能只说"我准备好了"):
-1. 单元测试: 覆盖所有公共函数,包括正常路径和错误路径
-2. 边界测试: 空输入、超大输入、并发安全
-3. 集成测试: 如果有数据库/外部依赖,编写集成测试
-4. 编译验证: 写完后运行 go test ./... 确保所有测试通过
 
-如果测试发现 Bug,详细记录:
-- 失败的测试用例名
-- 期望值 vs 实际值
-- 推测的根因和修复建议`,
+## 第一层: 单元测试 (Unit Tests)
+- 覆盖所有公共函数,包括正常路径和错误路径
+- 边界测试: 空输入、超大输入、nil 指针、并发安全
+- 使用 table-driven 测试模式
+- 目标覆盖率: >80%
+
+## 第二层: 跨模块集成测试 (Integration Tests)
+- 测试模块间的接口调用链路 (如 Service→Repository→DB)
+- 测试数据在模块间的传递正确性
+- 测试模块间的错误传播 (如底层DB错误是否正确冒泡到上层)
+- 测试并发场景下多模块协作的正确性
+
+## 第三层: 端到端测试 (E2E Tests)
+- 从用户输入到最终输出的完整流程测试
+- 测试主要的 Happy Path (正常业务流程)
+- 测试关键的 Error Path (如输入非法数据)
+- 如果是 CLI 应用, 测试命令行参数解析→执行→输出的完整链路
+- 如果是 API 应用, 测试 HTTP 请求→处理→响应的完整链路
+
+## 验证要求
+- 写完后运行 go test ./... 确保所有测试通过
+- 运行 go test -race ./... 检查竞态条件
+- 如果测试发现 Bug, 详细记录:
+  - 失败的测试用例名 + 期望值 vs 实际值
+  - 推测的根因和修复建议`,
 				Parallel: true,
 			},
 		},
@@ -361,15 +401,16 @@ Render your verdict:
 }
 
 // WorkflowExecutor 工作流执行器。
-// 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff + Evolution + Roles。
+// 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff + Evolution + Roles + AgentPool。
 type WorkflowExecutor struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	chatID      string
-	taskTracker TaskTracker      // 复用 V2 Task 系统 (可为 nil)
-	evolution   *EvolutionEngine // 自动进化引擎 (可为 nil)
-	roles       *RoleRegistry    // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
+	taskTracker TaskTracker        // 复用 V2 Task 系统 (可为 nil)
+	evolution   *EvolutionEngine   // 自动进化引擎 (可为 nil)
+	roles       *RoleRegistry      // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
 	metrics     *metrics.Collector // 持续观测指标 (可为 nil)
+	pool        *AgentPool         // Agent 池 (动态扩缩, 可为 nil)
 }
 
 // Execute 执行工作流, 返回所有阶段结果
@@ -411,6 +452,32 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 
 	// === 动态发现阶段角色 ===
 	designStages, generatorStages, evalStage, parallelStages := classifyStages(wf.Stages)
+
+	// === 动态 Agent Pool 扩缩 (按角色+复杂度) ===
+	// 参考: K8s HPA 按 Deployment 独立扩缩; MRKL 系统按 module 动态分配 expert
+	if we.pool != nil {
+		roleNeeds := make(map[string]int)
+		for _, s := range designStages {
+			roleNeeds[s.Role]++
+		}
+		for _, s := range generatorStages {
+			roleNeeds[s.Role] += maxRounds
+		}
+		if evalStage != nil {
+			roleNeeds[evalStage.Role] += maxRounds
+		}
+		for _, s := range parallelStages {
+			roleNeeds[s.Role]++
+		}
+		complexity := 0
+		if maxRounds >= 3 {
+			complexity = 1
+		}
+		if len(wf.Stages) > 5 || maxRounds >= 5 {
+			complexity = 2
+		}
+		we.pool.AutoScaleByRoles(roleNeeds, complexity)
+	}
 
 	// Phase 1: 设计阶段 (可能有多个串行 design 阶段，如 creative-brief → prompt-engineer)
 	if len(designStages) > 0 {

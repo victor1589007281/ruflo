@@ -52,7 +52,14 @@ type PoolStats struct {
 	TotalFailed int64 `json:"totalFailed"`
 }
 
-// AgentPool 动态 Agent 池。
+// RoleQuota 单角色的并发配额 (参考: K8s ResourceQuota per-namespace)
+type RoleQuota struct {
+	Max     int `json:"max"`
+	Current int `json:"current"`
+}
+
+// AgentPool 动态 Agent 池, 支持全局限流 + 按角色配额。
+// 参考: Kubernetes HPA (Horizontal Pod Autoscaler) 按 deployment 独立扩缩
 type AgentPool struct {
 	factory   CreateAgentFunc
 	semaphore chan struct{}
@@ -61,16 +68,18 @@ type AgentPool struct {
 	maxSize   int
 	nextID    int64
 
+	roleQuotas map[string]*RoleQuota // 按角色的动态配额
+
 	totalSpawns int64
 	totalDone   int64
 	totalFailed int64
 }
 
 // poolMaxCap 池信号量的固定容量上限 — 预分配后不再替换 channel，消除 Scale 竞态。
-const poolMaxCap = 16
+const poolMaxCap = 32
 
 // NewAgentPool 创建 Agent 池。
-// maxSize 控制最大并发 Agent 数 (推荐 4-12)。
+// maxSize 控制最大并发 Agent 数 (推荐 4-16)。
 func NewAgentPool(factory CreateAgentFunc, maxSize int) *AgentPool {
 	if maxSize <= 0 {
 		maxSize = 8
@@ -79,10 +88,11 @@ func NewAgentPool(factory CreateAgentFunc, maxSize int) *AgentPool {
 		maxSize = poolMaxCap
 	}
 	return &AgentPool{
-		factory:   factory,
-		semaphore: make(chan struct{}, poolMaxCap),
-		agents:    make(map[string]*PooledAgent),
-		maxSize:   maxSize,
+		factory:    factory,
+		semaphore:  make(chan struct{}, poolMaxCap),
+		agents:     make(map[string]*PooledAgent),
+		roleQuotas: make(map[string]*RoleQuota),
+		maxSize:    maxSize,
 	}
 }
 
@@ -196,9 +206,9 @@ func (p *AgentPool) AutoScale(pendingTasks int) {
 	p.mu.Unlock()
 
 	const minSize = 4
-	const maxCap = 16
+	const maxCap = 32
 
-	desired := pendingTasks + 2 // 额外预留 2 个缓冲槽位
+	desired := pendingTasks + 2
 	if desired < minSize {
 		desired = minSize
 	}
@@ -210,6 +220,85 @@ func (p *AgentPool) AutoScale(pendingTasks int) {
 		logging.For("agent-pool").Info("AutoScale", "active", currentActive, "pending", pendingTasks, "old", currentMax, "new", desired)
 		p.Scale(desired)
 	}
+}
+
+// AutoScaleByRoles 按角色的任务需求动态扩缩池。
+// 参考: K8s HPA 按 Deployment 独立扩缩。每个角色根据其复杂度系数获得配额。
+// roleNeeds: map[role]taskCount, complexity: 0=simple, 1=moderate, 2=complex
+func (p *AgentPool) AutoScaleByRoles(roleNeeds map[string]int, complexity int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// 复杂度乘数: 简单任务1倍, 中等2倍, 复杂3倍
+	multiplier := 1
+	switch {
+	case complexity >= 2:
+		multiplier = 3
+	case complexity >= 1:
+		multiplier = 2
+	}
+
+	totalNeeded := 0
+	for role, count := range roleNeeds {
+		// 每个角色的配额 = 任务数 × 复杂度乘数, 至少1
+		quota := count * multiplier
+		if quota < 1 {
+			quota = 1
+		}
+		if quota > 8 {
+			quota = 8
+		}
+		if p.roleQuotas[role] == nil {
+			p.roleQuotas[role] = &RoleQuota{}
+		}
+		p.roleQuotas[role].Max = quota
+		totalNeeded += quota
+	}
+
+	// 全局池大小 = 所有角色配额之和, 但不超过硬上限
+	if totalNeeded < 4 {
+		totalNeeded = 4
+	}
+	if totalNeeded > poolMaxCap {
+		totalNeeded = poolMaxCap
+	}
+
+	if totalNeeded != p.maxSize {
+		logging.For("agent-pool").Info("AutoScaleByRoles",
+			"roles", len(roleNeeds), "complexity", complexity,
+			"multiplier", multiplier, "old", p.maxSize, "new", totalNeeded)
+		p.maxSize = totalNeeded
+	}
+}
+
+// RoleActiveCount 返回指定角色当前的活跃 agent 数。
+func (p *AgentPool) RoleActiveCount(role string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := 0
+	for _, ag := range p.agents {
+		if ag.Role == role {
+			count++
+		}
+	}
+	return count
+}
+
+// RoleQuotas 返回当前各角色的配额快照。
+func (p *AgentPool) RoleQuotas() map[string]RoleQuota {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := make(map[string]RoleQuota, len(p.roleQuotas))
+	for role, q := range p.roleQuotas {
+		current := 0
+		for _, ag := range p.agents {
+			if ag.Role == role {
+				current++
+			}
+		}
+		result[role] = RoleQuota{Max: q.Max, Current: current}
+	}
+	return result
 }
 
 // Stats 返回池统计。
