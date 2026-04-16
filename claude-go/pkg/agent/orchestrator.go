@@ -19,6 +19,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -126,6 +127,7 @@ func (o *Orchestrator) SetDesignContext(designDoc, planDoc string) {
 }
 
 // ParsePlanToDAG 解析 Planner WBS → 写入 V2 TaskStore (DAG 单一数据源)。
+// 多策略解析: JSON (优先) → 宽松 markdown 表格 → 编号列表。
 // 返回任务节点列表 (元数据保存在内存, DAG 关系在 TaskStore)。
 func (o *Orchestrator) ParsePlanToDAG(planOutput, teamName string) ([]*TaskNode, error) {
 	o.mu.Lock()
@@ -135,67 +137,76 @@ func (o *Orchestrator) ParsePlanToDAG(planOutput, teamName string) ([]*TaskNode,
 		return nil, fmt.Errorf("DAGTaskTracker 未配置")
 	}
 
-	var nodes []*TaskNode
-	lines := strings.Split(planOutput, "\n")
-	tableRe := regexp.MustCompile(`^\|\s*(\d+)\s*\|`)
-	var rawTasks []rawTask
+	rawTasks := o.multiStrategyParse(planOutput)
+	if len(rawTasks) == 0 {
+		return nil, nil
+	}
+	return o.rawTasksToDAG(rawTasks, teamName)
+}
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !tableRe.MatchString(line) {
-			continue
-		}
-		cells := strings.Split(line, "|")
-		if len(cells) < 9 {
-			continue
-		}
-		title := strings.TrimSpace(cells[2])
-		if title == "" || title == "任务" {
-			continue
-		}
+// ParsePlanToDAGWithRepair 带 repair loop 的解析: 多策略 → repair prompt → fallback。
+func (o *Orchestrator) ParsePlanToDAGWithRepair(ctx context.Context, planOutput, teamName string, llmFactory CreateAgentFunc) ([]*TaskNode, error) {
+	o.mu.Lock()
 
-		num := strings.TrimSpace(cells[1])
-		role := strings.TrimSpace(cells[3])
-		deps := strings.TrimSpace(cells[4])
-		designRef := strings.TrimSpace(cells[5])
-		constraints := strings.TrimSpace(cells[6])
-		accept := strings.TrimSpace(cells[7])
-		priStr := strings.TrimSpace(cells[8])
-
-		var depNums []string
-		if deps != "" && deps != "-" && deps != "无" {
-			for _, d := range strings.Split(deps, ",") {
-				d = strings.TrimSpace(d)
-				d = strings.TrimPrefix(d, "#")
-				if d != "" {
-					depNums = append(depNums, d)
-				}
-			}
-		}
-
-		var cRefs []string
-		if constraints != "" && constraints != "-" {
-			for _, c := range strings.Split(constraints, ",") {
-				c = strings.TrimSpace(c)
-				if c != "" {
-					cRefs = append(cRefs, c)
-				}
-			}
-		}
-
-		priority := 0
-		if p, err := strconv.Atoi(priStr); err == nil {
-			priority = p
-		}
-
-		rawTasks = append(rawTasks, rawTask{
-			num: num, title: title, role: orchNormalizeRole(role),
-			depNums: depNums, designRef: designRef,
-			constraintRefs: cRefs, accept: accept, priority: priority,
-		})
+	if o.dag == nil {
+		o.mu.Unlock()
+		return nil, fmt.Errorf("DAGTaskTracker 未配置")
 	}
 
-	// 第二遍: 按序号创建 V2 任务, 建立 num→v2ID 映射
+	// 层 1+2: 多策略解析
+	rawTasks := o.multiStrategyParse(planOutput)
+	if len(rawTasks) > 0 {
+		nodes, err := o.rawTasksToDAG(rawTasks, teamName)
+		o.mu.Unlock()
+		return nodes, err
+	}
+
+	// 层 3: Repair Prompt (1 轮 LLM 修复)
+	o.mu.Unlock()
+	if llmFactory != nil {
+		repaired := o.repairPlanFormat(ctx, planOutput, llmFactory)
+		if repaired != "" {
+			o.mu.Lock()
+			rawTasks = o.multiStrategyParse(repaired)
+			if len(rawTasks) > 0 {
+				nodes, err := o.rawTasksToDAG(rawTasks, teamName)
+				o.mu.Unlock()
+				return nodes, err
+			}
+			o.mu.Unlock()
+		}
+	}
+
+	// 层 4: Fallback — 从自由文本提取最小 DAG
+	o.mu.Lock()
+	rawTasks = o.fallbackExtractTasks(planOutput)
+	if len(rawTasks) > 0 {
+		o.notify(o.chatID, "⚠️ WBS 格式解析失败, 使用 fallback 最小 DAG")
+		nodes, err := o.rawTasksToDAG(rawTasks, teamName)
+		o.mu.Unlock()
+		return nodes, err
+	}
+	o.mu.Unlock()
+	return nil, nil
+}
+
+// multiStrategyParse 依次尝试 JSON → 表格 → 编号列表三种策略解析 rawTasks。
+func (o *Orchestrator) multiStrategyParse(planOutput string) []rawTask {
+	// 策略 1: JSON
+	if tasks := parseWBSFromJSON(planOutput); len(tasks) > 0 {
+		return tasks
+	}
+	// 策略 2: markdown 表格 (宽松)
+	if tasks := parseWBSFromTable(planOutput); len(tasks) > 0 {
+		return tasks
+	}
+	// 策略 3: 编号列表
+	return parseWBSFromNumberedList(planOutput)
+}
+
+// rawTasksToDAG 将 rawTasks 写入 V2 DAG, 返回 TaskNode 列表 (调用者需持有 o.mu)。
+func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*TaskNode, error) {
+	var nodes []*TaskNode
 	numToV2ID := make(map[string]string)
 	for _, rt := range rawTasks {
 		var depV2IDs []string
@@ -226,14 +237,287 @@ func (o *Orchestrator) ParsePlanToDAG(planOutput, teamName string) ([]*TaskNode,
 	}
 
 	o.totalCount = len(nodes)
-
-	// 计算 DAG 拓扑宽度 (Kahn 分层后每层最大任务数)
 	o.dagMaxWidth = o.computeDAGWidth(rawTasks)
 	if o.dagMaxWidth > 0 && (o.config.MaxParallel <= 0 || o.config.MaxParallel > o.dagMaxWidth) {
 		o.config.MaxParallel = o.dagMaxWidth
 	}
-
 	return nodes, nil
+}
+
+// --- 策略 1: JSON 解析 ---
+
+type wbsJSON struct {
+	Tasks []wbsJSONTask `json:"tasks"`
+}
+type wbsJSONTask struct {
+	ID          int      `json:"id"`
+	Title       string   `json:"title"`
+	Role        string   `json:"role"`
+	DependsOn   []int    `json:"dependsOn"`
+	DesignRef   string   `json:"designRef"`
+	Constraints []string `json:"constraints"`
+	Acceptance  string   `json:"acceptance"`
+	Priority    int      `json:"priority"`
+}
+
+func stripCodeFences(s string) string {
+	re := regexp.MustCompile("(?s)```(?:json)?\\s*\n?(.*?)```")
+	if m := re.FindStringSubmatch(s); len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
+	return s
+}
+
+func parseWBSFromJSON(planOutput string) []rawTask {
+	body := stripCodeFences(planOutput)
+
+	var wbs wbsJSON
+	if err := json.Unmarshal([]byte(body), &wbs); err != nil {
+		// 尝试从文本中找到 JSON 对象
+		start := strings.Index(body, "{")
+		end := strings.LastIndex(body, "}")
+		if start >= 0 && end > start {
+			if err2 := json.Unmarshal([]byte(body[start:end+1]), &wbs); err2 != nil {
+				return nil
+			}
+		} else {
+			return nil
+		}
+	}
+	if len(wbs.Tasks) == 0 {
+		return nil
+	}
+
+	var tasks []rawTask
+	for _, t := range wbs.Tasks {
+		var deps []string
+		for _, d := range t.DependsOn {
+			deps = append(deps, strconv.Itoa(d))
+		}
+		tasks = append(tasks, rawTask{
+			num: strconv.Itoa(t.ID), title: t.Title,
+			role: orchNormalizeRole(t.Role), depNums: deps,
+			designRef: t.DesignRef, constraintRefs: t.Constraints,
+			accept: t.Acceptance, priority: t.Priority,
+		})
+	}
+	return tasks
+}
+
+// --- 策略 2: 宽松 markdown 表格 ---
+
+func parseWBSFromTable(planOutput string) []rawTask {
+	lines := strings.Split(planOutput, "\n")
+	tableRe := regexp.MustCompile(`^\|\s*(\d+)\s*\|`)
+	var tasks []rawTask
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !tableRe.MatchString(line) {
+			continue
+		}
+		cells := strings.Split(line, "|")
+		// 宽松: 只需 >= 6 列 (id|title|role|deps|...|)
+		if len(cells) < 6 {
+			continue
+		}
+		title := strings.TrimSpace(cells[2])
+		if title == "" || title == "任务" || title == "Task" {
+			continue
+		}
+
+		num := strings.TrimSpace(cells[1])
+		role := ""
+		if len(cells) > 3 {
+			role = strings.TrimSpace(cells[3])
+		}
+		deps := ""
+		if len(cells) > 4 {
+			deps = strings.TrimSpace(cells[4])
+		}
+		designRef := ""
+		if len(cells) > 5 {
+			designRef = strings.TrimSpace(cells[5])
+		}
+		constraints := ""
+		if len(cells) > 6 {
+			constraints = strings.TrimSpace(cells[6])
+		}
+		accept := ""
+		if len(cells) > 7 {
+			accept = strings.TrimSpace(cells[7])
+		}
+		priStr := ""
+		if len(cells) > 8 {
+			priStr = strings.TrimSpace(cells[8])
+		}
+
+		depNums := parseDepsString(deps)
+		cRefs := splitTrimNonEmpty(constraints, ",")
+		priority := 0
+		if p, err := strconv.Atoi(priStr); err == nil {
+			priority = p
+		}
+
+		tasks = append(tasks, rawTask{
+			num: num, title: title, role: orchNormalizeRole(role),
+			depNums: depNums, designRef: designRef,
+			constraintRefs: cRefs, accept: accept, priority: priority,
+		})
+	}
+	return tasks
+}
+
+// --- 策略 3: 编号列表启发式 ---
+
+func parseWBSFromNumberedList(planOutput string) []rawTask {
+	lines := strings.Split(planOutput, "\n")
+	listRe := regexp.MustCompile(`^\s*(\d+)[.)]\s+(.+)`)
+	roleRe := regexp.MustCompile(`(?i)(?:角色|role)[:\s]*(\S+)`)
+	depRe := regexp.MustCompile(`(?i)(?:依赖|depends?(?:\s*on)?|dep)[:\s]*([#\d,\s]+)`)
+	var tasks []rawTask
+
+	for _, line := range lines {
+		m := listRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		num := m[1]
+		rest := m[2]
+		title := rest
+
+		role := "coder"
+		if rm := roleRe.FindStringSubmatch(rest); rm != nil {
+			role = orchNormalizeRole(rm[1])
+			title = strings.Replace(title, rm[0], "", 1)
+		}
+
+		var deps []string
+		if dm := depRe.FindStringSubmatch(rest); dm != nil {
+			deps = parseDepsString(dm[1])
+			title = strings.Replace(title, dm[0], "", 1)
+		}
+
+		title = strings.TrimSpace(strings.TrimRight(title, " -—|"))
+		if title == "" {
+			continue
+		}
+
+		tasks = append(tasks, rawTask{
+			num: num, title: title, role: role, depNums: deps,
+		})
+	}
+	return tasks
+}
+
+// --- Repair Prompt (1 轮 LLM 修复) ---
+
+func (o *Orchestrator) repairPlanFormat(ctx context.Context, badOutput string, factory CreateAgentFunc) string {
+	prompt := fmt.Sprintf(`以下开发计划的格式无法被系统解析。请将其转换为严格 JSON, 不要添加任何解释:
+
+%sjson
+{
+  "tasks": [
+    {"id": 1, "title": "...", "role": "coder", "dependsOn": [], "designRef": "", "constraints": [], "acceptance": "...", "priority": 1}
+  ]
+}
+%s
+
+原始计划:
+%s
+
+请直接输出 JSON (用 %sjson ... %s 包裹):`, "```", "```", truncateResult(badOutput, 8000), "```", "```")
+
+	agent, err := factory(ctx, "planner", "")
+	if err != nil {
+		return ""
+	}
+	result, err := agent.Execute(ctx, prompt)
+	if err != nil {
+		return ""
+	}
+	return result
+}
+
+// --- Fallback: 从自由文本提取最小 DAG ---
+
+func (o *Orchestrator) fallbackExtractTasks(planOutput string) []rawTask {
+	lines := strings.Split(planOutput, "\n")
+	taskRe := regexp.MustCompile(`(?i)(?:task|任务|步骤|step)\s*#?\d*[.:：]?\s*(.{5,80})`)
+	var tasks []rawTask
+	id := 1
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if m := taskRe.FindStringSubmatch(line); m != nil {
+			title := strings.TrimSpace(m[1])
+			title = strings.TrimRight(title, " -—|:：")
+			if title == "" {
+				continue
+			}
+			tasks = append(tasks, rawTask{
+				num: strconv.Itoa(id), title: title, role: "coder",
+			})
+			id++
+			if id > 20 {
+				break
+			}
+		}
+	}
+
+	// 如果上面提取不到,尝试提取 markdown header 作为任务
+	if len(tasks) == 0 {
+		headerRe := regexp.MustCompile(`^#{2,4}\s+(.{5,80})`)
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if m := headerRe.FindStringSubmatch(line); m != nil {
+				title := strings.TrimSpace(m[1])
+				if strings.Contains(strings.ToLower(title), "职责") || strings.Contains(strings.ToLower(title), "偏差") {
+					continue
+				}
+				tasks = append(tasks, rawTask{
+					num: strconv.Itoa(id), title: title, role: "coder",
+				})
+				id++
+				if id > 15 {
+					break
+				}
+			}
+		}
+	}
+	return tasks
+}
+
+// --- 辅助函数 ---
+
+func parseDepsString(deps string) []string {
+	if deps == "" || deps == "-" || deps == "无" || deps == "none" {
+		return nil
+	}
+	var result []string
+	for _, d := range strings.Split(deps, ",") {
+		d = strings.TrimSpace(d)
+		d = strings.TrimPrefix(d, "#")
+		d = strings.TrimSpace(d)
+		if d != "" && regexp.MustCompile(`^\d+$`).MatchString(d) {
+			result = append(result, d)
+		}
+	}
+	return result
+}
+
+func splitTrimNonEmpty(s, sep string) []string {
+	if s == "" || s == "-" {
+		return nil
+	}
+	var result []string
+	for _, part := range strings.Split(s, sep) {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 // computeDAGWidth Kahn 算法计算拓扑分层的最大宽度 (用于 pool 精确扩缩)。
@@ -371,7 +655,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 	}
 
 	// 使用已有 AdaptiveTerminator 控制对抗轮数 (MAgICoRe + CaRT)
-	terminator := NewAdaptiveTerminator(1, o.config.AdversarialRound)
+	terminator := NewAdaptiveTerminator(2, o.config.AdversarialRound)
 
 	var lastOutput string
 	var lastFeedback string
@@ -408,7 +692,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		node.Output = result
 
 		// === Step 2: Reviewer 审查 (复用 SkepticalReviewerPersona + ParseEvalScoreJSON) ===
-		score := o.runSkepticalReview(ctx, node, objective)
+		score := o.runSkepticalReview(ctx, node, objective, lastScore)
 		lastScore = score
 
 		// === Step 3: Tester micro-test ===
@@ -430,8 +714,15 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		}
 
 		// === Step 4: AdaptiveTerminator 决定继续/停止 ===
+		terminator.RecordRoundOutput(round, score, lastOutput)
 		decision := terminator.ShouldTerminate(round, score)
 		if decision.ShouldStop {
+			// best-of-N 回滚: 退化/max_rounds 时使用历史最高分输出
+			if decision.BestOutput != "" {
+				lastOutput = decision.BestOutput
+				node.Output = lastOutput
+				o.notify(o.chatID, fmt.Sprintf("⏪ %s best-of-N 回滚到第 %d 轮 (最高分)", node.Title, decision.BestRound))
+			}
 			reasonCN := map[string]string{
 				"quality_pass": "质量达标", "max_rounds": "达到轮数上限",
 				"degradation": "连续退化", "converged": "改进已饱和",
@@ -538,13 +829,12 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 }
 
 // runSkepticalReview 复用 SkepticalReviewerPersona + BuildSkepticalEvaluatorUserPrompt + ParseEvalScoreJSON。
-// 与 workflow 层 runEvaluatorRound 使用完全相同的 reviewer 基础设施。
-func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, objective string) EvalScore {
+// lastScore: 上一轮分数, 解析失败时 hold-last-value 而不是返回全零 (避免噪声注入 terminator)。
+func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, objective string, lastScore EvalScore) EvalScore {
 	if o.factory == nil {
 		return EvalScore{Pass: true, Correctness: 8, Completeness: 8, Security: 8, CodeQuality: 8}
 	}
 
-	// 构建带设计上下文的 objective
 	taskObjective := fmt.Sprintf("任务: %s | 角色: %s | 验收标准: %s\n目标: %s",
 		node.Title, node.Role, node.AcceptCriteria, objective)
 	if node.DesignRef != "" && node.DesignRef != "-" {
@@ -552,7 +842,6 @@ func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, o
 		taskObjective += "\n\n设计参考:\n" + designCtx
 	}
 
-	// 复用 adversarial.go 的标准 prompt
 	userPrompt := BuildSkepticalEvaluatorUserPrompt(taskObjective, node.Output)
 
 	reviewCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -560,18 +849,28 @@ func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, o
 
 	runner, err := o.factory(reviewCtx, "reviewer", SkepticalReviewerPersona)
 	if err != nil {
-		return EvalScore{Pass: true, Correctness: 6, Completeness: 6, Security: 6, CodeQuality: 6}
+		return HoldLastOrDefault(lastScore)
 	}
 	result, err := runner.Execute(reviewCtx, userPrompt)
 	if err != nil {
-		return EvalScore{Pass: true, Correctness: 6, Completeness: 6, Security: 6, CodeQuality: 6}
+		return HoldLastOrDefault(lastScore)
 	}
 
 	score, parseErr := ParseEvalScoreJSON([]byte(result))
 	if parseErr != nil {
-		return EvalScore{Feedback: result}
+		held := HoldLastOrDefault(lastScore)
+		held.Feedback = result
+		return held
 	}
 	return score
+}
+
+// HoldLastOrDefault 评分解析失败时沿用上轮分数; 上轮也为零时返回保守默认值 (6/10)。
+func HoldLastOrDefault(last EvalScore) EvalScore {
+	if last.Correctness > 0 || last.Completeness > 0 {
+		return last
+	}
+	return EvalScore{Pass: true, Correctness: 6, Completeness: 6, Security: 6, CodeQuality: 6}
 }
 
 // handleTaskFailure 失败处理 + Phoenix 重试

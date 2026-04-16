@@ -168,16 +168,30 @@ func developmentWorkflow() *WorkflowDef {
 
 ## 职责 2: 制定开发计划 (WBS)
 
-将设计分解为可执行任务:
-
-| # | 任务 | 角色 | 依赖 | 设计章节 | 验收标准 | 优先级 |
-|---|------|------|------|---------|---------|--------|
+将设计分解为可执行任务, **输出严格 JSON** (不要额外解释):
+` + "```" + `json
+{
+  "tasks": [
+    {
+      "id": 1,
+      "title": "任务标题",
+      "role": "coder",
+      "dependsOn": [],
+      "designRef": "设计章节名",
+      "constraints": ["C1"],
+      "acceptance": "go build 通过 + 接口签名与设计一致",
+      "priority": 2
+    }
+  ]
+}
+` + "```" + `
 
 原则:
 1. **原子性**: 每个任务在一轮内可完成
 2. **可追溯**: 每个任务标注对应的设计章节和约束编号
-3. **验收标准**: 具体、可执行 (如 "go build通过 + 接口签名与设计一致")
-4. **依赖拓扑**: 标注前置任务编号, 形成 DAG
+3. **验收标准**: 具体、可执行
+4. **依赖拓扑**: dependsOn 填前置任务 id 数组, 形成 DAG
+5. role 可选: coder, tester, reviewer, researcher, architect
 
 ## 职责 3: 定义偏差检测点 (Drift Checkpoints)
 
@@ -659,7 +673,7 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 		orch.SetDesignContext(designDoc, planOutput)
 	}
 
-	nodes, err := orch.ParsePlanToDAG(planOutput, team.Name)
+	nodes, err := orch.ParsePlanToDAGWithRepair(ctx, planOutput, team.Name, we.factory)
 	if err != nil || len(nodes) == 0 {
 		return nil, fmt.Errorf("WBS 解析失败或无任务: %v", err)
 	}
@@ -762,6 +776,7 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 	var allResults []StageResult
 	we.notify(we.chatID, fmt.Sprintf("⚔️ Phase 2: 对抗循环 (最多 %d 轮)...", maxRounds))
 	var lastGenOutput, lastEvalFeedback string
+	var lastScore EvalScore
 
 	for round := 1; round <= maxRounds; round++ {
 		if ctx.Err() != nil {
@@ -780,8 +795,17 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 		lastEvalFeedback = we.runBuildGate(ctx, team, round, lastEvalFeedback)
 
 		// Evaluator 审查
-		evalResult, shouldBreak := we.runEvaluatorRound(ctx, evalStage, generatorStages, round, maxRounds, lastGenOutput, terminator, objective, prevResults, team, &lastEvalFeedback)
+		evalResult, shouldBreak, bestOutput := we.runEvaluatorRound(ctx, evalStage, generatorStages, round, maxRounds, lastGenOutput, terminator, objective, prevResults, team, &lastEvalFeedback, lastScore)
 		allResults = append(allResults, evalResult...)
+		if bestOutput != "" {
+			lastGenOutput = bestOutput
+			prevResults[generatorStages[len(generatorStages)-1].Name] = bestOutput
+		}
+		// 更新 lastScore (从 terminator 的 ScoreHistory 中取)
+		if terminator != nil && len(terminator.ScoreHistory) > 0 {
+			avg := terminator.ScoreHistory[len(terminator.ScoreHistory)-1]
+			lastScore = EvalScore{Correctness: avg, Completeness: avg, Security: avg, CodeQuality: avg}
+		}
 		if shouldBreak {
 			break
 		}
@@ -879,10 +903,10 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 	round, maxRounds int, lastGenOutput string,
 	terminator *AdaptiveTerminator,
 	objective string, prevResults map[string]string, team *ProductionTeam,
-	lastEvalFeedback *string,
-) (results []StageResult, shouldBreak bool) {
+	lastEvalFeedback *string, lastScore EvalScore,
+) (results []StageResult, shouldBreak bool, bestOutput string) {
 	if evalStage == nil {
-		return nil, false
+		return nil, false, ""
 	}
 
 	genName := genStages[len(genStages)-1].Name
@@ -903,12 +927,14 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 
 	if sr.Status != TaskCompleted {
 		*lastEvalFeedback = "评估器未能正常返回结果，请全面检查输出质量。"
-		return results, false
+		return results, false, ""
 	}
 
 	score, scoreErr := ParseEvalScoreJSON([]byte(sr.Output))
 	if scoreErr != nil {
-		log.Printf("[对抗] 第 %d 轮评分解析失败: %v", round, scoreErr)
+		log.Printf("[对抗] 第 %d 轮评分解析失败, hold-last-value: %v", round, scoreErr)
+		score = HoldLastOrDefault(lastScore)
+		score.Feedback = sr.Output
 	}
 
 	scoreMsg := fmt.Sprintf("正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f",
@@ -926,6 +952,7 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 
 	// 自适应终止判断
 	if terminator != nil {
+		terminator.RecordRoundOutput(round, score, lastGenOutput)
 		decision := terminator.ShouldTerminate(round, score)
 		if decision.ShouldStop {
 			reasonCN := map[string]string{
@@ -933,21 +960,25 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 				"degradation": "连续退化", "converged": "改进已饱和",
 			}[decision.Reason]
 			we.notify(we.chatID, fmt.Sprintf("🏁 自适应终止: %s (原因: %s)", passLabel, reasonCN))
+			if decision.BestOutput != "" {
+				we.notify(we.chatID, fmt.Sprintf("⏪ best-of-N 回滚到第 %d 轮 (最高分)", decision.BestRound))
+				bestOutput = decision.BestOutput
+			}
 			we.recordEvalMetrics(team, round, score, decision.Reason)
-			return results, true
+			return results, true, bestOutput
 		}
 		we.notify(we.chatID, fmt.Sprintf("🔄 自适应继续: %s, %d/%d轮", decision.Reason, round, maxRounds))
 	} else if score.MeetsHardPassThreshold() {
 		we.notify(we.chatID, fmt.Sprintf("✅ 对抗通过！第 %d 轮评审达标。", round))
 		we.recordEvalMetrics(team, round, score, "pass")
-		return results, true
+		return results, true, ""
 	}
 
 	*lastEvalFeedback = score.Feedback
 	if *lastEvalFeedback == "" {
 		*lastEvalFeedback = sr.Output
 	}
-	return results, false
+	return results, false, ""
 }
 
 // recordEvalMetrics 记录评估指标

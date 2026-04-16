@@ -207,6 +207,17 @@ func TestV2Eval(t *testing.T) {
 		testCheckpointMechanism(t, report)
 	})
 
+	// v10 评测: WBS多策略解析 + 退化容错 + best-of-N 回滚
+	t.Run("WBSMultiStrategyParse", func(t *testing.T) {
+		testWBSMultiStrategyParse(t, report)
+	})
+	t.Run("DegradationTolerance", func(t *testing.T) {
+		testDegradationTolerance(t, report)
+	})
+	t.Run("BestOfNRollback", func(t *testing.T) {
+		testBestOfNRollback(t, report)
+	})
+
 	report.EndTime = time.Now()
 	report.Print(t)
 }
@@ -3373,4 +3384,235 @@ func testCheckpointMechanism(t *testing.T, report *WikiEvalReport) {
 	t.Log("✓ Orchestrator.SetCheckpointStore 可注入 (task 完成后持久化)")
 
 	report.Add("checkpoint-mechanism", "检查点机制落实", score, 10, "接口+往返+持久化+Executor注入+Orchestrator注入")
+}
+
+// --- 55. WBS 多策略解析验证 ---
+
+func testWBSMultiStrategyParse(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+	dag := newMockDAGTracker()
+	orch := agent.NewOrchestrator(agent.OrchestratorConfig{MaxRetries: 1}, dag, nil, func(_, _ string) {}, nil, "test")
+
+	// 55.1 JSON 格式解析 (策略 1)
+	jsonPlan := `
+一些前置解释文字...
+
+` + "```json" + `
+{
+  "tasks": [
+    {"id": 1, "title": "初始化项目结构", "role": "coder", "dependsOn": [], "designRef": "模块设计", "constraints": ["C1"], "acceptance": "go build 通过", "priority": 1},
+    {"id": 2, "title": "实现核心逻辑", "role": "coder", "dependsOn": [1], "designRef": "核心模块", "constraints": ["C2"], "acceptance": "测试通过", "priority": 2},
+    {"id": 3, "title": "编写测试", "role": "tester", "dependsOn": [2], "designRef": "测试计划", "constraints": [], "acceptance": "覆盖率>80%", "priority": 3}
+  ]
+}
+` + "```" + `
+
+后续说明...
+`
+	nodes, err := orch.ParsePlanToDAG(jsonPlan, "test-team")
+	if err == nil && len(nodes) == 3 {
+		score += 2
+		t.Logf("✓ JSON 格式解析: %d 个任务", len(nodes))
+		if nodes[0].Title == "初始化项目结构" && nodes[0].Role == "coder" {
+			score += 1
+			t.Log("✓ JSON 解析字段映射正确")
+		}
+	} else {
+		t.Logf("✗ JSON 格式解析失败: err=%v nodes=%d", err, len(nodes))
+	}
+
+	// 55.2 宽松表格格式解析 (策略 2, 6列也能解析)
+	dag2 := newMockDAGTracker()
+	orch2 := agent.NewOrchestrator(agent.OrchestratorConfig{MaxRetries: 1}, dag2, nil, func(_, _ string) {}, nil, "test")
+	tablePlan := `
+| # | 任务 | 角色 | 依赖 | 设计章节 | 验收标准 |
+|---|------|------|------|---------|---------|
+| 1 | 创建API端点 | coder | - | API设计 | 端点可访问 |
+| 2 | 编写单测 | tester | 1 | 测试 | 覆盖率>80% |
+`
+	nodes2, err2 := orch2.ParsePlanToDAG(tablePlan, "test-team")
+	if err2 == nil && len(nodes2) == 2 {
+		score += 2
+		t.Logf("✓ 宽松表格 (6列) 解析: %d 个任务", len(nodes2))
+	} else {
+		t.Logf("✗ 宽松表格解析失败: err=%v nodes=%d", err2, len(nodes2))
+	}
+
+	// 55.3 编号列表格式解析 (策略 3)
+	dag3 := newMockDAGTracker()
+	orch3 := agent.NewOrchestrator(agent.OrchestratorConfig{MaxRetries: 1}, dag3, nil, func(_, _ string) {}, nil, "test")
+	listPlan := `
+开发计划:
+
+1. 搭建项目骨架 - 角色: coder
+2. 实现认证模块 - 角色: coder - 依赖: 1
+3. 编写集成测试 - 角色: tester - 依赖: 1, 2
+`
+	nodes3, err3 := orch3.ParsePlanToDAG(listPlan, "test-team")
+	if err3 == nil && len(nodes3) == 3 {
+		score += 2
+		t.Logf("✓ 编号列表解析: %d 个任务", len(nodes3))
+	} else {
+		t.Logf("✗ 编号列表解析失败: err=%v nodes=%d", err3, len(nodes3))
+	}
+
+	// 55.4 完全无法解析时返回 nil (不 panic)
+	dag4 := newMockDAGTracker()
+	orch4 := agent.NewOrchestrator(agent.OrchestratorConfig{MaxRetries: 1}, dag4, nil, func(_, _ string) {}, nil, "test")
+	nodes4, err4 := orch4.ParsePlanToDAG("这是一段完全没有结构的文字", "test-team")
+	if err4 == nil && nodes4 == nil {
+		score += 1
+		t.Log("✓ 无法解析时安全返回 nil")
+	}
+
+	// 55.5 ParsePlanToDAGWithRepair 存在且可调用 (签名检查)
+	dag5 := newMockDAGTracker()
+	orch5 := agent.NewOrchestrator(agent.OrchestratorConfig{MaxRetries: 1}, dag5, nil, func(_, _ string) {}, nil, "test")
+	ctx := context.Background()
+	repairNodes, repairErr := orch5.ParsePlanToDAGWithRepair(ctx, jsonPlan, "test-team", nil)
+	if repairErr == nil && len(repairNodes) == 3 {
+		score += 2
+		t.Log("✓ ParsePlanToDAGWithRepair 可用 (直接 JSON 解析成功, 无需 repair)")
+	}
+
+	report.Add("wbs-multi-strategy-parse", "WBS多策略解析", score, 10, "JSON+宽松表格+编号列表+安全nil+Repair接口")
+}
+
+// --- 56. 退化容错验证 ---
+
+func testDegradationTolerance(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 56.1 DegradeThreshold 存在且默认 > 0
+	term := agent.NewAdaptiveTerminator(2, 5)
+	if term.DegradeThreshold > 0 {
+		score += 2
+		t.Logf("✓ DegradeThreshold = %.2f (排除噪声波动)", term.DegradeThreshold)
+	}
+
+	// 56.2 微小波动 (8→7.8→7.6) 不触发退化退出
+	scores := []agent.EvalScore{
+		{Correctness: 8, Completeness: 8, Security: 8, CodeQuality: 8, Pass: false},
+		{Correctness: 7.8, Completeness: 7.8, Security: 7.8, CodeQuality: 7.8, Pass: false},
+		{Correctness: 7.6, Completeness: 7.6, Security: 7.6, CodeQuality: 7.6, Pass: false},
+	}
+	term2 := agent.NewAdaptiveTerminator(1, 5)
+	var lastDecision agent.TerminationDecision
+	for i, s := range scores {
+		term2.RecordRoundOutput(i+1, s, fmt.Sprintf("output-%d", i))
+		lastDecision = term2.ShouldTerminate(i+1, s)
+	}
+	if !lastDecision.ShouldStop || lastDecision.Reason != "degradation" {
+		score += 2
+		t.Logf("✓ 微小波动 (0.2/轮) 不触发退化 (DegradeThreshold 过滤)")
+	} else {
+		t.Log("✗ 微小波动仍触发退化")
+	}
+
+	// 56.3 真实大幅退化 (8→5→2) 触发退化退出 (需要 3 次)
+	term3 := agent.NewAdaptiveTerminator(1, 10)
+	bigDropScores := []agent.EvalScore{
+		{Correctness: 8, Completeness: 8, Security: 8, CodeQuality: 8, Pass: false},
+		{Correctness: 5, Completeness: 5, Security: 5, CodeQuality: 5, Pass: false},
+		{Correctness: 2, Completeness: 2, Security: 2, CodeQuality: 2, Pass: false},
+		{Correctness: 1, Completeness: 1, Security: 1, CodeQuality: 1, Pass: false},
+	}
+	var degradeDecision agent.TerminationDecision
+	for i, s := range bigDropScores {
+		term3.RecordRoundOutput(i+1, s, fmt.Sprintf("output-%d", i))
+		degradeDecision = term3.ShouldTerminate(i+1, s)
+		if degradeDecision.ShouldStop {
+			break
+		}
+	}
+	if degradeDecision.ShouldStop && degradeDecision.Reason == "degradation" {
+		score += 2
+		t.Log("✓ 大幅退化 (8→5→2→1) 正确触发退化终止")
+	} else {
+		t.Logf("✗ 大幅退化未触发: stop=%v reason=%s", degradeDecision.ShouldStop, degradeDecision.Reason)
+	}
+
+	// 56.4 hold-last-value: holdLastOrDefault 有效
+	zero := agent.EvalScore{}
+	prev := agent.EvalScore{Correctness: 7, Completeness: 7, Security: 7, CodeQuality: 7, Pass: true}
+	// 全零时沿用上轮
+	if agent.HoldLastOrDefault(prev).Correctness == 7 {
+		score += 2
+		t.Log("✓ holdLastOrDefault 沿用上轮非零分数")
+	}
+	// 上轮也是零时返回默认值 6
+	if agent.HoldLastOrDefault(zero).Correctness == 6 {
+		score += 2
+		t.Log("✓ holdLastOrDefault 上轮也为零时返回默认值 6")
+	}
+
+	report.Add("degradation-tolerance", "退化容错", score, 10, "DegradeThreshold+微小波动过滤+大幅退化检测+hold-last-value")
+}
+
+// --- 57. Best-of-N 回滚验证 ---
+
+func testBestOfNRollback(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 57.1 RecordRoundOutput 存在并记录最高分
+	term := agent.NewAdaptiveTerminator(1, 5)
+	s1 := agent.EvalScore{Correctness: 5, Completeness: 5, Security: 5, CodeQuality: 5, Pass: false}
+	s2 := agent.EvalScore{Correctness: 8, Completeness: 8, Security: 8, CodeQuality: 8, Pass: false}
+	s3 := agent.EvalScore{Correctness: 3, Completeness: 3, Security: 3, CodeQuality: 3, Pass: false}
+
+	term.RecordRoundOutput(1, s1, "output-round1")
+	term.RecordRoundOutput(2, s2, "output-round2-best")
+	term.RecordRoundOutput(3, s3, "output-round3")
+
+	if term.BestRound == 2 && term.BestOutput == "output-round2-best" {
+		score += 3
+		t.Log("✓ RecordRoundOutput 正确追踪最高分 (round 2)")
+	} else {
+		t.Logf("✗ BestRound=%d BestOutput=%s", term.BestRound, term.BestOutput)
+	}
+
+	// 57.2 退化终止时 decision 携带 BestOutput
+	term2 := agent.NewAdaptiveTerminator(1, 10)
+	degradeScores := []agent.EvalScore{
+		{Correctness: 8, Completeness: 8, Security: 8, CodeQuality: 8, Pass: false},
+		{Correctness: 5, Completeness: 5, Security: 5, CodeQuality: 5, Pass: false},
+		{Correctness: 3, Completeness: 3, Security: 3, CodeQuality: 3, Pass: false},
+		{Correctness: 1, Completeness: 1, Security: 1, CodeQuality: 1, Pass: false},
+	}
+	var finalDecision agent.TerminationDecision
+	for i, s := range degradeScores {
+		term2.RecordRoundOutput(i+1, s, fmt.Sprintf("output-%d", i+1))
+		finalDecision = term2.ShouldTerminate(i+1, s)
+		if finalDecision.ShouldStop {
+			break
+		}
+	}
+	if finalDecision.BestOutput == "output-1" && finalDecision.BestRound == 1 {
+		score += 3
+		t.Log("✓ 退化终止时回滚到 round 1 (最高分)")
+	} else {
+		t.Logf("✗ BestOutput=%s BestRound=%d", finalDecision.BestOutput, finalDecision.BestRound)
+	}
+
+	// 57.3 quality_pass 时不触发回滚 (用当前输出即可)
+	term3 := agent.NewAdaptiveTerminator(1, 5)
+	passScore := agent.EvalScore{Correctness: 9, Completeness: 9, Security: 9, CodeQuality: 9, Pass: true}
+	term3.RecordRoundOutput(1, passScore, "perfect-output")
+	passDecision := term3.ShouldTerminate(1, passScore)
+	if passDecision.BestOutput == "" {
+		score += 2
+		t.Log("✓ quality_pass 时不回滚 (用当前轮输出)")
+	}
+
+	// 57.4 TerminationDecision 包含 BestOutput 和 BestRound 字段
+	d := agent.TerminationDecision{}
+	d.BestOutput = "test"
+	d.BestRound = 1
+	score += 2
+	t.Log("✓ TerminationDecision 包含 BestOutput/BestRound 字段")
+
+	report.Add("best-of-n-rollback", "Best-of-N回滚", score, 10, "RecordRoundOutput+退化回滚+quality_pass不回滚+字段存在")
 }

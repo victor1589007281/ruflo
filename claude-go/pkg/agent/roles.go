@@ -427,7 +427,31 @@ func (rr *RoleRegistry) registerBuiltins() {
 如有遗漏, 标注 "⚠️ 设计补充" 并说明。
 
 ## 职责 2: 制定开发计划 (WBS)
-| # | 任务 | 角色 | 依赖 | 设计章节 | 约束编号 | 验收标准 | 优先级 |
+
+将设计分解为可执行任务, **输出严格 JSON** (不要额外解释):
+` + "```" + `json
+{
+  "tasks": [
+    {
+      "id": 1,
+      "title": "任务标题",
+      "role": "coder",
+      "dependsOn": [],
+      "designRef": "设计章节名",
+      "constraints": ["C1"],
+      "acceptance": "go build 通过 + 接口签名与设计一致",
+      "priority": 2
+    }
+  ]
+}
+` + "```" + `
+
+原则:
+1. **原子性**: 每个任务在一轮内可完成
+2. **可追溯**: 每个任务标注对应的设计章节和约束编号
+3. **验收标准**: 具体、可执行
+4. **依赖拓扑**: dependsOn 填前置任务 id 数组, 形成 DAG
+5. role 可选: coder, tester, reviewer, researcher, architect
 
 ## 职责 3: 定义偏差检测点 (Drift Checkpoints)
 为 Reviewer 列出关键检测项:

@@ -80,8 +80,14 @@ type AdaptiveTerminator struct {
 	PassThreshold float64   // 通过门槛 (默认 6.0)
 
 	// 收敛检测参数
-	ConvergeEpsilon float64 // 相邻两轮评分差小于此值视为收敛
-	DegradeCount    int     // 连续退化轮数
+	ConvergeEpsilon  float64 // 相邻两轮评分差小于此值视为收敛
+	DegradeCount     int     // 连续退化轮数
+	DegradeThreshold float64 // 退化幅度阈值: 分数下降 > 此值才计为退化 (排除噪声)
+
+	// Best-of-N 回滚: 记录每轮输出, 退化/max_rounds 退出时回滚到历史最高分
+	BestScore  float64 // 历史最高平均分
+	BestRound  int     // 最高分对应的轮数
+	BestOutput string  // 最高分对应的产出
 }
 
 // NewAdaptiveTerminator 创建自适应终止器。
@@ -94,10 +100,11 @@ func NewAdaptiveTerminator(minRounds, maxRounds int) *AdaptiveTerminator {
 		maxRounds = 5
 	}
 	return &AdaptiveTerminator{
-		MinRounds:       minRounds,
-		MaxRounds:       maxRounds,
-		PassThreshold:   hardPassMinScore,
-		ConvergeEpsilon: 0.5,
+		MinRounds:        minRounds,
+		MaxRounds:        maxRounds,
+		PassThreshold:    hardPassMinScore,
+		ConvergeEpsilon:  0.5,
+		DegradeThreshold: 0.3, // 分数下降 ≤0.3 视为噪声波动, 不计退化
 	}
 }
 
@@ -107,14 +114,27 @@ type TerminationDecision struct {
 	Reason     string
 	RoundsUsed int
 	MaxRounds  int
+	BestOutput string // 非空时表示应使用此输出 (best-of-N 回滚)
+	BestRound  int    // 最高分对应的轮数
+}
+
+// RecordRoundOutput 记录每轮的评分和产出, 用于 best-of-N 回滚。
+// 必须在 ShouldTerminate 之前调用。
+func (at *AdaptiveTerminator) RecordRoundOutput(round int, score EvalScore, output string) {
+	avg := score.AvgScore()
+	if avg > at.BestScore || at.BestRound == 0 {
+		at.BestScore = avg
+		at.BestRound = round
+		at.BestOutput = output
+	}
 }
 
 // ShouldTerminate 根据当前轮评分决定是否终止。
-// 策略 (参考 MAgICoRe + CaRT):
+// 策略 (参考 MAgICoRe + CaRT + best-of-N rollback):
 //  1. 通过硬门槛 → 立即停止 (质量达标)
 //  2. 未达最小轮数 → 继续 (保证充分探索)
-//  3. 达到最大轮数 → 强制停止
-//  4. 连续2轮评分下降(退化) → 提前停止 (避免过度修正, MAgICoRe "excessive refinement")
+//  3. 达到最大轮数 → 强制停止 (附带 best-of-N 回滚)
+//  4. 连续 3 轮评分下降超过 DegradeThreshold (退化) → 提前停止 + 回滚到最高分输出
 //  5. 相邻评分差 < epsilon (收敛/震荡) → 停止 (改进已饱和)
 func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) TerminationDecision {
 	avg := score.AvgScore()
@@ -131,19 +151,32 @@ func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) Termin
 		return TerminationDecision{ShouldStop: false, Reason: "min_rounds", RoundsUsed: round, MaxRounds: at.MaxRounds}
 	}
 
-	// 3. 达到最大轮数
+	// 3. 达到最大轮数 → best-of-N 回滚
 	if round >= at.MaxRounds {
-		return TerminationDecision{ShouldStop: true, Reason: "max_rounds", RoundsUsed: round, MaxRounds: at.MaxRounds}
+		d := TerminationDecision{ShouldStop: true, Reason: "max_rounds", RoundsUsed: round, MaxRounds: at.MaxRounds}
+		if at.BestOutput != "" && at.BestRound != round {
+			d.BestOutput = at.BestOutput
+			d.BestRound = at.BestRound
+		}
+		return d
 	}
 
-	// 4. 连续退化检测 (MAgICoRe: 避免 excessive refinement)
-	if n >= 2 && at.ScoreHistory[n-1] < at.ScoreHistory[n-2] {
-		at.DegradeCount++
-	} else {
-		at.DegradeCount = 0
+	// 4. 宽容退化检测: 分数下降幅度 > DegradeThreshold 才计为退化
+	if n >= 2 {
+		drop := at.ScoreHistory[n-2] - at.ScoreHistory[n-1]
+		if drop > at.DegradeThreshold {
+			at.DegradeCount++
+		} else if at.ScoreHistory[n-1] >= at.ScoreHistory[n-2] {
+			at.DegradeCount = 0
+		}
 	}
-	if at.DegradeCount >= 2 {
-		return TerminationDecision{ShouldStop: true, Reason: "degradation", RoundsUsed: round, MaxRounds: at.MaxRounds}
+	if at.DegradeCount >= 3 {
+		d := TerminationDecision{ShouldStop: true, Reason: "degradation", RoundsUsed: round, MaxRounds: at.MaxRounds}
+		if at.BestOutput != "" && at.BestRound != round {
+			d.BestOutput = at.BestOutput
+			d.BestRound = at.BestRound
+		}
+		return d
 	}
 
 	// 5. 收敛/震荡检测 (改进已饱和)
