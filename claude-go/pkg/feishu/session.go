@@ -118,6 +118,7 @@ type SessionManager struct {
 	roleRegistry   *agent.RoleRegistry          // 角色注册表
 	mediaSendFn    MediaSendFunc                // 飞书发送图片/文件的回调
 	teamMgr        *agent.ProductionTeamManager // 团队管理器 (供 TeamQuery 工具使用)
+	searcher       builtin.WebSearcher          // Web 搜索适配器 (浏览器)
 }
 
 // NewSessionManager 创建会话管理器。
@@ -162,6 +163,11 @@ func (sm *SessionManager) SetMediaSendFn(fn MediaSendFunc) {
 // SetTeamManager 注入团队管理器，让 LLM 能通过 TeamQuery 工具查询团队信息。
 func (sm *SessionManager) SetTeamManager(mgr *agent.ProductionTeamManager) {
 	sm.teamMgr = mgr
+}
+
+// SetSearcher 注入 Web 搜索适配器，让 WebSearchTool 能发起真实搜索。
+func (sm *SessionManager) SetSearcher(s builtin.WebSearcher) {
+	sm.searcher = s
 }
 
 // Get 获取已有会话（不创建）。如果不存在返回 nil。
@@ -210,7 +216,7 @@ func (sm *SessionManager) GetOrCreate(chatID string) *Session {
 //  3. 注册 Agent 工具 (支持嵌套 queryLoop)
 func (sm *SessionManager) createSession(chatID string) *Session {
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseToolsWithStore(reg, sm.taskStore)
+	builtin.RegisterBaseToolsWithStore(reg, sm.taskStore, sm.searcher)
 
 	// 注册飞书发送工具: 让 LLM 能直接通过飞书 SDK 发送图片/文件给用户
 	if sm.mediaSendFn != nil {
@@ -302,7 +308,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 //  5. 返回合并后的结果
 func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
 	nestedReg := tool.NewRegistry()
-	builtin.RegisterBaseToolsWithStore(nestedReg, sm.taskStore)
+	builtin.RegisterBaseToolsWithStore(nestedReg, sm.taskStore, sm.searcher)
 	if sm.mcpMgr != nil {
 		sm.mcpMgr.RefreshToolsForRegistry(nestedReg)
 	}
@@ -555,7 +561,7 @@ type sessionAgentRunner struct {
 // 集成: Role Skills + Evolution 经验 + Dreaming 记录 (通过 Hook 注入)。
 func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
 	nestedReg := tool.NewRegistry()
-	builtin.RegisterBaseToolsWithStore(nestedReg, r.sm.taskStore)
+	builtin.RegisterBaseToolsWithStore(nestedReg, r.sm.taskStore, r.sm.searcher)
 	if r.sm.mcpMgr != nil {
 		r.sm.mcpMgr.RefreshToolsForRegistry(nestedReg)
 	}

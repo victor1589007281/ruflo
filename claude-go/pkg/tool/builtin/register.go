@@ -1,19 +1,28 @@
 package builtin
 
-import "github.com/anthropic/claude-go/pkg/tool"
+import (
+	"context"
+
+	"github.com/anthropic/claude-go/pkg/tool"
+)
+
+// WebSearcher 网页搜索接口，与 browser.Client.Search 兼容。
+type WebSearcher interface {
+	Search(ctx context.Context, query string) (title, text, html string, err error)
+}
 
 // RegisterBaseTools registers all built-in tools.
 // Returns TodoWriteTool for external use.
 // Internally creates a default TaskStore; use RegisterBaseToolsWithStore to share one.
-func RegisterBaseTools(reg *tool.Registry) *TodoWriteTool {
-	todo, _ := RegisterBaseToolsWithStore(reg, nil)
+func RegisterBaseTools(reg *tool.Registry, searcher WebSearcher) *TodoWriteTool {
+	todo, _ := RegisterBaseToolsWithStore(reg, nil, searcher)
 	return todo
 }
 
 // RegisterBaseToolsWithStore registers all built-in tools with a shared TaskStore.
 // If store is nil, creates a new one with default path.
 // Returns the TodoWriteTool and the (possibly newly created) TaskStore for reuse.
-func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore) (*TodoWriteTool, *TaskStore) {
+func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher WebSearcher) (*TodoWriteTool, *TaskStore) {
 	// Core file tools
 	reg.Register(NewFileReadTool())
 	reg.Register(NewFileWriteTool())
@@ -32,7 +41,7 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore) (*TodoWrit
 
 	// Web tools
 	reg.Register(NewWebFetchTool())
-	reg.Register(NewWebSearchTool())
+	reg.Register(NewWebSearchTool(searcher))
 
 	// User interaction
 	reg.Register(NewAskUserQuestionTool())

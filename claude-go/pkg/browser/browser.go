@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -26,16 +27,48 @@ type Config struct {
 	ProxyURL     string        `json:"proxyUrl,omitempty"`
 	ChromePath   string        `json:"chromePath,omitempty"`
 	WaitSeconds  int           `json:"waitSeconds"`
+	// SearchEngine 搜索引擎 URL 模板，用 {query} 占位符。
+	// 内置预设: "bing", "baidu"，也可传入完整模板如 "https://www.bing.com/search?q={query}"
+	SearchEngine string `json:"searchEngine,omitempty"`
 }
 
 // DefaultConfig 返回默认配置。
 func DefaultConfig() Config {
 	return Config{
-		Headless:    true,
-		Timeout:     30 * time.Second,
-		UserAgent:   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-		WaitSeconds: 3,
+		Headless:     true,
+		Timeout:      30 * time.Second,
+		UserAgent:    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+		WaitSeconds:  3,
+		SearchEngine: "bing",
 	}
+}
+
+// 内置搜索引擎 URL 模板。
+var searchEngines = map[string]string{
+	"bing":   "https://www.bing.com/search?q={query}&count=10",
+	"baidu":  "https://www.baidu.com/s?wd={query}",
+	"sogou":  "https://www.sogou.com/web?query={query}",
+}
+
+// resolveSearchURL 将搜索引擎配置解析为完整 URL。
+func (c *Client) resolveSearchURL(query string) string {
+	engine := c.cfg.SearchEngine
+	// 先查内置预设
+	if template, ok := searchEngines[engine]; ok {
+		return strings.ReplaceAll(template, "{query}", url.QueryEscape(query))
+	}
+	// 如果用户传入的是完整 URL 模板
+	if strings.HasPrefix(engine, "http") {
+		return strings.ReplaceAll(engine, "{query}", url.QueryEscape(query))
+	}
+	// 兜底: Bing
+	return strings.ReplaceAll(searchEngines["bing"], "{query}", url.QueryEscape(query))
+}
+
+// Search 使用配置的搜索引擎搜索 query 并返回结果。
+func (c *Client) Search(ctx context.Context, query string) (*FetchResult, error) {
+	searchURL := c.resolveSearchURL(query)
+	return c.Fetch(ctx, searchURL)
 }
 
 // FetchResult 网页抓取结果。

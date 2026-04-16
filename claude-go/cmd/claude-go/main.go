@@ -542,7 +542,7 @@ func toolsCmd() *cobra.Command {
 		Example: `  claude-go tools`,
 		Run: func(cmd *cobra.Command, args []string) {
 			reg := tool.NewRegistry()
-			builtin.RegisterBaseTools(reg)
+			builtin.RegisterBaseTools(reg, nil)
 
 			fmt.Println("Available Tools:")
 			fmt.Println("================")
@@ -708,7 +708,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	}
 
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseTools(reg)
+	builtin.RegisterBaseTools(reg, nil)
 	mcp.RegisterMCPTools(reg, mcpConns)
 	if skillReg.Count() > 0 {
 		reg.Register(skills.NewSkillTool(skillReg))
@@ -838,7 +838,7 @@ func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
 
 func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
 	nestedReg := tool.NewRegistry()
-	builtin.RegisterBaseTools(nestedReg)
+	builtin.RegisterBaseTools(nestedReg, nil)
 	mcp.RegisterMCPTools(nestedReg, deps.mcpConns)
 	if deps.skillReg != nil && deps.skillReg.Count() > 0 {
 		nestedReg.Register(skills.NewSkillTool(deps.skillReg))

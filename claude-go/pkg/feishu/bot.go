@@ -122,6 +122,19 @@ func (w *wikiBrowserAdapter) Fetch(ctx context.Context, url string) (title, text
 	return result.Title, result.Text, result.HTML, nil
 }
 
+// browserSearchAdapter 适配 browser.Client 到 builtin.WebSearcher 接口。
+type browserSearchAdapter struct {
+	client *browser.Client
+}
+
+func (a *browserSearchAdapter) Search(ctx context.Context, query string) (title, text, html string, err error) {
+	result, err := a.client.Search(ctx, query)
+	if err != nil {
+		return "", "", "", err
+	}
+	return result.Title, result.Text, result.HTML, nil
+}
+
 func (da *dreamAdapter) RecordSession(record agent.DreamSessionRecord) {
 	if da.dreamer == nil {
 		return
@@ -340,6 +353,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		}
 		browserClient := browser.NewClient(browserCfg)
 		bot.wikiEngine.SetBrowser(&wikiBrowserAdapter{client: browserClient})
+		// 注入浏览器搜索适配器，让 WebSearchTool 能发起真实搜索
+		if browserClient.Available() {
+			bot.sessions.SetSearcher(&browserSearchAdapter{client: browserClient})
+		}
 
 		// 对所有注册的 Wiki 仓库内置 Schema（页面模板、分类、摄取工作流、Lint、整理任务）
 		allRepos := config.Wiki.Repos
