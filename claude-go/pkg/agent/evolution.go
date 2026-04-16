@@ -175,13 +175,13 @@ func (ee *EvolutionEngine) LearnFromTeam(ctx context.Context, teamName string) {
 	log.Printf("[Evolution] 经验提炼完成, 当前共 %d 条经验", len(ee.experiences))
 }
 
-// LearnFromStage 单阶段增量学习 (阶段完成后立即调用, 不等团队结束)。
-// 使用启发式快速提炼, 减少 LLM 延迟对后续阶段的影响。
+// LearnFromStage 单阶段增量学习 (双向: 成功+失败都提炼, 参考 MiniMax M2.7)。
 func (ee *EvolutionEngine) LearnFromStage(traj Trajectory) {
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
 
 	if traj.Error != "" && !traj.Success {
+		// 失败学习: 根因+错误模式+修复方向
 		content := fmt.Sprintf("[%s] 执行「%s」失败: %s → 建议: 检查参数和前置依赖",
 			traj.Role, truncateResult(traj.Objective, 80), truncateResult(traj.Error, 150))
 		if !ee.isDuplicate(content) {
@@ -193,12 +193,58 @@ func (ee *EvolutionEngine) LearnFromStage(traj Trajectory) {
 				Content:   content,
 				Quality:   0.4,
 				Source:    traj.TeamName + "/" + traj.StageName,
-				Tags:      []string{traj.Role, "incremental"},
+				Tags:      []string{traj.Role, "incremental", "failure"},
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			})
+		}
+	} else if traj.Success && traj.Output != "" && len(traj.Output) > 100 {
+		// 成功学习 (参考 MiniMax M2.7 self-evolution): 提炼 what-worked
+		content := ee.distillSuccessHeuristic(traj)
+		if content != "" && !ee.isDuplicate(content) {
+			ee.nextID++
+			ee.experiences = append(ee.experiences, &Experience{
+				ID:        fmt.Sprintf("exp-suc-%d-%d", time.Now().Unix(), ee.nextID),
+				Category:  "role",
+				Role:      traj.Role,
+				Content:   content,
+				Quality:   0.6,
+				Source:    traj.TeamName + "/" + traj.StageName,
+				Tags:      []string{traj.Role, "incremental", "success"},
 				CreatedAt: time.Now(),
 				UpdatedAt: time.Now(),
 			})
 		}
 	}
+}
+
+// distillSuccessHeuristic 从成功执行中启发式提炼经验。
+func (ee *EvolutionEngine) distillSuccessHeuristic(traj Trajectory) string {
+	output := traj.Output
+	if len(output) > 500 {
+		output = output[:500]
+	}
+	// 提取关键模式: 文件创建/修改, 技术决策, 测试覆盖
+	var patterns []string
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		isPattern := strings.Contains(line, "func ") || strings.Contains(line, "type ") ||
+			strings.Contains(line, "interface") || strings.Contains(line, "package ") ||
+			strings.Contains(line, "决策") || strings.Contains(line, "选择") ||
+			strings.Contains(line, "方案") || strings.Contains(line, "设计")
+		if isPattern && len(line) > 10 && len(line) < 200 {
+			patterns = append(patterns, line)
+			if len(patterns) >= 3 {
+				break
+			}
+		}
+	}
+	if len(patterns) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[%s] 成功执行「%s」— 关键模式: %s",
+		traj.Role, truncateResult(traj.Objective, 60), strings.Join(patterns, "; "))
 }
 
 func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, teamName string) {

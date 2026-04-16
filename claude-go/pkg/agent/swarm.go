@@ -541,6 +541,11 @@ func (s *SwarmOrchestrator) executeSubTask(
 		}
 	}
 
+	// 防伪并行检查 (参考 Kimi K2.5 PARL: 要求非平凡 artifact)
+	if !IsNonTrivialArtifact(result, task.Role) {
+		s.notify(s.chatID, fmt.Sprintf("⚠️ 子任务 %s 产出可能是伪并行 (无实质 artifact)", task.ID))
+	}
+
 	return StageResult{
 		Name: task.ID, Role: task.Role, Status: TaskCompleted,
 		Output: result, V2TaskID: v2ID, StartedAt: start,
@@ -563,7 +568,7 @@ func (s *SwarmOrchestrator) merge(ctx context.Context, results []StageResult, ob
 		}
 	}
 
-	sysPrompt := `你是结果综合专家。将多个子任务的结果汇总为一份连贯、完整的最终报告。
+	sysPrompt := `你是结果综合专家 (参考 Kimi K2.5 反思聚合)。将多个子任务的结果汇总为一份连贯、完整的最终报告。
 
 ## 报告结构 (必须包含)
 1. **执行摘要** — 3-5 条关键发现
@@ -571,14 +576,19 @@ func (s *SwarmOrchestrator) merge(ctx context.Context, results []StageResult, ob
 3. **量化指标汇总表** — 如果子任务中有量化数据，必须汇总为表格
    | 指标 | 值 | 来源 | 备注 |
    |------|----|------|------|
-4. **矛盾点分析** — 指出各子任务间的数据分歧和结论矛盾
-5. **结论与建议** — 分优先级的可操作建议
-6. **附录** — 各子任务耗时统计
+4. **跨 worker 共识裁决** (重要!):
+   - 如果不同 worker 对同一问题给出了不同结论, 必须明确指出分歧
+   - 对分歧进行裁决: 基于证据强度选择胜出方, 并说明理由
+   - 如果无法裁决, 标注 "需人工确认"
+5. **矛盾点分析** — 指出各子任务间的数据分歧和结论矛盾
+6. **结论与建议** — 分优先级的可操作建议
+7. **附录** — 各子任务耗时统计 + 产出有效性评估
 
 ## 要求
 - 结构化 Markdown 输出
 - 不要遗漏任何子任务的关键产出
-- 如果子任务产出了代码或文件，明确列出文件路径`
+- 如果子任务产出了代码或文件，明确列出文件路径
+- 对空洞/重复/伪并行的产出标注警告`
 
 	return s.llm.SimpleComplete(ctx, sysPrompt, sb.String())
 }
@@ -604,4 +614,30 @@ func (s *SwarmOrchestrator) formatPlan(plan *DecompositionPlan) string {
 		sb.WriteString(fmt.Sprintf("  %d. [%s] %s%s\n", i+1, t.Role, t.Description, deps))
 	}
 	return sb.String()
+}
+
+// isNonTrivialArtifact 检查产出是否为非平凡 artifact (参考 Kimi K2.5 PARL 防伪并行)。
+// 防止 worker 产出仅是声明性文本而无实质内容。
+func IsNonTrivialArtifact(output, role string) bool {
+	if len(output) < 100 {
+		return false
+	}
+	hasCoder := strings.Contains(role, "coder") || strings.Contains(role, "implement")
+	if hasCoder {
+		return strings.Contains(output, "func ") || strings.Contains(output, "package ") ||
+			strings.Contains(output, "import ") || strings.Contains(output, "class ") ||
+			strings.Contains(output, "def ") || strings.Contains(output, "const ")
+	}
+	hasReviewer := strings.Contains(role, "review")
+	if hasReviewer {
+		return strings.Contains(output, "PASS") || strings.Contains(output, "FAIL") ||
+			strings.Contains(output, "评分") || strings.Contains(output, "score") ||
+			strings.Contains(output, "|") // 表格
+	}
+	hasTester := strings.Contains(role, "test")
+	if hasTester {
+		return strings.Contains(output, "Test") || strings.Contains(output, "test") ||
+			strings.Contains(output, "assert") || strings.Contains(output, "PASS")
+	}
+	return len(output) > 200
 }

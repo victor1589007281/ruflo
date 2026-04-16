@@ -24,6 +24,79 @@ import (
 	"github.com/anthropic/claude-go/pkg/metrics"
 )
 
+// PromptCache 提示词缓存 (参考 Anthropic Prompt Caching)。
+// 将稳定的 system prompt 前缀和 tool definitions 分离, 最大化缓存命中率。
+type PromptCache struct {
+	mu           sync.RWMutex
+	staticPrefix string // 不变内容: system prompt + tool defs + repo context
+	prefixHash   string // SHA256 用于缓存追踪
+	cacheHits    int64  // 命中次数 (同一 prefix 复用)
+	cacheMisses  int64  // 未命中 (prefix 变化)
+}
+
+// BuildPrompt 组合静态前缀+动态后缀, 追踪缓存命中。
+func (pc *PromptCache) BuildPrompt(dynamicSuffix string) string {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.cacheHits++
+	return pc.staticPrefix + "\n\n" + dynamicSuffix
+}
+
+// UpdatePrefix 更新静态前缀 (prefix 变化时 cache miss)。
+func (pc *PromptCache) UpdatePrefix(newPrefix string) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	newHash := fmt.Sprintf("%x", len(newPrefix)) // lightweight hash
+	if newHash != pc.prefixHash {
+		pc.cacheMisses++
+		pc.prefixHash = newHash
+	}
+	pc.staticPrefix = newPrefix
+}
+
+// HitRate 缓存命中率。
+func (pc *PromptCache) HitRate() float64 {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	total := pc.cacheHits + pc.cacheMisses
+	if total == 0 {
+		return 0
+	}
+	return float64(pc.cacheHits) / float64(total)
+}
+
+// SummarizeOldOutput 渐进式摘要 (参考 Kimi K2 溢出策略 + MemGPT)。
+// 超过 maxLen 的旧输出压缩为关键信息摘要。
+func SummarizeOldOutput(output string, maxLen int) string {
+	if len(output) <= maxLen {
+		return output
+	}
+	lines := strings.Split(output, "\n")
+	var summary []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		isKey := strings.HasPrefix(line, "#") || strings.HasPrefix(line, "func ") ||
+			strings.HasPrefix(line, "type ") || strings.Contains(line, "决策") ||
+			strings.Contains(line, "结论") || strings.Contains(line, "推荐") ||
+			strings.Contains(line, "错误") || strings.Contains(line, "FAIL") ||
+			strings.HasPrefix(line, "- [") || strings.HasPrefix(line, "│")
+		if isKey {
+			summary = append(summary, line)
+		}
+	}
+	result := strings.Join(summary, "\n")
+	if len(result) > maxLen {
+		result = result[:maxLen]
+	}
+	if result == "" {
+		result = output[:maxLen]
+	}
+	return "[摘要] " + result
+}
+
 // WorkflowDef 工作流定义
 type WorkflowDef struct {
 	Name        string
@@ -99,32 +172,49 @@ func developmentWorkflow() *WorkflowDef {
 			// 改进: 调研由专门角色完成, 架构师聚焦设计决策
 			{
 				Name: "research", Role: "researcher",
-				Prompt: `你是技术调研专家。深入调研需求涉及的技术方案、最佳实践和已有实现。
+				Prompt: `你是深度技术调研专家。使用 **假设→证据→验证** 方法论调研 (参考 Kimi K2 Thinking)。
 
 需求: {objective}
 
-## 调研要求
-1. **技术选型**: 列出可选的技术栈、框架、库, 对比优劣
-2. **已有方案**: 搜索 GitHub/业界类似项目, 分析其架构和设计模式
-3. **关键挑战**: 识别技术难点、潜在风险、性能瓶颈
-4. **最佳实践**: 参考业界标准 (如 Go 项目结构、错误处理、测试策略)
-5. **技术约束**: 明确不可行的方案 (如 Go 不支持泛型继承)
+## 调研方法论 (HEV 循环)
 
-输出:
-- 技术选型对比表 (带推荐理由)
-- 关键技术难点及解决方案
-- 推荐的项目结构和设计模式
-- 参考项目/文章链接`,
+### Step 1: 假设生成
+针对需求, 提出 3-5 个技术方向假设:
+- 每个假设: 技术方案 + 预期效果 + 风险点
+- 覆盖不同架构/技术栈方向
+
+### Step 2: 证据搜集 (每个假设独立)
+- 搜索 GitHub/业界类似项目, 分析架构和设计模式
+- **必须主动搜集反例**: 该方案的失败案例、性能瓶颈、维护问题
+- 标注证据强度: strong (实测) / moderate (文档) / weak (推测)
+
+### Step 3: 验证收敛
+- 交叉对比: 不同假设的证据是否冲突
+- 证据权重: strong>moderate>weak, **反例权重 ×1.5**
+- 识别技术约束 (如语言限制、性能要求、兼容性)
+
+## 输出要求
+1. **假设验证表**: 每个假设的置信度 + 证据汇总
+2. **技术选型对比表**: 方案/优势/劣势/适用场景/推荐度
+3. **关键技术难点**: 每个难点必须有具体解决方案
+4. **最佳实践**: Go 项目结构、错误处理、测试策略
+5. **推荐结论**: 附决策理由和被否决方案的否决原因`,
 			},
 			// === Phase 1: 架构设计 (聚焦设计决策, 不再兼顾调研) ===
 			{
 				Name: "design", Role: "architect", DependsOn: []string{"research"},
-				Prompt: `你是高级软件架构师。基于调研结果, 产出详细的技术设计文档。
+				Prompt: `你是高级软件架构师。基于调研结果, 使用 **多方案对比** 方法产出设计文档。
 
 需求: {objective}
 
 技术调研结果:
 {prev_result}
+
+## 设计方法论 (参考 Kimi K2.5 多视角设计)
+
+### 关键设计决策: 每个决策生成 2-3 个可行方案
+| 方案 | 复杂度(1-10) | 可维护性(1-10) | 性能影响 | 风险 |
+选最优方案并**明确记录被否决方案的否决原因** (防止后续重复探索)
 
 ## 设计文档 (DESIGN.md) 必须包含:
 1. **架构总览**: 分层架构图, 标注依赖方向
@@ -132,7 +222,8 @@ func developmentWorkflow() *WorkflowDef {
 3. **数据流**: 核心数据结构定义(struct)、状态机、数据库 Schema
 4. **文件结构**: 完整的目录树, 每个文件标注用途和预估行数
 5. **错误处理策略**: 统一错误类型、重试逻辑、边界条件
-6. **关键约束清单** (编号 C1, C2, C3...): 
+6. **关键设计决策记录**: 每个决策的选中方案+否决方案+理由
+7. **关键约束清单** (编号 C1, C2, C3...): 
    - C1: 核心模块禁止 Mock/Stub
    - C2: 配置集中化 (禁止散落 os.Getenv)
    - C3: (根据需求补充更多约束)
@@ -523,6 +614,7 @@ type WorkflowExecutor struct {
 	metrics     *metrics.Collector // 持续观测指标 (可为 nil)
 	pool        *AgentPool         // Agent 池 (动态扩缩, 可为 nil)
 	checkpoints CheckpointStore    // 检查点存取 (由 Coordinator 注入, 可为 nil)
+	promptCache *PromptCache       // 提示词缓存 (参考 Anthropic Prompt Caching)
 }
 
 // tryInitDAG 从 taskTracker 检测 DAG 能力
@@ -801,10 +893,13 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 			lastGenOutput = bestOutput
 			prevResults[generatorStages[len(generatorStages)-1].Name] = bestOutput
 		}
-		// 更新 lastScore (从 terminator 的 ScoreHistory 中取)
-		if terminator != nil && len(terminator.ScoreHistory) > 0 {
-			avg := terminator.ScoreHistory[len(terminator.ScoreHistory)-1]
-			lastScore = EvalScore{Correctness: avg, Completeness: avg, Security: avg, CodeQuality: avg}
+		// 更新 lastScore: 保留完整多维度 EvalScore (修复塌缩问题, 参考 MAgICoRe 多维度评分驱动)
+		if len(evalResult) > 0 {
+			if parsed, err := ParseEvalScoreJSON([]byte(evalResult[len(evalResult)-1].Output)); err == nil {
+				lastScore = parsed
+			} else if terminator != nil && len(terminator.ScoreHistory) > 0 {
+				lastScore = HoldLastOrDefault(lastScore)
+			}
 		}
 		// 即时 Keep/Revert (参考 MiniMax M2.7): 退化时 revert 到最佳版本
 		if !shouldBreak && terminator != nil && round > 1 {

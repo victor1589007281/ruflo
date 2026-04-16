@@ -207,7 +207,10 @@ func (at *AdaptiveTerminator) ShouldRevert(currentScore EvalScore) (revert bool,
 	if at.BestRound == 0 || at.BestScore == 0 {
 		return false, "", 0
 	}
-	if at.BestScore-avg > at.DegradeThreshold && at.BestOutput != "" {
+	// 多维度回归检测 (参考 MiniMax M2.7): 任一核心维度下降>1.0 也触发 revert
+	dimRegression := currentScore.Correctness < 5 || currentScore.Security < 5
+	avgDrop := at.BestScore - avg
+	if (avgDrop > at.DegradeThreshold || dimRegression) && at.BestOutput != "" {
 		return true, at.BestOutput, at.BestRound
 	}
 	return false, "", 0

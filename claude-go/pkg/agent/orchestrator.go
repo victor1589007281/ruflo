@@ -791,17 +791,30 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		// === Step 4: AdaptiveTerminator 决定继续/停止 ===
 		decision := terminator.ShouldTerminate(round, score)
 
-		// 阶梯式策略转换 (参考 GLM 5.1): converged 时不退出, 注入策略转换 prompt
+		// 阶梯式策略转换 (参考 GLM 5.1): converged 时按瓶颈类型注入针对性策略
 		if decision.StrategyShift {
 			o.notify(o.chatID, fmt.Sprintf("🔀 %s 改进饱和, 触发策略转换 (第 %d 次, 最多 %d 次)",
 				node.Title, terminator.StrategyShiftCount, terminator.MaxStrategyShifts))
+			// 根据瓶颈类型生成针对性策略转换 prompt (精准复刻 GLM 5.1 benchmark-driven)
+			shiftAdvice := "换一种完全不同的实现思路"
+			for bnType, count := range bottleneckCounts {
+				if count >= 2 {
+					switch bnType {
+					case "compilation":
+						shiftAdvice = "编译持续失败: 简化实现, 减少依赖, 分步构建确保每步可编译"
+					case "design_drift":
+						shiftAdvice = "设计偏差持续: 重新阅读设计文档, 先对齐接口签名再实现逻辑"
+					case "constraint":
+						shiftAdvice = "约束违反持续: 列出所有约束, 逐条检查当前实现是否满足"
+					case "logic":
+						shiftAdvice = "逻辑错误持续: 增加单元测试驱动开发, 先写测试再写实现"
+					}
+					break
+				}
+			}
 			lastFeedback = fmt.Sprintf("⚠️ **策略转换要求** (第 %d 次):\n"+
-				"当前修补方式已饱和 (连续改进 < %.1f), 请从架构层面重新思考:\n"+
-				"1. 换一种完全不同的实现思路\n"+
-				"2. 重新分析问题本质, 不要在现有方案上微调\n"+
-				"3. 参考 reviewer 反馈中反复出现的问题, 可能是根本方向有误\n\n"+
-				"之前的反馈:\n%s",
-				terminator.StrategyShiftCount, terminator.ConvergeEpsilon, lastFeedback)
+				"当前修补方式已饱和, **必须**:\n%s\n\n之前的反馈:\n%s",
+				terminator.StrategyShiftCount, shiftAdvice, lastFeedback)
 			// 不 break, 继续下一轮
 		} else if decision.ShouldStop {
 			if decision.BestOutput != "" {
@@ -833,11 +846,16 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			lastFeedback = "上一轮未通过硬门槛，请全面改进。"
 		}
 
-		// 记录结构化短期记忆 (参考 MiniMax M2.7)
+		// 记录结构化短期记忆 (参考 MiniMax M2.7, 精准复刻: Approach 赋值)
 		kept := !(revertOccurred)
+		approach := truncateResult(lastOutput, 200)
+		if idx := strings.Index(approach, "\n"); idx > 0 && idx < 150 {
+			approach = approach[:idx]
+		}
 		iterMemory = append(iterMemory, IterationMemory{
-			Round: round, Score: score, KeyIssues: ExtractKeyIssues(score.Feedback),
-			TestPass: node.TestPassed, Kept: kept,
+			Round: round, Approach: approach, Score: score,
+			KeyIssues: ExtractKeyIssues(score.Feedback),
+			TestPass:  node.TestPassed, Kept: kept,
 		})
 
 		o.notify(o.chatID, fmt.Sprintf("🔄 %s 继续对抗 (第 %d/%d 轮)...",

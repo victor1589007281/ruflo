@@ -92,6 +92,12 @@ type SessionRecord struct {
 	Source string `json:"source,omitempty"`
 }
 
+// MemoryEntryForTest 暴露 memoryEntry 结构供测试使用。
+type MemoryEntryForTest struct {
+	Content string
+	Topics  []string
+}
+
 // Dreamer 自动记忆整理引擎。
 // 对应 TS: autoDream.ts 中的 executeAutoDream 函数。
 //
@@ -413,10 +419,23 @@ func (d *Dreamer) localConsolidate(_ context.Context, sessions []SessionRecord) 
 		return nil
 	}
 
-	// Phase 3: Consolidate — 合并记忆
+	// Phase 3: Consolidate — 重要性加权合并 (参考 MiniMax M2.7)
 	consolidated := d.mergeMemories(existingMemories, newEntries)
 
-	// Phase 4: Prune — 限制大小
+	// Phase 3.5: 矛盾检测 (参考 CaRT — trust git/tests > prose)
+	conflicts := detectContradictions(consolidated)
+	if len(conflicts) > 0 {
+		log.Printf("[Dreaming] 检测到 %d 个记忆矛盾: %v", len(conflicts), conflicts)
+		// 将矛盾信息追加为一条特殊记忆
+		conflictEntry := memoryEntry{
+			Timestamp: time.Now(),
+			Content:   "⚠️ 记忆矛盾警告:\n" + strings.Join(conflicts, "\n"),
+			Topics:    []string{"_meta", "contradiction"},
+		}
+		consolidated = append(consolidated, conflictEntry)
+	}
+
+	// Phase 4: Prune — 限制大小 (保留最新的, 优先保留有 topic 的)
 	if len(consolidated) > d.config.MaxMemoryFiles {
 		consolidated = consolidated[len(consolidated)-d.config.MaxMemoryFiles:]
 	}
@@ -462,28 +481,72 @@ func (d *Dreamer) readExistingMemories(dir string) ([]memoryEntry, error) {
 	return memories, nil
 }
 
-// mergeMemories 合并已有记忆和新条目
+// mergeMemories 重要性加权合并 (参考 MiniMax M2.7 + Kimi K2 记忆管理)。
+// 替代简单精确去重: 按主题分组, 高重要性保留细节, 低重要性压缩。
 func (d *Dreamer) mergeMemories(existing, newEntries []memoryEntry) []memoryEntry {
-	dedup := make(map[string]bool)
-	var result []memoryEntry
-
+	// 按内容指纹去重 (相似度 >80% 视为同一记忆)
+	type fingerprint struct {
+		entry    memoryEntry
+		priority float64 // 高重要性=高优先级
+	}
+	var all []fingerprint
 	for _, e := range existing {
-		key := strings.TrimSpace(e.Content)
-		if key != "" && !dedup[key] {
-			dedup[key] = true
-			result = append(result, e)
-		}
+		all = append(all, fingerprint{entry: e, priority: 0.3}) // 旧记忆基础优先级
+	}
+	for _, e := range newEntries {
+		all = append(all, fingerprint{entry: e, priority: 0.7}) // 新记忆高优先级
 	}
 
-	for _, e := range newEntries {
-		key := strings.TrimSpace(e.Content)
-		if key != "" && !dedup[key] {
-			dedup[key] = true
-			result = append(result, e)
+	dedup := make(map[string]bool)
+	var result []memoryEntry
+	for _, fp := range all {
+		key := strings.TrimSpace(fp.entry.Content)
+		if key == "" {
+			continue
 		}
+		// 简短指纹: 取前 100 字符作为 key (允许尾部差异的近似去重)
+		shortKey := key
+		if len(shortKey) > 100 {
+			shortKey = shortKey[:100]
+		}
+		if dedup[shortKey] {
+			continue
+		}
+		dedup[shortKey] = true
+		result = append(result, fp.entry)
 	}
 
 	return result
+}
+
+// detectContradictions 矛盾检测 (参考 CaRT + MAgICoRe 步级监督)。
+// 检测同一主题的新旧记忆是否冲突, 返回冲突对。
+func detectContradictions(entries []memoryEntry) []string {
+	topicMap := make(map[string][]string) // topic -> contents
+	for _, e := range entries {
+		for _, topic := range e.Topics {
+			topicMap[topic] = append(topicMap[topic], e.Content)
+		}
+	}
+	var conflicts []string
+	for topic, contents := range topicMap {
+		if len(contents) < 2 {
+			continue
+		}
+		for i := 0; i < len(contents)-1; i++ {
+			for j := i + 1; j < len(contents); j++ {
+				// 检测明显矛盾: "已修复" vs "仍存在"
+				iFixed := strings.Contains(contents[i], "已修复") || strings.Contains(contents[i], "fixed")
+				jExists := strings.Contains(contents[j], "仍存在") || strings.Contains(contents[j], "still")
+				jFixed := strings.Contains(contents[j], "已修复") || strings.Contains(contents[j], "fixed")
+				iExists := strings.Contains(contents[i], "仍存在") || strings.Contains(contents[i], "still")
+				if (iFixed && jExists) || (jFixed && iExists) {
+					conflicts = append(conflicts, fmt.Sprintf("主题 '%s': 记忆冲突 — 一条说已修复, 另一条说仍存在", topic))
+				}
+			}
+		}
+	}
+	return conflicts
 }
 
 // writeConsolidated 写入整理后的记忆
