@@ -66,11 +66,75 @@ func (e EvalScore) AvgScore() float64 {
 	return sum / count
 }
 
+// IterationMemory 结构化短期记忆 (参考 MiniMax M2.7 self-evolution)。
+// 记录每轮迭代的方法、评分、关键问题, 供下轮 prompt 注入, 消除重复犯错。
+type IterationMemory struct {
+	Round     int       `json:"round"`
+	Approach  string    `json:"approach"`   // coder 采用的方法摘要
+	Score     EvalScore `json:"score"`      // 该轮评分
+	KeyIssues []string  `json:"key_issues"` // reviewer 指出的关键问题
+	TestPass  bool      `json:"test_pass"`
+	Kept      bool      `json:"kept"` // 此轮结果是否被保留 (keep/revert)
+}
+
+// FormatMemoryChain 将多轮迭代记忆格式化为 prompt 注入文本。
+func FormatMemoryChain(memories []IterationMemory) string {
+	if len(memories) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("### 📋 历史迭代记忆 (避免重复犯错):\n")
+	for _, m := range memories {
+		status := "✅kept"
+		if !m.Kept {
+			status = "⏪reverted"
+		}
+		b.WriteString(fmt.Sprintf("- **第 %d 轮** [%s] 平均分=%.1f test=%v\n",
+			m.Round, status, m.Score.AvgScore(), m.TestPass))
+		if m.Approach != "" {
+			b.WriteString(fmt.Sprintf("  方法: %s\n", m.Approach))
+		}
+		for _, issue := range m.KeyIssues {
+			b.WriteString(fmt.Sprintf("  ❌ %s\n", issue))
+		}
+	}
+	return b.String()
+}
+
+// ExtractKeyIssues 从 reviewer feedback 中提取关键问题 (最多 5 条)。
+func ExtractKeyIssues(feedback string) []string {
+	if feedback == "" {
+		return nil
+	}
+	lines := strings.Split(feedback, "\n")
+	var issues []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		isIssue := strings.HasPrefix(line, "-") || strings.HasPrefix(line, "•") ||
+			strings.HasPrefix(line, "*") || strings.Contains(line, "FAIL") ||
+			strings.Contains(line, "问题") || strings.Contains(line, "缺") ||
+			strings.Contains(line, "missing") || strings.Contains(line, "error") ||
+			strings.Contains(line, "不") || strings.Contains(line, "未")
+		if isIssue && len(line) > 5 && len(line) < 200 {
+			line = strings.TrimLeft(line, "-•* ")
+			issues = append(issues, line)
+			if len(issues) >= 5 {
+				break
+			}
+		}
+	}
+	return issues
+}
+
 // AdaptiveTerminator 自适应对抗终止器。
 // 参考:
 //   - MAgICoRe (EMNLP 2025): 外部 reward model 评分驱动的自适应迭代
 //   - CaRT (2025): 反事实轨迹对比, 教模型判断"何时够了"
 //   - MiCP (2025): 多轮推理的置信度预测 + 覆盖率保证
+//   - MiniMax M2.7: 短期记忆 + 失败轨迹分析 + 阶梯策略转换
 //
 // 核心策略: 跟踪评分趋势, 检测收敛/震荡/退化, 动态决定继续或停止。
 type AdaptiveTerminator struct {
@@ -88,6 +152,10 @@ type AdaptiveTerminator struct {
 	BestScore  float64 // 历史最高平均分
 	BestRound  int     // 最高分对应的轮数
 	BestOutput string  // 最高分对应的产出
+
+	// 阶梯式策略转换 (参考 GLM 5.1 staircase optimization)
+	StrategyShiftCount int // 已执行的策略转换次数
+	MaxStrategyShifts  int // 最大策略转换次数 (默认 2)
 }
 
 // NewAdaptiveTerminator 创建自适应终止器。
@@ -100,22 +168,24 @@ func NewAdaptiveTerminator(minRounds, maxRounds int) *AdaptiveTerminator {
 		maxRounds = 5
 	}
 	return &AdaptiveTerminator{
-		MinRounds:        minRounds,
-		MaxRounds:        maxRounds,
-		PassThreshold:    hardPassMinScore,
-		ConvergeEpsilon:  0.5,
-		DegradeThreshold: 0.3, // 分数下降 ≤0.3 视为噪声波动, 不计退化
+		MinRounds:         minRounds,
+		MaxRounds:         maxRounds,
+		PassThreshold:     hardPassMinScore,
+		ConvergeEpsilon:   0.5,
+		DegradeThreshold:  0.3,
+		MaxStrategyShifts: 2,
 	}
 }
 
 // TerminationDecision 终止决策
 type TerminationDecision struct {
-	ShouldStop bool
-	Reason     string
-	RoundsUsed int
-	MaxRounds  int
-	BestOutput string // 非空时表示应使用此输出 (best-of-N 回滚)
-	BestRound  int    // 最高分对应的轮数
+	ShouldStop    bool
+	Reason        string
+	RoundsUsed    int
+	MaxRounds     int
+	BestOutput    string // 非空时表示应使用此输出 (best-of-N 回滚)
+	BestRound     int    // 最高分对应的轮数
+	StrategyShift bool   // true = 不终止, 而是触发策略转换 (参考 GLM 5.1)
 }
 
 // RecordRoundOutput 记录每轮的评分和产出, 用于 best-of-N 回滚。
@@ -127,6 +197,20 @@ func (at *AdaptiveTerminator) RecordRoundOutput(round int, score EvalScore, outp
 		at.BestRound = round
 		at.BestOutput = output
 	}
+}
+
+// ShouldRevert 每轮即时 keep/revert 决策 (参考 MiniMax M2.7)。
+// 当本轮评分相比历史最高分下降超过 DegradeThreshold 时, 返回 true + 最佳输出。
+// 调用方应将 coder 下一轮的基础从 lastOutput 切换为 BestOutput。
+func (at *AdaptiveTerminator) ShouldRevert(currentScore EvalScore) (revert bool, bestOutput string, bestRound int) {
+	avg := currentScore.AvgScore()
+	if at.BestRound == 0 || at.BestScore == 0 {
+		return false, "", 0
+	}
+	if at.BestScore-avg > at.DegradeThreshold && at.BestOutput != "" {
+		return true, at.BestOutput, at.BestRound
+	}
+	return false, "", 0
 }
 
 // ShouldTerminate 根据当前轮评分决定是否终止。
@@ -179,10 +263,15 @@ func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) Termin
 		return d
 	}
 
-	// 5. 收敛/震荡检测 (改进已饱和)
+	// 5. 收敛/震荡检测 → 策略转换 or 退出 (参考 GLM 5.1 staircase)
 	if n >= 2 {
 		delta := at.ScoreHistory[n-1] - at.ScoreHistory[n-2]
 		if delta >= 0 && delta < at.ConvergeEpsilon {
+			if at.StrategyShiftCount < at.MaxStrategyShifts {
+				at.StrategyShiftCount++
+				return TerminationDecision{ShouldStop: false, Reason: "strategy_shift",
+					RoundsUsed: round, MaxRounds: at.MaxRounds, StrategyShift: true}
+			}
 			return TerminationDecision{ShouldStop: true, Reason: "converged", RoundsUsed: round, MaxRounds: at.MaxRounds}
 		}
 	}

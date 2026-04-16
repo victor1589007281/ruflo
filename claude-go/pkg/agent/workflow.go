@@ -806,6 +806,14 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 			avg := terminator.ScoreHistory[len(terminator.ScoreHistory)-1]
 			lastScore = EvalScore{Correctness: avg, Completeness: avg, Security: avg, CodeQuality: avg}
 		}
+		// 即时 Keep/Revert (参考 MiniMax M2.7): 退化时 revert 到最佳版本
+		if !shouldBreak && terminator != nil && round > 1 {
+			if revert, bo, br := terminator.ShouldRevert(lastScore); revert {
+				we.notify(we.chatID, fmt.Sprintf("⏪ 第 %d 轮退化, revert 到第 %d 轮最佳版本", round, br))
+				lastGenOutput = bo
+				prevResults[generatorStages[len(generatorStages)-1].Name] = bo
+			}
+		}
 		if shouldBreak {
 			break
 		}
@@ -954,6 +962,15 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 	if terminator != nil {
 		terminator.RecordRoundOutput(round, score, lastGenOutput)
 		decision := terminator.ShouldTerminate(round, score)
+		if decision.StrategyShift {
+			we.notify(we.chatID, fmt.Sprintf("🔀 策略转换 (第 %d 次): 当前修补已饱和, 注入结构性变更提示",
+				terminator.StrategyShiftCount))
+			*lastEvalFeedback = fmt.Sprintf("⚠️ **策略转换要求** (第 %d 次):\n"+
+				"当前修补方式已饱和, 请从架构层面重新思考:\n"+
+				"1. 换一种完全不同的实现思路\n2. 重新分析问题本质\n3. 不要在现有方案上微调\n\n"+
+				"之前的反馈:\n%s", terminator.StrategyShiftCount, *lastEvalFeedback)
+			return results, false, ""
+		}
 		if decision.ShouldStop {
 			reasonCN := map[string]string{
 				"quality_pass": "质量达标", "max_rounds": "达到最大轮数",

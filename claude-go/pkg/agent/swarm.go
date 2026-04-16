@@ -106,22 +106,61 @@ func (s *SwarmOrchestrator) Execute(ctx context.Context, team *ProductionTeam, o
 
 	var allResults []StageResult
 	resultMap := make(map[string]string)
+	var prevFinishRate float64 = 1.0
 
 	for levelIdx, level := range levels {
 		if ctx.Err() != nil {
 			return allResults, ctx.Err()
 		}
 
-		s.notify(s.chatID, fmt.Sprintf("🔄 执行第 %d/%d 层 (%d 个子任务并行)...",
-			levelIdx+1, len(levels), len(level)))
+		// 动态并行度 (参考 Kimi K2.5 PARL): 前层完成率低时降低并行度
+		effectiveLevel := level
+		if prevFinishRate < 0.5 && len(level) > 1 {
+			half := (len(level) + 1) / 2
+			effectiveLevel = level[:half]
+			s.notify(s.chatID, fmt.Sprintf("📉 前层完成率 %.0f%%, 降低并行度: %d → %d",
+				prevFinishRate*100, len(level), len(effectiveLevel)))
+		}
 
-		levelResults := s.executeLevel(ctx, level, objective, resultMap, team)
+		s.notify(s.chatID, fmt.Sprintf("🔄 执行第 %d/%d 层 (%d 个子任务并行)...",
+			levelIdx+1, len(levels), len(effectiveLevel)))
+
+		levelResults := s.executeLevel(ctx, effectiveLevel, objective, resultMap, team)
+
+		// 完成率评估 (参考 Kimi K2.5 PARL finish rate)
+		completed, valid := 0, 0
 		for _, sr := range levelResults {
 			allResults = append(allResults, sr)
 			if sr.Status == TaskCompleted {
+				completed++
 				resultMap[sr.Name] = sr.Output
+				if sr.Output != "" && len(sr.Output) > 50 {
+					valid++
+				}
 			} else {
 				s.notify(s.chatID, fmt.Sprintf("⚠️ 子任务 **%s** 失败: %s", sr.Name, sr.Error))
+			}
+		}
+		if len(levelResults) > 0 {
+			prevFinishRate = float64(completed) / float64(len(levelResults))
+		}
+		if team.Blackboard != nil {
+			team.Blackboard.Write(fmt.Sprintf("swarm-level%d-metrics", levelIdx),
+				fmt.Sprintf("完成=%d/%d 有效=%d 完成率=%.0f%%",
+					completed, len(levelResults), valid, prevFinishRate*100),
+				"orchestrator", "metric")
+		}
+
+		// 如果降低了并行度, 补充执行剩余任务
+		if len(effectiveLevel) < len(level) {
+			remaining := level[len(effectiveLevel):]
+			s.notify(s.chatID, fmt.Sprintf("🔄 补充执行剩余 %d 个子任务...", len(remaining)))
+			extraResults := s.executeLevel(ctx, remaining, objective, resultMap, team)
+			for _, sr := range extraResults {
+				allResults = append(allResults, sr)
+				if sr.Status == TaskCompleted {
+					resultMap[sr.Name] = sr.Output
+				}
 			}
 		}
 	}

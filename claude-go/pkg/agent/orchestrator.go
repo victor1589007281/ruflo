@@ -30,6 +30,49 @@ import (
 	"github.com/anthropic/claude-go/pkg/logging"
 )
 
+// Bottleneck micro-test 识别的瓶颈 (参考 GLM 5.1 benchmark-driven 优化)。
+type Bottleneck struct {
+	Type     string `json:"type"`     // "compilation", "logic", "design_drift", "constraint"
+	Severity string `json:"severity"` // "blocking", "degrading"
+	Detail   string `json:"detail"`
+}
+
+// ClassifyBottlenecks 从 micro-test 结果中分类瓶颈。
+// 按 "field: PASS/FAIL" 格式逐段匹配, 避免跨段误判。
+func ClassifyBottlenecks(testResult string) []Bottleneck {
+	if testResult == "" {
+		return nil
+	}
+	upper := strings.ToUpper(testResult)
+	segments := strings.Split(upper, "|")
+	var bns []Bottleneck
+	for _, seg := range segments {
+		seg = strings.TrimSpace(seg)
+		if !strings.Contains(seg, "FAIL") {
+			continue
+		}
+		switch {
+		case strings.Contains(seg, "编译") || strings.Contains(seg, "COMPIL"):
+			bns = append(bns, Bottleneck{Type: "compilation", Severity: "blocking", Detail: "编译/语法错误"})
+		case strings.Contains(seg, "对齐") || strings.Contains(seg, "ALIGN"):
+			bns = append(bns, Bottleneck{Type: "design_drift", Severity: "degrading", Detail: "接口/设计偏差"})
+		case strings.Contains(seg, "约束") || strings.Contains(seg, "CONSTRAINT"):
+			bns = append(bns, Bottleneck{Type: "constraint", Severity: "degrading", Detail: "约束违反"})
+		default:
+			bns = append(bns, Bottleneck{Type: "logic", Severity: "degrading", Detail: "逻辑/测试失败"})
+		}
+	}
+	return bns
+}
+
+// SubGoal 子目标 (参考 DeepSeek Prover-V2 子目标分解验证)。
+// 复杂 task 可分解为可独立验证的子步骤, 精确定位失败点。
+type SubGoal struct {
+	Description string `json:"description"`
+	Verifier    string `json:"verifier,omitempty"` // e.g. "go build", "go test -run XXX"
+	Passed      bool   `json:"passed"`
+}
+
 // TaskNode 编排器的任务元数据 (与 V2 TaskStore 中的 task ID 关联)
 type TaskNode struct {
 	V2TaskID       string   `json:"v2TaskId"`
@@ -39,6 +82,7 @@ type TaskNode struct {
 	ConstraintRefs []string `json:"constraintRefs"`
 	AcceptCriteria string   `json:"acceptCriteria"`
 	MaxRetries     int      `json:"maxRetries"`
+	SubGoals       []SubGoal `json:"subGoals,omitempty"` // 子目标 (DeepSeek 风格)
 
 	Output      string `json:"output"`
 	Error       string `json:"error"`
@@ -86,6 +130,7 @@ type rawTask struct {
 	constraintRefs []string
 	accept         string
 	priority       int
+	subGoals       []SubGoal
 }
 
 // NewOrchestrator 创建编排器 (需要 DAGTaskTracker, 不再自建 DAG)
@@ -231,6 +276,7 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 			ConstraintRefs: rt.constraintRefs,
 			AcceptCriteria: rt.accept,
 			MaxRetries:     o.config.MaxRetries,
+			SubGoals:       rt.subGoals,
 		}
 		nodes = append(nodes, node)
 		o.nodes[v2ID] = node
@@ -258,6 +304,7 @@ type wbsJSONTask struct {
 	Constraints []string `json:"constraints"`
 	Acceptance  string   `json:"acceptance"`
 	Priority    int      `json:"priority"`
+	SubGoals    []SubGoal `json:"subGoals,omitempty"` // 子目标分解 (DeepSeek 风格)
 }
 
 func stripCodeFences(s string) string {
@@ -299,6 +346,7 @@ func parseWBSFromJSON(planOutput string) []rawTask {
 			role: orchNormalizeRole(t.Role), depNums: deps,
 			designRef: t.DesignRef, constraintRefs: t.Constraints,
 			accept: t.Acceptance, priority: t.Priority,
+			subGoals: t.SubGoals,
 		})
 	}
 	return tasks
@@ -660,13 +708,16 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 	var lastOutput string
 	var lastFeedback string
 	var lastScore EvalScore
+	var iterMemory []IterationMemory
+	bottleneckCounts := make(map[string]int)
 
 	for round := 1; round <= terminator.MaxRounds; round++ {
 		// === Step 1: Coder 生成/修复 ===
 		prompt := o.buildTaskPrompt(node, objective)
 		if round > 1 && lastFeedback != "" {
-			prompt = fmt.Sprintf("%s\n\n### ⚠️ 第 %d 轮修复 (reviewer 反馈, 必须全部修复):\n%s\n\n### 上轮产出 (增量修改, 不要从零重写):\n%s",
-				prompt, round, lastFeedback, truncateResult(lastOutput, 12000))
+			memorySection := FormatMemoryChain(iterMemory)
+			prompt = fmt.Sprintf("%s\n\n%s\n### ⚠️ 第 %d 轮修复 (reviewer 反馈, 必须全部修复):\n%s\n\n### 上轮产出 (增量修改, 不要从零重写):\n%s",
+				prompt, memorySection, round, lastFeedback, truncateResult(lastOutput, 12000))
 		}
 
 		runner, err := o.factory(ctx, node.Role, "")
@@ -695,8 +746,21 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		score := o.runSkepticalReview(ctx, node, objective, lastScore)
 		lastScore = score
 
-		// === Step 3: Tester micro-test ===
+		// === Step 3: Tester micro-test + 瓶颈分类 (参考 GLM 5.1) ===
 		o.runMicroTest(ctx, node)
+		bottlenecks := ClassifyBottlenecks(node.TestResult)
+		if len(bottlenecks) > 0 {
+			// 追踪重复瓶颈: 同类型连续出现 → 注入到 feedback 中
+			for _, bn := range bottlenecks {
+				bnKey := bn.Type
+				prevCount := bottleneckCounts[bnKey]
+				bottleneckCounts[bnKey] = prevCount + 1
+				if bottleneckCounts[bnKey] >= 2 {
+					o.notify(o.chatID, fmt.Sprintf("🔴 %s 重复瓶颈: %s (连续 %d 轮)",
+						node.Title, bn.Detail, bottleneckCounts[bnKey]))
+				}
+			}
+		}
 
 		// 评分日志
 		scoreMsg := fmt.Sprintf("正确=%.0f 完整=%.0f 安全=%.0f 质量=%.0f",
@@ -713,11 +777,33 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				scoreMsg+fmt.Sprintf(" test:%v", node.TestPassed), "evaluator", "score")
 		}
 
-		// === Step 4: AdaptiveTerminator 决定继续/停止 ===
+		// === Step 3.5: 即时 Keep/Revert 决策 (参考 MiniMax M2.7) ===
 		terminator.RecordRoundOutput(round, score, lastOutput)
+		revertOccurred := false
+		if revert, bestOut, bestR := terminator.ShouldRevert(score); revert && round > 1 {
+			o.notify(o.chatID, fmt.Sprintf("⏪ %s 第 %d 轮退化, revert 到第 %d 轮最佳版本 (继续迭代)",
+				node.Title, round, bestR))
+			lastOutput = bestOut
+			node.Output = lastOutput
+			revertOccurred = true
+		}
+
+		// === Step 4: AdaptiveTerminator 决定继续/停止 ===
 		decision := terminator.ShouldTerminate(round, score)
-		if decision.ShouldStop {
-			// best-of-N 回滚: 退化/max_rounds 时使用历史最高分输出
+
+		// 阶梯式策略转换 (参考 GLM 5.1): converged 时不退出, 注入策略转换 prompt
+		if decision.StrategyShift {
+			o.notify(o.chatID, fmt.Sprintf("🔀 %s 改进饱和, 触发策略转换 (第 %d 次, 最多 %d 次)",
+				node.Title, terminator.StrategyShiftCount, terminator.MaxStrategyShifts))
+			lastFeedback = fmt.Sprintf("⚠️ **策略转换要求** (第 %d 次):\n"+
+				"当前修补方式已饱和 (连续改进 < %.1f), 请从架构层面重新思考:\n"+
+				"1. 换一种完全不同的实现思路\n"+
+				"2. 重新分析问题本质, 不要在现有方案上微调\n"+
+				"3. 参考 reviewer 反馈中反复出现的问题, 可能是根本方向有误\n\n"+
+				"之前的反馈:\n%s",
+				terminator.StrategyShiftCount, terminator.ConvergeEpsilon, lastFeedback)
+			// 不 break, 继续下一轮
+		} else if decision.ShouldStop {
 			if decision.BestOutput != "" {
 				lastOutput = decision.BestOutput
 				node.Output = lastOutput
@@ -746,6 +832,13 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		if lastFeedback == "" {
 			lastFeedback = "上一轮未通过硬门槛，请全面改进。"
 		}
+
+		// 记录结构化短期记忆 (参考 MiniMax M2.7)
+		kept := !(revertOccurred)
+		iterMemory = append(iterMemory, IterationMemory{
+			Round: round, Score: score, KeyIssues: ExtractKeyIssues(score.Feedback),
+			TestPass: node.TestPassed, Kept: kept,
+		})
 
 		o.notify(o.chatID, fmt.Sprintf("🔄 %s 继续对抗 (第 %d/%d 轮)...",
 			node.Title, round+1, terminator.MaxRounds))
@@ -935,6 +1028,20 @@ func (o *Orchestrator) runMicroTest(ctx context.Context, node *TaskNode) {
 	node.TestPassed = !strings.Contains(strings.ToUpper(result), "FAIL")
 	if !node.TestPassed {
 		node.DriftReport = orchExtractDriftInfo(result)
+	}
+
+	// 子目标逐个验证 (参考 DeepSeek Prover-V2)
+	if len(node.SubGoals) > 0 {
+		upper := strings.ToUpper(result)
+		for i := range node.SubGoals {
+			sg := &node.SubGoals[i]
+			sgKey := strings.ToUpper(sg.Description)
+			if strings.Contains(upper, sgKey) && strings.Contains(upper, "PASS") {
+				sg.Passed = true
+			} else if sg.Verifier != "" && strings.Contains(upper, strings.ToUpper(sg.Verifier)) && !strings.Contains(upper, "FAIL") {
+				sg.Passed = true
+			}
+		}
 	}
 }
 
