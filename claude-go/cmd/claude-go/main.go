@@ -33,6 +33,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/commands"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/settings"
+	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/mcp"
@@ -110,6 +111,12 @@ const fullHelpGuide = `Claude Code (Go) - AI 编程助手
   /wiki organize [inc]           全量/增量整理
   /wiki lint                     检查链接健康
   /wiki health                   LLM 健康检查
+
+群体智能预测 (Swarm Intelligence):
+  /predict <问题>                群体智能预测 (多Agent辩论+贝叶斯融合)
+    例: /predict AI Agent 2027年市场规模?
+  /simulate <场景> [--mode X]    场景模拟 (social/game/montecarlo)
+    例: /simulate 如果量子计算突破会怎样?
 `
 
 var (
@@ -256,11 +263,18 @@ func chatCmd() *cobra.Command {
 			cmdRegistry := commands.NewRegistry()
 			commands.RegisterBuiltins(cmdRegistry)
 
+			siCfg := swarmintel.DefaultConfig()
+			siCfg.Notify = func(_, msg string) {
+				fmt.Println(msg)
+			}
+			siEngine := swarmintel.NewEngine(eng.APIClient, siCfg)
+
 			shouldExit := false
 			cmdCtx := &commands.CommandContext{
 				Engine:       eng,
 				SessionStore: store,
 				History:      history,
+				SwarmIntel:   siEngine,
 				Cwd:          cwd,
 				OnClear: func() {
 					// 清空后可选: 创建新 session

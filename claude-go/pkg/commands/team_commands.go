@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/swarm_intel"
 )
 
 // RegisterTeamCommands 注册 /team, /go, /wiki 命令。
@@ -263,6 +265,188 @@ func RegisterTeamCommands(r *Registry) {
 
 			default:
 				fmt.Println("用法: /wiki [status|query|organize|lint|health]")
+			}
+			return nil
+		},
+	})
+
+	r.Register(&Command{
+		Name:        "predict",
+		ArgHint:     "<目标问题>",
+		Description: "群体智能预测 (Boids+辩论+贝叶斯融合)",
+		Type:        CommandTypeLocal,
+		Execute: func(args string, ctx *CommandContext) error {
+			if ctx.SwarmIntel == nil {
+				fmt.Println("[群体智能引擎未初始化]")
+				return nil
+			}
+			if strings.TrimSpace(args) == "" {
+				fmt.Println("用法: /predict <目标问题>")
+				fmt.Println("示例: /predict 2026年AI Agent市场规模将达到多少?")
+				fmt.Println("      /predict 下一代iPhone会采用哪些关键技术?")
+				return nil
+			}
+
+			fmt.Println("🧠 启动群体智能预测引擎...")
+			result, err := ctx.SwarmIntel.Predict(
+				context.Background(), "cli", strings.TrimSpace(args))
+			if err != nil {
+				fmt.Printf("[预测失败: %v]\n", err)
+				return nil
+			}
+
+			fmt.Println()
+			for _, o := range result.Outcomes {
+				barLen := int(o.Probability * 30)
+				bar := strings.Repeat("█", barLen) + strings.Repeat("░", 30-barLen)
+				fmt.Printf("  %-16s %s %.1f%%\n", o.Outcome, bar, o.Probability*100)
+				fmt.Printf("  %-16s 95%% CI: [%.1f%% ~ %.1f%%]\n", "", o.Lower95*100, o.Upper95*100)
+			}
+			fmt.Printf("\n  共识度: %.0f%% | 辩论: %d轮 | 分析师: %d\n",
+				result.Consensus*100, result.Rounds, len(result.Agents))
+			if result.Summary != "" {
+				fmt.Printf("\n📝 %s\n", result.Summary)
+			}
+			return nil
+		},
+	})
+
+	r.Register(&Command{
+		Name:        "simulate",
+		ArgHint:     "<场景目标> [--mode social|game|montecarlo]",
+		Description: "场景模拟 (社会/博弈/蒙特卡洛)",
+		Type:        CommandTypeLocal,
+		Execute: func(args string, ctx *CommandContext) error {
+			if ctx.SwarmIntel == nil {
+				fmt.Println("[群体智能引擎未初始化]")
+				return nil
+			}
+			if strings.TrimSpace(args) == "" {
+				fmt.Println("用法: /simulate <场景目标> [--mode MODE]")
+				fmt.Println("模式: social|game|montecarlo|crisis|org|creative|market|policy|tech")
+				fmt.Println("示例: /simulate 如果OpenAI开源所有模型会怎样?")
+				fmt.Println("      /simulate 中美AI竞赛的未来走向 --mode game")
+				fmt.Println("      /simulate 全球芯片供应中断 --mode crisis")
+				fmt.Println("      /simulate AI+教育的未来 --mode creative")
+				return nil
+			}
+
+			mode := "montecarlo"
+			objective := args
+			if strings.Contains(args, "--mode ") {
+				parts := strings.SplitN(args, "--mode ", 2)
+				objective = strings.TrimSpace(parts[0])
+				modeParts := strings.Fields(parts[1])
+				if len(modeParts) > 0 {
+					mode = modeParts[0]
+				}
+			}
+
+			cfg := swarm_intel.SimulationConfig{
+				Mode:   mode,
+				Agents: 5,
+				Rounds: 3,
+			}
+
+			fmt.Printf("🎲 启动 %s 模拟...\n", mode)
+			result, err := ctx.SwarmIntel.Simulate(
+				context.Background(), "cli", strings.TrimSpace(objective), cfg)
+			if err != nil {
+				fmt.Printf("[模拟失败: %v]\n", err)
+				return nil
+			}
+
+			fmt.Println()
+			if len(result.Scenarios) > 0 {
+				fmt.Println("场景分析:")
+				for _, s := range result.Scenarios {
+					fmt.Printf("  📌 %s (概率: %.0f%%)\n", s.Name, s.Probability*100)
+					fmt.Printf("     %s\n", s.Description)
+				}
+			}
+			if len(result.Emergent) > 0 {
+				fmt.Println("\n涌现行为:")
+				for _, e := range result.Emergent {
+					fmt.Printf("  🌊 %s\n", e)
+				}
+			}
+			if result.Summary != "" {
+				fmt.Printf("\n📝 %s\n", result.Summary)
+			}
+			return nil
+		},
+	})
+
+	r.Register(&Command{
+		Name:        "metrics",
+		Description: "群体智能引擎可观测性指标",
+		Type:        CommandTypeLocal,
+		Execute: func(args string, ctx *CommandContext) error {
+			if ctx.SwarmIntel == nil {
+				fmt.Println("[群体智能引擎未初始化]")
+				return nil
+			}
+			summary := ctx.SwarmIntel.GetMetrics()
+			fmt.Println("\n📊 群体智能引擎 — 可观测性指标")
+			fmt.Println(strings.Repeat("─", 50))
+			fmt.Printf("总运行次数:     %d\n", summary.TotalRuns)
+			fmt.Printf("平均延迟:       %dms\n", summary.AvgLatencyMs)
+			fmt.Printf("平均共识度:     %.2f\n", summary.AvgConsensus)
+			fmt.Printf("平均Brier分数:  %.4f\n", summary.AvgBrierScore)
+			fmt.Printf("平均多样性:     %.2f\n", summary.AvgDiversityScore)
+			fmt.Printf("平均LLM调用数:  %.1f\n", summary.AvgLLMCalls)
+			fmt.Printf("平均辩论轮数:   %.1f\n", summary.AvgDebateRounds)
+			fmt.Printf("辩论跳过率:     %.0f%%\n", summary.DebateSkipRate*100)
+			fmt.Printf("DTI触发率:      %.0f%%\n", summary.DTITriggerRate*100)
+			return nil
+		},
+	})
+
+	r.Register(&Command{
+		Name:        "compare",
+		Description: "与 MiroFish 对比评测报告",
+		Type:        CommandTypeLocal,
+		Execute: func(args string, ctx *CommandContext) error {
+			if ctx.SwarmIntel == nil {
+				fmt.Println("[群体智能引擎未初始化]")
+				return nil
+			}
+			report := ctx.SwarmIntel.GetComparisonReport()
+			fmt.Println(swarm_intel.FormatComparisonReport(report))
+			return nil
+		},
+	})
+
+	r.Register(&Command{
+		Name:        "history",
+		ArgHint:     "[N]",
+		Description: "查看最近 N 条预测历史 (默认 10)",
+		Type:        CommandTypeLocal,
+		Execute: func(args string, ctx *CommandContext) error {
+			if ctx.SwarmIntel == nil {
+				fmt.Println("[群体智能引擎未初始化]")
+				return nil
+			}
+			n := 10
+			if strings.TrimSpace(args) != "" {
+				fmt.Sscanf(args, "%d", &n)
+			}
+			records, err := ctx.SwarmIntel.GetHistory(n)
+			if err != nil {
+				fmt.Printf("[获取历史失败: %v]\n", err)
+				return nil
+			}
+			if len(records) == 0 {
+				fmt.Println("暂无预测历史")
+				return nil
+			}
+			fmt.Printf("\n📜 最近 %d 条预测历史:\n", len(records))
+			for _, r := range records {
+				fmt.Printf("  [%s] %s — 共识度: %.2f, Brier: %.4f\n",
+					r.CreatedAt.Format("01-02 15:04"), r.Question, r.Consensus, r.BrierScore)
+				for _, o := range r.Outcomes {
+					fmt.Printf("    %s: %.1f%%\n", o.Outcome, o.Probability*100)
+				}
 			}
 			return nil
 		},

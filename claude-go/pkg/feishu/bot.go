@@ -38,6 +38,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/anthropic/claude-go/pkg/vision"
 	"github.com/anthropic/claude-go/pkg/wiki"
+	swarm_intel "github.com/anthropic/claude-go/pkg/swarm_intel"
 )
 
 // 飞书消息长度限制 (富文本卡片约 30KB, 普通文本约 4000 字符)
@@ -180,8 +181,9 @@ type Bot struct {
 	cfgWatcher *hotreload.Watcher           // 配置热加载监控器
 	cronSched  *agent.CronScheduler         // 定时任务调度器
 	layout     *basedir.Layout              // 统一目录布局
-	wikiEngine *wiki.Engine                 // LLM Wiki 知识库引擎
-	visionCli  *vision.Client               // 视觉能力客户端
+	wikiEngine  *wiki.Engine                 // LLM Wiki 知识库引擎
+	swarmEngine *swarm_intel.Engine           // 群体智能预测引擎
+	visionCli   *vision.Client               // 视觉能力客户端
 	skillAuto  *skills.AutoCreator          // 技能自动创建器
 	startTime  time.Time                    // 启动时间
 
@@ -399,6 +401,16 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				log.Printf("[Wiki API] 启动失败: %v", err)
 			}
 		}
+	}
+
+	// 14b. 初始化群体智能预测引擎
+	{
+		siCfg := swarm_intel.DefaultConfig()
+		siCfg.Notify = func(chatID, msg string) {
+			bot.sendLongMessage(context.Background(), chatID, msg)
+		}
+		bot.swarmEngine = swarm_intel.NewEngine(aiClient, siCfg)
+		log.Printf("[SwarmIntel] 群体智能引擎已初始化")
 	}
 
 	// 15. 初始化技能自动创建器 (Hermes-agent 特性吸收)
@@ -1465,7 +1477,15 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- /team workflows - 查看可用工作流\n\n" +
 			"*自然语言 (仅查询/停止):*\n" +
 			"- 说「团队进展如何」→ 查看状态\n" +
-			"- 说「停止团队」→ 停止执行"
+			"- 说「停止团队」→ 停止执行\n\n" +
+			"**群体智能预测:**\n" +
+			"- /predict <问题> — 群体智能5阶段预测\n" +
+			"  例: /predict 2026年中国GDP增速\n" +
+			"  例: /predict BTC半年内趋势\n" +
+			"- /simulate [模式] <目标> — 场景模拟\n" +
+			"  模式: social(默认) | game | montecarlo\n" +
+			"  例: /simulate 新能源汽车市场竞争\n" +
+			"  例: /simulate game 中美贸易谈判"
 		b.sendTextReply(ctx, messageID, help)
 		return true
 
@@ -1549,6 +1569,14 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 
 	case strings.HasPrefix(lower, "/wiki"):
 		b.handleWikiCommand(ctx, chatID, messageID, text)
+		return true
+
+	case strings.HasPrefix(lower, "/predict"):
+		b.handlePredictCommand(ctx, chatID, messageID, text)
+		return true
+
+	case strings.HasPrefix(lower, "/simulate"):
+		b.handleSimulateCommand(ctx, chatID, messageID, text)
 		return true
 
 	case lower == "/reload":
@@ -2167,6 +2195,131 @@ func (b *Bot) handleWikiCommand(ctx context.Context, chatID, messageID, text str
 	default:
 		b.sendTextReply(ctx, messageID, "Wiki 命令: status | query <问题> | organize [inc] | lint | health")
 	}
+}
+
+// handlePredictCommand 处理 /predict <目标> — 群体智能预测
+func (b *Bot) handlePredictCommand(ctx context.Context, chatID, messageID, text string) {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		b.sendTextReply(ctx, messageID, "用法: /predict <预测问题>\n\n"+
+			"示例:\n"+
+			"- /predict 2026年中国GDP增速\n"+
+			"- /predict 下一代iPhone发布时间\n"+
+			"- /predict BTC半年内趋势\n\n"+
+			"引擎将执行5阶段流水线: 分解→侦察→预测→辩论→融合")
+		return
+	}
+
+	objective := strings.Join(parts[1:], " ")
+	b.sendTextReply(ctx, messageID, fmt.Sprintf("🧠 群体智能引擎启动，正在预测: %s\n\n"+
+		"5阶段流水线: 分解→侦察→预测→辩论→融合\n请稍候...", objective))
+
+	go func() {
+		pCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		result, err := b.swarmEngine.Predict(pCtx, chatID, objective)
+		if err != nil {
+			b.sendTextMessage(context.Background(), chatID, fmt.Sprintf("❌ 预测失败: %v", err))
+			return
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("## 🔮 群体智能预测报告\n\n**问题**: %s\n\n", result.Question))
+		sb.WriteString("### 📊 预测结果\n\n| 结果 | 概率 | 95%置信区间 |\n|------|------|------------|\n")
+		for _, o := range result.Outcomes {
+			sb.WriteString(fmt.Sprintf("| %s | **%.1f%%** | [%.1f%%, %.1f%%] |\n",
+				o.Outcome, o.Probability*100, o.Lower95*100, o.Upper95*100))
+		}
+		sb.WriteString(fmt.Sprintf("\n### 📈 融合指标\n- 共识度: %.2f\n- 校准分数(Brier): %.4f\n- 辩论轮数: %d\n- 融合方法: %s\n",
+			result.Consensus, result.BrierScore, result.Rounds, result.Method))
+		if result.Summary != "" {
+			sb.WriteString(fmt.Sprintf("\n### 💡 综合分析\n%s\n", result.Summary))
+		}
+		b.sendLongMessage(context.Background(), chatID, sb.String())
+	}()
+}
+
+// handleSimulateCommand 处理 /simulate <模式> <目标> — 群体智能模拟
+func (b *Bot) handleSimulateCommand(ctx context.Context, chatID, messageID, text string) {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		b.sendTextReply(ctx, messageID, "用法: /simulate [模式] <模拟目标>\n\n"+
+			"**9种模式**:\n"+
+			"- social — 社会模拟 (默认)\n"+
+			"- game — 博弈论模拟\n"+
+			"- montecarlo — 蒙特卡洛场景树\n"+
+			"- crisis — 危机推演\n"+
+			"- org — 组织动力学\n"+
+			"- creative — 创意涌现\n"+
+			"- market — 市场竞争\n"+
+			"- policy — 政策推演\n"+
+			"- tech — 技术演进\n\n"+
+			"示例:\n"+
+			"- /simulate 新能源汽车市场竞争\n"+
+			"- /simulate game 中美贸易谈判\n"+
+			"- /simulate crisis 全球芯片供应中断\n"+
+			"- /simulate creative AI+教育的未来\n"+
+			"- /simulate tech 量子计算 vs 经典计算")
+		return
+	}
+
+	mode := "social"
+	var objective string
+	knownModes := map[string]bool{
+		"social": true, "game": true, "montecarlo": true,
+		"crisis": true, "org": true, "creative": true,
+		"market": true, "policy": true, "tech": true,
+	}
+	if knownModes[strings.ToLower(parts[1])] {
+		mode = strings.ToLower(parts[1])
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "请指定模拟目标，例如: /simulate game 中美贸易谈判")
+			return
+		}
+		objective = strings.Join(parts[2:], " ")
+	} else {
+		objective = strings.Join(parts[1:], " ")
+	}
+
+	b.sendTextReply(ctx, messageID, fmt.Sprintf("🌐 群体智能模拟启动\n模式: %s | 目标: %s\n请稍候...", mode, objective))
+
+	go func() {
+		sCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		cfg := swarm_intel.SimulationConfig{
+			Mode:   mode,
+			Agents: 5,
+			Rounds: 3,
+		}
+		result, err := b.swarmEngine.Simulate(sCtx, chatID, objective, cfg)
+		if err != nil {
+			b.sendTextMessage(context.Background(), chatID, fmt.Sprintf("❌ 模拟失败: %v", err))
+			return
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("## 🌐 群体智能模拟报告\n\n**模式**: %s | **轮数**: %d\n\n", result.Mode, result.Rounds))
+		sb.WriteString("### 📊 场景结果\n\n| 场景 | 概率 | 描述 |\n|------|------|------|\n")
+		for _, sc := range result.Scenarios {
+			desc := sc.Description
+			if len(desc) > 60 {
+				desc = desc[:60] + "…"
+			}
+			sb.WriteString(fmt.Sprintf("| %s | **%.1f%%** | %s |\n", sc.Name, sc.Probability*100, desc))
+		}
+		if len(result.Emergent) > 0 {
+			sb.WriteString("\n### 🌊 涌现行为\n")
+			for _, em := range result.Emergent {
+				sb.WriteString("- " + em + "\n")
+			}
+		}
+		if result.Summary != "" {
+			sb.WriteString(fmt.Sprintf("\n### 💡 综合分析\n%s\n", result.Summary))
+		}
+		b.sendLongMessage(context.Background(), chatID, sb.String())
+	}()
 }
 
 // handleCronCommand 处理 /cron 命令族。

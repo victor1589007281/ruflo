@@ -42,6 +42,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
+	"github.com/anthropic/claude-go/pkg/swarm_intel"
 )
 
 // TaskTracker 抽象 V2 任务管理, 与 builtin.TaskStore 通过 duck typing 对接。
@@ -364,6 +365,12 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	// 蜂群模式: 使用 SwarmOrchestrator
 	if team.Workflow == "swarm" {
 		ptm.executeSwarm(ctx, team)
+		return
+	}
+
+	// 群体智能预测模式: 使用 SwarmIntelligenceEngine
+	if team.Workflow == "predict" {
+		ptm.executePrediction(ctx, team)
 		return
 	}
 
@@ -939,4 +946,59 @@ func truncateResult(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// executePrediction 群体智能预测执行。
+// 使用 swarm_intel.Engine 的 5 阶段流水线: Decompose → Scout → Predict → Debate → Fuse
+func (ptm *ProductionTeamManager) executePrediction(ctx context.Context, team *ProductionTeam) {
+	ctx = logging.WithTrace(ctx)
+	ctx, endSpan := logging.WithSpan(ctx, "team."+team.Name+".predict")
+	defer endSpan()
+	logging.Event(ctx, "predict.start", "team", team.Name, "objective", team.Objective)
+
+	cfg := swarm_intel.DefaultConfig()
+	cfg.Notify = func(_, msg string) {
+		ptm.notify(team.ChatID, msg)
+		if team.Blackboard != nil {
+			team.Blackboard.Write("predict-progress", msg, "engine", "progress")
+		}
+	}
+
+	engine := swarm_intel.NewEngine(ptm.llm, cfg)
+
+	result, err := engine.Predict(ctx, team.ChatID, team.Objective)
+	if err != nil {
+		ptm.failTeam(team, fmt.Sprintf("预测失败: %v", err))
+		return
+	}
+
+	team.mu.Lock()
+	team.Status = TeamStatusCompleted
+	team.FinishedAt = time.Now()
+	team.mu.Unlock()
+
+	if team.Blackboard != nil {
+		resultJSON, _ := json.Marshal(result)
+		team.Blackboard.Write("predict-result", string(resultJSON), "engine", "result")
+		team.Blackboard.Write("predict-summary", result.Summary, "engine", "result")
+	}
+
+	var report strings.Builder
+	report.WriteString(fmt.Sprintf("# 群体智能预测: %s\n\n", result.Question))
+	report.WriteString(fmt.Sprintf("**共识度:** %.0f%%  |  **辩论轮数:** %d  |  **融合方法:** %s\n\n",
+		result.Consensus*100, result.Rounds, result.Method))
+	report.WriteString("## 预测结果\n\n")
+	for _, o := range result.Outcomes {
+		report.WriteString(fmt.Sprintf("| %s | **%.1f%%** | [%.1f%% ~ %.1f%%] |\n",
+			o.Outcome, o.Probability*100, o.Lower95*100, o.Upper95*100))
+	}
+	if result.Summary != "" {
+		report.WriteString(fmt.Sprintf("\n## 分析总结\n\n%s\n", result.Summary))
+	}
+	ptm.saveTeamReport(team, []StageResult{{
+		Name: "predict", Role: "swarm-intelligence", Output: report.String(),
+	}})
+
+	ptm.notify(team.ChatID, fmt.Sprintf("✅ 群体智能预测完成 (%s)", team.Name))
+	logging.Event(ctx, "predict.done", "team", team.Name, "consensus", fmt.Sprintf("%.2f", result.Consensus))
 }

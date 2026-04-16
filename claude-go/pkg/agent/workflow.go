@@ -132,6 +132,8 @@ func GetWorkflow(name string) *WorkflowDef {
 		return techBlogWorkflow()
 	case "creative", "design", "visual":
 		return creativeWorkflow()
+	case "predict", "prediction", "forecast":
+		return predictWorkflow()
 	default:
 		return nil
 	}
@@ -147,6 +149,24 @@ func ListWorkflows() []WorkflowDef {
 		*financeWorkflow(),
 		*techBlogWorkflow(),
 		*creativeWorkflow(),
+		*predictWorkflow(),
+	}
+}
+
+// predictWorkflow 群体智能预测工作流。
+// 实际执行由 SwarmIntelligenceEngine 接管, WorkflowDef 仅用于 CreateTeam 验证。
+func predictWorkflow() *WorkflowDef {
+	return &WorkflowDef{
+		Name:        "predict",
+		Description: "群体智能预测 — 多Agent辩论+贝叶斯融合",
+		Mode:        "predict",
+		Stages: []StageDef{
+			{Name: "decompose", Role: "decomposer"},
+			{Name: "scout", Role: "scout"},
+			{Name: "predict", Role: "analyst"},
+			{Name: "debate", Role: "critic"},
+			{Name: "fuse", Role: "synthesizer"},
+		},
 	}
 }
 

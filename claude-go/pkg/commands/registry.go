@@ -8,6 +8,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/session"
+	"github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/wiki"
 )
 
@@ -35,8 +36,9 @@ type CommandContext struct {
 	Engine       *engine.QueryEngine
 	SessionStore *session.SessionStore
 	History      *session.PromptHistory
-	TeamMgr      *agent.ProductionTeamManager // 团队管理器 (可选)
-	WikiEngine   *wiki.Engine                 // Wiki 引擎 (可选)
+	TeamMgr      *agent.ProductionTeamManager  // 团队管理器 (可选)
+	WikiEngine   *wiki.Engine                  // Wiki 引擎 (可选)
+	SwarmIntel   *swarm_intel.Engine            // 群体智能引擎 (可选)
 	Cwd          string
 	OnClear      func()
 	OnExit       func()
