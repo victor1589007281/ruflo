@@ -38,12 +38,13 @@ import (
 
 // RoleDef 角色定义。
 type RoleDef struct {
-	Name         string   `json:"name"`
-	Category     string   `json:"category"` // "workflow" | "standalone"
-	Description  string   `json:"description"`
-	SystemPrompt string   `json:"systemPrompt"` // 支持 {objective}, {prev_result} 等占位符
-	Skills       []string `json:"skills"`       // 角色专属技能文件相对路径
-	Tags         []string `json:"tags"`
+	Name          string   `json:"name"`
+	Category      string   `json:"category"` // "workflow" | "standalone"
+	Description   string   `json:"description"`
+	SystemPrompt  string   `json:"systemPrompt"`            // 支持 {objective}, {prev_result} 等占位符
+	Skills        []string `json:"skills"`                  // 角色专属技能文件相对路径
+	BuiltinSkills []string `json:"builtinSkills,omitempty"` // 内置技能名
+	Tags          []string `json:"tags"`
 }
 
 // RoleRegistry 角色注册表。
@@ -53,6 +54,7 @@ type RoleRegistry struct {
 	cwd               string // 项目根目录 (用于解析 skill 路径)
 	skillRegistry     *skills.Registry
 	recommendedByRole map[string][]string
+	profile           skills.ProjectProfile
 }
 
 // NewRoleRegistry 创建角色注册表并注册所有内置角色。
@@ -61,11 +63,13 @@ func NewRoleRegistry(cwd string) *RoleRegistry {
 		roles: make(map[string]*RoleDef),
 		cwd:   cwd,
 	}
+	rr.profile = skills.DetectProjectProfile(cwd)
 	rr.registerBuiltins()
 
 	// 尝试从磁盘加载用户自定义角色
-	customDir := filepath.Join(cwd, ".claude", "agents")
-	rr.loadCustomRoles(customDir)
+	for _, customDir := range defaultRoleDirs(cwd) {
+		rr.loadCustomRoles(customDir)
+	}
 	rr.initRecommendedSkills()
 
 	return rr
@@ -75,7 +79,7 @@ func NewRoleRegistry(cwd string) *RoleRegistry {
 func (rr *RoleRegistry) Get(name string) *RoleDef {
 	rr.mu.RLock()
 	defer rr.mu.RUnlock()
-	return rr.roles[name]
+	return rr.roles[rr.resolveRoleNameLocked(name)]
 }
 
 // MergedPrompt 合并角色系统提示词 + 专属 Skills 内容。
@@ -93,7 +97,7 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 	// 如果 MergedPrompt 吞掉了这些占位符，对抗反馈就无法注入
 
 	// 加载角色专属 Skills
-	if len(role.Skills) > 0 || len(rr.RecommendedSkills(roleName)) > 0 {
+	if len(role.Skills) > 0 || len(role.BuiltinSkills) > 0 || len(rr.RecommendedSkills(roleName)) > 0 {
 		var skillContent strings.Builder
 		skillContent.WriteString("\n\n<role_skills>\n")
 		for _, sp := range role.Skills {
@@ -111,7 +115,7 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 			}
 			skillContent.WriteString(fmt.Sprintf("### Skill: %s\n%s\n\n", filepath.Base(sp), content))
 		}
-		for _, name := range rr.RecommendedSkills(roleName) {
+		for _, name := range uniqueRoleStrings(append(append([]string{}, role.BuiltinSkills...), rr.RecommendedSkills(roleName)...)) {
 			if rr.skillRegistry == nil {
 				continue
 			}
@@ -187,14 +191,64 @@ func (rr *RoleRegistry) Count() int {
 	return len(rr.roles)
 }
 
+// ResolveRoleName returns the specialized role name that will actually be used.
+func (rr *RoleRegistry) ResolveRoleName(roleName string) string {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	return rr.resolveRoleNameLocked(roleName)
+}
+
 // RecommendedSkills 返回当前项目为指定角色推断出的补充技能。
 func (rr *RoleRegistry) RecommendedSkills(roleName string) []string {
 	rr.mu.RLock()
 	defer rr.mu.RUnlock()
-	skillsForRole := rr.recommendedByRole[roleName]
+	skillsForRole := rr.recommendedByRole[rr.resolveRoleNameLocked(roleName)]
 	out := make([]string, len(skillsForRole))
 	copy(out, skillsForRole)
 	return out
+}
+
+// RoleSkills returns builtin and inferred skills for a role.
+func (rr *RoleRegistry) RoleSkills(roleName string) []string {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	resolved := rr.resolveRoleNameLocked(roleName)
+	role := rr.roles[resolved]
+	var names []string
+	if role != nil {
+		names = append(names, role.BuiltinSkills...)
+	}
+	names = append(names, rr.recommendedByRole[resolved]...)
+	return uniqueRoleStrings(names)
+}
+
+type RoleInfo struct {
+	Requested         string
+	Resolved          string
+	Description       string
+	FileSkills        []string
+	BuiltinSkills     []string
+	RecommendedSkills []string
+	Tags              []string
+}
+
+func (rr *RoleRegistry) DescribeRole(roleName string) *RoleInfo {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	resolved := rr.resolveRoleNameLocked(roleName)
+	role := rr.roles[resolved]
+	if role == nil {
+		return nil
+	}
+	return &RoleInfo{
+		Requested:         roleName,
+		Resolved:          resolved,
+		Description:       role.Description,
+		FileSkills:        append([]string(nil), role.Skills...),
+		BuiltinSkills:     append([]string(nil), role.BuiltinSkills...),
+		RecommendedSkills: append([]string(nil), rr.recommendedByRole[resolved]...),
+		Tags:              append([]string(nil), role.Tags...),
+	}
 }
 
 func (rr *RoleRegistry) initRecommendedSkills() {
@@ -203,16 +257,114 @@ func (rr *RoleRegistry) initRecommendedSkills() {
 		return
 	}
 
-	roleSkills := map[string][]string{
-		"coder":    skills.RecommendedSkillsForRole(rr.cwd, "coder"),
-		"tester":   skills.RecommendedSkillsForRole(rr.cwd, "tester"),
-		"reviewer": skills.RecommendedSkillsForRole(rr.cwd, "reviewer"),
+	roleSkills := map[string][]string{}
+	for name := range rr.roles {
+		roleSkills[name] = skills.RecommendedSkillsForRoleFromProfile(rr.profile, baseRoleFor(name))
 	}
 
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 	rr.skillRegistry = reg
 	rr.recommendedByRole = roleSkills
+}
+
+func (rr *RoleRegistry) resolveRoleNameLocked(roleName string) string {
+	if variant := specializationForProfile(rr.profile, roleName); variant != "" {
+		if _, ok := rr.roles[variant]; ok {
+			return variant
+		}
+	}
+	if _, ok := rr.roles[roleName]; ok {
+		return roleName
+	}
+	return roleName
+}
+
+func specializationForProfile(profile skills.ProjectProfile, roleName string) string {
+	switch roleName {
+	case "coder", "reviewer", "tester":
+		langCount := 0
+		if profile.HasGo {
+			langCount++
+		}
+		if profile.HasTypeScript {
+			langCount++
+		}
+		if profile.HasPython {
+			langCount++
+		}
+		if profile.HasDotNet {
+			langCount++
+		}
+		if profile.HasCPP {
+			langCount++
+		}
+		if profile.HasJava {
+			langCount++
+		}
+		if profile.HasDart {
+			langCount++
+		}
+		if profile.HasDjango {
+			return "django-" + roleName
+		}
+		if langCount != 1 {
+			return ""
+		}
+		switch {
+		case profile.HasGo:
+			return "go-" + roleName
+		case profile.HasTypeScript:
+			return "typescript-" + roleName
+		case profile.HasPython:
+			return "python-" + roleName
+		case profile.HasDotNet:
+			return "dotnet-" + roleName
+		case profile.HasCPP:
+			return "cpp-" + roleName
+		}
+	}
+	return ""
+}
+
+func baseRoleFor(name string) string {
+	switch {
+	case strings.HasSuffix(name, "-coder"):
+		return "coder"
+	case strings.HasSuffix(name, "-reviewer"):
+		return "reviewer"
+	case strings.HasSuffix(name, "-tester"):
+		return "tester"
+	default:
+		return name
+	}
+}
+
+func defaultRoleDirs(cwd string) []string {
+	var dirs []string
+	if cwd != "" {
+		dirs = append(dirs,
+			filepath.Join(cwd, ".claude", "agents"),
+			filepath.Join(cwd, ".claude-go", "agents"),
+		)
+	}
+	return dirs
+}
+
+func uniqueRoleStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 // --- 内置角色定义 ---
@@ -396,6 +548,7 @@ func (rr *RoleRegistry) registerBuiltins() {
 - go test ./... 和 go test -race ./... 都必须通过
 - 必须输出可编译运行的测试代码文件`,
 	}
+	rr.registerLanguageSpecialists()
 
 	rr.roles["orchestrator"] = &RoleDef{
 		Name: "orchestrator", Category: "workflow",
@@ -736,5 +889,146 @@ Render your verdict:
 		Name: "swarm-merger", Category: "standalone",
 		Description: "蜂群汇聚器: 综合多子任务结果",
 		Tags:        []string{"swarm", "merge", "synthesis"},
+	}
+}
+
+func (rr *RoleRegistry) registerLanguageSpecialists() {
+	register := func(name, baseRole, desc, extra string, builtinSkills ...string) {
+		base := rr.roles[baseRole]
+		if base == nil {
+			return
+		}
+		prompt := base.SystemPrompt
+		if extra != "" {
+			prompt += "\n\n## 语言/栈专项要求\n" + extra
+		}
+		rr.roles[name] = &RoleDef{
+			Name:          name,
+			Category:      base.Category,
+			Description:   desc,
+			SystemPrompt:  prompt,
+			Skills:        append([]string(nil), base.Skills...),
+			BuiltinSkills: append([]string(nil), builtinSkills...),
+			Tags:          append(append([]string(nil), base.Tags...), "language-specialist"),
+		}
+	}
+
+	register(
+		"go-coder", "coder", "Go 实现专家: 面向生产 Go 服务与工具链实现",
+		"重点遵循 idiomatic Go、context 传递、并发安全、错误包装和 package 边界。",
+		"coding-standards", "backend-patterns", "golang-patterns",
+	)
+	register(
+		"go-reviewer", "reviewer", "Go 代码审查专家: 聚焦并发、接口和错误处理",
+		"重点检查 goroutine 生命周期、channel 使用、共享状态保护、error wrapping 和公共 API 稳定性。",
+		"coding-standards", "backend-patterns", "golang-patterns", "golang-testing",
+	)
+	register(
+		"go-tester", "tester", "Go 测试专家: 聚焦 table-driven、race、fuzz 和 benchmark",
+		"重点补齐 table-driven 测试、子测试、竞态测试、fuzz/benchmark，以及 context cancel 场景。",
+		"coding-standards", "golang-patterns", "golang-testing",
+	)
+
+	register(
+		"typescript-coder", "coder", "TypeScript 实现专家: 类型驱动的前后端实现",
+		"重点检查运行时校验、类型收窄、async 错误处理、组件/服务边界和 schema 对齐。",
+		"coding-standards", "typescript-patterns",
+	)
+	register(
+		"typescript-reviewer", "reviewer", "TypeScript 审查专家: 类型安全和运行时一致性",
+		"重点检查 any 泄漏、类型断言滥用、边界校验缺失、UI 状态分层和异步竞态。",
+		"coding-standards", "typescript-patterns", "typescript-testing",
+	)
+	register(
+		"typescript-tester", "tester", "TypeScript 测试专家: Vitest/Jest、UI 行为和 contract 测试",
+		"重点覆盖 schema 失败、用户交互、异步竞态、API contract 和 deterministic mock。",
+		"coding-standards", "typescript-patterns", "typescript-testing",
+	)
+
+	register(
+		"python-coder", "coder", "Python 实现专家: 服务化模块、类型和验证",
+		"重点检查 dataclass/TypedDict/Pydantic 建模、异常边界、async 与 sync 分层。",
+		"coding-standards", "backend-patterns", "python-patterns",
+	)
+	register(
+		"python-reviewer", "reviewer", "Python 审查专家: 模块边界、异常和测试可维护性",
+		"重点检查可变默认值、None 漏洞、异常翻译、fixture 复杂度和 IO 隔离。",
+		"coding-standards", "python-patterns", "python-testing",
+	)
+	register(
+		"python-tester", "tester", "Python 测试专家: pytest、fixture、parametrize",
+		"重点使用 pytest 参数化、轻量 fixture 和异常/边界覆盖。",
+		"coding-standards", "python-patterns", "python-testing",
+	)
+
+	register(
+		"django-coder", "coder", "Django 实现专家: model/service/serializer/view 分层",
+		"重点检查 Django app 边界、query 优化、权限、serializer 和 service 分离。",
+		"coding-standards", "backend-patterns", "python-patterns", "django-patterns", "django-security",
+	)
+	register(
+		"django-reviewer", "reviewer", "Django 审查专家: 安全、查询和权限边界",
+		"重点检查 object-level permission、CSRF、raw SQL、N+1 查询、migration 风险和 admin 面。",
+		"coding-standards", "python-patterns", "django-patterns", "django-security", "django-verification",
+	)
+	register(
+		"django-tester", "tester", "Django 测试专家: model/service/API 分层测试",
+		"重点覆盖 migration、API contract、permission、query count 和端到端业务路径。",
+		"coding-standards", "python-patterns", "django-tdd", "django-verification",
+	)
+
+	register(
+		"dotnet-coder", "coder", ".NET 实现专家: ASP.NET 服务和 async 工作流",
+		"重点检查 controller/service 分层、CancellationToken 传递、DTO 边界和异常转换。",
+		"coding-standards", "backend-patterns", "dotnet-patterns",
+	)
+	register(
+		"dotnet-reviewer", "reviewer", ".NET 审查专家: async、DI 和 API 契约",
+		"重点检查 async 泄漏、DI 过度、异常处理中间件和序列化契约。",
+		"coding-standards", "dotnet-patterns", "csharp-testing",
+	)
+	register(
+		"dotnet-tester", "tester", ".NET 测试专家: xUnit/NUnit、async 和集成测试",
+		"重点覆盖 cancellation、authorization、serialization 和 background worker 行为。",
+		"coding-standards", "dotnet-patterns", "csharp-testing",
+	)
+
+	register(
+		"cpp-coder", "coder", "C++ 实现专家: RAII、所有权和现代 C++",
+		"重点检查所有权语义、move/copy 策略、资源释放和接口可诊断性。",
+		"coding-standards", "cpp-coding-standards",
+	)
+	register(
+		"cpp-reviewer", "reviewer", "C++ 审查专家: 生命周期、UB 和接口安全",
+		"重点检查 raw new/delete、未定义行为风险、异常/错误边界和所有权不清晰点。",
+		"coding-standards", "cpp-coding-standards", "cpp-testing",
+	)
+	register(
+		"cpp-tester", "tester", "C++ 测试专家: GTest、CTests 和 sanitizers",
+		"重点补齐 sanitizer、生命周期回归、边界值和并发回归测试。",
+		"coding-standards", "cpp-coding-standards", "cpp-testing",
+	)
+
+	rr.roles["build-resolver"] = &RoleDef{
+		Name:        "build-resolver",
+		Category:    "workflow",
+		Description: "构建修复专家: 专注编译、依赖、测试与工具链故障闭环",
+		Tags:        []string{"build", "toolchain", "ci", "repair"},
+		BuiltinSkills: []string{
+			"coding-standards",
+		},
+		SystemPrompt: `你是构建修复专家。专注解决编译失败、依赖冲突、测试不通过、CI 断裂和工具链问题。
+
+目标: {objective}
+
+上游上下文:
+{prev_result}
+
+## 工作原则
+1. 先定位失败来源: 编译、测试、依赖、环境、生成代码、配置
+2. 输出最小修复集，不做无关重构
+3. 明确记录复现命令、根因、修复点、验证命令
+4. 如果是语言/框架特定问题，优先遵循对应工具链最佳实践
+5. 修复后必须给出验证矩阵: build/test/lint/typecheck 中实际验证了哪些`,
 	}
 }

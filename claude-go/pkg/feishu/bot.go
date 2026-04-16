@@ -28,13 +28,13 @@ import (
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/browser"
 	"github.com/anthropic/claude-go/pkg/dreaming"
-	"github.com/anthropic/claude-go/pkg/logging"
-	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/hotreload"
+	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/skills"
+	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/anthropic/claude-go/pkg/vision"
 	"github.com/anthropic/claude-go/pkg/wiki"
@@ -152,25 +152,25 @@ func (da *dreamAdapter) RecordSession(record agent.DreamSessionRecord) {
 //   - 支持 /clear 和 /help 等斜杠命令
 type Bot struct {
 	config     *BotConfig
-	client     *lark.Client       // 飞书 API 客户端 (用于发送消息)
-	wsClient   *larkws.Client     // WebSocket 长连接客户端
-	sessions   *SessionManager    // 会话管理器
-	apiClient  *api.Client        // AI API 客户端
-	mcpMgr      *dynmcp.Manager             // 动态 MCP 管理器 (进程级别共享)
-	skillReg    *skills.Registry            // 技能注册表 (进程级别共享)
-	dreamer     *dreaming.Dreamer           // Dreaming 记忆整理引擎
-	memStore    *memory.TieredStore         // 多层记忆存储 (进程级别共享)
-	teamMgr     *agent.ProductionTeamManager // 生产级 Agent Teams 管理器
-	intentRec   *agent.IntentRecognizer     // 自然语言意图识别器
-	taskStore   *builtin.TaskStore          // 共享 V2 Task 存储
-	evolution   *agent.EvolutionEngine      // 自动进化引擎
-	cfgWatcher  *hotreload.Watcher          // 配置热加载监控器
-	cronSched   *agent.CronScheduler       // 定时任务调度器
-	layout      *basedir.Layout             // 统一目录布局
-	wikiEngine  *wiki.Engine               // LLM Wiki 知识库引擎
-	visionCli   *vision.Client             // 视觉能力客户端
-	skillAuto   *skills.AutoCreator        // 技能自动创建器
-	startTime   time.Time                   // 启动时间
+	client     *lark.Client                 // 飞书 API 客户端 (用于发送消息)
+	wsClient   *larkws.Client               // WebSocket 长连接客户端
+	sessions   *SessionManager              // 会话管理器
+	apiClient  *api.Client                  // AI API 客户端
+	mcpMgr     *dynmcp.Manager              // 动态 MCP 管理器 (进程级别共享)
+	skillReg   *skills.Registry             // 技能注册表 (进程级别共享)
+	dreamer    *dreaming.Dreamer            // Dreaming 记忆整理引擎
+	memStore   *memory.TieredStore          // 多层记忆存储 (进程级别共享)
+	teamMgr    *agent.ProductionTeamManager // 生产级 Agent Teams 管理器
+	intentRec  *agent.IntentRecognizer      // 自然语言意图识别器
+	taskStore  *builtin.TaskStore           // 共享 V2 Task 存储
+	evolution  *agent.EvolutionEngine       // 自动进化引擎
+	cfgWatcher *hotreload.Watcher           // 配置热加载监控器
+	cronSched  *agent.CronScheduler         // 定时任务调度器
+	layout     *basedir.Layout              // 统一目录布局
+	wikiEngine *wiki.Engine                 // LLM Wiki 知识库引擎
+	visionCli  *vision.Client               // 视觉能力客户端
+	skillAuto  *skills.AutoCreator          // 技能自动创建器
+	startTime  time.Time                    // 启动时间
 
 	// 消息去重: 防止同一条消息触发多个团队
 	processedMsgs sync.Map // messageID → timestamp
@@ -277,10 +277,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
-		BaseDir:     layout.Teams,
-		Cwd:         config.Cwd,
-		Factory:     bot.sessions.CreateAgentRunner,
-		Notify:      func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
+		BaseDir: layout.Teams,
+		Cwd:     config.Cwd,
+		Factory: bot.sessions.CreateAgentRunner,
+		Notify:  func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
 		MediaNotify: func(chatID string, data []byte, filename, mediaType string) error {
 			ctx := context.Background()
 			switch mediaType {
@@ -1408,9 +1408,13 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- /mcp remove <名称> - 动态移除\n\n" +
 			"**技能管理:**\n" +
 			"- /skill list - 列出已加载技能\n" +
+			"- /skill show <名称> - 查看技能详情\n" +
 			"- /skill install <名称> - 创建技能模板\n" +
 			"- /skill uninstall <名称> - 卸载技能\n" +
 			"- /skill reload - 重新加载技能\n\n" +
+			"**角色查看:**\n" +
+			"- /role list - 列出角色\n" +
+			"- /role show <名称> - 查看角色最终技能绑定\n\n" +
 			"**Dreaming:**\n" +
 			"- /dream - 手动触发记忆整理\n\n" +
 			"**定时任务 (Cron):**\n" +
@@ -1503,6 +1507,10 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 
 	case strings.HasPrefix(lower, "/skill"):
 		b.handleSkillCommand(ctx, chatID, messageID, text)
+		return true
+
+	case strings.HasPrefix(lower, "/role"):
+		b.handleRoleCommand(ctx, messageID, text)
 		return true
 
 	case lower == "/dream":
@@ -1603,11 +1611,11 @@ func (b *Bot) handleMCPCommand(ctx context.Context, chatID, messageID, text stri
 }
 
 // handleSkillCommand 处理 /skill 命令
-// 支持: /skill list, /skill install <name> <content>, /skill uninstall <name>, /skill reload
+// 支持: /skill list, /skill show <name>, /skill install <name>, /skill uninstall <name>, /skill reload
 func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text string) {
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
-		b.sendTextReply(ctx, messageID, "/skill list - 列出技能\n/skill reload - 重载技能\n/skill install <name> - 安装\n/skill uninstall <name> - 卸载")
+		b.sendTextReply(ctx, messageID, "/skill list - 列出技能\n/skill show <name> - 查看技能详情\n/skill reload - 重载技能\n/skill install <name> - 安装\n/skill uninstall <name> - 卸载")
 		return
 	}
 
@@ -1616,7 +1624,7 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 	case "list":
 		allSkills := b.skillReg.All()
 		if len(allSkills) == 0 {
-			b.sendTextReply(ctx, messageID, "无已加载技能。在 .claude/skills/<name>/SKILL.md 中添加。")
+			b.sendTextReply(ctx, messageID, "无已加载技能。可放在 .claude/skills/ 或 .claude-go/skills/ 下。")
 			return
 		}
 		var sb strings.Builder
@@ -1626,13 +1634,29 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 		}
 		b.sendTextReply(ctx, messageID, sb.String())
 
+	case "show":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /skill show <name>")
+			return
+		}
+		skill, ok := b.skillReg.Get(parts[2])
+		if !ok {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("未找到技能: %s", parts[2]))
+			return
+		}
+		body := skill.Body
+		if len(body) > 2500 {
+			body = body[:2500] + "\n...(truncated)"
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("**%s**\n来源: %s\n用途: %s\n\n%s", skill.Name, skill.LoadedFrom, skill.WhenToUse, body))
+
 	case "reload":
 		count := b.skillReg.Reload()
 		b.sendTextReply(ctx, messageID, fmt.Sprintf("已重载 %d 个技能。", count))
 
 	case "install":
 		if len(parts) < 3 {
-			b.sendTextReply(ctx, messageID, "用法: /skill install <name>\n(在 .claude/skills/<name>/SKILL.md 中创建文件)")
+			b.sendTextReply(ctx, messageID, "用法: /skill install <name>\n(在 .claude-go/skills/<name>/SKILL.md 中创建文件)")
 			return
 		}
 		name := parts[2]
@@ -1645,7 +1669,11 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 			b.sendTextReply(ctx, messageID, fmt.Sprintf("安装失败: %v", err))
 		} else {
 			b.skillReg.Reload()
-			b.sendTextReply(ctx, messageID, fmt.Sprintf("已创建技能模板: .claude/skills/%s/SKILL.md\n请编辑内容后发送 /skill reload。", name))
+			relPath := ".claude/skills/" + name + "/SKILL.md"
+			if b.layout != nil {
+				relPath = ".claude-go/skills/" + name + "/SKILL.md"
+			}
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("已创建技能模板: %s\n请编辑内容后发送 /skill reload。", relPath))
 		}
 
 	case "uninstall":
@@ -1666,15 +1694,68 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 		}
 
 	default:
-		b.sendTextReply(ctx, messageID, "未知 /skill 子命令。用法: /skill [list|reload|install|uninstall]")
+		b.sendTextReply(ctx, messageID, "未知 /skill 子命令。用法: /skill [list|show|reload|install|uninstall]")
 	}
+}
+
+func (b *Bot) handleRoleCommand(ctx context.Context, messageID, text string) {
+	if b.sessions == nil || b.sessions.roleRegistry == nil {
+		b.sendTextReply(ctx, messageID, "角色注册表未初始化。")
+		return
+	}
+
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		b.sendTextReply(ctx, messageID, "/role list - 列出角色\n/role show <name> - 查看角色最终技能绑定")
+		return
+	}
+
+	switch strings.ToLower(parts[1]) {
+	case "list":
+		var sb strings.Builder
+		sb.WriteString("**可用角色:**\n")
+		for _, role := range b.sessions.roleRegistry.ListByCategory("") {
+			sb.WriteString(fmt.Sprintf("- **%s**: %s\n", role.Name, role.Description))
+		}
+		b.sendTextReply(ctx, messageID, sb.String())
+	case "show":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /role show <name>")
+			return
+		}
+		info := b.sessions.roleRegistry.DescribeRole(parts[2])
+		if info == nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("未找到角色: %s", parts[2]))
+			return
+		}
+		msg := fmt.Sprintf("**角色:** %s\n**解析后角色:** %s\n**描述:** %s\n**文件技能:** %s\n**内置技能:** %s\n**推荐技能:** %s\n**最终技能集:** %s",
+			info.Requested,
+			info.Resolved,
+			info.Description,
+			formatNames(info.FileSkills),
+			formatNames(info.BuiltinSkills),
+			formatNames(info.RecommendedSkills),
+			formatNames(b.sessions.roleRegistry.RoleSkills(parts[2])),
+		)
+		b.sendTextReply(ctx, messageID, msg)
+	default:
+		b.sendTextReply(ctx, messageID, "未知 /role 子命令。用法: /role [list|show]")
+	}
+}
+
+func formatNames(items []string) string {
+	if len(items) == 0 {
+		return "(none)"
+	}
+	return strings.Join(items, ", ")
 }
 
 // handleGoCommand 一键创建并启动团队: /go <工作流> <目标>
 // 示例:
-//   /go research 调研 kubernetes 最佳实践
-//   /go creative 画一个日落风景
-//   /go finance 分析特斯拉财报
+//
+//	/go research 调研 kubernetes 最佳实践
+//	/go creative 画一个日落风景
+//	/go finance 分析特斯拉财报
 func (b *Bot) handleGoCommand(ctx context.Context, chatID, messageID, text string) {
 	parts := strings.Fields(text)
 	if len(parts) < 3 {
@@ -2503,7 +2584,7 @@ func (b *Bot) sendCardMessage(ctx context.Context, chatID, title, markdownConten
 		},
 		Elements: []CardElement{
 			{
-				Tag: "markdown",
+				Tag:     "markdown",
 				Content: markdownContent,
 			},
 		},

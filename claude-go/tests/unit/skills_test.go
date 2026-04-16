@@ -197,8 +197,9 @@ func TestSkillReload(t *testing.T) {
 	reg := skills.NewRegistry()
 	reg.LoadFromDirs([]string{dir}, "test")
 
-	if reg.Count() != 1 {
-		t.Fatalf("初始加载期望 1, 实际 %d", reg.Count())
+	initial := reg.Count()
+	if initial != 1 {
+		t.Fatalf("初始加载期望 1, 实际 %d", initial)
 	}
 
 	// 添加新技能
@@ -208,8 +209,14 @@ func TestSkillReload(t *testing.T) {
 
 	// Reload
 	reloaded := reg.Reload()
-	if reloaded != 2 {
-		t.Errorf("重载期望 2, 实际 %d", reloaded)
+	if reloaded <= initial+1 {
+		t.Errorf("重载后数量应大于 %d, 实际 %d", initial+1, reloaded)
+	}
+	if _, ok := reg.Get("coding-standards"); !ok {
+		t.Error("重载后应保留内置技能")
+	}
+	if _, ok := reg.Get("new-skill"); !ok {
+		t.Error("重载后应包含新增技能")
 	}
 }
 

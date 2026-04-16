@@ -28,6 +28,33 @@ func TestBuiltinSkillsLoadedByDefault(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsIncludesClaudeGoStateDir(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".claude-go", "skills", "state-skill", "SKILL.md"), "---\nname: state-skill\ndescription: state dir skill\n---\nState body\n")
+
+	reg := skills.NewRegistry()
+	reg.LoadDefaults(dir)
+	skill, ok := reg.Get("state-skill")
+	if !ok {
+		t.Fatal("expected .claude-go/skills skill to be loaded")
+	}
+	if skill.LoadedFrom != "state" {
+		t.Fatalf("expected state source, got %q", skill.LoadedFrom)
+	}
+}
+
+func TestReloadPreservesBuiltins(t *testing.T) {
+	reg := skills.NewRegistry()
+	reg.LoadDefaults(t.TempDir())
+	if _, ok := reg.Get("coding-standards"); !ok {
+		t.Fatal("expected builtin skill before reload")
+	}
+	reg.Reload()
+	if _, ok := reg.Get("coding-standards"); !ok {
+		t.Fatal("expected builtin skill after reload")
+	}
+}
+
 func TestRecommendedSkillsForRole_GoProject(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "go.mod"), "module example.com/test\n\ngo 1.26\n")
@@ -62,6 +89,24 @@ func TestRoleRegistryInjectsRecommendedSkills(t *testing.T) {
 	testerPrompt := reg.MergedPrompt("tester", "验证 Go 服务", "前置结果")
 	if !strings.Contains(testerPrompt, "Go Testing Patterns") {
 		t.Fatalf("expected tester prompt to include builtin Go testing skill, got: %s", testerPrompt)
+	}
+}
+
+func TestRoleRegistryResolvesSpecializedGoRoles(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "go.mod"), "module example.com/test\n\ngo 1.26\n")
+	writeFile(t, filepath.Join(dir, "main.go"), "package main\n\nfunc main() {}\n")
+
+	reg := agent.NewRoleRegistry(dir)
+	if got := reg.ResolveRoleName("coder"); got != "go-coder" {
+		t.Fatalf("expected coder to resolve to go-coder, got %q", got)
+	}
+	info := reg.DescribeRole("coder")
+	if info == nil || info.Resolved != "go-coder" {
+		t.Fatalf("expected described role to resolve to go-coder, got %+v", info)
+	}
+	if !containsString(reg.RoleSkills("coder"), "golang-patterns") {
+		t.Fatalf("expected effective role skills to include golang-patterns, got %v", reg.RoleSkills("coder"))
 	}
 }
 

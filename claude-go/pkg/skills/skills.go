@@ -67,7 +67,12 @@ type Skill struct {
 type Registry struct {
 	mu     sync.RWMutex
 	skills map[string]*Skill // name → skill
-	dirs   []string          // 已扫描的目录
+	dirs   []scanDir         // 已扫描的目录
+}
+
+type scanDir struct {
+	Path   string
+	Source string
 }
 
 // NewRegistry 创建技能注册表
@@ -111,7 +116,9 @@ func (r *Registry) LoadFromDirs(dirs []string, source string) int {
 	}
 	if loaded > 0 {
 		r.mu.Lock()
-		r.dirs = append(r.dirs, dirs...)
+		for _, dir := range dirs {
+			r.dirs = append(r.dirs, scanDir{Path: dir, Source: source})
+		}
 		r.mu.Unlock()
 	}
 	return loaded
@@ -120,22 +127,36 @@ func (r *Registry) LoadFromDirs(dirs []string, source string) int {
 // LoadDefaults 加载默认技能目录。
 // 对应 TS: getSkillsPath 的三个来源:
 //  1. <cwd>/.claude/skills/ (项目级)
-//  2. ~/.claude/skills/ (用户级)
+//  2. <cwd>/.claude-go/skills/ (状态目录)
+//  3. ~/.claude/skills/ (用户级)
+//  4. ~/.claude-go/skills/ (用户状态目录)
 func (r *Registry) LoadDefaults(cwd string) int {
 	total := r.LoadBuiltins()
 
-	projectDir := filepath.Join(cwd, ".claude", "skills")
-	if info, err := os.Stat(projectDir); err == nil && info.IsDir() {
-		total += r.LoadFromDirs([]string{projectDir}, "project")
-	}
-
-	if home, err := os.UserHomeDir(); err == nil {
-		userDir := filepath.Join(home, ".claude", "skills")
-		if info, err := os.Stat(userDir); err == nil && info.IsDir() {
-			total += r.LoadFromDirs([]string{userDir}, "user")
+	for _, dir := range defaultSkillDirs(cwd) {
+		if info, err := os.Stat(dir.Path); err == nil && info.IsDir() {
+			total += r.LoadFromDirs([]string{dir.Path}, dir.Source)
 		}
 	}
 	return total
+}
+
+// defaultSkillDirs returns the default search paths for skills.
+func defaultSkillDirs(cwd string) []scanDir {
+	var dirs []scanDir
+	if cwd != "" {
+		dirs = append(dirs,
+			scanDir{Path: filepath.Join(cwd, ".claude", "skills"), Source: "project"},
+			scanDir{Path: filepath.Join(cwd, ".claude-go", "skills"), Source: "state"},
+		)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs,
+			scanDir{Path: filepath.Join(home, ".claude", "skills"), Source: "user"},
+			scanDir{Path: filepath.Join(home, ".claude-go", "skills"), Source: "user-state"},
+		)
+	}
+	return dirs
 }
 
 // Register 注册一个技能 (同名覆盖)
@@ -185,13 +206,17 @@ func (r *Registry) Count() int {
 // Reload 重新加载所有已知目录的技能
 func (r *Registry) Reload() int {
 	r.mu.Lock()
-	dirs := make([]string, len(r.dirs))
+	dirs := make([]scanDir, len(r.dirs))
 	copy(dirs, r.dirs)
 	r.skills = make(map[string]*Skill)
 	r.dirs = nil
 	r.mu.Unlock()
 
-	return r.LoadFromDirs(dirs, "reload")
+	total := r.LoadBuiltins()
+	for _, dir := range dirs {
+		total += r.LoadFromDirs([]string{dir.Path}, dir.Source)
+	}
+	return total
 }
 
 // FormatListing 格式化技能列表 (用于系统提示词)。

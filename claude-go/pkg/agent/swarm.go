@@ -7,18 +7,22 @@
 //   - 结果汇聚: LLM 综合所有子任务结果, 生成最终答案
 //
 // 执行流程:
-//   1. Decompose: LLM 分析目标, 生成 SubTask DAG (含依赖)
-//   2. Schedule:  拓扑排序, 按层级并行调度到 AgentPool
-//   3. Execute:   每层并行执行, 完成后写入 Blackboard
-//   4. Merge:     LLM 综合所有结果, 生成最终输出
 //
-//	┌─────────────────────────────────────────────────┐
-//	│ SwarmOrchestrator                               │
-//	│  decompose() → SubTask DAG                      │
-//	│  topologicalLevels() → [[level0], [level1], ...]│
-//	│  executeLevel() → 并行执行同层子任务            │
-//	│  merge() → LLM 综合最终结果                     │
-//	└─────────────────────────────────────────────────┘
+//  1. Decompose: LLM 分析目标, 生成 SubTask DAG (含依赖)
+//
+//  2. Schedule:  拓扑排序, 按层级并行调度到 AgentPool
+//
+//  3. Execute:   每层并行执行, 完成后写入 Blackboard
+//
+//  4. Merge:     LLM 综合所有结果, 生成最终输出
+//
+//     ┌─────────────────────────────────────────────────┐
+//     │ SwarmOrchestrator                               │
+//     │  decompose() → SubTask DAG                      │
+//     │  topologicalLevels() → [[level0], [level1], ...]│
+//     │  executeLevel() → 并行执行同层子任务            │
+//     │  merge() → LLM 综合最终结果                     │
+//     └─────────────────────────────────────────────────┘
 package agent
 
 import (
@@ -41,9 +45,9 @@ type SubTask struct {
 
 // DecompositionPlan LLM 生成的任务拆解计划。
 type DecompositionPlan struct {
-	SubTasks []SubTask `json:"subTasks"`
-	Strategy string    `json:"strategy"` // parallel, pipeline, hybrid
-	Rationale string   `json:"rationale"`
+	SubTasks  []SubTask `json:"subTasks"`
+	Strategy  string    `json:"strategy"` // parallel, pipeline, hybrid
+	Rationale string    `json:"rationale"`
 }
 
 // SwarmOrchestrator 蜂群编排器。
@@ -159,7 +163,14 @@ func (s *SwarmOrchestrator) decompose(ctx context.Context, objective string) (*D
 2. 标注依赖关系 (dependsOn): 哪些子任务必须在其之前完成
 3. 无依赖的子任务会自动并行执行
 4. 最多拆解 %d 个子任务
-5. role 可选: researcher, coder, reviewer, tester, architect, analyst
+5. role 可选: researcher, coder, reviewer, tester, architect, analyst,
+   go-coder, go-reviewer, go-tester,
+   typescript-coder, typescript-reviewer, typescript-tester,
+   python-coder, python-reviewer, python-tester,
+   django-coder, django-reviewer, django-tester,
+   dotnet-coder, dotnet-reviewer, dotnet-tester,
+   cpp-coder, cpp-reviewer, cpp-tester,
+   build-resolver
 
 ## 优化规则 (重要!)
 6. **最小依赖原则**: 只依赖真正需要的前置任务，不要过度串行化。
@@ -485,8 +496,8 @@ func (s *SwarmOrchestrator) executeSubTask(
 	if reason := validateAgentOutput(result, task.Role); reason != "" {
 		return StageResult{
 			Name: task.ID, Role: task.Role, Status: TaskFailed,
-			Error:   fmt.Sprintf("产出验证失败: %s", reason),
-			Output:  result,
+			Error:     fmt.Sprintf("产出验证失败: %s", reason),
+			Output:    result,
 			StartedAt: start, Duration: duration.Round(time.Second).String(),
 		}
 	}

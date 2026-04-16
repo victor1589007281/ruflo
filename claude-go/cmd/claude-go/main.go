@@ -52,6 +52,8 @@ const fullHelpGuide = `Claude Code (Go) - AI 编程助手
   claude-go feishu --config=xxx     飞书长连接模式
   claude-go doctor                  系统诊断
   claude-go tools                   列出可用工具
+  claude-go skills                  查看技能列表/详情
+  claude-go roles coder             查看角色最终技能绑定
   claude-go help                    查看完整帮助
 
 飞书模式详细配置:
@@ -128,6 +130,8 @@ func main() {
   feishu  WebSocket 长连接，企业飞书/Lark 机器人后台
   doctor  检查 API Key、rg/git/shell、CLAUDE.md 等环境
   tools   列出当前注册的内置与 MCP 工具
+  skills  查看已加载技能或某个技能详情
+  roles   查看角色以及某个角色最终绑定的技能
 
 全局标志（所有子命令可用，部分会被 feishu 的配置文件合并/覆盖）：
   --model、--api-key、--base-url、--max-tokens、--max-turns、
@@ -148,6 +152,8 @@ func main() {
   # 环境与工具
   claude-go doctor
   claude-go tools
+  claude-go skills
+  claude-go roles coder
 
   # 完整使用指南（含飞书、配置 JSON、斜杠命令）
   claude-go help`,
@@ -169,6 +175,8 @@ func main() {
 	rootCmd.AddCommand(feishuCmd())
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.AddCommand(toolsCmd())
+	rootCmd.AddCommand(skillsCmd())
+	rootCmd.AddCommand(rolesCmd())
 	rootCmd.AddCommand(helpCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -549,6 +557,95 @@ func toolsCmd() *cobra.Command {
 	}
 }
 
+func skillsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "skills [name]",
+		Short: "查看已加载技能或某个技能详情",
+		Example: `  claude-go skills
+  claude-go skills golang-patterns`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			reg := skills.NewRegistry()
+			reg.LoadDefaults(cwd)
+
+			if len(args) == 0 {
+				allSkills := reg.All()
+				if len(allSkills) == 0 {
+					fmt.Println("No skills loaded.")
+					return nil
+				}
+				fmt.Println("Loaded Skills:")
+				fmt.Println("==============")
+				for _, s := range allSkills {
+					fmt.Printf("- %-24s %s [%s]\n", s.Name, firstLine(s.Description), s.LoadedFrom)
+				}
+				return nil
+			}
+
+			skill, ok := reg.Get(args[0])
+			if !ok {
+				return fmt.Errorf("技能 %q 未找到", args[0])
+			}
+			fmt.Printf("Name: %s\n", skill.Name)
+			fmt.Printf("Description: %s\n", skill.Description)
+			fmt.Printf("When to use: %s\n", skill.WhenToUse)
+			fmt.Printf("Loaded from: %s\n", skill.LoadedFrom)
+			if skill.SourcePath != "" {
+				fmt.Printf("Source path: %s\n", skill.SourcePath)
+			}
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			fmt.Println(skill.Body)
+			return nil
+		},
+	}
+}
+
+func rolesCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "roles [name]",
+		Short: "查看角色以及某个角色最终绑定的技能",
+		Example: `  claude-go roles
+  claude-go roles coder
+  claude-go roles go-reviewer`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			reg := agent.NewRoleRegistry(cwd)
+
+			if len(args) == 0 {
+				fmt.Println("Available Roles:")
+				fmt.Println("================")
+				for _, role := range reg.ListByCategory("") {
+					resolved := reg.ResolveRoleName(role.Name)
+					suffix := ""
+					if resolved != role.Name {
+						suffix = fmt.Sprintf(" -> %s", resolved)
+					}
+					fmt.Printf("- %-24s %s%s\n", role.Name, firstLine(role.Description), suffix)
+				}
+				return nil
+			}
+
+			info := reg.DescribeRole(args[0])
+			if info == nil {
+				return fmt.Errorf("角色 %q 未找到", args[0])
+			}
+			fmt.Printf("Requested role: %s\n", info.Requested)
+			fmt.Printf("Resolved role: %s\n", info.Resolved)
+			fmt.Printf("Description: %s\n", info.Description)
+			if len(info.Tags) > 0 {
+				fmt.Printf("Tags: %s\n", strings.Join(info.Tags, ", "))
+			}
+			fmt.Printf("File skills: %s\n", formatNameList(info.FileSkills))
+			fmt.Printf("Builtin skills: %s\n", formatNameList(info.BuiltinSkills))
+			fmt.Printf("Recommended skills: %s\n", formatNameList(info.RecommendedSkills))
+			fmt.Printf("Effective skills: %s\n", formatNameList(reg.RoleSkills(args[0])))
+			return nil
+		},
+	}
+}
+
 func buildEngine() (*engine.QueryEngine, error) {
 	apiKey := getAPIKey()
 	if apiKey == "" {
@@ -693,6 +790,13 @@ func firstLine(s string) string {
 		return s[:idx]
 	}
 	return s
+}
+
+func formatNameList(items []string) string {
+	if len(items) == 0 {
+		return "(none)"
+	}
+	return strings.Join(items, ", ")
 }
 
 // engineDeps shared dependencies for the root engine and nested Agent runs.
