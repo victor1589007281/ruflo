@@ -1,23 +1,24 @@
 // Package prompt 实现系统提示词组装。
 // 对应 TS 源码: review/claude/src/utils/systemPrompt.ts
-//                review/claude/src/constants/prompts.ts
+//
+//	review/claude/src/constants/prompts.ts
 //
 // Claude Code 的系统提示词由多个部分组成，按优先级链组装:
 //
-//   优先级 (从高到低):
-//   0. Override system prompt (覆盖一切)
-//   1. Coordinator prompt (协调器模式, Manager.CoordinatorPrompt)
-//   2. Agent prompt (代理定义的提示词)
-//   3. Custom system prompt (--system-prompt 参数)
-//   4. Default system prompt (标准 Claude Code 提示词)
-//   + appendSystemPrompt (override 以外各分支可追加)
+//	优先级 (从高到低):
+//	0. Override system prompt (覆盖一切)
+//	1. Coordinator prompt (协调器模式, Manager.CoordinatorPrompt)
+//	2. Agent prompt (代理定义的提示词)
+//	3. Custom system prompt (--system-prompt 参数)
+//	4. Default system prompt (标准 Claude Code 提示词)
+//	+ appendSystemPrompt (override 以外各分支可追加)
 //
-//   Default prompt 的组成部分:
-//   - 工具描述 (自动生成)
-//   - 环境信息 (OS, shell, cwd)
-//   - CLAUDE.md 记忆内容
-//   - 行为指南 (编码规范, 文件操作规则)
-//   - memdir/MEMORY.md 内容
+//	Default prompt 的组成部分:
+//	- 工具描述 (自动生成)
+//	- 环境信息 (OS, shell, cwd)
+//	- CLAUDE.md 记忆内容
+//	- 行为指南 (编码规范, 文件操作规则)
+//	- memdir/MEMORY.md 内容
 package prompt
 
 import (
@@ -50,6 +51,8 @@ type Manager struct {
 	DreamMemoryDir string
 	// Model 当前主循环模型名 (可选，供环境块展示)
 	Model string
+	// SkillListing 可选的技能清单，通常来自 skills.Registry.FormatListing()。
+	SkillListing string
 	// ProductName 产品显示名 (空则默认 "Claude Code (Go)")
 	ProductName string
 	// FastMode 是否启用快速/精简模式 (环境块展示)
@@ -68,7 +71,8 @@ func NewManager(cwd string) *Manager {
 // 对应 TS: utils/systemPrompt.ts 中的 buildEffectiveSystemPrompt()
 //
 // 优先级链算法:
-//   override > coordinator > agent > custom > default；append 在除 override 外各分支末尾追加。
+//
+//	override > coordinator > agent > custom > default；append 在除 override 外各分支末尾追加。
 func (m *Manager) BuildEffectiveSystemPrompt(tools *tool.Registry) []string {
 	if m.OverridePrompt != "" {
 		return []string{m.OverridePrompt}
@@ -114,11 +118,11 @@ func (m *Manager) BuildEffectiveSystemPrompt(tools *tool.Registry) []string {
 // 对应 TS: constants/prompts.ts 中的 getSystemPrompt()
 //
 // 组装顺序:
-//   1. 身份声明
-//   2. 环境信息 (OS, date, cwd, shell)
-//   3. 工具使用指南
-//   4. CLAUDE.md 记忆内容
-//   5. 行为准则 (代码编写、文件操作、安全)
+//  1. 身份声明
+//  2. 环境信息 (OS, date, cwd, shell)
+//  3. 工具使用指南
+//  4. CLAUDE.md 记忆内容
+//  5. 行为准则 (代码编写、文件操作、安全)
 func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 	var sb strings.Builder
 
@@ -147,6 +151,11 @@ func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 		}
 	}
 	sb.WriteString("</available_tools>\n\n")
+
+	if m.SkillListing != "" {
+		sb.WriteString(m.SkillListing)
+		sb.WriteString("\n")
+	}
 
 	// 工具使用指南
 	sb.WriteString("<tool_usage>\n")
@@ -274,23 +283,23 @@ func buildSessionToolHints(tools *tool.Registry) string {
 		return ""
 	}
 	hints := map[string]string{
-		"Read":           "Use Read to inspect file contents instead of Shell cat/head/tail.",
-		"Write":          "Use Write for new files or full rewrites instead of shell redirection/heredoc.",
-		"StrReplace":     "Use StrReplace for surgical edits instead of sed/awk one-liners.",
-		"Glob":           "Use Glob for path patterns instead of find(1) when possible.",
-		"Grep":           "Use Grep for repository search instead of spawning shell grep/rg.",
-		"Shell":          "Reserve Shell for operations that have no first-class tool; prefer file tools when applicable.",
-		"TodoWrite":      "Use TodoWrite to track multi-step tasks and mark progress.",
-		"TaskCreate":     "Use TaskCreate / Task tools to break work into trackable sub-tasks.",
-		"TaskUpdate":     "Use TaskUpdate to advance structured sub-tasks.",
-		"TaskList":       "Use TaskList to inspect outstanding structured tasks.",
-		"TaskGet":        "Use TaskGet to fetch details for a specific task id.",
-		"WebFetch":       "Use WebFetch to retrieve URL bodies when you need page content.",
-		"WebSearch":      "Use WebSearch for open-web discovery instead of guessing URLs.",
-		"SendMessage":    "Use SendMessage when coordinating with teammate agents.",
-		"TeamCreate":     "Use TeamCreate / team tools for multi-agent sessions when available.",
-		"ToolSearch":     "Use ToolSearch to discover lesser-used tools instead of guessing names.",
-		"Skill":          "Use Skill to load project-specific skill instructions when present.",
+		"Read":        "Use Read to inspect file contents instead of Shell cat/head/tail.",
+		"Write":       "Use Write for new files or full rewrites instead of shell redirection/heredoc.",
+		"StrReplace":  "Use StrReplace for surgical edits instead of sed/awk one-liners.",
+		"Glob":        "Use Glob for path patterns instead of find(1) when possible.",
+		"Grep":        "Use Grep for repository search instead of spawning shell grep/rg.",
+		"Shell":       "Reserve Shell for operations that have no first-class tool; prefer file tools when applicable.",
+		"TodoWrite":   "Use TodoWrite to track multi-step tasks and mark progress.",
+		"TaskCreate":  "Use TaskCreate / Task tools to break work into trackable sub-tasks.",
+		"TaskUpdate":  "Use TaskUpdate to advance structured sub-tasks.",
+		"TaskList":    "Use TaskList to inspect outstanding structured tasks.",
+		"TaskGet":     "Use TaskGet to fetch details for a specific task id.",
+		"WebFetch":    "Use WebFetch to retrieve URL bodies when you need page content.",
+		"WebSearch":   "Use WebSearch for open-web discovery instead of guessing URLs.",
+		"SendMessage": "Use SendMessage when coordinating with teammate agents.",
+		"TeamCreate":  "Use TeamCreate / team tools for multi-agent sessions when available.",
+		"ToolSearch":  "Use ToolSearch to discover lesser-used tools instead of guessing names.",
+		"Skill":       "Use Skill to load project-specific skill instructions when present.",
 	}
 	names := tools.Names()
 	nameSet := make(map[string]struct{}, len(names))

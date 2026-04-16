@@ -39,7 +39,7 @@ type Session struct {
 	processing bool // 是否正在处理消息 (防止并发请求)
 
 	// 消息队列: 当 processing=true 时, 后续消息入队等待, 处理完自动消费
-	pendingMsg   *string // 最多缓存 1 条待处理消息 (最新的覆盖旧的)
+	pendingMsg   *string      // 最多缓存 1 条待处理消息 (最新的覆盖旧的)
 	pendingReply func(string) // 队列消息的回复回调
 }
 
@@ -97,6 +97,7 @@ func (s *Session) Touch() {
 //	  create new Session with fresh QueryEngine
 //	  sessions[chatID] = newSession
 //	  return newSession
+//
 // MediaSendFunc 飞书媒体发送回调（图片/文件）。
 type MediaSendFunc func(ctx context.Context, chatID string, data []byte, filename, mediaType string) error
 
@@ -112,11 +113,11 @@ type SessionManager struct {
 	dreamer        *dreaming.Dreamer
 	memoryStore    *memory.TieredStore
 	hookConfigs    []types.HookConfig
-	taskStore      *builtin.TaskStore     // 共享 V2 Task 存储 (Teams + LLM 工具共用)
-	evolution      *agent.EvolutionEngine // 进化引擎 (注入 agent runner hooks)
-	roleRegistry   *agent.RoleRegistry    // 角色注册表
-	mediaSendFn    MediaSendFunc                  // 飞书发送图片/文件的回调
-	teamMgr        *agent.ProductionTeamManager   // 团队管理器 (供 TeamQuery 工具使用)
+	taskStore      *builtin.TaskStore           // 共享 V2 Task 存储 (Teams + LLM 工具共用)
+	evolution      *agent.EvolutionEngine       // 进化引擎 (注入 agent runner hooks)
+	roleRegistry   *agent.RoleRegistry          // 角色注册表
+	mediaSendFn    MediaSendFunc                // 飞书发送图片/文件的回调
+	teamMgr        *agent.ProductionTeamManager // 团队管理器 (供 TeamQuery 工具使用)
 }
 
 // NewSessionManager 创建会话管理器。
@@ -243,6 +244,9 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		promptMgr.CustomPrompt = sm.config.SystemPrompt
 	}
 	promptMgr.Model = sm.config.Model
+	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
+		promptMgr.SkillListing = sm.skillReg.FormatListing()
+	}
 	promptMgr.ProductName = "Claude Code (Go) - Feishu Bot"
 	promptMgr.HookConfigs = sm.hookConfigs
 	if sm.dreamer != nil {
@@ -318,6 +322,9 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	compactor := compact.NewCompactor(sm.apiClient, 200000)
 	promptMgr := prompt.NewManager(sm.config.Cwd)
 	promptMgr.Model = sm.config.Model
+	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
+		promptMgr.SkillListing = sm.skillReg.FormatListing()
+	}
 
 	model := sm.config.Model
 	if opts.Model != "" {
@@ -568,6 +575,9 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	compactor := compact.NewCompactor(r.sm.apiClient, 200000)
 	promptMgr := prompt.NewManager(r.sm.config.Cwd)
 	promptMgr.Model = r.sm.config.Model
+	if r.sm.skillReg != nil && r.sm.skillReg.Count() > 0 {
+		promptMgr.SkillListing = r.sm.skillReg.FormatListing()
+	}
 
 	// 角色提示词: 优先使用外部传入的, 再尝试从 RoleRegistry 获取 (含专属 Skills)
 	effectivePrompt := r.systemPrompt

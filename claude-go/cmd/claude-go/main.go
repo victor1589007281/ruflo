@@ -36,6 +36,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
+	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -177,9 +178,9 @@ func main() {
 
 func helpCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "help",
-		Short: "查看完整使用指南",
-		Long:  "打印包含基础用法、飞书配置、通用参数、机器人命令与多 Agent 协作说明的完整指南。",
+		Use:     "help",
+		Short:   "查看完整使用指南",
+		Long:    "打印包含基础用法、飞书配置、通用参数、机器人命令与多 Agent 协作说明的完整指南。",
 		Example: `  claude-go help`,
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Print(fullHelpGuide)
@@ -496,8 +497,8 @@ JSON 配置文件示例:
 // doctorCmd 系统诊断
 func doctorCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "doctor",
-		Short: "系统诊断",
+		Use:     "doctor",
+		Short:   "系统诊断",
 		Example: `  claude-go doctor`,
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Println("Claude Code (Go) - System Diagnostics")
@@ -528,8 +529,8 @@ func doctorCmd() *cobra.Command {
 // toolsCmd 列出可用工具
 func toolsCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "tools",
-		Short: "列出所有可用工具",
+		Use:     "tools",
+		Short:   "列出所有可用工具",
 		Example: `  claude-go tools`,
 		Run: func(cmd *cobra.Command, args []string) {
 			reg := tool.NewRegistry()
@@ -582,6 +583,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 	if flagSystemPrompt != "" {
 		promptMgr.CustomPrompt = flagSystemPrompt
 	}
+	skillReg := skills.NewRegistry()
+	skillReg.LoadDefaults(cwd)
+	if skillReg.Count() > 0 {
+		promptMgr.SkillListing = skillReg.FormatListing()
+	}
 
 	cfg := &engine.Config{
 		Model:            flagModel,
@@ -601,11 +607,15 @@ func buildEngine() (*engine.QueryEngine, error) {
 		compactor:   compactor,
 		promptMgr:   promptMgr,
 		mcpConns:    mcpConns,
+		skillReg:    skillReg,
 	}
 
 	reg := tool.NewRegistry()
 	builtin.RegisterBaseTools(reg)
 	mcp.RegisterMCPTools(reg, mcpConns)
+	if skillReg.Count() > 0 {
+		reg.Register(skills.NewSkillTool(skillReg))
+	}
 
 	var runAgent agent.RunAgentFunc
 	runAgent = func(ctx context.Context, prompt string, opts agent.RunOptions) (string, error) {
@@ -694,6 +704,7 @@ type engineDeps struct {
 	compactor   *compact.Compactor
 	promptMgr   *prompt.Manager
 	mcpConns    []*mcp.Connection
+	skillReg    *skills.Registry
 }
 
 func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
@@ -721,10 +732,13 @@ func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
 	return out, nil
 }
 
-func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAgentFunc, prompt string, opts agent.RunOptions) (string, error) {
+func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
 	nestedReg := tool.NewRegistry()
 	builtin.RegisterBaseTools(nestedReg)
 	mcp.RegisterMCPTools(nestedReg, deps.mcpConns)
+	if deps.skillReg != nil && deps.skillReg.Count() > 0 {
+		nestedReg.Register(skills.NewSkillTool(deps.skillReg))
+	}
 	nestedReg.Register(agent.NewAgentTool(runAgent))
 
 	nestedCfg := *deps.cfg
@@ -737,10 +751,18 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 		perm = permissions.NewChecker(types.PermissionModePlan)
 	}
 
-	nested := engine.NewQueryEngine(&nestedCfg, deps.apiClient, nestedReg, deps.hookRunner, perm, deps.compactor, deps.promptMgr)
+	nestedPromptMgr := prompt.NewManager(nestedCfg.Cwd)
+	nestedPromptMgr.CustomPrompt = deps.promptMgr.CustomPrompt
+	nestedPromptMgr.AppendPrompt = deps.promptMgr.AppendPrompt
+	nestedPromptMgr.OverridePrompt = deps.promptMgr.OverridePrompt
+	nestedPromptMgr.CoordinatorPrompt = deps.promptMgr.CoordinatorPrompt
+	nestedPromptMgr.AgentPrompt = deps.promptMgr.AgentPrompt
+	nestedPromptMgr.Model = nestedCfg.Model
+	nestedPromptMgr.SkillListing = deps.promptMgr.SkillListing
+	nested := engine.NewQueryEngine(&nestedCfg, deps.apiClient, nestedReg, deps.hookRunner, perm, deps.compactor, nestedPromptMgr)
 
 	var sb strings.Builder
-	for msg := range nested.SubmitMessage(ctx, prompt) {
+	for msg := range nested.SubmitMessage(ctx, agentPrompt) {
 		if msg.Type != types.MessageTypeAssistant {
 			continue
 		}

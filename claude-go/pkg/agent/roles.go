@@ -8,17 +8,20 @@
 //   - standalone: 独立运行 (intent-recognizer, consolidator, distiller, etc.)
 //
 // 每个角色可配置:
+//
 //   - SystemPrompt: 角色定位提示词模板 (支持 {objective} 等占位符)
+//
 //   - Skills: 角色专属技能文件路径列表
+//
 //   - Tags: 角色标签 (用于搜索和匹配)
 //
-//	┌──────────────────────────────────────────────────────┐
-//	│ RoleRegistry                                         │
-//	│  Get(name)         → 获取角色定义                    │
-//	│  ListByCategory()  → 按类别列出角色                  │
-//	│  MergedPrompt()    → 合并角色提示词 + 专属 Skills    │
-//	│  RegisterCustom()  → 注册用户自定义角色              │
-//	└──────────────────────────────────────────────────────┘
+//     ┌──────────────────────────────────────────────────────┐
+//     │ RoleRegistry                                         │
+//     │  Get(name)         → 获取角色定义                    │
+//     │  ListByCategory()  → 按类别列出角色                  │
+//     │  MergedPrompt()    → 合并角色提示词 + 专属 Skills    │
+//     │  RegisterCustom()  → 注册用户自定义角色              │
+//     └──────────────────────────────────────────────────────┘
 package agent
 
 import (
@@ -29,12 +32,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/anthropic/claude-go/pkg/skills"
 )
 
 // RoleDef 角色定义。
 type RoleDef struct {
 	Name         string   `json:"name"`
-	Category     string   `json:"category"`     // "workflow" | "standalone"
+	Category     string   `json:"category"` // "workflow" | "standalone"
 	Description  string   `json:"description"`
 	SystemPrompt string   `json:"systemPrompt"` // 支持 {objective}, {prev_result} 等占位符
 	Skills       []string `json:"skills"`       // 角色专属技能文件相对路径
@@ -43,9 +48,11 @@ type RoleDef struct {
 
 // RoleRegistry 角色注册表。
 type RoleRegistry struct {
-	roles map[string]*RoleDef
-	mu    sync.RWMutex
-	cwd   string // 项目根目录 (用于解析 skill 路径)
+	roles             map[string]*RoleDef
+	mu                sync.RWMutex
+	cwd               string // 项目根目录 (用于解析 skill 路径)
+	skillRegistry     *skills.Registry
+	recommendedByRole map[string][]string
 }
 
 // NewRoleRegistry 创建角色注册表并注册所有内置角色。
@@ -59,6 +66,7 @@ func NewRoleRegistry(cwd string) *RoleRegistry {
 	// 尝试从磁盘加载用户自定义角色
 	customDir := filepath.Join(cwd, ".claude", "agents")
 	rr.loadCustomRoles(customDir)
+	rr.initRecommendedSkills()
 
 	return rr
 }
@@ -85,7 +93,7 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 	// 如果 MergedPrompt 吞掉了这些占位符，对抗反馈就无法注入
 
 	// 加载角色专属 Skills
-	if len(role.Skills) > 0 {
+	if len(role.Skills) > 0 || len(rr.RecommendedSkills(roleName)) > 0 {
 		var skillContent strings.Builder
 		skillContent.WriteString("\n\n<role_skills>\n")
 		for _, sp := range role.Skills {
@@ -102,6 +110,20 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 				content = content[:4096] + "...(truncated)"
 			}
 			skillContent.WriteString(fmt.Sprintf("### Skill: %s\n%s\n\n", filepath.Base(sp), content))
+		}
+		for _, name := range rr.RecommendedSkills(roleName) {
+			if rr.skillRegistry == nil {
+				continue
+			}
+			skill, ok := rr.skillRegistry.Get(name)
+			if !ok {
+				continue
+			}
+			content := skill.Body
+			if len(content) > 3072 {
+				content = content[:3072] + "...(truncated)"
+			}
+			skillContent.WriteString(fmt.Sprintf("### Skill: %s\n%s\n\n", skill.Name, content))
 		}
 		skillContent.WriteString("</role_skills>")
 		prompt += skillContent.String()
@@ -163,6 +185,34 @@ func (rr *RoleRegistry) Count() int {
 	rr.mu.RLock()
 	defer rr.mu.RUnlock()
 	return len(rr.roles)
+}
+
+// RecommendedSkills 返回当前项目为指定角色推断出的补充技能。
+func (rr *RoleRegistry) RecommendedSkills(roleName string) []string {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	skillsForRole := rr.recommendedByRole[roleName]
+	out := make([]string, len(skillsForRole))
+	copy(out, skillsForRole)
+	return out
+}
+
+func (rr *RoleRegistry) initRecommendedSkills() {
+	reg := skills.NewRegistry()
+	if reg.LoadDefaults(rr.cwd) == 0 {
+		return
+	}
+
+	roleSkills := map[string][]string{
+		"coder":    skills.RecommendedSkillsForRole(rr.cwd, "coder"),
+		"tester":   skills.RecommendedSkillsForRole(rr.cwd, "tester"),
+		"reviewer": skills.RecommendedSkillsForRole(rr.cwd, "reviewer"),
+	}
+
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	rr.skillRegistry = reg
+	rr.recommendedByRole = roleSkills
 }
 
 // --- 内置角色定义 ---

@@ -49,17 +49,17 @@ import (
 
 // Skill 技能定义
 type Skill struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	WhenToUse   string   `json:"when_to_use"`
-	Paths       []string `json:"paths,omitempty"`       // 条件路径 (glob 模式)
+	Name         string   `json:"name"`
+	Description  string   `json:"description"`
+	WhenToUse    string   `json:"when_to_use"`
+	Paths        []string `json:"paths,omitempty"` // 条件路径 (glob 模式)
 	AllowedTools []string `json:"allowed_tools,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Version     string   `json:"version,omitempty"`
-	SkillDir    string   `json:"skill_dir"`             // 技能所在目录
-	SourcePath  string   `json:"source_path"`           // SKILL.md 完整路径
-	LoadedFrom  string   `json:"loaded_from"`           // project/user/managed
-	Body        string   `json:"body"`                  // Markdown 正文
+	Model        string   `json:"model,omitempty"`
+	Version      string   `json:"version,omitempty"`
+	SkillDir     string   `json:"skill_dir"`   // 技能所在目录
+	SourcePath   string   `json:"source_path"` // SKILL.md 完整路径
+	LoadedFrom   string   `json:"loaded_from"` // project/user/managed
+	Body         string   `json:"body"`        // Markdown 正文
 }
 
 // Registry 技能注册表 (进程级别共享)。
@@ -122,23 +122,18 @@ func (r *Registry) LoadFromDirs(dirs []string, source string) int {
 //  1. <cwd>/.claude/skills/ (项目级)
 //  2. ~/.claude/skills/ (用户级)
 func (r *Registry) LoadDefaults(cwd string) int {
-	var dirs []string
+	total := r.LoadBuiltins()
 
 	projectDir := filepath.Join(cwd, ".claude", "skills")
 	if info, err := os.Stat(projectDir); err == nil && info.IsDir() {
-		dirs = append(dirs, projectDir)
+		total += r.LoadFromDirs([]string{projectDir}, "project")
 	}
 
 	if home, err := os.UserHomeDir(); err == nil {
 		userDir := filepath.Join(home, ".claude", "skills")
 		if info, err := os.Stat(userDir); err == nil && info.IsDir() {
-			dirs = append(dirs, userDir)
+			total += r.LoadFromDirs([]string{userDir}, "user")
 		}
-	}
-
-	total := 0
-	if len(dirs) > 0 {
-		total = r.LoadFromDirs(dirs, "project")
 	}
 	return total
 }
@@ -229,16 +224,20 @@ func ParseSkillFile(path string, source string) (*Skill, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParseSkillContent(string(data), path, source)
+}
 
-	content := string(data)
+// ParseSkillContent 从内存中的 Markdown 内容解析技能。
+// 用于磁盘文件和 embed FS 共享同一套解析逻辑。
+func ParseSkillContent(content string, sourcePath string, source string) (*Skill, error) {
 	skill := &Skill{
-		SourcePath: path,
-		SkillDir:   filepath.Dir(path),
+		SourcePath: sourcePath,
+		SkillDir:   filepath.Dir(sourcePath),
 		LoadedFrom: source,
 	}
 
 	// 默认名称从目录名推导
-	skill.Name = filepath.Base(filepath.Dir(path))
+	skill.Name = filepath.Base(filepath.Dir(sourcePath))
 
 	// 解析 YAML frontmatter
 	if strings.HasPrefix(content, "---\n") {
@@ -341,8 +340,8 @@ func (t *SkillTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *SkillTool) IsReadOnly(_ json.RawMessage) bool         { return true }
-func (t *SkillTool) IsConcurrencySafe(_ json.RawMessage) bool  { return true }
+func (t *SkillTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+func (t *SkillTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 func (t *SkillTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
