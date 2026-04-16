@@ -101,9 +101,29 @@ type Usage struct {
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
 }
 
-// StreamEvent 流式事件
+// StreamEventKind 流式事件类型 (用于实时 token-by-token 输出)。
+type StreamEventKind int
+
+const (
+	StreamEventDelta       StreamEventKind = iota // 文本增量 (逐 token)
+	StreamEventBlockDone                          // 一个 content block 完成
+	StreamEventMessageDone                        // 整条 assistant 消息完成
+	StreamEventToolStart                          // 工具调用开始
+	StreamEventToolDone                           // 工具调用完成
+	StreamEventError                              // 错误
+)
+
+// StreamEvent 统一流式事件 (支持 token-by-token 输出)。
 type StreamEvent struct {
-	Type string `json:"type"`
+	Kind       StreamEventKind
+	DeltaText  string   // Kind=Delta 时的文本片段
+	BlockIndex int      // 当前 content block 索引
+	Message    *Message // Kind=MessageDone 时的完整消息
+	ToolName   string   // Kind=ToolStart/ToolDone
+	ToolInput  string   // Kind=ToolStart 时的工具输入摘要
+	ToolResult string   // Kind=ToolDone 时的工具结果摘要
+	IsThinking bool     // thinking delta (区别于普通文本)
+	Error      error    // Kind=Error 时的错误
 }
 
 // ============================================================================

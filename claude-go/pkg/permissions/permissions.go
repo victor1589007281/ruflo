@@ -317,3 +317,11 @@ func matchPathPattern(pattern, pathVal string) bool {
 	ok, err := filepath.Match(pattern, pathVal)
 	return err == nil && ok
 }
+
+// AddSessionAllowRule 添加会话级别的永久允许规则 (用户交互式选择 "always allow")。
+func (c *Checker) AddSessionAllowRule(toolName string) {
+	c.AllowRules = append(c.AllowRules, types.PermissionRule{
+		ToolName: toolName,
+		Source:   "session_interactive",
+	})
+}

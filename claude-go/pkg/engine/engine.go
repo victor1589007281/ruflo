@@ -55,16 +55,28 @@ const (
 //   resultCh := engine.SubmitMessage(ctx, userMessage)
 //   for msg := range resultCh { ... }
 type QueryEngine struct {
-	Config      *Config
-	Messages    []types.Message
-	Tools       *tool.Registry
-	APIClient   *api.Client
-	HookRunner  *hooks.Runner
-	PermChecker *permissions.Checker
-	Compactor   *compact.Compactor
-	PromptMgr   *prompt.Manager
-	MemoryStore *memory.TieredStore // 多层记忆存储 (可选, nil 则不启用)
-	mu          sync.Mutex
+	Config       *Config
+	Messages     []types.Message
+	Tools        *tool.Registry
+	APIClient    *api.Client
+	HookRunner   *hooks.Runner
+	PermChecker  *permissions.Checker
+	Compactor    *compact.Compactor
+	PromptMgr    *prompt.Manager
+	MemoryStore  *memory.TieredStore   // 多层记忆存储 (可选, nil 则不启用)
+	SessionStore SessionStoreInterface // 会话持久化 (可选, nil 则不启用)
+
+	CumulativeUsage types.Usage // 本会话累积 token 消耗
+	ContextBudget   int         // 上下文窗口大小 (tokens, 默认 200000)
+
+	mu sync.Mutex
+}
+
+// SessionStoreInterface 会话存储抽象。
+type SessionStoreInterface interface {
+	AppendUserMessage(msg types.Message, cwd, model string)
+	AppendAssistantMessage(msg types.Message)
+	SessionID() string
 }
 
 // Config 引擎配置
@@ -102,13 +114,43 @@ func NewQueryEngine(
 		cfg.MaxTokens = 16384
 	}
 	return &QueryEngine{
-		Config:      cfg,
-		APIClient:   apiClient,
-		Tools:       tools,
-		HookRunner:  hookRunner,
-		PermChecker: permChecker,
-		Compactor:   compactor,
-		PromptMgr:   promptMgr,
+		Config:        cfg,
+		APIClient:     apiClient,
+		Tools:         tools,
+		HookRunner:    hookRunner,
+		PermChecker:   permChecker,
+		Compactor:     compactor,
+		PromptMgr:     promptMgr,
+		ContextBudget: 200000,
+	}
+}
+
+// ContextUsageInfo 返回上下文使用信息。
+type ContextUsageInfo struct {
+	TotalTokens   int
+	InputTokens   int
+	OutputTokens  int
+	Budget        int
+	Percentage    float64
+	MessageCount  int
+}
+
+// GetContextUsage 获取上下文使用信息。
+func (e *QueryEngine) GetContextUsage() ContextUsageInfo {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	total := e.CumulativeUsage.InputTokens + e.CumulativeUsage.OutputTokens
+	budget := e.ContextBudget
+	if budget == 0 {
+		budget = 200000
+	}
+	return ContextUsageInfo{
+		TotalTokens:  total,
+		InputTokens:  e.CumulativeUsage.InputTokens,
+		OutputTokens: e.CumulativeUsage.OutputTokens,
+		Budget:       budget,
+		Percentage:   float64(total) / float64(budget) * 100,
+		MessageCount: len(e.Messages),
 	}
 }
 
@@ -135,21 +177,56 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 	copy(messages, e.Messages)
 	e.mu.Unlock()
 
+	if e.SessionStore != nil {
+		e.SessionStore.AppendUserMessage(userMsg, e.Config.Cwd, e.Config.Model)
+	}
+
 	go func() {
 		defer close(ch)
-		finalMsgs, terminal := e.queryLoop(ctx, messages, ch)
+		finalMsgs, terminal := e.queryLoop(ctx, messages, ch, nil)
 		_ = terminal
 
-		// [BUG FIX] 将 queryLoop 中产生的完整对话历史 (包括 assistant 回复
-		// 和 tool 结果) 持久化回 e.Messages，否则下一次 SubmitMessage 会丢失
-		// 之前的 assistant/tool 消息。
-		// 对应 TS: QueryEngine 在 query.ts 结束后保存完整 messages 列表。
 		e.mu.Lock()
 		e.Messages = finalMsgs
 		e.mu.Unlock()
 	}()
 
 	return ch
+}
+
+// SubmitStream 提交用户消息，返回 StreamEvent 通道实现 token-by-token 流式输出。
+func (e *QueryEngine) SubmitStream(ctx context.Context, userContent string) <-chan types.StreamEvent {
+	streamCh := make(chan types.StreamEvent, 200)
+	msgCh := make(chan types.Message, 50)
+
+	e.mu.Lock()
+	userMsg := types.Message{
+		Type:      types.MessageTypeUser,
+		UUID:      generateUUID(),
+		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: userContent}},
+		CreatedAt: time.Now(),
+	}
+	e.Messages = append(e.Messages, userMsg)
+	messages := make([]types.Message, len(e.Messages))
+	copy(messages, e.Messages)
+	e.mu.Unlock()
+
+	if e.SessionStore != nil {
+		e.SessionStore.AppendUserMessage(userMsg, e.Config.Cwd, e.Config.Model)
+	}
+
+	go func() {
+		defer close(streamCh)
+		defer close(msgCh)
+		finalMsgs, terminal := e.queryLoop(ctx, messages, msgCh, streamCh)
+		_ = terminal
+
+		e.mu.Lock()
+		e.Messages = finalMsgs
+		e.mu.Unlock()
+	}()
+
+	return streamCh
 }
 
 // queryLoop 核心 ReAct 循环。
@@ -182,7 +259,7 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 //     toolResults = runTools(toolUseBlocks, registry, context)
 //     messages = append(messages, assistantMsgs, toolResults)
 //   }
-func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message) ([]types.Message, types.Terminal) {
+func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message, streamCh chan<- types.StreamEvent) ([]types.Message, types.Terminal) {
 	turnCount := 0
 	currentModel := e.Config.Model
 	consecutiveErrors := 0 // 断路器: 连续错误计数
@@ -308,42 +385,68 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					currentText.Reset()
 					currentToolInput.Reset()
 				}
-			case "content_block_delta":
-				if event.Delta != nil {
-					switch event.Delta.Type {
-					case "text_delta":
-						currentText.WriteString(event.Delta.Text)
-					case "input_json_delta":
-						currentToolInput.WriteString(event.Delta.PartialJSON)
-					case "thinking_delta":
-						currentText.WriteString(event.Delta.Thinking)
+		case "content_block_delta":
+			if event.Delta != nil {
+				switch event.Delta.Type {
+				case "text_delta":
+					currentText.WriteString(event.Delta.Text)
+					if streamCh != nil {
+						streamCh <- types.StreamEvent{
+							Kind:       types.StreamEventDelta,
+							DeltaText:  event.Delta.Text,
+							BlockIndex: event.Index,
+						}
 					}
-					// 捕获 stop_reason (可能在 delta 中)
-					if event.Delta.StopReason != "" {
-						stopReason = event.Delta.StopReason
+				case "input_json_delta":
+					currentToolInput.WriteString(event.Delta.PartialJSON)
+				case "thinking_delta":
+					currentText.WriteString(event.Delta.Thinking)
+					if streamCh != nil {
+						streamCh <- types.StreamEvent{
+							Kind:       types.StreamEventDelta,
+							DeltaText:  event.Delta.Thinking,
+							BlockIndex: event.Index,
+							IsThinking: true,
+						}
 					}
 				}
-			case "content_block_stop":
-				if currentBlock != nil {
-					block := *currentBlock
-					switch block.Type {
-					case types.ContentBlockText:
-						block.Text = currentText.String()
-					case types.ContentBlockToolUse:
-						block.Input = json.RawMessage(currentToolInput.String())
-						toolUseBlocks = append(toolUseBlocks, block)
-					case types.ContentBlockThinking:
-						block.Thinking = currentText.String()
-					case types.ContentBlockServerToolUse:
-						// 服务端工具调用 (如 web_search_tool)
-						block.Name = currentBlock.Name
-						block.Input = json.RawMessage(currentToolInput.String())
-					case types.ContentBlockServerToolResult:
-						// 服务端工具结果
-						block.Content = currentText.String()
-					}
-					assistantBlocks = append(assistantBlocks, block)
+				if event.Delta.StopReason != "" {
+					stopReason = event.Delta.StopReason
 				}
+			}
+		case "content_block_stop":
+			if currentBlock != nil {
+				block := *currentBlock
+				switch block.Type {
+				case types.ContentBlockText:
+					block.Text = currentText.String()
+				case types.ContentBlockToolUse:
+					block.Input = json.RawMessage(currentToolInput.String())
+					toolUseBlocks = append(toolUseBlocks, block)
+					if streamCh != nil {
+						inputSummary := currentToolInput.String()
+						if len(inputSummary) > 200 {
+							inputSummary = inputSummary[:200] + "..."
+						}
+						streamCh <- types.StreamEvent{
+							Kind:      types.StreamEventToolStart,
+							ToolName:  block.Name,
+							ToolInput: inputSummary,
+						}
+					}
+				case types.ContentBlockThinking:
+					block.Thinking = currentText.String()
+				case types.ContentBlockServerToolUse:
+					block.Name = currentBlock.Name
+					block.Input = json.RawMessage(currentToolInput.String())
+				case types.ContentBlockServerToolResult:
+					block.Content = currentText.String()
+				}
+				assistantBlocks = append(assistantBlocks, block)
+				if streamCh != nil {
+					streamCh <- types.StreamEvent{Kind: types.StreamEventBlockDone, BlockIndex: event.Index}
+				}
+			}
 			case "message_delta":
 				if event.Usage != nil {
 					usage = event.Usage
@@ -387,8 +490,6 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				continue
 			}
 
-			// 断路器: 累计连续错误
-			// 对应 TS: consecutiveErrorCount++ → 超阈值时退出循环
 			consecutiveErrors++
 			if consecutiveErrors >= maxConsecutiveErrors {
 				errMsg := types.Message{
@@ -402,6 +503,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					CreatedAt:         time.Now(),
 				}
 				ch <- errMsg
+				if streamCh != nil {
+					streamCh <- types.StreamEvent{Kind: types.StreamEventError, Error: streamErr}
+				}
 				return messages, types.Terminal{Reason: "circuit_breaker", Error: streamErr}
 			}
 
@@ -451,6 +555,20 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				CreatedAt:  time.Now(),
 			}
 			ch <- assistantMsg
+			if streamCh != nil {
+				streamCh <- types.StreamEvent{Kind: types.StreamEventMessageDone, Message: &assistantMsg}
+			}
+			if e.SessionStore != nil {
+				e.SessionStore.AppendAssistantMessage(assistantMsg)
+			}
+			if usage != nil {
+				e.mu.Lock()
+				e.CumulativeUsage.InputTokens += usage.InputTokens
+				e.CumulativeUsage.OutputTokens += usage.OutputTokens
+				e.CumulativeUsage.CacheReadInputTokens += usage.CacheReadInputTokens
+				e.CumulativeUsage.CacheCreationInputTokens += usage.CacheCreationInputTokens
+				e.mu.Unlock()
+			}
 			messages = append(messages, assistantMsg)
 		}
 
@@ -561,6 +679,20 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		for _, result := range toolResults {
 			ch <- result
 			messages = append(messages, result)
+			if streamCh != nil {
+				for _, cb := range result.Content {
+					if cb.Type == types.ContentBlockToolResult {
+						summary := cb.Content
+						if len(summary) > 200 {
+							summary = summary[:200] + "..."
+						}
+						streamCh <- types.StreamEvent{
+							Kind:       types.StreamEventToolDone,
+							ToolResult: summary,
+						}
+					}
+				}
+			}
 		}
 	}
 }

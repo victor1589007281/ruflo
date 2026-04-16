@@ -16,9 +16,11 @@
 package tool
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -250,7 +252,17 @@ func RunToolUse(
 		if reason == "" {
 			reason = "需要用户确认后方可执行该工具"
 		}
-		return makeErrorResult("权限待确认: " + reason)
+		if tctx != nil && !tctx.IsNonInteractive {
+			approved, alwaysAllow := promptUserApproval(toolName, block.Input, reason)
+			if !approved {
+				return makeErrorResult("用户拒绝: " + toolName)
+			}
+			if alwaysAllow && tctx.GlobalPerm != nil {
+				tctx.GlobalPerm.AddSessionAllowRule(toolName)
+			}
+		} else {
+			return makeErrorResult("权限待确认: " + reason)
+		}
 	default:
 		// allow — 继续执行
 	}
@@ -283,5 +295,28 @@ func RunToolUse(
 			Content:   content,
 			IsError:   result.IsError,
 		}},
+	}
+}
+
+func promptUserApproval(toolName string, input json.RawMessage, reason string) (approved bool, alwaysAllow bool) {
+	inputStr := string(input)
+	if len(inputStr) > 200 {
+		inputStr = inputStr[:200] + "..."
+	}
+	fmt.Printf("\n\033[33m[权限] %s 请求执行: %s\033[0m\n", toolName, reason)
+	fmt.Printf("  输入: %s\n", inputStr)
+	fmt.Print("  允许? [y/n/a(始终允许)] ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(strings.ToLower(line))
+
+	switch line {
+	case "y", "yes":
+		return true, false
+	case "a", "always":
+		return true, true
+	default:
+		return false, false
 	}
 }

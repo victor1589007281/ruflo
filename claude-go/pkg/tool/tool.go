@@ -21,6 +21,7 @@ import (
 // 由 pkg/permissions.Checker 实现。
 type GlobalPermissionChecker interface {
 	CheckGlobal(toolName string, input json.RawMessage, isReadOnly bool, toolPerm *types.PermissionResult) types.PermissionResult
+	AddSessionAllowRule(toolName string)
 }
 
 // Tool 定义一个可被 LLM 调用的工具。

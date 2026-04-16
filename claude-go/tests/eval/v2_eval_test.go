@@ -13,12 +13,18 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/browser"
+	"github.com/anthropic/claude-go/pkg/commands"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/metrics"
+	"github.com/anthropic/claude-go/pkg/permissions"
+	"github.com/anthropic/claude-go/pkg/session"
+	"github.com/anthropic/claude-go/pkg/settings"
+	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
+	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/anthropic/claude-go/pkg/wiki"
 )
 
@@ -237,6 +243,15 @@ func TestV2Eval(t *testing.T) {
 		testDreamingConsolidate(t, report)
 		testArchitectMultiPlan(t, report)
 		testStrategyShiftBottleneck(t, report)
+	})
+
+	t.Run("v13 Claude Client 交互能力复刻评测", func(t *testing.T) {
+		testStreamEvent(t, report)
+		testSessionStore(t, report)
+		testCommandRegistry(t, report)
+		testInteractivePermissions(t, report)
+		testSettingsSystem(t, report)
+		testContextManagement(t, report)
 	})
 
 	report.EndTime = time.Now()
@@ -4265,4 +4280,289 @@ func testStrategyShiftBottleneck(t *testing.T, report *WikiEvalReport) {
 	}
 
 	report.Add("strategy-bottleneck", "策略转换瓶颈映射", score, 10, "瓶颈分类+类型+联动+上限")
+}
+
+// ====================================================================
+// v13: Claude Client 交互能力复刻评测 (6 项, 60 分)
+// ====================================================================
+
+func testStreamEvent(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 72.1 StreamEventKind 常量定义完整
+	kinds := []types.StreamEventKind{
+		types.StreamEventDelta,
+		types.StreamEventBlockDone,
+		types.StreamEventMessageDone,
+		types.StreamEventToolStart,
+		types.StreamEventToolDone,
+		types.StreamEventError,
+	}
+	if len(kinds) == 6 {
+		score += 3
+		t.Log("✓ StreamEventKind 6 种类型完整")
+	}
+
+	// 72.2 StreamEvent 结构体关键字段
+	ev := types.StreamEvent{
+		Kind:       types.StreamEventDelta,
+		DeltaText:  "hello",
+		BlockIndex: 0,
+		IsThinking: true,
+	}
+	if ev.DeltaText == "hello" && ev.IsThinking {
+		score += 3
+		t.Log("✓ StreamEvent Delta+Thinking 字段可用")
+	}
+
+	// 72.3 StreamEvent ToolStart/Done
+	evTool := types.StreamEvent{
+		Kind:       types.StreamEventToolStart,
+		ToolName:   "Read",
+		ToolInput:  `{"path":"main.go"}`,
+	}
+	if evTool.ToolName == "Read" {
+		score += 2
+		t.Log("✓ StreamEvent ToolStart 字段可用")
+	}
+
+	// 72.4 StreamEvent MessageDone 携带完整消息
+	msg := types.Message{UUID: "test-uuid", Type: types.MessageTypeAssistant}
+	evMsg := types.StreamEvent{
+		Kind:    types.StreamEventMessageDone,
+		Message: &msg,
+	}
+	if evMsg.Message != nil && evMsg.Message.UUID == "test-uuid" {
+		score += 2
+		t.Log("✓ StreamEvent MessageDone 携带完整 Message")
+	}
+
+	report.Add("stream-event", "StreamEvent 流式输出类型", score, 10, "6种类型+Delta+Thinking+Tool+MessageDone")
+}
+
+func testSessionStore(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 73.1 创建 SessionStore
+	tmpDir := t.TempDir()
+	store, err := session.NewSessionStore(tmpDir)
+	if err == nil && store != nil {
+		score += 2
+		t.Log("✓ SessionStore 创建成功")
+	} else {
+		t.Logf("✗ SessionStore 创建失败: %v", err)
+		report.Add("session-store", "会话持久化", score, 10, "创建+追加+加载+恢复+历史")
+		return
+	}
+
+	// 73.2 SessionID 非空
+	if store.SessionID() != "" {
+		score += 1
+		t.Log("✓ SessionID 非空")
+	}
+
+	// 73.3 追加并加载消息
+	msg := types.Message{
+		UUID: "u1",
+		Type: types.MessageTypeUser,
+		Content: []types.ContentBlock{{Type: types.ContentBlockText, Text: "hello"}},
+	}
+	store.AppendUserMessage(msg, "/tmp", "test-model")
+	store.AppendAssistantMessage(types.Message{UUID: "a1", Type: types.MessageTypeAssistant})
+	sid := store.SessionID()
+	entries, err := store.LoadSession(sid)
+	if err == nil && len(entries) == 2 {
+		score += 3
+		t.Log("✓ 追加+加载 2 条记录成功")
+	}
+
+	// 73.4 ResumeSession 恢复消息链
+	msgs, err := store.ResumeSession(sid)
+	if err == nil && len(msgs) == 2 {
+		score += 2
+		t.Log("✓ ResumeSession 恢复 2 条消息")
+	}
+
+	// 73.5 PromptHistory
+	history, err := session.NewPromptHistory()
+	if err == nil && history != nil {
+		history.Append("test prompt", sid)
+		prompts := history.Prompts()
+		if len(prompts) > 0 {
+			score += 2
+			t.Log("✓ PromptHistory 追加+读取成功")
+		}
+	}
+
+	report.Add("session-store", "会话持久化", score, 10, "创建+追加+加载+恢复+历史")
+}
+
+func testCommandRegistry(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 74.1 创建注册表并注册内置命令
+	reg := commands.NewRegistry()
+	commands.RegisterBuiltins(reg)
+
+	all := reg.All()
+	if len(all) >= 15 {
+		score += 3
+		t.Logf("✓ 注册 %d 个可见命令 (≥15)", len(all))
+	}
+
+	// 74.2 Find 查找命令
+	helpCmd := reg.Find("help")
+	if helpCmd != nil && helpCmd.Name == "help" {
+		score += 2
+		t.Log("✓ Find('help') 找到命令")
+	}
+
+	// 74.3 别名查找
+	quitCmd := reg.Find("quit")
+	if quitCmd != nil && quitCmd.Name == "exit" {
+		score += 2
+		t.Log("✓ Find('quit') 通过别名找到 exit")
+	}
+
+	// 74.4 ParseSlashCommand
+	cmd, args := commands.ParseSlashCommand("/model gpt-4")
+	if cmd == "model" && args == "gpt-4" {
+		score += 2
+		t.Log("✓ ParseSlashCommand 解析 /model gpt-4")
+	}
+
+	// 74.5 CommandNames 包含别名
+	names := reg.CommandNames()
+	if len(names) > len(all) {
+		score += 1
+		t.Logf("✓ CommandNames %d 个 (含别名, > %d 个命令)", len(names), len(all))
+	}
+
+	report.Add("command-registry", "斜杠命令框架", score, 10, "注册+查找+别名+解析+补全")
+}
+
+func testInteractivePermissions(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 75.1 Checker.AddSessionAllowRule 存在且可调用
+	checker := permissions.NewChecker(types.PermissionMode("default"))
+	initialLen := len(checker.AllowRules)
+	checker.AddSessionAllowRule("Shell")
+	if len(checker.AllowRules) == initialLen+1 {
+		score += 3
+		t.Log("✓ AddSessionAllowRule 添加了 1 条规则")
+	}
+
+	// 75.2 新加的规则 Source 为 session_interactive
+	lastRule := checker.AllowRules[len(checker.AllowRules)-1]
+	if lastRule.Source == "session_interactive" && lastRule.ToolName == "Shell" {
+		score += 3
+		t.Log("✓ session_interactive 规则 Source 和 ToolName 正确")
+	}
+
+	// 75.3 GlobalPermissionChecker 接口包含 AddSessionAllowRule
+	var _ tool.GlobalPermissionChecker = checker
+	score += 4
+	t.Log("✓ Checker 实现 GlobalPermissionChecker 接口 (含 AddSessionAllowRule)")
+
+	report.Add("interactive-perm", "交互式权限审批", score, 10, "AddRule+Source+接口实现")
+}
+
+func testSettingsSystem(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 76.1 Settings 结构完整
+	s := settings.Settings{
+		Model: "test-model",
+		Env:   map[string]string{"FOO": "bar"},
+		Permissions: settings.PermissionSettings{
+			DefaultMode: "auto",
+			Allow:       []settings.PermissionRule{{Tool: "Read"}},
+			Deny:        []settings.PermissionRule{{Tool: "Shell", Pattern: "rm -rf"}},
+		},
+		McpServers: map[string]settings.McpConfig{
+			"test": {Command: "npx", Args: []string{"test"}},
+		},
+		MaxTokens:    32000,
+		SystemPrompt: "You are helpful",
+	}
+	if s.Model == "test-model" && s.MaxTokens == 32000 {
+		score += 3
+		t.Log("✓ Settings 结构体字段完整")
+	}
+
+	// 76.2 LoadProjectSettings 不崩溃 (空目录)
+	tmpDir := t.TempDir()
+	ps := settings.LoadProjectSettings(tmpDir)
+	if ps != nil {
+		score += 3
+		t.Log("✓ LoadProjectSettings 空目录不崩溃")
+	}
+
+	// 76.3 Load 正常读取
+	settingsPath := tmpDir + "/test-settings.json"
+	data := `{"model":"qwen-max","env":{"KEY":"val"},"maxTokens":65536}`
+	os.WriteFile(settingsPath, []byte(data), 0644)
+	loaded, err := settings.Load(settingsPath)
+	if err == nil && loaded.Model == "qwen-max" && loaded.MaxTokens == 65536 {
+		score += 2
+		t.Log("✓ Load 正常解析 JSON")
+	}
+
+	// 76.4 ApplyEnv 设置环境变量
+	loaded.ApplyEnv()
+	if os.Getenv("KEY") == "val" {
+		score += 2
+		t.Log("✓ ApplyEnv 设置环境变量成功")
+	}
+	_ = s
+
+	report.Add("settings-system", "Settings 配置系统", score, 10, "结构+加载+解析+ApplyEnv")
+}
+
+func testContextManagement(t *testing.T, report *WikiEvalReport) {
+	t.Helper()
+	score := 0.0
+
+	// 77.1 GetContextUsage 存在且默认值合理
+	eng := &engine.QueryEngine{
+		Config:        &engine.Config{Model: "test"},
+		ContextBudget: 200000,
+	}
+	usage := eng.GetContextUsage()
+	if usage.Budget == 200000 && usage.Percentage == 0 {
+		score += 3
+		t.Log("✓ GetContextUsage 初始值: budget=200000, pct=0%")
+	}
+
+	// 77.2 CumulativeUsage 累积
+	eng.CumulativeUsage = types.Usage{InputTokens: 50000, OutputTokens: 10000}
+	usage = eng.GetContextUsage()
+	if usage.TotalTokens == 60000 && usage.Percentage == 30 {
+		score += 3
+		t.Log("✓ CumulativeUsage 累积: 60000 tokens, 30%")
+	}
+
+	// 77.3 高占用预警 (>80%)
+	eng.CumulativeUsage = types.Usage{InputTokens: 170000, OutputTokens: 10000}
+	usage = eng.GetContextUsage()
+	if usage.Percentage > 80 {
+		score += 2
+		t.Logf("✓ 上下文 %.0f%% > 80%%, 触发预警", usage.Percentage)
+	}
+
+	// 77.4 ContextUsageInfo 包含 MessageCount
+	eng.Messages = []types.Message{{UUID: "m1"}, {UUID: "m2"}}
+	usage = eng.GetContextUsage()
+	if usage.MessageCount == 2 {
+		score += 2
+		t.Log("✓ ContextUsageInfo.MessageCount = 2")
+	}
+
+	report.Add("context-mgmt", "上下文管理", score, 10, "GetUsage+累积+预警+MessageCount")
 }

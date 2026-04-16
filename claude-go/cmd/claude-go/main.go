@@ -30,12 +30,15 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
+	"github.com/anthropic/claude-go/pkg/commands"
 	"github.com/anthropic/claude-go/pkg/engine"
+	"github.com/anthropic/claude-go/pkg/settings"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
+	"github.com/anthropic/claude-go/pkg/session"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
@@ -85,21 +88,28 @@ const fullHelpGuide = `Claude Code (Go) - AI 编程助手
   --debug           调试模式
   --mcp-config      MCP 配置 JSON 路径
 
-飞书机器人命令:
+交互式命令:
   /help             查看帮助
   /status           运行状态
   /clear            清除对话
-  /team workflows   查看工作流
-  /cron list        查看定时任务
-  /mcp list         查看 MCP 服务器
-  /skill list       查看技能
-  /dream            手动整理记忆
+  /model            查看/切换模型
+  /cost             查看 token 用量
 
-多Agent协作 (自然语言):
-  "帮我调研 Kubernetes 部署最佳实践"     → 自动创建 research 团队
-  "帮我开发一个用户管理模块"             → 自动创建 development 团队
-  "帮我辩论 Go vs Rust 哪个更适合后端"  → 自动创建 debate 团队
-  "蜂群模式全面分析 AI Agent 技术栈"    → 自动创建 swarm 团队
+  /team create <名称> <工作流>   创建多 Agent 团队
+  /team run <名称> <目标>        启动团队执行
+  /team status [名称]            查看团队状态
+  /team stop/delete <名称>       停止/删除团队
+  /team workflows                查看可用工作流
+
+  /go <工作流> <目标>            一键创建并启动团队
+    例: /go research 调研 k8s 最佳实践
+    例: /go development 开发用户登录模块
+
+  /wiki status                   查看知识库状态
+  /wiki query <问题>             查询知识库
+  /wiki organize [inc]           全量/增量整理
+  /wiki lint                     检查链接健康
+  /wiki health                   LLM 健康检查
 `
 
 var (
@@ -113,6 +123,8 @@ var (
 	flagPrint        bool
 	flagDebug        bool
 	flagMCPConfig    string
+	flagResume       string // --resume <sessionID>
+	flagContinue     bool   // --continue / -c
 )
 
 func main() {
@@ -169,6 +181,8 @@ func main() {
 	rootCmd.PersistentFlags().BoolVarP(&flagPrint, "print", "p", false, "Print 模式 (非交互式)")
 	rootCmd.PersistentFlags().BoolVar(&flagDebug, "debug", false, "调试模式")
 	rootCmd.PersistentFlags().StringVar(&flagMCPConfig, "mcp-config", "", "MCP 配置文件路径 (JSON，顶层 mcpServers)")
+	rootCmd.PersistentFlags().StringVar(&flagResume, "resume", "", "恢复指定 session ID 的对话")
+	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
 
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(runCmd())
@@ -212,8 +226,55 @@ func chatCmd() *cobra.Command {
 				return err
 			}
 
+			cwd, _ := os.Getwd()
+			store, storeErr := session.NewSessionStore(cwd)
+			if storeErr == nil {
+				eng.SessionStore = store
+				defer store.Close()
+
+				if flagResume != "" {
+					msgs, err := store.ResumeSession(flagResume)
+					if err != nil {
+						return fmt.Errorf("resume session %s: %w", flagResume, err)
+					}
+					eng.Messages = msgs
+					fmt.Printf("[已恢复会话 %s, %d 条消息]\n", flagResume, len(msgs))
+				} else if flagContinue {
+					sid, err := store.MostRecentSessionID()
+					if err == nil {
+						msgs, err := store.ResumeSession(sid)
+						if err == nil {
+							eng.Messages = msgs
+							fmt.Printf("[已恢复最近会话 %s, %d 条消息]\n", sid, len(msgs))
+						}
+					}
+				}
+			}
+
+			history, _ := session.NewPromptHistory()
+
+			cmdRegistry := commands.NewRegistry()
+			commands.RegisterBuiltins(cmdRegistry)
+
+			shouldExit := false
+			cmdCtx := &commands.CommandContext{
+				Engine:       eng,
+				SessionStore: store,
+				History:      history,
+				Cwd:          cwd,
+				OnClear: func() {
+					// 清空后可选: 创建新 session
+				},
+				OnExit: func() {
+					shouldExit = true
+				},
+			}
+
 			fmt.Println("Claude Code (Go) - 交互式模式")
-			fmt.Println("输入消息开始对话, /quit 退出, /clear 清空历史")
+			fmt.Println("输入消息开始对话, /help 查看所有命令")
+			if store != nil {
+				fmt.Printf("Session: %s\n", store.SessionID())
+			}
 			fmt.Println("---")
 
 			scanner := bufio.NewScanner(os.Stdin)
@@ -228,20 +289,36 @@ func chatCmd() *cobra.Command {
 				if input == "" {
 					continue
 				}
-				if input == "/quit" || input == "/exit" {
-					break
-				}
-				if input == "/clear" {
-					eng.ClearMessages()
-					fmt.Println("[对话已清空]")
+
+				if strings.HasPrefix(input, "/") {
+					cmdName, cmdArgs := commands.ParseSlashCommand(input)
+					if cmd := cmdRegistry.Find(cmdName); cmd != nil {
+						_ = cmd.Execute(cmdArgs, cmdCtx)
+						if shouldExit {
+							break
+						}
+						continue
+					}
+					fmt.Printf("未知命令: /%s, 输入 /help 查看可用命令\n", cmdName)
 					continue
 				}
 
-				ctx := context.Background()
-				ch := eng.SubmitMessage(ctx, input)
+				if history != nil {
+					sid := ""
+					if store != nil {
+						sid = store.SessionID()
+					}
+					history.Append(input, sid)
+				}
 
-				for msg := range ch {
-					printMessage(msg)
+				ctx := context.Background()
+				streamCh := eng.SubmitStream(ctx, input)
+
+				printStreamEvents(streamCh)
+
+				usage := eng.GetContextUsage()
+				if usage.Percentage > 80 {
+					fmt.Printf("\033[33m[上下文 %.0f%% — 建议 /compact]\033[0m\n", usage.Percentage)
 				}
 			}
 			return nil
@@ -267,11 +344,9 @@ func runCmd() *cobra.Command {
 
 			userPrompt := strings.Join(args, " ")
 			ctx := context.Background()
-			ch := eng.SubmitMessage(ctx, userPrompt)
+			streamCh := eng.SubmitStream(ctx, userPrompt)
 
-			for msg := range ch {
-				printMessage(msg)
-			}
+			printStreamEvents(streamCh)
 			return nil
 		},
 	}
@@ -647,24 +722,45 @@ func rolesCmd() *cobra.Command {
 }
 
 func buildEngine() (*engine.QueryEngine, error) {
+	cwd, _ := os.Getwd()
+
+	projectSettings := settings.LoadProjectSettings(cwd)
+	projectSettings.ApplyEnv()
+
 	apiKey := getAPIKey()
+	if apiKey == "" && projectSettings.AI != nil && projectSettings.AI.APIKey != "" {
+		apiKey = projectSettings.AI.APIKey
+	}
 	if apiKey == "" {
-		return nil, fmt.Errorf("需要 API Key: 设置 ANTHROPIC_API_KEY 环境变量或使用 --api-key 参数")
+		return nil, fmt.Errorf("需要 API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数或 claude-go.json 中的 ai.apiKey")
+	}
+
+	effectiveModel := flagModel
+	if effectiveModel == "qwen3.5-plus" && projectSettings.Model != "" {
+		effectiveModel = projectSettings.Model
+	}
+	if effectiveModel == "qwen3.5-plus" && projectSettings.AI != nil && projectSettings.AI.Model != "" {
+		effectiveModel = projectSettings.AI.Model
 	}
 
 	baseURL := flagBaseURL
 	if baseURL == "" {
 		baseURL = os.Getenv("API_BASE_URL")
 	}
+	if baseURL == "" && projectSettings.AI != nil && projectSettings.AI.BaseURL != "" {
+		baseURL = projectSettings.AI.BaseURL
+	}
 
 	var apiClient *api.Client
 	if baseURL != "" {
-		apiClient = api.NewClient(baseURL, apiKey, flagModel)
+		trimmed := strings.TrimRight(baseURL, "/")
+		if strings.HasSuffix(trimmed, "/anthropic") || strings.HasSuffix(trimmed, "/compatible-mode") {
+			trimmed += "/v1"
+		}
+		apiClient = api.NewClient(trimmed, apiKey, effectiveModel)
 	} else {
-		apiClient = api.NewDashScopeClient(apiKey, flagModel)
+		apiClient = api.NewDashScopeClient(apiKey, effectiveModel)
 	}
-
-	cwd, _ := os.Getwd()
 
 	mcpConns, err := connectMCP(context.Background(), flagMCPConfig)
 	if err != nil {
@@ -672,13 +768,33 @@ func buildEngine() (*engine.QueryEngine, error) {
 	}
 
 	permMode := types.PermissionMode(flagPermission)
+	if permMode == "bypass" && projectSettings.Permissions.DefaultMode != "" {
+		permMode = types.PermissionMode(projectSettings.Permissions.DefaultMode)
+	}
 	permChecker := permissions.NewChecker(permMode)
+
+	for _, rule := range projectSettings.Permissions.Allow {
+		permChecker.AllowRules = append(permChecker.AllowRules, types.PermissionRule{
+			ToolName: rule.Tool,
+			Pattern:  rule.Pattern,
+			Source:   "settings.json",
+		})
+	}
+	for _, rule := range projectSettings.Permissions.Deny {
+		permChecker.DenyRules = append(permChecker.DenyRules, types.PermissionRule{
+			ToolName: rule.Tool,
+			Pattern:  rule.Pattern,
+			Source:   "settings.json",
+		})
+	}
 
 	hookRunner := hooks.NewRunner(nil, "")
 	compactor := compact.NewCompactor(apiClient, 200000)
 	promptMgr := prompt.NewManager(cwd)
 	if flagSystemPrompt != "" {
 		promptMgr.CustomPrompt = flagSystemPrompt
+	} else if projectSettings.SystemPrompt != "" {
+		promptMgr.CustomPrompt = projectSettings.SystemPrompt
 	}
 	skillReg := skills.NewRegistry()
 	skillReg.LoadDefaults(cwd)
@@ -686,10 +802,19 @@ func buildEngine() (*engine.QueryEngine, error) {
 		promptMgr.SkillListing = skillReg.FormatListing()
 	}
 
+	effectiveMaxTokens := flagMaxTokens
+	if effectiveMaxTokens == 16384 && projectSettings.MaxTokens > 0 {
+		effectiveMaxTokens = projectSettings.MaxTokens
+	}
+	effectiveMaxTurns := flagMaxTurns
+	if effectiveMaxTurns == 0 && projectSettings.MaxTurns > 0 {
+		effectiveMaxTurns = projectSettings.MaxTurns
+	}
+
 	cfg := &engine.Config{
-		Model:            flagModel,
-		MaxTokens:        flagMaxTokens,
-		MaxTurns:         flagMaxTurns,
+		Model:            effectiveModel,
+		MaxTokens:        effectiveMaxTokens,
+		MaxTurns:         effectiveMaxTurns,
 		Cwd:              cwd,
 		PermissionMode:   permMode,
 		IsNonInteractive: flagPrint,
@@ -782,6 +907,55 @@ func printMessage(msg types.Message) {
 				}
 			}
 		}
+	}
+}
+
+// printStreamEvents 消费 StreamEvent 通道，实现 token-by-token 实时输出。
+func printStreamEvents(ch <-chan types.StreamEvent) {
+	inThinking := false
+	hasOutput := false
+	for ev := range ch {
+		switch ev.Kind {
+		case types.StreamEventDelta:
+			if ev.IsThinking {
+				if !inThinking {
+					fmt.Print("\033[2m") // dim
+					inThinking = true
+				}
+				fmt.Print(ev.DeltaText)
+			} else {
+				if inThinking {
+					fmt.Print("\033[0m") // reset
+					inThinking = false
+				}
+				fmt.Print(ev.DeltaText)
+			}
+			hasOutput = true
+		case types.StreamEventBlockDone:
+			if inThinking {
+				fmt.Print("\033[0m")
+				inThinking = false
+			}
+		case types.StreamEventToolStart:
+			if flagDebug {
+				fmt.Printf("\n[调用工具: %s]\n", ev.ToolName)
+			}
+		case types.StreamEventToolDone:
+			if flagDebug {
+				result := ev.ToolResult
+				if len(result) > 200 {
+					result = result[:200] + "..."
+				}
+				fmt.Printf("[工具完成] %s\n", result)
+			}
+		case types.StreamEventMessageDone:
+			// MessageDone 标志一轮 assistant 完成
+		case types.StreamEventError:
+			fmt.Fprintf(os.Stderr, "\n[Error] %v\n", ev.Error)
+		}
+	}
+	if hasOutput {
+		fmt.Println()
 	}
 }
 
