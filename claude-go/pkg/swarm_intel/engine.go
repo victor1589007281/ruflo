@@ -20,6 +20,10 @@ type Engine struct {
 	simulator  *Simulator
 	notify     NotifyFunc
 
+	// M10: 工程可靠性组件
+	cc *ContextCompressor // 上下文压缩
+	rc *ResilientCaller   // 弹性调用 (重试/熔断)
+
 	// M6: 持久化 + 历史学习
 	pheromoneStore *PheromoneStore
 	predHistory    *PredictionHistory
@@ -86,13 +90,21 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 		bandit.Register(id)
 	}
 
+	// M10: 可靠性组件
+	cc := DefaultContextCompressor()
+	rcCfg := DefaultResilientConfig()
+	rcCfg.Notify = cfg.Notify
+	rc := NewResilientCaller(llm, rcCfg)
+
 	return &Engine{
-		llm:             llm,
+		llm:             rc, // 用 ResilientCaller 替代裸 LLMClient
 		boids:           boids,
 		fuser:           NewFuser(boids),
 		pheromones:      NewPheromoneMemory(),
-		simulator:       NewSimulator(llm, cfg.Notify),
+		simulator:       NewSimulator(rc, cfg.Notify), // Simulator 也用 rc
 		notify:          cfg.Notify,
+		cc:              cc,
+		rc:              rc,
 		pheromoneStore:  phStore,
 		predHistory:     predHist,
 		reasoningBank:   rBank,
@@ -108,19 +120,28 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 	}
 }
 
-// Predict 执行完整的群体智能预测流水线 (M1-M7)。
+// Predict 执行完整的群体智能预测流水线 (M1-M7, M10 可靠性增强)。
 func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedPrediction, error) {
 	startTime := time.Now()
 	llmCallCount := 0
-	e.notify(chatID, "🧠 群体智能引擎启动 (v2.1 — 含在线校准/拜占庭容错/Bandit路由)...")
 
-	// M6: 检索历史推理路径
+	// M10: 分级超时预算 (默认 5 分钟总预算)
+	totalBudget := 5 * time.Minute
+	if dl, ok := ctx.Deadline(); ok {
+		totalBudget = time.Until(dl)
+	}
+	tb := PredictBudget(totalBudget)
+
+	e.notify(chatID, "🧠 群体智能引擎启动 (v2.2 — M10 工程可靠性增强)...")
+
+	// M6: 检索历史推理路径 (M10: 截断防膨胀)
 	var priorReasoning string
 	if e.reasoningBank != nil {
 		if entries, err := e.reasoningBank.FindSimilar(objective, 3); err == nil && len(entries) > 0 {
 			var parts []string
 			for _, entry := range entries {
-				parts = append(parts, fmt.Sprintf("- [Brier %.3f] %s → %s", entry.BrierScore, entry.Question, entry.Reasoning))
+				reasoning := e.cc.TruncateField(entry.Reasoning, 150)
+				parts = append(parts, fmt.Sprintf("- [Brier %.3f] %s → %s", entry.BrierScore, entry.Question, reasoning))
 			}
 			priorReasoning = strings.Join(parts, "\n")
 			e.notify(chatID, fmt.Sprintf("📚 找到 %d 条历史推理路径可复用", len(entries)))
@@ -130,7 +151,9 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	// Phase 1: Decompose
 	phaseStart := time.Now()
 	e.notify(chatID, "📋 Phase 1/7: 分解目标...")
-	domain, err := e.decompose(ctx, objective)
+	decompCtx, decompCancel := tb.PhaseContext(ctx, "decompose")
+	domain, err := e.decompose(decompCtx, objective)
+	decompCancel()
 	llmCallCount++
 	if err != nil {
 		return nil, fmt.Errorf("decompose: %w", err)
@@ -149,7 +172,9 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 
 	// Phase 2: Scout
 	e.notify(chatID, "🔍 Phase 2/7: 信息侦察...")
-	evidence, err := e.scout(ctx, domain)
+	scoutCtx, scoutCancel := tb.PhaseContext(ctx, "scout")
+	evidence, err := e.scout(scoutCtx, domain)
+	scoutCancel()
 	if err != nil {
 		evidence = []string{"无法获取额外证据，将基于已有知识进行预测"}
 	}
@@ -158,9 +183,11 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	}
 	e.notify(chatID, fmt.Sprintf("  搜集到 %d 条证据", len(evidence)))
 
-	// Phase 3: Predict (独立预测)
-	e.notify(chatID, fmt.Sprintf("🎯 Phase 3/7: %d 个分析师独立预测...", e.numAnalysts))
-	predictions, err := e.predict(ctx, domain, evidence)
+	// Phase 3: Predict (独立预测 — M10: 并行化)
+	e.notify(chatID, fmt.Sprintf("🎯 Phase 3/7: %d 个分析师并行预测...", e.numAnalysts))
+	predCtx, predCancel := tb.PhaseContext(ctx, "predict")
+	predictions, err := e.predict(predCtx, domain, evidence)
+	predCancel()
 	if err != nil {
 		return nil, fmt.Errorf("predict: %w", err)
 	}
@@ -193,14 +220,15 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 		}
 	}
 
-	// Phase 4: Debate (M7 认知不确定性门控)
+	// Phase 4: Debate (M7 门控 + M10 预算控制)
 	debateRound := 0
 	shouldDebate := e.debateGate.ShouldDebate(predictions)
 	if !shouldDebate {
 		e.notify(chatID, "⚡ Phase 4/7: 辩论门控 — 预测已高度一致, 跳过辩论 (节省 ~6x token)")
 	} else {
+		debateCtx, debateCancel := tb.PhaseContext(ctx, "debate")
 		for debateRound < e.maxDebateRounds {
-			if ctx.Err() != nil {
+			if debateCtx.Err() != nil || tb.Expired() {
 				break
 			}
 
@@ -214,7 +242,7 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 				break
 			}
 
-			updated, err := e.debateRound(ctx, domain, evidence, predictions, debateRound+1)
+			updated, err := e.debateRound(debateCtx, domain, evidence, predictions, debateRound+1)
 			if err != nil {
 				break
 			}
@@ -230,6 +258,7 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 				}
 			}
 		}
+		debateCancel()
 	}
 
 	// Phase 5: Fuse (标准融合)
@@ -258,7 +287,9 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 
 	result.PheromoneState = e.pheromones.Snapshot()
 
-	summary, err := e.generateSummary(ctx, domain, result)
+	sumCtx, sumCancel := tb.PhaseContext(ctx, "summary")
+	summary, err := e.generateSummary(sumCtx, domain, result)
+	sumCancel()
 	if err == nil {
 		result.Summary = summary
 	}
@@ -423,9 +454,12 @@ func (e *Engine) decompose(ctx context.Context, objective string) (*PredictionDo
 	return &domain, nil
 }
 
-// scout 信息侦察阶段。
+// scout 信息侦察阶段 (M10: 健壮 JSON 解析)。
 func (e *Engine) scout(ctx context.Context, domain *PredictionDomain) ([]string, error) {
 	var allEvidence []string
+
+	// M10: 上下文压缩 — 背景截断
+	compressedCtx := e.cc.TruncateField(domain.Context, 300)
 
 	for i := 0; i < e.numScouts; i++ {
 		if ctx.Err() != nil {
@@ -437,35 +471,34 @@ func (e *Engine) scout(ctx context.Context, domain *PredictionDomain) ([]string,
 			perspective = "反面视角 (寻找反例和风险)"
 		}
 
-		prompt := fmt.Sprintf(`作为信息侦察员 (%s), 针对以下预测问题搜集关键证据和信息。
+		prompt := fmt.Sprintf(`作为信息侦察员 (%s), 针对以下预测问题搜集关键证据。
 
 问题: %s
 背景: %s
 可能结果: %v
 
-请列出最相关的证据、数据点和分析 (每条简洁明了):
+输出严格JSON (不要markdown代码块):
+{"evidence": ["证据1", "证据2", "证据3"]}`, perspective, domain.Question, compressedCtx, domain.Outcomes)
 
-输出JSON:
-{"evidence": ["证据1: ...", "证据2: ...", "证据3: ..."]}`, perspective, domain.Question, domain.Context, domain.Outcomes)
-
-		resp, err := e.llm.SimpleComplete(ctx, "你是信息情报分析师。搜集全面、多角度的证据。", prompt)
+		resp, err := e.llm.SimpleComplete(ctx, "你是信息分析师。只输出JSON。", prompt)
 		if err != nil {
 			continue
 		}
 
-		jsonStr := extractJSON(resp)
-		var parsed struct {
+		// M10: 健壮 JSON 解析
+		type evidenceResp struct {
 			Evidence []string `json:"evidence"`
 		}
-		if json.Unmarshal([]byte(jsonStr), &parsed) == nil {
-			allEvidence = append(allEvidence, parsed.Evidence...)
+		result := ParseJSON[evidenceResp](resp)
+		if result.OK {
+			allEvidence = append(allEvidence, result.Value.Evidence...)
 		}
 	}
 
 	return allEvidence, nil
 }
 
-// predict 多 Agent 独立预测。
+// predict 多 Agent 独立预测 (M10: 并行化 + 上下文压缩)。
 func (e *Engine) predict(ctx context.Context, domain *PredictionDomain, evidence []string) ([]AgentPrediction, error) {
 	perspectives := []struct {
 		id   string
@@ -481,27 +514,27 @@ func (e *Engine) predict(ctx context.Context, domain *PredictionDomain, evidence
 		perspectives = perspectives[:e.numAnalysts]
 	}
 
-	evidenceStr := strings.Join(evidence, "\n- ")
+	// M10: 上下文压缩 — 证据去重+截断
+	evidenceStr := e.cc.CompressEvidence(evidence, 1500)
 	outcomesJSON, _ := json.Marshal(domain.Outcomes)
 
-	var predictions []AgentPrediction
+	// M10: 并行化 — 各分析师独立, 可安全并行
+	branches := make(map[string]BranchFunc)
 	for _, p := range perspectives {
-		if ctx.Err() != nil {
-			break
-		}
-
-		prompt := fmt.Sprintf(`你是 %s。你的分析偏向: %s
+		p := p
+		branches[p.id] = func(branchCtx context.Context) (string, error) {
+			prompt := fmt.Sprintf(`你是 %s。你的分析偏向: %s
 
 预测问题: %s
 可能结果: %s
 已知证据:
-- %s
+%s
 
-请独立给出你的概率预测。输出严格JSON:
+请独立给出你的概率预测。输出严格JSON (不要markdown代码块):
 {
   "predictions": {%s},
   "confidence": 0.7,
-  "rationale": "你的推理过程",
+  "rationale": "100字以内推理过程",
   "evidence": ["你重点依据的证据"]
 }
 
@@ -509,14 +542,28 @@ func (e *Engine) predict(ctx context.Context, domain *PredictionDomain, evidence
 - predictions中每个outcome对应一个0-1的概率
 - 所有概率之和必须等于1.0
 - confidence是你对自己预测的置信度(0-1)`, p.role, p.bias, domain.Question, string(outcomesJSON), evidenceStr,
-			buildOutcomeTemplate(domain.Outcomes))
+				buildOutcomeTemplate(domain.Outcomes))
 
-		resp, err := e.llm.SimpleComplete(ctx, fmt.Sprintf("你是%s。给出独立、有依据的概率预测。", p.role), prompt)
-		if err != nil {
+			return e.llm.SimpleComplete(branchCtx,
+				fmt.Sprintf("你是%s。给出独立概率预测。只输出JSON。", p.role), prompt)
+		}
+	}
+
+	cfg := DefaultFanOutConfig()
+	cfg.MaxConcurrency = 3
+	results := FanOutCollect(ctx, cfg, branches)
+
+	var predictions []AgentPrediction
+	roleMap := make(map[string]string)
+	for _, p := range perspectives {
+		roleMap[p.id] = p.role
+	}
+	for _, r := range results {
+		if r.Error != nil {
 			continue
 		}
-
-		pred := parseAgentPrediction(resp, p.id, p.role, domain.Outcomes)
+		role := roleMap[r.ID]
+		pred := parseAgentPrediction(r.Value, r.ID, role, domain.Outcomes)
 		pred.Round = 1
 		predictions = append(predictions, pred)
 	}
@@ -529,23 +576,23 @@ func (e *Engine) predict(ctx context.Context, domain *PredictionDomain, evidence
 
 // forceDiversity Boids Separation: 强制过于相似的 Agent 差异化。
 func (e *Engine) forceDiversity(ctx context.Context, domain *PredictionDomain, evidence []string, predictions []AgentPrediction) ([]AgentPrediction, error) {
-	diversePrompt := fmt.Sprintf(`以下分析师的预测过于一致, 请从完全不同的角度重新分析。
+	// M10: 上下文压缩
+	compressedEvidence := e.cc.CompressEvidence(evidence, 500)
+	diversePrompt := fmt.Sprintf(`分析师预测过于一致, 请从完全不同的角度重新分析。
 
 问题: %s
-当前共识预测: %v
+当前共识: %v
 证据: %s
 
-要求: 寻找被忽略的因素、黑天鹅事件、或反直觉的可能性。
-输出与其他分析师显著不同的概率分布。
-
-输出JSON:
+要求: 寻找被忽略的因素、黑天鹅事件。
+输出严格JSON (不要markdown代码块):
 {
   "predictions": {%s},
   "confidence": 0.5,
-  "rationale": "差异化推理",
+  "rationale": "80字以内差异化推理",
   "evidence": ["反常证据"]
 }`, domain.Question, predictions[0].Predictions,
-		strings.Join(evidence, "; "),
+		compressedEvidence,
 		buildOutcomeTemplate(domain.Outcomes))
 
 	resp, err := e.llm.SimpleComplete(ctx, "你是反共识分析师。专门寻找主流预测忽视的可能性。", diversePrompt)
@@ -566,64 +613,71 @@ func (e *Engine) forceDiversity(ctx context.Context, domain *PredictionDomain, e
 	return result, nil
 }
 
-// debateRound 单轮辩论。
+// debateRound 单轮辩论 (M10: 上下文压缩 + 并行化)。
 func (e *Engine) debateRound(ctx context.Context, domain *PredictionDomain, evidence []string, predictions []AgentPrediction, round int) ([]AgentPrediction, error) {
-	var otherViews strings.Builder
-	for _, p := range predictions {
-		otherViews.WriteString(fmt.Sprintf("[%s] %s (置信度: %.0f%%)\n  概率: %v\n  推理: %s\n\n",
-			p.AgentRole, p.AgentID, p.Confidence*100, p.Predictions, p.Rationale))
-	}
+	// M10: 上下文压缩 — 辩论视图只保留概率+摘要推理
+	compressedViews := e.cc.CompressDebateView(predictions)
 
 	topTrails := e.pheromones.TopTrails(3)
 	var trailInfo string
 	if len(topTrails) > 0 {
 		var parts []string
 		for _, t := range topTrails {
-			parts = append(parts, fmt.Sprintf("%s (信素: %.2f, 支持者: %d)", t.Hypothesis, t.Strength, t.Supporters))
+			parts = append(parts, fmt.Sprintf("%s(%.2f)", t.Hypothesis, t.Strength))
 		}
-		trailInfo = "\n信素最强假设: " + strings.Join(parts, ", ")
+		trailInfo = "\n信素: " + strings.Join(parts, ", ")
 	}
 
-	var updated []AgentPrediction
+	// M10: 并行化 — 各 agent 更新可并行
+	branches := make(map[string]BranchFunc)
 	for _, p := range predictions {
-		if ctx.Err() != nil {
-			break
-		}
-
-		prompt := fmt.Sprintf(`辩论第 %d 轮。你是 %s。
+		p := p
+		branches[p.AgentID] = func(branchCtx context.Context) (string, error) {
+			// M10: 自身推理也截断
+			myRationale := e.cc.TruncateField(p.Rationale, 100)
+			prompt := fmt.Sprintf(`辩论第 %d 轮。你是 %s。
 
 问题: %s
 你的上一轮预测: %v (置信度: %.0f%%)
 你的推理: %s
 
-其他分析师的预测:
-%s
-%s
+其他分析师:
+%s%s
 
-请:
-1. 指出你认为其他分析师的错误
-2. 考虑他们的论点是否改变了你的看法
-3. 更新你的概率预测
-
-输出JSON:
+更新你的预测。输出严格JSON (不要markdown代码块):
 {
   "predictions": {%s},
   "confidence": 0.7,
-  "rationale": "更新后的推理",
-  "evidence": ["新考虑的因素"]
+  "rationale": "80字以内更新推理",
+  "evidence": ["新因素"]
 }`, round, p.AgentRole, domain.Question,
-			p.Predictions, p.Confidence*100, p.Rationale,
-			otherViews.String(), trailInfo,
-			buildOutcomeTemplate(domain.Outcomes))
+				p.Predictions, p.Confidence*100, myRationale,
+				compressedViews, trailInfo,
+				buildOutcomeTemplate(domain.Outcomes))
 
-		resp, err := e.llm.SimpleComplete(ctx,
-			fmt.Sprintf("你是%s。在辩论中更新你的预测，但保持独立判断。", p.AgentRole), prompt)
-		if err != nil {
-			updated = append(updated, p)
+			return e.llm.SimpleComplete(branchCtx,
+				fmt.Sprintf("你是%s。更新预测,只输出JSON。", p.AgentRole), prompt)
+		}
+	}
+
+	cfg := DefaultFanOutConfig()
+	cfg.MaxConcurrency = 3
+	results := FanOutCollect(ctx, cfg, branches)
+
+	// 重组结果, 失败的保留原预测
+	predMap := make(map[string]AgentPrediction)
+	for _, p := range predictions {
+		predMap[p.AgentID] = p
+	}
+
+	var updated []AgentPrediction
+	for _, r := range results {
+		orig := predMap[r.ID]
+		if r.Error != nil {
+			updated = append(updated, orig)
 			continue
 		}
-
-		newPred := parseAgentPrediction(resp, p.AgentID, p.AgentRole, domain.Outcomes)
+		newPred := parseAgentPrediction(r.Value, orig.AgentID, orig.AgentRole, domain.Outcomes)
 		newPred.Round = round
 		updated = append(updated, newPred)
 	}
@@ -693,23 +747,66 @@ func (e *Engine) formatResult(result *FusedPrediction) string {
 // --- Helpers ---
 
 func extractJSON(s string) string {
-	start := strings.Index(s, "{")
+	// 先去掉 markdown 代码块标记
+	cleaned := s
+	cleaned = strings.ReplaceAll(cleaned, "```json", "")
+	cleaned = strings.ReplaceAll(cleaned, "```JSON", "")
+	cleaned = strings.ReplaceAll(cleaned, "```", "")
+	cleaned = strings.TrimSpace(cleaned)
+
+	start := strings.Index(cleaned, "{")
 	if start < 0 {
 		return "{}"
 	}
 	depth := 0
-	for i := start; i < len(s); i++ {
-		switch s[i] {
+	for i := start; i < len(cleaned); i++ {
+		switch cleaned[i] {
 		case '{':
 			depth++
 		case '}':
 			depth--
 			if depth == 0 {
-				return s[start : i+1]
+				return cleaned[start : i+1]
 			}
 		}
 	}
-	return s[start:]
+	return cleaned[start:]
+}
+
+// extractAllJSON 从文本中提取所有顶层 JSON 对象。
+func extractAllJSON(s string) []string {
+	cleaned := s
+	cleaned = strings.ReplaceAll(cleaned, "```json", "")
+	cleaned = strings.ReplaceAll(cleaned, "```JSON", "")
+	cleaned = strings.ReplaceAll(cleaned, "```", "")
+	cleaned = strings.TrimSpace(cleaned)
+
+	var results []string
+	pos := 0
+	for pos < len(cleaned) {
+		start := strings.Index(cleaned[pos:], "{")
+		if start < 0 {
+			break
+		}
+		start += pos
+		depth := 0
+		for i := start; i < len(cleaned); i++ {
+			switch cleaned[i] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					results = append(results, cleaned[start:i+1])
+					pos = i + 1
+					goto next
+				}
+			}
+		}
+		break
+	next:
+	}
+	return results
 }
 
 func buildOutcomeTemplate(outcomes []string) string {

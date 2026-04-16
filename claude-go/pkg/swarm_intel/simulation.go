@@ -2,7 +2,6 @@ package swarm_intel
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -16,6 +15,7 @@ import (
 type Simulator struct {
 	llm    LLMClient
 	notify NotifyFunc
+	cc     *ContextCompressor // M10: 上下文压缩
 }
 
 // NewSimulator 创建场景模拟器。
@@ -23,7 +23,7 @@ func NewSimulator(llm LLMClient, notify NotifyFunc) *Simulator {
 	if notify == nil {
 		notify = func(_, _ string) {}
 	}
-	return &Simulator{llm: llm, notify: notify}
+	return &Simulator{llm: llm, notify: notify, cc: DefaultContextCompressor()}
 }
 
 // Simulate 执行场景模拟。
@@ -73,7 +73,7 @@ func (s *Simulator) socialSimulation(ctx context.Context, chatID, objective stri
 Agent数量: %d
 模拟轮数: %d
 
-请设计模拟场景并输出JSON:
+请设计模拟场景并输出严格JSON (不要markdown代码块):
 {
   "agents": [{"id": "agent_1", "role": "角色名", "stance": "立场", "personality": "性格描述"}],
   "environment": "环境描述",
@@ -92,21 +92,25 @@ Agent数量: %d
 			break
 		}
 
+		historyStr := ""
+		if len(roundResults) > 0 {
+			last := roundResults[len(roundResults)-1]
+			historyStr = truncate(last, 300)
+		}
 		roundPrompt := fmt.Sprintf(`社会模拟第 %d/%d 轮。
 
 模拟设定: %s
 
-历史记录:
-%s
+上轮摘要: %s
 
-请模拟本轮所有Agent的行为和互动, 描述涌现的群体现象。输出JSON:
+请模拟本轮所有Agent的行为和互动, 描述涌现的群体现象。输出严格JSON (不要markdown代码块):
 {
   "round": %d,
-  "agent_actions": [{"agent": "agent_1", "action": "行为描述", "impact": "影响"}],
+  "agent_actions": [{"agent": "agent_1", "action": "行为", "impact": "影响"}],
   "emergent_patterns": ["涌现模式"],
   "key_events": ["关键事件"],
-  "sentiment_shift": "舆论/情绪变化描述"
-}`, round, cfg.Rounds, setupResp, strings.Join(roundResults, "\n"), round)
+  "sentiment_shift": "舆论变化"
+}`, round, cfg.Rounds, truncate(setupResp, 500), historyStr, round)
 
 		resp, err := s.llm.SimpleComplete(ctx, "你是社会行为模拟引擎。忠实模拟Agent互动，关注涌现行为。", roundPrompt)
 		if err != nil {
@@ -119,24 +123,30 @@ Agent数量: %d
 		}
 	}
 
+	allRounds := ""
+	for _, r := range roundResults {
+		allRounds += truncate(r, 200) + "\n"
+	}
 	summaryPrompt := fmt.Sprintf(`总结社会模拟结果。
 
 目标: %s
-模拟记录:
+模拟记录 (摘要):
 %s
 
-请输出JSON:
+输出严格JSON (不要markdown代码块, 不要其他文字):
 {
   "scenarios": [{"name": "场景名", "probability": 0.6, "description": "描述", "key_events": ["事件"]}],
   "emergent_behaviors": ["涌现行为1", "涌现行为2"],
   "summary": "综合总结"
-}`, objective, strings.Join(roundResults, "\n"))
+}`, objective, allRounds)
 
-	summaryResp, err := s.llm.SimpleComplete(ctx, "你是社会模拟分析师。", summaryPrompt)
+	summaryResp, err := s.llm.SimpleComplete(ctx, "你是社会模拟分析师。只输出JSON。", summaryPrompt)
 	if err != nil {
+		// M10: fallback 时也截断
+		allRoundsTrunc := truncate(strings.Join(roundResults, "\n"), 800)
 		return &SimulationResult{
 			Mode: "social", Rounds: len(roundResults),
-			Summary: strings.Join(roundResults, "\n"), CreatedAt: time.Now(),
+			Summary: allRoundsTrunc, CreatedAt: time.Now(),
 		}, nil
 	}
 
@@ -159,7 +169,7 @@ func (s *Simulator) gameSimulation(ctx context.Context, chatID, objective string
 3. 分析是否收敛到纳什均衡
 4. 给出各方最优策略和预期结果
 
-输出JSON:
+输出严格JSON (不要markdown代码块, description每个150字以内):
 {
   "scenarios": [{"name": "均衡名", "probability": 0.5, "description": "描述", "key_events": ["策略变化"]}],
   "emergent_behaviors": ["合作涌现", "背叛模式"],
@@ -174,85 +184,146 @@ func (s *Simulator) gameSimulation(ctx context.Context, chatID, objective string
 	return parseSimulationResult("game", cfg.Rounds, resp), nil
 }
 
-// monteCarloSimulation 蒙特卡洛场景树。
+// monteCarloSimulation 蒙特卡洛场景树 (M10: 并行化 + 健壮解析)。
 func (s *Simulator) monteCarloSimulation(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
-	branches := cfg.Scenarios
-	if len(branches) == 0 {
-		branches = []string{"乐观情景", "基准情景", "悲观情景", "黑天鹅情景"}
+	branchNames := cfg.Scenarios
+	if len(branchNames) == 0 {
+		branchNames = []string{"乐观情景", "基准情景", "悲观情景", "黑天鹅情景"}
 	}
-	s.notify(chatID, fmt.Sprintf("🎲 蒙特卡洛模拟启动: %d 条世界线", len(branches)))
+	s.notify(chatID, fmt.Sprintf("🎲 蒙特卡洛模拟启动: %d 条世界线 (并行)", len(branchNames)))
 
-	var scenarioResults []string
-	for _, branch := range branches {
-		if ctx.Err() != nil {
-			break
-		}
-
-		prompt := fmt.Sprintf(`你是场景模拟引擎。沿着特定的世界线推演未来。
+	// M10: 并行化 — 各世界线独立, 可安全并行
+	fanBranches := make(map[string]BranchFunc)
+	for _, branch := range branchNames {
+		branch := branch
+		fanBranches[branch] = func(branchCtx context.Context) (string, error) {
+			prompt := fmt.Sprintf(`你是场景模拟引擎。沿着特定的世界线推演未来。
 
 目标问题: %s
 世界线: %s
 
-请推演这条世界线的完整发展路径:
-1. 关键转折点
-2. 连锁反应
-3. 最终结果及概率评估
+输出严格JSON (不要markdown代码块):
+{"name": "%s", "probability": 0.25, "description": "200字以内推演描述", "key_events": ["事件1","事件2","事件3"]}`,
+				objective, branch, branch)
 
-输出JSON:
-{"name": "%s", "probability": 0.25, "description": "推演描述", "key_events": ["事件1","事件2","事件3"]}`,
-			objective, branch, branch)
+			return s.llm.SimpleComplete(branchCtx, "你是场景推演专家。只输出JSON。", prompt)
+		}
+	}
 
-		resp, err := s.llm.SimpleComplete(ctx, "你是未来学家和场景推演专家。", prompt)
-		if err != nil {
+	fanCfg := DefaultFanOutConfig()
+	fanCfg.MaxConcurrency = 3
+	fanResults := FanOutCollect(ctx, fanCfg, fanBranches)
+
+	// M10: 健壮 JSON 解析 — 逐分支解析
+	var directScenarios []ScenarioOutcome
+	for _, r := range fanResults {
+		if r.Error != nil {
 			continue
 		}
-		scenarioResults = append(scenarioResults, resp)
+		result := ParseJSON[ScenarioOutcome](r.Value)
+		if result.OK && result.Value.Name != "" {
+			directScenarios = append(directScenarios, result.Value)
+		}
 	}
 
-	mergePrompt := fmt.Sprintf(`合并蒙特卡洛场景树的多条世界线。
+	// 合并 + 生成摘要
+	scenarioSummaries := ""
+	for _, sc := range directScenarios {
+		scenarioSummaries += fmt.Sprintf("- %s (%.0f%%): %s\n", sc.Name, sc.Probability*100, s.cc.TruncateField(sc.Description, 100))
+	}
+	mergePrompt := fmt.Sprintf(`基于蒙特卡洛场景树推演, 归纳涌现行为和综合分析。
 
 目标: %s
-各世界线结果:
+各场景:
 %s
 
-确保概率总和归一化到1.0, 输出JSON:
+输出严格JSON (不要markdown代码块):
 {
-  "scenarios": [{"name":"", "probability": 0.0, "description":"", "key_events":[]}],
-  "emergent_behaviors": ["跨世界线的共同模式"],
-  "summary": "综合分析"
-}`, objective, strings.Join(scenarioResults, "\n---\n"))
+  "emergent_behaviors": ["共同模式1", "共同模式2"],
+  "summary": "200字以内综合分析"
+}`, objective, scenarioSummaries)
 
-	mergeResp, err := s.llm.SimpleComplete(ctx, "你是场景分析专家。", mergePrompt)
-	if err != nil {
-		return &SimulationResult{
-			Mode: "montecarlo", Rounds: len(scenarioResults),
-			Summary: strings.Join(scenarioResults, "\n"), CreatedAt: time.Now(),
-		}, nil
+	mergeResp, err := s.llm.SimpleComplete(ctx, "你是场景分析专家。只输出JSON。", mergePrompt)
+
+	simResult := &SimulationResult{
+		Mode:      "montecarlo",
+		Rounds:    len(directScenarios),
+		Scenarios: directScenarios,
+		CreatedAt: time.Now(),
 	}
 
-	return parseSimulationResult("montecarlo", len(scenarioResults), mergeResp), nil
+	// 归一化概率
+	var probSum float64
+	for _, sc := range simResult.Scenarios {
+		probSum += sc.Probability
+	}
+	if probSum > 0 {
+		for i := range simResult.Scenarios {
+			simResult.Scenarios[i].Probability /= probSum
+		}
+	}
+
+	if err == nil {
+		type mergeResult struct {
+			Emergent []string `json:"emergent_behaviors"`
+			Summary  string   `json:"summary"`
+		}
+		parsed := ParseJSON[mergeResult](mergeResp)
+		if parsed.OK {
+			simResult.Emergent = parsed.Value.Emergent
+			simResult.Summary = parsed.Value.Summary
+		}
+	}
+
+	return simResult, nil
 }
 
+// parseSimulationResult M10 健壮解析: 多级 fallback。
 func parseSimulationResult(mode string, rounds int, raw string) *SimulationResult {
-	jsonStr := extractJSON(raw)
 	result := &SimulationResult{
 		Mode:      mode,
 		Rounds:    rounds,
 		CreatedAt: time.Now(),
 	}
 
-	var parsed struct {
+	// Level 1: 使用 RobustJSONParser 解析完整结构
+	type simResultJSON struct {
 		Scenarios []ScenarioOutcome `json:"scenarios"`
 		Emergent  []string          `json:"emergent_behaviors"`
 		Summary   string            `json:"summary"`
 	}
 
-	if err := json.Unmarshal([]byte(jsonStr), &parsed); err == nil {
-		result.Scenarios = parsed.Scenarios
-		result.Emergent = parsed.Emergent
-		result.Summary = parsed.Summary
-	} else {
-		result.Summary = raw
+	parsed := ParseJSON[simResultJSON](raw)
+	if parsed.OK {
+		result.Scenarios = parsed.Value.Scenarios
+		result.Emergent = parsed.Value.Emergent
+		result.Summary = parsed.Value.Summary
+		return result
+	}
+
+	// Level 2: 尝试提取多个独立 JSON 对象
+	allJSON := extractAllJSON(raw)
+	for _, js := range allJSON {
+		// 单个场景
+		sc := ParseJSON[ScenarioOutcome](js)
+		if sc.OK && sc.Value.Name != "" {
+			result.Scenarios = append(result.Scenarios, sc.Value)
+			continue
+		}
+		// 包含 scenarios 数组的块
+		bulk := ParseJSON[simResultJSON](js)
+		if bulk.OK && len(bulk.Value.Scenarios) > 0 {
+			result.Scenarios = append(result.Scenarios, bulk.Value.Scenarios...)
+			result.Emergent = append(result.Emergent, bulk.Value.Emergent...)
+			if bulk.Value.Summary != "" {
+				result.Summary = bulk.Value.Summary
+			}
+		}
+	}
+
+	// Level 3: fallback — 截断原始文本作为 summary
+	if result.Summary == "" {
+		result.Summary = truncate(raw, 1000)
 	}
 	return result
 }
@@ -284,7 +355,7 @@ Agent角色: 决策者、媒体、公众、对手方、盟友
 
 关注涌现行为: 信息级联、恐慌传播、协调失败、意外联盟
 
-输出JSON:
+输出严格JSON (不要markdown代码块, description每个150字以内):
 {
   "scenarios": [
     {"name": "快速控制", "probability": 0.3, "description": "描述", "key_events": ["事件"]},
@@ -323,7 +394,7 @@ func (s *Simulator) orgSimulation(ctx context.Context, chatID, objective string,
 
 关注涌现行为: 群体极化、社会惰化、群体思维、创新抑制、非正式领导涌现
 
-输出JSON:
+输出严格JSON (不要markdown代码块, 简洁):
 {
   "scenarios": [{"name": "场景", "probability": 0.0, "description": "描述", "key_events": []}],
   "emergent_behaviors": ["涌现行为"],
@@ -352,7 +423,7 @@ func (s *Simulator) creativeSimulation(ctx context.Context, chatID, objective st
 
 关注涌现: 跨领域交叉灵感、非线性联想、范式转移、意外组合
 
-输出JSON:
+输出严格JSON (不要markdown代码块, 简洁):
 {
   "ideas": [
     {"perspective": "视角", "idea": "创意描述", "novelty": 0.8, "feasibility": 0.6}
@@ -379,7 +450,7 @@ func (s *Simulator) creativeSimulation(ctx context.Context, chatID, objective st
 2. 评估每个方案的新颖性和可行性
 3. 找出跨视角的"涌现洞察" (任何单一视角无法产生的灵感)
 
-输出JSON:
+输出严格JSON (不要markdown代码块, 简洁):
 {
   "scenarios": [
     {"name": "方案名", "probability": 0.0, "description": "方案详述", "key_events": ["关键步骤"]}
@@ -415,7 +486,7 @@ func (s *Simulator) marketSimulation(ctx context.Context, chatID, objective stri
 
 关注涌现: 赢者通吃、平台化、颠覆式创新、市场崩溃
 
-输出JSON:
+输出严格JSON (不要markdown代码块, 简洁):
 {
   "scenarios": [{"name": "市场走向", "probability": 0.0, "description": "描述", "key_events": []}],
   "emergent_behaviors": ["市场涌现行为"],
@@ -447,7 +518,7 @@ func (s *Simulator) policySimulation(ctx context.Context, chatID, objective stri
 
 关注涌现: Cobra效应 (政策适得其反)、制度变迁、利益重组
 
-输出JSON:
+输出严格JSON (不要markdown代码块, 简洁):
 {
   "scenarios": [{"name": "政策效果路径", "probability": 0.0, "description": "描述", "key_events": []}],
   "emergent_behaviors": ["涌现效应"],
@@ -480,7 +551,7 @@ func (s *Simulator) techSimulation(ctx context.Context, chatID, objective string
 
 关注涌现: 技术范式转移、涌现的应用场景、意外的跨领域融合
 
-输出JSON:
+输出严格JSON (不要markdown代码块, 简洁):
 {
   "scenarios": [{"name": "技术路径", "probability": 0.0, "description": "描述", "key_events": []}],
   "emergent_behaviors": ["技术涌现"],
