@@ -282,10 +282,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles)
 	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore, bot.evolution, roleReg)
-	// 注入飞书媒体发送回调，让 LLM 在飞书对话中能直接调用 FeishuSendFile 工具发送图片/文件
 	bot.sessions.SetMediaSendFn(bot.SendMediaToChat)
-	// 注入团队管理器，让 LLM 能通过 TeamQuery 工具查询团队状态和报告
-	bot.sessions.SetTeamManager(bot.teamMgr)
 
 	// 9. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
 	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)
@@ -313,8 +310,36 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		Roles:       roleReg,
 	})
 
+	// 10a. 修复: SetTeamManager 必须在 teamMgr 创建后调用 (之前因时序 bug 注入了 nil)
+	bot.sessions.SetTeamManager(bot.teamMgr)
+
 	// 10b. 注入记忆写入 (团队完成后高权重记忆可被检索)
 	bot.teamMgr.SetMemoryWriter(&memoryAdapter{store: bot.memStore})
+
+	// 10c-extra. 注入 LLM 事件回调 → 飞书通知 (限流/熔断/致命错误时主动推送)
+	aiClient.OnLLMEvent = func(eventType, detail string) {
+		icon := "ℹ️"
+		switch eventType {
+		case "retry":
+			icon = "🔄"
+		case "circuit_open":
+			icon = "🔴"
+		case "circuit_close":
+			icon = "🟢"
+		case "fatal":
+			icon = "🚨"
+		}
+		msg := fmt.Sprintf("%s **LLM 事件 [%s]**\n%s", icon, eventType, detail)
+		// 广播到所有活跃团队的 chatID
+		if bot.teamMgr != nil {
+			for _, t := range bot.teamMgr.ListAllTeams() {
+				if t.Status == agent.TeamStatusRunning && t.ChatID != "" {
+					bot.sendLongMessage(context.Background(), t.ChatID, msg)
+				}
+			}
+		}
+		log.Printf("[LLM事件] %s: %s", eventType, detail)
+	}
 
 	// 10c. 注入持续观测指标到 Dreamer (复用 teamMgr 的 Collector)
 	if bot.dreamer != nil && bot.teamMgr.Metrics() != nil {

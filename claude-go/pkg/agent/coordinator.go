@@ -32,6 +32,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -231,9 +232,26 @@ func (c *Coordinator) executeStageWithRetry(
 		c.saveCheckpoint(stage.Name, "failed", attempt, sr.Error)
 
 		if attempt < c.maxRetries {
-			backoff := time.Duration(1<<uint(attempt)) * 2 * time.Second
-			c.notify(c.chatID, fmt.Sprintf("⚠️ 阶段 **%s** 第 %d 次尝试失败, %.0f秒后重试...\n错误: %s",
-				stage.Name, attempt+1, backoff.Seconds(), sr.Error))
+			// 429/限流/熔断 → 更长退避 (基数 ×3)
+			base := 2 * time.Second
+			errLower := strings.ToLower(sr.Error)
+			isRateLimit := strings.Contains(sr.Error, "429") ||
+				strings.Contains(errLower, "rate limit") ||
+				strings.Contains(errLower, "限流") ||
+				strings.Contains(errLower, "熔断")
+			if isRateLimit {
+				base = 10 * time.Second
+			}
+			backoff := time.Duration(1<<uint(attempt)) * base
+			if backoff > 120*time.Second {
+				backoff = 120 * time.Second
+			}
+			retryHint := ""
+			if isRateLimit {
+				retryHint = " (LLM 限流中, 延长等待)"
+			}
+			c.notify(c.chatID, fmt.Sprintf("⚠️ 阶段 **%s** 第 %d 次尝试失败%s, %.0f秒后重试...\n错误: %s",
+				stage.Name, attempt+1, retryHint, backoff.Seconds(), sr.Error))
 
 			select {
 			case <-time.After(backoff):
@@ -374,6 +392,19 @@ func (c *Coordinator) loadCheckpoints() {
 		return
 	}
 	_ = json.Unmarshal(data, &c.checkpoints)
+}
+
+// CompletedCount 返回已完成阶段的数量。
+func (c *Coordinator) CompletedCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for _, cp := range c.checkpoints {
+		if cp.Status == "completed" && cp.Output != "" {
+			count++
+		}
+	}
+	return count
 }
 
 // ClearCheckpoints 清除所有检查点 (新工作流开始时调用)。

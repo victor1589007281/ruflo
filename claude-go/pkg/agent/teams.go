@@ -320,7 +320,8 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 	return team, nil
 }
 
-// RunTeam 启动团队执行
+// RunTeam 启动团队执行。
+// 如果团队之前因 LLM 限流/错误而失败, 重新激活时会从上次的检查点恢复 (跳过已完成的阶段)。
 func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 	ptm.mu.RLock()
 	team, ok := ptm.teams[name]
@@ -335,10 +336,14 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 		team.mu.Unlock()
 		return fmt.Errorf("团队 %q 正在执行中", name)
 	}
+
+	isResume := team.Status == TeamStatusFailed && team.Objective == objective
 	team.Objective = objective
 	team.Status = TeamStatusRunning
 	team.StartedAt = time.Now()
-	team.Stages = nil
+	if !isResume {
+		team.Stages = nil
+	}
 	team.Error = ""
 	ctx, cancel := context.WithCancel(context.Background())
 	team.cancel = cancel
@@ -347,14 +352,19 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 	// 更新黑板上的目标
 	team.Blackboard.Write("objective", objective, "system", "context")
 	team.persist()
-	ptm.notify(team.ChatID, fmt.Sprintf("🚀 团队 **%s** 开始执行\n目标: %s\n工作流: %s", name, objective, team.Workflow))
 
-	go ptm.executeWorkflow(ctx, team)
+	if isResume {
+		ptm.notify(team.ChatID, fmt.Sprintf("♻️ 团队 **%s** 从检查点恢复执行\n目标: %s\n工作流: %s", name, objective, team.Workflow))
+	} else {
+		ptm.notify(team.ChatID, fmt.Sprintf("🚀 团队 **%s** 开始执行\n目标: %s\n工作流: %s", name, objective, team.Workflow))
+	}
+
+	go ptm.executeWorkflow(ctx, team, isResume)
 	return nil
 }
 
-// executeWorkflow 在后台执行工作流
-func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *ProductionTeam) {
+// executeWorkflow 在后台执行工作流。isResume=true 时保留检查点, 从上次失败步骤继续。
+func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *ProductionTeam, isResume ...bool) {
 	// 注入 trace, 确保团队全生命周期有唯一 traceID
 	ctx = logging.WithTrace(ctx)
 	ctx, endSpan := logging.WithSpan(ctx, "team."+team.Name+".execute")
@@ -382,12 +392,21 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 
 	// 使用 Coordinator 带重试和检查点执行
 	coord := NewCoordinator(ptm.pool, ptm.taskTracker, ptm.notify, CoordinatorConfig{
-		MaxRetries:    2,
+		MaxRetries:    3, // 增加重试次数 (429 限流场景需要更多重试)
 		HeartbeatFreq: 30 * time.Second,
 		DataDir:       team.dataDir,
 		ChatID:        team.ChatID,
 	})
-	coord.ClearCheckpoints()
+	resuming := len(isResume) > 0 && isResume[0]
+	if !resuming {
+		coord.ClearCheckpoints()
+	} else {
+		// 恢复模式: 保留已完成阶段的检查点, 从失败处继续
+		restored := coord.CompletedCount()
+		if restored > 0 {
+			ptm.notify(team.ChatID, fmt.Sprintf("♻️ 检查点恢复: %d 个已完成阶段将跳过", restored))
+		}
+	}
 
 	executor := &WorkflowExecutor{
 		factory:     ptm.factory,
@@ -686,7 +705,22 @@ func (ptm *ProductionTeamManager) failTeam(team *ProductionTeam, reason string) 
 	team.Error = reason
 	team.mu.Unlock()
 	team.persist()
-	ptm.notify(team.ChatID, fmt.Sprintf("❌ 团队 **%s** 执行失败: %s", team.Name, reason))
+
+	// 判断是否 LLM 限流/熔断导致, 给出恢复提示
+	lower := strings.ToLower(reason)
+	isLLMIssue := strings.Contains(reason, "429") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "限流") ||
+		strings.Contains(lower, "熔断") ||
+		strings.Contains(lower, "circuit breaker") ||
+		strings.Contains(lower, "overload") ||
+		strings.Contains(lower, "全部失败")
+
+	msg := fmt.Sprintf("❌ 团队 **%s** 执行失败: %s", team.Name, reason)
+	if isLLMIssue {
+		msg += fmt.Sprintf("\n\n💡 **恢复方式**: 等待限流解除后, 使用相同目标重新启动团队即可从检查点恢复:\n`/team go %s %s`\n已完成的阶段会自动跳过。", team.Name, team.Objective)
+	}
+	ptm.notify(team.ChatID, msg)
 }
 
 // StopTeam 停止团队

@@ -20,8 +20,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"math"
+	"math/rand"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/types"
@@ -44,18 +49,37 @@ type OverloadedError struct {
 
 func (e *OverloadedError) Error() string { return e.Message }
 
+// LLMEventFunc 回调: LLM 调用发生重试/熔断等事件时通知外部 (如飞书)。
+// eventType: "retry", "circuit_open", "circuit_close", "fatal"
+type LLMEventFunc func(eventType, detail string)
+
 // Client Anthropic Messages API 客户端。
-// 对应 TS: services/api/claude.ts 中的 API 调用逻辑。
 type Client struct {
 	BaseURL string
 	APIKey  string
 	Model   string
 	Client  *http.Client
-	// RetryCount 请求重试次数 (用于 overloaded / 5xx)
-	RetryCount int
+
+	RetryCount int // 最大重试次数 (429/5xx), 默认 4
+	RetryBase  time.Duration // 退避基数, 默认 3s
+	RetryMax   time.Duration // 退避上限, 默认 60s
+
+	OnLLMEvent LLMEventFunc // 事件回调 (可选, 注入飞书通知)
+
+	// 熔断器
+	cbMu             sync.Mutex
+	consecutiveFails int
+	circuitOpen      bool
+	circuitOpenUntil time.Time
+	cbThreshold      int // 默认 5
+
+	// 统计
+	TotalRetries atomic.Int64
+	TotalFails   atomic.Int64
+	CircuitTrips atomic.Int64
 }
 
-// NewClient 创建 API 客户端
+// NewClient 创建 API 客户端 (内置 429/5xx 重试 + 熔断)
 func NewClient(baseURL, apiKey, model string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
@@ -64,6 +88,80 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		Client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
+		RetryCount:  4,
+		RetryBase:   3 * time.Second,
+		RetryMax:    60 * time.Second,
+		cbThreshold: 5,
+	}
+}
+
+// isRetryable 判断 HTTP 状态码是否可重试
+func isRetryableStatus(code int) bool {
+	return code == 429 || code == 503 || code == 529 || code >= 500
+}
+
+// retryDelay 计算退避时间 (指数退避 + jitter, 429 用 3x 基数)
+func (c *Client) retryDelay(attempt int, statusCode int) time.Duration {
+	base := c.RetryBase
+	if base <= 0 {
+		base = 3 * time.Second
+	}
+	if statusCode == 429 || statusCode == 503 {
+		base = base * 3
+	}
+	delay := time.Duration(float64(base) * math.Pow(2, float64(attempt)))
+	maxD := c.RetryMax
+	if maxD <= 0 {
+		maxD = 60 * time.Second
+	}
+	if delay > maxD {
+		delay = maxD
+	}
+	jitter := time.Duration(float64(delay) * (0.75 + rand.Float64()*0.5))
+	return jitter
+}
+
+func (c *Client) fireEvent(eventType, detail string) {
+	if c.OnLLMEvent != nil {
+		c.OnLLMEvent(eventType, detail)
+	}
+}
+
+func (c *Client) isCircuitOpen() bool {
+	c.cbMu.Lock()
+	defer c.cbMu.Unlock()
+	if !c.circuitOpen {
+		return false
+	}
+	if time.Now().After(c.circuitOpenUntil) {
+		c.circuitOpen = false
+		c.consecutiveFails = 0
+		c.fireEvent("circuit_close", "熔断器半开, 允许试探")
+		return false
+	}
+	return true
+}
+
+func (c *Client) recordSuccess() {
+	c.cbMu.Lock()
+	defer c.cbMu.Unlock()
+	c.consecutiveFails = 0
+	c.circuitOpen = false
+}
+
+func (c *Client) recordFailure(errMsg string) {
+	c.cbMu.Lock()
+	defer c.cbMu.Unlock()
+	c.consecutiveFails++
+	threshold := c.cbThreshold
+	if threshold <= 0 {
+		threshold = 5
+	}
+	if c.consecutiveFails >= threshold && !c.circuitOpen {
+		c.circuitOpen = true
+		c.circuitOpenUntil = time.Now().Add(30 * time.Second)
+		c.CircuitTrips.Add(1)
+		c.fireEvent("circuit_open", fmt.Sprintf("连续 %d 次失败, 熔断 30s: %s", c.consecutiveFails, errMsg))
 	}
 }
 
@@ -105,7 +203,12 @@ func (c *Client) StreamMessage(
 		defer close(eventCh)
 		defer close(errCh)
 
-		// 构建系统提示词
+		if c.isCircuitOpen() {
+			c.fireEvent("circuit_open", "熔断器开启, StreamMessage 被拒绝")
+			errCh <- fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
+			return
+		}
+
 		var system interface{}
 		if len(systemPrompt) == 1 {
 			system = systemPrompt[0]
@@ -137,49 +240,108 @@ func (c *Client) StreamMessage(
 			return
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(body))
-		if err != nil {
-			errCh <- fmt.Errorf("创建请求失败: %w", err)
-			return
+		maxRetry := c.RetryCount
+		if maxRetry <= 0 {
+			maxRetry = 4
 		}
 
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("x-api-key", c.APIKey)
-		httpReq.Header.Set("anthropic-version", "2023-06-01")
-		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+		var resp *http.Response
+		for attempt := 0; attempt <= maxRetry; attempt++ {
+			if ctx.Err() != nil {
+				errCh <- ctx.Err()
+				return
+			}
 
-		resp, err := c.Client.Do(httpReq)
-		if err != nil {
-			errCh <- fmt.Errorf("API 请求失败: %w", err)
-			return
-		}
-		defer resp.Body.Close()
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(body))
+			if err != nil {
+				errCh <- fmt.Errorf("创建请求失败: %w", err)
+				return
+			}
 
-		if resp.StatusCode != 200 {
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("x-api-key", c.APIKey)
+			httpReq.Header.Set("anthropic-version", "2023-06-01")
+			httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+
+			resp, err = c.Client.Do(httpReq)
+			if err != nil {
+				if attempt < maxRetry {
+					delay := c.retryDelay(attempt, 0)
+					c.TotalRetries.Add(1)
+					c.fireEvent("retry", fmt.Sprintf("Stream 网络错误(尝试 %d/%d), %.0fs 后重试", attempt+1, maxRetry+1, delay.Seconds()))
+					select {
+					case <-time.After(delay):
+						continue
+					case <-ctx.Done():
+						errCh <- ctx.Err()
+						return
+					}
+				}
+				c.recordFailure(err.Error())
+				errCh <- fmt.Errorf("API 请求失败: %w", err)
+				return
+			}
+
+			if resp.StatusCode == 200 {
+				c.recordSuccess()
+				break
+			}
+
 			respBody, _ := io.ReadAll(resp.Body)
-			// 检查特定错误类型 (对应 TS: services/api/errors.ts)
+			resp.Body.Close()
+
+			// 不可重试: prompt_too_long / refusal / 4xx
 			var apiErr types.APIError
 			if json.Unmarshal(respBody, &apiErr) == nil {
 				errType := apiErr.Error.Type
-				// prompt_too_long → 触发 reactive compact
 				if errType == "invalid_request_error" && strings.Contains(apiErr.Error.Message, "prompt is too long") {
 					errCh <- &PromptTooLongError{Message: apiErr.Error.Message}
 					return
 				}
-				// overloaded (529) → 触发重试或 fallback
-				if resp.StatusCode == 529 || errType == "overloaded_error" {
-					errCh <- &OverloadedError{Message: apiErr.Error.Message}
-					return
-				}
-				// refusal → 模型拒绝回答
 				if errType == "refusal" {
 					errCh <- fmt.Errorf("模型拒绝回答 (refusal): %s", apiErr.Error.Message)
 					return
 				}
 			}
+
+			if !isRetryableStatus(resp.StatusCode) {
+				c.recordFailure(string(respBody))
+				errCh <- fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
+				return
+			}
+
+			// 可重试: 429 / 503 / 529 / 5xx
+			if attempt < maxRetry {
+				delay := c.retryDelay(attempt, resp.StatusCode)
+				c.TotalRetries.Add(1)
+				statusHint := "服务端错误"
+				if resp.StatusCode == 429 {
+					statusHint = "限流(429)"
+				} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
+					statusHint = "过载"
+				}
+				c.fireEvent("retry", fmt.Sprintf("Stream %s(尝试 %d/%d), %.0fs 后重试", statusHint, attempt+1, maxRetry+1, delay.Seconds()))
+				select {
+				case <-time.After(delay):
+					continue
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				}
+			}
+
+			c.recordFailure(string(respBody))
+			c.TotalFails.Add(1)
+			c.fireEvent("fatal", fmt.Sprintf("Stream %d 次全部失败", maxRetry+1))
 			errCh <- fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 			return
 		}
+
+		if resp == nil || resp.StatusCode != 200 {
+			errCh <- fmt.Errorf("未获得有效响应")
+			return
+		}
+		defer resp.Body.Close()
 
 		// 解析 SSE 流
 		// SSE 格式: "event: <type>\ndata: <json>\n\n" 或 "data:<json>\n"
@@ -242,8 +404,7 @@ func (c *Client) StreamMessage(
 	return eventCh, errCh
 }
 
-// SendMessage 非流式发送消息。
-// 对应 TS 中的非流式路径 (用于 compact 等内部调用)。
+// SendMessage 非流式发送消息 (内置 429/5xx 自动重试 + 熔断)。
 func (c *Client) SendMessage(
 	ctx context.Context,
 	messages []types.APIMessage,
@@ -251,6 +412,11 @@ func (c *Client) SendMessage(
 	tools []types.APITool,
 	maxTokens int,
 ) (*types.APIResponse, error) {
+	if c.isCircuitOpen() {
+		c.fireEvent("circuit_open", "熔断器开启, SendMessage 被拒绝")
+		return nil, fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
+	}
+
 	var system interface{}
 	if len(systemPrompt) == 1 {
 		system = systemPrompt[0]
@@ -278,37 +444,94 @@ func (c *Client) SendMessage(
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
+	maxRetry := c.RetryCount
+	if maxRetry <= 0 {
+		maxRetry = 4
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", c.APIKey)
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+	var lastErr error
+	for attempt := 0; attempt <= maxRetry; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 
-	resp, err := c.Client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("API 请求失败: %w", err)
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("创建请求失败: %w", err)
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-api-key", c.APIKey)
+		httpReq.Header.Set("anthropic-version", "2023-06-01")
+		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+
+		resp, err := c.Client.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("API 请求失败: %w", err)
+			if attempt < maxRetry {
+				delay := c.retryDelay(attempt, 0)
+				c.TotalRetries.Add(1)
+				log.Printf("[api] SendMessage 网络错误(尝试 %d/%d): %v, %.1fs 后重试", attempt+1, maxRetry+1, err, delay.Seconds())
+				c.fireEvent("retry", fmt.Sprintf("网络错误(尝试 %d/%d): %v, %.0fs 后重试", attempt+1, maxRetry+1, err, delay.Seconds()))
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				continue
+			}
+			c.recordFailure(lastErr.Error())
+			c.TotalFails.Add(1)
+			return nil, lastErr
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("读取响应失败: %w", err)
+		}
+
+		if resp.StatusCode == 200 {
+			c.recordSuccess()
+			var result types.APIResponse
+			if err := json.Unmarshal(respBody, &result); err != nil {
+				return nil, fmt.Errorf("解析响应失败: %w", err)
+			}
+			return &result, nil
+		}
+
+		// 不可重试的客户端错误 (400/401/403)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 && !isRetryableStatus(resp.StatusCode) {
+			c.recordFailure(string(respBody))
+			return nil, fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
+		}
+
+		// 可重试: 429 / 5xx
+		lastErr = fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
+		if attempt < maxRetry {
+			delay := c.retryDelay(attempt, resp.StatusCode)
+			c.TotalRetries.Add(1)
+			statusHint := "服务端错误"
+			if resp.StatusCode == 429 {
+				statusHint = "限流(429)"
+			} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
+				statusHint = "过载"
+			}
+			log.Printf("[api] SendMessage %s(尝试 %d/%d): %.0fs 后重试", statusHint, attempt+1, maxRetry+1, delay.Seconds())
+			c.fireEvent("retry", fmt.Sprintf("LLM %s(尝试 %d/%d), %.0fs 后重试", statusHint, attempt+1, maxRetry+1, delay.Seconds()))
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
 	}
-	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result types.APIResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("解析响应失败: %w", err)
-	}
-
-	return &result, nil
+	c.recordFailure(lastErr.Error())
+	c.TotalFails.Add(1)
+	c.fireEvent("fatal", fmt.Sprintf("LLM 调用 %d 次全部失败: %v", maxRetry+1, lastErr))
+	return nil, fmt.Errorf("LLM 调用 %d 次全部失败: %w", maxRetry+1, lastErr)
 }
 
 // SimpleComplete 简单文本补全: 发送 system+user prompt, 返回回复文本。

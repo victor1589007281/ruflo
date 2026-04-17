@@ -1742,11 +1742,18 @@ CRITICAL: You MUST follow these execution rules strictly:
 </execution_constraints>`
 
 // buildStagePromptWithRoles 优先从 RoleRegistry 获取提示词，降级用 StageDef.Prompt。
+// maxDepOutputLen 每个依赖阶段输出注入 prompt 的最大字符数, 防止上下文膨胀。
+const maxDepOutputLen = 6000
+
 func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map[string]string, roles *RoleRegistry) string {
 	var prevOutput strings.Builder
 	for _, dep := range stage.DependsOn {
 		if r, ok := prevResults[dep]; ok {
-			prevOutput.WriteString(fmt.Sprintf("### Output from %s:\n%s\n\n", dep, r))
+			truncated := r
+			if len(truncated) > maxDepOutputLen {
+				truncated = truncated[:maxDepOutputLen] + "\n...(已截断, 完整输出请参阅黑板)"
+			}
+			prevOutput.WriteString(fmt.Sprintf("### Output from %s:\n%s\n\n", dep, truncated))
 		}
 	}
 
