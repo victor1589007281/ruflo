@@ -3,7 +3,6 @@ package swarm_intel
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -62,95 +61,37 @@ func (s *Simulator) Simulate(ctx context.Context, chatID string, objective strin
 	}
 }
 
-// socialSimulation 多 Agent 社会模拟。
-// Agent 扮演不同利益相关者, 在虚拟环境中互动, 观察涌现行为。
+// socialSimulation 多 Agent 社会模拟 (M10 v2: 单 prompt 模式, 从 5 次→1 次 LLM 调用)。
 func (s *Simulator) socialSimulation(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
-	s.notify(chatID, fmt.Sprintf("🌐 社会模拟启动: %d 个 Agent, %d 轮", cfg.Agents, cfg.Rounds))
+	s.notify(chatID, fmt.Sprintf("🌐 社会模拟启动: %d 个 Agent, %d 轮 (单 prompt)", cfg.Agents, cfg.Rounds))
 
-	setupPrompt := fmt.Sprintf(`你是一个社会模拟设计师。给定目标，设计多Agent社会模拟场景。
+	prompt := fmt.Sprintf(`你是社会模拟引擎。执行完整的多 Agent 社会模拟。
 
 目标: %s
-Agent数量: %d
+Agent 数量: %d
 模拟轮数: %d
 
-请设计模拟场景并输出严格JSON (不要markdown代码块):
-{
-  "agents": [{"id": "agent_1", "role": "角色名", "stance": "立场", "personality": "性格描述"}],
-  "environment": "环境描述",
-  "initial_events": ["事件1", "事件2"],
-  "observation_metrics": ["关注指标1", "关注指标2"]
-}`, objective, cfg.Agents, cfg.Rounds)
-
-	setupResp, err := s.llm.SimpleComplete(ctx, "你是社会模拟设计专家。", setupPrompt)
-	if err != nil {
-		return nil, fmt.Errorf("社会模拟设计失败: %w", err)
-	}
-
-	var roundResults []string
-	for round := 1; round <= cfg.Rounds; round++ {
-		if ctx.Err() != nil {
-			break
-		}
-
-		historyStr := ""
-		if len(roundResults) > 0 {
-			last := roundResults[len(roundResults)-1]
-			historyStr = truncate(last, 300)
-		}
-		roundPrompt := fmt.Sprintf(`社会模拟第 %d/%d 轮。
-
-模拟设定: %s
-
-上轮摘要: %s
-
-请模拟本轮所有Agent的行为和互动, 描述涌现的群体现象。输出严格JSON (不要markdown代码块):
-{
-  "round": %d,
-  "agent_actions": [{"agent": "agent_1", "action": "行为", "impact": "影响"}],
-  "emergent_patterns": ["涌现模式"],
-  "key_events": ["关键事件"],
-  "sentiment_shift": "舆论变化"
-}`, round, cfg.Rounds, truncate(setupResp, 500), historyStr, round)
-
-		resp, err := s.llm.SimpleComplete(ctx, "你是社会行为模拟引擎。忠实模拟Agent互动，关注涌现行为。", roundPrompt)
-		if err != nil {
-			continue
-		}
-		roundResults = append(roundResults, fmt.Sprintf("[第%d轮] %s", round, truncate(resp, 500)))
-
-		if round%2 == 0 {
-			s.notify(chatID, fmt.Sprintf("🔄 社会模拟进度: %d/%d 轮完成", round, cfg.Rounds))
-		}
-	}
-
-	allRounds := ""
-	for _, r := range roundResults {
-		allRounds += truncate(r, 200) + "\n"
-	}
-	summaryPrompt := fmt.Sprintf(`总结社会模拟结果。
-
-目标: %s
-模拟记录 (摘要):
-%s
+请完成以下任务:
+1. 设计 %d 个具有不同立场、性格的 Agent
+2. 模拟 %d 轮互动, 描述每轮关键行为和群体动态变化
+3. 识别涌现行为 (群体极化、信息级联、社会惰化、非正式领导等)
+4. 总结出 2-4 个可能的演化场景及概率
 
 输出严格JSON (不要markdown代码块, 不要其他文字):
 {
-  "scenarios": [{"name": "场景名", "probability": 0.6, "description": "描述", "key_events": ["事件"]}],
-  "emergent_behaviors": ["涌现行为1", "涌现行为2"],
-  "summary": "综合总结"
-}`, objective, allRounds)
+  "scenarios": [
+    {"name": "场景名", "probability": 0.5, "description": "150字以内描述", "key_events": ["事件1", "事件2"]}
+  ],
+  "emergent_behaviors": ["涌现行为1", "涌现行为2", "涌现行为3"],
+  "summary": "300字以内综合分析"
+}`, objective, cfg.Agents, cfg.Rounds, cfg.Agents, cfg.Rounds)
 
-	summaryResp, err := s.llm.SimpleComplete(ctx, "你是社会模拟分析师。只输出JSON。", summaryPrompt)
+	resp, err := s.llm.SimpleComplete(ctx, "你是社会模拟与群体行为专家。只输出JSON。", prompt)
 	if err != nil {
-		// M10: fallback 时也截断
-		allRoundsTrunc := truncate(strings.Join(roundResults, "\n"), 800)
-		return &SimulationResult{
-			Mode: "social", Rounds: len(roundResults),
-			Summary: allRoundsTrunc, CreatedAt: time.Now(),
-		}, nil
+		return nil, fmt.Errorf("社会模拟失败: %w", err)
 	}
 
-	return parseSimulationResult("social", len(roundResults), summaryResp), nil
+	return parseSimulationResult("social", cfg.Rounds, resp), nil
 }
 
 // gameSimulation 博弈论模拟。
@@ -202,8 +143,9 @@ func (s *Simulator) monteCarloSimulation(ctx context.Context, chatID, objective 
 目标问题: %s
 世界线: %s
 
+请根据现实情况独立估算这条世界线的发生概率 (0.0-1.0), 不要简单均分。
 输出严格JSON (不要markdown代码块):
-{"name": "%s", "probability": 0.25, "description": "200字以内推演描述", "key_events": ["事件1","事件2","事件3"]}`,
+{"name": "%s", "probability": 你估算的概率, "description": "200字以内推演描述", "key_events": ["事件1","事件2","事件3"]}`,
 				objective, branch, branch)
 
 			return s.llm.SimpleComplete(branchCtx, "你是场景推演专家。只输出JSON。", prompt)
@@ -408,62 +350,33 @@ func (s *Simulator) orgSimulation(ctx context.Context, chatID, objective string,
 	return parseSimulationResult("org", cfg.Rounds, resp), nil
 }
 
-// creativeSimulation 创意涌现模拟。
-// 通过多Agent头脑风暴产生创新方案。
+// creativeSimulation 创意涌现模拟 (M10 v2: 单 prompt 模式, 从 3 次→1 次 LLM 调用)。
 func (s *Simulator) creativeSimulation(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
-	s.notify(chatID, "💡 创意涌现模拟启动 — 多视角头脑风暴")
+	s.notify(chatID, "💡 创意涌现模拟启动 — 多视角头脑风暴 (单 prompt)")
 
-	// 阶段1: 发散思维 — 每个Agent从不同视角提出创意
-	divergePrompt := fmt.Sprintf(`你是创意涌现引擎。从6个完全不同的视角对目标进行头脑风暴。
-
-目标: %s
-
-6个视角: 技术专家、艺术家、经济学家、哲学家、儿童、外星人
-每个视角必须提出至少2个创意，创意要尽可能不同寻常。
-
-关注涌现: 跨领域交叉灵感、非线性联想、范式转移、意外组合
-
-输出严格JSON (不要markdown代码块, 简洁):
-{
-  "ideas": [
-    {"perspective": "视角", "idea": "创意描述", "novelty": 0.8, "feasibility": 0.6}
-  ],
-  "crossover_insights": ["跨领域灵感"],
-  "paradigm_shifts": ["范式转移"]
-}`, objective)
-
-	divergeResp, err := s.llm.SimpleComplete(ctx, "你是创意大师。追求极致的创新和非常规思维。", divergePrompt)
-	if err != nil {
-		return nil, fmt.Errorf("创意发散失败: %w", err)
-	}
-
-	// 阶段2: 收敛整合 — 将零散创意融合为可行方案
-	s.notify(chatID, "🔄 创意收敛: 整合最佳创意...")
-	convergePrompt := fmt.Sprintf(`基于多视角头脑风暴的创意, 整合为最终方案。
+	prompt := fmt.Sprintf(`你是创意涌现引擎。对以下目标同时执行"发散+收敛"创意流程。
 
 目标: %s
-原始创意:
-%s
 
-请:
-1. 识别最有潜力的创意组合
-2. 评估每个方案的新颖性和可行性
-3. 找出跨视角的"涌现洞察" (任何单一视角无法产生的灵感)
+流程:
+1. 发散: 从6个视角 (技术专家、艺术家、经济学家、哲学家、儿童、外星人) 分别提出创意
+2. 收敛: 将最有潜力的创意跨视角组合为 3 个综合方案
+3. 涌现: 找出任何单一视角无法产生的"跨领域灵感"
 
-输出严格JSON (不要markdown代码块, 简洁):
+输出严格JSON (不要markdown代码块, 不要其他文字):
 {
   "scenarios": [
-    {"name": "方案名", "probability": 0.0, "description": "方案详述", "key_events": ["关键步骤"]}
+    {"name": "方案名", "probability": 0.5, "description": "150字以内方案描述", "key_events": ["关键步骤1", "步骤2"]}
   ],
-  "emergent_behaviors": ["涌现洞察"],
-  "summary": "创意涌现总结"
-}`, objective, truncate(divergeResp, 2000))
+  "emergent_behaviors": ["涌现洞察1", "涌现洞察2", "涌现洞察3"],
+  "summary": "300字以内创意涌现总结"
+}`, objective)
 
-	convergeResp, err := s.llm.SimpleComplete(ctx, "你是创新整合专家。善于从碎片中发现系统性创新。", convergePrompt)
+	resp, err := s.llm.SimpleComplete(ctx, "你是跨学科创新专家。善于从碎片中发现系统性创新。只输出JSON。", prompt)
 	if err != nil {
-		return parseSimulationResult("creative", 2, divergeResp), nil
+		return nil, fmt.Errorf("创意涌现失败: %w", err)
 	}
-	return parseSimulationResult("creative", 2, convergeResp), nil
+	return parseSimulationResult("creative", 1, resp), nil
 }
 
 // marketSimulation 市场竞争模拟。
