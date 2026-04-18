@@ -82,7 +82,8 @@ type TaskNode struct {
 	ConstraintRefs []string `json:"constraintRefs"`
 	AcceptCriteria string   `json:"acceptCriteria"`
 	MaxRetries     int      `json:"maxRetries"`
-	SubGoals       []SubGoal `json:"subGoals,omitempty"` // 子目标 (DeepSeek 风格)
+	Complexity     string   `json:"complexity,omitempty"` // "simple"(2轮), "medium"(3轮), "complex"(5轮)
+	SubGoals       []SubGoal `json:"subGoals,omitempty"`
 
 	Output      string `json:"output"`
 	Error       string `json:"error"`
@@ -130,6 +131,7 @@ type rawTask struct {
 	constraintRefs []string
 	accept         string
 	priority       int
+	complexity     string // "simple", "medium", "complex"
 	subGoals       []SubGoal
 }
 
@@ -276,6 +278,7 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 			ConstraintRefs: rt.constraintRefs,
 			AcceptCriteria: rt.accept,
 			MaxRetries:     o.config.MaxRetries,
+			Complexity:     rt.complexity,
 			SubGoals:       rt.subGoals,
 		}
 		nodes = append(nodes, node)
@@ -304,7 +307,8 @@ type wbsJSONTask struct {
 	Constraints []string `json:"constraints"`
 	Acceptance  string   `json:"acceptance"`
 	Priority    int      `json:"priority"`
-	SubGoals    []SubGoal `json:"subGoals,omitempty"` // 子目标分解 (DeepSeek 风格)
+	Complexity  string   `json:"complexity,omitempty"` // "simple", "medium", "complex"
+	SubGoals    []SubGoal `json:"subGoals,omitempty"`
 }
 
 func stripCodeFences(s string) string {
@@ -346,7 +350,7 @@ func parseWBSFromJSON(planOutput string) []rawTask {
 			role: orchNormalizeRole(t.Role), depNums: deps,
 			designRef: t.DesignRef, constraintRefs: t.Constraints,
 			accept: t.Acceptance, priority: t.Priority,
-			subGoals: t.SubGoals,
+			complexity: t.Complexity, subGoals: t.SubGoals,
 		})
 	}
 	return tasks
@@ -702,8 +706,17 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		return o.executeTaskOnce(ctx, node, objective, team, start)
 	}
 
-	// 使用已有 AdaptiveTerminator 控制对抗轮数 (MAgICoRe + CaRT)
-	terminator := NewAdaptiveTerminator(2, o.config.AdversarialRound)
+	// L1: 自适应任务粒度 — 根据 complexity 调整对抗轮数
+	maxRounds := o.config.AdversarialRound
+	switch node.Complexity {
+	case "simple":
+		maxRounds = 2
+	case "medium":
+		maxRounds = 3
+	case "complex":
+		// 保持默认 (通常 5 轮)
+	}
+	terminator := NewAdaptiveTerminator(2, maxRounds)
 
 	var lastOutput string
 	var lastFeedback string
@@ -756,10 +769,21 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		lastOutput = result
 		node.Output = result
 
-		// === Step 1.5: L2 编译硬门禁 (与 workflow.go 的 runBuildHardGate 对齐) ===
+		// L4: 文件物化 — 提取代码块写入磁盘
+		lang := team.Language
+		if lang == "" {
+			lang = "go"
+		}
+		if team.Cwd != "" {
+			if written := MaterializeCode(team.Cwd, result, lang); len(written) > 0 {
+				o.notify(o.chatID, fmt.Sprintf("📁 %s 文件物化: %d 个文件", node.Title, len(written)))
+			}
+		}
+
+		// === Step 1.5: L2 编译硬门禁 (多语言, 与 workflow.go 的 runBuildHardGate 对齐) ===
 		buildPassed := true
 		if team.Cwd != "" {
-			buildErrors := runBuildCheck(team.Cwd)
+			buildErrors := runBuildCheckLang(team.Cwd, lang)
 			if buildErrors != "" {
 				buildPassed = false
 				o.notify(o.chatID, fmt.Sprintf("🔴 %s 第 %d 轮编译失败, 启动内部修复...", node.Title, round))
@@ -776,7 +800,8 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 					}
 					lastOutput = fixResult
 					node.Output = fixResult
-					buildErrors = runBuildCheck(team.Cwd)
+					MaterializeCode(team.Cwd, fixResult, lang)
+					buildErrors = runBuildCheckLang(team.Cwd, lang)
 					if buildErrors == "" {
 						buildPassed = true
 						o.notify(o.chatID, fmt.Sprintf("  🟢 %s 编译修复成功 (重试 %d)", node.Title, retry))

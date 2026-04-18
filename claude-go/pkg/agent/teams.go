@@ -281,7 +281,8 @@ type ProductionTeam struct {
 	FinishedAt time.Time           `json:"finishedAt,omitempty"`
 	Mailbox    []MailMessage       `json:"mailbox,omitempty"`
 	Error      string              `json:"error,omitempty"`
-	Cwd        string              `json:"cwd,omitempty"` // 工作目录 (用于编译验证和文件清单)
+	Cwd        string              `json:"cwd,omitempty"`      // 工作目录 (用于编译验证和文件清单)
+	Language   string              `json:"language,omitempty"` // 编程语言 ("go","cpp","rust","python"), 空=""go"
 
 	Blackboard *Blackboard `json:"-"` // 共享黑板 (不序列化, 独立持久化)
 	mu         sync.Mutex
@@ -289,6 +290,14 @@ type ProductionTeam struct {
 	mgr        *ProductionTeamManager
 	dataDir    string
 	doneCh     chan struct{} // 关闭信号: 工作流执行完毕时 close
+}
+
+// SetLanguage 设置团队的编程语言 (go/cpp/rust/python)。
+// 必须在 StartTeam 之前调用。影响编译门禁、文件物化和 prompt 模板。
+func (t *ProductionTeam) SetLanguage(lang string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Language = lang
 }
 
 // WaitDone 阻塞直到团队执行完毕。如果 doneCh 尚未初始化则立刻返回。

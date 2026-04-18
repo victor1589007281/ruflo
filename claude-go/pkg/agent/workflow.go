@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -291,24 +292,29 @@ func developmentWorkflow() *WorkflowDef {
   "tasks": [
     {
       "id": 1,
-      "title": "任务标题",
+      "title": "任务标题 (简洁, 单一职责)",
       "role": "coder",
       "dependsOn": [],
       "designRef": "设计章节名",
       "constraints": ["C1"],
-      "acceptance": "go build 通过 + 接口签名与设计一致",
-      "priority": 2
+      "acceptance": "编译通过 + 接口签名与设计一致",
+      "priority": 2,
+      "complexity": "medium",
+      "maxFiles": 3
     }
   ]
 }
 ` + "```" + `
 
 原则:
-1. **原子性**: 每个任务在一轮内可完成
+1. **原子性**: 每个任务应在 1-2 轮 LLM 调用内可完成 (最多 3 个文件, ~8K token 输出)
 2. **可追溯**: 每个任务标注对应的设计章节和约束编号
-3. **验收标准**: 具体、可执行
+3. **验收标准**: 具体、可执行, 必须包含编译命令
 4. **依赖拓扑**: dependsOn 填前置任务 id 数组, 形成 DAG
 5. role 可选: coder, tester, reviewer, researcher, architect
+6. **复杂度标签**: 每个任务标注 "complexity": "simple"(2轮)/"medium"(3轮)/"complex"(5轮)
+7. **粒度控制**: 算法密集型(如解析器/索引)必须拆为 3+ 子任务; 配置类任务合并为 1 个
+8. **理想任务数**: 14-18 个 (大于 10), 每个任务 8-15 分钟完成
 
 ## 职责 3: 定义偏差检测点 (Drift Checkpoints)
 
@@ -334,14 +340,15 @@ func developmentWorkflow() *WorkflowDef {
 ## 核心质量要求 (按优先级排序):
 
 ### P0: 可编译性 (编译不过=本轮自动失败)
-1. **每个文件写完后必须心理验证**: 检查 import 是否齐全, 函数签名是否匹配, 类型是否正确
+1. **每个文件写完后必须心理验证**: 检查 import/include 是否齐全, 函数签名是否匹配, 类型是否正确
 2. **不要使用不确定的 API**: 如果不确定某个标准库函数是否存在, 用最基础的方式实现
-3. **保持 import 一致**: 确保每个 import 的包都实际使用了, 不要遗漏也不要多余
+3. **保持依赖一致**: 确保每个 import/include/use 的包都实际使用了, 不要遗漏也不要多余
+4. **代码必须以 File: path/to/file.ext 格式标注路径**, 便于自动提取到磁盘
 
 ### P1: 完整性 (宁可简化但完整, 不要复杂但截断)
-4. **先写 main 入口**: 第一个输出的文件必须是 main.go, 确保可以 go run
-5. **核心功能优先**: 如果 token 不够输出所有文件, 优先输出核心模块的完整实现
-6. **禁止空壳/TODO**: 所有函数必须有真实实现, 不允许 Mock/Stub
+5. **先写入口文件**: 确保项目可编译运行
+6. **核心功能优先**: 如果 token 不够输出所有文件, 优先输出核心模块的完整实现
+7. **禁止空壳/TODO**: 所有函数必须有真实实现, 不允许 Mock/Stub
 
 ### P2: 工程质量
 7. 【配置集中】使用统一的 config 包管理配置
@@ -363,7 +370,7 @@ func developmentWorkflow() *WorkflowDef {
 				Prompt: `你是对抗式开发中的 Evaluator(只读、多疑的审查者)。
 你的核心使命不仅是审查代码质量, 更要检测实现与设计方案的偏差。
 
-⚠️ 重要: 本轮代码已通过编译门禁 (go build 通过), 你不需要检查编译问题。
+⚠️ 重要: 本轮代码已通过编译门禁, 你不需要检查编译问题。
 请聚焦于逻辑正确性、完整性、安全性和设计对齐。
 
 目标: {objective}
@@ -922,10 +929,10 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 			we.notify(we.chatID, fmt.Sprintf("🔄 第 %d 轮触发重采样 (连续低完整度+编译失败, 换思路)", round))
 			lastGenOutput = ""
 			lastEvalFeedback = "⚠️ **重采样模式**: 前几轮的实现方式无法产出完整代码。请换一种思路:\n" +
-				"1. 先实现最核心的 main 入口和 1 个核心模块, 确保可编译\n" +
-				"2. 每个文件写完后心理运行 go build 验证\n" +
+				"1. 先实现最核心的入口文件和 1 个核心模块, 确保可编译\n" +
+				"2. 每个文件写完后心理验证编译正确性\n" +
 				"3. 宁可功能不全但能编译, 也不要输出不可编译的完整框架\n" +
-				"4. 优先保证: go build 通过 > 功能完整 > 代码优雅"
+				"4. 优先保证: 编译通过 > 功能完整 > 代码优雅"
 		}
 
 		// L5: 注入迭代记忆链 (参考 Reflexion arXiv:2303.11366)
@@ -1025,9 +1032,23 @@ func (we *WorkflowExecutor) runBuildHardGate(
 	if team.Cwd == "" {
 		return true
 	}
-	buildErrors := runBuildCheck(team.Cwd)
+
+	// L4: 文件物化 — 从 Coder 输出提取代码写入磁盘
+	lang := team.Language
+	if lang == "" {
+		lang = "go"
+	}
+	if *lastGenOutput != "" {
+		written := MaterializeCode(team.Cwd, *lastGenOutput, lang)
+		if len(written) > 0 {
+			we.notify(we.chatID, fmt.Sprintf("📁 文件物化: %d 个文件写入磁盘", len(written)))
+		}
+	}
+
+	buildErrors := runBuildCheckLang(team.Cwd, lang)
 	if buildErrors == "" {
-		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译通过", round))
+		tc := GetToolchain(lang)
+		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译通过 (%s)", round, tc.BuildCheckLabel()))
 		if we.metrics != nil {
 			we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
 		}
@@ -1059,10 +1080,11 @@ func (we *WorkflowExecutor) runBuildHardGate(
 			if sr.Status == TaskCompleted {
 				*lastGenOutput = sr.Output
 				prevResults[genStage.Name] = sr.Output
+				MaterializeCode(team.Cwd, sr.Output, lang)
 			}
 		}
 
-		buildErrors = runBuildCheck(team.Cwd)
+		buildErrors = runBuildCheckLang(team.Cwd, lang)
 		if buildErrors == "" {
 			we.notify(we.chatID, fmt.Sprintf("  🟢 编译修复成功 (第 %d 次重试)", retry))
 			if we.metrics != nil {
@@ -1185,12 +1207,16 @@ func (we *WorkflowExecutor) buildFeedbackSection(round int, lastOutput, lastFeed
 	return section
 }
 
-// runBuildGate 编译验证门禁
+// runBuildGate 编译验证门禁 (多语言感知)
 func (we *WorkflowExecutor) runBuildGate(ctx context.Context, team *ProductionTeam, round int, prevFeedback string) string {
 	if team.Cwd == "" {
 		return prevFeedback
 	}
-	buildErrors := runBuildCheck(team.Cwd)
+	lang := team.Language
+	if lang == "" {
+		lang = "go"
+	}
+	buildErrors := runBuildCheckLang(team.Cwd, lang)
 	if buildErrors != "" {
 		we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译检查失败", round))
 		logging.Event(ctx, "adversarial.build_fail", "round", round)
@@ -1383,7 +1409,7 @@ func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStage
 
 %s
 
-修复后确保 go build ./... && go test ./... 通过。
+修复后确保编译和测试通过。
 `, round, e2eResult.Output)
 		fixStage := StageDef{Name: fmt.Sprintf("e2e-fix-round%d", round), Role: "coder", Prompt: fixPrompt}
 		fixResult := we.executeStage(ctx, fixStage, objective, prevResults, team)
@@ -1423,7 +1449,7 @@ func (we *WorkflowExecutor) buildE2EPrompt(objective string, prevResults map[str
 1. **跨模块集成测试**: 模块间接口连通性、数据传递、错误传播
 2. **端到端流程测试**: Happy Path + Error Path 完整链路
 3. **回归验证**: 确认之前发现的问题是否已修复
-4. **编译验证**: go build ./... && go vet ./... && go test -race ./...
+4. **编译验证**: 编译+静态分析+测试通过
 
 必须实际编写测试代码并运行。`)
 	return b.String()
@@ -2511,26 +2537,108 @@ func workspaceFileManifest(cwd string, since time.Time) string {
 		len(files), strings.Join(files, "\n"))
 }
 
-// runBuildCheck 在工作区运行 go build + go vet, 返回错误输出。
-// 空字符串表示编译通过。
+// LanguageToolchain 多语言编译/lint/测试工具链抽象。
+// 支持 Go, C++ (CMake), Rust (Cargo), Python 四种语言。
+type LanguageToolchain struct {
+	Language    string     // "go", "cpp", "rust", "python"
+	BuildCmds   [][]string // 编译命令序列
+	LintCmds    [][]string // 静态分析命令
+	TestCmds    [][]string // 测试命令
+	InitCmds    [][]string // 项目初始化命令
+	FileExt     string     // ".go", ".cpp"/".h", ".rs", ".py"
+	ProjectFile string     // "go.mod", "CMakeLists.txt", "Cargo.toml", "pyproject.toml"
+	Timeout     time.Duration
+}
+
+// GetToolchain 根据语言返回对应工具链。空字符串默认 Go。
+func GetToolchain(lang string) *LanguageToolchain {
+	switch lang {
+	case "cpp", "c++":
+		return &LanguageToolchain{
+			Language:    "cpp",
+			BuildCmds:   [][]string{{"cmake", "-B", "build", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"}, {"cmake", "--build", "build", "--parallel"}},
+			LintCmds:    [][]string{{"cmake", "--build", "build", "--target", "all"}},
+			TestCmds:    [][]string{{"ctest", "--test-dir", "build", "--output-on-failure"}},
+			InitCmds:    [][]string{},
+			FileExt:     ".cpp",
+			ProjectFile: "CMakeLists.txt",
+			Timeout:     120 * time.Second,
+		}
+	case "rust", "rs":
+		return &LanguageToolchain{
+			Language:    "rust",
+			BuildCmds:   [][]string{{"cargo", "build"}},
+			LintCmds:    [][]string{{"cargo", "clippy", "--", "-D", "warnings"}},
+			TestCmds:    [][]string{{"cargo", "test"}},
+			InitCmds:    [][]string{{"cargo", "init", "--name", "agentdb"}},
+			FileExt:     ".rs",
+			ProjectFile: "Cargo.toml",
+			Timeout:     120 * time.Second,
+		}
+	case "python", "py":
+		return &LanguageToolchain{
+			Language:    "python",
+			BuildCmds:   [][]string{{"python", "-m", "py_compile"}},
+			LintCmds:    [][]string{{"python", "-m", "flake8", "."}},
+			TestCmds:    [][]string{{"python", "-m", "pytest"}},
+			InitCmds:    [][]string{},
+			FileExt:     ".py",
+			ProjectFile: "pyproject.toml",
+			Timeout:     60 * time.Second,
+		}
+	default: // "go" or empty
+		return &LanguageToolchain{
+			Language:    "go",
+			BuildCmds:   [][]string{{"go", "build", "./..."}, {"go", "vet", "./..."}},
+			LintCmds:    [][]string{},
+			TestCmds:    [][]string{{"go", "test", "./..."}},
+			InitCmds:    [][]string{},
+			FileExt:     ".go",
+			ProjectFile: "go.mod",
+			Timeout:     30 * time.Second,
+		}
+	}
+}
+
+// BuildCheckLabel 返回编译命令描述 (用于 prompt)
+func (tc *LanguageToolchain) BuildCheckLabel() string {
+	switch tc.Language {
+	case "cpp":
+		return "cmake --build build 通过"
+	case "rust":
+		return "cargo build 通过"
+	case "python":
+		return "python -m py_compile 通过"
+	default:
+		return "go build 通过"
+	}
+}
+
+// runBuildCheck 在工作区运行编译+lint, 返回错误输出。空字符串表示通过。
+// 默认 Go 工具链, 向后兼容。
 func runBuildCheck(cwd string) string {
+	return runBuildCheckLang(cwd, "go")
+}
+
+// runBuildCheckLang 多语言版本的编译检查。
+func runBuildCheckLang(cwd, lang string) string {
 	if cwd == "" {
 		return ""
 	}
-	// 快速检查: 是否有 go.mod
-	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err != nil {
+	tc := GetToolchain(lang)
+	if _, err := os.Stat(filepath.Join(cwd, tc.ProjectFile)); err != nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), tc.Timeout)
 	defer cancel()
 
 	var errors []string
-	for _, args := range [][]string{{"build", "./..."}, {"vet", "./..."}} {
-		cmd := exec.CommandContext(ctx, "go", args...)
+	for _, args := range tc.BuildCmds {
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 		cmd.Dir = cwd
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("go %s 失败:\n%s", args[0], string(out)))
+			errors = append(errors, fmt.Sprintf("%s 失败:\n%s", strings.Join(args, " "), string(out)))
 		}
 	}
 	if len(errors) == 0 {
@@ -2541,6 +2649,54 @@ func runBuildCheck(cwd string) string {
 		result = result[:3000] + "\n...(截断)"
 	}
 	return result
+}
+
+// MaterializeCode 从 LLM 输出中提取代码块并写入磁盘。
+// 匹配 ```lang\n// File: path/to/file.ext\n...``` 或 ```lang:path/to/file.ext\n...``` 模式。
+// 返回写入的文件列表。
+func MaterializeCode(cwd, output, lang string) []string {
+	if cwd == "" || output == "" {
+		return nil
+	}
+	tc := GetToolchain(lang)
+	ext := tc.FileExt
+
+	var written []string
+
+	reBlock := regexp.MustCompile("(?s)```(?:go|cpp|c\\+\\+|rust|rs|python|py|h|hpp|toml|cmake|mod)(?::([^\\n]+))?\\n(.*?)```")
+	reFilePath := regexp.MustCompile(`(?m)^(?://|#|/\*)\s*(?:File|file|PATH|path):\s*(.+?)(?:\s*\*/)?$`)
+
+	for _, match := range reBlock.FindAllStringSubmatch(output, -1) {
+		block := match[2]
+		var filePath string
+
+		if match[1] != "" {
+			filePath = strings.TrimSpace(match[1])
+		} else {
+			if fpMatch := reFilePath.FindStringSubmatch(block); len(fpMatch) > 1 {
+				filePath = strings.TrimSpace(fpMatch[1])
+			}
+		}
+		if filePath == "" {
+			continue
+		}
+
+		if !strings.Contains(filePath, ext) && ext != ".py" {
+			continue
+		}
+
+		full := filepath.Join(cwd, filePath)
+		dir := filepath.Dir(full)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			continue
+		}
+		if err := os.WriteFile(full, []byte(block), 0o644); err != nil {
+			continue
+		}
+		written = append(written, filePath)
+	}
+
+	return written
 }
 
 // buildPrevResultsSummary 将 prevResults map 构建为 summary 字符串 (用于 E2E prompt)

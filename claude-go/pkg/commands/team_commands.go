@@ -144,14 +144,27 @@ func RegisterTeamCommands(r *Registry) {
 			}
 			parts := strings.Fields(args)
 			if len(parts) < 2 {
-				fmt.Println("用法: /go <工作流> <目标>")
+				fmt.Println("用法: /go <工作流> <目标> [--lang go|cpp|rust|python]")
 				fmt.Println("示例: /go research 调研 kubernetes 最佳实践")
 				fmt.Println("      /go development 开发用户登录模块")
+				fmt.Println("      /go dev 用Rust开发AgentDB --lang rust")
 				fmt.Println("      /go creative-v2 做一个产品介绍网页, 导出PNG和PDF")
 				return nil
 			}
 			workflow := strings.ToLower(parts[0])
-			objective := strings.Join(parts[1:], " ")
+
+			// 提取 --lang 参数
+			lang := ""
+			var objParts []string
+			for i := 1; i < len(parts); i++ {
+				if parts[i] == "--lang" && i+1 < len(parts) {
+					lang = strings.ToLower(parts[i+1])
+					i++
+				} else {
+					objParts = append(objParts, parts[i])
+				}
+			}
+			objective := strings.Join(objParts, " ")
 			teamName := fmt.Sprintf("go-%s-%d", workflow, time.Now().Unix()%10000)
 
 			team, err := ctx.TeamMgr.CreateTeam(teamName, workflow, objective, "cli")
@@ -159,7 +172,23 @@ func RegisterTeamCommands(r *Registry) {
 				fmt.Printf("[创建失败: %v]\n", err)
 				return nil
 			}
-			fmt.Printf("🚀 快速启动: 团队 %s (工作流: %s, Agent: %d)\n", team.Name, workflow, len(team.Agents))
+			if lang != "" {
+				team.SetLanguage(lang)
+			}
+			langLabel := "Go"
+			switch lang {
+			case "cpp", "c++":
+				langLabel = "C++"
+			case "rust", "rs":
+				langLabel = "Rust"
+			case "python", "py":
+				langLabel = "Python"
+			}
+			if lang != "" {
+				fmt.Printf("🚀 快速启动: 团队 %s (工作流: %s, 语言: %s, Agent: %d)\n", team.Name, workflow, langLabel, len(team.Agents))
+			} else {
+				fmt.Printf("🚀 快速启动: 团队 %s (工作流: %s, Agent: %d)\n", team.Name, workflow, len(team.Agents))
+			}
 			fmt.Printf("   目标: %s\n", objective)
 
 			if err := ctx.TeamMgr.RunTeam(teamName, objective); err != nil {
