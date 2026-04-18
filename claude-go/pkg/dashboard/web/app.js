@@ -113,11 +113,14 @@
     cmp: { enabled: false, picked: new Set() },
     teamsView: localStorage.getItem('teamsView') || 'list', // list | cards
     cronView: localStorage.getItem('cronView') || 'list',
-    logs: { sse: null, paused: false, filter: '' },
+    logs: { sse: null, paused: false, filter: '', source: '' },
     teamFilter: '',
     cronFilter: '',
+    cronEdit: null,
     tasksFilter: '',
     searchTimer: null,
+    llmStats: { window: '24h', timer: null },
+    blackboardEdit: { key: '', value: '' },
   };
 
   function destroyCharts() {
@@ -138,6 +141,10 @@
     { path: /^\/evolution\/?$/,   render: renderEvolution,     title: 'Evolution 机制',poll: 30000 },
     { path: /^\/swarm\/?$/,       render: renderSwarm,         title: '群体智能',      poll: 20000 },
     { path: /^\/tasks\/?$/,       render: renderTasks,         title: '任务',          poll: 15000 },
+    { path: /^\/workflows\/?$/,   render: renderWorkflows,     title: '工作流 & 团队模板', poll: 0 },
+    { path: /^\/workflows\/(.+)$/,render: renderWorkflows,     title: '工作流详情',    poll: 0 },
+    { path: /^\/backups\/?$/,     render: renderBackups,       title: '备份 & 恢复',   poll: 0 },
+    { path: /^\/llm\/?$/,         render: renderLLMStats,      title: 'LLM 大模型监控', poll: 60000 },
     { path: /^\/logs\/?$/,        render: renderLogs,          title: '实时日志',      poll: 0 },
   ];
 
@@ -619,9 +626,14 @@
       (detail.status === 'running')
         ? h('button', { class: 'btn danger', onClick: () => execAction('team', 'stop', name) }, '⏹ 停止')
         : h('button', { class: 'btn', onClick: () => execAction('team', 'restart', name) }, '↻ 重启'),
+      h('button', { class: 'btn primary', onClick: () => runTeamDiagnose(name) }, '✦ LLM 诊断'),
       h('button', { class: 'btn ghost', onClick: () => execAction('team', 'delete', name, { confirm: '删除该团队的所有记录?' }) }, '🗑 删除'),
       h('button', { class: 'btn ghost small', onClick: () => navigator.clipboard && navigator.clipboard.writeText(location.href) }, '复制链接'),
     ]));
+
+    // 诊断结果挂点
+    const diagSlot = h('div', { id: 'team-diag-slot' });
+    right.appendChild(diagSlot);
 
     right.appendChild(h('div', { class: 'grid grid-4 mb-16' }, [
       statCard('阶段', `${detail.stagesDone}/${detail.stagesTotal}`,
@@ -662,6 +674,101 @@
     })[t] || t;
   }
 
+  async function runTeamDiagnose(name) {
+    const slot = document.getElementById('team-diag-slot');
+    if (!slot) return;
+    slot.innerHTML = '';
+    slot.appendChild(h('div', { class: 'card mb-16' }, [
+      h('h3', {}, 'LLM 诊断中…'),
+      h('div', { class: 'muted' }, '调用共享 LLM 客户端, 分析团队运行过程 / 输出质量 / 与设计偏差…'),
+    ]));
+    try {
+      const resp = await api('/api/teams/' + encodeURIComponent(name) + '/diagnose', { method: 'POST' });
+      const card = h('div', { class: 'card mb-16' });
+      card.appendChild(h('div', { class: 'toolbar-row' }, [
+        h('h3', {}, '✦ 团队 LLM 诊断'),
+        h('div', {}, [
+          h('span', { class: 'badge accent' }, resp.model || resp.llmProfile?.model || 'llm'),
+          h('span', { class: 'badge' }, resp.llmProfile?.provider || ''),
+        ]),
+      ]));
+      if (resp.error) {
+        card.appendChild(h('div', { class: 'insight err' }, h('div', { class: 'insight-title' }, '诊断失败: ' + resp.error)));
+      }
+      if (resp.summary) {
+        const md = h('div', { class: 'md' });
+        md.innerHTML = renderMarkdown(resp.summary);
+        card.appendChild(md);
+      } else if (!resp.error) {
+        card.appendChild(h('div', { class: 'empty' }, '(无返回内容)'));
+      }
+      if (resp.prompt) {
+        const det = h('details', { style: { marginTop: '10px' } }, [
+          h('summary', { class: 'muted' }, '查看 LLM 输入 prompt'),
+          h('pre', { class: 'pre' }, resp.prompt),
+        ]);
+        card.appendChild(det);
+      }
+      slot.innerHTML = '';
+      slot.appendChild(card);
+    } catch (e) {
+      slot.innerHTML = '';
+      slot.appendChild(h('div', { class: 'card mb-16' }, [
+        h('h3', {}, '✦ 团队 LLM 诊断'),
+        h('div', { class: 'insight err' }, h('div', { class: 'insight-title' }, '调用失败: ' + e.message)),
+      ]));
+    }
+  }
+
+  async function renderTeamBlackboard(detail, panel) {
+    panel.innerHTML = '';
+    let bb = {};
+    try { bb = await api('/api/teams/' + encodeURIComponent(detail.name) + '/blackboard'); } catch (_) {}
+    const existing = h('div', { class: 'card mb-16' }, [
+      h('h3', {}, '当前黑板'),
+      (!bb || Object.keys(bb).length === 0)
+        ? h('div', { class: 'empty' }, '黑板为空')
+        : h('pre', { class: 'pre' }, JSON.stringify(bb, null, 2)),
+    ]);
+    panel.appendChild(existing);
+
+    // 写入表单
+    const keyInp = h('input', { class: 'input', placeholder: 'Key (如 notes / budget / hint)', value: state.blackboardEdit.key });
+    const valInp = h('textarea', { class: 'input', rows: 4, style: { width: '100%' },
+      placeholder: 'Value (支持纯文本 / JSON / markdown)', value: state.blackboardEdit.value });
+    const out = h('div', { class: 'muted small', style: { marginTop: '6px' } });
+    const submit = async () => {
+      const key = (keyInp.value || '').trim();
+      const value = valInp.value;
+      if (!key) { toast('key 必填', 'err'); return; }
+      try {
+        let parsed;
+        try { parsed = JSON.parse(value); } catch (_) { parsed = value; }
+        const resp = await api('/api/teams/' + encodeURIComponent(detail.name) + '/blackboard', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ key, value: parsed }),
+        });
+        toast('已写入 ' + key, 'ok');
+        out.textContent = 'ok · ' + (resp.size || '') + ' keys';
+        state.blackboardEdit = { key: '', value: '' };
+        setTimeout(() => renderTeamBlackboard(detail, panel), 300);
+      } catch (e) { toast('写入失败: ' + e.message, 'err'); }
+    };
+    const formCard = h('div', { class: 'card' }, [
+      sectionHeader('写入 / 更新黑板',
+        h('span', { class: 'muted small' }, '对应 blackboard.json, 同时排队 blackboard.write action 给主进程')),
+      h('div', { class: 'form-grid' }, [
+        h('div', {}, [h('label', { class: 'muted' }, 'Key'), keyInp]),
+        h('div', { style: { gridColumn: '1 / -1' } }, [h('label', { class: 'muted' }, 'Value'), valInp]),
+        h('div', { style: { gridColumn: '1 / -1' } }, [
+          h('button', { class: 'btn primary', onClick: submit }, '✓ 写入黑板'),
+          out,
+        ]),
+      ]),
+    ]);
+    panel.appendChild(formCard);
+  }
+
   async function renderTeamTab(tab, detail, panel) {
     panel.innerHTML = '';
     if (tab === 'dag') {
@@ -673,11 +780,7 @@
     } else if (tab === 'agents') {
       renderTeamAgents(detail, panel);
     } else if (tab === 'blackboard') {
-      try {
-        const bb = await api('/api/teams/' + encodeURIComponent(detail.name) + '/blackboard');
-        if (!bb || Object.keys(bb).length === 0) panel.appendChild(h('div', { class: 'empty' }, '黑板为空'));
-        else panel.appendChild(h('pre', { class: 'pre' }, JSON.stringify(bb, null, 2)));
-      } catch (_) { panel.appendChild(h('div', { class: 'empty' }, '无黑板数据')); }
+      await renderTeamBlackboard(detail, panel);
     } else if (tab === 'report') {
       if (!detail.report) panel.appendChild(h('div', { class: 'empty' }, '没有 REPORT.md'));
       else { const mdBox = h('div', { class: 'md' }); mdBox.innerHTML = renderMarkdown(detail.report); panel.appendChild(mdBox); }
@@ -1015,12 +1118,37 @@
   // 6. Metrics
   // ==================================================================
   async function renderMetrics() {
-    const sums = await api('/api/metrics');
+    const sumsRaw = await api('/api/metrics');
+    const sums = Array.isArray(sumsRaw) ? sumsRaw : [];
     const v = $('#view');
     v.innerHTML = '';
-    if (!sums.length) { v.appendChild(h('div', { class: 'empty' }, '暂无指标数据')); return; }
+
+    // 已知模块 (即使当前无事件, 也渲染一个入口卡, 方便用户翻历史 / 确认模块正常)
+    const known = ['team', 'dreaming', 'evolution', 'memory', 'task', 'cron', 'swarm', 'llm', 'api'];
+    const byMod = {};
+    for (const s of sums) byMod[s.module] = s;
+
+    const quick = h('div', { class: 'pill-row mb-16' }, [
+      h('span', { class: 'muted small' }, '快速跳转:'),
+      ...known.map(m => h('a', {
+        class: 'badge' + (byMod[m] ? ' accent' : ''),
+        href: '#/metrics/' + encodeURIComponent(m),
+        style: { cursor: 'pointer', textDecoration: 'none' },
+      }, m + (byMod[m] ? ' · ' + (byMod[m].eventCount || 0) : ' · —'))),
+    ]);
+    v.appendChild(quick);
+
+    const list = [];
+    for (const m of known) if (byMod[m]) list.push(byMod[m]);
+    for (const s of sums) if (!known.includes(s.module)) list.push(s);
+
+    if (!list.length) {
+      v.appendChild(h('div', { class: 'empty' }, '暂无指标数据 · 运行团队 / dreaming / cron 后会自动产生'));
+      return;
+    }
+
     const grid = h('div', { class: 'grid grid-2' });
-    for (const s of sums) {
+    for (const s of list) {
       const alerts = s.trendAlerts || [];
       const card = h('div', {
         class: 'card', style: { cursor: 'pointer' },
@@ -1131,12 +1259,85 @@
           value: state.cronFilter,
           onInput: e => { state.cronFilter = e.target.value; renderCronBody(); },
         }),
+        h('button', {
+          class: 'btn primary small',
+          onClick: () => { state.cronEdit = { open: true, mode: 'create', item: null }; renderCron(); },
+        }, '＋ 新建 Cron'),
         viewToggle(state.cronView, v => { state.cronView = v; localStorage.setItem('cronView', v); navigate(); }),
       ]),
     ]));
+
+    if (state.cronEdit && state.cronEdit.open) {
+      v.appendChild(renderCronEditor(state.cronEdit.item || {}, state.cronEdit.mode));
+    }
+
     v.__cronList = list;
     v.appendChild(h('div', { id: 'cron-body' }));
     renderCronBody();
+  }
+
+  async function cronDelete(c) {
+    if (!confirm('确认删除 cron 任务 ' + (c.name || c.id) + '?')) return;
+    try {
+      await api('/api/actions/cron/delete/' + encodeURIComponent(c.name || c.id), { method: 'POST' });
+      toast('已删除 ' + (c.name || c.id), 'ok');
+      renderCron();
+    } catch (e) { toast('删除失败: ' + e.message, 'err'); }
+  }
+
+  function renderCronEditor(item, mode) {
+    const card = h('div', { class: 'card mb-16' });
+    card.appendChild(sectionHeader(mode === 'create' ? '新建 Cron 任务' : ('编辑 Cron: ' + (item.name || item.id)),
+      h('button', { class: 'btn small ghost', onClick: () => { state.cronEdit = null; renderCron(); } }, '× 关闭')));
+
+    const nameInp = h('input', { class: 'input', placeholder: '任务名 (唯一, 如 daily-summary)',
+      value: item.name || item.id || '', disabled: mode === 'edit' });
+    const schInp = h('input', { class: 'input', placeholder: 'Cron 表达式 (如 0 */4 * * *)', value: item.schedule || '' });
+    const wfInp = h('input', { class: 'input', placeholder: 'Workflow 名 (development / reverse_engineering / ...)',
+      value: item.workflow || '' });
+    const payloadInp = h('textarea', { class: 'input', rows: 3, style: { width: '100%' },
+      placeholder: 'Payload (objective 或 JSON)', value: item.payload || '' });
+    const enabled = h('input', { type: 'checkbox', checked: item.enabled !== false });
+    const out = h('div', { class: 'muted', style: { marginTop: '10px', fontSize: '12px' } });
+
+    const submit = async () => {
+      const body = {
+        name: (nameInp.value || '').trim(),
+        schedule: (schInp.value || '').trim(),
+        workflow: (wfInp.value || '').trim(),
+        payload: (payloadInp.value || ''),
+        enabled: !!enabled.checked,
+      };
+      if (!body.name) { toast('name 必填', 'err'); return; }
+      if (!body.schedule) { toast('schedule 必填', 'err'); return; }
+      try {
+        const action = mode === 'create' ? 'create' : 'update';
+        const resp = await api('/api/actions/cron/' + action + '/' + encodeURIComponent(body.name), {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+        });
+        toast((mode === 'create' ? '已创建' : '已更新') + ' ' + body.name, 'ok');
+        out.textContent = JSON.stringify(resp);
+        state.cronEdit = null;
+        setTimeout(() => renderCron(), 200);
+      } catch (e) {
+        toast('提交失败: ' + e.message, 'err');
+      }
+    };
+
+    card.appendChild(h('div', { class: 'form-grid' }, [
+      h('div', {}, [h('label', { class: 'muted' }, '名称'), nameInp]),
+      h('div', {}, [h('label', { class: 'muted' }, 'Schedule'), schInp]),
+      h('div', {}, [h('label', { class: 'muted' }, 'Workflow'), wfInp]),
+      h('div', {}, [h('label', { class: 'muted' }, '启用'), enabled]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [h('label', { class: 'muted' }, 'Payload'), payloadInp]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [
+        h('button', { class: 'btn primary', onClick: submit }, mode === 'create' ? '▶ 创建' : '✓ 保存'),
+        h('button', { class: 'btn ghost', style: { marginLeft: '8px' },
+          onClick: () => { state.cronEdit = null; renderCron(); } }, '取消'),
+        out,
+      ]),
+    ]));
+    return card;
   }
 
   function renderCronBody() {
@@ -1173,7 +1374,9 @@
               ? h('button', { class: 'btn small ghost', onClick: () => execAction('cron', 'disable', c.id) }, '⏸')
               : h('button', { class: 'btn small', onClick: () => execAction('cron', 'enable', c.id) }, '▶'),
             h('button', { class: 'btn small primary', onClick: () => execAction('cron', 'trigger', c.id) }, '↻'),
-            h('button', { class: 'btn small ghost danger', onClick: () => execAction('cron', 'remove', c.id, { confirm: '删除该 cron 任务?' }) }, '×'),
+            h('button', { class: 'btn small ghost', title: '编辑',
+              onClick: () => { state.cronEdit = { open: true, mode: 'edit', item: c }; renderCron(); } }, '✎'),
+            h('button', { class: 'btn small ghost danger', onClick: () => cronDelete(c) }, '×'),
           ])),
         ]));
       }
@@ -1198,6 +1401,8 @@
               ? h('button', { class: 'btn small ghost', onClick: () => execAction('cron', 'disable', c.id) }, '⏸ 暂停')
               : h('button', { class: 'btn small', onClick: () => execAction('cron', 'enable', c.id) }, '▶ 激活'),
             h('button', { class: 'btn small primary', onClick: () => execAction('cron', 'trigger', c.id) }, '↻ 立即运行'),
+            h('button', { class: 'btn small ghost', onClick: () => { state.cronEdit = { open: true, mode: 'edit', item: c }; renderCron(); } }, '✎ 编辑'),
+            h('button', { class: 'btn small ghost danger', onClick: () => cronDelete(c) }, '× 删除'),
           ]),
         ]));
       }
@@ -1431,32 +1636,78 @@
   async function renderLogs() {
     const v = $('#view');
     v.innerHTML = '';
+
+    // 拉取日志源列表
+    let sources = [];
+    try {
+      const resp = await api('/api/logs/sources');
+      if (Array.isArray(resp)) sources = resp;
+      else if (resp && Array.isArray(resp.sources)) sources = resp.sources;
+    } catch (_) { sources = []; }
+    sources = sources.filter(s => s && (s.exists !== false));
+
+    if (!state.logs.source && sources.length > 0) {
+      state.logs.source = sources[0].id;
+    }
+
+    // 左侧频道列表
+    const left = h('div', { class: 'log-channels' }, [
+      h('div', { class: 'log-channels-hdr' }, [
+        h('strong', {}, '日志频道'),
+        h('span', { class: 'muted small' }, '共 ' + sources.length),
+      ]),
+    ]);
+    for (const s of sources) {
+      const active = s.id === state.logs.source;
+      left.appendChild(h('div', {
+        class: 'log-channel' + (active ? ' active' : ''),
+        onClick: () => { state.logs.source = s.id; renderLogs(); },
+      }, [
+        h('div', { class: 'log-channel-title' }, s.title || s.id),
+        h('div', { class: 'log-channel-meta muted small' }, [
+          h('span', {}, s.module || ''),
+          h('span', {}, (s.sizeBytes ? fmtBytes(s.sizeBytes) : '—')),
+        ]),
+        h('div', { class: 'log-channel-path muted small' }, s.path || ''),
+      ]));
+    }
+    if (sources.length === 0) {
+      left.appendChild(h('div', { class: 'empty' }, '暂无可用日志频道'));
+    }
+
+    // 右侧控制条 + 视图
+    const srcParam = state.logs.source ? ('?source=' + encodeURIComponent(state.logs.source)) : '';
     const ctrls = h('div', { class: 'log-ctrls' }, [
       h('span', { class: 'pulse ' + (state.logs.paused ? 'red' : '') }),
-      h('strong', {}, state.logs.paused ? '已暂停' : '实时日志 · SSE'),
-      h('input', { class: 'input', placeholder: '过滤关键词', onInput: e => state.logs.filter = e.target.value }),
+      h('strong', {}, (state.logs.paused ? '已暂停 · ' : '实时 · ') + (state.logs.source || 'default')),
+      h('input', { class: 'input', placeholder: '过滤关键词', value: state.logs.filter || '',
+                   onInput: e => state.logs.filter = e.target.value }),
       h('button', { class: 'btn small', onClick: () => { state.logs.paused = !state.logs.paused; renderLogs(); } },
         state.logs.paused ? '▶ 继续' : '⏸ 暂停'),
-      h('button', { class: 'btn small ghost', onClick: () => { $('#log-viewer').innerHTML = ''; } }, '清空视图'),
-      h('a', { class: 'btn small', href: '/api/logs/tail?n=1000', target: '_blank' }, '↓ 下载最近 1000 行'),
+      h('button', { class: 'btn small ghost', onClick: () => { const el = $('#log-viewer'); if (el) el.innerHTML = ''; } }, '清空视图'),
+      h('a', { class: 'btn small', href: '/api/logs/tail' + (srcParam ? srcParam + '&n=1000' : '?n=1000'), target: '_blank' }, '↓ 下载最近 1000 行'),
     ]);
-    v.appendChild(ctrls);
+    const pathBar = h('div', { class: 'muted small', id: 'log-path-bar', style: { marginBottom: '8px' } }, '');
     const viewer = h('div', { class: 'log-viewer', id: 'log-viewer' });
-    v.appendChild(viewer);
 
-    const initial = await api('/api/logs/tail?n=500').catch(() => ({ lines: [] }));
+    const right = h('div', { class: 'log-right' }, [ctrls, pathBar, viewer]);
+    const wrap = h('div', { class: 'two-col logs-layout' }, [left, right]);
+    v.appendChild(wrap);
+
+    const tailURL = '/api/logs/tail' + (srcParam ? srcParam + '&n=500' : '?n=500');
+    const initial = await api(tailURL).catch(() => ({ lines: [] }));
     if (initial.path) {
-      const hdr = h('div', { class: 'muted', style: { marginBottom: '8px' } }, 'tail: ' + initial.path);
-      v.insertBefore(hdr, viewer);
+      pathBar.textContent = 'tail: ' + initial.path;
     } else {
-      viewer.appendChild(h('div', { class: 'empty' }, '未找到日志文件 (.claude-go/.dashboard/dashboard.log 或 $HOME/.claude-go/history.jsonl)'));
+      viewer.appendChild(h('div', { class: 'empty' }, '未找到日志文件'));
       return;
     }
-    for (const line of initial.lines) appendLogLine(viewer, line);
+    for (const line of (initial.lines || [])) appendLogLine(viewer, line);
     viewer.scrollTop = viewer.scrollHeight;
 
     if (state.logs.sse) try { state.logs.sse.close(); } catch (_) {}
-    state.logs.sse = new EventSource('/api/logs/stream');
+    const streamURL = '/api/logs/stream' + srcParam;
+    state.logs.sse = new EventSource(streamURL);
     state.logs.sse.addEventListener('log', (e) => {
       if (state.logs.paused) return;
       const line = e.data;
@@ -1466,6 +1717,13 @@
     });
     state.logs.sse.addEventListener('info', () => {});
     state.logs.sse.onerror = () => { /* silent */ };
+  }
+  function fmtBytes(n) {
+    if (!n || n < 0) return '—';
+    const units = ['B', 'K', 'M', 'G'];
+    let i = 0; let v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + units[i];
   }
   function appendLogLine(viewer, line) {
     const cls = /error|ERROR|panic|FATAL/.test(line) ? 'log-line err'
@@ -1488,6 +1746,12 @@
       statCard('预测记录', data.summary.predictions, '', 'accent'),
       statCard('信息素域', data.summary.pheromones, '', 'purple'),
       statCard('指标点', data.summary.metricsPoints, '', ''),
+    ]));
+
+    // --- 新建群体智能预测任务 + 群体仿真 ---
+    v.appendChild(h('div', { class: 'grid grid-2 mb-16' }, [
+      renderSwarmCreatePanel(),
+      renderSwarmSimulatePanel(),
     ]));
 
     if ((data.notes || []).length) {
@@ -1544,14 +1808,645 @@
   }
 
   // ==================================================================
+  // 12b. Swarm 创建表单  (POST /api/actions/swarm/create/<name>)
+  // ==================================================================
+  function renderSwarmCreatePanel() {
+    const card = h('div', { class: 'card mb-16' });
+    card.appendChild(sectionHeader('发起新的群体智能预测', h('span', { class: 'muted', style: { fontSize: '12px' } }, '动作会写入 action queue, 主进程会真正调用 swarm_intel.Predict')));
+    const nameInp = h('input', { class: 'input', placeholder: '预测任务名 (例: q4-market-size)' });
+    const objInp = h('textarea', { class: 'input', placeholder: 'objective: 比如 "2027年全球 AI Agent 市场规模?"', rows: 2, style: { width: '100%' } });
+    const analystsInp = h('input', { class: 'input', type: 'number', value: '5', min: '1', max: '20', style: { width: '100px' } });
+    const roundsInp = h('input', { class: 'input', type: 'number', value: '3', min: '1', max: '10', style: { width: '100px' } });
+    const modelInp = h('input', { class: 'input', placeholder: '可选: 覆盖模型名 (留空用全局配置)', style: { width: '240px' } });
+    const btn = h('button', { class: 'btn primary', onClick: submit }, '▶ 发起预测');
+    const out = h('div', { class: 'muted', style: { marginTop: '10px', fontSize: '12px' } });
+
+    async function submit() {
+      const name = (nameInp.value || '').trim() || ('swarm-' + Date.now());
+      const objective = (objInp.value || '').trim();
+      if (!objective) { toast('objective 必填', 'err'); return; }
+      btn.disabled = true; btn.textContent = '提交中…';
+      try {
+        const resp = await api('/api/actions/swarm/create/' + encodeURIComponent(name), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            objective,
+            analysts: Number(analystsInp.value) || 5,
+            rounds: Number(roundsInp.value) || 3,
+            model: (modelInp.value || '').trim(),
+          }),
+        });
+        out.innerHTML = '';
+        out.appendChild(h('div', { class: 'insight ok' }, h('div', { class: 'insight-title' }, resp.message || '已排队')));
+        if (resp.hint) out.appendChild(h('pre', { class: 'code-block', style: { marginTop: '8px' } }, resp.hint));
+        toast('预测任务已入队 (' + (resp.actionId || '') + ')', 'ok');
+      } catch (e) {
+        toast('提交失败: ' + e.message, 'err');
+      } finally {
+        btn.disabled = false; btn.textContent = '▶ 发起预测';
+      }
+    }
+
+    card.appendChild(h('div', { class: 'form-grid' }, [
+      h('div', {}, [h('label', { class: 'muted' }, '名称'), nameInp]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [h('label', { class: 'muted' }, 'Objective'), objInp]),
+      h('div', {}, [h('label', { class: 'muted' }, 'Analysts'), analystsInp]),
+      h('div', {}, [h('label', { class: 'muted' }, 'Rounds'), roundsInp]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [h('label', { class: 'muted' }, '模型 (可选)'), modelInp]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [btn, out]),
+    ]));
+    return card;
+  }
+
+  // ==================================================================
+  // 12b2. Swarm 仿真面板  (POST /api/actions/swarm/simulate/<name>)
+  // ==================================================================
+  function renderSwarmSimulatePanel() {
+    const card = h('div', { class: 'card mb-16' });
+    card.appendChild(sectionHeader('发起群体仿真',
+      h('span', { class: 'muted', style: { fontSize: '12px' } }, '对复杂场景做多轮 Monte Carlo 仿真, 由主进程调用 swarm_intel.Simulate')));
+    const nameInp = h('input', { class: 'input', placeholder: '仿真任务名 (例: pricing-stress)' });
+    const scenarioInp = h('textarea', {
+      class: 'input',
+      placeholder: '场景描述: 比如 "某大型 SaaS 把 API 定价从 $20/M 调到 $12/M 后,未来 30 天的用户增长与收入变化"',
+      rows: 3, style: { width: '100%' },
+    });
+    const trialsInp = h('input', { class: 'input', type: 'number', value: '50', min: '5', max: '500', style: { width: '100px' } });
+    const agentsInp = h('input', { class: 'input', type: 'number', value: '6', min: '2', max: '20', style: { width: '100px' } });
+    const horizonInp = h('input', { class: 'input', placeholder: 'horizon: 7d / 30d / 90d', style: { width: '160px' } });
+    const modelInp = h('input', { class: 'input', placeholder: '可选: 覆盖模型名', style: { width: '240px' } });
+    const btn = h('button', { class: 'btn primary', onClick: submit }, '▶ 发起仿真');
+    const out = h('div', { class: 'muted', style: { marginTop: '10px', fontSize: '12px' } });
+
+    async function submit() {
+      const name = (nameInp.value || '').trim() || ('sim-' + Date.now());
+      const scenario = (scenarioInp.value || '').trim();
+      if (!scenario) { toast('场景必填', 'err'); return; }
+      btn.disabled = true; btn.textContent = '提交中…';
+      try {
+        const resp = await api('/api/actions/swarm/simulate/' + encodeURIComponent(name), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            scenario,
+            trials: Number(trialsInp.value) || 50,
+            agents: Number(agentsInp.value) || 6,
+            horizon: (horizonInp.value || '').trim() || '30d',
+            model: (modelInp.value || '').trim(),
+          }),
+        });
+        out.innerHTML = '';
+        out.appendChild(h('div', { class: 'insight ok' }, h('div', { class: 'insight-title' }, resp.message || '已排队')));
+        if (resp.hint) out.appendChild(h('pre', { class: 'code-block', style: { marginTop: '8px' } }, resp.hint));
+        toast('仿真任务已入队 (' + (resp.actionId || '') + ')', 'ok');
+      } catch (e) {
+        toast('提交失败: ' + e.message, 'err');
+      } finally {
+        btn.disabled = false; btn.textContent = '▶ 发起仿真';
+      }
+    }
+
+    card.appendChild(h('div', { class: 'form-grid' }, [
+      h('div', {}, [h('label', { class: 'muted' }, '名称'), nameInp]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [h('label', { class: 'muted' }, '场景'), scenarioInp]),
+      h('div', {}, [h('label', { class: 'muted' }, 'Trials'), trialsInp]),
+      h('div', {}, [h('label', { class: 'muted' }, 'Agents'), agentsInp]),
+      h('div', {}, [h('label', { class: 'muted' }, 'Horizon'), horizonInp]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [h('label', { class: 'muted' }, '模型 (可选)'), modelInp]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [btn, out]),
+    ]));
+    return card;
+  }
+
+  // ==================================================================
+  // 12c. Workflows 页面  /api/workflows[/:name]  + DAG + 创建团队
+  // ==================================================================
+  async function renderWorkflows(arg) {
+    const v = $('#view');
+    v.innerHTML = '<div class="loading">加载工作流…</div>';
+    const list = await api('/api/workflows');
+    v.innerHTML = '';
+
+    v.appendChild(h('div', { class: 'grid grid-3 mb-16' }, [
+      statCard('内置工作流', list.length, '来自 agent.ListWorkflows()', 'accent'),
+      statCard('支持模式', new Set(list.map(w => w.mode || 'sequential')).size, '', 'purple'),
+      statCard('总 Stage 数', list.reduce((s, w) => s + (w.stages || []).length, 0), '各 workflow stages 合计', ''),
+    ]));
+
+    // 左: 列表, 右: 详情 + DAG + 创建表单
+    const grid = h('div', { class: 'workflow-grid mb-16' });
+    const left = h('div', { class: 'card' }, [h('h3', {}, '可用工作流')]);
+    const right = h('div', { class: 'card workflow-detail' });
+
+    let active = arg || (list[0] && list[0].name) || null;
+    function renderDetail(name) {
+      right.innerHTML = '';
+      const wf = list.find(x => x.name === name);
+      if (!wf) { right.appendChild(h('div', { class: 'empty' }, '未找到工作流')); return; }
+      right.appendChild(h('h3', {}, wf.name));
+      right.appendChild(h('div', { class: 'muted', style: { marginBottom: '10px' } }, wf.description || '—'));
+      right.appendChild(h('div', { class: 'pill-row mb-16' }, [
+        h('span', { class: 'badge purple' }, 'mode: ' + (wf.mode || 'sequential')),
+        wf.rounds ? h('span', { class: 'badge' }, 'rounds: ' + wf.rounds) : null,
+        h('span', { class: 'badge' }, 'stages: ' + (wf.stages || []).length),
+      ]));
+      // Stages 列表
+      const stbl = h('table', { class: 'tbl' });
+      stbl.appendChild(h('thead', {}, h('tr', {}, [
+        h('th', {}, '#'), h('th', {}, 'Name'), h('th', {}, 'Role'), h('th', {}, 'Depends'), h('th', {}, 'Parallel'),
+      ])));
+      const tb = h('tbody');
+      (wf.stages || []).forEach((s, i) => {
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, String(i + 1)),
+          h('td', {}, s.name),
+          h('td', {}, h('span', { class: 'badge' }, s.role || '—')),
+          h('td', {}, (s.dependsOn || []).length ? (s.dependsOn || []).join(', ') : '—'),
+          h('td', {}, s.parallel ? '✓' : '—'),
+        ]));
+      });
+      stbl.appendChild(tb);
+      right.appendChild(h('div', { class: 'mb-16' }, stbl));
+
+      // DAG 可视化 (简单版 Canvas)
+      const dagWrap = h('div', { class: 'card', style: { padding: '10px' } }, [
+        h('h3', { style: { marginTop: 0 } }, 'Stage 依赖 DAG'),
+      ]);
+      const canvas = h('canvas', { style: { width: '100%', height: '260px' } });
+      dagWrap.appendChild(canvas);
+      right.appendChild(dagWrap);
+      setTimeout(() => drawWorkflowDAG(canvas, wf), 0);
+
+      // 创建团队表单
+      right.appendChild(renderTeamCreatePanel(wf.name));
+    }
+
+    for (const wf of list) {
+      const item = h('a', {
+        href: '#/workflows/' + encodeURIComponent(wf.name),
+        class: 'team-card' + (wf.name === active ? ' active' : ''),
+        style: { display: 'block', marginBottom: '6px' },
+        onClick: (e) => { e.preventDefault(); active = wf.name; renderDetail(active); location.hash = '#/workflows/' + encodeURIComponent(wf.name); },
+      }, [
+        h('div', { class: 'team-name' }, wf.name),
+        h('div', { class: 'team-meta' }, [
+          h('span', { class: 'badge purple' }, (wf.stages || []).length + ' stages'),
+          h('span', {}, (wf.mode || 'sequential')),
+        ]),
+      ]);
+      left.appendChild(item);
+    }
+
+    grid.appendChild(left);
+    grid.appendChild(right);
+    v.appendChild(grid);
+    if (active) renderDetail(active);
+  }
+
+  function drawWorkflowDAG(canvas, wf) {
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const cw = canvas.clientWidth || 500;
+    const ch = 260;
+    canvas.width = cw * dpr; canvas.height = ch * dpr;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cw, ch);
+
+    // 层次分层: depth(n) = max(depth(d)+1 for d in deps) else 0
+    const stages = wf.stages || [];
+    const byName = {}; stages.forEach(s => byName[s.name] = s);
+    const depth = {};
+    function d(n) {
+      if (depth[n] != null) return depth[n];
+      const s = byName[n]; if (!s) return 0;
+      if (!s.dependsOn || !s.dependsOn.length) return depth[n] = 0;
+      return depth[n] = 1 + Math.max.apply(null, s.dependsOn.map(x => d(x)));
+    }
+    stages.forEach(s => d(s.name));
+    const levels = {};
+    stages.forEach(s => { (levels[depth[s.name]] = levels[depth[s.name]] || []).push(s.name); });
+    const depths = Object.keys(levels).map(Number).sort((a, b) => a - b);
+
+    const margin = 24;
+    const nodeW = 120, nodeH = 34;
+    const colGap = (cw - margin * 2 - nodeW) / Math.max(1, depths.length - 1 || 1);
+    const pos = {};
+    depths.forEach((lv, colIdx) => {
+      const col = levels[lv];
+      col.forEach((name, rowIdx) => {
+        const x = margin + colIdx * colGap;
+        const rowGap = (ch - margin * 2 - nodeH) / Math.max(1, col.length - 1 || 1);
+        const y = col.length === 1 ? (ch - nodeH) / 2 : margin + rowIdx * rowGap;
+        pos[name] = { x, y };
+      });
+    });
+
+    // edges
+    ctx.strokeStyle = 'rgba(120,150,255,0.45)';
+    ctx.lineWidth = 1.5;
+    for (const s of stages) {
+      for (const dep of (s.dependsOn || [])) {
+        const p1 = pos[dep], p2 = pos[s.name]; if (!p1 || !p2) continue;
+        const x1 = p1.x + nodeW, y1 = p1.y + nodeH / 2;
+        const x2 = p2.x, y2 = p2.y + nodeH / 2;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.bezierCurveTo(x1 + 40, y1, x2 - 40, y2, x2, y2);
+        ctx.stroke();
+      }
+    }
+
+    // nodes
+    for (const s of stages) {
+      const p = pos[s.name]; if (!p) continue;
+      ctx.fillStyle = 'rgba(72,92,180,0.35)';
+      ctx.strokeStyle = 'rgba(140,170,255,0.9)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, p.x, p.y, nodeW, nodeH, 8, true, true);
+      ctx.fillStyle = '#E9ECFF';
+      ctx.font = '12px system-ui,-apple-system,sans-serif';
+      ctx.textBaseline = 'middle';
+      const label = s.name.length > 14 ? s.name.slice(0, 13) + '…' : s.name;
+      ctx.fillText(label, p.x + 10, p.y + 13);
+      ctx.fillStyle = 'rgba(200,210,255,0.7)';
+      ctx.font = '10px system-ui';
+      ctx.fillText(s.role || '', p.x + 10, p.y + 26);
+    }
+  }
+
+  function roundRect(ctx, x, y, w, hpx, r, fill, stroke) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + hpx - r);
+    ctx.quadraticCurveTo(x + w, y + hpx, x + w - r, y + hpx);
+    ctx.lineTo(x + r, y + hpx);
+    ctx.quadraticCurveTo(x, y + hpx, x, y + hpx - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    if (fill) ctx.fill();
+    if (stroke) ctx.stroke();
+  }
+
+  function renderTeamCreatePanel(workflowName) {
+    const card = h('div', { class: 'card', style: { marginTop: '16px' } });
+    card.appendChild(h('h3', {}, '用该工作流创建新团队'));
+    const nameInp = h('input', { class: 'input', placeholder: '团队名 (字母/数字/-)' });
+    const objInp = h('textarea', { class: 'input', placeholder: 'objective: 具体要达成的目标', rows: 2, style: { width: '100%' } });
+    const langSel = h('select', { class: 'select' }, [
+      h('option', { value: 'zh' }, '中文 (zh)'),
+      h('option', { value: 'en' }, 'English'),
+    ]);
+    const btn = h('button', { class: 'btn primary' }, '▶ 发起创建');
+    const out = h('div', { class: 'muted', style: { marginTop: '10px', fontSize: '12px' } });
+    btn.onclick = async () => {
+      const name = (nameInp.value || '').trim();
+      const objective = (objInp.value || '').trim();
+      if (!name || !objective) { toast('团队名 & objective 必填', 'err'); return; }
+      btn.disabled = true; btn.textContent = '提交中…';
+      try {
+        const resp = await api('/api/actions/team/create/' + encodeURIComponent(name), {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            workflow: workflowName,
+            objective,
+            lang: langSel.value,
+          }),
+        });
+        out.innerHTML = '';
+        out.appendChild(h('div', { class: 'insight ok' }, h('div', { class: 'insight-title' }, resp.message || '已排队')));
+        if (resp.hint) out.appendChild(h('pre', { class: 'code-block', style: { marginTop: '8px' } }, resp.hint));
+        toast('团队创建任务已入队', 'ok');
+      } catch (e) {
+        toast('提交失败: ' + e.message, 'err');
+      } finally {
+        btn.disabled = false; btn.textContent = '▶ 发起创建';
+      }
+    };
+    card.appendChild(h('div', { class: 'form-grid' }, [
+      h('div', {}, [h('label', { class: 'muted' }, '团队名'), nameInp]),
+      h('div', {}, [h('label', { class: 'muted' }, '语言'), langSel]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [h('label', { class: 'muted' }, 'Objective'), objInp]),
+      h('div', { style: { gridColumn: '1 / -1' } }, [btn, out]),
+    ]));
+    return card;
+  }
+
+  // ==================================================================
+  // 12d. Backups 页面  /api/backups  + create + restore
+  // ==================================================================
+  async function renderBackups() {
+    const v = $('#view');
+    v.innerHTML = '<div class="loading">加载备份列表…</div>';
+    let llm = null;
+    try { llm = await api('/api/llm/status'); } catch (_) {}
+
+    const data = await api('/api/backups');
+    v.innerHTML = '';
+
+    v.appendChild(h('div', { class: 'grid grid-4 mb-16' }, [
+      statCard('StateDir', data.stateDir ? '✓' : '✗', data.stateDir || '—', data.stateDir ? 'ok' : 'err'),
+      statCard('归档数', data.count || 0, '位于 stateDir/backups/', 'accent'),
+      statCard('总大小', fmtMB(data.entries || []), '', 'purple'),
+      statCard('LLM 就绪', llm && llm.ready ? 'ON' : 'OFF',
+        llm ? ((llm.profile && llm.profile.provider) + ' / ' + ((llm.profile && llm.profile.source) || '')) : '未知',
+        llm && llm.ready ? 'ok' : 'warn'),
+    ]));
+
+    // 创建备份表单
+    const createCard = h('div', { class: 'card mb-16' });
+    createCard.appendChild(h('h3', {}, '创建新备份'));
+    const labelInp = h('input', { class: 'input', placeholder: 'label (例: weekly / before-upgrade)', style: { maxWidth: '280px' } });
+    const incReports = h('input', { type: 'checkbox', checked: true });
+    const btnCreate = h('button', { class: 'btn primary' }, '📦 创建');
+    btnCreate.onclick = async () => {
+      btnCreate.disabled = true; btnCreate.textContent = '打包中…';
+      try {
+        const resp = await api('/api/backups/create', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            label: (labelInp.value || '').trim(),
+            includeReports: incReports.checked,
+          }),
+        });
+        toast('备份已创建: ' + resp.path, 'ok');
+        setTimeout(() => renderBackups(), 500);
+      } catch (e) { toast('创建失败: ' + e.message, 'err'); }
+      finally { btnCreate.disabled = false; btnCreate.textContent = '📦 创建'; }
+    };
+    createCard.appendChild(h('div', { class: 'form-grid' }, [
+      h('div', {}, [h('label', { class: 'muted' }, 'Label'), labelInp]),
+      h('div', {}, [
+        h('label', { class: 'muted' }, 'Include REPORT.md'),
+        h('div', { style: { marginTop: '4px' } }, [incReports, h('span', { class: 'muted', style: { marginLeft: '6px', fontSize: '12px' } }, '(体积较大但内容完整)')]),
+      ]),
+      h('div', { style: { gridColumn: '1 / -1' } }, btnCreate),
+    ]));
+    v.appendChild(createCard);
+
+    // 备份列表
+    const listCard = h('div', { class: 'card' });
+    listCard.appendChild(h('h3', {}, '归档列表 (按时间倒序)'));
+    if (!(data.entries || []).length) {
+      listCard.appendChild(h('div', { class: 'empty' }, '尚无备份'));
+    } else {
+      const tbl = h('table', { class: 'tbl' });
+      tbl.appendChild(h('thead', {}, h('tr', {}, [
+        h('th', {}, '时间'), h('th', {}, 'Label'), h('th', {}, '大小 (MB)'), h('th', {}, '文件'), h('th', {}, '动作'),
+      ])));
+      const tb = h('tbody');
+      for (const e of data.entries) {
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, fmtTime(e.createdAt)),
+          h('td', {}, e.label || '—'),
+          h('td', {}, (e.size / 1024 / 1024).toFixed(2)),
+          h('td', {}, h('code', { style: { fontSize: '11px' } }, e.name)),
+          h('td', {}, [
+            h('button', {
+              class: 'btn small',
+              title: '在浏览器下载 .tar.gz',
+              onClick: () => { location.href = '/api/backups/download?path=' + encodeURIComponent(e.path); },
+            }, '⬇ 下载'),
+            h('button', {
+              class: 'btn small ghost',
+              style: { marginLeft: '4px' },
+              onClick: async () => {
+                try {
+                  const m = await api('/api/backups/manifest?path=' + encodeURIComponent(e.path));
+                  alert('MANIFEST:\n' + JSON.stringify(m, null, 2));
+                } catch (err) { toast('读取失败: ' + err.message, 'err'); }
+              },
+            }, 'Manifest'),
+            h('button', {
+              class: 'btn small warn',
+              style: { marginLeft: '4px' },
+              onClick: async () => {
+                if (!confirm('从该备份恢复?\n⚠️ 会覆盖当前 .claude-go 中的对应目录\n(默认会先自动生成一份 safety 快照)\n\n' + e.path)) return;
+                try {
+                  const resp = await api('/api/backups/restore', {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ path: e.path }),
+                  });
+                  toast('已恢复 ' + resp.restoredFiles + ' 个文件; safety=' + (resp.safetyBackup || '(未生成)'), 'ok');
+                } catch (err) { toast('恢复失败: ' + err.message, 'err'); }
+              },
+            }, '♻ 恢复'),
+            h('button', {
+              class: 'btn small err',
+              style: { marginLeft: '4px' },
+              onClick: async () => {
+                if (!confirm('删除该备份?\n' + e.path)) return;
+                try {
+                  await api('/api/backups?path=' + encodeURIComponent(e.path), { method: 'DELETE' });
+                  toast('已删除', 'ok');
+                  setTimeout(() => renderBackups(), 300);
+                } catch (err) { toast('删除失败: ' + err.message, 'err'); }
+              },
+            }, '🗑 删除'),
+          ]),
+        ]));
+      }
+      tbl.appendChild(tb);
+      listCard.appendChild(tbl);
+    }
+    v.appendChild(listCard);
+  }
+
+  function fmtMB(entries) {
+    const total = (entries || []).reduce((s, e) => s + (e.size || 0), 0);
+    return (total / 1024 / 1024).toFixed(2) + ' MB';
+  }
+
+  // ==================================================================
+  // 12e. LLM 大模型监控 /api/llm/stats
+  // ==================================================================
+  async function renderLLMStats() {
+    const v = $('#view');
+    if (!state.llmStats.window) state.llmStats.window = '24h';
+    v.innerHTML = '<div class="loading">加载 LLM 统计…</div>';
+    let data;
+    try {
+      data = await api('/api/llm/stats?window=' + encodeURIComponent(state.llmStats.window));
+    } catch (e) {
+      v.innerHTML = '';
+      v.appendChild(h('div', { class: 'empty', style: { color: 'var(--red)' } }, '加载失败: ' + e.message));
+      return;
+    }
+    v.innerHTML = '';
+
+    // 工具栏
+    const toolbar = h('div', { class: 'toolbar-row mb-12' }, [
+      h('strong', {}, '✦ LLM 大模型运行质量'),
+      h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, [
+        h('span', { class: 'muted small' }, '时间窗口'),
+        ...['1h', '6h', '24h', '72h', '168h'].map(w => h('button', {
+          class: 'btn small' + (w === state.llmStats.window ? ' primary' : ' ghost'),
+          onClick: () => { state.llmStats.window = w; renderLLMStats(); },
+        }, w)),
+        h('span', { class: 'muted small', style: { marginLeft: '10px' } }, 'source: ' + (data.source || '—')),
+      ]),
+    ]);
+    v.appendChild(toolbar);
+
+    // 概览
+    v.appendChild(h('div', { class: 'grid grid-4 mb-16' }, [
+      statCard('总调用', data.totalCalls || 0,
+        (data.totalRetries ? ('重试 ' + data.totalRetries) : '—'),
+        data.totalCalls > 0 ? 'accent' : 'warn'),
+      statCard('成功率', fmtPct(data.successRate), '成功 ' + (data.success || 0) + ' / 错误 ' + (data.errors || 0),
+        (data.successRate || 0) >= 0.9 ? 'ok' : 'warn'),
+      statCard('平均时长', fmtDurSec(data.avgDuration), 'P95 ' + fmtDurSec(data.p95Duration),
+        (data.p95Duration || 0) > 25 ? 'warn' : ''),
+      statCard('Token 消耗',
+        fmtKilo((data.inputTokens || 0) + (data.outputTokens || 0) + (data.cacheReadTokens || 0) + (data.cacheCreationTokens || 0)),
+        'in ' + fmtKilo(data.inputTokens || 0) + ' · out ' + fmtKilo(data.outputTokens || 0),
+        'purple'),
+    ]));
+
+    // 告警
+    if ((data.alerts || []).length) {
+      const ac = h('div', { class: 'card mb-16' }, [h('h3', {}, '⚠ 告警 / 观察')]);
+      for (const a of data.alerts) ac.appendChild(h('div', { class: 'insight warn' }, h('div', { class: 'insight-title' }, a)));
+      v.appendChild(ac);
+    }
+
+    // 按模型聚合
+    if ((data.byModel || []).length) {
+      const tbl = h('table', { class: 'tbl' });
+      tbl.appendChild(h('thead', {}, h('tr', {}, [
+        h('th', {}, '模型'), h('th', {}, '调用'), h('th', {}, '成功率'),
+        h('th', {}, '平均时长'), h('th', {}, 'Input'), h('th', {}, 'Output'),
+        h('th', {}, 'Cache(读/写)'), h('th', {}, '重试'),
+      ])));
+      const tb = h('tbody');
+      for (const m of data.byModel) {
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, m.model),
+          h('td', {}, String(m.calls)),
+          h('td', {}, h('span', { class: 'badge ' + (m.successRate >= 0.9 ? 'ok' : 'warn') }, fmtPct(m.successRate))),
+          h('td', {}, fmtDurSec(m.avgDuration)),
+          h('td', {}, fmtKilo(m.inputTokens || 0)),
+          h('td', {}, fmtKilo(m.outputTokens || 0)),
+          h('td', {}, fmtKilo(m.cacheReadTokens || 0) + ' / ' + fmtKilo(m.cacheCreationTokens || 0)),
+          h('td', {}, String(m.retries || 0)),
+        ]));
+      }
+      tbl.appendChild(tb);
+      v.appendChild(h('div', { class: 'card mb-16' }, [h('h3', {}, '按模型聚合'), tbl]));
+    }
+
+    // 错误分布
+    if ((data.errorBuckets || []).length) {
+      const tbl = h('table', { class: 'tbl' });
+      tbl.appendChild(h('thead', {}, h('tr', {}, [h('th', {}, '错误类别'), h('th', {}, '次数')])));
+      const tb = h('tbody');
+      for (const b of data.errorBuckets) {
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, h('span', { class: 'badge ' + errBadgeClass(b.kind) }, b.kind)),
+          h('td', {}, String(b.count)),
+        ]));
+      }
+      tbl.appendChild(tb);
+      v.appendChild(h('div', { class: 'card mb-16' }, [h('h3', {}, '错误分布'), tbl]));
+    }
+
+    // 时序曲线
+    if ((data.timeseries || []).length) {
+      const wrap = h('div', { class: 'card mb-16' }, [
+        h('h3', {}, '调用时序 (按小时)'),
+        h('div', { class: 'chart-wrap' }, h('canvas', { id: 'chart-llm-ts' })),
+        h('div', { class: 'chart-wrap' }, h('canvas', { id: 'chart-llm-tok' })),
+      ]);
+      v.appendChild(wrap);
+      requestAnimationFrame(() => {
+        const c1 = document.getElementById('chart-llm-ts');
+        if (c1 && window.Chart) {
+          state.charts['llm-ts'] = new Chart(c1.getContext('2d'), {
+            type: 'line',
+            data: {
+              labels: data.timeseries.map(p => fmtTsShort(p.ts)),
+              datasets: [
+                { label: '调用', data: data.timeseries.map(p => p.calls), borderColor: '#5ef0ff', tension: 0.3, pointRadius: 1 },
+                { label: '成功', data: data.timeseries.map(p => p.success), borderColor: '#7CFF8C', tension: 0.3, pointRadius: 1 },
+                { label: '错误', data: data.timeseries.map(p => p.errors), borderColor: '#ff6680', tension: 0.3, pointRadius: 1 },
+              ],
+            },
+            options: baseChartOpts({}),
+          });
+        }
+        const c2 = document.getElementById('chart-llm-tok');
+        if (c2 && window.Chart) {
+          state.charts['llm-tok'] = new Chart(c2.getContext('2d'), {
+            type: 'line',
+            data: {
+              labels: data.timeseries.map(p => fmtTsShort(p.ts)),
+              datasets: [
+                { label: 'tokens/小时', data: data.timeseries.map(p => p.totalTokens), borderColor: '#C084FF', tension: 0.3, pointRadius: 1, fill: true, backgroundColor: 'rgba(192,132,255,0.12)' },
+                { label: '平均耗时 s', data: data.timeseries.map(p => p.avgDuration), borderColor: '#ffbe55', tension: 0.3, pointRadius: 1, yAxisID: 'y2' },
+              ],
+            },
+            options: baseChartOpts({
+              scales: { y2: { position: 'right', grid: { drawOnChartArea: false } } },
+            }),
+          });
+        }
+      });
+    } else {
+      v.appendChild(h('div', { class: 'card' }, [
+        h('h3', {}, '暂无数据'),
+        h('div', { class: 'muted' },
+          '窗口 ' + state.llmStats.window + ' 内没有 LLM 调用记录。首次启动需要等待主进程 / 飞书 bot / dashboard 自身发起至少 1 次 LLM 调用, 指标会写到 metrics/llm.jsonl。'),
+      ]));
+    }
+  }
+
+  function fmtPct(v) {
+    if (v == null || isNaN(v)) return '—';
+    return (v * 100).toFixed(1) + '%';
+  }
+  function fmtDurSec(v) {
+    if (!v || isNaN(v)) return '—';
+    if (v < 1) return (v * 1000).toFixed(0) + ' ms';
+    if (v < 60) return v.toFixed(2) + ' s';
+    return (v / 60).toFixed(1) + ' m';
+  }
+  function fmtKilo(n) {
+    if (!n) return '0';
+    if (n < 1000) return String(n);
+    if (n < 1e6) return (n / 1000).toFixed(1) + 'K';
+    if (n < 1e9) return (n / 1e6).toFixed(2) + 'M';
+    return (n / 1e9).toFixed(2) + 'B';
+  }
+  function errBadgeClass(kind) {
+    return ({
+      rate_limit: 'warn',
+      overloaded: 'warn',
+      timeout: 'warn',
+      refusal: 'err',
+      prompt_too_long: 'err',
+      auth: 'err',
+      server: 'err',
+    })[kind] || '';
+  }
+
+  // ==================================================================
   // 13. Actions (POST /api/actions/{kind}/{action}/{target})
   // ==================================================================
   async function execAction(kind, action, target, opts = {}) {
     if (opts.confirm && !confirm(opts.confirm + '\n' + kind + ' / ' + action + ' / ' + target)) return;
     try {
-      const resp = await api(`/api/actions/${encodeURIComponent(kind)}/${encodeURIComponent(action)}/${encodeURIComponent(target)}`, { method: 'POST' });
+      const fetchOpts = { method: 'POST' };
+      if (opts.payload) {
+        fetchOpts.headers = { 'content-type': 'application/json' };
+        fetchOpts.body = JSON.stringify(opts.payload);
+      }
+      const resp = await api(`/api/actions/${encodeURIComponent(kind)}/${encodeURIComponent(action)}/${encodeURIComponent(target)}`, fetchOpts);
       toast(resp.message || '动作已发送', 'ok');
-      setTimeout(() => navigate(), 500);
+      if (resp.hint) console.info('[action hint]', resp.hint);
+      if (!opts.noReload) setTimeout(() => navigate(), 500);
+      return resp;
     } catch (e) {
       toast('动作失败: ' + e.message, 'err');
     }

@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/metrics"
 )
 
 //go:embed web/*
@@ -45,6 +47,9 @@ func NewServer(cfg Config) *Server {
 		provider: NewProvider(cfg.StateDir, cfg.CacheTTL),
 		mux:      http.NewServeMux(),
 	}
+	// 幂等: 即使主进程已初始化过, 这里也是 no-op。保证 dashboard 单独前台运行时
+	// 也能捕获自身对 LLM 的诊断调用。
+	metrics.InitGlobalLLMCollector(cfg.StateDir)
 	s.registerRoutes()
 	s.server = &http.Server{
 		Addr:              cfg.Addr,
@@ -109,6 +114,18 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/actions/", s.handleAction)        // /api/actions/{kind}/{target}
 	s.mux.HandleFunc("/api/dreaming/diagnosis", s.handleDreamingDiagnosis)
 
+	// v1.2: backup / llm
+	s.mux.HandleFunc("/api/backups", s.handleBackupsList)
+	s.mux.HandleFunc("/api/backups/create", s.handleBackupCreate)
+	s.mux.HandleFunc("/api/backups/restore", s.handleBackupRestore)
+	s.mux.HandleFunc("/api/backups/manifest", s.handleBackupManifest)
+	s.mux.HandleFunc("/api/backups/download", s.handleBackupDownload)
+	s.mux.HandleFunc("/api/llm/status", s.handleLLMStatus)
+
+	// v1.3: 多源日志 / 团队 LLM 诊断 / LLM 统计 / 黑板写入
+	s.mux.HandleFunc("/api/logs/sources", s.handleLogsSources)
+	s.mux.HandleFunc("/api/llm/stats", s.handleLLMStats)
+
 	// 根路径和 SPA fallback
 	s.mux.HandleFunc("/", s.handleIndex)
 }
@@ -164,6 +181,10 @@ func (s *Server) handleTeamDetail(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, detail)
 	case "blackboard":
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
+			s.handleTeamBlackboardWrite(w, r, name)
+			return
+		}
 		bb, err := s.provider.Blackboard(name)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -177,6 +198,8 @@ func (s *Server) handleTeamDetail(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"content": detail.Report})
+	case "diagnose":
+		s.handleTeamDiagnose(w, r, name)
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown sub-path %q", sub))
 	}

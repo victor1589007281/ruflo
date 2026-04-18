@@ -30,6 +30,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/backup"
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/commands"
@@ -40,6 +41,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/mcp"
+	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/session"
@@ -202,6 +204,7 @@ func main() {
 	rootCmd.AddCommand(skillsCmd())
 	rootCmd.AddCommand(rolesCmd())
 	rootCmd.AddCommand(dashboardCmd())
+	rootCmd.AddCommand(backupCmd())
 	rootCmd.AddCommand(helpCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -1028,6 +1031,223 @@ func dashboardOpenCmd() *cobra.Command {
 	return c
 }
 
+// backupCmd 备份 / 恢复 .claude-go 运行态关键数据。
+//
+// 覆盖: teams/, memory/, metrics/, evolution/, swarm_intel/,
+//      tasks.json, cron_jobs.json, blackboard.json, config.json 等
+//
+// 归档路径: <stateDir>/backups/<timestamp>-<label>.tar.gz
+func backupCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "backup",
+		Short: "备份与恢复 .claude-go 运行态 (团队/记忆/指标/进化/群体智能)",
+		Long: `claude-go backup 是灾难恢复 & 跨机迁移通道:
+
+  create   把关键数据 tar.gz 归档到 .claude-go/backups/
+  list     列出已有归档 (时间/大小/label)
+  restore  从归档恢复 (默认先产生一个 safety 快照, 再覆盖)
+  delete   删除指定归档
+
+设计原则:
+  • 纯本地, 无网络依赖
+  • 归档可直接拷贝到另一台机器再 restore
+  • restore 前默认会自动 safety-before-restore 备份一份当前现场`,
+		Example: `  # 创建一次带标签的快照
+  claude-go backup create --label weekly-snapshot
+
+  # 只列出
+  claude-go backup list
+
+  # 从指定归档恢复 (路径必须在 .claude-go/backups/ 下)
+  claude-go backup restore --path .claude-go/backups/20260418-120000-weekly-snapshot.tar.gz
+
+  # 删除归档
+  claude-go backup delete --path .claude-go/backups/xxx.tar.gz`,
+	}
+	cmd.AddCommand(backupCreateCmd())
+	cmd.AddCommand(backupListCmd())
+	cmd.AddCommand(backupRestoreCmd())
+	cmd.AddCommand(backupDeleteCmd())
+	return cmd
+}
+
+func resolveStateDir(stateDir string) string {
+	cwd, _ := os.Getwd()
+	return basedir.ResolveDefault(stateDir, cwd)
+}
+
+func backupCreateCmd() *cobra.Command {
+	var (
+		stateDir       string
+		label          string
+		outPath        string
+		includeReports bool
+	)
+	c := &cobra.Command{
+		Use:   "create",
+		Short: "创建一次备份归档",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			res, err := runBackupCreate(resolveStateDir(stateDir), label, outPath, includeReports)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("\n✅ 已创建备份\n")
+			fmt.Printf("   归档     : %s\n", res.Path)
+			fmt.Printf("   文件数   : %d\n", res.FileCount)
+			fmt.Printf("   大小     : %.2f MB\n", float64(res.Size)/1024.0/1024.0)
+			fmt.Printf("   标签     : %s\n", res.Label)
+			fmt.Printf("   子系统   : %s\n", strings.Join(res.Targets, ", "))
+			return nil
+		},
+	}
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().StringVar(&label, "label", "manual", "标签 (只保留 [-_a-zA-Z0-9])")
+	c.Flags().StringVar(&outPath, "out", "", "自定义输出路径 (默认 stateDir/backups/<ts>-<label>.tar.gz)")
+	c.Flags().BoolVar(&includeReports, "include-reports", true, "是否包含 team/*/REPORT.md")
+	return c
+}
+
+func backupListCmd() *cobra.Command {
+	var stateDir string
+	var asJSON bool
+	c := &cobra.Command{
+		Use:   "list",
+		Short: "列出所有备份归档",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			list, err := runBackupList(resolveStateDir(stateDir))
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				b, _ := json.MarshalIndent(list, "", "  ")
+				fmt.Println(string(b))
+				return nil
+			}
+			if len(list) == 0 {
+				fmt.Println("(暂无备份)")
+				return nil
+			}
+			fmt.Printf("%-30s %-14s %-10s %s\n", "TIME", "SIZE(MB)", "LABEL", "PATH")
+			for _, e := range list {
+				fmt.Printf("%-30s %-14.2f %-10s %s\n",
+					e.CreatedAt.Format(time.RFC3339),
+					float64(e.Size)/1024.0/1024.0,
+					e.Label,
+					e.Path)
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().BoolVar(&asJSON, "json", false, "以 JSON 输出")
+	return c
+}
+
+func backupRestoreCmd() *cobra.Command {
+	var (
+		stateDir    string
+		path        string
+		skipSafety  bool
+		noOverwrite bool
+	)
+	c := &cobra.Command{
+		Use:   "restore",
+		Short: "从归档恢复 (默认先 safety 快照再覆盖)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if path == "" {
+				return fmt.Errorf("--path 必填 (一般位于 .claude-go/backups/)")
+			}
+			res, err := runBackupRestore(resolveStateDir(stateDir), path, skipSafety, !noOverwrite)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("\n✅ 已恢复\n")
+			fmt.Printf("   文件数   : %d\n", res.RestoredFiles)
+			if res.SafetyBackup != "" {
+				fmt.Printf("   安全快照 : %s\n", res.SafetyBackup)
+			}
+			if res.Manifest != nil {
+				fmt.Printf("   源快照   : %s (label=%s)\n",
+					res.Manifest.CreatedAt.Format(time.RFC3339),
+					res.Manifest.Label)
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().StringVar(&path, "path", "", "归档路径 (.tar.gz)")
+	c.Flags().BoolVar(&skipSafety, "skip-safety-backup", false, "恢复前跳过 safety 快照 (不推荐)")
+	c.Flags().BoolVar(&noOverwrite, "no-overwrite", false, "冲突时保留现有文件 (默认覆盖)")
+	return c
+}
+
+func backupDeleteCmd() *cobra.Command {
+	var stateDir, path string
+	c := &cobra.Command{
+		Use:   "delete",
+		Short: "删除指定备份归档",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if path == "" {
+				return fmt.Errorf("--path 必填")
+			}
+			return runBackupDelete(resolveStateDir(stateDir), path)
+		},
+	}
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().StringVar(&path, "path", "", "归档路径")
+	return c
+}
+
+// ---- backup adapters (使用 pkg/backup) ----
+
+type backupCreateSummary struct {
+	Path      string
+	Size      int64
+	FileCount int
+	Label     string
+	Targets   []string
+}
+
+func runBackupCreate(stateDir, label, out string, includeReports bool) (*backupCreateSummary, error) {
+	res, err := backup.Create(backup.CreateOptions{
+		StateDir:       stateDir,
+		OutPath:        out,
+		Label:          label,
+		IncludeReports: includeReports,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &backupCreateSummary{
+		Path:      res.Path,
+		Size:      res.Size,
+		FileCount: res.Manifest.FileCount,
+		Label:     res.Manifest.Label,
+		Targets:   res.Manifest.Targets,
+	}, nil
+}
+
+func runBackupList(stateDir string) ([]backup.ListEntry, error) {
+	return backup.List(stateDir)
+}
+
+func runBackupRestore(stateDir, path string, skipSafety, overwrite bool) (*backup.RestoreResult, error) {
+	return backup.Restore(backup.RestoreOptions{
+		StateDir:         stateDir,
+		ArchivePath:      path,
+		SkipSafetyBackup: skipSafety,
+		Overwrite:        overwrite,
+	})
+}
+
+func runBackupDelete(stateDir, path string) error {
+	if err := backup.Delete(stateDir, path); err != nil {
+		return err
+	}
+	fmt.Printf("已删除: %s\n", path)
+	return nil
+}
+
 // runDashboardForeground 前台阻塞运行 dashboard。
 func runDashboardForeground(addr string, port int, stateDir string, noOpen bool) error {
 	cwd, _ := os.Getwd()
@@ -1041,6 +1261,10 @@ func runDashboardForeground(addr string, port int, stateDir string, noOpen bool)
 		free := dashboard.FindFreePort(port)
 		bindAddr = fmt.Sprintf("127.0.0.1:%d", free)
 	}
+
+	// 启动 LLM 调用指标采集 (全局钩子): 所有 api.Client 的调用都会落盘到
+	// {stateDir}/metrics/llm.jsonl, dashboard 展示统一的 LLM token/质量视图。
+	metrics.InitGlobalLLMCollector(resolved)
 
 	srv := dashboard.NewServer(dashboard.Config{
 		StateDir: resolved,

@@ -240,9 +240,14 @@ func scoreTokens(fields ...interface{}) float64 {
 
 func (s *Server) handleLogsTail(w http.ResponseWriter, r *http.Request) {
 	n := parseIntQuery(r, "n", 500)
-	path := s.resolveLogPath(r)
+	path := s.resolveLogBySource(r)
 	if path == "" {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"path": "", "lines": []string{}})
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"path":   "",
+			"source": r.URL.Query().Get("source"),
+			"lines":  []string{},
+			"note":   "请求的日志源不存在, 请确认已启动对应组件 (dashboard / feishu bot / client / mcp)",
+		})
 		return
 	}
 	lines, err := tailLines(path, n)
@@ -251,8 +256,9 @@ func (s *Server) handleLogsTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"path":  path,
-		"lines": lines,
+		"path":   path,
+		"source": r.URL.Query().Get("source"),
+		"lines":  lines,
 	})
 }
 
@@ -267,13 +273,14 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	path := s.resolveLogPath(r)
+	path := s.resolveLogBySource(r)
 	if path == "" {
-		fmt.Fprintf(w, "event: error\ndata: no log file found\n\n")
+		src := r.URL.Query().Get("source")
+		fmt.Fprintf(w, "event: error\ndata: log source %q not available\n\n", src)
 		flusher.Flush()
 		return
 	}
-	fmt.Fprintf(w, "event: info\ndata: tailing %s\n\n", path)
+	fmt.Fprintf(w, "event: info\ndata: tailing %s (source=%s)\n\n", path, r.URL.Query().Get("source"))
 	flusher.Flush()
 
 	// 初始化发送最后 200 行
@@ -624,10 +631,11 @@ func computeTrend(points []timePointDTO) (trend string, slope float64) {
 // =====================================================================
 
 type actionResp struct {
-	OK        bool   `json:"ok"`
-	Queued    bool   `json:"queued"`
-	Message   string `json:"message,omitempty"`
-	ActionID  string `json:"actionId,omitempty"`
+	OK       bool   `json:"ok"`
+	Queued   bool   `json:"queued"`
+	Message  string `json:"message,omitempty"`
+	Hint     string `json:"hint,omitempty"`
+	ActionID string `json:"actionId,omitempty"`
 }
 
 func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
@@ -648,6 +656,15 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 支持可选 JSON payload: {workflow, objective, lang, analysts, rounds, ...}
+	var payload map[string]interface{}
+	if r.Body != nil {
+		defer r.Body.Close()
+		if body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024)); err == nil && len(body) > 0 {
+			_ = json.Unmarshal(body, &payload)
+		}
+	}
+
 	actionID := fmt.Sprintf("%s-%s-%s-%d", kind, action, target, time.Now().UnixMilli())
 	rec := map[string]interface{}{
 		"id":        actionID,
@@ -657,6 +674,9 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		"status":    "pending",
 		"requested": time.Now().Format(time.RFC3339),
 		"source":    "dashboard",
+	}
+	if payload != nil {
+		rec["payload"] = payload
 	}
 	queueDir := filepath.Join(s.cfg.StateDir, ".dashboard", "actions")
 	_ = os.MkdirAll(queueDir, 0o755)
@@ -669,16 +689,85 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 
 	// 对某些 action 我们直接执行 (无副作用的开关切换): cron enable/disable/pause/resume
 	immediate := ""
+	hint := ""
 	switch kind + "." + action {
 	case "cron.enable", "cron.disable", "cron.pause", "cron.resume":
 		if err := s.toggleCron(target, action); err == nil {
 			immediate = fmt.Sprintf("cron %s=%s 已写入磁盘", target, action)
 		}
+	case "cron.create":
+		if payload == nil {
+			payload = map[string]interface{}{}
+		}
+		if _, ok := payload["id"]; !ok && target != "" && target != "new" {
+			payload["id"] = target
+		}
+		if newID, err := s.cronCreate(payload); err == nil {
+			immediate = fmt.Sprintf("cron %s 已创建", newID)
+			rec["payload"] = payload
+			hint = "提示: 若主进程 (feishu bot / daemon) 未在运行, 新建任务只落盘、不调度。"
+		} else {
+			hint = "创建失败: " + err.Error()
+		}
+	case "cron.update", "cron.edit":
+		if err := s.cronUpdate(target, payload); err == nil {
+			immediate = fmt.Sprintf("cron %s 已更新", target)
+		} else {
+			hint = "更新失败: " + err.Error()
+		}
+	case "cron.delete", "cron.remove":
+		if err := s.cronDelete(target); err == nil {
+			immediate = fmt.Sprintf("cron %s 已删除", target)
+		} else {
+			hint = "删除失败: " + err.Error()
+		}
+	case "cron.trigger":
+		hint = "已排队立即触发, 需要主进程消费 (feishu bot / daemon) 才能真正运行。"
+	case "team.create":
+		// 为 team.create 给出可在 terminal 直接粘贴的 CLI 命令, 便于主进程 (chat/feishu) 消费或用户手动执行。
+		if payload != nil {
+			wf, _ := payload["workflow"].(string)
+			obj, _ := payload["objective"].(string)
+			lang, _ := payload["lang"].(string)
+			if wf != "" {
+				cmd := fmt.Sprintf("claude-go team create %s %s %q", target, wf, obj)
+				if lang != "" {
+					cmd += " --lang " + lang
+				}
+				hint = "若无主进程消费, 可手动运行: " + cmd
+			}
+		}
+	case "swarm.create", "swarm.predict":
+		if payload != nil {
+			obj, _ := payload["objective"].(string)
+			if obj != "" {
+				hint = fmt.Sprintf("若无主进程消费, 可手动运行: claude-go swarm predict %q", obj)
+			}
+		}
+	case "swarm.simulate":
+		if payload == nil {
+			payload = map[string]interface{}{}
+		}
+		mode, _ := payload["mode"].(string)
+		obj, _ := payload["objective"].(string)
+		if obj == "" {
+			if sc, ok := payload["scenario"].(string); ok {
+				obj = sc
+				payload["objective"] = sc
+			}
+		}
+		if mode == "" {
+			mode = "social"
+			payload["mode"] = mode
+		}
+		hint = fmt.Sprintf("已排队 swarm.simulate: mode=%s objective=%q. 主进程可调用 swarm_intel.Engine.Simulate(ctx, cfg) 消费。",
+			mode, obj)
 	}
 	writeJSON(w, http.StatusOK, actionResp{
 		OK:       true,
 		Queued:   true,
 		Message:  firstNonEmpty(immediate, "动作已排队, 等待 claude-go 主进程消费 (.claude-go/.dashboard/actions/)"),
+		Hint:     hint,
 		ActionID: actionID,
 	})
 }

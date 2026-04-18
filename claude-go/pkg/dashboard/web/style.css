@@ -810,3 +810,127 @@ table.tbl tr:hover td { background: rgba(94,240,255,0.04); }
 ::-webkit-scrollbar-track { background: rgba(10,14,36,0.3); }
 ::-webkit-scrollbar-thumb { background: rgba(94,240,255,0.18); border-radius: 6px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(94,240,255,0.35); }
+
+/* =========================================================================
+ * v1.2: workflows / backups / swarm-create 表单组件
+ * ========================================================================= */
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+  margin-top: 12px;
+}
+.form-grid label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.form-grid .input,
+.form-grid .select,
+.form-grid textarea.input {
+  width: 100%;
+  box-sizing: border-box;
+}
+.form-grid textarea.input {
+  min-height: 54px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.workflow-grid {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 960px) {
+  .workflow-grid { grid-template-columns: 1fr; }
+}
+.workflow-detail h3 { margin-top: 0; }
+
+.team-card.active {
+  border-color: rgba(94,240,255,0.55);
+  box-shadow: var(--glow-cyan);
+}
+
+.pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+
+.code-block {
+  background: rgba(10,14,36,0.6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-family: 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  color: var(--cyan);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 按钮变体 */
+.btn.small {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+}
+.btn.warn {
+  border-color: rgba(255,207,102,0.55);
+  color: var(--amber);
+}
+.btn.warn:hover {
+  background: rgba(255,207,102,0.12);
+}
+.btn.err {
+  border-color: rgba(255,94,122,0.55);
+  color: var(--red);
+}
+.btn.err:hover {
+  background: rgba(255,94,122,0.12);
+}
+
+/* v1.3: 日志多频道布局 */
+.logs-layout { grid-template-columns: 260px 1fr; gap: 14px; align-items: stretch; }
+@media (max-width: 1100px) { .logs-layout { grid-template-columns: 1fr; } }
+.log-channels {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  max-height: 68vh;
+  overflow-y: auto;
+}
+.log-channels-hdr {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  z-index: 1;
+}
+.log-channel {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.log-channel:hover { background: rgba(94,240,255,0.05); }
+.log-channel.active {
+  background: rgba(94,240,255,0.1);
+  border-left: 2px solid var(--cyan);
+}
+.log-channel-title { font-weight: 600; font-size: 13px; }
+.log-channel-meta { display: flex; gap: 10px; margin-top: 2px; }
+.log-channel-path { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--text-dim); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-right { display: flex; flex-direction: column; min-width: 0; }
+.log-right .log-viewer { flex: 1; min-height: 420px; }
+.small { font-size: 11.5px; }

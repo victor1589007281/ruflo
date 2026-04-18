@@ -1,35 +1,21 @@
 package dashboard
 
+// LLM 驱动的二次诊断摘要。
+// 本文件仅负责 "把规则洞察压缩成给人看的建议", 底层 API client 由
+// llm_client.go 统一提供 (GetSharedLLMClient), 与飞书 bot 使用同一份
+// claude-go.json#ai 配置。
+
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"os"
 	"strings"
 	"time"
-
-	"github.com/anthropic/claude-go/pkg/api"
 )
 
-// buildLLMSummary 使用 Claude 为当前的规则洞察做二次压缩/聚合, 返回一段 Markdown.
-// 需要环境变量 ANTHROPIC_API_KEY (或 ANTHROPIC_AUTH_TOKEN), 否则返回错误.
+// buildLLMSummary 使用 Claude/兼容模型把 rule-based InsightsResp 压缩成
+// 一段面向运维的 Markdown 建议。失败时返回原始错误, 调用方决定是否在
+// response 中显示为 LLMError。
 func buildLLMSummary(ctx context.Context, resp *InsightsResp) (string, error) {
-	key := firstNonEmpty(os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("ANTHROPIC_AUTH_TOKEN"))
-	if key == "" {
-		return "", fmt.Errorf("未设置 ANTHROPIC_API_KEY, LLM 诊断不可用")
-	}
-	model := os.Getenv("DASHBOARD_LLM_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
-	}
-	base := firstNonEmpty(os.Getenv("ANTHROPIC_BASE_URL"), "https://api.anthropic.com")
-	client := api.NewClient(base, key, model)
-
-	payload := map[string]interface{}{
-		"insights": resp.Insights,
-		"total":    resp.Total,
-	}
-	b, _ := json.Marshal(payload)
 	sys := strings.TrimSpace(`你是 Claude-Go 的系统诊断助手。你会收到一组基于规则产生的 insights（每条含 module/severity/title/suggestion）。请:
 1. 合并重复/同源问题
 2. 根据 severity 排优先级 (critical > warn > info)
@@ -37,11 +23,16 @@ func buildLLMSummary(ctx context.Context, resp *InsightsResp) (string, error) {
 4. 语言使用简体中文, 语气专业、克制, 不使用 emoji
 5. 输出 ≤ 220 字`)
 
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	out, err := client.SimpleComplete(cctx, sys, "规则产出的 JSON 数据如下:\n"+string(b))
+	payload := map[string]interface{}{
+		"insights": resp.Insights,
+		"total":    resp.Total,
+	}
+	b, _ := json.Marshal(payload)
+	user := "规则产出的 JSON 数据如下:\n" + string(b)
+
+	out, _, err := LLMComplete(ctx, sys, user, 30*time.Second)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(out), nil
+	return out, nil
 }

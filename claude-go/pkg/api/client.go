@@ -53,6 +53,29 @@ func (e *OverloadedError) Error() string { return e.Message }
 // eventType: "retry", "circuit_open", "circuit_close", "fatal"
 type LLMEventFunc func(eventType, detail string)
 
+// LLMCallRecord 单次 LLM 调用的可观测数据, 用于采集 token / 延迟 / 成败。
+type LLMCallRecord struct {
+	Model          string
+	BaseURL        string
+	Status         string // "success" | "error" | "retry_success"
+	Stream         bool
+	DurationSec    float64
+	InputTokens    int
+	OutputTokens   int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	TotalTokens    int
+	HTTPStatus     int    // 最终的 HTTP 状态码 (可能是 200)
+	Retries        int    // 本次调用内部触发的重试次数
+	ErrorKind      string // "timeout"|"rate_limit"|"overloaded"|"prompt_too_long"|"refusal"|"client"|"server"|""
+	ErrorMessage   string // 截断后的错误信息
+	StopReason     string // "end_turn"|"max_tokens"|"tool_use"|"refusal"|...
+	Timestamp      time.Time
+}
+
+// LLMMetricsHook 采集 LLM 调用指标的回调 (dashboard 在启动时注入, 避免循环依赖)。
+type LLMMetricsHook func(rec LLMCallRecord)
+
 // Client Anthropic Messages API 客户端。
 type Client struct {
 	BaseURL string
@@ -64,8 +87,9 @@ type Client struct {
 	RetryBase  time.Duration // 退避基数, 默认 3s
 	RetryMax   time.Duration // 退避上限, 默认 60s
 
-	OnLLMEvent LLMEventFunc // 事件回调 (可选, 注入飞书通知)
-	Guard      *RateLimitGuard // 全局准入控制器 (可选, 强烈建议设置)
+	OnLLMEvent   LLMEventFunc    // 事件回调 (可选, 注入飞书通知)
+	OnLLMMetrics LLMMetricsHook  // 指标回调 (可选, 注入 dashboard metrics collector)
+	Guard        *RateLimitGuard // 全局准入控制器 (可选, 强烈建议设置)
 
 	// 熔断器
 	cbMu             sync.Mutex
@@ -126,6 +150,78 @@ func (c *Client) fireEvent(eventType, detail string) {
 	if c.OnLLMEvent != nil {
 		c.OnLLMEvent(eventType, detail)
 	}
+}
+
+// ── 全局 LLM 指标采集钩子 (跨 Client 共用) ────────────────────────────────────
+// dashboard 启动时注册一次, 所有 api.Client (无论从哪里创建) 都会把调用统计
+// 汇总到同一处, 便于统一展示 "LLM token 使用 / 质量 / 错误" 指标。
+var (
+	globalLLMHookMu sync.RWMutex
+	globalLLMHook   LLMMetricsHook
+)
+
+// SetGlobalLLMMetricsHook 注册/覆盖全局 LLM 指标钩子。传入 nil 可禁用。
+func SetGlobalLLMMetricsHook(h LLMMetricsHook) {
+	globalLLMHookMu.Lock()
+	globalLLMHook = h
+	globalLLMHookMu.Unlock()
+}
+
+// emitLLMMetric 同时向 client 自己的 hook 和全局 hook 发送指标。
+func (c *Client) emitLLMMetric(rec LLMCallRecord) {
+	if rec.Timestamp.IsZero() {
+		rec.Timestamp = time.Now()
+	}
+	if rec.Model == "" {
+		rec.Model = c.Model
+	}
+	if rec.BaseURL == "" {
+		rec.BaseURL = c.BaseURL
+	}
+	if c.OnLLMMetrics != nil {
+		func() {
+			defer func() { _ = recover() }()
+			c.OnLLMMetrics(rec)
+		}()
+	}
+	globalLLMHookMu.RLock()
+	gh := globalLLMHook
+	globalLLMHookMu.RUnlock()
+	if gh != nil {
+		func() {
+			defer func() { _ = recover() }()
+			gh(rec)
+		}()
+	}
+}
+
+// classifyErrorKind 粗分类错误原因 (给指标上标签)。
+func classifyErrorKind(status int, errStr string) string {
+	low := strings.ToLower(errStr)
+	switch {
+	case status == 429:
+		return "rate_limit"
+	case status == 503 || status == 529 || strings.Contains(low, "overloaded"):
+		return "overloaded"
+	case strings.Contains(low, "prompt is too long") || strings.Contains(low, "prompt_too_long"):
+		return "prompt_too_long"
+	case strings.Contains(low, "refusal"):
+		return "refusal"
+	case strings.Contains(low, "context deadline") || strings.Contains(low, "timeout"):
+		return "timeout"
+	case status >= 400 && status < 500:
+		return "client"
+	case status >= 500:
+		return "server"
+	}
+	return ""
+}
+
+func truncateErr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func (c *Client) isCircuitOpen() bool {
@@ -201,11 +297,32 @@ func (c *Client) StreamMessage(
 	errCh := make(chan error, 1)
 
 	go func() {
+		startTS := time.Now()
+		streamRec := LLMCallRecord{Stream: true, Status: "success"}
+		streamErrMsg := ""
+		streamRetries := 0
+		defer func() {
+			streamRec.DurationSec = time.Since(startTS).Seconds()
+			streamRec.TotalTokens = streamRec.InputTokens + streamRec.OutputTokens + streamRec.CacheReadTokens + streamRec.CacheCreationTokens
+			streamRec.Retries = streamRetries
+			if streamErrMsg != "" {
+				streamRec.Status = "error"
+				streamRec.ErrorMessage = truncateErr(streamErrMsg, 256)
+				if streamRec.ErrorKind == "" {
+					streamRec.ErrorKind = classifyErrorKind(streamRec.HTTPStatus, streamErrMsg)
+				}
+			} else if streamRetries > 0 {
+				streamRec.Status = "retry_success"
+			}
+			c.emitLLMMetric(streamRec)
+		}()
 		defer close(eventCh)
 		defer close(errCh)
 
 		if c.isCircuitOpen() {
 			c.fireEvent("circuit_open", "熔断器开启, StreamMessage 被拒绝")
+			streamErrMsg = "circuit open"
+			streamRec.ErrorKind = "client"
 			errCh <- fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
 			return
 		}
@@ -276,19 +393,23 @@ func (c *Client) StreamMessage(
 				if attempt < maxRetry {
 					delay := c.retryDelay(attempt, 0)
 					c.TotalRetries.Add(1)
+					streamRetries++
 					c.fireEvent("retry", fmt.Sprintf("Stream 网络错误(尝试 %d/%d), %.0fs 后重试", attempt+1, maxRetry+1, delay.Seconds()))
 					select {
 					case <-time.After(delay):
 						continue
 					case <-ctx.Done():
+						streamErrMsg = ctx.Err().Error()
 						errCh <- ctx.Err()
 						return
 					}
 				}
 				c.recordFailure(err.Error())
+				streamErrMsg = err.Error()
 				errCh <- fmt.Errorf("API 请求失败: %w", err)
 				return
 			}
+			streamRec.HTTPStatus = resp.StatusCode
 
 			if resp.StatusCode == 200 {
 				c.recordSuccess()
@@ -306,16 +427,21 @@ func (c *Client) StreamMessage(
 			if json.Unmarshal(respBody, &apiErr) == nil {
 				errType := apiErr.Error.Type
 				if errType == "invalid_request_error" && strings.Contains(apiErr.Error.Message, "prompt is too long") {
+					streamErrMsg = apiErr.Error.Message
+					streamRec.ErrorKind = "prompt_too_long"
 					errCh <- &PromptTooLongError{Message: apiErr.Error.Message}
 					return
 				}
 				if errType == "refusal" {
+					streamErrMsg = apiErr.Error.Message
+					streamRec.ErrorKind = "refusal"
 					errCh <- fmt.Errorf("模型拒绝回答 (refusal): %s", apiErr.Error.Message)
 					return
 				}
 			}
 
 			if !isRetryableStatus(resp.StatusCode) {
+				streamErrMsg = fmt.Sprintf("API %d: %s", resp.StatusCode, string(respBody))
 				errCh <- fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 				return
 			}
@@ -347,6 +473,7 @@ func (c *Client) StreamMessage(
 					}
 				}
 				c.TotalRetries.Add(1)
+				streamRetries++
 				statusHint := "服务端错误"
 				if resp.StatusCode == 429 {
 					statusHint = fmt.Sprintf("限流(%s)", Classify429(resp.StatusCode, string(respBody)))
@@ -358,6 +485,7 @@ func (c *Client) StreamMessage(
 				case <-time.After(delay):
 					continue
 				case <-ctx.Done():
+					streamErrMsg = ctx.Err().Error()
 					errCh <- ctx.Err()
 					return
 				}
@@ -366,6 +494,7 @@ func (c *Client) StreamMessage(
 			c.recordFailure(string(respBody))
 			c.TotalFails.Add(1)
 			c.fireEvent("fatal", fmt.Sprintf("Stream %d 次全部失败", maxRetry+1))
+			streamErrMsg = fmt.Sprintf("API %d: %s", resp.StatusCode, string(respBody))
 			errCh <- fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 			return
 		}
@@ -401,6 +530,34 @@ func (c *Client) StreamMessage(
 			var delta types.StreamDelta
 			if err := json.Unmarshal([]byte(data), &delta); err != nil {
 				continue
+			}
+
+			// 采集 token 使用量 (message_start / message_delta)
+			if delta.Message != nil && delta.Message.Usage != nil {
+				u := delta.Message.Usage
+				if u.InputTokens > 0 {
+					streamRec.InputTokens = u.InputTokens
+				}
+				if u.OutputTokens > 0 {
+					streamRec.OutputTokens = u.OutputTokens
+				}
+				if u.CacheReadInputTokens > 0 {
+					streamRec.CacheReadTokens = u.CacheReadInputTokens
+				}
+				if u.CacheCreationInputTokens > 0 {
+					streamRec.CacheCreationTokens = u.CacheCreationInputTokens
+				}
+			}
+			if delta.Usage != nil {
+				if delta.Usage.OutputTokens > 0 {
+					streamRec.OutputTokens = delta.Usage.OutputTokens
+				}
+				if delta.Usage.InputTokens > 0 {
+					streamRec.InputTokens = delta.Usage.InputTokens
+				}
+			}
+			if delta.Delta != nil && delta.Delta.StopReason != "" {
+				streamRec.StopReason = delta.Delta.StopReason
 			}
 
 			// 处理 signature_delta (签名验证增量)
@@ -490,6 +647,9 @@ func (c *Client) SendMessage(
 	}
 
 	var lastErr error
+	var lastStatus int
+	startTS := time.Now()
+	retries := 0
 	for attempt := 0; attempt <= maxRetry; attempt++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -511,6 +671,7 @@ func (c *Client) SendMessage(
 			if attempt < maxRetry {
 				delay := c.retryDelay(attempt, 0)
 				c.TotalRetries.Add(1)
+				retries++
 				log.Printf("[api] SendMessage 网络错误(尝试 %d/%d): %v, %.1fs 后重试", attempt+1, maxRetry+1, err, delay.Seconds())
 				c.fireEvent("retry", fmt.Sprintf("网络错误(尝试 %d/%d): %v, %.0fs 后重试", attempt+1, maxRetry+1, err, delay.Seconds()))
 				select {
@@ -522,6 +683,14 @@ func (c *Client) SendMessage(
 			}
 			c.recordFailure(lastErr.Error())
 			c.TotalFails.Add(1)
+			c.emitLLMMetric(LLMCallRecord{
+				Status:       "error",
+				DurationSec:  time.Since(startTS).Seconds(),
+				HTTPStatus:   0,
+				Retries:      retries,
+				ErrorKind:    classifyErrorKind(0, err.Error()),
+				ErrorMessage: truncateErr(err.Error(), 256),
+			})
 			return nil, lastErr
 		}
 
@@ -530,6 +699,7 @@ func (c *Client) SendMessage(
 		if err != nil {
 			return nil, fmt.Errorf("读取响应失败: %w", err)
 		}
+		lastStatus = resp.StatusCode
 
 		if resp.StatusCode == 200 {
 			c.recordSuccess()
@@ -540,11 +710,38 @@ func (c *Client) SendMessage(
 			if err := json.Unmarshal(respBody, &result); err != nil {
 				return nil, fmt.Errorf("解析响应失败: %w", err)
 			}
+			rec := LLMCallRecord{
+				Status:      "success",
+				DurationSec: time.Since(startTS).Seconds(),
+				HTTPStatus:  200,
+				Retries:     retries,
+				StopReason:  result.StopReason,
+			}
+			if retries > 0 {
+				rec.Status = "retry_success"
+			}
+			if result.Usage != nil {
+				rec.InputTokens = result.Usage.InputTokens
+				rec.OutputTokens = result.Usage.OutputTokens
+				rec.CacheReadTokens = result.Usage.CacheReadInputTokens
+				rec.CacheCreationTokens = result.Usage.CacheCreationInputTokens
+				rec.TotalTokens = rec.InputTokens + rec.OutputTokens + rec.CacheReadTokens + rec.CacheCreationTokens
+			}
+			c.emitLLMMetric(rec)
 			return &result, nil
 		}
 
 		// 不可重试的客户端错误 (400/401/403) — 不计入熔断器
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 && !isRetryableStatus(resp.StatusCode) {
+			errMsg := fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(respBody))
+			c.emitLLMMetric(LLMCallRecord{
+				Status:       "error",
+				DurationSec:  time.Since(startTS).Seconds(),
+				HTTPStatus:   resp.StatusCode,
+				Retries:      retries,
+				ErrorKind:    classifyErrorKind(resp.StatusCode, string(respBody)),
+				ErrorMessage: truncateErr(errMsg, 256),
+			})
 			return nil, fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 		}
 
@@ -579,6 +776,7 @@ func (c *Client) SendMessage(
 				}
 			}
 			c.TotalRetries.Add(1)
+			retries++
 			statusHint := "服务端错误"
 			if resp.StatusCode == 429 {
 				statusHint = fmt.Sprintf("限流(%s)", Classify429(resp.StatusCode, string(respBody)))
@@ -603,6 +801,14 @@ func (c *Client) SendMessage(
 	c.recordFailure(lastErr.Error())
 	c.TotalFails.Add(1)
 	c.fireEvent("fatal", fmt.Sprintf("LLM 调用 %d 次全部失败: %v", maxRetry+1, lastErr))
+	c.emitLLMMetric(LLMCallRecord{
+		Status:       "error",
+		DurationSec:  time.Since(startTS).Seconds(),
+		HTTPStatus:   lastStatus,
+		Retries:      retries,
+		ErrorKind:    classifyErrorKind(lastStatus, lastErr.Error()),
+		ErrorMessage: truncateErr(lastErr.Error(), 256),
+	})
 	return nil, fmt.Errorf("LLM 调用 %d 次全部失败: %w", maxRetry+1, lastErr)
 }
 

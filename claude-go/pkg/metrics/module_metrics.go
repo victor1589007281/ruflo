@@ -380,3 +380,22 @@ const (
 	MMemPruneCount     = "mem_prune_count"       // 修剪次数
 	MMemRetrievalCount = "mem_retrieval_count"   // 检索次数
 )
+
+// LLM 指标 (跨模块通用的大模型调用观测)
+const (
+	MLLMCallCount         = "llm_call_count"          // 调用总数
+	MLLMSuccessCount      = "llm_success_count"       // 成功数
+	MLLMErrorCount        = "llm_error_count"         // 失败数
+	MLLMRetryCount        = "llm_retry_count"         // 重试次数
+	MLLMDurationSec       = "llm_duration_sec"        // 单次耗时(秒)
+	MLLMInputTokens       = "llm_input_tokens"        // 输入 token
+	MLLMOutputTokens      = "llm_output_tokens"       // 输出 token
+	MLLMCacheReadTokens   = "llm_cache_read_tokens"   // 缓存命中 token
+	MLLMCacheCreateTokens = "llm_cache_create_tokens" // 缓存创建 token
+	MLLMTotalTokens       = "llm_total_tokens"        // 总 token
+	MLLMRateLimitCount    = "llm_rate_limit_count"    // 429 次数
+	MLLMOverloadCount     = "llm_overload_count"      // 过载次数
+	MLLMTimeoutCount      = "llm_timeout_count"       // 超时次数
+	MLLMRefusalCount      = "llm_refusal_count"       // 拒答次数
+	MLLMPromptTooLong     = "llm_prompt_too_long"     // prompt 超长次数
+)
