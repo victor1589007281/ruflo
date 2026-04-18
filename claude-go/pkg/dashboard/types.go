@@ -264,11 +264,6 @@ type APIError struct {
 	Error string `json:"error"`
 }
 
-// BlackboardDTO 黑板 key-value。
-type BlackboardDTO struct {
-	Keys map[string]interface{} `json:"keys"`
-}
-
 // InsightDTO 自动诊断的单条洞察。
 //   - Severity: info / warn / critical
 //   - Kind:     trend / saturation / idle / anomaly / success

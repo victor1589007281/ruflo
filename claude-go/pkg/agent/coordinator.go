@@ -36,6 +36,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/metrics"
 )
 
 // Checkpoint 阶段执行检查点。
@@ -184,6 +186,9 @@ func (c *Coordinator) runPipelineWithRecovery(
 			stageResults := c.executeParallelWithRetry(ctx, parallelGroup, objective, results, team, executor)
 			for _, sr := range stageResults {
 				allResults = append(allResults, sr)
+				// 阶段一完成就增量刷盘 stages + 记录 stage 指标, dashboard 可实时看到进度
+				c.flushTeamStages(team, allResults)
+				c.recordStageMetrics(team, sr)
 				if sr.Status == TaskCompleted {
 					completed[sr.Name] = true
 					results[sr.Name] = sr.Output
@@ -195,6 +200,8 @@ func (c *Coordinator) runPipelineWithRecovery(
 			stage := ready[0]
 			sr := c.executeStageWithRetry(ctx, stage, objective, results, team, executor)
 			allResults = append(allResults, sr)
+			c.flushTeamStages(team, allResults)
+			c.recordStageMetrics(team, sr)
 			if sr.Status == TaskCompleted {
 				completed[stage.Name] = true
 				results[stage.Name] = sr.Output
@@ -205,6 +212,57 @@ func (c *Coordinator) runPipelineWithRecovery(
 	}
 
 	return allResults, nil
+}
+
+// flushTeamStages 把当前已产生的 stage 结果增量写回 team, 供 dashboard 实时查看。
+// 注意: 调用方不持有 team.mu, 这里会短暂加锁拷贝 + 触发 persist。
+func (c *Coordinator) flushTeamStages(team *ProductionTeam, snapshot []StageResult) {
+	if team == nil {
+		return
+	}
+	// 防御: 拷贝一份给 team, 避免后续 append 改动产生 data race。
+	cp := make([]StageResult, len(snapshot))
+	copy(cp, snapshot)
+	team.mu.Lock()
+	team.Stages = cp
+	team.mu.Unlock()
+	team.persist()
+}
+
+// recordStageMetrics 为单个 stage 结果上报细粒度指标: duration / retry / status。
+// 这些数据供 dashboard 绘制"每个阶段耗时分布 / 重试次数"等图表。
+func (c *Coordinator) recordStageMetrics(team *ProductionTeam, sr StageResult) {
+	if team == nil {
+		return
+	}
+	mc := team.metrics()
+	if mc == nil {
+		return
+	}
+	labels := map[string]string{
+		"workflow": team.Workflow,
+		"stage":    sr.Name,
+		"role":     sr.Role,
+		"status":   string(sr.Status),
+	}
+	durSec := 0.0
+	if sr.Duration != "" {
+		if d, err := time.ParseDuration(sr.Duration); err == nil {
+			durSec = d.Seconds()
+		}
+	}
+	if durSec > 0 {
+		mc.RecordRun("team", metrics.MTeamStageDurationSec, durSec, team.Name, labels)
+	}
+	mc.RecordRun("team", metrics.MTeamStageCount, 1, team.Name, labels)
+	if sr.Status == TaskCompleted {
+		mc.RecordRun("team", metrics.MTeamStageSuccessCount, 1, team.Name, labels)
+	} else {
+		mc.RecordRun("team", metrics.MTeamStageFailCount, 1, team.Name, labels)
+	}
+	if sr.Output != "" {
+		mc.RecordRun("team", metrics.MTeamStageOutputLen, float64(len(sr.Output)), team.Name, labels)
+	}
 }
 
 // executeStageWithRetry 带重试和检查点的阶段执行。

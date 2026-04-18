@@ -359,7 +359,7 @@ const (
 	MTaskCompletionRate = "task_completion_rate" // 完成率
 )
 
-// Team 指标
+// Team 指标 — 整团队级
 const (
 	MTeamRunCount       = "team_run_count"        // 运行总数
 	MTeamSuccessCount   = "team_success_count"    // 成功次数
@@ -371,6 +371,28 @@ const (
 	MTeamOutputAvgLen   = "team_output_avg_len"   // 平均产出长度
 	MTeamRoundCount     = "team_round_count"      // 对抗轮数
 	MTeamFileCount      = "team_file_count"       // 产出文件数
+)
+
+// Team 指标 — Stage 级 (每次 stage 完成即上报, 可绘制阶段耗时/成功率分布)
+const (
+	MTeamStageCount        = "team_stage_count"          // 阶段执行次数
+	MTeamStageDurationSec  = "team_stage_duration_sec"   // 单阶段耗时
+	MTeamStageSuccessCount = "team_stage_success_count"  // 单阶段成功次数
+	MTeamStageFailCount    = "team_stage_fail_count"     // 单阶段失败次数
+	MTeamStageRetryCount   = "team_stage_retry_count"    // 单阶段重试次数
+	MTeamStageOutputLen    = "team_stage_output_len"     // 单阶段产出长度
+	MTeamStageToolCalls    = "team_stage_tool_calls"     // 单阶段工具调用数
+	MTeamAgentRunCount     = "team_agent_run_count"      // Agent 触发次数
+	MTeamAgentDurationSec  = "team_agent_duration_sec"   // Agent 单次耗时
+	MTeamBlackboardWrites  = "team_blackboard_writes"    // 黑板写入次数
+)
+
+// Cron 指标 (从 cron_jobs.json 的历史执行统计)
+const (
+	MCronRunCount     = "cron_run_count"      // 触发次数
+	MCronSuccessCount = "cron_success_count"  // 成功次数
+	MCronFailCount    = "cron_fail_count"     // 失败次数
+	MCronDurationSec  = "cron_duration_sec"   // 运行耗时
 )
 
 // Memory 指标

@@ -357,23 +357,84 @@ func matchTeam(labels map[string]string, name string) bool {
 	return false
 }
 
+// BoardEntryDTO 黑板条目 (对外 API 视图)。与 pkg/agent.BoardEntry 字段一致。
+type BoardEntryDTO struct {
+	Key       string    `json:"key"`
+	Value     string    `json:"value"`
+	Author    string    `json:"author"`
+	Category  string    `json:"category"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// BlackboardDTO 黑板完整视图: 同时提供 entries (原始条目数组) 和 map (k→最新值),
+// 方便前端按条目列表或按 key 快速查找两种方式展示。
+type BlackboardDTO struct {
+	Team     string           `json:"team"`
+	Entries  []BoardEntryDTO  `json:"entries"`
+	Map      map[string]string `json:"map"`
+	Count    int              `json:"count"`
+	UpdateAt time.Time        `json:"updatedAt,omitempty"`
+}
+
 // Blackboard 读取某个团队的黑板 JSON。
-func (p *Provider) Blackboard(name string) (map[string]interface{}, error) {
+// 磁盘上 blackboard.json 由 pkg/agent.Blackboard 写入, 实际形态是 BoardEntry 数组;
+// 这里同时兼容旧版 map 形态 (dashboard /api/teams/.../blackboard POST 写入的临时形态)。
+func (p *Provider) Blackboard(name string) (*BlackboardDTO, error) {
 	if !safeName(name) {
 		return nil, errors.New("invalid team name")
 	}
-	data, err := os.ReadFile(p.pathIn("teams", name, "blackboard.json"))
+	dto := &BlackboardDTO{Team: name, Entries: []BoardEntryDTO{}, Map: map[string]string{}}
+	fp := p.pathIn("teams", name, "blackboard.json")
+	data, err := os.ReadFile(fp)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return map[string]interface{}{}, nil
+			return dto, nil
 		}
 		return nil, err
 	}
+	if st, err := os.Stat(fp); err == nil {
+		dto.UpdateAt = st.ModTime()
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return dto, nil
+	}
+	// 优先尝试 BoardEntry 数组形态 (真实线上形态)
+	if strings.HasPrefix(trimmed, "[") {
+		var entries []BoardEntryDTO
+		if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
+			return nil, err
+		}
+		dto.Entries = entries
+		for _, e := range entries {
+			dto.Map[e.Key] = e.Value
+		}
+		dto.Count = len(entries)
+		return dto, nil
+	}
+	// 兼容 map 形态 (dashboard 历史写入)
 	var m map[string]interface{}
-	if err := json.Unmarshal(data, &m); err != nil {
+	if err := json.Unmarshal([]byte(trimmed), &m); err != nil {
 		return nil, err
 	}
-	return m, nil
+	for k, v := range m {
+		sv := ""
+		switch val := v.(type) {
+		case string:
+			sv = val
+		default:
+			if b, err := json.Marshal(val); err == nil {
+				sv = string(b)
+			}
+		}
+		dto.Map[k] = sv
+		dto.Entries = append(dto.Entries, BoardEntryDTO{
+			Key:   k,
+			Value: sv,
+		})
+	}
+	dto.Count = len(dto.Entries)
+	return dto, nil
 }
 
 func (p *Provider) readTeamFile(name string) (*rawTeam, error) {

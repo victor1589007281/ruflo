@@ -71,6 +71,11 @@ type LLMCallRecord struct {
 	ErrorMessage   string // 截断后的错误信息
 	StopReason     string // "end_turn"|"max_tokens"|"tool_use"|"refusal"|...
 	Timestamp      time.Time
+
+	// 追踪信息 (由 Client.Tag 或调用方 Context 注入, 支持按业务维度聚合)
+	Source  string // "chat" | "feishu" | "team" | "swarm" | "dashboard" | "vision" | "compact" | ...
+	Purpose string // 额外标签, 如团队名 / stage 名 / agent 角色
+	Request string // 粗粒度 HTTP 方法标签 (messages / stream-messages)
 }
 
 // LLMMetricsHook 采集 LLM 调用指标的回调 (dashboard 在启动时注入, 避免循环依赖)。
@@ -90,6 +95,10 @@ type Client struct {
 	OnLLMEvent   LLMEventFunc    // 事件回调 (可选, 注入飞书通知)
 	OnLLMMetrics LLMMetricsHook  // 指标回调 (可选, 注入 dashboard metrics collector)
 	Guard        *RateLimitGuard // 全局准入控制器 (可选, 强烈建议设置)
+
+	// 追踪标签 (可选): 调用方通过 WithTag 或直接赋值, 标识该 Client 实例所服务的业务场景。
+	// 会写入 LLMCallRecord.Source, 方便在 dashboard 里按业务维度聚合 (chat/feishu/team/...)。
+	Tag string
 
 	// 熔断器
 	cbMu             sync.Mutex
@@ -118,6 +127,17 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		RetryMax:    60 * time.Second,
 		cbThreshold: 5,
 	}
+}
+
+// SetTag 为该 Client 实例设置业务追踪标签 (chat / feishu / team / dashboard / ...),
+// 该标签会写入 LLMCallRecord.Source, 方便 dashboard 按业务维度聚合 LLM 调用指标。
+// 直接修改原 Client, 不做拷贝 (Client 内含 sync.Mutex / atomic, 浅拷贝会被 go vet 拒绝)。
+func (c *Client) SetTag(tag string) *Client {
+	if c == nil {
+		return nil
+	}
+	c.Tag = tag
+	return c
 }
 
 // isRetryable 判断 HTTP 状态码是否可重试
@@ -177,6 +197,13 @@ func (c *Client) emitLLMMetric(rec LLMCallRecord) {
 	}
 	if rec.BaseURL == "" {
 		rec.BaseURL = c.BaseURL
+	}
+	if rec.Source == "" {
+		rec.Source = c.Tag
+	}
+	// 保底: 如果调用侧完全没给出 Source, 给一个 "unknown" 而不是空串, 便于 dashboard 统计。
+	if rec.Source == "" {
+		rec.Source = "unknown"
 	}
 	if c.OnLLMMetrics != nil {
 		func() {
@@ -298,7 +325,14 @@ func (c *Client) StreamMessage(
 
 	go func() {
 		startTS := time.Now()
-		streamRec := LLMCallRecord{Stream: true, Status: "success"}
+		streamRec := LLMCallRecord{
+			Stream:  true,
+			Status:  "success",
+			Model:   c.Model,
+			BaseURL: c.BaseURL,
+			Source:  c.Tag,
+			Request: "stream_messages",
+		}
 		streamErrMsg := ""
 		streamRetries := 0
 		defer func() {
@@ -685,6 +719,7 @@ func (c *Client) SendMessage(
 			c.TotalFails.Add(1)
 			c.emitLLMMetric(LLMCallRecord{
 				Status:       "error",
+				Request:      "messages",
 				DurationSec:  time.Since(startTS).Seconds(),
 				HTTPStatus:   0,
 				Retries:      retries,
@@ -712,10 +747,14 @@ func (c *Client) SendMessage(
 			}
 			rec := LLMCallRecord{
 				Status:      "success",
+				Request:     "messages",
 				DurationSec: time.Since(startTS).Seconds(),
 				HTTPStatus:  200,
 				Retries:     retries,
 				StopReason:  result.StopReason,
+			}
+			if result.Model != "" {
+				rec.Model = result.Model
 			}
 			if retries > 0 {
 				rec.Status = "retry_success"
@@ -736,6 +775,7 @@ func (c *Client) SendMessage(
 			errMsg := fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 			c.emitLLMMetric(LLMCallRecord{
 				Status:       "error",
+				Request:      "messages",
 				DurationSec:  time.Since(startTS).Seconds(),
 				HTTPStatus:   resp.StatusCode,
 				Retries:      retries,
@@ -803,6 +843,7 @@ func (c *Client) SendMessage(
 	c.fireEvent("fatal", fmt.Sprintf("LLM 调用 %d 次全部失败: %v", maxRetry+1, lastErr))
 	c.emitLLMMetric(LLMCallRecord{
 		Status:       "error",
+		Request:      "messages",
 		DurationSec:  time.Since(startTS).Seconds(),
 		HTTPStatus:   lastStatus,
 		Retries:      retries,

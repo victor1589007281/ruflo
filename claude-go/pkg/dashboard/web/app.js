@@ -2337,6 +2337,29 @@
       v.appendChild(h('div', { class: 'card mb-16' }, [h('h3', {}, '按模型聚合'), tbl]));
     }
 
+    // 按来源聚合 (cli / feishu / team / dashboard / unknown)
+    if ((data.bySource || []).length) {
+      const tbl = h('table', { class: 'tbl' });
+      tbl.appendChild(h('thead', {}, h('tr', {}, [
+        h('th', {}, '来源'), h('th', {}, '调用'), h('th', {}, '成功率'),
+        h('th', {}, '平均时长'), h('th', {}, 'Input'), h('th', {}, 'Output'), h('th', {}, '错误'),
+      ])));
+      const tb = h('tbody');
+      for (const s of data.bySource) {
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, h('span', { class: 'badge' }, s.source)),
+          h('td', {}, String(s.calls)),
+          h('td', {}, h('span', { class: 'badge ' + (s.successRate >= 0.9 ? 'ok' : 'warn') }, fmtPct(s.successRate))),
+          h('td', {}, fmtDurSec(s.avgDuration)),
+          h('td', {}, fmtKilo(s.inputTokens || 0)),
+          h('td', {}, fmtKilo(s.outputTokens || 0)),
+          h('td', {}, String(s.errors || 0)),
+        ]));
+      }
+      tbl.appendChild(tb);
+      v.appendChild(h('div', { class: 'card mb-16' }, [h('h3', {}, '按来源聚合'), tbl]));
+    }
+
     // 错误分布
     if ((data.errorBuckets || []).length) {
       const tbl = h('table', { class: 'tbl' });

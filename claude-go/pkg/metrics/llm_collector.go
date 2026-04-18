@@ -45,8 +45,13 @@ func GlobalLLMCollector() *Collector {
 
 func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 	labels := map[string]string{
-		"model":  firstNonEmptyStr(rec.Model, "unknown"),
-		"status": rec.Status,
+		"model":   firstNonEmptyStr(rec.Model, "unknown"),
+		"status":  rec.Status,
+		"source":  firstNonEmptyStr(rec.Source, "unknown"),
+		"request": firstNonEmptyStr(rec.Request, "messages"),
+	}
+	if rec.Purpose != "" {
+		labels["purpose"] = rec.Purpose
 	}
 	if rec.StopReason != "" {
 		labels["stop_reason"] = rec.StopReason

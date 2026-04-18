@@ -292,6 +292,15 @@ type ProductionTeam struct {
 	doneCh     chan struct{} // 关闭信号: 工作流执行完毕时 close
 }
 
+// metrics 返回 team 所属 manager 的指标采集器 (可能为 nil)。
+// Coordinator 在 stage 级别增量上报指标时使用。
+func (t *ProductionTeam) metrics() *metrics.Collector {
+	if t == nil || t.mgr == nil {
+		return nil
+	}
+	return t.mgr.metrics
+}
+
 // SetLanguage 设置团队的编程语言 (go/cpp/rust/python)。
 // 必须在 StartTeam 之前调用。影响编译门禁、文件物化和 prompt 模板。
 func (t *ProductionTeam) SetLanguage(lang string) {
@@ -785,8 +794,19 @@ func (ptm *ProductionTeamManager) failTeam(team *ProductionTeam, reason string) 
 	team.Status = TeamStatusFailed
 	team.FinishedAt = time.Now()
 	team.Error = reason
+	startedAt := team.StartedAt
 	team.mu.Unlock()
 	team.persist()
+
+	// 失败路径也要补齐整团队级指标, 否则 dashboard 的成败对比/故障分析会缺数据。
+	if ptm.metrics != nil {
+		labels := map[string]string{"workflow": team.Workflow, "status": "failed"}
+		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
+		ptm.metrics.RecordRun("team", metrics.MTeamFailCount, 1, team.Name, labels)
+		if !startedAt.IsZero() {
+			ptm.metrics.RecordRun("team", metrics.MTeamDurationSec, time.Since(startedAt).Seconds(), team.Name, labels)
+		}
+	}
 
 	// 判断是否 LLM 限流/熔断导致, 给出恢复提示
 	lower := strings.ToLower(reason)
@@ -1091,7 +1111,23 @@ func (ptm *ProductionTeamManager) executePrediction(ctx context.Context, team *P
 	team.mu.Lock()
 	team.Status = TeamStatusCompleted
 	team.FinishedAt = time.Now()
+	team.Stages = []StageResult{{
+		Name:    "predict",
+		Role:    "swarm-intelligence",
+		Status:  TaskCompleted,
+		Output:  result.Summary,
+	}}
 	team.mu.Unlock()
+	team.persist() // 补齐 predict 工作流的状态落盘
+
+	// 补齐 predict 工作流的团队级指标 (之前遗漏)
+	if ptm.metrics != nil {
+		labels := map[string]string{"workflow": team.Workflow, "status": "completed"}
+		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
+		ptm.metrics.RecordRun("team", metrics.MTeamSuccessCount, 1, team.Name, labels)
+		ptm.metrics.RecordRun("team", metrics.MTeamDurationSec,
+			team.FinishedAt.Sub(team.StartedAt).Seconds(), team.Name, labels)
+	}
 
 	if team.Blackboard != nil {
 		resultJSON, _ := json.Marshal(result)

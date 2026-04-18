@@ -143,6 +143,17 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "claude-go",
 		Short: "Claude Code (Go) - AI 编程助手",
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			// 在任何子命令执行前, 幂等初始化全局 LLM 指标采集钩子。
+			// 这样 chat/run/feishu/team/dashboard 等任意路径发起的 LLM 调用,
+			// 都会写入 <stateDir>/metrics/llm.jsonl, 供 dashboard 统一展示。
+			// 采用进程内 cwd 相对的默认 stateDir, 与 dashboard 默认一致。
+			cwd, _ := os.Getwd()
+			stateDir := basedir.ResolveDefault("", cwd)
+			// 启动前即尝试创建目录 (幂等), 避免首次 LLM 调用因目录不存在丢指标。
+			_ = os.MkdirAll(filepath.Join(stateDir, "metrics"), 0o755)
+			metrics.InitGlobalLLMCollector(stateDir)
+		},
 		Long: `Claude Code (Go) 是 Claude Code 客户端的 Go 实现，对标 review/claude/ (Tengu)，
 提供交互对话、一次性执行、飞书长连接、系统诊断与工具列表等能力。
 
@@ -1366,6 +1377,10 @@ func buildEngine() (*engine.QueryEngine, error) {
 
 	// 全局 LLM 准入控制器: RPM 令牌桶 + 并发信号量 + AIMD
 	apiClient.Guard = api.NewRateLimitGuard(api.DefaultGuardConfig())
+
+	// 为本客户端打上业务标签, 便于 dashboard 按 source 维度聚合指标。
+	// 交互/单次执行 → "cli", feishu/team/dashboard 会覆盖此值。
+	apiClient.Tag = "cli"
 
 	mcpConns, err := connectMCP(context.Background(), flagMCPConfig)
 	if err != nil {

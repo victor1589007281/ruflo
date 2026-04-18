@@ -230,6 +230,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	} else {
 		aiClient = api.NewDashScopeClient(config.APIKey, config.Model)
 	}
+	// 打上业务标签: 飞书 bot 发起的 LLM 调用在 dashboard 中可按 source=feishu 聚合
+	aiClient.Tag = "feishu"
 
 	// 初始化统一目录布局
 	stateRoot := basedir.ResolveDefault(config.StateDir, config.Cwd)

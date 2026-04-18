@@ -701,6 +701,7 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	designResults, err := we.runDesignPhase(ctx, designStages, objective, prevResults, team)
 	allResults = append(allResults, designResults...)
 	we.savePhaseCheckpoints(designResults)
+	we.flushStagesLive(team, allResults)
 	if err != nil {
 		return allResults, err
 	}
@@ -713,6 +714,7 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 		if orchErr == nil && len(orchResults) > 0 {
 			allResults = append(allResults, orchResults...)
 			we.savePhaseCheckpoints(orchResults)
+			we.flushStagesLive(team, allResults)
 			orchUsed = true
 		} else if orchErr != nil {
 			we.notify(we.chatID, fmt.Sprintf("⚠️ Orchestrator 启动失败, fallback 对抗循环: %v", orchErr))
@@ -724,6 +726,7 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 		advResults, err := we.runAdversarialLoop(ctx, generatorStages, evalStage, maxRounds, terminator, objective, prevResults, team)
 		allResults = append(allResults, advResults...)
 		we.savePhaseCheckpoints(advResults)
+		we.flushStagesLive(team, allResults)
 		if err != nil {
 			return allResults, err
 		}
@@ -733,10 +736,12 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	e2eResults := we.runE2EAdversarial(ctx, parallelStages, objective, prevResults, team)
 	allResults = append(allResults, e2eResults...)
 	we.savePhaseCheckpoints(e2eResults)
+	we.flushStagesLive(team, allResults)
 
 	// Phase 4: 收尾阶段
 	finishResults := we.runFinishPhase(ctx, parallelStages, objective, prevResults, team)
 	allResults = append(allResults, finishResults...)
+	we.flushStagesLive(team, allResults)
 	we.savePhaseCheckpoints(finishResults)
 
 	return allResults, nil
@@ -755,6 +760,47 @@ func (we *WorkflowExecutor) savePhaseCheckpoints(results []StageResult) {
 			we.checkpoints.SaveCheckpoint(r.Name, "completed", 0, r.Output)
 		} else if r.Status == TaskFailed {
 			we.checkpoints.SaveCheckpoint(r.Name, "failed", 0, r.Error)
+		}
+	}
+}
+
+// flushStagesLive 增量把当前已产生的 stage 列表写回 team, 并持久化。
+// 供 adversarial / fanout 等多 phase 工作流在每个 phase 结束后调用,
+// 让 dashboard 在整个工作流还在执行期间就能看到进度。
+func (we *WorkflowExecutor) flushStagesLive(team *ProductionTeam, results []StageResult) {
+	if team == nil || len(results) == 0 {
+		return
+	}
+	cp := make([]StageResult, len(results))
+	copy(cp, results)
+	team.mu.Lock()
+	team.Stages = cp
+	team.mu.Unlock()
+	team.persist()
+
+	// 把细粒度 stage 指标也一并上报, 与 Coordinator.recordStageMetrics 保持一致。
+	if mc := team.metrics(); mc != nil {
+		for _, sr := range results {
+			labels := map[string]string{
+				"workflow": team.Workflow,
+				"stage":    sr.Name,
+				"role":     sr.Role,
+				"status":   string(sr.Status),
+			}
+			if sr.Duration != "" {
+				if d, err := time.ParseDuration(sr.Duration); err == nil {
+					mc.RecordRun("team", metrics.MTeamStageDurationSec, d.Seconds(), team.Name, labels)
+				}
+			}
+			mc.RecordRun("team", metrics.MTeamStageCount, 1, team.Name, labels)
+			if sr.Status == TaskCompleted {
+				mc.RecordRun("team", metrics.MTeamStageSuccessCount, 1, team.Name, labels)
+			} else if sr.Status == TaskFailed {
+				mc.RecordRun("team", metrics.MTeamStageFailCount, 1, team.Name, labels)
+			}
+			if sr.Output != "" {
+				mc.RecordRun("team", metrics.MTeamStageOutputLen, float64(len(sr.Output)), team.Name, labels)
+			}
 		}
 	}
 }

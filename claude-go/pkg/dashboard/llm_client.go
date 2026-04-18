@@ -157,6 +157,8 @@ func resolveLLMClient() (*api.Client, LLMProfile, error) {
 			profile.Source = "dashscope-default"
 		}
 	}
+	// 打上业务标签: dashboard 自身发起的诊断/总结调用 source=dashboard
+	client.Tag = "dashboard"
 	return client, profile, nil
 }
 

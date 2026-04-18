@@ -205,6 +205,10 @@ func (s *Server) handleTeamDiagnose(w http.ResponseWriter, r *http.Request, name
 		return
 	}
 	bb, _ := s.provider.Blackboard(name)
+	bbMap := map[string]string{}
+	if bb != nil {
+		bbMap = bb.Map
+	}
 
 	payload := map[string]interface{}{
 		"name":        detail.Name,
@@ -230,16 +234,11 @@ func (s *Server) handleTeamDiagnose(w http.ResponseWriter, r *http.Request, name
 	}
 	payload["stages"] = stages
 	payload["rounds"] = detail.AdversaryRounds
-	if len(bb) > 0 {
-		// 黑板 value 可能很大, 截断
-		truncBB := map[string]interface{}{}
-		for k, v := range bb {
-			switch vv := v.(type) {
-			case string:
-				truncBB[k] = truncateString(vv, 400)
-			default:
-				truncBB[k] = vv
-			}
+	if len(bbMap) > 0 {
+		// 黑板 value 可能很大, 统一截断
+		truncBB := map[string]string{}
+		for k, v := range bbMap {
+			truncBB[k] = truncateString(v, 400)
 		}
 		payload["blackboard"] = truncBB
 	}
@@ -320,29 +319,75 @@ func (s *Server) handleTeamBlackboardWrite(w http.ResponseWriter, r *http.Reques
 	}
 
 	bbPath := filepath.Join(teamDir, "blackboard.json")
-	current := map[string]interface{}{}
+	// 读取为 BoardEntry 数组 (主进程写入的真实格式), 兼容旧的 map 格式。
+	var entries []BoardEntryDTO
 	if b, err := os.ReadFile(bbPath); err == nil && len(b) > 0 {
-		_ = json.Unmarshal(b, &current)
+		trimmed := strings.TrimSpace(string(b))
+		if strings.HasPrefix(trimmed, "[") {
+			_ = json.Unmarshal(b, &entries)
+		} else if strings.HasPrefix(trimmed, "{") {
+			var m map[string]interface{}
+			if err := json.Unmarshal(b, &m); err == nil {
+				for k, v := range m {
+					sv := ""
+					switch val := v.(type) {
+					case string:
+						sv = val
+					default:
+						if vb, err := json.Marshal(val); err == nil {
+							sv = string(vb)
+						}
+					}
+					entries = append(entries, BoardEntryDTO{
+						Key: k, Value: sv,
+					})
+				}
+			}
+		}
 	}
-	var value interface{}
+	var valueStr string
 	if len(req.Value) == 0 {
-		value = ""
-	} else if err := json.Unmarshal(req.Value, &value); err != nil {
-		value = string(req.Value)
+		valueStr = ""
+	} else {
+		// 尝试还原 Value: 优先作为字符串, 其他结构序列化成 JSON string
+		var raw interface{}
+		if err := json.Unmarshal(req.Value, &raw); err == nil {
+			switch vv := raw.(type) {
+			case string:
+				valueStr = vv
+			default:
+				if b, err := json.Marshal(raw); err == nil {
+					valueStr = string(b)
+				}
+			}
+		} else {
+			valueStr = string(req.Value)
+		}
 	}
-	current[req.Key] = value
-	// metadata: dashboard 写入元信息 (追踪来源)
-	meta, _ := current["_dashboard_writes"].([]interface{})
-	meta = append(meta, map[string]interface{}{
-		"key":  req.Key,
-		"time": time.Now().Format(time.RFC3339),
-	})
-	if len(meta) > 50 {
-		meta = meta[len(meta)-50:]
+	// 覆盖相同 key
+	updated := false
+	now := time.Now()
+	for i, e := range entries {
+		if e.Key == req.Key {
+			entries[i].Value = valueStr
+			entries[i].Author = "dashboard"
+			entries[i].Category = "dashboard_write"
+			entries[i].Timestamp = now
+			updated = true
+			break
+		}
 	}
-	current["_dashboard_writes"] = meta
+	if !updated {
+		entries = append(entries, BoardEntryDTO{
+			Key:       req.Key,
+			Value:     valueStr,
+			Author:    "dashboard",
+			Category:  "dashboard_write",
+			Timestamp: now,
+		})
+	}
 
-	nb, err := json.MarshalIndent(current, "", "  ")
+	nb, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -351,6 +396,7 @@ func (s *Server) handleTeamBlackboardWrite(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	value := valueStr
 	// 同时排队一条 action, 方便主进程订阅黑板变更触发下一步 (pull 模式)
 	queueDir := filepath.Join(s.cfg.StateDir, ".dashboard", "actions")
 	_ = os.MkdirAll(queueDir, 0o755)
@@ -375,7 +421,7 @@ func (s *Server) handleTeamBlackboardWrite(w http.ResponseWriter, r *http.Reques
 		"ok":       true,
 		"path":     bbPath,
 		"actionId": actionID,
-		"keys":     len(current),
+		"entries":  len(entries),
 	})
 }
 
@@ -406,6 +452,19 @@ type llmErrorBucket struct {
 	Count int    `json:"count"`
 }
 
+// llmSourceStats 按调用来源 (cli / feishu / team / dashboard / unknown) 聚合。
+// 帮助运维快速定位 "哪条业务路径在消耗 token / 触发错误"。
+type llmSourceStats struct {
+	Source       string  `json:"source"`
+	Calls        int     `json:"calls"`
+	Success      int     `json:"success"`
+	Errors       int     `json:"errors"`
+	InputTokens  int64   `json:"inputTokens"`
+	OutputTokens int64   `json:"outputTokens"`
+	AvgDuration  float64 `json:"avgDuration"`
+	SuccessRate  float64 `json:"successRate"`
+}
+
 type llmTimePoint struct {
 	Timestamp    time.Time `json:"ts"`
 	Calls        int       `json:"calls"`
@@ -430,6 +489,7 @@ type llmStatsResp struct {
 	AvgDuration  float64           `json:"avgDuration"`
 	P95Duration  float64           `json:"p95Duration"`
 	ByModel      []llmModelStats   `json:"byModel"`
+	BySource     []llmSourceStats  `json:"bySource"`
 	Errors5xx    []llmErrorBucket  `json:"errorBuckets"`
 	Timeseries   []llmTimePoint    `json:"timeseries"`
 	Alerts       []string          `json:"alerts,omitempty"`
@@ -465,6 +525,7 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		model      string
 		status     string
 		errKind    string
+		source     string
 		duration   float64
 		input      int64
 		output     int64
@@ -478,7 +539,13 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		k := callKey{ts: e.Timestamp.Truncate(time.Millisecond), model: e.Labels["model"]}
 		c := calls[k]
 		if c == nil {
-			c = &callAgg{model: e.Labels["model"], ts: e.Timestamp, status: e.Labels["status"], errKind: e.Labels["error_kind"]}
+			c = &callAgg{
+				model:   e.Labels["model"],
+				ts:      e.Timestamp,
+				status:  e.Labels["status"],
+				errKind: e.Labels["error_kind"],
+				source:  e.Labels["source"],
+			}
 			calls[k] = c
 		}
 		if c.model == "" {
@@ -489,6 +556,9 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		}
 		if c.errKind == "" {
 			c.errKind = e.Labels["error_kind"]
+		}
+		if c.source == "" {
+			c.source = e.Labels["source"]
 		}
 		return c
 	}
@@ -512,8 +582,9 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 按模型聚合
+	// 按模型 / 按来源 聚合
 	byModel := map[string]*llmModelStats{}
+	bySource := map[string]*llmSourceStats{}
 	errBuckets := map[string]int{}
 
 	for _, c := range calls {
@@ -521,24 +592,37 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		if m == "" {
 			m = "unknown"
 		}
+		src := c.source
+		if src == "" {
+			src = "unknown"
+		}
 		ms := byModel[m]
 		if ms == nil {
 			ms = &llmModelStats{Model: m}
 			byModel[m] = ms
 		}
+		ss := bySource[src]
+		if ss == nil {
+			ss = &llmSourceStats{Source: src}
+			bySource[src] = ss
+		}
 		ms.Calls++
+		ss.Calls++
 		resp.TotalCalls++
 		ms.InputTokens += c.input
 		ms.OutputTokens += c.output
 		ms.CacheRead += c.cacheRead
 		ms.CacheCreate += c.cacheCreate
 		ms.Retries += c.retries
+		ss.InputTokens += c.input
+		ss.OutputTokens += c.output
 		resp.InputTokens += c.input
 		resp.OutputTokens += c.output
 		resp.CacheRead += c.cacheRead
 		resp.CacheCreate += c.cacheCreate
 		resp.TotalRetries += c.retries
 		ms.AvgDuration += c.duration
+		ss.AvgDuration += c.duration
 		if c.duration > 0 {
 			durations = append(durations, c.duration)
 		}
@@ -546,14 +630,22 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		case "success", "retry_success":
 			ms.Success++
 			ms.SuccessCost += c.duration
+			ss.Success++
 			resp.Success++
 		case "error":
 			ms.Errors++
 			ms.ErrorCost += c.duration
+			ss.Errors++
 			resp.Errors++
 			if c.errKind != "" {
 				errBuckets[c.errKind]++
 			}
+		}
+	}
+	for _, ss := range bySource {
+		if ss.Calls > 0 {
+			ss.AvgDuration = ss.AvgDuration / float64(ss.Calls)
+			ss.SuccessRate = float64(ss.Success) / float64(ss.Calls)
 		}
 	}
 
@@ -593,6 +685,14 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Slice(resp.ByModel, func(i, j int) bool { return resp.ByModel[i].Calls > resp.ByModel[j].Calls })
+
+	// bySource 排序 (按调用数倒序)
+	for _, ss := range bySource {
+		if ss.Calls > 0 {
+			resp.BySource = append(resp.BySource, *ss)
+		}
+	}
+	sort.Slice(resp.BySource, func(i, j int) bool { return resp.BySource[i].Calls > resp.BySource[j].Calls })
 
 	// 错误桶
 	for k, v := range errBuckets {
