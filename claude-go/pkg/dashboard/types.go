@@ -290,6 +290,10 @@ type InsightsResp struct {
 	GeneratedAt time.Time    `json:"generatedAt"`
 	Total       int          `json:"total"`
 	Insights    []InsightDTO `json:"insights"`
+	// LLM 相关 (仅在 ?llm=1 时填充)
+	LLMEnabled  bool   `json:"llmEnabled,omitempty"`
+	LLMSummary  string `json:"llmSummary,omitempty"`
+	LLMError    string `json:"llmError,omitempty"`
 }
 
 // ProjectDTO 多项目聚合列表中的一项。

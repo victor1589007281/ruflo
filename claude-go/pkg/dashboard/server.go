@@ -98,6 +98,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/projects", s.handleProjects)
 	s.mux.HandleFunc("/api/stream/overview", s.handleStreamOverview)
 
+	// v1.1 扩展
+	s.mux.HandleFunc("/api/workflows", s.handleWorkflows)
+	s.mux.HandleFunc("/api/workflows/", s.handleWorkflow) // /api/workflows/:name
+	s.mux.HandleFunc("/api/search", s.handleSearch)
+	s.mux.HandleFunc("/api/logs/stream", s.handleLogsStream)
+	s.mux.HandleFunc("/api/logs/tail", s.handleLogsTail)
+	s.mux.HandleFunc("/api/hivemind", s.handleHiveMind)
+	s.mux.HandleFunc("/api/timeseries/", s.handleTimeSeries) // /api/timeseries/:module/:metric
+	s.mux.HandleFunc("/api/actions/", s.handleAction)        // /api/actions/{kind}/{target}
+	s.mux.HandleFunc("/api/dreaming/diagnosis", s.handleDreamingDiagnosis)
+
 	// 根路径和 SPA fallback
 	s.mux.HandleFunc("/", s.handleIndex)
 }
@@ -251,6 +262,15 @@ func (s *Server) handleInsights(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if r.URL.Query().Get("llm") == "1" {
+		resp.LLMEnabled = true
+		summary, err := buildLLMSummary(r.Context(), resp)
+		if err != nil {
+			resp.LLMError = err.Error()
+		} else {
+			resp.LLMSummary = summary
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

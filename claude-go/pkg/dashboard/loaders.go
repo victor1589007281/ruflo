@@ -337,16 +337,32 @@ func (p *Provider) ListTasks() ([]TaskDTO, error) {
 		}
 		return nil, err
 	}
-	// tasks.json 可能是数组或 { tasks: [...] } 结构
+	// tasks.json 可能是多种 shape, 为避免 500, 全部宽容解析, 无法解析则视为空。
 	var arr []rawTask
 	if err := json.Unmarshal(data, &arr); err != nil {
+		// 1) { tasks: [...] }
 		var wrap struct {
 			Tasks []rawTask `json:"tasks"`
+			Items []rawTask `json:"items"`
 		}
-		if err2 := json.Unmarshal(data, &wrap); err2 != nil {
-			return nil, err
+		if err2 := json.Unmarshal(data, &wrap); err2 == nil {
+			if len(wrap.Tasks) > 0 {
+				arr = wrap.Tasks
+			} else if len(wrap.Items) > 0 {
+				arr = wrap.Items
+			}
+		} else {
+			// 2) { "id1": { ... }, "id2": { ... } } (map-shape)
+			var m map[string]rawTask
+			if err3 := json.Unmarshal(data, &m); err3 == nil {
+				for id, t := range m {
+					if t.ID == "" {
+						t.ID = id
+					}
+					arr = append(arr, t)
+				}
+			}
 		}
-		arr = wrap.Tasks
 	}
 	out := make([]TaskDTO, 0, len(arr))
 	for _, t := range arr {
