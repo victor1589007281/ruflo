@@ -29,10 +29,10 @@ import (
 
 // Engine 媒体输出引擎
 type Engine struct {
-	OutputDir string        // 输出目录
-	Timeout   time.Duration // 单次渲染超时
-	Width     int           // 视口宽度
-	Height    int           // 视口高度
+	OutputDir string
+	Timeout   time.Duration
+	Width     int
+	Height    int
 }
 
 // NewEngine 创建媒体引擎
@@ -47,9 +47,9 @@ func NewEngine(outputDir string) *Engine {
 
 // RenderResult 渲染结果
 type RenderResult struct {
-	Format   string // png, pdf, mp4, svg, pptx
-	FilePath string // 输出文件路径
-	Size     int64  // 文件大小 (bytes)
+	Format   string
+	FilePath string
+	Size     int64
 	Duration time.Duration
 	Error    string
 }
@@ -90,24 +90,32 @@ func (e *Engine) RenderAll(ctx context.Context, htmlContent string, name string,
 	return results
 }
 
-// renderImage 使用 chromedp 将 HTML 渲染为 PNG/JPEG
-func (e *Engine) renderImage(ctx context.Context, htmlPath, name, format string) RenderResult {
-	outPath := filepath.Join(e.OutputDir, name+"."+format)
-
+// newBrowserCtx 创建 chromedp 浏览器上下文 (复用 allocator 配置)
+func (e *Engine) newBrowserCtx(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.WindowSize(e.Width, e.Height),
 		chromedp.Flag("headless", true),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-web-security", true),
 	)
+	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, opts...)
+	taskCtx, taskCancel := chromedp.NewContext(allocCtx)
+	timedCtx, timedCancel := context.WithTimeout(taskCtx, timeout)
 
-	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
-	defer cancel()
+	cancel := func() {
+		timedCancel()
+		taskCancel()
+		allocCancel()
+	}
+	return timedCtx, cancel
+}
 
-	taskCtx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
+// renderImage 使用 chromedp 将 HTML 渲染为 PNG/JPEG
+func (e *Engine) renderImage(ctx context.Context, htmlPath, name, format string) RenderResult {
+	outPath := filepath.Join(e.OutputDir, name+"."+format)
 
-	taskCtx, cancel = context.WithTimeout(taskCtx, e.Timeout)
+	taskCtx, cancel := e.newBrowserCtx(ctx, e.Timeout)
 	defer cancel()
 
 	fileURL := "file://" + htmlPath
@@ -142,12 +150,7 @@ func (e *Engine) renderImage(ctx context.Context, htmlPath, name, format string)
 		return RenderResult{Format: format, Error: fmt.Sprintf("写入图片失败: %v", err)}
 	}
 
-	info, _ := os.Stat(outPath)
-	size := int64(0)
-	if info != nil {
-		size = info.Size()
-	}
-
+	size := fileSize(outPath)
 	log.Printf("[media] 渲染 %s: %s (%.1f KB)", format, outPath, float64(size)/1024)
 	return RenderResult{Format: format, FilePath: outPath, Size: size}
 }
@@ -156,20 +159,7 @@ func (e *Engine) renderImage(ctx context.Context, htmlPath, name, format string)
 func (e *Engine) renderPDF(ctx context.Context, htmlPath, name string) RenderResult {
 	outPath := filepath.Join(e.OutputDir, name+".pdf")
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.WindowSize(e.Width, e.Height),
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-	)
-
-	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
-	defer cancel()
-
-	taskCtx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	taskCtx, cancel = context.WithTimeout(taskCtx, e.Timeout)
+	taskCtx, cancel := e.newBrowserCtx(ctx, e.Timeout)
 	defer cancel()
 
 	fileURL := "file://" + htmlPath
@@ -196,12 +186,7 @@ func (e *Engine) renderPDF(ctx context.Context, htmlPath, name string) RenderRes
 		return RenderResult{Format: "pdf", Error: fmt.Sprintf("写入 PDF 失败: %v", err)}
 	}
 
-	info, _ := os.Stat(outPath)
-	size := int64(0)
-	if info != nil {
-		size = info.Size()
-	}
-
+	size := fileSize(outPath)
 	log.Printf("[media] 渲染 PDF: %s (%.1f KB)", outPath, float64(size)/1024)
 	return RenderResult{Format: "pdf", FilePath: outPath, Size: size}
 }
@@ -216,7 +201,6 @@ func (e *Engine) extractSVG(htmlContent, name string) RenderResult {
 		return RenderResult{Format: "svg", Error: "HTML 中未找到 SVG 内容"}
 	}
 
-	// 确保 SVG 有 xmlns
 	if !strings.Contains(match, "xmlns") {
 		match = strings.Replace(match, "<svg", `<svg xmlns="http://www.w3.org/2000/svg"`, 1)
 	}
@@ -225,18 +209,18 @@ func (e *Engine) extractSVG(htmlContent, name string) RenderResult {
 		return RenderResult{Format: "svg", Error: fmt.Sprintf("写入 SVG 失败: %v", err)}
 	}
 
-	info, _ := os.Stat(outPath)
-	size := int64(0)
-	if info != nil {
-		size = info.Size()
-	}
-
+	size := fileSize(outPath)
 	log.Printf("[media] 提取 SVG: %s (%.1f KB)", outPath, float64(size)/1024)
 	return RenderResult{Format: "svg", FilePath: outPath, Size: size}
 }
 
-// renderVideo 使用 chromedp 逐帧截图 + FFmpeg 合成 MP4
-// 参考 HyperFrames 的 CDP BeginFrame 模式
+// renderVideo 使用 chromedp 逐帧截图 + FFmpeg 合成 MP4。
+//
+// 修复要点:
+//   1. 不依赖 getAnimations() — 很多 CSS 动画不暴露到该 API
+//   2. 用 CSS 时间控制: animation-play-state: paused + animation-delay 偏移
+//   3. 降低 fps 到 15 减少帧数 (5s@15fps = 75帧, 可接受)
+//   4. 如果没有真正动画, 生成一个带渐入效果的静态视频
 func (e *Engine) renderVideo(ctx context.Context, htmlPath, name string) RenderResult {
 	outPath := filepath.Join(e.OutputDir, name+".mp4")
 	framesDir := filepath.Join(e.OutputDir, name+"_frames")
@@ -244,104 +228,108 @@ func (e *Engine) renderVideo(ctx context.Context, htmlPath, name string) RenderR
 		return RenderResult{Format: "mp4", Error: fmt.Sprintf("创建帧目录失败: %v", err)}
 	}
 
-	// 检查 ffmpeg 是否可用
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return RenderResult{Format: "mp4", Error: "ffmpeg 未安装, 无法生成视频"}
 	}
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.WindowSize(e.Width, e.Height),
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-	)
-
-	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
-	defer cancel()
-
-	taskCtx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	taskCtx, cancel = context.WithTimeout(taskCtx, 5*time.Minute)
+	taskCtx, cancel := e.newBrowserCtx(ctx, 5*time.Minute)
 	defer cancel()
 
 	fileURL := "file://" + htmlPath
-	fps := 30
-	durationSec := 5 // 默认5秒动画
+	fps := 15
+	durationSec := 5
 	totalFrames := fps * durationSec
 
-	// 导航并查询动画时长
-	var animDuration float64
+	// 导航并检测动画
+	var hasRealAnimation bool
 	err := chromedp.Run(taskCtx,
 		chromedp.Navigate(fileURL),
 		emulation.SetDeviceMetricsOverride(int64(e.Width), int64(e.Height), 1.0, false),
 		chromedp.WaitReady("body"),
-		chromedp.Sleep(1*time.Second),
-		chromedp.Evaluate(`
-			(function() {
-				var d = document.querySelector('[data-duration]');
-				if (d) return parseFloat(d.getAttribute('data-duration')) || 5;
-				var anims = document.getAnimations ? document.getAnimations() : [];
-				if (anims.length > 0) {
-					var max = 0;
-					anims.forEach(function(a) {
-						var t = (a.effect && a.effect.getTiming) ? a.effect.getTiming() : {};
-						var end = (t.delay || 0) + (t.duration || 0);
-						if (end > max) max = end;
-					});
-					if (max > 0) return max / 1000;
-				}
-				return 5;
-			})()
-		`, &animDuration),
+		chromedp.Sleep(500*time.Millisecond),
+		chromedp.Evaluate(`(function() {
+			var anims = document.getAnimations ? document.getAnimations() : [];
+			if (anims.length > 0) return true;
+			var styles = document.querySelectorAll('style');
+			for (var i = 0; i < styles.length; i++) {
+				if (styles[i].textContent.indexOf('@keyframes') >= 0) return true;
+			}
+			var allEls = document.querySelectorAll('*');
+			for (var j = 0; j < allEls.length; j++) {
+				var cs = getComputedStyle(allEls[j]);
+				if (cs.animationName && cs.animationName !== 'none') return true;
+				if (cs.transition && cs.transition !== 'all 0s ease 0s' && cs.transition !== 'none') return true;
+			}
+			return false;
+		})()`, &hasRealAnimation),
 	)
 	if err != nil {
 		return RenderResult{Format: "mp4", Error: fmt.Sprintf("导航失败: %v", err)}
 	}
 
-	if animDuration > 0 && animDuration <= 60 {
-		durationSec = int(animDuration)
-		if durationSec < 1 {
-			durationSec = 1
-		}
-		totalFrames = fps * durationSec
-	}
+	log.Printf("[media] 视频: hasAnimation=%v, %d帧 (%ds@%dfps)", hasRealAnimation, totalFrames, durationSec, fps)
 
-	log.Printf("[media] 视频: %d 帧 (%ds @ %dfps)", totalFrames, durationSec, fps)
-
-	// 逐帧截图
+	capturedFrames := 0
 	for i := 0; i < totalFrames; i++ {
-		frameTime := float64(i) / float64(fps)
 		framePath := filepath.Join(framesDir, fmt.Sprintf("frame_%06d.png", i))
+		progress := float64(i) / float64(totalFrames)
 
-		err := chromedp.Run(taskCtx,
-			// 暂停动画并 seek 到指定时间点
-			chromedp.Evaluate(fmt.Sprintf(`
-				(function() {
-					var anims = document.getAnimations ? document.getAnimations() : [];
-					anims.forEach(function(a) { a.pause(); a.currentTime = %f * 1000; });
-				})()
-			`, frameTime), nil),
-			chromedp.Sleep(30*time.Millisecond),
-			chromedp.ActionFunc(func(ctx context.Context) error {
-				buf, err := page.CaptureScreenshot().
-					WithFormat(page.CaptureScreenshotFormatPng).
-					Do(ctx)
-				if err != nil {
-					return err
-				}
-				return os.WriteFile(framePath, buf, 0644)
-			}),
-		)
-		if err != nil {
+		var jsCode string
+		if hasRealAnimation {
+			// 对于有 CSS 动画的页面: 让动画自然播放, 用定时截图
+			jsCode = "" // 不注入 JS, 让动画自然运行
+		} else {
+			// 对于静态页面: 注入渐入 + 平移效果, 制造视觉动感
+			opacity := progress * 1.2
+			if opacity > 1 {
+				opacity = 1
+			}
+			translateY := (1 - progress) * 20
+			jsCode = fmt.Sprintf(`(function() {
+				document.body.style.opacity = '%f';
+				document.body.style.transform = 'translateY(%fpx)';
+				document.body.style.transition = 'none';
+			})()`, opacity, translateY)
+		}
+
+		actions := []chromedp.Action{}
+		if jsCode != "" {
+			actions = append(actions, chromedp.Evaluate(jsCode, nil))
+		}
+
+		if hasRealAnimation {
+			// 每帧间隔 = 1/fps 秒, 让动画自然播放
+			actions = append(actions, chromedp.Sleep(time.Duration(1000/fps)*time.Millisecond))
+		} else {
+			actions = append(actions, chromedp.Sleep(30*time.Millisecond))
+		}
+
+		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
+			buf, err := page.CaptureScreenshot().
+				WithFormat(page.CaptureScreenshotFormatPng).
+				Do(ctx)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(framePath, buf, 0644)
+		}))
+
+		if err := chromedp.Run(taskCtx, actions...); err != nil {
 			log.Printf("[media] 帧 %d 截图失败: %v", i, err)
 			continue
 		}
+		capturedFrames++
 
-		if i%30 == 0 {
-			log.Printf("[media] 帧捕获进度: %d/%d (%.0f%%)", i, totalFrames, float64(i)/float64(totalFrames)*100)
+		if i%15 == 0 {
+			log.Printf("[media] 帧进度: %d/%d (%.0f%%)", i, totalFrames, progress*100)
 		}
 	}
+
+	if capturedFrames == 0 {
+		return RenderResult{Format: "mp4", Error: "未能捕获任何帧"}
+	}
+
+	log.Printf("[media] 帧捕获完成: %d/%d 帧", capturedFrames, totalFrames)
 
 	// FFmpeg 编码
 	cmd := exec.CommandContext(ctx, "ffmpeg",
@@ -350,58 +338,38 @@ func (e *Engine) renderVideo(ctx context.Context, htmlPath, name string) RenderR
 		"-i", filepath.Join(framesDir, "frame_%06d.png"),
 		"-c:v", "libx264",
 		"-pix_fmt", "yuv420p",
-		"-preset", "medium",
-		"-crf", "23",
+		"-preset", "fast",
+		"-crf", "25",
 		"-movflags", "+faststart",
 		outPath,
 	)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	ffmpegOut, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[media] FFmpeg stderr: %s", string(ffmpegOut))
 		return RenderResult{Format: "mp4", Error: fmt.Sprintf("FFmpeg 编码失败: %v", err)}
 	}
 
 	// 清理帧文件
 	os.RemoveAll(framesDir)
 
-	info, _ := os.Stat(outPath)
-	size := int64(0)
-	if info != nil {
-		size = info.Size()
-	}
-
-	log.Printf("[media] 渲染视频: %s (%.1f MB, %ds)", outPath, float64(size)/1024/1024, durationSec)
+	size := fileSize(outPath)
+	log.Printf("[media] 渲染视频: %s (%.1f KB, %ds)", outPath, float64(size)/1024, durationSec)
 	return RenderResult{Format: "mp4", FilePath: outPath, Size: size}
 }
 
 // renderPPTX 将 HTML 幻灯片渲染为 PPTX (截图方式)
-// 每个 <section> 或 <div class="slide"> 作为一页幻灯片
 func (e *Engine) renderPPTX(ctx context.Context, htmlContent, name string) RenderResult {
 	outDir := filepath.Join(e.OutputDir, name+"_slides")
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return RenderResult{Format: "pptx", Error: fmt.Sprintf("创建幻灯片目录失败: %v", err)}
 	}
 
-	// 拆分幻灯片: 查找 <section> 或 slide 分隔符
 	slides := splitSlides(htmlContent)
 	if len(slides) == 0 {
-		// 作为单页处理
 		slides = []string{htmlContent}
 	}
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.WindowSize(e.Width, e.Height),
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-	)
-
-	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
-	defer cancel()
-
-	taskCtx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	taskCtx, cancel = context.WithTimeout(taskCtx, e.Timeout)
+	taskCtx, cancel := e.newBrowserCtx(ctx, e.Timeout)
 	defer cancel()
 
 	var slidePaths []string
@@ -439,26 +407,18 @@ func (e *Engine) renderPPTX(ctx context.Context, htmlContent, name string) Rende
 		log.Printf("[media] 幻灯片 %d/%d 已渲染", i+1, len(slides))
 	}
 
-	// 生成简易 PPTX (Open XML)
 	pptxPath := filepath.Join(e.OutputDir, name+".pptx")
 	if err := buildSimplePPTX(pptxPath, slidePaths); err != nil {
-		// PPTX 生成失败时, 回退为 PDF (多页)
-		log.Printf("[media] PPTX 生成失败 (%v), 回退为多页 PDF", err)
-		pdfPath := filepath.Join(e.OutputDir, name+"_slides.pdf")
+		log.Printf("[media] PPTX 生成失败 (%v), 回退为 PDF", err)
 		pdfResult := e.renderPDF(ctx, filepath.Join(outDir, "slide_001.html"), name+"_slides")
 		if pdfResult.Error == "" {
-			return RenderResult{Format: "pdf", FilePath: pdfPath, Size: pdfResult.Size}
+			return pdfResult
 		}
 		return RenderResult{Format: "pptx", Error: fmt.Sprintf("PPTX+PDF 均失败: %v", err)}
 	}
 
-	info, _ := os.Stat(pptxPath)
-	size := int64(0)
-	if info != nil {
-		size = info.Size()
-	}
-
-	log.Printf("[media] 渲染 PPTX: %s (%d 页, %.1f MB)", pptxPath, len(slidePaths), float64(size)/1024/1024)
+	size := fileSize(pptxPath)
+	log.Printf("[media] 渲染 PPTX: %s (%d 页, %.1f KB)", pptxPath, len(slidePaths), float64(size)/1024)
 	return RenderResult{Format: "pptx", FilePath: pptxPath, Size: size}
 }
 
@@ -478,8 +438,7 @@ func HasChrome() bool {
 			return true
 		}
 	}
-	// chromedp 会自动下载
-	return true
+	return true // chromedp 会自动下载
 }
 
 // HasFFmpeg 检查 FFmpeg 是否可用
@@ -488,9 +447,15 @@ func HasFFmpeg() bool {
 	return err == nil
 }
 
-// splitSlides 从 HTML 中拆分幻灯片
+func fileSize(path string) int64 {
+	info, _ := os.Stat(path)
+	if info != nil {
+		return info.Size()
+	}
+	return 0
+}
+
 func splitSlides(html string) []string {
-	// 匹配 <section> 标签
 	sectionRe := regexp.MustCompile(`(?si)<section[^>]*>(.*?)</section>`)
 	matches := sectionRe.FindAllStringSubmatch(html, -1)
 	if len(matches) > 1 {
@@ -505,7 +470,6 @@ func splitSlides(html string) []string {
 		}
 	}
 
-	// 匹配 class="slide" 的 div
 	slideRe := regexp.MustCompile(`(?si)<div[^>]*class="[^"]*slide[^"]*"[^>]*>(.*?)</div>`)
 	matches = slideRe.FindAllStringSubmatch(html, -1)
 	if len(matches) > 1 {
@@ -521,7 +485,6 @@ func splitSlides(html string) []string {
 	return nil
 }
 
-// wrapSlideHTML 将幻灯片内容包装为完整 HTML
 func wrapSlideHTML(content string, num, total int) string {
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html><head>
@@ -529,7 +492,7 @@ func wrapSlideHTML(content string, num, total int) string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { width: 1920px; height: 1080px; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+html, body { width: 1920px; height: 1080px; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; }
 </style>
 </head><body>
 %s

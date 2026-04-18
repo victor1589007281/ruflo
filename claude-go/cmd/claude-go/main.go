@@ -367,13 +367,16 @@ func runCmd() *cobra.Command {
 				siCfg.Notify = func(_, msg string) { fmt.Println(msg) }
 				siEngine := swarmintel.NewEngine(eng.APIClient, siCfg)
 
+				agentFactory := func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
+						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt}, nil
+					}
+				agentPool := agent.NewAgentPool(agentFactory, 8)
 				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
 					BaseDir: filepath.Join(cwd, ".claude-go", "teams"),
 					Cwd:     cwd,
-					Factory: func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
-						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt}, nil
-					},
-					Notify: func(_, msg string) { fmt.Println(msg) },
+					Factory: agentFactory,
+					Pool:    agentPool,
+					Notify:  func(_, msg string) { fmt.Println(msg) },
 					LLM:    eng.APIClient,
 					Roles:  agent.NewRoleRegistry(cwd),
 				})
