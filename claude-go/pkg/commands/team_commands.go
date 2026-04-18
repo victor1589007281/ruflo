@@ -31,7 +31,7 @@ func RegisterTeamCommands(r *Registry) {
 			case "create":
 				if len(parts) < 3 {
 					fmt.Println("用法: /team create <名称> <工作流>")
-					fmt.Println("工作流: development, research, debate, creative, finance, techblog, swarm")
+					fmt.Println("工作流: development, research, debate, creative, creative-v2, finance, trading-v2, techblog, swarm")
 					return nil
 				}
 				name, workflow := parts[1], parts[2]
@@ -118,7 +118,8 @@ func RegisterTeamCommands(r *Registry) {
 				fmt.Println("  development  — 研发团队 (architect → coder → tester → reviewer)")
 				fmt.Println("  research     — 研究团队 (researcher → analyst → writer)")
 				fmt.Println("  debate       — 辩论团队 (正方 → 反方 → 裁判)")
-				fmt.Println("  creative     — 创意团队 (designer → illustrator → reviewer)")
+				fmt.Println("  creative     — 创意团队 v1 (SVG/图片创作)")
+				fmt.Println("  creative-v2  — 创意团队 v2 (HTML网页→PNG/PDF/MP4/PPTX)")
 				fmt.Println("  finance      — 金融分析 v1 (analyst → strategist → advisor)")
 				fmt.Println("  trading-v2   — 金融交易 v2 (分析→Bull/Bear辩论→交易→风控辩论→PM裁决)")
 				fmt.Println("  techblog     — 技术博客 (researcher → writer → editor)")
@@ -146,7 +147,7 @@ func RegisterTeamCommands(r *Registry) {
 				fmt.Println("用法: /go <工作流> <目标>")
 				fmt.Println("示例: /go research 调研 kubernetes 最佳实践")
 				fmt.Println("      /go development 开发用户登录模块")
-				fmt.Println("      /go creative 设计一个着陆页")
+				fmt.Println("      /go creative-v2 做一个产品介绍网页, 导出PNG和PDF")
 				return nil
 			}
 			workflow := strings.ToLower(parts[0])

@@ -134,6 +134,8 @@ func GetWorkflow(name string) *WorkflowDef {
 		return techBlogWorkflow()
 	case "creative", "design", "visual":
 		return creativeWorkflow()
+	case "creative-v2", "creative2", "media", "html", "web":
+		return creativeV2Workflow()
 	case "predict", "prediction", "forecast":
 		return predictWorkflow()
 	default:
@@ -152,6 +154,7 @@ func ListWorkflows() []WorkflowDef {
 		*tradingV2Workflow(),
 		*techBlogWorkflow(),
 		*creativeWorkflow(),
+		*creativeV2Workflow(),
 		*predictWorkflow(),
 	}
 }
@@ -663,6 +666,8 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		return we.executeAdversarialDev(ctx, wf, objective, team)
 	case "trading_debate":
 		return we.executeTradingDebate(ctx, wf, objective, team)
+	case "creative_media":
+		return we.executeCreativeMedia(ctx, wf, objective, team)
 	default:
 		return we.executePipeline(ctx, wf, objective, team)
 	}

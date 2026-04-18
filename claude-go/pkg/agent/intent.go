@@ -97,7 +97,8 @@ var wfDetect = map[string][]string{
 	"finance":     {"股票", "股价", "盯盘", "交易", "买入", "卖出", "持仓", "行情", "大盘", "a股", "美股", "港股", "基金", "投资建议", "财报", "估值"},
 	"trading-v2":  {"深度分析股票", "交易决策", "bull bear", "多空辩论", "交易v2", "trading-v2", "对抗分析"},
 	"techblog":    {"写文章", "写博客", "公众号", "技术文章", "源码分析", "写作", "排版", "发文", "文章创作"},
-	"creative":    {"画图", "生图", "做图", "设计图", "海报", "logo", "封面", "插画", "视觉设计", "图片创作", "视频创作", "做视频", "生成视频", "帮我画", "创意设计", "视觉创作", "分镜", "动画", "宣传视频", "宣传图"},
+	"creative":    {"画图", "生图", "做图", "设计图", "海报", "logo", "封面", "插画", "视觉设计", "图片创作", "帮我画", "创意设计", "视觉创作", "分镜"},
+	"creative-v2": {"做网页", "html", "做ppt", "制作ppt", "幻灯片", "演示文稿", "做视频", "生成视频", "视频创作", "动画", "宣传视频", "网站", "落地页", "landing page", "网页设计", "前端", "导出pdf", "导出png", "导出mp4", "做个页面", "生成html"},
 }
 
 // CronIntent cron 定时任务意图。
@@ -370,7 +371,8 @@ const extractSysPrompt = `你是命令解析器。给定用户的中文消息，
 - finance: 简单股票分析/盯盘/快速投资评估
 - trading-v2: 深度交易决策/多空辩论/完整交易方案/需要Bull Bear对抗分析
 - techblog: 写技术文章/公众号文章/博客/源码分析文章
-- creative: 画图/做图/海报/Logo/封面/视频创作/视觉设计/动画`
+- creative: 画SVG/做图/海报/Logo/封面/SVG视觉设计
+- creative-v2: 做网页/HTML/做PPT/幻灯片/做视频/动画/网页设计/导出PDF/PNG/MP4`
 
 func (ir *IntentRecognizer) extractWithLLM(ctx context.Context, text string, intent *TeamIntent) {
 	resp, err := ir.llm.SimpleComplete(ctx, extractSysPrompt, text)

@@ -115,6 +115,8 @@ func (c *Coordinator) RunWithRecovery(
 		return executor.Execute(ctx, wf, objective, team)
 	case "trading_debate":
 		return executor.Execute(ctx, wf, objective, team)
+	case "creative_media":
+		return executor.Execute(ctx, wf, objective, team)
 	default:
 		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 	}
