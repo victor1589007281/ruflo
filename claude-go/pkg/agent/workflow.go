@@ -2662,26 +2662,44 @@ func MaterializeCode(cwd, output, lang string) []string {
 	ext := tc.FileExt
 
 	var written []string
+	seen := make(map[string]bool)
 
-	reBlock := regexp.MustCompile("(?s)```(?:go|cpp|c\\+\\+|rust|rs|python|py|h|hpp|toml|cmake|mod)(?::([^\\n]+))?\\n(.*?)```")
-	reFilePath := regexp.MustCompile(`(?m)^(?://|#|/\*)\s*(?:File|file|PATH|path):\s*(.+?)(?:\s*\*/)?$`)
+	reBlock := regexp.MustCompile("(?s)```(?:go|cpp|c\\+\\+|rust|rs|python|py|h|hpp|toml|cmake|mod|makefile|txt)(?::([^\\n]+))?\\n(.*?)```")
+	reFilePath := regexp.MustCompile(`(?m)^(?://|#|/\*)\s*(?:File|file|PATH|path|filename|Filename):\s*(.+?)(?:\s*\*/)?$`)
+	// L12: 额外模式 — markdown header 后紧跟代码块
+	reHeaderFile := regexp.MustCompile(`(?m)^#{2,4}\s+([^\n]+\.\w+)\s*$`)
 
 	for _, match := range reBlock.FindAllStringSubmatch(output, -1) {
 		block := match[2]
 		var filePath string
 
+		// 模式 1: ```lang:path/to/file
 		if match[1] != "" {
 			filePath = strings.TrimSpace(match[1])
-		} else {
+		}
+		// 模式 2: 代码块内 // File: path 或 # File: path
+		if filePath == "" {
 			if fpMatch := reFilePath.FindStringSubmatch(block); len(fpMatch) > 1 {
 				filePath = strings.TrimSpace(fpMatch[1])
+			}
+		}
+		// 模式 3: 代码块第一行就是文件路径 (e.g. "src/main.rs" 或 "include/kv.h")
+		if filePath == "" {
+			firstLine := strings.TrimSpace(strings.SplitN(block, "\n", 2)[0])
+			if strings.Contains(firstLine, "/") && strings.Contains(firstLine, ".") && len(firstLine) < 80 && !strings.Contains(firstLine, " ") {
+				filePath = firstLine
+				block = strings.SplitN(block, "\n", 2)[1]
 			}
 		}
 		if filePath == "" {
 			continue
 		}
+		filePath = strings.TrimSpace(strings.Trim(filePath, "`\"'"))
 
-		if !strings.Contains(filePath, ext) && ext != ".py" {
+		if !isRelevantFileExt(filePath, ext) {
+			continue
+		}
+		if seen[filePath] {
 			continue
 		}
 
@@ -2690,13 +2708,68 @@ func MaterializeCode(cwd, output, lang string) []string {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			continue
 		}
-		if err := os.WriteFile(full, []byte(block), 0o644); err != nil {
+		cleanBlock := reFilePath.ReplaceAllString(block, "")
+		if err := os.WriteFile(full, []byte(strings.TrimSpace(cleanBlock)+"\n"), 0o644); err != nil {
 			continue
 		}
 		written = append(written, filePath)
+		seen[filePath] = true
+	}
+
+	// 模式 4: markdown header "### path/to/file.ext" 后紧跟代码块
+	lines := strings.Split(output, "\n")
+	for i := 0; i < len(lines)-1; i++ {
+		hm := reHeaderFile.FindStringSubmatch(lines[i])
+		if hm == nil {
+			continue
+		}
+		candidate := strings.TrimSpace(hm[1])
+		if !isRelevantFileExt(candidate, ext) || seen[candidate] {
+			continue
+		}
+		for j := i + 1; j < len(lines); j++ {
+			trimmed := strings.TrimSpace(lines[j])
+			if trimmed == "" {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "```") {
+				blockStart := j + 1
+				for k := blockStart; k < len(lines); k++ {
+					if strings.HasPrefix(strings.TrimSpace(lines[k]), "```") {
+						block := strings.Join(lines[blockStart:k], "\n")
+						full := filepath.Join(cwd, candidate)
+						dir := filepath.Dir(full)
+						if err := os.MkdirAll(dir, 0o755); err == nil {
+							if err := os.WriteFile(full, []byte(strings.TrimSpace(block)+"\n"), 0o644); err == nil {
+								written = append(written, candidate)
+								seen[candidate] = true
+							}
+						}
+						break
+					}
+				}
+			}
+			break
+		}
 	}
 
 	return written
+}
+
+// isRelevantFileExt 检查文件路径是否包含当前语言或通用配置文件扩展名
+func isRelevantFileExt(filePath, langExt string) bool {
+	commonExts := []string{".toml", ".cmake", ".txt", ".md", ".json", ".yaml", ".yml", ".cfg", ".ini", ".mod"}
+	if strings.Contains(filePath, langExt) {
+		return true
+	}
+	for _, ce := range commonExts {
+		if strings.HasSuffix(filePath, ce) {
+			return true
+		}
+	}
+	lp := strings.ToLower(filePath)
+	return strings.HasSuffix(lp, ".h") || strings.HasSuffix(lp, ".hpp") ||
+		strings.HasSuffix(lp, ".c") || strings.HasSuffix(lp, ".cc")
 }
 
 // buildPrevResultsSummary 将 prevResults map 构建为 summary 字符串 (用于 E2E prompt)

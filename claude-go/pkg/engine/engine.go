@@ -52,6 +52,7 @@ const (
 //
 // 使用方式:
 //   engine := NewQueryEngine(config)
+//   engine.EnableFrontierOptimizations()  // 可选: 启用前沿模型优化组件
 //   resultCh := engine.SubmitMessage(ctx, userMessage)
 //   for msg := range resultCh { ... }
 type QueryEngine struct {
@@ -65,6 +66,18 @@ type QueryEngine struct {
 	PromptMgr    *prompt.Manager
 	MemoryStore  *memory.TieredStore   // 多层记忆存储 (可选, nil 则不启用)
 	SessionStore SessionStoreInterface // 会话持久化 (可选, nil 则不启用)
+
+	// ========== 前沿模型优化组件 (全部可选, nil 则走基线行为) ==========
+	// 设计依据: docs/query-engine-frontier-optimization.md
+	// 开关由 Config.Enable* 字段控制, 默认通过 EnableFrontierOptimizations() 统一启用。
+	Metrics       *EngineMetrics        // G10 共享指标
+	PromptCache   *PromptCacheBuilder   // G1 Prompt cache 构建
+	Budget        *TokenBudgetManager   // G2 Token 预算分级
+	LoopDet       *LoopDetector         // G3 工具循环检测
+	ErrClassifier *ErrorClassifier      // G4 错误族隔离 budget
+	JSONRepair    *JSONRepair           // G5 工具输入 JSON 修复
+	TrajStore     TrajectoryStore       // G6 轨迹记忆
+	StopDet       *StopSignalDetector   // G7 CaRT 停止信号
 
 	CumulativeUsage types.Usage // 本会话累积 token 消耗
 	ContextBudget   int         // 上下文窗口大小 (tokens, 默认 200000)
@@ -98,6 +111,29 @@ type Config struct {
 	// queryLoop 在构建 API 请求时过滤掉这些工具，防止 LLM 自主调用。
 	// 用途: 飞书 processAndReply 场景下禁止 LLM 自主创建/删除团队。
 	DisabledTools map[string]bool
+
+	// ==================== 前沿优化特性开关 (默认关闭) ====================
+	// 详细方案见 docs/query-engine-frontier-optimization.md。
+	// 推荐通过 QueryEngine.EnableFrontierOptimizations() 统一启用 P0/P1 组件。
+
+	// EnableMetrics 启用引擎级指标采集 (G10, 低开销)。
+	EnableMetrics bool
+	// EnablePromptCache 启用 prompt 稳定前缀布局与 cache 命中追踪 (G1)。
+	EnablePromptCache bool
+	// EnableBudget 启用 Token 预算分级降级 (G2)。
+	// 到 Red/Critical 会对旧 tool_result 做摘要压缩, 可能影响老消息可回溯性。
+	EnableBudget bool
+	// EnableLoopDetector 启用工具循环检测 (G3)。
+	EnableLoopDetector bool
+	// EnableErrorClassifier 启用错误族隔离 budget (G4)。
+	// 启用后替代原 consecutiveErrors 计数, 各族独立预算。
+	EnableErrorClassifier bool
+	// EnableJSONRepair 启用工具输入 JSON fallback 修复 (G5)。
+	EnableJSONRepair bool
+	// EnableTrajectory 启用轨迹记忆 (G6)。需要配套 MemoryStore。
+	EnableTrajectory bool
+	// EnableStopSignal 启用 CaRT 停止信号检测 (G7, 实验性, 默认关闭)。
+	EnableStopSignal bool
 }
 
 // NewQueryEngine 创建查询引擎
@@ -113,7 +149,7 @@ func NewQueryEngine(
 	if cfg.MaxTokens == 0 {
 		cfg.MaxTokens = 16384
 	}
-	return &QueryEngine{
+	e := &QueryEngine{
 		Config:        cfg,
 		APIClient:     apiClient,
 		Tools:         tools,
@@ -123,6 +159,74 @@ func NewQueryEngine(
 		PromptMgr:     promptMgr,
 		ContextBudget: 200000,
 	}
+	// 按 Config 开关懒加载对应组件。调用 EnableFrontierOptimizations() 可一次性启用 P0/P1。
+	e.applyFeatureFlags()
+	return e
+}
+
+// EnableFrontierOptimizations 一键启用推荐的 P0/P1 前沿优化组件。
+// 详细设计见 docs/query-engine-frontier-optimization.md。
+//
+// 启用清单:
+//   P0: Metrics, ErrorClassifier, JSONRepair, LoopDetector
+//   P1: PromptCache, Budget, Trajectory (若已配置 MemoryStore)
+//
+// StopSignal/HeavyMode 需单独设置 Config.EnableStopSignal=true。
+func (e *QueryEngine) EnableFrontierOptimizations() {
+	if e == nil || e.Config == nil {
+		return
+	}
+	e.Config.EnableMetrics = true
+	e.Config.EnableErrorClassifier = true
+	e.Config.EnableJSONRepair = true
+	e.Config.EnableLoopDetector = true
+	e.Config.EnablePromptCache = true
+	e.Config.EnableBudget = true
+	if e.MemoryStore != nil {
+		e.Config.EnableTrajectory = true
+	}
+	e.applyFeatureFlags()
+}
+
+// applyFeatureFlags 根据 Config.Enable* 懒初始化组件实例。
+// 幂等: 多次调用安全, 已存在的组件不会被替换。
+func (e *QueryEngine) applyFeatureFlags() {
+	if e == nil || e.Config == nil {
+		return
+	}
+	if e.Config.EnableMetrics && e.Metrics == nil {
+		e.Metrics = NewEngineMetrics()
+	}
+	if e.Config.EnablePromptCache && e.PromptCache == nil {
+		e.PromptCache = NewPromptCacheBuilder()
+	}
+	if e.Config.EnableBudget && e.Budget == nil {
+		e.Budget = NewTokenBudgetManager(e.ContextBudget)
+	}
+	if e.Config.EnableLoopDetector && e.LoopDet == nil {
+		e.LoopDet = NewLoopDetector()
+	}
+	if e.Config.EnableErrorClassifier && e.ErrClassifier == nil {
+		e.ErrClassifier = NewErrorClassifier()
+	}
+	if e.Config.EnableJSONRepair && e.JSONRepair == nil {
+		e.JSONRepair = NewJSONRepair()
+	}
+	if e.Config.EnableTrajectory && e.TrajStore == nil && e.MemoryStore != nil {
+		e.TrajStore = NewMemoryBackedTrajectoryStore(e.MemoryStore)
+	}
+	if e.Config.EnableStopSignal && e.StopDet == nil {
+		e.StopDet = NewStopSignalDetector()
+	}
+}
+
+// GetEngineMetrics 返回引擎指标快照 (供 dashboard/telemetry 采集)。
+// Metrics 未启用时返回空 map。
+func (e *QueryEngine) GetEngineMetrics() map[string]any {
+	if e == nil || e.Metrics == nil {
+		return map[string]any{}
+	}
+	return e.Metrics.Snapshot()
 }
 
 // ContextUsageInfo 返回上下文使用信息。
@@ -262,8 +366,18 @@ func (e *QueryEngine) SubmitStream(ctx context.Context, userContent string) <-ch
 func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message, streamCh chan<- types.StreamEvent) ([]types.Message, types.Terminal) {
 	turnCount := 0
 	currentModel := e.Config.Model
-	consecutiveErrors := 0 // 断路器: 连续错误计数
+	consecutiveErrors := 0 // 断路器: 连续错误计数 (ErrClassifier 启用后被绕过)
 	stopReason := ""       // 模型停止原因
+
+	// ==================== Trajectory 轨迹追踪状态 ====================
+	// 仅在 EnableTrajectory 时有效, 末尾统一写入 TrajStore。
+	turnStart := time.Now()
+	var turnUserIntent string
+	var turnToolSigs []ToolSig
+	var turnPlanMsgs []types.Message
+	if e.TrajStore != nil {
+		turnUserIntent = extractLatestUserIntent(messages)
+	}
 
 	for {
 		// ============================================================
@@ -271,7 +385,26 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 对应 TS: queryLoop 顶部 if (abortController.signal.aborted)
 		// ============================================================
 		if ctx.Err() != nil {
+			e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, stopReason, true, turnStart)
+			if e.Metrics != nil {
+				e.Metrics.TurnsAborted.Add(1)
+			}
 			return messages, types.Terminal{Reason: "aborted"}
+		}
+
+		// ============================================================
+		// Phase 0.5: Token Budget 分级降级 (G2)
+		// 对应 docs/query-engine-frontier-optimization.md §3.2
+		// Red/Critical 时对 3 轮前的 tool_result 做紧急摘要, 防止撞 PTL。
+		// ============================================================
+		if e.Budget != nil {
+			level := e.Budget.Level(messages)
+			if level >= BudgetRed {
+				messages = e.Budget.Degrade(messages, level)
+				if e.Metrics != nil {
+					e.Metrics.RecordBudgetDegrade(int(level))
+				}
+			}
 		}
 
 		// ============================================================
@@ -310,10 +443,12 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 
 		// ============================================================
 		// Phase 2: 组装系统提示词
+		// 集成 G1 PromptCache: 稳定前缀 + 动态后缀 分层, 追踪本地 cache 命中率。
 		// ============================================================
 		systemPrompt := e.PromptMgr.BuildEffectiveSystemPrompt(e.Tools)
 
 		// 仅在首轮注入相关记忆（避免多轮 tool_use 循环中反复注入膨胀上下文）
+		// 注入的记忆是 "动态内容", 但它每 turn 0 就固定, 所以 turn>0 时 prefix 是稳定的 — cache friendly。
 		if turnCount == 0 && e.MemoryStore != nil && e.MemoryStore.Count() > 0 && len(messages) > 0 {
 			lastUserText := ""
 			for i := len(messages) - 1; i >= 0; i-- {
@@ -339,6 +474,16 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 						systemPrompt[0] += "\n" + memPrompt
 					}
 				}
+			}
+		}
+
+		// G1 PromptCache: 本地记录稳定前缀是否未变, 近似后端 cache 命中率。
+		// 当前策略保守 — 不改变传递内容, 只做指标追踪; 后续 API 支持 cache_control 时再贴标。
+		if e.PromptCache != nil {
+			static, dynamic := SplitStaticDynamic(systemPrompt)
+			_, hit := e.PromptCache.Build(static, dynamic)
+			if e.Metrics != nil {
+				e.Metrics.RecordCache(hit)
 			}
 		}
 
@@ -460,6 +605,12 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// ============================================================
 		// 错误处理: PTL / fallback / 断路器
 		// 对应 TS: FallbackTriggeredError, PromptTooLongError 处理
+		//
+		// G4 ErrorClassifier 启用时:
+		//   - 按 HTTP 族分桶 budget (429/5xx/400/PTL 各有独立额度)
+		//   - PTL → reactive compact (保留现有分支)
+		//   - BadRequest/Auth → 立即终止, 不消耗其他族的预算
+		//   - RateLimit/Overload/Network → 按族 backoff
 		// ============================================================
 		if streamErr := <-errCh; streamErr != nil {
 			// PTL (Prompt Too Long) → 触发 reactive compact
@@ -469,11 +620,14 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				compacted, compactErr := e.Compactor.AutoCompact(ctx, messages, currentModel)
 				if compactErr == nil && compacted != nil {
 					messages = compacted
+					if e.Metrics != nil {
+						e.Metrics.RecordError(int(ErrFamilyPTL))
+					}
 					continue // 压缩后重试
 				}
 			}
 
-			// 尝试 fallback model
+			// 尝试 fallback model (保持原有行为, 不计入 budget)
 			if e.Config.FallbackModel != "" && currentModel != e.Config.FallbackModel {
 				currentModel = e.Config.FallbackModel
 				for _, block := range toolUseBlocks {
@@ -490,6 +644,62 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				continue
 			}
 
+			// ---- G4: ErrorClassifier 路径 (启用时替代原 consecutive 计数) ----
+			if e.ErrClassifier != nil {
+				family, abort, backoff, useCompact := e.ErrClassifier.Observe(streamErr)
+				if e.Metrics != nil {
+					e.Metrics.RecordError(int(family))
+				}
+				if abort {
+					errMsg := types.Message{
+						Type: types.MessageTypeAssistant,
+						UUID: generateUUID(),
+						Content: []types.ContentBlock{{
+							Type: types.ContentBlockText,
+							Text: fmt.Sprintf("%s 族 API 错误预算耗尽: %v", family, streamErr),
+						}},
+						IsApiErrorMessage: true,
+						CreatedAt:         time.Now(),
+					}
+					ch <- errMsg
+					if streamCh != nil {
+						streamCh <- types.StreamEvent{Kind: types.StreamEventError, Error: streamErr}
+					}
+					if e.Metrics != nil {
+						e.Metrics.TurnsError.Add(1)
+					}
+					e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, "error", false, turnStart)
+					return messages, types.Terminal{Reason: "error_family_exhausted_" + family.String(), Error: streamErr}
+				}
+				// 非致命: 向用户 channel 推送一条 withheld error 消息
+				errMsg := types.Message{
+					Type: types.MessageTypeAssistant,
+					UUID: generateUUID(),
+					Content: []types.ContentBlock{{
+						Type: types.ContentBlockText,
+						Text: fmt.Sprintf("API %s (retry in %.1fs): %v", family, backoff.Seconds(), streamErr),
+					}},
+					IsApiErrorMessage: true,
+					CreatedAt:         time.Now(),
+				}
+				ch <- errMsg
+				// 超时/PTL 类建议做一次 reactive compact 以减小 prompt
+				if useCompact && e.Compactor != nil {
+					if compacted, cerr := e.Compactor.AutoCompact(ctx, messages, currentModel); cerr == nil && compacted != nil {
+						messages = compacted
+					}
+				}
+				if backoff > 0 {
+					select {
+					case <-time.After(backoff):
+					case <-ctx.Done():
+						return messages, types.Terminal{Reason: "aborted"}
+					}
+				}
+				continue
+			}
+
+			// ---- 原始路径 (ErrorClassifier 未启用) ----
 			consecutiveErrors++
 			if consecutiveErrors >= maxConsecutiveErrors {
 				errMsg := types.Message{
@@ -535,6 +745,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 
 		// 成功收到响应, 重置断路器
 		consecutiveErrors = 0
+		if e.ErrClassifier != nil {
+			e.ErrClassifier.ResetAll()
+		}
 
 		// 检查 context 是否被取消
 		if ctx.Err() != nil {
@@ -553,6 +766,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				StopReason: stopReason,
 				Usage:      usage,
 				CreatedAt:  time.Now(),
+			}
+			// Trajectory: 首条 assistant 消息的文字/thinking 用于提取 plan
+			if e.TrajStore != nil && len(turnPlanMsgs) == 0 {
+				turnPlanMsgs = append(turnPlanMsgs, assistantMsg)
 			}
 			ch <- assistantMsg
 			if streamCh != nil {
@@ -616,12 +833,72 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					continue
 				}
 			}
+			// 完成出口: 记录 trajectory + metrics
+			if e.Metrics != nil {
+				e.Metrics.TurnsTotal.Add(1)
+				e.Metrics.TurnsSuccess.Add(1)
+				e.Metrics.RecordTurnLatency(time.Since(turnStart))
+			}
+			e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, stopReason, false, turnStart)
 			return messages, types.Terminal{Reason: "completed"}
 		}
 
 		// ============================================================
 		// Phase 5b: 有 tool_use → 执行工具
 		// ============================================================
+
+		// G5 JSONRepair: 对 tool_use.Input 做 fallback 修复, 降低因流式截断导致的工具失败率。
+		if e.JSONRepair != nil {
+			for i, blk := range toolUseBlocks {
+				repaired, res := e.JSONRepair.Try([]byte(blk.Input))
+				if res.OK && res.Changed {
+					toolUseBlocks[i].Input = repaired
+					if e.Metrics != nil {
+						e.Metrics.JSONRepairsApplied.Add(1)
+					}
+				} else if !res.OK {
+					if e.Metrics != nil {
+						e.Metrics.JSONRepairsFailed.Add(1)
+					}
+				}
+			}
+		}
+
+		// G3 LoopDetector: 检测同工具同参数的死循环, 命中时注入反向提示替代实际执行。
+		if e.LoopDet != nil {
+			var suppressed []types.ContentBlock
+			var looped bool
+			for _, blk := range toolUseBlocks {
+				if isLooped, suggestion := e.LoopDet.Observe(blk.Name, []byte(blk.Input)); isLooped {
+					looped = true
+					// 注入一个 tool_result 错误, 让模型看到系统反馈
+					noteMsg := types.Message{
+						Type: types.MessageTypeUser,
+						UUID: generateUUID(),
+						Content: []types.ContentBlock{{
+							Type:      types.ContentBlockToolResult,
+							ToolUseID: blk.ID,
+							Content:   suggestion,
+							IsError:   true,
+						}},
+						CreatedAt: time.Now(),
+					}
+					ch <- noteMsg
+					messages = append(messages, noteMsg)
+					if e.Metrics != nil {
+						e.Metrics.ToolLoopsDetected.Add(1)
+						e.Metrics.ToolLoopsSuppressed.Add(1)
+					}
+				} else {
+					suppressed = append(suppressed, blk)
+				}
+			}
+			toolUseBlocks = suppressed
+			if looped && len(toolUseBlocks) == 0 {
+				// 全部被循环检测拦下 — 回到循环让模型重新回复
+				continue
+			}
+		}
 
 		// 拦截被禁用的工具调用 — 将其替换为错误结果，不实际执行
 		if len(e.Config.DisabledTools) > 0 {
@@ -655,6 +932,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// maxTurns 检查 (在 tool 执行后检查, 对应 TS)
 		turnCount++
 		if e.Config.MaxTurns > 0 && turnCount > e.Config.MaxTurns {
+			if e.Metrics != nil {
+				e.Metrics.TurnsTotal.Add(1)
+				e.Metrics.TurnsAborted.Add(1)
+			}
+			e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, "max_turns", false, turnStart)
 			return messages, types.Terminal{Reason: "max_turns"}
 		}
 
@@ -674,7 +956,67 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			GlobalPerm:       e.PermChecker,
 		}
 
+		toolExecStart := time.Now()
 		toolResults := tool.RunTools(ctx, toolUseBlocks, e.Tools, tctx, e.HookRunner)
+		toolExecLatency := time.Since(toolExecStart)
+
+		// 用于 G6 Trajectory: 记录本批工具签名
+		if e.TrajStore != nil {
+			for i, blk := range toolUseBlocks {
+				ok := true
+				if i < len(toolResults) {
+					for _, cb := range toolResults[i].Content {
+						if cb.Type == types.ContentBlockToolResult && cb.IsError {
+							ok = false
+							break
+						}
+					}
+				}
+				turnToolSigs = append(turnToolSigs, ToolSig{
+					Name:      blk.Name,
+					InputHash: normalizeHash([]byte(blk.Input)),
+					OK:        ok,
+					LatencyMs: toolExecLatency.Milliseconds() / int64(maxInt(len(toolUseBlocks), 1)),
+					At:        toolExecStart,
+				})
+			}
+		}
+
+		// G7 StopSignalDetector: 观察 tool 结果, 必要时注入 soft stop hint (作为 assistant meta 消息)。
+		if e.StopDet != nil {
+			for i, blk := range toolUseBlocks {
+				var resultSummary string
+				if i < len(toolResults) {
+					for _, cb := range toolResults[i].Content {
+						if cb.Type == types.ContentBlockToolResult {
+							resultSummary = cb.Content
+							break
+						}
+					}
+				}
+				if suggest, reason := e.StopDet.Observe(blk.Name, string(blk.Input), resultSummary); suggest {
+					hintMsg := types.Message{
+						Type: types.MessageTypeUser,
+						UUID: generateUUID(),
+						Content: []types.ContentBlock{{
+							Type: types.ContentBlockText,
+							Text: BuildHintMessage(reason),
+						}},
+						IsMeta:    true,
+						CreatedAt: time.Now(),
+					}
+					messages = append(messages, hintMsg)
+					if e.Metrics != nil {
+						e.Metrics.StopSuggestionsEmitted.Add(1)
+					}
+					break // 一轮至多注入一次, 避免膨胀
+				}
+			}
+		}
+
+		if e.Metrics != nil {
+			e.Metrics.ToolCallsTotal.Add(int64(len(toolUseBlocks)))
+		}
 
 		for _, result := range toolResults {
 			ch <- result
@@ -695,6 +1037,63 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 		}
 	}
+}
+
+// recordTrajectoryIfNeeded 在 turn 结束或被中止时写入一次轨迹。
+// 调用约定: 每条 return 路径上都应调用一次 (成功 return 在 Phase 5a 已在 stop hooks 分支处理)。
+// 为避免过多出口改动, 这里做幂等保护: TrajStore 为 nil 时直接返回。
+func (e *QueryEngine) recordTrajectoryIfNeeded(intent string, planMsgs []types.Message, tools []ToolSig, stopReason string, aborted bool, start time.Time) {
+	if e == nil || e.TrajStore == nil {
+		return
+	}
+	verdict := InferVerdict(stopReason, tools, aborted)
+	sess := ""
+	if e.SessionStore != nil {
+		sess = e.SessionStore.SessionID()
+	}
+	plan := ExtractPlan(planMsgs)
+	t := &Trajectory{
+		TurnID:     generateUUID(),
+		SessionID:  sess,
+		UserIntent: intent,
+		Plan:       plan,
+		ToolCalls:  tools,
+		StopReason: stopReason,
+		Verdict:    verdict,
+		At:         time.Now(),
+		LatencyMs:  time.Since(start).Milliseconds(),
+	}
+	e.TrajStore.Append(t)
+	if e.Metrics != nil {
+		switch verdict {
+		case VerdictSuccess:
+			e.Metrics.TrajSuccessRecorded.Add(1)
+		case VerdictFail:
+			e.Metrics.TrajFailRecorded.Add(1)
+		}
+	}
+}
+
+// extractLatestUserIntent 从消息尾部反向找到最近的用户自然语言意图。
+func extractLatestUserIntent(messages []types.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Type != types.MessageTypeUser {
+			continue
+		}
+		for _, b := range messages[i].Content {
+			if b.Type == types.ContentBlockText && b.Text != "" {
+				return truncateStr(b.Text, 400)
+			}
+		}
+	}
+	return ""
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // messagesToAPI 将内部 Message 格式转换为 API 格式。

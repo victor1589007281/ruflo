@@ -117,6 +117,23 @@ Reviewer 给出的反馈在多轮后引导 coder 偏离原始好方案:
 - `total = C*0.3 + Co*0.25 + S*0.2 + Q*0.25`
 - `total ≥ 6.0` 即达标 (允许个别维度5分但总体合格)
 
+### 2.6 L12: 增强文件物化引擎 (解决代码不落盘)
+
+**问题**: C++ 团队 18 个任务只物化了 1 个文件, Rust 团队 0 个文件。代码全在 REPORT.md 里。
+
+**根因**: `MaterializeCode` 只匹配严格格式 `` ```lang // File: path/to/file.ext ```, 但 LLM 实际输出多种格式:
+- `` ```cpp\npath/to/file.cpp ``
+- `` ### file.cpp\n```cpp ``
+- 纯文本 `// filename: xxx.cpp` + 代码
+- 嵌在 markdown 段落中的代码块
+
+**改进**: 增加多模式文件名提取:
+1. `// File: path` 或 `// filename: path` (当前)
+2. `` ```lang:path `` (新增)
+3. `` ```lang\n// path/to/file.ext `` (新增)
+4. markdown header `### path/to/file.ext` 后紧跟代码块 (新增)
+5. Coder prompt 中强制要求使用统一标记格式
+
 ## 3. 实施计划
 
 | 优先级 | 改动 | 文件 | 影响 |
