@@ -34,19 +34,26 @@ type EvalScore struct {
 
 const hardPassMinScore = 6.0
 
-// MeetsHardPassThreshold 若各维度均不低于 6/10 且 Pass 为真，则认为通过硬门槛。
-// DesignAlignment > 0 时也纳入硬门槛 (方案对齐度不达标 = 不通过)
+// WeightedScore 返回加权总分: C*0.30 + Co*0.25 + S*0.20 + Q*0.25
+// 参考 DeepSeek V4 multi-dimension weighted evaluation
+func (e EvalScore) WeightedScore() float64 {
+	return e.Correctness*0.30 + e.Completeness*0.25 + e.Security*0.20 + e.CodeQuality*0.25
+}
+
+// MeetsHardPassThreshold 加权总分 ≥ 6.0 且无单项灾难性低分(<4) 且 Pass=true。
+// 相比旧版(ALL ≥ 6)更宽容: 允许个别维度 5 分但总体合格。
+// 参考 GPT 5.6 Codex "practical pass" — 工业级代码不需要完美, 需要可用。
 func (e EvalScore) MeetsHardPassThreshold() bool {
 	if !e.Pass {
 		return false
 	}
-	if e.DesignAlignment > 0 && e.DesignAlignment < hardPassMinScore {
+	if e.DesignAlignment > 0 && e.DesignAlignment < 4 {
 		return false
 	}
-	return e.Correctness >= hardPassMinScore &&
-		e.Completeness >= hardPassMinScore &&
-		e.Security >= hardPassMinScore &&
-		e.CodeQuality >= hardPassMinScore
+	if e.Correctness < 4 || e.Completeness < 4 || e.Security < 4 || e.CodeQuality < 4 {
+		return false
+	}
+	return e.WeightedScore() >= hardPassMinScore
 }
 
 // AvgScore 返回所有非零维度的平均分 (用于自适应终止判断)
@@ -278,8 +285,15 @@ func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) Termin
 	at.ScoreHistory = append(at.ScoreHistory, avg)
 	n := len(at.ScoreHistory)
 
-	// 1. 通过硬门槛
+	// 1. 通过硬门槛 (加权总分 ≥ 6.0)
 	if score.MeetsHardPassThreshold() {
+		return TerminationDecision{ShouldStop: true, Reason: "quality_pass", RoundsUsed: round, MaxRounds: at.MaxRounds}
+	}
+
+	// 1.5 L8 智能早期终止: R1 "可接受质量" 直接通过
+	// 参考 Kimi 2.6 "fast-pass" — 加权分 ≥ 6.5 且无灾难性低分时不浪费后续轮次
+	if round == 1 && score.WeightedScore() >= 6.5 &&
+		score.Correctness >= 5 && score.Completeness >= 5 && score.Security >= 5 && score.CodeQuality >= 5 {
 		return TerminationDecision{ShouldStop: true, Reason: "quality_pass", RoundsUsed: round, MaxRounds: at.MaxRounds}
 	}
 
@@ -298,7 +312,8 @@ func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) Termin
 		return d
 	}
 
-	// 4. 宽容退化检测: 分数下降幅度 > DegradeThreshold 才计为退化
+	// 4. L8 增强退化检测: 连续 2 轮退化直接终止 (不再等 3 轮)
+	// 参考 arXiv:2601.00828 准确-纠正悖论: 越改越差时应尽早停止
 	if n >= 2 {
 		drop := at.ScoreHistory[n-2] - at.ScoreHistory[n-1]
 		if drop > at.DegradeThreshold {
@@ -307,7 +322,7 @@ func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) Termin
 			at.DegradeCount = 0
 		}
 	}
-	if at.DegradeCount >= 3 {
+	if at.DegradeCount >= 2 {
 		d := TerminationDecision{ShouldStop: true, Reason: "degradation", RoundsUsed: round, MaxRounds: at.MaxRounds}
 		if at.BestOutput != "" && at.BestRound != round {
 			d.BestOutput = at.BestOutput

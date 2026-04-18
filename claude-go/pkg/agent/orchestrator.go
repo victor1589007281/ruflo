@@ -736,14 +736,15 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		prompt := o.buildTaskPrompt(node, objective)
 		if round > 1 && lastFeedback != "" {
 			memorySection := FormatMemoryChain(iterMemory)
-			// L5 上下文压缩: 动态截断, 随轮次减少 (防止 token 溢出)
 			maxCtx := 12000
 			if round == 3 {
 				maxCtx = 6000
 			} else if round >= 4 {
 				maxCtx = 3000
 			}
-			prompt = fmt.Sprintf("%s\n\n%s\n### ⚠️ 第 %d 轮修复 (reviewer 反馈, 必须全部修复):\n%s\n\n### 上轮产出 (增量修改, 不要从零重写):\n%s",
+			// L7: 差分修复 prompt — 明确要求只修改被指出的问题, 不动其余代码
+			prompt = fmt.Sprintf("%s\n\n%s\n### ⚠️ 第 %d 轮差分修复 (仅修改被指出的问题, 保留其余代码不变):\n"+
+				"**规则**: 1) 只修改 reviewer 指出的 MUST-FIX 函数 2) 其余代码原封不动输出 3) 不要重构未提及的模块\n\n%s\n\n### 上轮产出 (基线代码, 仅在标记处修改):\n%s",
 				prompt, memorySection, round, truncateResult(lastFeedback, 2000), truncateResult(lastOutput, maxCtx))
 		}
 
@@ -841,9 +842,12 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		o.runMicroTest(ctx, node)
 		bottlenecks := ClassifyBottlenecks(node.TestResult)
 		if len(bottlenecks) > 0 {
-			// 追踪重复瓶颈: 同类型连续出现 → 注入到 feedback 中
 			for _, bn := range bottlenecks {
 				bnKey := bn.Type
+				// L9: 编译已通过时覆盖"编译"类瓶颈 (消除 micro-test LLM 误判)
+				if bnKey == "compilation" && buildPassed {
+					continue
+				}
 				prevCount := bottleneckCounts[bnKey]
 				bottleneckCounts[bnKey] = prevCount + 1
 				if bottleneckCounts[bnKey] >= 2 {
@@ -924,10 +928,33 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			break
 		}
 
-		// 汇总 reviewer feedback + tester feedback 给下一轮 coder
+		// L10: Reviewer MUST-FIX 上限递减 (减少反馈漂移)
+		// R2: max 3 issues, R3: max 2, R4+: max 1
+		maxIssues := 5
+		switch {
+		case round >= 4:
+			maxIssues = 1
+		case round == 3:
+			maxIssues = 2
+		case round == 2:
+			maxIssues = 3
+		}
+		feedbackText := score.Feedback
+		if feedbackText != "" {
+			issues := ExtractKeyIssues(feedbackText)
+			if len(issues) > maxIssues {
+				issues = issues[:maxIssues]
+				feedbackText = fmt.Sprintf("⚠️ 仅列出最关键的 %d 个问题 (聚焦修复, 勿过度重构):\n", maxIssues)
+				for _, iss := range issues {
+					feedbackText += "- " + iss + "\n"
+				}
+			}
+		}
+
+		// L7: R1 保底+差分修复 — feedback 强调"增量修改, 保留已有好的部分"
 		var parts []string
-		if score.Feedback != "" {
-			parts = append(parts, "### Reviewer 审查 (EvalScore):\n"+score.Feedback)
+		if feedbackText != "" {
+			parts = append(parts, "### Reviewer 审查 (EvalScore):\n"+feedbackText)
 		}
 		if !node.TestPassed && node.TestResult != "" {
 			parts = append(parts, "### Tester Micro-Test:\n"+node.TestResult)
