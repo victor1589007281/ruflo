@@ -390,7 +390,18 @@ func runCmd() *cobra.Command {
 					}
 				agentPool := agent.NewAgentPool(agentFactory, 8)
 
-				taskStore := builtin.NewTaskStore(filepath.Join(cwd, ".claude-go", "tasks.json"))
+				// 任务持久化路径与 feishu bot / dashboard 对齐: <state>/tasks/tasks.json
+				// (通过 basedir.Layout 标准化, 避免多处写入多个不同位置)
+				tasksStateDir := basedir.ResolveDefault("", cwd)
+				tasksLayout, _ := basedir.NewLayout(tasksStateDir)
+				if tasksLayout != nil {
+					_ = os.MkdirAll(tasksLayout.Tasks, 0o755)
+				}
+				tasksFilePath := filepath.Join(tasksStateDir, "tasks", "tasks.json")
+				if tasksLayout != nil {
+					tasksFilePath = tasksLayout.TasksFilePath()
+				}
+				taskStore := builtin.NewTaskStore(tasksFilePath)
 				dagAdapter := agent.NewTaskStoreDAGAdapter(taskStore, func() []agent.DAGTaskSummary {
 					raw := taskStore.ReadyTasks()
 					out := make([]agent.DAGTaskSummary, len(raw))

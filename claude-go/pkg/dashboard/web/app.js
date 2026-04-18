@@ -134,9 +134,10 @@
     { path: /^\/?$/,              render: renderOverview,      title: '系统概览',      poll: 10000 },
     { path: /^\/teams\/?$/,       render: renderTeams,         title: '团队运行',      poll: 5000 },
     { path: /^\/teams\/(.+)$/,    render: renderTeamDetail,    title: '团队详情',      poll: 3000 },
-    { path: /^\/metrics\/?$/,     render: renderMetrics,       title: '观测指标',      poll: 0 },
+    { path: /^\/metrics\/?$/,     render: renderMetrics,       title: '观测指标 (含指标中心)', poll: 0 },
     { path: /^\/metrics\/(.+)$/,  render: renderMetricsDetail, title: '指标详情',      poll: 0 },
-    { path: /^\/catalog\/?$/,     render: renderMetricsCatalog,title: '指标中心 (中英双语)',poll: 0 },
+    // 兼容旧链接: /catalog 已合并进 /metrics
+    { path: /^\/catalog\/?$/,     render: () => { location.hash = '#/metrics'; }, title: '指标中心 (已合并)', poll: 0 },
     { path: /^\/cron\/?$/,        render: renderCron,          title: 'Cron 任务',     poll: 30000 },
     { path: /^\/dreaming\/?$/,    render: renderDreaming,      title: 'Dreaming 机制', poll: 30000 },
     { path: /^\/evolution\/?$/,   render: renderEvolution,     title: 'Evolution 机制',poll: 30000 },
@@ -680,60 +681,185 @@
   async function runTeamDiagnose(name) {
     const slot = document.getElementById('team-diag-slot');
     if (!slot) return;
+    await runAsyncDiagnosis({
+      slot,
+      kind: 'team',
+      target: name,
+      title: '✦ 团队 LLM 诊断',
+      description: '分析运行过程 / 输出质量 / 运行状态, 提出优化建议 (可能耗时 30~90s)',
+    });
+  }
+
+  // runAsyncDiagnosis: 通用异步诊断执行器。
+  //   kind: team / dreaming / evolution
+  //   target: team name (kind=team 时必填)
+  //   渲染阶段: pending -> running(loading bar) -> done(markdown) / failed(error card)
+  // 轮询策略: 指数退避, 2s -> 3s -> 5s -> 8s, 最多 180s
+  async function runAsyncDiagnosis({ slot, kind, target, title, description }) {
     slot.innerHTML = '';
-    slot.appendChild(h('div', { class: 'card mb-16' }, [
-      h('h3', {}, 'LLM 诊断中…'),
-      h('div', { class: 'muted' }, '调用共享 LLM 客户端, 分析团队运行过程 / 输出质量 / 与设计偏差…'),
-    ]));
+    const container = h('div', { class: 'card mb-16' });
+    const header = h('div', { class: 'toolbar-row' }, [
+      h('h3', { style: { margin: 0 } }, title),
+      h('span', { class: 'badge accent' }, kind),
+    ]);
+    const status = h('div', { class: 'muted', style: { margin: '8px 0' } }, description || '诊断中…');
+    const progress = h('div', {
+      style: { height: '4px', background: 'rgba(140,160,220,0.15)',
+               borderRadius: '2px', overflow: 'hidden', margin: '8px 0' } }, [
+      h('div', {
+        class: 'pulse-bar',
+        style: { height: '100%', width: '30%',
+                 background: 'linear-gradient(90deg, transparent, var(--accent, #8ab4f8), transparent)',
+                 animation: 'pulseX 1.4s linear infinite' } }),
+    ]);
+    const result = h('div');
+    container.appendChild(header);
+    container.appendChild(status);
+    container.appendChild(progress);
+    container.appendChild(result);
+    slot.appendChild(container);
+
+    // 创建作业
+    let jobID;
     try {
-      const resp = await api('/api/teams/' + encodeURIComponent(name) + '/diagnose', { method: 'POST' });
-      const card = h('div', { class: 'card mb-16' });
-      card.appendChild(h('div', { class: 'toolbar-row' }, [
-        h('h3', {}, '✦ 团队 LLM 诊断'),
-        h('div', {}, [
-          h('span', { class: 'badge accent' }, resp.model || resp.llmProfile?.model || 'llm'),
-          h('span', { class: 'badge' }, resp.llmProfile?.provider || ''),
-        ]),
-      ]));
-      if (resp.error) {
-        card.appendChild(h('div', { class: 'insight err' }, h('div', { class: 'insight-title' }, '诊断失败: ' + resp.error)));
-      }
-      if (resp.summary) {
-        const md = h('div', { class: 'md' });
-        md.innerHTML = renderMarkdown(resp.summary);
-        card.appendChild(md);
-      } else if (!resp.error) {
-        card.appendChild(h('div', { class: 'empty' }, '(无返回内容)'));
-      }
-      if (resp.prompt) {
-        const det = h('details', { style: { marginTop: '10px' } }, [
-          h('summary', { class: 'muted' }, '查看 LLM 输入 prompt'),
-          h('pre', { class: 'pre' }, resp.prompt),
-        ]);
-        card.appendChild(det);
-      }
-      slot.innerHTML = '';
-      slot.appendChild(card);
+      const body = { kind };
+      if (target) body.target = target;
+      const createResp = await api('/api/diag/jobs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      jobID = createResp.id;
+      status.textContent = `已创建作业 ${jobID} · 等待 LLM 返回…`;
     } catch (e) {
-      slot.innerHTML = '';
-      slot.appendChild(h('div', { class: 'card mb-16' }, [
-        h('h3', {}, '✦ 团队 LLM 诊断'),
-        h('div', { class: 'insight err' }, h('div', { class: 'insight-title' }, '调用失败: ' + e.message)),
-      ]));
+      progress.style.display = 'none';
+      status.innerHTML = '';
+      status.appendChild(h('div', { class: 'insight err' },
+        h('div', { class: 'insight-title' }, '创建诊断作业失败: ' + e.message)));
+      return;
     }
+
+    // 轮询: 指数退避
+    const waits = [2000, 2000, 3000, 3000, 5000, 5000, 8000, 8000, 10000, 10000, 15000, 15000];
+    const deadline = Date.now() + 180_000;
+    let idx = 0;
+    while (Date.now() < deadline) {
+      const w = waits[Math.min(idx, waits.length - 1)];
+      await new Promise(r => setTimeout(r, w));
+      idx++;
+      let job;
+      try {
+        job = await api('/api/diag/jobs/' + encodeURIComponent(jobID));
+      } catch (e) {
+        status.textContent = '轮询失败 (将重试): ' + e.message;
+        continue;
+      }
+      if (!job) continue;
+      if (job.status === 'running' || job.status === 'pending') {
+        const elapsed = Math.floor((Date.now() - new Date(job.createdAt).getTime()) / 1000);
+        status.textContent = `状态: ${job.status} · 已耗时 ${elapsed}s · 轮询周期 ${w/1000}s`;
+        continue;
+      }
+      // done / failed
+      progress.style.display = 'none';
+      if (job.status === 'failed') {
+        status.innerHTML = '';
+        status.appendChild(h('div', { class: 'insight err' },
+          h('div', { class: 'insight-title' }, '诊断失败: ' + (job.error || 'unknown'))));
+      } else {
+        const durSec = (job.durationMs || 0) / 1000;
+        status.innerHTML = '';
+        status.appendChild(h('div', { style: { display: 'flex', gap: '8px',
+                                                flexWrap: 'wrap', alignItems: 'center' } }, [
+          h('span', { class: 'badge ok' }, '✓ 完成'),
+          h('span', { class: 'badge' }, 'LLM: ' + ((job.llm && job.llm.model) || '—')),
+          h('span', { class: 'badge' }, 'provider: ' + ((job.llm && job.llm.provider) || '—')),
+          h('span', { class: 'muted small' }, '耗时 ' + durSec.toFixed(1) + 's'),
+        ]));
+        if (job.scope && job.scope.length) {
+          status.appendChild(h('div', { class: 'muted small', style: { marginTop: '4px' } },
+            '分析范围: ' + job.scope.join(' · ')));
+        }
+        const md = h('div', {
+          class: 'md',
+          style: { maxHeight: '60vh', overflow: 'auto', padding: '12px',
+                   background: 'rgba(255,255,255,0.02)', borderRadius: '8px',
+                   border: '1px solid rgba(140,160,220,0.15)', marginTop: '8px' },
+        });
+        md.innerHTML = renderMarkdown(job.summary || '(empty)');
+        result.innerHTML = '';
+        result.appendChild(md);
+      }
+      return;
+    }
+    progress.style.display = 'none';
+    status.innerHTML = '';
+    status.appendChild(h('div', { class: 'insight warn' },
+      h('div', { class: 'insight-title' }, '轮询超时 (180s), 作业可能仍在后台运行')));
   }
 
   async function renderTeamBlackboard(detail, panel) {
     panel.innerHTML = '';
     let bb = {};
     try { bb = await api('/api/teams/' + encodeURIComponent(detail.name) + '/blackboard'); } catch (_) {}
+
+    // 黑板的真实形态是 {map: {key: value}, version, ...}; 统一拉平成 (key, value) 列表。
+    // 兼容旧 shape: 直接 {key: value} map (由 provider 老版本返回)。
+    const rawMap = (bb && bb.map && typeof bb.map === 'object') ? bb.map : (bb || {});
+    const entries = Object.entries(rawMap).filter(([k]) => k !== 'version' && k !== 'updatedAt');
+    entries.sort((a, b) => a[0].localeCompare(b[0]));
+
+    const searchInp = h('input', { class: 'input', placeholder: '按 key / value 关键字过滤…',
+      style: { minWidth: '220px' } });
+    const listContainer = h('div', {
+      style: { maxHeight: '60vh', overflow: 'auto', padding: '8px',
+               background: 'rgba(255,255,255,0.02)', borderRadius: '8px',
+               border: '1px solid rgba(140,160,220,0.15)' },
+    });
+    const renderItems = () => {
+      listContainer.innerHTML = '';
+      const q = (searchInp.value || '').trim().toLowerCase();
+      const filtered = entries.filter(([k, v]) => {
+        if (!q) return true;
+        const vs = (typeof v === 'string' ? v : JSON.stringify(v)).toLowerCase();
+        return k.toLowerCase().includes(q) || vs.includes(q);
+      });
+      if (!filtered.length) {
+        listContainer.appendChild(h('div', { class: 'empty' },
+          entries.length === 0 ? '黑板为空' : '无匹配项'));
+        return;
+      }
+      for (const [k, v] of filtered) {
+        const valStr = (typeof v === 'string') ? v : JSON.stringify(v, null, 2);
+        const rawBytes = valStr.length;
+        const preview = valStr.length > 320 ? valStr.slice(0, 320) + '…' : valStr;
+        const row = h('div', { class: 'bb-row',
+          style: { padding: '10px 12px', borderBottom: '1px solid rgba(140,160,220,0.08)' } }, [
+          h('div', { style: { display: 'flex', justifyContent: 'space-between',
+                              alignItems: 'center', marginBottom: '4px' } }, [
+            h('strong', { style: { color: 'var(--accent, #8ab4f8)' } }, k),
+            h('span', { class: 'muted small' }, fmtKilo(rawBytes) + ' 字符'),
+          ]),
+          h('pre', { class: 'pre',
+            style: { margin: 0, whiteSpace: 'pre-wrap', fontSize: '12px', maxHeight: '200px', overflow: 'auto' } },
+            preview),
+        ]);
+        listContainer.appendChild(row);
+      }
+    };
+    searchInp.addEventListener('input', renderItems);
+
     const existing = h('div', { class: 'card mb-16' }, [
-      h('h3', {}, '当前黑板'),
-      (!bb || Object.keys(bb).length === 0)
-        ? h('div', { class: 'empty' }, '黑板为空')
-        : h('pre', { class: 'pre' }, JSON.stringify(bb, null, 2)),
+      h('div', { class: 'toolbar-row' }, [
+        h('h3', { style: { margin: 0 } }, '当前黑板'),
+        h('span', { class: 'muted small' }, `· ${entries.length} 条目`),
+        h('div', { style: { flex: 1 } }),
+        searchInp,
+      ]),
+      listContainer,
     ]);
     panel.appendChild(existing);
+    renderItems();
 
     // 写入表单
     const keyInp = h('input', { class: 'input', placeholder: 'Key (如 notes / budget / hint)', value: state.blackboardEdit.key });
@@ -809,7 +935,9 @@
     tbl.appendChild(tb);
     panel.appendChild(h('div', { class: 'card mb-16' }, [
       h('h3', {}, '检查点历史 (checkpoints.json)'),
-      tbl,
+      h('div', { style: { maxHeight: '60vh', overflow: 'auto',
+                         border: '1px solid rgba(140,160,220,0.15)',
+                         borderRadius: '8px' } }, tbl),
     ]));
   }
 
@@ -874,7 +1002,27 @@
       await renderTeamLogs(detail, panel);
     } else if (tab === 'report') {
       if (!detail.report) panel.appendChild(h('div', { class: 'empty' }, '没有 REPORT.md'));
-      else { const mdBox = h('div', { class: 'md' }); mdBox.innerHTML = renderMarkdown(detail.report); panel.appendChild(mdBox); }
+      else {
+        // 研发团队报告通常很长 (上千行); 加滚动条 + 顶部统计摘要。
+        const size = detail.report.length;
+        const lines = detail.report.split('\n').length;
+        panel.appendChild(h('div', { class: 'toolbar-row mb-12' }, [
+          h('strong', {}, 'REPORT.md'),
+          h('span', { class: 'muted small' }, `· ${lines} 行 / ${fmtKilo(size)} 字符`),
+          h('button', { class: 'btn ghost small', onClick: () => {
+            navigator.clipboard && navigator.clipboard.writeText(detail.report);
+            toast('已复制到剪贴板', 'ok');
+          }}, '📋 复制全文'),
+        ]));
+        const mdBox = h('div', {
+          class: 'md',
+          style: { maxHeight: '70vh', overflow: 'auto', padding: '16px',
+                   background: 'rgba(255,255,255,0.02)', borderRadius: '10px',
+                   border: '1px solid rgba(140,160,220,0.15)' }
+        });
+        mdBox.innerHTML = renderMarkdown(detail.report);
+        panel.appendChild(mdBox);
+      }
     } else if (tab === 'eval') {
       renderTeamEval(detail, panel);
     } else if (tab === 'metrics') {
@@ -900,6 +1048,16 @@
         attempts: s.attempts || 0,
         durationSec: s.durationSec,
         error: s.error,
+        // v1.5 rich fields
+        taskBrief: s.taskBrief || '',
+        assignedAgents: s.assignedAgents || [],
+        checkpointStatus: s.checkpointStatus || '',
+        checkpointSavedAt: s.checkpointSavedAt,
+        checkpointError: s.checkpointError || '',
+        adversaryRound: s.adversaryRound || 0,
+        adversaryScore: s.adversaryScore || 0,
+        adversaryPassed: s.adversaryPassed,
+        outputPreview: s.outputPreview || '',
       }));
       const meta = h('div', { class: 'muted', style: { marginBottom: '10px', fontSize: '12px' } }, [
         h('strong', {}, 'workflow: '), dag.workflow || detail.workflow || '—',
@@ -917,30 +1075,23 @@
         h('span', {}, [h('span', { class: 'dot pending' }), '待执行']),
       ]));
 
+      // 富信息卡片视图: 每个 stage 一个卡片, 清晰展示任务内容 / Agent / 检查点 / 对抗评分 / 错误
+      // 卡片网格布局, 响应式自适应, 适合研发团队 workflow 的多维度信息浏览。
       if (nodes.length) {
-        const tbl = h('table', { class: 'tbl' });
-        tbl.appendChild(h('thead', {}, h('tr', {}, [
-          h('th', {}, '阶段'), h('th', {}, '角色'), h('th', {}, '状态'),
-          h('th', {}, '尝试次数'), h('th', {}, '耗时'), h('th', {}, '依赖'), h('th', {}, '错误'),
-        ])));
-        const tb = h('tbody');
+        const cardsWrap = h('div', { class: 'dag-cards',
+          style: { display: 'grid', gap: '12px',
+                   gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' } });
         for (const n of nodes) {
-          tb.appendChild(h('tr', {}, [
-            h('td', {}, n.name),
-            h('td', {}, h('span', { class: 'badge' }, n.role || '—')),
-            h('td', {}, h('span', { class: 'badge ' + statusBadgeClass(n.status) }, n.status || '—')),
-            h('td', {}, String(n.attempts || 0)),
-            h('td', {}, n.durationSec ? fmtDurSec(n.durationSec) : '—'),
-            h('td', {}, (n.dependsOn || []).join(', ') || '—'),
-            h('td', { style: { maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis' } },
-              n.error ? h('span', { class: 'badge err', title: n.error }, (n.error || '').slice(0, 64)) : '—'),
-          ]));
+          cardsWrap.appendChild(renderDAGNodeCard(n));
         }
-        tbl.appendChild(tb);
         panel.appendChild(h('div', { class: 'card mb-16' }, [
-          h('h3', {}, '运行时明细 (来自 checkpoints.json + team.json)'),
-          tbl,
+          h('h3', {}, '📋 任务节点详情 (含任务 / Agent / 检查点 / 对抗 / 错误)'),
+          cardsWrap,
         ]));
+      }
+
+      if (dag.adversaryRounds && dag.adversaryRounds.length) {
+        panel.appendChild(renderDAGAdversaryRounds(dag.adversaryRounds));
       }
       return;
     }
@@ -967,6 +1118,129 @@
       status: stageStatus[s.name] || 'pending',
     }));
     panel.appendChild(renderDAGSVG(nodes, wf.description));
+  }
+
+  // renderDAGNodeCard: 富信息 DAG 节点卡片
+  //   - 顶部: 状态徽章 + 阶段名 + 角色
+  //   - 任务简述 (workflow 定义的 prompt 首行)
+  //   - Agents / 依赖 / 尝试次数 / 耗时
+  //   - 检查点: 状态 + 保存时间 + error
+  //   - 对抗: round + 分数 + 是否通过
+  //   - 可折叠的输出预览
+  function renderDAGNodeCard(n) {
+    const card = h('div', { class: 'dag-card',
+      style: { background: 'rgba(255,255,255,0.03)',
+               border: '1px solid rgba(140,160,220,0.15)',
+               borderRadius: '10px', padding: '12px', fontSize: '12px' } });
+
+    const header = h('div', { style: { display: 'flex', justifyContent: 'space-between',
+                                       alignItems: 'center', marginBottom: '8px' } }, [
+      h('strong', { style: { fontSize: '13px' } }, n.name),
+      h('span', { class: 'badge ' + statusBadgeClass(n.status) }, n.status || '—'),
+    ]);
+    card.appendChild(header);
+
+    if (n.role) {
+      card.appendChild(h('div', { class: 'muted small', style: { marginBottom: '4px' } },
+        '角色: ' + n.role + (n.parallel ? ' · 并行' : '')));
+    }
+    if (n.taskBrief) {
+      card.appendChild(h('div', { style: { margin: '6px 0', padding: '6px 8px',
+        background: 'rgba(140,160,220,0.06)', borderRadius: '6px',
+        borderLeft: '3px solid var(--accent, #8ab4f8)', fontSize: '11.5px' } },
+        n.taskBrief));
+    }
+
+    const metaRow = h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px',
+                                        marginTop: '6px' } });
+    if (n.assignedAgents && n.assignedAgents.length) {
+      metaRow.appendChild(h('span', { class: 'badge accent',
+        title: 'Agents: ' + n.assignedAgents.join(', ') }, '👥 ' + n.assignedAgents.join(', ')));
+    }
+    if (n.attempts > 0) {
+      metaRow.appendChild(h('span', { class: 'badge' }, '⟲ 尝试 ' + n.attempts));
+    }
+    if (n.durationSec) {
+      metaRow.appendChild(h('span', { class: 'badge' }, '⏱ ' + fmtDurSec(n.durationSec)));
+    }
+    if (n.dependsOn && n.dependsOn.length) {
+      metaRow.appendChild(h('span', { class: 'badge ghost',
+        title: '依赖: ' + n.dependsOn.join(', ') }, '⇠ ' + n.dependsOn.join(', ')));
+    }
+    card.appendChild(metaRow);
+
+    // 检查点
+    if (n.checkpointStatus || n.checkpointSavedAt || n.checkpointError) {
+      const cpBox = h('div', { style: { marginTop: '8px', padding: '6px 8px',
+        background: 'rgba(100,200,160,0.05)', borderRadius: '6px', fontSize: '11px' } }, [
+        h('span', { class: 'muted' }, '✓ 检查点: '),
+        h('span', { class: 'badge ' + statusBadgeClass(n.checkpointStatus) }, n.checkpointStatus || '—'),
+        n.checkpointSavedAt && n.checkpointSavedAt !== '0001-01-01T00:00:00Z'
+          ? h('span', { class: 'muted', style: { marginLeft: '6px' } }, fmtTime(n.checkpointSavedAt))
+          : '',
+      ]);
+      if (n.checkpointError) {
+        cpBox.appendChild(h('div', { class: 'err', style: { marginTop: '4px', fontSize: '11px' },
+          title: n.checkpointError }, '✗ ' + n.checkpointError.slice(0, 120)));
+      }
+      card.appendChild(cpBox);
+    }
+
+    // 对抗评审
+    if (n.adversaryRound > 0) {
+      const advCls = n.adversaryPassed ? 'ok' : 'err';
+      card.appendChild(h('div', { style: { marginTop: '8px', padding: '6px 8px',
+        background: 'rgba(200,160,100,0.05)', borderRadius: '6px', fontSize: '11px' } }, [
+        h('span', { class: 'muted' }, '⚔ 对抗 Round ' + n.adversaryRound + ': '),
+        h('span', { class: 'badge ' + advCls },
+          (n.adversaryScore || 0).toFixed(2) + (n.adversaryPassed ? ' · PASS' : ' · FAIL')),
+      ]));
+    }
+
+    if (n.error) {
+      card.appendChild(h('div', { class: 'insight err',
+        style: { marginTop: '8px', fontSize: '11px' } },
+        h('div', { class: 'insight-title', title: n.error }, '错误: ' + n.error.slice(0, 160))));
+    }
+
+    if (n.outputPreview) {
+      card.appendChild(h('details', { style: { marginTop: '8px' } }, [
+        h('summary', { class: 'muted small' }, '输出预览'),
+        h('pre', { class: 'pre', style: { fontSize: '11px', maxHeight: '160px',
+                                          overflow: 'auto', whiteSpace: 'pre-wrap' } },
+          n.outputPreview),
+      ]));
+    }
+    return card;
+  }
+
+  function renderDAGAdversaryRounds(rounds) {
+    const tbl = h('table', { class: 'tbl' });
+    tbl.appendChild(h('thead', {}, h('tr', {}, [
+      h('th', {}, 'Round'), h('th', {}, '平均分'),
+      h('th', {}, 'Correct'), h('th', {}, 'Complete'),
+      h('th', {}, 'Security'), h('th', {}, 'Quality'),
+      h('th', {}, 'Design'), h('th', {}, 'Pass?'),
+    ])));
+    const tb = h('tbody');
+    for (const r of rounds) {
+      tb.appendChild(h('tr', {}, [
+        h('td', {}, String(r.round)),
+        h('td', {}, h('strong', {}, (r.avgScore || 0).toFixed(2))),
+        h('td', {}, (r.correctness || 0).toFixed(2)),
+        h('td', {}, (r.completeness || 0).toFixed(2)),
+        h('td', {}, (r.security || 0).toFixed(2)),
+        h('td', {}, (r.codeQuality || 0).toFixed(2)),
+        h('td', {}, (r.designAlignment || 0).toFixed(2)),
+        h('td', {}, h('span', { class: 'badge ' + (r.passed ? 'ok' : 'err') },
+          r.passed ? 'PASS' : 'FAIL')),
+      ]));
+    }
+    tbl.appendChild(tb);
+    return h('div', { class: 'card mb-16' }, [
+      h('h3', {}, '⚔ 对抗评审历史'),
+      h('div', { style: { maxHeight: '40vh', overflow: 'auto' } }, tbl),
+    ]);
   }
 
   function renderDAGSVG(nodes, subtitle) {
@@ -1252,55 +1526,166 @@
   // ==================================================================
   // 6. Metrics
   // ==================================================================
+  // v1.5 统一"指标"页面: 合并 /metrics + /catalog
+  //   - 顶部: 概览 (总数 / 已采集 / 覆盖率 / 模块数)
+  //   - 中部: 模块索引 (点击进入 detail), 显示事件数 + 告警
+  //   - 底部: catalog 表 (中英双语, 最近值 / 最近采集时间 / 小型图表)
   async function renderMetrics() {
-    const sumsRaw = await api('/api/metrics');
-    const sums = Array.isArray(sumsRaw) ? sumsRaw : [];
     const v = $('#view');
+    v.innerHTML = '<div class="loading">加载 metrics…</div>';
+    let sums, cat, cov;
+    try {
+      [sums, cat, cov] = await Promise.all([
+        api('/api/metrics').then(r => Array.isArray(r) ? r : []),
+        api('/api/metrics/catalog').catch(() => ({ catalog: [], modules: [], total: 0 })),
+        api('/api/metrics/coverage').catch(() => ({ rows: [], totalDeclared: 0, totalCollected: 0, coverageRate: 0 })),
+      ]);
+    } catch (e) {
+      v.innerHTML = '';
+      v.appendChild(h('div', { class: 'empty', style: { color: 'var(--red)' } }, '加载失败: ' + e.message));
+      return;
+    }
     v.innerHTML = '';
 
-    // 已知模块 (即使当前无事件, 也渲染一个入口卡, 方便用户翻历史 / 确认模块正常)
+    // ---- 顶部概览 ----
+    const total = cat.total || (cat.catalog || []).length;
+    const collected = cov.totalCollected || 0;
+    const coveragePct = cov.coverageRate || (total > 0 ? collected / total : 0);
+    v.appendChild(h('div', { class: 'grid grid-4 mb-16' }, [
+      statCard('指标总数', total, '已在 pkg/metrics/catalog.go 声明', 'accent'),
+      statCard('已采集', collected, '至少 1 次样本', collected > 0 ? 'ok' : 'warn'),
+      statCard('覆盖率', fmtPct(coveragePct),
+        '有样本 / 总声明', coveragePct >= 0.8 ? 'ok' : (coveragePct >= 0.4 ? 'warn' : 'err')),
+      statCard('模块数', (cat.modules || []).length,
+        '按模块分组', 'purple'),
+    ]));
+
+    // ---- 模块快速跳转 ----
     const known = ['team', 'dreaming', 'evolution', 'memory', 'task', 'cron', 'swarm', 'llm', 'api'];
     const byMod = {};
     for (const s of sums) byMod[s.module] = s;
+    const mods = new Set(known);
+    for (const s of sums) mods.add(s.module);
+    for (const m of cat.modules || []) mods.add(m);
 
-    const quick = h('div', { class: 'pill-row mb-16' }, [
-      h('span', { class: 'muted small' }, '快速跳转:'),
-      ...known.map(m => h('a', {
-        class: 'badge' + (byMod[m] ? ' accent' : ''),
-        href: '#/metrics/' + encodeURIComponent(m),
-        style: { cursor: 'pointer', textDecoration: 'none' },
-      }, m + (byMod[m] ? ' · ' + (byMod[m].eventCount || 0) : ' · —'))),
-    ]);
-    v.appendChild(quick);
+    v.appendChild(h('div', { class: 'card mb-16' }, [
+      h('h3', {}, '📊 模块导航 · 点击查看事件曲线'),
+      h('div', { class: 'pill-row' }, [...mods].map(m => {
+        const s = byMod[m];
+        const evn = s ? (s.eventCount || 0) : 0;
+        return h('a', {
+          class: 'badge' + (evn > 0 ? ' accent' : ''),
+          href: '#/metrics/' + encodeURIComponent(m),
+          style: { cursor: 'pointer', textDecoration: 'none' },
+        }, m + ' · ' + (evn > 0 ? evn + ' events' : '—'));
+      })),
+      (sums.some(s => (s.trendAlerts || []).length)) ? h('div', { class: 'mt-12' },
+        sums.filter(s => (s.trendAlerts || []).length).map(s =>
+          h('div', { class: 'insight warn' }, [
+            h('div', { class: 'insight-title' }, s.module),
+            h('div', {}, (s.trendAlerts || []).slice(0, 3).join('; ')),
+          ]))
+      ) : null,
+    ]));
 
-    const list = [];
-    for (const m of known) if (byMod[m]) list.push(byMod[m]);
-    for (const s of sums) if (!known.includes(s.module)) list.push(s);
+    // ---- Catalog 表 (中英双语, 自动选图标) ----
+    const metricsList = cat.catalog || [];
+    const covRows = cov.rows || [];
+    const covMap = {};
+    covRows.forEach(c => { covMap[c.module + ':' + c.name] = c; });
 
-    if (!list.length) {
-      v.appendChild(h('div', { class: 'empty' }, '暂无指标数据 · 运行团队 / dreaming / cron 后会自动产生'));
+    if (!metricsList.length) {
+      v.appendChild(h('div', { class: 'empty' }, 'catalog 为空, 请在 pkg/metrics/catalog.go 补充指标描述'));
       return;
     }
 
-    const grid = h('div', { class: 'grid grid-2' });
-    for (const s of list) {
-      const alerts = s.trendAlerts || [];
-      const card = h('div', {
-        class: 'card', style: { cursor: 'pointer' },
-        onClick: () => location.hash = '#/metrics/' + encodeURIComponent(s.module),
-      }, [
-        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'baseline' } }, [
-          h('div', { style: { flex: '1', fontWeight: '700', fontSize: '15px' } }, s.module),
-          h('span', { class: 'badge' }, (s.eventCount || 0) + ' events'),
-          alerts.length ? h('span', { class: 'badge warn' }, alerts.length + ' alert') : null,
-        ]),
-        h('div', { class: 'muted mt-12', style: { fontSize: '12px' } },
-          Object.keys(s.metrics || {}).slice(0, 8).join(' · ') || '—'),
-        alerts.length ? h('div', { class: 'mt-12', style: { color: 'var(--amber)', fontSize: '12px' } }, alerts.slice(0, 2).join('; ')) : null,
-      ]);
-      grid.appendChild(card);
+    if ((cov.missingDesc || []).length) {
+      v.appendChild(h('div', { class: 'card mb-16' }, [
+        h('h3', {}, '⚠ 有数据但缺少中英文声明的指标'),
+        h('div', { class: 'muted small' }, '请在 pkg/metrics/catalog.go 补齐, 否则不会显示图表与描述'),
+        h('pre', { class: 'pre', style: { maxHeight: '120px', overflow: 'auto' } }, (cov.missingDesc || []).join('\n')),
+      ]));
     }
-    v.appendChild(grid);
+
+    // 搜索 / 过滤
+    const qInp = h('input', { class: 'input', placeholder: '搜索: 名称 / 中文描述 / 模块…', style: { minWidth: '260px' } });
+    const modSel = h('select', { class: 'select' }, [
+      h('option', { value: '' }, '全部模块'),
+      ...(cat.modules || []).map(m => h('option', { value: m }, m)),
+    ]);
+    const kindSel = h('select', { class: 'select' }, [
+      h('option', { value: '' }, '全部类型'),
+      h('option', { value: 'counter' }, 'counter · 计数器'),
+      h('option', { value: 'gauge' }, 'gauge · 瞬时量'),
+      h('option', { value: 'histogram' }, 'histogram · 分布'),
+      h('option', { value: 'duration' }, 'duration · 耗时'),
+      h('option', { value: 'rate' }, 'rate · 速率'),
+    ]);
+    const hasDataOnly = h('input', { type: 'checkbox', checked: true });
+    const hostHdr = h('div', { class: 'toolbar-row mb-12' }, [
+      h('strong', {}, '◈ 指标目录 · 中英双语 · 自动配图表'),
+      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        qInp, modSel, kindSel,
+        h('label', { class: 'muted small', style: { display: 'flex', alignItems: 'center', gap: '4px' } },
+          [hasDataOnly, ' 仅展示有数据']),
+      ]),
+    ]);
+    const host = h('div');
+
+    const renderRows = () => {
+      host.innerHTML = '';
+      const q = (qInp.value || '').trim().toLowerCase();
+      const mod = modSel.value;
+      const kind = kindSel.value;
+      const onlyHasData = hasDataOnly.checked;
+      const rows = metricsList.filter(m => {
+        if (mod && m.module !== mod) return false;
+        if (kind && m.kind !== kind) return false;
+        const c = covMap[m.module + ':' + m.name];
+        if (onlyHasData && (!c || (c.samples || 0) === 0)) return false;
+        if (q) {
+          const blob = (m.name + ' ' + (m.zh || '') + ' ' + (m.en || '') + ' ' + (m.module || '')).toLowerCase();
+          if (!blob.includes(q)) return false;
+        }
+        return true;
+      });
+      host.appendChild(h('div', { class: 'muted small mb-12' },
+        '匹配 ' + rows.length + ' / ' + total + ' · 有数据 ' + collected));
+
+      // 每个指标一张卡 (含迷你图)
+      const grid = h('div', { class: 'grid grid-2' });
+      for (const m of rows) {
+        const c = covMap[m.module + ':' + m.name] || {};
+        const has = (c.samples || 0) > 0;
+        const card = h('div', {
+          class: 'card', style: { cursor: has ? 'pointer' : 'default' },
+          onClick: () => { if (has) location.hash = '#/metrics/' + encodeURIComponent(m.module); },
+        }, [
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'baseline', flexWrap: 'wrap' } }, [
+            h('span', { class: 'badge' }, m.module || '—'),
+            h('span', { class: 'badge ' + metricKindBadge(m.kind) }, m.kind || '—'),
+            h('div', { style: { flex: 1, fontWeight: 700, fontSize: '14px' } }, m.zh || m.name),
+            has ? h('span', { class: 'badge ok' }, (c.samples || 0) + ' 样本') : h('span', { class: 'badge warn' }, '无样本'),
+          ]),
+          h('div', { class: 'muted small mt-12', style: { fontFamily: 'monospace' } }, m.name),
+          m.en ? h('div', { class: 'muted small' }, m.en) : null,
+          h('div', { class: 'muted small mt-12' }, [
+            m.unit ? ('单位: ' + m.unit + ' · ') : '',
+            has ? ('最近值 ' + fmtNum(c.lastValue || 0, 3) + ' · ' + fmtRel(c.lastSeen)) : '还没数据',
+          ]),
+        ]);
+        grid.appendChild(card);
+      }
+      host.appendChild(grid);
+    };
+    qInp.addEventListener('input', renderRows);
+    modSel.addEventListener('change', renderRows);
+    kindSel.addEventListener('change', renderRows);
+    hasDataOnly.addEventListener('change', renderRows);
+
+    v.appendChild(hostHdr);
+    v.appendChild(host);
+    renderRows();
   }
 
   async function renderMetricsDetail(module) {
@@ -1563,7 +1948,27 @@
       statCard('最近运行', fmtRel(data.lastDreamAt), data.lastDreamAt ? fmtTime(data.lastDreamAt) : '从未', data.lastDreamAt ? 'ok' : 'warn'),
     ]));
 
-    // 诊断
+    // v1.5: 操作区 - 主动触发 + LLM 诊断
+    const diagSlot = h('div', { id: 'dreaming-diag-slot' });
+    v.appendChild(h('div', { class: 'card mb-16' }, [
+      h('div', { class: 'toolbar-row' }, [
+        h('h3', { style: { margin: 0 } }, 'Dreaming 操作与诊断'),
+        h('button', { class: 'btn primary', onClick: async () => {
+          try {
+            const resp = await api('/api/dreaming/trigger', { method: 'POST' });
+            toast('已排队: ' + (resp.message || 'triggered'), 'ok');
+          } catch (e) { toast('触发失败: ' + e.message, 'err'); }
+        }}, '🌙 主动触发 Dreaming'),
+        h('button', { class: 'btn', onClick: () => runAsyncDiagnosis({
+          slot: diagSlot, kind: 'dreaming', target: '',
+          title: '✦ Dreaming LLM 诊断',
+          description: '分析整理质量 / 运行状态 / 被使用情况, 给出优化建议 (耗时 30~90s)',
+        }) }, '🔎 LLM 诊断'),
+      ]),
+      diagSlot,
+    ]));
+
+    // 诊断 (基于规则的简单诊断, 独立于 LLM 诊断)
     if (diag && (!diag.dreamerWired || diag.reasons.length)) {
       const card = h('div', { class: 'card mb-16' }, [
         sectionHeader('诊断: Dreaming 为什么没跑?',
@@ -1650,6 +2055,20 @@
       statCard('角色覆盖', roles.length, roles.slice(0, 6).join(' · '), 'purple'),
       statCard('分类', cats.length, cats.slice(0, 6).join(' · '), ''),
       statCard('质量均值', fmtNum(data.avgQuality || 0, 3), `成功率 ${fmtNum((data.successRate || 0) * 100, 1)}%`, data.avgQuality > 0.7 ? 'ok' : 'warn'),
+    ]));
+
+    // v1.5: Evolution LLM 诊断
+    const evoDiagSlot = h('div', { id: 'evolution-diag-slot' });
+    v.appendChild(h('div', { class: 'card mb-16' }, [
+      h('div', { class: 'toolbar-row' }, [
+        h('h3', { style: { margin: 0 } }, 'Evolution 操作与诊断'),
+        h('button', { class: 'btn', onClick: () => runAsyncDiagnosis({
+          slot: evoDiagSlot, kind: 'evolution', target: '',
+          title: '✦ Evolution LLM 诊断',
+          description: '分析数据质量 / 运行状态 / 被使用情况 / 是否退化, 给出优化建议 (耗时 30~90s)',
+        }) }, '🔎 LLM 诊断'),
+      ]),
+      evoDiagSlot,
     ]));
 
     // 时序: 质量均值趋势 (需要后端有 evolution.avg_quality 时间序列; fallback: 从 experiences 计算)
@@ -2793,6 +3212,109 @@
           '窗口 ' + state.llmStats.window + ' 内没有 LLM 调用记录。首次启动需要等待主进程 / 飞书 bot / dashboard 自身发起至少 1 次 LLM 调用, 指标会写到 metrics/llm.jsonl。'),
       ]));
     }
+
+    // ⭐ 提示词缓存效果 (v1.5)
+    //   - Anthropic prompt caching: cacheRead 按 10% 计费, cacheCreate 按 125% 计费
+    //   - HitRate = cacheRead / (input + cacheRead), 越高越省钱
+    //   - 时序图: 每小时桶的命中率 + 读/写 token 量
+    if (data.cache) {
+      v.appendChild(renderPromptCachePanel(data.cache));
+    }
+  }
+
+  // 提示词缓存效果面板
+  function renderPromptCachePanel(cache) {
+    const hitRate = cache.hitRate || 0;
+    const cov = cache.cacheCoverage || 0;
+    const wrap = h('div', { class: 'card mb-16' }, [
+      h('h3', {}, '💾 提示词缓存效果 (Prompt Cache)'),
+      h('div', { class: 'muted small mb-12' },
+        '命中率 = cacheRead / (input + cacheRead); 越高越省钱。Anthropic cacheRead 按 10% 计费, cacheCreate 按 125% 计费。'),
+      h('div', { class: 'grid grid-4 mb-16' }, [
+        statCard('命中率', (hitRate * 100).toFixed(1) + '%',
+          hitRate > 0.5 ? '优秀 (>50%)' : hitRate > 0.2 ? '一般' : '可优化',
+          hitRate > 0.5 ? 'ok' : hitRate > 0.2 ? 'accent' : 'warn'),
+        statCard('节省 Token', fmtKilo(cache.savedTokens || 0),
+          '≈ ' + fmtKilo(Math.floor((cache.savedTokens || 0) * 0.9)) + ' 折算节省',
+          'purple'),
+        statCard('调用覆盖率',
+          (cov * 100).toFixed(1) + '%',
+          (cache.callsWithCache || 0) + ' 次命中缓存',
+          cov > 0.5 ? 'ok' : ''),
+        statCard('缓存写入', fmtKilo(cache.cacheCreateTokens || 0),
+          '首次写入成本 (125%)', ''),
+      ]),
+    ]);
+
+    // 按模型
+    if ((cache.byModel || []).length) {
+      const tbl = h('table', { class: 'tbl' });
+      tbl.appendChild(h('thead', {}, h('tr', {}, [
+        h('th', {}, '模型'), h('th', {}, '调用'), h('th', {}, '命中次数'),
+        h('th', {}, '命中率'), h('th', {}, '命中 Token'), h('th', {}, '写入 Token'), h('th', {}, 'Input Token'),
+      ])));
+      const tb = h('tbody');
+      for (const m of cache.byModel) {
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, m.model),
+          h('td', {}, String(m.calls || 0)),
+          h('td', {}, String(m.callsWithCache || 0)),
+          h('td', {}, h('span', {
+            class: 'badge ' + ((m.hitRate || 0) > 0.5 ? 'ok' : (m.hitRate || 0) > 0.2 ? '' : 'warn')
+          }, ((m.hitRate || 0) * 100).toFixed(1) + '%')),
+          h('td', {}, fmtKilo(m.cacheReadTokens || 0)),
+          h('td', {}, fmtKilo(m.cacheCreateTokens || 0)),
+          h('td', {}, fmtKilo(m.inputTokens || 0)),
+        ]));
+      }
+      tbl.appendChild(tb);
+      wrap.appendChild(h('div', { class: 'card mb-12' }, [
+        h('h4', {}, '按模型细分'), tbl,
+      ]));
+    }
+
+    // 时序图
+    if ((cache.timeseries || []).length) {
+      const chartID = 'chart-cache-ts-' + Math.random().toString(36).slice(2, 8);
+      const rateID  = 'chart-cache-rate-' + Math.random().toString(36).slice(2, 8);
+      const chartCard = h('div', {}, [
+        h('h4', {}, '缓存效果时序 (按小时)'),
+        h('div', { class: 'chart-wrap' }, h('canvas', { id: chartID })),
+        h('div', { class: 'chart-wrap' }, h('canvas', { id: rateID })),
+      ]);
+      wrap.appendChild(chartCard);
+      requestAnimationFrame(() => {
+        const c1 = document.getElementById(chartID);
+        if (c1 && window.Chart) {
+          state.charts[chartID] = new Chart(c1.getContext('2d'), {
+            type: 'line',
+            data: {
+              labels: cache.timeseries.map(p => fmtTsShort(p.ts)),
+              datasets: [
+                { label: 'cacheRead (命中)', data: cache.timeseries.map(p => p.cacheReadTokens), borderColor: '#7CFF8C', backgroundColor: 'rgba(124,255,140,0.1)', fill: true, tension: 0.3, pointRadius: 1 },
+                { label: 'cacheCreate (写入)', data: cache.timeseries.map(p => p.cacheCreateTokens), borderColor: '#C084FF', backgroundColor: 'rgba(192,132,255,0.08)', fill: true, tension: 0.3, pointRadius: 1 },
+                { label: 'input (未命中)', data: cache.timeseries.map(p => p.inputTokens), borderColor: '#ffbe55', tension: 0.3, pointRadius: 1 },
+              ],
+            },
+            options: baseChartOpts({}),
+          });
+        }
+        const c2 = document.getElementById(rateID);
+        if (c2 && window.Chart) {
+          state.charts[rateID] = new Chart(c2.getContext('2d'), {
+            type: 'line',
+            data: {
+              labels: cache.timeseries.map(p => fmtTsShort(p.ts)),
+              datasets: [
+                { label: '命中率 (%)', data: cache.timeseries.map(p => (p.hitRate || 0) * 100), borderColor: '#5ef0ff', backgroundColor: 'rgba(94,240,255,0.12)', fill: true, tension: 0.3, pointRadius: 1 },
+              ],
+            },
+            options: baseChartOpts({ scales: { y: { suggestedMin: 0, suggestedMax: 100 } } }),
+          });
+        }
+      });
+    }
+    return wrap;
   }
 
   function fmtPct(v) {

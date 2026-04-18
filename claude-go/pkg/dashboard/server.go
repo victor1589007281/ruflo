@@ -32,6 +32,7 @@ type Server struct {
 	provider *Provider
 	mux      *http.ServeMux
 	server   *http.Server
+	jobs     *diagJobStore // 异步 LLM 诊断作业
 }
 
 // NewServer 构造 dashboard server。
@@ -46,6 +47,7 @@ func NewServer(cfg Config) *Server {
 		cfg:      cfg,
 		provider: NewProvider(cfg.StateDir, cfg.CacheTTL),
 		mux:      http.NewServeMux(),
+		jobs:     newDiagJobStore(100),
 	}
 	// 幂等: 即使主进程已初始化过, 这里也是 no-op。保证 dashboard 单独前台运行时
 	// 也能捕获自身对 LLM 的诊断调用。
@@ -70,6 +72,7 @@ func MountOn(cfg Config, mux *http.ServeMux) *Server {
 		cfg:      cfg,
 		provider: NewProvider(cfg.StateDir, cfg.CacheTTL),
 		mux:      mux, // 复用外部 mux
+		jobs:     newDiagJobStore(100),
 	}
 	metrics.InitGlobalLLMCollector(cfg.StateDir)
 	s.registerRoutesOn(mux)
@@ -163,6 +166,15 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/llm/guard", s.handleLLMGuard)
 	mux.HandleFunc("/api/metrics/catalog", s.handleMetricsCatalog)
 	mux.HandleFunc("/api/metrics/coverage", s.handleMetricsCoverage)
+
+	// v1.5: 异步 LLM 诊断作业 (team/dreaming/evolution)
+	//   POST /api/diag/jobs           -> 创建作业 (入参 {kind, target?})
+	//   GET  /api/diag/jobs           -> 列出最近作业
+	//   GET  /api/diag/jobs/{id}      -> 查询作业状态 / 结果
+	//   POST /api/dreaming/trigger    -> 主动触发一次 dreaming
+	mux.HandleFunc("/api/diag/jobs", s.handleDiagJobs)
+	mux.HandleFunc("/api/diag/jobs/", s.handleDiagJobDetail)
+	mux.HandleFunc("/api/dreaming/trigger", s.handleDreamingTrigger)
 
 	// 根路径和 SPA fallback
 	mux.HandleFunc("/", s.handleIndex)

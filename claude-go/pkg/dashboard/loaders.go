@@ -315,61 +315,140 @@ func (p *Provider) LoadEvolution() (*EvolutionResp, error) {
 
 // ============== Tasks ==============
 
+// rawTask 与 builtin/tasktools.go::v2TaskRecord 字段对齐。
+// 用 json.RawMessage 接收时间戳字段, 之后再转成 time.Time, 兼容
+// "2026-01-02T03:04:05.123456789Z" / "2026-01-02T03:04:05Z" 各种格式。
 type rawTask struct {
-	ID          string    `json:"id"`
-	Subject     string    `json:"subject"`
-	Description string    `json:"description,omitempty"`
-	Status      string    `json:"status"`
-	Owner       string    `json:"owner,omitempty"`
-	Priority    int       `json:"priority,omitempty"`
-	DependsOn   []string  `json:"dependsOn,omitempty"`
-	CreatedAt   time.Time `json:"createdAt,omitempty"`
-	UpdatedAt   time.Time `json:"updatedAt,omitempty"`
+	ID          string          `json:"id"`
+	Subject     string          `json:"subject"`
+	Description string          `json:"description,omitempty"`
+	ActiveForm  string          `json:"activeForm,omitempty"`
+	Status      string          `json:"status"`
+	Owner       string          `json:"owner,omitempty"`
+	Priority    int             `json:"priority,omitempty"`
+	DependsOn   []string        `json:"dependsOn,omitempty"`
+	CreatedAt   json.RawMessage `json:"createdAt,omitempty"`
+	UpdatedAt   json.RawMessage `json:"updatedAt,omitempty"`
+}
+
+// parseRawTime 宽容解析: 字符串 RFC3339/RFC3339Nano / 数字 Unix ts 都支持。
+func parseRawTime(raw json.RawMessage) time.Time {
+	if len(raw) == 0 {
+		return time.Time{}
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05"} {
+			if t, err2 := time.Parse(layout, s); err2 == nil {
+				return t
+			}
+		}
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil && n > 0 {
+		if n > 1e12 {
+			return time.UnixMilli(n)
+		}
+		return time.Unix(n, 0)
+	}
+	return time.Time{}
 }
 
 // ListTasks 读取 V2 tasks。
+//
+// 真实落盘路径兼容性:
+//  1. <state>/tasks/tasks.json          (feishu bot / daemon, basedir.Layout.TasksFilePath)
+//  2. <state>/tasks.json                (单次 CLI 调用, cmd/claude-go 早期写法)
+//  3. <state>/claude-go-v2-tasks.json   (builtin.TaskStore 默认文件, 兼容老版本)
+//
+// 真实 JSON 格式兼容性 (builtin.TaskStore 实际落盘为 {"tasks": {id: record}}):
+//  1. {"tasks": { "id": record }}       ← 主路径, V2 TaskStore
+//  2. {"tasks": [ record... ]}          ← 老版本备份
+//  3. {"items": [ record... ]}          ← 部分外部工具
+//  4. [ record... ]                     ← 裸数组
+//  5. { "id": record, ... }             ← 纯 map
 func (p *Provider) ListTasks() ([]TaskDTO, error) {
-	path := p.pathIn("tasks", "tasks.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return []TaskDTO{}, nil
-		}
-		return nil, err
+	candidates := []string{
+		p.pathIn("tasks", "tasks.json"),
+		p.pathIn("tasks.json"),
+		p.pathIn("claude-go-v2-tasks.json"),
 	}
+	var (
+		data []byte
+		path string
+		err  error
+	)
+	for _, c := range candidates {
+		data, err = os.ReadFile(c)
+		if err == nil {
+			path = c
+			break
+		}
+	}
+	if len(data) == 0 {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		return []TaskDTO{}, nil
+	}
+	_ = path // 保留路径变量以便未来诊断
 	// tasks.json 可能是多种 shape, 为避免 500, 全部宽容解析, 无法解析则视为空。
 	var arr []rawTask
 	if err := json.Unmarshal(data, &arr); err != nil {
-		// 1) { tasks: [...] }
-		var wrap struct {
-			Tasks []rawTask `json:"tasks"`
-			Items []rawTask `json:"items"`
+		// 1) { "tasks": {id: rec, ...} }  ← V2 TaskStore 真实格式
+		var wrapMap struct {
+			Tasks map[string]rawTask `json:"tasks"`
+			Items map[string]rawTask `json:"items"`
 		}
-		if err2 := json.Unmarshal(data, &wrap); err2 == nil {
-			if len(wrap.Tasks) > 0 {
-				arr = wrap.Tasks
-			} else if len(wrap.Items) > 0 {
-				arr = wrap.Items
+		if err2 := json.Unmarshal(data, &wrapMap); err2 == nil && (len(wrapMap.Tasks) > 0 || len(wrapMap.Items) > 0) {
+			src := wrapMap.Tasks
+			if len(src) == 0 {
+				src = wrapMap.Items
+			}
+			for id, t := range src {
+				if t.ID == "" {
+					t.ID = id
+				}
+				arr = append(arr, t)
 			}
 		} else {
-			// 2) { "id1": { ... }, "id2": { ... } } (map-shape)
-			var m map[string]rawTask
-			if err3 := json.Unmarshal(data, &m); err3 == nil {
-				for id, t := range m {
-					if t.ID == "" {
-						t.ID = id
+			// 2) { tasks: [...] } / { items: [...] } (array-shape)
+			var wrapArr struct {
+				Tasks []rawTask `json:"tasks"`
+				Items []rawTask `json:"items"`
+			}
+			if err3 := json.Unmarshal(data, &wrapArr); err3 == nil && (len(wrapArr.Tasks) > 0 || len(wrapArr.Items) > 0) {
+				if len(wrapArr.Tasks) > 0 {
+					arr = wrapArr.Tasks
+				} else {
+					arr = wrapArr.Items
+				}
+			} else {
+				// 3) { "id1": { ... }, "id2": { ... } } (裸 map)
+				var m map[string]rawTask
+				if err4 := json.Unmarshal(data, &m); err4 == nil {
+					for id, t := range m {
+						if t.ID == "" {
+							t.ID = id
+						}
+						arr = append(arr, t)
 					}
-					arr = append(arr, t)
 				}
 			}
 		}
 	}
 	out := make([]TaskDTO, 0, len(arr))
 	for _, t := range arr {
+		desc := t.Description
+		if desc == "" && t.ActiveForm != "" {
+			desc = t.ActiveForm
+		}
 		out = append(out, TaskDTO{
-			ID: t.ID, Subject: t.Subject, Description: t.Description,
+			ID: t.ID, Subject: t.Subject, Description: desc,
 			Status: t.Status, Owner: t.Owner, Priority: t.Priority,
-			DependsOn: t.DependsOn, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
+			DependsOn: t.DependsOn,
+			CreatedAt: parseRawTime(t.CreatedAt),
+			UpdatedAt: parseRawTime(t.UpdatedAt),
 		})
 	}
 	return out, nil

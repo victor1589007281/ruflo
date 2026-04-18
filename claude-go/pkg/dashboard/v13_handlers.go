@@ -474,6 +474,43 @@ type llmTimePoint struct {
 	AvgDuration  float64   `json:"avgDuration"`
 }
 
+// llmCacheStats 提示词缓存 (prompt cache) 效果统计。
+//   - HitRate: cacheRead / (cacheRead + input) 命中率: 在 "应当作为输入读入" 的 token 中,
+//     有多少是从缓存直接拿的 (不需要重新计费)。
+//   - SavedTokens: 等于 cacheRead (被直接当作输入的缓存命中 token)
+//   - CacheCreateTokens: 缓存写入的 token (首次/过期 时需要写一次, 有少量附加成本)
+//   - CallsWithCache: 该窗口内至少命中过一次缓存的调用数
+//   - CacheCoverage: CallsWithCache / TotalCalls 覆盖率
+type llmCacheStats struct {
+	HitRate           float64            `json:"hitRate"`
+	SavedTokens       int64              `json:"savedTokens"`
+	CacheReadTokens   int64              `json:"cacheReadTokens"`
+	CacheCreateTokens int64              `json:"cacheCreateTokens"`
+	InputTokens       int64              `json:"inputTokens"`
+	CallsWithCache    int                `json:"callsWithCache"`
+	CacheCoverage     float64            `json:"cacheCoverage"`
+	ByModel           []llmCacheByModel  `json:"byModel"`
+	Timeseries        []llmCacheTimePt   `json:"timeseries"`
+}
+
+type llmCacheByModel struct {
+	Model             string  `json:"model"`
+	Calls             int     `json:"calls"`
+	CallsWithCache    int     `json:"callsWithCache"`
+	HitRate           float64 `json:"hitRate"`
+	CacheReadTokens   int64   `json:"cacheReadTokens"`
+	CacheCreateTokens int64   `json:"cacheCreateTokens"`
+	InputTokens       int64   `json:"inputTokens"`
+}
+
+type llmCacheTimePt struct {
+	Timestamp         time.Time `json:"ts"`
+	HitRate           float64   `json:"hitRate"`
+	CacheReadTokens   int64     `json:"cacheReadTokens"`
+	CacheCreateTokens int64     `json:"cacheCreateTokens"`
+	InputTokens       int64     `json:"inputTokens"`
+}
+
 type llmStatsResp struct {
 	Source       string            `json:"source"` // metrics/llm.jsonl
 	Window       string            `json:"window"`
@@ -493,6 +530,7 @@ type llmStatsResp struct {
 	Errors5xx    []llmErrorBucket  `json:"errorBuckets"`
 	Timeseries   []llmTimePoint    `json:"timeseries"`
 	Alerts       []string          `json:"alerts,omitempty"`
+	Cache        llmCacheStats     `json:"cache"`
 }
 
 func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
@@ -709,6 +747,10 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		tokens  int64
 		sumDur  float64
 		nDur    int
+		// cache 相关
+		cacheRead   int64
+		cacheCreate int64
+		input       int64
 	}
 	tsAll := map[int64]*tsBucket{}
 	for _, c := range calls {
@@ -726,6 +768,9 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 			b.errors++
 		}
 		b.tokens += c.input + c.output + c.cacheRead + c.cacheCreate
+		b.cacheRead += c.cacheRead
+		b.cacheCreate += c.cacheCreate
+		b.input += c.input
 		if c.duration > 0 {
 			b.sumDur += c.duration
 			b.nDur++
@@ -752,10 +797,84 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// -------- Prompt Cache 效果统计 --------
+	// Anthropic prompt cache: cacheRead 是 "缓存命中, 按 10% 计费的输入 token",
+	//                        cacheCreate 是 "首次写入, 按 125% 计费的输入 token".
+	// 综合有效 "应输入" token = input + cacheRead (因为 cacheRead 本质上是替代了 input),
+	// 所以 HitRate = cacheRead / (input + cacheRead).
+	cacheTotalInput := resp.InputTokens + resp.CacheRead
+	if cacheTotalInput > 0 {
+		resp.Cache.HitRate = float64(resp.CacheRead) / float64(cacheTotalInput)
+	}
+	resp.Cache.CacheReadTokens = resp.CacheRead
+	resp.Cache.CacheCreateTokens = resp.CacheCreate
+	resp.Cache.SavedTokens = resp.CacheRead // 以命中 token 计算节省的原始输入成本
+	resp.Cache.InputTokens = resp.InputTokens
+	cacheCallsWithHit := 0
+	for _, c := range calls {
+		if c.cacheRead > 0 {
+			cacheCallsWithHit++
+		}
+	}
+	resp.Cache.CallsWithCache = cacheCallsWithHit
+	if resp.TotalCalls > 0 {
+		resp.Cache.CacheCoverage = float64(cacheCallsWithHit) / float64(resp.TotalCalls)
+	}
+
+	for model, ms := range byModel {
+		hits := 0
+		var cr, cc, in int64
+		for _, c := range calls {
+			if c.model != model && !(c.model == "" && model == "unknown") {
+				continue
+			}
+			cr += c.cacheRead
+			cc += c.cacheCreate
+			in += c.input
+			if c.cacheRead > 0 {
+				hits++
+			}
+		}
+		hr := 0.0
+		if total := in + cr; total > 0 {
+			hr = float64(cr) / float64(total)
+		}
+		resp.Cache.ByModel = append(resp.Cache.ByModel, llmCacheByModel{
+			Model: ms.Model, Calls: ms.Calls, CallsWithCache: hits,
+			HitRate: hr, CacheReadTokens: cr, CacheCreateTokens: cc, InputTokens: in,
+		})
+	}
+	sort.Slice(resp.Cache.ByModel, func(i, j int) bool {
+		return resp.Cache.ByModel[i].CacheReadTokens > resp.Cache.ByModel[j].CacheReadTokens
+	})
+
+	for _, k := range keys {
+		b := tsAll[k]
+		hr := 0.0
+		if total := b.input + b.cacheRead; total > 0 {
+			hr = float64(b.cacheRead) / float64(total)
+		}
+		resp.Cache.Timeseries = append(resp.Cache.Timeseries, llmCacheTimePt{
+			Timestamp:         b.hour,
+			HitRate:           hr,
+			CacheReadTokens:   b.cacheRead,
+			CacheCreateTokens: b.cacheCreate,
+			InputTokens:       b.input,
+		})
+	}
+
 	// 规则告警
 	if resp.TotalCalls > 50 && resp.SuccessRate < 0.9 {
 		resp.Alerts = append(resp.Alerts,
 			fmt.Sprintf("成功率 %.1f%% 低于 90%%, 关注限流/过载错误", resp.SuccessRate*100))
+	}
+	if resp.Cache.CacheReadTokens == 0 && resp.InputTokens > 100_000 {
+		resp.Alerts = append(resp.Alerts,
+			"提示词缓存未命中 (cache_read=0). 若大量重复系统提示, 建议启用 prompt_cache_control=ephemeral")
+	}
+	if resp.Cache.HitRate > 0 && resp.Cache.HitRate < 0.2 && resp.InputTokens > 500_000 {
+		resp.Alerts = append(resp.Alerts,
+			fmt.Sprintf("提示词缓存命中率仅 %.1f%%, 建议检查系统提示是否稳定, 避免频繁变更", resp.Cache.HitRate*100))
 	}
 	if resp.P95Duration > 25 {
 		resp.Alerts = append(resp.Alerts,

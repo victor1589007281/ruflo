@@ -495,10 +495,13 @@ func (s *Server) handleMetricsCoverage(w http.ResponseWriter, r *http.Request) {
 // /api/teams/:name/dag  — 团队运行时 DAG
 // ────────────────────────────────────────────────────────────────────────
 
+// dagStageDTO v1.5 扩展: 为 DAG 节点补充 assignedAgents / taskContent / checkpoint 详情 /
+// adversary (对抗评审) 等信息, 让前端在节点上能直接看到
+// "任务内容 / 执行 agent / 当前 checkpoint / 对抗评分" 全貌。
 type dagStageDTO struct {
 	Name        string    `json:"name"`
 	Role        string    `json:"role"`
-	Status      string    `json:"status"`       // pending / running / completed / failed
+	Status      string    `json:"status"` // pending / running / completed / failed
 	DependsOn   []string  `json:"dependsOn"`
 	Parallel    bool      `json:"parallel,omitempty"`
 	Attempts    int       `json:"attempts,omitempty"`
@@ -508,17 +511,31 @@ type dagStageDTO struct {
 	Error       string    `json:"error,omitempty"`
 	V2TaskID    string    `json:"v2TaskId,omitempty"`
 	OutputPre   string    `json:"outputPreview,omitempty"`
+
+	// v1.5 新增
+	// 任务信息 - 用户描述的意图 (通常等于 workflow stage description)
+	TaskBrief       string   `json:"taskBrief,omitempty"`
+	AssignedAgents  []string `json:"assignedAgents,omitempty"`
+	// checkpoint 详情 (来自 checkpoints.json)
+	CheckpointStatus string    `json:"checkpointStatus,omitempty"`
+	CheckpointSaved  time.Time `json:"checkpointSavedAt,omitempty"`
+	CheckpointError  string    `json:"checkpointError,omitempty"`
+	// 对抗评审 (若该 stage 是 adversary 相关的)
+	AdversaryRound   int     `json:"adversaryRound,omitempty"`
+	AdversaryScore   float64 `json:"adversaryScore,omitempty"`
+	AdversaryPassed  bool    `json:"adversaryPassed,omitempty"`
 }
 
 type dagResp struct {
-	Team        string         `json:"team"`
-	Workflow    string         `json:"workflow"`
-	Status      string         `json:"status"`
-	StartedAt   time.Time      `json:"startedAt,omitempty"`
-	FinishedAt  time.Time      `json:"finishedAt,omitempty"`
-	Stages      []dagStageDTO  `json:"stages"`
-	Source      string         `json:"source"` // 数据来源
-	Error       string         `json:"error,omitempty"`
+	Team            string                `json:"team"`
+	Workflow        string                `json:"workflow"`
+	Status          string                `json:"status"`
+	StartedAt       time.Time             `json:"startedAt,omitempty"`
+	FinishedAt      time.Time             `json:"finishedAt,omitempty"`
+	Stages          []dagStageDTO         `json:"stages"`
+	AdversaryRounds []AdversaryRoundDTO   `json:"adversaryRounds,omitempty"`
+	Source          string                `json:"source"`
+	Error           string                `json:"error,omitempty"`
 }
 
 // handleTeamDAG 读取 team.json + workflow 静态定义 + checkpoints.json, 合成实时 DAG
@@ -529,13 +546,30 @@ func (s *Server) handleTeamDAG(w http.ResponseWriter, r *http.Request, name stri
 		return
 	}
 
-	// 1) 静态 DAG (从 workflow 定义中取 dependsOn)
-	depMap := map[string][]string{} // stageName -> dependsOn
-	paraMap := map[string]bool{}
+	// 1) 静态 DAG (从 workflow 定义中取 dependsOn / task brief / agent)
+	type wfMeta struct {
+		DependsOn []string
+		Parallel  bool
+		Brief     string // 任务简述: 首选 prompt 的首行, 否则 role 描述
+		Agents    []string
+	}
+	wfMap := map[string]wfMeta{}
 	if wf := agent.GetWorkflow(detail.Workflow); wf != nil {
 		for _, st := range wf.Stages {
-			depMap[st.Name] = append([]string(nil), st.DependsOn...)
-			paraMap[st.Name] = st.Parallel
+			brief := stageBriefFromPrompt(st.Prompt)
+			if brief == "" && st.Role != "" {
+				brief = "角色: " + st.Role
+			}
+			agents := []string{}
+			if st.Role != "" {
+				agents = append(agents, st.Role)
+			}
+			wfMap[st.Name] = wfMeta{
+				DependsOn: append([]string(nil), st.DependsOn...),
+				Parallel:  st.Parallel,
+				Brief:     brief,
+				Agents:    agents,
+			}
 		}
 	}
 
@@ -550,15 +584,25 @@ func (s *Server) handleTeamDAG(w http.ResponseWriter, r *http.Request, name stri
 	resp := dagResp{
 		Team: name, Workflow: detail.Workflow, Status: detail.Status,
 		StartedAt: detail.StartedAt, FinishedAt: detail.FinishedAt,
-		Source: "team.json + checkpoints.json + workflow_def",
+		Source:          "team.json + checkpoints.json + workflow_def",
+		AdversaryRounds: detail.AdversaryRounds,
 	}
+	// 为快速定位对抗评审回合, 按 stage name 中的 "round-N" 字段匹配
+	advByRound := map[int]*AdversaryRoundDTO{}
+	for i := range detail.AdversaryRounds {
+		advByRound[detail.AdversaryRounds[i].Round] = &detail.AdversaryRounds[i]
+	}
+
 	for _, st := range detail.Stages {
+		meta := wfMap[st.Name]
 		stage := dagStageDTO{
 			Name: st.Name, Role: st.Role, Status: st.Status,
-			DependsOn: depMap[st.Name],
-			Parallel:  paraMap[st.Name],
+			DependsOn: meta.DependsOn,
+			Parallel:  meta.Parallel,
 			StartedAt: st.StartedAt,
 			Error:     st.Error,
+			TaskBrief:      meta.Brief,
+			AssignedAgents: meta.Agents,
 		}
 		if !st.StartedAt.IsZero() && st.DurationSec > 0 {
 			stage.FinishedAt = st.StartedAt.Add(time.Duration(st.DurationSec * float64(time.Second)))
@@ -571,9 +615,20 @@ func (s *Server) handleTeamDAG(w http.ResponseWriter, r *http.Request, name stri
 		}
 		if cp, ok := cpMap[st.Name]; ok {
 			stage.Attempts = cp.Attempt
+			stage.CheckpointStatus = cp.Status
+			stage.CheckpointSaved = cp.SavedAt
+			stage.CheckpointError = cp.Error
 			// checkpoint 的 status 比 stage.status 更实时 (stage.status 只有跑完才覆盖)
 			if cp.Status != "" && stage.Status == "" {
 				stage.Status = cp.Status
+			}
+		}
+		// 如果 stage 名称是 "adversary-roundN" / "eval-roundN" 模式, 关联对抗回合
+		if r := extractRoundFromStageName(st.Name); r > 0 {
+			if adv, ok := advByRound[r]; ok {
+				stage.AdversaryRound = adv.Round
+				stage.AdversaryScore = adv.AvgScore
+				stage.AdversaryPassed = adv.Passed
 			}
 		}
 		resp.Stages = append(resp.Stages, stage)
@@ -583,16 +638,67 @@ func (s *Server) handleTeamDAG(w http.ResponseWriter, r *http.Request, name stri
 	if len(resp.Stages) == 0 {
 		if wf := agent.GetWorkflow(detail.Workflow); wf != nil {
 			for _, st := range wf.Stages {
+				meta := wfMap[st.Name]
 				resp.Stages = append(resp.Stages, dagStageDTO{
 					Name: st.Name, Role: st.Role, Status: "pending",
-					DependsOn: append([]string(nil), st.DependsOn...),
-					Parallel:  st.Parallel,
+					DependsOn:      meta.DependsOn,
+					Parallel:       st.Parallel,
+					TaskBrief:      meta.Brief,
+					AssignedAgents: meta.Agents,
 				})
 			}
 			resp.Source = "workflow_def (未启动)"
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// stageBriefFromPrompt 从 workflow prompt 中抽取一条短摘要 (≤ 160 字符)。
+// 很多 stage 的 prompt 开头是 "你是 XXX, 负责 ...", 取首句即可。
+func stageBriefFromPrompt(prompt string) string {
+	s := strings.TrimSpace(prompt)
+	if s == "" {
+		return ""
+	}
+	// 尝试第一行
+	if idx := strings.IndexAny(s, "\n\r"); idx > 0 {
+		s = s[:idx]
+	}
+	if n := len([]rune(s)); n > 160 {
+		s = string([]rune(s)[:160]) + "…"
+	}
+	return s
+}
+
+// extractRoundFromStageName 从 stage 名称中抽 round 编号, 形如:
+//   "adversary-round2" -> 2
+//   "eval-round-3"     -> 3
+//   "round 1 review"   -> 1
+// 没匹配到返回 0。
+func extractRoundFromStageName(name string) int {
+	lower := strings.ToLower(name)
+	keywords := []string{"round", "eval-round", "adversary-round"}
+	for _, kw := range keywords {
+		idx := strings.Index(lower, kw)
+		if idx < 0 {
+			continue
+		}
+		rest := lower[idx+len(kw):]
+		n := 0
+		started := false
+		for _, c := range rest {
+			if c >= '0' && c <= '9' {
+				n = n*10 + int(c-'0')
+				started = true
+			} else if started {
+				break
+			}
+		}
+		if n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // ────────────────────────────────────────────────────────────────────────
