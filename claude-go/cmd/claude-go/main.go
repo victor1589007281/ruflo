@@ -30,8 +30,10 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/commands"
+	"github.com/anthropic/claude-go/pkg/dashboard"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/settings"
 	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
@@ -199,6 +201,7 @@ func main() {
 	rootCmd.AddCommand(toolsCmd())
 	rootCmd.AddCommand(skillsCmd())
 	rootCmd.AddCommand(rolesCmd())
+	rootCmd.AddCommand(dashboardCmd())
 	rootCmd.AddCommand(helpCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -790,6 +793,310 @@ func rolesCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// dashboardCmd 拉起本地只读可视化 dashboard (支持 run/start/stop/status/open)。
+func dashboardCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "dashboard",
+		Short: "本地 Web Dashboard (只读可视化)",
+		Long: `本地 Dashboard 聚合展示 claude-go 的运行状态与质量数据:
+
+  • 团队运行 (workflow / stages / 对抗循环 Eval / 时间线 / 产出)
+  • 持续观测指标 (team / evolution / dreaming / memory / task, 含趋势与 CSV 导出)
+  • Cron 定时任务 (最近执行、成功率)
+  • Dreaming 记忆整理 (压缩率、dream 日志、topic treemap)
+  • Evolution 进化机制 (经验库、轨迹、质量分布、热力图)
+  • 智能诊断 (本地规则, 不经 LLM)
+  • 多项目切换 (扫描父级或自定义 root)
+
+默认仅监听 127.0.0.1, 不暴露到外网。所有数据均来自本地 .claude-go/ 目录,
+Dashboard 不会写入任何文件。
+
+子命令:
+  run       前台运行 (默认, 按 Ctrl+C 退出)
+  start     后台启动 (daemon), pid 记录在 .claude-go/.dashboard/dashboard.pid
+  stop      停止后台进程
+  status    查看后台进程状态
+  open      打开浏览器访问当前运行的 Dashboard`,
+		Example: `  claude-go dashboard             # 前台运行 (默认)
+  claude-go dashboard start       # 后台启动
+  claude-go dashboard status      # 查看状态
+  claude-go dashboard stop        # 停止
+  claude-go dashboard open        # 浏览器打开`,
+	}
+	cmd.AddCommand(dashboardRunCmd())
+	cmd.AddCommand(dashboardStartCmd())
+	cmd.AddCommand(dashboardStopCmd())
+	cmd.AddCommand(dashboardStatusCmd())
+	cmd.AddCommand(dashboardOpenCmd())
+
+	// 兼容旧行为: 无子命令时等价于 run (保留 flags 传参)
+	var (
+		addr     string
+		port     int
+		stateDir string
+		noOpen   bool
+	)
+	cmd.Flags().StringVar(&addr, "addr", "", "监听地址 (如 127.0.0.1:7777), 与 --port 二选一")
+	cmd.Flags().IntVar(&port, "port", 7777, "监听端口 (默认绑定 127.0.0.1)")
+	cmd.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认当前工作目录下的 .claude-go)")
+	cmd.Flags().BoolVar(&noOpen, "no-open", false, "不自动打开浏览器")
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		return runDashboardForeground(addr, port, stateDir, noOpen)
+	}
+	return cmd
+}
+
+func dashboardRunCmd() *cobra.Command {
+	var (
+		addr     string
+		port     int
+		stateDir string
+		noOpen   bool
+	)
+	c := &cobra.Command{
+		Use:   "run",
+		Short: "前台运行 Dashboard (Ctrl+C 退出)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runDashboardForeground(addr, port, stateDir, noOpen)
+		},
+	}
+	c.Flags().StringVar(&addr, "addr", "", "监听地址 (如 127.0.0.1:7777)")
+	c.Flags().IntVar(&port, "port", 7777, "监听端口 (自动顺延至可用)")
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().BoolVar(&noOpen, "no-open", false, "不自动打开浏览器")
+	return c
+}
+
+func dashboardStartCmd() *cobra.Command {
+	var (
+		port     int
+		stateDir string
+		noOpen   bool
+	)
+	c := &cobra.Command{
+		Use:   "start",
+		Short: "后台启动 Dashboard (daemon)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			resolved := basedir.ResolveDefault(stateDir, cwd)
+			// 已在跑则拒绝
+			if st, _ := dashboard.QueryStatus(resolved); st.Running {
+				fmt.Printf("已在运行: pid=%d %s\n", st.PID, st.URL)
+				return nil
+			}
+			freePort := dashboard.FindFreePort(port)
+			bindAddr := fmt.Sprintf("127.0.0.1:%d", freePort)
+			exe, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			logPath := dashboard.LogFilePath(resolved)
+			logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if err != nil {
+				return fmt.Errorf("打开日志: %w", err)
+			}
+			defer logFile.Close()
+
+			// 启动子进程: claude-go dashboard run --addr ... --state-dir ... --no-open, 设置 detach 标记
+			args2 := []string{"dashboard", "run",
+				"--addr", bindAddr,
+				"--state-dir", resolved,
+				"--no-open",
+			}
+			subCmd := exec.Command(exe, args2...)
+			subCmd.Stdout = logFile
+			subCmd.Stderr = logFile
+			subCmd.Stdin = nil
+			// detach: 新 session, 让父退出后子进程继续运行
+			subCmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+			subCmd.Env = append(os.Environ(), "CLAUDE_GO_DASHBOARD_DAEMON=1")
+			if err := subCmd.Start(); err != nil {
+				return fmt.Errorf("启动失败: %w", err)
+			}
+			// 写 pid 文件
+			_ = dashboard.WritePIDFile(resolved, dashboard.PIDFile{
+				PID:       subCmd.Process.Pid,
+				Port:      freePort,
+				Addr:      bindAddr,
+				StartedAt: time.Now(),
+				StateDir:  resolved,
+				LogFile:   logPath,
+			})
+			// 等 0.5s 让端口就绪
+			time.Sleep(500 * time.Millisecond)
+			fmt.Printf("\n🚀 Dashboard 已后台启动\n")
+			fmt.Printf("   URL      : http://%s\n", bindAddr)
+			fmt.Printf("   PID      : %d\n", subCmd.Process.Pid)
+			fmt.Printf("   StateDir : %s\n", resolved)
+			fmt.Printf("   Log      : %s\n", logPath)
+			fmt.Printf("   停止     : claude-go dashboard stop\n\n")
+			if !noOpen {
+				_ = openBrowser("http://" + bindAddr)
+			}
+			return nil
+		},
+	}
+	c.Flags().IntVar(&port, "port", 7777, "期望端口 (占用时自动顺延)")
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().BoolVar(&noOpen, "no-open", false, "不自动打开浏览器")
+	return c
+}
+
+func dashboardStopCmd() *cobra.Command {
+	var stateDir string
+	c := &cobra.Command{
+		Use:   "stop",
+		Short: "停止后台 Dashboard 进程",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			resolved := basedir.ResolveDefault(stateDir, cwd)
+			st, err := dashboard.StopDaemon(resolved)
+			if err != nil {
+				return err
+			}
+			if st.PID == 0 {
+				fmt.Println("没有运行中的 Dashboard 后台进程")
+				return nil
+			}
+			fmt.Printf("已停止 Dashboard (pid=%d)\n", st.PID)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	return c
+}
+
+func dashboardStatusCmd() *cobra.Command {
+	var (
+		stateDir string
+		asJSON   bool
+	)
+	c := &cobra.Command{
+		Use:   "status",
+		Short: "查看后台 Dashboard 状态",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			resolved := basedir.ResolveDefault(stateDir, cwd)
+			st, _ := dashboard.QueryStatus(resolved)
+			if asJSON {
+				b, _ := json.MarshalIndent(st, "", "  ")
+				fmt.Println(string(b))
+				return nil
+			}
+			if !st.Running {
+				fmt.Println("状态      : 未运行")
+				if st.PID > 0 {
+					fmt.Printf("残留 PID  : %d (可能已崩溃, 使用 stop 清理)\n", st.PID)
+				}
+				fmt.Printf("StateDir  : %s\n", resolved)
+				return nil
+			}
+			fmt.Println("状态      : 运行中")
+			fmt.Printf("PID       : %d\n", st.PID)
+			fmt.Printf("URL       : %s\n", st.URL)
+			fmt.Printf("Uptime    : %s\n", st.Uptime)
+			fmt.Printf("StateDir  : %s\n", st.StateDir)
+			if st.LogFile != "" {
+				fmt.Printf("Log       : %s\n", st.LogFile)
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().BoolVar(&asJSON, "json", false, "以 JSON 输出")
+	return c
+}
+
+func dashboardOpenCmd() *cobra.Command {
+	var stateDir string
+	c := &cobra.Command{
+		Use:   "open",
+		Short: "在浏览器打开当前运行的 Dashboard",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			resolved := basedir.ResolveDefault(stateDir, cwd)
+			st, _ := dashboard.QueryStatus(resolved)
+			if !st.Running {
+				return fmt.Errorf("没有运行中的 Dashboard, 请先执行: claude-go dashboard start")
+			}
+			return openBrowser(st.URL)
+		},
+	}
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	return c
+}
+
+// runDashboardForeground 前台阻塞运行 dashboard。
+func runDashboardForeground(addr string, port int, stateDir string, noOpen bool) error {
+	cwd, _ := os.Getwd()
+	resolved := basedir.ResolveDefault(stateDir, cwd)
+
+	bindAddr := addr
+	if bindAddr == "" {
+		if port == 0 {
+			port = 7777
+		}
+		free := dashboard.FindFreePort(port)
+		bindAddr = fmt.Sprintf("127.0.0.1:%d", free)
+	}
+
+	srv := dashboard.NewServer(dashboard.Config{
+		StateDir: resolved,
+		Addr:     bindAddr,
+		CacheTTL: 2 * time.Second,
+	})
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	url := fmt.Sprintf("http://%s", bindAddr)
+	if os.Getenv("CLAUDE_GO_DASHBOARD_DAEMON") == "" {
+		fmt.Printf("\n🚀 Claude-Go Dashboard 已启动\n")
+		fmt.Printf("   URL       : %s\n", url)
+		fmt.Printf("   StateDir  : %s\n", resolved)
+		fmt.Printf("   Mode      : 只读\n")
+		fmt.Printf("   按 Ctrl+C 退出\n\n")
+		if !noOpen {
+			_ = openBrowser(url)
+		}
+	} else {
+		fmt.Printf("[dashboard daemon] url=%s stateDir=%s\n", url, resolved)
+	}
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer shutdownCancel()
+		if err := srv.Stop(shutdownCtx); err != nil {
+			return fmt.Errorf("shutdown: %w", err)
+		}
+		return nil
+	case err := <-errCh:
+		return err
+	}
+}
+
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch {
+	case fileExists("/usr/bin/open"):
+		cmd = exec.Command("open", url)
+	case fileExists("/usr/bin/xdg-open"), fileExists("/usr/local/bin/xdg-open"):
+		cmd = exec.Command("xdg-open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func buildEngine() (*engine.QueryEngine, error) {

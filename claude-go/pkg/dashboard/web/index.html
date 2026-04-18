@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude-Go Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="/static/chart.umd.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">CG</div>
+        <div class="brand-text">
+          <div class="brand-title">Claude-Go</div>
+          <div class="brand-sub">Dashboard</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <a class="nav-item" data-route="/">
+          <span class="nav-icon">⌂</span>
+          <span class="nav-label">概览</span>
+        </a>
+        <a class="nav-item" data-route="/teams">
+          <span class="nav-icon">⚙</span>
+          <span class="nav-label">团队</span>
+        </a>
+        <a class="nav-item" data-route="/metrics">
+          <span class="nav-icon">∿</span>
+          <span class="nav-label">指标</span>
+        </a>
+        <a class="nav-item" data-route="/cron">
+          <span class="nav-icon">⏲</span>
+          <span class="nav-label">Cron</span>
+        </a>
+        <a class="nav-item" data-route="/dreaming">
+          <span class="nav-icon">☾</span>
+          <span class="nav-label">Dreaming</span>
+        </a>
+        <a class="nav-item" data-route="/evolution">
+          <span class="nav-icon">✺</span>
+          <span class="nav-label">Evolution</span>
+        </a>
+        <a class="nav-item" data-route="/tasks">
+          <span class="nav-icon">☰</span>
+          <span class="nav-label">Tasks</span>
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div id="health-indicator" class="health">
+          <span class="health-dot"></span>
+          <span class="health-text">连接中…</span>
+        </div>
+        <div class="footer-hint">只读视图 · v1.0</div>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header class="topbar">
+        <div id="page-title" class="page-title">加载中…</div>
+        <div class="topbar-actions">
+          <select id="project-switcher" class="select" title="切换项目">
+            <option value="">(当前项目)</option>
+          </select>
+          <span id="refresh-status" class="muted"></span>
+          <button id="stream-btn" class="btn ghost" title="订阅实时推送 (SSE)">实时</button>
+          <button id="refresh-btn" class="btn">刷新</button>
+        </div>
+      </header>
+      <div id="view" class="view">
+        <div class="loading">加载中…</div>
+      </div>
+    </main>
+  </div>
+</body>
+</html>
