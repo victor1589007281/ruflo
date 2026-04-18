@@ -232,6 +232,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	}
 	// 打上业务标签: 飞书 bot 发起的 LLM 调用在 dashboard 中可按 source=feishu 聚合
 	aiClient.Tag = "feishu"
+	if len(config.FallbackModels) > 0 {
+		aiClient.FallbackModels = config.FallbackModels
+		log.Printf("[Bot] 已配置 %d 个备用模型: %v", len(config.FallbackModels), config.FallbackModels)
+	}
 
 	// 初始化统一目录布局
 	stateRoot := basedir.ResolveDefault(config.StateDir, config.Cwd)

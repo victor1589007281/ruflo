@@ -44,7 +44,7 @@ import (
 	"time"
 )
 
-// Experience 经验条目。
+// Experience 经验条目 (V2: 结构化+生命周期+注入追踪)。
 type Experience struct {
 	ID           string    `json:"id"`
 	Category     string    `json:"category"`              // "role", "error", "general"
@@ -57,6 +57,19 @@ type Experience struct {
 	Source       string    `json:"source"`                 // 来源 (team/stage)
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`
+
+	// V2 新增字段
+	Pattern    string   `json:"pattern,omitempty"`    // "strategy"|"pattern"|"antidote"|"evidence"
+	Lifecycle  string   `json:"lifecycle,omitempty"`  // "proposed"|"validated"|"promoted"|"active"|"decaying"|"archived"
+	SourceTeam string   `json:"sourceTeam,omitempty"` // 来源团队 (跨团队迁移追踪)
+	MinHashSig []uint64 `json:"minHash,omitempty"`    // MinHash 签名 (快速去重)
+
+	// 注入效果追踪 (参考 Live-Evo 动态权重)
+	InjectionCount   int `json:"injectionCount,omitempty"`   // 被注入次数
+	InjectionSuccess int `json:"injectionSuccess,omitempty"` // 注入后成功次数
+
+	// UCB 选择辅助
+	SelectionCount int `json:"selectionCount,omitempty"` // 被 UCB 选中次数 (含探索)
 }
 
 // SuccessRate 成功率。
@@ -65,6 +78,24 @@ func (e *Experience) SuccessRate() float64 {
 		return 0.5
 	}
 	return float64(e.SuccessCount) / float64(e.UsageCount)
+}
+
+// InjectionUplift 注入效果: 注入后成功率。
+func (e *Experience) InjectionUplift() float64 {
+	if e.InjectionCount == 0 {
+		return 0.5
+	}
+	return float64(e.InjectionSuccess) / float64(e.InjectionCount)
+}
+
+// InjectionRecord 注入追踪记录。
+type InjectionRecord struct {
+	ExpIDs    []string  `json:"expIds"`
+	TaskID    string    `json:"taskId"`
+	TeamName  string    `json:"teamName"`
+	Role      string    `json:"role"`
+	Success   bool      `json:"success"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // Trajectory 执行轨迹。
@@ -82,14 +113,21 @@ type Trajectory struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// EvolutionEngine 自动进化引擎。
+// EvolutionEngine 自动进化引擎 (V2: 注入追踪+MinHash+UCB+生命周期)。
 type EvolutionEngine struct {
 	experiences  []*Experience
 	trajectories []Trajectory
+	injections   []InjectionRecord // V2: 注入效果追踪
 	llm          LLMClient
 	dataDir      string
 	mu           sync.RWMutex
 	nextID       int
+
+	// V2 统计缓存
+	totalSelections int     // UCB 全局选择计数
+	totalDistilled  int     // 历史提炼总数 (用于 survival_rate)
+	baselineSuccess float64 // 无注入的基线成功率 (滑动窗口)
+	baselineTotal   int     // 基线样本数
 }
 
 // NewEvolutionEngine 创建进化引擎。
@@ -99,7 +137,36 @@ func NewEvolutionEngine(dataDir string, llm LLMClient) *EvolutionEngine {
 		dataDir: dataDir,
 	}
 	ee.load()
+	ee.migrateV2Fields()
 	return ee
+}
+
+// migrateV2Fields 为旧数据补充 V2 新字段默认值。
+func (ee *EvolutionEngine) migrateV2Fields() {
+	for _, exp := range ee.experiences {
+		if exp.Lifecycle == "" {
+			if exp.Quality >= 0.6 && exp.UsageCount > 0 {
+				exp.Lifecycle = "active"
+			} else if exp.Quality >= 0.3 {
+				exp.Lifecycle = "validated"
+			} else {
+				exp.Lifecycle = "proposed"
+			}
+		}
+		if exp.Pattern == "" {
+			switch exp.Category {
+			case "error":
+				exp.Pattern = "antidote"
+			case "role":
+				exp.Pattern = "strategy"
+			default:
+				exp.Pattern = "pattern"
+			}
+		}
+		if len(exp.MinHashSig) == 0 {
+			exp.MinHashSig = computeMinHash(evolutionTokenize(exp.Content), 64)
+		}
+	}
 }
 
 // --- RECORD: 记录执行轨迹 ---
@@ -181,38 +248,46 @@ func (ee *EvolutionEngine) LearnFromStage(traj Trajectory) {
 	defer ee.mu.Unlock()
 
 	if traj.Error != "" && !traj.Success {
-		// 失败学习: 根因+错误模式+修复方向
 		content := fmt.Sprintf("[%s] 执行「%s」失败: %s → 建议: 检查参数和前置依赖",
 			traj.Role, truncateResult(traj.Objective, 80), truncateResult(traj.Error, 150))
 		if !ee.isDuplicate(content) {
 			ee.nextID++
+			ee.totalDistilled++
 			ee.experiences = append(ee.experiences, &Experience{
-				ID:        fmt.Sprintf("exp-inc-%d-%d", time.Now().Unix(), ee.nextID),
-				Category:  "error",
-				Role:      traj.Role,
-				Content:   content,
-				Quality:   0.4,
-				Source:    traj.TeamName + "/" + traj.StageName,
-				Tags:      []string{traj.Role, "incremental", "failure"},
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
+				ID:         fmt.Sprintf("exp-inc-%d-%d", time.Now().Unix(), ee.nextID),
+				Category:   "error",
+				Role:       traj.Role,
+				Content:    content,
+				Quality:    0.4,
+				Source:     traj.TeamName + "/" + traj.StageName,
+				Tags:       []string{traj.Role, "incremental", "failure"},
+				Pattern:    "antidote",
+				Lifecycle:  "proposed",
+				SourceTeam: traj.TeamName,
+				MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
+				CreatedAt:  time.Now(),
+				UpdatedAt:  time.Now(),
 			})
 		}
 	} else if traj.Success && traj.Output != "" && len(traj.Output) > 100 {
-		// 成功学习 (参考 MiniMax M2.7 self-evolution): 提炼 what-worked
 		content := ee.distillSuccessHeuristic(traj)
 		if content != "" && !ee.isDuplicate(content) {
 			ee.nextID++
+			ee.totalDistilled++
 			ee.experiences = append(ee.experiences, &Experience{
-				ID:        fmt.Sprintf("exp-suc-%d-%d", time.Now().Unix(), ee.nextID),
-				Category:  "role",
-				Role:      traj.Role,
-				Content:   content,
-				Quality:   0.6,
-				Source:    traj.TeamName + "/" + traj.StageName,
-				Tags:      []string{traj.Role, "incremental", "success"},
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
+				ID:         fmt.Sprintf("exp-suc-%d-%d", time.Now().Unix(), ee.nextID),
+				Category:   "role",
+				Role:       traj.Role,
+				Content:    content,
+				Quality:    0.6,
+				Source:     traj.TeamName + "/" + traj.StageName,
+				Tags:       []string{traj.Role, "incremental", "success"},
+				Pattern:    "strategy",
+				Lifecycle:  "proposed",
+				SourceTeam: traj.TeamName,
+				MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
+				CreatedAt:  time.Now(),
+				UpdatedAt:  time.Now(),
 			})
 		}
 	}
@@ -330,16 +405,28 @@ func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, t
 		}
 
 		ee.nextID++
+		ee.totalDistilled++
+		pattern := "pattern"
+		switch ext.Category {
+		case "error":
+			pattern = "antidote"
+		case "role":
+			pattern = "strategy"
+		}
 		exp := &Experience{
-			ID:        fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
-			Category:  ext.Category,
-			Role:      ext.Role,
-			Content:   ext.Content,
-			Quality:   0.5, // 初始质量
-			Tags:      ext.Tags,
-			Source:     teamName,
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
+			ID:         fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
+			Category:   ext.Category,
+			Role:       ext.Role,
+			Content:    ext.Content,
+			Quality:    0.5,
+			Tags:       ext.Tags,
+			Source:      teamName,
+			Pattern:    pattern,
+			Lifecycle:  "proposed",
+			SourceTeam: teamName,
+			MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(ext.Content)), 64),
+			CreatedAt:  time.Now(),
+			UpdatedAt:  time.Now(),
 		}
 		ee.experiences = append(ee.experiences, exp)
 	}
@@ -361,16 +448,21 @@ func (ee *EvolutionEngine) heuristicDistill(trajs []Trajectory, teamName string)
 				suggestFix(errorType, t.Error))
 			if !ee.isDuplicate(content) {
 				ee.nextID++
+				ee.totalDistilled++
 				ee.experiences = append(ee.experiences, &Experience{
-					ID:        fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
-					Category:  "error",
-					Role:      t.Role,
-					Content:   content,
-					Quality:   0.4,
-					Source:    teamName,
-					Tags:      []string{t.Role, "error", errorType},
-					CreatedAt: time.Now(),
-					UpdatedAt: time.Now(),
+					ID:         fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
+					Category:   "error",
+					Role:       t.Role,
+					Content:    content,
+					Quality:    0.4,
+					Source:     teamName,
+					Tags:       []string{t.Role, "error", errorType},
+					Pattern:    "antidote",
+					Lifecycle:  "proposed",
+					SourceTeam: teamName,
+					MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
+					CreatedAt:  time.Now(),
+					UpdatedAt:  time.Now(),
 				})
 			}
 		}
@@ -380,16 +472,21 @@ func (ee *EvolutionEngine) heuristicDistill(trajs []Trajectory, teamName string)
 				t.Role, t.StageName, truncateResult(t.Objective, 100), t.Duration)
 			if !ee.isDuplicate(content) {
 				ee.nextID++
+				ee.totalDistilled++
 				ee.experiences = append(ee.experiences, &Experience{
-					ID:        fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
-					Category:  "role",
-					Role:      t.Role,
-					Content:   content,
-					Quality:   0.5,
-					Source:    teamName,
-					Tags:      []string{t.Role, "success"},
-					CreatedAt: time.Now(),
-					UpdatedAt: time.Now(),
+					ID:         fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
+					Category:   "role",
+					Role:       t.Role,
+					Content:    content,
+					Quality:    0.5,
+					Source:     teamName,
+					Tags:       []string{t.Role, "success"},
+					Pattern:    "strategy",
+					Lifecycle:  "proposed",
+					SourceTeam: teamName,
+					MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
+					CreatedAt:  time.Now(),
+					UpdatedAt:  time.Now(),
 				})
 			}
 		}
@@ -432,21 +529,151 @@ func suggestFix(errorType, _ string) string {
 }
 
 func (ee *EvolutionEngine) isDuplicate(content string) bool {
-	contentLower := strings.ToLower(content)
+	tokens := evolutionTokenize(strings.ToLower(content))
+	sig := computeMinHash(tokens, 64)
 	for _, existing := range ee.experiences {
-		existingLower := strings.ToLower(existing.Content)
-		// Jaccard 近似去重 (快速)
-		if jaccardSimilarity(contentLower, existingLower) > 0.7 {
-			return true
+		// 先用 MinHash 快速筛选, 再精确验证
+		if len(existing.MinHashSig) > 0 && minHashSimilarity(sig, existing.MinHashSig) > 0.6 {
+			if jaccardSimilarity(strings.ToLower(content), strings.ToLower(existing.Content)) > 0.7 {
+				return true
+			}
+		} else if len(existing.MinHashSig) == 0 {
+			if jaccardSimilarity(strings.ToLower(content), strings.ToLower(existing.Content)) > 0.7 {
+				return true
+			}
 		}
 	}
 	return false
 }
 
+// RecordInjection 记录一次经验注入 (V2: 注入效果追踪)。
+func (ee *EvolutionEngine) RecordInjection(expIDs []string, taskID, teamName, role string, success bool) {
+	ee.mu.Lock()
+	defer ee.mu.Unlock()
+
+	rec := InjectionRecord{
+		ExpIDs:    expIDs,
+		TaskID:    taskID,
+		TeamName:  teamName,
+		Role:      role,
+		Success:   success,
+		Timestamp: time.Now(),
+	}
+	ee.injections = append(ee.injections, rec)
+	if len(ee.injections) > 2000 {
+		ee.injections = ee.injections[len(ee.injections)-2000:]
+	}
+
+	// 更新每条经验的注入统计
+	for _, id := range expIDs {
+		for _, exp := range ee.experiences {
+			if exp.ID == id {
+				exp.InjectionCount++
+				if success {
+					exp.InjectionSuccess++
+				}
+				break
+			}
+		}
+	}
+
+	ee.persistInjections()
+}
+
+// InjectionUpliftGlobal 全局注入提升率 (V2指标: evo_injection_uplift)。
+// Uplift = P(success|injected) - P(success|baseline)
+func (ee *EvolutionEngine) InjectionUpliftGlobal() float64 {
+	ee.mu.RLock()
+	defer ee.mu.RUnlock()
+
+	if len(ee.injections) == 0 {
+		return 0
+	}
+	injSuccess, injTotal := 0, 0
+	for _, r := range ee.injections {
+		if len(r.ExpIDs) > 0 {
+			injTotal++
+			if r.Success {
+				injSuccess++
+			}
+		}
+	}
+	if injTotal == 0 {
+		return 0
+	}
+	injRate := float64(injSuccess) / float64(injTotal)
+	baseline := ee.baselineSuccess
+	if baseline == 0 {
+		baseline = 0.5 // 默认基线
+	}
+	return injRate - baseline
+}
+
+// UpdateBaseline 更新无注入的基线成功率 (用于 Uplift 计算)。
+func (ee *EvolutionEngine) UpdateBaseline(success bool) {
+	ee.mu.Lock()
+	defer ee.mu.Unlock()
+	ee.baselineTotal++
+	if success {
+		alpha := 0.1
+		ee.baselineSuccess = (1-alpha)*ee.baselineSuccess + alpha*1.0
+	} else {
+		alpha := 0.1
+		ee.baselineSuccess = (1-alpha)*ee.baselineSuccess + alpha*0.0
+	}
+}
+
+// LearnCounterfactual 反事实学习 (V2 P6): 从失败轨迹生成 "如果…会更好" 的假设。
+func (ee *EvolutionEngine) LearnCounterfactual(traj Trajectory) {
+	if traj.Success || traj.Error == "" {
+		return
+	}
+	ee.mu.Lock()
+	defer ee.mu.Unlock()
+
+	errType := classifyError(traj.Error)
+	fix := suggestFix(errType, traj.Error)
+	content := fmt.Sprintf("[反事实] %s 执行「%s」失败(%s), 如果采用以下策略可能更好: %s",
+		traj.Role, truncateResult(traj.Objective, 60), errType, fix)
+
+	if !ee.isDuplicate(content) {
+		ee.nextID++
+		ee.experiences = append(ee.experiences, &Experience{
+			ID:        fmt.Sprintf("exp-cf-%d-%d", time.Now().Unix(), ee.nextID),
+			Category:  "general",
+			Role:      traj.Role,
+			Content:   content,
+			Quality:   0.35,
+			Source:    traj.TeamName + "/" + traj.StageName,
+			Tags:      []string{traj.Role, "counterfactual", errType},
+			Pattern:   "strategy",
+			Lifecycle: "proposed",
+			SourceTeam: traj.TeamName,
+			MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		})
+		ee.totalDistilled++
+	}
+}
+
+// persistInjections 持久化注入记录。
+func (ee *EvolutionEngine) persistInjections() {
+	if ee.dataDir == "" {
+		return
+	}
+	_ = os.MkdirAll(ee.dataDir, 0755)
+	data, err := json.MarshalIndent(ee.injections, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(ee.dataDir, "injections.json"), data, 0644)
+}
+
 // --- RETRIEVE: 检索相关经验 ---
 
 // RetrieveFor 按角色和目标检索相关经验。
-// 使用 BM25+IDF + 角色匹配 + 质量加权 + 成功率 + 结果去重。
+// V2: BM25+IDF + 同义词扩展 + UCB探索/利用 + 注入Uplift加权 + 生命周期过滤。
 func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Experience {
 	if topK <= 0 {
 		topK = 5
@@ -459,12 +686,13 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 		return nil
 	}
 
+	// V2: 同义词扩展查询词
 	queryTerms := evolutionTokenize(objective)
+	queryTerms = expandSynonyms(queryTerms)
 	if len(queryTerms) == 0 {
 		return nil
 	}
 
-	// 构建 IDF: 统计每个 term 在多少文档中出现
 	docCount := float64(len(ee.experiences))
 	docFreq := make(map[string]int)
 	allDocTerms := make([][]string, len(ee.experiences))
@@ -487,21 +715,20 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 	var candidates []scored
 
 	for i, exp := range ee.experiences {
-		// v2: 降低质量门槛 (0.15→0.05), 让更多经验有被检索的机会
-		// 参考: 人类学习中"看似无用的经验"在新情境下可能变得有价值
+		// V2: 生命周期过滤 — 仅检索 validated/promoted/active
+		if exp.Lifecycle == "archived" || exp.Lifecycle == "decaying" {
+			continue
+		}
 		if exp.Quality < 0.05 {
 			continue
 		}
 
 		expTerms := allDocTerms[i]
-
-		// BM25 + IDF 加权
 		bm25 := bm25WithIDF(queryTerms, expTerms, docFreq, docCount)
-		if bm25 < 0.005 { // v2: 降低 BM25 门槛
+		if bm25 < 0.005 {
 			continue
 		}
 
-		// 角色匹配加权
 		roleBoost := 1.0
 		if role != "" && strings.EqualFold(exp.Role, role) {
 			roleBoost = 2.0
@@ -510,17 +737,38 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 			roleBoost = math.Max(roleBoost, 1.3)
 		}
 
-		// 质量加权 (参考 Live-Evo: 有效经验增强)
 		qualityWeight := 0.5 + exp.Quality*0.5
-
-		// 成功率加权: 高成功率的经验更有价值
 		successBoost := 1.0 + exp.SuccessRate()*0.5
 
-		// 新鲜度衰减
-		hoursSince := time.Since(exp.UpdatedAt).Hours()
-		freshness := 1.0 / (1.0 + hoursSince/720.0) // 30天半衰期
+		// V2: 注入效果加权 (参考 Live-Evo 动态权重)
+		upliftBoost := 1.0
+		if exp.InjectionCount >= 3 {
+			upliftBoost = 0.5 + exp.InjectionUplift()
+		}
 
-		score := bm25 * roleBoost * qualityWeight * successBoost * (1.0 + freshness)
+		// V2: 生命周期加权 — promoted/active 经验加分
+		lifecycleBoost := 1.0
+		switch exp.Lifecycle {
+		case "active":
+			lifecycleBoost = 1.3
+		case "promoted":
+			lifecycleBoost = 1.2
+		case "proposed":
+			lifecycleBoost = 0.8
+		}
+
+		hoursSince := time.Since(exp.UpdatedAt).Hours()
+		freshness := 1.0 / (1.0 + hoursSince/720.0)
+
+		score := bm25 * roleBoost * qualityWeight * successBoost * upliftBoost * lifecycleBoost * (1.0 + freshness)
+
+		// V2: UCB 探索加分 (参考 Bandit: 少使用的经验获得探索奖励)
+		if ee.totalSelections > 0 && exp.SelectionCount >= 0 {
+			c := 1.0
+			ucbBonus := c * math.Sqrt(math.Log(float64(ee.totalSelections+1))/float64(exp.SelectionCount+1))
+			score += ucbBonus * 0.1
+		}
+
 		candidates = append(candidates, scored{exp, score})
 	}
 
@@ -528,12 +776,17 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 		return candidates[i].score > candidates[j].score
 	})
 
-	// 去重: 移除内容高度相似的经验（保留分数更高的）
+	// V2: MinHash 加速去重 (替代部分 Jaccard)
 	var deduped []scored
 	for _, c := range candidates {
 		isDup := false
 		for _, d := range deduped {
-			if jaccardSimilarity(strings.ToLower(c.exp.Content), strings.ToLower(d.exp.Content)) > 0.6 {
+			if len(c.exp.MinHashSig) > 0 && len(d.exp.MinHashSig) > 0 {
+				if minHashSimilarity(c.exp.MinHashSig, d.exp.MinHashSig) > 0.5 {
+					isDup = true
+					break
+				}
+			} else if jaccardSimilarity(strings.ToLower(c.exp.Content), strings.ToLower(d.exp.Content)) > 0.6 {
 				isDup = true
 				break
 			}
@@ -546,14 +799,53 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 		}
 	}
 
-	// 更新使用计数 (EVOLVE: 标记被检索的经验)
 	result := make([]*Experience, len(deduped))
 	for i, c := range deduped {
 		c.exp.UsageCount++
+		c.exp.SelectionCount++
 		c.exp.UpdatedAt = time.Now()
 		result[i] = c.exp
 	}
+	ee.totalSelections += len(result)
 	return result
+}
+
+// synonymMap 中英文同义词表 (V2: 检索增强)。
+var synonymMap = map[string][]string{
+	"error":       {"错误", "异常", "失败", "bug"},
+	"handling":    {"处理", "解决", "修复"},
+	"concurrent":  {"并发", "并行", "goroutine"},
+	"timeout":     {"超时", "deadline"},
+	"api":         {"接口", "endpoint", "服务"},
+	"database":    {"数据库", "存储", "db"},
+	"test":        {"测试", "验证", "检验"},
+	"performance": {"性能", "优化", "效率"},
+	"security":    {"安全", "权限", "认证"},
+	"design":      {"设计", "架构", "方案"},
+}
+
+// expandSynonyms 同义词扩展查询词 (V2 P4)。
+func expandSynonyms(terms []string) []string {
+	expanded := make([]string, 0, len(terms)*2)
+	seen := make(map[string]bool)
+	for _, t := range terms {
+		if !seen[t] {
+			expanded = append(expanded, t)
+			seen[t] = true
+		}
+		if syns, ok := synonymMap[t]; ok {
+			for _, syn := range syns {
+				synTokens := evolutionTokenize(syn)
+				for _, st := range synTokens {
+					if !seen[st] {
+						expanded = append(expanded, st)
+						seen[st] = true
+					}
+				}
+			}
+		}
+	}
+	return expanded
 }
 
 // FormatForPrompt 格式化经验为 Agent 可用的 prompt 段。
@@ -626,8 +918,7 @@ func (ee *EvolutionEngine) RecordBatchFeedback(expIDs []string, success bool) {
 
 // --- CONSOLIDATE: 去重 + 剪枝 + 晋升 ---
 
-// Consolidate 整理经验库。参考 ruflo v3 ReasoningBank.consolidate()。
-// 在后台定期调用 (或团队完成后调用)。
+// Consolidate 整理经验库 (V2: MinHash+LSH去重 + 生命周期状态机 + 晋升/淘汰)。
 func (ee *EvolutionEngine) Consolidate() {
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
@@ -638,13 +929,11 @@ func (ee *EvolutionEngine) Consolidate() {
 
 	before := len(ee.experiences)
 
-	// 1. 剪枝 + 时间衰减 (v2: 参考人类遗忘曲线 — 未强化的记忆自然衰减)
-	var kept []*Experience
+	// 1. 生命周期状态转换 + 时间衰减
 	for _, exp := range ee.experiences {
 		ageDays := time.Since(exp.CreatedAt).Hours() / 24
 
-		// v2: 未使用经验的质量随时间自然衰减 (Ebbinghaus)
-		// 每过 7 天未使用，质量下降 5%
+		// Ebbinghaus 遗忘曲线: 未使用经验质量衰减
 		if exp.UsageCount == 0 && ageDays > 7 {
 			decay := 0.05 * (ageDays / 7)
 			exp.Quality -= decay
@@ -653,50 +942,106 @@ func (ee *EvolutionEngine) Consolidate() {
 			}
 		}
 
+		// 生命周期状态机
+		switch exp.Lifecycle {
+		case "proposed":
+			if exp.UsageCount > 0 && exp.SuccessRate() >= 0.3 {
+				exp.Lifecycle = "validated"
+			} else if ageDays > 7 && exp.UsageCount == 0 {
+				exp.Lifecycle = "archived"
+			}
+		case "validated":
+			if exp.InjectionCount >= 3 && exp.InjectionUplift() >= 0.5 {
+				exp.Lifecycle = "promoted"
+			} else if exp.Quality < 0.15 {
+				exp.Lifecycle = "decaying"
+			}
+		case "promoted":
+			if exp.UsageCount >= 5 && exp.SuccessRate() >= 0.5 {
+				exp.Lifecycle = "active"
+			} else if exp.Quality < 0.1 {
+				exp.Lifecycle = "decaying"
+			}
+		case "active":
+			if exp.Quality < 0.1 || (exp.UsageCount == 0 && ageDays > 30) {
+				exp.Lifecycle = "decaying"
+			}
+		case "decaying":
+			if ageDays > 3 && exp.Quality < 0.05 {
+				exp.Lifecycle = "archived"
+			}
+		}
+
+		// 确保 MinHash 签名存在
+		if len(exp.MinHashSig) == 0 {
+			exp.MinHashSig = computeMinHash(evolutionTokenize(exp.Content), 64)
+		}
+	}
+
+	// 2. 剪枝: 移除 archived 和低质量经验
+	var kept []*Experience
+	for _, exp := range ee.experiences {
+		if exp.Lifecycle == "archived" {
+			continue
+		}
+		ageDays := time.Since(exp.CreatedAt).Hours() / 24
 		if exp.Quality < 0.05 && ageDays > 3 {
-			continue // 淘汰 (v2: 更激进的淘汰, 3天而非7天)
+			continue
 		}
 		if exp.UsageCount == 0 && ageDays > 14 {
-			continue // v2: 14天未使用就淘汰 (原30天)
+			continue
 		}
 		kept = append(kept, exp)
 	}
 
-	// 2. 去重: 合并高度相似的经验 (保留质量更高的)
-	var deduped []*Experience
-	merged := make(map[int]bool)
+	// 3. MinHash+LSH 去重 (V2: O(n*k) 替代 O(n²))
+	buckets := make(map[uint64][]int) // LSH 桶 → 候选索引
+	bands, rows := 8, 8              // 64 hash → 8 bands * 8 rows
+	for i, exp := range kept {
+		if len(exp.MinHashSig) < bands*rows {
+			continue
+		}
+		for b := 0; b < bands; b++ {
+			h := fnvHash64(exp.MinHashSig[b*rows : (b+1)*rows])
+			buckets[h] = append(buckets[h], i)
+		}
+	}
 
+	merged := make(map[int]bool)
+	var deduped []*Experience
 	for i := 0; i < len(kept); i++ {
 		if merged[i] {
 			continue
 		}
 		best := kept[i]
-		for j := i + 1; j < len(kept); j++ {
-			if merged[j] {
-				continue
-			}
-			sim := jaccardSimilarity(
-				strings.ToLower(kept[i].Content),
-				strings.ToLower(kept[j].Content),
-			)
-			if sim > 0.6 {
-				merged[j] = true
-				if kept[j].Quality > best.Quality {
-					best = kept[j]
-					merged[i] = true
+		// 仅在同桶内比较
+		for b := 0; b < bands && len(best.MinHashSig) >= bands*rows; b++ {
+			h := fnvHash64(best.MinHashSig[b*rows : (b+1)*rows])
+			for _, j := range buckets[h] {
+				if j <= i || merged[j] {
+					continue
 				}
-				// 合并使用统计
-				best.UsageCount += kept[j].UsageCount
-				best.SuccessCount += kept[j].SuccessCount
+				sim := minHashSimilarity(kept[i].MinHashSig, kept[j].MinHashSig)
+				if sim > 0.6 {
+					merged[j] = true
+					if kept[j].Quality > best.Quality {
+						best = kept[j]
+						merged[i] = true
+					}
+					best.UsageCount += kept[j].UsageCount
+					best.SuccessCount += kept[j].SuccessCount
+				}
 			}
 		}
 		deduped = append(deduped, best)
 	}
 
-	// 3. 限制总量
+	// 4. 限制总量 (按综合分排序)
 	if len(deduped) > 200 {
 		sort.Slice(deduped, func(i, j int) bool {
-			return deduped[i].Quality > deduped[j].Quality
+			si := deduped[i].Quality*0.5 + deduped[i].SuccessRate()*0.3 + deduped[i].InjectionUplift()*0.2
+			sj := deduped[j].Quality*0.5 + deduped[j].SuccessRate()*0.3 + deduped[j].InjectionUplift()*0.2
+			return si > sj
 		})
 		deduped = deduped[:200]
 	}
@@ -747,6 +1092,10 @@ func (ee *EvolutionEngine) load() {
 	if data, err := os.ReadFile(filepath.Join(ee.dataDir, "trajectories.json")); err == nil {
 		_ = json.Unmarshal(data, &ee.trajectories)
 	}
+	// V2: 加载注入记录
+	if data, err := os.ReadFile(filepath.Join(ee.dataDir, "injections.json")); err == nil {
+		_ = json.Unmarshal(data, &ee.injections)
+	}
 }
 
 // Stats 统计信息。
@@ -790,8 +1139,7 @@ type EvolutionStats struct {
 	AvgQuality        float64 `json:"avgQuality"`    // 平均质量分
 }
 
-// CollectMetrics 采集进化引擎的持续观测指标, 写入 Collector。
-// 设计为定期调用 (如每次团队完成后), 用于跟踪进化质量趋势。
+// CollectMetrics 采集进化引擎全部 18 项持续观测指标。
 func (ee *EvolutionEngine) CollectMetrics(c interface{ Record(module, name string, value float64) }) {
 	if c == nil {
 		return
@@ -799,12 +1147,73 @@ func (ee *EvolutionEngine) CollectMetrics(c interface{ Record(module, name strin
 	ee.mu.RLock()
 	defer ee.mu.RUnlock()
 
+	// 基础计数
 	c.Record("evolution", "evo_experience_count", float64(len(ee.experiences)))
 	c.Record("evolution", "evo_trajectory_count", float64(len(ee.trajectories)))
 
-	// 成功率
+	// === 维度一: 学习质量 (Learn) ===
+
+	// #1 evo_distill_rate: 每条轨迹产出的经验数
+	if len(ee.trajectories) > 0 {
+		c.Record("evolution", "evo_distill_rate", float64(len(ee.experiences))/float64(len(ee.trajectories)))
+	}
+
+	// #2 evo_survival_rate: 非 archived 的经验占历史提炼总数
+	if ee.totalDistilled > 0 {
+		alive := 0
+		for _, e := range ee.experiences {
+			if e.Lifecycle != "archived" {
+				alive++
+			}
+		}
+		c.Record("evolution", "evo_survival_rate", float64(alive)/float64(ee.totalDistilled))
+	}
+
+	// #3 evo_pattern_diversity: 不同 Pattern 类型的数量
+	patterns := map[string]bool{}
+	for _, e := range ee.experiences {
+		if e.Pattern != "" {
+			patterns[e.Pattern] = true
+		}
+	}
+	c.Record("evolution", "evo_pattern_diversity", float64(len(patterns)))
+
+	// === 维度二: 检索效能 (Retrieve) ===
+
+	// #4 evo_retrieval_hit_rate: 注入后任务成功占比
+	injTotal, injSuccess := 0, 0
+	for _, r := range ee.injections {
+		if len(r.ExpIDs) > 0 {
+			injTotal++
+			if r.Success {
+				injSuccess++
+			}
+		}
+	}
+	if injTotal > 0 {
+		c.Record("evolution", "evo_retrieval_hit_rate", float64(injSuccess)/float64(injTotal))
+	}
+
+	// #6 evo_retrieval_coverage: 被使用过的经验占比
+	usedCount := 0
+	for _, e := range ee.experiences {
+		if e.UsageCount > 0 {
+			usedCount++
+		}
+	}
+	if len(ee.experiences) > 0 {
+		c.Record("evolution", "evo_retrieval_coverage", float64(usedCount)/float64(len(ee.experiences)))
+	}
+
+	// === 维度三: 进化效果 (Evolve) ===
+
+	// #7 evo_task_success_trend: 最近 N 条轨迹成功率
 	succCount, failCount := 0, 0
-	for _, t := range ee.trajectories {
+	window := ee.trajectories
+	if len(window) > 50 {
+		window = window[len(window)-50:]
+	}
+	for _, t := range window {
 		if t.Success {
 			succCount++
 		} else {
@@ -813,18 +1222,122 @@ func (ee *EvolutionEngine) CollectMetrics(c interface{ Record(module, name strin
 	}
 	total := succCount + failCount
 	if total > 0 {
-		c.Record("evolution", "evo_success_rate", float64(succCount)/float64(total))
-		c.Record("evolution", "evo_fail_trajectory_pct", float64(failCount)/float64(total))
+		c.Record("evolution", "evo_task_success_trend", float64(succCount)/float64(total))
 	}
 
-	// 使用率和质量分布
-	usedCount := 0
+	// #8 evo_injection_uplift
+	if injTotal > 0 {
+		injRate := float64(injSuccess) / float64(injTotal)
+		baseline := ee.baselineSuccess
+		if baseline == 0 {
+			baseline = 0.5
+		}
+		c.Record("evolution", "evo_injection_uplift", injRate-baseline)
+	}
+
+	// #9 evo_error_recurrence: 最近轨迹中同类错误重复率
+	errTypes := map[string]int{}
+	recentTrajs := ee.trajectories
+	if len(recentTrajs) > 100 {
+		recentTrajs = recentTrajs[len(recentTrajs)-100:]
+	}
+	for _, t := range recentTrajs {
+		if !t.Success && t.Error != "" {
+			errTypes[classifyError(t.Error)]++
+		}
+	}
+	maxRecur := 0
+	for _, cnt := range errTypes {
+		if cnt > maxRecur {
+			maxRecur = cnt
+		}
+	}
+	c.Record("evolution", "evo_error_recurrence", float64(maxRecur))
+
+	// === 维度四: 效率指标 (Efficiency) ===
+	// #13 evo_growth_rate: 经验增长率 (本周新增/总量)
+	weekAgo := time.Now().Add(-7 * 24 * time.Hour)
+	newThisWeek := 0
+	for _, e := range ee.experiences {
+		if e.CreatedAt.After(weekAgo) {
+			newThisWeek++
+		}
+	}
+	if len(ee.experiences) > 0 {
+		c.Record("evolution", "evo_growth_rate", float64(newThisWeek)/float64(len(ee.experiences)))
+	}
+
+	// === 维度五: 泛化能力 (Generalization) ===
+
+	// #14 evo_cross_team_transfer: 跨团队使用率
+	crossTeamUse := 0
+	totalUse := 0
+	for _, r := range ee.injections {
+		for _, id := range r.ExpIDs {
+			totalUse++
+			for _, e := range ee.experiences {
+				if e.ID == id && e.SourceTeam != "" && e.SourceTeam != r.TeamName {
+					crossTeamUse++
+					break
+				}
+			}
+		}
+	}
+	if totalUse > 0 {
+		c.Record("evolution", "evo_cross_team_transfer", float64(crossTeamUse)/float64(totalUse))
+	}
+
+	// #16 evo_abstraction_rate: general 经验占比
+	generalCount := 0
+	for _, e := range ee.experiences {
+		if e.Category == "general" {
+			generalCount++
+		}
+	}
+	if len(ee.experiences) > 0 {
+		c.Record("evolution", "evo_abstraction_rate", float64(generalCount)/float64(len(ee.experiences)))
+	}
+
+	// #17 evo_lifecycle_promoted: promoted+active 占比
+	promotedCount := 0
+	for _, e := range ee.experiences {
+		if e.Lifecycle == "promoted" || e.Lifecycle == "active" {
+			promotedCount++
+		}
+	}
+	if len(ee.experiences) > 0 {
+		c.Record("evolution", "evo_lifecycle_promoted", float64(promotedCount)/float64(len(ee.experiences)))
+	}
+
+	// #18 evo_counterfactual_gen: 反事实经验数
+	cfCount := 0
+	for _, e := range ee.experiences {
+		for _, tag := range e.Tags {
+			if tag == "counterfactual" {
+				cfCount++
+				break
+			}
+		}
+	}
+	c.Record("evolution", "evo_counterfactual_gen", float64(cfCount))
+
+	// 保留原有基础指标
+	allSucc, allFail := 0, 0
+	for _, t := range ee.trajectories {
+		if t.Success {
+			allSucc++
+		} else {
+			allFail++
+		}
+	}
+	if allSucc+allFail > 0 {
+		c.Record("evolution", "evo_success_rate", float64(allSucc)/float64(allSucc+allFail))
+		c.Record("evolution", "evo_fail_trajectory_pct", float64(allFail)/float64(allSucc+allFail))
+	}
+
 	var qualSum, qualMin, qualMax float64
 	qualMin = 1.0
 	for i, exp := range ee.experiences {
-		if exp.UsageCount > 0 {
-			usedCount++
-		}
 		qualSum += exp.Quality
 		if i == 0 || exp.Quality < qualMin {
 			qualMin = exp.Quality
@@ -983,6 +1496,65 @@ func smartTruncateEvolution(s string, maxLen int) string {
 		headLen = maxLen - tailLen - 30
 	}
 	return s[:headLen] + "\n...(truncated middle)...\n" + s[len(s)-tailLen:]
+}
+
+// computeMinHash 计算 MinHash 签名 (V2: 替代 O(n²) Jaccard)。
+// k 个哈希函数, 每个取所有 shingle 的最小哈希值。
+func computeMinHash(tokens []string, k int) []uint64 {
+	if len(tokens) == 0 {
+		return nil
+	}
+	sig := make([]uint64, k)
+	for i := range sig {
+		sig[i] = ^uint64(0) // max uint64
+	}
+	for _, t := range tokens {
+		for i := 0; i < k; i++ {
+			h := fnvHashString(t, uint64(i*0x517cc1b727220a95+0x6c62272e07bb0142))
+			if h < sig[i] {
+				sig[i] = h
+			}
+		}
+	}
+	return sig
+}
+
+// minHashSimilarity 估算 MinHash 签名的 Jaccard 相似度。
+func minHashSimilarity(a, b []uint64) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	match := 0
+	for i := 0; i < n; i++ {
+		if a[i] == b[i] {
+			match++
+		}
+	}
+	return float64(match) / float64(n)
+}
+
+// fnvHashString FNV-1a 哈希 (带 seed)。
+func fnvHashString(s string, seed uint64) uint64 {
+	h := seed ^ 0xcbf29ce484222325
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 0x100000001b3
+	}
+	return h
+}
+
+// fnvHash64 对 uint64 切片做 FNV-1a (用于 LSH 桶)。
+func fnvHash64(vals []uint64) uint64 {
+	h := uint64(0xcbf29ce484222325)
+	for _, v := range vals {
+		h ^= v
+		h *= 0x100000001b3
+	}
+	return h
 }
 
 func jaccardSimilarity(a, b string) float64 {

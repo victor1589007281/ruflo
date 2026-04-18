@@ -89,8 +89,14 @@ func (c *Collector) Record(module, name string, value float64) {
 
 // RecordWithLabels 记录带标签的指标值。
 func (c *Collector) RecordWithLabels(module, name string, value float64, labels map[string]string) {
+	c.RecordAtTime(module, name, value, labels, time.Now())
+}
+
+// RecordAtTime 记录指定时间戳的指标值。
+// 同一批指标共享时间戳, 确保 dashboard 能按 (ts, model) 正确分组聚合。
+func (c *Collector) RecordAtTime(module, name string, value float64, labels map[string]string, ts time.Time) {
 	evt := MetricEvent{
-		Timestamp: time.Now(),
+		Timestamp: ts,
 		Module:    module,
 		Name:      name,
 		Value:     value,

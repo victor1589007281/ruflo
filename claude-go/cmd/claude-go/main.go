@@ -631,6 +631,19 @@ JSON 配置文件示例:
 			if config.Wiki.APIPort > 0 {
 				stateDir := resolveStateDir(config.Cwd)
 				dashCfg := dashboard.Config{StateDir: stateDir}
+
+				// 将 bot 的 AI 客户端注入 dashboard, 确保诊断功能使用
+				// 与 bot 完全相同的模型配置 (model/apiKey/baseUrl)。
+				var dashLLMClient *api.Client
+				if config.BaseURL != "" {
+					dashLLMClient = api.NewClient(config.BaseURL, config.APIKey, config.Model)
+				} else {
+					dashLLMClient = api.NewDashScopeClient(config.APIKey, config.Model)
+				}
+				dashLLMClient.Tag = "dashboard"
+				dashLLMClient.FallbackModels = config.FallbackModels
+				dashboard.SetSharedLLMClient(dashLLMClient)
+
 				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 					func(mux *http.ServeMux) {
 						dashboard.MountOn(dashCfg, mux)

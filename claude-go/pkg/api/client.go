@@ -101,6 +101,10 @@ type Client struct {
 	OnLLMMetrics LLMMetricsHook  // 指标回调 (可选, 注入 dashboard metrics collector)
 	Guard        *RateLimitGuard // 全局准入控制器 (可选, 强烈建议设置)
 
+	// FallbackModels 备用模型列表: 主模型不可用时按序尝试。
+	// 触发条件: 模型不支持 (400 invalid model) / 超载 (529) / 配额耗尽 (402/403)。
+	FallbackModels []string
+
 	// 追踪标签 (可选): 调用方通过 WithTag 或直接赋值, 标识该 Client 实例所服务的业务场景。
 	// 会写入 LLMCallRecord.Source, 方便在 dashboard 里按业务维度聚合 (chat/feishu/team/...)。
 	Tag string
@@ -914,6 +918,68 @@ func (c *Client) SendMessage(
 		}
 	}
 
+	// 主模型全部重试失败 — 尝试 FallbackModels
+	if len(c.FallbackModels) > 0 && isFallbackEligible(lastStatus, lastErr) {
+		for fi, fbModel := range c.FallbackModels {
+			if fbModel == c.Model || fbModel == "" {
+				continue
+			}
+			log.Printf("[api] 主模型 %s 不可用, 尝试备用模型 %d/%d: %s",
+				c.Model, fi+1, len(c.FallbackModels), fbModel)
+			c.fireEvent("retry", fmt.Sprintf("切换备用模型 %s", fbModel))
+
+			req.Model = fbModel
+			fbBody, err := json.Marshal(req)
+			if err != nil {
+				continue
+			}
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(fbBody))
+			if err != nil {
+				continue
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("x-api-key", c.APIKey)
+			httpReq.Header.Set("anthropic-version", "2023-06-01")
+			httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+			resp, err := c.Client.Do(httpReq)
+			if err != nil {
+				continue
+			}
+			respBody, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				continue
+			}
+			if resp.StatusCode == 200 {
+				c.recordSuccess()
+				var result types.APIResponse
+				if err := json.Unmarshal(respBody, &result); err != nil {
+					continue
+				}
+				rec := LLMCallRecord{
+					Status:       "retry_success",
+					Request:      "messages",
+					DurationSec:  time.Since(startTS).Seconds(),
+					HTTPStatus:   200,
+					Retries:      retries + fi + 1,
+					StopReason:   result.StopReason,
+					GuardWaitSec: guardWaitSec,
+					Model:        fbModel,
+				}
+				if result.Usage != nil {
+					rec.InputTokens = result.Usage.InputTokens
+					rec.OutputTokens = result.Usage.OutputTokens
+					rec.CacheReadTokens = result.Usage.CacheReadInputTokens
+					rec.CacheCreationTokens = result.Usage.CacheCreationInputTokens
+					rec.TotalTokens = rec.InputTokens + rec.OutputTokens + rec.CacheReadTokens + rec.CacheCreationTokens
+				}
+				c.emitLLMMetric(rec)
+				log.Printf("[api] 备用模型 %s 成功", fbModel)
+				return &result, nil
+			}
+		}
+	}
+
 	opened, _ := c.recordFailure(lastErr.Error())
 	c.TotalFails.Add(1)
 	c.fireEvent("fatal", fmt.Sprintf("LLM 调用 %d 次全部失败: %v", maxRetry+1, lastErr))
@@ -929,6 +995,27 @@ func (c *Client) SendMessage(
 		CircuitOpened: opened,
 	})
 	return nil, fmt.Errorf("LLM 调用 %d 次全部失败: %w", maxRetry+1, lastErr)
+}
+
+// isFallbackEligible 判断失败是否适合切换备用模型。
+// 适用: 模型不支持(400)、配额耗尽(402/403)、超载(529)、全部重试超时。
+// 不适用: 提示词过长(需压缩而非换模型)、正常限流(等待即可恢复)。
+func isFallbackEligible(httpStatus int, err error) bool {
+	if err == nil {
+		return false
+	}
+	switch httpStatus {
+	case 400, 402, 403, 529:
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	for _, kw := range []string{"not supported", "not found", "invalid model",
+		"quota", "insufficient", "overloaded", "unavailable"} {
+		if strings.Contains(errStr, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // SimpleComplete 简单文本补全: 发送 system+user prompt, 返回回复文本。

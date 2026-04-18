@@ -1837,12 +1837,19 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			Timestamp: time.Now(),
 		}
 		we.evolution.RecordTrajectory(traj)
-		// 增量学习: 失败阶段立即提炼 error pattern，不等团队结束
+		// V2双向学习: 成功+失败都提炼经验 (参考 ExpeL/MiniMax)
+		we.evolution.LearnFromStage(traj)
+		// V2反事实学习: 失败时额外生成假设性策略
 		if sr.Status == TaskFailed {
-			we.evolution.LearnFromStage(traj)
+			we.evolution.LearnCounterfactual(traj)
 		}
 		if len(injectedExpIDs) > 0 {
 			we.evolution.RecordBatchFeedback(injectedExpIDs, sr.Status == TaskCompleted)
+			// V2注入效果追踪
+			we.evolution.RecordInjection(injectedExpIDs, stage.Name, team.Name, stage.Role, sr.Status == TaskCompleted)
+		} else {
+			// 无注入: 更新基线成功率 (用于 Uplift 计算)
+			we.evolution.UpdateBaseline(sr.Status == TaskCompleted)
 		}
 	}
 

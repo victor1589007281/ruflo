@@ -11,6 +11,7 @@ package metrics
 
 import (
 	"sync"
+	"time"
 
 	"github.com/anthropic/claude-go/pkg/api"
 )
@@ -66,59 +67,65 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 		labels["http_status"] = intStr(rec.HTTPStatus)
 	}
 
-	c.RecordWithLabels("llm", MLLMCallCount, 1, labels)
-	c.RecordWithLabels("llm", MLLMDurationSec, rec.DurationSec, labels)
+	// 同一次 LLM 调用的所有指标共享同一个时间戳,
+	// 确保 dashboard 的 handleLLMStats 能正确按 (ts, model) 分组聚合。
+	ts := rec.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
+	c.RecordAtTime("llm", MLLMCallCount, 1, labels, ts)
+	c.RecordAtTime("llm", MLLMDurationSec, rec.DurationSec, labels, ts)
 	if rec.InputTokens > 0 {
-		c.RecordWithLabels("llm", MLLMInputTokens, float64(rec.InputTokens), labels)
+		c.RecordAtTime("llm", MLLMInputTokens, float64(rec.InputTokens), labels, ts)
 	}
 	if rec.OutputTokens > 0 {
-		c.RecordWithLabels("llm", MLLMOutputTokens, float64(rec.OutputTokens), labels)
+		c.RecordAtTime("llm", MLLMOutputTokens, float64(rec.OutputTokens), labels, ts)
 	}
 	if rec.CacheReadTokens > 0 {
-		c.RecordWithLabels("llm", MLLMCacheReadTokens, float64(rec.CacheReadTokens), labels)
+		c.RecordAtTime("llm", MLLMCacheReadTokens, float64(rec.CacheReadTokens), labels, ts)
 	}
 	if rec.CacheCreationTokens > 0 {
-		c.RecordWithLabels("llm", MLLMCacheCreateTokens, float64(rec.CacheCreationTokens), labels)
+		c.RecordAtTime("llm", MLLMCacheCreateTokens, float64(rec.CacheCreationTokens), labels, ts)
 	}
 	if rec.TotalTokens > 0 {
-		c.RecordWithLabels("llm", MLLMTotalTokens, float64(rec.TotalTokens), labels)
+		c.RecordAtTime("llm", MLLMTotalTokens, float64(rec.TotalTokens), labels, ts)
 	}
 	if rec.Retries > 0 {
-		c.RecordWithLabels("llm", MLLMRetryCount, float64(rec.Retries), labels)
+		c.RecordAtTime("llm", MLLMRetryCount, float64(rec.Retries), labels, ts)
 	}
 
 	switch rec.Status {
 	case "success", "retry_success":
-		c.RecordWithLabels("llm", MLLMSuccessCount, 1, labels)
+		c.RecordAtTime("llm", MLLMSuccessCount, 1, labels, ts)
 	case "error":
-		c.RecordWithLabels("llm", MLLMErrorCount, 1, labels)
+		c.RecordAtTime("llm", MLLMErrorCount, 1, labels, ts)
 	}
 
 	switch rec.ErrorKind {
 	case "rate_limit":
-		c.RecordWithLabels("llm", MLLMRateLimitCount, 1, labels)
+		c.RecordAtTime("llm", MLLMRateLimitCount, 1, labels, ts)
 	case "overloaded":
-		c.RecordWithLabels("llm", MLLMOverloadCount, 1, labels)
+		c.RecordAtTime("llm", MLLMOverloadCount, 1, labels, ts)
 	case "timeout":
-		c.RecordWithLabels("llm", MLLMTimeoutCount, 1, labels)
+		c.RecordAtTime("llm", MLLMTimeoutCount, 1, labels, ts)
 	case "refusal":
-		c.RecordWithLabels("llm", MLLMRefusalCount, 1, labels)
+		c.RecordAtTime("llm", MLLMRefusalCount, 1, labels, ts)
 	case "prompt_too_long":
-		c.RecordWithLabels("llm", MLLMPromptTooLong, 1, labels)
+		c.RecordAtTime("llm", MLLMPromptTooLong, 1, labels, ts)
 	}
 
 	// 限流 / 熔断器事件
 	if rec.GuardWaitSec > 0 {
-		c.RecordWithLabels("llm", MLLMGuardWaitSec, rec.GuardWaitSec, labels)
+		c.RecordAtTime("llm", MLLMGuardWaitSec, rec.GuardWaitSec, labels, ts)
 	}
 	if rec.CircuitOpened {
-		c.RecordWithLabels("llm", MLLMCircuitTrips, 1, labels)
+		c.RecordAtTime("llm", MLLMCircuitTrips, 1, labels, ts)
 	}
 	if rec.CircuitBlocked {
-		// 被熔断器拒绝 — 复用 error_count 并单独打一条 gauge 1 便于查询
 		blockedLabels := copyLabels(labels)
 		blockedLabels["blocked"] = "1"
-		c.RecordWithLabels("llm", MLLMCircuitOpenGauge, 1, blockedLabels)
+		c.RecordAtTime("llm", MLLMCircuitOpenGauge, 1, blockedLabels, ts)
 	}
 }
 

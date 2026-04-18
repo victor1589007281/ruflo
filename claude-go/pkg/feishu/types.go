@@ -120,6 +120,9 @@ type BotConfig struct {
 	// 默认为 Cwd/.claude-go。若为空且 Cwd 也为空，程序拒绝启动。
 	StateDir string
 
+	// FallbackModels 备用模型列表: 主模型不可用时按序尝试
+	FallbackModels []string
+
 	// Wiki LLM Wiki 知识库配置
 	Wiki WikiConfig
 
@@ -337,11 +340,12 @@ type FeishuSection struct {
 
 // AISection AI 模型配置段
 type AISection struct {
-	Model     string `json:"model,omitempty"`
-	APIKey    string `json:"apiKey,omitempty"`
-	BaseURL   string `json:"baseUrl,omitempty"`
-	MaxTokens int    `json:"maxTokens,omitempty"`
-	MaxTurns  int    `json:"maxTurns,omitempty"`
+	Model          string   `json:"model,omitempty"`
+	APIKey         string   `json:"apiKey,omitempty"`
+	BaseURL        string   `json:"baseUrl,omitempty"`
+	MaxTokens      int      `json:"maxTokens,omitempty"`
+	MaxTurns       int      `json:"maxTurns,omitempty"`
+	FallbackModels []string `json:"fallbackModels,omitempty"` // 备用模型顺序: 主模型不可用时按序尝试
 }
 
 // MCPServerEntry MCP 服务器条目
@@ -454,6 +458,9 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		}
 		if jc.AI.MaxTurns > 0 && bc.MaxTurns == 0 {
 			bc.MaxTurns = jc.AI.MaxTurns
+		}
+		if len(jc.AI.FallbackModels) > 0 && len(bc.FallbackModels) == 0 {
+			bc.FallbackModels = jc.AI.FallbackModels
 		}
 	}
 

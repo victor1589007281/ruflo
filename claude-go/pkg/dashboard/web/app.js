@@ -121,6 +121,8 @@
     searchTimer: null,
     llmStats: { window: '24h', timer: null },
     blackboardEdit: { key: '', value: '' },
+    // v1.5: 默认手动刷新, 用户点击 "自动刷新" 切换才启用轮询; 跨页持久化在 localStorage。
+    autoRefresh: localStorage.getItem('autoRefresh') === '1',
   };
 
   function destroyCharts() {
@@ -172,8 +174,42 @@
     } catch (e) {
       $('#view').innerHTML = `<div class="empty" style="color:var(--red)">加载失败: ${e.message}</div>`;
     }
-    if (matched.poll > 0) {
+    // v1.5: 默认只手动刷新。只有当用户在 topbar 点击 "自动刷新" 切到 ON 时才开启轮询。
+    // 例外: 实时日志页 poll 为 0, 它本身用 SSE 流式拉取, 与这里无关。
+    if (state.autoRefresh && matched.poll > 0) {
       state.pollTimer = setInterval(() => matched.render(arg, { quiet: true }).catch(() => {}), matched.poll);
+    }
+    updateAutoRefreshBtn();
+  }
+
+  // 切换自动刷新状态。ON: 按当前页面 poll 间隔轮询; OFF: 停止轮询, 只能手动刷新。
+  function toggleAutoRefresh() {
+    state.autoRefresh = !state.autoRefresh;
+    localStorage.setItem('autoRefresh', state.autoRefresh ? '1' : '0');
+    if (!state.autoRefresh) {
+      if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+    } else if (state.route && state.route.handler && state.route.handler.poll > 0) {
+      const h = state.route.handler;
+      state.pollTimer = setInterval(() => h.render(state.route.arg, { quiet: true }).catch(() => {}), h.poll);
+    }
+    updateAutoRefreshBtn();
+    toast(state.autoRefresh ? '已开启自动刷新' : '已关闭自动刷新, 需手动点击 "刷新"', state.autoRefresh ? 'ok' : '');
+  }
+
+  function updateAutoRefreshBtn() {
+    const btn = document.getElementById('autorefresh-btn');
+    if (!btn) return;
+    const p = state.route && state.route.handler ? (state.route.handler.poll || 0) : 0;
+    if (state.autoRefresh) {
+      btn.classList.remove('ghost');
+      btn.classList.add('primary');
+      btn.textContent = p > 0 ? ('⟳ 自动 · ' + Math.round(p / 1000) + 's') : '⟳ 自动 (本页无推荐间隔)';
+      btn.title = '当前已开启自动刷新, 点击关闭';
+    } else {
+      btn.classList.remove('primary');
+      btn.classList.add('ghost');
+      btn.textContent = '⟳ 自动刷新 OFF';
+      btn.title = '自动刷新已关闭, 只有点击 "刷新" 才拉新数据. 点击开启';
     }
   }
 
@@ -1031,14 +1067,66 @@
   }
 
   // ---- DAG ----
+  // renderTeamDAG (v1.5 双视图):
+  //   ① Workflow 全局 DAG    → 直接基于 /api/teams/:name/dag 返回的 workflow stages,
+  //                           反映"团队设计时"的阶段编排以及运行状态覆盖
+  //   ② Plan 任务拆解树      → 基于 V2 Tasks (subject 前缀 "[team-name] ...")
+  //                           + DependsOn 形成的 DAG, 反映"LLM 拆解出的实际任务"。
+  //                           每个节点展示: 状态 / 内容 / 检查点状态 / 执行 agent(owner)
+  //
+  // 两种视图互为补充:
+  //   - Workflow 是静态设计, 便于看整体流程是否符合预期
+  //   - Plan 是动态运行, 便于看 LLM 把目标拆成了哪些子任务、谁在执行、卡在哪
   async function renderTeamDAG(detail, panel) {
-    // Prefer the richer /api/teams/:name/dag endpoint which merges
-    // workflow + runtime stages + checkpoints + attempts + durations.
     let dag = null;
     try {
       dag = await api('/api/teams/' + encodeURIComponent(detail.name) + '/dag');
     } catch (_) { /* fallback below */ }
 
+    // 顶部视图切换 (Workflow | Plan). 选中偏好记到 localStorage, 跨页保持。
+    const viewKey = 'teamDagView';
+    let curView = localStorage.getItem(viewKey) || 'workflow';
+    const mkBtn = (id, label) => h('button', {
+      class: 'btn small' + (curView === id ? '' : ' ghost'),
+      onClick: () => {
+        if (curView === id) return;
+        curView = id; localStorage.setItem(viewKey, id);
+        bodyBox.innerHTML = '';
+        render();
+      },
+    }, label);
+
+    const switcher = h('div', { class: 'toolbar-row mb-12' }, [
+      h('div', { style: { display: 'flex', gap: '8px' } }, [
+        mkBtn('workflow', '⇌ Workflow 全局 DAG'),
+        mkBtn('plan', '🌳 Plan 任务拆解树'),
+      ]),
+      h('span', { class: 'muted small' }, 'Workflow = 设计; Plan = LLM 拆解的真实任务'),
+    ]);
+    panel.appendChild(switcher);
+    const bodyBox = h('div', {});
+    panel.appendChild(bodyBox);
+
+    function render() {
+      // 切换按钮高亮重新计算
+      switcher.querySelectorAll('button').forEach(b => {
+        const isActive = b.textContent.startsWith(curView === 'workflow' ? '⇌' : '🌳');
+        b.classList.toggle('ghost', !isActive);
+      });
+      if (curView === 'plan') {
+        renderPlanTaskTree(detail, bodyBox).catch(e => {
+          bodyBox.appendChild(h('div', { class: 'empty', style: { color: 'var(--red)' } },
+            'Plan 树加载失败: ' + e.message));
+        });
+      } else {
+        renderWorkflowDAGBody(detail, dag, bodyBox);
+      }
+    }
+    render();
+  }
+
+  // Workflow DAG 主体 (原来的实现抽出来)
+  function renderWorkflowDAGBody(detail, dag, panel) {
     if (dag && (dag.stages || []).length) {
       const nodes = dag.stages.map(s => ({
         name: s.name, role: s.role,
@@ -1048,7 +1136,6 @@
         attempts: s.attempts || 0,
         durationSec: s.durationSec,
         error: s.error,
-        // v1.5 rich fields
         taskBrief: s.taskBrief || '',
         assignedAgents: s.assignedAgents || [],
         checkpointStatus: s.checkpointStatus || '',
@@ -1059,14 +1146,13 @@
         adversaryPassed: s.adversaryPassed,
         outputPreview: s.outputPreview || '',
       }));
-      const meta = h('div', { class: 'muted', style: { marginBottom: '10px', fontSize: '12px' } }, [
+      panel.appendChild(h('div', { class: 'muted', style: { marginBottom: '10px', fontSize: '12px' } }, [
         h('strong', {}, 'workflow: '), dag.workflow || detail.workflow || '—',
         ' · stages=', String(nodes.length),
         '  ·  ',
         h('span', { class: 'badge ' + statusBadgeClass(dag.status) }, dag.status || '—'),
         h('span', { class: 'muted', style: { marginLeft: '6px' } }, 'source: ' + (dag.source || '')),
-      ]);
-      panel.appendChild(meta);
+      ]));
       panel.appendChild(renderDAGSVG(nodes, dag.source));
       panel.appendChild(h('div', { class: 'legend' }, [
         h('span', {}, [h('span', { class: 'dot ok' }), '完成']),
@@ -1074,50 +1160,208 @@
         h('span', {}, [h('span', { class: 'dot err' }), '失败']),
         h('span', {}, [h('span', { class: 'dot pending' }), '待执行']),
       ]));
-
-      // 富信息卡片视图: 每个 stage 一个卡片, 清晰展示任务内容 / Agent / 检查点 / 对抗评分 / 错误
-      // 卡片网格布局, 响应式自适应, 适合研发团队 workflow 的多维度信息浏览。
       if (nodes.length) {
         const cardsWrap = h('div', { class: 'dag-cards',
           style: { display: 'grid', gap: '12px',
                    gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' } });
-        for (const n of nodes) {
-          cardsWrap.appendChild(renderDAGNodeCard(n));
-        }
+        for (const n of nodes) cardsWrap.appendChild(renderDAGNodeCard(n));
         panel.appendChild(h('div', { class: 'card mb-16' }, [
           h('h3', {}, '📋 任务节点详情 (含任务 / Agent / 检查点 / 对抗 / 错误)'),
           cardsWrap,
         ]));
       }
-
       if (dag.adversaryRounds && dag.adversaryRounds.length) {
         panel.appendChild(renderDAGAdversaryRounds(dag.adversaryRounds));
       }
       return;
     }
-
-    // Fallback path (older data / no workflow registry)
+    // Fallback (older data / no workflow registry)
     const wfName = detail.workflow || 'development';
-    let wf = null;
-    try { wf = await api('/api/workflows/' + encodeURIComponent(wfName)); } catch (_) {}
-    const stageStatus = {};
-    (detail.stages || []).forEach(s => {
-      if (!stageStatus[s.name]) stageStatus[s.name] = s.status;
-      else if (s.status === 'failed') stageStatus[s.name] = 'failed';
-      else if (stageStatus[s.name] === 'pending') stageStatus[s.name] = s.status;
-    });
-    if (!wf) {
-      const nodes = (detail.stages || []).map((s, i) => ({ name: s.name, role: s.role, dependsOn: i === 0 ? [] : [detail.stages[i - 1].name], status: s.status }));
-      panel.appendChild(renderDAGSVG(nodes, '(未知 workflow, 按顺序推断)'));
+    (async () => {
+      let wf = null;
+      try { wf = await api('/api/workflows/' + encodeURIComponent(wfName)); } catch (_) {}
+      const stageStatus = {};
+      (detail.stages || []).forEach(s => {
+        if (!stageStatus[s.name]) stageStatus[s.name] = s.status;
+        else if (s.status === 'failed') stageStatus[s.name] = 'failed';
+        else if (stageStatus[s.name] === 'pending') stageStatus[s.name] = s.status;
+      });
+      if (!wf) {
+        const nodes = (detail.stages || []).map((s, i) => ({
+          name: s.name, role: s.role,
+          dependsOn: i === 0 ? [] : [detail.stages[i - 1].name], status: s.status,
+        }));
+        panel.appendChild(renderDAGSVG(nodes, '(未知 workflow, 按顺序推断)'));
+        return;
+      }
+      const nodes = wf.stages.map(s => ({
+        name: s.name, role: s.role,
+        dependsOn: s.dependsOn || [],
+        parallel: s.parallel,
+        status: stageStatus[s.name] || 'pending',
+      }));
+      panel.appendChild(renderDAGSVG(nodes, wf.description));
+    })();
+  }
+
+  // =========================================================
+  // Plan 任务拆解树 (v1.5)
+  //
+  // 数据源: /api/tasks  → 按 subject 前缀 "[team-name] xxx" 过滤
+  // 关系: 使用每个 task 的 dependsOn 数组反推 parent->children (一个 task 若依赖
+  //       N 个前置任务, 视作 N 个 parent 都有它作为 child, 允许树多入度;
+  //       渲染时主要取第一个依赖作为树骨架, 其它依赖以 "⇠ depId" 标签展示)
+  // 若所有 task 都没有 dependsOn, 按创建时间顺序退化为扁平列表, 同样可用。
+  //
+  // 每个节点展示字段 (按用户要求):
+  //   - 状态 (status badge)
+  //   - 内容 (subject 去掉 [team] 前缀, 加 description 摘要)
+  //   - 检查点状态 (用团队 checkpoints.json 数据按 stage_name/subject 模糊匹配)
+  //   - 执行 agent (owner 字段)
+  // =========================================================
+  async function renderPlanTaskTree(detail, panel) {
+    panel.innerHTML = '<div class="loading">加载 Plan 任务…</div>';
+    const [allTasks, checkpoints] = await Promise.all([
+      api('/api/tasks').catch(() => []),
+      api('/api/teams/' + encodeURIComponent(detail.name) + '/checkpoints').catch(() => ({ checkpoints: [] })),
+    ]);
+    panel.innerHTML = '';
+
+    // 过滤: 只保留 subject 前缀是 "[team-name] "
+    const prefix = '[' + detail.name + ']';
+    const tasks = (Array.isArray(allTasks) ? allTasks : []).filter(t =>
+      (t.subject || '').startsWith(prefix)
+    );
+    if (!tasks.length) {
+      panel.appendChild(h('div', { class: 'empty' },
+        '该团队 (' + detail.name + ') 暂未生成 V2 Task. ' +
+        '通常是 workflow engine 为每个 stage 创建一条 task; 若 taskTracker 未启用则为空.'));
       return;
     }
-    const nodes = wf.stages.map(s => ({
-      name: s.name, role: s.role,
-      dependsOn: s.dependsOn || [],
-      parallel: s.parallel,
-      status: stageStatus[s.name] || 'pending',
-    }));
-    panel.appendChild(renderDAGSVG(nodes, wf.description));
+
+    // 依赖索引
+    const byID = new Map();
+    for (const t of tasks) byID.set(t.id, t);
+    const childrenOf = new Map();
+    const rootIDs = [];
+    for (const t of tasks) {
+      const deps = (t.dependsOn || []).filter(d => byID.has(d));
+      if (!deps.length) {
+        rootIDs.push(t.id);
+      } else {
+        // 使用第一个依赖作为树骨架
+        const parent = deps[0];
+        if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+        childrenOf.get(parent).push(t.id);
+      }
+    }
+    // 稳定排序: 按 createdAt
+    const byCreatedAsc = (a, b) =>
+      new Date(a.createdAt || 0) - new Date(b.createdAt || 0);
+    rootIDs.sort((a, b) => byCreatedAsc(byID.get(a), byID.get(b)));
+    for (const list of childrenOf.values()) {
+      list.sort((a, b) => byCreatedAsc(byID.get(a), byID.get(b)));
+    }
+
+    // Checkpoint 匹配: workflow.go 里 subject = "[team] stageName", Checkpoint 用 stageName 做 key
+    const cpByStage = new Map();
+    const cps = (checkpoints && (checkpoints.checkpoints || checkpoints.items || checkpoints)) || [];
+    for (const c of (Array.isArray(cps) ? cps : [])) {
+      const key = c && (c.stageName || c.stage);
+      if (key) cpByStage.set(key, c);
+    }
+
+    // 顶部摘要
+    const counts = { pending: 0, in_progress: 0, running: 0, completed: 0, failed: 0, blocked: 0, other: 0 };
+    for (const t of tasks) {
+      if (counts[t.status] != null) counts[t.status]++;
+      else counts.other++;
+    }
+    panel.appendChild(h('div', { class: 'muted', style: { marginBottom: '10px', fontSize: '12px' } }, [
+      h('strong', {}, 'Plan: '), tasks.length + ' 个任务',
+      ' · 已完成 ', String(counts.completed),
+      ' · 运行 ', String(counts.in_progress + counts.running),
+      ' · 失败 ', String(counts.failed),
+      ' · 待处理 ', String(counts.pending + counts.blocked),
+    ]));
+
+    // 树容器, 限高可滚动
+    const treeHost = h('div', { class: 'card',
+      style: { maxHeight: '70vh', overflow: 'auto', padding: '12px' } });
+    for (const rid of rootIDs) {
+      treeHost.appendChild(renderPlanTaskNode(byID.get(rid), byID, childrenOf, cpByStage, prefix, 0));
+    }
+    panel.appendChild(treeHost);
+  }
+
+  // 单个 plan 节点: 折叠 / 状态 / 内容 / checkpoint / agent
+  function renderPlanTaskNode(task, byID, childrenOf, cpByStage, teamPrefix, depth) {
+    const kids = (childrenOf.get(task.id) || []).map(id => byID.get(id)).filter(Boolean);
+    const cleanSubject = (task.subject || '').replace(teamPrefix, '').trim();
+    // 从 subject "[team] stage-name" 中取出 "stage-name" 去匹配 checkpoint
+    // 允许多段: 若 stage.Name 本身有空格先整体匹配, 否则取第一段
+    const cp = cpByStage.get(cleanSubject) || cpByStage.get(cleanSubject.split(/\s+/)[0] || '');
+
+    const node = h('div', { class: 'plan-node',
+      style: { borderLeft: depth > 0 ? '2px solid rgba(140,160,220,0.2)' : 'none',
+               marginLeft: depth > 0 ? '14px' : '0',
+               paddingLeft: depth > 0 ? '12px' : '0',
+               marginBottom: '8px' } });
+
+    const head = h('div', {
+      style: { display: 'flex', alignItems: 'center', gap: '8px',
+               flexWrap: 'wrap',
+               padding: '8px 10px',
+               background: 'rgba(255,255,255,0.03)',
+               border: '1px solid rgba(140,160,220,0.15)',
+               borderRadius: '8px' },
+    }, [
+      h('span', { class: 'badge ' + statusBadgeClass(task.status) }, task.status || '—'),
+      h('strong', { style: { fontSize: '13px' } }, cleanSubject || task.id),
+      task.owner ? h('span', { class: 'badge accent', title: '执行 Agent' }, '👤 ' + task.owner) : null,
+      cp ? h('span', {
+        class: 'badge ' + (cp.status === 'saved' || cp.status === 'completed' ? 'ok' : (cp.status === 'failed' ? 'err' : '')),
+        title: '检查点状态: ' + (cp.status || '—') + (cp.savedAt ? ' @ ' + cp.savedAt : ''),
+      }, '✓ 检查点: ' + (cp.status || '—')) : h('span', { class: 'muted small' }, '无检查点'),
+      task.priority ? h('span', { class: 'badge' }, '★ ' + task.priority) : null,
+      (task.dependsOn && task.dependsOn.length > 1)
+        ? h('span', { class: 'badge ghost', title: '依赖: ' + task.dependsOn.join(', ') },
+            '⇠ ' + (task.dependsOn.length - 1) + ' 额外依赖')
+        : null,
+      task.updatedAt
+        ? h('span', { class: 'muted small', style: { marginLeft: 'auto' } }, fmtRel(task.updatedAt))
+        : null,
+    ].filter(Boolean));
+
+    node.appendChild(head);
+
+    // 内容: description / activeForm / error
+    if (task.description || task.activeForm) {
+      node.appendChild(h('div', {
+        style: { marginTop: '4px', marginLeft: '4px', padding: '6px 10px',
+                 background: 'rgba(140,160,220,0.05)',
+                 borderRadius: '6px', fontSize: '12px', lineHeight: '1.5' },
+      }, (task.description || task.activeForm || '').slice(0, 360)));
+    }
+    // checkpoint error (若有)
+    if (cp && cp.error) {
+      node.appendChild(h('div', {
+        class: 'err',
+        style: { marginTop: '4px', marginLeft: '4px', padding: '6px 10px',
+                 background: 'rgba(220,80,80,0.08)', borderRadius: '6px', fontSize: '12px' },
+        title: cp.error,
+      }, '✗ 检查点错误: ' + cp.error.slice(0, 200)));
+    }
+
+    // 递归子节点
+    if (kids.length) {
+      const childWrap = h('div', { style: { marginTop: '6px' } });
+      for (const k of kids) {
+        childWrap.appendChild(renderPlanTaskNode(k, byID, childrenOf, cpByStage, teamPrefix, depth + 1));
+      }
+      node.appendChild(childWrap);
+    }
+    return node;
   }
 
   // renderDAGNodeCard: 富信息 DAG 节点卡片
@@ -2147,41 +2391,218 @@
   // ==================================================================
   // 10. Tasks (空数据容错)
   // ==================================================================
+  // v1.5 Tasks 页面重写:
+  //   - 滚动条: 表格容器 max-height 70vh
+  //   - 过滤器: 状态 / owner (agent) / team / 优先级
+  //   - 语义搜索: 使用 /api/search?type=task 按 token 相关度排序 (内部已实现)
+  //   - 普通搜索: 客户端 substring, 秒级响应
+  //
+  // 团队名解析: 团队 workflow engine 创建 task 时 Subject 形如 "[team-xxx] stage-yyy",
+  // 这里用正则 /^\[([^\]]+)\]/ 反推 team 名称, 无需后端改动。
   async function renderTasks() {
-    let list;
-    try { list = await api('/api/tasks'); } catch (e) { list = []; toast('Tasks 加载失败: ' + e.message, 'err'); }
     const v = $('#view');
+    v.innerHTML = '<div class="loading">加载任务…</div>';
+    let list;
+    try { list = await api('/api/tasks'); }
+    catch (e) { v.innerHTML = ''; v.appendChild(h('div', { class: 'empty', style: { color: 'var(--red)' } }, '加载失败: ' + e.message)); return; }
+    list = Array.isArray(list) ? list : [];
     v.innerHTML = '';
-    if (!Array.isArray(list) || !list.length) { v.appendChild(h('div', { class: 'empty' }, '无 V2 任务数据')); return; }
-    const counts = { pending: 0, running: 0, completed: 0, failed: 0, blocked: 0, other: 0 };
+
+    // ---- 抽 team 名 & 去重聚合 ----
+    const teamRe = /^\[([^\]]+)\]/;
+    const teamSet = new Set();
+    const ownerSet = new Set();
+    const statusSet = new Set();
+    for (const t of list) {
+      const m = (t.subject || '').match(teamRe);
+      t._team = m ? m[1] : '';
+      if (t._team) teamSet.add(t._team);
+      if (t.owner) ownerSet.add(t.owner);
+      if (t.status) statusSet.add(t.status);
+    }
+
+    // ---- 顶部概览 ----
+    const counts = { pending: 0, running: 0, in_progress: 0, completed: 0, failed: 0, blocked: 0, other: 0 };
     for (const t of list) {
       if (counts[t.status] != null) counts[t.status]++;
       else counts.other++;
     }
+    const running = (counts.running || 0) + (counts.in_progress || 0);
     v.appendChild(h('div', { class: 'grid grid-4 mb-16' }, [
-      statCard('任务总数', list.length, `运行中 ${counts.running}`, 'accent'),
-      statCard('已完成', counts.completed, '', 'ok'),
-      statCard('失败', counts.failed, '', counts.failed > 0 ? 'err' : ''),
-      statCard('待处理', counts.pending + counts.blocked, `pending ${counts.pending} / blocked ${counts.blocked}`, 'warn'),
+      statCard('任务总数', list.length, '运行中 ' + running, 'accent'),
+      statCard('已完成', counts.completed || 0, '', 'ok'),
+      statCard('失败', counts.failed || 0, '', (counts.failed || 0) > 0 ? 'err' : ''),
+      statCard('待处理', (counts.pending || 0) + (counts.blocked || 0),
+        `pending ${counts.pending || 0} / blocked ${counts.blocked || 0}`, 'warn'),
     ]));
-    const tbl = h('table', { class: 'tbl' });
-    tbl.appendChild(h('thead', {}, h('tr', {}, [
-      h('th', {}, 'ID'), h('th', {}, '主题'), h('th', {}, '状态'),
-      h('th', {}, '负责人'), h('th', {}, '优先级'), h('th', {}, '依赖'),
-    ])));
-    const tb = h('tbody');
-    for (const t of list) {
-      tb.appendChild(h('tr', {}, [
-        h('td', {}, t.id),
-        h('td', {}, t.subject || '—'),
-        h('td', {}, h('span', { class: 'badge ' + statusBadgeClass(t.status) }, t.status || '—')),
-        h('td', {}, t.owner || '—'),
-        h('td', {}, String(t.priority || 0)),
-        h('td', {}, (t.dependsOn || []).join(', ') || '—'),
-      ]));
+
+    // ---- 过滤器工具栏 ----
+    const qInp = h('input', {
+      class: 'input', placeholder: '搜索: 关键词 (回车做语义排序)…', style: { minWidth: '260px' }
+    });
+    const stSel = h('select', { class: 'select' }, [
+      h('option', { value: '' }, '全部状态'),
+      ...[...statusSet].sort().map(s => h('option', { value: s }, s)),
+    ]);
+    const ownerSel = h('select', { class: 'select' }, [
+      h('option', { value: '' }, '全部 Agent/Owner'),
+      ...[...ownerSet].sort().map(o => h('option', { value: o }, o)),
+    ]);
+    const teamSel = h('select', { class: 'select' }, [
+      h('option', { value: '' }, '全部团队'),
+      ...[...teamSet].sort().map(t => h('option', { value: t }, t)),
+    ]);
+    const semBtn = h('input', { type: 'checkbox' });
+    const sortSel = h('select', { class: 'select' }, [
+      h('option', { value: 'updated' }, '最近更新'),
+      h('option', { value: 'created' }, '最近创建'),
+      h('option', { value: 'priority' }, '优先级'),
+      h('option', { value: 'status' }, '状态'),
+    ]);
+    const hdr = h('div', { class: 'toolbar-row mb-12' }, [
+      h('strong', {}, '任务总数: ' + list.length),
+      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        qInp, stSel, ownerSel, teamSel,
+        h('label', { class: 'muted small', style: { display: 'flex', alignItems: 'center', gap: '4px' } },
+          [semBtn, ' 语义搜索']),
+        h('span', { class: 'muted small' }, '排序:'),
+        sortSel,
+        h('button', { class: 'btn small', onClick: () => {
+          qInp.value = ''; stSel.value = ''; ownerSel.value = ''; teamSel.value = ''; semBtn.checked = false;
+          runRender();
+        } }, '清空'),
+      ]),
+    ]);
+    v.appendChild(hdr);
+
+    // ---- 可滚动卡片容器 ----
+    //   任务很多时 (上百行) 锁死 70vh, 浏览器滚动条出现, 不污染页面其它区域
+    const host = h('div', {
+      class: 'card',
+      style: { maxHeight: '70vh', overflow: 'auto', padding: '12px' },
+    });
+    v.appendChild(host);
+
+    // ---- 语义搜索缓存: {query -> ordered list of task IDs} ----
+    const semaCache = new Map();
+
+    async function semanticOrder(q) {
+      if (!q) return null;
+      if (semaCache.has(q)) return semaCache.get(q);
+      try {
+        const hits = await api('/api/search?type=task&limit=200&q=' + encodeURIComponent(q));
+        const ids = Array.isArray(hits) ? hits.map(x => x.id) : [];
+        semaCache.set(q, ids);
+        return ids;
+      } catch (_) { return null; }
     }
-    tbl.appendChild(tb);
-    v.appendChild(h('div', { class: 'card' }, [h('h3', {}, '任务列表'), tbl]));
+
+    async function runRender() {
+      host.innerHTML = '<div class="loading">过滤中…</div>';
+      const q = (qInp.value || '').trim().toLowerCase();
+      const st = stSel.value;
+      const own = ownerSel.value;
+      const tm = teamSel.value;
+      const sortKey = sortSel.value;
+
+      // 基础过滤
+      let rows = list.filter(t => {
+        if (st && t.status !== st) return false;
+        if (own && t.owner !== own) return false;
+        if (tm && t._team !== tm) return false;
+        if (q && !semBtn.checked) {
+          const blob = ((t.subject || '') + ' ' + (t.description || '') + ' ' + (t.id || '') + ' ' + (t._team || '')).toLowerCase();
+          if (!blob.includes(q)) return false;
+        }
+        return true;
+      });
+
+      // 语义搜索: 按后端 /api/search 返回的顺序重排 (分词 + scoreTokens)
+      if (q && semBtn.checked) {
+        const order = await semanticOrder(q);
+        if (order && order.length) {
+          const rank = new Map();
+          order.forEach((id, idx) => rank.set(id, idx));
+          const inSet = new Set(order);
+          rows = rows.filter(t => inSet.has(t.id));
+          rows.sort((a, b) => (rank.get(a.id) ?? 1e9) - (rank.get(b.id) ?? 1e9));
+        } else {
+          rows = [];
+        }
+      } else {
+        // 非语义: 按排序键
+        const key = {
+          updated: t => -(new Date(t.updatedAt || 0).getTime()),
+          created: t => -(new Date(t.createdAt || 0).getTime()),
+          priority: t => -(t.priority || 0),
+          status:   t => (t.status || ''),
+        }[sortKey] || (t => 0);
+        rows.sort((a, b) => {
+          const ka = key(a), kb = key(b);
+          if (typeof ka === 'string') return ka.localeCompare(kb);
+          return ka - kb;
+        });
+      }
+
+      host.innerHTML = '';
+      host.appendChild(h('div', { class: 'muted small mb-12' },
+        '匹配 ' + rows.length + ' / ' + list.length +
+        (semBtn.checked && q ? ' · 语义排序' : '') +
+        (st || own || tm ? ' · 过滤: ' + [st, own, tm].filter(Boolean).join(' / ') : '')));
+      if (!rows.length) {
+        host.appendChild(h('div', { class: 'empty' }, '无匹配任务'));
+        return;
+      }
+
+      const tbl = h('table', { class: 'tbl' });
+      tbl.appendChild(h('thead', {}, h('tr', {}, [
+        h('th', {}, 'ID'), h('th', {}, '主题 / Team'), h('th', {}, '状态'),
+        h('th', {}, 'Owner/Agent'), h('th', {}, '优先级'),
+        h('th', {}, '依赖'), h('th', {}, '更新时间'),
+      ])));
+      const tb = h('tbody');
+      for (const t of rows) {
+        // Subject 里若已有 "[team] xxx" 前缀, 把 [team] 染色成 badge
+        const subjectCell = h('td', {});
+        if (t._team) {
+          subjectCell.appendChild(h('a', {
+            class: 'badge accent',
+            href: '#/teams/' + encodeURIComponent(t._team),
+            style: { textDecoration: 'none', marginRight: '6px', cursor: 'pointer' },
+          }, t._team));
+          subjectCell.appendChild(document.createTextNode((t.subject || '').replace(teamRe, '').trim() || '—'));
+        } else {
+          subjectCell.textContent = t.subject || '—';
+        }
+        tb.appendChild(h('tr', {}, [
+          h('td', { style: { fontFamily: 'monospace', fontSize: '11.5px' } }, t.id),
+          subjectCell,
+          h('td', {}, h('span', { class: 'badge ' + statusBadgeClass(t.status) }, t.status || '—')),
+          h('td', {}, t.owner || '—'),
+          h('td', {}, String(t.priority || 0)),
+          h('td', {}, (t.dependsOn || []).length
+            ? h('span', { title: (t.dependsOn || []).join(', ') }, String((t.dependsOn || []).length) + ' 依赖')
+            : '—'),
+          h('td', { class: 'muted small' }, t.updatedAt ? fmtRel(t.updatedAt) : (t.createdAt ? fmtRel(t.createdAt) : '—')),
+        ]));
+      }
+      tbl.appendChild(tb);
+      host.appendChild(tbl);
+    }
+
+    // 绑定事件
+    let qTimer = null;
+    qInp.addEventListener('input', () => {
+      clearTimeout(qTimer);
+      qTimer = setTimeout(runRender, 120);
+    });
+    stSel.addEventListener('change', runRender);
+    ownerSel.addEventListener('change', runRender);
+    teamSel.addEventListener('change', runRender);
+    semBtn.addEventListener('change', runRender);
+    sortSel.addEventListener('change', runRender);
+
+    runRender();
   }
 
   // ==================================================================
@@ -3587,6 +4008,8 @@
     $('#refresh-btn').addEventListener('click', () => navigate());
     const sBtn = $('#stream-btn');
     if (sBtn) sBtn.addEventListener('click', toggleSSE);
+    const arBtn = document.getElementById('autorefresh-btn');
+    if (arBtn) arBtn.addEventListener('click', toggleAutoRefresh);
 
     // global search
     const gs = $('#global-search');

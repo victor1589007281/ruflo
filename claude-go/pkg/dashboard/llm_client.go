@@ -52,13 +52,62 @@ var (
 	llmInitErr    error
 	llmClientMu   sync.Mutex // 保护 Reload 场景
 	llmCacheUntil time.Time
+	llmInjected   bool // 标记是否由外部注入 (如飞书 bot)
 )
 
+// SetSharedLLMClient 由外部注入已配置好的 LLM 客户端。
+// 当 dashboard 跟随飞书 bot 一起启动时, bot 应调用此函数注入其 aiClient,
+// 确保 dashboard 诊断使用与 bot 完全相同的模型配置, 而非自行猜测。
+// 注入后 GetSharedLLMClient 将始终返回该客户端, 不再自行解析。
+func SetSharedLLMClient(client *api.Client) {
+	if client == nil {
+		return
+	}
+	llmClientMu.Lock()
+	defer llmClientMu.Unlock()
+	llmClient = client
+	llmProfile = buildProfileFromClient(client)
+	llmInitErr = nil
+	llmInjected = true
+	llmCacheUntil = time.Now().Add(24 * time.Hour) // 注入的客户端长期有效
+}
+
+// buildProfileFromClient 从 api.Client 构建 LLMProfile 用于展示。
+func buildProfileFromClient(client *api.Client) LLMProfile {
+	provider := "compatible"
+	if client.BaseURL != "" {
+		lb := strings.ToLower(client.BaseURL)
+		switch {
+		case strings.Contains(lb, "anthropic.com"):
+			provider = "anthropic"
+		case strings.Contains(lb, "dashscope") || strings.Contains(lb, "aliyuncs.com"):
+			provider = "dashscope"
+		case strings.Contains(lb, "openai.com"):
+			provider = "openai"
+		case strings.Contains(lb, "moonshot"):
+			provider = "moonshot"
+		}
+	} else {
+		provider = "dashscope"
+	}
+	return LLMProfile{
+		Source:   "injected:bot",
+		Provider: provider,
+		BaseURL:  client.BaseURL,
+		Model:    client.Model,
+		HasAPIKey: client.APIKey != "",
+	}
+}
+
 // GetSharedLLMClient 返回全局共享的 LLM 客户端 (带 profile)。
-// 缓存 5 分钟, 之后自动重载 (容忍用户在运行中修改 claude-go.json)。
+// 若已通过 SetSharedLLMClient 注入, 直接返回注入的客户端。
+// 否则缓存 5 分钟, 之后自动重载 (容忍用户在运行中修改 claude-go.json)。
 func GetSharedLLMClient() (*api.Client, LLMProfile, error) {
 	llmClientMu.Lock()
 	defer llmClientMu.Unlock()
+	if llmInjected && llmClient != nil {
+		return llmClient, llmProfile, nil
+	}
 	if llmClient != nil && time.Now().Before(llmCacheUntil) {
 		return llmClient, llmProfile, llmInitErr
 	}
@@ -72,6 +121,7 @@ func ResetSharedLLMClient() {
 	llmClientMu.Lock()
 	defer llmClientMu.Unlock()
 	llmClient = nil
+	llmInjected = false
 	llmCacheUntil = time.Time{}
 }
 
@@ -126,33 +176,68 @@ func resolveLLMClient() (*api.Client, LLMProfile, error) {
 	if apiKey == "" {
 		return nil, profile, ErrLLMNotConfigured
 	}
+
+	// ---------------------------------------------------------------
+	// Provider-aware model default.
+	//
+	// 以前 bug: 当 claude-go.json 只配 ai.apiKey + ai.baseUrl 而没有 ai.model,
+	// 会固定 fallback 到 "claude-haiku-4-5", 直接打到 DashScope/Qwen 网关会得到
+	// 400 invalid_parameter_error "model claude-haiku-4-5 is not supported".
+	//
+	// 现在根据 baseURL 推断 provider, 选择该 provider 实际支持的模型:
+	//   anthropic.com                        -> claude-haiku-4-5
+	//   dashscope (aliyuncs.com / dashscope) -> qwen3.5-plus  (与 feishu bot 默认一致)
+	//   其他 OpenAI 兼容                      -> 若 cfg 仍未给, 退回 qwen3.5-plus (最广泛可用)
+	//   空 baseURL (走 DashScope SDK)         -> qwen3.5-plus
+	// ---------------------------------------------------------------
+	provider := "compatible"
+	if baseURL != "" {
+		lb := strings.ToLower(baseURL)
+		switch {
+		case strings.Contains(lb, "anthropic.com"):
+			provider = "anthropic"
+		case strings.Contains(lb, "dashscope") || strings.Contains(lb, "aliyuncs.com"):
+			provider = "dashscope"
+		case strings.Contains(lb, "openai.com"):
+			provider = "openai"
+		case strings.Contains(lb, "moonshot"):
+			provider = "moonshot"
+		default:
+			provider = "compatible"
+		}
+	} else {
+		provider = "dashscope"
+	}
 	if model == "" {
-		model = "claude-haiku-4-5"
+		switch provider {
+		case "anthropic":
+			model = "claude-haiku-4-5"
+		case "openai":
+			model = "gpt-4o-mini"
+		case "moonshot":
+			model = "moonshot-v1-auto"
+		default:
+			// dashscope / compatible: qwen3.5-plus 与飞书 bot 默认一致
+			model = "qwen3.5-plus"
+		}
 	}
 
 	profile.Model = model
+	profile.Provider = provider
 	profile.HasAPIKey = true
 	profile.BaseURL = baseURL
 
-	// 客户端选择
+	// 客户端构造
 	var client *api.Client
 	if baseURL != "" {
 		trimmed := strings.TrimRight(baseURL, "/")
+		// 常见 DashScope 端点尾部修正
 		if strings.HasSuffix(trimmed, "/anthropic") || strings.HasSuffix(trimmed, "/compatible-mode") {
 			trimmed += "/v1"
 		}
 		client = api.NewClient(trimmed, apiKey, model)
-		switch {
-		case strings.Contains(trimmed, "anthropic.com"):
-			profile.Provider = "anthropic"
-		case strings.Contains(trimmed, "dashscope"):
-			profile.Provider = "dashscope"
-		default:
-			profile.Provider = "compatible"
-		}
 	} else {
 		client = api.NewDashScopeClient(apiKey, model)
-		profile.Provider = "dashscope"
 		if profile.Source == "" {
 			profile.Source = "dashscope-default"
 		}
@@ -191,6 +276,10 @@ func loadFeishuJSONConfig() (*feishu.JSONConfig, string, error) {
 
 // LLMComplete 封装一次 "system + user" 的对话 (非流式), 自动使用共享 client。
 // 供 dashboard 的各个诊断 handler 使用。
+//
+// 错误信息里携带 profile.Provider + profile.Model 的原因:
+// 一旦出现 "model X is not supported" / "insufficient quota" 一类的错误,
+// 用户能直接从结果页看出发生在哪个 provider + 哪个模型, 不用再翻日志。
 func LLMComplete(ctx context.Context, system, user string, timeout time.Duration) (string, LLMProfile, error) {
 	client, profile, err := GetSharedLLMClient()
 	if err != nil {
@@ -203,7 +292,8 @@ func LLMComplete(ctx context.Context, system, user string, timeout time.Duration
 	defer cancel()
 	out, err := client.SimpleComplete(cctx, system, user)
 	if err != nil {
-		return "", profile, fmt.Errorf("llm complete: %w", err)
+		return "", profile, fmt.Errorf("llm complete (provider=%s, model=%s): %w",
+			profile.Provider, profile.Model, err)
 	}
 	return strings.TrimSpace(out), profile, nil
 }
