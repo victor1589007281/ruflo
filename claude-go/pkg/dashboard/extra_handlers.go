@@ -762,10 +762,20 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		}
 		hint = fmt.Sprintf("已排队 swarm.simulate: mode=%s objective=%q. 主进程可调用 swarm_intel.Engine.Simulate(ctx, cfg) 消费。",
 			mode, obj)
+	case "team.stop", "team.restart", "team.delete":
+		if s.cfg.TeamAction != nil {
+			if err := s.cfg.TeamAction(action, target); err != nil {
+				hint = fmt.Sprintf("操作失败: %v", err)
+			} else {
+				immediate = fmt.Sprintf("团队 %s 已执行 %s", target, action)
+			}
+		} else {
+			hint = "无主进程消费, 请通过飞书发送 /team stop " + target
+		}
 	}
 	writeJSON(w, http.StatusOK, actionResp{
 		OK:       true,
-		Queued:   true,
+		Queued:   immediate == "",
 		Message:  firstNonEmpty(immediate, "动作已排队, 等待 claude-go 主进程消费 (.claude-go/.dashboard/actions/)"),
 		Hint:     hint,
 		ActionID: actionID,

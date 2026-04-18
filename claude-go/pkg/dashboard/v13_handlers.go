@@ -512,8 +512,9 @@ type llmCacheTimePt struct {
 }
 
 type llmStatsResp struct {
-	Source       string            `json:"source"` // metrics/llm.jsonl
+	Source       string            `json:"source"`     // metrics/llm.jsonl 路径
 	Window       string            `json:"window"`
+	RawEvents    int               `json:"rawEvents"`  // 原始事件数 (调试用)
 	TotalCalls   int               `json:"totalCalls"`
 	Success      int               `json:"success"`
 	Errors       int               `json:"errors"`
@@ -550,8 +551,9 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := llmStatsResp{
-		Source: filepath.Join(s.cfg.StateDir, "metrics", "llm.jsonl"),
-		Window: window.String(),
+		Source:    filepath.Join(s.cfg.StateDir, "metrics", "llm.jsonl"),
+		Window:    window.String(),
+		RawEvents: len(events),
 	}
 
 	type callKey struct {

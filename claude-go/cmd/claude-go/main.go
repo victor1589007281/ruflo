@@ -628,9 +628,23 @@ JSON 配置文件示例:
 			// 统一 HTTP 服务: 把 dashboard 挂到 wiki API 同一端口,
 			// 避免飞书 bot 运行期间还要单独开 dashboard 进程。
 			// 前提: 配置了 Wiki.APIPort。
+			// dashTeamAction 延迟绑定: 闭包捕获 botRef，在 HTTP 启动时 bot 已初始化。
+			var botRef *feishu.Bot
+			var dashCfgRef *dashboard.Config
+
 			if config.Wiki.APIPort > 0 {
-				stateDir := resolveStateDir(config.Cwd)
-				dashCfg := dashboard.Config{StateDir: stateDir}
+				// 与 bot 使用相同的 stateDir 解析逻辑，确保 dashboard 读写 metrics 路径一致。
+				stateDir := basedir.ResolveDefault(config.StateDir, config.Cwd)
+				dashCfg := dashboard.Config{
+					StateDir: stateDir,
+					TeamAction: func(action, teamName string) error {
+						if botRef == nil {
+							return fmt.Errorf("bot 尚未初始化")
+						}
+						return botRef.DashboardTeamAction(action, teamName)
+					},
+				}
+				dashCfgRef = &dashCfg
 
 				// 将 bot 的 AI 客户端注入 dashboard, 确保诊断功能使用
 				// 与 bot 完全相同的模型配置 (model/apiKey/baseUrl)。
@@ -646,7 +660,7 @@ JSON 配置文件示例:
 
 				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 					func(mux *http.ServeMux) {
-						dashboard.MountOn(dashCfg, mux)
+						dashboard.MountOn(*dashCfgRef, mux)
 						fmt.Printf("[Dashboard] 已挂载到 wiki API 端口 %d (stateDir=%s)\n",
 							config.Wiki.APIPort, stateDir)
 					})
@@ -656,6 +670,8 @@ JSON 配置文件示例:
 			if err != nil {
 				return fmt.Errorf("创建飞书机器人失败: %w", err)
 			}
+			botRef = bot
+			_ = dashCfgRef // suppress unused warning when Wiki.APIPort == 0
 
 			// 优雅退出: 捕获 SIGINT/SIGTERM
 			ctx, cancel := context.WithCancel(context.Background())

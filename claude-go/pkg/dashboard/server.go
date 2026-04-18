@@ -19,11 +19,15 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
+// TeamActionFunc 团队操作回调: action 可为 "stop"/"restart"/"delete"。
+type TeamActionFunc func(action, teamName string) error
+
 // Config dashboard 启动配置。
 type Config struct {
-	StateDir string        // 数据根目录 (.claude-go)
-	Addr     string        // 监听地址, 例如 "127.0.0.1:7777"
-	CacheTTL time.Duration // 数据缓存 TTL, 0 禁用
+	StateDir   string         // 数据根目录 (.claude-go)
+	Addr       string         // 监听地址, 例如 "127.0.0.1:7777"
+	CacheTTL   time.Duration  // 数据缓存 TTL, 0 禁用
+	TeamAction TeamActionFunc // 团队操作回调 (stop/restart/delete)，为 nil 时仅排队
 }
 
 // Server HTTP 服务。

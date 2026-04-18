@@ -10,6 +10,8 @@
 package metrics
 
 import (
+	"log"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -31,6 +33,8 @@ func InitGlobalLLMCollector(stateDir string) *Collector {
 	}
 	c := NewCollector(stateDir)
 	llmGlobal = c
+	llmPath := filepath.Join(stateDir, "metrics", "llm.jsonl")
+	log.Printf("[metrics] LLM 指标采集已初始化: %s", llmPath)
 	api.SetGlobalLLMMetricsHook(func(rec api.LLMCallRecord) {
 		recordLLMCall(c, rec)
 	})

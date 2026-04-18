@@ -658,6 +658,26 @@ func (b *Bot) Shutdown() {
 	b.mcpMgr.Shutdown()
 }
 
+// DashboardTeamAction 供 dashboard 直接调用的团队操作 (stop/restart/delete)。
+func (b *Bot) DashboardTeamAction(action, teamName string) error {
+	if b.teamMgr == nil {
+		return fmt.Errorf("teamMgr 未初始化")
+	}
+	switch action {
+	case "stop":
+		return b.teamMgr.StopTeam(teamName)
+	case "delete":
+		return b.teamMgr.DeleteTeam(teamName)
+	case "restart":
+		if err := b.teamMgr.StopTeam(teamName); err != nil {
+			return fmt.Errorf("停止失败: %w", err)
+		}
+		return b.teamMgr.RunTeam(teamName, "")
+	default:
+		return fmt.Errorf("未知操作: %s", action)
+	}
+}
+
 // --- Cron 执行器适配器 ---
 
 type botCronExecutor struct {
