@@ -814,6 +814,9 @@ func buildEngine() (*engine.QueryEngine, error) {
 		apiClient = api.NewDashScopeClient(apiKey, effectiveModel)
 	}
 
+	// 全局 LLM 准入控制器: RPM 令牌桶 + 并发信号量 + AIMD
+	apiClient.Guard = api.NewRateLimitGuard(api.DefaultGuardConfig())
+
 	mcpConns, err := connectMCP(context.Background(), flagMCPConfig)
 	if err != nil {
 		return nil, fmt.Errorf("MCP 配置: %w", err)

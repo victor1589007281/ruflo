@@ -65,6 +65,7 @@ type Client struct {
 	RetryMax   time.Duration // 退避上限, 默认 60s
 
 	OnLLMEvent LLMEventFunc // 事件回调 (可选, 注入飞书通知)
+	Guard      *RateLimitGuard // 全局准入控制器 (可选, 强烈建议设置)
 
 	// 熔断器
 	cbMu             sync.Mutex
@@ -209,6 +210,13 @@ func (c *Client) StreamMessage(
 			return
 		}
 
+		// 全局准入控制
+		var guardRelease func()
+		if c.Guard != nil {
+			guardRelease = c.Guard.Acquire()
+			defer guardRelease()
+		}
+
 		var system interface{}
 		if len(systemPrompt) == 1 {
 			system = systemPrompt[0]
@@ -284,13 +292,16 @@ func (c *Client) StreamMessage(
 
 			if resp.StatusCode == 200 {
 				c.recordSuccess()
+				if c.Guard != nil {
+					c.Guard.OnSuccess()
+				}
 				break
 			}
 
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
-			// 不可重试: prompt_too_long / refusal / 4xx
+			// 不可重试: prompt_too_long / refusal / 4xx (不计入熔断器)
 			var apiErr types.APIError
 			if json.Unmarshal(respBody, &apiErr) == nil {
 				errType := apiErr.Error.Type
@@ -305,18 +316,40 @@ func (c *Client) StreamMessage(
 			}
 
 			if !isRetryableStatus(resp.StatusCode) {
-				c.recordFailure(string(respBody))
 				errCh <- fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 				return
+			}
+
+			// 429 分类 + Guard 通知
+			retryAfterSec := ParseRetryAfter(resp, respBody)
+			if resp.StatusCode == 429 {
+				kind := Classify429(resp.StatusCode, string(respBody))
+				if !kind.ShouldRetry() {
+					errCh <- fmt.Errorf("API 429 (%s): %s", kind, string(respBody))
+					return
+				}
+				if c.Guard != nil {
+					c.Guard.On429(retryAfterSec)
+				}
+			} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
+				if c.Guard != nil {
+					c.Guard.On429(retryAfterSec)
+				}
 			}
 
 			// 可重试: 429 / 503 / 529 / 5xx
 			if attempt < maxRetry {
 				delay := c.retryDelay(attempt, resp.StatusCode)
+				if retryAfterSec > 0 {
+					raDelay := time.Duration(retryAfterSec*1000)*time.Millisecond + time.Duration(rand.Float64()*2000)*time.Millisecond
+					if raDelay > delay {
+						delay = raDelay
+					}
+				}
 				c.TotalRetries.Add(1)
 				statusHint := "服务端错误"
 				if resp.StatusCode == 429 {
-					statusHint = "限流(429)"
+					statusHint = fmt.Sprintf("限流(%s)", Classify429(resp.StatusCode, string(respBody)))
 				} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
 					statusHint = "过载"
 				}
@@ -404,7 +437,7 @@ func (c *Client) StreamMessage(
 	return eventCh, errCh
 }
 
-// SendMessage 非流式发送消息 (内置 429/5xx 自动重试 + 熔断)。
+// SendMessage 非流式发送消息 (内置全局准入 + 429/5xx 自动重试 + 熔断)。
 func (c *Client) SendMessage(
 	ctx context.Context,
 	messages []types.APIMessage,
@@ -415,6 +448,13 @@ func (c *Client) SendMessage(
 	if c.isCircuitOpen() {
 		c.fireEvent("circuit_open", "熔断器开启, SendMessage 被拒绝")
 		return nil, fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
+	}
+
+	// 全局准入控制 (RPM 令牌桶 + 并发信号量)
+	var guardRelease func()
+	if c.Guard != nil {
+		guardRelease = c.Guard.Acquire()
+		defer guardRelease()
 	}
 
 	var system interface{}
@@ -493,6 +533,9 @@ func (c *Client) SendMessage(
 
 		if resp.StatusCode == 200 {
 			c.recordSuccess()
+			if c.Guard != nil {
+				c.Guard.OnSuccess()
+			}
 			var result types.APIResponse
 			if err := json.Unmarshal(respBody, &result); err != nil {
 				return nil, fmt.Errorf("解析响应失败: %w", err)
@@ -500,25 +543,54 @@ func (c *Client) SendMessage(
 			return &result, nil
 		}
 
-		// 不可重试的客户端错误 (400/401/403)
+		// 不可重试的客户端错误 (400/401/403) — 不计入熔断器
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 && !isRetryableStatus(resp.StatusCode) {
-			c.recordFailure(string(respBody))
 			return nil, fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 		}
 
 		// 可重试: 429 / 5xx
 		lastErr = fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
+
+		// 解析 Retry-After + 分类 429
+		retryAfterSec := ParseRetryAfter(resp, respBody)
+		if resp.StatusCode == 429 {
+			kind := Classify429(resp.StatusCode, string(respBody))
+			if !kind.ShouldRetry() {
+				return nil, fmt.Errorf("API 429 (%s): %s", kind, string(respBody))
+			}
+			if c.Guard != nil {
+				c.Guard.On429(retryAfterSec)
+			}
+		} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
+			if c.Guard != nil {
+				c.Guard.On429(retryAfterSec) // 过载也触发 AIMD 降速
+			}
+		}
+
 		if attempt < maxRetry {
 			delay := c.retryDelay(attempt, resp.StatusCode)
+			// 优先使用 Retry-After
+			if retryAfterSec > 0 {
+				raDelay := time.Duration(retryAfterSec*1000) * time.Millisecond
+				jitter := time.Duration(rand.Float64()*2000) * time.Millisecond
+				raDelay += jitter
+				if raDelay > delay {
+					delay = raDelay
+				}
+			}
 			c.TotalRetries.Add(1)
 			statusHint := "服务端错误"
 			if resp.StatusCode == 429 {
-				statusHint = "限流(429)"
+				statusHint = fmt.Sprintf("限流(%s)", Classify429(resp.StatusCode, string(respBody)))
 			} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
 				statusHint = "过载"
 			}
-			log.Printf("[api] SendMessage %s(尝试 %d/%d): %.0fs 后重试", statusHint, attempt+1, maxRetry+1, delay.Seconds())
-			c.fireEvent("retry", fmt.Sprintf("LLM %s(尝试 %d/%d), %.0fs 后重试", statusHint, attempt+1, maxRetry+1, delay.Seconds()))
+			guardStats := ""
+			if c.Guard != nil {
+				guardStats = " [" + c.Guard.Stats() + "]"
+			}
+			log.Printf("[api] SendMessage %s(尝试 %d/%d): %.0fs 后重试%s", statusHint, attempt+1, maxRetry+1, delay.Seconds(), guardStats)
+			c.fireEvent("retry", fmt.Sprintf("LLM %s(尝试 %d/%d), %.0fs 后重试%s", statusHint, attempt+1, maxRetry+1, delay.Seconds(), guardStats))
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():

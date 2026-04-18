@@ -1592,15 +1592,21 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	return sr
 }
 
-// executeParallel 并行执行多个阶段
+// maxWorkflowParallel 限制 workflow 层并行 LLM 调用上限, 配合全局 Guard 防止突发
+const maxWorkflowParallel = 6
+
+// executeParallel 并行执行多个阶段 (带并发上限)
 func (we *WorkflowExecutor) executeParallel(ctx context.Context, stages []StageDef, objective string, prevResults map[string]string, team *ProductionTeam) []StageResult {
 	results := make([]StageResult, len(stages))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxWorkflowParallel)
 
 	for i, stage := range stages {
 		wg.Add(1)
 		go func(idx int, s StageDef) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			results[idx] = we.executeStage(ctx, s, objective, prevResults, team)
 		}(i, stage)
 	}

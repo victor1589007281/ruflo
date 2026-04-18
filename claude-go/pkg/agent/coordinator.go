@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -233,20 +234,32 @@ func (c *Coordinator) executeStageWithRetry(
 		c.saveCheckpoint(stage.Name, "failed", attempt, sr.Error)
 
 		if attempt < c.maxRetries {
-			// 429/限流/熔断 → 更长退避 (基数 ×3)
 			base := 2 * time.Second
 			errLower := strings.ToLower(sr.Error)
 			isRateLimit := strings.Contains(sr.Error, "429") ||
 				strings.Contains(errLower, "rate limit") ||
+				strings.Contains(errLower, "rate_limit") ||
+				strings.Contains(errLower, "throttl") ||
 				strings.Contains(errLower, "限流") ||
-				strings.Contains(errLower, "熔断")
+				strings.Contains(errLower, "熔断") ||
+				strings.Contains(errLower, "overloaded") ||
+				strings.Contains(errLower, "过载") ||
+				strings.Contains(errLower, "503") ||
+				strings.Contains(errLower, "529") ||
+				strings.Contains(errLower, "burstrate") ||
+				strings.Contains(errLower, "allocationquota") ||
+				strings.Contains(errLower, "ratequota")
 			if isRateLimit {
-				base = 10 * time.Second
+				base = 15 * time.Second
 			}
 			backoff := time.Duration(1<<uint(attempt)) * base
 			if backoff > 120*time.Second {
 				backoff = 120 * time.Second
 			}
+			// 全抖动 (full jitter) 防止雷群效应
+			jitter := time.Duration(rand.Float64() * float64(backoff))
+			backoff = backoff/2 + jitter
+
 			retryHint := ""
 			if isRateLimit {
 				retryHint = " (LLM 限流中, 延长等待)"

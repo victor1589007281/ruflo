@@ -404,7 +404,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 
 	// 使用 Coordinator 带重试和检查点执行
 	coord := NewCoordinator(ptm.pool, ptm.taskTracker, ptm.notify, CoordinatorConfig{
-		MaxRetries:    3, // 增加重试次数 (429 限流场景需要更多重试)
+		MaxRetries:    6, // 限流场景需要更多重试 (429 + AIMD 退避后可恢复)
 		HeartbeatFreq: 30 * time.Second,
 		DataDir:       team.dataDir,
 		ChatID:        team.ChatID,
