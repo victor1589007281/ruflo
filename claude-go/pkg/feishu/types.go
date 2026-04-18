@@ -30,6 +30,7 @@ package feishu
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 )
@@ -148,6 +149,10 @@ type WikiConfig struct {
 	APIPort int
 	// APISecret API 鉴权密钥 (Bearer token)
 	APISecret string
+	// APIExtensions 当 APIPort > 0 时在 wikiAPIServer.Start 前被调用,
+	// 允许外部模块 (dashboard 等) 把自己的路由挂到同一 HTTP 端口,
+	// 避免开多个监听端口。调用方负责保证路由 pattern 与 /wiki/* 不冲突。
+	APIExtensions []func(mux *http.ServeMux) `json:"-"`
 }
 
 // DefaultBotConfig 返回默认配置

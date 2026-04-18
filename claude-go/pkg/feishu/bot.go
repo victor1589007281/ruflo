@@ -422,10 +422,20 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			}
 		})
 		// 启动 Wiki HTTP API (供 Obsidian 插件调用)
+		// 同端口还可以通过 config.Wiki.APIExtensions 扩展挂载 dashboard 等 HTTP 服务,
+		// 避免飞书 bot / dashboard 同时监听多个端口。
 		if config.Wiki.APIPort > 0 {
 			wikiAPI := wiki.NewAPIServer(bot.wikiEngine, config.Wiki.APISecret)
+			for _, ext := range config.Wiki.APIExtensions {
+				if ext == nil {
+					continue
+				}
+				ext(wikiAPI.Mux())
+			}
 			if err := wikiAPI.Start(config.Wiki.APIPort); err != nil {
 				log.Printf("[Wiki API] 启动失败: %v", err)
+			} else if len(config.Wiki.APIExtensions) > 0 {
+				log.Printf("[Wiki API] 已挂载 %d 个外部扩展 (如 dashboard)", len(config.Wiki.APIExtensions))
 			}
 		}
 	}

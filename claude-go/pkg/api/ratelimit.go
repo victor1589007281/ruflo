@@ -256,6 +256,62 @@ func (g *RateLimitGuard) Stats() string {
 		rpmTok, g.Total429s.Load(), pauseLeft.Round(time.Second))
 }
 
+// GuardSnapshot RateLimitGuard 的结构化运行态快照。
+// dashboard / 诊断系统拉取实时限流/并发状态, 进行可视化与分析。
+type GuardSnapshot struct {
+	// 并发信号量
+	InFlight    int32 `json:"inFlight"`    // 当前在途请求数
+	MaxParallel int32 `json:"maxParallel"` // AIMD 当前允许的最大并发
+	HardMax     int32 `json:"hardMax"`     // 并发硬上限
+	HardMin     int32 `json:"hardMin"`     // 并发硬下限
+
+	// RPM 令牌桶
+	RPMCapacity float64 `json:"rpmCapacity"` // 令牌桶容量 (每分钟请求)
+	RPMAvailable float64 `json:"rpmAvailable"` // 当前可用令牌
+
+	// 全局退避
+	PauseSecondsLeft float64 `json:"pauseSecondsLeft"` // 距离退避结束的秒数 (0=正常)
+
+	// 累计计数
+	TotalAcquires int64 `json:"totalAcquires"` // 总尝试获取次数
+	TotalWaits    int64 `json:"totalWaits"`    // 等待令牌/退避次数
+	Total429s     int64 `json:"total429s"`     // 收到 429 次数
+	TotalSuccess  int64 `json:"totalSuccess"`  // 成功计数
+	AIMDCuts      int64 `json:"aimdCuts"`      // AIMD 降并发次数
+
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// Snapshot 读取当前限流器的结构化快照, 用于 dashboard 可视化与 metrics 采集。
+func (g *RateLimitGuard) Snapshot() GuardSnapshot {
+	if g == nil {
+		return GuardSnapshot{Timestamp: time.Now()}
+	}
+	g.mu.Lock()
+	rpmTok := g.rpmTokens
+	rpmCap := g.rpmCapacity
+	pauseLeft := time.Until(g.pauseUntil)
+	g.mu.Unlock()
+	if pauseLeft < 0 {
+		pauseLeft = 0
+	}
+	return GuardSnapshot{
+		InFlight:         g.inFlight.Load(),
+		MaxParallel:      atomic.LoadInt32(&g.maxInFlight),
+		HardMax:          g.hardMax,
+		HardMin:          g.hardMin,
+		RPMCapacity:      rpmCap,
+		RPMAvailable:     rpmTok,
+		PauseSecondsLeft: pauseLeft.Seconds(),
+		TotalAcquires:    g.TotalAcquires.Load(),
+		TotalWaits:       g.TotalWaits.Load(),
+		Total429s:        g.Total429s.Load(),
+		TotalSuccess:     g.TotalSuccess.Load(),
+		AIMDCuts:         g.AIMDCuts.Load(),
+		Timestamp:        time.Now(),
+	}
+}
+
 // ── 内部方法 ──
 
 func (g *RateLimitGuard) waitForPause() {

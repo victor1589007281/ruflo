@@ -59,6 +59,23 @@ func NewServer(cfg Config) *Server {
 	return s
 }
 
+// MountOn 把 dashboard 挂到外部 mux 上 (不启动独立 HTTP 监听)。
+// 用于把 dashboard 合并到飞书 bot 的 wiki API 端口等统一 HTTP 服务。
+// 返回的 Server 不可再调用 ListenAndServe, 但 provider 等仍可被外部访问。
+func MountOn(cfg Config, mux *http.ServeMux) *Server {
+	if cfg.CacheTTL == 0 {
+		cfg.CacheTTL = 2 * time.Second
+	}
+	s := &Server{
+		cfg:      cfg,
+		provider: NewProvider(cfg.StateDir, cfg.CacheTTL),
+		mux:      mux, // 复用外部 mux
+	}
+	metrics.InitGlobalLLMCollector(cfg.StateDir)
+	s.registerRoutesOn(mux)
+	return s
+}
+
 // ListenAndServe 启动 HTTP 服务, 阻塞直到被 Stop 或出错。
 func (s *Server) ListenAndServe() error {
 	ln, err := net.Listen("tcp", s.cfg.Addr)
@@ -80,54 +97,75 @@ func (s *Server) Stop(ctx context.Context) error {
 // Addr 返回实际监听地址。
 func (s *Server) Addr() string { return s.cfg.Addr }
 
+// Handler 返回内部 http.Handler, 允许外部 HTTP 服务嵌入 dashboard (例如飞书
+// bot 的 wiki API 端口统一服务)。
+func (s *Server) Handler() http.Handler { return s.mux }
+
+// RegisterOn 把 dashboard 全部路由 (包括 static + /api/* + SPA fallback) 挂到
+// 外部 mux 上, 实现多个 HTTP service 合并到同一端口。
+// 调用方需保证外部 mux 上没有冲突的 pattern。
+func (s *Server) RegisterOn(mux *http.ServeMux) {
+	s.registerRoutesOn(mux)
+}
+
 func (s *Server) registerRoutes() {
+	s.registerRoutesOn(s.mux)
+}
+
+func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	// 静态资源
 	sub, err := fs.Sub(webFS, "web")
 	if err == nil {
 		fileServer := http.FileServer(http.FS(sub))
-		s.mux.Handle("/static/", http.StripPrefix("/static/", fileServer))
+		mux.Handle("/static/", http.StripPrefix("/static/", fileServer))
 	}
 
 	// API
-	s.mux.HandleFunc("/api/health", s.handleHealth)
-	s.mux.HandleFunc("/api/overview", s.handleOverview)
-	s.mux.HandleFunc("/api/teams", s.handleTeams)
-	s.mux.HandleFunc("/api/teams/", s.handleTeamDetail)
-	s.mux.HandleFunc("/api/metrics", s.handleMetrics)
-	s.mux.HandleFunc("/api/metrics/", s.handleMetricsModule)
-	s.mux.HandleFunc("/api/cron", s.handleCron)
-	s.mux.HandleFunc("/api/dreaming", s.handleDreaming)
-	s.mux.HandleFunc("/api/evolution", s.handleEvolution)
-	s.mux.HandleFunc("/api/tasks", s.handleTasks)
-	s.mux.HandleFunc("/api/insights", s.handleInsights)
-	s.mux.HandleFunc("/api/projects", s.handleProjects)
-	s.mux.HandleFunc("/api/stream/overview", s.handleStreamOverview)
+	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/overview", s.handleOverview)
+	mux.HandleFunc("/api/teams", s.handleTeams)
+	mux.HandleFunc("/api/teams/", s.handleTeamDetail)
+	mux.HandleFunc("/api/metrics", s.handleMetrics)
+	mux.HandleFunc("/api/metrics/", s.handleMetricsModule)
+	mux.HandleFunc("/api/cron", s.handleCron)
+	mux.HandleFunc("/api/dreaming", s.handleDreaming)
+	mux.HandleFunc("/api/evolution", s.handleEvolution)
+	mux.HandleFunc("/api/tasks", s.handleTasks)
+	mux.HandleFunc("/api/insights", s.handleInsights)
+	mux.HandleFunc("/api/projects", s.handleProjects)
+	mux.HandleFunc("/api/stream/overview", s.handleStreamOverview)
 
 	// v1.1 扩展
-	s.mux.HandleFunc("/api/workflows", s.handleWorkflows)
-	s.mux.HandleFunc("/api/workflows/", s.handleWorkflow) // /api/workflows/:name
-	s.mux.HandleFunc("/api/search", s.handleSearch)
-	s.mux.HandleFunc("/api/logs/stream", s.handleLogsStream)
-	s.mux.HandleFunc("/api/logs/tail", s.handleLogsTail)
-	s.mux.HandleFunc("/api/hivemind", s.handleHiveMind)
-	s.mux.HandleFunc("/api/timeseries/", s.handleTimeSeries) // /api/timeseries/:module/:metric
-	s.mux.HandleFunc("/api/actions/", s.handleAction)        // /api/actions/{kind}/{target}
-	s.mux.HandleFunc("/api/dreaming/diagnosis", s.handleDreamingDiagnosis)
+	mux.HandleFunc("/api/workflows", s.handleWorkflows)
+	mux.HandleFunc("/api/workflows/", s.handleWorkflow) // /api/workflows/:name
+	mux.HandleFunc("/api/search", s.handleSearch)
+	mux.HandleFunc("/api/logs/stream", s.handleLogsStream)
+	mux.HandleFunc("/api/logs/tail", s.handleLogsTail)
+	mux.HandleFunc("/api/hivemind", s.handleHiveMind)
+	mux.HandleFunc("/api/timeseries/", s.handleTimeSeries) // /api/timeseries/:module/:metric
+	mux.HandleFunc("/api/actions/", s.handleAction)        // /api/actions/{kind}/{target}
+	mux.HandleFunc("/api/dreaming/diagnosis", s.handleDreamingDiagnosis)
 
 	// v1.2: backup / llm
-	s.mux.HandleFunc("/api/backups", s.handleBackupsList)
-	s.mux.HandleFunc("/api/backups/create", s.handleBackupCreate)
-	s.mux.HandleFunc("/api/backups/restore", s.handleBackupRestore)
-	s.mux.HandleFunc("/api/backups/manifest", s.handleBackupManifest)
-	s.mux.HandleFunc("/api/backups/download", s.handleBackupDownload)
-	s.mux.HandleFunc("/api/llm/status", s.handleLLMStatus)
+	mux.HandleFunc("/api/backups", s.handleBackupsList)
+	mux.HandleFunc("/api/backups/create", s.handleBackupCreate)
+	mux.HandleFunc("/api/backups/restore", s.handleBackupRestore)
+	mux.HandleFunc("/api/backups/manifest", s.handleBackupManifest)
+	mux.HandleFunc("/api/backups/download", s.handleBackupDownload)
+	mux.HandleFunc("/api/llm/status", s.handleLLMStatus)
 
 	// v1.3: 多源日志 / 团队 LLM 诊断 / LLM 统计 / 黑板写入
-	s.mux.HandleFunc("/api/logs/sources", s.handleLogsSources)
-	s.mux.HandleFunc("/api/llm/stats", s.handleLLMStats)
+	mux.HandleFunc("/api/logs/sources", s.handleLogsSources)
+	mux.HandleFunc("/api/llm/stats", s.handleLLMStats)
+
+	// v1.4: LLM 速率/熔断/限流 快照, 全量 metrics 目录 & 审计, 团队 DAG / checkpoints / logs
+	mux.HandleFunc("/api/llm/rate", s.handleLLMRate)
+	mux.HandleFunc("/api/llm/guard", s.handleLLMGuard)
+	mux.HandleFunc("/api/metrics/catalog", s.handleMetricsCatalog)
+	mux.HandleFunc("/api/metrics/coverage", s.handleMetricsCoverage)
 
 	// 根路径和 SPA fallback
-	s.mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/", s.handleIndex)
 }
 
 // ============== Handlers ==============
@@ -200,6 +238,12 @@ func (s *Server) handleTeamDetail(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"content": detail.Report})
 	case "diagnose":
 		s.handleTeamDiagnose(w, r, name)
+	case "dag":
+		s.handleTeamDAG(w, r, name)
+	case "checkpoints":
+		s.handleTeamCheckpoints(w, r, name)
+	case "logs":
+		s.handleTeamLogs(w, r, name)
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown sub-path %q", sub))
 	}

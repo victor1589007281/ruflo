@@ -421,3 +421,19 @@ const (
 	MLLMRefusalCount      = "llm_refusal_count"       // 拒答次数
 	MLLMPromptTooLong     = "llm_prompt_too_long"     // prompt 超长次数
 )
+
+// LLM 限流/熔断 指标 (与 RateLimitGuard / Client 熔断器状态绑定, 周期性采样)
+const (
+	// RateLimitGuard (每次 LLM 调用或周期采样记录)
+	MLLMGuardInFlight    = "llm_guard_in_flight"    // 当前在途请求数 (gauge)
+	MLLMGuardMaxParallel = "llm_guard_max_parallel" // 当前允许最大并发 (gauge, AIMD)
+	MLLMGuardRPMTokens   = "llm_guard_rpm_tokens"   // 令牌桶剩余 (gauge)
+	MLLMGuardPauseSec    = "llm_guard_pause_sec"    // 全局退避剩余秒数 (gauge)
+	MLLMGuardWaitSec     = "llm_guard_wait_sec"     // 单次准入等待时间 (histogram)
+	MLLMGuardAIMDCut     = "llm_guard_aimd_cut"     // AIMD 降并发事件 (counter)
+
+	// 熔断器 (连续失败触发)
+	MLLMCircuitTrips     = "llm_circuit_trips"     // 熔断触发事件 (counter)
+	MLLMCircuitOpenGauge = "llm_circuit_open"      // 当前是否熔断 (gauge 0/1)
+	MLLMCircuitFailStreak = "llm_circuit_fail_streak" // 连续失败计数 (gauge)
+)

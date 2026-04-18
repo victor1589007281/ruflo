@@ -76,6 +76,11 @@ type LLMCallRecord struct {
 	Source  string // "chat" | "feishu" | "team" | "swarm" | "dashboard" | "vision" | "compact" | ...
 	Purpose string // 额外标签, 如团队名 / stage 名 / agent 角色
 	Request string // 粗粒度 HTTP 方法标签 (messages / stream-messages)
+
+	// 限流 / 熔断 观测 (用于 dashboard 速率与守护页面)
+	GuardWaitSec   float64 // 本次 RateLimitGuard.Acquire 等待时长 (包含 RPM 令牌 + 退避)
+	CircuitOpened  bool    // 本次调用触发了熔断 (从 closed 变 open)
+	CircuitBlocked bool    // 本次调用被熔断器拒绝 (未发起真实请求)
 }
 
 // LLMMetricsHook 采集 LLM 调用指标的回调 (dashboard 在启动时注入, 避免循环依赖)。
@@ -138,6 +143,51 @@ func (c *Client) SetTag(tag string) *Client {
 	}
 	c.Tag = tag
 	return c
+}
+
+// CircuitSnapshot 熔断器的结构化状态, 供 dashboard / diagnose 端点使用。
+type CircuitSnapshot struct {
+	Open             bool      `json:"open"`             // 当前是否熔断
+	OpenUntil        time.Time `json:"openUntil"`        // 本次熔断的解除时刻
+	OpenSecondsLeft  float64   `json:"openSecondsLeft"`  // 距离解除的秒数 (0=正常)
+	ConsecutiveFails int       `json:"consecutiveFails"` // 当前连续失败计数
+	Threshold        int       `json:"threshold"`        // 触发阈值
+	TotalRetries     int64     `json:"totalRetries"`     // 累计重试次数
+	TotalFails       int64     `json:"totalFails"`       // 累计失败次数
+	CircuitTrips     int64     `json:"circuitTrips"`     // 累计触发熔断次数
+	Timestamp        time.Time `json:"timestamp"`
+}
+
+// GetCircuitSnapshot 返回该 Client 的熔断器运行态快照。
+// 与 Snapshot() 配合, 供 dashboard LLM guard 页面展示。
+func (c *Client) GetCircuitSnapshot() CircuitSnapshot {
+	if c == nil {
+		return CircuitSnapshot{Timestamp: time.Now()}
+	}
+	c.cbMu.Lock()
+	open := c.circuitOpen
+	openUntil := c.circuitOpenUntil
+	fails := c.consecutiveFails
+	threshold := c.cbThreshold
+	c.cbMu.Unlock()
+	left := time.Until(openUntil)
+	if left < 0 || !open {
+		left = 0
+	}
+	if threshold <= 0 {
+		threshold = 5
+	}
+	return CircuitSnapshot{
+		Open:             open,
+		OpenUntil:        openUntil,
+		OpenSecondsLeft:  left.Seconds(),
+		ConsecutiveFails: fails,
+		Threshold:        threshold,
+		TotalRetries:     c.TotalRetries.Load(),
+		TotalFails:       c.TotalFails.Load(),
+		CircuitTrips:     c.CircuitTrips.Load(),
+		Timestamp:        time.Now(),
+	}
 }
 
 // isRetryable 判断 HTTP 状态码是否可重试
@@ -273,10 +323,13 @@ func (c *Client) recordSuccess() {
 	c.circuitOpen = false
 }
 
-func (c *Client) recordFailure(errMsg string) {
+// recordFailure 记录一次失败到熔断器状态。
+// 返回 (触发本次熔断, 当前连续失败数) — 调用方可用于给 LLMCallRecord 打标签。
+func (c *Client) recordFailure(errMsg string) (opened bool, fails int) {
 	c.cbMu.Lock()
 	defer c.cbMu.Unlock()
 	c.consecutiveFails++
+	fails = c.consecutiveFails
 	threshold := c.cbThreshold
 	if threshold <= 0 {
 		threshold = 5
@@ -285,8 +338,10 @@ func (c *Client) recordFailure(errMsg string) {
 		c.circuitOpen = true
 		c.circuitOpenUntil = time.Now().Add(30 * time.Second)
 		c.CircuitTrips.Add(1)
+		opened = true
 		c.fireEvent("circuit_open", fmt.Sprintf("连续 %d 次失败, 熔断 30s: %s", c.consecutiveFails, errMsg))
 	}
+	return opened, fails
 }
 
 // NewDashScopeClient 创建阿里百炼 DashScope API 客户端
@@ -357,6 +412,7 @@ func (c *Client) StreamMessage(
 			c.fireEvent("circuit_open", "熔断器开启, StreamMessage 被拒绝")
 			streamErrMsg = "circuit open"
 			streamRec.ErrorKind = "client"
+			streamRec.CircuitBlocked = true
 			errCh <- fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
 			return
 		}
@@ -364,7 +420,9 @@ func (c *Client) StreamMessage(
 		// 全局准入控制
 		var guardRelease func()
 		if c.Guard != nil {
+			waitStart := time.Now()
 			guardRelease = c.Guard.Acquire()
+			streamRec.GuardWaitSec = time.Since(waitStart).Seconds()
 			defer guardRelease()
 		}
 
@@ -438,7 +496,8 @@ func (c *Client) StreamMessage(
 						return
 					}
 				}
-				c.recordFailure(err.Error())
+				opened, _ := c.recordFailure(err.Error())
+				streamRec.CircuitOpened = opened
 				streamErrMsg = err.Error()
 				errCh <- fmt.Errorf("API 请求失败: %w", err)
 				return
@@ -525,7 +584,8 @@ func (c *Client) StreamMessage(
 				}
 			}
 
-			c.recordFailure(string(respBody))
+			opened, _ := c.recordFailure(string(respBody))
+			streamRec.CircuitOpened = opened
 			c.TotalFails.Add(1)
 			c.fireEvent("fatal", fmt.Sprintf("Stream %d 次全部失败", maxRetry+1))
 			streamErrMsg = fmt.Sprintf("API %d: %s", resp.StatusCode, string(respBody))
@@ -638,13 +698,25 @@ func (c *Client) SendMessage(
 ) (*types.APIResponse, error) {
 	if c.isCircuitOpen() {
 		c.fireEvent("circuit_open", "熔断器开启, SendMessage 被拒绝")
+		c.emitLLMMetric(LLMCallRecord{
+			Status:         "error",
+			Request:        "messages",
+			DurationSec:    0,
+			HTTPStatus:     0,
+			ErrorKind:      "client",
+			ErrorMessage:   "circuit open",
+			CircuitBlocked: true,
+		})
 		return nil, fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
 	}
 
 	// 全局准入控制 (RPM 令牌桶 + 并发信号量)
 	var guardRelease func()
+	var guardWaitSec float64
 	if c.Guard != nil {
+		waitStart := time.Now()
 		guardRelease = c.Guard.Acquire()
+		guardWaitSec = time.Since(waitStart).Seconds()
 		defer guardRelease()
 	}
 
@@ -715,16 +787,18 @@ func (c *Client) SendMessage(
 				}
 				continue
 			}
-			c.recordFailure(lastErr.Error())
+			opened, _ := c.recordFailure(lastErr.Error())
 			c.TotalFails.Add(1)
 			c.emitLLMMetric(LLMCallRecord{
-				Status:       "error",
-				Request:      "messages",
-				DurationSec:  time.Since(startTS).Seconds(),
-				HTTPStatus:   0,
-				Retries:      retries,
-				ErrorKind:    classifyErrorKind(0, err.Error()),
-				ErrorMessage: truncateErr(err.Error(), 256),
+				Status:        "error",
+				Request:       "messages",
+				DurationSec:   time.Since(startTS).Seconds(),
+				HTTPStatus:    0,
+				Retries:       retries,
+				ErrorKind:     classifyErrorKind(0, err.Error()),
+				ErrorMessage:  truncateErr(err.Error(), 256),
+				GuardWaitSec:  guardWaitSec,
+				CircuitOpened: opened,
 			})
 			return nil, lastErr
 		}
@@ -746,12 +820,13 @@ func (c *Client) SendMessage(
 				return nil, fmt.Errorf("解析响应失败: %w", err)
 			}
 			rec := LLMCallRecord{
-				Status:      "success",
-				Request:     "messages",
-				DurationSec: time.Since(startTS).Seconds(),
-				HTTPStatus:  200,
-				Retries:     retries,
-				StopReason:  result.StopReason,
+				Status:       "success",
+				Request:      "messages",
+				DurationSec:  time.Since(startTS).Seconds(),
+				HTTPStatus:   200,
+				Retries:      retries,
+				StopReason:   result.StopReason,
+				GuardWaitSec: guardWaitSec,
 			}
 			if result.Model != "" {
 				rec.Model = result.Model
@@ -781,6 +856,7 @@ func (c *Client) SendMessage(
 				Retries:      retries,
 				ErrorKind:    classifyErrorKind(resp.StatusCode, string(respBody)),
 				ErrorMessage: truncateErr(errMsg, 256),
+				GuardWaitSec: guardWaitSec,
 			})
 			return nil, fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 		}
@@ -838,17 +914,19 @@ func (c *Client) SendMessage(
 		}
 	}
 
-	c.recordFailure(lastErr.Error())
+	opened, _ := c.recordFailure(lastErr.Error())
 	c.TotalFails.Add(1)
 	c.fireEvent("fatal", fmt.Sprintf("LLM 调用 %d 次全部失败: %v", maxRetry+1, lastErr))
 	c.emitLLMMetric(LLMCallRecord{
-		Status:       "error",
-		Request:      "messages",
-		DurationSec:  time.Since(startTS).Seconds(),
-		HTTPStatus:   lastStatus,
-		Retries:      retries,
-		ErrorKind:    classifyErrorKind(lastStatus, lastErr.Error()),
-		ErrorMessage: truncateErr(lastErr.Error(), 256),
+		Status:        "error",
+		Request:       "messages",
+		DurationSec:   time.Since(startTS).Seconds(),
+		HTTPStatus:    lastStatus,
+		Retries:       retries,
+		ErrorKind:     classifyErrorKind(lastStatus, lastErr.Error()),
+		ErrorMessage:  truncateErr(lastErr.Error(), 256),
+		GuardWaitSec:  guardWaitSec,
+		CircuitOpened: opened,
 	})
 	return nil, fmt.Errorf("LLM 调用 %d 次全部失败: %w", maxRetry+1, lastErr)
 }

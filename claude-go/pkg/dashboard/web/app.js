@@ -136,6 +136,7 @@
     { path: /^\/teams\/(.+)$/,    render: renderTeamDetail,    title: '团队详情',      poll: 3000 },
     { path: /^\/metrics\/?$/,     render: renderMetrics,       title: '观测指标',      poll: 0 },
     { path: /^\/metrics\/(.+)$/,  render: renderMetricsDetail, title: '指标详情',      poll: 0 },
+    { path: /^\/catalog\/?$/,     render: renderMetricsCatalog,title: '指标中心 (中英双语)',poll: 0 },
     { path: /^\/cron\/?$/,        render: renderCron,          title: 'Cron 任务',     poll: 30000 },
     { path: /^\/dreaming\/?$/,    render: renderDreaming,      title: 'Dreaming 机制', poll: 30000 },
     { path: /^\/evolution\/?$/,   render: renderEvolution,     title: 'Evolution 机制',poll: 30000 },
@@ -643,7 +644,7 @@
       statCard('对抗轮次', (detail.adversaryRounds || []).length, '多轮 Eval', 'accent'),
     ]));
 
-    const tabs = ['dag', 'timeline', 'stages', 'agents', 'eval', 'metrics', 'blackboard', 'report'];
+    const tabs = ['dag', 'timeline', 'stages', 'agents', 'eval', 'metrics', 'blackboard', 'checkpoints', 'logs', 'report'];
     const tabBar = h('div', { class: 'tabs' });
     for (const t of tabs) {
       tabBar.appendChild(h('div', {
@@ -670,6 +671,8 @@
       eval: 'Eval',
       metrics: 'Metrics',
       blackboard: '黑板',
+      checkpoints: '检查点',
+      logs: '日志',
       report: 'Report',
     })[t] || t;
   }
@@ -769,6 +772,90 @@
     panel.appendChild(formCard);
   }
 
+  // ---- Team Checkpoints ----
+  async function renderTeamCheckpoints(detail, panel) {
+    panel.innerHTML = '';
+    let resp = null;
+    try {
+      resp = await api('/api/teams/' + encodeURIComponent(detail.name) + '/checkpoints');
+    } catch (e) {
+      panel.appendChild(h('div', { class: 'empty', style: { color: 'var(--red)' } }, '加载失败: ' + e.message));
+      return;
+    }
+    const list = (resp && resp.checkpoints) || [];
+    panel.appendChild(h('div', { class: 'muted small mb-12' },
+      '共 ' + list.length + ' 个检查点 · 文件: ' + (resp.file || 'checkpoints.json') + (resp.exists === false ? ' (尚未创建)' : '')));
+    if (!list.length) {
+      panel.appendChild(h('div', { class: 'empty' }, '暂无 checkpoint 数据 (团队尚未执行或已清理)'));
+      return;
+    }
+    const tbl = h('table', { class: 'tbl' });
+    tbl.appendChild(h('thead', {}, h('tr', {}, [
+      h('th', {}, '#'), h('th', {}, '阶段'), h('th', {}, '状态'),
+      h('th', {}, '尝试次数'), h('th', {}, '保存时间'), h('th', {}, '错误'),
+    ])));
+    const tb = h('tbody');
+    list.forEach((c, idx) => {
+      tb.appendChild(h('tr', {}, [
+        h('td', { class: 'muted' }, String(idx + 1)),
+        h('td', {}, c.stageName || '—'),
+        h('td', {}, h('span', { class: 'badge ' + statusBadgeClass(c.status) }, c.status || '—')),
+        h('td', {}, String(c.attempt ?? 0)),
+        h('td', {}, c.savedAt ? fmtTime(c.savedAt) : '—'),
+        h('td', { style: { maxWidth: '280px', overflow: 'hidden', textOverflow: 'ellipsis' } },
+          c.error ? h('span', { class: 'badge err', title: c.error }, (c.error || '').slice(0, 80)) : '—'),
+      ]));
+    });
+    tbl.appendChild(tb);
+    panel.appendChild(h('div', { class: 'card mb-16' }, [
+      h('h3', {}, '检查点历史 (checkpoints.json)'),
+      tbl,
+    ]));
+  }
+
+  // ---- Team Logs (filter global claude-go.log by team) ----
+  async function renderTeamLogs(detail, panel) {
+    panel.innerHTML = '';
+    const tailInp = h('input', { class: 'input', type: 'number', min: 50, max: 5000, value: 500, style: { width: '100px' } });
+    const qInp = h('input', { class: 'input', placeholder: '前端二次过滤 (本地关键词)…', style: { minWidth: '240px' } });
+    const preBox = h('pre', {
+      class: 'pre',
+      style: { maxHeight: '60vh', overflow: 'auto', fontSize: '12px', lineHeight: '1.5' },
+    }, '加载中…');
+    const pill = h('span', { class: 'muted small' }, '');
+    const reload = async () => {
+      preBox.textContent = '加载中…';
+      try {
+        const data = await api('/api/teams/' + encodeURIComponent(detail.name) + '/logs?limit=' + encodeURIComponent(String(tailInp.value || 500)));
+        let lines = data.lines || [];
+        const q = (qInp.value || '').trim().toLowerCase();
+        if (q) lines = lines.filter(l => l.toLowerCase().includes(q));
+        pill.textContent = `共 ${lines.length} 行 · 源: ${data.source || 'claude-go.log'}`;
+        if (!lines.length) {
+          preBox.textContent = '(未匹配到该团队的日志行, 尝试放宽关键词)';
+          return;
+        }
+        preBox.textContent = lines.join('\n');
+        preBox.scrollTop = preBox.scrollHeight;
+      } catch (e) {
+        preBox.textContent = '加载失败: ' + e.message;
+      }
+    };
+    qInp.addEventListener('input', reload);
+    panel.appendChild(h('div', { class: 'toolbar-row mb-12' }, [
+      h('strong', {}, '◉ 团队相关日志'),
+      h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, [
+        h('span', { class: 'muted small' }, '行数'),
+        tailInp,
+        qInp,
+        h('button', { class: 'btn', onClick: reload }, '刷新'),
+        pill,
+      ]),
+    ]));
+    panel.appendChild(h('div', { class: 'card' }, [preBox]));
+    await reload();
+  }
+
   async function renderTeamTab(tab, detail, panel) {
     panel.innerHTML = '';
     if (tab === 'dag') {
@@ -781,6 +868,10 @@
       renderTeamAgents(detail, panel);
     } else if (tab === 'blackboard') {
       await renderTeamBlackboard(detail, panel);
+    } else if (tab === 'checkpoints') {
+      await renderTeamCheckpoints(detail, panel);
+    } else if (tab === 'logs') {
+      await renderTeamLogs(detail, panel);
     } else if (tab === 'report') {
       if (!detail.report) panel.appendChild(h('div', { class: 'empty' }, '没有 REPORT.md'));
       else { const mdBox = h('div', { class: 'md' }); mdBox.innerHTML = renderMarkdown(detail.report); panel.appendChild(mdBox); }
@@ -793,45 +884,89 @@
 
   // ---- DAG ----
   async function renderTeamDAG(detail, panel) {
+    // Prefer the richer /api/teams/:name/dag endpoint which merges
+    // workflow + runtime stages + checkpoints + attempts + durations.
+    let dag = null;
+    try {
+      dag = await api('/api/teams/' + encodeURIComponent(detail.name) + '/dag');
+    } catch (_) { /* fallback below */ }
+
+    if (dag && (dag.stages || []).length) {
+      const nodes = dag.stages.map(s => ({
+        name: s.name, role: s.role,
+        dependsOn: s.dependsOn || [],
+        parallel: s.parallel,
+        status: s.status || 'pending',
+        attempts: s.attempts || 0,
+        durationSec: s.durationSec,
+        error: s.error,
+      }));
+      const meta = h('div', { class: 'muted', style: { marginBottom: '10px', fontSize: '12px' } }, [
+        h('strong', {}, 'workflow: '), dag.workflow || detail.workflow || '—',
+        ' · stages=', String(nodes.length),
+        '  ·  ',
+        h('span', { class: 'badge ' + statusBadgeClass(dag.status) }, dag.status || '—'),
+        h('span', { class: 'muted', style: { marginLeft: '6px' } }, 'source: ' + (dag.source || '')),
+      ]);
+      panel.appendChild(meta);
+      panel.appendChild(renderDAGSVG(nodes, dag.source));
+      panel.appendChild(h('div', { class: 'legend' }, [
+        h('span', {}, [h('span', { class: 'dot ok' }), '完成']),
+        h('span', {}, [h('span', { class: 'dot run' }), '运行']),
+        h('span', {}, [h('span', { class: 'dot err' }), '失败']),
+        h('span', {}, [h('span', { class: 'dot pending' }), '待执行']),
+      ]));
+
+      if (nodes.length) {
+        const tbl = h('table', { class: 'tbl' });
+        tbl.appendChild(h('thead', {}, h('tr', {}, [
+          h('th', {}, '阶段'), h('th', {}, '角色'), h('th', {}, '状态'),
+          h('th', {}, '尝试次数'), h('th', {}, '耗时'), h('th', {}, '依赖'), h('th', {}, '错误'),
+        ])));
+        const tb = h('tbody');
+        for (const n of nodes) {
+          tb.appendChild(h('tr', {}, [
+            h('td', {}, n.name),
+            h('td', {}, h('span', { class: 'badge' }, n.role || '—')),
+            h('td', {}, h('span', { class: 'badge ' + statusBadgeClass(n.status) }, n.status || '—')),
+            h('td', {}, String(n.attempts || 0)),
+            h('td', {}, n.durationSec ? fmtDurSec(n.durationSec) : '—'),
+            h('td', {}, (n.dependsOn || []).join(', ') || '—'),
+            h('td', { style: { maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis' } },
+              n.error ? h('span', { class: 'badge err', title: n.error }, (n.error || '').slice(0, 64)) : '—'),
+          ]));
+        }
+        tbl.appendChild(tb);
+        panel.appendChild(h('div', { class: 'card mb-16' }, [
+          h('h3', {}, '运行时明细 (来自 checkpoints.json + team.json)'),
+          tbl,
+        ]));
+      }
+      return;
+    }
+
+    // Fallback path (older data / no workflow registry)
     const wfName = detail.workflow || 'development';
     let wf = null;
     try { wf = await api('/api/workflows/' + encodeURIComponent(wfName)); } catch (_) {}
     const stageStatus = {};
     (detail.stages || []).forEach(s => {
-      // 允许多条同名 (round1/round2) 只存第一条状态
       if (!stageStatus[s.name]) stageStatus[s.name] = s.status;
       else if (s.status === 'failed') stageStatus[s.name] = 'failed';
       else if (stageStatus[s.name] === 'pending') stageStatus[s.name] = s.status;
     });
-
     if (!wf) {
-      // fallback - 线性
       const nodes = (detail.stages || []).map((s, i) => ({ name: s.name, role: s.role, dependsOn: i === 0 ? [] : [detail.stages[i - 1].name], status: s.status }));
       panel.appendChild(renderDAGSVG(nodes, '(未知 workflow, 按顺序推断)'));
       return;
     }
-
     const nodes = wf.stages.map(s => ({
       name: s.name, role: s.role,
       dependsOn: s.dependsOn || [],
       parallel: s.parallel,
       status: stageStatus[s.name] || 'pending',
     }));
-
-    const meta = h('div', { class: 'muted', style: { marginBottom: '10px', fontSize: '12px' } }, [
-      h('strong', {}, 'workflow: '), wf.name,
-      ' · mode=', wf.mode,
-      ' · stages=', String(wf.stages.length),
-      wf.rounds ? (' · rounds=' + wf.rounds) : '',
-    ]);
-    panel.appendChild(meta);
     panel.appendChild(renderDAGSVG(nodes, wf.description));
-    panel.appendChild(h('div', { class: 'legend' }, [
-      h('span', {}, [h('span', { class: 'dot ok' }), '完成']),
-      h('span', {}, [h('span', { class: 'dot run' }), '运行']),
-      h('span', {}, [h('span', { class: 'dot err' }), '失败']),
-      h('span', {}, [h('span', { class: 'dot pending' }), '待执行']),
-    ]));
   }
 
   function renderDAGSVG(nodes, subtitle) {
@@ -2260,6 +2395,233 @@
   }
 
   // ==================================================================
+  // 12d-1. Metrics Catalog (中英双语 / Grafana 风格指标中心)
+  // ==================================================================
+  async function renderMetricsCatalog() {
+    const v = $('#view');
+    v.innerHTML = '<div class="loading">加载 metrics catalog…</div>';
+    let cat, cov;
+    try {
+      [cat, cov] = await Promise.all([
+        api('/api/metrics/catalog'),
+        api('/api/metrics/coverage'),
+      ]);
+    } catch (e) {
+      v.innerHTML = '';
+      v.appendChild(h('div', { class: 'empty', style: { color: 'var(--red)' } }, '加载失败: ' + e.message));
+      return;
+    }
+    v.innerHTML = '';
+
+    // Backend 返回结构:
+    //   catalog 端点: { total, modules, catalog: MetricDesc[], byModule: {...} }
+    //   coverage 端点: { now, totalDeclared, totalCollected, coverageRate, rows, missingDesc }
+    //   MetricDesc 字段: { module, name, zh, en, unit, kind, panel }
+    //   coverage row 字段: { module, name, zh, en, unit, kind, panel, declared, collected, samples, lastValue, lastSeen }
+    const metricsList = cat.catalog || [];
+    const covRows = (cov && cov.rows) || [];
+    // key = module + ':' + name (coverage 里有同名不同模块)
+    const covMap = {};
+    covRows.forEach(m => { covMap[m.module + ':' + m.name] = m; });
+    const total = cat.total || metricsList.length;
+    const collected = (cov && cov.totalCollected) || 0;
+    const coveragePct = (cov && cov.coverageRate) || (total > 0 ? collected / total : 0);
+
+    v.appendChild(h('div', { class: 'grid grid-4 mb-16' }, [
+      statCard('指标总数', total, '已声明在 pkg/metrics/catalog.go', 'accent'),
+      statCard('有采集数据', collected, '至少 1 个事件', collected > 0 ? 'ok' : 'warn'),
+      statCard('覆盖率', fmtPct(coveragePct),
+        '= 有样本指标 / 总指标', coveragePct >= 0.8 ? 'ok' : (coveragePct >= 0.4 ? 'warn' : 'err')),
+      statCard('模块数', (cat.modules || []).length, '按模块分组的指标', 'purple'),
+    ]));
+
+    if (cov && (cov.missingDesc || []).length) {
+      const card = h('div', { class: 'card mb-16' }, [
+        h('h3', {}, '⚠ 已采集但未在 catalog 声明的 metric (请补中英文描述)'),
+        h('div', { class: 'muted small' }, '补全位置: pkg/metrics/catalog.go'),
+        h('pre', { class: 'pre', style: { maxHeight: '160px', overflow: 'auto' } }, cov.missingDesc.join('\n')),
+      ]);
+      v.appendChild(card);
+    }
+
+    // 过滤/搜索
+    const qInp = h('input', { class: 'input', placeholder: '搜索: 名称 / 描述 / 模块…', style: { minWidth: '260px' } });
+    const modSel = h('select', { class: 'select' }, [
+      h('option', { value: '' }, '全部模块'),
+      ...(cat.modules || []).map(m => h('option', { value: m }, m)),
+    ]);
+    const kindSel = h('select', { class: 'select' }, [
+      h('option', { value: '' }, '全部类型'),
+      h('option', { value: 'counter' }, 'counter 计数器'),
+      h('option', { value: 'gauge' }, 'gauge 瞬时量'),
+      h('option', { value: 'histogram' }, 'histogram 分布'),
+      h('option', { value: 'duration' }, 'duration 耗时'),
+      h('option', { value: 'rate' }, 'rate 速率'),
+    ]);
+    const onlyMissing = h('input', { type: 'checkbox' });
+    const listHost = h('div', { class: 'card' });
+
+    const render = () => {
+      const q = (qInp.value || '').trim().toLowerCase();
+      const mod = modSel.value;
+      const kind = kindSel.value;
+      const missingOnly = onlyMissing.checked;
+
+      const rows = metricsList.filter(m => {
+        if (mod && m.module !== mod) return false;
+        if (kind && m.kind !== kind) return false;
+        const c = covMap[m.module + ':' + m.name];
+        if (missingOnly && c && (c.samples || 0) > 0) return false;
+        if (q) {
+          const blob = (m.name + ' ' + (m.zh || '') + ' ' + (m.en || '') + ' ' + (m.module || '')).toLowerCase();
+          if (!blob.includes(q)) return false;
+        }
+        return true;
+      });
+
+      listHost.innerHTML = '';
+      listHost.appendChild(h('div', { class: 'muted small', style: { marginBottom: '6px' } },
+        '匹配 ' + rows.length + ' / ' + total + ' 个指标'));
+      const tbl = h('table', { class: 'tbl' });
+      tbl.appendChild(h('thead', {}, h('tr', {}, [
+        h('th', {}, '模块'), h('th', {}, '指标名 (EN)'), h('th', {}, '中文描述'),
+        h('th', {}, '类型'), h('th', {}, '单位'),
+        h('th', {}, '样本数'), h('th', {}, '最近值'), h('th', {}, '最近上报'),
+      ])));
+      const tb = h('tbody');
+      for (const m of rows) {
+        const c = covMap[m.module + ':' + m.name] || {};
+        const has = (c.samples || 0) > 0;
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, h('span', { class: 'badge' }, m.module || '—')),
+          h('td', { style: { fontFamily: 'monospace', fontSize: '12px' } }, [
+            h('div', {}, m.name),
+            m.en ? h('div', { class: 'muted small', title: m.en }, (m.en || '').slice(0, 90)) : null,
+          ]),
+          h('td', {}, [
+            h('div', {}, m.zh || '—'),
+            m.panel ? h('div', { class: 'muted small' }, 'panel: ' + m.panel) : null,
+          ]),
+          h('td', {}, h('span', { class: 'badge ' + metricKindBadge(m.kind) }, m.kind || '—')),
+          h('td', {}, m.unit || '—'),
+          h('td', {}, h('span', { class: 'badge ' + (has ? 'ok' : 'warn') }, String(c.samples || 0))),
+          h('td', {}, c.lastValue != null ? fmtNum(c.lastValue, 3) : '—'),
+          h('td', {}, c.lastSeen ? fmtRel(c.lastSeen) : '—'),
+        ]));
+      }
+      tbl.appendChild(tb);
+      listHost.appendChild(tbl);
+    };
+
+    v.appendChild(h('div', { class: 'toolbar-row mb-12' }, [
+      h('strong', {}, '◈ 指标中心 · 中英双语 · 覆盖率审计'),
+      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        qInp, modSel, kindSel,
+        h('label', { class: 'muted small', style: { display: 'flex', alignItems: 'center', gap: '4px' } },
+          [onlyMissing, ' 仅显示未上报的指标']),
+        h('button', { class: 'btn', onClick: render }, '刷新'),
+      ]),
+    ]));
+    qInp.addEventListener('input', render);
+    modSel.addEventListener('change', render);
+    kindSel.addEventListener('change', render);
+    onlyMissing.addEventListener('change', render);
+    v.appendChild(listHost);
+    render();
+  }
+
+  function metricKindBadge(k) {
+    return ({
+      counter: 'accent',
+      gauge: 'purple',
+      histogram: 'warn',
+      duration: 'run',
+      rate: 'ok',
+    })[k] || '';
+  }
+
+  // ==================================================================
+  // 12d-2. LLM rate (1s/60s/300s) + Guard (rate limit + circuit breaker)
+  // ==================================================================
+  async function renderLLMRateAndGuard(host) {
+    host.innerHTML = '';
+    host.appendChild(h('h3', {}, '⚡ 实时速率 / 限流 / 熔断器'));
+
+    let rate = null, guard = null;
+    try { rate = await api('/api/llm/rate?windows=1,60,300'); } catch (_) {}
+    try { guard = await api('/api/llm/guard'); } catch (_) {}
+
+    if (!rate && !guard) {
+      host.appendChild(h('div', { class: 'empty' }, '暂无数据 (尚未发起 LLM 调用, 或 metrics/llm.jsonl 为空)'));
+      return;
+    }
+
+    if (rate && (rate.buckets || []).length) {
+      const tbl = h('table', { class: 'tbl' });
+      tbl.appendChild(h('thead', {}, h('tr', {}, [
+        h('th', {}, '窗口'), h('th', {}, 'QPS'), h('th', {}, '调用'),
+        h('th', {}, '成功率'), h('th', {}, '平均耗时'), h('th', {}, 'P95'),
+        h('th', {}, '总Tokens'), h('th', {}, '429限流'),
+        h('th', {}, '准入等待'), h('th', {}, '熔断阻断'), h('th', {}, '熔断触发'),
+      ])));
+      const tb = h('tbody');
+      for (const w of rate.buckets) {
+        const label = (w.windowSec >= 60) ? (w.windowSec / 60) + 'min' : (w.windowSec + 's');
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, h('span', { class: 'badge accent' }, label)),
+          h('td', {}, fmtNum(w.qps || 0, 2)),
+          h('td', {}, String(w.calls || 0)),
+          h('td', {}, h('span', { class: 'badge ' + ((w.successRate || 0) >= 0.9 ? 'ok' : 'warn') }, fmtPct(w.successRate))),
+          h('td', {}, fmtDurSec(w.avgDurationSec)),
+          h('td', {}, fmtDurSec(w.p95DurationSec)),
+          h('td', {}, fmtKilo(w.totalTokens || 0)),
+          h('td', {}, h('span', { class: 'badge ' + ((w.rateLimited || 0) > 0 ? 'warn' : '') }, String(w.rateLimited || 0))),
+          h('td', {}, fmtNum(w.avgGuardWaitSec || 0, 2) + 's'),
+          h('td', {}, h('span', { class: 'badge ' + ((w.circuitBlocked || 0) > 0 ? 'err' : '') }, String(w.circuitBlocked || 0))),
+          h('td', {}, h('span', { class: 'badge ' + ((w.circuitTrips || 0) > 0 ? 'err' : '') }, String(w.circuitTrips || 0))),
+        ]));
+      }
+      tbl.appendChild(tb);
+      host.appendChild(tbl);
+      host.appendChild(h('div', { class: 'muted small', style: { marginTop: '4px' } },
+        '滑动窗口基于 metrics/llm.jsonl 内最近事件计算; 窗口越小越能捕获瞬时洪峰。'));
+    }
+
+    if (guard) {
+      const g = guard.guard || {};
+      const c = guard.circuit || {};
+      const hints = guard.hints || [];
+      const circuitState = c.open ? 'open' : 'closed';
+      const grid = h('div', { class: 'grid grid-4', style: { marginTop: '12px' } }, [
+        statCard('限流 · 并发',
+          (g.inFlight || 0) + ' / ' + (g.maxParallel || 0),
+          '硬限 ' + (g.hardMin || 0) + '~' + (g.hardMax || 0) + ' · 等待 ' + (g.totalWaits || 0),
+          (g.inFlight || 0) >= (g.maxParallel || 1) ? 'warn' : 'accent'),
+        statCard('限流 · RPM 令牌',
+          fmtNum(g.rpmAvailable || 0, 1) + ' / ' + fmtNum(g.rpmCapacity || 0, 0),
+          '已获取 ' + (g.totalAcquires || 0),
+          (g.rpmAvailable || 0) < 1 ? 'warn' : 'ok'),
+        statCard('熔断器',
+          circuitState,
+          '连续失败 ' + (c.consecutiveFails || 0) + '/' + (c.threshold || 5) + ' · 触发 ' + (c.circuitTrips || 0),
+          c.open ? 'err' : 'ok'),
+        statCard('AIMD 降速 / 429',
+          (g.aimdCuts || 0) + ' / ' + (g.total429s || 0),
+          (g.pauseSecondsLeft || 0) > 0 ? ('pause ' + fmtNum(g.pauseSecondsLeft, 1) + 's') : 'no backoff',
+          (g.total429s || 0) > 0 ? 'warn' : ''),
+      ]);
+      host.appendChild(grid);
+      if (hints.length) {
+        const hints_card = h('div', { style: { marginTop: '8px' } });
+        for (const t of hints) {
+          hints_card.appendChild(h('div', { class: 'insight warn' }, h('div', { class: 'insight-title' }, t)));
+        }
+        host.appendChild(hints_card);
+      }
+    }
+  }
+
+  // ==================================================================
   // 12e. LLM 大模型监控 /api/llm/stats
   // ==================================================================
   async function renderLLMStats() {
@@ -2289,6 +2651,14 @@
       ]),
     ]);
     v.appendChild(toolbar);
+
+    // ⭐ 实时速率 / 限流 / 熔断器 (新)
+    const rateHost = h('div', { class: 'card mb-16' }, [
+      h('h3', {}, '⚡ 实时速率 / 限流 / 熔断器'),
+      h('div', { class: 'muted small' }, '加载中…'),
+    ]);
+    v.appendChild(rateHost);
+    renderLLMRateAndGuard(rateHost).catch(() => {});
 
     // 概览
     v.appendChild(h('div', { class: 'grid grid-4 mb-16' }, [

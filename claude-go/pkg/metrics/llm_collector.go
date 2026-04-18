@@ -106,6 +106,68 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 	case "prompt_too_long":
 		c.RecordWithLabels("llm", MLLMPromptTooLong, 1, labels)
 	}
+
+	// 限流 / 熔断器事件
+	if rec.GuardWaitSec > 0 {
+		c.RecordWithLabels("llm", MLLMGuardWaitSec, rec.GuardWaitSec, labels)
+	}
+	if rec.CircuitOpened {
+		c.RecordWithLabels("llm", MLLMCircuitTrips, 1, labels)
+	}
+	if rec.CircuitBlocked {
+		// 被熔断器拒绝 — 复用 error_count 并单独打一条 gauge 1 便于查询
+		blockedLabels := copyLabels(labels)
+		blockedLabels["blocked"] = "1"
+		c.RecordWithLabels("llm", MLLMCircuitOpenGauge, 1, blockedLabels)
+	}
+}
+
+// GuardSample RateLimitGuard 的瞬时采样 (由调用方从 api.GuardSnapshot 映射)。
+// 避免 metrics 反向依赖 api 包。
+type GuardSample struct {
+	InFlight         float64
+	MaxParallel      float64
+	RPMAvailable     float64
+	PauseSecondsLeft float64
+}
+
+// CircuitSample 熔断器瞬时采样。
+type CircuitSample struct {
+	Open             bool
+	ConsecutiveFails float64
+}
+
+// SampleGuardSnapshot 周期性写入 RateLimitGuard + 熔断器的 gauge 快照。
+// dashboard / daemon 应每 5-10s 调一次, 让时序图能展现实时并发 / RPM 剩余 / 熔断状态。
+// 两个参数任意一个为 nil 时对应字段跳过。
+func SampleGuardSnapshot(module string, g *GuardSample, cb *CircuitSample) {
+	c := GlobalLLMCollector()
+	if c == nil {
+		return
+	}
+	labels := map[string]string{"module": firstNonEmptyStr(module, "unknown"), "kind": "sample"}
+	if g != nil {
+		c.RecordWithLabels("llm", MLLMGuardInFlight, g.InFlight, labels)
+		c.RecordWithLabels("llm", MLLMGuardMaxParallel, g.MaxParallel, labels)
+		c.RecordWithLabels("llm", MLLMGuardRPMTokens, g.RPMAvailable, labels)
+		c.RecordWithLabels("llm", MLLMGuardPauseSec, g.PauseSecondsLeft, labels)
+	}
+	if cb != nil {
+		open := 0.0
+		if cb.Open {
+			open = 1
+		}
+		c.RecordWithLabels("llm", MLLMCircuitOpenGauge, open, labels)
+		c.RecordWithLabels("llm", MLLMCircuitFailStreak, cb.ConsecutiveFails, labels)
+	}
+}
+
+func copyLabels(src map[string]string) map[string]string {
+	out := make(map[string]string, len(src)+1)
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 func firstNonEmptyStr(vals ...string) string {

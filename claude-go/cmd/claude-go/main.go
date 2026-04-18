@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -611,6 +612,20 @@ JSON 配置文件示例:
 			}
 			if maxSessions > 0 && cmd.Flags().Changed("max-sessions") {
 				config.MaxSessions = maxSessions
+			}
+
+			// 统一 HTTP 服务: 把 dashboard 挂到 wiki API 同一端口,
+			// 避免飞书 bot 运行期间还要单独开 dashboard 进程。
+			// 前提: 配置了 Wiki.APIPort。
+			if config.Wiki.APIPort > 0 {
+				stateDir := resolveStateDir(config.Cwd)
+				dashCfg := dashboard.Config{StateDir: stateDir}
+				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
+					func(mux *http.ServeMux) {
+						dashboard.MountOn(dashCfg, mux)
+						fmt.Printf("[Dashboard] 已挂载到 wiki API 端口 %d (stateDir=%s)\n",
+							config.Wiki.APIPort, stateDir)
+					})
 			}
 
 			bot, err := feishu.NewBot(config)

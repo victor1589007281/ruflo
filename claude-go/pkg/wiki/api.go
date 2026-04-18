@@ -36,6 +36,20 @@ func NewAPIServer(engine *Engine, secret string) *APIServer {
 	return s
 }
 
+// Mux 返回 APIServer 内部的 ServeMux, 便于调用方追加路由 (如 dashboard 复用
+// 同一 HTTP 端口)。dashboard/feishu-bot 统一 HTTP 服务使用。
+func (s *APIServer) Mux() *http.ServeMux { return s.mux }
+
+// Handle 代理 ServeMux.Handle, 允许外部把自己的路由挂到 wiki API 同一个端口。
+func (s *APIServer) Handle(pattern string, h http.Handler) {
+	s.mux.Handle(pattern, h)
+}
+
+// HandleFunc 代理 ServeMux.HandleFunc。
+func (s *APIServer) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	s.mux.HandleFunc(pattern, h)
+}
+
 // Start 启动 HTTP 服务（非阻塞）。
 func (s *APIServer) Start(port int) error {
 	addr := fmt.Sprintf(":%d", port)
