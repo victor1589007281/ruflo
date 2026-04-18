@@ -128,6 +128,8 @@ func GetWorkflow(name string) *WorkflowDef {
 		return swarmWorkflow()
 	case "finance", "trading":
 		return financeWorkflow()
+	case "trading-v2", "trading2", "finance-v2":
+		return tradingV2Workflow()
 	case "techblog", "article", "blog":
 		return techBlogWorkflow()
 	case "creative", "design", "visual":
@@ -147,6 +149,7 @@ func ListWorkflows() []WorkflowDef {
 		*debateWorkflow(),
 		*swarmWorkflow(),
 		*financeWorkflow(),
+		*tradingV2Workflow(),
 		*techBlogWorkflow(),
 		*creativeWorkflow(),
 		*predictWorkflow(),
@@ -658,6 +661,8 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		return we.executeAdversarial(ctx, wf, objective, team)
 	case "adversarial_dev":
 		return we.executeAdversarialDev(ctx, wf, objective, team)
+	case "trading_debate":
+		return we.executeTradingDebate(ctx, wf, objective, team)
 	default:
 		return we.executePipeline(ctx, wf, objective, team)
 	}

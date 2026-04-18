@@ -119,7 +119,8 @@ func RegisterTeamCommands(r *Registry) {
 				fmt.Println("  research     — 研究团队 (researcher → analyst → writer)")
 				fmt.Println("  debate       — 辩论团队 (正方 → 反方 → 裁判)")
 				fmt.Println("  creative     — 创意团队 (designer → illustrator → reviewer)")
-				fmt.Println("  finance      — 金融分析 (analyst → strategist → reviewer)")
+				fmt.Println("  finance      — 金融分析 v1 (analyst → strategist → advisor)")
+				fmt.Println("  trading-v2   — 金融交易 v2 (分析→Bull/Bear辩论→交易→风控辩论→PM裁决)")
 				fmt.Println("  techblog     — 技术博客 (researcher → writer → editor)")
 				fmt.Println("  swarm        — 蜂群模式 (LLM 自动分解并行)")
 
@@ -162,6 +163,11 @@ func RegisterTeamCommands(r *Registry) {
 
 			if err := ctx.TeamMgr.RunTeam(teamName, objective); err != nil {
 				fmt.Printf("[启动失败: %v]\n", err)
+				return nil
+			}
+			if ctx.WaitSync {
+				team.WaitDone()
+				fmt.Printf("\n✅ 团队 %s 执行完毕 (状态: %s)\n", team.Name, team.Status)
 			}
 			return nil
 		},

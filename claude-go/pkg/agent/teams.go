@@ -228,6 +228,14 @@ type ProductionTeam struct {
 	cancel     context.CancelFunc
 	mgr        *ProductionTeamManager
 	dataDir    string
+	doneCh     chan struct{} // 关闭信号: 工作流执行完毕时 close
+}
+
+// WaitDone 阻塞直到团队执行完毕。如果 doneCh 尚未初始化则立刻返回。
+func (t *ProductionTeam) WaitDone() {
+	if t.doneCh != nil {
+		<-t.doneCh
+	}
 }
 
 // BGAgent 后台 Agent
@@ -347,6 +355,7 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 	team.Error = ""
 	ctx, cancel := context.WithCancel(context.Background())
 	team.cancel = cancel
+	team.doneCh = make(chan struct{})
 	team.mu.Unlock()
 
 	// 更新黑板上的目标
@@ -359,7 +368,10 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 		ptm.notify(team.ChatID, fmt.Sprintf("🚀 团队 **%s** 开始执行\n目标: %s\n工作流: %s", name, objective, team.Workflow))
 	}
 
-	go ptm.executeWorkflow(ctx, team, isResume)
+	go func() {
+		defer func() { close(team.doneCh) }()
+		ptm.executeWorkflow(ctx, team, isResume)
+	}()
 	return nil
 }
 

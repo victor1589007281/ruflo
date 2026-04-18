@@ -37,6 +37,7 @@ type CommandContext struct {
 	SessionStore *session.SessionStore
 	History      *session.PromptHistory
 	TeamMgr      *agent.ProductionTeamManager  // 团队管理器 (可选)
+	WaitSync     bool                         // true 时 /go 等团队完成后返回 (CLI run 模式)
 	WikiEngine   *wiki.Engine                  // Wiki 引擎 (可选)
 	SwarmIntel   *swarm_intel.Engine            // 群体智能引擎 (可选)
 	Cwd          string

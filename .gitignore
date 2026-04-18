@@ -159,6 +159,7 @@ claude-go/claude-go
 # Claude Flow runtime data
 .claude-flow/data/
 .claude-flow/logs/
+claude-go/.claude-go/
 
 # Environment variables
 .env

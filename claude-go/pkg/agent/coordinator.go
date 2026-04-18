@@ -111,7 +111,8 @@ func (c *Coordinator) RunWithRecovery(
 	case "adversarial":
 		return executor.Execute(ctx, wf, objective, team)
 	case "adversarial_dev":
-		// 检查点恢复和保存由 executor 内部细粒度处理 (每个 phase / 每个 task)
+		return executor.Execute(ctx, wf, objective, team)
+	case "trading_debate":
 		return executor.Execute(ctx, wf, objective, team)
 	default:
 		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)

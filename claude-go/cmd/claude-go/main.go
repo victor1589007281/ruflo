@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -347,9 +348,8 @@ func runCmd() *cobra.Command {
 		Short: "一次性执行 (Print 模式)",
 		Args:  cobra.MinimumNArgs(1),
 		Example: `  claude-go run "你的问题"
-
-  # 限制输出长度与权限模式
-  claude-go run "总结 main.go" --max-tokens 8192 --permission-mode plan`,
+  claude-go run "/go trading-v2 分析英伟达"
+  claude-go run "/team create trading-v2 分析英伟达" --permission-mode bypass`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			eng, err := buildEngine()
 			if err != nil {
@@ -357,9 +357,47 @@ func runCmd() *cobra.Command {
 			}
 
 			userPrompt := strings.Join(args, " ")
+
+			if strings.HasPrefix(userPrompt, "/") {
+				cwd, _ := os.Getwd()
+				cmdRegistry := commands.NewRegistry()
+				commands.RegisterBuiltins(cmdRegistry)
+
+				siCfg := swarmintel.DefaultConfig()
+				siCfg.Notify = func(_, msg string) { fmt.Println(msg) }
+				siEngine := swarmintel.NewEngine(eng.APIClient, siCfg)
+
+				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
+					BaseDir: filepath.Join(cwd, ".claude-go", "teams"),
+					Cwd:     cwd,
+					Factory: func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
+						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt}, nil
+					},
+					Notify: func(_, msg string) { fmt.Println(msg) },
+					LLM:    eng.APIClient,
+					Roles:  agent.NewRoleRegistry(cwd),
+				})
+
+				cmdCtx := &commands.CommandContext{
+					Engine:     eng,
+					TeamMgr:    teamMgr,
+					SwarmIntel: siEngine,
+					Cwd:        cwd,
+					WaitSync:   true,
+					OnClear:    func() {},
+					OnExit:     func() {},
+				}
+
+				cmdName, cmdArgs := commands.ParseSlashCommand(userPrompt)
+				if c := cmdRegistry.Find(cmdName); c != nil {
+					return c.Execute(cmdArgs, cmdCtx)
+				}
+				fmt.Printf("未知命令: %s\n", cmdName)
+				return nil
+			}
+
 			ctx := context.Background()
 			streamCh := eng.SubmitStream(ctx, userPrompt)
-
 			printStreamEvents(streamCh)
 			return nil
 		},
@@ -922,6 +960,29 @@ func printMessage(msg types.Message) {
 			}
 		}
 	}
+}
+
+// cliAgentRunner 为 CLI run 模式提供的简单 AgentRunner。
+type cliAgentRunner struct {
+	eng          *engine.QueryEngine
+	role         string
+	systemPrompt string
+}
+
+func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
+	contentJSON, _ := json.Marshal(userPrompt)
+	msgs := []types.APIMessage{{Role: "user", Content: contentJSON}}
+	sys := []string{r.systemPrompt}
+	resp, err := r.eng.APIClient.SendMessage(ctx, msgs, sys, nil, 8192)
+	if err != nil {
+		return "", err
+	}
+	for _, c := range resp.Content {
+		if c.Type == "text" {
+			return c.Text, nil
+		}
+	}
+	return "", fmt.Errorf("no text in response")
 }
 
 // printStreamEvents 消费 StreamEvent 通道，实现 token-by-token 实时输出。

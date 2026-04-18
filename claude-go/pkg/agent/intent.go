@@ -95,6 +95,7 @@ var wfDetect = map[string][]string{
 	"debate":      {"辩论", "讨论利弊", "权衡", "利弊", "优劣", "pk", "vs"},
 	"swarm":       {"蜂群", "swarm", "并行分析", "全面调研", "深度分析", "多角度", "自动拆解"},
 	"finance":     {"股票", "股价", "盯盘", "交易", "买入", "卖出", "持仓", "行情", "大盘", "a股", "美股", "港股", "基金", "投资建议", "财报", "估值"},
+	"trading-v2":  {"深度分析股票", "交易决策", "bull bear", "多空辩论", "交易v2", "trading-v2", "对抗分析"},
 	"techblog":    {"写文章", "写博客", "公众号", "技术文章", "源码分析", "写作", "排版", "发文", "文章创作"},
 	"creative":    {"画图", "生图", "做图", "设计图", "海报", "logo", "封面", "插画", "视觉设计", "图片创作", "视频创作", "做视频", "生成视频", "帮我画", "创意设计", "视觉创作", "分镜", "动画", "宣传视频", "宣传图"},
 }
@@ -359,14 +360,15 @@ func (ir *IntentRecognizer) keywordDetect(lower, original string) *TeamIntent {
 const extractSysPrompt = `你是命令解析器。给定用户的中文消息，提取多Agent协作任务的参数。
 
 输出 JSON（仅JSON，不要解释）:
-{"workflow":"development|research|debate|swarm|finance|techblog|creative","objective":"简洁的任务目标","teamName":"kebab-case英文短名"}
+{"workflow":"development|research|debate|swarm|finance|trading-v2|techblog|creative","objective":"简洁的任务目标","teamName":"kebab-case英文短名"}
 
 判断规则:
 - development: 编写代码/实现功能/构建系统
 - research: 调研/分析/探索/对比方案
 - debate: 辩论/讨论利弊/权衡选择
 - swarm: 复杂任务需要多角度并行分析/全面调研/自动拆解子任务
-- finance: 股票分析/盯盘/交易建议/财报分析/投资评估
+- finance: 简单股票分析/盯盘/快速投资评估
+- trading-v2: 深度交易决策/多空辩论/完整交易方案/需要Bull Bear对抗分析
 - techblog: 写技术文章/公众号文章/博客/源码分析文章
 - creative: 画图/做图/海报/Logo/封面/视频创作/视觉设计/动画`
 
