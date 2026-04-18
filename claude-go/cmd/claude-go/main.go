@@ -371,14 +371,30 @@ func runCmd() *cobra.Command {
 						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt}, nil
 					}
 				agentPool := agent.NewAgentPool(agentFactory, 8)
+
+				taskStore := builtin.NewTaskStore(filepath.Join(cwd, ".claude-go", "tasks.json"))
+				dagAdapter := agent.NewTaskStoreDAGAdapter(taskStore, func() []agent.DAGTaskSummary {
+					raw := taskStore.ReadyTasks()
+					out := make([]agent.DAGTaskSummary, len(raw))
+					for i, t := range raw {
+						out[i] = agent.DAGTaskSummary{
+							ID: t.ID, Subject: t.Subject, Description: t.Description,
+							Status: t.Status, Owner: t.Owner, DependsOn: t.DependsOn, Priority: t.Priority,
+						}
+					}
+					return out
+				})
+
 				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
-					BaseDir: filepath.Join(cwd, ".claude-go", "teams"),
-					Cwd:     cwd,
-					Factory: agentFactory,
-					Pool:    agentPool,
-					Notify:  func(_, msg string) { fmt.Println(msg) },
-					LLM:    eng.APIClient,
-					Roles:  agent.NewRoleRegistry(cwd),
+					BaseDir:     filepath.Join(cwd, ".claude-go", "teams"),
+					Cwd:         cwd,
+					Factory:     agentFactory,
+					Pool:        agentPool,
+					Notify:      func(_, msg string) { fmt.Println(msg) },
+					LLM:         eng.APIClient,
+					Roles:       agent.NewRoleRegistry(cwd),
+					TaskTracker: dagAdapter,
+					Concurrency: eng.APIClient.Guard,
 				})
 
 				cmdCtx := &commands.CommandContext{

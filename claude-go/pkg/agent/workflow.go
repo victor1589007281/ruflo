@@ -331,45 +331,40 @@ func developmentWorkflow() *WorkflowDef {
 
 {adversarial_feedback}
 
-关键质量要求:
-1. 【禁止空壳】核心模块必须有真实实现,不允许 Mock/Stub/TODO
-2. 【编译通过】每创建/修改一个文件后,立即运行 go build/go vet 验证
-3. 【配置集中】使用统一的 config 包管理配置,不允许散落的 os.Getenv
-4. 【中文注释】关键函数和算法必须有中文注释说明意图
-5. 【增量修改】如果收到 Evaluator 反馈,在上一轮代码基础上修改,不要从零重写
-6. 【错误处理】每个可能失败的操作都要有 error 处理,不允许 _ = err
-7. 【方案对齐】每个模块实现前, 先检查设计文档的接口定义和约束清单
+## 核心质量要求 (按优先级排序):
 
-修复反馈时: 必须逐条处理 Evaluator 的每个 BLOCKER 和 HIGH 问题。
-实现完毕后, 在输出末尾附上:
-**约束检查:** C1 ✅ | C2 ✅ | ... (逐项确认)`,
+### P0: 可编译性 (编译不过=本轮自动失败)
+1. **每个文件写完后必须心理验证**: 检查 import 是否齐全, 函数签名是否匹配, 类型是否正确
+2. **不要使用不确定的 API**: 如果不确定某个标准库函数是否存在, 用最基础的方式实现
+3. **保持 import 一致**: 确保每个 import 的包都实际使用了, 不要遗漏也不要多余
+
+### P1: 完整性 (宁可简化但完整, 不要复杂但截断)
+4. **先写 main 入口**: 第一个输出的文件必须是 main.go, 确保可以 go run
+5. **核心功能优先**: 如果 token 不够输出所有文件, 优先输出核心模块的完整实现
+6. **禁止空壳/TODO**: 所有函数必须有真实实现, 不允许 Mock/Stub
+
+### P2: 工程质量
+7. 【配置集中】使用统一的 config 包管理配置
+8. 【中文注释】关键函数有中文注释说明意图
+9. 【增量修改】如果收到反馈,在上一轮基础上修改,不要从零重写
+10. 【错误处理】每个可能失败的操作都要有 error 处理
+
+### P3: 方案对齐
+11. 每个模块实现前, 先检查设计文档的接口定义和约束清单
+12. 实现完毕后附上: **约束检查:** C1 ✅ | C2 ✅ | ...
+
+修复反馈时: 必须逐条处理 Evaluator 的每个 BLOCKER 问题。`,
 			},
-			{
-				Name: "implement", Role: "coder", DependsOn: []string{"design"},
-				Prompt: `你是高级软件工程师(对抗式开发中的 Generator 角色)。
-严格按照架构设计实现完整的可编译、可运行的代码。
-
-目标: {objective}
-
-架构设计:
-{prev_result}
-
-{adversarial_feedback}
-
-关键质量要求:
-1. 【禁止空壳】核心模块必须有真实实现,不允许 Mock/Stub/TODO
-2. 【编译通过】每创建/修改一个文件后,立即运行 go build/go vet 验证
-3. 【配置集中】使用统一的 config 包管理配置,不允许散落的 os.Getenv
-4. 【中文注释】关键函数和算法必须有中文注释说明意图
-5. 【增量修改】如果收到 Evaluator 反馈,在上一轮代码基础上修改,不要从零重写
-6. 【错误处理】每个可能失败的操作都要有 error 处理,不允许 _ = err
-
-修复反馈时: 必须逐条处理 Evaluator 的每个 BLOCKER 和 HIGH 问题。`,
-			},
+		// 移除了重复的 implement stage (DependsOn: design)。
+		// 仅保留 DependsOn: plan 的版本，因为 plan 已经包含 design 上下文。
+		// 重复 stage 导致对抗循环中 coder 每轮执行两次，浪费 token 和时间。
 			{
 				Name: "evaluate", Role: "reviewer", DependsOn: []string{"implement"},
 				Prompt: `你是对抗式开发中的 Evaluator(只读、多疑的审查者)。
 你的核心使命不仅是审查代码质量, 更要检测实现与设计方案的偏差。
+
+⚠️ 重要: 本轮代码已通过编译门禁 (go build 通过), 你不需要检查编译问题。
+请聚焦于逻辑正确性、完整性、安全性和设计对齐。
 
 目标: {objective}
 
@@ -378,13 +373,14 @@ Generator 第 {adversarial_round} 轮产出:
 
 ## 审查维度 (5维度, 每项0-10分):
 
-### 1. correctness (正确性)
-- BLOCKER: 编译错误、缺少 import、语法错误 → 标注文件和行号
-- 逻辑错误、竞态条件、资源泄漏
+### 1. correctness (正确性) — 聚焦运行时逻辑
+- 逻辑错误、竞态条件、资源泄漏、边界条件
+- (编译已通过, 不需要检查 import/语法)
 
 ### 2. completeness (完整性)
 - 是否覆盖设计文档中所有模块?
 - CRITICAL: 核心功能未实现 (Mock/Stub)
+- 注意: 仅评估本轮**实际可见**的代码, 不因"看不到的文件"扣分
 
 ### 3. security (安全性)
 - SQL注入、硬编码密码、敏感数据泄露
@@ -392,20 +388,22 @@ Generator 第 {adversarial_round} 轮产出:
 ### 4. code_quality (代码质量)
 - 命名、结构、中文注释、错误处理
 
-### 5. design_alignment (方案对齐度) ← 关键新增维度
-参考 VERIMAP (EACL 2026) 的偏差检测:
-- 接口签名是否与设计文档一致? (方法名/参数/返回值)
-- 文件结构是否与设计文档一致? (目录树对比)
+### 5. design_alignment (方案对齐度)
+- 接口签名是否与设计文档一致?
 - 约束清单 C1/C2/C3... 是否全部遵守?
-- 数据结构 (struct) 是否与设计一致?
-- 依赖方向是否与设计一致? (不存在设计中未声明的依赖)
-偏差不一定是错误, 但必须标注并给出理由 (如 "设计遗漏, 运行时需要此依赖")。
+- 偏差标注理由 (如 "设计遗漏, 运行时需要")
+
+## 反馈规则 (避免反馈漂移):
+- **每轮反馈最多 5 条改进项**, 按优先级排序
+- **不要引入新需求**: 只检查现有设计是否实现, 不要添加设计中未要求的功能
+- **聚焦可操作性**: 每条反馈必须具体到文件名+函数名+修改方式
+- **不要重复已修复的问题**: 对比上轮反馈, 确认哪些已修复
 
 输出 STRICTLY as JSON:
-{"correctness": N, "completeness": N, "security": N, "code_quality": N, "design_alignment": N, "pass": bool, "feedback": "问题列表+修复建议+偏差说明"}
+{"correctness": N, "completeness": N, "security": N, "code_quality": N, "design_alignment": N, "pass": bool, "feedback": "最多5条问题+修复建议"}
 
-评分标准: 0-10 分。有 BLOCKER → correctness ≤ 3。有 Stub → completeness ≤ 4。
-有严重偏差(如设计中定义的接口未实现/签名不一致) → design_alignment ≤ 4。
+评分标准: 0-10 分。有 Stub → completeness ≤ 4。
+有严重偏差 → design_alignment ≤ 4。
 通过门槛: ALL 5 dimensions >= 6 AND pass == true。`,
 			},
 			{
@@ -633,14 +631,15 @@ type WorkflowExecutor struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	chatID      string
-	taskTracker TaskTracker        // 复用 V2 Task 系统 (可为 nil)
-	dagTracker  DAGTaskTracker     // V2 DAG 能力 (运行时从 taskTracker 检测)
-	evolution   *EvolutionEngine   // 自动进化引擎 (可为 nil)
-	roles       *RoleRegistry      // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
-	metrics     *metrics.Collector // 持续观测指标 (可为 nil)
-	pool        *AgentPool         // Agent 池 (动态扩缩, 可为 nil)
-	checkpoints CheckpointStore    // 检查点存取 (由 Coordinator 注入, 可为 nil)
-	promptCache *PromptCache       // 提示词缓存 (参考 Anthropic Prompt Caching)
+	taskTracker TaskTracker            // 复用 V2 Task 系统 (可为 nil)
+	dagTracker  DAGTaskTracker         // V2 DAG 能力 (运行时从 taskTracker 检测)
+	evolution   *EvolutionEngine       // 自动进化引擎 (可为 nil)
+	roles       *RoleRegistry          // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
+	metrics     *metrics.Collector     // 持续观测指标 (可为 nil)
+	pool        *AgentPool             // Agent 池 (动态扩缩, 可为 nil)
+	checkpoints CheckpointStore        // 检查点存取 (由 Coordinator 注入, 可为 nil)
+	promptCache *PromptCache           // 提示词缓存 (参考 Anthropic Prompt Caching)
+	concurrency ConcurrencySuggestor   // 动态并发建议 (基于 API 流控状态, 可为 nil)
 }
 
 // tryInitDAG 从 taskTracker 检测 DAG 能力
@@ -783,8 +782,15 @@ func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults ma
 // runOrchestratedPhase 使用 Orchestrator + V2 DAG 执行开发任务。
 // 当 Planner 输出了 WBS 表格时, Orchestrator 解析并通过 V2 TaskStore 调度。
 func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput, objective string, prevResults map[string]string, team *ProductionTeam) ([]StageResult, error) {
+	orchParallel := 3
+	if we.concurrency != nil {
+		suggested := we.concurrency.SuggestConcurrency()
+		if suggested > 1 {
+			orchParallel = suggested
+		}
+	}
 	orch := NewOrchestrator(
-		OrchestratorConfig{MaxParallel: 3, MaxRetries: 2, MicroTestAfter: true},
+		OrchestratorConfig{MaxParallel: orchParallel, MaxRetries: 2, MicroTestAfter: true, AdversarialRound: 5},
 		we.dagTracker, we.factory, we.notify, we.pool, we.chatID,
 	)
 
@@ -883,7 +889,12 @@ func (we *WorkflowExecutor) runDesignPhase(ctx context.Context, designStages []S
 	return results, nil
 }
 
-// runAdversarialLoop Phase 2: Generator ↔ Evaluator 对抗循环
+// maxBuildRetries 编译硬门禁内部重试次数 (L2, 参考 Self-Debugging arXiv:2304.05128)。
+// 编译修复循环独立于对抗循环, 不消耗 AdaptiveTerminator 的轮次配额。
+const maxBuildRetries = 2
+
+// runAdversarialLoop Phase 2: Generator ↔ Evaluator 对抗循环。
+// 六层质量保障: L2 编译硬门禁 + L5 上下文压缩 + L6 重采样决策。
 func (we *WorkflowExecutor) runAdversarialLoop(
 	ctx context.Context,
 	generatorStages []StageDef, evalStage *StageDef,
@@ -896,7 +907,7 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 	}
 
 	var allResults []StageResult
-	we.notify(we.chatID, fmt.Sprintf("⚔️ Phase 2: 对抗循环 (最多 %d 轮)...", maxRounds))
+	we.notify(we.chatID, fmt.Sprintf("⚔️ Phase 2: 对抗循环 (最多 %d 轮, 含编译硬门禁+重采样)...", maxRounds))
 	var lastGenOutput, lastEvalFeedback string
 	var lastScore EvalScore
 
@@ -905,25 +916,74 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 			return allResults, ctx.Err()
 		}
 
+		// L6: 重采样决策 (参考 arXiv:2604.10508)
+		// 连续 2 轮 Completeness<5 且编译失败 → 清空上轮输出, 换思路重新生成
+		if terminator != nil && round > 2 && terminator.ShouldResample() {
+			we.notify(we.chatID, fmt.Sprintf("🔄 第 %d 轮触发重采样 (连续低完整度+编译失败, 换思路)", round))
+			lastGenOutput = ""
+			lastEvalFeedback = "⚠️ **重采样模式**: 前几轮的实现方式无法产出完整代码。请换一种思路:\n" +
+				"1. 先实现最核心的 main 入口和 1 个核心模块, 确保可编译\n" +
+				"2. 每个文件写完后心理运行 go build 验证\n" +
+				"3. 宁可功能不全但能编译, 也不要输出不可编译的完整框架\n" +
+				"4. 优先保证: go build 通过 > 功能完整 > 代码优雅"
+		}
+
+		// L5: 注入迭代记忆链 (参考 Reflexion arXiv:2303.11366)
+		memoryHint := ""
+		if terminator != nil && len(terminator.Memories) > 0 {
+			memoryHint = FormatMemoryChain(terminator.Memories)
+		}
+
 		// Generator 执行
-		genResults, genOutput := we.runGeneratorRound(ctx, generatorStages, round, maxRounds, lastGenOutput, lastEvalFeedback, objective, prevResults, team)
+		genResults, genOutput := we.runGeneratorRound(ctx, generatorStages, round, maxRounds, lastGenOutput, lastEvalFeedback+"\n"+memoryHint, objective, prevResults, team)
 		allResults = append(allResults, genResults...)
 		if len(genResults) > 0 && genResults[len(genResults)-1].Status != TaskCompleted {
 			return allResults, fmt.Errorf("generator 第 %d 轮失败", round)
 		}
 		lastGenOutput = genOutput
 
-		// 编译门禁
-		lastEvalFeedback = we.runBuildGate(ctx, team, round, lastEvalFeedback)
+		// L2: 编译硬门禁 — 编译失败时内部重试, 不消耗对抗轮次
+		buildPassed := we.runBuildHardGate(ctx, generatorStages, round, maxRounds, &lastGenOutput, objective, prevResults, team, &allResults)
+		if terminator != nil {
+			terminator.RecordBuildResult(buildPassed)
+		}
+		if !buildPassed {
+			we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译硬门禁未通过 (含 %d 次内部重试), 跳过 Reviewer", round, maxBuildRetries))
+			// 编译未通过时, 为 reviewer 构造低分 (避免让 reviewer 审查不可编译的代码)
+			lastScore = EvalScore{
+				Correctness: 3, Completeness: 3, Security: 5, CodeQuality: 4,
+				Pass: false, Feedback: "编译未通过, 跳过 Reviewer 评审",
+			}
+			if terminator != nil {
+				terminator.RecordRoundOutput(round, lastScore, lastGenOutput)
+				terminator.RecordIterationMemory(round, lastScore, extractFileList(lastGenOutput), []string{"编译未通过"}, false)
+				decision := terminator.ShouldTerminate(round, lastScore)
+				if decision.ShouldStop {
+					we.notify(we.chatID, fmt.Sprintf("🏁 自适应终止 (编译持续失败, 原因: %s)", decision.Reason))
+					if decision.BestOutput != "" {
+						lastGenOutput = decision.BestOutput
+						prevResults[generatorStages[len(generatorStages)-1].Name] = decision.BestOutput
+					}
+					break
+				}
+			}
+			lastEvalFeedback = "编译未通过, 必须优先修复编译错误。"
+			continue
+		}
 
-		// Evaluator 审查
+		// 编译通过后, 清除之前的编译错误反馈
+		lastEvalFeedback = ""
+
+		// Evaluator 审查 (只有编译通过才进入)
 		evalResult, shouldBreak, bestOutput := we.runEvaluatorRound(ctx, evalStage, generatorStages, round, maxRounds, lastGenOutput, terminator, objective, prevResults, team, &lastEvalFeedback, lastScore)
 		allResults = append(allResults, evalResult...)
 		if bestOutput != "" {
 			lastGenOutput = bestOutput
 			prevResults[generatorStages[len(generatorStages)-1].Name] = bestOutput
 		}
-		// 更新 lastScore: 保留完整多维度 EvalScore (修复塌缩问题, 参考 MAgICoRe 多维度评分驱动)
+
+		// 更新 lastScore
+		kept := true
 		if len(evalResult) > 0 {
 			if parsed, err := ParseEvalScoreJSON([]byte(evalResult[len(evalResult)-1].Output)); err == nil {
 				lastScore = parsed
@@ -931,19 +991,117 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 				lastScore = HoldLastOrDefault(lastScore)
 			}
 		}
-		// 即时 Keep/Revert (参考 MiniMax M2.7): 退化时 revert 到最佳版本
-		if !shouldBreak && terminator != nil && round > 1 {
-			if revert, bo, br := terminator.ShouldRevert(lastScore); revert {
-				we.notify(we.chatID, fmt.Sprintf("⏪ 第 %d 轮退化, revert 到第 %d 轮最佳版本", round, br))
-				lastGenOutput = bo
-				prevResults[generatorStages[len(generatorStages)-1].Name] = bo
+
+		// L5: 记录迭代记忆
+		if terminator != nil {
+			issues := ExtractKeyIssues(lastScore.Feedback)
+			// 即时 Keep/Revert
+			if !shouldBreak && round > 1 {
+				if revert, bo, br := terminator.ShouldRevert(lastScore); revert {
+					we.notify(we.chatID, fmt.Sprintf("⏪ 第 %d 轮退化, revert 到第 %d 轮最佳版本", round, br))
+					lastGenOutput = bo
+					prevResults[generatorStages[len(generatorStages)-1].Name] = bo
+					kept = false
+				}
 			}
+			terminator.RecordIterationMemory(round, lastScore, extractFileList(lastGenOutput), issues, kept)
 		}
+
 		if shouldBreak {
 			break
 		}
 	}
 	return allResults, nil
+}
+
+// runBuildHardGate L2 编译硬门禁: 编译失败时驱动 Coder 内部重试。
+// 返回 true 表示编译通过。内部重试最多 maxBuildRetries 次, 不消耗对抗轮次。
+func (we *WorkflowExecutor) runBuildHardGate(
+	ctx context.Context, genStages []StageDef,
+	round, maxRounds int, lastGenOutput *string,
+	objective string, prevResults map[string]string, team *ProductionTeam,
+	allResults *[]StageResult,
+) bool {
+	if team.Cwd == "" {
+		return true
+	}
+	buildErrors := runBuildCheck(team.Cwd)
+	if buildErrors == "" {
+		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译通过", round))
+		if we.metrics != nil {
+			we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		}
+		return true
+	}
+
+	we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译失败, 启动内部修复 (最多 %d 次)...", round, maxBuildRetries))
+	if we.metrics != nil {
+		we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+	}
+
+	for retry := 1; retry <= maxBuildRetries; retry++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		buildFixPrompt := fmt.Sprintf("### 编译错误 (第 %d 次修复, 必须优先修复编译错误):\n%s\n\n"+
+			"要求:\n1. 仅修复编译错误, 不要做其他改动\n2. 保持现有代码结构不变\n3. 输出修复后的完整文件内容",
+			retry, truncateResult(buildErrors, 3000))
+
+		for _, genStage := range genStages {
+			fixStage := genStage
+			fixStage.Prompt = strings.ReplaceAll(fixStage.Prompt, "{adversarial_feedback}", buildFixPrompt)
+			fixStage.Name = fmt.Sprintf("%s-round%d-buildfix%d", genStage.Name, round, retry)
+
+			we.notify(we.chatID, fmt.Sprintf("  🔧 编译修复 %d/%d — %s...", retry, maxBuildRetries, genStage.Role))
+			sr := we.executeStage(ctx, fixStage, objective, prevResults, team)
+			sr.Name = fixStage.Name
+			*allResults = append(*allResults, sr)
+			if sr.Status == TaskCompleted {
+				*lastGenOutput = sr.Output
+				prevResults[genStage.Name] = sr.Output
+			}
+		}
+
+		buildErrors = runBuildCheck(team.Cwd)
+		if buildErrors == "" {
+			we.notify(we.chatID, fmt.Sprintf("  🟢 编译修复成功 (第 %d 次重试)", retry))
+			if we.metrics != nil {
+				we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name,
+					map[string]string{"round": fmt.Sprint(round), "build_retry": fmt.Sprint(retry)})
+			}
+			return true
+		}
+		we.notify(we.chatID, fmt.Sprintf("  🔴 编译修复第 %d 次仍失败", retry))
+	}
+	return false
+}
+
+// extractFileList 从 coder 输出中提取文件列表 (用于迭代记忆的 Approach 字段)
+func extractFileList(output string) string {
+	var files []string
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasSuffix(trimmed, ".go") || strings.HasSuffix(trimmed, ".ts") ||
+			strings.HasSuffix(trimmed, ".py") || strings.HasSuffix(trimmed, ".js") {
+			if len(trimmed) < 80 {
+				files = append(files, trimmed)
+			}
+		}
+		if strings.Contains(trimmed, "```go") || strings.Contains(trimmed, "// File:") ||
+			strings.Contains(trimmed, "package ") {
+			if len(trimmed) < 80 {
+				files = append(files, trimmed)
+			}
+		}
+	}
+	if len(files) > 10 {
+		files = files[:10]
+	}
+	if len(files) == 0 {
+		return "未识别到文件结构"
+	}
+	return strings.Join(files, "; ")
 }
 
 // runGeneratorRound 执行一轮 Generator
@@ -983,19 +1141,41 @@ func (we *WorkflowExecutor) runGeneratorRound(
 	return
 }
 
-// buildFeedbackSection 构建跨轮反馈上下文
+// buildFeedbackSection 构建跨轮反馈上下文。
+// L5 改进: 渐进式压缩 (参考 Kimi K2 溢出策略 + Reflexion 结构化记忆)
+// - Round 1: 全量设计文档 (无压缩)
+// - Round 2: 上轮输出压缩到 8K + Evaluator 反馈
+// - Round 3+: 上轮输出压缩到 4K + 仅关键问题 + 工作区文件清单
 func (we *WorkflowExecutor) buildFeedbackSection(round int, lastOutput, lastFeedback string, team *ProductionTeam) string {
 	section := ""
+
 	if lastFeedback != "" {
-		section = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, lastFeedback)
-	}
-	if round > 1 && lastOutput != "" {
-		prevSummary := lastOutput
-		if len(prevSummary) > 16000 {
-			prevSummary = prevSummary[:16000] + "\n...(上轮输出已截断)"
+		// 反馈也做压缩: 超过 4K 时提取关键问题
+		feedback := lastFeedback
+		if len(feedback) > 4000 {
+			feedback = SummarizeOldOutput(feedback, 4000)
 		}
+		section = fmt.Sprintf("### Evaluator 第 %d 轮反馈 (必须全部修复):\n%s", round-1, feedback)
+	}
+
+	if round > 1 && lastOutput != "" {
+		// 渐进式压缩: 越后面的轮次压缩越狠
+		maxOutputLen := 8000
+		if round >= 3 {
+			maxOutputLen = 4000
+		}
+		if round >= 4 {
+			maxOutputLen = 2000
+		}
+
+		prevSummary := lastOutput
+		if len(prevSummary) > maxOutputLen {
+			prevSummary = SummarizeOldOutput(prevSummary, maxOutputLen)
+		}
+
 		section = fmt.Sprintf("### 你的第 %d 轮代码输出 (严禁从零重写, 仅做增量修改):\n%s\n\n%s",
 			round-1, prevSummary, section)
+
 		if team.StartedAt.Unix() > 0 {
 			if manifest := workspaceFileManifest(team.Cwd, team.StartedAt); manifest != "" {
 				section = manifest + "\n" + section
@@ -1597,14 +1777,29 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	return sr
 }
 
-// maxWorkflowParallel 限制 workflow 层并行 LLM 调用上限, 配合全局 Guard 防止突发
-const maxWorkflowParallel = 6
+// maxWorkflowParallelDefault 默认 workflow 层并行上限
+const maxWorkflowParallelDefault = 6
 
-// executeParallel 并行执行多个阶段 (带并发上限)
+// effectiveParallel 基于流控状态动态确定 workflow 并发上限
+func (we *WorkflowExecutor) effectiveParallel() int {
+	if we.concurrency != nil {
+		suggested := we.concurrency.SuggestConcurrency()
+		if suggested > 0 && suggested < maxWorkflowParallelDefault {
+			return suggested
+		}
+		if suggested > maxWorkflowParallelDefault {
+			return maxWorkflowParallelDefault
+		}
+	}
+	return maxWorkflowParallelDefault
+}
+
+// executeParallel 并行执行多个阶段 (动态并发上限, 基于流控状态)
 func (we *WorkflowExecutor) executeParallel(ctx context.Context, stages []StageDef, objective string, prevResults map[string]string, team *ProductionTeam) []StageResult {
 	results := make([]StageResult, len(stages))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, maxWorkflowParallel)
+	para := we.effectiveParallel()
+	sem := make(chan struct{}, para)
 
 	for i, stage := range stages {
 		wg.Add(1)

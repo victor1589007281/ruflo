@@ -192,6 +192,55 @@ func (g *RateLimitGuard) On429(retryAfterSec float64) {
 	}
 }
 
+// CurrentMaxParallel 返回当前 AIMD 允许的最大并发数。
+func (g *RateLimitGuard) CurrentMaxParallel() int {
+	return int(atomic.LoadInt32(&g.maxInFlight))
+}
+
+// SuggestConcurrency 基于当前流控状态建议工作流层并发度。
+// 返回值在 [2, hardMax] 之间，考虑: 429 历史、当前 in-flight、RPM 余量。
+func (g *RateLimitGuard) SuggestConcurrency() int {
+	cur := int(atomic.LoadInt32(&g.maxInFlight))
+	inFlight := int(g.inFlight.Load())
+	avail := cur - inFlight
+	if avail < 0 {
+		avail = 0
+	}
+
+	g.mu.Lock()
+	rpmAvail := g.rpmTokens
+	isPaused := time.Until(g.pauseUntil) > 0
+	g.mu.Unlock()
+
+	// 正在全局退避中 → 最低并发
+	if isPaused {
+		return int(g.hardMin)
+	}
+	// RPM 余量不足 → 降低并发
+	if rpmAvail < 5 {
+		suggest := cur / 2
+		if suggest < int(g.hardMin) {
+			suggest = int(g.hardMin)
+		}
+		return suggest
+	}
+	// 429 比率较高 → 保守
+	total := g.TotalAcquires.Load()
+	rate429 := float64(0)
+	if total > 0 {
+		rate429 = float64(g.Total429s.Load()) / float64(total)
+	}
+	if rate429 > 0.1 {
+		suggest := cur * 2 / 3
+		if suggest < int(g.hardMin) {
+			suggest = int(g.hardMin)
+		}
+		return suggest
+	}
+	// 正常: 使用当前 AIMD 值
+	return cur
+}
+
 // Stats 返回当前状态 (用于日志/飞书通知)
 func (g *RateLimitGuard) Stats() string {
 	g.mu.Lock()

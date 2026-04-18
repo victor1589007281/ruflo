@@ -712,12 +712,26 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 	bottleneckCounts := make(map[string]int)
 
 	for round := 1; round <= terminator.MaxRounds; round++ {
+		// L6 重采样: 连续低质量时清空上轮输出，重新开始
+		if round > 2 && terminator.ShouldResample() {
+			o.notify(o.chatID, fmt.Sprintf("♻️ %s 触发重采样 (连续低完整度), 清空上轮输出重新生成", node.Title))
+			lastOutput = ""
+			lastFeedback = "⚠️ 重采样模式: 上一轮实现严重不完整, 请完全重新开始, 优先保证核心功能完整输出"
+		}
+
 		// === Step 1: Coder 生成/修复 ===
 		prompt := o.buildTaskPrompt(node, objective)
 		if round > 1 && lastFeedback != "" {
 			memorySection := FormatMemoryChain(iterMemory)
+			// L5 上下文压缩: 动态截断, 随轮次减少 (防止 token 溢出)
+			maxCtx := 12000
+			if round == 3 {
+				maxCtx = 6000
+			} else if round >= 4 {
+				maxCtx = 3000
+			}
 			prompt = fmt.Sprintf("%s\n\n%s\n### ⚠️ 第 %d 轮修复 (reviewer 反馈, 必须全部修复):\n%s\n\n### 上轮产出 (增量修改, 不要从零重写):\n%s",
-				prompt, memorySection, round, lastFeedback, truncateResult(lastOutput, 12000))
+				prompt, memorySection, round, truncateResult(lastFeedback, 2000), truncateResult(lastOutput, maxCtx))
 		}
 
 		runner, err := o.factory(ctx, node.Role, "")
@@ -741,6 +755,58 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 
 		lastOutput = result
 		node.Output = result
+
+		// === Step 1.5: L2 编译硬门禁 (与 workflow.go 的 runBuildHardGate 对齐) ===
+		buildPassed := true
+		if team.Cwd != "" {
+			buildErrors := runBuildCheck(team.Cwd)
+			if buildErrors != "" {
+				buildPassed = false
+				o.notify(o.chatID, fmt.Sprintf("🔴 %s 第 %d 轮编译失败, 启动内部修复...", node.Title, round))
+				for retry := 1; retry <= 2; retry++ {
+					fixPrompt := fmt.Sprintf("%s\n\n### 编译错误 (第 %d 次修复, 仅修复编译问题):\n%s\n\n上轮代码:\n%s",
+						o.buildTaskPrompt(node, objective), retry, truncateResult(buildErrors, 3000), truncateResult(lastOutput, 10000))
+					fixRunner, fixErr := o.factory(ctx, node.Role, "")
+					if fixErr != nil {
+						break
+					}
+					fixResult, fixErr := fixRunner.Execute(ctx, fixPrompt)
+					if fixErr != nil {
+						break
+					}
+					lastOutput = fixResult
+					node.Output = fixResult
+					buildErrors = runBuildCheck(team.Cwd)
+					if buildErrors == "" {
+						buildPassed = true
+						o.notify(o.chatID, fmt.Sprintf("  🟢 %s 编译修复成功 (重试 %d)", node.Title, retry))
+						break
+					}
+				}
+				if !buildPassed {
+					o.notify(o.chatID, fmt.Sprintf("  🔴 %s 编译修复失败, 跳过 reviewer, 直接记低分", node.Title))
+					score := EvalScore{Correctness: 3, Completeness: 2, Security: 5, CodeQuality: 3, DesignAlignment: 2,
+						Feedback: "编译未通过，无法评审代码质量"}
+					lastScore = score
+					terminator.RecordBuildResult(false)
+					terminator.RecordRoundOutput(round, score, lastOutput)
+					iterMemory = append(iterMemory, IterationMemory{
+						Round: round, Approach: "编译失败", Score: score,
+						KeyIssues: []string{"编译未通过"}, TestPass: false, Kept: false,
+					})
+					decision := terminator.ShouldTerminate(round, score)
+					if decision.ShouldStop {
+						break
+					}
+					lastFeedback = "编译失败，必须优先修复编译错误后再考虑功能"
+					continue
+				}
+			}
+			if buildPassed {
+				terminator.RecordBuildResult(true)
+				o.notify(o.chatID, fmt.Sprintf("🟢 %s 第 %d 轮编译通过", node.Title, round))
+			}
+		}
 
 		// === Step 2: Reviewer 审查 (复用 SkepticalReviewerPersona + ParseEvalScoreJSON) ===
 		score := o.runSkepticalReview(ctx, node, objective, lastScore)

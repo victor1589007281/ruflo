@@ -72,6 +72,57 @@ type DAGTaskSummary struct {
 	Priority    int      `json:"priority,omitempty"`
 }
 
+// TaskStoreForDAG 是 builtin.TaskStore 暴露给 agent 层的最小接口。
+// 解决 builtin.TaskStore.ReadyTasks() 返回 builtin.TaskSummary 而非 agent.DAGTaskSummary 的类型不匹配。
+type TaskStoreForDAG interface {
+	TaskTracker
+	AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
+	ReadyTasksRaw() []map[string]interface{}
+	SetTaskStatusAndUnblock(id, status string) (int, error)
+}
+
+// TaskStoreDAGAdapter 将 builtin.TaskStore 适配为 DAGTaskTracker。
+// builtin.TaskStore 已实现所有方法，仅 ReadyTasks 返回类型不同 ([]builtin.TaskSummary vs []DAGTaskSummary)。
+type TaskStoreDAGAdapter struct {
+	store interface {
+		AddTask(subject, description, owner string) (string, error)
+		SetTaskStatus(id, status string) error
+		AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
+		SetTaskStatusAndUnblock(id, status string) (int, error)
+	}
+	readyFunc func() []DAGTaskSummary
+}
+
+// NewTaskStoreDAGAdapter 创建适配器。
+// readyFn 由调用方提供，负责从 builtin.TaskStore.ReadyTasks() 转换类型。
+func NewTaskStoreDAGAdapter(
+	store interface {
+		AddTask(subject, description, owner string) (string, error)
+		SetTaskStatus(id, status string) error
+		AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
+		SetTaskStatusAndUnblock(id, status string) (int, error)
+	},
+	readyFn func() []DAGTaskSummary,
+) *TaskStoreDAGAdapter {
+	return &TaskStoreDAGAdapter{store: store, readyFunc: readyFn}
+}
+
+func (a *TaskStoreDAGAdapter) AddTask(subject, description, owner string) (string, error) {
+	return a.store.AddTask(subject, description, owner)
+}
+func (a *TaskStoreDAGAdapter) SetTaskStatus(id, status string) error {
+	return a.store.SetTaskStatus(id, status)
+}
+func (a *TaskStoreDAGAdapter) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
+	return a.store.AddTaskWithDeps(subject, description, owner, dependsOn, priority)
+}
+func (a *TaskStoreDAGAdapter) ReadyTasks() []DAGTaskSummary {
+	return a.readyFunc()
+}
+func (a *TaskStoreDAGAdapter) SetTaskStatusAndUnblock(id, status string) (int, error) {
+	return a.store.SetTaskStatusAndUnblock(id, status)
+}
+
 // DreamRecorder Dreaming 记录接口, 解耦 dreaming 包依赖。
 // 实现者: dreaming.Dreamer (通过 duck typing)。
 type DreamRecorder interface {
@@ -135,6 +186,12 @@ type MemoryWriter interface {
 	AddTeamMemory(teamName, workflow, objective, summary string)
 }
 
+// ConcurrencySuggestor 基于 LLM API 流控状态建议并发度 (解耦 api.RateLimitGuard)。
+type ConcurrencySuggestor interface {
+	SuggestConcurrency() int
+	CurrentMaxParallel() int
+}
+
 // ProductionTeamManager 生产级团队管理器
 type ProductionTeamManager struct {
 	teams       map[string]*ProductionTeam
@@ -150,8 +207,9 @@ type ProductionTeamManager struct {
 	evolution   *EvolutionEngine // 自动进化引擎
 	dreamer     DreamRecorder    // Dreaming 接口 (覆盖 team agent 会话)
 	roles       *RoleRegistry    // 角色注册表
-	memWriter   MemoryWriter     // 记忆写入 (团队完成后写入高权重记忆)
-	metrics     *metrics.Collector // 持续观测指标采集器
+	memWriter    MemoryWriter        // 记忆写入 (团队完成后写入高权重记忆)
+	metrics      *metrics.Collector  // 持续观测指标采集器
+	concurrency  ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
 }
 
 // TeamManagerConfig 团队管理器配置。
@@ -168,6 +226,7 @@ type TeamManagerConfig struct {
 	Dreamer     DreamRecorder
 	Roles       *RoleRegistry
 	MemWriter   MemoryWriter
+	Concurrency ConcurrencySuggestor
 }
 
 // SetMemoryWriter 注入记忆写入器 (在 Bot 初始化后调用)。
@@ -201,6 +260,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		dreamer:     cfg.Dreamer,
 		roles:       cfg.Roles,
 		metrics:     metrics.NewCollector(stateDir),
+		concurrency: cfg.Concurrency,
 	}
 	ptm.loadPersistedTeams()
 	return ptm
@@ -430,6 +490,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		metrics:     ptm.metrics,
 		pool:        ptm.pool,
 		checkpoints: coord, // 注入 Coordinator 作为 CheckpointStore
+		concurrency: ptm.concurrency,
 	}
 
 	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)

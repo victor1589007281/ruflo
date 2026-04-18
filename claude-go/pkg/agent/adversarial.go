@@ -135,6 +135,7 @@ func ExtractKeyIssues(feedback string) []string {
 //   - CaRT (2025): 反事实轨迹对比, 教模型判断"何时够了"
 //   - MiCP (2025): 多轮推理的置信度预测 + 覆盖率保证
 //   - MiniMax M2.7: 短期记忆 + 失败轨迹分析 + 阶梯策略转换
+//   - arXiv:2604.10508: "repair vs resample" — 前 2 轮修复最有效, 之后重采样更优
 //
 // 核心策略: 跟踪评分趋势, 检测收敛/震荡/退化, 动态决定继续或停止。
 type AdaptiveTerminator struct {
@@ -156,6 +157,15 @@ type AdaptiveTerminator struct {
 	// 阶梯式策略转换 (参考 GLM 5.1 staircase optimization)
 	StrategyShiftCount int // 已执行的策略转换次数
 	MaxStrategyShifts  int // 最大策略转换次数 (默认 2)
+
+	// 编译状态追踪 (L2 编译硬门禁)
+	BuildPassHistory []bool // 每轮编译是否通过
+
+	// 迭代记忆 (L5 上下文压缩, 参考 Reflexion)
+	Memories []IterationMemory
+
+	// 多维度评分历史 (用于 resample 决策)
+	FullScoreHistory []EvalScore
 }
 
 // NewAdaptiveTerminator 创建自适应终止器。
@@ -197,6 +207,46 @@ func (at *AdaptiveTerminator) RecordRoundOutput(round int, score EvalScore, outp
 		at.BestRound = round
 		at.BestOutput = output
 	}
+	at.FullScoreHistory = append(at.FullScoreHistory, score)
+}
+
+// RecordBuildResult 记录每轮编译结果 (L2 编译硬门禁)。
+func (at *AdaptiveTerminator) RecordBuildResult(passed bool) {
+	at.BuildPassHistory = append(at.BuildPassHistory, passed)
+}
+
+// RecordIterationMemory 记录本轮迭代记忆 (L5)。
+func (at *AdaptiveTerminator) RecordIterationMemory(round int, score EvalScore, approach string, issues []string, kept bool) {
+	at.Memories = append(at.Memories, IterationMemory{
+		Round:     round,
+		Approach:  approach,
+		Score:     score,
+		KeyIssues: issues,
+		TestPass:  len(at.BuildPassHistory) > 0 && at.BuildPassHistory[len(at.BuildPassHistory)-1],
+		Kept:      kept,
+	})
+}
+
+// ShouldResample 判断是否应该重采样而非继续修补 (参考 arXiv:2604.10508)。
+// 条件: Completeness 持续 <5 且编译未通过 → 说明当前方向错误, 需要换思路。
+// 返回 true 时调用方应清空 lastGenOutput, 用简化 prompt 重新生成。
+func (at *AdaptiveTerminator) ShouldResample() bool {
+	if len(at.FullScoreHistory) < 2 {
+		return false
+	}
+	consecutiveLowCompleteness := 0
+	consecutiveBuildFail := 0
+	for i := len(at.FullScoreHistory) - 1; i >= 0 && i >= len(at.FullScoreHistory)-2; i-- {
+		if at.FullScoreHistory[i].Completeness < 5 {
+			consecutiveLowCompleteness++
+		}
+	}
+	for i := len(at.BuildPassHistory) - 1; i >= 0 && i >= len(at.BuildPassHistory)-2; i-- {
+		if !at.BuildPassHistory[i] {
+			consecutiveBuildFail++
+		}
+	}
+	return consecutiveLowCompleteness >= 2 && consecutiveBuildFail >= 2
 }
 
 // ShouldRevert 每轮即时 keep/revert 决策 (参考 MiniMax M2.7)。
