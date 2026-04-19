@@ -620,6 +620,9 @@ func (o *Orchestrator) DAGMaxWidth() int {
 	return o.dagMaxWidth
 }
 
+// orchestratorStallTimeout 编排器停滞超时: 连续无进展超过此时间则中止。
+const orchestratorStallTimeout = 10 * time.Minute
+
 // Execute 从 V2 TaskStore 的就绪队列循环调度, 直到所有任务完成。
 func (o *Orchestrator) Execute(ctx context.Context, objective string, team *ProductionTeam) ([]StageResult, error) {
 	var allResults []StageResult
@@ -629,7 +632,6 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 		return nil, nil
 	}
 
-	// 基于 DAG 拓扑宽度精确调整 pool (不再用粗糙复杂度乘数)
 	if o.pool != nil && o.dagMaxWidth > 0 {
 		o.pool.AutoScale(o.dagMaxWidth)
 	}
@@ -638,17 +640,46 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 		o.totalCount, o.config.MaxParallel, o.dagMaxWidth))
 	logging.Event(ctx, "orchestrator.start", "tasks", o.totalCount, "maxParallel", o.config.MaxParallel, "dagWidth", o.dagMaxWidth)
 
+	lastProgressAt := time.Now()
+	lastCompletedCount := 0
+
 	for {
 		if ctx.Err() != nil {
 			return allResults, ctx.Err()
 		}
 
-		// 从 V2 TaskStore 获取就绪任务 (单一数据源)
+		// 完成检查前置: 所有任务已处理完 → 立即退出, 不受 ReadyTasks 中孤儿任务干扰
+		o.mu.Lock()
+		done := o.completedCount + o.failedCount >= o.totalCount
+		currentCompleted := o.completedCount + o.failedCount
+		o.mu.Unlock()
+		if done {
+			break
+		}
+
+		// 停滞检测: 若已完成数有推进则刷新计时
+		if currentCompleted > lastCompletedCount {
+			lastCompletedCount = currentCompleted
+			lastProgressAt = time.Now()
+		} else if time.Since(lastProgressAt) > orchestratorStallTimeout {
+			o.notify(o.chatID, fmt.Sprintf("⚠️ 编排器停滞超时 (%s 无进展, %d/%d 完成, %d 失败), 强制退出",
+				orchestratorStallTimeout, o.completedCount, o.totalCount, o.failedCount))
+			break
+		}
+
 		readyV2 := o.dag.ReadyTasks()
-		if len(readyV2) == 0 {
-			if o.completedCount+o.failedCount >= o.totalCount {
-				break
+
+		// 过滤孤儿任务: 只调度本编排器创建的任务 (防止 V2 TaskStore 中残留旧任务导致死循环)
+		var myReady []DAGTaskSummary
+		o.mu.Lock()
+		for _, t := range readyV2 {
+			if _, ok := o.nodes[t.ID]; ok {
+				myReady = append(myReady, t)
 			}
+		}
+		o.mu.Unlock()
+
+		if len(myReady) == 0 {
 			select {
 			case <-time.After(2 * time.Second):
 				continue
@@ -657,7 +688,7 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 			}
 		}
 
-		batch := readyV2
+		batch := myReady
 		if len(batch) > o.config.MaxParallel {
 			batch = batch[:o.config.MaxParallel]
 		}
@@ -665,13 +696,9 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 		var wg sync.WaitGroup
 		for _, task := range batch {
 			o.mu.Lock()
-			node, ok := o.nodes[task.ID]
+			node := o.nodes[task.ID]
 			o.mu.Unlock()
-			if !ok {
-				continue
-			}
 
-			// 标记为 running
 			_ = o.dag.SetTaskStatus(task.ID, "in_progress")
 
 			wg.Add(1)
@@ -1113,7 +1140,7 @@ func (o *Orchestrator) handleTaskFailure(ctx context.Context, node *TaskNode, ob
 		return o.executeTaskNode(ctx, node, objective, team)
 	}
 
-	_ = o.dag.SetTaskStatus(node.V2TaskID, "failed")
+	o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "failed")
 	o.mu.Lock()
 	o.failedCount++
 	o.mu.Unlock()
