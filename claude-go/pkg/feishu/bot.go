@@ -147,6 +147,13 @@ func (da *dreamAdapter) RecordSession(record agent.DreamSessionRecord) {
 	})
 }
 
+func (da *dreamAdapter) AfterQuery(ctx context.Context) {
+	if da.dreamer == nil {
+		return
+	}
+	da.dreamer.AfterQuery(ctx)
+}
+
 // Bot 飞书机器人。
 // 通过 WebSocket 长连接接收飞书消息事件，
 // 将用户消息桥接到 claude-go 的 QueryEngine，
@@ -174,6 +181,7 @@ type Bot struct {
 	skillReg   *skills.Registry             // 技能注册表 (进程级别共享)
 	dreamer    *dreaming.Dreamer            // Dreaming 记忆整理引擎
 	memStore   *memory.TieredStore          // 多层记忆存储 (进程级别共享)
+	factStore  *memory.FactStore            // L2 结构化记忆 (V3 Anti-Amnesia)
 	teamMgr    *agent.ProductionTeamManager // 生产级 Agent Teams 管理器
 	intentRec  *agent.IntentRecognizer      // 自然语言意图识别器
 	taskStore  *builtin.TaskStore           // 共享 V2 Task 存储
@@ -278,6 +286,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 4. 初始化多层记忆存储 (v2: 磁盘持久化, 解决重启后失忆)
 	bot.memStore = memory.NewTieredStoreWithPersist(bot.layout.Memory)
+
+	// 4b. V3 Anti-Amnesia: L2 结构化记忆
+	bot.factStore = memory.NewFactStore(bot.layout.Memory)
 
 	// 5. 解析 Hook 配置
 	hookConfigs := bot.parseHookConfigs(config)
@@ -639,6 +650,7 @@ func (b *Bot) Start(ctx context.Context) error {
 	}
 	if b.dreamer != nil && b.config.DreamEnabled {
 		log.Printf("[飞书Bot] Dreaming: 已启用")
+		go b.periodicMemoryMetrics(ctx)
 	}
 	if b.cronSched != nil {
 		ct, ce, _ := b.cronSched.Stats()
@@ -659,6 +671,47 @@ func (b *Bot) Shutdown() {
 		b.cfgWatcher.Stop()
 	}
 	b.mcpMgr.Shutdown()
+}
+
+// periodicMemoryMetrics 定期采集 Dreaming/FactStore/失忆风险指标
+func (b *Bot) periodicMemoryMetrics(ctx context.Context) {
+	mc := b.teamMgr.Metrics()
+	if mc == nil {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	collect := func() {
+		if b.dreamer != nil {
+			stats := b.dreamer.Stats()
+			mc.Record("dreaming", "dream_sessions_pending", float64(stats.SessionsSinceDream))
+			mc.Record("dreaming", "dream_hours_since_last", stats.HoursSinceLast)
+		}
+		if b.factStore != nil {
+			b.factStore.CollectMetrics(mc)
+			fStats := b.factStore.Stats()
+			dStats := b.dreamer.Stats()
+			risk := memory.ComputeAmnesiaRisk(
+				dStats.HoursSinceLast,
+				dStats.SessionsSinceDream,
+				fStats.AvgRetention,
+				fStats.ActiveFacts,
+				0, // compactLossRate: 需要 compact 模块配合，暂用 0
+			)
+			mc.Record("memory", "amnesia_risk_score", risk)
+		}
+	}
+
+	collect()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			collect()
+		}
+	}
 }
 
 // DashboardTeamAction 供 dashboard 直接调用的团队操作 (stop/restart/delete/resume)。

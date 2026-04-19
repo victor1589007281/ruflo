@@ -482,16 +482,23 @@ func (fs *FactStore) Stats() FactStoreStats {
 		TotalConnections: len(fs.connections),
 		CategoriesCount:  make(map[MemoryCategory]int),
 	}
+	retentionSum := 0.0
+	activeCount := 0
 	for _, f := range fs.facts {
 		if f.Archived {
 			stats.ArchivedFacts++
 		} else {
 			stats.ActiveFacts++
+			retentionSum += f.Retention()
+			activeCount++
 		}
 		if f.Evergreen {
 			stats.EvergreenFacts++
 		}
 		stats.CategoriesCount[f.Category]++
+	}
+	if activeCount > 0 {
+		stats.AvgRetention = retentionSum / float64(activeCount)
 	}
 	return stats
 }
@@ -504,5 +511,58 @@ type FactStoreStats struct {
 	EvergreenFacts   int                        `json:"evergreenFacts"`
 	TotalConnections int                        `json:"totalConnections"`
 	CategoriesCount  map[MemoryCategory]int     `json:"categoriesCount"`
+	AvgRetention     float64                    `json:"avgRetention"`
+}
+
+// MetricsRecorder 指标采集接口
+type MetricsRecorder interface {
+	Record(module, name string, value float64)
+}
+
+// CollectMetrics 采集 FactStore 指标到 metrics.Collector
+func (fs *FactStore) CollectMetrics(mc MetricsRecorder) {
+	stats := fs.Stats()
+	mc.Record("memory", "fact_total_count", float64(stats.TotalFacts))
+	mc.Record("memory", "fact_active_count", float64(stats.ActiveFacts))
+	mc.Record("memory", "fact_archived_count", float64(stats.ArchivedFacts))
+	mc.Record("memory", "fact_evergreen_count", float64(stats.EvergreenFacts))
+	mc.Record("memory", "fact_connection_count", float64(stats.TotalConnections))
+	mc.Record("memory", "fact_avg_retention", stats.AvgRetention)
+}
+
+// ComputeAmnesiaRisk 计算综合失忆风险评分 (0-100)
+//
+// 维度权重: dream过期(30%) + 会话积压(25%) + 记忆衰减(20%) + 事实稀缺(15%) + 压缩损失(10%)
+func ComputeAmnesiaRisk(hoursSinceDream float64, pendingSessions int64, avgRetention float64, activeFacts int, compactLossRate float64) float64 {
+	dreamStaleness := hoursSinceDream / 72.0
+	if dreamStaleness > 1.0 {
+		dreamStaleness = 1.0
+	}
+
+	sessionBacklog := float64(pendingSessions) / 20.0
+	if sessionBacklog > 1.0 {
+		sessionBacklog = 1.0
+	}
+
+	retentionDecay := 1.0 - avgRetention
+	if retentionDecay < 0 {
+		retentionDecay = 0
+	}
+
+	factScarcity := 1.0 - float64(activeFacts)/50.0
+	if factScarcity < 0 {
+		factScarcity = 0
+	}
+
+	loss := compactLossRate
+	if loss > 1.0 {
+		loss = 1.0
+	}
+
+	risk := dreamStaleness*30.0 + sessionBacklog*25.0 + retentionDecay*20.0 + factScarcity*15.0 + loss*10.0
+	if risk > 100 {
+		return 100
+	}
+	return risk
 }
 

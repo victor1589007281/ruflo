@@ -58,6 +58,8 @@ func TestDreamerRecordAndStats(t *testing.T) {
 	if stats.RecentSessions != 2 {
 		t.Errorf("期望 2 recent: %d", stats.RecentSessions)
 	}
+	// 等待后台 saveDreamState goroutine 完成, 避免 TempDir 清理竞态
+	time.Sleep(100 * time.Millisecond)
 }
 
 func TestDreamerGating(t *testing.T) {
@@ -189,6 +191,70 @@ func TestDreamerDisabled(t *testing.T) {
 	if d.IsDreaming() {
 		t.Error("禁用状态不应 dream")
 	}
+}
+
+func TestDreamerStatePersistence(t *testing.T) {
+	dir := t.TempDir()
+	memDir := filepath.Join(dir, "memory")
+	cfg := &dreaming.DreamConfig{
+		Enabled:     true,
+		MinHours:    24,
+		MinSessions: 5,
+		MemoryDir:   memDir,
+	}
+
+	d1 := dreaming.NewDreamer(cfg, dir)
+	d1.RecordSession(dreaming.SessionRecord{ChatID: "c1", Summary: "s1", EndTime: time.Now()})
+	d1.RecordSession(dreaming.SessionRecord{ChatID: "c2", Summary: "s2", EndTime: time.Now()})
+	d1.RecordSession(dreaming.SessionRecord{ChatID: "c3", Summary: "s3", EndTime: time.Now()})
+	time.Sleep(200 * time.Millisecond)
+
+	stats1 := d1.Stats()
+	if stats1.SessionsSinceDream != 3 {
+		t.Fatalf("期望 3 sessions: %d", stats1.SessionsSinceDream)
+	}
+
+	// 模拟进程重启: 新 Dreamer 应从磁盘恢复
+	d2 := dreaming.NewDreamer(cfg, dir)
+	stats2 := d2.Stats()
+	if stats2.SessionsSinceDream != 3 {
+		t.Errorf("重启后应恢复 sessions=3, 实际=%d", stats2.SessionsSinceDream)
+	}
+
+	stateFile := filepath.Join(memDir, "dream_state.json")
+	if _, err := os.Stat(stateFile); err != nil {
+		t.Errorf("dream_state.json 应存在: %v", err)
+	}
+}
+
+func TestDreamerIdleFallback(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &dreaming.DreamConfig{
+		Enabled:     true,
+		MinHours:    1,
+		MinSessions: 10, // 高阈值
+		MemoryDir:   filepath.Join(dir, "memory"),
+	}
+	d := dreaming.NewDreamer(cfg, dir)
+	d.SetConsolidateFn(func(ctx context.Context, sessions []dreaming.SessionRecord, memoryDir string) error {
+		os.MkdirAll(memoryDir, 0755)
+		return os.WriteFile(filepath.Join(memoryDir, "idle.md"), []byte("idle fallback"), 0644)
+	})
+
+	// 只有 1 条会话 (< minSessions=10)
+	d.RecordSession(dreaming.SessionRecord{ChatID: "c1", Summary: "s1", EndTime: time.Now()})
+	time.Sleep(100 * time.Millisecond)
+
+	// 正常 AfterQuery 不应触发 (1 < 10)
+	d.AfterQuery(context.Background())
+	time.Sleep(200 * time.Millisecond)
+	if d.IsDreaming() {
+		t.Error("正常门控下不应触发 (sessions=1 < 10)")
+	}
+
+	// 注意: 超时兜底需要 lastDreamTime 非零且 >48h，
+	// 但在新创建的 Dreamer 中 lastDreamTime 为零，idleFallback 条件不满足。
+	// 这是预期行为: 首次运行没有历史 dream 时不应兜底触发。
 }
 
 func TestDreamerCustomConsolidateFn(t *testing.T) {

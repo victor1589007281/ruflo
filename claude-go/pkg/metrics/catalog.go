@@ -74,6 +74,18 @@ var catalog = []MetricDesc{
 	{Module: "dreaming", Name: MDreamDurationSec, ZH: "整理耗时", EN: "Dreaming duration", Unit: "sec", Kind: KindHistogram, Panel: "dreaming"},
 	{Module: "dreaming", Name: MDreamErrorCount, ZH: "失败次数", EN: "Dreaming errors", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
 	{Module: "dreaming", Name: MDreamOutputSize, ZH: "输出大小 (字符)", EN: "Output size", Unit: "bytes", Kind: KindGauge, Panel: "dreaming"},
+	// V3: Dreaming 健康度
+	{Module: "dreaming", Name: MDreamSessionsPending, ZH: "待处理会话数", EN: "Pending sessions", Unit: "count", Kind: KindGauge, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamHoursSinceLast, ZH: "距上次整理 (小时)", EN: "Hours since last dream", Unit: "hours", Kind: KindGauge, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamGateBlockSessionsLow, ZH: "门控拦截: 会话不足", EN: "Gate block: sessions low", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamGateBlockTimeShort, ZH: "门控拦截: 时间不足", EN: "Gate block: time short", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamGateBlockDreaming, ZH: "门控拦截: 已在执行", EN: "Gate block: already dreaming", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamGateBlockLockHeld, ZH: "门控拦截: 锁被持有", EN: "Gate block: lock held", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamGateBlockScanThrottle, ZH: "门控拦截: 扫描节流", EN: "Gate block: scan throttle", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamTriggerSource, ZH: "触发来源", EN: "Trigger source", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamConsolidatorFacts, ZH: "Consolidator 事实产出", EN: "Consolidator facts", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamConsolidatorContra, ZH: "矛盾检测数", EN: "Contradictions detected", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
+	{Module: "dreaming", Name: MDreamConsolidatorPatterns, ZH: "模式发现数", EN: "Patterns found", Unit: "count", Kind: KindCounter, Panel: "dreaming"},
 
 	// ── Evolution ──────────────────────────────────────────
 	{Module: "evolution", Name: MEvoExperienceCount, ZH: "经验库条目数", EN: "Experience count", Unit: "count", Kind: KindGauge, Panel: "evolution"},
@@ -128,6 +140,17 @@ var catalog = []MetricDesc{
 	{Module: "memory", Name: MMemAvgAccessCount, ZH: "平均访问次数", EN: "Avg access count", Unit: "count", Kind: KindGauge, Panel: "memory"},
 	{Module: "memory", Name: MMemPruneCount, ZH: "记忆修剪次数", EN: "Memory prunes", Unit: "count", Kind: KindCounter, Panel: "memory"},
 	{Module: "memory", Name: MMemRetrievalCount, ZH: "记忆检索次数", EN: "Retrievals", Unit: "count", Kind: KindCounter, Panel: "memory"},
+	// V3: L2 FactStore + 失忆风险
+	{Module: "memory", Name: MFactTotalCount, ZH: "L2 事实总数", EN: "Total facts (L2)", Unit: "count", Kind: KindGauge, Panel: "memory"},
+	{Module: "memory", Name: MFactActiveCount, ZH: "活跃事实数", EN: "Active facts", Unit: "count", Kind: KindGauge, Panel: "memory"},
+	{Module: "memory", Name: MFactArchivedCount, ZH: "归档事实数", EN: "Archived facts", Unit: "count", Kind: KindGauge, Panel: "memory"},
+	{Module: "memory", Name: MFactEvergreenCount, ZH: "永久豁免事实", EN: "Evergreen facts", Unit: "count", Kind: KindGauge, Panel: "memory"},
+	{Module: "memory", Name: MFactAvgRetention, ZH: "平均保留率", EN: "Avg retention", Unit: "ratio", Kind: KindGauge, Panel: "memory"},
+	{Module: "memory", Name: MFactIngestCount, ZH: "新事实摄入数", EN: "Facts ingested", Unit: "count", Kind: KindCounter, Panel: "memory"},
+	{Module: "memory", Name: MFactDecayArchivedCount, ZH: "衰减归档数", EN: "Decay archived", Unit: "count", Kind: KindCounter, Panel: "memory"},
+	{Module: "memory", Name: MFactConnectionCount, ZH: "事实间关联数", EN: "Fact connections", Unit: "count", Kind: KindGauge, Panel: "memory"},
+	{Module: "memory", Name: MAmnesiaRiskScore, ZH: "失忆风险评分", EN: "Amnesia risk score", Unit: "score", Kind: KindGauge, Panel: "memory"},
+	{Module: "memory", Name: MPrecompactFactsSaved, ZH: "PreCompact 抢救事实", EN: "PreCompact facts saved", Unit: "count", Kind: KindCounter, Panel: "memory"},
 }
 
 // Catalog 返回内置的指标目录 (按模块+名称排序, 便于 diff)。

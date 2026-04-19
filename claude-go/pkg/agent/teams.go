@@ -127,6 +127,7 @@ func (a *TaskStoreDAGAdapter) SetTaskStatusAndUnblock(id, status string) (int, e
 // 实现者: dreaming.Dreamer (通过 duck typing)。
 type DreamRecorder interface {
 	RecordSession(record DreamSessionRecord)
+	AfterQuery(ctx context.Context)
 }
 
 // DreamSessionRecord 与 dreaming.SessionRecord 结构对齐。
@@ -596,6 +597,8 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 				Summary: fmt.Sprintf("[Team:%s] [%s/%s] %s", team.Name, r.Name, r.Role, truncateResult(r.Output, 300)),
 			})
 		}
+		// 团队完成后触发 Dreaming 检查 (解决仅有团队工作流时不触发的问题)
+		ptm.dreamer.AfterQuery(context.Background())
 	}
 
 	// 持久化完整报告文件 (解决产出散落、无法检索的问题)
@@ -692,6 +695,7 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 				Summary: fmt.Sprintf("[Swarm:%s] [%s/%s] %s", team.Name, r.Name, r.Role, truncateResult(r.Output, 300)),
 			})
 		}
+		ptm.dreamer.AfterQuery(context.Background())
 	}
 
 	// 持久化完整报告文件

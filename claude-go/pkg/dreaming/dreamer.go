@@ -26,6 +26,7 @@ package dreaming
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -138,6 +139,13 @@ type Dreamer struct {
 	ImportantEventThreshold float64
 }
 
+// dreamState 持久化的 Dreaming 状态 (解决进程重启后计数器丢失问题)
+type dreamState struct {
+	SessionsSinceDream int64     `json:"sessionsSinceDream"`
+	LastDreamTime      time.Time `json:"lastDreamTime"`
+	LastScanTime       time.Time `json:"lastScanTime"`
+}
+
 // NewDreamer 创建 Dreamer 实例
 func NewDreamer(config *DreamConfig, cwd string) *Dreamer {
 	if config == nil {
@@ -147,21 +155,63 @@ func NewDreamer(config *DreamConfig, cwd string) *Dreamer {
 		config.MemoryDir = filepath.Join(cwd, ".claude", "memory")
 	}
 	if config.MinHours <= 0 {
-		config.MinHours = 24
+		config.MinHours = 12
 	}
 	if config.MinSessions <= 0 {
-		config.MinSessions = 5
+		config.MinSessions = 3
 	}
 	if config.MaxMemoryFiles <= 0 {
 		config.MaxMemoryFiles = 50
 	}
 
-	return &Dreamer{
+	d := &Dreamer{
 		config:                  config,
 		cwd:                     cwd,
 		lockFile:                filepath.Join(config.MemoryDir, ".dream-lock"),
 		ImportantEventThreshold: 0.8,
 	}
+	d.loadDreamState()
+	return d
+}
+
+// saveDreamState 持久化 Dreaming 关键状态到磁盘
+func (d *Dreamer) saveDreamState() {
+	stateFile := filepath.Join(d.config.MemoryDir, "dream_state.json")
+	os.MkdirAll(filepath.Dir(stateFile), 0755)
+
+	d.mu.Lock()
+	state := dreamState{
+		SessionsSinceDream: d.sessionsSinceDream.Load(),
+		LastDreamTime:      d.lastDreamTime,
+		LastScanTime:       d.lastScanTime,
+	}
+	d.mu.Unlock()
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(stateFile, data, 0644)
+}
+
+// loadDreamState 从磁盘恢复 Dreaming 状态 (防止进程重启后归零)
+func (d *Dreamer) loadDreamState() {
+	stateFile := filepath.Join(d.config.MemoryDir, "dream_state.json")
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		return
+	}
+	var state dreamState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	d.sessionsSinceDream.Store(state.SessionsSinceDream)
+	d.lastDreamTime = state.LastDreamTime
+	d.mu.Lock()
+	d.lastScanTime = state.LastScanTime
+	d.mu.Unlock()
+	log.Printf("[Dreaming] 从磁盘恢复状态: sessions=%d, lastDream=%s",
+		state.SessionsSinceDream, state.LastDreamTime.Format("2006-01-02 15:04"))
 }
 
 // SetConsolidateFn 设置自定义整理函数 (配置入口)。
@@ -198,6 +248,9 @@ func (d *Dreamer) RecordSession(record SessionRecord) {
 	}
 	d.mu.Unlock()
 	d.sessionsSinceDream.Add(1)
+
+	// 持久化状态 (防止重启后丢失计数)
+	go d.saveDreamState()
 
 	// V3: 重要事件立即触发增量蒸馏 (不做完整 Dreaming)
 	if record.Importance >= d.ImportantEventThreshold && d.Consolidator != nil {
@@ -246,27 +299,35 @@ func max(a, b float64) float64 {
 //  1. 是否启用
 //  2. 是否已在整理中
 //  3. 距上次整理是否超过 MinHours
-//  4. 会话数是否达到 MinSessions
+//  4. 会话数是否达到 MinSessions (含超时兜底)
 //  5. 距上次扫描是否超过 10 分钟
 //  6. 文件锁是否可获取
 func (d *Dreamer) AfterQuery(ctx context.Context) {
 	if !d.config.Enabled {
 		return
 	}
-	// CAS 防止并发触发: 仅当 dreaming 从 false → true 时通过
 	if d.dreaming.Load() {
+		d.recordGateBlock("already_dreaming")
 		return
 	}
 
 	now := time.Now()
 
 	// 时间门控
-	if !d.lastDreamTime.IsZero() && now.Sub(d.lastDreamTime) < time.Duration(d.config.MinHours)*time.Hour {
+	timeSinceDream := now.Sub(d.lastDreamTime)
+	if !d.lastDreamTime.IsZero() && timeSinceDream < time.Duration(d.config.MinHours)*time.Hour {
+		d.recordGateBlock("time_short")
 		return
 	}
 
-	// 会话数门控
-	if d.sessionsSinceDream.Load() < int64(d.config.MinSessions) {
+	sessions := d.sessionsSinceDream.Load()
+
+	// 会话数门控 + 超时兜底:
+	// 正常路径: sessions >= minSessions
+	// 兜底路径: 超过 48h 且至少有 1 条会话 (解决长时间无飞书消息的场景)
+	idleFallback := !d.lastDreamTime.IsZero() && timeSinceDream > 48*time.Hour && sessions >= 1
+	if sessions < int64(d.config.MinSessions) && !idleFallback {
+		d.recordGateBlock("sessions_low")
 		return
 	}
 
@@ -274,23 +335,41 @@ func (d *Dreamer) AfterQuery(ctx context.Context) {
 	d.mu.Lock()
 	if !d.lastScanTime.IsZero() && now.Sub(d.lastScanTime) < 10*time.Minute {
 		d.mu.Unlock()
+		d.recordGateBlock("scan_throttle")
 		return
 	}
 	d.lastScanTime = now
 	d.mu.Unlock()
 
-	// CAS 原子抢占: 多个并发 goroutine 只有一个能成功
 	if !d.dreaming.CompareAndSwap(false, true) {
+		d.recordGateBlock("already_dreaming")
 		return
 	}
 
-	// 尝试获取文件锁
 	if !d.acquireLock() {
 		d.dreaming.Store(false)
+		d.recordGateBlock("lock_held")
 		return
+	}
+
+	triggerSource := "afterquery"
+	if idleFallback {
+		triggerSource = "idle_fallback"
+		log.Printf("[Dreaming] 超时兜底触发 (已 %v 未整理, %d 条会话)", timeSinceDream.Round(time.Minute), sessions)
+	}
+	if d.MetricsRecorder != nil {
+		d.MetricsRecorder.Record("dreaming", "dream_trigger_source", 1)
+		_ = triggerSource // label 将在后续 RecordWithLabels 支持时使用
 	}
 
 	go d.executeDream(ctx)
+}
+
+// recordGateBlock 记录门控拦截原因 (可观测性)
+func (d *Dreamer) recordGateBlock(reason string) {
+	if d.MetricsRecorder != nil {
+		d.MetricsRecorder.Record("dreaming", "dream_gate_block_"+reason, 1)
+	}
 }
 
 // executeDream 执行记忆整理 (v2: 人脑睡眠机制启发)。
@@ -333,6 +412,11 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 		} else {
 			log.Printf("[Dreaming] Consolidator: +%d 事实, %d 矛盾, %d 模式",
 				result.NewFacts, result.Contradictions, result.PatternsFound)
+			if d.MetricsRecorder != nil {
+				d.MetricsRecorder.Record("dreaming", "dream_consolidator_facts", float64(result.NewFacts))
+				d.MetricsRecorder.Record("dreaming", "dream_consolidator_contradictions", float64(result.Contradictions))
+				d.MetricsRecorder.Record("dreaming", "dream_consolidator_patterns", float64(result.PatternsFound))
+			}
 		}
 	}
 
@@ -361,6 +445,9 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 	d.mu.Lock()
 	d.recentSessions = nil
 	d.mu.Unlock()
+
+	// 持久化清零后的状态
+	go d.saveDreamState()
 
 	elapsed := time.Since(start)
 	log.Printf("[Dreaming] 整理完成 (耗时 %v, 处理 %d 条会话)", elapsed, len(sessions))
@@ -647,6 +734,11 @@ func (d *Dreamer) Stats() DreamStats {
 	recentCount := len(d.recentSessions)
 	d.mu.Unlock()
 
+	hoursSince := 0.0
+	if !d.lastDreamTime.IsZero() {
+		hoursSince = time.Since(d.lastDreamTime).Hours()
+	}
+
 	return DreamStats{
 		Enabled:            d.config.Enabled,
 		LastDreamTime:      d.lastDreamTime,
@@ -656,6 +748,7 @@ func (d *Dreamer) Stats() DreamStats {
 		MemoryDir:          d.config.MemoryDir,
 		MinHours:           d.config.MinHours,
 		MinSessions:        d.config.MinSessions,
+		HoursSinceLast:     hoursSince,
 	}
 }
 
@@ -669,6 +762,7 @@ type DreamStats struct {
 	MemoryDir          string    `json:"memoryDir"`
 	MinHours           int       `json:"minHours"`
 	MinSessions        int       `json:"minSessions"`
+	HoursSinceLast     float64   `json:"hoursSinceLast"`
 }
 
 // llmConsolidate LLM 驱动的记忆整理。

@@ -341,6 +341,19 @@ const (
 	MDreamDurationSec      = "dream_duration_sec"      // 整理耗时(秒)
 	MDreamErrorCount       = "dream_error_count"       // 失败次数
 	MDreamOutputSize       = "dream_output_size"       // 输出大小(字符)
+
+	// V3: Dreaming 健康度指标
+	MDreamSessionsPending       = "dream_sessions_pending"       // 待处理会话数
+	MDreamHoursSinceLast        = "dream_hours_since_last"       // 距上次 dream 小时数
+	MDreamGateBlockSessionsLow  = "dream_gate_block_sessions_low"  // 门控: 会话不足
+	MDreamGateBlockTimeShort    = "dream_gate_block_time_short"    // 门控: 时间不足
+	MDreamGateBlockDreaming     = "dream_gate_block_already_dreaming" // 门控: 已在执行
+	MDreamGateBlockLockHeld     = "dream_gate_block_lock_held"     // 门控: 锁被持有
+	MDreamGateBlockScanThrottle = "dream_gate_block_scan_throttle" // 门控: 扫描节流
+	MDreamTriggerSource         = "dream_trigger_source"          // 触发来源
+	MDreamConsolidatorFacts     = "dream_consolidator_facts"      // Consolidator 产出事实数
+	MDreamConsolidatorContra    = "dream_consolidator_contradictions" // 矛盾检测数
+	MDreamConsolidatorPatterns  = "dream_consolidator_patterns"   // 模式发现数
 )
 
 // Evolution 指标
@@ -407,6 +420,20 @@ const (
 	MMemAvgAccessCount = "mem_avg_access_count"  // 平均访问次数
 	MMemPruneCount     = "mem_prune_count"       // 修剪次数
 	MMemRetrievalCount = "mem_retrieval_count"   // 检索次数
+
+	// V3: L2 FactStore 指标
+	MFactTotalCount         = "fact_total_count"           // L2 事实总数
+	MFactActiveCount        = "fact_active_count"          // 活跃事实数
+	MFactArchivedCount      = "fact_archived_count"        // 已归档事实数
+	MFactEvergreenCount     = "fact_evergreen_count"       // 永久豁免事实数
+	MFactAvgRetention       = "fact_avg_retention"         // 平均保留率
+	MFactIngestCount        = "fact_ingest_count"          // 新事实摄入数
+	MFactDecayArchivedCount = "fact_decay_archived_count"  // 衰减归档数
+	MFactConnectionCount    = "fact_connection_count"      // 事实间关联数
+
+	// V3: 失忆风险指标
+	MAmnesiaRiskScore      = "amnesia_risk_score"         // 综合失忆风险评分 (0-100)
+	MPrecompactFactsSaved  = "precompact_facts_saved"     // PreCompact 抢救事实数
 )
 
 // LLM 指标 (跨模块通用的大模型调用观测)
