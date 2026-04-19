@@ -721,7 +721,7 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	//          fallback: 经典对抗循环 (pool 用粗糙 autoScalePool)
 	orchUsed := false
 	if planOutput, hasPlan := prevResults["plan"]; hasPlan && we.dagTracker != nil {
-		orchResults, orchErr := we.runOrchestratedPhase(ctx, planOutput, objective, prevResults, team)
+		orchResults, orchErr := we.runOrchestratedPhase(ctx, planOutput, objective, prevResults, team, allResults)
 		if orchErr == nil && len(orchResults) > 0 {
 			allResults = append(allResults, orchResults...)
 			we.savePhaseCheckpoints(orchResults)
@@ -845,7 +845,8 @@ func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults ma
 
 // runOrchestratedPhase 使用 Orchestrator + V2 DAG 执行开发任务。
 // 当 Planner 输出了 WBS 表格时, Orchestrator 解析并通过 V2 TaskStore 调度。
-func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput, objective string, prevResults map[string]string, team *ProductionTeam) ([]StageResult, error) {
+// priorStages: Phase 1 等已完成的阶段, 增量刷新时会与 Orchestrator 结果合并。
+func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput, objective string, prevResults map[string]string, team *ProductionTeam, priorStages []StageResult) ([]StageResult, error) {
 	orchParallel := 3
 	if we.concurrency != nil {
 		suggested := we.concurrency.SuggestConcurrency()
@@ -864,6 +865,16 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 	if designDoc, ok := prevResults["design"]; ok {
 		orch.SetDesignContext(designDoc, planOutput)
 	}
+
+	// 增量刷新: Orchestrator 每批任务完成后把 Phase 1 结果 + Orchestrator 结果合并写入 team.json
+	prefix := make([]StageResult, len(priorStages))
+	copy(prefix, priorStages)
+	orch.SetStageFlusher(func(orchResults []StageResult) {
+		combined := make([]StageResult, 0, len(prefix)+len(orchResults))
+		combined = append(combined, prefix...)
+		combined = append(combined, orchResults...)
+		we.flushStagesLive(team, combined)
+	})
 
 	nodes, err := orch.ParsePlanToDAGWithRepair(ctx, planOutput, team.Name, we.factory)
 	if err != nil || len(nodes) == 0 {

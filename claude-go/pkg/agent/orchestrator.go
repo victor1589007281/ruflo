@@ -101,6 +101,9 @@ type OrchestratorConfig struct {
 	AdversarialRound int // 每个 task 内 mini 对抗轮数 (0=不启用, 默认2)
 }
 
+// StageFlusher 回调: Orchestrator 每批任务完成后调用, 让调用方增量刷新 team.json。
+type StageFlusher func(results []StageResult)
+
 // Orchestrator 复用 V2 TaskStore 的 DAG 编排器
 type Orchestrator struct {
 	config OrchestratorConfig
@@ -115,6 +118,7 @@ type Orchestrator struct {
 	designDoc   string
 	planDoc     string
 	checkpoints CheckpointStore // 检查点 (从 WorkflowExecutor 传入, 可为 nil)
+	flusher     StageFlusher    // 增量刷新回调 (可为 nil)
 
 	completedCount int
 	failedCount    int
@@ -156,6 +160,13 @@ func NewOrchestrator(cfg OrchestratorConfig, dag DAGTaskTracker, factory CreateA
 		pool:    pool,
 		chatID:  chatID,
 	}
+}
+
+// SetStageFlusher 注入增量刷新回调, Execute 每批任务完成后调用。
+func (o *Orchestrator) SetStageFlusher(fn StageFlusher) {
+	o.mu.Lock()
+	o.flusher = fn
+	o.mu.Unlock()
 }
 
 // SetCheckpointStore 注入检查点存取 (供每个 task 完成后持久化)。
@@ -711,6 +722,15 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 			}(node, task.ID)
 		}
 		wg.Wait()
+
+		// 每批任务完成后增量刷新 team.json, 让 dashboard 实时可见
+		if o.flusher != nil {
+			resultsMu.Lock()
+			snapshot := make([]StageResult, len(allResults))
+			copy(snapshot, allResults)
+			resultsMu.Unlock()
+			o.flusher(snapshot)
+		}
 	}
 
 	o.notify(o.chatID, fmt.Sprintf("🏁 编排完成: %d/%d 成功, %d 失败",
@@ -895,8 +915,13 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			node.Title, round, scoreMsg, testLabel))
 
 		if team.Blackboard != nil {
+			fullScore := scoreMsg + fmt.Sprintf(" 通过:%v test:%v", score.MeetsHardPassThreshold(), node.TestPassed)
+			// 旧键 (向后兼容)
 			team.Blackboard.Write(fmt.Sprintf("%s-eval-round%d", node.V2TaskID, round),
-				scoreMsg+fmt.Sprintf(" test:%v", node.TestPassed), "evaluator", "score")
+				fullScore, "evaluator", "score")
+			// 新键 (dashboard 可识别的 eval-*-score 格式)
+			team.Blackboard.Write(fmt.Sprintf("eval-task-%s-round%d-score", node.Title, round),
+				fullScore, "evaluator", "score")
 		}
 
 		// === Step 3.5: 即时 Keep/Revert 决策 (参考 MiniMax M2.7) ===

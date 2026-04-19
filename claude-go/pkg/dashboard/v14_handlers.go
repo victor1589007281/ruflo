@@ -634,6 +634,40 @@ func (s *Server) handleTeamDAG(w http.ResponseWriter, r *http.Request, name stri
 		resp.Stages = append(resp.Stages, stage)
 	}
 
+	// 3.5) 补充 checkpoint-only 阶段: checkpoints.json 中有记录但 team.json 的 stages 里没有的阶段。
+	// 这发生在 Orchestrator 运行中——checkpoint 已实时落地, 但 stages 尚未 flush。
+	stageNameSet := map[string]bool{}
+	for _, st := range resp.Stages {
+		stageNameSet[st.Name] = true
+	}
+	for cpName, cp := range cpMap {
+		if stageNameSet[cpName] {
+			continue
+		}
+		meta := wfMap[cpName]
+		stage := dagStageDTO{
+			Name:             cpName,
+			Status:           cp.Status,
+			DependsOn:        meta.DependsOn,
+			Parallel:         meta.Parallel,
+			TaskBrief:        meta.Brief,
+			AssignedAgents:   meta.Agents,
+			Attempts:         cp.Attempt,
+			CheckpointStatus: cp.Status,
+			CheckpointSaved:  cp.SavedAt,
+			CheckpointError:  cp.Error,
+			V2TaskID:         cpName,
+		}
+		if cp.Status == "completed" && cp.Output != "" {
+			if len(cp.Output) > 400 {
+				stage.OutputPre = cp.Output[:400] + "..."
+			} else {
+				stage.OutputPre = cp.Output
+			}
+		}
+		resp.Stages = append(resp.Stages, stage)
+	}
+
 	// 4) 如果 team 根本没跑过 stages, 直接回填 workflow 的静态 DAG, 让前端也能渲染结构
 	if len(resp.Stages) == 0 {
 		if wf := agent.GetWorkflow(detail.Workflow); wf != nil {

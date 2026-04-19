@@ -63,10 +63,12 @@ type TeamDetail struct {
 	RunMetrics       []RunMetricSeries   `json:"runMetrics,omitempty"`
 }
 
-// AdversaryRoundDTO 对抗循环某一轮的多维评分 (从 blackboard 的 eval-roundN-score 解析得到)。
+// AdversaryRoundDTO 对抗循环某一轮的多维评分 (从 blackboard 的 eval-*-score 解析得到)。
 // 分数区间 0-10, 与 agent.EvalScore 一致。
+// Phase 区分来源: "global" = 经典对抗循环, "task-{name}" = Orchestrator 任务级对抗。
 type AdversaryRoundDTO struct {
 	Round           int     `json:"round"`
+	Phase           string  `json:"phase,omitempty"`
 	Correctness     float64 `json:"correctness"`
 	Completeness    float64 `json:"completeness"`
 	Security        float64 `json:"security"`

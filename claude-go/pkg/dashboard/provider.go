@@ -196,8 +196,12 @@ func (p *Provider) GetTeam(name string) (*TeamDetail, error) {
 	return detail, nil
 }
 
-// extractAdversaryRounds 解析 blackboard.json 中的 eval-roundN-score 字符串。
-// 已知格式: "正确=7 完整=3 安全=6 质量=8 对齐=5 通过:false"
+// extractAdversaryRounds 解析 blackboard.json 中的对抗评分。
+// 支持两种键格式:
+//   - "eval-roundN-score"                 (经典对抗循环, 全局轮次)
+//   - "eval-task-{title}-roundN-score"    (Orchestrator 任务级轮次)
+//
+// 已知值格式: "正确=7 完整=3 安全=6 质量=8 对齐=5 通过:false"
 func (p *Provider) extractAdversaryRounds(name string) []AdversaryRoundDTO {
 	if !safeName(name) {
 		return nil
@@ -213,29 +217,58 @@ func (p *Provider) extractAdversaryRounds(name string) []AdversaryRoundDTO {
 	if err := json.Unmarshal(data, &items); err != nil {
 		return nil
 	}
-	byRound := map[int]*AdversaryRoundDTO{}
+
+	// compositeKey = "phase:round" → dto, 区分不同来源以防覆盖
+	type dtoKey struct {
+		Phase string
+		Round int
+	}
+	byKey := map[dtoKey]*AdversaryRoundDTO{}
+
 	for _, it := range items {
 		k := it.Key
-		if !strings.HasPrefix(k, "eval-round") || !strings.HasSuffix(k, "-score") {
-			continue
-		}
-		numStr := strings.TrimSuffix(strings.TrimPrefix(k, "eval-round"), "-score")
-		round, err := strconvItoa(numStr)
-		if err != nil {
+		if !strings.HasPrefix(k, "eval-") || !strings.HasSuffix(k, "-score") {
 			continue
 		}
 		raw, ok := it.Value.(string)
 		if !ok {
 			continue
 		}
+
+		inner := strings.TrimSuffix(strings.TrimPrefix(k, "eval-"), "-score")
+		// 格式 1: "eval-roundN-score" → inner = "roundN"
+		// 格式 2: "eval-task-{title}-roundN-score" → inner = "task-{title}-roundN"
+		phase := "global"
+		roundStr := ""
+		if ri := strings.LastIndex(inner, "round"); ri >= 0 {
+			roundStr = inner[ri+len("round"):]
+			prefix := inner[:ri]
+			if prefix != "" {
+				phase = strings.TrimSuffix(prefix, "-")
+			}
+		}
+		if roundStr == "" {
+			continue
+		}
+		round, err := strconvItoa(roundStr)
+		if err != nil {
+			continue
+		}
 		r := parseEvalScoreLine(round, raw)
-		byRound[round] = &r
+		r.Phase = phase
+		byKey[dtoKey{Phase: phase, Round: round}] = &r
 	}
-	rounds := make([]AdversaryRoundDTO, 0, len(byRound))
-	for _, r := range byRound {
+
+	rounds := make([]AdversaryRoundDTO, 0, len(byKey))
+	for _, r := range byKey {
 		rounds = append(rounds, *r)
 	}
-	sort.Slice(rounds, func(i, j int) bool { return rounds[i].Round < rounds[j].Round })
+	sort.Slice(rounds, func(i, j int) bool {
+		if rounds[i].Round != rounds[j].Round {
+			return rounds[i].Round < rounds[j].Round
+		}
+		return rounds[i].Raw < rounds[j].Raw
+	})
 	return rounds
 }
 
