@@ -116,6 +116,13 @@ type Client struct {
 	// 会写入 LLMCallRecord.Source, 方便在 dashboard 里按业务维度聚合 (chat/feishu/team/...)。
 	Tag string
 
+	// 智能模型切换: 连续 429 达到阈值时自动切换备用模型, 冷却后回退主模型
+	fbMu                sync.Mutex
+	consecutive429      int       // 连续 429 次数
+	fallbackActiveModel string    // 当前激活的备用模型 (空=使用主模型)
+	fallbackActiveSince time.Time // 切换到备用模型的时刻
+	fallbackCooldownMin int       // 冷却时间(分钟), 默认 5, 到期后尝试恢复主模型
+
 	// 熔断器
 	cbMu             sync.Mutex
 	consecutiveFails int
@@ -487,7 +494,7 @@ func (c *Client) StreamMessage(
 		}
 
 		req := types.APIRequest{
-			Model:     c.Model,
+			Model:     c.effectiveModel(),
 			Messages:  messages,
 			System:    system,
 			MaxTokens: maxTokens,
@@ -512,6 +519,7 @@ func (c *Client) StreamMessage(
 		}
 
 		var resp *http.Response
+	streamRetryLoop:
 		for attempt := 0; attempt <= maxRetry; attempt++ {
 			if ctx.Err() != nil {
 				errCh <- ctx.Err()
@@ -599,6 +607,11 @@ func (c *Client) StreamMessage(
 				if c.Guard != nil {
 					c.Guard.On429(retryAfterSec)
 				}
+				// 智能模型切换: 连续 429 达阈值时切换备用模型
+				if newModel := c.on429OrFallback(); newModel != "" {
+					req.Model = newModel
+					body, _ = json.Marshal(req)
+				}
 			} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
 				if c.Guard != nil {
 					c.Guard.On429(retryAfterSec)
@@ -630,6 +643,21 @@ func (c *Client) StreamMessage(
 					streamErrMsg = ctx.Err().Error()
 					errCh <- ctx.Err()
 					return
+				}
+			}
+
+			// Stream 全部重试失败 — 尝试 FallbackModels
+			if len(c.FallbackModels) > 0 && isFallbackEligible(resp.StatusCode, fmt.Errorf("%s", string(respBody))) {
+				for _, fbModel := range c.FallbackModels {
+					if fbModel == "" || fbModel == req.Model {
+						continue
+					}
+					log.Printf("[api] Stream 主模型失败, 尝试备用模型: %s", fbModel)
+					c.fireEvent("retry", fmt.Sprintf("Stream 切换备用模型 %s", fbModel))
+					req.Model = fbModel
+					body, _ = json.Marshal(req)
+					// 用备用模型再走一轮完整重试
+					goto streamRetryLoop
 				}
 			}
 
@@ -781,7 +809,7 @@ func (c *Client) SendMessage(
 	}
 
 	req := types.APIRequest{
-		Model:     c.Model,
+		Model:     c.effectiveModel(),
 		Messages:  messages,
 		System:    system,
 		MaxTokens: maxTokens,
@@ -871,6 +899,7 @@ func (c *Client) SendMessage(
 			if err := json.Unmarshal(respBody, &result); err != nil {
 				return nil, fmt.Errorf("解析响应失败: %w", err)
 			}
+			c.onSuccess429Reset()
 			rec := LLMCallRecord{
 				Status:       "success",
 				Request:      "messages",
@@ -934,9 +963,15 @@ func (c *Client) SendMessage(
 			if c.Guard != nil {
 				c.Guard.On429(retryAfterSec)
 			}
+			// 智能模型切换: 连续 429 达阈值时切换备用模型, 用新模型重试
+			if newModel := c.on429OrFallback(); newModel != "" {
+				req.Model = newModel
+				body, _ = json.Marshal(req)
+				continue
+			}
 		} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
 			if c.Guard != nil {
-				c.Guard.On429(retryAfterSec) // 过载也触发 AIMD 降速
+				c.Guard.On429(retryAfterSec)
 			}
 		}
 
@@ -1054,8 +1089,7 @@ func (c *Client) SendMessage(
 }
 
 // isFallbackEligible 判断失败是否适合切换备用模型。
-// 适用: 模型不支持(400)、配额耗尽(402/403)、超载(529)、全部重试超时。
-// 不适用: 提示词过长(需压缩而非换模型)、正常限流(等待即可恢复)。
+// 适用: 模型不支持(400)、配额耗尽(402/403)、超载(529)、连续限流(429 多次)。
 func isFallbackEligible(httpStatus int, err error) bool {
 	if err == nil {
 		return false
@@ -1072,6 +1106,73 @@ func isFallbackEligible(httpStatus int, err error) bool {
 		}
 	}
 	return false
+}
+
+// effectiveModel 返回当前应使用的模型名 (考虑智能切换状态)。
+// 如果备用模型冷却期已过, 自动恢复主模型。
+func (c *Client) effectiveModel() string {
+	if len(c.FallbackModels) == 0 {
+		return c.Model
+	}
+	c.fbMu.Lock()
+	defer c.fbMu.Unlock()
+
+	if c.fallbackActiveModel == "" {
+		return c.Model
+	}
+
+	cooldown := c.fallbackCooldownMin
+	if cooldown <= 0 {
+		cooldown = 5
+	}
+	if time.Since(c.fallbackActiveSince) > time.Duration(cooldown)*time.Minute {
+		log.Printf("[api] 冷却期(%d分钟)已过, 恢复主模型 %s (从备用 %s)",
+			cooldown, c.Model, c.fallbackActiveModel)
+		c.fallbackActiveModel = ""
+		c.consecutive429 = 0
+		c.fireEvent("model_restore", fmt.Sprintf("恢复主模型 %s", c.Model))
+		return c.Model
+	}
+
+	return c.fallbackActiveModel
+}
+
+// on429OrFallback 处理 429 限流, 达到阈值时切换备用模型。
+// 返回切换后的模型名 (空字符串=不切换, 继续等待)。
+func (c *Client) on429OrFallback() string {
+	if len(c.FallbackModels) == 0 {
+		return ""
+	}
+	c.fbMu.Lock()
+	defer c.fbMu.Unlock()
+
+	c.consecutive429++
+	const threshold = 3 // 连续 3 次 429 触发切换
+
+	if c.consecutive429 < threshold {
+		return ""
+	}
+
+	// 选择第一个可用的备用模型
+	for _, fb := range c.FallbackModels {
+		if fb != "" && fb != c.Model && fb != c.fallbackActiveModel {
+			log.Printf("[api] 连续 %d 次 429 限流, 切换到备用模型: %s → %s",
+				c.consecutive429, c.Model, fb)
+			c.fallbackActiveModel = fb
+			c.fallbackActiveSince = time.Now()
+			c.consecutive429 = 0
+			c.fireEvent("model_switch", fmt.Sprintf("429 限流切换: %s → %s", c.Model, fb))
+			return fb
+		}
+	}
+	return ""
+}
+
+// onSuccess429Reset 成功调用后重置 429 计数器。
+func (c *Client) onSuccess429Reset() {
+	c.fbMu.Lock()
+	c.consecutive429 = 0
+	c.fbMu.Unlock()
 }
 
 // SimpleComplete 简单文本补全: 发送 system+user prompt, 返回回复文本。

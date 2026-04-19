@@ -299,6 +299,24 @@ type JSONConfig struct {
 
 	// StateDir 数据根目录
 	StateDir string `json:"stateDir,omitempty"`
+
+	// Dashboard Dashboard 配置
+	Dashboard *DashboardSection `json:"dashboard,omitempty"`
+}
+
+// DashboardSection Dashboard 配置段
+type DashboardSection struct {
+	Port   int    `json:"port,omitempty"`   // 监听端口 (默认 7777)
+	Addr   string `json:"addr,omitempty"`   // 完整监听地址 (覆盖 port)
+	NoOpen bool   `json:"noOpen,omitempty"` // 不自动打开浏览器
+
+	// StateDir 已废弃: Dashboard 现在统一复用顶层 stateDir / cwd 的解析规则
+	// (见 basedir.ResolveDefault), 与 feishu bot 共享同一数据目录。
+	// 仍然保留该字段仅为向后兼容: 若设置, 启动时会打 deprecation 警告,
+	// 并作为最低优先级 fallback (低于 CLI --state-dir 和顶层 stateDir)。
+	//
+	// Deprecated: 请改用顶层 stateDir 或 cwd。
+	StateDir string `json:"stateDir,omitempty"`
 }
 
 // WikiSection Wiki 配置段 (JSON)

@@ -148,10 +148,16 @@ func main() {
 			// 在任何子命令执行前, 幂等初始化全局 LLM 指标采集钩子。
 			// 这样 chat/run/feishu/team/dashboard 等任意路径发起的 LLM 调用,
 			// 都会写入 <stateDir>/metrics/llm.jsonl, 供 dashboard 统一展示。
-			// 采用进程内 cwd 相对的默认 stateDir, 与 dashboard 默认一致。
+			//
+			// 例外: dashboard / feishu 子命令会自己根据 --config (config.cwd/stateDir)
+			// 解析出精确路径再调用 InitGlobalLLMCollector (支持重定位)。在这里用 os.Getwd()
+			// 做兜底会提前创建错位的 .claude-go 目录, 所以直接跳过, 交给子命令自己初始化。
+			path := cmd.CommandPath()
+			if strings.Contains(path, " dashboard") || strings.Contains(path, " feishu") {
+				return
+			}
 			cwd, _ := os.Getwd()
 			stateDir := basedir.ResolveDefault("", cwd)
-			// 启动前即尝试创建目录 (幂等), 避免首次 LLM 调用因目录不存在丢指标。
 			_ = os.MkdirAll(filepath.Join(stateDir, "metrics"), 0o755)
 			metrics.InitGlobalLLMCollector(stateDir)
 		},
@@ -880,7 +886,12 @@ func dashboardCmd() *cobra.Command {
   • 多项目切换 (扫描父级或自定义 root)
 
 默认仅监听 127.0.0.1, 不暴露到外网。所有数据均来自本地 .claude-go/ 目录,
-Dashboard 不会写入任何文件。
+与 feishu bot 共用同一份数据 (通过 basedir.ResolveDefault(stateDir, cwd) 解析)。
+
+Dashboard 写入范围有限且只在自己子目录:
+  • .claude-go/backups/            (用户触发的备份归档)
+  • .claude-go/.dashboard/actions  (UI 动作队列, 由 bot 消费)
+  • .claude-go/.dashboard/triggers (LLM 异步诊断任务)
 
 子命令:
   run       前台运行 (默认, 按 Ctrl+C 退出)
@@ -902,54 +913,64 @@ Dashboard 不会写入任何文件。
 
 	// 兼容旧行为: 无子命令时等价于 run (保留 flags 传参)
 	var (
-		addr     string
-		port     int
-		stateDir string
-		noOpen   bool
+		addr       string
+		port       int
+		stateDir   string
+		noOpen     bool
+		configPath string
 	)
 	cmd.Flags().StringVar(&addr, "addr", "", "监听地址 (如 127.0.0.1:7777), 与 --port 二选一")
 	cmd.Flags().IntVar(&port, "port", 7777, "监听端口 (默认绑定 127.0.0.1)")
-	cmd.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认当前工作目录下的 .claude-go)")
+	cmd.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认从 --config 的 stateDir/cwd 推导, 兜底 <CWD>/.claude-go)")
 	cmd.Flags().BoolVar(&noOpen, "no-open", false, "不自动打开浏览器")
+	cmd.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (与 feishu bot 共用同一 stateDir/cwd 解析规则)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		return runDashboardForeground(addr, port, stateDir, noOpen)
+		return runDashboardForeground(addr, port, stateDir, noOpen, configPath)
 	}
 	return cmd
 }
 
 func dashboardRunCmd() *cobra.Command {
 	var (
-		addr     string
-		port     int
-		stateDir string
-		noOpen   bool
+		addr       string
+		port       int
+		stateDir   string
+		noOpen     bool
+		configPath string
 	)
 	c := &cobra.Command{
 		Use:   "run",
 		Short: "前台运行 Dashboard (Ctrl+C 退出)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runDashboardForeground(addr, port, stateDir, noOpen)
+			return runDashboardForeground(addr, port, stateDir, noOpen, configPath)
 		},
 	}
 	c.Flags().StringVar(&addr, "addr", "", "监听地址 (如 127.0.0.1:7777)")
 	c.Flags().IntVar(&port, "port", 7777, "监听端口 (自动顺延至可用)")
-	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认从 --config 的 stateDir/cwd 推导, 兜底 <CWD>/.claude-go)")
 	c.Flags().BoolVar(&noOpen, "no-open", false, "不自动打开浏览器")
+	c.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (与 feishu bot 共用同一 stateDir/cwd 解析规则)")
 	return c
 }
 
 func dashboardStartCmd() *cobra.Command {
 	var (
-		port     int
-		stateDir string
-		noOpen   bool
+		port       int
+		stateDir   string
+		noOpen     bool
+		configPath string
 	)
 	c := &cobra.Command{
 		Use:   "start",
 		Short: "后台启动 Dashboard (daemon)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cwd, _ := os.Getwd()
-			resolved := basedir.ResolveDefault(stateDir, cwd)
+			// 与 feishu bot 完全一致的 stateDir 解析, 保证 daemon 和前台 run 用同一份数据目录。
+			info, err := resolveDashStateDir(stateDir, configPath)
+			if err != nil {
+				return err
+			}
+			printDashStateDirInfo(info, "Dashboard/start")
+			resolved := info.Resolved
 			// 已在跑则拒绝
 			if st, _ := dashboard.QueryStatus(resolved); st.Running {
 				fmt.Printf("已在运行: pid=%d %s\n", st.PID, st.URL)
@@ -968,11 +989,15 @@ func dashboardStartCmd() *cobra.Command {
 			}
 			defer logFile.Close()
 
-			// 启动子进程: claude-go dashboard run --addr ... --state-dir ... --no-open, 设置 detach 标记
+			// 启动子进程: claude-go dashboard run --addr ... --state-dir ... --no-open
 			args2 := []string{"dashboard", "run",
 				"--addr", bindAddr,
 				"--state-dir", resolved,
 				"--no-open",
+			}
+			if configPath != "" {
+				absConfig, _ := filepath.Abs(configPath)
+				args2 = append(args2, "--config", absConfig)
 			}
 			subCmd := exec.Command(exe, args2...)
 			subCmd.Stdout = logFile
@@ -1008,19 +1033,27 @@ func dashboardStartCmd() *cobra.Command {
 		},
 	}
 	c.Flags().IntVar(&port, "port", 7777, "期望端口 (占用时自动顺延)")
-	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认从 --config 的 stateDir/cwd 推导, 兜底 <CWD>/.claude-go)")
 	c.Flags().BoolVar(&noOpen, "no-open", false, "不自动打开浏览器")
+	c.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (与 bot/run 共用同一 stateDir 解析规则)")
 	return c
 }
 
 func dashboardStopCmd() *cobra.Command {
-	var stateDir string
+	var (
+		stateDir   string
+		configPath string
+	)
 	c := &cobra.Command{
 		Use:   "stop",
 		Short: "停止后台 Dashboard 进程",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cwd, _ := os.Getwd()
-			resolved := basedir.ResolveDefault(stateDir, cwd)
+			// 必须与 start 用同一份解析逻辑, 否则 pid 文件找不到会导致 "残留" 进程无法清理。
+			info, err := resolveDashStateDir(stateDir, configPath)
+			if err != nil {
+				return err
+			}
+			resolved := info.Resolved
 			st, err := dashboard.StopDaemon(resolved)
 			if err != nil {
 				return err
@@ -1033,21 +1066,26 @@ func dashboardStopCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认从 --config 的 stateDir/cwd 推导, 兜底 <CWD>/.claude-go)")
+	c.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (与 bot/run/start 共用同一 stateDir 解析规则)")
 	return c
 }
 
 func dashboardStatusCmd() *cobra.Command {
 	var (
-		stateDir string
-		asJSON   bool
+		stateDir   string
+		configPath string
+		asJSON     bool
 	)
 	c := &cobra.Command{
 		Use:   "status",
 		Short: "查看后台 Dashboard 状态",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cwd, _ := os.Getwd()
-			resolved := basedir.ResolveDefault(stateDir, cwd)
+			info, err := resolveDashStateDir(stateDir, configPath)
+			if err != nil {
+				return err
+			}
+			resolved := info.Resolved
 			st, _ := dashboard.QueryStatus(resolved)
 			if asJSON {
 				b, _ := json.MarshalIndent(st, "", "  ")
@@ -1073,19 +1111,26 @@ func dashboardStatusCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认从 --config 的 stateDir/cwd 推导, 兜底 <CWD>/.claude-go)")
+	c.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (与 bot/run/start 共用同一 stateDir 解析规则)")
 	c.Flags().BoolVar(&asJSON, "json", false, "以 JSON 输出")
 	return c
 }
 
 func dashboardOpenCmd() *cobra.Command {
-	var stateDir string
+	var (
+		stateDir   string
+		configPath string
+	)
 	c := &cobra.Command{
 		Use:   "open",
 		Short: "在浏览器打开当前运行的 Dashboard",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cwd, _ := os.Getwd()
-			resolved := basedir.ResolveDefault(stateDir, cwd)
+			info, err := resolveDashStateDir(stateDir, configPath)
+			if err != nil {
+				return err
+			}
+			resolved := info.Resolved
 			st, _ := dashboard.QueryStatus(resolved)
 			if !st.Running {
 				return fmt.Errorf("没有运行中的 Dashboard, 请先执行: claude-go dashboard start")
@@ -1093,7 +1138,8 @@ func dashboardOpenCmd() *cobra.Command {
 			return openBrowser(st.URL)
 		},
 	}
-	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 .claude-go)")
+	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认从 --config 的 stateDir/cwd 推导, 兜底 <CWD>/.claude-go)")
+	c.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (与 bot/run/start 共用同一 stateDir 解析规则)")
 	return c
 }
 
@@ -1314,10 +1360,128 @@ func runBackupDelete(stateDir, path string) error {
 	return nil
 }
 
+// dashStateDirInfo 记录 Dashboard StateDir 的解析结果及数据来源,
+// 便于启动日志透明展示 "为什么 stateDir 最终是这个值"。
+type dashStateDirInfo struct {
+	Resolved      string              // 最终路径 (basedir.ResolveDefault 的输出)
+	StateDirInput string              // 参与解析的 stateDir (CLI 或 JSON.stateDir)
+	StateDirFrom  string              // "cli" / "json.stateDir" / "json.dashboard.stateDir(deprecated)" / ""
+	CwdInput      string              // 参与解析的 cwd
+	CwdFrom       string              // "json.cwd" / "os.getwd"
+	JSONCfg       *feishu.JSONConfig  // 预加载的 JSON 配置 (供调用方复用)
+	ConfigPath    string              // 实际生效的配置文件路径
+	Warnings      []string            // 例如 dashboard.stateDir 废弃提示
+}
+
+// resolveDashStateDir 统一 Dashboard 所有子命令 (run/start/stop/status/open) 的
+// StateDir 解析规则, 与飞书 bot 保持完全一致 (basedir.ResolveDefault(StateDir, Cwd)):
+//
+//	优先级:
+//	  stateDir:  CLI --state-dir
+//	             > JSON.stateDir (顶层, 与 bot 共用)
+//	             > JSON.dashboard.stateDir (已废弃, 打警告)
+//	  cwd:       JSON.cwd (与 bot 共用)
+//	             > os.Getwd() (进程当前目录)
+//	  resolved:  basedir.ResolveDefault(stateDir, cwd)
+//	             → stateDir 非空则直接用; 否则 cwd/.claude-go
+//
+// 这样可以保证:
+//  1. 只设置 config.cwd 时, Dashboard 的 StateDir 与 bot 完全对齐 (cwd/.claude-go)
+//  2. 独立运行 `claude-go dashboard run -c xxx.json` 也能正确解析到 bot 的数据目录
+//  3. backups/.dashboard/actions/.dashboard/triggers 都落在与 bot 一致的位置
+//
+// configPath 为空时会沿用 feishu.LoadJSONConfig 的自动发现规则
+// (./claude-go.json / ./config/claude-go.json / ~/.claude-go/config.json)。
+func resolveDashStateDir(cliStateDir, configPath string) (*dashStateDirInfo, error) {
+	jsonCfg, err := feishu.LoadJSONConfig(configPath)
+	if err != nil && configPath != "" {
+		return nil, fmt.Errorf("加载配置文件失败: %w", err)
+	}
+
+	info := &dashStateDirInfo{
+		JSONCfg:    jsonCfg,
+		ConfigPath: configPath,
+	}
+
+	switch {
+	case cliStateDir != "":
+		info.StateDirInput = cliStateDir
+		info.StateDirFrom = "cli"
+	case jsonCfg != nil && jsonCfg.StateDir != "":
+		info.StateDirInput = jsonCfg.StateDir
+		info.StateDirFrom = "json.stateDir"
+	case jsonCfg != nil && jsonCfg.Dashboard != nil && jsonCfg.Dashboard.StateDir != "":
+		info.StateDirInput = jsonCfg.Dashboard.StateDir
+		info.StateDirFrom = "json.dashboard.stateDir(deprecated)"
+		info.Warnings = append(info.Warnings,
+			"dashboard.stateDir 已废弃, 请改用顶层 stateDir (或留空自动取 cwd/.claude-go), 以便与 feishu bot 共用数据目录")
+	}
+
+	// 即使 CLI / 顶层 stateDir 已指定, 如果 dashboard.stateDir 同时存在也要提醒,
+	// 避免用户误以为它仍然生效。
+	if info.StateDirFrom != "json.dashboard.stateDir(deprecated)" &&
+		jsonCfg != nil && jsonCfg.Dashboard != nil && jsonCfg.Dashboard.StateDir != "" {
+		info.Warnings = append(info.Warnings,
+			fmt.Sprintf("已忽略 dashboard.stateDir=%q (已废弃), 实际使用 %s", jsonCfg.Dashboard.StateDir, info.StateDirFrom))
+	}
+
+	if jsonCfg != nil && jsonCfg.Cwd != "" {
+		info.CwdInput = jsonCfg.Cwd
+		info.CwdFrom = "json.cwd"
+	} else {
+		info.CwdInput, _ = os.Getwd()
+		info.CwdFrom = "os.getwd"
+	}
+
+	info.Resolved = basedir.ResolveDefault(info.StateDirInput, info.CwdInput)
+	return info, nil
+}
+
+// printDashStateDirInfo 把 stateDir 解析过程透明输出到 stderr,
+// 便于排查 "bot 和 dashboard 数据目录对不上" 类问题。
+// label 用于区分调用者 (dashboard run / dashboard start / ...)。
+func printDashStateDirInfo(info *dashStateDirInfo, label string) {
+	if info == nil {
+		return
+	}
+	for _, w := range info.Warnings {
+		fmt.Fprintf(os.Stderr, "[%s] ⚠️  %s\n", label, w)
+	}
+	if info.ConfigPath != "" {
+		fmt.Fprintf(os.Stderr, "[%s] 配置文件   : %s\n", label, info.ConfigPath)
+	}
+	if info.StateDirFrom != "" {
+		fmt.Fprintf(os.Stderr, "[%s] stateDir   : %s  (来源: %s)\n", label, info.Resolved, info.StateDirFrom)
+	} else {
+		fmt.Fprintf(os.Stderr, "[%s] stateDir   : %s  (默认: %s/.claude-go, 来源=%s)\n",
+			label, info.Resolved, info.CwdInput, info.CwdFrom)
+	}
+}
+
 // runDashboardForeground 前台阻塞运行 dashboard。
-func runDashboardForeground(addr string, port int, stateDir string, noOpen bool) error {
-	cwd, _ := os.Getwd()
-	resolved := basedir.ResolveDefault(stateDir, cwd)
+func runDashboardForeground(addr string, port int, stateDir string, noOpen bool, configPath string) error {
+	// StateDir / cwd 与飞书 bot 完全一致的解析规则, 避免数据目录错位。
+	info, err := resolveDashStateDir(stateDir, configPath)
+	if err != nil {
+		return err
+	}
+	jsonCfg := info.JSONCfg
+
+	// addr/port/noOpen: CLI > JSON.dashboard
+	if jsonCfg != nil && jsonCfg.Dashboard != nil {
+		if addr == "" && jsonCfg.Dashboard.Addr != "" {
+			addr = jsonCfg.Dashboard.Addr
+		}
+		if port == 7777 && jsonCfg.Dashboard.Port > 0 {
+			port = jsonCfg.Dashboard.Port
+		}
+		if !noOpen && jsonCfg.Dashboard.NoOpen {
+			noOpen = true
+		}
+	}
+
+	resolved := info.Resolved
+	printDashStateDirInfo(info, "Dashboard")
 
 	bindAddr := addr
 	if bindAddr == "" {
@@ -1331,6 +1495,24 @@ func runDashboardForeground(addr string, port int, stateDir string, noOpen bool)
 	// 启动 LLM 调用指标采集 (全局钩子): 所有 api.Client 的调用都会落盘到
 	// {stateDir}/metrics/llm.jsonl, dashboard 展示统一的 LLM token/质量视图。
 	metrics.InitGlobalLLMCollector(resolved)
+
+	// 如果配置文件提供了 AI 配置，注入 LLM Client 给 dashboard 诊断使用
+	if jsonCfg != nil && jsonCfg.AI != nil && jsonCfg.AI.APIKey != "" {
+		var dashClient *api.Client
+		if jsonCfg.AI.BaseURL != "" {
+			dashClient = api.NewClient(jsonCfg.AI.BaseURL, jsonCfg.AI.APIKey, jsonCfg.AI.Model)
+		} else {
+			dashClient = api.NewDashScopeClient(jsonCfg.AI.APIKey, jsonCfg.AI.Model)
+		}
+		dashClient.Tag = "dashboard"
+		dashClient.FallbackModels = jsonCfg.AI.FallbackModels
+		if jsonCfg.AI.PromptCacheMode != "" {
+			dashClient.PromptCacheMode = jsonCfg.AI.PromptCacheMode
+		}
+		dashClient.Guard = api.NewRateLimitGuard(api.DefaultGuardConfig())
+		dashboard.SetSharedLLMClient(dashClient)
+		fmt.Printf("[Dashboard] LLM 已配置: model=%s\n", jsonCfg.AI.Model)
+	}
 
 	srv := dashboard.NewServer(dashboard.Config{
 		StateDir: resolved,

@@ -19,25 +19,57 @@ import (
 )
 
 var (
-	llmGlobalMu sync.Mutex
-	llmGlobal   *Collector
+	llmGlobalMu      sync.Mutex
+	llmGlobal        *Collector
+	llmGlobalDataDir string // 用于检测 stateDir 变化时重新挂载采集器
 )
 
-// InitGlobalLLMCollector 幂等地在指定 stateDir 上启动全局 LLM 指标采集。
-// 多次调用使用同一个采集器实例。返回底层 Collector, 方便其它模块复用。
+// InitGlobalLLMCollector 在指定 stateDir 上启动全局 LLM 指标采集。
+//
+// 行为:
+//   - 首次调用: 创建新的 Collector, 安装全局 hook, 返回。
+//   - 相同 stateDir 再次调用: no-op, 返回已有 Collector。
+//   - 不同 stateDir 再次调用 (重定位): 关闭旧 Collector 的文件句柄,
+//     用新 stateDir 重建 Collector 并替换全局 hook。这对应 CLI 场景:
+//     rootCmd.PersistentPreRun 用 os.Getwd() 先占位, 子命令 (dashboard/feishu)
+//     解析到真实配置 stateDir 后, 会以精确路径再次调用, 此时应以新路径为准,
+//     避免指标写错目录。
+//
+// 返回当前生效的 Collector, 方便其它模块复用。
 func InitGlobalLLMCollector(stateDir string) *Collector {
+	// dataDir 以 NewCollector 的拼接方式 (stateDir/metrics) 作为标识,
+	// 保证幂等比较时走同一个范式, 不受传入 stateDir 是否带尾部斜杠影响。
+	wantDir := filepath.Join(stateDir, "metrics")
+
 	llmGlobalMu.Lock()
 	defer llmGlobalMu.Unlock()
-	if llmGlobal != nil {
+
+	if llmGlobal != nil && llmGlobalDataDir == wantDir {
 		return llmGlobal
 	}
+
+	relocating := llmGlobal != nil
+	oldCollector := llmGlobal
+
+	// 先准备好新 collector, 再原子替换全局指针 + hook,
+	// 最后再关闭旧 collector, 避免 in-flight LLM 调用命中已关闭的 fd。
 	c := NewCollector(stateDir)
 	llmGlobal = c
+	llmGlobalDataDir = wantDir
 	llmPath := filepath.Join(stateDir, "metrics", "llm.jsonl")
-	log.Printf("[metrics] LLM 指标采集已初始化: %s", llmPath)
+	if relocating {
+		log.Printf("[metrics] LLM 指标采集重定位 -> %s", llmPath)
+	} else {
+		log.Printf("[metrics] LLM 指标采集已初始化: %s", llmPath)
+	}
 	api.SetGlobalLLMMetricsHook(func(rec api.LLMCallRecord) {
 		recordLLMCall(c, rec)
 	})
+
+	// 关闭旧 collector 的文件句柄 (只影响旧目录, 新目录已由新 collector 接管)。
+	if oldCollector != nil {
+		oldCollector.Close()
+	}
 	return c
 }
 
