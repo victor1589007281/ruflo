@@ -639,6 +639,9 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 	swarm := NewSwarmOrchestrator(ptm.llm, ptm.pool, ptm.taskTracker, ptm.notify, team.ChatID, 8)
 	swarm.evolution = ptm.evolution
 	swarm.roles = ptm.roles
+	if team.dataDir != "" {
+		swarm.stateDir = team.dataDir
+	}
 
 	results, err := swarm.Execute(ctx, team, team.Objective)
 	if err != nil {

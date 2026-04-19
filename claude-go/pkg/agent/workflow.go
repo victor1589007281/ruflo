@@ -464,18 +464,42 @@ Generator 第 {adversarial_round} 轮产出:
 func researchWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "research",
-		Description: "调研汇总: 技术专家+市场分析师+风险审计员 并行调研 → 综合分析",
+		Description: "调研汇总: 预规划→三方并行调研→交叉验证→综合分析 (V2: 借鉴 Extended Thinking + CoVe)",
 		Mode:        "fanout",
 		Stages: []StageDef{
 			{
+				Name: "research-planning", Role: "synthesizer",
+				Prompt: `你是**首席分析师**，在调研团队出发前负责制定调研框架。
+(借鉴 Claude Extended Thinking: 先想后做，避免研究员盲目调研)
+
+调研主题: {objective}
+
+## 你的任务
+1. **分解核心问题**: 将调研主题拆解为 3-5 个核心子问题
+2. **为每位研究员制定关键问题清单**:
+   - 技术研究员: 必须回答的 3-5 个技术问题
+   - 市场分析师: 必须验证的 3-5 个市场假设
+   - 风险审计员: 必须排查的 3-5 个风险点
+3. **预设交叉验证点**: 标注三方可能出现分歧的领域 (如性能数据、市场份额)
+4. **明确调研边界**: 什么在范围内，什么在范围外
+
+## 输出格式
+结构化 Markdown，按"技术/市场/风险"三个维度列出问题清单。`,
+			},
+			{
 				Name: "research-tech", Role: "tech-researcher",
+				DependsOn: []string{"research-planning"},
 				Prompt: `你是**技术深度研究员** (专注技术架构和实现)。对以下主题进行技术层面的深度调研。
 
 调研主题: {objective}
 
+首席分析师的调研框架:
+{prev_result}
+
 ## 强制要求
-1. **使用 WebSearch 工具**验证关键技术数据 (版本号、性能指标、API 变更等), 不要仅依赖训练知识
-2. 必须包含**负面案例**: 至少 2 个选型失败/踩坑案例及原因分析
+1. **严格按照调研框架中的技术问题清单逐一回答** — 不要跳过任何问题
+2. **使用 WebSearch 工具**验证关键技术数据 (版本号、性能指标、API 变更等)
+3. 必须包含**负面案例**: 至少 2 个选型失败/踩坑案例及原因分析
 
 ## 调研维度
 - 核心技术架构和设计理念
@@ -486,19 +510,24 @@ func researchWorkflow() *WorkflowDef {
 - **踩坑案例**: 社区中报告的常见问题和解决方案
 
 ## 输出格式
-结构化 Markdown，每个数据点注明来源 (官方文档/社区/实测)。`,
+结构化 Markdown，每个数据点注明来源 (官方文档/社区/实测)。在标注了"交叉验证点"的数据上额外标注数据来源的可信度(高/中/低)。`,
 				Parallel: true,
 			},
 			{
 				Name: "research-market", Role: "market-analyst",
+				DependsOn: []string{"research-planning"},
 				Prompt: `你是**市场与商业分析师** (专注商业价值和竞争格局)。对以下主题进行市场和商业层面的调研。
 
 调研主题: {objective}
 
+首席分析师的调研框架:
+{prev_result}
+
 ## 强制要求
-1. **使用 WebSearch 工具**查询最新的市场数据和采用案例
-2. 必须包含**量化数据**: 成本对比表、性能对比表、市场份额等
-3. 必须包含**失败案例**: 至少 1 个迁移/采用失败的真实案例
+1. **严格按照调研框架中的市场假设清单逐一验证** — 不要跳过任何假设
+2. **使用 WebSearch 工具**查询最新的市场数据和采用案例
+3. 必须包含**量化数据**: 成本对比表、性能对比表、市场份额等
+4. 必须包含**失败案例**: 至少 1 个迁移/采用失败的真实案例
 
 ## 调研维度
 - 行业采用情况和市场趋势 (通过 WebSearch 获取最新数据)
@@ -508,19 +537,24 @@ func researchWorkflow() *WorkflowDef {
 - ROI 评估模型
 
 ## 输出格式
-结构化 Markdown，数据密集，使用表格对比。`,
+结构化 Markdown，数据密集，使用表格对比。在标注了"交叉验证点"的数据上额外标注数据来源的可信度(高/中/低)。`,
 				Parallel: true,
 			},
 			{
 				Name: "research-risk", Role: "risk-auditor",
+				DependsOn: []string{"research-planning"},
 				Prompt: `你是**风险审计员** (专注风险评估和合规)。对以下主题进行风险和安全层面的深度审计。
 
 调研主题: {objective}
 
+首席分析师的调研框架:
+{prev_result}
+
 ## 强制要求
-1. **使用 WebSearch 工具**搜索相关 CVE、安全公告、故障报告
-2. 必须给出**量化风险评分** (影响 × 概率 矩阵)
-3. 每个风险必须给出**具体缓解措施**
+1. **严格按照调研框架中的风险排查清单逐一排查** — 不要跳过任何风险点
+2. **使用 WebSearch 工具**搜索相关 CVE、安全公告、故障报告
+3. 必须给出**量化风险评分** (影响 × 概率 矩阵)
+4. 每个风险必须给出**具体缓解措施**
 
 ## 调研维度
 - 安全风险 (CVE 历史、攻击面分析、合规要求)
@@ -538,13 +572,45 @@ func researchWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "synthesize", Role: "synthesizer",
+				Name: "cross-verification", Role: "fact-checker",
 				DependsOn: []string{"research-tech", "research-market", "research-risk"},
+				Prompt: `你是**交叉验证审查员** (借鉴 CoVe: Chain of Verification)。
+
+调研主题: {objective}
+
+三位研究员的调研结果:
+{prev_result}
+
+## 你的任务 (严格按步骤执行)
+
+### Step 1: 提取关键声明
+从三位研究员的报告中提取所有**事实性声明** (数字、日期、性能数据、CVE编号等)。
+列出至少 10 条关键声明。
+
+### Step 2: 交叉比对
+对每条声明检查:
+- 是否有多个来源佐证？
+- 三位研究员的数据是否一致？
+- 是否有矛盾？
+
+### Step 3: 独立验证
+对关键分歧和可疑数据, **使用 WebSearch 独立验证**。
+
+### Step 4: 验证报告
+| 声明 | 来源 | 验证结果 | 置信度 |
+|------|------|---------|--------|
+| ...  | 技术/市场/风险 | ✅确认/⚠️存疑/❌矛盾 | 高/中/低 |
+
+### Step 5: 标注需要综合报告特别注意的分歧点`,
+			},
+			{
+				Name: "synthesize", Role: "synthesizer",
+				DependsOn: []string{"cross-verification"},
 				Prompt: `你是**首席分析师**，负责深度综合所有调研结果并撰写最终报告。
 
 调研主题: {objective}
 
-调研团队产出:
+调研团队产出 (含交叉验证结果):
 {prev_result}
 
 ## 综合报告要求 (逐条完成, 不允许偷工减料)
@@ -552,21 +618,21 @@ func researchWorkflow() *WorkflowDef {
 1. **执行摘要** (5-8 条关键发现, 按重要性排序)
 2. **技术深度分析**
    - 综合技术研究员的发现
-   - **矛盾数据对比表**: 当不同研究员给出不同数据时,列表对比并分析原因
+   - **矛盾数据对比表**: 引用交叉验证审查员的验证结果
    - 技术可行性评分 (1-10, 含评分依据)
 3. **市场分析** (竞品对比表、成本分析、ROI)
 4. **风险热力图** (影响×概率矩阵, 标红 Top 5)
 5. **失败案例专题** (综合所有负面案例, 提炼共性教训)
 6. **实施路线图** (分阶段: MVP→Beta→GA, 含里程碑和交付物)
-7. **CVE/安全验证** 
-   - 核查风险审计员引用的每个 CVE 编号
-   - 对无法验证的 CVE 标注 "⚠️ 待人工验证(AI推断)"
+7. **数据可信度总结** (基于交叉验证结果)
+   - 高置信度事实: 直接引用
+   - 中置信度数据: 标注需要进一步确认
+   - 低置信度/矛盾数据: 标注 "⚠️ 待人工验证"
 8. **结论与决策建议** (给出明确的"推荐/谨慎推荐/不推荐"评级)
 
 ## 质量红线
 - 三位研究员的产出必须逐篇阅读、逐条交叉验证, 不允许简单拼接
-- CVE 引用必须标注来源 (NVD URL 或 "AI 推断")
-- 性能数据必须标注测试条件 (如有多个来源给出不同数据, 必须注明差异)
+- 交叉验证审查员标注为 ❌矛盾 的数据必须在报告中明确标注
 - 报告长度不少于 500 行 (确保深度整合, 非简单提取)
 - 将报告保存为独立 Markdown 文件`,
 			},
@@ -577,23 +643,44 @@ func researchWorkflow() *WorkflowDef {
 func debateWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "debate",
-		Description: "对抗辩论: 正方 ↔ 反方 × 3轮 → 裁判",
+		Description: "智能辩论: 预分析→自适应轮数→证据验证→裁决 (V2: 借鉴 iMAD+CoVe+DRA)",
 		Mode:        "adversarial",
 		Rounds:      3,
 		Stages: []StageDef{
+			{
+				Name: "pre-analysis", Role: "analyst",
+				Prompt: `你是**辩论预分析师** (借鉴 DeepThink: 辩论前深度思考)。
+
+辩论命题: {objective}
+
+## 任务
+1. **命题分解**: 将命题拆解为 3-5 个核心争议点
+2. **正反面预判**: 对每个争议点，预判正方和反方可能的立场
+3. **证据需求**: 列出需要事实验证的关键声明 (数据、案例等)
+4. **分歧预测**: 预测哪些争议点分歧最大，需要深度辩论
+5. **辩论框架**: 建议辩论应聚焦的 Top 3 核心问题
+
+## 输出格式
+结构化 Markdown，每个争议点附带证据需求清单。`,
+			},
 			{
 				Name: "proposer", Role: "proposer",
 				Prompt: `You are the PROPOSER in a structured debate. Argue IN FAVOR of the proposition.
 
 Proposition: {objective}
 
+Pre-analysis (核心争议点已识别):
+{prev_result}
+
 {debate_context}
 
-Make your strongest arguments:
-1. Present clear, evidence-based reasoning
-2. Address any counterarguments from the opponent
-3. Provide specific examples and data
-4. Strengthen any weakened arguments
+## 重要要求
+1. **聚焦核心争议点**: 优先论证预分析中识别的 Top 3 核心问题
+2. Present clear, evidence-based reasoning
+3. Address any counterarguments from the opponent
+4. Provide specific examples and data (标注数据来源)
+5. Strengthen any weakened arguments
+6. **标注可验证声明**: 对你引用的关键数据用 [CLAIM: xxx] 标注
 
 Be persuasive but intellectually honest. Acknowledge valid opposing points while explaining why your position is stronger.`,
 			},
@@ -605,13 +692,35 @@ Proposition: {objective}
 
 {debate_context}
 
-Make your strongest counterarguments:
-1. Identify weaknesses in the proposer's arguments
-2. Present alternative perspectives and evidence
-3. Highlight risks, costs, and unintended consequences
-4. Propose better alternatives if applicable
+## 重要要求
+1. **聚焦核心争议点**: 针对正方论点中的核心声明逐一反驳
+2. Identify weaknesses in the proposer's arguments
+3. Present alternative perspectives and evidence
+4. Highlight risks, costs, and unintended consequences
+5. Propose better alternatives if applicable
+6. **标注可验证声明**: 对你引用的关键数据用 [CLAIM: xxx] 标注
 
 Be rigorous and critical but fair. Don't use straw man arguments.`,
+			},
+			{
+				Name: "evidence-verify", Role: "fact-checker",
+				Prompt: `你是**证据验证员** (借鉴 CoVe: Chain of Verification)。
+
+辩论命题: {objective}
+
+辩论记录:
+{prev_result}
+
+## 任务 (严格按步骤)
+1. **提取声明**: 从正反双方发言中提取所有 [CLAIM: xxx] 标注的声明，以及其他关键事实性断言
+2. **独立验证**: 使用 WebSearch 独立验证每个声明的真实性
+3. **出具验证报告**:
+
+| 声明 | 来源(正/反) | 验证结果 | 证据 |
+|------|-----------|---------|------|
+| ...  | 正方/反方  | ✅正确/⚠️部分正确/❌错误/❓无法验证 | 验证来源URL |
+
+4. **标注对裁决有重大影响的验证结果**: 如果某个关键论据被证伪，明确指出`,
 			},
 			{
 				Name: "judge", Role: "judge",
@@ -619,20 +728,23 @@ Be rigorous and critical but fair. Don't use straw man arguments.`,
 
 Proposition: {objective}
 
-Full Debate Transcript:
+Full Debate Transcript + Evidence Verification:
 {prev_result}
 
-Evaluate:
-1. Strength of arguments from each side
-2. Quality of evidence presented
-3. How well each side addressed counterarguments
-4. Logical consistency and coherence
+## 重要: 证据验证结果
+证据验证员已独立核实了双方引用的关键数据。在裁决时:
+- 标注 ✅正确 的证据: 正常采信
+- 标注 ❌错误 的证据: 该论点大幅降权
+- 标注 ❓无法验证 的证据: 需要谨慎对待
 
-Render your verdict:
-- Which side presented the stronger case and why
-- Key deciding factors
-- Nuances and areas of agreement
-- Final recommendation with caveats`,
+## 裁决要求
+1. **论证强度评分**: 正方 X/10, 反方 Y/10 (附评分依据)
+2. **证据质量评分**: 基于验证结果，正方 X/10, 反方 Y/10
+3. **关键决胜点**: 哪个论点/证据对裁决起了决定性作用
+4. **证据验证影响**: 被证伪的论据如何影响了最终判定
+5. **共识区域**: 双方实际同意的部分
+6. **最终裁决**: 明确的结论 + 置信度 (高/中/低)
+7. **建议**: 如果采纳获胜方的立场，需要注意的风险和条件`,
 			},
 		},
 	}
@@ -1675,7 +1787,8 @@ func (we *WorkflowExecutor) executeFanOut(ctx context.Context, wf *WorkflowDef, 
 	return we.executePipeline(ctx, wf, objective, team)
 }
 
-// executeAdversarial 对抗辩论执行
+// executeAdversarial 对抗辩论执行 (V2: iMAD 按需辩论 + CoVe 证据验证 + 预分析)。
+// 参考 iMAD (arXiv:2511.11306): 仅在分歧大时继续辩论; 分歧低时提前结束。
 func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	var allResults []StageResult
 	rounds := wf.Rounds
@@ -1683,13 +1796,17 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 		rounds = 3
 	}
 
-	var proposerStage, opponentStage, judgeStage *StageDef
+	var preAnalysisStage, proposerStage, opponentStage, evidenceStage, judgeStage *StageDef
 	for i := range wf.Stages {
 		switch wf.Stages[i].Role {
+		case "analyst":
+			preAnalysisStage = &wf.Stages[i]
 		case "proposer":
 			proposerStage = &wf.Stages[i]
 		case "opponent":
 			opponentStage = &wf.Stages[i]
+		case "fact-checker":
+			evidenceStage = &wf.Stages[i]
 		case "judge":
 			judgeStage = &wf.Stages[i]
 		}
@@ -1698,14 +1815,36 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 		return nil, fmt.Errorf("辩论工作流需要 proposer, opponent, judge 角色")
 	}
 
-	var debateTranscript strings.Builder
-	debateTranscript.WriteString("# Debate Transcript\n\n")
-
 	// 在黑板上写入辩论主题
 	if team.Blackboard != nil {
 		team.Blackboard.Write("debate-topic", objective, "system", "context")
 	}
 
+	// Phase 0: 预分析 (如果有 analyst 阶段)
+	preAnalysisOutput := ""
+	if preAnalysisStage != nil {
+		we.notify(we.chatID, "🧠 **辩论预分析** — 识别核心争议点...")
+		prompt := strings.ReplaceAll(preAnalysisStage.Prompt, "{objective}", objective)
+		sr := we.runAgent(ctx, preAnalysisStage.Role, prompt, team)
+		sr.Name = "pre-analysis"
+		allResults = append(allResults, sr)
+		if sr.Status == TaskCompleted {
+			preAnalysisOutput = sr.Output
+			if team.Blackboard != nil {
+				team.Blackboard.Write("pre-analysis", sr.Output, "analyst", "result")
+			}
+		}
+	}
+
+	var debateTranscript strings.Builder
+	debateTranscript.WriteString("# Debate Transcript\n\n")
+	if preAnalysisOutput != "" {
+		debateTranscript.WriteString("## Pre-Analysis (核心争议点)\n")
+		debateTranscript.WriteString(preAnalysisOutput)
+		debateTranscript.WriteString("\n\n")
+	}
+
+	// Phase 1: 辩论轮次 (iMAD: 按需辩论)
 	for round := 1; round <= rounds; round++ {
 		if ctx.Err() != nil {
 			return allResults, ctx.Err()
@@ -1713,12 +1852,17 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 
 		debateCtx := debateTranscript.String()
 		if round == 1 {
-			debateCtx = "(This is the opening round. Present your initial arguments.)"
+			if preAnalysisOutput != "" {
+				debateCtx = preAnalysisOutput + "\n\n(This is the opening round. Focus on the core disputes identified above.)"
+			} else {
+				debateCtx = "(This is the opening round. Present your initial arguments.)"
+			}
 		}
 
 		// 正方发言
 		proposerPrompt := strings.ReplaceAll(proposerStage.Prompt, "{objective}", objective)
 		proposerPrompt = strings.ReplaceAll(proposerPrompt, "{debate_context}", debateCtx)
+		proposerPrompt = strings.ReplaceAll(proposerPrompt, "{prev_result}", preAnalysisOutput)
 
 		we.notify(we.chatID, fmt.Sprintf("🗣️ 辩论第 %d/%d 轮 — 正方发言中...", round, rounds))
 		sr := we.runAgent(ctx, proposerStage.Role, proposerPrompt, team)
@@ -1749,10 +1893,43 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 		if team.Blackboard != nil {
 			team.Blackboard.Write(fmt.Sprintf("round%d-opponent", round), sr.Output, "opponent", "result")
 		}
+
+		// iMAD 分歧度检测: 如果正反方高度一致, 提前结束辩论 (节省 token)
+		if round < rounds {
+			divergence := estimateDebateDivergence(sr.Output, allResults[len(allResults)-2].Output)
+			if team.Blackboard != nil {
+				team.Blackboard.Write(fmt.Sprintf("round%d-divergence", round),
+					fmt.Sprintf("%.2f", divergence), "system", "metric")
+			}
+			if divergence < 0.3 {
+				we.notify(we.chatID, fmt.Sprintf("📊 分歧度=%.2f (低于0.3阈值) — 双方趋于一致, 提前结束辩论", divergence))
+				break
+			} else if divergence > 0.7 {
+				we.notify(we.chatID, fmt.Sprintf("📊 分歧度=%.2f (高分歧) — 继续深入辩论", divergence))
+			}
+		}
 	}
 
-	// 裁判裁决
-	we.notify(we.chatID, "⚖️ 裁判裁决中...")
+	// Phase 2: 证据验证 (CoVe: 独立核实双方声明)
+	if evidenceStage != nil {
+		we.notify(we.chatID, "🔍 **证据验证** — 独立核实双方论据...")
+		prompt := strings.ReplaceAll(evidenceStage.Prompt, "{objective}", objective)
+		prompt = strings.ReplaceAll(prompt, "{prev_result}", debateTranscript.String())
+		sr := we.runAgent(ctx, evidenceStage.Role, prompt, team)
+		sr.Name = "evidence-verify"
+		allResults = append(allResults, sr)
+		if sr.Status == TaskCompleted {
+			debateTranscript.WriteString("## Evidence Verification\n")
+			debateTranscript.WriteString(sr.Output)
+			debateTranscript.WriteString("\n\n")
+			if team.Blackboard != nil {
+				team.Blackboard.Write("evidence-verify", sr.Output, "fact-checker", "result")
+			}
+		}
+	}
+
+	// Phase 3: 裁判裁决
+	we.notify(we.chatID, "⚖️ 裁判裁决中 (基于已验证证据)...")
 	judgePrompt := strings.ReplaceAll(judgeStage.Prompt, "{objective}", objective)
 	judgePrompt = strings.ReplaceAll(judgePrompt, "{prev_result}", debateTranscript.String())
 
@@ -1761,6 +1938,51 @@ func (we *WorkflowExecutor) executeAdversarial(ctx context.Context, wf *Workflow
 	allResults = append(allResults, sr)
 
 	return allResults, nil
+}
+
+// estimateDebateDivergence 估计正反方发言的分歧度 (0-1)。
+// 参考 Boids MeasureDivergence: 基于关键词重叠度的轻量实现。
+// 0=完全一致 (无需继续辩论), 1=完全对立 (需深入辩论)。
+func estimateDebateDivergence(proposerOutput, opponentOutput string) float64 {
+	if proposerOutput == "" || opponentOutput == "" {
+		return 0.5
+	}
+
+	agreementMarkers := []string{"agree", "同意", "确实", "indeed", "correct", "正确", "是的", "没错"}
+	disagreementMarkers := []string{"disagree", "不同意", "反对", "however", "但是", "错误", "误导", "不正确", "fallacy"}
+
+	pLower := strings.ToLower(proposerOutput)
+	oLower := strings.ToLower(opponentOutput)
+	combined := pLower + " " + oLower
+
+	agreeCount, disagreeCount := 0, 0
+	for _, m := range agreementMarkers {
+		agreeCount += strings.Count(combined, m)
+	}
+	for _, m := range disagreementMarkers {
+		disagreeCount += strings.Count(combined, m)
+	}
+
+	total := agreeCount + disagreeCount
+	if total == 0 {
+		return 0.5
+	}
+
+	divergence := float64(disagreeCount) / float64(total)
+
+	// 文本长度差异也暗示分歧 (一方明显更长说明有更多反驳)
+	lenRatio := float64(len(proposerOutput)) / float64(len(opponentOutput))
+	if lenRatio < 1 {
+		lenRatio = 1 / lenRatio
+	}
+	if lenRatio > 2 {
+		divergence = divergence*0.7 + 0.3
+	}
+
+	if divergence > 1 {
+		divergence = 1
+	}
+	return divergence
 }
 
 // ExecuteSingleStage 公开的单阶段执行 (供 Coordinator 调用)。
@@ -2360,11 +2582,48 @@ func techBlogWorkflow() *WorkflowDef {
 ## 必须包含: 至少 1 个 benchmark 或性能数据 + 至少 1 个生产环境案例`,
 			},
 			{
-				Name: "formatting", Role: "article-formatter",
+				Name: "self-critique", Role: "tech-critic",
 				DependsOn: []string{"article-writing"},
+				Prompt: `你是**资深技术自媒体主编** (借鉴 Qwen3 Thinking Mode: 先深度思考再输出)。
+
+写作主题: {objective}
+
+待审文章:
+{prev_result}
+
+## 自审任务 (模拟读者视角)
+
+### Step 1: 深度自评 (内心独白)
+- 如果我是一个高级工程师, 读完这篇文章, 我会觉得...
+- 如果我是一个初学者, 这篇文章对我的帮助是...
+- 这篇文章最大的亮点是...
+- 这篇文章最大的不足是...
+
+### Step 2: 多维评分
+| 维度 | 评分(1-10) | 问题描述 | 修改建议 |
+|------|-----------|---------|---------|
+| 深度 | | 是否有独到见解而非表面描述? | |
+| 准确性 | | 技术描述是否准确? | |
+| 可读性 | | 行文是否流畅? 是否有让人费解的段落? | |
+| 实用性 | | 读者读完能否获得可操作的知识? | |
+| 吸引力 | | 标题和开头是否吸引人? | |
+
+### Step 3: 具体修改指令
+如果总分 < 35 (满分50), 输出逐段修改指令:
+- 哪一段需要重写, 为什么
+- 需要补充什么内容
+- 需要删除什么冗余
+
+### Step 4: 修改后的完整文章
+**如果总分 ≥ 35, 仅输出小修建议, 保留原文主体。**
+**如果总分 < 35, 输出修改后的完整文章。**`,
+			},
+			{
+				Name: "formatting", Role: "article-formatter",
+				DependsOn: []string{"self-critique"},
 				Prompt: `你是微信公众号排版和视觉设计专家。将文章优化为适合公众号发布的格式。
 
-原始文章:
+原始文章 (已经过主编自审):
 {prev_result}
 
 请进行排版优化:
