@@ -105,6 +105,13 @@ type Client struct {
 	// 触发条件: 模型不支持 (400 invalid model) / 超载 (529) / 配额耗尽 (402/403)。
 	FallbackModels []string
 
+	// PromptCacheEnabled 启用 Anthropic prompt caching (顶层 cache_control)。
+	// "auto" = 自动检测 (默认，Anthropic 官方 API 启用，其他关闭)
+	// "on"   = 强制启用
+	// "off"  = 强制关闭
+	PromptCacheMode string
+	promptCacheDisabledByError bool // 因 API 错误自适应关闭
+
 	// 追踪标签 (可选): 调用方通过 WithTag 或直接赋值, 标识该 Client 实例所服务的业务场景。
 	// 会写入 LLMCallRecord.Source, 方便在 dashboard 里按业务维度聚合 (chat/feishu/team/...)。
 	Tag string
@@ -197,6 +204,41 @@ func (c *Client) GetCircuitSnapshot() CircuitSnapshot {
 // isRetryable 判断 HTTP 状态码是否可重试
 func isRetryableStatus(code int) bool {
 	return code == 429 || code == 503 || code == 529 || code >= 500
+}
+
+// shouldEnablePromptCache 判断当前请求是否应启用 prompt caching。
+func (c *Client) shouldEnablePromptCache() bool {
+	if c.promptCacheDisabledByError {
+		return false
+	}
+	switch strings.ToLower(c.PromptCacheMode) {
+	case "on":
+		return true
+	case "off":
+		return false
+	default: // "auto" 或空
+		return isAnthropicEndpoint(c.BaseURL)
+	}
+}
+
+// isAnthropicEndpoint 检测是否为 Anthropic 官方 API (支持 prompt caching)。
+func isAnthropicEndpoint(baseURL string) bool {
+	lower := strings.ToLower(baseURL)
+	return strings.Contains(lower, "anthropic.com") ||
+		strings.Contains(lower, "api.claude") ||
+		strings.Contains(lower, "bedrock") // AWS Bedrock 也支持
+}
+
+// isCacheRelatedError 检测 API 错误是否与 prompt caching 相关。
+func isCacheRelatedError(statusCode int, body string) bool {
+	if statusCode != 400 && statusCode != 422 {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "cache_control") ||
+		strings.Contains(lower, "cache") && strings.Contains(lower, "breakpoint") ||
+		strings.Contains(lower, "cache") && strings.Contains(lower, "not supported") ||
+		strings.Contains(lower, "unknown") && strings.Contains(lower, "cache")
 }
 
 // retryDelay 计算退避时间 (指数退避 + jitter, 429 用 3x 基数)
@@ -453,6 +495,9 @@ func (c *Client) StreamMessage(
 		}
 		if len(tools) > 0 {
 			req.Tools = tools
+		}
+		if c.shouldEnablePromptCache() {
+			req.CacheControl = &types.CacheControl{Type: "ephemeral"}
 		}
 
 		body, err := json.Marshal(req)
@@ -745,6 +790,9 @@ func (c *Client) SendMessage(
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
+	if c.shouldEnablePromptCache() {
+		req.CacheControl = &types.CacheControl{Type: "ephemeral"}
+	}
 
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -851,6 +899,14 @@ func (c *Client) SendMessage(
 
 		// 不可重试的客户端错误 (400/401/403) — 不计入熔断器
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 && !isRetryableStatus(resp.StatusCode) {
+			// 自适应关闭 prompt cache: 如果 400 错误与 cache_control 相关，禁用后重试一次
+			if req.CacheControl != nil && isCacheRelatedError(resp.StatusCode, string(respBody)) {
+				log.Printf("[api] prompt cache 不被支持, 自适应关闭: %s", string(respBody)[:min(len(respBody), 200)])
+				c.promptCacheDisabledByError = true
+				req.CacheControl = nil
+				body, _ = json.Marshal(req)
+				continue // 重试一次
+			}
 			errMsg := fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 			c.emitLLMMetric(LLMCallRecord{
 				Status:       "error",

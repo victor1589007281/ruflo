@@ -236,6 +236,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		aiClient.FallbackModels = config.FallbackModels
 		log.Printf("[Bot] 已配置 %d 个备用模型: %v", len(config.FallbackModels), config.FallbackModels)
 	}
+	if config.PromptCacheMode != "" {
+		aiClient.PromptCacheMode = config.PromptCacheMode
+	}
 
 	// 初始化统一目录布局
 	stateRoot := basedir.ResolveDefault(config.StateDir, config.Cwd)

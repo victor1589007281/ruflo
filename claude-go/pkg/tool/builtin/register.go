@@ -3,6 +3,7 @@ package builtin
 import (
 	"context"
 
+	"github.com/anthropic/claude-go/pkg/computeruse"
 	"github.com/anthropic/claude-go/pkg/tool"
 )
 
@@ -86,6 +87,9 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	reg.Register(NewCronCreateTool())
 	reg.Register(NewCronDeleteTool())
 	reg.Register(NewCronListTool())
+
+	// Computer Use (截屏/鼠标/键盘控制)
+	computeruse.RegisterAll(reg, nil)
 
 	return todoTool, store
 }

@@ -176,11 +176,16 @@ func FormatKLineText(kl *KLineData) string {
 }
 
 // normalizeStockCode 将用户输入转换为东方财富 secid 格式。
+// A股: 1.600519 (沪), 0.000001 (深), 0.830799 (北交所)
+// 港股: 116.00100 (前缀116)
+// 美股: 105.AAPL (前缀105)
 func normalizeStockCode(symbol string) string {
 	s := strings.TrimSpace(strings.ToUpper(symbol))
 
+	// 显式市场前缀
 	if strings.HasPrefix(s, "SH") || strings.HasPrefix(s, "SZ") ||
-		strings.HasPrefix(s, "BJ") {
+		strings.HasPrefix(s, "BJ") || strings.HasPrefix(s, "HK") ||
+		strings.HasPrefix(s, "US") {
 		prefix := s[:2]
 		code := s[2:]
 		code = strings.TrimPrefix(code, ".")
@@ -191,10 +196,24 @@ func normalizeStockCode(symbol string) string {
 			return "0." + code
 		case "BJ":
 			return "0." + code
+		case "HK":
+			return "116." + code
+		case "US":
+			return "105." + code
 		}
 	}
 
-	// 6开头 = 上海, 0/3开头 = 深圳, 8/4开头 = 北交所
+	// 港股: 5位数字且以0开头 (00100, 09888, 01810 等)
+	if len(s) == 5 && s[0] == '0' {
+		return "116." + s
+	}
+
+	// 美股: 纯字母 (AAPL, TSLA, GOOG 等)
+	if reUSStock.MatchString(s) {
+		return "105." + s
+	}
+
+	// A股: 6位数字
 	if len(s) == 6 {
 		switch {
 		case strings.HasPrefix(s, "6"):
@@ -208,6 +227,8 @@ func normalizeStockCode(symbol string) string {
 
 	return ""
 }
+
+var reUSStock = regexp.MustCompile(`^[A-Z]{1,5}$`)
 
 func parseFloat(s string) float64 {
 	var f float64

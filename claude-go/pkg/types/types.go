@@ -415,6 +415,11 @@ const (
 // API 类型 (对应 TS: services/api/claude.ts)
 // ============================================================================
 
+// CacheControl Anthropic prompt caching 控制 (顶层自动缓存)。
+type CacheControl struct {
+	Type string `json:"type"` // "ephemeral"
+}
+
 // APIRequest Anthropic Messages API 请求
 type APIRequest struct {
 	Model         string         `json:"model"`
@@ -425,6 +430,7 @@ type APIRequest struct {
 	Stream        bool           `json:"stream,omitempty"`
 	Temperature   *float64       `json:"temperature,omitempty"`
 	StopSequences []string       `json:"stop_sequences,omitempty"`
+	CacheControl  *CacheControl  `json:"cache_control,omitempty"`
 }
 
 // APIMessage API 格式的消息

@@ -128,6 +128,9 @@ type BotConfig struct {
 
 	// Browser 浏览器自动化配置 (CDP)
 	Browser BrowserConfig
+
+	// PromptCacheMode 提示词缓存模式: "auto"(默认)/"on"/"off"
+	PromptCacheMode string
 }
 
 // BrowserConfig 浏览器抓取配置。
@@ -340,12 +343,13 @@ type FeishuSection struct {
 
 // AISection AI 模型配置段
 type AISection struct {
-	Model          string   `json:"model,omitempty"`
-	APIKey         string   `json:"apiKey,omitempty"`
-	BaseURL        string   `json:"baseUrl,omitempty"`
-	MaxTokens      int      `json:"maxTokens,omitempty"`
-	MaxTurns       int      `json:"maxTurns,omitempty"`
-	FallbackModels []string `json:"fallbackModels,omitempty"` // 备用模型顺序: 主模型不可用时按序尝试
+	Model            string   `json:"model,omitempty"`
+	APIKey           string   `json:"apiKey,omitempty"`
+	BaseURL          string   `json:"baseUrl,omitempty"`
+	MaxTokens        int      `json:"maxTokens,omitempty"`
+	MaxTurns         int      `json:"maxTurns,omitempty"`
+	FallbackModels   []string `json:"fallbackModels,omitempty"`   // 备用模型顺序: 主模型不可用时按序尝试
+	PromptCacheMode  string   `json:"promptCacheMode,omitempty"` // "auto"(默认)/"on"/"off"
 }
 
 // MCPServerEntry MCP 服务器条目
@@ -461,6 +465,9 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		}
 		if len(jc.AI.FallbackModels) > 0 && len(bc.FallbackModels) == 0 {
 			bc.FallbackModels = jc.AI.FallbackModels
+		}
+		if jc.AI.PromptCacheMode != "" && bc.PromptCacheMode == "" {
+			bc.PromptCacheMode = jc.AI.PromptCacheMode
 		}
 	}
 
