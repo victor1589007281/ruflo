@@ -51,7 +51,7 @@ func buildTestEngine(t *testing.T) *engine.QueryEngine {
 	cwd := t.TempDir()
 	apiClient := api.NewClient(testBaseURL, getAPIKey(), testModel)
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseTools(reg)
+	builtin.RegisterBaseTools(reg, nil)
 	hookRunner := hooks.NewRunner(nil, "test-session")
 	permChecker := permissions.NewChecker(types.PermissionModeBypass)
 	compactor := compact.NewCompactor(apiClient, 200000)

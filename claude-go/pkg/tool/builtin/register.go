@@ -42,6 +42,7 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	// Web tools
 	reg.Register(NewWebFetchTool())
 	reg.Register(NewWebSearchTool(searcher))
+	reg.Register(NewKLineTool())
 
 	// User interaction
 	reg.Register(NewAskUserQuestionTool())

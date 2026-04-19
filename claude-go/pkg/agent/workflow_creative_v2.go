@@ -27,7 +27,7 @@ import (
 func creativeV2Workflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "creative-v2",
-		Description: "增强版创意团队: 策划→HTML开发→审查→媒体输出(PNG/PDF/MP4/PPT)",
+		Description: "增强版创意团队: 策划→HTML开发→审查→媒体输出(PNG/PDF/MP4/PPT/APP原型)",
 		Mode:        "creative_media",
 		Rounds:      0, // 0 = 自适应 AdaptiveTerminator
 		Stages: []StageDef{
@@ -367,6 +367,11 @@ func detectOutputFormats(objective, htmlContent string) []string {
 	hasPPT := strings.Contains(lower, "ppt") || strings.Contains(lower, "幻灯片") ||
 		strings.Contains(lower, "演示") || strings.Contains(lower, "slides")
 	hasSVG := strings.Contains(lower, "svg") || strings.Contains(htmlContent, "<svg")
+	hasApp := strings.Contains(lower, "app") || strings.Contains(lower, "原型") ||
+		strings.Contains(lower, "prototype") || strings.Contains(lower, "ui设计") ||
+		strings.Contains(lower, "ui 设计") || strings.Contains(lower, "界面设计") ||
+		strings.Contains(htmlContent, "class=\"screen\"") ||
+		strings.Contains(htmlContent, "data-screen=")
 
 	if hasPDF || (!hasVideo && !hasPPT) {
 		formats = append(formats, "pdf")
@@ -379,6 +384,10 @@ func detectOutputFormats(objective, htmlContent string) []string {
 	}
 	if hasSVG {
 		formats = append(formats, "svg")
+	}
+	// APP 原型: 每个 screen 截图为独立 PNG (已覆盖在主 png 中)，额外生成多页 PDF
+	if hasApp && !hasPDF {
+		formats = append(formats, "pdf")
 	}
 
 	return formats
@@ -394,7 +403,7 @@ func sumDuration(results []media.RenderResult) time.Duration {
 
 // ── Prompt 定义 ──
 
-const creativePlannerPrompt = `你是资深创意策划师，精通视觉设计和网页开发。你的任务是理解用户需求，制定详细的创意执行方案。
+const creativePlannerPrompt = `你是资深创意策划师，精通视觉设计、网页开发和 APP 原型设计。你的任务是理解用户需求，制定详细的创意执行方案。
 
 用户需求: {objective}
 
@@ -409,7 +418,14 @@ const creativePlannerPrompt = `你是资深创意策划师，精通视觉设计�
 - 如果是多页内容 (PPT/网站), 规划每页的内容结构
 - 如果包含动画/视频, 规划关键帧和时间线, 使用 CSS @keyframes
 - 使用现代 CSS 技术 (Grid, Flexbox, 动画, 渐变)
-- 确保输出方案具有可执行性`
+- 确保输出方案具有可执行性
+- 如果是 APP 原型/界面设计:
+  · 规划页面流 (首页→详情→设置等)
+  · 定义设计 token (主色、辅色、字体阶梯、间距系统)
+  · 确定目标平台 (iOS/Android/跨平台)
+  · 每个页面用 <section class="screen" data-screen="页面名"> 包裹
+  · 容器固定 390x844 模拟 iPhone 15 (可按需切换平板 768x1024)
+  · 包含状态栏、导航栏、Tab Bar 等系统 UI 模拟`
 
 const taskDecomposePrompt = `你是项目拆解专家。根据创意方案，将任务拆分为可独立执行的子任务。
 
@@ -424,7 +440,7 @@ const taskDecomposePrompt = `你是项目拆解专家。根据创意方案，将
     {
       "id": 1,
       "name": "任务名称",
-      "type": "html|svg|css|animation",
+      "type": "html|svg|css|animation|app-screen",
       "description": "详细描述",
       "html_requirements": "HTML 实现要点",
       "estimated_lines": 100
@@ -432,13 +448,18 @@ const taskDecomposePrompt = `你是项目拆解专家。根据创意方案，将
   ],
   "output_formats": ["png", "pdf", "mp4", "pptx"],
   "total_pages": 1,
-  "has_animation": false
+  "has_animation": false,
+  "is_app_prototype": false
 }
 
 规则:
 - 单页网页/海报/名片: 1个任务
-- 多页 PPT: 每页1个任务 (用 <section> 标签分隔)
+- 多页 PPT: 每页1个任务 (用 <section class="slide"> 标签分隔)
 - 视频/动画: 拆分为场景, 每个场景1个任务
+- APP 原型: 每个页面1个任务 (用 <section class="screen" data-screen="页面名"> 分隔)
+  · 设置 is_app_prototype=true
+  · type 用 "app-screen"
+  · 规划页面间导航关系 (点击哪个元素跳到哪个页面)
 - 每个任务的 HTML 不超过 500 行`
 
 const htmlDeveloperPrompt = `创作需求: {objective}
@@ -457,10 +478,23 @@ const htmlDeveloperPrompt = `创作需求: {objective}
 - 字体: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif
 - 现代 CSS: Grid, Flexbox, 变量, 渐变, 阴影, 动画
 - 如果需要动画效果, 必须使用 CSS @keyframes 定义动画
-- 视口 1920×1080
+- 视口 1920×1080 (普通网页/PPT)
 - 多页 PPT 用 <section class="slide"> 分隔
 - 所有文字必须是真实内容 (禁止 Lorem ipsum)
-- 输出的第一行必须是 <!DOCTYPE html>`
+- 输出的第一行必须是 <!DOCTYPE html>
+
+APP 原型额外规范 (当需求包含 APP/原型/界面/UI 设计时):
+- 外层容器: <div class="phone-frame"> 模拟手机外壳 (390x844, 圆角44px, 边框)
+- 每个页面: <section class="screen" data-screen="页面名">
+- 状态栏: <div class="status-bar"> 含时间/信号/电量 (SVG图标)
+- 导航栏: <nav class="nav-bar"> 含返回按钮、标题、操作按钮
+- Tab Bar: <div class="tab-bar"> 含 3-5 个 tab (图标+文字)
+- CSS 变量定义设计 token: --color-primary, --color-bg, --spacing-sm/md/lg, --radius-sm/md/lg
+- 页面切换: 点击元素触发 JS 切换 screen (添加 data-goto="目标页面名" 属性)
+- 触控反馈: button:active { transform: scale(0.96); opacity: 0.8 }
+- 安全区域: 底部预留 34px (iPhone X+ home indicator)
+- 所有图标用内联 SVG (禁止 emoji 替代图标)
+- 卡片/列表使用真实内容和合理数据`
 
 const creativeReviewPrompt = `你是资深艺术指导和前端技术审查专家。审查提交的 HTML 作品质量。
 

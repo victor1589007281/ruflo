@@ -19,7 +19,7 @@ func TestToolRegistry(t *testing.T) {
 	reg := tool.NewRegistry()
 
 	// 注册内置工具
-	todoTool := builtin.RegisterBaseTools(reg)
+	todoTool := builtin.RegisterBaseTools(reg, nil)
 	_ = todoTool
 
 	// 验证工具数量
@@ -63,7 +63,7 @@ func TestToolRegistry(t *testing.T) {
 // 对应 TS: toolOrchestration.ts 中的 partitionToolCalls
 func TestPartitionToolCalls(t *testing.T) {
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseTools(reg)
+	builtin.RegisterBaseTools(reg, nil)
 
 	// 构造混合工具调用: [Read, Grep, Write, Read, Read]
 	blocks := []types.ContentBlock{

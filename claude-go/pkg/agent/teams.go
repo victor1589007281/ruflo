@@ -1022,6 +1022,8 @@ func (ptm *ProductionTeamManager) loadPersistedTeams() {
 			if team.Status == TeamStatusRunning {
 				team.Status = TeamStatusFailed
 				team.Error = "进程重启"
+				team.FinishedAt = time.Now()
+				team.persist()
 			}
 			ptm.teams[team.Name] = &team
 		}

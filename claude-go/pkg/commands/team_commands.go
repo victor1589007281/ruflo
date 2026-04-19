@@ -119,7 +119,7 @@ func RegisterTeamCommands(r *Registry) {
 				fmt.Println("  research     — 研究团队 (researcher → analyst → writer)")
 				fmt.Println("  debate       — 辩论团队 (正方 → 反方 → 裁判)")
 				fmt.Println("  creative     — 创意团队 v1 (SVG/图片创作)")
-				fmt.Println("  creative-v2  — 创意团队 v2 (HTML网页→PNG/PDF/MP4/PPTX)")
+				fmt.Println("  creative-v2  — 创意团队 v2 (HTML网页/APP原型→PNG/PDF/MP4/PPTX)")
 				fmt.Println("  finance      — 金融分析 v1 (analyst → strategist → advisor)")
 				fmt.Println("  trading-v2   — 金融交易 v2 (分析→Bull/Bear辩论→交易→风控辩论→PM裁决)")
 				fmt.Println("  techblog     — 技术博客 (researcher → writer → editor)")

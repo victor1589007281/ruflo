@@ -50,12 +50,25 @@ type webFetchInput struct {
 	Prompt string `json:"prompt,omitempty"`
 }
 
+// BrowserClient 浏览器客户端接口（可选注入，增强抓取能力）。
+type BrowserClient interface {
+	Available() bool
+	Fetch(ctx context.Context, url string) (title, text, html string, err error)
+}
+
 // WebFetchTool HTTP 拉取并文本化网页内容的工具。
-type WebFetchTool struct{}
+type WebFetchTool struct {
+	browser BrowserClient
+}
 
 // NewWebFetchTool 构造 WebFetch 工具实例。
 func NewWebFetchTool() *WebFetchTool {
 	return &WebFetchTool{}
+}
+
+// SetBrowser 注入浏览器客户端，增强抓取能力 (stealth + JS 渲染)。
+func (t *WebFetchTool) SetBrowser(b BrowserClient) {
+	t.browser = b
 }
 
 func (t *WebFetchTool) Name() string { return WebFetchToolName }
@@ -109,6 +122,30 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 		return &tool.ToolResult{Content: fmt.Sprintf("错误: 仅支持 http/https，拒绝协议 %q", u.Scheme), IsError: true}, nil
 	}
 
+	// 路由 1: 尝试浏览器抓取 (stealth + JS 渲染 + MediaWiki API 自动路由)
+	if t.browser != nil && t.browser.Available() {
+		bTitle, bText, _, bErr := t.browser.Fetch(ctx, u.String())
+		if bErr == nil && strings.TrimSpace(bText) != "" {
+			fullText := truncateRunes(bText, maxWebFetchChars)
+			var b strings.Builder
+			fmt.Fprintf(&b, "URL: %s\n", u.String())
+			if bTitle != "" {
+				fmt.Fprintf(&b, "Title: %s\n", bTitle)
+			}
+			b.WriteString("\n")
+			if strings.TrimSpace(in.Prompt) != "" {
+				fmt.Fprintf(&b, "（附加上下文 prompt）\n%s\n\n", strings.TrimSpace(in.Prompt))
+			}
+			b.WriteString(fullText)
+			if utf8.RuneCountInString(bText) > maxWebFetchChars {
+				fmt.Fprintf(&b, "\n\n[已截断: 提取后的纯文本超过 %d 个 Unicode 字符]", maxWebFetchChars)
+			}
+			return &tool.ToolResult{Content: b.String()}, nil
+		}
+		// 浏览器失败, 降级到 HTTP
+	}
+
+	// 路由 2: HTTP 直连 (兜底)
 	reqCtx, cancel := context.WithTimeout(ctx, webFetchHTTPTimeout)
 	defer cancel()
 
@@ -116,7 +153,9 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 	if err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("构造请求失败: %v", err), IsError: true}, nil
 	}
-	req.Header.Set("User-Agent", "claude-go-WebFetch/1.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 
 	client := &http.Client{Timeout: webFetchHTTPTimeout}
 	resp, err := client.Do(req)
@@ -125,7 +164,6 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 	}
 	defer resp.Body.Close()
 
-	// 最多多读约 2*maxWebFetchChars 字节，在 UTF-8 边界上再按 rune 截断。
 	const byteCap = maxWebFetchChars * 4
 	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(byteCap)))
 	if err != nil {

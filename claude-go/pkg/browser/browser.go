@@ -73,22 +73,30 @@ func (c *Client) Search(ctx context.Context, query string) (*FetchResult, error)
 
 // FetchResult 网页抓取结果。
 type FetchResult struct {
-	URL   string `json:"url"`
-	Title string `json:"title"`
-	Text  string `json:"text"`
-	HTML  string `json:"html"`
+	URL    string `json:"url"`
+	Title  string `json:"title"`
+	Text   string `json:"text"`
+	HTML   string `json:"html"`
+	Source string `json:"source,omitempty"` // "chrome"/"http"/"mediawiki"/"finance-api"
 }
 
 // Client 浏览器客户端。
 type Client struct {
-	cfg    Config
-	mu     sync.Mutex
-	chrome string
+	cfg      Config
+	mu       sync.Mutex
+	chrome   string
+	wikiCli  *MediaWikiClient
+	finCli   *FinanceClient
+	uaIndex  int
 }
 
 // NewClient 创建浏览器客户端。
 func NewClient(cfg Config) *Client {
-	c := &Client{cfg: cfg}
+	c := &Client{
+		cfg:     cfg,
+		wikiCli: NewMediaWikiClient(),
+		finCli:  NewFinanceClient(),
+	}
 	if cfg.ChromePath != "" {
 		c.chrome = cfg.ChromePath
 	} else {
@@ -102,17 +110,49 @@ func (c *Client) Available() bool {
 	return c.chrome != ""
 }
 
-// Fetch 使用浏览器加载 URL 并提取主要文本内容。
-// 若 Chrome 可用，用 headless Chrome；否则降级到 net/http。
-func (c *Client) Fetch(ctx context.Context, url string) (*FetchResult, error) {
-	if c.chrome != "" {
-		return c.fetchWithChrome(ctx, url)
+// rotateUA 轮换 User-Agent。
+func (c *Client) rotateUA() string {
+	if c.cfg.UserAgent != "" && c.cfg.UserAgent != DefaultConfig().UserAgent {
+		return c.cfg.UserAgent
 	}
-	return c.fetchWithHTTP(ctx, url)
+	ua := stealthUserAgents[c.uaIndex%len(stealthUserAgents)]
+	c.uaIndex++
+	return ua
 }
 
-// fetchWithChrome 使用 headless Chrome 的 --dump-dom 模式。
-func (c *Client) fetchWithChrome(ctx context.Context, url string) (*FetchResult, error) {
+// Fetch 智能路由: MediaWiki API → 金融 API → Chrome → HTTP。
+func (c *Client) Fetch(ctx context.Context, rawURL string) (*FetchResult, error) {
+	// 路由 1: MediaWiki 站点 → API 优先
+	if IsMediaWiki(rawURL) && c.wikiCli != nil {
+		result, err := c.wikiCli.Fetch(ctx, rawURL)
+		if err == nil && strings.TrimSpace(result.Text) != "" {
+			result.Source = "mediawiki"
+			log.Printf("[browser] MediaWiki API 成功: %s (%d chars)", rawURL, len(result.Text))
+			return result, nil
+		}
+		log.Printf("[browser] MediaWiki API 失败, 降级浏览器: %v", err)
+	}
+
+	// 路由 2: Chrome stealth 模式
+	if c.chrome != "" {
+		result, err := c.fetchWithChromeStealth(ctx, rawURL)
+		if err == nil && strings.TrimSpace(result.Text) != "" {
+			return result, nil
+		}
+		log.Printf("[browser] Chrome 抓取失败, 降级 HTTP: %v", err)
+	}
+
+	// 路由 3: HTTP 直连 (兜底)
+	return c.fetchWithHTTP(ctx, rawURL)
+}
+
+// FetchKLine 获取股票 K 线数据 (东方财富 API)。
+func (c *Client) FetchKLine(ctx context.Context, symbol, period string, count int) (*KLineData, error) {
+	return c.finCli.FetchKLine(ctx, symbol, period, count)
+}
+
+// fetchWithChromeStealth 使用 stealth 参数集的 Chrome headless 抓取。
+func (c *Client) fetchWithChromeStealth(ctx context.Context, targetURL string) (*FetchResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -123,40 +163,69 @@ func (c *Client) fetchWithChrome(ctx context.Context, url string) (*FetchResult,
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := []string{
-		"--headless=new",
-		"--no-sandbox",
-		"--disable-gpu",
-		"--disable-dev-shm-usage",
-		"--disable-blink-features=AutomationControlled",
-		fmt.Sprintf("--user-agent=%s", c.cfg.UserAgent),
-		"--dump-dom",
-	}
+	args := stealthArgs()
+	args = append(args, fmt.Sprintf("--user-agent=%s", c.rotateUA()))
+	args = append(args, "--dump-dom")
+
 	if c.cfg.ProxyURL != "" {
 		args = append(args, fmt.Sprintf("--proxy-server=%s", c.cfg.ProxyURL))
 	}
-	if c.cfg.WaitSeconds > 0 {
-		args = append(args, fmt.Sprintf("--virtual-time-budget=%d", c.cfg.WaitSeconds*1000))
+	waitMs := c.cfg.WaitSeconds * 1000
+	if waitMs <= 0 {
+		waitMs = 5000
 	}
-	args = append(args, url)
+	args = append(args, fmt.Sprintf("--virtual-time-budget=%d", waitMs))
+	args = append(args, targetURL)
 
 	cmd := exec.CommandContext(ctx, c.chrome, args...)
 	cmd.Env = append(os.Environ(), "DISPLAY=:0")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("chrome fetch failed: %w", err)
+		return nil, fmt.Errorf("chrome stealth fetch failed: %w", err)
 	}
 
 	htmlStr := string(output)
+
+	// 检测是否被拦截 (Cloudflare challenge / 验证码页面)
+	if isBlockedPage(htmlStr) {
+		return nil, fmt.Errorf("页面被 WAF 拦截 (检测到验证页面)")
+	}
+
 	title := extractTitle(htmlStr)
 	text := extractMainText(htmlStr)
 
 	return &FetchResult{
-		URL:   url,
-		Title: title,
-		Text:  text,
-		HTML:  htmlStr,
+		URL:    targetURL,
+		Title:  title,
+		Text:   text,
+		HTML:   htmlStr,
+		Source: "chrome",
 	}, nil
+}
+
+// isBlockedPage 检测是否被 WAF/反爬拦截。
+func isBlockedPage(html string) bool {
+	lower := strings.ToLower(html)
+	indicators := []string{
+		"checking your browser",
+		"just a moment",
+		"cf-browser-verification",
+		"challenge-platform",
+		"ray id",
+		"enable javascript and cookies",
+		"access denied",
+		"blocked by",
+		"captcha",
+		"recaptcha",
+		"hcaptcha",
+	}
+	matchCount := 0
+	for _, ind := range indicators {
+		if strings.Contains(lower, ind) {
+			matchCount++
+		}
+	}
+	return matchCount >= 2
 }
 
 // fetchWithHTTP 降级: 使用 net/http 抓取（不支持 JS 渲染）。

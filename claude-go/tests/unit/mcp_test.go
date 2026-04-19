@@ -39,7 +39,7 @@ func TestMCPToolRegistration(t *testing.T) {
 	}
 
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseTools(reg)
+	builtin.RegisterBaseTools(reg, nil)
 	baseCount := reg.Count()
 
 	mcp.RegisterMCPTools(reg, []*mcp.Connection{conn})
@@ -458,7 +458,7 @@ func TestMCPClientStdioProtocol(t *testing.T) {
 // TestMCPToolIntegrationWithRegistry 测试 MCP 工具在 Registry 中与内置工具共存
 func TestMCPToolIntegrationWithRegistry(t *testing.T) {
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseTools(reg)
+	builtin.RegisterBaseTools(reg, nil)
 	builtinCount := reg.Count()
 
 	// 模拟 MCP 连接

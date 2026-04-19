@@ -72,7 +72,7 @@ func TestDynMCPManager_RefreshToolsForRegistry(t *testing.T) {
 	mgr.AddServer(context.Background(), mcp.ServerConfig{Name: "srv-a", Transport: "stdio", Command: "sh", Args: []string{script}})
 
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseTools(reg)
+	builtin.RegisterBaseTools(reg, nil)
 	baseCnt := reg.Count()
 
 	mgr.RefreshToolsForRegistry(reg)
