@@ -68,11 +68,12 @@ type DreamConfig struct {
 }
 
 // DefaultDreamConfig 返回默认配置
+// V3: 降低触发门槛以增加整合频率 (从 24h/5sess → 12h/3sess)
 func DefaultDreamConfig() *DreamConfig {
 	return &DreamConfig{
 		Enabled:        true,
-		MinHours:       24,
-		MinSessions:    5,
+		MinHours:       12,
+		MinSessions:    3,
 		MaxMemoryFiles: 50,
 	}
 }
@@ -129,6 +130,12 @@ type Dreamer struct {
 	MetricsRecorder interface {
 		Record(module, name string, value float64)
 	}
+
+	// V3 Anti-Amnesia: 增量整合器 (可选)
+	Consolidator *Consolidator
+
+	// V3: 重要事件立即触发
+	ImportantEventThreshold float64
 }
 
 // NewDreamer 创建 Dreamer 实例
@@ -150,9 +157,10 @@ func NewDreamer(config *DreamConfig, cwd string) *Dreamer {
 	}
 
 	return &Dreamer{
-		config:   config,
-		cwd:      cwd,
-		lockFile: filepath.Join(config.MemoryDir, ".dream-lock"),
+		config:                  config,
+		cwd:                     cwd,
+		lockFile:                filepath.Join(config.MemoryDir, ".dream-lock"),
+		ImportantEventThreshold: 0.8,
 	}
 }
 
@@ -165,6 +173,11 @@ func (d *Dreamer) SetConsolidateFn(fn func(ctx context.Context, sessions []Sessi
 // SetAPIClient 注入 LLM API 客户端 (用于 LLM 模式整理)
 func (d *Dreamer) SetAPIClient(client LLMClient) {
 	d.APIClient = client
+}
+
+// SetConsolidator 设置增量整合器 (V3 Anti-Amnesia)
+func (d *Dreamer) SetConsolidator(c *Consolidator) {
+	d.Consolidator = c
 }
 
 // RecordSession 记录一个已完成的会话。
@@ -185,6 +198,15 @@ func (d *Dreamer) RecordSession(record SessionRecord) {
 	}
 	d.mu.Unlock()
 	d.sessionsSinceDream.Add(1)
+
+	// V3: 重要事件立即触发增量蒸馏 (不做完整 Dreaming)
+	if record.Importance >= d.ImportantEventThreshold && d.Consolidator != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			d.Consolidator.IncrementalDistill(ctx, []SessionRecord{record})
+		}()
+	}
 }
 
 // estimateImportance 自动评估会话重要性 (参考情感标记假说)。
@@ -303,6 +325,16 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].Importance > sessions[j].Importance
 	})
+
+	// V3: 先通过 Consolidator 做增量蒸馏 (如果可用)
+	if d.Consolidator != nil {
+		if result, cErr := d.Consolidator.IncrementalDistill(ctx, sessions); cErr != nil {
+			log.Printf("[Dreaming] Consolidator 蒸馏失败 (非致命): %v", cErr)
+		} else {
+			log.Printf("[Dreaming] Consolidator: +%d 事实, %d 矛盾, %d 模式",
+				result.NewFacts, result.Contradictions, result.PatternsFound)
+		}
+	}
 
 	var err error
 	if d.ConsolidateFn != nil {

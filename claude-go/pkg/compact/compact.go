@@ -35,8 +35,11 @@ const CompactMaxOutputTokens = 8192
 
 // Compactor 上下文压缩器
 type Compactor struct {
-	apiClient     *api.Client
+	apiClient        *api.Client
 	maxContextTokens int // 模型最大上下文窗口
+
+	// PreCompact 蒸馏: 压缩前将关键信息提取到持久记忆
+	PreCompactFn func(facts []string, source string)
 }
 
 // NewCompactor 创建压缩器
@@ -76,9 +79,22 @@ func (c *Compactor) AutoCompact(ctx context.Context, messages []types.Message, m
 //   1. 保留最近 N 条消息 (尾部保护)
 //   2. 将其余消息发送给模型, 要求生成摘要
 //   3. 构建新的消息序列: [boundary, summary_user_msg, ...tail]
+// SetPreCompactFn 设置 PreCompact 蒸馏回调
+func (c *Compactor) SetPreCompactFn(fn func(facts []string, source string)) {
+	c.PreCompactFn = fn
+}
+
 func (c *Compactor) runCompaction(ctx context.Context, messages []types.Message, model string) ([]types.Message, error) {
-	// 保护尾部 (最近 4 条消息不被压缩)
-	tailCount := 4
+	// PreCompact 蒸馏: 在压缩前提取关键信息到持久记忆
+	if c.PreCompactFn != nil {
+		facts := c.SmartExtractKeyFacts(ctx, messages)
+		if len(facts) > 0 {
+			c.PreCompactFn(facts, "pre_compact")
+		}
+	}
+
+	// 保护尾部 (最近 6 条消息不被压缩, 从 4 提升)
+	tailCount := 6
 	if tailCount > len(messages) {
 		tailCount = len(messages)
 	}

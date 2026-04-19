@@ -35,6 +35,8 @@ import (
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/commands"
+	"github.com/anthropic/claude-go/pkg/dreaming"
+	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/dashboard"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/settings"
@@ -1712,7 +1714,48 @@ func buildEngine() (*engine.QueryEngine, error) {
 	}
 	reg.Register(agent.NewAgentTool(runAgent))
 
-	return engine.NewQueryEngine(cfg, apiClient, reg, hookRunner, permChecker, compactor, promptMgr), nil
+	eng := engine.NewQueryEngine(cfg, apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
+
+	// V3 Anti-Amnesia: CLI 模式统一接入记忆系统
+	stateDir := filepath.Join(cwd, ".claude-go")
+	memDir := filepath.Join(stateDir, "memory")
+	_ = os.MkdirAll(memDir, 0755)
+
+	// L1: TieredStore (情景记忆)
+	tieredStore := memory.NewTieredStoreWithPersist(memDir)
+	eng.MemoryStore = tieredStore
+
+	// L2: FactStore (结构化记忆)
+	factStore := memory.NewFactStore(memDir)
+	eng.FactStore = factStore
+
+	// Ingestor (自动摄入)
+	ingestor := memory.NewIngestor(factStore, tieredStore)
+	eng.Ingestor = ingestor
+
+	// Dreaming (记忆整理)
+	dreamCfg := dreaming.DefaultDreamConfig()
+	dreamCfg.MemoryDir = filepath.Join(cwd, ".claude", "memory")
+	dreamer := dreaming.NewDreamer(dreamCfg, cwd)
+	dreamer.SetAPIClient(apiClient)
+
+	// V3: 增强整合器
+	consolidator := dreaming.NewConsolidator(factStore, apiClient, nil)
+	dreamer.SetConsolidator(consolidator)
+
+	// Dreaming 记忆目录注入 PromptMgr
+	promptMgr.DreamMemoryDir = dreamer.Stats().MemoryDir
+
+	// Decay Manager: 启动时执行一次衰减周期
+	decayMgr := memory.NewDecayManager(factStore)
+	go decayMgr.RunCycle()
+
+	// PreCompact 蒸馏接入
+	compactor.SetPreCompactFn(func(facts []string, source string) {
+		ingestor.IngestFacts(facts, source)
+	})
+
+	return eng, nil
 }
 
 func getAPIKey() string {

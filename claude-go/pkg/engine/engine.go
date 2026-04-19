@@ -65,6 +65,8 @@ type QueryEngine struct {
 	Compactor    *compact.Compactor
 	PromptMgr    *prompt.Manager
 	MemoryStore  *memory.TieredStore   // 多层记忆存储 (可选, nil 则不启用)
+	FactStore    *memory.FactStore    // V3 Anti-Amnesia: L2 结构化记忆 (可选)
+	Ingestor     *memory.Ingestor    // V3: 记忆摄入器 (可选)
 	SessionStore SessionStoreInterface // 会话持久化 (可选, nil 则不启用)
 
 	// ========== 前沿模型优化组件 (全部可选, nil 则走基线行为) ==========
@@ -414,12 +416,12 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		if e.Compactor != nil {
 			compacted, err := e.Compactor.AutoCompact(ctx, messages, currentModel)
 			if err == nil && compacted != nil {
-				// [NEW] 压缩前智能提取关键事实到 Episodic Memory
-				// 使用 LLM Anchored Iterative Summarization (回退到启发式)
-				if e.MemoryStore != nil {
-					cutoff := len(messages) - 4
-					if cutoff > 0 {
-						facts := e.Compactor.SmartExtractKeyFacts(ctx, messages[:cutoff])
+				// PreCompact 蒸馏: 提取关键事实到 L1 + L2
+				cutoff := len(messages) - 6
+				if cutoff > 0 {
+					facts := e.Compactor.SmartExtractKeyFacts(ctx, messages[:cutoff])
+					// L1: TieredStore
+					if e.MemoryStore != nil {
 						for _, fact := range facts {
 							e.MemoryStore.Add(&memory.MemoryEntry{
 								Content:    fact,
@@ -427,6 +429,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 								Importance: 0.7,
 							})
 						}
+					}
+					// L2: FactStore (通过 Ingestor 分类)
+					if e.Ingestor != nil && len(facts) > 0 {
+						e.Ingestor.IngestFacts(facts, "pre_compact")
 					}
 				}
 				messages = compacted
@@ -449,7 +455,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 
 		// 仅在首轮注入相关记忆（避免多轮 tool_use 循环中反复注入膨胀上下文）
 		// 注入的记忆是 "动态内容", 但它每 turn 0 就固定, 所以 turn>0 时 prefix 是稳定的 — cache friendly。
-		if turnCount == 0 && e.MemoryStore != nil && e.MemoryStore.Count() > 0 && len(messages) > 0 {
+		if turnCount == 0 && len(messages) > 0 {
 			lastUserText := ""
 			for i := len(messages) - 1; i >= 0; i-- {
 				if messages[i].Type == types.MessageTypeUser {
@@ -463,16 +469,26 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				}
 			}
 			if lastUserText != "" {
-				// v2: 移除 2h CreatedAt 硬截断，完全依赖 Ebbinghaus Retention() 自然衰减。
-				// 根因: 硬截断导致凌晨存的团队结果到早上完全不可见，即使 BM25 高度相关。
-				// 参考: Generative Agents (Park et al. 2023) — recency × importance × relevance
-				// Retrieve 内部已集成 retention 衰减 + recency boost，无需额外过滤。
-				relevant := e.MemoryStore.Retrieve(lastUserText, 7)
-				if len(relevant) > 0 {
-					memPrompt := memory.FormatForPrompt(relevant)
-					if len(systemPrompt) > 0 {
-						systemPrompt[0] += "\n" + memPrompt
+				var memPrompt string
+
+				// L1: TieredStore 情景记忆 (BM25 + Ebbinghaus)
+				if e.MemoryStore != nil && e.MemoryStore.Count() > 0 {
+					relevant := e.MemoryStore.Retrieve(lastUserText, 7)
+					if len(relevant) > 0 {
+						memPrompt += memory.FormatForPrompt(relevant)
 					}
+				}
+
+				// L2: FactStore 结构化记忆 (分类衰减 + 混合检索)
+				if e.FactStore != nil && e.FactStore.Count() > 0 {
+					facts := e.FactStore.Retrieve(lastUserText, 5)
+					if len(facts) > 0 {
+						memPrompt += memory.FormatFactsForPrompt(facts)
+					}
+				}
+
+				if memPrompt != "" && len(systemPrompt) > 0 {
+					systemPrompt[0] += "\n" + memPrompt
 				}
 			}
 		}

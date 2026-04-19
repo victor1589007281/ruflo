@@ -16,11 +16,11 @@ func TestDreamerConfig(t *testing.T) {
 	if !cfg.Enabled {
 		t.Error("默认应启用")
 	}
-	if cfg.MinHours != 24 {
-		t.Errorf("MinHours: %d", cfg.MinHours)
+	if cfg.MinHours != 12 {
+		t.Errorf("MinHours: %d (expected 12)", cfg.MinHours)
 	}
-	if cfg.MinSessions != 5 {
-		t.Errorf("MinSessions: %d", cfg.MinSessions)
+	if cfg.MinSessions != 3 {
+		t.Errorf("MinSessions: %d (expected 3)", cfg.MinSessions)
 	}
 }
 

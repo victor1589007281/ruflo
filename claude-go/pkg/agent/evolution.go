@@ -113,6 +113,11 @@ type Trajectory struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// DreamRecorderInterface V3: Evolution → Dreaming 交叉学习接口
+type DreamRecorderInterface interface {
+	RecordSession(record interface{})
+}
+
 // EvolutionEngine 自动进化引擎 (V2: 注入追踪+MinHash+UCB+生命周期)。
 type EvolutionEngine struct {
 	experiences  []*Experience
@@ -128,6 +133,9 @@ type EvolutionEngine struct {
 	totalDistilled  int     // 历史提炼总数 (用于 survival_rate)
 	baselineSuccess float64 // 无注入的基线成功率 (滑动窗口)
 	baselineTotal   int     // 基线样本数
+
+	// V3: 交叉学习 — 高质量经验自动注入 Dreaming
+	MemoryIngestFn func(content, source string, topics []string)
 }
 
 // NewEvolutionEngine 创建进化引擎。
@@ -240,6 +248,18 @@ func (ee *EvolutionEngine) LearnFromTeam(ctx context.Context, teamName string) {
 
 	ee.persistExperiences()
 	log.Printf("[Evolution] 经验提炼完成, 当前共 %d 条经验", len(ee.experiences))
+
+	// V3: 交叉学习 — 将高质量经验注入到 FactStore/Dreaming
+	if ee.MemoryIngestFn != nil {
+		ee.mu.RLock()
+		for _, exp := range ee.experiences {
+			if exp.Quality >= 0.6 && exp.SourceTeam == teamName &&
+				time.Since(exp.CreatedAt) < 5*time.Minute {
+				ee.MemoryIngestFn(exp.Content, "evolution:"+teamName, exp.Tags)
+			}
+		}
+		ee.mu.RUnlock()
+	}
 }
 
 // LearnFromStage 单阶段增量学习 (双向: 成功+失败都提炼, 参考 MiniMax M2.7)。
