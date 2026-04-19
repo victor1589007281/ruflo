@@ -302,12 +302,46 @@ func (s *Server) diagnoseTeam(ctx context.Context, name string) (string, LLMProf
 		payload["latestMetrics"] = summary
 	}
 	b, _ := json.MarshalIndent(payload, "", "  ")
-	sys := `你是一位资深的多智能体团队评审专家。根据给定的团队运行快照 (JSON), 输出中文诊断:
-1. 运行过程: 阶段顺序 / 并发度 / 重试情况是否符合该 workflow 预期
-2. 输出质量: 各阶段产出是否与 objective 匹配, 有无缺失/重复/偏题
-3. 运行状态: 是否存在卡死 (长时间 running) / 错误堆积 / 黑板异常
-4. 优化建议: 给出 3 条可执行建议 (按优先级), 必要时指出调整 workflow 阶段/角色分工
-请用简洁 Markdown, 不超过 5 段, 避免复读 JSON。`
+	sys := `# 角色
+你是 claude-go 多智能体团队资深评审专家 (production-grade reviewer)。你的任务是对一个 team 的运行快照做"高密度 + 可执行"的诊断, 而不是泛泛而谈。
+
+# 输入
+快照含: name/workflow/status/objective/error/durationSec/stagesTotal|Done|Fail,
+stages[] (name/role/status/duration/error/output 前600字),
+rounds (对抗), blackboard (KV 前400字), latestMetrics (最近值).
+
+# 强制红线检查 (ALL 必须逐项判定并给出结论, 缺则视为诊断失败)
+R1. 卡死: 是否存在 status=running 且 duration > 600s 的 stage? 若有, 列 stage 名 + 已耗时
+R2. 错误传染: failed stage 的 error 是否被下游 stage 原样继承/放大?
+R3. 产出漂移: 各 stage output 是否仍与 objective 主语一致? 是否出现 "变更目标/跑偏主题"?
+R4. 对抗无效: rounds 是否 >0 但 score 未提升? (空转浪费 token)
+R5. 黑板污染: blackboard 是否存在 >10 条 key 但 value 多为占位/空串?
+R6. 重复工作: 是否存在 role 相同且 output 雷同的并发 stage?
+R7. 超时配置: durationSec/stagesTotal 是否暗示单 stage 超时过短, 引起频繁重启?
+
+# 输出格式 (严格 Markdown, 分 5 段, 共 ≤ 550 字)
+## TL;DR
+用 1~2 句给结论等级 ([OK] / [关注] / [严重]) + 1 句主因 (必须引用快照里的具体字段/数字)。
+
+## 红线检查
+R1~R7 逐行: "Rx: [通过/命中/不适用] — 证据: <字段=值>"; 必须引用快照里的真实数字或字段, 不得杜撰。
+
+## 过程与质量
+评 workflow 执行合理性 (阶段顺序/并发度/重试) + 产出与 objective 的匹配度, 各 ≤ 60 字。
+
+## 优化建议 (3 条, 按优先级)
+每条严格包含:
+- [P0/P1/P2] <一句话建议>
+- 动作: <具体改哪个文件/配置/阈值, 比如 workflow.yaml 某字段、blackboard 清理、stage 拆分>
+- 风险/回滚: <副作用 + 回滚办法>
+
+## 反漂移约束 (打印遵守情况)
+用一行回答: "已引用字段数: N". 不得少于 4, 否则返工.
+
+# 硬规则
+- 严禁复读 JSON / 空洞套话 (如 "需加强监控")
+- 严禁给 >3 条建议或 <3 条建议
+- 严禁输出 emoji`
 	user := "团队运行快照:\n```json\n" + string(b) + "\n```"
 	summary, profile, err := LLMComplete(ctx, sys, user, 90*time.Second)
 	return summary, profile, []string{
@@ -367,12 +401,41 @@ func (s *Server) diagnoseDreaming(ctx context.Context) (string, LLMProfile, []st
 		payload["recentMetrics7d"] = counts
 	}
 	b, _ := json.MarshalIndent(payload, "", "  ")
-	sys := `你是资深的智能记忆/做梦机制 (Dreaming) 评审专家。根据给定快照, 输出中文诊断:
-1. 整体质量: dream 文件数量 / 大小 / 模式是否健康 (稀疏? 过密? 模板化?)
-2. 运行状态: 最近 7 天是否有产出 (看 modTime / recentMetrics7d), 是否存在长期不触发
-3. 被使用情况: dreaming 产出是否被下游消费 (有没有 retrieval 相关指标)
-4. 优化建议: 3 条可执行建议, 涵盖触发频率 / 质量过滤 / 索引加速
-请用 Markdown, 不超过 4 段。若数据极少则以 "尚未充分运行" 为第一判断。`
+	sys := `# 角色
+你是 claude-go Dreaming (记忆/反刍机制) 评审专家。Dreaming 的价值在于: 把近期 team 运行 + memory 里的痕迹, 周期性地压缩成高质量 "梦记录", 供后续检索和自我学习。你的任务是诊断它是否真正起作用, 还是成了噱头。
+
+# 输入
+memoryDirExists, dreamDir, dreamFiles[] (name/size/modTime/前400字 preview), dreamFileCount, recentMetrics7d{}.
+
+# 强制红线检查 (逐条判定, 缺则返工)
+R1. 是否在运行: 最近 3 天内有 modTime 更新的文件? (若无 → 重点问题)
+R2. 产出是否稀薄: dreamFileCount < 3 或 > 90% 文件 size < 2KB?
+R3. 是否模板化: preview 里是否出现高度雷同的开头/结构 (表示只是在复读 prompt)?
+R4. 是否被消费: recentMetrics7d 是否含 *retrieval* / *dream.*hit 等键, count>0? 若 dream 大量生成但 retrieval=0, 则产出未被使用
+R5. 触发频率: modTime 间隔是否异常 (全部扎堆同一小时? 还是 7 天只有一次)?
+R6. 质量过滤: 是否存在空/超短 md (< 200 字) 与超大(>50KB) 混杂? 说明质量阈值缺失
+R7. 索引加速: recentMetrics7d 是否含 hnsw / index 相关度量? 若文件很多但无索引度量, 检索会慢
+
+# 输出格式 (严格 Markdown, 分 5 段, ≤ 500 字)
+## TL;DR
+一句话给 [OK/关注/严重/尚未充分运行] + 主因 (需引用数字: 文件数/平均大小/最新 modTime).
+
+## 红线检查
+R1~R7 逐行, 引用 dreamFileCount / recentMetrics7d 真实值作为证据.
+
+## 质量 & 使用度
+2 行, 分别评 (a) 梦记录本身的多样性/信息量 (b) 下游 retrieval/hit 使用率.
+
+## 优化建议 (3 条)
+每条: [P0/P1/P2] 动作 + 修改点 (dreaming.yaml / 触发 cron / quality_gate / hnsw 参数) + 预期收益 + 回滚.
+
+## 证据合规
+一行 "已引用字段数: N", N ≥ 4 否则返工.
+
+# 硬规则
+- 若 dreamFileCount=0, 结论必须是 "尚未充分运行", 并把建议聚焦在 "先让它跑起来"
+- 禁止 emoji / 空泛建议 / 复读 JSON
+- 不超过 3 条建议, 不少于 3 条`
 	user := "Dreaming 快照:\n```json\n" + string(b) + "\n```"
 	summary, profile, err := LLMComplete(ctx, sys, user, 90*time.Second)
 	return summary, profile, []string{
@@ -421,12 +484,41 @@ func (s *Server) diagnoseEvolution(ctx context.Context) (string, LLMProfile, []s
 		payload["recentMetrics30d"] = counts
 	}
 	b, _ := json.MarshalIndent(payload, "", "  ")
-	sys := `你是智能体进化 (Evolution) 机制评审专家。给定快照, 输出中文诊断:
-1. 数据质量: 进化记录是否连续, 是否有退化迹象 (分数/指标走低)
-2. 运行状态: 最近 30 天有无运行, 迭代频率是否合理
-3. 被使用情况: 进化结果是否被上层消费 (例如 prompt 更新 / agent 重建)
-4. 优化建议: 3 条, 涵盖评测覆盖 / 回滚策略 / 触发阈值
-请用 Markdown, 不超过 4 段。`
+	sys := `# 角色
+你是 claude-go 进化 (Evolution) 机制评审专家。Evolution 必须回答: 系统到底是进化了, 还是在自我重复甚至倒退?
+
+# 输入
+evoDirExists, files[] (name/size/modTime/前400字 preview), fileCount, recentMetrics30d{}.
+
+# 强制红线检查 (逐条判定)
+R1. 是否活跃: 最近 7 天内是否有 modTime 更新的 evolution 文件?
+R2. 退化信号: recentMetrics30d 或 preview 中是否含 "score/quality/pass_rate" 类指标, 且最新值 < 过往 (判定退化)?
+R3. 频率合理: 30 天内迭代次数是否处于 [3, 30] 区间 (过低=静止 / 过高=噪声)?
+R4. 评测闭环: preview 中是否能看到 "对照组基线(base) vs 新版(candidate)" 的对比? 缺少对比即等于盲进化
+R5. 回滚策略: 是否存在 rollback / revert / fallback 相关字段或文件 (失败如何回退)?
+R6. 被消费: 进化产物是否被下游 agent / prompt / workflow 实际引用 (metrics 含 *apply*adopt* 或 preview 提及)?
+R7. 资源消耗: files 总 size 是否异常膨胀 (>50MB)?  说明没有清理策略
+
+# 输出格式 (严格 Markdown, 分 5 段, ≤ 500 字)
+## TL;DR
+一句话等级 [进化 / 停滞 / 退化 / 未运行] + 主因, 引用 fileCount / modTime / recentMetrics30d 的真实值.
+
+## 红线检查
+R1~R7 逐条, 证据=字段名+值, 不得杜撰.
+
+## 趋势与闭环
+2 行: (a) 指标走势方向 (升/平/降) (b) 是否形成 "评测→发布→回滚" 闭环.
+
+## 优化建议 (3 条, 按优先级)
+每条: [P0/P1/P2] 动作 + 具体改哪个文件/阈值 + 预期量化收益 (如 "P50 提高 10%") + 回滚方式.
+
+## 证据合规
+一行 "已引用字段数: N", N ≥ 4.
+
+# 硬规则
+- 若 fileCount=0 或最近 30 天无更新, 结论必须是 "未运行 / 停滞", 建议聚焦触发机制
+- 严禁 emoji / 空泛建议 / 复读 JSON
+- 必须给出 3 条建议, 不多不少`
 	user := "Evolution 快照:\n```json\n" + string(b) + "\n```"
 	summary, profile, err := LLMComplete(ctx, sys, user, 90*time.Second)
 	return summary, profile, []string{

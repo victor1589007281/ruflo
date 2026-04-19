@@ -1003,7 +1003,13 @@
         let lines = data.lines || [];
         const q = (qInp.value || '').trim().toLowerCase();
         if (q) lines = lines.filter(l => l.toLowerCase().includes(q));
-        pill.textContent = `共 ${lines.length} 行 · 源: ${data.source || 'claude-go.log'}`;
+        // 前端兜底: 最多渲染 1000 行, 超出则保留最新
+        let truncated = 0;
+        if (lines.length > 1000) {
+          truncated = lines.length - 1000;
+          lines = lines.slice(-1000);
+        }
+        pill.textContent = `共 ${lines.length} 行${truncated ? ' (已丢弃 ' + truncated + ' 条最老行)' : ''} · 源: ${data.source || 'claude-go.log'}`;
         if (!lines.length) {
           preBox.textContent = '(未匹配到该团队的日志行, 尝试放宽关键词)';
           return;
@@ -1128,62 +1134,165 @@
             'Plan 树加载失败: ' + e.message));
         });
       } else {
-        renderWorkflowDAGBody(detail, dag, bodyBox);
+        Promise.resolve(renderWorkflowDAGBody(detail, dag, bodyBox)).catch(e => {
+          bodyBox.appendChild(h('div', { class: 'empty', style: { color: 'var(--red)' } },
+            'Workflow DAG 渲染失败: ' + e.message));
+        });
       }
     }
     render();
   }
 
-  // Workflow DAG 主体 (原来的实现抽出来)
-  function renderWorkflowDAGBody(detail, dag, panel) {
-    if (dag && (dag.stages || []).length) {
-      const nodes = dag.stages.map(s => ({
-        name: s.name, role: s.role,
-        dependsOn: s.dependsOn || [],
-        parallel: s.parallel,
-        status: s.status || 'pending',
-        attempts: s.attempts || 0,
-        durationSec: s.durationSec,
-        error: s.error,
-        taskBrief: s.taskBrief || '',
-        assignedAgents: s.assignedAgents || [],
-        checkpointStatus: s.checkpointStatus || '',
-        checkpointSavedAt: s.checkpointSavedAt,
-        checkpointError: s.checkpointError || '',
-        adversaryRound: s.adversaryRound || 0,
-        adversaryScore: s.adversaryScore || 0,
-        adversaryPassed: s.adversaryPassed,
-        outputPreview: s.outputPreview || '',
-      }));
-      panel.appendChild(h('div', { class: 'muted', style: { marginBottom: '10px', fontSize: '12px' } }, [
-        h('strong', {}, 'workflow: '), dag.workflow || detail.workflow || '—',
-        ' · stages=', String(nodes.length),
-        '  ·  ',
-        h('span', { class: 'badge ' + statusBadgeClass(dag.status) }, dag.status || '—'),
-        h('span', { class: 'muted', style: { marginLeft: '6px' } }, 'source: ' + (dag.source || '')),
-      ]));
-      panel.appendChild(renderDAGSVG(nodes, dag.source));
-      panel.appendChild(h('div', { class: 'legend' }, [
-        h('span', {}, [h('span', { class: 'dot ok' }), '完成']),
-        h('span', {}, [h('span', { class: 'dot run' }), '运行']),
-        h('span', {}, [h('span', { class: 'dot err' }), '失败']),
-        h('span', {}, [h('span', { class: 'dot pending' }), '待执行']),
-      ]));
-      if (nodes.length) {
-        const cardsWrap = h('div', { class: 'dag-cards',
-          style: { display: 'grid', gap: '12px',
-                   gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' } });
-        for (const n of nodes) cardsWrap.appendChild(renderDAGNodeCard(n));
-        panel.appendChild(h('div', { class: 'card mb-16' }, [
-          h('h3', {}, '📋 任务节点详情 (含任务 / Agent / 检查点 / 对抗 / 错误)'),
-          cardsWrap,
-        ]));
-      }
-      if (dag.adversaryRounds && dag.adversaryRounds.length) {
-        panel.appendChild(renderDAGAdversaryRounds(dag.adversaryRounds));
-      }
-      return;
+  // Workflow DAG 主体。
+  // v1.6: 把 "plan 后动态生成的子 stage" 从平铺 cards 中分离出来, 按 dependsOn 组织成树,
+  //       让用户一眼看清 "静态工作流阶段" 与 "LLM 拆解出的子任务" 两层结构,
+  //       避免 plan 之后节点散乱一大片。
+  async function renderWorkflowDAGBody(detail, dag, panel) {
+    if (!(dag && (dag.stages || []).length)) {
+      // fallback 保留原逻辑
+      return renderWorkflowDAGBodyFallback(detail, panel);
     }
+
+    // 1) 拉取 workflow 静态定义, 用于识别哪些 stage 是 "注册表里定义的"
+    let wfDef = null;
+    try { wfDef = await api('/api/workflows/' + encodeURIComponent(dag.workflow || detail.workflow || '')); } catch (_) {}
+    const staticNames = new Set();
+    if (wfDef && Array.isArray(wfDef.stages)) {
+      for (const s of wfDef.stages) if (s && s.name) staticNames.add(s.name);
+    }
+
+    const nodes = dag.stages.map(s => ({
+      name: s.name, role: s.role,
+      dependsOn: s.dependsOn || [],
+      parallel: s.parallel,
+      status: s.status || 'pending',
+      attempts: s.attempts || 0,
+      durationSec: s.durationSec,
+      error: s.error,
+      taskBrief: s.taskBrief || '',
+      assignedAgents: s.assignedAgents || [],
+      checkpointStatus: s.checkpointStatus || '',
+      checkpointSavedAt: s.checkpointSavedAt,
+      checkpointError: s.checkpointError || '',
+      adversaryRound: s.adversaryRound || 0,
+      adversaryScore: s.adversaryScore || 0,
+      adversaryPassed: s.adversaryPassed,
+      outputPreview: s.outputPreview || '',
+      _static: staticNames.size === 0 ? true : staticNames.has(s.name),
+    }));
+
+    panel.appendChild(h('div', { class: 'muted', style: { marginBottom: '10px', fontSize: '12px' } }, [
+      h('strong', {}, 'workflow: '), dag.workflow || detail.workflow || '—',
+      ' · stages=', String(nodes.length),
+      '  ·  ',
+      h('span', { class: 'badge ' + statusBadgeClass(dag.status) }, dag.status || '—'),
+      h('span', { class: 'muted', style: { marginLeft: '6px' } }, 'source: ' + (dag.source || '')),
+    ]));
+    panel.appendChild(renderDAGSVG(nodes, dag.source));
+    panel.appendChild(h('div', { class: 'legend' }, [
+      h('span', {}, [h('span', { class: 'dot ok' }), '完成']),
+      h('span', {}, [h('span', { class: 'dot run' }), '运行']),
+      h('span', {}, [h('span', { class: 'dot err' }), '失败']),
+      h('span', {}, [h('span', { class: 'dot pending' }), '待执行']),
+    ]));
+
+    // 2) 分类: 静态 workflow stage  vs  动态 plan 子任务 stage
+    const staticNodes  = nodes.filter(n => n._static);
+    const dynamicNodes = nodes.filter(n => !n._static);
+
+    if (staticNodes.length) {
+      const cardsWrap = h('div', { class: 'dag-cards',
+        style: { display: 'grid', gap: '12px',
+                 gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' } });
+      for (const n of staticNodes) cardsWrap.appendChild(renderDAGNodeCard(n));
+      panel.appendChild(h('div', { class: 'card mb-16' }, [
+        h('h3', {}, '📋 静态工作流阶段详情 · ' + staticNodes.length + ' 个'),
+        h('div', { class: 'muted small mb-12' },
+          'workflow 注册表中声明的标准阶段, 含任务 / Agent / 检查点 / 对抗 / 错误等。'),
+        cardsWrap,
+      ]));
+    }
+
+    if (dynamicNodes.length) {
+      panel.appendChild(renderDynamicStageTree(dynamicNodes, detail));
+    }
+
+    if (dag.adversaryRounds && dag.adversaryRounds.length) {
+      panel.appendChild(renderDAGAdversaryRounds(dag.adversaryRounds));
+    }
+  }
+
+  // renderDynamicStageTree: 把 plan 阶段之后动态生成的 stage 按 dependsOn 组成嵌套树。
+  //   - 根节点 = dependsOn 为空, 或 dependsOn 里全是静态 stage
+  //   - 其它节点按第一个 dependsOn 为 parent 展开 (与 Plan 任务拆解树一致的骨架策略)
+  //   - 每个节点 UI 复用 renderDAGNodeCard, 套在折叠容器里, 便于收起大量子任务
+  function renderDynamicStageTree(dynamicNodes, detail) {
+    const dynSet = new Set(dynamicNodes.map(n => n.name));
+    const byName = new Map();
+    for (const n of dynamicNodes) byName.set(n.name, n);
+    const childrenOf = new Map();
+    const rootNames = [];
+    for (const n of dynamicNodes) {
+      const dynDeps = (n.dependsOn || []).filter(d => dynSet.has(d));
+      if (!dynDeps.length) {
+        rootNames.push(n.name);
+      } else {
+        const parent = dynDeps[0];
+        if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+        childrenOf.get(parent).push(n.name);
+      }
+    }
+
+    const host = h('div', { class: 'card mb-16' }, [
+      h('div', { class: 'toolbar-row' }, [
+        h('h3', { style: { margin: 0 } }, '🌳 Plan 生成的动态子任务 · ' + dynamicNodes.length + ' 个'),
+        h('a', {
+          class: 'btn small ghost',
+          href: '#',
+          title: '切换到 Plan 任务拆解树视图',
+          onClick: (e) => {
+            e.preventDefault();
+            localStorage.setItem('teamDagView', 'plan');
+            navigate();
+          },
+        }, '↗ 切到 Plan 拆解树视图'),
+      ]),
+      h('div', { class: 'muted small mb-12' },
+        '这些 stage 不在 workflow 静态注册表中, 通常是 plan 阶段由 LLM 按 objective 动态拆解出来。按依赖组织成树, 避免散乱。'),
+    ]);
+
+    const treeHost = h('div', { style: { maxHeight: '70vh', overflow: 'auto', paddingRight: '4px' } });
+    const renderNode = (name, depth) => {
+      const node = byName.get(name);
+      if (!node) return null;
+      const wrap = h('div', {
+        style: { borderLeft: depth > 0 ? '2px solid rgba(140,160,220,0.25)' : 'none',
+                 marginLeft: depth > 0 ? '14px' : '0',
+                 paddingLeft: depth > 0 ? '12px' : '0',
+                 marginBottom: '10px' },
+      });
+      wrap.appendChild(renderDAGNodeCard(node));
+      const kids = (childrenOf.get(name) || []);
+      if (kids.length) {
+        const kidsWrap = h('div', { style: { marginTop: '8px' } });
+        for (const k of kids) {
+          const child = renderNode(k, depth + 1);
+          if (child) kidsWrap.appendChild(child);
+        }
+        wrap.appendChild(kidsWrap);
+      }
+      return wrap;
+    };
+    for (const rn of rootNames) {
+      const el = renderNode(rn, 0);
+      if (el) treeHost.appendChild(el);
+    }
+    host.appendChild(treeHost);
+    return host;
+  }
+
+  // renderWorkflowDAGBodyFallback: 原来的 fallback (没 dag 数据时)
+  function renderWorkflowDAGBodyFallback(detail, panel) {
     // Fallback (older data / no workflow registry)
     const wfName = detail.workflow || 'development';
     (async () => {
@@ -1272,12 +1381,18 @@
       list.sort((a, b) => byCreatedAsc(byID.get(a), byID.get(b)));
     }
 
-    // Checkpoint 匹配: workflow.go 里 subject = "[team] stageName", Checkpoint 用 stageName 做 key
-    const cpByStage = new Map();
+    // Checkpoint 匹配: workflow.go 里 subject = "[team] stageName", Checkpoint 用 stageName 做 key。
+    // 做 "归一化" 索引 (lowercase + trim + collapse whitespace), 避免因大小写 / 空格差异漏匹配。
+    const cpByStage = new Map();       // 原始 stageName → checkpoint
+    const cpByNorm = new Map();        // 归一化 stageName → checkpoint
+    const normKey = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
     const cps = (checkpoints && (checkpoints.checkpoints || checkpoints.items || checkpoints)) || [];
     for (const c of (Array.isArray(cps) ? cps : [])) {
       const key = c && (c.stageName || c.stage);
-      if (key) cpByStage.set(key, c);
+      if (key) {
+        cpByStage.set(key, c);
+        cpByNorm.set(normKey(key), c);
+      }
     }
 
     // 顶部摘要
@@ -1297,25 +1412,54 @@
     // 树容器, 限高可滚动
     const treeHost = h('div', { class: 'card',
       style: { maxHeight: '70vh', overflow: 'auto', padding: '12px' } });
+    const ctx = { byID, childrenOf, cpByStage, cpByNorm, normKey, teamPrefix: prefix };
     for (const rid of rootIDs) {
-      treeHost.appendChild(renderPlanTaskNode(byID.get(rid), byID, childrenOf, cpByStage, prefix, 0));
+      treeHost.appendChild(renderPlanTaskNode(byID.get(rid), ctx, 0));
     }
     panel.appendChild(treeHost);
   }
 
   // 单个 plan 节点: 折叠 / 状态 / 内容 / checkpoint / agent
-  function renderPlanTaskNode(task, byID, childrenOf, cpByStage, teamPrefix, depth) {
+  // ctx = { byID, childrenOf, cpByStage, cpByNorm, normKey, teamPrefix }
+  function renderPlanTaskNode(task, ctx, depth) {
+    const { byID, childrenOf, cpByStage, cpByNorm, normKey, teamPrefix } = ctx;
     const kids = (childrenOf.get(task.id) || []).map(id => byID.get(id)).filter(Boolean);
     const cleanSubject = (task.subject || '').replace(teamPrefix, '').trim();
-    // 从 subject "[team] stage-name" 中取出 "stage-name" 去匹配 checkpoint
-    // 允许多段: 若 stage.Name 本身有空格先整体匹配, 否则取第一段
-    const cp = cpByStage.get(cleanSubject) || cpByStage.get(cleanSubject.split(/\s+/)[0] || '');
+    // 多重 checkpoint 匹配策略 (容忍 subject 和 stageName 的微小差异):
+    //   1) 原样 subject ⇢ checkpoint
+    //   2) subject 首段 (空格切) ⇢ checkpoint
+    //   3) 归一化 (lowercase + collapse whitespace) ⇢ checkpoint
+    //   4) 任务 id 若等于 stageName 也匹配
+    const subjFirstWord = (cleanSubject.split(/\s+/)[0] || '');
+    const cp = cpByStage.get(cleanSubject)
+           || cpByStage.get(subjFirstWord)
+           || (cpByNorm && cpByNorm.get(normKey(cleanSubject)))
+           || (cpByNorm && cpByNorm.get(normKey(subjFirstWord)))
+           || cpByStage.get(task.id);
+
+    // 如果 task 状态是终态 (completed/failed/running) 但没匹配到 checkpoint,
+    // 说明它可能是 plan LLM 生成的子任务 (没走 workflow stage, 所以不落 checkpoint)。
+    // 此时用 task 自身状态作为 "检查点状态" 的代理, 避免展示 "无检查点" 误导用户。
+    const terminalStatuses = { completed: 1, failed: 1, running: 1, in_progress: 1, blocked: 1 };
+    const cpFromTask = !cp && terminalStatuses[task.status];
 
     const node = h('div', { class: 'plan-node',
       style: { borderLeft: depth > 0 ? '2px solid rgba(140,160,220,0.2)' : 'none',
                marginLeft: depth > 0 ? '14px' : '0',
                paddingLeft: depth > 0 ? '12px' : '0',
                marginBottom: '8px' } });
+
+    const cpBadge = cp
+      ? h('span', {
+          class: 'badge ' + (cp.status === 'saved' || cp.status === 'completed' ? 'ok' : (cp.status === 'failed' ? 'err' : '')),
+          title: '检查点状态: ' + (cp.status || '—') + (cp.savedAt ? ' @ ' + cp.savedAt : ''),
+        }, '✓ 检查点: ' + (cp.status || '—'))
+      : cpFromTask
+        ? h('span', {
+            class: 'badge ghost',
+            title: '该子任务未落 workflow checkpoint, 使用任务状态 "' + task.status + '" 推断',
+          }, '≈ 状态同步: ' + task.status)
+        : h('span', { class: 'muted small' }, '无检查点');
 
     const head = h('div', {
       style: { display: 'flex', alignItems: 'center', gap: '8px',
@@ -1328,10 +1472,7 @@
       h('span', { class: 'badge ' + statusBadgeClass(task.status) }, task.status || '—'),
       h('strong', { style: { fontSize: '13px' } }, cleanSubject || task.id),
       task.owner ? h('span', { class: 'badge accent', title: '执行 Agent' }, '👤 ' + task.owner) : null,
-      cp ? h('span', {
-        class: 'badge ' + (cp.status === 'saved' || cp.status === 'completed' ? 'ok' : (cp.status === 'failed' ? 'err' : '')),
-        title: '检查点状态: ' + (cp.status || '—') + (cp.savedAt ? ' @ ' + cp.savedAt : ''),
-      }, '✓ 检查点: ' + (cp.status || '—')) : h('span', { class: 'muted small' }, '无检查点'),
+      cpBadge,
       task.priority ? h('span', { class: 'badge' }, '★ ' + task.priority) : null,
       (task.dependsOn && task.dependsOn.length > 1)
         ? h('span', { class: 'badge ghost', title: '依赖: ' + task.dependsOn.join(', ') },
@@ -1366,7 +1507,7 @@
     if (kids.length) {
       const childWrap = h('div', { style: { marginTop: '6px' } });
       for (const k of kids) {
-        childWrap.appendChild(renderPlanTaskNode(k, byID, childrenOf, cpByStage, teamPrefix, depth + 1));
+        childWrap.appendChild(renderPlanTaskNode(k, ctx, depth + 1));
       }
       node.appendChild(childWrap);
     }
@@ -1946,7 +2087,22 @@
     const params = new URLSearchParams(window.location.search);
     const since = params.get('since') || '';
     const qs = since ? '?since=' + encodeURIComponent(since) : '';
-    const data = await api('/api/metrics/' + encodeURIComponent(module) + qs);
+    // 并行拉取指标数据 + catalog (用于英中映射), catalog 失败也不阻塞主数据显示
+    const [data, cat] = await Promise.all([
+      api('/api/metrics/' + encodeURIComponent(module) + qs),
+      api('/api/metrics/catalog').catch(() => ({ catalog: [] })),
+    ]);
+    // 构建 name → descriptor 映射 (module+name 唯一, 同名跨模块取当前 module)
+    const descByName = {};
+    for (const m of (cat && cat.catalog) || []) {
+      if (!m || !m.name) continue;
+      if (m.module === module) { descByName[m.name] = m; continue; }
+      if (!descByName[m.name]) descByName[m.name] = m;
+    }
+    const zhOf = (name) => (descByName[name] && (descByName[name].zh || descByName[name].en)) || '';
+    const unitOf = (name) => (descByName[name] && descByName[name].unit) || '';
+    const panelOf = (name) => (descByName[name] && descByName[name].panel) || '';
+
     const v = $('#view');
     v.innerHTML = '';
     v.appendChild(h('div', { class: 'toolbar-row' }, [
@@ -1956,7 +2112,6 @@
           class: 'select',
           onChange: (e) => {
             const q = e.target.value ? '?since=' + encodeURIComponent(e.target.value) : '';
-            // 为保持 hash 路由, 不用 query; 直接用 localStorage 存 since 并重渲染
             location.hash = '#/metrics/' + encodeURIComponent(module);
           },
         }, [
@@ -1981,7 +2136,6 @@
       ]));
     }
 
-    // 每个指标一张 chart
     const byName = {};
     for (const e of (data.events || [])) {
       (byName[e.name] ||= []).push(e);
@@ -1990,10 +2144,19 @@
     if (!names.length) { v.appendChild(h('div', { class: 'empty' }, '无事件')); return; }
     for (const name of names) {
       const pts = byName[name];
+      const zh = zhOf(name);
+      const unit = unitOf(name);
+      const panel = panelOf(name);
+      // 标题区: 中文描述 (优先) · 英文指标名 · 单位 · 面板类型
+      const metaBits = [];
+      metaBits.push(h('code', { style: { fontSize: '11px', color: 'var(--text-dim)' } }, name));
+      if (unit) metaBits.push(h('span', { class: 'muted small' }, '· ' + unit));
+      if (panel) metaBits.push(h('span', { class: 'badge ghost small' }, panel));
+      metaBits.push(h('span', { class: 'badge' }, pts.length + ' pts'));
       v.appendChild(h('div', { class: 'card mb-16' }, [
-        h('div', { style: { display: 'flex', gap: '8px' } }, [
-          h('div', { style: { flex: '1', fontWeight: '600' } }, name),
-          h('span', { class: 'badge' }, pts.length + ' pts'),
+        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'baseline', flexWrap: 'wrap' } }, [
+          h('div', { style: { flex: '1 1 auto', fontWeight: '700', fontSize: '15px' } }, zh || name),
+          h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, metaBits),
         ]),
         h('div', { class: 'chart-wrap' }, h('canvas', { id: 'chart-m-' + name.replace(/[^a-z0-9]/gi, '_') })),
       ]));
@@ -2004,11 +2167,14 @@
         const cid = 'chart-m-' + name.replace(/[^a-z0-9]/gi, '_');
         const cv = document.getElementById(cid);
         if (!cv || !window.Chart) continue;
+        const zh = zhOf(name);
+        const unit = unitOf(name);
+        const legendLabel = zh ? (zh + (unit ? ' (' + unit + ')' : '')) : name;
         state.charts[cid] = new Chart(cv.getContext('2d'), {
           type: 'line',
           data: {
             labels: pts.map(p => fmtTsShort(p.ts || p.timestamp)),
-            datasets: [{ label: name, data: pts.map(p => p.value), borderColor: '#5ef0ff', tension: 0.2, pointRadius: 1.5 }],
+            datasets: [{ label: legendLabel, data: pts.map(p => p.value), borderColor: '#5ef0ff', tension: 0.2, pointRadius: 1.5 }],
           },
           options: baseChartOpts({}),
         });
@@ -2187,10 +2353,7 @@
   // 8. Dreaming (+ 时序 + diagnosis)
   // ==================================================================
   async function renderDreaming() {
-    const [data, diag] = await Promise.all([
-      api('/api/dreaming'),
-      api('/api/dreaming/diagnosis').catch(() => null),
-    ]);
+    const data = await api('/api/dreaming');
     const v = $('#view');
     v.innerHTML = '';
 
@@ -2201,7 +2364,7 @@
       statCard('最近运行', fmtRel(data.lastDreamAt), data.lastDreamAt ? fmtTime(data.lastDreamAt) : '从未', data.lastDreamAt ? 'ok' : 'warn'),
     ]));
 
-    // v1.5: 操作区 - 主动触发 + LLM 诊断
+    // v1.5: 操作区 - 主动触发 + LLM 诊断 (规则型诊断已废弃, 统一由 LLM 诊断接管)
     const diagSlot = h('div', { id: 'dreaming-diag-slot' });
     v.appendChild(h('div', { class: 'card mb-16' }, [
       h('div', { class: 'toolbar-row' }, [
@@ -2220,23 +2383,6 @@
       ]),
       diagSlot,
     ]));
-
-    // 诊断 (基于规则的简单诊断, 独立于 LLM 诊断)
-    if (diag && (!diag.dreamerWired || diag.reasons.length)) {
-      const card = h('div', { class: 'card mb-16' }, [
-        sectionHeader('诊断: Dreaming 为什么没跑?',
-          h('span', { class: 'badge ' + (diag.dreamerWired ? 'ok' : 'err') },
-            diag.dreamerWired ? 'CLI 已接入' : 'CLI 未接入')),
-      ]);
-      for (const r of diag.reasons) card.appendChild(h('div', { class: 'insight warn' }, [h('div', { class: 'insight-title' }, r)]));
-      if (diag.recommendations.length) {
-        card.appendChild(h('h4', { style: { marginTop: '12px' } }, '建议:'));
-        const ul = h('ul');
-        for (const r of diag.recommendations) ul.appendChild(h('li', {}, r));
-        card.appendChild(ul);
-      }
-      v.appendChild(card);
-    }
 
     // 时序 (来自 /api/timeseries/dreaming/*)
     try {
@@ -2670,6 +2816,7 @@
         state.logs.paused ? '▶ 继续' : '⏸ 暂停'),
       h('button', { class: 'btn small ghost', onClick: () => { const el = $('#log-viewer'); if (el) el.innerHTML = ''; } }, '清空视图'),
       h('a', { class: 'btn small', href: '/api/logs/tail' + (srcParam ? srcParam + '&n=1000' : '?n=1000'), target: '_blank' }, '↓ 下载最近 1000 行'),
+      h('span', { class: 'muted small', title: '超过后会从顶部丢弃最老的 50 条', style: { marginLeft: 'auto' } }, '视图上限: 1000 行'),
     ]);
     const pathBar = h('div', { class: 'muted small', id: 'log-path-bar', style: { marginBottom: '8px' } }, '');
     const viewer = h('div', { class: 'log-viewer', id: 'log-viewer' });
@@ -2709,12 +2856,24 @@
     while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
     return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + units[i];
   }
+  // appendLogLine: 保持 viewer 最多 MAX_LOG_LINES 行, 避免 DOM 无限增长。
+  // 超出后从头部丢弃最老的 k 行 (每次批量丢 50 条, 减少频繁 reflow)。
+  const MAX_LOG_LINES = 1000;
   function appendLogLine(viewer, line) {
     const cls = /error|ERROR|panic|FATAL/.test(line) ? 'log-line err'
               : /warn|WARN/.test(line) ? 'log-line warn'
               : /info|INFO/.test(line) ? 'log-line info'
               : 'log-line';
     viewer.appendChild(h('span', { class: cls }, line));
+    const count = viewer.childElementCount;
+    if (count > MAX_LOG_LINES) {
+      const toRemove = Math.min(50, count - MAX_LOG_LINES);
+      for (let i = 0; i < toRemove; i++) {
+        const first = viewer.firstElementChild;
+        if (!first) break;
+        viewer.removeChild(first);
+      }
+    }
   }
 
   // ==================================================================
@@ -3487,9 +3646,14 @@
     }
     v.innerHTML = '';
 
+    // v1.6 新结构: 把页面分为三段 (🩺 稳定性 / 📊 使用量 / 💾 效率)
+    //   稳定性: 实时速率 + 限流 + 熔断器 + 错误分布 + 超时/限流 诊断
+    //   使用量: stat cards + 按模型 + 按来源 + 联合时序图 (调用/错误/时长/tokens)
+    //   效率:   prompt cache 效果
+
     // 工具栏
     const toolbar = h('div', { class: 'toolbar-row mb-12' }, [
-      h('strong', {}, '✦ LLM 大模型运行质量'),
+      h('strong', {}, '✦ LLM 大模型监控'),
       h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, [
         h('span', { class: 'muted small' }, '时间窗口'),
         ...['1h', '6h', '24h', '72h', '168h'].map(w => h('button', {
@@ -3501,7 +3665,26 @@
     ]);
     v.appendChild(toolbar);
 
-    // ⭐ 实时速率 / 限流 / 熔断器 (新)
+    // 稳定性诊断 (errorBuckets + timeseries 自动摘要)
+    //   - 基于 error kind 里的 timeout / rate_limit 占比 + 关联时段的 QPS / P95 / tokens
+    //   - 目标: 让用户一眼看到 "什么时段出问题, 那时压力有多大"
+    const stabInsight = buildStabilityInsight(data);
+
+    // ============ ① 稳定性 ============
+    v.appendChild(h('h2', { style: { margin: '6px 0', fontSize: '15px' } },
+      '🩺 稳定性 (Stability) · 超时 / 限流 / 熔断'));
+    if (stabInsight.length) {
+      const insightCard = h('div', { class: 'card mb-16' }, [
+        h('h3', {}, '🧭 自动诊断 · 超时/限流 与 调用压力 的关联'),
+      ]);
+      for (const line of stabInsight) {
+        insightCard.appendChild(h('div', { class: 'insight ' + line.severity }, [
+          h('div', { class: 'insight-title' }, line.title),
+          line.detail ? h('div', { class: 'insight-sug' }, '▸ ' + line.detail) : null,
+        ]));
+      }
+      v.appendChild(insightCard);
+    }
     const rateHost = h('div', { class: 'card mb-16' }, [
       h('h3', {}, '⚡ 实时速率 / 限流 / 熔断器'),
       h('div', { class: 'muted small' }, '加载中…'),
@@ -3509,7 +3692,37 @@
     v.appendChild(rateHost);
     renderLLMRateAndGuard(rateHost).catch(() => {});
 
-    // 概览
+    // 错误分布 + 告警 合并放在稳定性区
+    if ((data.errorBuckets || []).length || (data.alerts || []).length) {
+      const card = h('div', { class: 'card mb-16' }, [h('h3', {}, '⚠ 错误分布 & 告警')]);
+      if ((data.errorBuckets || []).length) {
+        const totalErr = data.errorBuckets.reduce((s, b) => s + (b.count || 0), 0) || 1;
+        const tbl = h('table', { class: 'tbl' });
+        tbl.appendChild(h('thead', {}, h('tr', {}, [
+          h('th', {}, '错误类别'), h('th', {}, '次数'), h('th', {}, '占比'),
+        ])));
+        const tb = h('tbody');
+        for (const b of data.errorBuckets) {
+          const pct = ((b.count || 0) / totalErr * 100).toFixed(1) + '%';
+          tb.appendChild(h('tr', {}, [
+            h('td', {}, h('span', { class: 'badge ' + errBadgeClass(b.kind) }, b.kind)),
+            h('td', {}, String(b.count)),
+            h('td', {}, pct),
+          ]));
+        }
+        tbl.appendChild(tb);
+        card.appendChild(tbl);
+      }
+      for (const a of (data.alerts || [])) {
+        card.appendChild(h('div', { class: 'insight warn', style: { marginTop: '8px' } },
+          h('div', { class: 'insight-title' }, a)));
+      }
+      v.appendChild(card);
+    }
+
+    // ============ ② 使用量 ============
+    v.appendChild(h('h2', { style: { margin: '20px 0 6px', fontSize: '15px' } },
+      '📊 使用量 (Usage) · 调用 / Token / 模型 / 来源'));
     v.appendChild(h('div', { class: 'grid grid-4 mb-16' }, [
       statCard('总调用', data.totalCalls || 0,
         (data.totalRetries ? ('重试 ' + data.totalRetries) : '—'),
@@ -3524,14 +3737,6 @@
         'purple'),
     ]));
 
-    // 告警
-    if ((data.alerts || []).length) {
-      const ac = h('div', { class: 'card mb-16' }, [h('h3', {}, '⚠ 告警 / 观察')]);
-      for (const a of data.alerts) ac.appendChild(h('div', { class: 'insight warn' }, h('div', { class: 'insight-title' }, a)));
-      v.appendChild(ac);
-    }
-
-    // 按模型聚合
     if ((data.byModel || []).length) {
       const tbl = h('table', { class: 'tbl' });
       tbl.appendChild(h('thead', {}, h('tr', {}, [
@@ -3556,7 +3761,6 @@
       v.appendChild(h('div', { class: 'card mb-16' }, [h('h3', {}, '按模型聚合'), tbl]));
     }
 
-    // 按来源聚合 (cli / feishu / team / dashboard / unknown)
     if ((data.bySource || []).length) {
       const tbl = h('table', { class: 'tbl' });
       tbl.appendChild(h('thead', {}, h('tr', {}, [
@@ -3579,26 +3783,14 @@
       v.appendChild(h('div', { class: 'card mb-16' }, [h('h3', {}, '按来源聚合'), tbl]));
     }
 
-    // 错误分布
-    if ((data.errorBuckets || []).length) {
-      const tbl = h('table', { class: 'tbl' });
-      tbl.appendChild(h('thead', {}, h('tr', {}, [h('th', {}, '错误类别'), h('th', {}, '次数')])));
-      const tb = h('tbody');
-      for (const b of data.errorBuckets) {
-        tb.appendChild(h('tr', {}, [
-          h('td', {}, h('span', { class: 'badge ' + errBadgeClass(b.kind) }, b.kind)),
-          h('td', {}, String(b.count)),
-        ]));
-      }
-      tbl.appendChild(tb);
-      v.appendChild(h('div', { class: 'card mb-16' }, [h('h3', {}, '错误分布'), tbl]));
-    }
-
-    // 时序曲线
+    // 联合时序: 调用 / 错误 / 平均时长 / tokens, 用双 Y 轴堆叠以便关联阅读
     if ((data.timeseries || []).length) {
       const wrap = h('div', { class: 'card mb-16' }, [
-        h('h3', {}, '调用时序 (按小时)'),
+        h('h3', {}, '📈 联合时序 · 调用量 × 错误 × 平均时长'),
+        h('div', { class: 'muted small mb-12' },
+          '同一时间轴对齐: 左轴为调用/错误(次数), 右轴为平均耗时(秒)。错误曲线与 P95 同时抬升的时段, 通常是超时/限流高发期。'),
         h('div', { class: 'chart-wrap' }, h('canvas', { id: 'chart-llm-ts' })),
+        h('h3', { style: { marginTop: '14px' } }, '📊 Token 时序 · tokens/hour × 平均耗时'),
         h('div', { class: 'chart-wrap' }, h('canvas', { id: 'chart-llm-tok' })),
       ]);
       v.appendChild(wrap);
@@ -3610,12 +3802,15 @@
             data: {
               labels: data.timeseries.map(p => fmtTsShort(p.ts)),
               datasets: [
-                { label: '调用', data: data.timeseries.map(p => p.calls), borderColor: '#5ef0ff', tension: 0.3, pointRadius: 1 },
-                { label: '成功', data: data.timeseries.map(p => p.success), borderColor: '#7CFF8C', tension: 0.3, pointRadius: 1 },
-                { label: '错误', data: data.timeseries.map(p => p.errors), borderColor: '#ff6680', tension: 0.3, pointRadius: 1 },
+                { label: '调用 (次)', data: data.timeseries.map(p => p.calls), borderColor: '#5ef0ff', tension: 0.3, pointRadius: 1 },
+                { label: '成功 (次)', data: data.timeseries.map(p => p.success), borderColor: '#7CFF8C', tension: 0.3, pointRadius: 1 },
+                { label: '错误 (次)', data: data.timeseries.map(p => p.errors), borderColor: '#ff6680', tension: 0.3, pointRadius: 1 },
+                { label: '平均耗时 (s)', data: data.timeseries.map(p => p.avgDuration), borderColor: '#ffbe55', borderDash: [4, 3], tension: 0.3, pointRadius: 0, yAxisID: 'y2' },
               ],
             },
-            options: baseChartOpts({}),
+            options: baseChartOpts({
+              scales: { y2: { position: 'right', grid: { drawOnChartArea: false } } },
+            }),
           });
         }
         const c2 = document.getElementById('chart-llm-tok');
@@ -3643,13 +3838,96 @@
       ]));
     }
 
-    // ⭐ 提示词缓存效果 (v1.5)
-    //   - Anthropic prompt caching: cacheRead 按 10% 计费, cacheCreate 按 125% 计费
-    //   - HitRate = cacheRead / (input + cacheRead), 越高越省钱
-    //   - 时序图: 每小时桶的命中率 + 读/写 token 量
+    // ============ ③ 效率 ============
     if (data.cache) {
+      v.appendChild(h('h2', { style: { margin: '20px 0 6px', fontSize: '15px' } },
+        '💾 效率 (Efficiency) · 提示词缓存'));
       v.appendChild(renderPromptCachePanel(data.cache));
     }
+  }
+
+  // buildStabilityInsight: 基于 errorBuckets + timeseries, 自动生成 2~4 条诊断短句,
+  // 把 "何时出问题 / 哪类错误主导 / 那时 QPS 与 P95 是多少" 串起来。
+  // 输出 [{severity: 'warn'|'critical'|'info', title, detail}]
+  function buildStabilityInsight(data) {
+    const out = [];
+    const buckets = data.errorBuckets || [];
+    const ts = data.timeseries || [];
+    if (!buckets.length && !ts.length) return out;
+
+    const totalErr = buckets.reduce((s, b) => s + (b.count || 0), 0);
+    const totalCalls = data.totalCalls || 0;
+    const errRate = totalCalls ? totalErr / totalCalls : 0;
+
+    // 1) 超时 / 限流 占比
+    const find = (k) => (buckets.find(b => (b.kind || '').toLowerCase() === k) || {}).count || 0;
+    const timeoutN = find('timeout');
+    const rateLimitN = find('rate_limit') || find('ratelimit') || find('429');
+    const authN = find('auth') || find('unauthorized');
+    const serverN = find('server_error') || find('5xx') || find('upstream');
+
+    if (timeoutN > 0) {
+      const pct = totalErr ? (timeoutN / totalErr * 100).toFixed(0) : '?';
+      out.push({
+        severity: timeoutN >= 5 ? 'critical' : 'warn',
+        title: `⏱ 超时错误 ${timeoutN} 次 · 占错误 ${pct}%`,
+        detail: '若错误集中发生在 QPS 高峰或 Token 大 prompt 时段, 说明上游时延接近 api client timeout, 考虑 (a) 调大 timeout (b) 降低并发 maxParallel (c) 对长 prompt 分段。',
+      });
+    }
+    if (rateLimitN > 0) {
+      const pct = totalErr ? (rateLimitN / totalErr * 100).toFixed(0) : '?';
+      out.push({
+        severity: rateLimitN >= 3 ? 'critical' : 'warn',
+        title: `🚦 限流 (429) ${rateLimitN} 次 · 占错误 ${pct}%`,
+        detail: '限流与 QPS 正相关。建议调低 "限流 · RPM 令牌" 的上限或降低 maxParallel, 并启用 AIMD 回退; 长尾场景可切换备用模型/账号。',
+      });
+    }
+    if (serverN > 0) {
+      out.push({
+        severity: 'warn',
+        title: `🛠 上游服务端错误 ${serverN} 次`,
+        detail: '多为模型 provider 侧 5xx。若成片出现, 应触发熔断 + 切换备用 provider。',
+      });
+    }
+    if (authN > 0) {
+      out.push({
+        severity: 'critical',
+        title: `🔐 认证错误 ${authN} 次`,
+        detail: 'API Key 失效 / 权限不足 / 被封禁。优先检查 config.ai.apiKey 与账号配额。',
+      });
+    }
+
+    // 2) 调用量 × 错误率 关联 (找错误最集中的 1~2 小时桶)
+    if (ts.length) {
+      const ranked = ts
+        .map(p => ({ ts: p.ts, calls: p.calls || 0, errors: p.errors || 0, avg: p.avgDuration || 0, tok: p.totalTokens || 0 }))
+        .filter(p => p.errors > 0)
+        .sort((a, b) => b.errors - a.errors);
+      if (ranked.length) {
+        const top = ranked[0];
+        const rate = top.calls ? (top.errors / top.calls * 100).toFixed(0) : '?';
+        out.push({
+          severity: top.errors >= 10 ? 'critical' : 'warn',
+          title: `📉 错误最集中时段: ${fmtTsShort(top.ts)} · ${top.errors} 次 (错误率 ${rate}%)`,
+          detail: `当时段调用 ${top.calls} 次, 平均耗时 ${fmtDurSec(top.avg)}, tokens ${fmtKilo(top.tok)}; 可在上方 "联合时序" 图中对齐查看是否与调用洪峰重合。`,
+        });
+      }
+    }
+
+    // 3) 全局稳定性等级
+    if (totalCalls > 0) {
+      const sev = errRate > 0.1 ? 'critical' : errRate > 0.03 ? 'warn' : 'info';
+      out.push({
+        severity: sev,
+        title: `总体错误率 ${(errRate * 100).toFixed(2)}% · P95 ${fmtDurSec(data.p95Duration)}`,
+        detail: sev === 'info'
+          ? '当前 LLM 链路稳定性良好, 继续保持即可。'
+          : (sev === 'warn'
+              ? '错误率偏高, 关注是否为零星超时或特定模型; 若 P95 > 25s 则长尾明显, 可先缩短 prompt 或拆分批次。'
+              : '错误率显著偏高, 建议立即切换备用 provider/模型 + 临时降低并发直至恢复。'),
+      });
+    }
+    return out;
   }
 
   // 提示词缓存效果面板
