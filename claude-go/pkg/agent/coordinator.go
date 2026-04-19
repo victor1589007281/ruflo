@@ -119,6 +119,10 @@ func (c *Coordinator) RunWithRecovery(
 		return executor.Execute(ctx, wf, objective, team)
 	case "creative_media":
 		return executor.Execute(ctx, wf, objective, team)
+	case "novel_writing":
+		return executor.Execute(ctx, wf, objective, team)
+	case "swarm_novel":
+		return executor.Execute(ctx, wf, objective, team)
 	default:
 		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 	}

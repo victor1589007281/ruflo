@@ -139,6 +139,10 @@ func GetWorkflow(name string) *WorkflowDef {
 		return creativeV2Workflow()
 	case "predict", "prediction", "forecast":
 		return predictWorkflow()
+	case "novel-v2":
+		return novelV2Workflow()
+	case "novel-v3", "novel", "fiction", "story", "swarm-novel":
+		return novelV3Workflow()
 	default:
 		return nil
 	}
@@ -157,6 +161,8 @@ func ListWorkflows() []WorkflowDef {
 		*creativeWorkflow(),
 		*creativeV2Workflow(),
 		*predictWorkflow(),
+		*novelV2Workflow(),
+		*novelV3Workflow(),
 	}
 }
 
@@ -638,6 +644,7 @@ type WorkflowExecutor struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	chatID      string
+	llm         LLMClient              // LLM 客户端 (供 swarm_intel.Engine 等需要直接调用的场景)
 	taskTracker TaskTracker            // 复用 V2 Task 系统 (可为 nil)
 	dagTracker  DAGTaskTracker         // V2 DAG 能力 (运行时从 taskTracker 检测)
 	evolution   *EvolutionEngine       // 自动进化引擎 (可为 nil)
@@ -674,6 +681,10 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		return we.executeTradingDebate(ctx, wf, objective, team)
 	case "creative_media":
 		return we.executeCreativeMedia(ctx, wf, objective, team)
+	case "novel_writing":
+		return we.executeNovelWriting(ctx, wf, objective, team)
+	case "swarm_novel":
+		return we.executeSwarmNovel(ctx, wf, objective, team)
 	default:
 		return we.executePipeline(ctx, wf, objective, team)
 	}

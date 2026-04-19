@@ -360,7 +360,7 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 	if workflow != "swarm" {
 		wf := GetWorkflow(workflow)
 		if wf == nil {
-			return nil, fmt.Errorf("未知工作流 %q, 可选: development, research, debate, swarm, finance, techblog, creative", workflow)
+			return nil, fmt.Errorf("未知工作流 %q, 可选: development, research, debate, swarm, finance, techblog, creative, creative-v2, novel-v2, novel-v3, trading-v2, predict", workflow)
 		}
 		_ = wf
 	}
@@ -502,6 +502,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		factory:     ptm.factory,
 		notify:      ptm.notify,
 		chatID:      team.ChatID,
+		llm:         ptm.llm, // 供 swarm_intel.Engine 等直接 LLM 调用
 		taskTracker: ptm.taskTracker,
 		evolution:   ptm.evolution,
 		roles:       ptm.roles,
