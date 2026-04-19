@@ -506,8 +506,12 @@
             h('button', { class: 'btn small', onClick: () => location.hash = '#/teams/' + encodeURIComponent(t.name) }, '详情'),
             t.status === 'running'
               ? h('button', { class: 'btn small danger', onClick: () => execAction('team', 'stop', t.name) }, '停止')
-              : h('button', { class: 'btn small', onClick: () => execAction('team', 'restart', t.name) }, '重启'),
-          ]),
+              : null,
+            (t.status === 'stopped' || t.status === 'failed')
+              ? h('button', { class: 'btn small', onClick: () => execAction('team', 'resume', t.name) }, '恢复')
+              : null,
+            h('button', { class: 'btn small', onClick: () => execAction('team', 'restart', t.name) }, '重启'),
+          ].filter(Boolean)),
         ]));
       }
       content.appendChild(grid);
@@ -660,14 +664,19 @@
     ]));
 
     // actions toolbar
-    right.appendChild(h('div', { class: 'actions' }, [
+    const actions = [
       (detail.status === 'running')
         ? h('button', { class: 'btn danger', onClick: () => execAction('team', 'stop', name) }, '⏹ 停止')
-        : h('button', { class: 'btn', onClick: () => execAction('team', 'restart', name) }, '↻ 重启'),
+        : null,
+      (detail.status === 'stopped' || detail.status === 'failed')
+        ? h('button', { class: 'btn', onClick: () => execAction('team', 'resume', name) }, '♻ 恢复')
+        : null,
+      h('button', { class: 'btn', onClick: () => execAction('team', 'restart', name) }, '↻ 重启'),
       h('button', { class: 'btn primary', onClick: () => runTeamDiagnose(name) }, '✦ LLM 诊断'),
       h('button', { class: 'btn ghost', onClick: () => execAction('team', 'delete', name, { confirm: '删除该团队的所有记录?' }) }, '🗑 删除'),
       h('button', { class: 'btn ghost small', onClick: () => navigator.clipboard && navigator.clipboard.writeText(location.href) }, '复制链接'),
-    ]));
+    ].filter(Boolean);
+    right.appendChild(h('div', { class: 'actions' }, actions));
 
     // 诊断结果挂点
     const diagSlot = h('div', { id: 'team-diag-slot' });

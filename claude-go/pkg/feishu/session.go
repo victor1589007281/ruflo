@@ -289,6 +289,9 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 
 	eng := engine.NewQueryEngine(cfg, sm.apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = sm.memoryStore
+	if sm.config.EnableFrontierOptimizations {
+		eng.EnableFrontierOptimizations()
+	}
 
 	return &Session{
 		ChatID:     chatID,

@@ -27,7 +27,8 @@ type Config struct {
 	StateDir   string         // 数据根目录 (.claude-go)
 	Addr       string         // 监听地址, 例如 "127.0.0.1:7777"
 	CacheTTL   time.Duration  // 数据缓存 TTL, 0 禁用
-	TeamAction TeamActionFunc // 团队操作回调 (stop/restart/delete)，为 nil 时仅排队
+	TeamAction TeamActionFunc // 团队操作回调 (stop/restart/delete)，为 nil 时尝试转发到 BotAPIURL
+	BotAPIURL  string         // Feishu bot 的 wiki API URL (如 "http://127.0.0.1:18080"), 用于转发 team 操作
 }
 
 // Server HTTP 服务。

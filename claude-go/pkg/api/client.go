@@ -228,12 +228,14 @@ func (c *Client) shouldEnablePromptCache() bool {
 	}
 }
 
-// isAnthropicEndpoint 检测是否为 Anthropic 官方 API (支持 prompt caching)。
+// isAnthropicEndpoint 检测是否为 Anthropic 官方 API 或兼容协议 (支持 prompt caching)。
 func isAnthropicEndpoint(baseURL string) bool {
 	lower := strings.ToLower(baseURL)
 	return strings.Contains(lower, "anthropic.com") ||
 		strings.Contains(lower, "api.claude") ||
-		strings.Contains(lower, "bedrock") // AWS Bedrock 也支持
+		strings.Contains(lower, "bedrock") ||               // AWS Bedrock
+		strings.Contains(lower, "dashscope.aliyuncs.com") || // 阿里云百炼
+		strings.Contains(lower, "/apps/anthropic")           // Anthropic 兼容代理路径
 }
 
 // isCacheRelatedError 检测 API 错误是否与 prompt caching 相关。

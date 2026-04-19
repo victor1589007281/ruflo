@@ -131,6 +131,9 @@ type BotConfig struct {
 
 	// PromptCacheMode 提示词缓存模式: "auto"(默认)/"on"/"off"
 	PromptCacheMode string
+
+	// EnableFrontierOptimizations QueryEngine 前沿优化特性开关 (默认 true)
+	EnableFrontierOptimizations bool
 }
 
 // BrowserConfig 浏览器抓取配置。
@@ -164,15 +167,16 @@ type WikiConfig struct {
 // DefaultBotConfig 返回默认配置
 func DefaultBotConfig() *BotConfig {
 	return &BotConfig{
-		Domain:          "feishu",
-		Model:           "qwen3.5-plus",
-		MaxTokens:       16384,
-		SessionTimeout:  30 * time.Minute,
-		MaxSessions:     100,
-		PermissionMode:  "bypass",
-		MentionOnly:     true,
-		WelcomeMessage:  "你好！我是 Claude Code (Go) 机器人。发送消息与我对话，我可以帮你编程、分析代码、执行命令等。",
-		ThinkingMessage: "正在思考中...",
+		Domain:                        "feishu",
+		Model:                         "qwen3.5-plus",
+		MaxTokens:                     16384,
+		SessionTimeout:                30 * time.Minute,
+		MaxSessions:                   100,
+		PermissionMode:                "bypass",
+		MentionOnly:                   true,
+		WelcomeMessage:                "你好！我是 Claude Code (Go) 机器人。发送消息与我对话，我可以帮你编程、分析代码、执行命令等。",
+		ThinkingMessage:               "正在思考中...",
+		EnableFrontierOptimizations:   true,
 		Wiki: WikiConfig{
 			Enabled:       true,
 			AutoIngestURL: true,
@@ -302,6 +306,9 @@ type JSONConfig struct {
 
 	// Dashboard Dashboard 配置
 	Dashboard *DashboardSection `json:"dashboard,omitempty"`
+
+	// Engine QueryEngine 前沿优化特性配置
+	Engine *EngineSection `json:"engine,omitempty"`
 }
 
 // DashboardSection Dashboard 配置段
@@ -317,6 +324,13 @@ type DashboardSection struct {
 	//
 	// Deprecated: 请改用顶层 stateDir 或 cwd。
 	StateDir string `json:"stateDir,omitempty"`
+}
+
+// EngineSection QueryEngine 前沿优化特性配置段
+type EngineSection struct {
+	// EnableFrontierOptimizations 一键启用推荐的 P0/P1 前沿优化组件 (默认 true)
+	// 包括: Metrics, ErrorClassifier, JSONRepair, LoopDetector, PromptCache, Budget, Trajectory
+	EnableFrontierOptimizations *bool `json:"enableFrontierOptimizations,omitempty"`
 }
 
 // WikiSection Wiki 配置段 (JSON)
@@ -552,5 +566,12 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		if jc.Browser.ProxyURL != "" {
 			bc.Browser.ProxyURL = jc.Browser.ProxyURL
 		}
+	}
+
+	// Engine: 默认开启前沿优化 (与之前硬编码行为一致), 除非显式设为 false
+	if jc.Engine != nil && jc.Engine.EnableFrontierOptimizations != nil {
+		bc.EnableFrontierOptimizations = *jc.Engine.EnableFrontierOptimizations
+	} else {
+		bc.EnableFrontierOptimizations = true
 	}
 }

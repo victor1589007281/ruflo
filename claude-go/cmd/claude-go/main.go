@@ -1373,6 +1373,15 @@ type dashStateDirInfo struct {
 	Warnings      []string            // 例如 dashboard.stateDir 废弃提示
 }
 
+// botAPIURL 从配置中解析 feishu bot 的 wiki API URL，供 standalone dashboard 转发 team 操作。
+// 返回空字符串表示未配置 wiki API 端口。
+func botAPIURL(cfg *feishu.JSONConfig) string {
+	if cfg == nil || cfg.Wiki == nil || cfg.Wiki.APIPort == 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", cfg.Wiki.APIPort)
+}
+
 // resolveDashStateDir 统一 Dashboard 所有子命令 (run/start/stop/status/open) 的
 // StateDir 解析规则, 与飞书 bot 保持完全一致 (basedir.ResolveDefault(StateDir, Cwd)):
 //
@@ -1515,9 +1524,10 @@ func runDashboardForeground(addr string, port int, stateDir string, noOpen bool,
 	}
 
 	srv := dashboard.NewServer(dashboard.Config{
-		StateDir: resolved,
-		Addr:     bindAddr,
-		CacheTTL: 2 * time.Second,
+		StateDir:  resolved,
+		Addr:      bindAddr,
+		CacheTTL:  2 * time.Second,
+		BotAPIURL: botAPIURL(jsonCfg),
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -661,7 +661,7 @@ func (b *Bot) Shutdown() {
 	b.mcpMgr.Shutdown()
 }
 
-// DashboardTeamAction 供 dashboard 直接调用的团队操作 (stop/restart/delete)。
+// DashboardTeamAction 供 dashboard 直接调用的团队操作 (stop/restart/delete/resume)。
 func (b *Bot) DashboardTeamAction(action, teamName string) error {
 	if b.teamMgr == nil {
 		return fmt.Errorf("teamMgr 未初始化")
@@ -676,6 +676,8 @@ func (b *Bot) DashboardTeamAction(action, teamName string) error {
 			return fmt.Errorf("停止失败: %w", err)
 		}
 		return b.teamMgr.RunTeam(teamName, "")
+	case "resume":
+		return b.teamMgr.ResumeTeam(teamName)
 	default:
 		return fmt.Errorf("未知操作: %s", action)
 	}

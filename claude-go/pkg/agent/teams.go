@@ -846,6 +846,50 @@ func (ptm *ProductionTeamManager) StopTeam(name string) error {
 	return nil
 }
 
+// ResumeTeam 恢复已停止/失败的团队，从检查点继续执行。
+// 与 RunTeam 不同，ResumeTeam 不需要新目标，直接使用团队现有目标。
+func (ptm *ProductionTeamManager) ResumeTeam(name string) error {
+	ptm.mu.RLock()
+	team, ok := ptm.teams[name]
+	ptm.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("团队 %q 不存在", name)
+	}
+
+	team.mu.Lock()
+	if team.Status == TeamStatusRunning {
+		team.mu.Unlock()
+		return fmt.Errorf("团队 %q 正在执行中", name)
+	}
+
+	if team.Status == TeamStatusCompleted {
+		team.mu.Unlock()
+		return fmt.Errorf("团队 %q 已完成，无需恢复", name)
+	}
+
+	objective := team.Objective
+	team.Status = TeamStatusRunning
+	team.StartedAt = time.Now()
+	team.Error = ""
+	ctx, cancel := context.WithCancel(context.Background())
+	team.cancel = cancel
+	team.doneCh = make(chan struct{})
+	team.mu.Unlock()
+
+	// 更新黑板上的目标
+	team.Blackboard.Write("objective", objective, "system", "context")
+	team.persist()
+
+	ptm.notify(team.ChatID, fmt.Sprintf("♻️ 团队 **%s** 从检查点恢复执行\n目标: %s\n工作流: %s", name, objective, team.Workflow))
+
+	go func() {
+		defer func() { close(team.doneCh) }()
+		ptm.executeWorkflow(ctx, team, true)
+	}()
+	return nil
+}
+
 // StopFirstRunning 停止第一个正在运行的团队 (意图识别用)。
 func (ptm *ProductionTeamManager) StopFirstRunning() (string, error) {
 	ptm.mu.RLock()
