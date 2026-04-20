@@ -1924,7 +1924,7 @@ func (b *Bot) handleGoCommand(ctx context.Context, chatID, messageID, text strin
 	parts := strings.Fields(text)
 	if len(parts) < 3 {
 		b.sendTextReply(ctx, messageID, "用法: /go <工作流> <目标>\n"+
-			"工作流: research, development, debate, creative, finance, techblog, swarm\n"+
+			"工作流: research, development, debate, creative, finance, techblog, swarm, ml-training, app, game\n"+
 			"示例: /go research 调研 kubernetes 最佳实践")
 		return
 	}

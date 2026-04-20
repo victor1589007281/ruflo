@@ -143,6 +143,12 @@ func GetWorkflow(name string) *WorkflowDef {
 		return novelV2Workflow()
 	case "novel-v3", "novel", "fiction", "story", "swarm-novel":
 		return novelV3Workflow()
+	case "ml-training", "ml", "finetune", "training":
+		return mlTrainingWorkflow()
+	case "app", "miniprogram", "mobile":
+		return appCompositeWorkflow()
+	case "game", "gamedev", "game-dev":
+		return gameCompositeWorkflow()
 	default:
 		return nil
 	}
@@ -163,6 +169,9 @@ func ListWorkflows() []WorkflowDef {
 		*predictWorkflow(),
 		*novelV2Workflow(),
 		*novelV3Workflow(),
+		*mlTrainingWorkflow(),
+		*appCompositeWorkflow(),
+		*gameCompositeWorkflow(),
 	}
 }
 
@@ -797,6 +806,10 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		return we.executeNovelWriting(ctx, wf, objective, team)
 	case "swarm_novel":
 		return we.executeSwarmNovel(ctx, wf, objective, team)
+	case "app_composite":
+		return we.executeAppComposite(ctx, wf, objective, team)
+	case "game_composite":
+		return we.executeGameComposite(ctx, wf, objective, team)
 	default:
 		return we.executePipeline(ctx, wf, objective, team)
 	}
