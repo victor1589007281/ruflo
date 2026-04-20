@@ -361,7 +361,7 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 	if workflow != "swarm" {
 		wf := GetWorkflow(workflow)
 		if wf == nil {
-			return nil, fmt.Errorf("未知工作流 %q, 可选: development, research, debate, swarm, finance, techblog, creative, creative-v2, novel-v2, novel-v3, trading-v2, predict, ml-training, app, game", workflow)
+			return nil, fmt.Errorf("未知工作流 %q, 可选: development, research, debate, swarm, finance, techblog, creative, creative-v2, novel-v2, novel-v3, trading-v2, predict, ml-training, app, game, code-review, testing, parenting, hiring", workflow)
 		}
 		_ = wf
 	}

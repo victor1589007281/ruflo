@@ -9,7 +9,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
 )
 
-// RegisterTeamCommands 注册 /team, /go, /wiki 命令。
+// RegisterTeamCommands 注册 /team, /go, /wiki, /review 命令。
 func RegisterTeamCommands(r *Registry) {
 	r.Register(&Command{
 		Name:        "team",
@@ -124,6 +124,15 @@ func RegisterTeamCommands(r *Registry) {
 				fmt.Println("  trading-v2   — 金融交易 v2 (分析→Bull/Bear辩论→交易→风控辩论→PM裁决)")
 				fmt.Println("  techblog     — 技术博客 (researcher → writer → editor)")
 				fmt.Println("  swarm        — 蜂群模式 (LLM 自动分解并行)")
+				fmt.Println("  predict      — 群体智能预测 (多Agent辩论+贝叶斯)")
+				fmt.Println("  novel-v3     — 小说创作 (蜂群协作)")
+				fmt.Println("  ml-training  — ML训练微调 (数据分析→训练→评估)")
+				fmt.Println("  app          — APP&小程序 (跨团队协作)")
+				fmt.Println("  game         — 游戏研发 (2D/3D全流程)")
+				fmt.Println("  code-review  — 代码审查 (多维专家+对抗+测试验证)")
+				fmt.Println("  testing      — 研发测试 (单元/集成/属性/混沌)")
+				fmt.Println("  parenting    — 育儿教育 (全阶段咨询)")
+				fmt.Println("  hiring       — 应聘招聘 (JD分析→模拟面试)")
 
 			default:
 				fmt.Printf("未知子命令: %s\n用法: /team [create|run|status|stop|list|delete|workflows]\n", sub)
@@ -483,6 +492,98 @@ func RegisterTeamCommands(r *Registry) {
 				for _, o := range r.Outcomes {
 					fmt.Printf("    %s: %.1f%%\n", o.Outcome, o.Probability*100)
 				}
+			}
+			return nil
+		},
+	})
+
+	r.Register(&Command{
+		Name:        "review",
+		ArgHint:     "<代码路径或描述> [--severity high|medium|low] [--focus security|logic|performance|style]",
+		Description: "代码审查 (快速创建 code-review 团队并启动审查)",
+		Type:        CommandTypeLocal,
+		Execute: func(args string, ctx *CommandContext) error {
+			if ctx.TeamMgr == nil {
+				fmt.Println("[团队管理器未初始化]")
+				return nil
+			}
+			if strings.TrimSpace(args) == "" {
+				fmt.Println("用法: /review <代码路径或审查描述>")
+				fmt.Println("示例:")
+				fmt.Println("  /review ./pkg/api/handler.go")
+				fmt.Println("  /review --diff main  (审查当前分支与 main 的差异)")
+				fmt.Println("  /review --focus security ./src")
+				fmt.Println("  /review 审查用户认证模块的安全性")
+				fmt.Println("")
+				fmt.Println("选项:")
+				fmt.Println("  --severity high|medium|low  — 仅显示指定及以上级别")
+				fmt.Println("  --focus security|logic|performance|style  — 聚焦审查维度")
+				fmt.Println("  --diff <branch>  — 审查与指定分支的差异")
+				return nil
+			}
+
+			var objective string
+			var severity, focus, diffBranch string
+			parts := strings.Fields(args)
+			var objParts []string
+			for i := 0; i < len(parts); i++ {
+				switch parts[i] {
+				case "--severity":
+					if i+1 < len(parts) {
+						severity = parts[i+1]
+						i++
+					}
+				case "--focus":
+					if i+1 < len(parts) {
+						focus = parts[i+1]
+						i++
+					}
+				case "--diff":
+					if i+1 < len(parts) {
+						diffBranch = parts[i+1]
+						i++
+					}
+				default:
+					objParts = append(objParts, parts[i])
+				}
+			}
+
+			objective = strings.Join(objParts, " ")
+			if diffBranch != "" {
+				objective = fmt.Sprintf("[DIFF vs %s] %s", diffBranch, objective)
+			}
+			if severity != "" {
+				objective = fmt.Sprintf("[MIN_SEVERITY=%s] %s", severity, objective)
+			}
+			if focus != "" {
+				objective = fmt.Sprintf("[FOCUS=%s] %s", focus, objective)
+			}
+			if objective == "" {
+				objective = "审查指定代码"
+			}
+
+			teamName := fmt.Sprintf("review-%d", time.Now().Unix()%10000)
+			team, err := ctx.TeamMgr.CreateTeam(teamName, "code-review", objective, "cli")
+			if err != nil {
+				fmt.Printf("[创建审查团队失败: %v]\n", err)
+				return nil
+			}
+			fmt.Printf("🔍 代码审查启动: 团队 %s (Agent: %d)\n", team.Name, len(team.Agents))
+			fmt.Printf("   目标: %s\n", objective)
+			if severity != "" {
+				fmt.Printf("   最低级别: %s\n", severity)
+			}
+			if focus != "" {
+				fmt.Printf("   聚焦维度: %s\n", focus)
+			}
+
+			if err := ctx.TeamMgr.RunTeam(teamName, objective); err != nil {
+				fmt.Printf("[启动失败: %v]\n", err)
+				return nil
+			}
+			if ctx.WaitSync {
+				team.WaitDone()
+				fmt.Printf("\n✅ 审查完成 (团队: %s, 状态: %s)\n", team.Name, team.Status)
 			}
 			return nil
 		},

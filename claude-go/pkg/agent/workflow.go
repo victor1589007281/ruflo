@@ -149,6 +149,14 @@ func GetWorkflow(name string) *WorkflowDef {
 		return appCompositeWorkflow()
 	case "game", "gamedev", "game-dev":
 		return gameCompositeWorkflow()
+	case "code-review", "review", "cr":
+		return codeReviewWorkflow()
+	case "testing", "test-team", "qa":
+		return testingWorkflow()
+	case "parenting", "education", "育儿", "edu":
+		return parentingWorkflow()
+	case "hiring", "interview", "job", "recruit":
+		return hiringWorkflow()
 	default:
 		return nil
 	}
@@ -172,6 +180,10 @@ func ListWorkflows() []WorkflowDef {
 		*mlTrainingWorkflow(),
 		*appCompositeWorkflow(),
 		*gameCompositeWorkflow(),
+		*codeReviewWorkflow(),
+		*testingWorkflow(),
+		*parentingWorkflow(),
+		*hiringWorkflow(),
 	}
 }
 
