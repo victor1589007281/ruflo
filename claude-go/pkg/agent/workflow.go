@@ -762,19 +762,20 @@ Full Debate Transcript + Evidence Verification:
 // WorkflowExecutor 工作流执行器。
 // 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff + Evolution + Roles + AgentPool。
 type WorkflowExecutor struct {
-	factory     CreateAgentFunc
-	notify      NotifyFunc
-	chatID      string
-	llm         LLMClient              // LLM 客户端 (供 swarm_intel.Engine 等需要直接调用的场景)
-	taskTracker TaskTracker            // 复用 V2 Task 系统 (可为 nil)
-	dagTracker  DAGTaskTracker         // V2 DAG 能力 (运行时从 taskTracker 检测)
-	evolution   *EvolutionEngine       // 自动进化引擎 (可为 nil)
-	roles       *RoleRegistry          // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
-	metrics     *metrics.Collector     // 持续观测指标 (可为 nil)
-	pool        *AgentPool             // Agent 池 (动态扩缩, 可为 nil)
-	checkpoints CheckpointStore        // 检查点存取 (由 Coordinator 注入, 可为 nil)
-	promptCache *PromptCache           // 提示词缓存 (参考 Anthropic Prompt Caching)
-	concurrency ConcurrencySuggestor   // 动态并发建议 (基于 API 流控状态, 可为 nil)
+	factory          CreateAgentFunc
+	notify           NotifyFunc
+	chatID           string
+	llm              LLMClient            // LLM 客户端 (供 swarm_intel.Engine 等需要直接调用的场景)
+	taskTracker      TaskTracker          // 复用 V2 Task 系统 (可为 nil)
+	dagTracker       DAGTaskTracker       // V2 DAG 能力 (运行时从 taskTracker 检测)
+	evolution        *EvolutionEngine     // 自动进化引擎 (可为 nil)
+	roles            *RoleRegistry        // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
+	metrics          *metrics.Collector   // 持续观测指标 (可为 nil)
+	pool             *AgentPool           // Agent 池 (动态扩缩, 可为 nil)
+	checkpoints      CheckpointStore      // 检查点存取 (由 Coordinator 注入, 可为 nil)
+	promptCache      *PromptCache         // 提示词缓存 (参考 Anthropic Prompt Caching)
+	concurrency      ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态, 可为 nil)
+	activityCallback func()              // 活动回调: Coordinator watchdog 心跳 (可为 nil)
 }
 
 // tryInitDAG 从 taskTracker 检测 DAG 能力
@@ -984,6 +985,9 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 		we.dagTracker, we.factory, we.notify, we.pool, we.chatID,
 	)
 
+	if we.activityCallback != nil {
+		orch.SetActivityCallback(we.activityCallback)
+	}
 	if we.checkpoints != nil {
 		orch.SetCheckpointStore(we.checkpoints)
 	}
@@ -2009,6 +2013,11 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	ctx, endSpan := logging.WithSpan(ctx, "stage."+stage.Name)
 	defer endSpan()
 	logging.Event(ctx, "stage.start", "stage", stage.Name, "role", stage.Role, "team", team.Name)
+
+	// watchdog 心跳: 标记有活动
+	if we.activityCallback != nil {
+		we.activityCallback()
+	}
 
 	// 1. 构建 prompt: 原有模板 + Blackboard 上下文 + Handoff 信息
 	bbContext := ""
@@ -3132,30 +3141,48 @@ func buildPrevResultsSummary(prevResults map[string]string) string {
 	return b.String()
 }
 
+// filterParallel 从 ready 阶段中提取可并行执行的子集。
+//
+// 策略 (修复原有 bug: 之前要求所有 ready 阶段依赖集完全相同才并行,
+// 导致依赖不同但同时就绪的阶段无法并行):
+//  1. 显式标记 Parallel=true 的阶段总是可并行
+//  2. 多个 ready 阶段的依赖已全部满足 (它们才进入 ready 列表),
+//     因此它们之间没有执行顺序约束, 应该可以并行
+//  3. 唯一限制: 并行数由 executor 的 sem 控制
 func filterParallel(stages []StageDef) []StageDef {
 	if len(stages) <= 1 {
 		return stages
 	}
-	// 如果所有 ready stages 具有相同的依赖且标记了 parallel, 可并行
-	var parallel []StageDef
+
+	// 优先: 如果有显式标记 Parallel 的, 全部并行
+	var explicit []StageDef
 	for _, s := range stages {
-		if s.Parallel || len(stages) > 1 {
-			parallel = append(parallel, s)
+		if s.Parallel {
+			explicit = append(explicit, s)
 		}
 	}
-	// 只有多个无依赖或同依赖的才并行
-	if len(parallel) > 1 {
-		deps0 := strings.Join(parallel[0].DependsOn, ",")
-		allSameDeps := true
-		for _, p := range parallel[1:] {
-			if strings.Join(p.DependsOn, ",") != deps0 {
-				allSameDeps = false
-				break
-			}
-		}
-		if allSameDeps {
-			return parallel
+	if len(explicit) > 1 {
+		return explicit
+	}
+
+	// 所有 ready 阶段的依赖已满足 → 按依赖集分组, 同组可并行
+	groups := make(map[string][]StageDef)
+	for _, s := range stages {
+		key := strings.Join(s.DependsOn, ",")
+		groups[key] = append(groups[key], s)
+	}
+
+	// 选最大的同依赖组
+	var best []StageDef
+	for _, g := range groups {
+		if len(g) > len(best) {
+			best = g
 		}
 	}
-	return stages[:1]
+	if len(best) > 1 {
+		return best
+	}
+
+	// 兜底: 所有 ready 阶段依赖已满足, 无执行顺序约束, 全部并行
+	return stages
 }

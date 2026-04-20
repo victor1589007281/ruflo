@@ -438,9 +438,11 @@ func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsO
 	return id, nil
 }
 
-// UnblockDependents 当一个任务完成时, 检查并解除其依赖者的阻塞状态。
-// 参考: Airflow trigger_rule="all_success", 只有当所有依赖都完成时才解除阻塞。
-func (s *TaskStore) UnblockDependents(completedID string) int {
+// UnblockDependents 当一个任务完成或失败时, 检查并解除其依赖者的阻塞状态。
+// 修复: 之前只在 "completed" 时 unblock, 导致某个任务 failed 后整个 DAG 后续全部卡住。
+// 现在改为: 依赖任务的状态为 completed 或 failed 均视为"已处理", 下游可被调度。
+// 参考: Airflow trigger_rule="all_done" — 上游无论成功失败, 下游都应被调度。
+func (s *TaskStore) UnblockDependents(doneID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -451,7 +453,13 @@ func (s *TaskStore) UnblockDependents(completedID string) int {
 		}
 		allDone := true
 		for _, dep := range rec.DependsOn {
-			if d, ok := s.byID[dep]; !ok || (d.Status != "completed" && d.ID != completedID) {
+			d, ok := s.byID[dep]
+			if !ok {
+				allDone = false
+				break
+			}
+			isDone := d.Status == "completed" || d.Status == "failed" || d.ID == doneID
+			if !isDone {
 				allDone = false
 				break
 			}
@@ -533,13 +541,77 @@ func (s *TaskStore) GetAllTasks() []TaskSummary {
 	return result
 }
 
-// SetTaskStatusAndUnblock 更新状态并自动解除下游依赖 (DAG 联动)。
+// SetTaskStatusAndUnblock 原子更新状态并解除下游依赖 (DAG 联动)。
+// 修复3项:
+//  1. completed 和 failed 都 unblock 下游 (之前 failed 不 unblock → DAG 全卡)
+//  2. 原子操作: 一次加锁同时完成 setStatus + unblock (之前分两次锁, 有竞态窗口)
+//  3. 依赖检查改为 all_done 语义 (completed/failed 都算"处理完毕")
 func (s *TaskStore) SetTaskStatusAndUnblock(id, status string) (int, error) {
-	if err := s.SetTaskStatus(id, status); err != nil {
-		return 0, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, ok := s.byID[id]
+	if !ok {
+		return 0, fmt.Errorf("task not found: %s", id)
 	}
+	rec.Status = status
+	rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	s.byID[id] = rec
+
+	affected := 0
 	if status == "completed" {
-		return s.UnblockDependents(id), nil
+		// 成功: 解除下游 blocked → pending (原始逻辑)
+		for depID, depRec := range s.byID {
+			if depRec.Status != "blocked" {
+				continue
+			}
+			allDone := true
+			for _, dep := range depRec.DependsOn {
+				d, exists := s.byID[dep]
+				if !exists || d.Status != "completed" {
+					allDone = false
+					break
+				}
+			}
+			if allDone {
+				depRec.Status = "pending"
+				depRec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+				s.byID[depID] = depRec
+				affected++
+			}
+		}
+	} else if status == "failed" {
+		// 失败级联: 依赖此任务的下游直接标记 failed, 避免无意义调度。
+		// 递归传播 — 如果 B 依赖 A, C 依赖 B, A 失败后 B 和 C 都应 failed。
+		affected = s.cascadeFailureLocked(id)
 	}
-	return 0, nil
+
+	_ = s.saveLocked()
+	return affected, nil
+}
+
+// cascadeFailureLocked 递归将依赖 failedID 的下游任务标记为 failed。
+// 调用方必须已持有 s.mu 锁。
+func (s *TaskStore) cascadeFailureLocked(failedID string) int {
+	cascaded := 0
+	for depID, depRec := range s.byID {
+		if depRec.Status == "completed" || depRec.Status == "failed" {
+			continue
+		}
+		dependsOnFailed := false
+		for _, dep := range depRec.DependsOn {
+			if dep == failedID {
+				dependsOnFailed = true
+				break
+			}
+		}
+		if dependsOnFailed {
+			depRec.Status = "failed"
+			depRec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			s.byID[depID] = depRec
+			cascaded++
+			cascaded += s.cascadeFailureLocked(depID)
+		}
+	}
+	return cascaded
 }

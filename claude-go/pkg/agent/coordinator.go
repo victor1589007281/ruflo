@@ -63,6 +63,10 @@ type Coordinator struct {
 
 	maxRetries    int
 	heartbeatFreq time.Duration
+
+	// watchdog 状态
+	lastActivity   time.Time
+	lastActivityMu sync.Mutex
 }
 
 // CoordinatorConfig 协调器配置。
@@ -90,15 +94,39 @@ func NewCoordinator(pool *AgentPool, taskTracker TaskTracker, notify NotifyFunc,
 		dataDir:       cfg.DataDir,
 		maxRetries:    cfg.MaxRetries,
 		heartbeatFreq: cfg.HeartbeatFreq,
+		lastActivity:  time.Now(),
 	}
 	c.loadCheckpoints()
 	return c
 }
 
+// watchdogStaleThreshold 团队 watchdog: 超过此时间无进展则告警
+const watchdogStaleThreshold = 5 * time.Minute
+
+// watchdogCriticalThreshold 超过此时间无进展则尝试恢复
+const watchdogCriticalThreshold = 15 * time.Minute
+
+// watchdogCheckInterval watchdog 巡检间隔
+const watchdogCheckInterval = 60 * time.Second
+
+// TouchActivity 标记活动 (供 WorkflowExecutor 回调)
+func (c *Coordinator) TouchActivity() {
+	c.lastActivityMu.Lock()
+	c.lastActivity = time.Now()
+	c.lastActivityMu.Unlock()
+}
+
+// LastActivityAge 距离上次活动的时间
+func (c *Coordinator) LastActivityAge() time.Duration {
+	c.lastActivityMu.Lock()
+	defer c.lastActivityMu.Unlock()
+	return time.Since(c.lastActivity)
+}
+
 // RunWithRecovery 带恢复能力的工作流执行。
 // 根据已保存的 checkpoint 跳过已完成阶段, 对失败阶段重试。
-// 改进: adversarial_dev 现在也支持检查点恢复 (设计阶段可跳过)。
-// 参考: Temporal Workflow replay — 确定性重放已完成的活动。
+// 改进: 所有模式均受 watchdog 保护, adversarial_dev 支持检查点恢复。
+// 参考: Temporal Workflow replay + K8s liveness probe 思路。
 func (c *Coordinator) RunWithRecovery(
 	ctx context.Context,
 	wf *WorkflowDef,
@@ -106,26 +134,107 @@ func (c *Coordinator) RunWithRecovery(
 	team *ProductionTeam,
 	executor *WorkflowExecutor,
 ) ([]StageResult, error) {
+	c.TouchActivity()
+
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 	go c.heartbeatLoop(hbCtx, team)
+	go c.teamWatchdog(hbCtx, team)
 
 	switch wf.Mode {
 	case "adversarial":
-		return executor.Execute(ctx, wf, objective, team)
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "adversarial_dev":
-		return executor.Execute(ctx, wf, objective, team)
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "trading_debate":
-		return executor.Execute(ctx, wf, objective, team)
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "creative_media":
-		return executor.Execute(ctx, wf, objective, team)
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "novel_writing":
-		return executor.Execute(ctx, wf, objective, team)
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "swarm_novel":
-		return executor.Execute(ctx, wf, objective, team)
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	default:
 		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 	}
+}
+
+// executeWithWatchdog 带超时保护的工作流执行 (adversarial 等非 pipeline 模式)。
+// 关键改进: 之前 adversarial_dev 直接调 executor.Execute, 无 Coordinator 级恢复;
+// 现在套一层超时 + 通知, 失败后尝试续作。
+func (c *Coordinator) executeWithWatchdog(
+	ctx context.Context,
+	wf *WorkflowDef,
+	objective string,
+	team *ProductionTeam,
+	executor *WorkflowExecutor,
+) ([]StageResult, error) {
+	executor.activityCallback = c.TouchActivity
+
+	results, err := executor.Execute(ctx, wf, objective, team)
+	if err != nil {
+		age := c.LastActivityAge()
+		if age > watchdogStaleThreshold {
+			c.notify(c.chatID, fmt.Sprintf(
+				"⚠️ 工作流 **%s** 执行失败且已 %s 无活动, 检查是否需要手动恢复\n错误: %s",
+				wf.Name, age.Round(time.Second), err.Error()))
+		}
+	}
+	return results, err
+}
+
+// teamWatchdog 团队级 watchdog: 定期检查最后活动时间, 检测卡住并告警。
+// 参考: K8s liveness probe — 探测进程活着但无进展的场景。
+func (c *Coordinator) teamWatchdog(ctx context.Context, team *ProductionTeam) {
+	ticker := time.NewTicker(watchdogCheckInterval)
+	defer ticker.Stop()
+
+	warned := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			age := c.LastActivityAge()
+
+			if age > watchdogCriticalThreshold {
+				remaining := c.countRemainingTasks(team)
+				c.notify(c.chatID, fmt.Sprintf(
+					"🔴 团队 **%s** 已 **%s** 无进展 (%d 个剩余任务), 可能已卡住\n"+
+						"▸ 建议: 运行 `/team status %s` 查看详情, 或 `/team resume %s` 尝试恢复",
+					team.Name, age.Round(time.Second), remaining, team.Name, team.Name))
+				warned = false // 重置以便持续告警
+			} else if age > watchdogStaleThreshold && !warned {
+				c.notify(c.chatID, fmt.Sprintf(
+					"⚠️ 团队 **%s** 已 %s 无新进展, 持续监控中...",
+					team.Name, age.Round(time.Second)))
+				warned = true
+			} else if age < watchdogStaleThreshold {
+				warned = false
+			}
+		}
+	}
+}
+
+// countRemainingTasks 统计团队中未完成的任务数
+func (c *Coordinator) countRemainingTasks(team *ProductionTeam) int {
+	if team == nil {
+		return 0
+	}
+	c.mu.Lock()
+	total := 0
+	completed := 0
+	for _, cp := range c.checkpoints {
+		total++
+		if cp.Status == "completed" {
+			completed++
+		}
+	}
+	c.mu.Unlock()
+	if total == 0 {
+		return 0
+	}
+	return total - completed
 }
 
 
@@ -391,20 +500,37 @@ func (c *Coordinator) checkTeamHealth(team *ProductionTeam) {
 		return
 	}
 	team.mu.Lock()
-	defer team.mu.Unlock()
-
 	runningCount := 0
+	idleCount := 0
 	for _, ag := range team.Agents {
-		if ag.Status == AgentStatusRunning {
+		switch ag.Status {
+		case AgentStatusRunning:
 			runningCount++
+		case AgentStatusIdle:
+			idleCount++
 		}
 	}
+	team.mu.Unlock()
 
 	if c.pool != nil {
 		stats := c.pool.Stats()
-		if stats.ActiveCount > 0 || runningCount > 0 {
-			log.Printf("[Coordinator] 心跳: pool活跃=%d, team运行中=%d",
-				stats.ActiveCount, runningCount)
+		log.Printf("[Coordinator] 心跳: pool活跃=%d, team运行=%d idle=%d, 最后活动=%s前",
+			stats.ActiveCount, runningCount, idleCount, c.LastActivityAge().Round(time.Second))
+	}
+
+	// 所有 agent 都 idle 但团队仍在 running → 可能卡住
+	if runningCount == 0 && idleCount > 0 {
+		c.mu.Lock()
+		hasRemaining := false
+		for _, cp := range c.checkpoints {
+			if cp.Status != "completed" {
+				hasRemaining = true
+				break
+			}
+		}
+		c.mu.Unlock()
+		if hasRemaining {
+			log.Printf("[Coordinator] 警告: 所有 agent idle 但存在未完成任务")
 		}
 	}
 }

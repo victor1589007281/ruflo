@@ -117,8 +117,9 @@ type Orchestrator struct {
 	chatID      string
 	designDoc   string
 	planDoc     string
-	checkpoints CheckpointStore // 检查点 (从 WorkflowExecutor 传入, 可为 nil)
-	flusher     StageFlusher    // 增量刷新回调 (可为 nil)
+	checkpoints      CheckpointStore // 检查点 (从 WorkflowExecutor 传入, 可为 nil)
+	flusher          StageFlusher    // 增量刷新回调 (可为 nil)
+	activityCallback func()          // Coordinator 活动追踪回调
 
 	completedCount int
 	failedCount    int
@@ -167,6 +168,17 @@ func (o *Orchestrator) SetStageFlusher(fn StageFlusher) {
 	o.mu.Lock()
 	o.flusher = fn
 	o.mu.Unlock()
+}
+
+// SetActivityCallback 注入 Coordinator 活动追踪回调, 使 Orchestrator 执行期间能刷新 watchdog 计时器。
+func (o *Orchestrator) SetActivityCallback(fn func()) {
+	o.activityCallback = fn
+}
+
+func (o *Orchestrator) touchActivity() {
+	if o.activityCallback != nil {
+		o.activityCallback()
+	}
 }
 
 // SetCheckpointStore 注入检查点存取 (供每个 task 完成后持久化)。
@@ -631,8 +643,11 @@ func (o *Orchestrator) DAGMaxWidth() int {
 	return o.dagMaxWidth
 }
 
-// orchestratorStallTimeout 编排器停滞超时: 连续无进展超过此时间则中止。
+// orchestratorStallTimeout 编排器停滞超时: 连续无进展超过此时间触发恢复。
 const orchestratorStallTimeout = 10 * time.Minute
+
+// orchestratorMaxStallRecoveries 最大停滞恢复次数, 超过后退出
+const orchestratorMaxStallRecoveries = 2
 
 // Execute 从 V2 TaskStore 的就绪队列循环调度, 直到所有任务完成。
 func (o *Orchestrator) Execute(ctx context.Context, objective string, team *ProductionTeam) ([]StageResult, error) {
@@ -653,13 +668,14 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 
 	lastProgressAt := time.Now()
 	lastCompletedCount := 0
+	stallRecoveries := 0
 
 	for {
 		if ctx.Err() != nil {
 			return allResults, ctx.Err()
 		}
 
-		// 完成检查前置: 所有任务已处理完 → 立即退出, 不受 ReadyTasks 中孤儿任务干扰
+		// 完成检查前置: 所有任务已处理完 → 立即退出
 		o.mu.Lock()
 		done := o.completedCount + o.failedCount >= o.totalCount
 		currentCompleted := o.completedCount + o.failedCount
@@ -668,14 +684,32 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 			break
 		}
 
-		// 停滞检测: 若已完成数有推进则刷新计时
+		// 停滞检测 + 恢复 (参考 Temporal heartbeat timeout + K8s liveness probe)
 		if currentCompleted > lastCompletedCount {
 			lastCompletedCount = currentCompleted
 			lastProgressAt = time.Now()
+			stallRecoveries = 0
 		} else if time.Since(lastProgressAt) > orchestratorStallTimeout {
-			o.notify(o.chatID, fmt.Sprintf("⚠️ 编排器停滞超时 (%s 无进展, %d/%d 完成, %d 失败), 强制退出",
-				orchestratorStallTimeout, o.completedCount, o.totalCount, o.failedCount))
-			break
+			stallRecoveries++
+			if stallRecoveries > orchestratorMaxStallRecoveries {
+				o.notify(o.chatID, fmt.Sprintf(
+					"🔴 编排器停滞超时 (%s 无进展, %d 次恢复均失败, %d/%d 完成, %d 失败), 退出",
+					orchestratorStallTimeout, stallRecoveries-1, o.completedCount, o.totalCount, o.failedCount))
+				break
+			}
+
+			recovered := o.attemptStallRecovery(ctx, objective, team)
+			if recovered > 0 {
+				o.notify(o.chatID, fmt.Sprintf(
+					"♻️ 编排器停滞恢复: 重新调度 %d 个卡住任务 (第 %d 次恢复)",
+					recovered, stallRecoveries))
+				lastProgressAt = time.Now()
+			} else {
+				o.notify(o.chatID, fmt.Sprintf(
+					"⚠️ 编排器停滞 (%s 无进展, 恢复尝试 %d/%d, %d/%d 完成, %d 失败)",
+					orchestratorStallTimeout, stallRecoveries, orchestratorMaxStallRecoveries,
+					o.completedCount, o.totalCount, o.failedCount))
+			}
 		}
 
 		readyV2 := o.dag.ReadyTasks()
@@ -692,19 +726,22 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 
 		if len(myReady) == 0 {
 			select {
-			case <-time.After(2 * time.Second):
+			case <-time.After(500 * time.Millisecond):
 				continue
 			case <-ctx.Done():
 				return allResults, ctx.Err()
 			}
 		}
 
+		// 流式调度: 用 semaphore 限制并发, 任务完成立即触发下一轮就绪检查。
+		// 修复: 之前 wg.Wait() 整批等待 → 同批最慢任务拖住所有后续任务。
+		// 现在: 每个任务完成后发信号, 主循环立即检查新就绪任务。
 		batch := myReady
 		if len(batch) > o.config.MaxParallel {
 			batch = batch[:o.config.MaxParallel]
 		}
 
-		var wg sync.WaitGroup
+		doneCh := make(chan struct{}, len(batch))
 		for _, task := range batch {
 			o.mu.Lock()
 			node := o.nodes[task.ID]
@@ -712,30 +749,141 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 
 			_ = o.dag.SetTaskStatus(task.ID, "in_progress")
 
-			wg.Add(1)
 			go func(n *TaskNode, taskID string) {
-				defer wg.Done()
 				sr := o.executeTaskNode(ctx, n, objective, team)
 				resultsMu.Lock()
 				allResults = append(allResults, sr)
 				resultsMu.Unlock()
+
+				// 增量刷新: 每个任务完成后立即刷新
+				if o.flusher != nil {
+					resultsMu.Lock()
+					snapshot := make([]StageResult, len(allResults))
+					copy(snapshot, allResults)
+					resultsMu.Unlock()
+					o.flusher(snapshot)
+				}
+
+				doneCh <- struct{}{}
 			}(node, task.ID)
 		}
-		wg.Wait()
 
-		// 每批任务完成后增量刷新 team.json, 让 dashboard 实时可见
-		if o.flusher != nil {
-			resultsMu.Lock()
-			snapshot := make([]StageResult, len(allResults))
-			copy(snapshot, allResults)
-			resultsMu.Unlock()
-			o.flusher(snapshot)
+		// 等待本批所有任务完成 (不再阻塞主循环, 因为 unblock 在 goroutine 内发生)
+		for i := 0; i < len(batch); i++ {
+			select {
+			case <-doneCh:
+			case <-ctx.Done():
+				return allResults, ctx.Err()
+			}
 		}
 	}
+
+	// DAG 残留任务清理: 报告被遗弃的任务
+	o.cleanupResidualTasks()
 
 	o.notify(o.chatID, fmt.Sprintf("🏁 编排完成: %d/%d 成功, %d 失败",
 		o.completedCount, o.totalCount, o.failedCount))
 	return allResults, nil
+}
+
+// attemptStallRecovery 尝试从停滞状态恢复。
+// 策略: 找到本编排器的节点中, 未完成也不在就绪队列中的任务 → 重置为 pending。
+func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective string, team *ProductionTeam) int {
+	o.mu.Lock()
+	doneIDs := make(map[string]bool)
+	for id := range o.nodes {
+		if o.checkpoints != nil {
+			if cp := o.checkpoints.GetCheckpoint(id); cp != nil && cp.Status == "completed" {
+				doneIDs[id] = true
+			}
+		}
+	}
+
+	// 收集: in_progress 卡住的 + failed(瞬态) 可恢复的
+	var stuckIDs []string
+	var transientFailedIDs []string
+	for id, node := range o.nodes {
+		if doneIDs[id] {
+			continue
+		}
+		status := ""
+		if tasks := o.dag.ReadyTasks(); len(tasks) > 0 {
+			// ReadyTasks 只返回 pending, 这里需要直接检查
+		}
+		// 通过 node.Error 判断是否瞬态失败
+		if node.Error != "" && isTransientError(node.Error) {
+			transientFailedIDs = append(transientFailedIDs, id)
+		} else if !doneIDs[id] {
+			stuckIDs = append(stuckIDs, id)
+		}
+		_ = status
+	}
+	o.mu.Unlock()
+
+	recovered := 0
+
+	// 恢复瞬态失败的任务: 重置为 pending, 清零重试计数器
+	for _, id := range transientFailedIDs {
+		err := o.dag.SetTaskStatus(id, "pending")
+		if err == nil {
+			recovered++
+			o.mu.Lock()
+			if n, ok := o.nodes[id]; ok {
+				n.Retries = 0 // 瞬态恢复: 重置重试计数, 给予完整重试配额
+				n.Error = "stall recovery: 瞬态错误恢复, 重新调度"
+			}
+			o.failedCount-- // 从 failedCount 中减回
+			o.mu.Unlock()
+		}
+	}
+
+	// 恢复卡住的任务 (in_progress 超时等)
+	for _, id := range stuckIDs {
+		err := o.dag.SetTaskStatus(id, "pending")
+		if err == nil {
+			recovered++
+			o.mu.Lock()
+			if n, ok := o.nodes[id]; ok {
+				n.Retries++
+				n.Error = "stall recovery: 因停滞被重置"
+			}
+			o.mu.Unlock()
+		}
+	}
+	return recovered
+}
+
+// cleanupResidualTasks 编排结束后清理 DAG 中未完成的残留任务。
+func (o *Orchestrator) cleanupResidualTasks() {
+	o.mu.Lock()
+	completed := o.completedCount
+	failed := o.failedCount
+	total := o.totalCount
+	o.mu.Unlock()
+
+	residualCount := total - completed - failed
+	if residualCount <= 0 {
+		return
+	}
+
+	// 通过 ReadyTasks 找到仍可调度的残留任务, 标记为 failed
+	ready := o.dag.ReadyTasks()
+	var residualIDs []string
+	o.mu.Lock()
+	for _, t := range ready {
+		if _, ok := o.nodes[t.ID]; ok {
+			residualIDs = append(residualIDs, t.ID)
+		}
+	}
+	o.mu.Unlock()
+
+	for _, id := range residualIDs {
+		o.dag.SetTaskStatusAndUnblock(id, "failed")
+	}
+
+	if residualCount > 0 {
+		o.notify(o.chatID, fmt.Sprintf("⚠️ 清理 %d 个残留任务 (已标记 %d 个为 failed)", residualCount, len(residualIDs)))
+	}
 }
 
 // executeTaskNode 执行单个任务, 内置 mini 对抗循环:
@@ -746,6 +894,7 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 // 完全复用 adversarial.go 已有基础设施, 不重复实现。
 func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam) StageResult {
 	start := time.Now()
+	o.touchActivity()
 
 	o.notify(o.chatID, fmt.Sprintf("▶️ %s (%s) 执行中...", node.Title, node.Role))
 
@@ -911,6 +1060,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			scoreMsg += fmt.Sprintf(" 对齐=%.0f", score.DesignAlignment)
 		}
 		testLabel := map[bool]string{true: "✅", false: "⚠️"}[node.TestPassed]
+		o.touchActivity()
 		o.notify(o.chatID, fmt.Sprintf("📊 %s 第 %d 轮: %s | micro-test: %s",
 			node.Title, round, scoreMsg, testLabel))
 
@@ -977,6 +1127,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				reasonCN = decision.Reason
 			}
 			o.notify(o.chatID, fmt.Sprintf("🏁 %s 对抗终止: %s (第 %d 轮)", node.Title, reasonCN, round))
+			o.touchActivity()
 			break
 		}
 
@@ -1154,23 +1305,78 @@ func HoldLastOrDefault(last EvalScore) EvalScore {
 	return EvalScore{Pass: true, Correctness: 6, Completeness: 6, Security: 6, CodeQuality: 6}
 }
 
-// handleTaskFailure 失败处理 + Phoenix 重试
+// handleTaskFailure 失败处理 + Phoenix 重试。
+//
+// 关键设计: 区分瞬态错误 (限流/网络) 和永久错误 (验证/代码质量):
+//   - 瞬态: 不级联, 任务回 pending, 等 cooldown 后由主循环重新调度
+//   - 永久: 级联下游, 避免浪费 LLM 调用
 func (o *Orchestrator) handleTaskFailure(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, sr StageResult) StageResult {
+	transient := isTransientError(sr.Error)
+
+	// 瞬态错误: 额外允许更多重试 (限流可能持续数分钟)
+	maxRetries := node.MaxRetries
+	if transient {
+		maxRetries = node.MaxRetries + 3 // 瞬态错误额外 3 次 (共 5 次)
+	}
+
 	node.Retries++
-	if node.Retries <= node.MaxRetries {
-		o.notify(o.chatID, fmt.Sprintf("🔄 %s 重试 %d/%d: %s",
-			node.Title, node.Retries, node.MaxRetries, sr.Error))
+	if node.Retries <= maxRetries {
+		label := "🔄"
+		if transient {
+			label = "⏳"
+		}
+		o.notify(o.chatID, fmt.Sprintf("%s %s 重试 %d/%d: %s",
+			label, node.Title, node.Retries, maxRetries, sr.Error))
 		node.Error = sr.Error
-		_ = o.dag.SetTaskStatus(node.V2TaskID, "pending") // 重置为 pending 允许重调度
+		_ = o.dag.SetTaskStatus(node.V2TaskID, "pending")
 		return o.executeTaskNode(ctx, node, objective, team)
 	}
 
-	o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "failed")
-	o.mu.Lock()
-	o.failedCount++
-	o.mu.Unlock()
-	o.notify(o.chatID, fmt.Sprintf("❌ %s 最终失败 (重试 %d 次)", node.Title, node.MaxRetries))
+	// 重试耗尽
+	if transient {
+		// 瞬态失败: 不级联, 仅标记自身 failed, 下游保持 blocked。
+		// stall recovery 或 watchdog 可以在限流解除后重置此任务。
+		_ = o.dag.SetTaskStatus(node.V2TaskID, "failed")
+		o.mu.Lock()
+		o.failedCount++
+		o.mu.Unlock()
+		o.notify(o.chatID, fmt.Sprintf("⏳ %s 因瞬态错误暂停 (重试 %d 次, 限流/网络), 下游保留等待恢复",
+			node.Title, maxRetries))
+	} else {
+		// 永久失败: 级联下游, 避免浪费 LLM 调用
+		cascaded, _ := o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "failed")
+		o.mu.Lock()
+		o.failedCount += 1 + cascaded
+		o.mu.Unlock()
+		if cascaded > 0 {
+			o.notify(o.chatID, fmt.Sprintf("❌ %s 最终失败 (重试 %d 次), 级联跳过 %d 个下游任务",
+				node.Title, maxRetries, cascaded))
+		} else {
+			o.notify(o.chatID, fmt.Sprintf("❌ %s 最终失败 (重试 %d 次)", node.Title, maxRetries))
+		}
+	}
 	return sr
+}
+
+// isTransientError 判断错误是否为瞬态 (限流/网络/超时), 这类错误值得等待后重试。
+func isTransientError(errMsg string) bool {
+	if errMsg == "" {
+		return false
+	}
+	lower := strings.ToLower(errMsg)
+	transientPatterns := []string{
+		"429", "rate", "throttl", "限流", "频率",
+		"timeout", "deadline exceeded", "超时",
+		"connection refused", "connection reset", "网络错误",
+		"503", "529", "overloaded", "过载",
+		"temporary", "unavailable",
+	}
+	for _, p := range transientPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // runMicroTest 轻量级验证 (参考 TDAD 2026)
