@@ -211,6 +211,10 @@ type ProductionTeamManager struct {
 	memWriter    MemoryWriter        // 记忆写入 (团队完成后写入高权重记忆)
 	metrics      *metrics.Collector  // 持续观测指标采集器
 	concurrency  ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
+
+	// starting 防止并发 resume/run 同一个团队 (race condition 保护)
+	startingMu sync.Mutex
+	starting   map[string]bool // key=team name, value=是否正在启动中
 }
 
 // TeamManagerConfig 团队管理器配置。
@@ -262,9 +266,31 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		roles:       cfg.Roles,
 		metrics:     metrics.NewCollector(stateDir),
 		concurrency: cfg.Concurrency,
+		starting:    make(map[string]bool),
 	}
 	ptm.loadPersistedTeams()
 	return ptm
+}
+
+// tryStartTeam 原子性检查: 团队是否已在启动中, 若否则标记为启动中。
+// 返回 true 表示本次请求获得了启动权, false 表示已有其他请求在启动 (应跳过)。
+// 修复: 两个并发 resume 请求同时看到 stopped 状态, 都继续执行导致重复工作流。
+// 解决: manager 级的 starting 标志, 保证同一团队同一时刻只有一个启动流程。
+func (ptm *ProductionTeamManager) tryStartTeam(name string) bool {
+	ptm.startingMu.Lock()
+	defer ptm.startingMu.Unlock()
+	if ptm.starting[name] {
+		return false // 已有其他请求在启动中
+	}
+	ptm.starting[name] = true
+	return true
+}
+
+// clearStarting 清除团队的启动标记 (工作流 goroutine 结束后调用)
+func (ptm *ProductionTeamManager) clearStarting(name string) {
+	ptm.startingMu.Lock()
+	delete(ptm.starting, name)
+	ptm.startingMu.Unlock()
 }
 
 // ProductionTeam 生产级团队
@@ -409,6 +435,7 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 
 // RunTeam 启动团队执行。
 // 如果团队之前因 LLM 限流/错误而失败, 重新激活时会从上次的检查点恢复 (跳过已完成的阶段)。
+// 修复: 使用 starting 标志防止并发 run 导致的双重工作流执行。
 func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 	ptm.mu.RLock()
 	team, ok := ptm.teams[name]
@@ -425,6 +452,22 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 	}
 
 	isResume := team.Status == TeamStatusFailed && team.Objective == objective
+	team.mu.Unlock()
+
+	// 原子性检查: 是否已有其他请求在启动同一个团队
+	if !ptm.tryStartTeam(name) {
+		return fmt.Errorf("团队 %q 正在启动中，请稍后再试", name)
+	}
+
+	// 重新锁定 team.mu 修改状态
+	team.mu.Lock()
+	// 双重检查
+	if team.Status == TeamStatusRunning {
+		team.mu.Unlock()
+		ptm.clearStarting(name)
+		return fmt.Errorf("团队 %q 正在执行中", name)
+	}
+
 	team.Objective = objective
 	team.Status = TeamStatusRunning
 	team.StartedAt = time.Now()
@@ -448,6 +491,7 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 	}
 
 	go func() {
+		defer ptm.clearStarting(name)
 		defer func() { close(team.doneCh) }()
 		ptm.executeWorkflow(ctx, team, isResume)
 	}()
@@ -856,6 +900,7 @@ func (ptm *ProductionTeamManager) StopTeam(name string) error {
 
 // ResumeTeam 恢复已停止/失败的团队，从检查点继续执行。
 // 与 RunTeam 不同，ResumeTeam 不需要新目标，直接使用团队现有目标。
+// 修复: 使用 starting 标志防止并发 resume 导致的双重工作流执行。
 func (ptm *ProductionTeamManager) ResumeTeam(name string) error {
 	ptm.mu.RLock()
 	team, ok := ptm.teams[name]
@@ -868,7 +913,8 @@ func (ptm *ProductionTeamManager) ResumeTeam(name string) error {
 	team.mu.Lock()
 	if team.Status == TeamStatusRunning {
 		team.mu.Unlock()
-		return fmt.Errorf("团队 %q 正在执行中", name)
+		// 幂等: 团队已在运行，视为恢复成功
+		return nil
 	}
 
 	if team.Status == TeamStatusCompleted {
@@ -876,9 +922,37 @@ func (ptm *ProductionTeamManager) ResumeTeam(name string) error {
 		return fmt.Errorf("团队 %q 已完成，无需恢复", name)
 	}
 
+	// 先释放 team.mu, 再获取 starting 锁 (避免锁序问题导致死锁)
+	team.mu.Unlock()
+
+	// 原子性检查: 是否已有其他请求在启动同一个团队
+	if !ptm.tryStartTeam(name) {
+		// 另一个并发请求已经在启动中, 视为幂等成功
+		return nil
+	}
+
+	// 重新锁定 team.mu 修改状态
+	team.mu.Lock()
+	// 双重检查: 在获得 starting 锁后再次确认状态
+	if team.Status == TeamStatusRunning {
+		team.mu.Unlock()
+		ptm.clearStarting(name)
+		return nil
+	}
+	if team.Status == TeamStatusCompleted {
+		team.mu.Unlock()
+		ptm.clearStarting(name)
+		return fmt.Errorf("团队 %q 已完成，无需恢复", name)
+	}
+
 	objective := team.Objective
 	team.Status = TeamStatusRunning
-	team.StartedAt = time.Now()
+	// 保留原始 StartedAt，避免恢复后看起来像重新开始
+	if team.StartedAt.IsZero() {
+		team.StartedAt = time.Now()
+	}
+	// 清除 stop 设置的 FinishedAt，避免产生负 duration
+	team.FinishedAt = time.Time{}
 	team.Error = ""
 	ctx, cancel := context.WithCancel(context.Background())
 	team.cancel = cancel
@@ -892,6 +966,7 @@ func (ptm *ProductionTeamManager) ResumeTeam(name string) error {
 	ptm.notify(team.ChatID, fmt.Sprintf("♻️ 团队 **%s** 从检查点恢复执行\n目标: %s\n工作流: %s", name, objective, team.Workflow))
 
 	go func() {
+		defer ptm.clearStarting(name)
 		defer func() { close(team.doneCh) }()
 		ptm.executeWorkflow(ctx, team, true)
 	}()
