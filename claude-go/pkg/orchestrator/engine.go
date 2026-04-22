@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -194,7 +195,11 @@ func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 			BP:         e.bp,
 			RunningIDs: e.runningIDs(g),
 		}
-		batch := e.scheduler.Schedule(sCtx, maxPar-e.runningCount(g))
+		avail := maxPar - e.runningCount(g)
+		batch := e.scheduler.Schedule(sCtx, avail)
+		if len(batch) > 0 {
+			log.Printf("[engine] 调度: avail=%d, batch=%d", avail, len(batch))
+		}
 
 		for _, t := range batch {
 			t.mu.Lock()
@@ -264,22 +269,35 @@ func (e *Engine) executeTask(ctx context.Context, g *Graph, t *Task, doneCh chan
 	taskCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	log.Printf("[engine] task %s: 获取背压许可...", t.ID)
+
 	// 获取背压许可 (L1: RPM + L2: 并发)
 	if err := e.bp.AcquireAll(taskCtx); err != nil {
+		log.Printf("[engine] task %s: 背压获取失败: %v", t.ID, err)
 		doneCh <- taskDone{taskID: t.ID, err: err}
 		return
 	}
 
+	log.Printf("[engine] task %s: 背压获取成功, 查找 runner=%s", t.ID, t.Runner)
+
 	runner, err := e.runners.Get(t.Runner)
 	if err != nil {
+		log.Printf("[engine] task %s: runner 不存在: %v", t.ID, err)
 		e.bp.ReleaseConc(false)
 		doneCh <- taskDone{taskID: t.ID, err: err}
 		return
 	}
 
+	log.Printf("[engine] task %s: 开始执行 runner=%s", t.ID, runner.Name())
 	output, runErr := runner.Execute(taskCtx, t, e.blackboard)
 	success := runErr == nil
 	e.bp.ReleaseConc(success)
+
+	if runErr != nil {
+		log.Printf("[engine] task %s: 执行失败: %v", t.ID, runErr)
+	} else {
+		log.Printf("[engine] task %s: 执行成功", t.ID)
+	}
 
 	doneCh <- taskDone{taskID: t.ID, output: output, err: runErr}
 }

@@ -146,6 +146,8 @@ func (c *Coordinator) RunWithRecovery(
 		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "adversarial_dev":
 		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
+	case "orchestrated":
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "trading_debate":
 		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "creative_media":

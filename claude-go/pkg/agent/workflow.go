@@ -819,6 +819,8 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		return we.executeNovelWriting(ctx, wf, objective, team)
 	case "swarm_novel":
 		return we.executeSwarmNovel(ctx, wf, objective, team)
+	case "orchestrated":
+		return we.executeOrchestrated(ctx, wf, objective, team)
 	case "app_composite":
 		return we.executeAppComposite(ctx, wf, objective, team)
 	case "game_composite":

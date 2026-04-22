@@ -16,7 +16,7 @@ func hiringWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "hiring",
 		Description: "招聘团队: JD分析→差距分析→简历优化→STAR故事→模拟面试→评估报告",
-		Mode:        "pipeline",
+		Mode:        "orchestrated",
 		Stages: []StageDef{
 			{
 				Name: "parse-jd", Role: "jd-analyst",

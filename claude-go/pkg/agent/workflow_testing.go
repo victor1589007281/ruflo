@@ -16,7 +16,7 @@ func testingWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "testing",
 		Description: "测试团队: 代码分析→风险建模→测试生成(单元/集成/属性/混沌)→执行→变异→报告",
-		Mode:        "pipeline",
+		Mode:        "orchestrated",
 		Stages: []StageDef{
 			{
 				Name: "code-analysis", Role: "code-analyst",

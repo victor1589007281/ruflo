@@ -17,7 +17,7 @@ func parentingWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "parenting",
 		Description: "育儿教育顾问: 信息采集→安全筛查→领域路由→多维专家→行动计划→报告",
-		Mode:        "pipeline",
+		Mode:        "orchestrated",
 		Stages: []StageDef{
 			{
 				Name: "intake", Role: "intake-counselor",

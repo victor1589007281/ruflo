@@ -17,7 +17,7 @@ func codeReviewWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "code-review",
 		Description: "代码审查团队: 静态分析→多维专家审查→对抗质疑→测试验证→报告",
-		Mode:        "pipeline",
+		Mode:        "orchestrated",
 		Stages: []StageDef{
 			{
 				Name: "ingest", Role: "ingester",
