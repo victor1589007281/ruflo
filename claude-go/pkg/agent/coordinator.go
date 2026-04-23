@@ -501,7 +501,7 @@ func (c *Coordinator) checkTeamHealth(team *ProductionTeam) {
 	if team == nil {
 		return
 	}
-	team.mu.Lock()
+	// 统计 running/idle agent (pipeline 模式)
 	runningCount := 0
 	idleCount := 0
 	for _, ag := range team.Agents {
@@ -512,16 +512,22 @@ func (c *Coordinator) checkTeamHealth(team *ProductionTeam) {
 			idleCount++
 		}
 	}
-	team.mu.Unlock()
+	// orchestrated 模式下 engine 使用独立 goroutine, team.Agents 均为 idle。
+	// 通过 team.Stages 中已完成阶段数判断引擎是否活跃: 已完成阶段 < 总阶段数 = 引擎运行中
+	engineRunning := 0
+	if len(team.Agents) == 0 && len(team.Stages) > 0 {
+		engineRunning = 1
+	}
 
 	if c.pool != nil {
 		stats := c.pool.Stats()
-		log.Printf("[Coordinator] 心跳: pool活跃=%d, team运行=%d idle=%d, 最后活动=%s前",
-			stats.ActiveCount, runningCount, idleCount, c.LastActivityAge().Round(time.Second))
+		log.Printf("[Coordinator] 心跳: pool活跃=%d, team运行=%d idle=%d, 引擎=%d, 最后活动=%s前",
+			stats.ActiveCount, runningCount, idleCount, engineRunning, c.LastActivityAge().Round(time.Second))
 	}
 
 	// 所有 agent 都 idle 但团队仍在 running → 可能卡住
-	if runningCount == 0 && idleCount > 0 {
+	// orchestrated 模式下 engineRunning=1, 跳过此检查 (引擎用独立 goroutine)
+	if engineRunning == 0 && runningCount == 0 && idleCount > 0 {
 		c.mu.Lock()
 		hasRemaining := false
 		for _, cp := range c.checkpoints {

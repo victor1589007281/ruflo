@@ -60,7 +60,7 @@ func (we *WorkflowExecutor) executeOrchestrated(
 
 	// 1. 构建 orchestrator 引擎
 	cfg := orchestrator.DefaultEngineConfig()
-	cfg.MaxParallel = 2
+	cfg.MaxParallel = 4 // 匹配 LLM RunnerPool 上限, 让 4 路专家阶段真正并行
 	cfg.DefaultTimeout = 5 * time.Minute
 	cfg.StallTimeout = 8 * time.Minute
 	cfg.RPM = 120 // 由 api.Client 自身处理限流, 引擎不做额外限速
@@ -94,12 +94,14 @@ func (we *WorkflowExecutor) executeOrchestrated(
 	metricsHook := orchestrator.NewMetricsHook(nil)
 
 	// 注册 Coordinator 活动回调 Hook, 防止停滞检测误报
+	// 同时注册阶段实时刷新 Hook, 让外部监控能看到中间进度
 	var activityHook orchestrator.LifecycleHook
+	stageFlusher := &stageFlushHook{team: team, stages: &stageMapping}
 	if we.activityCallback != nil {
 		activityHook = &callbackHook{fn: we.activityCallback}
-		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, activityHook))
+		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, activityHook, stageFlusher))
 	} else {
-		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook))
+		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, stageFlusher))
 	}
 
 	// 6. 设置 Blackboard
@@ -192,11 +194,14 @@ func (we *WorkflowExecutor) buildGraph(
 		// 构建 prompt
 		systemPrompt := stage.Prompt
 
+		// 汇总类阶段需要更长的超时 (需合并多个上游输出)
+		timeout := taskTimeout(stage)
+
 		t := &orchestrator.Task{
 			ID:           taskID,
 			Name:         stage.Name,
 			Priority:     5,
-			Timeout:      3 * time.Minute,
+			Timeout:      timeout,
 			MaxRetries:   1,
 			MaxTransient: 2,
 			Runner:       runnerName,
@@ -361,6 +366,26 @@ func isExpandableStage(stage StageDef) bool {
 		strings.Contains(lower, "risk-model")
 }
 
+// taskTimeout 根据阶段类型分配差异化超时。
+// 汇总/报告类阶段需要合并多个上游输出, 耗时更长。
+func taskTimeout(stage StageDef) time.Duration {
+	lower := strings.ToLower(stage.Name + " " + stage.Role)
+	// 汇总报告类: 需要整合多个上游阶段输出
+	if strings.Contains(lower, "report") ||
+		strings.Contains(lower, "summary") ||
+		strings.Contains(lower, "final") {
+		return 5 * time.Minute
+	}
+	// 计划类阶段: 需要综合多位专家建议
+	if strings.Contains(lower, "plan") ||
+		strings.Contains(lower, "strategy") ||
+		strings.Contains(lower, "synthesize") {
+		return 4 * time.Minute
+	}
+	// 默认: 独立专家阶段
+	return 3 * time.Minute
+}
+
 // callbackHook 将 Coordinator 活动回调包装为 LifecycleHook。
 // 每当任务完成时调用 callback, 重置 Coordinator 的停滞检测计时器。
 type callbackHook struct {
@@ -370,6 +395,36 @@ type callbackHook struct {
 
 func (h *callbackHook) OnTaskStart(t *orchestrator.Task)  { h.fn() }
 func (h *callbackHook) OnTaskComplete(t *orchestrator.Task, output any) { h.fn() }
+
+// stageFlushHook 在每个任务完成时实时更新 team.Stages, 让外部监控能看到中间进度。
+type stageFlushHook struct {
+	orchestrator.NoopHook
+	team   *ProductionTeam
+	stages *map[string]stageInfo
+}
+
+func (h *stageFlushHook) OnTaskComplete(t *orchestrator.Task, output any) {
+	info, ok := (*h.stages)[t.ID]
+	if !ok {
+		return
+	}
+	sr := StageResult{
+		Name:   info.name,
+		Role:   info.role,
+		Status: TaskCompleted,
+		Output: fmt.Sprintf("%v", output),
+	}
+	h.team.mu.Lock()
+	defer h.team.mu.Unlock()
+	// 追加或更新已有阶段
+	for i, existing := range h.team.Stages {
+		if existing.Name == sr.Name {
+			h.team.Stages[i] = sr
+			return
+		}
+	}
+	h.team.Stages = append(h.team.Stages, sr)
+}
 
 // orchLLMAdapter 桥接 pkg/agent.LLMClient → pkg/orchestrator.LLMClient。
 // 两者接口签名完全一致, 但属于不同包, 需要适配器。
