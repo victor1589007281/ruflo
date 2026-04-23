@@ -317,6 +317,10 @@ type ProductionTeam struct {
 	mgr        *ProductionTeamManager
 	dataDir    string
 	doneCh     chan struct{} // 关闭信号: 工作流执行完毕时 close
+
+	// EngineRunning 标记 orchestrated 引擎是否正在运行 (供 Coordinator 心跳检测使用)。
+	// 在 executeOrchestrated() 开始时设为 true, 结束时设为 false。
+	EngineRunning bool `json:"-"`
 }
 
 // metrics 返回 team 所属 manager 的指标采集器 (可能为 nil)。

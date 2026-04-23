@@ -28,6 +28,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/logging"
@@ -88,9 +89,14 @@ func (we *WorkflowExecutor) executeOrchestrated(
 	// 4. 将 WorkflowDef 转换为 Graph
 	g, stageMapping := we.buildGraph(wf, objective, team, advRunner != nil)
 
-	// 5. 可选: 注册 LLMExpander (DAG 裂变)
+	// 5. 注册生命周期 Hooks
+	// LLMExpander: 已注册但默认休眠。
+	// 只有当 stage 设置了 `Config["expandable"] = true` 时才会触发裂变。
+	// 当前所有 orchestrated 工作流的阶段都通过 DependsOn 精确控制, 不需要运行时动态裂变。
+	// 需要裂变时, 在 StageDef 的 prompt 中设置 expandable 配置即可启用。
 	expander := orchestrator.NewLLMExpander(llmAdapter, "llm-stage", 8)
 	expanderHook := orchestrator.NewExpanderHook(expander, g)
+
 	metricsHook := orchestrator.NewMetricsHook(nil)
 
 	// 注册 Coordinator 活动回调 Hook, 防止停滞检测误报
@@ -98,7 +104,7 @@ func (we *WorkflowExecutor) executeOrchestrated(
 	var activityHook orchestrator.LifecycleHook
 	stageFlusher := &stageFlushHook{team: team, stages: &stageMapping}
 	if we.activityCallback != nil {
-		activityHook = &callbackHook{fn: we.activityCallback}
+		activityHook = &callbackHook{fn: we.activityCallback, stopCh: make(chan struct{})}
 		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, activityHook, stageFlusher))
 	} else {
 		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, stageFlusher))
@@ -125,13 +131,19 @@ func (we *WorkflowExecutor) executeOrchestrated(
 	we.notify(we.chatID, fmt.Sprintf("⚡ **Orchestrated 模式** — 引擎驱动 DAG 调度 (%d 个任务, %d 就绪, 并发≤%d)",
 		g.TaskCount(), len(readyTasks), cfg.MaxParallel))
 
-	// 8. 执行 (Build() 已在上面调用, Engine.Run 会再次调用但幂等)
+	// 8. 标记引擎正在运行 (供 Coordinator 心跳检测使用)
+	team.mu.Lock()
+	team.EngineRunning = true
+	team.mu.Unlock()
+	defer func() { team.mu.Lock(); team.EngineRunning = false; team.mu.Unlock() }()
+
+	// 9. 执行 (Build() 已在上面调用, Engine.Run 会再次调用但幂等)
 	result, err := eng.Run(ctx, g)
 	if err != nil && result == nil {
 		return nil, fmt.Errorf("引擎执行失败: %w", err)
 	}
 
-	// 9. 将引擎结果转换回 StageResult
+	// 10. 将引擎结果转换回 StageResult
 	return we.convertResults(result, stageMapping, team), err
 }
 
@@ -211,7 +223,6 @@ func (we *WorkflowExecutor) buildGraph(
 				"objective":     objective,
 				"stage_name":    stage.Name,
 				"role":          stage.Role,
-				"expandable":    isExpandableStage(stage),
 			},
 			Labels: map[string]string{
 				"workflow": wf.Name,
@@ -225,6 +236,11 @@ func (we *WorkflowExecutor) buildGraph(
 			depID := fmt.Sprintf("%s/%s", team.Name, dep)
 			t.DependsOn = append(t.DependsOn, depID)
 		}
+
+		// 调试: 记录 prompt 大小, 方便验证上游输出是否正确传递到下游任务
+		promptLen := len(systemPrompt)
+		logging.Event(context.Background(), "orchestrated.task_prompt",
+			"task", taskID, "prompt_chars", promptLen, "deps", len(stage.DependsOn))
 
 		_ = g.AddTask(t)
 	}
@@ -387,14 +403,44 @@ func taskTimeout(stage StageDef) time.Duration {
 }
 
 // callbackHook 将 Coordinator 活动回调包装为 LifecycleHook。
-// 每当任务完成时调用 callback, 重置 Coordinator 的停滞检测计时器。
+// 每当任务开始/完成时调用 callback, 重置 Coordinator 的停滞检测计时器。
+// 此外, 在任务执行期间每 15 秒周期性调用 TouchActivity,
+// 防止长任务 (如 LLM 生成) 导致 watchdog 误报 "无进展"。
 type callbackHook struct {
 	orchestrator.NoopHook
-	fn func()
+	fn       func()
+	stopCh   chan struct{} // 关闭信号
+	stopped  sync.Once
 }
 
-func (h *callbackHook) OnTaskStart(t *orchestrator.Task)  { h.fn() }
-func (h *callbackHook) OnTaskComplete(t *orchestrator.Task, output any) { h.fn() }
+func (h *callbackHook) startHeartbeat() {
+	ticker := time.NewTicker(15 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				h.fn()
+			case <-h.stopCh:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+func (h *callbackHook) stopHeartbeat() {
+	h.stopped.Do(func() { close(h.stopCh) })
+}
+
+func (h *callbackHook) OnTaskStart(t *orchestrator.Task) {
+	h.fn()
+	h.startHeartbeat()
+}
+
+func (h *callbackHook) OnTaskComplete(t *orchestrator.Task, output any) {
+	h.stopHeartbeat()
+	h.fn()
+}
 
 // stageFlushHook 在每个任务完成时实时更新 team.Stages, 让外部监控能看到中间进度。
 type stageFlushHook struct {

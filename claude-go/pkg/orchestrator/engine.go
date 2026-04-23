@@ -78,6 +78,7 @@ type Engine struct {
 	stallRecovers int       // 已执行的停滞恢复次数
 	startTime     time.Time
 	execID        string
+	running       bool      // 引擎是否正在执行 (供外部监控查询)
 }
 
 // NewEngine 创建引擎实例。
@@ -121,6 +122,13 @@ func (e *Engine) Runners() *RunnerRegistry { return e.runners }
 
 // BB 返回黑板实例, 用于外部读取共享状态。
 func (e *Engine) BB() *Blackboard { return e.blackboard }
+
+// IsRunning 返回引擎是否正在执行工作流 (供外部监控/心跳检测使用)。
+func (e *Engine) IsRunning() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.running
+}
 
 // ExecutionResult 是引擎运行的最终结果。
 type ExecutionResult struct {
@@ -210,6 +218,10 @@ func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 	e.suspended = 0
 	e.totalRetries = 0
 	e.stallRecovers = 0
+	e.mu.Lock()
+	e.running = true
+	e.mu.Unlock()
+	defer func() { e.mu.Lock(); e.running = false; e.mu.Unlock() }()
 
 	// 自动适配并发度: 不超过 DAG 最大宽度
 	maxPar := e.config.MaxParallel
@@ -324,16 +336,12 @@ func (e *Engine) executeTask(ctx context.Context, g *Graph, t *Task, doneCh chan
 	taskCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	log.Printf("[engine] task %s: 获取背压许可...", t.ID)
-
 	// 获取背压许可 (L1: RPM + L2: 并发)
 	if err := e.bp.AcquireAll(taskCtx); err != nil {
 		log.Printf("[engine] task %s: 背压获取失败: %v", t.ID, err)
 		doneCh <- taskDone{taskID: t.ID, err: err}
 		return
 	}
-
-	log.Printf("[engine] task %s: 背压获取成功, 查找 runner=%s", t.ID, t.Runner)
 
 	runner, err := e.runners.Get(t.Runner)
 	if err != nil {

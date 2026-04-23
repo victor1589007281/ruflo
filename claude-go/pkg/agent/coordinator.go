@@ -513,9 +513,12 @@ func (c *Coordinator) checkTeamHealth(team *ProductionTeam) {
 		}
 	}
 	// orchestrated 模式下 engine 使用独立 goroutine, team.Agents 均为 idle。
-	// 通过 team.Stages 中已完成阶段数判断引擎是否活跃: 已完成阶段 < 总阶段数 = 引擎运行中
+	// 通过 team.EngineRunning 显式标记判断引擎是否活跃 (而非依赖 team.Stages 启发式)。
 	engineRunning := 0
-	if len(team.Agents) == 0 && len(team.Stages) > 0 {
+	team.mu.Lock()
+	isEngineRunning := team.EngineRunning
+	team.mu.Unlock()
+	if isEngineRunning {
 		engineRunning = 1
 	}
 

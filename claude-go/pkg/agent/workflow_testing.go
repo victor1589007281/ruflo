@@ -195,8 +195,37 @@ func testingWorkflow() *WorkflowDef {
 - 失败测试的根因分析`,
 			},
 			{
-				Name: "mutation-analysis", Role: "mutation-analyst",
+				Name: "compile-check", Role: "compile-validator",
 				DependsOn: []string{"run-tests"},
+				Prompt: `你是**编译验证专家**。
+
+测试任务: {objective}
+
+测试执行结果:
+{prev_result}
+
+## 验证任务
+1. **语法检查**: 逐行检查生成的测试代码, 识别语法错误
+   - 变量名不一致 (如 range ttl vs range ttls)
+   - 括号/引号不匹配
+   - 缺失的逗号/分号
+2. **依赖检查**: 确认所有 import 都是标准库或已声明的依赖
+   - 使用不存在的包/函数 (如 rand.String 在标准库中不存在)
+   - 引用未定义的类型/方法
+3. **类型检查**: 确认类型匹配
+   - 接口实现完整性
+   - 函数签名正确性
+4. **编译可行性**: 判断代码是否可通过 go build / go test
+
+## 输出
+- ✅ PASS: 所有测试代码可编译 (无问题)
+- ❌ FAIL: 列出所有编译错误, 并给出修正后的代码
+
+**重要: 如果发现问题, 必须输出完整修正后的 _test.go 文件代码。**`,
+			},
+			{
+				Name: "mutation-analysis", Role: "mutation-analyst",
+				DependsOn: []string{"compile-check"},
 				Prompt: `你是**变异测试分析专家** (参考 PIT/go-mutesting)。
 
 测试任务: {objective}
