@@ -209,14 +209,56 @@ func (g *Graph) AddEdge(e Edge) error {
 
 // Build 预计算邻接表并验证 DAG 合法性。
 //
-// 算法: Kahn 拓扑排序
-//  1. 统计每个节点的入度 (仅计算 EdgeDependency 类型)
-//  2. 将入度为 0 的节点入队
-//  3. 不断出队, 将其下游节点入度减 1, 入度为 0 时入队
-//  4. 如果访问节点数 < 总节点数, 则图中存在环
-//  5. 同时初始化任务状态: 无依赖 → Ready, 有依赖 → Blocked
+// 算法: Kahn 拓扑排序 (BFS 版本)
 //
-// 时间复杂度: O(V + E), V=任务数, E=边数
+// 逐步推演示例 (parenting 工作流简化版):
+//
+//	图结构:
+//	  intake → safety-screen → academic-tutor
+//	                           → psychology-coach
+//	                           → parenting-advisor
+//	                           → development-assessor
+//	                                    ↓
+//	                             action-plan → consultation-report
+//
+//	Step 1: 统计入度
+//	  intake: 0        ← 无依赖
+//	  safety-screen: 1  ← [intake]
+//	  academic-tutor: 1 ← [safety-screen]
+//	  psychology-coach: 1
+//	  parenting-advisor: 1
+//	  development-assessor: 1
+//	  action-plan: 4    ← [academic-tutor, psychology-coach, parenting-advisor, development-assessor]
+//	  consultation-report: 1 ← [action-plan]
+//
+//	Step 2: 入度为 0 的入队 → queue = [intake]
+//
+//	Step 3: 处理队列
+//	  出队 intake, visited=1
+//	  intake 的下游: safety-screen, inDeg[safety-screen]-- → 0 → 入队
+//	  出队 safety-screen, visited=2
+//	  下游 4 个各减 1, 都不为 0 (都是 0? 等等, safety-screen 的下游入度都是 1, 减到 0)
+//	  → queue = [academic-tutor, psychology-coach, parenting-advisor, development-assessor]
+//	  依次出队 4 个, visited=6
+//	  每个的下游都是 action-plan, action-plan 入度从 4 减到 0 → 入队
+//	  出队 action-plan, visited=7, consultation-report 入度从 1 减到 0 → 入队
+//	  出队 consultation-report, visited=8
+//
+//	Step 4: visited(8) == TaskCount(8) → 无环路 ✓
+//
+//	Step 5: 初始化状态
+//	  intake → Ready (无上游)
+//	  其余 → Blocked (有上游依赖)
+//	  同时填充每个 Task 的 DependsOn 字段
+//
+// 环路检测: 如果 visited != total, 说明有环
+//   例: A→B→A, queue=[A], 出队A→B入度减到0入队, 出队B→A但A已被处理, 队列空
+//   visited=2, 但总任务=2... 等等, 这种情况需要仔细处理:
+//   实际上 A 被处理后 B 入队, B 处理后 A 的入度再减, 但 A 已经 visited 了
+//   问题在于有环时环内节点的入度永远不会减到 0 (除了第一个)
+//   所以 visited 必然 < total
+//
+// 时间复杂度: O(V + E), 每个节点和边各访问常数次
 func (g *Graph) Build() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -310,16 +352,34 @@ func (g *Graph) ReadyTasks() []*Task {
 
 // CriticalPath 使用 DAG 最长路径算法计算关键路径。
 //
-// 算法: 基于拓扑序的动态规划
-//  1. Kahn 拓扑排序得到处理顺序
-//  2. 对每个节点做松弛 (relaxation): dist[next] = max(dist[next], dist[current]+1)
-//  3. 记录前驱 pred[next] = current (当路径更长时)
-//  4. 找到 dist 最大的终点, 沿 pred 回溯得到完整路径
+// 算法: 基于拓扑序的动态规划 (最长路径 = 关键路径)
 //
-// 用途: 调度器的 CriticalPathScore 插件用此结果给关键路径上的任务加分,
-// 使其优先调度, 缩短整体完成时间。
+// 核心思想:
+//   在 DAG 上, 最长路径 (关键路径) 决定了整体完成时间的下限。
+//   因为无论怎么并行, 关键路径上的任务必须依次执行。
 //
-// 时间复杂度: O(V + E)
+// 逐步推演示例:
+//
+//	图: A→B→C→D (链) 和 A→E→D (短路)
+//
+//	Step 1: Kahn 拓扑序: A, B, E, C, D
+//
+//	Step 2: 松弛操作 (relaxation)
+//	  dist[A] = 1 (入度为 0, 初始化为 1)
+//	  处理 A: 下游 B → dist[B] = max(0, 1+1) = 2, pred[B] = A
+//	          下游 E → dist[E] = max(0, 1+1) = 2, pred[E] = A
+//	  处理 B: 下游 C → dist[C] = max(0, 2+1) = 3, pred[C] = B
+//	  处理 E: 下游 D → dist[D] = max(0, 2+1) = 3, pred[D] = E
+//	  处理 C: 下游 D → dist[D] = max(3, 3+1) = 4, pred[D] = C  ← 更长, 更新前驱
+//
+//	Step 3: 找最长: dist[D] = 4 最大, 从 D 回溯:
+//	  D ← pred[D]=C ← pred[C]=B ← pred[B]=A
+//	  关键路径: [A, B, C, D] (长度 4)
+//
+//	为什么不是 A→E→D? 因为 A→E→D 长度只有 3, 不是最长。
+//
+// 调度优化: CriticalPathScore 给关键路径上的任务 +500 分,
+// 使其优先被调度, 从而最小化整体完成时间。
 func (g *Graph) CriticalPath() []string {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -379,11 +439,30 @@ func (g *Graph) CriticalPath() []string {
 
 // DAGWidth 使用 Kahn 分层法计算 DAG 最大并行宽度。
 //
-// 算法: BFS 逐层推进, 每层的节点数即为该层的并行度。
-// 返回所有层中的最大值, 代表该 DAG 理论上可利用的最大并行度。
+// 算法: BFS 逐层推进, 每层的节点数 = 该层的理论并行度。
 //
-// 用途: Engine.Run() 用此值自动设置 maxParallel,
-// 避免配置的并发度超过 DAG 实际可支持的宽度。
+// 逐步推演示例:
+//
+//	图: intake → safety-screen → [academic, psych, parent, dev]
+//	                                        ↓
+//	                                 action-plan → report
+//
+//	Layer 0: [intake]               → 宽度 1
+//	Layer 1: [safety-screen]        → 宽度 1
+//	Layer 2: [academic, psych, parent, dev] → 宽度 4 ← 最大!
+//	Layer 3: [action-plan]          → 宽度 1
+//	Layer 4: [report]               → 宽度 1
+//
+//	返回: 4
+//
+// 为什么需要分层 (level-order BFS)?
+//   标准 Kahn 的队列在某一时刻可能包含不同层的节点。
+//   分层法: 每次处理完当前层的所有节点后, 再把下一层节点统一入队,
+//   这样才能准确统计每层的并行度。
+//
+// 用途: Engine.Run() 用此值自动设置 maxParallel:
+//   maxPar = min(config.MaxParallel, g.DAGWidth())
+//   避免配置 MaxParallel=8 但 DAG 最大宽度只有 4 的浪费。
 func (g *Graph) DAGWidth() int {
 	g.mu.RLock()
 	defer g.mu.RUnlock()

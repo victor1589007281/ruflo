@@ -133,14 +133,69 @@ type ExecutionResult struct {
 
 // Run 执行工作流图直到所有任务完成或失败。
 //
-// 主循环逻辑:
-//  1. 构建图 (环路检测 + 初始化任务状态)
-//  2. 进入主循环:
-//     a. 调度器选择就绪任务 (Filter → Score → Dispatch)
-//     b. 派发 goroutine 执行 (受背压控制)
-//     c. select 等待: 任务完成信号 / 停滞检测 / 上下文取消
-//     d. 处理完成: 成功→解锁下游 / 失败→重试或级联
-//  3. 所有任务到达终态后退出, 返回执行结果
+// 完整执行流程图 (以 parenting 工作流 8 阶段为例):
+//
+//	┌──────────────────────────────────────────────────────────────┐
+//	│ Step 1: g.Build()                                           │
+//	│   ┌─────────┐    ┌──────────────┐    ┌──────────────┐       │
+//	│   │intake   │───▶│safety-screen │───▶│academic-tutor│       │
+//	│   │(Ready)  │    │(Blocked)     │    │(Blocked)     │       │
+//	│   └─────────┘    └──────────────┘    └──────────────┘       │
+//	│                           │              ┌───────────────┐   │
+//	│                           │              │psychology-coach│  │
+//	│                           │              │(Blocked)      │   │
+//	│                           │              └───────────────┘   │
+//	│                           │              ┌───────────────┐   │
+//	│                           │              │parenting-advisor│  │
+//	│                           │              │(Blocked)      │   │
+//	│                           │              └───────────────┘   │
+//	│                           │              ┌───────────────┐   │
+//	│                           │              │dev-assessor   │   │
+//	│                           │              │(Blocked)      │   │
+//	│                           └──────────────┴───────────────┘   │
+//	│                                          │                    │
+//	│                                    ┌─────▼──────┐            │
+//	│                                    │action-plan │            │
+//	│                                    │(Blocked)   │            │
+//	│                                    └─────┬──────┘            │
+//	│                                          │                    │
+//	│                                    ┌─────▼──────────┐        │
+//	│                                    │consultation-report│     │
+//	│                                    │(Blocked)        │        │
+//	│                                    └────────────────┘        │
+//	└──────────────────────────────────────────────────────────────┘
+//
+//	┌──────────────────────────────────────────────────────────────┐
+//	│ Step 2: 主循环 (调度 → 派发 → 等待 → 处理)                    │
+//	│                                                              │
+//	│ Round 1: 调度 intake (唯一 Ready)                            │
+//	│   Filter(1) → Score(1) → Dispatch(1) → go executeTask()     │
+//	│   等待 doneCh: intake 完成                                   │
+//	│   handleDone: intake→Completed, 写黑板, unblock safety-screen│
+//	│                                                              │
+//	│ Round 2: 调度 safety-screen                                 │
+//	│   Filter(1) → Score(1) → Dispatch(1) → go executeTask()     │
+//	│   等待 doneCh: safety-screen 完成                            │
+//	│   handleDone: safety-screen→Completed, 解锁 4 个并行阶段      │
+//	│                                                              │
+//	│ Round 3: 调度 4 个并行阶段 (MaxParallel=2, 本批取 2 个)       │
+//	│   Filter(4) → Score(4) → Dispatch(2) → 2×go executeTask()   │
+//	│   等待 doneCh: 第 1 个完成 → drain 排空第 2 个               │
+//	│                                                              │
+//	│ Round 4: 调度剩余 2 个并行阶段                               │
+//	│   Filter(2) → Score(2) → Dispatch(2) → 2×go executeTask()   │
+//	│   等待 doneCh: 2 个完成后解锁 action-plan                    │
+//	│                                                              │
+//	│ Round 5: 调度 action-plan → consultation-report              │
+//	└──────────────────────────────────────────────────────────────┘
+//
+// 关键机制解读:
+//  1. 事件驱动解锁: 任务完成后立即调用 unblockDownstream(),
+//     检查下游依赖是否全部满足, 满足则 Blocked→Ready, 无需轮询
+//  2. Filter→Score→Dispatch: 每轮调度都重新评估, 考虑背压/依赖/优先级
+//  3. 流式派发: doneCh 是核心通道, 任务完成即刻触发下一轮调度
+//  4. 停滞检测: 30s 定时器检查 lastProgress, 超阈值则尝试恢复
+//  5. 检查点: 每完成 CheckpointEvery 个任务, 序列化全量状态到磁盘
 func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 	if err := g.Build(); err != nil {
 		return nil, fmt.Errorf("图构建失败: %w", err)
@@ -337,19 +392,39 @@ func (e *Engine) handleDone(g *Graph, done taskDone) {
 
 // handleFailure 统一处理任务失败。
 //
-// 三级错误分治策略 (借鉴 TCP 拥塞控制思路):
+// 三级错误分治决策树:
 //
-//	错误 → 分类器
-//	  ├─ 瞬态 (429/网络/超时)
-//	  │   ├─ 还有重试额度? → 设为 Ready + 指数退避延迟 → 下一轮重新调度
-//	  │   └─ 重试耗尽? → 设为 Suspended (不级联, 等 stallRecovery 恢复)
+//	task 失败 → ClassifyError(err)
 //	  │
-//	  ├─ 永久 (验证/代码质量)
-//	  │   ├─ 还有重试额度? → 设为 Ready → 立即重试
-//	  │   └─ 重试耗尽? → 设为 Failed + 级联下游 Cancelled
+//	  ├─ ErrorTransient (429/网络超时/连接重置)
+//	  │   重试策略: MaxRetries + MaxTransient 额度
+//	  │   ├── 有额度 → retries++ → 状态=Ready → 异步退避延迟 → 下一轮调度拾取
+//	  │   │        退避: Full Jitter Exponential Backoff
+//	  │   │          delay = base * 2^attempt, jitter = random(0, min(delay, maxDelay))
+//	  │   │        瞬态错误的 base = TransientBase (通常更大, 15s vs 2s)
+//	  │   │
+//	  │   └── 额度耗尽 → 状态=Suspended → 不级联下游
+//	  │              Suspended 是"暂停"而非"终止", 等 stallRecovery 唤醒
+//	  │              设计原因: LLM 限流通常是暂时的, 挂起比直接失败更合理
 //	  │
-//	  └─ 致命 (API Key 无效/配额耗尽)
-//	      └─ 设为 Failed + 级联所有下游
+//	  ├─ ErrorPermanent (验证失败/代码质量不达标/业务逻辑错误)
+//	  │   重试策略: 仅 MaxRetries 额度 (无额外瞬态重试)
+//	  │   ├── 有额度 → retries++ → 状态=Ready → 立即重试 (无延迟)
+//	  │   │        注意: Permanent 错误重试无退避, 因为重试不会改变结果
+//	  │   │        依赖上层逻辑 (如 AdversarialRunner) 做反馈迭代
+//	  │   │
+//	  │   └── 额度耗尽 → 状态=Failed → cascadeFailure(所有下游 Cancelled)
+//	  │              设计原因: 上游数据无效, 下游不可能产出正确结果
+//	  │
+//	  └─ ErrorFatal (API Key 无效/配额耗尽/账户停用)
+//	      重试策略: 永不重试
+//	      └── 状态=Failed → cascadeFailure(所有下游 Cancelled)
+//	                 设计原因: 基础设施级问题, 重试只会浪费时间和资源
+//
+// 与 Coordinator 重试的区别:
+//  - Coordinator: 团队级, 阶段间重试, 带指数退避 + 全抖动
+//  - Engine: DAG 级, 任务内重试, 按错误类型分治
+//  两者互补: Coordinator 处理宏观流程, Engine 处理微观执行
 func (e *Engine) handleFailure(g *Graph, t *Task, err error) {
 	t.mu.Lock()
 	attempt := t.retries
@@ -432,11 +507,30 @@ func (e *Engine) handleFailure(g *Graph, t *Task, err error) {
 
 // unblockDownstream 事件驱动的下游解锁。
 //
-// 当任务完成时, 遍历其所有下游任务:
-//   - 如果下游处于 Blocked 状态, 且其所有上游依赖都已 Completed
-//   - 则将下游状态转为 Ready, 使其可被下一轮调度拾取
+// 与轮询方案的对比:
 //
-// 这是引擎的核心性能优化: 避免轮询检查依赖状态。
+//  方案 A (轮询 -- 不推荐):
+//    for {
+//      for each Blocked task {
+//        if all upstreams Completed { unblock }
+//      }
+//      sleep(1s)  // 浪费 CPU, 延迟 1s 才感知
+//    }
+//
+//  方案 B (事件驱动 -- 本方案):
+//    task Completed → 只检查该 task 的下游邻居
+//    仅 O(downstream_count * upstream_count) 的局部检查
+//    零延迟, 任务完成的同一 goroutine 中立即触发
+//
+//  为什么不用 Channel 通知?
+//    每个任务建一个 done channel 会增加复杂度, 且下游可能依赖多个上游,
+//    需要 select 多个 channel。直接遍历下游更简单高效。
+//
+//  示例: safety-screen 完成后:
+//    downstream[safety-screen] = [academic-tutor, psychology-coach,
+//                                 parenting-advisor, development-assessor]
+//    对这 4 个任务逐个检查: 它们的上游只有 [safety-screen], 已全部完成
+//    → 4 个任务同时从 Blocked 转为 Ready
 func (e *Engine) unblockDownstream(g *Graph, completedID string) {
 	g.mu.RLock()
 	downstream := g.downstream[completedID]
@@ -473,8 +567,25 @@ func (e *Engine) unblockDownstream(g *Graph, completedID string) {
 
 // cascadeFailure 递归级联失败: 将所有下游非终态任务标记为 Cancelled。
 //
-// 设计原因: 上游永久失败后, 下游任务不可能成功 (依赖数据缺失),
-// 继续调度只会浪费 LLM 调用。直接级联标记避免无意义消耗。
+// 级联语义:
+//   上游永久失败 → 下游任务缺少必要输入数据 → 不可能成功产出 → 直接取消
+//
+// 递归 vs 非递归:
+//   A→B→C, 如果 A 失败:
+//   递归: cancel(B), 然后从 B 继续 cancel(C) — 整条链都取消
+//   非递归: 只 cancel(B), C 仍保持 Blocked — C 永远不会被解锁但会占用资源
+//
+// 为什么不用 ctx.Cancel() ?
+//   ctx.Cancel 会取消所有正在执行的任务, 包括其他并行分支中不相关的任务。
+//   cascadeFailure 是精细的拓扑级联, 只影响失败任务的直接和间接下游。
+//
+// 示例: parenting 工作流中, 如果 safety-screen 失败 (Fatal 错误):
+//   cascadeFailure(safety-screen) →
+//     cancel(academic-tutor) → cascade(academic-tutor) → cancel(action-plan) → cascade(action-plan) → cancel(consultation-report)
+//     cancel(psychology-coach) → cascade(...) → 同上
+//     cancel(parenting-advisor) → cascade(...) → 同上
+//     cancel(development-assessor) → cascade(...) → 同上
+//   注意: action-plan 会被多次尝试取消, 但 IsTerminal 检查避免重复计数
 func (e *Engine) cascadeFailure(g *Graph, failedID string) {
 	g.mu.RLock()
 	downstream := g.downstream[failedID]

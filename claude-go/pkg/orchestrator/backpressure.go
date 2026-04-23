@@ -87,10 +87,20 @@ func (tb *TokenBucket) SetRate(ratePerSec float64) {
 // AdaptiveSemaphore 自适应并发信号量, 实现 AIMD 算法。
 //
 // AIMD (Additive Increase, Multiplicative Decrease) 算法原理:
-//   - 灵感来自 TCP 拥塞控制
-//   - 成功时: limit += 1 (加性增加, 缓慢扩容)
-//   - 失败时: limit /= 2 (乘性降低, 快速收缩)
+//   - 灵感来自 TCP 拥塞控制 (RFC 5681)
+//   - 成功时: limit += 1 (加性增加, 缓慢扩容) — "探索更多带宽"
+//   - 失败时: limit /= 2 (乘性降低, 快速收缩) — "检测到拥塞, 快速退避"
 //   - 保持 limit 在 [minLimit, maxLimit] 范围内
+//
+// 与 TCP 拥塞控制的类比:
+//   TCP: 收到 ACK → cwnd++ ; 丢包 → cwnd/=2
+//   本系统: 任务成功 → limit++ ; 任务失败 → limit/=2
+//
+// 动态调整示例:
+//   初始 limit=8
+//   成功 → limit=9 → limit=10 → limit=11 → limit=12
+//   失败 → limit=6 (快速减半, 保护系统不被错误请求淹没)
+//   成功 → limit=7 → limit=8
 //
 // 用途: L2 层背压 — 根据执行成功率动态调整 Worker 并发度。
 // 例如大量 429 错误时自动降低并发, 恢复正常后逐步回升。

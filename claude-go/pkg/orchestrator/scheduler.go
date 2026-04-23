@@ -78,8 +78,41 @@ func (s *Scheduler) AddScorer(sc ScorePlugin) {
 
 // Schedule 执行三阶段调度, 返回按优先级排序的待执行任务批次。
 //
-// 时间复杂度: O(R * (F + S) + R*log(R))
-// 其中 R=就绪任务数, F=过滤器数, S=打分器数
+// 具体打分计算示例 (parenting 工作流):
+//
+//	假设 4 个并行阶段都 Ready:
+//	  academic-tutor (Priority=5, 在关键路径上)
+//	  psychology-coach (Priority=5, 不在关键路径上)
+//	  parenting-advisor (Priority=5, 不在关键路径上)
+//	  development-assessor (Priority=5, 在关键路径上)
+//
+//	Phase 1 -- Filter:
+//	  DependencyFilter: 4 个任务的上游 safety-screen 都 Completed → 全部通过
+//	  ResourceFilter: 背压允许入队 → 全部通过
+//	  feasible = [academic, psych, parent, dev]
+//
+//	Phase 2 -- Score:
+//	  academic-tutor:
+//	    PriorityScore    = 5 * 100 = 500
+//	    CriticalPathScore = 500      (在关键路径上)
+//	    FairnessScore     = -0 * 50 = 0    (无重试)
+//	    Total = 1000
+//
+//	  psychology-coach:
+//	    PriorityScore    = 5 * 100 = 500
+//	    CriticalPathScore = 0         (不在关键路径上)
+//	    FairnessScore     = -0 * 50 = 0
+//	    Total = 500
+//
+//	  排序: academic(1000) > dev(1000) > psych(500) > parent(500)
+//
+//	Phase 3 -- Dispatch:
+//	  如果 avail=2 (还有 2 个执行槽): 取 [academic, dev]
+//	  如果 avail=4: 取全部 4 个
+//
+// 为什么关键路径任务优先?
+//   关键路径是 DAG 中最长的依赖链, 决定了最短完成时间。
+//   优先执行关键路径任务可以最小化该链的完成时间, 从而缩短整体耗时。
 func (s *Scheduler) Schedule(ctx *SchedulerContext, maxBatch int) []*Task {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -194,7 +227,11 @@ func (s *PriorityScore) Score(task *Task, _ *SchedulerContext) int {
 //
 // 原理: 关键路径是 DAG 中最长的依赖链, 决定了整体执行时间的下限。
 // 优先调度关键路径上的任务可以最大化缩短总执行时间。
-// 使用 sync.Once 确保关键路径只计算一次 (结果在图变化前不会改变)。
+//
+// sync.Once 懒加载: 第一次 Score 调用时计算一次关键路径,
+// 之后直接查 criticalSet map, O(1) 查找。
+// 注意: 如果图被 DynamicExpander 修改过, 此处的 criticalSet 不会重新计算,
+// 因为 sync.Once 只执行一次。对于 DAG 扩展场景, 建议传入新的 CriticalPathScore 实例。
 type CriticalPathScore struct {
 	criticalSet map[string]bool
 	once        sync.Once

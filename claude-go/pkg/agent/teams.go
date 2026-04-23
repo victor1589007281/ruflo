@@ -1210,7 +1210,12 @@ func truncateResult(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "..."
+	// 使用 rune 截断, 避免在多字节 UTF-8 字符中间切断
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s // rune 数未超限, 返回原文 (len(s) > max 但 rune 数 <= max)
+	}
+	return string(runes[:max]) + "..."
 }
 
 // executePrediction 群体智能预测执行。

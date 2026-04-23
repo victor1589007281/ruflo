@@ -123,9 +123,30 @@ func NewCompositeRunner(name string, steps []TaskRunner, policy TerminationPolic
 
 func (r *CompositeRunner) Name() string { return r.name }
 
-// Execute 执行组合循环。
-// 每次迭代: 依次调用所有 steps, 将最后一步的输出作为本轮结果。
-// 在每步之间检查 ctx 取消, 在迭代开始时检查 policy 终止条件。
+// CompositeRunner 组合执行器: 按顺序链式调用多个 Runner。
+//
+// 迭代循环时序图 (以 adversarial coder→reviewer 为例):
+//
+//	Iter 0:
+//	  coder.Execute()     → 生成初版代码, 写入 bb
+//	  reviewer.Execute()  → 审查代码, 返回评审意见
+//	  history = [评审意见]
+//	  policy.ShouldTerminate(1, 评审意见, history) → false (质量未达标)
+//
+//	Iter 1:
+//	  coder.Execute()     → 接收评审意见, 改进代码
+//	  reviewer.Execute()  → 重新审查
+//	  history = [评审意见_0, 评审意见_1]
+//	  policy.ShouldTerminate(2, 新意见, history) → true (收敛或达标)
+//
+//	终止策略 (TerminationPolicy):
+//	  - MaxIterTermination: 固定轮数, 最简单
+//	  - QualityTermination: 质量分数达标/收敛/退化检测
+//
+// 注意事项:
+//   - 每一步之间检查 ctx.Done(), 支持外部取消
+//   - bb 是 ReadOnlyBlackboard, 步骤间通过 bb 共享状态
+//   - 任何一步失败, 整个复合任务立即失败返回
 func (r *CompositeRunner) Execute(ctx context.Context, task *Task, bb ReadOnlyBlackboard) (any, error) {
 	var history []any
 	var lastOutput any

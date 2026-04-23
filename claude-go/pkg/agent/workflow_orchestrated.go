@@ -1,9 +1,20 @@
 // workflow_orchestrated.go — 桥接层: 将 WorkflowDef 转换为 pkg/orchestrator.Engine 驱动的执行。
 //
-// 解决的核心问题:
-//   原来 pipeline 模式下, 对抗只是 Prompt 角色扮演 (单次调用)。
-//   orchestrated 模式下, 对抗阶段使用 AdversarialRunner 实现真正的多轮博弈,
-//   DAG 调度、背压控制、检查点等全部由 pkg/orchestrator.Engine 驱动。
+// 两套调度系统的关系:
+//
+//  系统 A: pkg/agent/coordinator.go + runPipelineWithRecovery
+//    - 轻量级: 简单的拓扑排序 + 并发执行 + 检查点
+//    - 适用: 线性 pipeline 工作流 (顺序阶段 + 偶尔并行组)
+//    - 特点: 每个阶段独立重试, 由 Coordinator 管理
+//
+//  系统 B: pkg/orchestrator/engine.go (本文件)
+//    - 重量级: K8s 风格三阶段调度 + 背压控制 + 错误分治
+//    - 适用: orchestrated 工作流 (复杂 DAG, 对抗循环, 动态扩展)
+//    - 特点: 统一的 DAG 调度, 错误按类型分治 (瞬态/永久/致命)
+//
+//  路由: Coordinator.RunWithRecovery() → 根据 workflow mode 选择
+//    - "orchestrated" → executeOrchestrated() → 系统 B
+//    - 其他模式 (pipeline/adversarial/swarm) → 系统 A
 //
 // 桥接流程:
 //   WorkflowDef.Stages → orchestrator.Graph.Tasks
@@ -81,7 +92,15 @@ func (we *WorkflowExecutor) executeOrchestrated(
 	expander := orchestrator.NewLLMExpander(llmAdapter, "llm-stage", 8)
 	expanderHook := orchestrator.NewExpanderHook(expander, g)
 	metricsHook := orchestrator.NewMetricsHook(nil)
-	eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook))
+
+	// 注册 Coordinator 活动回调 Hook, 防止停滞检测误报
+	var activityHook orchestrator.LifecycleHook
+	if we.activityCallback != nil {
+		activityHook = &callbackHook{fn: we.activityCallback}
+		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, activityHook))
+	} else {
+		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook))
+	}
 
 	// 6. 设置 Blackboard
 	bb := orchestrator.NewBlackboard()
@@ -115,15 +134,53 @@ func (we *WorkflowExecutor) executeOrchestrated(
 }
 
 // buildGraph 将 WorkflowDef 的 Stages 转换为 orchestrator.Graph。
+//
+// 完整映射示例 (parenting 工作流):
+//
+//	WorkflowDef (8 stages):
+//	  1. intake          (no deps)    → Task: go-development-8238/intake           Runner: llm-stage
+//	  2. safety-screen   [intake]     → Task: go-development-8238/safety-screen    Runner: llm-stage
+//	  3. academic-tutor  [safety-screen] → Task: .../academic-tutor                 Runner: llm-stage, Parallel=true
+//	  4. psychology-coach [safety-screen] → Task: .../psychology-coach              Runner: llm-stage, Parallel=true
+//	  5. parenting-advisor [safety-screen] → Task: .../parenting-advisor            Runner: llm-stage, Parallel=true
+//	  6. development-assessor [safety-screen] → Task: .../development-assessor      Runner: llm-stage, Parallel=true
+//	  7. action-plan     [3,4,5,6]    → Task: .../action-plan                      Runner: llm-stage
+//	  8. consultation-report [7]      → Task: .../consultation-report              Runner: llm-stage
+//
+//	产生的边 (Edges):
+//	  intake → safety-screen
+//	  safety-screen → academic-tutor
+//	  safety-screen → psychology-coach
+//	  safety-screen → parenting-advisor
+//	  safety-screen → development-assessor
+//	  academic-tutor → action-plan
+//	  psychology-coach → action-plan
+//	  parenting-advisor → action-plan
+//	  development-assessor → action-plan
+//	  action-plan → consultation-report
+//
+//	Prompt 模板变量替换:
+//	  {prev_result} → 所有上游任务输出的合并 (通过 blackboard 读取)
+//	  {objective}   → 工作流目标
+//	  {dep:taskID}  → 指定上游任务的输出
+//
+// 注意: Parallel 字段在 orchestrated 模式下由 DAG 边决定, 不需要显式标记。
+// 多个阶段依赖同一个上游, 上游完成后它们同时变为 Ready, 引擎会并发执行。
+// stageInfo 携带阶段名称和角色信息，用于结果转换时填充 StageResult。
+type stageInfo struct {
+	name string
+	role string
+}
+
 func (we *WorkflowExecutor) buildGraph(
 	wf *WorkflowDef, objective string, team *ProductionTeam, hasAdversarial bool,
-) (*orchestrator.Graph, map[string]string) {
+) (*orchestrator.Graph, map[string]stageInfo) {
 	g := orchestrator.NewGraph(team.Name+"-graph", wf.Name)
-	stageMapping := make(map[string]string) // taskID → stageName
+	stageMapping := make(map[string]stageInfo) // taskID → stageInfo
 
 	for _, stage := range wf.Stages {
 		taskID := fmt.Sprintf("%s/%s", team.Name, stage.Name)
-		stageMapping[taskID] = stage.Name
+		stageMapping[taskID] = stageInfo{name: stage.Name, role: stage.Role}
 
 		// 判断是否是对抗阶段 (角色名含 adversarial/skeptical)
 		isAdversarial := hasAdversarial && isAdversarialStage(stage)
@@ -242,15 +299,16 @@ func (a *AdversarialRunnerAdapter) Execute(ctx context.Context, task *orchestrat
 
 // convertResults 将 orchestrator.ExecutionResult 转换为 []StageResult。
 func (we *WorkflowExecutor) convertResults(
-	result *orchestrator.ExecutionResult, stageMapping map[string]string, team *ProductionTeam,
+	result *orchestrator.ExecutionResult, stageMapping map[string]stageInfo, team *ProductionTeam,
 ) []StageResult {
 	if result == nil {
 		return nil
 	}
 	var results []StageResult
-	for taskID, stageName := range stageMapping {
+	for taskID, info := range stageMapping {
 		sr := StageResult{
-			Name:   stageName,
+			Name:   info.name,
+			Role:   info.role,
 			Status: TaskCompleted,
 		}
 
@@ -266,10 +324,10 @@ func (we *WorkflowExecutor) convertResults(
 		// 写入团队 Blackboard
 		if team.Blackboard != nil {
 			if sr.Status == TaskCompleted {
-				team.Blackboard.Write(stageName+"-result", sr.Output, "orchestrator", "result")
-				team.Blackboard.Write(stageName+"-status", "completed", "system", "progress")
+				team.Blackboard.Write(info.name+"-result", sr.Output, "orchestrator", "result")
+				team.Blackboard.Write(info.name+"-status", "completed", "system", "progress")
 			} else {
-				team.Blackboard.Write(stageName+"-status", "failed: "+sr.Error, "system", "progress")
+				team.Blackboard.Write(info.name+"-status", "failed: "+sr.Error, "system", "progress")
 			}
 		}
 	}
@@ -302,6 +360,16 @@ func isExpandableStage(stage StageDef) bool {
 		strings.Contains(lower, "decompose") ||
 		strings.Contains(lower, "risk-model")
 }
+
+// callbackHook 将 Coordinator 活动回调包装为 LifecycleHook。
+// 每当任务完成时调用 callback, 重置 Coordinator 的停滞检测计时器。
+type callbackHook struct {
+	orchestrator.NoopHook
+	fn func()
+}
+
+func (h *callbackHook) OnTaskStart(t *orchestrator.Task)  { h.fn() }
+func (h *callbackHook) OnTaskComplete(t *orchestrator.Task, output any) { h.fn() }
 
 // orchLLMAdapter 桥接 pkg/agent.LLMClient → pkg/orchestrator.LLMClient。
 // 两者接口签名完全一致, 但属于不同包, 需要适配器。
