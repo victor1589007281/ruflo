@@ -420,6 +420,16 @@ func runCmd() *cobra.Command {
 						}
 					}
 					return out
+				}, func() []agent.DAGTaskSummary {
+					raw := taskStore.GetAllTasks()
+					out := make([]agent.DAGTaskSummary, len(raw))
+					for i, t := range raw {
+						out[i] = agent.DAGTaskSummary{
+							ID: t.ID, Subject: t.Subject, Description: t.Description,
+							Status: t.Status, Owner: t.Owner, DependsOn: t.DependsOn, Priority: t.Priority,
+						}
+					}
+					return out
 				})
 
 				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{

@@ -805,12 +805,38 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 	return allResults, nil
 }
 
-// restoreCompletedTasksFromDAG 从 V2 DAG 恢复已完成任务 (防御性检查)。
-// 核心修复在 AddTaskWithDeps (tasktools.go): 如果任务已存在且 completed, 直接复用旧 ID,
-// 避免创建重复任务导致全部重跑。
+// restoreCompletedTasksFromDAG 从 V2 DAG 恢复已完成/失败任务计数。
+// 关键: 如果不更新这些计数, 完成检查 (completedCount+failedCount >= totalCount) 永远不满足,
+// 导致 orchestrator 认为所有任务都未处理, 全部重新调度。
 func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
-	// AddTaskWithDeps 已经在任务创建时做了复用, 这里不需要额外操作。
-	return 0
+	if o.dag == nil {
+		return 0
+	}
+
+	allTasks := o.dag.GetAllTasks()
+	o.mu.Lock()
+	nodeIDs := make(map[string]bool)
+	for _, n := range o.nodes {
+		nodeIDs[n.V2TaskID] = true
+	}
+
+	restored := 0
+	for _, t := range allTasks {
+		if !nodeIDs[t.ID] {
+			continue
+		}
+		switch t.Status {
+		case "completed":
+			o.completedCount++
+			restored++
+		case "failed":
+			o.failedCount++
+			restored++
+		}
+	}
+	o.mu.Unlock()
+
+	return restored
 }
 
 func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective string, team *ProductionTeam) int {

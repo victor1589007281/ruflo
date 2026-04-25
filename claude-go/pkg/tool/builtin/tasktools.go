@@ -418,25 +418,51 @@ func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsO
 	defer s.mu.Unlock()
 
 	// 恢复场景修复: resume 时 ParsePlanToDAG 会重新创建任务,
-	// 如果已有相同 subject 的任务且状态为 completed, 直接复用旧任务,
-	// 避免产生重复任务导致重新开始。
+	// 搜集所有相同 subject 的任务, 优先复用已完成的, 避免产生重复任务。
+	var completedIDs, otherIDs []string
 	for id, rec := range s.byID {
 		if rec.Subject == subject {
 			if rec.Status == "completed" {
-				return id, nil // 已完成的任务, 直接复用
+				completedIDs = append(completedIDs, id)
+			} else {
+				otherIDs = append(otherIDs, id)
 			}
-			// 未完成的任务, 更新依赖后复用
-			rec.DependsOn = dependsOn
-			rec.Priority = priority
-			rec.Description = description
-			rec.Owner = owner
-			rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			s.byID[id] = rec
-			_ = s.saveLocked()
-			return id, nil
 		}
 	}
 
+	// 优先级 1: 复用最早的创建的已完成任务 (时间最可靠)
+	if len(completedIDs) > 0 {
+		bestID := completedIDs[0]
+		bestTime := s.byID[bestID].CreatedAt
+		for _, id := range completedIDs[1:] {
+			if t := s.byID[id].CreatedAt; t < bestTime {
+				bestID, bestTime = id, t
+			}
+		}
+		return bestID, nil
+	}
+
+	// 优先级 2: 复用最早的未完成的任务
+	if len(otherIDs) > 0 {
+		bestID := otherIDs[0]
+		bestTime := s.byID[bestID].CreatedAt
+		for _, id := range otherIDs[1:] {
+			if t := s.byID[id].CreatedAt; t < bestTime {
+				bestID, bestTime = id, t
+			}
+		}
+		rec := s.byID[bestID]
+		rec.DependsOn = dependsOn
+		rec.Priority = priority
+		rec.Description = description
+		rec.Owner = owner
+		rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		s.byID[bestID] = rec
+		_ = s.saveLocked()
+		return bestID, nil
+	}
+
+	// 优先级 3: 创建新任务
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	id := genTaskUUID()
 	// 如果有依赖但前置任务未完成, 状态设为 blocked

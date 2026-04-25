@@ -2908,6 +2908,18 @@ func (m *mockDAGTracker) SetTaskStatusAndUnblock(id, status string) (int, error)
 	}
 	return unblocked, nil
 }
+func (m *mockDAGTracker) GetAllTasks() []agent.DAGTaskSummary {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]agent.DAGTaskSummary, 0, len(m.tasks))
+	for _, t := range m.tasks {
+		result = append(result, agent.DAGTaskSummary{
+			ID: t.id, Subject: t.subject, Description: t.desc,
+			Status: t.status, Owner: t.owner, DependsOn: t.deps, Priority: t.priority,
+		})
+	}
+	return result
+}
 
 // --- 46. DAG 编排器 (V2 TaskStore 复用 + DynTaskMAS) ---
 

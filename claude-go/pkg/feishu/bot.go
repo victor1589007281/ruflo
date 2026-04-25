@@ -82,6 +82,18 @@ func (d *dagTaskAdapter) ReadyTasks() []agent.DAGTaskSummary {
 func (d *dagTaskAdapter) SetTaskStatusAndUnblock(id, status string) (int, error) {
 	return d.store.SetTaskStatusAndUnblock(id, status)
 }
+func (d *dagTaskAdapter) GetAllTasks() []agent.DAGTaskSummary {
+	v2Tasks := d.store.GetAllTasks()
+	result := make([]agent.DAGTaskSummary, len(v2Tasks))
+	for i, t := range v2Tasks {
+		result[i] = agent.DAGTaskSummary{
+			ID: t.ID, Subject: t.Subject, Description: t.Description,
+			Status: t.Status, Owner: t.Owner, DependsOn: t.DependsOn,
+			Priority: t.Priority,
+		}
+	}
+	return result
+}
 
 // memoryAdapter 适配 memory.TieredStore 到 agent.MemoryWriter 接口。
 // 团队完成后写入高权重记忆，确保团队名+目标可被 BM25 检索到。

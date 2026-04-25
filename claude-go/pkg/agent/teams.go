@@ -59,6 +59,7 @@ type DAGTaskTracker interface {
 	AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
 	ReadyTasks() []DAGTaskSummary
 	SetTaskStatusAndUnblock(id, status string) (int, error)
+	GetAllTasks() []DAGTaskSummary
 }
 
 // DAGTaskSummary 面向调度器的任务摘要 (与 builtin.TaskSummary 结构对齐)。
@@ -90,7 +91,8 @@ type TaskStoreDAGAdapter struct {
 		AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
 		SetTaskStatusAndUnblock(id, status string) (int, error)
 	}
-	readyFunc func() []DAGTaskSummary
+	readyFunc   func() []DAGTaskSummary
+	getAllFunc  func() []DAGTaskSummary
 }
 
 // NewTaskStoreDAGAdapter 创建适配器。
@@ -103,8 +105,9 @@ func NewTaskStoreDAGAdapter(
 		SetTaskStatusAndUnblock(id, status string) (int, error)
 	},
 	readyFn func() []DAGTaskSummary,
+	getAllFn func() []DAGTaskSummary,
 ) *TaskStoreDAGAdapter {
-	return &TaskStoreDAGAdapter{store: store, readyFunc: readyFn}
+	return &TaskStoreDAGAdapter{store: store, readyFunc: readyFn, getAllFunc: getAllFn}
 }
 
 func (a *TaskStoreDAGAdapter) AddTask(subject, description, owner string) (string, error) {
@@ -121,6 +124,12 @@ func (a *TaskStoreDAGAdapter) ReadyTasks() []DAGTaskSummary {
 }
 func (a *TaskStoreDAGAdapter) SetTaskStatusAndUnblock(id, status string) (int, error) {
 	return a.store.SetTaskStatusAndUnblock(id, status)
+}
+func (a *TaskStoreDAGAdapter) GetAllTasks() []DAGTaskSummary {
+	if a.getAllFunc != nil {
+		return a.getAllFunc()
+	}
+	return nil
 }
 
 // DreamRecorder Dreaming 记录接口, 解耦 dreaming 包依赖。
