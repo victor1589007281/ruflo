@@ -120,6 +120,7 @@ type Orchestrator struct {
 	checkpoints      CheckpointStore // 检查点 (从 WorkflowExecutor 传入, 可为 nil)
 	flusher          StageFlusher    // 增量刷新回调 (可为 nil)
 	activityCallback func()          // Coordinator 活动追踪回调
+	progressCallback func(phase string, iteration int, bytesWritten int64, taskID string) // 进展上报回调
 
 	completedCount int
 	failedCount    int
@@ -173,6 +174,17 @@ func (o *Orchestrator) SetStageFlusher(fn StageFlusher) {
 // SetActivityCallback 注入 Coordinator 活动追踪回调, 使 Orchestrator 执行期间能刷新 watchdog 计时器。
 func (o *Orchestrator) SetActivityCallback(fn func()) {
 	o.activityCallback = fn
+}
+
+// SetProgressCallback 注入进展上报回调, 用于 watchdog 区分 "进程活着" 和 "任务在前进"。
+func (o *Orchestrator) SetProgressCallback(fn func(phase string, iteration int, bytesWritten int64, taskID string)) {
+	o.progressCallback = fn
+}
+
+func (o *Orchestrator) reportProgress(phase string, iteration int, bytesWritten int64, taskID string) {
+	if o.progressCallback != nil {
+		o.progressCallback(phase, iteration, bytesWritten, taskID)
+	}
 }
 
 func (o *Orchestrator) touchActivity() {
@@ -965,6 +977,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 
 		lastOutput = result
 		node.Output = result
+		o.reportProgress("LLM生成", round, int64(len(result)), node.V2TaskID)
 
 		// L4: 文件物化 — 提取代码块写入磁盘
 		lang := team.Language
@@ -979,6 +992,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 
 		// === Step 1.5: L2 编译硬门禁 (多语言, 与 workflow.go 的 runBuildHardGate 对齐) ===
 		buildPassed := true
+		o.reportProgress("编译", round, 0, node.V2TaskID)
 		if team.Cwd != "" {
 			buildErrors := runBuildCheckLang(team.Cwd, lang)
 			if buildErrors != "" {
@@ -1034,6 +1048,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		// 根因修复: 将编译状态注入 reviewer prompt, 避免编译通过仍给 0 分的问题。
 		score := o.runSkepticalReview(ctx, node, objective, lastScore, buildPassed)
 		lastScore = score
+		o.reportProgress("评审", round, 0, node.V2TaskID)
 
 		// === Step 3: Tester micro-test + 瓶颈分类 (参考 GLM 5.1) ===
 		o.runMicroTest(ctx, node)
@@ -1239,6 +1254,7 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 	}
 
 	node.Output = result
+	o.reportProgress("LLM生成", 1, int64(len(result)), node.V2TaskID)
 	duration := time.Since(start)
 
 	o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")

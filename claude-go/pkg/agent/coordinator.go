@@ -67,6 +67,48 @@ type Coordinator struct {
 	// watchdog 状态
 	lastActivity   time.Time
 	lastActivityMu sync.Mutex
+
+	// 进展型心跳: 跟踪任务的实际进度, 而非仅心跳
+	// 心跳只证明 "进程活着", 进展证明 "任务在前进"
+	progress     ProgressState
+	progressMu   sync.RWMutex
+}
+
+// ProgressState 任务进展状态 (用于 watchdog 区分 "活着" 和 "在前进")
+type ProgressState struct {
+	Phase       string    `json:"phase"`       // 当前阶段: "LLM生成", "编译", "测试", "等待"
+	Iteration   int       `json:"iteration"`   // 当前轮次/尝试次数
+	UpdatedAt   time.Time `json:"updatedAt"`   // 上次更新进展时间
+	BytesWritten int64    `json:"bytesWritten"` // 累计产出大小 (代码行数/文件字节数)
+	TaskID      string    `json:"taskId"`      // 当前执行的任务 ID
+}
+
+// ReportProgress 上报进展 (由执行器在关键节点调用)
+func (c *Coordinator) ReportProgress(phase string, iteration int, bytesWritten int64, taskID string) {
+	c.progressMu.Lock()
+	c.progress.Phase = phase
+	c.progress.Iteration = iteration
+	c.progress.BytesWritten = bytesWritten
+	c.progress.TaskID = taskID
+	c.progress.UpdatedAt = time.Now()
+	c.progressMu.Unlock()
+}
+
+// ProgressAge 距上次真正进展的时间
+func (c *Coordinator) ProgressAge() time.Duration {
+	c.progressMu.RLock()
+	defer c.progressMu.RUnlock()
+	if c.progress.UpdatedAt.IsZero() {
+		return time.Since(c.lastActivity) // 降级到 activity 心跳
+	}
+	return time.Since(c.progress.UpdatedAt)
+}
+
+// CurrentProgress 返回当前进展快照
+func (c *Coordinator) CurrentProgress() ProgressState {
+	c.progressMu.RLock()
+	defer c.progressMu.RUnlock()
+	return c.progress
 }
 
 // CoordinatorConfig 协调器配置。
@@ -172,6 +214,7 @@ func (c *Coordinator) executeWithWatchdog(
 	executor *WorkflowExecutor,
 ) ([]StageResult, error) {
 	executor.activityCallback = c.TouchActivity
+	executor.progressCallback = c.ReportProgress
 
 	results, err := executor.Execute(ctx, wf, objective, team)
 	if err != nil {
@@ -185,33 +228,67 @@ func (c *Coordinator) executeWithWatchdog(
 	return results, err
 }
 
-// teamWatchdog 团队级 watchdog: 定期检查最后活动时间, 检测卡住并告警。
-// 参考: K8s liveness probe — 探测进程活着但无进展的场景。
+// teamWatchdog 团队级 watchdog: 区分 "进程活着" 和 "任务在前进"。
+//
+// 两层检测:
+//   L1 (activity 心跳): 5min 无 activity → 警告 (进程可能挂了)
+//   L2 (progress 进展): 10min 进展不变 → 疑似卡住, 30min → 强制终止
+//
+// 进展不变的定义: Phase 和 Iteration 都没变化, 说明卡在同一个状态。
+// 参考: K8s liveness probe (进程存活) + readiness probe (服务可用) 分离设计。
 func (c *Coordinator) teamWatchdog(ctx context.Context, team *ProductionTeam) {
 	ticker := time.NewTicker(watchdogCheckInterval)
 	defer ticker.Stop()
 
 	warned := false
+	var stagnantRounds int // 连续无进展轮数
+
+	// 进展检测阈值: 超过此时间 phase/iteration 不变即视为停滞
+	progressStaleThreshold := 10 * time.Minute
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// L1: Activity 心跳检测 (进程是否活着)
 			age := c.LastActivityAge()
 
-			if age > watchdogCriticalThreshold {
+			// L2: 进展检测 (任务是否在前进)
+			pAge := c.ProgressAge()
+			prog := c.CurrentProgress()
+
+			isProgressStagnant := pAge > progressStaleThreshold && prog.Phase != ""
+			if isProgressStagnant {
+				stagnantRounds++
+			} else {
+				stagnantRounds = 0
+			}
+
+			if stagnantRounds >= 3 { // 30min 无进展
+				c.notify(c.chatID, fmt.Sprintf(
+					"🔴 团队 **%s** 已 30 分钟无实际进展 (阶段: %s, 轮次: %d)\n"+
+						"可能陷入无效循环, 建议 /team resume 或手动干预",
+					team.Name, prog.Phase, prog.Iteration))
+				warned = false
+			} else if stagnantRounds >= 1 { // 10min 无进展, 首次告警
+				c.notify(c.chatID, fmt.Sprintf(
+					"⏳ 团队 **%s** 已 %s 停留在阶段 [%s] 轮次 %d, 疑似卡住",
+					team.Name, pAge.Round(time.Minute), prog.Phase, prog.Iteration))
+				warned = true
+			} else if age > watchdogCriticalThreshold {
 				remaining := c.countRemainingTasks(team)
 				c.notify(c.chatID, fmt.Sprintf(
-					"🔴 团队 **%s** 已 **%s** 无进展 (%d 个剩余任务), 可能已卡住\n"+
+					"🔴 团队 **%s** 已 **%s** 无活动 (%d 个剩余任务), 可能已卡住\n"+
 						"▸ 建议: 运行 `/team status %s` 查看详情, 或 `/team resume %s` 尝试恢复",
 					team.Name, age.Round(time.Second), remaining, team.Name, team.Name))
-				warned = false // 重置以便持续告警
+				warned = false
 			} else if age > watchdogStaleThreshold && !warned {
 				c.notify(c.chatID, fmt.Sprintf(
 					"⚠️ 团队 **%s** 已 %s 无新进展, 持续监控中...",
 					team.Name, age.Round(time.Second)))
 				warned = true
-			} else if age < watchdogStaleThreshold {
+			} else if age < watchdogStaleThreshold && stagnantRounds == 0 {
 				warned = false
 			}
 		}

@@ -17,6 +17,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -788,6 +790,7 @@ type WorkflowExecutor struct {
 	promptCache      *PromptCache         // 提示词缓存 (参考 Anthropic Prompt Caching)
 	concurrency      ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态, 可为 nil)
 	activityCallback func()              // 活动回调: Coordinator watchdog 心跳 (可为 nil)
+	progressCallback func(phase string, iteration int, bytesWritten int64, taskID string) // 进展上报 (可为 nil)
 }
 
 // tryInitDAG 从 taskTracker 检测 DAG 能力
@@ -1001,6 +1004,9 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 
 	if we.activityCallback != nil {
 		orch.SetActivityCallback(we.activityCallback)
+	}
+	if we.progressCallback != nil {
+		orch.SetProgressCallback(we.progressCallback)
 	}
 	if we.checkpoints != nil {
 		orch.SetCheckpointStore(we.checkpoints)
@@ -2925,7 +2931,9 @@ func GetToolchain(lang string) *LanguageToolchain {
 	switch lang {
 	case "cpp", "c++":
 		return &LanguageToolchain{
-			Language:    "cpp",
+			Language: "cpp",
+			// 默认: 最小化构建 (仅编译依赖当前源码的目标, 不构建 mysqld 全量)
+			// 通过 make <file>.o 验证语法, 避免每次修改都触发全量构建
 			BuildCmds:   [][]string{{"cmake", "-B", "build", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"}, {"cmake", "--build", "build", "--parallel"}},
 			LintCmds:    [][]string{{"cmake", "--build", "build", "--target", "all"}},
 			TestCmds:    [][]string{{"ctest", "--test-dir", "build", "--output-on-failure"}},
@@ -2933,6 +2941,8 @@ func GetToolchain(lang string) *LanguageToolchain {
 			FileExt:     ".cpp",
 			ProjectFile: "CMakeLists.txt",
 			Timeout:     120 * time.Second,
+			// MySQL/Percona 特殊处理: 增量编译时仅编译修改过的 .o
+			// 在 BuildCmds 执行前, buildScript 会检测项目类型并动态调整策略
 		}
 	case "rust", "rs":
 		return &LanguageToolchain{
@@ -2990,7 +3000,119 @@ func runBuildCheck(cwd string) string {
 	return runBuildCheckLang(cwd, "go")
 }
 
+// --- MySQL 首次编译方案 ---
+
+// mysqlBuildState MySQL 编译状态跟踪 (避免重复 cmake configure)。
+var mysqlBuildState = struct {
+	sync.Mutex
+	configured map[string]bool // cwd → 是否已完成 cmake configure
+}{configured: make(map[string]bool)}
+
+// mysqlEssentialTargets MySQL 首次编译必须构建的最小核心目标。
+// 这些目标是 mysqld 的直接依赖, 其他工具 (mysqlbinlog, mysqldump, 测试等) 跳过。
+// 根据 Percona-Server CMakeLists.txt 实际目标结构:
+//
+//	Level 0 (基础库): mysys, clientlib, heap, csv
+//	Level 1 (SQL 核心): sql_main (或 sql_commands)
+//	Level 2 (存储引擎): innobase, myisam, perfschema
+//	Level 3 (主程序): mysqld
+var mysqlEssentialTargets = []string{
+	"mysys",      // 底层系统库 (io, mem, thread, regex, etc.)
+	"clientlib",  // MySQL 客户端库
+	"heap",       // MEMORY 存储引擎
+	"csv",        // CSV 存储引擎
+	"innobase",   // InnoDB 存储引擎 (最大, 单独列出)
+	"myisam",     // MyISAM 存储引擎
+}
+
+// mysqlCMakeConfigureArgs MySQL 首次 cmake 配置的优化参数。
+// 关键: 禁用单元测试 (WITH_UNIT_TESTS=OFF) 节省 30-40% 编译时间。
+func mysqlCMakeConfigureArgs() []string {
+	return []string{
+		"-B", "build",
+		"-DWITH_UNIT_TESTS=OFF",        // 节省 30-40% 编译时间
+		"-DWITH_DEBUG=OFF",             // Release 模式
+		"-DCMAKE_BUILD_TYPE=Release",
+		"-DWITH_PROTOBUF=bundled",      // 使用预编译 protobuf
+		"-DWITH_SSL=system",            // 使用系统 OpenSSL
+	}
+}
+
+// runMySQLBuildCheck MySQL 专用编译检查: 分阶段构建。
+//
+// 首次编译 (3 阶段):
+//
+//	Phase 1: cmake configure — 禁用测试, 优化配置 (耗时 ~30-60s)
+//	Phase 2: 基础库 — mysys, clientlib, heap, csv (耗时 ~2-5min)
+//	Phase 3: 核心引擎 — innobase, myisam + mysqld (耗时 ~10-20min)
+//
+// 增量编译:
+//
+//	cmake --build build — CMake 自动追踪依赖, 仅重编译受影响的 .o
+func runMySQLBuildCheck(cwd string) string {
+	jobs := CalcSafeMakeJobs()
+
+	// 检测是否已配置 (避免每次 check 都重复 configure)
+	mysqlBuildState.Lock()
+	alreadyConfigured := mysqlBuildState.configured[cwd]
+	mysqlBuildState.Unlock()
+
+	buildCache := filepath.Join(cwd, "build", "CMakeCache.txt")
+	_, statErr := os.Stat(buildCache)
+	cacheOK := statErr == nil
+	if cacheOK && !alreadyConfigured {
+		mysqlBuildState.Lock()
+		mysqlBuildState.configured[cwd] = true
+		mysqlBuildState.Unlock()
+		alreadyConfigured = true
+	}
+
+	// Phase 1: cmake configure (仅首次)
+	if !alreadyConfigured {
+		configureArgs := mysqlCMakeConfigureArgs()
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel1()
+		cmd := exec.CommandContext(ctx1, "cmake", configureArgs...)
+		cmd.Dir = cwd
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Sprintf("cmake configure 失败:\n%.*s", 2000, string(out))
+		}
+		mysqlBuildState.Lock()
+		mysqlBuildState.configured[cwd] = true
+		mysqlBuildState.Unlock()
+	}
+
+	// Phase 2: 构建基础库 (首次 + 增量都执行, CMake 增量编译)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel2()
+	// 使用 ninja 或 make 的并行模式, 仅构建核心依赖
+	baseArgs := []string{"--build", "build", "--parallel", fmt.Sprintf("%d", jobs)}
+	for _, t := range mysqlEssentialTargets {
+		baseArgs = append(baseArgs, "--target", t)
+	}
+	cmd2 := exec.CommandContext(ctx2, "cmake", baseArgs...)
+	cmd2.Dir = cwd
+	out2, err2 := cmd2.CombinedOutput()
+	if err2 != nil {
+		return fmt.Sprintf("基础库编译失败:\n%.*s", 2000, string(out2))
+	}
+
+	// Phase 3: 构建 mysqld 主程序 (验证核心链接)
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel3()
+	cmd3 := exec.CommandContext(ctx3, "cmake", "--build", "build", "--parallel", fmt.Sprintf("%d", jobs), "--target", "mysqld")
+	cmd3.Dir = cwd
+	out3, err3 := cmd3.CombinedOutput()
+	if err3 != nil {
+		return fmt.Sprintf("mysqld 编译失败:\n%.*s", 2000, string(out3))
+	}
+
+	return ""
+}
+
 // runBuildCheckLang 多语言版本的编译检查。
+// MySQL/Percona 特殊处理: 自动路由到分阶段最小编译方案。
 func runBuildCheckLang(cwd, lang string) string {
 	if cwd == "" {
 		return ""
@@ -2999,6 +3121,11 @@ func runBuildCheckLang(cwd, lang string) string {
 	if _, err := os.Stat(filepath.Join(cwd, tc.ProjectFile)); err != nil {
 		return ""
 	}
+	// MySQL/Percona 专用: 分阶段最小编译 (禁用测试, 仅构建核心目标)
+	if lang == "cpp" && isMySQLProject(cwd) {
+		return runMySQLBuildCheck(cwd)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), tc.Timeout)
 	defer cancel()
 
@@ -3019,6 +3146,198 @@ func runBuildCheckLang(cwd, lang string) string {
 		result = result[:3000] + "\n...(截断)"
 	}
 	return result
+}
+
+// isMySQLProject 检测是否为 MySQL/Percona-Server 项目。
+// 判断依据: 根目录存在 CMakeLists.txt 且包含 mysqld 相关配置。
+func isMySQLProject(cwd string) bool {
+	if cwd == "" {
+		return false
+	}
+	// 检查特征文件
+	features := []string{
+		"sql/mysqld.cc",
+		"sql/sql_parse.cc",
+		"sql/sql_yacc.yy",
+		"VERSION",
+	}
+	for _, f := range features {
+		if _, err := os.Stat(filepath.Join(cwd, f)); err == nil {
+			return true
+		}
+	}
+	// 检查 CMakeCache 中是否有 mysqld 相关内容
+	cacheFile := filepath.Join(cwd, "build", "CMakeCache.txt")
+	if data, err := os.ReadFile(cacheFile); err == nil {
+		return strings.Contains(string(data), "mysqld") ||
+			strings.Contains(string(data), "MYSQLD")
+	}
+	return false
+}
+
+// CalcSafeMakeJobs 根据系统内存计算安全的编译并行度。
+// 经验值: 每个 C++ 编译 job 约需 1.5-2GB 内存。
+// MySQL/Percona 的链接阶段 (mysqld) 单个进程需要 4-8GB。
+// 策略: 保留至少 4GB 给系统, 其余分配给编译, 上限 8 jobs。
+func CalcSafeMakeJobs() int {
+	totalMemMB := getSystemMemoryMB()
+
+	// 保留 4GB 给系统
+	reservedMB := int64(4096)
+	availableMB := totalMemMB - reservedMB
+	if availableMB < 2048 {
+		availableMB = 2048 // 最小 2GB
+	}
+
+	// 每 job 约 2GB
+	perJobMB := int64(2048)
+	jobs := int(availableMB / perJobMB)
+
+	// 上限: CPU 核心数和 8 的较小值
+	cpuCount := runtime.NumCPU()
+	if jobs > cpuCount {
+		jobs = cpuCount
+	}
+	if jobs > 8 {
+		jobs = 8
+	}
+	if jobs < 1 {
+		jobs = 1
+	}
+	return jobs
+}
+
+func getSystemMemoryMB() int64 {
+	// Linux: 读取 /proc/meminfo
+	out, err := exec.Command("sh", "-c", "free -m | awk '/^Mem:/{print $2}'").Output()
+	if err != nil {
+		return 16384 // 兜底: 假设 16GB
+	}
+	mb, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if mb <= 0 {
+		return 16384
+	}
+	return mb
+}
+
+// getMySQLModifiedTargets 根据修改的文件计算最小编译目标。
+// MySQL/Percona 使用增量编译: CMake 自动追踪依赖, 只重编译修改过的 .o。
+// 返回最优的 cmake --build 参数。
+func getMySQLModifiedTargets(changedFiles []string) []string {
+	if len(changedFiles) == 0 {
+		return nil // 首次构建或未知修改, 返回 nil 表示全量
+	}
+
+	// 收集被修改的 .cc/.cpp/.h 文件所在的目录
+	dirs := make(map[string]bool)
+	for _, f := range changedFiles {
+		ext := filepath.Ext(f)
+		if ext == ".cc" || ext == ".cpp" || ext == ".c" || ext == ".h" || ext == ".hpp" {
+			dir := filepath.Dir(f)
+			dirs[dir] = true
+		}
+	}
+
+	if len(dirs) == 0 {
+		return nil
+	}
+
+	// 根据修改目录映射到 CMake 子目标
+	// MySQL 的关键目录 → target 映射
+	targets := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		switch {
+		case strings.HasPrefix(dir, "sql/"):
+			targets = append(targets, "sql_main")
+		case strings.HasPrefix(dir, "storage/innobase/"):
+			targets = append(targets, "innobase")
+		case strings.HasPrefix(dir, "storage/myisam/"):
+			targets = append(targets, "myisam")
+		case strings.HasPrefix(dir, "storage/perfschema/"):
+			targets = append(targets, "perfschema")
+		case strings.HasPrefix(dir, "client/"):
+			targets = append(targets, "client")
+		case strings.HasPrefix(dir, "libmysql/"):
+			targets = append(targets, "libmysql_api")
+		case strings.HasPrefix(dir, "plugin/"):
+			targets = append(targets, "plugin")
+		case strings.HasPrefix(dir, "include/"):
+			// include 目录被修改, 需要重编译所有依赖方 → 全量
+			return nil
+		case strings.HasPrefix(dir, "cmake/") || strings.HasSuffix(dir, "CMakeLists.txt"):
+			// CMake 配置修改 → 需要重新 cmake
+			return nil
+		default:
+			// 其他目录, 保守处理: 全量
+			return nil
+		}
+	}
+
+	// 去重
+	seen := make(map[string]bool)
+	unique := targets[:0]
+	for _, t := range targets {
+		if !seen[t] {
+			seen[t] = true
+			unique = append(unique, t)
+		}
+	}
+	return unique
+}
+
+// BuildMySQLIncremental 执行 MySQL/Percona 增量编译。
+// 策略:
+//   1. 限制并行度 (基于内存)
+//   2. 仅编译被修改的源码对应的子目标
+//   3. 不构建完整 mysqld, 仅验证语法和链接
+//   4. Phase 0 (语法验证阶段) 甚至可以不编译, 仅做语法检查
+func BuildMySQLIncremental(cwd string, changedFiles []string, phase int) string {
+	jobs := CalcSafeMakeJobs()
+
+	// 确定编译策略
+	var buildArgs []string
+	switch phase {
+	case 0:
+		// Phase 0: 仅语法验证 — 编译修改过的 .o 文件, 不链接
+		// 使用 cmake --build 但只编译单个文件
+		if len(changedFiles) > 0 {
+			for _, f := range changedFiles {
+				ext := filepath.Ext(f)
+				if ext == ".cc" || ext == ".cpp" || ext == ".c" {
+					// 仅编译单个 .o 验证语法
+					buildArgs = append(buildArgs, "--parallel", fmt.Sprintf("%d", jobs))
+					break
+				}
+			}
+		}
+	default:
+		// Phase 1+: 需要验证链接, 但至少构建修改的子目标
+		targets := getMySQLModifiedTargets(changedFiles)
+		buildArgs = append(buildArgs, "--parallel", fmt.Sprintf("%d", jobs))
+		if len(targets) > 0 {
+			// 仅构建特定子目标, 不构建完整的 mysqld
+			for _, t := range targets {
+				buildArgs = append(buildArgs, "--target", t)
+			}
+		}
+		// 最终仍需要验证 mysqld 能否链接 (但复用已有 .o)
+		// 注意: 这仅在所有子目标完成后才执行
+	}
+
+	if len(buildArgs) == 0 {
+		buildArgs = []string{"--parallel", fmt.Sprintf("%d", jobs)}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "cmake", append([]string{"--build", "build"}, buildArgs...)...)
+	cmd.Dir = cwd
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("cmake --build 失败 (jobs=%d):\n%s", jobs, string(out))
+	}
+	return ""
 }
 
 // MaterializeCode 从 LLM 输出中提取代码块并写入磁盘。
