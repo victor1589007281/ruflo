@@ -1276,7 +1276,7 @@ func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, o
 		taskObjective += "\n\n设计参考:\n" + designCtx
 	}
 
-	userPrompt := BuildSkepticalEvaluatorUserPrompt(taskObjective, node.Output, buildPassed)
+	userPrompt := BuildSkepticalEvaluatorUserPrompt(taskObjective, node.Output)
 
 	reviewCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
