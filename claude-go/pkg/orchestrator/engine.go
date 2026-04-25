@@ -204,6 +204,28 @@ type ExecutionResult struct {
 //  3. 流式派发: doneCh 是核心通道, 任务完成即刻触发下一轮调度
 //  4. 停滞检测: 30s 定时器检查 lastProgress, 超阈值则尝试恢复
 //  5. 检查点: 每完成 CheckpointEvery 个任务, 序列化全量状态到磁盘
+/**
+ * Run - 引擎主循环：调度 → 派发 → 等待 → 处理完成信号 → 重复直到所有任务终态
+ *
+ * 核心设计解读:
+ * ┌─────────────────────────────────────────────────────┐
+ * │  主循环是一个状态机，每次迭代做以下三件事之一：        │
+ * │  1. 调度一批 Ready 任务 (Filter→Score→Dispatch)      │
+ * │  2. 处理完成信号 (从 doneCh 读取)                    │
+ * │  3. 停滞检测 (30s 定时器)                            │
+ * │                                                     │
+ * │  关键：任务完成时立即 drain 排空通道中剩余的完成信号    │
+ * │  这减少了调度轮次，一次可以批量处理多个完成事件         │
+ * └─────────────────────────────────────────────────────┘
+ *
+ * 并发控制示例 (假设 maxPar=2):
+ *   Round 1: 调度 2 个任务 (avail=2) → 2 个 goroutine 执行 → doneCh 最多 2 个信号排队
+ *   Round 2: 收到 1 个完成信号 → handleDone → drain 排空第 2 个 → 重新调度 (avail=2)
+ *   Round 3: 收到 2 个完成信号 (同时完成) → handleDone → drain 不阻塞 → 重新调度 (avail=2)
+ *
+ * 时间复杂度: 每轮调度 O(V log V) [排序], 总轮数 = O(V / maxPar)
+ * 总体时间复杂度: O(V² log V / maxPar)，但实际远小于此（因为 ReadyTasks 通常只返回少量任务）
+ */
 func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 	if err := g.Build(); err != nil {
 		return nil, fmt.Errorf("图构建失败: %w", err)
@@ -223,7 +245,9 @@ func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 	e.mu.Unlock()
 	defer func() { e.mu.Lock(); e.running = false; e.mu.Unlock() }()
 
-	// 自动适配并发度: 不超过 DAG 最大宽度
+	// 自动适配并发度: maxPar = min(config.MaxParallel, DAGWidth)
+	// 举例: 配置 MaxParallel=8 但 DAG 最大宽度只有 4（即最多 4 个任务能并行）
+	// 则 maxPar=4，避免创建多余的 goroutine 浪费资源
 	maxPar := e.config.MaxParallel
 	if maxPar <= 0 || maxPar > g.DAGWidth() {
 		maxPar = g.DAGWidth()
@@ -237,8 +261,13 @@ func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 	// 完成信号通道: 任务 goroutine 完成后向此通道发送结果
 	doneCh := make(chan taskDone, maxPar*2)
 
-	// 停滞检测定时器
-	stallTicker := time.NewTicker(30 * time.Second)
+	// 停滞检测定时器: 使用 StallTimeout / 10 作为检测间隔
+	// 例如 StallTimeout=5min → 检测间隔=30s
+	stallCheckInterval := e.config.StallTimeout / 10
+	if stallCheckInterval < 5*time.Second {
+		stallCheckInterval = 5 * time.Second // 最少 5 秒，避免过于频繁检测
+	}
+	stallTicker := time.NewTicker(stallCheckInterval)
 	defer stallTicker.Stop()
 
 	totalTasks := g.TaskCount()
@@ -299,6 +328,18 @@ func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 				e.handleDone(g, done)
 			default:
 				break drain
+			}
+		}
+
+		// 超时排空: 处理正在发送中但还未到达通道的信号 (最多 5ms)
+		// 这减少了高并发下的任务状态短暂不一致窗口
+drainTimeout:
+		for {
+			select {
+			case done := <-doneCh:
+				e.handleDone(g, done)
+			case <-time.After(5 * time.Millisecond):
+				break drainTimeout
 			}
 		}
 	}

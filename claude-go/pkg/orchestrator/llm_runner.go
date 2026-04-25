@@ -378,13 +378,13 @@ func (e *LLMExpander) OnTaskComplete(task *Task, output any) ([]*Task, []Edge) {
 输出:
 %v
 
-如果需要拆分, 返回 JSON:
+如果需要拆分, 返回 JSON (最多 %d 个子任务, 不要超过此限制):
 {"tasks":[{"id":"sub-xxx","name":"子任务名","prompt":"子任务提示词","priority":5}]}
 
 如果不需要拆分, 返回:
 {"tasks":[]}
 
-只返回 JSON, 不要其他内容。`, task.Name, output)
+只返回 JSON, 不要其他内容。`, task.Name, output, e.maxExpand)
 
 	resp, err := e.llm.SimpleComplete(ctx, "你是一个任务分解专家。分析任务输出决定是否需要进一步拆分。", prompt)
 	if err != nil {

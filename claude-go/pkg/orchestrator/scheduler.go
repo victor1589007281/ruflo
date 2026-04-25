@@ -113,6 +113,35 @@ func (s *Scheduler) AddScorer(sc ScorePlugin) {
 // 为什么关键路径任务优先?
 //   关键路径是 DAG 中最长的依赖链, 决定了最短完成时间。
 //   优先执行关键路径任务可以最小化该链的完成时间, 从而缩短整体耗时。
+/**
+ * Schedule - 三阶段调度管线 (借鉴 K8s 调度器设计)
+ *
+ * Phase 1: Filter (硬约束) - 不能妥协的条件, 任一不满足则排除该任务
+ *   - DependencyFilter: 所有上游依赖必须已完成 (这是最基本的, 否则没有输入数据)
+ *   - ResourceFilter: 背压队列还有空间 (否则塞满会 OOM)
+ *   - 用户自定义 Filter: 比如冲突检测、标签过滤等
+ *
+ * Phase 2: Score (软偏好) - 可妥协的偏好, 分数越高越优先调度
+ *   - PriorityScore = Priority × 100 (用户设定的优先级)
+ *   - CriticalPathScore = 500 (如果在关键路径上) — 关键路径任务优先可缩短整体耗时
+ *   - FairnessScore = -Retries × 50 (重试越多分越低, 防止饥饿)
+ *   - 用户自定义 Score: 比如资源亲和性、反亲和性等
+ *
+ * Phase 3: Dispatch (截断) - 取前 maxBatch 个任务派发执行
+ *
+ * 打分示例 (4 个并行任务, maxBatch=2):
+ *   academic-tutor (Priority=5, 关键路径) → 5×100 + 500 + 0 = 1000 ✓ 选中
+ *   dev-assessor   (Priority=5, 关键路径) → 5×100 + 500 + 0 = 1000 ✓ 选中 (同分, 排序在前)
+ *   psych-coach    (Priority=5, 非关键路径) → 5×100 + 0 + 0 = 500  ✗ 未选中 (超出批次)
+ *   parent-advisor (Priority=5, 非关键路径) → 5×100 + 0 + 0 = 500  ✗ 未选中 (超出批次)
+ *   下轮调度时再派 psych-coach 和 parent-advisor。
+ *
+ * 时间复杂度: O(V × F + V × S + V log V) = O(V log V)
+ *   - Filter: V 个任务 × F 个过滤器 → O(V × F)
+ *   - Score: V 个任务 × S 个打分器 → O(V × S)
+ *   - Sort: V 个任务排序 → O(V log V)
+ *   F 和 S 通常很小 (2-4), 所以实际为 O(V log V)
+ */
 func (s *Scheduler) Schedule(ctx *SchedulerContext, maxBatch int) []*Task {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -155,12 +184,13 @@ func (s *Scheduler) Schedule(ctx *SchedulerContext, maxBatch int) []*Task {
 		}
 		items[i] = scored{task: t, score: total}
 	}
-	// 按分数降序排序
+	// 按分数降序排序 (高分优先)
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].score > items[j].score
 	})
 
 	// ---- Phase 3: 派发 (截断到 maxBatch) ----
+	// 只取前 maxBatch 个, 其余留在 Ready 状态等下一轮调度
 	n := len(items)
 	if maxBatch > 0 && n > maxBatch {
 		n = maxBatch

@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+func init() {
+	// 初始化随机种子, 避免退避抖动在不同进程实例中完全一致
+	// (例如多个服务实例同时启动, 默认种子=1 会导致退避模式完全同步)
+	rand.Seed(time.Now().UnixNano())
+}
+
 // ErrorKind 将错误分为三个层级, 对应不同的处理策略。
 //
 //	致命 (Fatal)  → 立即停止, 不重试
@@ -115,6 +121,44 @@ type RetryDecision struct {
 //	致命 → 永不重试
 //	瞬态 → 允许 MaxRetries + MaxTransient 次重试, 使用 TransientBase 退避
 //	永久 → 允许 MaxRetries 次重试, 使用 BaseDelay 退避
+/**
+ * ShouldRetry - 根据错误类型和已尝试次数，做出重试决策（是否重试 + 等多久）
+ *
+ * 决策树:
+ *   ErrorFatal (API Key 无效/配额耗尽)
+ *     └── 永不重试, 立即返回 Failure
+ *        原因: 基础设施级问题, 重试不可能成功, 只会浪费时间和资源
+ *
+ *   ErrorTransient (429 限流/网络超时/连接重置)
+ *     ├── 已尝试次数 < MaxRetries + MaxTransient (默认 2 + 5 = 7)
+ *     │    └── 重试! 使用 TransientBase (10s) 计算退避延迟
+ *     │        为什么用更长的 base? LLM 限流通常持续数秒, 10s 的 base 给系统更多恢复时间
+ *     │
+ *     └── 额度耗尽 (7 次都失败)
+ *          └── 挂起 (Suspended), 不级联下游, 等待 stallRecovery 唤醒
+ *             原因: LLM 限流是暂时的, 挂起比直接失败更合理, 可能过一会就能恢复
+ *
+ *   ErrorPermanent (验证失败/代码质量不达标)
+ *     ├── 已尝试次数 < MaxRetries (默认 2)
+ *     │    └── 重试! 使用 BaseDelay (2s) 计算退避延迟
+ *     │        为什么用较短的 base? Permanent 错误重试的目的是让 LLM 改进输出,
+ *     │        但 retry 无退避也没意义, 因为同样的 prompt 会得到同样的结果。
+ *     │        实际重试中, 延迟由 AdversarialRunner 等上层逻辑通过 feedback 来改变结果。
+ *     │
+ *     └── 额度耗尽
+ *          └── 失败 (Failed) + 级联取消所有下游 (Cancelled)
+ *             原因: 上游数据无效, 下游不可能产出正确结果
+ *
+ * 默认配置下的最大重试时间估算 (Transient):
+ *   attempt 0: delay=random(0,10s) → 平均 5s, 累计 5s
+ *   attempt 1: delay=random(0,20s) → 平均 10s, 累计 15s
+ *   attempt 2: delay=random(0,40s) → 平均 20s, 累计 35s
+ *   attempt 3: delay=random(0,80s) → 平均 40s, 累计 75s (约 1.25min)
+ *   attempt 4: delay=random(0,120s) → 平均 60s, 累计 135s (约 2.25min)
+ *   attempt 5: delay=random(0,120s) → 平均 60s, 累计 195s (约 3.25min)
+ *   attempt 6: delay=random(0,120s) → 平均 60s, 累计 255s (约 4.25min)
+ *   总平均等待时间 ≈ 4.25 分钟, 之后如果仍失败则挂起。
+ */
 func (p RetryPolicy) ShouldRetry(errMsg string, attempt int) RetryDecision {
 	kind := ClassifyErrorMsg(errMsg)
 	switch kind {

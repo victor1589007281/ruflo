@@ -1031,7 +1031,8 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		}
 
 		// === Step 2: Reviewer 审查 (复用 SkepticalReviewerPersona + ParseEvalScoreJSON) ===
-		score := o.runSkepticalReview(ctx, node, objective, lastScore)
+		// 根因修复: 将编译状态注入 reviewer prompt, 避免编译通过仍给 0 分的问题。
+		score := o.runSkepticalReview(ctx, node, objective, lastScore, buildPassed)
 		lastScore = score
 
 		// === Step 3: Tester micro-test + 瓶颈分类 (参考 GLM 5.1) ===
@@ -1262,7 +1263,8 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 
 // runSkepticalReview 复用 SkepticalReviewerPersona + BuildSkepticalEvaluatorUserPrompt + ParseEvalScoreJSON。
 // lastScore: 上一轮分数, 解析失败时 hold-last-value 而不是返回全零 (避免噪声注入 terminator)。
-func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, objective string, lastScore EvalScore) EvalScore {
+// buildPassed: 硬门禁结果, 注入 prompt 避免编译通过仍给 0 分 (根因修复)。
+func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, objective string, lastScore EvalScore, buildPassed bool) EvalScore {
 	if o.factory == nil {
 		return EvalScore{Pass: true, Correctness: 8, Completeness: 8, Security: 8, CodeQuality: 8}
 	}
@@ -1274,7 +1276,7 @@ func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, o
 		taskObjective += "\n\n设计参考:\n" + designCtx
 	}
 
-	userPrompt := BuildSkepticalEvaluatorUserPrompt(taskObjective, node.Output)
+	userPrompt := BuildSkepticalEvaluatorUserPrompt(taskObjective, node.Output, buildPassed)
 
 	reviewCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()

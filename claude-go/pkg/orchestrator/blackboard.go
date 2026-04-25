@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,6 +146,8 @@ func (b *Blackboard) Write(key string, value any, meta WriteMeta) (int64, error)
 				select {
 				case ch <- evt:
 				default:
+					// 消费者过慢导致通道满, 丢弃事件但记录警告便于排查 "为什么没收到事件"
+					log.Printf("[blackboard] Watcher 通道已满, 丢弃事件: key=%s, prefix=%s", key, prefix)
 				}
 			}
 		}

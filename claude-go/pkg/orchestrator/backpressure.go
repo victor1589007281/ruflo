@@ -23,26 +23,45 @@ type TokenBucket struct {
 	capacity float64   // 桶容量 (最大突发)
 	tokens   float64   // 当前令牌数
 	lastTime time.Time // 上次计算令牌的时间
+	cond     *sync.Cond // 用于通知令牌补充完成, 避免 busy-loop
 }
 
 // NewTokenBucket 创建一个令牌桶。初始令牌数 = 桶容量 (允许启动时的突发)。
 func NewTokenBucket(ratePerSec, capacity float64) *TokenBucket {
-	return &TokenBucket{
+	tb := &TokenBucket{
 		rate:     ratePerSec,
 		capacity: capacity,
 		tokens:   capacity,
 		lastTime: time.Now(),
 	}
+	tb.cond = sync.NewCond(&tb.mu)
+	return tb
 }
 
-// Acquire 阻塞获取一个令牌。如果令牌不足, 计算需要等待的时间并 sleep。
-// 支持通过 ctx 取消等待。
+/**
+ * Acquire - 阻塞获取一个令牌 (如果令牌不足, 等待令牌补充)
+ *
+ * 演算示例 (rate=10/s, capacity=5):
+ *   时刻 T0: tokens=5 (满桶)
+ *   请求 1: tokens=4 → 立即返回
+ *   请求 2: tokens=3 → 立即返回
+ *   请求 3: tokens=2 → 立即返回
+ *   请求 4: tokens=1 → 立即返回
+ *   请求 5: tokens=0 → 立即返回 (桶空)
+ *   请求 6: tokens=0 → 需要等待 (1-0)/10 = 0.1s → sleep 100ms → 醒来后 tokens>=1 → 返回 ✓
+ *   请求 7: tokens=0.0 (被上一个请求消耗) → 等待 100ms → ...
+ *
+ * 突发能力: 桶满时可以连续处理 5 个请求 (capacity=5), 之后回到稳态每 100ms 处理 1 个。
+ * 这就是 RPM 控制的本质: 长期平均速率 = rate, 短期允许突发 = capacity 个请求。
+ *
+ * 并发安全: 使用 sync.Cond 替代 busy-loop, 多个等待者共享同一个唤醒信号,
+ * 避免每个等待者都创建独立的 time.After 导致的不精确问题。
+ */
 func (tb *TokenBucket) Acquire(ctx context.Context) error {
 	for {
 		tb.mu.Lock()
 		now := time.Now()
 		elapsed := now.Sub(tb.lastTime).Seconds()
-		// 按经过时间补充令牌, 不超过容量
 		tb.tokens = math.Min(tb.capacity, tb.tokens+elapsed*tb.rate)
 		tb.lastTime = now
 		if tb.tokens >= 1 {
@@ -50,14 +69,31 @@ func (tb *TokenBucket) Acquire(ctx context.Context) error {
 			tb.mu.Unlock()
 			return nil
 		}
-		// 计算需要等待多久才能补充到 1 个令牌
+		// 计算需要等待多久才能补充到 1 个令牌: wait = (缺额 / 速率)
 		wait := time.Duration((1 - tb.tokens) / tb.rate * float64(time.Second))
-		tb.mu.Unlock()
 
+		// 启动唤醒 goroutine: 超时或 ctx 取消时广播通知等待者重试
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				tb.cond.Broadcast()
+			case <-time.After(wait):
+				tb.cond.Broadcast()
+			case <-done:
+			}
+		}()
+		// Wait: 解锁 → 等待 Broadcast → 重新加锁 → 返回后进入下一轮循环重新计算令牌
+		tb.cond.Wait()
+		close(done)
+
+		// 检查 ctx 是否已取消
 		select {
 		case <-ctx.Done():
+			tb.mu.Unlock()
 			return ctx.Err()
-		case <-time.After(wait):
+		default:
+			tb.mu.Unlock()
 		}
 	}
 }
@@ -139,17 +175,43 @@ func (s *AdaptiveSemaphore) Acquire(ctx context.Context) error {
 	}
 }
 
-// Release 归还并发许可, 并根据成败调整上限 (AIMD)。
+/**
+ * Release - 归还并发许可 + AIMD 自适应调整 (核心拥塞控制逻辑)
+ *
+ * AIMD 演算 (Additive Increase Multiplicative Decrease):
+ *   初始 limit=8, min=1, max=16
+ *
+ *   成功路径 (缓慢增长, 探索系统能力):
+ *     Release(true)  → limit = 8+1 = 9
+ *     Release(true)  → limit = 9+1 = 10
+ *     Release(true)  → limit = 10+1 = 11
+ *     ... 逐步增长到 maxLimit=16
+ *
+ *   失败路径 (快速收缩, 保护系统):
+ *     Release(false) → limit = 11/2 = 5 (瞬间减半!)
+ *     Release(true)  → limit = 5+1 = 6
+ *     Release(false) → limit = 6/2 = 3
+ *     Release(false) → limit = 3/2 = 1 (降到 minLimit, 不再降)
+ *
+ *   为什么成功只+1，失败却/2?
+ *     - 成功说明系统还有余力, 但不知道余量有多少, 所以缓慢试探 (+1)
+ *     - 失败说明系统过载, 必须立即释放资源 (/2)
+ *     - 这正是 TCP 拥塞控制的精髓: "乐观时保守, 悲观时激进"
+ *
+ *   在 LLM 编排场景中的表现:
+ *     当 LLM API 开始 429 时, 多个任务并发失败 → limit 快速降低 → 减少并发请求 → API 恢复 → 逐步回升。
+ *     整个过程自动调节, 无需人工干预。
+ */
 func (s *AdaptiveSemaphore) Release(success bool) {
 	atomic.AddInt32(&s.current, -1)
 	s.mu.Lock()
 	if success {
-		// 加性增加: 成功时 +1, 不超过最大值
+		// 加性增加: 成功时 +1, 不超过最大值 (缓慢探索)
 		if s.limit < s.maxLimit {
 			s.limit++
 		}
 	} else {
-		// 乘性降低: 失败时减半, 不低于最小值
+		// 乘性降低: 失败时减半, 不低于最小值 (快速退避)
 		newLimit := s.limit / 2
 		if newLimit < s.minLimit {
 			newLimit = s.minLimit

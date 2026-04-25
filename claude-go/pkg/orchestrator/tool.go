@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -275,10 +276,14 @@ func (te *ToolEngine) handleRunGraph(ctx context.Context, params map[string]any)
 		te.mu.Unlock()
 
 		go func() {
-			result, _ := te.engine.Run(execCtx, g)
+			result, err := te.engine.Run(execCtx, g)
 			te.mu.Lock()
 			te.results[graphID] = result
 			delete(te.cancels, graphID)
+			// 如果异步执行出错, 记录到日志中, 便于后续通过 get_status 排查问题
+			if err != nil {
+				log.Printf("[tool] 异步执行图 %s 失败: %v", graphID, err)
+			}
 			te.mu.Unlock()
 		}()
 

@@ -259,6 +259,27 @@ func (g *Graph) AddEdge(e Edge) error {
 //   所以 visited 必然 < total
 //
 // 时间复杂度: O(V + E), 每个节点和边各访问常数次
+/**
+ * Build - 预计算邻接表 + 环路检测 + 初始化任务状态 (Build 后 DAG 才能被 Engine.Run 使用)
+ *
+ * Kahn 算法原理:
+ *   1. 计算每个节点的入度（有多少条边指向它）
+ *   2. 入度为 0 的节点入队（没有依赖，可以直接执行）
+ *   3. 出队一个节点，将其所有下游节点的入度减 1；如果下游节点入度变为 0，入队
+ *   4. 重复步骤 3 直到队列为空
+ *   5. 如果访问的节点数 != 总节点数 → 存在环路（环内节点的入度永远不会减到 0）
+ *
+ * 为什么要建邻接表 (downstream/upstream)?
+ *   如果不建邻接表，每次检查下游依赖需要遍历所有边: O(E)
+ *   建了邻接表后: O(1) 查找某个任务的直接下游/上游 → 大幅提升 unblockDownstream 和 cascadeFailure 的性能
+ *
+ * 时间复杂度: O(V + E)
+ *   - 构建邻接表: O(E) 遍历所有边
+ *   - 计算入度: O(E)
+ *   - Kahn 排序: 每个节点出队一次，每条边访问一次 → O(V + E)
+ *   - 初始化状态: O(V) 遍历所有任务 + O(V + E) 填充 DependsOn
+ * 总: O(V + E)
+ */
 func (g *Graph) Build() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -306,7 +327,7 @@ func (g *Graph) Build() error {
 		return fmt.Errorf("图中存在环路: 已访问 %d / 共 %d 个任务", visited, len(g.Tasks))
 	}
 
-	// 初始化任务状态: 无上游 → Ready, 有上游 → Blocked
+	// 初始化任务状态: 无上游 → Ready, 有上游 → Blocked (依赖满足前不能执行)
 	for id, t := range g.Tasks {
 		deps := g.upstream[id]
 		if len(deps) == 0 {
