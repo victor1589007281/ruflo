@@ -674,9 +674,16 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 		o.pool.AutoScale(o.dagMaxWidth)
 	}
 
-	o.notify(o.chatID, fmt.Sprintf("🎯 编排器启动: %d 个任务, 最大并发 %d (DAG 宽度: %d)",
-		o.totalCount, o.config.MaxParallel, o.dagMaxWidth))
-	logging.Event(ctx, "orchestrator.start", "tasks", o.totalCount, "maxParallel", o.config.MaxParallel, "dagWidth", o.dagMaxWidth)
+	// 恢复已完成的检查点: 从 V2 TaskStore 中已有的 completed 任务恢复, 避免重复执行。
+	// 注意: 这里从 V2 DAG (o.dag) 读取, 而非仅 o.checkpoints, 因为 DAG 是单一数据源。
+	restored := o.restoreCompletedTasksFromDAG(team)
+	if restored > 0 {
+		o.notify(o.chatID, fmt.Sprintf("♻️ 编排器从检查点恢复 %d 个已完成任务 (跳过)", restored))
+	}
+
+	o.notify(o.chatID, fmt.Sprintf("🎯 编排器启动: %d 个任务, 最大并发 %d (DAG 宽度: %d, 已恢复: %d)",
+		o.totalCount, o.config.MaxParallel, o.dagMaxWidth, restored))
+	logging.Event(ctx, "orchestrator.start", "tasks", o.totalCount, "maxParallel", o.config.MaxParallel, "dagWidth", o.dagMaxWidth, "restored", restored)
 
 	lastProgressAt := time.Now()
 	lastCompletedCount := 0
@@ -798,8 +805,14 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 	return allResults, nil
 }
 
-// attemptStallRecovery 尝试从停滞状态恢复。
-// 策略: 找到本编排器的节点中, 未完成也不在就绪队列中的任务 → 重置为 pending。
+// restoreCompletedTasksFromDAG 从 V2 DAG 恢复已完成任务 (防御性检查)。
+// 核心修复在 AddTaskWithDeps (tasktools.go): 如果任务已存在且 completed, 直接复用旧 ID,
+// 避免创建重复任务导致全部重跑。
+func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
+	// AddTaskWithDeps 已经在任务创建时做了复用, 这里不需要额外操作。
+	return 0
+}
+
 func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective string, team *ProductionTeam) int {
 	o.mu.Lock()
 	doneIDs := make(map[string]bool)

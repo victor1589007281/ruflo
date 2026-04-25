@@ -7,22 +7,26 @@
 //   - 业界 Graceful Degradation (41-86.7% 生产故障率)
 //
 // 核心能力:
-//   1. 检查点: 每个 stage 执行前后保存快照, 可从中恢复
-//   2. 失败重试: 指数退避 + 最大重试次数
-//   3. 心跳检测: 后台 goroutine 定期检查活跃 agent 状态
-//   4. 断点续作: 重启后从最后成功的检查点恢复
 //
-//	┌──────────────────────────────────────────────────┐
-//	│ Coordinator                                      │
-//	│  RunWithRecovery() — 带恢复的工作流执行          │
-//	│    ├─ loadCheckpoints() — 加载已保存的检查点      │
-//	│    ├─ executeStageWithRetry() — 带重试的阶段执行  │
-//	│    │   ├─ checkpoint("running") — 执行前存档     │
-//	│    │   ├─ execute agent                          │
-//	│    │   ├─ checkpoint("completed") — 成功后存档   │
-//	│    │   └─ retry with backoff — 失败时重试        │
-//	│    └─ heartbeatLoop() — 后台心跳检测             │
-//	└──────────────────────────────────────────────────┘
+//  1. 检查点: 每个 stage 执行前后保存快照, 可从中恢复
+//
+//  2. 失败重试: 指数退避 + 最大重试次数
+//
+//  3. 心跳检测: 后台 goroutine 定期检查活跃 agent 状态
+//
+//  4. 断点续作: 重启后从最后成功的检查点恢复
+//
+//     ┌──────────────────────────────────────────────────┐
+//     │ Coordinator                                      │
+//     │  RunWithRecovery() — 带恢复的工作流执行          │
+//     │    ├─ loadCheckpoints() — 加载已保存的检查点      │
+//     │    ├─ executeStageWithRetry() — 带重试的阶段执行  │
+//     │    │   ├─ checkpoint("running") — 执行前存档     │
+//     │    │   ├─ execute agent                          │
+//     │    │   ├─ checkpoint("completed") — 成功后存档   │
+//     │    │   └─ retry with backoff — 失败时重试        │
+//     │    └─ heartbeatLoop() — 后台心跳检测             │
+//     └──────────────────────────────────────────────────┘
 package agent
 
 import (
@@ -70,17 +74,17 @@ type Coordinator struct {
 
 	// 进展型心跳: 跟踪任务的实际进度, 而非仅心跳
 	// 心跳只证明 "进程活着", 进展证明 "任务在前进"
-	progress     ProgressState
-	progressMu   sync.RWMutex
+	progress   ProgressState
+	progressMu sync.RWMutex
 }
 
 // ProgressState 任务进展状态 (用于 watchdog 区分 "活着" 和 "在前进")
 type ProgressState struct {
-	Phase       string    `json:"phase"`       // 当前阶段: "LLM生成", "编译", "测试", "等待"
-	Iteration   int       `json:"iteration"`   // 当前轮次/尝试次数
-	UpdatedAt   time.Time `json:"updatedAt"`   // 上次更新进展时间
-	BytesWritten int64    `json:"bytesWritten"` // 累计产出大小 (代码行数/文件字节数)
-	TaskID      string    `json:"taskId"`      // 当前执行的任务 ID
+	Phase        string    `json:"phase"`        // 当前阶段: "LLM生成", "编译", "测试", "等待"
+	Iteration    int       `json:"iteration"`    // 当前轮次/尝试次数
+	UpdatedAt    time.Time `json:"updatedAt"`    // 上次更新进展时间
+	BytesWritten int64     `json:"bytesWritten"` // 累计产出大小 (代码行数/文件字节数)
+	TaskID       string    `json:"taskId"`       // 当前执行的任务 ID
 }
 
 // ReportProgress 上报进展 (由执行器在关键节点调用)
@@ -224,15 +228,18 @@ func (c *Coordinator) executeWithWatchdog(
 				"⚠️ 工作流 **%s** 执行失败且已 %s 无活动, 检查是否需要手动恢复\n错误: %s",
 				wf.Name, age.Round(time.Second), err.Error()))
 		}
+
 	}
 	return results, err
 }
 
 // teamWatchdog 团队级 watchdog: 区分 "进程活着" 和 "任务在前进"。
 //
+
 // 两层检测:
-//   L1 (activity 心跳): 5min 无 activity → 警告 (进程可能挂了)
-//   L2 (progress 进展): 10min 进展不变 → 疑似卡住, 30min → 强制终止
+//
+//	L1 (activity 心跳): 5min 无 activity → 警告 (进程可能挂了)
+//	L2 (progress 进展): 10min 进展不变 → 疑似卡住, 30min → 强制终止
 //
 // 进展不变的定义: Phase 和 Iteration 都没变化, 说明卡在同一个状态。
 // 参考: K8s liveness probe (进程存活) + readiness probe (服务可用) 分离设计。
@@ -315,7 +322,6 @@ func (c *Coordinator) countRemainingTasks(team *ProductionTeam) int {
 	}
 	return total - completed
 }
-
 
 func (c *Coordinator) runPipelineWithRecovery(
 	ctx context.Context,

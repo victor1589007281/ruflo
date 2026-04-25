@@ -414,6 +414,29 @@ func (s *TaskStore) AddTask(subject, description, owner string) (string, error) 
 // AddTaskWithDeps 创建带依赖的任务 (DAG 支持)。
 // dependsOn: 前置依赖的 task ID 列表, priority: 0=normal, 1=high, 2=critical
 func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 恢复场景修复: resume 时 ParsePlanToDAG 会重新创建任务,
+	// 如果已有相同 subject 的任务且状态为 completed, 直接复用旧任务,
+	// 避免产生重复任务导致重新开始。
+	for id, rec := range s.byID {
+		if rec.Subject == subject {
+			if rec.Status == "completed" {
+				return id, nil // 已完成的任务, 直接复用
+			}
+			// 未完成的任务, 更新依赖后复用
+			rec.DependsOn = dependsOn
+			rec.Priority = priority
+			rec.Description = description
+			rec.Owner = owner
+			rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			s.byID[id] = rec
+			_ = s.saveLocked()
+			return id, nil
+		}
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	id := genTaskUUID()
 	// 如果有依赖但前置任务未完成, 状态设为 blocked
@@ -426,8 +449,6 @@ func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsO
 		Status: status, Owner: owner, DependsOn: dependsOn,
 		Priority: priority, CreatedAt: now, UpdatedAt: now,
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.byID == nil {
 		s.byID = make(map[string]v2TaskRecord)
 	}
