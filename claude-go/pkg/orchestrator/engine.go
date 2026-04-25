@@ -333,15 +333,21 @@ func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 
 		// 超时排空: 处理正在发送中但还未到达通道的信号 (最多 5ms)
 		// 这减少了高并发下的任务状态短暂不一致窗口
-drainTimeout:
+		// 修复: 使用 time.NewTimer 替代 time.After, 避免主循环每轮泄漏 timer
+		drainTimer := time.NewTimer(5 * time.Millisecond)
+	drainTimeout:
 		for {
 			select {
 			case done := <-doneCh:
+				if !drainTimer.Stop() {
+					<-drainTimer.C
+				}
 				e.handleDone(g, done)
-			case <-time.After(5 * time.Millisecond):
+			case <-drainTimer.C:
 				break drainTimeout
 			}
 		}
+		drainTimer.Stop()
 	}
 
 	metrics := e.buildMetrics(totalTasks)
@@ -475,14 +481,12 @@ func (e *Engine) handleDone(g *Graph, done taskDone) {
 //  - Engine: DAG 级, 任务内重试, 按错误类型分治
 //  两者互补: Coordinator 处理宏观流程, Engine 处理微观执行
 func (e *Engine) handleFailure(g *Graph, t *Task, err error) {
+	// 修复 TOCTOU 竞态: 先读取重试次数, 再做决策, 然后原子递增
 	t.mu.Lock()
 	attempt := t.retries
-	t.mu.Unlock()
-
 	decision := e.config.RetryPolicy.ShouldRetry(err.Error(), attempt)
 
 	if decision.ShouldRetry {
-		t.mu.Lock()
 		t.retries++
 		t.setStateInternal(TaskReady)
 		t.err = err.Error()
@@ -509,7 +513,10 @@ func (e *Engine) handleFailure(g *Graph, t *Task, err error) {
 	}
 
 	// 重试耗尽, 按错误类型做终态处理
-	switch decision.Kind {
+	kind := decision.Kind
+	t.mu.Unlock()
+
+	switch kind {
 	case ErrorTransient:
 		// 瞬态: 挂起但不级联, stallRecovery 可在限流解除后恢复
 		t.mu.Lock()
@@ -740,8 +747,20 @@ func (e *Engine) attemptStallRecovery(g *Graph) int {
 }
 
 // cancelRemaining 上下文取消时, 将所有非终态任务标记为 Cancelled。
+// 修复: 使用 g.mu.RLock() 保护 map 遍历, 防止并发修改导致 panic
 func (e *Engine) cancelRemaining(g *Graph) {
-	for _, t := range g.Tasks {
+	g.mu.RLock()
+	taskIDs := make([]string, 0, len(g.Tasks))
+	for id := range g.Tasks {
+		taskIDs = append(taskIDs, id)
+	}
+	g.mu.RUnlock()
+
+	for _, id := range taskIDs {
+		t := g.Tasks[id]
+		if t == nil {
+			continue
+		}
 		t.mu.Lock()
 		if !t.state.IsTerminal() && t.state != TaskCompleted {
 			t.setStateInternal(TaskCancelled)
@@ -763,6 +782,8 @@ func (e *Engine) isComplete(total int) bool {
 
 // runningCount 统计当前正在执行的任务数。
 func (e *Engine) runningCount(g *Graph) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	count := 0
 	for _, t := range g.Tasks {
 		if t.State() == TaskRunning {
@@ -774,6 +795,8 @@ func (e *Engine) runningCount(g *Graph) int {
 
 // runningIDs 返回正在执行的任务 ID 集合 (供调度器上下文使用)。
 func (e *Engine) runningIDs(g *Graph) map[string]bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	ids := make(map[string]bool)
 	for _, t := range g.Tasks {
 		if t.State() == TaskRunning {

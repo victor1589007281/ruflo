@@ -73,6 +73,10 @@ type AgentPool struct {
 	totalSpawns int64
 	totalDone   int64
 	totalFailed int64
+
+	// AutoScale 防震荡: 记录上次扩缩时间，避免频繁波动
+	lastScaleAt   time.Time
+	scaleCooldown time.Duration // 最小扩缩间隔
 }
 
 // poolMaxCap 池信号量的固定容量上限 — 预分配后不再替换 channel，消除 Scale 竞态。
@@ -88,11 +92,12 @@ func NewAgentPool(factory CreateAgentFunc, maxSize int) *AgentPool {
 		maxSize = poolMaxCap
 	}
 	return &AgentPool{
-		factory:    factory,
-		semaphore:  make(chan struct{}, poolMaxCap),
-		agents:     make(map[string]*PooledAgent),
-		roleQuotas: make(map[string]*RoleQuota),
-		maxSize:    maxSize,
+		factory:       factory,
+		semaphore:     make(chan struct{}, poolMaxCap),
+		agents:        make(map[string]*PooledAgent),
+		roleQuotas:    make(map[string]*RoleQuota),
+		maxSize:       maxSize,
+		scaleCooldown: 30 * time.Second, // 最小扩缩间隔, 防止频繁震荡
 	}
 }
 
@@ -198,11 +203,16 @@ func (p *AgentPool) ActiveCount() int {
 
 // AutoScale 根据待执行任务数自动调整池大小。
 // 策略: 池大小 = clamp(pendingTasks + 2, minSize, maxCap)
-// 确保有足够并发槽位，同时不过度分配。
+// 防震荡: 30s 冷却期 + 渐进式调整 (每次最多 ±50%)
 func (p *AgentPool) AutoScale(pendingTasks int) {
 	p.mu.Lock()
 	currentActive := len(p.agents)
 	currentMax := p.maxSize
+	// 冷却期检查: 如果距上次扩缩不足 30s，跳过本次调整
+	if time.Since(p.lastScaleAt) < p.scaleCooldown && p.lastScaleAt.IsZero() == false {
+		p.mu.Unlock()
+		return
+	}
 	p.mu.Unlock()
 
 	const minSize = 4
@@ -216,17 +226,39 @@ func (p *AgentPool) AutoScale(pendingTasks int) {
 		desired = maxCap
 	}
 
-	if desired != currentMax {
-		logging.For("agent-pool").Info("AutoScale", "active", currentActive, "pending", pendingTasks, "old", currentMax, "new", desired)
-		p.Scale(desired)
+	// 渐进式调整: 每次最多变化 50%，避免骤增骤降
+	maxStep := currentMax / 2
+	if maxStep < 2 {
+		maxStep = 2
+	}
+	diff := desired - currentMax
+	if diff > maxStep {
+		diff = maxStep
+	} else if diff < -maxStep {
+		diff = -maxStep
+	}
+	adjusted := currentMax + diff
+
+	if adjusted != currentMax {
+		p.mu.Lock()
+		p.lastScaleAt = time.Now()
+		p.mu.Unlock()
+		logging.For("agent-pool").Info("AutoScale", "active", currentActive, "pending", pendingTasks, "old", currentMax, "new", adjusted)
+		p.Scale(adjusted)
 	}
 }
 
 // AutoScaleByRoles 按角色的任务需求动态扩缩池。
 // 参考: K8s HPA 按 Deployment 独立扩缩。每个角色根据其复杂度系数获得配额。
 // roleNeeds: map[role]taskCount, complexity: 0=simple, 1=moderate, 2=complex
+// 防震荡: 30s 冷却期 + 渐进式调整
 func (p *AgentPool) AutoScaleByRoles(roleNeeds map[string]int, complexity int) {
 	p.mu.Lock()
+	// 冷却期检查
+	if time.Since(p.lastScaleAt) < p.scaleCooldown && !p.lastScaleAt.IsZero() {
+		p.mu.Unlock()
+		return
+	}
 	defer p.mu.Unlock()
 
 	// 复杂度乘数: 简单任务1倍, 中等2倍, 复杂3倍
@@ -264,10 +296,25 @@ func (p *AgentPool) AutoScaleByRoles(roleNeeds map[string]int, complexity int) {
 	}
 
 	if totalNeeded != p.maxSize {
+		// 渐进式调整: 每次最多变化 50%
+		currentMax := p.maxSize
+		maxStep := currentMax / 2
+		if maxStep < 3 {
+			maxStep = 3
+		}
+		diff := totalNeeded - currentMax
+		if diff > maxStep {
+			diff = maxStep
+		} else if diff < -maxStep {
+			diff = -maxStep
+		}
+		adjusted := currentMax + diff
+
+		p.lastScaleAt = time.Now()
 		logging.For("agent-pool").Info("AutoScaleByRoles",
 			"roles", len(roleNeeds), "complexity", complexity,
-			"multiplier", multiplier, "old", p.maxSize, "new", totalNeeded)
-		p.maxSize = totalNeeded
+			"multiplier", multiplier, "old", p.maxSize, "desired", totalNeeded, "new", adjusted)
+		p.maxSize = adjusted
 	}
 }
 
