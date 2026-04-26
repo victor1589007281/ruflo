@@ -75,12 +75,50 @@ func (s *Server) handleLLMRate(w http.ResponseWriter, r *http.Request) {
 			maxWin = w
 		}
 	}
-	// 为了避免跑遍全部, 最多往回看 "最大窗口秒数 + 10s buffer"
+	// 滑动窗口覆盖范围
 	since := time.Now().Add(-time.Duration(maxWin+10) * time.Second)
-	events, err := s.provider.ModuleMetricEvents("llm", 50000, since)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	var events []MetricEventDTO
+	var source string
+
+	// 尝试从 Prometheus 获取最近数据
+	promURL := os.Getenv("CLAUDE_GO_PROMETHEUS_URL")
+	if promURL != "" {
+		end := time.Now()
+		start := end.Add(-time.Duration(maxWin+10) * time.Second)
+		step := 15 * time.Second
+		query := fmt.Sprintf(`{__name__=~"claude_go_.*", module="llm"}`)
+		resp, err := queryPromRange(promURL, query, start, end, step)
+		if err == nil && resp != nil && resp.Status == "success" && len(resp.Data.Result) > 0 {
+			for _, r := range resp.Data.Result {
+				name := strings.TrimPrefix(r.Metric["__name__"], "claude_go_")
+				for _, v := range r.Values {
+					if len(v) < 2 {
+						continue
+					}
+					tsFloat, _ := v[0].(float64)
+					valFloat, _ := v[1].(string)
+					val, _ := strconv.ParseFloat(valFloat, 64)
+					events = append(events, MetricEventDTO{
+						Timestamp: time.Unix(int64(tsFloat), 0),
+						Module:    "llm",
+						Name:      name,
+						Value:     val,
+						Labels:    r.Metric,
+					})
+				}
+			}
+			source = "prometheus"
+		}
+	}
+	// 回退: Provider (自带 Prometheus->JSONL dual-read)
+	if len(events) == 0 {
+		evts, err := s.provider.ModuleMetricEvents("llm", 50000, since)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		events = evts
+		source = "jsonl"
 	}
 
 	// (ts_ms, model) -> aggregated call
@@ -161,7 +199,7 @@ func (s *Server) handleLLMRate(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	resp := llmRateResp{
-		Source: filepath.Join(s.cfg.StateDir, "metrics", "llm.jsonl"),
+		Source: source,
 		Now:    now,
 	}
 
@@ -387,52 +425,94 @@ type coverageResp struct {
 	MissingDesc []string `json:"missingDesc,omitempty"`
 }
 
+// coverageKey 指标覆盖查询的复合键。
+type coverageKey struct{ module, name string }
+
 func (s *Server) handleMetricsCoverage(w http.ResponseWriter, r *http.Request) {
 	cat := metrics.Catalog()
 	// Step 1: build declared index
-	type key struct{ module, name string }
-	declared := map[key]metrics.MetricDesc{}
+	declared := map[coverageKey]metrics.MetricDesc{}
 	for _, d := range cat {
-		declared[key{d.Module, d.Name}] = d
+		declared[coverageKey{d.Module, d.Name}] = d
 	}
 
-	// Step 2: 扫描每个模块的 events, 聚合 per-metric (samples/lastValue/lastSeen)
-	// 注意: 不用 AllMetricSummaries, 因为 MetricStatDTO 里没有 LastTime 字段。
+	// Step 2: 从 Prometheus 查询实际采集到的指标
 	type stat struct {
 		samples   int
 		lastValue float64
 		lastSeen  time.Time
 	}
-	collected := map[key]*stat{}
-	// 扫 metrics 目录, 枚举 <module>.jsonl
-	entries, _ := os.ReadDir(s.provider.pathIn("metrics"))
-	for _, ent := range entries {
-		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".jsonl") {
-			continue
-		}
-		module := strings.TrimSuffix(ent.Name(), ".jsonl")
-		events, err := s.provider.ModuleMetricEvents(module, 100000, time.Time{})
-		if err != nil {
-			continue
-		}
-		for _, e := range events {
-			k := key{module, e.Name}
-			st, ok := collected[k]
-			if !ok {
-				st = &stat{}
-				collected[k] = st
+	collected := map[coverageKey]*stat{}
+
+	promURL := os.Getenv("CLAUDE_GO_PROMETHEUS_URL")
+	if promURL != "" {
+		// 从 Prometheus 获取所有 claude_go_ 指标的当前值
+		resp, err := queryPromInstant(promURL, `{__name__=~"claude_go_.*"}`)
+		if err == nil && resp != nil && resp.Status == "success" {
+			for _, r := range resp.Data.Result {
+				if len(r.Value) < 2 {
+					continue
+				}
+				metricName := r.Metric["__name__"]
+				// claude_go_llm_call_count -> llm_call_count
+				name := strings.TrimPrefix(metricName, "claude_go_")
+				if name == metricName {
+					continue // 不是我们的指标
+				}
+				mod := r.Metric["module"]
+				if mod == "" {
+					// 从指标名推断模块: claude_go_{module}_{rest}
+					// 需要查 catalog 反向映射
+					mod = inferModuleFromName(name, declared)
+				}
+				tsFloat, _ := r.Value[0].(float64)
+				valFloat, _ := r.Value[1].(string)
+				val, _ := strconv.ParseFloat(valFloat, 64)
+
+				k := coverageKey{mod, name}
+				st, ok := collected[k]
+				if !ok {
+					st = &stat{}
+					collected[k] = st
+				}
+				st.samples++
+				st.lastValue = val
+				st.lastSeen = time.Unix(int64(tsFloat), 0)
 			}
-			st.samples++
-			st.lastValue = e.Value
-			if e.Timestamp.After(st.lastSeen) {
-				st.lastSeen = e.Timestamp
+		}
+	}
+
+	// Prometheus 无数据时, 回退到 JSONL 扫描 (兼容模式)
+	if len(collected) == 0 {
+		entries, _ := os.ReadDir(s.provider.pathIn("metrics"))
+		for _, ent := range entries {
+			if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".jsonl") {
+				continue
+			}
+			module := strings.TrimSuffix(ent.Name(), ".jsonl")
+			events, err := s.provider.ModuleMetricEvents(module, 100000, time.Time{})
+			if err != nil {
+				continue
+			}
+			for _, e := range events {
+				k := coverageKey{module, e.Name}
+				st, ok := collected[k]
+				if !ok {
+					st = &stat{}
+					collected[k] = st
+				}
+				st.samples++
+				st.lastValue = e.Value
+				if e.Timestamp.After(st.lastSeen) {
+					st.lastSeen = e.Timestamp
+				}
 			}
 		}
 	}
 
 	// Step 3: 合并成行 (declared ∪ collected)
 	var rows []metricCoverageRow
-	seen := map[key]bool{}
+	seen := map[coverageKey]bool{}
 	for k, d := range declared {
 		row := metricCoverageRow{
 			Module: k.module, Name: k.name,
@@ -489,6 +569,36 @@ func (s *Server) handleMetricsCoverage(w http.ResponseWriter, r *http.Request) {
 		Rows:           rows,
 		MissingDesc:    missingDesc,
 	})
+}
+
+// inferModuleFromName 从指标名推断所属模块 (当 Prometheus 没有 module label 时)。
+// 利用 catalog 中声明的 module→name 映射反向查找。
+// 例如: "llm_call_count" → "llm", "team_stage_pass_rate" → "team".
+func inferModuleFromName(name string, declared map[coverageKey]metrics.MetricDesc) string {
+	for k := range declared {
+		if k.name == name {
+			return k.module
+		}
+	}
+	// 回退: 从下划线分割取第一段
+	if idx := strings.Index(name, "_"); idx > 0 {
+		prefix := name[:idx]
+		// 常见前缀映射
+		switch prefix {
+		case "llm", "team", "dream", "evo", "task", "cron", "mem", "fact", "amnesia":
+			if prefix == "dream" {
+				return "dreaming"
+			}
+			if prefix == "evo" {
+				return "evolution"
+			}
+			if prefix == "mem" || prefix == "fact" || prefix == "amnesia" {
+				return "memory"
+			}
+			return prefix
+		}
+	}
+	return "unknown"
 }
 
 // ────────────────────────────────────────────────────────────────────────

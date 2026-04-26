@@ -209,6 +209,15 @@ type Bot struct {
 
 	// 消息去重: 防止同一条消息触发多个团队
 	processedMsgs sync.Map // messageID → timestamp
+
+	// 图片+文字关联: 飞书中图片+文字是两条独立消息
+	// 存储最近 30 秒内每个 chat 的文本消息，供图片消息关联
+	recentTexts sync.Map // chatID → []textEntry
+}
+
+type textEntry struct {
+	text string
+	ts   time.Time
 }
 
 // NewBot 创建飞书机器人。
@@ -869,12 +878,8 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 	case "share_chat", "share_user":
 		go b.handleShareMessage(chatID, messageID, msg, msgType)
 		return nil
-	case "post": // 富文本消息: 提取纯文本后走正常流程
-		userText := ExtractPostText(deref(msg.Content))
-		if userText == "" {
-			return nil
-		}
-		go b.processAndReply(chatID, messageID, userText)
+	case "post": // 富文本消息: 检测图片+文字组合
+		go b.handlePostMessage(chatID, messageID, msg)
 		return nil
 	case "text":
 		// 继续下面的文本处理逻辑
@@ -1040,15 +1045,124 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		}
 	}
 
+	// 存储到 recentTexts: 供图片消息关联上下文 (飞书图片+文字是两条独立消息)
+	b.storeRecentText(chatID, userText)
+
 	// 异步处理消息 (避免阻塞飞书回调的 3 秒超时)
 	go b.processAndReply(chatID, messageID, userText)
 
 	return nil
 }
 
+// handlePostMessage 处理富文本(post)消息: 检测图片+文字组合。
+// 飞书在用户发送图片+文字时, 会作为一个 post 消息送达, 内容包含 img 和 text 元素。
+func (b *Bot) handlePostMessage(chatID, messageID string, msg *larkim.EventMessage) {
+	content := deref(msg.Content)
+
+	// 检测是否包含图片
+	var imgKey string
+	var textParts []string
+
+	var raw struct {
+		Title   string          `json:"title"`
+		Content [][]json.RawMessage `json:"content"`
+	}
+
+	// 先尝试 locale wrapper
+	var wrapper map[string]json.RawMessage
+	if json.Unmarshal([]byte(content), &wrapper) == nil {
+		for _, locale := range []string{"zh_cn", "en_us", "ja_jp"} {
+			if raw, ok := wrapper[locale]; ok {
+				json.Unmarshal(raw, &raw)
+				break
+			}
+		}
+	}
+	if len(raw.Content) == 0 {
+		// 直接解析
+		if json.Unmarshal([]byte(content), &raw) != nil {
+			return
+		}
+	}
+
+	for _, line := range raw.Content {
+		for _, elemRaw := range line {
+			var elem struct {
+				Tag      string `json:"tag"`
+				Text     string `json:"text"`
+				ImageKey string `json:"image_key"`
+			}
+			if json.Unmarshal(elemRaw, &elem) != nil {
+				continue
+			}
+			switch elem.Tag {
+			case "img":
+				if imgKey == "" {
+					imgKey = elem.ImageKey
+				}
+			case "text":
+				if strings.TrimSpace(elem.Text) != "" {
+					textParts = append(textParts, strings.TrimSpace(elem.Text))
+				}
+			}
+		}
+	}
+
+	if imgKey != "" && len(textParts) > 0 {
+		// 图片+文字: 视觉理解 + 文字上下文
+		b.handleImageWithText(chatID, messageID, imgKey, strings.Join(textParts, " "), deref(msg.ChatType))
+	} else if imgKey != "" {
+		// 纯图片
+		b.handleImageMessage(chatID, messageID, msg)
+	} else if len(textParts) > 0 {
+		// 纯文字
+		userText := strings.Join(textParts, "\n")
+		b.processAndReply(chatID, messageID, userText)
+	}
+}
+
+// handleImageWithText 处理图片+文字组合: 下载图片进行视觉理解, 结合文字上下文回复。
+func (b *Bot) handleImageWithText(chatID, messageID, imageKey, text, chatType string) {
+	ctx := context.Background()
+
+	if b.visionCli == nil {
+		b.sendTextMessage(ctx, chatID, "视觉能力未初始化。")
+		return
+	}
+
+	b64, err := b.downloadImageAsBase64(ctx, messageID, imageKey)
+	if err != nil {
+		b.sendTextMessage(ctx, chatID, fmt.Sprintf("下载图片失败: %v", err))
+		return
+	}
+
+	prompt := fmt.Sprintf("用户发送了一张图片，并附言: %s\n\n请分析图片内容，并结合用户的附言进行回答。", text)
+
+	response, err := b.visionCli.Understand(ctx, b64, prompt)
+	if err != nil {
+		b.sendTextMessage(ctx, chatID, fmt.Sprintf("视觉分析失败: %v", err))
+		return
+	}
+
+	b.sendTextMessage(ctx, chatID, response)
+}
+
 // handleImageMessage 处理图片消息：下载为 base64 → Vision 理解。
 func (b *Bot) handleImageMessage(chatID, messageID string, msg *larkim.EventMessage) {
 	ctx := context.Background()
+
+	// 群聊中检查 @机器人 (与文本消息保持一致)
+	chatType := deref(msg.ChatType)
+	if chatType == "group" && b.config.MentionOnly {
+		mentions := msg.Mentions
+		if len(mentions) == 0 {
+			if b.config.Debug {
+				log.Printf("[飞书Bot] 图片消息忽略(群聊未@): chat=%s, msg=%s", chatID, messageID)
+			}
+			return
+		}
+	}
+
 	b.sendTextReply(ctx, messageID, "🔍 正在分析图片...")
 
 	content := deref(msg.Content)
@@ -1077,7 +1191,18 @@ func (b *Bot) handleImageMessage(chatID, messageID string, msg *larkim.EventMess
 		return
 	}
 
-	b.sendLongMessage(ctx, chatID, "🖼️ **图片分析结果:**\n\n"+response)
+	// 检查是否有关联的文本消息 (飞书图片+文字是两条独立消息)
+	associatedText := b.getRecentText(chatID)
+	var reply strings.Builder
+	reply.WriteString("🖼️ **图片分析结果:**\n\n")
+	reply.WriteString(response)
+	if associatedText != "" {
+		reply.WriteString("\n\n📝 **关联文字:** " + associatedText)
+		// 如果有图片描述+文字，交给 AI 综合处理
+		go b.processAndReply(chatID, messageID, "用户发送了一张图片和一段文字:\n图片内容: "+response+"\n文字: "+associatedText)
+		return
+	}
+	b.sendLongMessage(ctx, chatID, reply.String())
 }
 
 // handleFileMessage 处理文件消息：提取文件信息并提供说明。
@@ -1318,18 +1443,25 @@ func ExtractPostText(content string) string {
 		} `json:"content"`
 	}
 
-	// post 消息可能包裹在 locale key 下
+	// post 消息可能包裹在 locale key 下, 也可能是直接结构
 	var wrapper map[string]json.RawMessage
 	if json.Unmarshal([]byte(content), &wrapper) == nil {
 		for _, locale := range []string{"zh_cn", "en_us", "ja_jp"} {
 			if raw, ok := wrapper[locale]; ok {
 				if json.Unmarshal(raw, &post) == nil && len(post.Content) > 0 {
-					break
+					goto extract
 				}
 			}
 		}
+		// 不是 locale wrapper, 直接解析
+		if json.Unmarshal([]byte(content), &post) != nil || len(post.Content) == 0 {
+			return ""
+		}
+	} else {
+		return ""
 	}
 
+extract:
 	var sb strings.Builder
 	if post.Title != "" {
 		sb.WriteString(post.Title)
@@ -2974,6 +3106,49 @@ func splitMessage(content string, maxLen int) []string {
 	}
 
 	return chunks
+}
+
+// storeRecentText 存储最近的文本消息，供图片消息关联上下文。
+func (b *Bot) storeRecentText(chatID, text string) {
+	if chatID == "" || text == "" {
+		return
+	}
+	var texts []textEntry
+	if v, ok := b.recentTexts.Load(chatID); ok {
+		if ts, ok := v.([]textEntry); ok {
+			texts = ts
+		}
+	}
+	now := time.Now()
+	texts = append(texts, textEntry{text: text, ts: now})
+	// 清理超过 60 秒的旧条目
+	var kept []textEntry
+	for _, t := range texts {
+		if now.Sub(t.ts) < 60*time.Second {
+			kept = append(kept, t)
+		}
+	}
+	b.recentTexts.Store(chatID, kept)
+}
+
+// getRecentText 获取最近 30 秒内的文本消息，用于关联图片上下文。
+func (b *Bot) getRecentText(chatID string) string {
+	v, ok := b.recentTexts.Load(chatID)
+	if !ok {
+		return ""
+	}
+	texts, ok := v.([]textEntry)
+	if !ok || len(texts) == 0 {
+		return ""
+	}
+	now := time.Now()
+	// 从后往前找 30 秒内的第一条
+	for i := len(texts) - 1; i >= 0; i-- {
+		if now.Sub(texts[i].ts) < 30*time.Second {
+			return texts[i].text
+		}
+	}
+	return ""
 }
 
 // deref 安全解引用字符串指针

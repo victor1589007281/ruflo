@@ -3,13 +3,19 @@ package dashboard
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/metrics"
 )
 
 // Provider 封装对 .claude-go/ 数据目录的只读访问, 内置 TTL 缓存。
@@ -522,8 +528,155 @@ type rawMetricEvent struct {
 	RunID     string            `json:"run_id,omitempty"`
 }
 
-// AllMetricSummaries 扫描 metrics/*.jsonl, 返回每个模块的摘要。
+// ============== Prometheus Query Client ==============
+
+// PrometheusURL dashboard 内置的 Prometheus 查询地址。
+// 与 claude-go 内置的 /metrics 端点复用同一进程, 通过 127.0.0.1:7777/metrics 暴露。
+// 当 Prometheus 服务器存在时 (外部抓取), 也支持通过外部地址查询。
+// 默认回退到读取 JSONL 文件。
+
+// promQueryResponse Prometheus /api/v1/query_range 响应。
+type promQueryResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Metric map[string]string  `json:"metric"`
+			Values [][]interface{}    `json:"values"`
+		} `json:"result"`
+	} `json:"data"`
+}
+
+// promInstantResponse Prometheus /api/v1/query 响应。
+type promInstantResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Metric map[string]string `json:"metric"`
+			Value  []interface{}     `json:"value"`
+		} `json:"result"`
+	} `json:"data"`
+}
+
+// queryPromRange 执行 PromQL range query, 返回时序点。
+func queryPromRange(promURL, query string, start, end time.Time, step time.Duration) (*promQueryResponse, error) {
+	u := fmt.Sprintf("%s/api/v1/query_range", promURL)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	q := req.URL.Query()
+	q.Set("query", query)
+	q.Set("start", start.Format(time.RFC3339))
+	q.Set("end", end.Format(time.RFC3339))
+	q.Set("step", fmt.Sprintf("%.0fs", step.Seconds()))
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result promQueryResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// queryPromInstant 执行 PromQL instant query。
+func queryPromInstant(promURL, query string) (*promInstantResponse, error) {
+	u := fmt.Sprintf("%s/api/v1/query", promURL)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	q := req.URL.Query()
+	q.Set("query", query)
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result promInstantResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// AllMetricSummaries 从 Prometheus 查询各模块的最新指标摘要。
+// 回退到本地 JSONL 文件 (如果 Prometheus 不可用)。
 func (p *Provider) AllMetricSummaries() ([]*ModuleSummaryDTO, error) {
+	// 尝试 Prometheus
+	summaries := p.summariesFromProm()
+	if len(summaries) > 0 {
+		return summaries, nil
+	}
+
+	// 回退: 扫描 metrics/*.jsonl
+	return p.summariesFromJSONL()
+}
+
+// summariesFromProm 从 Prometheus 查询各模块的瞬时指标, 构造摘要。
+func (p *Provider) summariesFromProm() []*ModuleSummaryDTO {
+	promURL := p.resolvePromURL()
+	if promURL == "" {
+		return nil
+	}
+
+	// 获取所有 claude_go_ 开头的指标
+	resp, err := queryPromInstant(promURL, `{__name__=~"claude_go_.*"}`)
+	if err != nil || resp.Status != "success" || len(resp.Data.Result) == 0 {
+		return nil
+	}
+
+	// 按 module 分组
+	grouped := map[string][]rawMetricEvent{}
+	for _, r := range resp.Data.Result {
+		mod := r.Metric["__name__"]
+		if len(r.Value) < 2 {
+			continue
+		}
+		tsFloat, _ := r.Value[0].(float64)
+		valFloat, _ := r.Value[1].(string)
+		val, _ := strconv.ParseFloat(valFloat, 64)
+		evt := rawMetricEvent{
+			Timestamp: time.Unix(int64(tsFloat), 0),
+			Module:    mod,
+			Name:      mod,
+			Value:     val,
+			Labels:    r.Metric,
+		}
+		delete(evt.Labels, "__name__")
+		grouped[mod] = append(grouped[mod], evt)
+	}
+
+	var out []*ModuleSummaryDTO
+	for mod, events := range grouped {
+		out = append(out, summarizeModule(mod, events))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Module < out[j].Module })
+	return out
+}
+
+// summariesFromJSONL 从本地 JSONL 文件扫描指标摘要 (回退路径)。
+func (p *Provider) summariesFromJSONL() ([]*ModuleSummaryDTO, error) {
 	v, err := p.load("metrics:summary", func() (interface{}, error) {
 		dir := p.pathIn("metrics")
 		entries, err := os.ReadDir(dir)
@@ -554,11 +707,51 @@ func (p *Provider) AllMetricSummaries() ([]*ModuleSummaryDTO, error) {
 	return v.([]*ModuleSummaryDTO), nil
 }
 
+// resolvePromURL 尝试解析 Prometheus 地址。
+// 优先使用 CLAUDE_GO_PROMETHEUS_URL 环境变量, 否则返回空。
+func (p *Provider) resolvePromURL() string {
+	if u := os.Getenv("CLAUDE_GO_PROMETHEUS_URL"); u != "" {
+		return u
+	}
+	// 默认回退: 尝试同进程的 /metrics (非 API 查询)
+	// dashboard 本身不提供 PromQL 查询, 需要外部 Prometheus
+	return ""
+}
+
 // ModuleMetricSummary 返回某模块摘要。
 func (p *Provider) ModuleMetricSummary(module string) (*ModuleSummaryDTO, error) {
 	if !safeName(module) {
 		return nil, errors.New("invalid module name")
 	}
+
+	// 尝试 Prometheus
+	promURL := p.resolvePromURL()
+	if promURL != "" {
+		query := fmt.Sprintf(`{__name__=~"claude_go_.*", job="claude-go"}`)
+		resp, err := queryPromInstant(promURL, query)
+		if err == nil && resp.Status == "success" && len(resp.Data.Result) > 0 {
+			var events []rawMetricEvent
+			for _, r := range resp.Data.Result {
+				if len(r.Value) < 2 {
+					continue
+				}
+				valFloat, _ := r.Value[1].(string)
+				val, _ := strconv.ParseFloat(valFloat, 64)
+				tsFloat, _ := r.Value[0].(float64)
+				events = append(events, rawMetricEvent{
+					Timestamp: time.Unix(int64(tsFloat), 0),
+					Name:      module,
+					Value:     val,
+					Labels:    r.Metric,
+				})
+			}
+			if len(events) > 0 {
+				return summarizeModule(module, events), nil
+			}
+		}
+	}
+
+	// 回退: JSONL
 	events, err := p.readMetricEvents(module)
 	if err != nil {
 		return nil, err
@@ -574,6 +767,46 @@ func (p *Provider) ModuleMetricEvents(module string, limit int, since time.Time)
 	if !safeName(module) {
 		return nil, errors.New("invalid module name")
 	}
+
+	// 尝试 Prometheus range query
+	promURL := p.resolvePromURL()
+	if promURL != "" {
+		end := time.Now()
+		start := end.Add(-24 * time.Hour)
+		if !since.IsZero() {
+			start = since
+		}
+		query := fmt.Sprintf(`{__name__=~"claude_go_.*", module="%s"}`, module)
+		resp, err := queryPromRange(promURL, query, start, end, 60*time.Second)
+		if err == nil && resp.Status == "success" && len(resp.Data.Result) > 0 {
+			var events []MetricEventDTO
+			for _, r := range resp.Data.Result {
+				for _, v := range r.Values {
+					if len(v) < 2 {
+						continue
+					}
+					tsFloat, _ := v[0].(float64)
+					valFloat, _ := v[1].(string)
+					val, _ := strconv.ParseFloat(valFloat, 64)
+					events = append(events, MetricEventDTO{
+						Timestamp: time.Unix(int64(tsFloat), 0),
+						Module:    module,
+						Name:      r.Metric["__name__"],
+						Value:     val,
+						Labels:    r.Metric,
+					})
+				}
+			}
+			if len(events) > 0 {
+				if limit > 0 && len(events) > limit {
+					events = events[len(events)-limit:]
+				}
+				return events, nil
+			}
+		}
+	}
+
+	// 回退: JSONL
 	events, err := p.readMetricEvents(module)
 	if err != nil {
 		return nil, err
@@ -722,4 +955,86 @@ func detectTrend(name string, vs []float64) string {
 		}
 	}
 	return ""
+}
+
+// ============== Swarm Intel & Cron Prometheus Export ==============
+
+// ExportSwarmIntelMetrics 从 swarm_intel 的 runs.jsonl 读取指标并写入 Prometheus。
+func (p *Provider) ExportSwarmIntelMetrics() {
+	dir := p.pathIn("metrics")
+	path := filepath.Join(dir, "runs.jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // 无数据, 静默跳过
+	}
+
+	type runMetrics struct {
+		RunType        string  `json:"type"`
+		TotalLatencyMs int64   `json:"total_latency_ms"`
+		LLMCallCount   int     `json:"llm_call_count"`
+		Consensus      float64 `json:"consensus"`
+		BrierScore     float64 `json:"brier_score"`
+		Diversity      float64 `json:"diversity_score"`
+		DebateSkipped  bool    `json:"debate_skipped"`
+	}
+
+	var totalRuns, totalLLMCalls, debateSkips int
+	var sumConsensus, sumBrier, sumDiversity, sumLatency float64
+
+	for _, line := range splitLines(data) {
+		if len(line) == 0 {
+			continue
+		}
+		var m runMetrics
+		if json.Unmarshal(line, &m) != nil {
+			continue
+		}
+		lbl := map[string]string{"run_type": m.RunType}
+		totalRuns++
+		totalLLMCalls += m.LLMCallCount
+		sumConsensus += m.Consensus
+		sumBrier += m.BrierScore
+		sumDiversity += m.Diversity
+		sumLatency += float64(m.TotalLatencyMs)
+		if m.DebateSkipped {
+			debateSkips++
+		}
+
+		metrics.RecordPromMetric("swarm", metrics.MSwarmRunCount, 1, lbl)
+		metrics.RecordPromMetric("swarm", metrics.MSwarmConsensus, m.Consensus, lbl)
+		metrics.RecordPromMetric("swarm", metrics.MSwarmBrierScore, m.BrierScore, lbl)
+		metrics.RecordPromMetric("swarm", metrics.MSwarmDiversity, m.Diversity, lbl)
+		metrics.RecordPromMetric("swarm", metrics.MSwarmLatencyMs, float64(m.TotalLatencyMs), lbl)
+		metrics.RecordPromMetric("swarm", metrics.MSwarmLLMCalls, float64(m.LLMCallCount), lbl)
+	}
+
+	if totalRuns > 0 {
+		n := float64(totalRuns)
+		metrics.RecordPromMetric("swarm", metrics.MSwarmDebateSkipRate, float64(debateSkips)/n, map[string]string{})
+	}
+}
+
+// ExportCronMetrics 从 cron_jobs.json 读取指标并写入 Prometheus。
+func (p *Provider) ExportCronMetrics() {
+	jobs, err := p.ListCronJobs()
+	if err != nil {
+		return
+	}
+
+	var totalEnabled int
+	for _, j := range jobs {
+		lbl := map[string]string{"job_name": j.Name, "job_type": j.JobType}
+		if j.Enabled {
+			totalEnabled++
+		}
+		if j.RunCount > 0 {
+			metrics.RecordPromMetric("cron", metrics.MCronRunCount, float64(j.RunCount), lbl)
+		}
+		metrics.RecordPromMetric("cron", metrics.MCronSuccessCount, float64(j.RunCount-j.FailCount), lbl)
+		if j.FailCount > 0 {
+			metrics.RecordPromMetric("cron", metrics.MCronFailCount, float64(j.FailCount), lbl)
+		}
+	}
+
+	metrics.RecordPromMetric("cron", metrics.MCronRunCount, float64(totalEnabled), map[string]string{})
 }

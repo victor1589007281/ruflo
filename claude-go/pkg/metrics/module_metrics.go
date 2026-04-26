@@ -3,14 +3,7 @@
 // 设计目标: 为 claude-go 各模块提供固定的、可持续跟踪的质量指标,
 // 使每次迭代的效果可量化对比 (类似 MLOps 的 experiment tracking)。
 //
-// 业界参考:
-//   - MLflow Metrics Tracking: 按 run/experiment 记录 step-metric 时间序列
-//   - Weights & Biases: 自动 diff + 可视化 + 趋势告警
-//   - OpenTelemetry Metrics: Counter/Histogram/Gauge 三种原语
-//   - Google SRE: SLI/SLO 驱动的连续观测 + error budget
-//
-// 存储格式: JSONL (每行一个 MetricEvent), 支持 append-only 追加写入。
-// 路径: {stateDir}/metrics/{module}.jsonl
+// 存储: 全部通过 Prometheus 采集, 本地仅保留内存缓冲用于即时查询。
 //
 // 使用方式:
 //
@@ -21,17 +14,14 @@
 package metrics
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 )
 
-// MetricEvent 单次指标事件 (JSONL 存储的原子单元)。
+// MetricEvent 单次指标事件 (内存中的原子单元)。
 type MetricEvent struct {
 	Timestamp time.Time         `json:"ts"`
 	Module    string            `json:"module"`
@@ -43,10 +33,10 @@ type MetricEvent struct {
 
 // ModuleSummary 单模块指标摘要 (供 AI 分析)。
 type ModuleSummary struct {
-	Module       string                    `json:"module"`
-	SnapshotTime time.Time                 `json:"snapshot_time"`
-	Metrics      map[string]*MetricStat    `json:"metrics"`
-	TrendAlerts  []string                  `json:"trend_alerts,omitempty"`
+	Module       string                 `json:"module"`
+	SnapshotTime time.Time              `json:"snapshot_time"`
+	Metrics      map[string]*MetricStat `json:"metrics"`
+	TrendAlerts  []string               `json:"trend_alerts,omitempty"`
 }
 
 // MetricStat 单指标统计 (最近 N 次的聚合)。
@@ -61,24 +51,35 @@ type MetricStat struct {
 	Trend   string  `json:"trend"` // "improving", "degrading", "stable"
 }
 
-// Collector 指标采集器, 线程安全, append-only 写入 JSONL。
+// MetricCumulative 单指标累积统计 (用于 Prometheus counter)。
+type MetricCumulative struct {
+	Name  string  `json:"name"`
+	Total float64 `json:"total"` // 自进程启动以来的累计值
+	Count int     `json:"count"` // 事件数
+}
+
+// MetricHistogram 单指标直方图统计 (用于 Prometheus histogram)。
+type MetricHistogram struct {
+	Name   string         `json:"name"`
+	Sum    float64        `json:"sum"`
+	Count  int            `json:"count"`
+	Bucket map[string]int `json:"bucket"` // bucket_upper_bound -> count
+}
+
+// Collector 指标采集器, 线程安全, 仅写入 Prometheus + 内存缓冲。
 type Collector struct {
-	dataDir string
-	mu      sync.Mutex
-	files   map[string]*os.File
-	buffer  map[string][]MetricEvent // 内存缓冲 (用于 Summary)
+	mu     sync.Mutex
+	buffer map[string][]MetricEvent // 内存缓冲 (用于 Summary)
 }
 
 // NewCollector 创建指标采集器。
 func NewCollector(stateDir string) *Collector {
-	dir := filepath.Join(stateDir, "metrics")
-	os.MkdirAll(dir, 0o755)
+	// 确保 Prometheus 注册已初始化
+	PrometheusRegistry()
 	c := &Collector{
-		dataDir: dir,
-		files:   make(map[string]*os.File),
-		buffer:  make(map[string][]MetricEvent),
+		buffer: make(map[string][]MetricEvent),
 	}
-	c.loadExisting()
+	_ = stateDir // stateDir 保留接口兼容, 但不再用于文件路径
 	return c
 }
 
@@ -93,7 +94,8 @@ func (c *Collector) RecordWithLabels(module, name string, value float64, labels 
 }
 
 // RecordAtTime 记录指定时间戳的指标值。
-// 同一批指标共享时间戳, 确保 dashboard 能按 (ts, model) 正确分组聚合。
+// 同一批指标共享时间戳, 确保 dashboard 能正确分组聚合。
+// 同时写入 Prometheus 原生指标 (通过 prom_registry.go)。
 func (c *Collector) RecordAtTime(module, name string, value float64, labels map[string]string, ts time.Time) {
 	evt := MetricEvent{
 		Timestamp: ts,
@@ -106,7 +108,9 @@ func (c *Collector) RecordAtTime(module, name string, value float64, labels map[
 	defer c.mu.Unlock()
 
 	c.buffer[module] = append(c.buffer[module], evt)
-	c.appendToFile(module, evt)
+
+	// 同时写入 Prometheus 原生指标
+	recordPromMetric(module, name, value, labels)
 }
 
 // RecordRun 记录一个带 RunID 的指标值 (用于团队/任务级别追踪)。
@@ -123,7 +127,9 @@ func (c *Collector) RecordRun(module, name string, value float64, runID string, 
 	defer c.mu.Unlock()
 
 	c.buffer[module] = append(c.buffer[module], evt)
-	c.appendToFile(module, evt)
+
+	// 同时写入 Prometheus 原生指标
+	recordPromMetric(module, name, value, labels)
 }
 
 // Summary 生成单模块的指标摘要 (基于最近 100 条事件)。
@@ -160,6 +166,75 @@ func (c *Collector) Summary(module string) *ModuleSummary {
 	return summary
 }
 
+// RecentEvents 返回某模块最近 N 条事件 (用于 /metrics Prometheus 端点)。
+func (c *Collector) RecentEvents(module string, n int) []MetricEvent {
+	c.mu.Lock()
+	events := make([]MetricEvent, len(c.buffer[module]))
+	copy(events, c.buffer[module])
+	c.mu.Unlock()
+	if len(events) > n {
+		return events[len(events)-n:]
+	}
+	return events
+}
+
+// Cumulative 返回某模块所有指标的累积总和 (用于 Prometheus counter)。
+func (c *Collector) Cumulative(module string) map[string]*MetricCumulative {
+	c.mu.Lock()
+	events := make([]MetricEvent, len(c.buffer[module]))
+	copy(events, c.buffer[module])
+	c.mu.Unlock()
+
+	grouped := make(map[string]*MetricCumulative)
+	for _, e := range events {
+		mc, ok := grouped[e.Name]
+		if !ok {
+			mc = &MetricCumulative{Name: e.Name}
+			grouped[e.Name] = mc
+		}
+		mc.Total += e.Value
+		mc.Count++
+	}
+	return grouped
+}
+
+// Histogram 返回某模块指定指标的直方图统计 (用于 Prometheus histogram)。
+func (c *Collector) Histogram(module, name string, buckets []float64) *MetricHistogram {
+	c.mu.Lock()
+	events := make([]MetricEvent, len(c.buffer[module]))
+	copy(events, c.buffer[module])
+	c.mu.Unlock()
+
+	h := &MetricHistogram{
+		Name:   name,
+		Bucket: make(map[string]int),
+	}
+	for _, b := range buckets {
+		h.Bucket[fmt.Sprintf("%.6g", b)] = 0
+	}
+	h.Bucket["+Inf"] = 0
+
+	for _, e := range events {
+		if e.Name != name {
+			continue
+		}
+		h.Sum += e.Value
+		h.Count++
+		for _, b := range buckets {
+			if e.Value <= b {
+				h.Bucket[fmt.Sprintf("%.6g", b)]++
+			}
+		}
+		h.Bucket["+Inf"]++
+	}
+	return h
+}
+
+// HistogramDefaults 返回默认直方图桶 (适合耗时秒数分布)。
+func HistogramDefaults() []float64 {
+	return []float64{0.1, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600}
+}
+
 // AllSummaries 生成所有模块的摘要。
 func (c *Collector) AllSummaries() []*ModuleSummary {
 	c.mu.Lock()
@@ -177,77 +252,8 @@ func (c *Collector) AllSummaries() []*ModuleSummary {
 	return result
 }
 
-// Close 关闭所有文件句柄。
-func (c *Collector) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, f := range c.files {
-		f.Close()
-	}
-}
-
-func (c *Collector) appendToFile(module string, evt MetricEvent) {
-	f, ok := c.files[module]
-	if !ok {
-		path := filepath.Join(c.dataDir, module+".jsonl")
-		var err error
-		f, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			return
-		}
-		c.files[module] = f
-	}
-	data, _ := json.Marshal(evt)
-	f.Write(data)
-	f.WriteString("\n")
-}
-
-func (c *Collector) loadExisting() {
-	entries, err := os.ReadDir(c.dataDir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
-			continue
-		}
-		module := e.Name()[:len(e.Name())-6] // strip .jsonl
-		data, err := os.ReadFile(filepath.Join(c.dataDir, e.Name()))
-		if err != nil {
-			continue
-		}
-		var events []MetricEvent
-		for _, line := range splitLines(data) {
-			if len(line) == 0 {
-				continue
-			}
-			var evt MetricEvent
-			if json.Unmarshal(line, &evt) == nil {
-				events = append(events, evt)
-			}
-		}
-		if len(events) > 0 {
-			c.buffer[module] = events
-		}
-	}
-}
-
-func splitLines(data []byte) [][]byte {
-	var lines [][]byte
-	start := 0
-	for i, b := range data {
-		if b == '\n' {
-			if i > start {
-				lines = append(lines, data[start:i])
-			}
-			start = i + 1
-		}
-	}
-	if start < len(data) {
-		lines = append(lines, data[start:])
-	}
-	return lines
-}
+// Close no-op (no longer manages file handles).
+func (c *Collector) Close() {}
 
 func computeStat(name string, values []float64) *MetricStat {
 	n := len(values)
@@ -414,6 +420,18 @@ const (
 	MCronDurationSec  = "cron_duration_sec"   // 运行耗时
 )
 
+// Swarm Intel 指标 (群体智能预测/模拟)
+const (
+	MSwarmRunCount       = "swarm_run_count"        // 预测/模拟总次数
+	MSwarmSuccessCount   = "swarm_success_count"    // 成功次数
+	MSwarmConsensus      = "swarm_consensus"        // 共识度 (0-1)
+	MSwarmBrierScore     = "swarm_brier_score"      // Brier 校准分数
+	MSwarmDiversity      = "swarm_diversity"        // 多样性分数 (0-1)
+	MSwarmLatencyMs      = "swarm_latency_ms"       // 延迟 (ms)
+	MSwarmDebateSkipRate = "swarm_debate_skip_rate" // 辩论跳过率
+	MSwarmLLMCalls       = "swarm_llm_calls"        // 单次 LLM 调用数
+)
+
 // Memory 指标
 const (
 	MMemEntryCount     = "mem_entry_count"      // 记忆条目数
@@ -470,3 +488,135 @@ const (
 	MLLMCircuitOpenGauge = "llm_circuit_open"      // 当前是否熔断 (gauge 0/1)
 	MLLMCircuitFailStreak = "llm_circuit_fail_streak" // 连续失败计数 (gauge)
 )
+
+// ─── Prometheus 指标类型分类 ──────────────────────────────────────────────
+
+const KindPromHistogram = "histogram"
+
+// MetricType 定义每个指标的 Prometheus 类型 (仅列出常量中定义的指标)。
+var MetricType = map[string]MetricKind{
+	// LLM 计数器 (单调递增)
+	MLLMCallCount:         "counter",
+	MLLMSuccessCount:      "counter",
+	MLLMErrorCount:        "counter",
+	MLLMRetryCount:        "counter",
+	MLLMRateLimitCount:    "counter",
+	MLLMOverloadCount:     "counter",
+	MLLMTimeoutCount:      "counter",
+	MLLMRefusalCount:      "counter",
+	MLLMPromptTooLong:     "counter",
+	MLLMGuardAIMDCut:      "counter",
+	MLLMCircuitTrips:      "counter",
+
+	// LLM 状态 (gauge)
+	MLLMGuardInFlight:     "gauge",
+	MLLMGuardMaxParallel:  "gauge",
+	MLLMGuardRPMTokens:    "gauge",
+	MLLMGuardPauseSec:     "gauge",
+	MLLMGuardWaitSec:      "gauge",
+	MLLMCircuitOpenGauge:  "gauge",
+	MLLMCircuitFailStreak: "gauge",
+
+	// LLM 分布 (histogram)
+	MLLMDurationSec:       "histogram",
+	MLLMInputTokens:       "histogram",
+	MLLMOutputTokens:      "histogram",
+	MLLMCacheReadTokens:   "histogram",
+	MLLMCacheCreateTokens: "histogram",
+	MLLMTotalTokens:       "histogram",
+
+	// Team 计数器
+	MTeamRunCount:          "counter",
+	MTeamSuccessCount:      "counter",
+	MTeamFailCount:         "counter",
+	MTeamStageCount:        "counter",
+	MTeamStageSuccessCount: "counter",
+	MTeamStageFailCount:    "counter",
+	MTeamStageRetryCount:   "counter",
+	MTeamRoundCount:        "counter",
+	MTeamAgentRunCount:     "counter",
+
+	// Team 状态/比率 (gauge)
+	MTeamStagePassRate:  "gauge",
+	MTeamEvalPassRate:   "gauge",
+	MTeamBuildPassRate:  "gauge",
+	MTeamOutputAvgLen:   "gauge",
+	MTeamFileCount:      "gauge",
+
+	// Team 分布 (histogram)
+	MTeamDurationSec:      "histogram",
+	MTeamStageDurationSec: "histogram",
+	MTeamStageOutputLen:   "histogram",
+	MTeamAgentDurationSec: "histogram",
+
+	// Dreaming 计数器
+	MDreamCount:        "counter",
+	MDreamErrorCount:   "counter",
+	MDreamTriggerSource: "counter",
+
+	// Dreaming 状态 (gauge)
+	MDreamCompressionRatio:       "gauge",
+	MDreamOutputSize:             "gauge",
+	MDreamSessionsPending:        "gauge",
+	MDreamHoursSinceLast:         "gauge",
+	MDreamGateBlockSessionsLow:   "gauge",
+	MDreamGateBlockTimeShort:     "gauge",
+	MDreamGateBlockDreaming:      "gauge",
+	MDreamGateBlockLockHeld:      "gauge",
+	MDreamGateBlockScanThrottle:  "gauge",
+	MDreamConsolidatorFacts:      "gauge",
+	MDreamConsolidatorContra:     "gauge",
+	MDreamConsolidatorPatterns:   "gauge",
+
+	// Dreaming 分布 (histogram)
+	MDreamDurationSec:   "histogram",
+	MDreamSessionsInput: "histogram",
+
+	// Memory 计数器
+	MMemPruneCount:      "counter",
+	MMemRetrievalCount:  "counter",
+	MFactIngestCount:    "counter",
+	MFactDecayArchivedCount: "counter",
+	MPrecompactFactsSaved:   "counter",
+
+	// Memory 状态 (gauge)
+	MMemEntryCount:     "gauge",
+	MMemAvgAccessCount: "gauge",
+	MFactTotalCount:    "gauge",
+	MFactActiveCount:   "gauge",
+	MFactArchivedCount: "gauge",
+	MFactEvergreenCount: "gauge",
+	MFactAvgRetention:  "gauge",
+	MFactConnectionCount: "gauge",
+	MAmnesiaRiskScore:  "gauge",
+
+	// Evolution 计数器
+	MEvoDistillCount: "counter",
+	MEvoPruneCount:   "counter",
+
+	// Evolution 状态 (gauge)
+	MEvoExperienceCount: "gauge",
+	MEvoTrajectoryCount: "gauge",
+	MEvoSuccessRate:     "gauge",
+	MEvoUtilizationRate: "gauge",
+	MEvoAvgQuality:      "gauge",
+	MEvoQualityMin:      "gauge",
+	MEvoQualityMax:      "gauge",
+	MEvoFailTrajectory:  "gauge",
+
+	// Cron 计数器
+	MCronRunCount:     "counter",
+	MCronSuccessCount: "counter",
+	MCronFailCount:    "counter",
+
+	// Cron 分布 (histogram)
+	MCronDurationSec:  "histogram",
+
+	// Task 计数器
+	MTaskCreatedCount:   "counter",
+	MTaskCompletedCount: "counter",
+	MTaskFailedCount:    "counter",
+
+	// Task 状态 (gauge)
+	MTaskCompletionRate: "gauge",
+}

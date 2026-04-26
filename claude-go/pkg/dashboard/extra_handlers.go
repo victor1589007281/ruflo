@@ -551,10 +551,59 @@ func (s *Server) handleTimeSeries(w http.ResponseWriter, r *http.Request) {
 			since = time.Now().Add(-d)
 		}
 	}
-	events, err := s.provider.ModuleMetricEvents(module, limit, since)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+
+	// 优先从 Prometheus 查询 range query
+	var events []MetricEventDTO
+	promURL := os.Getenv("CLAUDE_GO_PROMETHEUS_URL")
+	if promURL != "" {
+		end := time.Now()
+		start := end.Add(-24 * time.Hour)
+		if !since.IsZero() {
+			start = since
+		}
+		step := time.Duration(float64(end.Sub(start).Seconds())/500) * time.Second
+		if step < 15*time.Second {
+			step = 15 * time.Second
+		}
+		query := fmt.Sprintf(`{__name__=~"claude_go_.*", module="%s"}`, module)
+		resp, err := queryPromRange(promURL, query, start, end, step)
+		if err == nil && resp != nil && resp.Status == "success" && len(resp.Data.Result) > 0 {
+			for _, r := range resp.Data.Result {
+				if r.Metric["__name__"] != "claude_go_"+metric {
+					continue
+				}
+				for _, v := range r.Values {
+					if len(v) < 2 {
+						continue
+					}
+					tsFloat, _ := v[0].(float64)
+					valFloat, _ := v[1].(string)
+					val, _ := strconv.ParseFloat(valFloat, 64)
+					events = append(events, MetricEventDTO{
+						Timestamp: time.Unix(int64(tsFloat), 0),
+						Module:    module,
+						Name:      metric,
+						Value:     val,
+						Labels:    r.Metric,
+					})
+				}
+			}
+		}
+	}
+
+	// 回退: Provider (自带 Prometheus->JSONL dual-read)
+	if len(events) == 0 {
+		evts, err := s.provider.ModuleMetricEvents(module, limit, since)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		for _, e := range evts {
+			if e.Name != metric {
+				continue
+			}
+			events = append(events, e)
+		}
 	}
 	resp := timeSeriesResp{Module: module, Metric: metric, Points: []timePointDTO{}}
 	for _, e := range events {

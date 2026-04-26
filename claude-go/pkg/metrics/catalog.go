@@ -105,6 +105,16 @@ var catalog = []MetricDesc{
 	{Module: "task", Name: MTaskFailedCount, ZH: "任务失败总数", EN: "Tasks failed", Unit: "count", Kind: KindCounter, Panel: "task"},
 	{Module: "task", Name: MTaskCompletionRate, ZH: "任务完成率", EN: "Completion rate", Unit: "ratio", Kind: KindGauge, Panel: "task"},
 
+	// ── Swarm Intel ──────────────────────────────────────
+	{Module: "swarm", Name: MSwarmRunCount, ZH: "群体智能预测/模拟次数", EN: "Swarm predict/simulate runs", Unit: "count", Kind: KindCounter, Panel: "swarm"},
+	{Module: "swarm", Name: MSwarmSuccessCount, ZH: "群体智能成功次数", EN: "Swarm successes", Unit: "count", Kind: KindCounter, Panel: "swarm"},
+	{Module: "swarm", Name: MSwarmConsensus, ZH: "共识度 (0-1)", EN: "Consensus score", Unit: "ratio", Kind: KindGauge, Panel: "swarm"},
+	{Module: "swarm", Name: MSwarmBrierScore, ZH: "Brier 校准分数", EN: "Brier calibration score", Unit: "ratio", Kind: KindGauge, Panel: "swarm"},
+	{Module: "swarm", Name: MSwarmDiversity, ZH: "多样性分数 (0-1)", EN: "Diversity score", Unit: "ratio", Kind: KindGauge, Panel: "swarm"},
+	{Module: "swarm", Name: MSwarmLatencyMs, ZH: "延迟分布 (ms)", EN: "Latency distribution", Unit: "ms", Kind: KindHistogram, Panel: "swarm"},
+	{Module: "swarm", Name: MSwarmDebateSkipRate, ZH: "辩论跳过率", EN: "Debate skip rate", Unit: "ratio", Kind: KindGauge, Panel: "swarm"},
+	{Module: "swarm", Name: MSwarmLLMCalls, ZH: "单次 LLM 调用数", EN: "LLM calls per run", Unit: "count", Kind: KindGauge, Panel: "swarm"},
+
 	// ── Team (整团队级) ───────────────────────────────────
 	{Module: "team", Name: MTeamRunCount, ZH: "团队运行次数", EN: "Team runs", Unit: "count", Kind: KindCounter, Panel: "team"},
 	{Module: "team", Name: MTeamSuccessCount, ZH: "团队成功次数", EN: "Team successes", Unit: "count", Kind: KindCounter, Panel: "team"},

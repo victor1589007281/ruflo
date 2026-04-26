@@ -402,6 +402,14 @@ func developmentWorkflow() *WorkflowDef {
 ⚠️ 重要: 本轮代码已通过编译门禁, 你不需要检查编译问题。
 请聚焦于逻辑正确性、完整性、安全性和设计对齐。
 
+## 🔴 最高优先级: 检测未实现逻辑 (TODO/STUB/placeholder)
+⚠️ 这是最严重的偷工减料行为, 一旦发现必须标注为 BLOCKER:
+- 搜索代码中的: TODO, FIXME, HACK, XXX, STUB, placeholder, 占位, 待实现, 未实现
+- 任何使用 panic("not implemented") 或 return nil/0/"" 的空壳函数
+- 任何只返回默认值、没有真实业务逻辑的函数
+- 发现任何一处 → completeness 直接 ≤ 3, pass = false
+- 必须在 feedback 中逐条列出: 文件名:行号 + 未实现内容
+
 目标: {objective}
 
 Generator 第 {adversarial_round} 轮产出:
@@ -415,7 +423,8 @@ Generator 第 {adversarial_round} 轮产出:
 
 ### 2. completeness (完整性)
 - 是否覆盖设计文档中所有模块?
-- CRITICAL: 核心功能未实现 (Mock/Stub)
+- CRITICAL: 核心功能未实现 (Mock/Stub/TODO/占位符)
+- 检测空壳函数: 函数体只有 return 默认值, 无真实逻辑
 - 注意: 仅评估本轮**实际可见**的代码, 不因"看不到的文件"扣分
 
 ### 3. security (安全性)
@@ -438,7 +447,8 @@ Generator 第 {adversarial_round} 轮产出:
 输出 STRICTLY as JSON:
 {"correctness": N, "completeness": N, "security": N, "code_quality": N, "design_alignment": N, "pass": bool, "feedback": "最多5条问题+修复建议"}
 
-评分标准: 0-10 分。有 Stub → completeness ≤ 4。
+评分标准: 0-10 分。有 Stub/TODO/占位符 → completeness ≤ 3。
+有空壳函数 (只有 return 默认值) → completeness ≤ 4。
 有严重偏差 → design_alignment ≤ 4。
 通过门槛: ALL 5 dimensions >= 6 AND pass == true。`,
 			},
@@ -1271,12 +1281,22 @@ func (we *WorkflowExecutor) runBuildHardGate(
 
 	buildErrors := runBuildCheckLang(team.Cwd, lang)
 	if buildErrors == "" {
-		tc := GetToolchain(lang)
-		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译通过 (%s)", round, tc.BuildCheckLabel()))
-		if we.metrics != nil {
-			we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		// L1.5: TODO/STUB 确定性门禁 — 编译通过不等于实现完整
+		if todos := scanForTodos(team.Cwd); len(todos) > 0 {
+			we.notify(we.chatID, fmt.Sprintf("🟡 第 %d 轮: 编译通过但发现 %d 处未实现项, 启动内部修复", round, len(todos)))
+			if we.metrics != nil {
+				we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			}
+			// 进入内部修复循环 (和编译失败同路径)
+			buildErrors = fmt.Sprintf("TODO/STUB 检测失败, 发现 %d 处未实现项", len(todos))
+		} else {
+			tc := GetToolchain(lang)
+			we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译通过且无未实现项 (%s)", round, tc.BuildCheckLabel()))
+			if we.metrics != nil {
+				we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			}
+			return true
 		}
-		return true
 	}
 
 	we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译失败, 启动内部修复 (最多 %d 次)...", round, maxBuildRetries))
@@ -1288,16 +1308,32 @@ func (we *WorkflowExecutor) runBuildHardGate(
 		if ctx.Err() != nil {
 			return false
 		}
-		buildFixPrompt := fmt.Sprintf("### 编译错误 (第 %d 次修复, 必须优先修复编译错误):\n%s\n\n"+
-			"要求:\n1. 仅修复编译错误, 不要做其他改动\n2. 保持现有代码结构不变\n3. 输出修复后的完整文件内容",
-			retry, truncateResult(buildErrors, 3000))
+
+		// 区分编译错误和 TODO/STUB 检测
+		isTodoFix := strings.Contains(buildErrors, "TODO/STUB")
+		var buildFixPrompt string
+		if isTodoFix {
+			todos := scanForTodos(team.Cwd)
+			var buf strings.Builder
+			buf.WriteString(fmt.Sprintf("### 未实现项检测 (第 %d 次修复, 必须将所有 TODO/STUB 替换为真实实现):\n", retry))
+			for _, t := range todos {
+				buf.WriteString(fmt.Sprintf("  - %s\n", t))
+			}
+			buf.WriteString("\n要求:\n1. 将上述每个 TODO/STUB/placeholder/panic 替换为真实、可运行的实现\n2. 宁可简化功能, 也不允许保留占位符\n3. 保持现有代码结构不变\n4. 输出修复后的完整文件内容")
+			buildFixPrompt = buf.String()
+		} else {
+			buildFixPrompt = fmt.Sprintf("### 编译错误 (第 %d 次修复, 必须优先修复编译错误):\n%s\n\n"+
+				"要求:\n1. 仅修复编译错误, 不要做其他改动\n2. 保持现有代码结构不变\n3. 输出修复后的完整文件内容",
+				retry, truncateResult(buildErrors, 3000))
+		}
 
 		for _, genStage := range genStages {
 			fixStage := genStage
 			fixStage.Prompt = strings.ReplaceAll(fixStage.Prompt, "{adversarial_feedback}", buildFixPrompt)
 			fixStage.Name = fmt.Sprintf("%s-round%d-buildfix%d", genStage.Name, round, retry)
 
-			we.notify(we.chatID, fmt.Sprintf("  🔧 编译修复 %d/%d — %s...", retry, maxBuildRetries, genStage.Role))
+			label := map[bool]string{true: "TODO", false: "编译"}[isTodoFix]
+			we.notify(we.chatID, fmt.Sprintf("  🔧 %s修复 %d/%d — %s...", label, retry, maxBuildRetries, genStage.Role))
 			sr := we.executeStage(ctx, fixStage, objective, prevResults, team)
 			sr.Name = fixStage.Name
 			*allResults = append(*allResults, sr)
@@ -1308,16 +1344,26 @@ func (we *WorkflowExecutor) runBuildHardGate(
 			}
 		}
 
+		// L2: 编译检查
 		buildErrors = runBuildCheckLang(team.Cwd, lang)
-		if buildErrors == "" {
-			we.notify(we.chatID, fmt.Sprintf("  🟢 编译修复成功 (第 %d 次重试)", retry))
-			if we.metrics != nil {
-				we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name,
-					map[string]string{"round": fmt.Sprint(round), "build_retry": fmt.Sprint(retry)})
-			}
-			return true
+		if buildErrors != "" {
+			we.notify(we.chatID, fmt.Sprintf("  🔴 编译修复第 %d 次仍失败", retry))
+			continue
 		}
-		we.notify(we.chatID, fmt.Sprintf("  🔴 编译修复第 %d 次仍失败", retry))
+
+		// L1.5: TODO/STUB 复扫
+		if todos := scanForTodos(team.Cwd); len(todos) > 0 {
+			buildErrors = fmt.Sprintf("TODO/STUB 检测失败, 仍发现 %d 处未实现项", len(todos))
+			we.notify(we.chatID, fmt.Sprintf("  🟡 TODO 修复第 %d 次仍残留 %d 处", retry, len(todos)))
+			continue
+		}
+
+		we.notify(we.chatID, fmt.Sprintf("  🟢 编译+实现均通过 (第 %d 次重试)", retry))
+		if we.metrics != nil {
+			we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name,
+				map[string]string{"round": fmt.Sprint(round), "build_retry": fmt.Sprint(retry)})
+		}
+		return true
 	}
 	return false
 }
@@ -1586,6 +1632,15 @@ func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStage
 	var results []StageResult
 	e2eTerminator := NewAdaptiveTerminator(1, 3) // E2E: 最少1轮, 最多3轮
 	we.notify(we.chatID, "🧪 Phase 3: E2E 对抗测试 (tester↔coder 自适应)...")
+
+	// L1.5 E2E 前置门禁: 在运行 E2E 测试前先扫描 TODO/STUB
+	if team.Cwd != "" {
+		if todos := scanForTodos(team.Cwd); len(todos) > 0 {
+			we.notify(we.chatID, fmt.Sprintf("🟡 E2E 前置门禁: 发现 %d 处未实现项, 触发修复循环", len(todos)))
+			// 把 TODO 作为 E2E 测试的初始问题, 驱动 coder 修复
+			prevResults["e2e-todo-blocker"] = fmt.Sprintf("E2E 门禁拦截: 发现 %d 处未实现项, 必须在 E2E 测试前修复:\n%v", len(todos), todos)
+		}
+	}
 
 	var lastE2EOutput string
 	for round := 1; round <= 3; round++ {
@@ -3121,6 +3176,57 @@ func runMySQLBuildCheck(cwd string) string {
 	}
 
 	return ""
+}
+
+// scanForTodos 扫描已物化的源码文件, 检测未实现的 TODO/STUB/HACK/placeholder。
+// 返回发现的未实现项列表; 空表示全部实现完整。
+// 作为 L1.5 确定性门禁, 不依赖 LLM 判断, 避免遗漏。
+func scanForTodos(cwd string) []string {
+	var findings []string
+	sourceExts := map[string]bool{
+		".go": true, ".ts": true, ".tsx": true, ".js": true, ".jsx": true,
+		".py": true, ".java": true, ".cs": true, ".c": true, ".cpp": true,
+		".h": true, ".rs": true, ".swift": true, ".kt": true, ".dart": true,
+	}
+
+	_ = filepath.WalkDir(cwd, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !sourceExts[filepath.Ext(path)] {
+			return nil
+		}
+		rel, _ := filepath.Rel(cwd, path)
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		lines := strings.Split(string(data), "\n")
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			// 跳过纯注释中的合理用法: 文档注释、版权说明等
+			// 重点捕获: TODO + 不完整的实现信号
+			todoPatterns := []string{
+				"TODO", "FIXME", "HACK", "XXX", "STUB",
+				"not implemented", "NotImplemented",
+				"placeholder", "占位", "待实现", "未实现",
+				"panic(", // Go 中的 panic 实现 = 未完成
+			}
+			for _, pat := range todoPatterns {
+				if strings.Contains(trimmed, pat) {
+					// 过滤: 如果是 // File: ... 或注释中的说明性文字, 跳过
+					if strings.HasPrefix(trimmed, "// File:") || strings.HasPrefix(trimmed, "# File:") {
+						continue
+					}
+					findings = append(findings, fmt.Sprintf("%s:%d: %s", rel, i+1, strings.TrimSpace(trimmed)))
+					break // 同一行只记录一次
+				}
+			}
+		}
+		return nil
+	})
+	return findings
 }
 
 // runBuildCheckLang 多语言版本的编译检查。

@@ -1554,12 +1554,13 @@ func (o *Orchestrator) runMicroTest(ctx context.Context, node *TaskNode) {
 ## 任务产出 (截取)
 %s
 
-## 快速验证 (3项, 每项 PASS/FAIL):
+## 快速验证 (4项, 每项 PASS/FAIL):
 1. **编译完整性**: 语法正确? import 完整?
 2. **接口对齐**: %s
 3. **约束遵守**: %s 是否被遵守?
+4. **TODO/STUB 检测**: 代码中是否含有 TODO, FIXME, HACK, STUB, placeholder, 占位, 待实现, panic("not implemented") 或空壳函数? 如有则 FAIL。
 
-输出格式: 编译: PASS/FAIL | 对齐: PASS/FAIL | 约束: PASS/FAIL | 综合: PASS/FAIL`,
+输出格式: 编译: PASS/FAIL | 对齐: PASS/FAIL | 约束: PASS/FAIL | TODO: PASS/FAIL | 综合: PASS/FAIL`,
 		node.Title, node.Role, node.DesignRef,
 		strings.Join(node.ConstraintRefs, ","), node.AcceptCriteria,
 		truncateResult(node.Output, 6000),

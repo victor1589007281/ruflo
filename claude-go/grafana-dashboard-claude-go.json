@@ -1,0 +1,5702 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "claude-go-overview",
+    "title": "Claude-Go 全局监控 (Prometheus Native)",
+    "tags": [
+      "claude-go",
+      "prometheus"
+    ],
+    "timezone": "browser",
+    "editable": true,
+    "refresh": "10s",
+    "time": {
+      "from": "now-6h",
+      "to": "now"
+    },
+    "schemaVersion": 36,
+    "version": 1,
+    "templating": {
+      "list": [
+        {
+          "name": "model",
+          "type": "query",
+          "label": "Model",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "query": "label_values(claude_go_llm_call_bucket, model)",
+          "refresh": 1,
+          "multi": true,
+          "includeAll": true,
+          "current": {
+            "selected": true,
+            "text": "All",
+            "value": "$__all"
+          },
+          "sort": 1,
+          "hide": 0
+        },
+        {
+          "name": "team",
+          "type": "query",
+          "label": "Team",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "query": "label_values(claude_go_team_run, team)",
+          "refresh": 1,
+          "multi": true,
+          "includeAll": true,
+          "current": {
+            "selected": true,
+            "text": "All",
+            "value": "$__all"
+          },
+          "sort": 1,
+          "hide": 0
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 1,
+        "type": "row",
+        "title": "LLM 调用 (全部指标)",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 0
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 2,
+        "type": "stat",
+        "title": "调用总次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_call_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 1
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 3,
+        "type": "stat",
+        "title": "LLM成功次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_success)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 1
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 4,
+        "type": "stat",
+        "title": "错误总数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_error)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 1
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 5,
+        "type": "stat",
+        "title": "限流次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_rate_limit)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 1
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 6,
+        "type": "stat",
+        "title": "超时次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_timeout)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 1
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 7,
+        "type": "stat",
+        "title": "重试次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_retry)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 1
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 8,
+        "type": "stat",
+        "title": "过载次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_overload)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 5
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 9,
+        "type": "stat",
+        "title": "拒答次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_refusal)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 5
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 10,
+        "type": "stat",
+        "title": "Prompt超长",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_prompt_too_long)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 5
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 11,
+        "type": "stat",
+        "title": "熔断触发",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_circuit_trips)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 5
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 12,
+        "type": "stat",
+        "title": "LLM成功率",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_success) / (sum(claude_go_llm_call_count) + 0.001) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 5
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 13,
+        "type": "stat",
+        "title": "LLM 延迟 (P50)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 5
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 14,
+        "type": "timeseries",
+        "title": "LLM 延迟分布 (P50/P95/P99)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 0,
+          "y": 9
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 15,
+        "type": "timeseries",
+        "title": "Token 消耗 (按模型)",
+        "targets": [
+          {
+            "expr": "sum by (model) (rate(claude_go_llm_input_tokens_sum[5m]))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum by (model) (rate(claude_go_llm_output_tokens_sum[5m]))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum by (model) (rate(claude_go_llm_total_tokens_sum[5m]))",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 8,
+          "y": 9
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 16,
+        "type": "timeseries",
+        "title": "错误 & 限流趋势",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_error[5m]))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_rate_limit[5m]))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_timeout[5m]))",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_retry[5m]))",
+            "refId": "D",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_overload[5m]))",
+            "refId": "E",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 17
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 17,
+        "type": "timeseries",
+        "title": "LLM 缓存 (Token/s)",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_cache_read_tokens_sum[5m]))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_cache_create_tokens_sum[5m]))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 17
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 18,
+        "type": "row",
+        "title": "LLM 限流 & 熔断",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 25
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 19,
+        "type": "stat",
+        "title": "当前在途",
+        "targets": [
+          {
+            "expr": "claude_go_llm_guard_in_flight",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 26
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 20,
+        "type": "stat",
+        "title": "AIMD最大并发",
+        "targets": [
+          {
+            "expr": "claude_go_llm_guard_max_parallel",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 26
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 21,
+        "type": "stat",
+        "title": "RPM令牌剩余",
+        "targets": [
+          {
+            "expr": "claude_go_llm_guard_rpm_tokens",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 26
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 22,
+        "type": "stat",
+        "title": "退避剩余秒",
+        "targets": [
+          {
+            "expr": "claude_go_llm_guard_pause_sec",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 26
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 23,
+        "type": "stat",
+        "title": "熔断状态",
+        "targets": [
+          {
+            "expr": "claude_go_llm_circuit_open",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 26
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 24,
+        "type": "stat",
+        "title": "连续失败",
+        "targets": [
+          {
+            "expr": "claude_go_llm_circuit_fail_streak",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 26
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 25,
+        "type": "timeseries",
+        "title": "AIMD 并发控制",
+        "targets": [
+          {
+            "expr": "claude_go_llm_guard_in_flight",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_llm_guard_max_parallel",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 0,
+          "y": 30
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 26,
+        "type": "timeseries",
+        "title": "熔断 & 限流器状态",
+        "targets": [
+          {
+            "expr": "claude_go_llm_circuit_open",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_llm_circuit_fail_streak",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_llm_guard_rpm_tokens",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_llm_guard_pause_sec",
+            "refId": "D",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 8,
+          "y": 30
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 27,
+        "type": "timeseries",
+        "title": "准入等待时间 (P50/P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_llm_guard_wait_sec_bucket[5m])) by (le))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_llm_guard_wait_sec_bucket[5m])) by (le))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 16,
+          "y": 30
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 28,
+        "type": "row",
+        "title": "团队协作 (全部指标)",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 38
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 29,
+        "type": "stat",
+        "title": "运行次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_run)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 39
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 30,
+        "type": "stat",
+        "title": "团队成功次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_success)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 39
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 31,
+        "type": "stat",
+        "title": "团队失败次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_fail)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 39
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 32,
+        "type": "stat",
+        "title": "阶段通过率",
+        "targets": [
+          {
+            "expr": "avg(claude_go_team_stage_pass_rate) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 39
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 33,
+        "type": "stat",
+        "title": "评审通过率",
+        "targets": [
+          {
+            "expr": "avg(claude_go_team_eval_pass_rate) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 39
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 34,
+        "type": "stat",
+        "title": "对抗轮数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_round)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 39
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 35,
+        "type": "stat",
+        "title": "阶段执行",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_stage)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 43
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 36,
+        "type": "stat",
+        "title": "阶段成功",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_stage_success)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 43
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 37,
+        "type": "stat",
+        "title": "阶段失败",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_stage_fail)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 43
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 38,
+        "type": "stat",
+        "title": "阶段重试",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_stage_retry)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 43
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 39,
+        "type": "stat",
+        "title": "Agent触发",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_agent_run)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 43
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 40,
+        "type": "stat",
+        "title": "产出文件",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_file_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 43
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 41,
+        "type": "timeseries",
+        "title": "团队阶段耗时 (P50/P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_team_stage_duration_bucket[5m])) by (le))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_team_stage_duration_bucket[5m])) by (le))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 0,
+          "y": 47
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 42,
+        "type": "timeseries",
+        "title": "团队整次耗时 (P50/P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_team_duration_bucket[5m])) by (le))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_team_duration_bucket[5m])) by (le))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 8,
+          "y": 47
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 43,
+        "type": "timeseries",
+        "title": "Agent耗时 (P50/P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_team_agent_duration_bucket[5m])) by (le))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_team_agent_duration_bucket[5m])) by (le))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 16,
+          "y": 47
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 44,
+        "type": "timeseries",
+        "title": "团队产出 & 质量趋势",
+        "targets": [
+          {
+            "expr": "claude_go_team_stage_pass_rate",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_team_eval_pass_rate",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_team_build_pass_rate",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_team_output_avg_len",
+            "refId": "D",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_team_stage_output_len",
+            "refId": "E",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 55
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 45,
+        "type": "stat",
+        "title": "团队完成率",
+        "targets": [
+          {
+            "expr": "sum(claude_go_team_success) / (sum(claude_go_team_run) + 0.001) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 55
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 46,
+        "type": "row",
+        "title": "记忆整理 Dreaming (全部指标)",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 63
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 47,
+        "type": "stat",
+        "title": "整理次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_dream_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 64
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 48,
+        "type": "stat",
+        "title": "Dreaming失败次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_dream_error)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 64
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 49,
+        "type": "stat",
+        "title": "压缩率",
+        "targets": [
+          {
+            "expr": "claude_go_dream_compression_ratio",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 64
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ratio",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 50,
+        "type": "stat",
+        "title": "待处理会话",
+        "targets": [
+          {
+            "expr": "claude_go_dream_sessions_pending",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 64
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 51,
+        "type": "stat",
+        "title": "距上次整理(h)",
+        "targets": [
+          {
+            "expr": "claude_go_dream_hours_since_last",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 64
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "h",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 52,
+        "type": "stat",
+        "title": "输出大小",
+        "targets": [
+          {
+            "expr": "claude_go_dream_output_size",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 64
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "bytes",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 53,
+        "type": "timeseries",
+        "title": "Dreaming 耗时 (P50/P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_dream_duration_bucket[5m])) by (le))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_dream_duration_bucket[5m])) by (le))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 0,
+          "y": 68
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 54,
+        "type": "timeseries",
+        "title": "Dreaming 产出 & 质量",
+        "targets": [
+          {
+            "expr": "claude_go_dream_compression_ratio",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_dream_output_size",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_dream_consolidator_facts",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_dream_consolidator_contradictions",
+            "refId": "D",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_dream_consolidator_patterns",
+            "refId": "E",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 8,
+          "y": 68
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 55,
+        "type": "timeseries",
+        "title": "Dreaming 趋势",
+        "targets": [
+          {
+            "expr": "sum(increase(claude_go_dream_count[1h]))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_dream_sessions_pending",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 16,
+          "y": 68
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 56,
+        "type": "timeseries",
+        "title": "Dreaming 触发来源",
+        "targets": [
+          {
+            "expr": "sum by (source) (increase(claude_go_dream_trigger[1h]))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 76
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 57,
+        "type": "row",
+        "title": "记忆系统 Memory (全部指标)",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 84
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 58,
+        "type": "stat",
+        "title": "记忆条目",
+        "targets": [
+          {
+            "expr": "claude_go_mem_entry_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 85
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 59,
+        "type": "stat",
+        "title": "平均访问",
+        "targets": [
+          {
+            "expr": "claude_go_mem_avg_access_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 85
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 60,
+        "type": "stat",
+        "title": "修剪次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_mem_prune_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 85
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 61,
+        "type": "stat",
+        "title": "检索次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_mem_retrieval_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 85
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 62,
+        "type": "stat",
+        "title": "PreCompact抢救",
+        "targets": [
+          {
+            "expr": "sum(claude_go_precompact_facts_saved)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 85
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 63,
+        "type": "stat",
+        "title": "失忆风险",
+        "targets": [
+          {
+            "expr": "claude_go_amnesia_risk_score",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 85
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 64,
+        "type": "stat",
+        "title": "事实总数",
+        "targets": [
+          {
+            "expr": "claude_go_fact_total_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 89
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 65,
+        "type": "stat",
+        "title": "活跃事实",
+        "targets": [
+          {
+            "expr": "claude_go_fact_active_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 89
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 66,
+        "type": "stat",
+        "title": "已归档",
+        "targets": [
+          {
+            "expr": "claude_go_fact_archived_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 89
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 67,
+        "type": "stat",
+        "title": "永久保留",
+        "targets": [
+          {
+            "expr": "claude_go_fact_evergreen_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 89
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 68,
+        "type": "stat",
+        "title": "平均保留率",
+        "targets": [
+          {
+            "expr": "claude_go_fact_avg_retention * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 89
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 69,
+        "type": "stat",
+        "title": "事实关联",
+        "targets": [
+          {
+            "expr": "claude_go_fact_connection_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 89
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 70,
+        "type": "timeseries",
+        "title": "事实生命周期",
+        "targets": [
+          {
+            "expr": "claude_go_fact_total_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_fact_active_count",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_fact_archived_count",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_fact_evergreen_count",
+            "refId": "D",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_fact_connection_count",
+            "refId": "E",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 93
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 71,
+        "type": "timeseries",
+        "title": "失忆风险 & 保留率",
+        "targets": [
+          {
+            "expr": "claude_go_amnesia_risk_score",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_fact_avg_retention * 100",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 93
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 72,
+        "type": "row",
+        "title": "经验进化 Evolution (全部指标)",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 101
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 73,
+        "type": "stat",
+        "title": "经验总数",
+        "targets": [
+          {
+            "expr": "claude_go_evo_experience_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 102
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 74,
+        "type": "stat",
+        "title": "轨迹总数",
+        "targets": [
+          {
+            "expr": "claude_go_evo_trajectory_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 102
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 75,
+        "type": "stat",
+        "title": "经验成功率",
+        "targets": [
+          {
+            "expr": "claude_go_evo_success_rate * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 102
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 76,
+        "type": "stat",
+        "title": "使用率",
+        "targets": [
+          {
+            "expr": "claude_go_evo_utilization_rate * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 102
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 77,
+        "type": "stat",
+        "title": "平均质量",
+        "targets": [
+          {
+            "expr": "claude_go_evo_avg_quality * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 102
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 78,
+        "type": "stat",
+        "title": "失败占比",
+        "targets": [
+          {
+            "expr": "claude_go_evo_fail_trajectory_pct * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 102
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 79,
+        "type": "stat",
+        "title": "经验提炼",
+        "targets": [
+          {
+            "expr": "sum(claude_go_evo_distill_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 106
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 80,
+        "type": "stat",
+        "title": "经验剪枝",
+        "targets": [
+          {
+            "expr": "sum(claude_go_evo_prune_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 106
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 81,
+        "type": "stat",
+        "title": "最低质量",
+        "targets": [
+          {
+            "expr": "claude_go_evo_quality_min * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 106
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 82,
+        "type": "stat",
+        "title": "最高质量",
+        "targets": [
+          {
+            "expr": "claude_go_evo_quality_max * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 106
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 83,
+        "type": "timeseries",
+        "title": "经验增长趋势",
+        "targets": [
+          {
+            "expr": "claude_go_evo_experience_count",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_evo_trajectory_count",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 110
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 84,
+        "type": "timeseries",
+        "title": "质量 & 成功率趋势",
+        "targets": [
+          {
+            "expr": "claude_go_evo_avg_quality * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_evo_success_rate * 100",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_evo_utilization_rate * 100",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_evo_quality_min * 100",
+            "refId": "D",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_evo_quality_max * 100",
+            "refId": "E",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 110
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 85,
+        "type": "row",
+        "title": "任务 Task (全部指标)",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 118
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 86,
+        "type": "stat",
+        "title": "创建总数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_task_created)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 119
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 87,
+        "type": "stat",
+        "title": "完成总数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_task_completed)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 119
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 88,
+        "type": "stat",
+        "title": "失败总数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_task_failed)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 119
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 89,
+        "type": "stat",
+        "title": "完成率",
+        "targets": [
+          {
+            "expr": "avg(claude_go_task_completion_rate) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 119
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 90,
+        "type": "stat",
+        "title": "任务完成率",
+        "targets": [
+          {
+            "expr": "sum(claude_go_task_completed) / (sum(claude_go_task_created) + 0.001) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 119
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 91,
+        "type": "row",
+        "title": "群体智能 Swarm Intel (全部指标)",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 123
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 92,
+        "type": "stat",
+        "title": "预测/模拟总次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_swarm_runs)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 124
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 93,
+        "type": "stat",
+        "title": "Swarm成功次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_swarm_success)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 124
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 94,
+        "type": "stat",
+        "title": "平均共识度",
+        "targets": [
+          {
+            "expr": "avg(claude_go_swarm_consensus)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 124
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ratio",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 95,
+        "type": "stat",
+        "title": "Brier分数",
+        "targets": [
+          {
+            "expr": "avg(claude_go_swarm_brier)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 124
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ratio",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 96,
+        "type": "stat",
+        "title": "多样性",
+        "targets": [
+          {
+            "expr": "avg(claude_go_swarm_diversity)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 124
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ratio",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 97,
+        "type": "stat",
+        "title": "辩论跳过率",
+        "targets": [
+          {
+            "expr": "avg(claude_go_swarm_debate_skip_rate)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 124
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percentunit",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 98,
+        "type": "timeseries",
+        "title": "Swarm 趋势",
+        "targets": [
+          {
+            "expr": "avg(claude_go_swarm_consensus)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "avg(claude_go_swarm_brier)",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "avg(claude_go_swarm_diversity)",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 128
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 99,
+        "type": "timeseries",
+        "title": "Swarm 延迟 & LLM调用",
+        "targets": [
+          {
+            "expr": "avg(claude_go_swarm_latency_ms_sum)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_swarm_llm_calls",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 128
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 100,
+        "type": "row",
+        "title": "定时任务 Cron (全部指标)",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 136
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 101,
+        "type": "stat",
+        "title": "触发次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_cron_run_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 137
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 102,
+        "type": "stat",
+        "title": "Cron成功次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_cron_success_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 137
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 103,
+        "type": "stat",
+        "title": "Cron失败次数",
+        "targets": [
+          {
+            "expr": "sum(claude_go_cron_fail_count)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 137
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 104,
+        "type": "stat",
+        "title": "Cron成功率",
+        "targets": [
+          {
+            "expr": "sum(claude_go_cron_success_count) / (sum(claude_go_cron_run_count) + 0.001) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 137
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 105,
+        "type": "stat",
+        "title": "启用任务",
+        "targets": [
+          {
+            "expr": "sum(claude_go_cron_enabled)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 137
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 106,
+        "type": "stat",
+        "title": "平均耗时",
+        "targets": [
+          {
+            "expr": "sum(claude_go_cron_duration_bucket) / (sum(claude_go_cron_run_count) + 0.001)",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 137
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 107,
+        "type": "timeseries",
+        "title": "Cron 趋势",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_cron_run_count[5m]))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum(rate(claude_go_cron_success_count[5m]))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "sum(rate(claude_go_cron_fail_count[5m]))",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 141
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 108,
+        "type": "timeseries",
+        "title": "Cron 耗时分布 (P50/P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_cron_duration_bucket[5m])) by (le))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_cron_duration_bucket[5m])) by (le))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 141
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 109,
+        "type": "row",
+        "title": "系统综合健康",
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 149
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "panels": []
+      },
+      {
+        "id": 110,
+        "type": "stat",
+        "title": "版本",
+        "targets": [
+          {
+            "expr": "claude_go_build_info",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 150
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 111,
+        "type": "stat",
+        "title": "LLM成功率(汇总)",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_success) / (sum(claude_go_llm_call_count) + 0.001) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 150
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 112,
+        "type": "stat",
+        "title": "任务完成率(汇总)",
+        "targets": [
+          {
+            "expr": "sum(claude_go_task_completed) / (sum(claude_go_task_created) + 0.001) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 150
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 113,
+        "type": "stat",
+        "title": "经验成功率(汇总)",
+        "targets": [
+          {
+            "expr": "claude_go_evo_success_rate * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 150
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 114,
+        "type": "stat",
+        "title": "记忆健康度",
+        "targets": [
+          {
+            "expr": "(1 - claude_go_amnesia_risk_score / 100) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 150
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 115,
+        "type": "stat",
+        "title": "阶段通过率(汇总)",
+        "targets": [
+          {
+            "expr": "avg(claude_go_team_stage_pass_rate) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 150
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 80
+                }
+              ]
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "textMode": "auto"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 116,
+        "type": "timeseries",
+        "title": "综合健康度",
+        "targets": [
+          {
+            "expr": "sum(claude_go_llm_success) / (sum(claude_go_llm_call) + 0.001) * 100",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "avg(claude_go_team_stage_pass_rate) * 100",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "(1 - claude_go_amnesia_risk_score / 100) * 100",
+            "refId": "C",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "claude_go_evo_success_rate * 100",
+            "refId": "D",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          },
+          {
+            "expr": "avg(claude_go_task_completion_rate) * 100",
+            "refId": "E",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 154
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent"
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom"
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      }
+    ],
+    "timepicker": {
+      "refresh_intervals": [
+        "5s",
+        "10s",
+        "30s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h"
+      ],
+      "time_options": [
+        "5m",
+        "15m",
+        "1h",
+        "6h",
+        "12h",
+        "24h",
+        "2d",
+        "7d",
+        "30d"
+      ]
+    },
+    "links": [],
+    "annotations": {
+      "list": []
+    },
+    "liveNow": false,
+    "graphTooltip": 0
+  },
+  "overwrite": true
+}

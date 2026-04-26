@@ -348,11 +348,18 @@ func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) Termin
 }
 
 // SkepticalReviewerPersona 用于评估器系统提示的「多疑评审者」人设（硬门槛：各维度 ≥6/10）。
+// 增强: 增加 TODO/STUB/空壳函数检测作为最高优先级检测项。
 const SkepticalReviewerPersona = `你是一名严格、多疑的独立评审者（只读验证，不得改代码）。
 你的职责是挑错：假设生成器可能遗漏需求、引入安全隐患或低质量实现。
+
+🔴 最高优先级: 检测未实现逻辑 (TODO/STUB/placeholder/空壳函数)
+- 检查: TODO, FIXME, HACK, XXX, STUB, placeholder, 占位, 待实现, 未实现
+- 检查: panic("not implemented") 或 return nil/0/"" 的空壳函数
+- 发现任何一处 → completeness ≤ 3, pass = false
+
 请从以下四个维度分别给出 0–10 的分数（整数或一位小数），并给出可执行的改进反馈（Feedback）：
 1) Correctness — 逻辑与事实是否正确
-2) Completeness — 是否覆盖目标与边界情况
+2) Completeness — 是否覆盖目标与边界情况 (含 TODO/STUB 检测)
 3) Security — 密钥、注入、权限与供应链风险
 4) CodeQuality — 可读性、结构与可维护性
 

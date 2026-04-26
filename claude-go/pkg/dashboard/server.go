@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +59,9 @@ func NewServer(cfg Config) *Server {
 	// 幂等: 即使主进程已初始化过, 这里也是 no-op。保证 dashboard 单独前台运行时
 	// 也能捕获自身对 LLM 的诊断调用。
 	metrics.InitGlobalLLMCollector(cfg.StateDir)
+	// 从 Swarm Intel / Cron JSON 数据回放历史指标到 Prometheus
+	s.provider.ExportSwarmIntelMetrics()
+	s.provider.ExportCronMetrics()
 	s.registerRoutes()
 	s.server = &http.Server{
 		Addr:              cfg.Addr,
@@ -80,8 +85,27 @@ func MountOn(cfg Config, mux *http.ServeMux) *Server {
 		jobs:     newDiagJobStore(100),
 	}
 	metrics.InitGlobalLLMCollector(cfg.StateDir)
+	s.provider.ExportSwarmIntelMetrics()
+	s.provider.ExportCronMetrics()
 	s.registerRoutesOn(mux)
 	return s
+}
+
+// recoverMiddleware 捕获 handler panic, 记录日志并返回 500, 防止进程崩溃。
+type recoverMiddleware struct {
+	handler http.Handler
+}
+
+func (r recoverMiddleware) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("[dashboard] panic in %s %s: %v", req.Method, req.URL.Path, err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"internal server error"}`))
+		}
+	}()
+	r.handler.ServeHTTP(w, req)
 }
 
 // ListenAndServe 启动 HTTP 服务, 阻塞直到被 Stop 或出错。
@@ -91,6 +115,8 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("dashboard listen %s: %w", s.cfg.Addr, err)
 	}
 	log.Printf("[dashboard] listening on http://%s  (stateDir=%s)", ln.Addr(), s.cfg.StateDir)
+	// 用 panic-recovery 包装 handler, 防止任意 handler panic 导致进程崩溃
+	s.server.Handler = recoverMiddleware{handler: s.mux}
 	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -171,6 +197,8 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/llm/guard", s.handleLLMGuard)
 	mux.HandleFunc("/api/metrics/catalog", s.handleMetricsCatalog)
 	mux.HandleFunc("/api/metrics/coverage", s.handleMetricsCoverage)
+	mux.HandleFunc("/api/metrics/full", s.handleMetricsFullModule)
+	mux.HandleFunc("/api/prom/query", s.handlePromQuery)
 
 	// v1.5: 异步 LLM 诊断作业 (team/dreaming/evolution)
 	//   POST /api/diag/jobs           -> 创建作业 (入参 {kind, target?})
@@ -180,6 +208,11 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/diag/jobs", s.handleDiagJobs)
 	mux.HandleFunc("/api/diag/jobs/", s.handleDiagJobDetail)
 	mux.HandleFunc("/api/dreaming/trigger", s.handleDreamingTrigger)
+
+	// Prometheus 端点: 使用真正的 Prometheus handler 导出实时指标
+	metricsDir := filepath.Join(s.cfg.StateDir, "metrics")
+	_ = metricsDir // 保留用于未来扩展
+	mux.Handle("/metrics", metrics.PrometheusHandler())
 
 	// 根路径和 SPA fallback
 	mux.HandleFunc("/", s.handleIndex)
@@ -490,4 +523,209 @@ func parseIntQuery(r *http.Request, key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// handleMetricsFullModule 返回某模块的所有 Prometheus 时序数据 (带最近历史)。
+// GET /api/metrics/full?module=llm&hours=24
+func (s *Server) handleMetricsFullModule(w http.ResponseWriter, r *http.Request) {
+	module := r.URL.Query().Get("module")
+	if module == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("module required"))
+		return
+	}
+	hours := parseIntQuery(r, "hours", 24)
+	promURL := os.Getenv("CLAUDE_GO_PROMETHEUS_URL")
+	if promURL == "" {
+		// 无外部 Prometheus, 回退到 JSONL
+		events, err := s.provider.ModuleMetricEvents(module, 5000, time.Now().Add(-time.Duration(hours)*time.Hour))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		summary, _ := s.provider.ModuleMetricSummary(module)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"module":  module,
+			"source":  "jsonl",
+			"events":  events,
+			"summary": summary,
+		})
+		return
+	}
+
+	// 从 Prometheus 查询
+	end := time.Now()
+	start := end.Add(-time.Duration(hours) * time.Hour)
+	step := time.Duration(float64(hours*3600)/500) * time.Second
+	if step < 15*time.Second {
+		step = 15 * time.Second
+	}
+
+	// 查询所有该模块的指标
+	query := fmt.Sprintf(`{module="%s"}`, module)
+	resp, err := queryPromRange(promURL, query, start, end, step)
+	if err != nil || resp.Status != "success" {
+		// 如果 range query 失败, 回退到 instant
+		instResp, instErr := queryPromInstant(promURL, query)
+		if instErr != nil || instResp.Status != "success" {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"module":  module,
+				"source":  "prometheus",
+				"error":   "no data",
+				"events":  []MetricEventDTO{},
+				"summary": map[string]interface{}{},
+			})
+			return
+		}
+		// 构造事件
+		var events []MetricEventDTO
+		for _, r := range instResp.Data.Result {
+			if len(r.Value) < 2 {
+				continue
+			}
+			tsFloat, _ := r.Value[0].(float64)
+			valFloat, _ := r.Value[1].(string)
+			val, _ := strconv.ParseFloat(valFloat, 64)
+			events = append(events, MetricEventDTO{
+				Timestamp: time.Unix(int64(tsFloat), 0),
+				Module:    module,
+				Name:      r.Metric["__name__"],
+				Value:     val,
+				Labels:    r.Metric,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"module":  module,
+			"source":  "prometheus",
+			"events":  events,
+			"summary": summarizeEvents(module, events),
+		})
+		return
+	}
+
+	// 转换 range query 结果
+	var events []MetricEventDTO
+	for _, r := range resp.Data.Result {
+		name := r.Metric["__name__"]
+		for _, v := range r.Values {
+			if len(v) < 2 {
+				continue
+			}
+			tsFloat, _ := v[0].(float64)
+			valFloat, _ := v[1].(string)
+			val, _ := strconv.ParseFloat(valFloat, 64)
+			events = append(events, MetricEventDTO{
+				Timestamp: time.Unix(int64(tsFloat), 0),
+				Module:    module,
+				Name:      name,
+				Value:     val,
+				Labels:    r.Metric,
+			})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"module":  module,
+		"source":  "prometheus",
+		"events":  events,
+		"summary": summarizeEvents(module, events),
+	})
+}
+
+// handlePromQuery 代理 Prometheus PromQL 查询。
+// GET /api/prom/query?query=...&start=...&end=...&step=...
+// GET /api/prom/query?type=instant&query=...
+func (s *Server) handlePromQuery(w http.ResponseWriter, r *http.Request) {
+	promURL := os.Getenv("CLAUDE_GO_PROMETHEUS_URL")
+	if promURL == "" {
+		writeError(w, http.StatusBadGateway, fmt.Errorf("Prometheus not configured (CLAUDE_GO_PROMETHEUS_URL)"))
+		return
+	}
+
+	queryStr := r.URL.Query().Get("query")
+	if queryStr == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("query required"))
+		return
+	}
+
+	qtype := r.URL.Query().Get("type")
+	if qtype == "instant" || qtype == "" && r.URL.Query().Get("start") == "" {
+		resp, err := queryPromInstant(promURL, queryStr)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	// range query
+	startStr := r.URL.Query().Get("start")
+	endStr := r.URL.Query().Get("end")
+	stepStr := r.URL.Query().Get("step")
+
+	var start, end time.Time
+	var step time.Duration
+	var err error
+
+	if t, e := time.Parse(time.RFC3339, startStr); e == nil {
+		start = t
+	} else if d, e := time.ParseDuration(startStr); e == nil {
+		start = time.Now().Add(-d)
+	} else {
+		start = time.Now().Add(-1 * time.Hour)
+	}
+
+	if t, e := time.Parse(time.RFC3339, endStr); e == nil {
+		end = t
+	} else {
+		end = time.Now()
+	}
+
+	if stepStr != "" {
+		step, err = time.ParseDuration(stepStr)
+		if err != nil {
+			step = 15 * time.Second
+		}
+	} else {
+		step = 15 * time.Second
+	}
+
+	resp, err := queryPromRange(promURL, queryStr, start, end, step)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// summarizeEvents 从事件列表构造简易摘要。
+func summarizeEvents(module string, events []MetricEventDTO) map[string]interface{} {
+	metrics := map[string][]float64{}
+	for _, e := range events {
+		metrics[e.Name] = append(metrics[e.Name], e.Value)
+	}
+	out := map[string]interface{}{"module": module}
+	for name, vs := range metrics {
+		if len(vs) == 0 {
+			continue
+		}
+		sum := 0.0
+		minV, maxV := vs[0], vs[0]
+		for _, v := range vs {
+			sum += v
+			if v < minV {
+				minV = v
+			}
+			if v > maxV {
+				maxV = v
+			}
+		}
+		out[name] = map[string]interface{}{
+			"count": len(vs),
+			"last":  vs[len(vs)-1],
+			"avg":   sum / float64(len(vs)),
+			"min":   minV,
+			"max":   maxV,
+		}
+	}
+	return out
 }

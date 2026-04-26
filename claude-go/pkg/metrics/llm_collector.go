@@ -70,6 +70,14 @@ func InitGlobalLLMCollector(stateDir string) *Collector {
 	if oldCollector != nil {
 		oldCollector.Close()
 	}
+
+	// 首次启动时回放 JSONL 历史事件到 Prometheus, 使重启后 counter/histogram 保留累计值。
+	if !relocating {
+		go func() {
+			_ = RestorePromFromJSONL(stateDir, 20000)
+		}()
+	}
+
 	return c
 }
 

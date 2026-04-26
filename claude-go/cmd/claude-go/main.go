@@ -967,6 +967,7 @@ func dashboardRunCmd() *cobra.Command {
 
 func dashboardStartCmd() *cobra.Command {
 	var (
+		addr       string
 		port       int
 		stateDir   string
 		noOpen     bool
@@ -989,7 +990,10 @@ func dashboardStartCmd() *cobra.Command {
 				return nil
 			}
 			freePort := dashboard.FindFreePort(port)
-			bindAddr := fmt.Sprintf("127.0.0.1:%d", freePort)
+			bindAddr := addr
+			if bindAddr == "" {
+				bindAddr = fmt.Sprintf("127.0.0.1:%d", freePort)
+			}
 			exe, err := os.Executable()
 			if err != nil {
 				return err
@@ -1030,8 +1034,26 @@ func dashboardStartCmd() *cobra.Command {
 				StateDir:  resolved,
 				LogFile:   logPath,
 			})
-			// 等 0.5s 让端口就绪
-			time.Sleep(500 * time.Millisecond)
+			// 等待子进程就绪 (轮询 /api/health, 最长 5s)
+			healthURL := fmt.Sprintf("http://%s/api/health", bindAddr)
+			ready := false
+			for i := 0; i < 50; i++ {
+				time.Sleep(100 * time.Millisecond)
+				resp, err := http.Get(healthURL)
+				if err == nil && resp.StatusCode == http.StatusOK {
+					resp.Body.Close()
+					ready = true
+					break
+				}
+				if err == nil {
+					resp.Body.Close()
+				}
+			}
+			if !ready {
+				// 子进程可能崩溃, 清理 pid 文件
+				dashboard.RemovePIDFile(resolved)
+				return fmt.Errorf("Dashboard 启动超时, 子进程未就绪 (PID=%d), 请查看日志: %s", subCmd.Process.Pid, logPath)
+			}
 			fmt.Printf("\n🚀 Dashboard 已后台启动\n")
 			fmt.Printf("   URL      : http://%s\n", bindAddr)
 			fmt.Printf("   PID      : %d\n", subCmd.Process.Pid)
@@ -1044,6 +1066,7 @@ func dashboardStartCmd() *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().StringVar(&addr, "addr", "", "监听地址 (如 0.0.0.0:7777), 与 --port 二选一")
 	c.Flags().IntVar(&port, "port", 7777, "期望端口 (占用时自动顺延)")
 	c.Flags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认从 --config 的 stateDir/cwd 推导, 兜底 <CWD>/.claude-go)")
 	c.Flags().BoolVar(&noOpen, "no-open", false, "不自动打开浏览器")
