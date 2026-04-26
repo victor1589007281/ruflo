@@ -168,6 +168,9 @@ type AdaptiveTerminator struct {
 	// 编译状态追踪 (L2 编译硬门禁)
 	BuildPassHistory []bool // 每轮编译是否通过
 
+	// 测试状态追踪 (L2.5 测试硬门禁)
+	TestPassHistory []bool // 每轮测试是否通过
+
 	// 迭代记忆 (L5 上下文压缩, 参考 Reflexion)
 	Memories []IterationMemory
 
@@ -220,6 +223,11 @@ func (at *AdaptiveTerminator) RecordRoundOutput(round int, score EvalScore, outp
 // RecordBuildResult 记录每轮编译结果 (L2 编译硬门禁)。
 func (at *AdaptiveTerminator) RecordBuildResult(passed bool) {
 	at.BuildPassHistory = append(at.BuildPassHistory, passed)
+}
+
+// RecordTestResult 记录每轮测试结果 (L2.5 测试硬门禁)。
+func (at *AdaptiveTerminator) RecordTestResult(passed bool) {
+	at.TestPassHistory = append(at.TestPassHistory, passed)
 }
 
 // RecordIterationMemory 记录本轮迭代记忆 (L5)。

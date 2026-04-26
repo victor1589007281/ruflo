@@ -393,6 +393,7 @@ const (
 	MTeamStagePassRate  = "team_stage_pass_rate"  // 阶段通过率
 	MTeamEvalPassRate   = "team_eval_pass_rate"   // 评审通过率
 	MTeamBuildPassRate  = "team_build_pass_rate"  // 编译通过率
+	MTeamTestPassRate   = "team_test_pass_rate"   // 测试通过率
 	MTeamOutputAvgLen   = "team_output_avg_len"   // 平均产出长度
 	MTeamRoundCount     = "team_round_count"      // 对抗轮数
 	MTeamFileCount      = "team_file_count"       // 产出文件数
@@ -540,6 +541,7 @@ var MetricType = map[string]MetricKind{
 	MTeamStagePassRate:  "gauge",
 	MTeamEvalPassRate:   "gauge",
 	MTeamBuildPassRate:  "gauge",
+	MTeamTestPassRate:   "gauge",
 	MTeamOutputAvgLen:   "gauge",
 	MTeamFileCount:      "gauge",
 

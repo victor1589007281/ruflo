@@ -1135,6 +1135,9 @@ func (we *WorkflowExecutor) runDesignPhase(ctx context.Context, designStages []S
 // 编译修复循环独立于对抗循环, 不消耗 AdaptiveTerminator 的轮次配额。
 const maxBuildRetries = 2
 
+// maxTestRetries 测试硬门禁内部重试次数 (L2.5)。
+const maxTestRetries = 2
+
 // runAdversarialLoop Phase 2: Generator ↔ Evaluator 对抗循环。
 // 六层质量保障: L2 编译硬门禁 + L5 上下文压缩 + L6 重采样决策。
 func (we *WorkflowExecutor) runAdversarialLoop(
@@ -1369,6 +1372,122 @@ func (we *WorkflowExecutor) runBuildHardGate(
 	return false
 }
 
+// runTestHardGate L2.5 测试硬门禁: 测试失败时驱动 Coder 内部重试。
+// 返回 true 表示测试通过。内部重试最多 maxTestRetries 次, 不消耗对抗轮次。
+func (we *WorkflowExecutor) runTestHardGate(
+	ctx context.Context, genStages []StageDef,
+	round, maxRounds int, lastGenOutput *string,
+	objective string, prevResults map[string]string, team *ProductionTeam,
+	allResults *[]StageResult,
+) bool {
+	if team.Cwd == "" {
+		return true
+	}
+	lang := team.Language
+	if lang == "" {
+		lang = "go"
+	}
+
+	// MySQL 项目走集成测试路径
+	if lang == "cpp" && isMySQLProject(team.Cwd) {
+		err := we.runMySQLIntegrationTest(team.Cwd)
+		if err != "" {
+			we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮 MySQL 集成测试不通过, 启动修复", round))
+			if we.metrics != nil {
+				we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			}
+			return we.runTestFixCycle(ctx, genStages, round, err, lastGenOutput, objective, prevResults, team, allResults)
+		}
+		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮 MySQL 集成测试通过", round))
+		if we.metrics != nil {
+			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		}
+		return true
+	}
+
+	// 标准语言测试
+	testErrors := runTestCheckLang(team.Cwd, lang)
+	if testErrors == "" {
+		tc := GetToolchain(lang)
+		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮测试通过 (%s)", round, tc.TestCheckLabel()))
+		if we.metrics != nil {
+			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		}
+		return true
+	}
+
+	we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮测试失败, 启动内部修复 (最多 %d 次)...", round, maxTestRetries))
+	if we.metrics != nil {
+		we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+	}
+
+	return we.runTestFixCycle(ctx, genStages, round, testErrors, lastGenOutput, objective, prevResults, team, allResults)
+}
+
+// runTestFixCycle 测试修复循环 (被 runTestHardGate 调用)。
+func (we *WorkflowExecutor) runTestFixCycle(
+	ctx context.Context, genStages []StageDef,
+	round int, testErrors string, lastGenOutput *string,
+	objective string, prevResults map[string]string, team *ProductionTeam,
+	allResults *[]StageResult,
+) bool {
+	lang := team.Language
+	if lang == "" {
+		lang = "go"
+	}
+
+	for retry := 1; retry <= maxTestRetries; retry++ {
+		if ctx.Err() != nil {
+			return false
+		}
+
+			fixPrompt := fmt.Sprintf("### 测试错误 (第 %d 次修复, 必须修复所有测试):\n%s\n\n" +
+				"要求:\n1. 仅修复测试错误, 不要做其他改动\n2. 保持现有代码结构不变\n3. 输出修复后的完整文件内容",
+				retry, truncateResult(testErrors, 3000))
+		for _, genStage := range genStages {
+			fixStage := genStage
+			fixStage.Prompt = strings.ReplaceAll(fixStage.Prompt, "{adversarial_feedback}", fixPrompt)
+			fixStage.Name = fmt.Sprintf("%s-round%d-testfix%d", genStage.Name, round, retry)
+			we.notify(we.chatID, fmt.Sprintf("  🧪 测试修复 %d/%d — %s...", retry, maxTestRetries, genStage.Role))
+			sr := we.executeStage(ctx, fixStage, objective, prevResults, team)
+			sr.Name = fixStage.Name
+			*allResults = append(*allResults, sr)
+			if sr.Status == TaskCompleted {
+				*lastGenOutput = sr.Output
+				prevResults[genStage.Name] = sr.Output
+				MaterializeCode(team.Cwd, sr.Output, lang)
+			}
+		}
+
+		// 物化后先编译
+		buildErrors := runBuildCheckLang(team.Cwd, lang)
+		if buildErrors != "" {
+			we.notify(we.chatID, fmt.Sprintf("  🔴 测试修复第 %d 次后编译失败", retry))
+			testErrors = buildErrors
+			continue
+		}
+
+		// 运行测试 (MySQL 走集成测试)
+		if lang == "cpp" && isMySQLProject(team.Cwd) {
+			testErrors = we.runMySQLIntegrationTest(team.Cwd)
+		} else {
+			testErrors = runTestCheckLang(team.Cwd, lang)
+		}
+		if testErrors != "" {
+			we.notify(we.chatID, fmt.Sprintf("  🔴 测试修复第 %d 次仍失败", retry))
+			continue
+		}
+
+		we.notify(we.chatID, fmt.Sprintf("  🟢 测试通过 (第 %d 次重试)", retry))
+		if we.metrics != nil {
+			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name,
+				map[string]string{"round": fmt.Sprint(round), "test_retry": fmt.Sprint(retry)})
+		}
+		return true
+	}
+	return false
+}
+
 // extractFileList 从 coder 输出中提取文件列表 (用于迭代记忆的 Approach 字段)
 func extractFileList(output string) string {
 	var files []string
@@ -1503,6 +1622,55 @@ func (we *WorkflowExecutor) runBuildGate(ctx context.Context, team *ProductionTe
 	we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译检查通过", round))
 	if we.metrics != nil {
 		we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+	}
+	return prevFeedback
+}
+
+// runTestGate L2.5 测试轻量门禁: 仅返回测试结果文本, 无 fix cycle。
+func (we *WorkflowExecutor) runTestGate(ctx context.Context, team *ProductionTeam, round int, prevFeedback string) string {
+	if team.Cwd == "" {
+		return prevFeedback
+	}
+	lang := team.Language
+	if lang == "" {
+		lang = "go"
+	}
+
+	// MySQL 项目走集成测试
+	if lang == "cpp" && isMySQLProject(team.Cwd) {
+		if err := we.runMySQLIntegrationTest(team.Cwd); err != "" {
+			we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮 MySQL 集成测试失败", round))
+			if we.metrics != nil {
+				we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			}
+			testPrefix := "### MySQL 集成测试错误 (必须修复):\n" + err
+			if prevFeedback == "" {
+				return testPrefix
+			}
+			return testPrefix + "\n\n" + prevFeedback
+		}
+		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮 MySQL 集成测试通过", round))
+		if we.metrics != nil {
+			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		}
+		return prevFeedback
+	}
+
+	testErrors := runTestCheckLang(team.Cwd, lang)
+	if testErrors != "" {
+		we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮测试检查失败", round))
+		if we.metrics != nil {
+			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		}
+		testPrefix := "### 测试错误 (必须优先修复):\n" + testErrors
+		if prevFeedback == "" {
+			return testPrefix
+		}
+		return testPrefix + "\n\n" + prevFeedback
+	}
+	we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮测试检查通过", round))
+	if we.metrics != nil {
+		we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
 	}
 	return prevFeedback
 }
@@ -3068,6 +3236,20 @@ func (tc *LanguageToolchain) BuildCheckLabel() string {
 	}
 }
 
+// TestCheckLabel 返回测试命令描述 (用于 prompt)
+func (tc *LanguageToolchain) TestCheckLabel() string {
+	switch tc.Language {
+	case "cpp":
+		return "ctest --output-on-failure 通过"
+	case "rust":
+		return "cargo test 通过"
+	case "python":
+		return "pytest 通过"
+	default:
+		return "go test ./... 通过"
+	}
+}
+
 // runBuildCheck 在工作区运行编译+lint, 返回错误输出。空字符串表示通过。
 // 默认 Go 工具链, 向后兼容。
 func runBuildCheck(cwd string) string {
@@ -3185,6 +3367,101 @@ func runMySQLBuildCheck(cwd string) string {
 	return ""
 }
 
+// runMySQLIntegrationTest 启动 mysqld 并执行 mysql 客户端验证集成测试。
+// 返回空串表示通过, 否则返回错误信息。
+func (we *WorkflowExecutor) runMySQLIntegrationTest(cwd string) string {
+	if cwd == "" {
+		return ""
+	}
+
+	// 定位 mysqld 二进制
+	mysqldPaths := []string{
+		filepath.Join(cwd, "build", "sql", "mysqld"),
+		filepath.Join(cwd, "build", "runtime_output_directory", "mysqld"),
+	}
+	var mysqldPath string
+	for _, p := range mysqldPaths {
+		if _, err := os.Stat(p); err == nil {
+			mysqldPath = p
+			break
+		}
+	}
+	if mysqldPath == "" {
+		return "mysqld 二进制未找到 (expected in build/sql/mysqld or build/runtime_output_directory/mysqld)"
+	}
+
+	// 创建临时数据目录
+	tmpDir, err := os.MkdirTemp("", "mysql-integration-*")
+	if err != nil {
+		return fmt.Sprintf("创建临时目录失败: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// 初始化数据目录 (--initialize-insecure, 无密码 root)
+	initCtx, initCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer initCancel()
+	initCmd := exec.CommandContext(initCtx, mysqldPath, "--initialize-insecure", "--datadir="+tmpDir)
+	if out, err := initCmd.CombinedOutput(); err != nil {
+			return fmt.Sprintf("mysqld --initialize-insecure 失败:\n%s", truncateResult(string(out), 2000))
+	}
+
+	// 后台启动 mysqld (skip-networking + unix socket, 避免端口冲突)
+	socketPath := filepath.Join(tmpDir, "mysql.sock")
+	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer startCancel()
+	mysqldCmd := exec.CommandContext(startCtx, mysqldPath,
+		"--skip-networking",
+		"--socket="+socketPath,
+		"--datadir="+tmpDir,
+		"--skip-grant-tables",
+	)
+	mysqldCmd.Dir = cwd
+	if err := mysqldCmd.Start(); err != nil {
+		return fmt.Sprintf("mysqld 启动失败: %v", err)
+	}
+
+	// 轮询等待 socket 文件 (最多 30 秒)
+	ready := false
+	for i := 0; i < 30; i++ {
+		time.Sleep(1 * time.Second)
+		if _, err := os.Stat(socketPath); err == nil {
+			ready = true
+			break
+		}
+	}
+	if !ready {
+		return "mysqld 未能在 30 秒内就绪 (socket 未创建)"
+	}
+
+	// 执行 mysql 客户端验证
+	mysqlClient := filepath.Join(cwd, "build", "runtime_output_directory", "mysql")
+	if _, err := os.Stat(mysqlClient); err != nil {
+		mysqlClient = filepath.Join(cwd, "build", "client", "mysql")
+	}
+	if _, err := os.Stat(mysqlClient); err != nil {
+		// fallback: 尝试系统 mysql
+		if sysMysql, err := exec.LookPath("mysql"); err == nil {
+			mysqlClient = sysMysql
+		} else {
+			// 无 mysql 客户端也可返回成功 (只验证 mysqld 能启动)
+			return ""
+		}
+	}
+
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer clientCancel()
+	clientCmd := exec.CommandContext(clientCtx, mysqlClient,
+		"-S", socketPath,
+		"-e", "SHOW DATABASES;",
+	)
+	clientCmd.Dir = cwd
+	out, err := clientCmd.CombinedOutput()
+	if err != nil {
+			return fmt.Sprintf("mysql 客户端验证失败:\n%s", truncateResult(string(out), 2000))
+	}
+	return ""
+}
+
 // scanForTodos 扫描已物化的源码文件, 检测未实现的 TODO/STUB/HACK/placeholder。
 // 返回发现的未实现项列表; 空表示全部实现完整。
 // 作为 L1.5 确定性门禁, 不依赖 LLM 判断, 避免遗漏。
@@ -3256,6 +3533,45 @@ func runBuildCheckLang(cwd, lang string) string {
 
 	var errors []string
 	for _, args := range tc.BuildCmds {
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		cmd.Dir = cwd
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("%s 失败:\n%s", strings.Join(args, " "), string(out)))
+		}
+	}
+	if len(errors) == 0 {
+		return ""
+	}
+	result := strings.Join(errors, "\n\n")
+	if len(result) > 3000 {
+		result = result[:3000] + "\n...(截断)"
+	}
+	return result
+}
+
+// runTestCheckLang 多语言版本的测试检查，运行 TestCmds 获取真实测试结果。
+// MySQL/Percona 特殊处理: 单元测试已禁用，返回空（跳过测试检查）。
+func runTestCheckLang(cwd, lang string) string {
+	if cwd == "" {
+		return ""
+	}
+	tc := GetToolchain(lang)
+	if _, err := os.Stat(filepath.Join(cwd, tc.ProjectFile)); err != nil {
+		return ""
+	}
+	// MySQL/C++ 项目: 单元测试已禁用 (WITH_UNIT_TESTS=OFF)
+	if lang == "cpp" && isMySQLProject(cwd) {
+		return ""
+	}
+	if len(tc.TestCmds) == 0 {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tc.Timeout)
+	defer cancel()
+
+	var errors []string
+	for _, args := range tc.TestCmds {
 		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 		cmd.Dir = cwd
 		out, err := cmd.CombinedOutput()
