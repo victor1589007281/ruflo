@@ -126,6 +126,7 @@ type Orchestrator struct {
 	failedCount    int
 	totalCount     int
 	dagMaxWidth    int
+	teamName       string // 用于 resume 时识别孤儿任务
 }
 
 // rawTask ParsePlanToDAG 内部用的中间表示
@@ -288,6 +289,7 @@ func (o *Orchestrator) multiStrategyParse(planOutput string) []rawTask {
 
 // rawTasksToDAG 将 rawTasks 写入 V2 DAG, 返回 TaskNode 列表 (调用者需持有 o.mu)。
 func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*TaskNode, error) {
+	o.teamName = teamName
 	var nodes []*TaskNode
 	numToV2ID := make(map[string]string)
 	for _, rt := range rawTasks {
@@ -659,12 +661,16 @@ func (o *Orchestrator) DAGMaxWidth() int {
 const orchestratorStallTimeout = 10 * time.Minute
 
 // orchestratorMaxStallRecoveries 最大停滞恢复次数, 超过后退出
-const orchestratorMaxStallRecoveries = 2
+const orchestratorMaxStallRecoveries = 5
+
+// taskExecutionTimeout 单个任务执行超时: 防止 goroutine 永久卡在 LLM 重试循环中。
+const taskExecutionTimeout = 30 * time.Minute
 
 // Execute 从 V2 TaskStore 的就绪队列循环调度, 直到所有任务完成。
 func (o *Orchestrator) Execute(ctx context.Context, objective string, team *ProductionTeam) ([]StageResult, error) {
 	var allResults []StageResult
 	var resultsMu sync.Mutex
+	var allErr error
 
 	if o.totalCount == 0 {
 		return nil, nil
@@ -674,16 +680,25 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 		o.pool.AutoScale(o.dagMaxWidth)
 	}
 
-	// 恢复已完成的检查点: 从 V2 TaskStore 中已有的 completed 任务恢复, 避免重复执行。
+	// 补齐孤儿节点 (必须在 restoreCompletedTasksFromDAG 之前执行):
+	// 将 DAG 中已存在但未被 ParsePlanToDAG 包含的任务加入 o.nodes。
+	// 修复: 如果先执行 restore, 孤儿节点不在 o.nodes 中 → 跳过状态恢复 → 永久停滞。
+	orphaned := o.populateOrphanNodes(team.Name)
+	if orphaned > 0 {
+		o.notify(o.chatID, fmt.Sprintf("🔗 补齐 %d 个孤儿任务节点 (DAG 已有但 WBS 未输出)", orphaned))
+	}
+
+	// 恢复已完成的检查点: 从 V2 TaskStore 中已有的 completed/failed 任务恢复, 避免重复执行。
 	// 注意: 这里从 V2 DAG (o.dag) 读取, 而非仅 o.checkpoints, 因为 DAG 是单一数据源。
+	// 关键: populateOrphanNodes 必须先执行, 确保 o.nodes 包含所有 DAG 任务, 这样 in_progress 僵尸任务才能被正确重置。
 	restored := o.restoreCompletedTasksFromDAG(team)
 	if restored > 0 {
 		o.notify(o.chatID, fmt.Sprintf("♻️ 编排器从检查点恢复 %d 个已完成任务 (跳过)", restored))
 	}
 
-	o.notify(o.chatID, fmt.Sprintf("🎯 编排器启动: %d 个任务, 最大并发 %d (DAG 宽度: %d, 已恢复: %d)",
-		o.totalCount, o.config.MaxParallel, o.dagMaxWidth, restored))
-	logging.Event(ctx, "orchestrator.start", "tasks", o.totalCount, "maxParallel", o.config.MaxParallel, "dagWidth", o.dagMaxWidth, "restored", restored)
+	o.notify(o.chatID, fmt.Sprintf("🎯 编排器启动: %d 个任务, 最大并发 %d (DAG 宽度: %d, 已恢复: %d, 补齐: %d)",
+		o.totalCount, o.config.MaxParallel, o.dagMaxWidth, restored, orphaned))
+	logging.Event(ctx, "orchestrator.start", "tasks", o.totalCount, "maxParallel", o.config.MaxParallel, "dagWidth", o.dagMaxWidth, "restored", restored, "orphaned", orphaned)
 
 	lastProgressAt := time.Now()
 	lastCompletedCount := 0
@@ -714,6 +729,8 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 				o.notify(o.chatID, fmt.Sprintf(
 					"🔴 编排器停滞超时 (%s 无进展, %d 次恢复均失败, %d/%d 完成, %d 失败), 退出",
 					orchestratorStallTimeout, stallRecoveries-1, o.completedCount, o.totalCount, o.failedCount))
+				allErr = fmt.Errorf("编排器停滞超时: %s 无进展, %d 次恢复均失败, %d/%d 完成, %d 失败",
+					orchestratorStallTimeout, stallRecoveries-1, o.completedCount, o.totalCount, o.failedCount)
 				break
 			}
 
@@ -769,7 +786,26 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 			_ = o.dag.SetTaskStatus(task.ID, "in_progress")
 
 			go func(n *TaskNode, taskID string) {
-				sr := o.executeTaskNode(ctx, n, objective, team)
+				// 关键修复: panic 恢复 + 保证 doneCh 始终发送信号。
+				// 之前: goroutine panic → doneCh 不发送 → 主循环永久阻塞 → 团队停滞。
+				// 现在: defer recover 捕获 panic, 确保 doneCh 一定被发送, 主循环不会卡死。
+				defer func() {
+					if r := recover(); r != nil {
+						o.notify(o.chatID, fmt.Sprintf("🔴 %s goroutine panic: %v, 标记为 failed", n.Title, r))
+						o.dag.SetTaskStatusAndUnblock(taskID, "failed")
+						o.mu.Lock()
+						o.failedCount++
+						o.mu.Unlock()
+					}
+					doneCh <- struct{}{}
+				}()
+
+				// 修复: 为每个任务添加独立超时, 防止 goroutine 永久卡在 LLM 重试循环中。
+				// 之前: 使用父 ctx (无超时) → LLM 429 重试无限循环 → 任务永久 in_progress。
+				// 现在: 每个任务独立超时 30min → 超时后自动标记 failed, 不影响其他任务。
+				taskCtx, cancel := context.WithTimeout(ctx, taskExecutionTimeout)
+				defer cancel()
+				sr := o.executeTaskNode(taskCtx, n, objective, team)
 				resultsMu.Lock()
 				allResults = append(allResults, sr)
 				resultsMu.Unlock()
@@ -782,8 +818,6 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 					resultsMu.Unlock()
 					o.flusher(snapshot)
 				}
-
-				doneCh <- struct{}{}
 			}(node, task.ID)
 		}
 
@@ -802,12 +836,47 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 
 	o.notify(o.chatID, fmt.Sprintf("🏁 编排完成: %d/%d 成功, %d 失败",
 		o.completedCount, o.totalCount, o.failedCount))
-	return allResults, nil
+	return allResults, allErr
 }
 
-// restoreCompletedTasksFromDAG 从 V2 DAG 恢复已完成/失败任务计数。
+// populateOrphanNodes 将 DAG 中存在但未加入 o.nodes 的任务（孤儿）补齐。
+// 修复 resume 场景: 当 Planner 的 WBS 遗漏已有任务时，AddTaskWithDeps 不会匹配到它，
+// 导致该任务不在 o.nodes 中 → restoreCompletedTasksFromDAG 跳过它 → 主循环孤儿过滤器拦截它 → 永久停滞。
+func (o *Orchestrator) populateOrphanNodes(teamName string) int {
+	if o.dag == nil {
+		return 0
+	}
+	prefix := "[" + teamName + "] "
+	allTasks := o.dag.GetAllTasks()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	orphaned := 0
+	for _, t := range allTasks {
+		if _, ok := o.nodes[t.ID]; ok {
+			continue // 已有对应节点，跳过
+		}
+		// 只处理属于当前 team 的任务
+		if !strings.HasPrefix(t.Subject, prefix) {
+			continue
+		}
+		title := strings.TrimPrefix(t.Subject, prefix)
+		o.nodes[t.ID] = &TaskNode{
+			V2TaskID:   t.ID,
+			Title:      title,
+			Role:       t.Owner,
+			MaxRetries: o.config.MaxRetries,
+		}
+		o.totalCount++
+		orphaned++
+	}
+	return orphaned
+}
+
+// restoreCompletedTasksFromDAG 从 V2 DAG 恢复已完成/失败任务计数, 并重置卡住的 in_progress 任务。
 // 关键: 如果不更新这些计数, 完成检查 (completedCount+failedCount >= totalCount) 永远不满足,
 // 导致 orchestrator 认为所有任务都未处理, 全部重新调度。
+// 修复: 对于 in_progress 但没有对应活跃执行的任务, 重置为 pending 让主循环重新调度。
 func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
 	if o.dag == nil {
 		return 0
@@ -821,6 +890,7 @@ func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
 	}
 
 	restored := 0
+	var inProgressIDs []string
 	for _, t := range allTasks {
 		if !nodeIDs[t.ID] {
 			continue
@@ -832,9 +902,18 @@ func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
 		case "failed":
 			o.failedCount++
 			restored++
+		case "in_progress":
+			// in_progress 任务可能是: (a) 真正在执行中 (b) 进程崩溃/重启后遗留的僵尸状态
+			// 由于 orchestrator 刚启动, 没有任何活跃执行 → 这些是僵尸任务, 重置为 pending
+			inProgressIDs = append(inProgressIDs, t.ID)
 		}
 	}
 	o.mu.Unlock()
+
+	// 重置僵尸 in_progress 任务为 pending
+	for _, id := range inProgressIDs {
+		_ = o.dag.SetTaskStatus(id, "pending")
+	}
 
 	return restored
 }
@@ -905,6 +984,7 @@ func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective strin
 }
 
 // cleanupResidualTasks 编排结束后清理 DAG 中未完成的残留任务。
+// 修复: 不仅清理 pending 任务, 还通过 GetAllTasks 清理 in_progress 的僵尸任务。
 func (o *Orchestrator) cleanupResidualTasks() {
 	o.mu.Lock()
 	completed := o.completedCount
@@ -917,7 +997,7 @@ func (o *Orchestrator) cleanupResidualTasks() {
 		return
 	}
 
-	// 通过 ReadyTasks 找到仍可调度的残留任务, 标记为 failed
+	// 1. 通过 ReadyTasks 找到仍可调度的 pending 残留任务, 标记为 failed
 	ready := o.dag.ReadyTasks()
 	var residualIDs []string
 	o.mu.Lock()
@@ -930,6 +1010,29 @@ func (o *Orchestrator) cleanupResidualTasks() {
 
 	for _, id := range residualIDs {
 		o.dag.SetTaskStatusAndUnblock(id, "failed")
+	}
+
+	// 2. 通过 GetAllTasks 找到 in_progress 的残留任务 (进程退出后遗留的僵尸状态)
+	if o.dag != nil {
+		allTasks := o.dag.GetAllTasks()
+		o.mu.Lock()
+		var zombieIDs []string
+		for _, t := range allTasks {
+			if t.Status == "in_progress" {
+				if _, ok := o.nodes[t.ID]; ok {
+					zombieIDs = append(zombieIDs, t.ID)
+				}
+			}
+		}
+		o.mu.Unlock()
+
+		for _, id := range zombieIDs {
+			o.dag.SetTaskStatusAndUnblock(id, "failed")
+		}
+
+		if len(zombieIDs) > 0 {
+			o.notify(o.chatID, fmt.Sprintf("⚠️ 清理 %d 个 in_progress 僵尸任务 (已标记为 failed)", len(zombieIDs)))
+		}
 	}
 
 	if residualCount > 0 {

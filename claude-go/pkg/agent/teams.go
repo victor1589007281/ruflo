@@ -580,6 +580,19 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		return
 	}
 
+	// 检查是否有失败阶段: 即使 err==nil, 只要 results 中有 TaskFailed 就标记团队失败
+	var failedStages []string
+	for _, r := range results {
+		if r.Status == TaskFailed {
+			failedStages = append(failedStages, fmt.Sprintf("%s(%s): %s", r.Name, r.Role, r.Error))
+		}
+	}
+	if len(failedStages) > 0 {
+		errStr := fmt.Sprintf("%d 个阶段失败: %s", len(failedStages), strings.Join(failedStages, "; "))
+		ptm.failTeam(team, errStr)
+		return
+	}
+
 	team.mu.Lock()
 	team.Status = TeamStatusCompleted
 	team.FinishedAt = time.Now()

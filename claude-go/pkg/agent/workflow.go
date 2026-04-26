@@ -892,6 +892,13 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	we.savePhaseCheckpoints(e2eResults)
 	we.flushStagesLive(team, allResults)
 
+	// E2E 是质量门禁, 失败则终止工作流
+	for _, er := range e2eResults {
+		if er.Status == TaskFailed {
+			return allResults, fmt.Errorf("E2E 测试失败: %s — %s", er.Name, er.Error)
+		}
+	}
+
 	// Phase 4: 收尾阶段
 	finishResults := we.runFinishPhase(ctx, parallelStages, objective, prevResults, team)
 	allResults = append(allResults, finishResults...)
@@ -1586,10 +1593,15 @@ func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStage
 			break
 		}
 
+		// 每轮独立超时, 防止 429 限流耗尽全部时间
+		e2eRoundTimeout := 5 * time.Minute
+		roundCtx, roundCancel := context.WithTimeout(ctx, e2eRoundTimeout)
+
 		// E2E Tester
 		e2ePrompt := we.buildE2EPrompt(objective, prevResults, lastE2EOutput, round)
 		e2eStageDef := StageDef{Name: fmt.Sprintf("e2e-round%d", round), Role: "tester", Prompt: e2ePrompt}
-		e2eResult := we.executeStage(ctx, e2eStageDef, objective, prevResults, team)
+		e2eResult := we.executeStage(roundCtx, e2eStageDef, objective, prevResults, team)
+		roundCancel()
 		e2eResult.Name = e2eStageDef.Name
 		results = append(results, e2eResult)
 
