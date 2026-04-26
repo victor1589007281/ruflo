@@ -221,6 +221,8 @@ type ProductionTeamManager struct {
 	metrics      *metrics.Collector  // 持续观测指标采集器
 	concurrency  ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
 
+	planCfgResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
+
 	// starting 防止并发 resume/run 同一个团队 (race condition 保护)
 	startingMu sync.Mutex
 	starting   map[string]bool // key=team name, value=是否正在启动中
@@ -228,19 +230,20 @@ type ProductionTeamManager struct {
 
 // TeamManagerConfig 团队管理器配置。
 type TeamManagerConfig struct {
-	BaseDir     string
-	Cwd         string // 项目工作目录 (用于编译验证)
-	Factory     CreateAgentFunc
-	Notify      NotifyFunc
-	MediaNotify MediaNotifyFunc
-	TaskTracker TaskTracker
-	Pool        *AgentPool
-	LLM         LLMClient
-	Evolution   *EvolutionEngine
-	Dreamer     DreamRecorder
-	Roles       *RoleRegistry
-	MemWriter   MemoryWriter
-	Concurrency ConcurrencySuggestor
+	BaseDir       string
+	Cwd           string // 项目工作目录 (用于编译验证)
+	Factory       CreateAgentFunc
+	Notify        NotifyFunc
+	MediaNotify   MediaNotifyFunc
+	TaskTracker   TaskTracker
+	Pool          *AgentPool
+	LLM           LLMClient
+	Evolution     *EvolutionEngine
+	Dreamer       DreamRecorder
+	Roles         *RoleRegistry
+	MemWriter     MemoryWriter
+	Concurrency   ConcurrencySuggestor
+	PlanConfigResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
 }
 
 // SetMemoryWriter 注入记忆写入器 (在 Bot 初始化后调用)。
@@ -275,6 +278,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		roles:       cfg.Roles,
 		metrics:     metrics.NewCollector(stateDir),
 		concurrency: cfg.Concurrency,
+		planCfgResolver: cfg.PlanConfigResolver,
 		starting:    make(map[string]bool),
 	}
 	ptm.loadPersistedTeams()
@@ -557,17 +561,18 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	}
 
 	executor := &WorkflowExecutor{
-		factory:     ptm.factory,
-		notify:      ptm.notify,
-		chatID:      team.ChatID,
-		llm:         ptm.llm, // 供 swarm_intel.Engine 等直接 LLM 调用
-		taskTracker: ptm.taskTracker,
-		evolution:   ptm.evolution,
-		roles:       ptm.roles,
-		metrics:     ptm.metrics,
-		pool:        ptm.pool,
-		checkpoints: coord, // 注入 Coordinator 作为 CheckpointStore
-		concurrency: ptm.concurrency,
+		factory:       ptm.factory,
+		planCfgResolver: ptm.planCfgResolver,
+		notify:        ptm.notify,
+		chatID:        team.ChatID,
+		llm:           ptm.llm, // 供 swarm_intel.Engine 等直接 LLM 调用
+		taskTracker:   ptm.taskTracker,
+		evolution:     ptm.evolution,
+		roles:         ptm.roles,
+		metrics:       ptm.metrics,
+		pool:          ptm.pool,
+		checkpoints:   coord, // 注入 Coordinator 作为 CheckpointStore
+		concurrency:   ptm.concurrency,
 	}
 
 	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)

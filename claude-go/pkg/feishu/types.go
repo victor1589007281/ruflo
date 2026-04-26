@@ -373,15 +373,25 @@ type FeishuSection struct {
 	ThinkingMessage string `json:"thinkingMessage,omitempty"`
 }
 
+// PlanModelConfig 单个 Plan (工作流) 的模型配置。
+type PlanModelConfig struct {
+	Model          string            `json:"model,omitempty"`          // 该 plan 使用的模型
+	BaseURL        string            `json:"baseUrl,omitempty"`        // 该 plan 使用的 API 地址 (可选, 默认用 ai.baseUrl)
+	APIKey         string            `json:"apiKey,omitempty"`         // 该 plan 使用的 API 密钥 (可选, 默认用 ai.apiKey)
+	FallbackModels []string          `json:"fallbackModels,omitempty"` // 该 plan 的备用模型 (可选, 默认用 ai.fallbackModels)
+	RoleModels     map[string]string `json:"roles,omitempty"`          // 按 role 覆盖模型, key=role name
+}
+
 // AISection AI 模型配置段
 type AISection struct {
-	Model            string   `json:"model,omitempty"`
-	APIKey           string   `json:"apiKey,omitempty"`
-	BaseURL          string   `json:"baseUrl,omitempty"`
-	MaxTokens        int      `json:"maxTokens,omitempty"`
-	MaxTurns         int      `json:"maxTurns,omitempty"`
-	FallbackModels   []string `json:"fallbackModels,omitempty"`   // 备用模型顺序: 主模型不可用时按序尝试
-	PromptCacheMode  string   `json:"promptCacheMode,omitempty"` // "auto"(默认)/"on"/"off"
+	Model            string                     `json:"model,omitempty"`
+	APIKey           string                     `json:"apiKey,omitempty"`
+	BaseURL          string                     `json:"baseUrl,omitempty"`
+	MaxTokens        int                        `json:"maxTokens,omitempty"`
+	MaxTurns         int                        `json:"maxTurns,omitempty"`
+	FallbackModels   []string                   `json:"fallbackModels,omitempty"`   // 备用模型顺序: 主模型不可用时按序尝试
+	PromptCacheMode  string                     `json:"promptCacheMode,omitempty"`  // "auto"(默认)/"on"/"off"
+	Plans            map[string]PlanModelConfig `json:"plans,omitempty"`            // 按 plan 名称覆盖模型配置
 }
 
 // MCPServerEntry MCP 服务器条目

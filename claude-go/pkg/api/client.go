@@ -136,6 +136,56 @@ type Client struct {
 	CircuitTrips atomic.Int64
 }
 
+// WithModel 返回一个共享同一 HTTP 客户端和限流器的轻量 Client 副本，仅覆盖 Model。
+// 用于为不同 plan/role 指定不同模型而不影响原始 Client 的 Model 字段。
+func (c *Client) WithModel(model string) *Client {
+	return &Client{
+		BaseURL:              c.BaseURL,
+		APIKey:               c.APIKey,
+		Model:                model,
+		Client:               c.Client,
+		Guard:                c.Guard,
+		RetryCount:           c.RetryCount,
+		RetryBase:            c.RetryBase,
+		RetryMax:             c.RetryMax,
+		OnLLMEvent:           c.OnLLMEvent,
+		OnLLMMetrics:         c.OnLLMMetrics,
+		FallbackModels:       c.FallbackModels,
+		PromptCacheMode:      c.PromptCacheMode,
+		cbThreshold:          c.cbThreshold,
+		fallbackCooldownMin:  c.fallbackCooldownMin,
+		Tag:                  c.Tag + ":" + model,
+	}
+}
+
+// ConfiguredClone 返回一个共享 HTTP 客户端和限流器的轻量 Client 副本，
+// 使用指定参数覆盖 baseURL / apiKey / model / fallbackModels。
+// 用于为不同 plan 使用完全不同的 API 端点而不影响原始 Client。
+func (c *Client) ConfiguredClone(baseURL, apiKey, model string, fallbackModels []string) *Client {
+	clone := &Client{
+		BaseURL:              strings.TrimRight(baseURL, "/"),
+		APIKey:               apiKey,
+		Model:                model,
+		Client:               c.Client,
+		Guard:                c.Guard,
+		RetryCount:           c.RetryCount,
+		RetryBase:            c.RetryBase,
+		RetryMax:             c.RetryMax,
+		OnLLMEvent:           c.OnLLMEvent,
+		OnLLMMetrics:         c.OnLLMMetrics,
+		PromptCacheMode:      c.PromptCacheMode,
+		cbThreshold:          c.cbThreshold,
+		fallbackCooldownMin:  c.fallbackCooldownMin,
+		Tag:                  c.Tag,
+	}
+	if len(fallbackModels) > 0 {
+		clone.FallbackModels = fallbackModels
+	} else {
+		clone.FallbackModels = c.FallbackModels
+	}
+	return clone
+}
+
 // NewClient 创建 API 客户端 (内置 429/5xx 重试 + 熔断)
 func NewClient(baseURL, apiKey, model string) *Client {
 	return &Client{

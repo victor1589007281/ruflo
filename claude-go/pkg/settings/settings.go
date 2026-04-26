@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/anthropic/claude-go/pkg/feishu"
 )
 
 // Settings 项目配置。
@@ -26,10 +28,11 @@ type Settings struct {
 
 // AISection AI 模型配置段 (与飞书 claude-go.json 格式统一)。
 type AISection struct {
-	Model     string `json:"model,omitempty"`
-	APIKey    string `json:"apiKey,omitempty"`
-	BaseURL   string `json:"baseUrl,omitempty"`
-	MaxTokens int    `json:"maxTokens,omitempty"`
+	Model     string                          `json:"model,omitempty"`
+	APIKey    string                          `json:"apiKey,omitempty"`
+	BaseURL   string                          `json:"baseUrl,omitempty"`
+	MaxTokens int                             `json:"maxTokens,omitempty"`
+	Plans     map[string]feishu.PlanModelConfig `json:"plans,omitempty"`
 }
 
 // PermissionSettings 权限配置。
@@ -163,6 +166,14 @@ func mergeSettings(dst, src *Settings) {
 		}
 		if src.AI.Model != "" {
 			dst.AI.Model = src.AI.Model
+		}
+		if len(src.AI.Plans) > 0 {
+			if dst.AI.Plans == nil {
+				dst.AI.Plans = make(map[string]feishu.PlanModelConfig, len(src.AI.Plans))
+			}
+			for k, v := range src.AI.Plans {
+				dst.AI.Plans[k] = v
+			}
 		}
 	}
 }

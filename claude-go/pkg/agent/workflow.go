@@ -787,6 +787,7 @@ Full Debate Transcript + Evidence Verification:
 // 集成 Blackboard (bMAS) + TaskTracker (V2 Task) + Structured Handoff + Evolution + Roles + AgentPool。
 type WorkflowExecutor struct {
 	factory          CreateAgentFunc
+	planCfgResolver  *PlanConfigResolver // 模型/连接参数解析器 (可选, 按 plan+role 层级解析)
 	notify           NotifyFunc
 	chatID           string
 	llm              LLMClient            // LLM 客户端 (供 swarm_intel.Engine 等需要直接调用的场景)
@@ -2269,6 +2270,12 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	// 单阶段超时保护: 防止 agent 陷入死循环
 	stageCtx, stageCancel := context.WithTimeout(ctx, stageTimeout)
 	defer stageCancel()
+
+	// 模型层级解析: role > plan > 全局默认
+	if we.planCfgResolver != nil {
+		resolved := we.planCfgResolver.Resolve(team.Workflow, role)
+		stageCtx = context.WithValue(stageCtx, PlanConfigKey{}, resolved)
+	}
 
 	runner, err := we.factory(stageCtx, role, "")
 	if err != nil {

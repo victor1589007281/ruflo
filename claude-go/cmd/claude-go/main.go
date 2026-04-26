@@ -394,7 +394,8 @@ func runCmd() *cobra.Command {
 				siEngine := swarmintel.NewEngine(eng.APIClient, siCfg)
 
 				agentFactory := func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
-						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt}, nil
+						planCfg, _ := ctx.Value(agent.PlanConfigKey{}).(agent.ResolvedPlanConfig)
+						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt, planCfg: planCfg}, nil
 					}
 				agentPool := agent.NewAgentPool(agentFactory, 8)
 
@@ -432,17 +433,52 @@ func runCmd() *cobra.Command {
 					return out
 				})
 
-				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
-					BaseDir:     filepath.Join(cwd, ".claude-go", "teams"),
-					Cwd:         cwd,
-					Factory:     agentFactory,
-					Pool:        agentPool,
-					Notify:      func(_, msg string) { fmt.Println(msg) },
-					LLM:         eng.APIClient,
-					Roles:       agent.NewRoleRegistry(cwd),
-					TaskTracker: dagAdapter,
-					Concurrency: eng.APIClient.Guard,
-				})
+				// 加载模型配置并创建解析器 (层级: role > plan > 全局默认)
+					projSettings := settings.LoadProjectSettings(cwd)
+					planCfgs := make(map[string]agent.PlanModels)
+					if projSettings.AI != nil && len(projSettings.AI.Plans) > 0 {
+						for name, pc := range projSettings.AI.Plans {
+							pm := agent.PlanModels{
+								Model:          pc.Model,
+								BaseURL:        pc.BaseURL,
+								APIKey:         pc.APIKey,
+								FallbackModels: pc.FallbackModels,
+							}
+							if len(pc.RoleModels) > 0 {
+								pm.RoleModels = make(map[string]string, len(pc.RoleModels))
+								for r, m := range pc.RoleModels {
+									pm.RoleModels[r] = m
+								}
+							}
+							planCfgs[name] = pm
+						}
+					}
+					// 内置默认: research plan 默认使用 kimi-2.5
+					builtinDefaults := map[string]agent.PlanModels{
+						"research": {Model: "kimi-2.5"},
+					}
+					// 全局 role 默认: planner 在任何 plan 中都默认 kimi-2.5
+					globalRoleDefaults := map[string]string{
+						"planner": "kimi-2.5",
+					}
+					modelResolver := agent.NewPlanConfigResolver(
+						eng.APIClient.BaseURL, eng.APIClient.APIKey, eng.APIClient.Model,
+						eng.APIClient.FallbackModels,
+						planCfgs, builtinDefaults, globalRoleDefaults,
+					)
+
+					teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
+						BaseDir:           filepath.Join(cwd, ".claude-go", "teams"),
+						Cwd:               cwd,
+						Factory:           agentFactory,
+						Pool:              agentPool,
+						Notify:            func(_, msg string) { fmt.Println(msg) },
+						LLM:               eng.APIClient,
+						Roles:             agent.NewRoleRegistry(cwd),
+						TaskTracker:       dagAdapter,
+						Concurrency:       eng.APIClient.Guard,
+						PlanConfigResolver: modelResolver,
+					})
 
 				cmdCtx := &commands.CommandContext{
 					Engine:     eng,
@@ -1858,13 +1894,34 @@ type cliAgentRunner struct {
 	eng          *engine.QueryEngine
 	role         string
 	systemPrompt string
+	planCfg      agent.ResolvedPlanConfig // 为空则使用 eng.APIClient 默认
 }
 
 func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
 	contentJSON, _ := json.Marshal(userPrompt)
 	msgs := []types.APIMessage{{Role: "user", Content: contentJSON}}
 	sys := []string{r.systemPrompt}
-	resp, err := r.eng.APIClient.SendMessage(ctx, msgs, sys, nil, 8192)
+	client := r.eng.APIClient
+	if r.planCfg.Model != "" || r.planCfg.BaseURL != "" || r.planCfg.APIKey != "" {
+		baseURL := r.planCfg.BaseURL
+		if baseURL == "" {
+			baseURL = client.BaseURL
+		}
+		apiKey := r.planCfg.APIKey
+		if apiKey == "" {
+			apiKey = client.APIKey
+		}
+		model := r.planCfg.Model
+		if model == "" {
+			model = client.Model
+		}
+		fallback := r.planCfg.FallbackModels
+		if len(fallback) == 0 {
+			fallback = client.FallbackModels
+		}
+		client = client.ConfiguredClone(baseURL, apiKey, model, fallback)
+	}
+	resp, err := client.SendMessage(ctx, msgs, sys, nil, 8192)
 	if err != nil {
 		return "", err
 	}
