@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +39,7 @@ type Server struct {
 	mux      *http.ServeMux
 	server   *http.Server
 	jobs     *diagJobStore // 异步 LLM 诊断作业
+	scraper  *metrics.JSONLScraper // JSONL → Prometheus 采集器 (MySQL Exporter 模式)
 }
 
 // NewServer 构造 dashboard server。
@@ -62,7 +62,10 @@ func NewServer(cfg Config) *Server {
 	// 从 Swarm Intel / Cron JSON 数据回放历史指标到 Prometheus
 	s.provider.ExportSwarmIntelMetrics()
 	s.provider.ExportCronMetrics()
+	// JSONL Scraper: MySQL Exporter 模式, 在每次 /metrics 请求时读取 CLI 进程写入的 JSONL
+	s.scraper = metrics.NewJSONLScraper(cfg.StateDir)
 	s.registerRoutes()
+
 	s.server = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.mux,
@@ -87,7 +90,9 @@ func MountOn(cfg Config, mux *http.ServeMux) *Server {
 	metrics.InitGlobalLLMCollector(cfg.StateDir)
 	s.provider.ExportSwarmIntelMetrics()
 	s.provider.ExportCronMetrics()
+	s.scraper = metrics.NewJSONLScraper(cfg.StateDir)
 	s.registerRoutesOn(mux)
+
 	return s
 }
 
@@ -108,7 +113,6 @@ func (r recoverMiddleware) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.handler.ServeHTTP(w, req)
 }
 
-// ListenAndServe 启动 HTTP 服务, 阻塞直到被 Stop 或出错。
 func (s *Server) ListenAndServe() error {
 	ln, err := net.Listen("tcp", s.cfg.Addr)
 	if err != nil {
@@ -209,10 +213,8 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/diag/jobs/", s.handleDiagJobDetail)
 	mux.HandleFunc("/api/dreaming/trigger", s.handleDreamingTrigger)
 
-	// Prometheus 端点: 使用真正的 Prometheus handler 导出实时指标
-	metricsDir := filepath.Join(s.cfg.StateDir, "metrics")
-	_ = metricsDir // 保留用于未来扩展
-	mux.Handle("/metrics", metrics.PrometheusHandler())
+	// Prometheus 端点: 使用 JSONLScraper 包装, 类似 MySQL Exporter 模式, 每次采集前读取 CLI 进程的 JSONL
+	mux.Handle("/metrics", metrics.WrapWithScrape(s.scraper, metrics.PrometheusHandler()))
 
 	// 根路径和 SPA fallback
 	mux.HandleFunc("/", s.handleIndex)
@@ -696,6 +698,7 @@ func (s *Server) handlePromQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
+
 
 // summarizeEvents 从事件列表构造简易摘要。
 func summarizeEvents(module string, events []MetricEventDTO) map[string]interface{} {

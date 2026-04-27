@@ -14,8 +14,11 @@
 package metrics
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -66,20 +69,23 @@ type MetricHistogram struct {
 	Bucket map[string]int `json:"bucket"` // bucket_upper_bound -> count
 }
 
-// Collector 指标采集器, 线程安全, 仅写入 Prometheus + 内存缓冲。
+// Collector 指标采集器, 线程安全, 写入 Prometheus + JSONL 持久化 + 内存缓冲。
 type Collector struct {
-	mu     sync.Mutex
-	buffer map[string][]MetricEvent // 内存缓冲 (用于 Summary)
+	mu       sync.Mutex
+	buffer   map[string][]MetricEvent // 内存缓冲 (用于 Summary)
+	jsonlDir string                   // JSONL 持久化目录, 供 dashboard 按 scrape 节奏读取
 }
 
-// NewCollector 创建指标采集器。
+// NewCollector 创建指标采集器, 在 stateDir/metrics/ 下持久化 JSONL。
 func NewCollector(stateDir string) *Collector {
 	// 确保 Prometheus 注册已初始化
 	PrometheusRegistry()
+	jsonlDir := filepath.Join(stateDir, "metrics")
+	_ = os.MkdirAll(jsonlDir, 0o755)
 	c := &Collector{
-		buffer: make(map[string][]MetricEvent),
+		buffer:   make(map[string][]MetricEvent),
+		jsonlDir: jsonlDir,
 	}
-	_ = stateDir // stateDir 保留接口兼容, 但不再用于文件路径
 	return c
 }
 
@@ -111,6 +117,9 @@ func (c *Collector) RecordAtTime(module, name string, value float64, labels map[
 
 	// 同时写入 Prometheus 原生指标
 	recordPromMetric(module, name, value, labels)
+
+	// 持久化到 JSONL (供 dashboard scrape)
+	c.appendJSONL(module, evt)
 }
 
 // RecordRun 记录一个带 RunID 的指标值 (用于团队/任务级别追踪)。
@@ -130,6 +139,27 @@ func (c *Collector) RecordRun(module, name string, value float64, runID string, 
 
 	// 同时写入 Prometheus 原生指标
 	recordPromMetric(module, name, value, labels)
+
+	// 持久化到 JSONL (供 dashboard scrape)
+	c.appendJSONL(module, evt)
+}
+
+// appendJSONL 将事件以 JSONL 格式追加到对应模块的文件。
+func (c *Collector) appendJSONL(module string, evt MetricEvent) {
+	if c.jsonlDir == "" {
+		return
+	}
+	path := filepath.Join(c.jsonlDir, module+".jsonl")
+	line, err := json.Marshal(evt)
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	f.Write(append(line, '\n'))
+	f.Close()
 }
 
 // Summary 生成单模块的指标摘要 (基于最近 100 条事件)。
