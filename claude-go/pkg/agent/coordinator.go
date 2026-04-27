@@ -76,6 +76,11 @@ type Coordinator struct {
 	// 心跳只证明 "进程活着", 进展证明 "任务在前进"
 	progress   ProgressState
 	progressMu sync.RWMutex
+
+	// autoResumeCallback 自动恢复回调: 当 watchdog 检测到团队因瞬态错误失败时,
+	// 自动触发恢复 (避免用户手动 /team resume)。
+	// 由 ProductionTeamManager 在创建 Coordinator 时注入。
+	autoResumeCallback func(teamName string)
 }
 
 // ProgressState 任务进展状态 (用于 watchdog 区分 "活着" 和 "在前进")
@@ -233,6 +238,11 @@ func (c *Coordinator) executeWithWatchdog(
 	return results, err
 }
 
+// SetAutoResumeCallback 设置自动恢复回调 (由 ProductionTeamManager 注入)。
+func (c *Coordinator) SetAutoResumeCallback(cb func(teamName string)) {
+	c.autoResumeCallback = cb
+}
+
 // teamWatchdog 团队级 watchdog: 区分 "进程活着" 和 "任务在前进"。
 //
 
@@ -249,6 +259,7 @@ func (c *Coordinator) teamWatchdog(ctx context.Context, team *ProductionTeam) {
 
 	warned := false
 	var stagnantRounds int // 连续无进展轮数
+	var autoResumeAttempted bool
 
 	// 进展检测阈值: 超过此时间 phase/iteration 不变即视为停滞
 	progressStaleThreshold := 10 * time.Minute
@@ -297,6 +308,26 @@ func (c *Coordinator) teamWatchdog(ctx context.Context, team *ProductionTeam) {
 				warned = true
 			} else if age < watchdogStaleThreshold && stagnantRounds == 0 {
 				warned = false
+			}
+
+			// L3: 自动恢复检测 (团队失败后自动 resume)
+			// 当团队状态为 failed 且错误为瞬态错误 (API 超时/限流) 时,
+			// 自动触发 ResumeTeam, 无需用户手动干预。
+			if !autoResumeAttempted && c.autoResumeCallback != nil && team.Status == TeamStatusFailed {
+				lower := strings.ToLower(team.Error)
+				isTransient := strings.Contains(lower, "timeout") ||
+					strings.Contains(lower, "deadline exceeded") ||
+					strings.Contains(lower, "429") ||
+					strings.Contains(lower, "rate limit") ||
+					strings.Contains(lower, "限流") ||
+					strings.Contains(lower, "overloaded") ||
+					strings.Contains(lower, "超过最大重试次数")
+				if isTransient {
+					autoResumeAttempted = true
+					c.notify(c.chatID, fmt.Sprintf(
+						"🔄 团队 **%s** 检测到瞬态错误失败, 正在自动恢复...", team.Name))
+					go c.autoResumeCallback(team.Name)
+				}
 			}
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1345,6 +1346,11 @@ func (we *WorkflowExecutor) runBuildHardGate(
 				*lastGenOutput = sr.Output
 				prevResults[genStage.Name] = sr.Output
 				MaterializeCode(team.Cwd, sr.Output, lang)
+			} else if isStageTransientError(sr.Error) {
+				// V2 改进: build fix 中 coder 因 API 瞬态错误失败时,
+				// 提前返回 false, 让对抗循环有机会重试整轮 (而非浪费 build fix 重试次数)
+				we.notify(we.chatID, fmt.Sprintf("  🔴 %s修复 %d/%d 因 API 错误失败 (已自动重试), 跳过本轮", label, retry, maxBuildRetries))
+				return false
 			}
 		}
 
@@ -1456,6 +1462,10 @@ func (we *WorkflowExecutor) runTestFixCycle(
 				*lastGenOutput = sr.Output
 				prevResults[genStage.Name] = sr.Output
 				MaterializeCode(team.Cwd, sr.Output, lang)
+			} else if isStageTransientError(sr.Error) {
+				// V2 改进: test fix 中 coder 因 API 瞬态错误失败时提前返回
+				we.notify(we.chatID, fmt.Sprintf("  🔴 测试修复 %d/%d 因 API 错误失败 (已自动重试), 跳过本轮", retry, maxTestRetries))
+				return false
 			}
 		}
 
@@ -2263,8 +2273,10 @@ func (we *WorkflowExecutor) ExecuteSingleStage(ctx context.Context, stage StageD
 	return we.executeStage(ctx, stage, objective, prevResults, team)
 }
 
-// executeStage 执行单个阶段。
+// executeStage 执行单个阶段 (注入 Blackboard + V2 Task + Evolution + 智能重试)。
 // 集成 Blackboard 读/写 + V2 Task 创建/更新 + Structured Handoff + Evolution。
+// V2 改进: 区分瞬态错误 (API 超时/限流/网络) 和永久错误 (产出验证失败),
+//          瞬态错误自动重试 (指数退避 + 抖动), 永久错误直接失败。
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
 	ctx, endSpan := logging.WithSpan(ctx, "stage."+stage.Name)
 	defer endSpan()
@@ -2314,8 +2326,8 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 
 	we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 开始执行...", stage.Name, stage.Role))
 
-	// 3. 执行 Agent
-	sr := we.runAgent(ctx, stage.Role, prompt, team)
+	// 3. 执行 Agent (带智能重试)
+	sr := we.executeStageWithRetry(ctx, stage, prompt, team, injectedExpIDs)
 	sr.Name = stage.Name
 	sr.Role = stage.Role
 	sr.V2TaskID = v2TaskID
@@ -2378,6 +2390,108 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	return sr
 }
 
+// executeStageWithRetry 执行阶段并智能重试。
+// 区分瞬态错误 (API 超时/限流/网络) 和永久错误 (产出验证失败/编译错误)。
+// 瞬态错误: 自动重试 (指数退避 + 全抖动), 最多 stageRetryMaxRetries 次。
+// 永久错误: 直接返回失败, 不重试。
+func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage StageDef, prompt string, team *ProductionTeam, injectedExpIDs []string) StageResult {
+	var lastErr StageResult
+	for attempt := 0; attempt <= stageRetryMaxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled"}
+		}
+
+		// 动态超时: 根据角色和尝试次数调整
+		timeout := we.computeStageTimeout(stage.Role, attempt)
+		stageCtx, stageCancel := context.WithTimeout(ctx, timeout)
+
+		we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 第 %d/%d 次尝试...",
+			stage.Name, stage.Role, attempt+1, stageRetryMaxRetries+1))
+
+		sr := we.runAgent(stageCtx, stage.Role, prompt, team)
+		stageCancel()
+
+		if sr.Status == TaskCompleted {
+			if attempt > 0 {
+				we.notify(we.chatID, fmt.Sprintf("✅ 阶段 **%s** 第 %d 次尝试成功", stage.Name, attempt+1))
+			}
+			return sr
+		}
+
+		lastErr = sr
+
+		// 错误分类: 瞬态错误 vs 永久错误
+		if !isStageTransientError(sr.Error) {
+			// 永久错误 (产出验证失败、编译错误等): 不重试, 直接失败
+			we.notify(we.chatID, fmt.Sprintf("❌ 阶段 **%s** 永久错误, 不重试: %s", stage.Name, sr.Error))
+			return sr
+		}
+
+		// 瞬态错误: 计算退避时间并重试
+		if attempt < stageRetryMaxRetries {
+			isRateLimit := strings.Contains(strings.ToLower(sr.Error), "429") ||
+				strings.Contains(strings.ToLower(sr.Error), "rate limit") ||
+				strings.Contains(strings.ToLower(sr.Error), "限流")
+			delay := computeRetryDelay(attempt, isRateLimit)
+
+			hint := ""
+			if isRateLimit {
+				hint = " (LLM 限流中, 延长等待)"
+			}
+			we.notify(we.chatID, fmt.Sprintf("⚠️ 阶段 **%s** 第 %d 次尝试失败%s, %.0f秒后重试...\n错误: %s",
+				stage.Name, attempt+1, hint, delay.Seconds(), sr.Error))
+
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled during retry"}
+			}
+		}
+	}
+
+	// 所有重试耗尽
+	return StageResult{
+		Role:   stage.Role,
+		Status: TaskFailed,
+		Error:  fmt.Sprintf("超过最大重试次数 (%d): %s", stageRetryMaxRetries, lastErr.Error),
+	}
+}
+
+// computeStageTimeout 根据角色和尝试次数计算动态超时。
+// 长时间编程任务 (如 C++ 代码生成) 需要更长的超时预算。
+func (we *WorkflowExecutor) computeStageTimeout(role string, attempt int) time.Duration {
+	base := stageTimeout // 默认 10 分钟
+
+	// 根据角色调整基础超时
+	switch role {
+	case "coder":
+		// Coder 生成复杂代码需要更长时间 (特别是 C++/MySQL 项目)
+		base = 15 * time.Minute
+	case "architect", "planner":
+		// 设计和规划阶段通常需要更多思考时间
+		base = 12 * time.Minute
+	case "tester":
+		// 测试阶段需要运行实际测试
+		base = 10 * time.Minute
+	case "reviewer":
+		// 审查阶段相对较短
+		base = 8 * time.Minute
+	}
+
+	// 每次重试增加 20% 超时预算 (给 LLM 更多时间)
+	if attempt > 0 {
+		multiplier := 1.0 + float64(attempt)*0.2
+		base = time.Duration(float64(base) * multiplier)
+	}
+
+	// 硬上限: 30 分钟
+	if base > 30*time.Minute {
+		base = 30 * time.Minute
+	}
+
+	return base
+}
+
 // maxWorkflowParallelDefault 默认 workflow 层并行上限
 const maxWorkflowParallelDefault = 6
 
@@ -2418,6 +2532,55 @@ func (we *WorkflowExecutor) executeParallel(ctx context.Context, stages []StageD
 
 // stageTimeout 单阶段执行超时 (防止 agent 无限循环)
 const stageTimeout = 10 * time.Minute
+
+// stageRetryMaxRetries 阶段级重试次数 (API 瞬态错误自动恢复)
+const stageRetryMaxRetries = 3
+
+// stageRetryBaseDelay 重试基础退避时间
+const stageRetryBaseDelay = 3 * time.Second
+
+// stageRetryMaxDelay 重试最大退避时间
+const stageRetryMaxDelay = 120 * time.Second
+
+// isStageTransientError 判断错误是否为瞬态错误 (可重试)
+// 区分 API 层错误 (超时/限流/网络) 和 应用层错误 (产出验证失败/编译错误)
+// 注意: orchestrator.go 中也有 isTransientError, 但本函数覆盖更全的 pattern
+func isStageTransientError(errStr string) bool {
+	if errStr == "" {
+		return false
+	}
+	lower := strings.ToLower(errStr)
+	transientPatterns := []string{
+		"context deadline exceeded", "timeout", "deadline",
+		"429", "rate limit", "rate_limit", "throttl", "限流", "频率",
+		"connection refused", "connection reset", "network",
+		"503", "529", "overloaded", "过载",
+		"burstrate", "allocationquota", "ratequota",
+		"temporary", "transient", "retry",
+	}
+	for _, pat := range transientPatterns {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// computeRetryDelay 计算重试退避时间 (指数退避 + 全抖动)
+func computeRetryDelay(attempt int, isRateLimit bool) time.Duration {
+	base := stageRetryBaseDelay
+	if isRateLimit {
+		base = 15 * time.Second
+	}
+	// 指数退避: base * 2^attempt
+	delay := time.Duration(1<<uint(attempt)) * base
+	if delay > stageRetryMaxDelay {
+		delay = stageRetryMaxDelay
+	}
+	// 全抖动: random(0, delay)
+	jitter := time.Duration(rand.Float64() * float64(delay))
+	return jitter
+}
 
 // runAgent 创建并运行一个 agent (带超时保护)
 func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, team *ProductionTeam) StageResult {

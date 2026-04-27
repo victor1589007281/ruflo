@@ -549,6 +549,15 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		DataDir:       team.dataDir,
 		ChatID:        team.ChatID,
 	})
+	// 注入自动恢复回调: 当 Coordinator watchdog 检测到瞬态错误导致团队失败时,
+	// 自动调用 ResumeTeam 从检查点恢复, 无需用户手动干预。
+	coord.SetAutoResumeCallback(func(teamName string) {
+		// 延迟 10 秒后恢复, 给 LLM API 限流/超时一些冷却时间
+		time.Sleep(10 * time.Second)
+		if err := ptm.ResumeTeam(teamName); err != nil {
+			ptm.notify(team.ChatID, fmt.Sprintf("⚠️ 团队 **%s** 自动恢复失败: %v", teamName, err))
+		}
+	})
 	resuming := len(isResume) > 0 && isResume[0]
 	if !resuming {
 		coord.ClearCheckpoints()
