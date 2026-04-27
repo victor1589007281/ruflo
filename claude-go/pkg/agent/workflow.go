@@ -874,8 +874,48 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 
 	// Phase 2: Orchestrator (DAG 驱动, pool 由 DAG 宽度精确控制)
 	//          fallback: 经典对抗循环 (pool 用粗糙 autoScalePool)
+	// 恢复优化: 检测是否已有 Orchestrator 阶段执行过 (UUID 检查点存在),
+	// 避免重新解析 WBS 生成新 UUID 导致检查点丢失。
 	orchUsed := false
-	if planOutput, hasPlan := prevResults["plan"]; hasPlan && we.dagTracker != nil {
+	orchCompleted, orchFailed, orchAlreadyRan := detectOrchestratorCheckpoints(we.checkpoints)
+	if orchAlreadyRan {
+		// 已有 Orchestrator 执行记录: 跳过重新解析, 只重跑失败阶段
+		we.notify(we.chatID, fmt.Sprintf("♻️ 检测到已执行过的 Orchestrator 阶段, 跳过重新解析 (已完成 %d 个任务, %d 个待重跑)", len(orchCompleted), len(orchFailed)))
+		// 将已完成的任务输出注入 prevResults, 供后续 E2E 使用
+		for k, v := range orchCompleted {
+			prevResults[k] = v
+		}
+		// 恢复已完成阶段到 allResults
+		for name, output := range orchCompleted {
+			allResults = append(allResults, StageResult{
+				Name: name, Status: TaskCompleted, Output: output,
+			})
+		}
+		// 重跑失败的阶段
+		if len(orchFailed) > 0 {
+			we.notify(we.chatID, fmt.Sprintf("🔧 重跑 %d 个失败的 Orchestrator 任务: %v", len(orchFailed), orchFailed))
+			for _, failedID := range orchFailed {
+				if ctx.Err() != nil {
+					break
+				}
+				failCtx := make(map[string]string)
+				for k, v := range prevResults {
+					failCtx[k] = v
+				}
+				stageDef := StageDef{Name: failedID, Role: "coder", Prompt: fmt.Sprintf("重跑失败的任务 %s, 目标: %s", failedID, objective)}
+				sr := we.executeStage(ctx, stageDef, objective, failCtx, team)
+				if sr.Status == TaskCompleted {
+					prevResults[failedID] = sr.Output
+					allResults = append(allResults, sr)
+					we.savePhaseCheckpoints([]StageResult{sr})
+					we.flushStagesLive(team, allResults)
+				} else {
+					return allResults, fmt.Errorf("阶段 %s 重跑失败: %s", failedID, sr.Error)
+				}
+			}
+		}
+		orchUsed = true // 跳过 fallback 对抗循环
+	} else if planOutput, hasPlan := prevResults["plan"]; hasPlan && we.dagTracker != nil {
 		orchResults, orchErr := we.runOrchestratedPhase(ctx, planOutput, objective, prevResults, team, allResults)
 		if orchErr == nil && len(orchResults) > 0 {
 			allResults = append(allResults, orchResults...)
@@ -976,6 +1016,42 @@ func (we *WorkflowExecutor) flushStagesLive(team *ProductionTeam, results []Stag
 			}
 		}
 	}
+}
+
+// isOrchestratorTaskID 检测阶段名是否为 Orchestrator 生成的 UUID 任务 ID。
+// Orchestrator 使用 UUID v4 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+// 静态阶段名 (research/design/plan/e2e-round1 等) 不含 UUID。
+var uuidStageRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+func isOrchestratorTaskID(name string) bool {
+	return uuidStageRe.MatchString(strings.ToLower(name))
+}
+
+// detectOrchestratorCheckpoints 检测是否已有 Orchestrator 阶段执行过 (存在 UUID 检查点)。
+// 返回: completed 阶段的 prevResults 映射, failed 阶段的 name 列表, 以及是否检测到的布尔值。
+func detectOrchestratorCheckpoints(cpStore CheckpointStore) (prevResults map[string]string, failed []string, found bool) {
+	coord, ok := cpStore.(*Coordinator)
+	if !ok {
+		return nil, nil, false
+	}
+	all := coord.AllCheckpoints()
+	if len(all) == 0 {
+		return nil, nil, false
+	}
+	hasUUID := false
+	prevResults = make(map[string]string)
+	for name, cp := range all {
+		if !isOrchestratorTaskID(name) {
+			continue
+		}
+		hasUUID = true
+		if cp.Status == "completed" && cp.Output != "" {
+			prevResults[name] = cp.Output
+		} else if cp.Status == "failed" {
+			failed = append(failed, name)
+		}
+	}
+	return prevResults, failed, hasUUID
 }
 
 // restoreCheckpoints 从检查点恢复已完成阶段, 注入 prevResults + allResults。
@@ -1810,7 +1886,31 @@ func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStage
 
 	var results []StageResult
 	e2eTerminator := NewAdaptiveTerminator(1, 3) // E2E: 最少1轮, 最多3轮
-	we.notify(we.chatID, "🧪 Phase 3: E2E 对抗测试 (tester↔coder 自适应)...")
+
+	// E2E 恢复: 检测已完成的 E2E 轮次, 跳过已完成的
+	startRound := 1
+	var e2eRestoredResults []StageResult
+	var lastE2EOutput string
+	if we.checkpoints != nil {
+		for round := 1; round <= 3; round++ {
+			roundName := fmt.Sprintf("e2e-round%d", round)
+			cp := we.checkpoints.GetCheckpoint(roundName)
+			if cp != nil && cp.Status == "completed" && cp.Output != "" {
+				lastE2EOutput = cp.Output
+				startRound = round + 1
+				e2eRestoredResults = append(e2eRestoredResults, StageResult{
+					Name: roundName, Role: "tester", Status: TaskCompleted, Output: cp.Output,
+				})
+			} else {
+				break
+			}
+		}
+	}
+	if startRound > 1 {
+		we.notify(we.chatID, fmt.Sprintf("♻️ E2E 从第 %d 轮继续 (已恢复 %d 轮)", startRound, startRound-1))
+	} else {
+		we.notify(we.chatID, "🧪 Phase 3: E2E 对抗测试 (tester↔coder 自适应)...")
+	}
 
 	// L1.5 E2E 前置门禁: 在运行 E2E 测试前先扫描 TODO/STUB
 	if team.Cwd != "" {
@@ -1821,8 +1921,7 @@ func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStage
 		}
 	}
 
-	var lastE2EOutput string
-	for round := 1; round <= 3; round++ {
+	for round := startRound; round <= 3; round++ {
 		if ctx.Err() != nil {
 			break
 		}

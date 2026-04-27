@@ -736,6 +736,17 @@ func (c *Coordinator) CompletedCount() int {
 	return count
 }
 
+// AllCheckpoints 返回所有检查点的 key 集合 (供 resume 检测已执行阶段)。
+func (c *Coordinator) AllCheckpoints() map[string]*Checkpoint {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]*Checkpoint, len(c.checkpoints))
+	for k, v := range c.checkpoints {
+		out[k] = v
+	}
+	return out
+}
+
 // ClearCheckpoints 清除所有检查点 (新工作流开始时调用)。
 func (c *Coordinator) ClearCheckpoints() {
 	c.mu.Lock()
