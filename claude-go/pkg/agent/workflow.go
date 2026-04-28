@@ -2392,21 +2392,37 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 
 // executeStageWithRetry 执行阶段并智能重试。
 // 区分瞬态错误 (API 超时/限流/网络) 和永久错误 (产出验证失败/编译错误)。
-// 瞬态错误: 自动重试 (指数退避 + 全抖动), 最多 stageRetryMaxRetries 次。
+// 瞬态错误: 自动重试 (指数退避 + 全抖动)。
+//   - 非限流瞬态错误: 最多 stageRetryMaxRetries 次 (默认 3 次)。
+//   - 429 限流: 无限重试, 直到成功或 context 被取消 (用户停止)。
+//     利用 RateLimitGuard 的全局退避机制, 自动等待限流解除。
 // 永久错误: 直接返回失败, 不重试。
 func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage StageDef, prompt string, team *ProductionTeam, injectedExpIDs []string) StageResult {
 	var lastErr StageResult
-	for attempt := 0; attempt <= stageRetryMaxRetries; attempt++ {
+	var rateLimitAttempt int // 限流专用重试计数器
+	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
 			return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled"}
 		}
 
 		// 动态超时: 根据角色和尝试次数调整
+		// 限流时增加超时预算, 给 RateLimitGuard 足够的等待时间
 		timeout := we.computeStageTimeout(stage.Role, attempt)
+		if rateLimitAttempt > 0 {
+			// 限流时增加 50% 超时预算, 让 API client 的 RateLimitGuard 有机会等待
+			timeout = time.Duration(float64(timeout) * 1.5)
+			if timeout > 45*time.Minute {
+				timeout = 45 * time.Minute
+			}
+		}
 		stageCtx, stageCancel := context.WithTimeout(ctx, timeout)
 
-		we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 第 %d/%d 次尝试...",
-			stage.Name, stage.Role, attempt+1, stageRetryMaxRetries+1))
+		attemptLabel := fmt.Sprintf("%d", attempt+1)
+		if rateLimitAttempt > 0 {
+			attemptLabel = fmt.Sprintf("%d (限流第 %d 次)", attempt+1, rateLimitAttempt)
+		}
+		we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 第 %s 次尝试...",
+			stage.Name, stage.Role, attemptLabel))
 
 		sr := we.runAgent(stageCtx, stage.Role, prompt, team)
 		stageCancel()
@@ -2427,34 +2443,65 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 			return sr
 		}
 
-		// 瞬态错误: 计算退避时间并重试
-		if attempt < stageRetryMaxRetries {
-			isRateLimit := strings.Contains(strings.ToLower(sr.Error), "429") ||
-				strings.Contains(strings.ToLower(sr.Error), "rate limit") ||
-				strings.Contains(strings.ToLower(sr.Error), "限流")
-			delay := computeRetryDelay(attempt, isRateLimit)
+		// 检测是否为 429 限流
+		isRateLimit := strings.Contains(strings.ToLower(sr.Error), "429") ||
+			strings.Contains(strings.ToLower(sr.Error), "rate limit") ||
+			strings.Contains(strings.ToLower(sr.Error), "限流") ||
+			strings.Contains(strings.ToLower(sr.Error), "throttl")
 
-			hint := ""
-			if isRateLimit {
-				hint = " (LLM 限流中, 延长等待)"
+		if isRateLimit {
+			rateLimitAttempt++
+			// 429 限流: 无限重试, 直到成功或 context 被取消
+			// 利用 RateLimitGuard 的全局退避机制自动等待
+			delay := computeRetryDelay(min(rateLimitAttempt-1, 5), true) // 最多用第 5 档退避
+			// 限流时增加固定等待, 让 RateLimitGuard 冷却
+			if delay < 30*time.Second {
+				delay = 30 * time.Second
 			}
-			we.notify(we.chatID, fmt.Sprintf("⚠️ 阶段 **%s** 第 %d 次尝试失败%s, %.0f秒后重试...\n错误: %s",
-				stage.Name, attempt+1, hint, delay.Seconds(), sr.Error))
+
+			we.notify(we.chatID, fmt.Sprintf(
+				"⏳ 阶段 **%s** 遇到 LLM 限流 (429), 等待 %.0f 秒后无限重试...\n"+
+					"▸ 已等待限流解除 %d 次 | 错误: %s",
+				stage.Name, delay.Seconds(), rateLimitAttempt, sr.Error))
 
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
 				return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled during retry"}
 			}
+			continue // 无限循环, 不限次数
+		}
+
+		// 非限流瞬态错误: 有限重试
+		if attempt >= stageRetryMaxRetries {
+			break
+		}
+
+		delay := computeRetryDelay(attempt, false)
+		we.notify(we.chatID, fmt.Sprintf("⚠️ 阶段 **%s** 第 %d 次尝试失败, %.0f秒后重试...\n错误: %s",
+			stage.Name, attempt+1, delay.Seconds(), sr.Error))
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled during retry"}
 		}
 	}
 
-	// 所有重试耗尽
+	// 非限流瞬态错误重试耗尽
 	return StageResult{
 		Role:   stage.Role,
 		Status: TaskFailed,
 		Error:  fmt.Sprintf("超过最大重试次数 (%d): %s", stageRetryMaxRetries, lastErr.Error),
 	}
+}
+
+// min 返回较小值
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // computeStageTimeout 根据角色和尝试次数计算动态超时。
@@ -2636,6 +2683,16 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 
 	// 产出验证: 防止 Agent "角色扮演空转"（仅声明就绪但无实际产出）
 	if reason := validateAgentOutput(result, role); reason != "" {
+		// V2 关键修复: 如果产出是 API 错误文本 (限流/超时/熔断), 将其转换为 API 错误,
+		// 使 executeStageWithRetry 能识别为瞬态错误并自动重试。
+		if reason == "__API_ERROR__" {
+			return StageResult{
+				Role: role, Status: TaskFailed,
+				Error:   fmt.Sprintf("API 错误 (限流/超时/熔断): %s", truncateResult(result, 200)),
+				Output:  result,
+				StartedAt: start, Duration: duration.Round(time.Second).String(),
+			}
+		}
 		we.notify(we.chatID, fmt.Sprintf("⚠️ Agent **%s** 产出不合格: %s — 标记为失败并重试", role, reason))
 		return StageResult{
 			Role: role, Status: TaskFailed,
@@ -2662,13 +2719,30 @@ func ValidateAgentOutput(output, role string) string {
 func validateAgentOutput(output, role string) string {
 	trimmed := strings.TrimSpace(output)
 
+	// V2 关键修复: 检测 API 错误文本 (限流/超时/熔断等导致的 withheld error 消息)。
+	// 这些文本不应被标记为"产出验证失败"(永久错误), 否则不会触发自动重试。
+	// 正确的行为是: 让 API 错误以 error 形式返回, 由 executeStageWithRetry 识别为瞬态错误并重试。
+	lower := strings.ToLower(trimmed)
+	apiErrorPatterns := []string{
+		"api error", "api 错误", "断路器触发", "circuit breaker",
+		"429", "rate limit", "rate_limit", "限流", "throttl",
+		"timeout", "deadline exceeded", "超时",
+		"overloaded", "过载", "503", "529",
+		"错误预算耗尽", "family exhausted",
+	}
+	for _, pat := range apiErrorPatterns {
+		if strings.Contains(lower, pat) {
+			// 返回特殊标记, 让调用方知道这是 API 错误而非产出问题
+			return "__API_ERROR__"
+		}
+	}
+
 	// 1. 基本长度检查 (有效产出通常 > 100 字符)
 	if len(trimmed) < 50 {
 		return "产出过短 (< 50 字符)，可能未实际执行任务"
 	}
 
 	// 2. 空转模式检测: 仅声明角色就绪、未提供实质内容
-	lower := strings.ToLower(trimmed)
 	idlePatterns := []string{
 		"i am ready", "i'm ready", "已就位", "已准备", "准备就绪",
 		"i understand my role", "i have been assigned",

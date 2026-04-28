@@ -1,0 +1,6 @@
+claude-go-bin
+/claude-go
+*.exe
+*.dll
+*.so
+*.dylib

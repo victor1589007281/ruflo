@@ -624,9 +624,14 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 
 	start := time.Now()
 	var sb strings.Builder
+	var hasApiError bool
 	for msg := range eng.SubmitMessage(ctx, userPrompt) {
 		if msg.Type != types.MessageTypeAssistant {
 			continue
+		}
+		// 检测是否包含 API 错误消息 (限流/超时等导致的 withheld error)
+		if msg.IsApiErrorMessage {
+			hasApiError = true
 		}
 		for _, b := range msg.Content {
 			if b.Type == types.ContentBlockText {
@@ -635,6 +640,18 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		}
 	}
 	result := sb.String()
+
+	// V2 关键修复: context 被取消且产出为空/过短时, 返回 API 错误而非空产出。
+	// 否则限流/超时导致的空产出会被 validateAgentOutput 标记为"产出验证失败"(永久错误),
+	// 不会触发自动重试, 导致团队持续失败。
+	if ctx.Err() != nil {
+		if hasApiError {
+			return result, fmt.Errorf("API 调用被中断 (限流/超时/熔断): %w", ctx.Err())
+		}
+		if len(result) < 100 {
+			return result, fmt.Errorf("context 取消且产出不完整 (%d 字符): %w", len(result), ctx.Err())
+		}
+	}
 
 	// Hook: Dreaming 记录 (覆盖 team agent 会话)
 	if r.sm.dreamer != nil && result != "" {

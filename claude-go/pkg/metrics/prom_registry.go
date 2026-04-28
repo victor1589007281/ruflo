@@ -614,7 +614,7 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 	case MLLMGuardPauseSec:
 		llmGuardPauseSec.With(prometheus.Labels{"module": module}).Set(value)
 	case MLLMCircuitOpenGauge:
-		llmCircuitOpenGauge.With(prometheus.Labels{"module": module}).Set(value)
+		llmCircuitOpenGauge.With(prometheus.Labels{"module": module, "blocked": ""}).Set(value)
 	case MLLMCircuitFailStreak:
 		llmCircuitFailStreak.With(prometheus.Labels{"module": module}).Set(value)
 
