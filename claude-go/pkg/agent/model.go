@@ -7,19 +7,23 @@ type PlanConfigKey struct{}
 
 // ResolvedPlanConfig 最终解析出的 plan 连接参数。
 type ResolvedPlanConfig struct {
-	Model          string
-	BaseURL        string
-	APIKey         string
-	FallbackModels []string
+	Model           string
+	BaseURL         string
+	APIKey          string
+	FallbackModels  []string
+	FallbackBaseURL string // 备用模型使用的 API 地址 (空则继承 BaseURL)
+	FallbackAPIKey  string // 备用模型使用的 API 密钥 (空则继承 APIKey)
 }
 
 // PlanModels 单个 plan 的模型配置，由 Caller 从 feishu.PlanModelConfig 转换后传入。
 type PlanModels struct {
-	Model          string
-	BaseURL        string
-	APIKey         string
-	FallbackModels []string
-	RoleModels     map[string]string
+	Model           string
+	BaseURL         string
+	APIKey          string
+	FallbackModels  []string
+	FallbackBaseURL string
+	FallbackAPIKey  string
+	RoleModels      map[string]string
 }
 
 // PlanConfigResolver 按 plan + role 层级解析最终 API 连接参数。
@@ -66,6 +70,12 @@ func NewPlanConfigResolver(
 		if len(v.FallbackModels) > 0 {
 			existing.FallbackModels = v.FallbackModels
 		}
+		if v.FallbackBaseURL != "" {
+			existing.FallbackBaseURL = v.FallbackBaseURL
+		}
+		if v.FallbackAPIKey != "" {
+			existing.FallbackAPIKey = v.FallbackAPIKey
+		}
 		if len(v.RoleModels) > 0 {
 			if existing.RoleModels == nil {
 				existing.RoleModels = make(map[string]string, len(v.RoleModels))
@@ -111,6 +121,12 @@ func (r *PlanConfigResolver) Resolve(plan, role string) ResolvedPlanConfig {
 		}
 		if len(p.FallbackModels) > 0 {
 			cfg.FallbackModels = p.FallbackModels
+		}
+		if p.FallbackBaseURL != "" {
+			cfg.FallbackBaseURL = p.FallbackBaseURL
+		}
+		if p.FallbackAPIKey != "" {
+			cfg.FallbackAPIKey = p.FallbackAPIKey
 		}
 
 		// Role 覆盖 (plan 内, 最高优先级)

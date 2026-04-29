@@ -328,12 +328,49 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 9. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
 	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)
 
+	// 9b. 创建 PlanConfigResolver (从配置 plans 解析各工作流的模型/API 参数)
+	var planCfgResolver *agent.PlanConfigResolver
+	if len(config.Plans) > 0 {
+		builtinDefaults := map[string]agent.PlanModels{
+			"research": {Model: "kimi-k2.5"},
+		}
+		globalRoleDefaults := map[string]string{
+			"planner": "kimi-k2.5",
+		}
+		planCfgs := make(map[string]agent.PlanModels, len(config.Plans))
+		for name, pc := range config.Plans {
+			pm := agent.PlanModels{
+				Model:           pc.Model,
+				BaseURL:         pc.BaseURL,
+				APIKey:          pc.APIKey,
+				FallbackModels:  pc.FallbackModels,
+				FallbackBaseURL: pc.FallbackBaseURL,
+				FallbackAPIKey:  pc.FallbackAPIKey,
+			}
+			if len(pc.RoleModels) > 0 {
+				pm.RoleModels = make(map[string]string, len(pc.RoleModels))
+				for r, m := range pc.RoleModels {
+					pm.RoleModels[r] = m
+				}
+			}
+			planCfgs[name] = pm
+		}
+		planCfgResolver = agent.NewPlanConfigResolver(
+			aiClient.BaseURL, aiClient.APIKey, aiClient.Model,
+			aiClient.FallbackModels,
+			planCfgs, builtinDefaults, globalRoleDefaults,
+		)
+		log.Printf("[Bot] PlanConfigResolver 已初始化: %d 个工作流 plan, defaultModel=%s, defaultBaseURL=%s", len(planCfgs), aiClient.Model, aiClient.BaseURL)
+	} else {
+		log.Printf("[Bot] PlanConfigResolver 跳过: config.Plans 为空")
+	}
+
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
-		BaseDir: layout.Teams,
-		Cwd:     config.Cwd,
-		Factory: bot.sessions.CreateAgentRunner,
-		Notify:  func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
+		BaseDir:            layout.Teams,
+		Cwd:                config.Cwd,
+		Factory:            bot.sessions.CreateAgentRunner,
+		Notify:             func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
 		MediaNotify: func(chatID string, data []byte, filename, mediaType string) error {
 			ctx := context.Background()
 			switch mediaType {
@@ -343,12 +380,13 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				return bot.sendFileMessage(ctx, chatID, data, filename, "stream")
 			}
 		},
-		TaskTracker: &dagTaskAdapter{store: bot.taskStore},
-		Pool:        agentPool,
-		LLM:         aiClient,
-		Evolution:   bot.evolution,
-		Dreamer:     &dreamAdapter{dreamer: bot.dreamer},
-		Roles:       roleReg,
+		TaskTracker:      &dagTaskAdapter{store: bot.taskStore},
+		Pool:             agentPool,
+		LLM:              aiClient,
+		Evolution:        bot.evolution,
+		Dreamer:          &dreamAdapter{dreamer: bot.dreamer},
+		Roles:            roleReg,
+		PlanConfigResolver: planCfgResolver,
 	})
 
 	// 10a. 修复: SetTeamManager 必须在 teamMgr 创建后调用 (之前因时序 bug 注入了 nil)

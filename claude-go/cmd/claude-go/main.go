@@ -1919,7 +1919,7 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 		if len(fallback) == 0 {
 			fallback = client.FallbackModels
 		}
-		client = client.ConfiguredClone(baseURL, apiKey, model, fallback)
+		client = client.ConfiguredCloneFull(baseURL, apiKey, model, fallback, r.planCfg.FallbackBaseURL, r.planCfg.FallbackAPIKey)
 	}
 	resp, err := client.SendMessage(ctx, msgs, sys, nil, 8192)
 	if err != nil {

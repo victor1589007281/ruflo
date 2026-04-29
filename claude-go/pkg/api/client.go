@@ -105,6 +105,11 @@ type Client struct {
 	// 触发条件: 模型不支持 (400 invalid model) / 超载 (529) / 配额耗尽 (402/403)。
 	FallbackModels []string
 
+	// FallbackBaseURL / FallbackAPIKey 备用模型独立端点配置。
+	// 若为空则继承主模型的 BaseURL / APIKey。
+	FallbackBaseURL string
+	FallbackAPIKey  string
+
 	// PromptCacheEnabled 启用 Anthropic prompt caching (顶层 cache_control)。
 	// "auto" = 自动检测 (默认，Anthropic 官方 API 启用，其他关闭)
 	// "on"   = 强制启用
@@ -162,6 +167,12 @@ func (c *Client) WithModel(model string) *Client {
 // 使用指定参数覆盖 baseURL / apiKey / model / fallbackModels。
 // 用于为不同 plan 使用完全不同的 API 端点而不影响原始 Client。
 func (c *Client) ConfiguredClone(baseURL, apiKey, model string, fallbackModels []string) *Client {
+	return c.ConfiguredCloneFull(baseURL, apiKey, model, fallbackModels, "", "")
+}
+
+// ConfiguredCloneFull 返回一个共享 HTTP 客户端和限流器的轻量 Client 副本，
+// 使用指定参数覆盖 baseURL / apiKey / model / fallbackModels / fallbackBaseURL / fallbackAPIKey。
+func (c *Client) ConfiguredCloneFull(baseURL, apiKey, model string, fallbackModels []string, fallbackBaseURL, fallbackAPIKey string) *Client {
 	clone := &Client{
 		BaseURL:              strings.TrimRight(baseURL, "/"),
 		APIKey:               apiKey,
@@ -182,6 +193,12 @@ func (c *Client) ConfiguredClone(baseURL, apiKey, model string, fallbackModels [
 		clone.FallbackModels = fallbackModels
 	} else {
 		clone.FallbackModels = c.FallbackModels
+	}
+	if fallbackBaseURL != "" {
+		clone.FallbackBaseURL = strings.TrimRight(fallbackBaseURL, "/")
+	}
+	if fallbackAPIKey != "" {
+		clone.FallbackAPIKey = fallbackAPIKey
 	}
 	return clone
 }
@@ -708,6 +725,13 @@ func (c *Client) StreamMessage(
 					c.fireEvent("retry", fmt.Sprintf("Stream 切换备用模型 %s", fbModel))
 					req.Model = fbModel
 					body, _ = json.Marshal(req)
+					// 若配置了独立的 fallback 端点, 切换 baseURL/apiKey
+					if c.FallbackBaseURL != "" {
+						c.BaseURL = c.FallbackBaseURL
+					}
+					if c.FallbackAPIKey != "" {
+						c.APIKey = c.FallbackAPIKey
+					}
 					// 用备用模型再走一轮完整重试
 					goto streamRetryLoop
 				}
@@ -1063,6 +1087,15 @@ func (c *Client) SendMessage(
 
 	// 主模型全部重试失败 — 尝试 FallbackModels
 	if len(c.FallbackModels) > 0 && isFallbackEligible(lastStatus, lastErr) {
+		// 若配置了独立的 fallback 端点, 计算一次
+		fbBaseURL := c.BaseURL
+		fbAPIKey := c.APIKey
+		if c.FallbackBaseURL != "" {
+			fbBaseURL = c.FallbackBaseURL
+		}
+		if c.FallbackAPIKey != "" {
+			fbAPIKey = c.FallbackAPIKey
+		}
 		for fi, fbModel := range c.FallbackModels {
 			if fbModel == c.Model || fbModel == "" {
 				continue
@@ -1076,14 +1109,14 @@ func (c *Client) SendMessage(
 			if err != nil {
 				continue
 			}
-			httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(fbBody))
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", fbBaseURL+"/messages", bytes.NewReader(fbBody))
 			if err != nil {
 				continue
 			}
 			httpReq.Header.Set("Content-Type", "application/json")
-			httpReq.Header.Set("x-api-key", c.APIKey)
+			httpReq.Header.Set("x-api-key", fbAPIKey)
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
-			httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+			httpReq.Header.Set("Authorization", "Bearer "+fbAPIKey)
 			resp, err := c.Client.Do(httpReq)
 			if err != nil {
 				continue
@@ -1108,6 +1141,7 @@ func (c *Client) SendMessage(
 					StopReason:   result.StopReason,
 					GuardWaitSec: guardWaitSec,
 					Model:        fbModel,
+					BaseURL:      fbBaseURL,
 				}
 				if result.Usage != nil {
 					rec.InputTokens = result.Usage.InputTokens

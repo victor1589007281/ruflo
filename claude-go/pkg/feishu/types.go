@@ -134,6 +134,9 @@ type BotConfig struct {
 
 	// EnableFrontierOptimizations QueryEngine 前沿优化特性开关 (默认 true)
 	EnableFrontierOptimizations bool
+
+	// Plans 按工作流名称覆盖模型配置 (供 Agent Teams 使用)
+	Plans map[string]PlanModelConfig
 }
 
 // BrowserConfig 浏览器抓取配置。
@@ -379,6 +382,8 @@ type PlanModelConfig struct {
 	BaseURL        string            `json:"baseUrl,omitempty"`        // 该 plan 使用的 API 地址 (可选, 默认用 ai.baseUrl)
 	APIKey         string            `json:"apiKey,omitempty"`         // 该 plan 使用的 API 密钥 (可选, 默认用 ai.apiKey)
 	FallbackModels []string          `json:"fallbackModels,omitempty"` // 该 plan 的备用模型 (可选, 默认用 ai.fallbackModels)
+	FallbackBaseURL string           `json:"fallbackBaseUrl,omitempty"` // 备用模型使用的 API 地址 (可选, 默认用 plan.baseUrl / ai.baseUrl)
+	FallbackAPIKey  string           `json:"fallbackApiKey,omitempty"`  // 备用模型使用的 API 密钥 (可选, 默认用 plan.apiKey / ai.apiKey)
 	RoleModels     map[string]string `json:"roles,omitempty"`          // 按 role 覆盖模型, key=role name
 }
 
@@ -510,6 +515,12 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		}
 		if jc.AI.PromptCacheMode != "" && bc.PromptCacheMode == "" {
 			bc.PromptCacheMode = jc.AI.PromptCacheMode
+		}
+		if len(jc.AI.Plans) > 0 {
+			bc.Plans = make(map[string]PlanModelConfig, len(jc.AI.Plans))
+			for name, pc := range jc.AI.Plans {
+				bc.Plans[name] = pc
+			}
 		}
 	}
 

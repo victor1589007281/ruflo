@@ -563,6 +563,25 @@ type sessionAgentRunner struct {
 // Execute 执行 agent 任务 (创建独立 QueryEngine, 复用主会话运行模式)。
 // 集成: Role Skills + Evolution 经验 + Dreaming 记录 (通过 Hook 注入)。
 func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
+	// 从 context 读取 PlanConfigKey: workflow 层面按 plan+role 解析的模型/API 参数
+	apiClient := r.sm.apiClient
+	modelOverride := r.sm.config.Model
+	if resolved, ok := ctx.Value(agent.PlanConfigKey{}).(agent.ResolvedPlanConfig); ok && resolved.Model != "" {
+		if resolved.BaseURL != "" && resolved.APIKey != "" {
+			apiClient = r.sm.apiClient.ConfiguredCloneFull(
+				resolved.BaseURL, resolved.APIKey, resolved.Model, resolved.FallbackModels,
+				resolved.FallbackBaseURL, resolved.FallbackAPIKey,
+			)
+		} else if resolved.Model != r.sm.config.Model {
+			// baseURL/apiKey 不变, 只换模型
+			apiClient = r.sm.apiClient.ConfiguredCloneFull(
+				r.sm.apiClient.BaseURL, r.sm.apiClient.APIKey, resolved.Model, resolved.FallbackModels,
+				resolved.FallbackBaseURL, resolved.FallbackAPIKey,
+			)
+		}
+		modelOverride = resolved.Model
+	}
+
 	nestedReg := tool.NewRegistry()
 	builtin.RegisterBaseToolsWithStore(nestedReg, r.sm.taskStore, r.sm.searcher)
 	if r.sm.mcpMgr != nil {
@@ -581,9 +600,9 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	permMode := types.PermissionMode(r.sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)
 	hookRunner := hooks.NewRunner(r.sm.hookConfigs, "")
-	compactor := compact.NewCompactor(r.sm.apiClient, 200000)
+	compactor := compact.NewCompactor(apiClient, 200000)
 	promptMgr := prompt.NewManager(r.sm.config.Cwd)
-	promptMgr.Model = r.sm.config.Model
+	promptMgr.Model = modelOverride
 	if r.sm.skillReg != nil && r.sm.skillReg.Count() > 0 {
 		promptMgr.SkillListing = r.sm.skillReg.FormatListing()
 	}
@@ -610,7 +629,7 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	}
 
 	cfg := &engine.Config{
-		Model:            r.sm.config.Model,
+		Model:            modelOverride,
 		MaxTokens:        r.sm.config.MaxTokens,
 		MaxTurns:         r.sm.config.MaxTurns,
 		Cwd:              r.sm.config.Cwd,
@@ -619,7 +638,7 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		Debug:            r.sm.config.Debug,
 	}
 
-	eng := engine.NewQueryEngine(cfg, r.sm.apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
+	eng := engine.NewQueryEngine(cfg, apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = r.sm.memoryStore
 
 	start := time.Now()

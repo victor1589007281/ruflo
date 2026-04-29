@@ -2513,7 +2513,7 @@ func (we *WorkflowExecutor) computeStageTimeout(role string, attempt int) time.D
 	switch role {
 	case "coder":
 		// Coder 生成复杂代码需要更长时间 (特别是 C++/MySQL 项目)
-		base = 15 * time.Minute
+		base = 25 * time.Minute
 	case "architect", "planner":
 		// 设计和规划阶段通常需要更多思考时间
 		base = 12 * time.Minute

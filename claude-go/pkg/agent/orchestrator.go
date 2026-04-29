@@ -911,8 +911,13 @@ func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
 	o.mu.Unlock()
 
 	// 重置僵尸 in_progress 任务为 pending
-	for _, id := range inProgressIDs {
-		_ = o.dag.SetTaskStatus(id, "pending")
+	if len(inProgressIDs) > 0 {
+		logging.Event(context.Background(), "orchestrator.restore.inprogress", "count", len(inProgressIDs), "team", team.Name)
+		for _, id := range inProgressIDs {
+			if err := o.dag.SetTaskStatus(id, "pending"); err != nil {
+				logging.Event(context.Background(), "orchestrator.restore.error", "task", id, "error", err.Error())
+			}
+		}
 	}
 
 	return restored
@@ -921,9 +926,10 @@ func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
 func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective string, team *ProductionTeam) int {
 	o.mu.Lock()
 	doneIDs := make(map[string]bool)
-	for id := range o.nodes {
+	for id, node := range o.nodes {
 		if o.checkpoints != nil {
-			if cp := o.checkpoints.GetCheckpoint(id); cp != nil && cp.Status == "completed" {
+			// 修复: checkpoint key 是 node.Title (而非 V2TaskID)
+			if cp := o.checkpoints.GetCheckpoint(node.Title); cp != nil && cp.Status == "completed" {
 				doneIDs[id] = true
 			}
 		}
@@ -936,17 +942,12 @@ func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective strin
 		if doneIDs[id] {
 			continue
 		}
-		status := ""
-		if tasks := o.dag.ReadyTasks(); len(tasks) > 0 {
-			// ReadyTasks 只返回 pending, 这里需要直接检查
-		}
 		// 通过 node.Error 判断是否瞬态失败
 		if node.Error != "" && isTransientError(node.Error) {
 			transientFailedIDs = append(transientFailedIDs, id)
 		} else if !doneIDs[id] {
 			stuckIDs = append(stuckIDs, id)
 		}
-		_ = status
 	}
 	o.mu.Unlock()
 
@@ -1101,18 +1102,18 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		runner, err := o.factory(ctx, node.Role, "")
 		if err != nil {
 			return o.handleTaskFailure(ctx, node, objective, team,
-				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+				StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 					StartedAt: start, Duration: time.Since(start).String()})
 		}
 		result, err := runner.Execute(ctx, prompt)
 		if err != nil {
 			return o.handleTaskFailure(ctx, node, objective, team,
-				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+				StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 					StartedAt: start, Duration: time.Since(start).String()})
 		}
 		if reason := validateAgentOutput(result, node.Role); reason != "" {
 			return o.handleTaskFailure(ctx, node, objective, team,
-				StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed,
+				StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed,
 					Error: "产出验证失败: " + reason, Output: result,
 					StartedAt: start, Duration: time.Since(start).String()})
 		}
@@ -1349,8 +1350,9 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 	o.mu.Unlock()
 
 	// 检查点: task 完成后持久化 (断点续作)
+	// 修复: 使用 node.Title (stage name) 作为 key, 与 WorkflowExecutor.restoreCheckpoints 保持一致
 	if o.checkpoints != nil {
-		o.checkpoints.SaveCheckpoint(node.V2TaskID, "completed", 0, lastOutput)
+		o.checkpoints.SaveCheckpoint(node.Title, "completed", 0, lastOutput)
 	}
 
 	passLabel := "⚠️未达标"
@@ -1364,11 +1366,11 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s) %s", node.Title, duration.Round(time.Second), passLabel))
 
 	if team.Blackboard != nil {
-		team.Blackboard.Write(node.V2TaskID+"-result", lastOutput, node.Role, "result")
+		team.Blackboard.Write(node.Title+"-result", lastOutput, node.Role, "result")
 	}
 
 	return StageResult{
-		Name: node.V2TaskID, Role: node.Role, Status: TaskCompleted,
+		Name: node.Title, Role: node.Role, Status: TaskCompleted,
 		Output: lastOutput, StartedAt: start, Duration: duration.Round(time.Second).String(),
 	}
 }
@@ -1379,18 +1381,18 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 	runner, err := o.factory(ctx, node.Role, "")
 	if err != nil {
 		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+			StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 				StartedAt: start, Duration: time.Since(start).String()})
 	}
 	result, err := runner.Execute(ctx, prompt)
 	if err != nil {
 		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed, Error: err.Error(),
+			StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 				StartedAt: start, Duration: time.Since(start).String()})
 	}
 	if reason := validateAgentOutput(result, node.Role); reason != "" {
 		return o.handleTaskFailure(ctx, node, objective, team,
-			StageResult{Name: node.V2TaskID, Role: node.Role, Status: TaskFailed,
+			StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed,
 				Error: "产出验证失败: " + reason, Output: result,
 				StartedAt: start, Duration: time.Since(start).String()})
 	}
@@ -1404,17 +1406,18 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 	o.completedCount++
 	o.mu.Unlock()
 
+	// 修复: 使用 node.Title (stage name) 作为 key, 与 WorkflowExecutor.restoreCheckpoints 保持一致
 	if o.checkpoints != nil {
-		o.checkpoints.SaveCheckpoint(node.V2TaskID, "completed", 0, result)
+		o.checkpoints.SaveCheckpoint(node.Title, "completed", 0, result)
 	}
 
 	o.notify(o.chatID, fmt.Sprintf("✅ %s 完成 (%s)", node.Title, duration.Round(time.Second)))
 
 	if team.Blackboard != nil {
-		team.Blackboard.Write(node.V2TaskID+"-result", result, node.Role, "result")
+		team.Blackboard.Write(node.Title+"-result", result, node.Role, "result")
 	}
 	return StageResult{
-		Name: node.V2TaskID, Role: node.Role, Status: TaskCompleted,
+		Name: node.Title, Role: node.Role, Status: TaskCompleted,
 		Output: result, StartedAt: start, Duration: duration.Round(time.Second).String(),
 	}
 }
