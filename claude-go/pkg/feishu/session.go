@@ -327,15 +327,33 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		permChecker = permissions.NewChecker(permMode)
 	}
 
+	// 从 context 读取 PlanConfigKey, 使嵌套 agent 继承外层 agent 的 plan 配置
+	nestedAPIClient := sm.apiClient
+	nestedModel := sm.config.Model
+	if resolved, ok := ctx.Value(agent.PlanConfigKey{}).(agent.ResolvedPlanConfig); ok && resolved.Model != "" {
+		if resolved.BaseURL != "" && resolved.APIKey != "" {
+			nestedAPIClient = sm.apiClient.ConfiguredCloneFull(
+				resolved.BaseURL, resolved.APIKey, resolved.Model, resolved.FallbackModels,
+				resolved.FallbackBaseURL, resolved.FallbackAPIKey,
+			)
+		} else if resolved.Model != sm.config.Model {
+			nestedAPIClient = sm.apiClient.ConfiguredCloneFull(
+				sm.apiClient.BaseURL, sm.apiClient.APIKey, resolved.Model, resolved.FallbackModels,
+				resolved.FallbackBaseURL, resolved.FallbackAPIKey,
+			)
+		}
+		nestedModel = resolved.Model
+	}
+
 	hookRunner := hooks.NewRunner(sm.hookConfigs, "")
-	compactor := compact.NewCompactor(sm.apiClient, 200000)
+	compactor := compact.NewCompactor(nestedAPIClient, 200000)
 	promptMgr := prompt.NewManager(sm.config.Cwd)
-	promptMgr.Model = sm.config.Model
+	promptMgr.Model = nestedModel
 	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
 		promptMgr.SkillListing = sm.skillReg.FormatListing()
 	}
 
-	model := sm.config.Model
+	model := nestedModel
 	if opts.Model != "" {
 		model = opts.Model
 	}
@@ -350,7 +368,7 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		Debug:            sm.config.Debug,
 	}
 
-	nested := engine.NewQueryEngine(cfg, sm.apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
+	nested := engine.NewQueryEngine(cfg, nestedAPIClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
 
 	var sb strings.Builder
 	for msg := range nested.SubmitMessage(ctx, agentPrompt) {
@@ -567,18 +585,20 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	apiClient := r.sm.apiClient
 	modelOverride := r.sm.config.Model
 	if resolved, ok := ctx.Value(agent.PlanConfigKey{}).(agent.ResolvedPlanConfig); ok && resolved.Model != "" {
-		if resolved.BaseURL != "" && resolved.APIKey != "" {
-			apiClient = r.sm.apiClient.ConfiguredCloneFull(
-				resolved.BaseURL, resolved.APIKey, resolved.Model, resolved.FallbackModels,
-				resolved.FallbackBaseURL, resolved.FallbackAPIKey,
-			)
-		} else if resolved.Model != r.sm.config.Model {
-			// baseURL/apiKey 不变, 只换模型
-			apiClient = r.sm.apiClient.ConfiguredCloneFull(
-				r.sm.apiClient.BaseURL, r.sm.apiClient.APIKey, resolved.Model, resolved.FallbackModels,
-				resolved.FallbackBaseURL, resolved.FallbackAPIKey,
-			)
+		// 只要存在 plan 配置就克隆 client, 确保 FallbackModels/FallbackBaseURL/FallbackAPIKey
+		// 即使主模型与默认相同也能被正确传递。
+		baseURL := resolved.BaseURL
+		if baseURL == "" {
+			baseURL = r.sm.apiClient.BaseURL
 		}
+		apiKey := resolved.APIKey
+		if apiKey == "" {
+			apiKey = r.sm.apiClient.APIKey
+		}
+		apiClient = r.sm.apiClient.ConfiguredCloneFull(
+			baseURL, apiKey, resolved.Model, resolved.FallbackModels,
+			resolved.FallbackBaseURL, resolved.FallbackAPIKey,
+		)
 		modelOverride = resolved.Model
 	}
 

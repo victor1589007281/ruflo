@@ -588,6 +588,8 @@ func (c *Client) StreamMessage(
 		}
 
 		var resp *http.Response
+		effectiveBaseURL := c.BaseURL
+		effectiveAPIKey := c.APIKey
 	streamRetryLoop:
 		for attempt := 0; attempt <= maxRetry; attempt++ {
 			if ctx.Err() != nil {
@@ -595,16 +597,16 @@ func (c *Client) StreamMessage(
 				return
 			}
 
-			httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(body))
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", effectiveBaseURL+"/messages", bytes.NewReader(body))
 			if err != nil {
 				errCh <- fmt.Errorf("创建请求失败: %w", err)
 				return
 			}
 
 			httpReq.Header.Set("Content-Type", "application/json")
-			httpReq.Header.Set("x-api-key", c.APIKey)
+			httpReq.Header.Set("x-api-key", effectiveAPIKey)
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
-			httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+			httpReq.Header.Set("Authorization", "Bearer "+effectiveAPIKey)
 
 			resp, err = c.Client.Do(httpReq)
 			if err != nil {
@@ -725,12 +727,12 @@ func (c *Client) StreamMessage(
 					c.fireEvent("retry", fmt.Sprintf("Stream 切换备用模型 %s", fbModel))
 					req.Model = fbModel
 					body, _ = json.Marshal(req)
-					// 若配置了独立的 fallback 端点, 切换 baseURL/apiKey
+					// 若配置了独立的 fallback 端点, 切换局部 baseURL/apiKey (不污染 client 实例)
 					if c.FallbackBaseURL != "" {
-						c.BaseURL = c.FallbackBaseURL
+						effectiveBaseURL = c.FallbackBaseURL
 					}
 					if c.FallbackAPIKey != "" {
-						c.APIKey = c.FallbackAPIKey
+						effectiveAPIKey = c.FallbackAPIKey
 					}
 					// 用备用模型再走一轮完整重试
 					goto streamRetryLoop

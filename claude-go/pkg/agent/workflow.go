@@ -1016,9 +1016,19 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 			orchParallel = suggested
 		}
 	}
+	// 包装 factory: 注入 PlanConfigKey, 使 Orchestrator 阶段也能按 plan+role 解析模型/API 配置
+	planFactory := we.factory
+	if we.planCfgResolver != nil {
+		planFactory = func(pCtx context.Context, role, systemPrompt string) (AgentRunner, error) {
+			resolved := we.planCfgResolver.Resolve(team.Workflow, role)
+			pCtx = context.WithValue(pCtx, PlanConfigKey{}, resolved)
+			return we.factory(pCtx, role, systemPrompt)
+		}
+	}
+
 	orch := NewOrchestrator(
 		OrchestratorConfig{MaxParallel: orchParallel, MaxRetries: 2, MicroTestAfter: true, AdversarialRound: 5},
-		we.dagTracker, we.factory, we.notify, we.pool, we.chatID,
+		we.dagTracker, planFactory, we.notify, we.pool, we.chatID,
 	)
 
 	if we.activityCallback != nil {
