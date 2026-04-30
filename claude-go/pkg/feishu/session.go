@@ -583,7 +583,11 @@ func extractTopics(text string) []string {
 // 创建一个独立的 QueryEngine 作为后台 Agent 执行器。
 // 实现 agent.CreateAgentFunc 签名, 由 ProductionTeamManager 调用。
 func (sm *SessionManager) CreateAgentRunner(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
-	return &sessionAgentRunner{sm: sm, role: role, systemPrompt: systemPrompt}, nil
+	r := &sessionAgentRunner{sm: sm, role: role, systemPrompt: systemPrompt}
+	if mcfg, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok && mcfg.ProviderName != "" {
+		r.resolvedCfg = mcfg
+	}
+	return r, nil
 }
 
 // sessionAgentRunner 基于 SessionManager 的 Agent 执行器
@@ -591,18 +595,26 @@ type sessionAgentRunner struct {
 	sm           *SessionManager
 	role         string
 	systemPrompt string
+	resolvedCfg  modelconfig.ResolvedConfig // 从创建时 context 捕获的 plan/role 模型配置
 }
 
 // Execute 执行 agent 任务 (创建独立 QueryEngine, 复用主会话运行模式)。
 // 集成: Role Skills + Evolution 经验 + Dreaming 记录 (通过 Hook 注入)。
 func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
-	// 从 context 读取 ModelConfigKey: workflow 层面按 plan+role 解析的模型/API 参数
+	// 优先使用创建时捕获的 plan/role 模型配置 (Orchestrator 阶段 Execute ctx 与创建 ctx 不同)
 	apiClient := r.sm.apiClient
 	modelOverride := r.sm.apiClient.Model
 	maxTokens := r.sm.defaultResolved.MaxTokens
 	maxTurns := r.sm.defaultResolved.MaxTurns
 	promptCacheMode := r.sm.config.PromptCacheMode
-	if mcfg, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok && mcfg.ProviderName != "" {
+	mcfg := r.resolvedCfg
+	if mcfg.ProviderName == "" {
+		// 回退: 尝试从执行时 context 读取 (非 Orchestrator 路径)
+		if mcfg2, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok && mcfg2.ProviderName != "" {
+			mcfg = mcfg2
+		}
+	}
+	if mcfg.ProviderName != "" {
 		apiClient = r.sm.apiClient.ConfiguredCloneFull(
 			mcfg.BaseURL, mcfg.APIKey, mcfg.ProviderName, mcfg.FallbackModels,
 			mcfg.FallbackBaseURL, mcfg.FallbackAPIKey,
@@ -633,6 +645,9 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 
 	var runAgentFn agent.RunAgentFunc
 	runAgentFn = func(aCtx context.Context, prompt string, opts agent.RunOptions) (string, error) {
+		if r.resolvedCfg.ProviderName != "" {
+			aCtx = context.WithValue(aCtx, agent.ModelConfigKey{}, r.resolvedCfg)
+		}
 		return r.sm.runNestedAgent(aCtx, runAgentFn, prompt, opts)
 	}
 	nestedReg.Register(agent.NewAgentTool(runAgentFn))

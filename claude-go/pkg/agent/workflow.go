@@ -1053,7 +1053,7 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 		we.flushStagesLive(team, combined)
 	})
 
-	nodes, err := orch.ParsePlanToDAGWithRepair(ctx, planOutput, team.Name, we.factory)
+	nodes, err := orch.ParsePlanToDAGWithRepair(ctx, planOutput, team.Name, planFactory)
 	if err != nil || len(nodes) == 0 {
 		return nil, fmt.Errorf("WBS 解析失败或无任务: %v", err)
 	}
