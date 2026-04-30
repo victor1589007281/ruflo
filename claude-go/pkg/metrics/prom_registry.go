@@ -161,7 +161,7 @@ func defaultLLMBuckets() []float64 {
 func initPrometheusMetrics() {
 	promReg = prometheus.NewRegistry()
 
-	llmLabels := []string{"model", "status", "source", "purpose", "stop_reason", "error_kind", "http_status", "stream"}
+	llmLabels := []string{"model", "model_alias", "status", "source", "purpose", "stop_reason", "error_kind", "http_status", "stream"}
 	teamLabels := []string{"team", "stage", "role", "workflow"}
 	dreamLabels := []string{"trigger_source", "consolidator_result"}
 	memLabels := []string{"memory_type"}
@@ -558,7 +558,7 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 		return pl
 	}
 
-	llmNeed := []string{"model", "status", "source", "purpose", "stop_reason", "error_kind", "http_status", "stream"}
+	llmNeed := []string{"model", "model_alias", "status", "source", "purpose", "stop_reason", "error_kind", "http_status", "stream"}
 	teamNeed := []string{"team", "stage", "role", "workflow"}
 	dreamNeed := []string{"trigger_source", "consolidator_result"}
 	memNeed := []string{"memory_type"}

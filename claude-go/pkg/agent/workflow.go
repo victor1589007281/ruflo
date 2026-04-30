@@ -1016,12 +1016,11 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 			orchParallel = suggested
 		}
 	}
-	// 包装 factory: 注入 PlanConfigKey, 使 Orchestrator 阶段也能按 plan+role 解析模型/API 配置
+	// 包装 factory: 注入 ModelConfigKey, 使 Orchestrator 阶段也能按 plan+role 解析模型/API 配置
 	planFactory := we.factory
 	if we.planCfgResolver != nil {
 		planFactory = func(pCtx context.Context, role, systemPrompt string) (AgentRunner, error) {
-			resolved := we.planCfgResolver.Resolve(team.Workflow, role)
-			pCtx = context.WithValue(pCtx, PlanConfigKey{}, resolved)
+			pCtx = context.WithValue(pCtx, ModelConfigKey{}, we.planCfgResolver.Resolve(team.Workflow, role))
 			return we.factory(pCtx, role, systemPrompt)
 		}
 	}
@@ -2661,8 +2660,7 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 
 	// 模型层级解析: role > plan > 全局默认
 	if we.planCfgResolver != nil {
-		resolved := we.planCfgResolver.Resolve(team.Workflow, role)
-		stageCtx = context.WithValue(stageCtx, PlanConfigKey{}, resolved)
+		stageCtx = context.WithValue(stageCtx, ModelConfigKey{}, we.planCfgResolver.Resolve(team.Workflow, role))
 	}
 
 	runner, err := we.factory(stageCtx, role, "")

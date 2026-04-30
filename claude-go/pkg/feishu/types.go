@@ -33,6 +33,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 )
 
 // BotConfig 飞书机器人配置
@@ -50,23 +52,8 @@ type BotConfig struct {
 	// 默认为 "feishu"
 	Domain string
 
-	// Model AI 模型名称
-	Model string
-
-	// APIKey AI API Key
-	APIKey string
-
-	// BaseURL AI API Base URL
-	BaseURL string
-
 	// Cwd 工作目录 (工具执行的根目录)
 	Cwd string
-
-	// MaxTokens 最大输出 token 数
-	MaxTokens int
-
-	// MaxTurns queryLoop 最大迭代次数
-	MaxTurns int
 
 	// SystemPrompt 自定义系统提示词
 	SystemPrompt string
@@ -120,8 +107,11 @@ type BotConfig struct {
 	// 默认为 Cwd/.claude-go。若为空且 Cwd 也为空，程序拒绝启动。
 	StateDir string
 
-	// FallbackModels 备用模型列表: 主模型不可用时按序尝试
-	FallbackModels []string
+	// ModelAlias 全局默认模型别名 (格式: "provider:modelName")
+	ModelAlias string
+
+	// FallbackAliases 全局默认备用模型别名列表
+	FallbackAliases []string
 
 	// Wiki LLM Wiki 知识库配置
 	Wiki WikiConfig
@@ -137,6 +127,9 @@ type BotConfig struct {
 
 	// Plans 按工作流名称覆盖模型配置 (供 Agent Teams 使用)
 	Plans map[string]PlanModelConfig
+
+	// Providers 厂商配置 (新模式): 每个 provider 包含 baseURL/apiKey + 模型列表。
+	Providers ProvidersSection
 }
 
 // BrowserConfig 浏览器抓取配置。
@@ -170,16 +163,14 @@ type WikiConfig struct {
 // DefaultBotConfig 返回默认配置
 func DefaultBotConfig() *BotConfig {
 	return &BotConfig{
-		Domain:                        "feishu",
-		Model:                         "qwen3.5-plus",
-		MaxTokens:                     16384,
-		SessionTimeout:                30 * time.Minute,
-		MaxSessions:                   100,
-		PermissionMode:                "bypass",
-		MentionOnly:                   true,
-		WelcomeMessage:                "你好！我是 Claude Code (Go) 机器人。发送消息与我对话，我可以帮你编程、分析代码、执行命令等。",
-		ThinkingMessage:               "正在思考中...",
-		EnableFrontierOptimizations:   true,
+		Domain:                      "feishu",
+		SessionTimeout:              30 * time.Minute,
+		MaxSessions:                 100,
+		PermissionMode:              "bypass",
+		MentionOnly:                 true,
+		WelcomeMessage:              "你好！我是 Claude Code (Go) 机器人。发送消息与我对话，我可以帮你编程、分析代码、执行命令等。",
+		ThinkingMessage:             "正在思考中...",
+		EnableFrontierOptimizations: true,
 		Wiki: WikiConfig{
 			Enabled:       true,
 			AutoIngestURL: true,
@@ -312,6 +303,9 @@ type JSONConfig struct {
 
 	// Engine QueryEngine 前沿优化特性配置
 	Engine *EngineSection `json:"engine,omitempty"`
+
+	// Providers 厂商配置 (新模式)
+	Providers ProvidersSection `json:"providers,omitempty"`
 }
 
 // DashboardSection Dashboard 配置段
@@ -376,28 +370,42 @@ type FeishuSection struct {
 	ThinkingMessage string `json:"thinkingMessage,omitempty"`
 }
 
-// PlanModelConfig 单个 Plan (工作流) 的模型配置。
-type PlanModelConfig struct {
-	Model          string            `json:"model,omitempty"`          // 该 plan 使用的模型
-	BaseURL        string            `json:"baseUrl,omitempty"`        // 该 plan 使用的 API 地址 (可选, 默认用 ai.baseUrl)
-	APIKey         string            `json:"apiKey,omitempty"`         // 该 plan 使用的 API 密钥 (可选, 默认用 ai.apiKey)
-	FallbackModels []string          `json:"fallbackModels,omitempty"` // 该 plan 的备用模型 (可选, 默认用 ai.fallbackModels)
-	FallbackBaseURL string           `json:"fallbackBaseUrl,omitempty"` // 备用模型使用的 API 地址 (可选, 默认用 plan.baseUrl / ai.baseUrl)
-	FallbackAPIKey  string           `json:"fallbackApiKey,omitempty"`  // 备用模型使用的 API 密钥 (可选, 默认用 plan.apiKey / ai.apiKey)
-	RoleModels     map[string]string `json:"roles,omitempty"`          // 按 role 覆盖模型, key=role name
+// ProviderModelConfig 单个模型在 provider 中的配置。
+// 注意: 别名本身编码了 provider 和实际模型名 (格式 "provider:modelName")，
+// 因此 ProviderModelConfig 不再包含 Alias 和 ProviderName 字段。
+type ProviderModelConfig struct {
+	MaxTokens       int    `json:"maxTokens,omitempty"`
+	MaxTurns        int    `json:"maxTurns,omitempty"`
+	PromptCacheMode string `json:"promptCacheMode,omitempty"`
+	ContextWindow   int    `json:"contextWindow,omitempty"`
 }
 
-// AISection AI 模型配置段
+// ProviderConfig 单个厂商的 API 连接参数。
+type ProviderConfig struct {
+	Name    string                       `json:"name"`
+	BaseURL string                       `json:"baseUrl"`
+	APIKey  string                       `json:"apiKey"`
+	Models  map[string]ProviderModelConfig `json:"models"` // key=alias
+}
+
+// PlanModelConfig 单个 Plan (工作流) 的模型配置。
+// 只配置别名，URL/KEY 通过别名自动解析。
+type PlanModelConfig struct {
+	ModelAlias      string            `json:"modelAlias,omitempty"`      // 该 plan 使用的模型别名
+	FallbackAliases []string          `json:"fallbackAliases,omitempty"` // 该 plan 的备用模型别名
+	RoleAliases     map[string]string `json:"roleAliases,omitempty"`     // 按 role 覆盖别名
+}
+
+// AISection AI 模型配置段 (只保留别名模式)。
 type AISection struct {
-	Model            string                     `json:"model,omitempty"`
-	APIKey           string                     `json:"apiKey,omitempty"`
-	BaseURL          string                     `json:"baseUrl,omitempty"`
-	MaxTokens        int                        `json:"maxTokens,omitempty"`
-	MaxTurns         int                        `json:"maxTurns,omitempty"`
-	FallbackModels   []string                   `json:"fallbackModels,omitempty"`   // 备用模型顺序: 主模型不可用时按序尝试
+	ModelAlias       string                     `json:"modelAlias,omitempty"`       // 全局默认模型别名
+	FallbackAliases  []string                   `json:"fallbackAliases,omitempty"`  // 全局默认备用模型别名
 	PromptCacheMode  string                     `json:"promptCacheMode,omitempty"`  // "auto"(默认)/"on"/"off"
 	Plans            map[string]PlanModelConfig `json:"plans,omitempty"`            // 按 plan 名称覆盖模型配置
 }
+
+// ProvidersSection providers 配置段 (新模式)。
+type ProvidersSection map[string]ProviderConfig
 
 // MCPServerEntry MCP 服务器条目
 type MCPServerEntry struct {
@@ -457,6 +465,51 @@ func LoadJSONConfig(path string) (*JSONConfig, error) {
 	return &cfg, nil
 }
 
+// ToModelConfigJSON 将 JSONConfig 转换为 modelconfig.ConfigJSON。
+func (jc *JSONConfig) ToModelConfigJSON() modelconfig.ConfigJSON {
+	var out modelconfig.ConfigJSON
+	if len(jc.Providers) > 0 {
+		out.Providers = make(map[string]modelconfig.ProviderConfig, len(jc.Providers))
+		for name, p := range jc.Providers {
+			models := make(map[string]modelconfig.ModelConfig, len(p.Models))
+			for alias, mc := range p.Models {
+				models[alias] = modelconfig.ModelConfig{
+					MaxTokens:       mc.MaxTokens,
+					MaxTurns:        mc.MaxTurns,
+					PromptCacheMode: mc.PromptCacheMode,
+					ContextWindow:   mc.ContextWindow,
+				}
+			}
+			out.Providers[name] = modelconfig.ProviderConfig{
+				Name:    p.Name,
+				BaseURL: p.BaseURL,
+				APIKey:  p.APIKey,
+				Models:  models,
+			}
+		}
+	}
+	if jc.AI != nil {
+		out.AI.GlobalConfig = modelconfig.GlobalConfig{
+			DefaultModelAlias:      jc.AI.ModelAlias,
+			DefaultFallbackAliases: jc.AI.FallbackAliases,
+			DefaultPromptCacheMode: jc.AI.PromptCacheMode,
+		}
+		out.AI.Plans = make(map[string]modelconfig.PlanConfig, len(jc.AI.Plans))
+		for planName, pc := range jc.AI.Plans {
+			plan := modelconfig.PlanConfig{
+				ModelAlias:      pc.ModelAlias,
+				FallbackAliases: pc.FallbackAliases,
+			}
+			plan.Roles = make(map[string]modelconfig.RoleConfig, len(pc.RoleAliases))
+			for role, alias := range pc.RoleAliases {
+				plan.Roles[role] = modelconfig.RoleConfig{ModelAlias: alias}
+			}
+			out.AI.Plans[planName] = plan
+		}
+	}
+	return out
+}
+
 // ApplyToBot 将 JSON 配置应用到 BotConfig (合并, 不覆盖已有非零值)
 func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 	if jc == nil {
@@ -493,34 +546,29 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 	}
 
 	if jc.AI != nil {
-		if bc.Model == "" || bc.Model == "qwen3.5-plus" {
-			if jc.AI.Model != "" {
-				bc.Model = jc.AI.Model
+		if bc.ModelAlias == "" {
+			if jc.AI.ModelAlias != "" {
+				bc.ModelAlias = jc.AI.ModelAlias
 			}
-		}
-		if bc.APIKey == "" {
-			bc.APIKey = jc.AI.APIKey
-		}
-		if bc.BaseURL == "" {
-			bc.BaseURL = jc.AI.BaseURL
-		}
-		if jc.AI.MaxTokens > 0 && bc.MaxTokens == 16384 {
-			bc.MaxTokens = jc.AI.MaxTokens
-		}
-		if jc.AI.MaxTurns > 0 && bc.MaxTurns == 0 {
-			bc.MaxTurns = jc.AI.MaxTurns
-		}
-		if len(jc.AI.FallbackModels) > 0 && len(bc.FallbackModels) == 0 {
-			bc.FallbackModels = jc.AI.FallbackModels
 		}
 		if jc.AI.PromptCacheMode != "" && bc.PromptCacheMode == "" {
 			bc.PromptCacheMode = jc.AI.PromptCacheMode
+		}
+		if len(jc.AI.FallbackAliases) > 0 && len(bc.FallbackAliases) == 0 {
+			bc.FallbackAliases = jc.AI.FallbackAliases
 		}
 		if len(jc.AI.Plans) > 0 {
 			bc.Plans = make(map[string]PlanModelConfig, len(jc.AI.Plans))
 			for name, pc := range jc.AI.Plans {
 				bc.Plans[name] = pc
 			}
+		}
+	}
+
+	if len(jc.Providers) > 0 {
+		bc.Providers = make(map[string]ProviderConfig, len(jc.Providers))
+		for name, p := range jc.Providers {
+			bc.Providers[name] = p
 		}
 	}
 

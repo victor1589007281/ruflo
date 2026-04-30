@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/dreaming"
@@ -119,6 +120,7 @@ type SessionManager struct {
 	mediaSendFn    MediaSendFunc                // 飞书发送图片/文件的回调
 	teamMgr        *agent.ProductionTeamManager // 团队管理器 (供 TeamQuery 工具使用)
 	searcher       builtin.WebSearcher          // Web 搜索适配器 (浏览器)
+	defaultResolved modelconfig.ResolvedConfig   // 默认模型解析配置 (从 alias 解析)
 }
 
 // NewSessionManager 创建会话管理器。
@@ -153,6 +155,11 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 	go sm.cleanupLoop()
 
 	return sm
+}
+
+// SetDefaultModelConfig 注入默认模型解析配置。
+func (sm *SessionManager) SetDefaultModelConfig(cfg modelconfig.ResolvedConfig) {
+	sm.defaultResolved = cfg
 }
 
 // SetMediaSendFn 注入飞书媒体发送回调。在 Bot 初始化完成后调用。
@@ -249,7 +256,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	if sm.config.SystemPrompt != "" {
 		promptMgr.CustomPrompt = sm.config.SystemPrompt
 	}
-	promptMgr.Model = sm.config.Model
+	promptMgr.Model = sm.apiClient.Model
 	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
 		promptMgr.SkillListing = sm.skillReg.FormatListing()
 	}
@@ -260,9 +267,9 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	}
 
 	cfg := &engine.Config{
-		Model:            sm.config.Model,
-		MaxTokens:        sm.config.MaxTokens,
-		MaxTurns:         sm.config.MaxTurns,
+		Model:            sm.apiClient.Model,
+		MaxTokens:        sm.defaultResolved.MaxTokens,
+		MaxTurns:         sm.defaultResolved.MaxTurns,
 		Cwd:              sm.config.Cwd,
 		PermissionMode:   permMode,
 		IsNonInteractive: true, // 飞书模式始终为非交互式
@@ -327,22 +334,30 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		permChecker = permissions.NewChecker(permMode)
 	}
 
-	// 从 context 读取 PlanConfigKey, 使嵌套 agent 继承外层 agent 的 plan 配置
+	// 从 context 读取 ModelConfigKey, 使嵌套 agent 继承外层 agent 的 plan 配置
 	nestedAPIClient := sm.apiClient
-	nestedModel := sm.config.Model
-	if resolved, ok := ctx.Value(agent.PlanConfigKey{}).(agent.ResolvedPlanConfig); ok && resolved.Model != "" {
-		if resolved.BaseURL != "" && resolved.APIKey != "" {
-			nestedAPIClient = sm.apiClient.ConfiguredCloneFull(
-				resolved.BaseURL, resolved.APIKey, resolved.Model, resolved.FallbackModels,
-				resolved.FallbackBaseURL, resolved.FallbackAPIKey,
-			)
-		} else if resolved.Model != sm.config.Model {
-			nestedAPIClient = sm.apiClient.ConfiguredCloneFull(
-				sm.apiClient.BaseURL, sm.apiClient.APIKey, resolved.Model, resolved.FallbackModels,
-				resolved.FallbackBaseURL, resolved.FallbackAPIKey,
-			)
+	nestedModel := sm.apiClient.Model
+	maxTokens := sm.defaultResolved.MaxTokens
+	maxTurns := sm.defaultResolved.MaxTurns
+	promptCacheMode := sm.config.PromptCacheMode
+	if mcfg, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok && mcfg.ProviderName != "" {
+		nestedAPIClient = sm.apiClient.ConfiguredCloneFull(
+			mcfg.BaseURL, mcfg.APIKey, mcfg.ProviderName, mcfg.FallbackModels,
+			mcfg.FallbackBaseURL, mcfg.FallbackAPIKey,
+		)
+		nestedModel = mcfg.ProviderName
+		if mcfg.MaxTokens > 0 {
+			maxTokens = mcfg.MaxTokens
 		}
-		nestedModel = resolved.Model
+		if mcfg.MaxTurns > 0 {
+			maxTurns = mcfg.MaxTurns
+		}
+		if mcfg.PromptCacheMode != "" {
+			promptCacheMode = mcfg.PromptCacheMode
+		}
+	}
+	if promptCacheMode != "" {
+		nestedAPIClient.PromptCacheMode = promptCacheMode
 	}
 
 	hookRunner := hooks.NewRunner(sm.hookConfigs, "")
@@ -360,8 +375,8 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 
 	cfg := &engine.Config{
 		Model:            model,
-		MaxTokens:        sm.config.MaxTokens,
-		MaxTurns:         sm.config.MaxTurns,
+		MaxTokens:        maxTokens,
+		MaxTurns:         maxTurns,
 		Cwd:              sm.config.Cwd,
 		PermissionMode:   permMode,
 		IsNonInteractive: true,
@@ -581,25 +596,30 @@ type sessionAgentRunner struct {
 // Execute 执行 agent 任务 (创建独立 QueryEngine, 复用主会话运行模式)。
 // 集成: Role Skills + Evolution 经验 + Dreaming 记录 (通过 Hook 注入)。
 func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
-	// 从 context 读取 PlanConfigKey: workflow 层面按 plan+role 解析的模型/API 参数
+	// 从 context 读取 ModelConfigKey: workflow 层面按 plan+role 解析的模型/API 参数
 	apiClient := r.sm.apiClient
-	modelOverride := r.sm.config.Model
-	if resolved, ok := ctx.Value(agent.PlanConfigKey{}).(agent.ResolvedPlanConfig); ok && resolved.Model != "" {
-		// 只要存在 plan 配置就克隆 client, 确保 FallbackModels/FallbackBaseURL/FallbackAPIKey
-		// 即使主模型与默认相同也能被正确传递。
-		baseURL := resolved.BaseURL
-		if baseURL == "" {
-			baseURL = r.sm.apiClient.BaseURL
-		}
-		apiKey := resolved.APIKey
-		if apiKey == "" {
-			apiKey = r.sm.apiClient.APIKey
-		}
+	modelOverride := r.sm.apiClient.Model
+	maxTokens := r.sm.defaultResolved.MaxTokens
+	maxTurns := r.sm.defaultResolved.MaxTurns
+	promptCacheMode := r.sm.config.PromptCacheMode
+	if mcfg, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok && mcfg.ProviderName != "" {
 		apiClient = r.sm.apiClient.ConfiguredCloneFull(
-			baseURL, apiKey, resolved.Model, resolved.FallbackModels,
-			resolved.FallbackBaseURL, resolved.FallbackAPIKey,
+			mcfg.BaseURL, mcfg.APIKey, mcfg.ProviderName, mcfg.FallbackModels,
+			mcfg.FallbackBaseURL, mcfg.FallbackAPIKey,
 		)
-		modelOverride = resolved.Model
+		modelOverride = mcfg.ProviderName
+		if mcfg.MaxTokens > 0 {
+			maxTokens = mcfg.MaxTokens
+		}
+		if mcfg.MaxTurns > 0 {
+			maxTurns = mcfg.MaxTurns
+		}
+		if mcfg.PromptCacheMode != "" {
+			promptCacheMode = mcfg.PromptCacheMode
+		}
+	}
+	if promptCacheMode != "" {
+		apiClient.PromptCacheMode = promptCacheMode
 	}
 
 	nestedReg := tool.NewRegistry()
@@ -650,8 +670,8 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 
 	cfg := &engine.Config{
 		Model:            modelOverride,
-		MaxTokens:        r.sm.config.MaxTokens,
-		MaxTurns:         r.sm.config.MaxTurns,
+		MaxTokens:        maxTokens,
+		MaxTurns:         maxTurns,
 		Cwd:              r.sm.config.Cwd,
 		PermissionMode:   permMode,
 		IsNonInteractive: true,

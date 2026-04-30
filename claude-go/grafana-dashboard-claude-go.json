@@ -39,6 +39,26 @@
           "hide": 0
         },
         {
+          "name": "model_alias",
+          "type": "query",
+          "label": "Model Alias",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "query": "label_values(claude_go_llm_call_count, model_alias)",
+          "refresh": 1,
+          "multi": true,
+          "includeAll": true,
+          "current": {
+            "selected": true,
+            "text": "All",
+            "value": "$__all"
+          },
+          "sort": 1,
+          "hide": 0
+        },
+        {
           "name": "team",
           "type": "query",
           "label": "Team",
@@ -681,31 +701,43 @@
       {
         "id": 14,
         "type": "timeseries",
-        "title": "LLM 延迟分布 (P50/P95/P99)",
+        "title": "LLM 延迟分布 (按别名 P50/P95 + 全局)",
         "targets": [
           {
-            "expr": "histogram_quantile(0.5, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_llm_call_bucket[5m])) by (le, model_alias))",
             "refId": "A",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P50 {{model_alias}}"
           },
           {
-            "expr": "histogram_quantile(0.95, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_llm_call_bucket[5m])) by (le, model_alias))",
             "refId": "B",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P95 {{model_alias}}"
           },
           {
-            "expr": "histogram_quantile(0.99, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "expr": "histogram_quantile(0.5, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
             "refId": "C",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "全局 P50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "refId": "D",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            },
+            "legendFormat": "全局 P95"
           }
         ],
         "gridPos": {
@@ -737,31 +769,34 @@
       {
         "id": 15,
         "type": "timeseries",
-        "title": "Token 消耗 (按模型)",
+        "title": "Token 消耗 (按别名)",
         "targets": [
           {
-            "expr": "sum by (model) (rate(claude_go_llm_input_tokens_sum[5m]))",
+            "expr": "sum by (model_alias) (rate(claude_go_llm_input_tokens_sum[5m]))",
             "refId": "A",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "输入 {{model_alias}}"
           },
           {
-            "expr": "sum by (model) (rate(claude_go_llm_output_tokens_sum[5m]))",
+            "expr": "sum by (model_alias) (rate(claude_go_llm_output_tokens_sum[5m]))",
             "refId": "B",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "输出 {{model_alias}}"
           },
           {
-            "expr": "sum by (model) (rate(claude_go_llm_total_tokens_sum[5m]))",
+            "expr": "sum(rate(claude_go_llm_total_tokens_sum[5m]))",
             "refId": "C",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "全局汇总"
           }
         ],
         "gridPos": {
@@ -772,14 +807,44 @@
         },
         "fieldConfig": {
           "defaults": {
-            "unit": "short"
+            "unit": "short",
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "linear",
+              "barAlignment": 0,
+              "lineWidth": 1,
+              "fillOpacity": 30,
+              "gradientMode": "none",
+              "spanNulls": false,
+              "showPoints": "auto",
+              "pointSize": 4,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto",
+              "axisLabel": "",
+              "axisColorMode": "text",
+              "scaleDistribution": {
+                "type": "linear"
+              },
+              "hideFrom": {
+                "tooltip": false,
+                "viz": false,
+                "legend": false
+              },
+              "thresholdsStyle": {
+                "mode": "off"
+              }
+            }
           },
           "overrides": []
         },
         "options": {
           "legend": {
             "displayMode": "list",
-            "placement": "bottom"
+            "placement": "bottom",
+            "calcs": []
           },
           "tooltip": {
             "mode": "single"
@@ -793,47 +858,43 @@
       {
         "id": 16,
         "type": "timeseries",
-        "title": "错误 & 限流趋势",
+        "title": "错误 & 限流趋势 (按别名)",
         "targets": [
           {
-            "expr": "sum(rate(claude_go_llm_error[5m]))",
+            "expr": "sum by (model_alias) (rate(claude_go_llm_error[5m]))",
             "refId": "A",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "错误 {{model_alias}}"
           },
           {
-            "expr": "sum(rate(claude_go_llm_rate_limit[5m]))",
+            "expr": "sum by (model_alias) (rate(claude_go_llm_rate_limit[5m]))",
             "refId": "B",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "限流 {{model_alias}}"
           },
           {
-            "expr": "sum(rate(claude_go_llm_timeout[5m]))",
+            "expr": "sum by (model_alias) (rate(claude_go_llm_timeout[5m]))",
             "refId": "C",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "超时 {{model_alias}}"
           },
           {
-            "expr": "sum(rate(claude_go_llm_retry[5m]))",
+            "expr": "sum(rate(claude_go_llm_error[5m]))",
             "refId": "D",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
-          },
-          {
-            "expr": "sum(rate(claude_go_llm_overload[5m]))",
-            "refId": "E",
-            "datasource": {
-              "type": "prometheus",
-              "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "全局错误"
           }
         ],
         "gridPos": {
@@ -5660,6 +5721,86 @@
           },
           "tooltip": {
             "mode": "single"
+          }
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        }
+      },
+      {
+        "id": 117,
+        "type": "timeseries",
+        "title": "LLM 调用量 (按别名)",
+        "targets": [
+          {
+            "expr": "sum by (model_alias) (rate(claude_go_llm_call_count[5m]))",
+            "refId": "A",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            },
+            "legendFormat": "调用 {{model_alias}}"
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_call_count[5m]))",
+            "refId": "B",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "PBFA97CFB590B2093"
+            },
+            "legendFormat": "全局汇总"
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 16,
+          "y": 9
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "cps",
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "linear",
+              "barAlignment": 0,
+              "lineWidth": 1,
+              "fillOpacity": 20,
+              "gradientMode": "none",
+              "spanNulls": false,
+              "showPoints": "auto",
+              "pointSize": 4,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto",
+              "axisLabel": "",
+              "axisColorMode": "text",
+              "scaleDistribution": {
+                "type": "linear"
+              },
+              "hideFrom": {
+                "tooltip": false,
+                "viz": false,
+                "legend": false
+              },
+              "thresholdsStyle": {
+                "mode": "off"
+              }
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi"
           }
         },
         "datasource": {

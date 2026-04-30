@@ -24,6 +24,7 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/browser"
@@ -32,6 +33,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/mcp"
+	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
@@ -203,9 +205,12 @@ type Bot struct {
 	layout     *basedir.Layout              // 统一目录布局
 	wikiEngine  *wiki.Engine                 // LLM Wiki 知识库引擎
 	swarmEngine *swarm_intel.Engine           // 群体智能预测引擎
-	visionCli   *vision.Client               // 视觉能力客户端
-	skillAuto  *skills.AutoCreator          // 技能自动创建器
-	startTime  time.Time                    // 启动时间
+	visionCli      *vision.Client               // 视觉能力客户端
+	skillAuto      *skills.AutoCreator          // 技能自动创建器
+	aliasMetrics   *modelconfig.AliasMetricsCollector // 别名级 LLM 指标采集器
+	modelRegistry  *modelconfig.ProviderRegistry      // 模型注册表 (新模式)
+	modelResolver  *modelconfig.ConfigResolver        // 模型配置解析器 (新模式)
+	startTime      time.Time                    // 启动时间
 
 	// 消息去重: 防止同一条消息触发多个团队
 	processedMsgs sync.Map // messageID → timestamp
@@ -234,8 +239,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	if config.AppID == "" || config.AppSecret == "" {
 		return nil, fmt.Errorf("飞书 AppID 和 AppSecret 不能为空")
 	}
-	if config.APIKey == "" {
-		return nil, fmt.Errorf("AI API Key 不能为空")
+	if config.ModelAlias == "" {
+		return nil, fmt.Errorf("AI ModelAlias 不能为空")
 	}
 
 	// 确定飞书 API 域名
@@ -252,21 +257,38 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		lark.WithOpenBaseUrl(domain),
 	)
 
-	// 创建 AI API 客户端
-	var aiClient *api.Client
-	if config.BaseURL != "" {
-		aiClient = api.NewClient(config.BaseURL, config.APIKey, config.Model)
-	} else {
-		aiClient = api.NewDashScopeClient(config.APIKey, config.Model)
+	// 1. 先创建模型配置注册表和解析器 (唯一配置路径)
+	registry, resolver, err := modelconfig.LoadFromConfig(buildModelConfigJSON(config))
+	if err != nil {
+		return nil, fmt.Errorf("加载 providers 配置失败: %w", err)
 	}
-	// 打上业务标签: 飞书 bot 发起的 LLM 调用在 dashboard 中可按 source=feishu 聚合
+	if errs := modelconfig.Validate(registry, resolver); len(errs) > 0 {
+		for _, e := range errs {
+			log.Printf("[Bot] 配置验证警告: %s", e)
+		}
+	}
+
+	// 2. 解析默认模型别名，获取完整的 API 连接参数
+	defaultResolved := resolver.Resolve("", "")
+	if defaultResolved.BaseURL == "" || defaultResolved.APIKey == "" || defaultResolved.ProviderName == "" {
+		return nil, fmt.Errorf("无法解析默认模型别名 %q: 请检查 providers 配置", config.ModelAlias)
+	}
+
+	// 3. 创建 AI API 客户端 (从解析后的配置)
+	aiClient := api.NewClient(defaultResolved.BaseURL, defaultResolved.APIKey, defaultResolved.ProviderName)
 	aiClient.Tag = "feishu"
-	if len(config.FallbackModels) > 0 {
-		aiClient.FallbackModels = config.FallbackModels
-		log.Printf("[Bot] 已配置 %d 个备用模型: %v", len(config.FallbackModels), config.FallbackModels)
+	if len(defaultResolved.FallbackModels) > 0 {
+		aiClient.FallbackModels = defaultResolved.FallbackModels
+		log.Printf("[Bot] 已配置 %d 个备用模型: %v", len(defaultResolved.FallbackModels), defaultResolved.FallbackModels)
 	}
-	if config.PromptCacheMode != "" {
-		aiClient.PromptCacheMode = config.PromptCacheMode
+	if defaultResolved.FallbackBaseURL != "" {
+		aiClient.FallbackBaseURL = defaultResolved.FallbackBaseURL
+	}
+	if defaultResolved.FallbackAPIKey != "" {
+		aiClient.FallbackAPIKey = defaultResolved.FallbackAPIKey
+	}
+	if defaultResolved.PromptCacheMode != "" {
+		aiClient.PromptCacheMode = defaultResolved.PromptCacheMode
 	}
 
 	// 初始化统一目录布局
@@ -328,42 +350,28 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 9. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
 	agentPool := agent.NewAgentPool(bot.sessions.CreateAgentRunner, 8)
 
-	// 9b. 创建 PlanConfigResolver (从配置 plans 解析各工作流的模型/API 参数)
-	var planCfgResolver *agent.PlanConfigResolver
-	if len(config.Plans) > 0 {
-		builtinDefaults := map[string]agent.PlanModels{
-			"research": {Model: "kimi-k2.5"},
+	// 9b. 创建 PlanConfigResolver (modelconfig 的唯一包装)
+	planCfgResolver := agent.NewPlanConfigResolver(resolver)
+	log.Printf("[Bot] ProviderRegistry 已初始化: %d providers, %d aliases", len(registry.AllAliases()), len(registry.AllAliases()))
+
+	// 注入默认解析配置到 SessionManager (用于 createSession 的 maxTokens/maxTurns)
+	bot.sessions.SetDefaultModelConfig(defaultResolved)
+
+	// 设置全局 alias 解析器，让 recordLLMCall 能自动把 model 名解析为完整 alias
+	metrics.SetAliasResolver(registry.LookupAliasByModelName)
+
+	// 初始化别名级 Metrics 采集器 (按 alias 聚合 token/耗时/错误)
+	aliasMetrics := modelconfig.NewAliasMetricsCollector(registry, layout.Root)
+	oldHook := aiClient.OnLLMMetrics
+	aiClient.OnLLMMetrics = func(rec api.LLMCallRecord) {
+		if oldHook != nil {
+			oldHook(rec)
 		}
-		globalRoleDefaults := map[string]string{
-			"planner": "kimi-k2.5",
-		}
-		planCfgs := make(map[string]agent.PlanModels, len(config.Plans))
-		for name, pc := range config.Plans {
-			pm := agent.PlanModels{
-				Model:           pc.Model,
-				BaseURL:         pc.BaseURL,
-				APIKey:          pc.APIKey,
-				FallbackModels:  pc.FallbackModels,
-				FallbackBaseURL: pc.FallbackBaseURL,
-				FallbackAPIKey:  pc.FallbackAPIKey,
-			}
-			if len(pc.RoleModels) > 0 {
-				pm.RoleModels = make(map[string]string, len(pc.RoleModels))
-				for r, m := range pc.RoleModels {
-					pm.RoleModels[r] = m
-				}
-			}
-			planCfgs[name] = pm
-		}
-		planCfgResolver = agent.NewPlanConfigResolver(
-			aiClient.BaseURL, aiClient.APIKey, aiClient.Model,
-			aiClient.FallbackModels,
-			planCfgs, builtinDefaults, globalRoleDefaults,
-		)
-		log.Printf("[Bot] PlanConfigResolver 已初始化: %d 个工作流 plan, defaultModel=%s, defaultBaseURL=%s", len(planCfgs), aiClient.Model, aiClient.BaseURL)
-	} else {
-		log.Printf("[Bot] PlanConfigResolver 跳过: config.Plans 为空")
+		aliasMetrics.Record(rec)
 	}
+	bot.aliasMetrics = aliasMetrics
+	bot.modelRegistry = registry
+	bot.modelResolver = resolver
 
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
@@ -528,7 +536,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	}
 
 	// 15. 初始化技能自动创建器 (Hermes-agent 特性吸收)
-	bot.skillAuto = skills.NewAutoCreator(layout.Skills, aiClient, config.Model, bot.skillReg)
+	bot.skillAuto = skills.NewAutoCreator(layout.Skills, aiClient, aiClient.Model, bot.skillReg)
 
 	// 16. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {
@@ -693,7 +701,7 @@ func (b *Bot) reloadConfig(path string) {
 // 主线程阻塞直到 context 取消或连接断开。
 func (b *Bot) Start(ctx context.Context) error {
 	log.Printf("[飞书Bot] 启动中... AppID=%s, Domain=%s, Model=%s",
-		b.config.AppID, b.config.Domain, b.config.Model)
+		b.config.AppID, b.config.Domain, b.apiClient.Model)
 	log.Printf("[飞书Bot] 工作目录: %s", b.config.Cwd)
 	log.Printf("[飞书Bot] 会话超时: %v, 最大会话数: %d",
 		b.config.SessionTimeout, b.config.MaxSessions)
@@ -1835,7 +1843,7 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- Evolution: %s\n"+
 			"- Cron: %s\n"+
 			"- 工作目录: %s",
-			uptime, total, active, b.config.Model, mcpInfo, skillInfo, dreamInfo, evoInfo, cronInfo, b.config.Cwd)
+			uptime, total, active, b.apiClient.Model, mcpInfo, skillInfo, dreamInfo, evoInfo, cronInfo, b.config.Cwd)
 		b.sendTextReply(ctx, messageID, status)
 		return true
 
@@ -3195,4 +3203,47 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// buildModelConfigJSON 将 BotConfig 转换为 modelconfig.ConfigJSON。
+func buildModelConfigJSON(cfg *BotConfig) modelconfig.ConfigJSON {
+	var out modelconfig.ConfigJSON
+	out.Providers = make(map[string]modelconfig.ProviderConfig, len(cfg.Providers))
+	for name, p := range cfg.Providers {
+		models := make(map[string]modelconfig.ModelConfig, len(p.Models))
+		for alias, mc := range p.Models {
+			models[alias] = modelconfig.ModelConfig{
+				MaxTokens:       mc.MaxTokens,
+				MaxTurns:        mc.MaxTurns,
+				PromptCacheMode: mc.PromptCacheMode,
+				ContextWindow:   mc.ContextWindow,
+			}
+		}
+		out.Providers[name] = modelconfig.ProviderConfig{
+			Name:    p.Name,
+			BaseURL: p.BaseURL,
+			APIKey:  p.APIKey,
+			Models:  models,
+		}
+	}
+
+	out.AI.GlobalConfig = modelconfig.GlobalConfig{
+		DefaultModelAlias:      cfg.ModelAlias,
+		DefaultFallbackAliases: cfg.FallbackAliases,
+		DefaultPromptCacheMode: cfg.PromptCacheMode,
+	}
+	out.AI.Plans = make(map[string]modelconfig.PlanConfig, len(cfg.Plans))
+	for planName, pc := range cfg.Plans {
+		plan := modelconfig.PlanConfig{
+			ModelAlias:      pc.ModelAlias,
+			FallbackAliases: pc.FallbackAliases,
+		}
+		plan.Roles = make(map[string]modelconfig.RoleConfig, len(pc.RoleAliases))
+		for role, alias := range pc.RoleAliases {
+			plan.Roles[role] = modelconfig.RoleConfig{ModelAlias: alias}
+		}
+		out.AI.Plans[planName] = plan
+	}
+
+	return out
 }

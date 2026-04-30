@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/backup"
 	"github.com/anthropic/claude-go/pkg/basedir"
@@ -394,8 +395,8 @@ func runCmd() *cobra.Command {
 				siEngine := swarmintel.NewEngine(eng.APIClient, siCfg)
 
 				agentFactory := func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
-						planCfg, _ := ctx.Value(agent.PlanConfigKey{}).(agent.ResolvedPlanConfig)
-						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt, planCfg: planCfg}, nil
+						mcfg, _ := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig)
+						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt, modelCfg: mcfg}, nil
 					}
 				agentPool := agent.NewAgentPool(agentFactory, 8)
 
@@ -434,39 +435,13 @@ func runCmd() *cobra.Command {
 				})
 
 				// 加载模型配置并创建解析器 (层级: role > plan > 全局默认)
-					projSettings := settings.LoadProjectSettings(cwd)
-					planCfgs := make(map[string]agent.PlanModels)
-					if projSettings.AI != nil && len(projSettings.AI.Plans) > 0 {
-						for name, pc := range projSettings.AI.Plans {
-							pm := agent.PlanModels{
-								Model:          pc.Model,
-								BaseURL:        pc.BaseURL,
-								APIKey:         pc.APIKey,
-								FallbackModels: pc.FallbackModels,
-							}
-							if len(pc.RoleModels) > 0 {
-								pm.RoleModels = make(map[string]string, len(pc.RoleModels))
-								for r, m := range pc.RoleModels {
-									pm.RoleModels[r] = m
-								}
-							}
-							planCfgs[name] = pm
+					var modelResolver *agent.PlanConfigResolver
+					if jsonCfg, err := feishu.LoadJSONConfig(filepath.Join(cwd, "claude-go.json")); err == nil && jsonCfg != nil {
+						if registry, resolver, err := modelconfig.LoadFromConfig(jsonCfg.ToModelConfigJSON()); err == nil && resolver != nil {
+							modelResolver = agent.NewPlanConfigResolver(resolver)
+							_ = registry
 						}
 					}
-					// 内置默认: research plan 默认使用 kimi-2.5
-					builtinDefaults := map[string]agent.PlanModels{
-						"research": {Model: "kimi-2.5"},
-					}
-					// 全局 role 默认: planner 在任何 plan 中都默认 kimi-2.5
-					globalRoleDefaults := map[string]string{
-						"planner": "kimi-2.5",
-					}
-					modelResolver := agent.NewPlanConfigResolver(
-						eng.APIClient.BaseURL, eng.APIClient.APIKey, eng.APIClient.Model,
-						eng.APIClient.FallbackModels,
-						planCfgs, builtinDefaults, globalRoleDefaults,
-					)
-
 					teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
 						BaseDir:           filepath.Join(cwd, ".claude-go", "teams"),
 						Cwd:               cwd,
@@ -629,12 +604,48 @@ JSON 配置文件示例:
 				return fmt.Errorf("需要飞书应用凭证: 使用 --app-id/--app-secret 或 --config 或设置 FEISHU_APP_ID/FEISHU_APP_SECRET")
 			}
 
+
 			apiKey := getAPIKey()
-			if apiKey != "" {
-				config.APIKey = apiKey
-			}
-			if config.APIKey == "" {
-				return fmt.Errorf("需要 AI API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数或 --config 中的 ai.apiKey")
+			baseURL := flagBaseURL
+			modelAlias := flagModel
+
+			// 如果 JSON 配置中已有 providers，优先使用
+			// 否则从 CLI 参数/环境变量构建合成 provider
+			if len(config.Providers) == 0 {
+				if apiKey == "" {
+					return fmt.Errorf("需要 AI API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数，或在配置文件中设置 providers")
+				}
+				if baseURL == "" {
+					baseURL = "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1"
+				}
+				// 推断 provider 名称
+				providerName := "compatible"
+				lb := strings.ToLower(baseURL)
+				switch {
+				case strings.Contains(lb, "dashscope") || strings.Contains(lb, "aliyuncs.com"):
+					providerName = "dashscope"
+				case strings.Contains(lb, "anthropic.com"):
+					providerName = "anthropic"
+				case strings.Contains(lb, "openai.com"):
+					providerName = "openai"
+				}
+				// 构建合成 provider
+				config.Providers = map[string]feishu.ProviderConfig{
+					providerName: {
+						Name:    providerName,
+						BaseURL: baseURL,
+						APIKey:  apiKey,
+						Models: map[string]feishu.ProviderModelConfig{
+							providerName + ":" + modelAlias: {},
+						},
+					},
+				}
+				config.ModelAlias = providerName + ":" + modelAlias
+			} else {
+				// 有 providers 配置时，若 CLI 指定了 model，覆盖 ModelAlias
+				if cmd.Flags().Changed("model") {
+					config.ModelAlias = flagModel
+				}
 			}
 
 			if cwd == "" {
@@ -645,18 +656,6 @@ JSON 配置文件示例:
 			}
 
 			// CLI 参数覆盖
-			if cmd.Flags().Changed("model") {
-				config.Model = flagModel
-			}
-			if cmd.Flags().Changed("base-url") {
-				config.BaseURL = flagBaseURL
-			}
-			if cmd.Flags().Changed("max-tokens") {
-				config.MaxTokens = flagMaxTokens
-			}
-			if cmd.Flags().Changed("max-turns") {
-				config.MaxTurns = flagMaxTurns
-			}
 			if cmd.Flags().Changed("system-prompt") {
 				config.SystemPrompt = flagSystemPrompt
 			}
@@ -700,18 +699,6 @@ JSON 配置文件示例:
 				}
 				dashCfgRef = &dashCfg
 
-				// 将 bot 的 AI 客户端注入 dashboard, 确保诊断功能使用
-				// 与 bot 完全相同的模型配置 (model/apiKey/baseUrl)。
-				var dashLLMClient *api.Client
-				if config.BaseURL != "" {
-					dashLLMClient = api.NewClient(config.BaseURL, config.APIKey, config.Model)
-				} else {
-					dashLLMClient = api.NewDashScopeClient(config.APIKey, config.Model)
-				}
-				dashLLMClient.Tag = "dashboard"
-				dashLLMClient.FallbackModels = config.FallbackModels
-				dashboard.SetSharedLLMClient(dashLLMClient)
-
 				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 					func(mux *http.ServeMux) {
 						dashboard.MountOn(*dashCfgRef, mux)
@@ -719,11 +706,10 @@ JSON 配置文件示例:
 							config.Wiki.APIPort, stateDir)
 					})
 			}
-
 			bot, err := feishu.NewBot(config)
-			if err != nil {
-				return fmt.Errorf("创建飞书机器人失败: %w", err)
-			}
+				if err != nil {
+					return fmt.Errorf("创建飞书机器人失败: %w", err)
+				}
 			botRef = bot
 			_ = dashCfgRef // suppress unused warning when Wiki.APIPort == 0
 
@@ -745,7 +731,7 @@ JSON 配置文件示例:
 			fmt.Println("========================================")
 			fmt.Printf("  App ID:    %s\n", config.AppID)
 			fmt.Printf("  Domain:    %s\n", config.Domain)
-			fmt.Printf("  Model:     %s\n", config.Model)
+			fmt.Printf("  Model:     %s\n", config.ModelAlias)
 			fmt.Printf("  Cwd:       %s\n", config.Cwd)
 			fmt.Printf("  Sessions:  max=%d, timeout=%dm\n", config.MaxSessions, int(config.SessionTimeout.Minutes()))
 			fmt.Printf("  @Only:     %v\n", config.MentionOnly)
@@ -1547,6 +1533,11 @@ func runDashboardForeground(addr string, port int, stateDir string, noOpen bool,
 	}
 	jsonCfg := info.JSONCfg
 
+	// 让 dashboard 内部 LLM 解析器能找到配置文件
+	if configPath != "" {
+		_ = os.Setenv("CLAUDE_GO_CONFIG", configPath)
+	}
+
 	// addr/port/noOpen: CLI > JSON.dashboard
 	if jsonCfg != nil && jsonCfg.Dashboard != nil {
 		if addr == "" && jsonCfg.Dashboard.Addr != "" {
@@ -1576,23 +1567,6 @@ func runDashboardForeground(addr string, port int, stateDir string, noOpen bool,
 	// {stateDir}/metrics/llm.jsonl, dashboard 展示统一的 LLM token/质量视图。
 	metrics.InitGlobalLLMCollector(resolved)
 
-	// 如果配置文件提供了 AI 配置，注入 LLM Client 给 dashboard 诊断使用
-	if jsonCfg != nil && jsonCfg.AI != nil && jsonCfg.AI.APIKey != "" {
-		var dashClient *api.Client
-		if jsonCfg.AI.BaseURL != "" {
-			dashClient = api.NewClient(jsonCfg.AI.BaseURL, jsonCfg.AI.APIKey, jsonCfg.AI.Model)
-		} else {
-			dashClient = api.NewDashScopeClient(jsonCfg.AI.APIKey, jsonCfg.AI.Model)
-		}
-		dashClient.Tag = "dashboard"
-		dashClient.FallbackModels = jsonCfg.AI.FallbackModels
-		if jsonCfg.AI.PromptCacheMode != "" {
-			dashClient.PromptCacheMode = jsonCfg.AI.PromptCacheMode
-		}
-		dashClient.Guard = api.NewRateLimitGuard(api.DefaultGuardConfig())
-		dashboard.SetSharedLLMClient(dashClient)
-		fmt.Printf("[Dashboard] LLM 已配置: model=%s\n", jsonCfg.AI.Model)
-	}
 
 	srv := dashboard.NewServer(dashboard.Config{
 		StateDir:  resolved,
@@ -1894,7 +1868,7 @@ type cliAgentRunner struct {
 	eng          *engine.QueryEngine
 	role         string
 	systemPrompt string
-	planCfg      agent.ResolvedPlanConfig // 为空则使用 eng.APIClient 默认
+	modelCfg     modelconfig.ResolvedConfig // 为空则使用 eng.APIClient 默认
 }
 
 func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
@@ -1902,24 +1876,11 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 	msgs := []types.APIMessage{{Role: "user", Content: contentJSON}}
 	sys := []string{r.systemPrompt}
 	client := r.eng.APIClient
-	if r.planCfg.Model != "" || r.planCfg.BaseURL != "" || r.planCfg.APIKey != "" {
-		baseURL := r.planCfg.BaseURL
-		if baseURL == "" {
-			baseURL = client.BaseURL
-		}
-		apiKey := r.planCfg.APIKey
-		if apiKey == "" {
-			apiKey = client.APIKey
-		}
-		model := r.planCfg.Model
-		if model == "" {
-			model = client.Model
-		}
-		fallback := r.planCfg.FallbackModels
-		if len(fallback) == 0 {
-			fallback = client.FallbackModels
-		}
-		client = client.ConfiguredCloneFull(baseURL, apiKey, model, fallback, r.planCfg.FallbackBaseURL, r.planCfg.FallbackAPIKey)
+	if r.modelCfg.ProviderName != "" {
+		client = client.ConfiguredCloneFull(
+			r.modelCfg.BaseURL, r.modelCfg.APIKey, r.modelCfg.ProviderName,
+			r.modelCfg.FallbackModels, r.modelCfg.FallbackBaseURL, r.modelCfg.FallbackAPIKey,
+		)
 	}
 	resp, err := client.SendMessage(ctx, msgs, sys, nil, 8192)
 	if err != nil {

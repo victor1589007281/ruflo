@@ -22,7 +22,17 @@ var (
 	llmGlobalMu      sync.Mutex
 	llmGlobal        *Collector
 	llmGlobalDataDir string // 用于检测 stateDir 变化时重新挂载采集器
+	aliasResolver    func(string) string
 )
+
+// SetAliasResolver 设置模型名到完整 alias 的解析函数。
+// 当 resolver 非 nil 时, recordLLMCall 会用它将原始 model 名解析为 provider:model 格式 alias,
+// 否则 fallback 到原始 model 名。
+func SetAliasResolver(fn func(string) string) {
+	llmGlobalMu.Lock()
+	defer llmGlobalMu.Unlock()
+	aliasResolver = fn
+}
 
 // InitGlobalLLMCollector 在指定 stateDir 上启动全局 LLM 指标采集。
 //
@@ -89,11 +99,18 @@ func GlobalLLMCollector() *Collector {
 }
 
 func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
+	modelAlias := firstNonEmptyStr(rec.Model, "unknown")
+	if aliasResolver != nil {
+		if resolved := aliasResolver(rec.Model); resolved != "" {
+			modelAlias = resolved
+		}
+	}
 	labels := map[string]string{
-		"model":   firstNonEmptyStr(rec.Model, "unknown"),
-		"status":  rec.Status,
-		"source":  firstNonEmptyStr(rec.Source, "unknown"),
-		"request": firstNonEmptyStr(rec.Request, "messages"),
+		"model":       firstNonEmptyStr(rec.Model, "unknown"),
+		"model_alias": modelAlias,
+		"status":      rec.Status,
+		"source":      firstNonEmptyStr(rec.Source, "unknown"),
+		"request":     firstNonEmptyStr(rec.Request, "messages"),
 	}
 	if rec.Purpose != "" {
 		labels["purpose"] = rec.Purpose
