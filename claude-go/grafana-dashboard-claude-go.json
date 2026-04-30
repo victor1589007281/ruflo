@@ -769,34 +769,16 @@
       {
         "id": 15,
         "type": "timeseries",
-        "title": "Token 消耗 (按别名)",
+        "title": "Token 消耗 (按模型, 5min速率)",
         "targets": [
           {
-            "expr": "sum by (model_alias) (rate(claude_go_llm_input_tokens_sum[5m]))",
+            "expr": "sum by (model_alias) (rate(claude_go_llm_total_tokens_sum[5m]))",
             "refId": "A",
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
             },
-            "legendFormat": "输入 {{model_alias}}"
-          },
-          {
-            "expr": "sum by (model_alias) (rate(claude_go_llm_output_tokens_sum[5m]))",
-            "refId": "B",
-            "datasource": {
-              "type": "prometheus",
-              "uid": "PBFA97CFB590B2093"
-            },
-            "legendFormat": "输出 {{model_alias}}"
-          },
-          {
-            "expr": "sum(rate(claude_go_llm_total_tokens_sum[5m]))",
-            "refId": "C",
-            "datasource": {
-              "type": "prometheus",
-              "uid": "PBFA97CFB590B2093"
-            },
-            "legendFormat": "全局汇总"
+            "legendFormat": "{{model_alias}}"
           }
         ],
         "gridPos": {
@@ -934,7 +916,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "缓存读取 Token/s"
           },
           {
             "expr": "sum(rate(claude_go_llm_cache_create_tokens_sum[5m]))",
@@ -942,7 +925,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "缓存创建 Token/s"
           }
         ],
         "gridPos": {
@@ -1299,7 +1283,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "当前在途"
           },
           {
             "expr": "claude_go_llm_guard_max_parallel",
@@ -1307,7 +1292,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "AIMD 最大并发"
           }
         ],
         "gridPos": {
@@ -1347,7 +1333,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "熔断状态"
           },
           {
             "expr": "claude_go_llm_circuit_fail_streak",
@@ -1355,7 +1342,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "连续失败"
           },
           {
             "expr": "claude_go_llm_guard_rpm_tokens",
@@ -1363,7 +1351,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "RPM 令牌"
           },
           {
             "expr": "claude_go_llm_guard_pause_sec",
@@ -1371,7 +1360,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "退避剩余"
           }
         ],
         "gridPos": {
@@ -1411,7 +1401,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P50"
           },
           {
             "expr": "histogram_quantile(0.95, sum(rate(claude_go_llm_guard_wait_sec_bucket[5m])) by (le))",
@@ -1419,7 +1410,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P95"
           }
         ],
         "gridPos": {
@@ -2076,7 +2068,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P50"
           },
           {
             "expr": "histogram_quantile(0.95, sum(rate(claude_go_team_stage_duration_bucket[5m])) by (le))",
@@ -2084,7 +2077,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P95"
           }
         ],
         "gridPos": {
@@ -2124,7 +2118,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P50"
           },
           {
             "expr": "histogram_quantile(0.95, sum(rate(claude_go_team_duration_bucket[5m])) by (le))",
@@ -2132,7 +2127,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P95"
           }
         ],
         "gridPos": {
@@ -2172,7 +2168,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P50"
           },
           {
             "expr": "histogram_quantile(0.95, sum(rate(claude_go_team_agent_duration_bucket[5m])) by (le))",
@@ -2180,7 +2177,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P95"
           }
         ],
         "gridPos": {
@@ -2220,7 +2218,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "阶段通过率"
           },
           {
             "expr": "claude_go_team_eval_pass_rate",
@@ -2228,7 +2227,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "评审通过率"
           },
           {
             "expr": "claude_go_team_build_pass_rate",
@@ -2236,7 +2236,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "编译通过率"
           },
           {
             "expr": "claude_go_team_output_avg_len",
@@ -2244,7 +2245,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "平均产出长度"
           },
           {
             "expr": "claude_go_team_stage_output_len",
@@ -2252,7 +2254,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "阶段产出长度"
           }
         ],
         "gridPos": {
@@ -2659,7 +2662,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P50"
           },
           {
             "expr": "histogram_quantile(0.95, sum(rate(claude_go_dream_duration_bucket[5m])) by (le))",
@@ -2667,7 +2671,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P95"
           }
         ],
         "gridPos": {
@@ -2707,7 +2712,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "压缩率"
           },
           {
             "expr": "claude_go_dream_output_size",
@@ -2715,7 +2721,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "输出大小"
           },
           {
             "expr": "claude_go_dream_consolidator_facts",
@@ -2723,7 +2730,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "Facts"
           },
           {
             "expr": "claude_go_dream_consolidator_contradictions",
@@ -2731,7 +2739,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "矛盾数"
           },
           {
             "expr": "claude_go_dream_consolidator_patterns",
@@ -2739,7 +2748,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "模式数"
           }
         ],
         "gridPos": {
@@ -2779,7 +2789,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "整理次数"
           },
           {
             "expr": "claude_go_dream_sessions_pending",
@@ -2787,7 +2798,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "待处理会话"
           }
         ],
         "gridPos": {
@@ -2827,7 +2839,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "{{source}}"
           }
         ],
         "gridPos": {
@@ -3484,7 +3497,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "事实总数"
           },
           {
             "expr": "claude_go_fact_active_count",
@@ -3492,7 +3506,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "活跃事实"
           },
           {
             "expr": "claude_go_fact_archived_count",
@@ -3500,7 +3515,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "已归档"
           },
           {
             "expr": "claude_go_fact_evergreen_count",
@@ -3508,7 +3524,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "永久保留"
           },
           {
             "expr": "claude_go_fact_connection_count",
@@ -3516,7 +3533,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "关联数"
           }
         ],
         "gridPos": {
@@ -3556,7 +3574,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "失忆风险"
           },
           {
             "expr": "claude_go_fact_avg_retention * 100",
@@ -3564,7 +3583,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "平均保留率(%)"
           }
         ],
         "gridPos": {
@@ -4121,7 +4141,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "经验总数"
           },
           {
             "expr": "claude_go_evo_trajectory_count",
@@ -4129,7 +4150,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "轨迹总数"
           }
         ],
         "gridPos": {
@@ -4169,7 +4191,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "平均质量(%)"
           },
           {
             "expr": "claude_go_evo_success_rate * 100",
@@ -4177,7 +4200,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "成功率(%)"
           },
           {
             "expr": "claude_go_evo_utilization_rate * 100",
@@ -4185,7 +4209,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "使用率(%)"
           },
           {
             "expr": "claude_go_evo_quality_min * 100",
@@ -4193,7 +4218,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "最低质量(%)"
           },
           {
             "expr": "claude_go_evo_quality_max * 100",
@@ -4201,7 +4227,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "最高质量(%)"
           }
         ],
         "gridPos": {
@@ -4825,7 +4852,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "共识度"
           },
           {
             "expr": "avg(claude_go_swarm_brier)",
@@ -4833,7 +4861,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "Brier 分数"
           },
           {
             "expr": "avg(claude_go_swarm_diversity)",
@@ -4841,7 +4870,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "多样性"
           }
         ],
         "gridPos": {
@@ -4881,7 +4911,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "平均延迟(ms)"
           },
           {
             "expr": "claude_go_swarm_llm_calls",
@@ -4889,7 +4920,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "LLM 调用数"
           }
         ],
         "gridPos": {
@@ -5246,7 +5278,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "触发速率"
           },
           {
             "expr": "sum(rate(claude_go_cron_success_count[5m]))",
@@ -5254,7 +5287,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "成功速率"
           },
           {
             "expr": "sum(rate(claude_go_cron_fail_count[5m]))",
@@ -5262,7 +5296,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "失败速率"
           }
         ],
         "gridPos": {
@@ -5302,7 +5337,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P50"
           },
           {
             "expr": "histogram_quantile(0.95, sum(rate(claude_go_cron_duration_bucket[5m])) by (le))",
@@ -5310,7 +5346,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "P95"
           }
         ],
         "gridPos": {
@@ -5667,7 +5704,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "LLM 成功率(%)"
           },
           {
             "expr": "avg(claude_go_team_stage_pass_rate) * 100",
@@ -5675,7 +5713,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "阶段通过率(%)"
           },
           {
             "expr": "(1 - claude_go_amnesia_risk_score / 100) * 100",
@@ -5683,7 +5722,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "记忆健康度(%)"
           },
           {
             "expr": "claude_go_evo_success_rate * 100",
@@ -5691,7 +5731,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "经验成功率(%)"
           },
           {
             "expr": "avg(claude_go_task_completion_rate) * 100",
@@ -5699,7 +5740,8 @@
             "datasource": {
               "type": "prometheus",
               "uid": "PBFA97CFB590B2093"
-            }
+            },
+            "legendFormat": "任务完成率(%)"
           }
         ],
         "gridPos": {

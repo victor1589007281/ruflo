@@ -14,7 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/metrics"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 )
 
 //go:embed web/*
@@ -59,6 +61,14 @@ func NewServer(cfg Config) *Server {
 	// 幂等: 即使主进程已初始化过, 这里也是 no-op。保证 dashboard 单独前台运行时
 	// 也能捕获自身对 LLM 的诊断调用。
 	metrics.InitGlobalLLMCollector(cfg.StateDir)
+
+	// 加载模型配置并设置 alias resolver，让指标中 model_alias 正确填充
+	cfg2, err := feishu.LoadJSONConfig("")
+	if err == nil && cfg2 != nil {
+		if registry, _, err := modelconfig.LoadFromConfig(cfg2.ToModelConfigJSON()); err == nil && registry != nil {
+			metrics.SetAliasResolver(registry.LookupAliasByModelName)
+		}
+	}
 	// 从 Swarm Intel / Cron JSON 数据回放历史指标到 Prometheus
 	s.provider.ExportSwarmIntelMetrics()
 	s.provider.ExportCronMetrics()
@@ -88,6 +98,15 @@ func MountOn(cfg Config, mux *http.ServeMux) *Server {
 		jobs:     newDiagJobStore(100),
 	}
 	metrics.InitGlobalLLMCollector(cfg.StateDir)
+
+	// 加载模型配置并设置 alias resolver
+	cfg2, err := feishu.LoadJSONConfig("")
+	if err == nil && cfg2 != nil {
+		if registry, _, err := modelconfig.LoadFromConfig(cfg2.ToModelConfigJSON()); err == nil && registry != nil {
+			metrics.SetAliasResolver(registry.LookupAliasByModelName)
+		}
+	}
+
 	s.provider.ExportSwarmIntelMetrics()
 	s.provider.ExportCronMetrics()
 	s.scraper = metrics.NewJSONLScraper(cfg.StateDir)
