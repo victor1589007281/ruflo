@@ -3403,14 +3403,16 @@ func workspaceFileManifest(cwd string, since time.Time) string {
 // LanguageToolchain 多语言编译/lint/测试工具链抽象。
 // 支持 Go, C++ (CMake), Rust (Cargo), Python 四种语言。
 type LanguageToolchain struct {
-	Language    string     // "go", "cpp", "rust", "python"
-	BuildCmds   [][]string // 编译命令序列
-	LintCmds    [][]string // 静态分析命令
-	TestCmds    [][]string // 测试命令
-	InitCmds    [][]string // 项目初始化命令
-	FileExt     string     // ".go", ".cpp"/".h", ".rs", ".py"
-	ProjectFile string     // "go.mod", "CMakeLists.txt", "Cargo.toml", "pyproject.toml"
-	Timeout     time.Duration
+	Language        string     // "go", "cpp", "rust", "python"
+	BuildCmds       [][]string // 编译命令序列
+	LintCmds        [][]string // 静态分析命令
+	TestCmds        [][]string // 测试命令
+	InitCmds        [][]string // 项目初始化命令
+	FileExt         string     // ".go", ".cpp"/".h", ".rs", ".py"
+	ProjectFile     string     // "go.mod", "CMakeLists.txt", "Cargo.toml", "pyproject.toml"
+	Timeout         time.Duration
+	MemoryMaxMB     int // 子进程内存上限 (MB), 0=不限制
+	CPUQuotaPercent int // CPU 配额百分比, 0=不限制
 }
 
 // GetToolchain 根据语言返回对应工具链。空字符串默认 Go。
@@ -3421,48 +3423,56 @@ func GetToolchain(lang string) *LanguageToolchain {
 			Language: "cpp",
 			// 默认: 最小化构建 (仅编译依赖当前源码的目标, 不构建 mysqld 全量)
 			// 通过 make <file>.o 验证语法, 避免每次修改都触发全量构建
-			BuildCmds:   [][]string{{"cmake", "-B", "build", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"}, {"cmake", "--build", "build", "--parallel"}},
-			LintCmds:    [][]string{{"cmake", "--build", "build", "--target", "all"}},
-			TestCmds:    [][]string{{"ctest", "--test-dir", "build", "--output-on-failure"}},
-			InitCmds:    [][]string{},
-			FileExt:     ".cpp",
-			ProjectFile: "CMakeLists.txt",
-			Timeout:     120 * time.Second,
+			BuildCmds:       [][]string{{"cmake", "-B", "build", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"}, {"cmake", "--build", "build", "--parallel"}},
+			LintCmds:        [][]string{{"cmake", "--build", "build", "--target", "all"}},
+			TestCmds:        [][]string{{"ctest", "--test-dir", "build", "--output-on-failure"}},
+			InitCmds:        [][]string{},
+			FileExt:         ".cpp",
+			ProjectFile:     "CMakeLists.txt",
+			Timeout:         120 * time.Second,
+			MemoryMaxMB:     16384,
+			CPUQuotaPercent: 200,
 			// MySQL/Percona 特殊处理: 增量编译时仅编译修改过的 .o
 			// 在 BuildCmds 执行前, buildScript 会检测项目类型并动态调整策略
 		}
 	case "rust", "rs":
 		return &LanguageToolchain{
-			Language:    "rust",
-			BuildCmds:   [][]string{{"cargo", "build"}},
-			LintCmds:    [][]string{{"cargo", "clippy", "--", "-D", "warnings"}},
-			TestCmds:    [][]string{{"cargo", "test"}},
-			InitCmds:    [][]string{{"cargo", "init", "--name", "agentdb"}},
-			FileExt:     ".rs",
-			ProjectFile: "Cargo.toml",
-			Timeout:     120 * time.Second,
+			Language:        "rust",
+			BuildCmds:       [][]string{{"cargo", "build"}},
+			LintCmds:        [][]string{{"cargo", "clippy", "--", "-D", "warnings"}},
+			TestCmds:        [][]string{{"cargo", "test"}},
+			InitCmds:        [][]string{{"cargo", "init", "--name", "agentdb"}},
+			FileExt:         ".rs",
+			ProjectFile:     "Cargo.toml",
+			Timeout:         120 * time.Second,
+			MemoryMaxMB:     8192,
+			CPUQuotaPercent: 200,
 		}
 	case "python", "py":
 		return &LanguageToolchain{
-			Language:    "python",
-			BuildCmds:   [][]string{{"python", "-m", "py_compile"}},
-			LintCmds:    [][]string{{"python", "-m", "flake8", "."}},
-			TestCmds:    [][]string{{"python", "-m", "pytest"}},
-			InitCmds:    [][]string{},
-			FileExt:     ".py",
-			ProjectFile: "pyproject.toml",
-			Timeout:     60 * time.Second,
+			Language:        "python",
+			BuildCmds:       [][]string{{"python", "-m", "py_compile"}},
+			LintCmds:        [][]string{{"python", "-m", "flake8", "."}},
+			TestCmds:        [][]string{{"python", "-m", "pytest"}},
+			InitCmds:        [][]string{},
+			FileExt:         ".py",
+			ProjectFile:     "pyproject.toml",
+			Timeout:         60 * time.Second,
+			MemoryMaxMB:     4096,
+			CPUQuotaPercent: 200,
 		}
 	default: // "go" or empty
 		return &LanguageToolchain{
-			Language:    "go",
-			BuildCmds:   [][]string{{"go", "build", "./..."}, {"go", "vet", "./..."}},
-			LintCmds:    [][]string{},
-			TestCmds:    [][]string{{"go", "test", "./..."}},
-			InitCmds:    [][]string{},
-			FileExt:     ".go",
-			ProjectFile: "go.mod",
-			Timeout:     30 * time.Second,
+			Language:        "go",
+			BuildCmds:       [][]string{{"go", "build", "./..."}, {"go", "vet", "./..."}},
+			LintCmds:        [][]string{},
+			TestCmds:        [][]string{{"go", "test", "-count=1", "-timeout=30s", "-parallel=4", "./..."}},
+			InitCmds:        [][]string{},
+			FileExt:         ".go",
+			ProjectFile:     "go.mod",
+			Timeout:         30 * time.Second,
+			MemoryMaxMB:     8192,
+			CPUQuotaPercent: 200,
 		}
 	}
 }
@@ -3758,6 +3768,60 @@ func scanForTodos(cwd string) []string {
 	return findings
 }
 
+// runLimitedCommand 在内存/CPU 限制下运行外部命令。
+// 优先使用 systemd-run (cgroup v2 memory.max), 回退到 prlimit --as, 最后直接运行。
+func runLimitedCommand(ctx context.Context, cwd string, args []string, memMaxMB, cpuQuotaPercent int) ([]byte, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("empty command")
+	}
+
+	// 策略1: systemd-run --user --wait --pipe --quiet --property=MemoryMax=... (cgroup v2)
+	if memMaxMB > 0 {
+		_, err := exec.LookPath("systemd-run")
+		if err == nil {
+			runArgs := []string{
+				"--user", "--collect", "--wait", "--pipe", "--quiet",
+				fmt.Sprintf("--property=MemoryMax=%dM", memMaxMB),
+			}
+			if cpuQuotaPercent > 0 {
+				runArgs = append(runArgs, fmt.Sprintf("--property=CPUQuota=%d%%", cpuQuotaPercent))
+			}
+			runArgs = append(runArgs, "--")
+			runArgs = append(runArgs, args...)
+			cmd := exec.CommandContext(ctx, "systemd-run", runArgs...)
+			cmd.Dir = cwd
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				return out, nil
+			}
+			// systemd-run 失败时降级到 prlimit
+			log.Printf("[workflow] systemd-run 限制失败 (%v), 降级到 prlimit: %s", err, string(out))
+		}
+	}
+
+	// 策略2: prlimit --as=... (RLIMIT_AS, 虚拟内存限制)
+	if memMaxMB > 0 {
+		_, err := exec.LookPath("prlimit")
+		if err == nil {
+			prlimitArgs := []string{fmt.Sprintf("--as=%d", int64(memMaxMB)*1024*1024)}
+			prlimitArgs = append(prlimitArgs, args...)
+			cmd := exec.CommandContext(ctx, "prlimit", prlimitArgs...)
+			cmd.Dir = cwd
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				return out, nil
+			}
+			// prlimit 失败时降级到直接运行
+			log.Printf("[workflow] prlimit 限制失败 (%v), 降级到直接运行: %s", err, string(out))
+		}
+	}
+
+	// 策略3: 直接运行 (无限制)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Dir = cwd
+	return cmd.CombinedOutput()
+}
+
 // runBuildCheckLang 多语言版本的编译检查。
 // MySQL/Percona 特殊处理: 自动路由到分阶段最小编译方案。
 func runBuildCheckLang(cwd, lang string) string {
@@ -3778,9 +3842,7 @@ func runBuildCheckLang(cwd, lang string) string {
 
 	var errors []string
 	for _, args := range tc.BuildCmds {
-		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-		cmd.Dir = cwd
-		out, err := cmd.CombinedOutput()
+		out, err := runLimitedCommand(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent)
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s 失败:\n%s", strings.Join(args, " "), string(out)))
 		}
@@ -3817,11 +3879,18 @@ func runTestCheckLang(cwd, lang string) string {
 
 	var errors []string
 	for _, args := range tc.TestCmds {
-		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-		cmd.Dir = cwd
-		out, err := cmd.CombinedOutput()
+		out, err := runLimitedCommand(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent)
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("%s 失败:\n%s", strings.Join(args, " "), string(out)))
+			errStr := string(out)
+			label := fmt.Sprintf("%s 失败:", strings.Join(args, " "))
+			// 检测内存限制/OOM 相关错误, 追加明确提示
+			if tc.MemoryMaxMB > 0 && (strings.Contains(errStr, "killed") || strings.Contains(errStr, "Killed") ||
+				strings.Contains(errStr, "signal: killed") || strings.Contains(errStr, "OOM") ||
+				strings.Contains(errStr, "out of memory") || strings.Contains(errStr, "cannot allocate memory") ||
+				strings.Contains(errStr, "exited") && len(errStr) < 100) {
+				label = fmt.Sprintf("%s (⚠️ 疑似内存超限, 当前限制 %dMB。请检查测试代码是否存在无限循环或未限制的数据结构增长):", strings.Join(args, " "), tc.MemoryMaxMB)
+			}
+			errors = append(errors, fmt.Sprintf("%s\n%s", label, errStr))
 		}
 	}
 	if len(errors) == 0 {
