@@ -357,6 +357,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 注入默认解析配置到 SessionManager (用于 createSession 的 maxTokens/maxTurns)
 	bot.sessions.SetDefaultModelConfig(defaultResolved)
 
+	// 初始化全局 LLM 指标采集器 (让 feishu bot 的指标走全局 JSONL + Prometheus 路径)
+	metrics.InitGlobalLLMCollector(layout.Root)
+
 	// 设置全局 alias 解析器，让 recordLLMCall 能自动把 model 名解析为完整 alias
 	metrics.SetAliasResolver(registry.LookupAliasByModelName)
 
@@ -1779,6 +1782,7 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"*管理命令:*\n" +
 			"- /team create <名称> <工作流> - 创建团队\n" +
 			"- /team run <名称> <目标> - 启动执行\n" +
+			"- /team resume <名称> - 恢复执行 (从检查点继续)\n" +
 			"- /team status [名称] - 查看状态\n" +
 			"- /team stop <名称> - 停止\n" +
 			"- /team list - 列出所有\n" +
@@ -2183,7 +2187,7 @@ func (b *Bot) injectSessionContext(chatID string, team *agent.ProductionTeam) {
 func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text string) {
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
-		b.sendTextReply(ctx, messageID, "用法: /team [create|run|status|stop|list|delete|workflows]")
+		b.sendTextReply(ctx, messageID, "用法: /team [create|run|resume|status|stop|list|delete|workflows]")
 		return
 	}
 
@@ -2219,6 +2223,18 @@ func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text str
 			return
 		}
 		b.sendTextReply(ctx, messageID, fmt.Sprintf("🚀 团队 **%s** 已启动, 后台执行中...\n发送 `/team status %s` 查看进度", name, name))
+
+	case "resume":
+		if len(parts) < 3 {
+			b.sendTextReply(ctx, messageID, "用法: /team resume <名称>")
+			return
+		}
+		name := parts[2]
+		if err := b.teamMgr.ResumeTeam(name); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("恢复失败: %v", err))
+			return
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("♻️ 团队 **%s** 已从检查点恢复执行", name))
 
 	case "status":
 		if len(parts) >= 3 {

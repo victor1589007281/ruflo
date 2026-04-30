@@ -226,11 +226,149 @@ func main() {
 	rootCmd.AddCommand(rolesCmd())
 	rootCmd.AddCommand(dashboardCmd())
 	rootCmd.AddCommand(backupCmd())
+	rootCmd.AddCommand(teamCmd())
 	rootCmd.AddCommand(helpCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// teamCmd 团队管理 CLI (list/status/resume/stop/delete)。
+// resume/stop/delete 通过 dashboard API 转发到运行中的主进程执行。
+func teamCmd() *cobra.Command {
+	var dashboardURL string
+	cmd := &cobra.Command{
+		Use:   "team",
+		Short: "团队管理: 列出、查看状态、恢复、停止、删除",
+		Long:  `通过 CLI 管理 claude-go 团队, 无需打开 dashboard。`,
+	}
+	cmd.PersistentFlags().StringVar(&dashboardURL, "dashboard", "http://localhost:7777", "Dashboard API 地址")
+
+	// list
+	cmd.AddCommand(&cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "列出所有团队",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			stateDir := basedir.ResolveDefault("", cwd)
+			teamsDir := filepath.Join(stateDir, "teams")
+			entries, err := os.ReadDir(teamsDir)
+			if err != nil {
+				return fmt.Errorf("读取团队目录失败: %w", err)
+			}
+			if len(entries) == 0 {
+				fmt.Println("暂无团队")
+				return nil
+			}
+			fmt.Printf("%-24s %-12s %-16s %s\n", "名称", "状态", "工作流", "目标")
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				path := filepath.Join(teamsDir, e.Name(), "team.json")
+				data, err := os.ReadFile(path)
+				if err != nil {
+					continue
+				}
+				var t struct {
+					Name     string `json:"name"`
+					Status   string `json:"status"`
+					Workflow string `json:"workflow"`
+					Objective string `json:"objective"`
+				}
+				if json.Unmarshal(data, &t) != nil {
+					continue
+				}
+				obj := t.Objective
+				if len(obj) > 30 {
+					obj = obj[:27] + "..."
+				}
+				fmt.Printf("%-24s %-12s %-16s %s\n", t.Name, t.Status, t.Workflow, obj)
+			}
+			return nil
+		},
+	})
+
+	// status
+	cmd.AddCommand(&cobra.Command{
+		Use:   "status <名称>",
+		Short: "查看团队详细状态",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			stateDir := basedir.ResolveDefault("", cwd)
+			path := filepath.Join(stateDir, "teams", args[0], "team.json")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return fmt.Errorf("团队 %q 不存在", args[0])
+			}
+			var t struct {
+				Name       string    `json:"name"`
+				Status     string    `json:"status"`
+				Workflow   string    `json:"workflow"`
+				Objective  string    `json:"objective"`
+				CreatedAt  time.Time `json:"createdAt"`
+				StartedAt  time.Time `json:"startedAt"`
+				FinishedAt time.Time `json:"finishedAt"`
+				Error      string    `json:"error"`
+				Agents     []struct {
+					Name   string `json:"name"`
+					Status string `json:"status"`
+				} `json:"agents"`
+			}
+			if err := json.Unmarshal(data, &t); err != nil {
+				return fmt.Errorf("解析团队状态失败: %w", err)
+			}
+			fmt.Printf("团队: %s [%s]\n", t.Name, t.Status)
+			fmt.Printf("工作流: %s\n", t.Workflow)
+			fmt.Printf("目标: %s\n", t.Objective)
+			fmt.Printf("创建时间: %s\n", t.CreatedAt.Format("2006-01-02 15:04:05"))
+			if !t.StartedAt.IsZero() {
+				elapsed := time.Since(t.StartedAt)
+				if !t.FinishedAt.IsZero() {
+					elapsed = t.FinishedAt.Sub(t.StartedAt)
+				}
+				fmt.Printf("耗时: %v\n", elapsed.Round(time.Second))
+			}
+			if t.Error != "" {
+				fmt.Printf("错误: %s\n", t.Error)
+			}
+			if len(t.Agents) > 0 {
+				fmt.Println("Agent 状态:")
+				for _, a := range t.Agents {
+					fmt.Printf("  - %s [%s]\n", a.Name, a.Status)
+				}
+			}
+			return nil
+		},
+	})
+
+	// resume / stop / delete 共用同一个 HTTP 调用逻辑
+	for _, action := range []string{"resume", "stop", "delete"} {
+		a := action
+		cmd.AddCommand(&cobra.Command{
+			Use:   fmt.Sprintf("%s <名称>", a),
+			Short: fmt.Sprintf("%s 团队", map[string]string{"resume": "恢复", "stop": "停止", "delete": "删除"}[a]),
+			Args:  cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				url := fmt.Sprintf("%s/api/actions/team/%s/%s", strings.TrimRight(dashboardURL, "/"), a, args[0])
+				resp, err := http.Post(url, "application/json", nil)
+				if err != nil {
+					return fmt.Errorf("请求 dashboard 失败: %w", err)
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					return fmt.Errorf("dashboard 返回 %s", resp.Status)
+				}
+				fmt.Printf("✅ 团队 %s 已执行 %s\n", args[0], a)
+				return nil
+			},
+		})
+	}
+
+	return cmd
 }
 
 func helpCmd() *cobra.Command {
