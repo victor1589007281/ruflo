@@ -1,0 +1,140 @@
+{
+  "dashboard": {
+    "title": "Claude-Go Prompt Observatory",
+    "tags": ["claude-go", "prompt"],
+    "timezone": "Asia/Shanghai",
+    "schemaVersion": 36,
+    "panels": [
+      {
+        "id": 1,
+        "title": "活跃 Prompt 版本数",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "count(count by (prompt_id, version) (claude_go_prompt_render_count))",
+            "legendFormat": "Versions"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "平均渲染耗时",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "avg(claude_go_prompt_render_time_ms)",
+            "legendFormat": "Avg ms"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "ms"}},
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "A/B 测试运行中",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "count(claude_go_prompt_ab_running)",
+            "legendFormat": "Running"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0}
+      },
+      {
+        "id": 4,
+        "title": "Prompt 平均长度",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "avg(claude_go_prompt_rendered_len)",
+            "legendFormat": "Chars"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0}
+      },
+      {
+        "id": 10,
+        "title": "Prompt 版本使用分布 (SQLite 数据源)",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "# 此面板需配置 SQLite 数据源查询 prompt_versions 表\n# SELECT prompt_id, version, COUNT(*) as use_count, AVG(render_time_ms) as avg_latency\n# FROM prompt_versions GROUP BY prompt_id, version ORDER BY use_count DESC",
+            "format": "table",
+            "legendFormat": ""
+          }
+        ],
+        "gridPos": {"h": 10, "w": 24, "x": 0, "y": 4}
+      },
+      {
+        "id": 20,
+        "title": "A/B 测试效果对比",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "avg by (variant) (claude_go_prompt_ab_success_rate)",
+            "legendFormat": "{{variant}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "percentunit"}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14}
+      },
+      {
+        "id": 21,
+        "title": "A/B 测试 Token 效率",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "avg by (variant) (claude_go_prompt_ab_token_efficiency)",
+            "legendFormat": "{{variant}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14}
+      },
+      {
+        "id": 30,
+        "title": "提示词渲染耗时分布",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum by (le) (rate(claude_go_prompt_render_time_bucket[5m])))",
+            "legendFormat": "p50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum by (le) (rate(claude_go_prompt_render_time_bucket[5m])))",
+            "legendFormat": "p95"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "ms"}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22}
+      },
+      {
+        "id": 31,
+        "title": "Prompt Hash 变更频率",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum by (prompt_id) (rate(claude_go_prompt_version_change[5m]))",
+            "legendFormat": "{{prompt_id}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22}
+      },
+      {
+        "id": 40,
+        "title": "模板效果热力图 (按 template_name)",
+        "type": "heatmap",
+        "targets": [
+          {
+            "expr": "avg by (template_name) (claude_go_prompt_render_time_ms)",
+            "legendFormat": "{{template_name}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 30}
+      }
+    ],
+    "time": {"from": "now-1h", "to": "now"},
+    "refresh": "10s"
+  }
+}

@@ -1,0 +1,164 @@
+{
+  "dashboard": {
+    "title": "Claude-Go Collaboration & Teams",
+    "tags": ["claude-go", "team", "collaboration"],
+    "timezone": "Asia/Shanghai",
+    "schemaVersion": 36,
+    "panels": [
+      {
+        "id": 1,
+        "title": "团队运行次数",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_team_run[5m])) * 300",
+            "legendFormat": "Runs"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "团队成功率",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_team_success[5m])) / sum(rate(claude_go_team_run[5m]))",
+            "legendFormat": "Success Rate"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "平均运行耗时",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_team_duration_bucket[5m])) by (le))",
+            "legendFormat": "p95"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "s"}},
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0}
+      },
+      {
+        "id": 4,
+        "title": "产出文件数",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "avg(claude_go_team_file_count)",
+            "legendFormat": "Files"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0}
+      },
+      {
+        "id": 10,
+        "title": "Stage 通过率 (按 Workflow)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum by (workflow) (rate(claude_go_team_stage_success[5m])) / sum by (workflow) (rate(claude_go_team_stage[5m]))",
+            "legendFormat": "{{workflow}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}
+      },
+      {
+        "id": 11,
+        "title": "Stage 失败率 (按 Role)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum by (role) (rate(claude_go_team_stage_fail[5m])) / sum by (role) (rate(claude_go_team_stage[5m]))",
+            "legendFormat": "{{role}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "percentunit"}},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}
+      },
+      {
+        "id": 20,
+        "title": "Agent 运行次数 (按 Role)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum by (role) (rate(claude_go_team_agent_run[5m]))",
+            "legendFormat": "{{role}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "cps"}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12}
+      },
+      {
+        "id": 21,
+        "title": "Agent 单次耗时 P95",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum by (le, role) (rate(claude_go_team_agent_duration_bucket[5m])))",
+            "legendFormat": "{{role}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "s"}},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12}
+      },
+      {
+        "id": 30,
+        "title": "Stage 产出长度分布",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "avg by (stage) (claude_go_team_stage_output_len)",
+            "legendFormat": "{{stage}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "bytes"}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20}
+      },
+      {
+        "id": 31,
+        "title": "Stage 重试次数",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "avg by (stage) (claude_go_team_stage_retry)",
+            "legendFormat": "{{stage}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20}
+      },
+      {
+        "id": 40,
+        "title": "编译通过率",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "avg(claude_go_team_build_pass_rate)",
+            "legendFormat": "Build"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "percentunit"}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28}
+      },
+      {
+        "id": 41,
+        "title": "黑板写入次数",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_team_blackboard_writes[5m]))",
+            "legendFormat": "Writes"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28}
+      }
+    ],
+    "time": {"from": "now-1h", "to": "now"},
+    "refresh": "10s"
+  }
+}

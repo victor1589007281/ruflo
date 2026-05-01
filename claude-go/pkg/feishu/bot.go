@@ -35,6 +35,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/memory"
+	"github.com/anthropic/claude-go/pkg/observability"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -308,6 +309,11 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		Console: true,
 	})
 
+	// 初始化可观测体系 (Hook Bus + MetricsEmitter + JSONL Store + Prompt Observatory)
+	if _, err := observability.InitSystem(layout.Root); err != nil {
+		log.Printf("[Bot] 可观测体系初始化失败: %v", err)
+	}
+
 	bot := &Bot{
 		config:    config,
 		client:    larkClient,
@@ -371,6 +377,25 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			oldHook(rec)
 		}
 		aliasMetrics.Record(rec)
+		// 发射到 observability bus (非侵入, 供 hook 体系消费)
+		observability.Emit(observability.Event{
+			Type:      observability.EvtLLMCallComplete,
+			Timestamp: rec.Timestamp,
+			Module:    "llm",
+			Name:      rec.Status,
+			Payload: map[string]interface{}{
+				"record":        rec,
+				"model":         rec.Model,
+				"status":        rec.Status,
+				"source":        rec.Source,
+				"purpose":       rec.Purpose,
+				"duration_sec":  rec.DurationSec,
+				"input_tokens":  rec.InputTokens,
+				"output_tokens": rec.OutputTokens,
+				"retries":       rec.Retries,
+				"error_kind":    rec.ErrorKind,
+			},
+		})
 	}
 	bot.aliasMetrics = aliasMetrics
 	bot.modelRegistry = registry

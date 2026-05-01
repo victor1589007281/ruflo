@@ -103,11 +103,12 @@ func (we *WorkflowExecutor) executeOrchestrated(
 	// 同时注册阶段实时刷新 Hook, 让外部监控能看到中间进度
 	var activityHook orchestrator.LifecycleHook
 	stageFlusher := &stageFlushHook{team: team, stages: &stageMapping}
+	obsBridge := orchestrator.NewObservabilityBridge()
 	if we.activityCallback != nil {
 		activityHook = &callbackHook{fn: we.activityCallback, stopCh: make(chan struct{})}
-		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, activityHook, stageFlusher))
+		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, activityHook, stageFlusher, obsBridge))
 	} else {
-		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, stageFlusher))
+		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, stageFlusher, obsBridge))
 	}
 
 	// 6. 设置 Blackboard

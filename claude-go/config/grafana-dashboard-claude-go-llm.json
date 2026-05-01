@@ -1,0 +1,199 @@
+{
+  "dashboard": {
+    "title": "Claude-Go LLM Observability",
+    "tags": ["claude-go", "llm"],
+    "timezone": "Asia/Shanghai",
+    "schemaVersion": 36,
+    "panels": [
+      {
+        "id": 1,
+        "title": "LLM 调用速率 (QPS)",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_success[5m])) + sum(rate(claude_go_llm_error[5m]))",
+            "legendFormat": "Total"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "成功率",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_success[5m])) / (sum(rate(claude_go_llm_success[5m])) + sum(rate(claude_go_llm_error[5m])))",
+            "legendFormat": "Success Rate"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {"unit": "percentunit", "min": 0, "max": 1}
+        },
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "P95 延迟",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(claude_go_llm_call_bucket[5m])) by (le))",
+            "legendFormat": "p95"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "s"}},
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0}
+      },
+      {
+        "id": 4,
+        "title": "错误数/分钟",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_error[5m])) * 60",
+            "legendFormat": "Errors"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0}
+      },
+      {
+        "id": 10,
+        "title": "按 Alias 分组的调用量",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum by (model_alias) (rate(claude_go_llm_success[5m]) + rate(claude_go_llm_error[5m]))",
+            "legendFormat": "{{model_alias}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "cps"}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}
+      },
+      {
+        "id": 11,
+        "title": "全局汇总调用线",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_success[5m]) + rate(claude_go_llm_error[5m]))",
+            "legendFormat": "Total"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "cps"}},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}
+      },
+      {
+        "id": 20,
+        "title": "Input / Output Tokens (按 Alias)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum by (model_alias) (rate(claude_go_llm_input_tokens[5m]))",
+            "legendFormat": "In {{model_alias}}"
+          },
+          {
+            "expr": "sum by (model_alias) (rate(claude_go_llm_output_tokens[5m]))",
+            "legendFormat": "Out {{model_alias}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "tps"}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12}
+      },
+      {
+        "id": 21,
+        "title": "Token 效率 (Output / Input)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_output_tokens[5m])) / sum(rate(claude_go_llm_input_tokens[5m]))",
+            "legendFormat": "Efficiency"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "percentunit"}},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12}
+      },
+      {
+        "id": 30,
+        "title": "Latency P50/P95/P99 (按 Alias)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum by (le, model_alias) (rate(claude_go_llm_call_bucket[5m])))",
+            "legendFormat": "p50 {{model_alias}}"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum by (le, model_alias) (rate(claude_go_llm_call_bucket[5m])))",
+            "legendFormat": "p95 {{model_alias}}"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "s"}},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20}
+      },
+      {
+        "id": 31,
+        "title": "错误细分 (RateLimit / Overload / Timeout / Refusal)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_rate_limit[5m]))",
+            "legendFormat": "429"
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_overload[5m]))",
+            "legendFormat": "503/529"
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_timeout[5m]))",
+            "legendFormat": "Timeout"
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_refusal[5m]))",
+            "legendFormat": "Refusal"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "cps"}},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20}
+      },
+      {
+        "id": 40,
+        "title": "限流 / 熔断状态",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "claude_go_llm_guard_in_flight",
+            "legendFormat": "In-flight"
+          },
+          {
+            "expr": "claude_go_llm_guard_max_parallel",
+            "legendFormat": "Max Parallel"
+          },
+          {
+            "expr": "claude_go_llm_circuit_open",
+            "legendFormat": "Circuit Open"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28}
+      },
+      {
+        "id": 41,
+        "title": "Cache Read / Create Tokens",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "sum(rate(claude_go_llm_cache_read_tokens[5m]))",
+            "legendFormat": "Cache Read"
+          },
+          {
+            "expr": "sum(rate(claude_go_llm_cache_create_tokens[5m]))",
+            "legendFormat": "Cache Create"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "tps"}},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28}
+      }
+    ],
+    "time": {"from": "now-1h", "to": "now"},
+    "refresh": "10s"
+  }
+}

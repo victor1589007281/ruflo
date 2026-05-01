@@ -26,6 +26,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
+	"github.com/anthropic/claude-go/pkg/observability"
 )
 
 // PromptCache 提示词缓存 (参考 Anthropic Prompt Caching)。
@@ -844,6 +845,51 @@ func (we *WorkflowExecutor) tryInitDAG() {
 
 // Execute 执行工作流, 返回所有阶段结果
 func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
+	start := time.Now()
+	traceCtx := observability.NewRootTrace().WithBaggage("team_id", team.Name).WithBaggage("workflow", wf.Mode)
+	ctx = observability.WithTrace(ctx, traceCtx)
+
+	observability.Emit(observability.Event{
+		Type:      observability.EvtTeamStart,
+		Timestamp: start,
+		TraceID:   traceCtx.TraceID,
+		Module:    "workflow",
+		Name:      wf.Mode,
+		Payload: map[string]interface{}{
+			"team_id":   team.Name,
+			"workflow":  wf.Mode,
+			"objective": objective,
+			"stage_count": len(wf.Stages),
+		},
+	})
+
+	var results []StageResult
+	var err error
+	defer func() {
+		dur := time.Since(start).Seconds()
+		ev := observability.Event{
+			Type:      observability.EvtTeamComplete,
+			Timestamp: time.Now(),
+			TraceID:   traceCtx.TraceID,
+			Module:    "workflow",
+			Name:      wf.Mode,
+			Payload: map[string]interface{}{
+				"team_id":       team.Name,
+				"workflow":      wf.Mode,
+				"duration_sec":  dur,
+				"stage_count":   len(results),
+				"success":       err == nil,
+				"error":         "",
+			},
+		}
+		if err != nil {
+			ev.Type = observability.EvtTeamFail
+			ev.Payload["error"] = err.Error()
+			ev.Payload["success"] = false
+		}
+		observability.Emit(ev)
+	}()
+
 	switch wf.Mode {
 	case "pipeline":
 		return we.executePipeline(ctx, wf, objective, team)
@@ -2308,6 +2354,24 @@ func (we *WorkflowExecutor) ExecuteSingleStage(ctx context.Context, stage StageD
 // V2 改进: 区分瞬态错误 (API 超时/限流/网络) 和永久错误 (产出验证失败),
 //          瞬态错误自动重试 (指数退避 + 抖动), 永久错误直接失败。
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
+	stageStart := time.Now()
+	traceCtx := observability.TraceFromContext(ctx)
+
+	observability.Emit(observability.Event{
+		Type:      observability.EvtStageStart,
+		Timestamp: stageStart,
+		TraceID:   traceCtx.TraceID,
+		SpanID:    traceCtx.SpanID,
+		Module:    "workflow",
+		Name:      stage.Name,
+		Payload: map[string]interface{}{
+			"team_id":    team.Name,
+			"workflow":   team.Workflow,
+			"stage_name": stage.Name,
+			"agent_role": stage.Role,
+		},
+	})
+
 	ctx, endSpan := logging.WithSpan(ctx, "stage."+stage.Name)
 	defer endSpan()
 	logging.Event(ctx, "stage.start", "stage", stage.Name, "role", stage.Role, "team", team.Name)
@@ -2415,6 +2479,46 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			// 无注入: 更新基线成功率 (用于 Uplift 计算)
 			we.evolution.UpdateBaseline(sr.Status == TaskCompleted)
 		}
+	}
+
+	// 发射 observability stage 完成/失败事件
+	stageDur := time.Since(stageStart).Seconds()
+	if sr.Status == TaskCompleted {
+		observability.Emit(observability.Event{
+			Type:      observability.EvtStageComplete,
+			Timestamp: time.Now(),
+			TraceID:   traceCtx.TraceID,
+			SpanID:    traceCtx.SpanID,
+			Module:    "workflow",
+			Name:      stage.Name,
+			Payload: map[string]interface{}{
+				"team_id":     team.Name,
+				"workflow":    team.Workflow,
+				"stage_name":  stage.Name,
+				"agent_role":  stage.Role,
+				"duration_sec": stageDur,
+				"success":     true,
+				"output_len":  len(sr.Output),
+			},
+		})
+	} else {
+		observability.Emit(observability.Event{
+			Type:      observability.EvtStageFail,
+			Timestamp: time.Now(),
+			TraceID:   traceCtx.TraceID,
+			SpanID:    traceCtx.SpanID,
+			Module:    "workflow",
+			Name:      stage.Name,
+			Payload: map[string]interface{}{
+				"team_id":     team.Name,
+				"workflow":    team.Workflow,
+				"stage_name":  stage.Name,
+				"agent_role":  stage.Role,
+				"duration_sec": stageDur,
+				"success":     false,
+				"error":       sr.Error,
+			},
+		})
 	}
 
 	return sr
