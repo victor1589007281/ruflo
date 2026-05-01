@@ -182,7 +182,7 @@ func (t *BashTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, "sh", "-c", in.Command)
+	cmd := exec.CommandContext(cmdCtx, "bash", "-c", in.Command)
 	cmd.Dir = cwd
 
 	var stdout, stderr bytes.Buffer
