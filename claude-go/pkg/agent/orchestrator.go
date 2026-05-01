@@ -84,6 +84,8 @@ type TaskNode struct {
 	MaxRetries     int      `json:"maxRetries"`
 	Complexity     string   `json:"complexity,omitempty"` // "simple"(2轮), "medium"(3轮), "complex"(5轮)
 	SubGoals       []SubGoal `json:"subGoals,omitempty"`
+	TargetPackages []string `json:"targetPackages,omitempty"` // 该任务涉及的包路径 (如 "./internal/storage/...")
+	TargetFiles    []string `json:"targetFiles,omitempty"`    // 该任务涉及的具体文件
 
 	Output      string `json:"output"`
 	Error       string `json:"error"`
@@ -140,6 +142,8 @@ type rawTask struct {
 	priority       int
 	complexity     string // "simple", "medium", "complex"
 	subGoals       []SubGoal
+	targetPackages []string // 该任务涉及的包路径 (如 "./internal/storage/...")
+	targetFiles    []string // 该任务涉及的具体文件 (如 "internal/storage/engine.go")
 }
 
 // NewOrchestrator 创建编排器 (需要 DAGTaskTracker, 不再自建 DAG)
@@ -317,6 +321,8 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 			MaxRetries:     o.config.MaxRetries,
 			Complexity:     rt.complexity,
 			SubGoals:       rt.subGoals,
+			TargetPackages: rt.targetPackages,
+			TargetFiles:    rt.targetFiles,
 		}
 		nodes = append(nodes, node)
 		o.nodes[v2ID] = node
@@ -336,16 +342,18 @@ type wbsJSON struct {
 	Tasks []wbsJSONTask `json:"tasks"`
 }
 type wbsJSONTask struct {
-	ID          int      `json:"id"`
-	Title       string   `json:"title"`
-	Role        string   `json:"role"`
-	DependsOn   []int    `json:"dependsOn"`
-	DesignRef   string   `json:"designRef"`
-	Constraints []string `json:"constraints"`
-	Acceptance  string   `json:"acceptance"`
-	Priority    int      `json:"priority"`
-	Complexity  string   `json:"complexity,omitempty"` // "simple", "medium", "complex"
-	SubGoals    []SubGoal `json:"subGoals,omitempty"`
+	ID             int      `json:"id"`
+	Title          string   `json:"title"`
+	Role           string   `json:"role"`
+	DependsOn      []int    `json:"dependsOn"`
+	DesignRef      string   `json:"designRef"`
+	Constraints    []string `json:"constraints"`
+	Acceptance     string   `json:"acceptance"`
+	Priority       int      `json:"priority"`
+	Complexity     string   `json:"complexity,omitempty"` // "simple", "medium", "complex"
+	SubGoals       []SubGoal `json:"subGoals,omitempty"`
+	TargetPackages []string `json:"targetPackages,omitempty"` // 该任务涉及的包路径
+	TargetFiles    []string `json:"targetFiles,omitempty"`    // 该任务涉及的具体文件
 }
 
 func stripCodeFences(s string) string {
@@ -388,6 +396,7 @@ func parseWBSFromJSON(planOutput string) []rawTask {
 			designRef: t.DesignRef, constraintRefs: t.Constraints,
 			accept: t.Acceptance, priority: t.Priority,
 			complexity: t.Complexity, subGoals: t.SubGoals,
+			targetPackages: t.TargetPackages, targetFiles: t.TargetFiles,
 		})
 	}
 	return tasks
@@ -1133,11 +1142,11 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			}
 		}
 
-		// === Step 1.5: L2 编译硬门禁 (多语言, 与 workflow.go 的 runBuildHardGate 对齐) ===
+		// === Step 1.5: L2 编译硬门禁 (按任务目标包隔离编译, 避免跨任务污染) ===
 		buildPassed := true
 		o.reportProgress("编译", round, 0, node.V2TaskID)
 		if team.Cwd != "" {
-			buildErrors := runBuildCheckLang(team.Cwd, lang)
+			buildErrors := runBuildCheckScoped(team.Cwd, lang, node.TargetPackages)
 			if buildErrors != "" {
 				buildPassed = false
 				o.notify(o.chatID, fmt.Sprintf("🔴 %s 第 %d 轮编译失败, 启动内部修复...", node.Title, round))
@@ -1155,7 +1164,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 					lastOutput = fixResult
 					node.Output = fixResult
 					MaterializeCode(team.Cwd, fixResult, lang)
-					buildErrors = runBuildCheckLang(team.Cwd, lang)
+					buildErrors = runBuildCheckScoped(team.Cwd, lang, node.TargetPackages)
 					if buildErrors == "" {
 						buildPassed = true
 						o.notify(o.chatID, fmt.Sprintf("  🟢 %s 编译修复成功 (重试 %d)", node.Title, retry))
@@ -1669,6 +1678,23 @@ func (o *Orchestrator) buildTaskPrompt(node *TaskNode, objective string) string 
 	if node.AcceptCriteria != "" && node.AcceptCriteria != "-" {
 		b.WriteString("### 验收标准\n" + node.AcceptCriteria + "\n\n")
 	}
+
+	// 文件隔离: 明确限定 coder 只能修改目标文件/包
+	if len(node.TargetFiles) > 0 {
+		b.WriteString("### 目标文件 (仅限以下文件, 不要修改其他文件)\n")
+		for _, f := range node.TargetFiles {
+			b.WriteString("- " + f + "\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(node.TargetPackages) > 0 {
+		b.WriteString("### 目标包 (编译验证范围)\n")
+		for _, p := range node.TargetPackages {
+			b.WriteString("- " + p + "\n")
+		}
+		b.WriteString("\n")
+	}
+
 	if node.Retries > 0 {
 		b.WriteString(fmt.Sprintf("### ⚠️ 重试 (第 %d 次)\n上次失败: %s\n", node.Retries, node.Error))
 		if node.TestResult != "" {

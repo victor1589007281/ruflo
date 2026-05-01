@@ -330,7 +330,10 @@ func developmentWorkflow() *WorkflowDef {
       "acceptance": "编译通过 + 接口签名与设计一致",
       "priority": 2,
       "complexity": "medium",
-      "maxFiles": 3
+      "maxFiles": 3,
+      "contextBudget": "medium",
+      "targetFiles": ["internal/storage/engine.go", "internal/storage/engine_test.go"],
+      "targetPackages": ["./internal/storage/..."]
     }
   ]
 }
@@ -345,6 +348,30 @@ func developmentWorkflow() *WorkflowDef {
 6. **复杂度标签**: 每个任务标注 "complexity": "simple"(2轮)/"medium"(3轮)/"complex"(5轮)
 7. **粒度控制**: 算法密集型(如解析器/索引)必须拆为 3+ 子任务; 配置类任务合并为 1 个
 8. **理想任务数**: 14-18 个 (大于 10), 每个任务 8-15 分钟完成
+9. **上下文预算 (新增)**: 每个任务必须估算 token 消耗并标注 "contextBudget"
+   - "low": <4K token (纯配置/接口定义, 无算法)
+   - "medium": 4K-10K token (标准业务逻辑, 1-3 个文件)
+   - "high": 10K-20K token (复杂算法, 必须进一步拆分)
+   - 禁止分配 "high" 预算的任务, 必须拆分为多个 "medium" 或 "low"
+10. **文件级拆解 (新增)**: 每个任务必须精确标注:
+    - "targetFiles": ["具体文件路径"] — coder 只能修改这些文件
+    - "targetPackages": ["./pkg/xxx/..."] — 编译验证只检查这些包
+    - 如果 task 涉及修改已有文件 + 新建文件, 必须全部列出
+11. **上下文压缩 (新增)**: 为控制 designRef 的 token 占用, 每个任务的 designRef 只包含:
+    - 目标模块的接口签名 (struct + method 签名, 不含实现)
+    - 跨模块依赖时, 只引用依赖模块的接口签名, 不引用实现
+    - 单模块接口签名应控制在 30 行以内 (约 1K token)
+12. **分解粒度自检 DGI (新增, 参考 clawrxiv 2604.00690)**:
+    - 计算 S = 完成项目的最小必要顺序步骤数 (从设计文档估算)
+    - 计算 K = 你分解的任务总数
+    - DGI = K / S
+    - 若 DGI < 0.5 * sqrt(S): 任务过粗, 需要增加子任务
+    - 若 DGI > 1.5 * sqrt(S): 任务过细, 协调开销过高, 合并部分任务
+    - 目标: DGI ≈ 0.85 * sqrt(S)
+13. **Search→Read→Edit 粒度 (新增, 参考 TRAJEVAL)**:
+    - 每个 coder task 必须是 "Edit" 级别: 已知要改哪些文件、哪些函数
+    - 不要给 coder 分配 "Search" 级别任务 (如"找出所有需要修改的地方")
+    - Search 和 Read 应该在 plan 阶段由 planner 完成, 不要留给 coder
 
 ## 职责 3: 定义偏差检测点 (Drift Checkpoints)
 
@@ -856,8 +883,7 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	var allResults []StageResult
 	prevResults := make(map[string]string)
 
-	designStages, generatorStages, evalStage, parallelStages := classifyStages(wf.Stages)
-	maxRounds, terminator := we.initAdaptiveTerminator(wf)
+	designStages, _, _, parallelStages := classifyStages(wf.Stages)
 	we.tryInitDAG()
 
 	// 恢复检查点: 如果有已完成的阶段, 跳过并注入 prevResults
@@ -873,7 +899,7 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 	}
 
 	// Phase 2: Orchestrator (DAG 驱动, pool 由 DAG 宽度精确控制)
-	//          fallback: 经典对抗循环 (pool 用粗糙 autoScalePool)
+	// 修复: 禁止 silent fallback 到对抗循环。Orchestrator 是 Plan→Execute 的唯一通道。
 	orchUsed := false
 	if planOutput, hasPlan := prevResults["plan"]; hasPlan && we.dagTracker != nil {
 		orchResults, orchErr := we.runOrchestratedPhase(ctx, planOutput, objective, prevResults, team, allResults)
@@ -883,19 +909,14 @@ func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *Workf
 			we.flushStagesLive(team, allResults)
 			orchUsed = true
 		} else if orchErr != nil {
-			we.notify(we.chatID, fmt.Sprintf("⚠️ Orchestrator 启动失败, fallback 对抗循环: %v", orchErr))
+			we.notify(we.chatID, fmt.Sprintf("🔴 Orchestrator 启动失败, 终止工作流 (不再 fallback 到对抗循环): %v", orchErr))
+			return allResults, fmt.Errorf("orchestrator 启动失败: %w", orchErr)
 		}
 	}
 
 	if !orchUsed {
-		we.autoScalePool(wf, designStages, generatorStages, evalStage, parallelStages, maxRounds)
-		advResults, err := we.runAdversarialLoop(ctx, generatorStages, evalStage, maxRounds, terminator, objective, prevResults, team)
-		allResults = append(allResults, advResults...)
-		we.savePhaseCheckpoints(advResults)
-		we.flushStagesLive(team, allResults)
-		if err != nil {
-			return allResults, err
-		}
+		we.notify(we.chatID, "🔴 未找到有效 Plan 或 DAG 未配置, 终止工作流")
+		return allResults, fmt.Errorf("plan 缺失或 DAG 未配置, 无法启动 Orchestrator")
 	}
 
 	// Phase 3: E2E 对抗测试
@@ -3845,6 +3866,42 @@ func runBuildCheckLang(cwd, lang string) string {
 		out, err := runLimitedCommand(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent)
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s 失败:\n%s", strings.Join(args, " "), string(out)))
+		}
+	}
+	if len(errors) == 0 {
+		return ""
+	}
+	result := strings.Join(errors, "\n\n")
+	if len(result) > 3000 {
+		result = result[:3000] + "\n...(截断)"
+	}
+	return result
+}
+
+// runBuildCheckScoped 按目标包路径进行局部编译检查，避免全局编译时跨任务错误污染。
+// targetPackages 为空时回退到全局编译 (runBuildCheckLang)。
+func runBuildCheckScoped(cwd, lang string, targetPackages []string) string {
+	if cwd == "" {
+		return ""
+	}
+	if len(targetPackages) == 0 {
+		return runBuildCheckLang(cwd, lang)
+	}
+
+	tc := GetToolchain(lang)
+	if _, err := os.Stat(filepath.Join(cwd, tc.ProjectFile)); err != nil {
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), tc.Timeout)
+	defer cancel()
+
+	var errors []string
+	for _, pkg := range targetPackages {
+		args := []string{"go", "build", pkg}
+		out, err := runLimitedCommand(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("go build %s 失败:\n%s", pkg, string(out)))
 		}
 	}
 	if len(errors) == 0 {
