@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"context"
+
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 )
 
@@ -11,6 +13,38 @@ type PlanConfigKey struct{}
 // ModelConfigKey 是 context.Context 中保存 modelconfig.ResolvedConfig 的 key。
 // 用于传递更丰富的模型配置 (alias, provider, maxTokens 等)。
 type ModelConfigKey struct{}
+
+// RunMetadataKey 是 context.Context 中保存团队/角色运行标签的 key。
+type RunMetadataKey struct{}
+
+// RunMetadata 描述一次 Agent Runner 调用的业务来源, 用于 LLM prompt 账本指标。
+type RunMetadata struct {
+	Source   string
+	Purpose  string
+	Workflow string
+	Role     string
+	Team     string
+	Stage    string
+}
+
+// WithRunMetadata 将团队运行标签写入 context。
+func WithRunMetadata(ctx context.Context, meta RunMetadata) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, RunMetadataKey{}, meta)
+}
+
+// RunMetadataFromContext 读取团队运行标签。
+func RunMetadataFromContext(ctx context.Context) RunMetadata {
+	if ctx == nil {
+		return RunMetadata{}
+	}
+	if meta, ok := ctx.Value(RunMetadataKey{}).(RunMetadata); ok {
+		return meta
+	}
+	return RunMetadata{}
+}
 
 // PlanConfigResolver 按 plan + role 层级解析最终 API 连接参数。
 // 现在是 modelconfig.ConfigResolver 的轻量包装，保持向后兼容的接口。

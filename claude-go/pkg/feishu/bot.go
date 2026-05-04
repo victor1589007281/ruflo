@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,15 +34,15 @@ import (
 	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/mcp"
-	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/memory"
+	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/observability"
 	"github.com/anthropic/claude-go/pkg/skills"
+	swarm_intel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/anthropic/claude-go/pkg/vision"
 	"github.com/anthropic/claude-go/pkg/wiki"
-	swarm_intel "github.com/anthropic/claude-go/pkg/swarm_intel"
 )
 
 // 飞书消息长度限制 (富文本卡片约 30KB, 普通文本约 4000 字符)
@@ -187,31 +188,31 @@ func (da *dreamAdapter) AfterQuery(ctx context.Context) {
 //   - 群聊中默认仅响应 @机器人 的消息
 //   - 支持 /clear 和 /help 等斜杠命令
 type Bot struct {
-	config     *BotConfig
-	client     *lark.Client                 // 飞书 API 客户端 (用于发送消息)
-	wsClient   *larkws.Client               // WebSocket 长连接客户端
-	sessions   *SessionManager              // 会话管理器
-	apiClient  *api.Client                  // AI API 客户端
-	mcpMgr     *dynmcp.Manager              // 动态 MCP 管理器 (进程级别共享)
-	skillReg   *skills.Registry             // 技能注册表 (进程级别共享)
-	dreamer    *dreaming.Dreamer            // Dreaming 记忆整理引擎
-	memStore   *memory.TieredStore          // 多层记忆存储 (进程级别共享)
-	factStore  *memory.FactStore            // L2 结构化记忆 (V3 Anti-Amnesia)
-	teamMgr    *agent.ProductionTeamManager // 生产级 Agent Teams 管理器
-	intentRec  *agent.IntentRecognizer      // 自然语言意图识别器
-	taskStore  *builtin.TaskStore           // 共享 V2 Task 存储
-	evolution  *agent.EvolutionEngine       // 自动进化引擎
-	cfgWatcher *hotreload.Watcher           // 配置热加载监控器
-	cronSched  *agent.CronScheduler         // 定时任务调度器
-	layout     *basedir.Layout              // 统一目录布局
-	wikiEngine  *wiki.Engine                 // LLM Wiki 知识库引擎
-	swarmEngine *swarm_intel.Engine           // 群体智能预测引擎
-	visionCli      *vision.Client               // 视觉能力客户端
-	skillAuto      *skills.AutoCreator          // 技能自动创建器
-	aliasMetrics   *modelconfig.AliasMetricsCollector // 别名级 LLM 指标采集器
-	modelRegistry  *modelconfig.ProviderRegistry      // 模型注册表 (新模式)
-	modelResolver  *modelconfig.ConfigResolver        // 模型配置解析器 (新模式)
-	startTime      time.Time                    // 启动时间
+	config        *BotConfig
+	client        *lark.Client                       // 飞书 API 客户端 (用于发送消息)
+	wsClient      *larkws.Client                     // WebSocket 长连接客户端
+	sessions      *SessionManager                    // 会话管理器
+	apiClient     *api.Client                        // AI API 客户端
+	mcpMgr        *dynmcp.Manager                    // 动态 MCP 管理器 (进程级别共享)
+	skillReg      *skills.Registry                   // 技能注册表 (进程级别共享)
+	dreamer       *dreaming.Dreamer                  // Dreaming 记忆整理引擎
+	memStore      *memory.TieredStore                // 多层记忆存储 (进程级别共享)
+	factStore     *memory.FactStore                  // L2 结构化记忆 (V3 Anti-Amnesia)
+	teamMgr       *agent.ProductionTeamManager       // 生产级 Agent Teams 管理器
+	intentRec     *agent.IntentRecognizer            // 自然语言意图识别器
+	taskStore     *builtin.TaskStore                 // 共享 V2 Task 存储
+	evolution     *agent.EvolutionEngine             // 自动进化引擎
+	cfgWatcher    *hotreload.Watcher                 // 配置热加载监控器
+	cronSched     *agent.CronScheduler               // 定时任务调度器
+	layout        *basedir.Layout                    // 统一目录布局
+	wikiEngine    *wiki.Engine                       // LLM Wiki 知识库引擎
+	swarmEngine   *swarm_intel.Engine                // 群体智能预测引擎
+	visionCli     *vision.Client                     // 视觉能力客户端
+	skillAuto     *skills.AutoCreator                // 技能自动创建器
+	aliasMetrics  *modelconfig.AliasMetricsCollector // 别名级 LLM 指标采集器
+	modelRegistry *modelconfig.ProviderRegistry      // 模型注册表 (新模式)
+	modelResolver *modelconfig.ConfigResolver        // 模型配置解析器 (新模式)
+	startTime     time.Time                          // 启动时间
 
 	// 消息去重: 防止同一条消息触发多个团队
 	processedMsgs sync.Map // messageID → timestamp
@@ -301,6 +302,14 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	if err := layout.EnsureAll(); err != nil {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
+	if config.PromptDebug {
+		aiClient.PromptDebugEnabled = true
+		aiClient.PromptDebugDir = config.PromptDebugDir
+		if aiClient.PromptDebugDir == "" {
+			aiClient.PromptDebugDir = filepath.Join(layout.Root, "prompt-debug")
+		}
+		log.Printf("[Bot] PromptDebug 已开启: %s", aiClient.PromptDebugDir)
+	}
 
 	// 初始化统一日志系统
 	_ = logging.Init(&logging.LogConfig{
@@ -389,6 +398,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				"status":        rec.Status,
 				"source":        rec.Source,
 				"purpose":       rec.Purpose,
+				"workflow":      rec.Workflow,
+				"role":          rec.Role,
 				"duration_sec":  rec.DurationSec,
 				"input_tokens":  rec.InputTokens,
 				"output_tokens": rec.OutputTokens,
@@ -403,10 +414,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
-		BaseDir:            layout.Teams,
-		Cwd:                config.Cwd,
-		Factory:            bot.sessions.CreateAgentRunner,
-		Notify:             func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
+		BaseDir: layout.Teams,
+		Cwd:     config.Cwd,
+		Factory: bot.sessions.CreateAgentRunner,
+		Notify:  func(chatID, msg string) { bot.sendLongMessage(context.Background(), chatID, msg) },
 		MediaNotify: func(chatID string, data []byte, filename, mediaType string) error {
 			ctx := context.Background()
 			switch mediaType {
@@ -416,12 +427,12 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				return bot.sendFileMessage(ctx, chatID, data, filename, "stream")
 			}
 		},
-		TaskTracker:      &dagTaskAdapter{store: bot.taskStore},
-		Pool:             agentPool,
-		LLM:              aiClient,
-		Evolution:        bot.evolution,
-		Dreamer:          &dreamAdapter{dreamer: bot.dreamer},
-		Roles:            roleReg,
+		TaskTracker:        &dagTaskAdapter{store: bot.taskStore},
+		Pool:               agentPool,
+		LLM:                aiClient,
+		Evolution:          bot.evolution,
+		Dreamer:            &dreamAdapter{dreamer: bot.dreamer},
+		Roles:              roleReg,
 		PlanConfigResolver: planCfgResolver,
 	})
 
@@ -609,7 +620,9 @@ func (b *Bot) initMCPServers(config *BotConfig) {
 		if err != nil {
 			log.Printf("[飞书Bot] 加载 MCP 配置失败 (%s): %v", config.MCPConfigPath, err)
 		} else {
-			b.mcpMgr.InitFromConfigs(ctx, configs)
+			for _, cfg := range configs {
+				b.addMCPServerWithTimeout(ctx, cfg)
+			}
 		}
 	}
 
@@ -623,9 +636,15 @@ func (b *Bot) initMCPServers(config *BotConfig) {
 		if sc.Transport == "" {
 			sc.Transport = "stdio"
 		}
-		if err := b.mcpMgr.AddServer(ctx, sc); err != nil {
-			log.Printf("[飞书Bot] MCP 连接失败 (%s): %v", name, err)
-		}
+		b.addMCPServerWithTimeout(ctx, sc)
+	}
+}
+
+func (b *Bot) addMCPServerWithTimeout(parent context.Context, sc mcp.ServerConfig) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	if err := b.mcpMgr.AddServer(ctx, sc); err != nil {
+		log.Printf("[飞书Bot] MCP 连接失败 (%s): %v", sc.Name, err)
 	}
 }
 
@@ -704,9 +723,7 @@ func (b *Bot) reloadConfig(path string) {
 	for _, cfg := range configs {
 		newServers[cfg.Name] = true
 		if !currentServers[cfg.Name] {
-			if err := b.mcpMgr.AddServer(ctx, cfg); err != nil {
-				log.Printf("[HotReload] 添加 MCP %s 失败: %v", cfg.Name, err)
-			}
+			b.addMCPServerWithTimeout(ctx, cfg)
 		}
 	}
 
@@ -1138,7 +1155,7 @@ func (b *Bot) handlePostMessage(chatID, messageID string, msg *larkim.EventMessa
 	var textParts []string
 
 	var raw struct {
-		Title   string          `json:"title"`
+		Title   string              `json:"title"`
 		Content [][]json.RawMessage `json:"content"`
 	}
 
@@ -3008,6 +3025,15 @@ func (b *Bot) llmDetectComplexity(ctx context.Context, text string) bool {
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
+	timeoutCtx = api.WithLLMMetrics(timeoutCtx, api.LLMMetricsContext{
+		Source:   "feishu_main",
+		Purpose:  "complexity_classifier",
+		Workflow: "auto_plan",
+		PromptComponents: api.PromptComponentMetrics{
+			SystemChars:   len(sysPrompt),
+			MessagesChars: len(text),
+		},
+	})
 
 	resp, err := b.apiClient.SimpleComplete(timeoutCtx, sysPrompt, text)
 	if err != nil {

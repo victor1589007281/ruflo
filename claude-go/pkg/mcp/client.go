@@ -130,11 +130,11 @@ func LoadServerConfigsFromFile(path string) ([]ServerConfig, error) {
 // 对应 TS: services/mcp/client.ts 中的 connectToServer()
 //
 // stdio 传输流程:
-//   1. spawn 子进程 (command + args)
-//   2. 发送 initialize 请求
-//   3. 收到 initialize 响应 (获取 server capabilities)
-//   4. 发送 initialized 通知
-//   5. 发送 tools/list 获取工具列表
+//  1. spawn 子进程 (command + args)
+//  2. 发送 initialize 请求
+//  3. 收到 initialize 响应 (获取 server capabilities)
+//  4. 发送 initialized 通知
+//  5. 发送 tools/list 获取工具列表
 func (c *Client) Connect(ctx context.Context, config ServerConfig) (*Connection, error) {
 	conn := &Connection{
 		Config: config,
@@ -189,8 +189,8 @@ func (c *Client) connectStdio(ctx context.Context, conn *Connection) error {
 	conn.stdout = bufio.NewScanner(stdout)
 	conn.stdout.Buffer(make([]byte, 1024*1024), 1024*1024)
 
-	// 发送 initialize
-	initResult, err := conn.sendRequest("initialize", map[string]interface{}{
+	// 发送 initialize。启动阶段必须继承调用方 ctx, 避免异常 MCP 进程卡死 Bot 初始化。
+	initResult, err := conn.sendRequestCtx(ctx, "initialize", map[string]interface{}{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]string{
@@ -207,7 +207,7 @@ func (c *Client) connectStdio(ctx context.Context, conn *Connection) error {
 	_ = conn.sendNotification("notifications/initialized", nil)
 
 	// 获取工具列表
-	toolsResult, err := conn.sendRequest("tools/list", nil)
+	toolsResult, err := conn.sendRequestCtx(ctx, "tools/list", nil)
 	if err != nil {
 		conn.Status = "connected"
 		return nil // 工具列表失败不影响连接
@@ -380,7 +380,7 @@ func (t *MCPTool) Name() string {
 	return fmt.Sprintf("mcp_%s_%s", t.serverName, t.info.Name)
 }
 
-func (t *MCPTool) Description() string { return t.info.Description }
+func (t *MCPTool) Description() string          { return t.info.Description }
 func (t *MCPTool) InputSchema() json.RawMessage { return t.info.InputSchema }
 func (t *MCPTool) IsReadOnly(_ json.RawMessage) bool {
 	lower := strings.ToLower(t.info.Name)

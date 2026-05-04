@@ -103,23 +103,23 @@ func (s *Session) Touch() {
 type MediaSendFunc func(ctx context.Context, chatID string, data []byte, filename, mediaType string) error
 
 type SessionManager struct {
-	sessions       map[string]*Session
-	mu             sync.RWMutex
-	config         *BotConfig
-	apiClient      *api.Client
-	maxSessions    int
-	sessionTimeout time.Duration
-	mcpMgr         *dynmcp.Manager
-	skillReg       *skills.Registry
-	dreamer        *dreaming.Dreamer
-	memoryStore    *memory.TieredStore
-	hookConfigs    []types.HookConfig
-	taskStore      *builtin.TaskStore           // 共享 V2 Task 存储 (Teams + LLM 工具共用)
-	evolution      *agent.EvolutionEngine       // 进化引擎 (注入 agent runner hooks)
-	roleRegistry   *agent.RoleRegistry          // 角色注册表
-	mediaSendFn    MediaSendFunc                // 飞书发送图片/文件的回调
-	teamMgr        *agent.ProductionTeamManager // 团队管理器 (供 TeamQuery 工具使用)
-	searcher       builtin.WebSearcher          // Web 搜索适配器 (浏览器)
+	sessions        map[string]*Session
+	mu              sync.RWMutex
+	config          *BotConfig
+	apiClient       *api.Client
+	maxSessions     int
+	sessionTimeout  time.Duration
+	mcpMgr          *dynmcp.Manager
+	skillReg        *skills.Registry
+	dreamer         *dreaming.Dreamer
+	memoryStore     *memory.TieredStore
+	hookConfigs     []types.HookConfig
+	taskStore       *builtin.TaskStore           // 共享 V2 Task 存储 (Teams + LLM 工具共用)
+	evolution       *agent.EvolutionEngine       // 进化引擎 (注入 agent runner hooks)
+	roleRegistry    *agent.RoleRegistry          // 角色注册表
+	mediaSendFn     MediaSendFunc                // 飞书发送图片/文件的回调
+	teamMgr         *agent.ProductionTeamManager // 团队管理器 (供 TeamQuery 工具使用)
+	searcher        builtin.WebSearcher          // Web 搜索适配器 (浏览器)
 	defaultResolved modelconfig.ResolvedConfig   // 默认模型解析配置 (从 alias 解析)
 }
 
@@ -274,6 +274,8 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		PermissionMode:   permMode,
 		IsNonInteractive: true, // 飞书模式始终为非交互式
 		Debug:            sm.config.Debug,
+		MetricsSource:    "feishu_main",
+		MetricsPurpose:   chatID,
 		DynamicPlanCheck: builtin.PlanModeActive,
 		// 飞书会话中禁止 LLM 自主调用团队内部工具。
 		// 团队操作只能通过 /team、/go 命令触发。
@@ -372,6 +374,8 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	if opts.Model != "" {
 		model = opts.Model
 	}
+	runMeta := agent.RunMetadataFromContext(ctx)
+	nestedPurpose := firstNonEmpty(opts.SubagentType, runMeta.Purpose, runMeta.Team)
 
 	cfg := &engine.Config{
 		Model:            model,
@@ -381,6 +385,10 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		PermissionMode:   permMode,
 		IsNonInteractive: true,
 		Debug:            sm.config.Debug,
+		MetricsSource:    "nested_agent",
+		MetricsPurpose:   nestedPurpose,
+		Workflow:         runMeta.Workflow,
+		Role:             firstNonEmpty(opts.SubagentType, runMeta.Role),
 	}
 
 	nested := engine.NewQueryEngine(cfg, nestedAPIClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
@@ -587,6 +595,7 @@ func (sm *SessionManager) CreateAgentRunner(ctx context.Context, role, systemPro
 	if mcfg, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok && mcfg.ProviderName != "" {
 		r.resolvedCfg = mcfg
 	}
+	r.runMeta = agent.RunMetadataFromContext(ctx)
 	return r, nil
 }
 
@@ -596,6 +605,7 @@ type sessionAgentRunner struct {
 	role         string
 	systemPrompt string
 	resolvedCfg  modelconfig.ResolvedConfig // 从创建时 context 捕获的 plan/role 模型配置
+	runMeta      agent.RunMetadata
 }
 
 // Execute 执行 agent 任务 (创建独立 QueryEngine, 复用主会话运行模式)。
@@ -691,6 +701,10 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		PermissionMode:   permMode,
 		IsNonInteractive: true,
 		Debug:            r.sm.config.Debug,
+		MetricsSource:    firstNonEmpty(r.runMeta.Source, "team_stage"),
+		MetricsPurpose:   firstNonEmpty(r.runMeta.Purpose, r.runMeta.Team),
+		Workflow:         r.runMeta.Workflow,
+		Role:             firstNonEmpty(r.runMeta.Role, r.role),
 	}
 
 	eng := engine.NewQueryEngine(cfg, apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
@@ -764,4 +778,13 @@ func extractMessageText(msg types.Message) string {
 		}
 	}
 	return text
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

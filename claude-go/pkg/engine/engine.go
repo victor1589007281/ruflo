@@ -3,11 +3,11 @@
 //
 // 这是 Claude Code 客户端的心脏。QueryEngine 管理对话状态，
 // queryLoop 是一个 while(true) 循环:
-//   1. (可选) auto-compact / micro-compact / snip
-//   2. 调用模型 API (流式)
-//   3. 解析 assistant 响应中的 tool_use 块
-//   4. 如果无 tool_use → 执行 stop hooks → 返回
-//   5. 如果有 tool_use → 执行工具 (partitionToolCalls) → 追加结果 → 继续循环
+//  1. (可选) auto-compact / micro-compact / snip
+//  2. 调用模型 API (流式)
+//  3. 解析 assistant 响应中的 tool_use 块
+//  4. 如果无 tool_use → 执行 stop hooks → 返回
+//  5. 如果有 tool_use → 执行工具 (partitionToolCalls) → 追加结果 → 继续循环
 //
 // 完整特性:
 //   - MicroCompact: 截断过大的 tool_result (对应 TS: microCompact.ts)
@@ -43,7 +43,7 @@ var uuidCounter atomic.Int64
 // 断路器常量 (Circuit Breaker)
 // 对应 TS: query.ts 中 consecutiveErrorCount 相关逻辑
 const (
-	maxConsecutiveErrors = 5  // 连续错误达到此阈值触发熔断
+	maxConsecutiveErrors = 5     // 连续错误达到此阈值触发熔断
 	microCompactMaxChars = 50000 // MicroCompact 截断阈值 (字符)
 )
 
@@ -51,10 +51,11 @@ const (
 // 对应 TS: QueryEngine.ts 中的 class QueryEngine。
 //
 // 使用方式:
-//   engine := NewQueryEngine(config)
-//   engine.EnableFrontierOptimizations()  // 可选: 启用前沿模型优化组件
-//   resultCh := engine.SubmitMessage(ctx, userMessage)
-//   for msg := range resultCh { ... }
+//
+//	engine := NewQueryEngine(config)
+//	engine.EnableFrontierOptimizations()  // 可选: 启用前沿模型优化组件
+//	resultCh := engine.SubmitMessage(ctx, userMessage)
+//	for msg := range resultCh { ... }
 type QueryEngine struct {
 	Config       *Config
 	Messages     []types.Message
@@ -65,21 +66,21 @@ type QueryEngine struct {
 	Compactor    *compact.Compactor
 	PromptMgr    *prompt.Manager
 	MemoryStore  *memory.TieredStore   // 多层记忆存储 (可选, nil 则不启用)
-	FactStore    *memory.FactStore    // V3 Anti-Amnesia: L2 结构化记忆 (可选)
-	Ingestor     *memory.Ingestor    // V3: 记忆摄入器 (可选)
+	FactStore    *memory.FactStore     // V3 Anti-Amnesia: L2 结构化记忆 (可选)
+	Ingestor     *memory.Ingestor      // V3: 记忆摄入器 (可选)
 	SessionStore SessionStoreInterface // 会话持久化 (可选, nil 则不启用)
 
 	// ========== 前沿模型优化组件 (全部可选, nil 则走基线行为) ==========
 	// 设计依据: docs/query-engine-frontier-optimization.md
 	// 开关由 Config.Enable* 字段控制, 默认通过 EnableFrontierOptimizations() 统一启用。
-	Metrics       *EngineMetrics        // G10 共享指标
-	PromptCache   *PromptCacheBuilder   // G1 Prompt cache 构建
-	Budget        *TokenBudgetManager   // G2 Token 预算分级
-	LoopDet       *LoopDetector         // G3 工具循环检测
-	ErrClassifier *ErrorClassifier      // G4 错误族隔离 budget
-	JSONRepair    *JSONRepair           // G5 工具输入 JSON 修复
-	TrajStore     TrajectoryStore       // G6 轨迹记忆
-	StopDet       *StopSignalDetector   // G7 CaRT 停止信号
+	Metrics       *EngineMetrics      // G10 共享指标
+	PromptCache   *PromptCacheBuilder // G1 Prompt cache 构建
+	Budget        *TokenBudgetManager // G2 Token 预算分级
+	LoopDet       *LoopDetector       // G3 工具循环检测
+	ErrClassifier *ErrorClassifier    // G4 错误族隔离 budget
+	JSONRepair    *JSONRepair         // G5 工具输入 JSON 修复
+	TrajStore     TrajectoryStore     // G6 轨迹记忆
+	StopDet       *StopSignalDetector // G7 CaRT 停止信号
 
 	CumulativeUsage types.Usage // 本会话累积 token 消耗
 	ContextBudget   int         // 上下文窗口大小 (tokens, 默认 200000)
@@ -105,6 +106,10 @@ type Config struct {
 	IsNonInteractive bool
 	Debug            bool
 	SessionID        string
+	MetricsSource    string // LLM 指标来源: feishu_main / nested_agent / team_stage / cli
+	MetricsPurpose   string // 额外维度: chatID / team / stage / compact 等
+	Workflow         string // Agent Team 工作流名
+	Role             string // Agent 角色名
 	// DynamicPlanCheck 动态计划模式检查。
 	// 当 LLM 调用 EnterPlanMode 时返回 true, 引擎自动切换到只读权限。
 	// 对应 TS: QueryEngine 中 permissionMode 与 PlanModeActive 联动。
@@ -170,8 +175,9 @@ func NewQueryEngine(
 // 详细设计见 docs/query-engine-frontier-optimization.md。
 //
 // 启用清单:
-//   P0: Metrics, ErrorClassifier, JSONRepair, LoopDetector
-//   P1: PromptCache, Budget, Trajectory (若已配置 MemoryStore)
+//
+//	P0: Metrics, ErrorClassifier, JSONRepair, LoopDetector
+//	P1: PromptCache, Budget, Trajectory (若已配置 MemoryStore)
 //
 // StopSignal/HeavyMode 需单独设置 Config.EnableStopSignal=true。
 func (e *QueryEngine) EnableFrontierOptimizations() {
@@ -233,12 +239,12 @@ func (e *QueryEngine) GetEngineMetrics() map[string]any {
 
 // ContextUsageInfo 返回上下文使用信息。
 type ContextUsageInfo struct {
-	TotalTokens   int
-	InputTokens   int
-	OutputTokens  int
-	Budget        int
-	Percentage    float64
-	MessageCount  int
+	TotalTokens  int
+	InputTokens  int
+	OutputTokens int
+	Budget       int
+	Percentage   float64
+	MessageCount int
 }
 
 // GetContextUsage 获取上下文使用信息。
@@ -264,10 +270,10 @@ func (e *QueryEngine) GetContextUsage() ContextUsageInfo {
 // 对应 TS: QueryEngine.submitMessage()
 //
 // 流程:
-//   1. 将用户消息追加到 Messages
-//   2. 组装系统提示词 (PromptMgr)
-//   3. 启动 queryLoop (goroutine)
-//   4. 通过 channel 返回所有响应消息
+//  1. 将用户消息追加到 Messages
+//  2. 组装系统提示词 (PromptMgr)
+//  3. 启动 queryLoop (goroutine)
+//  4. 通过 channel 返回所有响应消息
 func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-chan types.Message {
 	ch := make(chan types.Message, 50)
 
@@ -340,31 +346,31 @@ func (e *QueryEngine) SubmitStream(ctx context.Context, userContent string) <-ch
 //
 // 这是整个系统最关键的函数。算法如下:
 //
-//   while (true) {
-//     // Phase 1: 上下文压缩 (compact)
-//     messages = autoCompact(messages)
-//     messages = microCompact(messages)
+//	while (true) {
+//	  // Phase 1: 上下文压缩 (compact)
+//	  messages = autoCompact(messages)
+//	  messages = microCompact(messages)
 //
-//     // Phase 2: 组装提示词
-//     systemPrompt = buildEffectiveSystemPrompt(...)
+//	  // Phase 2: 组装提示词
+//	  systemPrompt = buildEffectiveSystemPrompt(...)
 //
-//     // Phase 3: 调用模型 API (流式)
-//     for event in stream(messages, systemPrompt, tools):
-//       收集 assistant 消息和 tool_use 块
+//	  // Phase 3: 调用模型 API (流式)
+//	  for event in stream(messages, systemPrompt, tools):
+//	    收集 assistant 消息和 tool_use 块
 //
-//     // Phase 4: 执行 post-sampling hooks
-//     executePostSamplingHooks(...)
+//	  // Phase 4: 执行 post-sampling hooks
+//	  executePostSamplingHooks(...)
 //
-//     // Phase 5a: 如果没有 tool_use → stop hooks → return
-//     if no tool_use:
-//       stopResult = handleStopHooks(...)
-//       if stopResult.blocking → 追加 blocking message → continue
-//       else → return "completed"
+//	  // Phase 5a: 如果没有 tool_use → stop hooks → return
+//	  if no tool_use:
+//	    stopResult = handleStopHooks(...)
+//	    if stopResult.blocking → 追加 blocking message → continue
+//	    else → return "completed"
 //
-//     // Phase 5b: 如果有 tool_use → 执行工具 → 追加结果 → continue
-//     toolResults = runTools(toolUseBlocks, registry, context)
-//     messages = append(messages, assistantMsgs, toolResults)
-//   }
+//	  // Phase 5b: 如果有 tool_use → 执行工具 → 追加结果 → continue
+//	  toolResults = runTools(toolUseBlocks, registry, context)
+//	  messages = append(messages, assistantMsgs, toolResults)
+//	}
 func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message, streamCh chan<- types.StreamEvent) ([]types.Message, types.Terminal) {
 	turnCount := 0
 	currentModel := e.Config.Model
@@ -520,7 +526,16 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			apiTools = allTools
 		}
 
-		eventCh, errCh := e.APIClient.StreamMessage(ctx, apiMessages, systemPrompt, apiTools, e.Config.MaxTokens)
+		components := buildPromptComponentMetrics(systemPrompt, apiTools, messages)
+		apiCtx := api.WithLLMMetrics(ctx, api.LLMMetricsContext{
+			Source:           e.Config.MetricsSource,
+			Purpose:          e.Config.MetricsPurpose,
+			Workflow:         e.Config.Workflow,
+			Role:             e.Config.Role,
+			PromptComponents: components,
+		})
+
+		eventCh, errCh := e.APIClient.StreamMessage(apiCtx, apiMessages, systemPrompt, apiTools, e.Config.MaxTokens)
 
 		var assistantBlocks []types.ContentBlock
 		var toolUseBlocks []types.ContentBlock
@@ -546,68 +561,68 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					currentText.Reset()
 					currentToolInput.Reset()
 				}
-		case "content_block_delta":
-			if event.Delta != nil {
-				switch event.Delta.Type {
-				case "text_delta":
-					currentText.WriteString(event.Delta.Text)
-					if streamCh != nil {
-						streamCh <- types.StreamEvent{
-							Kind:       types.StreamEventDelta,
-							DeltaText:  event.Delta.Text,
-							BlockIndex: event.Index,
+			case "content_block_delta":
+				if event.Delta != nil {
+					switch event.Delta.Type {
+					case "text_delta":
+						currentText.WriteString(event.Delta.Text)
+						if streamCh != nil {
+							streamCh <- types.StreamEvent{
+								Kind:       types.StreamEventDelta,
+								DeltaText:  event.Delta.Text,
+								BlockIndex: event.Index,
+							}
+						}
+					case "input_json_delta":
+						currentToolInput.WriteString(event.Delta.PartialJSON)
+					case "thinking_delta":
+						currentText.WriteString(event.Delta.Thinking)
+						if streamCh != nil {
+							streamCh <- types.StreamEvent{
+								Kind:       types.StreamEventDelta,
+								DeltaText:  event.Delta.Thinking,
+								BlockIndex: event.Index,
+								IsThinking: true,
+							}
 						}
 					}
-				case "input_json_delta":
-					currentToolInput.WriteString(event.Delta.PartialJSON)
-				case "thinking_delta":
-					currentText.WriteString(event.Delta.Thinking)
-					if streamCh != nil {
-						streamCh <- types.StreamEvent{
-							Kind:       types.StreamEventDelta,
-							DeltaText:  event.Delta.Thinking,
-							BlockIndex: event.Index,
-							IsThinking: true,
-						}
+					if event.Delta.StopReason != "" {
+						stopReason = event.Delta.StopReason
 					}
 				}
-				if event.Delta.StopReason != "" {
-					stopReason = event.Delta.StopReason
-				}
-			}
-		case "content_block_stop":
-			if currentBlock != nil {
-				block := *currentBlock
-				switch block.Type {
-				case types.ContentBlockText:
-					block.Text = currentText.String()
-				case types.ContentBlockToolUse:
-					block.Input = json.RawMessage(currentToolInput.String())
-					toolUseBlocks = append(toolUseBlocks, block)
-					if streamCh != nil {
-						inputSummary := currentToolInput.String()
-						if len(inputSummary) > 200 {
-							inputSummary = inputSummary[:200] + "..."
+			case "content_block_stop":
+				if currentBlock != nil {
+					block := *currentBlock
+					switch block.Type {
+					case types.ContentBlockText:
+						block.Text = currentText.String()
+					case types.ContentBlockToolUse:
+						block.Input = json.RawMessage(currentToolInput.String())
+						toolUseBlocks = append(toolUseBlocks, block)
+						if streamCh != nil {
+							inputSummary := currentToolInput.String()
+							if len(inputSummary) > 200 {
+								inputSummary = inputSummary[:200] + "..."
+							}
+							streamCh <- types.StreamEvent{
+								Kind:      types.StreamEventToolStart,
+								ToolName:  block.Name,
+								ToolInput: inputSummary,
+							}
 						}
-						streamCh <- types.StreamEvent{
-							Kind:      types.StreamEventToolStart,
-							ToolName:  block.Name,
-							ToolInput: inputSummary,
-						}
+					case types.ContentBlockThinking:
+						block.Thinking = currentText.String()
+					case types.ContentBlockServerToolUse:
+						block.Name = currentBlock.Name
+						block.Input = json.RawMessage(currentToolInput.String())
+					case types.ContentBlockServerToolResult:
+						block.Content = currentText.String()
 					}
-				case types.ContentBlockThinking:
-					block.Thinking = currentText.String()
-				case types.ContentBlockServerToolUse:
-					block.Name = currentBlock.Name
-					block.Input = json.RawMessage(currentToolInput.String())
-				case types.ContentBlockServerToolResult:
-					block.Content = currentText.String()
+					assistantBlocks = append(assistantBlocks, block)
+					if streamCh != nil {
+						streamCh <- types.StreamEvent{Kind: types.StreamEventBlockDone, BlockIndex: event.Index}
+					}
 				}
-				assistantBlocks = append(assistantBlocks, block)
-				if streamCh != nil {
-					streamCh <- types.StreamEvent{Kind: types.StreamEventBlockDone, BlockIndex: event.Index}
-				}
-			}
 			case "message_delta":
 				if event.Usage != nil {
 					usage = event.Usage

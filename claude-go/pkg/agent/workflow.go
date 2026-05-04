@@ -2,9 +2,9 @@
 //
 // 三种核心模式 (参考 CrewAI + LangGraph + AutoGen):
 //
-//	1. Pipeline (开发): Architect → Coder → Reviewer → Tester (串行依赖)
-//	2. Fan-Out (调研): Researcher₁ ∥ Researcher₂ → Synthesizer (并行汇聚)
-//	3. Adversarial (辩论): Proposer ↔ Opponent × N轮 → Judge (对抗决策)
+//  1. Pipeline (开发): Architect → Coder → Reviewer → Tester (串行依赖)
+//  2. Fan-Out (调研): Researcher₁ ∥ Researcher₂ → Synthesizer (并行汇聚)
+//  3. Adversarial (辩论): Proposer ↔ Opponent × N轮 → Judge (对抗决策)
 //
 // 工作流执行器按 stage 依赖拓扑排序, 自动传递上下文。
 package agent
@@ -218,9 +218,9 @@ func swarmWorkflow() *WorkflowDef {
 
 func developmentWorkflow() *WorkflowDef {
 	return &WorkflowDef{
-		Name: "development",
+		Name:        "development",
 		Description: "研发流水线: 调研→架构→计划→[Generator↔Evaluator 自适应对抗]→测试 (VERIMAP偏差检测)",
-		Mode: "adversarial_dev",
+		Mode:        "adversarial_dev",
 		// Rounds=0 表示使用自适应终止 (AdaptiveTerminator)
 		// 参考 MAgICoRe: 简单任务1-2轮, 复杂任务最多5轮
 		Rounds: 0,
@@ -420,9 +420,9 @@ func developmentWorkflow() *WorkflowDef {
 
 修复反馈时: 必须逐条处理 Evaluator 的每个 BLOCKER 问题。`,
 			},
-		// 移除了重复的 implement stage (DependsOn: design)。
-		// 仅保留 DependsOn: plan 的版本，因为 plan 已经包含 design 上下文。
-		// 重复 stage 导致对抗循环中 coder 每轮执行两次，浪费 token 和时间。
+			// 移除了重复的 implement stage (DependsOn: design)。
+			// 仅保留 DependsOn: plan 的版本，因为 plan 已经包含 design 上下文。
+			// 重复 stage 导致对抗循环中 coder 每轮执行两次，浪费 token 和时间。
 			{
 				Name: "evaluate", Role: "reviewer", DependsOn: []string{"implement"},
 				Prompt: `你是对抗式开发中的 Evaluator(只读、多疑的审查者)。
@@ -819,17 +819,17 @@ type WorkflowExecutor struct {
 	planCfgResolver  *PlanConfigResolver // 模型/连接参数解析器 (可选, 按 plan+role 层级解析)
 	notify           NotifyFunc
 	chatID           string
-	llm              LLMClient            // LLM 客户端 (供 swarm_intel.Engine 等需要直接调用的场景)
-	taskTracker      TaskTracker          // 复用 V2 Task 系统 (可为 nil)
-	dagTracker       DAGTaskTracker       // V2 DAG 能力 (运行时从 taskTracker 检测)
-	evolution        *EvolutionEngine     // 自动进化引擎 (可为 nil)
-	roles            *RoleRegistry        // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
-	metrics          *metrics.Collector   // 持续观测指标 (可为 nil)
-	pool             *AgentPool           // Agent 池 (动态扩缩, 可为 nil)
-	checkpoints      CheckpointStore      // 检查点存取 (由 Coordinator 注入, 可为 nil)
-	promptCache      *PromptCache         // 提示词缓存 (参考 Anthropic Prompt Caching)
-	concurrency      ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态, 可为 nil)
-	activityCallback func()              // 活动回调: Coordinator watchdog 心跳 (可为 nil)
+	llm              LLMClient                                                            // LLM 客户端 (供 swarm_intel.Engine 等需要直接调用的场景)
+	taskTracker      TaskTracker                                                          // 复用 V2 Task 系统 (可为 nil)
+	dagTracker       DAGTaskTracker                                                       // V2 DAG 能力 (运行时从 taskTracker 检测)
+	evolution        *EvolutionEngine                                                     // 自动进化引擎 (可为 nil)
+	roles            *RoleRegistry                                                        // 角色注册表 (可为 nil, 降级用 StageDef.Prompt)
+	metrics          *metrics.Collector                                                   // 持续观测指标 (可为 nil)
+	pool             *AgentPool                                                           // Agent 池 (动态扩缩, 可为 nil)
+	checkpoints      CheckpointStore                                                      // 检查点存取 (由 Coordinator 注入, 可为 nil)
+	promptCache      *PromptCache                                                         // 提示词缓存 (参考 Anthropic Prompt Caching)
+	concurrency      ConcurrencySuggestor                                                 // 动态并发建议 (基于 API 流控状态, 可为 nil)
+	activityCallback func()                                                               // 活动回调: Coordinator watchdog 心跳 (可为 nil)
 	progressCallback func(phase string, iteration int, bytesWritten int64, taskID string) // 进展上报 (可为 nil)
 }
 
@@ -856,9 +856,9 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		Module:    "workflow",
 		Name:      wf.Mode,
 		Payload: map[string]interface{}{
-			"team_id":   team.Name,
-			"workflow":  wf.Mode,
-			"objective": objective,
+			"team_id":     team.Name,
+			"workflow":    wf.Mode,
+			"objective":   objective,
 			"stage_count": len(wf.Stages),
 		},
 	})
@@ -874,12 +874,12 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 			Module:    "workflow",
 			Name:      wf.Mode,
 			Payload: map[string]interface{}{
-				"team_id":       team.Name,
-				"workflow":      wf.Mode,
-				"duration_sec":  dur,
-				"stage_count":   len(results),
-				"success":       err == nil,
-				"error":         "",
+				"team_id":      team.Name,
+				"workflow":     wf.Mode,
+				"duration_sec": dur,
+				"stage_count":  len(results),
+				"success":      err == nil,
+				"error":        "",
 			},
 		}
 		if err != nil {
@@ -1084,12 +1084,19 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 		}
 	}
 	// 包装 factory: 注入 ModelConfigKey, 使 Orchestrator 阶段也能按 plan+role 解析模型/API 配置
-	planFactory := we.factory
-	if we.planCfgResolver != nil {
-		planFactory = func(pCtx context.Context, role, systemPrompt string) (AgentRunner, error) {
+	baseFactory := we.factory
+	planFactory := func(pCtx context.Context, role, systemPrompt string) (AgentRunner, error) {
+		if we.planCfgResolver != nil {
 			pCtx = context.WithValue(pCtx, ModelConfigKey{}, we.planCfgResolver.Resolve(team.Workflow, role))
-			return we.factory(pCtx, role, systemPrompt)
 		}
+		pCtx = WithRunMetadata(pCtx, RunMetadata{
+			Source:   "team_stage",
+			Purpose:  team.Name,
+			Workflow: team.Workflow,
+			Role:     role,
+			Team:     team.Name,
+		})
+		return baseFactory(pCtx, role, systemPrompt)
 	}
 
 	orch := NewOrchestrator(
@@ -1523,9 +1530,9 @@ func (we *WorkflowExecutor) runTestFixCycle(
 			return false
 		}
 
-			fixPrompt := fmt.Sprintf("### 测试错误 (第 %d 次修复, 必须修复所有测试):\n%s\n\n" +
-				"要求:\n1. 仅修复测试错误, 不要做其他改动\n2. 保持现有代码结构不变\n3. 输出修复后的完整文件内容",
-				retry, truncateResult(testErrors, 3000))
+		fixPrompt := fmt.Sprintf("### 测试错误 (第 %d 次修复, 必须修复所有测试):\n%s\n\n"+
+			"要求:\n1. 仅修复测试错误, 不要做其他改动\n2. 保持现有代码结构不变\n3. 输出修复后的完整文件内容",
+			retry, truncateResult(testErrors, 3000))
 		for _, genStage := range genStages {
 			fixStage := genStage
 			fixStage.Prompt = strings.ReplaceAll(fixStage.Prompt, "{adversarial_feedback}", fixPrompt)
@@ -2017,6 +2024,7 @@ func (we *WorkflowExecutor) runFinishPhase(ctx context.Context, parallelStages [
 //  2. Parallel = 标记 Parallel:true 且不是 Evaluator 的阶段
 //  3. Generator = 被 Evaluator 依赖且不是 design/parallel 的阶段
 //  4. Design = 其余阶段 (按依赖链拓扑排序，从无依赖到 generator 之前)
+//
 // ClassifyStages 导出版本，供测试和外部调用。
 func ClassifyStages(stages []StageDef) (design []StageDef, generators []StageDef, eval *StageDef, parallel []StageDef) {
 	return classifyStages(stages)
@@ -2352,7 +2360,8 @@ func (we *WorkflowExecutor) ExecuteSingleStage(ctx context.Context, stage StageD
 // executeStage 执行单个阶段 (注入 Blackboard + V2 Task + Evolution + 智能重试)。
 // 集成 Blackboard 读/写 + V2 Task 创建/更新 + Structured Handoff + Evolution。
 // V2 改进: 区分瞬态错误 (API 超时/限流/网络) 和永久错误 (产出验证失败),
-//          瞬态错误自动重试 (指数退避 + 抖动), 永久错误直接失败。
+//
+//	瞬态错误自动重试 (指数退避 + 抖动), 永久错误直接失败。
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
 	stageStart := time.Now()
 	traceCtx := observability.TraceFromContext(ctx)
@@ -2492,13 +2501,13 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			Module:    "workflow",
 			Name:      stage.Name,
 			Payload: map[string]interface{}{
-				"team_id":     team.Name,
-				"workflow":    team.Workflow,
-				"stage_name":  stage.Name,
-				"agent_role":  stage.Role,
+				"team_id":      team.Name,
+				"workflow":     team.Workflow,
+				"stage_name":   stage.Name,
+				"agent_role":   stage.Role,
 				"duration_sec": stageDur,
-				"success":     true,
-				"output_len":  len(sr.Output),
+				"success":      true,
+				"output_len":   len(sr.Output),
 			},
 		})
 	} else {
@@ -2510,13 +2519,13 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			Module:    "workflow",
 			Name:      stage.Name,
 			Payload: map[string]interface{}{
-				"team_id":     team.Name,
-				"workflow":    team.Workflow,
-				"stage_name":  stage.Name,
-				"agent_role":  stage.Role,
+				"team_id":      team.Name,
+				"workflow":     team.Workflow,
+				"stage_name":   stage.Name,
+				"agent_role":   stage.Role,
 				"duration_sec": stageDur,
-				"success":     false,
-				"error":       sr.Error,
+				"success":      false,
+				"error":        sr.Error,
 			},
 		})
 	}
@@ -2530,6 +2539,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 //   - 非限流瞬态错误: 最多 stageRetryMaxRetries 次 (默认 3 次)。
 //   - 429 限流: 无限重试, 直到成功或 context 被取消 (用户停止)。
 //     利用 RateLimitGuard 的全局退避机制, 自动等待限流解除。
+//
 // 永久错误: 直接返回失败, 不重试。
 func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage StageDef, prompt string, team *ProductionTeam, injectedExpIDs []string) StageResult {
 	var lastErr StageResult
@@ -2787,6 +2797,13 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	if we.planCfgResolver != nil {
 		stageCtx = context.WithValue(stageCtx, ModelConfigKey{}, we.planCfgResolver.Resolve(team.Workflow, role))
 	}
+	stageCtx = WithRunMetadata(stageCtx, RunMetadata{
+		Source:   "team_stage",
+		Purpose:  team.Name,
+		Workflow: team.Workflow,
+		Role:     role,
+		Team:     team.Name,
+	})
 
 	runner, err := we.factory(stageCtx, role, "")
 	if err != nil {
@@ -2821,16 +2838,16 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 		if reason == "__API_ERROR__" {
 			return StageResult{
 				Role: role, Status: TaskFailed,
-				Error:   fmt.Sprintf("API 错误 (限流/超时/熔断): %s", truncateResult(result, 200)),
-				Output:  result,
+				Error:     fmt.Sprintf("API 错误 (限流/超时/熔断): %s", truncateResult(result, 200)),
+				Output:    result,
 				StartedAt: start, Duration: duration.Round(time.Second).String(),
 			}
 		}
 		we.notify(we.chatID, fmt.Sprintf("⚠️ Agent **%s** 产出不合格: %s — 标记为失败并重试", role, reason))
 		return StageResult{
 			Role: role, Status: TaskFailed,
-			Error:   fmt.Sprintf("产出验证失败: %s", reason),
-			Output:  result,
+			Error:     fmt.Sprintf("产出验证失败: %s", reason),
+			Output:    result,
 			StartedAt: start, Duration: duration.Round(time.Second).String(),
 		}
 	}
@@ -3653,12 +3670,12 @@ var mysqlBuildState = struct {
 //	Level 2 (存储引擎): innobase, myisam, perfschema
 //	Level 3 (主程序): mysqld
 var mysqlEssentialTargets = []string{
-	"mysys",      // 底层系统库 (io, mem, thread, regex, etc.)
-	"clientlib",  // MySQL 客户端库
-	"heap",       // MEMORY 存储引擎
-	"csv",        // CSV 存储引擎
-	"innobase",   // InnoDB 存储引擎 (最大, 单独列出)
-	"myisam",     // MyISAM 存储引擎
+	"mysys",     // 底层系统库 (io, mem, thread, regex, etc.)
+	"clientlib", // MySQL 客户端库
+	"heap",      // MEMORY 存储引擎
+	"csv",       // CSV 存储引擎
+	"innobase",  // InnoDB 存储引擎 (最大, 单独列出)
+	"myisam",    // MyISAM 存储引擎
 }
 
 // mysqlCMakeConfigureArgs MySQL 首次 cmake 配置的优化参数。
@@ -3666,11 +3683,11 @@ var mysqlEssentialTargets = []string{
 func mysqlCMakeConfigureArgs() []string {
 	return []string{
 		"-B", "build",
-		"-DWITH_UNIT_TESTS=OFF",        // 节省 30-40% 编译时间
-		"-DWITH_DEBUG=OFF",             // Release 模式
+		"-DWITH_UNIT_TESTS=OFF", // 节省 30-40% 编译时间
+		"-DWITH_DEBUG=OFF",      // Release 模式
 		"-DCMAKE_BUILD_TYPE=Release",
-		"-DWITH_PROTOBUF=bundled",      // 使用预编译 protobuf
-		"-DWITH_SSL=system",            // 使用系统 OpenSSL
+		"-DWITH_PROTOBUF=bundled", // 使用预编译 protobuf
+		"-DWITH_SSL=system",       // 使用系统 OpenSSL
 	}
 }
 
@@ -3782,7 +3799,7 @@ func (we *WorkflowExecutor) runMySQLIntegrationTest(cwd string) string {
 	defer initCancel()
 	initCmd := exec.CommandContext(initCtx, mysqldPath, "--initialize-insecure", "--datadir="+tmpDir)
 	if out, err := initCmd.CombinedOutput(); err != nil {
-			return fmt.Sprintf("mysqld --initialize-insecure 失败:\n%s", truncateResult(string(out), 2000))
+		return fmt.Sprintf("mysqld --initialize-insecure 失败:\n%s", truncateResult(string(out), 2000))
 	}
 
 	// 后台启动 mysqld (skip-networking + unix socket, 避免端口冲突)
@@ -3837,7 +3854,7 @@ func (we *WorkflowExecutor) runMySQLIntegrationTest(cwd string) string {
 	clientCmd.Dir = cwd
 	out, err := clientCmd.CombinedOutput()
 	if err != nil {
-			return fmt.Sprintf("mysql 客户端验证失败:\n%s", truncateResult(string(out), 2000))
+		return fmt.Sprintf("mysql 客户端验证失败:\n%s", truncateResult(string(out), 2000))
 	}
 	return ""
 }
@@ -4203,10 +4220,10 @@ func getMySQLModifiedTargets(changedFiles []string) []string {
 
 // BuildMySQLIncremental 执行 MySQL/Percona 增量编译。
 // 策略:
-//   1. 限制并行度 (基于内存)
-//   2. 仅编译被修改的源码对应的子目标
-//   3. 不构建完整 mysqld, 仅验证语法和链接
-//   4. Phase 0 (语法验证阶段) 甚至可以不编译, 仅做语法检查
+//  1. 限制并行度 (基于内存)
+//  2. 仅编译被修改的源码对应的子目标
+//  3. 不构建完整 mysqld, 仅验证语法和链接
+//  4. Phase 0 (语法验证阶段) 甚至可以不编译, 仅做语法检查
 func BuildMySQLIncremental(cwd string, changedFiles []string, phase int) string {
 	jobs := CalcSafeMakeJobs()
 

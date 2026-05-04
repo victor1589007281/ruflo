@@ -1,9 +1,9 @@
 // Package metrics — 指标中英文目录 (MetricCatalog)
 //
 // 用途:
-//   1. 所有被记录的 metric 在 dashboard 展示时同时显示英文 name + 中文描述
-//   2. 支撑 /api/metrics/catalog 接口, 让前端做全量指标审计: 每个指标是否有数据、是否被可视化
-//   3. 统一单位 / 采集类型 (counter/gauge/histogram/rate), 避免前端做猜测
+//  1. 所有被记录的 metric 在 dashboard 展示时同时显示英文 name + 中文描述
+//  2. 支撑 /api/metrics/catalog 接口, 让前端做全量指标审计: 每个指标是否有数据、是否被可视化
+//  3. 统一单位 / 采集类型 (counter/gauge/histogram/rate), 避免前端做猜测
 //
 // 设计参考: Prometheus metric_metadata + OpenTelemetry Instrument 类型
 package metrics
@@ -50,6 +50,8 @@ var catalog = []MetricDesc{
 	{Module: "llm", Name: MLLMCacheReadTokens, ZH: "缓存命中 token", EN: "Cache hit tokens", Unit: "tokens", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMCacheCreateTokens, ZH: "缓存创建 token", EN: "Cache create tokens", Unit: "tokens", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMTotalTokens, ZH: "总 token 消耗", EN: "Total tokens", Unit: "tokens", Kind: KindCounter, Panel: "llm"},
+	{Module: "llm", Name: MLLMPromptComponentChars, ZH: "Prompt 组件字符数", EN: "Prompt component chars", Unit: "chars", Kind: KindHistogram, Panel: "llm"},
+	{Module: "llm", Name: MLLMPromptComponentTokens, ZH: "Prompt 组件估算 token", EN: "Estimated prompt component tokens", Unit: "tokens", Kind: KindHistogram, Panel: "llm"},
 	{Module: "llm", Name: MLLMRateLimitCount, ZH: "限流 (429) 次数", EN: "Rate-limited (429) count", Unit: "count", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMOverloadCount, ZH: "过载 (503/529) 次数", EN: "Overloaded (503/529) count", Unit: "count", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMTimeoutCount, ZH: "超时次数", EN: "Timeout count", Unit: "count", Kind: KindCounter, Panel: "llm"},

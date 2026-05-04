@@ -44,14 +44,14 @@ type ModuleSummary struct {
 
 // MetricStat 单指标统计 (最近 N 次的聚合)。
 type MetricStat struct {
-	Name    string  `json:"name"`
-	Count   int     `json:"count"`
-	Last    float64 `json:"last"`
-	Avg     float64 `json:"avg"`
-	Min     float64 `json:"min"`
-	Max     float64 `json:"max"`
-	StdDev  float64 `json:"std_dev"`
-	Trend   string  `json:"trend"` // "improving", "degrading", "stable"
+	Name   string  `json:"name"`
+	Count  int     `json:"count"`
+	Last   float64 `json:"last"`
+	Avg    float64 `json:"avg"`
+	Min    float64 `json:"min"`
+	Max    float64 `json:"max"`
+	StdDev float64 `json:"std_dev"`
+	Trend  string  `json:"trend"` // "improving", "degrading", "stable"
 }
 
 // MetricCumulative 单指标累积统计 (用于 Prometheus counter)。
@@ -379,76 +379,76 @@ const (
 	MDreamOutputSize       = "dream_output_size"       // 输出大小(字符)
 
 	// V3: Dreaming 健康度指标
-	MDreamSessionsPending       = "dream_sessions_pending"       // 待处理会话数
-	MDreamHoursSinceLast        = "dream_hours_since_last"       // 距上次 dream 小时数
-	MDreamGateBlockSessionsLow  = "dream_gate_block_sessions_low"  // 门控: 会话不足
-	MDreamGateBlockTimeShort    = "dream_gate_block_time_short"    // 门控: 时间不足
+	MDreamSessionsPending       = "dream_sessions_pending"            // 待处理会话数
+	MDreamHoursSinceLast        = "dream_hours_since_last"            // 距上次 dream 小时数
+	MDreamGateBlockSessionsLow  = "dream_gate_block_sessions_low"     // 门控: 会话不足
+	MDreamGateBlockTimeShort    = "dream_gate_block_time_short"       // 门控: 时间不足
 	MDreamGateBlockDreaming     = "dream_gate_block_already_dreaming" // 门控: 已在执行
-	MDreamGateBlockLockHeld     = "dream_gate_block_lock_held"     // 门控: 锁被持有
-	MDreamGateBlockScanThrottle = "dream_gate_block_scan_throttle" // 门控: 扫描节流
-	MDreamTriggerSource         = "dream_trigger_source"          // 触发来源
-	MDreamConsolidatorFacts     = "dream_consolidator_facts"      // Consolidator 产出事实数
+	MDreamGateBlockLockHeld     = "dream_gate_block_lock_held"        // 门控: 锁被持有
+	MDreamGateBlockScanThrottle = "dream_gate_block_scan_throttle"    // 门控: 扫描节流
+	MDreamTriggerSource         = "dream_trigger_source"              // 触发来源
+	MDreamConsolidatorFacts     = "dream_consolidator_facts"          // Consolidator 产出事实数
 	MDreamConsolidatorContra    = "dream_consolidator_contradictions" // 矛盾检测数
-	MDreamConsolidatorPatterns  = "dream_consolidator_patterns"   // 模式发现数
+	MDreamConsolidatorPatterns  = "dream_consolidator_patterns"       // 模式发现数
 )
 
 // Evolution 指标
 const (
-	MEvoExperienceCount = "evo_experience_count"  // 经验总数
-	MEvoTrajectoryCount = "evo_trajectory_count"  // 轨迹总数
-	MEvoSuccessRate     = "evo_success_rate"       // 成功轨迹率
-	MEvoUtilizationRate = "evo_utilization_rate"   // 经验使用率 (至少用过1次的/总数)
-	MEvoAvgQuality      = "evo_avg_quality"        // 平均质量分
-	MEvoQualityMin      = "evo_quality_min"        // 最低质量分
-	MEvoQualityMax      = "evo_quality_max"        // 最高质量分
-	MEvoDistillCount    = "evo_distill_count"      // 提炼次数
-	MEvoPruneCount      = "evo_prune_count"        // 剪枝数量
+	MEvoExperienceCount = "evo_experience_count"    // 经验总数
+	MEvoTrajectoryCount = "evo_trajectory_count"    // 轨迹总数
+	MEvoSuccessRate     = "evo_success_rate"        // 成功轨迹率
+	MEvoUtilizationRate = "evo_utilization_rate"    // 经验使用率 (至少用过1次的/总数)
+	MEvoAvgQuality      = "evo_avg_quality"         // 平均质量分
+	MEvoQualityMin      = "evo_quality_min"         // 最低质量分
+	MEvoQualityMax      = "evo_quality_max"         // 最高质量分
+	MEvoDistillCount    = "evo_distill_count"       // 提炼次数
+	MEvoPruneCount      = "evo_prune_count"         // 剪枝数量
 	MEvoFailTrajectory  = "evo_fail_trajectory_pct" // 失败轨迹占比
 )
 
 // Task 指标
 const (
-	MTaskCreatedCount  = "task_created_count"   // 创建总数
+	MTaskCreatedCount   = "task_created_count"   // 创建总数
 	MTaskCompletedCount = "task_completed_count" // 完成总数
-	MTaskFailedCount   = "task_failed_count"    // 失败总数
+	MTaskFailedCount    = "task_failed_count"    // 失败总数
 	MTaskCompletionRate = "task_completion_rate" // 完成率
 )
 
 // Team 指标 — 整团队级
 const (
-	MTeamRunCount       = "team_run_count"        // 运行总数
-	MTeamSuccessCount   = "team_success_count"    // 成功次数
-	MTeamFailCount      = "team_fail_count"       // 失败次数
-	MTeamDurationSec    = "team_duration_sec"     // 运行耗时(秒)
-	MTeamStagePassRate  = "team_stage_pass_rate"  // 阶段通过率
-	MTeamEvalPassRate   = "team_eval_pass_rate"   // 评审通过率
-	MTeamBuildPassRate  = "team_build_pass_rate"  // 编译通过率
-	MTeamTestPassRate   = "team_test_pass_rate"   // 测试通过率
-	MTeamOutputAvgLen   = "team_output_avg_len"   // 平均产出长度
-	MTeamRoundCount     = "team_round_count"      // 对抗轮数
-	MTeamFileCount      = "team_file_count"       // 产出文件数
+	MTeamRunCount      = "team_run_count"       // 运行总数
+	MTeamSuccessCount  = "team_success_count"   // 成功次数
+	MTeamFailCount     = "team_fail_count"      // 失败次数
+	MTeamDurationSec   = "team_duration_sec"    // 运行耗时(秒)
+	MTeamStagePassRate = "team_stage_pass_rate" // 阶段通过率
+	MTeamEvalPassRate  = "team_eval_pass_rate"  // 评审通过率
+	MTeamBuildPassRate = "team_build_pass_rate" // 编译通过率
+	MTeamTestPassRate  = "team_test_pass_rate"  // 测试通过率
+	MTeamOutputAvgLen  = "team_output_avg_len"  // 平均产出长度
+	MTeamRoundCount    = "team_round_count"     // 对抗轮数
+	MTeamFileCount     = "team_file_count"      // 产出文件数
 )
 
 // Team 指标 — Stage 级 (每次 stage 完成即上报, 可绘制阶段耗时/成功率分布)
 const (
-	MTeamStageCount        = "team_stage_count"          // 阶段执行次数
-	MTeamStageDurationSec  = "team_stage_duration_sec"   // 单阶段耗时
-	MTeamStageSuccessCount = "team_stage_success_count"  // 单阶段成功次数
-	MTeamStageFailCount    = "team_stage_fail_count"     // 单阶段失败次数
-	MTeamStageRetryCount   = "team_stage_retry_count"    // 单阶段重试次数
-	MTeamStageOutputLen    = "team_stage_output_len"     // 单阶段产出长度
-	MTeamStageToolCalls    = "team_stage_tool_calls"     // 单阶段工具调用数
-	MTeamAgentRunCount     = "team_agent_run_count"      // Agent 触发次数
-	MTeamAgentDurationSec  = "team_agent_duration_sec"   // Agent 单次耗时
-	MTeamBlackboardWrites  = "team_blackboard_writes"    // 黑板写入次数
+	MTeamStageCount        = "team_stage_count"         // 阶段执行次数
+	MTeamStageDurationSec  = "team_stage_duration_sec"  // 单阶段耗时
+	MTeamStageSuccessCount = "team_stage_success_count" // 单阶段成功次数
+	MTeamStageFailCount    = "team_stage_fail_count"    // 单阶段失败次数
+	MTeamStageRetryCount   = "team_stage_retry_count"   // 单阶段重试次数
+	MTeamStageOutputLen    = "team_stage_output_len"    // 单阶段产出长度
+	MTeamStageToolCalls    = "team_stage_tool_calls"    // 单阶段工具调用数
+	MTeamAgentRunCount     = "team_agent_run_count"     // Agent 触发次数
+	MTeamAgentDurationSec  = "team_agent_duration_sec"  // Agent 单次耗时
+	MTeamBlackboardWrites  = "team_blackboard_writes"   // 黑板写入次数
 )
 
 // Cron 指标 (从 cron_jobs.json 的历史执行统计)
 const (
-	MCronRunCount     = "cron_run_count"      // 触发次数
-	MCronSuccessCount = "cron_success_count"  // 成功次数
-	MCronFailCount    = "cron_fail_count"     // 失败次数
-	MCronDurationSec  = "cron_duration_sec"   // 运行耗时
+	MCronRunCount     = "cron_run_count"     // 触发次数
+	MCronSuccessCount = "cron_success_count" // 成功次数
+	MCronFailCount    = "cron_fail_count"    // 失败次数
+	MCronDurationSec  = "cron_duration_sec"  // 运行耗时
 )
 
 // Swarm Intel 指标 (群体智能预测/模拟)
@@ -466,42 +466,44 @@ const (
 // Memory 指标
 const (
 	MMemEntryCount     = "mem_entry_count"      // 记忆条目数
-	MMemAvgAccessCount = "mem_avg_access_count"  // 平均访问次数
-	MMemPruneCount     = "mem_prune_count"       // 修剪次数
-	MMemRetrievalCount = "mem_retrieval_count"   // 检索次数
+	MMemAvgAccessCount = "mem_avg_access_count" // 平均访问次数
+	MMemPruneCount     = "mem_prune_count"      // 修剪次数
+	MMemRetrievalCount = "mem_retrieval_count"  // 检索次数
 
 	// V3: L2 FactStore 指标
-	MFactTotalCount         = "fact_total_count"           // L2 事实总数
-	MFactActiveCount        = "fact_active_count"          // 活跃事实数
-	MFactArchivedCount      = "fact_archived_count"        // 已归档事实数
-	MFactEvergreenCount     = "fact_evergreen_count"       // 永久豁免事实数
-	MFactAvgRetention       = "fact_avg_retention"         // 平均保留率
-	MFactIngestCount        = "fact_ingest_count"          // 新事实摄入数
-	MFactDecayArchivedCount = "fact_decay_archived_count"  // 衰减归档数
-	MFactConnectionCount    = "fact_connection_count"      // 事实间关联数
+	MFactTotalCount         = "fact_total_count"          // L2 事实总数
+	MFactActiveCount        = "fact_active_count"         // 活跃事实数
+	MFactArchivedCount      = "fact_archived_count"       // 已归档事实数
+	MFactEvergreenCount     = "fact_evergreen_count"      // 永久豁免事实数
+	MFactAvgRetention       = "fact_avg_retention"        // 平均保留率
+	MFactIngestCount        = "fact_ingest_count"         // 新事实摄入数
+	MFactDecayArchivedCount = "fact_decay_archived_count" // 衰减归档数
+	MFactConnectionCount    = "fact_connection_count"     // 事实间关联数
 
 	// V3: 失忆风险指标
-	MAmnesiaRiskScore      = "amnesia_risk_score"         // 综合失忆风险评分 (0-100)
-	MPrecompactFactsSaved  = "precompact_facts_saved"     // PreCompact 抢救事实数
+	MAmnesiaRiskScore     = "amnesia_risk_score"     // 综合失忆风险评分 (0-100)
+	MPrecompactFactsSaved = "precompact_facts_saved" // PreCompact 抢救事实数
 )
 
 // LLM 指标 (跨模块通用的大模型调用观测)
 const (
-	MLLMCallCount         = "llm_call_count"          // 调用总数
-	MLLMSuccessCount      = "llm_success_count"       // 成功数
-	MLLMErrorCount        = "llm_error_count"         // 失败数
-	MLLMRetryCount        = "llm_retry_count"         // 重试次数
-	MLLMDurationSec       = "llm_duration_sec"        // 单次耗时(秒)
-	MLLMInputTokens       = "llm_input_tokens"        // 输入 token
-	MLLMOutputTokens      = "llm_output_tokens"       // 输出 token
-	MLLMCacheReadTokens   = "llm_cache_read_tokens"   // 缓存命中 token
-	MLLMCacheCreateTokens = "llm_cache_create_tokens" // 缓存创建 token
-	MLLMTotalTokens       = "llm_total_tokens"        // 总 token
-	MLLMRateLimitCount    = "llm_rate_limit_count"    // 429 次数
-	MLLMOverloadCount     = "llm_overload_count"      // 过载次数
-	MLLMTimeoutCount      = "llm_timeout_count"       // 超时次数
-	MLLMRefusalCount      = "llm_refusal_count"       // 拒答次数
-	MLLMPromptTooLong     = "llm_prompt_too_long"     // prompt 超长次数
+	MLLMCallCount             = "llm_call_count"              // 调用总数
+	MLLMSuccessCount          = "llm_success_count"           // 成功数
+	MLLMErrorCount            = "llm_error_count"             // 失败数
+	MLLMRetryCount            = "llm_retry_count"             // 重试次数
+	MLLMDurationSec           = "llm_duration_sec"            // 单次耗时(秒)
+	MLLMInputTokens           = "llm_input_tokens"            // 输入 token
+	MLLMOutputTokens          = "llm_output_tokens"           // 输出 token
+	MLLMCacheReadTokens       = "llm_cache_read_tokens"       // 缓存命中 token
+	MLLMCacheCreateTokens     = "llm_cache_create_tokens"     // 缓存创建 token
+	MLLMTotalTokens           = "llm_total_tokens"            // 总 token
+	MLLMRateLimitCount        = "llm_rate_limit_count"        // 429 次数
+	MLLMOverloadCount         = "llm_overload_count"          // 过载次数
+	MLLMTimeoutCount          = "llm_timeout_count"           // 超时次数
+	MLLMRefusalCount          = "llm_refusal_count"           // 拒答次数
+	MLLMPromptTooLong         = "llm_prompt_too_long"         // prompt 超长次数
+	MLLMPromptComponentChars  = "llm_prompt_component_chars"  // prompt 组件字符数
+	MLLMPromptComponentTokens = "llm_prompt_component_tokens" // prompt 组件估算 token 数
 )
 
 // LLM 限流/熔断 指标 (与 RateLimitGuard / Client 熔断器状态绑定, 周期性采样)
@@ -515,8 +517,8 @@ const (
 	MLLMGuardAIMDCut     = "llm_guard_aimd_cut"     // AIMD 降并发事件 (counter)
 
 	// 熔断器 (连续失败触发)
-	MLLMCircuitTrips     = "llm_circuit_trips"     // 熔断触发事件 (counter)
-	MLLMCircuitOpenGauge = "llm_circuit_open"      // 当前是否熔断 (gauge 0/1)
+	MLLMCircuitTrips      = "llm_circuit_trips"       // 熔断触发事件 (counter)
+	MLLMCircuitOpenGauge  = "llm_circuit_open"        // 当前是否熔断 (gauge 0/1)
 	MLLMCircuitFailStreak = "llm_circuit_fail_streak" // 连续失败计数 (gauge)
 )
 
@@ -527,17 +529,17 @@ const KindPromHistogram = "histogram"
 // MetricType 定义每个指标的 Prometheus 类型 (仅列出常量中定义的指标)。
 var MetricType = map[string]MetricKind{
 	// LLM 计数器 (单调递增)
-	MLLMCallCount:         "counter",
-	MLLMSuccessCount:      "counter",
-	MLLMErrorCount:        "counter",
-	MLLMRetryCount:        "counter",
-	MLLMRateLimitCount:    "counter",
-	MLLMOverloadCount:     "counter",
-	MLLMTimeoutCount:      "counter",
-	MLLMRefusalCount:      "counter",
-	MLLMPromptTooLong:     "counter",
-	MLLMGuardAIMDCut:      "counter",
-	MLLMCircuitTrips:      "counter",
+	MLLMCallCount:      "counter",
+	MLLMSuccessCount:   "counter",
+	MLLMErrorCount:     "counter",
+	MLLMRetryCount:     "counter",
+	MLLMRateLimitCount: "counter",
+	MLLMOverloadCount:  "counter",
+	MLLMTimeoutCount:   "counter",
+	MLLMRefusalCount:   "counter",
+	MLLMPromptTooLong:  "counter",
+	MLLMGuardAIMDCut:   "counter",
+	MLLMCircuitTrips:   "counter",
 
 	// LLM 状态 (gauge)
 	MLLMGuardInFlight:     "gauge",
@@ -549,12 +551,14 @@ var MetricType = map[string]MetricKind{
 	MLLMCircuitFailStreak: "gauge",
 
 	// LLM 分布 (histogram)
-	MLLMDurationSec:       "histogram",
-	MLLMInputTokens:       "histogram",
-	MLLMOutputTokens:      "histogram",
-	MLLMCacheReadTokens:   "histogram",
-	MLLMCacheCreateTokens: "histogram",
-	MLLMTotalTokens:       "histogram",
+	MLLMDurationSec:           "histogram",
+	MLLMInputTokens:           "histogram",
+	MLLMOutputTokens:          "histogram",
+	MLLMCacheReadTokens:       "histogram",
+	MLLMCacheCreateTokens:     "histogram",
+	MLLMTotalTokens:           "histogram",
+	MLLMPromptComponentChars:  "histogram",
+	MLLMPromptComponentTokens: "histogram",
 
 	// Team 计数器
 	MTeamRunCount:          "counter",
@@ -568,12 +572,12 @@ var MetricType = map[string]MetricKind{
 	MTeamAgentRunCount:     "counter",
 
 	// Team 状态/比率 (gauge)
-	MTeamStagePassRate:  "gauge",
-	MTeamEvalPassRate:   "gauge",
-	MTeamBuildPassRate:  "gauge",
-	MTeamTestPassRate:   "gauge",
-	MTeamOutputAvgLen:   "gauge",
-	MTeamFileCount:      "gauge",
+	MTeamStagePassRate: "gauge",
+	MTeamEvalPassRate:  "gauge",
+	MTeamBuildPassRate: "gauge",
+	MTeamTestPassRate:  "gauge",
+	MTeamOutputAvgLen:  "gauge",
+	MTeamFileCount:     "gauge",
 
 	// Team 分布 (histogram)
 	MTeamDurationSec:      "histogram",
@@ -582,45 +586,45 @@ var MetricType = map[string]MetricKind{
 	MTeamAgentDurationSec: "histogram",
 
 	// Dreaming 计数器
-	MDreamCount:        "counter",
-	MDreamErrorCount:   "counter",
+	MDreamCount:         "counter",
+	MDreamErrorCount:    "counter",
 	MDreamTriggerSource: "counter",
 
 	// Dreaming 状态 (gauge)
-	MDreamCompressionRatio:       "gauge",
-	MDreamOutputSize:             "gauge",
-	MDreamSessionsPending:        "gauge",
-	MDreamHoursSinceLast:         "gauge",
-	MDreamGateBlockSessionsLow:   "gauge",
-	MDreamGateBlockTimeShort:     "gauge",
-	MDreamGateBlockDreaming:      "gauge",
-	MDreamGateBlockLockHeld:      "gauge",
-	MDreamGateBlockScanThrottle:  "gauge",
-	MDreamConsolidatorFacts:      "gauge",
-	MDreamConsolidatorContra:     "gauge",
-	MDreamConsolidatorPatterns:   "gauge",
+	MDreamCompressionRatio:      "gauge",
+	MDreamOutputSize:            "gauge",
+	MDreamSessionsPending:       "gauge",
+	MDreamHoursSinceLast:        "gauge",
+	MDreamGateBlockSessionsLow:  "gauge",
+	MDreamGateBlockTimeShort:    "gauge",
+	MDreamGateBlockDreaming:     "gauge",
+	MDreamGateBlockLockHeld:     "gauge",
+	MDreamGateBlockScanThrottle: "gauge",
+	MDreamConsolidatorFacts:     "gauge",
+	MDreamConsolidatorContra:    "gauge",
+	MDreamConsolidatorPatterns:  "gauge",
 
 	// Dreaming 分布 (histogram)
 	MDreamDurationSec:   "histogram",
 	MDreamSessionsInput: "histogram",
 
 	// Memory 计数器
-	MMemPruneCount:      "counter",
-	MMemRetrievalCount:  "counter",
-	MFactIngestCount:    "counter",
+	MMemPruneCount:          "counter",
+	MMemRetrievalCount:      "counter",
+	MFactIngestCount:        "counter",
 	MFactDecayArchivedCount: "counter",
 	MPrecompactFactsSaved:   "counter",
 
 	// Memory 状态 (gauge)
-	MMemEntryCount:     "gauge",
-	MMemAvgAccessCount: "gauge",
-	MFactTotalCount:    "gauge",
-	MFactActiveCount:   "gauge",
-	MFactArchivedCount: "gauge",
-	MFactEvergreenCount: "gauge",
-	MFactAvgRetention:  "gauge",
+	MMemEntryCount:       "gauge",
+	MMemAvgAccessCount:   "gauge",
+	MFactTotalCount:      "gauge",
+	MFactActiveCount:     "gauge",
+	MFactArchivedCount:   "gauge",
+	MFactEvergreenCount:  "gauge",
+	MFactAvgRetention:    "gauge",
 	MFactConnectionCount: "gauge",
-	MAmnesiaRiskScore:  "gauge",
+	MAmnesiaRiskScore:    "gauge",
 
 	// Evolution 计数器
 	MEvoDistillCount: "counter",
@@ -642,7 +646,7 @@ var MetricType = map[string]MetricKind{
 	MCronFailCount:    "counter",
 
 	// Cron 分布 (histogram)
-	MCronDurationSec:  "histogram",
+	MCronDurationSec: "histogram",
 
 	// Task 计数器
 	MTaskCreatedCount:   "counter",

@@ -125,6 +125,11 @@ type BotConfig struct {
 	// EnableFrontierOptimizations QueryEngine 前沿优化特性开关 (默认 true)
 	EnableFrontierOptimizations bool
 
+	// PromptDebug 开启后将完整 LLM 请求/响应落盘到 PromptDebugDir。
+	PromptDebug bool
+	// PromptDebugDir 提示词调试文件目录。为空时使用 stateDir/prompt-debug。
+	PromptDebugDir string
+
 	// Plans 按工作流名称覆盖模型配置 (供 Agent Teams 使用)
 	Plans map[string]PlanModelConfig
 
@@ -185,9 +190,9 @@ type FeishuTextContent struct {
 
 // FeishuCardContent 飞书卡片消息内容格式 (用于富文本回复)
 type FeishuCardContent struct {
-	Config   *CardConfig    `json:"config,omitempty"`
-	Header   *CardHeader    `json:"header,omitempty"`
-	Elements []CardElement  `json:"elements"`
+	Config   *CardConfig   `json:"config,omitempty"`
+	Header   *CardHeader   `json:"header,omitempty"`
+	Elements []CardElement `json:"elements"`
 }
 
 // CardConfig 卡片配置
@@ -328,6 +333,10 @@ type EngineSection struct {
 	// EnableFrontierOptimizations 一键启用推荐的 P0/P1 前沿优化组件 (默认 true)
 	// 包括: Metrics, ErrorClassifier, JSONRepair, LoopDetector, PromptCache, Budget, Trajectory
 	EnableFrontierOptimizations *bool `json:"enableFrontierOptimizations,omitempty"`
+	// PromptDebug 开启后保存每次发给 LLM 的完整请求与响应。仅建议排查成本/提示词问题时短期开启。
+	PromptDebug *bool `json:"promptDebug,omitempty"`
+	// PromptDebugDir 自定义调试输出目录。为空时使用 stateDir/prompt-debug。
+	PromptDebugDir string `json:"promptDebugDir,omitempty"`
 }
 
 // WikiSection Wiki 配置段 (JSON)
@@ -364,7 +373,7 @@ type FeishuSection struct {
 	AppSecret       string `json:"appSecret"`
 	Domain          string `json:"domain,omitempty"`
 	MentionOnly     *bool  `json:"mentionOnly,omitempty"`
-	SessionTimeout  int    `json:"sessionTimeout,omitempty"`  // 分钟
+	SessionTimeout  int    `json:"sessionTimeout,omitempty"` // 分钟
 	MaxSessions     int    `json:"maxSessions,omitempty"`
 	WelcomeMessage  string `json:"welcomeMessage,omitempty"`
 	ThinkingMessage string `json:"thinkingMessage,omitempty"`
@@ -382,9 +391,9 @@ type ProviderModelConfig struct {
 
 // ProviderConfig 单个厂商的 API 连接参数。
 type ProviderConfig struct {
-	Name    string                       `json:"name"`
-	BaseURL string                       `json:"baseUrl"`
-	APIKey  string                       `json:"apiKey"`
+	Name    string                         `json:"name"`
+	BaseURL string                         `json:"baseUrl"`
+	APIKey  string                         `json:"apiKey"`
 	Models  map[string]ProviderModelConfig `json:"models"` // key=alias
 }
 
@@ -398,10 +407,10 @@ type PlanModelConfig struct {
 
 // AISection AI 模型配置段 (只保留别名模式)。
 type AISection struct {
-	ModelAlias       string                     `json:"modelAlias,omitempty"`       // 全局默认模型别名
-	FallbackAliases  []string                   `json:"fallbackAliases,omitempty"`  // 全局默认备用模型别名
-	PromptCacheMode  string                     `json:"promptCacheMode,omitempty"`  // "auto"(默认)/"on"/"off"
-	Plans            map[string]PlanModelConfig `json:"plans,omitempty"`            // 按 plan 名称覆盖模型配置
+	ModelAlias      string                     `json:"modelAlias,omitempty"`      // 全局默认模型别名
+	FallbackAliases []string                   `json:"fallbackAliases,omitempty"` // 全局默认备用模型别名
+	PromptCacheMode string                     `json:"promptCacheMode,omitempty"` // "auto"(默认)/"on"/"off"
+	Plans           map[string]PlanModelConfig `json:"plans,omitempty"`           // 按 plan 名称覆盖模型配置
 }
 
 // ProvidersSection providers 配置段 (新模式)。
@@ -642,5 +651,13 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		bc.EnableFrontierOptimizations = *jc.Engine.EnableFrontierOptimizations
 	} else {
 		bc.EnableFrontierOptimizations = true
+	}
+	if jc.Engine != nil {
+		if jc.Engine.PromptDebug != nil {
+			bc.PromptDebug = *jc.Engine.PromptDebug
+		}
+		if jc.Engine.PromptDebugDir != "" {
+			bc.PromptDebugDir = jc.Engine.PromptDebugDir
+		}
 	}
 }

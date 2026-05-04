@@ -115,6 +115,12 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 	if rec.Purpose != "" {
 		labels["purpose"] = rec.Purpose
 	}
+	if rec.Workflow != "" {
+		labels["workflow"] = rec.Workflow
+	}
+	if rec.Role != "" {
+		labels["role"] = rec.Role
+	}
 	if rec.StopReason != "" {
 		labels["stop_reason"] = rec.StopReason
 	}
@@ -155,6 +161,7 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 	if rec.Retries > 0 {
 		c.RecordAtTime("llm", MLLMRetryCount, float64(rec.Retries), labels, ts)
 	}
+	recordPromptComponentMetrics(c, rec, labels, ts)
 
 	switch rec.Status {
 	case "success", "retry_success":
@@ -187,6 +194,29 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 		blockedLabels := copyLabels(labels)
 		blockedLabels["blocked"] = "1"
 		c.RecordAtTime("llm", MLLMCircuitOpenGauge, 1, blockedLabels, ts)
+	}
+}
+
+func recordPromptComponentMetrics(c *Collector, rec api.LLMCallRecord, labels map[string]string, ts time.Time) {
+	parts := []struct {
+		name  string
+		value int
+	}{
+		{"system_chars", rec.PromptComponents.SystemChars},
+		{"tools_schema_chars", rec.PromptComponents.ToolsSchemaChars},
+		{"mcp_tools_chars", rec.PromptComponents.MCPToolsChars},
+		{"skill_listing_chars", rec.PromptComponents.SkillListingChars},
+		{"role_skills_chars", rec.PromptComponents.RoleSkillsChars},
+		{"memory_chars", rec.PromptComponents.MemoryChars},
+		{"blackboard_chars", rec.PromptComponents.BlackboardChars},
+		{"prev_result_chars", rec.PromptComponents.PrevResultChars},
+		{"messages_chars", rec.PromptComponents.MessagesChars},
+	}
+	for _, part := range parts {
+		componentLabels := copyLabels(labels)
+		componentLabels["component"] = part.name
+		c.RecordAtTime("llm", MLLMPromptComponentChars, float64(part.value), componentLabels, ts)
+		c.RecordAtTime("llm", MLLMPromptComponentTokens, float64(part.value)/4.0, componentLabels, ts)
 	}
 }
 

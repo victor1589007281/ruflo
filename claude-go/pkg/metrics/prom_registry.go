@@ -34,12 +34,14 @@ var (
 	llmPromptTooLong  *prometheus.CounterVec
 
 	// LLM Histograms
-	llmDurationSec       *prometheus.HistogramVec
-	llmInputTokens       *prometheus.HistogramVec
-	llmOutputTokens      *prometheus.HistogramVec
-	llmCacheReadTokens   *prometheus.HistogramVec
-	llmCacheCreateTokens *prometheus.HistogramVec
-	llmTotalTokens       *prometheus.HistogramVec
+	llmDurationSec           *prometheus.HistogramVec
+	llmInputTokens           *prometheus.HistogramVec
+	llmOutputTokens          *prometheus.HistogramVec
+	llmCacheReadTokens       *prometheus.HistogramVec
+	llmCacheCreateTokens     *prometheus.HistogramVec
+	llmTotalTokens           *prometheus.HistogramVec
+	llmPromptComponentChars  *prometheus.HistogramVec
+	llmPromptComponentTokens *prometheus.HistogramVec
 
 	// LLM Guard / Circuit
 	llmGuardInFlight     *prometheus.GaugeVec
@@ -74,24 +76,24 @@ var (
 	teamStageOutputLen *prometheus.GaugeVec
 
 	// Dreaming
-	dreamCount        *prometheus.CounterVec
-	dreamErrorCount   *prometheus.CounterVec
+	dreamCount         *prometheus.CounterVec
+	dreamErrorCount    *prometheus.CounterVec
 	dreamTriggerSource *prometheus.CounterVec
-	dreamDurationSec  *prometheus.HistogramVec
+	dreamDurationSec   *prometheus.HistogramVec
 	dreamSessionsInput *prometheus.HistogramVec
 
-	dreamCompressionRatio       *prometheus.GaugeVec
-	dreamOutputSize             *prometheus.GaugeVec
-	dreamSessionsPending        *prometheus.GaugeVec
-	dreamHoursSinceLast         *prometheus.GaugeVec
-	dreamGateBlockSessionsLow   *prometheus.CounterVec
-	dreamGateBlockTimeShort     *prometheus.CounterVec
-	dreamGateBlockDreaming      *prometheus.CounterVec
-	dreamGateBlockLockHeld      *prometheus.CounterVec
-	dreamGateBlockScanThrottle  *prometheus.CounterVec
-	dreamConsolidatorFacts      *prometheus.GaugeVec
-	dreamConsolidatorContra     *prometheus.GaugeVec
-	dreamConsolidatorPatterns   *prometheus.GaugeVec
+	dreamCompressionRatio      *prometheus.GaugeVec
+	dreamOutputSize            *prometheus.GaugeVec
+	dreamSessionsPending       *prometheus.GaugeVec
+	dreamHoursSinceLast        *prometheus.GaugeVec
+	dreamGateBlockSessionsLow  *prometheus.CounterVec
+	dreamGateBlockTimeShort    *prometheus.CounterVec
+	dreamGateBlockDreaming     *prometheus.CounterVec
+	dreamGateBlockLockHeld     *prometheus.CounterVec
+	dreamGateBlockScanThrottle *prometheus.CounterVec
+	dreamConsolidatorFacts     *prometheus.GaugeVec
+	dreamConsolidatorContra    *prometheus.GaugeVec
+	dreamConsolidatorPatterns  *prometheus.GaugeVec
 
 	// Memory
 	memEntryCount     *prometheus.GaugeVec
@@ -139,11 +141,11 @@ var (
 	swarmLLMCalls       *prometheus.GaugeVec
 
 	// Cron
-	cronRunCount      *prometheus.CounterVec
-	cronSuccessCount  *prometheus.CounterVec
-	cronFailCount     *prometheus.CounterVec
-	cronDurationSec   *prometheus.HistogramVec
-	cronEnabledGauge  *prometheus.GaugeVec
+	cronRunCount     *prometheus.CounterVec
+	cronSuccessCount *prometheus.CounterVec
+	cronFailCount    *prometheus.CounterVec
+	cronDurationSec  *prometheus.HistogramVec
+	cronEnabledGauge *prometheus.GaugeVec
 
 	// Build info
 	buildInfo prometheus.Gauge
@@ -161,7 +163,7 @@ func defaultLLMBuckets() []float64 {
 func initPrometheusMetrics() {
 	promReg = prometheus.NewRegistry()
 
-	llmLabels := []string{"model", "model_alias", "status", "source", "purpose", "stop_reason", "error_kind", "http_status", "stream"}
+	llmLabels := []string{"model", "model_alias", "status", "source", "purpose", "workflow", "role", "stop_reason", "error_kind", "http_status", "stream"}
 	teamLabels := []string{"team", "stage", "role", "workflow"}
 	dreamLabels := []string{"trigger_source", "consolidator_result"}
 	memLabels := []string{"memory_type"}
@@ -213,6 +215,14 @@ func initPrometheusMetrics() {
 	llmTotalTokens = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "claude_go", Name: "llm_total_tokens", Help: "总 token 分布", Buckets: defaultLLMBuckets(),
 	}, llmLabels)
+	llmComponentLabels := append([]string{}, llmLabels...)
+	llmComponentLabels = append(llmComponentLabels, "component")
+	llmPromptComponentChars = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "claude_go", Name: "llm_prompt_component_chars", Help: "Prompt 组件字符数分布", Buckets: defaultLLMBuckets(),
+	}, llmComponentLabels)
+	llmPromptComponentTokens = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "claude_go", Name: "llm_prompt_component_tokens", Help: "Prompt 组件估算 token 分布", Buckets: defaultLLMBuckets(),
+	}, llmComponentLabels)
 
 	llmGuardInFlight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "claude_go", Name: "llm_guard_in_flight", Help: "在途请求数",
@@ -497,6 +507,7 @@ func initPrometheusMetrics() {
 		llmCallCount, llmSuccessCount, llmErrorCount, llmRetryCount,
 		llmRateLimitCount, llmOverloadCount, llmTimeoutCount, llmRefusalCount, llmPromptTooLong,
 		llmInputTokens, llmOutputTokens, llmCacheReadTokens, llmCacheCreateTokens, llmTotalTokens,
+		llmPromptComponentChars, llmPromptComponentTokens,
 		llmGuardInFlight, llmGuardMaxParallel, llmGuardRPMTokens, llmGuardPauseSec, llmGuardWaitSec,
 		llmCircuitTrips, llmCircuitOpenGauge, llmCircuitFailStreak,
 		teamRunCount, teamSuccessCount, teamFailCount, teamStageCount,
@@ -558,7 +569,9 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 		return pl
 	}
 
-	llmNeed := []string{"model", "model_alias", "status", "source", "purpose", "stop_reason", "error_kind", "http_status", "stream"}
+	llmNeed := []string{"model", "model_alias", "status", "source", "purpose", "workflow", "role", "stop_reason", "error_kind", "http_status", "stream"}
+	llmComponentNeed := append([]string{}, llmNeed...)
+	llmComponentNeed = append(llmComponentNeed, "component")
 	teamNeed := []string{"team", "stage", "role", "workflow"}
 	dreamNeed := []string{"trigger_source", "consolidator_result"}
 	memNeed := []string{"memory_type"}
@@ -601,6 +614,10 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 		llmCacheCreateTokens.With(fillLabels(llmNeed, labels)).Observe(value)
 	case MLLMTotalTokens:
 		llmTotalTokens.With(fillLabels(llmNeed, labels)).Observe(value)
+	case MLLMPromptComponentChars:
+		llmPromptComponentChars.With(fillLabels(llmComponentNeed, labels)).Observe(value)
+	case MLLMPromptComponentTokens:
+		llmPromptComponentTokens.With(fillLabels(llmComponentNeed, labels)).Observe(value)
 	case MLLMGuardWaitSec:
 		llmGuardWaitSec.With(fillLabels(llmNeed, labels)).Observe(value)
 
@@ -913,5 +930,3 @@ func replayJSONL(path string, maxEvents int) (int, error) {
 
 	return restored, nil
 }
-
-

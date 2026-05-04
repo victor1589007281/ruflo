@@ -55,32 +55,38 @@ type LLMEventFunc func(eventType, detail string)
 
 // LLMCallRecord 单次 LLM 调用的可观测数据, 用于采集 token / 延迟 / 成败。
 type LLMCallRecord struct {
-	Model          string
-	BaseURL        string
-	Status         string // "success" | "error" | "retry_success"
-	Stream         bool
-	DurationSec    float64
-	InputTokens    int
-	OutputTokens   int
+	Model               string
+	BaseURL             string
+	Status              string // "success" | "error" | "retry_success"
+	Stream              bool
+	DurationSec         float64
+	InputTokens         int
+	OutputTokens        int
 	CacheReadTokens     int
 	CacheCreationTokens int
-	TotalTokens    int
-	HTTPStatus     int    // 最终的 HTTP 状态码 (可能是 200)
-	Retries        int    // 本次调用内部触发的重试次数
-	ErrorKind      string // "timeout"|"rate_limit"|"overloaded"|"prompt_too_long"|"refusal"|"client"|"server"|""
-	ErrorMessage   string // 截断后的错误信息
-	StopReason     string // "end_turn"|"max_tokens"|"tool_use"|"refusal"|...
-	Timestamp      time.Time
+	TotalTokens         int
+	HTTPStatus          int    // 最终的 HTTP 状态码 (可能是 200)
+	Retries             int    // 本次调用内部触发的重试次数
+	ErrorKind           string // "timeout"|"rate_limit"|"overloaded"|"prompt_too_long"|"refusal"|"client"|"server"|""
+	ErrorMessage        string // 截断后的错误信息
+	StopReason          string // "end_turn"|"max_tokens"|"tool_use"|"refusal"|...
+	Timestamp           time.Time
 
 	// 追踪信息 (由 Client.Tag 或调用方 Context 注入, 支持按业务维度聚合)
-	Source  string // "chat" | "feishu" | "team" | "swarm" | "dashboard" | "vision" | "compact" | ...
-	Purpose string // 额外标签, 如团队名 / stage 名 / agent 角色
-	Request string // 粗粒度 HTTP 方法标签 (messages / stream-messages)
+	Source   string // "chat" | "feishu" | "team" | "swarm" | "dashboard" | "vision" | "compact" | ...
+	Purpose  string // 额外标签, 如团队名 / stage 名 / agent 角色
+	Request  string // 粗粒度 HTTP 方法标签 (messages / stream-messages)
+	Workflow string // Agent Team 工作流名, 如 development / research
+	Role     string // Agent 角色名, 如 coder / tester / reviewer
 
 	// 限流 / 熔断 观测 (用于 dashboard 速率与守护页面)
 	GuardWaitSec   float64 // 本次 RateLimitGuard.Acquire 等待时长 (包含 RPM 令牌 + 退避)
 	CircuitOpened  bool    // 本次调用触发了熔断 (从 closed 变 open)
 	CircuitBlocked bool    // 本次调用被熔断器拒绝 (未发起真实请求)
+
+	// PromptComponents 记录本次请求中各类提示词/上下文组件的字符数。
+	// 由 QueryEngine 在请求前计算, api.Client 只负责随 LLMCallRecord 透传。
+	PromptComponents PromptComponentMetrics
 }
 
 // LLMMetricsHook 采集 LLM 调用指标的回调 (dashboard 在启动时注入, 避免循环依赖)。
@@ -93,7 +99,7 @@ type Client struct {
 	Model   string
 	Client  *http.Client
 
-	RetryCount int // 最大重试次数 (429/5xx), 默认 4
+	RetryCount int           // 最大重试次数 (429/5xx), 默认 4
 	RetryBase  time.Duration // 退避基数, 默认 3s
 	RetryMax   time.Duration // 退避上限, 默认 60s
 
@@ -114,8 +120,13 @@ type Client struct {
 	// "auto" = 自动检测 (默认，Anthropic 官方 API 启用，其他关闭)
 	// "on"   = 强制启用
 	// "off"  = 强制关闭
-	PromptCacheMode string
+	PromptCacheMode            string
 	promptCacheDisabledByError bool // 因 API 错误自适应关闭
+
+	// PromptDebugEnabled 开启后将每次发给 LLM 的请求和响应落盘。
+	// 注意: 文件包含完整 prompt / tool schema / user content, 仅建议排查 token 问题时短期开启。
+	PromptDebugEnabled bool
+	PromptDebugDir     string
 
 	// 追踪标签 (可选): 调用方通过 WithTag 或直接赋值, 标识该 Client 实例所服务的业务场景。
 	// 会写入 LLMCallRecord.Source, 方便在 dashboard 里按业务维度聚合 (chat/feishu/team/...)。
@@ -145,21 +156,23 @@ type Client struct {
 // 用于为不同 plan/role 指定不同模型而不影响原始 Client 的 Model 字段。
 func (c *Client) WithModel(model string) *Client {
 	return &Client{
-		BaseURL:              c.BaseURL,
-		APIKey:               c.APIKey,
-		Model:                model,
-		Client:               c.Client,
-		Guard:                c.Guard,
-		RetryCount:           c.RetryCount,
-		RetryBase:            c.RetryBase,
-		RetryMax:             c.RetryMax,
-		OnLLMEvent:           c.OnLLMEvent,
-		OnLLMMetrics:         c.OnLLMMetrics,
-		FallbackModels:       c.FallbackModels,
-		PromptCacheMode:      c.PromptCacheMode,
-		cbThreshold:          c.cbThreshold,
-		fallbackCooldownMin:  c.fallbackCooldownMin,
-		Tag:                  c.Tag + ":" + model,
+		BaseURL:             c.BaseURL,
+		APIKey:              c.APIKey,
+		Model:               model,
+		Client:              c.Client,
+		Guard:               c.Guard,
+		RetryCount:          c.RetryCount,
+		RetryBase:           c.RetryBase,
+		RetryMax:            c.RetryMax,
+		OnLLMEvent:          c.OnLLMEvent,
+		OnLLMMetrics:        c.OnLLMMetrics,
+		FallbackModels:      c.FallbackModels,
+		PromptCacheMode:     c.PromptCacheMode,
+		PromptDebugEnabled:  c.PromptDebugEnabled,
+		PromptDebugDir:      c.PromptDebugDir,
+		cbThreshold:         c.cbThreshold,
+		fallbackCooldownMin: c.fallbackCooldownMin,
+		Tag:                 c.Tag + ":" + model,
 	}
 }
 
@@ -174,20 +187,22 @@ func (c *Client) ConfiguredClone(baseURL, apiKey, model string, fallbackModels [
 // 使用指定参数覆盖 baseURL / apiKey / model / fallbackModels / fallbackBaseURL / fallbackAPIKey。
 func (c *Client) ConfiguredCloneFull(baseURL, apiKey, model string, fallbackModels []string, fallbackBaseURL, fallbackAPIKey string) *Client {
 	clone := &Client{
-		BaseURL:              strings.TrimRight(baseURL, "/"),
-		APIKey:               apiKey,
-		Model:                model,
-		Client:               c.Client,
-		Guard:                c.Guard,
-		RetryCount:           c.RetryCount,
-		RetryBase:            c.RetryBase,
-		RetryMax:             c.RetryMax,
-		OnLLMEvent:           c.OnLLMEvent,
-		OnLLMMetrics:         c.OnLLMMetrics,
-		PromptCacheMode:      c.PromptCacheMode,
-		cbThreshold:          c.cbThreshold,
-		fallbackCooldownMin:  c.fallbackCooldownMin,
-		Tag:                  c.Tag,
+		BaseURL:             strings.TrimRight(baseURL, "/"),
+		APIKey:              apiKey,
+		Model:               model,
+		Client:              c.Client,
+		Guard:               c.Guard,
+		RetryCount:          c.RetryCount,
+		RetryBase:           c.RetryBase,
+		RetryMax:            c.RetryMax,
+		OnLLMEvent:          c.OnLLMEvent,
+		OnLLMMetrics:        c.OnLLMMetrics,
+		PromptCacheMode:     c.PromptCacheMode,
+		PromptDebugEnabled:  c.PromptDebugEnabled,
+		PromptDebugDir:      c.PromptDebugDir,
+		cbThreshold:         c.cbThreshold,
+		fallbackCooldownMin: c.fallbackCooldownMin,
+		Tag:                 c.Tag,
 	}
 	if len(fallbackModels) > 0 {
 		clone.FallbackModels = fallbackModels
@@ -300,9 +315,9 @@ func isAnthropicEndpoint(baseURL string) bool {
 	lower := strings.ToLower(baseURL)
 	return strings.Contains(lower, "anthropic.com") ||
 		strings.Contains(lower, "api.claude") ||
-		strings.Contains(lower, "bedrock") ||               // AWS Bedrock
+		strings.Contains(lower, "bedrock") || // AWS Bedrock
 		strings.Contains(lower, "dashscope.aliyuncs.com") || // 阿里云百炼
-		strings.Contains(lower, "/apps/anthropic")           // Anthropic 兼容代理路径
+		strings.Contains(lower, "/apps/anthropic") // Anthropic 兼容代理路径
 }
 
 // isCacheRelatedError 检测 API 错误是否与 prompt caching 相关。
@@ -481,15 +496,16 @@ func NewAnthropicClient(apiKey, model string) *Client {
 // 对应 TS: services/api/claude.ts 中的 queryModelWithStreaming()
 //
 // SSE 流式协议:
-//   每行格式: "data: {json}\n\n" 或 "event: {type}\n"
-//   事件类型: message_start, content_block_start, content_block_delta,
-//             content_block_stop, message_delta, message_stop
+//
+//	每行格式: "data: {json}\n\n" 或 "event: {type}\n"
+//	事件类型: message_start, content_block_start, content_block_delta,
+//	          content_block_stop, message_delta, message_stop
 //
 // 算法:
-//   1. 构建请求体 (model, messages, system, tools, stream=true)
-//   2. 发送 POST 请求
-//   3. 逐行读取 SSE 流
-//   4. 解析事件并通过 channel 发送
+//  1. 构建请求体 (model, messages, system, tools, stream=true)
+//  2. 发送 POST 请求
+//  3. 逐行读取 SSE 流
+//  4. 解析事件并通过 channel 发送
 func (c *Client) StreamMessage(
 	ctx context.Context,
 	messages []types.APIMessage,
@@ -502,6 +518,8 @@ func (c *Client) StreamMessage(
 
 	go func() {
 		startTS := time.Now()
+		callMeta := llmMetricsFromContext(ctx)
+		var debug *promptDebugCapture
 		streamRec := LLMCallRecord{
 			Stream:  true,
 			Status:  "success",
@@ -510,6 +528,7 @@ func (c *Client) StreamMessage(
 			Source:  c.Tag,
 			Request: "stream_messages",
 		}
+		applyLLMMetricsContext(&streamRec, callMeta)
 		streamErrMsg := ""
 		streamRetries := 0
 		defer func() {
@@ -525,7 +544,11 @@ func (c *Client) StreamMessage(
 			} else if streamRetries > 0 {
 				streamRec.Status = "retry_success"
 			}
+			applyLLMMetricsContext(&streamRec, callMeta)
 			c.emitLLMMetric(streamRec)
+			if debug != nil {
+				debug.finish(c, streamRec, streamErrMsg)
+			}
 		}()
 		defer close(eventCh)
 		defer close(errCh)
@@ -581,6 +604,7 @@ func (c *Client) StreamMessage(
 			errCh <- fmt.Errorf("序列化请求失败: %w", err)
 			return
 		}
+		debug = c.newPromptDebugCapture("stream_messages", true)
 
 		maxRetry := c.RetryCount
 		if maxRetry <= 0 {
@@ -595,6 +619,9 @@ func (c *Client) StreamMessage(
 			if ctx.Err() != nil {
 				errCh <- ctx.Err()
 				return
+			}
+			if debug != nil {
+				debug.addAttempt(attempt+1, effectiveBaseURL+"/messages", req.Model, body)
 			}
 
 			httpReq, err := http.NewRequestWithContext(ctx, "POST", effectiveBaseURL+"/messages", bytes.NewReader(body))
@@ -642,6 +669,9 @@ func (c *Client) StreamMessage(
 
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			if debug != nil {
+				debug.setResponse(resp.StatusCode, respBody)
+			}
 
 			// 不可重试: prompt_too_long / refusal / 4xx (不计入熔断器)
 			var apiErr types.APIError
@@ -780,6 +810,9 @@ func (c *Client) StreamMessage(
 			if err := json.Unmarshal([]byte(data), &delta); err != nil {
 				continue
 			}
+			if debug != nil {
+				debug.addStreamEvent(data)
+			}
 
 			// 采集 token 使用量 (message_start / message_delta)
 			if delta.Message != nil && delta.Message.Usage != nil {
@@ -851,9 +884,24 @@ func (c *Client) SendMessage(
 	tools []types.APITool,
 	maxTokens int,
 ) (*types.APIResponse, error) {
+	callMeta := llmMetricsFromContext(ctx)
+	var debug *promptDebugCapture
+	var debugRec LLMCallRecord
+	var debugErr string
+	emit := func(rec LLMCallRecord) {
+		applyLLMMetricsContext(&rec, callMeta)
+		debugRec = rec
+		c.emitLLMMetric(rec)
+	}
+	defer func() {
+		if debug != nil {
+			debug.finish(c, debugRec, debugErr)
+		}
+	}()
+
 	if c.isCircuitOpen() {
 		c.fireEvent("circuit_open", "熔断器开启, SendMessage 被拒绝")
-		c.emitLLMMetric(LLMCallRecord{
+		rec := LLMCallRecord{
 			Status:         "error",
 			Request:        "messages",
 			DurationSec:    0,
@@ -861,7 +909,9 @@ func (c *Client) SendMessage(
 			ErrorKind:      "client",
 			ErrorMessage:   "circuit open",
 			CircuitBlocked: true,
-		})
+		}
+		debugRec = rec
+		emit(rec)
 		return nil, fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
 	}
 
@@ -904,6 +954,7 @@ func (c *Client) SendMessage(
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
+	debug = c.newPromptDebugCapture("messages", false)
 
 	maxRetry := c.RetryCount
 	if maxRetry <= 0 {
@@ -917,6 +968,9 @@ func (c *Client) SendMessage(
 	for attempt := 0; attempt <= maxRetry; attempt++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if debug != nil {
+			debug.addAttempt(attempt+1, c.BaseURL+"/messages", req.Model, body)
 		}
 
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(body))
@@ -947,7 +1001,7 @@ func (c *Client) SendMessage(
 			}
 			opened, _ := c.recordFailure(lastErr.Error())
 			c.TotalFails.Add(1)
-			c.emitLLMMetric(LLMCallRecord{
+			rec := LLMCallRecord{
 				Status:        "error",
 				Request:       "messages",
 				DurationSec:   time.Since(startTS).Seconds(),
@@ -957,7 +1011,9 @@ func (c *Client) SendMessage(
 				ErrorMessage:  truncateErr(err.Error(), 256),
 				GuardWaitSec:  guardWaitSec,
 				CircuitOpened: opened,
-			})
+			}
+			debugErr = rec.ErrorMessage
+			emit(rec)
 			return nil, lastErr
 		}
 
@@ -967,6 +1023,9 @@ func (c *Client) SendMessage(
 			return nil, fmt.Errorf("读取响应失败: %w", err)
 		}
 		lastStatus = resp.StatusCode
+		if debug != nil {
+			debug.setResponse(resp.StatusCode, respBody)
+		}
 
 		if resp.StatusCode == 200 {
 			c.recordSuccess()
@@ -1000,7 +1059,7 @@ func (c *Client) SendMessage(
 				rec.CacheCreationTokens = result.Usage.CacheCreationInputTokens
 				rec.TotalTokens = rec.InputTokens + rec.OutputTokens + rec.CacheReadTokens + rec.CacheCreationTokens
 			}
-			c.emitLLMMetric(rec)
+			emit(rec)
 			return &result, nil
 		}
 
@@ -1015,7 +1074,7 @@ func (c *Client) SendMessage(
 				continue // 重试一次
 			}
 			errMsg := fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(respBody))
-			c.emitLLMMetric(LLMCallRecord{
+			rec := LLMCallRecord{
 				Status:       "error",
 				Request:      "messages",
 				DurationSec:  time.Since(startTS).Seconds(),
@@ -1024,7 +1083,9 @@ func (c *Client) SendMessage(
 				ErrorKind:    classifyErrorKind(resp.StatusCode, string(respBody)),
 				ErrorMessage: truncateErr(errMsg, 256),
 				GuardWaitSec: guardWaitSec,
-			})
+			}
+			debugErr = rec.ErrorMessage
+			emit(rec)
 			return nil, fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 		}
 
@@ -1111,6 +1172,9 @@ func (c *Client) SendMessage(
 			if err != nil {
 				continue
 			}
+			if debug != nil {
+				debug.addAttempt(maxRetry+fi+2, fbBaseURL+"/messages", req.Model, fbBody)
+			}
 			httpReq, err := http.NewRequestWithContext(ctx, "POST", fbBaseURL+"/messages", bytes.NewReader(fbBody))
 			if err != nil {
 				continue
@@ -1127,6 +1191,9 @@ func (c *Client) SendMessage(
 			resp.Body.Close()
 			if err != nil {
 				continue
+			}
+			if debug != nil {
+				debug.setResponse(resp.StatusCode, respBody)
 			}
 			if resp.StatusCode == 200 {
 				c.recordSuccess()
@@ -1152,7 +1219,7 @@ func (c *Client) SendMessage(
 					rec.CacheCreationTokens = result.Usage.CacheCreationInputTokens
 					rec.TotalTokens = rec.InputTokens + rec.OutputTokens + rec.CacheReadTokens + rec.CacheCreationTokens
 				}
-				c.emitLLMMetric(rec)
+				emit(rec)
 				log.Printf("[api] 备用模型 %s 成功", fbModel)
 				return &result, nil
 			}
@@ -1162,7 +1229,7 @@ func (c *Client) SendMessage(
 	opened, _ := c.recordFailure(lastErr.Error())
 	c.TotalFails.Add(1)
 	c.fireEvent("fatal", fmt.Sprintf("LLM 调用 %d 次全部失败: %v", maxRetry+1, lastErr))
-	c.emitLLMMetric(LLMCallRecord{
+	rec := LLMCallRecord{
 		Status:        "error",
 		Request:       "messages",
 		DurationSec:   time.Since(startTS).Seconds(),
@@ -1172,7 +1239,9 @@ func (c *Client) SendMessage(
 		ErrorMessage:  truncateErr(lastErr.Error(), 256),
 		GuardWaitSec:  guardWaitSec,
 		CircuitOpened: opened,
-	})
+	}
+	debugErr = rec.ErrorMessage
+	emit(rec)
 	return nil, fmt.Errorf("LLM 调用 %d 次全部失败: %w", maxRetry+1, lastErr)
 }
 
