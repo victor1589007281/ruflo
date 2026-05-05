@@ -240,6 +240,33 @@ func (r *Registry) FormatListing() string {
 	return sb.String()
 }
 
+// FormatShortListing 格式化精简技能清单。
+// 用于长驻 Bot/system prompt: 只暴露可发现性，不把完整 when_to_use 清单重复塞进每次请求。
+func (r *Registry) FormatShortListing(limit int) string {
+	skills := r.All()
+	if len(skills) == 0 {
+		return ""
+	}
+	if limit <= 0 || limit > len(skills) {
+		limit = len(skills)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<available_skills summary=\"short\">\n")
+	for _, s := range skills[:limit] {
+		desc := s.Description
+		if len(desc) > 140 {
+			desc = desc[:140] + "...(truncated)"
+		}
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", s.Name, desc))
+	}
+	if len(skills) > limit {
+		sb.WriteString(fmt.Sprintf("- ... %d more skills. Use the Skill tool by name to load details.\n", len(skills)-limit))
+	}
+	sb.WriteString("</available_skills>\n")
+	return sb.String()
+}
+
 // ParseSkillFile 解析 SKILL.md 文件。
 // 对应 TS: parseSkillFrontmatterFields + createSkillCommand
 //
@@ -341,17 +368,7 @@ func NewSkillTool(reg *Registry) *SkillTool {
 func (t *SkillTool) Name() string { return "Skill" }
 
 func (t *SkillTool) Description() string {
-	listing := ""
-	for _, s := range t.registry.All() {
-		listing += fmt.Sprintf("\n- %s: %s", s.Name, s.Description)
-	}
-	if listing == "" {
-		listing = "\n(no skills currently loaded)"
-	}
-	return fmt.Sprintf(
-		"Invoke a skill by name. Available skills:%s\n\nUse this tool when a skill's description matches the current task.",
-		listing,
-	)
+	return "Load a skill's full instructions by name. Use this when the short skill listing or task intent indicates a relevant skill; if the name is unknown, ask for a likely name and the error response will list available skills."
 }
 
 func (t *SkillTool) InputSchema() json.RawMessage {

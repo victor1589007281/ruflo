@@ -285,9 +285,9 @@ func (c *Coordinator) teamWatchdog(ctx context.Context, team *ProductionTeam) {
 
 			if stagnantRounds >= 3 { // 30min 无进展
 				c.notify(c.chatID, fmt.Sprintf(
-					"🔴 团队 **%s** 已 30 分钟无实际进展 (阶段: %s, 轮次: %d)\n"+
+					"🔴 团队 **%s** 已 %s 无实际进展 (阶段: %s, 轮次: %d)\n"+
 						"可能陷入无效循环, 建议 /team resume 或手动干预",
-					team.Name, prog.Phase, prog.Iteration))
+					team.Name, pAge.Round(time.Minute), prog.Phase, prog.Iteration))
 				warned = false
 			} else if stagnantRounds >= 1 { // 10min 无进展, 首次告警
 				c.notify(c.chatID, fmt.Sprintf(

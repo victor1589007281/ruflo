@@ -346,9 +346,9 @@ func developmentWorkflow() *WorkflowDef {
 3. **验收标准**: 具体、可执行, 必须包含编译命令
 4. **依赖拓扑**: dependsOn 填前置任务 id 数组, 形成 DAG
 5. role 可选: coder, tester, reviewer, researcher, architect
-6. **复杂度标签**: 每个任务标注 "complexity": "simple"(2轮)/"medium"(3轮)/"complex"(5轮)
-7. **粒度控制**: 算法密集型(如解析器/索引)必须拆为 3+ 子任务; 配置类任务合并为 1 个
-8. **理想任务数**: 14-18 个 (大于 10), 每个任务 8-15 分钟完成
+6. **复杂度标签**: 每个任务标注 "complexity": "simple"(1轮)/"medium"(2轮)/"complex"(3轮)
+7. **粒度控制**: 优先合并同一模块/同一文件族的改动; 算法密集型才拆为 2-3 个子任务, 配置类任务合并为 1 个
+8. **理想任务数**: 普通应用/CLI 控制在 4-8 个任务; 除非用户明确要求大型项目, 禁止超过 10 个任务。每个任务目标 2-5 分钟完成
 9. **上下文预算 (新增)**: 每个任务必须估算 token 消耗并标注 "contextBudget"
    - "low": <4K token (纯配置/接口定义, 无算法)
    - "medium": 4K-10K token (标准业务逻辑, 1-3 个文件)
@@ -366,9 +366,9 @@ func developmentWorkflow() *WorkflowDef {
     - 计算 S = 完成项目的最小必要顺序步骤数 (从设计文档估算)
     - 计算 K = 你分解的任务总数
     - DGI = K / S
-    - 若 DGI < 0.5 * sqrt(S): 任务过粗, 需要增加子任务
-    - 若 DGI > 1.5 * sqrt(S): 任务过细, 协调开销过高, 合并部分任务
-    - 目标: DGI ≈ 0.85 * sqrt(S)
+    - 若 DGI < 0.4 * sqrt(S): 任务过粗, 需要增加子任务
+    - 若 DGI > 1.0 * sqrt(S): 任务过细, 协调/评审 token 开销过高, 必须合并任务
+    - 目标: DGI ≈ 0.65 * sqrt(S), 小型应用优先少任务快闭环
 13. **Search→Read→Edit 粒度 (新增, 参考 TRAJEVAL)**:
     - 每个 coder task 必须是 "Edit" 级别: 已知要改哪些文件、哪些函数
     - 不要给 coder 分配 "Search" 级别任务 (如"找出所有需要修改的地方")
@@ -1100,7 +1100,7 @@ func (we *WorkflowExecutor) runOrchestratedPhase(ctx context.Context, planOutput
 	}
 
 	orch := NewOrchestrator(
-		OrchestratorConfig{MaxParallel: orchParallel, MaxRetries: 2, MicroTestAfter: true, AdversarialRound: 5},
+		OrchestratorConfig{MaxParallel: orchParallel, MaxRetries: 2, MicroTestAfter: true, AdversarialRound: 3},
 		we.dagTracker, planFactory, we.notify, we.pool, we.chatID,
 	)
 
@@ -2948,17 +2948,14 @@ CRITICAL: You MUST follow these execution rules strictly:
 
 // buildStagePromptWithRoles 优先从 RoleRegistry 获取提示词，降级用 StageDef.Prompt。
 // maxDepOutputLen 每个依赖阶段输出注入 prompt 的最大字符数, 防止上下文膨胀。
-const maxDepOutputLen = 6000
+const maxDepOutputLen = 1500
 
 func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map[string]string, roles *RoleRegistry) string {
 	var prevOutput strings.Builder
 	for _, dep := range stage.DependsOn {
 		if r, ok := prevResults[dep]; ok {
-			truncated := r
-			if len(truncated) > maxDepOutputLen {
-				truncated = truncated[:maxDepOutputLen] + "\n...(已截断, 完整输出请参阅黑板)"
-			}
-			prevOutput.WriteString(fmt.Sprintf("### Output from %s:\n%s\n\n", dep, truncated))
+			summary := SummarizeOldOutput(r, maxDepOutputLen)
+			prevOutput.WriteString(fmt.Sprintf("### Dependency summary from %s:\n%s\n\nFull artifact/ref: blackboard key `%s-result`.\n\n", dep, summary, dep))
 		}
 	}
 
@@ -4398,11 +4395,8 @@ func isRelevantFileExt(filePath, langExt string) bool {
 func buildPrevResultsSummary(prevResults map[string]string) string {
 	var b strings.Builder
 	for name, output := range prevResults {
-		summary := output
-		if len(summary) > 3000 {
-			summary = summary[:3000] + "\n...(已截断)"
-		}
-		b.WriteString(fmt.Sprintf("### %s:\n%s\n\n", name, summary))
+		summary := SummarizeOldOutput(output, 1000)
+		b.WriteString(fmt.Sprintf("### %s:\n%s\n\nFull artifact/ref: prevResults[%q] / blackboard key `%s-result`.\n\n", name, summary, name, name))
 	}
 	return b.String()
 }

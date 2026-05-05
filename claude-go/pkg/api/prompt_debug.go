@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,7 +71,14 @@ func (c *Client) newPromptDebugCapture(request string, stream bool) *promptDebug
 		dir = "prompt-debug"
 	}
 	now := time.Now()
-	id := fmt.Sprintf("%s-%06d", now.Format("20060102-150405.000000"), promptDebugSeq.Add(1))
+	seq := promptDebugSeq.Add(1)
+	if c.PromptDebugSampleRate > 0 && c.PromptDebugSampleRate < 1 {
+		threshold := int64(c.PromptDebugSampleRate * 10000)
+		if threshold <= 0 || seq%10000 >= threshold {
+			return nil
+		}
+	}
+	id := fmt.Sprintf("%s-%06d", now.Format("20060102-150405.000000"), seq)
 	return &promptDebugCapture{
 		dir:       dir,
 		id:        id,
@@ -171,6 +180,9 @@ func (d *promptDebugCapture) finish(client *Client, rec LLMCallRecord, errMsg st
 		Events:      events,
 		Response:    response,
 	}
+	if client != nil && client.PromptDebugRedact {
+		redactPromptDebugFile(&out)
+	}
 
 	if err := os.MkdirAll(d.dir, 0o700); err != nil {
 		return
@@ -179,7 +191,92 @@ func (d *promptDebugCapture) finish(client *Client, rec LLMCallRecord, errMsg st
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(d.dir, d.id+".json"), data, 0o600)
+	if err := os.WriteFile(filepath.Join(d.dir, d.id+".json"), data, 0o600); err == nil && client != nil {
+		enforcePromptDebugRetention(d.dir, client.PromptDebugMaxFiles, client.PromptDebugMaxBytes)
+	}
+}
+
+func redactPromptDebugFile(out *promptDebugFile) {
+	if out == nil {
+		return
+	}
+	out.BaseURL = redactSecretsString(out.BaseURL)
+	for i := range out.Attempts {
+		out.Attempts[i].URL = redactSecretsString(out.Attempts[i].URL)
+		out.Attempts[i].Body = redactRawMessage(out.Attempts[i].Body)
+	}
+	for i := range out.Events {
+		out.Events[i] = redactRawMessage(out.Events[i])
+	}
+	if out.Response != nil {
+		out.Response.Body = redactSecretsString(out.Response.Body)
+	}
+}
+
+var (
+	jsonSecretPattern = regexp.MustCompile(`(?i)("?(?:api[_-]?key|authorization|x-api-key|app[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret)"?\s*:\s*")([^"]+)(")`)
+	bearerPattern     = regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/=-]+`)
+	skPattern         = regexp.MustCompile(`\bsk-[A-Za-z0-9._-]{12,}\b`)
+)
+
+func redactRawMessage(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	return json.RawMessage(redactSecretsString(string(raw)))
+}
+
+func redactSecretsString(s string) string {
+	if s == "" {
+		return s
+	}
+	s = jsonSecretPattern.ReplaceAllString(s, `${1}[REDACTED]${3}`)
+	s = bearerPattern.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = skPattern.ReplaceAllString(s, "sk-[REDACTED]")
+	return s
+}
+
+func enforcePromptDebugRetention(dir string, maxFiles int, maxBytes int64) {
+	if maxFiles <= 0 && maxBytes <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type fileInfo struct {
+		path string
+		mod  time.Time
+		size int64
+	}
+	var files []fileInfo
+	var total int64
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fileInfo{
+			path: filepath.Join(dir, entry.Name()),
+			mod:  info.ModTime(),
+			size: info.Size(),
+		})
+		total += info.Size()
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	for len(files) > 0 && maxFiles > 0 && len(files) > maxFiles {
+		_ = os.Remove(files[0].path)
+		total -= files[0].size
+		files = files[1:]
+	}
+	for len(files) > 0 && maxBytes > 0 && total > maxBytes {
+		_ = os.Remove(files[0].path)
+		total -= files[0].size
+		files = files[1:]
+	}
 }
 
 func firstNonEmpty(vals ...string) string {

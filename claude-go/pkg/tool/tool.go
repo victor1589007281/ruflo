@@ -80,14 +80,15 @@ type ToolResult struct {
 // 对应 TS: Tool.ts 中的 ToolUseContext (简化版)。
 // 包含当前工作目录、权限模式、消息历史等运行时信息。
 type ToolContext struct {
-	Cwd              string                  `json:"cwd"`
-	PermissionMode   types.PermissionMode    `json:"permissionMode"`
-	AbortCh          <-chan struct{}          `json:"-"` // 对应 TS: abortController.signal
-	Messages         []types.Message         `json:"messages,omitempty"`
-	MainLoopModel    string                  `json:"mainLoopModel,omitempty"`
-	AgentID          types.AgentID           `json:"agentId,omitempty"`
-	IsNonInteractive bool                    `json:"isNonInteractive"`
-	Debug            bool                    `json:"debug"`
+	Cwd                string               `json:"cwd"`
+	PermissionMode     types.PermissionMode `json:"permissionMode"`
+	AbortCh            <-chan struct{}      `json:"-"` // 对应 TS: abortController.signal
+	Messages           []types.Message      `json:"messages,omitempty"`
+	MainLoopModel      string               `json:"mainLoopModel,omitempty"`
+	AgentID            types.AgentID        `json:"agentId,omitempty"`
+	IsNonInteractive   bool                 `json:"isNonInteractive"`
+	Debug              bool                 `json:"debug"`
+	MaxToolResultChars int                  `json:"maxToolResultChars,omitempty"`
 	// GlobalPerm 若非 nil，RunToolUse 会用其 CheckGlobal 合并全局策略与工具自带权限结果
 	GlobalPerm GlobalPermissionChecker `json:"-"`
 }

@@ -125,8 +125,12 @@ type Client struct {
 
 	// PromptDebugEnabled 开启后将每次发给 LLM 的请求和响应落盘。
 	// 注意: 文件包含完整 prompt / tool schema / user content, 仅建议排查 token 问题时短期开启。
-	PromptDebugEnabled bool
-	PromptDebugDir     string
+	PromptDebugEnabled    bool
+	PromptDebugDir        string
+	PromptDebugMaxFiles   int
+	PromptDebugMaxBytes   int64
+	PromptDebugSampleRate float64
+	PromptDebugRedact     bool
 
 	// 追踪标签 (可选): 调用方通过 WithTag 或直接赋值, 标识该 Client 实例所服务的业务场景。
 	// 会写入 LLMCallRecord.Source, 方便在 dashboard 里按业务维度聚合 (chat/feishu/team/...)。
@@ -156,23 +160,27 @@ type Client struct {
 // 用于为不同 plan/role 指定不同模型而不影响原始 Client 的 Model 字段。
 func (c *Client) WithModel(model string) *Client {
 	return &Client{
-		BaseURL:             c.BaseURL,
-		APIKey:              c.APIKey,
-		Model:               model,
-		Client:              c.Client,
-		Guard:               c.Guard,
-		RetryCount:          c.RetryCount,
-		RetryBase:           c.RetryBase,
-		RetryMax:            c.RetryMax,
-		OnLLMEvent:          c.OnLLMEvent,
-		OnLLMMetrics:        c.OnLLMMetrics,
-		FallbackModels:      c.FallbackModels,
-		PromptCacheMode:     c.PromptCacheMode,
-		PromptDebugEnabled:  c.PromptDebugEnabled,
-		PromptDebugDir:      c.PromptDebugDir,
-		cbThreshold:         c.cbThreshold,
-		fallbackCooldownMin: c.fallbackCooldownMin,
-		Tag:                 c.Tag + ":" + model,
+		BaseURL:               c.BaseURL,
+		APIKey:                c.APIKey,
+		Model:                 model,
+		Client:                c.Client,
+		Guard:                 c.Guard,
+		RetryCount:            c.RetryCount,
+		RetryBase:             c.RetryBase,
+		RetryMax:              c.RetryMax,
+		OnLLMEvent:            c.OnLLMEvent,
+		OnLLMMetrics:          c.OnLLMMetrics,
+		FallbackModels:        c.FallbackModels,
+		PromptCacheMode:       c.PromptCacheMode,
+		PromptDebugEnabled:    c.PromptDebugEnabled,
+		PromptDebugDir:        c.PromptDebugDir,
+		PromptDebugMaxFiles:   c.PromptDebugMaxFiles,
+		PromptDebugMaxBytes:   c.PromptDebugMaxBytes,
+		PromptDebugSampleRate: c.PromptDebugSampleRate,
+		PromptDebugRedact:     c.PromptDebugRedact,
+		cbThreshold:           c.cbThreshold,
+		fallbackCooldownMin:   c.fallbackCooldownMin,
+		Tag:                   c.Tag + ":" + model,
 	}
 }
 
@@ -187,22 +195,26 @@ func (c *Client) ConfiguredClone(baseURL, apiKey, model string, fallbackModels [
 // 使用指定参数覆盖 baseURL / apiKey / model / fallbackModels / fallbackBaseURL / fallbackAPIKey。
 func (c *Client) ConfiguredCloneFull(baseURL, apiKey, model string, fallbackModels []string, fallbackBaseURL, fallbackAPIKey string) *Client {
 	clone := &Client{
-		BaseURL:             strings.TrimRight(baseURL, "/"),
-		APIKey:              apiKey,
-		Model:               model,
-		Client:              c.Client,
-		Guard:               c.Guard,
-		RetryCount:          c.RetryCount,
-		RetryBase:           c.RetryBase,
-		RetryMax:            c.RetryMax,
-		OnLLMEvent:          c.OnLLMEvent,
-		OnLLMMetrics:        c.OnLLMMetrics,
-		PromptCacheMode:     c.PromptCacheMode,
-		PromptDebugEnabled:  c.PromptDebugEnabled,
-		PromptDebugDir:      c.PromptDebugDir,
-		cbThreshold:         c.cbThreshold,
-		fallbackCooldownMin: c.fallbackCooldownMin,
-		Tag:                 c.Tag,
+		BaseURL:               strings.TrimRight(baseURL, "/"),
+		APIKey:                apiKey,
+		Model:                 model,
+		Client:                c.Client,
+		Guard:                 c.Guard,
+		RetryCount:            c.RetryCount,
+		RetryBase:             c.RetryBase,
+		RetryMax:              c.RetryMax,
+		OnLLMEvent:            c.OnLLMEvent,
+		OnLLMMetrics:          c.OnLLMMetrics,
+		PromptCacheMode:       c.PromptCacheMode,
+		PromptDebugEnabled:    c.PromptDebugEnabled,
+		PromptDebugDir:        c.PromptDebugDir,
+		PromptDebugMaxFiles:   c.PromptDebugMaxFiles,
+		PromptDebugMaxBytes:   c.PromptDebugMaxBytes,
+		PromptDebugSampleRate: c.PromptDebugSampleRate,
+		PromptDebugRedact:     c.PromptDebugRedact,
+		cbThreshold:           c.cbThreshold,
+		fallbackCooldownMin:   c.fallbackCooldownMin,
+		Tag:                   c.Tag,
 	}
 	if len(fallbackModels) > 0 {
 		clone.FallbackModels = fallbackModels

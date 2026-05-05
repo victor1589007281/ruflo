@@ -128,7 +128,11 @@ type BotConfig struct {
 	// PromptDebug 开启后将完整 LLM 请求/响应落盘到 PromptDebugDir。
 	PromptDebug bool
 	// PromptDebugDir 提示词调试文件目录。为空时使用 stateDir/prompt-debug。
-	PromptDebugDir string
+	PromptDebugDir        string
+	PromptDebugMaxFiles   int
+	PromptDebugMaxBytes   int64
+	PromptDebugSampleRate float64
+	PromptDebugRedact     bool
 
 	// Plans 按工作流名称覆盖模型配置 (供 Agent Teams 使用)
 	Plans map[string]PlanModelConfig
@@ -176,6 +180,9 @@ func DefaultBotConfig() *BotConfig {
 		WelcomeMessage:              "你好！我是 Claude Code (Go) 机器人。发送消息与我对话，我可以帮你编程、分析代码、执行命令等。",
 		ThinkingMessage:             "正在思考中...",
 		EnableFrontierOptimizations: true,
+		PromptDebugMaxFiles:         500,
+		PromptDebugMaxBytes:         200 * 1024 * 1024,
+		PromptDebugRedact:           true,
 		Wiki: WikiConfig{
 			Enabled:       true,
 			AutoIngestURL: true,
@@ -336,7 +343,11 @@ type EngineSection struct {
 	// PromptDebug 开启后保存每次发给 LLM 的完整请求与响应。仅建议排查成本/提示词问题时短期开启。
 	PromptDebug *bool `json:"promptDebug,omitempty"`
 	// PromptDebugDir 自定义调试输出目录。为空时使用 stateDir/prompt-debug。
-	PromptDebugDir string `json:"promptDebugDir,omitempty"`
+	PromptDebugDir        string  `json:"promptDebugDir,omitempty"`
+	PromptDebugMaxFiles   int     `json:"promptDebugMaxFiles,omitempty"`
+	PromptDebugMaxBytes   int64   `json:"promptDebugMaxBytes,omitempty"`
+	PromptDebugSampleRate float64 `json:"promptDebugSampleRate,omitempty"`
+	PromptDebugRedact     *bool   `json:"promptDebugRedact,omitempty"`
 }
 
 // WikiSection Wiki 配置段 (JSON)
@@ -658,6 +669,18 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		}
 		if jc.Engine.PromptDebugDir != "" {
 			bc.PromptDebugDir = jc.Engine.PromptDebugDir
+		}
+		if jc.Engine.PromptDebugMaxFiles > 0 {
+			bc.PromptDebugMaxFiles = jc.Engine.PromptDebugMaxFiles
+		}
+		if jc.Engine.PromptDebugMaxBytes > 0 {
+			bc.PromptDebugMaxBytes = jc.Engine.PromptDebugMaxBytes
+		}
+		if jc.Engine.PromptDebugSampleRate > 0 {
+			bc.PromptDebugSampleRate = jc.Engine.PromptDebugSampleRate
+		}
+		if jc.Engine.PromptDebugRedact != nil {
+			bc.PromptDebugRedact = *jc.Engine.PromptDebugRedact
 		}
 	}
 }

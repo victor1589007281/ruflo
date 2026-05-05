@@ -34,22 +34,22 @@ import (
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/backup"
 	"github.com/anthropic/claude-go/pkg/basedir"
-	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/commands"
-	"github.com/anthropic/claude-go/pkg/dreaming"
-	"github.com/anthropic/claude-go/pkg/memory"
+	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/dashboard"
+	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/engine"
-	"github.com/anthropic/claude-go/pkg/settings"
-	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/mcp"
+	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/session"
+	"github.com/anthropic/claude-go/pkg/settings"
 	"github.com/anthropic/claude-go/pkg/skills"
+	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -273,9 +273,9 @@ func teamCmd() *cobra.Command {
 					continue
 				}
 				var t struct {
-					Name     string `json:"name"`
-					Status   string `json:"status"`
-					Workflow string `json:"workflow"`
+					Name      string `json:"name"`
+					Status    string `json:"status"`
+					Workflow  string `json:"workflow"`
 					Objective string `json:"objective"`
 				}
 				if json.Unmarshal(data, &t) != nil {
@@ -533,9 +533,9 @@ func runCmd() *cobra.Command {
 				siEngine := swarmintel.NewEngine(eng.APIClient, siCfg)
 
 				agentFactory := func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
-						mcfg, _ := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig)
-						return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt, modelCfg: mcfg}, nil
-					}
+					mcfg, _ := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig)
+					return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt, modelCfg: mcfg}, nil
+				}
 				agentPool := agent.NewAgentPool(agentFactory, 8)
 
 				// 任务持久化路径与 feishu bot / dashboard 对齐: <state>/tasks/tasks.json
@@ -573,25 +573,25 @@ func runCmd() *cobra.Command {
 				})
 
 				// 加载模型配置并创建解析器 (层级: role > plan > 全局默认)
-					var modelResolver *agent.PlanConfigResolver
-					if jsonCfg, err := feishu.LoadJSONConfig(filepath.Join(cwd, "claude-go.json")); err == nil && jsonCfg != nil {
-						if registry, resolver, err := modelconfig.LoadFromConfig(jsonCfg.ToModelConfigJSON()); err == nil && resolver != nil {
-							modelResolver = agent.NewPlanConfigResolver(resolver)
-							_ = registry
-						}
+				var modelResolver *agent.PlanConfigResolver
+				if jsonCfg, err := feishu.LoadJSONConfig(filepath.Join(cwd, "claude-go.json")); err == nil && jsonCfg != nil {
+					if registry, resolver, err := modelconfig.LoadFromConfig(jsonCfg.ToModelConfigJSON()); err == nil && resolver != nil {
+						modelResolver = agent.NewPlanConfigResolver(resolver)
+						_ = registry
 					}
-					teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
-						BaseDir:           filepath.Join(cwd, ".claude-go", "teams"),
-						Cwd:               cwd,
-						Factory:           agentFactory,
-						Pool:              agentPool,
-						Notify:            func(_, msg string) { fmt.Println(msg) },
-						LLM:               eng.APIClient,
-						Roles:             agent.NewRoleRegistry(cwd),
-						TaskTracker:       dagAdapter,
-						Concurrency:       eng.APIClient.Guard,
-						PlanConfigResolver: modelResolver,
-					})
+				}
+				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
+					BaseDir:            filepath.Join(cwd, ".claude-go", "teams"),
+					Cwd:                cwd,
+					Factory:            agentFactory,
+					Pool:               agentPool,
+					Notify:             func(_, msg string) { fmt.Println(msg) },
+					LLM:                eng.APIClient,
+					Roles:              agent.NewRoleRegistry(cwd),
+					TaskTracker:        dagAdapter,
+					Concurrency:        eng.APIClient.Guard,
+					PlanConfigResolver: modelResolver,
+				})
 
 				cmdCtx := &commands.CommandContext{
 					Engine:     eng,
@@ -742,7 +742,6 @@ JSON 配置文件示例:
 				return fmt.Errorf("需要飞书应用凭证: 使用 --app-id/--app-secret 或 --config 或设置 FEISHU_APP_ID/FEISHU_APP_SECRET")
 			}
 
-
 			apiKey := getAPIKey()
 			baseURL := flagBaseURL
 			modelAlias := flagModel
@@ -845,9 +844,9 @@ JSON 配置文件示例:
 					})
 			}
 			bot, err := feishu.NewBot(config)
-				if err != nil {
-					return fmt.Errorf("创建飞书机器人失败: %w", err)
-				}
+			if err != nil {
+				return fmt.Errorf("创建飞书机器人失败: %w", err)
+			}
 			botRef = bot
 			_ = dashCfgRef // suppress unused warning when Wiki.APIPort == 0
 
@@ -1036,7 +1035,8 @@ func rolesCmd() *cobra.Command {
 			fmt.Printf("File skills: %s\n", formatNameList(info.FileSkills))
 			fmt.Printf("Builtin skills: %s\n", formatNameList(info.BuiltinSkills))
 			fmt.Printf("Recommended skills: %s\n", formatNameList(info.RecommendedSkills))
-			fmt.Printf("Effective skills: %s\n", formatNameList(reg.RoleSkills(args[0])))
+			fmt.Printf("Injected skills: %s\n", formatNameList(info.InjectedSkills))
+			fmt.Printf("Estimated injected skill chars: %d\n", info.InjectedSkillChars)
 			return nil
 		},
 	}
@@ -1341,7 +1341,8 @@ func dashboardOpenCmd() *cobra.Command {
 // backupCmd 备份 / 恢复 .claude-go 运行态关键数据。
 //
 // 覆盖: teams/, memory/, metrics/, evolution/, swarm_intel/,
-//      tasks.json, cron_jobs.json, blackboard.json, config.json 等
+//
+//	tasks.json, cron_jobs.json, blackboard.json, config.json 等
 //
 // 归档路径: <stateDir>/backups/<timestamp>-<label>.tar.gz
 func backupCmd() *cobra.Command {
@@ -1558,14 +1559,14 @@ func runBackupDelete(stateDir, path string) error {
 // dashStateDirInfo 记录 Dashboard StateDir 的解析结果及数据来源,
 // 便于启动日志透明展示 "为什么 stateDir 最终是这个值"。
 type dashStateDirInfo struct {
-	Resolved      string              // 最终路径 (basedir.ResolveDefault 的输出)
-	StateDirInput string              // 参与解析的 stateDir (CLI 或 JSON.stateDir)
-	StateDirFrom  string              // "cli" / "json.stateDir" / "json.dashboard.stateDir(deprecated)" / ""
-	CwdInput      string              // 参与解析的 cwd
-	CwdFrom       string              // "json.cwd" / "os.getwd"
-	JSONCfg       *feishu.JSONConfig  // 预加载的 JSON 配置 (供调用方复用)
-	ConfigPath    string              // 实际生效的配置文件路径
-	Warnings      []string            // 例如 dashboard.stateDir 废弃提示
+	Resolved      string             // 最终路径 (basedir.ResolveDefault 的输出)
+	StateDirInput string             // 参与解析的 stateDir (CLI 或 JSON.stateDir)
+	StateDirFrom  string             // "cli" / "json.stateDir" / "json.dashboard.stateDir(deprecated)" / ""
+	CwdInput      string             // 参与解析的 cwd
+	CwdFrom       string             // "json.cwd" / "os.getwd"
+	JSONCfg       *feishu.JSONConfig // 预加载的 JSON 配置 (供调用方复用)
+	ConfigPath    string             // 实际生效的配置文件路径
+	Warnings      []string           // 例如 dashboard.stateDir 废弃提示
 }
 
 // botAPIURL 从配置中解析 feishu bot 的 wiki API URL，供 standalone dashboard 转发 team 操作。
@@ -1704,7 +1705,6 @@ func runDashboardForeground(addr string, port int, stateDir string, noOpen bool,
 	// 启动 LLM 调用指标采集 (全局钩子): 所有 api.Client 的调用都会落盘到
 	// {stateDir}/metrics/llm.jsonl, dashboard 展示统一的 LLM token/质量视图。
 	metrics.InitGlobalLLMCollector(resolved)
-
 
 	srv := dashboard.NewServer(dashboard.Config{
 		StateDir:  resolved,
@@ -1849,7 +1849,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	skillReg := skills.NewRegistry()
 	skillReg.LoadDefaults(cwd)
 	if skillReg.Count() > 0 {
-		promptMgr.SkillListing = skillReg.FormatListing()
+		promptMgr.SkillListing = skillReg.FormatShortListing(8)
 	}
 
 	effectiveMaxTokens := flagMaxTokens

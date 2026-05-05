@@ -44,7 +44,8 @@ var uuidCounter atomic.Int64
 // 对应 TS: query.ts 中 consecutiveErrorCount 相关逻辑
 const (
 	maxConsecutiveErrors = 5     // 连续错误达到此阈值触发熔断
-	microCompactMaxChars = 50000 // MicroCompact 截断阈值 (字符)
+	microCompactMaxChars = 16000 // MicroCompact 截断阈值 (字符)
+	messageCompactChars  = 30000 // messages 超过该字符数时提前压缩旧 tool_result
 )
 
 // QueryEngine 查询引擎，管理整个对话循环。
@@ -101,6 +102,7 @@ type Config struct {
 	FallbackModel    string
 	MaxTokens        int
 	MaxTurns         int    // queryLoop 最大迭代次数 (0 = 无限)
+	ContextWindow    int    // 模型上下文窗口 (tokens, 0 = 默认 200000)
 	Cwd              string // 当前工作目录
 	PermissionMode   types.PermissionMode
 	IsNonInteractive bool
@@ -156,6 +158,10 @@ func NewQueryEngine(
 	if cfg.MaxTokens == 0 {
 		cfg.MaxTokens = 16384
 	}
+	contextBudget := cfg.ContextWindow
+	if contextBudget <= 0 {
+		contextBudget = 200000
+	}
 	e := &QueryEngine{
 		Config:        cfg,
 		APIClient:     apiClient,
@@ -164,7 +170,7 @@ func NewQueryEngine(
 		PermChecker:   permChecker,
 		Compactor:     compactor,
 		PromptMgr:     promptMgr,
-		ContextBudget: 200000,
+		ContextBudget: contextBudget,
 	}
 	// 按 Config 开关懒加载对应组件。调用 EnableFrontierOptimizations() 可一次性启用 P0/P1。
 	e.applyFeatureFlags()
@@ -452,6 +458,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 防止单个工具输出过大撑满上下文窗口。
 		// ============================================================
 		messages = compact.MicroCompact(messages, microCompactMaxChars)
+		if messageChars(messages) > messageCompactChars {
+			messages = compact.MicroCompact(messages, microCompactMaxChars/2)
+		}
 
 		// ============================================================
 		// Phase 2: 组装系统提示词
@@ -978,13 +987,14 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		}
 
 		tctx := &tool.ToolContext{
-			Cwd:              e.Config.Cwd,
-			PermissionMode:   effectivePerm,
-			MainLoopModel:    currentModel,
-			IsNonInteractive: e.Config.IsNonInteractive,
-			Debug:            e.Config.Debug,
-			Messages:         messages,
-			GlobalPerm:       e.PermChecker,
+			Cwd:                e.Config.Cwd,
+			PermissionMode:     effectivePerm,
+			MainLoopModel:      currentModel,
+			IsNonInteractive:   e.Config.IsNonInteractive,
+			Debug:              e.Config.Debug,
+			Messages:           messages,
+			MaxToolResultChars: microCompactMaxChars,
+			GlobalPerm:         e.PermChecker,
 		}
 
 		toolExecStart := time.Now()

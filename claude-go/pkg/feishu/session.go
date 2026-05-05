@@ -33,11 +33,12 @@ import (
 //
 // 对应概念: 类似 Claude Code 中每个 terminal tab 的独立会话。
 type Session struct {
-	ChatID     string
-	Engine     *engine.QueryEngine
-	LastActive time.Time
-	mu         sync.Mutex
-	processing bool // 是否正在处理消息 (防止并发请求)
+	ChatID      string
+	Engine      *engine.QueryEngine
+	LastActive  time.Time
+	ToolProfile builtin.ToolProfile
+	mu          sync.Mutex
+	processing  bool // 是否正在处理消息 (防止并发请求)
 
 	// 消息队列: 当 processing=true 时, 后续消息入队等待, 处理完自动消费
 	pendingMsg   *string      // 最多缓存 1 条待处理消息 (最新的覆盖旧的)
@@ -177,6 +178,137 @@ func (sm *SessionManager) SetSearcher(s builtin.WebSearcher) {
 	sm.searcher = s
 }
 
+func (sm *SessionManager) SetCwd(cwd string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.config.Cwd = cwd
+	sm.roleRegistry = agent.NewRoleRegistry(cwd)
+	sm.sessions = make(map[string]*Session)
+}
+
+func contextWindowOrDefault(v int) int {
+	if v > 0 {
+		return v
+	}
+	return 200000
+}
+
+type registryOptions struct {
+	chatID             string
+	includeFeishuTools bool
+	includeTeamQuery   bool
+	includeAgent       bool
+	runAgentFn         agent.RunAgentFunc
+}
+
+func (sm *SessionManager) newProfileRegistry(profile builtin.ToolProfile, opts registryOptions) *tool.Registry {
+	profile = builtin.NormalizeToolProfile(profile)
+	reg := tool.NewRegistry()
+	builtin.RegisterProfileToolsWithStore(reg, sm.taskStore, sm.searcher, profile)
+
+	if opts.includeFeishuTools && opts.chatID != "" && sm.mediaSendFn != nil {
+		reg.Register(NewFeishuSendFileTool(opts.chatID, sm.mediaSendFn))
+	}
+	if opts.includeTeamQuery && sm.teamMgr != nil {
+		reg.Register(NewTeamQueryTool(sm.teamMgr))
+	}
+	if sm.mcpMgr != nil {
+		if profile == builtin.ToolProfileAdmin {
+			sm.mcpMgr.RefreshToolsForRegistry(reg)
+		} else {
+			registerMCPProxyTools(reg, sm.mcpMgr)
+		}
+	}
+	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
+		reg.Register(skills.NewSkillTool(sm.skillReg))
+	}
+	if opts.includeAgent && opts.runAgentFn != nil {
+		reg.Register(agent.NewAgentTool(opts.runAgentFn))
+	}
+	return reg
+}
+
+func shortSkillListing(reg *skills.Registry) string {
+	if reg == nil || reg.Count() == 0 {
+		return ""
+	}
+	return reg.FormatShortListing(8)
+}
+
+func (sm *SessionManager) configureSessionTools(session *Session, profile builtin.ToolProfile) {
+	profile = builtin.NormalizeToolProfile(profile)
+	if session.ToolProfile == profile && session.Engine != nil && session.Engine.Tools != nil {
+		return
+	}
+	var runAgentFn agent.RunAgentFunc
+	runAgentFn = func(ctx context.Context, agentPrompt string, opts agent.RunOptions) (string, error) {
+		return sm.runNestedAgent(ctx, runAgentFn, agentPrompt, opts)
+	}
+	session.Engine.Tools = sm.newProfileRegistry(profile, registryOptions{
+		chatID:             session.ChatID,
+		includeFeishuTools: true,
+		includeTeamQuery:   true,
+		includeAgent:       true,
+		runAgentFn:         runAgentFn,
+	})
+	session.ToolProfile = profile
+}
+
+func inferFeishuToolProfile(text string) builtin.ToolProfile {
+	lower := strings.ToLower(text)
+	if strings.HasPrefix(strings.TrimSpace(lower), "/") {
+		return builtin.ToolProfileAdmin
+	}
+	codingHints := []string{
+		"claude-go", "golang", " go ", ".go", "代码", "开发", "实现", "重构", "测试", "bug",
+		"仓库", "项目", "架构", "编译", "修复", "todo 应用", "api", "backend",
+	}
+	padded := " " + lower + " "
+	for _, hint := range codingHints {
+		if strings.Contains(padded, hint) || strings.Contains(lower, hint) {
+			return builtin.ToolProfileCoding
+		}
+	}
+	researchHints := []string{"分析", "调研", "搜索", "查找", "资料", "网页", "web", "最新", "新闻"}
+	for _, hint := range researchHints {
+		if strings.Contains(lower, hint) {
+			return builtin.ToolProfileResearch
+		}
+	}
+	return builtin.ToolProfileChat
+}
+
+func profileForRunOptions(opts agent.RunOptions, meta agent.RunMetadata) builtin.ToolProfile {
+	role := strings.ToLower(firstNonEmpty(opts.SubagentType, meta.Role, meta.Purpose))
+	if opts.ReadOnly || strings.Contains(role, "research") || strings.Contains(role, "review") || strings.Contains(role, "plan") {
+		return builtin.ToolProfileResearch
+	}
+	if strings.Contains(role, "coder") || strings.Contains(role, "tester") || strings.Contains(role, "architect") ||
+		strings.Contains(role, "implement") || strings.Contains(role, "build") {
+		return builtin.ToolProfileCoding
+	}
+	return builtin.ToolProfileChat
+}
+
+func profileForTeamRole(role, workflow string) builtin.ToolProfile {
+	role = strings.ToLower(role)
+	workflow = strings.ToLower(workflow)
+	if workflow == "development" && (strings.Contains(role, "research") ||
+		strings.Contains(role, "review") ||
+		strings.Contains(role, "planner") ||
+		strings.Contains(role, "architect")) {
+		return builtin.ToolProfileTeam
+	}
+	if strings.Contains(role, "research") || strings.Contains(role, "review") || strings.Contains(role, "planner") {
+		return builtin.ToolProfileResearch
+	}
+	if strings.Contains(role, "coder") || strings.Contains(role, "tester") || strings.Contains(role, "architect") ||
+		strings.Contains(role, "implement") || strings.Contains(role, "build") {
+		return builtin.ToolProfileCoding
+	}
+	return builtin.ToolProfileTeam
+}
+
 // Get 获取已有会话（不创建）。如果不存在返回 nil。
 func (sm *SessionManager) Get(chatID string) *Session {
 	sm.mu.RLock()
@@ -222,28 +354,18 @@ func (sm *SessionManager) GetOrCreate(chatID string) *Session {
 //  2. 从共享的 MCP 连接中获取工具列表 (RegisterMCPTools)
 //  3. 注册 Agent 工具 (支持嵌套 queryLoop)
 func (sm *SessionManager) createSession(chatID string) *Session {
-	reg := tool.NewRegistry()
-	builtin.RegisterBaseToolsWithStore(reg, sm.taskStore, sm.searcher)
-
-	// 注册飞书发送工具: 让 LLM 能直接通过飞书 SDK 发送图片/文件给用户
-	if sm.mediaSendFn != nil {
-		reg.Register(NewFeishuSendFileTool(chatID, sm.mediaSendFn))
+	profile := builtin.ToolProfileChat
+	var runAgentFn agent.RunAgentFunc
+	runAgentFn = func(ctx context.Context, agentPrompt string, opts agent.RunOptions) (string, error) {
+		return sm.runNestedAgent(ctx, runAgentFn, agentPrompt, opts)
 	}
-
-	// 注册团队查询工具: 让 LLM 能查询团队状态和报告（解决"找不到团队"的问题）
-	if sm.teamMgr != nil {
-		reg.Register(NewTeamQueryTool(sm.teamMgr))
-	}
-
-	// 注册 MCP 工具 (动态, 对应 TS: assembleToolPool + refreshTools)
-	if sm.mcpMgr != nil {
-		sm.mcpMgr.RefreshToolsForRegistry(reg)
-	}
-
-	// 注册 Skill 工具 (如果有已加载技能)
-	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
-		reg.Register(skills.NewSkillTool(sm.skillReg))
-	}
+	reg := sm.newProfileRegistry(profile, registryOptions{
+		chatID:             chatID,
+		includeFeishuTools: true,
+		includeTeamQuery:   true,
+		includeAgent:       true,
+		runAgentFn:         runAgentFn,
+	})
 
 	permMode := types.PermissionMode(sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)
@@ -251,15 +373,14 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	// Hook 配置 (从 JSON config 加载)
 	hookRunner := hooks.NewRunner(sm.hookConfigs, "")
 
-	compactor := compact.NewCompactor(sm.apiClient, 200000)
+	contextWindow := contextWindowOrDefault(sm.defaultResolved.ContextWindow)
+	compactor := compact.NewCompactor(sm.apiClient, contextWindow)
 	promptMgr := prompt.NewManager(sm.config.Cwd)
 	if sm.config.SystemPrompt != "" {
 		promptMgr.CustomPrompt = sm.config.SystemPrompt
 	}
 	promptMgr.Model = sm.apiClient.Model
-	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
-		promptMgr.SkillListing = sm.skillReg.FormatListing()
-	}
+	promptMgr.SkillListing = shortSkillListing(sm.skillReg)
 	promptMgr.ProductName = "Claude Code (Go) - Feishu Bot"
 	promptMgr.HookConfigs = sm.hookConfigs
 	if sm.dreamer != nil {
@@ -270,6 +391,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		Model:            sm.apiClient.Model,
 		MaxTokens:        sm.defaultResolved.MaxTokens,
 		MaxTurns:         sm.defaultResolved.MaxTurns,
+		ContextWindow:    contextWindow,
 		Cwd:              sm.config.Cwd,
 		PermissionMode:   permMode,
 		IsNonInteractive: true, // 飞书模式始终为非交互式
@@ -288,14 +410,6 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		},
 	}
 
-	// 注册 Agent 工具 (对应 TS: AgentTool → runAgent → 嵌套 queryLoop)
-	// Agent 需要能创建嵌套 QueryEngine, 因此使用闭包注入 runAgent 函数
-	var runAgentFn agent.RunAgentFunc
-	runAgentFn = func(ctx context.Context, agentPrompt string, opts agent.RunOptions) (string, error) {
-		return sm.runNestedAgent(ctx, runAgentFn, agentPrompt, opts)
-	}
-	reg.Register(agent.NewAgentTool(runAgentFn))
-
 	eng := engine.NewQueryEngine(cfg, sm.apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = sm.memoryStore
 	if sm.config.EnableFrontierOptimizations {
@@ -303,9 +417,10 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	}
 
 	return &Session{
-		ChatID:     chatID,
-		Engine:     eng,
-		LastActive: time.Now(),
+		ChatID:      chatID,
+		Engine:      eng,
+		LastActive:  time.Now(),
+		ToolProfile: profile,
 	}
 }
 
@@ -319,16 +434,6 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 //  4. 执行查询循环，收集所有 assistant 文本
 //  5. 返回合并后的结果
 func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
-	nestedReg := tool.NewRegistry()
-	builtin.RegisterBaseToolsWithStore(nestedReg, sm.taskStore, sm.searcher)
-	if sm.mcpMgr != nil {
-		sm.mcpMgr.RefreshToolsForRegistry(nestedReg)
-	}
-	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
-		nestedReg.Register(skills.NewSkillTool(sm.skillReg))
-	}
-	nestedReg.Register(agent.NewAgentTool(runAgentFn))
-
 	permMode := types.PermissionMode(sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)
 	if opts.ReadOnly {
@@ -341,6 +446,7 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	nestedModel := sm.apiClient.Model
 	maxTokens := sm.defaultResolved.MaxTokens
 	maxTurns := sm.defaultResolved.MaxTurns
+	contextWindow := contextWindowOrDefault(sm.defaultResolved.ContextWindow)
 	promptCacheMode := sm.config.PromptCacheMode
 	if mcfg, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok && mcfg.ProviderName != "" {
 		nestedAPIClient = sm.apiClient.ConfiguredCloneFull(
@@ -354,6 +460,9 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		if mcfg.MaxTurns > 0 {
 			maxTurns = mcfg.MaxTurns
 		}
+		if mcfg.ContextWindow > 0 {
+			contextWindow = mcfg.ContextWindow
+		}
 		if mcfg.PromptCacheMode != "" {
 			promptCacheMode = mcfg.PromptCacheMode
 		}
@@ -363,12 +472,10 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	}
 
 	hookRunner := hooks.NewRunner(sm.hookConfigs, "")
-	compactor := compact.NewCompactor(nestedAPIClient, 200000)
+	compactor := compact.NewCompactor(nestedAPIClient, contextWindow)
 	promptMgr := prompt.NewManager(sm.config.Cwd)
 	promptMgr.Model = nestedModel
-	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
-		promptMgr.SkillListing = sm.skillReg.FormatListing()
-	}
+	promptMgr.SkillListing = shortSkillListing(sm.skillReg)
 
 	model := nestedModel
 	if opts.Model != "" {
@@ -376,11 +483,13 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	}
 	runMeta := agent.RunMetadataFromContext(ctx)
 	nestedPurpose := firstNonEmpty(opts.SubagentType, runMeta.Purpose, runMeta.Team)
+	nestedReg := sm.newProfileRegistry(profileForRunOptions(opts, runMeta), registryOptions{})
 
 	cfg := &engine.Config{
 		Model:            model,
 		MaxTokens:        maxTokens,
 		MaxTurns:         maxTurns,
+		ContextWindow:    contextWindow,
 		Cwd:              sm.config.Cwd,
 		PermissionMode:   permMode,
 		IsNonInteractive: true,
@@ -517,6 +626,7 @@ func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, us
 		}
 	}()
 	session.Touch()
+	sm.configureSessionTools(session, inferFeishuToolProfile(userText))
 
 	ch := session.Engine.SubmitMessage(ctx, userText)
 
@@ -616,6 +726,7 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	modelOverride := r.sm.apiClient.Model
 	maxTokens := r.sm.defaultResolved.MaxTokens
 	maxTurns := r.sm.defaultResolved.MaxTurns
+	contextWindow := contextWindowOrDefault(r.sm.defaultResolved.ContextWindow)
 	promptCacheMode := r.sm.config.PromptCacheMode
 	mcfg := r.resolvedCfg
 	if mcfg.ProviderName == "" {
@@ -636,6 +747,9 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		if mcfg.MaxTurns > 0 {
 			maxTurns = mcfg.MaxTurns
 		}
+		if mcfg.ContextWindow > 0 {
+			contextWindow = mcfg.ContextWindow
+		}
 		if mcfg.PromptCacheMode != "" {
 			promptCacheMode = mcfg.PromptCacheMode
 		}
@@ -644,33 +758,15 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		apiClient.PromptCacheMode = promptCacheMode
 	}
 
-	nestedReg := tool.NewRegistry()
-	builtin.RegisterBaseToolsWithStore(nestedReg, r.sm.taskStore, r.sm.searcher)
-	if r.sm.mcpMgr != nil {
-		r.sm.mcpMgr.RefreshToolsForRegistry(nestedReg)
-	}
-	if r.sm.skillReg != nil && r.sm.skillReg.Count() > 0 {
-		nestedReg.Register(skills.NewSkillTool(r.sm.skillReg))
-	}
-
-	var runAgentFn agent.RunAgentFunc
-	runAgentFn = func(aCtx context.Context, prompt string, opts agent.RunOptions) (string, error) {
-		if r.resolvedCfg.ProviderName != "" {
-			aCtx = context.WithValue(aCtx, agent.ModelConfigKey{}, r.resolvedCfg)
-		}
-		return r.sm.runNestedAgent(aCtx, runAgentFn, prompt, opts)
-	}
-	nestedReg.Register(agent.NewAgentTool(runAgentFn))
+	nestedReg := r.sm.newProfileRegistry(profileForTeamRole(firstNonEmpty(r.runMeta.Role, r.role), r.runMeta.Workflow), registryOptions{})
 
 	permMode := types.PermissionMode(r.sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)
 	hookRunner := hooks.NewRunner(r.sm.hookConfigs, "")
-	compactor := compact.NewCompactor(apiClient, 200000)
+	compactor := compact.NewCompactor(apiClient, contextWindow)
 	promptMgr := prompt.NewManager(r.sm.config.Cwd)
 	promptMgr.Model = modelOverride
-	if r.sm.skillReg != nil && r.sm.skillReg.Count() > 0 {
-		promptMgr.SkillListing = r.sm.skillReg.FormatListing()
-	}
+	promptMgr.SkillListing = shortSkillListing(r.sm.skillReg)
 
 	// 角色提示词: 优先使用外部传入的, 再尝试从 RoleRegistry 获取 (含专属 Skills)
 	effectivePrompt := r.systemPrompt
@@ -697,6 +793,7 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		Model:            modelOverride,
 		MaxTokens:        maxTokens,
 		MaxTurns:         maxTurns,
+		ContextWindow:    contextWindow,
 		Cwd:              r.sm.config.Cwd,
 		PermissionMode:   permMode,
 		IsNonInteractive: true,

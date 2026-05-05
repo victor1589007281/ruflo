@@ -7,9 +7,10 @@
 //   - 非只读工具 → 单独一个串行批次 (serial)
 //
 // 例如 [Glob, Grep, FileWrite, FileRead, FileRead] 会被分区为:
-//   Batch 1: [Glob, Grep] → concurrent
-//   Batch 2: [FileWrite] → serial
-//   Batch 3: [FileRead, FileRead] → concurrent
+//
+//	Batch 1: [Glob, Grep] → concurrent
+//	Batch 2: [FileWrite] → serial
+//	Batch 3: [FileRead, FileRead] → concurrent
 //
 // 这保证了写操作不会与其他操作并发执行，
 // 同时最大化只读操作的并行度。
@@ -21,8 +22,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -48,11 +51,11 @@ type ToolCallUpdate struct {
 // 对应 TS: toolOrchestration.ts 中的 partitionToolCalls()
 //
 // 算法:
-//   1. 遍历所有 tool_use 块
-//   2. 对每个块，通过 registry 查找对应工具
-//   3. 调用 tool.IsConcurrencySafe(input) 判断是否并发安全
-//   4. 相邻的相同类型块合并为一个批次
-//   5. 非并发安全的块独立成批
+//  1. 遍历所有 tool_use 块
+//  2. 对每个块，通过 registry 查找对应工具
+//  3. 调用 tool.IsConcurrencySafe(input) 判断是否并发安全
+//  4. 相邻的相同类型块合并为一个批次
+//  5. 非并发安全的块独立成批
 func PartitionToolCalls(blocks []types.ContentBlock, reg *Registry) []Batch {
 	if len(blocks) == 0 {
 		return nil
@@ -180,12 +183,12 @@ func runSerialBatch(
 // 对应 TS: services/tools/toolExecution.ts 中的 runToolUse()
 //
 // 执行流程:
-//   1. 查找工具
-//   2. 运行 pre-tool-use hooks (可被 hook 阻止)
-//   3. 检查权限
-//   4. 调用 tool.Call()
-//   5. 运行 post-tool-use hooks
-//   6. 组装 tool_result 消息返回
+//  1. 查找工具
+//  2. 运行 pre-tool-use hooks (可被 hook 阻止)
+//  3. 检查权限
+//  4. 调用 tool.Call()
+//  5. 运行 post-tool-use hooks
+//  6. 组装 tool_result 消息返回
 func RunToolUse(
 	ctx context.Context,
 	block types.ContentBlock,
@@ -286,6 +289,7 @@ func RunToolUse(
 	if preHookContext != "" {
 		content = preHookContext + "\n\n" + content
 	}
+	content = compactToolResultContent(toolName, content, tctx)
 
 	return types.Message{
 		Type: types.MessageTypeUser,
@@ -296,6 +300,112 @@ func RunToolUse(
 			IsError:   result.IsError,
 		}},
 	}
+}
+
+const defaultMaxToolResultChars = 24000
+
+func compactToolResultContent(toolName, content string, tctx *ToolContext) string {
+	maxChars := defaultMaxToolResultChars
+	if tctx != nil && tctx.MaxToolResultChars > 0 {
+		maxChars = tctx.MaxToolResultChars
+	}
+	if maxChars <= 0 || len(content) <= maxChars {
+		return content
+	}
+
+	artifactPath := writeToolResultArtifact(toolName, content, tctx)
+	summaryLimit := maxChars / 3
+	if summaryLimit < 2500 {
+		summaryLimit = 2500
+	}
+	if summaryLimit > 6000 {
+		summaryLimit = 6000
+	}
+	summary := summarizeLongToolResult(content, summaryLimit)
+
+	var b strings.Builder
+	b.WriteString("[tool_result compacted]\n")
+	b.WriteString(fmt.Sprintf("tool: %s\n", toolName))
+	b.WriteString(fmt.Sprintf("original_chars: %d\n", len(content)))
+	if artifactPath != "" {
+		b.WriteString(fmt.Sprintf("full_artifact: %s\n", artifactPath))
+	}
+	b.WriteString("summary:\n")
+	b.WriteString(summary)
+	return b.String()
+}
+
+func writeToolResultArtifact(toolName, content string, tctx *ToolContext) string {
+	if tctx == nil || strings.TrimSpace(tctx.Cwd) == "" {
+		return ""
+	}
+	dir := filepath.Join(tctx.Cwd, ".claude-go", "artifacts", "tool-results")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ""
+	}
+	name := sanitizeArtifactName(toolName)
+	path := filepath.Join(dir, fmt.Sprintf("%s-%s.txt", time.Now().Format("20060102-150405.000000"), name))
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return ""
+	}
+	return path
+}
+
+func sanitizeArtifactName(s string) string {
+	if s == "" {
+		return "tool"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "tool"
+	}
+	if len(out) > 80 {
+		out = out[:80]
+	}
+	return out
+}
+
+func summarizeLongToolResult(raw string, maxChars int) string {
+	if len(raw) <= maxChars {
+		return raw
+	}
+	lines := strings.Split(raw, "\n")
+	var picked []string
+	for i, line := range lines {
+		if i >= 20 {
+			break
+		}
+		picked = append(picked, line)
+	}
+	lower := strings.ToLower(raw)
+	for _, marker := range []string{"error", "错误", "failed", "panic", "exception", "fatal"} {
+		if idx := strings.Index(lower, marker); idx >= 0 {
+			end := idx + 800
+			if end > len(raw) {
+				end = len(raw)
+			}
+			picked = append(picked, "", "[diagnostic excerpt]", raw[idx:end])
+			break
+		}
+	}
+	tail := raw
+	if len(tail) > 1200 {
+		tail = tail[len(tail)-1200:]
+	}
+	picked = append(picked, "", "[tail excerpt]", tail)
+	out := strings.Join(picked, "\n")
+	if len(out) > maxChars {
+		out = out[:maxChars] + "\n...(summary truncated)"
+	}
+	return out
 }
 
 func promptUserApproval(toolName string, input json.RawMessage, reason string) (approved bool, alwaysAllow bool) {

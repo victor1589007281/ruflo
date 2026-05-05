@@ -15,17 +15,17 @@
 //  4. 意图识别层 — 用户发送中文自然语言即可驱动团队,
 //     无需记忆 /team 命令。IntentRecognizer 自动拆解执行。
 //
-//	┌────────────────────────────────────────────────────┐
-//	│ ProductionTeamManager (进程级单例)                  │
-//	│  - TaskTracker: 复用 V2 Task (LLM 可通过 TaskList 看到)│
-//	│  - 文件持久化: .claude/teams/{name}/                │
-//	│  - 通知回调: 向飞书推送进度                         │
-//	├────────────────────────────────────────────────────┤
-//	│ ProductionTeam                                     │
-//	│  - Blackboard: 共享黑板 (bMAS 架构)                 │
-//	│  - Workflow: pipeline / fanout / adversarial        │
-//	│  - V2 TaskIDs: 每个阶段对应一个 V2 Task             │
-//	└────────────────────────────────────────────────────┘
+//     ┌────────────────────────────────────────────────────┐
+//     │ ProductionTeamManager (进程级单例)                  │
+//     │  - TaskTracker: 复用 V2 Task (LLM 可通过 TaskList 看到)│
+//     │  - 文件持久化: .claude/teams/{name}/                │
+//     │  - 通知回调: 向飞书推送进度                         │
+//     ├────────────────────────────────────────────────────┤
+//     │ ProductionTeam                                     │
+//     │  - Blackboard: 共享黑板 (bMAS 架构)                 │
+//     │  - Workflow: pipeline / fanout / adversarial        │
+//     │  - V2 TaskIDs: 每个阶段对应一个 V2 Task             │
+//     └────────────────────────────────────────────────────┘
 package agent
 
 import (
@@ -91,8 +91,8 @@ type TaskStoreDAGAdapter struct {
 		AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
 		SetTaskStatusAndUnblock(id, status string) (int, error)
 	}
-	readyFunc   func() []DAGTaskSummary
-	getAllFunc  func() []DAGTaskSummary
+	readyFunc  func() []DAGTaskSummary
+	getAllFunc func() []DAGTaskSummary
 }
 
 // NewTaskStoreDAGAdapter 创建适配器。
@@ -211,15 +211,15 @@ type ProductionTeamManager struct {
 	factory     CreateAgentFunc
 	notify      NotifyFunc
 	mediaNotify MediaNotifyFunc
-	taskTracker TaskTracker      // 复用 V2 Task 系统
-	pool        *AgentPool       // Agent 池 (动态扩缩)
-	llm         LLMClient        // LLM 客户端 (蜂群分解)
-	evolution   *EvolutionEngine // 自动进化引擎
-	dreamer     DreamRecorder    // Dreaming 接口 (覆盖 team agent 会话)
-	roles       *RoleRegistry    // 角色注册表
-	memWriter    MemoryWriter        // 记忆写入 (团队完成后写入高权重记忆)
-	metrics      *metrics.Collector  // 持续观测指标采集器
-	concurrency  ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
+	taskTracker TaskTracker          // 复用 V2 Task 系统
+	pool        *AgentPool           // Agent 池 (动态扩缩)
+	llm         LLMClient            // LLM 客户端 (蜂群分解)
+	evolution   *EvolutionEngine     // 自动进化引擎
+	dreamer     DreamRecorder        // Dreaming 接口 (覆盖 team agent 会话)
+	roles       *RoleRegistry        // 角色注册表
+	memWriter   MemoryWriter         // 记忆写入 (团队完成后写入高权重记忆)
+	metrics     *metrics.Collector   // 持续观测指标采集器
+	concurrency ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
 
 	planCfgResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
 
@@ -230,19 +230,19 @@ type ProductionTeamManager struct {
 
 // TeamManagerConfig 团队管理器配置。
 type TeamManagerConfig struct {
-	BaseDir       string
-	Cwd           string // 项目工作目录 (用于编译验证)
-	Factory       CreateAgentFunc
-	Notify        NotifyFunc
-	MediaNotify   MediaNotifyFunc
-	TaskTracker   TaskTracker
-	Pool          *AgentPool
-	LLM           LLMClient
-	Evolution     *EvolutionEngine
-	Dreamer       DreamRecorder
-	Roles         *RoleRegistry
-	MemWriter     MemoryWriter
-	Concurrency   ConcurrencySuggestor
+	BaseDir            string
+	Cwd                string // 项目工作目录 (用于编译验证)
+	Factory            CreateAgentFunc
+	Notify             NotifyFunc
+	MediaNotify        MediaNotifyFunc
+	TaskTracker        TaskTracker
+	Pool               *AgentPool
+	LLM                LLMClient
+	Evolution          *EvolutionEngine
+	Dreamer            DreamRecorder
+	Roles              *RoleRegistry
+	MemWriter          MemoryWriter
+	Concurrency        ConcurrencySuggestor
 	PlanConfigResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
 }
 
@@ -256,6 +256,16 @@ func (ptm *ProductionTeamManager) Metrics() *metrics.Collector {
 	return ptm.metrics
 }
 
+// SetCwd updates the default working directory used by subsequently created teams.
+func (ptm *ProductionTeamManager) SetCwd(cwd string) {
+	if ptm == nil || strings.TrimSpace(cwd) == "" {
+		return
+	}
+	ptm.mu.Lock()
+	ptm.cwd = cwd
+	ptm.mu.Unlock()
+}
+
 // NewProductionTeamManager 创建生产级团队管理器。
 func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 	if cfg.Notify == nil {
@@ -264,22 +274,22 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 	// 指标采集器: 从 BaseDir 推导 stateDir (teams 目录的父目录)
 	stateDir := filepath.Dir(cfg.BaseDir)
 	ptm := &ProductionTeamManager{
-		teams:       make(map[string]*ProductionTeam),
-		baseDir:     cfg.BaseDir,
-		cwd:         cfg.Cwd,
-		factory:     cfg.Factory,
-		notify:      cfg.Notify,
-		mediaNotify: cfg.MediaNotify,
-		taskTracker: cfg.TaskTracker,
-		pool:        cfg.Pool,
-		llm:         cfg.LLM,
-		evolution:   cfg.Evolution,
-		dreamer:     cfg.Dreamer,
-		roles:       cfg.Roles,
-		metrics:     metrics.NewCollector(stateDir),
-		concurrency: cfg.Concurrency,
+		teams:           make(map[string]*ProductionTeam),
+		baseDir:         cfg.BaseDir,
+		cwd:             cfg.Cwd,
+		factory:         cfg.Factory,
+		notify:          cfg.Notify,
+		mediaNotify:     cfg.MediaNotify,
+		taskTracker:     cfg.TaskTracker,
+		pool:            cfg.Pool,
+		llm:             cfg.LLM,
+		evolution:       cfg.Evolution,
+		dreamer:         cfg.Dreamer,
+		roles:           cfg.Roles,
+		metrics:         metrics.NewCollector(stateDir),
+		concurrency:     cfg.Concurrency,
 		planCfgResolver: cfg.PlanConfigResolver,
-		starting:    make(map[string]bool),
+		starting:        make(map[string]bool),
 	}
 	ptm.loadPersistedTeams()
 	return ptm
@@ -570,18 +580,18 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	}
 
 	executor := &WorkflowExecutor{
-		factory:       ptm.factory,
+		factory:         ptm.factory,
 		planCfgResolver: ptm.planCfgResolver,
-		notify:        ptm.notify,
-		chatID:        team.ChatID,
-		llm:           ptm.llm, // 供 swarm_intel.Engine 等直接 LLM 调用
-		taskTracker:   ptm.taskTracker,
-		evolution:     ptm.evolution,
-		roles:         ptm.roles,
-		metrics:       ptm.metrics,
-		pool:          ptm.pool,
-		checkpoints:   coord, // 注入 Coordinator 作为 CheckpointStore
-		concurrency:   ptm.concurrency,
+		notify:          ptm.notify,
+		chatID:          team.ChatID,
+		llm:             ptm.llm, // 供 swarm_intel.Engine 等直接 LLM 调用
+		taskTracker:     ptm.taskTracker,
+		evolution:       ptm.evolution,
+		roles:           ptm.roles,
+		metrics:         ptm.metrics,
+		pool:            ptm.pool,
+		checkpoints:     coord, // 注入 Coordinator 作为 CheckpointStore
+		concurrency:     ptm.concurrency,
 	}
 
 	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)
@@ -619,7 +629,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		TeamName: team.Name, Workflow: team.Workflow, Objective: team.Objective,
 		StartTime: team.StartedAt, EndTime: team.FinishedAt,
 		DurationSec: team.FinishedAt.Sub(team.StartedAt).Seconds(),
-		Status: string(team.Status),
+		Status:      string(team.Status),
 	}
 	for _, r := range results {
 		durSec := 0.0
@@ -1286,10 +1296,10 @@ func (ptm *ProductionTeamManager) executePrediction(ctx context.Context, team *P
 	team.Status = TeamStatusCompleted
 	team.FinishedAt = time.Now()
 	team.Stages = []StageResult{{
-		Name:    "predict",
-		Role:    "swarm-intelligence",
-		Status:  TaskCompleted,
-		Output:  result.Summary,
+		Name:   "predict",
+		Role:   "swarm-intelligence",
+		Status: TaskCompleted,
+		Output: result.Summary,
 	}}
 	team.mu.Unlock()
 	team.persist() // 补齐 predict 工作流的状态落盘

@@ -305,6 +305,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	if config.PromptDebug {
 		aiClient.PromptDebugEnabled = true
 		aiClient.PromptDebugDir = config.PromptDebugDir
+		aiClient.PromptDebugMaxFiles = config.PromptDebugMaxFiles
+		aiClient.PromptDebugMaxBytes = config.PromptDebugMaxBytes
+		aiClient.PromptDebugSampleRate = config.PromptDebugSampleRate
+		aiClient.PromptDebugRedact = config.PromptDebugRedact
 		if aiClient.PromptDebugDir == "" {
 			aiClient.PromptDebugDir = filepath.Join(layout.Root, "prompt-debug")
 		}
@@ -1905,6 +1909,10 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 		b.handleRoleCommand(ctx, messageID, text)
 		return true
 
+	case strings.HasPrefix(lower, "/cwd"):
+		b.handleCwdCommand(ctx, chatID, messageID, text)
+		return true
+
 	case lower == "/dream":
 		b.handleDreamCommand(ctx, messageID)
 		return true
@@ -2128,14 +2136,15 @@ func (b *Bot) handleRoleCommand(ctx context.Context, messageID, text string) {
 			b.sendTextReply(ctx, messageID, fmt.Sprintf("未找到角色: %s", parts[2]))
 			return
 		}
-		msg := fmt.Sprintf("**角色:** %s\n**解析后角色:** %s\n**描述:** %s\n**文件技能:** %s\n**内置技能:** %s\n**推荐技能:** %s\n**最终技能集:** %s",
+		msg := fmt.Sprintf("**角色:** %s\n**解析后角色:** %s\n**描述:** %s\n**文件技能:** %s\n**内置技能:** %s\n**推荐技能:** %s\n**实际注入技能:** %s\n**预计注入字符:** %d",
 			info.Requested,
 			info.Resolved,
 			info.Description,
 			formatNames(info.FileSkills),
 			formatNames(info.BuiltinSkills),
 			formatNames(info.RecommendedSkills),
-			formatNames(b.sessions.roleRegistry.RoleSkills(parts[2])),
+			formatNames(info.InjectedSkills),
+			info.InjectedSkillChars,
 		)
 		b.sendTextReply(ctx, messageID, msg)
 	default:
@@ -2857,6 +2866,44 @@ func (b *Bot) handleDreamCommand(ctx context.Context, messageID string) {
 	}
 }
 
+func (b *Bot) handleCwdCommand(ctx context.Context, chatID, messageID, text string) {
+	parts := strings.Fields(text)
+	if len(parts) == 1 {
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("当前工作目录: `%s`\n用法: `/cwd set <绝对路径或~路径>`", b.config.Cwd))
+		return
+	}
+	if len(parts) < 3 || strings.ToLower(parts[1]) != "set" {
+		b.sendTextReply(ctx, messageID, "用法: `/cwd` 查看当前工作目录，或 `/cwd set <path>` 临时切换。")
+		return
+	}
+	target := strings.TrimSpace(strings.Join(parts[2:], " "))
+	if strings.HasPrefix(target, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			target = filepath.Join(home, strings.TrimPrefix(target, "~"))
+		}
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("路径解析失败: %v", err))
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("目录不存在或不可访问: `%s`", abs))
+		return
+	}
+
+	b.config.Cwd = abs
+	if b.sessions != nil {
+		b.sessions.SetCwd(abs)
+		b.sessions.ClearSession(chatID)
+	}
+	if b.teamMgr != nil {
+		b.teamMgr.SetCwd(abs)
+	}
+	b.sendTextReply(ctx, messageID, fmt.Sprintf("已临时切换工作目录为: `%s`\n当前会话已清空，后续新团队会使用该目录。", abs))
+}
+
 // formatTimeSince 格式化距今时间
 func formatTimeSince(t time.Time) string {
 	if t.IsZero() {
@@ -2887,11 +2934,7 @@ func (b *Bot) processAndReply(chatID, messageID, userText string) {
 
 	// Auto Plan: LLM 判断复杂度 → 自动注入 Plan+Build 指令
 	if b.llmDetectComplexity(ctx, userText) {
-		userText = "[Auto Plan+Build] 这是一个复杂任务。\n" +
-			"阶段1(Plan): 调用 EnterPlanMode，深入分析需求，设计详细方案(架构、模块拆分、接口定义、风险点)。\n" +
-			"阶段2(Switch): 调用 ExitPlanMode 附带完整计划摘要。\n" +
-			"阶段3(Build): 按计划逐步执行实现(编写代码、创建文件、运行命令)，每完成一步验证结果。\n\n" +
-			"原始任务:\n" + userText
+		userText = "[AutoPlanBuild] 复杂任务: 先 EnterPlanMode 规划, 再 ExitPlanMode 后执行并验证。\n原始任务:\n" + userText
 		b.sendTextReply(ctx, messageID, "🧠 LLM 判定为复杂任务，自动启用 Plan→Build 流程...")
 	}
 

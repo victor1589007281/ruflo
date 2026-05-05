@@ -36,6 +36,13 @@ import (
 	"github.com/anthropic/claude-go/pkg/skills"
 )
 
+const (
+	maxRoleFileSkills        = 2
+	maxRoleBuiltinSkills     = 3
+	maxRoleFileSkillChars    = 1200
+	maxRoleBuiltinSkillChars = 800
+)
+
 // RoleDef 角色定义。
 type RoleDef struct {
 	Name          string   `json:"name"`
@@ -100,7 +107,10 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 	if len(role.Skills) > 0 || len(role.BuiltinSkills) > 0 || len(rr.RecommendedSkills(roleName)) > 0 {
 		var skillContent strings.Builder
 		skillContent.WriteString("\n\n<role_skills>\n")
-		for _, sp := range role.Skills {
+		for i, sp := range role.Skills {
+			if i >= maxRoleFileSkills {
+				break
+			}
 			fullPath := sp
 			if !filepath.IsAbs(sp) {
 				fullPath = filepath.Join(rr.cwd, sp)
@@ -110,12 +120,12 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 				continue
 			}
 			content := string(data)
-			if len(content) > 4096 {
-				content = content[:4096] + "...(truncated)"
+			if len(content) > maxRoleFileSkillChars {
+				content = content[:maxRoleFileSkillChars] + "...(truncated)"
 			}
 			skillContent.WriteString(fmt.Sprintf("### Skill: %s\n%s\n\n", filepath.Base(sp), content))
 		}
-		for _, name := range uniqueRoleStrings(append(append([]string{}, role.BuiltinSkills...), rr.RecommendedSkills(roleName)...)) {
+		for _, name := range limitRoleSkillNames(uniqueRoleStrings(append(append([]string{}, role.BuiltinSkills...), rr.RecommendedSkills(roleName)...)), maxRoleBuiltinSkills) {
 			if rr.skillRegistry == nil {
 				continue
 			}
@@ -124,8 +134,8 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 				continue
 			}
 			content := skill.Body
-			if len(content) > 3072 {
-				content = content[:3072] + "...(truncated)"
+			if len(content) > maxRoleBuiltinSkillChars {
+				content = content[:maxRoleBuiltinSkillChars] + "...(truncated)"
 			}
 			skillContent.WriteString(fmt.Sprintf("### Skill: %s\n%s\n\n", skill.Name, content))
 		}
@@ -219,17 +229,26 @@ func (rr *RoleRegistry) RoleSkills(roleName string) []string {
 		names = append(names, role.BuiltinSkills...)
 	}
 	names = append(names, rr.recommendedByRole[resolved]...)
-	return uniqueRoleStrings(names)
+	return limitRoleSkillNames(uniqueRoleStrings(names), maxRoleBuiltinSkills)
 }
 
 type RoleInfo struct {
-	Requested         string
-	Resolved          string
-	Description       string
-	FileSkills        []string
-	BuiltinSkills     []string
-	RecommendedSkills []string
-	Tags              []string
+	Requested          string
+	Resolved           string
+	Description        string
+	FileSkills         []string
+	BuiltinSkills      []string
+	RecommendedSkills  []string
+	InjectedSkills     []string
+	InjectedSkillChars int
+	Tags               []string
+}
+
+func limitRoleSkillNames(names []string, limit int) []string {
+	if limit <= 0 || len(names) <= limit {
+		return names
+	}
+	return names[:limit]
 }
 
 func (rr *RoleRegistry) DescribeRole(roleName string) *RoleInfo {
@@ -240,15 +259,58 @@ func (rr *RoleRegistry) DescribeRole(roleName string) *RoleInfo {
 	if role == nil {
 		return nil
 	}
+	injected := limitRoleSkillNames(uniqueRoleStrings(append(append([]string{}, role.BuiltinSkills...), rr.recommendedByRole[resolved]...)), maxRoleBuiltinSkills)
 	return &RoleInfo{
-		Requested:         roleName,
-		Resolved:          resolved,
-		Description:       role.Description,
-		FileSkills:        append([]string(nil), role.Skills...),
-		BuiltinSkills:     append([]string(nil), role.BuiltinSkills...),
-		RecommendedSkills: append([]string(nil), rr.recommendedByRole[resolved]...),
-		Tags:              append([]string(nil), role.Tags...),
+		Requested:          roleName,
+		Resolved:           resolved,
+		Description:        role.Description,
+		FileSkills:         append([]string(nil), role.Skills...),
+		BuiltinSkills:      append([]string(nil), role.BuiltinSkills...),
+		RecommendedSkills:  append([]string(nil), rr.recommendedByRole[resolved]...),
+		InjectedSkills:     append([]string(nil), injected...),
+		InjectedSkillChars: rr.estimateInjectedSkillCharsLocked(role, injected),
+		Tags:               append([]string(nil), role.Tags...),
 	}
+}
+
+func (rr *RoleRegistry) estimateInjectedSkillCharsLocked(role *RoleDef, injected []string) int {
+	if role == nil {
+		return 0
+	}
+	total := 0
+	for i, sp := range role.Skills {
+		if i >= maxRoleFileSkills {
+			break
+		}
+		fullPath := sp
+		if !filepath.IsAbs(sp) {
+			fullPath = filepath.Join(rr.cwd, sp)
+		}
+		data, err := os.ReadFile(fullPath)
+		if err != nil {
+			continue
+		}
+		if len(data) > maxRoleFileSkillChars {
+			total += maxRoleFileSkillChars
+		} else {
+			total += len(data)
+		}
+	}
+	if rr.skillRegistry == nil {
+		return total
+	}
+	for _, name := range injected {
+		skill, ok := rr.skillRegistry.Get(name)
+		if !ok {
+			continue
+		}
+		if len(skill.Body) > maxRoleBuiltinSkillChars {
+			total += maxRoleBuiltinSkillChars
+		} else {
+			total += len(skill.Body)
+		}
+	}
+	return total
 }
 
 func (rr *RoleRegistry) initRecommendedSkills() {
@@ -440,18 +502,23 @@ func (rr *RoleRegistry) registerBuiltins() {
       "designRef": "设计章节名",
       "constraints": ["C1"],
       "acceptance": "go build 通过 + 接口签名与设计一致",
-      "priority": 2
+      "priority": 2,
+      "complexity": "simple",
+      "targetFiles": ["cmd/app/main.go"],
+      "targetPackages": ["./cmd/app"]
     }
   ]
 }
 ` + "```" + `
 
 原则:
-1. **原子性**: 每个任务在一轮内可完成
+1. **原子性**: 每个任务在 1-2 轮内可完成, 优先合并同一模块/文件族的改动
 2. **可追溯**: 每个任务标注对应的设计章节和约束编号
 3. **验收标准**: 具体、可执行
 4. **依赖拓扑**: dependsOn 填前置任务 id 数组, 形成 DAG
 5. role 可选: coder, tester, reviewer, researcher, architect
+6. **任务数预算**: 普通应用/CLI 控制在 4-8 个任务, 除非用户明确要求大型项目, 禁止超过 10 个任务
+7. **复杂度标签**: simple=1轮, medium=2轮, complex=3轮; 不要默认 complex
 
 ## 职责 3: 定义偏差检测点 (Drift Checkpoints)
 为 Reviewer 列出关键检测项:

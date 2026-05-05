@@ -31,7 +31,7 @@ type Blackboard struct {
 	entries   []*BoardEntry
 	mu        sync.RWMutex
 	dataDir   string
-	dirty     bool          // 延迟写标记
+	dirty     bool // 延迟写标记
 	flushOnce sync.Once
 	flushCh   chan struct{} // 触发异步持久化
 }
@@ -321,7 +321,7 @@ func (bb *Blackboard) HandoffContext(completedStages []string, nextRole string) 
 		for _, stage := range completedStages {
 			for _, e := range bb.entries {
 				if e.Key == stage+"-result" {
-					sb.WriteString(fmt.Sprintf("**%s** (%s):\n%s\n\n", stage, e.Author, truncateResult(e.Value, 1500)))
+					sb.WriteString(fmt.Sprintf("**%s** (%s):\n%s\n\nFull artifact/ref: blackboard key `%s`.\n\n", stage, e.Author, truncateResult(e.Value, 800), e.Key))
 				}
 			}
 		}
@@ -339,7 +339,7 @@ func (bb *Blackboard) HandoffContext(completedStages []string, nextRole string) 
 
 	// 对下一个角色的指引
 	sb.WriteString(fmt.Sprintf("### Your Role: %s\n", nextRole))
-	sb.WriteString("Read the above context carefully and build upon previous work.\n")
+	sb.WriteString("Use the summaries above by default. Query/read the referenced blackboard artifact only when precise details are required.\n")
 
 	return sb.String()
 }

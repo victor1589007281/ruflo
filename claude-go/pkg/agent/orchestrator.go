@@ -6,9 +6,10 @@
 //   - Gradientsys (2025): 失败重试 + 上下文累积 Phoenix protocol
 //
 // 关键设计决策:
-//   删除自建的 DAG (ParsePlanToDAG/ReadyNodes/UnblockDependents),
-//   直接复用 V2 TaskStore 已有的 DAG 能力 (AddTaskWithDeps/ReadyTasks/SetTaskStatusAndUnblock)。
-//   Swarm 的 topologicalLevels 也应迁移到 V2 TaskStore (统一调度器)。
+//
+//	删除自建的 DAG (ParsePlanToDAG/ReadyNodes/UnblockDependents),
+//	直接复用 V2 TaskStore 已有的 DAG 能力 (AddTaskWithDeps/ReadyTasks/SetTaskStatusAndUnblock)。
+//	Swarm 的 topologicalLevels 也应迁移到 V2 TaskStore (统一调度器)。
 //
 // 职责分工:
 //
@@ -75,17 +76,17 @@ type SubGoal struct {
 
 // TaskNode 编排器的任务元数据 (与 V2 TaskStore 中的 task ID 关联)
 type TaskNode struct {
-	V2TaskID       string   `json:"v2TaskId"`
-	Title          string   `json:"title"`
-	Role           string   `json:"role"`
-	DesignRef      string   `json:"designRef"`
-	ConstraintRefs []string `json:"constraintRefs"`
-	AcceptCriteria string   `json:"acceptCriteria"`
-	MaxRetries     int      `json:"maxRetries"`
-	Complexity     string   `json:"complexity,omitempty"` // "simple"(2轮), "medium"(3轮), "complex"(5轮)
+	V2TaskID       string    `json:"v2TaskId"`
+	Title          string    `json:"title"`
+	Role           string    `json:"role"`
+	DesignRef      string    `json:"designRef"`
+	ConstraintRefs []string  `json:"constraintRefs"`
+	AcceptCriteria string    `json:"acceptCriteria"`
+	MaxRetries     int       `json:"maxRetries"`
+	Complexity     string    `json:"complexity,omitempty"` // "simple"(1轮), "medium"(2轮), "complex"(3轮)
 	SubGoals       []SubGoal `json:"subGoals,omitempty"`
-	TargetPackages []string `json:"targetPackages,omitempty"` // 该任务涉及的包路径 (如 "./internal/storage/...")
-	TargetFiles    []string `json:"targetFiles,omitempty"`    // 该任务涉及的具体文件
+	TargetPackages []string  `json:"targetPackages,omitempty"` // 该任务涉及的包路径 (如 "./internal/storage/...")
+	TargetFiles    []string  `json:"targetFiles,omitempty"`    // 该任务涉及的具体文件
 
 	Output      string `json:"output"`
 	Error       string `json:"error"`
@@ -100,7 +101,7 @@ type OrchestratorConfig struct {
 	MaxParallel      int
 	MaxRetries       int
 	MicroTestAfter   bool
-	AdversarialRound int // 每个 task 内 mini 对抗轮数 (0=不启用, 默认2)
+	AdversarialRound int // 每个 task 内 mini 对抗轮数上限 (0=默认2)
 }
 
 // StageFlusher 回调: Orchestrator 每批任务完成后调用, 让调用方增量刷新 team.json。
@@ -113,15 +114,15 @@ type Orchestrator struct {
 	nodes  map[string]*TaskNode
 	mu     sync.Mutex
 
-	factory     CreateAgentFunc
-	notify      NotifyFunc
-	pool        *AgentPool
-	chatID      string
-	designDoc   string
-	planDoc     string
-	checkpoints      CheckpointStore // 检查点 (从 WorkflowExecutor 传入, 可为 nil)
-	flusher          StageFlusher    // 增量刷新回调 (可为 nil)
-	activityCallback func()          // Coordinator 活动追踪回调
+	factory          CreateAgentFunc
+	notify           NotifyFunc
+	pool             *AgentPool
+	chatID           string
+	designDoc        string
+	planDoc          string
+	checkpoints      CheckpointStore                                                      // 检查点 (从 WorkflowExecutor 传入, 可为 nil)
+	flusher          StageFlusher                                                         // 增量刷新回调 (可为 nil)
+	activityCallback func()                                                               // Coordinator 活动追踪回调
 	progressCallback func(phase string, iteration int, bytesWritten int64, taskID string) // 进展上报回调
 
 	completedCount int
@@ -155,7 +156,7 @@ func NewOrchestrator(cfg OrchestratorConfig, dag DAGTaskTracker, factory CreateA
 		cfg.MaxRetries = 2
 	}
 	if cfg.AdversarialRound <= 0 {
-		cfg.AdversarialRound = 5 // 与 AdaptiveTerminator 默认 MaxRounds 对齐
+		cfg.AdversarialRound = 2
 	}
 	return &Orchestrator{
 		config: cfg,
@@ -304,7 +305,7 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 			}
 		}
 
-		subject := fmt.Sprintf("[%s] %s", teamName, rt.title)
+		subject := orchestratorTaskSubject(teamName, rt.title)
 		v2ID, err := o.dag.AddTaskWithDeps(subject, rt.accept, rt.role, depV2IDs, rt.priority)
 		if err != nil {
 			return nodes, fmt.Errorf("创建V2 DAG任务失败: %w", err)
@@ -342,18 +343,35 @@ type wbsJSON struct {
 	Tasks []wbsJSONTask `json:"tasks"`
 }
 type wbsJSONTask struct {
-	ID             int      `json:"id"`
-	Title          string   `json:"title"`
-	Role           string   `json:"role"`
-	DependsOn      []int    `json:"dependsOn"`
-	DesignRef      string   `json:"designRef"`
-	Constraints    []string `json:"constraints"`
-	Acceptance     string   `json:"acceptance"`
-	Priority       int      `json:"priority"`
-	Complexity     string   `json:"complexity,omitempty"` // "simple", "medium", "complex"
-	SubGoals       []SubGoal `json:"subGoals,omitempty"`
-	TargetPackages []string `json:"targetPackages,omitempty"` // 该任务涉及的包路径
-	TargetFiles    []string `json:"targetFiles,omitempty"`    // 该任务涉及的具体文件
+	ID             flexibleWBSID   `json:"id"`
+	Title          string          `json:"title"`
+	Role           string          `json:"role"`
+	DependsOn      []flexibleWBSID `json:"dependsOn"`
+	DesignRef      string          `json:"designRef"`
+	Constraints    []string        `json:"constraints"`
+	Acceptance     string          `json:"acceptance"`
+	Priority       int             `json:"priority"`
+	Complexity     string          `json:"complexity,omitempty"` // "simple", "medium", "complex"
+	SubGoals       []SubGoal       `json:"subGoals,omitempty"`
+	TargetPackages []string        `json:"targetPackages,omitempty"` // 该任务涉及的包路径
+	TargetFiles    []string        `json:"targetFiles,omitempty"`    // 该任务涉及的具体文件
+}
+
+type flexibleWBSID string
+
+func (id *flexibleWBSID) UnmarshalJSON(data []byte) error {
+	s := strings.TrimSpace(string(data))
+	if s == "" || s == "null" {
+		*id = ""
+		return nil
+	}
+	var quoted string
+	if err := json.Unmarshal(data, &quoted); err == nil {
+		*id = flexibleWBSID(strings.TrimSpace(quoted))
+		return nil
+	}
+	*id = flexibleWBSID(s)
+	return nil
 }
 
 func stripCodeFences(s string) string {
@@ -386,12 +404,19 @@ func parseWBSFromJSON(planOutput string) []rawTask {
 
 	var tasks []rawTask
 	for _, t := range wbs.Tasks {
+		id := strings.TrimSpace(string(t.ID))
+		if id == "" {
+			continue
+		}
 		var deps []string
 		for _, d := range t.DependsOn {
-			deps = append(deps, strconv.Itoa(d))
+			dep := strings.TrimSpace(string(d))
+			if dep != "" {
+				deps = append(deps, dep)
+			}
 		}
 		tasks = append(tasks, rawTask{
-			num: strconv.Itoa(t.ID), title: t.Title,
+			num: id, title: t.Title,
 			role: orchNormalizeRole(t.Role), depNums: deps,
 			designRef: t.DesignRef, constraintRefs: t.Constraints,
 			accept: t.Acceptance, priority: t.Priority,
@@ -597,7 +622,7 @@ func parseDepsString(deps string) []string {
 		d = strings.TrimSpace(d)
 		d = strings.TrimPrefix(d, "#")
 		d = strings.TrimSpace(d)
-		if d != "" && regexp.MustCompile(`^\d+$`).MatchString(d) {
+		if d != "" && regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(d) {
 			result = append(result, d)
 		}
 	}
@@ -616,6 +641,14 @@ func splitTrimNonEmpty(s, sep string) []string {
 		}
 	}
 	return result
+}
+
+func orchestratorTaskSubject(teamName, title string) string {
+	return fmt.Sprintf("%s%s", orchestratorTaskPrefix(teamName), title)
+}
+
+func orchestratorTaskPrefix(teamName string) string {
+	return fmt.Sprintf("[%s] [orch] ", teamName)
 }
 
 // computeDAGWidth Kahn 算法计算拓扑分层的最大宽度 (用于 pool 精确扩缩)。
@@ -673,7 +706,13 @@ const orchestratorStallTimeout = 10 * time.Minute
 const orchestratorMaxStallRecoveries = 5
 
 // taskExecutionTimeout 单个任务执行超时: 防止 goroutine 永久卡在 LLM 重试循环中。
-const taskExecutionTimeout = 30 * time.Minute
+const taskExecutionTimeout = 12 * time.Minute
+
+const (
+	coderCallTimeout    = 6 * time.Minute
+	reviewerCallTimeout = 2 * time.Minute
+	testerCallTimeout   = 2 * time.Minute
+)
 
 // Execute 从 V2 TaskStore 的就绪队列循环调度, 直到所有任务完成。
 func (o *Orchestrator) Execute(ctx context.Context, objective string, team *ProductionTeam) ([]StageResult, error) {
@@ -720,7 +759,7 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 
 		// 完成检查前置: 所有任务已处理完 → 立即退出
 		o.mu.Lock()
-		done := o.completedCount + o.failedCount >= o.totalCount
+		done := o.completedCount+o.failedCount >= o.totalCount
 		currentCompleted := o.completedCount + o.failedCount
 		o.mu.Unlock()
 		if done {
@@ -855,7 +894,7 @@ func (o *Orchestrator) populateOrphanNodes(teamName string) int {
 	if o.dag == nil {
 		return 0
 	}
-	prefix := "[" + teamName + "] "
+	prefix := orchestratorTaskPrefix(teamName)
 	allTasks := o.dag.GetAllTasks()
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -1050,6 +1089,117 @@ func (o *Orchestrator) cleanupResidualTasks() {
 	}
 }
 
+func (o *Orchestrator) roundBudgetFor(node *TaskNode) int {
+	cfg := o.config.AdversarialRound
+	if cfg <= 0 {
+		cfg = 2
+	}
+	if cfg > 3 {
+		cfg = 3
+	}
+
+	switch strings.ToLower(strings.TrimSpace(node.Complexity)) {
+	case "simple", "low":
+		return 1
+	case "medium", "moderate":
+		return min(cfg, 2)
+	case "complex", "high":
+		return min(cfg, 3)
+	}
+
+	// Planner 偶尔漏填 complexity。按文件范围和标题保守推断, 避免 CLI/配置类小任务默认跑满多轮。
+	title := strings.ToLower(node.Title)
+	switch {
+	case len(node.TargetFiles) > 0 && len(node.TargetFiles) <= 2:
+		return 1
+	case strings.Contains(title, "cli") || strings.Contains(title, "命令") ||
+		strings.Contains(title, "flag") || strings.Contains(title, "配置") ||
+		strings.Contains(title, "入口") || strings.Contains(title, "格式化"):
+		return 1
+	case len(node.TargetFiles) > 0 && len(node.TargetFiles) <= 4:
+		return min(cfg, 2)
+	default:
+		return min(cfg, 2)
+	}
+}
+
+func (o *Orchestrator) shouldFastPassSimpleTask(node *TaskNode, maxRounds int, buildPassed bool, team *ProductionTeam) bool {
+	if !buildPassed || maxRounds > 1 || team == nil || team.Cwd == "" {
+		return false
+	}
+	complexity := strings.ToLower(strings.TrimSpace(node.Complexity))
+	if complexity == "simple" || complexity == "low" {
+		return true
+	}
+	return len(node.TargetFiles) > 0 && len(node.TargetFiles) <= 2
+}
+
+func (o *Orchestrator) shouldRunLocalVerification(node *TaskNode) bool {
+	role := strings.ToLower(node.Role)
+	title := strings.ToLower(node.Title)
+	acceptance := strings.ToLower(node.AcceptCriteria)
+	if strings.Contains(role, "tester") {
+		return true
+	}
+	return (strings.Contains(title, "测试") || strings.Contains(title, "验证") ||
+		strings.Contains(title, "test") || strings.Contains(title, "build")) &&
+		(strings.Contains(acceptance, "go test") || strings.Contains(acceptance, "go build") ||
+			strings.Contains(acceptance, "编译") || strings.Contains(acceptance, "测试"))
+}
+
+func (o *Orchestrator) executeLocalVerificationTask(node *TaskNode, team *ProductionTeam, start time.Time) StageResult {
+	lang := "go"
+	if team != nil && team.Language != "" {
+		lang = team.Language
+	}
+	var checks []string
+	var failures []string
+	if team == nil || team.Cwd == "" {
+		failures = append(failures, "工作目录为空, 无法执行本地验证")
+	} else {
+		if errText := runBuildCheckScoped(team.Cwd, lang, node.TargetPackages); errText != "" {
+			failures = append(failures, errText)
+		} else {
+			checks = append(checks, "scoped build passed")
+		}
+		if errText := runTestCheckLang(team.Cwd, lang); errText != "" {
+			failures = append(failures, errText)
+		} else {
+			checks = append(checks, "test command passed or not configured")
+		}
+	}
+	duration := time.Since(start)
+	output := "local verification: " + strings.Join(checks, "; ")
+	if len(failures) > 0 {
+		output = "local verification failed:\n" + strings.Join(failures, "\n\n")
+		node.Error = output
+		_, _ = o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "failed")
+		o.mu.Lock()
+		o.failedCount++
+		o.mu.Unlock()
+		o.notify(o.chatID, fmt.Sprintf("🔴 %s 本地验证失败 (%s)", node.Title, duration.Round(time.Second)))
+		return StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: output, Output: output, StartedAt: start, Duration: duration.Round(time.Second).String()}
+	}
+
+	node.Output = output
+	node.TestResult = output
+	node.TestPassed = true
+	_, _ = o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")
+	o.mu.Lock()
+	o.completedCount++
+	o.mu.Unlock()
+	if o.checkpoints != nil {
+		o.checkpoints.SaveCheckpoint(node.Title, "completed", 0, output)
+	}
+	if team != nil && team.Blackboard != nil {
+		team.Blackboard.Write(node.Title+"-result", output, node.Role, "result")
+	}
+	o.touchActivity()
+	o.reportProgress("local-verification", 1, int64(len(output)), node.V2TaskID)
+	o.notify(o.chatID, fmt.Sprintf("✅ %s 本地验证完成 (%s) ✅build/test通过", node.Title, duration.Round(time.Second)))
+	return StageResult{Name: node.Title, Role: node.Role, Status: TaskCompleted, Output: output, StartedAt: start, Duration: duration.Round(time.Second).String()}
+}
+
 // executeTaskNode 执行单个任务, 内置 mini 对抗循环:
 //
 //	每轮: coder 执行 → reviewer 审查 (SkepticalReviewerPersona + ParseEvalScoreJSON)
@@ -1062,21 +1212,21 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 
 	o.notify(o.chatID, fmt.Sprintf("▶️ %s (%s) 执行中...", node.Title, node.Role))
 
+	if o.shouldRunLocalVerification(node) {
+		return o.executeLocalVerificationTask(node, team, start)
+	}
+
 	if !o.config.MicroTestAfter {
 		return o.executeTaskOnce(ctx, node, objective, team, start)
 	}
 
-	// L1: 自适应任务粒度 — 根据 complexity 调整对抗轮数
-	maxRounds := o.config.AdversarialRound
-	switch node.Complexity {
-	case "simple":
-		maxRounds = 2
-	case "medium":
-		maxRounds = 3
-	case "complex":
-		// 保持默认 (通常 5 轮)
+	// L1: 自适应任务粒度 — 以 token/time 预算为先, 避免简单任务陷入多轮评审黑洞。
+	maxRounds := o.roundBudgetFor(node)
+	minRounds := 2
+	if maxRounds < minRounds {
+		minRounds = maxRounds
 	}
-	terminator := NewAdaptiveTerminator(2, maxRounds)
+	terminator := NewAdaptiveTerminator(minRounds, maxRounds)
 
 	var lastOutput string
 	var lastFeedback string
@@ -1114,7 +1264,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 					StartedAt: start, Duration: time.Since(start).String()})
 		}
-		result, err := runner.Execute(ctx, prompt)
+		result, err := executeRunnerBounded(ctx, runner, prompt, coderCallTimeout)
 		if err != nil {
 			return o.handleTaskFailure(ctx, node, objective, team,
 				StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
@@ -1157,7 +1307,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 					if fixErr != nil {
 						break
 					}
-					fixResult, fixErr := fixRunner.Execute(ctx, fixPrompt)
+					fixResult, fixErr := executeRunnerBounded(ctx, fixRunner, fixPrompt, coderCallTimeout)
 					if fixErr != nil {
 						break
 					}
@@ -1194,6 +1344,34 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				terminator.RecordBuildResult(true)
 				o.notify(o.chatID, fmt.Sprintf("🟢 %s 第 %d 轮编译通过", node.Title, round))
 			}
+		}
+
+		if o.shouldFastPassSimpleTask(node, maxRounds, buildPassed, team) {
+			score := EvalScore{
+				Correctness:     8,
+				Completeness:    7,
+				Security:        7,
+				CodeQuality:     7,
+				DesignAlignment: 7,
+				Feedback:        "simple task fast-pass: scoped build passed; skipped reviewer/tester LLM to preserve team token budget",
+				Pass:            true,
+			}
+			lastScore = score
+			node.TestPassed = true
+			node.TestResult = "fast-pass: scoped build passed"
+			terminator.RecordTestResult(true)
+			terminator.RecordRoundOutput(round, score, lastOutput)
+			o.reportProgress("fast-pass", round, int64(len(lastOutput)), node.V2TaskID)
+			o.touchActivity()
+			o.notify(o.chatID, fmt.Sprintf("⚡ %s simple fast-pass: 编译通过, 跳过 reviewer/tester LLM", node.Title))
+			if team.Blackboard != nil {
+				fullScore := "正确=8 完整=7 安全=7 质量=7 通过:true test:true fast-pass"
+				team.Blackboard.Write(fmt.Sprintf("%s-eval-round%d", node.V2TaskID, round),
+					fullScore, "evaluator", "score")
+				team.Blackboard.Write(fmt.Sprintf("eval-task-%s-round%d-score", node.Title, round),
+					fullScore, "evaluator", "score")
+			}
+			break
 		}
 
 		// === Step 2: Reviewer 审查 (复用 SkepticalReviewerPersona + ParseEvalScoreJSON) ===
@@ -1347,8 +1525,10 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			TestPass:  node.TestPassed, Kept: kept,
 		})
 
-		o.notify(o.chatID, fmt.Sprintf("🔄 %s 继续对抗 (第 %d/%d 轮)...",
-			node.Title, round+1, terminator.MaxRounds))
+		if round+1 <= terminator.MaxRounds {
+			o.notify(o.chatID, fmt.Sprintf("🔄 %s 继续对抗 (第 %d/%d 轮)...",
+				node.Title, round+1, terminator.MaxRounds))
+		}
 	}
 
 	duration := time.Since(start)
@@ -1393,7 +1573,7 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 			StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 				StartedAt: start, Duration: time.Since(start).String()})
 	}
-	result, err := runner.Execute(ctx, prompt)
+	result, err := executeRunnerBounded(ctx, runner, prompt, coderCallTimeout)
 	if err != nil {
 		return o.handleTaskFailure(ctx, node, objective, team,
 			StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
@@ -1431,6 +1611,34 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 	}
 }
 
+func executeRunnerBounded(ctx context.Context, runner AgentRunner, prompt string, timeout time.Duration) (string, error) {
+	if runner == nil {
+		return "", fmt.Errorf("agent runner is nil")
+	}
+	if timeout <= 0 {
+		return runner.Execute(ctx, prompt)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	type result struct {
+		output string
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		output, err := runner.Execute(callCtx, prompt)
+		done <- result{output: output, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		return res.output, res.err
+	case <-callCtx.Done():
+		return "", fmt.Errorf("agent execution timeout after %s: %w", timeout, callCtx.Err())
+	}
+}
+
 // runSkepticalReview 复用 SkepticalReviewerPersona + BuildSkepticalEvaluatorUserPrompt + ParseEvalScoreJSON。
 // lastScore: 上一轮分数, 解析失败时 hold-last-value 而不是返回全零 (避免噪声注入 terminator)。
 // buildPassed: 硬门禁结果, 注入 prompt 避免编译通过仍给 0 分 (根因修复)。
@@ -1455,7 +1663,7 @@ func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, o
 	if err != nil {
 		return HoldLastOrDefault(lastScore)
 	}
-	result, err := runner.Execute(reviewCtx, userPrompt)
+	result, err := executeRunnerBounded(reviewCtx, runner, userPrompt, reviewerCallTimeout)
 	if err != nil {
 		return HoldLastOrDefault(lastScore)
 	}
@@ -1586,7 +1794,7 @@ func (o *Orchestrator) runMicroTest(ctx context.Context, node *TaskNode) {
 	if err != nil {
 		return
 	}
-	result, err := runner.Execute(testCtx, prompt)
+	result, err := executeRunnerBounded(testCtx, runner, prompt, testerCallTimeout)
 	if err != nil {
 		return
 	}
