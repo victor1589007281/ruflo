@@ -3368,7 +3368,7 @@ func testIntegrationPaths(t *testing.T, report *WikiEvalReport) {
 	}
 
 	// 53.4 DAGTaskTracker 是 TaskTracker 的超集
-	var _ agent.TaskTracker = dag // 窄接口
+	var _ agent.TaskTracker = dag    // 窄接口
 	var _ agent.DAGTaskTracker = dag // 宽接口
 	score += 2
 	t.Log("✓ DAGTaskTracker 继承 TaskTracker (接口兼容)")
@@ -3518,7 +3518,7 @@ func testWBSMultiStrategyParse(t *testing.T, report *WikiEvalReport) {
 	dag5 := newMockDAGTracker()
 	orch5 := agent.NewOrchestrator(agent.OrchestratorConfig{MaxRetries: 1}, dag5, nil, func(_, _ string) {}, nil, "test")
 	ctx := context.Background()
-	repairNodes, repairErr := orch5.ParsePlanToDAGWithRepair(ctx, jsonPlan, "test-team", nil)
+	repairNodes, repairErr := orch5.ParsePlanToDAGWithRepair(ctx, jsonPlan, "", "test-team", nil)
 	if repairErr == nil && len(repairNodes) == 3 {
 		score += 2
 		t.Log("✓ ParsePlanToDAGWithRepair 可用 (直接 JSON 解析成功, 无需 repair)")
@@ -4003,7 +4003,7 @@ func testEvolutionBidirectional(t *testing.T, report *WikiEvalReport) {
 	// 65.2 成功学习 (新增双向学习)
 	successTraj := agent.Trajectory{
 		Role: "coder", Objective: "implement auth module",
-		Output: "func AuthHandler() {\n  // 使用 JWT 方案\n  type TokenClaims struct {\n    设计决策: 选择 bcrypt 加密\n  }\n}\npackage auth\n",
+		Output:  "func AuthHandler() {\n  // 使用 JWT 方案\n  type TokenClaims struct {\n    设计决策: 选择 bcrypt 加密\n  }\n}\npackage auth\n",
 		Success: true, TeamName: "dev", StageName: "implement",
 	}
 	ee.LearnFromStage(successTraj)
@@ -4330,9 +4330,9 @@ func testStreamEvent(t *testing.T, report *WikiEvalReport) {
 
 	// 72.3 StreamEvent ToolStart/Done
 	evTool := types.StreamEvent{
-		Kind:       types.StreamEventToolStart,
-		ToolName:   "Read",
-		ToolInput:  `{"path":"main.go"}`,
+		Kind:      types.StreamEventToolStart,
+		ToolName:  "Read",
+		ToolInput: `{"path":"main.go"}`,
 	}
 	if evTool.ToolName == "Read" {
 		score += 2
@@ -4377,8 +4377,8 @@ func testSessionStore(t *testing.T, report *WikiEvalReport) {
 
 	// 73.3 追加并加载消息
 	msg := types.Message{
-		UUID: "u1",
-		Type: types.MessageTypeUser,
+		UUID:    "u1",
+		Type:    types.MessageTypeUser,
 		Content: []types.ContentBlock{{Type: types.ContentBlockText, Text: "hello"}},
 	}
 	store.AppendUserMessage(msg, "/tmp", "test-model")

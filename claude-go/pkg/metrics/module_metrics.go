@@ -443,6 +443,19 @@ const (
 	MTeamBlackboardWrites  = "team_blackboard_writes"   // 黑板写入次数
 )
 
+// Team 指标 — WBS 粒度/拆分观测
+const (
+	MWBSTaskEstimatedMinutes    = "wbs_task_estimated_minutes"    // WBS 任务预计耗时(分钟)
+	MWBSTaskActualDurationSec   = "wbs_task_actual_duration_sec"  // WBS 任务实际耗时(秒)
+	MWBSSplitCount              = "wbs_split_count"               // sizing gate 产生的拆分 leaf 数
+	MWBSTimeoutSplitCount       = "wbs_timeout_split_count"       // timeout 触发 split-on-timeout 次数
+	MWBSLeafFiles               = "wbs_leaf_files"                // Leaf 任务目标文件数
+	MWBSMaterializedFiles       = "wbs_materialized_files"        // Leaf 任务实际物化文件数
+	MWBSBuildRootDetected       = "wbs_build_root_detected"       // Leaf 任务检测到的构建根目录
+	MWBSParallelGroupSize       = "wbs_parallel_group_size"       // parallel group 内任务数
+	MWBSFailedBlockedDependents = "wbs_failed_blocked_dependents" // failed leaf 级联阻塞的下游数
+)
+
 // Cron 指标 (从 cron_jobs.json 的历史执行统计)
 const (
 	MCronRunCount     = "cron_run_count"     // 触发次数
@@ -570,20 +583,29 @@ var MetricType = map[string]MetricKind{
 	MTeamStageRetryCount:   "counter",
 	MTeamRoundCount:        "counter",
 	MTeamAgentRunCount:     "counter",
+	MWBSSplitCount:         "counter",
+	MWBSTimeoutSplitCount:  "counter",
 
 	// Team 状态/比率 (gauge)
-	MTeamStagePassRate: "gauge",
-	MTeamEvalPassRate:  "gauge",
-	MTeamBuildPassRate: "gauge",
-	MTeamTestPassRate:  "gauge",
-	MTeamOutputAvgLen:  "gauge",
-	MTeamFileCount:     "gauge",
+	MTeamStagePassRate:    "gauge",
+	MTeamEvalPassRate:     "gauge",
+	MTeamBuildPassRate:    "gauge",
+	MTeamTestPassRate:     "gauge",
+	MTeamOutputAvgLen:     "gauge",
+	MTeamFileCount:        "gauge",
+	MWBSLeafFiles:         "gauge",
+	MWBSMaterializedFiles: "gauge",
+	MWBSBuildRootDetected: "gauge",
+	MWBSParallelGroupSize: "gauge",
 
 	// Team 分布 (histogram)
-	MTeamDurationSec:      "histogram",
-	MTeamStageDurationSec: "histogram",
-	MTeamStageOutputLen:   "histogram",
-	MTeamAgentDurationSec: "histogram",
+	MTeamDurationSec:            "histogram",
+	MTeamStageDurationSec:       "histogram",
+	MTeamStageOutputLen:         "histogram",
+	MTeamAgentDurationSec:       "histogram",
+	MWBSTaskEstimatedMinutes:    "histogram",
+	MWBSTaskActualDurationSec:   "histogram",
+	MWBSFailedBlockedDependents: "histogram",
 
 	// Dreaming 计数器
 	MDreamCount:         "counter",

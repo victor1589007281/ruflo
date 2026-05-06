@@ -444,12 +444,14 @@ type HookEntry struct {
 	If      string `json:"if,omitempty"`
 }
 
-// LoadJSONConfig 从文件加载 JSON 配置。
+// ResolveJSONConfigPath 解析 JSON 配置文件路径。
 // 如果 path 为空，尝试以下路径:
 //  1. CLAUDE_GO_CONFIG 环境变量
 //  2. ./claude-go.json (当前目录)
-//  3. ~/.claude-go/config.json (用户目录)
-func LoadJSONConfig(path string) (*JSONConfig, error) {
+//  3. ./config/claude-go.json
+//  4. ~/.claude-go/config/config.json (新版用户目录)
+//  5. ~/.claude-go/config.json (旧版用户目录)
+func ResolveJSONConfigPath(path string) (string, error) {
 	if path == "" {
 		path = os.Getenv("CLAUDE_GO_CONFIG")
 	}
@@ -459,7 +461,10 @@ func LoadJSONConfig(path string) (*JSONConfig, error) {
 			"config/claude-go.json",
 		}
 		if home, err := os.UserHomeDir(); err == nil {
-			candidates = append(candidates, home+"/.claude-go/config.json")
+			candidates = append(candidates,
+				home+"/.claude-go/config/config.json",
+				home+"/.claude-go/config.json",
+			)
 		}
 		for _, c := range candidates {
 			if _, err := os.Stat(c); err == nil {
@@ -467,6 +472,15 @@ func LoadJSONConfig(path string) (*JSONConfig, error) {
 				break
 			}
 		}
+	}
+	return path, nil
+}
+
+// LoadJSONConfig 从文件加载 JSON 配置。
+func LoadJSONConfig(path string) (*JSONConfig, error) {
+	path, err := ResolveJSONConfigPath(path)
+	if err != nil {
+		return nil, err
 	}
 	if path == "" {
 		return nil, nil // 无配置文件，使用默认值

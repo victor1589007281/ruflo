@@ -65,6 +65,7 @@
   const statusBadgeClass = s => {
     switch ((s || '').toLowerCase()) {
       case 'completed': case 'success': case 'ok': return 'ok';
+      case 'delivered_with_remediation': return 'warn';
       case 'failed': case 'error': return 'err';
       case 'running': return 'run';
       case 'stopped': case 'cancelled': case 'paused': return 'warn';
@@ -386,13 +387,14 @@
     // stats header
     const running = list.filter(t => t.status === 'running').length;
     const completed = list.filter(t => t.status === 'completed').length;
+    const remediated = list.filter(t => t.status === 'delivered_with_remediation').length;
     const failed = list.filter(t => t.status === 'failed').length;
 
     const toolbar = h('div', { class: 'toolbar-row mb-12' }, [
       h('div', {}, [
         h('strong', {}, '团队总数: ' + list.length),
         h('span', { class: 'muted', style: { marginLeft: '12px' } },
-          `运行中 ${running} · 已完成 ${completed} · 失败 ${failed}`),
+          `运行中 ${running} · 纯完成 ${completed} · 修复交付 ${remediated} · 失败 ${failed}`),
       ]),
       h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
         h('input', {

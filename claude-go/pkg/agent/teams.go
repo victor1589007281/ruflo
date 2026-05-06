@@ -167,8 +167,11 @@ const (
 	TeamStatusCreated   TeamStatus = "created"
 	TeamStatusRunning   TeamStatus = "running"
 	TeamStatusCompleted TeamStatus = "completed"
-	TeamStatusFailed    TeamStatus = "failed"
-	TeamStatusStopped   TeamStatus = "stopped"
+	// TeamStatusDeliveredWithRemediation means final deterministic gates passed after one
+	// or more failed intermediate stages were remediated by E2E/local repair.
+	TeamStatusDeliveredWithRemediation TeamStatus = "delivered_with_remediation"
+	TeamStatusFailed                   TeamStatus = "failed"
+	TeamStatusStopped                  TeamStatus = "stopped"
 )
 
 // AgentStatus Agent 状态
@@ -604,21 +607,29 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		return
 	}
 
-	// 检查是否有失败阶段: 即使 err==nil, 只要 results 中有 TaskFailed 就标记团队失败
+	// 检查是否有失败阶段: 默认 err==nil 但存在 TaskFailed 仍标记团队失败。
+	// development 工作流例外: 若最终本地 E2E 门禁已通过 build/test, 则说明中间
+	// leaf 的失败已被后置确定性门禁修复/兜底, 团队按交付成功处理并保留失败阶段供复盘。
 	var failedStages []string
 	for _, r := range results {
 		if r.Status == TaskFailed {
 			failedStages = append(failedStages, fmt.Sprintf("%s(%s): %s", r.Name, r.Role, r.Error))
 		}
 	}
+	deliveryStatus := TeamStatusCompleted
 	if len(failedStages) > 0 {
-		errStr := fmt.Sprintf("%d 个阶段失败: %s", len(failedStages), strings.Join(failedStages, "; "))
-		ptm.failTeam(team, errStr)
-		return
+		if team.Workflow == "development" && hasPassingLocalE2EGate(results) {
+			deliveryStatus = TeamStatusDeliveredWithRemediation
+			ptm.notify(team.ChatID, fmt.Sprintf("🟡 团队 **%s** 存在 %d 个中间阶段失败, 但最终 E2E 本地门禁已通过 build/test, 按交付成功处理", team.Name, len(failedStages)))
+		} else {
+			errStr := fmt.Sprintf("%d 个阶段失败: %s", len(failedStages), strings.Join(failedStages, "; "))
+			ptm.failTeam(team, errStr)
+			return
+		}
 	}
 
 	team.mu.Lock()
-	team.Status = TeamStatusCompleted
+	team.Status = deliveryStatus
 	team.FinishedAt = time.Now()
 	team.Stages = results
 	team.mu.Unlock()
@@ -646,10 +657,10 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 
 	// 持续观测指标: 团队运行质量
 	if ptm.metrics != nil {
-		labels := map[string]string{"workflow": team.Workflow}
+		labels := map[string]string{"workflow": team.Workflow, "status": string(team.Status)}
 		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
 		ptm.metrics.RecordRun("team", metrics.MTeamDurationSec, report.DurationSec, team.Name, labels)
-		if team.Status == TeamStatusCompleted {
+		if isSuccessfulTeamStatus(team.Status) {
 			ptm.metrics.RecordRun("team", metrics.MTeamSuccessCount, 1, team.Name, labels)
 		} else {
 			ptm.metrics.RecordRun("team", metrics.MTeamFailCount, 1, team.Name, labels)
@@ -726,6 +737,21 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	if ptm.mediaNotify != nil && (team.Workflow == "creative") {
 		ptm.sendMediaAssets(team, results)
 	}
+}
+
+func hasPassingLocalE2EGate(results []StageResult) bool {
+	for i := len(results) - 1; i >= 0; i-- {
+		r := results[i]
+		if r.Name != "e2e-local-gate" {
+			continue
+		}
+		return r.Status == TaskCompleted && strings.Contains(r.Output, "E2E 本地门禁通过")
+	}
+	return false
+}
+
+func isSuccessfulTeamStatus(status TeamStatus) bool {
+	return status == TeamStatusCompleted || status == TeamStatusDeliveredWithRemediation
 }
 
 // executeSwarm 蜂群模式执行
@@ -967,7 +993,7 @@ func (ptm *ProductionTeamManager) ResumeTeam(name string) error {
 		return nil
 	}
 
-	if team.Status == TeamStatusCompleted {
+	if isSuccessfulTeamStatus(team.Status) {
 		team.mu.Unlock()
 		return fmt.Errorf("团队 %q 已完成，无需恢复", name)
 	}
@@ -989,7 +1015,7 @@ func (ptm *ProductionTeamManager) ResumeTeam(name string) error {
 		ptm.clearStarting(name)
 		return nil
 	}
-	if team.Status == TeamStatusCompleted {
+	if isSuccessfulTeamStatus(team.Status) {
 		team.mu.Unlock()
 		ptm.clearStarting(name)
 		return fmt.Errorf("团队 %q 已完成，无需恢复", name)

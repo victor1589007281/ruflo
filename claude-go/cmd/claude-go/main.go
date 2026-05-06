@@ -96,6 +96,7 @@ const fullHelpGuide = `Claude Code (Go) - AI 编程助手
   --permission-mode 权限模式 bypass/default/plan/auto
   --system-prompt   自定义系统提示词
   --debug           调试模式
+  --config          JSON 配置文件路径
   --mcp-config      MCP 配置 JSON 路径
 
 交互式命令:
@@ -139,6 +140,7 @@ var (
 	flagPrint        bool
 	flagDebug        bool
 	flagMCPConfig    string
+	flagConfig       string
 	flagResume       string // --resume <sessionID>
 	flagContinue     bool   // --continue / -c
 )
@@ -160,7 +162,14 @@ func main() {
 				return
 			}
 			cwd, _ := os.Getwd()
-			stateDir := basedir.ResolveDefault("", cwd)
+			stateDirInput := ""
+			if jsonCfg, _, err := loadRuntimeJSONConfig(); err == nil && jsonCfg != nil {
+				if jsonCfg.Cwd != "" {
+					cwd = jsonCfg.Cwd
+				}
+				stateDirInput = jsonCfg.StateDir
+			}
+			stateDir := basedir.ResolveDefault(stateDirInput, cwd)
 			_ = os.MkdirAll(filepath.Join(stateDir, "metrics"), 0o755)
 			metrics.InitGlobalLLMCollector(stateDir)
 		},
@@ -180,7 +189,7 @@ func main() {
 
 全局标志（所有子命令可用，部分会被 feishu 的配置文件合并/覆盖）：
   --model、--api-key、--base-url、--max-tokens、--max-turns、
-  --permission-mode、--system-prompt、--debug、--mcp-config
+  --permission-mode、--system-prompt、--debug、--mcp-config、--config
 
 更完整的用法、飞书配置示例与机器人斜杠命令说明请执行：
 
@@ -214,6 +223,7 @@ func main() {
 	rootCmd.PersistentFlags().BoolVarP(&flagPrint, "print", "p", false, "Print 模式 (非交互式)")
 	rootCmd.PersistentFlags().BoolVar(&flagDebug, "debug", false, "调试模式")
 	rootCmd.PersistentFlags().StringVar(&flagMCPConfig, "mcp-config", "", "MCP 配置文件路径 (JSON，顶层 mcpServers)")
+	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "JSON 配置文件路径 (默认自动发现 CLAUDE_GO_CONFIG、./claude-go.json、~/.claude-go/config/config.json)")
 	rootCmd.PersistentFlags().StringVar(&flagResume, "resume", "", "恢复指定 session ID 的对话")
 	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
 
@@ -399,7 +409,7 @@ func chatCmd() *cobra.Command {
 				return err
 			}
 
-			cwd, _ := os.Getwd()
+			cwd := eng.Config.Cwd
 			store, storeErr := session.NewSessionStore(cwd)
 			if storeErr == nil {
 				eng.SessionStore = store
@@ -524,7 +534,11 @@ func runCmd() *cobra.Command {
 			userPrompt := strings.Join(args, " ")
 
 			if strings.HasPrefix(userPrompt, "/") {
-				cwd, _ := os.Getwd()
+				cwd := eng.Config.Cwd
+				jsonCfg, _, cfgErr := loadRuntimeJSONConfig()
+				if cfgErr != nil {
+					return fmt.Errorf("加载配置文件失败: %w", cfgErr)
+				}
 				cmdRegistry := commands.NewRegistry()
 				commands.RegisterBuiltins(cmdRegistry)
 
@@ -540,7 +554,11 @@ func runCmd() *cobra.Command {
 
 				// 任务持久化路径与 feishu bot / dashboard 对齐: <state>/tasks/tasks.json
 				// (通过 basedir.Layout 标准化, 避免多处写入多个不同位置)
-				tasksStateDir := basedir.ResolveDefault("", cwd)
+				stateDirInput := ""
+				if jsonCfg != nil {
+					stateDirInput = jsonCfg.StateDir
+				}
+				tasksStateDir := basedir.ResolveDefault(stateDirInput, cwd)
 				tasksLayout, _ := basedir.NewLayout(tasksStateDir)
 				if tasksLayout != nil {
 					_ = os.MkdirAll(tasksLayout.Tasks, 0o755)
@@ -574,7 +592,7 @@ func runCmd() *cobra.Command {
 
 				// 加载模型配置并创建解析器 (层级: role > plan > 全局默认)
 				var modelResolver *agent.PlanConfigResolver
-				if jsonCfg, err := feishu.LoadJSONConfig(filepath.Join(cwd, "claude-go.json")); err == nil && jsonCfg != nil {
+				if jsonCfg != nil {
 					if registry, resolver, err := modelconfig.LoadFromConfig(jsonCfg.ToModelConfigJSON()); err == nil && resolver != nil {
 						modelResolver = agent.NewPlanConfigResolver(resolver)
 						_ = registry
@@ -696,6 +714,9 @@ JSON 配置文件示例:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// 1. 构建默认配置
 			config := feishu.DefaultBotConfig()
+			if configPath == "" {
+				configPath = flagConfig
+			}
 
 			// 2. 加载 JSON 配置 (优先级低于 CLI 参数)
 			jsonCfg, err := feishu.LoadJSONConfig(configPath)
@@ -1596,8 +1617,11 @@ func botAPIURL(cfg *feishu.JSONConfig) string {
 //  3. backups/.dashboard/actions/.dashboard/triggers 都落在与 bot 一致的位置
 //
 // configPath 为空时会沿用 feishu.LoadJSONConfig 的自动发现规则
-// (./claude-go.json / ./config/claude-go.json / ~/.claude-go/config.json)。
+// (./claude-go.json / ./config/claude-go.json / ~/.claude-go/config/config.json / ~/.claude-go/config.json)。
 func resolveDashStateDir(cliStateDir, configPath string) (*dashStateDirInfo, error) {
+	if configPath == "" {
+		configPath = flagConfig
+	}
 	jsonCfg, err := feishu.LoadJSONConfig(configPath)
 	if err != nil && configPath != "" {
 		return nil, fmt.Errorf("加载配置文件失败: %w", err)
@@ -1764,31 +1788,181 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+func normalizeProviderModelAlias(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return model
+	}
+	parts := strings.SplitN(model, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return model
+	}
+	return parts[1]
+}
+
+func loadRuntimeJSONConfig() (*feishu.JSONConfig, string, error) {
+	path, err := feishu.ResolveJSONConfigPath(flagConfig)
+	if err != nil {
+		return nil, "", err
+	}
+	if path == "" {
+		return nil, "", nil
+	}
+	cfg, err := feishu.LoadJSONConfig(path)
+	if err != nil {
+		return nil, path, err
+	}
+	return cfg, path, nil
+}
+
+func resolveRuntimeModelConfig(jsonCfg *feishu.JSONConfig, preferredModel string) (modelconfig.ResolvedConfig, bool, error) {
+	if jsonCfg == nil || len(jsonCfg.Providers) == 0 {
+		return modelconfig.ResolvedConfig{}, false, nil
+	}
+
+	cfgJSON := jsonCfg.ToModelConfigJSON()
+	_, resolver, err := modelconfig.LoadFromConfig(cfgJSON)
+	if err != nil {
+		return modelconfig.ResolvedConfig{}, false, err
+	}
+
+	preferredModel = strings.TrimSpace(preferredModel)
+	defaultResolved := resolver.Resolve("", "")
+	if preferredModel == "" || preferredModel == "qwen3.5-plus" {
+		return defaultResolved, defaultResolved.ProviderName != "", nil
+	}
+
+	if !strings.Contains(preferredModel, ":") {
+		if defaultResolved.ProviderName != "" {
+			defaultResolved.Alias = preferredModel
+			defaultResolved.ProviderName = preferredModel
+			defaultResolved.FallbackModels = nil
+			defaultResolved.FallbackBaseURL = ""
+			defaultResolved.FallbackAPIKey = ""
+			return defaultResolved, true, nil
+		}
+		return modelconfig.ResolvedConfig{Alias: preferredModel, ProviderName: preferredModel}, true, nil
+	}
+
+	cfgJSON.AI.GlobalConfig.DefaultModelAlias = preferredModel
+	cfgJSON.AI.GlobalConfig.DefaultFallbackAliases = nil
+	cfgJSON.AI.Plans = nil
+	_, resolver, err = modelconfig.LoadFromConfig(cfgJSON)
+	if err != nil {
+		return modelconfig.ResolvedConfig{}, false, err
+	}
+	resolved := resolver.Resolve("", "")
+	return resolved, resolved.ProviderName != "", nil
+}
+
+func applyRuntimePromptDebug(apiClient *api.Client, jsonCfg *feishu.JSONConfig) {
+	if apiClient == nil {
+		return
+	}
+	enabled := false
+	dir := ""
+	maxFiles := 500
+	maxBytes := int64(200 * 1024 * 1024)
+	sampleRate := 1.0
+	redact := true
+	stateDir := ""
+	if jsonCfg != nil {
+		stateDir = strings.TrimSpace(jsonCfg.StateDir)
+		if jsonCfg.Engine != nil {
+			if jsonCfg.Engine.PromptDebug != nil {
+				enabled = *jsonCfg.Engine.PromptDebug
+			}
+			dir = strings.TrimSpace(jsonCfg.Engine.PromptDebugDir)
+			if jsonCfg.Engine.PromptDebugMaxFiles > 0 {
+				maxFiles = jsonCfg.Engine.PromptDebugMaxFiles
+			}
+			if jsonCfg.Engine.PromptDebugMaxBytes > 0 {
+				maxBytes = jsonCfg.Engine.PromptDebugMaxBytes
+			}
+			if jsonCfg.Engine.PromptDebugSampleRate > 0 {
+				sampleRate = jsonCfg.Engine.PromptDebugSampleRate
+			}
+			if jsonCfg.Engine.PromptDebugRedact != nil {
+				redact = *jsonCfg.Engine.PromptDebugRedact
+			}
+		}
+	}
+	if env := strings.TrimSpace(os.Getenv("CLAUDE_GO_PROMPT_DEBUG")); env != "" {
+		enabled = env == "1" || strings.EqualFold(env, "true") || strings.EqualFold(env, "yes") || strings.EqualFold(env, "on")
+	}
+	if envDir := strings.TrimSpace(os.Getenv("CLAUDE_GO_PROMPT_DEBUG_DIR")); envDir != "" {
+		dir = envDir
+	}
+	if !enabled {
+		return
+	}
+	if dir == "" {
+		if stateDir == "" {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				stateDir = filepath.Join(home, ".claude-go")
+			}
+		}
+		if stateDir == "" {
+			stateDir = ".claude-go"
+		}
+		dir = filepath.Join(stateDir, "prompt-debug")
+	}
+	apiClient.PromptDebugEnabled = true
+	apiClient.PromptDebugDir = dir
+	apiClient.PromptDebugMaxFiles = maxFiles
+	apiClient.PromptDebugMaxBytes = maxBytes
+	apiClient.PromptDebugSampleRate = sampleRate
+	apiClient.PromptDebugRedact = redact
+}
+
 func buildEngine() (*engine.QueryEngine, error) {
 	cwd, _ := os.Getwd()
+
+	jsonCfg, jsonConfigPath, err := loadRuntimeJSONConfig()
+	if err != nil {
+		return nil, fmt.Errorf("加载配置文件失败: %w", err)
+	}
+	if jsonCfg != nil && jsonCfg.Cwd != "" {
+		cwd = jsonCfg.Cwd
+	}
 
 	projectSettings := settings.LoadProjectSettings(cwd)
 	projectSettings.ApplyEnv()
 
+	resolvedModel, hasResolvedModel, err := resolveRuntimeModelConfig(jsonCfg, flagModel)
+	if err != nil {
+		return nil, fmt.Errorf("解析 providers 配置失败: %w", err)
+	}
+
 	apiKey := getAPIKey()
+	if apiKey == "" && hasResolvedModel && resolvedModel.APIKey != "" {
+		apiKey = resolvedModel.APIKey
+	}
 	if apiKey == "" && projectSettings.AI != nil && projectSettings.AI.APIKey != "" {
 		apiKey = projectSettings.AI.APIKey
 	}
 	if apiKey == "" {
-		return nil, fmt.Errorf("需要 API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数或 claude-go.json 中的 ai.apiKey")
+		return nil, fmt.Errorf("需要 API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数，或在配置文件 providers 中设置 apiKey")
 	}
 
 	effectiveModel := flagModel
+	if hasResolvedModel {
+		effectiveModel = resolvedModel.ProviderName
+	}
 	if effectiveModel == "qwen3.5-plus" && projectSettings.Model != "" {
 		effectiveModel = projectSettings.Model
 	}
 	if effectiveModel == "qwen3.5-plus" && projectSettings.AI != nil && projectSettings.AI.Model != "" {
 		effectiveModel = projectSettings.AI.Model
 	}
+	effectiveModel = normalizeProviderModelAlias(effectiveModel)
 
 	baseURL := flagBaseURL
 	if baseURL == "" {
 		baseURL = os.Getenv("API_BASE_URL")
+	}
+	if baseURL == "" && hasResolvedModel && resolvedModel.BaseURL != "" {
+		baseURL = resolvedModel.BaseURL
 	}
 	if baseURL == "" && projectSettings.AI != nil && projectSettings.AI.BaseURL != "" {
 		baseURL = projectSettings.AI.BaseURL
@@ -1804,6 +1978,13 @@ func buildEngine() (*engine.QueryEngine, error) {
 	} else {
 		apiClient = api.NewDashScopeClient(apiKey, effectiveModel)
 	}
+	if hasResolvedModel {
+		apiClient.FallbackModels = resolvedModel.FallbackModels
+		apiClient.FallbackBaseURL = resolvedModel.FallbackBaseURL
+		apiClient.FallbackAPIKey = resolvedModel.FallbackAPIKey
+		apiClient.PromptCacheMode = resolvedModel.PromptCacheMode
+	}
+	applyRuntimePromptDebug(apiClient, jsonCfg)
 
 	// 全局 LLM 准入控制器: RPM 令牌桶 + 并发信号量 + AIMD
 	apiClient.Guard = api.NewRateLimitGuard(api.DefaultGuardConfig())
@@ -1812,12 +1993,19 @@ func buildEngine() (*engine.QueryEngine, error) {
 	// 交互/单次执行 → "cli", feishu/team/dashboard 会覆盖此值。
 	apiClient.Tag = "cli"
 
-	mcpConns, err := connectMCP(context.Background(), flagMCPConfig)
+	mcpConfigPath := flagMCPConfig
+	if mcpConfigPath == "" && jsonCfg != nil && len(jsonCfg.MCPServers) > 0 {
+		mcpConfigPath = jsonConfigPath
+	}
+	mcpConns, err := connectMCP(context.Background(), mcpConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("MCP 配置: %w", err)
 	}
 
 	permMode := types.PermissionMode(flagPermission)
+	if flagPermission == "bypass" && jsonCfg != nil && jsonCfg.PermissionMode != "" {
+		permMode = types.PermissionMode(jsonCfg.PermissionMode)
+	}
 	if permMode == "bypass" && projectSettings.Permissions.DefaultMode != "" {
 		permMode = types.PermissionMode(projectSettings.Permissions.DefaultMode)
 	}
@@ -1838,11 +2026,18 @@ func buildEngine() (*engine.QueryEngine, error) {
 		})
 	}
 
+	contextWindow := 200000
+	if hasResolvedModel && resolvedModel.ContextWindow > 0 {
+		contextWindow = resolvedModel.ContextWindow
+	}
+
 	hookRunner := hooks.NewRunner(nil, "")
-	compactor := compact.NewCompactor(apiClient, 200000)
+	compactor := compact.NewCompactor(apiClient, contextWindow)
 	promptMgr := prompt.NewManager(cwd)
 	if flagSystemPrompt != "" {
 		promptMgr.CustomPrompt = flagSystemPrompt
+	} else if jsonCfg != nil && jsonCfg.SystemPrompt != "" {
+		promptMgr.CustomPrompt = jsonCfg.SystemPrompt
 	} else if projectSettings.SystemPrompt != "" {
 		promptMgr.CustomPrompt = projectSettings.SystemPrompt
 	}
@@ -1853,18 +2048,24 @@ func buildEngine() (*engine.QueryEngine, error) {
 	}
 
 	effectiveMaxTokens := flagMaxTokens
+	if effectiveMaxTokens == 16384 && hasResolvedModel && resolvedModel.MaxTokens > 0 {
+		effectiveMaxTokens = resolvedModel.MaxTokens
+	}
 	if effectiveMaxTokens == 16384 && projectSettings.MaxTokens > 0 {
 		effectiveMaxTokens = projectSettings.MaxTokens
 	}
 	effectiveMaxTurns := flagMaxTurns
+	if effectiveMaxTurns == 0 && hasResolvedModel && resolvedModel.MaxTurns > 0 {
+		effectiveMaxTurns = resolvedModel.MaxTurns
+	}
 	if effectiveMaxTurns == 0 && projectSettings.MaxTurns > 0 {
 		effectiveMaxTurns = projectSettings.MaxTurns
 	}
-
 	cfg := &engine.Config{
 		Model:            effectiveModel,
 		MaxTokens:        effectiveMaxTokens,
 		MaxTurns:         effectiveMaxTurns,
+		ContextWindow:    contextWindow,
 		Cwd:              cwd,
 		PermissionMode:   permMode,
 		IsNonInteractive: flagPrint,

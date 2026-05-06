@@ -98,7 +98,7 @@ func TestCodexOptimizedFeishuScenarios(t *testing.T) {
 			}
 			t.Logf("team status=%s progress=%d/%d", current.Status, completedAgentCount(current), len(current.Agents))
 			switch current.Status {
-			case agent.TeamStatusCompleted:
+			case agent.TeamStatusCompleted, agent.TeamStatusDeliveredWithRemediation:
 				return
 			case agent.TeamStatusFailed, agent.TeamStatusStopped:
 				t.Fatalf("team ended with status=%s error=%s", current.Status, current.Error)

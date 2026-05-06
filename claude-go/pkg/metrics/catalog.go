@@ -140,6 +140,15 @@ var catalog = []MetricDesc{
 	{Module: "team", Name: MTeamAgentRunCount, ZH: "Agent 触发次数", EN: "Agent runs", Unit: "count", Kind: KindCounter, Panel: "team"},
 	{Module: "team", Name: MTeamAgentDurationSec, ZH: "Agent 单次耗时", EN: "Agent duration", Unit: "sec", Kind: KindHistogram, Panel: "team"},
 	{Module: "team", Name: MTeamBlackboardWrites, ZH: "黑板写入次数", EN: "Blackboard writes", Unit: "count", Kind: KindCounter, Panel: "team"},
+	{Module: "team", Name: MWBSTaskEstimatedMinutes, ZH: "WBS 任务预计耗时", EN: "WBS task estimated minutes", Unit: "min", Kind: KindHistogram, Panel: "team"},
+	{Module: "team", Name: MWBSTaskActualDurationSec, ZH: "WBS 任务实际耗时", EN: "WBS task actual duration", Unit: "sec", Kind: KindHistogram, Panel: "team"},
+	{Module: "team", Name: MWBSSplitCount, ZH: "WBS 拆分 Leaf 数", EN: "WBS split leaf count", Unit: "count", Kind: KindCounter, Panel: "team"},
+	{Module: "team", Name: MWBSTimeoutSplitCount, ZH: "WBS 超时拆分次数", EN: "WBS timeout split count", Unit: "count", Kind: KindCounter, Panel: "team"},
+	{Module: "team", Name: MWBSLeafFiles, ZH: "WBS Leaf 目标文件数", EN: "WBS leaf files", Unit: "count", Kind: KindGauge, Panel: "team"},
+	{Module: "team", Name: MWBSMaterializedFiles, ZH: "WBS Leaf 实际物化文件数", EN: "WBS materialized files", Unit: "count", Kind: KindGauge, Panel: "team"},
+	{Module: "team", Name: MWBSBuildRootDetected, ZH: "WBS 构建根目录识别", EN: "WBS build root detected", Unit: "count", Kind: KindGauge, Panel: "team"},
+	{Module: "team", Name: MWBSParallelGroupSize, ZH: "WBS 并发组大小", EN: "WBS parallel group size", Unit: "count", Kind: KindGauge, Panel: "team"},
+	{Module: "team", Name: MWBSFailedBlockedDependents, ZH: "WBS 失败阻塞下游数", EN: "WBS failed blocked dependents", Unit: "count", Kind: KindHistogram, Panel: "team"},
 
 	// ── Cron ──────────────────────────────────────────────
 	{Module: "cron", Name: MCronRunCount, ZH: "Cron 触发总数", EN: "Cron runs", Unit: "count", Kind: KindCounter, Panel: "cron"},
