@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/anthropic/claude-go/pkg/feishu"
+	"github.com/anthropic/claude-go/pkg/sandbox"
 )
 
 func TestNormalizeProviderModelAlias(t *testing.T) {
@@ -111,6 +112,7 @@ func TestResolveRuntimeModelConfigUsesDefaultProviderForRawCLIModel(t *testing.T
 func TestBuildEngineUsesRuntimeConfigProviders(t *testing.T) {
 	restore := snapshotGlobalFlags()
 	defer restore()
+	defer sandbox.ResetConfigForTest()
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("DASHSCOPE_API_KEY", "")
 	t.Setenv("API_BASE_URL", "")
@@ -167,6 +169,69 @@ func TestBuildEngineUsesRuntimeConfigProviders(t *testing.T) {
 	}
 	if eng.Config.Cwd != workDir || eng.Config.MaxTokens != 65536 || eng.Config.MaxTurns != 7 || eng.Config.ContextWindow != 1000000 {
 		t.Fatalf("config values not applied: %+v", eng.Config)
+	}
+}
+
+func TestBuildEngineAppliesSandboxConfig(t *testing.T) {
+	restore := snapshotGlobalFlags()
+	defer restore()
+	defer sandbox.ResetConfigForTest()
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("DASHSCOPE_API_KEY", "")
+	t.Setenv("API_BASE_URL", "")
+
+	workDir := t.TempDir()
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{
+  "cwd": "`+filepath.ToSlash(workDir)+`",
+  "stateDir": "`+filepath.ToSlash(filepath.Join(workDir, ".claude-go"))+`",
+  "providers": {
+    "dashscope": {
+      "name": "dashscope",
+      "baseUrl": "https://dashscope.example/v1",
+      "apiKey": "dash-key",
+      "models": {"dashscope:qwen3.6-plus": {}}
+    }
+  },
+  "ai": {"modelAlias": "dashscope:qwen3.6-plus"},
+  "sandbox": {
+    "mode": "docker",
+    "requiredForTeam": false,
+    "allowUnsafeFallback": true,
+    "outputMaxBytes": 12345,
+    "previewMaxBytes": 2345,
+    "logMaxBytes": 34567,
+    "pidsMax": 77,
+    "docker": {"image": "golang:1.24", "tempSize": "256m"}
+  }
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	flagConfig = cfgPath
+	flagModel = "qwen3.5-plus"
+	flagAPIKey = ""
+	flagBaseURL = ""
+	flagMaxTokens = 16384
+	flagMaxTurns = 0
+	flagPermission = "bypass"
+	flagSystemPrompt = ""
+	flagMCPConfig = ""
+	flagDebug = false
+	flagPrint = false
+
+	if _, err := buildEngine(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := sandbox.CurrentConfig()
+	if cfg.Mode != "docker" || cfg.RequiredForTeam || !cfg.AllowUnsafeFallback {
+		t.Fatalf("sandbox config not applied: %+v", cfg)
+	}
+	if cfg.OutputMaxBytes != 12345 || cfg.PreviewMaxBytes != 2345 || cfg.LogMaxBytes != 34567 || cfg.PidsMax != 77 {
+		t.Fatalf("sandbox limits not applied: %+v", cfg)
+	}
+	if cfg.Docker.TempSize != "256m" || cfg.Docker.Image != "golang:1.24" {
+		t.Fatalf("docker config not applied: %+v", cfg.Docker)
 	}
 }
 

@@ -11,16 +11,15 @@
 package builtin
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -182,41 +181,32 @@ func (t *BashTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, "bash", "-c", in.Command)
-	cmd.Dir = cwd
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-
-	output := stdout.String()
-	errOutput := stderr.String()
-
-	var result strings.Builder
-	if output != "" {
-		result.WriteString(output)
+	result, err := sandbox.RunProcessGuarded(cmdCtx, cwd, []string{"bash", "-c", in.Command}, sandbox.ResourceLimits{
+		Timeout:         timeout,
+		OutputMaxBytes:  4 * 1024 * 1024,
+		PreviewMaxBytes: 192 * 1024,
+		LogMaxBytes:     16 * 1024 * 1024,
+	})
+	text := ""
+	exitCode := -1
+	if result != nil {
+		text = truncateToMaxRunes(result.CombinedPreview, maxResultSizeChars)
+		exitCode = result.ExitCode
 	}
-	if errOutput != "" {
-		if result.Len() > 0 {
-			result.WriteString("\n")
-		}
-		result.WriteString(errOutput)
-	}
-
-	text := truncateToMaxRunes(result.String(), maxResultSizeChars)
-
-	exitCode := 0
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else if cmdCtx.Err() == context.DeadlineExceeded {
+		if result != nil && result.FailureKind == sandbox.FailureOutputLimit {
+			return &tool.ToolResult{
+				Content: fmt.Sprintf("Command stopped: %s\nLogs: %s\n%s", result.FailureKind, result.LogDir, text),
+				IsError: true,
+			}, nil
+		}
+		if cmdCtx.Err() == context.DeadlineExceeded || (result != nil && result.FailureKind == sandbox.FailureTimeout) {
 			return &tool.ToolResult{
 				Content: fmt.Sprintf("Command timed out after %v\n%s", timeout, text),
 				IsError: true,
 			}, nil
-		} else {
+		}
+		if exitCode < 0 {
 			return &tool.ToolResult{
 				Content: fmt.Sprintf("命令执行失败: %v\n%s", err, text),
 				IsError: true,

@@ -46,6 +46,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
+	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/session"
 	"github.com/anthropic/claude-go/pkg/settings"
 	"github.com/anthropic/claude-go/pkg/skills"
@@ -236,6 +237,7 @@ func main() {
 	rootCmd.AddCommand(rolesCmd())
 	rootCmd.AddCommand(dashboardCmd())
 	rootCmd.AddCommand(backupCmd())
+	rootCmd.AddCommand(sandboxCmd())
 	rootCmd.AddCommand(teamCmd())
 	rootCmd.AddCommand(helpCmd())
 
@@ -377,6 +379,112 @@ func teamCmd() *cobra.Command {
 			},
 		})
 	}
+
+	return cmd
+}
+
+// sandboxCmd 管理 claude-go 本地沙盒执行层。
+func sandboxCmd() *cobra.Command {
+	var stateDir string
+	cmd := &cobra.Command{
+		Use:   "sandbox",
+		Short: "沙盒 runtime 诊断、状态和清理",
+		Long:  "诊断 Native cgroup v2、Docker、process guard 的可用性，并管理 claude-go 创建的沙盒残留资源。",
+	}
+	cmd.PersistentFlags().StringVar(&stateDir, "state-dir", "", "数据根目录 (默认 <cwd>/.claude-go)")
+
+	cmd.AddCommand(&cobra.Command{
+		Use:   "doctor",
+		Short: "检查 runtime 自动适配结果",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 8*time.Second)
+			defer cancel()
+			mgr := sandbox.DefaultManager()
+			fmt.Println("Sandbox runtime probes:")
+			for _, p := range mgr.ProbeAll(ctx) {
+				status := "unavailable"
+				if p.OK {
+					status = "available"
+				}
+				fmt.Printf("- %-16s %-11s memory=%t pids=%t cpu=%t detail=%s\n",
+					p.Runtime, status, p.CanMemory, p.CanPids, p.CanCPU, p.Detail)
+			}
+			selected := mgr.SelectRuntime(ctx, true)
+			if selected.OK {
+				fmt.Printf("Selected for team verification: %s\n", selected.Runtime)
+			} else {
+				fmt.Printf("Selected for team verification: none (%s)\n", selected.Detail)
+				fmt.Println("Tip: on macOS start Docker/Colima; on Linux run sandbox setup-cgroupv2 or delegate a writable cgroup v2 subtree.")
+			}
+			return nil
+		},
+	})
+
+	cmd.AddCommand(&cobra.Command{
+		Use:   "status",
+		Short: "列出沙盒容器和日志目录",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
+			defer cancel()
+			if out, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--filter", "label=claude-go.sandbox=true", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
+				fmt.Println(string(out))
+			} else {
+				fmt.Println("Docker sandboxes: unavailable or none")
+			}
+			cwd, _ := os.Getwd()
+			root := basedir.ResolveDefault(stateDir, cwd)
+			logDir := filepath.Join(root, "sandboxes")
+			entries, err := os.ReadDir(logDir)
+			if err != nil {
+				fmt.Printf("Log sandboxes: none (%s)\n", logDir)
+				return nil
+			}
+			fmt.Printf("Log sandboxes in %s: %d\n", logDir, len(entries))
+			for i, e := range entries {
+				if i >= 20 {
+					fmt.Printf("... %d more\n", len(entries)-i)
+					break
+				}
+				fmt.Println("-", e.Name())
+			}
+			return nil
+		},
+	})
+
+	var cleanupLogs bool
+	cleanupCmd := &cobra.Command{
+		Use:   "cleanup",
+		Short: "清理 claude-go 标记的沙盒残留",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 20*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", "label=claude-go.sandbox=true").Output()
+			if err == nil {
+				ids := strings.Fields(string(out))
+				if len(ids) > 0 {
+					rmArgs := append([]string{"rm", "-f"}, ids...)
+					if rmOut, rmErr := exec.CommandContext(ctx, "docker", rmArgs...).CombinedOutput(); rmErr != nil {
+						return fmt.Errorf("docker cleanup failed: %w\n%s", rmErr, string(rmOut))
+					}
+					fmt.Printf("Removed docker sandboxes: %d\n", len(ids))
+				} else {
+					fmt.Println("Removed docker sandboxes: 0")
+				}
+			}
+			if cleanupLogs {
+				cwd, _ := os.Getwd()
+				root := basedir.ResolveDefault(stateDir, cwd)
+				logDir := filepath.Join(root, "sandboxes")
+				if err := os.RemoveAll(logDir); err != nil {
+					return fmt.Errorf("remove sandbox logs: %w", err)
+				}
+				fmt.Printf("Removed sandbox logs: %s\n", logDir)
+			}
+			return nil
+		},
+	}
+	cleanupCmd.Flags().BoolVar(&cleanupLogs, "logs", false, "同时删除 .claude-go/sandboxes 日志目录")
+	cmd.AddCommand(cleanupCmd)
 
 	return cmd
 }
@@ -1915,6 +2023,19 @@ func applyRuntimePromptDebug(apiClient *api.Client, jsonCfg *feishu.JSONConfig) 
 	apiClient.PromptDebugRedact = redact
 }
 
+func applyRuntimeSandboxConfig(jsonCfg *feishu.JSONConfig, cwd string) {
+	stateDirInput := ""
+	var cfg sandbox.Config
+	if jsonCfg != nil {
+		stateDirInput = jsonCfg.StateDir
+		if jsonCfg.Sandbox != nil {
+			cfg = *jsonCfg.Sandbox
+		}
+	}
+	cfg.StateDir = basedir.ResolveDefault(stateDirInput, cwd)
+	sandbox.Configure(cfg)
+}
+
 func buildEngine() (*engine.QueryEngine, error) {
 	cwd, _ := os.Getwd()
 
@@ -1925,6 +2046,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	if jsonCfg != nil && jsonCfg.Cwd != "" {
 		cwd = jsonCfg.Cwd
 	}
+	applyRuntimeSandboxConfig(jsonCfg, cwd)
 
 	projectSettings := settings.LoadProjectSettings(cwd)
 	projectSettings.ApplyEnv()

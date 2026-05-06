@@ -27,6 +27,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/observability"
+	"github.com/anthropic/claude-go/pkg/sandbox"
 )
 
 // PromptCache 提示词缓存 (参考 Anthropic Prompt Caching)。
@@ -4261,9 +4262,7 @@ func runMySQLBuildCheck(cwd string) string {
 		configureArgs := mysqlCMakeConfigureArgs()
 		ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel1()
-		cmd := exec.CommandContext(ctx1, "cmake", configureArgs...)
-		cmd.Dir = cwd
-		out, err := cmd.CombinedOutput()
+		out, err := runLimitedCommand(ctx1, cwd, append([]string{"cmake"}, configureArgs...), 16384, 200)
 		if err != nil {
 			return fmt.Sprintf("cmake configure 失败:\n%.*s", 2000, string(out))
 		}
@@ -4280,9 +4279,7 @@ func runMySQLBuildCheck(cwd string) string {
 	for _, t := range mysqlEssentialTargets {
 		baseArgs = append(baseArgs, "--target", t)
 	}
-	cmd2 := exec.CommandContext(ctx2, "cmake", baseArgs...)
-	cmd2.Dir = cwd
-	out2, err2 := cmd2.CombinedOutput()
+	out2, err2 := runLimitedCommand(ctx2, cwd, append([]string{"cmake"}, baseArgs...), 16384, 200)
 	if err2 != nil {
 		return fmt.Sprintf("基础库编译失败:\n%.*s", 2000, string(out2))
 	}
@@ -4290,9 +4287,7 @@ func runMySQLBuildCheck(cwd string) string {
 	// Phase 3: 构建 mysqld 主程序 (验证核心链接)
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel3()
-	cmd3 := exec.CommandContext(ctx3, "cmake", "--build", "build", "--parallel", fmt.Sprintf("%d", jobs), "--target", "mysqld")
-	cmd3.Dir = cwd
-	out3, err3 := cmd3.CombinedOutput()
+	out3, err3 := runLimitedCommand(ctx3, cwd, []string{"cmake", "--build", "build", "--parallel", fmt.Sprintf("%d", jobs), "--target", "mysqld"}, 16384, 200)
 	if err3 != nil {
 		return fmt.Sprintf("mysqld 编译失败:\n%.*s", 2000, string(out3))
 	}
@@ -4333,8 +4328,7 @@ func (we *WorkflowExecutor) runMySQLIntegrationTest(cwd string) string {
 	// 初始化数据目录 (--initialize-insecure, 无密码 root)
 	initCtx, initCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer initCancel()
-	initCmd := exec.CommandContext(initCtx, mysqldPath, "--initialize-insecure", "--datadir="+tmpDir)
-	if out, err := initCmd.CombinedOutput(); err != nil {
+	if out, err := runLimitedCommand(initCtx, cwd, []string{mysqldPath, "--initialize-insecure", "--datadir=" + tmpDir}, 4096, 100); err != nil {
 		return fmt.Sprintf("mysqld --initialize-insecure 失败:\n%s", truncateResult(string(out), 2000))
 	}
 
@@ -4383,12 +4377,10 @@ func (we *WorkflowExecutor) runMySQLIntegrationTest(cwd string) string {
 
 	clientCtx, clientCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer clientCancel()
-	clientCmd := exec.CommandContext(clientCtx, mysqlClient,
+	out, err := runLimitedCommand(clientCtx, cwd, []string{mysqlClient,
 		"-S", socketPath,
 		"-e", "SHOW DATABASES;",
-	)
-	clientCmd.Dir = cwd
-	out, err := clientCmd.CombinedOutput()
+	}, 1024, 100)
 	if err != nil {
 		return fmt.Sprintf("mysql 客户端验证失败:\n%s", truncateResult(string(out), 2000))
 	}
@@ -4446,58 +4438,42 @@ func scanForTodos(cwd string) []string {
 	return findings
 }
 
-// runLimitedCommand 在内存/CPU 限制下运行外部命令。
-// 优先使用 systemd-run (cgroup v2 memory.max), 回退到 prlimit --as, 最后直接运行。
+// runLimitedCommand 在沙盒执行层中运行外部命令。
+// auto 模式优先 native cgroup v2 / Docker；若不可用则至少使用输出限流的 process guard。
 func runLimitedCommand(ctx context.Context, cwd string, args []string, memMaxMB, cpuQuotaPercent int) ([]byte, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
-
-	// 策略1: systemd-run --user --wait --pipe --quiet --property=MemoryMax=... (cgroup v2)
-	if memMaxMB > 0 {
-		_, err := exec.LookPath("systemd-run")
-		if err == nil {
-			runArgs := []string{
-				"--user", "--collect", "--wait", "--pipe", "--quiet",
-				fmt.Sprintf("--property=MemoryMax=%dM", memMaxMB),
-			}
-			if cpuQuotaPercent > 0 {
-				runArgs = append(runArgs, fmt.Sprintf("--property=CPUQuota=%d%%", cpuQuotaPercent))
-			}
-			runArgs = append(runArgs, "--")
-			runArgs = append(runArgs, args...)
-			cmd := exec.CommandContext(ctx, "systemd-run", runArgs...)
-			cmd.Dir = cwd
-			out, err := cmd.CombinedOutput()
-			if err == nil {
-				return out, nil
-			}
-			// systemd-run 失败时降级到 prlimit
-			log.Printf("[workflow] systemd-run 限制失败 (%v), 降级到 prlimit: %s", err, string(out))
-		}
+	spec := sandbox.CommandSpec{
+		Purpose:             "team-verification",
+		Cwd:                 cwd,
+		Args:                args,
+		AllowUnsafeFallback: os.Getenv("CLAUDE_GO_SANDBOX_ALLOW_UNSAFE_FALLBACK") != "",
+		NetworkDisabled:     true,
+		Limits: sandbox.ResourceLimits{
+			MemoryMaxMB:     memMaxMB,
+			CPUQuotaPercent: cpuQuotaPercent,
+			PidsMax:         256,
+			OutputMaxBytes:  4 * 1024 * 1024,
+			PreviewMaxBytes: 192 * 1024,
+			LogMaxBytes:     16 * 1024 * 1024,
+		},
 	}
-
-	// 策略2: prlimit --as=... (RLIMIT_AS, 虚拟内存限制)
-	if memMaxMB > 0 {
-		_, err := exec.LookPath("prlimit")
-		if err == nil {
-			prlimitArgs := []string{fmt.Sprintf("--as=%d", int64(memMaxMB)*1024*1024)}
-			prlimitArgs = append(prlimitArgs, args...)
-			cmd := exec.CommandContext(ctx, "prlimit", prlimitArgs...)
-			cmd.Dir = cwd
-			out, err := cmd.CombinedOutput()
-			if err == nil {
-				return out, nil
-			}
-			// prlimit 失败时降级到直接运行
-			log.Printf("[workflow] prlimit 限制失败 (%v), 降级到直接运行: %s", err, string(out))
-		}
+	result, err := sandbox.DefaultManager().Run(ctx, spec)
+	if result == nil {
+		return nil, err
 	}
-
-	// 策略3: 直接运行 (无限制)
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	cmd.Dir = cwd
-	return cmd.CombinedOutput()
+	if result.Runtime == "process-unsafe" && memMaxMB > 0 {
+		log.Printf("[workflow] sandbox isolated runtime unavailable, using output-limited process guard for %s", strings.Join(args, " "))
+	}
+	out := []byte(result.CombinedPreview)
+	if err != nil {
+		if result.FailureKind != sandbox.FailureNone {
+			return out, fmt.Errorf("%s: %w", result.FailureKind, err)
+		}
+		return out, err
+	}
+	return out, nil
 }
 
 // runBuildCheckLang 多语言版本的编译检查。
@@ -4844,9 +4820,7 @@ func BuildMySQLIncremental(cwd string, changedFiles []string, phase int) string 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "cmake", append([]string{"--build", "build"}, buildArgs...)...)
-	cmd.Dir = cwd
-	out, err := cmd.CombinedOutput()
+	out, err := runLimitedCommand(ctx, cwd, append([]string{"cmake", "--build", "build"}, buildArgs...), 16384, 200)
 	if err != nil {
 		return fmt.Sprintf("cmake --build 失败 (jobs=%d):\n%s", jobs, string(out))
 	}

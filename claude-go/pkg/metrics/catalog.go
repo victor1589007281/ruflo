@@ -172,6 +172,23 @@ var catalog = []MetricDesc{
 	{Module: "memory", Name: MFactConnectionCount, ZH: "事实间关联数", EN: "Fact connections", Unit: "count", Kind: KindGauge, Panel: "memory"},
 	{Module: "memory", Name: MAmnesiaRiskScore, ZH: "失忆风险评分", EN: "Amnesia risk score", Unit: "score", Kind: KindGauge, Panel: "memory"},
 	{Module: "memory", Name: MPrecompactFactsSaved, ZH: "PreCompact 抢救事实", EN: "PreCompact facts saved", Unit: "count", Kind: KindCounter, Panel: "memory"},
+
+	// ── Sandbox ───────────────────────────────────────────
+	{Module: "sandbox", Name: MSandboxRunCount, ZH: "沙盒运行次数", EN: "Sandbox runs", Unit: "count", Kind: KindCounter, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxActiveCount, ZH: "当前活跃沙盒", EN: "Active sandboxes", Unit: "count", Kind: KindGauge, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxDurationMs, ZH: "沙盒运行耗时", EN: "Sandbox duration", Unit: "ms", Kind: KindHistogram, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxSetupMs, ZH: "沙盒启动耗时", EN: "Sandbox setup latency", Unit: "ms", Kind: KindHistogram, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxRunnerSelected, ZH: "runtime 可用/选中", EN: "Runtime selected/available", Unit: "count", Kind: KindCounter, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxProbeLatencyMs, ZH: "runtime 探测耗时", EN: "Runtime probe latency", Unit: "ms", Kind: KindHistogram, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxMemoryLimitBytes, ZH: "沙盒内存限制", EN: "Sandbox memory limit", Unit: "bytes", Kind: KindGauge, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxOutputLimitBytes, ZH: "沙盒输出限制", EN: "Sandbox output limit", Unit: "bytes", Kind: KindGauge, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxExitCode, ZH: "沙盒退出码", EN: "Sandbox exit code", Unit: "", Kind: KindGauge, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxOOMCount, ZH: "沙盒 OOM 次数", EN: "Sandbox OOM count", Unit: "count", Kind: KindCounter, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxTimeoutCount, ZH: "沙盒超时次数", EN: "Sandbox timeout count", Unit: "count", Kind: KindCounter, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxOutputLimitCount, ZH: "沙盒输出超限次数", EN: "Sandbox output limit count", Unit: "count", Kind: KindCounter, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxPidsLimitCount, ZH: "沙盒 pids 超限次数", EN: "Sandbox pids limit count", Unit: "count", Kind: KindCounter, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxRuntimeUnavailableCount, ZH: "沙盒 runtime 不可用次数", EN: "Sandbox runtime unavailable count", Unit: "count", Kind: KindCounter, Panel: "sandbox"},
+	{Module: "sandbox", Name: MSandboxCleanupFailedCount, ZH: "沙盒清理失败次数", EN: "Sandbox cleanup failures", Unit: "count", Kind: KindCounter, Panel: "sandbox"},
 }
 
 // Catalog 返回内置的指标目录 (按模块+名称排序, 便于 diff)。

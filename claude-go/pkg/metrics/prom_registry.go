@@ -147,6 +147,23 @@ var (
 	cronDurationSec  *prometheus.HistogramVec
 	cronEnabledGauge *prometheus.GaugeVec
 
+	// Sandbox
+	sandboxRunCount                *prometheus.CounterVec
+	sandboxActiveCount             *prometheus.GaugeVec
+	sandboxDurationMs              *prometheus.HistogramVec
+	sandboxSetupMs                 *prometheus.HistogramVec
+	sandboxRunnerSelected          *prometheus.CounterVec
+	sandboxProbeLatencyMs          *prometheus.HistogramVec
+	sandboxMemoryLimitBytes        *prometheus.GaugeVec
+	sandboxOutputLimitBytes        *prometheus.GaugeVec
+	sandboxExitCode                *prometheus.GaugeVec
+	sandboxOOMCount                *prometheus.CounterVec
+	sandboxTimeoutCount            *prometheus.CounterVec
+	sandboxOutputLimitCount        *prometheus.CounterVec
+	sandboxPidsLimitCount          *prometheus.CounterVec
+	sandboxRuntimeUnavailableCount *prometheus.CounterVec
+	sandboxCleanupFailedCount      *prometheus.CounterVec
+
 	// Build info
 	buildInfo prometheus.Gauge
 )
@@ -157,6 +174,10 @@ func defaultBuckets() []float64 {
 
 func defaultLLMBuckets() []float64 {
 	return []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120}
+}
+
+func defaultMillisecondBuckets() []float64 {
+	return []float64{10, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000, 120000, 300000, 600000}
 }
 
 // initPrometheusMetrics 初始化所有 Prometheus 指标。线程安全 (sync.Once)。
@@ -497,6 +518,56 @@ func initPrometheusMetrics() {
 		Namespace: "claude_go", Name: "cron_enabled", Help: "启用的定时任务数",
 	}, []string{})
 
+	// ── Sandbox ──
+	sandboxRunLabels := []string{"runtime", "purpose", "status", "failure_kind", "exit_code"}
+	sandboxActiveLabels := []string{"runtime", "purpose"}
+	sandboxProbeLabels := []string{"runtime", "status"}
+	sandboxRunCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "sandbox_run_count", Help: "沙盒运行次数",
+	}, sandboxRunLabels)
+	sandboxActiveCount = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "sandbox_active_count", Help: "当前活跃沙盒数",
+	}, sandboxActiveLabels)
+	sandboxDurationMs = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "claude_go", Name: "sandbox_duration_ms", Help: "沙盒运行耗时 (毫秒)", Buckets: defaultMillisecondBuckets(),
+	}, sandboxRunLabels)
+	sandboxSetupMs = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "claude_go", Name: "sandbox_setup_ms", Help: "沙盒启动耗时 (毫秒)", Buckets: defaultMillisecondBuckets(),
+	}, sandboxRunLabels)
+	sandboxRunnerSelected = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "sandbox_runner_selected", Help: "runtime 可用/选中事件",
+	}, sandboxProbeLabels)
+	sandboxProbeLatencyMs = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "claude_go", Name: "sandbox_probe_latency_ms", Help: "runtime 探测耗时 (毫秒)", Buckets: defaultMillisecondBuckets(),
+	}, sandboxProbeLabels)
+	sandboxMemoryLimitBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "sandbox_memory_limit_bytes", Help: "沙盒内存限制 (bytes)",
+	}, sandboxRunLabels)
+	sandboxOutputLimitBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "sandbox_output_limit_bytes", Help: "沙盒输出限制 (bytes)",
+	}, sandboxRunLabels)
+	sandboxExitCode = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "sandbox_exit_code", Help: "沙盒退出码",
+	}, sandboxRunLabels)
+	sandboxOOMCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "sandbox_oom_count", Help: "沙盒 OOM 次数",
+	}, sandboxRunLabels)
+	sandboxTimeoutCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "sandbox_timeout_count", Help: "沙盒超时次数",
+	}, sandboxRunLabels)
+	sandboxOutputLimitCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "sandbox_output_limit_count", Help: "沙盒输出超限次数",
+	}, sandboxRunLabels)
+	sandboxPidsLimitCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "sandbox_pids_limit_count", Help: "沙盒 pids 超限次数",
+	}, sandboxRunLabels)
+	sandboxRuntimeUnavailableCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "sandbox_runtime_unavailable_count", Help: "沙盒 runtime 不可用次数",
+	}, sandboxRunLabels)
+	sandboxCleanupFailedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "sandbox_cleanup_failed_count", Help: "沙盒清理失败次数",
+	}, sandboxRunLabels)
+
 	// ── Build Info ──
 	buildInfo = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "claude_go", Name: "build_info", Help: "Build 信息",
@@ -529,6 +600,11 @@ func initPrometheusMetrics() {
 		swarmRunCount, swarmSuccessCount, swarmConsensus, swarmBrierScore,
 		swarmDiversity, swarmLatencyMs, swarmDebateSkipRate, swarmLLMCalls,
 		cronRunCount, cronSuccessCount, cronFailCount, cronDurationSec, cronEnabledGauge,
+		sandboxRunCount, sandboxActiveCount, sandboxDurationMs, sandboxSetupMs,
+		sandboxRunnerSelected, sandboxProbeLatencyMs, sandboxMemoryLimitBytes,
+		sandboxOutputLimitBytes, sandboxExitCode, sandboxOOMCount, sandboxTimeoutCount,
+		sandboxOutputLimitCount, sandboxPidsLimitCount, sandboxRuntimeUnavailableCount,
+		sandboxCleanupFailedCount,
 		buildInfo,
 	} {
 		promReg.MustRegister(c)
@@ -577,6 +653,9 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 	memNeed := []string{"memory_type"}
 	evoNeed := []string{"evolution_stage"}
 	taskNeed := []string{"task_type"}
+	sandboxRunNeed := []string{"runtime", "purpose", "status", "failure_kind", "exit_code"}
+	sandboxActiveNeed := []string{"runtime", "purpose"}
+	sandboxProbeNeed := []string{"runtime", "status"}
 
 	switch name {
 	// LLM counters
@@ -822,6 +901,42 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 		cronFailCount.With(prometheus.Labels{"job_name": labelsOrEmpty(labels, "job_name"), "job_type": labelsOrEmpty(labels, "job_type")}).Add(value)
 	case MCronDurationSec:
 		cronDurationSec.With(prometheus.Labels{"job_name": labelsOrEmpty(labels, "job_name"), "job_type": labelsOrEmpty(labels, "job_type")}).Observe(value)
+
+	// Sandbox counters
+	case MSandboxRunCount:
+		sandboxRunCount.With(fillLabels(sandboxRunNeed, labels)).Add(value)
+	case MSandboxRunnerSelected:
+		sandboxRunnerSelected.With(fillLabels(sandboxProbeNeed, labels)).Add(value)
+	case MSandboxOOMCount:
+		sandboxOOMCount.With(fillLabels(sandboxRunNeed, labels)).Add(value)
+	case MSandboxTimeoutCount:
+		sandboxTimeoutCount.With(fillLabels(sandboxRunNeed, labels)).Add(value)
+	case MSandboxOutputLimitCount:
+		sandboxOutputLimitCount.With(fillLabels(sandboxRunNeed, labels)).Add(value)
+	case MSandboxPidsLimitCount:
+		sandboxPidsLimitCount.With(fillLabels(sandboxRunNeed, labels)).Add(value)
+	case MSandboxRuntimeUnavailableCount:
+		sandboxRuntimeUnavailableCount.With(fillLabels(sandboxRunNeed, labels)).Add(value)
+	case MSandboxCleanupFailedCount:
+		sandboxCleanupFailedCount.With(fillLabels(sandboxRunNeed, labels)).Add(value)
+
+	// Sandbox histograms
+	case MSandboxDurationMs:
+		sandboxDurationMs.With(fillLabels(sandboxRunNeed, labels)).Observe(value)
+	case MSandboxSetupMs:
+		sandboxSetupMs.With(fillLabels(sandboxRunNeed, labels)).Observe(value)
+	case MSandboxProbeLatencyMs:
+		sandboxProbeLatencyMs.With(fillLabels(sandboxProbeNeed, labels)).Observe(value)
+
+	// Sandbox gauges
+	case MSandboxActiveCount:
+		sandboxActiveCount.With(fillLabels(sandboxActiveNeed, labels)).Set(value)
+	case MSandboxMemoryLimitBytes:
+		sandboxMemoryLimitBytes.With(fillLabels(sandboxRunNeed, labels)).Set(value)
+	case MSandboxOutputLimitBytes:
+		sandboxOutputLimitBytes.With(fillLabels(sandboxRunNeed, labels)).Set(value)
+	case MSandboxExitCode:
+		sandboxExitCode.With(fillLabels(sandboxRunNeed, labels)).Set(value)
 	}
 }
 

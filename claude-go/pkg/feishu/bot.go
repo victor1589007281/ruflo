@@ -37,6 +37,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/observability"
+	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/skills"
 	swarm_intel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
@@ -378,6 +379,13 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 初始化全局 LLM 指标采集器 (让 feishu bot 的指标走全局 JSONL + Prometheus 路径)
 	metrics.InitGlobalLLMCollector(layout.Root)
+	if config.Sandbox != nil {
+		sbxCfg := *config.Sandbox
+		sbxCfg.StateDir = layout.Root
+		sandbox.Configure(sbxCfg)
+	} else {
+		sandbox.Configure(sandbox.Config{StateDir: layout.Root})
+	}
 
 	// 设置全局 alias 解析器，让 recordLLMCall 能自动把 model 名解析为完整 alias
 	metrics.SetAliasResolver(registry.LookupAliasByModelName)

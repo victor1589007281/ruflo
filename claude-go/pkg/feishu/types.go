@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
+	"github.com/anthropic/claude-go/pkg/sandbox"
 )
 
 // BotConfig 飞书机器人配置
@@ -139,6 +140,9 @@ type BotConfig struct {
 
 	// Providers 厂商配置 (新模式): 每个 provider 包含 baseURL/apiKey + 模型列表。
 	Providers ProvidersSection
+
+	// Sandbox agent 代码执行沙盒配置。
+	Sandbox *sandbox.Config
 }
 
 // BrowserConfig 浏览器抓取配置。
@@ -318,6 +322,9 @@ type JSONConfig struct {
 
 	// Providers 厂商配置 (新模式)
 	Providers ProvidersSection `json:"providers,omitempty"`
+
+	// Sandbox agent 代码执行沙盒配置。
+	Sandbox *sandbox.Config `json:"sandbox,omitempty"`
 }
 
 // DashboardSection Dashboard 配置段
@@ -604,6 +611,10 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		for name, p := range jc.Providers {
 			bc.Providers[name] = p
 		}
+	}
+	if jc.Sandbox != nil {
+		cp := *jc.Sandbox
+		bc.Sandbox = &cp
 	}
 
 	if jc.SystemPrompt != "" && bc.SystemPrompt == "" {

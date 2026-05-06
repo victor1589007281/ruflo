@@ -28,13 +28,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os/exec"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/logging"
+	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -340,21 +340,32 @@ func (r *Runner) executeCommandHook(config types.HookConfig, input types.HookInp
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", config.Command)
-
 	inputJSON, err := json.Marshal(input)
 	if err != nil {
 		return nil, fmt.Errorf("序列化 hook 输入失败: %w", err)
 	}
-	cmd.Stdin = bytes.NewReader(inputJSON)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	result, runErr := sandbox.DefaultManager().Run(ctx, sandbox.CommandSpec{
+		Purpose:             "hook",
+		Runtime:             "process",
+		AllowUnsafeFallback: true,
+		Args:                []string{"sh", "-c", config.Command},
+		Stdin:               inputJSON,
+		Limits: sandbox.ResourceLimits{
+			Timeout:         timeout,
+			OutputMaxBytes:  512 * 1024,
+			PreviewMaxBytes: 128 * 1024,
+			LogMaxBytes:     1024 * 1024,
+		},
+	})
+	stdoutPreview := ""
+	stderrPreview := ""
+	if result != nil {
+		stdoutPreview = result.StdoutPreview
+		stderrPreview = result.StderrPreview
+	}
 
-	runErr := cmd.Run()
-
-	output := bytes.TrimSpace(stdout.Bytes())
+	output := bytes.TrimSpace([]byte(stdoutPreview))
 	if len(output) > 0 && output[0] == '{' {
 		var hookOutput types.HookOutput
 		if err := json.Unmarshal(output, &hookOutput); err == nil {
@@ -363,17 +374,15 @@ func (r *Runner) executeCommandHook(config types.HookConfig, input types.HookInp
 	}
 
 	if runErr != nil {
-		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			if exitErr.ExitCode() == 2 {
-				reason := strings.TrimSpace(stderr.String())
-				if reason == "" {
-					reason = "Hook exited with code 2 (blocking)"
-				}
-				return &types.HookOutput{
-					Decision: "block",
-					Reason:   reason,
-				}, nil
+		if result != nil && result.ExitCode == 2 {
+			reason := strings.TrimSpace(stderrPreview)
+			if reason == "" {
+				reason = "Hook exited with code 2 (blocking)"
 			}
+			return &types.HookOutput{
+				Decision: "block",
+				Reason:   reason,
+			}, nil
 		}
 		return nil, fmt.Errorf("hook 执行失败: %w", runErr)
 	}

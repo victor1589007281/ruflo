@@ -456,6 +456,25 @@ const (
 	MWBSFailedBlockedDependents = "wbs_failed_blocked_dependents" // failed leaf 级联阻塞的下游数
 )
 
+// Sandbox 指标 — agent 代码执行沙盒。
+const (
+	MSandboxRunCount                = "sandbox_run_count"                 // 沙盒运行次数
+	MSandboxActiveCount             = "sandbox_active_count"              // 当前活跃沙盒数
+	MSandboxDurationMs              = "sandbox_duration_ms"               // 沙盒运行耗时(ms)
+	MSandboxSetupMs                 = "sandbox_setup_ms"                  // 沙盒启动耗时(ms)
+	MSandboxRunnerSelected          = "sandbox_runner_selected"           // runtime 可用/选中事件
+	MSandboxProbeLatencyMs          = "sandbox_probe_latency_ms"          // runtime 探测耗时(ms)
+	MSandboxMemoryLimitBytes        = "sandbox_memory_limit_bytes"        // 内存限制(bytes)
+	MSandboxOutputLimitBytes        = "sandbox_output_limit_bytes"        // 输出限制(bytes)
+	MSandboxExitCode                = "sandbox_exit_code"                 // 退出码
+	MSandboxOOMCount                = "sandbox_oom_count"                 // OOM 次数
+	MSandboxTimeoutCount            = "sandbox_timeout_count"             // 超时次数
+	MSandboxOutputLimitCount        = "sandbox_output_limit_count"        // 输出超限次数
+	MSandboxPidsLimitCount          = "sandbox_pids_limit_count"          // pids 超限次数
+	MSandboxRuntimeUnavailableCount = "sandbox_runtime_unavailable_count" // runtime 不可用次数
+	MSandboxCleanupFailedCount      = "sandbox_cleanup_failed_count"      // 清理失败次数
+)
+
 // Cron 指标 (从 cron_jobs.json 的历史执行统计)
 const (
 	MCronRunCount     = "cron_run_count"     // 触发次数
