@@ -30,11 +30,17 @@ func (r *NativeCgroupV2Runner) Probe(ctx context.Context) ProbeResult {
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return ProbeResult{Runtime: r.Name(), OK: false, Detail: "cgroup base not writable: " + err.Error(), Latency: time.Since(start)}
 	}
-	test := filepath.Join(base, ".claude-go-write-test")
-	if err := os.WriteFile(test, []byte("1"), 0o644); err != nil {
+	// cgroup v2 is a special filesystem — cannot write arbitrary files.
+	// Test by writing to actual control files and creating a sub-cgroup.
+	if err := os.WriteFile(filepath.Join(base, "cgroup.freeze"), []byte("1"), 0o644); err != nil {
 		return ProbeResult{Runtime: r.Name(), OK: false, Detail: "cgroup base not delegated/writable: " + err.Error(), Latency: time.Since(start)}
 	}
-	_ = os.Remove(test)
+	_ = os.WriteFile(filepath.Join(base, "cgroup.freeze"), []byte("0"), 0o644)
+	subTest := filepath.Join(base, ".claude-go-probe-sub")
+	if err := os.MkdirAll(subTest, 0o755); err != nil {
+		return ProbeResult{Runtime: r.Name(), OK: false, Detail: "cannot create sub-cgroup: " + err.Error(), Latency: time.Since(start)}
+	}
+	_ = os.Remove(subTest)
 	return ProbeResult{Runtime: r.Name(), OK: true, Detail: base, Latency: time.Since(start), CanMemory: true, CanPids: true, CanCPU: true}
 }
 
