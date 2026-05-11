@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,7 +43,7 @@ type v2TaskRecord struct {
 	Status      string   `json:"status"`
 	Owner       string   `json:"owner,omitempty"`
 	DependsOn   []string `json:"dependsOn,omitempty"` // DAG: 前置依赖的 task ID 列表
-	Priority    int      `json:"priority,omitempty"`   // 0=normal, 1=high, 2=critical
+	Priority    int      `json:"priority,omitempty"`  // 0=normal, 1=high, 2=critical
 	CreatedAt   string   `json:"createdAt"`
 	UpdatedAt   string   `json:"updatedAt"`
 }
@@ -156,7 +157,7 @@ func (t *TaskCreateTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TaskCreateTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *TaskCreateTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *TaskCreateTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 func (t *TaskCreateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
@@ -233,7 +234,7 @@ func (t *TaskGetTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TaskGetTool) IsReadOnly(_ json.RawMessage) bool { return true }
+func (t *TaskGetTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *TaskGetTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 func (t *TaskGetTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
@@ -297,7 +298,7 @@ func (t *TaskUpdateTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TaskUpdateTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *TaskUpdateTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *TaskUpdateTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 func (t *TaskUpdateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
@@ -369,7 +370,7 @@ func (t *TaskListTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TaskListTool) IsReadOnly(_ json.RawMessage) bool { return true }
+func (t *TaskListTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *TaskListTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 func (t *TaskListTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
@@ -452,6 +453,7 @@ func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsO
 			}
 		}
 		rec := s.byID[bestID]
+		dependsOn = filterTaskDependsOn(dependsOn, bestID)
 		rec.DependsOn = dependsOn
 		rec.Priority = priority
 		rec.Description = description
@@ -465,6 +467,7 @@ func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsO
 	// 优先级 3: 创建新任务
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	id := genTaskUUID()
+	dependsOn = filterTaskDependsOn(dependsOn, id)
 	// 如果有依赖但前置任务未完成, 状态设为 blocked
 	status := "pending"
 	if len(dependsOn) > 0 {
@@ -483,6 +486,23 @@ func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsO
 		return "", err
 	}
 	return id, nil
+}
+
+func filterTaskDependsOn(dependsOn []string, selfID string) []string {
+	if len(dependsOn) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(dependsOn))
+	filtered := make([]string, 0, len(dependsOn))
+	for _, dep := range dependsOn {
+		dep = strings.TrimSpace(dep)
+		if dep == "" || dep == selfID || seen[dep] {
+			continue
+		}
+		seen[dep] = true
+		filtered = append(filtered, dep)
+	}
+	return filtered
 }
 
 // UnblockDependents 当一个任务完成或失败时, 检查并解除其依赖者的阻塞状态。

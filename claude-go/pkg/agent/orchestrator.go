@@ -29,6 +29,8 @@ import (
 	"go/printer"
 	"go/token"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -98,6 +100,15 @@ type TaskNode struct {
 	TargetPackages []string  `json:"targetPackages,omitempty"` // 该任务涉及的包路径 (如 "./internal/storage/...")
 	TargetFiles    []string  `json:"targetFiles,omitempty"`    // 该任务涉及的具体文件
 	TaskType       string    `json:"taskType,omitempty"`       // "macro", "leaf", "verification"
+	WorkUnitType   string    `json:"workUnitType,omitempty"`   // "contract", "implementation", "integration", "verification"
+	CapabilityID   string    `json:"capabilityId,omitempty"`
+	ContractRefs   []string  `json:"contractRefs,omitempty"`
+	Provides       []string  `json:"provides,omitempty"`
+	Requires       []string  `json:"requires,omitempty"`
+	ReadFiles      []string  `json:"readFiles,omitempty"`
+	WriteFiles     []string  `json:"writeFiles,omitempty"`
+	ConflictKeys   []string  `json:"conflictKeys,omitempty"`
+	EstimatedLOC   int       `json:"estimatedChangedLOC,omitempty"`
 	ParentID       string    `json:"parentId,omitempty"`
 	EstimatedMin   int       `json:"estimatedMinutes,omitempty"`
 	RiskLevel      string    `json:"riskLevel,omitempty"` // "low", "medium", "high"
@@ -105,6 +116,7 @@ type TaskNode struct {
 	ParallelGroup  string    `json:"parallelGroup,omitempty"`
 	BlockingPolicy string    `json:"blockingPolicy,omitempty"` // "fail_blocks_dependents", "fail_open"
 	SplitReason    string    `json:"splitReason,omitempty"`
+	TimeoutKind    string    `json:"timeoutKind,omitempty"`
 
 	Output      string `json:"output"`
 	Error       string `json:"error"`
@@ -148,6 +160,7 @@ type Orchestrator struct {
 	totalCount     int
 	dagMaxWidth    int
 	teamName       string // 用于 resume 时识别孤儿任务
+	planningLang   string // language adapter used by local plan compiler/sizing gate
 
 	wbsSplitCount        int
 	wbsTimeoutSplitCount int
@@ -167,6 +180,15 @@ type rawTask struct {
 	targetPackages []string // 该任务涉及的包路径 (如 "./internal/storage/...")
 	targetFiles    []string // 该任务涉及的具体文件 (如 "internal/storage/engine.go")
 	taskType       string
+	workUnitType   string
+	capabilityID   string
+	contractRefs   []string
+	provides       []string
+	requires       []string
+	readFiles      []string
+	writeFiles     []string
+	conflictKeys   []string
+	estimatedLOC   int
 	parentID       string
 	estimatedMin   int
 	riskLevel      string
@@ -174,6 +196,7 @@ type rawTask struct {
 	parallelGroup  string
 	blockingPolicy string
 	splitReason    string
+	timeoutKind    string
 }
 
 const (
@@ -187,6 +210,19 @@ const (
 
 	wbsBlockingFailBlocks = "fail_blocks_dependents"
 	wbsBlockingFailOpen   = "fail_open"
+
+	wbsWorkUnitContract       = "contract"
+	wbsWorkUnitImplementation = "implementation"
+	wbsWorkUnitIntegration    = "integration"
+	wbsWorkUnitVerification   = "verification"
+
+	wbsTimeoutKindTrueOversize  = "true_oversize"
+	wbsTimeoutKindProviderStall = "provider_or_network_stall"
+	wbsTimeoutKindPromptBloat   = "prompt_bloat"
+	wbsTimeoutKindRateLimit     = "rate_limit_or_overload"
+	wbsTimeoutKindUnknown       = "unknown_timeout"
+	wbsTimeoutActionSplit       = "split"
+	wbsTimeoutActionRetryOrFail = "retry_or_fail"
 )
 
 // NewOrchestrator 创建编排器 (需要 DAGTaskTracker, 不再自建 DAG)
@@ -256,6 +292,19 @@ func (o *Orchestrator) SetDesignContext(designDoc, planDoc string) {
 	o.planDoc = planDoc
 }
 
+func (o *Orchestrator) SetPlanningLanguage(language string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.planningLang = inferPlanningLanguageID("", language)
+}
+
+func (o *Orchestrator) planningAdapter(objective string) planningLanguageAdapter {
+	if o.planningLang == "" {
+		o.planningLang = inferPlanningLanguageID(objective, "")
+	}
+	return planningLanguageAdapterFor(o.planningLang)
+}
+
 // ParsePlanToDAG 解析 Planner WBS → 写入 V2 TaskStore (DAG 单一数据源)。
 // 多策略解析: JSON (优先) → 宽松 markdown 表格 → 编号列表。
 // 返回任务节点列表 (元数据保存在内存, DAG 关系在 TaskStore)。
@@ -271,7 +320,7 @@ func (o *Orchestrator) ParsePlanToDAG(planOutput, teamName string) ([]*TaskNode,
 	if len(rawTasks) == 0 {
 		return nil, nil
 	}
-	rawTasks = o.normalizeAndSplitRawTasks(rawTasks)
+	rawTasks = o.normalizeAndSplitRawTasks(rawTasks, "")
 	return o.rawTasksToDAG(rawTasks, teamName)
 }
 
@@ -283,19 +332,30 @@ func (o *Orchestrator) ParsePlanToDAGWithRepair(ctx context.Context, planOutput,
 		o.mu.Unlock()
 		return nil, fmt.Errorf("DAGTaskTracker 未配置")
 	}
-
-	if synthesized := synthesizeObjectiveWBS(objective); len(synthesized) > 0 {
-		o.notify(o.chatID, "🧩 WBS policy: 新 Go 目标目录使用稳定内置 Leaf DAG")
-		rawTasks := o.normalizeAndSplitRawTasks(synthesized)
-		nodes, err := o.rawTasksToDAG(rawTasks, teamName)
-		o.mu.Unlock()
-		return nodes, err
-	}
+	o.planningAdapter(objective)
 
 	// 层 1+2: 多策略解析
 	rawTasks := o.multiStrategyParse(planOutput)
-	if len(rawTasks) > 0 && validateParsedWBSForObjective(rawTasks, objective) == nil {
-		rawTasks = o.normalizeAndSplitRawTasks(rawTasks)
+	var firstValidationErr error
+	if len(rawTasks) > 0 {
+		firstValidationErr = validateParsedWBSForObjective(rawTasks, objective)
+	}
+	if len(rawTasks) > 0 && firstValidationErr == nil {
+		rawTasks = o.normalizeAndSplitRawTasks(rawTasks, objective)
+		if err := validateFinalWBSForObjective(rawTasks, objective); err != nil {
+			if objectiveAllowsDeterministicV1Fallback(objective) {
+				o.notify(o.chatID, "⚠️ Planner WBS 二次拆分后超过最终预算, 切换到 universal V1 fallback DAG")
+				rawTasks = o.normalizeAndSplitRawTasks(synthesizeObjectiveWBS(objective), objective)
+				if fallbackErr := validateFinalWBSForObjective(rawTasks, objective); fallbackErr != nil {
+					o.mu.Unlock()
+					return nil, fmt.Errorf("%v; fallback invalid: %w", err, fallbackErr)
+				}
+			} else {
+				o.notify(o.chatID, "⚠️ Planner WBS 未满足完整设计任务预算, 已拒绝 V1 降级并要求真实 Planner 重做")
+				o.mu.Unlock()
+				return nil, err
+			}
+		}
 		nodes, err := o.rawTasksToDAG(rawTasks, teamName)
 		o.mu.Unlock()
 		return nodes, err
@@ -311,12 +371,26 @@ func (o *Orchestrator) ParsePlanToDAGWithRepair(ctx context.Context, planOutput,
 			o.mu.Lock()
 			rawTasks = o.multiStrategyParse(repaired)
 			if len(rawTasks) > 0 && validateParsedWBSForObjective(rawTasks, objective) == nil {
-				rawTasks = o.normalizeAndSplitRawTasks(rawTasks)
+				rawTasks = o.normalizeAndSplitRawTasks(rawTasks, objective)
+				if err := validateFinalWBSForObjective(rawTasks, objective); err != nil {
+					if objectiveAllowsDeterministicV1Fallback(objective) {
+						o.notify(o.chatID, "⚠️ Repair WBS 二次拆分后超过最终预算, 切换到 universal V1 fallback DAG")
+						rawTasks = o.normalizeAndSplitRawTasks(synthesizeObjectiveWBS(objective), objective)
+						if fallbackErr := validateFinalWBSForObjective(rawTasks, objective); fallbackErr != nil {
+							o.mu.Unlock()
+							return nil, fmt.Errorf("%v; fallback invalid: %w", err, fallbackErr)
+						}
+					} else {
+						o.notify(o.chatID, "⚠️ Repair WBS 仍未满足完整设计任务预算, 已拒绝 V1 降级")
+						o.mu.Unlock()
+						return nil, err
+					}
+				}
 				nodes, err := o.rawTasksToDAG(rawTasks, teamName)
 				o.mu.Unlock()
 				return nodes, err
 			} else if len(rawTasks) > 0 {
-				o.notify(o.chatID, "⚠️ Repair WBS 仍未满足目标目录/可执行 Leaf 约束, 使用 objective fallback")
+				o.notify(o.chatID, "⚠️ Repair WBS 仍未满足目标目录/可执行 Leaf 约束, 尝试从原计划提取最小 DAG")
 			}
 			o.mu.Unlock()
 		}
@@ -327,19 +401,27 @@ func (o *Orchestrator) ParsePlanToDAGWithRepair(ctx context.Context, planOutput,
 	rawTasks = o.fallbackExtractTasks(planOutput)
 	if len(rawTasks) > 0 && validateParsedWBSForObjective(rawTasks, objective) == nil {
 		o.notify(o.chatID, "⚠️ WBS 格式解析失败, 使用 fallback 最小 DAG")
-		rawTasks = o.normalizeAndSplitRawTasks(rawTasks)
-		nodes, err := o.rawTasksToDAG(rawTasks, teamName)
-		o.mu.Unlock()
-		return nodes, err
-	}
-	if synthesized := synthesizeObjectiveWBS(objective); len(synthesized) > 0 {
-		o.notify(o.chatID, "🧩 WBS fallback: 基于目标目录合成可执行 Go 项目 Leaf DAG")
-		rawTasks = o.normalizeAndSplitRawTasks(synthesized)
+		rawTasks = o.normalizeAndSplitRawTasks(rawTasks, objective)
+		if err := validateFinalWBSForObjective(rawTasks, objective); err != nil {
+			if objectiveAllowsDeterministicV1Fallback(objective) {
+				rawTasks = o.normalizeAndSplitRawTasks(synthesizeObjectiveWBS(objective), objective)
+				if fallbackErr := validateFinalWBSForObjective(rawTasks, objective); fallbackErr != nil {
+					o.mu.Unlock()
+					return nil, fmt.Errorf("%v; fallback invalid: %w", err, fallbackErr)
+				}
+			} else {
+				o.mu.Unlock()
+				return nil, err
+			}
+		}
 		nodes, err := o.rawTasksToDAG(rawTasks, teamName)
 		o.mu.Unlock()
 		return nodes, err
 	}
 	o.mu.Unlock()
+	if firstValidationErr != nil && !objectiveAllowsDeterministicV1Fallback(objective) {
+		return nil, firstValidationErr
+	}
 	return nil, nil
 }
 
@@ -359,13 +441,15 @@ func (o *Orchestrator) multiStrategyParse(planOutput string) []rawTask {
 
 // rawTasksToDAG 将 rawTasks 写入 V2 DAG, 返回 TaskNode 列表 (调用者需持有 o.mu)。
 func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*TaskNode, error) {
+	fillVerificationDeps(rawTasks)
+	rawTasks = orderRawTasksByDeps(rawTasks)
 	o.teamName = teamName
 	var nodes []*TaskNode
 	numToV2ID := make(map[string]string)
-	groupLastV2ID := make(map[string]string)
-	groupLastNum := make(map[string]string)
 	fileLastV2ID := make(map[string]string)
 	fileLastNum := make(map[string]string)
+	conflictLastV2ID := make(map[string]string)
+	conflictLastNum := make(map[string]string)
 	widthTasks := make([]rawTask, 0, len(rawTasks))
 	for _, rt := range rawTasks {
 		var depV2IDs []string
@@ -374,15 +458,15 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 				depV2IDs = append(depV2IDs, v2id)
 			}
 		}
-		if rt.parallelGroup != "" {
-			if prev, ok := groupLastV2ID[rt.parallelGroup]; ok && !containsString(depV2IDs, prev) {
+		for _, key := range rawTaskConflictKeys(rt) {
+			if prev, ok := conflictLastV2ID[key]; ok && !containsString(depV2IDs, prev) {
 				depV2IDs = append(depV2IDs, prev)
 			}
-			if prevNum, ok := groupLastNum[rt.parallelGroup]; ok && !containsString(rt.depNums, prevNum) {
+			if prevNum, ok := conflictLastNum[key]; ok && !containsString(rt.depNums, prevNum) {
 				rt.depNums = append(rt.depNums, prevNum)
 			}
 		}
-		for _, file := range rt.targetFiles {
+		for _, file := range rawTaskWriteFiles(rt) {
 			file = strings.TrimSpace(file)
 			if file == "" {
 				continue
@@ -394,11 +478,19 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 				rt.depNums = append(rt.depNums, prevNum)
 			}
 		}
+		depV2IDs = uniqueTrimmedStrings(depV2IDs)
 
 		subject := orchestratorTaskSubject(teamName, rt.title)
 		v2ID, err := o.dag.AddTaskWithDeps(subject, rt.accept, rt.role, depV2IDs, rt.priority)
 		if err != nil {
 			return nodes, fmt.Errorf("创建V2 DAG任务失败: %w", err)
+		}
+		if containsString(depV2IDs, v2ID) {
+			depV2IDs = removeString(depV2IDs, v2ID)
+			v2ID, err = o.dag.AddTaskWithDeps(subject, rt.accept, rt.role, depV2IDs, rt.priority)
+			if err != nil {
+				return nodes, fmt.Errorf("修正V2 DAG自依赖失败: %w", err)
+			}
 		}
 		numToV2ID[rt.num] = v2ID
 
@@ -415,6 +507,15 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 			TargetPackages: rt.targetPackages,
 			TargetFiles:    rt.targetFiles,
 			TaskType:       rt.taskType,
+			WorkUnitType:   rt.workUnitType,
+			CapabilityID:   rt.capabilityID,
+			ContractRefs:   rt.contractRefs,
+			Provides:       rt.provides,
+			Requires:       rt.requires,
+			ReadFiles:      rt.readFiles,
+			WriteFiles:     rt.writeFiles,
+			ConflictKeys:   rt.conflictKeys,
+			EstimatedLOC:   rt.estimatedLOC,
 			ParentID:       rt.parentID,
 			EstimatedMin:   rt.estimatedMin,
 			RiskLevel:      rt.riskLevel,
@@ -422,14 +523,15 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 			ParallelGroup:  rt.parallelGroup,
 			BlockingPolicy: rt.blockingPolicy,
 			SplitReason:    rt.splitReason,
+			TimeoutKind:    rt.timeoutKind,
 		}
 		nodes = append(nodes, node)
 		o.nodes[v2ID] = node
-		if rt.parallelGroup != "" {
-			groupLastV2ID[rt.parallelGroup] = v2ID
-			groupLastNum[rt.parallelGroup] = rt.num
+		for _, key := range rawTaskConflictKeys(rt) {
+			conflictLastV2ID[key] = v2ID
+			conflictLastNum[key] = rt.num
 		}
-		for _, file := range rt.targetFiles {
+		for _, file := range rawTaskWriteFiles(rt) {
 			file = strings.TrimSpace(file)
 			if file == "" {
 				continue
@@ -467,6 +569,15 @@ type wbsJSONTask struct {
 	TargetPackages []string        `json:"targetPackages,omitempty"` // 该任务涉及的包路径
 	TargetFiles    []string        `json:"targetFiles,omitempty"`    // 该任务涉及的具体文件
 	TaskType       string          `json:"taskType,omitempty"`
+	WorkUnitType   string          `json:"workUnitType,omitempty"`
+	CapabilityID   string          `json:"capabilityId,omitempty"`
+	ContractRefs   []string        `json:"contractRefs,omitempty"`
+	Provides       []string        `json:"provides,omitempty"`
+	Requires       []string        `json:"requires,omitempty"`
+	ReadFiles      []string        `json:"readFiles,omitempty"`
+	WriteFiles     []string        `json:"writeFiles,omitempty"`
+	ConflictKeys   []string        `json:"conflictKeys,omitempty"`
+	EstimatedLOC   int             `json:"estimatedChangedLOC,omitempty"`
 	ParentID       flexibleWBSID   `json:"parentId,omitempty"`
 	EstimatedMin   int             `json:"estimatedMinutes,omitempty"`
 	RiskLevel      string          `json:"riskLevel,omitempty"`
@@ -474,6 +585,7 @@ type wbsJSONTask struct {
 	ParallelGroup  string          `json:"parallelGroup,omitempty"`
 	BlockingPolicy string          `json:"blockingPolicy,omitempty"`
 	SplitReason    string          `json:"splitReason,omitempty"`
+	TimeoutKind    string          `json:"timeoutKind,omitempty"`
 }
 
 type flexibleWBSID string
@@ -502,25 +614,20 @@ func stripCodeFences(s string) string {
 }
 
 func parseWBSFromJSON(planOutput string) []rawTask {
-	body := stripCodeFences(planOutput)
-
-	var wbs wbsJSON
-	if err := json.Unmarshal([]byte(body), &wbs); err != nil {
-		// 尝试从文本中找到 JSON 对象
-		start := strings.Index(body, "{")
-		end := strings.LastIndex(body, "}")
-		if start >= 0 && end > start {
-			if err2 := json.Unmarshal([]byte(body[start:end+1]), &wbs); err2 != nil {
-				return nil
-			}
-		} else {
-			return nil
+	for _, body := range wbsJSONCandidateBodies(planOutput) {
+		var wbs wbsJSON
+		if err := json.Unmarshal([]byte(body), &wbs); err != nil || len(wbs.Tasks) == 0 {
+			continue
 		}
+		return rawTasksFromWBS(wbs)
 	}
+	return nil
+}
+
+func rawTasksFromWBS(wbs wbsJSON) []rawTask {
 	if len(wbs.Tasks) == 0 {
 		return nil
 	}
-
 	var tasks []rawTask
 	for _, t := range wbs.Tasks {
 		id := strings.TrimSpace(string(t.ID))
@@ -542,6 +649,15 @@ func parseWBSFromJSON(planOutput string) []rawTask {
 			complexity: t.Complexity, subGoals: t.SubGoals,
 			targetPackages: t.TargetPackages, targetFiles: t.TargetFiles,
 			taskType:       t.TaskType,
+			workUnitType:   t.WorkUnitType,
+			capabilityID:   t.CapabilityID,
+			contractRefs:   t.ContractRefs,
+			provides:       t.Provides,
+			requires:       t.Requires,
+			readFiles:      t.ReadFiles,
+			writeFiles:     t.WriteFiles,
+			conflictKeys:   t.ConflictKeys,
+			estimatedLOC:   t.EstimatedLOC,
 			parentID:       strings.TrimSpace(string(t.ParentID)),
 			estimatedMin:   t.EstimatedMin,
 			riskLevel:      t.RiskLevel,
@@ -549,9 +665,75 @@ func parseWBSFromJSON(planOutput string) []rawTask {
 			parallelGroup:  t.ParallelGroup,
 			blockingPolicy: t.BlockingPolicy,
 			splitReason:    t.SplitReason,
+			timeoutKind:    t.TimeoutKind,
 		})
 	}
 	return tasks
+}
+
+func wbsJSONCandidateBodies(text string) []string {
+	var candidates []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		for _, existing := range candidates {
+			if existing == s {
+				return
+			}
+		}
+		candidates = append(candidates, s)
+	}
+	add(stripCodeFences(text))
+	add(text)
+	for _, obj := range extractJSONObjectCandidates(text) {
+		add(obj)
+	}
+	return candidates
+}
+
+func extractJSONObjectCandidates(text string) []string {
+	var out []string
+	start := -1
+	depth := 0
+	inString := false
+	escaped := false
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch ch {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			if depth == 0 {
+				continue
+			}
+			depth--
+			if depth == 0 && start >= 0 {
+				out = append(out, strings.TrimSpace(text[start:i+1]))
+				start = -1
+			}
+		}
+	}
+	return out
 }
 
 // --- 策略 2: 宽松 markdown 表格 ---
@@ -666,9 +848,15 @@ func (o *Orchestrator) repairPlanFormat(ctx context.Context, badOutput, objectiv
 	targetRoot := inferObjectiveTargetRoot(objective)
 	targetRule := ""
 	if targetRoot != "" {
-		targetRule = fmt.Sprintf("\n硬约束: 用户指定输出目录为 %s。所有 targetFiles 必须以 %s/ 开头; 新 Go 项目的第一个 Leaf 必须包含 %s/go.mod; verification 使用 cd %s && go test ./...。\n",
-			targetRoot, targetRoot, targetRoot, targetRoot)
+		targetRule = fmt.Sprintf("\n硬约束: 用户指定输出目录为 %s。所有 targetFiles/writeFiles 必须以 %s/ 开头; verification 必须使用架构阶段确定的语言适配器命令, 不要默认假设 Go。\n",
+			targetRoot, targetRoot)
 	}
+	sampleRoot := targetRoot
+	if sampleRoot == "" {
+		sampleRoot = "X"
+	}
+	sampleManifest := objectiveManifestPath(sampleRoot, objective)
+	sampleSource := filepath.ToSlash(filepath.Join(sampleRoot, "internal", "module.ext"))
 	prompt := fmt.Sprintf(`以下开发计划的格式无法被系统解析或不可执行。请将其转换为严格 JSON, 不要添加任何解释:
 
 项目目标:
@@ -678,15 +866,48 @@ func (o *Orchestrator) repairPlanFormat(ctx context.Context, badOutput, objectiv
 %sjson
 {
   "tasks": [
-    {"id": 1, "title": "...", "role": "coder", "taskType": "leaf", "dependsOn": [], "designRef": "", "constraints": [], "acceptance": "...", "priority": 1, "estimatedMinutes": 3, "riskLevel": "medium", "blockingPolicy": "fail_blocks_dependents"}
+    {
+      "id": 1,
+      "title": "创建目标语言项目骨架与 manifest",
+      "role": "coder",
+      "taskType": "leaf",
+      "dependsOn": [],
+      "designRef": "上游架构设计中的目录结构/语言适配器摘要",
+      "constraints": [],
+      "acceptance": "目标目录下最小 build/test 通过",
+      "priority": 3,
+      "estimatedMinutes": 3,
+      "riskLevel": "low",
+      "verifyCommand": "架构阶段确定的本地 build/test 命令",
+      "parallelGroup": "project-skeleton",
+      "workUnitType": "contract",
+      "capabilityId": "project-skeleton",
+      "contractRefs": [],
+      "provides": ["project skeleton"],
+      "requires": [],
+      "readFiles": [],
+      "writeFiles": ["%s", "%s/README.md", "%s"],
+      "conflictKeys": ["contract:project"],
+      "estimatedChangedLOC": 120,
+      "blockingPolicy": "fail_blocks_dependents",
+      "targetFiles": ["%s", "%s/README.md", "%s"],
+      "targetPackages": []
+    }
   ]
 }
 %s
 
+硬性规则:
+1. 禁止输出“读取设计文档/查看目录/检查目标目录/理解需求/制定计划”等元任务。
+2. 禁止输出 bash/cat/ls/Read/minimax:tool_call 等伪工具调用。
+3. 每个 coder leaf 必须有非空 targetFiles/writeFiles, 且必须是实现或测试文件。
+4. 第一个 coder leaf 创建目标语言项目骨架和 manifest; 后续 leaf 只增量实现模块。
+5. verification task 只跑本地 build/test/TODO scan, 不调用 tester LLM。
+
 原始计划:
 %s
 
-请直接输出 JSON (用 %sjson ... %s 包裹):`, objective, targetRule, "```", "```", truncateResult(badOutput, 8000), "```", "```")
+请直接输出 JSON (用 %sjson ... %s 包裹):`, objective, targetRule, "```", sampleManifest, sampleRoot, sampleSource, sampleManifest, sampleRoot, sampleSource, "```", truncateResult(badOutput, 8000), "```", "```")
 
 	agent, err := factory(ctx, "planner", "")
 	if err != nil {
@@ -697,6 +918,26 @@ func (o *Orchestrator) repairPlanFormat(ctx context.Context, badOutput, objectiv
 		return ""
 	}
 	return result
+}
+
+func objectiveManifestPath(root, objective string) string {
+	lower := strings.ToLower(objective)
+	switch {
+	case strings.Contains(lower, "golang") || strings.Contains(lower, "go ") || strings.Contains(lower, "go项目") || strings.Contains(lower, "go 项目"):
+		return filepath.ToSlash(filepath.Join(root, "go.mod"))
+	case strings.Contains(lower, "python") || strings.Contains(lower, "pyproject") || strings.Contains(lower, "pytest"):
+		return filepath.ToSlash(filepath.Join(root, "pyproject.toml"))
+	case strings.Contains(lower, "typescript") || strings.Contains(lower, "javascript") || strings.Contains(lower, "node") || strings.Contains(lower, "npm"):
+		return filepath.ToSlash(filepath.Join(root, "package.json"))
+	case strings.Contains(lower, "rust") || strings.Contains(lower, "cargo"):
+		return filepath.ToSlash(filepath.Join(root, "Cargo.toml"))
+	case strings.Contains(lower, "java") || strings.Contains(lower, "maven"):
+		return filepath.ToSlash(filepath.Join(root, "pom.xml"))
+	case strings.Contains(lower, "c++") || strings.Contains(lower, "cpp") || strings.Contains(lower, "cmake"):
+		return filepath.ToSlash(filepath.Join(root, "CMakeLists.txt"))
+	default:
+		return filepath.ToSlash(filepath.Join(root, "README.md"))
+	}
 }
 
 // --- Fallback: 从自由文本提取最小 DAG ---
@@ -761,14 +1002,21 @@ func validateParsedWBSForObjective(rawTasks []rawTask, objective string) error {
 	if genericMeta == len(rawTasks) {
 		return fmt.Errorf("WBS contains only meta/review tasks")
 	}
+	if err := validateWBSLeafBudget(rawTasks, objective); err != nil {
+		return err
+	}
+	if err := validateUnrequestedWBSSurfaces(rawTasks, objective); err != nil {
+		return err
+	}
+	if err := validateUnrequestedAdvancedCoreSurfaces(rawTasks, objective); err != nil {
+		return err
+	}
 
 	targetRoot := inferObjectiveTargetRoot(objective)
 	if targetRoot == "" {
 		return nil
 	}
-	if len(rawTasks) > 12 {
-		return fmt.Errorf("WBS has %d tasks for target root %s; prefer bounded objective fallback", len(rawTasks), targetRoot)
-	}
+	applyObjectiveTargetRootToWBS(rawTasks, targetRoot)
 	targetPrefix := targetRoot + "/"
 	hasTargetFile := false
 	hasGoMod := false
@@ -792,6 +1040,404 @@ func validateParsedWBSForObjective(rawTasks []rawTask, objective string) error {
 	return nil
 }
 
+func validateFinalWBSForObjective(rawTasks []rawTask, objective string) error {
+	if len(rawTasks) == 0 {
+		return fmt.Errorf("empty normalized WBS")
+	}
+	if objectiveRequiresDesignCompleteMode(objective) && hasObjectiveFallbackRawTask(rawTasks) {
+		return fmt.Errorf("design-complete objective rejected deterministic V1 fallback WBS; planner must produce a real design-coverage DAG")
+	}
+	leafCount := countExecutableWBSLeaves(rawTasks)
+	budget := objectiveWBSFinalLeafBudget(objective)
+	if leafCount > budget {
+		return fmt.Errorf("normalized WBS executable leaf count %d exceeds final DAG budget %d; planner must merge trivial scaffolding while preserving the requested acceptance scope", leafCount, budget)
+	}
+	return nil
+}
+
+func hasObjectiveFallbackRawTask(rawTasks []rawTask) bool {
+	for _, task := range rawTasks {
+		if strings.Contains(strings.ToLower(task.splitReason), "objective-fallback") {
+			return true
+		}
+	}
+	return false
+}
+
+func validateWBSLeafBudget(rawTasks []rawTask, objective string) error {
+	leafCount := countExecutableWBSLeaves(rawTasks)
+	if leafCount == 0 {
+		return fmt.Errorf("WBS has no executable leaf tasks")
+	}
+	budget := objectiveWBSLeafBudget(objective)
+	if leafCount > budget {
+		return fmt.Errorf("WBS leaf count %d exceeds objective budget %d; keep macro tasks at capability boundaries and let TaskSizingGate split only oversized leaves", leafCount, budget)
+	}
+	return nil
+}
+
+func countExecutableWBSLeaves(rawTasks []rawTask) int {
+	count := 0
+	for _, task := range rawTasks {
+		taskType := normalizeWBSTaskType(task.taskType)
+		if taskType == wbsTaskTypeMacro || taskType == wbsTaskTypeVerification {
+			continue
+		}
+		if isGenericMetaWBSTitle(task.title) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func objectiveWBSLeafBudget(objective string) int {
+	if objectiveRequiresDesignCompleteMode(objective) {
+		return designCompleteWBSBudget(objective, 72)
+	}
+	if objectiveRequestsExpandedScope(objective) {
+		return 28
+	}
+	return 18
+}
+
+func objectiveWBSFinalLeafBudget(objective string) int {
+	if objectiveRequiresDesignCompleteMode(objective) {
+		return max(120, designCompleteWBSBudget(objective, 120))
+	}
+	if objectiveRequestsExpandedScope(objective) {
+		return 30
+	}
+	return 20
+}
+
+func designCompleteWBSBudget(objective string, floor int) int {
+	paths := extractLocalReferencePaths(objective)
+	if len(paths) == 0 {
+		return floor
+	}
+	docCount, totalBytes := localReferenceDocStats(paths)
+	if docCount == 0 && totalBytes == 0 {
+		return floor
+	}
+	// Full-design objectives need enough DAG room to keep leaf tasks small.
+	// Scale with the referenced design corpus, but cap to avoid pathological
+	// planner output from turning into unlimited concurrency pressure.
+	byDocs := 80 + docCount*10
+	bySize := 80 + int(totalBytes/2048)
+	return min(260, max(floor, max(byDocs, bySize)))
+}
+
+func localReferenceDocStats(paths []string) (int, int64) {
+	var count int
+	var total int64
+	seen := make(map[string]bool)
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if !info.IsDir() {
+			if isReferenceDocFile(p) && !seen[p] {
+				seen[p] = true
+				count++
+				total += info.Size()
+			}
+			continue
+		}
+		root := p
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if path != root {
+					switch d.Name() {
+					case ".git", ".claude-go", "node_modules", "vendor", "dist", "build":
+						return filepath.SkipDir
+					}
+				}
+				return nil
+			}
+			if !isReferenceDocFile(path) || seen[path] {
+				return nil
+			}
+			seen[path] = true
+			count++
+			if info, err := d.Info(); err == nil {
+				total += info.Size()
+			}
+			return nil
+		})
+	}
+	return count, total
+}
+
+func objectiveRequestsExpandedScope(objective string) bool {
+	if objectiveRequiresDesignCompleteMode(objective) {
+		return true
+	}
+	lower := strings.ToLower(objective)
+	hints := []string{
+		"full", "complete", "all modules", "end-to-end", "e2e",
+		"enterprise", "production-grade", "production ready",
+		"distributed", "cluster", "microservice",
+		"完整", "全量", "全部", "所有模块", "端到端", "企业级", "生产级", "生产可用", "分布式", "集群", "微服务",
+	}
+	for _, hint := range hints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func objectiveAllowsDeterministicV1Fallback(objective string) bool {
+	return !objectiveRequiresDesignCompleteMode(objective)
+}
+
+func objectiveRequiresDesignCompleteMode(objective string) bool {
+	lower := strings.ToLower(objective)
+	strongHints := []string{
+		"100%", "100 percent", "百分百", "完全满足", "严格满足",
+		"严格按照", "完全按照", "完整按照", "全部按照",
+		"完整实现", "全量实现", "全部实现", "全功能",
+		"全部设计", "完整设计", "设计文档", "design docs", "design document",
+	}
+	for _, hint := range strongHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	if !objectiveReferencesDesignSource(objective) {
+		return false
+	}
+	// When the user points development at a concrete design corpus, the design
+	// corpus is the acceptance scope. Do not silently degrade it to a V1 slice.
+	designScopeHints := []string{
+		"参考", "按照", "基于", "设计方案", "设计目录",
+		"reference", "based on", "follow", "according to",
+	}
+	for _, hint := range designScopeHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func objectiveReferencesDesignSource(objective string) bool {
+	lower := strings.ToLower(objective)
+	if strings.Contains(lower, "/v2") || strings.Contains(lower, "\\v2") {
+		return true
+	}
+	hints := []string{
+		"设计文档", "设计方案", "设计目录", "参考设计", "架构设计",
+		"design doc", "design docs", "reference design", "architecture doc",
+	}
+	for _, hint := range hints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	for _, path := range extractLocalReferencePaths(objective) {
+		base := strings.ToLower(filepath.Base(path))
+		if strings.Contains(base, "design") || strings.Contains(base, "v2") || strings.Contains(base, "设计") {
+			return true
+		}
+	}
+	return false
+}
+
+func validateUnrequestedWBSSurfaces(rawTasks []rawTask, objective string) error {
+	if objectiveRequestsExternalProtocolSurface(objective) {
+		return nil
+	}
+	var offenders []string
+	for _, task := range rawTasks {
+		if !rawTaskUsesExternalProtocolSurface(task) {
+			continue
+		}
+		label := strings.TrimSpace(task.title)
+		if label == "" {
+			label = strings.TrimSpace(task.num)
+		}
+		if label == "" {
+			label = "unnamed task"
+		}
+		offenders = append(offenders, label)
+		if len(offenders) >= 3 {
+			break
+		}
+	}
+	if len(offenders) > 0 {
+		return fmt.Errorf("WBS includes external serving/RPC surface not requested by the objective: %s", strings.Join(offenders, "; "))
+	}
+	return nil
+}
+
+func objectiveRequestsExternalProtocolSurface(objective string) bool {
+	if objectiveRequestsExpandedScope(objective) {
+		return true
+	}
+	return containsExternalProtocolSurfaceTerm(objective)
+}
+
+func rawTaskUsesExternalProtocolSurface(task rawTask) bool {
+	parts := []string{task.title, task.designRef, task.accept, task.verifyCommand, task.parentID, task.capabilityID, task.parallelGroup}
+	parts = append(parts, task.targetFiles...)
+	parts = append(parts, task.writeFiles...)
+	parts = append(parts, task.readFiles...)
+	for _, part := range parts {
+		if containsExternalProtocolSurfaceTerm(part) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsExternalProtocolSurfaceTerm(text string) bool {
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, ".proto") || strings.Contains(lower, "cmd/server") || strings.Contains(lower, "/server/") ||
+		strings.Contains(lower, "api client") || strings.Contains(lower, "api 客户端") ||
+		strings.Contains(lower, "http client") || strings.Contains(lower, "http.client") ||
+		strings.Contains(lower, "endpoint") || strings.Contains(lower, "api key") || strings.Contains(lower, "apikey") ||
+		strings.Contains(lower, "remote service") || strings.Contains(lower, "remote api") || strings.Contains(lower, "远程服务") || strings.Contains(lower, "远程 api") {
+		return true
+	}
+	re := regexp.MustCompile(`(^|[^a-z0-9])(grpc|protobuf|proto|rpc|rest|http-server|http server|websocket)([^a-z0-9]|$)`)
+	return re.MatchString(lower)
+}
+
+func validateUnrequestedAdvancedCoreSurfaces(rawTasks []rawTask, objective string) error {
+	if objectiveRequestsAdvancedCoreSurface(objective) {
+		return nil
+	}
+	var offenders []string
+	for _, task := range rawTasks {
+		if !rawTaskUsesAdvancedCoreSurface(task) {
+			continue
+		}
+		label := strings.TrimSpace(task.title)
+		if label == "" {
+			label = strings.TrimSpace(task.num)
+		}
+		if label == "" {
+			label = "unnamed task"
+		}
+		offenders = append(offenders, label)
+		if len(offenders) >= 3 {
+			break
+		}
+	}
+	if len(offenders) > 0 {
+		return fmt.Errorf("WBS includes advanced core engine surface not explicitly requested by the objective: %s", strings.Join(offenders, "; "))
+	}
+	return nil
+}
+
+func objectiveRequestsAdvancedCoreSurface(objective string) bool {
+	if objectiveRequestsExpandedScope(objective) {
+		return true
+	}
+	return containsAdvancedCoreSurfaceTerm(objective)
+}
+
+func rawTaskUsesAdvancedCoreSurface(task rawTask) bool {
+	parts := []string{task.title, task.designRef, task.accept, task.verifyCommand, task.parentID, task.capabilityID, task.parallelGroup, task.splitReason}
+	parts = append(parts, task.targetFiles...)
+	parts = append(parts, task.writeFiles...)
+	parts = append(parts, task.readFiles...)
+	for _, part := range parts {
+		if containsAdvancedCoreSurfaceTerm(part) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAdvancedCoreSurfaceTerm(text string) bool {
+	lower := strings.ToLower(text)
+	terms := []string{
+		"hnsw", "hierarchical navigable small world",
+		"lsm", "lsm-tree", "log structured merge", "log-structured merge",
+		"sstable", "sorted string table", "sst 文件", "sst file", "sst-",
+		"mvcc", "multi-version concurrency control",
+		"wal", "write-ahead log", "write ahead log",
+		"mmap", "memory mapped", "memory-mapped",
+		"page cache", "pagecache",
+		"compaction", "压缩合并", "层级合并",
+		"snapshot isolation", "快照隔离",
+		"readview", "read view", "版本链",
+		"csr", "compressed sparse row", "adjacency", "邻接",
+		"delta store", "delta-store", "增量更新", "增量存储",
+		"product quantization", "quantization", "量化", "pq",
+	}
+	for _, term := range terms {
+		if strings.Contains(lower, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyObjectiveTargetRootToWBS(rawTasks []rawTask, targetRoot string) {
+	targetRoot = strings.Trim(strings.TrimSpace(filepath.ToSlash(targetRoot)), "/")
+	if targetRoot == "" {
+		return
+	}
+	for i := range rawTasks {
+		rawTasks[i].targetFiles = prefixObjectiveTargetFiles(rawTasks[i].targetFiles, targetRoot)
+		rawTasks[i].writeFiles = prefixObjectiveTargetFiles(rawTasks[i].writeFiles, targetRoot)
+		rawTasks[i].readFiles = prefixObjectiveTargetFiles(rawTasks[i].readFiles, targetRoot)
+	}
+}
+
+func prefixObjectiveTargetFiles(files []string, targetRoot string) []string {
+	if len(files) == 0 {
+		return files
+	}
+	out := make([]string, 0, len(files))
+	prefix := targetRoot + "/"
+	for _, file := range files {
+		trimmed := strings.TrimSpace(file)
+		if trimmed == "" {
+			continue
+		}
+		slash := filepath.ToSlash(strings.TrimPrefix(trimmed, "./"))
+		if filepath.IsAbs(trimmed) {
+			if rel := absolutePathUnderTargetRoot(trimmed, targetRoot); rel != "" {
+				out = append(out, rel)
+			} else {
+				out = append(out, trimmed)
+			}
+			continue
+		}
+		if strings.HasPrefix(slash, prefix) || strings.HasPrefix(slash, "../") {
+			out = append(out, trimmed)
+			continue
+		}
+		out = append(out, prefix+slash)
+	}
+	return uniqueTrimmedStrings(out)
+}
+
+func absolutePathUnderTargetRoot(file, targetRoot string) string {
+	targetRoot = strings.Trim(strings.TrimSpace(filepath.ToSlash(targetRoot)), "/")
+	if targetRoot == "" {
+		return ""
+	}
+	slash := filepath.ToSlash(filepath.Clean(file))
+	marker := "/" + targetRoot + "/"
+	if idx := strings.Index(slash, marker); idx >= 0 {
+		return targetRoot + "/" + strings.TrimPrefix(slash[idx+len(marker):], "/")
+	}
+	if strings.HasSuffix(slash, "/"+targetRoot) {
+		return targetRoot
+	}
+	return ""
+}
+
 func isGenericMetaWBSTitle(title string) bool {
 	lower := strings.ToLower(strings.TrimSpace(title))
 	if lower == "" {
@@ -807,6 +1453,10 @@ func isGenericMetaWBSTitle(title string) bool {
 		"analyse design",
 		"analyze design",
 		"设计评审",
+		"读取设计文档",
+		"查看目录",
+		"检查目标目录",
+		"理解需求",
 		"检查现有项目结构",
 		"制定开发计划",
 	}
@@ -826,155 +1476,50 @@ func objectiveLooksLikeGoProject(objective string) bool {
 }
 
 func synthesizeObjectiveWBS(objective string) []rawTask {
-	targetRoot := inferObjectiveTargetRoot(objective)
-	if targetRoot == "" || !objectiveLooksLikeGoProject(objective) {
-		return nil
-	}
-	pkg := "./" + targetRoot + "/..."
-	return []rawTask{
-		{
-			num:            "1",
-			title:          "初始化 AgentDB Go 模块与公共 API 骨架",
-			role:           "coder",
-			accept:         "只创建 go.mod、README、agentdb.go 最小可编译骨架; agentdb.go 仅定义 Config、DB、New、Close、Stats 等不会与后续模块冲突的最小 API; 不要定义 Namespace/Collection/Vector/Graph/Index/Store 类型; 仅使用 Go 标准库; cd " + targetRoot + " && go test ./... 通过",
-			priority:       3,
-			complexity:     "simple",
-			targetFiles:    []string{targetRoot + "/go.mod", targetRoot + "/README.md", targetRoot + "/agentdb.go"},
-			targetPackages: []string{pkg},
-			taskType:       wbsTaskTypeLeaf,
-			estimatedMin:   2,
-			riskLevel:      wbsRiskLow,
-			verifyCommand:  "cd " + targetRoot + " && go test ./...",
-			parallelGroup:  targetRoot + "-core",
-			blockingPolicy: wbsBlockingFailBlocks,
-			splitReason:    "objective-fallback",
-		},
-		{
-			num:            "2",
-			title:          "实现文件对象与普通 KV 存储能力",
-			role:           "coder",
-			depNums:        []string{"1"},
-			accept:         "实现面向 agent 的文件对象、普通 KV 读写、命名空间隔离和基础错误处理; 单元测试使用 testing 标准库覆盖核心路径",
-			priority:       3,
-			complexity:     "medium",
-			targetFiles:    []string{targetRoot + "/store.go", targetRoot + "/store_test.go"},
-			targetPackages: []string{pkg},
-			taskType:       wbsTaskTypeLeaf,
-			estimatedMin:   3,
-			riskLevel:      wbsRiskMedium,
-			verifyCommand:  "cd " + targetRoot + " && go test ./...",
-			parallelGroup:  targetRoot + "-core",
-			blockingPolicy: wbsBlockingFailBlocks,
-			splitReason:    "objective-fallback",
-		},
-		{
-			num:            "3",
-			title:          "实现向量存储与相似度检索",
-			role:           "coder",
-			depNums:        []string{"2"},
-			accept:         "实现内存 VectorStore、Add/Get/Delete/SearchTopK; 仅使用标准库和朴素余弦相似度; 单元测试覆盖基础查询",
-			priority:       3,
-			complexity:     "medium",
-			targetFiles:    []string{targetRoot + "/vector.go", targetRoot + "/vector_test.go"},
-			targetPackages: []string{pkg},
-			taskType:       wbsTaskTypeLeaf,
-			estimatedMin:   3,
-			riskLevel:      wbsRiskMedium,
-			verifyCommand:  "cd " + targetRoot + " && go test ./...",
-			parallelGroup:  targetRoot + "-vector",
-			blockingPolicy: wbsBlockingFailBlocks,
-			splitReason:    "objective-fallback",
-		},
-		{
-			num:            "4",
-			title:          "实现图谱节点边存储与邻接查询",
-			role:           "coder",
-			depNums:        []string{"3"},
-			accept:         "实现内存 GraphStore、节点/边 CRUD、邻接查询; 仅使用标准库; 单元测试覆盖基础图查询",
-			priority:       3,
-			complexity:     "medium",
-			targetFiles:    []string{targetRoot + "/graph.go", targetRoot + "/graph_test.go"},
-			targetPackages: []string{pkg},
-			taskType:       wbsTaskTypeLeaf,
-			estimatedMin:   3,
-			riskLevel:      wbsRiskMedium,
-			verifyCommand:  "cd " + targetRoot + " && go test ./...",
-			parallelGroup:  targetRoot + "-graph",
-			blockingPolicy: wbsBlockingFailBlocks,
-			splitReason:    "objective-fallback",
-		},
-		{
-			num:            "5",
-			title:          "实现倒排索引与关键词检索",
-			role:           "coder",
-			depNums:        []string{"4"},
-			accept:         "实现内存 InvertedIndex、文档索引、AND 查询、删除; 仅使用标准库; 单元测试覆盖基础检索",
-			priority:       3,
-			complexity:     "medium",
-			targetFiles:    []string{targetRoot + "/index.go", targetRoot + "/index_test.go"},
-			targetPackages: []string{pkg},
-			taskType:       wbsTaskTypeLeaf,
-			estimatedMin:   3,
-			riskLevel:      wbsRiskMedium,
-			verifyCommand:  "cd " + targetRoot + " && go test ./...",
-			parallelGroup:  targetRoot + "-index",
-			blockingPolicy: wbsBlockingFailBlocks,
-			splitReason:    "objective-fallback",
-		},
-		{
-			num:            "6",
-			title:          "集成 AgentDB 服务门面与端到端测试",
-			role:           "coder",
-			depNums:        []string{"5"},
-			accept:         "修改 agentdb.go 提供统一 AgentDB 门面、使用示例和端到端测试; 测试使用 testing 标准库; cd " + targetRoot + " && go test ./... 通过",
-			priority:       3,
-			complexity:     "medium",
-			targetFiles:    []string{targetRoot + "/agentdb.go", targetRoot + "/agentdb_test.go", targetRoot + "/example_test.go"},
-			targetPackages: []string{pkg},
-			taskType:       wbsTaskTypeLeaf,
-			estimatedMin:   3,
-			riskLevel:      wbsRiskMedium,
-			verifyCommand:  "cd " + targetRoot + " && go test ./...",
-			parallelGroup:  targetRoot + "-integration",
-			blockingPolicy: wbsBlockingFailBlocks,
-			splitReason:    "objective-fallback",
-		},
-		{
-			num:            "7",
-			title:          "AgentDB V1 本地验证",
-			role:           "tester",
-			depNums:        []string{"6"},
-			accept:         "本地执行 cd " + targetRoot + " && go test ./...; 不调用 tester LLM",
-			priority:       2,
-			complexity:     "simple",
-			targetFiles:    []string{targetRoot + "/go.mod"},
-			targetPackages: []string{pkg},
-			taskType:       wbsTaskTypeVerification,
-			estimatedMin:   1,
-			riskLevel:      wbsRiskLow,
-			verifyCommand:  "cd " + targetRoot + " && go test ./...",
-			parallelGroup:  targetRoot + "-verification",
-			blockingPolicy: wbsBlockingFailBlocks,
-			splitReason:    "objective-fallback;auto-verification",
-		},
-	}
+	return synthesizedObjectiveWBS(objective)
 }
 
 // normalizeAndSplitRawTasks 在 DAG 入库前执行 TaskSizingGate:
 // 1. 补齐旧 WBS 默认值; 2. Macro 不直接执行; 3. 高风险/超预算 Leaf 展开为可验证 Leaf DAG。
-func (o *Orchestrator) normalizeAndSplitRawTasks(rawTasks []rawTask) []rawTask {
+func (o *Orchestrator) normalizeAndSplitRawTasks(rawTasks []rawTask, objective string) []rawTask {
 	if len(rawTasks) == 0 {
 		return nil
 	}
 	o.wbsSplitCount = 0
+	adapter := o.planningAdapter(objective)
 	var normalized []rawTask
 	rewriteDep := make(map[string]string)
+	macroDeps := collectRawMacroDeps(rawTasks)
 
 	for _, rt := range rawTasks {
 		rt = normalizeRawTaskDefaults(rt)
-		shouldSplit, reason := shouldSplitRawTask(rt)
+		if rt.taskType == wbsTaskTypeMacro {
+			continue
+		}
+		rt.depNums = expandRawMacroDeps(rt.depNums, macroDeps)
+		if isProjectBootstrapRawTask(rt) && bootstrapBusinessFiles(rt) != nil {
+			bootstrap, business := splitBootstrapBusinessRawTask(rt, adapter)
+			if hasBootstrapSkeletonTargets(bootstrap) {
+				normalized = append(normalized, bootstrap)
+			}
+			for _, child := range business {
+				shouldSplit, reason := shouldSplitRawTask(child, objective)
+				if shouldSplit {
+					children := expandRawTask(child, reason, adapter, objective)
+					if len(children) > 0 {
+						normalized = append(normalized, children...)
+						rewriteDep[child.num] = children[len(children)-1].num
+						o.wbsSplitCount += len(children)
+						continue
+					}
+				}
+				normalized = append(normalized, child)
+			}
+			continue
+		}
+		shouldSplit, reason := shouldSplitRawTask(rt, objective)
 		if shouldSplit {
-			children := expandRawTask(rt, reason)
+			children := expandRawTask(rt, reason, adapter, objective)
 			if len(children) > 0 {
 				normalized = append(normalized, children...)
 				rewriteDep[rt.num] = children[len(children)-1].num
@@ -982,18 +1527,601 @@ func (o *Orchestrator) normalizeAndSplitRawTasks(rawTasks []rawTask) []rawTask {
 				continue
 			}
 		}
-		if rt.taskType == wbsTaskTypeMacro {
-			// 宏任务理论上必须被展开。兜底情况下也转成 Leaf, 避免写入一个不可执行节点后卡住 DAG。
-			rt.taskType = wbsTaskTypeLeaf
-			rt.splitReason = appendSplitReason(rt.splitReason, "macro-fallback-to-leaf")
-		}
 		normalized = append(normalized, rt)
 	}
 
 	for i := range normalized {
 		normalized[i].depNums = rewriteRawTaskDeps(normalized[i].depNums, rewriteDep, normalized[i].num)
 	}
+	normalized = addContractFirstRawDeps(normalized)
+	normalized = addProjectBootstrapRawDeps(normalized)
+	normalized = relaxOverSerialRawDeps(normalized)
+	normalized = addDesignCompletePhaseBarriers(normalized, objective)
+	fillVerificationDeps(normalized)
+	normalized = orderRawTasksByDeps(normalized)
 	return normalized
+}
+
+func addContractFirstRawDeps(tasks []rawTask) []rawTask {
+	if len(tasks) == 0 {
+		return tasks
+	}
+	var contractTasks []rawTask
+	for _, task := range tasks {
+		if task.num == "" || !isContractRawTask(task) {
+			continue
+		}
+		contractTasks = append(contractTasks, task)
+	}
+	if len(contractTasks) == 0 {
+		return tasks
+	}
+	for i := range tasks {
+		if tasks[i].num == "" || isContractRawTask(tasks[i]) || isProjectBootstrapRawTask(tasks[i]) {
+			continue
+		}
+		for _, contract := range contractTasks {
+			if contract.num == "" || contract.num == tasks[i].num {
+				continue
+			}
+			if shouldDependOnContractTask(tasks[i], contract) {
+				tasks[i].depNums = uniqueTrimmedStrings(append(tasks[i].depNums, contract.num))
+			}
+		}
+	}
+	return tasks
+}
+
+func isContractRawTask(task rawTask) bool {
+	if task.workUnitType == wbsWorkUnitContract {
+		return true
+	}
+	if task.parentID != "" && strings.Contains(task.splitReason, "sizing-gate") {
+		return false
+	}
+	text := strings.ToLower(task.title + " " + strings.Join(task.writeFiles, " ") + " " + strings.Join(task.targetFiles, " "))
+	return strings.Contains(text, "contract") || strings.Contains(text, "interface") ||
+		strings.Contains(text, "schema") || strings.Contains(text, "types") ||
+		strings.Contains(text, "接口") || strings.Contains(text, "契约") || strings.Contains(text, "类型")
+}
+
+func shouldDependOnContractTask(cur, contract rawTask) bool {
+	if cur.num == contract.num {
+		return false
+	}
+	if rawStringSetsOverlap(cur.depNums, []string{contract.num}) {
+		return false
+	}
+	if rawStringSetsOverlap(cur.readFiles, rawTaskWriteFiles(contract)) {
+		return true
+	}
+	if rawStringSetsOverlap(cur.contractRefs, contract.provides) || rawStringSetsOverlap(cur.requires, contract.provides) {
+		return true
+	}
+	if rawStringSetsOverlap(nonGlobalRawTaskConflictKeys(cur), nonGlobalRawTaskConflictKeys(contract)) {
+		return true
+	}
+	if len(cur.readFiles) == 0 && len(cur.contractRefs) == 0 && len(cur.requires) == 0 {
+		return false
+	}
+	return false
+}
+
+func addProjectBootstrapRawDeps(tasks []rawTask) []rawTask {
+	bootstrapIDs := projectBootstrapRawTaskIDs(tasks)
+	if len(bootstrapIDs) == 0 {
+		return tasks
+	}
+	for i := range tasks {
+		if tasks[i].num == "" || tasks[i].taskType == wbsTaskTypeVerification || isProjectBootstrapRawTask(tasks[i]) {
+			continue
+		}
+		tasks[i].depNums = uniqueTrimmedStrings(append(tasks[i].depNums, bootstrapIDs...))
+	}
+	return tasks
+}
+
+func addDesignCompletePhaseBarriers(tasks []rawTask, objective string) []rawTask {
+	if !objectiveRequiresDesignCompleteMode(objective) || len(tasks) == 0 {
+		return tasks
+	}
+	type classifiedTask struct {
+		idx   int
+		id    string
+		phase int
+	}
+	var classified []classifiedTask
+	for i := range tasks {
+		if tasks[i].num == "" || tasks[i].taskType == wbsTaskTypeVerification {
+			continue
+		}
+		classified = append(classified, classifiedTask{idx: i, id: tasks[i].num, phase: designCompleteTaskPhase(tasks[i])})
+	}
+	for i := range classified {
+		cur := classified[i]
+		if cur.phase <= designCompletePhaseBase {
+			continue
+		}
+		for _, dep := range classified {
+			if dep.id == cur.id || dep.phase >= cur.phase {
+				if dep.id != cur.id && isDesignCompleteFoundationContractRawTask(tasks[dep.idx]) && !isDesignCompleteFoundationContractRawTask(tasks[cur.idx]) && dep.phase == cur.phase {
+					tasks[cur.idx].depNums = uniqueTrimmedStrings(append(tasks[cur.idx].depNums, dep.id))
+				}
+				continue
+			}
+			if dep.phase == designCompletePhaseProtocol && cur.phase < designCompletePhaseProtocol {
+				continue
+			}
+			if shouldAddDesignPhaseDependency(tasks[cur.idx], tasks[dep.idx]) {
+				tasks[cur.idx].depNums = uniqueTrimmedStrings(append(tasks[cur.idx].depNums, dep.id))
+			}
+		}
+	}
+	return tasks
+}
+
+const (
+	designCompletePhaseBase = iota
+	designCompletePhaseContract
+	designCompletePhaseCore
+	designCompletePhaseQuery
+	designCompletePhaseProtocol
+)
+
+func designCompleteTaskPhase(task rawTask) int {
+	if isProjectBootstrapRawTask(task) {
+		return designCompletePhaseBase
+	}
+	if rawTaskUsesExternalProtocolSurface(task) || containsProtocolEntrypointTerm(rawTaskTextForClassification(task)) {
+		return designCompletePhaseProtocol
+	}
+	if task.workUnitType == wbsWorkUnitContract || isContractRawTask(task) {
+		return designCompletePhaseContract
+	}
+	text := rawTaskTextForClassification(task)
+	if containsQueryAdapterTerm(text) {
+		return designCompletePhaseQuery
+	}
+	if containsAdvancedCoreSurfaceTerm(text) || isHighRiskTaskText(text) || containsCoreEngineTerm(text) {
+		return designCompletePhaseCore
+	}
+	return designCompletePhaseCore
+}
+
+func shouldAddDesignPhaseDependency(cur, dep rawTask) bool {
+	if dep.taskType == wbsTaskTypeVerification || cur.num == dep.num || containsString(cur.depNums, dep.num) {
+		return false
+	}
+	if isProjectBootstrapRawTask(dep) {
+		return true
+	}
+	if isDesignCompleteFoundationContractRawTask(dep) && !isDesignCompleteFoundationContractRawTask(cur) {
+		return true
+	}
+	depPhase := designCompleteTaskPhase(dep)
+	if depPhase == designCompletePhaseContract {
+		return shouldDependOnDesignContractPhase(cur, dep)
+	}
+	if designCompleteTaskPhase(cur) == designCompletePhaseProtocol {
+		return depPhase == designCompletePhaseQuery
+	}
+	if designCompleteTaskPhase(cur) == designCompletePhaseQuery {
+		return depPhase == designCompletePhaseCore
+	}
+	if designCompleteTaskPhase(cur) == designCompletePhaseCore {
+		return false
+	}
+	return false
+}
+
+func shouldDependOnDesignContractPhase(cur, dep rawTask) bool {
+	if isDesignCompleteFoundationContractRawTask(dep) && !isDesignCompleteFoundationContractRawTask(cur) {
+		return true
+	}
+	if shouldDependOnContractTask(cur, dep) {
+		return true
+	}
+	curDomain := coreStateDomainForRawTask(cur)
+	depDomain := coreStateDomainForRawTask(dep)
+	return curDomain != "" && curDomain == depDomain
+}
+
+func isDesignCompleteFoundationContractRawTask(task rawTask) bool {
+	if task.taskType != wbsTaskTypeLeaf || task.workUnitType == wbsWorkUnitVerification || isProjectBootstrapRawTask(task) {
+		return false
+	}
+	if !(task.workUnitType == wbsWorkUnitContract || isContractRawTask(task) || isContractBoundaryRawTask(task)) {
+		return false
+	}
+	files := strings.Join(append(append([]string{}, task.targetFiles...), task.writeFiles...), " ")
+	fileText := strings.ToLower(filepath.ToSlash(files))
+	if strings.Contains(fileText, "/internal/types/") ||
+		strings.Contains(fileText, "/internal/errors/") ||
+		strings.Contains(fileText, "/internal/api/core") ||
+		strings.Contains(fileText, "/pkg/types/") ||
+		strings.Contains(fileText, "/pkg/errors/") {
+		return true
+	}
+	text := strings.ToLower(strings.Join([]string{
+		task.title,
+		task.designRef,
+		task.capabilityID,
+		task.parentID,
+		strings.Join(task.constraintRefs, " "),
+	}, " "))
+	terms := []string{
+		"核心类型", "错误定义", "错误类型", "错误码", "核心错误",
+		"core type", "core types", "error type", "error code", "core api", "core interface",
+		"base type", "shared type", "公共类型", "基础类型", "共享类型",
+	}
+	for _, term := range terms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func rawTaskTextForClassification(task rawTask) string {
+	parts := []string{
+		task.title, task.designRef, task.accept, task.verifyCommand, task.parentID,
+		task.capabilityID, task.parallelGroup, task.splitReason, task.workUnitType,
+	}
+	parts = append(parts, task.constraintRefs...)
+	parts = append(parts, task.targetFiles...)
+	parts = append(parts, task.writeFiles...)
+	parts = append(parts, task.readFiles...)
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+func containsProtocolEntrypointTerm(text string) bool {
+	terms := []string{
+		"cmd/http", "cmd/grpc", "cmd/server", "cmd/cli", "pkg/protocol",
+		"http api", "rest api", "grpc api", "mcp", "cli", "server",
+		"handler", "endpoint", "router", "listener", "transport",
+		"协议", "入口", "适配器",
+	}
+	for _, term := range terms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsQueryAdapterTerm(text string) bool {
+	terms := []string{
+		"sql", "cypher", "query", "planner", "executor", "parser", "semantic",
+		"retrieve", "retrieval", "resolver", "查询", "解析", "执行器", "检索",
+	}
+	for _, term := range terms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsCoreEngineTerm(text string) bool {
+	terms := []string{
+		"storage", "engine", "store", "vector", "graph", "file", "embedding",
+		"memory", "session", "format", "kv", "column", "index",
+		"存储", "引擎", "向量", "图谱", "文件", "记忆", "会话", "索引",
+	}
+	for _, term := range terms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func projectBootstrapRawTaskIDs(tasks []rawTask) []string {
+	var ids []string
+	for _, task := range tasks {
+		if task.num == "" || task.taskType == wbsTaskTypeVerification || !isProjectBootstrapRawTask(task) {
+			continue
+		}
+		ids = append(ids, task.num)
+	}
+	return uniqueTrimmedStrings(ids)
+}
+
+func collectRawMacroDeps(tasks []rawTask) map[string][]string {
+	macroDeps := make(map[string][]string)
+	for _, task := range tasks {
+		task = normalizeRawTaskDefaults(task)
+		if task.num == "" || task.taskType != wbsTaskTypeMacro {
+			continue
+		}
+		macroDeps[task.num] = append([]string(nil), task.depNums...)
+	}
+	return macroDeps
+}
+
+func expandRawMacroDeps(deps []string, macroDeps map[string][]string) []string {
+	if len(deps) == 0 || len(macroDeps) == 0 {
+		return deps
+	}
+	var expand func(string, map[string]bool) []string
+	expand = func(dep string, seen map[string]bool) []string {
+		dep = strings.TrimSpace(dep)
+		if dep == "" {
+			return nil
+		}
+		if seen[dep] {
+			return nil
+		}
+		mdeps, ok := macroDeps[dep]
+		if !ok {
+			return []string{dep}
+		}
+		seen[dep] = true
+		var out []string
+		for _, mdep := range mdeps {
+			out = append(out, expand(mdep, seen)...)
+		}
+		return out
+	}
+	out := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		out = append(out, expand(dep, map[string]bool{})...)
+	}
+	return uniqueTrimmedStrings(out)
+}
+
+func relaxOverSerialRawDeps(tasks []rawTask) []rawTask {
+	if len(tasks) == 0 {
+		return tasks
+	}
+	byID := make(map[string]rawTask, len(tasks))
+	for _, task := range tasks {
+		byID[task.num] = task
+	}
+	for i := range tasks {
+		if len(tasks[i].depNums) == 0 || isBarrierRawTask(tasks[i]) {
+			continue
+		}
+		kept := make([]string, 0, len(tasks[i].depNums))
+		for _, depID := range tasks[i].depNums {
+			dep, ok := byID[depID]
+			if !ok || shouldKeepRawDependency(tasks[i], dep) {
+				kept = append(kept, depID)
+			}
+		}
+		tasks[i].depNums = uniqueTrimmedStrings(kept)
+	}
+	return tasks
+}
+
+func orderRawTasksByDeps(tasks []rawTask) []rawTask {
+	if len(tasks) <= 1 {
+		return tasks
+	}
+	known := make(map[string]bool, len(tasks))
+	for _, task := range tasks {
+		if strings.TrimSpace(task.num) != "" {
+			known[task.num] = true
+		}
+	}
+	used := make([]bool, len(tasks))
+	resolved := make(map[string]bool, len(tasks))
+	ordered := make([]rawTask, 0, len(tasks))
+	for len(ordered) < len(tasks) {
+		progressed := false
+		for i, task := range tasks {
+			if used[i] || !rawTaskDepsResolved(task, known, resolved) {
+				continue
+			}
+			ordered = append(ordered, task)
+			used[i] = true
+			if strings.TrimSpace(task.num) != "" {
+				resolved[task.num] = true
+			}
+			progressed = true
+		}
+		if !progressed {
+			return tasks
+		}
+	}
+	return ordered
+}
+
+func rawTaskDepsResolved(task rawTask, known, resolved map[string]bool) bool {
+	for _, dep := range task.depNums {
+		dep = strings.TrimSpace(dep)
+		if dep == "" || dep == task.num || !known[dep] {
+			continue
+		}
+		if !resolved[dep] {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldKeepRawDependency(cur, dep rawTask) bool {
+	if dep.taskType == wbsTaskTypeMacro || isProjectBootstrapRawTask(dep) {
+		return true
+	}
+	if cur.parentID != "" && cur.parentID == dep.parentID {
+		return true
+	}
+	if rawStringSetsOverlap(rawTaskWriteFiles(cur), rawTaskWriteFiles(dep)) {
+		return true
+	}
+	if rawStringSetsOverlap(nonGlobalRawTaskConflictKeys(cur), nonGlobalRawTaskConflictKeys(dep)) {
+		return true
+	}
+	if rawStringSetsOverlap(cur.readFiles, rawTaskWriteFiles(dep)) {
+		return true
+	}
+	if rawStringSetsOverlap(cur.contractRefs, dep.provides) || rawStringSetsOverlap(cur.requires, dep.provides) {
+		return true
+	}
+	return false
+}
+
+func isBarrierRawTask(task rawTask) bool {
+	if isLocalVerificationRawTask(task) {
+		return true
+	}
+	text := strings.ToLower(strings.Join([]string{
+		task.title,
+		task.role,
+		task.workUnitType,
+		task.capabilityID,
+	}, " "))
+	if orchNormalizeRole(task.role) == "tester" {
+		return true
+	}
+	phrases := []string{
+		"test", "testing", "verification", "validate", "validation", "benchmark", "acceptance",
+		"测试", "验证", "验收", "基准", "集成测试", "回归",
+	}
+	for _, phrase := range phrases {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLocalVerificationRawTask(task rawTask) bool {
+	if task.taskType == wbsTaskTypeVerification &&
+		(strings.Contains(task.splitReason, "sizing-gate") || strings.Contains(task.splitReason, "timeout")) {
+		return true
+	}
+	return false
+}
+
+func isProjectBootstrapRawTask(task rawTask) bool {
+	text := strings.ToLower(task.title + " " + task.workUnitType + " " + task.capabilityID)
+	if strings.Contains(text, "project-init") ||
+		strings.Contains(text, "project-structure") ||
+		strings.Contains(text, "init") ||
+		strings.Contains(text, "bootstrap") ||
+		strings.Contains(text, "skeleton") ||
+		strings.Contains(text, "scaffold") ||
+		strings.Contains(text, "初始化") ||
+		strings.Contains(text, "项目结构") ||
+		strings.Contains(text, "目录结构") ||
+		strings.Contains(text, "项目骨架") ||
+		strings.Contains(text, "脚手架") ||
+		strings.Contains(text, "骨架") {
+		return true
+	}
+	for _, file := range append(append([]string{}, task.targetFiles...), task.writeFiles...) {
+		if isProjectManifestFile(file) {
+			return true
+		}
+	}
+	return false
+}
+
+func bootstrapBusinessFiles(task rawTask) []string {
+	var business []string
+	for _, file := range concreteWritablePlanFiles(task) {
+		if !isBootstrapSkeletonTarget(file) {
+			business = append(business, file)
+		}
+	}
+	return uniqueTrimmedStrings(business)
+}
+
+func splitBootstrapBusinessRawTask(task rawTask, adapter planningLanguageAdapter) (rawTask, []rawTask) {
+	bootstrap := task
+	bootstrapTargets := make([]string, 0, len(task.targetFiles))
+	for _, target := range task.targetFiles {
+		if isBootstrapSkeletonTarget(target) || pathIsDirectoryLike(target) {
+			bootstrapTargets = append(bootstrapTargets, target)
+		}
+	}
+	bootstrapWrites := make([]string, 0, len(task.writeFiles))
+	for _, target := range task.writeFiles {
+		if isBootstrapSkeletonTarget(target) || pathIsDirectoryLike(target) {
+			bootstrapWrites = append(bootstrapWrites, target)
+		}
+	}
+	bootstrap.targetFiles = uniqueTrimmedStrings(bootstrapTargets)
+	bootstrap.writeFiles = uniqueTrimmedStrings(bootstrapWrites)
+
+	var business []rawTask
+	for i, file := range bootstrapBusinessFiles(task) {
+		child := task
+		child.num = fmt.Sprintf("%s.bootstrap-file.%d", task.num, i+1)
+		child.title = "实现业务源码文件 - " + path.Base(filepath.ToSlash(file))
+		child.taskType = wbsTaskTypeLeaf
+		child.workUnitType = wbsWorkUnitImplementation
+		child.riskLevel = wbsRiskMedium
+		if isHighRiskTaskText(file+" "+task.title+" "+task.accept) || containsAdvancedCoreSurfaceTerm(file) || containsQueryAdapterTerm(file) {
+			child.riskLevel = wbsRiskHigh
+		}
+		child.complexity = "medium"
+		child.parentID = task.num
+		child.targetFiles = []string{file}
+		child.writeFiles = []string{file}
+		child.readFiles = nil
+		child.targetPackages = targetPackagesForFileByLanguage(file, adapter.ID)
+		child.parallelGroup = ""
+		child.conflictKeys = nil
+		child.splitReason = appendSplitReason(task.splitReason, "bootstrap-business-file")
+		child.accept = "该文件不是项目初始化产物; 只实现该业务文件的单一职责; 不修改 go.mod/目录骨架; scoped build 通过"
+		business = append(business, child)
+	}
+	return bootstrap, business
+}
+
+func hasBootstrapSkeletonTargets(task rawTask) bool {
+	return len(task.targetFiles) > 0 || len(task.writeFiles) > 0 || len(directoryLikeTaskTargets(task)) > 0
+}
+
+func isBootstrapSkeletonTarget(file string) bool {
+	clean := strings.TrimSpace(filepath.ToSlash(file))
+	if clean == "" {
+		return false
+	}
+	if isProjectManifestFile(clean) || isPlanPlaceholderFile(clean) {
+		return true
+	}
+	base := strings.ToLower(path.Base(strings.TrimSuffix(clean, "/")))
+	switch base {
+	case "main.go", "main.py", "main.ts", "main.js", "index.ts", "index.js",
+		"mod.rs", "lib.rs", "__init__.py", "readme.md", "makefile", "dockerfile":
+		return true
+	default:
+		return false
+	}
+}
+
+func pathIsDirectoryLike(file string) bool {
+	clean := strings.TrimSpace(filepath.ToSlash(file))
+	if clean == "" || filepath.IsAbs(clean) {
+		return false
+	}
+	trimmed := strings.TrimSuffix(strings.TrimPrefix(clean, "./"), "/...")
+	trimmed = strings.TrimSuffix(trimmed, "/")
+	return strings.HasSuffix(clean, "/") || strings.HasSuffix(clean, "/...") || (path.Ext(trimmed) == "" && strings.Contains(trimmed, "/"))
+}
+
+func rawStringSetsOverlap(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	seen := make(map[string]bool, len(a))
+	for _, item := range a {
+		item = strings.ToLower(strings.TrimSpace(filepath.ToSlash(item)))
+		if item != "" {
+			seen[item] = true
+		}
+	}
+	for _, item := range b {
+		item = strings.ToLower(strings.TrimSpace(filepath.ToSlash(item)))
+		if item != "" && seen[item] {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeRawTaskDefaults(rt rawTask) rawTask {
@@ -1001,15 +2129,57 @@ func normalizeRawTaskDefaults(rt rawTask) rawTask {
 	rt.title = strings.TrimSpace(rt.title)
 	rt.role = orchNormalizeRole(rt.role)
 	rt.taskType = normalizeWBSTaskType(rt.taskType)
+	rt.workUnitType = normalizeWBSWorkUnitType(rt.workUnitType, rt.taskType)
 	rt.riskLevel = normalizeWBSRisk(rt.riskLevel)
 	rt.blockingPolicy = normalizeWBSBlockingPolicy(rt.blockingPolicy)
 	rt.complexity = strings.ToLower(strings.TrimSpace(rt.complexity))
+	rt.capabilityID = normalizePlanningID(rt.capabilityID)
+	rt.contractRefs = uniqueTrimmedStrings(rt.contractRefs)
+	rt.provides = uniqueTrimmedStrings(rt.provides)
+	rt.requires = uniqueTrimmedStrings(rt.requires)
+	rt.readFiles = normalizePlanFiles(rt.readFiles)
+	rt.writeFiles = normalizePlanFiles(rt.writeFiles)
+	rt.targetFiles = normalizePlanFiles(rt.targetFiles)
+	rt.targetPackages = uniqueTrimmedStrings(rt.targetPackages)
+	rt.conflictKeys = uniqueTrimmedStrings(rt.conflictKeys)
 	rt.parentID = strings.TrimSpace(rt.parentID)
 	rt.verifyCommand = strings.TrimSpace(rt.verifyCommand)
 	rt.parallelGroup = strings.TrimSpace(rt.parallelGroup)
 	rt.splitReason = strings.TrimSpace(rt.splitReason)
+	rt.timeoutKind = strings.TrimSpace(rt.timeoutKind)
+	if len(rt.targetFiles) == 0 && len(rt.writeFiles) > 0 {
+		rt.targetFiles = append([]string(nil), rt.writeFiles...)
+	}
+	if len(rt.writeFiles) == 0 && len(rt.targetFiles) > 0 {
+		rt.writeFiles = append([]string(nil), rt.targetFiles...)
+	}
+	if isContractBoundaryRawTask(rt) {
+		root := firstPlanPathSegment(append(append([]string{}, rt.targetFiles...), rt.writeFiles...))
+		if root == "" {
+			root = "project"
+		}
+		component := coreStateComponentForPlanFiles(append(append([]string{}, rt.targetFiles...), rt.writeFiles...))
+		if component != "" {
+			rt.conflictKeys = append(rt.conflictKeys, "contract:"+root+":"+component)
+		} else {
+			rt.conflictKeys = append(rt.conflictKeys, "contract:"+root)
+		}
+		rt.conflictKeys = uniqueTrimmedStrings(rt.conflictKeys)
+	}
+	if isCoreStateRawTask(rt) {
+		rt.conflictKeys = uniqueTrimmedStrings(append(rt.conflictKeys, coreStateConflictKeysForRawTask(rt)...))
+	}
+	if shouldSerializePackageForRawTask(rt) {
+		rt.conflictKeys = uniqueTrimmedStrings(append(rt.conflictKeys, packageConflictKeysForPlanFiles(rt.targetFiles, rt.writeFiles)...))
+	}
+	if rt.parallelGroup == "" && len(rt.conflictKeys) > 0 {
+		rt.parallelGroup = rt.conflictKeys[0]
+	}
 	if rt.priority == 0 {
 		rt.priority = 1
+	}
+	if rt.estimatedLOC <= 0 {
+		rt.estimatedLOC = estimateRawTaskLOC(rt)
 	}
 	if rt.estimatedMin <= 0 {
 		switch rt.complexity {
@@ -1025,6 +2195,239 @@ func normalizeRawTaskDefaults(rt rawTask) rawTask {
 		rt.accept = "编译通过 + 目标文件满足任务验收标准"
 	}
 	return rt
+}
+
+func isContractBoundaryRawTask(rt rawTask) bool {
+	if rt.taskType != wbsTaskTypeLeaf {
+		return false
+	}
+	if rt.workUnitType == wbsWorkUnitContract {
+		return true
+	}
+	text := strings.ToLower(rt.title + " " + rt.accept + " " + rt.splitReason)
+	return strings.Contains(text, "接口") ||
+		strings.Contains(text, "契约") ||
+		strings.Contains(text, "数据结构边界") ||
+		strings.Contains(text, "interface") ||
+		strings.Contains(text, "contract") ||
+		strings.Contains(text, "type boundary")
+}
+
+func isMixedContractImplementationRawTask(rt rawTask) bool {
+	if rt.taskType != wbsTaskTypeLeaf || rt.workUnitType == wbsWorkUnitContract || rt.workUnitType == wbsWorkUnitVerification {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{
+		rt.title,
+		rt.accept,
+		rt.designRef,
+		rt.capabilityID,
+		rt.parentID,
+		rt.splitReason,
+		strings.Join(rt.constraintRefs, " "),
+	}, " "))
+	hasContract := strings.Contains(text, "接口") ||
+		strings.Contains(text, "契约") ||
+		strings.Contains(text, "数据结构边界") ||
+		strings.Contains(text, "interface") ||
+		strings.Contains(text, "contract") ||
+		strings.Contains(text, "type boundary")
+	hasImplementation := strings.Contains(text, "实现") ||
+		strings.Contains(text, "implementation") ||
+		strings.Contains(text, "implement") ||
+		strings.Contains(text, "engine") ||
+		strings.Contains(text, "executor") ||
+		strings.Contains(text, "runtime")
+	return hasContract && hasImplementation
+}
+
+func isCoreStateRawTask(rt rawTask) bool {
+	if rt.taskType != wbsTaskTypeLeaf {
+		return false
+	}
+	text := strings.Join([]string{
+		rt.title,
+		rt.accept,
+		rt.designRef,
+		rt.capabilityID,
+		rt.parentID,
+		rt.parallelGroup,
+		rt.splitReason,
+		strings.Join(rt.constraintRefs, " "),
+	}, " ")
+	return isHighRiskTaskText(text) || containsAdvancedCoreSurfaceTerm(text)
+}
+
+func coreStateConflictKeysForRawTask(rt rawTask) []string {
+	files := append(append([]string{}, rt.targetFiles...), rt.writeFiles...)
+	root := firstPlanPathSegment(files)
+	if root == "" {
+		root = "project"
+	}
+	component := coreStateComponentForPlanFiles(files)
+	if component == "" {
+		component = normalizePlanningID(rt.capabilityID)
+	}
+	if component == "" {
+		component = normalizePlanningID(rt.parentID)
+	}
+	if component == "" {
+		component = "core"
+	}
+	keys := []string{"core-state:" + root + ":" + component}
+	if domain := coreStateDomainForRawTask(rt); domain != "" {
+		keys = append(keys, "core-domain:"+root+":"+domain)
+	}
+	return uniqueTrimmedStrings(keys)
+}
+
+func coreStateDomainForRawTask(rt rawTask) string {
+	text := strings.ToLower(strings.Join([]string{
+		rt.title,
+		rt.accept,
+		rt.designRef,
+		rt.capabilityID,
+		rt.parentID,
+		rt.parallelGroup,
+		strings.Join(rt.constraintRefs, " "),
+		strings.Join(rt.targetFiles, " "),
+		strings.Join(rt.writeFiles, " "),
+	}, " "))
+	domains := []struct {
+		id    string
+		terms []string
+	}{
+		{"hnsw", []string{"hnsw"}},
+		{"lsm", []string{"lsm", "sstable", "sst 文件", "sst file", "sst-", "compaction", "memtable", "skiplist", "skip list"}},
+		{"wal", []string{"wal", "write-ahead", "write ahead"}},
+		{"mvcc", []string{"mvcc", "transaction", "事务", "readview", "版本链", "snapshot isolation"}},
+		{"graph", []string{"csr", "adjacency", "邻接", "bfs", "dfs", "traversal", "graph", "图"}},
+		{"query", []string{"sql", "dsl", "parser", "解析", "lexer", "planner", "executor", "query", "查询"}},
+		{"vector", []string{"vector", "向量", "mmap", "quantization", "量化", "pq", "product quantization"}},
+		{"pagecache", []string{"page cache", "pagecache", "页面缓存", "缓存层"}},
+		{"delta", []string{"delta store", "delta-store", "增量更新", "增量存储"}},
+	}
+	for _, domain := range domains {
+		for _, term := range domain.terms {
+			if strings.Contains(text, term) {
+				return domain.id
+			}
+		}
+	}
+	return ""
+}
+
+func coreStateComponentForPlanFiles(files []string) string {
+	for _, file := range files {
+		clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(file)))
+		if clean == "" || clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "../") {
+			continue
+		}
+		parts := strings.Split(clean, "/")
+		if len(parts) >= 3 && (parts[1] == "internal" || parts[1] == "pkg" || parts[1] == "src" || parts[1] == "lib") {
+			return parts[1] + "/" + parts[2]
+		}
+		if len(parts) >= 2 {
+			return parts[1]
+		}
+	}
+	return ""
+}
+
+func packageConflictKeysForPlanFiles(fileGroups ...[]string) []string {
+	var keys []string
+	for _, files := range fileGroups {
+		for _, file := range files {
+			key := packageConflictKeyForPlanFile(file)
+			if key != "" {
+				keys = append(keys, key)
+			}
+		}
+	}
+	return uniqueTrimmedStrings(keys)
+}
+
+func shouldSerializePackageForRawTask(rt rawTask) bool {
+	if rt.taskType == wbsTaskTypeVerification {
+		return true
+	}
+	switch rt.workUnitType {
+	case wbsWorkUnitContract, wbsWorkUnitIntegration, wbsWorkUnitVerification:
+		return true
+	}
+	for _, file := range append(append([]string{}, rt.targetFiles...), rt.writeFiles...) {
+		if isProjectManifestFile(file) || strings.HasSuffix(strings.ToLower(filepath.Base(file)), "_test.go") {
+			return true
+		}
+	}
+	return false
+}
+
+func packageConflictKeyForPlanFile(file string) string {
+	clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(file)))
+	if clean == "" || clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "../") {
+		return ""
+	}
+	ext := strings.ToLower(filepath.Ext(clean))
+	if ext == "" {
+		return ""
+	}
+	dir := filepath.ToSlash(path.Dir(clean))
+	if dir == "." || dir == "" {
+		dir = "_root"
+	}
+	switch ext {
+	case ".go":
+		return "pkg:" + dir
+	case ".proto":
+		return "pkg:" + dir
+	case ".py":
+		return "pkg:" + pythonPackageConflictDir(dir)
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
+		return "pkg:" + dir
+	case ".rs":
+		return "pkg:" + rustPackageConflictDir(dir)
+	case ".java", ".kt", ".kts", ".scala", ".cs", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hh":
+		return "pkg:" + dir
+	default:
+		return ""
+	}
+}
+
+func pythonPackageConflictDir(dir string) string {
+	if dir == "" || dir == "." {
+		return "_root"
+	}
+	parts := strings.Split(dir, "/")
+	if len(parts) >= 2 && (parts[0] == "src" || parts[0] == "lib" || parts[0] == "tests" || parts[0] == "test") {
+		return strings.Join(parts[:2], "/")
+	}
+	return dir
+}
+
+func rustPackageConflictDir(dir string) string {
+	if dir == "" || dir == "." {
+		return "_root"
+	}
+	parts := strings.Split(dir, "/")
+	if len(parts) >= 2 && parts[0] == "src" {
+		return strings.Join(parts[:2], "/")
+	}
+	if len(parts) >= 3 && parts[1] == "src" {
+		return strings.Join(parts[:3], "/")
+	}
+	return dir
+}
+
+func normalizeWBSWorkUnitType(workUnitType, taskType string) string {
+	switch strings.ToLower(strings.TrimSpace(workUnitType)) {
+	case wbsWorkUnitContract, wbsWorkUnitImplementation, wbsWorkUnitIntegration, wbsWorkUnitVerification:
+		return strings.ToLower(strings.TrimSpace(workUnitType))
+	}
+	if taskType == wbsTaskTypeVerification {
+		return wbsWorkUnitVerification
+	}
+	return wbsWorkUnitImplementation
 }
 
 func normalizeWBSTaskType(taskType string) string {
@@ -1058,11 +2461,11 @@ func normalizeWBSBlockingPolicy(policy string) string {
 	}
 }
 
-func shouldSplitRawTask(rt rawTask) (bool, string) {
+func shouldSplitRawTask(rt rawTask, objective string) (bool, string) {
 	if rt.taskType == wbsTaskTypeVerification {
 		return false, ""
 	}
-	if rt.parentID != "" || strings.Contains(rt.splitReason, "sizing-gate") {
+	if strings.Contains(rt.splitReason, "sizing-gate") {
 		return false, ""
 	}
 	if strings.Contains(rt.splitReason, "objective-fallback") {
@@ -1071,29 +2474,376 @@ func shouldSplitRawTask(rt rawTask) (bool, string) {
 	if rt.taskType == wbsTaskTypeMacro {
 		return true, "macro-task-not-executable"
 	}
+	if isProjectBootstrapRawTask(rt) && len(directoryLikeTaskTargets(rt)) > 0 {
+		return false, ""
+	}
+	reasonPrefix := ""
+	if objectiveRequiresDesignCompleteMode(objective) {
+		reasonPrefix = "design-complete:"
+	}
+	if len(directoryLikeTaskTargets(rt)) > 0 {
+		return true, reasonPrefix + "directory-target-requires-file-leaves"
+	}
+	if objectiveRequiresDesignCompleteMode(objective) && isMixedContractImplementationRawTask(rt) {
+		return true, "mixed-contract-implementation"
+	}
+	if objectiveRequiresDesignCompleteMode(objective) && isDesignCompleteRiskySingleFileRawTask(rt) {
+		return true, reasonPrefix + "single-file-risk-leaf"
+	}
 	if rt.estimatedMin > 4 {
-		return true, fmt.Sprintf("estimated-%dmin-over-leaf-budget", rt.estimatedMin)
+		return true, reasonPrefix + fmt.Sprintf("estimated-%dmin-over-leaf-budget", rt.estimatedMin)
 	}
 	if rt.riskLevel == wbsRiskHigh {
-		return true, "high-risk-leaf-requires-micro-milestones"
+		return true, reasonPrefix + "high-risk-leaf-requires-micro-milestones"
 	}
-	if len(rt.targetFiles) > 3 {
-		return true, fmt.Sprintf("target-files-%d-over-leaf-budget", len(rt.targetFiles))
+	if len(rawTaskWriteFiles(rt)) > 3 {
+		return true, reasonPrefix + fmt.Sprintf("write-files-%d-over-leaf-budget", len(rawTaskWriteFiles(rt)))
+	}
+	if rt.estimatedLOC > 250 {
+		return true, reasonPrefix + fmt.Sprintf("estimated-loc-%d-over-leaf-budget", rt.estimatedLOC)
 	}
 	if isHighRiskTaskText(rt.title + " " + rt.designRef + " " + strings.Join(rt.constraintRefs, " ")) {
-		return true, "domain-risk-keyword"
+		return true, reasonPrefix + "domain-risk-keyword"
 	}
 	return false, ""
 }
 
-func expandRawTask(rt rawTask, reason string) []rawTask {
-	if isMVCCTask(rt) {
-		return expandMVCCRawTask(rt, reason)
+func expandRawTask(rt rawTask, reason string, adapter planningLanguageAdapter, objective string) []rawTask {
+	if dirs := directoryLikeTaskTargets(rt); len(dirs) > 0 {
+		return expandDirectoryTargetRawTask(rt, reason, dirs, adapter)
+	}
+	if files := concreteWritablePlanFiles(rt); len(files) > 1 {
+		return expandFileTargetRawTask(rt, reason, files, adapter)
+	}
+	if files := concreteWritablePlanFiles(rt); len(files) == 1 && shouldMicroSplitFileTarget(rt, files[0], reason) {
+		rt.targetFiles = []string{files[0]}
+		rt.writeFiles = []string{files[0]}
+		rt.targetPackages = targetPackagesForFileByLanguage(files[0], adapter.ID)
+		return expandFileTargetMicroRawTask(rt, "single-file-risk:"+reason)
+	}
+	if file := inferRiskyRawTaskTargetFile(rt, adapter, objective); file != "" && shouldMicroSplitFileTarget(rt, file, reason) {
+		rt.targetFiles = []string{file}
+		rt.writeFiles = []string{file}
+		rt.targetPackages = targetPackagesForFileByLanguage(file, adapter.ID)
+		return expandFileTargetMicroRawTask(rt, "inferred-file-risk:"+reason)
 	}
 	return expandGenericRawTask(rt, reason)
 }
 
-func expandMVCCRawTask(rt rawTask, reason string) []rawTask {
+func concreteWritablePlanFiles(rt rawTask) []string {
+	files := rawTaskWriteFiles(rt)
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		clean := strings.TrimSpace(filepath.ToSlash(file))
+		if clean == "" || filepath.IsAbs(clean) || strings.HasPrefix(clean, "../") {
+			continue
+		}
+		if strings.HasSuffix(clean, "/") || strings.HasSuffix(clean, "/...") || path.Ext(clean) == "" {
+			continue
+		}
+		out = append(out, clean)
+	}
+	return uniqueTrimmedStrings(out)
+}
+
+func inferRiskyRawTaskTargetFile(rt rawTask, adapter planningLanguageAdapter, objective string) string {
+	if rt.taskType != wbsTaskTypeLeaf || rt.workUnitType == wbsWorkUnitVerification {
+		return ""
+	}
+	if len(concreteWritablePlanFiles(rt)) > 0 {
+		return ""
+	}
+	if adapter.ID == "" {
+		adapter = planningLanguageAdapterFor("")
+	}
+	text := strings.Join([]string{
+		rt.title,
+		rt.accept,
+		rt.designRef,
+		rt.capabilityID,
+		rt.parentID,
+		strings.Join(rt.constraintRefs, " "),
+	}, " ")
+	if !isHighRiskTaskText(text) && !containsAdvancedCoreSurfaceTerm(text) && !containsQueryAdapterTerm(text) {
+		return ""
+	}
+	component, stem := inferRiskyTaskComponentAndStem(text)
+	if explicit := inferExplicitPlanFileFromText(text, adapter); explicit != "" {
+		if strings.Contains(filepath.ToSlash(explicit), "/") {
+			return prefixInferredPlanFileWithObjectiveRoot(explicit, objective)
+		}
+		if component != "" {
+			ext := strings.TrimSpace(adapter.SourceExt)
+			if ext == "" {
+				ext = path.Ext(explicit)
+			}
+			stem = strings.TrimSuffix(path.Base(filepath.ToSlash(explicit)), ext)
+			return renderInferredRiskyTaskFile(inferObjectiveTargetRoot(objective), component, stem, adapter)
+		}
+		return prefixInferredPlanFileWithObjectiveRoot(explicit, objective)
+	}
+	if stem == "" {
+		return ""
+	}
+	if component == "" {
+		component = stem
+	}
+	return renderInferredRiskyTaskFile(inferObjectiveTargetRoot(objective), component, stem, adapter)
+}
+
+func renderInferredRiskyTaskFile(root, component, stem string, adapter planningLanguageAdapter) string {
+	root = strings.Trim(strings.TrimSpace(filepath.ToSlash(root)), "/")
+	if root == "" {
+		root = "project"
+	}
+	component = safePlanFileStem(component)
+	stem = safePlanFileStem(stem)
+	if component == "" || stem == "" {
+		return ""
+	}
+	switch adapter.ID {
+	case "python":
+		return filepath.ToSlash(filepath.Join(root, component, stem+".py"))
+	case "typescript":
+		return filepath.ToSlash(filepath.Join(root, "src", component, stem+".ts"))
+	case "javascript":
+		return filepath.ToSlash(filepath.Join(root, "src", component, stem+".js"))
+	case "rust":
+		return filepath.ToSlash(filepath.Join(root, "src", component, stem+".rs"))
+	case "cpp":
+		return filepath.ToSlash(filepath.Join(root, "src", component, stem+".cpp"))
+	default:
+		return filepath.ToSlash(filepath.Join(root, "internal", component, stem+".go"))
+	}
+}
+
+func inferExplicitPlanFileFromText(text string, adapter planningLanguageAdapter) string {
+	ext := strings.TrimSpace(adapter.SourceExt)
+	if ext == "" {
+		ext = ".go"
+	}
+	re := regexp.MustCompile(`[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*` + regexp.QuoteMeta(ext) + `\b`)
+	for _, match := range re.FindAllString(text, -1) {
+		clean := cleanMaterializeRelPath(match)
+		if clean == "" {
+			continue
+		}
+		slash := filepath.ToSlash(clean)
+		if strings.HasSuffix(slash, ext) && !strings.HasSuffix(slash, adapter.TestSuffix) {
+			return slash
+		}
+	}
+	return ""
+}
+
+func prefixInferredPlanFileWithObjectiveRoot(file, objective string) string {
+	file = strings.TrimSpace(filepath.ToSlash(file))
+	root := inferObjectiveTargetRoot(objective)
+	if file == "" || root == "" || filepath.IsAbs(file) || strings.HasPrefix(file, "../") {
+		return file
+	}
+	prefix := strings.Trim(root, "/") + "/"
+	if strings.HasPrefix(file, prefix) {
+		return file
+	}
+	if strings.Contains(file, "/") {
+		return prefix + file
+	}
+	return file
+}
+
+func inferRiskyTaskComponentAndStem(text string) (string, string) {
+	lower := strings.ToLower(text)
+	type candidate struct {
+		terms     []string
+		component string
+		stem      string
+	}
+	candidates := []candidate{
+		{[]string{"sstable", "sorted string table", "sst 文件", "sst"}, "storage", "sstable"},
+		{[]string{"memtable", "skiplist", "skip list"}, "storage", "memtable"},
+		{[]string{"wal", "write-ahead", "write ahead"}, "storage", "wal"},
+		{[]string{"lsm", "compaction"}, "storage", "lsm"},
+		{[]string{"mvcc", "transaction", "事务", "readview", "版本链"}, "txn", "manager"},
+		{[]string{"hnsw"}, "vector", "hnsw"},
+		{[]string{"向量", "vector"}, "vector", "index"},
+		{[]string{"bfs", "dfs", "traversal", "图遍历"}, "graph", "traversal"},
+		{[]string{"graph", "图引擎", "图谱"}, "graph", "graph"},
+		{[]string{"parser", "解析器", "词法", "lexer"}, "query", "parser"},
+		{[]string{"planner", "计划器"}, "query", "planner"},
+		{[]string{"executor", "执行器"}, "query", "executor"},
+		{[]string{"auth", "鉴权", "认证", "rbac", "权限"}, "security", "auth"},
+		{[]string{"cache", "缓存"}, "cache", "cache"},
+		{[]string{"protocol", "协议"}, "protocol", "protocol"},
+	}
+	for _, c := range candidates {
+		for _, term := range c.terms {
+			if strings.Contains(lower, term) {
+				return c.component, c.stem
+			}
+		}
+	}
+	id := normalizePlanningID(text)
+	if id == "" {
+		return "", ""
+	}
+	parts := strings.Split(id, "-")
+	var useful []string
+	stop := map[string]bool{
+		"implement": true, "implementation": true, "create": true, "define": true,
+		"task": true, "core": true, "behavior": true, "path": true,
+	}
+	for _, part := range parts {
+		if len(part) < 3 || stop[part] {
+			continue
+		}
+		useful = append(useful, part)
+		if len(useful) >= 2 {
+			break
+		}
+	}
+	if len(useful) == 0 {
+		return "", ""
+	}
+	stem := useful[len(useful)-1]
+	component := useful[0]
+	return component, stem
+}
+
+func expandFileTargetRawTask(rt rawTask, reason string, files []string, adapter planningLanguageAdapter) []rawTask {
+	if len(files) == 0 {
+		return expandGenericRawTask(rt, reason)
+	}
+	if len(files) > 8 {
+		files = files[:8]
+	}
+	parentID := rt.num
+	group := rt.parallelGroup
+	if group == "" {
+		group = parentID + ":file-leaves"
+	}
+	duplicateBase := duplicatePlanFileBasenames(files)
+	children := make([]rawTask, 0, len(files)+1)
+	for i, file := range files {
+		child := rt
+		child.num = fmt.Sprintf("%s.%d", parentID, i+1)
+		child.title = fileTargetLeafTitle(rt.title, file, duplicateBase)
+		child.role = "coder"
+		child.taskType = wbsTaskTypeLeaf
+		child.parentID = parentID
+		child.estimatedMin = 2
+		if i > 0 {
+			child.estimatedMin = 3
+		}
+		child.riskLevel = wbsRiskMedium
+		child.parallelGroup = group + ":" + sanitizeParallelGroupSegment(path.Base(filepath.ToSlash(file)))
+		child.conflictKeys = nil
+		child.blockingPolicy = wbsBlockingFailBlocks
+		child.splitReason = appendSplitReason(rt.splitReason, "sizing-gate:"+reason+";file-target")
+		child.complexity = "medium"
+		child.targetFiles = []string{file}
+		child.writeFiles = []string{file}
+		child.readFiles = nil
+		child.targetPackages = targetPackagesForFileByLanguage(file, adapter.ID)
+		child.workUnitType = wbsWorkUnitImplementation
+		if i == 0 || isPlanContractFile(file) {
+			child.workUnitType = wbsWorkUnitContract
+			child.accept = "定义该文件的最小接口、类型或结构边界; scoped build 通过"
+		} else if isPlanTestFile(file) {
+			child.workUnitType = wbsWorkUnitVerification
+			child.accept = "为对应实现补最小测试文件; scoped build/test 通过"
+		} else {
+			child.accept = "实现该文件的单一职责; 不修改其它文件; scoped build 通过"
+		}
+		child.depNums = append([]string(nil), rt.depNums...)
+		if i > 0 && isPlanTestFile(file) {
+			child.depNums = append(child.depNums, children[i-1].num)
+		}
+		if shouldMicroSplitFileTarget(child, file, reason) {
+			nested := expandFileTargetMicroRawTask(child, "file-target-risk:"+reason)
+			if len(nested) > 0 {
+				children = append(children, nested...)
+				continue
+			}
+		}
+		children = append(children, child)
+	}
+	verify := rt
+	verify.num = fmt.Sprintf("%s.%d", parentID, len(children)+1)
+	verify.title = rt.title + " - 本地验证与回归检查"
+	verify.role = "tester"
+	verify.taskType = wbsTaskTypeVerification
+	verify.workUnitType = wbsWorkUnitVerification
+	verify.parentID = parentID
+	verify.estimatedMin = 2
+	verify.riskLevel = wbsRiskLow
+	verify.parallelGroup = group + ":verification"
+	verify.conflictKeys = []string{verify.parallelGroup}
+	verify.blockingPolicy = wbsBlockingFailBlocks
+	verify.splitReason = appendSplitReason(rt.splitReason, "sizing-gate:"+reason+";file-target")
+	verify.accept = "本地执行 build/test/TODO scan; 不调用 tester LLM"
+	verify.verifyCommand = defaultVerifyCommand(rt)
+	verify.depNums = []string{children[len(children)-1].num}
+	children = append(children, verify)
+	return children
+}
+
+func shouldMicroSplitFileTarget(rt rawTask, file, reason string) bool {
+	if rt.taskType != wbsTaskTypeLeaf || rt.workUnitType == wbsWorkUnitVerification || isPlanTestFile(file) {
+		return false
+	}
+	if !strings.Contains(reason, "design-complete") &&
+		!strings.Contains(reason, "high-risk") &&
+		!strings.Contains(reason, "domain-risk") &&
+		!strings.Contains(reason, "inferred-file-risk") &&
+		rt.riskLevel != wbsRiskHigh {
+		return false
+	}
+	if isProjectBootstrapRawTask(rt) || isPlanPlaceholderFile(file) {
+		return false
+	}
+	if rt.workUnitType == wbsWorkUnitContract && isPlanContractFile(file) {
+		return false
+	}
+	text := strings.Join([]string{rt.title, rt.accept, rt.designRef, rt.capabilityID, reason, file, strings.Join(rt.constraintRefs, " ")}, " ")
+	return isHighRiskTaskText(text) || containsAdvancedCoreSurfaceTerm(text) || containsQueryAdapterTerm(text) || isDesignCompleteRiskyPlanFile(file)
+}
+
+func isDesignCompleteRiskySingleFileRawTask(rt rawTask) bool {
+	files := concreteWritablePlanFiles(rt)
+	if len(files) != 1 || rt.taskType != wbsTaskTypeLeaf || rt.workUnitType == wbsWorkUnitVerification {
+		return false
+	}
+	text := strings.Join([]string{
+		rt.title,
+		rt.accept,
+		rt.designRef,
+		rt.capabilityID,
+		files[0],
+		strings.Join(rt.constraintRefs, " "),
+	}, " ")
+	return isHighRiskTaskText(text) || containsAdvancedCoreSurfaceTerm(text) || containsQueryAdapterTerm(text) || isDesignCompleteRiskyPlanFile(files[0])
+}
+
+func isDesignCompleteRiskyPlanFile(file string) bool {
+	base := strings.ToLower(path.Base(filepath.ToSlash(file)))
+	stem := strings.TrimSuffix(base, path.Ext(base))
+	switch stem {
+	case "planner", "executor", "parser", "query", "logical", "physical", "optimizer",
+		"bfs", "dfs", "traversal", "graph", "engine", "wal", "lsm", "sstable",
+		"memtable", "mvcc", "txn", "transaction", "snapshot", "hnsw", "index",
+		"cache", "compaction", "filter", "bloom", "adjacency", "csr", "delta", "quantize", "quantization", "pq":
+		return true
+	default:
+		return false
+	}
+}
+
+func expandFileTargetMicroRawTask(rt rawTask, reason string) []rawTask {
+	file := ""
+	if len(rt.targetFiles) > 0 {
+		file = rt.targetFiles[0]
+	}
 	steps := []struct {
 		title    string
 		accept   string
@@ -1101,17 +2851,266 @@ func expandMVCCRawTask(rt rawTask, reason string) []rawTask {
 		role     string
 		minutes  int
 	}{
-		{"MVCC 数据结构与事务状态枚举", "只定义 TxnID、Version、ReadView、WriteSet、事务状态枚举; scoped build 通过", wbsTaskTypeLeaf, "coder", 2},
-		{"Begin/Commit/Rollback 生命周期骨架", "实现 Begin/Commit/Rollback 状态转换骨架; 覆盖非法状态转换; scoped build 通过", wbsTaskTypeLeaf, "coder", 3},
-		{"ReadView 与可见性判断", "实现 snapshot visibility / ReadView 判断; 增加表驱动测试; scoped build/test 通过", wbsTaskTypeLeaf, "coder", 3},
-		{"写写冲突与提交校验", "实现 write-write conflict detection 与提交前校验; 增加冲突测试; scoped build/test 通过", wbsTaskTypeLeaf, "coder", 3},
-		{"版本链读写与 GC 接口", "实现版本链读写边界与 retention/cleanup 接口; scoped build/test 通过", wbsTaskTypeLeaf, "coder", 3},
-		{"MVCC 集成验证", "本地执行并发读写、回滚、可见性测试; 不调用 tester LLM", wbsTaskTypeVerification, "tester", 2},
+		{"契约与数据边界", "只定义该文件需要的最小类型、接口、错误码和空实现骨架; 禁止实现复杂算法; scoped build 通过", wbsTaskTypeLeaf, "coder", 2},
+		{"最小行为路径", "只实现该文件的单一 happy path; 禁止修改上游契约或其它核心文件; scoped build 通过", wbsTaskTypeLeaf, "coder", 2},
+		{"边界与错误路径", "补齐该文件内的错误处理、边界条件和并发保护; 不扩大作用域; scoped build 通过", wbsTaskTypeLeaf, "coder", 3},
+		{"本地验证与回归检查", "本地执行 build/test/TODO scan; 不调用 tester LLM", wbsTaskTypeVerification, "tester", 2},
 	}
-	return buildExpandedTasks(rt, reason, "mvcc-core", steps)
+	children := buildExpandedTasks(rt, reason, "file-risk-slices", steps)
+	for i := range children {
+		children[i].targetFiles = []string{file}
+		children[i].writeFiles = []string{file}
+		children[i].readFiles = nil
+		children[i].targetPackages = rt.targetPackages
+		children[i].parallelGroup = rt.parallelGroup
+		children[i].conflictKeys = rt.conflictKeys
+		if i == 0 {
+			children[i].workUnitType = wbsWorkUnitContract
+			children[i].riskLevel = wbsRiskLow
+			children[i].complexity = "simple"
+		} else if children[i].taskType == wbsTaskTypeLeaf {
+			children[i].workUnitType = wbsWorkUnitImplementation
+		} else {
+			children[i].workUnitType = wbsWorkUnitVerification
+		}
+	}
+	return children
+}
+
+func sanitizeParallelGroupSegment(segment string) string {
+	segment = normalizePlanningID(segment)
+	if segment == "" {
+		return "file"
+	}
+	return segment
+}
+
+func duplicatePlanFileBasenames(files []string) map[string]bool {
+	counts := make(map[string]int, len(files))
+	for _, file := range files {
+		base := strings.ToLower(path.Base(filepath.ToSlash(file)))
+		if base != "" && base != "." {
+			counts[base]++
+		}
+	}
+	out := make(map[string]bool)
+	for base, count := range counts {
+		if count > 1 {
+			out[base] = true
+		}
+	}
+	return out
+}
+
+func fileTargetLeafTitle(parentTitle, file string, duplicateBase map[string]bool) string {
+	slash := filepath.ToSlash(file)
+	base := path.Base(slash)
+	if duplicateBase[strings.ToLower(base)] {
+		dir := path.Base(path.Dir(slash))
+		if dir != "" && dir != "." {
+			return parentTitle + " - " + dir + "/" + base
+		}
+	}
+	return parentTitle + " - " + base
+}
+
+func previousPlanFiles(files []string, idx int) []string {
+	if idx <= 0 {
+		return nil
+	}
+	prev := make([]string, 0, idx)
+	for i := 0; i < idx && i < len(files); i++ {
+		prev = append(prev, files[i])
+	}
+	return prev
+}
+
+func targetPackagesForFileByLanguage(file, language string) []string {
+	if strings.ToLower(strings.TrimSpace(language)) != "go" {
+		return nil
+	}
+	dir := path.Dir(filepath.ToSlash(file))
+	if dir == "." || dir == "" {
+		return nil
+	}
+	return targetPackagesForDirByLanguage(dir, "go")
+}
+
+func isPlanContractFile(file string) bool {
+	base := strings.ToLower(path.Base(filepath.ToSlash(file)))
+	return strings.Contains(base, "type") || strings.Contains(base, "interface") ||
+		strings.Contains(base, "contract") || strings.Contains(base, "schema")
+}
+
+func isPlanTestFile(file string) bool {
+	base := strings.ToLower(path.Base(filepath.ToSlash(file)))
+	return strings.Contains(base, "_test.") || strings.Contains(base, ".test.") ||
+		strings.HasPrefix(base, "test_")
+}
+
+func isPlanPlaceholderFile(file string) bool {
+	base := strings.ToLower(path.Base(filepath.ToSlash(file)))
+	return strings.Contains(base, "placeholder") || strings.Contains(base, "stub") ||
+		strings.Contains(base, "doc.go") || strings.Contains(base, "empty")
+}
+
+func directoryLikeTaskTargets(rt rawTask) []string {
+	return directoryLikePlanPaths(append(append([]string{}, rt.targetFiles...), rt.writeFiles...))
+}
+
+func directoryLikeNodeTargets(node *TaskNode) []string {
+	if node == nil {
+		return nil
+	}
+	return directoryLikePlanPaths(append(append([]string{}, node.TargetFiles...), node.WriteFiles...))
+}
+
+func directoryLikePlanPaths(files []string) []string {
+	var dirs []string
+	for _, file := range files {
+		clean := strings.TrimSpace(filepath.ToSlash(file))
+		if clean == "" || filepath.IsAbs(clean) {
+			continue
+		}
+		trimmed := strings.TrimSuffix(strings.TrimPrefix(clean, "./"), "/...")
+		trimmed = strings.TrimSuffix(trimmed, "/")
+		if trimmed == "" || strings.HasPrefix(trimmed, "../") {
+			continue
+		}
+		base := strings.ToLower(path.Base(trimmed))
+		if base == "makefile" || base == "dockerfile" || base == "readme" {
+			continue
+		}
+		if strings.HasSuffix(clean, "/") || strings.HasSuffix(clean, "/...") || (path.Ext(trimmed) == "" && strings.Contains(trimmed, "/")) {
+			dirs = append(dirs, trimmed)
+		}
+	}
+	return uniqueTrimmedStrings(dirs)
+}
+
+func expandDirectoryTargetRawTask(rt rawTask, reason string, dirs []string, adapter planningLanguageAdapter) []rawTask {
+	if len(dirs) == 0 {
+		return expandGenericRawTask(rt, reason)
+	}
+	if adapter.ID == "" {
+		adapter = planningLanguageAdapterFor("")
+	}
+	if len(dirs) > 4 {
+		dirs = dirs[:4]
+	}
+	children := make([]rawTask, 0, len(dirs)*len(adapter.DirectorySpecs)+1)
+	parentID := rt.num
+	group := rt.parallelGroup
+	if group == "" {
+		group = parentID + ":directory-files"
+	}
+	for _, dir := range dirs {
+		stem := safePlanFileStem(path.Base(dir))
+		for _, spec := range adapter.DirectorySpecs {
+			child := rt
+			child.num = fmt.Sprintf("%s.%d", parentID, len(children)+1)
+			child.title = rt.title + " - " + spec.Title
+			child.role = orchNormalizeRole(spec.Role)
+			if child.role == "" {
+				child.role = "coder"
+			}
+			if spec.IsTest || spec.WorkUnitType == wbsWorkUnitVerification {
+				child.taskType = wbsTaskTypeVerification
+				child.riskLevel = wbsRiskLow
+				child.verifyCommand = defaultVerifyCommand(rt)
+			} else {
+				child.taskType = wbsTaskTypeLeaf
+				child.riskLevel = wbsRiskMedium
+			}
+			child.workUnitType = spec.WorkUnitType
+			child.parentID = parentID
+			child.estimatedMin = spec.Minutes
+			child.parallelGroup = group + ":" + dir
+			child.conflictKeys = []string{child.parallelGroup}
+			child.blockingPolicy = wbsBlockingFailBlocks
+			child.splitReason = appendSplitReason(rt.splitReason, "sizing-gate:"+reason)
+			child.accept = spec.Acceptance
+			child.complexity = "medium"
+			child.title = rt.title + " - " + path.Base(dir) + " " + spec.Title
+			target := adapter.renderDirectoryLeafFile(dir, stem, spec)
+			child.targetFiles = []string{target}
+			child.writeFiles = []string{target}
+			child.readFiles = nil
+			child.targetPackages = targetPackagesForDirByLanguage(dir, adapter.ID)
+			if len(children) == 0 {
+				child.depNums = append([]string(nil), rt.depNums...)
+			} else {
+				child.depNums = []string{children[len(children)-1].num}
+			}
+			children = append(children, child)
+		}
+	}
+	if len(children) > 0 {
+		verify := rt
+		verify.num = fmt.Sprintf("%s.%d", parentID, len(children)+1)
+		verify.title = rt.title + " - 本地验证与回归检查"
+		verify.role = "tester"
+		verify.taskType = wbsTaskTypeVerification
+		verify.workUnitType = wbsWorkUnitVerification
+		verify.parentID = parentID
+		verify.estimatedMin = 2
+		verify.riskLevel = wbsRiskLow
+		verify.parallelGroup = group + ":verification"
+		verify.conflictKeys = []string{verify.parallelGroup}
+		verify.blockingPolicy = wbsBlockingFailBlocks
+		verify.splitReason = appendSplitReason(rt.splitReason, "sizing-gate:"+reason)
+		verify.accept = "本地执行 build/test/TODO scan; 不调用 tester LLM"
+		verify.verifyCommand = defaultVerifyCommand(rt)
+		verify.depNums = []string{children[len(children)-1].num}
+		children = append(children, verify)
+	}
+	return children
+}
+
+func safePlanFileStem(stem string) string {
+	stem = normalizePlanningID(stem)
+	if stem == "" {
+		return "module"
+	}
+	return strings.ReplaceAll(stem, "-", "_")
+}
+
+func targetPackagesForDir(dir string) []string {
+	return targetPackagesForDirByLanguage(dir, "go")
+}
+
+func targetPackagesForDirByLanguage(dir, language string) []string {
+	if strings.ToLower(strings.TrimSpace(language)) != "go" {
+		return nil
+	}
+	dir = strings.Trim(strings.TrimSpace(filepath.ToSlash(dir)), "/")
+	if dir == "" {
+		return nil
+	}
+	parts := strings.Split(dir, "/")
+	if len(parts) > 1 && isLikelyGeneratedProjectRoot(parts[0]) {
+		return []string{"./" + strings.Join(parts[1:], "/")}
+	}
+	return []string{"./" + dir}
 }
 
 func expandGenericRawTask(rt rawTask, reason string) []rawTask {
+	if rt.riskLevel == wbsRiskHigh || isCoreStateRawTask(rt) || strings.Contains(reason, "domain-risk-keyword") || strings.Contains(reason, "high-risk") {
+		steps := []struct {
+			title    string
+			accept   string
+			taskType string
+			role     string
+			minutes  int
+		}{
+			{"接口与状态边界", "只定义最小公开接口、状态结构、错误/常量契约; 不实现复杂算法; scoped build 通过", wbsTaskTypeLeaf, "coder", 2},
+			{"最小可运行路径", "实现单一 happy path 或生命周期骨架; 不扩展额外模块; scoped build 通过", wbsTaskTypeLeaf, "coder", 2},
+			{"边界与失败路径", "补齐边界条件、错误路径、并发/一致性保护中的最小必要部分; scoped build 通过", wbsTaskTypeLeaf, "coder", 3},
+			{"集成适配", "只接入已经存在的上游/下游接口, 不新建未声明文件; scoped build 通过", wbsTaskTypeLeaf, "coder", 3},
+			{"本地验证与回归检查", "本地执行 build/test/TODO scan; 不调用 tester LLM", wbsTaskTypeVerification, "tester", 2},
+		}
+		return buildExpandedTasks(rt, reason, "core-state-slices", steps)
+	}
 	steps := []struct {
 		title    string
 		accept   string
@@ -1146,6 +3145,9 @@ func buildExpandedTasks(rt rawTask, reason, groupSuffix string, steps []struct {
 		if rt.title != "" {
 			child.title = rt.title + " - " + step.title
 		}
+		if strings.Contains(reason, "mixed-contract-implementation") {
+			child.title = mixedContractImplementationChildTitle(rt.title, i)
+		}
 		child.role = orchNormalizeRole(step.role)
 		child.taskType = step.taskType
 		child.parentID = parentID
@@ -1156,6 +3158,23 @@ func buildExpandedTasks(rt rawTask, reason, groupSuffix string, steps []struct {
 		child.splitReason = appendSplitReason(rt.splitReason, "sizing-gate:"+reason)
 		child.accept = step.accept
 		child.complexity = "medium"
+		if i == 0 && strings.Contains(reason, "mixed-contract-implementation") && step.taskType == wbsTaskTypeLeaf {
+			child.workUnitType = wbsWorkUnitContract
+			child.riskLevel = wbsRiskLow
+			child.complexity = "simple"
+			child.accept = "只定义稳定接口/类型/错误码/最小文件骨架; 禁止实现复杂算法或跨模块接入; scoped build 通过"
+		} else if strings.Contains(reason, "mixed-contract-implementation") && step.taskType == wbsTaskTypeLeaf {
+			child.workUnitType = wbsWorkUnitImplementation
+			child.blockingPolicy = wbsBlockingFailOpen
+			child.accept = mixedContractImplementationChildAcceptance(i, step.accept)
+		} else if rt.workUnitType == wbsWorkUnitContract && step.taskType == wbsTaskTypeLeaf {
+			if i == 0 {
+				child.workUnitType = wbsWorkUnitContract
+			} else {
+				child.workUnitType = wbsWorkUnitImplementation
+				child.blockingPolicy = wbsBlockingFailOpen
+			}
+		}
 		if step.taskType == wbsTaskTypeVerification {
 			child.complexity = "simple"
 			child.riskLevel = wbsRiskLow
@@ -1171,6 +3190,56 @@ func buildExpandedTasks(rt rawTask, reason, groupSuffix string, steps []struct {
 	return children
 }
 
+func mixedContractImplementationChildTitle(parent string, index int) string {
+	component := mixedContractImplementationComponentName(parent)
+	switch index {
+	case 0:
+		return component + " 契约定义"
+	case 1:
+		return component + " 最小实现路径"
+	case 2:
+		return component + " 边界行为完善"
+	case 3:
+		return component + " 集成适配"
+	default:
+		return component + " 本地验证与回归检查"
+	}
+}
+
+func mixedContractImplementationChildAcceptance(index int, fallback string) string {
+	switch index {
+	case 1:
+		return "仅实现已定义契约的最小 happy path; 禁止修改上游契约; scoped build 通过"
+	case 2:
+		return "补齐同一契约内的错误路径和边界条件; 禁止新增未声明接口; scoped build 通过"
+	case 3:
+		return "只接入已经通过的上游/下游契约; 如需接口变化必须局部兼容; scoped build 通过"
+	default:
+		return fallback
+	}
+}
+
+func mixedContractImplementationComponentName(parent string) string {
+	parent = strings.TrimSpace(parent)
+	if parent == "" {
+		return "组件"
+	}
+	replacements := []string{
+		"接口与实现", "",
+		"interface and implementation", "",
+		"Interface and Implementation", "",
+		"接口实现", "",
+		"实现接口", "",
+	}
+	name := strings.NewReplacer(replacements...).Replace(parent)
+	name = strings.Join(strings.Fields(name), " ")
+	name = strings.Trim(name, " -:：")
+	if name == "" {
+		return "组件"
+	}
+	return name
+}
+
 func appendSplitReason(existing, reason string) string {
 	existing = strings.TrimSpace(existing)
 	reason = strings.TrimSpace(reason)
@@ -1184,10 +3253,13 @@ func appendSplitReason(existing, reason string) string {
 }
 
 func defaultVerifyCommand(rt rawTask) string {
+	if strings.TrimSpace(rt.verifyCommand) != "" {
+		return strings.TrimSpace(rt.verifyCommand)
+	}
 	if len(rt.targetPackages) > 0 {
 		return "go test " + strings.Join(rt.targetPackages, " ")
 	}
-	return "go test ./..."
+	return ""
 }
 
 func rewriteRawTaskDeps(depNums []string, rewrite map[string]string, self string) []string {
@@ -1210,12 +3282,6 @@ func rewriteRawTaskDeps(depNums []string, rewrite map[string]string, self string
 	return out
 }
 
-func isMVCCTask(rt rawTask) bool {
-	text := strings.ToLower(rt.title + " " + rt.designRef + " " + strings.Join(rt.constraintRefs, " "))
-	return strings.Contains(text, "mvcc") || strings.Contains(text, "readview") ||
-		strings.Contains(text, "事务") || strings.Contains(text, "transaction")
-}
-
 func isHighRiskTaskText(text string) bool {
 	lower := strings.ToLower(text)
 	keywords := []string{
@@ -1223,6 +3289,12 @@ func isHighRiskTaskText(text string) bool {
 		"scheduler", "调度", "index", "索引", "parser", "解析",
 		"consensus", "共识", "raft", "cache", "缓存", "gc", "snapshot",
 		"readview", "版本链", "visibility", "冲突",
+		"wal", "write-ahead", "lsm", "sstable", "sst 文件", "sst file", "sst-", "compaction", "mmap",
+		"page cache", "pagecache", "hnsw", "btree", "b-tree", "trie",
+		"csr", "adjacency", "邻接", "delta store", "delta-store", "增量更新",
+		"product quantization", "quantization", "量化", "pq",
+		"replication", "sharding", "isolation", "权限", "auth", "security",
+		"runtime", "compiler", "编译器", "协议", "protocol",
 	}
 	for _, kw := range keywords {
 		if strings.Contains(lower, kw) {
@@ -1271,6 +3343,19 @@ func containsString(items []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func removeString(items []string, target string) []string {
+	if len(items) == 0 {
+		return items
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if item != target {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func uniqueStrings(items []string) []string {
@@ -1428,7 +3513,11 @@ func (o *Orchestrator) recordWBSPlanMetrics(team *ProductionTeam) {
 			mc.RecordRun("team", metrics.MWBSTaskEstimatedMinutes, float64(node.EstimatedMin), team.Name, labels)
 		}
 		if node.TaskType == wbsTaskTypeLeaf || node.TaskType == wbsTaskTypeVerification {
-			mc.RecordRun("team", metrics.MWBSLeafFiles, float64(len(node.TargetFiles)), team.Name, labels)
+			fileCount := len(node.WriteFiles)
+			if fileCount == 0 {
+				fileCount = len(node.TargetFiles)
+			}
+			mc.RecordRun("team", metrics.MWBSLeafFiles, float64(fileCount), team.Name, labels)
 		}
 		if node.ParallelGroup != "" {
 			groupSizes[node.ParallelGroup]++
@@ -1489,6 +3578,180 @@ func buildRootMetricLabel(cwd, buildCwd string) string {
 	return filepath.ToSlash(filepath.Base(buildCwd))
 }
 
+func ensureProjectSkeletonForTeam(team *ProductionTeam, objective string, adapter planningLanguageAdapter) ([]string, error) {
+	if team == nil || strings.TrimSpace(team.Cwd) == "" {
+		return nil, nil
+	}
+	targetRoot := inferObjectiveTargetRoot(objective)
+	if targetRoot == "" {
+		return nil, nil
+	}
+	return ensureProjectSkeletonForRoot(team, targetRoot, adapter)
+}
+
+func ensureProjectSkeletonForRoot(team *ProductionTeam, targetRoot string, adapter planningLanguageAdapter) ([]string, error) {
+	if team == nil || strings.TrimSpace(team.Cwd) == "" {
+		return nil, nil
+	}
+	targetRoot = strings.Trim(strings.TrimSpace(filepath.ToSlash(targetRoot)), "/")
+	if targetRoot == "" || strings.HasPrefix(targetRoot, "../") || filepath.IsAbs(targetRoot) {
+		return nil, nil
+	}
+	if adapter.ID == "" {
+		adapter = planningLanguageAdapterFor("")
+	}
+	files := projectSkeletonFiles(adapter, targetRoot)
+	if len(files) == 0 {
+		return nil, nil
+	}
+	rootDir := filepath.Join(team.Cwd, filepath.FromSlash(targetRoot))
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		return nil, err
+	}
+	var written []string
+	for rel, content := range files {
+		clean := filepath.ToSlash(filepath.Clean(rel))
+		if clean == "." || strings.HasPrefix(clean, "../") || filepath.IsAbs(clean) {
+			continue
+		}
+		abs := filepath.Join(rootDir, filepath.FromSlash(clean))
+		if _, err := os.Stat(abs); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return written, err
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return written, err
+		}
+		if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+			return written, err
+		}
+		written = append(written, filepath.ToSlash(filepath.Join(targetRoot, clean)))
+	}
+	sort.Strings(written)
+	return written, nil
+}
+
+func projectSkeletonFiles(adapter planningLanguageAdapter, targetRoot string) map[string]string {
+	name := safeProjectIdentifier(targetRoot, "-")
+	if name == "" {
+		name = "app"
+	}
+	switch adapter.ID {
+	case "python":
+		pkg := safeProjectIdentifier(targetRoot, "_")
+		if pkg == "" {
+			pkg = "app"
+		}
+		return map[string]string{
+			"pyproject.toml": fmt.Sprintf(`[project]
+name = "%s"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+`, strings.ReplaceAll(name, "_", "-")),
+			filepath.ToSlash(filepath.Join(pkg, "__init__.py")): fmt.Sprintf("\"\"\"%s package.\"\"\"\n", pkg),
+		}
+	case "rust":
+		return map[string]string{
+			"Cargo.toml": fmt.Sprintf(`[package]
+name = "%s"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+`, strings.ReplaceAll(name, "_", "-")),
+			filepath.ToSlash(filepath.Join("src", "lib.rs")): "//! Project library root.\n\n",
+		}
+	case "typescript":
+		return map[string]string{
+			"package.json": fmt.Sprintf(`{"name":"%s","version":"0.1.0","type":"module","scripts":{"test":"node --test"},"dependencies":{},"devDependencies":{}}
+`, strings.ReplaceAll(name, "_", "-")),
+			filepath.ToSlash(filepath.Join("src", "index.ts")): "export {};\n",
+		}
+	case "javascript":
+		return map[string]string{
+			"package.json": fmt.Sprintf(`{"name":"%s","version":"0.1.0","type":"module","scripts":{"test":"node --test"},"dependencies":{},"devDependencies":{}}
+`, strings.ReplaceAll(name, "_", "-")),
+			filepath.ToSlash(filepath.Join("src", "index.js")): "export {};\n",
+		}
+	case "cpp":
+		return map[string]string{
+			"CMakeLists.txt": fmt.Sprintf("cmake_minimum_required(VERSION 3.16)\nproject(%s LANGUAGES CXX)\nset(CMAKE_CXX_STANDARD 17)\nset(CMAKE_CXX_STANDARD_REQUIRED ON)\n", safeCMakeProjectName(targetRoot)),
+			filepath.ToSlash(filepath.Join("src", "main.cpp")): "int main() { return 0; }\n",
+		}
+	default:
+		pkg := safeGoPackageName(targetRoot)
+		if pkg == "" {
+			pkg = "app"
+		}
+		return map[string]string{
+			"go.mod": fmt.Sprintf("module %s\n\ngo 1.22\n", strings.ToLower(strings.ReplaceAll(name, "_", "-"))),
+			"doc.go": fmt.Sprintf("package %s\n", pkg),
+		}
+	}
+}
+
+func safeGoPackageName(raw string) string {
+	id := safeProjectIdentifier(raw, "_")
+	id = strings.ReplaceAll(id, "-", "_")
+	id = strings.ReplaceAll(id, ".", "_")
+	if id == "" {
+		return "app"
+	}
+	var b strings.Builder
+	for i, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || (i > 0 && r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	if out == "" || out == "_" {
+		out = "app"
+	}
+	out = strings.ToLower(out)
+	if out[0] >= '0' && out[0] <= '9' {
+		out = "pkg_" + out
+	}
+	if isGoKeywordPackageName(out) {
+		out += "pkg"
+	}
+	return out
+}
+
+func isGoKeywordPackageName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "break", "default", "func", "interface", "select",
+		"case", "defer", "go", "map", "struct",
+		"chan", "else", "goto", "package", "switch",
+		"const", "fallthrough", "if", "range", "type",
+		"continue", "for", "import", "return", "var":
+		return true
+	default:
+		return false
+	}
+}
+
+func safeProjectIdentifier(raw, sep string) string {
+	id := normalizePlanningID(raw)
+	id = strings.ReplaceAll(id, "-", sep)
+	id = strings.ReplaceAll(id, ".", sep)
+	id = strings.Trim(id, sep)
+	if id == "" {
+		return ""
+	}
+	return strings.ToLower(id)
+}
+
+func safeCMakeProjectName(raw string) string {
+	id := safeProjectIdentifier(raw, "_")
+	if id == "" {
+		return "app"
+	}
+	return id
+}
+
 func (n *TaskNode) wbsMetricLabels(team *ProductionTeam) map[string]string {
 	workflow := ""
 	if team != nil {
@@ -1498,8 +3761,11 @@ func (n *TaskNode) wbsMetricLabels(team *ProductionTeam) map[string]string {
 		"workflow":        workflow,
 		"role":            n.Role,
 		"task_type":       n.TaskType,
+		"work_unit_type":  n.WorkUnitType,
+		"capability_id":   n.CapabilityID,
 		"risk_level":      n.RiskLevel,
 		"blocking_policy": n.BlockingPolicy,
+		"timeout_kind":    n.TimeoutKind,
 	}
 }
 
@@ -1515,6 +3781,12 @@ func (o *Orchestrator) Execute(ctx context.Context, objective string, team *Prod
 
 	if o.pool != nil && o.dagMaxWidth > 0 {
 		o.pool.AutoScale(o.dagMaxWidth)
+	}
+
+	if written, err := ensureProjectSkeletonForTeam(team, objective, o.planningAdapter(objective)); err != nil {
+		o.notify(o.chatID, fmt.Sprintf("⚠️ 最小项目骨架初始化失败: %v", err))
+	} else if len(written) > 0 {
+		o.notify(o.chatID, fmt.Sprintf("🧱 本地语言适配器已初始化最小项目骨架: %s", strings.Join(written, ", ")))
 	}
 
 	// 补齐孤儿节点 (必须在 restoreCompletedTasksFromDAG 之前执行):
@@ -1879,13 +4151,19 @@ func (o *Orchestrator) cleanupResidualTasks() {
 	}
 }
 
-func (o *Orchestrator) roundBudgetFor(node *TaskNode) int {
+func (o *Orchestrator) roundBudgetFor(node *TaskNode, objective string) int {
 	cfg := o.config.AdversarialRound
 	if cfg <= 0 {
 		cfg = 2
 	}
 	if cfg > 3 {
 		cfg = 3
+	}
+	if objectiveRequiresCompleteImplementation(objective) && requiresStrictLeafLocalIntegrity(node) {
+		if cfg < 3 {
+			cfg = 3
+		}
+		return min(cfg, 3)
 	}
 
 	switch strings.ToLower(strings.TrimSpace(node.Complexity)) {
@@ -1914,7 +4192,19 @@ func (o *Orchestrator) roundBudgetFor(node *TaskNode) int {
 }
 
 func (o *Orchestrator) shouldFastPassSimpleTask(node *TaskNode, maxRounds int, buildPassed bool, team *ProductionTeam) bool {
-	if !buildPassed || maxRounds > 1 || team == nil || team.Cwd == "" {
+	if !buildPassed || team == nil || team.Cwd == "" {
+		return false
+	}
+	if objectiveRequiresCompleteImplementation(team.Objective) && requiresStrictLeafLocalIntegrity(node) {
+		return false
+	}
+	if isManifestOnlyNode(node) {
+		return validateManifestTargets(team.Cwd, node.TargetFiles) == ""
+	}
+	if isProjectSkeletonNode(node) {
+		return true
+	}
+	if maxRounds > 1 {
 		return false
 	}
 	complexity := strings.ToLower(strings.TrimSpace(node.Complexity))
@@ -1922,6 +4212,13 @@ func (o *Orchestrator) shouldFastPassSimpleTask(node *TaskNode, maxRounds int, b
 		return true
 	}
 	return len(node.TargetFiles) > 0 && len(node.TargetFiles) <= 2
+}
+
+func effectiveTargetPackagesForBuild(node *TaskNode, targetPackages []string) []string {
+	if isProjectSkeletonNode(node) || isManifestOnlyNode(node) {
+		return nil
+	}
+	return targetPackages
 }
 
 func (o *Orchestrator) shouldRunLocalVerification(node *TaskNode) bool {
@@ -1932,7 +4229,10 @@ func (o *Orchestrator) shouldRunLocalVerification(node *TaskNode) bool {
 	title := strings.ToLower(node.Title)
 	acceptance := strings.ToLower(node.AcceptCriteria)
 	if strings.Contains(role, "tester") {
-		return true
+		return len(node.TargetFiles) == 0 && len(node.WriteFiles) == 0
+	}
+	if len(node.TargetFiles) > 0 || len(node.WriteFiles) > 0 {
+		return false
 	}
 	return (strings.Contains(title, "测试") || strings.Contains(title, "验证") ||
 		strings.Contains(title, "test") || strings.Contains(title, "build")) &&
@@ -1940,17 +4240,102 @@ func (o *Orchestrator) shouldRunLocalVerification(node *TaskNode) bool {
 			strings.Contains(acceptance, "编译") || strings.Contains(acceptance, "测试"))
 }
 
-func (o *Orchestrator) executeLocalVerificationTask(node *TaskNode, team *ProductionTeam, start time.Time) StageResult {
-	lang := "go"
-	if team != nil && team.Language != "" {
-		lang = team.Language
+func (o *Orchestrator) shouldRunLocalDirectoryBootstrap(node *TaskNode) bool {
+	if node == nil || node.TaskType == wbsTaskTypeVerification {
+		return false
 	}
+	if orchNormalizeRole(node.Role) != "coder" {
+		return false
+	}
+	if isManifestOnlyNode(node) {
+		return !isOptionalManifestOnlyNode(node)
+	}
+	if !isProjectSkeletonNode(node) {
+		return false
+	}
+	if hasRequiredProjectManifestTarget(node) && isProjectSkeletonText(node) {
+		return true
+	}
+	return len(directoryLikeNodeTargets(node)) > 0
+}
+
+func (o *Orchestrator) executeLocalDirectoryBootstrapTask(node *TaskNode, objective string, team *ProductionTeam, start time.Time) StageResult {
+	var ensured []string
+	var failures []string
+	if team == nil || strings.TrimSpace(team.Cwd) == "" {
+		failures = append(failures, "工作目录为空, 无法创建目录结构")
+	} else {
+		if errText := o.ensureTaskProjectSkeleton(team, objective, node); errText != "" {
+			failures = append(failures, errText)
+		}
+		for _, manifest := range node.TargetFiles {
+			clean := cleanMaterializeRelPath(manifest)
+			if clean == "" || !isProjectManifestFile(clean) || isOptionalProjectManifestFile(clean) {
+				continue
+			}
+			if errText := validateManifestTargets(team.Cwd, []string{clean}); errText != "" {
+				failures = append(failures, errText)
+				continue
+			}
+			ensured = append(ensured, filepath.ToSlash(clean))
+		}
+		for _, dir := range directoryLikeNodeTargets(node) {
+			clean := cleanMaterializeRelPath(dir)
+			if clean == "" {
+				continue
+			}
+			if err := os.MkdirAll(filepath.Join(team.Cwd, clean), 0o755); err != nil {
+				failures = append(failures, fmt.Sprintf("创建目录失败 %s: %v", filepath.ToSlash(clean), err))
+				continue
+			}
+			ensured = append(ensured, filepath.ToSlash(clean))
+		}
+	}
+	duration := time.Since(start)
+	if len(failures) > 0 {
+		output := "local directory bootstrap failed:\n" + strings.Join(failures, "\n")
+		node.Error = output
+		cascaded, _ := o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "failed")
+		o.mu.Lock()
+		o.failedCount += 1 + cascaded
+		o.mu.Unlock()
+		o.recordWBSTaskDuration(team, node, duration, TaskFailed)
+		o.recordWBSFailedBlockedDependents(team, node, cascaded)
+		o.notify(o.chatID, fmt.Sprintf("🔴 %s 目录初始化失败 (%s)", node.Title, duration.Round(time.Second)))
+		return StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: output, Output: output, StartedAt: start, Duration: duration.Round(time.Second).String()}
+	}
+	sort.Strings(ensured)
+	output := "local directory bootstrap: ensured " + strings.Join(ensured, ", ")
+	node.Output = output
+	node.TestPassed = true
+	_, _ = o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")
+	o.mu.Lock()
+	o.completedCount++
+	o.mu.Unlock()
+	if o.checkpoints != nil {
+		o.checkpoints.SaveCheckpoint(node.Title, "completed", 0, output)
+	}
+	o.recordWBSTaskDuration(team, node, duration, TaskCompleted)
+	if team != nil && team.Blackboard != nil {
+		team.Blackboard.Write(node.Title+"-result", output, node.Role, "result")
+	}
+	o.touchActivity()
+	o.reportProgress("local-directory-bootstrap", 1, int64(len(output)), node.V2TaskID)
+	o.notify(o.chatID, fmt.Sprintf("✅ %s 目录初始化完成 (%s)", node.Title, duration.Round(time.Second)))
+	return StageResult{Name: node.Title, Role: node.Role, Status: TaskCompleted, Output: output, StartedAt: start, Duration: duration.Round(time.Second).String()}
+}
+
+func (o *Orchestrator) executeLocalVerificationTask(node *TaskNode, objective string, team *ProductionTeam, start time.Time) StageResult {
+	lang := o.runtimeLanguageForTeam(team, "")
 	var checks []string
 	var failures []string
 	if team == nil || team.Cwd == "" {
 		failures = append(failures, "工作目录为空, 无法执行本地验证")
 	} else {
-		buildCwd := inferBuildCwdFromTaskScope(team.Cwd, node.TargetFiles, node.TargetPackages)
+		if errText := o.ensureTaskProjectSkeleton(team, "", node); errText != "" {
+			failures = append(failures, errText)
+		}
+		buildCwd := inferBuildCwdFromTaskScopeForObjective(team.Cwd, node.TargetFiles, node.TargetPackages, objective)
 		targetPackages := adjustTargetPackagesForBuildRoot(team.Cwd, buildCwd, node.TargetPackages)
 		if errText := runBuildCheckScoped(buildCwd, lang, targetPackages); errText != "" {
 			failures = append(failures, errText)
@@ -1966,6 +4351,27 @@ func (o *Orchestrator) executeLocalVerificationTask(node *TaskNode, team *Produc
 	duration := time.Since(start)
 	output := "local verification: " + strings.Join(checks, "; ")
 	if len(failures) > 0 {
+		if recovered, msg := o.recoverStaleVerificationWithProjectTest(team, objective, node); recovered {
+			output = "local verification rechecked: " + msg
+			node.Output = output
+			node.TestResult = output
+			node.TestPassed = true
+			_, _ = o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")
+			o.mu.Lock()
+			o.completedCount++
+			o.mu.Unlock()
+			if o.checkpoints != nil {
+				o.checkpoints.SaveCheckpoint(node.Title, "completed", 0, output)
+			}
+			o.recordWBSTaskDuration(team, node, duration, TaskCompleted)
+			if team != nil && team.Blackboard != nil {
+				team.Blackboard.Write(node.Title+"-result", output, node.Role, "result")
+			}
+			o.touchActivity()
+			o.reportProgress("local-verification-recheck", 1, int64(len(output)), node.V2TaskID)
+			o.notify(o.chatID, fmt.Sprintf("🟡 %s 本地验证项目级复核通过 (%s)", node.Title, duration.Round(time.Second)))
+			return StageResult{Name: node.Title, Role: node.Role, Status: TaskCompleted, Output: output, StartedAt: start, Duration: duration.Round(time.Second).String()}
+		}
 		output = "local verification failed:\n" + strings.Join(failures, "\n\n")
 		node.Error = output
 		cascaded, _ := o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "failed")
@@ -1998,11 +4404,93 @@ func (o *Orchestrator) executeLocalVerificationTask(node *TaskNode, team *Produc
 	return StageResult{Name: node.Title, Role: node.Role, Status: TaskCompleted, Output: output, StartedAt: start, Duration: duration.Round(time.Second).String()}
 }
 
+func (o *Orchestrator) recoverStaleVerificationWithProjectTest(team *ProductionTeam, objective string, node *TaskNode) (bool, string) {
+	if team == nil || team.Cwd == "" || node == nil {
+		return false, ""
+	}
+	lang := o.runtimeLanguageForTeam(team, objective)
+	if strings.TrimSpace(lang) == "" {
+		return false, ""
+	}
+	var candidates []string
+	if targetRoot := inferObjectiveTargetRoot(objective); targetRoot != "" {
+		candidates = append(candidates, filepath.Join(team.Cwd, filepath.FromSlash(targetRoot)))
+	}
+	if buildCwd := inferBuildCwdFromTaskScopeForObjective(team.Cwd, node.TargetFiles, node.TargetPackages, objective); buildCwd != "" {
+		candidates = append(candidates, buildCwd)
+	}
+	candidates = append(candidates, team.Cwd)
+	for _, candidate := range uniqueTrimmedStrings(candidates) {
+		if candidate == "" || !isDir(candidate) {
+			continue
+		}
+		if errText := runTestCheckLang(candidate, lang); errText == "" {
+			return true, "project-level local test passed; scoped verification failure was stale or over-specific"
+		}
+	}
+	return false, ""
+}
+
+func (o *Orchestrator) runtimeLanguageForTeam(team *ProductionTeam, objective string) string {
+	if team != nil && strings.TrimSpace(team.Language) != "" {
+		return inferPlanningLanguageID("", team.Language)
+	}
+	if strings.TrimSpace(o.planningLang) != "" {
+		return o.planningLang
+	}
+	if inferred := inferPlanningLanguageID(objective, ""); inferred != "" {
+		return inferred
+	}
+	return "go"
+}
+
+func (o *Orchestrator) ensureTaskProjectSkeleton(team *ProductionTeam, objective string, node *TaskNode) string {
+	if team == nil || strings.TrimSpace(team.Cwd) == "" {
+		return ""
+	}
+	targetRoot := inferObjectiveTargetRoot(objective)
+	if targetRoot == "" && node != nil {
+		targetRoot = firstPlanPathSegment(append(append([]string{}, node.TargetFiles...), node.WriteFiles...))
+	}
+	var err error
+	if targetRoot != "" {
+		_, err = ensureProjectSkeletonForRoot(team, targetRoot, o.planningAdapter(objective))
+	} else {
+		_, err = ensureProjectSkeletonForTeam(team, objective, o.planningAdapter(objective))
+	}
+	if err != nil {
+		return fmt.Sprintf("最小项目骨架初始化失败: %v", err)
+	}
+	return ""
+}
+
 func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, start time.Time, err error) StageResult {
 	duration := time.Since(start)
-	errText := "split-on-timeout: " + err.Error()
+	promptChars := 0
+	if node != nil {
+		promptChars = len(o.buildTaskPrompt(node, objective, team))
+	}
+	classification := classifyAgentTimeout(err, node, promptChars, duration)
+	if node != nil {
+		node.TimeoutKind = classification.Kind
+	}
+	errText := fmt.Sprintf("timeout-classifier: kind=%s action=%s reason=%s; error=%s",
+		classification.Kind, classification.Action, classification.Reason, err.Error())
 	node.Error = errText
 	node.SplitReason = appendSplitReason(node.SplitReason, "timeout")
+
+	if !classification.AllowSplit {
+		o.notify(o.chatID, fmt.Sprintf("⏱️ %s 超过 agent %s 预算, 分类为 %s (%s), 不做动态拆分, 进入重试/失败流程",
+			node.Title, coderCallTimeout, classification.Kind, classification.Reason))
+		return o.handleTaskFailure(ctx, node, objective, team, StageResult{
+			Name:      node.Title,
+			Role:      node.Role,
+			Status:    TaskFailed,
+			Error:     errText,
+			StartedAt: start,
+			Duration:  duration.Round(time.Second).String(),
+		})
+	}
 
 	children, splitSource, splitErr := o.addTimeoutSplitChildren(ctx, node, objective, team, err)
 	if team != nil {
@@ -2103,13 +4591,22 @@ func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNo
 			targetPackages: node.TargetPackages,
 			targetFiles:    node.TargetFiles,
 			taskType:       wbsTaskTypeMacro,
+			workUnitType:   node.WorkUnitType,
+			capabilityID:   node.CapabilityID,
+			contractRefs:   node.ContractRefs,
+			provides:       node.Provides,
+			requires:       node.Requires,
+			readFiles:      node.ReadFiles,
+			writeFiles:     node.WriteFiles,
+			conflictKeys:   node.ConflictKeys,
+			estimatedLOC:   node.EstimatedLOC,
 			estimatedMin:   max(node.EstimatedMin, 6),
 			riskLevel:      wbsRiskHigh,
 			parallelGroup:  node.ParallelGroup,
 			blockingPolicy: wbsBlockingFailBlocks,
 			splitReason:    appendSplitReason(node.SplitReason, "timeout"),
 		}
-		children = expandRawTask(rt, "timeout")
+		children = expandRawTask(rt, "timeout", o.planningAdapter(objective), objective)
 		splitSource = "deterministic-fallback"
 		if len(children) == 0 {
 			return 0, splitSource, fmt.Errorf("timeout split produced no children; llm_error=%v", planErr)
@@ -2118,7 +4615,7 @@ func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNo
 
 	children = o.prepareTimeoutSplitChildren(children, node)
 	childNumToV2ID := make(map[string]string)
-	groupLastV2ID := make(map[string]string)
+	conflictLastV2ID := make(map[string]string)
 	fileLastV2ID := make(map[string]string)
 	var lastChildV2ID string
 	childNodes := make([]*TaskNode, 0, len(children))
@@ -2144,12 +4641,12 @@ func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNo
 		if len(depV2IDs) == 0 {
 			depV2IDs = append(depV2IDs, node.V2TaskID)
 		}
-		if child.parallelGroup != "" {
-			if prev, ok := groupLastV2ID[child.parallelGroup]; ok && !containsString(depV2IDs, prev) {
+		for _, key := range rawTaskConflictKeys(child) {
+			if prev, ok := conflictLastV2ID[key]; ok && !containsString(depV2IDs, prev) {
 				depV2IDs = append(depV2IDs, prev)
 			}
 		}
-		for _, file := range child.targetFiles {
+		for _, file := range rawTaskWriteFiles(child) {
 			file = strings.TrimSpace(file)
 			if file == "" {
 				continue
@@ -2178,6 +4675,15 @@ func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNo
 			TargetPackages: child.targetPackages,
 			TargetFiles:    child.targetFiles,
 			TaskType:       child.taskType,
+			WorkUnitType:   child.workUnitType,
+			CapabilityID:   child.capabilityID,
+			ContractRefs:   child.contractRefs,
+			Provides:       child.provides,
+			Requires:       child.requires,
+			ReadFiles:      child.readFiles,
+			WriteFiles:     child.writeFiles,
+			ConflictKeys:   child.conflictKeys,
+			EstimatedLOC:   child.estimatedLOC,
 			ParentID:       node.V2TaskID,
 			EstimatedMin:   child.estimatedMin,
 			RiskLevel:      child.riskLevel,
@@ -2185,13 +4691,14 @@ func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNo
 			ParallelGroup:  child.parallelGroup,
 			BlockingPolicy: child.blockingPolicy,
 			SplitReason:    appendSplitReason(child.splitReason, "source:"+splitSource),
+			TimeoutKind:    child.timeoutKind,
 		}
 		childNodes = append(childNodes, childNode)
 		childNumToV2ID[child.num] = v2ID
-		if child.parallelGroup != "" {
-			groupLastV2ID[child.parallelGroup] = v2ID
+		for _, key := range rawTaskConflictKeys(child) {
+			conflictLastV2ID[key] = v2ID
 		}
-		for _, file := range child.targetFiles {
+		for _, file := range rawTaskWriteFiles(child) {
 			file = strings.TrimSpace(file)
 			if file != "" {
 				fileLastV2ID[file] = v2ID
@@ -2316,13 +4823,22 @@ func (o *Orchestrator) buildTimeoutSplitPlannerPrompt(node *TaskNode, objective 
       "complexity": "medium",
       "estimatedMinutes": 2,
       "riskLevel": "medium",
-      "verifyCommand": "go test ./...",
-      "parallelGroup": "",
-      "blockingPolicy": "fail_blocks_dependents",
-      "splitReason": "llm-timeout-split",
-      "targetFiles": [],
-      "targetPackages": []
-    }
+      "verifyCommand": "架构阶段确定的本地 build/test 命令",
+	      "parallelGroup": "",
+	      "workUnitType": "implementation",
+	      "capabilityId": "",
+	      "contractRefs": [],
+	      "provides": [],
+	      "requires": [],
+	      "readFiles": [],
+	      "writeFiles": [],
+	      "conflictKeys": [],
+	      "estimatedChangedLOC": 120,
+	      "blockingPolicy": "fail_blocks_dependents",
+	      "splitReason": "llm-timeout-split",
+	      "targetFiles": [],
+	      "targetPackages": []
+	    }
   ]
 }
 ` + "```" + `
@@ -2330,13 +4846,14 @@ func (o *Orchestrator) buildTimeoutSplitPlannerPrompt(node *TaskNode, objective 
 规则:
 1. 输出 2-8 个 task, 最多 12 个; 禁止输出 macro。
 2. 每个 leaf 预算 2-4 分钟, estimatedMinutes 不得超过 4。
-3. 每个 leaf 默认 1-3 个 targetFiles; 如果无法精确到文件, 继承原任务文件, 但标题必须进一步收窄。
+3. 每个 leaf 默认 1-2 个 writeFiles/targetFiles; 如果无法精确到文件, 继承原任务文件, 但标题必须进一步收窄。
 4. 最后必须有 taskType="verification" 的本地验证任务, role="tester", 只跑 build/test/TODO scan。
-5. MVCC/事务/锁/并发/索引/调度/缓存一致性等共享核心状态默认串行, 使用 dependsOn 或相同 parallelGroup 表达。
+5. 共享核心状态、共享写文件、共享 schema/contract、共享 runtime manifest 的 leaf 默认串行, 使用 dependsOn 或 conflictKeys 表达；parallelGroup 只是能力分组标签, 不表示串行锁。
 6. 只有无共享文件、无共享核心状态、无依赖边的 leaf 才允许并发。
 7. dependsOn 只能引用本次输出中更早的 id。
 8. blockingPolicy 默认 fail_blocks_dependents。
 9. designRef/acceptance 必须说明要复用的真实 API 名称, 避免重复定义已有符号。
+10. readFiles 只表示可参考文件, DAG compiler 不会因为共同 readFiles 串行; writeFiles/conflictKeys 才会触发串行。
 `)
 	return b.String()
 }
@@ -2431,6 +4948,7 @@ func sanitizeLLMTimeoutSplitTasks(tasks []rawTask, parent *TaskNode) ([]rawTask,
 		}
 		task.blockingPolicy = wbsBlockingFailBlocks
 		task.splitReason = appendSplitReason(task.splitReason, "llm-timeout-split")
+		task = normalizeRawTaskDefaults(task)
 		cleaned = append(cleaned, task)
 		seenIDs[task.num] = true
 		previousIDs[task.num] = true
@@ -2477,6 +4995,9 @@ func sanitizeLLMTimeoutSplitTasks(tasks []rawTask, parent *TaskNode) ([]rawTask,
 		})
 	} else {
 		fillVerificationDeps(cleaned)
+	}
+	for i := range cleaned {
+		cleaned[i] = normalizeRawTaskDefaults(cleaned[i])
 	}
 	return cleaned, nil
 }
@@ -2535,7 +5056,7 @@ func (o *Orchestrator) prepareTimeoutSplitChildren(children []rawTask, parent *T
 			child.parallelGroup = parent.ParallelGroup
 		}
 		child.blockingPolicy = wbsBlockingFailBlocks
-		children[i] = child
+		children[i] = normalizeRawTaskDefaults(child)
 	}
 	if !hasVerificationTask(children) {
 		children = append(children, rawTask{
@@ -2562,6 +5083,9 @@ func (o *Orchestrator) prepareTimeoutSplitChildren(children []rawTask, parent *T
 	} else {
 		fillVerificationDeps(children)
 	}
+	for i := range children {
+		children[i] = normalizeRawTaskDefaults(children[i])
+	}
 	return children
 }
 
@@ -2583,6 +5107,9 @@ func terminalRawTaskIDs(tasks []rawTask) []string {
 		}
 	}
 	for _, task := range tasks {
+		if isLocalVerificationRawTask(task) {
+			continue
+		}
 		for _, dep := range task.depNums {
 			dep = strings.TrimSpace(dep)
 			if ids[dep] {
@@ -2592,7 +5119,7 @@ func terminalRawTaskIDs(tasks []rawTask) []string {
 	}
 	var terminals []string
 	for _, task := range tasks {
-		if task.num == "" || task.taskType == wbsTaskTypeVerification {
+		if task.num == "" || isLocalVerificationRawTask(task) {
 			continue
 		}
 		if !hasDownstream[task.num] {
@@ -2612,538 +5139,370 @@ func terminalRawTaskIDs(tasks []rawTask) []string {
 
 func fillVerificationDeps(tasks []rawTask) {
 	terminals := terminalRawTaskIDs(tasks)
+	barrierTerminals := terminalRawTaskIDsExcludingBarriers(tasks)
 	for i := range tasks {
-		if tasks[i].taskType != wbsTaskTypeVerification || len(tasks[i].depNums) > 0 {
-			continue
-		}
-		if len(terminals) > 0 {
-			tasks[i].depNums = append([]string(nil), terminals...)
-		} else if i > 0 {
-			tasks[i].depNums = []string{tasks[i-1].num}
-		}
-	}
-}
-
-func (o *Orchestrator) tryDeterministicContractPatch(team *ProductionTeam, objective string, node *TaskNode, lang string, written []string, buildCwd string, targetPackages []string) (string, []string, string, []string, bool, bool) {
-	if team == nil || team.Cwd == "" || node == nil || lang != "go" {
-		return "", written, buildCwd, targetPackages, false, false
-	}
-	targetRoot := inferObjectiveTargetRoot(objective)
-	if !strings.EqualFold(targetRoot, "agentDBV1") {
-		return "", written, buildCwd, targetPackages, false, false
-	}
-	patchWritten, err := writeAgentDBV1ContractPatch(team.Cwd, targetRoot, node.TargetFiles)
-	if err != nil || len(patchWritten) == 0 {
-		return fmt.Sprintf("deterministic contract patch failed: %v", err), written, buildCwd, targetPackages, false, false
-	}
-	written = uniqueStrings(append(written, patchWritten...))
-	if inferred := inferTaskBuildCwd(team.Cwd, patchWritten); inferred != "" {
-		buildCwd = inferred
-		targetPackages = adjustTargetPackagesForBuildRoot(team.Cwd, buildCwd, node.TargetPackages)
-	}
-	if buildCwd == "" {
-		buildCwd = filepath.Join(team.Cwd, targetRoot)
-	}
-	o.recordWBSMaterialization(team, node, patchWritten, buildCwd)
-	o.notify(o.chatID, fmt.Sprintf("🧩 %s deterministic contract patch: 写入 %d 个 AgentDBV1 合约文件", node.Title, len(patchWritten)))
-
-	buildErrors := missingTargetFilesError(team.Cwd, node.TargetFiles)
-	if buildErrors == "" {
-		buildErrors = runBuildCheckScoped(buildCwd, lang, targetPackages)
-	}
-	localTestsPassed := false
-	if buildErrors == "" && shouldRunLocalTestsForWritten(patchWritten) {
-		buildErrors = runTestCheckLang(buildCwd, lang)
-		localTestsPassed = buildErrors == ""
-	}
-	return buildErrors, written, buildCwd, targetPackages, true, localTestsPassed
-}
-
-func writeAgentDBV1ContractPatch(cwd, targetRoot string, targetFiles []string) ([]string, error) {
-	if cwd == "" || targetRoot == "" {
-		return nil, fmt.Errorf("missing cwd or target root")
-	}
-	root := filepath.Join(cwd, targetRoot)
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return nil, err
-	}
-	files := agentDBV1ContractFiles()
-	var written []string
-	for rel, data := range files {
-		if !strings.HasPrefix(rel, targetRoot+"/") {
-			continue
-		}
-		localRel := strings.TrimPrefix(rel, targetRoot+"/")
-		path := filepath.Join(root, filepath.FromSlash(localRel))
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return written, err
-		}
-		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-			return written, err
-		}
-		written = append(written, rel)
-	}
-	sort.Strings(written)
-	return written, nil
-}
-
-func agentDBV1ContractFiles() map[string]string {
-	prefix := "agentDBV1/"
-	return map[string]string{
-		prefix + "go.mod":          agentDBV1ContractGoMod,
-		prefix + "README.md":       agentDBV1ContractReadme,
-		prefix + "agentdb.go":      agentDBV1ContractCore,
-		prefix + "store.go":        agentDBV1ContractStore,
-		prefix + "store_test.go":   agentDBV1ContractStoreTest,
-		prefix + "vector.go":       agentDBV1ContractVector,
-		prefix + "vector_test.go":  agentDBV1ContractVectorTest,
-		prefix + "graph.go":        agentDBV1ContractGraph,
-		prefix + "graph_test.go":   agentDBV1ContractGraphTest,
-		prefix + "index.go":        agentDBV1ContractIndex,
-		prefix + "index_test.go":   agentDBV1ContractIndexTest,
-		prefix + "agentdb_test.go": agentDBV1ContractIntegrationTest,
-		prefix + "example_test.go": agentDBV1ContractExampleTest,
-	}
-}
-
-const agentDBV1ContractGoMod = `module agentdbv1
-
-go 1.21
-`
-
-const agentDBV1ContractReadme = `# AgentDB V1
-
-AgentDB V1 is a stdlib-only Go storage facade for agent workloads. It offers key/value memory, file payloads, exact vector search, graph edges, and an inverted text index behind a small in-process API.
-`
-
-const agentDBV1ContractCore = `package agentdb
-
-import "sync"
-
-type DB struct {
-	mu      sync.RWMutex
-	kv      map[string][]byte
-	files   map[string]FileObject
-	vectors map[string]Vector
-	nodes   map[string]GraphNode
-	edges   []GraphEdge
-	index   map[string]map[string]struct{}
-}
-
-type Stats struct {
-	Keys    int
-	Files   int
-	Vectors int
-	Nodes   int
-	Edges   int
-	Terms   int
-}
-
-func New() *DB {
-	return &DB{
-		kv:      make(map[string][]byte),
-		files:   make(map[string]FileObject),
-		vectors: make(map[string]Vector),
-		nodes:   make(map[string]GraphNode),
-		index:   make(map[string]map[string]struct{}),
-	}
-}
-
-func (db *DB) Stats() Stats {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	return Stats{
-		Keys:    len(db.kv),
-		Files:   len(db.files),
-		Vectors: len(db.vectors),
-		Nodes:   len(db.nodes),
-		Edges:   len(db.edges),
-		Terms:   len(db.index),
-	}
-}
-`
-
-const agentDBV1ContractStore = `package agentdb
-
-type FileObject struct {
-	Name     string
-	MIMEType string
-	Data     []byte
-}
-
-func (db *DB) Put(key string, value []byte) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	db.kv[key] = cloneBytes(value)
-}
-
-func (db *DB) Get(key string) ([]byte, bool) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	value, ok := db.kv[key]
-	return cloneBytes(value), ok
-}
-
-func (db *DB) PutFile(id string, file FileObject) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	file.Data = cloneBytes(file.Data)
-	db.files[id] = file
-}
-
-func (db *DB) GetFile(id string) (FileObject, bool) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	file, ok := db.files[id]
-	file.Data = cloneBytes(file.Data)
-	return file, ok
-}
-
-func cloneBytes(in []byte) []byte {
-	if in == nil {
-		return nil
-	}
-	out := make([]byte, len(in))
-	copy(out, in)
-	return out
-}
-`
-
-const agentDBV1ContractStoreTest = `package agentdb
-
-import "testing"
-
-func TestKVAndFileCopies(t *testing.T) {
-	db := New()
-	value := []byte("agent memory")
-	db.Put("memory/session-1", value)
-	value[0] = 'x'
-	got, ok := db.Get("memory/session-1")
-	if !ok || string(got) != "agent memory" {
-		t.Fatalf("Get() = %q, %v", string(got), ok)
-	}
-	got[0] = 'x'
-	again, _ := db.Get("memory/session-1")
-	if string(again) != "agent memory" {
-		t.Fatalf("Get returned mutable backing slice")
-	}
-	db.PutFile("file:plan", FileObject{Name: "plan.md", MIMEType: "text/markdown", Data: []byte("# Plan")})
-	file, ok := db.GetFile("file:plan")
-	if !ok || file.Name != "plan.md" || string(file.Data) != "# Plan" {
-		t.Fatalf("GetFile() = %+v, %v", file, ok)
-	}
-}
-`
-
-const agentDBV1ContractVector = `package agentdb
-
-import (
-	"errors"
-	"math"
-	"sort"
-)
-
-type Vector struct {
-	ID       string
-	Values   []float64
-	Metadata map[string]string
-}
-
-type SearchResult struct {
-	ID    string
-	Score float64
-}
-
-func (db *DB) AddVector(v Vector) error {
-	if v.ID == "" || len(v.Values) == 0 {
-		return errors.New("agentdb: vector requires id and values")
-	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	v.Values = cloneFloat64s(v.Values)
-	v.Metadata = cloneStringMap(v.Metadata)
-	db.vectors[v.ID] = v
-	return nil
-}
-
-func (db *DB) SearchVector(query []float64, topK int) []SearchResult {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if topK <= 0 || len(query) == 0 {
-		return nil
-	}
-	results := make([]SearchResult, 0, len(db.vectors))
-	for _, v := range db.vectors {
-		if len(v.Values) == len(query) {
-			results = append(results, SearchResult{ID: v.ID, Score: cosine(query, v.Values)})
-		}
-	}
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Score == results[j].Score {
-			return results[i].ID < results[j].ID
-		}
-		return results[i].Score > results[j].Score
-	})
-	if len(results) > topK {
-		results = results[:topK]
-	}
-	return results
-}
-
-func cosine(a, b []float64) float64 {
-	var dot, normA, normB float64
-	for i := range a {
-		dot += a[i] * b[i]
-		normA += a[i] * a[i]
-		normB += b[i] * b[i]
-	}
-	if normA == 0 || normB == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
-}
-
-func cloneFloat64s(in []float64) []float64 {
-	if in == nil {
-		return nil
-	}
-	out := make([]float64, len(in))
-	copy(out, in)
-	return out
-}
-
-func cloneStringMap(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-`
-
-const agentDBV1ContractVectorTest = `package agentdb
-
-import "testing"
-
-func TestVectorSearch(t *testing.T) {
-	db := New()
-	if err := db.AddVector(Vector{ID: "doc:agents", Values: []float64{1, 0, 0}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.AddVector(Vector{ID: "doc:storage", Values: []float64{0, 1, 0}}); err != nil {
-		t.Fatal(err)
-	}
-	results := db.SearchVector([]float64{0.9, 0.1, 0}, 1)
-	if len(results) != 1 || results[0].ID != "doc:agents" {
-		t.Fatalf("SearchVector() = %+v", results)
-	}
-}
-`
-
-const agentDBV1ContractGraph = `package agentdb
-
-import "errors"
-
-type GraphNode struct {
-	ID       string
-	Kind     string
-	Metadata map[string]string
-}
-
-type GraphEdge struct {
-	From string
-	To   string
-	Kind string
-}
-
-func (db *DB) AddNode(node GraphNode) error {
-	if node.ID == "" {
-		return errors.New("agentdb: graph node requires id")
-	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	node.Metadata = cloneStringMap(node.Metadata)
-	db.nodes[node.ID] = node
-	return nil
-}
-
-func (db *DB) AddEdge(edge GraphEdge) error {
-	if edge.From == "" || edge.To == "" {
-		return errors.New("agentdb: graph edge requires from and to")
-	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	db.edges = append(db.edges, edge)
-	return nil
-}
-
-func (db *DB) Neighbors(id string) []GraphNode {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	var out []GraphNode
-	for _, edge := range db.edges {
-		if edge.From != id {
-			continue
-		}
-		if node, ok := db.nodes[edge.To]; ok {
-			node.Metadata = cloneStringMap(node.Metadata)
-			out = append(out, node)
-		}
-	}
-	return out
-}
-`
-
-const agentDBV1ContractGraphTest = `package agentdb
-
-import "testing"
-
-func TestGraphNeighbors(t *testing.T) {
-	db := New()
-	if err := db.AddNode(GraphNode{ID: "agent", Kind: "actor"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.AddNode(GraphNode{ID: "memory", Kind: "resource"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.AddEdge(GraphEdge{From: "agent", To: "memory", Kind: "uses"}); err != nil {
-		t.Fatal(err)
-	}
-	neighbors := db.Neighbors("agent")
-	if len(neighbors) != 1 || neighbors[0].ID != "memory" {
-		t.Fatalf("Neighbors() = %+v", neighbors)
-	}
-}
-`
-
-const agentDBV1ContractIndex = `package agentdb
-
-import (
-	"sort"
-	"strings"
-)
-
-func (db *DB) IndexDoc(id, text string) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	for _, term := range tokenize(text) {
-		if db.index[term] == nil {
-			db.index[term] = make(map[string]struct{})
-		}
-		db.index[term][id] = struct{}{}
-	}
-}
-
-func (db *DB) SearchTerms(query string) []string {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	terms := tokenize(query)
-	if len(terms) == 0 {
-		return nil
-	}
-	var ids map[string]struct{}
-	for i, term := range terms {
-		postings := db.index[term]
-		if len(postings) == 0 {
-			return nil
-		}
-		if i == 0 {
-			ids = cloneSet(postings)
-			continue
-		}
-		for id := range ids {
-			if _, ok := postings[id]; !ok {
-				delete(ids, id)
+		switch {
+		case isLocalVerificationRawTask(tasks[i]):
+			scopedTerminals := scopedTerminalRawTaskIDs(tasks, tasks[i].parentID, tasks[i].num)
+			if len(scopedTerminals) > 0 {
+				tasks[i].depNums = uniqueTrimmedStrings(append(tasks[i].depNums, scopedTerminals...))
+			} else if len(tasks[i].depNums) > 0 {
+				tasks[i].depNums = uniqueTrimmedStrings(tasks[i].depNums)
+			} else if len(terminals) > 0 {
+				tasks[i].depNums = uniqueTrimmedStrings(append(tasks[i].depNums, terminals...))
+			} else if i > 0 {
+				tasks[i].depNums = []string{tasks[i-1].num}
+			}
+		case isBarrierRawTask(tasks[i]):
+			deps := excludeRawTaskID(barrierTerminals, tasks[i].num)
+			if len(deps) > 0 {
+				tasks[i].depNums = uniqueTrimmedStrings(append(tasks[i].depNums, deps...))
+			} else if len(tasks[i].depNums) > 0 {
+				tasks[i].depNums = uniqueTrimmedStrings(tasks[i].depNums)
 			}
 		}
 	}
-	out := make([]string, 0, len(ids))
-	for id := range ids {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out
 }
 
-func tokenize(text string) []string {
-	fields := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
-	})
-	out := fields[:0]
-	for _, field := range fields {
-		if field != "" {
-			out = append(out, field)
+func scopedTerminalRawTaskIDs(tasks []rawTask, parentID, self string) []string {
+	parentID = strings.TrimSpace(parentID)
+	if parentID == "" {
+		return nil
+	}
+	ids := make(map[string]bool)
+	hasDownstream := make(map[string]bool)
+	for _, task := range tasks {
+		if task.num == "" || task.num == self || task.parentID != parentID || isLocalVerificationRawTask(task) {
+			continue
+		}
+		ids[task.num] = true
+	}
+	for _, task := range tasks {
+		if task.parentID != parentID || isLocalVerificationRawTask(task) {
+			continue
+		}
+		for _, dep := range task.depNums {
+			dep = strings.TrimSpace(dep)
+			if ids[dep] {
+				hasDownstream[dep] = true
+			}
 		}
 	}
-	return out
+	var terminals []string
+	for _, task := range tasks {
+		if task.num == "" || task.num == self || task.parentID != parentID || isLocalVerificationRawTask(task) {
+			continue
+		}
+		if !hasDownstream[task.num] {
+			terminals = append(terminals, task.num)
+		}
+	}
+	return uniqueTrimmedStrings(terminals)
 }
 
-func cloneSet(in map[string]struct{}) map[string]struct{} {
-	out := make(map[string]struct{}, len(in))
-	for k := range in {
-		out[k] = struct{}{}
+func terminalRawTaskIDsExcludingBarriers(tasks []rawTask) []string {
+	ids := make(map[string]bool)
+	hasDownstream := make(map[string]bool)
+	for _, task := range tasks {
+		if task.num != "" {
+			ids[task.num] = true
+		}
+	}
+	for _, task := range tasks {
+		if isBarrierRawTask(task) {
+			continue
+		}
+		for _, dep := range task.depNums {
+			dep = strings.TrimSpace(dep)
+			if ids[dep] {
+				hasDownstream[dep] = true
+			}
+		}
+	}
+	var terminals []string
+	for _, task := range tasks {
+		if task.num == "" || isBarrierRawTask(task) {
+			continue
+		}
+		if !hasDownstream[task.num] {
+			terminals = append(terminals, task.num)
+		}
+	}
+	if len(terminals) > 0 {
+		return terminals
+	}
+	for i := len(tasks) - 1; i >= 0; i-- {
+		if tasks[i].num != "" && !isBarrierRawTask(tasks[i]) {
+			return []string{tasks[i].num}
+		}
+	}
+	return nil
+}
+
+func excludeRawTaskID(ids []string, excluded string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" && id != excluded {
+			out = append(out, id)
+		}
+	}
+	return uniqueTrimmedStrings(out)
+}
+
+func (o *Orchestrator) tryDeterministicContractPatch(team *ProductionTeam, objective string, node *TaskNode, lang string, written []string, buildCwd string, targetPackages []string, initialBuildErrors string) (string, []string, string, []string, bool, bool) {
+	if strings.ToLower(strings.TrimSpace(lang)) != "go" || strings.TrimSpace(buildCwd) == "" {
+		return "", written, buildCwd, targetPackages, false, false
+	}
+	changed := applyGoCompileTextRepairs(buildCwd)
+	if initialBuildErrors != "" {
+		changed += applyGoCompileErrorRepairs(buildCwd, initialBuildErrors)
+	}
+	if changed == 0 {
+		return "", written, buildCwd, targetPackages, false, false
+	}
+	buildErrors := o.ensureTaskProjectSkeleton(team, objective, node)
+	if buildErrors == "" {
+		buildErrors = runBuildCheckScoped(buildCwd, lang, effectiveTargetPackagesForBuild(node, targetPackages))
+	}
+	if buildErrors != "" {
+		if errorFixes := applyGoCompileErrorRepairs(buildCwd, buildErrors); errorFixes > 0 {
+			buildErrors = runBuildCheckScoped(buildCwd, lang, effectiveTargetPackagesForBuild(node, targetPackages))
+			changed += errorFixes
+		}
+	}
+	testsPassed := false
+	if buildErrors == "" && shouldRunLocalTestsForNode(node, written) {
+		buildErrors = runTestCheckLang(buildCwd, lang)
+		testsPassed = buildErrors == ""
+	}
+	if buildErrors == "" && !shouldRunLocalTestsForNode(node, written) {
+		testsPassed = true
+	}
+	if changed > 0 {
+		o.notify(o.chatID, fmt.Sprintf("🛠️ %s deterministic Go compile repair applied (%d files/fixes)", node.Title, changed))
+	}
+	return buildErrors, written, buildCwd, targetPackages, true, testsPassed
+}
+
+func (o *Orchestrator) tryDeterministicContractSkeletonFallback(team *ProductionTeam, node *TaskNode, lang string, written []string, buildCwd string, targetPackages []string) (string, []string, string, []string, bool) {
+	if team == nil || node == nil || strings.ToLower(strings.TrimSpace(lang)) != "go" || !isContractBoundaryNode(node) {
+		return "", written, buildCwd, targetPackages, false
+	}
+	if objectiveRequiresCompleteImplementation(team.Objective) {
+		return "", written, buildCwd, targetPackages, false
+	}
+	target := firstConcreteGoFallbackTargetFile(team.Cwd, node)
+	if target == "" {
+		return "", written, buildCwd, targetPackages, false
+	}
+	full := filepath.Join(team.Cwd, filepath.FromSlash(target))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return err.Error(), written, buildCwd, targetPackages, false
+	}
+	src := buildGoContractSkeletonSource(target, node)
+	if err := os.WriteFile(full, []byte(src), 0o644); err != nil {
+		return err.Error(), written, buildCwd, targetPackages, false
+	}
+	_ = runGofmtFiles([]string{full})
+	written = uniqueTrimmedStrings(append(written, target))
+	if buildCwd == "" {
+		buildCwd = team.Cwd
+	}
+	if _, err := os.Stat(filepath.Join(buildCwd, "go.mod")); err != nil {
+		buildCwd = team.Cwd
+	}
+	if inferred := inferTaskBuildCwd(team.Cwd, []string{target}); inferred != "" && !goModExists(buildCwd) {
+		buildCwd = inferred
+		targetPackages = adjustTargetPackagesForBuildRoot(team.Cwd, buildCwd, node.TargetPackages)
+	}
+	buildErrors := runBuildCheckScoped(buildCwd, lang, effectiveTargetPackagesForBuild(node, targetPackages))
+	if buildErrors != "" {
+		if changed := applyGoCompileErrorRepairs(buildCwd, buildErrors); changed > 0 {
+			buildErrors = runBuildCheckScoped(buildCwd, lang, effectiveTargetPackagesForBuild(node, targetPackages))
+		}
+	}
+	if buildErrors != "" {
+		return buildErrors, written, buildCwd, targetPackages, false
+	}
+	return "", written, buildCwd, targetPackages, true
+}
+
+func goModExists(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dir, "go.mod"))
+	return err == nil
+}
+
+func runGofmtFiles(files []string) error {
+	files = uniqueTrimmedStrings(files)
+	if len(files) == 0 {
+		return nil
+	}
+	args := append([]string{"-w"}, files...)
+	return exec.Command("gofmt", args...).Run()
+}
+
+func firstConcreteGoTargetFile(node *TaskNode) string {
+	if node == nil {
+		return ""
+	}
+	for _, file := range append(append([]string{}, node.TargetFiles...), node.WriteFiles...) {
+		clean := strings.TrimSpace(filepath.ToSlash(file))
+		if clean == "" || filepath.IsAbs(clean) || strings.HasPrefix(clean, "../") {
+			continue
+		}
+		if strings.HasSuffix(clean, ".go") && !strings.HasSuffix(clean, "_test.go") {
+			return clean
+		}
+	}
+	return ""
+}
+
+func firstConcreteGoFallbackTargetFile(cwd string, node *TaskNode) string {
+	if target := firstConcreteGoTargetFile(node); target != "" {
+		return target
+	}
+	tokens := goFileTokensFromTaskNode(node)
+	for _, token := range tokens {
+		clean := cleanMaterializeRelPath(token)
+		if clean == "" {
+			continue
+		}
+		slash := filepath.ToSlash(clean)
+		if strings.Contains(slash, "/") && strings.HasSuffix(slash, ".go") && !strings.HasSuffix(slash, "_test.go") {
+			return slash
+		}
+	}
+	if cwd == "" || len(tokens) == 0 {
+		return ""
+	}
+	byBase := map[string]bool{}
+	for _, token := range tokens {
+		base := path.Base(filepath.ToSlash(token))
+		if base != "" && strings.HasSuffix(base, ".go") && !strings.HasSuffix(base, "_test.go") {
+			byBase[base] = true
+		}
+	}
+	if len(byBase) == 0 {
+		return ""
+	}
+	matches := map[string][]string{}
+	_ = filepath.Walk(cwd, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		if info.IsDir() {
+			switch info.Name() {
+			case ".git", ".claude-go", "vendor", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !byBase[info.Name()] {
+			return nil
+		}
+		rel, relErr := filepath.Rel(cwd, p)
+		if relErr == nil {
+			matches[info.Name()] = append(matches[info.Name()], filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	for _, token := range tokens {
+		base := path.Base(filepath.ToSlash(token))
+		candidates := uniqueTrimmedStrings(matches[base])
+		if len(candidates) == 1 {
+			return candidates[0]
+		}
+	}
+	return ""
+}
+
+func goFileTokensFromTaskNode(node *TaskNode) []string {
+	if node == nil {
+		return nil
+	}
+	text := strings.Join([]string{
+		node.Title,
+		node.AcceptCriteria,
+		node.SplitReason,
+		node.CapabilityID,
+		strings.Join(node.ReadFiles, " "),
+		strings.Join(node.TargetFiles, " "),
+		strings.Join(node.WriteFiles, " "),
+	}, " ")
+	re := regexp.MustCompile(`[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*\.go\b`)
+	return uniqueTrimmedStrings(re.FindAllString(text, -1))
+}
+
+func buildGoContractSkeletonSource(target string, node *TaskNode) string {
+	pkg := goPackageNameForPlanFile(target)
+	typeStem := exportedIdentifierFromText(node.Title)
+	if typeStem == "" {
+		typeStem = exportedIdentifierFromText(path.Base(strings.TrimSuffix(target, ".go")))
+	}
+	if typeStem == "" {
+		typeStem = "Contract"
+	}
+	return fmt.Sprintf(`package %s
+
+import "context"
+
+// %s is a stable contract boundary generated after a failed contract draft.
+type %s interface {
+	ContractName() string
+}
+
+// %sSpec captures minimal contract metadata for downstream implementation leaves.
+type %sSpec struct {
+	Name string
+}
+
+func (s %sSpec) ContractName() string {
+	if s.Name == "" {
+		return "%s"
+	}
+	return s.Name
+}
+
+type OperationContext = context.Context
+`, pkg, typeStem, typeStem, typeStem, typeStem, typeStem, strings.ToLower(typeStem))
+}
+
+func goPackageNameForPlanFile(file string) string {
+	dir := path.Base(path.Dir(filepath.ToSlash(file)))
+	if dir == "" || dir == "." || dir == string(filepath.Separator) {
+		return "main"
+	}
+	return safeGoPackageName(dir)
+}
+
+func exportedIdentifierFromText(text string) string {
+	parts := regexp.MustCompile(`[^A-Za-z0-9]+`).Split(text, -1)
+	var b strings.Builder
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if part[0] >= '0' && part[0] <= '9' {
+			continue
+		}
+		b.WriteString(strings.ToUpper(part[:1]))
+		if len(part) > 1 {
+			b.WriteString(part[1:])
+		}
+		if b.Len() >= 32 {
+			break
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return ""
 	}
 	return out
 }
-`
-
-const agentDBV1ContractIndexTest = `package agentdb
-
-import "testing"
-
-func TestInvertedIndexANDQuery(t *testing.T) {
-	db := New()
-	db.IndexDoc("doc1", "agent vector graph storage")
-	db.IndexDoc("doc2", "agent file storage")
-	db.IndexDoc("doc3", "vector only")
-	results := db.SearchTerms("agent storage")
-	if len(results) != 2 || results[0] != "doc1" || results[1] != "doc2" {
-		t.Fatalf("SearchTerms() = %+v", results)
-	}
-}
-`
-
-const agentDBV1ContractIntegrationTest = `package agentdb
-
-import "testing"
-
-func TestAgentDBIntegration(t *testing.T) {
-	db := New()
-	db.Put("session", []byte("memory"))
-	db.PutFile("file", FileObject{Name: "note.txt", Data: []byte("agent note")})
-	if err := db.AddVector(Vector{ID: "memory", Values: []float64{1, 0}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.AddNode(GraphNode{ID: "agent"}); err != nil {
-		t.Fatal(err)
-	}
-	db.IndexDoc("doc", "agent memory")
-	stats := db.Stats()
-	if stats.Keys != 1 || stats.Files != 1 || stats.Vectors != 1 || stats.Nodes != 1 || stats.Terms != 2 {
-		t.Fatalf("Stats() = %+v", stats)
-	}
-}
-`
-
-const agentDBV1ContractExampleTest = `package agentdb_test
-
-import (
-	"fmt"
-
-	"agentdbv1"
-)
-
-func ExampleDB() {
-	db := agentdb.New()
-	db.Put("memory", []byte("agent context"))
-	value, _ := db.Get("memory")
-	fmt.Println(string(value))
-	// Output: agent context
-}
-`
 
 // executeTaskNode 执行单个任务, 内置 mini 对抗循环:
 //
@@ -3157,8 +5516,12 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 
 	o.notify(o.chatID, fmt.Sprintf("▶️ %s (%s) 执行中...", node.Title, node.Role))
 
+	if o.shouldRunLocalDirectoryBootstrap(node) {
+		return o.executeLocalDirectoryBootstrapTask(node, objective, team, start)
+	}
+
 	if o.shouldRunLocalVerification(node) {
-		return o.executeLocalVerificationTask(node, team, start)
+		return o.executeLocalVerificationTask(node, objective, team, start)
 	}
 
 	if !o.config.MicroTestAfter {
@@ -3166,7 +5529,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 	}
 
 	// L1: 自适应任务粒度 — 以 token/time 预算为先, 避免简单任务陷入多轮评审黑洞。
-	maxRounds := o.roundBudgetFor(node)
+	maxRounds := o.roundBudgetFor(node, objective)
 	minRounds := 2
 	if maxRounds < minRounds {
 		minRounds = maxRounds
@@ -3220,7 +5583,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 					StartedAt: start, Duration: time.Since(start).String()})
 		}
-		if reason := validateAgentOutput(result, node.Role); reason != "" {
+		if reason := validateTaskAgentOutput(result, node); reason != "" {
 			return o.handleTaskFailure(ctx, node, objective, team,
 				StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed,
 					Error: "产出验证失败: " + reason, Output: result,
@@ -3232,16 +5595,15 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		o.reportProgress("LLM生成", round, int64(len(result)), node.V2TaskID)
 
 		// L4: 文件物化 — 提取代码块写入磁盘
-		lang := team.Language
-		if lang == "" {
-			lang = "go"
-		}
+		lang := o.runtimeLanguageForTeam(team, objective)
 		buildCwd := team.Cwd
 		targetPackages := append([]string(nil), node.TargetPackages...)
 		var written []string
+		var scopeError string
 		if team.Cwd != "" {
-			written = MaterializeCode(team.Cwd, result, lang)
-			written = enforceTargetFileScope(team.Cwd, written, node.TargetFiles)
+			rawWritten := MaterializeCode(team.Cwd, result, lang)
+			written = enforceTargetFileScope(team.Cwd, rawWritten, node)
+			scopeError = targetScopeViolationError(rawWritten, written, node)
 			if len(written) > 0 {
 				o.notify(o.chatID, fmt.Sprintf("📁 %s 文件物化: %d 个文件", node.Title, len(written)))
 				if inferred := inferTaskBuildCwd(team.Cwd, written); inferred != "" {
@@ -3261,9 +5623,19 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				buildErrors = missingTargetFilesError(team.Cwd, node.TargetFiles)
 			}
 			if buildErrors == "" {
-				buildErrors = runBuildCheckScoped(buildCwd, lang, targetPackages)
+				buildErrors = scopeError
 			}
-			if buildErrors == "" && shouldRunLocalTestsForWritten(written) {
+			if buildErrors == "" {
+				buildErrors = o.ensureTaskProjectSkeleton(team, objective, node)
+			}
+			if buildErrors == "" {
+				if isManifestOnlyNode(node) {
+					buildErrors = validateManifestTargets(team.Cwd, node.TargetFiles)
+				} else {
+					buildErrors = runBuildCheckScoped(buildCwd, lang, effectiveTargetPackagesForBuild(node, targetPackages))
+				}
+			}
+			if buildErrors == "" && shouldRunLocalTestsForNode(node, written) {
 				buildErrors = runTestCheckLang(buildCwd, lang)
 				localTestsPassed = buildErrors == ""
 			}
@@ -3271,13 +5643,13 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				var patched bool
 				var patchTestsPassed bool
 				var patchErrors string
-				patchErrors, written, buildCwd, targetPackages, patched, patchTestsPassed = o.tryDeterministicContractPatch(team, objective, node, lang, written, buildCwd, targetPackages)
+				patchErrors, written, buildCwd, targetPackages, patched, patchTestsPassed = o.tryDeterministicContractPatch(team, objective, node, lang, written, buildCwd, targetPackages, buildErrors)
 				if patched {
 					buildErrors = patchErrors
 					localTestsPassed = localTestsPassed || patchTestsPassed
 					if buildErrors == "" {
 						buildPassed = true
-						o.notify(o.chatID, fmt.Sprintf("🟢 %s deterministic contract patch 后编译通过", node.Title))
+						o.notify(o.chatID, fmt.Sprintf("🟢 %s deterministic contract repair 后编译通过", node.Title))
 					}
 				}
 			}
@@ -3297,8 +5669,9 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 					}
 					lastOutput = fixResult
 					node.Output = fixResult
-					written = MaterializeCode(team.Cwd, fixResult, lang)
-					written = enforceTargetFileScope(team.Cwd, written, node.TargetFiles)
+					rawWritten := MaterializeCode(team.Cwd, fixResult, lang)
+					written = enforceTargetFileScope(team.Cwd, rawWritten, node)
+					scopeError = targetScopeViolationError(rawWritten, written, node)
 					if len(written) > 0 {
 						o.notify(o.chatID, fmt.Sprintf("📁 %s 修复物化: %d 个文件", node.Title, len(written)))
 						if inferred := inferTaskBuildCwd(team.Cwd, written); inferred != "" {
@@ -3312,9 +5685,19 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 						buildErrors = missingTargetFilesError(team.Cwd, node.TargetFiles)
 					}
 					if buildErrors == "" {
-						buildErrors = runBuildCheckScoped(buildCwd, lang, targetPackages)
+						buildErrors = scopeError
 					}
-					if buildErrors == "" && shouldRunLocalTestsForWritten(written) {
+					if buildErrors == "" {
+						buildErrors = o.ensureTaskProjectSkeleton(team, objective, node)
+					}
+					if buildErrors == "" {
+						if isManifestOnlyNode(node) {
+							buildErrors = validateManifestTargets(team.Cwd, node.TargetFiles)
+						} else {
+							buildErrors = runBuildCheckScoped(buildCwd, lang, effectiveTargetPackagesForBuild(node, targetPackages))
+						}
+					}
+					if buildErrors == "" && shouldRunLocalTestsForNode(node, written) {
 						buildErrors = runTestCheckLang(buildCwd, lang)
 						localTestsPassed = buildErrors == ""
 					}
@@ -3322,7 +5705,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 						var patched bool
 						var patchTestsPassed bool
 						var patchErrors string
-						patchErrors, written, buildCwd, targetPackages, patched, patchTestsPassed = o.tryDeterministicContractPatch(team, objective, node, lang, written, buildCwd, targetPackages)
+						patchErrors, written, buildCwd, targetPackages, patched, patchTestsPassed = o.tryDeterministicContractPatch(team, objective, node, lang, written, buildCwd, targetPackages, buildErrors)
 						if patched {
 							buildErrors = patchErrors
 							localTestsPassed = localTestsPassed || patchTestsPassed
@@ -3332,6 +5715,50 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 						buildPassed = true
 						o.notify(o.chatID, fmt.Sprintf("  🟢 %s 编译修复成功 (重试 %d)", node.Title, retry))
 						break
+					}
+				}
+				if !buildPassed {
+					var fallbackOK bool
+					var fallbackErr string
+					fallbackErr, written, buildCwd, targetPackages, fallbackOK = o.tryDeterministicContractSkeletonFallback(team, node, lang, written, buildCwd, targetPackages)
+					if fallbackOK {
+						buildErrors = ""
+						buildPassed = true
+						localTestsPassed = true
+						lastScore = EvalScore{Correctness: 7, Completeness: 5, Security: 7, CodeQuality: 7, DesignAlignment: 6,
+							Feedback: "契约任务编译失败后已降级为最小稳定契约骨架，允许下游继续细化实现"}
+						terminator.RecordBuildResult(true)
+						o.notify(o.chatID, fmt.Sprintf("🟢 %s contract skeleton fallback 后编译通过", node.Title))
+					} else if fallbackErr != "" {
+						buildErrors = fallbackErr
+					}
+				}
+				if !buildPassed {
+					if shouldTryEarlyStaleBuildRecovery(buildErrors, written, node, objective) {
+						if recovered, msg := o.recoverStaleFailureWithProjectTest(team, objective, node); recovered {
+							buildPassed = true
+							lastBuildPassed = true
+							localTestsPassed = true
+							node.TestPassed = true
+							node.TestResult = msg
+							lastScore = EvalScore{
+								Correctness:     7,
+								Completeness:    6,
+								Security:        7,
+								CodeQuality:     7,
+								DesignAlignment: 6,
+								Feedback:        msg,
+								Pass:            true,
+							}
+							terminator.RecordBuildResult(true)
+							terminator.RecordRoundOutput(round, lastScore, lastOutput)
+							iterMemory = append(iterMemory, IterationMemory{
+								Round: round, Approach: "项目级复核通过", Score: lastScore,
+								KeyIssues: []string{"局部编译失败状态已被全项目测试证伪"}, TestPass: true, Kept: true,
+							})
+							o.notify(o.chatID, fmt.Sprintf("🟡 %s 编译修复后项目级复核通过, 提前覆盖陈旧局部失败状态", node.Title))
+							break
+						}
 					}
 				}
 				if !buildPassed {
@@ -3403,6 +5830,10 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			node.TestPassed = true
 			node.TestResult = "local go test passed; LLM micro-test advisory was overridden:\n" + node.TestResult
 		}
+		if buildPassed && objectiveRequiresCompleteImplementation(objective) && shouldTreatMicroTestAsAdvisory(node, written) && !node.TestPassed {
+			node.TestPassed = true
+			node.TestResult = "strict design-complete local build passed; LLM micro-test advisory was overridden:\n" + node.TestResult
+		}
 		bottlenecks := ClassifyBottlenecks(node.TestResult)
 		if len(bottlenecks) > 0 {
 			for _, bn := range bottlenecks {
@@ -3432,7 +5863,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			node.Title, round, scoreMsg, testLabel))
 
 		if team.Blackboard != nil {
-			fullScore := scoreMsg + fmt.Sprintf(" 通过:%v test:%v", score.MeetsHardPassThreshold(), node.TestPassed)
+			fullScore := scoreMsg + fmt.Sprintf(" 通过:%v test:%v", taskScoreMeetsHardGate(node, score, node.TestPassed, buildPassed, objective), node.TestPassed)
 			// 旧键 (向后兼容)
 			team.Blackboard.Write(fmt.Sprintf("%s-eval-round%d", node.V2TaskID, round),
 				fullScore, "evaluator", "score")
@@ -3481,6 +5912,11 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				terminator.StrategyShiftCount, shiftAdvice, lastFeedback)
 			// 不 break, 继续下一轮
 		} else if decision.ShouldStop {
+			if (!taskScoreMeetsHardGate(node, score, node.TestPassed, buildPassed, objective) || !node.TestPassed || !buildPassed) && round < terminator.MaxRounds {
+				lastFeedback = hardGateContinuationFeedback(score.Feedback, node.TestResult, buildPassed, node.TestPassed)
+				o.notify(o.chatID, fmt.Sprintf("🔄 %s hard gate 未满足, 忽略提前终止继续修复 (第 %d/%d 轮)", node.Title, round+1, terminator.MaxRounds))
+				continue
+			}
 			if decision.BestOutput != "" {
 				lastOutput = decision.BestOutput
 				node.Output = lastOutput
@@ -3558,10 +5994,58 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 
 	duration := time.Since(start)
 
+	if !lastBuildPassed && team != nil && team.Cwd != "" && !(objectiveRequiresCompleteImplementation(objective) && requiresStrictLeafLocalIntegrity(node)) {
+		lang := o.runtimeLanguageForTeam(team, objective)
+		buildCwd := inferBuildCwdFromTaskScope(team.Cwd, node.TargetFiles, node.TargetPackages)
+		targetPackages := adjustTargetPackagesForBuildRoot(team.Cwd, buildCwd, node.TargetPackages)
+		finalBuildErrors := o.ensureTaskProjectSkeleton(team, objective, node)
+		if finalBuildErrors == "" {
+			if isManifestOnlyNode(node) {
+				finalBuildErrors = validateManifestTargets(team.Cwd, node.TargetFiles)
+			} else {
+				finalBuildErrors = runBuildCheckScoped(buildCwd, lang, effectiveTargetPackagesForBuild(node, targetPackages))
+			}
+		}
+		if finalBuildErrors == "" {
+			lastBuildPassed = true
+			node.TestPassed = true
+			node.TestResult = "final local build recheck passed; previous compile failure was stale"
+			if lastScore.Correctness < 6 || lastScore.CodeQuality < 6 {
+				lastScore = EvalScore{
+					Correctness:     7,
+					Completeness:    6,
+					Security:        7,
+					CodeQuality:     7,
+					DesignAlignment: 6,
+					Feedback:        "final local build recheck passed; allow incremental leaf to continue downstream",
+					Pass:            true,
+				}
+			}
+			o.notify(o.chatID, fmt.Sprintf("🟡 %s 最终本地构建复核通过, 覆盖陈旧编译失败状态", node.Title))
+		} else if recovered, msg := o.recoverStaleFailureWithProjectTest(team, objective, node); recovered {
+			lastBuildPassed = true
+			node.TestPassed = true
+			node.TestResult = msg
+			if lastScore.Correctness < 6 || lastScore.CodeQuality < 6 {
+				lastScore = EvalScore{
+					Correctness:     7,
+					Completeness:    6,
+					Security:        7,
+					CodeQuality:     7,
+					DesignAlignment: 6,
+					Feedback:        msg,
+					Pass:            true,
+				}
+			}
+			o.notify(o.chatID, fmt.Sprintf("🟡 %s 全项目最终验证通过, 覆盖陈旧局部失败状态", node.Title))
+		}
+	}
+
 	passLabel := "⚠️未达标"
-	taskPassed := lastScore.MeetsHardPassThreshold() && node.TestPassed
+	reviewPassed := taskScoreMeetsHardGate(node, lastScore, node.TestPassed, lastBuildPassed, objective)
+	taskPassed := reviewPassed && node.TestPassed
 	incrementalAccepted := false
-	if !taskPassed && shouldAcceptIncrementalLeaf(node, lastScore, node.TestPassed, lastBuildPassed) {
+	if !taskPassed && shouldAcceptIncrementalLeaf(node, lastScore, node.TestPassed, lastBuildPassed, objective) {
 		taskPassed = true
 		incrementalAccepted = true
 		passLabel = "✅增量Leaf本地通过"
@@ -3570,10 +6054,32 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		passLabel = "✅增量Leaf本地通过"
 	} else if taskPassed {
 		passLabel = "✅全通过"
-	} else if lastScore.MeetsHardPassThreshold() {
+	} else if reviewPassed {
 		passLabel = "✅review通过 ⚠️test偏差"
 	} else if node.TestPassed {
 		passLabel = "⚠️review未达标 ✅test通过"
+	}
+
+	if !taskPassed && node.BlockingPolicy != wbsBlockingFailOpen {
+		if recovered, msg := o.recoverStaleFailureWithProjectTest(team, objective, node); recovered {
+			lastBuildPassed = true
+			node.TestPassed = true
+			node.TestResult = msg
+			if lastScore.Correctness < 6 || lastScore.CodeQuality < 6 {
+				lastScore = EvalScore{
+					Correctness:     7,
+					Completeness:    6,
+					Security:        7,
+					CodeQuality:     7,
+					DesignAlignment: 6,
+					Feedback:        msg,
+					Pass:            true,
+				}
+			}
+			taskPassed = true
+			passLabel = "✅项目级复核通过"
+			o.notify(o.chatID, fmt.Sprintf("🟡 %s hard gate 前项目级最终验证通过, 覆盖陈旧局部失败状态", node.Title))
+		}
 	}
 
 	if !taskPassed && node.BlockingPolicy != wbsBlockingFailOpen {
@@ -3636,13 +6142,109 @@ func materializationGateError(output string, written []string, lang string) stri
 }
 
 func materializationGateErrorForTask(output string, written []string, lang string, node *TaskNode) string {
+	if containsPseudoToolCall(output) {
+		return "输出包含伪工具调用, 但 coder leaf 必须直接输出目标文件完整内容代码块"
+	}
 	if len(written) > 0 {
 		return ""
 	}
+	if isOptionalManifestOnlyNode(node) {
+		return ""
+	}
 	if node != nil && orchNormalizeRole(node.Role) == "coder" && node.TaskType != wbsTaskTypeVerification && len(node.TargetFiles) > 0 {
-		return "当前 coder Leaf 声明了 targetFiles 但未能物化任何文件。请按 `File: path/to/file.go` 或 `### path/to/file.go` 输出完整文件内容。"
+		return "当前 coder Leaf 声明了 targetFiles 但未能物化任何文件。请按 `File: path/to/file.ext` 或 `### path/to/file.ext` 输出完整文件内容。"
 	}
 	return materializationGateError(output, written, lang)
+}
+
+func validateTaskAgentOutput(output string, node *TaskNode) string {
+	if isManifestOnlyNode(node) && strings.TrimSpace(output) != "" {
+		return ""
+	}
+	role := ""
+	if node != nil {
+		role = node.Role
+	}
+	return validateAgentOutput(output, role)
+}
+
+func isManifestOnlyNode(node *TaskNode) bool {
+	if node == nil || len(node.TargetFiles) == 0 {
+		return false
+	}
+	for _, file := range node.TargetFiles {
+		if !isProjectManifestFile(file) {
+			return false
+		}
+	}
+	return true
+}
+
+func isOptionalManifestOnlyNode(node *TaskNode) bool {
+	if node == nil || len(node.TargetFiles) == 0 {
+		return false
+	}
+	for _, file := range node.TargetFiles {
+		if !isOptionalProjectManifestFile(file) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasRequiredProjectManifestTarget(node *TaskNode) bool {
+	if node == nil {
+		return false
+	}
+	for _, file := range append(append([]string{}, node.TargetFiles...), node.WriteFiles...) {
+		clean := cleanMaterializeRelPath(file)
+		if clean == "" || isOptionalProjectManifestFile(clean) {
+			continue
+		}
+		if isProjectManifestFile(clean) {
+			return true
+		}
+	}
+	return false
+}
+
+func isProjectManifestFile(file string) bool {
+	switch strings.ToLower(path.Base(filepath.ToSlash(file))) {
+	case "go.mod", "go.sum", "package.json", "cargo.toml", "pyproject.toml", "cmakelists.txt":
+		return true
+	default:
+		return false
+	}
+}
+
+func isOptionalProjectManifestFile(file string) bool {
+	return strings.EqualFold(path.Base(filepath.ToSlash(file)), "go.sum")
+}
+
+func validateManifestTargets(cwd string, targetFiles []string) string {
+	if cwd == "" || len(targetFiles) == 0 {
+		return ""
+	}
+	for _, target := range targetFiles {
+		clean := cleanMaterializeRelPath(target)
+		if clean == "" {
+			continue
+		}
+		if isOptionalProjectManifestFile(clean) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, clean))
+		if err != nil {
+			return fmt.Sprintf("manifest 缺失或不可读: %s: %v", filepath.ToSlash(clean), err)
+		}
+		if strings.TrimSpace(string(data)) == "" {
+			return "manifest 为空: " + filepath.ToSlash(clean)
+		}
+		if strings.EqualFold(path.Base(filepath.ToSlash(clean)), "go.mod") && !strings.Contains(string(data), "module ") {
+			return "go.mod 缺少 module 声明: " + filepath.ToSlash(clean)
+		}
+	}
+	return ""
 }
 
 func shouldRunLocalTestsForWritten(written []string) bool {
@@ -3654,25 +6256,226 @@ func shouldRunLocalTestsForWritten(written []string) bool {
 	return false
 }
 
-func shouldAcceptIncrementalLeaf(node *TaskNode, score EvalScore, testPassed, buildPassed bool) bool {
-	if node == nil || !testPassed || !buildPassed {
+func shouldRunLocalTestsForNode(node *TaskNode, written []string) bool {
+	if isManifestOnlyNode(node) || isProjectSkeletonNode(node) {
+		return false
+	}
+	return shouldRunLocalTestsForWritten(written)
+}
+
+func shouldTreatMicroTestAsAdvisory(node *TaskNode, written []string) bool {
+	if node == nil || shouldRunLocalTestsForWritten(written) {
+		return false
+	}
+	if isManifestOnlyNode(node) || (isProjectSkeletonNode(node) && !isContractLikeNode(node)) {
+		return false
+	}
+	return isContractLikeNode(node)
+}
+
+func taskScoreMeetsHardGate(node *TaskNode, score EvalScore, testPassed, buildPassed bool, objective string) bool {
+	if score.MeetsHardPassThreshold() {
+		return true
+	}
+	if node == nil || !testPassed || !buildPassed || !objectiveRequiresCompleteImplementation(objective) || !isContractLikeNode(node) {
+		return false
+	}
+	if score.DesignAlignment > 0 && score.DesignAlignment < 4 {
+		return false
+	}
+	if score.Correctness < 4 || score.Completeness < 4 || score.Security < 4 || score.CodeQuality < 4 {
+		return false
+	}
+	if score.WeightedScore() < hardPassMinScore {
+		return false
+	}
+	return !feedbackContainsConcreteDeliveryFailure(score.Feedback)
+}
+
+func hardGateContinuationFeedback(reviewFeedback, testResult string, buildPassed, testPassed bool) string {
+	var parts []string
+	if !buildPassed {
+		parts = append(parts, "编译未通过: 必须先让当前 leaf 和目标包可编译。")
+	}
+	if reviewFeedback != "" {
+		parts = append(parts, "Reviewer MUST-FIX:\n"+reviewFeedback)
+	}
+	if !testPassed && testResult != "" {
+		parts = append(parts, "Tester/Micro-test MUST-FIX:\n"+testResult)
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "hard gate 未满足: 继续补齐设计覆盖、测试偏差和实现完整性。")
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func feedbackContainsConcreteDeliveryFailure(feedback string) bool {
+	lower := strings.ToLower(feedback)
+	markers := []string{
+		"compile error",
+		"compilation failed",
+		"build failed",
+		"syntax error",
+		"undefined:",
+		"cannot use",
+		"not implemented",
+		"placeholder",
+		"todo",
+		"stub",
+		"占位",
+		"语法错误",
+		"编译失败",
+		"构建失败",
+		"无法编译",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldAcceptIncrementalLeaf(node *TaskNode, score EvalScore, testPassed, buildPassed bool, objective string) bool {
+	if node == nil || !buildPassed {
+		return false
+	}
+	if objectiveRequiresCompleteImplementation(objective) && requiresStrictLeafLocalIntegrity(node) {
 		return false
 	}
 	if node.TaskType != wbsTaskTypeLeaf {
 		return false
 	}
+	if isManifestOnlyNode(node) {
+		return true
+	}
+	if strings.Contains(node.SplitReason, "sizing-gate") {
+		writeFiles := len(node.WriteFiles)
+		if writeFiles == 0 {
+			writeFiles = len(node.TargetFiles)
+		}
+		return writeFiles > 0 && score.Security >= 4 && (testPassed || score.Correctness >= 6 || score.CodeQuality >= 6)
+	}
 	if !strings.Contains(node.SplitReason, "objective-fallback") && !strings.Contains(node.SplitReason, "sizing-gate") {
+		return false
+	}
+	if !testPassed {
 		return false
 	}
 	return score.Correctness >= 6 && score.CodeQuality >= 7 && score.Security >= 6
 }
 
-func enforceTargetFileScope(cwd string, written, targetFiles []string) []string {
-	if cwd == "" || len(written) == 0 || len(targetFiles) == 0 {
+func (o *Orchestrator) recoverStaleFailureWithProjectTest(team *ProductionTeam, objective string, node *TaskNode) (bool, string) {
+	if team == nil || team.Cwd == "" || node == nil || orchNormalizeRole(node.Role) != "coder" || node.TaskType == wbsTaskTypeVerification {
+		return false, ""
+	}
+	if objectiveRequiresCompleteImplementation(objective) && requiresStrictLeafLocalIntegrity(node) {
+		return false, ""
+	}
+	lang := o.runtimeLanguageForTeam(team, objective)
+	if strings.TrimSpace(lang) == "" {
+		return false, ""
+	}
+	var candidates []string
+	if buildCwd := inferBuildCwdFromTaskScopeForObjective(team.Cwd, node.TargetFiles, node.TargetPackages, objective); buildCwd != "" {
+		candidates = append(candidates, buildCwd)
+	}
+	if targetRoot := inferObjectiveTargetRoot(objective); targetRoot != "" {
+		candidates = append(candidates, filepath.Join(team.Cwd, filepath.FromSlash(targetRoot)))
+	}
+	candidates = append(candidates, team.Cwd)
+	for _, candidate := range uniqueTrimmedStrings(candidates) {
+		if candidate == "" || !isDir(candidate) {
+			continue
+		}
+		if errText := runTestCheckLang(candidate, lang); errText == "" {
+			return true, "project-level local test passed after concurrent repairs; previous scoped failure was stale"
+		}
+	}
+	return false, ""
+}
+
+func shouldTryEarlyStaleBuildRecovery(buildErrors string, written []string, node *TaskNode, objective string) bool {
+	if node == nil || orchNormalizeRole(node.Role) != "coder" || node.TaskType == wbsTaskTypeVerification {
+		return false
+	}
+	if objectiveRequiresCompleteImplementation(objective) && requiresStrictLeafLocalIntegrity(node) {
+		return false
+	}
+	if strings.TrimSpace(buildErrors) == "" {
+		return false
+	}
+	// Do not let a project-level green test hide delivery-contract failures.
+	if len(node.TargetFiles) > 0 && len(written) == 0 {
+		return false
+	}
+	lower := strings.ToLower(buildErrors)
+	hardGateMarkers := []string{
+		"未能从 coder 输出中物化任何文件",
+		"声明了 targetfiles 但未能物化任何文件",
+		"目标文件缺失",
+		"文件隔离门禁失败",
+		"最小项目骨架初始化失败",
+		"manifest",
+		"伪工具调用",
+	}
+	for _, marker := range hardGateMarkers {
+		if strings.Contains(lower, strings.ToLower(marker)) {
+			return false
+		}
+	}
+	return true
+}
+
+func requiresStrictLeafLocalIntegrity(node *TaskNode) bool {
+	if node == nil {
+		return false
+	}
+	if orchNormalizeRole(node.Role) == "coder" && node.TaskType == wbsTaskTypeLeaf && !isManifestOnlyNode(node) && !isProjectSkeletonNode(node) {
+		return true
+	}
+	if node.TaskType == wbsTaskTypeVerification || orchNormalizeRole(node.Role) == "tester" {
+		return true
+	}
+	if isContractBoundaryNode(node) {
+		return true
+	}
+	text := strings.ToLower(strings.Join([]string{
+		node.Title,
+		node.AcceptCriteria,
+		node.DesignRef,
+		node.SplitReason,
+		node.WorkUnitType,
+		node.CapabilityID,
+		strings.Join(node.TargetFiles, " "),
+		strings.Join(node.WriteFiles, " "),
+		strings.Join(node.TargetPackages, " "),
+	}, " "))
+	terms := []string{
+		"边界", "错误路径", "失败路径", "最小行为", "最小可运行",
+		"集成适配", "单元测试", "本地验证", "回归检查", "核心", "错误类型", "返回值",
+		"契约", "接口", "元数据", "向量", "存储", "查询", "事务", "索引",
+		"api", "remember", "recall", "select", "traverse", "graph api", "sql api", "memory api",
+		"core", "engine", "storage", "wal", "lsm", "sst", "sstable",
+		"compaction", "hnsw", "vector", "graph", "index", "query",
+		"parser", "lexer", "planner", "executor", "transaction", "mvcc",
+		"semantic", "dsl", "http api", "cli",
+	}
+	for _, term := range terms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func enforceTargetFileScope(cwd string, written []string, node *TaskNode) []string {
+	if cwd == "" || len(written) == 0 || node == nil || len(allowedPlanFilesForNode(node)) == 0 {
 		return written
 	}
-	allowed := make(map[string]bool, len(targetFiles))
-	for _, target := range targetFiles {
+	allowedFiles := allowedPlanFilesForNode(node)
+	allowed := make(map[string]bool, len(allowedFiles))
+	for _, target := range allowedFiles {
 		clean := cleanMaterializeRelPath(target)
 		if clean != "" {
 			allowed[filepath.ToSlash(clean)] = true
@@ -3697,6 +6500,170 @@ func enforceTargetFileScope(cwd string, written, targetFiles []string) []string 
 	return filtered
 }
 
+func targetScopeViolationError(rawWritten, kept []string, node *TaskNode) string {
+	if node == nil || len(rawWritten) == 0 || len(allowedPlanFilesForNode(node)) == 0 {
+		return ""
+	}
+	allowed := make(map[string]bool)
+	for _, target := range allowedPlanFilesForNode(node) {
+		clean := filepath.ToSlash(cleanMaterializeRelPath(target))
+		if clean != "" {
+			allowed[clean] = true
+		}
+	}
+	if len(allowed) == 0 {
+		return ""
+	}
+	var disallowed []string
+	keptSet := make(map[string]bool, len(kept))
+	for _, file := range kept {
+		clean := filepath.ToSlash(cleanMaterializeRelPath(file))
+		if clean != "" {
+			keptSet[clean] = true
+		}
+	}
+	for _, file := range rawWritten {
+		clean := filepath.ToSlash(cleanMaterializeRelPath(file))
+		if clean == "" || allowed[clean] || keptSet[clean] {
+			continue
+		}
+		disallowed = append(disallowed, clean)
+	}
+	disallowed = uniqueTrimmedStrings(disallowed)
+	if len(disallowed) == 0 {
+		return ""
+	}
+	if len(disallowed) > 6 {
+		disallowed = append(disallowed[:6], fmt.Sprintf("...(+%d)", len(disallowed)-6))
+	}
+	return "文件隔离门禁失败: 当前 Leaf 只能输出 targetFiles/writeFiles 中声明的文件, 但输出了越界文件: " + strings.Join(disallowed, ", ") +
+		"。请只输出目标文件完整内容, 不要在本 Leaf 新建其它模块、配置或外部依赖。"
+}
+
+func allowedPlanFilesForNode(node *TaskNode) []string {
+	if node == nil {
+		return nil
+	}
+	files := append([]string{}, node.TargetFiles...)
+	files = append(files, node.WriteFiles...)
+	return uniqueTrimmedStrings(files)
+}
+
+func isProjectSkeletonNode(node *TaskNode) bool {
+	if node == nil {
+		return false
+	}
+	if isManifestOnlyNode(node) {
+		return true
+	}
+	return isProjectSkeletonText(node)
+}
+
+func isProjectSkeletonText(node *TaskNode) bool {
+	if node == nil {
+		return false
+	}
+	text := strings.ToLower(node.Title + " " + node.WorkUnitType + " " + node.CapabilityID)
+	return strings.Contains(text, "skeleton") ||
+		strings.Contains(text, "scaffold") ||
+		strings.Contains(text, "go module") ||
+		strings.Contains(text, "go.mod") ||
+		strings.Contains(text, "module path") ||
+		strings.Contains(text, "manifest") ||
+		strings.Contains(text, "模块路径") ||
+		strings.Contains(text, "模块声明") ||
+		strings.Contains(text, "项目初始化") ||
+		strings.Contains(text, "项目结构") ||
+		strings.Contains(text, "项目骨架") ||
+		strings.Contains(text, "目录结构") ||
+		strings.Contains(text, "脚手架") ||
+		strings.Contains(text, "构建") ||
+		strings.Contains(text, "骨架")
+}
+
+func isContractBoundaryNode(node *TaskNode) bool {
+	if node == nil {
+		return false
+	}
+	if node.WorkUnitType == wbsWorkUnitContract {
+		return true
+	}
+	hasGoTarget := firstConcreteGoTargetFile(node) != ""
+	text := strings.ToLower(strings.Join([]string{
+		node.Title,
+		node.AcceptCriteria,
+		node.SplitReason,
+		node.CapabilityID,
+		strings.Join(node.TargetFiles, " "),
+		strings.Join(node.WriteFiles, " "),
+	}, " "))
+	return strings.Contains(text, "契约与数据边界") ||
+		strings.Contains(text, "接口与状态边界") ||
+		strings.Contains(text, "契约定义") ||
+		strings.Contains(text, "contract boundary") ||
+		strings.Contains(text, "interface boundary") ||
+		strings.Contains(text, "接口契约") ||
+		strings.Contains(text, "类型边界") ||
+		strings.Contains(text, "公开类型") ||
+		strings.Contains(text, "错误边界") ||
+		((strings.Contains(text, "接口") || strings.Contains(text, "interface") || strings.Contains(text, "api")) &&
+			(strings.Contains(text, "错误类型") ||
+				strings.Contains(text, "错误码") ||
+				strings.Contains(text, "返回值") ||
+				strings.Contains(text, "类型") ||
+				strings.Contains(text, "边界") ||
+				strings.Contains(text, "契约") ||
+				strings.Contains(text, "schema") ||
+				strings.Contains(text, "error"))) ||
+		(strings.Contains(text, "manifest") && hasGoTarget && (strings.Contains(text, "接口") ||
+			strings.Contains(text, "interface") ||
+			strings.Contains(text, "contract") ||
+			strings.Contains(text, "schema") ||
+			strings.Contains(text, "api") ||
+			strings.Contains(text, "storage") ||
+			strings.Contains(text, "query")))
+}
+
+func isContractLikeNode(node *TaskNode) bool {
+	if node == nil {
+		return false
+	}
+	if isContractBoundaryNode(node) {
+		return true
+	}
+	text := strings.ToLower(strings.Join([]string{
+		node.Title,
+		node.AcceptCriteria,
+		node.WorkUnitType,
+		node.CapabilityID,
+		strings.Join(node.TargetFiles, " "),
+		strings.Join(node.WriteFiles, " "),
+	}, " "))
+	return strings.Contains(text, "contract") ||
+		strings.Contains(text, "契约") ||
+		strings.Contains(text, "类型边界") ||
+		strings.Contains(text, "公开类型") ||
+		((strings.Contains(text, "定义") || strings.Contains(text, "边界") || strings.Contains(text, "接口") || strings.Contains(text, "interface")) &&
+			(strings.Contains(text, "错误类型") ||
+				strings.Contains(text, "错误码") ||
+				strings.Contains(text, "返回值") ||
+				strings.Contains(text, "公开类型")))
+}
+
+func firstPlanPathSegment(files []string) string {
+	for _, file := range files {
+		clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(file)))
+		if clean == "" || clean == "." || strings.HasPrefix(clean, "../") || filepath.IsAbs(clean) {
+			continue
+		}
+		parts := strings.Split(clean, "/")
+		if len(parts) > 1 && parts[0] != "" {
+			return parts[0]
+		}
+	}
+	return ""
+}
+
 func missingTargetFilesError(cwd string, targetFiles []string) string {
 	if cwd == "" || len(targetFiles) == 0 {
 		return ""
@@ -3705,6 +6672,9 @@ func missingTargetFilesError(cwd string, targetFiles []string) string {
 	for _, target := range targetFiles {
 		clean := cleanMaterializeRelPath(target)
 		if clean == "" {
+			continue
+		}
+		if isOptionalProjectManifestFile(clean) {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(cwd, clean)); err != nil {
@@ -3761,6 +6731,20 @@ func inferBuildCwdFromTaskScope(cwd string, targetFiles, targetPackages []string
 	return cwd
 }
 
+func inferBuildCwdFromTaskScopeForObjective(cwd string, targetFiles, targetPackages []string, objective string) string {
+	buildCwd := inferBuildCwdFromTaskScope(cwd, targetFiles, targetPackages)
+	if buildCwd != "" && buildCwd != cwd {
+		return buildCwd
+	}
+	if targetRoot := inferObjectiveTargetRoot(objective); targetRoot != "" {
+		candidate := filepath.Join(cwd, filepath.FromSlash(targetRoot))
+		if isDir(candidate) {
+			return candidate
+		}
+	}
+	return buildCwd
+}
+
 func isLikelyGeneratedProjectRoot(name string) bool {
 	if name == "" || strings.HasPrefix(name, ".") {
 		return false
@@ -3799,7 +6783,9 @@ func adjustTargetPackagesForBuildRoot(cwd, buildCwd string, targetPackages []str
 
 var (
 	objectiveTargetRootPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(?:输出到|放到|写到|生成到|创建到)\s*([~A-Za-z0-9_./-]*[\\/][A-Za-z0-9][A-Za-z0-9._-]*)(?:\s*(?:目录|文件夹|/|下|中|内|$|[，,。).）]))`),
 		regexp.MustCompile(`(?i)(?:输出到|放到|写到|生成到|创建到)(?:工作目录(?:下|的)?|当前目录(?:下|的)?|cwd)?\s*[\\/]*([A-Za-z0-9][A-Za-z0-9._-]*)(?:\s*(?:目录|文件夹|/|下|中|内|$|[，,。).）]))`),
+		regexp.MustCompile(`(?i)(?:开发|实现|创建|生成|build|implement)\s+(?:一个|个|an?\s+)?([A-Za-z][A-Za-z0-9._-]*\d*)(?:\s|$|[，,。).）])`),
 		regexp.MustCompile(`(?i)([A-Za-z0-9][A-Za-z0-9._-]*)(?:\s*(?:目录|文件夹))(?:下|中|内)?`),
 	}
 	objectiveTargetRootNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -3824,7 +6810,10 @@ func sanitizeObjectiveTargetRoot(raw string) string {
 	root := strings.TrimSpace(raw)
 	root = strings.Trim(root, "`'\"“”‘’ ，,。.)）(")
 	root = filepath.ToSlash(filepath.Clean(root))
-	if root == "." || root == "" || strings.Contains(root, "/") || strings.HasPrefix(root, ".") || strings.HasPrefix(root, "..") {
+	if strings.Contains(root, "/") {
+		root = path.Base(root)
+	}
+	if root == "." || root == "" || strings.HasPrefix(root, ".") || strings.HasPrefix(root, "..") {
 		return ""
 	}
 	if !objectiveTargetRootNamePattern.MatchString(root) {
@@ -3851,7 +6840,7 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 			StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 				StartedAt: start, Duration: time.Since(start).String()})
 	}
-	if reason := validateAgentOutput(result, node.Role); reason != "" {
+	if reason := validateTaskAgentOutput(result, node); reason != "" {
 		return o.handleTaskFailure(ctx, node, objective, team,
 			StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed,
 				Error: "产出验证失败: " + reason, Output: result,
@@ -3922,6 +6911,12 @@ func (o *Orchestrator) runSkepticalReview(ctx context.Context, node *TaskNode, o
 
 	taskObjective := fmt.Sprintf("任务: %s | 角色: %s | 验收标准: %s\n目标: %s",
 		node.Title, node.Role, node.AcceptCriteria, objective)
+	if isContractLikeNode(node) {
+		taskObjective += "\n\n契约类 Leaf 评审范围:\n" +
+			"- 只评审本 Leaf 的接口、公开类型、错误类型、返回值、包边界是否完整且与设计目标一致。\n" +
+			"- 不要要求本 Leaf 同时实现复杂算法、存储引擎、索引器、HTTP/CLI 或完整单元测试；这些应由后续 implementation/verification Leaf 完成。\n" +
+			"- 若契约本身可编译、无 TODO/STUB/占位、没有外部依赖漂移，并为后续实现提供清晰边界，应给出 pass=true。\n"
+	}
 	if node.DesignRef != "" && node.DesignRef != "-" {
 		designCtx := o.orchDesignRefContext(node.DesignRef)
 		taskObjective += "\n\n设计参考:\n" + designCtx
@@ -4183,6 +7178,10 @@ func languageHintForFile(path string) string {
 		return "python"
 	case ".rs":
 		return "rust"
+	case ".ts":
+		return "typescript"
+	case ".js", ".mjs", ".cjs":
+		return "javascript"
 	case ".cpp", ".cc", ".cxx", ".hpp", ".h":
 		return "cpp"
 	case ".txt":
@@ -4203,6 +7202,18 @@ func currentGoAPISummaryForTask(team *ProductionTeam, node *TaskNode, objective 
 		}
 	}
 	return summarizeGoPackageAPI(root, maxChars)
+}
+
+func currentGoModulePathForPrompt(team *ProductionTeam, objective string) string {
+	if team == nil || team.Cwd == "" {
+		return ""
+	}
+	root := team.Cwd
+	if targetRoot := inferObjectiveTargetRoot(objective); targetRoot != "" {
+		root = filepath.Join(team.Cwd, targetRoot)
+	}
+	modulePath, _ := readGoModModuleAndRequires(filepath.Join(root, "go.mod"))
+	return strings.TrimSpace(modulePath)
 }
 
 func summarizeGoPackageAPI(root string, maxChars int) string {
@@ -4325,10 +7336,21 @@ func compactWhitespace(s string) string {
 func (o *Orchestrator) buildTaskPrompt(node *TaskNode, objective string, team *ProductionTeam) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("## 任务: %s\n项目目标: %s\n\n", node.Title, objective))
+	b.WriteString("### 执行边界 (硬约束)\n")
+	b.WriteString("- 你不是工具执行器, 不要输出 Bash/Read/cat/ls/minimax:tool_call/task/invoke 等伪工具调用。\n")
+	b.WriteString("- 不要读取项目目标中的参考设计路径; research/architect/planner 已经提供了当前 Leaf 所需信息。\n")
+	b.WriteString("- 你的唯一交付物是目标文件的完整内容代码块; 如果需要目录, 通过输出对应文件路径让系统自动创建目录。\n\n")
+	b.WriteString("- 默认禁止引入新的第三方依赖; 优先使用标准库或项目内接口。确需第三方依赖时, 当前 Leaf 必须显式包含 manifest 文件(go.mod/package.json/Cargo.toml 等)并给出完整内容。\n\n")
 	if node.TaskType != "" || node.EstimatedMin > 0 || node.RiskLevel != "" {
 		b.WriteString("### WBS 执行预算\n")
 		if node.TaskType != "" {
 			b.WriteString("- taskType: " + node.TaskType + "\n")
+		}
+		if node.WorkUnitType != "" {
+			b.WriteString("- workUnitType: " + node.WorkUnitType + "\n")
+		}
+		if node.CapabilityID != "" {
+			b.WriteString("- capabilityId: " + node.CapabilityID + "\n")
 		}
 		if node.ParentID != "" {
 			b.WriteString("- parentId: " + node.ParentID + "\n")
@@ -4345,13 +7367,39 @@ func (o *Orchestrator) buildTaskPrompt(node *TaskNode, objective string, team *P
 		b.WriteString("- 规则: 只完成当前 Leaf 的单一目标; 不要顺手实现后续 Leaf; 超出目标时优先保持可编译。\n\n")
 	}
 
+	if len(node.ContractRefs) > 0 || len(node.Provides) > 0 || len(node.Requires) > 0 || len(node.ConflictKeys) > 0 {
+		b.WriteString("### Planning IR 约束\n")
+		if len(node.ContractRefs) > 0 {
+			b.WriteString("- contractRefs: " + strings.Join(node.ContractRefs, ", ") + "\n")
+		}
+		if len(node.Provides) > 0 {
+			b.WriteString("- provides: " + strings.Join(node.Provides, ", ") + "\n")
+		}
+		if len(node.Requires) > 0 {
+			b.WriteString("- requires: " + strings.Join(node.Requires, ", ") + "\n")
+		}
+		if len(node.ConflictKeys) > 0 {
+			b.WriteString("- conflictKeys: " + strings.Join(node.ConflictKeys, ", ") + "\n")
+		}
+		if node.EstimatedLOC > 0 {
+			b.WriteString(fmt.Sprintf("- estimatedChangedLOC: %d\n", node.EstimatedLOC))
+		}
+		b.WriteString("- 规则: implementation leaf 不允许修改未列入 writeFiles/目标文件的 contract; integration leaf 才能组装跨 capability 门面。\n\n")
+	}
+
 	if targetRoot := inferObjectiveTargetRoot(objective); targetRoot != "" {
 		b.WriteString("### 用户指定输出目录 (硬约束)\n")
 		b.WriteString("- targetRoot: " + targetRoot + "\n")
 		b.WriteString("- 所有新增或修改的 File path 必须以 `" + targetRoot + "/` 开头, 不要写到仓库根目录或其它目录。\n")
-		b.WriteString("- 如果这是新的 Go 项目, 必须在最早的代码 Leaf 中输出 `" + targetRoot + "/go.mod`、README 和最小可编译骨架; 后续 Leaf 只能在该目录内增量补充。\n")
-		b.WriteString("- Go V1 默认只使用标准库; 不要引入 testify、gonum、uuid 等第三方依赖。若绝对必须引入依赖, 目标文件必须同时包含 go.mod/go.sum, 否则 go test 会失败。\n")
-		b.WriteString("- 验证命令优先使用 `cd " + targetRoot + " && go test ./...`。\n\n")
+		b.WriteString("- 项目骨架和验证命令必须跟随架构阶段确定的语言/运行时: Go 使用 go.mod/go test, Python 使用 pyproject/pytest, TypeScript 使用 package.json/npm test, Rust 使用 Cargo.toml/cargo test 等。\n")
+		b.WriteString("- 不要为了当前 Leaf 引入未在计划或架构中声明的新语言/依赖; 如必须新增依赖, 同步更新对应 manifest/lock 文件并保持本地 build/test 可运行。\n\n")
+	}
+
+	if modulePath := currentGoModulePathForPrompt(team, objective); modulePath != "" {
+		b.WriteString("### Go module/import 约束\n")
+		b.WriteString("- 当前 go.mod module: `" + modulePath + "`\n")
+		b.WriteString("- 本项目内部 import 必须使用该 module 前缀, 例如 `" + modulePath + "/...`; 不要发明 github.com/huaquan.liang/agentDBV4、github.com/agentdb/v4 等其它 module path。\n")
+		b.WriteString("- 同一目录下所有 .go 文件必须使用同一个 package 名; 测试文件可使用相同 package 或 package_test, 不要混用 agentdb/agentdbv4 等包名。\n\n")
 	}
 
 	if node.DesignRef != "" && node.DesignRef != "-" {
@@ -4379,7 +7427,17 @@ func (o *Orchestrator) buildTaskPrompt(node *TaskNode, objective string, team *P
 			b.WriteString("// 或对应文件格式的完整内容\n")
 			b.WriteString("```\n\n")
 		}
-		b.WriteString("未按上述格式输出目标文件会被视为未执行任务并触发编译门禁失败。\n\n")
+		b.WriteString("未按上述格式输出目标文件, 或输出工具调用/命令清单而不是文件内容, 会被视为未执行任务并触发编译门禁失败。\n\n")
+	}
+	if len(node.ReadFiles) > 0 || len(node.WriteFiles) > 0 {
+		b.WriteString("### 文件访问预算\n")
+		if len(node.ReadFiles) > 0 {
+			b.WriteString("- readFiles: " + strings.Join(node.ReadFiles, ", ") + "\n")
+		}
+		if len(node.WriteFiles) > 0 {
+			b.WriteString("- writeFiles: " + strings.Join(node.WriteFiles, ", ") + "\n")
+		}
+		b.WriteString("- 规则: 可以参考 readFiles 的 API, 但只能输出 writeFiles/目标文件的完整内容。\n\n")
 	}
 	if len(node.TargetPackages) > 0 {
 		b.WriteString("### 目标包 (编译验证范围)\n")

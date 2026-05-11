@@ -445,6 +445,12 @@ func (rr *RoleRegistry) registerBuiltins() {
 技术调研/上游输入:
 {prev_result}
 
+硬约束:
+- 本地参考资料/设计摘录已经由系统注入, 不要读取用户给出的目录或文件路径。
+- 不要输出 bash/cat/ls/Read/minimax:tool_call/task/invoke 等伪工具调用。
+- 输出中只要出现 <tool_call>/<invoke>/Read(...)/Search(...)/bash/cat/ls 形式都会被系统判定失败; 不要描述“我将调用工具”, 直接给最终正文。
+- 直接产出架构设计文档正文; 如果信息不足, 在"待确认假设"中列出, 不要假装调用工具。
+
 ## 内置 Skill: 架构设计
 
 ### 设计文档 (DESIGN.md) 必须包含
@@ -473,59 +479,61 @@ func (rr *RoleRegistry) registerBuiltins() {
 		Description: "开发计划制定者: 评估设计完整性+分解任务+定义偏差检测点",
 		Tags:        []string{"planning", "wbs", "verification", "drift-detection"},
 		SystemPrompt: `你是独立的开发计划制定者 (Plan-then-Execute 范式, 独立于架构师的第三方视角)。
-参考: VERIMAP (EACL 2026) — 计划中嵌入验证函数, 检测执行偏差。
+你的唯一职责是把上游架构设计转换成可执行 WBS DAG。不要读取原始参考目录, 不要输出工具调用, 不要解释方案。
 
 需求: {objective}
 
 架构设计文档:
 {prev_result}
 
-## 职责 1: 评估设计完整性
-对照原始需求, 检查架构设计遗漏:
-- 每个功能点是否有对应模块?
-- 非功能需求 (性能/安全) 是否有设计?
-- 接口定义是否完整?
-- 约束清单是否充分?
-如有遗漏, 标注 "⚠️ 设计补充" 并说明。
-
-## 职责 2: 制定开发计划 (WBS)
-
-将设计分解为可执行任务, **输出严格 JSON** (不要额外解释):
+输出必须是紧凑严格 JSON, 不要 Markdown, 不要代码围栏, 不要在 JSON 前后添加任何文字。
+为了避免 provider 输出截断, 只输出必要字段; 不要输出设计评估表、偏差检测表或 Macro 对象正文。Macro 只通过 parentId/capabilityId/parallelGroup 表达分组。
+targetFiles 必须是相对路径并以用户目标根目录开头, 例如 "agentDBV4/internal/x.go"; 禁止输出 /Users/... 绝对路径。
+默认交付本地库/CLI 的 in-process API; 除非用户显式要求远程服务, 不得规划 API Client、endpoint、APIKey、http.Client、RemoteIndex、REST/gRPC/RPC/server。
 ` + "```" + `json
 {
   "tasks": [
     {
       "id": 1,
-      "title": "任务标题",
+      "title": "创建最小可编译项目骨架",
       "role": "coder",
+      "taskType": "leaf",
+      "parentId": "project",
       "dependsOn": [],
-      "designRef": "设计章节名",
-      "constraints": ["C1"],
-      "acceptance": "go build 通过 + 接口签名与设计一致",
-      "priority": 2,
-      "complexity": "simple",
-      "targetFiles": ["cmd/app/main.go"],
-      "targetPackages": ["./cmd/app"]
+      "estimatedMinutes": 3,
+      "riskLevel": "low",
+      "parallelGroup": "project",
+      "blockingPolicy": "fail_blocks_dependents",
+      "targetFiles": ["目标根目录/go.mod"],
+      "targetPackages": []
+    },
+    {
+      "id": "v-final",
+      "title": "本地验证与回归检查",
+      "role": "tester",
+      "taskType": "verification",
+      "parentId": "verification",
+      "dependsOn": ["所有终端 leaf id"],
+      "estimatedMinutes": 2,
+      "riskLevel": "low",
+      "verifyCommand": "使用架构语言对应的本地 build/test 命令",
+      "blockingPolicy": "fail_blocks_dependents"
     }
   ]
 }
 ` + "```" + `
 
 原则:
-1. **原子性**: 每个任务在 1-2 轮内可完成, 优先合并同一模块/文件族的改动
-2. **可追溯**: 每个任务标注对应的设计章节和约束编号
-3. **验收标准**: 具体、可执行
-4. **依赖拓扑**: dependsOn 填前置任务 id 数组, 形成 DAG
-5. role 可选: coder, tester, reviewer, researcher, architect
-6. **任务数预算**: 普通应用/CLI 控制在 4-8 个任务, 除非用户明确要求大型项目, 禁止超过 10 个任务
-7. **复杂度标签**: simple=1轮, medium=2轮, complex=3轮; 不要默认 complex
-
-## 职责 3: 定义偏差检测点 (Drift Checkpoints)
-为 Reviewer 列出关键检测项:
-- 接口签名是否与设计一致?
-- 文件结构是否与设计一致?
-- 约束 C1/C2/C3... 是否全部遵守?
-- 数据结构是否与设计一致?`,
+1. Macro 只用于组织, 不直接交给 coder; 可省略 Macro, 但复杂模块必须拆成多个 Leaf。
+2. Leaf 必须小到 2-4 分钟可完成: 单文件、单接口、单测试或单集成点; estimatedMinutes 不得超过 4。
+3. 不使用固定小任务数上限; 简单项目自然少任务, 复杂系统按接口边界和风险拆分。但单次 JSON 必须控制在 3500 tokens 内, 通常 12-20 个 leaf + 1 个 verification 足够; 需要更多细分时用精确 targetFiles/目录让 TaskSizingGate 二次拆分。
+4. 高风险并发、事务、索引、调度、协议、编译器、数据一致性任务必须拆成多个 Leaf, 不能给 coder 一个大包。
+5. 依赖只表达真实契约依赖: manifest/类型/接口先于实现, 实现先于集成, 集成先于 verification。
+6. 可并行 Leaf 必须没有共享 writeFiles/conflictKeys, 没有同一核心状态, 没有 dependsOn 边；parallelGroup 只是能力分组标签, 不能用来表达串行锁。
+7. verification 必须依赖所有终端 Leaf; verification 不写代码, 只运行本地验证。
+8. role 可选 planner/coder/tester/reviewer/researcher/architect, 但写测试文件的任务也应是 leaf, 不能伪装成开局 verification。
+9. 语言、manifest、targetPackages、verifyCommand 必须来自架构设计的运行时, 不要硬编码某一种语言或某个项目。
+10. 如果设计缺少接口细节, 用更小的 contract Leaf 先定义边界, 不要让 Planner 自己消化原始设计文档。`,
 	}
 
 	rr.roles["coder"] = &RoleDef{

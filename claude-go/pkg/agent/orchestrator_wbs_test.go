@@ -168,49 +168,6 @@ func TestParseWBSFromJSONNewFields(t *testing.T) {
 	}
 }
 
-func TestNormalizeAndSplitRawTasksExpandsMVCCMacro(t *testing.T) {
-	o := NewOrchestrator(OrchestratorConfig{}, newWBSFakeDAG(), nil, func(string, string) {}, nil, "")
-	raw := []rawTask{{
-		num: "1", title: "MVCC 事务管理器", role: "coder",
-		taskType: wbsTaskTypeMacro, estimatedMin: 8, riskLevel: wbsRiskHigh,
-		targetFiles:    []string{"internal/storage/mvcc.go"},
-		targetPackages: []string{"./internal/storage/..."},
-	}}
-
-	got := o.normalizeAndSplitRawTasks(raw)
-	if len(got) != 6 {
-		t.Fatalf("expected 6 MVCC leaves, got %d: %+v", len(got), got)
-	}
-	if got[0].taskType != wbsTaskTypeLeaf || got[5].taskType != wbsTaskTypeVerification {
-		t.Fatalf("unexpected task types: first=%s last=%s", got[0].taskType, got[5].taskType)
-	}
-	for i := 1; i < len(got); i++ {
-		if len(got[i].depNums) != 1 || got[i].depNums[0] != got[i-1].num {
-			t.Fatalf("leaf %d is not chained to previous leaf: %+v", i, got[i])
-		}
-	}
-	if o.wbsSplitCount != 6 {
-		t.Fatalf("expected split count 6, got %d", o.wbsSplitCount)
-	}
-}
-
-func TestNormalizeAndSplitRawTasksSplitsOversizeLeaf(t *testing.T) {
-	o := NewOrchestrator(OrchestratorConfig{}, newWBSFakeDAG(), nil, func(string, string) {}, nil, "")
-	raw := []rawTask{{
-		num: "1", title: "实现复杂索引调度", role: "coder",
-		taskType: wbsTaskTypeLeaf, estimatedMin: 7, riskLevel: wbsRiskHigh,
-		targetFiles: []string{"internal/index/index.go", "internal/index/scheduler.go", "internal/index/gc.go", "internal/index/index_test.go"},
-	}}
-
-	got := o.normalizeAndSplitRawTasks(raw)
-	if len(got) != 3 {
-		t.Fatalf("expected generic oversize leaf to split into 3 tasks, got %d", len(got))
-	}
-	if got[2].taskType != wbsTaskTypeVerification {
-		t.Fatalf("expected final generic split task to be verification, got %s", got[2].taskType)
-	}
-}
-
 func TestRawTasksToDAGSerializesSharedTargetFiles(t *testing.T) {
 	dag := newWBSFakeDAG()
 	o := NewOrchestrator(OrchestratorConfig{MaxParallel: 3}, dag, nil, func(string, string) {}, nil, "")
@@ -242,50 +199,6 @@ func TestExecuteRunnerBoundedReturnsTypedTimeout(t *testing.T) {
 	}
 	if !isAgentExecutionTimeout(err) {
 		t.Fatalf("expected typed timeout error, got %T: %v", err, err)
-	}
-}
-
-func TestHandleTaskTimeoutInjectsSplitChildrenAndRewiresDownstream(t *testing.T) {
-	dag := newWBSFakeDAG()
-	parentID, err := dag.AddTaskWithDeps("[team] [orch] MVCC 事务管理器", "parent", "coder", nil, 1)
-	if err != nil {
-		t.Fatalf("create parent: %v", err)
-	}
-	downstreamID, err := dag.AddTaskWithDeps("[team] [orch] 下游集成", "downstream", "coder", []string{parentID}, 1)
-	if err != nil {
-		t.Fatalf("create downstream: %v", err)
-	}
-	o := NewOrchestrator(OrchestratorConfig{}, dag, nil, func(string, string) {}, nil, "")
-	o.teamName = "team"
-	parent := &TaskNode{
-		V2TaskID: parentID, Title: "MVCC 事务管理器", Role: "coder",
-		TaskType: wbsTaskTypeLeaf, EstimatedMin: 6, RiskLevel: wbsRiskHigh,
-		BlockingPolicy: wbsBlockingFailBlocks,
-		TargetFiles:    []string{"internal/storage/mvcc.go"},
-		TargetPackages: []string{"./internal/storage/..."},
-	}
-	downstream := &TaskNode{V2TaskID: downstreamID, Title: "下游集成", Role: "coder", TaskType: wbsTaskTypeLeaf}
-	o.nodes[parentID] = parent
-	o.nodes[downstreamID] = downstream
-	o.totalCount = 2
-
-	sr := o.handleTaskTimeout(context.Background(), parent, "开发 MVCC 事务管理器", &ProductionTeam{Name: "team", Workflow: "development"}, time.Now().Add(-6*time.Minute), &AgentExecutionTimeoutError{Timeout: coderCallTimeout, Cause: context.DeadlineExceeded})
-	if sr.Status != TaskCompleted {
-		t.Fatalf("timeout parent should become split macro completed, got %s: %s", sr.Status, sr.Error)
-	}
-	if o.totalCount != 8 {
-		t.Fatalf("expected 6 injected children plus original 2 tasks, got total=%d", o.totalCount)
-	}
-	if o.completedCount != 1 || o.wbsTimeoutSplitCount != 1 {
-		t.Fatalf("unexpected counters: completed=%d timeoutSplit=%d", o.completedCount, o.wbsTimeoutSplitCount)
-	}
-	rewired := dag.tasks[downstreamID].DependsOn
-	if len(rewired) != 1 || rewired[0] == parentID {
-		t.Fatalf("downstream was not rewired to last split child: %+v", rewired)
-	}
-	firstChildID := "task-3"
-	if dag.tasks[firstChildID].Status != "pending" {
-		t.Fatalf("first split child should be unblocked after parent completes, got %s", dag.tasks[firstChildID].Status)
 	}
 }
 

@@ -30,6 +30,7 @@ type EvalScore struct {
 	DesignAlignment float64 `json:"design_alignment,omitempty"` // 方案对齐度 (0-10)
 	Feedback        string  `json:"feedback"`
 	Pass            bool    `json:"pass"`
+	PassSet         bool    `json:"-"`
 }
 
 const hardPassMinScore = 6.0
@@ -40,11 +41,13 @@ func (e EvalScore) WeightedScore() float64 {
 	return e.Correctness*0.30 + e.Completeness*0.25 + e.Security*0.20 + e.CodeQuality*0.25
 }
 
-// MeetsHardPassThreshold 加权总分 ≥ 6.0 且无单项灾难性低分(<4) 且 Pass=true。
+// MeetsHardPassThreshold 加权总分 ≥ 6.0 且无单项灾难性低分(<4)。
+// Reviewer 必须显式 pass=false 才否决；缺失 pass 字段时按分数和阻塞反馈判断,
+// 避免模型给出高分但漏写 pass=true 时误杀可交付 leaf。
 // 相比旧版(ALL ≥ 6)更宽容: 允许个别维度 5 分但总体合格。
 // 参考 GPT 5.6 Codex "practical pass" — 工业级代码不需要完美, 需要可用。
 func (e EvalScore) MeetsHardPassThreshold() bool {
-	if !e.Pass {
+	if e.PassSet && !e.Pass {
 		return false
 	}
 	if e.DesignAlignment > 0 && e.DesignAlignment < 4 {
@@ -53,7 +56,52 @@ func (e EvalScore) MeetsHardPassThreshold() bool {
 	if e.Correctness < 4 || e.Completeness < 4 || e.Security < 4 || e.CodeQuality < 4 {
 		return false
 	}
-	return e.WeightedScore() >= hardPassMinScore
+	if e.WeightedScore() < hardPassMinScore {
+		return false
+	}
+	if !e.PassSet && feedbackContainsBlockingFailure(e.Feedback) {
+		return false
+	}
+	return true
+}
+
+func feedbackContainsBlockingFailure(feedback string) bool {
+	lower := strings.ToLower(feedback)
+	markers := []string{
+		"pass=false",
+		"pass: false",
+		"\"pass\": false",
+		"\"pass\":false",
+		"阻塞",
+		"不可交付",
+		"不能交付",
+		"未实现",
+		"待实现",
+		"not implemented",
+		"placeholder",
+		"todo",
+		"stub",
+		"compile error",
+		"compilation failed",
+		"build failed",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func markEvalScorePassPresence(score EvalScore, raw string) EvalScore {
+	lower := strings.ToLower(raw)
+	if strings.Contains(lower, `"pass"`) ||
+		strings.Contains(lower, "pass:") ||
+		strings.Contains(lower, "通过: true") ||
+		strings.Contains(lower, "通过: false") {
+		score.PassSet = true
+	}
+	return score
 }
 
 // AvgScore 返回所有非零维度的平均分 (用于自适应终止判断)
@@ -298,13 +346,6 @@ func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) Termin
 		return TerminationDecision{ShouldStop: true, Reason: "quality_pass", RoundsUsed: round, MaxRounds: at.MaxRounds}
 	}
 
-	// 1.5 L8 智能早期终止: R1 "可接受质量" 直接通过
-	// 参考 Kimi 2.6 "fast-pass" — 加权分 ≥ 6.5 且无灾难性低分时不浪费后续轮次
-	if round == 1 && score.WeightedScore() >= 6.5 &&
-		score.Correctness >= 5 && score.Completeness >= 5 && score.Security >= 5 && score.CodeQuality >= 5 {
-		return TerminationDecision{ShouldStop: true, Reason: "quality_pass", RoundsUsed: round, MaxRounds: at.MaxRounds}
-	}
-
 	// 2. 未达最小轮数
 	if round < at.MinRounds {
 		return TerminationDecision{ShouldStop: false, Reason: "min_rounds", RoundsUsed: round, MaxRounds: at.MaxRounds}
@@ -401,7 +442,7 @@ func ParseEvalScoreJSON(raw []byte) (EvalScore, error) {
 	// 策略 1: 直接解析全文 (纯 JSON 输出)
 	var s EvalScore
 	if err := json.Unmarshal(raw, &s); err == nil && (s.Correctness > 0 || s.Completeness > 0) {
-		return s, nil
+		return markEvalScorePassPresence(s, text), nil
 	}
 
 	// 策略 2: 提取 ```json ... ``` 代码块中的 JSON
@@ -410,7 +451,7 @@ func ParseEvalScoreJSON(raw []byte) (EvalScore, error) {
 		if end := strings.Index(text[start:], "```"); end >= 0 {
 			block := strings.TrimSpace(text[start : start+end])
 			if err := json.Unmarshal([]byte(block), &s); err == nil {
-				return s, nil
+				return markEvalScorePassPresence(s, block), nil
 			}
 		}
 	}
@@ -420,7 +461,7 @@ func ParseEvalScoreJSON(raw []byte) (EvalScore, error) {
 		if end := strings.Index(text[start:], "```"); end >= 0 {
 			block := strings.TrimSpace(text[start : start+end])
 			if err := json.Unmarshal([]byte(block), &s); err == nil {
-				return s, nil
+				return markEvalScorePassPresence(s, block), nil
 			}
 		}
 	}
@@ -438,7 +479,7 @@ func ParseEvalScoreJSON(raw []byte) (EvalScore, error) {
 				if depth == 0 {
 					candidate := text[i : lastBrace+1]
 					if err := json.Unmarshal([]byte(candidate), &s); err == nil && (s.Correctness > 0 || s.Completeness > 0) {
-						return s, nil
+						return markEvalScorePassPresence(s, candidate), nil
 					}
 					break
 				}
@@ -449,7 +490,7 @@ func ParseEvalScoreJSON(raw []byte) (EvalScore, error) {
 	// 策略 4: 用正则提取各维度数值 (兜底: reviewer 输出了表格或非标准格式)
 	s = extractScoreFromText(text)
 	if s.Correctness > 0 || s.Completeness > 0 || s.Security > 0 || s.CodeQuality > 0 {
-		return s, nil
+		return markEvalScorePassPresence(s, text), nil
 	}
 
 	return EvalScore{}, fmt.Errorf("无法从 evaluator 输出中提取评分 (长度: %d)", len(raw))
@@ -533,7 +574,7 @@ func extractScoreFromText(text string) EvalScore {
 
 // Rule 单条确定性规则：对单次工具调用做校验。
 type Rule struct {
-	Name string
+	Name  string
 	Check func(toolName string, input json.RawMessage) error
 }
 

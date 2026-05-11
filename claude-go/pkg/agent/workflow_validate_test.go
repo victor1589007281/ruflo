@@ -11,6 +11,46 @@ func TestValidateAgentOutputAllowsTechnicalRateLimitDiscussion(t *testing.T) {
 	}
 }
 
+func TestEvalScorePassMissingUsesScores(t *testing.T) {
+	score, err := ParseEvalScoreJSON([]byte(`{"correctness":8,"completeness":8,"security":9,"code_quality":8,"feedback":"looks good"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if score.PassSet {
+		t.Fatal("pass presence should be false when reviewer omitted pass")
+	}
+	if !score.MeetsHardPassThreshold() {
+		t.Fatalf("high score without explicit pass should pass, got %#v", score)
+	}
+	score, err = ParseEvalScoreJSON([]byte(`{"correctness":8,"completeness":8,"security":9,"code_quality":8,"feedback":"blocked","pass":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !score.PassSet {
+		t.Fatal("explicit pass=false should be recorded")
+	}
+	if score.MeetsHardPassThreshold() {
+		t.Fatalf("explicit pass=false must fail, got %#v", score)
+	}
+}
+
+func TestAdaptiveTerminatorDoesNotFastPassBlockingFeedback(t *testing.T) {
+	terminator := NewAdaptiveTerminator(2, 4)
+	score := EvalScore{
+		Correctness:  6,
+		Completeness: 6,
+		Security:     9,
+		CodeQuality:  7,
+		Feedback:     "implementation is not implemented yet",
+		Pass:         false,
+		PassSet:      true,
+	}
+	decision := terminator.ShouldTerminate(1, score)
+	if decision.ShouldStop {
+		t.Fatalf("blocking feedback must continue to another round, got %#v", decision)
+	}
+}
+
 func TestValidateAgentOutputStillDetectsAPIErrorWrapper(t *testing.T) {
 	output := `API 错误 (限流/超时/熔断): 429 rate limit exceeded`
 	if reason := validateAgentOutput(output, "researcher"); reason != "__API_ERROR__" {

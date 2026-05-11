@@ -2184,13 +2184,12 @@ func (b *Bot) handleGoCommand(ctx context.Context, chatID, messageID, text strin
 
 	workflow := strings.ToLower(parts[1])
 	objective := strings.Join(parts[2:], " ")
-	teamName := fmt.Sprintf("go-%s-%d", workflow, time.Now().Unix()%10000)
-
-	team, err := b.teamMgr.CreateTeam(teamName, workflow, objective, chatID)
+	team, err := b.teamMgr.CreateTeamWithUniquePrefix("go-"+workflow, workflow, objective, chatID)
 	if err != nil {
 		b.sendTextReply(ctx, messageID, fmt.Sprintf("创建失败: %v", err))
 		return
 	}
+	teamName := team.Name
 
 	// 将当前会话的近期上下文注入团队 Blackboard，确保 Agent 有完整背景
 	b.injectSessionContext(chatID, team)

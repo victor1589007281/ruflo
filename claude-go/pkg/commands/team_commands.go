@@ -174,13 +174,12 @@ func RegisterTeamCommands(r *Registry) {
 				}
 			}
 			objective := strings.Join(objParts, " ")
-			teamName := fmt.Sprintf("go-%s-%d", workflow, time.Now().Unix()%10000)
-
-			team, err := ctx.TeamMgr.CreateTeam(teamName, workflow, objective, "cli")
+			team, err := ctx.TeamMgr.CreateTeamWithUniquePrefix("go-"+workflow, workflow, objective, "cli")
 			if err != nil {
 				fmt.Printf("[创建失败: %v]\n", err)
 				return nil
 			}
+			teamName := team.Name
 			if lang != "" {
 				team.SetLanguage(lang)
 			}

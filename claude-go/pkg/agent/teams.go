@@ -463,6 +463,32 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 	return team, nil
 }
 
+// CreateTeamWithUniquePrefix creates a team for quick-start flows and retries
+// name collisions caused by persisted historical teams.
+func (ptm *ProductionTeamManager) CreateTeamWithUniquePrefix(prefix, workflow, objective, chatID string) (*ProductionTeam, error) {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "-")
+	if prefix == "" {
+		prefix = "team"
+	}
+	var lastErr error
+	for attempt := 0; attempt < 20; attempt++ {
+		name := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+		if attempt > 0 {
+			name = fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), attempt)
+		}
+		team, err := ptm.CreateTeam(name, workflow, objective, chatID)
+		if err == nil {
+			return team, nil
+		}
+		lastErr = err
+		if !strings.Contains(err.Error(), "已存在") {
+			return nil, err
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil, fmt.Errorf("创建唯一团队失败: %w", lastErr)
+}
+
 // RunTeam 启动团队执行。
 // 如果团队之前因 LLM 限流/错误而失败, 重新激活时会从上次的检查点恢复 (跳过已完成的阶段)。
 // 修复: 使用 starting 标志防止并发 run 导致的双重工作流执行。
@@ -618,7 +644,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	}
 	deliveryStatus := TeamStatusCompleted
 	if len(failedStages) > 0 {
-		if team.Workflow == "development" && hasPassingLocalE2EGate(results) {
+		if team.Workflow == "development" && hasPassingLocalE2EGate(results) && !hasBlockingDevelopmentFailure(results) {
 			deliveryStatus = TeamStatusDeliveredWithRemediation
 			ptm.notify(team.ChatID, fmt.Sprintf("🟡 团队 **%s** 存在 %d 个中间阶段失败, 但最终 E2E 本地门禁已通过 build/test, 按交付成功处理", team.Name, len(failedStages)))
 		} else {
@@ -746,6 +772,25 @@ func hasPassingLocalE2EGate(results []StageResult) bool {
 			continue
 		}
 		return r.Status == TaskCompleted && strings.Contains(r.Output, "E2E 本地门禁通过")
+	}
+	return false
+}
+
+func hasBlockingDevelopmentFailure(results []StageResult) bool {
+	for _, r := range results {
+		if r.Status != TaskFailed {
+			continue
+		}
+		text := strings.ToLower(r.Name + "\n" + r.Error + "\n" + r.Output)
+		if strings.Contains(text, "hard gate") ||
+			strings.Contains(text, "local verification failed") ||
+			strings.Contains(text, "本地验证失败") ||
+			strings.Contains(text, "级联阻塞") ||
+			strings.Contains(text, "cascade") ||
+			strings.Contains(text, "orchestrator 启动失败") ||
+			strings.Contains(text, "wbs 解析失败") {
+			return true
+		}
 	}
 	return false
 }
