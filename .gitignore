@@ -150,8 +150,9 @@ claude-flow
 # Removed Windows wrapper files per user request
 hive-mind-prompt-*.txt
 
-# Claude Go binary
-claude-go/claude-go
+# Claude Go binaries
+claude-go/bin/
+claude-go/claude-go-bin
 
 # Codex local configuration
 .codex/
