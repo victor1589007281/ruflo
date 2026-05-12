@@ -1,11 +1,11 @@
 package agent
 
-
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,12 +16,12 @@ import (
 
 // CodeTask 代码生成/修复任务
 type CodeTask struct {
-	ID           string   `json:"id"`
-	Objective    string   `json:"objective"`
-	TargetFiles  []string `json:"target_files,omitempty"`
-	Language     string   `json:"language"`
-	RepoRoot     string   `json:"repo_root"`
-	ModulePath   string   `json:"module_path,omitempty"`
+	ID          string   `json:"id"`
+	Objective   string   `json:"objective"`
+	TargetFiles []string `json:"target_files,omitempty"`
+	Language    string   `json:"language"`
+	RepoRoot    string   `json:"repo_root"`
+	ModulePath  string   `json:"module_path,omitempty"`
 }
 
 // CodeResult 执行结果
@@ -55,14 +55,15 @@ type ExecutionStep struct {
 
 // CodeExecutor 代码执行器（实现 orchestrator.TaskRunner）
 type CodeExecutor struct {
-	contractStore  *ContractStore
-	patchApplier   *PatchApplier
-	validationGate *ValidationGate
-	contextEngine  *ContextEngine
-	skillRuntime   *toolskill.Runtime
-	llmRunner      orchestrator.LLMClient
-	maxRounds      int
-	promptSkills   []string
+	contractStore    *ContractStore
+	patchApplier     *PatchApplier
+	validationGate   *ValidationGate
+	contextEngine    *ContextEngine
+	skillRuntime     *toolskill.Runtime
+	llmRunner        orchestrator.LLMClient
+	maxRounds        int
+	promptSkills     []string
+	constitutionPath string
 }
 
 func NewCodeExecutor(
@@ -105,6 +106,11 @@ func (e *CodeExecutor) Execute(
 		return result, err
 	}
 
+	if err := e.PreFlightCompileCheck(codeTask); err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+
 	e.validationGate.ResetRoundBudget()
 
 	for round := 0; round < e.maxRounds; round++ {
@@ -115,9 +121,32 @@ func (e *CodeExecutor) Execute(
 		if round == 0 {
 			snippets, stepErr = e.generateCode(ctx, codeTask)
 		} else {
+			// Try self-refine first for auto-fixable blockers
+			if result.Validation != nil && !result.Validation.Passed && len(result.Validation.Diagnostics) > 0 {
+				autoFixable := true
+				for _, d := range result.Validation.Diagnostics {
+					if d.Severity == "blocking" {
+						switch d.Category {
+						case "undefined", "wrong_import", "format":
+							// auto-fixable
+						default:
+							autoFixable = false
+						}
+					}
+				}
+				if autoFixable {
+					refined, refineErr := e.SelfRefine(ctx, codeTask, result.Validation.Diagnostics)
+					if refineErr == nil && len(refined) > 0 {
+						snippets = refined
+						stepErr = nil
+						goto ApplySnippets
+					}
+				}
+			}
 			snippets, stepErr = e.repairFromDiagnostics(ctx, codeTask, result.Validation)
 		}
 
+	ApplySnippets:
 		if stepErr != nil {
 			action := "generate"
 			if round > 0 {
@@ -176,7 +205,12 @@ func (e *CodeExecutor) Execute(
 			Round:    round,
 			Action:   "validate",
 			Duration: time.Since(valStart),
-			Result:   func() string { if gateResult.Passed { return "pass" }; return "fail" }(),
+			Result: func() string {
+				if gateResult.Passed {
+					return "pass"
+				}
+				return "fail"
+			}(),
 			Details: map[string]any{
 				"stage":    gateResult.Stage,
 				"blockers": len(gateResult.Blockers),
@@ -234,6 +268,82 @@ func (e *CodeExecutor) generateCode(ctx context.Context, task CodeTask) ([]EditS
 		return nil, fmt.Errorf("llm generation failed: %w", err)
 	}
 	return e.parseEditSnippets(output)
+}
+
+// SelfRefine attempts to fix diagnostics internally before submitting to Validator.
+func (e *CodeExecutor) SelfRefine(ctx context.Context, task CodeTask, diags []toolskill.Diagnostic) ([]EditSnippet, error) {
+	var autoFixDiags []toolskill.Diagnostic
+	for _, d := range diags {
+		if d.Severity != "blocking" {
+			continue
+		}
+		switch d.Category {
+		case "undefined", "wrong_import", "format":
+			autoFixDiags = append(autoFixDiags, d)
+		}
+	}
+	if len(autoFixDiags) == 0 {
+		return nil, fmt.Errorf("no auto-fixable diagnostics")
+	}
+
+	var diagBuilder strings.Builder
+	for _, d := range autoFixDiags {
+		diagBuilder.WriteString(fmt.Sprintf("- [%s] %s:%d: %s\n", d.Category, d.File, d.Line, d.Message))
+	}
+
+	prompt := fmt.Sprintf(`You are fixing Go compilation errors via self-refinement.
+
+## Objective
+%s
+
+## Auto-fixable Diagnostics
+%s
+
+## Rules
+1. Fix ONLY the listed diagnostics.
+2. Minimal change: total changed lines <= 20.
+3. Output changes as a JSON array of EditSnippet objects.
+4. Use "//...existing code..." to preserve unchanged parts.
+5. Do NOT output explanations outside the JSON.
+
+## Output Format
+Return ONLY a JSON array:
+[
+  {
+    "file": "relative/path/to/file.go",
+    "start_marker": "func main() {",
+    "replacement": "func main() {\n    //...existing code...\n    newCode()\n}"
+  }
+]`, task.Objective, diagBuilder.String())
+
+	output, err := e.llmRunner.SimpleComplete(ctx, "", prompt)
+	if err != nil {
+		return nil, fmt.Errorf("llm self-refine failed: %w", err)
+	}
+	return e.parseEditSnippets(output)
+}
+
+// PreFlightCompileCheck verifies that tests compile before generating implementation.
+func (e *CodeExecutor) PreFlightCompileCheck(task CodeTask) error {
+	if task.RepoRoot == "" {
+		return nil
+	}
+	cmd := exec.Command("go", "test", "-c", "./...")
+	cmd.Dir = task.RepoRoot
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	outStr := string(out)
+	// Missing stubs or undefined symbols are expected before generation
+	if strings.Contains(outStr, "undefined") || strings.Contains(outStr, "not declared") || strings.Contains(outStr, "missing") {
+		return nil
+	}
+	// If no test files exist, also acceptable
+	if strings.Contains(outStr, "no non-test Go files") || strings.Contains(outStr, "no test files") {
+		return nil
+	}
+	return fmt.Errorf("pre-flight compile check failed: %s", outStr)
 }
 
 func (e *CodeExecutor) repairFromDiagnostics(
@@ -295,7 +405,21 @@ func (e *CodeExecutor) buildGenerationPrompt(task CodeTask) string {
 
 	strategy := e.loadPromptSkillContent("contract-first-coding")
 
-	return fmt.Sprintf(`You are a Go code generator working in contract-first mode.
+	var constitution string
+	if e.constitutionPath != "" {
+		if data, err := os.ReadFile(e.constitutionPath); err == nil {
+			constitution = string(data)
+		}
+	}
+
+	var prompt strings.Builder
+	if constitution != "" {
+		prompt.WriteString("## GO CODE CONSTITUTION (Hard Rules - MUST NOT VIOLATE)\n")
+		prompt.WriteString(constitution)
+		prompt.WriteString("\n\n")
+	}
+
+	prompt.WriteString(fmt.Sprintf(`You are a Go code generator working in contract-first mode.
 
 ## Objective (WHAT, not HOW)
 %s
@@ -333,7 +457,7 @@ Your think block MUST address ALL of the following:
 9. Do NOT output explanations outside the JSON.
 
 ## ── SUCCESS CRITERIA (MUST ALL PASS) ──
-- [ ] Code compiles: ` + "`" + `go build ./...` + "`" + ` returns zero errors
+- [ ] Code compiles: `+"`"+`go build ./...`+"`"+` returns zero errors
 - [ ] Simplicity: Total changed lines ≤ 200 (generation) or ≤ 50 (repair)
 - [ ] Surgical: Only declared files modified; no collateral changes
 - [ ] Contract-compliant: All referenced types exist in Contract Context
@@ -349,7 +473,9 @@ First output your <think> block, then return ONLY a JSON array:
   }
 ]`,
 		task.Objective, task.RepoRoot, e.contractStore.GetModule(),
-		contractCtx.String(), strategy)
+		contractCtx.String(), strategy))
+
+	return prompt.String()
 }
 
 func (e *CodeExecutor) buildRepairPrompt(
@@ -519,6 +645,12 @@ func (e *CodeExecutor) parseCodeTask(task *orchestrator.Task, bb orchestrator.Re
 }
 
 func (e *CodeExecutor) loadPromptSkillContent(skillName string) string {
+	// Try loading from skills/ subdirectory if available
+	if e.skillRuntime != nil {
+		if data, err := os.ReadFile(filepath.Join("skills", skillName+".md")); err == nil {
+			return string(data)
+		}
+	}
 	switch skillName {
 	case "contract-first-coding":
 		return "1. Declare interfaces before implementations. 2. Constructors must return declared types. 3. No empty interfaces."
@@ -535,4 +667,8 @@ func (e *CodeExecutor) SetMaxRounds(n int) {
 
 func (e *CodeExecutor) SetPromptSkills(skills []string) {
 	e.promptSkills = skills
+}
+
+func (e *CodeExecutor) SetConstitutionPath(path string) {
+	e.constitutionPath = path
 }

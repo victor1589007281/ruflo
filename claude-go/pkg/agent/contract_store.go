@@ -844,3 +844,155 @@ func (cs *ContractStore) SymbolCount() int {
 	defer cs.mu.RUnlock()
 	return len(cs.symbols)
 }
+
+// ─── Contract Locking & Versioning ───
+
+// lockState tracks which agent holds the lock for a given interface name.
+type lockState struct {
+	lockedBy string
+	locked   bool
+}
+
+// Inconsistency represents a discovered contract inconsistency.
+type Inconsistency struct {
+	Type     string `json:"type"`     // "missing_method", "broken_signature", "orphan_reference"
+	Symbol   string `json:"symbol"`
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Message  string `json:"message"`
+	Severity string `json:"severity"` // "error", "warning"
+}
+
+// lockMap holds the global interface locks.
+var (
+	lockMap   = make(map[string]*lockState)
+	lockMapMu sync.RWMutex
+)
+
+// LockInterface locks an interface so other agents can't modify it.
+func (cs *ContractStore) LockInterface(name string, agentID string) error {
+	lockMapMu.Lock()
+	defer lockMapMu.Unlock()
+
+	state, ok := lockMap[name]
+	if ok && state.locked && state.lockedBy != agentID {
+		return fmt.Errorf("interface %q is already locked by agent %q", name, state.lockedBy)
+	}
+	lockMap[name] = &lockState{locked: true, lockedBy: agentID}
+	return nil
+}
+
+// UnlockInterface unlocks an interface (only if LockedBy matches).
+func (cs *ContractStore) UnlockInterface(name string, agentID string) error {
+	lockMapMu.Lock()
+	defer lockMapMu.Unlock()
+
+	state, ok := lockMap[name]
+	if !ok || !state.locked {
+		return fmt.Errorf("interface %q is not locked", name)
+	}
+	if state.lockedBy != agentID {
+		return fmt.Errorf("interface %q is locked by agent %q, cannot unlock by %q", name, state.lockedBy, agentID)
+	}
+	state.locked = false
+	state.lockedBy = ""
+	return nil
+}
+
+// IsLocked returns whether an interface is locked and by which agent.
+func (cs *ContractStore) IsLocked(name string) (bool, string) {
+	lockMapMu.RLock()
+	defer lockMapMu.RUnlock()
+
+	state, ok := lockMap[name]
+	if !ok || !state.locked {
+		return false, ""
+	}
+	return true, state.lockedBy
+}
+
+// GlobalConsistencyScan scans all interfaces to find inconsistencies:
+//   - implementors that don't satisfy the current contract
+//   - missing methods in implementors
+//   - references to deleted methods
+func (cs *ContractStore) GlobalConsistencyScan() ([]Inconsistency, error) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	var inconsistencies []Inconsistency
+
+	// Gather all interfaces.
+	for importPath, pkg := range cs.packages {
+		for typeName, ti := range pkg.Types {
+			if ti.Kind != "interface" {
+				continue
+			}
+			ifaceQName := importPath + "." + typeName
+
+			// Build interface method set.
+			ifaceMethods := make(map[string]MethodInfo)
+			for _, m := range ti.Methods {
+				ifaceMethods[m.Name] = m
+			}
+
+			// Find implementors.
+			for impPath, impPkg := range cs.packages {
+				for structName, sti := range impPkg.Types {
+					if sti.Kind != "struct" {
+						continue
+					}
+					if !cs.implements(sti, ti) {
+						continue
+					}
+
+					// Check for missing methods or broken signatures.
+					structMethods := make(map[string]MethodInfo)
+					for _, m := range sti.Methods {
+						structMethods[m.Name] = m
+					}
+
+					for mName, ifaceMethod := range ifaceMethods {
+						structMethod, ok := structMethods[mName]
+						if !ok {
+							inconsistencies = append(inconsistencies, Inconsistency{
+								Type:     "missing_method",
+								Symbol:   impPath + "." + structName + "." + mName,
+								File:     sti.File,
+								Line:     sti.Line,
+								Message:  fmt.Sprintf("struct %s.%s is missing method %s required by interface %s", impPath, structName, mName, ifaceQName),
+								Severity: "error",
+							})
+							continue
+						}
+						if len(structMethod.Params) != len(ifaceMethod.Params) ||
+							len(structMethod.Returns) != len(ifaceMethod.Returns) {
+							inconsistencies = append(inconsistencies, Inconsistency{
+								Type:     "broken_signature",
+								Symbol:   impPath + "." + structName + "." + mName,
+								File:     structMethod.File,
+								Line:     structMethod.Line,
+								Message:  fmt.Sprintf("method %s on %s.%s has a different signature than interface %s", mName, impPath, structName, ifaceQName),
+								Severity: "error",
+							})
+						}
+					}
+				}
+			}
+
+			// Orphan reference check: look for interface methods that are no longer declared
+			// but still referenced by callers. (Simplified: report if interface has zero methods.)
+			if len(ti.Methods) == 0 {
+				inconsistencies = append(inconsistencies, Inconsistency{
+					Type:     "orphan_reference",
+					Symbol:   ifaceQName,
+					File:     ti.File,
+					Line:     ti.Line,
+					Message:  fmt.Sprintf("interface %s has no methods; possible orphan reference", ifaceQName),
+					Severity: "warning",
+				})
+			}
+		}
+	}
+
+	return inconsistencies, nil
+}

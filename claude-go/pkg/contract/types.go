@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
+	"time"
 )
 
 // Store holds all discovered interface contracts for a project.
@@ -75,4 +76,23 @@ func (s *Store) GetImplementors(fqName string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Implementors[fqName]
+}
+
+// ContractVersion represents a snapshot of an interface contract.
+type ContractVersion struct {
+	Version   int       `json:"version"`
+	Author    string    `json:"author"` // Agent ID
+	Timestamp time.Time `json:"timestamp"`
+	Diff      string    `json:"diff,omitempty"` // diff from previous version
+	Breaking  bool      `json:"breaking"`       // whether this breaks compatibility
+}
+
+// InterfaceContractV2 extends InterfaceContract with versioning.
+// We keep backward compat by embedding the old fields.
+type InterfaceContractV2 struct {
+	InterfaceContract
+	Versions []ContractVersion `json:"versions"`
+	Current  MethodSig         `json:"current"` // latest version
+	Locked   bool              `json:"locked"`
+	LockedBy string            `json:"locked_by,omitempty"`
 }

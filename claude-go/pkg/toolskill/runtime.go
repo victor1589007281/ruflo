@@ -81,4 +81,7 @@ func (rt *Runtime) RegisterDefaults(store *contract.Store) {
 	rt.registry.Register(NewGoImportResolution(rt))
 	rt.registry.Register(NewRepoQualityGate(rt))
 	rt.registry.Register(NewGoFormat(rt))
+	rt.registry.Register(NewSecurityScan())
+	rt.registry.Register(NewBenchmarkGate())
+	rt.registry.Register(NewPropertyTest())
 }

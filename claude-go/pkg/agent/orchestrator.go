@@ -451,6 +451,10 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 	conflictLastV2ID := make(map[string]string)
 	conflictLastNum := make(map[string]string)
 	widthTasks := make([]rawTask, 0, len(rawTasks))
+
+	// Phase 3.3: Build symbol-level conflict key map for finer-grained parallelism
+	fileSymbols := buildSymbolMapFromRawTasks(rawTasks)
+
 	for _, rt := range rawTasks {
 		var depV2IDs []string
 		for _, dn := range rt.depNums {
@@ -458,7 +462,11 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 				depV2IDs = append(depV2IDs, v2id)
 			}
 		}
-		for _, key := range rawTaskConflictKeys(rt) {
+		for _, key := range smartConflictKeys(rt, fileSymbols) {
+			// SmartConflictKeys: read-only tasks sharing conflict keys should not be serialized
+			if isReadOnlyRawTask(rt) {
+				continue
+			}
 			if prev, ok := conflictLastV2ID[key]; ok && !containsString(depV2IDs, prev) {
 				depV2IDs = append(depV2IDs, prev)
 			}
@@ -527,7 +535,7 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 		}
 		nodes = append(nodes, node)
 		o.nodes[v2ID] = node
-		for _, key := range rawTaskConflictKeys(rt) {
+		for _, key := range smartConflictKeys(rt, fileSymbols) {
 			conflictLastV2ID[key] = v2ID
 			conflictLastNum[key] = rt.num
 		}
@@ -1538,6 +1546,7 @@ func (o *Orchestrator) normalizeAndSplitRawTasks(rawTasks []rawTask, objective s
 	normalized = relaxOverSerialRawDeps(normalized)
 	normalized = addDesignCompletePhaseBarriers(normalized, objective)
 	fillVerificationDeps(normalized)
+	normalized = autoInjectTestDeps(normalized)
 	normalized = orderRawTasksByDeps(normalized)
 	return normalized
 }
@@ -1566,6 +1575,52 @@ func addContractFirstRawDeps(tasks []rawTask) []rawTask {
 			}
 			if shouldDependOnContractTask(tasks[i], contract) {
 				tasks[i].depNums = uniqueTrimmedStrings(append(tasks[i].depNums, contract.num))
+			}
+		}
+	}
+	// Contract Lock Serialization: add dependencies for locked interfaces
+	tasks = addContractLockSerializationDeps(tasks)
+	return tasks
+}
+
+// addContractLockSerializationDeps adds dependencies for locked interfaces.
+// If an interface is locked, tasks that write files referencing that interface
+// must depend on the task that locked it.
+func addContractLockSerializationDeps(tasks []rawTask) []rawTask {
+	// Build a map of which task num locked which interface
+	lockOwner := make(map[string]string) // interface name -> task num that locked it
+	for _, task := range tasks {
+		if task.num == "" {
+			continue
+		}
+		for _, iface := range task.contractRefs {
+			iface = strings.TrimSpace(iface)
+			if iface == "" {
+				continue
+			}
+			// Check if this interface is locked by this task
+			// We use a heuristic: contract tasks with matching contractRefs "own" the lock
+			if isContractRawTask(task) {
+				lockOwner[iface] = task.num
+			}
+		}
+	}
+	if len(lockOwner) == 0 {
+		return tasks
+	}
+	for i := range tasks {
+		if tasks[i].num == "" || isContractRawTask(tasks[i]) {
+			continue
+		}
+		for _, iface := range tasks[i].contractRefs {
+			iface = strings.TrimSpace(iface)
+			if iface == "" {
+				continue
+			}
+			if ownerNum, ok := lockOwner[iface]; ok && ownerNum != tasks[i].num {
+				if !containsString(tasks[i].depNums, ownerNum) {
+					tasks[i].depNums = uniqueTrimmedStrings(append(tasks[i].depNums, ownerNum))
+				}
 			}
 		}
 	}
@@ -2900,6 +2955,120 @@ func duplicatePlanFileBasenames(files []string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// isReadOnlyRawTask returns true if the task only reads files and does not write any.
+func isReadOnlyRawTask(rt rawTask) bool {
+	if len(rt.writeFiles) > 0 {
+		return false
+	}
+	if len(rt.targetFiles) > 0 {
+		for _, f := range rt.targetFiles {
+			if !isPlanTestFile(f) {
+				return false
+			}
+		}
+	}
+	return rt.workUnitType == wbsWorkUnitVerification || rt.taskType == wbsTaskTypeVerification
+}
+
+// inferTestFiles infers test file paths from implementation files.
+// For each file, if it ends with a known source extension, appends the corresponding test suffix.
+func inferTestFiles(files []string) []string {
+	var out []string
+	for _, f := range files {
+		f = strings.TrimSpace(filepath.ToSlash(f))
+		if f == "" {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(f))
+		var testFile string
+		switch ext {
+		case ".go":
+			testFile = strings.TrimSuffix(f, ".go") + "_test.go"
+		case ".py":
+			testFile = "test_" + path.Base(f)
+		case ".ts", ".js":
+			testFile = strings.TrimSuffix(f, ext) + ".test" + ext
+		case ".rs":
+			testFile = strings.TrimSuffix(f, ".rs") + "_test.rs"
+		case ".java":
+			testFile = strings.TrimSuffix(f, ".java") + "Test.java"
+		case ".cpp", ".cc", ".cxx":
+			testFile = strings.TrimSuffix(f, ext) + "_test" + ext
+		default:
+			continue
+		}
+		out = append(out, testFile)
+	}
+	return uniqueTrimmedStrings(out)
+}
+
+// autoInjectTestDeps automatically creates test_design tasks for implementation tasks
+// that don't already have a test_design dependency.
+func autoInjectTestDeps(tasks []rawTask) []rawTask {
+	if len(tasks) == 0 {
+		return tasks
+	}
+	// Build a set of task nums that are test_design tasks
+	testDesignNums := make(map[string]bool)
+	for _, task := range tasks {
+		if task.num == "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(task.title), "test_design") ||
+			strings.Contains(strings.ToLower(task.title), "test design") ||
+			strings.Contains(strings.ToLower(task.title), "测试设计") {
+			testDesignNums[task.num] = true
+		}
+	}
+	var injected []rawTask
+	for _, task := range tasks {
+		if task.num == "" || task.workUnitType != wbsWorkUnitImplementation {
+			injected = append(injected, task)
+			continue
+		}
+		// Check if any dependency is a test_design task
+		hasTestDesignDep := false
+		for _, dep := range task.depNums {
+			if testDesignNums[dep] {
+				hasTestDesignDep = true
+				break
+			}
+		}
+		if hasTestDesignDep {
+			injected = append(injected, task)
+			continue
+		}
+		// Create a new test_design task
+		testFiles := inferTestFiles(append(append([]string{}, task.targetFiles...), task.writeFiles...))
+		testNum := task.num + ".test_design"
+		testTask := rawTask{
+			num:            testNum,
+			title:          task.title + " - test_design",
+			role:           "tester",
+			depNums:        []string{task.num},
+			accept:         "设计该实现的最小测试方案; 输出测试文件清单和关键测试用例",
+			priority:       task.priority,
+			complexity:     "simple",
+			taskType:       wbsTaskTypeLeaf,
+			workUnitType:   wbsWorkUnitVerification,
+			targetFiles:    testFiles,
+			writeFiles:     testFiles,
+			parentID:       task.num,
+			estimatedMin:   2,
+			riskLevel:      wbsRiskLow,
+			blockingPolicy: wbsBlockingFailOpen,
+			splitReason:    appendSplitReason(task.splitReason, "auto-inject-test-design"),
+		}
+		// Add the test_design task as a dependency to the original task's downstream
+		// But first, insert the test task before the original task in the list
+		injected = append(injected, task)
+		injected = append(injected, testTask)
+		// Mark this test_design num for potential downstream deps
+		testDesignNums[testNum] = true
+	}
+	return injected
 }
 
 func fileTargetLeafTitle(parentTitle, file string, duplicateBase map[string]bool) string {
@@ -7461,6 +7630,16 @@ func (o *Orchestrator) buildTaskPrompt(node *TaskNode, objective string, team *P
 			b.WriteString("Micro-Test 结果:\n" + node.TestResult + "\n")
 		}
 	}
+
+	// A/B test: inject simplicity-first skill for treatment group tasks
+	if abTestShouldInjectSkill(node.Title + "|" + node.Role) {
+		b.WriteString("\n### 🧪 A/B 实验组注入: simplicity-first\n")
+		b.WriteString("- 优先使用最简单的方案实现目标\n")
+		b.WriteString("- 避免过度工程化、过早抽象\n")
+		b.WriteString("- 每个函数不超过 50 行; 优先组合而非继承\n")
+		b.WriteString("- 变量/函数命名要自解释, 减少注释负担\n\n")
+	}
+
 	return b.String()
 }
 
@@ -7503,4 +7682,87 @@ func (o *Orchestrator) NodeCount() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.totalCount
+}
+
+// AutoInjectTestDepsResult holds the result of auto-injecting test design dependencies.
+type AutoInjectTestDepsResult struct {
+	Tasks         []rawTask
+	InjectedCount int
+}
+
+// RunAutoInjectTestDeps is a convenience wrapper for external callers.
+func RunAutoInjectTestDeps(tasks []rawTask) AutoInjectTestDepsResult {
+	result := autoInjectTestDeps(tasks)
+	return AutoInjectTestDepsResult{
+		Tasks:         result,
+		InjectedCount: len(result) - len(tasks),
+	}
+}
+
+// abTestShouldInjectSkill returns true for the treatment group (50% split based on task hash).
+// This enables A/B testing of skill injection effects on code quality metrics.
+func abTestShouldInjectSkill(taskKey string) bool {
+	var sum uint64
+	for i := 0; i < len(taskKey); i++ {
+		sum += uint64(taskKey[i])
+	}
+	return sum%2 == 1 // 50/50 deterministic split
+}
+
+// ABTestGroup returns the group name for a task key.
+func ABTestGroup(taskKey string) string {
+	if abTestShouldInjectSkill(taskKey) {
+		return "treatment"
+	}
+	return "control"
+}
+
+// buildSymbolMapFromRawTasks builds a map of file path to symbol-level conflict keys
+// from the Go source files referenced by raw tasks. This enables Phase 3.3
+// symbol-level dependency analysis, replacing coarse file-level conflict keys.
+func buildSymbolMapFromRawTasks(tasks []rawTask) map[string][]string {
+	ca := NewConflictAnalyzer()
+	files := make(map[string][]byte)
+	for _, rt := range tasks {
+		for _, f := range rt.targetFiles {
+			f = filepath.ToSlash(f)
+			if strings.HasSuffix(f, ".go") {
+				if _, ok := files[f]; !ok {
+					data, _ := os.ReadFile(f)
+					if len(data) > 0 {
+						files[f] = data
+					}
+				}
+			}
+		}
+		for _, f := range rt.readFiles {
+			f = filepath.ToSlash(f)
+			if strings.HasSuffix(f, ".go") {
+				if _, ok := files[f]; !ok {
+					data, _ := os.ReadFile(f)
+					if len(data) > 0 {
+						files[f] = data
+					}
+				}
+			}
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	return ca.BuildFileSymbolMap(files)
+}
+
+// smartConflictKeys returns symbol-level conflict keys when available,
+// otherwise falls back to rawTaskConflictKeys.
+func smartConflictKeys(rt rawTask, fileSymbols map[string][]string) []string {
+	if fileSymbols == nil {
+		return rawTaskConflictKeys(rt)
+	}
+	ca := NewConflictAnalyzer()
+	keys := ca.SmartConflictKeysForTask(rt, fileSymbols)
+	if len(keys) == 0 {
+		return rawTaskConflictKeys(rt)
+	}
+	return keys
 }

@@ -654,6 +654,22 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		}
 	}
 
+	// Global Gates: compile, test, and consistency checks after workflow stages complete
+	if team.Cwd != "" {
+		if gateErr := ptm.runGlobalCompileGate(team); gateErr != "" {
+			ptm.failTeam(team, fmt.Sprintf("全局编译门禁失败: %s", gateErr))
+			return
+		}
+		if gateErr := ptm.runGlobalTestGate(team); gateErr != "" {
+			ptm.failTeam(team, fmt.Sprintf("全局测试门禁失败: %s", gateErr))
+			return
+		}
+		if gateErr := ptm.runGlobalConsistencyCheck(team); gateErr != "" {
+			ptm.failTeam(team, fmt.Sprintf("全局一致性检查失败: %s", gateErr))
+			return
+		}
+	}
+
 	team.mu.Lock()
 	team.Status = deliveryStatus
 	team.FinishedAt = time.Now()
@@ -797,6 +813,60 @@ func hasBlockingDevelopmentFailure(results []StageResult) bool {
 
 func isSuccessfulTeamStatus(status TeamStatus) bool {
 	return status == TeamStatusCompleted || status == TeamStatusDeliveredWithRemediation
+}
+
+// runGlobalCompileGate runs a global compile check for the team.
+// Returns empty string on success, error message on failure.
+func (ptm *ProductionTeamManager) runGlobalCompileGate(team *ProductionTeam) string {
+	if team == nil || team.Cwd == "" {
+		return ""
+	}
+	cmd := exec.Command("go", "build", "./...")
+	cmd.Dir = team.Cwd
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("go build ./... failed: %v\n%s", err, string(out))
+	}
+	return ""
+}
+
+// runGlobalTestGate runs a global test check with race detection for the team.
+// Returns empty string on success, error message on failure.
+func (ptm *ProductionTeamManager) runGlobalTestGate(team *ProductionTeam) string {
+	if team == nil || team.Cwd == "" {
+		return ""
+	}
+	cmd := exec.Command("go", "test", "-race", "./...")
+	cmd.Dir = team.Cwd
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("go test -race ./... failed: %v\n%s", err, string(out))
+	}
+	return ""
+}
+
+// runGlobalConsistencyCheck runs a global consistency check using the ContractStore.
+// Returns empty string on success, error message on failure.
+func (ptm *ProductionTeamManager) runGlobalConsistencyCheck(team *ProductionTeam) string {
+	if team == nil || team.Cwd == "" {
+		return ""
+	}
+	cs := NewContractStore(team.Cwd, "")
+	if err := cs.BuildFromRepo(); err != nil {
+		return fmt.Sprintf("contract store build failed: %v", err)
+	}
+	inconsistencies, err := cs.GlobalConsistencyScan()
+	if err != nil {
+		return fmt.Sprintf("global consistency scan failed: %v", err)
+	}
+	if len(inconsistencies) > 0 {
+		var msgs []string
+		for _, inc := range inconsistencies {
+			msgs = append(msgs, fmt.Sprintf("[%s] %s: %s", inc.Severity, inc.Type, inc.Message))
+		}
+		return "global consistency issues found:\n" + strings.Join(msgs, "\n")
+	}
+	return ""
 }
 
 // executeSwarm 蜂群模式执行

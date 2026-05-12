@@ -136,6 +136,22 @@ func (t *GoRepairDiagnosis) diagnose(errorText, filePath, contractHint, snippet 
 			msgTemplate: "Function call argument count mismatch.",
 			instrTmpl:   "Check callee's contract or definition. Update call site or function signature.",
 		},
+		{
+			re:          regexp.MustCompile(`DATA RACE|WARNING: DATA RACE`),
+			category:    "data_race",
+			action:      "add_sync",
+			confidence:  0.95,
+			msgTemplate: "Data race detected. Shared mutable state accessed without synchronization.",
+			instrTmpl:   "Use sync.Mutex, sync.RWMutex, sync.Map, or channels to protect shared state. Prefer channel-based communication over shared memory.",
+		},
+		{
+			re:          regexp.MustCompile(`Goroutine leak|leaked goroutine|goroutine .* leaked`),
+			category:    "goroutine_leak",
+			action:      "fix_lifecycle",
+			confidence:  0.85,
+			msgTemplate: "Goroutine leak detected. Goroutine started but never terminates.",
+			instrTmpl:   "Ensure goroutines have a cancellation path (context.Done(), close channel, or sync.WaitGroup).",
+		},
 	}
 
 	for _, p := range patterns {

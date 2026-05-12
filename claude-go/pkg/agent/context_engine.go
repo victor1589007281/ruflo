@@ -62,6 +62,8 @@ func (ce *ContextEngine) Retrieve(req ContextRequest) (*ContextResult, error) {
 		ce.retrieveUnusedImport(req, result)
 	case "format":
 		result.Suggestions = append(result.Suggestions, "Run goimports or gofmt to fix formatting")
+	case "data_race", "goroutine_leak", "channel_close", "mutex_deadlock":
+		ce.retrieveConcurrencyIssue(req, result)
 	default:
 		ce.retrieveGeneric(req, result)
 	}
@@ -393,6 +395,67 @@ func (ce *ContextEngine) formatTypeDefinition(ti TypeInfo) string {
 		sb.WriteString(fmt.Sprintf("type %s %s", ti.Name, ti.Kind))
 	}
 	return sb.String()
+}
+
+func (ce *ContextEngine) retrieveConcurrencyIssue(req ContextRequest, result *ContextResult) {
+	// Provide suggestions based on the concurrency issue type
+	switch req.Category {
+	case "data_race":
+		result.Suggestions = append(result.Suggestions,
+			"Use sync.Mutex or sync.RWMutex to protect shared state",
+			"Consider sync.Map for map-only shared state",
+			"Consider channel-based communication instead of shared memory",
+			"Use atomic.Value for single-value shared state",
+		)
+		// Find the type definition for the raced variable
+		typeName := ce.extractTypeFromRaceDiagnostic(req.Diagnostic)
+		if typeName != "" {
+			for _, pkg := range ce.store.packages {
+				if ti, ok := pkg.Types[typeName]; ok {
+					result.Chunks = append(result.Chunks, ContextChunk{
+						Source: "contract", File: ti.File, Line: ti.Line,
+						Content: ce.formatTypeDefinition(ti), Relevance: 1.0,
+					})
+				}
+			}
+		}
+	case "goroutine_leak":
+		result.Suggestions = append(result.Suggestions,
+			"Pass context.Context to goroutine and check ctx.Done()",
+			"Use sync.WaitGroup to track goroutine completion",
+			"Use errgroup.Group for structured goroutine management",
+			"Add timeout or cancellation to long-running goroutines",
+		)
+	case "channel_close":
+		result.Suggestions = append(result.Suggestions,
+			"Only the sender should close the channel",
+			"Use sync.Once to ensure channel is closed exactly once",
+			"Check if channel is closed before sending with select + default",
+		)
+	case "mutex_deadlock":
+		result.Suggestions = append(result.Suggestions,
+			"Ensure mutex unlock happens in defer or on all return paths",
+			"Avoid holding multiple mutexes; if necessary, always acquire in the same order",
+			"Use sync.RWMutex when reads dominate",
+		)
+	}
+}
+
+func (ce *ContextEngine) extractTypeFromRaceDiagnostic(diag string) string {
+	// Extract type/variable name from race detector output
+	// e.g., "Previous write at 0x00c0000 by goroutine 8:"
+	// Try to find the variable name on subsequent lines
+	lines := strings.Split(diag, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, ".go:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				return parts[len(parts)-1]
+			}
+		}
+	}
+	return ""
 }
 
 func sortChunksByRelevance(chunks []ContextChunk) {

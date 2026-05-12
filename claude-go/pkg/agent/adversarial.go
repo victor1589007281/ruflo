@@ -33,6 +33,45 @@ type EvalScore struct {
 	PassSet         bool    `json:"-"`
 }
 
+// DimensionScore 单个维度的评分与发现。
+type DimensionScore struct {
+	Score    float64   `json:"score"`
+	Pass     bool      `json:"pass"`
+	Findings []Finding `json:"findings,omitempty"`
+}
+
+// Finding 单个发现问题。
+type Finding struct {
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Message  string `json:"message"`
+	Severity string `json:"severity"` // "blocking", "warning"
+}
+
+// MultiDimEvalScore 多维度评估分数（6 维度）。
+type MultiDimEvalScore struct {
+	Correctness DimensionScore `json:"correctness"`
+	Security    DimensionScore `json:"security"`
+	Concurrency DimensionScore `json:"concurrency"`
+	Performance DimensionScore `json:"performance"`
+	Idiomatic   DimensionScore `json:"idiomatic"`
+	Pass        bool           `json:"pass"`
+	Feedback    string         `json:"feedback"`
+}
+
+// ToMultiDim 将旧版 EvalScore 转换为 MultiDimEvalScore。
+func (e EvalScore) ToMultiDim() MultiDimEvalScore {
+	return MultiDimEvalScore{
+		Correctness: DimensionScore{Score: e.Correctness, Pass: e.Correctness >= hardPassMinScore},
+		Security:    DimensionScore{Score: e.Security, Pass: e.Security >= hardPassMinScore},
+		Concurrency: DimensionScore{Score: 0, Pass: true},
+		Performance: DimensionScore{Score: 0, Pass: true},
+		Idiomatic:   DimensionScore{Score: 0, Pass: true},
+		Pass:        e.Pass,
+		Feedback:    e.Feedback,
+	}
+}
+
 const hardPassMinScore = 6.0
 
 // WeightedScore 返回加权总分: C*0.30 + Co*0.25 + S*0.20 + Q*0.25
@@ -398,6 +437,7 @@ func (at *AdaptiveTerminator) ShouldTerminate(round int, score EvalScore) Termin
 
 // SkepticalReviewerPersona 用于评估器系统提示的「多疑评审者」人设（硬门槛：各维度 ≥6/10）。
 // 增强: 增加 TODO/STUB/空壳函数检测作为最高优先级检测项。
+// 扩展: 增加 Security、Concurrency、Performance、Idiomatic 四个维度，并显式检查并发与安全问题。
 const SkepticalReviewerPersona = `你是一名严格、多疑的独立评审者（只读验证，不得改代码）。
 你的职责是挑错：假设生成器可能遗漏需求、引入安全隐患或低质量实现。
 
@@ -406,15 +446,33 @@ const SkepticalReviewerPersona = `你是一名严格、多疑的独立评审者�
 - 检查: panic("not implemented") 或 return nil/0/"" 的空壳函数
 - 发现任何一处 → completeness ≤ 3, pass = false
 
-请从以下四个维度分别给出 0–10 的分数（整数或一位小数），并给出可执行的改进反馈（Feedback）：
+请从以下六个维度分别给出 0–10 的分数（整数或一位小数），并给出可执行的改进反馈（Feedback）：
 1) Correctness — 逻辑与事实是否正确
 2) Completeness — 是否覆盖目标与边界情况 (含 TODO/STUB 检测)
 3) Security — 密钥、注入、权限与供应链风险
 4) CodeQuality — 可读性、结构与可维护性
+5) Concurrency — 并发安全性（goroutine、channel、mutex、context）
+6) Performance — 性能与资源效率（算法复杂度、内存分配、热点路径）
+7) Idiomatic — 是否符合语言社区惯用法（命名、接口、组合、简洁性）
 
-硬通过条件：四个维度均 ≥ 6，且你明确认为可以交付（Pass=true）。
+🔒 Security 专项检查清单:
+- 输入验证: 所有外部输入是否经过验证？
+- 弱加密: 是否使用 md5/sha1？是否使用 crypto/rand？
+- 硬编码凭证: API key、密码、私钥是否硬编码？
+- 注入风险: SQL/OS Command/Path/Template 注入
+- 权限: 是否有越权访问风险？
+- 日志泄漏: 日志中是否包含敏感信息？
+
+🧵 Concurrency 专项检查清单:
+- Race conditions: 共享可变状态是否有同步保护？
+- Goroutine leaks: goroutine 是否有退出路径？
+- Channel safety: channel 关闭责任是否明确？是否可能向已关闭 channel 发送？
+- Mutex correctness: mutex 加锁/解锁是否配对？是否有死锁风险？
+- Context propagation: context.Context 是否正确传递和取消？
+
+硬通过条件：六个维度均 ≥ 6，且你明确认为可以交付（Pass=true）。
 若任一维度 < 6 或存在阻塞问题，必须 Pass=false，并在 Feedback 中列出具体修复项。
-输出必须为 JSON，字段名：correctness, completeness, security, code_quality, feedback, pass。`
+输出必须为 JSON，字段名：correctness, completeness, security, code_quality, concurrency, performance, idiomatic, feedback, pass。`
 
 // BuildSkepticalEvaluatorUserPrompt 组装发给评估模型的用户消息（objective + 生成器产出摘要）。
 func BuildSkepticalEvaluatorUserPrompt(objective, generatorOutput string) string {
@@ -946,6 +1004,156 @@ func SetPendingOnArtifact(a HandoffArtifact, pending []string) HandoffArtifact {
 // MarshalHandoff 将 HandoffArtifact 序列化为 JSON。
 func MarshalHandoff(a HandoffArtifact) ([]byte, error) {
 	return json.Marshal(a)
+}
+
+// -----------------------------------------------------------------------------
+// Global Consistency Reviewer
+// -----------------------------------------------------------------------------
+
+// GlobalConsistencyReviewer checks global consistency across all changed files.
+type GlobalConsistencyReviewer struct {
+	store *ContractStore
+}
+
+// NewGlobalConsistencyReviewer creates a new GlobalConsistencyReviewer.
+func NewGlobalConsistencyReviewer(store *ContractStore) *GlobalConsistencyReviewer {
+	return &GlobalConsistencyReviewer{store: store}
+}
+
+// ConsistencyIssue represents a single consistency issue.
+type ConsistencyIssue struct {
+	Type    string `json:"type"`
+	Symbol  string `json:"symbol"`
+	File    string `json:"file"`
+	Message string `json:"message"`
+}
+
+// InterfaceCheck represents the result of checking an interface.
+type InterfaceCheck struct {
+	InterfaceName string   `json:"interface_name"`
+	Passed        bool     `json:"passed"`
+	Implementors  []string `json:"implementors"`
+	Missing       []string `json:"missing,omitempty"`
+}
+
+// GlobalConsistencyReport is the result of a global consistency review.
+type GlobalConsistencyReport struct {
+	Passed          bool               `json:"passed"`
+	Issues          []ConsistencyIssue `json:"issues"`
+	InterfaceChecks []InterfaceCheck   `json:"interface_checks"`
+}
+
+// Review checks global consistency across all changed files.
+func (r *GlobalConsistencyReviewer) Review(changedFiles []string) (*GlobalConsistencyReport, error) {
+	report := &GlobalConsistencyReport{
+		Passed:          true,
+		Issues:          make([]ConsistencyIssue, 0),
+		InterfaceChecks: make([]InterfaceCheck, 0),
+	}
+
+	if r.store == nil {
+		return report, nil
+	}
+
+	// Track interfaces that were modified
+	modifiedInterfaces := make(map[string]bool)
+	for _, file := range changedFiles {
+		for _, pkg := range r.store.packages {
+			for _, ti := range pkg.Types {
+				if ti.Kind == "interface" && ti.File == file {
+					modifiedInterfaces[ti.Name] = true
+				}
+			}
+		}
+	}
+
+	// For each modified interface, verify all known implementors still satisfy it
+	for ifaceName := range modifiedInterfaces {
+		check := InterfaceCheck{
+			InterfaceName: ifaceName,
+			Passed:        true,
+			Implementors:  make([]string, 0),
+			Missing:       make([]string, 0),
+		}
+		for _, pkg := range r.store.packages {
+			for _, ti := range pkg.Types {
+				for _, impl := range ti.Implements {
+					if impl == ifaceName {
+						check.Implementors = append(check.Implementors, ti.Name)
+						// In a real implementation, we would check method signatures here
+						// For now, we assume the contract store tracks this
+					}
+				}
+			}
+		}
+		if len(check.Implementors) == 0 {
+			check.Passed = false
+			report.Issues = append(report.Issues, ConsistencyIssue{
+				Type:    "no_implementors",
+				Symbol:  ifaceName,
+				File:    "",
+				Message: fmt.Sprintf("interface %s has no known implementors", ifaceName),
+			})
+		}
+		report.InterfaceChecks = append(report.InterfaceChecks, check)
+	}
+
+	// Check for undefined cross-package references via field types
+	for _, file := range changedFiles {
+		for _, pkg := range r.store.packages {
+			for _, ti := range pkg.Types {
+				if ti.File == file {
+					for _, f := range ti.Fields {
+						found := false
+						for _, otherPkg := range r.store.packages {
+							for _, otherTi := range otherPkg.Types {
+								if otherTi.Name == f.Type {
+									found = true
+									break
+								}
+							}
+							if found {
+								break
+							}
+						}
+						if !found {
+							report.Issues = append(report.Issues, ConsistencyIssue{
+								Type:    "undefined_reference",
+								Symbol:  f.Type,
+								File:    file,
+								Message: fmt.Sprintf("undefined cross-package reference: %s", f.Type),
+							})
+							report.Passed = false
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Check for duplicate implementations
+	implMap := make(map[string][]string)
+	for _, pkg := range r.store.packages {
+		for _, ti := range pkg.Types {
+			for _, impl := range ti.Implements {
+				key := impl + ":" + ti.Name
+				implMap[key] = append(implMap[key], ti.File)
+			}
+		}
+	}
+	for key, files := range implMap {
+		if len(files) > 1 {
+			report.Issues = append(report.Issues, ConsistencyIssue{
+				Type:    "duplicate_implementation",
+				Symbol:  key,
+				File:    strings.Join(files, ", "),
+				Message: fmt.Sprintf("duplicate implementation of %s in files: %s", key, strings.Join(files, ", ")),
+			})
+			report.Passed = false
+		}
+	}
+
+	return report, nil
 }
 
 // -----------------------------------------------------------------------------

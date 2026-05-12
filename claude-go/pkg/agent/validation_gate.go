@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -16,23 +19,34 @@ import (
 type GateStage string
 
 const (
-	GateCompile GateStage = "compile" // go build / go test compile
-	GateStatic  GateStage = "static"  // go vet / staticcheck
-	GateTest    GateStage = "test"    // go test
-	GateFormat  GateStage = "format"  // gofmt / goimports
-	GateQuality GateStage = "quality" // repo-quality-gate
+	GateCompile     GateStage = "compile"     // go build / go test compile
+	GateStatic      GateStage = "static"      // go vet / staticcheck
+	GateTest        GateStage = "test"        // go test
+	GateFormat      GateStage = "format"      // gofmt / goimports
+	GateQuality     GateStage = "quality"     // repo-quality-gate
+	GateSecurity    GateStage = "security"    // security scan
+	GateConcurrency GateStage = "concurrency" // concurrency check
+	GatePerformance GateStage = "performance" // benchmark gate
 )
+
+// ConstitutionViolation tracks violations of the Go Code Constitution.
+type ConstitutionViolation struct {
+	Rule    string `json:"rule"`
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Message string `json:"message"`
+}
 
 // GateResult 验证结果
 type GateResult struct {
-	Passed      bool                 `json:"passed"`
-	Stage       GateStage            `json:"stage,omitempty"` // 首次失败的阶段
+	Passed      bool                   `json:"passed"`
+	Stage       GateStage              `json:"stage,omitempty"` // 首次失败的阶段
 	Diagnostics []toolskill.Diagnostic `json:"diagnostics,omitempty"`
-	Blockers    []GateBlocker        `json:"blockers,omitempty"`
-	Warnings    []GateWarning        `json:"warnings,omitempty"`
-	Evidence    map[string]any       `json:"evidence"` // 各 skill 原始输出
-	Duration    time.Duration        `json:"duration"`
-	Round       int                  `json:"round"`
+	Blockers    []GateBlocker          `json:"blockers,omitempty"`
+	Warnings    []GateWarning          `json:"warnings,omitempty"`
+	Evidence    map[string]any         `json:"evidence"` // 各 skill 原始输出
+	Duration    time.Duration          `json:"duration"`
+	Round       int                    `json:"round"`
 }
 
 // GateBlocker 阻断项
@@ -73,7 +87,7 @@ type GateConfig struct {
 	MaxAutoFix  int       `json:"max_auto_fix"` // 自动修复最大尝试次数
 }
 
-// DefaultGateConfig 返回默认验证阶段配置
+// DefaultGateConfig 返回默认验证阶段配置（5 阶段，保留向后兼容）
 func DefaultGateConfig() []GateConfig {
 	return []GateConfig{
 		{Stage: GateFormat, SkillName: "go-static-check", Required: true, AutoRetry: true, MaxAutoFix: 1},
@@ -84,10 +98,24 @@ func DefaultGateConfig() []GateConfig {
 	}
 }
 
+// DefaultGateConfigV2 返回 8 阶段验证配置
+func DefaultGateConfigV2() []GateConfig {
+	return []GateConfig{
+		{Stage: GateFormat, SkillName: "go-format", Required: true, AutoRetry: true, MaxAutoFix: 1},
+		{Stage: GateCompile, SkillName: "go-static-check", Required: true, AutoRetry: false, MaxAutoFix: 0},
+		{Stage: GateStatic, SkillName: "go-static-check", Required: true, AutoRetry: false, MaxAutoFix: 0},
+		{Stage: GateSecurity, SkillName: "security-scan", Required: true, AutoRetry: false, MaxAutoFix: 0},
+		{Stage: GateConcurrency, SkillName: "concurrency-check", Required: true, AutoRetry: false, MaxAutoFix: 0},
+		{Stage: GateTest, SkillName: "repo-quality-gate", Required: true, AutoRetry: false, MaxAutoFix: 0},
+		{Stage: GatePerformance, SkillName: "benchmark-gate", Required: false, AutoRetry: false, MaxAutoFix: 0},
+		{Stage: GateQuality, SkillName: "repo-quality-gate", Required: true, AutoRetry: false, MaxAutoFix: 0},
+	}
+}
+
 // NewValidationGate 创建验证门禁
 func NewValidationGate(config []GateConfig, maxRounds int) *ValidationGate {
 	hard := make(map[GateStage]bool)
-	for _, s := range []GateStage{GateCompile, GateStatic, GateTest, GateQuality} {
+	for _, s := range []GateStage{GateCompile, GateStatic, GateTest, GateQuality, GateSecurity, GateConcurrency} {
 		hard[s] = true
 	}
 	return &ValidationGate{
@@ -206,6 +234,27 @@ func (vg *ValidationGate) AddAutoFixRule(rule string) {
 	vg.mu.Lock()
 	defer vg.mu.Unlock()
 	vg.autoFix[rule] = true
+}
+
+// HasPerformanceRegression returns true if the performance gate detected regressions.
+func (gr *GateResult) HasPerformanceRegression() bool {
+	if gr == nil || gr.Evidence == nil {
+		return false
+	}
+	perf, ok := gr.Evidence[string(GatePerformance)]
+	if !ok {
+		return false
+	}
+	m, ok := perf.(map[string]any)
+	if !ok {
+		return false
+	}
+	v, ok := m["performance_regression"]
+	if !ok {
+		return false
+	}
+	b, ok := v.(bool)
+	return ok && b
 }
 
 // Summary 返回验证结果的文本摘要
@@ -351,6 +400,64 @@ func countDiffLines(filePath string) (additions, deletions int) {
 	// 实际实现应调用 git diff 或解析 patch
 	// 这里提供接口占位
 	return 0, 0
+}
+
+// CheckConstitution scans code for constitutional violations (hard-coded crypto/md5, bare map access, context.Background in business code).
+func (vg *ValidationGate) CheckConstitution(files []string) ([]ConstitutionViolation, error) {
+	var violations []ConstitutionViolation
+
+	weakCryptoRe := regexp.MustCompile(`"crypto/md5"|"crypto/sha1"`)
+	bareMapRe := regexp.MustCompile(`map\[\S+\]\S+\s*\[`)
+	backgroundRe := regexp.MustCompile(`context\.Background\(\)`)
+	syncMutexRe := regexp.MustCompile(`sync\.Mutex|sync\.RWMutex|sync\.Map`)
+
+	for _, f := range files {
+		content, err := os.ReadFile(f)
+		if err != nil {
+			continue // skip unreadable files
+		}
+		lines := strings.Split(string(content), "\n")
+		base := filepath.Base(f)
+
+		for i, line := range lines {
+			lineNo := i + 1
+
+			if weakCryptoRe.MatchString(line) {
+				violations = append(violations, ConstitutionViolation{
+					Rule:    "weak_crypto",
+					File:    f,
+					Line:    lineNo,
+					Message: fmt.Sprintf("Weak cryptographic import detected in %s", base),
+				})
+			}
+
+			if bareMapRe.MatchString(line) {
+				// Heuristic: look for sync.Mutex anywhere in the file
+				hasSync := syncMutexRe.Match(content)
+				if !hasSync {
+					violations = append(violations, ConstitutionViolation{
+						Rule:    "bare_map_access",
+						File:    f,
+						Line:    lineNo,
+						Message: fmt.Sprintf("Bare map access without synchronization in %s", base),
+					})
+				}
+			}
+
+			if backgroundRe.MatchString(line) {
+				if !strings.Contains(base, "_test.go") && base != "main.go" {
+					violations = append(violations, ConstitutionViolation{
+						Rule:    "hardcoded_background",
+						File:    f,
+						Line:    lineNo,
+						Message: fmt.Sprintf("context.Background() used outside main/init/test in %s", base),
+					})
+				}
+			}
+		}
+	}
+
+	return violations, nil
 }
 
 // hasCollateralDamage 检测替换前后的附带损伤
