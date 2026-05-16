@@ -220,6 +220,187 @@ func (r *Runner) ExecuteSessionHooks(event types.HookEvent) {
 	}
 }
 
+// ExecutePreCompactHooks 执行上下文压缩前 hooks。
+func (r *Runner) ExecutePreCompactHooks(messages []types.Message) {
+	r.executeMessageHooks(types.HookEventPreCompact, messages)
+}
+
+// ExecutePostCompactHooks 执行上下文压缩后 hooks。
+func (r *Runner) ExecutePostCompactHooks(messages []types.Message) {
+	r.executeMessageHooks(types.HookEventPostCompact, messages)
+}
+
+// ExecutePreTurnHooks 执行单轮开始前 hooks。
+func (r *Runner) ExecutePreTurnHooks(messages []types.Message, turnCount int) {
+	r.executeMessageHooksWithInput(types.HookEventPreTurn, messages, types.HookInput{TurnCount: turnCount})
+}
+
+// ExecutePostTurnHooks 执行单轮结束后 hooks。
+func (r *Runner) ExecutePostTurnHooks(messages []types.Message, turnCount int) {
+	r.executeMessageHooksWithInput(types.HookEventPostTurn, messages, types.HookInput{TurnCount: turnCount})
+}
+
+// ExecutePreRequestHooks 执行 API 请求前 hooks。
+func (r *Runner) ExecutePreRequestHooks(messages []types.Message, model string) {
+	r.executeMessageHooksWithInput(types.HookEventPreRequest, messages, types.HookInput{Model: model})
+}
+
+// ExecutePostRequestHooks 执行 API 请求后 hooks。
+func (r *Runner) ExecutePostRequestHooks(messages []types.Message, model string) {
+	r.executeMessageHooksWithInput(types.HookEventPostRequest, messages, types.HookInput{Model: model})
+}
+
+// ExecuteOnContextOverflowHooks 执行上下文溢出预警 hooks。
+func (r *Runner) ExecuteOnContextOverflowHooks(messages []types.Message, level int) {
+	r.executeMessageHooksWithInput(types.HookEventOnContextOverflow, messages, types.HookInput{BudgetLevel: level})
+}
+
+// ExecuteOnMaxTurnsReachedHooks 执行到达最大轮次 hooks。
+func (r *Runner) ExecuteOnMaxTurnsReachedHooks(messages []types.Message, turnCount int) {
+	r.executeMessageHooksWithInput(types.HookEventOnMaxTurnsReached, messages, types.HookInput{TurnCount: turnCount})
+}
+
+// ExecuteOnErrorHooks 执行错误捕获 hooks。
+func (r *Runner) ExecuteOnErrorHooks(messages []types.Message, reason string, err error) {
+	in := types.HookInput{Reason: reason}
+	if err != nil {
+		in.ErrorMessage = err.Error()
+	}
+	r.executeMessageHooksWithInput(types.HookEventOnError, messages, in)
+}
+
+// ExecuteOnRecoveryHooks 执行恢复/降级 hooks。
+func (r *Runner) ExecuteOnRecoveryHooks(messages []types.Message, reason string) {
+	r.executeMessageHooksWithInput(types.HookEventOnRecovery, messages, types.HookInput{Reason: reason})
+}
+
+// ExecuteOnRateLimitHooks 执行限流触发 hooks。
+func (r *Runner) ExecuteOnRateLimitHooks(err error, backoff time.Duration) {
+	in := types.HookInput{BackoffMs: int(backoff.Milliseconds())}
+	if err != nil {
+		in.ErrorMessage = err.Error()
+	}
+	r.executeMessageHooksWithInput(types.HookEventOnRateLimit, nil, in)
+}
+
+// ExecuteOnRetryHooks 执行重试 hooks。
+func (r *Runner) ExecuteOnRetryHooks(messages []types.Message, reason string, attempt int) {
+	r.executeMessageHooksWithInput(types.HookEventOnRetry, messages, types.HookInput{Reason: reason, TurnCount: attempt})
+}
+
+// ExecuteOnMessageFilterHooks 执行消息过滤 hooks。
+// 注意：当前仅做观测，不采纳 hook 对 Messages 的修改返回值，以避免破坏消息结构。
+func (r *Runner) ExecuteOnMessageFilterHooks(messages []types.Message) {
+	r.executeMessageHooks(types.HookEventOnMessageFilter, messages)
+}
+
+// ExecuteNotificationHooks 执行通知类 hooks。
+func (r *Runner) ExecuteNotificationHooks(msg string) {
+	hooks := r.findHooks(types.HookEventNotification, "")
+	for _, h := range hooks {
+		_, _ = r.executeHook(h, types.HookInput{
+			Event:       types.HookEventNotification,
+			SessionID:   r.sessionID,
+			ErrorMessage: msg,
+		})
+	}
+}
+
+// ExecuteSubagentStartHooks 执行子代理启动 hooks。
+func (r *Runner) ExecuteSubagentStartHooks(role, prompt string) {
+	hooks := r.findHooks(types.HookEventSubagentStart, "")
+	for _, h := range hooks {
+		_, _ = r.executeHook(h, types.HookInput{
+			Event:     types.HookEventSubagentStart,
+			SessionID: r.sessionID,
+			Role:      role,
+			Reason:    prompt,
+		})
+	}
+}
+
+// ExecuteSubagentStopHooks 执行子代理停止 hooks。
+func (r *Runner) ExecuteSubagentStopHooks(role, result string) {
+	hooks := r.findHooks(types.HookEventSubagentStop, "")
+	for _, h := range hooks {
+		_, _ = r.executeHook(h, types.HookInput{
+			Event:      types.HookEventSubagentStop,
+			SessionID:  r.sessionID,
+			Role:       role,
+			ToolResult: result,
+		})
+	}
+}
+
+// ExecuteTeammateIdleHooks 执行队友空闲 hooks。
+func (r *Runner) ExecuteTeammateIdleHooks(teammate string) {
+	hooks := r.findHooks(types.HookEventTeammateIdle, "")
+	for _, h := range hooks {
+		_, _ = r.executeHook(h, types.HookInput{
+			Event:     types.HookEventTeammateIdle,
+			SessionID: r.sessionID,
+			Role:      teammate,
+		})
+	}
+}
+
+// ExecuteTaskCompletedHooks 执行任务完成 hooks。
+func (r *Runner) ExecuteTaskCompletedHooks(taskID string, success bool) {
+	hooks := r.findHooks(types.HookEventTaskCompleted, "")
+	for _, h := range hooks {
+		_, _ = r.executeHook(h, types.HookInput{
+			Event:     types.HookEventTaskCompleted,
+			SessionID: r.sessionID,
+			TaskID:    taskID,
+			Success:   success,
+		})
+	}
+}
+
+// RunPostToolUseFailureHooks 执行工具执行失败（Go-error 级）hooks。
+// 与 PostToolUse 区分：PostToolUse 观察工具结果（含业务错误），
+// PostToolUseFailure 观察工具抛出异常/ panic 等执行失败。
+func (r *Runner) RunPostToolUseFailureHooks(toolName string, input json.RawMessage, errMsg string) error {
+	hooks := r.findHooks(types.HookEventPostToolUseFailure, toolName)
+	if len(hooks) == 0 {
+		return nil
+	}
+	hookInput := types.HookInput{
+		Event:       types.HookEventPostToolUseFailure,
+		SessionID:   r.sessionID,
+		ToolName:    toolName,
+		ToolInput:   input,
+		ErrorMessage: errMsg,
+		IsError:     true,
+	}
+	for _, h := range hooks {
+		_, _ = r.executeHook(h, hookInput)
+	}
+	return nil
+}
+
+// executeMessageHooks 辅助方法：对消息类事件统一执行。
+func (r *Runner) executeMessageHooks(event types.HookEvent, messages []types.Message) {
+	r.executeMessageHooksWithInput(event, messages, types.HookInput{})
+}
+
+// executeMessageHooksWithInput 辅助方法：带自定义输入字段的消息类事件执行。
+func (r *Runner) executeMessageHooksWithInput(event types.HookEvent, messages []types.Message, base types.HookInput) {
+	hooks := r.findHooks(event, "")
+	if len(hooks) == 0 {
+		return
+	}
+	in := base
+	in.Event = event
+	in.SessionID = r.sessionID
+	if messages != nil {
+		in.Messages = messages
+	}
+	for _, h := range hooks {
+		_, _ = r.executeHook(h, in)
+	}
+}
+
 // findHooks 查找匹配事件与 If 条件的 hooks
 func (r *Runner) findHooks(event types.HookEvent, toolName string) []types.HookConfig {
 	var result []types.HookConfig

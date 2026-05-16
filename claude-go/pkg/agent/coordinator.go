@@ -510,8 +510,16 @@ func (c *Coordinator) executeStageWithRetry(
 
 		c.saveCheckpoint(stage.Name, "running", attempt, "")
 
-		// 每次重试也有独立超时保护
-		stageCtx, stageCancel := context.WithTimeout(ctx, stageTimeout)
+		// 每次重试也有独立超时保护。这里必须使用 executor 自己的角色级
+		// 超时 (coder 25min / tester 15min / 等等), 而不是硬编码的 stageTimeout
+		// (10min). 否则 WorkflowExecutor.executeStageWithRetry 内层即便把
+		// timeout 设到 25min, 也会被 Coordinator 的这个 10min 包裹截断,
+		// 导致大功能 (Phase1+Phase2) 阶段反复在 10min 处被杀.
+		stageTimeoutForRole := stageTimeout
+		if executor != nil {
+			stageTimeoutForRole = executor.computeStageTimeout(stage.Role, attempt)
+		}
+		stageCtx, stageCancel := context.WithTimeout(ctx, stageTimeoutForRole)
 		sr := executor.ExecuteSingleStage(stageCtx, stage, objective, prevResults, team)
 		stageCancel()
 

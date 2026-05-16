@@ -103,6 +103,11 @@ type Client struct {
 	RetryBase  time.Duration // 退避基数, 默认 3s
 	RetryMax   time.Duration // 退避上限, 默认 60s
 
+	// 首token超时分离 (模型级可配置, 0 = 使用全局默认值)
+	FirstTokenTimeout time.Duration // 首token等待时间, 默认 180s
+	CallTimeout       time.Duration // 整体调用超时, 默认 600s
+	DeadlineRetryBase time.Duration // deadline exceeded 退避基数, 默认 10s
+
 	OnLLMEvent   LLMEventFunc    // 事件回调 (可选, 注入飞书通知)
 	OnLLMMetrics LLMMetricsHook  // 指标回调 (可选, 注入 dashboard metrics collector)
 	Guard        *RateLimitGuard // 全局准入控制器 (可选, 强烈建议设置)
@@ -239,10 +244,13 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		Client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
-		RetryCount:  4,
-		RetryBase:   3 * time.Second,
-		RetryMax:    60 * time.Second,
-		cbThreshold: 5,
+		RetryCount:        4,
+		RetryBase:         3 * time.Second,
+		RetryMax:          60 * time.Second,
+		cbThreshold:       5,
+		FirstTokenTimeout: 180 * time.Second,
+		CallTimeout:       600 * time.Second,
+		DeadlineRetryBase: 10 * time.Second,
 	}
 }
 
@@ -344,14 +352,20 @@ func isCacheRelatedError(statusCode int, body string) bool {
 		strings.Contains(lower, "unknown") && strings.Contains(lower, "cache")
 }
 
-// retryDelay 计算退避时间 (指数退避 + jitter, 429 用 3x 基数)
-func (c *Client) retryDelay(attempt int, statusCode int) time.Duration {
+// retryDelay 计算退避时间 (指数退避 + jitter, 429 用 3x 基数, deadline exceeded 用 DeadlineRetryBase)
+func (c *Client) retryDelay(attempt int, statusCode int, err error) time.Duration {
 	base := c.RetryBase
 	if base <= 0 {
 		base = 3 * time.Second
 	}
 	if statusCode == 429 || statusCode == 503 {
 		base = base * 3
+	}
+	if err != nil && isDeadlineError(err) {
+		base = c.DeadlineRetryBase
+		if base <= 0 {
+			base = 10 * time.Second
+		}
 	}
 	delay := time.Duration(float64(base) * math.Pow(2, float64(attempt)))
 	maxD := c.RetryMax
@@ -363,6 +377,14 @@ func (c *Client) retryDelay(attempt int, statusCode int) time.Duration {
 	}
 	jitter := time.Duration(float64(delay) * (0.75 + rand.Float64()*0.5))
 	return jitter
+}
+
+func isDeadlineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "deadline") || strings.Contains(msg, "timeout")
 }
 
 func (c *Client) fireEvent(eventType, detail string) {
@@ -585,14 +607,25 @@ func (c *Client) StreamMessage(
 
 		var system interface{}
 		if len(systemPrompt) == 1 {
-			system = systemPrompt[0]
+			if c.shouldEnablePromptCache() {
+				system = []map[string]interface{}{
+					{"type": "text", "text": systemPrompt[0], "cache_control": map[string]string{"type": "ephemeral"}},
+				}
+			} else {
+				system = systemPrompt[0]
+			}
 		} else if len(systemPrompt) > 1 {
-			blocks := make([]map[string]string, len(systemPrompt))
+			blocks := make([]map[string]interface{}, len(systemPrompt))
 			for i, s := range systemPrompt {
-				blocks[i] = map[string]string{
+				blocks[i] = map[string]interface{}{
 					"type": "text",
 					"text": s,
 				}
+			}
+			if c.shouldEnablePromptCache() {
+				// G1 PromptCache: cache_control 贴在第一个稳定块 (block 0),
+				// 而非最后一个动态块 (memory), 避免动态内容污染缓存键。
+				blocks[0]["cache_control"] = map[string]string{"type": "ephemeral"}
 			}
 			system = blocks
 		}
@@ -606,9 +639,6 @@ func (c *Client) StreamMessage(
 		}
 		if len(tools) > 0 {
 			req.Tools = tools
-		}
-		if c.shouldEnablePromptCache() {
-			req.CacheControl = &types.CacheControl{Type: "ephemeral"}
 		}
 
 		body, err := json.Marshal(req)
@@ -650,7 +680,7 @@ func (c *Client) StreamMessage(
 			resp, err = c.Client.Do(httpReq)
 			if err != nil {
 				if attempt < maxRetry {
-					delay := c.retryDelay(attempt, 0)
+					delay := c.retryDelay(attempt, 0, err)
 					c.TotalRetries.Add(1)
 					streamRetries++
 					c.fireEvent("retry", fmt.Sprintf("Stream 网络错误(尝试 %d/%d), %.0fs 后重试", attempt+1, maxRetry+1, delay.Seconds()))
@@ -724,6 +754,12 @@ func (c *Client) StreamMessage(
 				if newModel := c.on429OrFallback(); newModel != "" {
 					req.Model = newModel
 					body, _ = json.Marshal(req)
+					if c.FallbackBaseURL != "" {
+						effectiveBaseURL = c.FallbackBaseURL
+					}
+					if c.FallbackAPIKey != "" {
+						effectiveAPIKey = c.FallbackAPIKey
+					}
 				}
 			} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
 				if c.Guard != nil {
@@ -733,7 +769,7 @@ func (c *Client) StreamMessage(
 
 			// 可重试: 429 / 503 / 529 / 5xx
 			if attempt < maxRetry {
-				delay := c.retryDelay(attempt, resp.StatusCode)
+				delay := c.retryDelay(attempt, resp.StatusCode, nil)
 				if retryAfterSec > 0 {
 					raDelay := time.Duration(retryAfterSec*1000)*time.Millisecond + time.Duration(rand.Float64()*2000)*time.Millisecond
 					if raDelay > delay {
@@ -939,11 +975,25 @@ func (c *Client) SendMessage(
 
 	var system interface{}
 	if len(systemPrompt) == 1 {
-		system = systemPrompt[0]
+		if c.shouldEnablePromptCache() {
+			system = []map[string]interface{}{
+				{"type": "text", "text": systemPrompt[0], "cache_control": map[string]string{"type": "ephemeral"}},
+			}
+		} else {
+			system = systemPrompt[0]
+		}
 	} else if len(systemPrompt) > 1 {
-		blocks := make([]map[string]string, len(systemPrompt))
+		blocks := make([]map[string]interface{}, len(systemPrompt))
 		for i, s := range systemPrompt {
-			blocks[i] = map[string]string{"type": "text", "text": s}
+			blocks[i] = map[string]interface{}{
+				"type": "text",
+				"text": s,
+			}
+		}
+		if c.shouldEnablePromptCache() {
+			// G1 PromptCache: cache_control 贴在第一个稳定块 (block 0),
+			// 而非最后一个动态块 (memory), 避免动态内容污染缓存键。
+			blocks[0]["cache_control"] = map[string]string{"type": "ephemeral"}
 		}
 		system = blocks
 	}
@@ -957,9 +1007,6 @@ func (c *Client) SendMessage(
 	}
 	if len(tools) > 0 {
 		req.Tools = tools
-	}
-	if c.shouldEnablePromptCache() {
-		req.CacheControl = &types.CacheControl{Type: "ephemeral"}
 	}
 
 	body, err := json.Marshal(req)
@@ -977,29 +1024,31 @@ func (c *Client) SendMessage(
 	var lastStatus int
 	startTS := time.Now()
 	retries := 0
+	effectiveBaseURL := c.BaseURL
+	effectiveAPIKey := c.APIKey
 	for attempt := 0; attempt <= maxRetry; attempt++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		if debug != nil {
-			debug.addAttempt(attempt+1, c.BaseURL+"/messages", req.Model, body)
+			debug.addAttempt(attempt+1, effectiveBaseURL+"/messages", req.Model, body)
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/messages", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", effectiveBaseURL+"/messages", bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("创建请求失败: %w", err)
 		}
 
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("x-api-key", c.APIKey)
+		httpReq.Header.Set("x-api-key", effectiveAPIKey)
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
-		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+		httpReq.Header.Set("Authorization", "Bearer "+effectiveAPIKey)
 
 		resp, err := c.Client.Do(httpReq)
 		if err != nil {
 			lastErr = fmt.Errorf("API 请求失败: %w", err)
 			if attempt < maxRetry {
-				delay := c.retryDelay(attempt, 0)
+				delay := c.retryDelay(attempt, 0, err)
 				c.TotalRetries.Add(1)
 				retries++
 				log.Printf("[api] SendMessage 网络错误(尝试 %d/%d): %v, %.1fs 后重试", attempt+1, maxRetry+1, err, delay.Seconds())
@@ -1118,6 +1167,12 @@ func (c *Client) SendMessage(
 			if newModel := c.on429OrFallback(); newModel != "" {
 				req.Model = newModel
 				body, _ = json.Marshal(req)
+				if c.FallbackBaseURL != "" {
+					effectiveBaseURL = c.FallbackBaseURL
+				}
+				if c.FallbackAPIKey != "" {
+					effectiveAPIKey = c.FallbackAPIKey
+				}
 				continue
 			}
 		} else if resp.StatusCode == 503 || resp.StatusCode == 529 {
@@ -1127,7 +1182,7 @@ func (c *Client) SendMessage(
 		}
 
 		if attempt < maxRetry {
-			delay := c.retryDelay(attempt, resp.StatusCode)
+			delay := c.retryDelay(attempt, resp.StatusCode, nil)
 			// 优先使用 Retry-After
 			if retryAfterSec > 0 {
 				raDelay := time.Duration(retryAfterSec*1000) * time.Millisecond

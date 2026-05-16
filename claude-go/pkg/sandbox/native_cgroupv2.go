@@ -36,12 +36,99 @@ func (r *NativeCgroupV2Runner) Probe(ctx context.Context) ProbeResult {
 		return ProbeResult{Runtime: r.Name(), OK: false, Detail: "cgroup base not delegated/writable: " + err.Error(), Latency: time.Since(start)}
 	}
 	_ = os.WriteFile(filepath.Join(base, "cgroup.freeze"), []byte("0"), 0o644)
+	// Enable subtree_control so child cgroups can use memory/pids/cpu controllers.
+	// Without this, writes to child's memory.max etc fail with EACCES.
+	canMem, canPids, canCPU := ensureSubtreeControl(base)
 	subTest := filepath.Join(base, ".claude-go-probe-sub")
 	if err := os.MkdirAll(subTest, 0o755); err != nil {
 		return ProbeResult{Runtime: r.Name(), OK: false, Detail: "cannot create sub-cgroup: " + err.Error(), Latency: time.Since(start)}
 	}
-	_ = os.Remove(subTest)
-	return ProbeResult{Runtime: r.Name(), OK: true, Detail: base, Latency: time.Since(start), CanMemory: true, CanPids: true, CanCPU: true}
+	defer os.Remove(subTest)
+	// Verify we can actually configure resource limits on the sub-cgroup.
+	// This catches the case where subtree_control delegation is incomplete.
+	if canMem {
+		if err := os.WriteFile(filepath.Join(subTest, "memory.max"), []byte("max"), 0o644); err != nil {
+			canMem = false
+		}
+	}
+	if canPids {
+		if err := os.WriteFile(filepath.Join(subTest, "pids.max"), []byte("max"), 0o644); err != nil {
+			canPids = false
+		}
+	}
+	// If neither memory nor pids can be enforced, this runtime offers no isolation
+	// benefit over process-unsafe — fail the probe so a stronger runtime is picked.
+	if !canMem && !canPids {
+		return ProbeResult{Runtime: r.Name(), OK: false, Detail: "no resource controllers (memory/pids) writable in sub-cgroup at " + base, Latency: time.Since(start)}
+	}
+	// Verify that we can migrate processes into the sub-cgroup. systemd cgroup
+	// delegation requires the writer to have write permission on cgroup.procs of
+	// the common ancestor of the source (our own cgroup) and destination cgroups.
+	// In rootless setups where claude-go was launched from a user session scope
+	// (e.g. session-N.scope), the common ancestor with app.slice/claude-go-sandbox
+	// is user-1000.slice, which is owned by root. The earlier controller writes
+	// (memory.max, pids.max) succeed because they don't migrate processes, but
+	// the AfterStart hook's cgroup.procs write fails with EACCES at runtime —
+	// every command then errors as "sandbox setup failed". Detect this here and
+	// fail the probe so the manager falls back to docker.
+	procsWriteOK := true
+	procsDetail := ""
+	testCmd := exec.CommandContext(ctx, "sleep", "1")
+	if err := testCmd.Start(); err == nil {
+		childPid := testCmd.Process.Pid
+		if werr := os.WriteFile(filepath.Join(subTest, "cgroup.procs"), []byte(strconv.Itoa(childPid)), 0o644); werr != nil {
+			procsWriteOK = false
+			procsDetail = werr.Error()
+		}
+		_ = testCmd.Process.Kill()
+		_, _ = testCmd.Process.Wait()
+	}
+	if !procsWriteOK {
+		return ProbeResult{Runtime: r.Name(), OK: false, Detail: "cgroup.procs migration not permitted (systemd delegation gap): " + procsDetail, Latency: time.Since(start)}
+	}
+	return ProbeResult{Runtime: r.Name(), OK: true, Detail: base, Latency: time.Since(start), CanMemory: canMem, CanPids: canPids, CanCPU: canCPU}
+}
+
+// ensureSubtreeControl enables memory/pids/cpu controllers in the given cgroup's
+// cgroup.subtree_control file, so that child cgroups inherit those controllers
+// and can configure resource limits (memory.max, pids.max, cpu.max).
+//
+// Returns booleans indicating which controllers are available after the operation.
+// Best-effort: failures are silent (caller verifies via the probe step).
+func ensureSubtreeControl(base string) (canMemory, canPids, canCPU bool) {
+	// Read controllers available in this cgroup (inherited from parent's subtree_control).
+	availData, err := os.ReadFile(filepath.Join(base, "cgroup.controllers"))
+	if err != nil {
+		return false, false, false
+	}
+	avail := map[string]bool{}
+	for _, c := range strings.Fields(string(availData)) {
+		avail[c] = true
+	}
+	// Read what's currently enabled in subtree_control.
+	curData, _ := os.ReadFile(filepath.Join(base, "cgroup.subtree_control"))
+	enabled := map[string]bool{}
+	for _, c := range strings.Fields(string(curData)) {
+		enabled[c] = true
+	}
+	// Enable available controllers that aren't yet enabled.
+	wants := []string{"memory", "pids", "cpu"}
+	var toAdd []string
+	for _, w := range wants {
+		if avail[w] && !enabled[w] {
+			toAdd = append(toAdd, "+"+w)
+		}
+	}
+	if len(toAdd) > 0 {
+		if err := os.WriteFile(filepath.Join(base, "cgroup.subtree_control"), []byte(strings.Join(toAdd, " ")), 0o644); err == nil {
+			for _, w := range wants {
+				if avail[w] {
+					enabled[w] = true
+				}
+			}
+		}
+	}
+	return enabled["memory"], enabled["pids"], enabled["cpu"]
 }
 
 func (r *NativeCgroupV2Runner) Run(ctx context.Context, spec CommandSpec) (*CommandResult, error) {
@@ -51,6 +138,10 @@ func (r *NativeCgroupV2Runner) Run(ctx context.Context, spec CommandSpec) (*Comm
 		result.Err = fmt.Errorf("%s: %s", FailureRuntime, probe.Detail)
 		return result, result.Err
 	}
+
+	// Defensive: re-ensure subtree_control before creating child cgroup, in case
+	// another process or restart reset it. Idempotent and cheap.
+	ensureSubtreeControl(r.basePath())
 
 	cgPath := filepath.Join(r.basePath(), spec.ID)
 	if err := os.MkdirAll(cgPath, 0o755); err != nil {

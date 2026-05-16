@@ -111,6 +111,10 @@ func (d *wbsFakeDAG) GetAllTasks() []DAGTaskSummary {
 	return all
 }
 
+func (d *wbsFakeDAG) ReevaluateBlockedTasks() int {
+	return 0
+}
+
 type sleepingRunner struct{}
 
 func (sleepingRunner) Execute(ctx context.Context, userPrompt string) (string, error) {

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -555,6 +556,145 @@ func planningErrorText(err error) string {
 	return err.Error()
 }
 
+// cognitiveLoadScore 计算任务的动态认知负载分 (0~10+).
+// 综合考虑文件耦合度、任务类型、逻辑密度关键词、风险等级等。
+func cognitiveLoadScore(node *TaskNode) float64 {
+	if node == nil {
+		return 0
+	}
+	load := 0.0
+
+	// 文件数基础负载 (读比写轻量)
+	writeFiles := len(node.WriteFiles)
+	if writeFiles == 0 {
+		writeFiles = len(node.TargetFiles)
+	}
+	load += float64(writeFiles) * 0.4
+	load += float64(len(node.ReadFiles)) * 0.25
+
+	// 任务类型权重: contract/verification 密度低, implementation 密度中等
+	switch node.WorkUnitType {
+	case wbsWorkUnitContract:
+		load += 0.5
+	case wbsWorkUnitImplementation:
+		load += 1.0
+	case wbsWorkUnitVerification:
+		load += 0.3
+	default:
+		// WorkUnitType 未明确时, coder 角色默认按 implementation 密度估算
+		if strings.Contains(strings.ToLower(node.Role), "coder") {
+			load += 1.0
+		}
+	}
+
+	// 逻辑密度关键词检测 (高认知负载任务)
+	text := strings.ToLower(node.Title + " " + node.AcceptCriteria)
+	highDensityTerms := []string{
+		"编码", "序列化", "协议", "索引", "crc", "wal", "sstable",
+		"并发", "锁", "事务", "mvcc", "一致性", "调度", "状态机",
+		"编译器", "解析器", "lexer", "parser", "ast",
+		"权限", "安全边界", "加密", "签名",
+		"二进制", "wire format", "endian", "checksum",
+		// 扩充: 存储/引擎/查询/执行/调度等核心系统组件
+		"存储", "引擎", "计划器", "执行器", "内核", "管理器",
+		"数据结构", "接口", "模块", "系统", "框架", "服务",
+		"编解码", "压缩", "哈希", "内存", "缓存", "gc",
+		"网络", "数据库", "db", "类型系统", "编译", "反序列化",
+		"goroutine", "channel", "context", "allocator", "arena", "mmap",
+		"rpc", "grpc", "http", "mq", "消息队列", "event", "pubsub",
+		"fsm", "pipeline", "workflow", "orchestrator", "middleware",
+		"gateway", "proxy", "负载均衡", "路由", "分片", "shard",
+		"复制", "replica", "同步", "备份", "恢复", "迁移",
+		"优化", "profile", "benchmark", "调优",
+		"embedding", "vector", "hnsw", "ann", "cluster",
+		"model", "train", "inference", "attention", "transformer", "llm",
+	}
+	for _, term := range highDensityTerms {
+		if strings.Contains(text, term) {
+			load += 1.5
+			break // 只加一次，避免同一类密度反复累加
+		}
+	}
+
+	// 标题语义密度兜底: 当结构化元数据稀疏时，从标题中提取技术概念密度
+	load += titleSemanticLoad(node.Title)
+
+	// coder leaf 保底负载: 即使 WBS 未声明目标文件，agent 执行时仍会自行推断并生成代码
+	if writeFiles == 0 && len(node.TargetFiles) == 0 &&
+		node.TaskType == wbsTaskTypeLeaf && strings.Contains(strings.ToLower(node.Role), "coder") {
+		load += 2.5
+	}
+
+	// 子目标数
+	load += float64(len(node.SubGoals)) * 0.35
+
+	// 风险等级
+	switch node.RiskLevel {
+	case wbsRiskHigh:
+		load += 2.5
+	case wbsRiskMedium:
+		load += 0.8
+	}
+
+	// 预估时间偏差
+	if node.EstimatedMin > 4 {
+		load += 1.5
+	}
+
+	return load
+}
+
+// titleSemanticLoad 从标题中提取技术概念密度 (0~4.0)。
+// 当 WBS 未提供结构化元数据时，用标题语义作为负载兜底信号。
+func titleSemanticLoad(title string) float64 {
+	if title == "" {
+		return 0
+	}
+	text := strings.ToLower(title)
+
+	// 核心技术概念 (每个匹配 +0.8)
+	coreTerms := []string{
+		"存储", "引擎", "计划器", "执行器", "调度器", "管理器", "内核",
+		"数据结构", "算法", "协议", "接口", "模块", "系统", "框架",
+		"编解码", "序列化", "压缩", "加密", "哈希", "索引", "缓存",
+		"内存", "gc", "垃圾回收", "allocator", "arena", "mmap",
+		"并发", "锁", "事务", "mvcc", "一致性", "共识", "raft",
+		"网络", "数据库", "db", "sql", "nosql", "rpc", "grpc", "http",
+		"消息队列", "mq", "event", "pubsub", "watcher", "observer",
+		"fsm", "pipeline", "workflow", "orchestrator", "middleware",
+		"gateway", "proxy", "负载均衡", "路由", "分片", "shard",
+		"复制", "replica", "同步", "备份", "恢复", "迁移",
+		"优化", "profile", "benchmark", "调优",
+		"编译", "解析", "lexer", "parser", "ast", "类型系统",
+		"b+", "btree", "skiplist", "hashtable", "bloom", "bitmap",
+		"lsm", "wal", "sstable", "日志", "checkpoint",
+		"embedding", "vector", "hnsw", "ann", "cluster",
+		"model", "train", "inference", "attention", "transformer", "llm",
+	}
+
+	// 实现动作词 (每个匹配 +0.5)
+	actionTerms := []string{
+		"实现", "设计", "重构", "优化", "集成", "适配",
+		"编码", "开发", "构建", "组装", "封装", "抽象",
+	}
+
+	score := 0.0
+	for _, term := range coreTerms {
+		if strings.Contains(text, term) {
+			score += 0.8
+		}
+	}
+	for _, term := range actionTerms {
+		if strings.Contains(text, term) {
+			score += 0.5
+		}
+	}
+	if score > 4.0 {
+		score = 4.0
+	}
+	return score
+}
+
 func classifyAgentTimeout(err error, node *TaskNode, promptChars int, elapsed time.Duration) timeoutClassification {
 	lowerErr := strings.ToLower(planningErrorText(err))
 	if strings.Contains(lowerErr, "rate limit") || strings.Contains(lowerErr, "429") ||
@@ -568,15 +708,22 @@ func classifyAgentTimeout(err error, node *TaskNode, promptChars int, elapsed ti
 	if node == nil {
 		return timeoutClassification{Kind: wbsTimeoutKindUnknown, Action: wbsTimeoutActionRetryOrFail, Reason: "missing task node", AllowSplit: false}
 	}
-	writeFiles := len(node.WriteFiles)
-	if writeFiles == 0 {
-		writeFiles = len(node.TargetFiles)
+
+	load := cognitiveLoadScore(node)
+
+	// 连续评分: >8 分明确拆分, 6~8 分允许拆分, <6 分倾向 provider stall
+	if load > 8.0 {
+		return timeoutClassification{Kind: wbsTimeoutKindTrueOversize, Action: wbsTimeoutActionSplit, Reason: fmt.Sprintf("cognitive load %.1f exceeds high threshold", load), AllowSplit: true}
 	}
-	if node.EstimatedMin > 4 || node.RiskLevel == wbsRiskHigh || writeFiles > 3 || node.EstimatedLOC > 250 {
-		return timeoutClassification{Kind: wbsTimeoutKindTrueOversize, Action: wbsTimeoutActionSplit, Reason: "leaf exceeds declared readiness budget", AllowSplit: true}
+	if load >= 6.0 {
+		return timeoutClassification{Kind: wbsTimeoutKindTrueOversize, Action: wbsTimeoutActionSplit, Reason: fmt.Sprintf("cognitive load %.1f exceeds medium threshold", load), AllowSplit: true}
 	}
-	if node.TaskType == wbsTaskTypeLeaf && node.EstimatedMin > 0 && node.EstimatedMin <= 4 && elapsed >= coderCallTimeout {
-		return timeoutClassification{Kind: wbsTimeoutKindProviderStall, Action: wbsTimeoutActionRetryOrFail, Reason: "small ready leaf timed out, likely provider/tool stall rather than granularity", AllowSplit: false}
+
+	// 小负载任务超时 → provider stall 可能性大
+	const defaultCoderCallTimeout = 10 * time.Minute
+	if node.TaskType == wbsTaskTypeLeaf && elapsed >= defaultCoderCallTimeout {
+		return timeoutClassification{Kind: wbsTimeoutKindProviderStall, Action: wbsTimeoutActionRetryOrFail, Reason: fmt.Sprintf("small load (%.1f) leaf timed out, likely provider/tool stall", load), AllowSplit: false}
 	}
-	return timeoutClassification{Kind: wbsTimeoutKindUnknown, Action: wbsTimeoutActionRetryOrFail, Reason: "timeout cause is ambiguous", AllowSplit: false}
+
+	return timeoutClassification{Kind: wbsTimeoutKindUnknown, Action: wbsTimeoutActionRetryOrFail, Reason: fmt.Sprintf("timeout cause ambiguous (load %.1f)", load), AllowSplit: false}
 }

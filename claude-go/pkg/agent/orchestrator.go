@@ -131,7 +131,8 @@ type OrchestratorConfig struct {
 	MaxParallel      int
 	MaxRetries       int
 	MicroTestAfter   bool
-	AdversarialRound int // 每个 task 内 mini 对抗轮数上限 (0=默认2)
+	AdversarialRound int           // 每个 task 内 mini 对抗轮数上限 (0=默认2)
+	CallTimeout      time.Duration // 单次 agent 调用总超时 (0=默认10m)
 }
 
 // StageFlusher 回调: Orchestrator 每批任务完成后调用, 让调用方增量刷新 team.json。
@@ -1399,6 +1400,26 @@ func applyObjectiveTargetRootToWBS(rawTasks []rawTask, targetRoot string) {
 		rawTasks[i].writeFiles = prefixObjectiveTargetFiles(rawTasks[i].writeFiles, targetRoot)
 		rawTasks[i].readFiles = prefixObjectiveTargetFiles(rawTasks[i].readFiles, targetRoot)
 	}
+	// 安全网: 如果 Planner 把 go.mod 放到了子目录, 强制提升到项目根目录
+	for i := range rawTasks {
+		rawTasks[i].targetFiles = normalizeGoModToRoot(rawTasks[i].targetFiles, targetRoot)
+		rawTasks[i].writeFiles = normalizeGoModToRoot(rawTasks[i].writeFiles, targetRoot)
+	}
+}
+
+func normalizeGoModToRoot(files []string, targetRoot string) []string {
+	prefix := targetRoot + "/"
+	rootGoMod := prefix + "go.mod"
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(f)))
+		if strings.HasSuffix(clean, "/go.mod") && clean != rootGoMod {
+			out = append(out, rootGoMod)
+		} else {
+			out = append(out, f)
+		}
+	}
+	return uniqueTrimmedStrings(out)
 }
 
 func prefixObjectiveTargetFiles(files []string, targetRoot string) []string {
@@ -1413,6 +1434,12 @@ func prefixObjectiveTargetFiles(files []string, targetRoot string) []string {
 			continue
 		}
 		slash := filepath.ToSlash(strings.TrimPrefix(trimmed, "./"))
+		// Planner WBS 示例中常使用 "X/" 作为项目根目录占位符, 替换为真实目标根目录
+		if strings.HasPrefix(slash, "X/") || strings.HasPrefix(slash, "x/") {
+			slash = strings.TrimPrefix(strings.TrimPrefix(slash, "X/"), "x/")
+			out = append(out, prefix+slash)
+			continue
+		}
 		if filepath.IsAbs(trimmed) {
 			if rel := absolutePathUnderTargetRoot(trimmed, targetRoot); rel != "" {
 				out = append(out, rel)
@@ -2791,6 +2818,9 @@ func expandFileTargetRawTask(rt rawTask, reason string, files []string, adapter 
 			child.estimatedMin = 3
 		}
 		child.riskLevel = wbsRiskMedium
+		if rt.riskLevel == wbsRiskHigh {
+			child.riskLevel = wbsRiskHigh
+		}
 		child.parallelGroup = group + ":" + sanitizeParallelGroupSegment(path.Base(filepath.ToSlash(file)))
 		child.conflictKeys = nil
 		child.blockingPolicy = wbsBlockingFailBlocks
@@ -3190,6 +3220,9 @@ func expandDirectoryTargetRawTask(rt rawTask, reason string, dirs []string, adap
 			} else {
 				child.taskType = wbsTaskTypeLeaf
 				child.riskLevel = wbsRiskMedium
+				if rt.riskLevel == wbsRiskHigh {
+					child.riskLevel = wbsRiskHigh
+				}
 			}
 			child.workUnitType = spec.WorkUnitType
 			child.parentID = parentID
@@ -3312,7 +3345,12 @@ func buildExpandedTasks(rt rawTask, reason, groupSuffix string, steps []struct {
 		child.num = fmt.Sprintf("%s.%d", parentID, i+1)
 		child.title = step.title
 		if rt.title != "" {
-			child.title = rt.title + " - " + step.title
+			// 限制标题嵌套深度：最多保留一层父标题前缀，防止多次拆分后标题指数膨胀
+			baseTitle := rt.title
+			if idx := strings.LastIndex(rt.title, " - "); idx >= 0 {
+				baseTitle = rt.title[:idx]
+			}
+			child.title = baseTitle + " - " + step.title
 		}
 		if strings.Contains(reason, "mixed-contract-implementation") {
 			child.title = mixedContractImplementationChildTitle(rt.title, i)
@@ -3322,6 +3360,9 @@ func buildExpandedTasks(rt rawTask, reason, groupSuffix string, steps []struct {
 		child.parentID = parentID
 		child.estimatedMin = step.minutes
 		child.riskLevel = wbsRiskMedium
+		if rt.riskLevel == wbsRiskHigh {
+			child.riskLevel = wbsRiskHigh
+		}
 		child.parallelGroup = group
 		child.blockingPolicy = wbsBlockingFailBlocks
 		child.splitReason = appendSplitReason(rt.splitReason, "sizing-gate:"+reason)
@@ -3626,12 +3667,26 @@ const orchestratorMaxStallRecoveries = 5
 const taskExecutionTimeout = 12 * time.Minute
 
 const (
-	coderCallTimeout        = 6 * time.Minute
+	coderCallTimeout        = 10 * time.Minute // 默认 600s, 可通过 OrchestratorConfig.CallTimeout 覆盖
 	reviewerCallTimeout     = 2 * time.Minute
 	testerCallTimeout       = 2 * time.Minute
 	splitPlannerCallTimeout = 2 * time.Minute
-	longRunningLeafBudget   = coderCallTimeout + 30*time.Second
 )
+
+func longRunningLeafBudget(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		timeout = coderCallTimeout
+	}
+	return timeout + 30*time.Second
+}
+
+// callTimeout 返回当前 orchestrator 配置的有效调用超时。
+func (o *Orchestrator) callTimeout() time.Duration {
+	if o.config.CallTimeout > 0 {
+		return o.config.CallTimeout
+	}
+	return coderCallTimeout
+}
 
 // AgentExecutionTimeoutError 标记单次 agent 调用超时。它不是普通瞬态重试信号:
 // 对高风险 Leaf 应触发 split-on-timeout, 避免把同一个过粗 prompt 原样重试 5 次。
@@ -4199,6 +4254,16 @@ func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
 		}
 	}
 
+	// 恢复场景关键修复: 已 completed/failed 的任务在 resume 时不会触发 SetTaskStatusAndUnblock,
+	// 导致其下游 blocked 任务永远等不到 unblock. 这里主动重新评估所有 blocked 任务,
+	// 将依赖已全部完成的转为 pending, 让编排器能继续调度.
+	if o.dag != nil {
+		reevaluated := o.dag.ReevaluateBlockedTasks()
+		if reevaluated > 0 {
+			logging.Event(context.Background(), "orchestrator.restore.reevaluate", "count", reevaluated, "team", team.Name)
+		}
+	}
+
 	return restored
 }
 
@@ -4213,18 +4278,36 @@ func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective strin
 			}
 		}
 	}
+	o.mu.Unlock()
+
+	// 用 DAG 实际状态判断哪些是"卡住", 不依赖 node.Error 推断。
+	// 之前 bug: 任何 node.Error != "" 且非瞬态 → 重置为 pending → hard-gate failed 任务被一次次复活重跑.
+	// 正确语义: 只重置"正在执行但久未推进"或"瞬态失败"的任务. failed (含 hard-gate) 已经按 all_done
+	// 解除下游阻塞, 不应再被复活; 应让 DAG 顺其自然地推进或终止.
+	dagStatus := make(map[string]string)
+	if o.dag != nil {
+		for _, t := range o.dag.GetAllTasks() {
+			dagStatus[t.ID] = t.Status
+		}
+	}
 
 	// 收集: in_progress 卡住的 + failed(瞬态) 可恢复的
 	var stuckIDs []string
 	var transientFailedIDs []string
+	o.mu.Lock()
 	for id, node := range o.nodes {
 		if doneIDs[id] {
 			continue
 		}
-		// 通过 node.Error 判断是否瞬态失败
-		if node.Error != "" && isTransientError(node.Error) {
+		status := dagStatus[id]
+		// 瞬态失败: 网络/限流/超时类, 重试有效
+		if status == "failed" && node.Error != "" && isTransientError(node.Error) {
 			transientFailedIDs = append(transientFailedIDs, id)
-		} else if !doneIDs[id] {
+			continue
+		}
+		// 卡住: 必须是 in_progress (真的在跑但久未推进), 才有重置意义.
+		// pending/blocked/completed/failed 都不应被强制重置.
+		if status == "in_progress" {
 			stuckIDs = append(stuckIDs, id)
 		}
 	}
@@ -4650,7 +4733,7 @@ func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, ob
 
 	if !classification.AllowSplit {
 		o.notify(o.chatID, fmt.Sprintf("⏱️ %s 超过 agent %s 预算, 分类为 %s (%s), 不做动态拆分, 进入重试/失败流程",
-			node.Title, coderCallTimeout, classification.Kind, classification.Reason))
+			node.Title, o.callTimeout(), classification.Kind, classification.Reason))
 		return o.handleTaskFailure(ctx, node, objective, team, StageResult{
 			Name:      node.Title,
 			Role:      node.Role,
@@ -4681,7 +4764,7 @@ func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, ob
 			o.checkpoints.SaveCheckpoint(node.Title, "completed", node.Retries, node.Output)
 		}
 		o.recordWBSTaskDuration(team, node, duration, TaskCompleted)
-		o.notify(o.chatID, fmt.Sprintf("⏱️ %s 超过 agent %s 预算, 已通过 %s 在线拆分为 %d 个 Leaf, 不再原样重试", node.Title, coderCallTimeout, splitSource, children))
+		o.notify(o.chatID, fmt.Sprintf("⏱️ %s 超过 agent %s 预算, 已通过 %s 在线拆分为 %d 个 Leaf, 不再原样重试", node.Title, o.callTimeout(), splitSource, children))
 		return StageResult{Name: node.Title, Role: node.Role, Status: TaskCompleted, Output: node.Output, StartedAt: start, Duration: duration.Round(time.Second).String()}
 	}
 
@@ -4696,12 +4779,12 @@ func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, ob
 	}
 	o.recordWBSTaskDuration(team, node, duration, TaskFailed)
 	o.recordWBSFailedBlockedDependents(team, node, cascaded)
-	o.notify(o.chatID, fmt.Sprintf("⏱️ %s 超过 agent %s 预算, split-on-timeout 动态拆分失败, 标记 failed", node.Title, coderCallTimeout))
+	o.notify(o.chatID, fmt.Sprintf("⏱️ %s 超过 agent %s 预算, split-on-timeout 动态拆分失败, 标记 failed", node.Title, o.callTimeout()))
 	return StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: errText, StartedAt: start, Duration: duration.Round(time.Second).String()}
 }
 
 func (o *Orchestrator) shouldSplitLongRunningLeaf(node *TaskNode, start time.Time) bool {
-	if node == nil || time.Since(start) < longRunningLeafBudget {
+	if node == nil || time.Since(start) < longRunningLeafBudget(o.callTimeout()) {
 		return false
 	}
 	taskType := strings.ToLower(strings.TrimSpace(node.TaskType))
@@ -4716,9 +4799,10 @@ func (o *Orchestrator) shouldSplitLongRunningLeaf(node *TaskNode, start time.Tim
 
 func (o *Orchestrator) handleLongRunningLeaf(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, start time.Time) StageResult {
 	node.SplitReason = appendSplitReason(node.SplitReason, "long-running")
+	budget := longRunningLeafBudget(o.callTimeout())
 	return o.handleTaskTimeout(ctx, node, objective, team, start, &AgentExecutionTimeoutError{
-		Timeout: longRunningLeafBudget,
-		Cause:   fmt.Errorf("long-running leaf exceeded %s without hard gate pass", longRunningLeafBudget),
+		Timeout: budget,
+		Cause:   fmt.Errorf("long-running leaf exceeded %s without hard gate pass", budget),
 	})
 }
 
@@ -5743,7 +5827,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 				StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 					StartedAt: start, Duration: time.Since(start).String()})
 		}
-		result, err := executeRunnerBounded(ctx, runner, prompt, coderCallTimeout)
+		result, err := executeRunnerBounded(ctx, runner, prompt, o.callTimeout())
 		if err != nil {
 			if isAgentExecutionTimeout(err) {
 				return o.handleTaskTimeout(ctx, node, objective, team, start, err)
@@ -5825,14 +5909,15 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 			if buildErrors != "" {
 				buildPassed = false
 				o.notify(o.chatID, fmt.Sprintf("🔴 %s 第 %d 轮编译失败, 启动内部修复...", node.Title, round))
-				for retry := 1; retry <= 2; retry++ {
-					fixPrompt := fmt.Sprintf("%s\n\n### 编译错误 (第 %d 次修复, 仅修复编译问题):\n%s\n\n上轮代码:\n%s",
-						o.buildTaskPrompt(node, objective, team), retry, truncateResult(buildErrors, 3000), truncateResult(lastOutput, 10000))
+				guard := NewCompileRepairGuard(3)
+				for retry := 1; retry <= 4; retry++ {
+					fixPrompt := fmt.Sprintf("%s\n\n### 编译错误 (第 %d 次修复, 仅修复编译问题):\n%s\n\n上轮代码:\n%s\n%s",
+						o.buildTaskPrompt(node, objective, team), retry, truncateResult(buildErrors, 3000), truncateResult(lastOutput, 10000), ConfidencePromptSuffix)
 					fixRunner, fixErr := o.factory(ctx, node.Role, "")
 					if fixErr != nil {
 						break
 					}
-					fixResult, fixErr := executeRunnerBounded(ctx, fixRunner, fixPrompt, coderCallTimeout)
+					fixResult, fixErr := executeRunnerBounded(ctx, fixRunner, fixPrompt, o.callTimeout())
 					if fixErr != nil {
 						break
 					}
@@ -5883,6 +5968,21 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 					if buildErrors == "" {
 						buildPassed = true
 						o.notify(o.chatID, fmt.Sprintf("  🟢 %s 编译修复成功 (重试 %d)", node.Title, retry))
+						break
+					}
+					// 编译仍失败，检查守卫
+					conf := ParseConfidenceFromOutput(fixResult)
+					round := repairRound{
+						retryNum:        retry,
+						errorSignatures: ExtractErrorSignatures(buildErrors),
+						modifiedFiles:   written,
+						modifiedLines:   0,
+						agentOutput:     fixResult,
+						confidence:      conf,
+					}
+					decision := guard.RecordRound(round)
+					if decision.Action == "abort" {
+						o.notify(o.chatID, fmt.Sprintf("🔴 %s 编译修复被守卫终止: %s", node.Title, decision.Reason))
 						break
 					}
 				}
@@ -6262,15 +6362,17 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 		node.Error = errText
 		cascaded, _ := o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "failed")
 		o.mu.Lock()
-		o.failedCount += 1 + cascaded
+		o.failedCount += 1
 		o.mu.Unlock()
 		if o.checkpoints != nil {
 			o.checkpoints.SaveCheckpoint(node.Title, "failed", node.Retries, errText)
 		}
 		o.recordWBSTaskDuration(team, node, duration, TaskFailed)
 		o.recordWBSFailedBlockedDependents(team, node, cascaded)
+		// 失败语义已改为 all_done unblock: cascaded 实际是 "解除阻塞的下游兄弟数".
+		// 旧版的级联硬阻塞已废弃, 现在失败任务不再硬性阻塞下游, 让 LLM 仍有机会尝试.
 		if cascaded > 0 {
-			o.notify(o.chatID, fmt.Sprintf("🔴 %s hard gate 未通过 (%s) %s, 级联阻塞 %d 个下游任务", node.Title, duration.Round(time.Second), passLabel, cascaded))
+			o.notify(o.chatID, fmt.Sprintf("🔴 %s hard gate 未通过 (%s) %s, 解除下游 %d 个兄弟任务阻塞", node.Title, duration.Round(time.Second), passLabel, cascaded))
 		} else {
 			o.notify(o.chatID, fmt.Sprintf("🔴 %s hard gate 未通过 (%s) %s", node.Title, duration.Round(time.Second), passLabel))
 		}
@@ -7000,7 +7102,7 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 			StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: err.Error(),
 				StartedAt: start, Duration: time.Since(start).String()})
 	}
-	result, err := executeRunnerBounded(ctx, runner, prompt, coderCallTimeout)
+	result, err := executeRunnerBounded(ctx, runner, prompt, o.callTimeout())
 	if err != nil {
 		if isAgentExecutionTimeout(err) {
 			return o.handleTaskTimeout(ctx, node, objective, team, start, err)

@@ -33,6 +33,14 @@ type ModelConfig struct {
 	MaxTurns        int    `json:"maxTurns,omitempty"`        // 默认 max_turns
 	PromptCacheMode string `json:"promptCacheMode,omitempty"` // "auto" / "on" / "off"
 	ContextWindow   int    `json:"contextWindow,omitempty"`   // 上下文窗口长度
+	// 模型专属限流参数 (0 = 使用全局默认值)
+	RPM         int `json:"rpm,omitempty"`         // 每分钟最大请求数
+	MaxParallel int `json:"maxParallel,omitempty"` // 最大并发请求数
+	MinParallel int `json:"minParallel,omitempty"` // 最小并发请求数 (AIMD 下限)
+	// 超时与退避参数 (0 = 使用全局默认值)
+	FirstTokenTimeoutSec int `json:"firstTokenTimeoutSec,omitempty"` // 首token等待时间(秒)
+	CallTimeoutSec       int `json:"callTimeoutSec,omitempty"`       // 单次agent调用总时间(秒)
+	DeadlineRetryBaseSec int `json:"deadlineRetryBaseSec,omitempty"` // deadline exceeded退避基数(秒)
 }
 
 // GlobalConfig 全局默认配置。
@@ -69,6 +77,14 @@ type ResolvedConfig struct {
 	MaxTurns        int
 	PromptCacheMode string
 	ContextWindow   int
+	// 模型专属限流参数 (0 = 使用全局默认值)
+	RPM         int
+	MaxParallel int
+	MinParallel int
+	// 超时与退避参数 (0 = 使用全局默认值)
+	FirstTokenTimeoutSec int // 首token等待时间(秒)
+	CallTimeoutSec       int // 单次agent调用总时间(秒)
+	DeadlineRetryBaseSec int // deadline exceeded退避基数(秒)
 }
 
 // ConfigJSON 顶层 JSON 配置结构 (对应 config.json 中的 ai 段 + providers 段)。

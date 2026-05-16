@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -173,6 +174,17 @@ func dockerRunArgs(name string, spec CommandSpec) []string {
 	if tempSize == "" {
 		tempSize = "512m"
 	}
+	// 当宿主机启用了 userns-remap (如 /etc/subuid 配置) 时, 容器内 root 会被映射到
+	// 一个非宿主机属主的 UID, 导致对 bind mount 的宿主机目录没有写权限。
+	// 显式指定 --user 为当前宿主机用户, 使容器内 UID/GID 与宿主机文件属主一致,
+	// 从而保证 go build / npm install 等需要写工作区的命令能正常执行。
+	uid := os.Getuid()
+	gid := os.Getgid()
+	userSpec := ""
+	if uid >= 0 && gid >= 0 {
+		userSpec = fmt.Sprintf("%d:%d", uid, gid)
+	}
+
 	args := []string{
 		"run",
 		"--name", name,
@@ -186,6 +198,9 @@ func dockerRunArgs(name string, spec CommandSpec) []string {
 		"-e", "GOCACHE=/tmp/go-cache",
 		"-e", "GOMODCACHE=/tmp/go-mod",
 		"-v", filepath.Clean(spec.Cwd) + ":/workspace:rw",
+	}
+	if userSpec != "" {
+		args = append(args, "--user", userSpec)
 	}
 	if spec.NetworkDisabled {
 		args = append(args, "--network", "none")

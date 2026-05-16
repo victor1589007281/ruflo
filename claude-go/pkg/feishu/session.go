@@ -763,6 +763,10 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	permMode := types.PermissionMode(r.sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)
 	hookRunner := hooks.NewRunner(r.sm.hookConfigs, "")
+	if hookRunner != nil {
+		hookRunner.ExecuteSessionHooks(types.HookEventSessionStart)
+		hookRunner.ExecuteSubagentStartHooks(r.role, userPrompt)
+	}
 	compactor := compact.NewCompactor(apiClient, contextWindow)
 	promptMgr := prompt.NewManager(r.sm.config.Cwd)
 	promptMgr.Model = modelOverride
@@ -806,11 +810,14 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 
 	eng := engine.NewQueryEngine(cfg, apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = r.sm.memoryStore
+	// 将任务描述从 user message 移到 system prompt 末尾，避免 msg[0] 膨胀
+	// 同时让 system prompt 前缀享受 prompt caching。
+	eng.TaskInstruction = userPrompt
 
 	start := time.Now()
 	var sb strings.Builder
 	var hasApiError bool
-	for msg := range eng.SubmitMessage(ctx, userPrompt) {
+	for msg := range eng.SubmitMessage(ctx, "") {
 		if msg.Type != types.MessageTypeAssistant {
 			continue
 		}
@@ -858,6 +865,10 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	}
 
 	_ = start // used by evolution trajectory in workflow layer
+	if hookRunner != nil {
+		hookRunner.ExecuteSubagentStopHooks(r.role, result)
+		hookRunner.ExecuteSessionHooks(types.HookEventSessionEnd)
+	}
 	return result, nil
 }
 

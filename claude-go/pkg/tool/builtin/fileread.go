@@ -10,12 +10,15 @@ package builtin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -39,10 +42,15 @@ type fileReadInput struct {
 }
 
 // FileReadTool 文件读取工具
-type FileReadTool struct{}
+type FileReadTool struct {
+	mu             sync.Mutex
+	lastReadHashes map[string]string // path -> content hash (不含内容，仅去重)
+}
 
 func NewFileReadTool() *FileReadTool {
-	return &FileReadTool{}
+	return &FileReadTool{
+		lastReadHashes: make(map[string]string),
+	}
 }
 
 func (t *FileReadTool) Name() string { return FileReadToolName }
@@ -144,6 +152,16 @@ func (t *FileReadTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 		return &tool.ToolResult{Content: "File is empty."}, nil
 	}
 
+	// 优化2: Read 工具 hash 缓存 — 只存 hash，不含内容
+	currentHash := hashBytes(data)
+	t.mu.Lock()
+	lastHash, exists := t.lastReadHashes[filePath]
+	t.lastReadHashes[filePath] = currentHash
+	t.mu.Unlock()
+	if exists && lastHash == currentHash {
+		return &tool.ToolResult{Content: fmt.Sprintf("<file %s unchanged since last read (hash: %s)>", filePath, currentHash[:8])}, nil
+	}
+
 	lines := strings.Split(content, "\n")
 	totalLines := len(lines)
 
@@ -205,4 +223,13 @@ func fileFindHint(path string) string {
 		return fmt.Sprintf("The directory %s does not exist.", dir)
 	}
 	return "If this is a relative path, the file may be in a different directory. Try using an absolute path."
+}
+
+// hashBytes 计算字节切片的短 SHA256 哈希。
+func hashBytes(b []byte) string {
+	if len(b) == 0 {
+		return "empty"
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])[:16]
 }

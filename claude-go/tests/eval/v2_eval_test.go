@@ -2921,6 +2921,29 @@ func (m *mockDAGTracker) GetAllTasks() []agent.DAGTaskSummary {
 	return result
 }
 
+func (m *mockDAGTracker) ReevaluateBlockedTasks() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	unblocked := 0
+	for _, t := range m.tasks {
+		if t.status != "blocked" {
+			continue
+		}
+		ready := true
+		for _, dep := range t.deps {
+			if dt, ok := m.tasks[dep]; ok && dt.status != "completed" {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			t.status = "pending"
+			unblocked++
+		}
+	}
+	return unblocked
+}
+
 // --- 46. DAG 编排器 (V2 TaskStore 复用 + DynTaskMAS) ---
 
 func testOrchestratorDAG(t *testing.T, report *WikiEvalReport) {

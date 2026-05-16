@@ -263,8 +263,13 @@ func teamCmd() *cobra.Command {
 		Aliases: []string{"ls"},
 		Short:   "列出所有团队",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			jsonCfg, _ := feishu.LoadJSONConfig(flagConfig)
+			stateDirInput := ""
+			if jsonCfg != nil {
+				stateDirInput = jsonCfg.StateDir
+			}
 			cwd, _ := os.Getwd()
-			stateDir := basedir.ResolveDefault("", cwd)
+			stateDir := basedir.ResolveDefault(stateDirInput, cwd)
 			teamsDir := filepath.Join(stateDir, "teams")
 			entries, err := os.ReadDir(teamsDir)
 			if err != nil {
@@ -309,8 +314,13 @@ func teamCmd() *cobra.Command {
 		Short: "查看团队详细状态",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			jsonCfg, _ := feishu.LoadJSONConfig(flagConfig)
+			stateDirInput := ""
+			if jsonCfg != nil {
+				stateDirInput = jsonCfg.StateDir
+			}
 			cwd, _ := os.Getwd()
-			stateDir := basedir.ResolveDefault("", cwd)
+			stateDir := basedir.ResolveDefault(stateDirInput, cwd)
 			path := filepath.Join(stateDir, "teams", args[0], "team.json")
 			data, err := os.ReadFile(path)
 			if err != nil {
@@ -707,7 +717,7 @@ func runCmd() *cobra.Command {
 					}
 				}
 				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
-					BaseDir:            filepath.Join(cwd, ".claude-go", "teams"),
+					BaseDir:            filepath.Join(tasksStateDir, "teams"),
 					Cwd:                cwd,
 					Factory:            agentFactory,
 					Pool:               agentPool,
@@ -2109,7 +2119,20 @@ func buildEngine() (*engine.QueryEngine, error) {
 	applyRuntimePromptDebug(apiClient, jsonCfg)
 
 	// 全局 LLM 准入控制器: RPM 令牌桶 + 并发信号量 + AIMD
-	apiClient.Guard = api.NewRateLimitGuard(api.DefaultGuardConfig())
+	// 使用模型配置中的限流参数 (替代硬编码默认值)
+	guardCfg := api.DefaultGuardConfig()
+	if hasResolvedModel {
+		if resolvedModel.RPM > 0 {
+			guardCfg.RPM = resolvedModel.RPM
+		}
+		if resolvedModel.MaxParallel > 0 {
+			guardCfg.MaxParallel = resolvedModel.MaxParallel
+		}
+		if resolvedModel.MinParallel > 0 {
+			guardCfg.MinParallel = resolvedModel.MinParallel
+		}
+	}
+	apiClient.Guard = api.NewRateLimitGuard(guardCfg)
 
 	// 为本客户端打上业务标签, 便于 dashboard 按 source 维度聚合指标。
 	// 交互/单次执行 → "cli", feishu/team/dashboard 会覆盖此值。
@@ -2221,7 +2244,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 	eng := engine.NewQueryEngine(cfg, apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
 
 	// V3 Anti-Amnesia: CLI 模式统一接入记忆系统
-	stateDir := filepath.Join(cwd, ".claude-go")
+	stateDirInput := ""
+	if jsonCfg != nil {
+		stateDirInput = jsonCfg.StateDir
+	}
+	stateDir := basedir.ResolveDefault(stateDirInput, cwd)
 	memDir := filepath.Join(stateDir, "memory")
 	_ = os.MkdirAll(memDir, 0755)
 
@@ -2333,9 +2360,13 @@ type cliAgentRunner struct {
 }
 
 func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
-	contentJSON, _ := json.Marshal(userPrompt)
-	msgs := []types.APIMessage{{Role: "user", Content: contentJSON}}
-	sys := []string{r.systemPrompt}
+	// 走完整的工具循环 (engine.RunIsolated): 这里既支持 Anthropic 原生 tool_use,
+	// 也支持 XML / [TOOL_CALL] bracket 风格的工具调用回退.
+	// 之前的实现直接走 client.SendMessage 没有工具循环, 导致 MiniMax 等模型在文本里塞
+	// 的 <minimax:tool_call>... 永远不会被执行, 整个 team stage 形同空转.
+	//
+	// 角色策略: 思考型 (architect/researcher/planner) 关闭工具, 强制单轮产出文档.
+	// 操作型 (coder/tester/reviewer) 开放工具循环, 让它真的去读/写/编译代码.
 	client := r.eng.APIClient
 	if r.modelCfg.ProviderName != "" {
 		client = client.ConfiguredCloneFull(
@@ -2343,16 +2374,42 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 			r.modelCfg.FallbackModels, r.modelCfg.FallbackBaseURL, r.modelCfg.FallbackAPIKey,
 		)
 	}
-	resp, err := client.SendMessage(ctx, msgs, sys, nil, 8192)
-	if err != nil {
-		return "", err
+	role := strings.ToLower(strings.TrimSpace(r.role))
+	disableTools := false
+	// 做事型角色 (coder/tester/reviewer): 写 20+ 文件, 边读边改, 默认 30 turns 远远不够.
+	// 实测 Phase1+Phase2 全量实现 6 分多钟才跑了 30 turns, 还没接近完成. 提到 150 留足空间.
+	maxTurns := 150
+	maxTokens := 16384
+	if r.modelCfg.MaxTokens > 0 {
+		maxTokens = r.modelCfg.MaxTokens
 	}
-	for _, c := range resp.Content {
-		if c.Type == "text" {
-			return c.Text, nil
+	switch role {
+	case "architect", "researcher", "planner",
+		"outline-architect", "evo-architect", "game-architect":
+		disableTools = true
+		maxTurns = 1
+		// 思考型一次性吐完整设计稿; 优先使用模型配置里的 maxTokens
+		if r.modelCfg.MaxTokens > 0 {
+			maxTokens = r.modelCfg.MaxTokens
+		} else {
+			maxTokens = 65536
 		}
 	}
-	return "", fmt.Errorf("no text in response")
+	out, err := r.eng.RunIsolated(ctx, userPrompt, engine.IsolatedRunOptions{
+		SystemPrompt: r.systemPrompt,
+		MaxTurns:     maxTurns,
+		MaxTokens:    maxTokens,
+		Client:       client,
+		DisableTools: disableTools,
+	})
+	if err != nil {
+		// 把目前为止收集到的文本一并带回, 方便上游写 checkpoint / debug.
+		if out != "" {
+			return out, err
+		}
+		return "", err
+	}
+	return out, nil
 }
 
 // printStreamEvents 消费 StreamEvent 通道，实现 token-by-token 实时输出。

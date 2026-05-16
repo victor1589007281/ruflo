@@ -131,6 +131,7 @@ func RunTools(
 type HookRunner interface {
 	RunPreToolUseHooks(toolName string, input json.RawMessage) (*types.HookOutput, error)
 	RunPostToolUseHooks(toolName string, input json.RawMessage, result string, isError bool) error
+	RunPostToolUseFailureHooks(toolName string, input json.RawMessage, errMsg string) error
 }
 
 // runConcurrentBatch 并发执行一批工具调用。
@@ -276,6 +277,7 @@ func RunToolUse(
 		content := fmt.Sprintf("工具执行错误: %v", err)
 		if hookRunner != nil {
 			_ = hookRunner.RunPostToolUseHooks(toolName, block.Input, content, true)
+			_ = hookRunner.RunPostToolUseFailureHooks(toolName, block.Input, content)
 		}
 		return makeErrorResult(content)
 	}

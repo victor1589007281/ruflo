@@ -30,6 +30,7 @@ type ResilientCaller struct {
 	baseDelay  time.Duration
 	maxDelay   time.Duration
 	perCallTTL time.Duration
+	deadlineRetryBase time.Duration
 
 	// 熔断器
 	mu               sync.Mutex
@@ -54,15 +55,24 @@ type ResilientCallerConfig struct {
 	PerCallTTL       time.Duration
 	CircuitThreshold int
 	Notify           NotifyFunc
+	// 首token超时分离: FirstTokenTTL 用于等待模型首token, OverallTTL 用于单次调用整体上限。
+	// 若 FirstTokenTTL <= 0, 退回到 PerCallTTL。
+	FirstTokenTTL time.Duration
+	OverallTTL    time.Duration
+	// DeadlineRetryBase 针对 context deadline exceeded / timeout 的基础退避 (默认 10s)
+	DeadlineRetryBase time.Duration
 }
 
 func DefaultResilientConfig() ResilientCallerConfig {
 	return ResilientCallerConfig{
-		MaxRetries:       3,
-		BaseDelay:        2 * time.Second,
-		MaxDelay:         30 * time.Second,
-		PerCallTTL:       90 * time.Second,
-		CircuitThreshold: 5,
+		MaxRetries:        3,
+		BaseDelay:         2 * time.Second,
+		MaxDelay:          30 * time.Second,
+		PerCallTTL:        180 * time.Second, // 首token等待: 180s (dashscope 首token慢)
+		FirstTokenTTL:     180 * time.Second,
+		OverallTTL:        600 * time.Second,
+		CircuitThreshold:  5,
+		DeadlineRetryBase: 10 * time.Second,
 	}
 }
 
@@ -77,23 +87,33 @@ func NewResilientCaller(inner LLMClient, cfg ResilientCallerConfig) *ResilientCa
 		cfg.MaxDelay = 30 * time.Second
 	}
 	if cfg.PerCallTTL <= 0 {
-		cfg.PerCallTTL = 90 * time.Second
+		cfg.PerCallTTL = 180 * time.Second
+	}
+	if cfg.FirstTokenTTL <= 0 {
+		cfg.FirstTokenTTL = cfg.PerCallTTL
+	}
+	if cfg.OverallTTL <= 0 {
+		cfg.OverallTTL = cfg.PerCallTTL
 	}
 	if cfg.CircuitThreshold <= 0 {
 		cfg.CircuitThreshold = 5
+	}
+	if cfg.DeadlineRetryBase <= 0 {
+		cfg.DeadlineRetryBase = 10 * time.Second
 	}
 	notify := cfg.Notify
 	if notify == nil {
 		notify = func(_, _ string) {}
 	}
 	return &ResilientCaller{
-		inner:            inner,
-		maxRetries:       cfg.MaxRetries,
-		baseDelay:        cfg.BaseDelay,
-		maxDelay:         cfg.MaxDelay,
-		perCallTTL:       cfg.PerCallTTL,
-		circuitThreshold: cfg.CircuitThreshold,
-		notify:           notify,
+		inner:             inner,
+		maxRetries:        cfg.MaxRetries,
+		baseDelay:         cfg.BaseDelay,
+		maxDelay:          cfg.MaxDelay,
+		perCallTTL:        cfg.PerCallTTL,
+		deadlineRetryBase: cfg.DeadlineRetryBase,
+		circuitThreshold:  cfg.CircuitThreshold,
+		notify:            notify,
 	}
 }
 
@@ -131,7 +151,7 @@ func (rc *ResilientCaller) Call(ctx context.Context, systemPrompt, userPrompt st
 
 		if attempt < rc.maxRetries {
 			rc.totalRetries.Add(1)
-			delay := rc.computeDelay(attempt, errClass)
+			delay := rc.computeDelay(attempt, errClass, err)
 			rc.notify("", fmt.Sprintf("🔄 LLM 调用失败(尝试 %d/%d): %s, %.1fs 后重试",
 				attempt+1, rc.maxRetries+1, truncateErr(err), delay.Seconds()))
 
@@ -196,10 +216,17 @@ func classifyError(err error) errClass {
 	}
 }
 
-func (rc *ResilientCaller) computeDelay(attempt int, class errClass) time.Duration {
+func (rc *ResilientCaller) computeDelay(attempt int, class errClass, err error) time.Duration {
 	base := rc.baseDelay
 	if class == errClassOverload {
 		base = rc.baseDelay * 3 // 429/503 用更长的基础退避
+	}
+	// 针对 deadline exceeded / timeout 使用专门的退避基数
+	if err != nil && isDeadlineError(err) {
+		base = rc.deadlineRetryBase
+		if base <= 0 {
+			base = 10 * time.Second
+		}
 	}
 
 	delay := time.Duration(float64(base) * math.Pow(2, float64(attempt)))
@@ -210,6 +237,14 @@ func (rc *ResilientCaller) computeDelay(attempt int, class errClass) time.Durati
 	// 加 jitter (±25%)
 	jitter := time.Duration(float64(delay) * (0.75 + rand.Float64()*0.5))
 	return jitter
+}
+
+func isDeadlineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "deadline") || strings.Contains(msg, "timeout")
 }
 
 // --- 熔断器 ---

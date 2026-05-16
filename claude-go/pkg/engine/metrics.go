@@ -27,6 +27,7 @@ type EngineMetrics struct {
 	ToolCallsTotal       atomic.Int64
 	ToolLoopsDetected    atomic.Int64
 	ToolLoopsSuppressed  atomic.Int64
+	ProgressLoopsDetected atomic.Int64
 	JSONRepairsApplied   atomic.Int64
 	JSONRepairsFailed    atomic.Int64
 
@@ -152,6 +153,7 @@ func (m *EngineMetrics) Snapshot() map[string]any {
 		"tool_calls_total":          m.ToolCallsTotal.Load(),
 		"tool_loops_detected":       m.ToolLoopsDetected.Load(),
 		"tool_loops_suppressed":     m.ToolLoopsSuppressed.Load(),
+		"progress_loops_detected":   m.ProgressLoopsDetected.Load(),
 		"json_repairs_applied":      m.JSONRepairsApplied.Load(),
 		"json_repairs_failed":       m.JSONRepairsFailed.Load(),
 		"cache_hits":                m.CacheHits.Load(),

@@ -190,11 +190,8 @@ func TestJSONConfigLoad(t *testing.T) {
 			"thinkingMessage": "让我想想..."
 		},
 		"ai": {
-			"model": "claude-3-sonnet",
-			"apiKey": "sk-test-key",
-			"baseUrl": "https://api.example.com/v1",
-			"maxTokens": 8192,
-			"maxTurns": 50
+			"modelAlias": "claude-3-sonnet",
+			"promptCacheMode": "auto"
 		},
 		"mcpServers": {
 			"code-tools": {
@@ -241,14 +238,11 @@ func TestJSONConfigLoad(t *testing.T) {
 	}
 
 	// 验证 AI 配置
-	if jc.AI.Model != "claude-3-sonnet" {
-		t.Errorf("Model: %s", jc.AI.Model)
+	if jc.AI.ModelAlias != "claude-3-sonnet" {
+		t.Errorf("ModelAlias: %s", jc.AI.ModelAlias)
 	}
-	if jc.AI.APIKey != "sk-test-key" {
-		t.Errorf("APIKey: %s", jc.AI.APIKey)
-	}
-	if jc.AI.BaseURL != "https://api.example.com/v1" {
-		t.Errorf("BaseURL: %s", jc.AI.BaseURL)
+	if jc.AI.PromptCacheMode != "auto" {
+		t.Errorf("PromptCacheMode: %s", jc.AI.PromptCacheMode)
 	}
 
 	// 验证 MCP 配置
@@ -289,9 +283,7 @@ func TestJSONConfigApplyToBot(t *testing.T) {
 			Domain:    "lark",
 		},
 		AI: &feishu.AISection{
-			Model:     "gpt-4",
-			APIKey:    "json-api-key",
-			MaxTokens: 4096,
+			ModelAlias: "gpt-4",
 		},
 		MCPServers: map[string]feishu.MCPServerEntry{
 			"test-mcp": {Command: "test", Args: []string{"-v"}},
@@ -306,9 +298,6 @@ func TestJSONConfigApplyToBot(t *testing.T) {
 	if bc.AppID != "json-app-id" {
 		t.Errorf("AppID 应从 JSON 加载: %s", bc.AppID)
 	}
-	if bc.APIKey != "json-api-key" {
-		t.Errorf("APIKey 应从 JSON 加载: %s", bc.APIKey)
-	}
 	if bc.Domain != "lark" {
 		t.Errorf("Domain 应从 JSON 加载: %s", bc.Domain)
 	}
@@ -322,14 +311,10 @@ func TestJSONConfigApplyToBot(t *testing.T) {
 	// 测试 CLI 参数优先级 (已有值不被覆盖)
 	bc2 := feishu.DefaultBotConfig()
 	bc2.AppID = "cli-app-id"
-	bc2.APIKey = "cli-key"
 	jc.ApplyToBot(bc2)
 
 	if bc2.AppID != "cli-app-id" {
 		t.Errorf("CLI AppID 应保留: %s", bc2.AppID)
-	}
-	if bc2.APIKey != "cli-key" {
-		t.Errorf("CLI APIKey 应保留: %s", bc2.APIKey)
 	}
 }
 

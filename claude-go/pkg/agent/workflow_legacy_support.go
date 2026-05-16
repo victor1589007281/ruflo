@@ -13,8 +13,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// goModTidyMutex 串行化 go mod tidy，防止多个并行任务同时修改共享的 go.mod/go.sum。
+var goModTidyMutex sync.Mutex
 
 // applyGoCompileTextRepairs applies deterministic text-level repairs.
 // DEPRECATED: Will be replaced by Contract-First Agent Harness (CodeExecutor).
@@ -98,7 +102,11 @@ func runTestCheckLang(cwd, lang string) string {
 
 	var errors []string
 	for _, args := range tc.TestCmds {
-		out, err := runLimitedCommand(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent)
+		var env map[string]string
+		if tc.Language == "go" {
+			env = map[string]string{"GOFLAGS": "-mod=readonly"}
+		}
+		out, err := runLimitedCommandWithNetwork(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent, true, env)
 		if err != nil {
 			if tc.Language == "go" && isGoNoPackagesOutput(string(out)) {
 				continue
@@ -329,6 +337,17 @@ func cleanMaterializeRelPathForCwd(cwd, path string) string {
 		}
 	}
 	path = strings.TrimPrefix(path, "./")
+	// 关键修复: 当 LLM 输出 "<basename(cwd)>/file.ext", 而 cwd 已经指向该目录时, 去掉前缀避免嵌套
+	// 例如: cwd=/path/to/agentDBV7, path="agentDBV7/file.go" → 应该写入 cwd/file.go, 而非 cwd/agentDBV7/file.go
+	if cwd != "" {
+		cwdBase := filepath.Base(filepath.Clean(cwd))
+		if cwdBase != "" && cwdBase != "." && cwdBase != "/" {
+			prefix := cwdBase + "/"
+			if strings.HasPrefix(path, prefix) {
+				path = strings.TrimPrefix(path, prefix)
+			}
+		}
+	}
 	if path == "" || strings.HasPrefix(path, "/") || path == ".." || strings.HasPrefix(path, "../") || strings.Contains(path, "/../") {
 		return ""
 	}
@@ -598,9 +617,11 @@ func ensureGoModuleDependencies(cwd, lang string, tc *LanguageToolchain) string 
 	if undeclared := undeclaredGoExternalImports(cwd); len(undeclared) > 0 {
 		return "Go 外部依赖未声明且默认禁止自动引入。请优先改为标准库/本项目内实现；如确需第三方依赖，必须在同一 Leaf 明确修改 go.mod 并说明原因。\n未声明依赖: " + strings.Join(undeclared, ", ")
 	}
+	goModTidyMutex.Lock()
+	defer goModTidyMutex.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	out, err := runLimitedCommand(ctx, cwd, []string{"go", "mod", "tidy"}, tc.MemoryMaxMB, tc.CPUQuotaPercent)
+	out, err := runLimitedCommandWithNetwork(ctx, cwd, []string{"go", "mod", "tidy"}, tc.MemoryMaxMB, tc.CPUQuotaPercent, false, nil)
 	if err == nil {
 		return ""
 	}
@@ -663,46 +684,4 @@ func getSystemMemoryMB() int64 {
 }
 
 // ── Test support stubs (functions referenced by workflow_materialize_test.go) ──
-
-func cleanupMaterializedMetadataDirs(root string) int {
-	_ = root
-	return 0
-}
-
-type goModBaseline struct{}
-
-func captureGoModBaseline(cwd string) goModBaseline {
-	_ = cwd
-	return goModBaseline{}
-}
-
-func restoreGoModBaseline(cwd string, baseline goModBaseline) int {
-	_ = cwd
-	_ = baseline
-	return 0
-}
-
-func enforceGoExternalDependencyPolicy(cwd, objective string) string {
-	_ = cwd
-	_ = objective
-	return ""
-}
-
-func (we *WorkflowExecutor) runLocalE2EGate(team *ProductionTeam, objective string) *StageResult {
-	_ = team
-	_ = objective
-	return nil
-}
-
-func (we *WorkflowExecutor) runLocalE2EFixCycle(ctx context.Context, initial *StageResult, objective string, prevResults map[string]string, team *ProductionTeam) (*StageResult, []StageResult) {
-	_ = ctx
-	_ = objective
-	_ = prevResults
-	_ = team
-	return initial, nil
-}
-
-func scanForTodos(output string) []string {
-	_ = output
-	return nil
-}
+// NOTE: real implementations now live in workflow_adversarial_dev.go

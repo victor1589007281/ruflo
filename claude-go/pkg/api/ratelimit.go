@@ -432,6 +432,7 @@ const (
 	RateLimitRPM                      // RateQuota: RPM/RPS 超限 → 降速
 	RateLimitBurst                    // BurstRate: 突发过快 → 平滑
 	RateLimitTPM                      // AllocationQuota: TPM/TPS 超限 → 降速+缩上下文
+	RateLimitConcurrency              // 并发数限制 (如 coding.dashscope "concurrency allocated quota")
 	RateLimitBilling                  // 计费问题 → 不重试
 	RateLimitOverloaded               // 503/529 服务过载 → 长退避
 )
@@ -447,6 +448,10 @@ func Classify429(statusCode int, body string) RateLimitKind {
 
 	lower := strings.ToLower(body)
 
+	// DashScope / coding 端点 并发限制
+	if strings.Contains(lower, "concurrency allocated quota") {
+		return RateLimitConcurrency
+	}
 	// DashScope 特有错误码
 	if strings.Contains(lower, "burstrate") || strings.Contains(lower, "burst_rate") {
 		return RateLimitBurst
@@ -475,6 +480,8 @@ func (k RateLimitKind) String() string {
 		return "突发速率过快(Burst)"
 	case RateLimitTPM:
 		return "Token吞吐超限(TPM)"
+	case RateLimitConcurrency:
+		return "并发数超限(Concurrency)"
 	case RateLimitBilling:
 		return "计费/配额问题(不可重试)"
 	case RateLimitOverloaded:

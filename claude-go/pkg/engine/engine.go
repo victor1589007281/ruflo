@@ -83,6 +83,11 @@ type QueryEngine struct {
 	TrajStore     TrajectoryStore     // G6 轨迹记忆
 	StopDet       *StopSignalDetector // G7 CaRT 停止信号
 
+	// TaskInstruction 动态任务指令，追加到 system prompt 末尾（而非 user message）。
+	// 用于 Agent Team 场景：将 20K 任务描述从 msg[0] 移到 system prompt，
+	// 使 system prompt 前缀享受 cache，同时避免 user message 重复膨胀。
+	TaskInstruction string
+
 	CumulativeUsage types.Usage // 本会话累积 token 消耗
 	ContextBudget   int         // 上下文窗口大小 (tokens, 默认 200000)
 
@@ -174,6 +179,9 @@ func NewQueryEngine(
 	}
 	// 按 Config 开关懒加载对应组件。调用 EnableFrontierOptimizations() 可一次性启用 P0/P1。
 	e.applyFeatureFlags()
+	if e.LoopDet != nil {
+		e.LoopDet.Cwd = cfg.Cwd
+	}
 	return e
 }
 
@@ -394,11 +402,21 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 	}
 
 	for {
+		// PreTurn Hook: 单轮开始
+		if e.HookRunner != nil {
+			e.HookRunner.ExecutePreTurnHooks(messages, turnCount)
+		}
+
 		// ============================================================
 		// Phase 0: Abort 检查
 		// 对应 TS: queryLoop 顶部 if (abortController.signal.aborted)
 		// ============================================================
 		if ctx.Err() != nil {
+			if e.HookRunner != nil {
+				e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+				e.HookRunner.ExecuteOnErrorHooks(messages, "aborted", ctx.Err())
+				e.HookRunner.ExecuteStopFailureHooks(messages)
+			}
 			e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, stopReason, true, turnStart)
 			if e.Metrics != nil {
 				e.Metrics.TurnsAborted.Add(1)
@@ -414,6 +432,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		if e.Budget != nil {
 			level := e.Budget.Level(messages)
 			if level >= BudgetRed {
+				if e.HookRunner != nil {
+					e.HookRunner.ExecuteOnContextOverflowHooks(messages, int(level))
+				}
 				messages = e.Budget.Degrade(messages, level)
 				if e.Metrics != nil {
 					e.Metrics.RecordBudgetDegrade(int(level))
@@ -426,6 +447,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 对应 TS: queryLoop 中的 deps.autocompact(...) 调用
 		// ============================================================
 		if e.Compactor != nil {
+			if e.HookRunner != nil {
+				e.HookRunner.ExecutePreCompactHooks(messages)
+			}
 			compacted, err := e.Compactor.AutoCompact(ctx, messages, currentModel)
 			if err == nil && compacted != nil {
 				// PreCompact 蒸馏: 提取关键事实到 L1 + L2
@@ -448,6 +472,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					}
 				}
 				messages = compacted
+				if e.HookRunner != nil {
+					e.HookRunner.ExecutePostCompactHooks(messages)
+				}
 			}
 		}
 
@@ -467,6 +494,12 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 集成 G1 PromptCache: 稳定前缀 + 动态后缀 分层, 追踪本地 cache 命中率。
 		// ============================================================
 		systemPrompt := e.PromptMgr.BuildEffectiveSystemPrompt(e.Tools)
+
+		// 将动态任务指令追加到 system prompt 末尾（作为最后一个 block）。
+		// 这样 system prompt 前缀仍可享受 cache，任务指令不占用 user message 空间。
+		if e.TaskInstruction != "" {
+			systemPrompt = append(systemPrompt, e.TaskInstruction)
+		}
 
 		// 仅在首轮注入相关记忆（避免多轮 tool_use 循环中反复注入膨胀上下文）
 		// 注入的记忆是 "动态内容", 但它每 turn 0 就固定, 所以 turn>0 时 prefix 是稳定的 — cache friendly。
@@ -502,14 +535,15 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					}
 				}
 
-				if memPrompt != "" && len(systemPrompt) > 0 {
-					systemPrompt[0] += "\n" + memPrompt
+				if memPrompt != "" {
+					systemPrompt = append(systemPrompt, memPrompt)
 				}
 			}
 		}
 
 		// G1 PromptCache: 本地记录稳定前缀是否未变, 近似后端 cache 命中率。
-		// 当前策略保守 — 不改变传递内容, 只做指标追踪; 后续 API 支持 cache_control 时再贴标。
+		// API client 已支持在 system content block 级别贴 cache_control 标
+		// ( Anthropic / DashScope 兼容接口), 此处仅做命中率追踪与布局优化。
 		if e.PromptCache != nil {
 			static, dynamic := SplitStaticDynamic(systemPrompt)
 			_, hit := e.PromptCache.Build(static, dynamic)
@@ -522,7 +556,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// Phase 3: 调用模型 API (流式)
 		// 对应 TS: while(attemptWithFallback) + for await(callModel(...))
 		// ============================================================
-		apiMessages := messagesToAPI(messages)
+		if e.HookRunner != nil {
+			e.HookRunner.ExecutePreRequestHooks(messages, currentModel)
+		}
+		apiMessages := messagesToAPI(messages, e.HookRunner)
 		allTools := e.Tools.APITools()
 		var apiTools []types.APITool
 		if len(e.Config.DisabledTools) > 0 {
@@ -642,6 +679,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 		}
 
+		// PostRequest Hook: API 调用完成（无论成功或失败，都在错误处理前触发）
+		if e.HookRunner != nil {
+			e.HookRunner.ExecutePostRequestHooks(messages, currentModel)
+		}
+
 		// ============================================================
 		// 错误处理: PTL / fallback / 断路器
 		// 对应 TS: FallbackTriggeredError, PromptTooLongError 处理
@@ -663,6 +705,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					if e.Metrics != nil {
 						e.Metrics.RecordError(int(ErrFamilyPTL))
 					}
+					if e.HookRunner != nil {
+						e.HookRunner.ExecuteOnRecoveryHooks(messages, "ptl_reactive_compact")
+						e.HookRunner.ExecuteOnRetryHooks(messages, "ptl_reactive_compact", 0)
+					}
 					continue // 压缩后重试
 				}
 			}
@@ -680,6 +726,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 							IsError:   true,
 						}},
 					})
+				}
+				if e.HookRunner != nil {
+					e.HookRunner.ExecuteOnRecoveryHooks(messages, "fallback_model_switch")
+					e.HookRunner.ExecuteOnRetryHooks(messages, "fallback_model_switch", 0)
 				}
 				continue
 			}
@@ -709,6 +759,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 						e.Metrics.TurnsError.Add(1)
 					}
 					e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, "error", false, turnStart)
+					if e.HookRunner != nil {
+						e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+						e.HookRunner.ExecuteOnErrorHooks(messages, "error_family_exhausted", streamErr)
+						e.HookRunner.ExecuteStopFailureHooks(messages)
+					}
 					return messages, types.Terminal{Reason: "error_family_exhausted_" + family.String(), Error: streamErr}
 				}
 				// 非致命: 向用户 channel 推送一条 withheld error 消息
@@ -733,6 +788,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					select {
 					case <-time.After(backoff):
 					case <-ctx.Done():
+						if e.HookRunner != nil {
+							e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+							e.HookRunner.ExecuteOnErrorHooks(messages, "aborted", ctx.Err())
+							e.HookRunner.ExecuteStopFailureHooks(messages)
+						}
 						return messages, types.Terminal{Reason: "aborted"}
 					}
 				}
@@ -756,6 +816,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				if streamCh != nil {
 					streamCh <- types.StreamEvent{Kind: types.StreamEventError, Error: streamErr}
 				}
+				if e.HookRunner != nil {
+					e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+					e.HookRunner.ExecuteOnErrorHooks(messages, "circuit_breaker", streamErr)
+					e.HookRunner.ExecuteStopFailureHooks(messages)
+				}
 				return messages, types.Terminal{Reason: "circuit_breaker", Error: streamErr}
 			}
 
@@ -776,10 +841,20 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			// overloaded 错误时短暂等待后重试
 			var overloadErr *api.OverloadedError
 			if errors.As(streamErr, &overloadErr) {
-				time.Sleep(time.Duration(consecutiveErrors) * 2 * time.Second)
+				backoff := time.Duration(consecutiveErrors) * 2 * time.Second
+				if e.HookRunner != nil {
+					e.HookRunner.ExecuteOnRateLimitHooks(streamErr, backoff)
+					e.HookRunner.ExecuteOnRetryHooks(messages, "overloaded", consecutiveErrors)
+				}
+				time.Sleep(backoff)
 				continue
 			}
 
+			if e.HookRunner != nil {
+				e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+				e.HookRunner.ExecuteOnErrorHooks(messages, "model_error", streamErr)
+				e.HookRunner.ExecuteStopFailureHooks(messages)
+			}
 			return messages, types.Terminal{Reason: "model_error", Error: streamErr}
 		}
 
@@ -791,7 +866,45 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 
 		// 检查 context 是否被取消
 		if ctx.Err() != nil {
+			if e.HookRunner != nil {
+				e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+				e.HookRunner.ExecuteOnErrorHooks(messages, "aborted_streaming", ctx.Err())
+				e.HookRunner.ExecuteStopFailureHooks(messages)
+			}
 			return messages, types.Terminal{Reason: "aborted_streaming"}
+		}
+
+		// ============================================================
+		// XML 风格工具调用回退解析
+		//
+		// MiniMax / Qwen / GLM 等模型不走 Anthropic 原生 tool_use 协议, 而是把
+		// <minimax:tool_call><invoke name="X">...</invoke></minimax:tool_call>
+		// 之类的 XML 塞进 assistant 文本里. 此时 streaming 阶段没有生成任何
+		// ContentBlockToolUse, 后面的 Phase 5 会误判为 "assistant 已经结束",
+		// 整轮 turn 就没有任何工具被实际执行.
+		//
+		// 这里在流结束、构建 assistant 消息之前做一次回退扫描:
+		//   - 把文本里的 XML 工具调用拆出来, 转成 ContentBlockToolUse
+		//   - 同步追加到 toolUseBlocks, 让后续 RunTools / 多轮循环正常推进
+		//   - 把 stopReason 改成 "tool_use", 避免被 Phase 3.5 当成 max_tokens 等
+		// ============================================================
+		if mergedAssistant, mergedToolUse, ndelta := MergeXMLToolCalls(assistantBlocks, toolUseBlocks, fmt.Sprintf("t%d", turnCount)); ndelta > 0 {
+			assistantBlocks = mergedAssistant
+			toolUseBlocks = mergedToolUse
+			stopReason = string(types.StopReasonToolUse)
+			if streamCh != nil {
+				for _, blk := range mergedToolUse[len(mergedToolUse)-ndelta:] {
+					inputSummary := string(blk.Input)
+					if len(inputSummary) > 200 {
+						inputSummary = inputSummary[:200] + "..."
+					}
+					streamCh <- types.StreamEvent{
+						Kind:      types.StreamEventToolStart,
+						ToolName:  blk.Name,
+						ToolInput: inputSummary,
+					}
+				}
+			}
 		}
 
 		// ============================================================
@@ -880,6 +993,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				e.Metrics.RecordTurnLatency(time.Since(turnStart))
 			}
 			e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, stopReason, false, turnStart)
+			if e.HookRunner != nil {
+				e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+			}
 			return messages, types.Terminal{Reason: "completed"}
 		}
 
@@ -977,6 +1093,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				e.Metrics.TurnsAborted.Add(1)
 			}
 			e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, "max_turns", false, turnStart)
+			if e.HookRunner != nil {
+				e.HookRunner.ExecuteOnMaxTurnsReachedHooks(messages, turnCount)
+				e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+			}
 			return messages, types.Terminal{Reason: "max_turns"}
 		}
 
@@ -1020,6 +1140,40 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					LatencyMs: toolExecLatency.Milliseconds() / int64(maxInt(len(toolUseBlocks), 1)),
 					At:        toolExecStart,
 				})
+			}
+		}
+
+		// G3 LoopDetector (产出级): 观察 tool 结果, 检测编辑震荡和编译错误循环。
+		if e.LoopDet != nil {
+			for i, blk := range toolUseBlocks {
+				var resultSummary string
+				var isError bool
+				if i < len(toolResults) {
+					for _, cb := range toolResults[i].Content {
+						if cb.Type == types.ContentBlockToolResult {
+							resultSummary = cb.Content
+							isError = cb.IsError
+							break
+						}
+					}
+				}
+				if stuck, suggestion := e.LoopDet.ObserveResult(blk.Name, []byte(blk.Input), resultSummary, isError); stuck {
+					hintMsg := types.Message{
+						Type: types.MessageTypeUser,
+						UUID: generateUUID(),
+						Content: []types.ContentBlock{{
+							Type: types.ContentBlockText,
+							Text: suggestion,
+						}},
+						IsMeta:    true,
+						CreatedAt: time.Now(),
+					}
+					messages = append(messages, hintMsg)
+					if e.Metrics != nil {
+						e.Metrics.ProgressLoopsDetected.Add(1)
+					}
+					break // 一轮至多注入一次, 避免膨胀
+				}
 			}
 		}
 
@@ -1076,6 +1230,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					}
 				}
 			}
+		}
+
+		// PostTurn Hook: 单轮正常结束，即将进入下一轮
+		if e.HookRunner != nil {
+			e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
 		}
 	}
 }
@@ -1143,10 +1302,18 @@ func maxInt(a, b int) int {
 // 关键逻辑: 合并连续同角色的消息。
 // Anthropic API 要求 user/assistant 严格交替。多个 tool_result
 // 作为独立 user 消息存在时，必须合并到同一个 user 消息中。
-func messagesToAPI(messages []types.Message) []types.APIMessage {
+func messagesToAPI(messages []types.Message, hookRunner *hooks.Runner) []types.APIMessage {
+	// OnMessageFilter Hook: 消息过滤前观测点
+	if hookRunner != nil {
+		hookRunner.ExecuteOnMessageFilterHooks(messages)
+	}
+
+	// 优化1: 过滤不含 reasoning 的古老 assistant + tool_result 原子单元
+	messages = filterPureToolUseUnits(messages, 6)
+
 	var result []types.APIMessage
 
-	for _, msg := range messages {
+	for i, msg := range messages {
 		role := ""
 		switch msg.Type {
 		case types.MessageTypeUser:
@@ -1155,6 +1322,11 @@ func messagesToAPI(messages []types.Message) []types.APIMessage {
 			role = "assistant"
 		default:
 			continue
+		}
+
+		// 优化5: 对古老的 user tool_result 做轻量级内容压缩
+		if role == "user" && i < len(messages)-4 {
+			msg = compressMessageContent(msg)
 		}
 
 		// 合并连续同角色消息的 content 块
@@ -1174,6 +1346,186 @@ func messagesToAPI(messages []types.Message) []types.APIMessage {
 	}
 
 	return result
+}
+
+// filterPureToolUseUnits 删除不含 text/thinking 的古老 assistant 消息及其对应的
+// tool_result，以"assistant + 后续纯 tool_result user 消息"为原子单元整体保留/删除。
+// keepRecent 表示至少保留最近多少个 assistant 原子单元。
+func filterPureToolUseUnits(messages []types.Message, keepRecent int) []types.Message {
+	if len(messages) <= keepRecent*2 {
+		return messages
+	}
+
+	// 收集所有 assistant 消息的索引（从旧到新）
+	var assistantIdx []int
+	for i, m := range messages {
+		if m.Type == types.MessageTypeAssistant {
+			assistantIdx = append(assistantIdx, i)
+		}
+	}
+
+	if len(assistantIdx) <= keepRecent {
+		return messages
+	}
+
+	// 标记需要删除的索引
+	remove := make(map[int]bool)
+	for i, ai := range assistantIdx {
+		// 保留最近的 keepRecent 个 assistant
+		if i >= len(assistantIdx)-keepRecent {
+			break
+		}
+		// 检查 assistant 是否包含 reasoning (text/thinking)
+		if hasReasoningContent(messages[ai]) {
+			continue
+		}
+		// 纯 tool_use: 标记 assistant 及其后续纯 tool_result user 消息
+		remove[ai] = true
+		for j := ai + 1; j < len(messages); j++ {
+			if messages[j].Type == types.MessageTypeAssistant {
+				break
+			}
+			if isPureToolResultMessage(messages[j]) {
+				remove[j] = true
+			}
+		}
+	}
+
+	if len(remove) == 0 {
+		return messages
+	}
+
+	var out []types.Message
+	for i, m := range messages {
+		if !remove[i] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// hasReasoningContent 检查消息是否包含 text 或 thinking 块。
+func hasReasoningContent(msg types.Message) bool {
+	for _, b := range msg.Content {
+		if b.Type == types.ContentBlockText || b.Type == types.ContentBlockThinking {
+			return true
+		}
+	}
+	return false
+}
+
+// isPureToolResultMessage 检查消息是否只包含 tool_result 块。
+func isPureToolResultMessage(msg types.Message) bool {
+	if msg.Type != types.MessageTypeUser {
+		return false
+	}
+	if len(msg.Content) == 0 {
+		return false
+	}
+	for _, b := range msg.Content {
+		if b.Type != types.ContentBlockToolResult {
+			return false
+		}
+	}
+	return true
+}
+
+// compressMessageContent 对消息内容做轻量级压缩（LLMlingua 简化版）。
+// 主要作用于古老的 tool_result，移除冗余空白、停用词，压缩代码注释。
+func compressMessageContent(msg types.Message) types.Message {
+	if msg.Type != types.MessageTypeUser || len(msg.Content) == 0 {
+		return msg
+	}
+
+	var changed bool
+	newBlocks := make([]types.ContentBlock, len(msg.Content))
+	copy(newBlocks, msg.Content)
+
+	for i, b := range newBlocks {
+		if b.Type != types.ContentBlockToolResult || b.Content == "" {
+			continue
+		}
+		compressed := compressText(b.Content)
+		if compressed != b.Content {
+			newBlocks[i].Content = compressed
+			changed = true
+		}
+	}
+
+	if !changed {
+		return msg
+	}
+	msg.Content = newBlocks
+	return msg
+}
+
+// stopWords 为轻量级压缩使用的常见停用词集合。
+var stopWords = map[string]struct{}{
+	"the": {}, "is": {}, "are": {}, "was": {}, "were": {},
+	"a": {}, "an": {}, "and": {}, "or": {}, "but": {},
+	"in": {}, "on": {}, "at": {}, "to": {}, "for": {},
+	"of": {}, "with": {}, "by": {}, "from": {}, "as": {},
+	"it": {}, "this": {}, "that": {}, "these": {}, "those": {},
+}
+
+// compressText 对文本做轻量级压缩：移除多余空白、压缩常见停用词、简化代码注释。
+func compressText(s string) string {
+	if len(s) < 200 {
+		return s
+	}
+
+	lines := strings.Split(s, "\n")
+	var sb strings.Builder
+	inCodeBlock := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// 代码块边界检测
+		if strings.HasPrefix(trimmed, "```") {
+			inCodeBlock = !inCodeBlock
+			sb.WriteString(line)
+			sb.WriteByte('\n')
+			continue
+		}
+
+		if inCodeBlock {
+			// 代码块内：保留语法，压缩注释
+			if strings.HasPrefix(trimmed, "// ") && len(trimmed) > 50 {
+				// 保留短注释，压缩长注释
+				sb.WriteString(line)
+				sb.WriteByte('\n')
+				continue
+			}
+			sb.WriteString(line)
+			sb.WriteByte('\n')
+			continue
+		}
+
+		// 自然语言部分：移除停用词、压缩空白
+		if trimmed == "" {
+			continue // 删除空行
+		}
+		fields := strings.Fields(trimmed)
+		var kept []string
+		for _, w := range fields {
+			lw := strings.ToLower(strings.TrimRight(w, ",.!?;:"))
+			if _, ok := stopWords[lw]; ok && len(kept) > 0 {
+				continue
+			}
+			kept = append(kept, w)
+		}
+		if len(kept) > 0 {
+			sb.WriteString(strings.Join(kept, " "))
+			sb.WriteByte('\n')
+		}
+	}
+
+	result := sb.String()
+	if len(result) < len(s)*7/10 {
+		return result
+	}
+	return s
 }
 
 // generateUUID 生成唯一标识 (时间戳 + 全局原子计数器，避免并发碰撞)。

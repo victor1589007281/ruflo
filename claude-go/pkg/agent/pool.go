@@ -77,6 +77,9 @@ type AgentPool struct {
 	// AutoScale 防震荡: 记录上次扩缩时间，避免频繁波动
 	lastScaleAt   time.Time
 	scaleCooldown time.Duration // 最小扩缩间隔
+
+	// OnRelease Agent 释放回调 (用于触发 TeammateIdle Hook 等)。
+	OnRelease func(*PooledAgent)
 }
 
 // poolMaxCap 池信号量的固定容量上限 — 预分配后不再替换 channel，消除 Scale 竞态。
@@ -161,6 +164,10 @@ func (p *AgentPool) Release(agent *PooledAgent) {
 	agent.TasksDone++
 	delete(p.agents, agent.ID)
 	p.mu.Unlock()
+
+	if p.OnRelease != nil {
+		p.OnRelease(agent)
+	}
 
 	atomic.AddInt64(&p.totalDone, 1)
 	<-p.semaphore

@@ -453,8 +453,14 @@ func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsO
 			}
 		}
 		rec := s.byID[bestID]
-		dependsOn = filterTaskDependsOn(dependsOn, bestID)
-		rec.DependsOn = dependsOn
+		// 恢复场景关键修复: resume 时 ParsePlanToDAG 会重新遍历所有任务,
+		// 动态 file-write/conflict 依赖依赖处理顺序. 若顺序与原始运行不同,
+		// 动态依赖方向可能反转, 与显式依赖叠加后形成死循环.
+		// 正确做法: 复用现有任务时保留其原始依赖图, 不覆盖.
+		// 原始依赖图已经过验证(团队曾在此基础上执行), 更安全.
+		// dependsOn = filterTaskDependsOn(dependsOn, bestID)
+		// dependsOn = s.filterCycleCreatingDeps(bestID, dependsOn)
+		// rec.DependsOn = dependsOn
 		rec.Priority = priority
 		rec.Description = description
 		rec.Owner = owner
@@ -505,6 +511,53 @@ func filterTaskDependsOn(dependsOn []string, selfID string) []string {
 	return filtered
 }
 
+// filterCycleCreatingDeps 过滤掉会为目标任务引入有向环的依赖.
+// 在 resume 场景下, 动态 file-write/conflict 依赖可能因任务处理顺序反转而产生反向依赖,
+// 与显式依赖叠加后形成死循环. 此方法通过 BFS 检查添加 bestID -> dep 是否会形成环
+// (即 dep 的依赖链中是否已包含 bestID).
+func (s *TaskStore) filterCycleCreatingDeps(bestID string, dependsOn []string) []string {
+	if len(dependsOn) == 0 {
+		return nil
+	}
+	filtered := make([]string, 0, len(dependsOn))
+	for _, dep := range dependsOn {
+		if dep == bestID {
+			continue // 自依赖已在 filterTaskDependsOn 中过滤, 双重保险
+		}
+		if s.isReachable(dep, bestID) {
+			// 添加 bestID -> dep 会形成环, 跳过此依赖
+			continue
+		}
+		filtered = append(filtered, dep)
+	}
+	return filtered
+}
+
+// isReachable 从 startID 出发沿依赖边 BFS, 检查是否能到达 targetID.
+func (s *TaskStore) isReachable(startID, targetID string) bool {
+	visited := make(map[string]bool)
+	queue := []string{startID}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		if curr == targetID {
+			return true
+		}
+		if visited[curr] {
+			continue
+		}
+		visited[curr] = true
+		if rec, ok := s.byID[curr]; ok {
+			for _, dep := range rec.DependsOn {
+				if !visited[dep] {
+					queue = append(queue, dep)
+				}
+			}
+		}
+	}
+	return false
+}
+
 // UnblockDependents 当一个任务完成或失败时, 检查并解除其依赖者的阻塞状态。
 // 修复: 之前只在 "completed" 时 unblock, 导致某个任务 failed 后整个 DAG 后续全部卡住。
 // 现在改为: 依赖任务的状态为 completed 或 failed 均视为"已处理", 下游可被调度。
@@ -546,6 +599,13 @@ func (s *TaskStore) UnblockDependents(doneID string) int {
 
 // ReadyTasks 返回所有可执行的任务 (pending 且依赖已满足), 按优先级排序。
 // 这是 DAG 调度器的核心: 拓扑排序的"就绪队列"。
+//
+// 依赖满足语义 (all_done): completed 或 failed 都算"已处理完毕"。
+// 这与 SetTaskStatusAndUnblock 的 unblock 语义保持一致 — 否则会出现:
+//   1. 上游任务 hard-gate failed → SetTaskStatusAndUnblock 将下游 blocked → pending (用 all_done)
+//   2. ReadyTasks 仍要求依赖 completed → 已 pending 的下游永远进不了 ready 队列
+//   3. 调度器 10 分钟后触发 stall recovery → 把 failed 任务重置成 pending → 重新执行 → 再失败
+// 死循环的根因。修复后, failed 依赖也视为已满足, 下游可正常向前推进。
 func (s *TaskStore) ReadyTasks() []TaskSummary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -557,7 +617,14 @@ func (s *TaskStore) ReadyTasks() []TaskSummary {
 		}
 		allDepsOK := true
 		for _, dep := range r.DependsOn {
-			if d, ok := s.byID[dep]; !ok || d.Status != "completed" {
+			d, ok := s.byID[dep]
+			if !ok {
+				allDepsOK = false
+				break
+			}
+			// all_done 语义: completed 和 failed 都算"已处理完毕".
+			// 失败依赖不再阻塞下游, 让 LLM 仍有机会基于残缺上下文推进.
+			if d.Status != "completed" && d.Status != "failed" {
 				allDepsOK = false
 				break
 			}
@@ -608,11 +675,50 @@ func (s *TaskStore) GetAllTasks() []TaskSummary {
 	return result
 }
 
+// ReevaluateBlockedTasks 扫描所有 blocked 任务, 若其所有依赖均已 completed/failed,
+// 则将其状态改为 pending. 专用于 resume 场景: 原始运行中已完成的检查点任务不会触发
+// SetTaskStatusAndUnblock, 导致下游 blocked 任务永久卡住.
+func (s *TaskStore) ReevaluateBlockedTasks() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	affected := 0
+	for id, rec := range s.byID {
+		if rec.Status != "blocked" {
+			continue
+		}
+		allDone := true
+		for _, dep := range rec.DependsOn {
+			d, exists := s.byID[dep]
+			if !exists {
+				allDone = false
+				break
+			}
+			if d.Status != "completed" && d.Status != "failed" {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			rec.Status = "pending"
+			rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			s.byID[id] = rec
+			affected++
+		}
+	}
+	if affected > 0 {
+		_ = s.saveLocked()
+	}
+	return affected
+}
+
 // SetTaskStatusAndUnblock 原子更新状态并解除下游依赖 (DAG 联动)。
-// 修复3项:
+// 修复4项:
 //  1. completed 和 failed 都 unblock 下游 (之前 failed 不 unblock → DAG 全卡)
 //  2. 原子操作: 一次加锁同时完成 setStatus + unblock (之前分两次锁, 有竞态窗口)
 //  3. 依赖检查改为 all_done 语义 (completed/failed 都算"处理完毕")
+//  4. 失败路径不再硬级联标记下游 failed, 而是同样尝试 unblock (failed 计为 "done");
+//     这样上游任务失败不会无脑阻塞兄弟分支, 让 LLM 仍有机会基于残缺上下文产出可用代码。
 func (s *TaskStore) SetTaskStatusAndUnblock(id, status string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -626,8 +732,10 @@ func (s *TaskStore) SetTaskStatusAndUnblock(id, status string) (int, error) {
 	s.byID[id] = rec
 
 	affected := 0
-	if status == "completed" {
-		// 成功: 解除下游 blocked → pending (原始逻辑)
+	if status == "completed" || status == "failed" {
+		// 统一语义: 任何"已处理完毕"的状态都触发下游 unblock 检查.
+		// 下游 blocked → pending 仅当所有依赖均已 completed 或 failed.
+		// failed 依赖不再阻塞兄弟分支, 也不再级联标记下游 failed.
 		for depID, depRec := range s.byID {
 			if depRec.Status != "blocked" {
 				continue
@@ -635,7 +743,11 @@ func (s *TaskStore) SetTaskStatusAndUnblock(id, status string) (int, error) {
 			allDone := true
 			for _, dep := range depRec.DependsOn {
 				d, exists := s.byID[dep]
-				if !exists || d.Status != "completed" {
+				if !exists {
+					allDone = false
+					break
+				}
+				if d.Status != "completed" && d.Status != "failed" {
 					allDone = false
 					break
 				}
@@ -647,18 +759,18 @@ func (s *TaskStore) SetTaskStatusAndUnblock(id, status string) (int, error) {
 				affected++
 			}
 		}
-	} else if status == "failed" {
-		// 失败级联: 依赖此任务的下游直接标记 failed, 避免无意义调度。
-		// 递归传播 — 如果 B 依赖 A, C 依赖 B, A 失败后 B 和 C 都应 failed。
-		affected = s.cascadeFailureLocked(id)
 	}
 
 	_ = s.saveLocked()
 	return affected, nil
 }
 
-// cascadeFailureLocked 递归将依赖 failedID 的下游任务标记为 failed。
-// 调用方必须已持有 s.mu 锁。
+// cascadeFailureLocked 递归将依赖 failedID 的下游任务标记为 failed.
+//
+// 已废弃: 当前 SetTaskStatusAndUnblock 不再调用此函数. 历史行为是失败级联阻塞,
+// 在 LLM 质量不稳的多任务编排中会导致大面积无谓阻塞 (单点 fail → 50+ 兄弟分支 fail).
+// 改为 all_done 语义后, 失败任务仍计为 "已处理完毕", 不会硬性阻塞下游兄弟.
+// 保留函数仅为兼容外部调用方; 调用方应改用 SetTaskStatusAndUnblock(failed).
 func (s *TaskStore) cascadeFailureLocked(failedID string) int {
 	cascaded := 0
 	for depID, depRec := range s.byID {

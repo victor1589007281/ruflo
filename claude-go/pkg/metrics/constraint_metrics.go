@@ -153,11 +153,12 @@ func (cm *ConstraintMetrics) RecordDeliveryStatus(status string) {
 }
 
 // Snapshot returns a copy of current metrics.
-func (cm *ConstraintMetrics) Snapshot() ConstraintMetrics {
+// 返回指针以避免 sync.RWMutex 的值拷贝（go vet 检查）。
+func (cm *ConstraintMetrics) Snapshot() *ConstraintMetrics {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	snap := ConstraintMetrics{
+	snap := &ConstraintMetrics{
 		GatePassRate:               make(map[string]float64, len(cm.GatePassRate)),
 		GateFailureReason:          make(map[string]map[string]int, len(cm.GateFailureReason)),
 		SkillEffectiveness:         make(map[string]float64, len(cm.SkillEffectiveness)),

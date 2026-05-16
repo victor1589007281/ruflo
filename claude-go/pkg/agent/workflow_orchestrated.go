@@ -27,6 +27,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -59,20 +60,38 @@ func (we *WorkflowExecutor) executeOrchestrated(
 	// 桥接: pkg/agent.LLMClient → pkg/orchestrator.LLMClient (duck typing 兼容)
 	llmAdapter := &orchLLMAdapter{llm: we.llm}
 
-	// 1. 构建 orchestrator 引擎
+	// 1. 解析主模型配置, 获取模型专属限流参数
+	maxParallel := 4
+	rpmOverride := 0
+	if we.planCfgResolver != nil {
+		resolved := we.planCfgResolver.Resolve(team.Workflow, "")
+		if resolved.MaxParallel > 0 {
+			maxParallel = resolved.MaxParallel
+		}
+		if resolved.RPM > 0 {
+			rpmOverride = resolved.RPM
+		}
+	}
+
+	// 2. 构建 orchestrator 引擎
 	cfg := orchestrator.DefaultEngineConfig()
-	cfg.MaxParallel = 4 // 匹配 LLM RunnerPool 上限, 让 4 路专家阶段真正并行
+	cfg.MaxParallel = maxParallel // 匹配 LLM RunnerPool 上限, 让专家阶段真正并行
 	cfg.DefaultTimeout = 5 * time.Minute
 	cfg.StallTimeout = 8 * time.Minute
-	cfg.RPM = 120 // 由 api.Client 自身处理限流, 引擎不做额外限速
-	cfg.RPMBurst = 10
+	if rpmOverride > 0 {
+		cfg.RPM = float64(rpmOverride)
+		cfg.RPMBurst = math.Max(1, float64(rpmOverride)/6)
+	} else {
+		cfg.RPM = 120 // 由 api.Client 自身处理限流, 引擎不做额外限速
+		cfg.RPMBurst = 10
+	}
 	cfg.CheckpointEvery = 1
 
 	eng := orchestrator.NewEngine(cfg)
 
-	// 2. 构建 RunnerPool (per-runner 并发控制)
+	// 3. 构建 RunnerPool (per-runner 并发控制)
 	pool := orchestrator.NewRunnerPool()
-	pool.SetLimit("llm-stage", 4)          // LLM 阶段最多 4 并发
+	pool.SetLimit("llm-stage", maxParallel) // LLM 阶段并发上限 (模型个性化)
 	pool.SetLimit("llm-adversarial", 1)    // 对抗循环串行
 
 	// 3. 注册 Runner

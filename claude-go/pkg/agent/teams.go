@@ -40,9 +40,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
+	"github.com/anthropic/claude-go/pkg/types"
 )
 
 // TaskTracker 抽象 V2 任务管理, 与 builtin.TaskStore 通过 duck typing 对接。
@@ -60,6 +62,7 @@ type DAGTaskTracker interface {
 	ReadyTasks() []DAGTaskSummary
 	SetTaskStatusAndUnblock(id, status string) (int, error)
 	GetAllTasks() []DAGTaskSummary
+	ReevaluateBlockedTasks() int
 }
 
 // DAGTaskSummary 面向调度器的任务摘要 (与 builtin.TaskSummary 结构对齐)。
@@ -90,6 +93,7 @@ type TaskStoreDAGAdapter struct {
 		SetTaskStatus(id, status string) error
 		AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
 		SetTaskStatusAndUnblock(id, status string) (int, error)
+		ReevaluateBlockedTasks() int
 	}
 	readyFunc  func() []DAGTaskSummary
 	getAllFunc func() []DAGTaskSummary
@@ -103,6 +107,7 @@ func NewTaskStoreDAGAdapter(
 		SetTaskStatus(id, status string) error
 		AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
 		SetTaskStatusAndUnblock(id, status string) (int, error)
+		ReevaluateBlockedTasks() int
 	},
 	readyFn func() []DAGTaskSummary,
 	getAllFn func() []DAGTaskSummary,
@@ -130,6 +135,9 @@ func (a *TaskStoreDAGAdapter) GetAllTasks() []DAGTaskSummary {
 		return a.getAllFunc()
 	}
 	return nil
+}
+func (a *TaskStoreDAGAdapter) ReevaluateBlockedTasks() int {
+	return a.store.ReevaluateBlockedTasks()
 }
 
 // DreamRecorder Dreaming 记录接口, 解耦 dreaming 包依赖。
@@ -225,6 +233,7 @@ type ProductionTeamManager struct {
 	concurrency ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
 
 	planCfgResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
+	hookRunner      *hooks.Runner       // Hook 执行器 (TeammateIdle / TaskCompleted)
 
 	// starting 防止并发 resume/run 同一个团队 (race condition 保护)
 	startingMu sync.Mutex
@@ -247,6 +256,7 @@ type TeamManagerConfig struct {
 	MemWriter          MemoryWriter
 	Concurrency        ConcurrencySuggestor
 	PlanConfigResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
+	HookConfigs        []types.HookConfig  // Hook 配置 (用于 TeammateIdle / TaskCompleted 等)
 }
 
 // SetMemoryWriter 注入记忆写入器 (在 Bot 初始化后调用)。
@@ -293,6 +303,17 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		concurrency:     cfg.Concurrency,
 		planCfgResolver: cfg.PlanConfigResolver,
 		starting:        make(map[string]bool),
+	}
+	if len(cfg.HookConfigs) > 0 {
+		ptm.hookRunner = hooks.NewRunner(cfg.HookConfigs, "")
+		// Agent 释放时触发 TeammateIdle Hook
+		if ptm.pool != nil {
+			ptm.pool.OnRelease = func(agent *PooledAgent) {
+				if ptm.hookRunner != nil {
+					ptm.hookRunner.ExecuteTeammateIdleHooks(agent.Role)
+				}
+			}
+		}
 	}
 	ptm.loadPersistedTeams()
 	return ptm
@@ -654,13 +675,20 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		}
 	}
 
-	// Global Gates: compile, test, and consistency checks after workflow stages complete
+	// Global Gates: compile, test, and consistency checks after workflow stages complete.
+	//
+	// 注: 当 compile / test gate 失败时, 跑 1-2 轮"修复尝试", 由 coder 角色
+	// 拿到具体错误输出去修源码 (修 bug / 删重复声明 / 修 vet 警告 / 删死循环).
+	// 修完后再跑 gate. 这样团队就有自我恢复能力, 不会因为单个 vet 警告或
+	// 一处明显 bug 就把 30 分钟的工作直接判废.
 	if team.Cwd != "" {
-		if gateErr := ptm.runGlobalCompileGate(team); gateErr != "" {
+		if gateErr := ptm.tryGateWithRemediation(ctx, team, executor, "compile",
+			ptm.runGlobalCompileGate, 2); gateErr != "" {
 			ptm.failTeam(team, fmt.Sprintf("全局编译门禁失败: %s", gateErr))
 			return
 		}
-		if gateErr := ptm.runGlobalTestGate(team); gateErr != "" {
+		if gateErr := ptm.tryGateWithRemediation(ctx, team, executor, "test",
+			ptm.runGlobalTestGate, 2); gateErr != "" {
 			ptm.failTeam(team, fmt.Sprintf("全局测试门禁失败: %s", gateErr))
 			return
 		}
@@ -676,6 +704,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	team.Stages = results
 	team.mu.Unlock()
 	team.persist()
+	ptm.runTaskCompletedHooks(results)
 
 	// 结构化运行报告 (可观测性: 供后续 AI 分析团队运行效果)
 	report := logging.TeamRunReport{
@@ -817,13 +846,21 @@ func isSuccessfulTeamStatus(status TeamStatus) bool {
 
 // runGlobalCompileGate runs a global compile check for the team.
 // Returns empty string on success, error message on failure.
+//
+// 注: 用 exec.CommandContext + WithTimeout 包一层超时.
+// 否则 AI 生成的 build.go / cgo 之类的死循环会让整个团队卡死.
 func (ptm *ProductionTeamManager) runGlobalCompileGate(team *ProductionTeam) string {
 	if team == nil || team.Cwd == "" {
 		return ""
 	}
-	cmd := exec.Command("go", "build", "./...")
+	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "go", "build", "./...")
 	cmd.Dir = team.Cwd
 	out, err := cmd.CombinedOutput()
+	if cctx.Err() == context.DeadlineExceeded {
+		return fmt.Sprintf("go build ./... timed out after 5m\n%s", string(out))
+	}
 	if err != nil {
 		return fmt.Sprintf("go build ./... failed: %v\n%s", err, string(out))
 	}
@@ -832,13 +869,23 @@ func (ptm *ProductionTeamManager) runGlobalCompileGate(team *ProductionTeam) str
 
 // runGlobalTestGate runs a global test check with race detection for the team.
 // Returns empty string on success, error message on failure.
+//
+// 注: 用 exec.CommandContext + WithTimeout 包一层超时.
+// 否则 AI 生成的代码里有死循环 (比如 kmeans 中 k > len(vectors) 的 for{} ),
+// 整个团队会卡在这条命令上数十分钟. 12 分钟的超时足够正常单元测试跑完,
+// 又能在病态情况下及时止血.
 func (ptm *ProductionTeamManager) runGlobalTestGate(team *ProductionTeam) string {
 	if team == nil || team.Cwd == "" {
 		return ""
 	}
-	cmd := exec.Command("go", "test", "-race", "./...")
+	cctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "go", "test", "-race", "-timeout", "120s", "./...")
 	cmd.Dir = team.Cwd
 	out, err := cmd.CombinedOutput()
+	if cctx.Err() == context.DeadlineExceeded {
+		return fmt.Sprintf("go test -race ./... timed out after 12m (very likely an infinite loop in generated code)\n%s", string(out))
+	}
 	if err != nil {
 		return fmt.Sprintf("go test -race ./... failed: %v\n%s", err, string(out))
 	}
@@ -869,6 +916,108 @@ func (ptm *ProductionTeamManager) runGlobalConsistencyCheck(team *ProductionTeam
 	return ""
 }
 
+// tryGateWithRemediation 跑一次 gate, 失败就让 coder 修, 最多 maxAttempts 次.
+//
+// 行为:
+//  1. 先跑 gate(). 通过 → 直接返回 "".
+//  2. 不通过 → 用 gate 输出作为 feedback, 触发一个 coder 阶段去修.
+//  3. coder 跑完后 (不论 status 如何), 再跑一次 gate. 若仍失败, 进入下一轮.
+//  4. 用完 maxAttempts 仍失败, 返回最后一次的错误.
+//
+// 这个机制让团队具备 "门禁失败 → 自动修复 → 再校验" 的闭环, 能消化掉绝大多数
+// 由 AI 生成代码引入的低级错误 (vet 警告 / 重复声明 / 易触发死循环的边界等).
+//
+// 注意: 这里使用 executor.ExecuteSingleStage 直接调度一个临时 coder stage,
+// 不写入 workflow.results, 也不被 reviewer 重新审一遍, 避免无限套娃.
+func (ptm *ProductionTeamManager) tryGateWithRemediation(
+	ctx context.Context,
+	team *ProductionTeam,
+	executor *WorkflowExecutor,
+	gateName string,
+	gateFn func(*ProductionTeam) string,
+	maxAttempts int,
+) string {
+	if gateFn == nil {
+		return ""
+	}
+	gateErr := gateFn(team)
+	if gateErr == "" {
+		return ""
+	}
+	if maxAttempts <= 0 || executor == nil || ctx == nil {
+		return gateErr
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return gateErr
+		}
+		ptm.notify(team.ChatID, fmt.Sprintf(
+			"🛠 全局 %s 门禁失败, 启动第 %d/%d 次自动修复尝试...",
+			gateName, attempt, maxAttempts))
+
+		fixPrompt := fmt.Sprintf(`你处于"全局 %s 门禁失败 → 自动修复"阶段.
+
+刚才执行 `+"`go %s`"+` 失败, 错误输出如下 (来自仓库根目录):
+
+%s
+
+请按下列要求修复:
+1. **使用 Bash 工具** 在仓库根 (%s) 下重现错误: `+"`go %s`"+`.
+2. **使用 Read 工具** 打开错误信息中提到的源文件.
+3. **使用 Edit/Write 工具** 直接修改源码 (不要只输出 patch 文字, 必须真的写入磁盘).
+4. **再次运行** `+"`go %s`"+` 验证修复. 仍失败则继续修, 最多再尝试 3 次.
+5. 完成后, 列出修改过的文件路径和每处改动的简要原因.
+
+禁止事项:
+- 不要 *删除* 失败的测试以伪造 PASS.
+- 不要把 main 包的逻辑改回未实现状态来回避错误.
+- 不要交付一份 "我建议这样改" 的 markdown - 必须真的修改文件.`,
+			gateName,
+			gateCommandFor(gateName),
+			gateErr,
+			team.Cwd,
+			gateCommandFor(gateName),
+			gateCommandFor(gateName),
+		)
+
+		fixStage := StageDef{
+			Name:   fmt.Sprintf("remediation-%s-%d", gateName, attempt),
+			Role:   "coder",
+			Prompt: fixPrompt,
+		}
+		// 给修复阶段一个相对充裕的超时 (25min), 走 executor 的 retry/timeout 机制.
+		fixCtx, fixCancel := context.WithTimeout(ctx, 25*time.Minute)
+		_ = executor.ExecuteSingleStage(fixCtx, fixStage, team.Objective, nil, team)
+		fixCancel()
+
+		// 重跑 gate. 如果 ctx 已取消 (用户停止), 直接退出.
+		if ctx.Err() != nil {
+			return gateErr
+		}
+		newErr := gateFn(team)
+		if newErr == "" {
+			ptm.notify(team.ChatID, fmt.Sprintf(
+				"✅ 第 %d 次修复成功, 全局 %s 门禁通过", attempt, gateName))
+			return ""
+		}
+		gateErr = newErr
+	}
+	return gateErr
+}
+
+// gateCommandFor 把 gateName 映射成等价的 go 命令字符串, 用于喂给修复 prompt.
+func gateCommandFor(gateName string) string {
+	switch strings.ToLower(gateName) {
+	case "compile":
+		return "build ./..."
+	case "test":
+		return "test -race -timeout 120s ./..."
+	default:
+		return gateName
+	}
+}
+
 // executeSwarm 蜂群模式执行
 func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *ProductionTeam) {
 	swarm := NewSwarmOrchestrator(ptm.llm, ptm.pool, ptm.taskTracker, ptm.notify, team.ChatID, 8)
@@ -894,6 +1043,7 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 	team.Stages = results
 	team.mu.Unlock()
 	team.persist()
+	ptm.runTaskCompletedHooks(results)
 
 	// 蜂群持续观测指标
 	if ptm.metrics != nil {
@@ -1066,6 +1216,20 @@ func (ptm *ProductionTeamManager) failTeam(team *ProductionTeam, reason string) 
 		msg += fmt.Sprintf("\n\n💡 **恢复方式**: 等待限流解除后, 使用相同目标重新启动团队即可从检查点恢复:\n`/team go %s %s`\n已完成的阶段会自动跳过。", team.Name, team.Objective)
 	}
 	ptm.notify(team.ChatID, msg)
+}
+
+// runTaskCompletedHooks 对已完成阶段触发 TaskCompleted Hook。
+func (ptm *ProductionTeamManager) runTaskCompletedHooks(results []StageResult) {
+	if ptm.hookRunner == nil {
+		return
+	}
+	for _, r := range results {
+		if r.Status == TaskCompleted {
+			ptm.hookRunner.ExecuteTaskCompletedHooks(r.Name, true)
+		} else {
+			ptm.hookRunner.ExecuteTaskCompletedHooks(r.Name, false)
+		}
+	}
 }
 
 // StopTeam 停止团队

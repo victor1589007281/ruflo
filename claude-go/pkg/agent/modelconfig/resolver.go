@@ -120,6 +120,12 @@ func (r *ConfigResolver) resolveAlias(alias string) ResolvedConfig {
 	cfg.MaxTurns = entry.Params.MaxTurns
 	cfg.PromptCacheMode = entry.Params.PromptCacheMode
 	cfg.ContextWindow = entry.Params.ContextWindow
+	cfg.RPM = entry.Params.RPM
+	cfg.MaxParallel = entry.Params.MaxParallel
+	cfg.MinParallel = entry.Params.MinParallel
+	cfg.FirstTokenTimeoutSec = entry.Params.FirstTokenTimeoutSec
+	cfg.CallTimeoutSec = entry.Params.CallTimeoutSec
+	cfg.DeadlineRetryBaseSec = entry.Params.DeadlineRetryBaseSec
 
 	return cfg
 }

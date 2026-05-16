@@ -60,6 +60,25 @@ func RegisterTeamCommands(r *Registry) {
 				}
 				fmt.Printf("🚀 团队 **%s** 已启动, 后台执行中...\n", name)
 
+			case "resume":
+				if len(parts) < 2 {
+					fmt.Println("用法: /team resume <名称>")
+					return nil
+				}
+				name := parts[1]
+				if err := ctx.TeamMgr.ResumeTeam(name); err != nil {
+					fmt.Printf("[恢复失败: %v]\n", err)
+					return nil
+				}
+				fmt.Printf("♻️ 团队 **%s** 已恢复执行\n", name)
+				if ctx.WaitSync {
+					team := ctx.TeamMgr.GetTeam(name)
+					if team != nil {
+						team.WaitDone()
+						fmt.Printf("\n🏁 团队 %s 执行完毕 (状态: %s)\n", team.Name, team.Status)
+					}
+				}
+
 			case "status":
 				if len(parts) >= 2 {
 					team := ctx.TeamMgr.GetTeam(parts[1])

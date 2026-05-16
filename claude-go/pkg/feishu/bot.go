@@ -99,6 +99,9 @@ func (d *dagTaskAdapter) GetAllTasks() []agent.DAGTaskSummary {
 	}
 	return result
 }
+func (d *dagTaskAdapter) ReevaluateBlockedTasks() int {
+	return d.store.ReevaluateBlockedTasks()
+}
 
 // memoryAdapter 适配 memory.TieredStore 到 agent.MemoryWriter 接口。
 // 团队完成后写入高权重记忆，确保团队名+目标可被 BM25 检索到。
@@ -446,6 +449,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		Dreamer:            &dreamAdapter{dreamer: bot.dreamer},
 		Roles:              roleReg,
 		PlanConfigResolver: planCfgResolver,
+		HookConfigs:        hookConfigs,
 	})
 
 	// 10a. 修复: SetTeamManager 必须在 teamMgr 创建后调用 (之前因时序 bug 注入了 nil)

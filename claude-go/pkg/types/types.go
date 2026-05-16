@@ -275,6 +275,19 @@ const (
 	HookEventTeammateIdle       HookEvent = "TeammateIdle"
 	HookEventTaskCompleted      HookEvent = "TaskCompleted"
 	HookEventNotification       HookEvent = "Notification"
+
+	// 以下为新补充的 HookEvent（覆盖业界生命周期管理缺失点）
+	HookEventPreTurn           HookEvent = "PreTurn"
+	HookEventPostTurn          HookEvent = "PostTurn"
+	HookEventPreRequest        HookEvent = "PreRequest"
+	HookEventPostRequest       HookEvent = "PostRequest"
+	HookEventOnContextOverflow HookEvent = "OnContextOverflow"
+	HookEventOnMaxTurnsReached HookEvent = "OnMaxTurnsReached"
+	HookEventOnError           HookEvent = "OnError"
+	HookEventOnRecovery        HookEvent = "OnRecovery"
+	HookEventOnRateLimit       HookEvent = "OnRateLimit"
+	HookEventOnRetry           HookEvent = "OnRetry"
+	HookEventOnMessageFilter   HookEvent = "OnMessageFilter"
 )
 
 // HookType 定义 hook 的执行方式。
@@ -310,6 +323,17 @@ type HookInput struct {
 	IsError     bool            `json:"is_error,omitempty"`
 	Messages    []Message       `json:"messages,omitempty"`
 	Transcript  string          `json:"transcript_path,omitempty"`
+
+	// 以下为扩展字段，供新 HookEvent 使用
+	TurnCount   int    `json:"turn_count,omitempty"`
+	Model       string `json:"model,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	BackoffMs   int    `json:"backoff_ms,omitempty"`
+	BudgetLevel int    `json:"budget_level,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Role        string `json:"role,omitempty"`
+	TaskID      string `json:"task_id,omitempty"`
+	Success     bool   `json:"success,omitempty"`
 }
 
 // HookOutput hook 执行后的输出

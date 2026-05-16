@@ -11,6 +11,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -73,19 +74,45 @@ var mysqlEssentialTargets = []string{
 	"myisam",    // MyISAM 存储引擎
 }
 
-// GetWorkflow 获取预定义工作流 (简化版).
+// workflowRegistry 工作流名 → 构造函数. 注意: 工作流定义本身不带状态,
+// 每次按需 new 一份, 避免不同 team 之间共享同一 WorkflowDef 引用.
+var workflowRegistry = map[string]func() *WorkflowDef{
+	"development":  developmentWorkflow,
+	"app":          appCompositeWorkflow,
+	"game":         gameCompositeWorkflow,
+	"code-review":  codeReviewWorkflow,
+	"testing":      testingWorkflow,
+	"creative-v2":  creativeV2Workflow,
+	"trading-v2":   tradingV2Workflow,
+	"novel-v2":     novelV2Workflow,
+	"novel-v3":     novelV3Workflow,
+	"ml-training":  mlTrainingWorkflow,
+	"hiring":       hiringWorkflow,
+	"parenting":    parentingWorkflow,
+}
+
+// GetWorkflow 获取预定义工作流. 名称未注册时返回 nil, 让上层走"未知工作流"错误路径.
 func GetWorkflow(name string) *WorkflowDef {
+	if factory, ok := workflowRegistry[name]; ok {
+		return factory()
+	}
 	return nil
 }
 
-// ListWorkflows 列出所有可用工作流 (简化版).
+// ListWorkflows 列出所有可用工作流 (按名称排序, 便于 CLI 输出稳定).
 func ListWorkflows() []WorkflowDef {
-	return nil
-}
-
-// executeAdversarialDev 对抗式开发流水线 (简化版: 直接复用 pipeline 执行)。
-func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
-	return we.executePipeline(ctx, wf, objective, team)
+	names := make([]string, 0, len(workflowRegistry))
+	for n := range workflowRegistry {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]WorkflowDef, 0, len(names))
+	for _, n := range names {
+		if wf := workflowRegistry[n](); wf != nil {
+			out = append(out, *wf)
+		}
+	}
+	return out
 }
 
 // executeFanOut 并行扇出 → 汇聚 (简化版: 直接复用 pipeline 执行)。
@@ -104,6 +131,33 @@ type PromptCache struct {
 	prefixHash   string // SHA256 用于缓存追踪
 	cacheHits    int64  // 命中次数 (同一 prefix 复用)
 	cacheMisses  int64  // 未命中 (prefix 变化)
+}
+
+// UpdatePrefix 更新静态前缀（对应测试中的 PromptCache API）。
+func (p *PromptCache) UpdatePrefix(prefix string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.staticPrefix = prefix
+	p.prefixHash = fmt.Sprintf("%x", sha256.Sum256([]byte(prefix)))[:16]
+	p.cacheMisses++
+}
+
+// BuildPrompt 组合 static + dynamic 内容（对应测试中的 PromptCache API）。
+func (p *PromptCache) BuildPrompt(dynamic string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.staticPrefix + "\n" + dynamic
+}
+
+// HitRate 返回缓存命中率（供测试/观测使用）。
+func (p *PromptCache) HitRate() float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	total := p.cacheHits + p.cacheMisses
+	if total == 0 {
+		return 0
+	}
+	return float64(p.cacheHits) / float64(total)
 }
 
 func SummarizeOldOutput(output string, maxLen int) string {
@@ -334,53 +388,6 @@ func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults ma
 	}
 }
 
-func objectiveRequiresCompleteImplementation(objective string) bool {
-	if containsCompleteImplementationTerm(objective) {
-		return true
-	}
-	for _, p := range extractLocalReferencePaths(objective) {
-		excerpt := readLocalReferenceExcerpt(p, 60000)
-		if containsCompleteImplementationTerm(excerpt) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsCompleteImplementationTerm(text string) bool {
-	lower := strings.ToLower(text)
-	terms := []string{
-		"100% 覆盖",
-		"100%覆盖",
-		"100% 满足",
-		"100%满足",
-		"严格参考",
-		"完整实现",
-		"不得降级",
-		"不允许降级",
-		"不能降级",
-		"未来扩展",
-		"未实现能力",
-		"full implementation",
-		"complete implementation",
-		"fully implemented",
-		"no mvp",
-		"not mvp",
-		"no placeholder",
-		"no placeholders",
-	}
-	for _, term := range terms {
-		if strings.Contains(lower, term) {
-			return true
-		}
-	}
-	return false
-}
-
-func isDir(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
-}
 
 func (we *WorkflowExecutor) executePipeline(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	results := make(map[string]string)
@@ -1246,18 +1253,21 @@ func min(a, b int) int {
 func (we *WorkflowExecutor) computeStageTimeout(role string, attempt int) time.Duration {
 	base := stageTimeout // 默认 10 分钟
 
-	// 根据角色调整基础超时
+	// 根据角色调整基础超时.
+	// 注意: 做事型角色 (coder/tester) 在写 Phase1+Phase2 这种大功能时需要 20+ 分钟,
+	// 之前 8 min 直接被 RunIsolated 撞墙. 这里大幅放宽; 简单 bug 修复阶段会有更短的
+	// 总流水线截止时间兜底.
 	switch role {
 	case "coder":
-		base = 8 * time.Minute
+		base = 25 * time.Minute
 	case "researcher":
-		base = 4 * time.Minute
+		base = 6 * time.Minute
 	case "architect", "planner":
-		base = 4 * time.Minute
+		base = 6 * time.Minute
 	case "tester":
-		base = 5 * time.Minute
+		base = 15 * time.Minute
 	case "reviewer":
-		base = 4 * time.Minute
+		base = 10 * time.Minute
 	}
 
 	// 每次重试增加 20% 超时预算 (给 LLM 更多时间)
@@ -1266,9 +1276,9 @@ func (we *WorkflowExecutor) computeStageTimeout(role string, attempt int) time.D
 		base = time.Duration(float64(base) * multiplier)
 	}
 
-	// 硬上限: 前置阶段必须快速失败重试, 避免团队主流程长时间假死。
-	if base > 12*time.Minute {
-		base = 12 * time.Minute
+	// 硬上限: 给 coder 这种大动作放到 40 分钟; 简单角色配置远低于此, 不会受影响.
+	if base > 40*time.Minute {
+		base = 40 * time.Minute
 	}
 
 	return base
@@ -1469,6 +1479,37 @@ func validateAgentOutput(output, role string) string {
 		return "产出过短 (< 50 字符)，可能未实际执行任务"
 	}
 	lower := strings.ToLower(trimmed)
+
+	// 思考型角色 (architect/researcher/planner) 在 DisableTools 模式下经常吐
+	// "我将先读文档" 之类 1-2 句承诺型 stub. 这里识别两种典型 stub 形态:
+	//   1. 输出非常短 (< 300 字符), 同时只包含 "执行/调用/读取" 这类动词 ➜ 标记为 stub
+	//   2. 开头明确说 "我将先读 X / 首先读取 Y" 这类承诺型措辞 ➜ 标记为 stub
+	// 对 1500+ 字符的正常设计稿不影响, 对 200-300 字符的合法简报也保留 (没有承诺措辞).
+	roleLower := strings.ToLower(strings.TrimSpace(role))
+	if roleLower == "architect" || roleLower == "researcher" || roleLower == "planner" {
+		head := trimmed
+		if len(head) > 600 {
+			head = head[:600]
+		}
+		promiseTriggers := []string{
+			"我将先读", "我将先看", "我先读", "我先看",
+			"首先读取", "首先查看", "首先了解", "首先阅读", "首先获取",
+			"我将按照", // "我将按照 X 流水线执行..." 这种描述性开场
+			"i will first read", "i'll first read", "let me first read",
+			"first, i will read", "first, let me read",
+		}
+		matchedPromise := false
+		for _, p := range promiseTriggers {
+			if strings.Contains(head, p) {
+				matchedPromise = true
+				break
+			}
+		}
+		// 极短输出 + 承诺措辞 ➜ 几乎必然是 stub. 此时拒绝.
+		if matchedPromise && len(trimmed) < 800 {
+			return "思考型角色产出仅是 \"先读文档再做事\" 的承诺型 stub. 必须直接基于已注入的参考资料给出完整产出, 不要先承诺再行动"
+		}
+	}
 
 	// 2. 空转模式检测: 仅声明角色就绪、未提供实质内容
 	idlePatterns := []string{
@@ -1778,6 +1819,10 @@ func runMySQLBuildCheck(cwd string) string {
 }
 
 func runLimitedCommand(ctx context.Context, cwd string, args []string, memMaxMB, cpuQuotaPercent int) ([]byte, error) {
+	return runLimitedCommandWithNetwork(ctx, cwd, args, memMaxMB, cpuQuotaPercent, true, nil)
+}
+
+func runLimitedCommandWithNetwork(ctx context.Context, cwd string, args []string, memMaxMB, cpuQuotaPercent int, networkDisabled bool, env map[string]string) ([]byte, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -1786,7 +1831,8 @@ func runLimitedCommand(ctx context.Context, cwd string, args []string, memMaxMB,
 		Cwd:                 cwd,
 		Args:                args,
 		AllowUnsafeFallback: os.Getenv("CLAUDE_GO_SANDBOX_ALLOW_UNSAFE_FALLBACK") != "",
-		NetworkDisabled:     true,
+		NetworkDisabled:     networkDisabled,
+		Env:                 env,
 		Limits: sandbox.ResourceLimits{
 			MemoryMaxMB:     memMaxMB,
 			CPUQuotaPercent: cpuQuotaPercent,
@@ -1798,6 +1844,9 @@ func runLimitedCommand(ctx context.Context, cwd string, args []string, memMaxMB,
 	}
 	result, err := sandbox.DefaultManager().Run(ctx, spec)
 	if result == nil {
+		if err != nil {
+			return []byte(fmt.Sprintf("[runLimitedCommand] sandbox 调度失败 (无 result): %v", err)), err
+		}
 		return nil, err
 	}
 	if result.Runtime == "process-unsafe" && memMaxMB > 0 {
@@ -1805,12 +1854,42 @@ func runLimitedCommand(ctx context.Context, cwd string, args []string, memMaxMB,
 	}
 	out := []byte(result.CombinedPreview)
 	if err != nil {
+		// 关键修复: out 为空时输出 err / FailureKind / RuntimeDetail / ExitCode, 让上层 build/test 检查能拿到可诊断信息。
+		if len(out) == 0 {
+			diag := buildLimitedCommandDiagnostics(result, err)
+			out = []byte(diag)
+		}
 		if result.FailureKind != sandbox.FailureNone {
 			return out, fmt.Errorf("%s: %w", result.FailureKind, err)
 		}
 		return out, err
 	}
 	return out, nil
+}
+
+// buildLimitedCommandDiagnostics 构造 sandbox 失败时的诊断信息, 用于 build/test 错误消息.
+func buildLimitedCommandDiagnostics(result *sandbox.CommandResult, err error) string {
+	if result == nil {
+		if err != nil {
+			return fmt.Sprintf("[runLimitedCommand] sandbox 无 result, err=%v", err)
+		}
+		return "[runLimitedCommand] sandbox 无 result 且无 err"
+	}
+	parts := []string{fmt.Sprintf("[runLimitedCommand] 命令未产生输出, sandbox 报告失败 (runtime=%s exit=%d)", result.Runtime, result.ExitCode)}
+	if result.FailureKind != sandbox.FailureNone {
+		parts = append(parts, fmt.Sprintf("failureKind=%s", result.FailureKind))
+	}
+	if result.RuntimeDetail != "" {
+		parts = append(parts, fmt.Sprintf("runtimeDetail=%s", result.RuntimeDetail))
+	}
+	if result.LogDir != "" {
+		parts = append(parts, fmt.Sprintf("logDir=%s", result.LogDir))
+	}
+	if err != nil {
+		parts = append(parts, fmt.Sprintf("err=%v", err))
+	}
+	parts = append(parts, fmt.Sprintf("args=%s", strings.Join(result.Args, " ")))
+	return strings.Join(parts, "\n")
 }
 
 func runBuildCheckLang(cwd, lang string) string {
@@ -1840,7 +1919,11 @@ func runBuildCheckLang(cwd, lang string) string {
 
 	var errors []string
 	for _, args := range tc.BuildCmds {
-		out, err := runLimitedCommand(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent)
+		var env map[string]string
+		if tc.Language == "go" {
+			env = map[string]string{"GOFLAGS": "-mod=readonly"}
+		}
+		out, err := runLimitedCommandWithNetwork(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent, true, env)
 		if err != nil {
 			if tc.Language == "go" && isGoNoPackagesOutput(string(out)) {
 				continue
@@ -1901,7 +1984,11 @@ func runBuildCheckScoped(cwd, lang string, targetPackages []string) string {
 			}
 			args = []string{"go", "build", "-o", filepath.Join(tmpOutDir, outName), pkg}
 		}
-		out, err := runLimitedCommand(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent)
+		var env map[string]string
+		if tc.Language == "go" {
+			env = map[string]string{"GOFLAGS": "-mod=readonly"}
+		}
+		out, err := runLimitedCommandWithNetwork(ctx, cwd, args, tc.MemoryMaxMB, tc.CPUQuotaPercent, true, env)
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s 失败:\n%s", strings.Join(args, " "), string(out)))
 		}
