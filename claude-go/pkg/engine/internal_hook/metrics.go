@@ -58,6 +58,52 @@ type EngineMetrics struct {
 	// Trajectory
 	TrajSuccessRecorded atomic.Int64
 	TrajFailRecorded    atomic.Int64
+
+	// =========================================================================
+	// 消息链指标 (由 MessageMetricsHook 在 PhasePreRequest 阶段写入)
+	// =========================================================================
+	// MsgChainTotalRecorded 记录的消息链分析次数（每轮 API 请求前计数一次）
+	MsgChainTotalRecorded atomic.Int64
+	// MsgChainTotalTokens 所有消息链的估算 token 总数（字符数/4 累加）
+	MsgChainTotalTokens atomic.Int64
+	// MsgChainMaxLength 历史最大消息链长度（消息条数）
+	MsgChainMaxLength atomic.Int64
+	// MsgChainMaxTokens 历史最大消息链估算 token 数
+	MsgChainMaxTokens atomic.Int64
+
+	// =========================================================================
+	// ToolResult 指标 (由 MessageMetricsHook 在 PhasePreRequest 阶段写入)
+	// =========================================================================
+	// ToolResultsTotal 累计 tool_result 块总数
+	ToolResultsTotal atomic.Int64
+	// ToolResultsSuccess 累计成功 tool_result 数（IsError=false）
+	ToolResultsSuccess atomic.Int64
+	// ToolResultsError 累计错误 tool_result 数（IsError=true）
+	ToolResultsError atomic.Int64
+	// ToolResultsTotalChars 累计 tool_result 字符总数（用于计算平均值）
+	ToolResultsTotalChars atomic.Int64
+
+	// =========================================================================
+	// 压缩/过滤效果指标 (由 MessageMetricsHook 在 PhasePreRequest 阶段写入)
+	// =========================================================================
+	// FilterDeletedUnits FilterPureToolUseUnits 累计删除的原子单元数
+	FilterDeletedUnits atomic.Int64
+	// CompressTotalBeforeChars CompressMessageContent 压缩前总字符数
+	CompressTotalBeforeChars atomic.Int64
+	// CompressTotalAfterChars CompressMessageContent 压缩后总字符数
+	CompressTotalAfterChars atomic.Int64
+
+	// =========================================================================
+	// MemGPT 预留指标 (待 MemGPT 实施后填充)
+	// =========================================================================
+	// MemGPTWorkingTokens Working Memory 累计 token 数
+	MemGPTWorkingTokens atomic.Int64
+	// MemGPTArchivalTokens Archival Memory 累计 token 数
+	MemGPTArchivalTokens atomic.Int64
+	// MemGPTRecallHits Recall Memory 向量检索命中次数
+	MemGPTRecallHits atomic.Int64
+	// MemGPTRecallMisses Recall Memory 向量检索未命中次数
+	MemGPTRecallMisses atomic.Int64
 }
 
 // NewEngineMetrics 构造默认指标对象。

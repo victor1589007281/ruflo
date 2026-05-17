@@ -256,8 +256,10 @@ func (e *QueryEngine) registerInternalHooks() {
 		e.HookChain.Register(internal_hook.NewBudgetDegradeHook(e.Budget, e.HookRunner, e.Metrics))
 	}
 
-	// PhasePreRequest: MessageFilter(40) + MemoryInject(50) + PromptCache(55)
+	// PhasePreRequest: ToolResultLevel(38) + MessageFilter(40) + MessageMetrics(48) + MemoryInject(50) + PromptCache(55)
+	e.HookChain.Register(internal_hook.NewToolResultLevelHook(nil, e.Metrics))
 	e.HookChain.Register(internal_hook.NewMessageFilterHook())
+	e.HookChain.Register(internal_hook.NewMessageMetricsHook(e.Metrics))
 	if e.MemoryStore != nil || e.FactStore != nil {
 		e.HookChain.Register(internal_hook.NewMemoryInjectHook(e.MemoryStore, e.FactStore))
 	}
