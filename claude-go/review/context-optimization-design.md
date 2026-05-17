@@ -13,6 +13,134 @@
 |------|------|------|
 | 2026-05-16 | 1.0 | 初始方案 |
 | 2026-05-16 | 1.1 | 标注已实施能力；补充额外实施的优化项（TaskInstruction 移动、Assistant 过滤、LLMlingua 压缩） |
+| 2026-05-17 | 1.2 | 补充提示词拼接模板；确认当前 tool 注入与 message 截断现状 |
+| 2026-05-17 | 1.3 | 新增 Metrics 指标设计（MessageMetricsHook）；实施 ToolResult 分级保留（ToolResultLevelHook）；更新收益汇总 |
+
+---
+
+## 0. 当前提示词拼接模板（基于源码）
+
+### 0.1 完整拼接流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Phase 1: 上下文压缩（可选）                                                  │
+│  - AutoCompact: 触发阈值 0.8（~160K token）                                  │
+│  - MicroCompact: 单条 tool_result 截断到 50K 字符                            │
+│  - PreCompact Hook 可 block 压缩                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Phase 2: System Prompt 构建（每轮重新组装）                                  │
+│                                                                             │
+│  1. BuildEffectiveSystemPrompt() 优先级链: override > coordinator > agent    │
+│     > custom > default                                                      │
+│                                                                             │
+│  2. 默认 prompt 拼接顺序（buildDefaultSystemPrompt）:                         │
+│     [1] 身份声明 ("You are Claude...")                                      │
+│     [2] <environment> OS/日期/cwd/shell/git/模型                            │
+│     [3] <available_tools> 工具列表 (name + description)                     │
+│     [4] <tool_usage> 工具使用指南                                           │
+│     [5] <mcp_tool_guidance> MCP 工具引导（如有 MCP 工具）                    │
+│     [6] <guidelines> 行为准则（先读后写、不提交 secrets 等）                 │
+│     [7] <plan_mode> Plan Mode 引导                                          │
+│     [8] CLAUDE.md 记忆内容（MemoryLoader.LoadAll）                          │
+│     [9] <long_term_memory> Dream 记忆（跨会话 MEMORY.md）                    │
+│                                                                             │
+│  3. + TaskInstruction（若非空，追加到末尾）                                   │
+│     用途: 将 20K 任务描述从 user message 移到 system prompt，               │
+│     使前缀享受 cache_control，避免 user message 每轮重复膨胀                 │
+│                                                                             │
+│  4. PhasePreRequest HookChain:                                              │
+│     - MemoryInjectHook: 首轮从 MemoryStore/FactStore 检索相关记忆，          │
+│       追加到 system prompt（仅 TurnCount==0 执行）                          │
+│     - PromptCacheHook: 拆分 static/dynamic，追踪 cache 命中率               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Phase 3: apiMessages 构建（messagesToAPI）                                   │
+│                                                                             │
+│  1. OnMessageFilter Hook 拦截（可 block 整个请求）                            │
+│                                                                             │
+│  2. FilterPureToolUseUnits(messages, keepRecent=6)                          │
+│     → 删除不含 text/thinking 的古老 assistant 消息                          │
+│     → 连同其后续纯 tool_result user 消息一起删除（原子单元）                  │
+│     → 保留最近 6 个 assistant 原子单元                                       │
+│                                                                             │
+│  3. 遍历 messages，合并连续同角色消息（user/assistant 严格交替）              │
+│                                                                             │
+│  4. CompressMessageContent(msg) — 对尾部倒数第 4 条之前的 user message       │
+│     → 删除空行、移除 21 个停用词、压缩代码注释                               │
+│     → 压缩后长度未减少 30% 时回退到原文                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Phase 4: API 调用                                                          │
+│  StreamMessage(apiMessages, systemPrompt, apiTools, maxTokens)              │
+│  参数:                                                                      │
+│    - apiMessages: user/assistant 严格交替的消息链                            │
+│    - systemPrompt: 字符串数组（ Anthropic API 的 system 参数）               │
+│    - apiTools: 过滤掉 DisabledTools 后的工具 schema                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 0.2 最终发送给 LLM 的数据结构
+
+```go
+// System Prompt（字符串数组， Anthropic API system 参数）
+[
+    "<身份+环境+工具+指南...>",      // static，享受 prompt cache
+    "<CLAUDE.md 记忆>",              // static（若不变则 cache 命中）
+    "<TaskInstruction>",             // dynamic，每轮可能变化
+    "<L1/L2 检索记忆>",              // dynamic，首轮注入
+]
+
+// Messages（user/assistant 严格交替）
+[
+    {role: "user",     content: "[用户原始请求 / 或 SubmitMessage 传空]"},
+    {role: "assistant", content: "[text/thinking + tool_use blocks...]"},
+    {role: "user",     content: "[tool_results (合并后的) + meta 消息]"},
+    {role: "assistant", content: "[thinking + tool_use...]"},
+    ...
+    // 注: 古老的无 reasoning assistant 已被 FilterPureToolUseUnits 删除
+    // 注: 古老的 user message 内容已被 CompressMessageContent 压缩
+]
+
+// Tools Schema
+[tool1, tool2, ...]  // APITools() 过滤 DisabledTools
+```
+
+### 0.3 Tool 注入与 Tool Result 注入逻辑
+
+**Tool Use 注入**（`engine.go:753-766`）:
+- 流式解析 assistant 响应，遇到 `content_block_stop` + `ContentBlockToolUse`
+- 收集 `toolUseBlocks []ContentBlock`（含 name + input JSON）
+- assistant message 本身已 `append(messages, assistantMsg)`（`engine.go:1058`）
+
+**Tool Result 注入**（`engine.go:1196-1245`）:
+- `tool.RunTools(ctx, toolUseBlocks, e.Tools, tctx, e.HookRunner)` 返回 `[]types.Message`
+- 每个 `toolResult` 是 `MessageTypeUser`，`Content` 包含 `ContentBlockToolResult`
+- `messages = append(messages, result)`（`engine.go:1245`）
+- 如果多个 tool 并行执行，它们的 tool_result 作为**同一条 user message 的不同 content block** 合并
+
+**关键特性**:
+- `messages` 数组只增不减（在 `queryLoop` 内没有任何删除操作）
+- `messagesToAPI` 是对 `messages` 的**只读转换**（深拷贝 + 过滤 + 压缩），不修改原始 `messages`
+- 所有截断/过滤/压缩发生在 `messagesToAPI` 阶段，不影响引擎内部状态
+
+### 0.4 当前 Message 截断现状（确认）
+
+| 处理类型 | 实现状态 | 作用范围 | 源码位置 |
+|---------|---------|---------|---------|
+| **滑动窗口截断**（丢弃整条消息） | ❌ **未实现** | — | 文档 3.x 节标注 `[未实现]` |
+| **纯 tool_use 原子单元过滤** | ✅ 已实施 | 删除古老无 reasoning 的 assistant + 对应 tool_result | `message_filter.go:13` |
+| **LLMlingua 内容压缩** | ✅ 已实施 | 压缩古老 user message（tool_result）内容 | `message_filter.go:94` |
+| **AutoCompact 上下文压缩** | ✅ 已实施 | 触发阈值 0.8，保留最近 6 条，摘要化早期消息 | `compact.go` |
+| **MicroCompact 单条截断** | ✅ 已实施 | 单条 tool_result 截断到 50K 字符 | `compact.go` |
+| **TaskInstruction 移动** | ✅ 已实施 | 20K 任务描述从 user msg 移到 system prompt | `engine.go:578` |
+| **Read 哈希缓存** | ✅ 已实施 | 重复读取相同文件返回 "unchanged" 标记 | `fileread.go` |
+
+**结论**: 当前**没有**基于消息数量的滑动窗口截断（如保留最近 12 条、丢弃其余）。`messages` 数组在 `queryLoop` 内部持续增长，仅在 `messagesToAPI` 阶段做**过滤**（删除无 reasoning 的古老 assistant）和**压缩**（压缩古老 tool_result 内容）。这意味着 100+ 轮后 `messages` 仍可能包含 99 条消息，只是其中部分被过滤/压缩后发给 API。
 
 ---
 
@@ -40,6 +168,88 @@
 - 最大消息链长度: **99 条**（死亡循环）
 - System prompt: **~8K**
 - 重复用户消息（任务描述）: **~20K/轮**
+
+---
+
+## 1.3 Metrics 指标设计（基于 Hook 实现）
+
+### 1.3.1 设计原则
+
+所有新增指标通过 `InternalHook` 机制采集，遵循以下原则：
+1. **纯观测，零干预**：Metrics Hook 只读分析 `messages`，不修改内容
+2. **Lock-free 写入**：所有计数器使用 `atomic.Int64`，无锁竞争
+3. **低开销**：字符统计 + 简单遍历，单次分析 < 1ms
+4. **可开关**：通过 `Config.EnableMetrics` 统一控制
+
+### 1.3.2 指标清单与含义
+
+**实现**: `pkg/engine/internal_hook/hook_message_metrics.go` — `MessageMetricsHook`（PhasePreRequest, Priority 48）
+
+| 指标名 | 类型 | 含义 | 写入时机 | 用途 |
+|--------|------|------|---------|------|
+| `turns_total` | counter | 总轮次 | PhasePostTurn | 会话长度分布 |
+| `turns_success` | counter | 成功完成轮次 | PhasePostTurn | 成功率 |
+| `turns_aborted` | counter | 中止轮次 | PhasePostTurn | 异常率 |
+| `turns_error` | counter | 错误轮次 | PhasePostTurn | 错误率 |
+| `tool_calls_total` | counter | 工具调用总数 | PhasePostToolUse | 工具使用频率 |
+| `tool_loops_detected` | counter | 循环检测触发数 | PhasePostToolUse | 循环频率 |
+| `cache_hits` / `cache_misses` | counter | Prompt Cache 命中/未命中 | PhasePreRequest | 缓存效率 |
+| `avg_turn_latency_ms` | gauge | 平均轮次延迟 | PhasePostTurn | 性能基线 |
+| **--- 以下为本次新增 ---** | | | | |
+| `msg_chain_total_recorded` | counter | 消息链分析次数 | PhasePreRequest | 采样基数 |
+| `msg_chain_total_tokens` | counter | 消息链估算 token 总数 | PhasePreRequest | Token 膨胀趋势 |
+| `msg_chain_max_length` | gauge | 历史最大消息链长度 | PhasePreRequest | 峰值压力 |
+| `msg_chain_max_tokens` | gauge | 历史最大消息链 token 数 | PhasePreRequest | 峰值 token |
+| `tool_results_total` | counter | 累计 tool_result 块数 | PhasePreRequest | tool_result 密度 |
+| `tool_results_success` | counter | 成功 tool_result 数 | PhasePreRequest | 成功比例 |
+| `tool_results_error` | counter | 错误 tool_result 数 | PhasePreRequest | 错误比例 |
+| `tool_results_total_chars` | counter | tool_result 总字符数 | PhasePreRequest | 平均大小 |
+| `filter_deleted_units` | counter | FilterPureToolUseUnits 删除数 | PhasePreRequest | 过滤效果 |
+| `compress_total_before_chars` | counter | 压缩前总字符数 | PhasePreRequest | 压缩收益 |
+| `compress_total_after_chars` | counter | 压缩后总字符数 | PhasePreRequest | 压缩收益 |
+| `memgpt_working_tokens` | counter | Working Memory token（预留）| — | MemGPT 实施后填充 |
+| `memgpt_archival_tokens` | counter | Archival Memory token（预留）| — | MemGPT 实施后填充 |
+| `memgpt_recall_hits` | counter | Recall 命中（预留）| — | MemGPT 实施后填充 |
+
+### 1.3.3 关键衍生指标（通过 Snapshot 计算）
+
+```go
+// 平均每轮消息链长度
+avgMsgChainLength = msg_chain_total_tokens / msg_chain_total_recorded
+
+// tool_result 平均字符数
+toolResultAvgChars = tool_results_total_chars / tool_results_total
+
+// 过滤删除率
+filterDeleteRatio = filter_deleted_units / msg_chain_total_recorded
+
+// 压缩率
+compressRatio = (compress_total_before_chars - compress_total_after_chars) / compress_total_before_chars
+
+// 成功/错误比例
+toolResultSuccessRatio = tool_results_success / tool_results_total
+toolResultErrorRatio   = tool_results_error / tool_results_total
+```
+
+### 1.3.4 基于 Metrics 的 MemGPT ROI 预判
+
+运行一周后，通过 Metrics 数据可精确计算 MemGPT 预期收益：
+
+```python
+# 假设 metrics 采集到以下数据（单次会话平均）
+avg_turns = 15.2                    # turns_total / sessions
+avg_msg_tokens = 4800               # msg_chain_total_tokens / msg_chain_total_recorded
+p99_msg_tokens = 68000              # msg_chain_max_tokens 的 P99
+avg_tr_chars = 2400                 # tool_results_total_chars / tool_results_total
+tr_success_ratio = 0.72             # tool_results_success / tool_results_total
+
+# MemGPT 节省估算
+working_memory_tokens = 6 * 3000    # 6 轮 × 每轮 3K
+archival_memory_tokens = avg_msg_tokens * 0.15  # 早期摘要约占原长的 15%
+toolresult_saving = avg_msg_tokens * 0.20       # ToolResult 分级节省约 20%
+
+estimated_saving = 1 - (working_memory_tokens + archival_memory_tokens + toolresult_saving) / avg_msg_tokens
+```
 
 ---
 
@@ -184,7 +394,7 @@ func isPureToolResultMessage(msg types.Message) bool
 
 ---
 
-## 5. P0: ToolResult 分级保留与渐进降级 `[部分实现]`
+## 5. P0: ToolResult 分级保留与渐进降级 `[已实施]`
 
 ### 5.1 问题定位
 
@@ -202,53 +412,89 @@ return &tool.ToolResult{Content: fmt.Sprintf("Exit code: 0\n\n%s", text)}
 
 成功写入的确认消息、历史 Bash 输出、已读的旧文件内容——这些在 10 轮后就完全失去价值，但仍占用上下文。
 
-### 5.2 方案设计: ToolResult 三级保留策略
+### 5.2 方案设计: ToolResult 四级保留策略
 
 根据消息"年龄"（距离当前轮次）和"重要性"实施分级：
 
 ```
-Level 0 (当前轮):   完整保留，原始长度
-Level 1 (前 1-2 轮): 截断保留，最多 500 字符
-Level 2 (前 3-5 轮): 仅保留状态标记（成功/失败 + 一句话摘要）
-Level 3 (> 5 轮):    完全移除（成功类）或保留为事实摘要（失败类）
+Level 0 (当前轮):      完整保留，原始长度
+Level 1 (前 1-2 轮):   截断保留，最多 500 字符
+Level 2 (前 3-5 轮):   仅保留状态标记（成功/失败 + 一句话摘要）
+Level 3 (> 5 轮):      成功类完全移除；失败类保留 200 字符摘要
 ```
 
 **消息重要性分类**:
 
 | 重要性 | 消息特征 | 降级策略 |
 |--------|---------|---------|
-| **高** | `IsError=true` 的 tool_result、编译失败、权限被拒绝 | 永久保留完整内容 |
-| **中** | Read 返回的关键文件内容（被后续 Edit 引用过） | Level 1 后保留摘要 |
-| **低** | Write/Edit 成功确认、Bash `ls/cat/pwd` 输出、Grep 结果 | Level 2 后仅保留标记，Level 3 移除 |
+| **高** | `IsError=true` 的 tool_result、编译失败、权限被拒绝 | 永远不被完全删除（最多 Level 2 标记化） |
+| **中** | Read 返回的关键文件内容（被后续 Edit 引用过） | Level 1 后截断，Level 2 后标记 |
+| **低** | Write/Edit 成功确认、Bash `ls/cat/pwd` 输出、Grep 结果 | Level 2 后仅保留标记，Level 3 完全移除 |
 
-### 5.3 已实现部分
+### 5.3 源码实现
 
-**文件**: `pkg/engine/engine.go`
+**文件**: `pkg/engine/internal_hook/hook_toolresult_level.go`
 
-已实施 `compressMessageContent` + `compressText`（LLMlingua 简化版）：
-- 对尾部倒数第 4 条之前的旧 user 消息做轻量压缩
-- 删除空行、移除 21 个常见停用词
-- 代码块内保留语法，仅压缩长注释
-- 压缩后长度未减少 30% 以上时回退到原文
+**实现方式**: `ToolResultLevelHook`（InternalHook，PhasePreRequest，Priority 38），在 `MessageFilterHook(40)` 之前执行。
 
 ```go
-func compressMessageContent(msg types.Message) types.Message
-func compressText(s string) string
+// 核心逻辑
+func (h *ToolResultLevelHook) Execute(ctx *HookContext) (*HookResult, error) {
+    // 1. 计算每条消息所属的轮次（从尾部倒数，以 assistant 为边界）
+    msgRound := computeMessageRounds(messages)
+
+    // 2. 对每条消息的 tool_result content blocks 按轮次年龄分级处理
+    for i := range messages {
+        round := msgRound[i]
+        level := determineLevel(round) // Level0/1/2/3
+        for _, b := range messages[i].Content {
+            if b.Type == ContentBlockToolResult {
+                degraded := degradeBlock(b, level)
+                // Level3 成功类返回 nil → 完全移除该 block
+            }
+        }
+    }
+}
 ```
 
-**待实现**:
-- `MicroCompactWithLevel` 四级年龄策略
-- 成功确认类消息 1 轮后替换为标记
+**降级规则详情**:
 
-### 5.4 关键优化: 成功确认类消息去重
+| 等级 | 成功类（IsError=false） | 错误类（IsError=true） |
+|------|------------------------|----------------------|
+| **Level 0** | 完整保留 | 完整保留 |
+| **Level 1** | 截断到 500 字符 + "... (truncated by level1)" | 完整保留（`PreserveErrors=true`） |
+| **Level 2** | `[历史操作结果: 成功]` | `[历史错误] 前300字符摘要` |
+| **Level 3** | `nil`（完全移除该 block） | `[历史错误摘要] 前200字符` |
 
-Write/Edit 的成功确认（"Successfully wrote..."）在 1 轮后可直接替换为：
+**安全设计**:
+- `IsError=true` 永远不被完全删除（最多 Level 2 标记化，保留 300 字符）
+- 以 `assistant + 其后的 tool_result user 消息` 为原子轮次判定
+- 配置可定制：`ToolResultLevelConfig` 支持调整各级保留轮数、截断阈值
+
+### 5.4 与现有压缩的协同
+
+ToolResultLevelHook(38) → MessageFilterHook(40) → MessageMetricsHook(48) 的执行顺序：
+
+1. **ToolResultLevelHook**: 先对古老 tool_result 做分级降级（从内容层面压缩）
+2. **MessageFilterHook**: 再删除不含 reasoning 的古老 assistant 原子单元（从消息数量层面压缩）
+3. **MessageMetricsHook**: 最后记录处理后的指标，用于观测效果
+
+**收益叠加**:
+- ToolResult 分级：对 tool_result 内容做年龄感知降级 → 节省 ~20-30%
+- MessageFilter：删除无 reasoning 的 assistant 单元 → 额外节省 ~10-20%
+- LLMlingua 压缩：对剩余古老 user message 做停用词压缩 → 额外节省 ~5-15%
+
+### 5.5 关键优化: 成功确认类消息去重
+
+Write/Edit 的成功确认（"Successfully wrote..."）在 Level 2 后被替换为：
 
 ```
-[历史操作] Write: path/to/file.go (已完成)
+[历史操作结果: 成功]
 ```
 
-这种压缩可在 `messagesToAPI` 的合并阶段完成，不修改原始消息。
+在 Level 3 后完全移除（因为同一条 user message 中可能还有其他 tool_result 需要保留，只移除该 block 不破坏消息结构）。
+
+这种压缩通过 Hook 实现，不修改 `messages` 原始数组（HookResult.Messages 返回新切片），引擎内部状态不受影响。
 
 ---
 
@@ -643,9 +889,10 @@ recalledFacts := e.MemoryStore.Retrieve(userIntent, 5) // 向量检索
 | Assistant 纯 tool_use 过滤 | -10~20% | 删除无 reasoning 的历史 turn | **已实施** |
 | LLMlingua 压缩 | -5~15% | 古老 tool_result 压缩 20-40% | **已实施** |
 | Read 哈希缓存 | -5~10% | 避免重复读取相同文件 | **已实施** |
+| **ToolResult 分级** | **-20~30%** | 成功确认类 1 轮后标记化，3 轮后移除 | **已实施** (hook_toolresult_level.go) |
+| **MessageMetrics** | **观测型** | 消息链/token/tool_result 分布采集 | **已实施** (hook_message_metrics.go) |
 | 消息滑动窗口 | -60~80% | 99 轮从 140K → 30K | 未实施 |
-| ToolResult 分级 | -20~30% | 移除大量历史成功确认 | 未实施 |
 | 会话状态摘要 | -10~15% | 用摘要替代早期消息链 | 未实施 |
 | 分层工具暴露 | -5~10% (初期) | 前 3 轮 schema 减半 | 未实施 |
-| **已实施合计** | **-30~50%** | **200K 上下文可支撑 100+ 轮** | |
-| **全部实施后合计** | **-70~90%** | **200K 上下文可支撑 200+ 轮** | |
+| **已实施合计** | **-50~70%** | **200K 上下文可支撑 150+ 轮** | |
+| **全部实施后合计** | **-75~90%** | **200K 上下文可支撑 250+ 轮** | |
