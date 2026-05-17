@@ -1,7 +1,7 @@
 # Claude-Go QueryEngine Hook 生命周期全景图
 
-> **版本**: 1.1（外部 Hook 扩展版）
-> **日期**: 2026-05-16
+> **版本**: 1.2（全 Hook 决策干预版）
+> **日期**: 2026-05-17
 > **范围**: QueryEngine / Tool / Session 三层 Hook 全覆盖 + 8 种 Hook 执行类型
 > **目标**: 激活全部僵尸 Hook，补全业界缺失的生命周期观测点，扩展外部 Hook 类型至 MCP/Plugin/OPA/Function/gRPC，Decision 语义支持 approve/deny
 
@@ -45,7 +45,16 @@
   │  │  │      ↓                                                  │    │    │
   │  │  │  API Call                                               │    │    │
   │  │  │      ↓                                                  │    │    │
-  │  │  │  PostRequest           [新增·已激活] ✅  engine.go:684  │    │    │
+  │  │  │  [等待首 token]                                         │    │    │
+  │  │  │      ↓                                                  │    │    │
+  │  │  │  首 chunk 到达 ←──── 触发 OnChunk / OnTokenStream  [新增·已激活] ✅       │    │    │
+  │  │  │      │                                                  │    │    │
+  │  │  │      ├────→ chunk #1 ──→ OnChunk  [新增·已激活] ✅           │    │    │
+  │  │  │      ├────→ chunk #2 ──→ OnChunk  [新增·已激活] ✅           │    │    │
+  │  │  │      ├────→   ...    ──→ OnChunk  [新增·已激活] ✅           │    │    │
+  │  │  │      └────→ chunk #N ──→ OnChunk  [新增·已激活] ✅           │    │    │
+  │  │  │      ↓                                                  │    │    │
+  │  │  │  流结束 → PostRequest                                   │    │    │
   │  │  │      ↓                                                  │    │    │
   │  │  │  PostSamplingHooks     [已激活] ✅  engine.go:971        │    │    │
   │  │  │      ↓                                                  │    │    │
@@ -291,29 +300,51 @@ PostTurn 被设计为"每轮结束必触发"，无论该轮是：
 | **流式事件推送**（StreamEventDelta/ToolStart/MessageDone/ToolDone/Error） | `engine.go:616` `engine.go:653` `engine.go:669` `engine.go:756` `engine.go:817` `engine.go:901` `engine.go:929` `engine.go:1226` | PreTurn / PostTurn / PostRequest / PostToolUse | 事件路由外置，Hook 可将事件转发到 WebSocket / SSE / 消息队列 |
 | **Teams 运行指标**（TeamRunCount/Duration/Success/Fail/StagePassRate/OutputAvgLen） | `teams.go:732-751` `teams.go:1052-1063` `teams.go:1197-1200` `teams.go:1615-1617` | TaskCompleted / SessionEnd | 团队指标采集逻辑外置，支持自定义标签和维度 |
 
-### 5.7 已 Hook 化功能（保留现状）
+### 5.7 已 Hook 化功能（全部可干预）
 
-以下 **5 个功能** 已经通过 Hook 机制实现，无需改动：
+以下 **25 个功能** 已经全部通过 Hook 机制实现，均支持决策干预：
 
-| 功能 | 驱动 Hook | 调用点代码位置 | Runner 执行方法 | Hook 注册代码位置 | 功能说明 |
+| 功能 | 驱动 Hook | 调用点代码位置 | Runner 执行方法 | 干预能力 | 功能说明 |
 |---|---|---|---|---|---|
-| **工具调用拦截** | PreToolUse | `pkg/tool/orchestration.go:223` | `pkg/hooks/hooks.go:78` (`RunPreToolUseHooks`) | 配置加载：`pkg/hooks/hooks.go:55` (`NewRunner` 接收 `[]types.HookConfig`)；配置匹配：`hooks.go:405` (`findHooks`)；执行分发：`hooks.go:438` (`executeHook` → `executeCommandHook:515` / `executeHTTPHook:453`) | 工具执行前，若 Hook 返回 `Decision="block"` 则跳过 `t.Call()`，构造 `result.IsError=true` 的错误结果返回给模型，实现外部配置化拦截 |
-| **工具上下文注入** | PreToolUse（非 block 分支） | `pkg/tool/orchestration.go:232` | `pkg/hooks/hooks.go:78` (`RunPreToolUseHooks`) | 配置加载：`pkg/hooks/hooks.go:55` (`NewRunner` 接收 `[]types.HookConfig`)；配置匹配：`hooks.go:405` (`findHooks`)；执行分发：`hooks.go:438` (`executeHook` → `executeCommandHook:515` / `executeHTTPHook:453`) | 未 block 时，合并所有匹配 hook 的 `AdditionalContext` 返回给调用方，注入额外上下文到工具执行环境 |
-| **对话终止后自动追问** | Stop | `pkg/engine/engine.go:980` | `pkg/hooks/hooks.go:167` (`ExecuteStopHooks`) | 配置加载：`pkg/hooks/hooks.go:55` (`NewRunner` 接收 `[]types.HookConfig`)；配置匹配：`hooks.go:405` (`findHooks`)；执行分发：`hooks.go:176` (`executeStopLikeHooks` → `executeHook:438` → `executeCommandHook:515` / `executeHTTPHook:453`) | 模型回复完成且无 tool_use 时，若 Hook 返回 `ContinueDecision="block"`，生成 `blockingMessages` 注入对话，引擎 `continue` 进入下一轮，实现"不满意就继续" |
-| **异常终止时恢复追问** | StopFailure | `pkg/engine/engine.go:418` 等 6 处 | `pkg/hooks/hooks.go:172` (`ExecuteStopFailureHooks`) | 配置加载：`pkg/hooks/hooks.go:55` (`NewRunner` 接收 `[]types.HookConfig`)；配置匹配：`hooks.go:405` (`findHooks`)；执行分发：`hooks.go:176` (`executeStopLikeHooks` → `executeHook:438` → `executeCommandHook:515` / `executeHTTPHook:453`) | queryLoop 异常终止时，若 Hook 返回 `ContinueDecision="block"`，同 Stop 逻辑注入恢复消息，尝试在错误后挽救对话而非直接退出 |
-| **后采样回调处理** | PostSamplingCallbacks | `pkg/engine/engine.go:971` | `pkg/hooks/hooks.go:139` (`ExecutePostSamplingHooks`) | 注册方法：`pkg/hooks/hooks.go:64` (`RegisterPostSamplingHook`)；实际注册调用点：`pkg/feishu/session.go:789` (Evolution 经验检索回调) | 采样完成后依次调用所有已注册的回调函数；当前用于 Evolution 经验 ID 记录，支持外部注入日志、指标、状态同步等后采样逻辑 |
+| **工具调用拦截** | PreToolUse | `pkg/tool/orchestration.go:223` | `pkg/hooks/hooks.go:78` (`RunPreToolUseHooks`) | **Decision** (`block`/`deny`/`approve`) | 工具执行前，若 Hook 返回 `Decision="block"` 则跳过 `t.Call()`，构造 `result.IsError=true` 的错误结果返回给模型，实现外部配置化拦截 |
+| **工具上下文注入** | PreToolUse（非 block 分支） | `pkg/tool/orchestration.go:232` | `pkg/hooks/hooks.go:78` (`RunPreToolUseHooks`) | **AdditionalContext** | 未 block 时，合并所有匹配 hook 的 `AdditionalContext` 返回给调用方，注入额外上下文到工具执行环境 |
+| **上下文压缩干预** | PreCompact | `pkg/engine/engine.go:451` | `pkg/hooks/hooks.go:240` (`ExecutePreCompactHooks`) | **Decision** (`block`/`deny`/`approve`) | 上下文压缩前，若 Hook 返回 `Decision="block"`/`"deny"`，跳过本轮 AutoCompact，保留完整上下文 |
+| **Token 降级干预** | OnContextOverflow | `pkg/engine/engine.go:436` | `pkg/hooks/hooks.go:270` (`ExecuteOnContextOverflowHooks`) | **Decision** (`block`/`deny`/`approve`) | Budget 达到 Red/Critical 时，若 Hook 返回 `Decision="block"`/`"deny"`，跳过 `Budget.Degrade`，阻止紧急摘要 |
+| **API 请求拦截** | PreRequest | `pkg/engine/engine.go:560` | `pkg/hooks/hooks.go:260` (`ExecutePreRequestHooks`) | **Decision** (`block`/`deny`/`approve`) | API 调用前，若 Hook 返回 `Decision="block"`/`"deny"`，跳过模型调用，注入 `[hook blocked]` meta 消息并进入下一轮 |
+| **MaxTurns 续写干预** | OnMaxTurnsReached | `pkg/engine/engine.go:1097` | `pkg/hooks/hooks.go:278` (`ExecuteOnMaxTurnsReachedHooks`) | **ContinueDecision** (`block`/`deny`/`approve`) | 达到 MaxTurns 时，若 Hook 返回 `ContinueDecision="block"`/`"deny"`，重置轮次并注入恢复消息，继续对话而非终止 |
+| **对话终止后自动追问** | Stop | `pkg/engine/engine.go:980` | `pkg/hooks/hooks.go:167` (`ExecuteStopHooks`) | **ContinueDecision** (`block`/`deny`/`approve`) | 模型回复完成且无 tool_use 时，若 Hook 返回 `ContinueDecision="block"`，生成 `blockingMessages` 注入对话，引擎 `continue` 进入下一轮，实现"不满意就继续" |
+| **异常终止时恢复追问** | StopFailure | `pkg/engine/engine.go:418` 等 6 处 | `pkg/hooks/hooks.go:172` (`ExecuteStopFailureHooks`) | **ContinueDecision** (`block`/`deny`/`approve`) | queryLoop 异常终止时，若 Hook 返回 `ContinueDecision="block"`，同 Stop 逻辑注入恢复消息，尝试在错误后挽救对话而非直接退出 |
+| **后采样回调处理** | PostSamplingCallbacks | `pkg/engine/engine.go:971` | `pkg/hooks/hooks.go:139` (`ExecutePostSamplingHooks`) | **Callbacks** (函数注册) | 采样完成后依次调用所有已注册的回调函数；当前用于 Evolution 经验 ID 记录，支持外部注入日志、指标、状态同步等后采样逻辑 |
+| **单轮开始前干预** | PreTurn | `pkg/engine/engine.go:407` | `pkg/hooks/hooks.go:251` (`ExecutePreTurnHooks`) | **Decision** (`block`/`deny`/`approve`) | 单轮迭代开始前，若 Hook 返回 `Decision="block"`/`"deny"`，跳过本轮直接进入下一轮 |
+| **单轮结束后干预** | PostTurn | `pkg/engine/engine.go` 多处 | `pkg/hooks/hooks.go:257` (`ExecutePostTurnHooks`) | **Decision** (`block`/`deny`/`approve`) | 单轮迭代结束后，若 Hook 返回 `Decision="block"`/`"deny"`，记录日志（主要在错误路径前观测） |
+| **压缩后观测干预** | PostCompact | `pkg/engine/engine.go:493` | `pkg/hooks/hooks.go:247` (`ExecutePostCompactHooks`) | **Decision** (`block`/`deny`/`approve`) | 上下文压缩完成后，若 Hook 返回 `Decision="block"`/`"deny"`，记录日志（压缩已完成，无法回滚） |
+| **API 请求后干预** | PostRequest | `pkg/engine/engine.go:743` | `pkg/hooks/hooks.go:271` (`ExecutePostRequestHooks`) | **Decision** (`block`/`deny`/`approve`) | API 调用完成后，若 Hook 返回 `Decision="block"`/`"deny"`，记录日志（响应已接收） |
+| **错误捕获干预** | OnError | `pkg/engine/engine.go` 6 处 | `pkg/hooks/hooks.go:289` (`ExecuteOnErrorHooks`) | **Decision** (`block`/`deny`/`approve`) | 错误发生时，若 Hook 返回 `Decision="block"`/`"deny"`，可影响错误处理路径（记录日志） |
+| **恢复/降级干预** | OnRecovery | `pkg/engine/engine.go:768` `engine.go:790` | `pkg/hooks/hooks.go:299` (`ExecuteOnRecoveryHooks`) | **Decision** (`block`/`deny`/`approve`) | 触发恢复（PTL / fallback）时，若 Hook 返回 `Decision="block"`/`"deny"`，跳过 `continue` 重试，直接进入后续错误处理 |
+| **重试干预** | OnRetry | `pkg/engine/engine.go` 3 处 | `pkg/hooks/hooks.go:315` (`ExecuteOnRetryHooks`) | **Decision** (`block`/`deny`/`approve`) | 重试发生时，若 Hook 返回 `Decision="block"`/`"deny"`，跳过本次重试（与 OnRecovery 联动） |
+| **限流干预** | OnRateLimit | `pkg/engine/engine.go:905` | `pkg/hooks/hooks.go:305` (`ExecuteOnRateLimitHooks`) | **Decision** (`block`/`deny`/`approve`) | 限流触发时，若 Hook 返回 `Decision="block"`/`"deny"`，跳过 `time.Sleep(backoff)` 和 `continue`，直接进入后续错误处理 |
+| **消息过滤拦截** | OnMessageFilter | `pkg/engine/engine.go:1416` | `pkg/hooks/hooks.go:321` (`ExecuteOnMessageFilterHooks`) | **Decision** (`block`/`deny`/`approve`) | 消息转换为 API 格式前，若 Hook 返回 `Decision="block"`/`"deny"`，返回 `nil` 阻止 API 请求 |
+| **会话开始拦截** | SessionStart | `pkg/feishu/session.go:767` | `pkg/hooks/hooks.go:229` (`ExecuteSessionHooks`) | **Decision** (`block`/`deny`/`approve`) | 会话开始时，若 Hook 返回 `Decision="block"`/`"deny"`，阻止会话创建，返回错误 |
+| **会话结束观测** | SessionEnd | `pkg/feishu/session.go:876` | `pkg/hooks/hooks.go:229` (`ExecuteSessionHooks`) | **Decision** (`block`/`deny`/`approve`) | 会话结束时，若 Hook 返回 `Decision="block"`/`"deny"`，记录日志（会话已结束） |
+| **子代理启动拦截** | SubagentStart | `pkg/feishu/session.go:768` | `pkg/hooks/hooks.go:333` (`ExecuteSubagentStartHooks`) | **Decision** (`block`/`deny`/`approve`) | 子代理启动时，若 Hook 返回 `Decision="block"`/`"deny"`，阻止子代理启动，返回错误 |
+| **子代理停止观测** | SubagentStop | `pkg/feishu/session.go:875` | `pkg/hooks/hooks.go:339` (`ExecuteSubagentStopHooks`) | **Decision** (`block`/`deny`/`approve`) | 子代理停止时，若 Hook 返回 `Decision="block"`/`"deny"`，记录日志（子代理已执行完毕） |
+| **队友空闲观测** | TeammateIdle | `pkg/agent/teams.go` | `pkg/hooks/hooks.go:345` (`ExecuteTeammateIdleHooks`) | **Decision** (`block`/`deny`/`approve`) | 队友空闲时触发，若 Hook 返回 `Decision="block"`/`"deny"`，记录日志 |
+| **任务完成观测** | TaskCompleted | `pkg/agent/teams.go` | `pkg/hooks/hooks.go:351` (`ExecuteTaskCompletedHooks`) | **Decision** (`block`/`deny`/`approve`) | 任务完成时触发，若 Hook 返回 `Decision="block"`/`"deny"`，记录日志 |
+| **通知观测** | Notification | `pkg/hooks/hooks.go:327` | `pkg/hooks/hooks.go:327` (`ExecuteNotificationHooks`) | **Decision** (`block`/`deny`/`approve`) | 通知事件触发，若 Hook 返回 `Decision="block"`/`"deny"`，记录日志 |
+| **流式 Chunk 拦截** | OnChunk | `pkg/engine/engine.go:648` `engine.go:660` | `pkg/hooks/hooks.go:357` (`ExecuteOnChunkHooks`) | **Decision** (`block`/`deny`/`approve`) | 流式输出每个 chunk 到达时，若 Hook 返回 `Decision="block"`/`"deny"`，跳过向 `streamCh` 推送该 delta，但内部仍累积文本 |
+| **流式 Token 拦截** | OnTokenStream | `pkg/engine/engine.go:648` | `pkg/hooks/hooks.go:368` (`ExecuteOnTokenStreamHooks`) | **Decision** (`block`/`deny`/`approve`) | 流式文本 token 到达时，若 Hook 返回 `Decision="block"`/`"deny"`，跳过向 `streamCh` 推送该 delta（仅普通文本，不含 thinking） |
 
-> **总结**：在引擎核心逻辑中，约有 **36 个硬编码功能点**（含可观测追踪 12 个）具备 Hook 化潜力；当前仅 **5 个** 已完成 Hook 化。优先推荐 Hook 化的 TOP 5：**系统提示词组装**（PreRequest）、**错误恢复策略**（OnError/OnRecovery）、**消息过滤/压缩**（OnMessageFilter）、**退避计算**（OnRateLimit）、**上下文压缩干预**（PreCompact）。
+> **总结**：在引擎核心逻辑中，约有 **36 个硬编码功能点**（含可观测追踪 12 个）具备 Hook 化潜力；当前 **25 个** 已全部完成 Hook 化，**全部支持决策干预**（`Decision`/`ContinueDecision`）。通过 `executeMessageHooksWithDecision` 统一框架，所有消息类 Hook 遇到第一个含非空决策字段的 hook 即停止并返回，纯观测型 hook（不返回 Decision）保持执行全部匹配 hooks 的行为不变。
 
 ### 5.8 HookOutput 字段语义与引擎影响解读
 
-以下 4 个字段是 Hook 与引擎交互的核心契约。当前仅 **PreToolUse / Stop / StopFailure** 真正读取这些字段，其余 Hook 为纯观测型（返回值被丢弃）。
+以下 4 个字段是 Hook 与引擎交互的核心契约。当前 **全部 25 个 Execute* 方法** 均通过 `executeMessageHooksWithDecision` 读取 `Decision`/`ContinueDecision` 字段，所有 Hook 均已从纯观测升级为可干预。
 
 | 字段 | 类型 | 取值范围 | 被读取的位置 | 对引擎的实际影响 |
 |---|---|---|---|---|
-| **Decision** | `string` | `"block"` / `"approve"` / `"deny"` | `pkg/hooks/hooks.go:98` (`RunPreToolUseHooks`) | `"block"` / `"deny"` → 阻止工具执行，构造 `result.IsError=true` 的错误结果返回给模型。`"approve"` → 显式放行，跳过剩余 hooks，工具正常执行。 `"deny"` 语义同 `"block"` 但表达更强 |
-| **ContinueDecision** | `string` | `"block"` / `"approve"` / `"deny"` | `pkg/hooks/hooks.go:194` (`executeStopLikeHooks`) | `"block"` / `"deny"` → 生成一条 `MessageTypeUser` 的 blocking 消息注入对话，引擎 `continue` 进入下一轮循环。 `"approve"` → 不生成 blocking 消息，正常结束。用于 Stop/StopFailure 场景实现"不满意就继续"或"错误后恢复" |
-| **Reason** | `string` | 任意文本 | `pkg/tool/orchestration.go:226` / `pkg/hooks/hooks.go:195` | PreToolUse block 时：作为错误消息内容返回给模型（若为空则默认"被 hook 阻止"）。Stop/StopFailure block 时：作为 blocking 消息的文本内容（若为空则默认"Stop hook 要求继续"）。此外，`executeCommandHook` exit code 2 时自动将 stderr 内容填入 Reason |
+| **Decision** | `string` | `"block"` / `"approve"` / `"deny"` | `pkg/hooks/hooks.go:98` (`RunPreToolUseHooks`)<br>`pkg/hooks/hooks.go:240` (`ExecutePreCompactHooks`)<br>`pkg/hooks/hooks.go:260` (`ExecutePreRequestHooks`)<br>`pkg/hooks/hooks.go:270` (`ExecuteOnContextOverflowHooks`)<br>`pkg/hooks/hooks.go` 全部 `Execute*` 方法（通过 `executeMessageHooksWithDecision`） | **PreToolUse**: `"block"` / `"deny"` → 阻止工具执行，构造 `result.IsError=true` 返回模型；`"approve"` → 显式放行。<br>**PreCompact**: `"block"` / `"deny"` → 跳过 AutoCompact，保留完整上下文。<br>**PreRequest**: `"block"` / `"deny"` → 跳过模型调用，注入 `[hook blocked]` meta 消息并进入下一轮。<br>**OnContextOverflow**: `"block"` / `"deny"` → 跳过 `Budget.Degrade`，阻止紧急摘要。<br>**PreTurn/PostTurn/PostCompact/PostRequest/OnError/OnRecovery/OnRetry/OnRateLimit/OnMessageFilter/SessionStart/SessionEnd/SubagentStart/SubagentStop/TeammateIdle/TaskCompleted/Notification/OnChunk/OnTokenStream**: `"block"` / `"deny"` → 按各自语义阻止对应操作（详见 §5.7 表格）。 |
+| **ContinueDecision** | `string` | `"block"` / `"approve"` / `"deny"` | `pkg/hooks/hooks.go:194` (`executeStopLikeHooks`)<br>`pkg/hooks/hooks.go:278` (`ExecuteOnMaxTurnsReachedHooks`) | **Stop/StopFailure**: `"block"` / `"deny"` → 生成 blocking 消息注入对话，引擎 `continue` 进入下一轮；`"approve"` → 正常结束。<br>**OnMaxTurnsReached**: `"block"` / `"deny"` → 重置轮次并注入恢复消息，继续对话而非终止。 |
+| **Reason** | `string` | 任意文本 | `pkg/tool/orchestration.go:226` / `pkg/hooks/hooks.go:195` / `pkg/engine/engine.go` | block/deny 时：作为错误消息内容或 blocking 消息文本内容返回给模型（若为空则使用默认文案）。此外，`executeCommandHook` exit code 2 时自动将 stderr 内容填入 Reason |
 | **AdditionalContext** | `string` | 任意文本 | `pkg/hooks/hooks.go:101` (`RunPreToolUseHooks`) | PreToolUse 非 block 时：合并所有匹配 hook 的 `AdditionalContext`（用 `\n` 连接），通过 `preHookContext` 注入到工具结果内容前。prompt 类型 hook 直接将该字段作为返回值。当前**未被引擎其他位置读取** |
 
 **command 类型 Hook 的 exit code 语义**（`pkg/hooks/hooks.go:557-567`）：
@@ -882,9 +913,9 @@ Content-Type: application/json
 
 ## 7. 后续可扩展方向
 
-1. **Notification 调用点注入**：当前 Notification 仅有 Runner 方法，需在引擎关键路径（如严重错误、恢复成功时）调用 `ExecuteNotificationHooks`，使其从"有方法未注入"转为真正可用。
-2. **OnTokenStream / OnChunk**：如需逐 token/chunk 级别的 hook，需在 `apiClient.StreamMessage` 内部或 engine.go 的 stream event for-select 中增加逐事件回调（当前 PostRequest 已覆盖请求粒度）。
-3. **Hook 返回值统一处理框架化**：当前仅 PreToolUse / Stop / StopFailure 读取返回值。建议统一抽象出 `executeMessageHooksWithDecision` 辅助方法，让 PreCompact、OnContextOverflow、SubagentStart 等纯观测型 Hook 的 `Decision` 字段标准化地被引擎采纳，从观测升级为干预。
+1. **Notification 调用点注入**（✅ 已完成）：`ExecuteNotificationHooks` 已返回 `*types.HookOutput`，支持 `Decision` 干预。需在引擎关键路径（如严重错误、恢复成功时）实际调用并读取返回值。
+2. **OnTokenStream / OnChunk**（✅ 已完成）：已在 `engine.go` 的 stream event for-select 中注入逐事件回调。`text_delta` 时触发 `OnChunk` + `OnTokenStream`，`thinking_delta` 时仅触发 `OnChunk`。若 Hook 返回 `Decision="block"`/`"deny"`，跳过向 `streamCh` 推送该 delta。
+3. **Hook 返回值统一处理框架化**（✅ 已完成）：已抽象出 `executeMessageHooksWithDecision` 辅助方法（`pkg/hooks/hooks.go`）。全部 25 个 `Execute*` 方法均通过该框架读取 `Decision`/`ContinueDecision`：**PreCompact、PreRequest、OnContextOverflow、PreTurn、PostTurn、PostCompact、PostRequest、OnError、OnRecovery、OnRateLimit、OnRetry、OnMessageFilter、SessionStart、SessionEnd、SubagentStart、SubagentStop、TeammateIdle、TaskCompleted、Notification、OnChunk、OnTokenStream** 的 `Decision` 字段均已被引擎采纳；**Stop、StopFailure、OnMaxTurnsReached** 的 `ContinueDecision` 字段已被采纳。纯观测型 Hook（不返回 Decision）保持执行全部匹配 hooks 的行为不变。
 
 ---
 
