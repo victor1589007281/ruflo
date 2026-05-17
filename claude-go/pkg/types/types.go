@@ -288,6 +288,8 @@ const (
 	HookEventOnRateLimit       HookEvent = "OnRateLimit"
 	HookEventOnRetry           HookEvent = "OnRetry"
 	HookEventOnMessageFilter   HookEvent = "OnMessageFilter"
+	HookEventOnChunk           HookEvent = "OnChunk"
+	HookEventOnTokenStream     HookEvent = "OnTokenStream"
 )
 
 // HookType 定义 hook 的执行方式。
@@ -358,6 +360,11 @@ type HookInput struct {
 	Role        string `json:"role,omitempty"`
 	TaskID      string `json:"task_id,omitempty"`
 	Success     bool   `json:"success,omitempty"`
+
+	// 流式输出相关字段 (OnChunk / OnTokenStream)
+	ChunkText  string `json:"chunk_text,omitempty"`
+	BlockIndex int    `json:"block_index,omitempty"`
+	IsThinking bool   `json:"is_thinking,omitempty"`
 }
 
 // HookOutput hook 执行后的输出

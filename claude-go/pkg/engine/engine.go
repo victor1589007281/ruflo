@@ -31,6 +31,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/hooks"
+	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
@@ -404,7 +405,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 	for {
 		// PreTurn Hook: 单轮开始
 		if e.HookRunner != nil {
-			e.HookRunner.ExecutePreTurnHooks(messages, turnCount)
+			hookOut := e.HookRunner.ExecutePreTurnHooks(messages, turnCount)
+			if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+				logging.For("engine").Warn("PreTurn blocked by hook", "reason", hookOut.Reason)
+				continue
+			}
 		}
 
 		// ============================================================
@@ -432,12 +437,19 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		if e.Budget != nil {
 			level := e.Budget.Level(messages)
 			if level >= BudgetRed {
+				skipDegrade := false
 				if e.HookRunner != nil {
-					e.HookRunner.ExecuteOnContextOverflowHooks(messages, int(level))
+					hookOut := e.HookRunner.ExecuteOnContextOverflowHooks(messages, int(level))
+					if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+						logging.For("engine").Warn("OnContextOverflow blocked degrade by hook", "reason", hookOut.Reason)
+						skipDegrade = true
+					}
 				}
-				messages = e.Budget.Degrade(messages, level)
-				if e.Metrics != nil {
-					e.Metrics.RecordBudgetDegrade(int(level))
+				if !skipDegrade {
+					messages = e.Budget.Degrade(messages, level)
+					if e.Metrics != nil {
+						e.Metrics.RecordBudgetDegrade(int(level))
+					}
 				}
 			}
 		}
@@ -447,33 +459,43 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 对应 TS: queryLoop 中的 deps.autocompact(...) 调用
 		// ============================================================
 		if e.Compactor != nil {
+			skipCompact := false
 			if e.HookRunner != nil {
-				e.HookRunner.ExecutePreCompactHooks(messages)
+				hookOut := e.HookRunner.ExecutePreCompactHooks(messages)
+				if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+					logging.For("engine").Warn("PreCompact blocked by hook", "reason", hookOut.Reason)
+					skipCompact = true
+				}
 			}
-			compacted, err := e.Compactor.AutoCompact(ctx, messages, currentModel)
-			if err == nil && compacted != nil {
-				// PreCompact 蒸馏: 提取关键事实到 L1 + L2
-				cutoff := len(messages) - 6
-				if cutoff > 0 {
-					facts := e.Compactor.SmartExtractKeyFacts(ctx, messages[:cutoff])
-					// L1: TieredStore
-					if e.MemoryStore != nil {
-						for _, fact := range facts {
-							e.MemoryStore.Add(&memory.MemoryEntry{
-								Content:    fact,
-								Source:     "pre_compact",
-								Importance: 0.7,
-							})
+			if !skipCompact {
+				compacted, err := e.Compactor.AutoCompact(ctx, messages, currentModel)
+				if err == nil && compacted != nil {
+					// PreCompact 蒸馏: 提取关键事实到 L1 + L2
+					cutoff := len(messages) - 6
+					if cutoff > 0 {
+						facts := e.Compactor.SmartExtractKeyFacts(ctx, messages[:cutoff])
+						// L1: TieredStore
+						if e.MemoryStore != nil {
+							for _, fact := range facts {
+								e.MemoryStore.Add(&memory.MemoryEntry{
+									Content:    fact,
+									Source:     "pre_compact",
+									Importance: 0.7,
+								})
+							}
+						}
+						// L2: FactStore (通过 Ingestor 分类)
+						if e.Ingestor != nil && len(facts) > 0 {
+							e.Ingestor.IngestFacts(facts, "pre_compact")
 						}
 					}
-					// L2: FactStore (通过 Ingestor 分类)
-					if e.Ingestor != nil && len(facts) > 0 {
-						e.Ingestor.IngestFacts(facts, "pre_compact")
+					messages = compacted
+					if e.HookRunner != nil {
+						hookOut := e.HookRunner.ExecutePostCompactHooks(messages)
+							if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+								logging.For("engine").Warn("PostCompact blocked by hook", "reason", hookOut.Reason)
+							}
 					}
-				}
-				messages = compacted
-				if e.HookRunner != nil {
-					e.HookRunner.ExecutePostCompactHooks(messages)
 				}
 			}
 		}
@@ -557,7 +579,22 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 对应 TS: while(attemptWithFallback) + for await(callModel(...))
 		// ============================================================
 		if e.HookRunner != nil {
-			e.HookRunner.ExecutePreRequestHooks(messages, currentModel)
+			hookOut := e.HookRunner.ExecutePreRequestHooks(messages, currentModel)
+			if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+				reason := hookOut.Reason
+				if reason == "" {
+					reason = "PreRequest hook 阻止了模型调用"
+				}
+				messages = append(messages, types.Message{
+					Type: types.MessageTypeUser,
+					Content: []types.ContentBlock{{
+						Type: types.ContentBlockText,
+						Text: fmt.Sprintf("[hook blocked] %s", reason),
+					}},
+					IsMeta: true,
+				})
+				continue
+			}
 		}
 		apiMessages := messagesToAPI(messages, e.HookRunner)
 		allTools := e.Tools.APITools()
@@ -612,7 +649,21 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					switch event.Delta.Type {
 					case "text_delta":
 						currentText.WriteString(event.Delta.Text)
-						if streamCh != nil {
+						skipStream := false
+						if e.HookRunner != nil {
+							hookOut := e.HookRunner.ExecuteOnChunkHooks(event.Delta.Text, event.Index, false)
+							if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+								logging.For("engine").Warn("OnChunk blocked stream delta by hook", "reason", hookOut.Reason)
+								skipStream = true
+							} else {
+								hookOut = e.HookRunner.ExecuteOnTokenStreamHooks(event.Delta.Text, event.Index)
+								if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+									logging.For("engine").Warn("OnTokenStream blocked stream delta by hook", "reason", hookOut.Reason)
+									skipStream = true
+								}
+							}
+						}
+						if streamCh != nil && !skipStream {
 							streamCh <- types.StreamEvent{
 								Kind:       types.StreamEventDelta,
 								DeltaText:  event.Delta.Text,
@@ -623,7 +674,15 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 						currentToolInput.WriteString(event.Delta.PartialJSON)
 					case "thinking_delta":
 						currentText.WriteString(event.Delta.Thinking)
-						if streamCh != nil {
+						skipStream := false
+						if e.HookRunner != nil {
+							hookOut := e.HookRunner.ExecuteOnChunkHooks(event.Delta.Thinking, event.Index, true)
+							if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+								logging.For("engine").Warn("OnChunk blocked thinking delta by hook", "reason", hookOut.Reason)
+								skipStream = true
+							}
+						}
+						if streamCh != nil && !skipStream {
 							streamCh <- types.StreamEvent{
 								Kind:       types.StreamEventDelta,
 								DeltaText:  event.Delta.Thinking,
@@ -705,11 +764,22 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					if e.Metrics != nil {
 						e.Metrics.RecordError(int(ErrFamilyPTL))
 					}
+					skipRetry := false
 					if e.HookRunner != nil {
-						e.HookRunner.ExecuteOnRecoveryHooks(messages, "ptl_reactive_compact")
-						e.HookRunner.ExecuteOnRetryHooks(messages, "ptl_reactive_compact", 0)
+						hookOut := e.HookRunner.ExecuteOnRecoveryHooks(messages, "ptl_reactive_compact")
+						if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+							logging.For("engine").Warn("OnRecovery blocked ptl retry by hook", "reason", hookOut.Reason)
+							skipRetry = true
+						}
+						hookOut = e.HookRunner.ExecuteOnRetryHooks(messages, "ptl_reactive_compact", 0)
+						if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+							logging.For("engine").Warn("OnRetry blocked ptl retry by hook", "reason", hookOut.Reason)
+							skipRetry = true
+						}
 					}
-					continue // 压缩后重试
+					if !skipRetry {
+						continue // 压缩后重试
+					}
 				}
 			}
 
@@ -727,11 +797,22 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 						}},
 					})
 				}
+				skipRetry := false
 				if e.HookRunner != nil {
-					e.HookRunner.ExecuteOnRecoveryHooks(messages, "fallback_model_switch")
-					e.HookRunner.ExecuteOnRetryHooks(messages, "fallback_model_switch", 0)
+					hookOut := e.HookRunner.ExecuteOnRecoveryHooks(messages, "fallback_model_switch")
+					if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+						logging.For("engine").Warn("OnRecovery blocked fallback by hook", "reason", hookOut.Reason)
+						skipRetry = true
+					}
+					hookOut = e.HookRunner.ExecuteOnRetryHooks(messages, "fallback_model_switch", 0)
+					if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+						logging.For("engine").Warn("OnRetry blocked fallback by hook", "reason", hookOut.Reason)
+						skipRetry = true
+					}
 				}
-				continue
+				if !skipRetry {
+					continue
+				}
 			}
 
 			// ---- G4: ErrorClassifier 路径 (启用时替代原 consecutive 计数) ----
@@ -842,12 +923,23 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			var overloadErr *api.OverloadedError
 			if errors.As(streamErr, &overloadErr) {
 				backoff := time.Duration(consecutiveErrors) * 2 * time.Second
+				skipRetry := false
 				if e.HookRunner != nil {
-					e.HookRunner.ExecuteOnRateLimitHooks(streamErr, backoff)
-					e.HookRunner.ExecuteOnRetryHooks(messages, "overloaded", consecutiveErrors)
+					hookOut := e.HookRunner.ExecuteOnRateLimitHooks(streamErr, backoff)
+					if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+						logging.For("engine").Warn("OnRateLimit blocked retry by hook", "reason", hookOut.Reason)
+						skipRetry = true
+					}
+					hookOut = e.HookRunner.ExecuteOnRetryHooks(messages, "overloaded", consecutiveErrors)
+					if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+						logging.For("engine").Warn("OnRetry blocked overloaded retry by hook", "reason", hookOut.Reason)
+						skipRetry = true
+					}
 				}
-				time.Sleep(backoff)
-				continue
+				if !skipRetry {
+					time.Sleep(backoff)
+					continue
+				}
 			}
 
 			if e.HookRunner != nil {
@@ -1094,7 +1186,23 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 			e.recordTrajectoryIfNeeded(turnUserIntent, turnPlanMsgs, turnToolSigs, "max_turns", false, turnStart)
 			if e.HookRunner != nil {
-				e.HookRunner.ExecuteOnMaxTurnsReachedHooks(messages, turnCount)
+				hookOut := e.HookRunner.ExecuteOnMaxTurnsReachedHooks(messages, turnCount)
+				if hookOut != nil && (hookOut.ContinueDecision == "block" || hookOut.ContinueDecision == "deny") {
+					reason := hookOut.Reason
+					if reason == "" {
+						reason = "OnMaxTurnsReached hook 要求继续对话"
+					}
+					messages = append(messages, types.Message{
+						Type: types.MessageTypeUser,
+						Content: []types.ContentBlock{{
+							Type: types.ContentBlockText,
+							Text: reason,
+						}},
+						IsMeta: true,
+					})
+					turnCount = 0
+					continue
+				}
 				e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
 			}
 			return messages, types.Terminal{Reason: "max_turns"}
@@ -1304,8 +1412,13 @@ func maxInt(a, b int) int {
 // 作为独立 user 消息存在时，必须合并到同一个 user 消息中。
 func messagesToAPI(messages []types.Message, hookRunner *hooks.Runner) []types.APIMessage {
 	// OnMessageFilter Hook: 消息过滤前观测点
+	// OnMessageFilter Hook: 消息过滤前观测点
 	if hookRunner != nil {
-		hookRunner.ExecuteOnMessageFilterHooks(messages)
+		hookOut := hookRunner.ExecuteOnMessageFilterHooks(messages)
+		if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+			logging.For("engine").Warn("OnMessageFilter blocked API request by hook", "reason", hookOut.Reason)
+			return nil
+		}
 	}
 
 	// 优化1: 过滤不含 reasoning 的古老 assistant + tool_result 原子单元

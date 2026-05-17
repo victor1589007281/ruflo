@@ -225,152 +225,148 @@ func (r *Runner) executeStopLikeHooks(event types.HookEvent, messages []types.Me
 	return blockingMessages
 }
 
-// ExecuteSessionHooks 执行会话生命周期 hooks
-func (r *Runner) ExecuteSessionHooks(event types.HookEvent) {
-	hooks := r.findHooks(event, "")
-	for _, h := range hooks {
-		_, _ = r.executeHook(h, types.HookInput{
-			Event:     event,
-			SessionID: r.sessionID,
-		})
-	}
+// ExecuteSessionHooks 执行会话生命周期 hooks。
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteSessionHooks(event types.HookEvent) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(event, nil, types.HookInput{})
 }
 
 // ExecutePreCompactHooks 执行上下文压缩前 hooks。
-func (r *Runner) ExecutePreCompactHooks(messages []types.Message) {
-	r.executeMessageHooks(types.HookEventPreCompact, messages)
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecutePreCompactHooks(messages []types.Message) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventPreCompact, messages, types.HookInput{})
 }
 
 // ExecutePostCompactHooks 执行上下文压缩后 hooks。
-func (r *Runner) ExecutePostCompactHooks(messages []types.Message) {
-	r.executeMessageHooks(types.HookEventPostCompact, messages)
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecutePostCompactHooks(messages []types.Message) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventPostCompact, messages, types.HookInput{})
 }
 
 // ExecutePreTurnHooks 执行单轮开始前 hooks。
-func (r *Runner) ExecutePreTurnHooks(messages []types.Message, turnCount int) {
-	r.executeMessageHooksWithInput(types.HookEventPreTurn, messages, types.HookInput{TurnCount: turnCount})
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecutePreTurnHooks(messages []types.Message, turnCount int) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventPreTurn, messages, types.HookInput{TurnCount: turnCount})
 }
 
 // ExecutePostTurnHooks 执行单轮结束后 hooks。
-func (r *Runner) ExecutePostTurnHooks(messages []types.Message, turnCount int) {
-	r.executeMessageHooksWithInput(types.HookEventPostTurn, messages, types.HookInput{TurnCount: turnCount})
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecutePostTurnHooks(messages []types.Message, turnCount int) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventPostTurn, messages, types.HookInput{TurnCount: turnCount})
 }
 
 // ExecutePreRequestHooks 执行 API 请求前 hooks。
-func (r *Runner) ExecutePreRequestHooks(messages []types.Message, model string) {
-	r.executeMessageHooksWithInput(types.HookEventPreRequest, messages, types.HookInput{Model: model})
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecutePreRequestHooks(messages []types.Message, model string) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventPreRequest, messages, types.HookInput{Model: model})
 }
 
 // ExecutePostRequestHooks 执行 API 请求后 hooks。
-func (r *Runner) ExecutePostRequestHooks(messages []types.Message, model string) {
-	r.executeMessageHooksWithInput(types.HookEventPostRequest, messages, types.HookInput{Model: model})
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecutePostRequestHooks(messages []types.Message, model string) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventPostRequest, messages, types.HookInput{Model: model})
 }
 
 // ExecuteOnContextOverflowHooks 执行上下文溢出预警 hooks。
-func (r *Runner) ExecuteOnContextOverflowHooks(messages []types.Message, level int) {
-	r.executeMessageHooksWithInput(types.HookEventOnContextOverflow, messages, types.HookInput{BudgetLevel: level})
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnContextOverflowHooks(messages []types.Message, level int) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventOnContextOverflow, messages, types.HookInput{BudgetLevel: level})
 }
 
 // ExecuteOnMaxTurnsReachedHooks 执行到达最大轮次 hooks。
-func (r *Runner) ExecuteOnMaxTurnsReachedHooks(messages []types.Message, turnCount int) {
-	r.executeMessageHooksWithInput(types.HookEventOnMaxTurnsReached, messages, types.HookInput{TurnCount: turnCount})
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnMaxTurnsReachedHooks(messages []types.Message, turnCount int) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventOnMaxTurnsReached, messages, types.HookInput{TurnCount: turnCount})
 }
 
 // ExecuteOnErrorHooks 执行错误捕获 hooks。
-func (r *Runner) ExecuteOnErrorHooks(messages []types.Message, reason string, err error) {
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnErrorHooks(messages []types.Message, reason string, err error) *types.HookOutput {
 	in := types.HookInput{Reason: reason}
 	if err != nil {
 		in.ErrorMessage = err.Error()
 	}
-	r.executeMessageHooksWithInput(types.HookEventOnError, messages, in)
+	return r.executeMessageHooksWithDecision(types.HookEventOnError, messages, in)
 }
 
 // ExecuteOnRecoveryHooks 执行恢复/降级 hooks。
-func (r *Runner) ExecuteOnRecoveryHooks(messages []types.Message, reason string) {
-	r.executeMessageHooksWithInput(types.HookEventOnRecovery, messages, types.HookInput{Reason: reason})
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnRecoveryHooks(messages []types.Message, reason string) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventOnRecovery, messages, types.HookInput{Reason: reason})
 }
 
 // ExecuteOnRateLimitHooks 执行限流触发 hooks。
-func (r *Runner) ExecuteOnRateLimitHooks(err error, backoff time.Duration) {
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnRateLimitHooks(err error, backoff time.Duration) *types.HookOutput {
 	in := types.HookInput{BackoffMs: int(backoff.Milliseconds())}
 	if err != nil {
 		in.ErrorMessage = err.Error()
 	}
-	r.executeMessageHooksWithInput(types.HookEventOnRateLimit, nil, in)
+	return r.executeMessageHooksWithDecision(types.HookEventOnRateLimit, nil, in)
 }
 
 // ExecuteOnRetryHooks 执行重试 hooks。
-func (r *Runner) ExecuteOnRetryHooks(messages []types.Message, reason string, attempt int) {
-	r.executeMessageHooksWithInput(types.HookEventOnRetry, messages, types.HookInput{Reason: reason, TurnCount: attempt})
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnRetryHooks(messages []types.Message, reason string, attempt int) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventOnRetry, messages, types.HookInput{Reason: reason, TurnCount: attempt})
 }
 
 // ExecuteOnMessageFilterHooks 执行消息过滤 hooks。
-// 注意：当前仅做观测，不采纳 hook 对 Messages 的修改返回值，以避免破坏消息结构。
-func (r *Runner) ExecuteOnMessageFilterHooks(messages []types.Message) {
-	r.executeMessageHooks(types.HookEventOnMessageFilter, messages)
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnMessageFilterHooks(messages []types.Message) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventOnMessageFilter, messages, types.HookInput{})
 }
 
 // ExecuteNotificationHooks 执行通知类 hooks。
-func (r *Runner) ExecuteNotificationHooks(msg string) {
-	hooks := r.findHooks(types.HookEventNotification, "")
-	for _, h := range hooks {
-		_, _ = r.executeHook(h, types.HookInput{
-			Event:       types.HookEventNotification,
-			SessionID:   r.sessionID,
-			ErrorMessage: msg,
-		})
-	}
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteNotificationHooks(msg string) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventNotification, nil, types.HookInput{ErrorMessage: msg})
 }
 
 // ExecuteSubagentStartHooks 执行子代理启动 hooks。
-func (r *Runner) ExecuteSubagentStartHooks(role, prompt string) {
-	hooks := r.findHooks(types.HookEventSubagentStart, "")
-	for _, h := range hooks {
-		_, _ = r.executeHook(h, types.HookInput{
-			Event:     types.HookEventSubagentStart,
-			SessionID: r.sessionID,
-			Role:      role,
-			Reason:    prompt,
-		})
-	}
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteSubagentStartHooks(role, prompt string) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventSubagentStart, nil, types.HookInput{Role: role, Reason: prompt})
 }
 
 // ExecuteSubagentStopHooks 执行子代理停止 hooks。
-func (r *Runner) ExecuteSubagentStopHooks(role, result string) {
-	hooks := r.findHooks(types.HookEventSubagentStop, "")
-	for _, h := range hooks {
-		_, _ = r.executeHook(h, types.HookInput{
-			Event:      types.HookEventSubagentStop,
-			SessionID:  r.sessionID,
-			Role:       role,
-			ToolResult: result,
-		})
-	}
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteSubagentStopHooks(role, result string) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventSubagentStop, nil, types.HookInput{Role: role, ToolResult: result})
 }
 
 // ExecuteTeammateIdleHooks 执行队友空闲 hooks。
-func (r *Runner) ExecuteTeammateIdleHooks(teammate string) {
-	hooks := r.findHooks(types.HookEventTeammateIdle, "")
-	for _, h := range hooks {
-		_, _ = r.executeHook(h, types.HookInput{
-			Event:     types.HookEventTeammateIdle,
-			SessionID: r.sessionID,
-			Role:      teammate,
-		})
-	}
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteTeammateIdleHooks(teammate string) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventTeammateIdle, nil, types.HookInput{Role: teammate})
 }
 
 // ExecuteTaskCompletedHooks 执行任务完成 hooks。
-func (r *Runner) ExecuteTaskCompletedHooks(taskID string, success bool) {
-	hooks := r.findHooks(types.HookEventTaskCompleted, "")
-	for _, h := range hooks {
-		_, _ = r.executeHook(h, types.HookInput{
-			Event:     types.HookEventTaskCompleted,
-			SessionID: r.sessionID,
-			TaskID:    taskID,
-			Success:   success,
-		})
-	}
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteTaskCompletedHooks(taskID string, success bool) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventTaskCompleted, nil, types.HookInput{TaskID: taskID, Success: success})
+}
+
+// ExecuteOnChunkHooks 执行流式 chunk 输出 hooks。
+// 在每个 content_block_delta（text 或 thinking）时触发。
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnChunkHooks(chunkText string, blockIndex int, isThinking bool) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventOnChunk, nil, types.HookInput{
+		ChunkText:  chunkText,
+		BlockIndex: blockIndex,
+		IsThinking: isThinking,
+	})
+}
+
+// ExecuteOnTokenStreamHooks 执行流式 token 输出 hooks。
+// 在每个 text_delta（非 thinking）时触发。
+// 返回值：若 Hook 返回 Decision/ContinueDecision，则返回该 HookOutput；否则 nil。
+func (r *Runner) ExecuteOnTokenStreamHooks(tokenText string, blockIndex int) *types.HookOutput {
+	return r.executeMessageHooksWithDecision(types.HookEventOnTokenStream, nil, types.HookInput{
+		ChunkText:  tokenText,
+		BlockIndex: blockIndex,
+		IsThinking: false,
+	})
 }
 
 // RunPostToolUseFailureHooks 执行工具执行失败（Go-error 级）hooks。
@@ -395,16 +391,13 @@ func (r *Runner) RunPostToolUseFailureHooks(toolName string, input json.RawMessa
 	return nil
 }
 
-// executeMessageHooks 辅助方法：对消息类事件统一执行。
-func (r *Runner) executeMessageHooks(event types.HookEvent, messages []types.Message) {
-	r.executeMessageHooksWithInput(event, messages, types.HookInput{})
-}
-
-// executeMessageHooksWithInput 辅助方法：带自定义输入字段的消息类事件执行。
-func (r *Runner) executeMessageHooksWithInput(event types.HookEvent, messages []types.Message, base types.HookInput) {
+// executeMessageHooksWithDecision 决策感知执行框架。
+// 按配置顺序逐个执行 hooks，遇到第一个返回非空 Decision 或 ContinueDecision 的 hook 即停止并返回。
+// 适用于需要同步决策干预的场景（PreCompact、PreRequest、OnContextOverflow、OnMaxTurnsReached 等）。
+func (r *Runner) executeMessageHooksWithDecision(event types.HookEvent, messages []types.Message, base types.HookInput) *types.HookOutput {
 	hooks := r.findHooks(event, "")
 	if len(hooks) == 0 {
-		return
+		return nil
 	}
 	in := base
 	in.Event = event
@@ -413,8 +406,16 @@ func (r *Runner) executeMessageHooksWithInput(event types.HookEvent, messages []
 		in.Messages = messages
 	}
 	for _, h := range hooks {
-		_, _ = r.executeHook(h, in)
+		output, err := r.executeHook(h, in)
+		if err != nil || output == nil {
+			continue
+		}
+		// 只要有明确的决策字段就返回（block/deny/approve）
+		if output.Decision != "" || output.ContinueDecision != "" {
+			return output
+		}
 	}
+	return nil
 }
 
 // findHooks 查找匹配事件与 If 条件的 hooks

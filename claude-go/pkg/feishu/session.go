@@ -764,8 +764,14 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	permChecker := permissions.NewChecker(permMode)
 	hookRunner := hooks.NewRunner(r.sm.hookConfigs, "")
 	if hookRunner != nil {
-		hookRunner.ExecuteSessionHooks(types.HookEventSessionStart)
-		hookRunner.ExecuteSubagentStartHooks(r.role, userPrompt)
+		hookOut := hookRunner.ExecuteSessionHooks(types.HookEventSessionStart)
+		if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+			return "", fmt.Errorf("SessionStart blocked by hook: %s", hookOut.Reason)
+		}
+		hookOut = hookRunner.ExecuteSubagentStartHooks(r.role, userPrompt)
+		if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+			return "", fmt.Errorf("SubagentStart blocked by hook: %s", hookOut.Reason)
+		}
 	}
 	compactor := compact.NewCompactor(apiClient, contextWindow)
 	promptMgr := prompt.NewManager(r.sm.config.Cwd)
@@ -866,7 +872,10 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 
 	_ = start // used by evolution trajectory in workflow layer
 	if hookRunner != nil {
-		hookRunner.ExecuteSubagentStopHooks(r.role, result)
+		hookOut := hookRunner.ExecuteSubagentStopHooks(r.role, result)
+		if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
+			// SubagentStop blocked: still return result but log the reason
+		}
 		hookRunner.ExecuteSessionHooks(types.HookEventSessionEnd)
 	}
 	return result, nil
