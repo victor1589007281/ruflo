@@ -237,7 +237,12 @@ func (t *CodeIntelQueryTool) Description() string {
 - impact: dependency radius of a file
 - communities: Leiden communities + god nodes in a shard
 - god_nodes: highest-degree nodes in a shard
-- cross_shard: cross-shard references of a symbol`
+- cross_shard: cross-shard references of a symbol
+	- find_refs: all reference locations of a symbol
+	- path: shortest path between two symbols
+	- surprises: anomalous edges (cross-community / high-weight)
+	- native_grep: real-time grep fallback
+	- native_read: real-time file read fallback`
 }
 
 func (t *CodeIntelQueryTool) InputSchema() json.RawMessage {
@@ -245,7 +250,7 @@ func (t *CodeIntelQueryTool) InputSchema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"repo_path": {"type": "string", "description": "Absolute path to the indexed repository."},
-			"query_type": {"type": "string", "enum": ["navigate", "impact", "communities", "god_nodes", "cross_shard"]},
+			"query_type": {"type": "string", "enum": ["navigate", "impact", "find_refs", "communities", "god_nodes", "path", "surprises", "cross_shard", "native_grep", "native_read"]},
 			"shard": {"type": "string"},
 			"symbol": {"type": "string"},
 			"file_path": {"type": "string"},
@@ -267,8 +272,9 @@ func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ 
 		FilePath    string `json:"file_path,omitempty"`
 		Depth       int    `json:"depth,omitempty"`
 		TopN        int    `json:"top_n,omitempty"`
-		TargetShard string `json:"target_shard,omitempty"`
-		Branch      string `json:"branch,omitempty"`
+		TargetShard  string `json:"target_shard,omitempty"`
+		TargetSymbol string `json:"target_symbol,omitempty"`
+		Branch       string `json:"branch,omitempty"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
@@ -292,6 +298,16 @@ func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ 
 		qr, err = engine.GodNodes(in.Branch, in.Shard, in.TopN)
 	case "cross_shard":
 		qr, err = engine.CrossShard(in.Branch, codeintel.CrossShardQuery{Symbol: in.Symbol, TargetShard: in.TargetShard})
+	case "find_refs":
+		qr, err = engine.FindRefs(in.Branch, codeintel.NavigateQuery{Symbol: in.Symbol, Shard: in.Shard})
+	case "path":
+		qr, err = engine.Path(in.Branch, in.Symbol, in.TargetSymbol)
+	case "surprises":
+		qr, err = engine.Surprises(in.Branch, in.Shard, in.TopN)
+	case "native_grep":
+		qr, err = engine.Native.Grep(in.Symbol, codeintel.GrepOptions{Dir: in.FilePath, MaxResults: in.TopN})
+	case "native_read":
+		qr, err = engine.Native.ReadFile(in.FilePath, codeintel.ReadOptions{Offset: in.Depth, Limit: in.TopN})
 	default:
 		return &tool.ToolResult{Content: fmt.Sprintf("unknown query_type: %s", in.QueryType), IsError: true}, nil
 	}

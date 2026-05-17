@@ -298,8 +298,9 @@ func (s *MCPServer) toolQuery(args json.RawMessage) (string, error) {
 		FilePath    string          `json:"file_path,omitempty"`
 		Depth       int             `json:"depth,omitempty"`
 		TopN        int             `json:"top_n,omitempty"`
-		TargetShard string          `json:"target_shard,omitempty"`
-		Branch      string          `json:"branch,omitempty"`
+		TargetShard  string          `json:"target_shard,omitempty"`
+		TargetSymbol string          `json:"target_symbol,omitempty"`
+		Branch       string          `json:"branch,omitempty"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", err
@@ -322,6 +323,16 @@ func (s *MCPServer) toolQuery(args json.RawMessage) (string, error) {
 		qr, err = s.Engine.GodNodes(branch, in.Shard, in.TopN)
 	case "cross_shard":
 		qr, err = s.Engine.CrossShard(branch, CrossShardQuery{Symbol: in.Symbol, TargetShard: in.TargetShard})
+	case "find_refs":
+		qr, err = s.Engine.FindRefs(branch, NavigateQuery{Symbol: in.Symbol, Shard: in.Shard})
+	case "path":
+		qr, err = s.Engine.Path(branch, in.Symbol, in.TargetSymbol)
+	case "surprises":
+		qr, err = s.Engine.Surprises(branch, in.Shard, in.TopN)
+	case "native_grep":
+		qr, err = s.Engine.Native.Grep(in.Symbol, GrepOptions{Dir: in.FilePath, MaxResults: in.TopN})
+	case "native_read":
+		qr, err = s.Engine.Native.ReadFile(in.FilePath, ReadOptions{Offset: in.Depth, Limit: in.TopN})
 	default:
 		return "", fmt.Errorf("unknown query_type: %s", in.QueryType)
 	}
@@ -397,8 +408,8 @@ func (s *MCPServer) listTools() []mcpToolDef {
 		},
 		{
 			Name:        "code_intel_query",
-			Description: "Query the code intelligence graph. Supports: navigate, impact, communities, god_nodes, cross_shard.",
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"query_type":{"type":"string","enum":["navigate","impact","communities","god_nodes","cross_shard"]},"shard":{"type":"string"},"symbol":{"type":"string"},"file_path":{"type":"string"},"depth":{"type":"integer"},"top_n":{"type":"integer"},"target_shard":{"type":"string"},"branch":{"type":"string"}},"required":["query_type"]}`),
+			Description: "Query the code intelligence graph. Supports: navigate, impact, find_refs, communities, god_nodes, path, surprises, cross_shard, native_grep, native_read.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"query_type":{"type":"string","enum":["navigate","impact","find_refs","communities","god_nodes","path","surprises","cross_shard","native_grep","native_read"]},"shard":{"type":"string"},"symbol":{"type":"string"},"file_path":{"type":"string"},"depth":{"type":"integer"},"top_n":{"type":"integer"},"target_shard":{"type":"string"},"target_symbol":{"type":"string"},"branch":{"type":"string"}},"required":["query_type"]}`),
 		},
 		{
 			Name:        "code_intel_branch",

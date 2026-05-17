@@ -1,246 +1,111 @@
-// query.go — 查询引擎。
+// query.go — 三引擎查询路由器。
 //
-// 提供结构查询（类 GitNexus）和语义查询（类 Graphify）的统一入口。
-// 查询路由：
-//   - navigate / impact / find_refs → 结构查询（SQLite AST 索引 + 调用图 JSON）
-//   - communities / god_nodes / path / surprises → 语义查询（图数据）
-//   - cross_shard → 跨片查询（cross_edges.json）
+// 查询路由策略（Graphify + GitNexus + Native 互补）：
+//   - navigate / impact / find_refs / cross_shard → GitNexus 结构查询（SQLite AST 索引 + 调用图 JSON）
+//   - communities / god_nodes / path / surprises   → Graphify 语义查询（图数据 + 社区检测）
+//   - native_grep / native_read / native_fallback  → Native 原生兜底（实时 Grep/Read）
+//
+// 降级策略：
+//   1. 优先查询索引引擎（GitNexus / Graphify）
+//   2. 索引缺失、未命中或报错 → 自动降级到 Native 引擎
+//   3. 同时返回 "engine" 字段标识实际使用的引擎
 package codeintel
 
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 )
 
-// Engine 查询引擎。
+// Engine 三引擎查询路由器。
 type Engine struct {
-	Store *Store
+	GitNexus *GitNexusEngine
+	Graphify *GraphifyEngine
+	Native   *NativeEngine
+	Store    *Store
 }
 
-// NewEngine 创建查询引擎。
+// NewEngine 创建三引擎路由器。
 func NewEngine(repoPath string) *Engine {
-	return &Engine{Store: NewStore(repoPath)}
+	store := NewStore(repoPath)
+	return &Engine{
+		GitNexus: NewGitNexusEngine(repoPath),
+		Graphify: NewGraphifyEngine(repoPath),
+		Native:   NewNativeEngine(repoPath),
+		Store:    store,
+	}
 }
 
-// Navigate 符号导航：定义位置 + 调用方/被调用方。
+// Navigate 符号导航 → GitNexus（索引）→ Native（兜底）。
 func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, error) {
-	start := time.Now()
-
-	shards := e.resolveShards(branchName, q.Shard)
-	if len(shards) == 0 {
-		return nil, fmt.Errorf("no shards available")
+	qr, err := e.GitNexus.Navigate(branchName, q)
+	if err != nil {
+		return e.nativeFallback("navigate", q.Symbol, err)
 	}
-
-	var results []map[string]interface{}
-	for _, shardName := range shards {
-		// 1. 从 SQLite 查定义
-		def, err := e.findSymbolDefInShard(branchName, shardName, q.Symbol)
-		if err != nil {
-			continue
-		}
-
-		// 2. 从 SQLite 查调用方/被调用方
-		callers, _ := e.findCallersInShard(branchName, shardName, q.Symbol, q.Depth)
-		callees, _ := e.findCalleesInShard(branchName, shardName, q.Symbol, q.Depth)
-
-		results = append(results, map[string]interface{}{
-			"shard":   shardName,
-			"symbol":  q.Symbol,
-			"def":     def,
-			"callers": callers,
-			"callees": callees,
-		})
-	}
-
-	content, _ := json.MarshalIndent(results, "", "  ")
-	return &QueryResult{
-		QueryType: "navigate",
-		Shard:     q.Shard,
-		Results:   results,
-		Tokens:    len(content) / 4,
-		LatencyMs: time.Since(start).Milliseconds(),
-	}, nil
+	return qr, nil
 }
 
-// Impact 影响分析：给定文件的依赖半径。
+// Impact 影响分析 → GitNexus。
 func (e *Engine) Impact(branchName string, q ImpactQuery) (*QueryResult, error) {
-	start := time.Now()
-
-	// 加载调用图 JSON
-	shards := e.resolveShards(branchName, "")
-	directDeps := make(map[string]bool)
-	transitive := make(map[string]bool)
-	var topCallers []map[string]interface{}
-
-	for _, shardName := range shards {
-		cgPath := e.Store.CallgraphPath(branchName, shardName)
-		data, err := os.ReadFile(cgPath)
-		if err != nil {
-			continue
-		}
-		var cg struct {
-			Nodes []map[string]interface{} `json:"nodes"`
-			Edges []map[string]interface{} `json:"edges"`
-		}
-		if err := json.Unmarshal(data, &cg); err != nil {
-			continue
-		}
-
-		// 找到文件中定义的符号
-		fileSymbols := make(map[string]bool)
-		for _, node := range cg.Nodes {
-			if file, _ := node["file"].(string); file == q.FilePath {
-				if id, _ := node["id"].(string); id != "" {
-					fileSymbols[id] = true
-				}
-			}
-		}
-
-		// BFS 找依赖
-		for sym := range fileSymbols {
-			for _, edge := range cg.Edges {
-				src, _ := edge["source"].(string)
-				dst, _ := edge["target"].(string)
-				if src == sym && !fileSymbols[dst] {
-					directDeps[dst] = true
-				}
-				if dst == sym && !fileSymbols[src] {
-					directDeps[src] = true
-				}
-			}
-		}
+	qr, err := e.GitNexus.Impact(branchName, q)
+	if err != nil {
+		return e.nativeFallback("impact", q.FilePath, err)
 	}
-
-	// 简化：transitive = direct (不做深层 BFS 避免性能问题)
-	for dep := range directDeps {
-		transitive[dep] = true
-	}
-
-	var directList, transList []string
-	for d := range directDeps {
-		directList = append(directList, d)
-	}
-	for t := range transitive {
-		transList = append(transList, t)
-	}
-
-	result := map[string]interface{}{
-		"file":        q.FilePath,
-		"direct_deps": directList,
-		"transitive":  transList,
-		"top_callers": topCallers,
-	}
-	content, _ := json.MarshalIndent(result, "", "  ")
-	return &QueryResult{
-		QueryType: "impact",
-		Results:   result,
-		Tokens:    len(content) / 4,
-		LatencyMs: time.Since(start).Milliseconds(),
-	}, nil
+	return qr, nil
 }
 
-// Communities 社区列表查询。
+// FindRefs 符号引用 → GitNexus → Native（兜底）。
+func (e *Engine) FindRefs(branchName string, q NavigateQuery) (*QueryResult, error) {
+	qr, err := e.GitNexus.FindRefs(branchName, q)
+	if err != nil {
+		return e.nativeFallback("find_refs", q.Symbol, err)
+	}
+	return qr, nil
+}
+
+// Communities 社区列表 → Graphify。
 func (e *Engine) Communities(branchName string, q CommunityQuery) (*QueryResult, error) {
-	start := time.Now()
-	idx, err := e.Store.LoadShardIndex(branchName, q.Shard)
+	qr, err := e.Graphify.Communities(branchName, q)
 	if err != nil {
-		return nil, err
+		return e.nativeFallback("communities", q.Shard, err)
 	}
-	result := map[string]interface{}{
-		"shard":        q.Shard,
-		"communities":  idx.Communities,
-		"god_nodes":    idx.GodNodes,
-		"file_count":   idx.FileCount,
-		"symbol_count": idx.SymbolCount,
-	}
-	content, _ := json.MarshalIndent(result, "", "  ")
-	return &QueryResult{
-		QueryType: "communities",
-		Shard:     q.Shard,
-		Results:   result,
-		Tokens:    len(content) / 4,
-		LatencyMs: time.Since(start).Milliseconds(),
-	}, nil
+	return qr, nil
 }
 
-// GodNodes 高度数节点查询。
+// GodNodes 高度数节点 → Graphify。
 func (e *Engine) GodNodes(branchName, shardName string, topN int) (*QueryResult, error) {
-	start := time.Now()
-	idx, err := e.Store.LoadShardIndex(branchName, shardName)
+	qr, err := e.Graphify.GodNodes(branchName, shardName, topN)
 	if err != nil {
-		return nil, err
+		return e.nativeFallback("god_nodes", shardName, err)
 	}
-	gods := idx.GodNodes
-	if topN > 0 && topN < len(gods) {
-		gods = gods[:topN]
-	}
-	result := map[string]interface{}{
-		"shard":     shardName,
-		"god_nodes": gods,
-	}
-	content, _ := json.MarshalIndent(result, "", "  ")
-	return &QueryResult{
-		QueryType: "god_nodes",
-		Shard:     shardName,
-		Results:   result,
-		Tokens:    len(content) / 4,
-		LatencyMs: time.Since(start).Milliseconds(),
-	}, nil
+	return qr, nil
 }
 
-// CrossShard 跨片查询。
+// Path 最短路径 → Graphify。
+func (e *Engine) Path(branchName string, src, dst string) (*QueryResult, error) {
+	qr, err := e.Graphify.Path(branchName, src, dst)
+	if err != nil {
+		return e.nativeFallback("path", src+"->"+dst, err)
+	}
+	return qr, nil
+}
+
+// Surprises 异常边 → Graphify。
+func (e *Engine) Surprises(branchName, shardName string, topN int) (*QueryResult, error) {
+	qr, err := e.Graphify.Surprises(branchName, shardName, topN)
+	if err != nil {
+		return e.nativeFallback("surprises", shardName, err)
+	}
+	return qr, nil
+}
+
+// CrossShard 跨片查询 → GitNexus。
 func (e *Engine) CrossShard(branchName string, q CrossShardQuery) (*QueryResult, error) {
-	start := time.Now()
-
-	// 加载跨片边 JSON
-	crossPath := e.Store.CrossEdgesPath(branchName) + ".json"
-	var crossData struct {
-		CrossEdges []struct {
-			Src  string `json:"src"`
-			Dst  string `json:"dst"`
-			Kind string `json:"kind"`
-		} `json:"cross_edges"`
+	qr, err := e.GitNexus.CrossShard(branchName, q)
+	if err != nil {
+		return e.nativeFallback("cross_shard", q.Symbol, err)
 	}
-
-	data, err := os.ReadFile(crossPath)
-	if err == nil {
-		_ = json.Unmarshal(data, &crossData)
-	}
-
-	var related []map[string]string
-	for _, edge := range crossData.CrossEdges {
-		if q.Symbol != "" && (edge.Src == q.Symbol || edge.Dst == q.Symbol) {
-			related = append(related, map[string]string{
-				"src":  edge.Src,
-				"dst":  edge.Dst,
-				"kind": edge.Kind,
-			})
-		}
-		if q.TargetShard != "" && (edge.Src == q.TargetShard || edge.Dst == q.TargetShard) {
-			related = append(related, map[string]string{
-				"src":  edge.Src,
-				"dst":  edge.Dst,
-				"kind": edge.Kind,
-			})
-		}
-	}
-
-	result := map[string]interface{}{
-		"symbol":       q.Symbol,
-		"target_shard": q.TargetShard,
-		"call_sites":   related,
-		"total_edges":  len(crossData.CrossEdges),
-	}
-	content, _ := json.MarshalIndent(result, "", "  ")
-	return &QueryResult{
-		QueryType: "cross_shard",
-		Results:   result,
-		Tokens:    len(content) / 4,
-		LatencyMs: time.Since(start).Milliseconds(),
-	}, nil
+	return qr, nil
 }
 
 // Status 返回仓库索引全局状态。
@@ -287,124 +152,80 @@ func (e *Engine) Status(branchName string) (*QueryResult, error) {
 	}, nil
 }
 
+// UnifiedQuery 统一查询入口（支持所有查询类型）。
+func (e *Engine) UnifiedQuery(branchName string, q UnifiedQuery) (*QueryResult, error) {
+	switch q.QueryType {
+	case QueryNavigate:
+		return e.Navigate(branchName, NavigateQuery{Symbol: q.Symbol, Depth: q.Depth, Shard: q.Shard})
+	case QueryImpact:
+		return e.Impact(branchName, ImpactQuery{FilePath: q.FilePath, Depth: q.Depth})
+	case QueryFindRefs:
+		return e.FindRefs(branchName, NavigateQuery{Symbol: q.Symbol, Shard: q.Shard})
+	case QueryCommunities:
+		return e.Communities(branchName, CommunityQuery{Shard: q.Shard, TopN: q.TopN})
+	case QueryGodNodes:
+		return e.GodNodes(branchName, q.Shard, q.TopN)
+	case QueryPath:
+		return e.Path(branchName, q.Symbol, q.TargetSymbol)
+	case QuerySurprises:
+		return e.Surprises(branchName, q.Shard, q.TopN)
+	case QueryCrossShard:
+		return e.CrossShard(branchName, CrossShardQuery{Symbol: q.Symbol, TargetShard: q.TargetShard})
+	case QueryNativeGrep:
+		return e.Native.Grep(q.Symbol, GrepOptions{Dir: q.FilePath, MaxResults: q.TopN})
+	case QueryNativeRead:
+		return e.Native.ReadFile(q.FilePath, ReadOptions{Offset: q.Depth, Limit: q.TopN})
+	default:
+		return nil, fmt.Errorf("unknown query_type: %s", q.QueryType)
+	}
+}
+
+// nativeFallback 索引引擎失败时降级到 Native 引擎。
+func (e *Engine) nativeFallback(queryType, target string, originalErr error) (*QueryResult, error) {
+	start := time.Now()
+	qr, err := e.Native.FallbackSearch(target)
+	if err != nil {
+		// Native 也失败了，返回原始错误
+		return nil, fmt.Errorf("%s failed (index: %v; native fallback: %v)", queryType, originalErr, err)
+	}
+	qr.QueryType = queryType + "_fallback"
+	qr.LatencyMs = time.Since(start).Milliseconds()
+	// 注入降级标记
+	if m, ok := qr.Results.(map[string]interface{}); ok {
+		m["_fallback"] = true
+		m["_original_error"] = originalErr.Error()
+		m["engine"] = "native"
+	}
+	return qr, nil
+}
+
 // ============================================================================
-// 私有辅助 — 真实 SQLite 查询
+// 统一查询参数
 // ============================================================================
 
-func (e *Engine) resolveShards(branchName, shard string) []string {
-	if shard != "" {
-		return []string{shard}
-	}
-	idx, err := e.Store.LoadBranchIndex(branchName)
-	if err != nil {
-		return nil
-	}
-	var names []string
-	for name := range idx.Shards {
-		names = append(names, name)
-	}
-	return names
-}
-
-func (e *Engine) findSymbolDefInShard(branchName, shardName, symbol string) (map[string]interface{}, error) {
-	db, err := e.Store.OpenShardDB(branchName, shardName)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	var name, kind, file string
-	var line int
-	err = db.QueryRow("SELECT name, kind, file, line FROM symbols WHERE name = ? LIMIT 1", symbol).Scan(&name, &kind, &file, &line)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]interface{}{
-		"name": name,
-		"kind": kind,
-		"file": file,
-		"line": line,
-	}, nil
-}
-
-func (e *Engine) findCallersInShard(branchName, shardName, symbol string, depth int) ([]map[string]interface{}, error) {
-	db, err := e.Store.OpenShardDB(branchName, shardName)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT src_symbol, file, line FROM edges WHERE dst_symbol = ? AND kind = 'call' LIMIT 50", symbol)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []map[string]interface{}
-	for rows.Next() {
-		var src, file string
-		var line int
-		if err := rows.Scan(&src, &file, &line); err != nil {
-			continue
-		}
-		results = append(results, map[string]interface{}{
-			"caller": src,
-			"file":   file,
-			"line":   line,
-		})
-	}
-	return results, rows.Err()
-}
-
-func (e *Engine) findCalleesInShard(branchName, shardName, symbol string, depth int) ([]map[string]interface{}, error) {
-	db, err := e.Store.OpenShardDB(branchName, shardName)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT dst_symbol, file, line FROM edges WHERE src_symbol = ? AND kind = 'call' LIMIT 50", symbol)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []map[string]interface{}
-	for rows.Next() {
-		var dst, file string
-		var line int
-		if err := rows.Scan(&dst, &file, &line); err != nil {
-			continue
-		}
-		results = append(results, map[string]interface{}{
-			"callee": dst,
-			"file":   file,
-			"line":   line,
-		})
-	}
-	return results, rows.Err()
-}
-
-// LoadShardGraph 加载分片的 NetworkX 风格图数据（JSON）。
-func LoadShardGraph(graphifyPath string) (map[string]interface{}, error) {
-	path := filepath.Join(graphifyPath, "graph.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var g map[string]interface{}
-	if err := json.Unmarshal(data, &g); err != nil {
-		return nil, err
-	}
-	return g, nil
+// UnifiedQuery 统一查询参数（用于 Router 分发）。
+type UnifiedQuery struct {
+	QueryType    string `json:"query_type"`
+	Shard        string `json:"shard,omitempty"`
+	Symbol       string `json:"symbol,omitempty"`
+	TargetSymbol string `json:"target_symbol,omitempty"`
+	FilePath     string `json:"file_path,omitempty"`
+	Depth        int    `json:"depth,omitempty"`
+	TopN         int    `json:"top_n,omitempty"`
+	TargetShard  string `json:"target_shard,omitempty"`
 }
 
 // QueryType 枚举。
 const (
 	QueryNavigate    = "navigate"
 	QueryImpact      = "impact"
+	QueryFindRefs    = "find_refs"
 	QueryCommunities = "communities"
 	QueryGodNodes    = "god_nodes"
+	QueryPath        = "path"
+	QuerySurprises   = "surprises"
 	QueryCrossShard  = "cross_shard"
 	QueryStatus      = "status"
+	QueryNativeGrep  = "native_grep"
+	QueryNativeRead  = "native_read"
 )

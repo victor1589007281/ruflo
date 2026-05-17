@@ -1,10 +1,11 @@
-# 大型代码库知识图谱构造方案 —— Graphify + GitNexus + Claude (Final v2.0)
+# 大型代码库知识图谱构造方案 —— Graphify + GitNexus + Native (Final v2.1)
 
-> **版本**: 2.0
+> **版本**: 2.1
 > **日期**: 2026-05-17
 > **范围**: Linux Kernel / MySQL 级别超大型代码库的 LLM 知识图谱构造与消费
 > **目标**: 对内作为 claude-go 内置 Tool 使用；对外通过 MCP Server 向 Claude Desktop / Cursor / Cline 提供标准化代码智能服务
 > **核心约束**: 构建流水线零 LLM Token，纯静态分析 + 图算法
+> **核心架构**: **三引擎互补** — GitNexus（精确结构）+ Graphify（语义图谱）+ Native（原生兜底）
 
 ---
 
@@ -23,21 +24,35 @@
 - `Glob`: 在 `drivers/` 或 `storage/innobase/` 下返回数千个文件，噪音极高
 - 无模块边界感知: 模型看不到 "TCP 拥塞控制子系统包含哪些文件、与网络栈的接口在哪里"
 
-### 1.2 双模暴露架构
+### 1.2 三引擎互补 + 双模暴露架构
 
-本方案的核心设计是**同一套引擎能力，两种暴露方式**：
+本方案的核心设计是**三引擎互补查询**，通过**两种模式**暴露：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          统一核心引擎 (pkg/codeintel)                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
-│  │ 分片管理     │  │ 构建流水线   │  │ 查询引擎     │  │ 分支隔离     │        │
-│  │ (shard.go)  │  │(builder.go) │  │ (query.go)  │  │(branch.go)  │        │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
-│  ┌─────────────┐  ┌─────────────┐                                           │
-│  │ 存储抽象     │  │ MCP Server   │                                           │
-│  │ (store.go)  │  │(mcpserver.go)│                                           │
-│  └─────────────┘  └─────────────┘                                           │
+│                     三引擎查询路由器 (pkg/codeintel/query.go)                  │
+│                                                                              │
+│  ┌─────────────────────────┐  ┌─────────────────────────┐                   │
+│  │  GitNexus 结构引擎       │  │  Graphify 语义引擎       │                   │
+│  │  (gitnexus.go)          │  │  (graphify.go)          │                   │
+│  │  ─────────────────────  │  │  ─────────────────────  │                   │
+│  │  • navigate   符号导航   │  │  • communities 社区检测  │                   │
+│  │  • impact     影响分析   │  │  • god_nodes   枢纽节点  │                   │
+│  │  • find_refs  引用查找   │  │  • path        最短路径  │                   │
+│  │  • cross_shard 跨片查询  │  │  • surprises   异常边    │                   │
+│  │  数据源: SQLite + JSON   │  │  数据源: graph.json      │                   │
+│  └─────────────────────────┘  └─────────────────────────┘                   │
+│           │                              │                                   │
+│           └──────────────┬───────────────┘                                   │
+│                          ▼                                                   │
+│              ┌─────────────────────┐                                         │
+│              │   Native 原生兜底    │                                         │
+│              │   (native.go)       │                                         │
+│              │   ───────────────── │                                         │
+│              │   • native_grep     │  ← 索引缺失/过期时自动降级                │
+│              │   • native_read     │  ← 实时文本搜索，零存储依赖               │
+│              │   • fallback_search │  ← Grep → Read 自动组合                  │
+│              └─────────────────────┘                                         │
 └─────────────────────────────────────────────────────────────────────────────┘
          │                                    │
     ┌────┴────┐                        ┌─────┴──────┐
@@ -329,17 +344,58 @@ func (bm *BranchManager) CreateBranch(baseBranch, newBranch string) error {
 
 ---
 
-## 6. 查询引擎
+## 6. 查询引擎（三引擎互补）
 
-### 6.1 查询类型
+### 6.1 查询路由
 
-| 查询类型 | 对应能力 | 数据源 | 延迟目标 |
-|----------|----------|--------|----------|
-| `navigate` | 符号定义 + 调用方/被调用方 | SQLite AST | < 50ms |
-| `impact` | 文件依赖半径 | callgraph.json | < 100ms |
-| `communities` | Leiden 社区 + God Nodes | graphify/graph.json | < 200ms |
-| `god_nodes` | 高度数节点排名 | index.json | < 50ms |
-| `cross_shard` | 跨片引用 | cross_edges.db | < 30ms |
+```
+                    ┌─────────────────┐
+    user query ───▶ │  Router (query) │
+                    └────────┬────────┘
+                             │
+           ┌─────────────────┼─────────────────┐
+           ▼                 ▼                 ▼
+    ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+    │  GitNexus   │  │  Graphify   │  │   Native    │
+    │  结构引擎    │  │  语义引擎    │  │  原生兜底    │
+    └─────────────┘  └─────────────┘  └─────────────┘
+           │                 │                 │
+           ▼                 ▼                 ▼
+    SQLite + JSON     graph.json          grep/read
+    （精确导航）        （社区/路径）        （实时文本）
+```
+
+| 查询类型 | 引擎 | 对应能力 | 数据源 | 延迟目标 |
+|----------|------|----------|--------|----------|
+| `navigate` | **GitNexus** | 符号定义 + 调用方/被调用方 | SQLite AST | < 50ms |
+| `impact` | **GitNexus** | 文件依赖半径 | callgraph.json | < 100ms |
+| `find_refs` | **GitNexus** | 符号所有引用位置 | SQLite edges | < 50ms |
+| `cross_shard` | **GitNexus** | 跨片引用 | cross_edges.json | < 30ms |
+| `communities` | **Graphify** | Leiden 社区 + God Nodes | graphify/graph.json | < 200ms |
+| `god_nodes` | **Graphify** | 高度数节点排名 | index.json | < 50ms |
+| `path` | **Graphify** | 两符号间最短路径 | callgraph.json (BFS) | < 200ms |
+| `surprises` | **Graphify** | 异常边（跨社区/高权重） | callgraph + community | < 200ms |
+| `native_grep` | **Native** | 实时文本搜索 | 文件系统 | < 500ms |
+| `native_read` | **Native** | 实时文件读取 | 文件系统 | < 50ms |
+
+### 6.2 降级策略
+
+当索引引擎（GitNexus / Graphify）查询失败时，**自动降级**到 Native 引擎：
+
+1. **优先索引**：navigate → GitNexus SQLite 查询
+2. **索引缺失**：SQLite 未找到 → Native.Grep(symbol) + Native.ReadFile()
+3. **返回标记**：降级结果带 `"_fallback": true` 和 `"_original_error"` 字段
+
+```go
+// query.go — 自动降级示例
+func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, error) {
+    qr, err := e.GitNexus.Navigate(branchName, q)
+    if err != nil {
+        return e.nativeFallback("navigate", q.Symbol, err)  // 自动降级
+    }
+    return qr, nil
+}
+```
 
 ### 6.2 Token 效率对比
 
@@ -354,19 +410,23 @@ func (bm *BranchManager) CreateBranch(baseBranch, newBranch string) error {
 Total: ~1,600 行 → ~4,800 Token
 ```
 
-**After (code_intel_query)**:
+**After (三引擎互补查询)**:
 ```
 1. code_intel_query query_type="communities" shard="net"
-   → {communities: [{id: 3, label: "Congestion Control", files: [...], core_nodes: ["tcp_congestion_control", "bbr_main"]}]}
+   → Graphify: {communities: [{id: 3, label: "Congestion Control", files: [...], core_nodes: ["tcp_congestion_control", "bbr_main"]}]}
    Token: ~120
 
 2. code_intel_query query_type="navigate" symbol="tcp_congestion_control" depth=2
-   → {def: "net/ipv4/tcp_cong.c:142", callers: [...], callees: [...]}
+   → GitNexus: {def: "net/ipv4/tcp_cong.c:142", callers: [...], callees: [...]}
    Token: ~150
 
-3. 按需 Read 2 个文件的特定行 (60 行)
+3. code_intel_query query_type="path" symbol="tcp_sendmsg" target_symbol="tcp_congestion_control"
+   → Graphify: {path: ["tcp_sendmsg", "tcp_transmit_skb", "tcp_congestion_control"], length: 3}
+   Token: ~80
+
+4. 按需 native_read 2 个文件的特定行 (60 行)
    Token: ~180
-Total: ~450 Token (10.7x 节省)
+Total: ~530 Token (9x 节省)
 ```
 
 ---
@@ -381,7 +441,10 @@ pkg/codeintel/
 ├── store.go           # 存储抽象：SQLite/JSON/YAML 读写，目录管理
 ├── shard.go           # 分片管理与自动检测（按顶层目录分组）
 ├── builder.go         # 构建流水线：全量构建 + 增量更新（零 LLM）
-├── query.go           # 查询引擎：navigate/impact/communities/god_nodes/cross_shard
+├── gitnexus.go        # GitNexus 结构引擎：navigate/impact/find_refs/cross_shard
+├── graphify.go        # Graphify 语义引擎：communities/god_nodes/path/surprises
+├── native.go          # Native 原生兜底：native_grep/native_read/fallback_search
+├── query.go           # 三引擎查询路由器：自动路由 + 降级策略
 ├── branch.go          # 分支隔离：CoW 元数据 + 共享只读数据
 └── mcpserver.go       # MCP Server：JSON-RPC 2.0 over stdio
 
@@ -464,21 +527,30 @@ if tool == "Bash" && strings.Contains(args.command, "git commit") {
 - [x] 5 个内置 Tool（codeintel_tools.go）
 - [x] Tool 注册（register.go）
 
-### Phase 2: AST 解析集成（1 周）
-- [ ] 集成 `go-tree-sitter` 实现真实 AST 解析
-- [ ] 符号提取（函数、类型、变量、宏）
-- [ ] 调用关系提取
+### Phase 2: AST 解析集成（已完成）
+- [x] 集成 `go-tree-sitter` 实现真实 AST 解析（8 种语言：C/C++/Go/Java/JS/TS/Python/Rust）
+- [x] 符号提取（函数、类型、变量、宏）
+- [x] 调用关系提取
 
-### Phase 3: 图算法集成（1 周）
-- [ ] 实现/集成 Leiden 社区检测
-- [ ] God Node 识别（度数/中心性/ betweenness）
-- [ ] 跨片边精确提取
+### Phase 3: 图算法集成（已完成）
+- [x] 实现简化版 Leiden 社区检测（模块度优化 + 社区聚合）
+- [x] God Node 识别（PageRank × log(degree+1)）
+- [x] 跨片边精确提取
+- [x] 新增：最短路径（BFS）、异常边检测（surprises）
 
-### Phase 4: 性能与运维（1 周）
-- [ ] 并行分片构建
-- [ ] 增量更新性能优化（变更文件精准映射）
+### Phase 4: 三引擎架构重构（已完成）
+- [x] 拆分 GitNexus 结构引擎（gitnexus.go）
+- [x] 拆分 Graphify 语义引擎（graphify.go）
+- [x] 新增 Native 原生兜底引擎（native.go）
+- [x] 查询路由器 + 自动降级策略（query.go）
+- [x] 并行分片构建
+- [x] 增量更新性能优化（变更文件精准映射）
+
+### Phase 5: 性能与运维（未来）
 - [ ] 索引过期检测 + 自动重索引 Hook
 - [ ] 存储压缩（大仓库分卷）
+- [ ] 完整 Leiden 算法替换（当前为简化版）
+- [ ] KuzuDB 跨片图边存储（当前为 JSON）
 
 ---
 
