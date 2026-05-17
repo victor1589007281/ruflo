@@ -2,13 +2,12 @@
 //
 // 提供结构查询（类 GitNexus）和语义查询（类 Graphify）的统一入口。
 // 查询路由：
-//   - navigate / impact / find_refs → 结构查询（SQLite AST 索引）
+//   - navigate / impact / find_refs → 结构查询（SQLite AST 索引 + 调用图 JSON）
 //   - communities / god_nodes / path / surprises → 语义查询（图数据）
-//   - cross_shard → 跨片查询（KuzuDB 占位）
+//   - cross_shard → 跨片查询（cross_edges.json）
 package codeintel
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,7 +29,6 @@ func NewEngine(repoPath string) *Engine {
 func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, error) {
 	start := time.Now()
 
-	// 未指定分片时，尝试在所有分片中查找
 	shards := e.resolveShards(branchName, q.Shard)
 	if len(shards) == 0 {
 		return nil, fmt.Errorf("no shards available")
@@ -38,25 +36,22 @@ func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, err
 
 	var results []map[string]interface{}
 	for _, shardName := range shards {
-		db, err := e.Store.OpenShardDB(branchName, shardName)
+		// 1. 从 SQLite 查定义
+		def, err := e.findSymbolDefInShard(branchName, shardName, q.Symbol)
 		if err != nil {
 			continue
 		}
-		defer db.Close()
 
-		def, err := e.findSymbolDef(db, q.Symbol)
-		if err != nil {
-			continue
-		}
-		callers, _ := e.findCallers(db, q.Symbol, q.Depth)
-		callees, _ := e.findCallees(db, q.Symbol, q.Depth)
+		// 2. 从 SQLite 查调用方/被调用方
+		callers, _ := e.findCallersInShard(branchName, shardName, q.Symbol, q.Depth)
+		callees, _ := e.findCalleesInShard(branchName, shardName, q.Symbol, q.Depth)
 
 		results = append(results, map[string]interface{}{
-			"shard":    shardName,
-			"symbol":   q.Symbol,
-			"def":      def,
-			"callers":  callers,
-			"callees":  callees,
+			"shard":   shardName,
+			"symbol":  q.Symbol,
+			"def":     def,
+			"callers": callers,
+			"callees": callees,
 		})
 	}
 
@@ -73,13 +68,70 @@ func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, err
 // Impact 影响分析：给定文件的依赖半径。
 func (e *Engine) Impact(branchName string, q ImpactQuery) (*QueryResult, error) {
 	start := time.Now()
-	// TODO: real impact analysis using callgraph + type dependencies
+
+	// 加载调用图 JSON
+	shards := e.resolveShards(branchName, "")
+	directDeps := make(map[string]bool)
+	transitive := make(map[string]bool)
+	var topCallers []map[string]interface{}
+
+	for _, shardName := range shards {
+		cgPath := e.Store.CallgraphPath(branchName, shardName)
+		data, err := os.ReadFile(cgPath)
+		if err != nil {
+			continue
+		}
+		var cg struct {
+			Nodes []map[string]interface{} `json:"nodes"`
+			Edges []map[string]interface{} `json:"edges"`
+		}
+		if err := json.Unmarshal(data, &cg); err != nil {
+			continue
+		}
+
+		// 找到文件中定义的符号
+		fileSymbols := make(map[string]bool)
+		for _, node := range cg.Nodes {
+			if file, _ := node["file"].(string); file == q.FilePath {
+				if id, _ := node["id"].(string); id != "" {
+					fileSymbols[id] = true
+				}
+			}
+		}
+
+		// BFS 找依赖
+		for sym := range fileSymbols {
+			for _, edge := range cg.Edges {
+				src, _ := edge["source"].(string)
+				dst, _ := edge["target"].(string)
+				if src == sym && !fileSymbols[dst] {
+					directDeps[dst] = true
+				}
+				if dst == sym && !fileSymbols[src] {
+					directDeps[src] = true
+				}
+			}
+		}
+	}
+
+	// 简化：transitive = direct (不做深层 BFS 避免性能问题)
+	for dep := range directDeps {
+		transitive[dep] = true
+	}
+
+	var directList, transList []string
+	for d := range directDeps {
+		directList = append(directList, d)
+	}
+	for t := range transitive {
+		transList = append(transList, t)
+	}
+
 	result := map[string]interface{}{
-		"file":         q.FilePath,
-		"direct_deps":  []string{},
-		"transitive":   []string{},
-		"top_callers":  []string{},
-		"note":         "impact analysis placeholder — integrate callgraph for real results",
+		"file":        q.FilePath,
+		"direct_deps": directList,
+		"transitive":  transList,
+		"top_callers": topCallers,
 	}
 	content, _ := json.MarshalIndent(result, "", "  ")
 	return &QueryResult{
@@ -98,10 +150,10 @@ func (e *Engine) Communities(branchName string, q CommunityQuery) (*QueryResult,
 		return nil, err
 	}
 	result := map[string]interface{}{
-		"shard":       q.Shard,
-		"communities": idx.Communities,
-		"god_nodes":   idx.GodNodes,
-		"file_count":  idx.FileCount,
+		"shard":        q.Shard,
+		"communities":  idx.Communities,
+		"god_nodes":    idx.GodNodes,
+		"file_count":   idx.FileCount,
 		"symbol_count": idx.SymbolCount,
 	}
 	content, _ := json.MarshalIndent(result, "", "  ")
@@ -126,7 +178,7 @@ func (e *Engine) GodNodes(branchName, shardName string, topN int) (*QueryResult,
 		gods = gods[:topN]
 	}
 	result := map[string]interface{}{
-		"shard":    shardName,
+		"shard":     shardName,
 		"god_nodes": gods,
 	}
 	content, _ := json.MarshalIndent(result, "", "  ")
@@ -142,12 +194,45 @@ func (e *Engine) GodNodes(branchName, shardName string, topN int) (*QueryResult,
 // CrossShard 跨片查询。
 func (e *Engine) CrossShard(branchName string, q CrossShardQuery) (*QueryResult, error) {
 	start := time.Now()
-	// TODO: real cross-shard query via KuzuDB
+
+	// 加载跨片边 JSON
+	crossPath := e.Store.CrossEdgesPath(branchName) + ".json"
+	var crossData struct {
+		CrossEdges []struct {
+			Src  string `json:"src"`
+			Dst  string `json:"dst"`
+			Kind string `json:"kind"`
+		} `json:"cross_edges"`
+	}
+
+	data, err := os.ReadFile(crossPath)
+	if err == nil {
+		_ = json.Unmarshal(data, &crossData)
+	}
+
+	var related []map[string]string
+	for _, edge := range crossData.CrossEdges {
+		if q.Symbol != "" && (edge.Src == q.Symbol || edge.Dst == q.Symbol) {
+			related = append(related, map[string]string{
+				"src":  edge.Src,
+				"dst":  edge.Dst,
+				"kind": edge.Kind,
+			})
+		}
+		if q.TargetShard != "" && (edge.Src == q.TargetShard || edge.Dst == q.TargetShard) {
+			related = append(related, map[string]string{
+				"src":  edge.Src,
+				"dst":  edge.Dst,
+				"kind": edge.Kind,
+			})
+		}
+	}
+
 	result := map[string]interface{}{
-		"symbol":      q.Symbol,
+		"symbol":       q.Symbol,
 		"target_shard": q.TargetShard,
-		"call_sites":  []string{},
-		"note":        "cross-shard query placeholder — integrate KuzuDB for real results",
+		"call_sites":   related,
+		"total_edges":  len(crossData.CrossEdges),
 	}
 	content, _ := json.MarshalIndent(result, "", "  ")
 	return &QueryResult{
@@ -186,12 +271,12 @@ func (e *Engine) Status(branchName string) (*QueryResult, error) {
 	}
 
 	result := map[string]interface{}{
-		"repo_path":    cfg.RepoPath,
-		"repo_hash":    cfg.RepoHash,
-		"shard_count":  len(cfg.Shards),
-		"branches":     branchInfo,
-		"llm_enhance":  cfg.LLMEnhance,
-		"auto_shard":   cfg.AutoShard,
+		"repo_path":   cfg.RepoPath,
+		"repo_hash":   cfg.RepoHash,
+		"shard_count": len(cfg.Shards),
+		"branches":    branchInfo,
+		"llm_enhance": cfg.LLMEnhance,
+		"auto_shard":  cfg.AutoShard,
 	}
 	content, _ := json.MarshalIndent(result, "", "  ")
 	return &QueryResult{
@@ -203,7 +288,7 @@ func (e *Engine) Status(branchName string) (*QueryResult, error) {
 }
 
 // ============================================================================
-// 私有辅助
+// 私有辅助 — 真实 SQLite 查询
 // ============================================================================
 
 func (e *Engine) resolveShards(branchName, shard string) []string {
@@ -221,19 +306,83 @@ func (e *Engine) resolveShards(branchName, shard string) []string {
 	return names
 }
 
-func (e *Engine) findSymbolDef(db *sql.DB, symbol string) (map[string]interface{}, error) {
-	// TODO: real SQLite query
-	return map[string]interface{}{"symbol": symbol, "note": "placeholder"}, nil
+func (e *Engine) findSymbolDefInShard(branchName, shardName, symbol string) (map[string]interface{}, error) {
+	db, err := e.Store.OpenShardDB(branchName, shardName)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	var name, kind, file string
+	var line int
+	err = db.QueryRow("SELECT name, kind, file, line FROM symbols WHERE name = ? LIMIT 1", symbol).Scan(&name, &kind, &file, &line)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"name": name,
+		"kind": kind,
+		"file": file,
+		"line": line,
+	}, nil
 }
 
-func (e *Engine) findCallers(db *sql.DB, symbol string, depth int) ([]map[string]interface{}, error) {
-	// TODO: real SQLite query
-	return nil, nil
+func (e *Engine) findCallersInShard(branchName, shardName, symbol string, depth int) ([]map[string]interface{}, error) {
+	db, err := e.Store.OpenShardDB(branchName, shardName)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT src_symbol, file, line FROM edges WHERE dst_symbol = ? AND kind = 'call' LIMIT 50", symbol)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var src, file string
+		var line int
+		if err := rows.Scan(&src, &file, &line); err != nil {
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"caller": src,
+			"file":   file,
+			"line":   line,
+		})
+	}
+	return results, rows.Err()
 }
 
-func (e *Engine) findCallees(db *sql.DB, symbol string, depth int) ([]map[string]interface{}, error) {
-	// TODO: real SQLite query
-	return nil, nil
+func (e *Engine) findCalleesInShard(branchName, shardName, symbol string, depth int) ([]map[string]interface{}, error) {
+	db, err := e.Store.OpenShardDB(branchName, shardName)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT dst_symbol, file, line FROM edges WHERE src_symbol = ? AND kind = 'call' LIMIT 50", symbol)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var dst, file string
+		var line int
+		if err := rows.Scan(&dst, &file, &line); err != nil {
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"callee": dst,
+			"file":   file,
+			"line":   line,
+		})
+	}
+	return results, rows.Err()
 }
 
 // LoadShardGraph 加载分片的 NetworkX 风格图数据（JSON）。
@@ -252,10 +401,10 @@ func LoadShardGraph(graphifyPath string) (map[string]interface{}, error) {
 
 // QueryType 枚举。
 const (
-	QueryNavigate   = "navigate"
-	QueryImpact     = "impact"
+	QueryNavigate    = "navigate"
+	QueryImpact      = "impact"
 	QueryCommunities = "communities"
-	QueryGodNodes   = "god_nodes"
-	QueryCrossShard = "cross_shard"
-	QueryStatus     = "status"
+	QueryGodNodes    = "god_nodes"
+	QueryCrossShard  = "cross_shard"
+	QueryStatus      = "status"
 )

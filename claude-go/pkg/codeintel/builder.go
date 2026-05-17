@@ -1,10 +1,10 @@
 // builder.go — 构建流水线。
 //
 // 零 LLM 设计：所有阶段均为纯静态分析/图算法。
-//   Phase 1: 文件枚举 + Tree-sitter AST 解析（占位，待 go-tree-sitter 集成）
+//   Phase 1: 文件枚举 + Tree-sitter AST 解析
 //   Phase 2: 调用图/类型层级提取
-//   Phase 3: Leiden 社区检测（占位，纯算法）
-//   Phase 4: God Node 识别（度数/中心性统计）
+//   Phase 3: Leiden 社区检测
+//   Phase 4: God Node 识别
 //   Phase 5: 跨片边提取 + 清单生成
 //
 // LLM 仅用于可选的语义摘要增强（config.LLMEnhance=true，默认关闭）。
@@ -15,8 +15,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -38,7 +40,7 @@ func NewBuilder(repoPath string) (*Builder, error) {
 	return &Builder{Store: store, Config: cfg}, nil
 }
 
-// BuildAll 全量构建所有分片。
+// BuildAll 全量构建所有分片（并行）。
 func (b *Builder) BuildAll(branchName string, progress chan<- BuildProgress) (*BranchIndex, error) {
 	if progress != nil {
 		progress <- BuildProgress{Phase: "init", Message: "starting full build", Total: len(b.Config.Shards)}
@@ -55,16 +57,36 @@ func (b *Builder) BuildAll(branchName string, progress chan<- BuildProgress) (*B
 		UpdatedAt:  time.Now(),
 	}
 
-	for i, shard := range b.Config.Shards {
-		if progress != nil {
-			progress <- BuildProgress{Phase: "shard", Shard: shard.Name, Current: i + 1, Total: len(b.Config.Shards), Message: "indexing shard"}
-		}
+	// 并行构建各分片
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(b.Config.Shards))
 
-		si, err := b.buildShard(branchName, shard, progress)
+	for i, shard := range b.Config.Shards {
+		wg.Add(1)
+		go func(shardIdx int, cfg ShardConfig) {
+			defer wg.Done()
+			if progress != nil {
+				progress <- BuildProgress{Phase: "shard", Shard: cfg.Name, Current: shardIdx + 1, Total: len(b.Config.Shards), Message: "indexing shard"}
+			}
+
+			si, err := b.buildShard(branchName, cfg, progress)
+			if err != nil {
+				errChan <- fmt.Errorf("build shard %q: %w", cfg.Name, err)
+				return
+			}
+			mu.Lock()
+			idx.Shards[cfg.Name] = si
+			mu.Unlock()
+		}(i, shard)
+	}
+
+	wg.Wait()
+	close(errChan)
+	for err := range errChan {
 		if err != nil {
-			return nil, fmt.Errorf("build shard %q: %w", shard.Name, err)
+			return nil, err
 		}
-		idx.Shards[shard.Name] = si
 	}
 
 	// 提取跨片边
@@ -72,8 +94,7 @@ func (b *Builder) BuildAll(branchName string, progress chan<- BuildProgress) (*B
 		progress <- BuildProgress{Phase: "cross", Message: "extracting cross-shard edges"}
 	}
 	if err := b.extractCrossEdges(branchName, idx); err != nil {
-		// 跨片边失败不阻断主流程
-		_ = err
+		_ = err // 跨片边失败不阻断主流程
 	}
 
 	idx.UpdatedAt = time.Now()
@@ -90,7 +111,7 @@ func (b *Builder) BuildAll(branchName string, progress chan<- BuildProgress) (*B
 	return idx, nil
 }
 
-// IncrementalUpdate 增量更新：检测变更文件，仅重索引受影响分片。
+// IncrementalUpdate 增量更新：检测变更文件，仅重索引受影响分片（并行）。
 func (b *Builder) IncrementalUpdate(branchName string, progress chan<- BuildProgress) (*BranchIndex, error) {
 	if progress != nil {
 		progress <- BuildProgress{Phase: "diff", Message: "detecting changed files"}
@@ -107,7 +128,6 @@ func (b *Builder) IncrementalUpdate(branchName string, progress chan<- BuildProg
 		return b.Store.LoadBranchIndex(branchName)
 	}
 
-	// 识别受影响的分片
 	affectedShards := b.mapFilesToShards(changedFiles)
 	if progress != nil {
 		progress <- BuildProgress{Phase: "plan", Message: fmt.Sprintf("affected shards: %v", affectedShards), Total: len(affectedShards)}
@@ -118,22 +138,41 @@ func (b *Builder) IncrementalUpdate(branchName string, progress chan<- BuildProg
 		return nil, err
 	}
 
+	// 并行重建受影响分片
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(affectedShards))
+
 	for i, shardName := range affectedShards {
 		shardCfg := b.findShardConfig(shardName)
 		if shardCfg == nil {
 			continue
 		}
-		if progress != nil {
-			progress <- BuildProgress{Phase: "shard", Shard: shardName, Current: i + 1, Total: len(affectedShards), Message: "incremental reindex"}
-		}
-		si, err := b.buildShard(branchName, *shardCfg, progress)
-		if err != nil {
-			return nil, fmt.Errorf("rebuild shard %q: %w", shardName, err)
-		}
-		idx.Shards[shardName] = si
+		wg.Add(1)
+		go func(shardIdx int, name string, cfg ShardConfig) {
+			defer wg.Done()
+			if progress != nil {
+				progress <- BuildProgress{Phase: "shard", Shard: name, Current: shardIdx + 1, Total: len(affectedShards), Message: "incremental reindex"}
+			}
+			si, err := b.buildShard(branchName, cfg, progress)
+			if err != nil {
+				errChan <- fmt.Errorf("rebuild shard %q: %w", name, err)
+				return
+			}
+			mu.Lock()
+			idx.Shards[name] = si
+			mu.Unlock()
+		}(i, shardName, *shardCfg)
 	}
 
-	// 增量更新跨片边
+	wg.Wait()
+	close(errChan)
+	for err := range errChan {
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	_ = b.extractCrossEdges(branchName, idx)
 
 	idx.UpdatedAt = time.Now()
@@ -148,7 +187,7 @@ func (b *Builder) IncrementalUpdate(branchName string, progress chan<- BuildProg
 }
 
 // ============================================================================
-// 分片构建（核心占位：待 Tree-sitter + 图算法集成）
+// 分片构建（真实实现）
 // ============================================================================
 
 func (b *Builder) buildShard(branchName string, cfg ShardConfig, progress chan<- BuildProgress) (*ShardIndex, error) {
@@ -158,50 +197,78 @@ func (b *Builder) buildShard(branchName string, cfg ShardConfig, progress chan<-
 		return nil, err
 	}
 
-	// 2. 创建/打开 SQLite AST 索引
+	// 2. Tree-sitter AST 解析
+	if progress != nil {
+		progress <- BuildProgress{Phase: "parse", Shard: cfg.Name, Current: 0, Total: len(files), Message: "parsing files with tree-sitter"}
+	}
+	parsedFiles, err := ParseFiles(files)
+	if err != nil {
+		return nil, fmt.Errorf("parse files: %w", err)
+	}
+
+	// 3. 构建调用图
+	graph := BuildGraphFromParsed(parsedFiles)
+
+	// 4. 创建/打开 SQLite AST 索引
 	db, err := b.Store.OpenShardDB(branchName, cfg.Name)
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 
-	// 3. Tree-sitter AST 解析 + 符号提取（占位）
-	// TODO: integrate go-tree-sitter for real AST parsing
-	symbols, edges := b.parseASTPlaceholder(files, cfg, progress)
-
-	// 4. 写入 SQLite
-	if err := b.insertSymbols(db, symbols); err != nil {
+	// 5. 写入 SQLite
+	if err := b.insertSymbols(db, parsedFiles); err != nil {
 		return nil, err
 	}
-	if err := b.insertEdges(db, edges); err != nil {
+	if err := b.insertEdges(db, parsedFiles); err != nil {
 		return nil, err
 	}
 
-	// 5. 调用图 JSON
-	cg := b.buildCallgraph(symbols, edges)
+	// 6. Leiden 社区检测
+	communities := graph.LeidenCommunities(1.0, 10)
+	communityList := graph.ToCommunities(communities)
+
+	// 7. God Node 识别
+	godNodeResults := graph.IdentifyGodNodes(50)
+	godNodes := make([]GodNode, len(godNodeResults))
+	for i, gn := range godNodeResults {
+		godNodes[i] = GodNode{
+			Name:      gn.Name,
+			Kind:      gn.Kind,
+			Degree:    gn.Degree,
+			InDegree:  gn.InDegree,
+			OutDegree: gn.OutDegree,
+			File:      gn.File,
+		}
+	}
+
+	// 8. 调用图 JSON
+	cg := buildCallgraph(graph)
 	cgPath := b.Store.CallgraphPath(branchName, cfg.Name)
 	if err := saveJSON(cgPath, cg); err != nil {
 		return nil, err
 	}
 
-	// 6. Leiden 社区检测（占位，纯算法）
-	communities := b.detectCommunitiesPlaceholder(symbols, edges)
-
-	// 7. God Node 识别
-	godNodes := b.identifyGodNodes(symbols, edges)
-
-	// 8. 清单生成
-	manifest := b.buildManifest(cfg.Name, symbols, edges)
+	// 9. 清单生成
+	manifest := b.buildManifestFromParsed(cfg.Name, parsedFiles)
 	mfPath := b.Store.ManifestPath(branchName, cfg.Name)
 	_ = saveYAML(mfPath, manifest)
 
-	// 9. 保存分片索引元数据
+	// 10. 统计
+	symbolCount := 0
+	edgeCount := 0
+	for _, pf := range parsedFiles {
+		symbolCount += len(pf.Symbols) + len(pf.Types)
+		edgeCount += len(pf.Calls)
+	}
+
+	// 11. 保存分片索引元数据
 	si := &ShardIndex{
 		ShardName:   cfg.Name,
 		FileCount:   len(files),
-		SymbolCount: len(symbols),
-		EdgeCount:   len(edges),
-		Communities: communities,
+		SymbolCount: symbolCount,
+		EdgeCount:   edgeCount,
+		Communities: communityList,
 		GodNodes:    godNodes,
 		Manifest:    manifest,
 		LastIndexed: time.Now(),
@@ -213,113 +280,39 @@ func (b *Builder) buildShard(branchName string, cfg ShardConfig, progress chan<-
 }
 
 // ============================================================================
-// 占位实现（后续替换为真实算法）
-// ============================================================================
-
-type edgeRef struct {
-	Src  string
-	Dst  string
-	Kind string
-	File string
-	Line int
-}
-
-// parseASTPlaceholder 占位 AST 解析：模拟提取符号和边。
-func (b *Builder) parseASTPlaceholder(files []string, cfg ShardConfig, progress chan<- BuildProgress) ([]SymbolRef, []edgeRef) {
-	var symbols []SymbolRef
-	var edges []edgeRef
-	for i, f := range files {
-		if progress != nil && i%100 == 0 {
-			progress <- BuildProgress{Phase: "parse", Shard: cfg.Name, Current: i, Total: len(files), Message: "parsing files"}
-		}
-		// 简单启发式：从文件名推导出一些符号
-		base := filepath.Base(f)
-		name := strings.TrimSuffix(base, filepath.Ext(base))
-		symbols = append(symbols, SymbolRef{
-			Name: name,
-			Kind: "function",
-			File: f,
-			Line: 1,
-		})
-	}
-	return symbols, edges
-}
-
-// detectCommunitiesPlaceholder 占位社区检测。
-func (b *Builder) detectCommunitiesPlaceholder(symbols []SymbolRef, edges []edgeRef) []Community {
-	// TODO: replace with real Leiden algorithm (gonum/graph or custom implementation)
-	if len(symbols) == 0 {
-		return nil
-	}
-	return []Community{{
-		ID:        0,
-		Label:     "default",
-		Files:     []string{},
-		CoreNodes: []string{},
-		NodeCount: len(symbols),
-		EdgeCount: len(edges),
-	}}
-}
-
-// identifyGodNodes 基于度数统计识别枢纽节点。
-func (b *Builder) identifyGodNodes(symbols []SymbolRef, edges []edgeRef) []GodNode {
-	deg := make(map[string]int)
-	inDeg := make(map[string]int)
-	outDeg := make(map[string]int)
-	for _, e := range edges {
-		deg[e.Src]++
-		deg[e.Dst]++
-		outDeg[e.Src]++
-		inDeg[e.Dst]++
-	}
-	var gods []GodNode
-	for _, s := range symbols {
-		d := deg[s.Name]
-		if d > 10 { // 阈值可配置
-			gods = append(gods, GodNode{
-				Name:      s.Name,
-				Kind:      s.Kind,
-				Degree:    d,
-				InDegree:  inDeg[s.Name],
-				OutDegree: outDeg[s.Name],
-				File:      s.File,
-			})
-		}
-	}
-	return gods
-}
-
-// buildManifest 构建分片接口清单。
-func (b *Builder) buildManifest(shardName string, symbols []SymbolRef, edges []edgeRef) Manifest {
-	// TODO: real export/import detection via visibility analysis
-	var exports []SymbolRef
-	var imports []SymbolRef
-	for _, s := range symbols {
-		// 占位：假设所有符号都是 exports
-		exports = append(exports, s)
-	}
-	return Manifest{Exports: exports, Imports: imports}
-}
-
-// buildCallgraph 构建调用图结构（JSON 序列化用）。
-func (b *Builder) buildCallgraph(symbols []SymbolRef, edges []edgeRef) map[string]interface{} {
-	return map[string]interface{}{
-		"nodes": symbols,
-		"edges": edges,
-	}
-}
-
-// ============================================================================
 // 跨片边提取
 // ============================================================================
 
 func (b *Builder) extractCrossEdges(branchName string, idx *BranchIndex) error {
-	// TODO: real cross-shard edge extraction using symbol resolution
-	// Placeholder: create an empty KuzuDB or SQLite cross_edges file
+	// 收集所有分片的 exports 和 imports
+	exportMap := make(map[string]string) // symbol -> shard
+	for shardName, si := range idx.Shards {
+		for _, exp := range si.Manifest.Exports {
+			exportMap[exp.Name] = shardName
+		}
+	}
+
+	// 识别跨片调用
+	var crossEdges []edgeRef
+	for shardName, si := range idx.Shards {
+		for _, imp := range si.Manifest.Imports {
+			if targetShard, ok := exportMap[imp.Name]; ok && targetShard != shardName {
+				crossEdges = append(crossEdges, edgeRef{
+					Src:  fmt.Sprintf("%s:%s", shardName, imp.Name),
+					Dst:  fmt.Sprintf("%s:%s", targetShard, imp.Name),
+					Kind: "cross_shard_call",
+				})
+			}
+		}
+	}
+
+	// 保存跨片边（JSON 格式，后续可替换为 KuzuDB）
 	path := b.Store.CrossEdgesPath(branchName)
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
-	// KuzuDB placeholder
-	return nil
+	return saveJSON(path+".json", map[string]interface{}{
+		"cross_edges": crossEdges,
+		"extracted_at": time.Now(),
+	})
 }
 
 // ============================================================================
@@ -327,9 +320,34 @@ func (b *Builder) extractCrossEdges(branchName string, idx *BranchIndex) error {
 // ============================================================================
 
 func (b *Builder) detectChangedFiles(branchName string) ([]string, error) {
-	// TODO: use git diff to detect changed files since last indexed commit
-	// Placeholder: return empty (no changes)
-	return []string{}, nil
+	// 获取上次索引的 commit hash
+	idx, err := b.Store.LoadBranchIndex(branchName)
+	if err != nil {
+		// 首次更新，无法检测，返回空（全量重建由调用方决定）
+		return nil, nil
+	}
+
+	// 使用 git diff 检测变更
+	baseCommit := idx.CommitHash
+	if baseCommit == "" {
+		baseCommit = "HEAD~1"
+	}
+
+	cmd := exec.Command("git", "-C", b.Config.RepoPath, "diff", "--name-only", baseCommit)
+	out, err := cmd.Output()
+	if err != nil {
+		// git 命令失败，返回空（安全降级）
+		return nil, nil
+	}
+
+	var changed []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			changed = append(changed, filepath.Join(b.Config.RepoPath, line))
+		}
+	}
+	return changed, nil
 }
 
 func (b *Builder) mapFilesToShards(files []string) []string {
@@ -337,7 +355,8 @@ func (b *Builder) mapFilesToShards(files []string) []string {
 	for _, f := range files {
 		for _, shard := range b.Config.Shards {
 			for _, root := range shard.RootDirs {
-				if strings.HasPrefix(f, root) {
+				rootPath := filepath.Join(b.Config.RepoPath, root)
+				if strings.HasPrefix(f, rootPath) {
 					shardSet[shard.Name] = true
 					break
 				}
@@ -373,7 +392,7 @@ func (b *Builder) enumerateFiles(cfg ShardConfig) ([]string, error) {
 				return nil
 			}
 			ext := strings.ToLower(filepath.Ext(path))
-			if ext == ".c" || ext == ".cc" || ext == ".cpp" || ext == ".h" || ext == ".hpp" || ext == ".go" || ext == ".rs" || ext == ".java" || ext == ".py" || ext == ".js" || ext == ".ts" {
+			if ext == ".c" || ext == ".cc" || ext == ".cpp" || ext == ".h" || ext == ".hpp" || ext == ".go" || ext == ".rs" || ext == ".java" || ext == ".py" || ext == ".js" || ext == ".ts" || ext == ".tsx" || ext == ".jsx" {
 				files = append(files, path)
 			}
 			return nil
@@ -383,22 +402,143 @@ func (b *Builder) enumerateFiles(cfg ShardConfig) ([]string, error) {
 }
 
 // ============================================================================
-// 数据库辅助
+// 数据库辅助（真实实现）
 // ============================================================================
 
-func (b *Builder) insertSymbols(db *sql.DB, symbols []SymbolRef) error {
-	// Placeholder: batch insert into SQLite
-	return nil
+func (b *Builder) insertSymbols(db *sql.DB, files []ParsedFile) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("INSERT INTO symbols (name, kind, file, line, col, parent_id) VALUES (?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, pf := range files {
+		for _, sym := range pf.Symbols {
+			_, err := stmt.Exec(sym.Name, sym.Kind, sym.File, sym.Line, 0, nil)
+			if err != nil {
+				return err
+			}
+		}
+		for _, t := range pf.Types {
+			_, err := stmt.Exec(t.Name, t.Kind, t.File, t.Line, 0, nil)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
-func (b *Builder) insertEdges(db *sql.DB, edges []edgeRef) error {
-	// Placeholder: batch insert into SQLite
-	return nil
+func (b *Builder) insertEdges(db *sql.DB, files []ParsedFile) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("INSERT INTO edges (src_symbol, dst_symbol, kind, file, line) VALUES (?, ?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, pf := range files {
+		for _, call := range pf.Calls {
+			_, err := stmt.Exec(call.Caller, call.Callee, "call", call.File, call.Line)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 // ============================================================================
-// 通用序列化辅助
+// 清单生成
 // ============================================================================
+
+func (b *Builder) buildManifestFromParsed(shardName string, files []ParsedFile) Manifest {
+	var exports []SymbolRef
+	var imports []SymbolRef
+	importSet := make(map[string]bool)
+
+	for _, pf := range files {
+		// 所有符号都视为 exports（简化版，后续可做可见性分析）
+		for _, sym := range pf.Symbols {
+			exports = append(exports, sym)
+		}
+		for _, t := range pf.Types {
+			exports = append(exports, SymbolRef{
+				Name: t.Name,
+				Kind: t.Kind,
+				File: t.File,
+				Line: t.Line,
+			})
+		}
+		// imports
+		for _, imp := range pf.Imports {
+			if !importSet[imp] {
+				importSet[imp] = true
+				imports = append(imports, SymbolRef{
+					Name: imp,
+					Kind: "import",
+					File: pf.Path,
+				})
+			}
+		}
+	}
+	return Manifest{Exports: exports, Imports: imports}
+}
+
+// ============================================================================
+// 通用辅助
+// ============================================================================
+
+type edgeRef struct {
+	Src  string
+	Dst  string
+	Kind string
+	File string
+	Line int
+}
+
+func buildCallgraph(graph *Graph) map[string]interface{} {
+	var nodes []map[string]interface{}
+	for id, node := range graph.Nodes {
+		nodes = append(nodes, map[string]interface{}{
+			"id":         id,
+			"label":      node.Label,
+			"kind":       node.Kind,
+			"file":       node.File,
+			"line":       node.Line,
+			"degree":     node.Degree,
+			"in_degree":  node.InDegree,
+			"out_degree": node.OutDegree,
+		})
+	}
+	var edges []map[string]interface{}
+	for src, dsts := range graph.Edges {
+		for dst, w := range dsts {
+			edges = append(edges, map[string]interface{}{
+				"source": src,
+				"target": dst,
+				"weight": w,
+			})
+		}
+	}
+	return map[string]interface{}{
+		"nodes": nodes,
+		"edges": edges,
+		"node_count": len(graph.Nodes),
+		"edge_count": len(edges),
+	}
+}
 
 func saveJSON(path string, v interface{}) error {
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
