@@ -50,8 +50,10 @@ func (b *Builder) BuildAll(branchName string, progress chan<- BuildProgress) (*B
 		return nil, err
 	}
 
+	commitHash, _ := getCurrentCommit(b.Config.RepoPath)
 	idx := &BranchIndex{
 		BranchName: branchName,
+		CommitHash: commitHash,
 		Shards:     make(map[string]*ShardIndex),
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
@@ -176,6 +178,7 @@ func (b *Builder) IncrementalUpdate(branchName string, progress chan<- BuildProg
 	_ = b.extractCrossEdges(branchName, idx)
 
 	idx.UpdatedAt = time.Now()
+	idx.CommitHash, _ = getCurrentCommit(b.Config.RepoPath)
 	if err := b.Store.SaveBranchIndex(idx); err != nil {
 		return nil, err
 	}

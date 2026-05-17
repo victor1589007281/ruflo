@@ -19,20 +19,22 @@ import (
 
 // Engine 三引擎查询路由器。
 type Engine struct {
-	GitNexus *GitNexusEngine
-	Graphify *GraphifyEngine
-	Native   *NativeEngine
-	Store    *Store
+	GitNexus     *GitNexusEngine
+	Graphify     *GraphifyEngine
+	Native       *NativeEngine
+	Store        *Store
+	StaleDetector *StaleDetector
 }
 
 // NewEngine 创建三引擎路由器。
 func NewEngine(repoPath string) *Engine {
 	store := NewStore(repoPath)
 	return &Engine{
-		GitNexus: NewGitNexusEngine(repoPath),
-		Graphify: NewGraphifyEngine(repoPath),
-		Native:   NewNativeEngine(repoPath),
-		Store:    store,
+		GitNexus:      NewGitNexusEngine(repoPath),
+		Graphify:      NewGraphifyEngine(repoPath),
+		Native:        NewNativeEngine(repoPath),
+		Store:         store,
+		StaleDetector: NewStaleDetector(repoPath),
 	}
 }
 
@@ -42,6 +44,7 @@ func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, err
 	if err != nil {
 		return e.nativeFallback("navigate", q.Symbol, err)
 	}
+	e.injectStaleIfNeeded(qr, branchName)
 	return qr, nil
 }
 
@@ -51,6 +54,7 @@ func (e *Engine) Impact(branchName string, q ImpactQuery) (*QueryResult, error) 
 	if err != nil {
 		return e.nativeFallback("impact", q.FilePath, err)
 	}
+	e.injectStaleIfNeeded(qr, branchName)
 	return qr, nil
 }
 
@@ -60,6 +64,7 @@ func (e *Engine) FindRefs(branchName string, q NavigateQuery) (*QueryResult, err
 	if err != nil {
 		return e.nativeFallback("find_refs", q.Symbol, err)
 	}
+	e.injectStaleIfNeeded(qr, branchName)
 	return qr, nil
 }
 
@@ -69,6 +74,7 @@ func (e *Engine) Communities(branchName string, q CommunityQuery) (*QueryResult,
 	if err != nil {
 		return e.nativeFallback("communities", q.Shard, err)
 	}
+	e.injectStaleIfNeeded(qr, branchName)
 	return qr, nil
 }
 
@@ -78,6 +84,7 @@ func (e *Engine) GodNodes(branchName, shardName string, topN int) (*QueryResult,
 	if err != nil {
 		return e.nativeFallback("god_nodes", shardName, err)
 	}
+	e.injectStaleIfNeeded(qr, branchName)
 	return qr, nil
 }
 
@@ -87,6 +94,7 @@ func (e *Engine) Path(branchName string, src, dst string) (*QueryResult, error) 
 	if err != nil {
 		return e.nativeFallback("path", src+"->"+dst, err)
 	}
+	e.injectStaleIfNeeded(qr, branchName)
 	return qr, nil
 }
 
@@ -96,6 +104,7 @@ func (e *Engine) Surprises(branchName, shardName string, topN int) (*QueryResult
 	if err != nil {
 		return e.nativeFallback("surprises", shardName, err)
 	}
+	e.injectStaleIfNeeded(qr, branchName)
 	return qr, nil
 }
 
@@ -105,6 +114,7 @@ func (e *Engine) CrossShard(branchName string, q CrossShardQuery) (*QueryResult,
 	if err != nil {
 		return e.nativeFallback("cross_shard", q.Symbol, err)
 	}
+	e.injectStaleIfNeeded(qr, branchName)
 	return qr, nil
 }
 
@@ -177,6 +187,17 @@ func (e *Engine) UnifiedQuery(branchName string, q UnifiedQuery) (*QueryResult, 
 		return e.Native.ReadFile(q.FilePath, ReadOptions{Offset: q.Depth, Limit: q.TopN})
 	default:
 		return nil, fmt.Errorf("unknown query_type: %s", q.QueryType)
+	}
+}
+
+// injectStaleIfNeeded 检测索引过期并在结果中注入警告。
+func (e *Engine) injectStaleIfNeeded(qr *QueryResult, branchName string) {
+	if e.StaleDetector == nil || qr == nil {
+		return
+	}
+	report, err := e.StaleDetector.Check(branchName)
+	if err == nil && report != nil && report.IsStale {
+		InjectStaleWarning(qr, report)
 	}
 }
 
