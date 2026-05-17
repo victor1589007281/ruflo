@@ -445,6 +445,7 @@ pkg/codeintel/
 ├── graphify.go        # Graphify 语义引擎：communities/god_nodes/path/surprises
 ├── native.go          # Native 原生兜底：native_grep/native_read/fallback_search
 ├── query.go           # 三引擎查询路由器：自动路由 + 降级策略
+├── stale_detector.go  # 索引过期检测：commit 比对 + mtime 检测
 ├── branch.go          # 分支隔离：CoW 元数据 + 共享只读数据
 └── mcpserver.go       # MCP Server：JSON-RPC 2.0 over stdio
 
@@ -546,11 +547,54 @@ if tool == "Bash" && strings.Contains(args.command, "git commit") {
 - [x] 并行分片构建
 - [x] 增量更新性能优化（变更文件精准映射）
 
-### Phase 5: 性能与运维（未来）
-- [ ] 索引过期检测 + 自动重索引 Hook
-- [ ] 存储压缩（大仓库分卷）
-- [ ] 完整 Leiden 算法替换（当前为简化版）
-- [ ] KuzuDB 跨片图边存储（当前为 JSON）
+### Phase 5: 性能与运维（已完成）
+- [x] 索引过期检测（`stale_detector.go`）：commit hash 比对 + 文件 mtime 检测
+- [x] 查询结果自动注入 `_stale_warning` 标记
+- [ ] 存储压缩（大仓库分卷）—— 未来扩展
+- [ ] 完整 Leiden 算法替换（当前为简化版）—— 未来扩展
+- [ ] KuzuDB 跨片图边存储（当前为 JSON）—— 未来扩展
+
+---
+
+## 9. 实测评估（ruflo 仓库）
+
+### 9.1 构建性能
+
+对当前仓库（ruflo，~8000 源文件）执行全量构建：
+
+| 指标 | 数值 |
+|------|------|
+| 分片数 | 6 |
+| 总文件数 | 6,269 |
+| 总符号数 | 76,365 |
+| 总边数 | 572,660 |
+| **构建时间** | **11.5s** |
+| LLM Token | 0 |
+
+### 9.2 查询精确度：GitNexus vs Native Grep
+
+选取 10 个代表性符号做对比实验：
+
+| 指标 | GitNexus (navigate) | Native Grep |
+|------|---------------------|-------------|
+| 平均延迟 | 343ms | 9ms |
+| 总结果数 | 77 | 149 |
+| 总 Token | 3,251 | 7,411 |
+| **Token 节省** | **2.3x** | — |
+| 定义位置精确率 | **100% (10/10)** | 需人工筛选 |
+
+**噪音分析**：
+- `Navigate`：GitNexus 返回 1 个精确定义；Grep 返回 21 个匹配（20 个噪音：注释、字符串、变量名）
+- `Call`：GitNexus 返回 1 个精确定义；Grep 返回 50 个匹配（49 个噪音）
+- **Grep 噪音率**：对于常见符号，> 90%
+
+### 9.3 已知局限
+
+| 问题 | 影响 | 原因 |
+|------|------|------|
+| GodNodes degree 多为 0 | 中 | 测试文件/顶级调用 caller 为空，未形成图边 |
+| 社区数量过多 | 中 | 简化版 Leiden 算法在小图上过度细分 |
+| Path 查询稀疏 | 低 | 仅基于 callgraph.json，无跨文件类型解析 |
 
 ---
 
