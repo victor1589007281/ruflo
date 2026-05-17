@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"path"
 	"strings"
 	"sync"
@@ -95,8 +97,16 @@ func (r *Runner) RunPreToolUseHooks(toolName string, input json.RawMessage) (*ty
 			continue
 		}
 		if output != nil {
-			if output.Decision == "block" {
+			// Decision 语义: "deny" / "block" = 阻止; "approve" = 显式放行并跳过剩余 hook
+			if output.Decision == "deny" || output.Decision == "block" {
 				return output, nil
+			}
+			if output.Decision == "approve" {
+				// 显式批准: 跳过剩余 hooks，返回 nil 表示不阻止
+				if len(contexts) > 0 {
+					return &types.HookOutput{AdditionalContext: strings.Join(contexts, "\n")}, nil
+				}
+				return nil, nil
 			}
 			if output.AdditionalContext != "" {
 				contexts = append(contexts, output.AdditionalContext)
@@ -191,19 +201,25 @@ func (r *Runner) executeStopLikeHooks(event types.HookEvent, messages []types.Me
 		if err != nil {
 			continue
 		}
-		if output != nil && output.ContinueDecision == "block" {
-			reason := output.Reason
-			if reason == "" {
-				reason = "Stop hook 要求继续"
+		if output != nil {
+			// ContinueDecision 语义: "deny" / "block" = 阻止并注入恢复消息; "approve" = 不阻止
+			if output.ContinueDecision == "approve" {
+				return nil
 			}
-			blockingMessages = append(blockingMessages, types.Message{
-				Type: types.MessageTypeUser,
-				Content: []types.ContentBlock{{
-					Type: types.ContentBlockText,
-					Text: reason,
-				}},
-				IsMeta: true,
-			})
+			if output.ContinueDecision == "deny" || output.ContinueDecision == "block" {
+				reason := output.Reason
+				if reason == "" {
+					reason = "Stop hook 要求继续"
+				}
+				blockingMessages = append(blockingMessages, types.Message{
+					Type: types.MessageTypeUser,
+					Content: []types.ContentBlock{{
+						Type: types.ContentBlockText,
+						Text: reason,
+					}},
+					IsMeta: true,
+				})
+			}
 		}
 	}
 	return blockingMessages
@@ -434,7 +450,7 @@ func effectiveHookType(h types.HookConfig) types.HookType {
 	return h.HookType
 }
 
-// executeHook 执行单个 hook（command / prompt / http）。
+// executeHook 执行单个 hook（command / prompt / http / mcp / plugin / opa / function / grpc）。
 func (r *Runner) executeHook(config types.HookConfig, input types.HookInput) (*types.HookOutput, error) {
 	switch effectiveHookType(config) {
 	case types.HookTypePrompt:
@@ -445,6 +461,16 @@ func (r *Runner) executeHook(config types.HookConfig, input types.HookInput) (*t
 		return &types.HookOutput{AdditionalContext: text}, nil
 	case types.HookTypeHTTP:
 		return r.executeHTTPHook(config, input)
+	case types.HookTypeMCP:
+		return r.executeMCPHook(config, input)
+	case types.HookTypePlugin:
+		return r.executePluginHook(config, input)
+	case types.HookTypeOPA:
+		return r.executeOPAHook(config, input)
+	case types.HookTypeFunction:
+		return r.executeFunctionHook(config, input)
+	case types.HookTypeGRPC:
+		return r.executeGRPCHook(config, input)
 	default:
 		return r.executeCommandHook(config, input)
 	}
@@ -566,6 +592,297 @@ func (r *Runner) executeCommandHook(config types.HookConfig, input types.HookInp
 			}, nil
 		}
 		return nil, fmt.Errorf("hook 执行失败: %w", runErr)
+	}
+
+	return nil, nil
+}
+
+// ============================================================================
+// 扩展 Hook 执行器: MCP / OPA / Function / gRPC
+// Plugin 见 hooks_plugin.go (build tag: linux || freebsd || darwin)
+// ============================================================================
+
+// mcpJSONRPCRequest MCP JSON-RPC 请求体
+type mcpJSONRPCRequest struct {
+	JSONRPC string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params"`
+	ID      int         `json:"id"`
+}
+
+// mcpJSONRPCResponse MCP JSON-RPC 响应体
+type mcpJSONRPCResponse struct {
+	Result *mcpToolCallResult `json:"result,omitempty"`
+	Error  *mcpJSONRPCError   `json:"error,omitempty"`
+	ID     int                `json:"id"`
+}
+
+// mcpToolCallResult MCP tools/call 结果
+type mcpToolCallResult struct {
+	Content []mcpContentItem `json:"content"`
+}
+
+// mcpContentItem MCP 内容项
+type mcpContentItem struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+// mcpJSONRPCError MCP JSON-RPC 错误
+type mcpJSONRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// executeMCPHook 通过 HTTP JSON-RPC 调用 MCP 工具。
+// 配置: URL = MCP 服务端点, MCPTool = 工具名（Command 作为 MCPTool 回退）。
+func (r *Runner) executeMCPHook(config types.HookConfig, input types.HookInput) (*types.HookOutput, error) {
+	urlStr := strings.TrimSpace(config.URL)
+	if urlStr == "" {
+		return nil, fmt.Errorf("mcp hook: empty url")
+	}
+
+	toolName := strings.TrimSpace(config.MCPTool)
+	if toolName == "" {
+		toolName = strings.TrimSpace(config.Command)
+	}
+	if toolName == "" {
+		return nil, fmt.Errorf("mcp hook: empty tool name")
+	}
+
+	timeout := r.timeout
+	if config.Timeout > 0 {
+		timeout = time.Duration(config.Timeout) * time.Millisecond
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 将 HookInput 转为 map 以作为 arguments
+	inputJSON, _ := json.Marshal(input)
+	var args map[string]interface{}
+	_ = json.Unmarshal(inputJSON, &args)
+
+	reqBody, err := json.Marshal(mcpJSONRPCRequest{
+		JSONRPC: "2.0",
+		Method:  "tools/call",
+		Params: map[string]interface{}{
+			"name":      toolName,
+			"arguments": args,
+		},
+		ID: 1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mcp hook: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("mcp hook: request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("mcp hook: do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("mcp hook: read body: %w", err)
+	}
+
+	// 优先按 JSON-RPC 响应解析
+	var rpcResp mcpJSONRPCResponse
+	if err := json.Unmarshal(body, &rpcResp); err == nil {
+		if rpcResp.Error != nil {
+			return &types.HookOutput{
+				Decision: "deny",
+				Reason:   fmt.Sprintf("MCP error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message),
+			}, nil
+		}
+		if rpcResp.Result != nil && len(rpcResp.Result.Content) > 0 {
+			text := rpcResp.Result.Content[0].Text
+			var hookOut types.HookOutput
+			if err := json.Unmarshal([]byte(text), &hookOut); err == nil {
+				return &hookOut, nil
+			}
+			return &types.HookOutput{AdditionalContext: text}, nil
+		}
+	}
+
+	// 回退: 直接解析为 HookOutput
+	body = bytes.TrimSpace(body)
+	if len(body) > 0 && body[0] == '{' {
+		var hookOut types.HookOutput
+		if err := json.Unmarshal(body, &hookOut); err == nil {
+			return &hookOut, nil
+		}
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("mcp hook: status %s: %s", resp.Status, string(body))
+	}
+
+	return nil, nil
+}
+
+// executeOPAHook 通过 shell 调用 `opa eval` 执行 Rego 策略。
+// 配置: OPAPolicy = Rego 文件路径（Command 作为回退）, OPAQuery = 查询表达式。
+func (r *Runner) executeOPAHook(config types.HookConfig, input types.HookInput) (*types.HookOutput, error) {
+	policyFile := strings.TrimSpace(config.OPAPolicy)
+	if policyFile == "" {
+		policyFile = strings.TrimSpace(config.Command)
+	}
+	if policyFile == "" {
+		return nil, fmt.Errorf("opa hook: empty policy")
+	}
+
+	query := strings.TrimSpace(config.OPAQuery)
+	if query == "" {
+		query = "data.hook.allow"
+	}
+
+	timeout := r.timeout
+	if config.Timeout > 0 {
+		timeout = time.Duration(config.Timeout) * time.Millisecond
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return nil, fmt.Errorf("opa hook: marshal input: %w", err)
+	}
+
+	// 将输入写入临时文件
+	tmpFile, err := os.CreateTemp("", "opa-input-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("opa hook: create temp: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(inputJSON); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("opa hook: write temp: %w", err)
+	}
+	tmpFile.Close()
+
+	cmd := exec.CommandContext(ctx, "opa", "eval", "--data", policyFile, "--input", tmpFile.Name(), query)
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+			return nil, fmt.Errorf("opa hook: eval failed: %s", string(exitErr.Stderr))
+		}
+		return nil, fmt.Errorf("opa hook: eval: %w", err)
+	}
+
+	// 解析 OPA 输出
+	var opaOut struct {
+		Result []struct {
+			Expressions []struct {
+				Value interface{} `json:"value"`
+			} `json:"expressions"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &opaOut); err != nil {
+		return nil, fmt.Errorf("opa hook: parse output: %w", err)
+	}
+
+	if len(opaOut.Result) > 0 && len(opaOut.Result[0].Expressions) > 0 {
+		val := opaOut.Result[0].Expressions[0].Value
+
+		// 布尔结果
+		if allow, ok := val.(bool); ok {
+			if !allow {
+				return &types.HookOutput{Decision: "deny", Reason: "OPA policy denied"}, nil
+			}
+			return &types.HookOutput{Decision: "approve"}, nil
+		}
+
+		// 对象结果
+		if m, ok := val.(map[string]interface{}); ok {
+			hookOut := types.HookOutput{}
+			if d, ok := m["decision"].(string); ok {
+				hookOut.Decision = d
+			}
+			if reason, ok := m["reason"].(string); ok {
+				hookOut.Reason = reason
+			}
+			if ctx, ok := m["additional_context"].(string); ok {
+				hookOut.AdditionalContext = ctx
+			}
+			if hookOut.Decision == "" {
+				// 默认对象存在即 allow
+				hookOut.Decision = "approve"
+			}
+			return &hookOut, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// executeFunctionHook 通过 HTTP 调用函数端点（Function-as-a-Service 风格）。
+// 配置: URL = 端点地址, FunctionName = 函数名（Command 作为回退）。
+func (r *Runner) executeFunctionHook(config types.HookConfig, input types.HookInput) (*types.HookOutput, error) {
+	urlStr := strings.TrimSpace(config.URL)
+	if urlStr == "" {
+		return nil, fmt.Errorf("function hook: empty url")
+	}
+
+	funcName := strings.TrimSpace(config.FunctionName)
+	if funcName == "" {
+		funcName = strings.TrimSpace(config.Command)
+	}
+
+	timeout := r.timeout
+	if config.Timeout > 0 {
+		timeout = time.Duration(config.Timeout) * time.Millisecond
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"function": funcName,
+		"input":    input,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("function hook: marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("function hook: request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("function hook: do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("function hook: read body: %w", err)
+	}
+
+	body = bytes.TrimSpace(body)
+	if len(body) > 0 && body[0] == '{' {
+		var hookOutput types.HookOutput
+		if err := json.Unmarshal(body, &hookOutput); err == nil {
+			return &hookOutput, nil
+		}
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("function hook: status %s: %s", resp.Status, string(body))
 	}
 
 	return nil, nil

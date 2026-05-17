@@ -701,8 +701,22 @@ func (b *Bot) parseHookConfigs(config *BotConfig) []types.HookConfig {
 	var hookConfigs []types.HookConfig
 	for _, h := range config.Hooks {
 		hookConfigs = append(hookConfigs, types.HookConfig{
-			Event: types.HookEvent(h.Event), Command: h.Command,
-			Timeout: h.Timeout, If: h.If,
+			Event:    types.HookEvent(h.Event),
+			HookType: types.HookType(h.HookType),
+			Command:  h.Command,
+			Timeout:  h.Timeout,
+			If:       h.If,
+			URL:      h.URL,
+
+			MCPServer:    h.MCPServer,
+			MCPTool:      h.MCPTool,
+			PluginPath:   h.PluginPath,
+			PluginSymbol: h.PluginSymbol,
+			OPAPolicy:    h.OPAPolicy,
+			OPAQuery:     h.OPAQuery,
+			FunctionName: h.FunctionName,
+			GRPCService:  h.GRPCService,
+			GRPCMethod:   h.GRPCMethod,
 		})
 	}
 	return hookConfigs

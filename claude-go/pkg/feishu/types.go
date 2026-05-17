@@ -445,10 +445,31 @@ type MCPServerEntry struct {
 
 // HookEntry Hook 配置条目
 type HookEntry struct {
-	Event   string `json:"event"`
-	Command string `json:"command"`
-	Timeout int    `json:"timeout,omitempty"`
-	If      string `json:"if,omitempty"`
+	Event    string `json:"event"`
+	HookType string `json:"hook_type,omitempty"`
+	Command  string `json:"command"`
+	Timeout  int    `json:"timeout,omitempty"`
+	If       string `json:"if,omitempty"`
+	URL      string `json:"url,omitempty"`
+
+	// MCP 类型专用
+	MCPServer string `json:"mcp_server,omitempty"`
+	MCPTool   string `json:"mcp_tool,omitempty"`
+
+	// Plugin 类型专用
+	PluginPath   string `json:"plugin_path,omitempty"`
+	PluginSymbol string `json:"plugin_symbol,omitempty"`
+
+	// OPA 类型专用
+	OPAPolicy string `json:"opa_policy,omitempty"`
+	OPAQuery  string `json:"opa_query,omitempty"`
+
+	// Function 类型专用
+	FunctionName string `json:"function_name,omitempty"`
+
+	// gRPC 类型专用
+	GRPCService string `json:"grpc_service,omitempty"`
+	GRPCMethod  string `json:"grpc_method,omitempty"`
 }
 
 // ResolveJSONConfigPath 解析 JSON 配置文件路径。

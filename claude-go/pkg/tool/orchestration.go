@@ -222,7 +222,8 @@ func RunToolUse(
 	if hookRunner != nil {
 		hookOut, err := hookRunner.RunPreToolUseHooks(toolName, block.Input)
 		if err == nil && hookOut != nil {
-			if hookOut.Decision == "block" {
+			// Decision 语义: "deny" / "block" = 阻止; "approve" = 显式放行
+			if hookOut.Decision == "deny" || hookOut.Decision == "block" {
 				reason := hookOut.Reason
 				if reason == "" {
 					reason = "被 hook 阻止"

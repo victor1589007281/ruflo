@@ -2176,7 +2176,30 @@ func buildEngine() (*engine.QueryEngine, error) {
 		contextWindow = resolvedModel.ContextWindow
 	}
 
-	hookRunner := hooks.NewRunner(nil, "")
+	var hookConfigs []types.HookConfig
+	if jsonCfg != nil {
+		for _, h := range jsonCfg.Hooks {
+			hookConfigs = append(hookConfigs, types.HookConfig{
+				Event:    types.HookEvent(h.Event),
+				HookType: types.HookType(h.HookType),
+				Command:  h.Command,
+				Timeout:  h.Timeout,
+				If:       h.If,
+				URL:      h.URL,
+
+				MCPServer:    h.MCPServer,
+				MCPTool:      h.MCPTool,
+				PluginPath:   h.PluginPath,
+				PluginSymbol: h.PluginSymbol,
+				OPAPolicy:    h.OPAPolicy,
+				OPAQuery:     h.OPAQuery,
+				FunctionName: h.FunctionName,
+				GRPCService:  h.GRPCService,
+				GRPCMethod:   h.GRPCMethod,
+			})
+		}
+	}
+	hookRunner := hooks.NewRunner(hookConfigs, "")
 	compactor := compact.NewCompactor(apiClient, contextWindow)
 	promptMgr := prompt.NewManager(cwd)
 	if flagSystemPrompt != "" {

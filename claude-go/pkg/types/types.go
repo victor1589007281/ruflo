@@ -295,9 +295,14 @@ const (
 type HookType string
 
 const (
-	HookTypeCommand HookType = "command"
-	HookTypePrompt  HookType = "prompt"
-	HookTypeHTTP    HookType = "http"
+	HookTypeCommand  HookType = "command"
+	HookTypePrompt   HookType = "prompt"
+	HookTypeHTTP     HookType = "http"
+	HookTypeMCP      HookType = "mcp"
+	HookTypePlugin   HookType = "plugin"
+	HookTypeOPA      HookType = "opa"
+	HookTypeFunction HookType = "function"
+	HookTypeGRPC     HookType = "grpc"
 )
 
 // HookConfig 用户自定义 hook 配置
@@ -306,10 +311,29 @@ type HookConfig struct {
 	Event    HookEvent `json:"event"`
 	HookType HookType  `json:"hook_type,omitempty"`
 	// If 非空时仅当 tool_name 匹配该 glob 模式（如 "Read*"）时才运行；会话类事件无 tool 名时不匹配。
-	If       string    `json:"if,omitempty"`
-	Command  string    `json:"command"`
-	Timeout  int       `json:"timeout,omitempty"` // 毫秒
-	URL      string    `json:"url,omitempty"`     // http 类型时可显式指定 URL；否则使用 Command 作为 URL
+	If      string `json:"if,omitempty"`
+	Command string `json:"command"`
+	Timeout int    `json:"timeout,omitempty"` // 毫秒
+	URL     string `json:"url,omitempty"`     // http 类型时可显式指定 URL；否则使用 Command 作为 URL
+
+	// MCP 类型专用：通过 MCP 协议调用外部工具
+	MCPServer string `json:"mcp_server,omitempty"` // MCP 服务器名称或 URL
+	MCPTool   string `json:"mcp_tool,omitempty"`   // 要调用的 MCP 工具名
+
+	// Plugin 类型专用：通过 Go plugin 加载 .so
+	PluginPath   string `json:"plugin_path,omitempty"`   // .so 文件路径
+	PluginSymbol string `json:"plugin_symbol,omitempty"` // 导出符号名（默认 "Hook"）
+
+	// OPA 类型专用：通过 OPA eval 执行 Rego 策略
+	OPAPolicy string `json:"opa_policy,omitempty"` // Rego 策略文件路径
+	OPAQuery  string `json:"opa_query,omitempty"`  // Rego 查询表达式（默认 "data.hook.allow"）
+
+	// Function 类型专用：通过 HTTP 调用函数端点
+	FunctionName string `json:"function_name,omitempty"` // 函数名
+
+	// gRPC 类型专用
+	GRPCService string `json:"grpc_service,omitempty"` // gRPC 服务完整名（如 my.hook.PolicyService）
+	GRPCMethod  string `json:"grpc_method,omitempty"`  // gRPC 方法名（如 Evaluate）
 }
 
 // HookInput hook 执行时的输入数据
