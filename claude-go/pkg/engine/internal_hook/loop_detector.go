@@ -16,7 +16,7 @@
 //     判定为无效震荡, 提示模型换策略。
 //   - 编译错误指纹检测: 对 Bash 错误结果提取规范化指纹, 若同一指纹连续 >=2 次出现,
 //     判定为"此路不通", 提示模型停止重复尝试。
-package engine
+package internal_hook
 
 import (
 	"crypto/sha256"
@@ -98,7 +98,7 @@ func (d *LoopDetector) Observe(tool string, input []byte) (looped bool, suggesti
 
 	sig := callSignature{
 		Tool: tool,
-		Hash: normalizeHash(input),
+		Hash: NormalizeHash(input),
 		At:   time.Now(),
 	}
 
@@ -198,7 +198,7 @@ func (d *LoopDetector) checkEditOscillationLocked(tool string, input []byte) (bo
 	// 记录本次编辑
 	record := fileEditRecord{
 		ContentHash: contentHash,
-		InputHash:   normalizeHash(input),
+		InputHash:   NormalizeHash(input),
 		At:          time.Now(),
 	}
 	d.fileEdits[p] = append(d.fileEdits[p], record)
@@ -327,7 +327,7 @@ func (d *LoopDetector) Size() int {
 
 // normalizeHash 对 input 做轻量归一化 (去空白) 后 hash, 避免 trivial 差异导致误判。
 // 不做 JSON 字段排序 — 代价高且边际收益低, 真要误放过就留给下一轮 human-in-loop。
-func normalizeHash(input []byte) string {
+func NormalizeHash(input []byte) string {
 	if len(input) == 0 {
 		return "empty"
 	}

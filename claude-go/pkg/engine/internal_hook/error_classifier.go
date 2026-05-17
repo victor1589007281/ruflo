@@ -11,7 +11,7 @@
 //   - PTL 虽有专门分支, 但恢复后计数未重置
 //
 // 本组件按错误族分桶, 各族独立 budget + 独立 backoff 曲线。
-package engine
+package internal_hook
 
 import (
 	"context"

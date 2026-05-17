@@ -1,13 +1,15 @@
 # Claude-Go QueryEngine Hook 生命周期全景图
 
-> **版本**: 1.2（全 Hook 决策干预版）
+> **版本**: 1.5（internal_hook 重构完成版）
 > **日期**: 2026-05-17
-> **范围**: QueryEngine / Tool / Session 三层 Hook 全覆盖 + 8 种 Hook 执行类型
-> **目标**: 激活全部僵尸 Hook，补全业界缺失的生命周期观测点，扩展外部 Hook 类型至 MCP/Plugin/OPA/Function/gRPC，Decision 语义支持 approve/deny
+> **范围**: QueryEngine / Tool / Session 三层 Hook 全覆盖 + 8 种 Hook 执行类型 + 17 个内置 InternalHook
+> **目标**: 激活全部僵尸 Hook，补全业界缺失的生命周期观测点，扩展外部 Hook 类型至 MCP/Plugin/OPA/Function/gRPC，Decision 语义支持 approve/deny；queryLoop 全部硬编码功能点解耦为 InternalHook；可观测性指标全部迁移至 InternalHook；InternalHook 统一迁移到 `pkg/engine/internal_hook/` 包
 
 ---
 
-## 1. 生命周期 ASCII 图
+## 1. 生命周期全景图
+
+### 1.1 ASCII 生命周期图
 
 ```
 ═══════════════════════════════════════════════════════════════════════════════
@@ -96,14 +98,14 @@
   │  │  │  └─────────────────────────────────────────────────┘    │    │    │
   │  │  │      ↓                                                  │    │    │
   │  │  │  PostTurn              [新增·已激活] ✅ engine.go:1237 │    │    │
-  │  │  └─────────────────────────────────────────────────────────┘    │    │
-  │  │      ↓                                                          │    │
-  │  │  OnMaxTurnsReached     [新增·已激活] ✅ engine.go:1097       │    │
-  │  └─────────────────────────────────────────────────────────────────┘    │
-  │      ↓                                                                  │
-  │  SubagentStop          [已激活] ✅  pkg/feishu/session.go:869          │
-  │      ↓                                                                  │
-  │  SessionEnd            [已激活] ✅  pkg/feishu/session.go:870          │
+  │  └─────────────────────────────────────────────────────────┘    │    │
+  │      ↓                                                          │    │
+  │  OnMaxTurnsReached     [新增·已激活] ✅ engine.go:1097       │    │
+  └─────────────────────────────────────────────────────────────────┘    │
+      ↓                                                                  │
+  SubagentStop          [已激活] ✅  pkg/feishu/session.go:869          │
+      ↓                                                                  │
+  SessionEnd            [已激活] ✅  pkg/feishu/session.go:870          │
   └─────────────────────────────────────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -128,6 +130,208 @@
   │  Notification            [已激活] ✅  pkg/hooks/hooks.go:298           │
   └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+> **图例**
+> - 🔵 **外部 Hook**：用户可配置，通过 `hooks.Runner` 触发，`Decision`/`ContinueDecision` 支持干预
+> - 🟢 **Internal Hook**：引擎内置，编译期确定，通过 `HookChain` 按 `Priority` 排序调度
+> - 🔶 **动作**：引擎核心动作（API Call、Tool Execution、Compact）
+
+### 1.2 Mermaid 纵向生命周期图（主流程 + 内部 Hook 左右侧解读）
+
+> **布局说明**
+> - 引擎核心处理流为**纵向实线**，由多个 `direction LR` 的 Phase 行垂直堆叠而成；每行内部 Hooks（🟢）与引擎节点呈**左右关系**，不再上下堆叠。
+> - `PhasePreCompact / PhasePreRequest / PhasePreToolUse` 的 Hooks 位于主节点**左侧**；`PhasePostRequest / PhasePostToolUse` 的 Hooks 位于主节点**右侧**。
+> - 流式传输（chunk）过程显式展开，包含 `OnChunk` / `OnTokenStream`。
+> - `Error & Notification` 与 `PhaseOnError` 内部 Hooks 均在主流程内体现。
+> - 每个 Hook 节点包含：**函数名 | 一句话功能描述 | Execute 代码路径**。
+
+```mermaid
+flowchart TB
+    classDef ext fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef int fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px
+    classDef act fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
+
+    %% ===== Session 层 =====
+    SS([SessionStart 🔵<br/>session.go:767]):::ext --> SAS([SubagentStart 🔵<br/>session.go:768]):::ext
+
+    subgraph Turn["🔄 Turn Loop"]
+        direction TB
+
+        %% ---------- PreTurn ----------
+        PT([PreTurn 🔵<br/>engine.go:407]):::ext
+
+        %% ---------- Context Management（Hooks 在左） ----------
+        subgraph PhaseCompact["📦 Context Management"]
+            direction LR
+            ACH["🟢 AutoCompactHook<br/>上下文自动压缩+事实蒸馏<br/>hook_compact.go:83"]:::int
+            MCH["🟢 MicroCompactHook<br/>截断过大tool_result<br/>hook_compact.go:36"]:::int
+            BDH["🟢 BudgetDegradeHook<br/>Token预算分级降级<br/>hook_compact.go:150"]:::int
+            PC([PreCompact 🔵<br/>engine.go:451]):::ext --> AC{{AutoCompact}}:::act --> PoC([PostCompact 🔵<br/>engine.go:476]):::ext
+        end
+        ACH -.-> PC
+        MCH -.-> PC
+        BDH -.-> PC
+
+        %% ---------- LLM Inference（Hooks 在左） ----------
+        subgraph PhaseInference["📡 LLM Inference"]
+            direction LR
+            MFH["🟢 MessageFilterHook<br/>过滤古老纯tool_use单元<br/>hook_message.go:39"]:::int
+            MIH["🟢 MemoryInjectHook<br/>L1/L2记忆注入<br/>hook_memory.go:36"]:::int
+            PCH["🟢 PromptCacheHook<br/>static/dynamic拆分<br/>hook_memory.go:107"]:::int
+            PR([PreRequest 🔵<br/>engine.go:560]):::ext --> API{{API Call}}:::act
+        end
+        MFH -.-> PR
+        MIH -.-> PR
+        PCH -.-> PR
+
+        %% ---------- Streaming ----------
+        subgraph PhaseStream["⚡ Streaming"]
+            direction LR
+            API --> FC([首chunk]):::act --> OC([OnChunk / OnTokenStream 🔵<br/>engine.go:648]):::ext
+            OC --> C1[chunk #1] --> C2[chunk #2] --> CN[chunk #N]
+            CN --> PoReq([PostRequest 🔵<br/>engine.go:985]):::ext
+        end
+
+        %% ---------- PostRequest（Hook 在右） ----------
+        subgraph PhasePostReq["⚡ PostRequest"]
+            direction LR
+            PoReq --> PSH([PostSampling 🔵<br/>engine.go:971]):::ext
+            XFH["🟢 XMLToolFallbackHook<br/>XML风格回退解析<br/>hook_message.go:132"]:::int
+        end
+        XFH -.-> PoReq
+
+        %% ---------- Error Boundary（主流程内） ----------
+        API -.-> ERR([OnError 🔵]):::ext
+        PSH -.-> ERR
+        ERR --> OR([OnRecovery 🔵<br/>engine.go:709/731]):::ext --> NF([Notification 🔵<br/>hooks.go:298]):::ext
+
+        %% ---------- PhaseOnError（内部 Hooks 在 Error 左侧） ----------
+        subgraph PhaseOnError["🚨 PhaseOnError"]
+            direction LR
+            ECH["🟢 ErrorClassifierHook<br/>G4错误族分类与隔离预算<br/>hook_error.go:41"]:::int
+            CBH["🟢 CircuitBreakerHook<br/>连续错误熔断兜底<br/>hook_error.go:125"]:::int
+            ERR2([OnError 🔵]):::ext
+        end
+        ECH -.-> ERR2
+        CBH -.-> ERR2
+
+        %% ---------- Fork ----------
+        PSH --> ST([Stop 🔵<br/>engine.go:980]):::ext & PTU([PreToolUse 🔵<br/>tool/orchestration.go:222]):::ext
+
+        %% ---------- Stop Phase（Hook 在左） ----------
+        subgraph PhaseStop["🛑 Stop Phase"]
+            direction LR
+            MTRH["🟢 MaxTokensRecoveryHook<br/>max_tokens续写注入<br/>hook_message.go:78"]:::int -.-> ST
+            ST --> SF([StopFailure 🔵]):::ext
+        end
+
+        %% ---------- Tool Phase（Pre-Hooks 在左，Post-Hooks 在右） ----------
+        subgraph PhaseTool["🔧 Tool Phase"]
+            direction LR
+            JRH["🟢 JSONRepairHook<br/>工具输入JSON修复<br/>hook_tool.go:42"]:::int
+            LDIH["🟢 LoopDetectorInputHook<br/>同工具同参数死循环拦截<br/>hook_tool.go:96"]:::int
+            DTH["🟢 DisabledToolHook<br/>禁用工具拦截<br/>hook_tool.go:238"]:::int
+            PTU --> TE{{Tool Execution}}:::act --> PoTU([PostToolUse 🔵<br/>tool/orchestration.go:285]):::ext
+            LDRH["🟢 LoopDetectorResultHook<br/>编辑震荡/编译错误循环检测<br/>hook_tool.go:171"]:::int
+            SSH["🟢 StopSignalHook<br/>软停止信号检测<br/>hook_tool.go:305"]:::int
+            MCH2["🟢 MetricsCollectHook<br/>工具调用计数<br/>hook_metrics.go:36"]:::int
+        end
+        JRH -.-> PTU
+        LDIH -.-> PTU
+        DTH -.-> PTU
+        LDRH -.-> PoTU
+        SSH -.-> PoTU
+        MCH2 -.-> PoTU
+        PoTU --> PTF([PostToolUseFailure 🔵<br/>tool/orchestration.go:280]):::ext
+
+        %% ---------- PostTurn（Hook 在左） ----------
+        subgraph PhasePostTurn["📊 PostTurn"]
+            direction LR
+            TMH["🟢 TurnMetricsHook<br/>Turn级指标+Trajectory<br/>hook_metrics.go:79"]:::int -.-> PoT
+            SF & PTF --> PoT([PostTurn 🔵<br/>engine.go:1237]):::ext
+        end
+
+        %% ---------- Loop ----------
+        PoT -.->|next turn| PT
+    end
+
+    SAS --> PT
+    PoT --> OMT([OnMaxTurnsReached 🔵<br/>engine.go:1097]):::ext
+    OMT --> SAS2([SubagentStop 🔵<br/>session.go:869]):::ext --> SE([SessionEnd 🔵<br/>session.go:870]):::ext
+
+    %% ===== Agent Teams =====
+    subgraph Teams["👥 Agent Teams"]
+        TI([TeammateIdle 🔵<br/>hooks.go:336]):::ext --> TC([TaskCompleted 🔵<br/>hooks.go:348]):::ext
+    end
+```
+
+### 1.3 外部 Hook 执行类型与输入输出参数
+
+```mermaid
+classDiagram
+    class command {
+        +输入: stdin HookInput JSON
+        +输出: stdout HookOutput JSON
+        +exit 0 → 正常解析
+        +exit 2 → Decision=block, Reason=stderr
+    }
+
+    class http {
+        +输入: POST body HookInput JSON
+        +输出: 2xx 响应体 → HookOutput JSON
+        +非 2xx → error (fail-open)
+    }
+
+    class prompt {
+        +输入: command 字段纯文本
+        +输出: HookOutput{additional_context: text}
+        +零副作用, 不执行 shell
+    }
+
+    class mcp {
+        +输入: JSON-RPC tools/call
+        +参数: arguments = HookInput map
+        +输出: result.content[0].text → HookOutput JSON
+        +error → Decision=deny
+    }
+
+    class plugin {
+        +输入: []byte(HookInput JSON)
+        +符号: func([]byte)([]byte, error)
+        +输出: []byte → HookOutput JSON
+        +限制: Linux/macOS/FreeBSD
+    }
+
+    class opa {
+        +输入: --input HookInput JSON
+        +策略: --data policy.rego
+        +查询: opa_query (默认 data.hook.allow)
+        +输出: result[0].expressions[0].value
+        +false → deny, 对象 → HookOutput 映射
+    }
+
+    class function {
+        +输入: POST {function, input}
+        +输出: 2xx 响应体 → HookOutput JSON
+        +非 2xx → error (fail-open)
+    }
+
+    class grpc {
+        +输入: grpcurl -d HookInput JSON
+        +输出: stdout → HookOutput JSON
+        +grpcurl 不可用时回退 HTTP POST
+    }
+```
+
+### 1.4 外部 Hook 与 InternalHook 区别
+
+| 维度 | 外部 Hook（`hooks.Runner`） | 内置 InternalHook（`internal_hook.HookChain`） |
+|---|---|---|
+| **配置方式** | JSON 配置文件 / 代码动态注册 | 编译期确定，引擎启动时注册 |
+| **调度方式** | `HookEvent` 触发，运行时匹配 | `InternalHookPhase` + `Priority` 排序 |
+| **干预能力** | `Decision` / `ContinueDecision` | `HookResult`（Messages/ToolUseBlocks/AppendMsgs/InjectContinue/ReturnTerminal/Backoff/StreamEvents） |
+| **使用场景** | 用户自定义策略、安全门禁、告警通知 | 引擎核心功能解耦（压缩/修复/检测/指标） |
+| **代码位置** | `pkg/hooks/hooks.go` | `pkg/engine/internal_hook/` |
 
 ---
 
@@ -178,23 +382,73 @@
 | **TeammateIdle** | 队友空闲时（Agent 归还池时触发） | `pkg/agent/pool.go:165` | `pkg/hooks/hooks.go:335` | 已激活 |
 | **TaskCompleted** | 任务完成时（Workflow/Swarm 成功路径） | `pkg/agent/teams.go:704`, `teams.go:1042` | `pkg/hooks/hooks.go:347` | 已激活 |
 
+### 2.5 内置 InternalHook（本次迁移新增）
+
+> **InternalHook** 是引擎内部功能组件的抽象，与外部 Hook（`hooks.Runner`）的区别：
+> - InternalHook: 编译期确定，通过 `Priority` 排序，由 `HookChain` 统一调度
+> - 外部 Hook: 用户自定义逻辑，运行时配置，通过 `HookEvent` 触发
+>
+> 设计目标：将 `engine.go` queryLoop 中所有 `if e.XXX != nil` 硬编码分支解耦为独立的 `InternalHook` 实现，queryLoop 中不再有任何功能组件的直接调用判断。
+
+| Hook 名称 | Phase | Priority | 功能 | 实现文件 | 对应原硬编码功能 |
+|---|---|---|---|---|---|
+| **MicroCompactHook** | `PhasePreCompact` | 20 | 截断过大 tool_result | `pkg/engine/internal_hook/hook_compact.go` | `engine.go` MicroCompact |
+| **MessageFilterHook** | `PhasePreRequest` | 40 | 过滤古老纯 tool_use 单元 + 轻量压缩 | `pkg/engine/internal_hook/hook_message.go` | `messagesToAPI` filterPureToolUseUnits |
+| **MaxTokensRecoveryHook** | `PhaseOnStop` | 60 | max_output_tokens 恢复 | `pkg/engine/internal_hook/hook_message.go` | `engine.go` max_tokens 续写 |
+| **XMLToolFallbackHook** | `PhasePostRequest` | 130 | XML 风格工具调用回退解析 | `pkg/engine/internal_hook/hook_message.go` | `engine.go` MergeXMLToolCalls |
+| **JSONRepairHook** | `PhasePreToolUse` | 70 | 工具输入 JSON 修复 | `pkg/engine/internal_hook/hook_tool.go` | `engine.go` JSONRepair.Try |
+| **LoopDetectorInputHook** | `PhasePreToolUse` | 80 | 死循环检测（输入级） | `pkg/engine/internal_hook/hook_tool.go` | `engine.go` LoopDet.Observe |
+| **LoopDetectorResultHook** | `PhasePostToolUse` | 90 | 死循环检测（产出级） | `pkg/engine/internal_hook/hook_tool.go` | `engine.go` LoopDet.ObserveResult |
+| **StopSignalHook** | `PhasePostToolUse` | 100 | 软停止信号检测 | `pkg/engine/internal_hook/hook_tool.go` | `engine.go` StopDet.Observe |
+| **DisabledToolHook** | `PhasePreToolUse` | 150 | 禁用工具拦截 | `pkg/engine/internal_hook/hook_tool.go` | `engine.go` Config.DisabledTools 检查 |
+| **BudgetDegradeHook** | `PhasePreCompact` | 30 | Token 预算分级降级 | `pkg/engine/internal_hook/hook_compact.go` | `engine.go` Budget.Level + Degrade |
+| **AutoCompactHook** | `PhasePreCompact` | 10 | 上下文自动压缩 + 关键事实蒸馏 | `pkg/engine/internal_hook/hook_compact.go` | `engine.go` Compactor.AutoCompact |
+| **MemoryInjectHook** | `PhasePreRequest` | 50 | L1/L2 记忆注入 | `pkg/engine/internal_hook/hook_memory.go` | `engine.go` MemoryStore/FactStore 检索 |
+| **PromptCacheHook** | `PhasePreRequest` | 55 | Prompt cache 构建与命中率追踪 | `pkg/engine/internal_hook/hook_memory.go` | `engine.go` PromptCache.Build |
+| **ErrorClassifierHook** | `PhaseOnError` | 110 | G4 错误族分类与隔离预算 | `pkg/engine/internal_hook/hook_error.go` | `engine.go` ErrClassifier.Observe |
+| **CircuitBreakerHook** | `PhaseOnError` | 120 | 原始断路器兜底 | `pkg/engine/internal_hook/hook_error.go` | `engine.go` consecutiveErrors 计数 |
+
+**InternalHook 框架代码位置：**
+- 接口定义 + HookChain: `pkg/engine/internal_hook/hook.go`
+- Phase 1（低风险）: `pkg/engine/internal_hook/hook_compact.go` / `pkg/engine/internal_hook/hook_message.go`
+- Phase 2（中风险）: `pkg/engine/internal_hook/hook_tool.go`
+- Phase 3（高风险）: `pkg/engine/internal_hook/hook_compact.go` / `pkg/engine/internal_hook/hook_memory.go` / `pkg/engine/internal_hook/hook_error.go`
+- 注册入口: `pkg/engine/engine.go` `registerInternalHooks()`
+- queryLoop 调用点: `pkg/engine/engine.go` 各 `e.HookChain.Execute(Phase*, ctx)` 处
+
+**Phase 执行顺序（按优先级升序）：**
+
+```
+PhasePreCompact:    AutoCompact(10) → MicroCompact(20) → BudgetDegrade(30)
+PhasePreRequest:    MessageFilter(40) → MemoryInject(50) → PromptCache(55)
+PhasePostRequest:   XMLToolFallback(130)
+PhaseOnStreamDelta: (预留，暂无内置 Hook)
+PhasePreToolUse:    JSONRepair(70) → LoopDetectorInput(80) → DisabledTool(150)
+PhasePostToolUse:   LoopDetectorResult(90) → StopSignal(100) → MetricsCollect(200)
+PhaseOnError:       ErrorClassifier(110) → CircuitBreaker(120)
+PhaseOnStop:        MaxTokensRecovery(60)
+PhasePostTurn:      TurnMetrics(10)
+```
+
 ---
 
 ## 3. 统计与覆盖率
 
 | 分类 | 数量 | 说明 |
 |---|---|---|
-| **原有已激活** | 3 个 | PreToolUse, PostToolUse, Stop |
-| **原有僵尸 → 已激活（纯观测）** | 6 个 | PostToolUseFailure, PreCompact, PostCompact, SessionStart, SessionEnd |
-| **原有僵尸 → 已激活（具备干预能力）** | 1 个 | StopFailure |
-| **原有僵尸 → 有方法未注入** | 1 个 | Notification（Runner 就绪，暂无引擎调用点） |
-| **本次新增并已激活** | 11 个 | PreTurn, PostTurn, PreRequest, PostRequest, OnContextOverflow, OnMaxTurnsReached, OnError, OnRecovery, OnRateLimit, OnRetry, OnMessageFilter |
-| **Agent Teams 已激活** | 4 个 | SubagentStart, SubagentStop, TeammateIdle, TaskCompleted |
-| **合计已定义** | **25 个** | 24 个已注入调用点，1 个（Notification）待注入 |
+| **原有已激活（外部 Hook）** | 3 个 | PreToolUse, PostToolUse, Stop |
+| **原有僵尸 → 已激活（外部 Hook，纯观测）** | 6 个 | PostToolUseFailure, PreCompact, PostCompact, SessionStart, SessionEnd |
+| **原有僵尸 → 已激活（外部 Hook，具备干预能力）** | 1 个 | StopFailure |
+| **原有僵尸 → 有方法未注入（外部 Hook）** | 1 个 | Notification（Runner 就绪，暂无引擎调用点） |
+| **本次新增并已激活（外部 Hook）** | 11 个 | PreTurn, PostTurn, PreRequest, PostRequest, OnContextOverflow, OnMaxTurnsReached, OnError, OnRecovery, OnRateLimit, OnRetry, OnMessageFilter |
+| **Agent Teams 已激活（外部 Hook）** | 4 个 | SubagentStart, SubagentStop, TeammateIdle, TaskCompleted |
+| **内置 InternalHook（本次迁移）** | 15 个 | 14 个已注册 + 1 个框架基类（baseInternalHook） |
+| **合计已定义** | **40 个** | 25 个外部 Hook + 15 个内置 InternalHook |
 
 **生命周期覆盖率变化**：
 - 改造前：≈ 12%（3/25 事件点有调用）
-- 改造后：≈ 96%（24/25 事件点已定义+注入调用点，仅剩 Notification 未注入）
+- 改造后（外部 Hook）：≈ 96%（24/25 事件点已定义+注入调用点，仅剩 Notification 未注入）
+- 改造后（含 InternalHook）：queryLoop 中全部 14 个硬编码功能点已解耦为 InternalHook，引擎核心无 `if e.XXX != nil` 判断
 
 ---
 
@@ -234,35 +488,35 @@ PostTurn 被设计为"每轮结束必触发"，无论该轮是：
 
 ### 5.1 提示词与消息层（8 个硬编码功能）
 
-| 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 |
-|---|---|---|---|
-| **系统提示词组装**（BuildEffectiveSystemPrompt + TaskInstruction + 记忆拼接） | `engine.go:496-541` | PreRequest / PreTurn | 用户可通过 Hook 动态注入/修改 system prompt，无需改代码即可调整人设或追加规则 |
-| **首轮记忆注入**（L1 TieredStore + L2 FactStore 检索并追加到 system prompt） | `engine.go:522-540` | SessionStart / PreRequest | 记忆检索策略外置，可替换为向量检索、知识图谱等不同后端 |
-| **max_tokens 续写提示注入**（硬编码 "Continue from where you left off..."） | `engine.go:951-963` | PostRequest | 续写提示词可由 Hook 返回，支持多语言、不同风格续写 |
-| **messagesToAPI 消息过滤/压缩**（filterPureToolUseUnits + compressMessageContent） | `engine.go:1311-1346` | OnMessageFilter | 过滤策略外置，用户可自定义保留/丢弃规则，无需改引擎 |
-| **XML 工具调用回退解析**（MergeXMLToolCalls 扫描文本提取 tool_use） | `engine.go:891-908` | PostRequest | 不同厂商的 XML 协议可通过 Hook 适配，无需硬编码到引擎 |
-| **LoopDetector 死循环提示注入**（检测到循环时硬编码注入反向提示） | `engine.go:1147-1178` | PostToolUse / PreTurn | 循环判定逻辑和提示词可由 Hook 自定义 |
-| **StopSignalDetector 软停止提示注入**（检测到可停止时注入 hint） | `engine.go:1181-1210` | PostToolUse | 停止判定策略和提示词外置 |
-| **Evolution 经验上下文注入**（SessionStart 时检索经验并拼接到 CustomPrompt） | `session.go:785-793` | SessionStart / SubagentStart | 经验检索与格式化逻辑外置，可接入不同经验库 |
+| 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 | **迁移状态** |
+|---|---|---|---|---|
+| **系统提示词组装**（BuildEffectiveSystemPrompt + TaskInstruction + 记忆拼接） | `engine.go:496-541` | PreRequest / PreTurn | 用户可通过 Hook 动态注入/修改 system prompt，无需改代码即可调整人设或追加规则 | 未迁移（引擎级编排，保留在 queryLoop） |
+| **首轮记忆注入**（L1 TieredStore + L2 FactStore 检索并追加到 system prompt） | `engine.go:522-540` → `hook_memory.go` | `MemoryInjectHook` / `PhasePreRequest` | 记忆检索策略外置，可替换为向量检索、知识图谱等不同后端 | **✅ 已迁移→InternalHook** `MemoryInjectHook` |
+| **max_tokens 续写提示注入**（硬编码 "Continue from where you left off..."） | `engine.go:951-963` → `hook_message.go` | `MaxTokensRecoveryHook` / `PhaseOnStop` | 续写提示词可由 Hook 返回，支持多语言、不同风格续写 | **✅ 已迁移→InternalHook** `MaxTokensRecoveryHook` |
+| **messagesToAPI 消息过滤/压缩**（filterPureToolUseUnits + compressMessageContent） | `engine.go:1311-1346` → `hook_message.go` | `MessageFilterHook` / `PhasePreRequest` | 过滤策略外置，用户可自定义保留/丢弃规则，无需改引擎 | **✅ 已迁移→InternalHook** `MessageFilterHook`（`messagesToAPI` 中保留兜底过滤） |
+| **XML 工具调用回退解析**（MergeXMLToolCalls 扫描文本提取 tool_use） | `engine.go:891-908` → `hook_message.go` | `XMLToolFallbackHook` / `PhasePostRequest` | 不同厂商的 XML 协议可通过 Hook 适配，无需硬编码到引擎 | **✅ 已迁移→InternalHook** `XMLToolFallbackHook` |
+| **LoopDetector 死循环提示注入**（检测到循环时硬编码注入反向提示） | `engine.go:1147-1178` → `hook_tool.go` | `LoopDetectorInputHook` / `PhasePreToolUse`<br>`LoopDetectorResultHook` / `PhasePostToolUse` | 循环判定逻辑和提示词可由 Hook 自定义 | **✅ 已迁移→InternalHook** `LoopDetectorInputHook` + `LoopDetectorResultHook` |
+| **StopSignalDetector 软停止提示注入**（检测到可停止时注入 hint） | `engine.go:1181-1210` → `hook_tool.go` | `StopSignalHook` / `PhasePostToolUse` | 停止判定策略和提示词外置 | **✅ 已迁移→InternalHook** `StopSignalHook` |
+| **Evolution 经验上下文注入**（SessionStart 时检索经验并拼接到 CustomPrompt） | `session.go:785-793` | SessionStart / SubagentStart | 经验检索与格式化逻辑外置，可接入不同经验库 | 未迁移（非 queryLoop 功能） |
 
 ### 5.2 错误处理与恢复层（6 个硬编码功能）
 
-| 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 |
-|---|---|---|---|
-| **PTL 错误恢复**（PromptTooLongError 时自动 reactive compact） | `engine.go:700-714` | OnError / OnRecovery | 恢复策略可由 Hook 决定（compact / drop-older / switch-model），不局限于 compact |
-| **fallback model 切换**（错误时硬编码切换到 Config.FallbackModel） | `engine.go:717-734` | OnError / OnRecovery | 模型切换策略外置，支持按错误类型选择不同 fallback |
-| **withheld error 消息生成**（硬编码 "API Error (attempt X/Y): ..."） | `engine.go:829-838` | OnError | 错误消息模板可由 Hook 返回，支持多语言、不同格式 |
-| **overloaded 退避计算**（硬编码 `backoff = consecutiveErrors * 2s`） | `engine.go:844-850` | OnRateLimit | 退避算法可由 Hook 自定义（线性/指数/固定），甚至返回 0 立即重试 |
-| **ErrorClassifier 预算耗尽终止**（硬编码生成终止消息并返回） | `engine.go:743-767` | OnError | 预算耗尽时的行为可由 Hook 决定（终止/降级/切换 key） |
-| **工具执行错误格式化**（硬编码 "工具执行错误: %v"） | `tool/orchestration.go:277-282` | PostToolUseFailure | 错误格式化模板外置 |
+| 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 | **迁移状态** |
+|---|---|---|---|---|
+| **PTL 错误恢复**（PromptTooLongError 时自动 reactive compact） | `engine.go:700-714` | OnError / OnRecovery | 恢复策略可由 Hook 决定（compact / drop-older / switch-model），不局限于 compact | 未迁移（引擎级编排，保留在 queryLoop） |
+| **fallback model 切换**（错误时硬编码切换到 Config.FallbackModel） | `engine.go:717-734` | OnError / OnRecovery | 模型切换策略外置，支持按错误类型选择不同 fallback | 未迁移（引擎级编排，保留在 queryLoop） |
+| **withheld error 消息生成**（硬编码 "API Error (attempt X/Y): ..."） | `engine.go:829-838` | OnError | 错误消息模板可由 Hook 返回，支持多语言、不同格式 | 未迁移（保留在 CircuitBreakerHook 未覆盖路径） |
+| **overloaded 退避计算**（硬编码 `backoff = consecutiveErrors * 2s`） | `engine.go:844-850` | OnRateLimit | 退避算法可由 Hook 自定义（线性/指数/固定），甚至返回 0 立即重试 | 未迁移（保留在原始错误处理路径） |
+| **ErrorClassifier 预算耗尽终止**（硬编码生成终止消息并返回） | `engine.go:743-767` → `hook_error.go` | `ErrorClassifierHook` / `PhaseOnError` | 预算耗尽时的行为可由 Hook 决定（终止/降级/切换 key） | **✅ 已迁移→InternalHook** `ErrorClassifierHook` |
+| **工具执行错误格式化**（硬编码 "工具执行错误: %v"） | `tool/orchestration.go:277-282` | PostToolUseFailure | 错误格式化模板外置 | 未迁移（在 tool/orchestration.go，非 queryLoop） |
 
 ### 5.3 上下文与压缩层（3 个硬编码功能）
 
-| 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 |
-|---|---|---|---|
-| **Token Budget 降级**（BudgetRed 时硬编码调用 Degrade） | `engine.go:432-442` | OnContextOverflow | 降级策略可由 Hook 选择（summarization / truncate / switch-model） |
-| **上下文压缩阻止/干预**（AutoCompact 前无干预能力） | `engine.go:449-478` | PreCompact | Hook 返回 `Decision="block"` 即可阻止本轮压缩，无需改引擎 |
-| **工具结果截断**（硬编码 compactToolResultContent 超限时写入文件） | `tool/orchestration.go:309-330` | PostToolUse | 截断策略和存储方式可由 Hook 自定义 |
+| 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 | **迁移状态** |
+|---|---|---|---|---|
+| **Token Budget 降级**（BudgetRed 时硬编码调用 Degrade） | `engine.go:432-442` → `hook_compact.go` | `BudgetDegradeHook` / `PhasePreCompact` | 降级策略可由 Hook 选择（summarization / truncate / switch-model） | **✅ 已迁移→InternalHook** `BudgetDegradeHook`（内部已调用外部 OnContextOverflow Hook） |
+| **上下文压缩阻止/干预**（AutoCompact 前无干预能力） | `engine.go:449-478` → `hook_compact.go` | `AutoCompactHook` / `PhasePreCompact` | Hook 返回 `Decision="block"` 即可阻止本轮压缩，无需改引擎 | **✅ 已迁移→InternalHook** `AutoCompactHook`（内部已调用外部 PreCompact Hook） |
+| **工具结果截断**（硬编码 compactToolResultContent 超限时写入文件） | `tool/orchestration.go:309-330` | PostToolUse | 截断策略和存储方式可由 Hook 自定义 | 未迁移（在 tool/orchestration.go，非 queryLoop） |
 
 ### 5.4 Agent Teams 层（4 个硬编码功能）
 
@@ -275,11 +529,11 @@ PostTurn 被设计为"每轮结束必触发"，无论该轮是：
 
 ### 5.5 权限与工具层（3 个硬编码功能）
 
-| 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 |
-|---|---|---|---|
-| **DisabledTools 拦截**（硬编码检查 Config.DisabledTools） | `engine.go:1060-1086` | PreToolUse | 已可通过 Hook 实现，引擎层的硬编码检查可以移除，统一走 Hook |
-| **工具权限检查**（PermissionDeny/Ask/Allow 硬编码分支） | `tool/orchestration.go:237-272` | PreToolUse | 权限规则可由 Hook 返回，支持动态权限（时间/用户/环境敏感） |
-| **JSONRepair 工具输入修复**（硬编码 e.JSONRepair.Try） | `engine.go:1007-1021` | PreToolUse | 修复策略可由 Hook 自定义，甚至允许 Hook 直接返回修复后的 Input |
+| 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 | **迁移状态** |
+|---|---|---|---|---|
+| **DisabledTools 拦截**（硬编码检查 Config.DisabledTools） | `engine.go:1060-1086` → `hook_tool.go` | `DisabledToolHook` / `PhasePreToolUse` | 已可通过 Hook 实现，引擎层的硬编码检查可以移除，统一走 Hook | **✅ 已迁移→InternalHook** `DisabledToolHook` |
+| **工具权限检查**（PermissionDeny/Ask/Allow 硬编码分支） | `tool/orchestration.go:237-272` | PreToolUse | 权限规则可由 Hook 返回，支持动态权限（时间/用户/环境敏感） | 未迁移（在 tool/orchestration.go，非 queryLoop） |
+| **JSONRepair 工具输入修复**（硬编码 e.JSONRepair.Try） | `engine.go:1007-1021` → `hook_tool.go` | `JSONRepairHook` / `PhasePreToolUse` | 修复策略可由 Hook 自定义，甚至允许 Hook 直接返回修复后的 Input | **✅ 已迁移→InternalHook** `JSONRepairHook` |
 
 ### 5.6 可观测与追踪层（12 个硬编码功能）
 
@@ -287,22 +541,22 @@ PostTurn 被设计为"每轮结束必触发"，无论该轮是：
 
 | 现有硬编码功能 | 代码位置 | 建议 Hook | Hook 化后的好处 |
 |---|---|---|---|
-| **Turn 级指标采集**（TurnsTotal/Success/Error/Aborted + TurnLatency） | `engine.go:991-993` `engine.go:422` `engine.go:759` `engine.go:1092` | PostTurn / OnError | 指标采集逻辑外置，引擎无侵入，可接入任意 Metrics 后端 |
-| **Budget 降级指标**（RecordBudgetDegrade） | `engine.go:440` | OnContextOverflow | 降级事件通过 Hook 推送到外部监控，无需引擎内维护计数器 |
-| **Cache 命中率追踪**（RecordCache） | `engine.go:551` | PreRequest / PostRequest | 缓存统计由 Hook 接管，支持自定义采样率或关闭 |
-| **Error 分类指标**（RecordError 按 PTL/5xx/429 分族） | `engine.go:706` `engine.go:741` | OnError / OnRecovery | 错误分桶逻辑外置，用户可自定义分类维度 |
-| **JSONRepair 指标**（JSONRepairsApplied/Failed） | `engine.go:1013` `engine.go:1017` | PostToolUse / PreToolUse | 修复统计由 Hook 记录，引擎无需关心 |
-| **死循环检测指标**（ToolLoopsDetected/Suppressed, ProgressLoopsDetected） | `engine.go:1045` `engine.go:1173` | PostToolUse / PostTurn | 循环事件通过 Hook 推送，可配置告警阈值 |
-| **StopSignal 指标**（StopSuggestionsEmitted） | `engine.go:1205` | PostToolUse | 软停止建议事件外置 |
-| **工具调用计数**（ToolCallsTotal） | `engine.go:1213` | PostToolUse | 工具调用统计由 Hook 聚合，支持按工具名打标签 |
-| **Trajectory 轨迹写入**（recordTrajectoryIfNeeded 构建并写入 TrajStore） | `engine.go:1245-1266` `engine.go:1270` `engine.go:1272` | PostTurn / SessionEnd | 轨迹构建与存储策略外置，可接入不同的 Trajectory DB |
-| **会话消息持久化**（SessionStore AppendUserMessage/AppendAssistantMessage） | `engine.go:307` `engine.go:341` `engine.go:932` | PreTurn / PostTurn | 持久化逻辑由 Hook 实现，支持多种存储后端（SQLite/Redis/文件） |
-| **流式事件推送**（StreamEventDelta/ToolStart/MessageDone/ToolDone/Error） | `engine.go:616` `engine.go:653` `engine.go:669` `engine.go:756` `engine.go:817` `engine.go:901` `engine.go:929` `engine.go:1226` | PreTurn / PostTurn / PostRequest / PostToolUse | 事件路由外置，Hook 可将事件转发到 WebSocket / SSE / 消息队列 |
-| **Teams 运行指标**（TeamRunCount/Duration/Success/Fail/StagePassRate/OutputAvgLen） | `teams.go:732-751` `teams.go:1052-1063` `teams.go:1197-1200` `teams.go:1615-1617` | TaskCompleted / SessionEnd | 团队指标采集逻辑外置，支持自定义标签和维度 |
+| **Turn 级指标采集**（TurnsTotal/Success/Error/Aborted + TurnLatency） | `engine.go` 各 return 路径 → `hook_metrics.go` | `TurnMetricsHook` / `PhasePostTurn` | **✅ 已迁移→InternalHook** `TurnMetricsHook`：统一在 queryLoop 所有返回路径触发，按 stopReason 分派指标 |
+| **Budget 降级指标**（RecordBudgetDegrade） | `engine.go` → `hook_compact.go` | `BudgetDegradeHook` / `PhasePreCompact` | **✅ 已迁移→InternalHook** `BudgetDegradeHook` 内部记录 |
+| **Cache 命中率追踪**（RecordCache） | `engine.go` → `hook_memory.go` | `PromptCacheHook` / `PhasePreRequest` | **✅ 已迁移→InternalHook** `PromptCacheHook` 内部记录 |
+| **Error 分类指标**（RecordError 按 PTL/5xx/429 分族） | `engine.go` → `hook_error.go` | `ErrorClassifierHook` / `PhaseOnError` | **✅ 已迁移→InternalHook** `ErrorClassifierHook` 内部记录 |
+| **JSONRepair 指标**（JSONRepairsApplied/Failed） | `engine.go` → `hook_tool.go` `phase2.go:44` | `JSONRepairHook` / `PhasePreToolUse` | **✅ 已迁移→InternalHook** `JSONRepairHook` 内部记录 |
+| **死循环检测指标**（ToolLoopsDetected/Suppressed, ProgressLoopsDetected） | `engine.go` → `hook_tool.go` `phase2.go:177` | `LoopDetectorInputHook` / `LoopDetectorResultHook` | **✅ 已迁移→InternalHook** 死循环检测 hooks 内部记录 |
+| **StopSignal 指标**（StopSuggestionsEmitted） | `engine.go` → `hook_tool.go` | `StopSignalHook` / `PhasePostToolUse` | **✅ 已迁移→InternalHook** `StopSignalHook` 内部记录 |
+| **工具调用计数**（ToolCallsTotal） | `engine.go:1221` → `hook_metrics.go` | `MetricsCollectHook` / `PhasePostToolUse` | **✅ 已迁移→InternalHook** `MetricsCollectHook`：在 PhasePostToolUse 阶段统计 tool_use 块数量 |
+| **Trajectory 轨迹写入**（recordTrajectoryIfNeeded 构建并写入 TrajStore） | `engine.go` 各 return 路径 → `hook_metrics.go` | `TurnMetricsHook` / `PhasePostTurn` | **✅ 已迁移→InternalHook** `TurnMetricsHook`：统一在 PhasePostTurn 构建 Trajectory 并写入 TrajStore，按 verdict 记录 TrajSuccessRecorded/TrajFailRecorded |
+| **会话消息持久化**（SessionStore AppendUserMessage/AppendAssistantMessage） | `engine.go:307` `engine.go:341` `engine.go:932` | PreTurn / PostTurn | 持久化逻辑由 Hook 实现，支持多种存储后端（SQLite/Redis/文件） | 未迁移（SessionStore 为引擎核心组件，保留硬编码） |
+| **流式事件推送**（StreamEventDelta/ToolStart/MessageDone/ToolDone/Error） | `engine.go:616` `engine.go:653` `engine.go:669` `engine.go:756` `engine.go:817` `engine.go:901` `engine.go:929` `engine.go:1226` | PreTurn / PostTurn / PostRequest / PostToolUse | 事件路由外置，Hook 可将事件转发到 WebSocket / SSE / 消息队列 | 未迁移（流式事件为引擎核心输出，保留硬编码） |
+| **Teams 运行指标**（TeamRunCount/Duration/Success/Fail/StagePassRate/OutputAvgLen） | `teams.go:732-751` `teams.go:1052-1063` `teams.go:1197-1200` `teams.go:1615-1617` | TaskCompleted / SessionEnd | 团队指标采集逻辑外置，支持自定义标签和维度 | 未迁移（teams 层非 queryLoop 范围） |
 
 ### 5.7 已 Hook 化功能（全部可干预）
 
-以下 **25 个功能** 已经全部通过 Hook 机制实现，均支持决策干预：
+以下 **25 个外部 Hook 功能 + 17 个内置 InternalHook** 已经全部通过 Hook 机制实现，均支持决策干预：
 
 | 功能 | 驱动 Hook | 调用点代码位置 | Runner 执行方法 | 干预能力 | 功能说明 |
 |---|---|---|---|---|---|
@@ -334,7 +588,25 @@ PostTurn 被设计为"每轮结束必触发"，无论该轮是：
 | **流式 Chunk 拦截** | OnChunk | `pkg/engine/engine.go:648` `engine.go:660` | `pkg/hooks/hooks.go:357` (`ExecuteOnChunkHooks`) | **Decision** (`block`/`deny`/`approve`) | 流式输出每个 chunk 到达时，若 Hook 返回 `Decision="block"`/`"deny"`，跳过向 `streamCh` 推送该 delta，但内部仍累积文本 |
 | **流式 Token 拦截** | OnTokenStream | `pkg/engine/engine.go:648` | `pkg/hooks/hooks.go:368` (`ExecuteOnTokenStreamHooks`) | **Decision** (`block`/`deny`/`approve`) | 流式文本 token 到达时，若 Hook 返回 `Decision="block"`/`"deny"`，跳过向 `streamCh` 推送该 delta（仅普通文本，不含 thinking） |
 
-> **总结**：在引擎核心逻辑中，约有 **36 个硬编码功能点**（含可观测追踪 12 个）具备 Hook 化潜力；当前 **25 个** 已全部完成 Hook 化，**全部支持决策干预**（`Decision`/`ContinueDecision`）。通过 `executeMessageHooksWithDecision` 统一框架，所有消息类 Hook 遇到第一个含非空决策字段的 hook 即停止并返回，纯观测型 hook（不返回 Decision）保持执行全部匹配 hooks 的行为不变。
+| **预算分级降级** | `BudgetDegradeHook` | `pkg/engine/engine.go` `PhasePreCompact` | `pkg/engine/internal_hook/hook_compact.go` | **Messages** (降级后的消息列表) | BudgetRed/Critical 时，外部 OnContextOverflow Hook 未 block 则调用 `Budget.Degrade` 生成摘要消息 |
+| **上下文自动压缩** | `AutoCompactHook` | `pkg/engine/engine.go` `PhasePreCompact` | `pkg/engine/internal_hook/hook_compact.go` | **Messages** (压缩后的消息列表) | 外部 PreCompact Hook 未 block 则调用 `Compactor.AutoCompact`；提取关键事实到 MemoryStore/FactStore |
+| **截断过大 tool_result** | `MicroCompactHook` | `pkg/engine/engine.go` `PhasePreCompact` | `pkg/engine/internal_hook/hook_compact.go` | **Messages** (截断后的消息列表) | 对 tool_result 内容做字符截断，超阈值时二次截断 |
+| **消息过滤/压缩** | `MessageFilterHook` | `pkg/engine/engine.go` `PhasePreRequest` | `pkg/engine/internal_hook/hook_message.go` | **Messages** (过滤后的消息列表) | 过滤古老纯 tool_use 单元，对古老 user tool_result 做轻量内容压缩 |
+| **L1/L2 记忆注入** | `MemoryInjectHook` | `pkg/engine/engine.go` `PhasePreRequest` | `pkg/engine/internal_hook/hook_memory.go` | **SystemPrompt** (追加记忆后的 system prompt) | turnCount==0 时，从 TieredStore(L1) 和 FactStore(L2) 检索相关记忆追加到 system prompt |
+| **PromptCache 追踪** | `PromptCacheHook` | `pkg/engine/engine.go` `PhasePreRequest` | `pkg/engine/internal_hook/hook_memory.go` | 无（纯观测） | 拆分 static/dynamic system prompt，记录 cache 命中率到 Metrics |
+| **XML 工具调用回退** | `XMLToolFallbackHook` | `pkg/engine/engine.go` `PhasePostRequest` | `pkg/engine/internal_hook/hook_message.go` | **AssistantBlocks** + **ToolUseBlocks** + **StreamEvents** | 扫描 assistant 文本中的 XML 工具调用，提取为 ContentBlockToolUse，追加 stream events |
+| **max_tokens 恢复** | `MaxTokensRecoveryHook` | `pkg/engine/engine.go` `PhaseOnStop` | `pkg/engine/internal_hook/hook_message.go` | **InjectContinue** + **ContinueMsg** | stopReason=max_tokens 且无 tool_use 时，注入 continue 消息并继续循环 |
+| **JSON 输入修复** | `JSONRepairHook` | `pkg/engine/engine.go` `PhasePreToolUse` | `pkg/engine/internal_hook/hook_tool.go` | **ToolUseBlocks** (修复后的 tool_use 列表) | 对每个 tool_use.Input 尝试 JSON 修复，记录修复成功/失败到 Metrics |
+| **死循环检测（输入级）** | `LoopDetectorInputHook` | `pkg/engine/engine.go` `PhasePreToolUse` | `pkg/engine/internal_hook/hook_tool.go` | **ToolUseBlocks** + **AppendMsgs** + **InjectContinue** | 检测同工具同参数死循环，命中时注入 tool_result 错误消息替代执行；全部拦截时继续循环 |
+| **死循环检测（产出级）** | `LoopDetectorResultHook` | `pkg/engine/engine.go` `PhasePostToolUse` | `pkg/engine/internal_hook/hook_tool.go` | **AppendMsgs** | 观察 tool 结果检测编辑震荡和编译错误循环，命中时注入 hint meta 消息 |
+| **禁用工具拦截** | `DisabledToolHook` | `pkg/engine/engine.go` `PhasePreToolUse` | `pkg/engine/internal_hook/hook_tool.go` | **ToolUseBlocks** + **AppendMsgs** + **InjectContinue** | 将 Config.DisabledTools 中匹配的工具替换为错误结果；全部禁用时继续循环 |
+| **软停止信号检测** | `StopSignalHook` | `pkg/engine/engine.go` `PhasePostToolUse` | `pkg/engine/internal_hook/hook_tool.go` | **AppendMsgs** | 观察 tool 结果，必要时注入 soft stop hint（IsMeta 消息） |
+| **错误族分类与隔离** | `ErrorClassifierHook` | `pkg/engine/engine.go` `PhaseOnError` | `pkg/engine/internal_hook/hook_error.go` | **AppendMsgs** + **StreamEvents** + **Backoff** + **InjectContinue** / **ReturnTerminal** | G4 按 HTTP 族分桶 budget：abort 时终止并返回；非致命时推送 withheld error + backoff + continue |
+| **断路器兜底** | `CircuitBreakerHook` | `pkg/engine/engine.go` `PhaseOnError` | `pkg/engine/internal_hook/hook_error.go` | **AppendMsgs** + **StreamEvents** + **ReturnTerminal** | ErrClassifier 未启用时，连续错误 >= maxConsecutiveErrors 触发熔断终止 |
+| **工具调用计数** | `MetricsCollectHook` | `pkg/engine/engine.go` `PhasePostToolUse` | `pkg/engine/internal_hook/hook_metrics.go` | 无（纯观测） | 统计本轮 tool_use 块数量，累加到 Metrics.ToolCallsTotal |
+| **Turn 级指标与轨迹** | `TurnMetricsHook` | `pkg/engine/engine.go` `PhasePostTurn` | `pkg/engine/internal_hook/hook_metrics.go` | 无（纯观测） | 在 queryLoop 所有返回路径触发，按 stopReason 分派 Turn 级指标（Total/Success/Error/Aborted + Latency），构建 Trajectory 写入 TrajStore |
+
+> **总结**：在引擎核心逻辑中，约有 **36 个硬编码功能点**（含可观测追踪 12 个）具备 Hook 化潜力；当前 **25 个外部 Hook + 17 个内置 InternalHook** 已全部完成 Hook 化。**外部 Hook 全部支持决策干预**（`Decision`/`ContinueDecision`）；**InternalHook 通过 HookResult 字段影响引擎行为**（Messages/SystemPrompt/ToolUseBlocks/AppendMsgs/InjectContinue/ReturnTerminal/Backoff/StreamEvents）。通过 `executeMessageHooksWithDecision` 统一框架，所有消息类外部 Hook 遇到第一个含非空决策字段的 hook 即停止并返回，纯观测型 hook（不返回 Decision）保持执行全部匹配 hooks 的行为不变。
 
 ### 5.8 HookOutput 字段语义与引擎影响解读
 
@@ -916,6 +1188,7 @@ Content-Type: application/json
 1. **Notification 调用点注入**（✅ 已完成）：`ExecuteNotificationHooks` 已返回 `*types.HookOutput`，支持 `Decision` 干预。需在引擎关键路径（如严重错误、恢复成功时）实际调用并读取返回值。
 2. **OnTokenStream / OnChunk**（✅ 已完成）：已在 `engine.go` 的 stream event for-select 中注入逐事件回调。`text_delta` 时触发 `OnChunk` + `OnTokenStream`，`thinking_delta` 时仅触发 `OnChunk`。若 Hook 返回 `Decision="block"`/`"deny"`，跳过向 `streamCh` 推送该 delta。
 3. **Hook 返回值统一处理框架化**（✅ 已完成）：已抽象出 `executeMessageHooksWithDecision` 辅助方法（`pkg/hooks/hooks.go`）。全部 25 个 `Execute*` 方法均通过该框架读取 `Decision`/`ContinueDecision`：**PreCompact、PreRequest、OnContextOverflow、PreTurn、PostTurn、PostCompact、PostRequest、OnError、OnRecovery、OnRateLimit、OnRetry、OnMessageFilter、SessionStart、SessionEnd、SubagentStart、SubagentStop、TeammateIdle、TaskCompleted、Notification、OnChunk、OnTokenStream** 的 `Decision` 字段均已被引擎采纳；**Stop、StopFailure、OnMaxTurnsReached** 的 `ContinueDecision` 字段已被采纳。纯观测型 Hook（不返回 Decision）保持执行全部匹配 hooks 的行为不变。
+4. **queryLoop 硬编码功能 InternalHook 化**（✅ 已完成）：全部 14 个硬编码功能点已解耦为 15 个 InternalHook，通过 `HookChain` 统一调度。queryLoop 中不再有任何 `if e.XXX != nil` 功能组件判断。保留在引擎中的仅剩：PTL/fallback 模型切换（引擎级编排）、外部 Hook 调用、Trajectory 记录、metrics 采集。详见 §2.5 和 §5.1-5.5 迁移状态表。
 
 ---
 

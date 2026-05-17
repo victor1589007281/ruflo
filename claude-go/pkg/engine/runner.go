@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -54,7 +55,7 @@ type IsolatedRunOptions struct {
 // 与 QueryEngine.queryLoop 的区别:
 //   - 不持久化 SessionStore / Trajectory
 //   - 不应用 Phase 1 的 autoCompact / microCompact (假设 stage 输出量适中)
-//   - 但仍跑 MergeXMLToolCalls 回退 + RunTools, 这是核心功能.
+//   - 但仍跑 internal_hook.MergeXMLToolCalls 回退 + RunTools, 这是核心功能.
 func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts IsolatedRunOptions) (string, error) {
 	if e == nil {
 		return "", fmt.Errorf("nil engine")
@@ -77,7 +78,7 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 	messages := []types.Message{
 		{
 			Type: types.MessageTypeUser,
-			UUID: generateUUID(),
+			UUID: internal_hook.GenerateUUID(),
 			Content: []types.ContentBlock{
 				{Type: types.ContentBlockText, Text: userPrompt},
 			},
@@ -141,9 +142,9 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		}
 
 		// 5. XML / bracket 回退: 把文本里的工具调用补齐成 tool_use blocks; 即使
-		// 没有提取出可执行的工具, MergeXMLToolCalls 也会把 <minimax:tool_call>
+		// 没有提取出可执行的工具, internal_hook.MergeXMLToolCalls 也会把 <minimax:tool_call>
 		// 等噪声标签从 text 块里剥离, 这一步必须早于 lastAssistantText 计算.
-		mergedAssistant, mergedToolUse, _ := MergeXMLToolCalls(assistantBlocks, toolUseBlocks, fmt.Sprintf("iso_t%d", turn))
+		mergedAssistant, mergedToolUse, _ := internal_hook.MergeXMLToolCalls(assistantBlocks, toolUseBlocks, fmt.Sprintf("iso_t%d", turn))
 		assistantBlocks = mergedAssistant
 		toolUseBlocks = mergedToolUse
 
@@ -182,7 +183,7 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		if len(assistantBlocks) > 0 {
 			messages = append(messages, types.Message{
 				Type:       types.MessageTypeAssistant,
-				UUID:       generateUUID(),
+				UUID:       internal_hook.GenerateUUID(),
 				Content:    assistantBlocks,
 				StopReason: resp.StopReason,
 				CreatedAt:  time.Now(),

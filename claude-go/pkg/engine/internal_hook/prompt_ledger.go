@@ -1,4 +1,4 @@
-package engine
+package internal_hook
 
 import (
 	"encoding/json"
@@ -8,9 +8,9 @@ import (
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
-// buildPromptComponentMetrics 从最终发送给模型的 system/messages/tools 中拆解提示词组件。
+// BuildPromptComponentMetrics 从最终发送给模型的 system/messages/tools 中拆解提示词组件。
 // 这是观测用的账本, 不改变实际请求内容。
-func buildPromptComponentMetrics(systemPrompt []string, tools []types.APITool, messages []types.Message) api.PromptComponentMetrics {
+func BuildPromptComponentMetrics(systemPrompt []string, tools []types.APITool, messages []types.Message) api.PromptComponentMetrics {
 	systemText := strings.Join(systemPrompt, "\n")
 	messageText := messageTextForLedger(messages)
 
@@ -23,7 +23,7 @@ func buildPromptComponentMetrics(systemPrompt []string, tools []types.APITool, m
 		MemoryChars:       countMemoryChars(systemText),
 		BlackboardChars:   countHandoffChars(messageText),
 		PrevResultChars:   countPrevResultChars(systemText) + countPrevResultChars(messageText),
-		MessagesChars:     messageChars(messages),
+		MessagesChars:     MessageChars(messages),
 	}
 	return metrics
 }
@@ -46,7 +46,7 @@ func mcpToolsJSONLen(tools []types.APITool) int {
 	return total
 }
 
-func messageChars(messages []types.Message) int {
+func MessageChars(messages []types.Message) int {
 	total := 0
 	for _, msg := range messages {
 		for _, block := range msg.Content {

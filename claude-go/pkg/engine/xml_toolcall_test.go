@@ -1,5 +1,7 @@
 package engine
 
+import "github.com/anthropic/claude-go/pkg/engine/internal_hook"
+
 import (
 	"encoding/json"
 	"strings"
@@ -19,7 +21,7 @@ func TestExtractXMLToolCalls_MiniMaxWrapperMultipleInvokes(t *testing.T) {
 </invoke>
 </minimax:tool_call>`
 
-	blocks, cleaned := ExtractXMLToolCalls(text, "t0")
+	blocks, cleaned := internal_hook.ExtractXMLToolCalls(text, "t0")
 	if len(blocks) != 2 {
 		t.Fatalf("expected 2 tool_use blocks, got %d", len(blocks))
 	}
@@ -65,7 +67,7 @@ func TestExtractXMLToolCalls_NameAliases(t *testing.T) {
 </invoke>
 </minimax:tool_call>`
 
-	blocks, _ := ExtractXMLToolCalls(text, "x")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "x")
 	if len(blocks) != 2 {
 		t.Fatalf("expected 2 blocks, got %d", len(blocks))
 	}
@@ -91,7 +93,7 @@ func TestExtractXMLToolCalls_NameAliases(t *testing.T) {
 }
 
 func TestExtractXMLToolCalls_NoXML(t *testing.T) {
-	blocks, cleaned := ExtractXMLToolCalls("just a plain answer", "p")
+	blocks, cleaned := internal_hook.ExtractXMLToolCalls("just a plain answer", "p")
 	if len(blocks) != 0 {
 		t.Fatalf("expected no blocks, got %d", len(blocks))
 	}
@@ -107,7 +109,7 @@ func TestExtractXMLToolCalls_FunctionCallsWrapper(t *testing.T) {
 <parameter name="content">hello world</parameter>
 </invoke>
 </function_calls>`
-	blocks, cleaned := ExtractXMLToolCalls(text, "fc")
+	blocks, cleaned := internal_hook.ExtractXMLToolCalls(text, "fc")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -133,7 +135,7 @@ func TestExtractXMLToolCalls_BareInvoke(t *testing.T) {
 <parameter name="file_path">/etc/hosts</parameter>
 </invoke>
 done.`
-	blocks, cleaned := ExtractXMLToolCalls(text, "b")
+	blocks, cleaned := internal_hook.ExtractXMLToolCalls(text, "b")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d (text=%q)", len(blocks), text)
 	}
@@ -152,7 +154,7 @@ func TestExtractXMLToolCalls_BooleanCoercion(t *testing.T) {
 <parameter name="follow_redirects">true</parameter>
 </invoke>
 </minimax:tool_call>`
-	blocks, _ := ExtractXMLToolCalls(text, "bc")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "bc")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block")
 	}
@@ -165,7 +167,7 @@ func TestExtractXMLToolCalls_BooleanCoercion(t *testing.T) {
 
 func TestExtractXMLToolCalls_PreservesMultilineContent(t *testing.T) {
 	text := "<minimax:tool_call>\n<invoke name=\"Write\">\n<parameter name=\"file_path\">/tmp/x.go</parameter>\n<parameter name=\"content\">package main\n\nfunc main() {\n\tprintln(\"hi\")\n}\n</parameter>\n</invoke>\n</minimax:tool_call>"
-	blocks, _ := ExtractXMLToolCalls(text, "ml")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "ml")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -184,7 +186,7 @@ func TestMergeXMLToolCalls_AppendsToolUseAndKeepsText(t *testing.T) {
 	original := []types.ContentBlock{
 		{Type: types.ContentBlockText, Text: "preamble <minimax:tool_call>\n<invoke name=\"Read\"><parameter name=\"file_path\">/a</parameter></invoke>\n</minimax:tool_call> trailing"},
 	}
-	updated, tu, n := MergeXMLToolCalls(original, nil, "turn1")
+	updated, tu, n := internal_hook.MergeXMLToolCalls(original, nil, "turn1")
 	if n != 1 {
 		t.Fatalf("expected 1 delta, got %d", n)
 	}
@@ -209,7 +211,7 @@ func TestMergeXMLToolCalls_NoOpWhenNoXML(t *testing.T) {
 	original := []types.ContentBlock{
 		{Type: types.ContentBlockText, Text: "all good"},
 	}
-	updated, tu, n := MergeXMLToolCalls(original, nil, "turn1")
+	updated, tu, n := internal_hook.MergeXMLToolCalls(original, nil, "turn1")
 	if n != 0 {
 		t.Fatalf("expected n=0, got %d", n)
 	}
@@ -225,7 +227,7 @@ func TestMergeXMLToolCalls_DropsEmptyTextBlock(t *testing.T) {
 	original := []types.ContentBlock{
 		{Type: types.ContentBlockText, Text: "<minimax:tool_call><invoke name=\"Read\"><parameter name=\"file_path\">/x</parameter></invoke></minimax:tool_call>"},
 	}
-	updated, tu, n := MergeXMLToolCalls(original, nil, "turn1")
+	updated, tu, n := internal_hook.MergeXMLToolCalls(original, nil, "turn1")
 	if n != 1 {
 		t.Fatalf("expected 1 delta, got %d", n)
 	}
@@ -240,7 +242,7 @@ func TestMergeXMLToolCalls_DropsEmptyTextBlock(t *testing.T) {
 	}
 }
 
-// TestMergeXMLToolCalls_StripsWrapperWithoutInvoke 回归: 当模型只输出 <minimax:tool_call>
+// Testinternal_hook.MergeXMLToolCalls_StripsWrapperWithoutInvoke 回归: 当模型只输出 <minimax:tool_call>
 // 包裹但里面没有 <invoke> 子元素 (MiniMax 偶尔会这么干, 例如把 wrapper 留作
 // 占位符), 我们应该: 提取出 0 个 tool_use, 但仍然把包裹标签从文本里抹掉,
 // 这样上层 architect / researcher 的 "伪工具调用" 校验器不会把残留 XML 当成
@@ -249,7 +251,7 @@ func TestMergeXMLToolCalls_StripsWrapperWithoutInvoke(t *testing.T) {
 	original := []types.ContentBlock{
 		{Type: types.ContentBlockText, Text: "前置说明.\n\n<minimax:tool_call>just narrative, no invoke</minimax:tool_call>\n\n后置正文."},
 	}
-	updated, tu, n := MergeXMLToolCalls(original, nil, "turn1")
+	updated, tu, n := internal_hook.MergeXMLToolCalls(original, nil, "turn1")
 	if n != 0 {
 		t.Fatalf("expected 0 delta (no invoke inside), got %d", n)
 	}
@@ -282,7 +284,7 @@ func TestExtractXMLToolCalls_ParamAlias_ReadAndWrite(t *testing.T) {
 <parameter name="new_string">bar</parameter>
 </invoke>
 </minimax:tool_call>`
-	blocks, _ := ExtractXMLToolCalls(text, "p")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "p")
 	if len(blocks) != 3 {
 		t.Fatalf("expected 3 blocks, got %d", len(blocks))
 	}
@@ -327,7 +329,7 @@ func TestExtractXMLToolCalls_ParamAlias_DoesNotClobber(t *testing.T) {
 <parameter name="file_path">/alias/path</parameter>
 </invoke>
 </minimax:tool_call>`
-	blocks, _ := ExtractXMLToolCalls(text, "p")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "p")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -353,7 +355,7 @@ func TestExtractBracketToolCalls_SingleRead(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, cleaned := ExtractXMLToolCalls(text, "bk")
+	blocks, cleaned := internal_hook.ExtractXMLToolCalls(text, "bk")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d (cleaned=%q)", len(blocks), cleaned)
 	}
@@ -386,7 +388,7 @@ func TestExtractBracketToolCalls_BashWithMultipleArgs(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, _ := ExtractXMLToolCalls(text, "bk")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "bk")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -412,7 +414,7 @@ func TestExtractBracketToolCalls_EscapedQuotes(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, _ := ExtractXMLToolCalls(text, "bk")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "bk")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -438,7 +440,7 @@ func TestExtractBracketToolCalls_MultipleCalls(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, cleaned := ExtractXMLToolCalls(text, "bk")
+	blocks, cleaned := internal_hook.ExtractXMLToolCalls(text, "bk")
 	if len(blocks) != 2 {
 		t.Fatalf("expected 2 blocks, got %d (cleaned=%q)", len(blocks), cleaned)
 	}
@@ -461,7 +463,7 @@ func TestExtractBracketToolCalls_WriteWithMultilineContent(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, _ := ExtractXMLToolCalls(text, "bk")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "bk")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -489,7 +491,7 @@ func TestExtractBracketToolCalls_NameAlias_EditToStrReplace(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, _ := ExtractXMLToolCalls(text, "bk")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "bk")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -517,7 +519,7 @@ func TestExtractBracketToolCalls_MixedWithXML(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, _ := ExtractXMLToolCalls(text, "mix")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "mix")
 	if len(blocks) != 2 {
 		t.Fatalf("expected 2 blocks, got %d", len(blocks))
 	}
@@ -552,7 +554,7 @@ func TestExtractBracketToolCalls_SingleQuotedToolName(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, _ := ExtractXMLToolCalls(text, "sq")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "sq")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -574,7 +576,7 @@ func TestExtractBracketToolCalls_BooleanCoercion(t *testing.T) {
 		"}}\n" +
 		"[/TOOL_CALL]"
 
-	blocks, _ := ExtractXMLToolCalls(text, "bc")
+	blocks, _ := internal_hook.ExtractXMLToolCalls(text, "bc")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}

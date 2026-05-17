@@ -6,7 +6,7 @@
 //   - Anthropic 客户端 telemetry (cached_tokens/input_tokens 分项暴露)
 //
 // 全部字段使用 atomic.Int64 或 sync.Map, 允许 lock-free 读写。
-package engine
+package internal_hook
 
 import (
 	"sync"
@@ -47,6 +47,10 @@ type EngineMetrics struct {
 
 	// 延迟 (单调累加, 平均需除以 TurnsTotal)
 	TotalTurnLatencyMs atomic.Int64
+
+	// 首 token 延迟 (按模型分桶, 单调累加 ms, 平均需除以对应 counts)
+	firstTokenLatencies sync.Map // modelName → *atomic.Int64
+	firstTokenCounts    sync.Map // modelName → *atomic.Int64
 
 	// 最近一次 turn 时间戳
 	LastTurnAt atomic.Int64 // unix nano
@@ -100,6 +104,18 @@ func (m *EngineMetrics) RecordTurnLatency(d time.Duration) {
 	m.LastTurnAt.Store(time.Now().UnixNano())
 }
 
+// RecordFirstTokenLatency 记录某个模型的首 token 延迟 (ms)。
+// 每次 API 流式调用在收到第一个 content_block_delta 时调用一次。
+func (m *EngineMetrics) RecordFirstTokenLatency(model string, d time.Duration) {
+	if m == nil || model == "" {
+		return
+	}
+	v, _ := m.firstTokenLatencies.LoadOrStore(model, new(atomic.Int64))
+	v.(*atomic.Int64).Add(d.Milliseconds())
+	c, _ := m.firstTokenCounts.LoadOrStore(model, new(atomic.Int64))
+	c.(*atomic.Int64).Add(1)
+}
+
 // CacheHitRate 返回 cache 命中率 (0-1)。
 func (m *EngineMetrics) CacheHitRate() float64 {
 	if m == nil {
@@ -145,6 +161,23 @@ func (m *EngineMetrics) Snapshot() map[string]any {
 		return true
 	})
 
+	// 首 token 延迟快照: model → {avg_ms, count}
+	firstToken := map[string]map[string]int64{}
+	m.firstTokenCounts.Range(func(k, v any) bool {
+		model := k.(string)
+		count := v.(*atomic.Int64).Load()
+		var total int64
+		if tv, ok := m.firstTokenLatencies.Load(model); ok {
+			total = tv.(*atomic.Int64).Load()
+		}
+		avg := int64(0)
+		if count > 0 {
+			avg = total / count
+		}
+		firstToken[model] = map[string]int64{"avg_ms": avg, "count": count}
+		return true
+	})
+
 	return map[string]any{
 		"turns_total":               m.TurnsTotal.Load(),
 		"turns_success":             m.TurnsSuccess.Load(),
@@ -164,6 +197,7 @@ func (m *EngineMetrics) Snapshot() map[string]any {
 		"traj_success":              m.TrajSuccessRecorded.Load(),
 		"traj_fail":                 m.TrajFailRecorded.Load(),
 		"avg_turn_latency_ms":       m.AvgTurnLatencyMs(),
+		"first_token_latency_ms":    firstToken,
 		"budget_degradations":       budget,
 		"errors_by_family":          errs,
 		"last_turn_at":              m.LastTurnAt.Load(),

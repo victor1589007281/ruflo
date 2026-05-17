@@ -14,7 +14,7 @@
 //
 // 本地 hash 命中 ≠ 后端 cache 命中, 但在稳定前缀的前提下, 后端命中率近似等于本地。
 // 当 Anthropic API 支持显式 cache_control 字段时, 本组件的 Static() 输出可直接贴标。
-package engine
+package internal_hook
 
 import (
 	"crypto/sha256"

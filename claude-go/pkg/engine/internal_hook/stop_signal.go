@@ -13,7 +13,7 @@
 // 上层可选择是否注入给模型: "you may have enough evidence, consider finalizing"。
 //
 // 设计原则: 保守 — 宁错放过也少误触, 避免模型过早终止。
-package engine
+package internal_hook
 
 import (
 	"fmt"

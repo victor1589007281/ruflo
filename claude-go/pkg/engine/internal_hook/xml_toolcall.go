@@ -28,7 +28,7 @@
 //
 //   本文件实现了对这两种方言的回退解析: 把文本里的工具调用拆出来, 转成原生
 //   ContentBlockToolUse, 让后续阶段照常 RunToolUse, 然后把 tool_result 追加回去.
-package engine
+package internal_hook
 
 import (
 	"encoding/json"

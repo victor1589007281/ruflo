@@ -16,7 +16,7 @@
 //
 // 本组件提供一个短 fallback chain:
 //   valid? → strip markdown → fix trailing commas → close brackets → swap single→double quotes → fail
-package engine
+package internal_hook
 
 import (
 	"encoding/json"

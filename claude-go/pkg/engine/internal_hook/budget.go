@@ -15,7 +15,7 @@
 //   Critical > 95%  : 拒绝新 tool_use 直到 reactive compact 成功
 //
 // 组件只负责 "判定当前等级 + 执行 Red 降级", AutoCompact 由现有 Compactor 处理。
-package engine
+package internal_hook
 
 import (
 	"fmt"

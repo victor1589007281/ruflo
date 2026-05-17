@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
-// ==================== PromptCacheBuilder ====================
+// ==================== internal_hook.PromptCacheBuilder ====================
 
 func TestPromptCache_StablePrefixHit(t *testing.T) {
-	b := NewPromptCacheBuilder()
+	b := internal_hook.NewPromptCacheBuilder()
 	static := []string{"sys prompt", "tool defs"}
 
 	_, hit1 := b.Build(static, []string{"turn1 user"})
@@ -42,7 +43,7 @@ func TestPromptCache_StablePrefixHit(t *testing.T) {
 }
 
 func TestPromptCache_SplitStaticDynamic(t *testing.T) {
-	static, dynamic := SplitStaticDynamic([]string{
+	static, dynamic := internal_hook.SplitStaticDynamic([]string{
 		"system role prompt",
 		"<recent_memory> some mem </recent_memory>",
 		"tool defs list",
@@ -56,7 +57,7 @@ func TestPromptCache_SplitStaticDynamic(t *testing.T) {
 }
 
 func TestPromptCache_NilSafe(t *testing.T) {
-	var b *PromptCacheBuilder
+	var b *internal_hook.PromptCacheBuilder
 	merged, hit := b.Build([]string{"a"}, []string{"b"})
 	if hit {
 		t.Fatalf("nil builder 不应报告 hit")
@@ -69,33 +70,33 @@ func TestPromptCache_NilSafe(t *testing.T) {
 // ==================== TokenBudgetManager ====================
 
 func TestBudget_LevelDetection(t *testing.T) {
-	m := NewTokenBudgetManager(1000) // 1000 token 预算
+	m := internal_hook.NewTokenBudgetManager(1000) // 1000 token 预算
 	// 生成 ~650 token (≈ 2600 字符) 进入 Yellow (>=60%)
 	msgs := []types.Message{
 		{Type: types.MessageTypeUser, Content: []types.ContentBlock{{Type: types.ContentBlockText, Text: strings.Repeat("x", 2600)}}},
 	}
 	level := m.Level(msgs)
-	if level != BudgetYellow {
+	if level != internal_hook.BudgetYellow {
 		t.Fatalf("期望 Yellow, 实际 %s", level)
 	}
 
 	// Red: >= 90% → >= 3600 字符
 	msgs[0].Content[0].Text = strings.Repeat("x", 3700)
 	level = m.Level(msgs)
-	if level != BudgetRed {
+	if level != internal_hook.BudgetRed {
 		t.Fatalf("期望 Red, 实际 %s", level)
 	}
 
 	// Critical: >= 95% → >= 3800 字符
 	msgs[0].Content[0].Text = strings.Repeat("x", 3900)
 	level = m.Level(msgs)
-	if level != BudgetCritical {
+	if level != internal_hook.BudgetCritical {
 		t.Fatalf("期望 Critical, 实际 %s", level)
 	}
 }
 
 func TestBudget_RedDegradeToolResults(t *testing.T) {
-	m := NewTokenBudgetManager(100000)
+	m := internal_hook.NewTokenBudgetManager(100000)
 	m.KeepRecentToolTurns = 1
 	m.RedSummaryMaxChars = 50
 
@@ -106,7 +107,7 @@ func TestBudget_RedDegradeToolResults(t *testing.T) {
 		{Type: types.MessageTypeUser, Content: []types.ContentBlock{{Type: types.ContentBlockToolResult, Content: long, ToolUseID: "t2"}}},
 	}
 
-	degraded := m.Degrade(msgs, BudgetRed)
+	degraded := m.Degrade(msgs, internal_hook.BudgetRed)
 	if len(degraded) != 3 {
 		t.Fatalf("degrade 不应改变消息数量")
 	}
@@ -120,14 +121,14 @@ func TestBudget_RedDegradeToolResults(t *testing.T) {
 }
 
 func TestBudget_GreenNoChange(t *testing.T) {
-	m := NewTokenBudgetManager(100000)
+	m := internal_hook.NewTokenBudgetManager(100000)
 	msgs := []types.Message{
 		{Type: types.MessageTypeUser, Content: []types.ContentBlock{{Type: types.ContentBlockText, Text: "short"}}},
 	}
-	if got := m.Level(msgs); got != BudgetGreen {
+	if got := m.Level(msgs); got != internal_hook.BudgetGreen {
 		t.Fatalf("少量消息应为 Green, 实际 %s", got)
 	}
-	out := m.Degrade(msgs, BudgetGreen)
+	out := m.Degrade(msgs, internal_hook.BudgetGreen)
 	if &out[0] == &msgs[0] {
 		// ok, 共享底层, 不强制要求
 	}
@@ -139,7 +140,7 @@ func TestBudget_GreenNoChange(t *testing.T) {
 // ==================== LoopDetector ====================
 
 func TestLoopDetector_TriggerOnRepeatedCall(t *testing.T) {
-	d := NewLoopDetector()
+	d := internal_hook.NewLoopDetector()
 	d.Threshold = 3
 
 	input := json.RawMessage(`{"path":"a.go"}`)
@@ -160,7 +161,7 @@ func TestLoopDetector_TriggerOnRepeatedCall(t *testing.T) {
 }
 
 func TestLoopDetector_DifferentInputsNotLooped(t *testing.T) {
-	d := NewLoopDetector()
+	d := internal_hook.NewLoopDetector()
 	d.Threshold = 3
 
 	for _, p := range []string{`{"path":"a.go"}`, `{"path":"b.go"}`, `{"path":"c.go"}`} {
@@ -172,7 +173,7 @@ func TestLoopDetector_DifferentInputsNotLooped(t *testing.T) {
 }
 
 func TestLoopDetector_Reset(t *testing.T) {
-	d := NewLoopDetector()
+	d := internal_hook.NewLoopDetector()
 	d.Threshold = 2
 	d.Observe("Read", json.RawMessage(`{"a":1}`))
 	if d.Size() != 1 {
@@ -187,24 +188,24 @@ func TestLoopDetector_Reset(t *testing.T) {
 // ==================== ErrorClassifier ====================
 
 func TestErrorClassifier_Classify(t *testing.T) {
-	c := NewErrorClassifier()
+	c := internal_hook.NewErrorClassifier()
 
 	tests := []struct {
 		name string
 		err  error
-		want ErrorFamily
+		want internal_hook.ErrorFamily
 	}{
-		{"ptl typed", &api.PromptTooLongError{Message: "prompt too long"}, ErrFamilyPTL},
-		{"overloaded typed", &api.OverloadedError{Message: "overloaded"}, ErrFamilyOverload},
-		{"429 string", errors.New("HTTP 429 rate limit exceeded"), ErrFamilyRateLimit},
-		{"503 string", errors.New("503 overloaded"), ErrFamilyOverload},
-		{"500 string", errors.New("500 internal server error"), ErrFamilyServer},
-		{"400 string", errors.New("400 bad request: invalid parameter"), ErrFamilyBadRequest},
-		{"timeout string", errors.New("context deadline exceeded timeout"), ErrFamilyTimeout},
-		{"network string", errors.New("connection reset by peer"), ErrFamilyNetwork},
-		{"auth string", errors.New("401 unauthorized"), ErrFamilyAuth},
-		{"ctx deadline", context.DeadlineExceeded, ErrFamilyTimeout},
-		{"nil err", nil, ErrFamilyUnknown},
+		{"ptl typed", &api.PromptTooLongError{Message: "prompt too long"}, internal_hook.ErrFamilyPTL},
+		{"overloaded typed", &api.OverloadedError{Message: "overloaded"}, internal_hook.ErrFamilyOverload},
+		{"429 string", errors.New("HTTP 429 rate limit exceeded"), internal_hook.ErrFamilyRateLimit},
+		{"503 string", errors.New("503 overloaded"), internal_hook.ErrFamilyOverload},
+		{"500 string", errors.New("500 internal server error"), internal_hook.ErrFamilyServer},
+		{"400 string", errors.New("400 bad request: invalid parameter"), internal_hook.ErrFamilyBadRequest},
+		{"timeout string", errors.New("context deadline exceeded timeout"), internal_hook.ErrFamilyTimeout},
+		{"network string", errors.New("connection reset by peer"), internal_hook.ErrFamilyNetwork},
+		{"auth string", errors.New("401 unauthorized"), internal_hook.ErrFamilyAuth},
+		{"ctx deadline", context.DeadlineExceeded, internal_hook.ErrFamilyTimeout},
+		{"nil err", nil, internal_hook.ErrFamilyUnknown},
 	}
 	for _, tt := range tests {
 		got := c.Classify(tt.err)
@@ -215,7 +216,7 @@ func TestErrorClassifier_Classify(t *testing.T) {
 }
 
 func TestErrorClassifier_BudgetExhaustion(t *testing.T) {
-	c := NewErrorClassifier()
+	c := internal_hook.NewErrorClassifier()
 
 	// BadRequest: 0 次重试预算, 立即 abort
 	_, abort, _, _ := c.Observe(errors.New("400 bad request"))
@@ -234,7 +235,7 @@ func TestErrorClassifier_BudgetExhaustion(t *testing.T) {
 }
 
 func TestErrorClassifier_ResetOnSuccess(t *testing.T) {
-	c := NewErrorClassifier()
+	c := internal_hook.NewErrorClassifier()
 	_, _, _, _ = c.Observe(errors.New("429 rate limit"))
 	c.ResetAll()
 	cnt := c.Counters()
@@ -246,7 +247,7 @@ func TestErrorClassifier_ResetOnSuccess(t *testing.T) {
 // ==================== JSONRepair ====================
 
 func TestJSONRepair_DirectValid(t *testing.T) {
-	r := NewJSONRepair()
+	r := internal_hook.NewJSONRepair()
 	out, res := r.Try([]byte(`{"a":1}`))
 	if !res.OK || res.Method != "direct" {
 		t.Fatalf("direct valid 应直接通过, got %+v", res)
@@ -257,7 +258,7 @@ func TestJSONRepair_DirectValid(t *testing.T) {
 }
 
 func TestJSONRepair_TrailingComma(t *testing.T) {
-	r := NewJSONRepair()
+	r := internal_hook.NewJSONRepair()
 	out, res := r.Try([]byte(`{"a":1,}`))
 	if !res.OK {
 		t.Fatalf("尾逗号应被修复, got %+v", res)
@@ -268,7 +269,7 @@ func TestJSONRepair_TrailingComma(t *testing.T) {
 }
 
 func TestJSONRepair_MarkdownFence(t *testing.T) {
-	r := NewJSONRepair()
+	r := internal_hook.NewJSONRepair()
 	input := "```json\n{\"a\":1}\n```"
 	out, res := r.Try([]byte(input))
 	if !res.OK {
@@ -280,7 +281,7 @@ func TestJSONRepair_MarkdownFence(t *testing.T) {
 }
 
 func TestJSONRepair_TruncatedBracket(t *testing.T) {
-	r := NewJSONRepair()
+	r := internal_hook.NewJSONRepair()
 	out, res := r.Try([]byte(`{"a":1`))
 	if !res.OK {
 		t.Fatalf("截断应被修复, got %+v", res)
@@ -291,7 +292,7 @@ func TestJSONRepair_TruncatedBracket(t *testing.T) {
 }
 
 func TestJSONRepair_SingleQuotes(t *testing.T) {
-	r := NewJSONRepair()
+	r := internal_hook.NewJSONRepair()
 	out, res := r.Try([]byte(`{'key':'value'}`))
 	if !res.OK {
 		t.Fatalf("单引号应被替换, got %+v", res)
@@ -302,7 +303,7 @@ func TestJSONRepair_SingleQuotes(t *testing.T) {
 }
 
 func TestJSONRepair_FailCase(t *testing.T) {
-	r := NewJSONRepair()
+	r := internal_hook.NewJSONRepair()
 	_, res := r.Try([]byte(`not json at all ###`))
 	if res.OK {
 		t.Fatalf("garbage 不应被报告为 OK")
@@ -310,7 +311,7 @@ func TestJSONRepair_FailCase(t *testing.T) {
 }
 
 func TestJSONRepair_EmptyInput(t *testing.T) {
-	r := NewJSONRepair()
+	r := internal_hook.NewJSONRepair()
 	_, res := r.Try([]byte{})
 	if !res.OK {
 		t.Fatalf("空输入应视为 OK")
@@ -323,19 +324,19 @@ func TestTrajectory_InferVerdict(t *testing.T) {
 	tests := []struct {
 		name    string
 		stop    string
-		tools   []ToolSig
+		tools   []internal_hook.ToolSig
 		aborted bool
-		want    TrajVerdict
+		want    internal_hook.TrajVerdict
 	}{
-		{"aborted wins", "", nil, true, VerdictAborted},
-		{"end_turn no tools", "end_turn", nil, false, VerdictSuccess},
-		{"max_tokens", "max_tokens", nil, false, VerdictPartial},
-		{"all tools ok", "tool_use", []ToolSig{{OK: true}, {OK: true}}, false, VerdictSuccess},
-		{"partial tools", "tool_use", []ToolSig{{OK: true}, {OK: false}}, false, VerdictPartial},
-		{"all tools fail", "tool_use", []ToolSig{{OK: false}, {OK: false}}, false, VerdictFail},
+		{"aborted wins", "", nil, true, internal_hook.VerdictAborted},
+		{"end_turn no tools", "end_turn", nil, false, internal_hook.VerdictSuccess},
+		{"max_tokens", "max_tokens", nil, false, internal_hook.VerdictPartial},
+		{"all tools ok", "tool_use", []internal_hook.ToolSig{{OK: true}, {OK: true}}, false, internal_hook.VerdictSuccess},
+		{"partial tools", "tool_use", []internal_hook.ToolSig{{OK: true}, {OK: false}}, false, internal_hook.VerdictPartial},
+		{"all tools fail", "tool_use", []internal_hook.ToolSig{{OK: false}, {OK: false}}, false, internal_hook.VerdictFail},
 	}
 	for _, tt := range tests {
-		got := InferVerdict(tt.stop, tt.tools, tt.aborted)
+		got := internal_hook.InferVerdict(tt.stop, tt.tools, tt.aborted)
 		if got != tt.want {
 			t.Errorf("%s: got %s want %s", tt.name, got, tt.want)
 		}
@@ -343,16 +344,16 @@ func TestTrajectory_InferVerdict(t *testing.T) {
 }
 
 func TestTrajectory_Format(t *testing.T) {
-	tr := &Trajectory{
+	tr := &internal_hook.Trajectory{
 		TurnID:     "t1",
 		UserIntent: "帮我重构认证模块",
 		Plan:       "先阅读现有代码, 然后提取接口",
-		ToolCalls: []ToolSig{
+		ToolCalls: []internal_hook.ToolSig{
 			{Name: "Read", OK: true},
 			{Name: "Edit", OK: true},
 			{Name: "Read", OK: true},
 		},
-		Verdict:   VerdictSuccess,
+		Verdict:   internal_hook.VerdictSuccess,
 		At:        time.Now(),
 		LatencyMs: 1500,
 	}
@@ -374,23 +375,23 @@ func TestTrajectory_ExtractPlan(t *testing.T) {
 			{Type: types.ContentBlockText, Text: "ok here is what we will do"},
 		}},
 	}
-	plan := ExtractPlan(msgs)
+	plan := internal_hook.ExtractPlan(msgs)
 	if plan != "let me plan" {
 		t.Fatalf("期望从 thinking 提取, 实际: %q", plan)
 	}
 }
 
-// ==================== EngineMetrics ====================
+// ==================== internal_hook.EngineMetrics ====================
 
 func TestEngineMetrics_Snapshot(t *testing.T) {
-	m := NewEngineMetrics()
+	m := internal_hook.NewEngineMetrics()
 	m.TurnsTotal.Add(3)
 	m.TurnsSuccess.Add(2)
 	m.RecordCache(true)
 	m.RecordCache(true)
 	m.RecordCache(false)
-	m.RecordBudgetDegrade(int(BudgetRed))
-	m.RecordError(int(ErrFamilyRateLimit))
+	m.RecordBudgetDegrade(int(internal_hook.BudgetRed))
+	m.RecordError(int(internal_hook.ErrFamilyRateLimit))
 	m.RecordTurnLatency(500 * time.Millisecond)
 
 	snap := m.Snapshot()
@@ -402,11 +403,11 @@ func TestEngineMetrics_Snapshot(t *testing.T) {
 		t.Fatalf("cache_hit_rate 错误: %v (期望 ~0.666)", rate)
 	}
 	budget := snap["budget_degradations"].(map[int]int64)
-	if budget[int(BudgetRed)] != 1 {
+	if budget[int(internal_hook.BudgetRed)] != 1 {
 		t.Fatalf("Red 降级计数错误: %v", budget)
 	}
 	errs := snap["errors_by_family"].(map[int]int64)
-	if errs[int(ErrFamilyRateLimit)] != 1 {
+	if errs[int(internal_hook.ErrFamilyRateLimit)] != 1 {
 		t.Fatalf("RateLimit 计数错误: %v", errs)
 	}
 	if avg := snap["avg_turn_latency_ms"].(int64); avg != 166 {
@@ -415,7 +416,7 @@ func TestEngineMetrics_Snapshot(t *testing.T) {
 }
 
 func TestEngineMetrics_NilSafe(t *testing.T) {
-	var m *EngineMetrics
+	var m *internal_hook.EngineMetrics
 	m.RecordCache(true)
 	m.RecordError(0)
 	m.RecordBudgetDegrade(0)
@@ -429,7 +430,7 @@ func TestEngineMetrics_NilSafe(t *testing.T) {
 // ==================== StopSignalDetector ====================
 
 func TestStopSignal_RepeatedReads(t *testing.T) {
-	d := NewStopSignalDetector()
+	d := internal_hook.NewStopSignalDetector()
 	d.MinToolCallsBeforeHint = 1
 	d.MaxFileReadsSamePath = 3
 	d.DiminishingWindow = 1 // 一次即可发射
@@ -452,7 +453,7 @@ func TestStopSignal_RepeatedReads(t *testing.T) {
 }
 
 func TestStopSignal_BelowMinCalls(t *testing.T) {
-	d := NewStopSignalDetector()
+	d := internal_hook.NewStopSignalDetector()
 	d.MinToolCallsBeforeHint = 100 // 高阈值
 	suggest, _ := d.Observe("Read", `{"path":"x"}`, "")
 	if suggest {
@@ -461,7 +462,7 @@ func TestStopSignal_BelowMinCalls(t *testing.T) {
 }
 
 func TestStopSignal_BuildHintMessage(t *testing.T) {
-	msg := BuildHintMessage("test reason")
+	msg := internal_hook.BuildHintMessage("test reason")
 	if !strings.Contains(msg, "soft_stop_hint") || !strings.Contains(msg, "test reason") {
 		t.Fatalf("hint 格式不对: %s", msg)
 	}
