@@ -1,9 +1,10 @@
-# 大型代码库知识图谱构造方案 —— Graphify + GitNexus + Claude
+# 大型代码库知识图谱构造方案 —— Graphify + GitNexus + Claude (Final v2.0)
 
-> **版本**: 1.0
-> **日期**: 2026-05-16
+> **版本**: 2.0
+> **日期**: 2026-05-17
 > **范围**: Linux Kernel / MySQL 级别超大型代码库的 LLM 知识图谱构造与消费
-> **目标**: 在单台工作站上完成千万行级代码库的多模态图谱构建，通过 MCP 向 Claude 提供 71.5x Token 效率的代码智能查询
+> **目标**: 对内作为 claude-go 内置 Tool 使用；对外通过 MCP Server 向 Claude Desktop / Cursor / Cline 提供标准化代码智能服务
+> **核心约束**: 构建流水线零 LLM Token，纯静态分析 + 图算法
 
 ---
 
@@ -22,641 +23,417 @@
 - `Glob`: 在 `drivers/` 或 `storage/innobase/` 下返回数千个文件，噪音极高
 - 无模块边界感知: 模型看不到 "TCP 拥塞控制子系统包含哪些文件、与网络栈的接口在哪里"
 
-### 1.2 双引擎互补架构
+### 1.2 双模暴露架构
+
+本方案的核心设计是**同一套引擎能力，两种暴露方式**：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Claude Code / Claude Desktop                       │
-│                              (消费者层)                                       │
+│                          统一核心引擎 (pkg/codeintel)                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
+│  │ 分片管理     │  │ 构建流水线   │  │ 查询引擎     │  │ 分支隔离     │        │
+│  │ (shard.go)  │  │(builder.go) │  │ (query.go)  │  │(branch.go)  │        │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
+│  ┌─────────────┐  ┌─────────────┐                                           │
+│  │ 存储抽象     │  │ MCP Server   │                                           │
+│  │ (store.go)  │  │(mcpserver.go)│                                           │
+│  └─────────────┘  └─────────────┘                                           │
 └─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                        ┌───────────┴───────────┐
-                        │      MCP Router        │
-                        │   (claude-go 工具表)   │
-                        └───────────┬───────────┘
-                                    │
-        ┌───────────────────────────┼───────────────────────────┐
-        ▼                           ▼                           ▼
-┌───────────────┐         ┌─────────────────┐         ┌───────────────┐
-│  GitNexus     │         │  Graphify       │         │ 原生工具       │
-│  (结构索引)   │         │  (语义图谱)     │         │ (Grep/Read)   │
-│  ─────────    │         │  ─────────      │         │ ─────────     │
-│  LadybugDB    │         │  NetworkX       │         │ 实时搜索       │
-│  Tree-sitter  │         │  Leiden 聚类    │         │ 精确读取       │
-│  SCIP/LSP     │         │  LLM 语义提取   │         │ 兜底回退       │
-└───────────────┘         └─────────────────┘         └───────────────┘
-        │                           │                           │
-        └───────────────────────────┴───────────────────────────┘
-                                    │
-                        ┌───────────┴───────────┐
-                        │   统一查询编排器        │
-                        │   (Query Orchestrator) │
-                        └───────────┬───────────┘
-                                    │
-        ┌───────────────────────────┼───────────────────────────┐
-        ▼                           ▼                           ▼
-┌───────────────┐         ┌─────────────────┐         ┌───────────────┐
-│ Linux Kernel  │         │ MySQL           │         │ PostgreSQL    │
-│ graph-main/   │         │ graph-mysql/    │         │ graph-pg/     │
-│ (分片存储)    │         │ (分片存储)      │         │ (分片存储)    │
-└───────────────┘         └─────────────────┘         └───────────────┘
+         │                                    │
+    ┌────┴────┐                        ┌─────┴──────┐
+    ▼         ▼                        ▼            ▼
+┌────────┐ ┌─────────────┐      ┌──────────┐  ┌─────────────┐
+│ 对内    │ │ 对内         │      │ 对外      │  │ 对外         │
+│内置 Tool│ │内置 Tool    │      │MCP Server│  │MCP Server   │
+├────────┤ ├─────────────┤      ├──────────┤  ├─────────────┤
+│ init   │ │ status      │      │ stdio    │  │ stdio        │
+│ update │ │ query       │      │ JSON-RPC │  │ JSON-RPC     │
+│ branch │ │             │      │ 2.0      │  │ 2.0          │
+└────────┘ └─────────────┘      └──────────┘  └─────────────┘
+    │            │                     │             │
+    └────┬───────┘                     └──────┬──────┘
+         ▼                                    ▼
+   ┌─────────────┐                    ┌──────────────┐
+   │ claude-go   │                    │ Claude Desktop│
+   │ 工具列表     │                    │ Cursor        │
+   │             │                    │ Cline         │
+   │             │                    │ Windsurf      │
+   └─────────────┘                    └──────────────┘
 ```
 
-**分工原则**:
+**对外协议选型结论：MCP Server（stdio）**
 
-| 维度 | GitNexus | Graphify |
-|------|----------|----------|
-| **核心能力** | 精确的代码属性图（调用链、依赖、类型层级） | 语义社区检测、多模态提取、可视化 |
-| **查询类型** | "谁调用了 `tcp_sendmsg`" / "InnoDB 缓冲池的所有引用" | "TCP 子系统的核心模块是什么" / "异常跨层调用" |
-| **存储引擎** | LadybugDB（本地持久化，极速查询） | NetworkX + 增量缓存 |
-| **更新策略** | Git hooks 自动增量重索引 | Watch 模式实时更新 |
-| **MCP 暴露** | `gitnexus_mcp`（工具集 + Hooks） | `graphify_mcp`（查询 + 报告） |
-| **最佳场景** | 精确导航、影响分析、PR Review | 宏观理解、新人 onboarding、架构审计 |
+| 候选协议 | 支持情况 | 配置复杂度 | 结论 |
+|----------|----------|-----------|------|
+| **MCP Server (stdio)** | Claude Desktop ✓, Cursor ✓, Cline ✓, Windsurf ✓ | 极低（一行配置） | **选用** |
+| MCP Server (HTTP/SSE) | 同上 | 需端口/防火墙 | 备选（未来扩展） |
+| gRPC | 无原生支持 | 高 | 不选 |
+| REST API | 需自定义客户端 | 中 | 不选 |
+| CLI 子命令 | 仅限终端 | 低 | 已内置 |
+
+MCP 是**事实标准**，Claude/Cursor/Cline 均原生支持，零网络配置（stdio 子进程通信），工具发现、调用、资源读取统一协议。
 
 ---
 
-## 2. 大型代码库分片构造策略
+## 2. 对内：内置 Tool 套件
 
-千万行代码无法一次性加载到内存构建单张图。必须按**子系统分片**构建，再通过**跨片边**连接。
+### 2.1 Tool 列表
 
-### 2.1 Linux Kernel 分片方案
+注册于 `pkg/tool/builtin/register.go`，与 FileRead、Bash、Grep 等并列。
 
-```
-linux-graph/
-├── arch/                    # 架构抽象层 (x86, arm64, riscv)
-│   ├── graph.json
-│   └── manifest.json        # 跨片接口符号列表
-├── kernel/                  # 核心调度、同步原语
-├── mm/                      # 内存管理子系统
-├── net/                     # 网络栈 (TCP/IP, socket)
-│   ├── tcp/                 # TCP 拥塞控制可再分片
-│   └── ipv4/
-├── fs/                      # 文件系统 VFS + 具体实现
-├── drivers/                 # 驱动框架 + 总线 (PCI, USB)
-├── crypto/                  # 加密子系统
-└── cross_edges.db           # 跨片子图边 (KuzuDB/SQLite)
-```
+| Tool | 名称 | 只读 | 并发安全 | 功能 |
+|------|------|------|----------|------|
+| `code_intel_init` | 初始化构建 | ✗ | ✗ | 仓库全量索引，自动/手动分片 |
+| `code_intel_update` | 增量更新 | ✗ | ✗ | git diff 检测变更，仅重建受影响分片 |
+| `code_intel_status` | 状态查询 | ✓ | ✓ | 查看分片、分支、索引时间、文件数 |
+| `code_intel_query` | 图谱查询 | ✓ | ✓ | navigate / impact / communities / god_nodes / cross_shard |
+| `code_intel_branch` | 分支管理 | ✗ | ✗ | switch / create (CoW) / delete / list |
 
-**分片边界定义** (以 `net/` 为例):
-
-```yaml
-# net/manifest.yaml
-shard_name: "net"
-root_dirs: ["net/", "include/net/"]
-interface_symbols:
-  exports:          # 本片区对外暴露的符号
-    - "tcp_sendmsg"
-    - "tcp_recvmsg"
-    - "sock_init_data"
-    - "inet_ioctl"
-  imports:          # 本片区依赖的外部符号
-    - "kmalloc"          # 来自 mm/
-    - "spin_lock"        # 来自 kernel/
-    - "schedule"         # 来自 kernel/
-    - "pci_register_driver"  # 来自 drivers/
-```
-
-**跨片边存储**:
-
-```cypher
-// cross_edges.db (KuzuDB)
-(:符号 {名称, 类型, shard})-[:跨片调用]->(:符号 {名称, 类型, shard})
-(:符号 {名称, 类型, shard})-[:跨片导入]->(:符号 {名称, 类型, shard})
-
-// 示例: net/ 调用 mm/ 的 kmalloc
-CREATE (s:符号 {名称: "tcp_sendmsg", shard: "net", 类型: "function"})
-CREATE (t:符号 {名称: "kmalloc", shard: "mm", 类型: "function"})
-CREATE (s)-[:跨片调用]->(t)
-```
-
-### 2.2 MySQL 分片方案
-
-```
-mysql-graph/
-├── sql/                     # 解析器、优化器、执行器
-├── storage/innobase/        # InnoDB 存储引擎
-├── storage/myisam/          # MyISAM 引擎
-├── storage/ndb/             # NDB Cluster
-├── client/                  # 客户端协议
-├── replication/             # 主从复制
-├── backup/                  # 备份恢复
-├── plugin/                  # 插件框架
-└── cross_edges.db
-```
-
-**MySQL 特有的分层边界**:
-
-| 层级 | 目录 | 关键跨片接口 |
-|------|------|-------------|
-| SQL 层 | `sql/` | `handler::` 虚函数接口 |
-| 存储引擎 | `storage/*/`| `handlerton` 结构体 |
-| 日志系统 | `log/` | `mysql_bin_log` 全局实例 |
-| 复制 | `replication/` | `Binlog_sender`, `Relay_log_info` |
-
-### 2.3 分片构建流水线
-
-```bash
-# 1. 安装双引擎
-npm install -g gitnexus
-pip install graphifyy
-
-# 2. 配置分片边界
-# linux-shards.yml (用户自定义)
-shards:
-  - name: net
-    roots: ["net/", "include/net/"]
-    max_files: 5000
-  - name: mm
-    roots: ["mm/", "include/linux/mm.h"]
-    max_files: 3000
-  # ...
-
-# 3. GitNexus 分片索引
-for shard in net mm kernel fs drivers; do
-  gitnexus analyze \
-    --shard $shard \
-    --root linux/ \
-    --include "$(yq ".shards[] | select(.name==\"$shard\") | .roots[]" linux-shards.yml)" \
-    --output "linux-graph/$shard/"
-done
-
-# 4. Graphify 语义聚类 (在每个分片上运行)
-for shard in net mm kernel fs drivers; do
-  graphify ./linux-graph/$shard/ \
-    --mode shard \
-    --leiden-resolution 0.8 \
-    --output ./linux-graph/$shard/graphify-out/
-done
-
-# 5. 跨片边提取
-python3 extract_cross_edges.py \
-  --manifest linux-shards.yml \
-  --gitnexus-dir linux-graph/ \
-  --output linux-graph/cross_edges.db
-```
-
----
-
-## 3. MCP 服务设计与 Claude 集成
-
-### 3.1 GitNexus MCP 服务 (`gitnexus mcp`)
-
-GitNexus 原生支持 MCP。对大型代码库，需要扩展配置以支持分片路由。
+### 2.2 Tool 调用示例
 
 ```json
-// ~/.claude-go/mcp/gitnexus-mcp.json
+// code_intel_init
+{
+  "repo_path": "/home/victor/base/git/linux",
+  "auto_shard": true
+}
+
+// code_intel_query — 符号导航
+{
+  "repo_path": "/home/victor/base/git/linux",
+  "query_type": "navigate",
+  "symbol": "tcp_sendmsg",
+  "shard": "net",
+  "depth": 2
+}
+
+// code_intel_query — 社区概览
+{
+  "repo_path": "/home/victor/base/git/linux",
+  "query_type": "communities",
+  "shard": "net"
+}
+
+// code_intel_branch — 创建 feature 分支索引
+{
+  "repo_path": "/home/victor/base/git/linux",
+  "action": "create",
+  "branch_name": "feature-tcp-optim",
+  "base_branch": "main"
+}
+```
+
+---
+
+## 3. 对外：MCP Server
+
+### 3.1 启动方式
+
+```bash
+# 方式 1: 作为 claude-go 子命令
+claude-go codeintel-mcp-server --repo /path/to/repo
+
+# 方式 2: 独立二进制（未来）
+codeintel-mcp-server --repo /path/to/repo
+```
+
+### 3.2 Claude Desktop 配置
+
+```json
 {
   "mcpServers": {
-    "gitnexus-linux": {
-      "command": "gitnexus",
-      "args": ["mcp", "--project", "/home/victor/base/git/linux", "--shard-dir", "/home/victor/base/git/linux-graph"],
-      "env": {
-        "GITNEXUS_LADYBUG_PATH": "/home/victor/base/git/linux-graph/.ladybug"
-      }
-    },
-    "gitnexus-mysql": {
-      "command": "gitnexus",
-      "args": ["mcp", "--project", "/home/victor/base/git/mysql-server", "--shard-dir", "/home/victor/base/git/mysql-graph"]
+    "code-intel": {
+      "command": "claude-go",
+      "args": ["codeintel-mcp-server", "--repo", "/home/victor/base/git/linux"]
     }
   }
 }
 ```
 
-**暴露的 MCP 工具** (GitNexus 原生):
+### 3.3 Cursor 配置
 
-| 工具名 | 输入 | 输出 | Token 成本 |
-|--------|------|------|-----------|
-| `gitnexus_navigate` | `symbol`, `depth` | 定义位置 + 调用方/被调用方 | ~150 Token |
-| `gitnexus_impact` | `file_path` | 影响半径（依赖文件列表 + 依赖数） | ~200 Token |
-| `gitnexus_type_hierarchy` | `type_name` | 继承链 + 实现者 | ~180 Token |
-| `gitnexus_find_refs` | `symbol` | 所有引用位置 | ~250 Token |
-| `gitnexus_cross_shard` | `symbol`, `target_shard` | 跨片调用关系 | ~120 Token |
-
-### 3.2 Graphify MCP 服务 (`graphify serve`)
-
-Graphify 提供 `serve.py` 模块，需包装为 MCP 服务。
-
-```python
-# graphify_mcp_bridge.py
-from mcp.server import Server
-from mcp.types import TextContent
-import json
-
-app = Server("graphify-bridge")
-
-@app.call_tool()
-async def graphify_query(name: str, arguments: dict):
-    if name == "graphify_communities":
-        shard = arguments["shard"]
-        with open(f"{shard}/graphify-out/graph.json") as f:
-            graph = json.load(f)
-        # Leiden 社区摘要
-        communities = extract_community_summary(graph)
-        return [TextContent(type="text", text=json.dumps(communities, indent=2))]
-    
-    elif name == "graphify_god_nodes":
-        shard = arguments["shard"]
-        top_n = arguments.get("top_n", 10)
-        gods = extract_highest_degree_nodes(shard, top_n)
-        return [TextContent(type="text", text=json.dumps(gods, indent=2))]
-    
-    elif name == "graphify_explain":
-        shard = arguments["shard"]
-        node = arguments["node"]
-        explanation = generate_node_explanation(shard, node)
-        return [TextContent(type="text", text=explanation)]
-    
-    elif name == "graphify_surprises":
-        shard = arguments["shard"]
-        surprises = detect_cross_community_edges(shard)
-        return [TextContent(type="text", text=json.dumps(surprises, indent=2))]
+```json
+{
+  "mcpServers": {
+    "code-intel": {
+      "command": "claude-go",
+      "args": ["codeintel-mcp-server", "--repo", "/home/victor/base/git/linux"]
+    }
+  }
+}
 ```
 
-**Graphify MCP 工具**:
+### 3.4 MCP 暴露的工具
 
-| 工具名 | 输入 | 输出 | 用途 |
-|--------|------|------|------|
-| `graphify_communities` | `shard` | 社区列表 + 核心节点 + 职责摘要 | 宏观理解子系统 |
-| `graphify_god_nodes` | `shard`, `top_n` | 高度数节点排名 | 识别关键枢纽 |
-| `graphify_explain` | `shard`, `node` | 自然语言解释该节点的职责 | 快速理解陌生符号 |
-| `graphify_surprises` | `shard` | 异常跨社区连接 | 发现架构异味 |
-| `graphify_path` | `shard`, `from`, `to` | 两节点间的最短路径 | 理解调用链 |
+与对内 Tool 1:1 映射，通过 `tools/list` 返回：
 
-### 3.3 统一查询编排器 (Integration with claude-go)
-
-在 `claude-go` 的现有四层混合架构基础上，将 Graphify + GitNexus 作为**新的第 2.5 层**插入：
-
-```
-┌────────────────────────────────────────────┐
-│  第 4 层: 编排器 (claude-go orchestrator)   │
-│  - 意图分类                                │
-│  - Token 预算检查                          │
-│  - 多层结果 RRF 排序                       │
-│  - 上下文剪枝                              │
-└────────────────────────────────────────────┘
-                     │
-    ┌────────────────┼────────────────┐
-    ▼                ▼                ▼
-┌────────┐    ┌────────────┐    ┌──────────┐
-│ 第一层 │    │ 第 2.5 层  │    │ 第三层   │
-│ Zoekt  │    │ GitNexus   │    │ SCIP/LSP │
-│ (文本) │    │ +Graphify  │    │ (精确)   │
-└────────┘    │ (结构+语义)│    └──────────┘
-              └────────────┘
+```json
+{
+  "tools": [
+    {"name": "code_intel_init", "description": "...", "inputSchema": {...}},
+    {"name": "code_intel_update", "description": "...", "inputSchema": {...}},
+    {"name": "code_intel_status", "description": "...", "inputSchema": {...}},
+    {"name": "code_intel_query", "description": "...", "inputSchema": {...}},
+    {"name": "code_intel_branch", "description": "...", "inputSchema": {...}}
+  ]
+}
 ```
 
-**意图路由规则**:
+### 3.5 MCP Server 实现
 
-| 用户意图 | 首选层 | 工具 | 降级 |
-|----------|--------|------|------|
-| "`tcp_sendmsg` 在哪里定义" | GitNexus | `gitnexus_navigate` | Zoekt |
-| "修改 VFS 会影响什么" | GitNexus | `gitnexus_impact` | 手工 grep |
-| "TCP 子系统有哪些模块" | Graphify | `graphify_communities` | 读 Kconfig |
-| "InnoDB 缓冲池的核心文件" | Graphify | `graphify_god_nodes` | 读目录 |
-| "这个结构体有哪些实现" | SCIP/LSP | LSP `textDocument/implementation` | ctags |
-| "认证逻辑在哪里" | 向量层 | CodeBERT + Qdrant | Zoekt |
+位于 `pkg/codeintel/mcpserver.go`，JSON-RPC 2.0 over stdio：
 
-**Token 预算检查**:
+```
+stdin  → [JSON-RPC Request]  → handleRequest()
+                                    │
+                                    ▼
+                         ┌──────────────────┐
+                         │ initialize       │
+                         │ tools/list       │
+                         │ tools/call       │──→ executeTool() ──→ Engine/Builder/BranchMgr
+                         │ resources/list   │
+                         └──────────────────┘
+                                    │
+stdout ← [JSON-RPC Response] ←──────┘
+```
+
+---
+
+## 4. 构建流水线（零 LLM Token）
+
+### 4.1 设计原则
+
+**构建过程不使用 LLM**。所有阶段均为纯静态分析或图算法：
+
+| 阶段 | 技术 | Token 消耗 | 说明 |
+|------|------|-----------|------|
+| 1. 文件枚举 | filepath.Walk | 0 | 按分片配置遍历源码 |
+| 2. AST 解析 | Tree-sitter (占位) | 0 | 提取符号、类型、调用关系 |
+| 3. 调用图构建 | 内存图结构 | 0 | 函数调用、类型继承、引用关系 |
+| 4. 社区检测 | Leiden 算法 (占位) | 0 | 基于边权重划分语义社区 |
+| 5. God Node | 度数/中心性统计 | 0 | 识别高度数枢纽节点 |
+| 6. 跨片边 | 符号解析 | 0 | 导出/导入符号匹配 |
+| 7. 语义摘要 | LLM (可选) | 可调 | **默认关闭**，仅增强模式启用 |
+
+### 4.2 分片构建流水线
 
 ```go
-// pkg/tool/builtin/code_intel.go (新增)
-type CodeIntelBudget struct {
-    MaxTokensPerQuery int // 默认 800
-}
-
-func (b *CodeIntelBudget) Check(queryType string, estimatedTokens int) error {
-    if estimatedTokens > b.MaxTokensPerQuery {
-        return fmt.Errorf("查询 %s 预估消耗 %d Token, 超出预算 %d", 
-            queryType, estimatedTokens, b.MaxTokensPerQuery)
+// builder.go — BuildAll 全量构建
+func (b *Builder) BuildAll(branchName string, progress chan<- BuildProgress) (*BranchIndex, error) {
+    for _, shard := range b.Config.Shards {
+        // 1. 枚举文件
+        files := enumerateFiles(shard)
+        
+        // 2. AST 解析 + 符号提取
+        symbols, edges := parseAST(files)
+        
+        // 3. 写入 SQLite 索引
+        insertSymbols(db, symbols)
+        insertEdges(db, edges)
+        
+        // 4. 调用图 JSON
+        saveJSON(callgraphPath, buildCallgraph(symbols, edges))
+        
+        // 5. Leiden 社区检测
+        communities := detectCommunities(symbols, edges)
+        
+        // 6. God Node 识别
+        godNodes := identifyGodNodes(symbols, edges)
+        
+        // 7. 清单生成
+        manifest := buildManifest(symbols, edges)
     }
-    return nil
+    // 8. 跨片边提取
+    extractCrossEdges(branchIndex)
 }
 ```
 
----
+### 4.3 增量更新
 
-## 4. 与 claude-go 工作流的深度集成
-
-### 4.1 Agent Skills 自动注入
-
-GitNexus 的 `analyze` 命令会自动生成 `CLAUDE.md` / `AGENTS.md`。对于分片架构，需要扩展为按子系统生成。
-
-```bash
-# 为 Linux 网络子系统生成上下文
-graphify ./linux-graph/net/ --output-context ./linux-graph/net/CLAUDE.md
-
-# 内容示例 (自动生成的 CLAUDE.md)
-# === TCP Subsystem Context ===
-# Core Files: net/ipv4/tcp.c, net/ipv4/tcp_input.c, net/ipv4/tcp_output.c
-# God Nodes: tcp_sendmsg (degree 142), tcp_recvmsg (degree 128), tcp_v4_do_rcv (degree 95)
-# Communities:
-#   - Congestion Control (tcp_cong.c, tcp_bbr.c, tcp_cubic.c)
-#   - Connection Management (tcp_timer.c, tcp_fastopen.c)
-#   - Data Path (tcp_input.c, tcp_output.c)
-# Cross-Shard Interfaces:
-#   - Calls mm/: kmalloc, kfree, page_frag_alloc
-#   - Calls kernel/: spin_lock, rcu_read_lock
-# Surprises: tcp_bbr.c has unexpected calls to crypto/ (should be net-only)
-```
-
-### 4.2 PreToolUse Hook (GitNexus 原生支持)
-
-在 Claude 执行 `Read` 或 `Grep` 前，自动注入图谱上下文：
-
-```typescript
-// GitNexus PreToolUse Hook 伪代码
-onPreToolUse(tool, args) {
-  if (tool === "Read" && args.file.includes("net/ipv4/tcp")) {
-    // 自动附加 TCP 子系统的社区摘要
-    const context = gitnexus.getShardContext("net");
-    return { 
-      augmentedPrompt: `You are reading a file in the TCP subsystem.\n${context.communities}\nProceed with reading.` 
-    };
-  }
-  if (tool === "Grep" && args.pattern === "tcp_congestion_control") {
-    // 替换为图谱导航，节省 Token
-    return { 
-      redirect: { tool: "gitnexus_navigate", args: { symbol: "tcp_congestion_control", depth: 2 } }
-    };
-  }
-}
-```
-
-### 4.3 PostToolUse Hook (自动重索引)
-
-代码提交后自动检测索引过期：
-
-```typescript
-onPostToolUse(tool, args, result) {
-  if (tool === "Bash" && args.command.includes("git commit")) {
-    const staleShards = gitnexus.checkStaleShards();
-    if (staleShards.length > 0) {
-      return {
-        suggestion: `Index stale for shards: ${staleShards.join(", ")}. Run reindex?`,
-        autoAction: () => gitnexus.incrementalReindex(staleShards)
-      };
+```go
+// builder.go — IncrementalUpdate
+func (b *Builder) IncrementalUpdate(branchName string, ...) (*BranchIndex, error) {
+    changedFiles := gitDiff()           // git diff --name-only
+    affectedShards := mapFilesToShards(changedFiles)
+    for _, shard := range affectedShards {
+        rebuildShard(shard)              // 仅重建受影响分片
     }
-  }
+    updateCrossEdges()                   // 增量更新跨片边
 }
 ```
 
 ---
 
-## 5. 部署手册
+## 5. 存储与分支隔离
 
-### 5.1 环境准备
+### 5.1 存储布局
 
-```bash
-# 系统要求
-# - RAM: 32GB+ (Linux Kernel 全量索引峰值占用 ~24GB)
-# - Disk: 100GB+ SSD (索引文件约为源码的 3-5 倍)
-# - OS: Linux (推荐 Ubuntu 22.04+)
-
-# 安装依赖
-sudo apt-get install -y ripgrep nodejs npm python3-pip
-
-# 安装双引擎
-npm install -g gitnexus
-pip install graphifyy yq
-
-# 配置 GitNexus (自动检测编辑器)
-gitnexus setup
+```
+~/.claude-code-intel/
+├── <repo-hash>/                       # 以仓库路径哈希为根
+│   ├── config.yaml                    # 仓库配置（分片边界、构建参数）
+│   ├── branches/
+│   │   ├── main/                      # main 分支索引
+│   │   │   ├── branch.json            # 分支元数据（Commit、Shards 列表）
+│   │   │   ├── shards/
+│   │   │   │   ├── net/
+│   │   │   │   │   ├── index.json     # 分片元数据（文件数、符号数、社区）
+│   │   │   │   │   ├── ast.db         # SQLite AST 索引
+│   │   │   │   │   ├── callgraph.json # 调用图
+│   │   │   │   │   ├── graphify/      # 社区检测结果
+│   │   │   │   │   │   └── graph.json # NetworkX 风格图
+│   │   │   │   │   └── manifest.yaml  # 跨片接口符号（exports/imports）
+│   │   │   │   ├── mm/
+│   │   │   │   ├── kernel/
+│   │   │   │   └── ...
+│   │   │   └── cross_edges.db         # KuzuDB/SQLite 跨片边
+│   │   └── feature-tcp-optim/         # feature 分支
+│   │       ├── branch.json            # CoW 复制的元数据
+│   │       ├── shards/
+│   │       │   ├── net/               # 若 net/ 被修改，独立存储
+│   │       │   │   ├── index.json
+│   │       │   │   ├── ast.db
+│   │       │   │   └── ...
+│   │       │   ├── mm/
+│   │       │   │   └── .ref           # 引用文件 → 指向 main/mm/（共享）
+│   │       │   └── ...
+│   │       └── cross_edges.db
+│   └── shared/                        # 分支间共享的只读数据（如语言模型缓存）
 ```
 
-### 5.2 Linux Kernel 索引
+### 5.2 分支隔离策略：CoW 元数据 + 共享只读数据
 
-```bash
-# 1. 获取源码
-git clone --depth=1 https://github.com/torvalds/linux.git /data/codebases/linux
-cd /data/codebases/linux
+| 操作 | 实现 |
+|------|------|
+| **创建分支** | 复制 `branch.json` 元数据；各分片目录写 `.ref` 文件指向 base 分支 |
+| **切换分支** | 修改活跃分支指针（未来扩展：config.yaml 中的 `active_branch`） |
+| **修改分片** | 若某分片在新分支有变更，创建独立的 `ast.db`/`callgraph.json`；无变更则通过 `.ref` 共享 |
+| **删除分支** | 仅删除分支目录中的元数据和独立分片；共享数据保留（由引用计数管理，未来扩展） |
 
-# 2. 生成分片配置
-python3 << 'EOF'
-import os, yaml
-
-subsystems = ['arch', 'kernel', 'mm', 'net', 'fs', 'drivers', 'crypto', 'lib']
-shards = []
-for s in subsystems:
-    shards.append({
-        'name': s,
-        'roots': [f'{s}/'] if s != 'arch' else [f'{s}/x86/', f'{s}/arm64/', f'{s}/include/'],
-        'max_files': 5000
-    })
-
-with open('linux-shards.yml', 'w') as f:
-    yaml.dump({'shards': shards}, f)
-EOF
-
-# 3. 分片索引 (并行)
-mkdir -p /data/graphs/linux
-export GITNEXUS_LADYBUG_PATH=/data/graphs/linux/.ladybug
-
-parallel -j 4 '
-  shard={}
-  echo "Indexing shard: $shard"
-  gitnexus analyze \
-    --shard $shard \
-    --include "$(yq ".shards[] | select(.name==\"$shard\") | .roots[]" linux-shards.yml)" \
-    --output /data/graphs/linux/$shard/
-' ::: arch kernel mm net fs drivers crypto lib
-
-# 4. Graphify 语义增强
-parallel -j 4 '
-  shard={}
-  graphify /data/graphs/linux/$shard/ \
-    --mode shard \
-    --leiden-resolution 0.8 \
-    --output /data/graphs/linux/$shard/graphify/
-' ::: arch kernel mm net fs drivers crypto lib
-
-# 5. 提取跨片边
-python3 extract_cross_edges.py \
-  --manifest linux-shards.yml \
-  --ladybug-path /data/graphs/linux/.ladybug \
-  --output /data/graphs/linux/cross_edges.kuzu
-
-# 6. 注册 MCP
-cat >> ~/.claude-go/mcp.json << 'MCP'
-{
-  "gitnexus-linux": {
-    "command": "gitnexus",
-    "args": ["mcp", "--shard-dir", "/data/graphs/linux"]
-  },
-  "graphify-linux": {
-    "command": "python3",
-    "args": ["/data/graphs/linux/graphify_mcp_bridge.py"]
-  }
+```go
+// branch.go — CreateBranch (CoW)
+func (bm *BranchManager) CreateBranch(baseBranch, newBranch string) error {
+    baseIdx := loadBranchIndex(baseBranch)
+    newIdx := &BranchIndex{
+        BranchName: newBranch,
+        Shards:     copyMetadata(baseIdx.Shards),  // 元数据复制
+    }
+    for name := range baseIdx.Shards {
+        shardDir := bm.Store.ShardDir(newBranch, name)
+        baseShardDir := bm.Store.ShardDir(baseBranch, name)
+        os.MkdirAll(shardDir, 0755)
+        os.WriteFile(filepath.Join(shardDir, ".ref"), []byte(baseShardDir), 0644)
+    }
 }
-MCP
-```
-
-### 5.3 MySQL 索引
-
-```bash
-git clone --depth=1 https://github.com/mysql/mysql-server.git /data/codebases/mysql
-cd /data/codebases/mysql
-
-# MySQL 分片更简单：按存储引擎 + SQL 层分片
-mkdir -p /data/graphs/mysql
-
-gitnexus analyze --shard sql --include "sql/" --output /data/graphs/mysql/sql/
-gitnexus analyze --shard innodb --include "storage/innobase/" --output /data/graphs/mysql/innodb/
-gitnexus analyze --shard replication --include "replication/" --output /data/graphs/mysql/replication/
-
-# Graphify
-for shard in sql innodb replication; do
-  graphify /data/graphs/mysql/$shard/ --mode shard --output /data/graphs/mysql/$shard/graphify/
-done
 ```
 
 ---
 
-## 6. 查询示例与 Token 效率对比
+## 6. 查询引擎
 
-### 6.1 场景: "理解 TCP 拥塞控制子系统"
+### 6.1 查询类型
+
+| 查询类型 | 对应能力 | 数据源 | 延迟目标 |
+|----------|----------|--------|----------|
+| `navigate` | 符号定义 + 调用方/被调用方 | SQLite AST | < 50ms |
+| `impact` | 文件依赖半径 | callgraph.json | < 100ms |
+| `communities` | Leiden 社区 + God Nodes | graphify/graph.json | < 200ms |
+| `god_nodes` | 高度数节点排名 | index.json | < 50ms |
+| `cross_shard` | 跨片引用 | cross_edges.db | < 30ms |
+
+### 6.2 Token 效率对比
+
+**场景: "理解 TCP 拥塞控制子系统"**
 
 **Before (纯 Read/Grep)**:
 ```
 1. Grep "tcp_congestion_control" → 18 个文件, 200 个匹配
 2. Read net/ipv4/tcp_cong.c → 350 行
 3. Read net/ipv4/tcp_bbr.c → 420 行
-4. Read net/ipv4/tcp_cubic.c → 380 行
-5. Grep "struct tcp_congestion_ops" → 12 个匹配
-6. Read include/net/tcp.h → 相关 80 行
+4. Grep "struct tcp_congestion_ops" → 12 个匹配
 Total: ~1,600 行 → ~4,800 Token
 ```
 
-**After (Graphify + GitNexus)**:
+**After (code_intel_query)**:
 ```
-1. graphify_communities shard="net"
-   → 返回 TCP Congestion Control 社区: {files: [tcp_cong.c, tcp_bbr.c, tcp_cubic.c], core_nodes: ["tcp_congestion_control", "bbr_main"], summary: "拥塞控制算法框架 + BBR/Cubic 实现"}
+1. code_intel_query query_type="communities" shard="net"
+   → {communities: [{id: 3, label: "Congestion Control", files: [...], core_nodes: ["tcp_congestion_control", "bbr_main"]}]}
    Token: ~120
 
-2. gitnexus_navigate symbol="tcp_congestion_control" depth=2
-   → 定义 + 调用方 + 被调用方 (精确位置)
+2. code_intel_query query_type="navigate" symbol="tcp_congestion_control" depth=2
+   → {def: "net/ipv4/tcp_cong.c:142", callers: [...], callees: [...]}
    Token: ~150
 
-3. 按需 Read 3 个文件的特定行 (80 行)
-   Token: ~240
-Total: ~510 Token (9.4x 节省)
-```
-
-### 6.2 场景: "修改 `innobase/buf` 会影响什么"
-
-**Before**:
-```
-1. Grep "buf_pool_t" → 47 个文件
-2. 手动筛选相关文件
-3. Read 10 个文件的关键部分
-Total: ~3,000 Token
-```
-
-**After**:
-```
-1. gitnexus_impact file_path="storage/innobase/buf/buf0buf.cc"
-   → 影响半径: {direct: 12 files, transitive: 34 files, top_callers: ["buf_page_get_gen", "buf_pool_init"]}
-   Token: ~200
-
-2. graphify_surprises shard="innodb"
-   → 发现 buf/ 社区与 log/ 社区有异常密集的跨社区调用
+3. 按需 Read 2 个文件的特定行 (60 行)
    Token: ~180
-Total: ~380 Token (7.9x 节省)
-```
-
-### 6.3 场景: "找出 Linux 中所有内存分配相关调用"
-
-**Before**:
-```
-Grep "kmalloc\|kzalloc\|vmalloc" → 5,000+ 匹配
-无法直接消费
-```
-
-**After**:
-```
-1. gitnexus_cross_shard symbol="kmalloc" target_shard="*"
-   → 返回跨片调用统计: {net: 142, fs: 98, drivers: 523, ...}
-   Token: ~250
-
-2. graphify_god_nodes shard="mm" top_n=5
-   → 发现 "kmalloc" 是 mm/ 子系统的最高度节点 (degree 1,247)
-   Token: ~100
-Total: ~350 Token + 可操作性结果
+Total: ~450 Token (10.7x 节省)
 ```
 
 ---
 
-## 7. 存储与性能优化
+## 7. 实现文件清单
 
-### 7.1 存储预算
+### 7.1 新增文件
 
-| 代码库 | 源码大小 | GitNexus 索引 | Graphify 输出 | 跨片边 | 总计 |
-|--------|----------|--------------|--------------|--------|------|
-| Linux Kernel | ~3GB | ~8GB | ~2GB | ~500MB | ~11GB |
-| MySQL | ~800MB | ~2GB | ~600MB | ~100MB | ~3GB |
-| PostgreSQL | ~300MB | ~800MB | ~250MB | ~50MB | ~1.1GB |
-
-### 7.2 查询延迟 SLA
-
-| 操作 | 延迟 | 条件 |
-|------|------|------|
-| GitNexus `navigate` | < 50ms | LadybugDB 热缓存 |
-| GitNexus `impact` | < 100ms | 2 跳内 |
-| Graphify `communities` | < 200ms | graph.json 已加载 |
-| Graphify `god_nodes` | < 50ms | NetworkX 内存图 |
-| 跨片边查询 | < 30ms | KuzuDB 本地 |
-
-### 7.3 内存管理
-
-```python
-# graphify_mcp_bridge.py 中的内存控制
-import resource
-
-# 限制每个分片的内存占用
-MAX_SHARD_MEMORY_MB = 4096
-
-def load_shard_graph(shard_path):
-    """按需加载分片图，LRU 淘汰"""
-    if shard_path in _graph_cache:
-        return _graph_cache[shard_path]
-    
-    # 检查内存压力
-    usage_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    while usage_mb > MAX_SHARD_MEMORY_MB * 0.8:
-        # LRU 淘汰
-        evict_oldest_shard()
-    
-    graph = nx.readwrite.json_graph.node_link_graph(
-        json.load(open(f"{shard_path}/graphify-out/graph.json"))
-    )
-    _graph_cache[shard_path] = graph
-    return graph
 ```
+pkg/codeintel/
+├── types.go           # 核心类型：RepoConfig, ShardConfig, ShardIndex, BranchIndex, QueryResult...
+├── store.go           # 存储抽象：SQLite/JSON/YAML 读写，目录管理
+├── shard.go           # 分片管理与自动检测（按顶层目录分组）
+├── builder.go         # 构建流水线：全量构建 + 增量更新（零 LLM）
+├── query.go           # 查询引擎：navigate/impact/communities/god_nodes/cross_shard
+├── branch.go          # 分支隔离：CoW 元数据 + 共享只读数据
+└── mcpserver.go       # MCP Server：JSON-RPC 2.0 over stdio
+
+pkg/tool/builtin/
+└── codeintel_tools.go # 5 个内置 Tool 实现（init/update/status/query/branch）
+```
+
+### 7.2 修改文件
+
+```
+pkg/tool/builtin/register.go    # 注册 5 个 codeintel tools
+```
+
+### 7.3 依赖
+
+```
+github.com/mattn/go-sqlite3    # 已有（AST 索引）
+gopkg.in/yaml.v3               # 新增（配置/清单序列化）
+```
+
+**占位待集成（未来扩展，不影响编译）**:
+- `github.com/smacker/go-tree-sitter` — AST 解析
+- `gonum/graph` 或自实现 — Leiden 社区检测
+- KuzuDB Go driver — 跨片图边存储
 
 ---
 
-## 8. 与现有 claude-go 架构的融合点
+## 8. 与 claude-go 工作流的集成
 
-### 8.1 复用组件
+### 8.1 PreToolUse Hook 增强（未来扩展）
 
-| claude-go 已有组件 | 复用方式 |
-|-------------------|----------|
-| `modelconfig.ResolvedConfig` | 扩展 `CodeIntelShardConfig` 字段，支持分片参数 |
-| `api.RateLimitGuard` | MCP 工具调用也走 Guard，防止 Graphify LLM 调用超限 |
-| `orchestrator.Engine` | 分片构建流水线本身是一个 DAG，可用 Engine 调度 |
-| `hooks.Hooks` | PreToolUse/PostToolUse 接入 GitNexus 原生 hooks |
-| `feishu.Bot` | 索引进度通知、长时间构建的飞书状态推送 |
-
-### 8.2 新增组件
-
+```go
+// 在 Claude 执行 Read/Grep 前，自动重定向为图谱查询
+if tool == "Grep" && args.pattern == "tcp_congestion_control" {
+    return { redirect: { tool: "code_intel_query", args: {
+        query_type: "navigate",
+        symbol: "tcp_congestion_control",
+        shard: "net",
+        depth: 2
+    }}}
+}
 ```
-claude-go/pkg/codeintel/
-├── shard_manager.go         # 分片生命周期管理
-├── cross_edge_store.go      # 跨片边存储 (KuzuDB 封装)
-├── query_router.go          # 意图 → 层 路由
-├── token_budget.go          # Token 预算检查
-├── mcp_bridge_gitnexus.go   # GitNexus MCP 客户端
-├── mcp_bridge_graphify.go   # Graphify MCP 客户端
-└── context_pruner.go        # 结果剪枝 (去重/截断/社区过滤)
+
+### 8.2 PostToolUse Hook 自动重索引（未来扩展）
+
+```go
+if tool == "Bash" && strings.Contains(args.command, "git commit") {
+    staleShards := detectStaleShards()
+    if len(staleShards) > 0 {
+        suggest: fmt.Sprintf("Index stale for shards: %v. Run code_intel_update?", staleShards)
+    }
+}
 ```
 
 ---
@@ -665,50 +442,51 @@ claude-go/pkg/codeintel/
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
-| Linux Kernel 索引耗时过长 | 高 | 首次全量夜间跑；后续增量 < 5 分钟 |
-| LadybugDB 单文件过大 | 中 | 按分片拆分；> 2GB 自动分卷 |
-| Tree-sitter 解析内联 ASM 失败 | 低 | 跳过 `.S` 文件；记录警告 |
-| Graphify Leiden 聚类粒度不当 | 中 | 可调 resolution 参数；人工 review 社区摘要 |
-| MCP 工具过多导致 Claude 困惑 | 中 | 工具命名规范 (`gitnexus_*`, `graphify_*`)；系统提示词中提供使用示例 |
-| 跨片边遗漏 | 中 | 定期全量校验 (CI  nightly)；遗漏时降级到 Zoekt |
+| Tree-sitter Go binding 集成复杂度 | 中 | 当前为占位实现，不影响整体架构；可渐进替换 |
+| Leiden 算法 Go 实现 | 中 | 先用 NetworkX 风格图 + 简化社区检测；后续替换为完整 Leiden |
+| KuzuDB Go driver 成熟度 | 低 | 先用 SQLite 存储跨片边；KuzuDB 作为未来优化 |
+| 千万行代码首次构建耗时 | 高 | 夜间全量跑；日常增量 < 5 分钟 |
+| 存储空间占用 | 中 | 按分片拆分；CoW 分支共享未变更数据 |
+| MCP 工具命名冲突 | 低 | 统一 `code_intel_*` 前缀命名 |
 
 ---
 
 ## 10. 实施路线图
 
-### Phase 1: 单分片验证 (1 周)
-- [ ] 选 Linux `net/` 或 MySQL `storage/innobase/` 作为试点
-- [ ] 跑通 `gitnexus analyze` + `graphify` 完整流水线
-- [ ] 验证 MCP 工具在 Claude 中的可用性
-- [ ] 测量 Token 节省率 (目标 > 5x)
+### Phase 1: 骨架可用（已完成）
+- [x] 核心类型与接口（types.go）
+- [x] 存储抽象（store.go）
+- [x] 分片自动检测（shard.go）
+- [x] 构建流水线骨架（builder.go）
+- [x] 查询引擎骨架（query.go）
+- [x] 分支 CoW 管理（branch.go）
+- [x] MCP Server（mcpserver.go）
+- [x] 5 个内置 Tool（codeintel_tools.go）
+- [x] Tool 注册（register.go）
 
-### Phase 2: 多分片 + 跨片 (1 周)
-- [ ] 完成全部分片索引
-- [ ] 实现 `extract_cross_edges.py`
-- [ ] 集成 `cross_shard` 查询工具
-- [ ] 性能基准测试 (延迟 < 100ms P99)
+### Phase 2: AST 解析集成（1 周）
+- [ ] 集成 `go-tree-sitter` 实现真实 AST 解析
+- [ ] 符号提取（函数、类型、变量、宏）
+- [ ] 调用关系提取
 
-### Phase 3: claude-go 深度集成 (1 周)
-- [ ] 实现 `pkg/codeintel/` 模块
-- [ ] 接入 `PreToolUse` / `PostToolUse` hooks
-- [ ] Token 预算强制检查
-- [ ] 飞书通知集成 (索引进度、过期告警)
+### Phase 3: 图算法集成（1 周）
+- [ ] 实现/集成 Leiden 社区检测
+- [ ] God Node 识别（度数/中心性/ betweenness）
+- [ ] 跨片边精确提取
 
-### Phase 4: 自动化运维 (持续)
-- [ ] Git hooks 自动增量重索引
-- [ ] CI nightly 全量校验
-- [ ] 社区摘要自动生成与更新
-- [ ] 基于实际查询日志优化意图路由模型
+### Phase 4: 性能与运维（1 周）
+- [ ] 并行分片构建
+- [ ] 增量更新性能优化（变更文件精准映射）
+- [ ] 索引过期检测 + 自动重索引 Hook
+- [ ] 存储压缩（大仓库分卷）
 
 ---
 
 ## 11. 参考
 
 - [GitNexus](https://github.com/abhigyanpatwari/GitNexus) — Zero-Server Code Intelligence Engine
-- [Graphify](https://graphify.net/) — Knowledge Graphs for AI Coding Assistants
-- [code-retrieval-design.md](./code-retrieval-design.md) — 本仓库原有的代码检索四层架构设计
-- [Zoekt](https://github.com/sourcegraph/zoekt) — Google 代码搜索引擎
-- [KuzuDB](https://github.com/kuzudb/kuzu) — 嵌入式图数据库
 - [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) — 增量解析器
 - [Leiden Algorithm](https://arxiv.org/abs/1810.08473) — 社区检测
+- [MCP Specification](https://modelcontextprotocol.io/) — Model Context Protocol
+- [KuzuDB](https://github.com/kuzudb/kuzu) — 嵌入式图数据库
 - [Zhao et al., ICSE 2023](https://ieeexplore.ieee.org/abstract/document/10172761) — 增量调用图构建

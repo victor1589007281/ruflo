@@ -88,6 +88,13 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	reg.Register(NewCronDeleteTool())
 	reg.Register(NewCronListTool())
 
+	// Code Intelligence (大型代码库知识图谱)
+	reg.Register(NewCodeIntelInitTool())
+	reg.Register(NewCodeIntelUpdateTool())
+	reg.Register(NewCodeIntelStatusTool())
+	reg.Register(NewCodeIntelQueryTool())
+	reg.Register(NewCodeIntelBranchTool())
+
 	// Computer Use (截屏/鼠标/键盘控制)
 	computeruse.RegisterAll(reg, nil)
 
