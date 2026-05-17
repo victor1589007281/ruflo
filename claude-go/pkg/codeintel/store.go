@@ -28,7 +28,7 @@ func NewStore(repoPath string) *Store {
 // EnsureDirs 创建必要的目录结构。
 func (s *Store) EnsureDirs(branchName string) error {
 	dirs := []string{
-		s.ConfigPath(),
+		filepath.Dir(s.ConfigPath()),
 		s.BranchPath(branchName),
 		filepath.Join(s.BranchPath(branchName), "shards"),
 		s.SharedPath(),

@@ -7,6 +7,7 @@
 package codeintel
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -147,7 +148,7 @@ func ParseFile(path string) (*ParsedFile, error) {
 	}
 	defer p.Close()
 
-	tree, err := p.ParseCtx(nil, nil, content)
+	tree, err := p.ParseCtx(context.Background(), nil, content)
 	if err != nil {
 		return nil, err
 	}

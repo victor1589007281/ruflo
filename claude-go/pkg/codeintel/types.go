@@ -26,6 +26,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -174,7 +175,7 @@ func HashRepoPath(repoPath string) string {
 
 // DefaultBasePath 返回默认存储根目录。
 func DefaultBasePath() string {
-	home, err := filepath.Abs("~")
+	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
 	}
