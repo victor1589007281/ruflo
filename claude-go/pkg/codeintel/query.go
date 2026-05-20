@@ -1,157 +1,174 @@
-// query.go — 三引擎查询路由器。
+// query.go — 查询路由器（v3.1）。
 //
-// 查询路由策略（Graphify + GitNexus + Native 互补）：
-//   - navigate / impact / find_refs / cross_shard → GitNexus 结构查询（SQLite AST 索引 + 调用图 JSON）
-//   - communities / god_nodes / path / surprises   → Graphify 语义查询（图数据 + 社区检测）
-//   - native_grep / native_read / native_fallback  → Native 原生兜底（实时 Grep/Read）
-//
-// 降级策略：
-//   1. 优先查询索引引擎（GitNexus / Graphify）
-//   2. 索引缺失、未命中或报错 → 自动降级到 Native 引擎
-//   3. 同时返回 "engine" 字段标识实际使用的引擎
+// 路由策略：
+//   1. 优先调用 GitNexus / Graphify CLI（外部索引）
+//   2. 缓存最近 60s 的查询结果（避免重复 exec）
+//   3. GitNexus 返回 ambiguous / not_found → 自动降级到 Native 兜底
+//   4. Graphify 返回空结果 → 提示用户可能未索引
 package codeintel
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
-// Engine 三引擎查询路由器。
+// Engine 查询路由器。
 type Engine struct {
-	GitNexus     *GitNexusEngine
-	Graphify     *GraphifyEngine
-	Native       *NativeEngine
-	Store        *Store
-	StaleDetector *StaleDetector
+	GitNexus       *GitNexus
+	Graphify       *Graphify
+	GraphifyNoLLM  *GraphifyNoLLM
+	Native         *NativeEngine
+	Store          *Store
+	cache          *queryCache
+	vectorCache    *VectorCache
+	metrics        *MetricsCollector
+	globalIndex      *GlobalIndex
+	repoID           string
+	incrementalMgr   *IncrementalIndexManager
+	implicitFeedback *ImplicitFeedbackCollector
 }
 
-// NewEngine 创建三引擎路由器。
+// NewEngine 创建查询路由器。
 func NewEngine(repoPath string) *Engine {
-	store := NewStore(repoPath)
 	return &Engine{
-		GitNexus:      NewGitNexusEngine(repoPath),
-		Graphify:      NewGraphifyEngine(repoPath),
+		GitNexus:      NewGitNexus(repoPath),
+		Graphify:      NewGraphify(repoPath),
+		GraphifyNoLLM: NewGraphifyNoLLM(repoPath),
 		Native:        NewNativeEngine(repoPath),
-		Store:         store,
-		StaleDetector: NewStaleDetector(repoPath),
+		Store:         NewStore(repoPath),
+		cache:         newQueryCache(60 * time.Second),
+		vectorCache:   NewVectorCache(repoPath),
+		metrics:       NewMetricsCollector(repoPath),
 	}
 }
 
-// Navigate 符号导航 → GitNexus（索引）→ Native（兜底）。
+// SetGlobalIndex 绑定全局索引管理器，用于查询前 readiness 检查。
+func (e *Engine) SetGlobalIndex(gi *GlobalIndex, repoID string) {
+	e.globalIndex = gi
+	e.repoID = repoID
+}
+
+// SetIncrementalManager 绑定增量索引管理器。
+func (e *Engine) SetIncrementalManager(mgr *IncrementalIndexManager) {
+	e.incrementalMgr = mgr
+}
+
+// SetImplicitFeedbackCollector 绑定隐式反馈采集器。
+func (e *Engine) SetImplicitFeedbackCollector(collector *ImplicitFeedbackCollector) {
+	e.implicitFeedback = collector
+}
+
+// Navigate 符号导航 → GitNexus context → Native 兜底。
 func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, error) {
+	start := time.Now()
 	qr, err := e.GitNexus.Navigate(branchName, q)
-	if err != nil {
-		return e.nativeFallback("navigate", q.Symbol, err)
+	fallback := false
+	if err != nil || isEmptyResult(qr) {
+		qr, err = e.Native.FallbackSearch(q.Symbol)
+		fallback = true
+	} else if isGitNexusMiss(qr) {
+		qr, err = e.Native.FallbackSearch(q.Symbol)
+		fallback = true
 	}
-	e.injectStaleIfNeeded(qr, branchName)
-	return qr, nil
+	e.recordQuery("navigate", "gitnexus", qr, err, fallback, time.Since(start).Milliseconds())
+	return qr, err
 }
 
-// Impact 影响分析 → GitNexus。
+// Impact 影响分析 → GitNexus impact → Native 兜底。
 func (e *Engine) Impact(branchName string, q ImpactQuery) (*QueryResult, error) {
-	qr, err := e.GitNexus.Impact(branchName, q)
-	if err != nil {
-		return e.nativeFallback("impact", q.FilePath, err)
+	start := time.Now()
+	qr, err := e.GitNexus.ImpactQuery(branchName, q)
+	fallback := false
+	if err != nil || isEmptyResult(qr) {
+		qr, err = e.Native.FallbackSearch(q.FilePath)
+		fallback = true
+	} else if isGitNexusMiss(qr) {
+		qr, err = e.Native.FallbackSearch(q.FilePath)
+		fallback = true
 	}
-	e.injectStaleIfNeeded(qr, branchName)
-	return qr, nil
+	e.recordQuery("impact", "gitnexus", qr, err, fallback, time.Since(start).Milliseconds())
+	return qr, err
 }
 
-// FindRefs 符号引用 → GitNexus → Native（兜底）。
+// FindRefs 符号引用 → GitNexus context → Native 兜底。
 func (e *Engine) FindRefs(branchName string, q NavigateQuery) (*QueryResult, error) {
+	start := time.Now()
 	qr, err := e.GitNexus.FindRefs(branchName, q)
-	if err != nil {
-		return e.nativeFallback("find_refs", q.Symbol, err)
+	fallback := false
+	if err != nil || isEmptyResult(qr) {
+		qr, err = e.Native.FindReferences(q.Symbol, 50)
+		fallback = true
+	} else if isGitNexusMiss(qr) {
+		qr, err = e.Native.FindReferences(q.Symbol, 50)
+		fallback = true
 	}
-	e.injectStaleIfNeeded(qr, branchName)
-	return qr, nil
+	e.recordQuery("find_refs", "gitnexus", qr, err, fallback, time.Since(start).Milliseconds())
+	return qr, err
 }
 
-// Communities 社区列表 → Graphify。
+// Communities 社区列表 → Graphify query。
 func (e *Engine) Communities(branchName string, q CommunityQuery) (*QueryResult, error) {
+	start := time.Now()
 	qr, err := e.Graphify.Communities(branchName, q)
-	if err != nil {
-		return e.nativeFallback("communities", q.Shard, err)
-	}
-	e.injectStaleIfNeeded(qr, branchName)
-	return qr, nil
+	e.recordQuery("communities", "graphify", qr, err, false, time.Since(start).Milliseconds())
+	return qr, err
 }
 
-// GodNodes 高度数节点 → Graphify。
+// GodNodes 高度数节点 → Graphify query。
 func (e *Engine) GodNodes(branchName, shardName string, topN int) (*QueryResult, error) {
+	start := time.Now()
 	qr, err := e.Graphify.GodNodes(branchName, shardName, topN)
-	if err != nil {
-		return e.nativeFallback("god_nodes", shardName, err)
-	}
-	e.injectStaleIfNeeded(qr, branchName)
-	return qr, nil
+	e.recordQuery("god_nodes", "graphify", qr, err, false, time.Since(start).Milliseconds())
+	return qr, err
 }
 
-// Path 最短路径 → Graphify。
+// Path 最短路径 → Graphify path。
 func (e *Engine) Path(branchName string, src, dst string) (*QueryResult, error) {
-	qr, err := e.Graphify.Path(branchName, src, dst)
-	if err != nil {
-		return e.nativeFallback("path", src+"->"+dst, err)
-	}
-	e.injectStaleIfNeeded(qr, branchName)
-	return qr, nil
+	start := time.Now()
+	qr, err := e.Graphify.Path(src, dst)
+	e.recordQuery("path", "graphify", qr, err, false, time.Since(start).Milliseconds())
+	return qr, err
 }
 
-// Surprises 异常边 → Graphify。
+// Surprises 异常边 → Graphify query。
 func (e *Engine) Surprises(branchName, shardName string, topN int) (*QueryResult, error) {
+	start := time.Now()
 	qr, err := e.Graphify.Surprises(branchName, shardName, topN)
-	if err != nil {
-		return e.nativeFallback("surprises", shardName, err)
-	}
-	e.injectStaleIfNeeded(qr, branchName)
-	return qr, nil
+	e.recordQuery("surprises", "graphify", qr, err, false, time.Since(start).Milliseconds())
+	return qr, err
 }
 
-// CrossShard 跨片查询 → GitNexus。
+// CrossShard 跨片查询 → GitNexus query → Native 兜底。
 func (e *Engine) CrossShard(branchName string, q CrossShardQuery) (*QueryResult, error) {
+	start := time.Now()
 	qr, err := e.GitNexus.CrossShard(branchName, q)
-	if err != nil {
-		return e.nativeFallback("cross_shard", q.Symbol, err)
+	fallback := false
+	if err != nil || isEmptyResult(qr) || isGitNexusMiss(qr) {
+		qr, err = e.Native.FindReferences(q.Symbol, 50)
+		fallback = true
 	}
-	e.injectStaleIfNeeded(qr, branchName)
-	return qr, nil
+	e.recordQuery("cross_shard", "gitnexus", qr, err, fallback, time.Since(start).Milliseconds())
+	return qr, err
 }
 
-// Status 返回仓库索引全局状态。
+// Status 返回两个工具的状态汇总。
 func (e *Engine) Status(branchName string) (*QueryResult, error) {
 	start := time.Now()
-	cfg, err := e.Store.LoadConfig()
-	if err != nil {
-		return nil, err
-	}
-	branches, _ := e.Store.ListBranches()
 
-	var branchInfo []map[string]interface{}
-	for _, b := range branches {
-		idx, err := e.Store.LoadBranchIndex(b)
-		if err != nil {
-			continue
-		}
-		shardNames := make([]string, 0, len(idx.Shards))
-		for name := range idx.Shards {
-			shardNames = append(shardNames, name)
-		}
-		branchInfo = append(branchInfo, map[string]interface{}{
-			"name":       b,
-			"commit":     idx.CommitHash,
-			"shards":     shardNames,
-			"updated_at": idx.UpdatedAt,
-		})
-	}
+	gnStatus, gnErr := e.GitNexus.Status()
+	gfStatus, gfErr := e.Graphify.IsIndexed(), error(nil)
+	_ = gfErr
+
+	state, _ := e.Store.LoadState()
 
 	result := map[string]interface{}{
-		"repo_path":   cfg.RepoPath,
-		"repo_hash":   cfg.RepoHash,
-		"shard_count": len(cfg.Shards),
-		"branches":    branchInfo,
-		"llm_enhance": cfg.LLMEnhance,
-		"auto_shard":  cfg.AutoShard,
+		"repo_path":        e.Store.RepoPath,
+		"gitnexus_status":  safeResult(gnStatus),
+		"gitnexus_error":   errString(gnErr),
+		"graphify_indexed": gfStatus,
+		"state":            state,
 	}
 	content, _ := json.MarshalIndent(result, "", "  ")
 	return &QueryResult{
@@ -162,91 +179,274 @@ func (e *Engine) Status(branchName string) (*QueryResult, error) {
 	}, nil
 }
 
-// UnifiedQuery 统一查询入口（支持所有查询类型）。
+// UnifiedQuery 统一查询入口。
 func (e *Engine) UnifiedQuery(branchName string, q UnifiedQuery) (*QueryResult, error) {
+	queryText := unifiedQueryText(q)
+
+	// 隐式反馈：观察是否有重查行为
+	if e.implicitFeedback != nil {
+		e.implicitFeedback.ObserveQuery(queryText)
+	}
+
+	// L1: 精确查询缓存（TTL 60s）
+	cacheKey := fmt.Sprintf("%s:%s:%s:%s", q.QueryType, q.Symbol, q.FilePath, q.Shard)
+	if cached := e.cache.get(cacheKey); cached != nil {
+		if e.metrics != nil {
+			e.metrics.RecordQuery(QueryMetrics{
+				Timestamp: time.Now(),
+				QueryType: q.QueryType,
+				Engine:    "l1_cache",
+				Success:   true,
+				CacheHit:  true,
+			})
+		}
+		return cached, nil
+	}
+
+	// L1.5: 全局索引 readiness 检查（引导降级）
+	if e.globalIndex != nil && e.repoID != "" {
+		readiness := e.globalIndex.CheckQueryReady(e.repoID, branchName)
+		if !readiness.Ready {
+			result := map[string]interface{}{
+				"ready":         false,
+				"repo_exists":   readiness.RepoExists,
+				"branch_exists": readiness.BranchExists,
+				"commit_match":  readiness.CommitMatch,
+				"current_head":  readiness.CurrentHead,
+				"indexed_head":  readiness.IndexedHead,
+				"suggestion":    readiness.Suggestion,
+			}
+			content, _ := json.MarshalIndent(result, "", "  ")
+			return &QueryResult{
+				QueryType: q.QueryType,
+				Results:   result,
+				Tokens:    len(content) / 4,
+				LatencyMs: 0,
+			}, nil
+		}
+	}
+
+	// L2: 语义相似缓存（向量相似度）
+	if cached, hit := e.vectorCache.FindSimilar(queryText); hit {
+		if e.metrics != nil {
+			e.metrics.RecordQuery(QueryMetrics{
+				Timestamp: time.Now(),
+				QueryType: q.QueryType,
+				Engine:    "l2_cache",
+				Success:   true,
+				CacheHit:  true,
+			})
+		}
+		return cached, nil
+	}
+
+	var qr *QueryResult
+	var err error
+
 	switch q.QueryType {
 	case QueryNavigate:
-		return e.Navigate(branchName, NavigateQuery{Symbol: q.Symbol, Depth: q.Depth, Shard: q.Shard})
+		qr, err = e.Navigate(branchName, NavigateQuery{Symbol: q.Symbol, Depth: q.Depth, Shard: q.Shard})
 	case QueryImpact:
-		return e.Impact(branchName, ImpactQuery{FilePath: q.FilePath, Depth: q.Depth})
+		qr, err = e.Impact(branchName, ImpactQuery{FilePath: q.FilePath, Depth: q.Depth})
 	case QueryFindRefs:
-		return e.FindRefs(branchName, NavigateQuery{Symbol: q.Symbol, Shard: q.Shard})
+		qr, err = e.FindRefs(branchName, NavigateQuery{Symbol: q.Symbol, Shard: q.Shard})
 	case QueryCommunities:
-		return e.Communities(branchName, CommunityQuery{Shard: q.Shard, TopN: q.TopN})
+		qr, err = e.Communities(branchName, CommunityQuery{Shard: q.Shard, TopN: q.TopN})
 	case QueryGodNodes:
-		return e.GodNodes(branchName, q.Shard, q.TopN)
+		qr, err = e.GodNodes(branchName, q.Shard, q.TopN)
 	case QueryPath:
-		return e.Path(branchName, q.Symbol, q.TargetSymbol)
+		qr, err = e.Path(branchName, q.Symbol, q.TargetSymbol)
 	case QuerySurprises:
-		return e.Surprises(branchName, q.Shard, q.TopN)
+		qr, err = e.Surprises(branchName, q.Shard, q.TopN)
 	case QueryCrossShard:
-		return e.CrossShard(branchName, CrossShardQuery{Symbol: q.Symbol, TargetShard: q.TargetShard})
-	case QueryNativeGrep:
-		return e.Native.Grep(q.Symbol, GrepOptions{Dir: q.FilePath, MaxResults: q.TopN})
-	case QueryNativeRead:
-		return e.Native.ReadFile(q.FilePath, ReadOptions{Offset: q.Depth, Limit: q.TopN})
+		qr, err = e.CrossShard(branchName, CrossShardQuery{Symbol: q.Symbol, TargetShard: q.TargetShard})
+	case QueryStatus:
+		qr, err = e.Status(branchName)
 	default:
 		return nil, fmt.Errorf("unknown query_type: %s", q.QueryType)
 	}
+
+	// 增量索引合并：如果分支有增量变更且查询符号受影响，尝试合并增量结果
+	if err == nil && qr != nil && e.incrementalMgr != nil && e.repoID != "" {
+		if delta, ok := e.incrementalMgr.GetDelta(e.repoID, branchName); ok && delta.IsSymbolAffected(q.Symbol) {
+			// 重新查询当前 HEAD（增量），与基线结果合并
+			var deltaQr *QueryResult
+			var deltaErr error
+			switch q.QueryType {
+			case QueryNavigate:
+				deltaQr, deltaErr = e.Navigate(branchName, NavigateQuery{Symbol: q.Symbol, Depth: q.Depth, Shard: q.Shard})
+			case QueryFindRefs:
+				deltaQr, deltaErr = e.FindRefs(branchName, NavigateQuery{Symbol: q.Symbol, Shard: q.Shard})
+			case QueryImpact:
+				deltaQr, deltaErr = e.Impact(branchName, ImpactQuery{FilePath: q.FilePath, Depth: q.Depth})
+			}
+			if deltaErr == nil && deltaQr != nil {
+				qr = MergeWithBaseline(qr, deltaQr)
+			}
+		}
+	}
+
+	if err == nil && qr != nil {
+		e.cache.set(cacheKey, qr)
+		e.vectorCache.Store(queryText, qr)
+	}
+
+	// 隐式反馈：记录本次查询，启动超时观察
+	if e.implicitFeedback != nil {
+		cacheHit := e.cache.get(cacheKey) != nil
+		e.implicitFeedback.TrackQuery(queryText, cacheHit)
+	}
+
+	return qr, err
 }
 
-// injectStaleIfNeeded 检测索引过期并在结果中注入警告。
-func (e *Engine) injectStaleIfNeeded(qr *QueryResult, branchName string) {
-	if e.StaleDetector == nil || qr == nil {
+// RecordFeedback 记录用户对查询结果的反馈，用于 VectorCache 阈值自校准。
+// 由外部 Tool / MCP handler 在获取用户反馈后调用。
+func (e *Engine) RecordFeedback(queryText string, hit bool, rating int, clicked, resent bool) {
+	if e.vectorCache != nil {
+		e.vectorCache.RecordFeedback(queryText, hit, rating, clicked, resent)
+	}
+}
+
+// unifiedQueryText 将 UnifiedQuery 转换为用于语义缓存的查询文本。
+func unifiedQueryText(q UnifiedQuery) string {
+	parts := []string{q.QueryType, q.Symbol, q.FilePath, q.Shard, q.TargetSymbol, q.TargetShard}
+	var nonEmpty []string
+	for _, p := range parts {
+		if p != "" {
+			nonEmpty = append(nonEmpty, p)
+		}
+	}
+	return strings.Join(nonEmpty, " ")
+}
+
+// ============================================================================
+// 降级判断
+// ============================================================================
+
+func isEmptyResult(qr *QueryResult) bool {
+	if qr == nil || qr.Results == nil {
+		return true
+	}
+	return false
+}
+
+func isGitNexusMiss(qr *QueryResult) bool {
+	if qr == nil || qr.Results == nil {
+		return true
+	}
+	m, ok := qr.Results.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	// GitNexus context/status 返回的 miss 标记
+	if status, ok := m["status"].(string); ok {
+		if status == "not_found" {
+			return true
+		}
+		// ambiguous 但 candidates 非空 → 保留 GitNexus 结果（比 Native 更精确）
+		if status == "ambiguous" {
+			if cands, ok := m["candidates"].([]interface{}); ok && len(cands) > 0 {
+				return false
+			}
+			if cands, ok := m["candidates"].([]map[string]interface{}); ok && len(cands) > 0 {
+				return false
+			}
+			return true // ambiguous 但无 candidates，降级到 Native
+		}
+	}
+	// 没有 symbol/target/candidates 字段才视为 miss
+	if _, ok := m["symbol"]; !ok {
+		if _, ok := m["target"]; !ok {
+			if _, ok := m["candidates"]; !ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ============================================================================
+// 简单内存缓存（TTL）
+// ============================================================================
+
+type cacheEntry struct {
+	result    *QueryResult
+	expiresAt time.Time
+}
+
+type queryCache struct {
+	ttl     time.Duration
+	entries map[string]*cacheEntry
+}
+
+func newQueryCache(ttl time.Duration) *queryCache {
+	return &queryCache{
+		ttl:     ttl,
+		entries: make(map[string]*cacheEntry),
+	}
+}
+
+func (c *queryCache) get(key string) *QueryResult {
+	ent, ok := c.entries[key]
+	if !ok {
+		return nil
+	}
+	if time.Now().After(ent.expiresAt) {
+		delete(c.entries, key)
+		return nil
+	}
+	return ent.result
+}
+
+func (c *queryCache) set(key string, qr *QueryResult) {
+	c.entries[key] = &cacheEntry{
+		result:    qr,
+		expiresAt: time.Now().Add(c.ttl),
+	}
+}
+
+// ============================================================================
+// 私有辅助
+// ============================================================================
+
+func safeResult(qr *QueryResult) interface{} {
+	if qr == nil {
+		return nil
+	}
+	return qr.Results
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// recordQuery 记录查询指标。
+func (e *Engine) recordQuery(queryType, engine string, qr *QueryResult, err error, fallback bool, latencyMs int64) {
+	if e.metrics == nil {
 		return
 	}
-	report, err := e.StaleDetector.Check(branchName)
-	if err == nil && report != nil && report.IsStale {
-		InjectStaleWarning(qr, report)
+	resultCount := 0
+	if qr != nil && qr.Results != nil {
+		switch v := qr.Results.(type) {
+		case []interface{}:
+			resultCount = len(v)
+		case []map[string]interface{}:
+			resultCount = len(v)
+		case map[string]interface{}:
+			resultCount = len(v)
+		}
 	}
+	e.metrics.RecordQuery(QueryMetrics{
+		Timestamp:   time.Now(),
+		QueryType:   queryType,
+		Engine:      engine,
+		LatencyMs:   latencyMs,
+		Success:     err == nil,
+		Fallback:    fallback,
+		ResultCount: resultCount,
+	})
 }
-
-// nativeFallback 索引引擎失败时降级到 Native 引擎。
-func (e *Engine) nativeFallback(queryType, target string, originalErr error) (*QueryResult, error) {
-	start := time.Now()
-	qr, err := e.Native.FallbackSearch(target)
-	if err != nil {
-		// Native 也失败了，返回原始错误
-		return nil, fmt.Errorf("%s failed (index: %v; native fallback: %v)", queryType, originalErr, err)
-	}
-	qr.QueryType = queryType + "_fallback"
-	qr.LatencyMs = time.Since(start).Milliseconds()
-	// 注入降级标记
-	if m, ok := qr.Results.(map[string]interface{}); ok {
-		m["_fallback"] = true
-		m["_original_error"] = originalErr.Error()
-		m["engine"] = "native"
-	}
-	return qr, nil
-}
-
-// ============================================================================
-// 统一查询参数
-// ============================================================================
-
-// UnifiedQuery 统一查询参数（用于 Router 分发）。
-type UnifiedQuery struct {
-	QueryType    string `json:"query_type"`
-	Shard        string `json:"shard,omitempty"`
-	Symbol       string `json:"symbol,omitempty"`
-	TargetSymbol string `json:"target_symbol,omitempty"`
-	FilePath     string `json:"file_path,omitempty"`
-	Depth        int    `json:"depth,omitempty"`
-	TopN         int    `json:"top_n,omitempty"`
-	TargetShard  string `json:"target_shard,omitempty"`
-}
-
-// QueryType 枚举。
-const (
-	QueryNavigate    = "navigate"
-	QueryImpact      = "impact"
-	QueryFindRefs    = "find_refs"
-	QueryCommunities = "communities"
-	QueryGodNodes    = "god_nodes"
-	QueryPath        = "path"
-	QuerySurprises   = "surprises"
-	QueryCrossShard  = "cross_shard"
-	QueryStatus      = "status"
-	QueryNativeGrep  = "native_grep"
-	QueryNativeRead  = "native_read"
-)

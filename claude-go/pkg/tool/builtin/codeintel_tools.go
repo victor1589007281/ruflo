@@ -1,20 +1,15 @@
-// codeintel_tools.go — 代码智能内置 Tool 套件。
+// codeintel_tools.go — 代码智能内置 Tool 套件（GitNexus + Graphify CLI 包装）。
 //
-// 将 pkg/codeintel 引擎能力包装为 5 个内置 tool，注册到 claude-go 工具列表。
-// 与 MCP Server 共享同一核心逻辑（Engine/Builder/BranchManager）。
-//
-// 工具列表:
-//   - code_intel_init     仓库初始化构建（非只读、非并发安全）
-//   - code_intel_update   增量更新（非只读、非并发安全）
-//   - code_intel_status   状态查询（只读、并发安全）
-//   - code_intel_query    图谱查询（只读、并发安全）
-//   - code_intel_branch   分支管理（非只读、非并发安全）
+// Go 仅做编排：所有智能工作交给外部工具。
+//   - GitNexus (Node.js): 结构查询、影响分析、符号导航
+//   - Graphify (Python): 语义查询、社区检测、路径分析
 package builtin
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/anthropic/claude-go/pkg/codeintel"
 	"github.com/anthropic/claude-go/pkg/tool"
@@ -35,19 +30,16 @@ func (t *CodeIntelInitTool) IsConcurrencySafe(_ json.RawMessage) bool  { return 
 func (t *CodeIntelInitTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
 
 func (t *CodeIntelInitTool) Description() string {
-	return `Initialize code intelligence index for a repository.
-Supports auto-sharding (detect shards by top-level directories) or manual shard configuration.
-Build pipeline is pure static analysis (zero LLM tokens): Tree-sitter AST + call graph + Leiden community detection.
-This tool creates the index under ~/.claude-code-intel/<repo-hash>/.`
+	return `Initialize code intelligence for a repository by running GitNexus analyze and Graphify update.
+Requires GitNexus (npm install -g gitnexus) and Graphify (pip3 install graphifyy) to be installed locally.
+This tool delegates all work to external CLI tools — zero LLM tokens consumed during indexing.`
 }
 
 func (t *CodeIntelInitTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"repo_path": {"type": "string", "description": "Absolute path to the git repository to index."},
-			"auto_shard": {"type": "boolean", "description": "Auto-detect shards by top-level directories. Default true."},
-			"shards": {"type": "array", "description": "Manual shard config (only if auto_shard=false).", "items": {"type": "object", "properties": {"name": {"type": "string"}, "root_dirs": {"type": "array", "items": {"type": "string"}}, "max_files": {"type": "integer"}}}}
+			"repo_path": {"type": "string", "description": "Absolute path to the git repository to index."}
 		},
 		"required": ["repo_path"]
 	}`)
@@ -55,61 +47,46 @@ func (t *CodeIntelInitTool) InputSchema() json.RawMessage {
 
 func (t *CodeIntelInitTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
-		RepoPath   string                `json:"repo_path"`
-		AutoShard  bool                  `json:"auto_shard"`
-		Shards     []codeintel.ShardConfig `json:"shards,omitempty"`
+		RepoPath string `json:"repo_path"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
 
-	store := codeintel.NewStore(in.RepoPath)
-	if err := store.EnsureDirs("main"); err != nil {
-		return &tool.ToolResult{Content: fmt.Sprintf("ensure dirs error: %v", err), IsError: true}, nil
-	}
+	// 并行执行 GitNexus analyze + Graphify update
+	gn := codeintel.NewGitNexus(in.RepoPath)
+	gf := codeintel.NewGraphify(in.RepoPath)
 
-	var shards []codeintel.ShardConfig
-	if in.AutoShard {
-		auto, err := codeintel.DetectShards(in.RepoPath, nil)
-		if err != nil {
-			return &tool.ToolResult{Content: fmt.Sprintf("auto-shard error: %v", err), IsError: true}, nil
-		}
-		shards = auto
-	} else if len(in.Shards) > 0 {
-		shards = in.Shards
-	} else {
-		shards = []codeintel.ShardConfig{{Name: "default", RootDirs: []string{"."}}}
-	}
+	var gnResult *codeintel.QueryResult
+	var gfResult *codeintel.QueryResult
+	var gnErr, gfErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	cfg := &codeintel.RepoConfig{
-		RepoPath:  in.RepoPath,
-		RepoHash:  codeintel.HashRepoPath(in.RepoPath),
-		Shards:    shards,
-		AutoShard: in.AutoShard,
-	}
-	if err := store.SaveConfig(cfg); err != nil {
-		return &tool.ToolResult{Content: fmt.Sprintf("save config error: %v", err), IsError: true}, nil
-	}
-
-	builder, err := codeintel.NewBuilder(in.RepoPath)
-	if err != nil {
-		return &tool.ToolResult{Content: fmt.Sprintf("builder init error: %v", err), IsError: true}, nil
-	}
-	idx, err := builder.BuildAll("main", nil)
-	if err != nil {
-		return &tool.ToolResult{Content: fmt.Sprintf("build error: %v", err), IsError: true}, nil
-	}
+	go func() {
+		defer wg.Done()
+		gnResult, gnErr = gn.Analyze()
+	}()
+	go func() {
+		defer wg.Done()
+		gfResult, gfErr = gf.Update(true)
+	}()
+	wg.Wait()
 
 	result := map[string]interface{}{
-		"status":        "initialized",
-		"repo_path":     in.RepoPath,
-		"shard_count":   len(cfg.Shards),
-		"branch":        "main",
-		"files_indexed": 0,
+		"status":         "initialized",
+		"repo_path":      in.RepoPath,
+		"gitnexus":       safeMap(gnResult),
+		"gitnexus_error": errString(gnErr),
+		"graphify":       safeMap(gfResult),
+		"graphify_error": errString(gfErr),
 	}
-	for _, si := range idx.Shards {
-		result["files_indexed"] = result["files_indexed"].(int) + si.FileCount
+	if gnErr != nil && gfErr != nil {
+		result["status"] = "failed"
+	} else if gnErr != nil || gfErr != nil {
+		result["status"] = "partial"
 	}
+
 	out, _ := json.MarshalIndent(result, "", "  ")
 	return &tool.ToolResult{Content: string(out)}, nil
 }
@@ -128,45 +105,62 @@ func (t *CodeIntelUpdateTool) IsConcurrencySafe(_ json.RawMessage) bool  { retur
 func (t *CodeIntelUpdateTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
 
 func (t *CodeIntelUpdateTool) Description() string {
-	return `Incrementally update the code intelligence index based on git changes.
-Only affected shards are rebuilt. Zero LLM tokens consumed.`
+	return `Incrementally update the code intelligence index by re-running GitNexus analyze and Graphify update.
+Zero LLM tokens consumed.`
 }
 
 func (t *CodeIntelUpdateTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"repo_path": {"type": "string", "description": "Absolute path to the indexed repository."},
-			"branch": {"type": "string", "description": "Branch to update. Default: main."}
-		}
+			"repo_path": {"type": "string", "description": "Absolute path to the indexed repository."}
+		},
+		"required": ["repo_path"]
 	}`)
 }
 
 func (t *CodeIntelUpdateTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		RepoPath string `json:"repo_path"`
-		Branch   string `json:"branch,omitempty"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
-	if in.Branch == "" {
-		in.Branch = "main"
-	}
-	builder, err := codeintel.NewBuilder(in.RepoPath)
-	if err != nil {
-		return &tool.ToolResult{Content: fmt.Sprintf("builder init error: %v", err), IsError: true}, nil
-	}
-	idx, err := builder.IncrementalUpdate(in.Branch, nil)
-	if err != nil {
-		return &tool.ToolResult{Content: fmt.Sprintf("update error: %v", err), IsError: true}, nil
-	}
+
+	// 并行执行 GitNexus analyze + Graphify update
+	gn := codeintel.NewGitNexus(in.RepoPath)
+	gf := codeintel.NewGraphify(in.RepoPath)
+
+	var gnResult *codeintel.QueryResult
+	var gfResult *codeintel.QueryResult
+	var gnErr, gfErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		gnResult, gnErr = gn.Analyze()
+	}()
+	go func() {
+		defer wg.Done()
+		gfResult, gfErr = gf.Update(true)
+	}()
+	wg.Wait()
+
 	result := map[string]interface{}{
-		"status":      "updated",
-		"branch":      in.Branch,
-		"shard_count": len(idx.Shards),
-		"updated_at":  idx.UpdatedAt,
+		"status":         "updated",
+		"repo_path":      in.RepoPath,
+		"gitnexus":       safeMap(gnResult),
+		"gitnexus_error": errString(gnErr),
+		"graphify":       safeMap(gfResult),
+		"graphify_error": errString(gfErr),
 	}
+	if gnErr != nil && gfErr != nil {
+		result["status"] = "failed"
+	} else if gnErr != nil || gfErr != nil {
+		result["status"] = "partial"
+	}
+
 	out, _ := json.MarshalIndent(result, "", "  ")
 	return &tool.ToolResult{Content: string(out)}, nil
 }
@@ -185,32 +179,29 @@ func (t *CodeIntelStatusTool) IsConcurrencySafe(_ json.RawMessage) bool  { retur
 func (t *CodeIntelStatusTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
 
 func (t *CodeIntelStatusTool) Description() string {
-	return `Get the status of code intelligence index: shards, branches, last update time, and indexed file counts.`
+	return `Get the status of code intelligence index from GitNexus and Graphify.`
 }
 
 func (t *CodeIntelStatusTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"repo_path": {"type": "string", "description": "Absolute path to the indexed repository."},
-			"branch": {"type": "string", "description": "Branch to check. Default: main."}
-		}
+			"repo_path": {"type": "string", "description": "Absolute path to the indexed repository."}
+		},
+		"required": ["repo_path"]
 	}`)
 }
 
 func (t *CodeIntelStatusTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		RepoPath string `json:"repo_path"`
-		Branch   string `json:"branch,omitempty"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
-	if in.Branch == "" {
-		in.Branch = "main"
-	}
+
 	engine := codeintel.NewEngine(in.RepoPath)
-	qr, err := engine.Status(in.Branch)
+	qr, err := engine.Status("main")
 	if err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("status error: %v", err), IsError: true}, nil
 	}
@@ -219,7 +210,7 @@ func (t *CodeIntelStatusTool) Call(ctx context.Context, input json.RawMessage, _
 }
 
 // ============================================================================
-// CodeIntelQueryTool — 图谱查询
+// CodeIntelQueryTool — 查询
 // ============================================================================
 
 type CodeIntelQueryTool struct{}
@@ -232,17 +223,11 @@ func (t *CodeIntelQueryTool) IsConcurrencySafe(_ json.RawMessage) bool  { return
 func (t *CodeIntelQueryTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
 
 func (t *CodeIntelQueryTool) Description() string {
-	return `Query the code intelligence graph. Supports structural and semantic queries:
-- navigate: symbol definition + callers + callees
-- impact: dependency radius of a file
-- communities: Leiden communities + god nodes in a shard
-- god_nodes: highest-degree nodes in a shard
-- cross_shard: cross-shard references of a symbol
-	- find_refs: all reference locations of a symbol
-	- path: shortest path between two symbols
-	- surprises: anomalous edges (cross-community / high-weight)
-	- native_grep: real-time grep fallback
-	- native_read: real-time file read fallback`
+	return `Query the code intelligence graph via GitNexus or Graphify CLI.
+Query types:
+- navigate / find_refs / cross_shard / impact → GitNexus structural queries
+- path / explain / communities / god_nodes / surprises → Graphify semantic queries
+- query (generic) → routed to both engines`
 }
 
 func (t *CodeIntelQueryTool) InputSchema() json.RawMessage {
@@ -250,14 +235,14 @@ func (t *CodeIntelQueryTool) InputSchema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"repo_path": {"type": "string", "description": "Absolute path to the indexed repository."},
-			"query_type": {"type": "string", "enum": ["navigate", "impact", "find_refs", "communities", "god_nodes", "path", "surprises", "cross_shard", "native_grep", "native_read"]},
+			"query_type": {"type": "string", "enum": ["navigate", "impact", "find_refs", "communities", "god_nodes", "path", "surprises", "cross_shard", "query", "explain"], "description": "Query type."},
 			"shard": {"type": "string"},
 			"symbol": {"type": "string"},
 			"file_path": {"type": "string"},
 			"depth": {"type": "integer"},
 			"top_n": {"type": "integer"},
 			"target_shard": {"type": "string"},
-			"branch": {"type": "string", "description": "Default: main."}
+			"target_symbol": {"type": "string"}
 		},
 		"required": ["repo_path", "query_type"]
 	}`)
@@ -265,22 +250,18 @@ func (t *CodeIntelQueryTool) InputSchema() json.RawMessage {
 
 func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
-		RepoPath    string `json:"repo_path"`
-		QueryType   string `json:"query_type"`
-		Shard       string `json:"shard,omitempty"`
-		Symbol      string `json:"symbol,omitempty"`
-		FilePath    string `json:"file_path,omitempty"`
-		Depth       int    `json:"depth,omitempty"`
-		TopN        int    `json:"top_n,omitempty"`
+		RepoPath     string `json:"repo_path"`
+		QueryType    string `json:"query_type"`
+		Shard        string `json:"shard,omitempty"`
+		Symbol       string `json:"symbol,omitempty"`
+		FilePath     string `json:"file_path,omitempty"`
+		Depth        int    `json:"depth,omitempty"`
+		TopN         int    `json:"top_n,omitempty"`
 		TargetShard  string `json:"target_shard,omitempty"`
 		TargetSymbol string `json:"target_symbol,omitempty"`
-		Branch       string `json:"branch,omitempty"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
-	}
-	if in.Branch == "" {
-		in.Branch = "main"
 	}
 
 	engine := codeintel.NewEngine(in.RepoPath)
@@ -289,25 +270,49 @@ func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ 
 
 	switch in.QueryType {
 	case "navigate":
-		qr, err = engine.Navigate(in.Branch, codeintel.NavigateQuery{Symbol: in.Symbol, Depth: in.Depth, Shard: in.Shard})
+		qr, err = engine.Navigate("main", codeintel.NavigateQuery{Symbol: in.Symbol, Depth: in.Depth, Shard: in.Shard})
 	case "impact":
-		qr, err = engine.Impact(in.Branch, codeintel.ImpactQuery{FilePath: in.FilePath, Depth: in.Depth})
-	case "communities":
-		qr, err = engine.Communities(in.Branch, codeintel.CommunityQuery{Shard: in.Shard, TopN: in.TopN})
-	case "god_nodes":
-		qr, err = engine.GodNodes(in.Branch, in.Shard, in.TopN)
-	case "cross_shard":
-		qr, err = engine.CrossShard(in.Branch, codeintel.CrossShardQuery{Symbol: in.Symbol, TargetShard: in.TargetShard})
+		qr, err = engine.Impact("main", codeintel.ImpactQuery{FilePath: in.FilePath, Depth: in.Depth})
 	case "find_refs":
-		qr, err = engine.FindRefs(in.Branch, codeintel.NavigateQuery{Symbol: in.Symbol, Shard: in.Shard})
+		qr, err = engine.FindRefs("main", codeintel.NavigateQuery{Symbol: in.Symbol, Shard: in.Shard})
+	case "communities":
+		qr, err = engine.Communities("main", codeintel.CommunityQuery{Shard: in.Shard, TopN: in.TopN})
+	case "god_nodes":
+		qr, err = engine.GodNodes("main", in.Shard, in.TopN)
 	case "path":
-		qr, err = engine.Path(in.Branch, in.Symbol, in.TargetSymbol)
+		qr, err = engine.Path("main", in.Symbol, in.TargetSymbol)
 	case "surprises":
-		qr, err = engine.Surprises(in.Branch, in.Shard, in.TopN)
-	case "native_grep":
-		qr, err = engine.Native.Grep(in.Symbol, codeintel.GrepOptions{Dir: in.FilePath, MaxResults: in.TopN})
-	case "native_read":
-		qr, err = engine.Native.ReadFile(in.FilePath, codeintel.ReadOptions{Offset: in.Depth, Limit: in.TopN})
+		qr, err = engine.Surprises("main", in.Shard, in.TopN)
+	case "cross_shard":
+		qr, err = engine.CrossShard("main", codeintel.CrossShardQuery{Symbol: in.Symbol, TargetShard: in.TargetShard})
+	case "query":
+		// 通用查询：并行发给 GitNexus query 和 Graphify query，合并结果
+		gn := codeintel.NewGitNexus(in.RepoPath)
+		gf := codeintel.NewGraphify(in.RepoPath)
+		var gnQr, gfQr *codeintel.QueryResult
+		var gnErr, gfErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			gnQr, gnErr = gn.Query(in.Symbol)
+		}()
+		go func() {
+			defer wg.Done()
+			gfQr, gfErr = gf.Query(in.Symbol)
+		}()
+		wg.Wait()
+		result := map[string]interface{}{
+			"gitnexus":       safeMap(gnQr),
+			"gitnexus_error": errString(gnErr),
+			"graphify":       safeMap(gfQr),
+			"graphify_error": errString(gfErr),
+		}
+		out, _ := json.MarshalIndent(result, "", "  ")
+		return &tool.ToolResult{Content: string(out)}, nil
+	case "explain":
+		gf := codeintel.NewGraphify(in.RepoPath)
+		qr, err = gf.Explain(in.Symbol)
 	default:
 		return &tool.ToolResult{Content: fmt.Sprintf("unknown query_type: %s", in.QueryType), IsError: true}, nil
 	}
@@ -320,7 +325,7 @@ func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ 
 }
 
 // ============================================================================
-// CodeIntelBranchTool — 分支管理
+// CodeIntelBranchTool — 分支管理（简化版）
 // ============================================================================
 
 type CodeIntelBranchTool struct{}
@@ -333,9 +338,9 @@ func (t *CodeIntelBranchTool) IsConcurrencySafe(_ json.RawMessage) bool  { retur
 func (t *CodeIntelBranchTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
 
 func (t *CodeIntelBranchTool) Description() string {
-	return `Manage code intelligence branches (index snapshots per git branch).
-Actions: switch (activate), create (CoW from base), delete, list.
-Branch isolation uses Copy-on-Write metadata with shared read-only index data.`
+	return `Branch management for code intelligence.
+GitNexus and Graphify do not maintain per-branch isolated indexes by default.
+This tool provides: switch (git checkout), detect-changes, and status.`
 }
 
 func (t *CodeIntelBranchTool) InputSchema() json.RawMessage {
@@ -343,9 +348,8 @@ func (t *CodeIntelBranchTool) InputSchema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"repo_path": {"type": "string", "description": "Absolute path to the indexed repository."},
-			"action": {"type": "string", "enum": ["switch", "create", "delete", "list"]},
-			"branch_name": {"type": "string"},
-			"base_branch": {"type": "string", "description": "Base branch for create action. Default: main."}
+			"action": {"type": "string", "enum": ["switch", "detect_changes", "status", "reindex"]},
+			"branch_name": {"type": "string"}
 		},
 		"required": ["repo_path", "action"]
 	}`)
@@ -356,36 +360,51 @@ func (t *CodeIntelBranchTool) Call(ctx context.Context, input json.RawMessage, _
 		RepoPath   string `json:"repo_path"`
 		Action     string `json:"action"`
 		BranchName string `json:"branch_name,omitempty"`
-		BaseBranch string `json:"base_branch,omitempty"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
 
-	bm := codeintel.NewBranchManager(in.RepoPath)
-	var result string
+	gn := codeintel.NewGitNexus(in.RepoPath)
+	gf := codeintel.NewGraphify(in.RepoPath)
+	var result map[string]interface{}
 	var err error
 
 	switch in.Action {
 	case "switch":
-		err = bm.SwitchBranch(in.BranchName)
-		result = fmt.Sprintf("Switched to branch: %s", in.BranchName)
-	case "create":
-		base := in.BaseBranch
-		if base == "" {
-			base = "main"
+		if in.BranchName == "" {
+			return &tool.ToolResult{Content: "branch_name required for switch", IsError: true}, nil
 		}
-		err = bm.CreateBranch(base, in.BranchName)
-		result = fmt.Sprintf("Created branch: %s (from %s)", in.BranchName, base)
-	case "delete":
-		err = bm.DeleteBranch(in.BranchName)
-		result = fmt.Sprintf("Deleted branch: %s", in.BranchName)
-	case "list":
-		var branches []string
-		branches, err = bm.ListBranches()
-		if err == nil {
-			out, _ := json.MarshalIndent(map[string]interface{}{"branches": branches}, "", "  ")
-			result = string(out)
+		result = map[string]interface{}{
+			"action":       "switch",
+			"branch":       in.BranchName,
+			"note":         "GitNexus/Graphify indexes are not branch-isolated. After switching, run 'reindex' to refresh.",
+			"git_checkout": fmt.Sprintf("git -C %s checkout %s", in.RepoPath, in.BranchName),
+		}
+	case "detect_changes":
+		qr, e := gn.DetectChanges()
+		result = map[string]interface{}{
+			"action":           "detect_changes",
+			"gitnexus":         safeMap(qr),
+			"gitnexus_error":   errString(e),
+		}
+	case "status":
+		gnQr, gnErr := gn.Status()
+		result = map[string]interface{}{
+			"action":         "status",
+			"gitnexus":       safeMap(gnQr),
+			"gitnexus_error": errString(gnErr),
+			"graphify_indexed": gf.IsIndexed(),
+		}
+	case "reindex":
+		gnQr, gnErr := gn.Analyze()
+		gfQr, gfErr := gf.Update(true)
+		result = map[string]interface{}{
+			"action":         "reindex",
+			"gitnexus":       safeMap(gnQr),
+			"gitnexus_error": errString(gnErr),
+			"graphify":       safeMap(gfQr),
+			"graphify_error": errString(gfErr),
 		}
 	default:
 		return &tool.ToolResult{Content: fmt.Sprintf("unknown action: %s", in.Action), IsError: true}, nil
@@ -394,5 +413,24 @@ func (t *CodeIntelBranchTool) Call(ctx context.Context, input json.RawMessage, _
 	if err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("branch error: %v", err), IsError: true}, nil
 	}
-	return &tool.ToolResult{Content: result}, nil
+	out, _ := json.MarshalIndent(result, "", "  ")
+	return &tool.ToolResult{Content: string(out)}, nil
+}
+
+// ============================================================================
+// 辅助函数
+// ============================================================================
+
+func safeMap(qr *codeintel.QueryResult) interface{} {
+	if qr == nil {
+		return nil
+	}
+	return qr.Results
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

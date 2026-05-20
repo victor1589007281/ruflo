@@ -24,6 +24,9 @@ type Settings struct {
 
 	// AI 段 (兼容 claude-go.json 飞书统一配置格式)
 	AI *AISection `json:"ai,omitempty"`
+
+	// CodeIntel 段 (代码智能配置)
+	CodeIntel *CodeIntelSettings `json:"codeIntel,omitempty"`
 }
 
 // AISection AI 模型配置段 (与飞书 claude-go.json 格式统一)。
@@ -54,6 +57,69 @@ type McpConfig struct {
 	Args    []string `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 	Enabled *bool    `json:"enabled,omitempty"`
+}
+
+// CodeIntelSettings 代码智能配置。
+type CodeIntelSettings struct {
+	// 全局索引根目录（默认 ~/.claude-code-intel）
+	GlobalIndexRoot string `json:"globalIndexRoot,omitempty"`
+
+	// 缓存配置
+	Cache *CodeIntelCacheSettings `json:"cache,omitempty"`
+
+	// MCP Server 配置
+	MCP *CodeIntelMCPSettings `json:"mcp,omitempty"`
+
+	// Metrics 配置
+	Metrics *CodeIntelMetricsSettings `json:"metrics,omitempty"`
+
+	// 自动更新配置
+	AutoUpdate *CodeIntelAutoUpdateSettings `json:"autoUpdate,omitempty"`
+
+	// 工具路径覆盖（优先于自动探测）
+	ToolPaths *CodeIntelToolPaths `json:"toolPaths,omitempty"`
+}
+
+// CodeIntelCacheSettings 缓存配置。
+type CodeIntelCacheSettings struct {
+	MaxNodes     int `json:"maxNodes,omitempty"`     // 节点缓存容量（默认 10000）
+	MaxEdges     int `json:"maxEdges,omitempty"`     // 边列表缓存容量（默认 50000）
+	QueryTTLSec  int `json:"queryTTLSec,omitempty"`  // 查询结果缓存 TTL（默认 60）
+}
+
+// CodeIntelMCPSettings MCP Server 配置。
+type CodeIntelMCPSettings struct {
+	Enabled   bool     `json:"enabled,omitempty"`   // 是否启用 MCP Server
+	RepoPath  string   `json:"repoPath,omitempty"`  // 默认仓库路径
+	Transport string   `json:"transport,omitempty"` // "stdio" | "http" | "sse"
+}
+
+// CodeIntelMetricsSettings Metrics 配置。
+type CodeIntelMetricsSettings struct {
+	Enabled    bool   `json:"enabled,omitempty"`    // 是否启用指标采集
+	OutputPath string `json:"outputPath,omitempty"` // 指标输出路径（默认 .claude-code-intel/metrics.json）
+	FlushIntervalSec int `json:"flushIntervalSec,omitempty"` // 刷盘间隔（默认 300）
+}
+
+// CodeIntelAutoUpdateSettings 自动更新配置。
+type CodeIntelAutoUpdateSettings struct {
+	Enabled       bool `json:"enabled,omitempty"`       // 是否启用自动更新
+	IntervalSec   int  `json:"intervalSec,omitempty"`   // 检测间隔（默认 300 = 5分钟）
+	FileThreshold int  `json:"fileThreshold,omitempty"` // 触发重建的文件变更阈值（默认 5）
+	QuietHours    *CodeIntelQuietHours `json:"quietHours,omitempty"` // 静默时段
+}
+
+// CodeIntelQuietHours 静默时段配置。
+type CodeIntelQuietHours struct {
+	Start string `json:"start,omitempty"` // "HH:MM" 格式
+	End   string `json:"end,omitempty"`   // "HH:MM" 格式
+}
+
+// CodeIntelToolPaths 工具路径覆盖。
+type CodeIntelToolPaths struct {
+	NodePath     string `json:"nodePath,omitempty"`     // Node.js 路径
+	GitNexusPath string `json:"gitnexusPath,omitempty"` // gitnexus CLI 路径
+	GraphifyPath string `json:"graphifyPath,omitempty"` // graphify CLI 路径
 }
 
 // HookSettings hook 配置。
@@ -174,6 +240,93 @@ func mergeSettings(dst, src *Settings) {
 			for k, v := range src.AI.Plans {
 				dst.AI.Plans[k] = v
 			}
+		}
+	}
+
+	// 合并 CodeIntel 配置
+	if src.CodeIntel != nil {
+		if dst.CodeIntel == nil {
+			dst.CodeIntel = &CodeIntelSettings{}
+		}
+		mergeCodeIntelSettings(dst.CodeIntel, src.CodeIntel)
+	}
+}
+
+func mergeCodeIntelSettings(dst, src *CodeIntelSettings) {
+	if src.GlobalIndexRoot != "" {
+		dst.GlobalIndexRoot = src.GlobalIndexRoot
+	}
+	if src.Cache != nil {
+		if dst.Cache == nil {
+			dst.Cache = &CodeIntelCacheSettings{}
+		}
+		if src.Cache.MaxNodes > 0 {
+			dst.Cache.MaxNodes = src.Cache.MaxNodes
+		}
+		if src.Cache.MaxEdges > 0 {
+			dst.Cache.MaxEdges = src.Cache.MaxEdges
+		}
+		if src.Cache.QueryTTLSec > 0 {
+			dst.Cache.QueryTTLSec = src.Cache.QueryTTLSec
+		}
+	}
+	if src.MCP != nil {
+		if dst.MCP == nil {
+			dst.MCP = &CodeIntelMCPSettings{}
+		}
+		if src.MCP.Enabled {
+			dst.MCP.Enabled = true
+		}
+		if src.MCP.RepoPath != "" {
+			dst.MCP.RepoPath = src.MCP.RepoPath
+		}
+		if src.MCP.Transport != "" {
+			dst.MCP.Transport = src.MCP.Transport
+		}
+	}
+	if src.Metrics != nil {
+		if dst.Metrics == nil {
+			dst.Metrics = &CodeIntelMetricsSettings{}
+		}
+		if src.Metrics.Enabled {
+			dst.Metrics.Enabled = true
+		}
+		if src.Metrics.OutputPath != "" {
+			dst.Metrics.OutputPath = src.Metrics.OutputPath
+		}
+		if src.Metrics.FlushIntervalSec > 0 {
+			dst.Metrics.FlushIntervalSec = src.Metrics.FlushIntervalSec
+		}
+	}
+	if src.AutoUpdate != nil {
+		if dst.AutoUpdate == nil {
+			dst.AutoUpdate = &CodeIntelAutoUpdateSettings{}
+		}
+		if src.AutoUpdate.Enabled {
+			dst.AutoUpdate.Enabled = true
+		}
+		if src.AutoUpdate.IntervalSec > 0 {
+			dst.AutoUpdate.IntervalSec = src.AutoUpdate.IntervalSec
+		}
+		if src.AutoUpdate.FileThreshold > 0 {
+			dst.AutoUpdate.FileThreshold = src.AutoUpdate.FileThreshold
+		}
+		if src.AutoUpdate.QuietHours != nil {
+			dst.AutoUpdate.QuietHours = src.AutoUpdate.QuietHours
+		}
+	}
+	if src.ToolPaths != nil {
+		if dst.ToolPaths == nil {
+			dst.ToolPaths = &CodeIntelToolPaths{}
+		}
+		if src.ToolPaths.NodePath != "" {
+			dst.ToolPaths.NodePath = src.ToolPaths.NodePath
+		}
+		if src.ToolPaths.GitNexusPath != "" {
+			dst.ToolPaths.GitNexusPath = src.ToolPaths.GitNexusPath
+		}
+		if src.ToolPaths.GraphifyPath != "" {
+			dst.ToolPaths.GraphifyPath = src.ToolPaths.GraphifyPath
 		}
 	}
 }
