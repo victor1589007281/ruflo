@@ -89,6 +89,10 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"ml-training":  mlTrainingWorkflow,
 	"hiring":       hiringWorkflow,
 	"parenting":    parentingWorkflow,
+	"research":     researchWorkflow,
+	"finance":      financeWorkflow,
+	"techblog":     techBlogWorkflow,
+	"creative":     creativeWorkflow,
 }
 
 // GetWorkflow 获取预定义工作流. 名称未注册时返回 nil, 让上层走"未知工作流"错误路径.
