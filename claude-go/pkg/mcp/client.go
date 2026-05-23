@@ -18,15 +18,18 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -45,14 +48,15 @@ type ServerConfig struct {
 
 // Connection 与单个 MCP 服务器的连接
 type Connection struct {
-	Config  ServerConfig
-	Status  string // connected, pending, error, disconnected
-	Tools   []ToolInfo
-	Process *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  *bufio.Scanner
-	mu      sync.Mutex
-	nextID  atomic.Int64
+	Config     ServerConfig
+	Status     string // connected, pending, error, disconnected
+	Tools      []ToolInfo
+	Process    *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     *bufio.Scanner
+	httpClient *http.Client
+	mu         sync.Mutex
+	nextID     atomic.Int64
 }
 
 // ToolInfo MCP 服务器声明的工具信息
@@ -147,6 +151,11 @@ func (c *Client) Connect(ctx context.Context, config ServerConfig) (*Connection,
 			conn.Status = "error"
 			return conn, fmt.Errorf("stdio 连接失败: %w", err)
 		}
+	case "http":
+		if err := c.connectHTTP(ctx, conn); err != nil {
+			conn.Status = "error"
+			return conn, fmt.Errorf("http 连接失败: %w", err)
+		}
 	default:
 		return nil, fmt.Errorf("不支持的传输方式: %s", config.Transport)
 	}
@@ -224,6 +233,46 @@ func (c *Client) connectStdio(ctx context.Context, conn *Connection) error {
 	return nil
 }
 
+// connectHTTP 通过 HTTP 传输连接 MCP 服务器
+func (c *Client) connectHTTP(ctx context.Context, conn *Connection) error {
+	if conn.Config.URL == "" {
+		return fmt.Errorf("HTTP 传输需要配置 url")
+	}
+	conn.httpClient = &http.Client{Timeout: 30 * time.Second}
+
+	// 发送 initialize
+	initBody, _ := json.Marshal(map[string]interface{}{
+		"protocolVersion": "2024-11-05",
+		"capabilities":    map[string]interface{}{},
+		"clientInfo": map[string]string{
+			"name":    "claude-go",
+			"version": "1.0.0",
+		},
+	})
+	resp, err := conn.httpClient.Post(conn.Config.URL+"/mcp/v1/initialize", "application/json", bytes.NewReader(initBody))
+	if err != nil {
+		return fmt.Errorf("initialize 请求失败: %w", err)
+	}
+	_ = resp.Body.Close()
+
+	// 获取工具列表
+	toolsResp, err := conn.httpClient.Post(conn.Config.URL+"/mcp/v1/tools/list", "application/json", nil)
+	if err != nil {
+		conn.Status = "connected"
+		return nil
+	}
+	var toolsList struct {
+		Tools []ToolInfo `json:"tools"`
+	}
+	if err := json.NewDecoder(toolsResp.Body).Decode(&toolsList); err == nil {
+		conn.Tools = toolsList.Tools
+	}
+	_ = toolsResp.Body.Close()
+
+	conn.Status = "connected"
+	return nil
+}
+
 // sendRequest 发送 JSON-RPC 请求并等待响应
 func (conn *Connection) sendRequest(method string, params interface{}) (json.RawMessage, error) {
 	return conn.sendRequestCtx(context.Background(), method, params)
@@ -234,6 +283,36 @@ func (conn *Connection) sendRequest(method string, params interface{}) (json.Raw
 func (conn *Connection) sendRequestCtx(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
+
+	// HTTP 传输: 直接发送 RESTful POST
+	if conn.Config.Transport == "http" {
+		var body []byte
+		if params != nil {
+			var err error
+			body, err = json.Marshal(params)
+			if err != nil {
+				return nil, err
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, conn.Config.URL+"/mcp/v1/"+method, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := conn.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		result, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(result))
+		}
+		return result, nil
+	}
 
 	id := conn.nextID.Add(1)
 	req := jsonrpcRequest{
@@ -341,6 +420,10 @@ func (conn *Connection) CallTool(ctx context.Context, name string, arguments jso
 
 // Close 关闭连接
 func (conn *Connection) Close() error {
+	if conn.Config.Transport == "http" {
+		conn.httpClient = nil
+		return nil
+	}
 	if conn.stdin != nil {
 		conn.stdin.Close()
 	}

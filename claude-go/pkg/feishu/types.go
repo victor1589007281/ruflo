@@ -325,6 +325,21 @@ type JSONConfig struct {
 
 	// Sandbox agent 代码执行沙盒配置。
 	Sandbox *sandbox.Config `json:"sandbox,omitempty"`
+
+	// CodeIntel Code Intelligence 配置 (MCP Server 与内部工具共用)
+	CodeIntel *CodeIntelSection `json:"codeIntel,omitempty"`
+}
+
+// CodeIntelSection Code Intelligence 配置段
+type CodeIntelSection struct {
+	// RepoPath 默认仓库路径 (可选; 所有工具均支持通过参数传入 repo_path 实现多仓库管理)
+	RepoPath string `json:"repoPath,omitempty"`
+	// Transport MCP 传输方式: stdio | http | sse (默认 stdio)
+	Transport string `json:"transport,omitempty"`
+	// Addr HTTP/SSE 监听地址 (仅 transport=http/sse 时生效, 默认 127.0.0.1:9234)
+	Addr string `json:"addr,omitempty"`
+	// IndexBaseDir 集中索引根目录 (如 /mnt/data/codeintel)。为空时索引存放在各仓库本地。
+	IndexBaseDir string `json:"indexBaseDir,omitempty"`
 }
 
 // DashboardSection Dashboard 配置段

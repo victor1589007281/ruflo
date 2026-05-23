@@ -11,8 +11,9 @@ import (
 
 // Graphify Graphify CLI 包装器。
 type Graphify struct {
-	RepoPath string
-	paths    *ToolPaths
+	RepoPath     string
+	IndexBaseDir string
+	paths        *ToolPaths
 }
 
 // NewGraphify 创建 Graphify 包装器。
@@ -32,8 +33,23 @@ func (gf *Graphify) ensurePaths() (*ToolPaths, error) {
 	return paths, nil
 }
 
+func (gf *Graphify) setupIndex() error {
+	if gf.IndexBaseDir == "" {
+		return nil
+	}
+	im := NewIndexManager(gf.IndexBaseDir)
+	if im == nil {
+		return nil
+	}
+	_, _, err := im.SetupRepoIndex(gf.RepoPath)
+	return err
+}
+
 // Update 执行 graphify update（重新提取代码并更新图谱）。
 func (gf *Graphify) Update(force bool) (*QueryResult, error) {
+	if err := gf.setupIndex(); err != nil {
+		return nil, fmt.Errorf("setup index: %w", err)
+	}
 	paths, err := gf.ensurePaths()
 	if err != nil {
 		return nil, err

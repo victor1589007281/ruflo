@@ -34,6 +34,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/backup"
 	"github.com/anthropic/claude-go/pkg/basedir"
+	"github.com/anthropic/claude-go/pkg/codeintel"
 	"github.com/anthropic/claude-go/pkg/commands"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/dashboard"
@@ -240,6 +241,7 @@ func main() {
 	rootCmd.AddCommand(sandboxCmd())
 	rootCmd.AddCommand(teamCmd())
 	rootCmd.AddCommand(helpCmd())
+	rootCmd.AddCommand(codeintelMCPServerCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -2576,4 +2578,79 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 		}
 	}
 	return sb.String(), nil
+}
+
+// ============================================================================
+// Code Intelligence MCP Server
+// ============================================================================
+
+func codeintelMCPServerCmd() *cobra.Command {
+	var (
+		repoPath     string
+		transport    string
+		addr         string
+		configPath   string
+		indexBaseDir string
+	)
+	cmd := &cobra.Command{
+		Use:   "codeintel-mcp-server",
+		Short: "Code Intelligence MCP Server (GitNexus + Graphify)",
+		Long: `启动 Code Intelligence MCP Server，对外暴露代码图谱查询工具。
+
+支持三种传输方式:
+  stdio  — JSON-RPC 2.0 over stdin/stdout（Claude Desktop / Cursor 默认）
+  http   — RESTful JSON-RPC 端点，适合 service 守护
+  sse    — Server-Sent Events 流式推送
+
+配置优先级: CLI 参数 > --config JSON 中的 codeIntel > 默认值
+
+示例:
+  claude-go codeintel-mcp-server --repo /path/to/repo
+  claude-go codeintel-mcp-server --config /path/to/config.json
+  claude-go codeintel-mcp-server --repo /path/to/repo --transport http --addr 127.0.0.1:9234`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// 若指定了 --config，从 JSON 读取 codeIntel 配置
+			if configPath != "" {
+				jsonCfg, err := feishu.LoadJSONConfig(configPath)
+				if err == nil && jsonCfg != nil && jsonCfg.CodeIntel != nil {
+					if !cmd.Flags().Changed("repo") {
+						repoPath = jsonCfg.CodeIntel.RepoPath
+					}
+					if !cmd.Flags().Changed("transport") {
+						transport = jsonCfg.CodeIntel.Transport
+					}
+					if !cmd.Flags().Changed("addr") {
+						addr = jsonCfg.CodeIntel.Addr
+					}
+					if !cmd.Flags().Changed("index-base-dir") {
+						indexBaseDir = jsonCfg.CodeIntel.IndexBaseDir
+					}
+				}
+			}
+			if transport == "" {
+				transport = "stdio"
+			}
+			if addr == "" {
+				addr = "127.0.0.1:9234"
+			}
+			srv := codeintel.NewMCPServerV2(repoPath)
+			srv.IndexBaseDir = indexBaseDir
+			var t codeintel.MCPTransport
+			switch transport {
+			case "http":
+				t = codeintel.NewHTTPTransport(addr)
+			case "sse":
+				t = codeintel.NewSSETransport(addr)
+			default:
+				t = codeintel.NewStdioTransport()
+			}
+			return t.Run(srv)
+		},
+	}
+	cmd.Flags().StringVar(&repoPath, "repo", "", "默认仓库路径 (可选; 工具通过参数传入 repo_path)")
+	cmd.Flags().StringVar(&transport, "transport", "stdio", "传输方式: stdio | http | sse")
+	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1:9234", "HTTP/SSE 监听地址 (仅 transport=http/sse 时生效)")
+	cmd.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (读取其中的 codeIntel 段)")
+	cmd.Flags().StringVar(&indexBaseDir, "index-base-dir", "", "集中索引根目录 (如 /mnt/data/codeintel)")
+	return cmd
 }

@@ -4,13 +4,15 @@
 package codeintel
 
 import (
+	"fmt"
 	"time"
 )
 
 // GitNexus GitNexus CLI 包装器。
 type GitNexus struct {
-	RepoPath string
-	paths    *ToolPaths
+	RepoPath     string
+	IndexBaseDir string
+	paths        *ToolPaths
 }
 
 // NewGitNexus 创建 GitNexus 包装器。
@@ -30,14 +32,29 @@ func (g *GitNexus) ensurePaths() (*ToolPaths, error) {
 	return paths, nil
 }
 
+func (g *GitNexus) setupIndex() error {
+	if g.IndexBaseDir == "" {
+		return nil
+	}
+	im := NewIndexManager(g.IndexBaseDir)
+	if im == nil {
+		return nil
+	}
+	_, _, err := im.SetupRepoIndex(g.RepoPath)
+	return err
+}
+
 // Analyze 执行 gitnexus analyze（全量索引）。
 func (g *GitNexus) Analyze() (*QueryResult, error) {
+	if err := g.setupIndex(); err != nil {
+		return nil, fmt.Errorf("setup index: %w", err)
+	}
 	paths, err := g.ensurePaths()
 	if err != nil {
 		return nil, err
 	}
 	start := time.Now()
-	stdout, stderr, err := runWithTimeout(g.RepoPath, 30*time.Minute, paths.NodePath, paths.GitNexusPath, "analyze", ".")
+	stdout, stderr, err := runWithTimeout(g.RepoPath, 2*time.Hour, paths.NodePath, paths.GitNexusPath, "analyze", "--index-only", "--worker-timeout", "60", ".")
 	combined := append(stderr, '\n')
 	combined = append(combined, stdout...)
 	if err != nil {

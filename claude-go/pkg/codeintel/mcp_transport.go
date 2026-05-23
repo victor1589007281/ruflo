@@ -56,16 +56,19 @@ type MCPTransport interface {
 
 // MCPServerV2 Code Intelligence MCP 服务器（支持多传输）。
 type MCPServerV2 struct {
-	RepoPath string
-	Engine   *Engine
+	RepoPath     string
+	IndexBaseDir string
+	Engine       *Engine
 }
 
 // NewMCPServerV2 创建 MCP 服务器（V2）。
+// repoPath 为空时服务器仍可按多仓库模式工作（工具通过参数传入 repo_path）。
 func NewMCPServerV2(repoPath string) *MCPServerV2 {
-	return &MCPServerV2{
-		RepoPath: repoPath,
-		Engine:   NewEngine(repoPath),
+	srv := &MCPServerV2{RepoPath: repoPath}
+	if repoPath != "" {
+		srv.Engine = NewEngine(repoPath)
 	}
+	return srv
 }
 
 // ============================================================================
@@ -493,7 +496,9 @@ func (s *MCPServerV2) toolInit(args json.RawMessage) (string, bool) {
 		return fmt.Sprintf("parse error: %v", err), true
 	}
 	gn := NewGitNexus(in.RepoPath)
+	gn.IndexBaseDir = s.IndexBaseDir
 	gf := NewGraphify(in.RepoPath)
+	gf.IndexBaseDir = s.IndexBaseDir
 
 	gnResult, gnErr := gn.Analyze()
 	gfResult, gfErr := gf.Update(true)
@@ -521,7 +526,9 @@ func (s *MCPServerV2) toolUpdate(args json.RawMessage) (string, bool) {
 		return fmt.Sprintf("parse error: %v", err), true
 	}
 	gn := NewGitNexus(in.RepoPath)
+	gn.IndexBaseDir = s.IndexBaseDir
 	gf := NewGraphify(in.RepoPath)
+	gf.IndexBaseDir = s.IndexBaseDir
 
 	gnResult, gnErr := gn.Analyze()
 	gfResult, gfErr := gf.Update(true)
@@ -632,7 +639,9 @@ func (s *MCPServerV2) toolBranch(args json.RawMessage) (string, bool) {
 	}
 
 	gn := NewGitNexus(in.RepoPath)
+	gn.IndexBaseDir = s.IndexBaseDir
 	gf := NewGraphify(in.RepoPath)
+	gf.IndexBaseDir = s.IndexBaseDir
 	var result map[string]interface{}
 
 	switch in.Action {
@@ -813,12 +822,15 @@ func (s *MCPServerV2) handleHTTPHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":       true,
-		"repoPath": s.RepoPath,
-		"version":  "1.0.0",
-		"time":     time.Now(),
-	})
+	resp := map[string]interface{}{
+		"ok":      true,
+		"version": "1.0.0",
+		"time":    time.Now(),
+	}
+	if s.RepoPath != "" {
+		resp["repoPath"] = s.RepoPath
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ============================================================================

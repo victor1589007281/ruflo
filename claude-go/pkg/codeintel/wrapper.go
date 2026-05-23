@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -169,6 +170,7 @@ func runTool(dir string, name string, args ...string) ([]byte, []byte, error) {
 }
 
 // runWithTimeout 带超时的命令执行。
+// 使用进程组确保超时后能清理所有子进程（防止 Node.js worker 孤儿化阻塞管道）。
 func runWithTimeout(dir string, timeout time.Duration, name string, args ...string) ([]byte, []byte, error) {
 	ctx, cancel := execTimeout(timeout)
 	defer cancel()
@@ -176,10 +178,16 @@ func runWithTimeout(dir string, timeout time.Duration, name string, args ...stri
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	// 创建新进程组，便于超时后批量清理子进程
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	// 若因超时退出，强制杀死整个进程组（SIGKILL 给进程组）
+	if ctx.Err() != nil && cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	return stdout.Bytes(), stderr.Bytes(), err
 }
 
