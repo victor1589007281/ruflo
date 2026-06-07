@@ -681,7 +681,10 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	// 拿到具体错误输出去修源码 (修 bug / 删重复声明 / 修 vet 警告 / 删死循环).
 	// 修完后再跑 gate. 这样团队就有自我恢复能力, 不会因为单个 vet 警告或
 	// 一处明显 bug 就把 30 分钟的工作直接判废.
-	if team.Cwd != "" {
+	// 编译/测试/一致性门禁仅对"产出可编译代码"的工作流生效。
+	// techblog/creative/novel/research 等写作类工作流不产出代码, 跑 go build 会因
+	// "no main module" 误判失败并触发无意义的修复轮次 (浪费 token)。
+	if team.Cwd != "" && workflowProducesCode(team.Workflow) {
 		if gateErr := ptm.tryGateWithRemediation(ctx, team, executor, "compile",
 			ptm.runGlobalCompileGate, 2); gateErr != "" {
 			ptm.failTeam(team, fmt.Sprintf("全局编译门禁失败: %s", gateErr))
@@ -844,6 +847,20 @@ func isSuccessfulTeamStatus(status TeamStatus) bool {
 	return status == TeamStatusCompleted || status == TeamStatusDeliveredWithRemediation
 }
 
+// workflowProducesCode 判定工作流是否产出可编译代码 (决定是否跑编译/测试门禁)。
+// 写作/调研/分析类工作流产出文本, 不应跑 go build 门禁。
+func workflowProducesCode(workflow string) bool {
+	switch strings.ToLower(strings.TrimSpace(workflow)) {
+	case "techblog", "creative", "creative-v2", "novel-v2", "novel-v3",
+		"research", "debate", "swarm", "finance", "predict",
+		"parenting", "hiring", "code-review":
+		return false
+	default:
+		// development / app / game / trading-v2 / ml-training / testing 等代码类
+		return true
+	}
+}
+
 // runGlobalCompileGate runs a global compile check for the team.
 // Returns empty string on success, error message on failure.
 //
@@ -851,6 +868,10 @@ func isSuccessfulTeamStatus(status TeamStatus) bool {
 // 否则 AI 生成的 build.go / cgo 之类的死循环会让整个团队卡死.
 func (ptm *ProductionTeamManager) runGlobalCompileGate(team *ProductionTeam) string {
 	if team == nil || team.Cwd == "" {
+		return ""
+	}
+	// 兜底: 无 go.mod 的目录不是 Go 模块, go build ./... 必然报 "no main module", 跳过。
+	if _, err := os.Stat(filepath.Join(team.Cwd, "go.mod")); err != nil {
 		return ""
 	}
 	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

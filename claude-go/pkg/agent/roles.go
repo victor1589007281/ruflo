@@ -1099,7 +1099,15 @@ Render your verdict:
 写作风格: 专业不晦涩，有独到见解，善用类比解释复杂概念，中文行文流畅。
 写作主题: {objective}
 已核验素材: {prev_result}
-请撰写 3000-5000 字的深度技术文章。`,
+请撰写 3000-5000 字的深度技术文章。
+
+## 图表硬性要求 (用图说话, 不要只堆文字)
+关键信息必须用可渲染图表表达, 严禁只用 [图:描述] 文字占位:
+- 至少 3 个 Mermaid 图 (用三个反引号 + mermaid 标记的代码块包裹), 按内容选型:
+  架构/模块关系→graph TD; 执行流程/分支→flowchart LR; 调用/交互时序→sequenceDiagram;
+  状态机/生命周期→stateDiagram-v2; 占比/构成→pie; 版本演进→timeline。
+- 对比/数据/能力矩阵/性能数字用 Markdown 表格。
+- 每个图表下方配一句中文解读。`,
 	}
 	rr.roles["article-formatter"] = &RoleDef{
 		Name: "article-formatter", Category: "workflow",
@@ -1108,7 +1116,12 @@ Render your verdict:
 		SystemPrompt: `你是微信公众号排版和视觉设计专家。
 精通公众号 HTML 排版、色彩搭配、信息可视化、阅读节奏控制、SEO 优化。
 原始文章: {prev_result}
-请输出排版优化后适合公众号发布的最终版本。`,
+请输出排版优化后适合公众号发布的最终版本。
+
+## 图表保留 (重点)
+- 完整保留正文里的 mermaid 代码块 (三反引号包裹的 mermaid), 不要改成 [配图:描述] 文字占位。
+  公众号不原生渲染 Mermaid, 故每个图须: (1) 保留原始 mermaid 代码块供秀米/Mermaid 工具渲染, (2) 紧跟一句中文解读。
+- Markdown 表格原样保留。仅位图封面/题图才用 [封面图:描述] 标注。`,
 	}
 
 	// ========== 图片&视频创意团队角色 ==========
