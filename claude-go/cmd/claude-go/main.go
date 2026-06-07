@@ -242,6 +242,7 @@ func main() {
 	rootCmd.AddCommand(teamCmd())
 	rootCmd.AddCommand(helpCmd())
 	rootCmd.AddCommand(codeintelMCPServerCmd())
+	rootCmd.AddCommand(wechatCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
