@@ -49,13 +49,22 @@ func RenderMermaidPNG(ctx context.Context, chromePath, code string, timeout time
 	return out, err
 }
 
-// RenderMermaidBatch 复用同一浏览器渲染多张 mermaid 图; 返回与 codes 等长的 PNG/错误切片。
+// RenderMermaidBatch 复用同一浏览器渲染多张 mermaid 图; 失败的图自动重试一次 (放宽超时,
+// 规避浏览器/CDN 冷启动导致的偶发 deadline)。返回与 codes 等长的 PNG/错误切片。
 func RenderMermaidBatch(ctx context.Context, chromePath string, codes []string, perTimeout time.Duration) ([][]byte, []error) {
 	pngs := make([][]byte, len(codes))
 	errs := make([]error, len(codes))
 	_ = withBrowser(ctx, chromePath, func(allocCtx context.Context) error {
+		// 预热: 先渲一张空 mermaid 让 mermaid.js 完成首次加载, 后续都走热路径
+		_, _ = renderElementPNG(allocCtx, mermaidHTML("graph LR\n  A-->B"), "#out svg", "#out", perTimeout)
 		for i, code := range codes {
 			pngs[i], errs[i] = renderElementPNG(allocCtx, mermaidHTML(code), "#out svg", "#out", perTimeout)
+		}
+		// 重试失败项 (新标签 + 更长超时)
+		for i := range codes {
+			if errs[i] != nil {
+				pngs[i], errs[i] = renderElementPNG(allocCtx, mermaidHTML(codes[i]), "#out svg", "#out", perTimeout+30*time.Second)
+			}
 		}
 		return nil
 	})
