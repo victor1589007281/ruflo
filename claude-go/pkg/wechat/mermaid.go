@@ -94,9 +94,10 @@ func RenderMermaidPNG(ctx context.Context, chromePath, code string, timeout time
 	return out, err
 }
 
-// RenderMermaidBatch 复用同一浏览器渲染多张 mermaid 图。语法校验不通过/渲染失败时, 先自动
-// 修复(repairMermaid)再重试一次, 仍失败才返回错误。返回与 codes 等长的 PNG/错误切片。
-func RenderMermaidBatch(ctx context.Context, chromePath string, codes []string, perTimeout time.Duration) ([][]byte, []error) {
+// RenderMermaidBatch 复用同一浏览器渲染多张 mermaid 图。语法校验不通过/渲染失败时:
+// ①启发式修复 repairMermaid 重试; ②仍失败且 fixer!=nil 则调 LLM 修复再重试。
+// fixer(原始代码, 错误信息) 返回修正后的 mermaid 代码 (空串表示放弃)。
+func RenderMermaidBatch(ctx context.Context, chromePath string, codes []string, perTimeout time.Duration, fixer func(code, errMsg string) string) ([][]byte, []error) {
 	pngs := make([][]byte, len(codes))
 	errs := make([]error, len(codes))
 	_ = withBrowser(ctx, chromePath, func(allocCtx context.Context) error {
@@ -105,11 +106,23 @@ func RenderMermaidBatch(ctx context.Context, chromePath string, codes []string, 
 		for i, code := range codes {
 			pngs[i], errs[i] = renderMermaidOne(allocCtx, code, perTimeout)
 		}
-		// 失败项: 自动修复语法后重试 (新标签 + 更长超时)
 		for i := range codes {
-			if errs[i] != nil {
-				fixed := repairMermaid(codes[i])
-				pngs[i], errs[i] = renderMermaidOne(allocCtx, fixed, perTimeout+30*time.Second)
+			if errs[i] == nil {
+				continue
+			}
+			// ① 启发式修复
+			pngs[i], errs[i] = renderMermaidOne(allocCtx, repairMermaid(codes[i]), perTimeout+30*time.Second)
+			// ② LLM 迭代修复 (把每次的新错误反馈给 LLM, 最多 3 轮)
+			if fixer != nil {
+				cur := codes[i]
+				for pass := 0; pass < 3 && errs[i] != nil; pass++ {
+					lf := strings.TrimSpace(fixer(cur, errs[i].Error()))
+					if lf == "" || lf == cur {
+						break
+					}
+					pngs[i], errs[i] = renderMermaidOne(allocCtx, lf, perTimeout+30*time.Second)
+					cur = lf
+				}
 			}
 		}
 		return nil

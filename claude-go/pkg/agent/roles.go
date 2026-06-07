@@ -1107,7 +1107,11 @@ Render your verdict:
   架构/模块关系→graph TD; 执行流程/分支→flowchart LR; 调用/交互时序→sequenceDiagram;
   状态机/生命周期→stateDiagram-v2; 占比/构成→pie; 版本演进→timeline。
 - 对比/数据/能力矩阵/性能数字用 Markdown 表格。
-- 每个图表下方配一句中文解读。`,
+- 每个图表下方配一句中文解读。
+- **Mermaid 语法铁律 (避免渲染失败)**: ①节点/状态标识符只用英文字母数字下划线(如 INSTANT、stEval),
+  中文/说明放进标签; ②含特殊字符(()、:、,、/、空格)的标签必须加双引号 ["..."];
+  ③标签里不要用 < > <br/> [*]，要表达"小于"就写"小于"，换行用单独节点；
+  ④stateDiagram-v2 用 state "中文名" as 英文id 定义后再引用。`,
 	}
 	rr.roles["article-formatter"] = &RoleDef{
 		Name: "article-formatter", Category: "workflow",

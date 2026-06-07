@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/wechat"
 	"github.com/spf13/cobra"
@@ -65,6 +66,27 @@ func wechatCmd() *cobra.Command {
 			// Tier 2: 调 API 建/更新草稿
 			c := wechat.NewClient(wcfg)
 			opt := wechat.TypesetOptions{ChromePath: chromePath, Title: title, Author: author, SourceURL: sourceURL}
+			// LLM mermaid 自动修复 (启发式修不动时兜底)
+			if llm := loadLLMClient(cfgPath); llm != nil {
+				opt.MermaidFixer = func(code, errMsg string) string {
+					sys := "你是 mermaid 语法专家。修复给定 mermaid 图的语法错误。" +
+						"只输出修正后的完整 mermaid 代码(含图类型首行), 不要任何解释、不要 markdown 围栏。" +
+						"常见问题: 节点/转移标签含特殊字符(()/:,等)需加双引号; stateDiagram-v2 的中文或含空格的状态名" +
+						"需用 state \"名称\" as id 先别名再引用; 标签里避免裸 < > 和 <br/>。"
+					user := "错误信息:\n" + errMsg + "\n\n原始 mermaid:\n" + code
+					cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+					defer cancel()
+					out, e := llm.SimpleComplete(cctx, sys, user)
+					if e != nil {
+						fmt.Printf("  ⚠️ LLM 修复调用失败: %v\n", e)
+						return ""
+					}
+					fixed := stripMermaidFence(out)
+					fmt.Printf("  🔧 LLM 修复 mermaid (返回 %d 字符)\n", len(fixed))
+					return fixed
+				}
+				fmt.Println("[wechat] 已启用 LLM mermaid 自动修复")
+			}
 			if updateID != "" {
 				fmt.Printf("[wechat] 更新草稿模式 (add-new+delete-old 规避 WAF): 替换 media_id=%s\n", updateID)
 				newID, res, err := c.UpdateDraftFromMarkdown(ctx, updateID, md, opt)
@@ -177,6 +199,48 @@ func loadWechatMarkdown(mdFile, team string) (string, string, error) {
 		}
 	}
 	return "", "", fmt.Errorf("团队 %s 未找到文章产物", team)
+}
+
+// loadLLMClient 从 config.json 解析默认模型 (ai.modelAlias + providers) 构造 LLM 客户端; 失败返回 nil。
+func loadLLMClient(path string) *api.Client {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var raw struct {
+		Providers map[string]struct {
+			BaseURL string `json:"baseUrl"`
+			APIKey  string `json:"apiKey"`
+		} `json:"providers"`
+		AI struct {
+			ModelAlias string `json:"modelAlias"`
+		} `json:"ai"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		return nil
+	}
+	parts := strings.SplitN(raw.AI.ModelAlias, ":", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	prov, ok := raw.Providers[parts[0]]
+	if !ok || prov.BaseURL == "" {
+		return nil
+	}
+	return api.NewClient(prov.BaseURL, prov.APIKey, parts[1])
+}
+
+// stripMermaidFence 去掉 LLM 返回里可能包裹的 ```mermaid ... ``` 围栏。
+func stripMermaidFence(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = s[i+1:]
+		}
+		s = strings.TrimSpace(s)
+		s = strings.TrimSuffix(s, "```")
+	}
+	return strings.TrimSpace(s)
 }
 
 func inferTitle(md string) string {

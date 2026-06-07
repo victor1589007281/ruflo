@@ -23,7 +23,7 @@ func TypesetLocal(ctx context.Context, md, chromePath, imgDir, imgRefBase string
 	for i, b := range blocks {
 		codes[i] = b.Code
 	}
-	pngs, errs := RenderMermaidBatch(ctx, chromePath, codes, 45*time.Second)
+	pngs, errs := RenderMermaidBatch(ctx, chromePath, codes, 45*time.Second, nil)
 	for i, b := range blocks {
 		if errs[i] != nil {
 			warnings = append(warnings, fmt.Sprintf("mermaid#%d 渲染失败: %v", b.Index, errs[i]))
@@ -58,6 +58,9 @@ type TypesetOptions struct {
 	Author     string
 	Digest     string // 摘要 (<=120 字)
 	SourceURL  string // 原文链接
+	// MermaidFixer 可选: 语法校验/渲染失败且启发式修复无效时, 调它(LLM)修复 mermaid。
+	// 入参 (原始代码, 错误信息), 返回修正后的 mermaid (空串=放弃)。
+	MermaidFixer func(code, errMsg string) string
 }
 
 // TypesetResult 排版产物。
@@ -80,7 +83,7 @@ func (c *Client) Typeset(ctx context.Context, md string, opts TypesetOptions) (*
 	for i, b := range blocks {
 		codes[i] = b.Code
 	}
-	pngs, errs := RenderMermaidBatch(ctx, opts.ChromePath, codes, 45*time.Second)
+	pngs, errs := RenderMermaidBatch(ctx, opts.ChromePath, codes, 45*time.Second, opts.MermaidFixer)
 	for i, b := range blocks {
 		if errs[i] != nil {
 			res.Warnings = append(res.Warnings, fmt.Sprintf("mermaid#%d 渲染失败: %v", b.Index, errs[i]))
