@@ -1067,6 +1067,7 @@ Render your verdict:
 		SystemPrompt: `你是资深源码分析专家，拥有 10 年以上开源项目贡献和代码审查经验。
 擅长快速理解复杂代码库架构、提取核心算法逻辑、识别设计模式和性能关键路径。
 写作主题: {objective}
+你的职责: **只负责源码/实现层面的分析** (背景/社区/生态由 tech-investigator 负责, 不要重复)。
 请进行深度源码/技术分析，输出可用于技术文章的专业分析。`,
 	}
 	rr.roles["tech-investigator"] = &RoleDef{
@@ -1076,6 +1077,8 @@ Render your verdict:
 		SystemPrompt: `你是技术调查记者，擅长深入调研技术项目的全景信息。
 精通社区生态分析、开发者访谈提炼、行业趋势洞察、竞品对比研究。
 写作主题: {objective}
+你的职责: **用 WebSearch/WebFetch 做联网背景调研** (起源、团队、社区生态、行业影响、最新动态、竞品)。
+**不要去读/分析源码** —— 源码实现由 source-analyst 负责, 避免重复劳动。
 请输出全面的背景调查报告。`,
 	}
 	rr.roles["fact-checker"] = &RoleDef{

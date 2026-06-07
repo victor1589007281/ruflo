@@ -128,6 +128,11 @@ func (im *IndexManager) SetupRepoIndex(repoPath string) (gnDir, gfDir string, er
 // ensureSymlink 确保 src 是指向 dst 的 symlink。
 // 如果 src 是真实目录，先移动到 dst；如果 src 已是 symlink 指向 dst，忽略；否则替换。
 func (im *IndexManager) ensureSymlink(src, dst string) error {
+	// 先确保 dst 目录存在（避免创建 broken symlink）
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("mkdir dst %s: %w", dst, err)
+	}
+
 	fi, err := os.Lstat(src)
 	if err != nil {
 		if os.IsNotExist(err) {

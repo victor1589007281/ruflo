@@ -32,8 +32,11 @@ import (
 
 const WebFetchToolName = "WebFetch"
 
-// maxWebFetchChars 与 TS 侧常见截断一致的量级：防止超大页面撑爆上下文。
-const maxWebFetchChars = 50000
+// maxWebFetchChars 单次抓取注入上下文的纯文本上限。
+// 50000 字符 (~12.5K token) 对"背景调研"过大: 实测 tech-investigator 多次抓取整页,
+// 每页都是一次 cache-miss 计费, 占团队 token 的 80%+。收紧到 16000 字符 (~4K token),
+// 既够提炼背景信息, 又把抓取成本砍 ~3x。需要全文精读的场景应改用专门的文档读取流程。
+const maxWebFetchChars = 16000
 
 const webFetchHTTPTimeout = 60 * time.Second
 

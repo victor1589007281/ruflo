@@ -394,10 +394,17 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 	ch := make(chan types.Message, 50)
 
 	e.mu.Lock()
+	text := userContent
+	if text == "" && e.TaskInstruction != "" {
+		text = e.TaskInstruction
+	}
+	if text == "" {
+		text = "."
+	}
 	userMsg := types.Message{
 		Type:      types.MessageTypeUser,
 		UUID:      internal_hook.GenerateUUID(),
-		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: userContent}},
+		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: text}},
 		CreatedAt: time.Now(),
 	}
 	e.Messages = append(e.Messages, userMsg)
@@ -428,10 +435,17 @@ func (e *QueryEngine) SubmitStream(ctx context.Context, userContent string) <-ch
 	msgCh := make(chan types.Message, 50)
 
 	e.mu.Lock()
+	text := userContent
+	if text == "" && e.TaskInstruction != "" {
+		text = e.TaskInstruction
+	}
+	if text == "" {
+		text = "."
+	}
 	userMsg := types.Message{
 		Type:      types.MessageTypeUser,
 		UUID:      internal_hook.GenerateUUID(),
-		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: userContent}},
+		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: text}},
 		CreatedAt: time.Now(),
 	}
 	e.Messages = append(e.Messages, userMsg)
@@ -1290,6 +1304,65 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// sanitizeToolPairing 移除"孤儿"工具块: 保证每个 tool_use 都有对应 tool_result, 反之亦然。
+// 消息过滤/预算降级/压缩可能破坏 tool_use↔tool_result 配对, 严格网关 (Kimi/OpenAI 协议) 会 400。
+func sanitizeToolPairing(messages []types.Message) []types.Message {
+	toolUseIDs := make(map[string]bool)
+	toolResultIDs := make(map[string]bool)
+	for _, m := range messages {
+		for _, b := range m.Content {
+			switch b.Type {
+			case types.ContentBlockToolUse:
+				if b.ID != "" {
+					toolUseIDs[b.ID] = true
+				}
+			case types.ContentBlockToolResult:
+				if b.ToolUseID != "" {
+					toolResultIDs[b.ToolUseID] = true
+				}
+			}
+		}
+	}
+	out := make([]types.Message, 0, len(messages))
+	for _, m := range messages {
+		kept := make([]types.ContentBlock, 0, len(m.Content))
+		for _, b := range m.Content {
+			switch b.Type {
+			case types.ContentBlockToolUse:
+				if b.ID == "" || !toolResultIDs[b.ID] {
+					continue // 无对应 tool_result, 丢弃孤儿 tool_use
+				}
+			case types.ContentBlockToolResult:
+				if b.ToolUseID == "" || !toolUseIDs[b.ToolUseID] {
+					continue // 无对应 tool_use, 丢弃孤儿 tool_result
+				}
+			}
+			kept = append(kept, b)
+		}
+		if len(kept) == 0 {
+			continue // 整条消息只剩孤儿块, 整条丢弃
+		}
+		// tool_result 块必须位于 user 消息开头: Anthropic 硬性要求, 且严格网关 (Kimi/OpenAI 翻译层)
+		// 要求 assistant 的 tool_calls 紧跟 tool 响应, 否则报 "tool_calls must be followed by tool messages"。
+		if m.Type == types.MessageTypeUser {
+			var results, others []types.ContentBlock
+			for _, b := range kept {
+				if b.Type == types.ContentBlockToolResult {
+					results = append(results, b)
+				} else {
+					others = append(others, b)
+				}
+			}
+			if len(results) > 0 && len(others) > 0 {
+				kept = append(results, others...)
+			}
+		}
+		m.Content = kept
+		out = append(out, m)
+	}
+	return out
+}
+
 // messagesToAPI 将内部 Message 格式转换为 API 格式。
 // 对应 TS: utils/messages.ts 中的 normalizeMessagesForAPI()
 //
@@ -1309,6 +1382,11 @@ func messagesToAPI(messages []types.Message, hookRunner *hooks.Runner) []types.A
 
 	// 优化1: 过滤不含 reasoning 的古老 assistant + tool_result 原子单元
 	messages = internal_hook.FilterPureToolUseUnits(messages, 6)
+
+	// 优化1b: 修复工具配对 —— 过滤/压缩可能产生孤儿 tool_use 或 tool_result,
+	// Anthropic 原生 API 容忍, 但 Kimi 等严格网关 (OpenAI 协议翻译层) 会 400
+	// ("tool_calls must be followed by tool messages" / "role 'tool' must be a response...").
+	messages = sanitizeToolPairing(messages)
 
 	var result []types.APIMessage
 
@@ -1341,6 +1419,33 @@ func messagesToAPI(messages []types.Message, hookRunner *hooks.Runner) []types.A
 				Role:    role,
 				Content: content,
 			})
+		}
+	}
+
+	// 合并后再做一次 tool_result 前置: 注入的提示/文本可能夹在 assistant(tool_use) 与
+	// tool_result 之间, 合并连续 user 消息后变成 [text, tool_result, ...]。Anthropic 容忍,
+	// 但 Kimi 等严格网关要求 assistant 的 tool_calls 后紧跟 tool 响应, 否则 400。
+	// 这里保证每条 user 消息的 tool_result 块都排在最前面。
+	for i := range result {
+		if result[i].Role != "user" {
+			continue
+		}
+		var blocks []types.ContentBlock
+		if err := json.Unmarshal(result[i].Content, &blocks); err != nil {
+			continue
+		}
+		var res, oth []types.ContentBlock
+		for _, b := range blocks {
+			if b.Type == types.ContentBlockToolResult {
+				res = append(res, b)
+			} else {
+				oth = append(oth, b)
+			}
+		}
+		if len(res) > 0 && len(oth) > 0 {
+			if reordered, err := json.Marshal(append(res, oth...)); err == nil {
+				result[i].Content = reordered
+			}
 		}
 	}
 

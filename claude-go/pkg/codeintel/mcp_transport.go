@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -54,11 +55,24 @@ type MCPTransport interface {
 // MCPServerV2 — 支持多传输的 MCP Server
 // ============================================================================
 
+// GitNexusConfig GitNexus 运行时调优配置
+type GitNexusConfig struct {
+	// DefaultHeapMB V8 默认堆内存上限 (MB)。0 表示使用 GitNexus 内置默认值 8192。
+	DefaultHeapMB int `json:"defaultHeapMB,omitempty"`
+	// MaxHeapMB V8 最大堆内存上限 (MB)。0 表示 32768。
+	MaxHeapMB int `json:"maxHeapMB,omitempty"`
+	// PerThousandFilesMB 每 1000 个可解析文件额外增加的堆内存 (MB)。0 表示 256。
+	PerThousandFilesMB int `json:"perThousandFilesMB,omitempty"`
+	// PerHundredMBSourceMB 每 100MB 源码额外增加的堆内存 (MB)。0 表示 512。
+	PerHundredMBSourceMB int `json:"perHundredMBSourceMB,omitempty"`
+}
+
 // MCPServerV2 Code Intelligence MCP 服务器（支持多传输）。
 type MCPServerV2 struct {
 	RepoPath     string
 	IndexBaseDir string
 	Engine       *Engine
+	GitNexusCfg  *GitNexusConfig
 }
 
 // NewMCPServerV2 创建 MCP 服务器（V2）。
@@ -490,6 +504,76 @@ func (s *MCPServerV2) executeTool(name string, args json.RawMessage) (string, bo
 // Tool 实现（复用 Engine 逻辑）
 // ============================================================================
 
+// calcHeapMB 根据仓库规模与配置计算 GitNexus V8 堆内存上限。
+//
+// 公式: heap = default + (fileCount/1000)*per1K + (sourceMB/100)*per100MB
+// 其中 fileCount 为 GitNexus 支持语言的可解析文件数，sourceMB 为对应源码总大小。
+// 结果在 [default, max] 区间内。返回 0 表示让 GitNexus 使用其内置默认值。
+func calcHeapMB(repoPath string, cfg *GitNexusConfig) int {
+	if cfg == nil {
+		cfg = &GitNexusConfig{}
+	}
+	base := cfg.DefaultHeapMB
+	if base <= 0 {
+		base = 8192
+	}
+	max := cfg.MaxHeapMB
+	if max <= 0 {
+		max = 32768
+	}
+	per1K := cfg.PerThousandFilesMB
+	if per1K <= 0 {
+		per1K = 256
+	}
+	per100MB := cfg.PerHundredMBSourceMB
+	if per100MB <= 0 {
+		per100MB = 512
+	}
+
+	fileCount, sourceMB := estimateRepoSize(repoPath)
+
+	heap := base
+	heap += (fileCount / 1000) * per1K
+	heap += (sourceMB / 100) * per100MB
+
+	if heap > max {
+		heap = max
+	}
+	if heap < base {
+		heap = base
+	}
+	return heap
+}
+
+// estimateRepoSize 统计仓库中 GitNexus 支持语言的可解析文件数及源码总大小 (MB)。
+func estimateRepoSize(repoPath string) (fileCount int, sourceMB int) {
+	exts := map[string]bool{
+		".c": true, ".h": true, ".cpp": true, ".cc": true, ".cxx": true, ".hpp": true,
+		".go": true, ".rs": true, ".java": true, ".py": true,
+		".js": true, ".jsx": true, ".ts": true, ".tsx": true,
+		".php": true, ".swift": true, ".kt": true, ".dart": true,
+		".cs": true, ".rb": true, ".vue": true, ".cbl": true, ".cob": true,
+	}
+	var totalBytes int64
+	_ = filepath.WalkDir(repoPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if !exts[ext] {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		fileCount++
+		totalBytes += info.Size()
+		return nil
+	})
+	return fileCount, int(totalBytes / (1024 * 1024))
+}
+
 func (s *MCPServerV2) toolInit(args json.RawMessage) (string, bool) {
 	var in struct{ RepoPath string `json:"repo_path"` }
 	if err := json.Unmarshal(args, &in); err != nil {
@@ -497,6 +581,7 @@ func (s *MCPServerV2) toolInit(args json.RawMessage) (string, bool) {
 	}
 	gn := NewGitNexus(in.RepoPath)
 	gn.IndexBaseDir = s.IndexBaseDir
+	gn.MaxHeapMB = calcHeapMB(in.RepoPath, s.GitNexusCfg)
 	gf := NewGraphify(in.RepoPath)
 	gf.IndexBaseDir = s.IndexBaseDir
 
@@ -527,6 +612,7 @@ func (s *MCPServerV2) toolUpdate(args json.RawMessage) (string, bool) {
 	}
 	gn := NewGitNexus(in.RepoPath)
 	gn.IndexBaseDir = s.IndexBaseDir
+	gn.MaxHeapMB = calcHeapMB(in.RepoPath, s.GitNexusCfg)
 	gf := NewGraphify(in.RepoPath)
 	gf.IndexBaseDir = s.IndexBaseDir
 

@@ -856,12 +856,38 @@ func (b *Bot) periodicMemoryMetrics(ctx context.Context) {
 	}
 }
 
-// DashboardTeamAction 供 dashboard 直接调用的团队操作 (stop/restart/delete/resume)。
-func (b *Bot) DashboardTeamAction(action, teamName string) error {
+// DashboardTeamAction 供 dashboard 直接调用的团队操作 (create/run/stop/restart/delete/resume)。
+func (b *Bot) DashboardTeamAction(action, teamName string, payload map[string]interface{}) error {
 	if b.teamMgr == nil {
 		return fmt.Errorf("teamMgr 未初始化")
 	}
 	switch action {
+	case "create":
+		workflow := ""
+		objective := ""
+		if payload != nil {
+			if w, ok := payload["workflow"].(string); ok {
+				workflow = w
+			}
+			if o, ok := payload["objective"].(string); ok {
+				objective = o
+			}
+		}
+		if workflow == "" {
+			return fmt.Errorf("create 操作需要 workflow 参数")
+		}
+		if _, err := b.teamMgr.CreateTeam(teamName, workflow, objective, "dashboard"); err != nil {
+			return err
+		}
+		return b.teamMgr.RunTeam(teamName, objective)
+	case "run":
+		objective := ""
+		if payload != nil {
+			if o, ok := payload["objective"].(string); ok {
+				objective = o
+			}
+		}
+		return b.teamMgr.RunTeam(teamName, objective)
 	case "stop":
 		return b.teamMgr.StopTeam(teamName)
 	case "delete":
@@ -870,7 +896,13 @@ func (b *Bot) DashboardTeamAction(action, teamName string) error {
 		if err := b.teamMgr.StopTeam(teamName); err != nil {
 			return fmt.Errorf("停止失败: %w", err)
 		}
-		return b.teamMgr.RunTeam(teamName, "")
+		objective := ""
+		if payload != nil {
+			if o, ok := payload["objective"].(string); ok {
+				objective = o
+			}
+		}
+		return b.teamMgr.RunTeam(teamName, objective)
 	case "resume":
 		return b.teamMgr.ResumeTeam(teamName)
 	default:

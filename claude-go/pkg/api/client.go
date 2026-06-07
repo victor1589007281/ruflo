@@ -337,6 +337,8 @@ func isAnthropicEndpoint(baseURL string) bool {
 		strings.Contains(lower, "api.claude") ||
 		strings.Contains(lower, "bedrock") || // AWS Bedrock
 		strings.Contains(lower, "dashscope.aliyuncs.com") || // 阿里云百炼
+		strings.Contains(lower, "moonshot") || // Moonshot Anthropic 兼容端点 (api.moonshot.ai|cn/anthropic)
+		strings.Contains(lower, "kimi.com") || // Kimi coding 端点 (api.kimi.com/coding, Claude Code 兼容, 支持 cache_control)
 		strings.Contains(lower, "/apps/anthropic") // Anthropic 兼容代理路径
 }
 
@@ -524,6 +526,17 @@ func NewDashScopeClient(apiKey, model string) *Client {
 // NewAnthropicClient 创建标准 Anthropic API 客户端
 func NewAnthropicClient(apiKey, model string) *Client {
 	return NewClient("https://api.anthropic.com/v1", apiKey, model)
+}
+
+// NewMoonshotClient 创建 Moonshot/Kimi 客户端 (Anthropic 兼容端点)。
+// 国际站默认 api.moonshot.ai；国内站请传 cn=true 使用 api.moonshot.cn。
+// 模型名如 kimi-k2.6 / kimi-k2.5 / kimi-latest，鉴权走 Authorization: Bearer。
+func NewMoonshotClient(apiKey, model string, cn bool) *Client {
+	host := "https://api.moonshot.ai/anthropic"
+	if cn {
+		host = "https://api.moonshot.cn/anthropic"
+	}
+	return NewClient(host, apiKey, model)
 }
 
 // StreamMessage 以流式方式发送消息，返回事件通道。

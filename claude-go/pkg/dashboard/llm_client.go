@@ -222,7 +222,8 @@ func resolveLLMClient() (*api.Client, LLMProfile, error) {
 		case "openai":
 			model = "gpt-4o-mini"
 		case "moonshot":
-			model = "moonshot-v1-auto"
+			// Kimi K2 系列 (Anthropic 兼容端点)，取代已过时的 moonshot-v1-auto
+			model = "kimi-k2.6"
 		default:
 			// dashscope / compatible: qwen3.5-plus 与飞书 bot 默认一致
 			model = "qwen3.5-plus"

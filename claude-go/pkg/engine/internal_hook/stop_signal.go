@@ -30,10 +30,13 @@ type StopSignalDetector struct {
 	MinToolCallsBeforeHint int // 至少经过 N 个工具后才允许 hint (默认 8)
 	JaccardOverlapThreshold float64 // grep 结果集合重合阈值 (默认 0.8)
 	DiminishingWindow    int // 连续低收益窗口 (默认 3)
+	MaxWebFetches        int // 累计 WebFetch/WebSearch 次数上限, 超过即提示背景信息已足够 (默认 8)
 
 	// 状态
 	fileReads       map[string]int
 	searchResults   []map[string]struct{} // 最近 K 次 grep 结果集合
+	webFetches      int                   // 累计联网抓取/搜索次数
+	fetchedURLs     map[string]int        // 每个 URL 抓取次数 (防重复抓同一页)
 	totalToolCalls  int
 	diminishingCnt  int
 	lastSuggestion  string
@@ -46,7 +49,9 @@ func NewStopSignalDetector() *StopSignalDetector {
 		MinToolCallsBeforeHint:  8,
 		JaccardOverlapThreshold: 0.8,
 		DiminishingWindow:       3,
+		MaxWebFetches:           8,
 		fileReads:               make(map[string]int),
+		fetchedURLs:             make(map[string]int),
 	}
 }
 
@@ -79,6 +84,26 @@ func (d *StopSignalDetector) Observe(toolName, inputSummary, resultSummary strin
 				reason = fmt.Sprintf("already read '%s' %d times", path, d.fileReads[path])
 				return d.maybeEmit(reason), reason
 			}
+		}
+	case "webfetch", "web_fetch", "websearch", "web_search":
+		// 规则 1b: 联网抓取/搜索过多或重复 → 背景信息已足够
+		d.webFetches++
+		if url := extractURL(inputSummary); url != "" {
+			d.fetchedURLs[url]++
+			if d.fetchedURLs[url] >= 2 {
+				d.diminishingCnt++
+				reason = fmt.Sprintf("already fetched the same URL %d times", d.fetchedURLs[url])
+				return d.maybeEmit(reason), reason
+			}
+		}
+		if d.MaxWebFetches > 0 && d.webFetches >= d.MaxWebFetches {
+			// 抓取次数本身是强信号, 直接提示 (不必等 diminishing 窗口)
+			reason = fmt.Sprintf("performed %d web fetches/searches; background info is likely sufficient", d.webFetches)
+			if reason != d.lastSuggestion {
+				d.lastSuggestion = reason
+				return true, reason
+			}
+			return false, reason
 		}
 	case "grep", "search", "ripgrep":
 		// 规则 2: 连续 grep 结果集合高度重合
@@ -133,6 +158,8 @@ func (d *StopSignalDetector) Reset() {
 	d.mu.Lock()
 	d.fileReads = make(map[string]int)
 	d.searchResults = nil
+	d.webFetches = 0
+	d.fetchedURLs = make(map[string]int)
 	d.totalToolCalls = 0
 	d.diminishingCnt = 0
 	d.lastSuggestion = ""
@@ -157,6 +184,34 @@ func extractPath(input string) string {
 		}
 		rest := input[idx+len(key):]
 		// 找冒号后的第一个字符串值
+		co := strings.IndexByte(rest, ':')
+		if co < 0 {
+			continue
+		}
+		rest = rest[co+1:]
+		q1 := strings.IndexByte(rest, '"')
+		if q1 < 0 {
+			continue
+		}
+		rest = rest[q1+1:]
+		q2 := strings.IndexByte(rest, '"')
+		if q2 < 0 {
+			continue
+		}
+		return rest[:q2]
+	}
+	return ""
+}
+
+// extractURL 从 tool input 中抓 url 字段 (WebFetch/WebSearch 的目标)。
+func extractURL(input string) string {
+	lower := strings.ToLower(input)
+	for _, key := range []string{`"url"`, `"query"`, `"q"`} {
+		idx := strings.Index(lower, key)
+		if idx < 0 {
+			continue
+		}
+		rest := input[idx+len(key):]
 		co := strings.IndexByte(rest, ':')
 		if co < 0 {
 			continue

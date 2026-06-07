@@ -22,6 +22,7 @@ type promptDebugCapture struct {
 	startedAt time.Time
 	stream    bool
 	request   string
+	sampled   bool // 命中采样的正常请求才落盘; 失败请求无论是否采样都强制落盘
 
 	attempts []promptDebugAttempt
 	events   []json.RawMessage
@@ -72,10 +73,12 @@ func (c *Client) newPromptDebugCapture(request string, stream bool) *promptDebug
 	}
 	now := time.Now()
 	seq := promptDebugSeq.Add(1)
+	// 采样判定: 即使未命中采样也创建 capture, 以便失败请求在 finish() 时强制落盘 (永不漏掉失败样本)。
+	sampled := true
 	if c.PromptDebugSampleRate > 0 && c.PromptDebugSampleRate < 1 {
 		threshold := int64(c.PromptDebugSampleRate * 10000)
 		if threshold <= 0 || seq%10000 >= threshold {
-			return nil
+			sampled = false
 		}
 	}
 	id := fmt.Sprintf("%s-%06d", now.Format("20060102-150405.000000"), seq)
@@ -85,6 +88,7 @@ func (c *Client) newPromptDebugCapture(request string, stream bool) *promptDebug
 		startedAt: now,
 		stream:    stream,
 		request:   request,
+		sampled:   sampled,
 	}
 }
 
@@ -138,6 +142,12 @@ func (d *promptDebugCapture) finish(client *Client, rec LLMCallRecord, errMsg st
 
 	if errMsg == "" {
 		errMsg = rec.ErrorMessage
+	}
+	// 失败请求 (有错误 / 状态 error / HTTP>=400) 无论是否命中采样都落盘; 未采样的成功请求跳过。
+	isFailure := errMsg != "" || rec.Status == "error" ||
+		(response != nil && response.HTTPStatus >= 400)
+	if !d.sampled && !isFailure {
+		return
 	}
 	usage := map[string]int{}
 	if rec.InputTokens > 0 {

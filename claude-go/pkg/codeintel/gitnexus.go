@@ -5,6 +5,7 @@ package codeintel
 
 import (
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -12,6 +13,7 @@ import (
 type GitNexus struct {
 	RepoPath     string
 	IndexBaseDir string
+	MaxHeapMB    int      // Node.js V8 最大堆内存（MB），0 表示使用 GitNexus 默认值
 	paths        *ToolPaths
 }
 
@@ -54,7 +56,23 @@ func (g *GitNexus) Analyze() (*QueryResult, error) {
 		return nil, err
 	}
 	start := time.Now()
-	stdout, stderr, err := runWithTimeout(g.RepoPath, 2*time.Hour, paths.NodePath, paths.GitNexusPath, "analyze", "--index-only", "--worker-timeout", "60", ".")
+
+	var env []string
+	if g.MaxHeapMB > 0 {
+		nodeOpts := os.Getenv("NODE_OPTIONS")
+		if nodeOpts != "" {
+			nodeOpts += " "
+		}
+		nodeOpts += fmt.Sprintf("--max-old-space-size=%d", g.MaxHeapMB)
+		env = append(env, "NODE_OPTIONS="+nodeOpts)
+	}
+	env = append(env,
+		"GITNEXUS_WORKER_POOL_SIZE=32",
+		"GITNEXUS_CHUNK_BYTE_BUDGET=8388608",
+		"GITNEXUS_PARSE_CHUNK_CONCURRENCY=4",
+	)
+
+	stdout, stderr, err := runWithTimeoutEnv(g.RepoPath, 2*time.Hour, env, paths.NodePath, paths.GitNexusPath, "analyze", "--index-only", "--worker-timeout", "60", ".")
 	combined := append(stderr, '\n')
 	combined = append(combined, stdout...)
 	if err != nil {

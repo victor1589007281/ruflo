@@ -773,18 +773,36 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "cron.trigger":
 		hint = "已排队立即触发, 需要主进程消费 (feishu bot / daemon) 才能真正运行。"
 	case "team.create":
-		// 为 team.create 给出可在 terminal 直接粘贴的 CLI 命令, 便于主进程 (chat/feishu) 消费或用户手动执行。
-		if payload != nil {
-			wf, _ := payload["workflow"].(string)
-			obj, _ := payload["objective"].(string)
-			lang, _ := payload["lang"].(string)
-			if wf != "" {
-				cmd := fmt.Sprintf("claude-go team create %s %s %q", target, wf, obj)
-				if lang != "" {
-					cmd += " --lang " + lang
-				}
-				hint = "若无主进程消费, 可手动运行: " + cmd
+		if s.cfg.TeamAction != nil {
+			if err := s.cfg.TeamAction(action, target, payload); err != nil {
+				hint = fmt.Sprintf("操作失败: %v", err)
+			} else {
+				immediate = fmt.Sprintf("团队 %s 已创建", target)
 			}
+		} else {
+			// 为 team.create 给出可在 terminal 直接粘贴的 CLI 命令, 便于主进程 (chat/feishu) 消费或用户手动执行。
+			if payload != nil {
+				wf, _ := payload["workflow"].(string)
+				obj, _ := payload["objective"].(string)
+				lang, _ := payload["lang"].(string)
+				if wf != "" {
+					cmd := fmt.Sprintf("claude-go team create %s %s %q", target, wf, obj)
+					if lang != "" {
+						cmd += " --lang " + lang
+					}
+					hint = "若无主进程消费, 可手动运行: " + cmd
+				}
+			}
+		}
+	case "team.run":
+		if s.cfg.TeamAction != nil {
+			if err := s.cfg.TeamAction(action, target, payload); err != nil {
+				hint = fmt.Sprintf("操作失败: %v", err)
+			} else {
+				immediate = fmt.Sprintf("团队 %s 已开始运行", target)
+			}
+		} else {
+			hint = "无主进程消费, 可手动运行: claude-go run \"/team run " + target + " <目标描述>\""
 		}
 	case "swarm.create", "swarm.predict":
 		if payload != nil {
@@ -813,7 +831,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			mode, obj)
 	case "team.stop", "team.restart", "team.delete", "team.resume":
 		if s.cfg.TeamAction != nil {
-			if err := s.cfg.TeamAction(action, target); err != nil {
+			if err := s.cfg.TeamAction(action, target, payload); err != nil {
 				hint = fmt.Sprintf("操作失败: %v", err)
 			} else {
 				immediate = fmt.Sprintf("团队 %s 已执行 %s", target, action)

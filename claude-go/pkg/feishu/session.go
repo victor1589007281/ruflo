@@ -299,12 +299,17 @@ func profileForTeamRole(role, workflow string) builtin.ToolProfile {
 		strings.Contains(role, "architect")) {
 		return builtin.ToolProfileTeam
 	}
-	if strings.Contains(role, "research") || strings.Contains(role, "review") || strings.Contains(role, "planner") {
-		return builtin.ToolProfileResearch
-	}
+	// 写代码类 → Coding (含写/编辑/Bash/建索引)
 	if strings.Contains(role, "coder") || strings.Contains(role, "tester") || strings.Contains(role, "architect") ||
 		strings.Contains(role, "implement") || strings.Contains(role, "build") {
 		return builtin.ToolProfileCoding
+	}
+	// 只读分析/调研/审阅类 → Analysis (精简只读: Read/Grep/Glob + CodeIntel只读 + Web)。
+	// 既给 tech-investigator 联网调研能力 (解决与 source-analyst 重复读码), 又裁掉重型工具 schema 每轮重发。
+	if strings.Contains(role, "research") || strings.Contains(role, "review") || strings.Contains(role, "planner") ||
+		strings.Contains(role, "investigat") || strings.Contains(role, "analyst") ||
+		strings.Contains(role, "critic") || strings.Contains(role, "fact") {
+		return builtin.ToolProfileAnalysis
 	}
 	return builtin.ToolProfileTeam
 }
@@ -819,6 +824,14 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	// 将任务描述从 user message 移到 system prompt 末尾，避免 msg[0] 膨胀
 	// 同时让 system prompt 前缀享受 prompt caching。
 	eng.TaskInstruction = userPrompt
+	// 与主会话一致, 给团队 agent 也启用前沿优化:
+	//   - PromptCache: 稳定前缀布局 (利于 Kimi 自动前缀缓存命中) —— A
+	//   - Budget: 上下文超限时降级隐藏旧 tool_result, 不再每轮重发整文件 —— C
+	//   - LoopDetector + StopSignal(CaRT): 检测同文件重复读/搜索收益递减, 注入收敛提示, 止住无脑搜索 —— D
+	if r.sm.config.EnableFrontierOptimizations {
+		eng.Config.EnableStopSignal = true // CaRT 停止信号 (EnableFrontierOptimizations 不含, 需单独开)
+		eng.EnableFrontierOptimizations()
+	}
 
 	start := time.Now()
 	var sb strings.Builder

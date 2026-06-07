@@ -968,11 +968,11 @@ JSON 配置文件示例:
 				stateDir := basedir.ResolveDefault(config.StateDir, config.Cwd)
 				dashCfg := dashboard.Config{
 					StateDir: stateDir,
-					TeamAction: func(action, teamName string) error {
+					TeamAction: func(action, teamName string, payload map[string]interface{}) error {
 						if botRef == nil {
 							return fmt.Errorf("bot 尚未初始化")
 						}
-						return botRef.DashboardTeamAction(action, teamName)
+						return botRef.DashboardTeamAction(action, teamName, payload)
 					},
 				}
 				dashCfgRef = &dashCfg

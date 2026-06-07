@@ -87,6 +87,16 @@ func (r *ConfigResolver) Resolve(planName, role string) ResolvedConfig {
 		resolved.PromptCacheMode = promptCacheMode
 	}
 
+	// 7. MaxTurns/MaxTokens 兜底: 模型未指定 (0) 时套用全局默认上限,
+	//    防止 maxTurns=0 (无限) 导致 agent 无界循环烧 token。
+	//    需要更多回合/输出的模型可在 model 级显式调大, 会覆盖此兜底。
+	if resolved.MaxTurns == 0 && r.global.DefaultMaxTurns > 0 {
+		resolved.MaxTurns = r.global.DefaultMaxTurns
+	}
+	if resolved.MaxTokens == 0 && r.global.DefaultMaxTokens > 0 {
+		resolved.MaxTokens = r.global.DefaultMaxTokens
+	}
+
 	return resolved
 }
 

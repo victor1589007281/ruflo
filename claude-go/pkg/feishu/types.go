@@ -340,6 +340,13 @@ type CodeIntelSection struct {
 	Addr string `json:"addr,omitempty"`
 	// IndexBaseDir 集中索引根目录 (如 /mnt/data/codeintel)。为空时索引存放在各仓库本地。
 	IndexBaseDir string `json:"indexBaseDir,omitempty"`
+	// GitNexus GitNexus 运行时调优配置
+	GitNexus *struct {
+		DefaultHeapMB        int `json:"defaultHeapMB,omitempty"`
+		MaxHeapMB            int `json:"maxHeapMB,omitempty"`
+		PerThousandFilesMB   int `json:"perThousandFilesMB,omitempty"`
+		PerHundredMBSourceMB int `json:"perHundredMBSourceMB,omitempty"`
+	} `json:"gitnexus,omitempty"`
 }
 
 // DashboardSection Dashboard 配置段
@@ -443,6 +450,8 @@ type AISection struct {
 	ModelAlias      string                     `json:"modelAlias,omitempty"`      // 全局默认模型别名
 	FallbackAliases []string                   `json:"fallbackAliases,omitempty"` // 全局默认备用模型别名
 	PromptCacheMode string                     `json:"promptCacheMode,omitempty"` // "auto"(默认)/"on"/"off"
+	MaxTurns        int                        `json:"maxTurns,omitempty"`        // 全局默认最大回合数 (0=不限); 防 agent 无界循环
+	MaxTokens       int                        `json:"maxTokens,omitempty"`       // 全局默认最大输出 token (0=用引擎默认)
 	Plans           map[string]PlanModelConfig `json:"plans,omitempty"`           // 按 plan 名称覆盖模型配置
 }
 
@@ -570,6 +579,8 @@ func (jc *JSONConfig) ToModelConfigJSON() modelconfig.ConfigJSON {
 			DefaultModelAlias:      jc.AI.ModelAlias,
 			DefaultFallbackAliases: jc.AI.FallbackAliases,
 			DefaultPromptCacheMode: jc.AI.PromptCacheMode,
+			DefaultMaxTurns:        jc.AI.MaxTurns,
+			DefaultMaxTokens:       jc.AI.MaxTokens,
 		}
 		out.AI.Plans = make(map[string]modelconfig.PlanConfig, len(jc.AI.Plans))
 		for planName, pc := range jc.AI.Plans {

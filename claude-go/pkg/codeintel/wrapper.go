@@ -172,11 +172,20 @@ func runTool(dir string, name string, args ...string) ([]byte, []byte, error) {
 // runWithTimeout 带超时的命令执行。
 // 使用进程组确保超时后能清理所有子进程（防止 Node.js worker 孤儿化阻塞管道）。
 func runWithTimeout(dir string, timeout time.Duration, name string, args ...string) ([]byte, []byte, error) {
+	return runWithTimeoutEnv(dir, timeout, nil, name, args...)
+}
+
+// runWithTimeoutEnv 带超时和额外环境变量的命令执行。
+// env 中的条目会追加到当前进程环境变量之后（同名变量后出现的优先）。
+func runWithTimeoutEnv(dir string, timeout time.Duration, env []string, name string, args ...string) ([]byte, []byte, error) {
 	ctx, cancel := execTimeout(timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	if dir != "" {
 		cmd.Dir = dir
+	}
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
 	}
 	// 创建新进程组，便于超时后批量清理子进程
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

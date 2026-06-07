@@ -53,6 +53,31 @@ const antiLoopDirective = `
 - 不要反复解释、道歉或自我修正已通过的步骤。
 `
 
+// codeIntelDirective 代码分析铁律: 强制"先索引后精读", 注入到代码类 agent prompt,
+// 取代对大仓库的 Read/Grep/Glob 地毯式扫描, 大幅节省 token。
+const codeIntelDirective = `
+## CRITICAL — 代码分析铁律 (必须遵守, 否则浪费大量 token)
+分析任何代码仓库 (尤其大型仓库) 时:
+1. **先索引后精读**: 先用 code_intel_status 确认索引就绪; 未就绪则用 code_intel_init 建一次索引 (由外部 CLI 完成, 不消耗 LLM token)。
+2. **用知识图谱精准定位**: 用 code_intel_query 以自然语言查询相关执行流/符号/调用关系/影响面, 拿到精确文件与位置。
+3. **只精读命中文件**: 仅对 code_intel_query 指向的少量文件做 Read (尽量带行号范围)。
+4. **严禁地毯式扫描**: 不要用 Glob/Grep/Read 遍历整个仓库; code_intel_query 已能回答时不要再翻文件。
+`
+
+// isCodeAnalysisRole 判定角色是否为"代码类"(需要读/分析源码), 用于决定是否注入 codeIntelDirective。
+func isCodeAnalysisRole(role *RoleDef) bool {
+	if role == nil {
+		return false
+	}
+	hay := strings.ToLower(role.Name + " " + role.Description + " " + strings.Join(role.Tags, " "))
+	for _, kw := range []string{"source", "code", "源码", "coder", "architect", "review", "tester", "implement", "debug", "refactor", "analyst"} {
+		if strings.Contains(hay, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // maxDepOutputLen 每个依赖阶段输出注入 prompt 的最大字符数, 防止上下文膨胀。
 const maxDepOutputLen = 1500
 
@@ -1601,10 +1626,16 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 		}
 	}
 
+	// 代码类角色额外注入"先索引后精读"铁律
+	extra := antiLoopDirective
+	if roles != nil && isCodeAnalysisRole(roles.Get(stage.Role)) {
+		extra += codeIntelDirective
+	}
+
 	// 优先从角色注册表获取 (包含专属 Skills)
 	if roles != nil {
 		if merged := roles.MergedPrompt(stage.Role, objective, prevOutput.String()); merged != "" {
-			return merged + antiLoopDirective
+			return merged + extra
 		}
 	}
 
@@ -1612,7 +1643,7 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 	prompt := stage.Prompt
 	prompt = strings.ReplaceAll(prompt, "{objective}", objective)
 	prompt = strings.ReplaceAll(prompt, "{prev_result}", prevOutput.String())
-	return prompt + antiLoopDirective
+	return prompt + extra
 }
 
 func stripRoundSuffix(name string) string {

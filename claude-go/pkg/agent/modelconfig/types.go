@@ -48,6 +48,10 @@ type GlobalConfig struct {
 	DefaultModelAlias      string   `json:"defaultModelAlias"`
 	DefaultFallbackAliases []string `json:"defaultFallbackAliases"`
 	DefaultPromptCacheMode string   `json:"defaultPromptCacheMode"`
+	// DefaultMaxTurns / DefaultMaxTokens 全局兜底上限 (0=不限)。
+	// 当模型/plan/role 未显式指定时生效; 需要更多回合/输出的场景可在 model 级单独调大覆盖。
+	DefaultMaxTurns  int `json:"defaultMaxTurns,omitempty"`
+	DefaultMaxTokens int `json:"defaultMaxTokens,omitempty"`
 }
 
 // RoleConfig 角色级别的模型别名配置。
