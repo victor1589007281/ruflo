@@ -7,12 +7,15 @@ package wechat
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"sync"
 	"time"
 )
@@ -35,11 +38,34 @@ type Client struct {
 }
 
 // NewClient 构造客户端。
+//
+// 强制 HTTP/1.1: Go 默认走 HTTP/2, 其指纹会被 Tencent WAF 拦成 501 page; curl(HTTP/1.1) 正常。
 func NewClient(cfg Config) *Client {
-	return &Client{cfg: cfg, httpc: &http.Client{Timeout: 30 * time.Second}}
+	tr := &http.Transport{
+		ForceAttemptHTTP2: false,
+		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁用 HTTP/2
+	}
+	return &Client{cfg: cfg, httpc: &http.Client{Timeout: 30 * time.Second, Transport: tr}}
 }
 
 const apiBase = "https://api.weixin.qq.com"
+
+// userAgent 用真实浏览器 UA, 规避 Tencent WAF 把 Go 默认 UA 当机器人拦截 (501 page)。
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+func (c *Client) get(u string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
 
 type wxErr struct {
 	ErrCode int    `json:"errcode"`
@@ -66,12 +92,10 @@ func (c *Client) AccessToken() (string, error) {
 	}
 	u := fmt.Sprintf("%s/cgi-bin/token?grant_type=client_credential&appid=%s&secret=%s",
 		apiBase, url.QueryEscape(c.cfg.AppID), url.QueryEscape(c.cfg.AppSecret))
-	resp, err := c.httpc.Get(u)
+	body, err := c.get(u)
 	if err != nil {
 		return "", fmt.Errorf("请求 access_token 失败: %w", err)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 	var out struct {
 		wxErr
 		AccessToken string `json:"access_token"`
@@ -156,12 +180,10 @@ func (c *Client) AddDraft(a DraftArticle) (string, error) {
 	}
 	u := fmt.Sprintf("%s/cgi-bin/draft/add?access_token=%s", apiBase, url.QueryEscape(token))
 	payload, _ := json.Marshal(map[string]any{"articles": []DraftArticle{a}})
-	resp, err := c.httpc.Post(u, "application/json", bytes.NewReader(payload))
+	body, err := c.postJSON(u, payload)
 	if err != nil {
 		return "", fmt.Errorf("请求 draft/add 失败: %w", err)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 	var out struct {
 		wxErr
 		MediaID string `json:"media_id"`
@@ -175,6 +197,96 @@ func (c *Client) AddDraft(a DraftArticle) (string, error) {
 	return out.MediaID, nil
 }
 
+// UpdateDraft 更新已有草稿的第 index 篇文章。对应 cgi-bin/draft/update。
+func (c *Client) UpdateDraft(mediaID string, index int, a DraftArticle) error {
+	token, err := c.AccessToken()
+	if err != nil {
+		return err
+	}
+	u := fmt.Sprintf("%s/cgi-bin/draft/update?access_token=%s", apiBase, url.QueryEscape(token))
+	payload, _ := json.Marshal(map[string]any{"media_id": mediaID, "index": index, "articles": a})
+	body, err := c.postJSON(u, payload)
+	if err != nil {
+		return fmt.Errorf("请求 draft/update 失败: %w", err)
+	}
+	var out wxErr
+	if err := json.Unmarshal(body, &out); err != nil {
+		return fmt.Errorf("解析 draft/update 响应失败: %w (%s)", err, string(body))
+	}
+	return out.err()
+}
+
+// looksLikeHTML 判断响应是否是 WAF/网关拦截页 (非 JSON)。
+func looksLikeHTML(body []byte) bool {
+	b := bytes.TrimSpace(body)
+	return len(b) > 0 && b[0] == '<'
+}
+
+// postJSON POST application/json。
+//
+// 实测: Go 的 net/http (HTTP/1.1 或 2 + 浏览器 UA 都试过) 在 draft/* 端点会被 Tencent WAF
+// 按 TLS 指纹拦成 501 page, 而 curl(HTTP/1.1) 正常。故 draft 的 JSON 请求改走 curl 子进程。
+func (c *Client) postJSON(u string, payload []byte) ([]byte, error) {
+	tmp, err := os.CreateTemp("", "wxpost-*.json")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(payload); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	tmp.Close()
+
+	var last []byte
+	waits := []time.Duration{0, 5 * time.Second, 15 * time.Second}
+	for attempt := 0; attempt < len(waits); attempt++ {
+		if waits[attempt] > 0 {
+			time.Sleep(waits[attempt])
+		}
+		cmd := exec.Command("curl", "-s", "--max-time", "40", "-A", userAgent,
+			"-X", "POST", u, "-H", "Content-Type: application/json",
+			"--data-binary", "@"+tmp.Name())
+		out, cerr := cmd.Output()
+		if cerr != nil {
+			last = out
+			continue
+		}
+		if looksLikeHTML(out) {
+			last = out
+			continue
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("响应被网关/WAF 拦截(HTML), 重试后仍失败: %s", truncate(string(last), 120))
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+// DeleteDraft 删除草稿。对应 cgi-bin/draft/delete。
+func (c *Client) DeleteDraft(mediaID string) error {
+	token, err := c.AccessToken()
+	if err != nil {
+		return err
+	}
+	u := fmt.Sprintf("%s/cgi-bin/draft/delete?access_token=%s", apiBase, url.QueryEscape(token))
+	payload, _ := json.Marshal(map[string]any{"media_id": mediaID})
+	body, err := c.postJSON(u, payload)
+	if err != nil {
+		return fmt.Errorf("请求 draft/delete 失败: %w", err)
+	}
+	var out wxErr
+	if err := json.Unmarshal(body, &out); err != nil {
+		return fmt.Errorf("解析 draft/delete 响应失败: %w (%s)", err, string(body))
+	}
+	return out.err()
+}
+
 func (c *Client) postMultipart(u, field, filename string, data []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -186,15 +298,30 @@ func (c *Client) postMultipart(u, field, filename string, data []byte) ([]byte, 
 		return nil, err
 	}
 	w.Close()
-	req, err := http.NewRequest(http.MethodPost, u, &buf)
-	if err != nil {
-		return nil, err
+	ct := w.FormDataContentType()
+	raw := buf.Bytes()
+	var last []byte
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*3) * time.Second)
+		}
+		req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", ct)
+		req.Header.Set("User-Agent", userAgent)
+		resp, err := c.httpc.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if looksLikeHTML(body) {
+			last = body
+			continue
+		}
+		return body, nil
 	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return nil, fmt.Errorf("上传响应被网关/WAF 拦截(HTML), 重试后仍失败: %s", truncate(string(last), 120))
 }

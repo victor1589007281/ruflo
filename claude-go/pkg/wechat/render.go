@@ -19,6 +19,41 @@ type MermaidBlock struct {
 
 var mermaidFence = regexp.MustCompile("(?s)```mermaid\\s*\\n(.*?)```")
 
+var orderedItemRe = regexp.MustCompile(`^\s*\d+\.\s`)
+
+// TightenOrderedLists 删除有序列表项之间的空行 (公众号/markdown 里这种空行会让列表变松散或断裂)。
+// 规则: 一个空行, 若其上一非空行与下一非空行都是有序列表项 (形如 "1. "), 则删除。
+func TightenOrderedLists(md string) string {
+	lines := strings.Split(md, "\n")
+	keep := make([]bool, len(lines))
+	for i := range keep {
+		keep[i] = true
+	}
+	for i, l := range lines {
+		if strings.TrimSpace(l) != "" {
+			continue
+		}
+		p := i - 1
+		for p >= 0 && strings.TrimSpace(lines[p]) == "" {
+			p--
+		}
+		n := i + 1
+		for n < len(lines) && strings.TrimSpace(lines[n]) == "" {
+			n++
+		}
+		if p >= 0 && n < len(lines) && orderedItemRe.MatchString(lines[p]) && orderedItemRe.MatchString(lines[n]) {
+			keep[i] = false
+		}
+	}
+	var out []string
+	for i, l := range lines {
+		if keep[i] {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
 // ExtractMermaid 把 markdown 里的 ```mermaid 代码块替换成占位符, 返回处理后的 md 和图列表。
 // 占位符形如独立一行 @@WXMERMAID:N@@, 经 goldmark 后变成 <p>@@WXMERMAID:N@@</p>, 便于回填 <img>。
 func ExtractMermaid(md string) (string, []MermaidBlock) {

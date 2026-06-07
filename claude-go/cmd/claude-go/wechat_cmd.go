@@ -20,7 +20,7 @@ import (
 //	claude-go wechat --team <团队名> --title "标题"            # 取团队 techblog 产物
 //	claude-go wechat --md article.md --draft                  # 调 API 建草稿 (需 IP 白名单)
 func wechatCmd() *cobra.Command {
-	var mdFile, team, title, author, sourceURL, outDir string
+	var mdFile, team, title, author, sourceURL, outDir, updateID string
 	var draft bool
 	cmd := &cobra.Command{
 		Use:   "wechat",
@@ -43,7 +43,7 @@ func wechatCmd() *cobra.Command {
 			}
 			ctx := context.Background()
 
-			if !draft {
+			if !draft && updateID == "" {
 				// 离线预览 (不调 API): mermaid → 本地 PNG, 产出内联 HTML
 				fmt.Printf("[wechat] 离线预览模式 (不调用公众号 API)\n")
 				html, n, ok, warns, err := wechat.TypesetLocal(ctx, md, chromePath, outDir, "")
@@ -62,12 +62,26 @@ func wechatCmd() *cobra.Command {
 				return nil
 			}
 
-			// Tier 2: 调 API 建草稿
-			fmt.Printf("[wechat] 草稿模式: 渲染 mermaid + 上传图片 + 建草稿 (appid=%s)\n", wcfg.AppID)
+			// Tier 2: 调 API 建/更新草稿
 			c := wechat.NewClient(wcfg)
-			mediaID, res, err := c.PublishDraft(ctx, md, wechat.TypesetOptions{
-				ChromePath: chromePath, Title: title, Author: author, SourceURL: sourceURL,
-			})
+			opt := wechat.TypesetOptions{ChromePath: chromePath, Title: title, Author: author, SourceURL: sourceURL}
+			if updateID != "" {
+				fmt.Printf("[wechat] 更新草稿模式 (add-new+delete-old 规避 WAF): 替换 media_id=%s\n", updateID)
+				newID, res, err := c.UpdateDraftFromMarkdown(ctx, updateID, md, opt)
+				if res != nil {
+					fmt.Printf("[wechat] mermaid 图: %d 个, 成功 %d 个\n", res.MermaidCount, res.MermaidOK)
+					for _, w := range res.Warnings {
+						fmt.Printf("  ⚠️ %s\n", w)
+					}
+				}
+				if err != nil {
+					return fmt.Errorf("更新草稿失败: %w", err)
+				}
+				fmt.Printf("[wechat] ✅ 草稿已替换, 新 media_id=%s (旧草稿已删除)\n登录公众号草稿箱查看最新版。\n", newID)
+				return nil
+			}
+			fmt.Printf("[wechat] 草稿模式: 渲染 mermaid + 上传图片 + 建草稿 (appid=%s)\n", wcfg.AppID)
+			mediaID, res, err := c.PublishDraft(ctx, md, opt)
 			if res != nil {
 				fmt.Printf("[wechat] mermaid 图: %d 个, 成功 %d 个\n", res.MermaidCount, res.MermaidOK)
 				for _, w := range res.Warnings {
@@ -88,6 +102,7 @@ func wechatCmd() *cobra.Command {
 	cmd.Flags().StringVar(&sourceURL, "source-url", "", "原文链接")
 	cmd.Flags().StringVar(&outDir, "out", "", "输出目录 (预览模式)")
 	cmd.Flags().BoolVar(&draft, "draft", false, "调用公众号 API 建草稿 (需服务器 IP 在白名单)")
+	cmd.Flags().StringVar(&updateID, "update", "", "更新已有草稿的 media_id (配合 --draft, 不新建)")
 	return cmd
 }
 

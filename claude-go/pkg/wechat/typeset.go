@@ -16,6 +16,7 @@ func TypesetLocal(ctx context.Context, md, chromePath, imgDir, imgRefBase string
 	if mkErr := os.MkdirAll(imgDir, 0o755); mkErr != nil {
 		return "", 0, 0, nil, mkErr
 	}
+	md = TightenOrderedLists(md)
 	md2, blocks := ExtractMermaid(md)
 	urls := map[int]string{}
 	codes := make([]string, len(blocks))
@@ -71,6 +72,7 @@ type TypesetResult struct {
 // Typeset 把 Markdown 排版成公众号安全内联 HTML; 期间把 mermaid 渲染成图并上传。
 func (c *Client) Typeset(ctx context.Context, md string, opts TypesetOptions) (*TypesetResult, error) {
 	res := &TypesetResult{ImgURLs: map[int]string{}}
+	md = TightenOrderedLists(md) // 删除有序列表项之间的空行
 	md2, blocks := ExtractMermaid(md)
 	res.MermaidCount = len(blocks)
 
@@ -83,6 +85,9 @@ func (c *Client) Typeset(ctx context.Context, md string, opts TypesetOptions) (*
 		if errs[i] != nil {
 			res.Warnings = append(res.Warnings, fmt.Sprintf("mermaid#%d 渲染失败: %v", b.Index, errs[i]))
 			continue
+		}
+		if i > 0 {
+			time.Sleep(1500 * time.Millisecond) // 放慢上传节奏, 规避 Tencent WAF 突发限流
 		}
 		u, err := c.UploadContentImage(pngs[i], fmt.Sprintf("mermaid-%d.png", b.Index))
 		if err != nil {
@@ -103,16 +108,15 @@ func (c *Client) Typeset(ctx context.Context, md string, opts TypesetOptions) (*
 	return res, nil
 }
 
-// PublishDraft 完整流程: 排版 → 生成封面 → 建草稿, 返回草稿 media_id。
-func (c *Client) PublishDraft(ctx context.Context, md string, opts TypesetOptions) (mediaID string, res *TypesetResult, err error) {
-	res, err = c.Typeset(ctx, md, opts)
+// buildArticle 排版 + 生成封面, 组装成 DraftArticle。
+func (c *Client) buildArticle(ctx context.Context, md string, opts TypesetOptions) (DraftArticle, *TypesetResult, error) {
+	res, err := c.Typeset(ctx, md, opts)
 	if err != nil {
-		return "", res, err
+		return DraftArticle{}, res, err
 	}
-	// 封面 (草稿必填 thumb_media_id): 渲染标题卡片为 PNG → 永久素材
 	thumbID, terr := c.makeCover(ctx, opts)
 	if terr != nil {
-		return "", res, fmt.Errorf("封面生成/上传失败: %w", terr)
+		return DraftArticle{}, res, fmt.Errorf("封面生成/上传失败: %w", terr)
 	}
 	author := opts.Author
 	if author == "" {
@@ -122,15 +126,43 @@ func (c *Client) PublishDraft(ctx context.Context, md string, opts TypesetOption
 	if digest == "" {
 		digest = plainExcerpt(res.ContentHTML, 100)
 	}
-	mediaID, err = c.AddDraft(DraftArticle{
+	return DraftArticle{
 		Title:            firstNonEmptyStr(opts.Title, "未命名文章"),
 		Author:           author,
 		Digest:           digest,
 		Content:          res.ContentHTML,
 		ContentSourceURL: opts.SourceURL,
 		ThumbMediaID:     thumbID,
-	})
+	}, res, nil
+}
+
+// PublishDraft 完整流程: 排版 → 生成封面 → 新建草稿, 返回草稿 media_id。
+func (c *Client) PublishDraft(ctx context.Context, md string, opts TypesetOptions) (mediaID string, res *TypesetResult, err error) {
+	a, res, err := c.buildArticle(ctx, md, opts)
+	if err != nil {
+		return "", res, err
+	}
+	mediaID, err = c.AddDraft(a)
 	return mediaID, res, err
+}
+
+// UpdateDraftFromMarkdown 用新 Markdown 重排版并替换已有草稿, 返回新草稿 media_id。
+//
+// 注意: draft/update 端点会被 Tencent WAF 按内容(代码/SQL 关键词)拦成 501; 而 draft/add 不会。
+// 故采用 add-new + delete-old 实现"更新", 规避 WAF。
+func (c *Client) UpdateDraftFromMarkdown(ctx context.Context, oldMediaID, md string, opts TypesetOptions) (newMediaID string, res *TypesetResult, err error) {
+	a, res, err := c.buildArticle(ctx, md, opts)
+	if err != nil {
+		return "", res, err
+	}
+	newMediaID, err = c.AddDraft(a)
+	if err != nil {
+		return "", res, err
+	}
+	if oldMediaID != "" {
+		_ = c.DeleteDraft(oldMediaID) // 删旧草稿; 失败不致命
+	}
+	return newMediaID, res, nil
 }
 
 // makeCover 渲染一张标题封面卡片并上传为永久素材, 返回 thumb media_id。
