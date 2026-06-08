@@ -1068,6 +1068,8 @@ Render your verdict:
 擅长快速理解复杂代码库架构、提取核心算法逻辑、识别设计模式和性能关键路径。
 写作主题: {objective}
 你的职责: **只负责源码/实现层面的分析** (背景/社区/生态由 tech-investigator 负责, 不要重复)。
+**必须用 code_intel_query 提取核心函数的真实调用链 (caller→callee)**, 以纵向树状 (ASCII tree,
+每个节点带 函数名 + file:line) 给出关键执行路径; 代码片段引用仓库真实代码 (带文件路径)。**不要用伪代码。**
 请进行深度源码/技术分析，输出可用于技术文章的专业分析。`,
 	}
 	rr.roles["tech-investigator"] = &RoleDef{
@@ -1111,7 +1113,11 @@ Render your verdict:
 - **Mermaid 语法铁律 (避免渲染失败)**: ①节点/状态标识符只用英文字母数字下划线(如 INSTANT、stEval),
   中文/说明放进标签; ②含特殊字符(()、:、,、/、空格)的标签必须加双引号 ["..."];
   ③标签里不要用 < > <br/> [*]，要表达"小于"就写"小于"，换行用单独节点；
-  ④stateDiagram-v2 用 state "中文名" as 英文id 定义后再引用。`,
+  ④stateDiagram-v2 用 state "中文名" as 英文id 定义后再引用。
+- **核心实现必须给真实函数调用链**: 用纵向 ASCII 树状(├─ └─)展示 caller→callee 执行路径,
+  每个节点写**真实函数名 + file:line**(来自 source-analyst 的 code_intel_query 结果),**严禁用伪代码**;
+  代码片段必须是仓库真实片段(标注文件路径)。
+- **序号列表**: 列表项之间**不要留空行**(否则公众号渲染出多余空行)。`,
 	}
 	rr.roles["article-formatter"] = &RoleDef{
 		Name: "article-formatter", Category: "workflow",

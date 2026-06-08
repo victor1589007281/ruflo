@@ -39,6 +39,11 @@ func wechatCmd() *cobra.Command {
 			if title == "" {
 				title = t2
 			}
+			// 列表门禁 (类似 lint): 检测并修复"序号/无序列表内空行"
+			if lf, n := wechat.LintLists(md); n > 0 {
+				fmt.Printf("[wechat] 📋 列表门禁: 检测到并修复 %d 处列表内空行\n", n)
+				md = lf
+			}
 			if outDir == "" {
 				outDir = filepath.Join(os.TempDir(), "wechat-"+fmt.Sprint(time.Now().Unix()))
 			}

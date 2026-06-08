@@ -19,16 +19,26 @@ type MermaidBlock struct {
 
 var mermaidFence = regexp.MustCompile("(?s)```mermaid\\s*\\n(.*?)```")
 
-var orderedItemRe = regexp.MustCompile(`^\s*\d+\.\s`)
+// listItemRe 匹配有序(1. / 1)) 或无序(- / * / +) 列表项。
+var listItemRe = regexp.MustCompile(`^\s*(?:\d+[.)]|[-*+])\s`)
 
-// TightenOrderedLists 删除有序列表项之间的空行 (公众号/markdown 里这种空行会让列表变松散或断裂)。
-// 规则: 一个空行, 若其上一非空行与下一非空行都是有序列表项 (形如 "1. "), 则删除。
-func TightenOrderedLists(md string) string {
+// LintLists 列表门禁: 删除"列表项之间/列表项与其缩进续行之间"的空行 (这种空行会让 markdown
+// 渲染成 loose list 或被公众号当成段落间距 → 看起来像空行)。返回 (修复后文本, 删除的空行数)。
+// 类似 golang lint: 既能检测(返回计数)也能自动修复。
+func LintLists(md string) (string, int) {
 	lines := strings.Split(md, "\n")
 	keep := make([]bool, len(lines))
 	for i := range keep {
 		keep[i] = true
 	}
+	isListCtx := func(s string) bool {
+		if listItemRe.MatchString(s) {
+			return true
+		}
+		// 缩进续行(属于某个列表项的后续内容)
+		return strings.HasPrefix(s, "  ") || strings.HasPrefix(s, "\t")
+	}
+	removed := 0
 	for i, l := range lines {
 		if strings.TrimSpace(l) != "" {
 			continue
@@ -41,8 +51,10 @@ func TightenOrderedLists(md string) string {
 		for n < len(lines) && strings.TrimSpace(lines[n]) == "" {
 			n++
 		}
-		if p >= 0 && n < len(lines) && orderedItemRe.MatchString(lines[p]) && orderedItemRe.MatchString(lines[n]) {
+		// 上一非空是列表项/续行, 且下一非空是列表项 → 该空行在列表内部, 删除
+		if p >= 0 && n < len(lines) && isListCtx(lines[p]) && listItemRe.MatchString(lines[n]) {
 			keep[i] = false
+			removed++
 		}
 	}
 	var out []string
@@ -51,7 +63,13 @@ func TightenOrderedLists(md string) string {
 			out = append(out, l)
 		}
 	}
-	return strings.Join(out, "\n")
+	return strings.Join(out, "\n"), removed
+}
+
+// TightenOrderedLists 兼容旧调用点。
+func TightenOrderedLists(md string) string {
+	out, _ := LintLists(md)
+	return out
 }
 
 // ExtractMermaid 把 markdown 里的 ```mermaid 代码块替换成占位符, 返回处理后的 md 和图列表。
@@ -96,9 +114,9 @@ var inlineStyles = map[string]string{
 	"h4":         "font-size:15px;font-weight:600;color:#333;margin:18px 0 10px;",
 	"p":          "font-size:15px;color:#3a3a3a;line-height:1.85;margin:14px 0;letter-spacing:0.3px;",
 	"blockquote": "border-left:4px solid #ff6b35;background:#fff7f3;color:#5e5e5e;padding:12px 16px;margin:16px 0;border-radius:4px;font-size:14px;",
-	"ul":         "margin:14px 0;padding-left:22px;color:#3a3a3a;font-size:15px;line-height:1.85;",
-	"ol":         "margin:14px 0;padding-left:22px;color:#3a3a3a;font-size:15px;line-height:1.85;",
-	"li":         "margin:6px 0;",
+	"ul":         "margin:12px 0;padding-left:22px;color:#3a3a3a;font-size:15px;line-height:1.7;",
+	"ol":         "margin:12px 0;padding-left:22px;color:#3a3a3a;font-size:15px;line-height:1.7;",
+	"li":         "margin:0;padding:0;", // 紧凑: 避免公众号给 li 加间距形成"空行"
 	"table":      "border-collapse:collapse;width:100%;margin:18px 0;font-size:14px;",
 	"th":         "border:1px solid #d0d7de;background:#eef3f8;color:#1a5fb4;padding:8px 10px;text-align:left;font-weight:600;",
 	"td":         "border:1px solid #d0d7de;padding:8px 10px;color:#3a3a3a;",
