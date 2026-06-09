@@ -136,21 +136,81 @@ var inlineTagRe = func() map[string]*regexp.Regexp {
 	return m
 }()
 
+var (
+	codeBlockRe = regexp.MustCompile(`(?s)<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>`)
+	inlineCodeRe = regexp.MustCompile(`<code(?:\s[^>]*)?>`)
+	olBlockRe    = regexp.MustCompile(`(?s)<ol[^>]*>(.*?)</ol>`)
+	ulBlockRe    = regexp.MustCompile(`(?s)<ul[^>]*>(.*?)</ul>`)
+	liItemRe     = regexp.MustCompile(`(?s)<li[^>]*>(.*?)</li>`)
+)
+
+// renderCodeBlock 把单个代码块改造成公众号能保留排版的形式。
+// 关键: 公众号会**删掉 <pre> 里的 <br>、折叠换行**, 所以不能用 <pre>+<br>。
+// 改为: 一个 <section> 容器, **每行一个 <p>**(公众号保留 <p> 块 → 必然换行), 空格→&nbsp; 保对齐。
+func renderCodeBlock(m string) string {
+	inner := strings.Trim(codeBlockRe.FindStringSubmatch(m)[1], "\n")
+	var b strings.Builder
+	b.WriteString(`<section style="background:#0d1117;border-radius:8px;padding:12px 14px;overflow-x:auto;margin:16px 0;">`)
+	for _, ln := range strings.Split(inner, "\n") {
+		esc := strings.ReplaceAll(ln, " ", "&nbsp;")
+		if esc == "" {
+			esc = "&nbsp;"
+		}
+		b.WriteString(`<p style="margin:0;padding:0;color:#e6edf3;font-size:12px;line-height:1.7;` +
+			`white-space:nowrap;font-family:Consolas,Menlo,'Courier New',monospace;">` + esc + `</p>`)
+	}
+	b.WriteString(`</section>`)
+	return b.String()
+}
+
+// listsToParagraphs 把 <ol>/<ul> 转成紧凑的带编号/项目符的 <p> (公众号对 <li> 会强加间距 →
+// 直接不用列表标签, 改用 <p> + 手动编号, 彻底消除"序号列表空行")。仅处理扁平列表。
+func listsToParagraphs(html string) string {
+	const pStyle = "font-size:15px;color:#3a3a3a;line-height:1.75;margin:3px 0;"
+	conv := func(body string, ordered bool) string {
+		items := liItemRe.FindAllStringSubmatch(body, -1)
+		var b strings.Builder
+		for i, it := range items {
+			marker := "• "
+			if ordered {
+				marker = fmt.Sprintf("%d. ", i+1)
+			}
+			b.WriteString(`<p style="` + pStyle + `"><strong style="color:#1a5fb4;">` + marker + `</strong>` +
+				strings.TrimSpace(it[1]) + `</p>`)
+		}
+		return b.String()
+	}
+	html = olBlockRe.ReplaceAllStringFunc(html, func(m string) string {
+		return conv(olBlockRe.FindStringSubmatch(m)[1], true)
+	})
+	html = ulBlockRe.ReplaceAllStringFunc(html, func(m string) string {
+		return conv(ulBlockRe.FindStringSubmatch(m)[1], false)
+	})
+	return html
+}
+
 // InlineWechatStyles 把公众号安全样式内联到各标签 (公众号会删 <style>/class, 只认内联 style)。
 func InlineWechatStyles(html string) string {
-	// 先处理 pre>code: 去掉内层 code 的样式 (用 pre 的)
-	html = strings.ReplaceAll(html, "<pre><code", "<pre><code data-raw")
+	// 1. 抽出代码块 → 占位符, 避免它的逐行 <p> 被后面的样式循环二次加样式
+	var codeBlocks []string
+	html = codeBlockRe.ReplaceAllStringFunc(html, func(m string) string {
+		codeBlocks = append(codeBlocks, renderCodeBlock(m))
+		return fmt.Sprintf("@@WXCODE:%d@@", len(codeBlocks)-1)
+	})
+	// 2. 普通标签内联样式
 	for tag, style := range inlineStyles {
-		if tag == "code" {
-			continue // 单独处理, 避免覆盖 pre 内的 code
+		if tag == "code" || tag == "pre" {
+			continue
 		}
 		re := inlineTagRe[tag]
 		html = re.ReplaceAllString(html, "<"+tag+" style=\""+style+"\"$1")
 	}
-	// 行内 code (非 pre 内): goldmark 输出 <code>...; pre 内的已标记 data-raw
-	html = regexp.MustCompile("<code(?: )?>").ReplaceAllString(html, "<code style=\""+inlineStyles["code"]+"\">")
-	html = strings.ReplaceAll(html, "<code data-raw", "<code")
-	// 整体包一层 section 容器 (公众号常见做法)
+	html = inlineCodeRe.ReplaceAllString(html, "<code style=\""+inlineStyles["code"]+"\">") // 行内 code
+	html = listsToParagraphs(html)                                                          // ol/ul → 紧凑 <p>
+	// 3. 还原代码块
+	for i, cb := range codeBlocks {
+		html = strings.ReplaceAll(html, fmt.Sprintf("@@WXCODE:%d@@", i), cb)
+	}
 	return "<section style=\"font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;color:#3a3a3a;\">" + html + "</section>"
 }
 
