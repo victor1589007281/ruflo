@@ -28,7 +28,21 @@ mermaid.initialize({startOnLoad:false,theme:"default",securityLevel:"loose"});
 (async function(){
   try { await mermaid.parse(window.__code); }
   catch(e){ document.body.setAttribute("data-mmerr","parse: "+e); return; }
-  try { var r = await mermaid.render("g0", window.__code); document.getElementById("out").innerHTML = r.svg; }
+  try {
+    var r = await mermaid.render("g0", window.__code);
+    document.getElementById("out").innerHTML = r.svg;
+    // 高清: mermaid 默认给 svg 加 max-width 并按内容缩小, 截图会糊。
+    // 放大矢量 svg 到至少 ~1200 逻辑像素宽 (矢量放大不失真), 再配合 3x DSF 截图 → 高 DPI 位图。
+    var svg = document.querySelector('#out svg');
+    if (svg) {
+      svg.style.maxWidth = "none";
+      var w = svg.getBoundingClientRect().width || 800;
+      var target = Math.max(w, 1200);
+      svg.style.width = target + "px";
+      svg.removeAttribute("height");
+      svg.style.height = "auto";
+    }
+  }
   catch(e){ document.body.setAttribute("data-mmerr","render: "+e); }
 })();
 </script>
@@ -156,7 +170,7 @@ func renderMermaidOne(allocCtx context.Context, code string, timeout time.Durati
 	var mmerr string
 	var buf []byte
 	err = chromedp.Run(taskCtx,
-		emulation.SetDeviceMetricsOverride(1000, 800, 2.0, false),
+		emulation.SetDeviceMetricsOverride(1600, 1200, 3.0, false), // 3x DSF + 大视口, 高清不模糊
 		chromedp.Navigate("file://"+filepath.ToSlash(tmpPath)),
 		// 轮询: svg 出现 (成功) 或 body 标记了错误
 		chromedp.Poll(`!!(document.querySelector('#out svg') || document.body.getAttribute('data-mmerr'))`, &done,
