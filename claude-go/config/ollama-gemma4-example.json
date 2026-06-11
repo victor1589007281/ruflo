@@ -1,0 +1,33 @@
+{
+  "_comment": "本地 Ollama gemma4 配置示例。Ollama ≥0.30 在 /v1/messages 提供 Anthropic 兼容 API (含 tool_use/thinking/图片输入), claude-go 可直连。参数依据 ~/gemma4-test-report.md: 32K 上下文 / thinking 需 num_predict≥4096 / OLLAMA_NUM_PARALLEL=6 / 本地解码 ~25 tok/s 需放宽超时。本机端点无需真实 apiKey (占位即可, 也可省略)。",
+  "providers": {
+    "ollama": {
+      "name": "ollama",
+      "baseUrl": "http://localhost:11434/v1",
+      "apiKey": "ollama",
+      "models": {
+        "ollama:gemma4:26b-a4b-it-qat": {
+          "maxTokens": 8192,
+          "maxTurns": 0,
+          "promptCacheMode": "off",
+          "contextWindow": 32768,
+          "maxParallel": 6,
+          "rpm": 120,
+          "firstTokenTimeoutSec": 300,
+          "callTimeoutSec": 1800
+        }
+      }
+    }
+  },
+  "ai": {
+    "modelAlias": "ollama:gemma4:26b-a4b-it-qat",
+    "maxTurns": 40,
+    "maxTokens": 8192
+  },
+  "_usage": [
+    "默认模型走本地 gemma4: 把上面 providers/ai 合并进 ~/.claude-go/config/config.json",
+    "临时切换: claude-go run --model 'ollama:gemma4:26b-a4b-it-qat' '你的问题'",
+    "多模态输入: claude-go run --model 'ollama:gemma4:26b-a4b-it-qat' --attach photo.png --attach clip.mp4 --attach voice.wav '描述这些内容'",
+    "媒体输出: 模型可调用 GenerateImage / GenerateVideo / GenerateSpeech 工具产出真实 PNG/mp4/WAV"
+  ]
+}

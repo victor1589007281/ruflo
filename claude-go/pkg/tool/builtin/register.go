@@ -40,6 +40,11 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	todoTool := NewTodoWriteTool()
 	reg.Register(todoTool)
 
+	// Media generation (闭环输出: SVG/HTML→PNG, Python→mp4, 文本→WAV)
+	reg.Register(NewGenerateImageTool())
+	reg.Register(NewGenerateVideoTool())
+	reg.Register(NewGenerateSpeechTool())
+
 	// Web tools
 	reg.Register(NewWebFetchTool())
 	reg.Register(NewWebSearchTool(searcher))

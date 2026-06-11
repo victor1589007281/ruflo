@@ -427,6 +427,14 @@ type ProviderModelConfig struct {
 	MaxTurns        int    `json:"maxTurns,omitempty"`
 	PromptCacheMode string `json:"promptCacheMode,omitempty"`
 	ContextWindow   int    `json:"contextWindow,omitempty"`
+	// 模型专属限流参数 (0 = 使用全局默认值)
+	RPM         int `json:"rpm,omitempty"`         // 每分钟最大请求数
+	MaxParallel int `json:"maxParallel,omitempty"` // 最大并发请求数 (本地 Ollama 对应 OLLAMA_NUM_PARALLEL)
+	MinParallel int `json:"minParallel,omitempty"` // 最小并发请求数 (AIMD 下限)
+	// 超时参数 (0 = 使用全局默认值); 本地大模型解码慢, 建议调大
+	FirstTokenTimeoutSec int `json:"firstTokenTimeoutSec,omitempty"`
+	CallTimeoutSec       int `json:"callTimeoutSec,omitempty"`
+	DeadlineRetryBaseSec int `json:"deadlineRetryBaseSec,omitempty"`
 }
 
 // ProviderConfig 单个厂商的 API 连接参数。
@@ -560,10 +568,16 @@ func (jc *JSONConfig) ToModelConfigJSON() modelconfig.ConfigJSON {
 			models := make(map[string]modelconfig.ModelConfig, len(p.Models))
 			for alias, mc := range p.Models {
 				models[alias] = modelconfig.ModelConfig{
-					MaxTokens:       mc.MaxTokens,
-					MaxTurns:        mc.MaxTurns,
-					PromptCacheMode: mc.PromptCacheMode,
-					ContextWindow:   mc.ContextWindow,
+					MaxTokens:            mc.MaxTokens,
+					MaxTurns:             mc.MaxTurns,
+					PromptCacheMode:      mc.PromptCacheMode,
+					ContextWindow:        mc.ContextWindow,
+					RPM:                  mc.RPM,
+					MaxParallel:          mc.MaxParallel,
+					MinParallel:          mc.MinParallel,
+					FirstTokenTimeoutSec: mc.FirstTokenTimeoutSec,
+					CallTimeoutSec:       mc.CallTimeoutSec,
+					DeadlineRetryBaseSec: mc.DeadlineRetryBaseSec,
 				}
 			}
 			out.Providers[name] = modelconfig.ProviderConfig{

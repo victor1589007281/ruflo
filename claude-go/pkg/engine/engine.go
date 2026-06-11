@@ -431,6 +431,12 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 
 // SubmitStream 提交用户消息，返回 StreamEvent 通道实现 token-by-token 流式输出。
 func (e *QueryEngine) SubmitStream(ctx context.Context, userContent string) <-chan types.StreamEvent {
+	return e.SubmitStreamBlocks(ctx, userContent, nil)
+}
+
+// SubmitStreamBlocks 提交带附加内容块 (如图片) 的用户消息。
+// extraBlocks 排在文本之前 (Anthropic 推荐图片在前)，用于多模态输入。
+func (e *QueryEngine) SubmitStreamBlocks(ctx context.Context, userContent string, extraBlocks []types.ContentBlock) <-chan types.StreamEvent {
 	streamCh := make(chan types.StreamEvent, 200)
 	msgCh := make(chan types.Message, 50)
 
@@ -442,10 +448,13 @@ func (e *QueryEngine) SubmitStream(ctx context.Context, userContent string) <-ch
 	if text == "" {
 		text = "."
 	}
+	content := make([]types.ContentBlock, 0, len(extraBlocks)+1)
+	content = append(content, extraBlocks...)
+	content = append(content, types.ContentBlock{Type: types.ContentBlockText, Text: text})
 	userMsg := types.Message{
 		Type:      types.MessageTypeUser,
 		UUID:      internal_hook.GenerateUUID(),
-		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: text}},
+		Content:   content,
 		CreatedAt: time.Now(),
 	}
 	e.Messages = append(e.Messages, userMsg)

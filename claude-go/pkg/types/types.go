@@ -59,6 +59,19 @@ type ContentBlock struct {
 
 	// thinking 类型的字段
 	Thinking string `json:"thinking,omitempty"`
+
+	// image / document 类型的媒体源 (Anthropic Messages API 格式)
+	Source *MediaSource `json:"source,omitempty"`
+}
+
+// MediaSource 图片/文档内容块的数据源。
+// 对应 Anthropic API: {"type":"base64","media_type":"image/png","data":"..."}
+// 或 {"type":"url","url":"https://..."}
+type MediaSource struct {
+	Type      string `json:"type"`                 // "base64" | "url"
+	MediaType string `json:"media_type,omitempty"` // 如 "image/png"
+	Data      string `json:"data,omitempty"`       // base64 编码数据
+	URL       string `json:"url,omitempty"`        // type=url 时的地址
 }
 
 // Message 表示对话中的一条消息。

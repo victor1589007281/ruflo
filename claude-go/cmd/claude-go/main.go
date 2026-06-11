@@ -54,6 +54,7 @@ import (
 	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
+	"github.com/anthropic/claude-go/pkg/media"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/spf13/cobra"
 )
@@ -133,6 +134,10 @@ const fullHelpGuide = `Claude Code (Go) - AI 编程助手
 
 var (
 	flagModel        string
+	flagAttach       []string
+	flagCwd          string
+	flagFinalOnly    bool
+	flagEmitSession  bool
 	flagAPIKey       string
 	flagBaseURL      string
 	flagMaxTokens    int
@@ -227,6 +232,10 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagMCPConfig, "mcp-config", "", "MCP 配置文件路径 (JSON，顶层 mcpServers)")
 	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "JSON 配置文件路径 (默认自动发现 CLAUDE_GO_CONFIG、./claude-go.json、~/.claude-go/config/config.json)")
 	rootCmd.PersistentFlags().StringVar(&flagResume, "resume", "", "恢复指定 session ID 的对话")
+	rootCmd.PersistentFlags().StringArrayVar(&flagAttach, "attach", nil, "附加媒体文件 (图片/视频/音频, 可重复); 图片直接进视觉模型, 视频抽帧, 音频 ASR 转写")
+	rootCmd.PersistentFlags().StringVar(&flagCwd, "cwd", "", "工作目录 (优先级最高, 覆盖配置文件 cwd; 工具相对路径与会话存储均锚定于此)")
+	rootCmd.PersistentFlags().BoolVar(&flagFinalOnly, "final-only", false, "仅输出最终回答文本 (不输出 thinking 过程, 供程序化调用解析)")
+	rootCmd.PersistentFlags().BoolVar(&flagEmitSession, "emit-session-id", false, "结束时输出 __CLAUDE_GO_SESSION__=<id> 行, 供调用方记录以便 --resume 续聊")
 	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
 
 	rootCmd.AddCommand(chatCmd())
@@ -750,12 +759,46 @@ func runCmd() *cobra.Command {
 				return nil
 			}
 
+			// 会话持久化: 支持 --resume 续聊与 --emit-session-id (供 webapp 等程序化调用)
+			store, storeErr := session.NewSessionStore(eng.Config.Cwd)
+			if storeErr == nil {
+				eng.SessionStore = store
+				defer store.Close()
+				if flagResume != "" {
+					msgs, err := store.ResumeSession(flagResume)
+					if err != nil {
+						return fmt.Errorf("resume session %s: %w", flagResume, err)
+					}
+					eng.Messages = msgs
+				}
+			}
+
 			ctx := context.Background()
-			streamCh := eng.SubmitStream(ctx, userPrompt)
+			attachBlocks, err := ingestAttachments(flagAttach)
+			if err != nil {
+				return err
+			}
+			streamCh := eng.SubmitStreamBlocks(ctx, userPrompt, attachBlocks)
 			printStreamEvents(streamCh)
+			if flagEmitSession && store != nil {
+				fmt.Printf("\n__CLAUDE_GO_SESSION__=%s\n", store.SessionID())
+			}
 			return nil
 		},
 	}
+}
+
+// ingestAttachments 把 --attach 指定的媒体文件转换为内容块 (多模态输入)。
+func ingestAttachments(paths []string) ([]types.ContentBlock, error) {
+	var blocks []types.ContentBlock
+	for _, p := range paths {
+		bs, err := media.IngestFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("处理附件 %s 失败: %w", p, err)
+		}
+		blocks = append(blocks, bs...)
+	}
+	return blocks, nil
 }
 
 // feishuCmd 飞书长连接后台守护模式。
@@ -2059,6 +2102,13 @@ func buildEngine() (*engine.QueryEngine, error) {
 	if jsonCfg != nil && jsonCfg.Cwd != "" {
 		cwd = jsonCfg.Cwd
 	}
+	if flagCwd != "" {
+		if abs, err := filepath.Abs(flagCwd); err == nil {
+			cwd = abs
+		} else {
+			cwd = flagCwd
+		}
+	}
 	applyRuntimeSandboxConfig(jsonCfg, cwd)
 
 	projectSettings := settings.LoadProjectSettings(cwd)
@@ -2076,9 +2126,6 @@ func buildEngine() (*engine.QueryEngine, error) {
 	if apiKey == "" && projectSettings.AI != nil && projectSettings.AI.APIKey != "" {
 		apiKey = projectSettings.AI.APIKey
 	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("需要 API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数，或在配置文件 providers 中设置 apiKey")
-	}
 
 	effectiveModel := flagModel
 	if hasResolvedModel {
@@ -2090,7 +2137,12 @@ func buildEngine() (*engine.QueryEngine, error) {
 	if effectiveModel == "qwen3.5-plus" && projectSettings.AI != nil && projectSettings.AI.Model != "" {
 		effectiveModel = projectSettings.AI.Model
 	}
-	effectiveModel = normalizeProviderModelAlias(effectiveModel)
+	if !hasResolvedModel {
+		// 仅对未经 providers 解析的 "provider:model" 形式剥离前缀;
+		// 已解析的 ProviderName 是厂商真实模型名, 可能本身含冒号
+		// (如 Ollama 的 "gemma4:26b-a4b-it-qat"), 不能二次截断。
+		effectiveModel = normalizeProviderModelAlias(effectiveModel)
+	}
 
 	baseURL := flagBaseURL
 	if baseURL == "" {
@@ -2103,13 +2155,27 @@ func buildEngine() (*engine.QueryEngine, error) {
 		baseURL = projectSettings.AI.BaseURL
 	}
 
+	// 本机端点 (如 Ollama localhost:11434) 无需 API Key，自动使用占位 key
+	if apiKey == "" && api.IsLocalEndpoint(baseURL) {
+		apiKey = "ollama"
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf("需要 API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数，或在配置文件 providers 中设置 apiKey (本机 Ollama 端点可免 key)")
+	}
+
 	var apiClient *api.Client
 	if baseURL != "" {
 		trimmed := strings.TrimRight(baseURL, "/")
 		if strings.HasSuffix(trimmed, "/anthropic") || strings.HasSuffix(trimmed, "/compatible-mode") {
 			trimmed += "/v1"
 		}
-		apiClient = api.NewClient(trimmed, apiKey, effectiveModel)
+		if api.IsLocalEndpoint(trimmed) {
+			// 本地模型解码受内存带宽限制，复用 Ollama 客户端的宽松超时
+			apiClient = api.NewOllamaClient(trimmed, effectiveModel)
+			apiClient.APIKey = apiKey
+		} else {
+			apiClient = api.NewClient(trimmed, apiKey, effectiveModel)
+		}
 	} else {
 		apiClient = api.NewDashScopeClient(apiKey, effectiveModel)
 	}
@@ -2118,6 +2184,16 @@ func buildEngine() (*engine.QueryEngine, error) {
 		apiClient.FallbackBaseURL = resolvedModel.FallbackBaseURL
 		apiClient.FallbackAPIKey = resolvedModel.FallbackAPIKey
 		apiClient.PromptCacheMode = resolvedModel.PromptCacheMode
+		// 模型级超时覆盖 (本地 Ollama 解码慢, 配置中可调大)
+		if resolvedModel.FirstTokenTimeoutSec > 0 {
+			apiClient.FirstTokenTimeout = time.Duration(resolvedModel.FirstTokenTimeoutSec) * time.Second
+		}
+		if resolvedModel.CallTimeoutSec > 0 {
+			apiClient.CallTimeout = time.Duration(resolvedModel.CallTimeoutSec) * time.Second
+		}
+		if resolvedModel.DeadlineRetryBaseSec > 0 {
+			apiClient.DeadlineRetryBase = time.Duration(resolvedModel.DeadlineRetryBaseSec) * time.Second
+		}
 	}
 	applyRuntimePromptDebug(apiClient, jsonCfg)
 
@@ -2446,6 +2522,9 @@ func printStreamEvents(ch <-chan types.StreamEvent) {
 		switch ev.Kind {
 		case types.StreamEventDelta:
 			if ev.IsThinking {
+				if flagFinalOnly {
+					continue // --final-only: thinking 过程不输出
+				}
 				if !inThinking {
 					fmt.Print("\033[2m") // dim
 					inThinking = true

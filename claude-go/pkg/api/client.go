@@ -539,6 +539,48 @@ func NewMoonshotClient(apiKey, model string, cn bool) *Client {
 	return NewClient(host, apiKey, model)
 }
 
+// DefaultOllamaBaseURL 本机 Ollama 的 Anthropic 兼容端点。
+// Ollama ≥0.30 在 /v1/messages 上提供完整的 Anthropic Messages API
+// (含 tool_use / thinking / 图片输入)，可直接复用本客户端。
+const DefaultOllamaBaseURL = "http://localhost:11434/v1"
+
+// NewOllamaClient 创建本地 Ollama 客户端 (Anthropic 兼容端点)。
+// baseURL 为空时使用 DefaultOllamaBaseURL；Ollama 无鉴权，使用占位 key。
+// 本地模型解码慢 (CPU/iGPU 带宽瓶颈)，放宽首 token 与单次调用超时。
+func NewOllamaClient(baseURL, model string) *Client {
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = DefaultOllamaBaseURL
+	}
+	c := NewClient(baseURL, "ollama", model)
+	c.FirstTokenTimeout = 300 * time.Second
+	c.CallTimeout = 1800 * time.Second
+	return c
+}
+
+// IsLocalEndpoint 判断 baseURL 是否指向本机端点 (localhost/127.0.0.1/0.0.0.0/::1)。
+// 本机端点 (如 Ollama) 通常无需 API Key。
+func IsLocalEndpoint(baseURL string) bool {
+	u := strings.ToLower(strings.TrimSpace(baseURL))
+	for _, p := range []string{"http://", "https://"} {
+		u = strings.TrimPrefix(u, p)
+	}
+	host := u
+	if i := strings.IndexAny(u, ":/"); i >= 0 {
+		host = u[:i]
+	}
+	// IPv6 字面量形如 [::1]:11434
+	if strings.HasPrefix(u, "[") {
+		if j := strings.Index(u, "]"); j > 0 {
+			host = u[1:j]
+		}
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "0.0.0.0", "::1":
+		return true
+	}
+	return false
+}
+
 // StreamMessage 以流式方式发送消息，返回事件通道。
 // 对应 TS: services/api/claude.ts 中的 queryModelWithStreaming()
 //

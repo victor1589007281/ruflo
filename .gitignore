@@ -166,3 +166,8 @@ claude-go/.claude-go/
 .env
 .env.local
 .env.*.local
+
+# External codeintel symlinks & stray runtime log
+/graphify-out
+/.gitnexus
+claude-go/\!
