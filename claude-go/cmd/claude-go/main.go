@@ -252,6 +252,7 @@ func main() {
 	rootCmd.AddCommand(helpCmd())
 	rootCmd.AddCommand(codeintelMCPServerCmd())
 	rootCmd.AddCommand(wechatCmd())
+	rootCmd.AddCommand(swarmCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -2732,5 +2733,168 @@ func codeintelMCPServerCmd() *cobra.Command {
 	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1:9234", "HTTP/SSE 监听地址 (仅 transport=http/sse 时生效)")
 	cmd.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (读取其中的 codeIntel 段)")
 	cmd.Flags().StringVar(&indexBaseDir, "index-base-dir", "", "集中索引根目录 (如 /mnt/data/codeintel)")
+	return cmd
+}
+
+// noopSwarmLLM 离线占位 LLM, 仅供 swarm history 等只读子命令构造引擎用 (不会真正发起调用)。
+type noopSwarmLLM struct{}
+
+func (noopSwarmLLM) SimpleComplete(context.Context, string, string) (string, error) {
+	return "", fmt.Errorf("offline: 只读模式不可调用 LLM")
+}
+
+// swarmCmd 群体智能 CLI: 直接驱动 swarm_intel 引擎执行预测/模拟, 供脚本与 Web 后端程序化调用。
+// 与 chat/run 内的 /predict /simulate 同源, 但支持 --json: 结构化结果写 stdout, 过程通知写 stderr。
+// 结果持久化在 ~/.claude-go/swarm_intel/, dashboard GET /api/hivemind 可统一查看。
+func swarmCmd() *cobra.Command {
+	var jsonOut bool
+	var timeoutMin int
+
+	cmd := &cobra.Command{
+		Use:   "swarm",
+		Short: "群体智能引擎 (预测/模拟/历史)",
+		Long: `群体智能 (SwarmIntel) 引擎 CLI。
+
+5+2 阶段流水线: 分解 → 侦察 → 预测 → 辩论 → 融合 → 校准 → 学习
+多角色分析师独立预测后经多轮辩论, Boids 协调 + 贝叶斯/拜占庭融合 + Conformal 校准,
+信素记忆跨会话强化。结果持久化在 <stateDir>/swarm_intel/, dashboard /api/hivemind 可读。`,
+		Example: `  claude-go swarm predict "2027年AI Agent市场规模?"
+  claude-go swarm simulate "如果量子计算突破会怎样?" --mode social
+  claude-go swarm predict "BTC半年内趋势" --json
+  claude-go swarm history --n 10 --json`,
+	}
+	cmd.PersistentFlags().BoolVar(&jsonOut, "json", false, "结构化 JSON 输出 (stdout 仅 JSON, 过程通知走 stderr)")
+	cmd.PersistentFlags().IntVar(&timeoutMin, "timeout", 15, "执行超时 (分钟)")
+
+	newSwarmEngine := func() (*swarmintel.Engine, error) {
+		eng, err := buildEngine()
+		if err != nil {
+			return nil, err
+		}
+		eng.APIClient.Tag = "swarm"
+		siCfg := swarmintel.DefaultConfig()
+		siCfg.Notify = func(_, msg string) {
+			if jsonOut {
+				fmt.Fprintln(os.Stderr, msg)
+			} else {
+				fmt.Println(msg)
+			}
+		}
+		return swarmintel.NewEngine(eng.APIClient, siCfg), nil
+	}
+
+	emitJSON := func(v any) error {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		return enc.Encode(v)
+	}
+
+	predictCmd := &cobra.Command{
+		Use:   "predict <目标问题>",
+		Short: "群体智能预测 (Boids协调+多轮辩论+贝叶斯融合)",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			si, err := newSwarmEngine()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
+			defer cancel()
+			result, err := si.Predict(ctx, "cli", strings.Join(args, " "))
+			if err != nil {
+				return fmt.Errorf("预测失败: %w", err)
+			}
+			if jsonOut {
+				return emitJSON(result)
+			}
+			fmt.Println()
+			for _, o := range result.Outcomes {
+				barLen := int(o.Probability * 30)
+				if barLen > 30 {
+					barLen = 30
+				}
+				bar := strings.Repeat("█", barLen) + strings.Repeat("░", 30-barLen)
+				fmt.Printf("  %-16s %s %.1f%%  95%%CI [%.1f%%, %.1f%%]\n",
+					o.Outcome, bar, o.Probability*100, o.Lower95*100, o.Upper95*100)
+			}
+			fmt.Printf("\n  共识度: %.0f%% | 辩论: %d轮 | 分析师: %d | 融合: %s\n",
+				result.Consensus*100, result.Rounds, len(result.Agents), result.Method)
+			if result.Summary != "" {
+				fmt.Printf("\n%s\n", result.Summary)
+			}
+			return nil
+		},
+	}
+
+	var simMode string
+	var simAgents, simRounds int
+	simulateCmd := &cobra.Command{
+		Use:   "simulate <场景目标>",
+		Short: "多Agent场景模拟与涌现行为检测",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			si, err := newSwarmEngine()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
+			defer cancel()
+			cfg := swarmintel.SimulationConfig{Mode: simMode, Agents: simAgents, Rounds: simRounds}
+			result, err := si.Simulate(ctx, "cli", strings.Join(args, " "), cfg)
+			if err != nil {
+				return fmt.Errorf("模拟失败: %w", err)
+			}
+			if jsonOut {
+				return emitJSON(result)
+			}
+			fmt.Println()
+			for _, s := range result.Scenarios {
+				fmt.Printf("  📌 %s (概率 %.0f%%)\n     %s\n", s.Name, s.Probability*100, s.Description)
+			}
+			if len(result.Emergent) > 0 {
+				fmt.Println("\n涌现行为:")
+				for _, e := range result.Emergent {
+					fmt.Printf("  🌊 %s\n", e)
+				}
+			}
+			if result.Summary != "" {
+				fmt.Printf("\n%s\n", result.Summary)
+			}
+			return nil
+		},
+	}
+	simulateCmd.Flags().StringVar(&simMode, "mode", "social", "模拟模式: social|game|montecarlo|crisis|org|creative|market|policy|tech")
+	simulateCmd.Flags().IntVar(&simAgents, "agents", 5, "模拟 Agent 数量")
+	simulateCmd.Flags().IntVar(&simRounds, "rounds", 3, "模拟轮数")
+
+	var histN int
+	historyCmd := &cobra.Command{
+		Use:   "history",
+		Short: "查看最近的预测历史 (离线, 不调用 LLM)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			siCfg := swarmintel.DefaultConfig()
+			si := swarmintel.NewEngine(noopSwarmLLM{}, siCfg)
+			records, err := si.GetHistory(histN)
+			if err != nil {
+				return fmt.Errorf("读取历史失败: %w", err)
+			}
+			if jsonOut {
+				return emitJSON(records)
+			}
+			if len(records) == 0 {
+				fmt.Println("暂无预测历史")
+				return nil
+			}
+			for _, r := range records {
+				fmt.Printf("[%s] %s (共识度 %.0f%%)\n", r.CreatedAt.Format("2006-01-02 15:04"), r.Question, r.Consensus*100)
+			}
+			return nil
+		},
+	}
+	historyCmd.Flags().IntVar(&histN, "n", 20, "返回条数")
+
+	cmd.AddCommand(predictCmd)
+	cmd.AddCommand(simulateCmd)
+	cmd.AddCommand(historyCmd)
 	return cmd
 }
