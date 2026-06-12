@@ -109,6 +109,8 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"testing":      testingWorkflow,
 	"creative-v2":  creativeV2Workflow,
 	"trading-v2":   tradingV2Workflow,
+	"sector-scan":  sectorScanWorkflow,
+	"industry-map": industryMapWorkflow,
 	"novel-v2":     novelV2Workflow,
 	"novel-v3":     novelV3Workflow,
 	"ml-training":  mlTrainingWorkflow,
