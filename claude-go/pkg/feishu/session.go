@@ -158,6 +158,20 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 	return sm
 }
 
+// teamStageMaxTurnsFloor 是 agent 工具循环的硬下限兜底。
+// 修复: 模型配置 maxTurns=0 经 `if mcfg.MaxTurns>0` 守卫被忽略后, 若 defaultResolved
+// 也为 0, 会让 engine.go 把 0 当"无限", agent 一直循环到 stageTimeout(10min) 才停,
+// 单个团队曾因此烧掉数百万 token。这里强制兜底, 任何 <=0 都收敛到该值。
+const teamStageMaxTurnsFloor = 40
+
+// clampTurns 保证 agent 回合数始终有界 (>0)。
+func clampTurns(n int) int {
+	if n <= 0 {
+		return teamStageMaxTurnsFloor
+	}
+	return n
+}
+
 // SetDefaultModelConfig 注入默认模型解析配置。
 func (sm *SessionManager) SetDefaultModelConfig(cfg modelconfig.ResolvedConfig) {
 	sm.defaultResolved = cfg
@@ -395,7 +409,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	cfg := &engine.Config{
 		Model:            sm.apiClient.Model,
 		MaxTokens:        sm.defaultResolved.MaxTokens,
-		MaxTurns:         sm.defaultResolved.MaxTurns,
+		MaxTurns:         clampTurns(sm.defaultResolved.MaxTurns),
 		ContextWindow:    contextWindow,
 		Cwd:              sm.config.Cwd,
 		PermissionMode:   permMode,
@@ -493,7 +507,7 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	cfg := &engine.Config{
 		Model:            model,
 		MaxTokens:        maxTokens,
-		MaxTurns:         maxTurns,
+		MaxTurns:         clampTurns(maxTurns),
 		ContextWindow:    contextWindow,
 		Cwd:              sm.config.Cwd,
 		PermissionMode:   permMode,
@@ -800,14 +814,22 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 			hookRunner.RegisterPostSamplingHook(func(_ []types.Message) {
 				// 经验 ID 记录, 后续由 workflow/swarm 层面反馈
 			})
-			promptMgr.CustomPrompt = expContext + "\n" + promptMgr.CustomPrompt
+			// 前缀缓存修复: 经验按 userPrompt 检索, 每次都不同。若前置到
+			// CustomPrompt(=system block 0), 会让本应稳定的 system 前缀每次变化,
+			// 自动前缀缓存彻底失效(实测 97% 角色 system 前缀不稳)。改为放入
+			// AppendPrompt → 成为独立尾部 system 块, block 0(角色提示词)保持稳定可缓存。
+			if promptMgr.AppendPrompt != "" {
+				promptMgr.AppendPrompt = promptMgr.AppendPrompt + "\n" + expContext
+			} else {
+				promptMgr.AppendPrompt = expContext
+			}
 		}
 	}
 
 	cfg := &engine.Config{
 		Model:            modelOverride,
 		MaxTokens:        maxTokens,
-		MaxTurns:         maxTurns,
+		MaxTurns:         clampTurns(maxTurns),
 		ContextWindow:    contextWindow,
 		Cwd:              r.sm.config.Cwd,
 		PermissionMode:   permMode,

@@ -137,11 +137,11 @@ var inlineTagRe = func() map[string]*regexp.Regexp {
 }()
 
 var (
-	codeBlockRe = regexp.MustCompile(`(?s)<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>`)
+	codeBlockRe  = regexp.MustCompile(`(?s)<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>`)
 	inlineCodeRe = regexp.MustCompile(`<code(?:\s[^>]*)?>`)
-	olBlockRe    = regexp.MustCompile(`(?s)<ol[^>]*>(.*?)</ol>`)
-	ulBlockRe    = regexp.MustCompile(`(?s)<ul[^>]*>(.*?)</ul>`)
-	liItemRe     = regexp.MustCompile(`(?s)<li[^>]*>(.*?)</li>`)
+	listOpenRe   = regexp.MustCompile(`(?i)<(ol|ul)(\s[^>]*)?>`)
+	pTagRe       = regexp.MustCompile(`(?i)</?p(\s[^>]*)?>`)
+	olStartRe    = regexp.MustCompile(`(?i)\bstart\s*=\s*["']?(\d+)`)
 )
 
 // renderCodeBlock 把单个代码块改造成公众号能保留排版的形式。
@@ -164,29 +164,143 @@ func renderCodeBlock(m string) string {
 }
 
 // listsToParagraphs 把 <ol>/<ul> 转成紧凑的带编号/项目符的 <p> (公众号对 <li> 会强加间距 →
-// 直接不用列表标签, 改用 <p> + 手动编号, 彻底消除"序号列表空行")。仅处理扁平列表。
+// 直接不用列表标签, 改用 <p> + 手动编号, 彻底消除"序号列表空行")。
+// 递归处理任意层级嵌套: 每层按 depth 加 margin-left 缩进, 有序列表按本层独立计数,
+// 修复了旧实现把嵌套子项当成顶层项 (序号错乱) 且子项无缩进的问题。
 func listsToParagraphs(html string) string {
-	const pStyle = "font-size:15px;color:#3a3a3a;line-height:1.75;margin:3px 0;"
-	conv := func(body string, ordered bool) string {
-		items := liItemRe.FindAllStringSubmatch(body, -1)
-		var b strings.Builder
-		for i, it := range items {
-			marker := "• "
-			if ordered {
-				marker = fmt.Sprintf("%d. ", i+1)
-			}
-			b.WriteString(`<p style="` + pStyle + `"><strong style="color:#1a5fb4;">` + marker + `</strong>` +
-				strings.TrimSpace(it[1]) + `</p>`)
+	return convertLists(html, 0)
+}
+
+// 每级缩进像素 (公众号支持 margin-left)。
+const listIndentPx = 20
+
+// convertLists 把 s 中所有顶层 <ol>/<ul> 块替换为按 depth 缩进的 <p>, 非列表内容原样保留。
+func convertLists(s string, depth int) string {
+	var b strings.Builder
+	for {
+		loc := listOpenRe.FindStringIndex(s)
+		if loc == nil {
+			b.WriteString(s)
+			break
 		}
-		return b.String()
+		b.WriteString(s[:loc[0]])
+		ordered := strings.EqualFold(listOpenRe.FindStringSubmatch(s[loc[0]:loc[1]])[1], "ol")
+		openTag := s[loc[0]:loc[1]]
+		tag := "ul"
+		if ordered {
+			tag = "ol"
+		}
+		bodyStart := loc[1]
+		bodyEnd, after := matchListClose(s, bodyStart, tag)
+		if bodyEnd < 0 { // 没有配对的闭合标签, 保底原样输出, 避免死循环
+			b.WriteString(s[loc[0]:loc[1]])
+			s = s[loc[1]:]
+			continue
+		}
+		start := 1
+		if m := olStartRe.FindStringSubmatch(openTag); ordered && m != nil {
+			fmt.Sscanf(m[1], "%d", &start)
+		}
+		b.WriteString(renderListBody(s[bodyStart:bodyEnd], ordered, depth, start))
+		s = s[after:]
 	}
-	html = olBlockRe.ReplaceAllStringFunc(html, func(m string) string {
-		return conv(olBlockRe.FindStringSubmatch(m)[1], true)
-	})
-	html = ulBlockRe.ReplaceAllStringFunc(html, func(m string) string {
-		return conv(ulBlockRe.FindStringSubmatch(m)[1], false)
-	})
-	return html
+	return b.String()
+}
+
+// matchListClose 从 from 开始, 计 <tag.../</tag> 嵌套深度, 返回匹配 </tag> 的起始下标与其后下标。
+func matchListClose(s string, from int, tag string) (closeStart, after int) {
+	openRe := regexp.MustCompile(`(?i)<` + tag + `(\s[^>]*)?>`)
+	closeTok := "</" + tag + ">"
+	depth := 1
+	i := from
+	for i < len(s) {
+		nextClose := strings.Index(strings.ToLower(s[i:]), closeTok)
+		if nextClose < 0 {
+			return -1, len(s)
+		}
+		nextClose += i
+		if oc := openRe.FindStringIndex(s[i:nextClose]); oc != nil {
+			depth++
+			i = i + oc[1]
+			continue
+		}
+		depth--
+		if depth == 0 {
+			return nextClose, nextClose + len(closeTok)
+		}
+		i = nextClose + len(closeTok)
+	}
+	return -1, len(s)
+}
+
+// renderListBody 渲染一个列表体: 拆出本层 <li>, 逐项输出 <p> + 递归处理其嵌套子列表。
+func renderListBody(body string, ordered bool, depth, start int) string {
+	const pStyle = "font-size:15px;color:#3a3a3a;line-height:1.75;margin:3px 0;"
+	indent := ""
+	if depth > 0 {
+		indent = fmt.Sprintf("margin-left:%dpx;", depth*listIndentPx)
+	}
+	var b strings.Builder
+	for i, item := range splitTopLevelLi(body) {
+		// 分离本项自身内容(lead)与其内部嵌套子列表(nested)
+		lead, nested := item, ""
+		if nl := listOpenRe.FindStringIndex(item); nl != nil {
+			lead, nested = item[:nl[0]], item[nl[0]:]
+		}
+		// loose list 的项内容被 goldmark 包了 <p>, 去掉以免 <p> 嵌套; 保留 <strong> 等行内标签
+		lead = strings.TrimSpace(pTagRe.ReplaceAllString(lead, ""))
+		marker := "• "
+		if ordered {
+			marker = fmt.Sprintf("%d. ", start+i)
+		}
+		if lead != "" {
+			b.WriteString(`<p style="` + pStyle + indent + `"><strong style="color:#1a5fb4;">` +
+				marker + `</strong>` + lead + `</p>`)
+		}
+		if strings.TrimSpace(nested) != "" {
+			b.WriteString(convertLists(nested, depth+1)) // 子列表深一层缩进
+		}
+	}
+	return b.String()
+}
+
+// splitTopLevelLi 按 li 嵌套深度切分, 返回本层每个 <li> 的内部内容 (不含嵌套 li)。
+func splitTopLevelLi(body string) []string {
+	liOpenRe := regexp.MustCompile(`(?i)<li(\s[^>]*)?>`)
+	var items []string
+	depth, innerStart := 0, -1
+	i := 0
+	for i < len(body) {
+		openLoc := liOpenRe.FindStringIndex(body[i:])
+		closeIdx := strings.Index(strings.ToLower(body[i:]), "</li>")
+		// 下一个 token 是开标签还是闭标签?
+		nextOpen := -1
+		if openLoc != nil {
+			nextOpen = i + openLoc[0]
+		}
+		nextClose := -1
+		if closeIdx >= 0 {
+			nextClose = i + closeIdx
+		}
+		if nextOpen < 0 && nextClose < 0 {
+			break
+		}
+		if nextOpen >= 0 && (nextClose < 0 || nextOpen < nextClose) {
+			if depth == 0 {
+				innerStart = i + openLoc[1]
+			}
+			depth++
+			i = i + openLoc[1]
+		} else {
+			depth--
+			if depth == 0 && innerStart >= 0 {
+				items = append(items, body[innerStart:nextClose])
+				innerStart = -1
+			}
+			i = nextClose + len("</li>")
+		}
+	}
+	return items
 }
 
 // InlineWechatStyles 把公众号安全样式内联到各标签 (公众号会删 <style>/class, 只认内联 style)。

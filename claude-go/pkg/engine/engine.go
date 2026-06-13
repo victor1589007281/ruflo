@@ -1345,6 +1345,12 @@ func sanitizeToolPairing(messages []types.Message) []types.Message {
 				if b.ToolUseID == "" || !toolUseIDs[b.ToolUseID] {
 					continue // 无对应 tool_use, 丢弃孤儿 tool_result
 				}
+				// 修复: 工具返回空内容时, 严格网关 (Kimi/OpenAI 翻译层) 会因
+				// "message ... must not be empty" 报 400, 导致 agent 在 WebSearch
+				// 等循环里反复撞 400 烧 token。补占位符保证 tool_result 非空。
+				if strings.TrimSpace(b.Content) == "" {
+					b.Content = "(工具无输出)"
+				}
 			}
 			kept = append(kept, b)
 		}
