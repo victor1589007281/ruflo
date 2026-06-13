@@ -3,6 +3,7 @@ package dashboard
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -97,9 +98,8 @@ func TestDynamicWorkflowOverHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r2.Body.Close()
-	buf := make([]byte, 1<<16)
-	n, _ := r2.Body.Read(buf)
-	listed := string(buf[:n])
+	listedBytes, _ := io.ReadAll(r2.Body)
+	listed := string(listedBytes)
 	if !strings.Contains(listed, "http-dyn-flow") || !strings.Contains(listed, `"custom":true`) {
 		t.Fatalf("列表未含动态工作流(注册未生效): %s", listed)
 	}

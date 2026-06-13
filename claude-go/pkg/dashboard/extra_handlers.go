@@ -25,6 +25,7 @@ import (
 type workflowStageDTO struct {
 	Name      string   `json:"name"`
 	Role      string   `json:"role"`
+	Prompt    string   `json:"prompt,omitempty"` // 供编辑预填 (列表里多数为空/简短)
 	DependsOn []string `json:"dependsOn,omitempty"`
 	Parallel  bool     `json:"parallel,omitempty"`
 }
@@ -101,14 +102,16 @@ func (s *Server) handleWorkflowGenerate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var body struct {
-		Objective string `json:"objective"`
+		Objective   string             `json:"objective"`
+		Current     *agent.WorkflowDef `json:"current,omitempty"`     // 迭代: 当前编排
+		Instruction string             `json:"instruction,omitempty"` // 迭代: 调整指令
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	roles := agent.NewRoleRegistry(s.cfg.StateDir)
-	def, err := agent.GenerateWorkflowDef(r.Context(), dashLLMAdapter{s.cfg.LLMComplete}, body.Objective, roles.Names())
+	def, err := agent.GenerateWorkflowDef(r.Context(), dashLLMAdapter{s.cfg.LLMComplete}, body.Objective, roles.Names(), body.Current, body.Instruction)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -162,12 +165,32 @@ func (s *Server) handleWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("workflow name required"))
 		return
 	}
+	if r.Method == http.MethodDelete {
+		s.handleWorkflowDelete(w, r, name)
+		return
+	}
 	wf := agent.GetWorkflow(name)
 	if wf == nil {
 		writeError(w, http.StatusNotFound, fmt.Errorf("workflow %q not found", name))
 		return
 	}
 	writeJSON(w, http.StatusOK, toWorkflowDTO(wf))
+}
+
+// handleWorkflowDelete DELETE /api/workflows/{name}: 删除一个动态工作流 (内置不可删) + 删除落盘文件。
+func (s *Server) handleWorkflowDelete(w http.ResponseWriter, r *http.Request, name string) {
+	if err := agent.UnregisterWorkflow(name); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	_ = os.Remove(filepath.Join(s.cfg.StateDir, "workflows", sanitizeWFFile(name)+".json"))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "deleted": name})
+}
+
+// sanitizeWFFile 与 agent.SaveWorkflowToDir 的文件名规则一致。
+func sanitizeWFFile(name string) string {
+	r := strings.NewReplacer("/", "_", "\\", "_", "..", "_", " ", "-")
+	return r.Replace(name)
 }
 
 func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
@@ -177,7 +200,7 @@ func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
 	}
 	for _, st := range wf.Stages {
 		dto.Stages = append(dto.Stages, workflowStageDTO{
-			Name: st.Name, Role: st.Role,
+			Name: st.Name, Role: st.Role, Prompt: st.Prompt,
 			DependsOn: append([]string(nil), st.DependsOn...),
 			Parallel:  st.Parallel,
 		})

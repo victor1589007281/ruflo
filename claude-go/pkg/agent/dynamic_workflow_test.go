@@ -25,7 +25,7 @@ func TestGenerateWorkflowDef(t *testing.T) {
 	llm := &stubGenLLM{out: "这是结果 ```json\n" +
 		`{"name":"gen-flow","mode":"pipeline","stages":[{"name":"a","role":"researcher","prompt":"调研"},{"name":"b","prompt":"写","dependsOn":["a"]}]}` +
 		"\n``` 完毕"}
-	def, err := GenerateWorkflowDef(context.Background(), llm, "调研并撰写某主题", []string{"researcher", "tech-writer"})
+	def, err := GenerateWorkflowDef(context.Background(), llm, "调研并撰写某主题", []string{"researcher", "tech-writer"}, nil, "")
 	if err != nil {
 		t.Fatalf("生成失败: %v", err)
 	}
@@ -37,6 +37,39 @@ func TestGenerateWorkflowDef(t *testing.T) {
 	}
 	if err := def.Validate(nil); err != nil {
 		t.Errorf("生成的 def 应能通过 Validate(均有内联prompt): %v", err)
+	}
+
+	// 迭代: 带 current + instruction → prompt 应含当前编排 + 调整指令
+	llm2 := &stubGenLLM{out: `{"name":"gen-flow","mode":"pipeline","stages":[{"name":"a","prompt":"x"},{"name":"test","prompt":"测试","dependsOn":["a"]}]}`}
+	_, err = GenerateWorkflowDef(context.Background(), llm2, "", nil, def, "增加一个测试阶段")
+	if err != nil {
+		t.Fatalf("迭代生成失败: %v", err)
+	}
+	if !strings.Contains(llm2.gotUser, "增加一个测试阶段") || !strings.Contains(llm2.gotUser, "gen-flow") {
+		t.Error("迭代生成 prompt 应含调整指令与当前编排")
+	}
+}
+
+func TestUnregisterWorkflow(t *testing.T) {
+	if err := RegisterWorkflow(goodPipeline("dyn-del"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if GetWorkflow("dyn-del") == nil {
+		t.Fatal("注册后应存在")
+	}
+	if err := UnregisterWorkflow("dyn-del"); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	if GetWorkflow("dyn-del") != nil {
+		t.Error("删除后不应存在")
+	}
+	// 内置不可删
+	if err := UnregisterWorkflow("techblog"); err == nil {
+		t.Error("内置工作流应不可删")
+	}
+	// 不存在
+	if err := UnregisterWorkflow("nope-x"); err == nil {
+		t.Error("删除不存在的应报错")
 	}
 }
 

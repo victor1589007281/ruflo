@@ -54,6 +54,23 @@ func RegisterWorkflow(def *WorkflowDef, roles *RoleRegistry) error {
 	return nil
 }
 
+// UnregisterWorkflow 删除一个动态工作流 (内置工作流不可删)。
+func UnregisterWorkflow(name string) error {
+	customMu.Lock()
+	_, ok := customWFs[name]
+	if ok {
+		delete(customWFs, name)
+	}
+	customMu.Unlock()
+	if !ok {
+		if _, builtin := workflowRegistry[name]; builtin {
+			return fmt.Errorf("内置工作流 %q 不可删除", name)
+		}
+		return fmt.Errorf("动态工作流 %q 不存在", name)
+	}
+	return nil
+}
+
 // getCustomWorkflow 返回自定义工作流的副本 (避免共享引用); 不存在返回 nil。
 func getCustomWorkflow(name string) *WorkflowDef {
 	customMu.RLock()
@@ -248,27 +265,46 @@ func PlanToWorkflowDef(plan *DecompositionPlan, name string) *WorkflowDef {
 
 // GenerateWorkflowDef 用 LLM 从目标 + 可用角色生成一个动态工作流定义 (返回但不注册, 供审核)。
 // 与 swarm 的 decompose 同源(都是 LLM 从目标生成编排), 但产出可复用、可审核的 WorkflowDef。
-func GenerateWorkflowDef(ctx context.Context, llm LLMClient, objective string, roleNames []string) (*WorkflowDef, error) {
+//
+// 迭代生成: 当 current!=nil && instruction!="" 时为"在现有编排上按指令调整"(多轮交互), 否则首次生成。
+func GenerateWorkflowDef(ctx context.Context, llm LLMClient, objective string, roleNames []string, current *WorkflowDef, instruction string) (*WorkflowDef, error) {
 	if llm == nil {
 		return nil, fmt.Errorf("LLM 不可用")
-	}
-	if strings.TrimSpace(objective) == "" {
-		return nil, fmt.Errorf("objective 不能为空")
 	}
 	sort.Strings(roleNames)
 	roleList := strings.Join(roleNames, ", ")
 	sys := "你是多智能体工作流编排专家。把用户目标拆解成一个可执行的工作流(有依赖关系的若干阶段)。只输出严格 JSON, 不要任何解释或代码块标记。"
-	user := fmt.Sprintf(`目标: %s
 
-可用角色(尽量从中给每个阶段选一个 role; 找不到合适角色时, 把该阶段要做的事写进 prompt 字段): %s
-
-只输出如下结构的 JSON:
+	schema := `只输出如下结构的 JSON:
 {"name":"英文短横线命名的唯一工作流名","description":"一句话描述","mode":"pipeline|fanout|adversarial|orchestrated","stages":[
   {"name":"阶段英文名(唯一)","role":"上面列表里的角色名(可留空)","prompt":"该阶段做什么; 支持 {objective} {prev_result} {user_feedback} 占位符; role 留空时必填","dependsOn":["前置阶段名"]}
 ]}
 
-硬性要求: mode 只能是列出的四种之一; stage 名互不相同; dependsOn 只能引用已定义的 stage; 不能有循环依赖; 阶段数 3-7 个。`,
-		truncateResult(objective, 2000), roleList)
+硬性要求: mode 只能是列出的四种之一; stage 名互不相同; dependsOn 只能引用已定义的 stage; 不能有循环依赖; 阶段数 3-7 个。`
+
+	var user string
+	if current != nil && strings.TrimSpace(instruction) != "" {
+		// 迭代: 在现有编排上按调整指令修改
+		curJSON, _ := json.Marshal(current)
+		user = fmt.Sprintf(`这是当前的工作流编排:
+%s
+
+可用角色: %s
+
+请按下面的调整指令修改并重新输出**完整**工作流(保留未涉及的部分):
+调整指令: %s
+
+%s`, string(curJSON), roleList, truncateResult(instruction, 1000), schema)
+	} else {
+		if strings.TrimSpace(objective) == "" {
+			return nil, fmt.Errorf("objective 不能为空")
+		}
+		user = fmt.Sprintf(`目标: %s
+
+可用角色(尽量从中给每个阶段选一个 role; 找不到合适角色时, 把该阶段要做的事写进 prompt 字段): %s
+
+%s`, truncateResult(objective, 2000), roleList, schema)
+	}
 
 	out, err := llm.SimpleComplete(ctx, sys, user)
 	if err != nil {
