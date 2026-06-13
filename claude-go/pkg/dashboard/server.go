@@ -9,7 +9,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -315,9 +317,132 @@ func (s *Server) handleTeamDetail(w http.ResponseWriter, r *http.Request) {
 		s.handleTeamCheckpoints(w, r, name)
 	case "logs":
 		s.handleTeamLogs(w, r, name)
+	case "media":
+		s.handleTeamMedia(w, r, name, parts[2:])
+	case "refine":
+		s.handleTeamRefine(w, r, name)
+	case "fork":
+		s.handleTeamFork(w, r, name)
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown sub-path %q", sub))
 	}
+}
+
+// execTeamActionDirect 同步直连执行团队动作 (不走 .dashboard/actions 队列)。
+// 供 webapp 等外部服务直接触发; 需要主进程注入了 TeamAction (即 :18080 飞书挂载的 dashboard)。
+func (s *Server) execTeamActionDirect(w http.ResponseWriter, action, name string, payload map[string]interface{}) {
+	if s.cfg.TeamAction == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			fmt.Errorf("无团队执行器: 请直连 :18080 (飞书挂载、已注入 TeamAction 的 dashboard) 触发"))
+		return
+	}
+	if err := s.cfg.TeamAction(action, name, payload); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "team": name, "action": action})
+}
+
+// handleTeamRefine POST /api/teams/{name}/refine  body: {feedback, targetStage?}
+func (s *Server) handleTeamRefine(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var body struct {
+		Feedback    string `json:"feedback"`
+		TargetStage string `json:"targetStage"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if strings.TrimSpace(body.Feedback) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("feedback 不能为空"))
+		return
+	}
+	s.execTeamActionDirect(w, "refine", name, map[string]interface{}{
+		"feedback": body.Feedback, "targetStage": body.TargetStage,
+	})
+}
+
+// handleTeamFork POST /api/teams/{name}/fork  body: {newName}
+func (s *Server) handleTeamFork(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var body struct {
+		NewName string `json:"newName"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if strings.TrimSpace(body.NewName) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("newName 不能为空"))
+		return
+	}
+	s.execTeamActionDirect(w, "fork", name, map[string]interface{}{"newName": body.NewName})
+}
+
+// handleTeamMedia 列出/服务团队的媒体产出 (creative-v2 等生成的 PNG/PDF/MP4/GIF/PPTX/HTML)。
+//   GET /api/teams/{name}/media            → 产出文件清单 (JSON)
+//   GET /api/teams/{name}/media/{file...}  → 服务单个文件 (带 path-traversal 守卫)
+// 注: 产出 HTML 为模型生成内容, 通过 CSP sandbox 隔离, 防止注入 dashboard 同源。
+func (s *Server) handleTeamMedia(w http.ResponseWriter, r *http.Request, name string, fileParts []string) {
+	mediaDir := filepath.Join(s.provider.StateDir(), "teams", name, "media")
+	absDir, err := filepath.Abs(mediaDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if len(fileParts) == 0 || (len(fileParts) == 1 && fileParts[0] == "") {
+		// 列清单
+		type mediaFile struct {
+			Name string `json:"name"`
+			Ext  string `json:"ext"`
+			Size int64  `json:"size"`
+			URL  string `json:"url"`
+		}
+		files := []mediaFile{}
+		entries, _ := os.ReadDir(absDir)
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			info, _ := e.Info()
+			var sz int64
+			if info != nil {
+				sz = info.Size()
+			}
+			files = append(files, mediaFile{
+				Name: e.Name(),
+				Ext:  strings.ToLower(strings.TrimPrefix(filepath.Ext(e.Name()), ".")),
+				Size: sz,
+				URL:  "/api/teams/" + url.PathEscape(name) + "/media/" + url.PathEscape(e.Name()),
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"files": files})
+		return
+	}
+
+	// 服务单个文件: 拼接后取绝对路径, 必须仍在 mediaDir 之内 (防 ../ 穿越)。
+	full, err := filepath.Abs(filepath.Join(absDir, filepath.Join(fileParts...)))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if full != absDir && !strings.HasPrefix(full, absDir+string(os.PathSeparator)) {
+		writeError(w, http.StatusForbidden, fmt.Errorf("path traversal blocked"))
+		return
+	}
+	info, err := os.Stat(full)
+	if err != nil || info.IsDir() {
+		writeError(w, http.StatusNotFound, fmt.Errorf("media not found"))
+		return
+	}
+	// 模型生成的 HTML: 用 CSP sandbox 隔离 (允许脚本以保留动画预览, 但不与 dashboard 同源)。
+	if strings.HasSuffix(strings.ToLower(full), ".html") || strings.HasSuffix(strings.ToLower(full), ".svg") {
+		w.Header().Set("Content-Security-Policy", "sandbox allow-scripts;")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+	}
+	http.ServeFile(w, r, full)
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

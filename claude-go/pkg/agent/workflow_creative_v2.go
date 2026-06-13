@@ -364,6 +364,7 @@ func detectOutputFormats(objective, htmlContent string) []string {
 	hasPDF := strings.Contains(lower, "pdf")
 	hasVideo := strings.Contains(lower, "视频") || strings.Contains(lower, "video") ||
 		strings.Contains(lower, "mp4") || strings.Contains(lower, "动画")
+	hasGIF := strings.Contains(lower, "动图") || strings.Contains(lower, "gif") || strings.Contains(lower, "动态图")
 	hasPPT := strings.Contains(lower, "ppt") || strings.Contains(lower, "幻灯片") ||
 		strings.Contains(lower, "演示") || strings.Contains(lower, "slides")
 	hasSVG := strings.Contains(lower, "svg") || strings.Contains(htmlContent, "<svg")
@@ -373,11 +374,14 @@ func detectOutputFormats(objective, htmlContent string) []string {
 		strings.Contains(htmlContent, "class=\"screen\"") ||
 		strings.Contains(htmlContent, "data-screen=")
 
-	if hasPDF || (!hasVideo && !hasPPT) {
+	if hasPDF || (!hasVideo && !hasPPT && !hasGIF) {
 		formats = append(formats, "pdf")
 	}
 	if hasVideo || strings.Contains(htmlContent, "@keyframes") {
 		formats = append(formats, "mp4")
+	}
+	if hasGIF {
+		formats = append(formats, "gif")
 	}
 	if hasPPT || strings.Contains(htmlContent, "<section") {
 		formats = append(formats, "pptx")

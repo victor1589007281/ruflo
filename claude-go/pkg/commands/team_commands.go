@@ -13,8 +13,8 @@ import (
 func RegisterTeamCommands(r *Registry) {
 	r.Register(&Command{
 		Name:        "team",
-		ArgHint:     "[create|run|status|stop|list|delete|workflows]",
-		Description: "团队管理 (create/run/status/stop/list/delete/workflows)",
+		ArgHint:     "[create|run|refine|fork|resume|status|stop|list|delete|workflows]",
+		Description: "团队管理 (create/run/refine/fork/resume/status/stop/list/delete/workflows)",
 		Type:        CommandTypeLocal,
 		Execute: func(args string, ctx *CommandContext) error {
 			if ctx.TeamMgr == nil {
@@ -78,6 +78,52 @@ func RegisterTeamCommands(r *Registry) {
 						fmt.Printf("\n🏁 团队 %s 执行完毕 (状态: %s)\n", team.Name, team.Status)
 					}
 				}
+
+			case "refine":
+				if len(parts) < 3 {
+					fmt.Println("用法: /team refine <名称> <反馈> [--stage 阶段名]")
+					fmt.Println("说明: 让已完成/失败的团队带着反馈继续优化迭代。")
+					fmt.Println("  不带 --stage: 整体带反馈重跑。")
+					fmt.Println("  带 --stage X: 仅从阶段 X 起重跑(之前阶段复用检查点, 省 token)。")
+					return nil
+				}
+				name := parts[1]
+				stage := ""
+				var fbParts []string
+				for i := 2; i < len(parts); i++ {
+					if parts[i] == "--stage" && i+1 < len(parts) {
+						stage = parts[i+1]
+						i++
+					} else {
+						fbParts = append(fbParts, parts[i])
+					}
+				}
+				feedback := strings.Join(fbParts, " ")
+				if err := ctx.TeamMgr.RefineTeam(name, feedback, stage); err != nil {
+					fmt.Printf("[精修失败: %v]\n", err)
+					return nil
+				}
+				fmt.Printf("🛠️ 团队 **%s** 已带反馈进入精修迭代...\n", name)
+				if ctx.WaitSync {
+					if team := ctx.TeamMgr.GetTeam(name); team != nil {
+						team.WaitDone()
+						fmt.Printf("\n🏁 精修完毕 (状态: %s)\n", team.Status)
+					}
+				}
+
+			case "fork":
+				if len(parts) < 3 {
+					fmt.Println("用法: /team fork <源团队> <新团队名>")
+					fmt.Println("说明: 复制一个已完成团队(含产出/检查点)为新团队, 便于在保留原版的前提下迭代精修。")
+					return nil
+				}
+				nt, err := ctx.TeamMgr.ForkTeam(parts[1], parts[2])
+				if err != nil {
+					fmt.Printf("[fork 失败: %v]\n", err)
+					return nil
+				}
+				fmt.Printf("🍴 已从 **%s** 复制出团队 **%s** (状态: %s)\n", parts[1], nt.Name, nt.Status)
+				fmt.Printf("   用 /team refine %s <反馈> 继续迭代\n", nt.Name)
 
 			case "status":
 				if len(parts) >= 2 {
@@ -154,7 +200,7 @@ func RegisterTeamCommands(r *Registry) {
 				fmt.Println("  hiring       — 应聘招聘 (JD分析→模拟面试)")
 
 			default:
-				fmt.Printf("未知子命令: %s\n用法: /team [create|run|status|stop|list|delete|workflows]\n", sub)
+				fmt.Printf("未知子命令: %s\n用法: /team [create|run|refine|fork|resume|status|stop|list|delete|workflows]\n", sub)
 			}
 			return nil
 		},

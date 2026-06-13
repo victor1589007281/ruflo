@@ -753,3 +753,29 @@ func (c *Coordinator) ClearCheckpoints() {
 		os.Remove(filepath.Join(c.dataDir, "checkpoints.json"))
 	}
 }
+
+// InvalidateCheckpoints 从 dataDir 的 checkpoints.json 中删除指定阶段的检查点, 使其在下次
+// resume 时重新执行 (保留其余已完成阶段)。供 RefineTeam 做"从目标阶段起增量重跑"。
+// 不依赖 Coordinator 实例; 直接操作磁盘上的检查点文件。
+func InvalidateCheckpoints(dataDir string, stageNames []string) error {
+	if dataDir == "" || len(stageNames) == 0 {
+		return nil
+	}
+	path := filepath.Join(dataDir, "checkpoints.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil // 无检查点文件 → 无需失效
+	}
+	var cps map[string]*Checkpoint
+	if err := json.Unmarshal(data, &cps); err != nil {
+		return err
+	}
+	for _, n := range stageNames {
+		delete(cps, n)
+	}
+	out, err := json.MarshalIndent(cps, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0644)
+}

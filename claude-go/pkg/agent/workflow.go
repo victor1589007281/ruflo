@@ -699,6 +699,19 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		prompt = bbContext + "\n\n---\n\n" + prompt
 	}
 
+	// 1a2. 注入用户反馈 (RefineTeam: 运行后用户反馈, 本轮重做的所有阶段都必须针对性处理)。
+	// 支持角色模板里的 {user_feedback} 占位; 无占位则前置整段强约束。
+	if team != nil {
+		if fb := strings.TrimSpace(team.PendingFeedback); fb != "" {
+			block := "### ⚠️ 用户反馈 (上一轮产出后收到, 本次必须针对性修正, 不得忽略):\n" + fb + "\n"
+			if strings.Contains(prompt, "{user_feedback}") {
+				prompt = strings.ReplaceAll(prompt, "{user_feedback}", block)
+			} else {
+				prompt = block + "\n---\n\n" + prompt
+			}
+		}
+	}
+
 	// 1b. 注入进化经验 (RETRIEVE: 执行前检索相关经验)
 	var injectedExpIDs []string
 	if we.evolution != nil {

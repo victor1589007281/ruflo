@@ -512,6 +512,9 @@
             (t.status === 'stopped' || t.status === 'failed')
               ? h('button', { class: 'btn small', onClick: () => execAction('team', 'resume', t.name) }, '恢复')
               : null,
+            canRefineStatus(t.status)
+              ? h('button', { class: 'btn small', onClick: () => teamRefinePrompt(t.name) }, '✏️ 精修')
+              : null,
             h('button', { class: 'btn small', onClick: () => execAction('team', 'restart', t.name) }, '重启'),
           ].filter(Boolean)),
         ]));
@@ -673,6 +676,9 @@
       (detail.status === 'stopped' || detail.status === 'failed')
         ? h('button', { class: 'btn', onClick: () => execAction('team', 'resume', name) }, '♻ 恢复')
         : null,
+      canRefineStatus(detail.status)
+        ? h('button', { class: 'btn primary', onClick: () => teamRefinePrompt(name) }, '🛠 精修迭代')
+        : null,
       h('button', { class: 'btn', onClick: () => execAction('team', 'restart', name) }, '↻ 重启'),
       h('button', { class: 'btn primary', onClick: () => runTeamDiagnose(name) }, '✦ LLM 诊断'),
       h('button', { class: 'btn ghost', onClick: () => execAction('team', 'delete', name, { confirm: '删除该团队的所有记录?' }) }, '🗑 删除'),
@@ -692,7 +698,7 @@
       statCard('对抗轮次', (detail.adversaryRounds || []).length, '多轮 Eval', 'accent'),
     ]));
 
-    const tabs = ['dag', 'timeline', 'stages', 'agents', 'eval', 'metrics', 'blackboard', 'checkpoints', 'logs', 'report'];
+    const tabs = ['dag', 'timeline', 'stages', 'agents', 'eval', 'metrics', 'blackboard', 'checkpoints', 'logs', 'media', 'report'];
     const tabBar = h('div', { class: 'tabs' });
     for (const t of tabs) {
       tabBar.appendChild(h('div', {
@@ -721,8 +727,23 @@
       blackboard: '黑板',
       checkpoints: '检查点',
       logs: '日志',
+      media: '产出预览',
       report: 'Report',
     })[t] || t;
+  }
+
+  // canRefineStatus 团队处于终态(已产出结果)才可精修。
+  function canRefineStatus(status) {
+    return status === 'completed' || status === 'delivered_with_remediation' ||
+      status === 'failed' || status === 'stopped';
+  }
+
+  // teamRefinePrompt 弹窗收集精修反馈, 触发 team.refine 动作 (带反馈 + 可选起始阶段)。
+  function teamRefinePrompt(name) {
+    const feedback = prompt('精修反馈 — 告诉团队这次产出哪里要改进:');
+    if (!feedback || !feedback.trim()) return;
+    const stage = (prompt('可选: 从哪个阶段起重跑 (留空=整体带反馈重跑; 仅 pipeline 类工作流支持按阶段):') || '').trim();
+    execAction('team', 'refine', name, { payload: { feedback: feedback.trim(), targetStage: stage } });
   }
 
   async function runTeamDiagnose(name) {
@@ -1037,6 +1058,58 @@
     await reload();
   }
 
+  // renderTeamMedia 展示团队产出的媒体文件 (图片/动图/视频/PDF/PPT/HTML) 的内联预览。
+  async function renderTeamMedia(detail, panel) {
+    const name = detail.name;
+    panel.appendChild(h('div', { class: 'muted small mb-8' },
+      '团队产出的媒体文件 (creative-v2 / app / game 等工作流生成的图片/动图/视频/PPT/HTML)。'));
+    let data;
+    try {
+      data = await api('/api/teams/' + encodeURIComponent(name) + '/media');
+    } catch (e) {
+      panel.appendChild(h('div', { class: 'empty' }, '加载产出失败: ' + e.message));
+      return;
+    }
+    const files = (data && data.files) || [];
+    if (!files.length) {
+      panel.appendChild(h('div', { class: 'empty' }, '该团队暂无媒体产出。'));
+      return;
+    }
+    const imgExt = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'];
+    const grid = h('div', { class: 'grid grid-2', style: { gap: '14px' } });
+    for (const f of files) {
+      const ext = (f.ext || '').toLowerCase();
+      let preview;
+      if (imgExt.includes(ext)) {
+        preview = h('img', { src: f.url, loading: 'lazy',
+          style: { maxWidth: '100%', maxHeight: '320px', borderRadius: '8px', background: '#fff' } });
+      } else if (ext === 'mp4') {
+        preview = h('video', { src: f.url, controls: 'controls',
+          style: { maxWidth: '100%', maxHeight: '320px', borderRadius: '8px', background: '#000' } });
+      } else if (ext === 'html' || ext === 'pdf') {
+        // 模型生成的 HTML 用 sandbox(allow-scripts, 非同源) 隔离, 保留动画又不污染 dashboard 源;
+        // PDF 由内部渲染、风险低, 不沙箱以保证查看器正常。
+        preview = h('iframe', {
+          src: f.url,
+          sandbox: ext === 'html' ? 'allow-scripts' : null,
+          loading: 'lazy',
+          style: { width: '100%', height: '320px', border: '1px solid rgba(140,160,220,0.2)', borderRadius: '8px', background: '#fff' },
+        });
+      } else {
+        preview = h('div', { class: 'muted', style: { padding: '24px', textAlign: 'center' } }, '（' + ext + ' 无内联预览, 可下载查看）');
+      }
+      grid.appendChild(h('div', { class: 'card', style: { padding: '12px' } }, [
+        h('div', { class: 'toolbar-row mb-8' }, [
+          h('strong', { class: 'small' }, f.name),
+          h('span', { class: 'muted small' }, '· ' + fmtBytes(f.size)),
+          h('a', { href: f.url, target: '_blank', class: 'btn ghost small', download: f.name }, '⬇ 下载'),
+        ]),
+        preview,
+      ]));
+    }
+    panel.appendChild(grid);
+  }
+
   async function renderTeamTab(tab, detail, panel) {
     panel.innerHTML = '';
     if (tab === 'dag') {
@@ -1053,6 +1126,8 @@
       await renderTeamCheckpoints(detail, panel);
     } else if (tab === 'logs') {
       await renderTeamLogs(detail, panel);
+    } else if (tab === 'media') {
+      await renderTeamMedia(detail, panel);
     } else if (tab === 'report') {
       if (!detail.report) panel.appendChild(h('div', { class: 'empty' }, '没有 REPORT.md'));
       else {

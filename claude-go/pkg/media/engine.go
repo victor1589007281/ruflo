@@ -22,17 +22,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 )
 
+// maxRenderFrames 单段视频/GIF 的帧数上限 (防止超长目标导致渲染失控)。
+const maxRenderFrames = 1800 // 例如 60s@30fps
+
 // Engine 媒体输出引擎
 type Engine struct {
-	OutputDir string
-	Timeout   time.Duration
-	Width     int
-	Height    int
+	OutputDir   string
+	Timeout     time.Duration
+	Width       int
+	Height      int
+	FPS         int // 视频/GIF 帧率 (0=按格式默认: 视频30, GIF15)
+	DurationSec int // 视频/GIF 时长秒 (0=默认: 视频5, GIF4)
 }
 
 // NewEngine 创建媒体引擎
@@ -78,6 +82,8 @@ func (e *Engine) RenderAll(ctx context.Context, htmlContent string, name string,
 			r = e.extractSVG(htmlContent, name)
 		case "mp4":
 			r = e.renderVideo(ctx, htmlPath, name)
+		case "gif":
+			r = e.renderGIF(ctx, htmlPath, name)
 		case "pptx":
 			r = e.renderPPTX(ctx, htmlContent, name)
 		default:
@@ -90,23 +96,21 @@ func (e *Engine) RenderAll(ctx context.Context, htmlContent string, name string,
 	return results
 }
 
-// newBrowserCtx 创建 chromedp 浏览器上下文 (复用 allocator 配置)
+// newBrowserCtx 在共享的常驻 Chrome 分配器上新开一个 tab (见 pool.go), 避免反复冷启动 Chrome。
 func (e *Engine) newBrowserCtx(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.WindowSize(e.Width, e.Height),
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-web-security", true),
-	)
-	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, opts...)
-	taskCtx, taskCancel := chromedp.NewContext(allocCtx)
+	taskCtx, taskCancel := chromedp.NewContext(sharedAllocator())
 	timedCtx, timedCancel := context.WithTimeout(taskCtx, timeout)
-
+	// 把上游 ctx 的取消传播到该 tab (allocator 根于 Background, 不会自动继承请求取消)。
+	go func() {
+		select {
+		case <-ctx.Done():
+			timedCancel()
+		case <-timedCtx.Done():
+		}
+	}()
 	cancel := func() {
 		timedCancel()
 		taskCancel()
-		allocCancel()
 	}
 	return timedCtx, cancel
 }
@@ -214,146 +218,42 @@ func (e *Engine) extractSVG(htmlContent, name string) RenderResult {
 	return RenderResult{Format: "svg", FilePath: outPath, Size: size}
 }
 
-// renderVideo 使用 chromedp 逐帧截图 + FFmpeg 合成 MP4。
+// renderVideo 渲染 HTML(CSS动画) 为 MP4。
 //
-// 修复要点:
-//   1. 不依赖 getAnimations() — 很多 CSS 动画不暴露到该 API
-//   2. 用 CSS 时间控制: animation-play-state: paused + animation-delay 偏移
-//   3. 降低 fps 到 15 减少帧数 (5s@15fps = 75帧, 可接受)
-//   4. 如果没有真正动画, 生成一个带渐入效果的静态视频
+// 采用确定性逐帧 seek (见 video.go captureFrames): 把每个 Web Animation 的 currentTime
+// 精确 seek 到 i/fps 时刻再截图, 回放速度精确、无墙钟漂移。纯 JS/canvas 动画(无 Web
+// Animations) 自动回退到定时截图。fps/时长由 e.FPS / e.DurationSec 控制 (默认 30fps/5s)。
 func (e *Engine) renderVideo(ctx context.Context, htmlPath, name string) RenderResult {
 	outPath := filepath.Join(e.OutputDir, name+".mp4")
 	framesDir := filepath.Join(e.OutputDir, name+"_frames")
-	if err := os.MkdirAll(framesDir, 0755); err != nil {
-		return RenderResult{Format: "mp4", Error: fmt.Sprintf("创建帧目录失败: %v", err)}
-	}
-
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return RenderResult{Format: "mp4", Error: "ffmpeg 未安装, 无法生成视频"}
 	}
 
-	taskCtx, cancel := e.newBrowserCtx(ctx, 5*time.Minute)
-	defer cancel()
+	fps := e.FPS
+	if fps <= 0 {
+		fps = 30
+	}
+	dur := e.DurationSec
+	if dur <= 0 {
+		dur = 5
+	}
 
-	fileURL := "file://" + htmlPath
-	fps := 15
-	durationSec := 5
-	totalFrames := fps * durationSec
-
-	// 导航并检测动画
-	var hasRealAnimation bool
-	err := chromedp.Run(taskCtx,
-		chromedp.Navigate(fileURL),
-		emulation.SetDeviceMetricsOverride(int64(e.Width), int64(e.Height), 1.0, false),
-		chromedp.WaitReady("body"),
-		chromedp.Sleep(500*time.Millisecond),
-		chromedp.Evaluate(`(function() {
-			var anims = document.getAnimations ? document.getAnimations() : [];
-			if (anims.length > 0) return true;
-			var styles = document.querySelectorAll('style');
-			for (var i = 0; i < styles.length; i++) {
-				if (styles[i].textContent.indexOf('@keyframes') >= 0) return true;
-			}
-			var allEls = document.querySelectorAll('*');
-			for (var j = 0; j < allEls.length; j++) {
-				var cs = getComputedStyle(allEls[j]);
-				if (cs.animationName && cs.animationName !== 'none') return true;
-				if (cs.transition && cs.transition !== 'all 0s ease 0s' && cs.transition !== 'none') return true;
-			}
-			return false;
-		})()`, &hasRealAnimation),
-	)
+	captured, err := e.captureFrames(ctx, htmlPath, framesDir, fps, dur)
 	if err != nil {
-		return RenderResult{Format: "mp4", Error: fmt.Sprintf("导航失败: %v", err)}
+		os.RemoveAll(framesDir)
+		return RenderResult{Format: "mp4", Error: err.Error()}
 	}
+	log.Printf("[media] 视频: 确定性捕获 %d 帧 (%ds@%dfps)", captured, dur, fps)
 
-	log.Printf("[media] 视频: hasAnimation=%v, %d帧 (%ds@%dfps)", hasRealAnimation, totalFrames, durationSec, fps)
-
-	capturedFrames := 0
-	for i := 0; i < totalFrames; i++ {
-		framePath := filepath.Join(framesDir, fmt.Sprintf("frame_%06d.png", i))
-		progress := float64(i) / float64(totalFrames)
-
-		var jsCode string
-		if hasRealAnimation {
-			// 对于有 CSS 动画的页面: 让动画自然播放, 用定时截图
-			jsCode = "" // 不注入 JS, 让动画自然运行
-		} else {
-			// 对于静态页面: 注入渐入 + 平移效果, 制造视觉动感
-			opacity := progress * 1.2
-			if opacity > 1 {
-				opacity = 1
-			}
-			translateY := (1 - progress) * 20
-			jsCode = fmt.Sprintf(`(function() {
-				document.body.style.opacity = '%f';
-				document.body.style.transform = 'translateY(%fpx)';
-				document.body.style.transition = 'none';
-			})()`, opacity, translateY)
-		}
-
-		actions := []chromedp.Action{}
-		if jsCode != "" {
-			actions = append(actions, chromedp.Evaluate(jsCode, nil))
-		}
-
-		if hasRealAnimation {
-			// 每帧间隔 = 1/fps 秒, 让动画自然播放
-			actions = append(actions, chromedp.Sleep(time.Duration(1000/fps)*time.Millisecond))
-		} else {
-			actions = append(actions, chromedp.Sleep(30*time.Millisecond))
-		}
-
-		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
-			buf, err := page.CaptureScreenshot().
-				WithFormat(page.CaptureScreenshotFormatPng).
-				Do(ctx)
-			if err != nil {
-				return err
-			}
-			return os.WriteFile(framePath, buf, 0644)
-		}))
-
-		if err := chromedp.Run(taskCtx, actions...); err != nil {
-			log.Printf("[media] 帧 %d 截图失败: %v", i, err)
-			continue
-		}
-		capturedFrames++
-
-		if i%15 == 0 {
-			log.Printf("[media] 帧进度: %d/%d (%.0f%%)", i, totalFrames, progress*100)
-		}
+	if err := encodeFramesToMP4(ctx, framesDir, outPath, fps); err != nil {
+		os.RemoveAll(framesDir)
+		return RenderResult{Format: "mp4", Error: err.Error()}
 	}
-
-	if capturedFrames == 0 {
-		return RenderResult{Format: "mp4", Error: "未能捕获任何帧"}
-	}
-
-	log.Printf("[media] 帧捕获完成: %d/%d 帧", capturedFrames, totalFrames)
-
-	// FFmpeg 编码
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-y",
-		"-framerate", fmt.Sprintf("%d", fps),
-		"-i", filepath.Join(framesDir, "frame_%06d.png"),
-		"-c:v", "libx264",
-		"-pix_fmt", "yuv420p",
-		"-preset", "fast",
-		"-crf", "25",
-		"-movflags", "+faststart",
-		outPath,
-	)
-	ffmpegOut, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("[media] FFmpeg stderr: %s", string(ffmpegOut))
-		return RenderResult{Format: "mp4", Error: fmt.Sprintf("FFmpeg 编码失败: %v", err)}
-	}
-
-	// 清理帧文件
 	os.RemoveAll(framesDir)
 
 	size := fileSize(outPath)
-	log.Printf("[media] 渲染视频: %s (%.1f KB, %ds)", outPath, float64(size)/1024, durationSec)
+	log.Printf("[media] 渲染视频: %s (%.1f KB, %ds)", outPath, float64(size)/1024, dur)
 	return RenderResult{Format: "mp4", FilePath: outPath, Size: size}
 }
 

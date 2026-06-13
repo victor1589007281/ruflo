@@ -18,7 +18,7 @@ import (
 func mermaidHTML(code string) string {
 	cj, _ := json.Marshal(code)
 	return `<!doctype html><html><head><meta charset="utf-8">
-<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+` + mermaidScriptTag() + `
 <style>html,body{margin:0;padding:0;background:#ffffff}#out{display:inline-block;padding:18px;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif}</style>
 </head><body>
 <div id="out"></div>
@@ -88,6 +88,7 @@ func withBrowser(ctx context.Context, chromePath string, fn func(allocCtx contex
 		chromedp.NoSandbox,
 		chromedp.Flag("headless", true),
 		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("allow-file-access-from-files", true), // 允许 file:// HTML 加载本地内嵌 mermaid.min.js
 	)
 	if chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(chromePath))

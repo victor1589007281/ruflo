@@ -829,7 +829,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		}
 		hint = fmt.Sprintf("已排队 swarm.simulate: mode=%s objective=%q. 主进程可调用 swarm_intel.Engine.Simulate(ctx, cfg) 消费。",
 			mode, obj)
-	case "team.stop", "team.restart", "team.delete", "team.resume":
+	case "team.stop", "team.restart", "team.delete", "team.resume", "team.refine", "team.fork":
 		if s.cfg.TeamAction != nil {
 			if err := s.cfg.TeamAction(action, target, payload); err != nil {
 				hint = fmt.Sprintf("操作失败: %v", err)

@@ -89,6 +89,16 @@ var deleteKW = []string{
 	"删除研究团队", "删除开发团队",
 }
 
+// refineKW 精修(运行后带反馈继续优化)的强措辞。仅在会话存在"已结束团队"时才路由 (由调用方把关),
+// 避免劫持普通聊天。
+var refineKW = []string{
+	"继续优化", "再优化", "接着优化", "迭代优化",
+	"按我说的改", "按反馈改", "按这个改", "照我说的改",
+	"重做", "重写", "再改一版", "改一版", "再完善", "继续完善",
+	"不满意", "不太满意", "不够好", "还要改", "再调整一下",
+	"精修", "优化团队产出", "优化结果", "改进结果",
+}
+
 var wfDetect = map[string][]string{
 	"development": {"开发", "实现", "编码", "构建", "写代码", "搭建", "编程", "重构"},
 	"research":    {"调研", "研究", "调查", "探索", "对比分析", "了解", "评估"},
@@ -192,6 +202,18 @@ func (ir *IntentRecognizer) RecognizeSafeOnly(_ context.Context, text string) *T
 		}
 	}
 
+	return nil
+}
+
+// RecognizeRefine 识别"运行后带反馈继续优化"意图。仅做强措辞关键词匹配; 返回非 nil 时
+// Objective 为完整反馈文本。调用方必须在会话存在已结束团队时才实际路由 (避免劫持普通聊天)。
+func (ir *IntentRecognizer) RecognizeRefine(_ context.Context, text string) *TeamIntent {
+	lower := strings.ToLower(text)
+	for _, kw := range refineKW {
+		if strings.Contains(lower, kw) {
+			return &TeamIntent{Action: "refine", Objective: strings.TrimSpace(text), Confidence: 0.75}
+		}
+	}
 	return nil
 }
 

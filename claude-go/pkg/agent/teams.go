@@ -180,6 +180,8 @@ const (
 	TeamStatusDeliveredWithRemediation TeamStatus = "delivered_with_remediation"
 	TeamStatusFailed                   TeamStatus = "failed"
 	TeamStatusStopped                  TeamStatus = "stopped"
+	// TeamStatusRefining 标记团队正带着运行后反馈进行精修迭代 (completed → refining → running)。
+	TeamStatusRefining TeamStatus = "refining"
 )
 
 // AgentStatus Agent 状态
@@ -358,6 +360,11 @@ type ProductionTeam struct {
 	Cwd        string              `json:"cwd,omitempty"`      // 工作目录 (用于编译验证和文件清单)
 	Language   string              `json:"language,omitempty"` // 编程语言 ("go","cpp","rust","python"), 空=""go"
 
+	// 持续优化 (RefineTeam): 运行后用户反馈驱动的精修迭代
+	RefineHistory   []RefineEntry `json:"refineHistory,omitempty"`   // 历次精修留痕 (可追溯)
+	PendingFeedback string        `json:"pendingFeedback,omitempty"` // 本轮待处理的用户反馈 (注入重跑阶段, 完成后清空)
+	FeedbackTarget  string        `json:"feedbackTarget,omitempty"`  // 本轮精修的起始阶段 (空=整体重跑)
+
 	Blackboard *Blackboard `json:"-"` // 共享黑板 (不序列化, 独立持久化)
 	mu         sync.Mutex
 	cancel     context.CancelFunc
@@ -414,6 +421,15 @@ type StageResult struct {
 	V2TaskID  string     `json:"v2TaskId,omitempty"` // 关联的 V2 Task ID
 	StartedAt time.Time  `json:"startedAt,omitempty"`
 	Duration  string     `json:"duration,omitempty"`
+}
+
+// RefineEntry 一次精修迭代的记录 (供审计与 Evolution 经验闭环)。
+type RefineEntry struct {
+	At          time.Time `json:"at"`
+	Feedback    string    `json:"feedback"`
+	TargetStage string    `json:"targetStage,omitempty"`
+	FromStatus  string    `json:"fromStatus,omitempty"`
+	Accepted    *bool     `json:"accepted,omitempty"` // 精修运行是否成功 (供进化学习区分有效/无效反馈)
 }
 
 // MailMessage 邮箱消息
@@ -701,11 +717,18 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		}
 	}
 
+	// 内容质量门禁: 写作类(pipeline)工作流的"评审→未达标→自动修订"环 (见 content_gate.go)。
+	// 仅对白名单工作流生效; 跳过用户驱动的精修运行 (PendingFeedback 非空), 避免双重注入。
+	if contentQualityGated(team.Workflow) && strings.TrimSpace(team.PendingFeedback) == "" {
+		results = ptm.tryContentQualityGate(ctx, team, executor, wf, results)
+	}
+
 	team.mu.Lock()
 	team.Status = deliveryStatus
 	team.FinishedAt = time.Now()
 	team.Stages = results
 	team.mu.Unlock()
+	ptm.finishRefine(team, true) // 若本轮是精修: 清空反馈并留痕"已采纳", 喂 Evolution 经验闭环
 	team.persist()
 	ptm.runTaskCompletedHooks(results)
 
@@ -850,14 +873,16 @@ func isSuccessfulTeamStatus(status TeamStatus) bool {
 // workflowProducesCode 判定工作流是否产出可编译代码 (决定是否跑编译/测试门禁)。
 // 写作/调研/分析类工作流产出文本, 不应跑 go build 门禁。
 func workflowProducesCode(workflow string) bool {
+	// 改为白名单 (原黑名单会把新增/分析类工作流误判为代码类, 触发无意义的
+	// go build/test 门禁 + coder 修复死循环, 单团队曾因此烧掉数百万 token)。
+	// 只有确实产出可编译代码的工作流才跑编译/测试门禁。
 	switch strings.ToLower(strings.TrimSpace(workflow)) {
-	case "techblog", "creative", "creative-v2", "novel-v2", "novel-v3",
-		"research", "debate", "swarm", "finance", "predict",
-		"parenting", "hiring", "code-review":
-		return false
-	default:
-		// development / app / game / trading-v2 / ml-training / testing 等代码类
+	case "development", "app", "game", "ml-training", "testing", "adversarial-dev":
 		return true
+	default:
+		// trading-v2 / sector-scan / industry-map / finance / techblog /
+		// research / creative / novel 等分析或写作类工作流一律不跑代码门禁。
+		return false
 	}
 }
 
@@ -1210,6 +1235,7 @@ func (ptm *ProductionTeamManager) failTeam(team *ProductionTeam, reason string) 
 	team.Error = reason
 	startedAt := team.StartedAt
 	team.mu.Unlock()
+	ptm.finishRefine(team, false) // 若本轮是精修: 清空反馈并留痕"未采纳"
 	team.persist()
 
 	// 失败路径也要补齐整团队级指标, 否则 dashboard 的成败对比/故障分析会缺数据。
@@ -1347,6 +1373,221 @@ func (ptm *ProductionTeamManager) ResumeTeam(name string) error {
 		ptm.executeWorkflow(ctx, team, true)
 	}()
 	return nil
+}
+
+// RefineTeam 让一个已产出结果的团队带着"运行后反馈"继续迭代优化。
+//
+// 这是"团队跑完后无法持续优化"痛点的核心入口: 与 RunTeam(需新目标)/ResumeTeam(仅失败恢复、
+// 不收反馈) 不同, RefineTeam 接受已完成(completed/delivered)、失败或停止的团队 + 一段反馈,
+// 复用检查点机制做"增量重入":
+//   - targetStage 为空 → 整体带反馈重跑 (清空检查点)。
+//   - targetStage 指定 → 仅失效该阶段及其后续, 之前阶段从检查点复用 (省 token, 不从头再生成)。
+//
+// 反馈通过 team.PendingFeedback 注入本轮所有重跑阶段的 prompt (见 workflow.go executeStage 的
+// {user_feedback} 注入)。完成后清空反馈并把"反馈→是否采纳"留痕 (供 Evolution 经验闭环)。
+func (ptm *ProductionTeamManager) RefineTeam(name, feedback, targetStage string) error {
+	ptm.mu.RLock()
+	team, ok := ptm.teams[name]
+	ptm.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("团队 %q 不存在", name)
+	}
+	feedback = strings.TrimSpace(feedback)
+	if feedback == "" {
+		return fmt.Errorf("精修反馈不能为空")
+	}
+
+	team.mu.Lock()
+	switch team.Status {
+	case TeamStatusRunning, TeamStatusRefining:
+		team.mu.Unlock()
+		return fmt.Errorf("团队 %q 正在执行中", name)
+	case TeamStatusCreated:
+		team.mu.Unlock()
+		return fmt.Errorf("团队 %q 尚未运行过, 请先 /team run <名称> <目标>", name)
+	}
+	fromStatus := string(team.Status)
+	team.mu.Unlock()
+
+	if !ptm.tryStartTeam(name) {
+		return fmt.Errorf("团队 %q 正在启动中，请稍后再试", name)
+	}
+
+	// 计算精修范围: 决定哪些检查点失效 (即哪些阶段重跑)。
+	wf := GetWorkflow(team.Workflow)
+	var invalidated []string
+	// 按阶段增量精修仅对 pipeline 模式可靠: 对抗(adversarial*)/编排(orchestrated) 模式的检查点
+	// 键带轮次后缀(如 implement-round3)或图结构, 按声明阶段名失效会"静默失配"。非 pipeline 一律
+	// 转整体重跑 (清空检查点), 保证反馈一定生效, 只是不增量复用。
+	if targetStage != "" && wf != nil && !strings.EqualFold(wf.Mode, "pipeline") {
+		ptm.notify(team.ChatID, fmt.Sprintf("ℹ️ 工作流 %q (%s 模式) 不支持按阶段增量精修, 已转为整体带反馈重跑", team.Workflow, wf.Mode))
+		targetStage = ""
+	}
+	if targetStage != "" {
+		invalidated = stagesFromTarget(wf, targetStage)
+		if len(invalidated) == 0 {
+			ptm.clearStarting(name)
+			return fmt.Errorf("未找到阶段 %q (可用: %s)", targetStage, strings.Join(stageNamesOf(wf), ", "))
+		}
+		_ = InvalidateCheckpoints(team.dataDir, invalidated)
+	} else {
+		// 整体重跑: 清空检查点
+		if team.dataDir != "" {
+			os.Remove(filepath.Join(team.dataDir, "checkpoints.json"))
+		}
+	}
+
+	team.mu.Lock()
+	if team.Status == TeamStatusRunning {
+		team.mu.Unlock()
+		ptm.clearStarting(name)
+		return fmt.Errorf("团队 %q 正在执行中", name)
+	}
+	team.PendingFeedback = feedback
+	team.FeedbackTarget = targetStage
+	team.RefineHistory = append(team.RefineHistory, RefineEntry{
+		At: time.Now(), Feedback: feedback, TargetStage: targetStage, FromStatus: fromStatus,
+	})
+	objective := team.Objective
+	team.Status = TeamStatusRunning
+	team.StartedAt = time.Now()
+	team.FinishedAt = time.Time{}
+	team.Error = ""
+	ctx, cancel := context.WithCancel(context.Background())
+	team.cancel = cancel
+	team.doneCh = make(chan struct{})
+	team.mu.Unlock()
+
+	team.Blackboard.Write("objective", objective, "system", "context")
+	team.Blackboard.Write("user-feedback", feedback, "user", "context")
+	team.persist()
+
+	ptm.notify(team.ChatID, fmt.Sprintf("🛠️ 团队 **%s** 进入精修迭代\n反馈: %s\n范围: %s",
+		name, feedback, refineScopeLabel(targetStage, invalidated)))
+
+	go func() {
+		defer ptm.clearStarting(name)
+		defer func() { close(team.doneCh) }()
+		ptm.executeWorkflow(ctx, team, true) // isResume=true: 保留未失效阶段的检查点, 只重跑目标及后续
+	}()
+	return nil
+}
+
+// finishRefine 在团队本轮执行结束(成功/失败)时收尾精修: 清空待处理反馈、给本次 RefineEntry
+// 标注是否采纳, 并把"已采纳的反馈"写入高权重记忆形成经验闭环 (供后续团队首跑规避同类问题)。
+// 若本轮不是精修 (PendingFeedback 为空) 则直接返回。
+func (ptm *ProductionTeamManager) finishRefine(team *ProductionTeam, accepted bool) {
+	team.mu.Lock()
+	fb := team.PendingFeedback
+	if fb == "" {
+		team.mu.Unlock()
+		return
+	}
+	team.PendingFeedback = ""
+	team.FeedbackTarget = ""
+	if n := len(team.RefineHistory); n > 0 {
+		a := accepted
+		team.RefineHistory[n-1].Accepted = &a
+	}
+	workflow, objective := team.Workflow, team.Objective
+	team.mu.Unlock()
+
+	if accepted && ptm.memWriter != nil {
+		ptm.memWriter.AddTeamMemory(team.Name, workflow, objective,
+			fmt.Sprintf("[精修反馈·已采纳] 用户要求: %s", truncateResult(fb, 300)))
+	}
+}
+
+// LatestFinishedTeam 返回某会话中最近一个"已结束"(completed/delivered/failed/stopped) 的团队,
+// 供"完成态消息→精修"路由使用。无则返回 nil。
+func (ptm *ProductionTeamManager) LatestFinishedTeam(chatID string) *ProductionTeam {
+	ptm.mu.RLock()
+	defer ptm.mu.RUnlock()
+	var latest *ProductionTeam
+	for _, t := range ptm.teams {
+		if chatID != "" && t.ChatID != chatID {
+			continue
+		}
+		switch t.Status {
+		case TeamStatusCompleted, TeamStatusDeliveredWithRemediation, TeamStatusFailed, TeamStatusStopped:
+		default:
+			continue
+		}
+		if latest == nil || t.FinishedAt.After(latest.FinishedAt) {
+			latest = t
+		}
+	}
+	return latest
+}
+
+// ForkTeam 把一个已运行过的团队复制为新团队 (含产出/检查点), 便于保留原版的前提下迭代精修。
+func (ptm *ProductionTeamManager) ForkTeam(src, dst string) (*ProductionTeam, error) {
+	source := ptm.GetTeam(src)
+	if source == nil {
+		return nil, fmt.Errorf("源团队 %q 不存在", src)
+	}
+	source.mu.Lock()
+	workflow, objective, chatID, lang := source.Workflow, source.Objective, source.ChatID, source.Language
+	srcStages := append([]StageResult(nil), source.Stages...)
+	srcStatus := source.Status
+	srcDataDir := source.dataDir
+	source.mu.Unlock()
+
+	nt, err := ptm.CreateTeam(dst, workflow, objective, chatID)
+	if err != nil {
+		return nil, err
+	}
+	if lang != "" {
+		nt.SetLanguage(lang)
+	}
+	// 复制检查点, 使 fork 能从源团队的阶段产出继续增量精修。
+	if srcDataDir != "" && nt.dataDir != "" {
+		if data, e := os.ReadFile(filepath.Join(srcDataDir, "checkpoints.json")); e == nil {
+			_ = os.WriteFile(filepath.Join(nt.dataDir, "checkpoints.json"), data, 0644)
+		}
+	}
+	nt.mu.Lock()
+	nt.Stages = srcStages
+	if isSuccessfulTeamStatus(srcStatus) {
+		nt.Status = srcStatus // 标为已完成副本, 可直接 RefineTeam
+	}
+	nt.mu.Unlock()
+	nt.persist()
+	return nt, nil
+}
+
+// stagesFromTarget 返回从 target 阶段(含)起、按声明顺序及其后的所有阶段名 (用于增量失效)。
+func stagesFromTarget(wf *WorkflowDef, target string) []string {
+	idx := -1
+	for i, s := range wf.Stages {
+		if s.Name == target || stripRoundSuffix(s.Name) == target {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	var out []string
+	for i := idx; i < len(wf.Stages); i++ {
+		out = append(out, wf.Stages[i].Name)
+	}
+	return out
+}
+
+func stageNamesOf(wf *WorkflowDef) []string {
+	var out []string
+	for _, s := range wf.Stages {
+		out = append(out, s.Name)
+	}
+	return out
+}
+
+func refineScopeLabel(target string, invalidated []string) string {
+	if target == "" {
+		return "整体带反馈重跑"
+	}
+	return fmt.Sprintf("从阶段 `%s` 起重跑 (%d 个阶段, 之前阶段复用检查点)", target, len(invalidated))
 }
 
 // StopFirstRunning 停止第一个正在运行的团队 (意图识别用)。

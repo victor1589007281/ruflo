@@ -905,6 +905,32 @@ func (b *Bot) DashboardTeamAction(action, teamName string, payload map[string]in
 		return b.teamMgr.RunTeam(teamName, objective)
 	case "resume":
 		return b.teamMgr.ResumeTeam(teamName)
+	case "refine":
+		feedback, targetStage := "", ""
+		if payload != nil {
+			if f, ok := payload["feedback"].(string); ok {
+				feedback = f
+			}
+			if ts, ok := payload["targetStage"].(string); ok {
+				targetStage = ts
+			}
+		}
+		if strings.TrimSpace(feedback) == "" {
+			return fmt.Errorf("refine 操作需要 feedback 参数")
+		}
+		return b.teamMgr.RefineTeam(teamName, feedback, targetStage)
+	case "fork":
+		newName := ""
+		if payload != nil {
+			if n, ok := payload["newName"].(string); ok {
+				newName = n
+			}
+		}
+		if strings.TrimSpace(newName) == "" {
+			return fmt.Errorf("fork 操作需要 newName 参数")
+		}
+		_, err := b.teamMgr.ForkTeam(teamName, newName)
+		return err
 	default:
 		return fmt.Errorf("未知操作: %s", action)
 	}
@@ -1143,6 +1169,17 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 	if intent := b.intentRec.RecognizeSafeOnly(ctx, userText); intent != nil {
 		go b.handleTeamIntent(chatID, messageID, intent)
 		return nil
+	}
+
+	// 完成态消息→精修: 仅当会话中存在"已结束团队"时, 强精修措辞才路由到 RefineTeam。
+	// 这样既实现"团队跑完后直接说哪里要改就继续优化", 又不会劫持没有团队上下文的普通聊天。
+	if b.teamMgr != nil {
+		if rIntent := b.intentRec.RecognizeRefine(ctx, userText); rIntent != nil {
+			if latest := b.teamMgr.LatestFinishedTeam(chatID); latest != nil {
+				go b.handleTeamRefineIntent(chatID, messageID, latest.Name, rIntent.Objective)
+				return nil
+			}
+		}
 	}
 
 	// Wiki 自然语言命令检测 + URL 自动检测
@@ -2344,6 +2381,40 @@ func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text str
 		}
 		b.sendTextReply(ctx, messageID, fmt.Sprintf("♻️ 团队 **%s** 已从检查点恢复执行", name))
 
+	case "refine":
+		if len(parts) < 4 {
+			b.sendTextReply(ctx, messageID, "用法: /team refine <名称> <反馈> [--stage 阶段名]\n说明: 让已完成/失败的团队带反馈继续优化; --stage 指定从某阶段起增量重跑(省 token)。")
+			return
+		}
+		name := parts[2]
+		stage := ""
+		var fbParts []string
+		for i := 3; i < len(parts); i++ {
+			if parts[i] == "--stage" && i+1 < len(parts) {
+				stage = parts[i+1]
+				i++
+			} else {
+				fbParts = append(fbParts, parts[i])
+			}
+		}
+		if err := b.teamMgr.RefineTeam(name, strings.Join(fbParts, " "), stage); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("精修失败: %v", err))
+			return
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("🛠️ 团队 **%s** 已带反馈进入精修迭代, 完成后通知。", name))
+
+	case "fork":
+		if len(parts) < 4 {
+			b.sendTextReply(ctx, messageID, "用法: /team fork <源团队> <新团队名>")
+			return
+		}
+		nt, err := b.teamMgr.ForkTeam(parts[2], parts[3])
+		if err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("fork 失败: %v", err))
+			return
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("🍴 已从 **%s** 复制出团队 **%s** (状态: %s)\n用 `/team refine %s <反馈>` 继续迭代", parts[2], nt.Name, nt.Status, nt.Name))
+
 	case "status":
 		if len(parts) >= 3 {
 			team := b.teamMgr.GetTeam(parts[2])
@@ -2438,6 +2509,18 @@ func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text str
 	default:
 		b.sendTextReply(ctx, messageID, "未知子命令。用法: /team [create|run|status|stop|list|delete|msg|workflows]")
 	}
+}
+
+// handleTeamRefineIntent 把"完成态消息"作为反馈, 对最近结束的团队发起精修迭代。
+func (b *Bot) handleTeamRefineIntent(chatID, messageID, teamName, feedback string) {
+	ctx := context.Background()
+	if err := b.teamMgr.RefineTeam(teamName, feedback, ""); err != nil {
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("精修失败: %v", err))
+		return
+	}
+	b.sendTextReply(ctx, messageID, fmt.Sprintf(
+		"🛠️ 已把你的反馈作为团队 **%s** 的精修目标, 带反馈重新迭代中, 完成后通知。\n"+
+			"(如需指定从某阶段起重跑, 用 `/team refine %s <反馈> --stage <阶段>`)", teamName, teamName))
 }
 
 // handleTeamIntent 处理意图识别结果 — 中文自然语言自动驱动团队操作。

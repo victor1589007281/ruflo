@@ -363,6 +363,269 @@ func (t *GenerateSpeechTool) Call(ctx context.Context, input json.RawMessage, tc
 	return &tool.ToolResult{Content: fmt.Sprintf("语音已合成: %s (%s%d bytes, 引擎: %s)", outPath, dur, st.Size(), usedDesc)}, nil
 }
 
+// ============================================================================
+// GenerateGIF: HTML(CSS动画) → 动图 GIF (确定性逐帧 + 调色板编码)
+// ============================================================================
+
+const GenerateGIFToolName = "GenerateGIF"
+
+type generateGIFInput struct {
+	HTML        string `json:"html"`
+	OutputPath  string `json:"output_path"`
+	Width       int    `json:"width,omitempty"`
+	Height      int    `json:"height,omitempty"`
+	FPS         int    `json:"fps,omitempty"`
+	DurationSec int    `json:"duration_sec,omitempty"`
+}
+
+type GenerateGIFTool struct{}
+
+func NewGenerateGIFTool() *GenerateGIFTool { return &GenerateGIFTool{} }
+
+func (t *GenerateGIFTool) Name() string { return GenerateGIFToolName }
+
+func (t *GenerateGIFTool) Description() string {
+	return `Render an animated GIF from an HTML document that contains CSS @keyframes animations. ` +
+		`Write HTML/CSS where the motion is expressed via CSS animations (the renderer deterministically seeks each frame, so playback speed is exact). ` +
+		`Provide "html" and "output_path" (.gif). Optional: width, height, fps (default 15), duration_sec (default 4).`
+}
+
+func (t *GenerateGIFTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"html": {"type": "string", "description": "Complete HTML document with CSS @keyframes animation."},
+			"output_path": {"type": "string", "description": "Output .gif file path."},
+			"width": {"type": "number", "description": "Viewport width px (default 800)."},
+			"height": {"type": "number", "description": "Viewport height px (default 600)."},
+			"fps": {"type": "number", "description": "Frames per second (default 15)."},
+			"duration_sec": {"type": "number", "description": "Animation length in seconds (default 4)."}
+		},
+		"required": ["html", "output_path"]
+	}`)
+}
+
+func (t *GenerateGIFTool) IsReadOnly(json.RawMessage) bool        { return false }
+func (t *GenerateGIFTool) IsConcurrencySafe(json.RawMessage) bool { return false }
+func (t *GenerateGIFTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
+	return denyInPlanMode(tctx, "GenerateGIF")
+}
+
+func (t *GenerateGIFTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
+	var in generateGIFInput
+	if err := json.Unmarshal(input, &in); err != nil {
+		return &tool.ToolResult{Content: "输入解析失败: " + err.Error(), IsError: true}, nil
+	}
+	if strings.TrimSpace(in.HTML) == "" {
+		return &tool.ToolResult{Content: "html 不能为空", IsError: true}, nil
+	}
+	outPath, err := resolveOutPath(in.OutputPath, tctx.Cwd)
+	if err != nil {
+		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
+	}
+	eng := media.NewEngine(filepath.Dir(outPath))
+	eng.Width = pick(in.Width, 800)
+	eng.Height = pick(in.Height, 600)
+	eng.FPS = in.FPS
+	eng.DurationSec = in.DurationSec
+	name := strings.TrimSuffix(filepath.Base(outPath), filepath.Ext(outPath))
+	r := eng.RenderHTMLString(ctx, in.HTML, name, "gif")
+	if r.Error != "" {
+		return &tool.ToolResult{Content: "GIF 渲染失败: " + r.Error, IsError: true}, nil
+	}
+	rendered := filepath.Join(filepath.Dir(outPath), name+".gif")
+	if rendered != outPath {
+		_ = os.Rename(rendered, outPath)
+	}
+	st, err := os.Stat(outPath)
+	if err != nil || st.Size() == 0 {
+		return &tool.ToolResult{Content: "渲染后未生成有效 GIF: " + outPath, IsError: true}, nil
+	}
+	return &tool.ToolResult{Content: fmt.Sprintf("GIF 已生成: %s (%d bytes)", outPath, st.Size())}, nil
+}
+
+// ============================================================================
+// GeneratePPTX: 结构化 slides → 可编辑 PPTX (或 HTML → 高保真整页截图)
+// ============================================================================
+
+const GeneratePPTXToolName = "GeneratePPTX"
+
+type generatePPTXInput struct {
+	Slides []media.EditableSlide `json:"slides,omitempty"` // 结构化(可编辑)模式
+	HTML   string                `json:"html,omitempty"`   // 高保真截图模式
+	Title  string                `json:"title,omitempty"`
+	Output string                `json:"output_path"`
+}
+
+type GeneratePPTXTool struct{}
+
+func NewGeneratePPTXTool() *GeneratePPTXTool { return &GeneratePPTXTool{} }
+
+func (t *GeneratePPTXTool) Name() string { return GeneratePPTXToolName }
+
+func (t *GeneratePPTXTool) Description() string {
+	return `Generate a PowerPoint .pptx file. Two modes: ` +
+		`(1) EDITABLE — provide "slides": [{title, bullets:[...], subtitle, notes}], producing real editable text boxes you can edit in PowerPoint/WPS/Keynote (preferred for decks the user will further edit). ` +
+		`(2) HIGH-FIDELITY — provide "html" with multiple <section class="slide">...</section>, each rendered as a full-page screenshot (pixel-perfect but not editable). ` +
+		`Provide exactly one of "slides" or "html", plus "output_path" (.pptx).`
+}
+
+func (t *GeneratePPTXTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"slides": {"type": "array", "description": "Editable mode: array of {title, bullets:[string], subtitle?, notes?}.",
+				"items": {"type": "object", "properties": {
+					"title": {"type": "string"},
+					"bullets": {"type": "array", "items": {"type": "string"}},
+					"subtitle": {"type": "string"},
+					"notes": {"type": "string"}
+				}}},
+			"html": {"type": "string", "description": "High-fidelity mode: HTML with multiple <section class=\"slide\">."},
+			"title": {"type": "string", "description": "Deck title (optional)."},
+			"output_path": {"type": "string", "description": "Output .pptx file path."}
+		},
+		"required": ["output_path"]
+	}`)
+}
+
+func (t *GeneratePPTXTool) IsReadOnly(json.RawMessage) bool        { return false }
+func (t *GeneratePPTXTool) IsConcurrencySafe(json.RawMessage) bool { return false }
+func (t *GeneratePPTXTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
+	return denyInPlanMode(tctx, "GeneratePPTX")
+}
+
+func (t *GeneratePPTXTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
+	var in generatePPTXInput
+	if err := json.Unmarshal(input, &in); err != nil {
+		return &tool.ToolResult{Content: "输入解析失败: " + err.Error(), IsError: true}, nil
+	}
+	if (len(in.Slides) == 0) == (strings.TrimSpace(in.HTML) == "") {
+		return &tool.ToolResult{Content: "必须且只能提供 slides(可编辑) 或 html(高保真) 之一", IsError: true}, nil
+	}
+	outPath, err := resolveOutPath(in.Output, tctx.Cwd)
+	if err != nil {
+		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
+	}
+
+	if len(in.Slides) > 0 {
+		// 可编辑模式
+		if err := media.BuildEditablePPTX(outPath, media.EditableDeck{Title: in.Title, Slides: in.Slides}); err != nil {
+			return &tool.ToolResult{Content: "可编辑 PPTX 生成失败: " + err.Error(), IsError: true}, nil
+		}
+		st, _ := os.Stat(outPath)
+		return &tool.ToolResult{Content: fmt.Sprintf("可编辑 PPTX 已生成: %s (%d 页, %d bytes, 文本可在 PowerPoint 中直接编辑)", outPath, len(in.Slides), fileSizeOf(st))}, nil
+	}
+
+	// 高保真截图模式
+	eng := media.NewEngine(filepath.Dir(outPath))
+	name := strings.TrimSuffix(filepath.Base(outPath), filepath.Ext(outPath))
+	r := eng.RenderHTMLString(ctx, in.HTML, name, "pptx")
+	if r.Error != "" {
+		return &tool.ToolResult{Content: "高保真 PPTX 渲染失败: " + r.Error, IsError: true}, nil
+	}
+	rendered := filepath.Join(filepath.Dir(outPath), name+".pptx")
+	if rendered != outPath {
+		_ = os.Rename(rendered, outPath)
+	}
+	st, err := os.Stat(outPath)
+	if err != nil || st.Size() == 0 {
+		return &tool.ToolResult{Content: "渲染后未生成有效 PPTX: " + outPath, IsError: true}, nil
+	}
+	return &tool.ToolResult{Content: fmt.Sprintf("高保真 PPTX 已生成: %s (%d bytes, 每页为整页图、不可编辑)", outPath, st.Size())}, nil
+}
+
+// ============================================================================
+// GenerateChart: ECharts option(JSON) → 图表 PNG
+// ============================================================================
+
+const GenerateChartToolName = "GenerateChart"
+
+type generateChartInput struct {
+	Option     json.RawMessage `json:"option"`
+	OutputPath string          `json:"output_path"`
+	Width      int             `json:"width,omitempty"`
+	Height     int             `json:"height,omitempty"`
+}
+
+type GenerateChartTool struct{}
+
+func NewGenerateChartTool() *GenerateChartTool { return &GenerateChartTool{} }
+
+func (t *GenerateChartTool) Name() string { return GenerateChartToolName }
+
+func (t *GenerateChartTool) Description() string {
+	return `Render a data chart to PNG using Apache ECharts. ` +
+		`Provide "option": a valid ECharts option object (bar/line/pie/scatter/candlestick/radar/sankey/map/...), plus "output_path" (.png). ` +
+		`Use this for data visualizations; for flowcharts/diagrams prefer mermaid. Optional: width (default 1000), height (default 600).`
+}
+
+func (t *GenerateChartTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"option": {"type": "object", "description": "ECharts option object (the argument to setOption)."},
+			"output_path": {"type": "string", "description": "Output PNG file path."},
+			"width": {"type": "number", "description": "Chart width px (default 1000)."},
+			"height": {"type": "number", "description": "Chart height px (default 600)."}
+		},
+		"required": ["option", "output_path"]
+	}`)
+}
+
+func (t *GenerateChartTool) IsReadOnly(json.RawMessage) bool        { return false }
+func (t *GenerateChartTool) IsConcurrencySafe(json.RawMessage) bool { return false }
+func (t *GenerateChartTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
+	return denyInPlanMode(tctx, "GenerateChart")
+}
+
+func (t *GenerateChartTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
+	var in generateChartInput
+	if err := json.Unmarshal(input, &in); err != nil {
+		return &tool.ToolResult{Content: "输入解析失败: " + err.Error(), IsError: true}, nil
+	}
+	if len(in.Option) == 0 {
+		return &tool.ToolResult{Content: "option 不能为空", IsError: true}, nil
+	}
+	outPath, err := resolveOutPath(in.OutputPath, tctx.Cwd)
+	if err != nil {
+		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
+	}
+	w, h := pick(in.Width, 1000), pick(in.Height, 600)
+	html := media.BuildEChartsHTML(string(in.Option), w, h)
+	eng := media.NewEngine(filepath.Dir(outPath))
+	eng.Width = w + 40
+	eng.Height = h + 40
+	name := strings.TrimSuffix(filepath.Base(outPath), filepath.Ext(outPath))
+	r := eng.RenderHTMLString(ctx, html, name, "png")
+	if r.Error != "" {
+		return &tool.ToolResult{Content: "图表渲染失败: " + r.Error, IsError: true}, nil
+	}
+	rendered := filepath.Join(filepath.Dir(outPath), name+".png")
+	if rendered != outPath {
+		_ = os.Rename(rendered, outPath)
+	}
+	st, err := os.Stat(outPath)
+	if err != nil || st.Size() == 0 {
+		return &tool.ToolResult{Content: "渲染后未生成有效 PNG: " + outPath, IsError: true}, nil
+	}
+	return &tool.ToolResult{Content: fmt.Sprintf("图表已生成: %s (%d bytes, %dx%d)", outPath, st.Size(), w, h)}, nil
+}
+
+func pick(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	return def
+}
+
+func fileSizeOf(st os.FileInfo) int64 {
+	if st == nil {
+		return 0
+	}
+	return st.Size()
+}
+
 // piperBin 定位 piper 二进制: 环境变量 > PATH > ~/piper/piper。
 func piperBin() string {
 	if v := os.Getenv("CLAUDE_GO_PIPER_BIN"); v != "" {
