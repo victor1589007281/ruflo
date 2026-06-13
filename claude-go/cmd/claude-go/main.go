@@ -1019,6 +1019,12 @@ JSON 配置文件示例:
 						}
 						return botRef.DashboardTeamAction(action, teamName, payload)
 					},
+					LLMComplete: func(ctx context.Context, sys, user string) (string, error) {
+						if botRef == nil {
+							return "", fmt.Errorf("bot 尚未初始化")
+						}
+						return botRef.DashboardLLMComplete(ctx, sys, user)
+					},
 				}
 				dashCfgRef = &dashCfg
 

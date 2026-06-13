@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,14 +30,22 @@ type workflowStageDTO struct {
 }
 
 type workflowDefDTO struct {
-	Name        string             `json:"name"`
-	Description string             `json:"description,omitempty"`
-	Mode        string             `json:"mode,omitempty"`
-	Rounds      int                `json:"rounds,omitempty"`
-	Stages      []workflowStageDTO `json:"stages"`
+	Name         string             `json:"name"`
+	Description  string             `json:"description,omitempty"`
+	Mode         string             `json:"mode,omitempty"`
+	Rounds       int                `json:"rounds,omitempty"`
+	Stages       []workflowStageDTO `json:"stages"`
+	Custom       bool               `json:"custom,omitempty"`       // 运行时定义的动态工作流
+	ProducesCode bool               `json:"producesCode,omitempty"` // 跑编译/测试门禁
+	QualityGate  string             `json:"qualityGate,omitempty"`  // 内容质量门禁策略
 }
 
+// handleWorkflows: GET 列出所有工作流(内置+动态); POST 注册一个动态工作流。
 func (s *Server) handleWorkflows(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		s.handleWorkflowCreate(w, r)
+		return
+	}
 	list := agent.ListWorkflows()
 	out := make([]workflowDefDTO, 0, len(list))
 	for i := range list {
@@ -44,6 +53,106 @@ func (s *Server) handleWorkflows(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toWorkflowDTO(&wf))
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleWorkflowCreate POST /api/workflows: 校验并注册一个动态工作流, 同时落盘 (重启可恢复)。
+// 必须在 :18080 (飞书挂载、与 teamMgr 同进程的 dashboard) 调用, 注册才能即时被团队执行使用。
+func (s *Server) handleWorkflowCreate(w http.ResponseWriter, r *http.Request) {
+	var def agent.WorkflowDef
+	if err := json.NewDecoder(r.Body).Decode(&def); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("JSON 解析失败: %w", err))
+		return
+	}
+	// 用内置角色注册表校验 (registerBuiltins 同步加载, 与 cwd 无关)
+	roles := agent.NewRoleRegistry(s.cfg.StateDir)
+	if err := agent.RegisterWorkflow(&def, roles); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// 落盘持久化 (失败不阻断: 已在进程内注册, 仅重启后丢失)
+	if err := agent.SaveWorkflowToDir(filepath.Join(s.cfg.StateDir, "workflows"), &def); err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"workflow": toWorkflowDTO(&def), "persisted": false, "warn": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"workflow": toWorkflowDTO(&def), "persisted": true})
+}
+
+// dashLLMAdapter 把 dashboard Config.LLMComplete 回调适配成 agent.LLMClient。
+type dashLLMAdapter struct {
+	fn func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+}
+
+func (a dashLLMAdapter) SimpleComplete(ctx context.Context, sys, user string) (string, error) {
+	return a.fn(ctx, sys, user)
+}
+
+// handleWorkflowGenerate POST /api/workflows/generate {objective}
+// 用 LLM 生成一个工作流编排, Validate 后返回(不注册), 供前端审核/编辑后再注册。
+// 这与蜂群 decompose 是同源操作(LLM 从目标生成编排), 区别是产出可复用、可审核的 WorkflowDef。
+func (s *Server) handleWorkflowGenerate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	if s.cfg.LLMComplete == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("LLM 不可用: 请通过 :18080 (注入了 LLM 的 dashboard) 调用"))
+		return
+	}
+	var body struct {
+		Objective string `json:"objective"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	roles := agent.NewRoleRegistry(s.cfg.StateDir)
+	def, err := agent.GenerateWorkflowDef(r.Context(), dashLLMAdapter{s.cfg.LLMComplete}, body.Objective, roles.Names())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	valErr := ""
+	if e := def.Validate(roles); e != nil {
+		valErr = e.Error() // 非致命: 生成可能不完美, 用户在审核时修正
+	}
+	// 返回完整 def (含每阶段 prompt, 供前端预填编辑器)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"workflow": def, "validationError": valErr})
+}
+
+// handleTeamSwarmPlan GET /api/teams/{name}/swarm-plan
+// 返回蜂群运行时 LLM 动态生成的编排 (SubTask DAG): stages(供 MiniStageDiagram 画图) + tasks(含描述)。
+// 让"黑盒的"蜂群编排变得可视化。
+func (s *Server) handleTeamSwarmPlan(w http.ResponseWriter, r *http.Request, name string) {
+	bb, err := s.provider.Blackboard(name)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	resp := map[string]interface{}{"mode": "swarm", "stages": []workflowStageDTO{}, "available": false}
+	planJSON := ""
+	if bb != nil {
+		planJSON = bb.Map["swarm-plan"]
+	}
+	if strings.TrimSpace(planJSON) != "" {
+		var plan agent.DecompositionPlan
+		if err := json.Unmarshal([]byte(planJSON), &plan); err == nil {
+			stages := make([]workflowStageDTO, 0, len(plan.SubTasks))
+			for _, st := range plan.SubTasks {
+				// Name 用 ID 以保证 DependsOn 的边能对上; 描述放 tasks 里
+				stages = append(stages, workflowStageDTO{
+					Name: st.ID, Role: st.Role, DependsOn: append([]string(nil), st.DependsOn...),
+				})
+			}
+			resp["stages"] = stages
+			resp["tasks"] = plan.SubTasks
+			resp["strategy"] = plan.Strategy
+			resp["rationale"] = plan.Rationale
+			resp["available"] = len(plan.SubTasks) > 0
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleWorkflow(w http.ResponseWriter, r *http.Request) {
@@ -64,6 +173,7 @@ func (s *Server) handleWorkflow(w http.ResponseWriter, r *http.Request) {
 func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
 	dto := workflowDefDTO{
 		Name: wf.Name, Description: wf.Description, Mode: wf.Mode, Rounds: wf.Rounds,
+		Custom: wf.Custom, ProducesCode: wf.ProducesCode, QualityGate: wf.QualityGate,
 	}
 	for _, st := range wf.Stages {
 		dto.Stages = append(dto.Stages, workflowStageDTO{

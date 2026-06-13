@@ -24,6 +24,10 @@ const (
 
 // contentQualityGated 判定工作流是否启用内容质量门禁 (保守白名单, 避免对所有工作流额外烧 token)。
 func contentQualityGated(workflow string) bool {
+	// 动态(自定义)工作流: 读声明式 QualityGate 字段, 不能按名字 switch(否则静默丢门禁)。
+	if _, qg, isCustom := customWorkflowFlags(workflow); isCustom {
+		return qg == "content"
+	}
 	switch strings.ToLower(strings.TrimSpace(workflow)) {
 	case "techblog", "research":
 		return true

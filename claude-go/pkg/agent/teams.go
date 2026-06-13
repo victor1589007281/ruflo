@@ -876,6 +876,10 @@ func workflowProducesCode(workflow string) bool {
 	// 改为白名单 (原黑名单会把新增/分析类工作流误判为代码类, 触发无意义的
 	// go build/test 门禁 + coder 修复死循环, 单团队曾因此烧掉数百万 token)。
 	// 只有确实产出可编译代码的工作流才跑编译/测试门禁。
+	// 动态(自定义)工作流: 读声明式字段, 不能按名字 switch(否则静默丢门禁)。
+	if produces, _, isCustom := customWorkflowFlags(workflow); isCustom {
+		return produces
+	}
 	switch strings.ToLower(strings.TrimSpace(workflow)) {
 	case "development", "app", "game", "ml-training", "testing", "adversarial-dev":
 		return true

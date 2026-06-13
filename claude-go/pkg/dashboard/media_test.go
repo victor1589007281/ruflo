@@ -1,6 +1,8 @@
 package dashboard
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +10,136 @@ import (
 	"strings"
 	"testing"
 )
+
+// TestHandleWorkflowGenerate 验证 LLM 生成工作流编排端点 (Mode 2)。
+func TestHandleWorkflowGenerate(t *testing.T) {
+	s := &Server{cfg: Config{StateDir: t.TempDir(), LLMComplete: func(_ context.Context, _, _ string) (string, error) {
+		return `{"name":"ai-gen-flow","mode":"pipeline","stages":[{"name":"a","prompt":"do {objective}"},{"name":"b","prompt":"then","dependsOn":["a"]}]}`, nil
+	}}, provider: NewProvider(t.TempDir(), 0)}
+	rec := httptest.NewRecorder()
+	s.handleWorkflowGenerate(rec, httptest.NewRequest("POST", "/api/workflows/generate", strings.NewReader(`{"objective":"写一篇技术文章"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("生成应 200, got %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "ai-gen-flow") || !strings.Contains(rec.Body.String(), `"workflow"`) {
+		t.Errorf("应返回生成的工作流(含prompt供编辑): %s", rec.Body.String())
+	}
+
+	// 无 LLM → 503
+	s2 := &Server{cfg: Config{StateDir: t.TempDir()}, provider: NewProvider(t.TempDir(), 0)}
+	rec = httptest.NewRecorder()
+	s2.handleWorkflowGenerate(rec, httptest.NewRequest("POST", "/api/workflows/generate", strings.NewReader(`{"objective":"x"}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("无 LLM 应 503, got %d", rec.Code)
+	}
+}
+
+// TestHandleTeamSwarmPlan 验证蜂群动态编排可视化端点 (Mode 3): 从黑板取 swarm-plan 转 stage 形状。
+func TestHandleTeamSwarmPlan(t *testing.T) {
+	dir := t.TempDir()
+	teamDir := filepath.Join(dir, "teams", "swt")
+	if err := os.MkdirAll(teamDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	planJSON := `{"subTasks":[{"id":"t1","description":"调研","role":"researcher"},{"id":"t2","description":"撰写","role":"writer","dependsOn":["t1"]}],"strategy":"pipeline","rationale":"先调研后写"}`
+	entries := []map[string]string{{"key": "swarm-plan", "value": planJSON}}
+	data, _ := json.Marshal(entries)
+	if err := os.WriteFile(filepath.Join(teamDir, "blackboard.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: Config{StateDir: dir}, provider: NewProvider(dir, 0)}
+	rec := httptest.NewRecorder()
+	s.handleTeamSwarmPlan(rec, httptest.NewRequest("GET", "/x", nil), "swt")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"available":true`) || !strings.Contains(body, "t1") || !strings.Contains(body, "t2") {
+		t.Fatalf("蜂群编排未正确返回: %s", body)
+	}
+	if !strings.Contains(body, `"strategy":"pipeline"`) {
+		t.Errorf("应含策略: %s", body)
+	}
+
+	// 无 swarm-plan 的团队 → available:false, 不报错
+	rec = httptest.NewRecorder()
+	s.handleTeamSwarmPlan(rec, httptest.NewRequest("GET", "/x", nil), "nonexistent")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"available":false`) {
+		t.Errorf("无 plan 应返回 available:false, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestDynamicWorkflowOverHTTP 通过真实 HTTP 往返(httptest.Server)触发动态工作流注册端点,
+// 模拟 webapp → claude-go 的实际调用路径 (真实 TCP/路由/JSON 编解码)。
+func TestDynamicWorkflowOverHTTP(t *testing.T) {
+	s := &Server{cfg: Config{StateDir: t.TempDir()}, provider: NewProvider(t.TempDir(), 0)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/workflows", s.handleWorkflows)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// 创建动态工作流 (webapp 走的就是这个 POST)
+	body := `{"name":"http-dyn-flow","mode":"pipeline","qualityGate":"content","stages":[
+		{"name":"a","role":"x","prompt":"do {objective}"},
+		{"name":"b","role":"y","prompt":"then {prev_result}","dependsOn":["a"]}]}`
+	resp, err := http.Post(ts.URL+"/api/workflows", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST 失败: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("创建动态工作流 HTTP %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 列表能拿到它
+	r2, err := http.Get(ts.URL + "/api/workflows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Body.Close()
+	buf := make([]byte, 1<<16)
+	n, _ := r2.Body.Read(buf)
+	listed := string(buf[:n])
+	if !strings.Contains(listed, "http-dyn-flow") || !strings.Contains(listed, `"custom":true`) {
+		t.Fatalf("列表未含动态工作流(注册未生效): %s", listed)
+	}
+}
+
+// TestHandleWorkflowCreate 验证 POST /api/workflows 动态工作流注册端点 (webapp 创建自定义工作流走它)。
+func TestHandleWorkflowCreate(t *testing.T) {
+	s := &Server{cfg: Config{StateDir: t.TempDir()}, provider: NewProvider(t.TempDir(), 0)}
+
+	// 合法 pipeline (内联 prompt) → 注册成功, 落盘
+	body := `{"name":"webapp-dyn-1","mode":"pipeline","qualityGate":"content","stages":[
+		{"name":"a","role":"x","prompt":"do {objective}"},
+		{"name":"b","role":"y","prompt":"then {prev_result}","dependsOn":["a"]}]}`
+	rec := httptest.NewRecorder()
+	s.handleWorkflows(rec, httptest.NewRequest("POST", "/api/workflows", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("注册合法工作流应 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"persisted":true`) {
+		t.Errorf("应落盘 persisted:true, body=%s", rec.Body.String())
+	}
+	// 落盘文件存在
+	if _, err := os.Stat(filepath.Join(s.cfg.StateDir, "workflows", "webapp-dyn-1.json")); err != nil {
+		t.Errorf("工作流应落盘: %v", err)
+	}
+	// GET 列表应包含它, 且内容门禁声明可见
+	rec = httptest.NewRecorder()
+	s.handleWorkflows(rec, httptest.NewRequest("GET", "/api/workflows", nil))
+	if !strings.Contains(rec.Body.String(), "webapp-dyn-1") || !strings.Contains(rec.Body.String(), `"custom":true`) {
+		t.Errorf("列表应含自定义工作流且标记 custom: %s", rec.Body.String())
+	}
+
+	// 非法模式 (creative_media 有伴生硬编码) → 400, 不注册
+	rec = httptest.NewRecorder()
+	s.handleWorkflows(rec, httptest.NewRequest("POST", "/api/workflows",
+		strings.NewReader(`{"name":"webapp-dyn-bad","mode":"creative_media","stages":[{"name":"a","prompt":"x"}]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("非纯数据模式应被拒 400, got %d", rec.Code)
+	}
+}
 
 // TestHandleTeamRefineEndpoint 锁定直连端点 POST /api/teams/{name}/refine|fork 的路由与 payload 契约。
 // (验证 handleTeamRefine 写入的键名与 bot.DashboardTeamAction 读取的键名一致: feedback/targetStage/newName)

@@ -452,6 +452,12 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		HookConfigs:        hookConfigs,
 	})
 
+	// 10-extra. 加载用户自定义动态工作流 (~/.claude-go/workflows/*.json), 启动即注册到进程内,
+	// 与 dashboard POST /api/workflows 注册的共用同一进程注册表 (此进程即 :18080 挂载 dashboard 的进程)。
+	if loaded, failed, details := agent.LoadWorkflowsFromDir(filepath.Join(bot.layout.Root, "workflows"), roleReg); loaded > 0 || failed > 0 {
+		log.Printf("[bot] 动态工作流加载: 成功 %d, 失败 %d %v", loaded, failed, details)
+	}
+
 	// 10a. 修复: SetTeamManager 必须在 teamMgr 创建后调用 (之前因时序 bug 注入了 nil)
 	bot.sessions.SetTeamManager(bot.teamMgr)
 
@@ -934,6 +940,14 @@ func (b *Bot) DashboardTeamAction(action, teamName string, payload map[string]in
 	default:
 		return fmt.Errorf("未知操作: %s", action)
 	}
+}
+
+// DashboardLLMComplete 供 dashboard 调用 bot 的 LLM 客户端 (用于 LLM 生成工作流编排)。
+func (b *Bot) DashboardLLMComplete(ctx context.Context, sys, user string) (string, error) {
+	if b.apiClient == nil {
+		return "", fmt.Errorf("LLM 客户端未初始化")
+	}
+	return b.apiClient.SimpleComplete(ctx, sys, user)
 }
 
 // --- Cron 执行器适配器 ---

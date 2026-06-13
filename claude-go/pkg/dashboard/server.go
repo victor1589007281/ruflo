@@ -34,6 +34,9 @@ type Config struct {
 	CacheTTL   time.Duration  // 数据缓存 TTL, 0 禁用
 	TeamAction TeamActionFunc // 团队操作回调 (create/run/stop/restart/delete)，为 nil 时尝试转发到 BotAPIURL
 	BotAPIURL  string         // Feishu bot 的 wiki API URL (如 "http://127.0.0.1:18080"), 用于转发 team 操作
+	// LLMComplete LLM 文本补全回调 (供 LLM 生成工作流编排); nil 时 /api/workflows/generate 返回 503。
+	// 由主进程(feishu bot)注入其 LLM 客户端。
+	LLMComplete func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
 }
 
 // Server HTTP 服务。
@@ -196,7 +199,8 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 
 	// v1.1 扩展
 	mux.HandleFunc("/api/workflows", s.handleWorkflows)
-	mux.HandleFunc("/api/workflows/", s.handleWorkflow) // /api/workflows/:name
+	mux.HandleFunc("/api/workflows/generate", s.handleWorkflowGenerate) // LLM 生成编排 (更具体, 优先于下面)
+	mux.HandleFunc("/api/workflows/", s.handleWorkflow)                 // /api/workflows/:name
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/logs/stream", s.handleLogsStream)
 	mux.HandleFunc("/api/logs/tail", s.handleLogsTail)
@@ -319,6 +323,8 @@ func (s *Server) handleTeamDetail(w http.ResponseWriter, r *http.Request) {
 		s.handleTeamLogs(w, r, name)
 	case "media":
 		s.handleTeamMedia(w, r, name, parts[2:])
+	case "swarm-plan":
+		s.handleTeamSwarmPlan(w, r, name)
 	case "refine":
 		s.handleTeamRefine(w, r, name)
 	case "fork":

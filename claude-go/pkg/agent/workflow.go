@@ -122,28 +122,17 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"creative":     creativeWorkflow,
 }
 
-// GetWorkflow 获取预定义工作流. 名称未注册时返回 nil, 让上层走"未知工作流"错误路径.
+// GetWorkflow 获取工作流: 先查内置, 再查运行时注册的动态工作流. 都没有返回 nil.
 func GetWorkflow(name string) *WorkflowDef {
 	if factory, ok := workflowRegistry[name]; ok {
 		return factory()
 	}
-	return nil
+	return getCustomWorkflow(name)
 }
 
-// ListWorkflows 列出所有可用工作流 (按名称排序, 便于 CLI 输出稳定).
+// ListWorkflows 列出所有可用工作流 (内置 + 动态, 按名称排序, 便于 CLI/API 输出稳定).
 func ListWorkflows() []WorkflowDef {
-	names := make([]string, 0, len(workflowRegistry))
-	for n := range workflowRegistry {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	out := make([]WorkflowDef, 0, len(names))
-	for _, n := range names {
-		if wf := workflowRegistry[n](); wf != nil {
-			out = append(out, *wf)
-		}
-	}
-	return out
+	return mergedWorkflowList()
 }
 
 // executeFanOut 并行扇出 → 汇聚 (简化版: 直接复用 pipeline 执行)。
@@ -222,19 +211,25 @@ func SummarizeOldOutput(output string, maxLen int) string {
 }
 
 type WorkflowDef struct {
-	Name        string
-	Description string
-	Mode        string     // pipeline, fanout, adversarial
-	Stages      []StageDef // pipeline/fanout 模式
-	Rounds      int        // adversarial 模式的对抗轮数
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Mode        string     `json:"mode"`             // pipeline, fanout, adversarial, adversarial_dev, orchestrated, ...
+	Stages      []StageDef `json:"stages,omitempty"` // pipeline/fanout 模式
+	Rounds      int        `json:"rounds,omitempty"` // adversarial 模式的对抗轮数
+
+	// 动态工作流(运行时定义)用的声明式元数据。内置工作流通过名字白名单判定门禁(见 teams.go /
+	// content_gate.go), 自定义工作流则读下列字段——否则按名字判定会让自定义工作流静默丢门禁。
+	ProducesCode bool   `json:"producesCode,omitempty"` // 是否跑编译/测试门禁
+	QualityGate  string `json:"qualityGate,omitempty"`  // ""|"content"|"none": 内容质量门禁策略
+	Custom       bool   `json:"custom,omitempty"`       // 运行时注册的动态工作流标记
 }
 
 type StageDef struct {
-	Name      string   // 阶段名称
-	Role      string   // agent 角色
-	Prompt    string   // 系统提示词模板 (支持 {objective}, {prev_result} 占位符)
-	DependsOn []string // 依赖的前置阶段
-	Parallel  bool     // 是否可与同级并行
+	Name      string   `json:"name"`                // 阶段名称
+	Role      string   `json:"role"`                // agent 角色
+	Prompt    string   `json:"prompt,omitempty"`    // 系统提示词模板 (支持 {objective}, {prev_result}, {user_feedback} 占位符)
+	DependsOn []string `json:"dependsOn,omitempty"` // 依赖的前置阶段
+	Parallel  bool     `json:"parallel,omitempty"`  // 是否可与同级并行
 }
 
 type WorkflowExecutor struct {

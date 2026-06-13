@@ -201,6 +201,17 @@ func (rr *RoleRegistry) Count() int {
 	return len(rr.roles)
 }
 
+// Names 返回所有已注册角色名 (供 LLM 生成工作流时约束可用角色)。
+func (rr *RoleRegistry) Names() []string {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	out := make([]string, 0, len(rr.roles))
+	for n := range rr.roles {
+		out = append(out, n)
+	}
+	return out
+}
+
 // ResolveRoleName returns the specialized role name that will actually be used.
 func (rr *RoleRegistry) ResolveRoleName(roleName string) string {
 	rr.mu.RLock()
