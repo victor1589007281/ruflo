@@ -89,6 +89,59 @@ func (a dashLLMAdapter) SimpleComplete(ctx context.Context, sys, user string) (s
 	return a.fn(ctx, sys, user)
 }
 
+// roleInfoDTO 角色富信息 (供工作流详细 DAG 的节点详情面板)。
+type roleInfoDTO struct {
+	Name         string   `json:"name"`
+	Resolved     string   `json:"resolved,omitempty"`
+	Description  string   `json:"description,omitempty"`  // 功能设计
+	SystemPrompt string   `json:"systemPrompt,omitempty"` // 角色基础提示词
+	Skills       []string `json:"skills,omitempty"`       // 真实 per-role skills (builtin+file+recommended)
+	Tags         []string `json:"tags,omitempty"`
+	Found        bool     `json:"found"`
+}
+
+// handleRoles GET /api/roles?names=a,b,c — 批量返回角色富信息 (description/systemPrompt/真实skills/tags)。
+// 注: tools/MCP 是全局的(角色无 per-role 工具映射), 不在此返回, 由前端如实标注。
+func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request) {
+	reg := agent.NewRoleRegistry(s.cfg.StateDir)
+	out := []roleInfoDTO{}
+	seen := map[string]bool{}
+	for _, n := range strings.Split(r.URL.Query().Get("names"), ",") {
+		n = strings.TrimSpace(n)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		dto := roleInfoDTO{Name: n}
+		if info := reg.DescribeRole(n); info != nil {
+			dto.Found = true
+			dto.Resolved = info.Resolved
+			dto.Description = info.Description
+			dto.Tags = info.Tags
+			merged := append(append(append([]string{}, info.BuiltinSkills...), info.FileSkills...), info.RecommendedSkills...)
+			dto.Skills = dedupStrings(merged)
+		}
+		if rd := reg.Get(n); rd != nil {
+			dto.SystemPrompt = rd.SystemPrompt
+		}
+		out = append(out, dto)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func dedupStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
 // handleWorkflowGenerate POST /api/workflows/generate {objective}
 // 用 LLM 生成一个工作流编排, Validate 后返回(不注册), 供前端审核/编辑后再注册。
 // 这与蜂群 decompose 是同源操作(LLM 从目标生成编排), 区别是产出可复用、可审核的 WorkflowDef。

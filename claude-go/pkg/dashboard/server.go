@@ -200,6 +200,7 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	// v1.1 扩展
 	mux.HandleFunc("/api/workflows", s.handleWorkflows)
 	mux.HandleFunc("/api/workflows/generate", s.handleWorkflowGenerate) // LLM 生成编排 (更具体, 优先于下面)
+	mux.HandleFunc("/api/roles", s.handleRoles)                         // 角色富信息 (供详细 DAG 节点面板)
 	mux.HandleFunc("/api/workflows/", s.handleWorkflow)                 // /api/workflows/:name
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/logs/stream", s.handleLogsStream)
