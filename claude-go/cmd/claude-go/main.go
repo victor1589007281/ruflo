@@ -1025,6 +1025,17 @@ JSON 配置文件示例:
 						}
 						return botRef.DashboardLLMComplete(ctx, sys, user)
 					},
+					MCPServers: func() interface{} {
+						if botRef == nil {
+							return []interface{}{}
+						}
+						return botRef.DashboardMCPServers()
+					},
+					ReloadSkills: func() {
+						if botRef != nil {
+							botRef.DashboardReloadSkills()
+						}
+					},
 				}
 				dashCfgRef = &dashCfg
 

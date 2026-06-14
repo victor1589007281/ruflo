@@ -34,9 +34,13 @@ type Config struct {
 	CacheTTL   time.Duration  // 数据缓存 TTL, 0 禁用
 	TeamAction TeamActionFunc // 团队操作回调 (create/run/stop/restart/delete)，为 nil 时尝试转发到 BotAPIURL
 	BotAPIURL  string         // Feishu bot 的 wiki API URL (如 "http://127.0.0.1:18080"), 用于转发 team 操作
-	// LLMComplete LLM 文本补全回调 (供 LLM 生成工作流编排); nil 时 /api/workflows/generate 返回 503。
+	// LLMComplete LLM 文本补全回调 (供 LLM 生成工作流编排/skill); nil 时返回 503。
 	// 由主进程(feishu bot)注入其 LLM 客户端。
 	LLMComplete func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+	// MCPServers 返回运行态 MCP 服务器列表 (可序列化); nil 时 /api/mcp/servers 返回空。
+	MCPServers func() interface{}
+	// ReloadSkills 创建 skill 后让主进程技能库即时重载 (可选)。
+	ReloadSkills func()
 }
 
 // Server HTTP 服务。
@@ -201,6 +205,13 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/workflows", s.handleWorkflows)
 	mux.HandleFunc("/api/workflows/generate", s.handleWorkflowGenerate) // LLM 生成编排 (更具体, 优先于下面)
 	mux.HandleFunc("/api/roles", s.handleRoles)                         // 角色富信息 (供详细 DAG 节点面板)
+	// 能力管理: skills / tools / MCP / 引用关系
+	mux.HandleFunc("/api/skills", s.handleSkills)                  // GET 列表 / POST 创建
+	mux.HandleFunc("/api/skills/generate", s.handleSkillGenerate) // LLM 生成 skill 草稿
+	mux.HandleFunc("/api/skills/", s.handleSkillDetail)           // GET 详情 / DELETE
+	mux.HandleFunc("/api/tools", s.handleTools)
+	mux.HandleFunc("/api/mcp/servers", s.handleMCPServers)
+	mux.HandleFunc("/api/references", s.handleReferences)
 	mux.HandleFunc("/api/workflows/", s.handleWorkflow)                 // /api/workflows/:name
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/logs/stream", s.handleLogsStream)

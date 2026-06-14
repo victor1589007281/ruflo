@@ -942,6 +942,24 @@ func (b *Bot) DashboardTeamAction(action, teamName string, payload map[string]in
 	}
 }
 
+// DashboardMCPServers 供 dashboard 列出运行态 MCP 服务器 (返回可序列化的 ServerInfo 列表)。
+func (b *Bot) DashboardMCPServers() interface{} {
+	if b.mcpMgr == nil {
+		return []interface{}{}
+	}
+	return b.mcpMgr.ListServers()
+}
+
+// DashboardReloadSkills 供 dashboard 创建 skill 后让 bot 的技能库即时重载。
+func (b *Bot) DashboardReloadSkills() {
+	if b.skillReg != nil {
+		b.skillReg.Reload()
+		if b.layout != nil {
+			b.skillReg.LoadFromDirs([]string{b.layout.Skills}, "state")
+		}
+	}
+}
+
 // DashboardLLMComplete 供 dashboard 调用 bot 的 LLM 客户端 (用于 LLM 生成工作流编排)。
 func (b *Bot) DashboardLLMComplete(ctx context.Context, sys, user string) (string, error) {
 	if b.apiClient == nil {
