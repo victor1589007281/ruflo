@@ -180,6 +180,34 @@ func (p *PromptCache) HitRate() float64 {
 	return float64(p.cacheHits) / float64(total)
 }
 
+// maxCodeDepOutputLen 代码/HTML 类依赖件注入下游(审查/渲染)stage 时的上限。
+// 远大于 maxDepOutputLen: 评审/渲染必须看到完整产物。1500 字符会把 17KB 的 HTML 砍到只剩
+// <head>+场景1, 导致 art-director 把"看不到的后续场景"误判成"内容缺失", 对抗循环永不通过。
+const maxCodeDepOutputLen = 60000
+
+// looksLikeCodeArtifact 判断依赖输出是否为需完整传递的代码/HTML 产物 (而非可摘要的散文)。
+func looksLikeCodeArtifact(s string) bool {
+	h := strings.ToLower(s)
+	for _, m := range []string{"<!doctype", "<html", "<section", "<svg", "<style", "<script", "```"} {
+		if strings.Contains(h, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// summarizeDependency 为依赖注入选择策略: 代码/HTML 产物保留原文(大上限, 供完整审查/渲染),
+// 普通文本走关键行摘要(小上限, 防上下文膨胀)。
+func summarizeDependency(output string) string {
+	if looksLikeCodeArtifact(output) {
+		if len(output) > maxCodeDepOutputLen {
+			return output[:maxCodeDepOutputLen] + "\n...(truncated)"
+		}
+		return output
+	}
+	return SummarizeOldOutput(output, maxDepOutputLen)
+}
+
 func SummarizeOldOutput(output string, maxLen int) string {
 	if len(output) <= maxLen {
 		return output
@@ -1631,8 +1659,9 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 	var prevOutput strings.Builder
 	for _, dep := range stage.DependsOn {
 		if r, ok := prevResults[dep]; ok {
-			summary := SummarizeOldOutput(r, maxDepOutputLen)
-			prevOutput.WriteString(fmt.Sprintf("### Dependency summary from %s:\n%s\n\nFull artifact/ref: blackboard key `%s-result`.\n\n", dep, summary, dep))
+			// 代码/HTML 产物完整传递 (供审查/渲染); 散文走关键行摘要。
+			summary := summarizeDependency(r)
+			prevOutput.WriteString(fmt.Sprintf("### Dependency output from %s:\n%s\n\nFull artifact/ref: blackboard key `%s-result`.\n\n", dep, summary, dep))
 		}
 	}
 
@@ -1645,15 +1674,68 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 	// 优先从角色注册表获取 (包含专属 Skills)
 	if roles != nil {
 		if merged := roles.MergedPrompt(stage.Role, objective, prevOutput.String()); merged != "" {
-			return merged + extra
+			// 角色模板已承载任务目标 (SystemPrompt 含 {objective} 占位并已替换) → 保持原行为,
+			// 不重复注入, 避免 70+ 个正常角色出现任务双写。
+			if strings.TrimSpace(objective) == "" || strings.Contains(merged, objective) {
+				return merged + extra
+			}
+			// 角色模板是纯人格 (persona-only, 无 {objective} 占位, 如 creative-v2 的
+			// creative-planner / html-developer / art-director / media-producer):
+			// 必须补上 stage 的具体任务, 否则 agent 收不到目标, 只会自我介绍并反向索要需求 (历史 bug)。
+			task := substituteStagePlaceholders(stage.Prompt, objective, prevOutput.String(), prevResults)
+			if strings.TrimSpace(task) == "" {
+				// stage 自身也没有任务模板 (如 final-delivery): 注入显式任务块。
+				task = buildExplicitTaskBlock(objective, prevOutput.String())
+			}
+			return merged + "\n\n---\n\n" + task + extra
 		}
 	}
 
 	// 降级: 使用 StageDef 中的内联 Prompt
-	prompt := stage.Prompt
-	prompt = strings.ReplaceAll(prompt, "{objective}", objective)
-	prompt = strings.ReplaceAll(prompt, "{prev_result}", prevOutput.String())
+	prompt := substituteStagePlaceholders(stage.Prompt, objective, prevOutput.String(), prevResults)
 	return prompt + extra
+}
+
+// optionalStagePlaceholders 是"对应阶段可能尚未产出"的可选占位符。
+// 当其对应键还不在 prevResults 中时 (如对抗第 1 轮还没有 visual-feedback),
+// 替换为空字符串, 避免字面 {visual-feedback} 泄漏进提示词。
+// 注意: {user_feedback} 不在此列 — 它由 executeStage 在更晚阶段按 team.PendingFeedback 处理。
+var optionalStagePlaceholders = []string{"visual-feedback"}
+
+// substituteStagePlaceholders 替换 stage 模板里的占位符:
+//   - {objective}    → 任务目标
+//   - {prev_result}  → 依赖阶段产出摘要
+//   - {<阶段名>}      → 对应阶段产出 (如 {html-develop} {media-render} {visual-feedback})
+//
+// 刻意不删除未知的 {…}: taskDecompose 等模板含字面 JSON 大括号, 必须原样保留。
+func substituteStagePlaceholders(tmpl, objective, prevResult string, prevResults map[string]string) string {
+	s := strings.ReplaceAll(tmpl, "{objective}", objective)
+	s = strings.ReplaceAll(s, "{prev_result}", prevResult)
+	for k, v := range prevResults {
+		s = strings.ReplaceAll(s, "{"+k+"}", summarizeDependency(v))
+	}
+	for _, opt := range optionalStagePlaceholders {
+		if _, done := prevResults[opt]; !done {
+			s = strings.ReplaceAll(s, "{"+opt+"}", "")
+		}
+	}
+	return s
+}
+
+// buildExplicitTaskBlock 为"纯人格角色 + 无 stage 模板"的阶段 (如 final-delivery)
+// 兜底注入明确任务, 直接对治"只自我介绍、反向索要需求"的失败模式。
+func buildExplicitTaskBlock(objective, prevResult string) string {
+	var b strings.Builder
+	b.WriteString("## 当前任务\n")
+	b.WriteString(objective)
+	b.WriteString("\n")
+	if strings.TrimSpace(prevResult) != "" {
+		b.WriteString("\n## 已完成阶段产出 (基于此继续, 勿重复索要需求)\n")
+		b.WriteString(prevResult)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n请直接产出本阶段要求的最终成果, 不要自我介绍, 也不要反过来索要需求。")
+	return b.String()
 }
 
 func stripRoundSuffix(name string) string {

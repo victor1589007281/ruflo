@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -72,6 +73,16 @@ func (we *WorkflowExecutor) executeCreativeMedia(ctx context.Context, wf *Workfl
 		if team != nil {
 			we.notify(team.ChatID, msg)
 		}
+	}
+
+	// ── Phase B: genre 路由 ──
+	// 算法/技术原理类讲解视频 → 走 manim 专业引擎 (确定性、广电级, 参考 TheoremExplainAgent);
+	// manim 不可用或生成失败时回退到下面的 HTML 创意流水线。
+	if IsAlgorithmExplainerVideo(objective) && ManimAvailable() {
+		if results, ok := we.runManimVideoPath(ctx, objective, team); ok {
+			return results, nil
+		}
+		notify("⚠️ manim 路径未成功, 回退 HTML 创意流水线")
 	}
 
 	// ── 检查点恢复 (复用研发团队 checkpoint 机制) ──
@@ -215,16 +226,84 @@ func (we *WorkflowExecutor) executeCreativeMedia(ctx context.Context, wf *Workfl
 	mediaDir := filepath.Join(team.dataDir, "media")
 	engine := media.NewEngine(mediaDir)
 
-	mediaResults := engine.RenderAll(ctx, htmlContent, team.Name, formats)
+	// A3 确定性拼接: 视频用"逐场景定长片段拼接"(无空档、无全局时间线脆弱); 拆不出多场景或失败则回退整页渲染。
+	renderAllMedia := func(html string) []media.RenderResult {
+		var rs []media.RenderResult
+		fmts := append([]string{}, formats...)
+		if scenes := splitHTMLToScenes(html); len(scenes) >= 2 && containsFormat(fmts, "mp4") {
+			notify(fmt.Sprintf("  🎞️ 确定性拼接: %d 个场景各定长渲染后拼接成视频", len(scenes)))
+			if vr, err := engine.RenderScenesToVideo(ctx, scenes, team.Name, creativeSecsPerScene); err == nil && vr.FilePath != "" {
+				rs = append(rs, vr)
+				fmts = removeFormat(fmts, "mp4")
+			} else {
+				log.Printf("[creative-v2] 确定性拼接失败, 回退整页视频: %v", err)
+			}
+		}
+		return append(rs, engine.RenderAll(ctx, html, team.Name, fmts)...)
+	}
+
+	mediaResults := renderAllMedia(htmlContent)
+
+	// ── Phase 4.5: 视觉接地质检 (vision-grounded QA) ──
+	// 渲染出 MP4 后, 用多模态模型评审"真实渲染画面"(而非 HTML 源码文本——后者看不出好坏),
+	// 不达标则按"看到的"问题定向重做一轮再渲染。仅在视觉端点可用时启用; 本地 CPU 模型较慢,
+	// 故只跑一次门禁 + 至多一次修复 + 一次复评。可配置 CREATIVE_VISION_* 指向更快的云端 VL。
+	var visionRC RawVisionCompleter
+	if r, ok := we.llm.(RawVisionCompleter); ok {
+		visionRC = r // 复用团队的 api.Client(kimi 等), Anthropic 图像块, 快
+	}
+	vb := SelectVisionBackend(ctx, visionRC)
+	if mp4Path := mediaFilePath(mediaResults, "mp4"); mp4Path != "" && vb != nil {
+		titles := extractSceneTitles(htmlContent)
+		notify(fmt.Sprintf("  👁️ 视觉质检 (后端 %s): 评审 %d 个场景的真实画面...", vb.Name(), len(titles)))
+		if vs, err := ReviewVideoScenes(ctx, vb, mp4Path, titles, objective); err == nil {
+			allPass, fb := VerdictsFeedback(vs)
+			if !allPass {
+				notify("  🔁 视觉质检发现问题, 按真实画面反馈定向重做一轮:\n" + fb)
+				prevResults["visual-feedback"] = "视觉质检(基于真实渲染画面)发现以下问题, 本轮必须逐条修正:\n" + fb
+				if hs := findStage(wf, "html-develop"); hs != nil {
+					fixStage := *hs
+					fixStage.Name = "html-develop-vision-fix"
+					sr := we.executeStage(ctx, fixStage, objective, prevResults, team)
+					allResults = append(allResults, sr)
+					if sr.Status == TaskCompleted {
+						if fixed := extractHTMLFromOutput(sr.Output); fixed != "" {
+							htmlContent = fixed
+							prevResults["html-develop"] = sr.Output
+							mediaResults = renderAllMedia(htmlContent)
+							if mp4b := mediaFilePath(mediaResults, "mp4"); mp4b != "" {
+								if vs2, e2 := ReviewVideoScenes(ctx, vb, mp4b, titles, objective); e2 == nil {
+									vs = vs2
+								}
+							}
+						}
+					}
+				}
+			} else {
+				notify("  ✅ 视觉质检通过: 所有场景画面清晰、内容达标")
+			}
+			// 把"看真实画面"的裁决并入交付上下文, 让 final-delivery 基于像素事实写报告 (而非臆测缺失)。
+			prevResults["vision-review"] = formatVisionVerdicts(vs)
+		} else {
+			log.Printf("[creative-v2] 视觉质检跳过: %v", err)
+		}
+	}
+
 	var mediaSummary strings.Builder
 	for _, mr := range mediaResults {
 		if mr.Error != "" {
 			mediaSummary.WriteString(fmt.Sprintf("❌ %s: %s\n", mr.Format, mr.Error))
 			notify(fmt.Sprintf("  ❌ %s: %s", mr.Format, mr.Error))
 		} else {
-			mediaSummary.WriteString(fmt.Sprintf("✅ %s: %s (%.1f KB, %.1fs)\n",
-				mr.Format, mr.FilePath, float64(mr.Size)/1024, mr.Duration.Seconds()))
-			notify(fmt.Sprintf("  ✅ %s: %.1f KB (%.1fs)", strings.ToUpper(mr.Format), float64(mr.Size)/1024, mr.Duration.Seconds()))
+			// 区分"播放时长"(MediaSeconds, 视频/GIF) 与"渲染耗时"(Duration, 墙钟):
+			// 旧版只打印渲染耗时, 下游 final-delivery 误读成"视频时长过短"。
+			lenInfo := ""
+			if mr.MediaSeconds > 0 {
+				lenInfo = fmt.Sprintf(", 播放时长%.1fs", mr.MediaSeconds)
+			}
+			mediaSummary.WriteString(fmt.Sprintf("✅ %s: %s (%.1f KB%s, 渲染耗时%.1fs)\n",
+				mr.Format, mr.FilePath, float64(mr.Size)/1024, lenInfo, mr.Duration.Seconds()))
+			notify(fmt.Sprintf("  ✅ %s: %.1f KB%s", strings.ToUpper(mr.Format), float64(mr.Size)/1024, lenInfo))
 		}
 	}
 
@@ -242,7 +321,12 @@ func (we *WorkflowExecutor) executeCreativeMedia(ctx context.Context, wf *Workfl
 
 	deliveryStage := findStage(wf, "final-delivery")
 	if deliveryStage != nil {
-		sr := we.executeStage(ctx, *deliveryStage, objective, prevResults, team)
+		ds := *deliveryStage
+		// 让交付报告看到视觉质检裁决 (基于真实画面), 避免再凭空报"内容缺失"。
+		if _, ok := prevResults["vision-review"]; ok {
+			ds.DependsOn = append(append([]string{}, ds.DependsOn...), "vision-review")
+		}
+		sr := we.executeStage(ctx, ds, objective, prevResults, team)
 		allResults = append(allResults, sr)
 	}
 
@@ -256,6 +340,119 @@ func (we *WorkflowExecutor) executeCreativeMedia(ctx context.Context, wf *Workfl
 }
 
 // ── 辅助函数 ──
+
+// creativeSecsPerScene A3 确定性拼接里每个场景片段的固定时长 (秒)。
+const creativeSecsPerScene = 5
+
+func containsFormat(fs []string, f string) bool {
+	for _, x := range fs {
+		if strings.EqualFold(x, f) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeFormat(fs []string, f string) []string {
+	out := fs[:0:0]
+	for _, x := range fs {
+		if !strings.EqualFold(x, f) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// mediaFilePath 返回指定格式 (如 "mp4") 已成功渲染的文件路径; 无则空串。
+func mediaFilePath(results []media.RenderResult, format string) string {
+	for _, r := range results {
+		if strings.EqualFold(r.Format, format) && r.Error == "" && r.FilePath != "" {
+			return r.FilePath
+		}
+	}
+	return ""
+}
+
+var sectionRe = regexp.MustCompile(`(?is)<section\b[^>]*>(.*?)</section>`)
+var headingRe = regexp.MustCompile(`(?is)<(?:h1|h2|h3)[^>]*>(.*?)</(?:h1|h2|h3)>`)
+var tagStripRe = regexp.MustCompile(`(?s)<[^>]+>`)
+
+// extractSceneTitles 从 HTML 逐个 <section> 提取首个标题文本, 作为视觉评审的"本场景应表达"提示。
+// 提取不到标题的场景回退为"场景N"。无 section 时回退单一"整体画面"。
+func extractSceneTitles(html string) []string {
+	var titles []string
+	for i, m := range sectionRe.FindAllStringSubmatch(html, -1) {
+		title := ""
+		if h := headingRe.FindStringSubmatch(m[1]); h != nil {
+			title = strings.TrimSpace(tagStripRe.ReplaceAllString(h[1], ""))
+		}
+		if title == "" {
+			title = fmt.Sprintf("场景%d", i+1)
+		}
+		titles = append(titles, title)
+	}
+	if len(titles) == 0 {
+		titles = []string{"整体画面"}
+	}
+	return titles
+}
+
+// formatVisionVerdicts 把视觉裁决整理为给 final-delivery 的事实依据 (基于真实画面, 非臆测)。
+func formatVisionVerdicts(vs []SceneVerdict) string {
+	if len(vs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("视觉质检结果 (多模态模型评审真实渲染画面, 以此为准, 勿臆测内容缺失):\n")
+	for i, v := range vs {
+		status := "✅达标"
+		if !v.Pass || !v.Readable {
+			status = "⚠️待改进"
+		}
+		b.WriteString(fmt.Sprintf("- 场景%d「%s」: %s (评分%.0f/10)", i+1, v.Scene, status, v.Score))
+		if len(v.Issues) > 0 {
+			b.WriteString(" — " + strings.Join(v.Issues, "; "))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+var headBlockRe = regexp.MustCompile(`(?is)<head\b[^>]*>(.*?)</head>`)
+
+// splitHTMLToScenes (A3 确定性拼接的前置): 把"单页多场景 HTML"拆成多个"独立单场景 HTML"。
+// 每个场景文档复用原 <head>(含 <style>), 但强制该场景立即可见 (去掉依赖全局时间线的
+// opacity:0/animation-delay 揭示), 并加一层干净的淡入淡出, 使其作为定长片段独立渲染。
+// 返回各场景 HTML; 不足 2 个场景时返回 nil (交回单页路径)。
+func splitHTMLToScenes(html string) []string {
+	secs := sectionRe.FindAllString(html, -1)
+	if len(secs) < 2 {
+		return nil
+	}
+	head := ""
+	if m := headBlockRe.FindStringSubmatch(html); m != nil {
+		head = m[1]
+	}
+	// 覆盖样式: 让任意 section/.slide/.scene 立即满显示 (压过原全局时间线的隐藏),
+	// 内部装饰动画照常; 外层 sceneFade 提供干净的入场/退场。
+	// 关键: 把所有元素的 animation-delay 归零 + fill-mode:both。原 HTML 的内部元素揭示动画
+	// 的 delay 是按"全局 30s 时间线"排的 (如场景6 的元素 delay~25s); 独立成 5s 片段时这些
+	// delay 会让内容永不出现(片段只有5s)。归零后各场景内元素在片段内即时揭示并保持可见。
+	override := `<style>
+  html,body{margin:0;padding:0;width:1920px;height:1080px;overflow:hidden;background:#0a0e17}
+  *{animation-delay:0s!important;animation-fill-mode:both!important}
+  section,.slide,.scene{position:absolute!important;inset:0!important;opacity:1!important;
+    transform:none!important;display:flex!important;align-items:center;justify-content:center}
+  body>section,body>.slide,body>.scene{animation:sceneFade 5s ease both!important}
+  @keyframes sceneFade{0%{opacity:0}8%{opacity:1}92%{opacity:1}100%{opacity:0}}
+</style>`
+	var out []string
+	for _, sec := range secs {
+		out = append(out, fmt.Sprintf("<!DOCTYPE html><html><head><meta charset=\"utf-8\">%s%s</head><body>%s</body></html>",
+			head, override, sec))
+	}
+	return out
+}
 
 func findStage(wf *WorkflowDef, name string) *StageDef {
 	for i := range wf.Stages {
@@ -483,6 +680,16 @@ const htmlDeveloperPrompt = `创作需求: {objective}
 - 现代 CSS: Grid, Flexbox, 变量, 渐变, 阴影, 动画
 - 如果需要动画效果, 必须使用 CSS @keyframes 定义动画
 - 视口 1920×1080 (普通网页/PPT)
+
+🎬 视频/动画硬规范 (需求含"视频/动画/MP4/分镜/演示动画"时必须严格遵守, 否则无法正确导出为视频):
+- 必须在 body 上声明总时长: <body data-duration="N">, N=整段视频秒数 (每个场景 4-6 秒, 总时长 ≤ 60)。
+- 场景切换/分镜推进必须用"单一 CSS 时间线": 用 @keyframes + animation-delay 串起每个场景的淡入/淡出
+  (场景1 delay 0s, 场景2 delay 5s, 场景3 delay 10s ...), 使整条时间线可被逐帧 seek。
+- 严禁用 setTimeout / setInterval / requestAnimationFrame 切换场景或推进时间 (渲染器无法 seek JS 定时器,
+  会导致视频卡在开头、后续场景全部丢失)。循环装饰动画(脉冲/呼吸/旋转)可用 infinite, 但不得承担场景推进。
+- 每个场景用 <section class="slide"> 包裹, 默认 opacity:0, 由各自的 animation-delay 触发淡入、结束淡出,
+  确保任意时刻只有当前场景可见 (animation-fill-mode 用 both)。
+- 自检: 最后一个场景动画的 (animation-delay + animation-duration) 必须约等于 data-duration。
 - 多页 PPT 用 <section class="slide"> 分隔
 - 所有文字必须是真实内容 (禁止 Lorem ipsum)
 - 输出的第一行必须是 <!DOCTYPE html>

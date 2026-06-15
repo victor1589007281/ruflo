@@ -246,7 +246,8 @@ func shortSkillListing(reg *skills.Registry) string {
 	if reg == nil || reg.Count() == 0 {
 		return ""
 	}
-	return reg.FormatShortListing(8)
+	// 0 = 不设软上限, 由描述字符预算约束; 所有技能名称始终可见 (可发现性)。
+	return reg.FormatShortListing(0)
 }
 
 func (sm *SessionManager) configureSessionTools(session *Session, profile builtin.ToolProfile) {

@@ -9,8 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/basedir"
+	"github.com/anthropic/claude-go/pkg/media"
 	"github.com/anthropic/claude-go/pkg/wechat"
 	"github.com/spf13/cobra"
 )
@@ -23,6 +25,9 @@ import (
 func wechatCmd() *cobra.Command {
 	var mdFile, team, title, author, sourceURL, outDir, updateID string
 	var draft bool
+	var genImages string
+	var imgCount int
+	var newspic, genAudio, genVideo bool
 	cmd := &cobra.Command{
 		Use:   "wechat",
 		Short: "微信公众号自动排版 (Markdown→公众号内联HTML, mermaid→图), 可建草稿",
@@ -49,6 +54,52 @@ func wechatCmd() *cobra.Command {
 			}
 			ctx := context.Background()
 
+			// ── 可选多媒体生成 (techblog 增强): 配图 / 音频 / 视频 ──
+			style := genImages
+			if style == "" && (newspic || genVideo) {
+				style = "card" // 图片消息/视频需要图, 缺省用要点卡片风格
+			}
+			var imgPaths []string
+			var audioPath, videoPath string
+			if style != "" || genAudio || genVideo {
+				llm := loadLLMClient(cfgPath)
+				if (style != "" || newspic || genVideo) && llm != nil {
+					if specs, e := agent.ExtractImageSpecs(ctx, llm, md, imgCount); e == nil {
+						if ps, e2 := agent.GenerateArticleImages(ctx, llm, specs, style, outDir); e2 == nil {
+							imgPaths = ps
+							fmt.Printf("[wechat] 配图(%s 风格): 生成 %d 张 → %s\n", style, len(ps), outDir)
+						} else {
+							fmt.Printf("  ⚠️ 配图生成失败: %v\n", e2)
+						}
+					} else {
+						fmt.Printf("  ⚠️ 配图规格提炼失败: %v\n", e)
+					}
+				}
+				if genAudio {
+					if ap, e := agent.GenerateArticleAudio(ctx, md, outDir, ""); e == nil {
+						audioPath = ap
+						fmt.Printf("[wechat] 音频(朗读): %s\n", ap)
+					} else {
+						fmt.Printf("  ⚠️ 音频生成失败: %v\n", e)
+					}
+				}
+				if genVideo && len(imgPaths) > 0 {
+					videoPath = filepath.Join(outDir, "slideshow.mp4")
+					if e := media.SlideshowFromImages(ctx, imgPaths, videoPath, 4, 30); e == nil {
+						if audioPath != "" {
+							muxed := filepath.Join(outDir, "narrated.mp4")
+							if media.MuxAudio(ctx, videoPath, audioPath, muxed) == nil {
+								videoPath = muxed
+							}
+						}
+						fmt.Printf("[wechat] 视频(配图幻灯片%s): %s\n", map[bool]string{true: "+解说", false: ""}[audioPath != ""], videoPath)
+					} else {
+						fmt.Printf("  ⚠️ 视频生成失败: %v\n", e)
+						videoPath = ""
+					}
+				}
+			}
+
 			if !draft && updateID == "" {
 				// 离线预览 (不调 API): mermaid → 本地 PNG, 产出内联 HTML
 				fmt.Printf("[wechat] 离线预览模式 (不调用公众号 API)\n")
@@ -64,7 +115,16 @@ func wechatCmd() *cobra.Command {
 				}
 				fmt.Printf("[wechat] 预览 HTML: %s\n", htmlPath)
 				fmt.Printf("[wechat] 图片目录: %s\n", outDir)
-				fmt.Printf("[wechat] 用浏览器打开 preview.html 查看效果; 确认 IP 白名单后加 --draft 直接建草稿。\n")
+				if len(imgPaths) > 0 {
+					fmt.Printf("[wechat] 配图 %d 张 (可作图文消息/图片消息): %s\n", len(imgPaths), strings.Join(imgPaths, ", "))
+				}
+				if audioPath != "" {
+					fmt.Printf("[wechat] 音频: %s\n", audioPath)
+				}
+				if videoPath != "" {
+					fmt.Printf("[wechat] 视频: %s\n", videoPath)
+				}
+				fmt.Printf("[wechat] 用浏览器打开 preview.html 查看效果; 确认 IP 白名单后加 --draft 直接建草稿/上传素材。\n")
 				return nil
 			}
 
@@ -104,7 +164,9 @@ func wechatCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("更新草稿失败: %w", err)
 				}
-				fmt.Printf("[wechat] ✅ 草稿已替换, 新 media_id=%s (旧草稿已删除)\n登录公众号草稿箱查看最新版。\n", newID)
+				fmt.Printf("[wechat] ✅ 图文草稿已替换, 新 media_id=%s (旧草稿已删除)\n", newID)
+				publishExtraMedia(c, title, md, imgPaths, audioPath, videoPath, newspic, genAudio, genVideo)
+				fmt.Printf("登录公众号草稿箱/素材库查看最新版。\n")
 				return nil
 			}
 			fmt.Printf("[wechat] 草稿模式: 渲染 mermaid + 上传图片 + 建草稿 (appid=%s)\n", wcfg.AppID)
@@ -118,7 +180,9 @@ func wechatCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("建草稿失败: %w", err)
 			}
-			fmt.Printf("[wechat] ✅ 草稿已创建 media_id=%s\n登录公众号后台「草稿箱」即可预览并群发。\n", mediaID)
+			fmt.Printf("[wechat] ✅ 图文草稿已创建 media_id=%s\n", mediaID)
+			publishExtraMedia(c, title, md, imgPaths, audioPath, videoPath, newspic, genAudio, genVideo)
+			fmt.Printf("登录公众号后台「草稿箱/素材库」即可预览。\n")
 			return nil
 		},
 	}
@@ -130,8 +194,74 @@ func wechatCmd() *cobra.Command {
 	cmd.Flags().StringVar(&outDir, "out", "", "输出目录 (预览模式)")
 	cmd.Flags().BoolVar(&draft, "draft", false, "调用公众号 API 建草稿 (需服务器 IP 在白名单)")
 	cmd.Flags().StringVar(&updateID, "update", "", "更新已有草稿的 media_id (配合 --draft, 不新建)")
+	cmd.Flags().StringVar(&genImages, "gen-images", "", "生成文章配图风格: card(要点卡片) | illustration(AI插画)")
+	cmd.Flags().IntVar(&imgCount, "img-count", 4, "生成配图数量 (第一张作封面)")
+	cmd.Flags().BoolVar(&newspic, "newspic", false, "把配图发布为「图片消息」(贴图)草稿 (配合 --draft)")
+	cmd.Flags().BoolVar(&genAudio, "gen-audio", false, "用 edge-tts 生成文章朗读音频 (--draft 时上传为语音素材)")
+	cmd.Flags().BoolVar(&genVideo, "gen-video", false, "用配图合成讲解视频 (--draft 时上传为视频素材)")
 	return cmd
 }
+
+// publishExtraMedia 在已建图文草稿后, 按勾选追加发布: 图片消息(贴图)草稿 + 视频/音频永久素材。
+func publishExtraMedia(c *wechat.Client, title, md string, imgPaths []string, audioPath, videoPath string, newspic, genAudio, genVideo bool) {
+	if newspic && len(imgPaths) > 0 {
+		var ids []string
+		for _, p := range imgPaths {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			id, err := c.AddImageThumb(b, filepath.Base(p)) // add_material?type=image → 永久 media_id
+			if err != nil {
+				fmt.Printf("  ⚠️ 图片上传失败 %s: %v\n", filepath.Base(p), err)
+				continue
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) > 0 {
+			if mid, err := c.AddNewspicDraft(title, firstNonHeadingLine(md, 120), ids); err == nil {
+				fmt.Printf("[wechat] ✅ 图片消息(贴图)草稿已创建 media_id=%s (%d 张)\n", mid, len(ids))
+			} else {
+				fmt.Printf("  ⚠️ 图片消息草稿失败: %v\n", err)
+			}
+		}
+	}
+	if genAudio && audioPath != "" {
+		if b, err := os.ReadFile(audioPath); err == nil {
+			if id, err := c.AddMaterialVoice(b, filepath.Base(audioPath)); err == nil {
+				fmt.Printf("[wechat] ✅ 语音素材已上传 media_id=%s\n", id)
+			} else {
+				fmt.Printf("  ⚠️ 语音素材上传失败: %v\n", err)
+			}
+		}
+	}
+	if genVideo && videoPath != "" {
+		if b, err := os.ReadFile(videoPath); err == nil {
+			if id, err := c.AddMaterialVideo(b, filepath.Base(videoPath), title, "techblog 讲解视频"); err == nil {
+				fmt.Printf("[wechat] ✅ 视频素材已上传 media_id=%s\n", id)
+			} else {
+				fmt.Printf("  ⚠️ 视频素材上传失败: %v\n", err)
+			}
+		}
+	}
+}
+
+// firstNonHeadingLine 取首段非标题正文 (newspic 的 content/摘要)。
+func firstNonHeadingLine(md string, max int) string {
+	for _, ln := range strings.Split(md, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "!") || strings.HasPrefix(t, "|") {
+			continue
+		}
+		if len([]rune(t)) > max {
+			t = string([]rune(t)[:max])
+		}
+		return t
+	}
+	return title2OrEmpty(md)
+}
+
+func title2OrEmpty(md string) string { return inferTitle(md) }
 
 func resolveWechatConfigPath() string {
 	if flagConfig != "" {

@@ -15,9 +15,11 @@ package media
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/chromedp/cdproto/emulation"
@@ -50,6 +52,53 @@ const detectAnimationsJS = `(function(){
   } catch (e) { return false; }
 })()`
 
+// animationDurationJS 计算页面所有动画结束时刻的最大值 (毫秒), 即"整段动画时长"。
+// getComputedTiming().endTime 已含 delay + activeDuration + endDelay; 再加上 startTime
+// 兼容延迟启动的动画。无限循环动画 (endTime=Infinity) 跳过 → 由调用方回退到默认时长。
+// 用途: 视频渲染按真实动画时长截全部场景, 而非固定 5s 只截到开头。
+const animationDurationJS = `(function(){
+  try {
+    var anims = (document.getAnimations ? document.getAnimations() : []) || [];
+    var maxMs = 0;
+    for (var i = 0; i < anims.length; i++) {
+      try {
+        var a = anims[i];
+        if (!a.effect || !a.effect.getComputedTiming) continue;
+        var end = a.effect.getComputedTiming().endTime;
+        if (typeof end !== 'number' || !isFinite(end)) continue;
+        var st = (typeof a.startTime === 'number' && isFinite(a.startTime)) ? a.startTime : 0;
+        if (st < 0) st = 0;
+        var total = st + end;
+        if (total > maxMs) maxMs = total;
+      } catch (e) {}
+    }
+    return maxMs;
+  } catch (e) { return 0; }
+})()`
+
+// durationHintJS 读取 HTML 显式声明的视频时长 (秒): <body data-duration="N"> 或
+// <meta name="video-duration" content="N">。这是 html-developer 与渲染器之间的"时长契约",
+// 对 JS 定时器(setTimeout)驱动的多场景动画尤其必要 (静态无法推断其总时长)。
+const durationHintJS = `(function(){
+  try {
+    var d = 0, b = document.body;
+    if (b) { var ds = b.getAttribute('data-duration'); if (ds) d = parseFloat(ds) || 0; }
+    if (!d) { var m = document.querySelector('meta[name="video-duration"]'); if (m) d = parseFloat(m.getAttribute('content')) || 0; }
+    return d > 0 ? d : 0;
+  } catch (e) { return 0; }
+})()`
+
+// timeDrivenJS 粗判页面是否依赖 JS 定时器/帧循环推进 (setTimeout/setInterval/rAF)。
+// 若是, 必须用墙钟实时回放截图 (确定性 seek 只能拨 Web Animations 的 currentTime,
+// 拨不动 setTimeout → 场景不切换, 视频会卡在开头)。
+const timeDrivenJS = `(function(){
+  try {
+    var s = document.querySelectorAll('script'), t = '';
+    for (var i = 0; i < s.length; i++) { t += s[i].textContent || ''; }
+    return /setTimeout|setInterval|requestAnimationFrame/.test(t);
+  } catch (e) { return false; }
+})()`
+
 // captureFrames 把 htmlPath 渲染成 framesDir 下的 frame_%06d.png 序列。
 // 返回成功捕获的帧数。优先用确定性 Web Animations seek; 无动画时回退到定时截图。
 func (e *Engine) captureFrames(ctx context.Context, htmlPath, framesDir string, fps, durationSec int) (int, error) {
@@ -59,27 +108,56 @@ func (e *Engine) captureFrames(ctx context.Context, htmlPath, framesDir string, 
 	if fps <= 0 {
 		fps = 30
 	}
-	if durationSec <= 0 {
-		durationSec = 5
-	}
-	totalFrames := fps * durationSec
-	if totalFrames > maxRenderFrames {
-		totalFrames = maxRenderFrames
-	}
 
 	taskCtx, cancel := e.newBrowserCtx(ctx, 8*time.Minute)
 	defer cancel()
 
 	fileURL := "file://" + htmlPath
-	var deterministic bool
+	var hasSeekable, timeDriven bool
+	var animEndMs, durHintSec float64
 	if err := chromedp.Run(taskCtx,
 		chromedp.Navigate(fileURL),
 		emulation.SetDeviceMetricsOverride(int64(e.Width), int64(e.Height), 1.0, false),
 		chromedp.WaitReady("body"),
 		chromedp.Sleep(400*time.Millisecond),
-		chromedp.Evaluate(detectAnimationsJS, &deterministic),
+		chromedp.Evaluate(detectAnimationsJS, &hasSeekable),
+		chromedp.Evaluate(animationDurationJS, &animEndMs),
+		chromedp.Evaluate(durationHintJS, &durHintSec),
+		chromedp.Evaluate(timeDrivenJS, &timeDriven),
 	); err != nil {
 		return 0, fmt.Errorf("导航失败: %w", err)
+	}
+
+	// durationSec<=0: 自动决定时长, 确保截到全部场景 (修复"固定5s只截开头、后续场景丢失")。
+	// 优先级: 显式时长契约 data-duration > 时间驱动兜底 > Web Animations 总时长。
+	// 注意: 时间驱动页面的 animEndMs 只覆盖局部入场/循环动画 (偏小不可信), 故排在兜底之后。
+	if durationSec <= 0 {
+		switch {
+		case durHintSec > 0:
+			durationSec = int(math.Ceil(durHintSec))
+		case timeDriven:
+			durationSec = timedSceneDefaultSec
+			if s := int(math.Ceil(animEndMs/1000.0)) + 1; s > durationSec {
+				durationSec = s
+			}
+		case animEndMs > 0:
+			durationSec = int(math.Ceil(animEndMs/1000.0)) + 1 // +1s 收尾缓冲
+		}
+		if durationSec < 5 {
+			durationSec = 5
+		}
+	}
+	if durationSec > maxVideoSec {
+		durationSec = maxVideoSec
+	}
+
+	// 截帧模式: 仅"纯 CSS/Web Animations 且不靠 JS 定时器推进"时用确定性 seek (精确无漂移);
+	// 一旦页面靠 setTimeout/setInterval/rAF 推进, 必须墙钟实时回放, 否则场景不切换。
+	deterministic := hasSeekable && !timeDriven
+
+	totalFrames := fps * durationSec
+	if totalFrames > maxRenderFrames {
+		totalFrames = maxRenderFrames
 	}
 
 	frameInterval := float64(1000) / float64(fps) // 每帧对应的动画毫秒数
@@ -233,8 +311,49 @@ func (e *Engine) renderGIF(ctx context.Context, htmlPath, name string) RenderRes
 		return RenderResult{Format: "gif", Error: err.Error()}
 	}
 	os.RemoveAll(framesDir)
-	_ = n
-	return RenderResult{Format: "gif", FilePath: outPath, Size: fileSize(outPath)}
+	return RenderResult{Format: "gif", FilePath: outPath, Size: fileSize(outPath), MediaSeconds: float64(n) / float64(fps)}
+}
+
+// SlideshowFromImages 把若干同尺寸图片合成一段幻灯片视频 (每张定长, 简单硬切)。
+// 用于"文章配图 → 短视频"(可再用 MuxAudio 叠加朗读解说)。返回输出路径。
+func SlideshowFromImages(ctx context.Context, imgPaths []string, outPath string, secsPer int, fps int) error {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return fmt.Errorf("ffmpeg 未安装")
+	}
+	if len(imgPaths) == 0 {
+		return fmt.Errorf("无图片")
+	}
+	if secsPer <= 0 {
+		secsPer = 4
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+	// concat demuxer 列表: 每张图 duration 秒; 末张需重复一次 (ffmpeg concat 末项 duration 被忽略)。
+	var lst strings.Builder
+	for _, p := range imgPaths {
+		ap, _ := filepath.Abs(p)
+		lst.WriteString("file '" + strings.ReplaceAll(ap, "'", "'\\''") + "'\n")
+		lst.WriteString(fmt.Sprintf("duration %d\n", secsPer))
+	}
+	last, _ := filepath.Abs(imgPaths[len(imgPaths)-1])
+	lst.WriteString("file '" + strings.ReplaceAll(last, "'", "'\\''") + "'\n")
+
+	listFile := outPath + ".concat.txt"
+	if err := os.WriteFile(listFile, []byte(lst.String()), 0o644); err != nil {
+		return err
+	}
+	defer os.Remove(listFile)
+
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listFile,
+		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps="+fmt.Sprintf("%d", fps),
+		"-pix_fmt", "yuv420p", "-c:v", "libx264", outPath)
+	if b, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ffmpeg 合成幻灯片失败: %v\n%s", err, string(b))
+	}
+	return nil
 }
 
 // MuxAudio 把音频轨混流进视频 (视频已有则替换音轨)。用于"图文→带解说短视频"闭环。

@@ -2309,7 +2309,8 @@ func buildEngine() (*engine.QueryEngine, error) {
 	skillReg := skills.NewRegistry()
 	skillReg.LoadDefaults(cwd)
 	if skillReg.Count() > 0 {
-		promptMgr.SkillListing = skillReg.FormatShortListing(8)
+		// 0 = 不设软上限, 由描述字符预算约束; 所有技能名称始终可见, 保证 Skill 工具可被正确调用。
+		promptMgr.SkillListing = skillReg.FormatShortListing(0)
 	}
 
 	effectiveMaxTokens := flagMaxTokens

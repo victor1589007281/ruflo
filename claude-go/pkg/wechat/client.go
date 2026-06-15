@@ -162,14 +162,74 @@ func (c *Client) AddImageThumb(img []byte, filename string) (string, error) {
 	return out.MediaID, nil
 }
 
-// DraftArticle 草稿图文。
+// DraftArticle 草稿文章。article_type="news"(图文, 默认) 或 "newspic"(图片消息/贴图)。
 type DraftArticle struct {
-	Title            string `json:"title"`
-	Author           string `json:"author,omitempty"`
-	Digest           string `json:"digest,omitempty"`
-	Content          string `json:"content"` // 公众号安全内联 HTML
-	ContentSourceURL string `json:"content_source_url,omitempty"`
-	ThumbMediaID     string `json:"thumb_media_id"`
+	ArticleType      string            `json:"article_type,omitempty"` // ""/"news" | "newspic"
+	Title            string            `json:"title"`
+	Author           string            `json:"author,omitempty"`
+	Digest           string            `json:"digest,omitempty"`
+	Content          string            `json:"content,omitempty"` // 公众号安全内联 HTML (news 必填)
+	ContentSourceURL string            `json:"content_source_url,omitempty"`
+	ThumbMediaID     string            `json:"thumb_media_id,omitempty"` // news 封面
+	ImageInfo        *NewsPicImageInfo `json:"image_info,omitempty"`     // newspic 图片列表
+}
+
+// NewsPicImageInfo / NewsPicImage: 图片消息(newspic)的图片列表 (最多 20 张, 第一张作封面)。
+type NewsPicImageInfo struct {
+	ImageList []NewsPicImage `json:"image_list"`
+}
+type NewsPicImage struct {
+	ImageMediaID string `json:"image_media_id"` // 永久图片素材 media_id (来自 add_material?type=image)
+}
+
+// AddNewspicDraft 新建"图片消息"(贴图)草稿。imageMediaIDs 为永久图片素材 media_id (第一张=封面)。
+func (c *Client) AddNewspicDraft(title, content string, imageMediaIDs []string) (string, error) {
+	if len(imageMediaIDs) == 0 {
+		return "", fmt.Errorf("图片消息至少需要一张图片")
+	}
+	imgs := make([]NewsPicImage, 0, len(imageMediaIDs))
+	for _, id := range imageMediaIDs {
+		imgs = append(imgs, NewsPicImage{ImageMediaID: id})
+	}
+	return c.AddDraft(DraftArticle{
+		ArticleType: "newspic", Title: title, Content: content,
+		ImageInfo: &NewsPicImageInfo{ImageList: imgs},
+	})
+}
+
+// AddMaterialVoice 上传语音为永久素材 (<=2MB, mp3/wav/amr), 返回 media_id。
+func (c *Client) AddMaterialVoice(data []byte, filename string) (string, error) {
+	return c.addMaterial("voice", filename, data, nil)
+}
+
+// AddMaterialVideo 上传视频为永久素材 (<=10MB, mp4), 需 description{title,introduction}, 返回 media_id。
+func (c *Client) AddMaterialVideo(data []byte, filename, title, intro string) (string, error) {
+	desc, _ := json.Marshal(map[string]string{"title": title, "introduction": intro})
+	return c.addMaterial("video", filename, data, map[string]string{"description": string(desc)})
+}
+
+// addMaterial 通用永久素材上传。对应 cgi-bin/material/add_material?type=image|voice|video。
+func (c *Client) addMaterial(mediaType, filename string, data []byte, extra map[string]string) (string, error) {
+	token, err := c.AccessToken()
+	if err != nil {
+		return "", err
+	}
+	u := fmt.Sprintf("%s/cgi-bin/material/add_material?access_token=%s&type=%s", apiBase, url.QueryEscape(token), mediaType)
+	body, err := c.postMultipartFields(u, "media", filename, data, extra)
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		wxErr
+		MediaID string `json:"media_id"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("解析 add_material(%s) 响应失败: %w (%s)", mediaType, err, string(body))
+	}
+	if e := out.wxErr.err(); e != nil {
+		return "", e
+	}
+	return out.MediaID, nil
 }
 
 // AddDraft 新建草稿, 返回草稿 media_id。对应 cgi-bin/draft/add。
@@ -288,6 +348,11 @@ func (c *Client) DeleteDraft(mediaID string) error {
 }
 
 func (c *Client) postMultipart(u, field, filename string, data []byte) ([]byte, error) {
+	return c.postMultipartFields(u, field, filename, data, nil)
+}
+
+// postMultipartFields 在文件字段外附带额外表单字段 (如视频素材的 description)。
+func (c *Client) postMultipartFields(u, field, filename string, data []byte, extra map[string]string) ([]byte, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 	fw, err := w.CreateFormFile(field, filename)
@@ -296,6 +361,9 @@ func (c *Client) postMultipart(u, field, filename string, data []byte) ([]byte, 
 	}
 	if _, err := fw.Write(data); err != nil {
 		return nil, err
+	}
+	for k, v := range extra {
+		_ = w.WriteField(k, v)
 	}
 	w.Close()
 	ct := w.FormDataContentType()

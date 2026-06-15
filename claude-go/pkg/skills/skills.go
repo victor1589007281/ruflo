@@ -40,6 +40,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -193,6 +194,9 @@ func (r *Registry) All() []*Skill {
 	for _, s := range r.skills {
 		result = append(result, s)
 	}
+	// 确定性排序 (按名称)。否则 map 迭代顺序随机, 导致每次重载时
+	// 技能清单 / Skill 工具回退列表暴露的顺序漂移, 截断时还会随机隐藏不同技能。
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
 
@@ -240,29 +244,56 @@ func (r *Registry) FormatListing() string {
 	return sb.String()
 }
 
+// shortListingDescBudget 是精简清单中"描述"部分的总字符(rune)预算。
+// 名称不计入预算且永远写出; 描述在预算耗尽后被丢弃(仅留名称),
+// 这样技能数量增长时 prompt 体积可控, 同时所有技能始终可被发现。
+// ~2400 runes ≈ 600 tokens, 足以容纳数十个技能的描述。
+const shortListingDescBudget = 2400
+
+// truncateRunes 按 rune 截断, 避免切坏多字节 UTF-8 (如中文描述)。
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= max {
+		return s
+	}
+	return string(rs[:max]) + "…"
+}
+
 // FormatShortListing 格式化精简技能清单。
 // 用于长驻 Bot/system prompt: 只暴露可发现性，不把完整 when_to_use 清单重复塞进每次请求。
+//
+// 与旧实现的区别 (修复"技能数 >limit 时其余技能名称不可见、无法被 Skill 工具调用"的可发现性缺陷):
+//   - 所有技能名称始终列出 (确定性排序), 不再随机隐藏在 "N more skills" 计数里;
+//   - 描述受字符预算约束, 预算耗尽后只保留名称, 保证清单体积随技能增长平滑可控;
+//   - limit (>0) 作为"展示完整描述的技能数"软上限; <=0 表示不设上限, 仅由预算约束。
 func (r *Registry) FormatShortListing(limit int) string {
-	skills := r.All()
+	skills := r.All() // 已按名称确定性排序
 	if len(skills) == 0 {
 		return ""
 	}
-	if limit <= 0 || limit > len(skills) {
+	if limit <= 0 {
 		limit = len(skills)
 	}
 
 	var sb strings.Builder
 	sb.WriteString("<available_skills summary=\"short\">\n")
-	for _, s := range skills[:limit] {
-		desc := s.Description
-		if len(desc) > 140 {
-			desc = desc[:140] + "...(truncated)"
+	usedDesc := 0
+	for i, s := range skills {
+		line := "- " + s.Name
+		// 名称恒写出; 描述受 limit 与剩余预算双重约束
+		if i < limit && usedDesc < shortListingDescBudget && s.Description != "" {
+			desc := truncateRunes(s.Description, 140)
+			if usedDesc+len([]rune(desc)) <= shortListingDescBudget {
+				line += ": " + desc
+				usedDesc += len([]rune(desc))
+			}
 		}
-		sb.WriteString(fmt.Sprintf("- %s: %s\n", s.Name, desc))
+		sb.WriteString(line + "\n")
 	}
-	if len(skills) > limit {
-		sb.WriteString(fmt.Sprintf("- ... %d more skills. Use the Skill tool by name to load details.\n", len(skills)-limit))
-	}
+	sb.WriteString("Use the Skill tool with a skill name to load its full instructions.\n")
 	sb.WriteString("</available_skills>\n")
 	return sb.String()
 }
