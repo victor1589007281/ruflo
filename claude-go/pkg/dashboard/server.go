@@ -204,7 +204,9 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	// v1.1 扩展
 	mux.HandleFunc("/api/workflows", s.handleWorkflows)
 	mux.HandleFunc("/api/workflows/generate", s.handleWorkflowGenerate) // LLM 生成编排 (更具体, 优先于下面)
-	mux.HandleFunc("/api/roles", s.handleRoles)                         // 角色富信息 (供详细 DAG 节点面板)
+	mux.HandleFunc("/api/roles", s.handleRoles)                         // 角色富信息 (DAG 节点面板 / Agents 展示页; 无 names 则列全部)
+	mux.HandleFunc("/api/intent", s.handleIntent)                       // 会话意图识别 (LLM 语义: 是否需编排 + workflow/objective)
+	mux.HandleFunc("/api/verify-goal", s.handleVerifyGoal)              // 目标验收 (供会话编排目标循环: 未达成带 gap 重跑)
 	// 能力管理: skills / tools / MCP / 引用关系
 	mux.HandleFunc("/api/skills", s.handleSkills)                  // GET 列表 / POST 创建
 	mux.HandleFunc("/api/skills/generate", s.handleSkillGenerate) // LLM 生成 skill 草稿

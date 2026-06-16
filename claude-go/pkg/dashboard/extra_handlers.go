@@ -100,16 +100,176 @@ type roleInfoDTO struct {
 	Found        bool     `json:"found"`
 }
 
+// simpleCompleteFn 把 cfg.LLMComplete 适配为 agent.LLMClient (供意图识别器用)。
+type simpleCompleteFn func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+
+func (f simpleCompleteFn) SimpleComplete(ctx context.Context, sys, user string) (string, error) {
+	return f(ctx, sys, user)
+}
+
+// handleIntent POST /api/intent {text} — 识别一条会话消息是否为"需编排多agent完成的目标"。
+// 供 webapp 会话做自动编排路由: orchestrate=true 时建议用 workflow 跑团队(默认 swarm 自动拆解),
+// 否则走普通单 agent 对话。复用 IntentRecognizer (关键词 + LLM 参数提取)。
+func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var in struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || strings.TrimSpace(in.Text) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("text 必填"))
+		return
+	}
+	// 优先 LLM 语义分类 (理解意图, 而非正则关键词匹配)。
+	if s.cfg.LLMComplete != nil {
+		if resp, ok := s.llmClassifyIntent(r.Context(), in.Text); ok {
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+	}
+	// 回退: 关键词识别器 (仅在 LLM 不可用时)。
+	rec := agent.NewIntentRecognizer(nil)
+	intent := rec.Recognize(r.Context(), in.Text)
+	resp := map[string]any{"orchestrate": false, "via": "keyword-fallback"}
+	if intent != nil && intent.Action == "create_and_run" && intent.Confidence >= 0.6 {
+		obj := intent.Objective
+		if strings.TrimSpace(obj) == "" {
+			obj = in.Text
+		}
+		wf := intent.Workflow
+		if strings.TrimSpace(wf) == "" {
+			wf = "swarm"
+		}
+		resp["orchestrate"] = true
+		resp["objective"] = obj
+		resp["workflow"] = wf
+		resp["confidence"] = intent.Confidence
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// llmClassifyIntent 用 LLM 语义判断: 该消息是"需编排多 agent 完成的任务目标"还是普通对话。
+// 返回 (resp, true) 表示成功; (nil,false) 表示 LLM 失败, 调用方回退关键词。
+func (s *Server) llmClassifyIntent(ctx context.Context, text string) (map[string]any, bool) {
+	var wfs strings.Builder
+	for _, wf := range agent.ListWorkflows() {
+		desc := wf.Description
+		if len(desc) > 60 {
+			desc = desc[:60]
+		}
+		wfs.WriteString(fmt.Sprintf("- %s: %s\n", wf.Name, desc))
+	}
+	sys := "你是任务路由分类器。判断用户消息是'需要多步/动手才能完成的任务目标'(应编排团队多agent执行) 还是'普通对话/提问/查询/闲聊'(单agent回答即可)。只输出 JSON, 不要解释。"
+	user := fmt.Sprintf(`可用工作流 (选最匹配的; 都不匹配则用 swarm 自动拆解):
+%s
+用户消息: %q
+
+只输出: {"orchestrate": true/false, "workflow": "工作流名或swarm", "objective": "把消息整理成清晰、命令式的执行目标", "confidence": 0到1, "reason": "一句话判断依据"}
+判定 orchestrate=true 仅当用户想"做出某产物/完成某复杂任务"(如: 开发/实现某功能、调研某主题并成文、制作图文音视频、多步分析报告)。
+判定 false: 简单提问、概念解释、闲聊、打招呼、查询状态、单轮即可答完的请求。`, wfs.String(), text)
+
+	out, err := s.cfg.LLMComplete(ctx, sys, user)
+	if err != nil {
+		return nil, false
+	}
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start < 0 || end <= start {
+		return nil, false
+	}
+	var parsed struct {
+		Orchestrate bool    `json:"orchestrate"`
+		Workflow    string  `json:"workflow"`
+		Objective   string  `json:"objective"`
+		Confidence  float64 `json:"confidence"`
+		Reason      string  `json:"reason"`
+	}
+	if json.Unmarshal([]byte(out[start:end+1]), &parsed) != nil {
+		return nil, false
+	}
+	resp := map[string]any{
+		"orchestrate": parsed.Orchestrate, "confidence": parsed.Confidence,
+		"reason": parsed.Reason, "via": "llm",
+	}
+	if parsed.Orchestrate {
+		obj := strings.TrimSpace(parsed.Objective)
+		if obj == "" {
+			obj = text
+		}
+		wf := strings.TrimSpace(parsed.Workflow)
+		if wf == "" || agent.GetWorkflow(wf) == nil && wf != "swarm" {
+			wf = "swarm"
+		}
+		resp["objective"] = obj
+		resp["workflow"] = wf
+	}
+	return resp, true
+}
+
+// handleVerifyGoal POST /api/verify-goal {objective, result} — LLM 验收: 结果是否达成目标。
+// 供会话编排的"目标循环": 未达成则带 gap 反馈重跑。
+func (s *Server) handleVerifyGoal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var in struct {
+		Objective string `json:"objective"`
+		Result    string `json:"result"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || strings.TrimSpace(in.Objective) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("objective 必填"))
+		return
+	}
+	if s.cfg.LLMComplete == nil {
+		// LLM 不可用: 保守认为已达成 (避免无限重跑)
+		writeJSON(w, http.StatusOK, map[string]any{"met": true, "score": 6, "gap": "", "via": "no-llm"})
+		return
+	}
+	result := in.Result
+	if len(result) > 7000 {
+		result = result[:7000]
+	}
+	sys := "你是严格的验收员。判断'结果'是否真正达成了'目标'。只输出 JSON, 不要解释。"
+	user := fmt.Sprintf(`目标:
+%s
+
+结果:
+%s
+
+只输出: {"met": true/false, "score": 0到10, "gap": "若未达成, 给出具体差距与下一轮必须改进的点(命令式); 达成则空串"}`, in.Objective, result)
+	out, err := s.cfg.LLMComplete(r.Context(), sys, user)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"met": true, "score": 6, "gap": "", "via": "llm-error"})
+		return
+	}
+	st, en := strings.Index(out, "{"), strings.LastIndex(out, "}")
+	resp := map[string]any{"met": true, "score": 6, "gap": ""}
+	if st >= 0 && en > st {
+		var parsed struct {
+			Met   bool    `json:"met"`
+			Score float64 `json:"score"`
+			Gap   string  `json:"gap"`
+		}
+		if json.Unmarshal([]byte(out[st:en+1]), &parsed) == nil {
+			resp = map[string]any{"met": parsed.Met, "score": parsed.Score, "gap": parsed.Gap}
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // handleRoles GET /api/roles?names=a,b,c — 批量返回角色富信息 (description/systemPrompt/真实skills/tags)。
 // 注: tools/MCP 是全局的(角色无 per-role 工具映射), 不在此返回, 由前端如实标注。
 func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request) {
 	reg := agent.NewRoleRegistry(s.cfg.StateDir)
 	out := []roleInfoDTO{}
 	seen := map[string]bool{}
-	for _, n := range strings.Split(r.URL.Query().Get("names"), ",") {
+	describe := func(n string) {
 		n = strings.TrimSpace(n)
 		if n == "" || seen[n] {
-			continue
+			return
 		}
 		seen[n] = true
 		dto := roleInfoDTO{Name: n}
@@ -125,6 +285,19 @@ func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request) {
 			dto.SystemPrompt = rd.SystemPrompt
 		}
 		out = append(out, dto)
+	}
+	names := strings.TrimSpace(r.URL.Query().Get("names"))
+	if names == "" {
+		// 无 names: 返回全部 agent (供 webapp Agents 展示页)
+		all := reg.Names()
+		sort.Strings(all)
+		for _, n := range all {
+			describe(n)
+		}
+	} else {
+		for _, n := range strings.Split(names, ",") {
+			describe(n)
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
