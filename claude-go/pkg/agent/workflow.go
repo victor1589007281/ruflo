@@ -122,6 +122,7 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"creative":                       creativeWorkflow,
 	"manager-lab-rehearsal-npc":      managerLabRehearsalNPCWorkflow,
 	"manager-lab-rehearsal-critic":   managerLabRehearsalCriticWorkflow,
+	"manager-lab-simulation-v2":      managerLabSimulationV2Workflow,
 }
 
 // GetWorkflow 获取工作流: 先查内置, 再查运行时注册的动态工作流. 都没有返回 nil.

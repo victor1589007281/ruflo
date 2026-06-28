@@ -57,3 +57,13 @@ func TestValidateAgentOutputStillDetectsAPIErrorWrapper(t *testing.T) {
 		t.Fatalf("expected API wrapper to be detected, got %q", reason)
 	}
 }
+
+func TestManagerLabSimulationV2WorkflowIsValid(t *testing.T) {
+	wf := GetWorkflow("manager-lab-simulation-v2")
+	if wf == nil {
+		t.Fatal("manager-lab-simulation-v2 workflow should be registered")
+	}
+	if err := wf.Validate(nil); err != nil {
+		t.Fatalf("manager-lab-simulation-v2 should validate: %v", err)
+	}
+}
