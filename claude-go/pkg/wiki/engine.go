@@ -323,6 +323,7 @@ type LLMClient interface {
 type BrowserFetcher interface {
 	Available() bool
 	Fetch(ctx context.Context, url string) (title, text, html string, err error)
+	Search(ctx context.Context, query string) (title, text, html string, err error)
 }
 
 // Engine 是 LLM Wiki 知识库的运行时入口，负责摄取、查询与质检。
@@ -343,7 +344,58 @@ func (e *Engine) SetBrowser(b BrowserFetcher) {
 	e.browser = b
 }
 
-// BrokenLink 表示从源页指向不存在目标页的坏链。
+// WebSearch 使用浏览器搜索引擎搜索 query，返回纯文本摘要。
+// 如果浏览器不可用或未配置，返回空字符串和错误。
+func (e *Engine) WebSearch(ctx context.Context, query string) (string, error) {
+	if e.browser == nil {
+		return "", fmt.Errorf("web search: browser fetcher not configured")
+	}
+	if !e.browser.Available() {
+		return "", fmt.Errorf("web search: browser not available (no Chrome)")
+	}
+	title, text, _, err := e.browser.Search(ctx, query)
+	if err != nil {
+		return "", fmt.Errorf("web search: %w", err)
+	}
+	var b strings.Builder
+	if title != "" {
+		fmt.Fprintf(&b, "搜索结果: %s\n\n", title)
+	}
+	b.WriteString(strings.TrimSpace(text))
+	return b.String(), nil
+}
+
+// QueryWithWebSearch 先搜索网络，再基于 wiki 内容回答。
+func (e *Engine) QueryWithWebSearch(ctx context.Context, question string) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.RepoDir == "" {
+		return "", fmt.Errorf("wiki: RepoDir 未设置")
+	}
+	if err := EnsureRepo(e.RepoDir); err != nil {
+		return "", err
+	}
+	q := strings.TrimSpace(question)
+	if q == "" {
+		return "", fmt.Errorf("wiki: 问题为空")
+	}
+
+	searchText, searchErr := e.WebSearch(ctx, q)
+	bundle, err := buildWikiContextBundle(e.RepoDir, 12000)
+	if err != nil {
+		return "", err
+	}
+	var user strings.Builder
+	user.WriteString("用户问题:\n")
+	user.WriteString(q)
+	if searchErr == nil && strings.TrimSpace(searchText) != "" {
+		user.WriteString("\n\n---\n联网搜索结果（供参考）:\n")
+		user.WriteString(truncateRunes(searchText, 4000))
+	}
+	user.WriteString("\n\n---\n目录与摘录:\n")
+	user.WriteString(bundle)
+	return e.completeLLM(ctx, querySystemPrompt, user.String())
+}
 type BrokenLink struct {
 	SourcePage string // 含有错误链接的 wiki 页面文件名（不含路径）
 	TargetPage string // 被引用但缺失的目标 slug

@@ -40,6 +40,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/skills"
 	swarm_intel "github.com/anthropic/claude-go/pkg/swarm_intel"
+	claudesync "github.com/anthropic/claude-go/pkg/sync"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/anthropic/claude-go/pkg/vision"
@@ -143,6 +144,14 @@ func (w *wikiBrowserAdapter) Fetch(ctx context.Context, url string) (title, text
 	return result.Title, result.Text, result.HTML, nil
 }
 
+func (w *wikiBrowserAdapter) Search(ctx context.Context, query string) (title, text, html string, err error) {
+	result, err := w.client.Search(ctx, query)
+	if err != nil {
+		return "", "", "", err
+	}
+	return result.Title, result.Text, result.HTML, nil
+}
+
 // browserSearchAdapter 适配 browser.Client 到 builtin.WebSearcher 接口。
 type browserSearchAdapter struct {
 	client *browser.Client
@@ -216,6 +225,7 @@ type Bot struct {
 	aliasMetrics  *modelconfig.AliasMetricsCollector // 别名级 LLM 指标采集器
 	modelRegistry *modelconfig.ProviderRegistry      // 模型注册表 (新模式)
 	modelResolver *modelconfig.ConfigResolver        // 模型配置解析器 (新模式)
+	syncScheduler *claudesync.Scheduler              // 外部数据源同步调度器
 	startTime     time.Time                          // 启动时间
 
 	// 消息去重: 防止同一条消息触发多个团队
@@ -567,11 +577,18 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				}
 			}
 		})
+
+		// 初始化外部数据源同步调度器
+		bot.syncScheduler = claudesync.NewScheduler(config.Sync)
+		bot.registerSyncJobs(config.Sync)
+		bot.syncScheduler.Start()
+
 		// 启动 Wiki HTTP API (供 Obsidian 插件调用)
 		// 同端口还可以通过 config.Wiki.APIExtensions 扩展挂载 dashboard 等 HTTP 服务,
 		// 避免飞书 bot / dashboard 同时监听多个端口。
 		if config.Wiki.APIPort > 0 {
 			wikiAPI := wiki.NewAPIServer(bot.wikiEngine, config.Wiki.APISecret)
+			wikiAPI.SetScheduler(bot.syncScheduler)
 			for _, ext := range config.Wiki.APIExtensions {
 				if ext == nil {
 					continue
@@ -814,6 +831,9 @@ func (b *Bot) Start(ctx context.Context) error {
 func (b *Bot) Shutdown() {
 	if b.cronSched != nil {
 		b.cronSched.Stop()
+	}
+	if b.syncScheduler != nil {
+		b.syncScheduler.Stop()
 	}
 	if b.cfgWatcher != nil {
 		b.cfgWatcher.Stop()
@@ -3485,6 +3505,45 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// registerSyncJobs 根据配置注册 IMA / 微信读书定时同步任务。
+func (b *Bot) registerSyncJobs(cfg claudesync.Config) {
+	if cfg.KnowledgeRepo == "" {
+		return
+	}
+	if cfg.IMA.Enabled && cfg.IMA.Cron != "" {
+		if err := b.syncScheduler.Register("ima", cfg.IMA.Cron, func(ctx context.Context) error {
+			adapter := claudesync.NewIMAAdapter(cfg.IMA.ClientID, cfg.IMA.APIKey)
+			res, err := claudesync.RunSync(cfg, adapter.Source(), adapter)
+			if err != nil {
+				log.Printf("[Sync] IMA 同步失败: %v", err)
+				return err
+			}
+			log.Printf("[Sync] IMA 同步完成: %+v", res)
+			return nil
+		}); err != nil {
+			log.Printf("[Sync] 注册 IMA 任务失败: %v", err)
+		} else {
+			log.Printf("[Sync] IMA 定时同步已注册: %s", cfg.IMA.Cron)
+		}
+	}
+	if cfg.WeRead.Enabled && cfg.WeRead.Cron != "" {
+		if err := b.syncScheduler.Register("weread", cfg.WeRead.Cron, func(ctx context.Context) error {
+			adapter := claudesync.NewWeReadAdapter(cfg.WeRead.APIKey)
+			res, err := claudesync.RunSync(cfg, adapter.Source(), adapter)
+			if err != nil {
+				log.Printf("[Sync] 微信读书同步失败: %v", err)
+				return err
+			}
+			log.Printf("[Sync] 微信读书同步完成: %+v", res)
+			return nil
+		}); err != nil {
+			log.Printf("[Sync] 注册微信读书任务失败: %v", err)
+		} else {
+			log.Printf("[Sync] 微信读书定时同步已注册: %s", cfg.WeRead.Cron)
+		}
+	}
 }
 
 // buildModelConfigJSON 将 BotConfig 转换为 modelconfig.ConfigJSON。

@@ -10,14 +10,17 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/sync"
 )
 
 // APIServer 为 Obsidian 插件等外部客户端提供 HTTP API。
 type APIServer struct {
-	engine *Engine
-	secret string
-	mux    *http.ServeMux
-	server *http.Server
+	engine    *Engine
+	secret    string
+	mux       *http.ServeMux
+	server    *http.Server
+	scheduler *sync.Scheduler
 }
 
 // NewAPIServer 创建 Wiki HTTP API 服务器。
@@ -33,7 +36,16 @@ func NewAPIServer(engine *Engine, secret string) *APIServer {
 	s.mux.HandleFunc("/wiki/lint", s.auth(s.handleLint))
 	s.mux.HandleFunc("/wiki/organize", s.auth(s.handleOrganize))
 	s.mux.HandleFunc("/wiki/health-check", s.auth(s.handleHealthCheck))
+
+	s.mux.HandleFunc("/sync/ima", s.auth(s.handleSyncIMA))
+	s.mux.HandleFunc("/sync/weread", s.auth(s.handleSyncWeRead))
+	s.mux.HandleFunc("/sync/status/", s.auth(s.handleSyncStatus))
 	return s
+}
+
+// SetScheduler 设置同步调度器，启用 /sync/* 端点。
+func (s *APIServer) SetScheduler(sched *sync.Scheduler) {
+	s.scheduler = sched
 }
 
 // Mux 返回 APIServer 内部的 ServeMux, 便于调用方追加路由 (如 dashboard 复用
@@ -140,6 +152,7 @@ func (s *APIServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Question string `json:"question"`
 		Archive  bool   `json:"archive"`
+		WebSearch bool  `json:"webSearch"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -152,6 +165,16 @@ func (s *APIServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
+
+	if req.WebSearch {
+		answer, err := s.engine.QueryWithWebSearch(ctx, req.Question)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"answer": answer})
+		return
+	}
 
 	if req.Archive {
 		answer, archived, err := s.engine.QueryAndArchive(ctx, req.Question)
@@ -230,6 +253,76 @@ func (s *APIServer) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, report)
+}
+
+func (s *APIServer) handleSyncIMA(w http.ResponseWriter, r *http.Request) {
+	s.handleSyncTrigger(w, r, "ima")
+}
+
+func (s *APIServer) handleSyncWeRead(w http.ResponseWriter, r *http.Request) {
+	s.handleSyncTrigger(w, r, "weread")
+}
+
+func (s *APIServer) handleSyncTrigger(w http.ResponseWriter, r *http.Request, source string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
+		return
+	}
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "sync scheduler not configured"})
+		return
+	}
+	cfg := s.scheduler.Config()
+	var fn func(context.Context) error
+	switch source {
+	case "ima":
+		fn = func(ctx context.Context) error {
+			adapter := sync.NewIMAAdapter(cfg.IMA.ClientID, cfg.IMA.APIKey)
+			res, err := sync.RunSync(cfg, adapter.Source(), adapter)
+			if err == nil {
+				log.Printf("[sync/api] IMA sync finished: %+v", res)
+			}
+			return err
+		}
+	case "weread":
+		fn = func(ctx context.Context) error {
+			adapter := sync.NewWeReadAdapter(cfg.WeRead.APIKey)
+			res, err := sync.RunSync(cfg, adapter.Source(), adapter)
+			if err == nil {
+				log.Printf("[sync/api] WeRead sync finished: %+v", res)
+			}
+			return err
+		}
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown source"})
+		return
+	}
+	job := s.scheduler.RunNow(source, fn)
+	log.Printf("[sync/api] triggered %s sync job %s", source, job.ID)
+	writeJSON(w, http.StatusAccepted, map[string]string{"jobId": job.ID})
+}
+
+func (s *APIServer) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only"})
+		return
+	}
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "sync scheduler not configured"})
+		return
+	}
+	prefix := "/sync/status/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing job id"})
+		return
+	}
+	jobID := strings.TrimPrefix(r.URL.Path, prefix)
+	job, ok := s.scheduler.JobStatusByID(jobID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {

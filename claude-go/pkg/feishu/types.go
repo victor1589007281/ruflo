@@ -36,6 +36,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/sandbox"
+	"github.com/anthropic/claude-go/pkg/sync"
 )
 
 // BotConfig 飞书机器人配置
@@ -143,6 +144,9 @@ type BotConfig struct {
 
 	// Sandbox agent 代码执行沙盒配置。
 	Sandbox *sandbox.Config
+
+	// Sync 外部数据源同步配置。
+	Sync sync.Config
 }
 
 // BrowserConfig 浏览器抓取配置。
@@ -234,6 +238,16 @@ type CardElement struct {
 // JSON 配置文件支持
 // 对应 TS: .claude/settings.json 中的配置结构
 // ============================================================================
+
+// SyncSection 外部数据源同步配置段。
+type SyncSection struct {
+	// KnowledgeRepo 知识库根目录。
+	KnowledgeRepo string `json:"knowledgeRepo,omitempty"`
+	// IMA IMA 笔记同步配置。
+	IMA sync.IMAConfig `json:"ima,omitempty"`
+	// WeRead 微信读书同步配置。
+	WeRead sync.WeReadConfig `json:"weread,omitempty"`
+}
 
 // JSONConfig JSON 配置文件的完整结构。
 // 支持通过 --config 参数或 CLAUDE_GO_CONFIG 环境变量指定。
@@ -328,6 +342,9 @@ type JSONConfig struct {
 
 	// CodeIntel Code Intelligence 配置 (MCP Server 与内部工具共用)
 	CodeIntel *CodeIntelSection `json:"codeIntel,omitempty"`
+
+	// Sync 外部数据源同步配置 (IMA / 微信读书)
+	Sync *SyncSection `json:"sync,omitempty"`
 }
 
 // CodeIntelSection Code Intelligence 配置段
@@ -768,5 +785,13 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		if jc.Engine.PromptDebugRedact != nil {
 			bc.PromptDebugRedact = *jc.Engine.PromptDebugRedact
 		}
+	}
+
+	if jc.Sync != nil {
+		if jc.Sync.KnowledgeRepo != "" {
+			bc.Sync.KnowledgeRepo = jc.Sync.KnowledgeRepo
+		}
+		bc.Sync.IMA = jc.Sync.IMA
+		bc.Sync.WeRead = jc.Sync.WeRead
 	}
 }
