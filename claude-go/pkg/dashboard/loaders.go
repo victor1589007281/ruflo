@@ -41,7 +41,15 @@ func (p *Provider) ListCronJobs() ([]CronJobDTO, error) {
 	}
 	var raw []rawCronJob
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, err
+		// CronScheduler.persist() 写的是 map[id]job (JSON 对象); 兼容之。
+		var m map[string]rawCronJob
+		if err2 := json.Unmarshal(data, &m); err2 != nil {
+			return nil, err
+		}
+		raw = make([]rawCronJob, 0, len(m))
+		for _, j := range m {
+			raw = append(raw, j)
+		}
 	}
 	out := make([]CronJobDTO, 0, len(raw))
 	for _, j := range raw {

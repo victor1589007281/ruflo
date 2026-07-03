@@ -1041,7 +1041,19 @@ JSON 配置文件示例:
 
 				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 					func(mux *http.ServeMux) {
-						dashboard.MountOn(*dashCfgRef, mux)
+						dsrv := dashboard.MountOn(*dashCfgRef, mux)
+						// 注入活动定时任务调度器的【解析器】, 启用 /api/cron 写接口(创建/更新/启停/删除)。
+						// 关键: 本闭包在 NewBot 内经 APIExtensions 执行, 早于 `botRef = bot`(NewBot 返回后)
+						// → 此刻 botRef 尚为 nil。故传解析器请求期再取, 与 TeamAction 等同进程回调同一惰性模式。
+						dsrv.SetCronController(func() dashboard.CronController {
+							if botRef == nil {
+								return nil
+							}
+							if cs := botRef.CronScheduler(); cs != nil {
+								return cs
+							}
+							return nil
+						})
 						fmt.Printf("[Dashboard] 已挂载到 wiki API 端口 %d (stateDir=%s)\n",
 							config.Wiki.APIPort, stateDir)
 					})

@@ -162,6 +162,45 @@ func (cs *CronScheduler) ResumeJob(id string) error {
 	return nil
 }
 
+// UpdateJob 更新任务的可变字段 (schedule/name/payload/jobType/workflow/chatId),
+// 保留 ID、CreatedAt 与运行统计。patch 中非空字段才覆盖; enabled 由 Pause/ResumeJob 管理。
+func (cs *CronScheduler) UpdateJob(id string, patch *CronJob) error {
+	if patch.Schedule != "" {
+		if err := validateCronExpr(patch.Schedule); err != nil {
+			return fmt.Errorf("无效的 cron 表达式 %q: %w", patch.Schedule, err)
+		}
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	job, ok := cs.jobs[id]
+	if !ok {
+		return fmt.Errorf("任务 %q 不存在", id)
+	}
+	if patch.Name != "" {
+		job.Name = patch.Name
+	}
+	if patch.Schedule != "" {
+		job.Schedule = patch.Schedule
+	}
+	if patch.JobType != "" {
+		job.JobType = patch.JobType
+	}
+	if patch.Payload != "" {
+		job.Payload = patch.Payload
+	}
+	if patch.Workflow != "" {
+		job.Workflow = patch.Workflow
+	}
+	if patch.ChatID != "" {
+		job.ChatID = patch.ChatID
+	}
+	cs.persist()
+	log.Printf("[Cron] 更新任务: %s (%s) [%s]", job.Name, job.Schedule, job.JobType)
+	return nil
+}
+
 // ListJobs 列出所有任务。
 func (cs *CronScheduler) ListJobs() []*CronJob {
 	cs.mu.RLock()

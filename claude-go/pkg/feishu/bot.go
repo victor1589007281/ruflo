@@ -980,6 +980,9 @@ func (b *Bot) DashboardReloadSkills() {
 	}
 }
 
+// CronScheduler 返回 bot 的活动定时任务调度器, 供挂载的 dashboard 注入以启用 cron 写接口。
+func (b *Bot) CronScheduler() *agent.CronScheduler { return b.cronSched }
+
 // DashboardLLMComplete 供 dashboard 调用 bot 的 LLM 客户端 (用于 LLM 生成工作流编排)。
 func (b *Bot) DashboardLLMComplete(ctx context.Context, sys, user string) (string, error) {
 	if b.apiClient == nil {

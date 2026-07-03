@@ -16,10 +16,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 )
+
+// CronController 是 dashboard 写接口所需的定时任务能力子集。
+// *agent.CronScheduler 已实现全部方法; 由飞书 bot 进程 (:18080) 在挂载 dashboard 时注入其
+// 活动调度器 (见 SetCronController)。独立 dashboard (:7777) 未注入, cronCtl 为 nil,
+// 写接口返回 501, 只读列表照常工作。
+type CronController interface {
+	AddJob(job *agent.CronJob) error
+	RemoveJob(id string) error
+	PauseJob(id string) error
+	ResumeJob(id string) error
+	UpdateJob(id string, patch *agent.CronJob) error
+	GetJob(id string) *agent.CronJob
+	ListJobs() []*agent.CronJob
+}
 
 //go:embed web/*
 var webFS embed.FS
@@ -51,6 +66,21 @@ type Server struct {
 	server   *http.Server
 	jobs     *diagJobStore // 异步 LLM 诊断作业
 	scraper  *metrics.JSONLScraper // JSONL → Prometheus 采集器 (MySQL Exporter 模式)
+	cronCtl  func() CronController // 定时任务写控制器【解析器】(仅 :18080 飞书进程注入; nil/返回nil 时写接口 501)
+}
+
+// SetCronController 注入活动定时任务调度器的【解析器】, 启用 /api/cron 写接口 (创建/更新/启停/删除)。
+// 用解析器而非具体值是关键: dashboard 在 NewBot 内经 APIExtensions 挂载, 那一刻主进程的
+// botRef 尚为 nil(botRef 在 NewBot 返回后才赋值), 必须请求期再解析 —— 与 TeamAction/
+// LLMComplete 等同进程回调同一惰性模式。解析器返回 nil 时写接口 501。
+func (s *Server) SetCronController(fn func() CronController) { s.cronCtl = fn }
+
+// resolveCron 请求期解析活动调度器; 未注入或主进程未就绪时返回 nil (写接口据此 501)。
+func (s *Server) resolveCron() CronController {
+	if s.cronCtl == nil {
+		return nil
+	}
+	return s.cronCtl()
 }
 
 // NewServer 构造 dashboard server。
@@ -193,7 +223,8 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/teams/", s.handleTeamDetail)
 	mux.HandleFunc("/api/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/metrics/", s.handleMetricsModule)
-	mux.HandleFunc("/api/cron", s.handleCron)
+	mux.HandleFunc("/api/cron", s.handleCron)      // GET 列表 / POST 创建
+	mux.HandleFunc("/api/cron/", s.handleCronItem) // /api/cron/{id}: PATCH 更新/启停 · DELETE 删除
 	mux.HandleFunc("/api/dreaming", s.handleDreaming)
 	mux.HandleFunc("/api/evolution", s.handleEvolution)
 	mux.HandleFunc("/api/tasks", s.handleTasks)
@@ -615,12 +646,112 @@ func (s *Server) handleStreamOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCron(w http.ResponseWriter, r *http.Request) {
-	list, err := s.provider.ListCronJobs()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+	switch r.Method {
+	case http.MethodGet:
+		// 有活动调度器(:18080)时直接返回其内存态, 与写路径同源、避开 cron_jobs.json 的
+		// map/array 格式差异; 独立 dashboard(:7777)无调度器时回退读文件(parser 已兼容两种格式)。
+		if ctl := s.resolveCron(); ctl != nil {
+			writeJSON(w, http.StatusOK, ctl.ListJobs())
+			return
+		}
+		list, err := s.provider.ListCronJobs()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, list)
+	case http.MethodPost:
+		// 创建定时任务 (写入活动调度器并持久化)。
+		ctl := s.resolveCron()
+		if ctl == nil {
+			writeError(w, http.StatusNotImplemented, fmt.Errorf("此 dashboard 实例未挂载定时任务调度器 (请直连 :18080 飞书进程)"))
+			return
+		}
+		var job agent.CronJob
+		if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("请求体解析失败: %w", err))
+			return
+		}
+		job.ID = "" // ID 由调度器生成
+		if err := ctl.AddJob(&job); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, job)
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("不支持的方法 %s", r.Method))
+	}
+}
+
+// handleCronItem 处理 /api/cron/{id}: PATCH/PUT 更新或启停, DELETE 删除。
+// 仅在注入了活动调度器的实例 (:18080) 上可用; 否则返回 501。
+func (s *Server) handleCronItem(w http.ResponseWriter, r *http.Request) {
+	ctl := s.resolveCron()
+	if ctl == nil {
+		writeError(w, http.StatusNotImplemented, fmt.Errorf("此 dashboard 实例未挂载定时任务调度器 (请直连 :18080 飞书进程)"))
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	id := strings.TrimPrefix(r.URL.Path, "/api/cron/")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("缺少或非法的任务 id"))
+		return
+	}
+
+	switch r.Method {
+	case http.MethodDelete:
+		if err := ctl.RemoveJob(id); err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "id": id})
+	case http.MethodPatch, http.MethodPut:
+		var body struct {
+			Name     string `json:"name"`
+			Schedule string `json:"schedule"`
+			JobType  string `json:"jobType"`
+			Payload  string `json:"payload"`
+			Workflow string `json:"workflow"`
+			ChatID   string `json:"chatId"`
+			Enabled  *bool  `json:"enabled"` // 指针: 仅在请求显式提供时才启停
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("请求体解析失败: %w", err))
+			return
+		}
+		// 启停 (显式提供 enabled 时)
+		if body.Enabled != nil {
+			var err error
+			if *body.Enabled {
+				err = ctl.ResumeJob(id)
+			} else {
+				err = ctl.PauseJob(id)
+			}
+			if err != nil {
+				writeError(w, http.StatusNotFound, err)
+				return
+			}
+		}
+		// 字段更新 (任一非空字段)
+		if body.Name != "" || body.Schedule != "" || body.JobType != "" || body.Payload != "" || body.Workflow != "" || body.ChatID != "" {
+			patch := &agent.CronJob{
+				Name: body.Name, Schedule: body.Schedule, JobType: body.JobType,
+				Payload: body.Payload, Workflow: body.Workflow, ChatID: body.ChatID,
+			}
+			if err := ctl.UpdateJob(id, patch); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
+		if j := ctl.GetJob(id); j != nil {
+			writeJSON(w, http.StatusOK, j)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "id": id})
+	default:
+		w.Header().Set("Allow", "PATCH, PUT, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("不支持的方法 %s", r.Method))
+	}
 }
 
 func (s *Server) handleDreaming(w http.ResponseWriter, r *http.Request) {

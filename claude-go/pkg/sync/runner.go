@@ -3,7 +3,9 @@ package sync
 import (
 	"crypto/sha256"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -118,7 +120,48 @@ func RunSync(cfg Config, source string, adapter Adapter) (*Result, error) {
 		return res, fmt.Errorf("保存索引失败: %w", err)
 	}
 
+	// 把本次同步产物提交(并尝试推送)到 knowledge 仓库 —— 否则同步只落在工作区、进不了版本库。
+	// 全程尽力而为: git 不可用/非仓库/无凭证时只告警、不让同步失败(文件已写入工作区)。
+	if cfg.KnowledgeRepo != "" {
+		commitKnowledge(cfg.KnowledgeRepo, source)
+	}
+
 	return res, nil
+}
+
+// commitKnowledge 尽力把本次同步产物 (raw/ + schema/) 提交并推送到 knowledge 仓库。
+// 任何一步失败都只告警、返回 —— 同步文件已写入工作区, 不因 git 问题让整次同步失败。
+// 只暂存 raw/ 与 schema/, 不牵连仓库里的其它改动(wiki/.obsidian 等)。
+func commitKnowledge(repoDir, source string) {
+	// 非 git 仓库(或无 git)→ 跳过提交, 保持"仅写文件"的原行为。
+	if _, err := runGit(repoDir, "rev-parse", "--is-inside-work-tree"); err != nil {
+		return
+	}
+	if out, err := runGit(repoDir, "add", "raw", "schema"); err != nil {
+		log.Printf("[sync] %s: git add 失败, 跳过提交: %v (%s)", source, err, out)
+		return
+	}
+	// 无暂存变更 → 无需提交(含上次已提交/无新笔记的情况)。
+	if _, err := runGit(repoDir, "diff", "--cached", "--quiet"); err == nil {
+		return
+	}
+	msg := fmt.Sprintf("chore(sync): %s @ %s", source, time.Now().UTC().Format("2006-01-02T15:04Z"))
+	if out, err := runGit(repoDir, "commit", "-m", msg); err != nil {
+		log.Printf("[sync] %s: git commit 失败: %v (%s)", source, err, out)
+		return
+	}
+	if out, err := runGit(repoDir, "push"); err != nil {
+		log.Printf("[sync] %s: 已本地提交但 push 失败(下次同步会重试): %v (%s)", source, err, out)
+	} else {
+		log.Printf("[sync] %s: 已提交并推送到 knowledge 仓库", source)
+	}
+}
+
+func runGit(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
 }
 
 func buildMarkdown(item ExternalItem, source string, syncedAt time.Time) string {
