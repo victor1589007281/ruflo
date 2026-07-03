@@ -21,6 +21,7 @@ func (stubCronExec) Notify(string, string)                                      
 func (stubCronExec) WikiOrganize(context.Context, string) (string, error)             { return "", nil }
 func (stubCronExec) WikiHealthCheck(context.Context) (string, error)                  { return "", nil }
 func (stubCronExec) WikiLint(context.Context) (string, error)                         { return "", nil }
+func (stubCronExec) TriggerSync(context.Context, string) (string, error)              { return "", nil }
 
 // TestCronWriteHandlers 验证 /api/cron 写接口经解析器打到活动调度器的完整链路
 // (create/disable/update/delete), 以及未注入解析器时返回 501。

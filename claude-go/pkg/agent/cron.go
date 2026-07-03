@@ -58,6 +58,8 @@ type CronExecutor interface {
 	WikiOrganize(ctx context.Context, mode string) (string, error)
 	WikiHealthCheck(ctx context.Context) (string, error)
 	WikiLint(ctx context.Context) (string, error)
+	// TriggerSync 触发外部数据源(ima/weread)同步, 返回结果摘要。
+	TriggerSync(ctx context.Context, source string) (string, error)
 }
 
 // CronScheduler 定时任务调度器。
@@ -316,6 +318,15 @@ func (cs *CronScheduler) executeJob(job *CronJob) {
 
 	case "command":
 		execErr = cs.executor.RunCommand(ctx, job.ChatID, job.Payload)
+
+	case "sync":
+		// payload = 数据源 (ima / weread)
+		result, err := cs.executor.TriggerSync(ctx, job.Payload)
+		if err != nil {
+			execErr = err
+		} else {
+			cs.executor.Notify(job.ChatID, fmt.Sprintf("🔄 同步任务 **%s** 完成:\n%s", job.Name, result))
+		}
 
 	case "wiki-organize":
 		mode := job.Payload

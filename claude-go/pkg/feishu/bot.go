@@ -1014,6 +1014,29 @@ func (e *botCronExecutor) RunCommand(ctx context.Context, chatID, command string
 	return err
 }
 
+// TriggerSync 触发外部数据源(ima/weread)同步 (供定时任务 jobType=sync), 返回结果摘要。
+func (e *botCronExecutor) TriggerSync(_ context.Context, source string) (string, error) {
+	if e.bot.syncScheduler == nil {
+		return "", fmt.Errorf("同步调度器未初始化")
+	}
+	cfg := e.bot.syncScheduler.Config()
+	var adapter claudesync.Adapter
+	switch source {
+	case "ima":
+		adapter = claudesync.NewIMAAdapter(cfg.IMA.ClientID, cfg.IMA.APIKey)
+	case "weread":
+		adapter = claudesync.NewWeReadAdapter(cfg.WeRead.APIKey)
+	default:
+		return "", fmt.Errorf("未知同步源 %q (应为 ima 或 weread)", source)
+	}
+	res, err := claudesync.RunSync(cfg, adapter.Source(), adapter)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("新增 %d · 更新 %d · 不变 %d · 删除 %d · 错误 %d",
+		res.Created, res.Updated, res.Unchanged, res.Deleted, res.Errors), nil
+}
+
 func (e *botCronExecutor) Notify(chatID, message string) {
 	e.bot.sendLongMessage(context.Background(), chatID, message)
 }
