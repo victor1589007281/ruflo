@@ -100,6 +100,14 @@ func (r *ConfigResolver) Resolve(planName, role string) ResolvedConfig {
 	return resolved
 }
 
+// ResolveAlias 将任意单个 alias 解析为 ResolvedConfig (不含 fallback)。
+// 供 advisor 等需要在 plan/role 体系之外解析独立模型的场景使用。
+func (r *ConfigResolver) ResolveAlias(alias string) ResolvedConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.resolveAlias(alias)
+}
+
 // resolveAlias 将单个 alias 解析为 ResolvedConfig (不含 fallback)。
 func (r *ConfigResolver) resolveAlias(alias string) ResolvedConfig {
 	cfg := ResolvedConfig{Alias: alias}

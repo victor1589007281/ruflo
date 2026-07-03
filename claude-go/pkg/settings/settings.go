@@ -27,6 +27,10 @@ type Settings struct {
 
 	// CodeIntel 段 (代码智能配置)
 	CodeIntel *CodeIntelSettings `json:"codeIntel,omitempty"`
+
+	// Advisor 顾问工具配置 (设计文档 docs/advisor-tool-design.md)。
+	// 项目级 settings.json 中配置时作为全局 config.json advisor 段的回退。
+	Advisor *feishu.AdvisorSection `json:"advisor,omitempty"`
 }
 
 // AISection AI 模型配置段 (与飞书 claude-go.json 格式统一)。

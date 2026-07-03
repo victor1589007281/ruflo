@@ -122,6 +122,11 @@ type SessionManager struct {
 	teamMgr         *agent.ProductionTeamManager // 团队管理器 (供 TeamQuery 工具使用)
 	searcher        builtin.WebSearcher          // Web 搜索适配器 (浏览器)
 	defaultResolved modelconfig.ResolvedConfig   // 默认模型解析配置 (从 alias 解析)
+
+	// Advisor 顾问工具 (设计文档 docs/advisor-tool-design.md)
+	advisorClient *api.Client                     // advisor 模型专用客户端 (nil=禁用)
+	advisorTools  map[string]*builtin.AdvisorTool // chatID → 工具实例 (预算按会话隔离, profile 切换不重置)
+	advisorMu     sync.Mutex
 }
 
 // NewSessionManager 创建会话管理器。
@@ -175,6 +180,65 @@ func clampTurns(n int) int {
 // SetDefaultModelConfig 注入默认模型解析配置。
 func (sm *SessionManager) SetDefaultModelConfig(cfg modelconfig.ResolvedConfig) {
 	sm.defaultResolved = cfg
+}
+
+// SetAdvisorClient 注入 advisor 模型客户端。在 Bot 初始化完成后调用；nil 表示禁用。
+func (sm *SessionManager) SetAdvisorClient(client *api.Client) {
+	sm.advisorMu.Lock()
+	defer sm.advisorMu.Unlock()
+	sm.advisorClient = client
+	if client == nil {
+		sm.advisorTools = nil
+	}
+}
+
+// AdvisorEnabled 返回 advisor 是否已启用。
+func (sm *SessionManager) AdvisorEnabled() bool {
+	sm.advisorMu.Lock()
+	defer sm.advisorMu.Unlock()
+	return sm.advisorClient != nil
+}
+
+// AdvisorModel 返回 advisor 模型名 (未启用时为空)。
+func (sm *SessionManager) AdvisorModel() string {
+	sm.advisorMu.Lock()
+	defer sm.advisorMu.Unlock()
+	if sm.advisorClient == nil {
+		return ""
+	}
+	return sm.advisorClient.Model
+}
+
+// advisorOptionsFromConfig 从 BotConfig.Advisor 段构造工具护栏配置。
+func (sm *SessionManager) advisorOptionsFromConfig() builtin.AdvisorOptions {
+	opts := builtin.AdvisorOptions{}
+	if sm.config != nil && sm.config.Advisor != nil {
+		opts.MaxCallsPerSession = sm.config.Advisor.MaxCallsPerSession
+		opts.CooldownTurns = sm.config.Advisor.CooldownTurns
+		opts.MaxTranscriptTokens = sm.config.Advisor.MaxTranscriptTokens
+		opts.MaxOutputTokens = sm.config.Advisor.MaxOutputTokens
+	}
+	return opts
+}
+
+// advisorToolFor 返回 chatID 对应的 advisor 工具实例 (惰性创建)。
+// 实例按会话缓存: 预算/冷却状态在 profile 切换重建 registry 时保持。
+// advisor 未启用时返回 nil。
+func (sm *SessionManager) advisorToolFor(chatID string) *builtin.AdvisorTool {
+	sm.advisorMu.Lock()
+	defer sm.advisorMu.Unlock()
+	if sm.advisorClient == nil || chatID == "" {
+		return nil
+	}
+	if sm.advisorTools == nil {
+		sm.advisorTools = make(map[string]*builtin.AdvisorTool)
+	}
+	if t, ok := sm.advisorTools[chatID]; ok {
+		return t
+	}
+	t := builtin.NewAdvisorTool(sm.advisorClient, sm.advisorOptionsFromConfig())
+	sm.advisorTools[chatID] = t
+	return t
 }
 
 // SetMediaSendFn 注入飞书媒体发送回调。在 Bot 初始化完成后调用。
@@ -238,6 +302,10 @@ func (sm *SessionManager) newProfileRegistry(profile builtin.ToolProfile, opts r
 	}
 	if opts.includeAgent && opts.runAgentFn != nil {
 		reg.Register(agent.NewAgentTool(opts.runAgentFn))
+	}
+	// Advisor 顾问工具: 仅主会话 (chatID 非空) 注册; 嵌套 agent 不注册避免预算翻倍。
+	if advTool := sm.advisorToolFor(opts.chatID); advTool != nil {
+		reg.Register(advTool)
 	}
 	return reg
 }
@@ -430,6 +498,15 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		},
 	}
 
+	// Advisor push 模式 (Phase 3): checkpoint hook 与 pull 模式共享同一工具实例的预算
+	if advTool := sm.advisorToolFor(chatID); advTool != nil && sm.config.Advisor != nil {
+		if sm.config.Advisor.CheckpointEveryTurns > 0 || sm.config.Advisor.CheckpointOnLoop {
+			cfg.AdvisorConsultFn = advTool.Consult
+			cfg.AdvisorCheckpointEveryTurns = sm.config.Advisor.CheckpointEveryTurns
+			cfg.AdvisorCheckpointOnLoop = sm.config.Advisor.CheckpointOnLoop
+		}
+	}
+
 	eng := engine.NewQueryEngine(cfg, sm.apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = sm.memoryStore
 	if sm.config.EnableFrontierOptimizations {
@@ -552,7 +629,15 @@ func (sm *SessionManager) evictOldest() {
 
 	if oldestID != "" {
 		delete(sm.sessions, oldestID)
+		sm.dropAdvisorTool(oldestID)
 	}
+}
+
+// dropAdvisorTool 移除会话对应的 advisor 工具实例 (预算状态随会话生命周期释放)。
+func (sm *SessionManager) dropAdvisorTool(chatID string) {
+	sm.advisorMu.Lock()
+	defer sm.advisorMu.Unlock()
+	delete(sm.advisorTools, chatID)
 }
 
 // cleanupLoop 后台定期清理超时会话
@@ -575,6 +660,7 @@ func (sm *SessionManager) cleanup() {
 		s.mu.Lock()
 		if now.Sub(s.LastActive) > sm.sessionTimeout && !s.processing {
 			delete(sm.sessions, id)
+			sm.dropAdvisorTool(id)
 		}
 		s.mu.Unlock()
 	}
@@ -585,6 +671,7 @@ func (sm *SessionManager) ClearSession(chatID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	delete(sm.sessions, chatID)
+	sm.dropAdvisorTool(chatID)
 }
 
 // Stats 返回会话统计

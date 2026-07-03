@@ -144,6 +144,15 @@ type Config struct {
 	EnableTrajectory bool
 	// EnableStopSignal 启用 CaRT 停止信号检测 (G7, 实验性, 默认关闭)。
 	EnableStopSignal bool
+
+	// ==================== Advisor push 模式 (设计文档 docs/advisor-tool-design.md 3.5) ====================
+	// AdvisorConsultFn 主动咨询 advisor 的函数 (通常是 builtin.AdvisorTool.Consult)。
+	// 为 nil 时 push 模式关闭; pull 模式 (advisor 工具注册) 不依赖此字段。
+	AdvisorConsultFn internal_hook.AdvisorConsultFn
+	// AdvisorCheckpointEveryTurns 每 N 轮无 advisor 介入时 harness 主动咨询 (0=关闭周期触发)。
+	AdvisorCheckpointEveryTurns int
+	// AdvisorCheckpointOnLoop LoopDetector 触发时联动主动咨询。
+	AdvisorCheckpointOnLoop bool
 }
 
 // NewQueryEngine 创建查询引擎
@@ -283,9 +292,18 @@ func (e *QueryEngine) registerInternalHooks() {
 		}
 	}
 
-	// PhasePostToolUse: LoopDetectorResult(90) + StopSignal(100)
+	// PhasePostToolUse: LoopDetectorResult(90) + AdvisorCheckpoint(95) + StopSignal(100)
 	if e.LoopDet != nil {
 		e.HookChain.Register(internal_hook.NewLoopDetectorResultHook(e.LoopDet, e.Metrics))
+	}
+	if h := internal_hook.NewAdvisorCheckpointHook(
+		e.Config.AdvisorConsultFn,
+		e.Config.AdvisorCheckpointEveryTurns,
+		e.Config.AdvisorCheckpointOnLoop,
+		e.LoopDet,
+		e.Metrics,
+	); h != nil {
+		e.HookChain.Register(h)
 	}
 	if e.StopDet != nil {
 		e.HookChain.Register(internal_hook.NewStopSignalHook(e.StopDet, e.Metrics))

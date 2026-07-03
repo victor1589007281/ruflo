@@ -150,6 +150,7 @@ var (
 	flagConfig       string
 	flagResume       string // --resume <sessionID>
 	flagContinue     bool   // --continue / -c
+	flagAdvisor      string // --advisor <provider:model|off>
 )
 
 func main() {
@@ -237,6 +238,7 @@ func main() {
 	rootCmd.PersistentFlags().BoolVar(&flagFinalOnly, "final-only", false, "仅输出最终回答文本 (不输出 thinking 过程, 供程序化调用解析)")
 	rootCmd.PersistentFlags().BoolVar(&flagEmitSession, "emit-session-id", false, "结束时输出 __CLAUDE_GO_SESSION__=<id> 行, 供调用方记录以便 --resume 续聊")
 	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
+	rootCmd.PersistentFlags().StringVar(&flagAdvisor, "advisor", "", "启用 advisor 顾问工具并指定模型别名 (provider:model); \"off\" 强制关闭 (覆盖配置文件)")
 
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(runCmd())
@@ -2049,6 +2051,66 @@ func resolveRuntimeModelConfig(jsonCfg *feishu.JSONConfig, preferredModel string
 	return resolved, resolved.ProviderName != "", nil
 }
 
+// advisorSectionFromConfig 返回配置中的 advisor 段, 优先 config.json, 回退项目级 settings.json。
+func advisorSectionFromConfig(jsonCfg *feishu.JSONConfig, projectSettings *settings.Settings) *feishu.AdvisorSection {
+	if jsonCfg != nil && jsonCfg.Advisor != nil {
+		return jsonCfg.Advisor
+	}
+	if projectSettings != nil && projectSettings.Advisor != nil {
+		return projectSettings.Advisor
+	}
+	return nil
+}
+
+// buildAdvisorClient 按 "--advisor flag > config advisor 段" 的优先级构造 advisor 模型客户端。
+// 返回 ok=false 表示 advisor 未启用或配置无效 (无效时打印警告, 不阻断启动)。
+func buildAdvisorClient(jsonCfg *feishu.JSONConfig, projectSettings *settings.Settings) (*api.Client, builtin.AdvisorOptions, bool) {
+	opts := builtin.AdvisorOptions{}
+	alias := ""
+	if adv := advisorSectionFromConfig(jsonCfg, projectSettings); adv != nil {
+		if adv.Enabled {
+			alias = adv.ModelAlias
+		}
+		opts.MaxCallsPerSession = adv.MaxCallsPerSession
+		opts.CooldownTurns = adv.CooldownTurns
+		opts.MaxTranscriptTokens = adv.MaxTranscriptTokens
+		opts.MaxOutputTokens = adv.MaxOutputTokens
+	}
+	if flagAdvisor != "" {
+		if strings.EqualFold(flagAdvisor, "off") {
+			return nil, opts, false
+		}
+		alias = flagAdvisor
+	}
+	if alias == "" {
+		return nil, opts, false
+	}
+
+	advResolved, ok, err := resolveRuntimeModelConfig(jsonCfg, alias)
+	if err != nil || !ok || advResolved.BaseURL == "" || advResolved.APIKey == "" || advResolved.ProviderName == "" {
+		fmt.Fprintf(os.Stderr, "警告: advisor 别名 %q 解析失败 (请检查 providers 配置), advisor 已禁用\n", alias)
+		return nil, opts, false
+	}
+	var client *api.Client
+	if api.IsLocalEndpoint(advResolved.BaseURL) {
+		client = api.NewOllamaClient(advResolved.BaseURL, advResolved.ProviderName)
+		client.APIKey = advResolved.APIKey
+	} else {
+		client = api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.ProviderName)
+	}
+	client.Tag = "advisor"
+	if advResolved.CallTimeoutSec > 0 {
+		client.CallTimeout = time.Duration(advResolved.CallTimeoutSec) * time.Second
+	}
+	if advResolved.FirstTokenTimeoutSec > 0 {
+		client.FirstTokenTimeout = time.Duration(advResolved.FirstTokenTimeoutSec) * time.Second
+	}
+	if flagDebug {
+		fmt.Fprintf(os.Stderr, "[AdvisorTool] 已启用, advisor 模型: %s\n", alias)
+	}
+	return client, opts, true
+}
+
 func applyRuntimePromptDebug(apiClient *api.Client, jsonCfg *feishu.JSONConfig) {
 	if apiClient == nil {
 		return
@@ -2373,6 +2435,18 @@ func buildEngine() (*engine.QueryEngine, error) {
 		return runNestedAgent(ctx, deps, runAgent, prompt, opts)
 	}
 	reg.Register(agent.NewAgentTool(runAgent))
+
+	// Advisor 顾问工具 (设计文档 docs/advisor-tool-design.md)
+	// 别名优先级: --advisor flag > config advisor 段; "--advisor off" 强制关闭。
+	if advisorClient, advisorOpts, ok := buildAdvisorClient(jsonCfg, projectSettings); ok {
+		advTool := builtin.NewAdvisorTool(advisorClient, advisorOpts)
+		reg.Register(advTool)
+		if adv := advisorSectionFromConfig(jsonCfg, projectSettings); adv != nil && (adv.CheckpointEveryTurns > 0 || adv.CheckpointOnLoop) {
+			cfg.AdvisorConsultFn = advTool.Consult
+			cfg.AdvisorCheckpointEveryTurns = adv.CheckpointEveryTurns
+			cfg.AdvisorCheckpointOnLoop = adv.CheckpointOnLoop
+		}
+	}
 
 	eng := engine.NewQueryEngine(cfg, apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
 

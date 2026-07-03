@@ -390,6 +390,33 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 注入默认解析配置到 SessionManager (用于 createSession 的 maxTokens/maxTurns)
 	bot.sessions.SetDefaultModelConfig(defaultResolved)
 
+	// Advisor 顾问工具客户端 (设计文档 docs/advisor-tool-design.md)
+	if adv := config.Advisor; adv != nil && adv.Enabled && adv.ModelAlias != "" {
+		advResolved := resolver.ResolveAlias(adv.ModelAlias)
+		if advResolved.BaseURL == "" || advResolved.APIKey == "" || advResolved.ProviderName == "" {
+			log.Printf("[Bot] Advisor 配置无效: 无法解析别名 %q (缺 baseURL/apiKey), advisor 已禁用", adv.ModelAlias)
+		} else {
+			advisorClient := api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.ProviderName)
+			advisorClient.Tag = "advisor"
+			if advResolved.CallTimeoutSec > 0 {
+				advisorClient.CallTimeout = time.Duration(advResolved.CallTimeoutSec) * time.Second
+			}
+			if advResolved.FirstTokenTimeoutSec > 0 {
+				advisorClient.FirstTokenTimeout = time.Duration(advResolved.FirstTokenTimeoutSec) * time.Second
+			}
+			// advisor 与主模型共享同一 provider 时复用限流 guard, 避免双客户端各自满额打爆 RPM
+			if advResolved.Provider == defaultResolved.Provider {
+				advisorClient.Guard = aiClient.Guard
+			}
+			bot.sessions.SetAdvisorClient(advisorClient)
+			if advResolved.ProviderName == defaultResolved.ProviderName {
+				log.Printf("[Bot] Advisor 已启用: %s (警告: 与主模型相同, self-consult 模式)", adv.ModelAlias)
+			} else {
+				log.Printf("[Bot] Advisor 已启用: %s (checkpoint: every=%d, onLoop=%v)", adv.ModelAlias, adv.CheckpointEveryTurns, adv.CheckpointOnLoop)
+			}
+		}
+	}
+
 	// 初始化全局 LLM 指标采集器 (让 feishu bot 的指标走全局 JSONL + Prometheus 路径)
 	metrics.InitGlobalLLMCollector(layout.Root)
 	if config.Sandbox != nil {
@@ -1977,6 +2004,10 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			"- /role show <名称> - 查看角色最终技能绑定\n\n" +
 			"**Dreaming:**\n" +
 			"- /dream - 手动触发记忆整理\n\n" +
+			"**Advisor (顾问):**\n" +
+			"- /advisor - 查看 advisor 状态\n" +
+			"- /advisor <provider:model> - 启用/切换 advisor 模型\n" +
+			"- /advisor off - 关闭 advisor\n\n" +
 			"**定时任务 (Cron):**\n" +
 			"- /cron list - 列出所有定时任务\n" +
 			"- /cron add <表达式> <类型> <内容> - 添加\n" +
@@ -2055,18 +2086,23 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 			ct, ce, cr := b.cronSched.Stats()
 			cronInfo = fmt.Sprintf("%d 个任务 (%d 启用), 已执行 %d 次", ct, ce, cr)
 		}
+		advisorInfo := "未启用"
+		if b.sessions.AdvisorEnabled() {
+			advisorInfo = b.sessions.AdvisorModel()
+		}
 		status := fmt.Sprintf("**运行状态**\n"+
 			"- 运行时长: %v\n"+
 			"- 总会话数: %d\n"+
 			"- 活跃处理: %d\n"+
 			"- AI 模型: %s\n"+
+			"- Advisor: %s\n"+
 			"- MCP: %s\n"+
 			"- Skills: %s\n"+
 			"- Dreaming: %s\n"+
 			"- Evolution: %s\n"+
 			"- Cron: %s\n"+
 			"- 工作目录: %s",
-			uptime, total, active, b.apiClient.Model, mcpInfo, skillInfo, dreamInfo, evoInfo, cronInfo, b.config.Cwd)
+			uptime, total, active, b.apiClient.Model, advisorInfo, mcpInfo, skillInfo, dreamInfo, evoInfo, cronInfo, b.config.Cwd)
 		b.sendTextReply(ctx, messageID, status)
 		return true
 
@@ -2088,6 +2124,10 @@ func (b *Bot) handleSlashCommand(ctx context.Context, chatID, messageID, text st
 
 	case lower == "/dream":
 		b.handleDreamCommand(ctx, messageID)
+		return true
+
+	case strings.HasPrefix(lower, "/advisor"):
+		b.handleAdvisorCommand(ctx, messageID, text)
 		return true
 
 	case strings.HasPrefix(lower, "/go "):
@@ -3081,6 +3121,50 @@ func (b *Bot) handleDreamCommand(ctx context.Context, messageID string) {
 		b.sendTextReply(ctx, messageID, fmt.Sprintf("触发 Dreaming 失败: %v", err))
 	} else {
 		b.sendTextReply(ctx, messageID, "已触发记忆整理 (后台执行)。")
+	}
+}
+
+// handleAdvisorCommand 处理 /advisor 命令: 查看状态 / 启用 / 切换模型 / 关闭。
+// 对齐 Claude Code 官方 /advisor 命令语义 (设计文档 docs/advisor-tool-design.md)。
+func (b *Bot) handleAdvisorCommand(ctx context.Context, messageID, text string) {
+	arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), "/advisor"))
+	switch {
+	case arg == "":
+		if b.sessions.AdvisorEnabled() {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf(
+				"**Advisor 状态**: 已启用\n- 模型: %s\n- 主模型在关键时刻可调用 advisor() 咨询该模型\n\n用法: `/advisor off` 关闭, `/advisor <provider:model>` 切换模型",
+				b.sessions.AdvisorModel()))
+		} else {
+			b.sendTextReply(ctx, messageID,
+				"**Advisor 状态**: 未启用\n\n用法: `/advisor <provider:model>` 启用 (如 `/advisor kimi:kimi-k2-thinking`)")
+		}
+	case strings.EqualFold(arg, "off") || strings.EqualFold(arg, "unset"):
+		b.sessions.SetAdvisorClient(nil)
+		b.sendTextReply(ctx, messageID, "Advisor 已关闭。现有会话发送 /clear 后完全生效。")
+	default:
+		if b.modelResolver == nil {
+			b.sendTextReply(ctx, messageID, "无法切换: 模型解析器未初始化")
+			return
+		}
+		resolved := b.modelResolver.ResolveAlias(arg)
+		if resolved.BaseURL == "" || resolved.APIKey == "" || resolved.ProviderName == "" {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("无法解析别名 `%s`: 请检查 providers 配置", arg))
+			return
+		}
+		client := api.NewClient(resolved.BaseURL, resolved.APIKey, resolved.ProviderName)
+		client.Tag = "advisor"
+		if resolved.CallTimeoutSec > 0 {
+			client.CallTimeout = time.Duration(resolved.CallTimeoutSec) * time.Second
+		}
+		if resolved.FirstTokenTimeoutSec > 0 {
+			client.FirstTokenTimeout = time.Duration(resolved.FirstTokenTimeoutSec) * time.Second
+		}
+		b.sessions.SetAdvisorClient(client)
+		note := ""
+		if resolved.ProviderName == b.apiClient.Model {
+			note = "\n⚠️ 与主模型相同 (self-consult 模式)，建议配置更强的模型作为 advisor。"
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("Advisor 已设置为 **%s**。新会话立即生效; 现有会话发送 /clear 后生效。%s", arg, note))
 	}
 }
 

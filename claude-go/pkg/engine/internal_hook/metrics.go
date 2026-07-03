@@ -45,6 +45,9 @@ type EngineMetrics struct {
 	StopSuggestionsEmitted atomic.Int64
 	StopSuggestionsHonored atomic.Int64
 
+	// Advisor push 模式主动咨询次数
+	AdvisorCheckpoints atomic.Int64
+
 	// 延迟 (单调累加, 平均需除以 TurnsTotal)
 	TotalTurnLatencyMs atomic.Int64
 

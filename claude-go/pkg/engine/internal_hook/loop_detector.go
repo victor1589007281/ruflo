@@ -51,6 +51,10 @@ type LoopDetector struct {
 	// 编译错误指纹: 规范化指纹 -> 连续出现次数
 	errorFingerprints map[string]int
 	lastErrorFP       string
+
+	// triggerCount 累计触发次数 (输入级 + 产出级)。
+	// AdvisorCheckpointHook 通过增量判断"本轮是否检测到循环"。
+	triggerCount int
 }
 
 type callSignature struct {
@@ -132,7 +136,18 @@ func (d *LoopDetector) Observe(tool string, input []byte) (looped bool, suggesti
 			"注意: 再次以相同参数调用同一工具将不会带来进展。",
 		threshold, first.Tool,
 	)
+	d.triggerCount++
 	return true, suggestion
+}
+
+// TriggerCount 返回累计触发次数 (输入级 + 产出级)。
+func (d *LoopDetector) TriggerCount() int {
+	if d == nil {
+		return 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.triggerCount
 }
 
 // ObserveResult 在工具执行后调用, 检测产出级循环 (编辑震荡 / 编译错误重复)。
@@ -155,11 +170,13 @@ func (d *LoopDetector) ObserveResult(tool string, input []byte, result string, i
 
 	// 1. 编辑震荡检测
 	if stuck, suggestion = d.checkEditOscillationLocked(tool, input); stuck {
+		d.triggerCount++
 		return true, suggestion
 	}
 
 	// 2. 编译错误指纹检测
 	if stuck, suggestion = d.checkCompileErrorLoopLocked(tool, result, isError); stuck {
+		d.triggerCount++
 		return true, suggestion
 	}
 

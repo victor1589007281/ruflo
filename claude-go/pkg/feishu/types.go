@@ -147,6 +147,9 @@ type BotConfig struct {
 
 	// Sync 外部数据源同步配置。
 	Sync sync.Config
+
+	// Advisor 顾问工具配置。
+	Advisor *AdvisorSection
 }
 
 // BrowserConfig 浏览器抓取配置。
@@ -345,6 +348,30 @@ type JSONConfig struct {
 
 	// Sync 外部数据源同步配置 (IMA / 微信读书)
 	Sync *SyncSection `json:"sync,omitempty"`
+
+	// Advisor 顾问工具配置 (设计文档: docs/advisor-tool-design.md)
+	Advisor *AdvisorSection `json:"advisor,omitempty"`
+}
+
+// AdvisorSection advisor 顾问工具配置段。
+// 主模型在关键时刻通过 advisor() 工具咨询更强的 reviewer 模型。
+type AdvisorSection struct {
+	// Enabled 是否启用 advisor 工具
+	Enabled bool `json:"enabled,omitempty"`
+	// ModelAlias advisor 模型别名 (格式 "provider:modelName"); 为空时禁用
+	ModelAlias string `json:"modelAlias,omitempty"`
+	// MaxCallsPerSession 单会话最大咨询次数 (默认 8)
+	MaxCallsPerSession int `json:"maxCallsPerSession,omitempty"`
+	// CooldownTurns 两次咨询间最少间隔的 assistant 轮数 (默认 2)
+	CooldownTurns int `json:"cooldownTurns,omitempty"`
+	// MaxTranscriptTokens transcript 序列化 token 预算 (默认 60000)
+	MaxTranscriptTokens int `json:"maxTranscriptTokens,omitempty"`
+	// MaxOutputTokens advisor 回复最大输出 token (默认 2000)
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+	// CheckpointEveryTurns Phase 3 push 模式: 每 N 轮 harness 主动咨询一次 (0=关闭)
+	CheckpointEveryTurns int `json:"checkpointEveryTurns,omitempty"`
+	// CheckpointOnLoop Phase 3 push 模式: LoopDetector 检测到工具循环时主动咨询
+	CheckpointOnLoop bool `json:"checkpointOnLoop,omitempty"`
 }
 
 // CodeIntelSection Code Intelligence 配置段
@@ -693,6 +720,10 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 	if jc.Sandbox != nil {
 		cp := *jc.Sandbox
 		bc.Sandbox = &cp
+	}
+	if jc.Advisor != nil && bc.Advisor == nil {
+		cp := *jc.Advisor
+		bc.Advisor = &cp
 	}
 
 	if jc.SystemPrompt != "" && bc.SystemPrompt == "" {
