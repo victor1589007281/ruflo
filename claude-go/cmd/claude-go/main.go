@@ -350,9 +350,19 @@ func teamCmd() *cobra.Command {
 				StartedAt  time.Time `json:"startedAt"`
 				FinishedAt time.Time `json:"finishedAt"`
 				Error      string    `json:"error"`
-				Agents     []struct {
-					Name   string `json:"name"`
-					Status string `json:"status"`
+				Progress   *struct {
+					Phase        string    `json:"phase"`
+					Iteration    int       `json:"iteration"`
+					BytesWritten int64     `json:"bytesWritten"`
+					UpdatedAt    time.Time `json:"updatedAt"`
+					TaskID       string    `json:"taskId"`
+				} `json:"progress"`
+				Agents map[string]struct {
+					Name     string    `json:"name"`
+					Role     string    `json:"role"`
+					Status   string    `json:"status"`
+					Phase    string    `json:"phase"`
+					LastBeat time.Time `json:"lastBeat"`
 				} `json:"agents"`
 			}
 			if err := json.Unmarshal(data, &t); err != nil {
@@ -372,10 +382,27 @@ func teamCmd() *cobra.Command {
 			if t.Error != "" {
 				fmt.Printf("错误: %s\n", t.Error)
 			}
+			if t.Progress != nil && (t.Progress.Phase != "" || t.Progress.Iteration > 0 || !t.Progress.UpdatedAt.IsZero()) {
+				line := fmt.Sprintf("实时进展: 阶段=%s 轮次=%d 产出=%dB", t.Progress.Phase, t.Progress.Iteration, t.Progress.BytesWritten)
+				if !t.Progress.UpdatedAt.IsZero() {
+					line += fmt.Sprintf(" (%s前)", time.Since(t.Progress.UpdatedAt).Round(time.Second))
+				}
+				fmt.Println(line)
+			}
 			if len(t.Agents) > 0 {
 				fmt.Println("Agent 状态:")
 				for _, a := range t.Agents {
-					fmt.Printf("  - %s [%s]\n", a.Name, a.Status)
+					line := fmt.Sprintf("  - %s [%s]", a.Name, a.Status)
+					if a.Role != "" {
+						line += fmt.Sprintf(" (%s)", a.Role)
+					}
+					if a.Phase != "" {
+						line += fmt.Sprintf(" 阶段=%s", a.Phase)
+					}
+					if !a.LastBeat.IsZero() {
+						line += fmt.Sprintf(" 心跳=%s前", time.Since(a.LastBeat).Round(time.Second))
+					}
+					fmt.Println(line)
 				}
 			}
 			return nil

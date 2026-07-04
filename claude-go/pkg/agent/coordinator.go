@@ -666,6 +666,10 @@ func (c *Coordinator) checkTeamHealth(team *ProductionTeam) {
 			log.Printf("[Coordinator] 警告: 所有 agent idle 但存在未完成任务")
 		}
 	}
+
+	// 实时心跳落盘: 把当前进展快照写入 team.json, 让既有展示入口
+	// (team status / dashboard) 能看到团队内部实时状态, 而非只有结束态。
+	team.updateHeartbeat(c.CurrentProgress())
 }
 
 // --- 检查点持久化 ---

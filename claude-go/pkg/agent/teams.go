@@ -351,7 +351,8 @@ type ProductionTeam struct {
 	Status     TeamStatus          `json:"status"`
 	Agents     map[string]*BGAgent `json:"agents"`
 	Stages     []StageResult       `json:"stages"`
-	TaskIDs    map[string]string   `json:"taskIds,omitempty"` // stageName → V2 taskID
+	Progress   *ProgressState      `json:"progress,omitempty"` // 实时进展快照 (运行中由 Coordinator 心跳回填)
+	TaskIDs    map[string]string   `json:"taskIds,omitempty"`  // stageName → V2 taskID
 	CreatedAt  time.Time           `json:"createdAt"`
 	StartedAt  time.Time           `json:"startedAt,omitempty"`
 	FinishedAt time.Time           `json:"finishedAt,omitempty"`
@@ -408,6 +409,9 @@ type BGAgent struct {
 	Status AgentStatus `json:"status"`
 	Result string      `json:"result,omitempty"`
 	Error  string      `json:"error,omitempty"`
+	// 实时心跳 (运行中由 Coordinator 心跳回填, 供 team status / dashboard 观测团队内部)。
+	Phase    string    `json:"phase,omitempty"`    // 当前阶段: LLM生成/编译/测试/等待
+	LastBeat time.Time `json:"lastBeat,omitempty"` // 上次心跳时间
 }
 
 // StageResult 阶段执行结果
@@ -1745,6 +1749,27 @@ func (t *ProductionTeam) persist() {
 	}
 	os.MkdirAll(t.dataDir, 0755)
 	_ = os.WriteFile(filepath.Join(t.dataDir, "team.json"), data, 0644)
+}
+
+// updateHeartbeat 将 Coordinator 的实时进展快照回填到 team 及运行中 agent 的
+// 心跳字段并落盘。目的: 让既有展示入口(team status / dashboard, 都读 team.json)
+// 能看到团队内部"此刻在做什么"(阶段/轮次/累计产出/心跳时间), 而不再只有结束态,
+// 解决"看不清团队内部运行情况"。由 Coordinator.checkTeamHealth 每个心跳周期调用。
+func (t *ProductionTeam) updateHeartbeat(prog ProgressState) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	snap := prog
+	t.Progress = &snap
+	now := time.Now()
+	for _, ag := range t.Agents {
+		// pipeline 模式: 把团队级进展映射到运行中的 agent;
+		// orchestrated 模式 agent 均 idle, 由 t.Progress 承载团队级可见性。
+		if ag.Status == AgentStatusRunning {
+			ag.Phase = prog.Phase
+			ag.LastBeat = now
+		}
+	}
+	t.persist()
 }
 
 // loadPersistedTeams 从磁盘恢复团队状态

@@ -44,17 +44,30 @@ type StageDTO struct {
 
 // AgentDTO 团队成员展示数据。
 type AgentDTO struct {
-	Name   string `json:"name"`
-	Role   string `json:"role"`
-	Status string `json:"status"`
-	Result string `json:"result,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Name     string    `json:"name"`
+	Role     string    `json:"role"`
+	Status   string    `json:"status"`
+	Result   string    `json:"result,omitempty"`
+	Error    string    `json:"error,omitempty"`
+	Phase    string    `json:"phase,omitempty"`    // 实时: 当前阶段 (运行中心跳回填)
+	LastBeat time.Time `json:"lastBeat,omitempty"` // 实时: 上次心跳时间
+}
+
+// ProgressDTO 团队实时进展 (运行中由 Coordinator 心跳回填, 只读展示)。
+// 兼作 team.json 中 progress 字段的解析目标 (json tag 对齐)。
+type ProgressDTO struct {
+	Phase        string    `json:"phase,omitempty"`
+	Iteration    int       `json:"iteration,omitempty"`
+	BytesWritten int64     `json:"bytesWritten,omitempty"`
+	UpdatedAt    time.Time `json:"updatedAt,omitempty"`
+	TaskID       string    `json:"taskId,omitempty"`
 }
 
 // TeamDetail 团队详情。
 type TeamDetail struct {
 	TeamSummary
 	Cwd              string              `json:"cwd,omitempty"`
+	Progress         *ProgressDTO        `json:"progress,omitempty"` // 运行中实时进展
 	Agents           []AgentDTO          `json:"agents"`
 	Stages           []StageDTO          `json:"stages"`
 	Report           string              `json:"report,omitempty"`

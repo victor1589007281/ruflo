@@ -90,6 +90,7 @@ type rawTeam struct {
 	Status     string                 `json:"status"`
 	Agents     map[string]*rawAgent   `json:"agents"`
 	Stages     []rawStage             `json:"stages"`
+	Progress   *ProgressDTO           `json:"progress,omitempty"`
 	TaskIDs    map[string]string      `json:"taskIds,omitempty"`
 	CreatedAt  time.Time              `json:"createdAt"`
 	StartedAt  time.Time              `json:"startedAt,omitempty"`
@@ -100,11 +101,13 @@ type rawTeam struct {
 }
 
 type rawAgent struct {
-	Name   string `json:"name"`
-	Role   string `json:"role"`
-	Status string `json:"status"`
-	Result string `json:"result,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Name     string    `json:"name"`
+	Role     string    `json:"role"`
+	Status   string    `json:"status"`
+	Result   string    `json:"result,omitempty"`
+	Error    string    `json:"error,omitempty"`
+	Phase    string    `json:"phase,omitempty"`
+	LastBeat time.Time `json:"lastBeat,omitempty"`
 }
 
 type rawStage struct {
@@ -165,6 +168,7 @@ func (p *Provider) GetTeam(name string) (*TeamDetail, error) {
 	detail := &TeamDetail{
 		TeamSummary: toSummary(t),
 		Cwd:         t.Cwd,
+		Progress:    t.Progress,
 		TaskIDs:     t.TaskIDs,
 	}
 	for _, ag := range t.Agents {
@@ -174,6 +178,7 @@ func (p *Provider) GetTeam(name string) (*TeamDetail, error) {
 		detail.Agents = append(detail.Agents, AgentDTO{
 			Name: ag.Name, Role: ag.Role, Status: ag.Status,
 			Result: ag.Result, Error: ag.Error,
+			Phase: ag.Phase, LastBeat: ag.LastBeat,
 		})
 	}
 	sort.Slice(detail.Agents, func(i, j int) bool {
