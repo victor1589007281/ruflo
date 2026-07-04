@@ -1430,10 +1430,12 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 		return StageResult{Role: role, Status: TaskFailed, Error: "Agent 工厂未配置"}
 	}
 
-	// 更新 agent 状态
+	// 更新 agent 状态 (含实时心跳: 进入运行态, 供 team status / dashboard 观测团队内部)
 	team.mu.Lock()
 	if ag, ok := team.Agents[role]; ok {
 		ag.Status = AgentStatusRunning
+		ag.Phase = "执行中"
+		ag.LastBeat = time.Now()
 	}
 	team.mu.Unlock()
 	team.persist()
@@ -1471,9 +1473,11 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	result, err := executeRunnerBounded(stageCtx, runner, prompt, timeout)
 	duration := time.Since(start)
 
-	// 更新 agent 状态
+	// 更新 agent 状态 (结束: 清空实时阶段, 刷新心跳)
 	team.mu.Lock()
 	if ag, ok := team.Agents[role]; ok {
+		ag.Phase = ""
+		ag.LastBeat = time.Now()
 		if err != nil {
 			ag.Status = AgentStatusFailed
 			ag.Error = err.Error()

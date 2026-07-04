@@ -1762,10 +1762,14 @@ func (t *ProductionTeam) updateHeartbeat(prog ProgressState) {
 	t.Progress = &snap
 	now := time.Now()
 	for _, ag := range t.Agents {
-		// pipeline 模式: 把团队级进展映射到运行中的 agent;
-		// orchestrated 模式 agent 均 idle, 由 t.Progress 承载团队级可见性。
+		// pipeline 模式: 运行中的 agent 已由 runAgent 置为"执行中"; 心跳周期刷新
+		// LastBeat 证明存活, 并在有更细进展(orchestrated 经 ReportProgress)时升级
+		// Phase —— 但不用空值覆盖 runAgent 已置的阶段。
+		// orchestrated 模式 agent 多为 idle, 由 t.Progress 承载团队级可见性。
 		if ag.Status == AgentStatusRunning {
-			ag.Phase = prog.Phase
+			if prog.Phase != "" {
+				ag.Phase = prog.Phase
+			}
 			ag.LastBeat = now
 		}
 	}

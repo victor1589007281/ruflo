@@ -56,3 +56,29 @@ func TestHeartbeatSurfacesLiveProgress(t *testing.T) {
 		}
 	}
 }
+
+// TestHeartbeatDoesNotClobberAgentPhase 守护 pipeline 模式(默认路径)的真实性:
+// 该模式无 ReportProgress → CurrentProgress() 为空; 此时心跳周期必须只刷新
+// LastBeat(证明存活), 而不能用空 Phase 覆盖 runAgent 已置的"执行中"。
+// (防止 per-agent 心跳在最常见路径上变成空壳。)
+func TestHeartbeatDoesNotClobberAgentPhase(t *testing.T) {
+	dir := t.TempDir()
+	team := &ProductionTeam{
+		Name:    "hb2",
+		Status:  TeamStatusRunning,
+		dataDir: dir,
+		Agents: map[string]*BGAgent{
+			// 模拟 runAgent 在阶段起始已置的状态
+			"coder": {Name: "coder", Role: "coder", Status: AgentStatusRunning, Phase: "执行中"},
+		},
+	}
+	c := &Coordinator{} // 未 ReportProgress → 空进展 (pipeline 模式)
+	c.checkTeamHealth(team)
+
+	if got := team.Agents["coder"].Phase; got != "执行中" {
+		t.Fatalf("空进展不应覆盖 runAgent 已置的阶段, got %q", got)
+	}
+	if team.Agents["coder"].LastBeat.IsZero() {
+		t.Fatal("LastBeat 应被心跳刷新以证明存活")
+	}
+}
