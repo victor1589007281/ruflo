@@ -256,6 +256,19 @@ func TestBuildAdvisorTranscriptRendering(t *testing.T) {
 	}
 }
 
+func TestBuildAdvisorTranscriptSkipsAdvisorToolUse(t *testing.T) {
+	msgs := []types.Message{
+		{Type: types.MessageTypeUser, Content: []types.ContentBlock{{Type: types.ContentBlockText, Text: "任务"}}},
+		{Type: types.MessageTypeAssistant, Content: []types.ContentBlock{
+			{Type: types.ContentBlockToolUse, Name: "advisor", Input: json.RawMessage(`{}`)},
+		}},
+	}
+	out := BuildAdvisorTranscript(msgs, 10000)
+	if strings.Contains(out, "advisor") {
+		t.Fatalf("in-flight advisor tool_use 不应进入 transcript:\n%s", out)
+	}
+}
+
 func TestBuildAdvisorTranscriptTruncation(t *testing.T) {
 	msgs := []types.Message{{
 		Type:    types.MessageTypeUser,
@@ -292,6 +305,47 @@ func TestBuildAdvisorTranscriptTruncation(t *testing.T) {
 func TestBuildAdvisorTranscriptEmpty(t *testing.T) {
 	if out := BuildAdvisorTranscript(nil, 1000); !strings.Contains(out, "empty conversation") {
 		t.Fatalf("空历史应有占位输出, got %q", out)
+	}
+}
+
+func TestAdvisorToolThinkingOnlyFallback(t *testing.T) {
+	// 模拟推理模型把输出预算全花在 thinking 块上 (无 text 块)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := types.APIResponse{
+			ID: "msg_t", Type: "message", Role: "assistant",
+			Content: []types.ContentBlock{{
+				Type:     types.ContentBlockThinking,
+				Thinking: "分析中……结论是应该先做基准测试再决定是否用 goroutine 池",
+			}},
+			StopReason: "max_tokens",
+			Usage:      &types.Usage{InputTokens: 100, OutputTokens: 2000},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := api.NewClient(srv.URL, "test-key", "test-model")
+	tl := NewAdvisorTool(client, AdvisorOptions{})
+	advice, err := tl.Consult(context.Background(), testMessages(1))
+	if err != nil {
+		t.Fatalf("Consult: %v", err)
+	}
+	if !strings.Contains(advice, "基准测试") || !strings.Contains(advice, "分析过程节选") {
+		t.Fatalf("应回退到 thinking 内容, got %q", advice)
+	}
+}
+
+func TestTailOfRuneSafe(t *testing.T) {
+	s := strings.Repeat("中", 100)
+	out := tailOf(s, 10)
+	if !strings.HasPrefix(out, "...") || len([]rune(out)) != 13 {
+		t.Fatalf("tailOf rune 安全截断失败: %q", out)
+	}
+	for _, r := range out {
+		if r != '.' && r != '中' {
+			t.Fatalf("出现乱码 rune: %q", out)
+		}
 	}
 }
 

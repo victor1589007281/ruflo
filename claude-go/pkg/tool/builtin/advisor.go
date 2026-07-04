@@ -50,7 +50,7 @@ func (o AdvisorOptions) withDefaults() AdvisorOptions {
 		o.MaxTranscriptTokens = 60000
 	}
 	if o.MaxOutputTokens <= 0 {
-		o.MaxOutputTokens = 2000
+		o.MaxOutputTokens = 3000
 	}
 	return o
 }
@@ -210,7 +210,31 @@ func (t *AdvisorTool) consultOnce(ctx context.Context, messages []types.Message,
 			sb.WriteString(block.Text)
 		}
 	}
-	return sb.String(), nil
+	if strings.TrimSpace(sb.String()) != "" {
+		return sb.String(), nil
+	}
+	// 兜底: 推理模型 (如 kimi-k2) 可能把输出预算全花在 thinking 块上
+	// (stop_reason=max_tokens 且无 text)。thinking 内容就是 advisor 的分析
+	// 过程, 作为降级建议返回, 远好于空占位符。
+	var think strings.Builder
+	for _, block := range resp.Content {
+		if block.Type == types.ContentBlockThinking && strings.TrimSpace(block.Thinking) != "" {
+			think.WriteString(block.Thinking)
+		}
+	}
+	if strings.TrimSpace(think.String()) != "" {
+		return "(advisor 输出预算耗尽, 以下为其分析过程节选)\n" + tailOf(think.String(), 2500), nil
+	}
+	return "", nil
+}
+
+// tailOf 保留字符串尾部 (thinking 的结论通常在尾部), rune 安全。
+func tailOf(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return "..." + string(r[len(r)-max:])
 }
 
 // CallCount 返回累计 advisor 咨询次数 (含 checkpoint 主动咨询)。
@@ -329,6 +353,11 @@ func renderTranscriptEntry(msg types.Message) string {
 			}
 			sb.WriteString(fmt.Sprintf("[%s] %s\n", role, truncateHead(text, transcriptTextCap)))
 		case types.ContentBlockToolUse:
+			// advisor 自身的调用块无信息量 (无参数), 且当前 in-flight 调用
+			// 在轨迹尾部无对应结果, 会让 advisor 误判"调用了但未返回"。
+			if block.Name == "advisor" {
+				continue
+			}
 			input := strings.TrimSpace(string(block.Input))
 			sb.WriteString(fmt.Sprintf("[tool_use] %s(%s)\n", block.Name, truncateHead(input, transcriptToolInputCap)))
 		case types.ContentBlockToolResult:
