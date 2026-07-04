@@ -1298,13 +1298,13 @@ func (ptm *ProductionTeamManager) StopTeam(name string) error {
 	}
 
 	team.mu.Lock()
-	defer team.mu.Unlock()
 	if team.cancel != nil {
 		team.cancel()
 	}
 	team.Status = TeamStatusStopped
 	team.FinishedAt = time.Now()
-	team.persist()
+	team.mu.Unlock()
+	team.persist() // persist 内部自锁, 先解锁避免重入死锁
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestHeartbeatSurfacesLiveProgress 验证 per-agent 心跳链路:
@@ -122,4 +123,36 @@ func TestHeartbeatConcurrentPersistNoRace(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// TestStopTeamNoReentrantDeadlock 守护 persist() 自锁后的重入死锁:
+// StopTeam 曾 `team.mu.Lock(); defer Unlock; ...; team.persist()`, 而 persist
+// 现在内部自锁 team.mu → 若仍在锁内调用即死锁。此测试若命中该 bug 会超时失败。
+func TestStopTeamNoReentrantDeadlock(t *testing.T) {
+	ptm := &ProductionTeamManager{
+		teams:   map[string]*ProductionTeam{},
+		baseDir: t.TempDir(),
+	}
+	team := &ProductionTeam{
+		Name:    "st",
+		Status:  TeamStatusRunning,
+		dataDir: t.TempDir(),
+		Agents:  map[string]*BGAgent{},
+	}
+	team.mgr = ptm
+	ptm.teams["st"] = team
+
+	done := make(chan error, 1)
+	go func() { done <- ptm.StopTeam("st") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("StopTeam 返回错误: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopTeam 超时 —— persist 在持有 team.mu 时重入自锁死锁")
+	}
+	if team.Status != TeamStatusStopped {
+		t.Fatalf("StopTeam 未置 stopped: %s", team.Status)
+	}
 }
