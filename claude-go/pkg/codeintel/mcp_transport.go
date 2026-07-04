@@ -585,21 +585,14 @@ func (s *MCPServerV2) toolInit(args json.RawMessage) (string, bool) {
 	gf := NewGraphify(in.RepoPath)
 	gf.IndexBaseDir = s.IndexBaseDir
 
-	gnResult, gnErr := gn.Analyze()
-	gfResult, gfErr := gf.Update(true)
-
+	o := RunIndex(gn, gf)
 	result := map[string]interface{}{
-		"status":         "initialized",
+		"status":         o.StatusOr("initialized"),
 		"repo_path":      in.RepoPath,
-		"gitnexus":       safeMCPResult(gnResult),
-		"gitnexus_error": errMCPString(gnErr),
-		"graphify":       safeMCPResult(gfResult),
-		"graphify_error": errMCPString(gfErr),
-	}
-	if gnErr != nil && gfErr != nil {
-		result["status"] = "failed"
-	} else if gnErr != nil || gfErr != nil {
-		result["status"] = "partial"
+		"gitnexus":       safeMCPResult(o.GitNexus),
+		"gitnexus_error": errMCPString(o.GNErr),
+		"graphify":       safeMCPResult(o.Graphify),
+		"graphify_error": errMCPString(o.GFErr),
 	}
 	out, _ := json.MarshalIndent(result, "", "  ")
 	return string(out), false
@@ -616,21 +609,14 @@ func (s *MCPServerV2) toolUpdate(args json.RawMessage) (string, bool) {
 	gf := NewGraphify(in.RepoPath)
 	gf.IndexBaseDir = s.IndexBaseDir
 
-	gnResult, gnErr := gn.Analyze()
-	gfResult, gfErr := gf.Update(true)
-
+	o := RunIndex(gn, gf)
 	result := map[string]interface{}{
-		"status":         "updated",
+		"status":         o.StatusOr("updated"),
 		"repo_path":      in.RepoPath,
-		"gitnexus":       safeMCPResult(gnResult),
-		"gitnexus_error": errMCPString(gnErr),
-		"graphify":       safeMCPResult(gfResult),
-		"graphify_error": errMCPString(gfErr),
-	}
-	if gnErr != nil && gfErr != nil {
-		result["status"] = "failed"
-	} else if gnErr != nil || gfErr != nil {
-		result["status"] = "partial"
+		"gitnexus":       safeMCPResult(o.GitNexus),
+		"gitnexus_error": errMCPString(o.GNErr),
+		"graphify":       safeMCPResult(o.Graphify),
+		"graphify_error": errMCPString(o.GFErr),
 	}
 	out, _ := json.MarshalIndent(result, "", "  ")
 	return string(out), false
@@ -758,14 +744,13 @@ func (s *MCPServerV2) toolBranch(args json.RawMessage) (string, bool) {
 			"graphify_indexed": gf.IsIndexed(),
 		}
 	case "reindex":
-		gnQr, gnErr := gn.Analyze()
-		gfQr, gfErr := gf.Update(true)
+		o := RunIndex(gn, gf)
 		result = map[string]interface{}{
 			"action":         "reindex",
-			"gitnexus":       safeMCPResult(gnQr),
-			"gitnexus_error": errMCPString(gnErr),
-			"graphify":       safeMCPResult(gfQr),
-			"graphify_error": errMCPString(gfErr),
+			"gitnexus":       safeMCPResult(o.GitNexus),
+			"gitnexus_error": errMCPString(o.GNErr),
+			"graphify":       safeMCPResult(o.Graphify),
+			"graphify_error": errMCPString(o.GFErr),
 		}
 	default:
 		return fmt.Sprintf("unknown action: %s", in.Action), true

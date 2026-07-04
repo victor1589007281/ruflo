@@ -53,38 +53,18 @@ func (t *CodeIntelInitTool) Call(ctx context.Context, input json.RawMessage, _ *
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
 
-	// 并行执行 GitNexus analyze + Graphify update
+	// 统一索引操作(gitnexus analyze + graphify update, 内部并行)
 	gn := codeintel.NewGitNexus(in.RepoPath)
 	gf := codeintel.NewGraphify(in.RepoPath)
-
-	var gnResult *codeintel.QueryResult
-	var gfResult *codeintel.QueryResult
-	var gnErr, gfErr error
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		gnResult, gnErr = gn.Analyze()
-	}()
-	go func() {
-		defer wg.Done()
-		gfResult, gfErr = gf.Update(true)
-	}()
-	wg.Wait()
+	o := codeintel.RunIndex(gn, gf)
 
 	result := map[string]interface{}{
-		"status":         "initialized",
+		"status":         o.StatusOr("initialized"),
 		"repo_path":      in.RepoPath,
-		"gitnexus":       safeMap(gnResult),
-		"gitnexus_error": errString(gnErr),
-		"graphify":       safeMap(gfResult),
-		"graphify_error": errString(gfErr),
-	}
-	if gnErr != nil && gfErr != nil {
-		result["status"] = "failed"
-	} else if gnErr != nil || gfErr != nil {
-		result["status"] = "partial"
+		"gitnexus":       safeMap(o.GitNexus),
+		"gitnexus_error": errString(o.GNErr),
+		"graphify":       safeMap(o.Graphify),
+		"graphify_error": errString(o.GFErr),
 	}
 
 	out, _ := json.MarshalIndent(result, "", "  ")
@@ -127,38 +107,18 @@ func (t *CodeIntelUpdateTool) Call(ctx context.Context, input json.RawMessage, _
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
 
-	// 并行执行 GitNexus analyze + Graphify update
+	// 统一索引操作(gitnexus analyze + graphify update, 内部并行)
 	gn := codeintel.NewGitNexus(in.RepoPath)
 	gf := codeintel.NewGraphify(in.RepoPath)
-
-	var gnResult *codeintel.QueryResult
-	var gfResult *codeintel.QueryResult
-	var gnErr, gfErr error
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		gnResult, gnErr = gn.Analyze()
-	}()
-	go func() {
-		defer wg.Done()
-		gfResult, gfErr = gf.Update(true)
-	}()
-	wg.Wait()
+	o := codeintel.RunIndex(gn, gf)
 
 	result := map[string]interface{}{
-		"status":         "updated",
+		"status":         o.StatusOr("updated"),
 		"repo_path":      in.RepoPath,
-		"gitnexus":       safeMap(gnResult),
-		"gitnexus_error": errString(gnErr),
-		"graphify":       safeMap(gfResult),
-		"graphify_error": errString(gfErr),
-	}
-	if gnErr != nil && gfErr != nil {
-		result["status"] = "failed"
-	} else if gnErr != nil || gfErr != nil {
-		result["status"] = "partial"
+		"gitnexus":       safeMap(o.GitNexus),
+		"gitnexus_error": errString(o.GNErr),
+		"graphify":       safeMap(o.Graphify),
+		"graphify_error": errString(o.GFErr),
 	}
 
 	out, _ := json.MarshalIndent(result, "", "  ")
@@ -398,14 +358,13 @@ func (t *CodeIntelBranchTool) Call(ctx context.Context, input json.RawMessage, _
 			"graphify_indexed": gf.IsIndexed(),
 		}
 	case "reindex":
-		gnQr, gnErr := gn.Analyze()
-		gfQr, gfErr := gf.Update(true)
+		o := codeintel.RunIndex(gn, gf)
 		result = map[string]interface{}{
 			"action":         "reindex",
-			"gitnexus":       safeMap(gnQr),
-			"gitnexus_error": errString(gnErr),
-			"graphify":       safeMap(gfQr),
-			"graphify_error": errString(gfErr),
+			"gitnexus":       safeMap(o.GitNexus),
+			"gitnexus_error": errString(o.GNErr),
+			"graphify":       safeMap(o.Graphify),
+			"graphify_error": errString(o.GFErr),
 		}
 	default:
 		return &tool.ToolResult{Content: fmt.Sprintf("unknown action: %s", in.Action), IsError: true}, nil
