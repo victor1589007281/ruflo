@@ -1737,12 +1737,17 @@ func (ptm *ProductionTeamManager) GetTeamReport(name string) (content string, pa
 	return string(data), reportPath
 }
 
-// persist 持久化团队状态到文件
+// persist 持久化团队状态到文件。
+// marshal 在 t.mu 下做一致性快照, 避免与 runAgent / 心跳等并发写者产生撕裂
+// 快照或数据竞争; 文件 I/O 放锁外以免长时间持锁。
+// 约定: 调用方【不得】持有 t.mu(本函数内部自锁, 否则重入死锁)。
 func (t *ProductionTeam) persist() {
 	if t.dataDir == "" {
 		return
 	}
+	t.mu.Lock()
 	data, err := json.MarshalIndent(t, "", "  ")
+	t.mu.Unlock()
 	if err != nil {
 		logging.For("teams").Warn("持久化失败", "team", t.Name, "err", err)
 		return
@@ -1757,7 +1762,6 @@ func (t *ProductionTeam) persist() {
 // 解决"看不清团队内部运行情况"。由 Coordinator.checkTeamHealth 每个心跳周期调用。
 func (t *ProductionTeam) updateHeartbeat(prog ProgressState) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	snap := prog
 	t.Progress = &snap
 	now := time.Now()
@@ -1773,7 +1777,8 @@ func (t *ProductionTeam) updateHeartbeat(prog ProgressState) {
 			ag.LastBeat = now
 		}
 	}
-	t.persist()
+	t.mu.Unlock()
+	t.persist() // persist 内部自锁做一致性快照, 故此处先解锁避免重入死锁
 }
 
 // loadPersistedTeams 从磁盘恢复团队状态

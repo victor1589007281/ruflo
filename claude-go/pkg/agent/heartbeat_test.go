@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -81,4 +82,44 @@ func TestHeartbeatDoesNotClobberAgentPhase(t *testing.T) {
 	if team.Agents["coder"].LastBeat.IsZero() {
 		t.Fatal("LastBeat 应被心跳刷新以证明存活")
 	}
+}
+
+// TestHeartbeatConcurrentPersistNoRace 用 -race 验证 2b 修复:
+// persist() 的 marshal 现在 t.mu 下做一致性快照, 与并发写者(模拟 runAgent 的
+// 加锁改动)不再产生撕裂快照/数据竞争; 且 persist 内部自锁、updateHeartbeat
+// 调用前已解锁, 不会重入死锁。
+func TestHeartbeatConcurrentPersistNoRace(t *testing.T) {
+	dir := t.TempDir()
+	team := &ProductionTeam{
+		Name:    "hbrace",
+		Status:  TeamStatusRunning,
+		dataDir: dir,
+		Agents: map[string]*BGAgent{
+			"coder": {Name: "coder", Role: "coder", Status: AgentStatusRunning, Phase: "执行中"},
+		},
+	}
+	c := &Coordinator{}
+	c.ReportProgress("编译", 1, 10, "t")
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// 写者: 模拟 runAgent 在 t.mu 下改 agent/team 字段 + 落盘
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 300; i++ {
+			team.mu.Lock()
+			team.Agents["coder"].Result = "partial"
+			team.Status = TeamStatusRunning
+			team.mu.Unlock()
+			team.persist()
+		}
+	}()
+	// 心跳: 并发 updateHeartbeat(含 persist 快照)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 300; i++ {
+			team.updateHeartbeat(c.CurrentProgress())
+		}
+	}()
+	wg.Wait()
 }
