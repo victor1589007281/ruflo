@@ -391,9 +391,10 @@ func (t *CodeIntelBranchTool) Call(ctx context.Context, input json.RawMessage, _
 	case "status":
 		gnQr, gnErr := gn.Status()
 		result = map[string]interface{}{
-			"action":         "status",
-			"gitnexus":       safeMap(gnQr),
-			"gitnexus_error": errString(gnErr),
+			"action":           "status",
+			"gitnexus":         safeMap(gnQr),
+			"gitnexus_error":   errString(gnErr),
+			"gitnexus_indexed": gn.IsIndexed(),
 			"graphify_indexed": gf.IsIndexed(),
 		}
 	case "reindex":

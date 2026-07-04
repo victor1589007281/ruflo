@@ -6,6 +6,7 @@ package codeintel
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -193,18 +194,41 @@ func (g *GitNexus) Cypher(query string) (*QueryResult, error) {
 	return wrapResult("gitnexus_cypher", filterJSONOutput(combined), start), nil
 }
 
-// IsIndexed 检查当前仓库是否已被 GitNexus 索引。
-func (g *GitNexus) IsIndexed() bool {
-	qr, err := g.Status()
-	if err != nil {
+// gitnexusIndexedFrom 从一次 GitNexus.Status() 结果推断是否已索引。
+// GitNexus.Status() 经 wrapResult/tryParseJSON 后结果形如
+// {"output": "...仓库: X\n索引提交: abc\n状态: ✅ 已是最新..."}（CLI 报错时经
+// wrapError 含 "error" 键）。老逻辑读取并不存在的 "Status" 键 → 恒 false，
+// 只因此前 Status 路径从不调用它才未暴露。这里改为解析权威的 CLI 文本。
+// 抽为独立函数，使各状态入口共用同一判定，避免重复解析。
+func gitnexusIndexedFrom(qr *QueryResult, err error) bool {
+	if err != nil || qr == nil {
 		return false
 	}
 	m, ok := qr.Results.(map[string]interface{})
 	if !ok {
 		return false
 	}
-	status, _ := m["Status"].(string)
-	return status != "" && status != "not indexed"
+	if _, isErr := m["error"]; isErr { // wrapError：CLI 报错 → 视为未索引
+		return false
+	}
+	out, _ := m["output"].(string)
+	if out == "" {
+		return false
+	}
+	for _, neg := range []string{"未索引", "尚未索引", "未建立索引", "not indexed"} {
+		if strings.Contains(out, neg) {
+			return false
+		}
+	}
+	// 已索引判据：状态行含索引提交或"已是最新/需要更新"（后者=已索引但需增量更新）。
+	return strings.Contains(out, "索引提交") ||
+		strings.Contains(out, "已是最新") ||
+		strings.Contains(out, "需要更新")
+}
+
+// IsIndexed 检查当前仓库是否已被 GitNexus 索引。
+func (g *GitNexus) IsIndexed() bool {
+	return gitnexusIndexedFrom(g.Status())
 }
 
 // Navigate 符号导航（alias to Context）。

@@ -754,6 +754,7 @@ func (s *MCPServerV2) toolBranch(args json.RawMessage) (string, bool) {
 			"action":           "status",
 			"gitnexus":         safeMCPResult(gnQr),
 			"gitnexus_error":   errMCPString(gnErr),
+			"gitnexus_indexed": gitnexusIndexedFrom(gnQr, gnErr),
 			"graphify_indexed": gf.IsIndexed(),
 		}
 	case "reindex":

@@ -158,16 +158,26 @@ func (e *Engine) Status(branchName string) (*QueryResult, error) {
 	start := time.Now()
 
 	gnStatus, gnErr := e.GitNexus.Status()
-	gfStatus, gfErr := e.Graphify.IsIndexed(), error(nil)
-	_ = gfErr
+	gnIndexed := gitnexusIndexedFrom(gnStatus, gnErr)
+	gfIndexed := e.Graphify.IsIndexed()
 
+	// 单一真相源 = live 索引器。历史上 Store.MarkGitNexusIndexed/MarkGraphifyIndexed
+	// 从未被任何路径调用，且 state.*_indexed 除本函数外无人读取（纯展示用），
+	// 故直接以 live 检查结果回填，消除 graphify_indexed(live) 与
+	// state.graphify_indexed(旧值恒 false) 自相矛盾，令 CLIENT/API/MCP 三入口一致。
 	state, _ := e.Store.LoadState()
+	if state == nil {
+		state = &RepoState{RepoPath: e.Store.RepoPath}
+	}
+	state.GitNexusIndexed = gnIndexed
+	state.GraphifyIndexed = gfIndexed
 
 	result := map[string]interface{}{
 		"repo_path":        e.Store.RepoPath,
 		"gitnexus_status":  safeResult(gnStatus),
 		"gitnexus_error":   errString(gnErr),
-		"graphify_indexed": gfStatus,
+		"gitnexus_indexed": gnIndexed,
+		"graphify_indexed": gfIndexed,
 		"state":            state,
 	}
 	content, _ := json.MarshalIndent(result, "", "  ")
