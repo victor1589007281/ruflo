@@ -120,6 +120,7 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"finance":      financeWorkflow,
 	"mr-worker":        mrWorkerWorkflow,        // market-radar 手脚(gemma), 单 agent
 	"quant-strategist": quantStrategistWorkflow, // market-radar 大脑(kimi), 单 agent
+	"mr-chain":         mrChainWorkflow,         // market-radar 产业链建模(kimi), 单 agent
 	"techblog":     techBlogWorkflow,
 	"creative":                       creativeWorkflow,
 	"manager-lab-rehearsal-npc":      managerLabRehearsalNPCWorkflow,

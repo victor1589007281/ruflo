@@ -15,7 +15,7 @@ func mrWorkerWorkflow() *WorkflowDef {
 		QualityGate: "none",
 		Stages: []StageDef{
 			{
-				Name: "worker", Role: "researcher",
+				Name: "worker", Role: "mr-emitter",
 				Prompt: `你是一个数据处理器。你的**唯一输出是一个 JSON 对象**。禁止任何前后说明、禁止分析过程、禁止 markdown 代码围栏、禁止 "以下是"/"我将" 之类的话。第一个字符必须是 { ，最后一个字符必须是 } 。
 
 任务:
@@ -30,6 +30,34 @@ func mrWorkerWorkflow() *WorkflowDef {
 	}
 }
 
+func mrChainWorkflow() *WorkflowDef {
+	return &WorkflowDef{
+		Name:        "mr-chain",
+		Description: "market-radar 产业链建模: 单 agent(kimi) 直出完整 JSON 产业链图",
+		Mode:        "pipeline",
+		QualityGate: "none",
+		Stages: []StageDef{
+			{
+				Name: "chain-builder", Role: "mr-emitter",
+				Prompt: `你是产业链分析师。为给定产业输出一份【完整的产业链图】，只输出一个合法 JSON 对象：不要任何解释、不要 markdown、不要代码围栏。第一个字符是 { 。
+
+产业: {objective}
+
+严格要求:
+- 结构: {"chain":"英文短id(小写连字符)","name":"中文名","groups":[{"id","name","layer":"上游|中游|下游"}],"segments":[{"id","name","group":"所属group的id","companies":[...]}]}
+- 每个 segment 的 companies 至少 3-8 家【真实上市公司】。
+- ★硬性要求: 整条产业链【必须同时包含中国大陆A股、香港、美股】三地公司。中国相关产业往往有A股/港股龙头,
+  务必主动纳入(例: 商业航天有航天科技/航天电子/中国卫星/中航光电等A股; 创新药有恒瑞/百济神州/药明康德A+H等)。
+  只给美股是不合格的输出。
+- 公司字段: {"name","market":"A|HK|US","ticker":"纯代码不带交易所后缀","secid":"港股/美股给,如 116.00700 / 105.NVDA；A股可省略","role":"龙头|跟随等"}。
+- A股 ticker 如 "600519"；港股 ticker 如 "00700" secid "116.00700"；美股 ticker 如 "NVDA" secid "105.NVDA"(纳斯达克105/纽交所106)。
+- 只列你确信真实存在且已上市的公司；未上市公司不要列。
+- 覆盖上中下游 6-10 个 segment。只输出 JSON。`,
+			},
+		},
+	}
+}
+
 func quantStrategistWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "quant-strategist",
@@ -38,7 +66,7 @@ func quantStrategistWorkflow() *WorkflowDef {
 		QualityGate: "none",
 		Stages: []StageDef{
 			{
-				Name: "strategist", Role: "trade-advisor",
+				Name: "strategist", Role: "mr-emitter",
 				Prompt: `你是量化策略研究员。根据输入完成"提出策略"或"复盘归因"，并且【只输出一个合法的 JSON 对象】：不要解释、不要 markdown 围栏。
 
 输入:

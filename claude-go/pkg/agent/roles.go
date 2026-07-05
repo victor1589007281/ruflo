@@ -73,6 +73,17 @@ func NewRoleRegistry(cwd string) *RoleRegistry {
 	rr.profile = skills.DetectProjectProfile(cwd)
 	rr.registerBuiltins()
 
+	// market-radar 专用：格式中立的结构化输出器（不套 HEV/投资报告等模板，避免污染 JSON 产出）
+	rr.roles["mr-emitter"] = &RoleDef{
+		Name:        "mr-emitter",
+		Category:    "workflow",
+		Description: "market-radar 结构化输出器：只按要求输出一个 JSON 对象，无分析/方法论/散文",
+		Tags:        []string{"structured", "json", "market-radar"},
+		SystemPrompt: "你是一个严格的结构化数据输出器。你【只】输出任务所要求的那一个 JSON 对象：" +
+			"禁止任何分析过程、方法论(如HEV)、假设、表格、投资评级、markdown 标题或代码围栏。" +
+			"第一个字符必须是 { ，最后一个字符必须是 } 。\n\n任务: {objective}",
+	}
+
 	// 尝试从磁盘加载用户自定义角色
 	for _, customDir := range defaultRoleDirs(cwd) {
 		rr.loadCustomRoles(customDir)
