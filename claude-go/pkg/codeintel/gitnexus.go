@@ -14,7 +14,8 @@ import (
 type GitNexus struct {
 	RepoPath     string
 	IndexBaseDir string
-	MaxHeapMB    int      // Node.js V8 最大堆内存（MB），0 表示使用 GitNexus 默认值
+	MaxHeapMB    int           // Node.js V8 最大堆内存（MB），0 表示使用 GitNexus 默认值
+	IndexTimeout time.Duration // analyze 执行超时，0 表示默认 2h
 	paths        *ToolPaths
 }
 
@@ -73,7 +74,11 @@ func (g *GitNexus) Analyze() (*QueryResult, error) {
 		"GITNEXUS_PARSE_CHUNK_CONCURRENCY=4",
 	)
 
-	stdout, stderr, err := runWithTimeoutEnv(g.RepoPath, 2*time.Hour, env, paths.NodePath, paths.GitNexusPath, "analyze", "--index-only", "--worker-timeout", "60", ".")
+	timeout := g.IndexTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Hour
+	}
+	stdout, stderr, err := runWithTimeoutEnv(g.RepoPath, timeout, env, paths.NodePath, paths.GitNexusPath, "analyze", "--index-only", "--worker-timeout", "60", ".")
 	combined := append(stderr, '\n')
 	combined = append(combined, stdout...)
 	if err != nil {

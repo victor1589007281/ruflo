@@ -2803,6 +2803,7 @@ func codeintelMCPServerCmd() *cobra.Command {
 		addr         string
 		configPath   string
 		indexBaseDir string
+		gnCfg        *codeintel.GitNexusConfig
 	)
 	cmd := &cobra.Command{
 		Use:   "codeintel-mcp-server",
@@ -2837,6 +2838,16 @@ func codeintelMCPServerCmd() *cobra.Command {
 					if !cmd.Flags().Changed("index-base-dir") {
 						indexBaseDir = jsonCfg.CodeIntel.IndexBaseDir
 					}
+					// gitnexus 调优段此前从未接线, calcHeapMB 一直用内置默认值
+					if g := jsonCfg.CodeIntel.GitNexus; g != nil {
+						gnCfg = &codeintel.GitNexusConfig{
+							DefaultHeapMB:        g.DefaultHeapMB,
+							MaxHeapMB:            g.MaxHeapMB,
+							PerThousandFilesMB:   g.PerThousandFilesMB,
+							PerHundredMBSourceMB: g.PerHundredMBSourceMB,
+							IndexTimeoutMin:      g.IndexTimeoutMin,
+						}
+					}
 				}
 			}
 			if transport == "" {
@@ -2847,6 +2858,7 @@ func codeintelMCPServerCmd() *cobra.Command {
 			}
 			srv := codeintel.NewMCPServerV2(repoPath)
 			srv.IndexBaseDir = indexBaseDir
+			srv.GitNexusCfg = gnCfg
 			var t codeintel.MCPTransport
 			switch transport {
 			case "http":

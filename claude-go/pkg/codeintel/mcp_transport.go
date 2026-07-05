@@ -65,6 +65,16 @@ type GitNexusConfig struct {
 	PerThousandFilesMB int `json:"perThousandFilesMB,omitempty"`
 	// PerHundredMBSourceMB 每 100MB 源码额外增加的堆内存 (MB)。0 表示 512。
 	PerHundredMBSourceMB int `json:"perHundredMBSourceMB,omitempty"`
+	// IndexTimeoutMin gitnexus analyze 单次执行超时 (分钟)。0 表示内置默认 120。
+	IndexTimeoutMin int `json:"indexTimeoutMin,omitempty"`
+}
+
+// indexTimeout 从配置换算索引超时；未配置时返回 0（由 GitNexus 用内置默认）。
+func indexTimeout(cfg *GitNexusConfig) time.Duration {
+	if cfg != nil && cfg.IndexTimeoutMin > 0 {
+		return time.Duration(cfg.IndexTimeoutMin) * time.Minute
+	}
+	return 0
 }
 
 // MCPServerV2 Code Intelligence MCP 服务器（支持多传输）。
@@ -582,6 +592,7 @@ func (s *MCPServerV2) toolInit(args json.RawMessage) (string, bool) {
 	gn := NewGitNexus(in.RepoPath)
 	gn.IndexBaseDir = s.IndexBaseDir
 	gn.MaxHeapMB = calcHeapMB(in.RepoPath, s.GitNexusCfg)
+	gn.IndexTimeout = indexTimeout(s.GitNexusCfg)
 	gf := NewGraphify(in.RepoPath)
 	gf.IndexBaseDir = s.IndexBaseDir
 
@@ -606,6 +617,7 @@ func (s *MCPServerV2) toolUpdate(args json.RawMessage) (string, bool) {
 	gn := NewGitNexus(in.RepoPath)
 	gn.IndexBaseDir = s.IndexBaseDir
 	gn.MaxHeapMB = calcHeapMB(in.RepoPath, s.GitNexusCfg)
+	gn.IndexTimeout = indexTimeout(s.GitNexusCfg)
 	gf := NewGraphify(in.RepoPath)
 	gf.IndexBaseDir = s.IndexBaseDir
 
@@ -712,6 +724,8 @@ func (s *MCPServerV2) toolBranch(args json.RawMessage) (string, bool) {
 
 	gn := NewGitNexus(in.RepoPath)
 	gn.IndexBaseDir = s.IndexBaseDir
+	gn.MaxHeapMB = calcHeapMB(in.RepoPath, s.GitNexusCfg)
+	gn.IndexTimeout = indexTimeout(s.GitNexusCfg)
 	gf := NewGraphify(in.RepoPath)
 	gf.IndexBaseDir = s.IndexBaseDir
 	var result map[string]interface{}

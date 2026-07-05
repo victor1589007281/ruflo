@@ -390,6 +390,7 @@ type CodeIntelSection struct {
 		MaxHeapMB            int `json:"maxHeapMB,omitempty"`
 		PerThousandFilesMB   int `json:"perThousandFilesMB,omitempty"`
 		PerHundredMBSourceMB int `json:"perHundredMBSourceMB,omitempty"`
+		IndexTimeoutMin      int `json:"indexTimeoutMin,omitempty"`
 	} `json:"gitnexus,omitempty"`
 }
 
