@@ -213,31 +213,42 @@ func (h *LoopDetectorResultHook) Execute(ctx *HookContext) (*HookResult, error) 
 // DisabledToolHook — 禁用工具拦截
 // ============================================================================
 
-// DisabledToolHook 在 PhasePreToolUse 阶段将 Config.DisabledTools 中匹配的工具
-// 替换为错误结果，避免模型调用不应使用的工具。
-// 若全部被禁用，则注入 continue 消息让模型重新选择。
-type DisabledToolHook struct {
+// ToolGateHook 在 PhasePreToolUse 阶段拦截不允许的工具调用，替换为错误结果。
+// 拦截条件: 命中 disabled 黑名单，或 (allowed 白名单非空且工具不在其中)。
+// 这是即便模型凭空产出未暴露工具调用时的第二道防线 (工具表过滤为第一道)。
+// 若全部被拦截，则注入 continue 消息让模型重新选择。
+type ToolGateHook struct {
 	disabled map[string]bool
+	allowed  map[string]bool
 }
 
-// NewDisabledToolHook 创建 DisabledToolHook。
-// 若 disabled 为空则返回 nil，避免注册无意义的 hook。
-func NewDisabledToolHook(disabled map[string]bool) *DisabledToolHook {
-	if len(disabled) == 0 {
+// NewToolGateHook 创建 ToolGateHook。disabled 与 allowed 均为空时返回 nil。
+func NewToolGateHook(disabled, allowed map[string]bool) *ToolGateHook {
+	if len(disabled) == 0 && len(allowed) == 0 {
 		return nil
 	}
-	return &DisabledToolHook{disabled: disabled}
+	return &ToolGateHook{disabled: disabled, allowed: allowed}
 }
 
-func (h *DisabledToolHook) Name() string                { return "disabled_tool" }
-func (h *DisabledToolHook) Priority() int               { return 150 }
-func (h *DisabledToolHook) Phases() []InternalHookPhase {
+func (h *ToolGateHook) blocked(name string) bool {
+	if h.disabled != nil && h.disabled[name] {
+		return true
+	}
+	if len(h.allowed) > 0 && !h.allowed[name] {
+		return true
+	}
+	return false
+}
+
+func (h *ToolGateHook) Name() string  { return "tool_gate" }
+func (h *ToolGateHook) Priority() int { return 150 }
+func (h *ToolGateHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreToolUse}
 }
 
-// Execute 遍历 tool_use 块，拦截禁用工具并生成错误结果。
-func (h *DisabledToolHook) Execute(ctx *HookContext) (*HookResult, error) {
-	if len(h.disabled) == 0 || len(ctx.ToolUseBlocks) == 0 {
+// Execute 遍历 tool_use 块，拦截不允许的工具并生成错误结果。
+func (h *ToolGateHook) Execute(ctx *HookContext) (*HookResult, error) {
+	if (len(h.disabled) == 0 && len(h.allowed) == 0) || len(ctx.ToolUseBlocks) == 0 {
 		return nil, nil
 	}
 
@@ -245,7 +256,7 @@ func (h *DisabledToolHook) Execute(ctx *HookContext) (*HookResult, error) {
 	var appendMsgs []types.Message
 
 	for _, block := range ctx.ToolUseBlocks {
-		if h.disabled[block.Name] {
+		if h.blocked(block.Name) {
 			errResult := types.Message{
 				Type: types.MessageTypeUser,
 				UUID: GenerateUUID(),

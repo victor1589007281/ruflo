@@ -151,6 +151,8 @@ var (
 	flagResume       string // --resume <sessionID>
 	flagContinue     bool   // --continue / -c
 	flagAdvisor      string // --advisor <provider:model|off>
+	flagAllowedTools string // --allowed-tools t1,t2 (whitelist; non-empty = only these)
+	flagOutputFormat string // --output-format text|json
 )
 
 func main() {
@@ -239,6 +241,8 @@ func main() {
 	rootCmd.PersistentFlags().BoolVar(&flagEmitSession, "emit-session-id", false, "结束时输出 __CLAUDE_GO_SESSION__=<id> 行, 供调用方记录以便 --resume 续聊")
 	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
 	rootCmd.PersistentFlags().StringVar(&flagAdvisor, "advisor", "", "启用 advisor 顾问工具并指定模型别名 (provider:model); \"off\" 强制关闭 (覆盖配置文件)")
+	rootCmd.PersistentFlags().StringVar(&flagAllowedTools, "allowed-tools", "", "工具白名单 (逗号分隔); 非空时仅这些工具可见且可执行, 其余硬拒 (用于受限托管 agent)")
+	rootCmd.PersistentFlags().StringVar(&flagOutputFormat, "output-format", "text", "输出格式: text (默认) | json (final/usage/error_kind/session_id 顶层 envelope, 供程序化调用)")
 
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(runCmd())
@@ -808,14 +812,49 @@ func runCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			jsonMode := flagOutputFormat == "json"
 			streamCh := eng.SubmitStreamBlocks(ctx, userPrompt, attachBlocks)
-			printStreamEvents(streamCh)
+			// In JSON mode the deltas are collected, not streamed, so the only
+			// thing on stdout is the final envelope — safe to parse.
+			final, errKind := consumeStreamEvents(streamCh, jsonMode)
+			sessionID := ""
+			if store != nil {
+				sessionID = store.SessionID()
+			}
+			if jsonMode {
+				return emitRunEnvelope(final, sessionID, errKind)
+			}
 			if flagEmitSession && store != nil {
-				fmt.Printf("\n__CLAUDE_GO_SESSION__=%s\n", store.SessionID())
+				fmt.Printf("\n__CLAUDE_GO_SESSION__=%s\n", sessionID)
 			}
 			return nil
 		},
 	}
+}
+
+// runEnvelope is the --output-format json result: a single parseable object
+// carrying the final answer, session id, and error classification, so callers
+// no longer scrape free-form stdout (design/09 §8 structured IO contract).
+type runEnvelope struct {
+	Final     string `json:"final"`
+	SessionID string `json:"session_id,omitempty"`
+	IsError   bool   `json:"is_error"`
+	ErrorKind string `json:"error_kind,omitempty"`
+}
+
+func emitRunEnvelope(final, sessionID, errKind string) error {
+	env := runEnvelope{
+		Final:     final,
+		SessionID: sessionID,
+		IsError:   errKind != "",
+		ErrorKind: errKind,
+	}
+	b, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(b))
+	return nil
 }
 
 // ingestAttachments 把 --attach 指定的媒体文件转换为内容块 (多模态输入)。
@@ -2437,6 +2476,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 		PermissionMode:   permMode,
 		IsNonInteractive: flagPrint,
 		Debug:            flagDebug,
+		AllowedTools:     parseAllowedTools(flagAllowedTools),
 	}
 
 	deps := &engineDeps{
@@ -2648,14 +2688,22 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 
 // printStreamEvents 消费 StreamEvent 通道，实现 token-by-token 实时输出。
 func printStreamEvents(ch <-chan types.StreamEvent) {
+	consumeStreamEvents(ch, false)
+}
+
+// consumeStreamEvents 消费 StreamEvent 通道。quiet=false 时 token-by-token 实时
+// 输出 (原 printStreamEvents 行为); quiet=true 时不打印, 仅累积最终 (非 thinking)
+// 文本与错误分类, 供 --output-format json 的 envelope 使用。
+func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool) (finalText, errKind string) {
 	inThinking := false
 	hasOutput := false
+	var final strings.Builder
 	for ev := range ch {
 		switch ev.Kind {
 		case types.StreamEventDelta:
 			if ev.IsThinking {
-				if flagFinalOnly {
-					continue // --final-only: thinking 过程不输出
+				if flagFinalOnly || quiet {
+					continue // --final-only / json: thinking 过程不输出
 				}
 				if !inThinking {
 					fmt.Print("\033[2m") // dim
@@ -2663,6 +2711,11 @@ func printStreamEvents(ch <-chan types.StreamEvent) {
 				}
 				fmt.Print(ev.DeltaText)
 			} else {
+				final.WriteString(ev.DeltaText)
+				if quiet {
+					hasOutput = true
+					continue
+				}
 				if inThinking {
 					fmt.Print("\033[0m") // reset
 					inThinking = false
@@ -2671,16 +2724,16 @@ func printStreamEvents(ch <-chan types.StreamEvent) {
 			}
 			hasOutput = true
 		case types.StreamEventBlockDone:
-			if inThinking {
+			if inThinking && !quiet {
 				fmt.Print("\033[0m")
 				inThinking = false
 			}
 		case types.StreamEventToolStart:
-			if flagDebug {
+			if flagDebug && !quiet {
 				fmt.Printf("\n[调用工具: %s]\n", ev.ToolName)
 			}
 		case types.StreamEventToolDone:
-			if flagDebug {
+			if flagDebug && !quiet {
 				result := ev.ToolResult
 				if len(result) > 200 {
 					result = result[:200] + "..."
@@ -2690,12 +2743,58 @@ func printStreamEvents(ch <-chan types.StreamEvent) {
 		case types.StreamEventMessageDone:
 			// MessageDone 标志一轮 assistant 完成
 		case types.StreamEventError:
-			fmt.Fprintf(os.Stderr, "\n[Error] %v\n", ev.Error)
+			if ev.Error != nil {
+				errKind = classifyRunError(ev.Error)
+				if !quiet {
+					fmt.Fprintf(os.Stderr, "\n[Error] %v\n", ev.Error)
+				}
+			}
 		}
 	}
-	if hasOutput {
+	if hasOutput && !quiet {
 		fmt.Println()
 	}
+	return strings.TrimSpace(final.String()), errKind
+}
+
+// classifyRunError maps a stream error to a coarse kind for the JSON envelope
+// so callers can pick a retry strategy without parsing free-form messages.
+func classifyRunError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "context deadline") || strings.Contains(msg, "timeout"):
+		return "timeout"
+	case strings.Contains(msg, "rate limit") || strings.Contains(msg, "429"):
+		return "rate_limit"
+	case strings.Contains(msg, "overloaded") || strings.Contains(msg, "529"):
+		return "overloaded"
+	case strings.Contains(msg, "too long") || strings.Contains(msg, "context length") || strings.Contains(msg, "max tokens"):
+		return "prompt_too_long"
+	default:
+		return "error"
+	}
+}
+
+// parseAllowedTools splits a comma-separated whitelist into a set. Empty input
+// yields nil (no whitelist = all tools exposed, subject to DisabledTools).
+func parseAllowedTools(csv string) map[string]bool {
+	csv = strings.TrimSpace(csv)
+	if csv == "" {
+		return nil
+	}
+	set := make(map[string]bool)
+	for _, t := range strings.Split(csv, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			set[t] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
 }
 
 func firstLine(s string) string {

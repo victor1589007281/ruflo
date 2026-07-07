@@ -122,6 +122,12 @@ type Config struct {
 	// 用途: 飞书 processAndReply 场景下禁止 LLM 自主创建/删除团队。
 	DisabledTools map[string]bool
 
+	// AllowedTools 工具白名单。非空时仅白名单内的工具对模型可见且可执行，
+	// 其余一律硬拒 (等价于隐式全部 disabled)。用途: 受限托管 agent — 平台只
+	// 放开经 MCP 暴露的工具，Bash/Write 等内置工具即使在工具表中也无法调用。
+	// 白名单在会话构建时锁定，运行中无法自行扩展。
+	AllowedTools map[string]bool
+
 	// ==================== 前沿优化特性开关 (默认关闭) ====================
 	// 详细方案见 docs/query-engine-frontier-optimization.md。
 	// 推荐通过 QueryEngine.EnableFrontierOptimizations() 统一启用 P0/P1 组件。
@@ -153,6 +159,19 @@ type Config struct {
 	AdvisorCheckpointEveryTurns int
 	// AdvisorCheckpointOnLoop LoopDetector 触发时联动主动咨询。
 	AdvisorCheckpointOnLoop bool
+}
+
+// toolExposed reports whether a tool may be shown to the model and executed,
+// applying DisabledTools (blacklist) and AllowedTools (whitelist, when set).
+// This is the single source of truth mirrored by ToolGateHook at PreToolUse.
+func (c *Config) toolExposed(name string) bool {
+	if c.DisabledTools != nil && c.DisabledTools[name] {
+		return false
+	}
+	if len(c.AllowedTools) > 0 && !c.AllowedTools[name] {
+		return false
+	}
+	return true
 }
 
 // NewQueryEngine 创建查询引擎
@@ -286,8 +305,8 @@ func (e *QueryEngine) registerInternalHooks() {
 	if e.LoopDet != nil {
 		e.HookChain.Register(internal_hook.NewLoopDetectorInputHook(e.LoopDet, e.Metrics))
 	}
-	if len(e.Config.DisabledTools) > 0 {
-		if h := internal_hook.NewDisabledToolHook(e.Config.DisabledTools); h != nil {
+	if len(e.Config.DisabledTools) > 0 || len(e.Config.AllowedTools) > 0 {
+		if h := internal_hook.NewToolGateHook(e.Config.DisabledTools, e.Config.AllowedTools); h != nil {
 			e.HookChain.Register(h)
 		}
 	}
@@ -683,9 +702,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		apiMessages := messagesToAPI(messages, e.HookRunner)
 		allTools := e.Tools.APITools()
 		var apiTools []types.APITool
-		if len(e.Config.DisabledTools) > 0 {
+		if len(e.Config.DisabledTools) > 0 || len(e.Config.AllowedTools) > 0 {
 			for _, t := range allTools {
-				if !e.Config.DisabledTools[t.Name] {
+				if e.Config.toolExposed(t.Name) {
 					apiTools = append(apiTools, t)
 				}
 			}

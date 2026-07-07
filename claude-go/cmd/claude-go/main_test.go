@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -269,5 +270,41 @@ func snapshotGlobalFlags() func() {
 		flagConfig = old.config
 		flagResume = old.resume
 		flagContinue = old.continueFlag
+	}
+}
+
+func TestParseAllowedTools(t *testing.T) {
+	if parseAllowedTools("") != nil {
+		t.Fatal("empty input must yield nil (no whitelist)")
+	}
+	if parseAllowedTools("  ,  ") != nil {
+		t.Fatal("blank-only input must yield nil")
+	}
+	set := parseAllowedTools("sql_query, submit_finding ,heartbeat")
+	for _, want := range []string{"sql_query", "submit_finding", "heartbeat"} {
+		if !set[want] {
+			t.Fatalf("expected %q in whitelist set %v", want, set)
+		}
+	}
+	if len(set) != 3 {
+		t.Fatalf("expected 3 tools, got %d", len(set))
+	}
+}
+
+func TestClassifyRunError(t *testing.T) {
+	cases := map[string]string{
+		"context deadline exceeded":    "timeout",
+		"HTTP 429 rate limit reached":  "rate_limit",
+		"model overloaded (529)":       "overloaded",
+		"prompt is too long for model": "prompt_too_long",
+		"some unknown failure":         "error",
+	}
+	for msg, want := range cases {
+		if got := classifyRunError(fmt.Errorf("%s", msg)); got != want {
+			t.Fatalf("classifyRunError(%q)=%q, want %q", msg, got, want)
+		}
+	}
+	if classifyRunError(nil) != "" {
+		t.Fatal("nil error must classify to empty string")
 	}
 }
