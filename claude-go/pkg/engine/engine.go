@@ -122,10 +122,12 @@ type Config struct {
 	// 用途: 飞书 processAndReply 场景下禁止 LLM 自主创建/删除团队。
 	DisabledTools map[string]bool
 
-	// AllowedTools 工具白名单。非空时仅白名单内的工具对模型可见且可执行，
-	// 其余一律硬拒 (等价于隐式全部 disabled)。用途: 受限托管 agent — 平台只
-	// 放开经 MCP 暴露的工具，Bash/Write 等内置工具即使在工具表中也无法调用。
-	// 白名单在会话构建时锁定，运行中无法自行扩展。
+	// AllowedTools 工具白名单。语义区分 nil 与空集 (fail-closed):
+	//   nil    = 未设置白名单, 全部工具可见 (仅受 DisabledTools 约束);
+	//   非 nil = 仅白名单内的工具对模型可见且可执行, 其余一律硬拒 —
+	//            **空集 = 全部拒绝**, 而不是不限制。
+	// 用途: 受限托管 agent — 平台只放开经 MCP 暴露的工具，Bash/Write 等
+	// 内置工具即使在工具表中也无法调用。白名单在会话构建时锁定。
 	AllowedTools map[string]bool
 
 	// ==================== 前沿优化特性开关 (默认关闭) ====================
@@ -168,7 +170,8 @@ func (c *Config) toolExposed(name string) bool {
 	if c.DisabledTools != nil && c.DisabledTools[name] {
 		return false
 	}
-	if len(c.AllowedTools) > 0 && !c.AllowedTools[name] {
+	// nil = 无白名单; 非 nil (含空集) = 仅名单内放行, 空集拒绝一切。
+	if c.AllowedTools != nil && !c.AllowedTools[name] {
 		return false
 	}
 	return true
@@ -305,7 +308,7 @@ func (e *QueryEngine) registerInternalHooks() {
 	if e.LoopDet != nil {
 		e.HookChain.Register(internal_hook.NewLoopDetectorInputHook(e.LoopDet, e.Metrics))
 	}
-	if len(e.Config.DisabledTools) > 0 || len(e.Config.AllowedTools) > 0 {
+	if len(e.Config.DisabledTools) > 0 || e.Config.AllowedTools != nil {
 		if h := internal_hook.NewToolGateHook(e.Config.DisabledTools, e.Config.AllowedTools); h != nil {
 			e.HookChain.Register(h)
 		}

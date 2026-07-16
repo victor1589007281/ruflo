@@ -294,14 +294,25 @@ func RunToolUse(
 	}
 	content = compactToolResultContent(toolName, content, tctx)
 
+	resultBlocks := []types.ContentBlock{{
+		Type:      types.ContentBlockToolResult,
+		ToolUseID: toolUseID,
+		Content:   content,
+		IsError:   result.IsError,
+	}}
+	// 图像附件: 以 image 块追加在同一条 user 消息里 (Anthropic 多模态格式),
+	// tool_result 文本负责说明来源, 视觉模型 (kimi/qwen) 可直接查看图像内容。
+	for i := range result.Images {
+		src := result.Images[i]
+		resultBlocks = append(resultBlocks, types.ContentBlock{
+			Type:   types.ContentBlockImage,
+			Source: &src,
+		})
+	}
+
 	return types.Message{
-		Type: types.MessageTypeUser,
-		Content: []types.ContentBlock{{
-			Type:      types.ContentBlockToolResult,
-			ToolUseID: toolUseID,
-			Content:   content,
-			IsError:   result.IsError,
-		}},
+		Type:    types.MessageTypeUser,
+		Content: resultBlocks,
 	}
 }
 
@@ -391,11 +402,16 @@ func summarizeLongToolResult(raw string, maxChars int) string {
 	lower := strings.ToLower(raw)
 	for _, marker := range []string{"error", "错误", "failed", "panic", "exception", "fatal"} {
 		if idx := strings.Index(lower, marker); idx >= 0 {
+			// idx 是 lower 的字节偏移。strings.ToLower 底层 strings.Map 会把每个非法 UTF-8
+			// 字节替换成 U+FFFD(1 字节→3 字节)，故当 raw 含二进制/截断的多字节数据(如读到
+			// 二进制文件、被切断的流)时 lower 会比 raw 长，idx 可能越过 len(raw)——用它切 raw
+			// 会越界(曾崩: slice bounds out of range [103740:100043], 约 1850 个坏字节即触发)。
+			// 改切 lower：同一坐标系，恒合法且始终对齐 marker；诊断摘要小写化无碍。end 按 lower 长度夹取。
 			end := idx + 800
-			if end > len(raw) {
-				end = len(raw)
+			if end > len(lower) {
+				end = len(lower)
 			}
-			picked = append(picked, "", "[diagnostic excerpt]", raw[idx:end])
+			picked = append(picked, "", "[diagnostic excerpt]", lower[idx:end])
 			break
 		}
 	}

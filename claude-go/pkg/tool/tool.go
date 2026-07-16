@@ -74,6 +74,9 @@ type AliasedTool interface {
 type ToolResult struct {
 	Content string `json:"content"`
 	IsError bool   `json:"is_error,omitempty"`
+	// Images 可选图像附件 (如 FileRead 读取图片文件)。非空时 RunToolUse 会在 tool_result
+	// 块之后以 image 内容块追加到同一条 user 消息 (Anthropic 多模态格式), 供视觉模型直接查看。
+	Images []types.MediaSource `json:"images,omitempty"`
 }
 
 // ToolContext 工具执行时的上下文环境。

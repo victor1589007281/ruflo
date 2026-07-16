@@ -49,7 +49,9 @@ func novelV3Workflow() *WorkflowDef {
 			{Name: "catalyst", Role: "fate-weaver", DependsOn: []string{"world-forge", "soul-forge"}, Prompt: fateWeaverPrompt},
 			{Name: "evo-blueprint", Role: "evo-architect", DependsOn: []string{"world-forge", "soul-forge", "catalyst"}, Prompt: evoArchitectPrompt},
 			// Phase D: 复用 v2 大纲设计
-			{Name: "outline-design", Role: "outline-architect", DependsOn: []string{"world-forge", "soul-forge", "catalyst"}, Prompt: v3OutlinePrompt},
+			// best-narrative(胜出时间线) + second-narrative(次优时间线, #3 跨线亮点) + evaluation(审判团共识/依据/融合建议)
+		// 一并注入, 让大纲建立在 swarm 模拟结果之上, 而非仅凭世界观/角色空想 —— 否则 Phase B/C 沦为装饰。
+		{Name: "outline-design", Role: "outline-architect", DependsOn: []string{"best-narrative", "second-narrative", "evaluation", "world-forge", "soul-forge", "catalyst"}, Prompt: v3OutlinePrompt},
 			// Phase E-F: 由编排器动态驱动 (复用 v2 章节循环 + 全书整合)
 		},
 	}
@@ -125,6 +127,13 @@ func (we *WorkflowExecutor) executeSwarmNovel(ctx context.Context, wf *WorkflowD
 		}
 
 		siCfg := swarm_intel.DefaultConfig()
+		// 隔离小说域 swarm 学习状态到独立 DataDir: 与 aiops 等共享域的预测校准/信任互不污染,
+		// 且 §2 #5/#6/#7 跨会话学习(保形/信任/路由)只在小说域累积。**这也是关键安全边界**:
+		// 共享域(aiops)从不调 RecordOutcome → trustScores 恒空 → TrustWeightedTrimmedFuse 退化为
+		// TrimmedFuse, 其 Predict 输出零回归。
+		if home, herr := os.UserHomeDir(); herr == nil {
+			siCfg.DataDir = filepath.Join(home, ".claude-go", "swarm_intel", "novel")
+		}
 		siCfg.Notify = func(_, msg string) {
 			notify("  [群体智能] " + msg)
 			if team.Blackboard != nil {
@@ -139,87 +148,97 @@ func (we *WorkflowExecutor) executeSwarmNovel(ctx context.Context, wf *WorkflowD
 
 		baseObjective := buildSimulateObjective(objective, prevResults, soulCards)
 
-		// 并行模拟所有时间线 (各时间线互相独立, 可安全并发)
-		type tlResult struct {
-			ID        int
-			SR        StageResult
-			Narrative string
-			Emergent  []string
+		// #8: 用群体智能历史经验预热模拟目标 (跨小说学习: 哪些演化模式产出过好走向)
+		if we.evolution != nil {
+			if exps := we.evolution.RetrieveFor("swarm-intel", objective, 3); len(exps) > 0 {
+				baseObjective += "\n\n## 历史群体演化经验 (参考, 非约束)\n" + FormatExperiencesForPrompt(exps)
+				notify(fmt.Sprintf("  📚 注入 %d 条历史演化经验预热模拟", len(exps)))
+			}
 		}
-		tlResults := make([]tlResult, blueprint.TimelineCount)
 
+		// #9: 用 FanOutFirstN 生成时间线 —— 多生成 1 条冗余, 保留最先完成的 TimelineCount 条成功者。
+		// 好处: ①容忍单条时间线失败(冗余顶上) ②凑够目标数后早停取消富余分支省算力
+		//       ③复用已实现却从未被调用的 FanOutFirstN 原语 (design/08 §2 #9)。
+		targetTL := blueprint.TimelineCount
+		bufferTL := targetTL + 1
 		para := we.effectiveParallel()
-		if para > blueprint.TimelineCount {
-			para = blueprint.TimelineCount
-		}
-		sem := make(chan struct{}, para)
-		var wg sync.WaitGroup
 
-		for tlID := 1; tlID <= blueprint.TimelineCount; tlID++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
+		var tlMu sync.Mutex
+		tlNarr := map[int]string{}
+		tlEmerg := map[int][]string{}
 
-				tlObjective := fmt.Sprintf("%s\n\n## 时间线 #%d 演化指令\n分歧策略: %s\n请模拟角色在此世界中 %d 轮互动, 产生独特的故事走向。时间线 #%d 应尝试与其他时间线产生差异化的叙事路径。",
-					baseObjective, id, blueprint.DivergenceStrategy, blueprint.Rounds, id)
-
+		branches := map[string]swarm_intel.BranchFunc{}
+		for tlID := 1; tlID <= bufferTL; tlID++ {
+			id := tlID
+			tlObjective := fmt.Sprintf("%s\n\n## 时间线 #%d 演化指令\n分歧策略: %s\n请模拟角色在此世界中 %d 轮互动, 产生独特的故事走向。时间线 #%d 应尝试与其他时间线产生差异化的叙事路径。",
+				baseObjective, id, blueprint.DivergenceStrategy, blueprint.Rounds, id)
+			branches[fmt.Sprintf("timeline-%d", id)] = func(bctx context.Context) (string, error) {
 				notify(fmt.Sprintf("  🔄 时间线 #%d: 群体智能社会模拟启动...", id))
-
-				simCfg := swarm_intel.SimulationConfig{
-					Mode:   "social",
-					Agents: len(soulCards),
-					Rounds: blueprint.Rounds,
-				}
-
-				simResult, err := engine.Simulate(ctx, team.ChatID, tlObjective, simCfg)
-
-				sr := StageResult{Name: fmt.Sprintf("timeline-%d", id), Role: "swarm-intel-simulate"}
-				var narrative string
-				var emergent []string
+				simCfg := swarm_intel.SimulationConfig{Mode: "social", Agents: len(soulCards), Rounds: blueprint.Rounds}
+				simResult, err := engine.Simulate(bctx, team.ChatID, tlObjective, simCfg)
 				if err != nil {
-					sr.Status = TaskFailed
-					sr.Error = err.Error()
 					notify(fmt.Sprintf("  ⚠️ 时间线 #%d 模拟失败: %s", id, err))
-				} else {
-					narrative = formatSimulationAsNarrative(simResult, id)
-					emergent = simResult.Emergent
-					sr.Status = TaskCompleted
-					sr.Output = narrative
-					notify(fmt.Sprintf("  ✅ 时间线 #%d 完成 (%d 个场景, %d 字, %d 条涌现行为)",
-						id, len(simResult.Scenarios), len(narrative), len(simResult.Emergent)))
+					return "", err
 				}
-
-				tlResults[id-1] = tlResult{ID: id, SR: sr, Narrative: narrative, Emergent: emergent}
-			}(tlID)
+				narrative := formatSimulationAsNarrative(simResult, id)
+				tlMu.Lock()
+				tlNarr[id] = narrative
+				tlEmerg[id] = simResult.Emergent
+				tlMu.Unlock()
+				notify(fmt.Sprintf("  ✅ 时间线 #%d 完成 (%d 个场景, %d 字, %d 条涌现行为)",
+					id, len(simResult.Scenarios), len(narrative), len(simResult.Emergent)))
+				return narrative, nil
+			}
 		}
-		wg.Wait()
 
-		// 按时间线顺序收集结果
+		foCfg := swarm_intel.DefaultFanOutConfig()
+		foCfg.MaxConcurrency = para
+		// 时间线社会模拟较慢, 且 Simulate 内部自带预算。让 FanOut 超时**非绑定**(不比 Simulate 内部预算更紧),
+		// 保持原 Phase B "由 ctx / Simulate 自身预算治理" 的语义, 避免默认 3min 分支超时误杀慢时间线。
+		foTimeout := 30 * time.Minute
+		if dl, ok := ctx.Deadline(); ok {
+			foTimeout = time.Until(dl)
+		}
+		foCfg.TotalTimeout = foTimeout
+		foCfg.PerBranchTimeout = foTimeout
+		foResults := swarm_intel.FanOutFirstN(ctx, foCfg, branches, targetTL)
+
+		succeeded := map[int]bool{}
+		for _, r := range foResults {
+			if r.Error == nil {
+				var idn int
+				fmt.Sscanf(r.ID, "timeline-%d", &idn)
+				if idn > 0 {
+					succeeded[idn] = true
+				}
+			}
+		}
+
+		// 按 id 升序收集前 targetTL 条成功时间线, 位置即 Predict 的 "时间线 #i"
 		var timelineNarratives []string
 		var timelineEmergent [][]string
-		for _, tlr := range tlResults {
-			allResults = append(allResults, tlr.SR)
-			if tlr.SR.Status == TaskCompleted {
-				timelineNarratives = append(timelineNarratives, tlr.Narrative)
-				timelineEmergent = append(timelineEmergent, tlr.Emergent)
+		for idn := 1; idn <= bufferTL && len(timelineNarratives) < targetTL; idn++ {
+			if !succeeded[idn] {
+				continue
 			}
-			if team.Blackboard != nil && tlr.SR.Status == TaskCompleted {
-				team.Blackboard.Write(
-					fmt.Sprintf("timeline-%d-result", tlr.ID),
-					SummarizeOldOutput(tlr.SR.Output, 3000),
-					"swarm-intel", "timeline-result",
-				)
+			tlMu.Lock()
+			nar := tlNarr[idn]
+			emerg := tlEmerg[idn]
+			tlMu.Unlock()
+			sr := StageResult{Name: fmt.Sprintf("timeline-%d", idn), Role: "swarm-intel-simulate", Status: TaskCompleted, Output: nar}
+			allResults = append(allResults, sr)
+			timelineNarratives = append(timelineNarratives, nar)
+			timelineEmergent = append(timelineEmergent, emerg)
+			if team.Blackboard != nil {
+				team.Blackboard.Write(fmt.Sprintf("timeline-%d-result", idn), SummarizeOldOutput(nar, 3000), "swarm-intel", "timeline-result")
 			}
 			if we.evolution != nil {
 				we.evolution.RecordTrajectory(Trajectory{
-					StageName: fmt.Sprintf("timeline-%d-simulate", tlr.ID),
+					StageName: fmt.Sprintf("timeline-%d-simulate", idn),
 					Role:      "swarm-intel",
-					Input:     fmt.Sprintf("timeline-%d", tlr.ID),
-					Output:    SummarizeOldOutput(tlr.SR.Output, 2000),
-					Duration:  "",
-					Success:   tlr.SR.Status == TaskCompleted,
+					Input:     fmt.Sprintf("timeline-%d", idn),
+					Output:    SummarizeOldOutput(nar, 2000),
+					Success:   true,
 				})
 			}
 		}
@@ -227,6 +246,7 @@ func (we *WorkflowExecutor) executeSwarmNovel(ctx context.Context, wf *WorkflowD
 		if len(timelineNarratives) == 0 {
 			return allResults, fmt.Errorf("所有时间线均失败")
 		}
+		notify(fmt.Sprintf("  🎲 时间线生成完成: %d/%d 条成功 (FanOutFirstN 冗余 %d)", len(timelineNarratives), targetTL, bufferTL))
 
 		if team.dataDir != "" {
 			for i, nar := range timelineNarratives {
@@ -265,9 +285,22 @@ func (we *WorkflowExecutor) executeSwarmNovel(ctx context.Context, wf *WorkflowD
 			srPredict.Status = TaskCompleted
 			srPredict.Output = evaluation
 
-			bestTLIdx = selectBestFromPrediction(predictResult, len(timelineNarratives))
+			var winOutcome string
+			bestTLIdx, winOutcome = selectBestFromPrediction(predictResult, len(timelineNarratives))
 			notify(fmt.Sprintf("  🏆 群体智能共识度: %.0f%%  辩论轮数: %d  最佳时间线: #%d",
 				predictResult.Consensus*100, predictResult.Rounds, bestTLIdx+1))
+
+			// #5/#6/#7: 事后把"胜选结局"反馈引擎, 驱动跨小说学习 (Brier + 保形校准 + 信任/路由, 持久化)
+			if winOutcome != "" {
+				brier := engine.RecordOutcome(predictResult, winOutcome)
+				notify(fmt.Sprintf("  🧠 跨会话学习: 记录胜选结局 Brier=%.3f (保形/信任/路由已更新并持久化)", brier))
+			}
+
+			// #3: 保留次优时间线, 供大纲吸收跨线亮点 (不再丢弃 N−1 条演化产物)
+			if secondIdx := secondBestTimeline(predictResult, len(timelineNarratives), bestTLIdx); secondIdx >= 0 {
+				prevResults["second-narrative"] = timelineNarratives[secondIdx]
+				notify(fmt.Sprintf("  🥈 次优时间线 #%d 保留, 供大纲吸收跨线亮点", secondIdx+1))
+			}
 		}
 		allResults = append(allResults, srPredict)
 
@@ -284,14 +317,17 @@ func (we *WorkflowExecutor) executeSwarmNovel(ctx context.Context, wf *WorkflowD
 		})
 
 		if we.evolution != nil {
-			we.evolution.RecordTrajectory(Trajectory{
+			traj := Trajectory{
 				StageName: "swarm-evolution-complete",
 				Role:      "swarm-intel",
 				Input:     objective,
 				Output:    SummarizeOldOutput(prevResults["best-narrative"], 3000),
 				Duration:  "",
 				Success:   true,
-			})
+			}
+			we.evolution.RecordTrajectory(traj)
+			// #8: 蒸馏本次群体演化经验入进化记忆, 供后续小说的 Simulate/Predict 检索复用
+			we.evolution.LearnFromStage(traj)
 		}
 	}
 
@@ -473,8 +509,9 @@ func (we *WorkflowExecutor) executeSwarmNovel(ctx context.Context, wf *WorkflowD
 	assemblyPrompt := buildBookAssemblyPrompt(objective, prevResults, allChapters)
 	srAssembly := we.runAgent(ctx, "novel-editor", assemblyPrompt, team)
 	srAssembly.Name = "book-assembly"
-	allResults = append(allResults, srAssembly)
 
+	// 先落盘完整小说 —— 这才是 novel-v3 的真正交付物 (全部章节已写好)。
+	novelWritten := false
 	if team.dataDir != "" && len(allChapters) > 0 {
 		var novelBuilder strings.Builder
 		for i, ch := range allChapters {
@@ -482,11 +519,29 @@ func (we *WorkflowExecutor) executeSwarmNovel(ctx context.Context, wf *WorkflowD
 			novelBuilder.WriteString(ch)
 		}
 		novelFile := filepath.Join(team.dataDir, "NOVEL.md")
-		os.WriteFile(novelFile, []byte(novelBuilder.String()), 0644)
-		notify(fmt.Sprintf("📎 完整小说已保存: `%s`", novelFile))
+		if err := os.WriteFile(novelFile, []byte(novelBuilder.String()), 0644); err == nil {
+			novelWritten = true
+			notify(fmt.Sprintf("📎 完整小说已保存: `%s`", novelFile))
+		}
 	}
 
-	if srAssembly.Status == TaskCompleted && team.dataDir != "" {
+	// 统稿(book-assembly)只是后置的编辑点评, 不应因其失败而废掉整本已写好的书。
+	// 若小说正文已落盘, 则把非瞬态失败的统稿阶段降级为"完成(带告警)", 避免 teams.go
+	// 把单个统稿失败判成整队失败。瞬态 API 错误保留失败态, 以便 auto-resume 生效。
+	if srAssembly.Status != TaskCompleted && novelWritten &&
+		!strings.Contains(srAssembly.Error, "__API_ERROR__") && !isStageTransientError(srAssembly.Error) {
+		notify("🟡 统稿点评未达门禁, 但全书正文已完成 —— 按交付成功处理 (统稿降级为告警)")
+		if strings.TrimSpace(srAssembly.Output) == "" {
+			srAssembly.Output = "（统稿点评阶段产出不足, 已跳过; 全书正文见 NOVEL.md）"
+		} else {
+			srAssembly.Output = "⚠️ 统稿点评未达门禁(已降级, 全书正文已完成):\n\n" + srAssembly.Output
+		}
+		srAssembly.Status = TaskCompleted
+		srAssembly.Error = ""
+	}
+	allResults = append(allResults, srAssembly)
+
+	if srAssembly.Status == TaskCompleted && team.dataDir != "" && strings.TrimSpace(srAssembly.Output) != "" {
 		os.WriteFile(filepath.Join(team.dataDir, "ASSEMBLY_REPORT.md"), []byte(srAssembly.Output), 0644)
 	}
 
@@ -665,19 +720,85 @@ func formatPredictAsEvaluation(result *swarm_intel.FusedPrediction, timelines []
 }
 
 // selectBestFromPrediction 从 Predict 结果中选出最佳时间线索引。
-func selectBestFromPrediction(result *swarm_intel.FusedPrediction, timelineCount int) int {
+//
+// P0 修复: Predict 的结局空间由 LLM decompose 自建 (见 engine.decompose), 顺序/标签与
+// buildPredictObjective 里 "时间线 #N" 的位置**不保证**对齐。旧实现按 Outcomes 位置取 argmax,
+// 一旦 decompose 打乱顺序就会选错时间线, 唯一护栏是静默的 bestIdx>=n→0 钳制 (掩盖而非修复)。
+// 现优先从获胜结局标签里解析编号回连 timeline; 解析失败再退回按位置取 argmax。
+// 返回 (最佳时间线索引, 获胜结局标签)。结局标签供 RecordOutcome 做跨会话学习 (#5/#6/#7)。
+func selectBestFromPrediction(result *swarm_intel.FusedPrediction, timelineCount int) (int, string) {
+	// 置信度感知选择 (P1 优化 #2): 不再单看点估计 argmax, 而是用风险调整分
+	//   score = Probability - 0.5 * (Upper95 - Lower95)
+	// 对"点估计高但 95% CI 很宽 (评审分歧大/证据薄)"的时间线施加惩罚, 优先选稳健的走向。
+	// 当引擎未产出有效 CI (宽度退化为 0) 时, 该式自动退回为纯 Probability argmax, 始终安全。
 	bestIdx := 0
-	bestProb := 0.0
+	bestScore := -1e9
+	bestOutcome := ""
 	for i, o := range result.Outcomes {
-		if o.Probability > bestProb {
-			bestProb = o.Probability
-			bestIdx = i
+		width := o.Upper95 - o.Lower95
+		if width < 0 {
+			width = 0
 		}
+		score := o.Probability - 0.5*width
+		if score > bestScore {
+			bestScore = score
+			bestIdx = i
+			bestOutcome = o.Outcome
+		}
+	}
+	// 按标签编号回连 (如 "时间线 #2" / "timeline 3" / "方案1" → 编号 N → 索引 N-1)
+	if n, ok := parseLeadingIndex(bestOutcome); ok && n >= 1 && n <= timelineCount {
+		return n - 1, bestOutcome
 	}
 	if bestIdx >= timelineCount {
 		bestIdx = 0
 	}
+	return bestIdx, bestOutcome
+}
+
+// secondBestTimeline 返回置信度调整分次高、且与 excludeIdx 不同的时间线索引 (#3: 供大纲吸收跨线亮点);
+// 找不到独立次优时返回 -1。best-effort, 优先按标签回连, 否则退回按位置。
+func secondBestTimeline(result *swarm_intel.FusedPrediction, timelineCount, excludeIdx int) int {
+	bestIdx := -1
+	bestScore := -1e9
+	for i, o := range result.Outcomes {
+		width := o.Upper95 - o.Lower95
+		if width < 0 {
+			width = 0
+		}
+		score := o.Probability - 0.5*width
+		tlIdx := i
+		if n, ok := parseLeadingIndex(o.Outcome); ok && n >= 1 && n <= timelineCount {
+			tlIdx = n - 1
+		}
+		if tlIdx >= timelineCount || tlIdx == excludeIdx {
+			continue
+		}
+		if score > bestScore {
+			bestScore = score
+			bestIdx = tlIdx
+		}
+	}
 	return bestIdx
+}
+
+// parseLeadingIndex 从标签里解析出第一个出现的十进制编号 (数字为 ASCII, 中文标签安全)。
+func parseLeadingIndex(label string) (int, bool) {
+	start := -1
+	for i := 0; i < len(label); i++ {
+		if label[i] >= '0' && label[i] <= '9' {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return 0, false
+	}
+	n := 0
+	for i := start; i < len(label) && label[i] >= '0' && label[i] <= '9'; i++ {
+		n = n*10 + int(label[i]-'0')
+	}
+	return n, true
 }
 
 // ── 数据结构 ──
@@ -848,7 +969,7 @@ const v3OutlinePrompt = `你是大纲架构师, 精通三幕式、英雄之旅�
 
 用户需求: {objective}
 
-以下是群体智能演化选出的最佳故事方案, 请基于它设计精细的章节大纲:
+以下依次是: **best-narrative**(群体智能演化胜出的最佳故事时间线)、**second-narrative**(次优时间线, 可选, 从中吸收独特亮点情节融入主线)、**evaluation**(命运审判团的共识度/评分依据/融合建议)、以及世界观/角色/催化事件设定。请基于它们设计精细的章节大纲:
 
 {prev_result}
 
@@ -892,7 +1013,8 @@ const v3OutlinePrompt = `你是大纲架构师, 精通三幕式、英雄之旅�
 3. 三幕式结构: Act1(1-25%) / Act2(26-75%) / Act3(76-100%)
 4. tension_level (1-10): 根据演化叙事的实际张力分布设计
 5. 每章必须有明确的"叙事目的" + cliffhanger
-6. 至少 3 条伏笔线`
+6. 至少 3 条伏笔线
+7. **采纳审判团建议**: 若 evaluation 中给出了"融合建议/待加强之处/风险点", 必须在大纲里落实 (强化被点名的薄弱环节、吸收 runner-up 时间线里被推荐的亮点情节)`
 
 // ── Phase A Prompt 模板 ──
 

@@ -39,6 +39,11 @@ type Engine struct {
 	// M9: 可观测性
 	metrics *MetricsCollector
 
+	// 跨会话学习 (design/08 §2 #5/#6/#7) — 仅当 dataDir 独立时生效
+	dataDir     string
+	resolutions int
+	meanBrier   float64
+
 	maxDebateRounds int
 	numAnalysts     int
 	numScouts       int
@@ -96,7 +101,7 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 	rcCfg.Notify = cfg.Notify
 	rc := NewResilientCaller(llm, rcCfg)
 
-	return &Engine{
+	e := &Engine{
 		llm:             rc, // 用 ResilientCaller 替代裸 LLMClient
 		boids:           boids,
 		fuser:           NewFuser(boids),
@@ -114,10 +119,13 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 		byzantineFuser:  NewByzantineFuser(cfg.TrimRatio),
 		banditRouter:    bandit,
 		metrics:         NewMetricsCollector(cfg.DataDir),
+		dataDir:         cfg.DataDir,
 		maxDebateRounds: cfg.MaxDebateRounds,
 		numAnalysts:     cfg.NumAnalysts,
 		numScouts:       cfg.NumScouts,
 	}
+	e.loadLearning() // 恢复跨会话学习状态 (保形/信任/路由); 缺失则安全跳过
+	return e
 }
 
 // Predict 执行完整的群体智能预测流水线 (M1-M7, M10 可靠性增强)。
@@ -265,9 +273,9 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	e.notify(chatID, "🔮 Phase 5/7: 贝叶斯融合...")
 	result := e.fuser.Fuse(*domain, predictions)
 
-	// Phase 6: Byzantine Trim (M7 拜占庭容错)
+	// Phase 6: Byzantine Trim (M7 拜占庭容错; #7: 有学习信任时剔除低信任 agent, 无信任时同 TrimmedFuse)
 	e.notify(chatID, "🛡️ Phase 6/7: 拜占庭容错校验...")
-	trimmedDist := e.byzantineFuser.TrimmedFuse(predictions)
+	trimmedDist := e.byzantineFuser.TrustWeightedTrimmedFuse(predictions)
 	for i, o := range result.Outcomes {
 		if tp, ok := trimmedDist[o.Outcome]; ok {
 			blended := 0.7*o.Probability + 0.3*tp

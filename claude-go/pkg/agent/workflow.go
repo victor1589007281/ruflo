@@ -113,6 +113,10 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"industry-map": industryMapWorkflow,
 	"novel-v2":     novelV2Workflow,
 	"novel-v3":     novelV3Workflow,
+	"plot-simulate": plotSimulateWorkflow, // 剧情模拟/演化 (swarm_intel.Simulate)
+	"plot-predict":  plotPredictWorkflow,  // 走向群体评估 (swarm_intel.Predict)
+	"graph-extract-swarm": graphExtractSwarmWorkflow, // 合议图谱抽取 (FanOut + 投票融合)
+	"review-panel":        reviewPanelWorkflow,        // 合议评审团 (FanOut + 截尾均值)
 	"ml-training":  mlTrainingWorkflow,
 	"hiring":       hiringWorkflow,
 	"parenting":    parentingWorkflow,
@@ -357,6 +361,14 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		return we.executeNovelWriting(ctx, wf, objective, team)
 	case "swarm_novel":
 		return we.executeSwarmNovel(ctx, wf, objective, team)
+	case "plot_simulate":
+		return we.executePlotSimulate(ctx, wf, objective, team)
+	case "plot_predict":
+		return we.executePlotPredict(ctx, wf, objective, team)
+	case "ensemble_extract":
+		return we.executeEnsembleExtract(ctx, wf, objective, team)
+	case "review_panel":
+		return we.executeReviewPanel(ctx, wf, objective, team)
 	case "orchestrated":
 		return we.executeOrchestrated(ctx, wf, objective, team)
 	case "app_composite":
@@ -1618,6 +1630,13 @@ func validateAgentOutput(output, role string) string {
 		}
 	}
 
+	// 创作类角色 (小说家/编辑/世界观等) 的产出是自然语言散文/点评, 天然不含代码或
+	// "##/```/分析/建议" 等结构化标记. 对这类角色, 只要 ≥50 字且非空转措辞即视为有实质内容,
+	// 不再强求结构化标记 —— 否则一段合法但简短的成书点评会误判为 "空转", 拖垮整本已写好的书.
+	if isProseRole(roleLower) && len(trimmed) >= 50 {
+		hasSubstantiveContent = true
+	}
+
 	if idleCount >= 2 && !hasSubstantiveContent {
 		return "检测到角色扮演空转 (仅声明就绪/等待指令，无实质产出)"
 	}
@@ -1628,6 +1647,21 @@ func validateAgentOutput(output, role string) string {
 	}
 
 	return ""
+}
+
+// isProseRole 判断角色是否为"以自然语言散文为产出"的创作类角色 (小说家/编辑/世界观塑造等)。
+// 这类角色的合法产出可能是纯散文, 不含代码/Markdown 结构标记, 故豁免结构化内容强校验。
+func isProseRole(roleLower string) bool {
+	proseMarkers := []string{
+		"novel", "writer", "editor", "world", "char", "narrat",
+		"soul", "fate", "outline", "plot", "story", "creative", "prose",
+	}
+	for _, m := range proseMarkers {
+		if strings.Contains(roleLower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 func looksLikeAPIErrorOutput(output string) bool {

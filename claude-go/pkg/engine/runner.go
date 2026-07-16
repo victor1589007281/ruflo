@@ -98,13 +98,14 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		systemPrompts = append(systemPrompts, def...)
 	}
 
-	// 3. 准备 APITools (过滤掉 disabled tools). DisableTools 时直接置空,
-	// 不向模型暴露任何工具描述, 进一步降低 MiniMax 等模型乱产 XML 工具调用的概率.
+	// 3. 准备 APITools (经 toolExposed 统一过滤: DisabledTools 黑名单 +
+	// AllowedTools 白名单). DisableTools 时直接置空, 不向模型暴露任何工具描述,
+	// 进一步降低 MiniMax 等模型乱产 XML 工具调用的概率.
 	var apiTools []types.APITool
 	if !opts.DisableTools && e.Tools != nil {
 		all := e.Tools.APITools()
 		for _, t := range all {
-			if e.Config.DisabledTools != nil && e.Config.DisabledTools[t.Name] {
+			if !e.Config.toolExposed(t.Name) {
 				continue
 			}
 			apiTools = append(apiTools, t)
@@ -204,6 +205,16 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			return lastAssistantText, fmt.Errorf("tool registry not configured, cannot execute %d tool_use blocks", len(toolUseBlocks))
 		}
 
+		// 8a. 黑/白名单闸: RunIsolated 不经 HookChain, 在这里应用与主循环
+		// ToolGateHook 相同的 toolExposed 语义 — 未获准的 tool_use (含 XML 回退
+		// 提取的凭空调用) 替换为错误 tool_result, 绝不执行.
+		gated, deniedResults := gateToolUses(e.Config, toolUseBlocks)
+		messages = append(messages, deniedResults...)
+		toolUseBlocks = gated
+		if len(toolUseBlocks) == 0 {
+			continue // 全部被拒: 错误结果已入上下文, 让模型重新选择
+		}
+
 		effectivePerm := e.Config.PermissionMode
 		if e.Config.DynamicPlanCheck != nil && e.Config.DynamicPlanCheck() {
 			effectivePerm = types.PermissionModePlan
@@ -227,6 +238,31 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		return lastAssistantText, fmt.Errorf("max_turns (%d) reached without final answer", opts.MaxTurns)
 	}
 	return "", fmt.Errorf("max_turns (%d) reached without any text response", opts.MaxTurns)
+}
+
+// gateToolUses 对 tool_use 块应用 Config.toolExposed (黑名单 + 白名单):
+// 未获准的块被替换为错误 tool_result 消息以保持协议一致 (每个 tool_use 必须有
+// 对应 tool_result), 获准的原样返回. RunIsolated 不走引擎 HookChain, 这是它的
+// ToolGateHook 等价物.
+func gateToolUses(cfg *Config, blocks []types.ContentBlock) (allowed []types.ContentBlock, denied []types.Message) {
+	for _, b := range blocks {
+		if cfg.toolExposed(b.Name) {
+			allowed = append(allowed, b)
+			continue
+		}
+		denied = append(denied, types.Message{
+			Type: types.MessageTypeUser,
+			UUID: internal_hook.GenerateUUID(),
+			Content: []types.ContentBlock{{
+				Type:      types.ContentBlockToolResult,
+				ToolUseID: b.ID,
+				Content:   fmt.Sprintf("工具 %s 不在本会话允许的工具清单内，已被拒绝。请只使用当前可见的工具。", b.Name),
+				IsError:   true,
+			}},
+			CreatedAt: time.Now(),
+		})
+	}
+	return allowed, denied
 }
 
 // MessagesToAPI 把内部 types.Message 列表转换成 API 协议的 APIMessage 列表

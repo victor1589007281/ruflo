@@ -195,7 +195,7 @@ func (we *WorkflowExecutor) executeGameComposite(ctx context.Context, wf *Workfl
 					notify(fmt.Sprintf("  ⚠️ Predict 失败, 使用模拟结果: %v", err))
 					prevResults["narrative-evolution"] = strings.Join(narratives, "\n\n---\n\n")
 				} else {
-					bestIdx := selectBestFromPrediction(predictResult, len(narratives))
+					bestIdx, _ := selectBestFromPrediction(predictResult, len(narratives))
 					var result strings.Builder
 					result.WriteString("## 群体智能剧情评估报告\n\n")
 					result.WriteString(fmt.Sprintf("**最佳方案**: #%d (共识度: %.0f%%)\n\n", bestIdx+1, predictResult.Consensus*100))

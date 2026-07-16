@@ -207,6 +207,14 @@ func (c *Coordinator) RunWithRecovery(
 		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	case "swarm_novel":
 		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
+	case "plot_simulate":
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
+	case "plot_predict":
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
+	case "ensemble_extract":
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
+	case "review_panel":
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	default:
 		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 	}
@@ -365,8 +373,18 @@ func (c *Coordinator) runPipelineWithRecovery(
 	results := make(map[string]string)
 	var allResults []StageResult
 
-	// 恢复已完成的检查点
+	// 恢复已完成的检查点。
+	// 只恢复当前工作流定义中存在的阶段: 工作流定义变更(拆分/改名阶段)后, 残留旧阶段名的
+	// 检查点会把 completed 数量虚增到 >= len(wf.Stages), 使下方 for 循环直接退出,
+	// 尾部阶段被静默跳过且团队仍报 completed (曾致 qc 阶段两次未执行)。
+	currentStages := make(map[string]bool, len(wf.Stages))
+	for _, s := range wf.Stages {
+		currentStages[s.Name] = true
+	}
 	for name, cp := range c.checkpoints {
+		if !currentStages[name] {
+			continue
+		}
 		if cp.Status == "completed" && cp.Output != "" {
 			completed[name] = true
 			results[name] = cp.Output

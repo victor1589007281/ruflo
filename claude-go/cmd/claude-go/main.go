@@ -242,7 +242,7 @@ func main() {
 	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
 	rootCmd.PersistentFlags().StringVar(&flagAdvisor, "advisor", "", "启用 advisor 顾问工具并指定模型别名 (provider:model); \"off\" 强制关闭 (覆盖配置文件)")
 	rootCmd.PersistentFlags().StringVar(&flagAllowedTools, "allowed-tools", "", "工具白名单 (逗号分隔); 非空时仅这些工具可见且可执行, 其余硬拒 (用于受限托管 agent)")
-	rootCmd.PersistentFlags().StringVar(&flagOutputFormat, "output-format", "text", "输出格式: text (默认) | json (final/usage/error_kind/session_id 顶层 envelope, 供程序化调用)")
+	rootCmd.PersistentFlags().StringVar(&flagOutputFormat, "output-format", "text", "输出格式: text (默认) | json (final/is_error/error_kind/session_id 顶层 envelope, 供程序化调用; token 用量见 metrics JSONL)")
 
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(runCmd())
@@ -697,7 +697,10 @@ func runCmd() *cobra.Command {
 
 			userPrompt := strings.Join(args, " ")
 
-			if strings.HasPrefix(userPrompt, "/") {
+			// 受限会话 (--allowed-tools 已设置) 绝不进入 slash-command 分发:
+			// /team 等编排路径拥有全量能力, 会绕过白名单 — 不可信输入以 "/"
+			// 开头时按普通 prompt 处理 (安全前提: 白名单只对引擎路径强制)。
+			if strings.HasPrefix(userPrompt, "/") && eng.Config.AllowedTools == nil {
 				cwd := eng.Config.Cwd
 				jsonCfg, _, cfgErr := loadRuntimeJSONConfig()
 				if cfgErr != nil {
@@ -2778,8 +2781,11 @@ func classifyRunError(err error) string {
 	}
 }
 
-// parseAllowedTools splits a comma-separated whitelist into a set. Empty input
-// yields nil (no whitelist = all tools exposed, subject to DisabledTools).
+// parseAllowedTools splits a comma-separated whitelist into a set. Only a
+// fully-empty flag ("") yields nil (no whitelist). A non-empty flag that parses
+// to zero valid entries (e.g. " , ") returns a non-nil EMPTY set, which the
+// engine treats as deny-all — fail-closed, so a caller template that renders
+// blank never silently exposes every tool.
 func parseAllowedTools(csv string) map[string]bool {
 	csv = strings.TrimSpace(csv)
 	if csv == "" {
@@ -2790,9 +2796,6 @@ func parseAllowedTools(csv string) map[string]bool {
 		if t = strings.TrimSpace(t); t != "" {
 			set[t] = true
 		}
-	}
-	if len(set) == 0 {
-		return nil
 	}
 	return set
 }

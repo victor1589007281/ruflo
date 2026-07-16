@@ -1456,12 +1456,23 @@ func (c *Client) onSuccess429Reset() {
 
 // SimpleComplete 简单文本补全: 发送 system+user prompt, 返回回复文本。
 // 实现 dreaming.LLMClient 接口。
+// simpleCompleteMaxTokens 是 SimpleComplete / CompleteDiag 的输出上限。
+// 与单 agent 路径(executePipeline 用配置 AI.maxTokens=32768/子配置 65536)看齐并从宽取 65536。
+// 演进史(踩坑记录):
+//   ① 原 4096 → 大章节抽取 JSON 中途截断 → ParseJSON 失败;
+//   ② 抬到 16384 修好多数, 但后端模型(kimi)会输出 thinking 块且 thinking token 计入本上限,
+//      密集章节 thinking+JSON >16384 → stop=max_tokens: 要么 JSON 截断在半途(不可解析),
+//      要么 thinking 吃光 16384 令 text 为空("空响应")。单 agent 走 32768 故同内容不炸。
+//   ③ 故从宽取 65536, 给 thinking+完整 JSON 充足余量。是"上限非目标", 短输出正常 end_turn 早停,
+//      对其它调用方零副作用。注意:此值硬编码, 若日后调大 config AI.maxTokens 需同步(未做动态解析)。
+const simpleCompleteMaxTokens = 65536
+
 func (c *Client) SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
 	messages := []types.APIMessage{{
 		Role:    "user",
 		Content: json.RawMessage(`[{"type":"text","text":` + string(mustMarshalString(userPrompt)) + `}]`),
 	}}
-	resp, err := c.SendMessage(ctx, messages, []string{systemPrompt}, nil, 4096)
+	resp, err := c.SendMessage(ctx, messages, []string{systemPrompt}, nil, simpleCompleteMaxTokens)
 	if err != nil {
 		return "", err
 	}
@@ -1472,6 +1483,45 @@ func (c *Client) SimpleComplete(ctx context.Context, systemPrompt, userPrompt st
 		}
 	}
 	return sb.String(), nil
+}
+
+// CompleteDiag 等价于 SimpleComplete(相同请求/maxTokens),但额外回传一行诊断元数据(diag):
+// stop=停止原因 / outTok=输出token / blocks=内容块数与类型 / textLen=文本长度 / tail=文本尾部。
+// 供合议扇出(graph-extract-swarm)定位"空响应/截断/超时"的确切根因:
+//   · 空响应 + stop=max_tokens + outTok 大 → 内容进了非 text 块(如 thinking), 我们没取到;
+//   · 空响应 + outTok=0 → 后端确实返回空(模型/网关问题);
+//   · 非空但 parseOK=false + stop=max_tokens → 输出被上限截断在 JSON 中途(需再抬上限/减输入);
+//   · err=context deadline → PerBranchTimeout 截断(需放宽超时)。
+// 仅诊断用途, 不改变 SimpleComplete 的行为与其它调用方。
+func (c *Client) CompleteDiag(ctx context.Context, systemPrompt, userPrompt string) (text, diag string, err error) {
+	messages := []types.APIMessage{{
+		Role:    "user",
+		Content: json.RawMessage(`[{"type":"text","text":` + string(mustMarshalString(userPrompt)) + `}]`),
+	}}
+	resp, err := c.SendMessage(ctx, messages, []string{systemPrompt}, nil, simpleCompleteMaxTokens)
+	if err != nil {
+		return "", fmt.Sprintf("SendMessage 出错: %v", err), err
+	}
+	var sb strings.Builder
+	blockTypes := make([]string, 0, len(resp.Content))
+	for _, block := range resp.Content {
+		blockTypes = append(blockTypes, string(block.Type))
+		if block.Type == types.ContentBlockText {
+			sb.WriteString(block.Text)
+		}
+	}
+	text = sb.String()
+	outTok := 0
+	if resp.Usage != nil {
+		outTok = resp.Usage.OutputTokens
+	}
+	tail := text
+	if len(tail) > 160 {
+		tail = "…" + tail[len(tail)-160:]
+	}
+	diag = fmt.Sprintf("stop=%s outTok=%d blocks=%d%v textLen=%d tail=%q",
+		resp.StopReason, outTok, len(resp.Content), blockTypes, len(text), tail)
+	return text, diag, nil
 }
 
 func mustMarshalString(s string) json.RawMessage {

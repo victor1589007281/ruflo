@@ -9,11 +9,17 @@
 package builtin
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"  // image.DecodeConfig 尺寸探测
+	_ "image/jpeg" // image.DecodeConfig 尺寸探测
+	_ "image/png"  // image.DecodeConfig 尺寸探测
 	"io"
 	"os"
 	"path/filepath"
@@ -83,11 +89,59 @@ func (t *FileReadTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) 
 	return nil
 }
 
+// 图像多模态读取: base64 编码后以 image 内容块回传, 视觉模型 (kimi/qwen) 可直接查看。
+// Anthropic 图片块上限 5MB, 留余量取 4MB; 超限提示先用 ffmpeg/Pillow 缩放。
+const maxImageBytes = 4 << 20
+
+var imageMediaTypes = map[string]string{
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+}
+
+func readImageResult(filePath string) (*tool.ToolResult, bool) {
+	mediaType, ok := imageMediaTypes[strings.ToLower(filepath.Ext(filePath))]
+	if !ok {
+		return nil, false
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &tool.ToolResult{Content: fmt.Sprintf("Error: file not found: %s", filePath), IsError: true}, true
+		}
+		return &tool.ToolResult{Content: fmt.Sprintf("读取图片失败: %v", err), IsError: true}, true
+	}
+	if info.Size() > maxImageBytes {
+		return &tool.ToolResult{
+			Content: fmt.Sprintf("[图片 %s 大小 %.1fMB 超过 %dMB 上限, 请先缩放后再读 (如: ffmpeg -i in.png -vf scale=1280:-1 out.png)]",
+				filePath, float64(info.Size())/1e6, maxImageBytes>>20),
+			IsError: true,
+		}, true
+	}
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return &tool.ToolResult{Content: fmt.Sprintf("读取图片失败: %v", err), IsError: true}, true
+	}
+	dims := ""
+	if cfg, _, derr := image.DecodeConfig(bytes.NewReader(data)); derr == nil {
+		dims = fmt.Sprintf(", %dx%d", cfg.Width, cfg.Height)
+	}
+	return &tool.ToolResult{
+		Content: fmt.Sprintf("[图片 %s (%s%s, %.0fKB) 已作为图像内容附加在本条消息中, 请直接查看]",
+			filePath, mediaType, dims, float64(len(data))/1024),
+		Images: []types.MediaSource{{
+			Type:      "base64",
+			MediaType: mediaType,
+			Data:      base64.StdEncoding.EncodeToString(data),
+		}},
+	}, true
+}
+
 func fileReadKindMessage(filePath string) (msg string, skip bool) {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	switch ext {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg":
-		return fmt.Sprintf("[Image file: %s] - Image reading requires multimodal support", filePath), true
 	case ".pdf":
 		return fmt.Sprintf("[PDF file: %s] - PDF reading requires external parser", filePath), true
 	case ".ipynb":
@@ -131,6 +185,11 @@ func (t *FileReadTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 	}
 
 	filePath := expandPath(in.Path, tctx.Cwd)
+
+	// 图片文件: 多模态读取 (base64 image 块), 供视觉模型直接查看
+	if res, isImage := readImageResult(filePath); isImage {
+		return res, nil
+	}
 
 	if msg, skip := fileReadKindMessage(filePath); skip {
 		return &tool.ToolResult{Content: msg}, nil

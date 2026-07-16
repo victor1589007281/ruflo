@@ -214,27 +214,29 @@ func (h *LoopDetectorResultHook) Execute(ctx *HookContext) (*HookResult, error) 
 // ============================================================================
 
 // ToolGateHook 在 PhasePreToolUse 阶段拦截不允许的工具调用，替换为错误结果。
-// 拦截条件: 命中 disabled 黑名单，或 (allowed 白名单非空且工具不在其中)。
+// 拦截条件: 命中 disabled 黑名单，或 (allowed 白名单已设置且工具不在其中)。
+// 白名单语义与 Config.AllowedTools 一致: nil=未设置, 非 nil 空集=全部拒绝。
 // 这是即便模型凭空产出未暴露工具调用时的第二道防线 (工具表过滤为第一道)。
 // 若全部被拦截，则注入 continue 消息让模型重新选择。
 type ToolGateHook struct {
 	disabled map[string]bool
 	allowed  map[string]bool
+	hasAllow bool // allowed 是否"已设置"(区分 nil 与空集, 空集 fail-closed)
 }
 
-// NewToolGateHook 创建 ToolGateHook。disabled 与 allowed 均为空时返回 nil。
+// NewToolGateHook 创建 ToolGateHook。disabled 为空且 allowed 未设置(nil)时返回 nil。
 func NewToolGateHook(disabled, allowed map[string]bool) *ToolGateHook {
-	if len(disabled) == 0 && len(allowed) == 0 {
+	if len(disabled) == 0 && allowed == nil {
 		return nil
 	}
-	return &ToolGateHook{disabled: disabled, allowed: allowed}
+	return &ToolGateHook{disabled: disabled, allowed: allowed, hasAllow: allowed != nil}
 }
 
 func (h *ToolGateHook) blocked(name string) bool {
 	if h.disabled != nil && h.disabled[name] {
 		return true
 	}
-	if len(h.allowed) > 0 && !h.allowed[name] {
+	if h.hasAllow && !h.allowed[name] {
 		return true
 	}
 	return false
@@ -248,7 +250,7 @@ func (h *ToolGateHook) Phases() []InternalHookPhase {
 
 // Execute 遍历 tool_use 块，拦截不允许的工具并生成错误结果。
 func (h *ToolGateHook) Execute(ctx *HookContext) (*HookResult, error) {
-	if (len(h.disabled) == 0 && len(h.allowed) == 0) || len(ctx.ToolUseBlocks) == 0 {
+	if (len(h.disabled) == 0 && !h.hasAllow) || len(ctx.ToolUseBlocks) == 0 {
 		return nil, nil
 	}
 
@@ -263,7 +265,7 @@ func (h *ToolGateHook) Execute(ctx *HookContext) (*HookResult, error) {
 				Content: []types.ContentBlock{{
 					Type:      types.ContentBlockToolResult,
 					ToolUseID: block.ID,
-					Content:   fmt.Sprintf("工具 %s 在当前会话中不可用。团队操作请通过 /team 命令或意图识别完成。", block.Name),
+					Content:   fmt.Sprintf("工具 %s 不在本会话允许的工具清单内，已被拒绝。请只使用当前可见的工具。", block.Name),
 					IsError:   true,
 				}},
 				CreatedAt: time.Now(),

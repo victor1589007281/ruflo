@@ -72,6 +72,26 @@ func TestToolGateHook_NilWhenEmpty(t *testing.T) {
 	}
 }
 
+// An empty-but-set whitelist must produce a hook that denies everything
+// (fail-closed), not a nil hook.
+func TestToolGateHook_EmptyWhitelistDeniesAll(t *testing.T) {
+	h := NewToolGateHook(nil, map[string]bool{})
+	if h == nil {
+		t.Fatal("expected a hook for a set-but-empty whitelist")
+	}
+	ctx := &HookContext{Ctx: context.Background(), ToolUseBlocks: []types.ContentBlock{toolUse("1", "Bash"), toolUse("2", "Read")}}
+	res, err := h.Execute(ctx)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if res == nil || len(res.ToolUseBlocks) != 0 || !res.InjectContinue {
+		t.Fatalf("expected everything denied with continue injection, got %+v", res)
+	}
+	if len(res.AppendMsgs) != 2 {
+		t.Fatalf("expected 2 error results, got %d", len(res.AppendMsgs))
+	}
+}
+
 // When every emitted tool is denied, the model must be told to continue.
 func TestToolGateHook_AllDeniedInjectsContinue(t *testing.T) {
 	h := NewToolGateHook(nil, map[string]bool{"sql_query": true})

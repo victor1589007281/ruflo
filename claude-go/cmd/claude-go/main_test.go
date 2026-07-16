@@ -277,8 +277,10 @@ func TestParseAllowedTools(t *testing.T) {
 	if parseAllowedTools("") != nil {
 		t.Fatal("empty input must yield nil (no whitelist)")
 	}
-	if parseAllowedTools("  ,  ") != nil {
-		t.Fatal("blank-only input must yield nil")
+	// A set-but-blank flag is deny-all (non-nil empty set), NOT nil: a template
+	// that renders blank must fail closed instead of exposing every tool.
+	if got := parseAllowedTools("  ,  "); got == nil || len(got) != 0 {
+		t.Fatalf("blank-only input must yield a non-nil empty set (deny-all), got %v", got)
 	}
 	set := parseAllowedTools("sql_query, submit_finding ,heartbeat")
 	for _, want := range []string{"sql_query", "submit_finding", "heartbeat"} {
