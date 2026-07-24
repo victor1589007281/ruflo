@@ -199,6 +199,13 @@ func (c *Coordinator) RunWithRecovery(
 	if ModeHasDedicatedExecutor(wf.Mode) {
 		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
 	}
+	// 图引擎灰度 (design/01 M1): 开关命中时 pipeline/fanout 类走 executor.Execute
+	// → executePipeline → executeGraph (ready-set 调度 + Journal 恢复), 取代
+	// Coordinator 自带的 runPipelineWithRecovery。使灰度 flag 对真实团队生效
+	// (此前 flag 只在直接调 executePipeline 时触发, 团队恒走本恢复路径故永不命中)。
+	if graphEngineEnabled() {
+		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
+	}
 	return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 }
 

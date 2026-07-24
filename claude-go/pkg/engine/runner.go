@@ -1,13 +1,14 @@
 // runner.go - 独立的一次性 (one-shot) Agent 运行器.
 //
 // 背景:
-//   cliAgentRunner.Execute (cmd/claude-go/main.go) 早期实现直接调 client.SendMessage,
-//   绕过了 QueryEngine 的工具循环和 XML 回退解析. 当 LLM (MiniMax M2.x 等) 在文本里
-//   塞 <minimax:tool_call> 或 [TOOL_CALL] 风格的工具调用时, Agent 实际什么也没做.
 //
-//   本文件提供一个轻量循环: 共享 QueryEngine 的工具注册表, 但消息历史完全独立 (不污染
-//   QueryEngine.Messages), 既支持 Anthropic 原生 tool_use 协议也支持 XML/Bracket 回退,
-//   适合 Team workflow 的每一个 stage 独立运行.
+//	cliAgentRunner.Execute (cmd/claude-go/main.go) 早期实现直接调 client.SendMessage,
+//	绕过了 QueryEngine 的工具循环和 XML 回退解析. 当 LLM (MiniMax M2.x 等) 在文本里
+//	塞 <minimax:tool_call> 或 [TOOL_CALL] 风格的工具调用时, Agent 实际什么也没做.
+//
+//	本文件提供一个轻量循环: 共享 QueryEngine 的工具注册表, 但消息历史完全独立 (不污染
+//	QueryEngine.Messages), 既支持 Anthropic 原生 tool_use 协议也支持 XML/Bracket 回退,
+//	适合 Team workflow 的每一个 stage 独立运行.
 package engine
 
 import (
@@ -19,7 +20,9 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/tool"
+	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -56,9 +59,35 @@ type IsolatedRunOptions struct {
 //   - 不持久化 SessionStore / Trajectory
 //   - 不应用 Phase 1 的 autoCompact / microCompact (假设 stage 输出量适中)
 //   - 但仍跑 internal_hook.MergeXMLToolCalls 回退 + RunTools, 这是核心功能.
-func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts IsolatedRunOptions) (string, error) {
+func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts IsolatedRunOptions) (finalText string, finalErr error) {
 	if e == nil {
 		return "", fmt.Errorf("nil engine")
+	}
+	// 轨迹采集 (design/03 §4.1 E1): RunIsolated 不经 HookChain, TraceCaptureHook
+	// 不会触发。此处补一个 episode 级 turn span (输入 prompt → 最终产出), 使 CLI
+	// 团队路径也进 TraceStore。tool_call 级细粒度采集属飞书完整循环路径 (已覆盖)。
+	if e.TraceStore != nil {
+		start := time.Now()
+		ids := trace.From(ctx)
+		defer func() {
+			status := "completed"
+			if finalErr != nil {
+				status = "failed"
+			}
+			e.TraceStore.Write(tracestore.Span{
+				TraceID:   ids.RunID,
+				SpanID:    internal_hook.GenerateUUID(),
+				Kind:      "node",
+				Name:      ids.NodeID,
+				NodeID:    ids.NodeID,
+				TurnID:    ids.TurnID,
+				InputRef:  e.TraceStore.MakeRef(userPrompt),
+				OutputRef: e.TraceStore.MakeRef(finalText),
+				Attrs:     map[string]any{"status": status, "isolated": true},
+				TS:        start.UnixMilli(),
+				DurMS:     time.Since(start).Milliseconds(),
+			})
+		}()
 	}
 	if opts.MaxTurns <= 0 {
 		opts.MaxTurns = 30

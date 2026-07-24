@@ -27,6 +27,7 @@ var dynamicModes = map[string]bool{
 	"adversarial":     true,
 	"adversarial_dev": true,
 	"orchestrated":    true,
+	"graph":           true, // design/01 M1: 纯数据图模式, 无伴生硬编码, 天然可动态定义
 }
 
 var (

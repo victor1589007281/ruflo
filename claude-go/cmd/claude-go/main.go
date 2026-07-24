@@ -774,6 +774,15 @@ func runCmd() *cobra.Command {
 						_ = registry
 					}
 				}
+
+				// 加载用户自定义动态工作流 (<state>/workflows/*.json) —— 与飞书 bot 路径对齐
+				// (design/02 §六: 工作流应跨入口一致)。此前仅飞书 bot 加载, CLI headless run
+				// 无法跑自定义/图模式工作流。
+				if wfDir := filepath.Join(tasksStateDir, "workflows"); wfDir != "" {
+					if loaded, failed, _ := agent.LoadWorkflowsFromDir(wfDir, agent.NewRoleRegistry(cwd)); loaded > 0 || failed > 0 {
+						fmt.Printf("[run] 自定义工作流加载: 成功 %d 失败 %d\n", loaded, failed)
+					}
+				}
 				// 进化引擎: headless run 路径与飞书路径同构装配 (design/03 §1.2 开环1 修复)。
 				// 此前 CLI 团队路径不实例化 Evolution → workflow.go 全部学习分支被
 				// `we.evolution != nil` 守卫跳过, 下游平台流量零学习。

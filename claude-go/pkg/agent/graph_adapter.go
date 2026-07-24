@@ -94,8 +94,9 @@ func (we *WorkflowExecutor) executeGraph(ctx context.Context, wf *WorkflowDef, o
 	if err != nil {
 		return nil, err
 	}
-	journalPath := filepath.Join(team.dataDir, "graph-journal.jsonl")
-	journal, err := graph.NewFileJournal(journalPath)
+	// NewFileJournal 收目录名, 内部落 <dir>/journal.jsonl
+	journalDir := filepath.Join(team.dataDir, "graph-journal")
+	journal, err := graph.NewFileJournal(journalDir)
 	if err != nil {
 		return nil, fmt.Errorf("graph_adapter: 打开 journal 失败: %w", err)
 	}
