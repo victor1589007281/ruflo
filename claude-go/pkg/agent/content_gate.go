@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+
 	"fmt"
+	"github.com/anthropic/claude-go/pkg/trace"
 	"strings"
 )
 
@@ -19,7 +21,7 @@ import (
 
 const (
 	contentQualityThreshold = 75 // 达标分数线 (0-100)
-	contentQualityMaxRounds  = 1 // 未达标时最多自动修订轮数
+	contentQualityMaxRounds = 1  // 未达标时最多自动修订轮数
 )
 
 // contentQualityGated 判定工作流是否启用内容质量门禁 (保守白名单, 避免对所有工作流额外烧 token)。
@@ -59,6 +61,18 @@ func (ptm *ProductionTeamManager) tryContentQualityGate(ctx context.Context, tea
 		v := ptm.runContentCritic(ctx, team.Objective, results[idx].Output)
 		if v == nil {
 			return results // 评审不可用 → 不阻塞交付
+		}
+		// 奖励持久化 (design/03 §4.2): 0-100 分归一化到 [-1,1] 落 rewards.jsonl,
+		// 修复"content_gate 连续分用完即丢"(design/03 §1.4)。
+		if ptm.evolution != nil {
+			ptm.evolution.RecordReward(RewardEvent{
+				RunID:  trace.From(ctx).RunID,
+				NodeID: results[idx].Name,
+				Source: "gate.content",
+				Value:  float64(v.Score)/50.0 - 1.0,
+				Raw:    v.Score,
+				Team:   team.Name,
+			})
 		}
 		if v.Pass || v.Score >= contentQualityThreshold {
 			ptm.notify(team.ChatID, fmt.Sprintf("✅ 内容质量门禁通过 (%d/100)", v.Score))

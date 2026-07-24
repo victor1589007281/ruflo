@@ -825,6 +825,25 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		}
 	}
 
+	// episode 级奖励 (design/03 §4.2): 团队终态是最稳定的奖励信号, 统一落 rewards.jsonl。
+	// delivered_with_remediation 记 0.5 —— fail-open 交付语义: 交付了但过程有瑕疵。
+	if ptm.evolution != nil {
+		episodeVal := -1.0
+		switch team.Status {
+		case TeamStatusCompleted:
+			episodeVal = 1.0
+		case TeamStatusDeliveredWithRemediation:
+			episodeVal = 0.5
+		}
+		ptm.evolution.RecordReward(RewardEvent{
+			RunID:  trace.From(ctx).RunID,
+			Source: "episode",
+			Value:  episodeVal,
+			Raw:    string(team.Status),
+			Team:   team.Name,
+		})
+	}
+
 	// 触发进化学习 (DISTILL: 从轨迹中提炼经验) + 采集进化指标
 	if ptm.evolution != nil {
 		mc := ptm.metrics

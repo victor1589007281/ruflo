@@ -5,6 +5,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -87,4 +91,32 @@ func TestLastNonEmptyOutput(t *testing.T) {
 	if got := lastNonEmptyOutput(nil, 100); got != "" {
 		t.Errorf("空输入应返回空串, got %q", got)
 	}
+}
+
+// TestRecordRewardPersists 守护 design/03 §4.2 奖励落盘雏形:
+// rewards.jsonl 追加写、字段齐全、value 归一化。
+func TestRecordRewardPersists(t *testing.T) {
+	dir := t.TempDir()
+	ee := NewEvolutionEngine(dir, nil)
+	ee.RecordReward(RewardEvent{RunID: "run-x", Source: "gate.content", Value: 0.6, Raw: 80, Team: "tm"})
+	ee.RecordReward(RewardEvent{Source: "episode", Value: 1.0, Raw: "completed"})
+
+	data, err := os.ReadFile(filepath.Join(dir, "rewards.jsonl"))
+	if err != nil {
+		t.Fatalf("rewards.jsonl 未写入: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("应有 2 条奖励事件, got %d", len(lines))
+	}
+	var ev RewardEvent
+	if err := json.Unmarshal([]byte(lines[0]), &ev); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if ev.RunID != "run-x" || ev.Source != "gate.content" || ev.Value != 0.6 || ev.TS == 0 {
+		t.Fatalf("字段不完整: %+v", ev)
+	}
+	// nil 引擎防御
+	var nilEE *EvolutionEngine
+	nilEE.RecordReward(RewardEvent{Source: "x"})
 }

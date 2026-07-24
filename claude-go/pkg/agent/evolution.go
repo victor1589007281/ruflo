@@ -139,6 +139,43 @@ type EvolutionEngine struct {
 	MemoryIngestFn func(content, source string, topics []string)
 }
 
+// RewardEvent 奖励事件 (design/03 §4.2 RewardBus 的落盘雏形)。
+// 历史缺陷: content_gate 的 0-100 连续分是现成 dense reward 却用完即丢
+// (design/03 §1.4); 现所有奖励源统一落 <evolution>/rewards.jsonl,
+// P3 的 RewardBus/学习器直接消费该文件, 格式即契约。
+type RewardEvent struct {
+	TS     int64   `json:"ts"`                // unix milli
+	RunID  string  `json:"run_id,omitempty"`  // trace 四元组 episode id
+	NodeID string  `json:"node_id,omitempty"` // 阶段/节点粒度奖励时非空
+	Source string  `json:"source"`            // gate.content|gate.compile|episode|user.explicit|...
+	Value  float64 `json:"value"`             // 归一化 [-1,1]
+	Raw    any     `json:"raw,omitempty"`     // 原始值 (0-100 分 / 状态字符串等)
+	Team   string  `json:"team,omitempty"`
+}
+
+// RecordReward 追加奖励事件到 rewards.jsonl (追加写, 失败静默——奖励缺一条不应影响交付)。
+func (ee *EvolutionEngine) RecordReward(ev RewardEvent) {
+	if ee == nil || ee.dataDir == "" {
+		return
+	}
+	if ev.TS == 0 {
+		ev.TS = time.Now().UnixMilli()
+	}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	ee.mu.Lock()
+	defer ee.mu.Unlock()
+	_ = os.MkdirAll(ee.dataDir, 0o755)
+	f, err := os.OpenFile(filepath.Join(ee.dataDir, "rewards.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(b, '\n'))
+}
+
 // NewEvolutionEngine 创建进化引擎。
 func NewEvolutionEngine(dataDir string, llm LLMClient) *EvolutionEngine {
 	ee := &EvolutionEngine{
