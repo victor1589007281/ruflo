@@ -1,0 +1,122 @@
+# 分布式模式 (design/02 §四 T2/T3 精简版): 控制面 + worker×2 + llm-gateway 三组件。
+# - control-plane: serve 子命令 (:18080 编排控制面 + 任务队列 HTTP 下发)
+# - worker: worker 子命令, HTTP 长轮询拉取 NodeTask, 心跳注册 (design/02 §3.3)
+# - llm-gateway: llm-gateway 子命令 (:18081, design/02 §3.1 R1)
+# 冒烟验收: worker 注册可见 / 经控制面提交图任务由 worker 执行 / gateway 代理补全。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-gateway
+  namespace: claude-go
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: claude-go-gateway }
+  template:
+    metadata:
+      labels: { app: claude-go-gateway }
+    spec:
+      containers:
+        - name: gateway
+          image: localhost:5000/claude-go:latest
+          args: ["llm-gateway", "--addr", "0.0.0.0:18081"]
+          env:
+            - name: KIMI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+          ports: [{ containerPort: 18081 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 18081 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - { name: config, mountPath: /etc/claude-go }
+      volumes:
+        - name: config
+          configMap: { name: claude-go-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-gateway
+  namespace: claude-go
+spec:
+  selector: { app: claude-go-gateway }
+  ports: [{ port: 18081, targetPort: 18081 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-control
+  namespace: claude-go
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: claude-go-control }
+  template:
+    metadata:
+      labels: { app: claude-go-control }
+    spec:
+      containers:
+        - name: control
+          image: localhost:5000/claude-go:latest
+          args: ["serve", "--addr", "0.0.0.0:18080", "--dispatch-mode", "queue"]
+          env:
+            - name: CLAUDE_GO_LLM_GATEWAY
+              value: "http://claude-go-gateway:18081"
+            - name: KIMI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+          ports: [{ containerPort: 18080 }]
+          readinessProbe:
+            httpGet: { path: /api/health, port: 18080 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: config, mountPath: /etc/claude-go }
+      volumes:
+        - name: state
+          emptyDir: {}
+        - name: config
+          configMap: { name: claude-go-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-control
+  namespace: claude-go
+spec:
+  selector: { app: claude-go-control }
+  ports: [{ port: 18080, targetPort: 18080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-worker
+  namespace: claude-go
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: claude-go-worker }
+  template:
+    metadata:
+      labels: { app: claude-go-worker }
+    spec:
+      containers:
+        - name: worker
+          image: localhost:5000/claude-go:latest
+          args: ["worker", "--control", "http://claude-go-control:18080"]
+          env:
+            - name: CLAUDE_GO_LLM_GATEWAY
+              value: "http://claude-go-gateway:18081"
+            - name: KIMI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/claude-go }
+      volumes:
+        - name: config
+          configMap: { name: claude-go-config }

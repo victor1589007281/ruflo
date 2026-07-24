@@ -907,8 +907,9 @@ func feishuCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "feishu",
-		Short: "飞书长连接后台守护模式 (WebSocket)",
+		Use:     "feishu",
+		Aliases: []string{"serve"},
+		Short:   "飞书长连接后台守护模式 (WebSocket); 以 serve 调用时为 headless 全栈模式(不连飞书)",
 		Long: `启动飞书机器人守护进程，通过 WebSocket 长连接接收飞书消息。
 每个对话(chat_id)维护独立的 AI 会话，支持多轮对话、工具执行、MCP 调用等完整能力。
 
@@ -1006,8 +1007,13 @@ JSON 配置文件示例:
 				config.Domain = domain
 			}
 
-			if config.AppID == "" || config.AppSecret == "" {
-				return fmt.Errorf("需要飞书应用凭证: 使用 --app-id/--app-secret 或 --config 或设置 FEISHU_APP_ID/FEISHU_APP_SECRET")
+			// serve 别名 = headless 全栈模式 (design/02 §四 单体部署形态):
+			// :18080 wiki+dashboard+teams+cron+sync 全量, 不连飞书 WS, 无需飞书凭证。
+			if cmd.CalledAs() == "serve" {
+				config.Headless = true
+			}
+			if !config.Headless && (config.AppID == "" || config.AppSecret == "") {
+				return fmt.Errorf("需要飞书应用凭证: 使用 --app-id/--app-secret 或 --config 或设置 FEISHU_APP_ID/FEISHU_APP_SECRET (headless 部署请用 serve 子命令)")
 			}
 
 			apiKey := getAPIKey()

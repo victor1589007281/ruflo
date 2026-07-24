@@ -252,8 +252,16 @@ type textEntry struct {
 //  4. 注册消息事件处理器
 //  5. 创建 WebSocket 长连接客户端
 func NewBot(config *BotConfig) (*Bot, error) {
-	if config.AppID == "" || config.AppSecret == "" {
-		return nil, fmt.Errorf("飞书 AppID 和 AppSecret 不能为空")
+	if config.Headless {
+		// headless serve 模式: 不连飞书, 凭证给占位值让 lark SDK 构造不炸 (从不真正调用)
+		if config.AppID == "" {
+			config.AppID = "headless"
+		}
+		if config.AppSecret == "" {
+			config.AppSecret = "headless"
+		}
+	} else if config.AppID == "" || config.AppSecret == "" {
+		return nil, fmt.Errorf("飞书 AppID 和 AppSecret 不能为空 (headless 部署请用 serve 子命令)")
 	}
 	if config.ModelAlias == "" {
 		return nil, fmt.Errorf("AI ModelAlias 不能为空")
@@ -855,6 +863,13 @@ func (b *Bot) Start(ctx context.Context) error {
 		}
 	}
 
+	if b.config.Headless {
+		// headless serve 模式 (design/02 §四): 全栈已就绪 (:18080/cron/sync),
+		// 不连接飞书 WS, 阻塞至 ctx 取消。
+		log.Printf("[serve] headless 模式就绪: 不连接飞书 WS, HTTP 栈已启动")
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return b.wsClient.Start(ctx)
 }
 
@@ -1640,6 +1655,10 @@ func (b *Bot) downloadFileAsBase64(ctx context.Context, messageID, fileKey strin
 
 // sendImageMessage 发送图片消息到飞书（需先上传图片获取 image_key）。
 func (b *Bot) sendImageMessage(ctx context.Context, chatID string, imageData []byte, filename string) error {
+	if b.config.Headless {
+		log.Printf("[serve][media %s] 跳过发送图片 %s (%d 字节)", chatID, filename, len(imageData))
+		return nil
+	}
 	imgReq := larkim.NewCreateImageReqBuilder().
 		Body(larkim.NewCreateImageReqBodyBuilder().
 			ImageType("message").
@@ -1679,6 +1698,10 @@ func (b *Bot) sendImageMessage(ctx context.Context, chatID string, imageData []b
 
 // sendFileMessage 发送文件消息到飞书。
 func (b *Bot) sendFileMessage(ctx context.Context, chatID string, fileData []byte, filename, fileType string) error {
+	if b.config.Headless {
+		log.Printf("[serve][media %s] 跳过发送文件 %s (%d 字节)", chatID, filename, len(fileData))
+		return nil
+	}
 	if fileType == "" {
 		fileType = "stream"
 	}
@@ -3513,6 +3536,11 @@ func (b *Bot) sendCardMessage(ctx context.Context, chatID, title, markdownConten
 func (b *Bot) sendLongMessage(ctx context.Context, chatID, content string) {
 	content = strings.TrimSpace(content)
 	if content == "" {
+		return
+	}
+	if b.config.Headless {
+		// headless 模式: 出站飞书消息降级为日志 (无有效凭证, 也无人在飞书侧接收)
+		log.Printf("[serve][notify %s] %s", chatID, truncateResult(content, 400))
 		return
 	}
 

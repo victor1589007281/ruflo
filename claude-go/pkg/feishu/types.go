@@ -41,11 +41,17 @@ import (
 
 // BotConfig 飞书机器人配置
 type BotConfig struct {
-	// AppID 飞书应用 App ID (必填)
+	// Headless 无飞书模式 (design/02 §四 单体部署形态):
+	// 完整装配 :18080 wiki+dashboard+teams+cron+sync 全栈, 但不连接飞书 WS,
+	// 出站飞书消息降级为日志。K8s 单体 Pod / 下游平台专用实例用此模式,
+	// 避免与生产 bot 重复消费同一飞书应用的消息。
+	Headless bool
+
+	// AppID 飞书应用 App ID (Headless 模式下可空)
 	// 在飞书开发者后台 > 应用凭证中获取
 	AppID string
 
-	// AppSecret 飞书应用 App Secret (必填)
+	// AppSecret 飞书应用 App Secret (Headless 模式下可空)
 	AppSecret string
 
 	// Domain 飞书API域名

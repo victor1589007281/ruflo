@@ -1,0 +1,76 @@
+# 单体模式 (design/02 §四 T0): 一个 Pod 跑 all-in-one HTTP 栈 (serve 子命令,
+# = :18080 wiki+dashboard+TeamAction 全量, 不连飞书 WS —— 避免与宿主机生产 bot
+# 重复消费飞书消息)。冒烟验收: /api/health + /api/workflows + 建团队跑通。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: claude-go
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claude-go-config
+  namespace: claude-go
+data:
+  # 精简配置: 模型 provider 经 Secret 注入 key; stateDir 用容器内路径
+  config.json: |
+    {
+      "stateDir": "/data/.claude-go",
+      "providers": {
+        "kimi": {
+          "baseUrl": "https://api.kimi.com/coding/v1",
+          "apiKeyEnv": "KIMI_API_KEY"
+        }
+      },
+      "ai": { "defaultModelAlias": "kimi:k3" },
+      "models": { "kimi:k3": { "provider": "kimi", "model": "k3", "contextWindow": 1048576 } }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-monolith
+  namespace: claude-go
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: claude-go-monolith }
+  template:
+    metadata:
+      labels: { app: claude-go-monolith }
+    spec:
+      containers:
+        - name: claude-go
+          image: localhost:5000/claude-go:latest
+          args: ["serve", "--addr", "0.0.0.0:18080"]
+          env:
+            - name: KIMI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+          ports:
+            - containerPort: 18080
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: config, mountPath: /etc/claude-go }
+          readinessProbe:
+            httpGet: { path: /api/health, port: 18080 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { cpu: "2", memory: 2Gi }
+      volumes:
+        - name: state
+          emptyDir: {}
+        - name: config
+          configMap: { name: claude-go-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-monolith
+  namespace: claude-go
+spec:
+  selector: { app: claude-go-monolith }
+  ports:
+    - { port: 18080, targetPort: 18080 }
