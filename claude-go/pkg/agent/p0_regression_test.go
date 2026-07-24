@@ -37,7 +37,7 @@ func TestDedicatedExecutorModesExact(t *testing.T) {
 		"adversarial", "adversarial_dev", "orchestrated", "trading_debate",
 		"creative_media", "novel_writing", "swarm_novel", "plot_simulate",
 		"plot_predict", "ensemble_extract", "review_panel",
-		"app_composite", "game_composite",
+		"app_composite", "game_composite", "graph",
 	}
 	if len(dedicatedExecutorModes) != len(want) {
 		t.Fatalf("dedicatedExecutorModes 数量 %d != 期望 %d; 若有意增删请同步更新本测试与 design/01",

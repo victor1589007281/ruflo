@@ -83,6 +83,7 @@ var dedicatedExecutorModes = map[string]bool{
 	"review_panel":    true,
 	"app_composite":   true,
 	"game_composite":  true,
+	"graph":           true, // 图引擎自带 Journal 恢复, 不走 pipeline 检查点路径
 }
 
 // ModeHasDedicatedExecutor 供 Coordinator 判断是否走 executor 专用分发。
@@ -400,6 +401,8 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		return we.executePipeline(ctx, wf, objective, team)
 	case "fanout":
 		return we.executeFanOut(ctx, wf, objective, team)
+	case "graph":
+		return we.executeGraph(ctx, wf, objective, team)
 	case "adversarial":
 		return we.executeAdversarial(ctx, wf, objective, team)
 	case "adversarial_dev":
@@ -513,6 +516,11 @@ func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults ma
 
 
 func (we *WorkflowExecutor) executePipeline(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
+	// 灰度切换 (design/01 M1): CLAUDE_GO_GRAPH_ENGINE=1 时 pipeline 走图引擎
+	// (ready-set 调度 + Journal 恢复), 行为等价验收后成为默认路径。
+	if graphEngineEnabled() {
+		return we.executeGraph(ctx, wf, objective, team)
+	}
 	results := make(map[string]string)
 	var allResults []StageResult
 
