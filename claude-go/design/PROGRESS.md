@@ -42,10 +42,10 @@
 - 🟨 P4.3 worker/control HTTP 子命令 + cron 租约：K8s distributed.yaml 已声明契约；HTTP 端点接线归 R3 后续
 - ✅ P4.4 单元测试：cluster 全 -race 绿
 
-## P5 评估与进化操作台（03-E3/E4 精简）⬜ 待启动
-- ⬜ P5.1 离线回放 harness（tests/eval 扩展）
-- ⬜ P5.2 evo_* 工具最小集（list/smoke/status + 锁定字段护栏）
-- ⬜ P5.3 单元测试
+## P5 评估与进化操作台（03-E3/E4 精简）🟨 操作台只读版完成
+- 🟨 P5.1 离线回放 harness：设计已规格化（design/03 §4.5）；tests/eval 扩展归 E4 后续
+- ✅ P5.2 evo 操作台只读版：`pkg/evolution/console` + `evo` CLI 命令，检视学习闭环健康度（轨迹/奖励/经验/shadow技能，healthy/partial/open 判定）；只读护栏（Hermes H7）；对真实 E2E 制品实测 PARTIAL 正确诊断。propose/smoke/promote 写操作闭环归 E3/E4
+- ✅ P5.3 单元测试：console 3 测试（healthy/open/shadow）全绿
 
 ## 验收链
 - ✅ V1 全量 go build/vet 绿；pkg/... test 除预存 orchestrator 死锁外全绿（见偏差记录）

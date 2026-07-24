@@ -44,6 +44,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dashboard"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/engine"
+	"github.com/anthropic/claude-go/pkg/evolution/console"
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
@@ -261,6 +262,7 @@ func main() {
 	rootCmd.AddCommand(dashboardCmd())
 	rootCmd.AddCommand(llmGatewayCmd())
 	rootCmd.AddCommand(workerCmd())
+	rootCmd.AddCommand(evoCmd())
 	rootCmd.AddCommand(backupCmd())
 	rootCmd.AddCommand(sandboxCmd())
 	rootCmd.AddCommand(teamCmd())
@@ -1418,6 +1420,45 @@ func rolesCmd() *cobra.Command {
 }
 
 // dashboardCmd 拉起本地只读可视化 dashboard (支持 run/start/stop/status/open)。
+// evoCmd 进化操作台 (design/03 §4.7): 检视学习闭环健康度 (轨迹/奖励/经验/shadow技能)。
+// v1 只读检视 (evo status); propose/smoke/promote 写操作属 E3/E4 后续。
+func evoCmd() *cobra.Command {
+	var (
+		stateDirFlag string
+		jsonOut      bool
+	)
+	cmd := &cobra.Command{
+		Use:   "evo",
+		Short: "进化操作台: 检视学习闭环健康度 (design/03 §4.7)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			stateDir := stateDirFlag
+			if stateDir == "" {
+				jsonCfg, _ := feishu.LoadJSONConfig(flagConfig)
+				cwd, _ := os.Getwd()
+				sdInput := ""
+				if jsonCfg != nil {
+					sdInput = jsonCfg.StateDir
+				}
+				stateDir = basedir.ResolveDefault(sdInput, cwd)
+			}
+			rep, err := console.Inspect(stateDir)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				b, _ := json.MarshalIndent(rep, "", "  ")
+				fmt.Println(string(b))
+			} else {
+				fmt.Print(rep.Format())
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&stateDirFlag, "state-dir", "", "状态目录 (默认从 config/cwd 解析)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "JSON 输出")
+	return cmd
+}
+
 // workerCmd 分布式 worker (design/02 §3.3 L3): 连接控制面, 心跳注册, 拉取任务执行回报。
 // v1 执行 "stage" 类任务: payload 为图节点描述, 经本地 agent 运行时执行 (无 LLM 凭证时
 // 回报占位结果, 证明任务分发链路)。真实分布式执行需 worker 侧完整引擎装配 (R3 后续)。
