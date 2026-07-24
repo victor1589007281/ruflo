@@ -1,0 +1,372 @@
+# 03 · RL 进化引擎（统一自我进化闭环）设计方案
+
+> 状态：设计稿 v1.1（2026-07-23）· 基于 HEAD `6bd8da22f` 全量源码梳理；v1.1 新增 Hermes-Agent（Nous Research）RL 引擎源码实地调研与吸收（§2.1、§4.2、§4.3e、§4.5、§4.7）
+> 关联：[00-overview.md](00-overview.md) · [01 编排引擎](01-unified-agent-orchestration-engine.md)（轨迹/注入挂载点）· [02 分层架构](02-cloud-native-layered-architecture.md)（L4 服务归属）
+> 范畴：自动学习 LLM 轨迹与会话交互 → 自我进化。统一囊括：**记忆整理、经验总结、skill 进化**，外加工作流/prompt 进化与（可选）权重内进化导出。
+
+---
+
+## 一、现状诊断：形式完整、三处开环、奖励贫乏
+
+### 1.1 现有学习设施全景
+
+claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈——这是本方案的地基而非推倒对象：
+
+| 环节 | 组件 | 核心能力 | 位置 |
+|---|---|---|---|
+| 采集 | EvolutionEngine.RecordTrajectory | 团队 stage 轨迹（截断 Input4k/Output6k，上限 500 条） | `evolution.go:184,196,202` |
+| 采集 | 引擎 turn 轨迹 TrajStore | TurnID/意图/计划/工具调用/verdict，写分层记忆 | `internal_hook/trajectory.go:57,92,158`；装配 `engine.go:265,347` |
+| 采集 | LLMCallRecord→llm.jsonl | token/延迟/错误/来源/PromptComponents(仅字符数) | `api/client.go:57`、`llm_collector.go:101` |
+| 采集 | 会话 transcript | user 初始消息+assistant(含 tool_use) JSONL | `session/storage.go`、`engine.go:456,506,1113` |
+| 蒸馏 | LearnFromTeam/LearnFromStage/LearnCounterfactual | LLM 蒸馏（严格 JSON）+启发式回退+反事实假设 | `evolution.go:224,266,345,457,647` |
+| 蒸馏 | PreCompact 事实抽取 | 压缩前 SmartExtractKeyFacts→Ingestor | `compact.go:64-92`、`main.go:2562` |
+| 存储 | Experience 库 | 三类经验、质量分、生命周期、MinHash 签名、UCB 计数 | `evolution.go:48` |
+| 存储 | 分层记忆 | L1 TieredStore(情景)/L2 FactStore(结构化+矛盾检测)/L3 markdown | `tiered.go:207`、`store.go:110,285`、`fact.go:57` |
+| 存储 | 遗忘曲线 | Ebbinghaus 衰减、分类衰减率、归档、召回强化 | `fact.go:21,57`、`decay.go:33,115` |
+| 检索 | RetrieveFor | BM25+IDF+中英同义词+lifecycle/uplift 加权+UCB 探索+MinHash 去重 | `evolution.go:697,834,1424` |
+| 注入 | MemoryInjectHook / FormatExperiencesForPrompt | 首轮注入 L1×7+L2×5 / `<learned_experiences>` 段 | `hook_memory.go:36`、`evolution.go:872` |
+| 反馈 | RecordFeedback/RecordInjection/UpdateBaseline | EMA 质量更新、注入 uplift 追踪 | `evolution.go:906,570,633,605` |
+| 整理 | Consolidate | 生命周期状态机(proposed→…→archived)、衰减、LSH 去重、上限 200 | `evolution.go:942,1017` |
+| 整理 | Dreaming | 门控触发、LLM 整合、增量蒸馏 consolidated.md | `dreamer.go:235,305,382,777`、`consolidator.go:73` |
+| 度量 | CollectMetrics | 18 项进化指标（distill_rate/uplift/error_recurrence…） | `evolution.go:1163` |
+| 技能 | AutoCreator | MaybeCreate/ImproveSkill 写 SKILL.md+Reload | `autocreate.go:42,108` |
+| 知识 | wiki 引擎 | LLM-Wiki 三层概念库（独立，不回流） | `wiki/engine.go` |
+
+### 1.2 三处关键开环（本方案第一优先修复）
+
+1. **headless `run` 不实例化进化引擎**：`cmd/claude-go/main.go:768` 的 `NewProductionTeamManager` 未设 `Evolution` 字段 → `workflow.go:758-840` 全部学习分支被 `we.evolution != nil` 守卫跳过。**CLI 跑的所有团队（下游 8+ 平台的全部流量！）零学习**。唯一装配点在飞书：`bot.go:376`。
+2. **技能自进化是死代码**：`AutoCreator` 仅构造（`bot.go:644`），全仓库对 `MaybeCreate`/`ImproveSkill` 的调用点为 **0**。
+3. **Dreaming headless 只建不触发**：`AfterQuery`/`RecordSession` 仅飞书路径调用（`feishu/session.go:770`、`bot.go:183`）；CLI 创建 dreamer 只为取 MemoryDir（`main.go:2547`）。
+
+### 1.3 轨迹不可对齐（RL 的数据地基缺失）
+
+要重建 (state, action, reward) 三元组，当前缺：
+- **统一 trace-id**：llm.jsonl 无 turn/session/trajectory id，与 transcript/团队轨迹只能按时间戳粗对齐;
+- **action 完整文本**：llm.jsonl 只存计数不存 prompt/response 正文；transcript 不落 tool_result（`engine.go` 只 Append user 初始消息与 assistant 消息）；进化轨迹 Input/Output 被截断；
+- **headless 团队路径** trajectories.json 根本不产生（开环 1）。
+
+### 1.4 奖励贫乏
+
+| 信号 | 现状 | 问题 |
+|---|---|---|
+| stage 成败二值 | 入学习（EMA） | 唯一稳定奖励，且 headless 不采集 |
+| turn Verdict 四值 | 启发式推断（工具成功率，`trajectory.go:158`） | 非真实任务达成度 |
+| content_gate LLM 0-100 分 | **用完即丢**（`content_gate.go:20`，仅触发重做） | 现成 dense reward 被浪费 |
+| 编译/测试门禁 | 间接影响 stage 状态 | 未作为独立奖励事件记录 |
+| 用户反馈 | **完全缺失**（无点赞/评分入口；steer 修正未被视为负信号） | 最高价值信号为零 |
+| review 评分（评审团 86 分之类） | 落 REPORT.md 文本，不入库 | 未结构化 |
+
+---
+
+## 二、业界方案与论文调研
+
+**权重外进化（本方案主体——我们不持有前沿模型权重）**
+
+| 来源 | 采纳 |
+|---|---|
+| **Voyager（2023）** | 技能库=可执行技能+描述索引，成功后固化、失败迭代。→ skill 进化器的库模型 |
+| **ExpeL / Reflexion** | 从成功/失败轨迹中提炼语言经验，注入后续任务；语言化的"策略梯度"。→ 现 EvolutionEngine 的理论定位，保留强化 |
+| **Agent Workflow Memory（AWM, 2024）** | 从轨迹中归纳**可复用工作流**并注入。→ 工作流进化器：从 Journal 归纳图模板 |
+| **MemGPT/Letta + sleep-time compute** | 分层记忆+睡眠时整理。→ 现 Dreaming 的定位；本方案把它变成统一进化循环的一个学习器 |
+| **Generative Agents** | 记忆流+重要性评分+反思金字塔。→ FactStore 反思层级 |
+| **SkillRL / SkillBank（arXiv:2602.08234）** | 分层技能库+经验蒸馏+**技能库与策略递归共进化**。→ 技能库分层（通用启发式 vs 任务特定）与递归进化节奏 |
+| **SkillAudit（arXiv:2606.14239）** | **无 ground-truth 的技能进化审计：配对轨迹对照**（带/不带该技能的轨迹对比）。→ 技能晋升门禁的核心机制 |
+| **Trajectory-Informed Memory Generation（arXiv:2603.10600）** | 从执行轨迹自动抽取 actionable learnings 入上下文记忆。→ 经验学习器的抽取规范 |
+| **The Past Is Prologue（arXiv:2606.31121）** | 顺序演化记忆的**选择性更新控制器**（何时改/何时不改）。→ 记忆整理器的更新门 |
+| **OPD-Evolver（arXiv:2606.17628）** | on-policy 蒸馏培养整体 evolver。→ 权重内导出路径参考 |
+| **AFlow（ICLR'25）/ ADAS / GPTSwarm** | 工作流=可搜索/可优化的图。→ 图模板变异+离线评估 |
+| **GEPA / DSPy（2025）** | 反思式 prompt 进化：用执行反馈+LLM 反思优化 prompt，样本效率高于 RL 微调。→ prompt 进化器 |
+| **Darwin-Gödel Machine / AlphaEvolve（2025）** | 自改进代码 agent 的**评估门禁+谱系存档**。→ 五级治理与回滚谱系 |
+
+**权重内进化（可选导出路径）**：GRPO（DeepSeek-R1）/ RLVR（可验证奖励）/ RFT / DPO——本机有 ollama+gemma，轨迹+奖励可导出为 DPO 对/RFT 数据集微调本地小模型（如意图识别、路由、gate 评分等窄任务），主力模型不动。
+
+### 2.1 实地调研：Hermes-Agent 的 RL 引擎（Tinker-Atropos）
+
+本机 `/home/victor/base/git/temp/hermes-agent`（Nous Research，Python）内置了一套**权重内** RL 训练引擎，已做全量源码调研。它与本方案定位互补：hermes 训模型权重（GRPO+LoRA），我们主体优化系统策略 π_sys——但它在**环境抽象、奖励工程、轨迹管线、训练编排**四方面的工程实践直接可用。
+
+**架构**：三进程管线——Atropos（轨迹 API：rollout 组管理+advantage 计算）+ Tinker（云端训练服务：LoRA/采样/优化器步）+ Environment（任务/评分定义）；agent 自身通过 10 个 `rl_*` 工具全程编排训练（`rl_cli.py:113` 的"自动化后训练工程师"系统提示词 + `tools/rl_training_tool.py`）。环境不是经典 reset/step MDP，而是**轨迹级 rollout 契约**：`setup / get_next_item / format_prompt / compute_reward / evaluate` 五方法（`environments/hermes_base_env.py:650-714`），整个多轮 agent loop（`environments/agent_loop.py:175`）是 RL 的"一步"。
+
+**吸收清单**（→ 指向本文落点）：
+
+| # | Hermes 设计点 | 位置 | 吸收到 |
+|---|---|---|---|
+| H1 | **验证器复用 rollout 后的活沙箱**：reward 函数拿 `ToolContext(task_id)` 全工具访问，直接检查模型跑完后的真实文件/进程状态，无需重放快照 | `hermes_base_env.py:584`、`tool_context.py:67` | §4.2 奖励在原始工作区计算 |
+| H2 | **多信号 shaped reward 配方**：0.6 正确性 + 0.2 工具使用 + 0.2 效率（超 5 次调用递减惩罚）+ 多样性加分，权重可配；LLM judge 失败回退启发式 | `web_research_env.py:345-421` | §4.2 复合奖励模板 |
+| H3 | **judge 独立性教训**：web_research 的 judge 用被训模型同一 server 自评（`:639`）——自评偏差/reward hacking 风险 | `web_research_env.py:639` | §4.6 治理：独立 judge 强制 |
+| H4 | **三层 token-safe 工具结果落盘**：超大输出写沙箱文件，上下文只留预览+路径（模型可 read_file 取回），read_file 阈值 pin ∞ 防循环——**信息无损的上下文控制，优于 LLM 摘要** | `tools/tool_result_storage.py:115-225` | §4.1 TraceStore + compact 协同 |
+| H5 | **双轨迹管线严格分离**：RL 用 token 对齐流（tokens/masks/logprobs，ManagedServer SequenceNode），SFT 语料用 messages 流（可有损压缩，`trajectory_compressor.py` LLM 摘要中段、保护首尾 N turn）；两者不可混用 | `hermes_base_env.py:607-642`、`trajectory_compressor.py:656-774` | §4.3e 导出器双管线 |
+| H6 | **训练前多档模型冒烟**（test-before-train）：3 step × 16 completion × 3 个不同规模模型（小/中/大）验证环境加载/prompt 构造/解析鲁棒性/verifier 正确性，再开数小时的真训练 | `rl_training_tool.py:1019-1312` | §4.5 晋升前冒烟 |
+| H7 | **锁定/可配置字段分离**：基础设施参数（lr/lora_rank/tokenizer/URL）对 agent 锁死，只暴露安全字段（group_size/batch_size），改锁定字段直接拒绝 | `rl_training_tool.py:72-108,690` | §4.7 进化操作台护栏 |
+| H8 | **agent 即后训练工程师**：发现环境→读源码理解 verifier→复制模板造新环境→冒烟→训练→限速监控→早停，全程 agent 工具自助 | `rl_cli.py:113-170` | §4.7 进化操作台 |
+| H9 | **监控限速内建于工具层**：`rl_check_status` 同一 run 30 分钟最小间隔，直接返回 rate_limited+剩余秒数——把"别轮询"纪律做进工具而非提示词 | `rl_training_tool.py:150,828-841` | §4.7 |
+| H10 | **GRPO 组卫生**：组内同任务同工具（工具集按组解析一次），只有采样不同；工具集支持概率分布采样促泛化 | `hermes_base_env.py:350-369,289-322` | §4.3e 组语义 |
+| H11 | **On-Policy Distillation（OPD）**：从 next_state（工具结果/报错）用 PRM 多数投票抽 hindsight hint→hint 增强 prompt 下取 teacher top-K logprob→`A_t = teacher_lp − student_lp` 逐 token 稠密信号，补稀疏末端 reward | `agentic_opd_env.py:551-1002` | §4.3e 可选深化（机制采纳、实现需重做：其 token span 反向匹配脆弱） |
+| H12 | **评测骨架健壮性**：Semaphore 限并发、每任务硬超时、每完成一条立即流式落盘 JSONL（中断不丢）、按 prompt 内容而非 index 判断续跑、空 rollout 短路不启动沙箱 | `terminalbench2_env.py:784-996`、`batch_runner.py:714-756`、`hermes_base_env.py:573-581` | §4.5 回放 harness |
+| H13 | **SFT 样本质量过滤**：无 reasoning 覆盖的轨迹直接丢弃 | `batch_runner.py:442-447` | §4.3e 导出过滤 |
+| H14 | **指标契约**：reward_mean / percent_correct / logprob 漂移（reference−training）作为训练健康度三件套 | rl-training.md、`rl_training_tool.py:892-897` | §4.5 指标 |
+
+**不吸收/引以为戒**：RL 环境里 memory/skill 被禁用（`agent_loop.py:396-401`，为可复现性牺牲了"带记忆的策略"——恰是我们 π_sys 的主体，不能照搬）；SWE 环境 reward 用字符串插值执行测试且部分分逻辑失效（`hermes_swe_env.py:178,187`，脆弱写法反面教材）；trajectory_compressor 的 LLM 摘要压缩对 RL 管线是污染源（仅 SFT 可用）；OPD 引用的论文出处存疑、token 对齐实现 O(n·m) 且不可靠。
+
+**核心结论**：在不持有权重的约束下，"RL"落地为**系统级策略优化**——策略 π = (注入的经验, 记忆, 选用的 skill, 图模板, prompt, 模型档位) 的组合；学习 = 用真实奖励更新这些组件的**选择分布与内容**。这正是 2026 年 SkillRL/SkillAudit 系工作的共识框架，而 claude-go 已有其中 60% 的原件，缺的是：轨迹底座、奖励总线、统一调度、治理门禁。
+
+---
+
+## 三、RL 形式化
+
+```
+POMDP:  state  s = (任务 objective, 图/节点上下文, 黑板, 注入的记忆与经验, 环境观测)
+        action a = LLM 输出（文本/tool_use）——由 底座模型 π_base + 系统策略 π_sys 联合产生
+        π_sys  = { 经验注入选择, 记忆注入选择, skill 选择, 图模板选择, prompt 版本, 模型档位 }
+        reward r = RewardBus 聚合（§4.2），episode = 一次 GraphRun / 一次会话任务
+优化目标：max E[R]，仅优化 π_sys（权重外）；π_base 可选经导出数据离线微调（权重内）
+学习算法：① 经验/记忆内容更新 = 语言化梯度（distill + reflect）
+          ② 选择分布更新 = contextual bandit（UCB/Thompson，按任务上下文条件化）
+          ③ 结构更新 = 进化搜索（图模板/prompt 变异 + 离线回放评估 + 灰度）
+```
+
+**信用分配（credit assignment）**：episode 级奖励 → 节点级：门禁/gate 分数天然挂节点；episode 终值按 Journal 因果链回溯衰减分摊（γ 折扣）；争议节点用 LLM-judge 过程评分（PRM 风格，低频采样控成本）。
+
+---
+
+## 四、统一进化引擎架构（Evolution Service）
+
+```
+                        ┌────────────────────────────────────────────┐
+   design/01 Hook总线 ──►│ ① TraceStore 轨迹底座（append-only, trace-id）│
+   design/01 拦截器  ──►│ ② RewardBus 奖励总线（多源信号→奖励事件）      │
+                        ├────────────────────────────────────────────┤
+                        │ ③ 学习器族（统一调度循环 EvolutionLoop）       │
+                        │   a.经验学习器  b.记忆整理器  c.Skill进化器    │
+                        │   d.工作流/Prompt进化器  e.权重导出器(可选)    │
+                        ├────────────────────────────────────────────┤
+                        │ ④ 策略应用层（检索注入 + bandit 选择）         │──► prompt/图模板/skill
+                        │ ⑤ 评估与门禁（离线回放 + uplift + canary）     │
+                        │ ⑥ 治理（五级生命周期 + 谱系 + 回滚 + 预算）     │
+                        │ ⑦ 进化操作台（evo_* 工具，agent 自助实验）      │◄── 飞书/CLI/cron
+                        └────────────────────────────────────────────┘
+```
+
+部署：L4 辅助系统（design/02）。单机=进程内模块；分布式=独立 evolution 服务，中心化经验/记忆库（解学习孤岛，假设 #17）。
+
+### 4.1 ① TraceStore：轨迹底座
+
+**统一 trace-id**（与 design/01 Journal、design/02 LLMGateway 同一套）：
+
+```
+trace = run_id / node_id / turn_id / call_id        （团队路径）
+      = session_id / turn_id / call_id              （会话路径）
+```
+
+**Span 模型**（OTel 风格，`trace.jsonl` append-only，StateStore Log bucket）：
+
+```go
+type Span struct {
+    TraceID, SpanID, ParentID string
+    Kind    string    // run | node | turn | llm_call | tool_call | gate | human
+    Name    string    // 节点名/工具名/gate 名
+    Input   Ref       // 内容寻址引用（Blob），全文不截断；含 prompt 组装各段引用
+    Output  Ref       // response 全文 / tool_result 全文
+    Attrs   map[string]any // tokens/model/duration/status/score/verdict...
+    TS, DurMS int64
+}
+```
+
+**采集点**（全部是现有代码的接线，不发明新路径）：
+- llm_call：LLMGateway 出口（design/02 §3.1），LLMCallRecord 增加 trace 四元组字段——修"llm.jsonl 无关联键"；
+- tool_call：引擎 PhasePre/PostToolUse hook——修"transcript 缺 tool_result"；
+- node/gate：design/01 Journal 事件双写（Journal 是执行真源，TraceStore 是学习视图，同源不同投影）;
+- turn：现 `TurnMetricsHook`（`hook_metrics.go:79`）升级为写 Span。
+
+**成本控制**：正文入 Blob 内容寻址（prompt 各段天然去重——system prompt/skill 正文重复率极高）；采样策略可配（默认全采 metadata、正文按 run 级开关，产码团队默认开）；TTL 分级（原始正文 30 天，Span 元数据永久）。
+
+**与上下文压缩的协同（吸收 Hermes H4）**：运行期超大工具结果优先走**"落盘+指针"**而非丢弃/摘要——参照 hermes 三层机制（单结果超阈值→写工作区文件、上下文只留预览+路径、agent 可 Read 取回；Read 结果自身豁免落盘防循环）。对 claude-go：`pkg/compact` 的截断路径增加 persist 档位，被落盘的原文**天然就是 TraceStore 的 Blob**——上下文瘦身与轨迹保真一次解决；LLM 摘要压缩（现 SmartExtractKeyFacts）保留用于会话延续，但 Span 里始终记指针指向无损原文，学习管线永远读得到全文。这直接消解 §1.3 "action 完整文本缺失"中 transcript 截断的那一半。
+
+### 4.2 ② RewardBus：奖励总线
+
+```go
+type RewardEvent struct {
+    TraceID string; SpanID string   // 挂到哪个粒度
+    Source  string   // gate.compile | gate.test | gate.content | e2e | user.explicit
+                     // | user.steer | review.panel | verdict.heuristic | cost | latency
+    Value   float64  // 归一化 [-1,1]
+    Raw     any      // 原始值（0-100 分、pass/fail、点赞种类…）
+    Weight  float64  // 源可信度权重（配置）
+}
+```
+
+**奖励源接线清单**（按价值排序）：
+
+| 源 | 接线 | 改动 |
+|---|---|---|
+| 编译/测试门禁 | gate 节点 verdict 事件（design/01） | Journal→RewardBus 投影 |
+| content_gate 0-100 分 | **持久化**（现状用完即丢，`content_gate.go:20`） | gate 节点输出进 Span.Attrs.score |
+| 用户显式反馈 | 飞书回复加 👍/👎 reaction 监听 + `/rate <1-5>` 命令 | feishu-adapter 新增，发 user.explicit |
+| steer 修正 | 用户在执行中纠偏（`session.go:698` processMessageInternal 路径）→ 对被纠偏 turn 记负信号 | 会话 actor 埋点 |
+| review 评分 | review_panel/评审团分数结构化（现散落 REPORT.md 文本） | reduce 节点输出规范化 |
+| e2e/下游验收 | :18080 新增 `POST /api/runs/<id>/feedback`（下游平台如 testforge 的门禁结果回传） | 兼容层新端点 |
+| turn Verdict | 现启发式保留为弱信号（weight 低） | 已有（`trajectory.go:158`） |
+| cost/latency | token 成本与时长作 shaping 负项（防"堆 token 刷分"） | llm.jsonl 已有 |
+
+**奖励工程三原则（吸收 Hermes §2.1）**：
+
+1. **奖励在原始工作区计算（H1）**：episode 级奖励评估器（gate 节点/事后 judge）在 run 结束、工作区清理**之前**执行，直接检查团队 cwd 的真实产物（文件存在性、可编译、测试通过、产物完整性）——claude-go 的编译/测试门禁本就在团队 cwd 跑，此原则将其推广为 RewardBus 的通用契约：`RewardEvaluator` 接口收 `WorkspaceHandle`（等价 hermes `ToolContext(task_id)`），奖励逻辑可任意使用只读工具，不依赖轨迹文本的自述。design/01 的 Journal `run.finished` 事件先触发奖励评估、后触发清理。
+2. **复合 shaped reward 模板（H2）**：episode 奖励默认配方 `R = w1·正确性 + w2·效率 + w3·过程规范`，权重进配置。效率项参照 hermes 阶梯惩罚：工具调用/轮次在预算内满分，超出后按档递减——直接对抗"堆 turn 堆 token 刷分"；过程规范项吃 turn Verdict/工具错误率等弱信号。正确性项优先确定性验证（门禁），无法确定性验证的域用 LLM judge，**judge 不可用时回退启发式**（关键词/结构断言）而非置 0——保证奖励覆盖率。
+3. **judge 独立性（H3 教训）**：LLM judge 一律使用与被评估主模型**不同的模型档位或供应商**（配置强制，如主模型 kimi-k3 → judge 走 gemma4 本地或 fallback 供应商）；hermes 的 web_research 用被训模型自评自训，是 reward hacking 的标准入口，明令禁止。
+
+### 4.3 ③ 学习器族：五个学习器、一个循环
+
+**EvolutionLoop 统一调度**（取代"飞书路径散点触发"）：事件驱动（run 完成→立即小学习）+ 周期批量（空闲期→深度整理，即 dreaming 时机）+ 预算约束（学习自身的 LLM 花费单独记账）。单机跑在进程内 goroutine；分布式由 evolution 服务消费 `evolution.trace` subject（design/02 EventBus）。
+
+#### a. 经验学习器（现 EvolutionEngine 升级，改动最小）
+
+- 保留全部现有机制：三类经验、LLM 蒸馏+启发式回退+反事实、BM25+同义词+UCB 检索、EMA 质量、uplift 追踪、生命周期 Consolidate、18 指标（`evolution.go` 全能力平移）。
+- 升级点：
+  1. 数据源从"截断的 stage 轨迹"改为 TraceStore 全文 Span（蒸馏质量↑）；
+  2. UCB → **contextual bandit**：按（工作流类型×角色×项目 profile）条件化选择分布，跨团队迁移显式建模（现 `cross_team_transfer` 指标已埋）；
+  3. 反馈从"stage 二值"扩展为 RewardBus 加权聚合；
+  4. 抽取规范对齐 Trajectory-Informed Memory Generation：经验必须是 **actionable**（条件+动作+预期效果三段式），拒绝叙事型总结。
+
+#### b. 记忆整理器（现 Dreaming+Memory 收编）
+
+- 保留：TieredStore/FactStore/衰减/矛盾检测/召回强化/PreCompact 蒸馏/consolidated.md。
+- 升级点：
+  1. 触发权收归 EvolutionLoop（修开环 3：headless 同样按空闲/阈值触发，不再依赖飞书 AfterQuery）；
+  2. **选择性更新门**（The Past Is Prologue）：整理前判断"新信息与既有记忆的关系"（新增/修正/冲突/冗余），冲突走 DetectContradictions（`store.go:285`）+ 保留谱系，不盲目覆写；
+  3. 检索增强：BM25 保留为主检索，**可选 embedding 后端**（本机 ollama embedding 或网关代理），配置开关，默认关（尊重现状无向量库的取舍）；
+  4. wiki 引擎纳入为"概念记忆"后端：Dreaming 整理产出的稳定概念可晋升入 wiki，wiki 查询结果可作为记忆注入源（现状 wiki 完全孤立）。
+
+#### c. Skill 进化器（接线死代码 + 治理门禁）
+
+```
+候选发现 ──► 起草 ──► 影子验证 ──► 晋升 ──► 监控 ──► 改进/退役
+```
+
+1. **候选发现**：EvolutionLoop 扫描高奖励轨迹簇（同类任务 N 次成功且无对应 skill）→ 触发 `MaybeCreate`（现成代码，`autocreate.go:42`）；同理低奖励+已有 skill → `ImproveSkill`（`autocreate.go:108`）。
+2. **影子验证（SkillAudit 式配对审计）**：新/改技能先处 `shadow` 状态——后续匹配任务随机 50% 注入，**配对轨迹对照**（带 vs 不带该技能的 reward 差）；样本量达阈值且 uplift 显著才晋升。复用现 InjectionTracker/UpdateBaseline 机制（`evolution.go:570,633`），从"经验粒度"推广到"技能粒度"。
+3. **版本与谱系**：SKILL.md frontmatter 增加 `version/lineage/status(shadow|active|deprecated)/audit`（现有 `auto_generated/created_at/improved_at` 保留）；SkillStore 版本化（design/02 R2）。
+4. **技能库分层**（SkillBank）：通用启发式技能（跨项目）vs 任务特定技能（绑项目 profile），检索时先特定后通用——对齐现 `RecommendedSkills`/`DetectProjectProfile` 机制（`roles.go:234,338,367`）。
+5. **技能=子图**：design/01 §4.7 允许 skill 携带图模板段，技能进化因此涵盖"多阶段技能"的结构进化。
+
+#### d. 工作流/Prompt 进化器（新增，AFlow/GEPA 式，节奏最慢）
+
+- **工作流归纳（AWM）**：从高奖励 Journal 归纳可复用图模板（"这类 objective 用这个节点序列成功率高"）→ 起草 GraphSpec 变体入 shadow。
+- **图模板变异（AFlow）**：对低分模板做受限变异（加 gate 节点/调整 loop 上限/换角色/改交接裁剪），**只在离线回放评估通过后**进灰度。
+- **Prompt 进化（GEPA）**：角色 SystemPrompt/stage Prompt 的反思式改写：取该 prompt 下的失败轨迹+奖励，LLM 反思产出候选版本，离线回放对比，胜出者 canary 5%→50%→100%。
+- 搜索空间=design/01 的纯数据 GraphSpec/RoleDef/SKILL.md——**这正是 01 方案坚持"图是纯数据"的回报**。
+
+#### e. 权重进化导出器（可选，默认关；v1.1 按 Hermes 实践细化）
+
+- **双管线严格分离（H5）**：
+  - **SFT/DPO 语料管线**：从 TraceStore 的 messages 视图导出 ShareGPT 风格对话；允许有损处理（长轨迹压缩沿 hermes trajectory_compressor 策略：保护首条 system/user 与末尾 N turn，只对中段做 LLM 摘要替换并在 system 注明"部分历史已摘要"）；质量过滤参照 H13——无推理过程覆盖/奖励低于阈值/含 schema 回显的轨迹直接丢弃。
+  - **RL token 管线**（远期，仅当引入自管推理服务时）：需要 token/mask/logprob 精确对齐，**禁止任何有损摘要**；上下文控制只允许"落盘+指针"方式（见 §4.1 H4 协同）。当前 claude-go 经网关调外部 API 拿不到 logprob，此管线默认不建，仅在文档层预留契约。
+- **环境即任务集+验证器**：把 hermes 的五方法环境契约（setup/get_next_item/format_prompt/compute_reward/evaluate）映射为导出侧的 `EvalEnv` 定义 = 离线回放任务集（§4.5）+ RewardEvaluator——**同一个 EvalEnv 既服务进化产物门禁，又服务训练数据生成与训后评测**，一份任务集三用，不另造格式。
+- **组语义（H10）**：为 GRPO/DPO 采样时，同一任务的 N 次 rollout 必须控制变量——同 objective、同注入经验/技能版本、同工具集（组级解析一次），只有采样温度不同；组内奖励全同的组丢弃（无学习信号）。
+- **OPD 稠密信号（H11，可选深化）**：对本地窄任务模型（gate 评分器/路由器）可采纳 hermes 的 hindsight-hint 机制——从工具结果/门禁反馈中用多数投票 judge 抽取"上一步本可更好"的 hint，构造 hint 增强上下文下的 teacher 分布做逐 token 蒸馏。机制采纳，实现不照搬（其独立再分词的 token span 反向匹配在子词分词上下文相关性下不可靠，须在同一次前向里同时取 teacher/student logprob）。
+- 目标仅限本地小模型窄任务：意图识别（`IntentRecognizer`）、路由 gate、内容评分器——用 gemma4:26b 微调后替换对应 SimpleComplete 调用，省 token 且可控;
+- 明确不做：主力模型微调（无权重）、在线 RL（风险与算力都不成立）。
+
+### 4.4 ④ 策略应用层
+
+- 注入点全部走 design/01 拦截器/hook（EvolutionRecorder 拦截器 + MemoryInjectHook），**headless 与飞书同构**——开环 1 从架构上不可能再出现；
+- 每次注入记 `policy_decision` Span（注入了哪些经验/记忆/技能/模板版本）——bandit 更新与 uplift 归因的数据基础（现 RecordInjection 的推广）。
+
+### 4.5 ⑤ 评估与门禁
+
+- **离线回放 harness**：扩展 `tests/eval`（现为特性自评分，`bench_test.go:108` 及格线 60%）为**轨迹回放评估**：固定任务集（从历史高置信轨迹沉淀）+ LLM-judge 评分 + 确定性断言（产码任务跑真门禁），任何进化产物晋升前必过；
+- **晋升前多档冒烟（H6，test-before-train 推广为 test-before-promote）**：任何进化产物（新技能/新图模板/新 prompt 版本）先跑小规模冒烟——少量任务 × 多次采样 × **多个模型档位**（如 kimi-k3 / fallback 供应商 / gemma 本地各一），验证注入后 prompt 组装不劣化、解析不崩、奖励覆盖正常，再进 shadow 灰度。多档模型是关键：hermes 用小/中/大三档专测解析鲁棒性——技能/prompt 对弱模型不鲁棒是线上劣化的常见来源；
+- **harness 工程规范（H12）**：并发信号量限流（防打爆网关配额）、每任务硬超时、**每完成一条立即流式落盘 JSONL**（中断不丢已完成结果）、续跑按任务内容指纹而非序号（任务集增删不错位）、空产出短路（zero-turn 轨迹直接 0 分不启动评估器）；
+- **uplift 因果评估**：全部进化产物（经验/技能/模板/prompt）统一用配对对照（注入组 vs 基线组）报告 uplift，替代"感觉变好了"；
+- **18 项进化指标保留** + 新增：reward 趋势、灰度胜率、回滚率、学习成本占比（学习 LLM 花费/总花费）；导出训练路径启用时加 hermes 三件套（H14）：reward_mean / percent_correct / 分布漂移监控。
+
+### 4.6 ⑥ 治理
+
+- **五级生命周期**（对齐 aiops design/09 的治理框架）：`observed → proposed → shadow(validated) → active(promoted) → archived`，每级迁移条件量化、事件入 Journal 可审计；
+- **四律**：进化产物不越权（ConstraintSet 单调性）、必留痕（谱系）、必过闸（离线回放+uplift）、可回滚（版本化存储，一键回退到任意谱系点）；
+- **防经验污染/reward hacking**：奖励源加权可信度（用户显式>门禁>LLM-judge>启发式）；cost shaping 防堆 token；经验/技能上限与淘汰（现 200 条上限机制推广）；对抗审计（周期抽样进化产物让独立 judge 复核）。
+
+### 4.7 ⑦ 进化操作台：agent 自助编排进化实验（吸收 Hermes H7/H8/H9）
+
+Hermes 最有借鉴价值的顶层设计是**"agent 即后训练工程师"**：整条 RL 管线（发现环境→读源码理解 verifier→复制模板造新环境→冒烟→训练→限速监控→早停→取结果）通过 10 个 `rl_*` 工具由 agent 自己驱动，人只下目标（`rl_cli.py:113-170`）。对应到本方案，Evolution Service 暴露一组 `evo_*` 工具（注册进 claude-go 工具池，飞书/CLI 均可用），让 claude-go 自己当"进化工程师"：
+
+| 工具 | 作用 | Hermes 对应 |
+|---|---|---|
+| `evo_list_envs` | 列出 EvalEnv（回放任务集+验证器），含描述与样本量 | rl_list_environments（AST 静态扫描发现，不执行代码） |
+| `evo_inspect` | 查看进化产物（技能/模板/prompt）的谱系、uplift 历史、当前状态 | 读环境源码理解 verifier |
+| `evo_propose` | 提交候选产物（起草技能/模板变体）进 proposed 态 | 复制模板造新环境 |
+| `evo_smoke` | 晋升前多档冒烟（§4.5 H6），返回各档解析/奖励覆盖报告 | rl_test_inference |
+| `evo_run_experiment` | 启动 shadow 配对实验 / 离线回放批次 | rl_start_training |
+| `evo_status` | 查实验进度与指标——**同一实验 30 分钟限速，内建于工具层，返回 rate_limited+剩余时间（H9）** | rl_check_status |
+| `evo_promote` / `evo_rollback` | 过闸晋升 / 一键回滚到谱系任意点 | rl_get_results 后的人工决策，此处闸门化 |
+
+**护栏（H7 锁定字段模式）**：`evo_*` 工具可改的只有安全字段（实验样本量、任务集选择、shadow 比例上限 50%、描述文本）；**治理参数一律锁定**——晋升阈值、uplift 显著性标准、judge 模型选择、学习预算上限、生命周期规则，agent 请求修改直接拒绝并返回锁定原因（等价 `rl_edit_config` 对 LOCKED_FIELDS 的拒绝语义，`rl_training_tool.py:690`）。这把 §4.6 的"四律"从约定变成机械强制：agent 可以自由做实验，但**闸门标准本身不在它的动作空间里**。
+
+工作流纪律进系统提示词（仿 RL_SYSTEM_PROMPT 的规范）：先冒烟后实验、指标坏了早停、从小样本起步再放大、状态检查遵守限速。定时驱动：EvolutionLoop 的周期批量（§4.3）本质就是 cron 触发一个带 `evo_*` 工具集的进化 agent 会话——与 aiops"数字员工"模式同构，复用其"先发布后深挖"的教训。
+
+---
+
+## 五、三处开环的具体修复（E0 立即执行）
+
+| # | 修复 | 改动点 |
+|---|---|---|
+| 1 | headless 实例化进化 | `main.go:768` `NewProductionTeamManager` 补 `Evolution: NewEvolutionEngine(...)`（与 `bot.go:376` 同参装配，状态目录同 `<state>/evolution/`）；长期由 EvolutionRecorder 拦截器取代散点接线 |
+| 2 | 接线技能自进化 | 短期：`teams.go:786-792` 团队学习后追加"高奖励簇→MaybeCreate / 低奖励→ImproveSkill"调用（含 shadow 状态门禁，未过审计不 active）；长期：Skill 进化器接管 |
+| 3 | Dreaming 触发统一 | `main.go:2547` 后台注册与飞书同款触发（空闲阈值+ForceDream 命令）；长期：EvolutionLoop 调度 |
+
+附带小修：CLI 产生的 turn 轨迹（TieredStore）与飞书 evolution 目录数据互通——统一 StateStore bucket 后自然解决（design/02 R2）。
+
+---
+
+## 六、现有功能覆盖矩阵（学习域）
+
+| 现有能力 | 位置 | 新归属 | 状态 |
+|---|---|---|---|
+| 三类经验/蒸馏/反事实/去重 | `evolution.go:224-647` | 经验学习器 | 等价（数据源升级为全文） |
+| BM25+同义词+UCB 检索/注入 | `evolution.go:697-872` | 策略应用层 | 等价（→contextual bandit） |
+| EMA 质量/uplift/Consolidate/18 指标 | `evolution.go:906-1163` | 经验学习器+评估 | 等价+新指标 |
+| turn 轨迹+Verdict | `internal_hook/trajectory.go` | TraceStore Span（弱奖励源保留） | 增强（持久化+关联） |
+| L1/L2/L3 记忆+衰减+矛盾检测+召回强化 | `pkg/memory` | 记忆整理器 | 等价+选择性更新门 |
+| MemoryInjectHook 首轮注入 | `hook_memory.go:36` | 策略应用层 | 等价 |
+| PreCompact 事实蒸馏 | `compact.go:64-92` | 记忆整理器采集源 | 等价 |
+| Dreaming 门控/整合/增量蒸馏/ForceDream | `dreamer.go`、`consolidator.go` | 记忆整理器（触发权归 Loop） | 等价（修开环） |
+| AutoCreator 创建/改进技能 | `autocreate.go:42,108` | Skill 进化器（加门禁） | 激活（修死代码） |
+| 技能热重载/InstallSkill/dashboard skills API | `skills.go:210,460`、`server.go:242-244` | 不变；进化产物经同一通道发布 | 等价 |
+| swarm_intel 信素记忆/校准存储 | `swarm_intel/engine.go:67` | 记忆整理器专用 bucket（预测域经验） | 等价 |
+| wiki 三层知识库 | `wiki/engine.go` | 概念记忆后端（双向打通） | 增强 |
+| llm.jsonl 记账 | `llm_collector.go` | TraceStore 的 llm_call 投影 | 增强（trace-id+双边 token） |
+| transcript/续聊 | `session/storage.go:129-147` | 不变；tool_result 补录进 Span | 增强 |
+| tests/eval 自评分 harness | `tests/eval/bench_test.go` | 离线回放 harness 的基座 | 增强 |
+| 进化数据目录 `<state>/evolution/` | `evolution.go:1092` | StateStore bucket（格式兼容迁移） | 等价 |
+
+---
+
+## 七、数据模式与代码组织
+
+```
+pkg/evolution/            // 新根包（pkg/agent/evolution.go 平移+拆分）
+  trace/    span.go store.go collector.go   // ① TraceStore
+  reward/   bus.go sources.go attribution.go // ② RewardBus + 信用分配
+  learners/ experience.go memory.go skill.go workflow.go export.go // ③ 学习器族
+  policy/   inject.go bandit.go              // ④ 策略应用
+  eval/     replay.go uplift.go metrics.go   // ⑤ 评估
+  govern/   lifecycle.go lineage.go audit.go // ⑥ 治理
+  loop.go                                    // EvolutionLoop 调度
+存储 bucket（design/02 StateStore）：
+  Log:  trace/<runID>.jsonl · reward/<runID>.jsonl
+  KV:   experiences · skills(版本化) · prompts(版本化) · templates(版本化) · bandit-state
+  Blob: span 正文（内容寻址）· 回放任务集
+```
+
+---
+
+## 八、实施路线
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| E0 修开环+trace-id（1 周，可独立先行） | §五 三修复；LLMCallRecord/transcript/团队轨迹加 trace 四元组 | headless 团队跑完 experiences.json 有增量；llm.jsonl 记录可按 run_id 聚合 |
+| E1 轨迹底座（2 周） | TraceStore + tool_result 采集 + Blob 内容寻址 + 采样/TTL | 任一 run 可从 Span 完整还原 prompt→response→tool→结果链 |
+| E2 奖励总线+学习器收编（3 周） | RewardBus 八源接线（含飞书 reaction/`/rate`/steer 负信号/下游回传端点）；经验/记忆两学习器迁入 Loop；content_gate 分数持久化 | reward 事件覆盖率>90% 的 run；uplift 报表出数 |
+| E3 Skill 进化器（2 周） | 候选发现→shadow→配对审计→晋升全链；SKILL.md 版本谱系 | 真实产生 ≥3 个 shadow 技能且 ≥1 个过审计晋升；劣化技能被拒绝的负例 e2e |
+| E4 工作流/Prompt 进化+回放 harness（3 周） | 离线回放任务集沉淀（=EvalEnv 契约，§4.3e 三用）；GEPA 式 prompt 进化 canary；AWM 工作流归纳；harness 按 H12 工程规范实现（限流/硬超时/流式落盘/内容指纹续跑）；**进化操作台 `evo_*` 七工具 + 锁定字段护栏（§4.7）** | 一个真实 prompt 版本经 canary 全量；回放 harness 阻断一次劣化变异的负例；agent 经 `evo_*` 全自助完成一轮"propose→smoke→experiment→promote"且改锁定字段被拒 |
+| E5 权重导出（可选） | 双管线导出器（SFT 有损压缩管线 + RL token 管线契约预留，§4.3e H5）+ 质量过滤（H13）+ gemma 窄任务微调实验；OPD 稠密蒸馏为可选深化 | 意图识别任务上微调模型 ≥ 原 SimpleComplete 准确率且延迟/成本下降 |
+
+**风险**：① reward hacking——cost shaping+多源加权+对抗审计三重防线；② 学习成本失控——学习 LLM 花费单列预算（BudgetManager 拦截器），默认 ≤ 总花费 10%；③ 经验库污染放大（interviewforge 式"短产物被丢/字段置空"类蒸馏事故）——蒸馏输出走严格 schema 校验+信息量下限（现 `llmDistill` 严格 JSON 基础上加长度/结构断言）；④ 隐私——Span 正文含用户数据，Blob 桶加 TTL 与脱敏钩子，导出器默认排除会话域数据。
