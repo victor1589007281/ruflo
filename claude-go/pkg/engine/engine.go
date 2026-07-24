@@ -30,6 +30,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/memory"
@@ -76,6 +77,7 @@ type QueryEngine struct {
 	JSONRepair    *internal_hook.JSONRepair         // G5 工具输入 JSON 修复
 	TrajStore     internal_hook.TrajectoryStore // G6 轨迹记忆
 	StopDet       *internal_hook.StopSignalDetector // G7 CaRT 停止信号
+	TraceStore    *tracestore.Store                 // design/03 §4.1 E1: 轨迹底座 (可选, nil 则不采集)
 
 	// TaskInstruction 动态任务指令，追加到 system prompt 末尾（而非 user message）。
 	// 用于 Agent Team 场景：将 20K 任务描述从 msg[0] 移到 system prompt，
@@ -346,6 +348,12 @@ func (e *QueryEngine) registerInternalHooks() {
 
 	// PhasePostTurn: TurnMetrics(10)
 	e.HookChain.Register(internal_hook.NewTurnMetricsHook(e.Metrics, e.SessionStore, e.TrajStore))
+
+	// PhasePostToolUse + PhasePostTurn: TraceCapture (design/03 §4.1 E1)。
+	// 仿 MemoryInjectHook 守卫: 仅 TraceStore 非 nil 才采集。
+	if e.TraceStore != nil {
+		e.HookChain.Register(internal_hook.NewTraceCaptureHook(e.TraceStore))
+	}
 }
 
 // firePhasePostTurn 触发 PhasePostTurn 内置 hooks（TurnMetricsHook）。

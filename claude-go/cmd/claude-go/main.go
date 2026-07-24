@@ -40,6 +40,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dashboard"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/engine"
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/llmgw"
@@ -53,6 +54,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/session"
 	"github.com/anthropic/claude-go/pkg/settings"
 	"github.com/anthropic/claude-go/pkg/skills"
+	"github.com/anthropic/claude-go/pkg/statestore"
 	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
@@ -2686,6 +2688,10 @@ func buildEngine() (*engine.QueryEngine, error) {
 	compactor.SetPreCompactFn(func(facts []string, source string) {
 		ingestor.IngestFacts(facts, source)
 	})
+
+	// TraceStore 轨迹底座 (design/03 §4.1 E1): 落 <state>/statestore/, 采集 turn/tool_call Span。
+	ss := statestore.NewFileStore(filepath.Join(stateDir, "statestore"))
+	eng.TraceStore = tracestore.New(ss)
 
 	return eng, nil
 }

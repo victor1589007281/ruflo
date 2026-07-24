@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,11 +15,13 @@ import (
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/engine"
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/skills"
+	"github.com/anthropic/claude-go/pkg/statestore"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -117,6 +120,7 @@ type SessionManager struct {
 	hookConfigs     []types.HookConfig
 	taskStore       *builtin.TaskStore           // 共享 V2 Task 存储 (Teams + LLM 工具共用)
 	evolution       *agent.EvolutionEngine       // 进化引擎 (注入 agent runner hooks)
+	traceStore      *tracestore.Store            // design/03 §4.1 E1: 共享轨迹底座 (注入各 stage 隔离引擎)
 	roleRegistry    *agent.RoleRegistry          // 角色注册表
 	mediaSendFn     MediaSendFunc                // 飞书发送图片/文件的回调
 	teamMgr         *agent.ProductionTeamManager // 团队管理器 (供 TeamQuery 工具使用)
@@ -155,6 +159,14 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 		taskStore:      taskStore,
 		evolution:      evolution,
 		roleRegistry:   roleRegistry,
+	}
+
+	// TraceStore 轨迹底座 (design/03 §4.1 E1): 各 stage 隔离引擎共享一个 Store,
+	// 落 <state>/statestore/。stateDir 从 config.Cwd 推导 (与 basedir 约定一致)。
+	if stateDir := strings.TrimSpace(config.StateDir); stateDir != "" {
+		sm.traceStore = tracestore.New(statestore.NewFileStore(filepath.Join(stateDir, "statestore")))
+	} else if config.Cwd != "" {
+		sm.traceStore = tracestore.New(statestore.NewFileStore(filepath.Join(config.Cwd, ".claude-go", "statestore")))
 	}
 
 	// 启动后台清理 goroutine
@@ -509,6 +521,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 
 	eng := engine.NewQueryEngine(cfg, sm.apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = sm.memoryStore
+	eng.TraceStore = sm.traceStore // design/03 §4.1 E1
 	if sm.config.EnableFrontierOptimizations {
 		eng.EnableFrontierOptimizations()
 	}
@@ -931,6 +944,7 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 
 	eng := engine.NewQueryEngine(cfg, apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = r.sm.memoryStore
+	eng.TraceStore = r.sm.traceStore // design/03 §4.1 E1: team stage 轨迹采集
 	// 将任务描述从 user message 移到 system prompt 末尾，避免 msg[0] 膨胀
 	// 同时让 system prompt 前缀享受 prompt caching。
 	eng.TaskInstruction = userPrompt
