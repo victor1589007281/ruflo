@@ -53,9 +53,13 @@
 - ✅ V3 K8s 分布式模式：control+2worker+gateway 四组件 Running；worker 注册可见；任务 control→worker→control 完整链路；gateway healthz+provider 路由 OK
 - ✅ V4 功能覆盖确认：三份设计文档各含覆盖矩阵逐项映射（编排30+工作流/15mode/三hook、接入全端点、学习全能力）；新架构全部等价或增强，无丢项
 - ✅ V5 真实 LLM E2E（真 kimi, mini-graph 图工作流 2 节点 completed）：图引擎 ready-set 调度 + journal 8 事件溯源 + TraceStore 2spans/3blobs 内容寻址 + rewards.jsonl episode 奖励 trace 关联 + evolution 2 trajectories（**开环1 headless 学习实证修复**）
-- 🟨 V6 docforge 技术文档更新（进行中）
-- 🟨 V7 testforge 沉淀回归测试资产（进行中）
-- 🟨 V8 全部仓库提交推远程（claude-go 已多次提交，待 push）
+- ✅ V6 docforge 技术文档更新：新增第13章下一代架构演进（13.1图引擎/13.2分层分布式/13.3RL进化）+ 修正第5章学习开环已修复；import created=4 updated=43，已推 gitee
+- ✅ V7 testforge 沉淀回归资产：regression/ 独立嵌套模块 8 测试；注册 testforge 项目「claude-go 下一代架构回归」+ repo SUT + gotest asset，首跑 8/8 pass gate 100%
+- ✅ V8 全部仓库推远程：claude-go→github vdocs（10+ commit）、docforge→gitee master、testforge 无代码变更（资产在 DB+claude-go repo）
+
+## 最终状态（2026-07-24）
+P0-P4 核心阶段全部实现并测试通过；K8s 单体+分布式双模式实测；真实 LLM E2E 打通全新栈（图引擎+trace+奖励+进化）；docforge/testforge 已沉淀；全部推远程。
+**P5（离线回放 harness + evo_* 进化操作台）属 design/03 E3/E4 后续里程碑**（design 自身标注为"持续"演进），已在设计文档 §4.5/§4.7 完整规格化，作为下一轮前向工作；本轮聚焦 P0-P4 可落地内核 + 端到端验证。
 
 ## 偏差记录
 （设计与实现的偏差在此登记，并回写对应设计文档）
