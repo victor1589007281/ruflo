@@ -20,7 +20,7 @@ spec:
         - name: gateway
           image: localhost:5000/claude-go:latest
           imagePullPolicy: IfNotPresent
-          args: ["llm-gateway", "--addr", "0.0.0.0:18081"]
+          args: ["llm-gateway", "--addr", "0.0.0.0:18081", "--config", "/etc/claude-go/config.json"]
           env:
             - name: KIMI_API_KEY
               valueFrom:

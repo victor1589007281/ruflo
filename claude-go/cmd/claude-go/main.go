@@ -37,6 +37,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/backup"
 	"github.com/anthropic/claude-go/pkg/basedir"
+	"github.com/anthropic/claude-go/pkg/cluster"
 	"github.com/anthropic/claude-go/pkg/codeintel"
 	"github.com/anthropic/claude-go/pkg/commands"
 	"github.com/anthropic/claude-go/pkg/compact"
@@ -259,6 +260,7 @@ func main() {
 	rootCmd.AddCommand(rolesCmd())
 	rootCmd.AddCommand(dashboardCmd())
 	rootCmd.AddCommand(llmGatewayCmd())
+	rootCmd.AddCommand(workerCmd())
 	rootCmd.AddCommand(backupCmd())
 	rootCmd.AddCommand(sandboxCmd())
 	rootCmd.AddCommand(teamCmd())
@@ -913,6 +915,7 @@ func feishuCmd() *cobra.Command {
 		configPath     string
 		httpPort       int // serve 模式的 HTTP 端口 (覆盖 wiki.apiPort); 支持 --addr host:port 形式
 		addr           string
+		dispatchMode   string // "" | "queue" (分布式控制面: 挂 cluster 任务队列端点)
 	)
 
 	cmd := &cobra.Command{
@@ -1170,6 +1173,20 @@ JSON 配置文件示例:
 				}
 				dashCfgRef = &dashCfg
 
+				// 分布式控制面 (design/02 §3.2): --dispatch-mode queue 时挂 cluster 端点,
+				// 暴露任务队列 + worker 注册表, 供 worker 拉取执行。
+				if dispatchMode == "queue" {
+					stateDir := basedir.ResolveDefault(config.StateDir, config.Cwd)
+					ss := statestore.NewFileStore(filepath.Join(stateDir, "statestore"))
+					clusterQueue := cluster.NewQueue(ss, 5*time.Minute)
+					clusterReg := cluster.NewRegistry(ss, 90*time.Second)
+					config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
+						func(mux *http.ServeMux) {
+							cluster.Mount(mux, clusterQueue, clusterReg)
+							fmt.Printf("[Cluster] 分布式控制面已挂载 (/cluster/*), 任务队列就绪\n")
+						})
+				}
+
 				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 					func(mux *http.ServeMux) {
 						dsrv := dashboard.MountOn(*dashCfgRef, mux)
@@ -1240,6 +1257,7 @@ JSON 配置文件示例:
 	cmd.Flags().StringVar(&cwd, "cwd", "", "工作目录 (默认当前目录)")
 	cmd.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (包含 feishu/ai/mcpServers/hooks 等)")
 	cmd.Flags().IntVar(&httpPort, "http-port", 0, "serve 模式 HTTP 端口 (覆盖 wiki.apiPort; 默认 18080)")
+	cmd.Flags().StringVar(&dispatchMode, "dispatch-mode", "", "分布式控制面模式: queue (挂 /cluster/* 任务队列端点)")
 	cmd.Flags().StringVar(&addr, "addr", "", "serve 模式监听地址 host:port (等价 --http-port, 便于 K8s 声明)")
 
 	return cmd
@@ -1391,6 +1409,111 @@ func rolesCmd() *cobra.Command {
 }
 
 // dashboardCmd 拉起本地只读可视化 dashboard (支持 run/start/stop/status/open)。
+// workerCmd 分布式 worker (design/02 §3.3 L3): 连接控制面, 心跳注册, 拉取任务执行回报。
+// v1 执行 "stage" 类任务: payload 为图节点描述, 经本地 agent 运行时执行 (无 LLM 凭证时
+// 回报占位结果, 证明任务分发链路)。真实分布式执行需 worker 侧完整引擎装配 (R3 后续)。
+func workerCmd() *cobra.Command {
+	var (
+		control    string
+		workerName string
+		caps       []string
+		pollMs     int
+	)
+	cmd := &cobra.Command{
+		Use:   "worker",
+		Short: "分布式 worker: 连接控制面拉取任务执行 (design/02 §3.3)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if control == "" {
+				control = os.Getenv("CLAUDE_GO_CONTROL")
+			}
+			if control == "" {
+				return fmt.Errorf("需要控制面地址: --control 或 CLAUDE_GO_CONTROL")
+			}
+			if workerName == "" {
+				workerName = os.Getenv("POD_NAME")
+			}
+			if workerName == "" {
+				host, _ := os.Hostname()
+				workerName = "worker-" + host
+			}
+			if pollMs <= 0 {
+				pollMs = 1000
+			}
+			client := cluster.NewClient(control, workerName)
+			kinds := []string{"stage"}
+			log.Printf("[worker] %s 连接控制面 %s, caps=%v", workerName, control, caps)
+
+			ctx := cmd.Context()
+			// 心跳 goroutine (每 30s)
+			go func() {
+				t := time.NewTicker(30 * time.Second)
+				defer t.Stop()
+				_ = client.Heartbeat(caps, kinds) // 立即注册一次
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						if err := client.Heartbeat(caps, kinds); err != nil {
+							log.Printf("[worker] 心跳失败: %v", err)
+						}
+					}
+				}
+			}()
+
+			// 拉取-执行循环
+			poll := time.Duration(pollMs) * time.Millisecond
+			var done int
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+				task, err := client.Pull(kinds)
+				if err != nil {
+					log.Printf("[worker] 拉取失败: %v", err)
+					time.Sleep(poll)
+					continue
+				}
+				if task == nil {
+					time.Sleep(poll)
+					continue
+				}
+				log.Printf("[worker] 执行任务 %s (kind=%s run=%s node=%s)", task.ID, task.Kind, task.RunID, task.NodeID)
+				result, execErr := executeWorkerTask(task, workerName)
+				if execErr != nil {
+					_ = client.Fail(task.ID, execErr.Error())
+					log.Printf("[worker] 任务 %s 失败: %v", task.ID, execErr)
+				} else {
+					_ = client.Complete(task.ID, result)
+					done++
+					log.Printf("[worker] 任务 %s 完成 (累计 %d)", task.ID, done)
+				}
+			}
+		},
+	}
+	cmd.Flags().StringVar(&control, "control", "", "控制面基址 (如 http://claude-go-control:18080)")
+	cmd.Flags().StringVar(&workerName, "name", "", "worker 名 (默认 POD_NAME 或主机名)")
+	cmd.Flags().StringSliceVar(&caps, "caps", nil, "能力标签 (bash/browser/k8s-sandbox)")
+	cmd.Flags().IntVar(&pollMs, "poll-ms", 1000, "无任务时轮询间隔 (毫秒)")
+	return cmd
+}
+
+// executeWorkerTask 执行一个 stage 任务。v1 简化实现: 回显 payload + worker 标识,
+// 证明控制面→worker→控制面的任务分发链路。R3 后续接完整引擎做真实 agent 执行。
+func executeWorkerTask(task *cluster.Task, worker string) (json.RawMessage, error) {
+	out := map[string]any{
+		"worker":  worker,
+		"task_id": task.ID,
+		"run_id":  task.RunID,
+		"node_id": task.NodeID,
+		"echo":    json.RawMessage(task.Payload),
+		"status":  "completed",
+	}
+	return json.Marshal(out)
+}
+
 // llmGatewayCmd LLM 网关独立进程 (design/02 §3.1 R1, L1 层)。
 // 反向代理式: 按 model 路由 provider、注入鉴权、token 双边记账、access.jsonl。
 // 多副本/多平台共享同一网关 = 共享配额观测。

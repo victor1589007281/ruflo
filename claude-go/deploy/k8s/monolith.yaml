@@ -16,14 +16,17 @@ data:
   config.json: |
     {
       "stateDir": "/data/.claude-go",
+      "cwd": "/data",
       "providers": {
         "kimi": {
+          "name": "kimi",
           "baseUrl": "https://api.kimi.com/coding/v1",
-          "apiKeyEnv": "KIMI_API_KEY"
+          "apiKey": "PLACEHOLDER_OVERRIDE_VIA_ENV",
+          "models": { "kimi:k3": {} }
         }
       },
-      "ai": { "defaultModelAlias": "kimi:k3" },
-      "models": { "kimi:k3": { "provider": "kimi", "model": "k3", "contextWindow": 1048576 } }
+      "ai": { "modelAlias": "kimi:k3" },
+      "wiki": { "enabled": true, "apiPort": 18080 }
     }
 ---
 apiVersion: apps/v1
