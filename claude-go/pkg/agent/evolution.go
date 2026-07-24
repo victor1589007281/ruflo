@@ -101,6 +101,7 @@ type InjectionRecord struct {
 // Trajectory 执行轨迹。
 type Trajectory struct {
 	ID        string    `json:"id"`
+	RunID     string    `json:"runId,omitempty"` // trace 四元组 episode id (design/03 §4.1 E0), 与 llm.jsonl 的 RunID 可 join
 	TeamName  string    `json:"teamName"`
 	StageName string    `json:"stageName"`
 	Role      string    `json:"role"`

@@ -36,6 +36,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/tool"
+	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -723,6 +724,8 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			Role:             e.Config.Role,
 			PromptComponents: components,
 		})
+		// trace 四元组 TurnID (design/03 §4.1 E0): 本轮内的 LLM 调用(含重试)共享同一 TurnID。
+		apiCtx = trace.With(apiCtx, trace.IDs{TurnID: fmt.Sprintf("t%d", turnCount)})
 
 		apiCallStart := time.Now()
 		eventCh, errCh := e.APIClient.StreamMessage(apiCtx, apiMessages, systemPrompt, apiTools, e.Config.MaxTokens)

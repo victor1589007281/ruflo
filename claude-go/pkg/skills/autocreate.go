@@ -85,7 +85,9 @@ func (ac *AutoCreator) MaybeCreate(ctx context.Context, objective, approach, out
 		return "", nil
 	}
 
-	skillMD := fmt.Sprintf("---\nname: %s\ndescription: %s\nwhen_to_use: %s\ncreated_at: %s\nauto_generated: true\n---\n\n%s\n",
+	// status: shadow —— 自动提炼的技能默认处 shadow 态, 晋升 active 由进化门禁
+	// (配对轨迹审计, design/03 §4.3c) 裁决; 谱系字段供审计与回滚。
+	skillMD := fmt.Sprintf("---\nname: %s\ndescription: %s\nwhen_to_use: %s\ncreated_at: %s\nauto_generated: true\nstatus: shadow\n---\n\n%s\n",
 		result.Name, result.Description, result.WhenToUse, time.Now().Format(time.RFC3339), result.Content)
 
 	dir := filepath.Join(ac.SkillDir, result.Name)

@@ -765,6 +765,14 @@ func runCmd() *cobra.Command {
 						_ = registry
 					}
 				}
+				// 进化引擎: headless run 路径与飞书路径同构装配 (design/03 §1.2 开环1 修复)。
+				// 此前 CLI 团队路径不实例化 Evolution → workflow.go 全部学习分支被
+				// `we.evolution != nil` 守卫跳过, 下游平台流量零学习。
+				evoDir := filepath.Join(tasksStateDir, "evolution")
+				if tasksLayout != nil {
+					evoDir = tasksLayout.Evolution
+				}
+				evoEngine := agent.NewEvolutionEngine(evoDir, eng.APIClient)
 				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
 					BaseDir:            filepath.Join(tasksStateDir, "teams"),
 					Cwd:                cwd,
@@ -776,6 +784,9 @@ func runCmd() *cobra.Command {
 					TaskTracker:        dagAdapter,
 					Concurrency:        eng.APIClient.Guard,
 					PlanConfigResolver: modelResolver,
+					Evolution:          evoEngine,
+					Dreamer:            &cliDreamAdapter{dreamer: cliDreamer},
+					SkillCreator:       cliSkillCreator(tasksLayout, tasksStateDir, eng),
 				})
 
 				cmdCtx := &commands.CommandContext{
@@ -2253,6 +2264,46 @@ func applyRuntimeSandboxConfig(jsonCfg *feishu.JSONConfig, cwd string) {
 	sandbox.Configure(cfg)
 }
 
+// cliSkillCreator 为 headless run 团队路径构造技能自创建器 (design/03 §1.2 开环2)。
+// Registry 传 nil: CLI 是一次性进程, 无需热重载; 新技能落 <state>/skills/ 目录,
+// 下一次进程 LoadDefaults 时自然收录。
+func cliSkillCreator(layout *basedir.Layout, stateDir string, eng *engine.QueryEngine) agent.SkillAutoCreator {
+	if eng == nil || eng.APIClient == nil {
+		return nil
+	}
+	skillDir := filepath.Join(stateDir, "skills")
+	if layout != nil {
+		skillDir = layout.Skills
+	}
+	return skills.NewAutoCreator(skillDir, eng.APIClient, eng.APIClient.Model, nil)
+}
+
+// cliDreamer 暴露 buildEngine 装配的 Dreamer 给 run 团队路径复用, 使 headless
+// 团队完成后也触发 Dreaming 整理 (design/03 §1.2 开环3 修复)。
+// P0 过渡方案: P2 分层接口 (design/02 R0) 落地后由显式依赖注入取代。
+var cliDreamer *dreaming.Dreamer
+
+// cliDreamAdapter 适配 dreaming.Dreamer → agent.DreamRecorder (与 feishu.dreamAdapter 同构)。
+type cliDreamAdapter struct{ dreamer *dreaming.Dreamer }
+
+func (da *cliDreamAdapter) RecordSession(record agent.DreamSessionRecord) {
+	if da.dreamer == nil {
+		return
+	}
+	da.dreamer.RecordSession(dreaming.SessionRecord{
+		ChatID:  record.ChatID,
+		EndTime: record.EndTime,
+		Summary: record.Summary,
+	})
+}
+
+func (da *cliDreamAdapter) AfterQuery(ctx context.Context) {
+	if da.dreamer == nil {
+		return
+	}
+	da.dreamer.AfterQuery(ctx)
+}
+
 func buildEngine() (*engine.QueryEngine, error) {
 	cwd, _ := os.Getwd()
 
@@ -2546,6 +2597,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	dreamCfg.MemoryDir = filepath.Join(cwd, ".claude", "memory")
 	dreamer := dreaming.NewDreamer(dreamCfg, cwd)
 	dreamer.SetAPIClient(apiClient)
+	cliDreamer = dreamer // 供 run 团队路径接入 TeamManagerConfig.Dreamer (headless dreaming 触发)
 
 	// V3: 增强整合器
 	consolidator := dreaming.NewConsolidator(factStore, apiClient, nil)

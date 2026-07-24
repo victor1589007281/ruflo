@@ -464,6 +464,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	bot.modelRegistry = registry
 	bot.modelResolver = resolver
 
+	// 9b. 技能自动创建器 (提前到 teamMgr 之前构造, 供 SkillCreator 注入;
+	// 历史上在第 15 步构造导致 teamMgr 拿不到 —— design/03 §1.2 开环2)
+	bot.skillAuto = skills.NewAutoCreator(layout.Skills, aiClient, aiClient.Model, bot.skillReg)
+
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
 		BaseDir: layout.Teams,
@@ -487,6 +491,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		Roles:              roleReg,
 		PlanConfigResolver: planCfgResolver,
 		HookConfigs:        hookConfigs,
+		SkillCreator:       bot.skillAuto,
 	})
 
 	// 10-extra. 加载用户自定义动态工作流 (~/.claude-go/workflows/*.json), 启动即注册到进程内,
@@ -640,8 +645,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		log.Printf("[SwarmIntel] 群体智能引擎已初始化")
 	}
 
-	// 15. 初始化技能自动创建器 (Hermes-agent 特性吸收)
-	bot.skillAuto = skills.NewAutoCreator(layout.Skills, aiClient, aiClient.Model, bot.skillReg)
+	// 15. (技能自动创建器已提前到 9b 构造)
 
 	// 16. 启动配置热加载 (如果有配置文件)
 	if config.MCPConfigPath != "" {

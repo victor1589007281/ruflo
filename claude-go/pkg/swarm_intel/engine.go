@@ -133,12 +133,15 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	startTime := time.Now()
 	llmCallCount := 0
 
-	// M10: 分级超时预算 (默认 5 分钟总预算)
-	totalBudget := 5 * time.Minute
+	// M10: 分级超时预算 (默认 15 分钟总预算)
+	// 注: 曾为 5 分钟 → decompose 仅 30s, 在高延迟 LLM 后端(kimi)下单次调用即超时
+	// ("decompose: context deadline exceeded"), 无 ctx deadline 的团队调用路径必现。
+	totalBudget := 15 * time.Minute
 	if dl, ok := ctx.Deadline(); ok {
 		totalBudget = time.Until(dl)
 	}
 	tb := PredictBudget(totalBudget)
+	e.notify(chatID, fmt.Sprintf("⏱️ 预测总预算 %s (decompose %s)", totalBudget.Round(time.Second), (time.Duration(float64(totalBudget)*0.10)).Round(time.Second)))
 
 	e.notify(chatID, "🧠 群体智能引擎启动 (v2.2 — M10 工程可靠性增强)...")
 

@@ -42,6 +42,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/logging"
+	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -229,6 +230,7 @@ type ProductionTeamManager struct {
 	llm         LLMClient            // LLM 客户端 (蜂群分解)
 	evolution   *EvolutionEngine     // 自动进化引擎
 	dreamer     DreamRecorder        // Dreaming 接口 (覆盖 team agent 会话)
+	skillCreator SkillAutoCreator    // 技能自创建器 (团队干净成功后提炼 shadow 技能)
 	roles       *RoleRegistry        // 角色注册表
 	memWriter   MemoryWriter         // 记忆写入 (团队完成后写入高权重记忆)
 	metrics     *metrics.Collector   // 持续观测指标采集器
@@ -259,6 +261,43 @@ type TeamManagerConfig struct {
 	Concurrency        ConcurrencySuggestor
 	PlanConfigResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
 	HookConfigs        []types.HookConfig  // Hook 配置 (用于 TeammateIdle / TaskCompleted 等)
+	SkillCreator       SkillAutoCreator    // 技能自创建器 (可选; design/03 §1.2 开环2 接线)
+}
+
+// SkillAutoCreator 技能自创建接口 (实现者: skills.AutoCreator, duck typing 解耦包依赖)。
+// 历史缺陷: AutoCreator 仅在 feishu bot 被构造、全仓库零调用点 (design/03 §1.2 开环2);
+// 现由团队干净成功路径触发, 产物 frontmatter 带 status: shadow 供进化门禁裁决晋升。
+type SkillAutoCreator interface {
+	MaybeCreate(ctx context.Context, objective, approach, outcome string) (string, error)
+}
+
+// allStagesCompleted 判断全部阶段是否干净通过 (技能提炼触发条件)。
+func allStagesCompleted(results []StageResult) bool {
+	for _, r := range results {
+		if r.Status != TaskCompleted {
+			return false
+		}
+	}
+	return true
+}
+
+// summarizeStageApproach 把阶段序列压成"方法"描述, 供技能提炼 prompt 使用。
+func summarizeStageApproach(results []StageResult) string {
+	var b strings.Builder
+	for i, r := range results {
+		fmt.Fprintf(&b, "%d. [%s/%s] 产出 %d 字\n", i+1, r.Name, r.Role, len(r.Output))
+	}
+	return b.String()
+}
+
+// lastNonEmptyOutput 取最后一个非空阶段产出 (截断), 作为技能提炼的"结果"示例。
+func lastNonEmptyOutput(results []StageResult, maxLen int) string {
+	for i := len(results) - 1; i >= 0; i-- {
+		if out := strings.TrimSpace(results[i].Output); out != "" {
+			return truncateResult(out, maxLen)
+		}
+	}
+	return ""
 }
 
 // SetMemoryWriter 注入记忆写入器 (在 Bot 初始化后调用)。
@@ -300,6 +339,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		llm:             cfg.LLM,
 		evolution:       cfg.Evolution,
 		dreamer:         cfg.Dreamer,
+		skillCreator:    cfg.SkillCreator,
 		roles:           cfg.Roles,
 		metrics:         metrics.NewCollector(stateDir),
 		concurrency:     cfg.Concurrency,
@@ -601,6 +641,9 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	ctx = logging.WithTrace(ctx)
 	ctx, endSpan := logging.WithSpan(ctx, "team."+team.Name+".execute")
 	defer endSpan()
+	// trace 四元组 RunID (design/03 §4.1 E0): 复用 logging traceID 作后缀,
+	// llm.jsonl 的 RunID 可直接 join 结构化日志; 下游 stage/engine 逐层补 NodeID/TurnID。
+	ctx = trace.With(ctx, trace.IDs{RunID: fmt.Sprintf("run-%s-%s", team.Name, logging.TraceID(ctx))})
 	logging.Event(ctx, "team.start", "team", team.Name, "workflow", team.Workflow, "objective", team.Objective)
 	logging.IncrCounter("team.start." + team.Workflow)
 
@@ -790,6 +833,23 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 			ptm.evolution.Consolidate()
 			if mc != nil {
 				ptm.evolution.CollectMetrics(mc)
+			}
+		}()
+	}
+
+	// 技能自创建 (design/03 §1.2 开环2 接线): 仅全阶段通过的干净成功才尝试提炼,
+	// 是否值得由 LLM 自判 (AutoCreator 内含判据); 产物 frontmatter 带 status: shadow,
+	// 晋升裁决归进化门禁 (E3), 提炼失败静默不影响交付。
+	if ptm.skillCreator != nil && len(results) > 0 && allStagesCompleted(results) {
+		objective := team.Objective
+		chatID := team.ChatID
+		approach := summarizeStageApproach(results)
+		outcome := lastNonEmptyOutput(results, 2000)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if name, err := ptm.skillCreator.MaybeCreate(ctx, objective, approach, outcome); err == nil && name != "" {
+				ptm.notify(chatID, fmt.Sprintf("🧬 已自动提炼 shadow 技能: **%s** (待进化门禁验证晋升)", name))
 			}
 		}()
 	}

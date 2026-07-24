@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -87,6 +88,24 @@ type LLMCallRecord struct {
 	// PromptComponents 记录本次请求中各类提示词/上下文组件的字符数。
 	// 由 QueryEngine 在请求前计算, api.Client 只负责随 LLMCallRecord 透传。
 	PromptComponents PromptComponentMetrics
+
+	// Trace 四元组 (pkg/trace, design/03 §4.1 E0): 关联 llm.jsonl ↔ 团队轨迹 ↔ transcript,
+	// 修复"llm.jsonl 无 run/turn 关联键, 跨源只能按时间戳粗对齐"(design/03 §1.3)。
+	RunID  string // episode 级 (团队一次执行 / 会话任务); 上游未注入时为空
+	NodeID string // 图节点 / workflow stage 级
+	TurnID string // QueryEngine 单轮
+	CallID string // 单次 LLM HTTP 调用 (api.Client 生成, 恒非空)
+}
+
+// stampTraceIDs 把 trace 四元组盖到记录上; CallID 每条记录独立生成。
+func stampTraceIDs(rec *LLMCallRecord, ids trace.IDs) {
+	if rec == nil {
+		return
+	}
+	rec.RunID, rec.NodeID, rec.TurnID = ids.RunID, ids.NodeID, ids.TurnID
+	if rec.CallID == "" {
+		rec.CallID = trace.NewID("c")
+	}
 }
 
 // LLMMetricsHook 采集 LLM 调用指标的回调 (dashboard 在启动时注入, 避免循环依赖)。
@@ -618,6 +637,7 @@ func (c *Client) StreamMessage(
 			Request: "stream_messages",
 		}
 		applyLLMMetricsContext(&streamRec, callMeta)
+		stampTraceIDs(&streamRec, trace.From(ctx))
 		streamErrMsg := ""
 		streamRetries := 0
 		defer func() {
@@ -988,11 +1008,13 @@ func (c *Client) SendMessage(
 	maxTokens int,
 ) (*types.APIResponse, error) {
 	callMeta := llmMetricsFromContext(ctx)
+	traceIDs := trace.From(ctx)
 	var debug *promptDebugCapture
 	var debugRec LLMCallRecord
 	var debugErr string
 	emit := func(rec LLMCallRecord) {
 		applyLLMMetricsContext(&rec, callMeta)
+		stampTraceIDs(&rec, traceIDs)
 		debugRec = rec
 		c.emitLLMMetric(rec)
 	}

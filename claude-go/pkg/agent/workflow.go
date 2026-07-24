@@ -27,6 +27,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/observability"
+	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/sandbox"
 )
 
@@ -38,6 +39,56 @@ const maxWorkflowParallelDefault = 6
 
 // stageRetryMaxRetries 阶段级重试次数 (API 瞬态错误自动恢复)
 const stageRetryMaxRetries = 3
+
+// stageRateLimitMaxRetries 429 限流路径的硬上限 (design/01 §1.2-4 P0 止血):
+// 历史上限流分支 `continue` 无限循环, 仅靠上层 context/watchdog 兜底;
+// 现按每次 30-120s 退避 × 20 次 ≈ 最长 ~40min 的等待耐心, 超过即判失败交上层。
+const stageRateLimitMaxRetries = 20
+
+// outerRetryDrivenKey 标记"重试由 Coordinator 恢复路径驱动"的 context 键。
+// Coordinator.executeStageWithRetry(最多 maxRetries 次) 会经 ExecuteSingleStage
+// 进入本文件的 executeStageWithRetry(又 3 次 + 429 无限), 两层叠加把重试放大
+// (design/01 §1.2-4)。外层在 ctx 打标后, 内层退化为单次尝试(仅保留输出校验
+// 的快速修正重试), 消除乘法效应。
+type outerRetryDrivenKey struct{}
+
+// WithOuterRetryDriven 供 Coordinator 在恢复路径标记 ctx。
+func WithOuterRetryDriven(ctx context.Context) context.Context {
+	return context.WithValue(ctx, outerRetryDrivenKey{}, true)
+}
+
+func isOuterRetryDriven(ctx context.Context) bool {
+	v, _ := ctx.Value(outerRetryDrivenKey{}).(bool)
+	return v
+}
+
+// dedicatedExecutorModes 列出在 WorkflowExecutor.Execute 中拥有专用执行器、
+// 必须经 executor 分发的模式。Coordinator.RunWithRecovery 据此路由, 取代历史上
+// 与本文件 Execute switch 各自维护的第二张模式表——两表不同步曾导致
+// app_composite/game_composite 被静默降级为普通 pipeline 恢复路径
+// (design/01 §1.2-1)。新增专用模式时: 在 Execute 加 case + 本表加一行, 同文件
+// 相邻可见, 不再跨文件漂移。pipeline/fanout 故意不在表内——fanout 目前是
+// pipeline 的空壳转调, 走 Coordinator 的检查点恢复路径收益更大。
+var dedicatedExecutorModes = map[string]bool{
+	"adversarial":     true,
+	"adversarial_dev": true,
+	"orchestrated":    true,
+	"trading_debate":  true,
+	"creative_media":  true,
+	"novel_writing":   true,
+	"swarm_novel":     true,
+	"plot_simulate":   true,
+	"plot_predict":    true,
+	"ensemble_extract": true,
+	"review_panel":    true,
+	"app_composite":   true,
+	"game_composite":  true,
+}
+
+// ModeHasDedicatedExecutor 供 Coordinator 判断是否走 executor 专用分发。
+func ModeHasDedicatedExecutor(mode string) bool {
+	return dedicatedExecutorModes[mode]
+}
 
 // stageRetryBaseDelay 重试基础退避时间
 const stageRetryBaseDelay = 3 * time.Second
@@ -697,6 +748,9 @@ func readReferenceFileExcerpt(path string, maxChars int) string {
 
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
 	stageStart := time.Now()
+	// trace 四元组 NodeID = stage 名 (design/03 §4.1 E0): 本阶段内所有 LLM 调用
+	// 的 llm.jsonl 记录都可按 (RunID, NodeID) 聚合回本 stage。
+	ctx = trace.With(ctx, trace.IDs{NodeID: stage.Name})
 	traceCtx := observability.TraceFromContext(ctx)
 
 	observability.Emit(observability.Event{
@@ -811,6 +865,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	// 6. 记录执行轨迹 (RECORD) + 经验反馈 (EVOLVE) + 增量学习
 	if we.evolution != nil {
 		traj := Trajectory{
+			RunID:     trace.From(ctx).RunID,
 			TeamName:  team.Name,
 			StageName: stage.Name,
 			Role:      stage.Role,
@@ -885,6 +940,15 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage StageDef, prompt, objective string, team *ProductionTeam, injectedExpIDs []string) StageResult {
 	var lastErr StageResult
 	var rateLimitAttempt int // 限流专用重试计数器
+
+	// 外层(Coordinator 恢复路径)驱动时内层退化为单次尝试, 消除嵌套重试放大;
+	// 输出校验修正重试保留 1 次(便宜且针对性强), 限流耐心也大幅缩短(外层会再来)。
+	effMaxRetries := stageRetryMaxRetries
+	effRateLimitMax := stageRateLimitMaxRetries
+	if isOuterRetryDriven(ctx) {
+		effMaxRetries = 1
+		effRateLimitMax = 3
+	}
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
 			return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled"}
@@ -919,7 +983,7 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 					we.notify(we.chatID, fmt.Sprintf("🧭 阶段 **%s** 输出越界, 使用确定性 fallback: %s", stage.Name, validationErr))
 					return fallback
 				}
-				if attempt >= stageRetryMaxRetries {
+				if attempt >= effMaxRetries {
 					if fallback := deterministicPlannerFallbackStageResult(stage, objective, validationErr); fallback.Status == TaskCompleted {
 						we.notify(we.chatID, fmt.Sprintf("🧭 阶段 **%s** 多次越界, 使用通用 V1 纵切 fallback WBS", stage.Name))
 						return fallback
@@ -944,7 +1008,7 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 				we.notify(we.chatID, fmt.Sprintf("🧭 阶段 **%s** 输出形态错误, 使用确定性 fallback: %s", stage.Name, sr.Error))
 				return fallback
 			}
-			if attempt >= stageRetryMaxRetries {
+			if attempt >= effMaxRetries {
 				we.notify(we.chatID, fmt.Sprintf("❌ 阶段 **%s** 输出形态错误重试耗尽: %s", stage.Name, sr.Error))
 				return sr
 			}
@@ -968,8 +1032,18 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 
 		if isRateLimit {
 			rateLimitAttempt++
-			// 429 限流: 无限重试, 直到成功或 context 被取消
-			// 利用 RateLimitGuard 的全局退避机制自动等待
+			if rateLimitAttempt > effRateLimitMax {
+				we.notify(we.chatID, fmt.Sprintf(
+					"❌ 阶段 **%s** 限流重试达硬上限 (%d 次), 交由上层处理: %s",
+					stage.Name, effRateLimitMax, sr.Error))
+				return StageResult{
+					Role:   stage.Role,
+					Status: TaskFailed,
+					Error:  fmt.Sprintf("限流重试达硬上限 (%d): %s", effRateLimitMax, sr.Error),
+				}
+			}
+			// 429 限流: 有限耐心重试 (硬上限 effRateLimitMax), 等待期间
+			// 利用 RateLimitGuard 的全局退避机制自动冷却
 			delay := computeRetryDelay(min(rateLimitAttempt-1, 5), true) // 最多用第 5 档退避
 			// 限流时增加固定等待, 让 RateLimitGuard 冷却
 			if delay < 30*time.Second {
@@ -986,11 +1060,11 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 			case <-ctx.Done():
 				return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled during retry"}
 			}
-			continue // 无限循环, 不限次数
+			continue // 限流重试不计入普通 attempt 上限, 但受 effRateLimitMax 硬上限约束
 		}
 
 		// 非限流瞬态错误: 有限重试
-		if attempt >= stageRetryMaxRetries {
+		if attempt >= effMaxRetries {
 			break
 		}
 
@@ -1009,7 +1083,7 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 	return StageResult{
 		Role:   stage.Role,
 		Status: TaskFailed,
-		Error:  fmt.Sprintf("超过最大重试次数 (%d): %s", stageRetryMaxRetries, lastErr.Error),
+		Error:  fmt.Sprintf("超过最大重试次数 (%d): %s", effMaxRetries, lastErr.Error),
 	}
 }
 

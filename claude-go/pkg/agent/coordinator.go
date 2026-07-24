@@ -192,32 +192,14 @@ func (c *Coordinator) RunWithRecovery(
 	go c.heartbeatLoop(hbCtx, team)
 	go c.teamWatchdog(hbCtx, team)
 
-	switch wf.Mode {
-	case "adversarial":
+	// 路由单一真源: 与 WorkflowExecutor.Execute 的模式表共享 (dedicatedExecutorModes)。
+	// 历史缺陷: 此处曾手抄一份 case 列表, 与 executor 的 switch 漂移, 导致
+	// app_composite/game_composite 落 default 被静默降级为普通 pipeline 恢复,
+	// 专用跨团队编排器永不触发 (design/01 §1.2-1)。
+	if ModeHasDedicatedExecutor(wf.Mode) {
 		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "adversarial_dev":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "orchestrated":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "trading_debate":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "creative_media":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "novel_writing":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "swarm_novel":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "plot_simulate":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "plot_predict":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "ensemble_extract":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	case "review_panel":
-		return c.executeWithWatchdog(ctx, wf, objective, team, executor)
-	default:
-		return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 	}
+	return c.runPipelineWithRecovery(ctx, wf, objective, team, executor)
 }
 
 // executeWithWatchdog 带超时保护的工作流执行 (adversarial 等非 pipeline 模式)。
@@ -538,7 +520,10 @@ func (c *Coordinator) executeStageWithRetry(
 			stageTimeoutForRole = executor.computeStageTimeout(stage.Role, attempt)
 		}
 		stageCtx, stageCancel := context.WithTimeout(ctx, stageTimeoutForRole)
-		sr := executor.ExecuteSingleStage(stageCtx, stage, objective, prevResults, team)
+		// 标记外层重试驱动: 内层 WorkflowExecutor.executeStageWithRetry 见此标记
+		// 退化为单次尝试, 消除 Coordinator(maxRetries) × 内层(3+限流) 的嵌套放大
+		// (design/01 §1.2-4)。
+		sr := executor.ExecuteSingleStage(WithOuterRetryDriven(stageCtx), stage, objective, prevResults, team)
 		stageCancel()
 
 		if sr.Status == TaskCompleted {
