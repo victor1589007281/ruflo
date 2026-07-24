@@ -20,11 +20,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -908,6 +911,8 @@ func feishuCmd() *cobra.Command {
 		mentionOnly    bool
 		cwd            string
 		configPath     string
+		httpPort       int // serve 模式的 HTTP 端口 (覆盖 wiki.apiPort); 支持 --addr host:port 形式
+		addr           string
 	)
 
 	cmd := &cobra.Command{
@@ -1016,6 +1021,27 @@ JSON 配置文件示例:
 			if cmd.CalledAs() == "serve" {
 				config.Headless = true
 			}
+
+			// --addr host:port / --http-port: 覆盖 wiki.apiPort (serve 模式 HTTP 端口)。
+			// 默认 18080 (K8s 单体/分布式部署经此暴露服务)。
+			if addr != "" {
+				if _, portStr, err := net.SplitHostPort(addr); err == nil {
+					if p, perr := strconv.Atoi(portStr); perr == nil {
+						httpPort = p
+					}
+				}
+			}
+			if config.Headless {
+				if httpPort == 0 && config.Wiki.APIPort == 0 {
+					httpPort = 18080 // headless 默认端口
+				}
+				if httpPort > 0 {
+					config.Wiki.APIPort = httpPort
+					config.Wiki.Enabled = true
+				}
+			} else if httpPort > 0 {
+				config.Wiki.APIPort = httpPort
+			}
 			if !config.Headless && (config.AppID == "" || config.AppSecret == "") {
 				return fmt.Errorf("需要飞书应用凭证: 使用 --app-id/--app-secret 或 --config 或设置 FEISHU_APP_ID/FEISHU_APP_SECRET (headless 部署请用 serve 子命令)")
 			}
@@ -1027,35 +1053,48 @@ JSON 配置文件示例:
 			// 如果 JSON 配置中已有 providers，优先使用
 			// 否则从 CLI 参数/环境变量构建合成 provider
 			if len(config.Providers) == 0 {
-				if apiKey == "" {
-					return fmt.Errorf("需要 AI API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数，或在配置文件中设置 providers")
-				}
-				if baseURL == "" {
-					baseURL = "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1"
-				}
-				// 推断 provider 名称
-				providerName := "compatible"
-				lb := strings.ToLower(baseURL)
-				switch {
-				case strings.Contains(lb, "dashscope") || strings.Contains(lb, "aliyuncs.com"):
-					providerName = "dashscope"
-				case strings.Contains(lb, "anthropic.com"):
-					providerName = "anthropic"
-				case strings.Contains(lb, "openai.com"):
-					providerName = "openai"
-				}
-				// 构建合成 provider
-				config.Providers = map[string]feishu.ProviderConfig{
-					providerName: {
-						Name:    providerName,
-						BaseURL: baseURL,
-						APIKey:  apiKey,
-						Models: map[string]feishu.ProviderModelConfig{
-							providerName + ":" + modelAlias: {},
+				if apiKey == "" && config.Headless {
+					// headless HTTP-only 部署 (design/02 §四): 无 LLM 凭证时合成占位 provider,
+					// 让 :18080 wiki/dashboard/teams 全栈仍可启动 (LLM 调用会失败但 HTTP 端点可用)。
+					// 真实 LLM E2E 经 --config 或环境变量提供真凭证。
+					config.Providers = map[string]feishu.ProviderConfig{
+						"placeholder": {
+							Name: "placeholder", BaseURL: "http://127.0.0.1:1", APIKey: "placeholder",
+							Models: map[string]feishu.ProviderModelConfig{"placeholder:noop": {}},
 						},
-					},
+					}
+					config.ModelAlias = "placeholder:noop"
+					log.Printf("[serve] 未配置 LLM 凭证, 使用占位 provider (HTTP 栈可用, LLM 调用不可用)")
+				} else if apiKey == "" {
+					return fmt.Errorf("需要 AI API Key: 设置 ANTHROPIC_API_KEY 环境变量、--api-key 参数，或在配置文件中设置 providers")
+				} else {
+					if baseURL == "" {
+						baseURL = "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1"
+					}
+					// 推断 provider 名称
+					providerName := "compatible"
+					lb := strings.ToLower(baseURL)
+					switch {
+					case strings.Contains(lb, "dashscope") || strings.Contains(lb, "aliyuncs.com"):
+						providerName = "dashscope"
+					case strings.Contains(lb, "anthropic.com"):
+						providerName = "anthropic"
+					case strings.Contains(lb, "openai.com"):
+						providerName = "openai"
+					}
+					// 构建合成 provider
+					config.Providers = map[string]feishu.ProviderConfig{
+						providerName: {
+							Name:    providerName,
+							BaseURL: baseURL,
+							APIKey:  apiKey,
+							Models: map[string]feishu.ProviderModelConfig{
+								providerName + ":" + modelAlias: {},
+							},
+						},
+					}
+					config.ModelAlias = providerName + ":" + modelAlias
 				}
-				config.ModelAlias = providerName + ":" + modelAlias
 			} else {
 				// 有 providers 配置时，若 CLI 指定了 model，覆盖 ModelAlias
 				if cmd.Flags().Changed("model") {
@@ -1200,6 +1239,8 @@ JSON 配置文件示例:
 	cmd.Flags().BoolVar(&mentionOnly, "mention-only", true, "群聊中仅响应 @机器人 的消息")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "工作目录 (默认当前目录)")
 	cmd.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (包含 feishu/ai/mcpServers/hooks 等)")
+	cmd.Flags().IntVar(&httpPort, "http-port", 0, "serve 模式 HTTP 端口 (覆盖 wiki.apiPort; 默认 18080)")
+	cmd.Flags().StringVar(&addr, "addr", "", "serve 模式监听地址 host:port (等价 --http-port, 便于 K8s 声明)")
 
 	return cmd
 }

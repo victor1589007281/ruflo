@@ -42,6 +42,7 @@ spec:
       containers:
         - name: claude-go
           image: localhost:5000/claude-go:latest
+          imagePullPolicy: IfNotPresent
           args: ["serve", "--addr", "0.0.0.0:18080"]
           env:
             - name: KIMI_API_KEY

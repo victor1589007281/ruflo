@@ -19,6 +19,7 @@ spec:
       containers:
         - name: gateway
           image: localhost:5000/claude-go:latest
+          imagePullPolicy: IfNotPresent
           args: ["llm-gateway", "--addr", "0.0.0.0:18081"]
           env:
             - name: KIMI_API_KEY
@@ -60,6 +61,7 @@ spec:
       containers:
         - name: control
           image: localhost:5000/claude-go:latest
+          imagePullPolicy: IfNotPresent
           args: ["serve", "--addr", "0.0.0.0:18080", "--dispatch-mode", "queue"]
           env:
             - name: CLAUDE_GO_LLM_GATEWAY
@@ -106,6 +108,7 @@ spec:
       containers:
         - name: worker
           image: localhost:5000/claude-go:latest
+          imagePullPolicy: IfNotPresent
           args: ["worker", "--control", "http://claude-go-control:18080"]
           env:
             - name: CLAUDE_GO_LLM_GATEWAY

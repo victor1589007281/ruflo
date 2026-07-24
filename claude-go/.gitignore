@@ -4,3 +4,4 @@ claude-go-bin
 *.dll
 *.so
 *.dylib
+deploy/claude-go-linux
