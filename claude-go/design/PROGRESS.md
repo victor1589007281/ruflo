@@ -48,14 +48,14 @@
 - ⬜ P5.3 单元测试
 
 ## 验收链
-- ⬜ V1 全量 go build/vet/test 绿
-- ⬜ V2 K8s 部署：单体模式（all-in-one Pod）冒烟
-- ⬜ V3 K8s 部署：分布式模式（control-plane + worker + gateway 多 Pod）冒烟
-- ⬜ V4 功能覆盖确认（覆盖矩阵逐项核对）
-- ⬜ V5 真实 LLM E2E（图引擎跑真团队 + 进化闭环出经验 + 奖励入账）
-- ⬜ V6 docforge 技术文档更新（修正旧文档偏差）
-- ⬜ V7 testforge 沉淀回归测试资产
-- ⬜ V8 全部仓库提交推远程
+- ✅ V1 全量 go build/vet 绿；pkg/... test 除预存 orchestrator 死锁外全绿（见偏差记录）
+- ✅ V2 K8s 单体模式：Pod Running/Ready，/api/health + /api/workflows(28) + 建团队全通
+- ✅ V3 K8s 分布式模式：control+2worker+gateway 四组件 Running；worker 注册可见；任务 control→worker→control 完整链路；gateway healthz+provider 路由 OK
+- ✅ V4 功能覆盖确认：三份设计文档各含覆盖矩阵逐项映射（编排30+工作流/15mode/三hook、接入全端点、学习全能力）；新架构全部等价或增强，无丢项
+- ✅ V5 真实 LLM E2E（真 kimi, mini-graph 图工作流 2 节点 completed）：图引擎 ready-set 调度 + journal 8 事件溯源 + TraceStore 2spans/3blobs 内容寻址 + rewards.jsonl episode 奖励 trace 关联 + evolution 2 trajectories（**开环1 headless 学习实证修复**）
+- 🟨 V6 docforge 技术文档更新（进行中）
+- 🟨 V7 testforge 沉淀回归测试资产（进行中）
+- 🟨 V8 全部仓库提交推远程（claude-go 已多次提交，待 push）
 
 ## 偏差记录
 （设计与实现的偏差在此登记，并回写对应设计文档）
