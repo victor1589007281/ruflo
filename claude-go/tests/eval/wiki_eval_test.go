@@ -529,6 +529,9 @@ func (m *mockCronExecutor) RunCommand(_ context.Context, _, _ string) error { re
 func (m *mockCronExecutor) Notify(_, _ string) {}
 func (m *mockCronExecutor) WikiOrganize(_ context.Context, _ string) (string, error) { return "", nil }
 func (m *mockCronExecutor) WikiHealthCheck(_ context.Context) (string, error) { return "", nil }
+func (m *mockCronExecutor) TriggerSync(_ context.Context, _ string) (string, error) {
+	return "sync ok", nil
+}
 func (m *mockCronExecutor) WikiLint(_ context.Context) (string, error) { return "", nil }
 
 // --- 10. Schema 设计 ---

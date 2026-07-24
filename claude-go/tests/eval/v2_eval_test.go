@@ -568,6 +568,9 @@ func (m *mockBrowserFetcher) Available() bool { return true }
 func (m *mockBrowserFetcher) Fetch(_ context.Context, _ string) (string, string, string, error) {
 	return m.title, m.text, "<html>" + m.text + "</html>", nil
 }
+func (m *mockBrowserFetcher) Search(_ context.Context, _ string) (string, string, string, error) {
+	return m.title, m.text, "<html>" + m.text + "</html>", nil
+}
 
 // --- 8. MediaNotify 回调 ---
 
