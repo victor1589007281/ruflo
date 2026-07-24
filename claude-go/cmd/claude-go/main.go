@@ -42,7 +42,9 @@ import (
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
+	"github.com/anthropic/claude-go/pkg/llmgw"
 	"github.com/anthropic/claude-go/pkg/mcp"
+	"github.com/anthropic/claude-go/pkg/media"
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/permissions"
@@ -54,7 +56,6 @@ import (
 	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
-	"github.com/anthropic/claude-go/pkg/media"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/spf13/cobra"
 )
@@ -252,6 +253,7 @@ func main() {
 	rootCmd.AddCommand(skillsCmd())
 	rootCmd.AddCommand(rolesCmd())
 	rootCmd.AddCommand(dashboardCmd())
+	rootCmd.AddCommand(llmGatewayCmd())
 	rootCmd.AddCommand(backupCmd())
 	rootCmd.AddCommand(sandboxCmd())
 	rootCmd.AddCommand(teamCmd())
@@ -1346,6 +1348,70 @@ func rolesCmd() *cobra.Command {
 }
 
 // dashboardCmd 拉起本地只读可视化 dashboard (支持 run/start/stop/status/open)。
+// llmGatewayCmd LLM 网关独立进程 (design/02 §3.1 R1, L1 层)。
+// 反向代理式: 按 model 路由 provider、注入鉴权、token 双边记账、access.jsonl。
+// 多副本/多平台共享同一网关 = 共享配额观测。
+func llmGatewayCmd() *cobra.Command {
+	var (
+		gwAddr       string
+		gwConfigPath string
+	)
+	cmd := &cobra.Command{
+		Use:   "llm-gateway",
+		Short: "LLM 网关独立进程 (provider 路由/鉴权注入/token 双边记账)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if gwConfigPath == "" {
+				gwConfigPath = flagConfig
+			}
+			botCfg := feishu.DefaultBotConfig()
+			jsonCfg, err := feishu.LoadJSONConfig(gwConfigPath)
+			if err != nil {
+				return fmt.Errorf("加载配置失败: %w", err)
+			}
+			if jsonCfg != nil {
+				jsonCfg.ApplyToBot(botCfg)
+			}
+			if len(botCfg.Providers) == 0 {
+				return fmt.Errorf("配置中无 providers, 网关无路由可用 (--config 指定含 providers 的配置)")
+			}
+			var routes []llmgw.Route
+			for name, p := range botCfg.Providers {
+				rt := llmgw.Route{Provider: name, BaseURL: p.BaseURL, APIKey: p.APIKey}
+				// 环境变量覆盖 key (K8s Secret 注入形态): <PROVIDER>_API_KEY
+				if env := os.Getenv(strings.ToUpper(name) + "_API_KEY"); env != "" {
+					rt.APIKey = env
+				}
+				for alias := range p.Models {
+					// 别名 "provider:model" → 裸模型名入路由表
+					if i := strings.IndexByte(alias, ':'); i >= 0 {
+						rt.Models = append(rt.Models, alias[i+1:])
+					} else {
+						rt.Models = append(rt.Models, alias)
+					}
+				}
+				routes = append(routes, rt)
+			}
+			defaultProvider := ""
+			if i := strings.IndexByte(botCfg.ModelAlias, ':'); i > 0 {
+				defaultProvider = botCfg.ModelAlias[:i]
+			}
+			gwStateDir := basedir.ResolveDefault("", ".")
+			if jsonCfg != nil && jsonCfg.StateDir != "" {
+				gwStateDir = jsonCfg.StateDir
+			}
+			srv, err := llmgw.NewServer(routes, defaultProvider, filepath.Join(gwStateDir, "llm-gateway"))
+			if err != nil {
+				return err
+			}
+			fmt.Printf("[llm-gateway] 监听 %s | providers=%d 默认=%s\n", gwAddr, len(routes), defaultProvider)
+			return http.ListenAndServe(gwAddr, srv.Handler())
+		},
+	}
+	cmd.Flags().StringVar(&gwAddr, "addr", "127.0.0.1:18081", "监听地址")
+	cmd.Flags().StringVar(&gwConfigPath, "config", "", "JSON 配置文件 (含 providers)")
+	return cmd
+}
+
 func dashboardCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "dashboard",
