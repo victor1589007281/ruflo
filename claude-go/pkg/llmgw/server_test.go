@@ -9,7 +9,31 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// readFirstRecord 轮询读取 access.jsonl 首条记录。流式路径下, 客户端 ReadAll
+// 返回与服务端 writeLog 之间在重负载下存在时序窗口, 轮询消除测试脆弱性。
+func readFirstRecord(t *testing.T, path string) AccessRecord {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			line := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]
+			if line != "" {
+				var rec AccessRecord
+				if json.Unmarshal([]byte(line), &rec) == nil && rec.TS != 0 {
+					return rec
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("access.jsonl 未在超时内写入有效记录: %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // 假上游: 记录收到的鉴权头与模型名, 按路径返回非流式/流式响应。
 func fakeUpstream(t *testing.T, sawAuth *string, sawModel *string) *httptest.Server {
@@ -79,14 +103,7 @@ func TestGatewayNonStreamRoutingAuthAndAccounting(t *testing.T) {
 	}
 
 	// access.jsonl 记账: 双边 token 均非零
-	data, err := os.ReadFile(filepath.Join(dir, "access.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var rec AccessRecord
-	if err := json.Unmarshal([]byte(strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]), &rec); err != nil {
-		t.Fatal(err)
-	}
+	rec := readFirstRecord(t, filepath.Join(dir, "access.jsonl"))
 	if rec.InputTokens != 5 || rec.OutputTokens != 3 || rec.InputEstimated {
 		t.Fatalf("token 记账错误: %+v", rec)
 	}
@@ -115,9 +132,7 @@ func TestGatewayStreamPassthroughAndUsageTee(t *testing.T) {
 		t.Fatalf("SSE 未透传: %s", body)
 	}
 	// tee 记账: input=11 (message_start) output=7 (message_delta)
-	data, _ := os.ReadFile(filepath.Join(dir, "access.jsonl"))
-	var rec AccessRecord
-	_ = json.Unmarshal([]byte(strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]), &rec)
+	rec := readFirstRecord(t, filepath.Join(dir, "access.jsonl"))
 	if rec.InputTokens != 11 || rec.OutputTokens != 7 || !rec.Stream {
 		t.Fatalf("流式 tee 记账错误: %+v", rec)
 	}
@@ -137,9 +152,7 @@ func TestGatewayInputEstimateFallback(t *testing.T) {
 	if _, err := http.Post(gw.URL+"/messages", "application/json", strings.NewReader(payload)); err != nil {
 		t.Fatal(err)
 	}
-	data, _ := os.ReadFile(filepath.Join(dir, "access.jsonl"))
-	var rec AccessRecord
-	_ = json.Unmarshal([]byte(strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]), &rec)
+	rec := readFirstRecord(t, filepath.Join(dir, "access.jsonl"))
 	if !rec.InputEstimated || rec.InputTokens < 100 {
 		t.Fatalf("input 估算兜底未生效: %+v", rec)
 	}
