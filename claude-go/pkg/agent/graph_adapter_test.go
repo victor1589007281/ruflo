@@ -5,6 +5,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"github.com/anthropic/claude-go/pkg/graph"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -148,5 +149,71 @@ func TestGraphJournalResume(t *testing.T) {
 func TestGraphModeInRouting(t *testing.T) {
 	if !ModeHasDedicatedExecutor("graph") {
 		t.Fatal("graph 模式必须在 dedicatedExecutorModes 表内 (自带 Journal 恢复, 不走 pipeline 检查点)")
+	}
+}
+
+// TestGateNodeDeterministicScoring 门禁节点差异化执行: 确定性 gate 输出 score。
+func TestGateNodeDeterministicScoring(t *testing.T) {
+	// 用直接 stageNodeRunner + 确定性 gate (compile/test 关键词, 无需 LLM)
+	team := newStubTeam(t, "gate-test")
+	we := newStubExecutor(new(atomic.Int64))
+	r := &stageNodeRunner{we: we, team: team, objective: "obj"}
+
+	// compile gate: 上游有产出 → score 80+; 结构化 → 90
+	res := r.runGate(context.Background(),
+		graph.NodeSpec{ID: "compile-gate", Kind: graph.NodeKindGate},
+		graph.NodeInput{PrevOutputs: map[string]string{"coder": "package main\nfunc main(){}"}})
+	if res.Status != graph.NodeStatusCompleted {
+		t.Fatalf("gate 应 completed: %+v", res)
+	}
+	if res.Score < 80 {
+		t.Fatalf("有产出的 compile gate 应 score>=80, got %.0f", res.Score)
+	}
+
+	// 无产出 → score 0
+	res2 := r.runGate(context.Background(),
+		graph.NodeSpec{ID: "test-gate", Kind: graph.NodeKindGate},
+		graph.NodeInput{PrevOutputs: map[string]string{}})
+	if res2.Score != 0 {
+		t.Fatalf("无产出应 score=0, got %.0f", res2.Score)
+	}
+}
+
+// TestGateConditionRouting gate 分数经条件边路由到不同分支。
+func TestGateConditionRouting(t *testing.T) {
+	// 图: coder → gate(compile) → [pass: score>=75 → deploy] / [fail: score<75 → fix]
+	wf := &WorkflowDef{
+		Name: "gate-routing",
+		Mode: "graph",
+		Stages: []StageDef{
+			{Name: "coder", Role: "coder", Prompt: "写代码 {objective}"},
+			{Name: "compile-gate", Role: "gate", Prompt: "", DependsOn: []string{"coder"}},
+		},
+	}
+	spec, err := TranslateWorkflow(wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// compile-gate 应被译为 gate 节点
+	var gateKind graph.NodeKind
+	for _, n := range spec.Nodes {
+		if n.ID == "compile-gate" {
+			gateKind = n.Kind
+		}
+	}
+	if gateKind != graph.NodeKindGate {
+		t.Fatalf("含 gate 关键词的 stage 应译为 gate 节点, got %q", gateKind)
+	}
+}
+
+func TestStageIsGate(t *testing.T) {
+	if !stageIsGate(StageDef{Name: "compile-gate", Role: "gate"}) {
+		t.Error("含 gate 应识别为门禁")
+	}
+	if !stageIsGate(StageDef{Name: "质量门禁", Role: "critic"}) {
+		t.Error("含门禁应识别")
+	}
+	if stageIsGate(StageDef{Name: "coder", Role: "coder"}) {
+		t.Error("普通 coder 不应识别为门禁")
 	}
 }

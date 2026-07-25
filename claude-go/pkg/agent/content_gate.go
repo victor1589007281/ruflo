@@ -116,8 +116,17 @@ func (ptm *ProductionTeamManager) tryContentQualityGate(ctx context.Context, tea
 	return results
 }
 
-// runContentCritic 用一次廉价 LLM 调用给产出打分, 返回结构化评审 (解析失败返回 nil)。
+// runContentCritic 用一次廉价 LLM 调用给产出打分 (ProductionTeamManager 方法, 委托自由函数)。
 func (ptm *ProductionTeamManager) runContentCritic(ctx context.Context, objective, deliverable string) *contentVerdict {
+	return runContentCriticLLM(ctx, ptm.llm, objective, deliverable)
+}
+
+// runContentCriticLLM 内容质量评审自由函数, 供 ProductionTeamManager 与图 gate 节点复用。
+// 解析失败返回 nil。
+func runContentCriticLLM(ctx context.Context, llm LLMClient, objective, deliverable string) *contentVerdict {
+	if llm == nil {
+		return nil
+	}
 	deliverable = strings.TrimSpace(deliverable)
 	if deliverable == "" {
 		return nil
@@ -135,7 +144,7 @@ func (ptm *ProductionTeamManager) runContentCritic(ctx context.Context, objectiv
 要求: score<%d 时 pass 必须为 false; issues 给出最关键的 2-5 条, 必须具体到"改什么、怎么改"。`,
 		truncateResult(objective, 1500), truncateResult(deliverable, 12000), contentQualityThreshold)
 
-	out, err := ptm.llm.SimpleComplete(ctx, sys, user)
+	out, err := llm.SimpleComplete(ctx, sys, user)
 	if err != nil {
 		return nil
 	}

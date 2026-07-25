@@ -14,6 +14,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,9 +41,13 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 		},
 	}
 	for _, st := range wf.Stages {
+		kind := graph.NodeKindAgent
+		if stageIsGate(st) {
+			kind = graph.NodeKindGate // 门禁阶段 → gate 节点 (输出 score 供条件边路由)
+		}
 		spec.Nodes = append(spec.Nodes, graph.NodeSpec{
 			ID:   st.Name,
-			Kind: graph.NodeKindAgent,
+			Kind: kind,
 			Agent: graph.AgentSpec{
 				Role:   st.Role,
 				Prompt: st.Prompt,
@@ -66,6 +71,12 @@ type stageNodeRunner struct {
 }
 
 func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in graph.NodeInput) graph.NodeResult {
+	// gate 节点差异化执行 (design/01 §4.1): 门禁节点输出 score, 供条件边
+	// `score >= 75` 路由; 不是普通 agent。
+	if node.Kind == graph.NodeKindGate {
+		return r.runGate(ctx, node, in)
+	}
+
 	stage := StageDef{
 		Name:   node.ID,
 		Role:   node.Agent.Role,
@@ -84,6 +95,82 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 		res.Status = graph.NodeStatusFailed
 	}
 	return res
+}
+
+// runGate 执行门禁节点: 对上游产出打分, Score 落 NodeResult 供条件边路由。
+// Status 恒 completed (无论分数, 由条件边决定后续), 除非评审彻底不可用。
+// gate 语义按 role/name 关键词分派 (design/01 §4.1):
+//   - content/quality/评审: LLM 内容质量评审 (复用 runContentCritic)
+//   - compile/test/build: 确定性门禁 (上游产出非空 + 结构化即通过, 占位; 真编译门禁在产码工作流)
+//   - 其余: 默认 LLM 评分
+func (r *stageNodeRunner) runGate(ctx context.Context, node graph.NodeSpec, in graph.NodeInput) graph.NodeResult {
+	// 取待评审产出: 优先直接前驱的产出, 否则全部上游拼接
+	deliverable := gatePickDeliverable(in.PrevOutputs)
+	key := strings.ToLower(node.ID + " " + node.Agent.Role)
+
+	// 确定性门禁 (compile/test/build): 无 LLM, 按产出存在性/结构给分
+	if strings.Contains(key, "compile") || strings.Contains(key, "test") || strings.Contains(key, "build") {
+		score := 0.0
+		if strings.TrimSpace(deliverable) != "" {
+			score = 80 // 有产出即视为通过 (占位; 真编译门禁在 GateEnforcer/产码工作流)
+			if looksLikeCodeArtifact(deliverable) {
+				score = 90
+			}
+		}
+		return graph.NodeResult{
+			Status: graph.NodeStatusCompleted,
+			Score:  score,
+			Output: fmt.Sprintf(`{"gate":"deterministic","score":%.0f}`, score),
+		}
+	}
+
+	// LLM 内容评审 (content/quality/评审/默认): 复用 runContentCriticLLM (走 we.llm)
+	if r.we != nil && r.we.llm != nil {
+		if v := runContentCriticLLM(ctx, r.we.llm, r.objective, deliverable); v != nil {
+			out, _ := json.Marshal(v)
+			// 奖励持久化 (design/03 §4.2): 图 gate 分数也入 rewards.jsonl
+			if r.we.evolution != nil && r.team != nil {
+				r.we.evolution.RecordReward(RewardEvent{
+					RunID:  trace.From(ctx).RunID,
+					NodeID: node.ID,
+					Source: "gate.content",
+					Value:  float64(v.Score)/50.0 - 1.0,
+					Raw:    v.Score,
+					Team:   r.team.Name,
+				})
+			}
+			return graph.NodeResult{
+				Status: graph.NodeStatusCompleted,
+				Score:  float64(v.Score),
+				Output: string(out),
+			}
+		}
+	}
+	// 评审不可用: 给中性分, 不阻断 (fail-open)
+	return graph.NodeResult{Status: graph.NodeStatusCompleted, Score: 60, Output: `{"gate":"unavailable","score":60}`}
+}
+
+// stageIsGate 判断一个 stage 是否门禁阶段 (按 role/name 关键词)。
+// 门禁阶段被译为 gate 节点, 输出 score 供条件边路由, 不做常规 agent 产出。
+func stageIsGate(st StageDef) bool {
+	key := strings.ToLower(st.Name + " " + st.Role)
+	for _, kw := range []string{"gate", "门禁", "quality-gate", "content-gate"} {
+		if strings.Contains(key, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// gatePickDeliverable 从上游产出中选待评审内容: 取最长的非空产出。
+func gatePickDeliverable(prev map[string]string) string {
+	best := ""
+	for _, v := range prev {
+		if len(v) > len(best) {
+			best = v
+		}
+	}
+	return best
 }
 
 // executeGraph 图引擎执行入口 (wf.Mode=="graph" 或灰度开关命中时由 Execute/executePipeline 转入)。
