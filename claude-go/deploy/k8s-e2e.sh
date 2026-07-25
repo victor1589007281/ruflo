@@ -21,23 +21,23 @@ NS=claude-go
 CLUSTER=${CLAUDE_GO_E2E_CLUSTER:-dbk8s-e2e}   # kind 集群名; 独立 namespace, 不碰其它项目
 IMG=claude-go:e2e
 step() { echo; echo "━━━ $* ━━━"; }
-TOTAL=12
+TOTAL=11
 ok()   { echo "  ✅ $*"; }
 bad()  { echo "  ❌ $*"; FAILED=1; }
 FAILED=0
 
-step "1/12 构建静态二进制"
+step "1/11 构建静态二进制"
 cd "$REPO" || exit 1
 CGO_ENABLED=0 go build -trimpath -o deploy/claude-go-linux ./cmd/claude-go || exit 1
 ls -la --block-size=M deploy/claude-go-linux | awk '{print "  二进制", $5}'
 
-step "2/12 构建镜像并导入 kind"
+step "2/11 构建镜像并导入 kind"
 docker build -q -t "$IMG" -f deploy/Dockerfile deploy/ >/dev/null || exit 1
 # kind 节点看不到宿主 docker 镜像库，必须 save + ctr import（已知坑）
 docker save "$IMG" | docker exec -i "${CLUSTER}-control-plane" ctr -n k8s.io images import - >/dev/null || exit 1
 ok "镜像已导入 ${CLUSTER}-control-plane"
 
-step "3/12 创建 namespace / Secret / ConfigMap"
+step "3/11 创建 namespace / Secret / ConfigMap"
 kubectl create ns "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 # 真实 kimi key 从宿主配置取，只进 Secret，不写进仓库任何文件
 KEY=$(python3 -c "
@@ -65,7 +65,7 @@ kubectl -n "$NS" create configmap claude-go-config --from-literal=config.json='{
 }' --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 ok "ConfigMap 已建（apiKey 故意留占位符）"
 
-step "4/12 部署单体模式"
+step "4/11 部署单体模式"
 sed -e "s|image: localhost:5000/claude-go:latest|image: $IMG|" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
     "$REPO/deploy/k8s/monolith.yaml" \
@@ -74,7 +74,7 @@ kubectl -n "$NS" rollout status deploy/claude-go-monolith --timeout=180s || bad 
 POD=$(kubectl -n "$NS" get pod -l app=claude-go-monolith -o jsonpath='{.items[0].metadata.name}')
 echo "  pod=$POD"
 
-step "5/12 验收①: ConfigMap 真被读取 + 真 key 生效"
+step "5/11 验收①: ConfigMap 真被读取 + 真 key 生效"
 sleep 3
 LOG=$(kubectl -n "$NS" logs "$POD" --tail=200 2>/dev/null)
 if grep -q 'apiKey 取自环境变量 KIMI_API_KEY' <<<"$LOG"; then
@@ -88,12 +88,12 @@ else
   ok "未落占位 provider 分支"
 fi
 
-step "6/12 验收②: HTTP 面存活"
+step "6/11 验收②: HTTP 面存活"
 kubectl -n "$NS" exec "$POD" -- curl -s -o /dev/null -w '  /api/health → %{http_code}\n' localhost:18080/api/health
 WF=$(kubectl -n "$NS" exec "$POD" -- curl -s localhost:18080/api/workflows | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null)
 echo "  /api/workflows 数量 = ${WF:-取不到}"
 
-step "7/12 验收③: 真实 LLM 团队执行"
+step "7/11 验收③: 真实 LLM 团队执行"
 # 真实端点是 /api/actions/team/{action}/{target}, 载荷 {workflow, objective}
 kubectl -n "$NS" exec "$POD" -- curl -s -X POST \
   localhost:18080/api/actions/team/create/e2e-real \
@@ -115,7 +115,7 @@ for i in $(seq 144); do
 done
 [ -n "${ST:-}" ] && echo "  最终状态: $ST"
 
-step "8/12 验收④: 本轮修复的产物是否真落盘"
+step "8/11 验收④: 本轮修复的产物是否真落盘"
 echo "  — 轨迹 Span（证明 TraceCaptureHook 已注册）:"
 kubectl -n "$NS" exec "$POD" -- sh -c 'ls -la /data/.claude-go/statestore/log/ 2>/dev/null | head -5' || bad "无 statestore/log"
 SPANS=$(kubectl -n "$NS" exec "$POD" -- sh -c 'cat /data/.claude-go/statestore/log/trace-*.jsonl 2>/dev/null | wc -l')
@@ -126,7 +126,7 @@ RW=$(kubectl -n "$NS" exec "$POD" -- sh -c 'wc -l < /data/.claude-go/evolution/r
 echo "  — 团队产物:"
 kubectl -n "$NS" exec "$POD" -- sh -c 'ls /data/.claude-go/teams/e2e-real/ 2>/dev/null' || bad "无团队目录"
 
-# (原第 9 步内容并入下方第 12 步)
+step "9/11 验收⑤: 分布式模式 + 网关真被经过"
 sed -e "s|image: localhost:5000/claude-go:latest|image: $IMG|g" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|g" \
     "$REPO/deploy/k8s/distributed.yaml" \
@@ -151,7 +151,7 @@ if [ -n "$CTLPOD" ]; then
     || bad "网关无访问记录 —— 流量没经网关（或路径不同）"
 fi
 
-step "10/12 验收⑥: 动作队列消费方已注册（design/01 §4.12）"
+step "10/11 验收⑥: 动作队列消费方已注册（design/01 §4.12）"
 # 改造前 :7777 动作队列两处写入、全仓零消费方, "等待 claude-go 主进程消费"是假承诺。
 LOG2=$(kubectl -n "$NS" logs "$POD" --tail=400 2>/dev/null)
 if grep -q '动作队列消费方已启动' <<<"$LOG2"; then
@@ -165,7 +165,7 @@ ACT=$(kubectl -n "$NS" exec "$POD" -- curl -s -X POST \
   -d '{"workflow":"research","objective":"验证动作队列消费"}' 2>/dev/null)
 echo "  动作回包: $(head -c 200 <<<"$ACT")"
 
-step "11/12 验收⑦⑧: 图引擎 + 拦截器链 + 预算台账（design/01 §4.10）"
+step "11/11 验收⑦⑧: 图引擎 + 拦截器链 + 预算台账（design/01 §4.10）"
 # 单体那轮跑的是 pipeline 路径（灰度默认关），这里显式开灰度跑一轮图引擎，
 # 才能验证拦截器链与预算事件真的落盘。
 kubectl -n "$NS" set env deploy/claude-go-monolith CLAUDE_GO_GRAPH_ENGINE=1 >/dev/null 2>&1
@@ -211,8 +211,6 @@ for l in open('$JRN'):
     except Exception: pass
 for k,v in sorted(c.items()): print('    %-24s %d'%(k,v))
 \"" 2>/dev/null || echo "    (取不到)"
-
-step "12/12 验收⑨: 分布式模式 + 网关真被经过"
 
 step "结论"
 [ "$FAILED" -eq 0 ] && echo "  全部验收通过" || echo "  有 $FAILED 项未通过（见上方 ❌）"
