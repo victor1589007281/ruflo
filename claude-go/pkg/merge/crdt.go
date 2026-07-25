@@ -1,3 +1,22 @@
+// Package merge 曾计划提供并行编辑的三级合并阶梯 (AST 无交集 → 文本合并 →
+// 语法感知 Mergiraf), 让并行 coder agent 编辑同一文件时不再被冲突键串行化。
+//
+// Deprecated: 本包**零引用, 且根本没被链进生产二进制**。计划中的接线
+// (patch_apply.go 的 ApplyCRDT/ApplyMergiraf) 从未实现, 而其宿主 PatchApplier
+// 本身也是零调用的死代码。并行编辑安全当前由冲突键串行化 + git worktree
+// 隔离解决, 不涉及文本合并。已知缺陷:
+//
+//   - **CRDTDoc 不是 CRDT**: 只有一个 Text string 字段, 无元素 ID、无逻辑时钟、
+//     无墓碑, 且 Merge 会**返回冲突错误**——conflict-free 类型按定义不会冲突。
+//     实际语义是"仅当一侧改动时才接受的两路前后缀文本合并"(连 3 路都不是)。
+//   - Mergiraf 从不调用 mergiraf: mergeWithMergiraf 自认是桩, 直接走 fallback,
+//     故 IsAvailable 门控不了任何东西, 语法感知合并并不存在。
+//   - MergeError 从无构造点, 于是 IsMergeConflict 恒返回 false。
+//   - commonPrefix/commonSuffix 按**字节**比较并按字节下标切片, 对中文等多字节
+//     文本会在 UTF-8 序列中间截断, 产出非法 UTF-8。
+//
+// 保留仅为留痕; 若将来真要做语法感知合并, 应按 rune 重写并直接对 pkg/graph
+// 设计, 不要在本包上加功能。
 package merge
 
 import (

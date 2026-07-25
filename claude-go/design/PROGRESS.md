@@ -108,3 +108,22 @@ R1 token 主路径修复 / R2 sqlite 后端 / R3 cron选主+caps路由 / E1 采�
 - ⚠️ **`/api/dreaming/diagnosis` 容器内会误报**：靠读磁盘上的 `cmd/claude-go/main.go` 源码文本判断接线，容器部署无源码树 → wired=false 误报。运维应用 `evo` 看制品而非该端点猜代码。
 - ⚠️ **`workflow_orchestrated.go:1-24` 注释已部分失真**：仍写"两套调度系统 + Coordinator 按 mode 选择"，未提共享表与图引擎第三路。
 - ⚠️ **未鉴权面因 cluster 扩大**：`/api/*` 与新增 `/cluster/*`（含 enqueue/pull/complete）均无鉴权，仅 `/wiki/*`+`/sync/*` 有 Bearer。
+
+### 2026-07-24 手册「仍存边界」五条逐条处置
+
+用户按手册 §1.4 列出的五条边界要求修复，逐条到源码核实后处置如下。**核实过程推翻了三个原以为成立的前提**，记在各条里。
+
+- ✅ **旧 `pkg/orchestrator` 预存死锁（生产可达，已修）**：根因不是两方互锁，而是**单 goroutine 的死定时器**——"超时排空"块窗口内一旦收到 done 就 `drainTimer.Stop()`，Go 1.23+ 起被 Stop 的定时器 channel 永不再送值而此处从不 Reset，回到 select 时两条臂同时永不可满足。该 select 还漏了 `ctx.Done()`，wedge 后连取消都救不回来（引擎 goroutine 永久泄漏、`EngineRunning` 永久 true）。**前提修正：原以为"待 M4 删除所以可以不管"，实际 `orchestrated` 仍是生产路径**（`workflow.go:426` + 5 个注册工作流），其中 code-review/testing/parenting 都是 4 路扇出→汇合，取消或快失败时多个任务微秒级同时返回则几乎必中。修法=删掉该微优化块（上方非阻塞排空已批处理"已到达"信号），原地留长注释记机理。`-race -count=3` 从永久挂死转全绿，整包 11.4s 通过。**CI 不再需要 `-skip TestEngine_DiamondDAG`**。引入者 44b9c2ed2（修 timer 泄漏时引入死锁）。
+- ✅ **`/api/*` 与 `/cluster/*` 无鉴权（已修，fail-open 上线）**：新增 `pkg/httpauth` 在 Handler 层统一拦一次。**前提修正一：原以为逐路由 `s.auth` 只是漏了两组，实际是"高度不对"**——:18080 上 /api/*(50 条)、/wiki/*、/sync/*、/cluster/*、SPA、/metrics 全挂同一个 `wiki.APIServer.Mux()`，逐路由包装必然继续漏，故改为中间件（新增路由默认被保护，有回归测试锁定）。**前提修正二：`/wiki/*` 并非"有 Bearer 保护"**——`auth()` 本就 fail-open 且线上 `apiSecret` 为空，故这两组今天同样无鉴权。**前提修正三（更严重）：手册所称"安全全靠主机网络隔离"在 socket 层不成立**——`wiki/api.go` 的 addr 硬编码 `":%d"` = 绑 0.0.0.0，实测经局域网 IP 可达 200，且本机有 tailscale 接口；`design/02` 与 CLI help 里"仅监听 127.0.0.1"的说法是错的。附带修：恒定时间比较、`ReadHeaderTimeout` 防 Slowloris、新增 `wiki.apiHost` 配置项、绑非回环且无 token 时启动打 WARN、dashboard :7777 同接中间件、:7777→:18080 内部转发加 token。⚠️ **`apiHost` 默认仍为空（保持零行为变更），收口需显式配置**——见下方"待决"。
+- ✅ **`pkg/toolskill` 阻塞缺陷（已修）**：`Runtime.Execute` 只设 Success/Data/Error/Timing，**从不设 `Status` 与 `Diagnostics`**，而消费方读的正是这两个字段 → 每个阶段都读成"未通过且零 blocker"，与"跑挂了"无法区分，门禁永远报不出 pass。已修（`deriveStatus` + `hoistDiagnostics`，含 JSON 往返退化成 `[]any` 的分支），并为这个此前**零测试的 1675 行包**补了首批单测。
+- 📌 **契约优先编码链 / `pkg/merge` / GoalTree（已标记，未删除）**：查清后是 5 个独立部分而非 3 个，处置分开。**前提修正：原以为"图 gate 是占位 → 生产无编译门禁"，实际 `teams.go` 的 `runGlobalCompileGate`/`runGlobalTestGate`/`runGlobalConsistencyCheck` + `tryGateWithRemediation`（2 次自动修复）是真实且更完善的**，占位只影响图声明的 gate 节点。所以接线契约链等于造第二套竞争门禁，反而不该做。
+  - `pkg/toolskill`（1675 行，~90% 真实：真 shell 出去调 staticcheck/gosec/go build/go test -bench）+ `pkg/contract`（73 行，其数据模型）：**保留**，修完上述缺陷后是接 `pkg/graph` gate 节点的天然实现。
+  - `CodeExecutor`+`PatchApplier`+`ValidationGate`+`ContextEngine`（1709 行，0 测试）：**加 `// Deprecated:` 标记，未删**。两个阻塞缺陷证明从未执行过：`patch_apply.go` 的 `findNodeByMarker` 因 `nodeRange` 无 `*ast.File` 守卫，会把**整个文件**当匹配节点并用 LLM 片段覆盖掉；`validation_gate.go` 依赖上面那个 Status 缺陷故永远读不到 pass。
+  - `pkg/merge`（200 行）：**加包级 Deprecated，未删**。零引用且**根本没链进生产二进制**；"CRDT"是错名（只有一个 `Text string`，无 ID/时钟/墓碑，`Merge` 会返回冲突——conflict-free 类型按定义不冲突）；`mergeWithMergiraf` 自认是桩故 mergiraf 从不被调用；`MergeError` 无构造点致 `IsMergeConflict` 恒 false；前后缀按字节切片会截断 UTF-8。
+  - GoalTree（260 行）：**加实验性横幅 + 到期声明**。按 design/01 §4.2 其 HTN 算法将吸收为 `pkg/graph` 的 ExpandSpec 展开器而持久化层删除（Journal 已取代四源恢复）；现在无法接线（ExpandSpec 未实现且 `graph.Validate` 拒绝非 agent/gate 的 Kind）。吸收时必修的缺陷已逐条记入文件头，其中最要命的是 **pending→active 转移缺失致 `NextGoals` 永久重复派发**。
+- ✅ **主动误导的假注释（已修）**：`workflow_legacy_support.go` 两处 `DEPRECATED: ... all repair logic now handled by LLM-driven ValidationGate` —— 该说法不成立（ValidationGate 从未接线），而两个函数已据此打桩为恒返回 0。已改为写明"替代品并不存在，真实修复环在 `tryGateWithRemediation`"。
+
+**本轮待决（需决策，均已留好开关）**：
+1. `wiki.apiHost` 默认值：现为空（绑全部网卡，零行为变更）。改 `127.0.0.1` 更安全，6 个下游平台走回环不受影响，但会断掉从手机/别的机器直连 :18080 的用法。
+2. 上述 1900 行死代码（`pkg/merge` + CodeExecutor 链）是否真删。已加标记但保留；删前应摘走 `CheckConstitution`、`CheckThinkPhase`、`ContextEngine` 的诊断→上下文分类三处有独立价值的逻辑。
+3. 是否把 `pkg/toolskill` 接成 `pkg/graph` gate 节点的真实现（替换 80/90 占位分）。这会让门禁真的开始拦人，原先靠占位分混过的 graph 工作流可能开始失败。

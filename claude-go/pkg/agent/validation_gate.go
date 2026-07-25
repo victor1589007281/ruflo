@@ -113,6 +113,13 @@ func DefaultGateConfigV2() []GateConfig {
 }
 
 // NewValidationGate 创建验证门禁
+// Deprecated: 本类型无任何生产调用方, 从未执行过。它属于"契约优先编码链"
+// (CodeExecutor + PatchApplier + ValidationGate + ContextEngine, 约 1700 行,
+// 零测试)。该链复制的编译/测试门禁在 teams.go 已有真实且更完善的实现
+// (runGlobalCompileGate / runGlobalTestGate / runGlobalConsistencyCheck +
+// tryGateWithRemediation 两次自动修复), 且它宿主在计划删除的 pkg/orchestrator
+// 之上 (design/01 M4)。链内已知阻塞缺陷见 design/PROGRESS.md 偏差记录。
+// 勿在其上继续开发; 需要真实质量门禁请用 pkg/toolskill 接 pkg/graph 的 gate 节点。
 func NewValidationGate(config []GateConfig, maxRounds int) *ValidationGate {
 	hard := make(map[GateStage]bool)
 	for _, s := range []GateStage{GateCompile, GateStatic, GateTest, GateQuality, GateSecurity, GateConcurrency} {

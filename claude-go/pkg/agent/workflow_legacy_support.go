@@ -21,16 +21,24 @@ import (
 var goModTidyMutex sync.Mutex
 
 // applyGoCompileTextRepairs applies deterministic text-level repairs.
-// DEPRECATED: Will be replaced by Contract-First Agent Harness (CodeExecutor).
-// Stubbed to return 0 — all repair logic now handled by LLM-driven ValidationGate.
+//
+// 已被打桩为恒返回 0, 即"确定性文本修复"这条能力当前不存在。
+//
+// 注意原注释称"修复逻辑已交给 LLM 驱动的 ValidationGate"——**该说法不成立**:
+// ValidationGate/CodeExecutor 这条契约优先编码链从未接线 (零生产调用, 见
+// executor.go 顶部的 Deprecated 说明), 所以打桩换来的替代品并不存在。
+// 真实生效的编译修复在 teams.go 的 tryGateWithRemediation: 编译/测试门禁
+// 失败后由 LLM 阶段重跑修复, 最多 2 次。此处保留桩函数只为不改调用方签名。
 func applyGoCompileTextRepairs(root string) int {
 	_ = root
 	return 0
 }
 
 // applyGoCompileErrorRepairs applies deterministic error-driven repairs.
-// DEPRECATED: Will be replaced by Contract-First Agent Harness (CodeExecutor).
-// Stubbed to return 0 — all repair logic now handled by LLM-driven ValidationGate.
+//
+// 同 applyGoCompileTextRepairs: 已打桩恒返回 0, 原注释所称的替代品
+// (Contract-First Agent Harness) 从未接线。真实修复环在
+// teams.go 的 tryGateWithRemediation。
 func applyGoCompileErrorRepairs(root, buildErrors string) int {
 	_ = root
 	_ = buildErrors

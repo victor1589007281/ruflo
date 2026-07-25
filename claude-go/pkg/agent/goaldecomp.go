@@ -13,6 +13,24 @@
 //   - Devin AI 的 multi-step planning (Cognition 2024)
 //   - Chain-of-Thought 的层级变体 (Tree-of-Thoughts, Yao et al. 2023)
 //   - 人类项目管理: WBS (Work Breakdown Structure, PMI/PMBOK)
+//
+// ⚠️ 实验性, 零生产调用, 有明确到期计划。当前状态:
+//
+//   - 无任何生产调用方; 唯一测试是 tests/eval 里的打分式用例 (只 t.Log 不
+//     t.Error, 即便结果全错也会 PASS)。仓内三个分解器中另两个 (WBS
+//     ParsePlanToDAG、swarm LLM 分解) 才是接线的。
+//   - 按 design/01 §4.2 规划, HTN 分解算法将被吸收为 pkg/graph 的 ExpandSpec
+//     展开器 (planner 节点), 而**持久化与进度层将被删除**: Journal 已取代
+//     goals.json/checkpoints.json/tasks.json 的"四源互相打补丁"恢复逻辑
+//     (design/01 §4.4)。故勿在 save/load/SaveCheckpoint 上继续开发。
+//   - 现在无法接线: ExpandSpec 尚未实现, 且 pkg/graph 的 Validate 目前拒绝
+//     除 agent/gate 之外的全部 Kind。独立接线会重新制造刚消除掉的四源缺陷。
+//   - 已知缺陷 (吸收时必须一并修): GoalFailed/GoalBlocked 两个状态只读不写
+//     (无 Fail/Block 方法, 目标树无法表达失败); **pending→active 转移缺失**,
+//     没有任何地方把目标标为 active, 故 NextGoals 每次返回同一批, 调度方
+//     会永久重复派发; TaskIDs 声明了与 TaskStore 联动却从无写入点;
+//     save() 非原子且丢弃错误 (os.WriteFile 直写, 崩溃会截断整棵树);
+//     Decompose 非幂等 (重复调用会重复追加子节点并永久破坏 Progress 计数)。
 package agent
 
 import (
