@@ -114,9 +114,9 @@ claude-go 当前的编排能力分散在**三套各自独立的引擎**里，外
 
 ## 四、核心抽象
 
-### 4.1 一切皆 AgentNode　　**[🟠 Kind 仍 2/8 / AgentSpec 字段已通电]**
+### 4.1 一切皆 AgentNode　　**[🟠 Kind 5/8 已实现 / router·subgraph·human 仍缺]**
 
-> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。✅ **`AgentSpec` 三个字段已通电（2026-07-25）**：`Deterministic` 由 compile/test/build gate 派生并被 `runGate` 消费；`ToolProfile`/`MaxTurns` 经新增的 `NodeExecHints` ctx 载体下推——`MaxTurns` 通过包装 factory 改写 `ResolvedConfig` 真实生效（必须在 factory：`runAgent` 会在调用前覆盖该 ctx 值），`ToolProfile` 在飞书 runner 侧**优先于角色名子串推断**（退役了 `world-builder` 因含 "build" 被判 coding 档拿到 Bash 那个真实误判）。Kind 仍只有 agent|gate。
+> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。✅ **map/reduce/loop-group 三种已实现（2026-07-25）**：新增 `pkg/graph/fanout.go`（map 扇出 + reduce 汇聚）与 `expand.go`，`Validate` 相应放开——但**未实现的 Kind 仍明确报错**，不是放开成静默接受。现为 5/8；router/subgraph/human 仍缺。✅ **`AgentSpec` 三个字段已通电（2026-07-25）**：`Deterministic` 由 compile/test/build gate 派生并被 `runGate` 消费；`ToolProfile`/`MaxTurns` 经新增的 `NodeExecHints` ctx 载体下推——`MaxTurns` 通过包装 factory 改写 `ResolvedConfig` 真实生效（必须在 factory：`runAgent` 会在调用前覆盖该 ctx 值），`ToolProfile` 在飞书 runner 侧**优先于角色名子串推断**（退役了 `world-builder` 因含 "build" 被判 coding 档拿到 Bash 那个真实误判）。
 
 ```go
 // pkg/graph/spec.go —— 图与节点是纯数据，可 JSON 序列化
@@ -171,9 +171,9 @@ type AgentSpec struct {
 
 gate/router 设 `Deterministic` 时零 LLM 调用——但仍走同一节点生命周期（hook、预算、轨迹），所以进化引擎能看到全部决策点。
 
-### 4.2 Graph：DAG + 条件边 + 动态展开　　**[🟠 DAG ✅ / 条件边 🟡 / 动态展开 ❌]**
+### 4.2 Graph：DAG + 条件边 + 动态展开　　**[🟠 DAG ✅ / 条件边可表达 / 动态展开 ✅]**
 
-> **实测**：ready-set 并行调度真实且生产接线（`pkg/graph/engine.go:183-252`）。条件边实现为**自研极简条件**而非设计写的 CEL（`pkg/graph/condition.go:54-111`，仅 ok/fail/score/contains 四类）。✅ **可表达性已通电（2026-07-25）**：新增 per-workflow 覆盖表（`RegisterGraphOverride` / `LoadGraphOverridesJSON` / `CLAUDE_GO_GRAPH_OVERRIDES`，fail-open）让条件边/Loop/Retry/Timeout 可从生产输入表达，且 `stageDeclaredOverride`+`mergeStageOverride` 是预留接缝（将来给 `StageDef` 加字段只需改前者）。**条件绝不从阶段名推断**——那等于把设计明确否定的"名字白名单"搬进调度器，且猜错会静默跳过整个分支。`ExpandSpec` 全仓零代码（仅 2 处注释）。
+> **实测**：ready-set 并行调度真实且生产接线（`pkg/graph/engine.go:183-252`）。条件边实现为**自研极简条件**而非设计写的 CEL（`pkg/graph/condition.go:54-111`，仅 ok/fail/score/contains 四类）。✅ **可表达性已通电（2026-07-25）**：新增 per-workflow 覆盖表（`RegisterGraphOverride` / `LoadGraphOverridesJSON` / `CLAUDE_GO_GRAPH_OVERRIDES`，fail-open）让条件边/Loop/Retry/Timeout 可从生产输入表达，且 `stageDeclaredOverride`+`mergeStageOverride` 是预留接缝（将来给 `StageDef` 加字段只需改前者）。**条件绝不从阶段名推断**——那等于把设计明确否定的"名字白名单"搬进调度器，且猜错会静默跳过整个分支。✅ **`ExpandSpec` 已实现（2026-07-25）**：`pkg/graph/expand.go`。**边界是必需而非可选**——展开深度/单次节点数/总节点数三重上限，设计明确要求"有界展开"因为无界会被 LLM 产出打爆；展开节点继承或收窄父约束、**不能放宽**（§4.2 单调性）。事件溯源的关键取舍：`graph.expanded` 入 journal 且 **Replay 按事件重建已展开的图而不是重新问 runner**——上游产出来自 LLM，重问会得到与首跑不同的图，事件溯源就失效了；另有 `graph.expand_rejected` 单独记账，有它才能解释"模型给了子图但图没变大"。
 
 ```go
 type EdgeSpec struct {
@@ -216,9 +216,9 @@ type GraphRun struct {
 - **重试单层化**：重试只存在于节点 RetryPolicy（引擎执行），瞬态错误判定与限流慢退（base 15s/cap 120s，`coordinator.go:551-576`）收编为内置 RetryClassifier。QueryEngine 内层不再自带无界重试环（`workflow.go:885` 废除）。
 - **watchdog**：图级（进展检测：Journal 尾部 N 分钟无事件即停滞）+ 节点级（activity 心跳）两层，参数沿用 `coordinator.go:155-161`；停滞动作=发 hook 事件+按策略 retry/fail/notify，收编 `orchestrator.go:4055-4083` 的独立实现。
 
-### 4.4 Loop：节点级与组级循环　　**[🟡 节点级建成未通电 / 组级 ❌]**
+### 4.4 Loop：节点级与组级循环　　**[✅ 节点级已通电 / 组级 loop-group 已实现]**
 
-> **实测**：节点级 LoopPolicy 实现完整且有测试（`pkg/graph/engine.go:360-382`），但 `TranslateWorkflow` 从不设 Loop、`StageDef` 也无对应字段 ⇒ **生产零产生方**。`loop-group` 被 Validate 显式拒绝。
+> **实测**：节点级 LoopPolicy 实现完整且有测试（`pkg/graph/engine.go:360-382`），但 `TranslateWorkflow` 从不设 Loop、`StageDef` 也无对应字段 ⇒ **生产零产生方**。✅ **`loop-group` 已实现（2026-07-25）**：组内子图整体循环，`loop.group.iteration` 入 journal 且 **resume 按已完成轮次续跑**（幂等）。
 
 ```go
 type LoopPolicy struct {
@@ -259,9 +259,20 @@ type Hook interface { Match(HookEvent) bool; Execute(context.Context, HookEvent)
 - **每个节点集成 hook**：NodeSpec.Hooks 绑定节点级 hook；图级 Policies.Hooks 对全部节点生效；hook 本身也可以是 agent（`HookBinding{NodeRef}` 指向一个 gate 节点）——审批型 hook 即 human 节点的语法糖。
 - **fail-open/fail-closed 显式化**：每个 HookBinding 声明 `on_error: ignore|block`，取代当前 PreToolUse 隐式 fail-open（`hooks.go:96-98`）。
 
-### 4.6 规则与约束：ConstraintSet 单一真源　　**[❌ 未实现（子项 AllowedTools ✅）]**
+### 4.6 规则与约束：ConstraintSet 单一真源　　**[✅ 已实现并接线]**
 
-> **实测**：`ConstraintSet` 全仓零命中。约束仍散在三处：`pkg/feishu/session.go:421-443` 子串匹配（`world-builder` 命中 Coding 的老坑原样保留）、`pkg/engine/engine.go:185`、`cmd/claude-go/main.go` DisableTools。**唯一达成的子项**是 AllowedTools 双路径收敛到同一 `toolExposed`（`pkg/engine/runner.go:278`）。
+> **实测（改造前）**：`ConstraintSet` 全仓零命中，约束散在三处：`pkg/feishu/session.go:421-443` 子串匹配（`world-builder` 命中 Coding 的老坑）、`pkg/engine/engine.go:185`、`cmd/claude-go/main.go` DisableTools。
+>
+> ✅ **已实现并接线（2026-07-25）**：`pkg/agent/constraints.go`（46 个测试）。核心是 **`Narrow` 单调收窄——放宽必须被拒绝**，这是安全属性而非便利功能。三处决策点现从同一真源读；`NarrowedPermissionMode` 让权限档位也只能收紧（阶梯 `bypass<acceptEdits<auto<default<dontAsk<plan`，**空串按 default 计**，否则 `bypass` 声明会被当成收窄接受 = fail-open）。
+>
+> 关键设计取舍（与设计文档的偏离，已核实必要）：
+> - **档位是偏序不是全序**。六档工具集真的互不包含（`research` 有 WebFetch/WebSearch 而 `coding` 没有；`analysis` 有网络而 `team` 没有），所以不能用 int 等级比"谁更严"。改用特权位子集判定；两档不可比时 `Narrow` **拒绝而不猜**（fail-closed）。特权位表用真实注册表双向反查，`profile.go` 加工具忘同步就红。
+> - **`pkg/engine` 与 `pkg/agent` 零互相 import**：engine 只定义最小接口 `ToolConstraintSource`，`*agent.ConstraintSet` 结构性满足，编译期断言放在 `pkg/feishu`（全仓唯一同时 import 两者的包）。engine 是热路径底层包，反向依赖 agent 那棵重依赖树是倒挂。
+> - **`Allow` 的 nil ≠ 空集，且故意不加 `omitempty`**：空集经 JSON 往返若被省掉，"全部拒绝"会静默变"不限制"。有专门往返测试。
+> - **向后兼容**：`profileForTeamRole` 子串匹配一行没搬没抄，降级为 `ResolveToolProfile` 的 fallback（6 个下游平台依赖它，不能一刀切删），可被显式声明覆盖且用回退时打 deprecation 日志（按 role+profile 去重、**上限 512 条**——`nested-agent:<SubagentType>` 来源是模型可控字符串，无上限就是慢性内存泄漏）。20 组 (role, workflow) 逐项等价有测试。
+> - **嵌套 agent 只采纳"更窄的"节点声明**：直接覆盖会放宽——节点声明 `coding` + `opts.ReadOnly=true`（本该 research）会让只读子代理拿到 Shell。
+>
+> ⚠️ **仍未接的最后一跳**：`cmd/claude-go/main.go:2877` 的 CLI DisableTools 尚未改从 ConstraintSet 读；且 `main.go:715` 的 slash 直通防护目前靠嗅探 `eng.Config.AllowedTools == nil` 判断"是否受限会话"——拿 map 的 nil 性当权限标志，应改读 `ConstraintOrigin`。另 `Paths`/`ModelTier`/`Conflicts` 有类型有单调性有校验但**运行期还无消费者**（`Provides/Requires` 仍活在待删的 `pkg/agent/orchestrator.go` WBS 里）。
 
 ```go
 type ConstraintSet struct {
@@ -353,7 +364,7 @@ type CallInterceptor interface { Around(ctx context.Context, c LLMCall, next Cal
 
 拦截器配置在图级 Policies 或全局 settings，顺序确定、可开关——第三方横切逻辑（如 aiops 平台的权限桥）也从此注入而非改主流程。
 
-### 4.11 通信机制抽象　　**[❌ 未实现]**
+### 4.11 通信机制抽象　　**[🟠 接口与 Watch 已落地 / 双黑板待 M4 归一]**
 
 > **实测**：`pkg/graph/blackboard.go` 不存在。双黑板仍并存（`pkg/agent/blackboard.go:29` + `pkg/orchestrator/blackboard.go:69`），跨黑板手工同步仍在 `pkg/agent/workflow_orchestrated.go:133-136`。**设计要「新增」的 `Watch` 只存在于那份要被删的实现里**（`pkg/orchestrator/blackboard.go:210`）。Mailbox 仍是裸 slice。
 
@@ -371,9 +382,9 @@ type Mailbox interface { Send(MailMessage) error; Inbox(agent string) []MailMess
 - `pkg/orchestrator/blackboard.go` 删除，orchestrated 跨黑板手工同步（`workflow_orchestrated.go:365-373`）消失。
 - 事件流：GraphRun 的 Journal 本身即对外事件流（dashboard SSE、飞书进度播报订阅之，取代 `updateHeartbeat` 回填 team.json 的轮询观测，`teams.go:1763`）。
 
-### 4.12 任务机制抽象　　**[❌ 未实现]**
+### 4.12 任务机制抽象　　**[✅ 已实现，含动作队列消费方]**
 
-> **实测**：`TaskService` 类型全仓不存在；仍 `RunTeam`/`WaitDone`/`tryStartTeam` 去重。:7777 动作队列仍是裸目录，且**全仓无消费方**（写入即烂在盘上）。
+> ✅ **已实现（2026-07-25）**：`pkg/agent/taskservice.go` 的 `FileQueueTaskService`——Submit（**幂等键**取代 `tryStartTeam` 的状态判断去重，后者有竞态）/ Wait / List / **ConsumeActions**。最有价值的一点是给一个只写不读的队列接上了消费方：:7777 动作队列此前两处写入（`pkg/dashboard/extra_handlers.go`、`v13_handlers.go`）而**全仓无消费方**，那句"等待 claude-go 主进程消费"是**假承诺**、写进去的动作烂在盘上。后端复用 `pkg/statestore`（其 `validateBucket` 禁止 `/`，桶名已扁平化）。向后兼容：`RunTeam`/`WaitDone` 签名未变，新接口与它们并存。
 
 ```go
 type TaskService interface {

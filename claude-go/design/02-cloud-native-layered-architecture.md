@@ -190,9 +190,9 @@ type LLMGateway interface {
 
 **MCP/stdio 工具**：stdio MCP 子进程属于 worker 本地资源，在 RuntimeCaps 里声明为能力标签（如 `mcp:playwright`）；需要该工具的节点被路由到具备标签的 worker——不再假设"所有工具处处可用"。
 
-### 3.4 L4 · 辅助系统　　**[🟠 StateStore 齐 / EventBus 🟡 / TaskService ❌]**
+### 3.4 L4 · 辅助系统　　**[🟠 StateStore 齐 / TaskService ✅ / EventBus 仍 🟡]**
 
-> **实测**：StateStore 三后端齐备，但 **sqlite 零生产调用**（唯一调用方是 regression 测试）、无 `state:` 配置项、FileStore **无跨进程锁**（自己声明不保证）⇒ R2 验收「双进程读写一致」未达成。**`pkg/eventbus` 零生产 import** ⇒ §3.4.2 承诺的全部订阅者一个都没迁。`TaskService` 不存在。cron 选主 ✅（opt-in）。⚠️ §3.4.1 桶映射表大半未落地，且 `bb/<t>`、`journal/<runID>` 这类**层级桶名结构性不可表达**（`validateBucket` 白名单排除 `/`）；生产实际只有 4 个桶。
+> **实测**：StateStore 三后端齐备，但 **sqlite 零生产调用**（唯一调用方是 regression 测试）、无 `state:` 配置项、FileStore **无跨进程锁**（自己声明不保证）⇒ R2 验收「双进程读写一致」未达成。**`pkg/eventbus` 零生产 import** ⇒ §3.4.2 承诺的全部订阅者一个都没迁。✅ **`TaskService` 已实现**（`pkg/agent/taskservice.go`，含 :7777 动作队列的消费方——此前那个队列只写不读）。cron 选主 ✅（opt-in）。⚠️ §3.4.1 桶映射表大半未落地，且 `bb/<t>`、`journal/<runID>` 这类**层级桶名结构性不可表达**（`validateBucket` 白名单排除 `/`）；生产实际只有 4 个桶。
 
 #### 3.4.1 状态存储 StateStore（一切外置的地基）
 
