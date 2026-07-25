@@ -192,9 +192,14 @@ type EdgeSpec struct {
   - swarm 动态分解（`swarm.go:523`）→ decompose 节点展开分层并行子图。
 - **子图**：`subgraph` 节点引用命名 GraphSpec，参数注入。composite 类 mode 从"专用执行器"降级为普通子图组合——**双 switch 不一致问题从根上消失**（不再存在第二张模式表）。
 
-### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 Journal ✅ / 「唯一真源」❌]**
+### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 事件 17/16 ✅ · InvalidateFrom ✅ / 四源归一属 M4]**
 
-> **实测**：FileJournal + Replay 真实且有零重跑硬证据（`pkg/graph/engine_test.go:422-423`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。事件类型 8/16；RunStatus 3 态而非设计的 7 态；`InvalidateFrom` 不存在，refine 仍只删 checkpoints.json。✅ **重试单层化已落地（2026-07-25）**：`TranslateWorkflow` 现在总给出 `Policies.DefaultRetry={6,5s}`，`stageNodeRunner` 调 `ExecuteSingleStage` 时打 `WithOuterRetryDriven` 标记使内层退化——**图层负责重试、内层让位**，次数刻意与 pipeline 外层（`Coordinator.MaxRetries=6`）对齐，故总尝试数同量级而非新的乘法放大。另修正一处前提：角色差异化的**单次**超时在图模式下本来就生效，缺的是节点级天花板，现按 `computeStageTimeout×(retries+1)×2` 给预算（复用同一张角色→超时表而非再抄一份）。
+> **实测**：FileJournal + Replay 真实且有零重跑硬证据（`pkg/graph/engine_test.go:422-423`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。✅ **事件类型已补齐并超出设计（2026-07-25）**：设计列 16 种，现有 17 种——补上了 `map.expanded`/`graph.expanded`/`graph.expand_rejected`/`loop.group.iteration`/`subgraph.spawned`/`subgraph.rejected`/`budget.consumed`/`budget.exceeded`/`node.invalidated`。
+>
+> ✅ **`InvalidateFrom` 已实现**：`pkg/graph/journal.go`，refine 改为追加 `node.invalidated` 事件而不是删快照文件（5 个测试）。**顺带修掉一个静默失效的真 bug**：灰度开关（`CLAUDE_GO_GRAPH_ENGINE`）开着时 `wf.Mode` 仍是 `"pipeline"`，于是「非 pipeline 转整体重跑」那道闸放行了按阶段精修，但它只失效 `checkpoints.json` 而 `graph-journal` 原样保留 → Resume 重放全部 `node.completed` → 零节点执行、直接返回旧产出，**用户的反馈静默消失**。失效必须连带摘掉该节点派生出的运行图形态（分片集/组轮次/展开产物/子节点缓存），否则是"失效了一半"——重跑的节点会继承上一轮的扇出与轮次进度。`InvalidateFrom` 在 runID 为空时**直接报错**而不是写一条注定被 Replay 过滤的事件（静默失败正是这个 bug 原本的形态）。
+>
+> ⚠️ **RunStatus 仍 3 态**（completed/partial/failed）而非设计的 8 态：`paused`/`stopped`/`refining` 在团队层已有对应状态，图层再加一套需要两层状态机对齐，属 M4。
+> ⚠️ **四源归一未达成**：checkpoints.json / goals.json / tasks.json / orchestrator CheckpointStore 仍在，journal 是第五源。删除它们要动 8+ 下游平台共用的主路径，属 M4。✅ **重试单层化已落地（2026-07-25）**：`TranslateWorkflow` 现在总给出 `Policies.DefaultRetry={6,5s}`，`stageNodeRunner` 调 `ExecuteSingleStage` 时打 `WithOuterRetryDriven` 标记使内层退化——**图层负责重试、内层让位**，次数刻意与 pipeline 外层（`Coordinator.MaxRetries=6`）对齐，故总尝试数同量级而非新的乘法放大。另修正一处前提：角色差异化的**单次**超时在图模式下本来就生效，缺的是节点级天花板，现按 `computeStageTimeout×(retries+1)×2` 给预算（复用同一张角色→超时表而非再抄一份）。
 
 ```go
 // pkg/graph/run.go
@@ -431,7 +436,7 @@ type TaskService interface {
 
 ---
 
-## 五、15 种 mode → 图模板映射　　**[❌ 0/15（宽算 2/15 且默认关）]**
+## 五、15 种 mode → 图模板映射　　**[🟠 4/15 等价且有等价性测试，默认关；余 11 逐条记账能力缺口]**
 
 > **实测**：`pkg/graph/templates/` **目录不存在**，图模板库零落地；`TranslateWorkflow` 是 WorkflowDef 直译器不是模板库。只有 pipeline/fanout 可经灰度开关切图，而 `CLAUDE_GO_GRAPH_ENGINE` 全仓/全部署清单无处设置。13 个专用 mode 全部仍走各自执行器（`pkg/agent/workflow.go:409-434`）。§5 承诺的「fanout 首次真正实现 map→reduce」未发生——`executeFanOut` 仍原封不动转调 pipeline（`pkg/agent/workflow.go:201-203`）。
 

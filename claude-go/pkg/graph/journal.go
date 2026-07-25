@@ -5,6 +5,7 @@ package graph
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,6 +40,12 @@ const (
 	// EvGroupIteration loop-group 一轮结束 (design/01 §4.4)。
 	// Data: iteration / status / output / score。**resume 按已完成轮次续跑**。
 	EvGroupIteration = "loop.group.iteration"
+
+	// EvNodeInvalidated 节点被显式失效 (design/01 §4.3 refine 凭 InvalidateFrom)。
+	// Data: reason。Replay 见到它就把该节点从 Completed 里摘掉, 于是下一次 resume
+	// 会重跑它 —— **这才是事件溯源的 refine**: 进度真源始终是 journal, 而不是靠
+	// 删掉某个快照文件来"让它忘记"。
+	EvNodeInvalidated = "node.invalidated"
 
 	// EvSubgraphSpawned 节点内 agent 派生了子图 (design/01 §4.8)。
 	// Data: spawn(请求指纹) / namespace / nodes / result_from / depth / subgraph。
@@ -363,6 +370,34 @@ func Replay(events []Event) *RunState {
 				gs.Score = f
 			}
 			st.GroupIters[ev.NodeID] = gs
+		case EvNodeInvalidated:
+			if ev.NodeID == "" {
+				continue
+			}
+			// 摘掉缓存的同时, 该节点派生出来的运行图形态也要一起摘: 分片集/组轮次
+			// 留着会让重跑的节点继承上一轮的扇出与轮次进度, 等于"失效了一半"。
+			delete(st.Completed, ev.NodeID)
+			delete(st.MapShards, ev.NodeID)
+			delete(st.GroupIters, ev.NodeID)
+			// 展开产物同理: 该节点上一轮展开出的子图不该在重跑前就存在
+			// (否则重跑会与旧子图并存, 得到一张谁都没声明过的图)。
+			if len(st.Expansions) > 0 {
+				kept := st.Expansions[:0]
+				for _, rec := range st.Expansions {
+					if rec.Parent != ev.NodeID {
+						kept = append(kept, rec)
+					}
+				}
+				st.Expansions = kept
+			}
+			// 该节点展开/派生出来的子节点缓存也要摘 (它们的 ID 带父节点前缀)。
+			for id := range st.Completed {
+				if strings.HasPrefix(id, ev.NodeID+"/") ||
+					strings.HasPrefix(id, ev.NodeID+SpawnIDInfix) ||
+					strings.HasPrefix(id, ev.NodeID+"#") {
+					delete(st.Completed, id)
+				}
+			}
 		case EvRunFinished:
 			st.Finished = true
 			if s, ok := ev.Data["status"].(string); ok {
@@ -385,4 +420,42 @@ func Replay(events []Event) *RunState {
 		st.GroupIters = map[string]GroupIterState{}
 	}
 	return st
+}
+
+// InvalidateFrom 显式失效一组节点 (design/01 §4.3: "refine 凭 InvalidateFrom(nodeID) 事件")。
+//
+// 为什么必须有它: 改造前的 refine 走"删快照文件"这条路 —— 整体重跑删
+// graph-journal 目录, 按阶段精修只删 checkpoints.json。后者在图模式下**完全失效**:
+// 灰度开关开着时 wf.Mode 仍是 "pipeline", 于是按阶段精修不会被转成整体重跑, 但它
+// 只动 checkpoints.json 而 graph-journal 原样保留 → Resume 重放全部 node.completed
+// → 零节点执行、直接返回旧产出, 用户的反馈静默消失。
+//
+// 有了失效事件, 进度真源始终是 journal 本身: 不再需要"删掉某个文件来让它忘记",
+// 而且失效这件事自己也留了痕 (谁在什么时候因什么失效了哪些节点)。
+//
+// runID 必须是**要失效的那次运行**的 ID —— Replay 只重放最近一次 run, 事件写错
+// RunID 就会被过滤掉、静默不生效。
+func InvalidateFrom(j Journal, runID string, nodeIDs []string, reason string) error {
+	if j == nil {
+		return errors.New("graph: InvalidateFrom 需要 journal")
+	}
+	if runID == "" {
+		return errors.New("graph: InvalidateFrom 需要 runID (写错 RunID 的失效事件会被 Replay 静默过滤)")
+	}
+	var firstErr error
+	for _, id := range nodeIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		err := j.Append(Event{
+			TS: time.Now().UnixMilli(), Type: EvNodeInvalidated,
+			RunID: runID, NodeID: id,
+			Data: map[string]any{"reason": reason},
+		})
+		if err != nil && firstErr == nil {
+			firstErr = err // 继续写其余的: 少失效一个节点比整批不生效好排查
+		}
+	}
+	return firstErr
 }

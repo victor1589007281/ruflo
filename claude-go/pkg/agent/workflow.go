@@ -396,6 +396,17 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 		observability.Emit(ev)
 	}()
 
+	// 图模板库灰度分发 (design/01 §五): 开关命中且该 mode 有**已验证等价**的图模板时,
+	// 由图引擎接管调度 (模板 = 该 mode 执行器真实阶段序列的展开, 见 graph_templates.go)。
+	// 三条纪律:
+	//   - 默认关: CLAUDE_GO_GRAPH_ENGINE 未设 ⇒ 下面的 switch 一字不变地生效
+	//     (:18080 上有 8+ 个下游平台在跑, 默认路径改了就是生产事故);
+	//   - 只认 modeGraphTemplates 里的 mode: 未验证等价的 mode 一律继续走自己的执行器;
+	//   - Mode=="graph" 不走这里: 它本来就是图, 直接落 executeGraph 的直译路径。
+	if wf.Mode != "graph" && graphEngineEnabled() && ModeHasGraphTemplate(wf.Mode) {
+		return we.executeGraph(ctx, wf, objective, team)
+	}
+
 	switch wf.Mode {
 	case "pipeline":
 		return we.executePipeline(ctx, wf, objective, team)

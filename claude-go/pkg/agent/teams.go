@@ -40,6 +40,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/trace"
@@ -230,6 +231,7 @@ type ProductionTeamManager struct {
 	llm         LLMClient            // LLM 客户端 (蜂群分解)
 	evolution   *EvolutionEngine     // 自动进化引擎
 	evoLoop     *EvolutionLoop       // 统一学习调度循环 (design/03 §4.3); nil = 回落到直调路径
+	traceStore  *tracestore.Store    // 轨迹底座 (design/03 §4.1); nil = 不采集 gate Span
 	dreamer     DreamRecorder        // Dreaming 接口 (覆盖 team agent 会话)
 	skillCreator SkillAutoCreator    // 技能自创建器 (团队干净成功后提炼 shadow 技能)
 	roles       *RoleRegistry        // 角色注册表
@@ -259,6 +261,9 @@ type TeamManagerConfig struct {
 	// EvolutionLoop 统一学习循环 (design/03 §4.3)。非 nil 时团队完成的学习经它调度
 	// (去重/预算/串行/空闲期整理); nil 则回落到直调, 见 submitLearn。
 	EvolutionLoop *EvolutionLoop
+	// TraceStore 轨迹底座 (design/03 §4.1)。非 nil 时门禁判定写 gate Span ——
+	// 这是 §4.1 五种 Kind 里唯一必须由 pkg/agent 写的一种 (门禁在团队层, 引擎看不到)。
+	TraceStore         *tracestore.Store
 	Dreamer            DreamRecorder
 	Roles              *RoleRegistry
 	MemWriter          MemoryWriter
@@ -324,6 +329,37 @@ func (ptm *ProductionTeamManager) Metrics() *metrics.Collector {
 	return ptm.metrics
 }
 
+// WrapAgentFactory 用 wrap 包装 agent 执行工厂 (design/02 §3.3 远程 runtime 接线点)。
+//
+// 为什么需要它: 阶段执行的唯一出口是 `we.factory(stageCtx, role, "")`
+// (workflow.go:1580), 而 `we.factory` 来自 `ptm.factory` (本文件 executeWorkflow
+// 里构造 WorkflowExecutor 时传入)。把远程放置能力接进来最小的改动就是在这里换掉
+// 工厂 —— 于是门禁/journal/重试/黑板全部不动, 只有"这次 agent 由谁执行"变了。
+// wrap 收到当前工厂 (通常是本地执行体), 应当把它作为回退包在新工厂里。
+//
+// ⚠️ 只能在**任何团队启动之前**调用 (进程装配阶段): ptm.factory 在运行期被
+// 读取且不持锁, 运行中替换是数据竞争。
+func (ptm *ProductionTeamManager) WrapAgentFactory(wrap func(CreateAgentFunc) CreateAgentFunc) {
+	if ptm == nil || wrap == nil {
+		return
+	}
+	ptm.mu.Lock()
+	defer ptm.mu.Unlock()
+	if next := wrap(ptm.factory); next != nil {
+		ptm.factory = next
+	}
+}
+
+// AgentFactory 返回当前 agent 执行工厂 (装配期只读用途)。
+func (ptm *ProductionTeamManager) AgentFactory() CreateAgentFunc {
+	if ptm == nil {
+		return nil
+	}
+	ptm.mu.RLock()
+	defer ptm.mu.RUnlock()
+	return ptm.factory
+}
+
 // SetCwd updates the default working directory used by subsequently created teams.
 func (ptm *ProductionTeamManager) SetCwd(cwd string) {
 	if ptm == nil || strings.TrimSpace(cwd) == "" {
@@ -353,6 +389,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		llm:             cfg.LLM,
 		evolution:       cfg.Evolution,
 		evoLoop:         cfg.EvolutionLoop,
+		traceStore:      cfg.TraceStore,
 		dreamer:         cfg.Dreamer,
 		skillCreator:    cfg.SkillCreator,
 		roles:           cfg.Roles,
@@ -415,6 +452,13 @@ type ProductionTeam struct {
 	Error      string              `json:"error,omitempty"`
 	Cwd        string              `json:"cwd,omitempty"`      // 工作目录 (用于编译验证和文件清单)
 	Language   string              `json:"language,omitempty"` // 编程语言 ("go","cpp","rust","python"), 空=""go"
+
+	// LastRunID 最近一次执行的 trace RunID (design/03 §4.1 四元组的 episode 键)。
+	//
+	// 必须持久化: 用户显式评分 (/team rate) 与精修负信号都发生在 run **结束之后**,
+	// 那时 ctx 里已经没有 trace 了。没有这个字段, 这两类奖励只能写出 RunID 为空的
+	// 事件, 而 AggregateRewards 强制要求 RunID —— 落盘即死数据。跨重启同理。
+	LastRunID string `json:"lastRunId,omitempty"`
 
 	// 持续优化 (RefineTeam): 运行后用户反馈驱动的精修迭代
 	RefineHistory   []RefineEntry `json:"refineHistory,omitempty"`   // 历次精修留痕 (可追溯)
@@ -691,6 +735,10 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	// trace 四元组 RunID (design/03 §4.1 E0): 复用 logging traceID 作后缀,
 	// llm.jsonl 的 RunID 可直接 join 结构化日志; 下游 stage/engine 逐层补 NodeID/TurnID。
 	ctx = trace.With(ctx, trace.IDs{RunID: fmt.Sprintf("run-%s-%s", team.Name, logging.TraceID(ctx))})
+	// 记住本轮 RunID: 运行后才发生的奖励 (用户评分 / 精修负信号) 只能靠它归因。
+	team.mu.Lock()
+	team.LastRunID = trace.From(ctx).RunID
+	team.mu.Unlock()
 	logging.Event(ctx, "team.start", "team", team.Name, "workflow", team.Workflow, "objective", team.Objective)
 	logging.IncrCounter("team.start." + team.Workflow)
 
@@ -887,11 +935,14 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		}
 		ptm.evolution.RecordReward(RewardEvent{
 			RunID:  trace.From(ctx).RunID,
-			Source: "episode",
+			Source: RewardSourceEpisode,
 			Value:  episodeVal,
 			Raw:    string(team.Status),
 			Team:   team.Name,
 		})
+		// 时长 shaping 负项 (design/03 §4.2 第 8 行, 防"堆 turn 堆 token 刷分")。
+		// 只在超预算时写, 预算内不写 —— 见 recordLatencyReward。
+		ptm.recordLatencyReward(ctx, team, report.DurationSec)
 	}
 
 	// 触发进化学习 (DISTILL: 从轨迹中提炼经验) + 采集进化指标。
@@ -1037,6 +1088,12 @@ func (ptm *ProductionTeamManager) runGlobalCompileGate(ctx context.Context, team
 	}
 	// 兜底: 无 go.mod 的目录不是 Go 模块, go build ./... 必然报 "no main module", 跳过。
 	if _, err := os.Stat(filepath.Join(team.Cwd, "go.mod")); err != nil {
+		// 跳过也留轨迹 (不发奖励): 否则事后无法分清"编译过了"与"根本没编译",
+		// 而 §4.5 的教训正是"静默跳过会让人以为门禁过了"。
+		ptm.writeGateSpan(ctx, team, gateSpanInput{
+			Gate: RewardSourceGateCompile, Node: RewardSourceGateCompile,
+			Input: team.Cwd, Detail: "无 go.mod, 非 Go 模块, 跳过编译门禁", Skipped: true,
+		})
 		return ""
 	}
 	// 执行超时刻意不挂在 ctx 上 (保持原语义: 门禁自己限时, 不受上游取消影响);
@@ -1067,7 +1124,7 @@ func (ptm *ProductionTeamManager) runGlobalCompileGate(ctx context.Context, team
 // (以及门禁失败后触发的修复阶段) 的学习反馈被"它正要修的失败"污染。
 // 跳过的门禁 (无 go.mod / 无 cwd) 不发奖励 —— 没跑过就不是证据。
 func (ptm *ProductionTeamManager) recordGateReward(ctx context.Context, team *ProductionTeam, source, gateErr string) {
-	if ptm == nil || ptm.evolution == nil || team == nil {
+	if ptm == nil || team == nil {
 		return
 	}
 	if ctx == nil {
@@ -1077,13 +1134,30 @@ func (ptm *ProductionTeamManager) recordGateReward(ctx context.Context, team *Pr
 	if gateErr != "" {
 		value, raw = -1.0, any(truncateResult(gateErr, 300))
 	}
-	ptm.evolution.RecordReward(RewardEvent{
-		RunID:  trace.From(ctx).RunID,
-		NodeID: source,
-		Source: source,
-		Value:  value,
+	// 奖励与轨迹的守卫**分开**: 只装了 TraceStore 没装 Evolution 的宿主 (或反之)
+	// 仍应各得其一。合成一个 `evolution == nil → return` 会让 gate Span 悄悄跟着
+	// 奖励一起消失, 那正是"实现了但零生产调用"的经典成因。
+	if ptm.evolution != nil {
+		ptm.evolution.RecordReward(RewardEvent{
+			RunID:  trace.From(ctx).RunID,
+			NodeID: source,
+			Source: source,
+			Value:  value,
+			Raw:    raw,
+			Team:   team.Name,
+		})
+	}
+	// gate Span (design/03 §4.1 Kind=gate): 与奖励同一处发出, 保证"奖励有值但
+	// 轨迹里查不到它凭什么"这种断链不会发生。Input 记被判定的工作目录 (门禁的判定
+	// 对象是磁盘上的代码, 不是某段文本), Output 记报错全文供蒸馏读。
+	ptm.writeGateSpan(ctx, team, gateSpanInput{
+		Gate:   source,
+		Node:   source,
+		Input:  team.Cwd,
+		Detail: gateErr,
+		Score:  value,
 		Raw:    raw,
-		Team:   team.Name,
+		Pass:   gateErr == "",
 	})
 }
 
@@ -1580,7 +1654,14 @@ func (ptm *ProductionTeamManager) RefineTeam(name, feedback, targetStage string)
 		return fmt.Errorf("团队 %q 尚未运行过, 请先 /team run <名称> <目标>", name)
 	}
 	fromStatus := string(team.Status)
+	// 上一轮的 RunID 必须在这里取: 下面 executeWorkflow 会把 LastRunID 覆盖成新一轮的,
+	// 那时再取就把"用户对旧产出的不满"记到了新一轮头上 —— 归因反了。
+	prevRunID := team.LastRunID
 	team.mu.Unlock()
+
+	// user.steer 负信号 (design/03 §4.2 第 4 行): 用户主动来精修, 定义上就是对上一轮
+	// 产出的显式否定。此前这条最直接的人类反馈只写进 RefineHistory 供人看, 不入学习。
+	ptm.recordSteerReward(team, prevRunID, feedback, targetStage)
 
 	if !ptm.tryStartTeam(name) {
 		return fmt.Errorf("团队 %q 正在启动中，请稍后再试", name)
@@ -1603,6 +1684,13 @@ func (ptm *ProductionTeamManager) RefineTeam(name, feedback, targetStage string)
 			return fmt.Errorf("未找到阶段 %q (可用: %s)", targetStage, strings.Join(stageNamesOf(wf), ", "))
 		}
 		_ = InvalidateCheckpoints(team.dataDir, invalidated)
+		// 图引擎路径的进度真源是 graph-journal, 不是 checkpoints.json。
+		// 这里曾有一个静默失效的真 bug: 灰度开关 (CLAUDE_GO_GRAPH_ENGINE) 开着时
+		// wf.Mode 仍是 "pipeline", 于是上面那道"非 pipeline 转整体重跑"的闸放行了
+		// 按阶段精修, 但只失效 checkpoints.json 而 graph-journal 原样保留 →
+		// Resume 重放全部 node.completed → 零节点执行、直接返回旧产出,
+		// **用户的反馈静默消失**。用失效事件补上 (design/01 §4.3 InvalidateFrom)。
+		invalidateGraphJournal(context.Background(), team, invalidated, "refine:"+targetStage)
 	} else {
 		// 整体重跑: 清空检查点。
 		// 图引擎路径的进度真源是 graph-journal 而非 checkpoints.json, 必须一并

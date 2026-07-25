@@ -1431,3 +1431,50 @@ func graphRunParams(team *ProductionTeam, wf *WorkflowDef, runID string) map[str
 	}
 	return p
 }
+
+// invalidateGraphJournal 给图 journal 追加节点失效事件 (design/01 §4.3 InvalidateFrom)。
+//
+// 只在 journal 目录已存在时动手: 目录不存在说明这个团队没走过图引擎, 凭空建一个
+// 空 journal 会让下一次 Run 的 Resume 读到一个"有文件但无事件"的基线 —— 无害但
+// 会让排查时误以为跑过图。
+//
+// 失效对象用**阶段名**: TranslateWorkflow 把阶段名原样用作节点 ID, 所以
+// stagesFromTarget 给出的名字就是节点 ID (派生 ID 带前缀, 由 Replay 侧一并摘掉)。
+//
+// 失败只记日志不阻断精修: 精修本身还有 checkpoints.json 与 PendingFeedback 两条腿,
+// 因为写不进一条事件就把用户的精修请求整个拒掉是过度反应。但**必须留痕** ——
+// 静默失败正是这个 bug 原本的形态。
+func invalidateGraphJournal(ctx context.Context, team *ProductionTeam, stages []string, reason string) {
+	if team == nil || team.dataDir == "" || len(stages) == 0 {
+		return
+	}
+	dir := filepath.Join(team.dataDir, "graph-journal")
+	if _, err := os.Stat(dir); err != nil {
+		return // 没走过图引擎
+	}
+	runID := team.LastRunID
+	if runID == "" {
+		// 没有 RunID 就写不出能被 Replay 认领的事件 (它按最近一次 run 过滤)。
+		// 退回到"整段清掉"这个粗粒度但确定生效的做法, 而不是写一条注定被过滤的事件。
+		logging.Event(ctx, "graph.invalidate.fallback", "team", team.Name, "reason", reason,
+			"detail", "无 LastRunID 无法定位 run, 改为清空 graph-journal")
+		if err := os.RemoveAll(dir); err != nil {
+			logging.Event(ctx, "graph.invalidate.error", "team", team.Name, "err", err.Error())
+		}
+		return
+	}
+	j, err := graph.NewFileJournal(dir)
+	if err != nil {
+		logging.Event(ctx, "graph.invalidate.error", "team", team.Name, "err", err.Error(),
+			"detail", "打开 graph-journal 失败, 按阶段失效未生效")
+		return
+	}
+	defer j.Close()
+	if err := graph.InvalidateFrom(j, runID, stages, reason); err != nil {
+		logging.Event(ctx, "graph.invalidate.error", "team", team.Name, "err", err.Error(),
+			"detail", "写入节点失效事件失败")
+		return
+	}
+	logging.Event(ctx, "graph.invalidate", "team", team.Name, "run", runID, "reason", reason,
+		"nodes", fmt.Sprintf("%d", len(stages)), "stages", strings.Join(stages, ","))
+}
