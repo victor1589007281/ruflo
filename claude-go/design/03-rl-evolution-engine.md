@@ -213,9 +213,9 @@ type Span struct {
 
 **与上下文压缩的协同（吸收 Hermes H4）**：运行期超大工具结果优先走**"落盘+指针"**而非丢弃/摘要——参照 hermes 三层机制（单结果超阈值→写工作区文件、上下文只留预览+路径、agent 可 Read 取回；Read 结果自身豁免落盘防循环）。对 claude-go：`pkg/compact` 的截断路径增加 persist 档位，被落盘的原文**天然就是 TraceStore 的 Blob**——上下文瘦身与轨迹保真一次解决；LLM 摘要压缩（现 SmartExtractKeyFacts）保留用于会话延续，但 Span 里始终记指针指向无损原文，学习管线永远读得到全文。这直接消解 §1.3 "action 完整文本缺失"中 transcript 截断的那一半。
 
-### 4.2 ② RewardBus：奖励总线　　**[🟠 只写不读（零消费者）]**
+### 4.2 ② RewardBus：奖励总线　　**[🟠 已进学习器 / 8 源中 3 源]**
 
-> **实测**：`RewardEvent` + rewards.jsonl 落盘真实（`pkg/agent/evolution.go:146-177`），但**设计的 `Weight`（源可信度）字段不存在** ⇒ §4.6「奖励源加权」无载体。⚠️ **最关键开环：奖励零消费**——`rewards.jsonl` 的读取方全仓只有两个离线 CLI（console/skillaudit），学习反馈仍走 stage 二值（`pkg/agent/workflow.go:896-901`）⇒ **RewardBus 是只写日志，不是总线**。H2 复合 shaped reward、H3 judge 独立性均未实现（judge 用主模型自评，**反向违反 H3**）。
+> **实测**：`RewardEvent` + rewards.jsonl 落盘真实（`pkg/agent/evolution.go:146-177`），~~但设计的 `Weight`（源可信度）字段不存在 ⇒ §4.6「奖励源加权」无载体~~ ✅ **奖励已进学习器且 Weight 已补（2026-07-25）**：新增 `AggregateRewards`（倒序扫尾部窗口、**同 (source,node) 只取最新一条**——门禁"失败→修复→通过"若取均值会被旧失败拖回去）与 `StageRewardScore`/`RunRewardScore`/`GateRewardScore`；`workflow.go` 三处布尔改为「有同节点证据用加权分，无证据回退二值」（回退必须保留，否则未接奖励源的工作流全部退化）。`RewardEvent` 补 `Weight` 并**落盘**，故将来调权重表时历史奖励保留当时可信度。**归因边界**：stage 反馈只认同 run 同节点证据，不吃 run 级奖励——否则"门禁失败后触发的修复阶段"会被它正要修的失败倒打一耙。奖励源由 1/8 增至 **3/8**：新增 `gate.compile`/`gate.test`（`runGlobalCompileGate`/`runGlobalTestGate` 真跑 `go build`/`go test`，是设计里价值排第一的确定性信号，此前这两个函数内 `RecordReward` 调用数为 0）。⚠️ **H2 复合 shaped reward 与 H3 judge 独立性仍未实现**（judge 仍用主模型自评，反向违反 H3）；且确定性门禁是 run 终端信号、发生在 stage 反馈之后，故**首轮阶段仍走二值回退**，要反哺需一次"run 末回溯反馈"（会与 stage 时已发生的反馈双计，未做），折中是加了 run 级消费者：技能提炼闸（`GateRewardScore<0` 时不提炼）。
 
 ```go
 type RewardEvent struct {
@@ -320,7 +320,7 @@ type RewardEvent struct {
 
 ### 4.6 ⑥ 治理　　**[🟠 必留痕/可回滚部分 · 必过闸 🟡 · 不越权 ❌]**
 
-> **实测**：存在**两套互不相通的状态机**：经验用 proposed/validated/promoted/…，技能用 shadow/active/archived；设计的 `observed` 无实现，迁移事件**不入 Journal**。⚠️ **「必过闸」是纸面的**：`pkg/skills` 的 `Skill` 结构无 Status 字段、`parseFrontmatter` 不解析 `status`、`Registry.All()` 不过滤 ⇒ shadow 技能照常进清单、照常可被加载，`evo promote` 改的是**没人读的文本字段**。「不越权」无 ConstraintSet 单调性检查。防 reward hacking 三防线全无。
+> **实测**：存在**两套互不相通的状态机**：经验用 proposed/validated/promoted/…，技能用 shadow/active/archived；设计的 `observed` 无实现，迁移事件**不入 Journal**。✅ **「必过闸」已有运行期效力（2026-07-25）**：`Skill.Status` + frontmatter 解析 + `Get`/清单/Skill 工具排除 shadow，`GetAny`/`All` 留给治理审计。刻意用**黑名单**（shadow/archived/retired/disabled）而非"只有 active 才可用"的白名单——存量 SKILL.md 绝大多数没有 status 行，白名单会一夜禁用全部既有技能；未知值（stable/beta）fail-open 放行。`ImproveSkill` 改用 `GetAny`，否则自改进再也改不了 shadow 技能、`preserveStatus` 会变成死代码。「不越权」无 ConstraintSet 单调性检查。防 reward hacking 三防线全无。
 
 - **五级生命周期**（对齐 aiops design/09 的治理框架）：`observed → proposed → shadow(validated) → active(promoted) → archived`，每级迁移条件量化、事件入 Journal 可审计；
 - **四律**：进化产物不越权（ConstraintSet 单调性）、必留痕（谱系）、必过闸（离线回放+uplift）、可回滚（版本化存储，一键回退到任意谱系点）；

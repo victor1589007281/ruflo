@@ -114,9 +114,9 @@ claude-go 当前的编排能力分散在**三套各自独立的引擎**里，外
 
 ## 四、核心抽象
 
-### 4.1 一切皆 AgentNode　　**[🟠 部分（Kind 2/8）]**
+### 4.1 一切皆 AgentNode　　**[🟠 Kind 仍 2/8 / AgentSpec 字段已通电]**
 
-> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。`AgentSpec` 的 ToolProfile/MaxTurns/Deterministic 字段存在但**零消费方**——`TranslateWorkflow` 只填 Role/Prompt（`pkg/agent/graph_adapter.go:50-53`）。
+> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。✅ **`AgentSpec` 三个字段已通电（2026-07-25）**：`Deterministic` 由 compile/test/build gate 派生并被 `runGate` 消费；`ToolProfile`/`MaxTurns` 经新增的 `NodeExecHints` ctx 载体下推——`MaxTurns` 通过包装 factory 改写 `ResolvedConfig` 真实生效（必须在 factory：`runAgent` 会在调用前覆盖该 ctx 值），`ToolProfile` 在飞书 runner 侧**优先于角色名子串推断**（退役了 `world-builder` 因含 "build" 被判 coding 档拿到 Bash 那个真实误判）。Kind 仍只有 agent|gate。
 
 ```go
 // pkg/graph/spec.go —— 图与节点是纯数据，可 JSON 序列化
@@ -173,7 +173,7 @@ gate/router 设 `Deterministic` 时零 LLM 调用——但仍走同一节点生�
 
 ### 4.2 Graph：DAG + 条件边 + 动态展开　　**[🟠 DAG ✅ / 条件边 🟡 / 动态展开 ❌]**
 
-> **实测**：ready-set 并行调度真实且生产接线（`pkg/graph/engine.go:183-252`）。条件边实现为**自研极简条件**而非设计写的 CEL（`pkg/graph/condition.go:54-111`，仅 ok/fail/score/contains 四类），且 `TranslateWorkflow` 从不产生 Condition ⇒ 生产图全是无条件边。`ExpandSpec` 全仓零代码（仅 2 处注释）。
+> **实测**：ready-set 并行调度真实且生产接线（`pkg/graph/engine.go:183-252`）。条件边实现为**自研极简条件**而非设计写的 CEL（`pkg/graph/condition.go:54-111`，仅 ok/fail/score/contains 四类）。✅ **可表达性已通电（2026-07-25）**：新增 per-workflow 覆盖表（`RegisterGraphOverride` / `LoadGraphOverridesJSON` / `CLAUDE_GO_GRAPH_OVERRIDES`，fail-open）让条件边/Loop/Retry/Timeout 可从生产输入表达，且 `stageDeclaredOverride`+`mergeStageOverride` 是预留接缝（将来给 `StageDef` 加字段只需改前者）。**条件绝不从阶段名推断**——那等于把设计明确否定的"名字白名单"搬进调度器，且猜错会静默跳过整个分支。`ExpandSpec` 全仓零代码（仅 2 处注释）。
 
 ```go
 type EdgeSpec struct {
@@ -194,7 +194,7 @@ type EdgeSpec struct {
 
 ### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 Journal ✅ / 「唯一真源」❌]**
 
-> **实测**：FileJournal + Replay 真实且有零重跑硬证据（`pkg/graph/engine_test.go:422-423`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。事件类型 8/16；RunStatus 3 态而非设计的 7 态；`InvalidateFrom` 不存在，refine 仍只删 checkpoints.json。重试单层化**语义反转**：图层 RetryPolicy 生产恒 0 次，内层环仍是唯一生效层。
+> **实测**：FileJournal + Replay 真实且有零重跑硬证据（`pkg/graph/engine_test.go:422-423`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。事件类型 8/16；RunStatus 3 态而非设计的 7 态；`InvalidateFrom` 不存在，refine 仍只删 checkpoints.json。✅ **重试单层化已落地（2026-07-25）**：`TranslateWorkflow` 现在总给出 `Policies.DefaultRetry={6,5s}`，`stageNodeRunner` 调 `ExecuteSingleStage` 时打 `WithOuterRetryDriven` 标记使内层退化——**图层负责重试、内层让位**，次数刻意与 pipeline 外层（`Coordinator.MaxRetries=6`）对齐，故总尝试数同量级而非新的乘法放大。另修正一处前提：角色差异化的**单次**超时在图模式下本来就生效，缺的是节点级天花板，现按 `computeStageTimeout×(retries+1)×2` 给预算（复用同一张角色→超时表而非再抄一份）。
 
 ```go
 // pkg/graph/run.go
@@ -231,9 +231,9 @@ type LoopPolicy struct {
 
 覆盖：adversarial `Rounds`、content gate 重做环（`teams.go` 内容质量环）、novel-v3 章节循环、refine 多轮、evaluator-optimizer 模式。`loop-group` 容器把"生成→评审"两节点整体循环，即对抗模式的标准化表达。
 
-### 4.5 Hook 总线：三套合一　　**[🟠 骨架 + 🟡 生产未挂；三套仍并存]**
+### 4.5 Hook 总线：三套合一　　**[🟠 已通电为观测桥 / 三套仍并存]**
 
-> **实测**：`HookBus` 骨架存在（`pkg/graph/hooks.go:16-51`，仅 graph/node scope、仅 deny 被解释），但 `executeGraph` 构造 Engine 时**不传 Hooks**（`pkg/agent/graph_adapter.go:189-192`）⇒ 生产恒 `NopBus`。三套原物全在：`pkg/hooks/`、`pkg/engine/internal_hook/`（22 文件）、`pkg/orchestrator/hooks.go:20`。
+> **实测**：`HookBus` 骨架存在（`pkg/graph/hooks.go:16-51`，仅 graph/node scope、仅 deny 被解释），✅ **HookBus 已通电（2026-07-25）**：`teamGraphHooks` 把节点 pre → `TaskRunning` 占位 + `team.Stages` 增量刷盘 + 心跳，post/failure → 终态 StageResult + 刷盘 + 阶段指标（4 个 label 与 `recordStageMetrics` 完全一致，既有 dashboard 不受影响）。**绝不返回 deny**——灰度期观测桥不该新增阻塞路径。这同时补上了此前"图路径无 stage 级增量刷盘与指标、灰度打开后 dashboard 看不到进度"的缺口。三套原物全在：`pkg/hooks/`、`pkg/engine/internal_hook/`（22 文件）、`pkg/orchestrator/hooks.go:20`。
 
 ```go
 // pkg/graph/hooks.go —— 统一事件模型，双维度：作用域 × 相位
