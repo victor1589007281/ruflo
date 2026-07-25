@@ -40,8 +40,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/anthropic/claude-go/pkg/metrics"
 )
 
 // Checkpoint 阶段执行检查点。
@@ -468,37 +466,9 @@ func (c *Coordinator) flushTeamStages(team *ProductionTeam, snapshot []StageResu
 // recordStageMetrics 为单个 stage 结果上报细粒度指标: duration / retry / status。
 // 这些数据供 dashboard 绘制"每个阶段耗时分布 / 重试次数"等图表。
 func (c *Coordinator) recordStageMetrics(team *ProductionTeam, sr StageResult) {
-	if team == nil {
-		return
-	}
-	mc := team.metrics()
-	if mc == nil {
-		return
-	}
-	labels := map[string]string{
-		"workflow": team.Workflow,
-		"stage":    sr.Name,
-		"role":     sr.Role,
-		"status":   string(sr.Status),
-	}
-	durSec := 0.0
-	if sr.Duration != "" {
-		if d, err := time.ParseDuration(sr.Duration); err == nil {
-			durSec = d.Seconds()
-		}
-	}
-	if durSec > 0 {
-		mc.RecordRun("team", metrics.MTeamStageDurationSec, durSec, team.Name, labels)
-	}
-	mc.RecordRun("team", metrics.MTeamStageCount, 1, team.Name, labels)
-	if sr.Status == TaskCompleted {
-		mc.RecordRun("team", metrics.MTeamStageSuccessCount, 1, team.Name, labels)
-	} else {
-		mc.RecordRun("team", metrics.MTeamStageFailCount, 1, team.Name, labels)
-	}
-	if sr.Output != "" {
-		mc.RecordRun("team", metrics.MTeamStageOutputLen, float64(len(sr.Output)), team.Name, labels)
-	}
+	// 委托给图侧那份实现: 两者的 4 个 label 与指标项逐一相同, 保留两份必然漂移。
+	// 图侧额外记重试次数, pipeline 路径的重试由本 Coordinator 自己吞掉, 故传 0。
+	recordGraphStageMetrics(team, sr, 0)
 }
 
 // executeStageWithRetry 带重试和检查点的阶段执行。

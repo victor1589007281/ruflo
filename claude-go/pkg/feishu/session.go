@@ -912,7 +912,32 @@ func (sm *SessionManager) CreateAgentRunner(ctx context.Context, role, systemPro
 		r.resolvedCfg = mcfg
 	}
 	r.runMeta = agent.RunMetadataFromContext(ctx)
+	// 图节点的显式执行提示 (design/01 §4.1 AgentSpec.ToolProfile/MaxTurns)。
+	// 必须在**创建时**捕获: Execute 时的 ctx 已被 runAgent 换过, 拿不到。
+	r.hints = agent.NodeExecHintsFromContext(ctx)
 	return r, nil
+}
+
+// mapExplicitToolProfile 把图节点声明的 tool_profile 字符串映射为内部档位。
+// 无法识别时返回空串, 由调用方回落到角色名推断——**未知值不应导致降权或报错**,
+// 那会让一个拼错的声明静默剥掉 agent 的工具。
+func mapExplicitToolProfile(s string) builtin.ToolProfile {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "chat":
+		return builtin.ToolProfileChat
+	case "research":
+		return builtin.ToolProfileResearch
+	case "coding":
+		return builtin.ToolProfileCoding
+	case "team":
+		return builtin.ToolProfileTeam
+	case "analysis":
+		return builtin.ToolProfileAnalysis
+	case "admin":
+		return builtin.ToolProfileAdmin
+	default:
+		return ""
+	}
 }
 
 // sessionAgentRunner 基于 SessionManager 的 Agent 执行器
@@ -922,6 +947,7 @@ type sessionAgentRunner struct {
 	systemPrompt string
 	resolvedCfg  modelconfig.ResolvedConfig // 从创建时 context 捕获的 plan/role 模型配置
 	runMeta      agent.RunMetadata
+	hints        agent.NodeExecHints // 图节点显式声明的 ToolProfile/MaxTurns (空 = 回落既有推断)
 }
 
 // Execute 执行 agent 任务 (创建独立 QueryEngine, 复用主会话运行模式)。
@@ -964,7 +990,16 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		apiClient.PromptCacheMode = promptCacheMode
 	}
 
-	nestedReg := r.sm.newProfileRegistry(profileForTeamRole(firstNonEmpty(r.runMeta.Role, r.role), r.runMeta.Workflow), registryOptions{})
+	// 工具画像: **显式声明优先于角色名推断**。
+	// profileForTeamRole 是按角色名子串匹配的 (session.go 上方), 那套推断有真实
+	// 误判——例如 world-builder 因含 "build" 被判成 Coding 档而拿到 Bash。
+	// design/01 §4.6 要求显式声明取代猜测; 图节点若声明了 tool_profile 就用它,
+	// 没声明时保持既有行为 (fail-open, 不改变任何现有工作流)。
+	prof := profileForTeamRole(firstNonEmpty(r.runMeta.Role, r.role), r.runMeta.Workflow)
+	if p := mapExplicitToolProfile(r.hints.ToolProfile); p != "" {
+		prof = p
+	}
+	nestedReg := r.sm.newProfileRegistry(prof, registryOptions{})
 
 	permMode := types.PermissionMode(r.sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)

@@ -764,7 +764,10 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	// 编译/测试/一致性门禁仅对"产出可编译代码"的工作流生效。
 	// techblog/creative/novel/research 等写作类工作流不产出代码, 跑 go build 会因
 	// "no main module" 误判失败并触发无意义的修复轮次 (浪费 token)。
-	if team.Cwd != "" && workflowProducesCode(team.Workflow) {
+	// 门禁判据改读**图元数据**而非工作流名白名单: 同一份 GraphMeta 现在同时
+	// 供图引擎与这里使用, 动态注册的工作流因此不会再静默丢掉门禁
+	// (WorkflowGateMetaByName 内部仍回落到原来的两个函数, 今天行为完全等价)。
+	if team.Cwd != "" && WorkflowGateMetaByName(team.Workflow).ProducesCode {
 		if gateErr := ptm.tryGateWithRemediation(ctx, team, executor, "compile",
 			ptm.runGlobalCompileGate, 2); gateErr != "" {
 			ptm.failTeam(team, fmt.Sprintf("全局编译门禁失败: %s", gateErr))
@@ -783,7 +786,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 
 	// 内容质量门禁: 写作类(pipeline)工作流的"评审→未达标→自动修订"环 (见 content_gate.go)。
 	// 仅对白名单工作流生效; 跳过用户驱动的精修运行 (PendingFeedback 非空), 避免双重注入。
-	if contentQualityGated(team.Workflow) && strings.TrimSpace(team.PendingFeedback) == "" {
+	if WorkflowGateMetaByName(team.Workflow).QualityGate == "content" && strings.TrimSpace(team.PendingFeedback) == "" {
 		results = ptm.tryContentQualityGate(ctx, team, executor, wf, results)
 	}
 
