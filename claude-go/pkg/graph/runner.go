@@ -22,8 +22,44 @@ type NodeInput struct {
 	// PrevOutputs 按节点 ID 的上游产出, 仅含直接前驱中 completed 的
 	// (与入边条件是否满足无关, 见 engine.go 语义5)。
 	PrevOutputs map[string]string
-	Iteration   int    // loop 轮次, 0 起 (design/01 §4.4)
+	Iteration   int    // 节点级 loop 轮次, 0 起 (design/01 §4.4)
 	Feedback    string // loop 回灌 (Feedback 模板中 {prev_output} 已被引擎替换)
+
+	// GroupIteration loop-group 组级轮次 (0 起), 仅组内成员节点非零。
+	// 与 Iteration 分开是必须的: 成员节点自己也可能声明节点级 Loop, 那会覆写
+	// Iteration —— 两个轮次挤一个字段会让 runner 分不清"第几轮组循环"。
+	GroupIteration int
+	// Shard 本次执行是 map 节点的一个分片时非 nil (§4.2)。
+	// 分片内容如何进 prompt 由 runner 决定 (引擎不做占位替换)。
+	Shard *ShardInput
+	// Shards reduce 节点聚合的上游分片结果 (按 map 节点 + 分片序), 非 reduce 节点为空。
+	Shards []ShardResult
+
+	// nested 引擎内部调度标记: 本次执行属于嵌套层叶子 (map 分片 / loop-group 组内),
+	// 需要先取 run 级并发票。不导出 —— 它是调度细节, 不属于 runner 契约。
+	nested bool
+}
+
+// ShardInput map 分片的输入 (design/01 §4.2)。
+type ShardInput struct {
+	NodeID string // 分片节点 ID: <map节点>#<序号>
+	MapID  string // 所属 map 节点 ID
+	Index  int    // 分片序号, 0 起
+	Total  int    // 本次扇出的分片总数
+	Value  string // 分片内容 (切分后的集合元素原文)
+}
+
+// ShardResult 一个 map 分片的执行结果 (进 map 节点的 NodeResult.Shards,
+// 再经 NodeInput.Shards 供 reduce 聚合)。
+type ShardResult struct {
+	NodeID string  `json:"node_id"`
+	MapID  string  `json:"map_id"`
+	Index  int     `json:"index"`
+	Input  string  `json:"input,omitempty"`
+	Status string  `json:"status"`
+	Output string  `json:"output,omitempty"`
+	Score  float64 `json:"score,omitempty"`
+	Err    string  `json:"err,omitempty"`
 }
 
 // NodeResult 节点执行结果。
@@ -32,6 +68,21 @@ type NodeResult struct {
 	Output string  // 节点产出 (进 journal, 供下游 PrevOutputs / 条件求值)
 	Score  float64 // gate 节点评分, 无则 0
 	Err    string  // 失败/跳过原因
+
+	// Shards map 节点各分片结果 (引擎填, runner 不必理); 经 journal 往返以支持 resume。
+	Shards []ShardResult
+	// Expansion runner 请求追加进运行图的子图 (design/01 §4.2 动态展开)。
+	// **仅当该节点声明了 NodeSpec.Expand 时被引擎接受**, 且要过深度/条数/总量
+	// 三道闸与"约束只收窄"检查; 被拒绝不影响本节点自身的终态, 只记 journal + 日志。
+	Expansion *Expansion
+}
+
+// Expansion 一次动态展开的载荷 (design/01 §4.2)。
+// 节点 ID 会被引擎命名空间化为 <父节点>/<子节点ID> (防重名 + 归因),
+// Edges 的 From/To 用**未命名空间化**的子节点 ID 或父节点 ID 书写。
+type Expansion struct {
+	Nodes []NodeSpec `json:"nodes"`
+	Edges []EdgeSpec `json:"edges,omitempty"`
 }
 
 // NodeRunner 节点执行器接口。实现方须遵守 ctx 取消/超时

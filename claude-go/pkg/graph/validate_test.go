@@ -56,19 +56,28 @@ func TestValidateErrors(t *testing.T) {
 			}},
 			wantSub: "重复",
 		},
+		// 未实现的形态必须**显式报错**而不是静默接受 (静默接受 = 图里多一个什么都
+		// 不做的节点, 表现为"整条分支莫名 skipped")。
 		{
-			name: "预留Kind暂不支持",
+			name: "router尚未实现",
 			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
-				{ID: "m", Kind: NodeKindMap},
+				{ID: "r", Kind: NodeKindRouter},
 			}},
-			wantSub: "暂不支持",
+			wantSub: "尚未实现",
 		},
 		{
-			name: "loop-group暂不支持",
+			name: "subgraph尚未实现",
 			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
-				{ID: "lg", Kind: "loop-group"},
+				{ID: "s", Kind: NodeKindSubgraph},
 			}},
-			wantSub: "暂不支持",
+			wantSub: "尚未实现",
+		},
+		{
+			name: "human尚未实现",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "h", Kind: NodeKindHuman},
+			}},
+			wantSub: "尚未实现",
 		},
 		{
 			name: "未知Kind",

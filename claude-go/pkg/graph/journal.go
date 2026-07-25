@@ -23,6 +23,22 @@ const (
 	EvNodeSkipped   = "node.skipped"
 	EvLoopIteration = "loop.iteration"
 	EvRunFinished   = "run.finished"
+
+	// EvMapExpanded map 节点完成扇出切分 (design/01 §4.2)。
+	// Data: count / shards(JSON 数组字符串) / ids / truncated / source / split。
+	// **它是 resume 的真源**: 恢复时按事件里记下的分片重建, 不重新切分上游产出
+	// —— 上游产出来自 LLM, 重切可能得到不同的分片集, 事件溯源就失效了。
+	EvMapExpanded = "map.expanded"
+	// EvGraphExpanded 动态展开: 节点产出被并入运行图 (design/01 §4.2)。
+	// Data: parent / depth / count / subgraph(JSON 字符串, 已命名空间化)。
+	// 恢复时按此重建运行图, 不重新问 runner。
+	EvGraphExpanded = "graph.expanded"
+	// EvExpandRejected 展开被边界闸拦下 (深度/条数/总量/约束放宽/结构非法)。
+	// 只记账不改变节点终态; 有它才能解释"模型给了子图但图没变大"。
+	EvExpandRejected = "graph.expand_rejected"
+	// EvGroupIteration loop-group 一轮结束 (design/01 §4.4)。
+	// Data: iteration / status / output / score。**resume 按已完成轮次续跑**。
+	EvGroupIteration = "loop.group.iteration"
 )
 
 // Event 一条 journal 事件 (design/01 §4.3)。
@@ -193,6 +209,30 @@ type RunState struct {
 	Completed map[string]NodeResult // 已完成节点 (按节点 ID), 后写覆盖先写
 	Finished  bool                  // 是否已记 run.finished
 	Status    string                // run.finished 携带的最终状态
+
+	// MapShards map 节点 → 上次扇出的分片内容 (按序)。resume 时按此重建分片集,
+	// **不重新切分上游产出** (上游是 LLM 产出, 重切可能得到不同分片集)。
+	MapShards map[string][]string
+	// Expansions 动态展开记录 (按发生序)。resume 时按此重建运行图,
+	// 而不是重新问 runner —— 否则恢复会得到与首跑不同的图, 事件溯源就失效了。
+	Expansions []ExpandRecord
+	// GroupIters loop-group 节点 → 已完成的组轮次状态 (resume 从下一轮续跑)。
+	GroupIters map[string]GroupIterState
+}
+
+// ExpandRecord 一条已生效的动态展开 (节点 ID 已命名空间化)。
+type ExpandRecord struct {
+	Parent string
+	Depth  int
+	Sub    Expansion
+}
+
+// GroupIterState loop-group 已完成轮次的快照。
+type GroupIterState struct {
+	Done   int     // 已完成的轮次数 (= 下一轮的轮次号)
+	Status string  // 最后一轮 ResultFrom 节点的状态
+	Output string  // 最后一轮产出 (供 Feedback 回灌)
+	Score  float64 // 最后一轮评分 (供 Until 求值)
 }
 
 // Replay 重放事件序列重建 RunState。
@@ -203,7 +243,11 @@ type RunState struct {
 // resume 语义: Engine 启动时若 RunState 里已有 completed 节点,
 // 直接作为缓存产出跳过执行 (见 engine.go)。
 func Replay(events []Event) *RunState {
-	st := &RunState{Completed: map[string]NodeResult{}}
+	st := &RunState{
+		Completed:  map[string]NodeResult{},
+		MapShards:  map[string][]string{},
+		GroupIters: map[string]GroupIterState{},
+	}
 
 	// —— 只重放"最近一次 run"的事件 ——
 	//
@@ -251,7 +295,56 @@ func Replay(events []Event) *RunState {
 			if f, ok := ev.Data["score"].(float64); ok {
 				r.Score = f
 			}
+			// map 节点的分片结果一并恢复: reduce 在 resume 后可能要重跑, 而它的
+			// 上游 map 是缓存命中不再执行的 —— 分片结果只能来自 journal。
+			if s, ok := ev.Data["shards"].(string); ok && s != "" {
+				var shards []ShardResult
+				if json.Unmarshal([]byte(s), &shards) == nil {
+					r.Shards = shards
+				}
+			}
 			st.Completed[ev.NodeID] = r
+		case EvMapExpanded:
+			if ev.NodeID == "" {
+				continue
+			}
+			if s, ok := ev.Data["shards"].(string); ok && s != "" {
+				var vals []string
+				if json.Unmarshal([]byte(s), &vals) == nil {
+					st.MapShards[ev.NodeID] = vals
+				}
+			}
+		case EvGraphExpanded:
+			rec := ExpandRecord{Parent: ev.NodeID}
+			if s, ok := ev.Data["parent"].(string); ok && s != "" {
+				rec.Parent = s
+			}
+			if f, ok := ev.Data["depth"].(float64); ok {
+				rec.Depth = int(f)
+			} else if i, ok := ev.Data["depth"].(int); ok {
+				rec.Depth = i
+			}
+			s, _ := ev.Data["subgraph"].(string)
+			if s == "" || json.Unmarshal([]byte(s), &rec.Sub) != nil {
+				continue // 载荷坏了就当没展开过: 宁可少一段子图, 不要半个图
+			}
+			st.Expansions = append(st.Expansions, rec)
+		case EvGroupIteration:
+			if ev.NodeID == "" {
+				continue
+			}
+			gs := st.GroupIters[ev.NodeID]
+			gs.Done++
+			if s, ok := ev.Data["status"].(string); ok {
+				gs.Status = s
+			}
+			if s, ok := ev.Data["output"].(string); ok {
+				gs.Output = s
+			}
+			if f, ok := ev.Data["score"].(float64); ok {
+				gs.Score = f
+			}
+			st.GroupIters[ev.NodeID] = gs
 		case EvRunFinished:
 			st.Finished = true
 			if s, ok := ev.Data["status"].(string); ok {
@@ -267,6 +360,11 @@ func Replay(events []Event) *RunState {
 	// 其余——与 checkpoints.json 的既有语义一致, 不改变用户可感知行为。
 	if st.Finished && st.Status == RunStatusCompleted {
 		st.Completed = map[string]NodeResult{}
+		// 展开/扇出/组轮次同属"上一轮的运行图形态", 必须一起清空: 只清 Completed
+		// 会让新一轮继承上一轮展开出来的节点, 得到一张谁都没声明过的图。
+		st.MapShards = map[string][]string{}
+		st.Expansions = nil
+		st.GroupIters = map[string]GroupIterState{}
 	}
 	return st
 }
