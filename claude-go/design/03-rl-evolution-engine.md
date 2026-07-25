@@ -178,9 +178,9 @@ POMDP:  state  s = (任务 objective, 图/节点上下文, 黑板, 注入的记�
 
 部署：L4 辅助系统（design/02）。单机=进程内模块；分布式=独立 evolution 服务，中心化经验/记忆库（解学习孤岛，假设 #17）。
 
-### 4.1 ① TraceStore：轨迹底座　　**[🟠 Ref ✅ / Kind 3/5 / 采样 TTL 🟡]**
+### 4.1 ① TraceStore：轨迹底座　　**[🟠 Ref ✅ / 采样 TTL ✅ / Kind 仍 3/5]**
 
-> **实测**：Span + Ref 内联/Blob 内容寻址真实且生产接线（`pkg/evolution/tracestore/tracestore.go:43-131`）。但只写出 3 种 Kind（tool_call/turn/node），**`llm_call`/`gate` 从不写** ⇒ E1 验收「任一 run 可完整还原 prompt→response→tool 链」不成立。⚠️ **`TraceCaptureHook` 在 CLI 形态永不注册**（`applyFeatureFlags` 只在 `NewQueryEngine` 内跑，而 CLI 在建引擎后才赋 TraceStore 且无 re-register）。**此结论有可执行证据**：`pkg/engine/hook_registration_order_test.go` 用 `HookChain.Names(phase)` 断言三种赋值顺序下 hook 的有无，可直接 `go test -run TestHookRegistration -v ./pkg/engine/` 复现。采样 `BodySampleRate`/TTL `SweepTraceFiles` **生产调用方均为 0** ⇒ 🟡 能力就绪；长跑实例 log+blob 无限增长。
+> **实测**：Span + Ref 内联/Blob 内容寻址真实且生产接线（`pkg/evolution/tracestore/tracestore.go:43-131`）。但只写出 3 种 Kind（tool_call/turn/node），**`llm_call`/`gate` 从不写** ⇒ E1 验收「任一 run 可完整还原 prompt→response→tool 链」不成立。✅ **`TraceCaptureHook` 在 CLI 不注册的问题已修（2026-07-25）**：新增 `QueryEngine.RefreshHooks()` 并在 CLI 装配末尾调用（`cmd/claude-go/main.go`）。刻意不复用 `EnableFrontierOptimizations`——后者会顺带翻开一批 `Config.Enable*`，那是行为变更。可执行证据：`pkg/engine/hook_registration_order_test.go` 用新增的 `HookChain.Names(phase)` 断言三种赋值顺序，`go test -run TestHookRegistration -v ./pkg/engine/` 可复现。✅ **采样与 TTL 已通电（2026-07-25）**：`CLAUDE_GO_TRACE_SAMPLE` 控正文采样率、`CLAUDE_GO_TRACE_TTL` 控 TTL；`StartJanitor` 改为包级函数（只需目录、不碰 Store 状态，而调用方才是知道路径的那层），CLI 与飞书 Bot 两条路径都已接。两个变量未设时行为与此前完全一致（全采、不清理），解析失败/越界回落默认并打日志。
 
 **统一 trace-id**（与 design/01 Journal、design/02 LLMGateway 同一套）：
 
@@ -301,9 +301,9 @@ type RewardEvent struct {
 - 目标仅限本地小模型窄任务：意图识别（`IntentRecognizer`）、路由 gate、内容评分器——用 gemma4:26b 微调后替换对应 SimpleComplete 调用，省 token 且可控;
 - 明确不做：主力模型微调（无权重）、在线 RL（风险与算力都不成立）。
 
-### 4.4 ④ 策略应用层　　**[🟠 经验注入同构 / hook 不同构]**
+### 4.4 ④ 策略应用层　　**[🟠 经验注入与 hook 均已同构 / 拦截器仍缺]**
 
-> **实测**：`EvolutionRecorder` 拦截器零命中（依赖 design/01 §4.10，未实现）。经验注入确实同构（`pkg/agent/workflow.go:820`，两形态共用）。但 ⚠️ **`MemoryInjectHook` 在 CLI 同样未注册**（与 TraceCaptureHook 同根因；实测 CLI 顺序下 `PhasePreRequest` 只有 `[toolresult_level message_filter message_metrics]`，见 `pkg/engine/hook_registration_order_test.go`）⇒ **L1/L2 记忆注入在 CLI 形态失效**，设计声称的「headless 与飞书同构，开环 1 从架构上不可能再出现」**未达成**。`policy_decision` Span 零命中。
+> **实测**：`EvolutionRecorder` 拦截器零命中（依赖 design/01 §4.10，未实现）。经验注入确实同构（`pkg/agent/workflow.go:820`，两形态共用）。但 ✅ **`MemoryInjectHook` 在 CLI 未注册的问题已随 `RefreshHooks()` 一并修（2026-07-25）**；实测修复前 CLI 顺序下 `PhasePreRequest` 只有 `[toolresult_level message_filter message_metrics]`，见 `pkg/engine/hook_registration_order_test.go`⇒ **L1/L2 记忆注入在 CLI 形态失效**，设计声称的「headless 与飞书同构，开环 1 从架构上不可能再出现」**未达成**。`policy_decision` Span 零命中。
 
 - 注入点全部走 design/01 拦截器/hook（EvolutionRecorder 拦截器 + MemoryInjectHook），**headless 与飞书同构**——开环 1 从架构上不可能再出现；
 - 每次注入记 `policy_decision` Span（注入了哪些经验/记忆/技能/模板版本）——bandit 更新与 uplift 归因的数据基础（现 RecordInjection 的推广）。

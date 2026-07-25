@@ -127,9 +127,9 @@
 
 依赖方向：L5→L2→L3→L1，L4 被 L2/L3/L5 共享；**严禁反向依赖**（现状 Bot 上帝对象即全层互抱）。
 
-### 3.1 L1 · LLM 引擎层（LLM Gateway）　　**[🟡 接口建成零通电]**
+### 3.1 L1 · LLM 引擎层（LLM Gateway）　　**[🟠 网关可接入 / 接口仍未被生产依赖]**
 
-> **实测**：`LLMGateway` 接口存在（`pkg/llmgw/gateway.go:26-33`）但 **`NewLocal` 全仓唯一调用方是自己的测试**；生产 `pkg/feishu/bot.go:305,419` 直接 `api.NewClient` ⇒「上层只依赖本接口」未发生。`ChatRequest` **无 Trace 字段**（设计要求必带四元组）。网关只做路由 + access.jsonl：**fallback/429 熔断/配额/prompt cache 全无**，OpenAI 协议未实现。⚠️ `CLAUDE_GO_LLM_GATEWAY` 是**死环境变量**（distributed.yaml 设了两处，Go 侧零读取）⇒ T1 拓扑里网关是装饰品。
+> **实测**：`LLMGateway` 接口存在（`pkg/llmgw/gateway.go:26-33`）但 **`NewLocal` 全仓唯一调用方是自己的测试**；生产 `pkg/feishu/bot.go:305,419` 直接 `api.NewClient` ⇒「上层只依赖本接口」未发生。`ChatRequest` **无 Trace 字段**（设计要求必带四元组）。网关只做路由 + access.jsonl：**fallback/429 熔断/配额/prompt cache 全无**，OpenAI 协议未实现。✅ **`CLAUDE_GO_LLM_GATEWAY` 已通电（2026-07-25）**：新增 `modelconfig.ApplyGatewayOverride`，覆盖点选在 `ConfigResolver` 的 4 个出口而非各 `api.NewClient` 调用点（后者散落 feishu/CLI/advisor/worker 多处，逐个改必然漏）；**fallback 端点一并改指网关**，否则主端点走网关而降级直连，集中记账在最需要时失效。⚠️ 但 `LLMGateway` **接口本身**仍未被生产依赖（`NewLocal` 唯一调用方仍是自测），故本层整体仍为 🟠：网关可接入了，但"上层只依赖本接口"未达成。
 
 **现状归属**：`pkg/api.Client`（全部出口）、`pkg/agent/modelconfig`（别名→端点解析）、`ConfiguredCloneFull`（`client.go:201`）。
 
@@ -276,7 +276,7 @@ design/03 的 Evolution Service 整体作为 L4 组件：单机=进程内模块�
 
 ## 四、部署形态　　**[🟠 T0 ✅ / T1 🟡 断链 / T2 🟠 / T3 🟠 声明级]**
 
-> **实测**：⚠️ **「实测跑通」的证据强度需下调**：仓内零 shell 脚本、零 Makefile、零 CI、零 kubectl 输出，V2/V3 结论只存在于 `PROGRESS.md` 文字里。且 monolith 与 control **都没传 `--config`**，而配置自动发现路径不含 `/etc/claude-go/` ⇒ **挂载的 ConfigMap 从未被读取**，Pod 落到占位 provider 分支 ⇒ 那是不需要 LLM 的**存活冒烟**，不构成功能验证。T3 的 control state 是 emptyDir 且 replicas>1 会立即分裂。`layers: {llm,bus,state}` 配置项不存在；「进程间嵌入式 NATS」无依赖。
+> **实测**：⚠️ **「实测跑通」的证据强度需下调**：仓内零 shell 脚本、零 Makefile、零 CI、零 kubectl 输出，V2/V3 结论只存在于 `PROGRESS.md` 文字里。~~且 monolith 与 control 都没传 `--config`，而配置自动发现路径不含 `/etc/claude-go/` ⇒ 挂载的 ConfigMap 从未被读取~~ ✅ **已修（2026-07-25）**：`ResolveJSONConfigPath` 的发现列表补上容器约定路径 `/etc/claude-go/config.json`（放最后，本机开发时家目录配置优先），挂载的 ConfigMap 现在会被读取。⚠️ 但此前记录的 V2/V3"双模式实测全通"仍应按**存活冒烟**理解——那次跑的是修复前的二进制，Pod 落在占位 provider 分支、不接触 LLM。T3 的 control state 是 emptyDir 且 replicas>1 会立即分裂。`layers: {llm,bus,state}` 配置项不存在；「进程间嵌入式 NATS」无依赖。
 
 | 形态 | 进程 | 适用 | 说明 |
 |---|---|---|---|
