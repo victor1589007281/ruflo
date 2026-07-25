@@ -307,9 +307,21 @@ type SkillSelector struct {
 - 注入路径不变：合并进 `<role_skills>` 块（`MergedPrompt`，`roles.go:105-159`）；Skill 工具按需取全文。
 - **编排能力**：skill 可声明 `graph:` 段——技能不仅是提示词，还能携带一个子图模板（如 mr-chain 类多阶段技能），Skill 选择即子图注入。这为 design/03 的"skill 进化=图模板进化"铺路。
 
-### 4.8 Subagent 派生　　**[❌ 未实现]**
+### 4.8 Subagent 派生　　**[🟠 图内派生 ✅ / 收编飞书裸 QueryEngine 属 M4]**
 
-> **实测**：`SpawnSubgraph` 零命中；subagent 仍是裸 QueryEngine（`pkg/feishu/session.go:909`、`cmd/claude-go/main.go:730`），不进 Journal、不受预算。
+> **实测（改造前）**：`SpawnSubgraph` 零命中；subagent 是节点内 agent 自己造的裸 QueryEngine（`pkg/feishu/session.go` `runNestedAgent`、`cmd/claude-go/main.go`），**对编排层完全不可见**——没有 NodeID、不进 Journal、不受 hook/预算/轨迹覆盖，一个节点可以在里面烧掉任意多 token 而图这一层什么都看不到。
+>
+> ✅ **`SpawnSubgraph` 已实现（2026-07-25）**：`pkg/graph/spawn.go`（19 个测试）。设计要的三样「对编排层可见」不是额外写的，是**复用同一个 `rc`** 白拿的：子图节点经同一个 `rc.nodeExec` 执行 ⇒ 自动过同一条拦截器链（预算把子图开销记在父运行头上）、自动进同一份 journal（NodeID 形如 `<父>~sp<指纹>/<子>`）、自动受同一套 hook 覆盖。有测试直接断言「父 1 次 + 子图 2 次 = 预算台账 3 次」与「预算满了能掐住子图」。
+>
+> 与 §4.2 动态展开的分工：展开是 planner 节点**跑完后**把分解结果并入当前 run（异步、改图）；spawn 是节点**执行期间**由 agent 工具调用派生、同步等结果（不改父图）。边界闸的理由相同（内容来自 LLM 产出），故 spawn 复用 expand 的 `narrowToParent` 做单调收窄，不另写一套。
+>
+> **命名空间用请求内容指纹而非序号**——这是个隐蔽坑：用序号时父节点重跑序号从 0 重来，而 agent 这次可能请求了**不同**的子图，同一个 `~sp0/` 下 resume 缓存会把上次产出错配给这次。指纹方案下请求相同则命中缓存（省真金白银的 LLM 调用）、不同则命名空间不同不可能误命中。指纹对节点声明顺序不敏感，否则会白丢缓存。
+>
+> 四道闸：授权（未声明 `Spawn` 则 `NodeInput.Spawn` 为 nil，授权缺失表现为"没这个能力"而非调了才报错）、深度、单次条数、派生次数（与条数是两道不同的闸——后者挡"派生 500 次每次 1 个节点"），外加运行图总量闸。拒绝一律记 `subgraph.rejected`，否则"agent 说它派生了但图里什么都没有"事后不可解释。`SpawnSpec` 三个上限允许 0（取缺省）但**负值在 Validate 阶段就拒**：负数会被 `<=0 取缺省` 静默当成"没设"，一个写错的 `-1` 就绕过了边界。
+>
+> ⚠️ **被自己的测试抓出一个真缺陷**：预算原本"执行后记账"，嵌套派生时父节点在飞行中一直没被计数，子图便能借这个空档多跑几个节点，**透支量正好等于派生深度**。改为**准入即记账**（判定与记账在同一把锁里，否则 N 个并发节点会同时通过"还差 1 个配额"的判定，并发度就是透支量）。
+>
+> ⚠️ **仍缺**：收编 `pkg/feishu` 的 `runNestedAgent` 与 `cmd/claude-go` 那两条裸 QueryEngine 路径——它们是全部会话共用的 Agent 工具主路径，替换属 M4。现状是「图内派生已可见，图外派生仍不可见」。
 
 - 节点内 agent 通过 `SpawnSubgraph(spec, params)` 工具派生子图（受 ConstraintSet 单调性约束、计入父节点预算）。取代"factory 创建裸 QueryEngine"（`teams.go:158`、`feishu/session.go:807-830`、`main.go:2639`）——**subagent 从此对编排层可见**：有 NodeID、进 Journal、受 hook/预算/轨迹覆盖。
 - 现有 `cliAgentRunner`/`sessionAgentRunner` 改为 AgentRuntime 的两个实现（见 4.9），行为不变。

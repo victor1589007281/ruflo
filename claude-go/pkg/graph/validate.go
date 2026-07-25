@@ -215,6 +215,14 @@ func validateNodeShape(n NodeSpec, insideGroup bool) error {
 	if n.Expand != nil && n.Expand.MaxNodes <= 0 {
 		return fmt.Errorf("graph: 节点 %q 的 Expand.max_nodes 必须 > 0 (无界展开违法, design/01 §4.2)", n.ID)
 	}
+	// Spawn 的三个上限允许留 0 (走缺省), 但**负值必须拒**: 负数会让 maxXxx() 的
+	// "<=0 取缺省"判定把它当成"没设", 于是一个写错的 -1 会静默变成默认值而不是报错
+	// —— 派生边界是安全属性, 不能靠猜。
+	if n.Spawn != nil {
+		if n.Spawn.MaxDepth < 0 || n.Spawn.MaxNodes < 0 || n.Spawn.MaxSpawns < 0 {
+			return fmt.Errorf("graph: 节点 %q 的 Spawn 上限不得为负 (0 = 取缺省, design/01 §4.8)", n.ID)
+		}
+	}
 	return nil
 }
 

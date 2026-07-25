@@ -148,13 +148,18 @@ func (b budgetExceeded) String() string {
 
 // BudgetManager 预算台账拦截器。并发安全 (引擎从多个节点 goroutine 调用)。
 //
-// 记账与判定分离: 判定发生在**执行前**(拒绝还没花的钱), 记账发生在执行后。
-// 这个顺序是必须的 —— 执行后才判定意味着预算总会被超出至少一个节点的开销。
+// **准入即记账**: 次数在放行的那一刻就加, 不等执行完。这一点是被测试逼出来的 ——
+// 起初写成"执行后记账", 结果嵌套派生 (§4.8 SpawnSubgraph) 时父节点在飞行中一直
+// 没被计数, 子图便能借着这个空档多跑几个节点, 预算透支量正好等于派生深度。
+// 改成准入即记账后, "上限 N 就只执行 N 次"在任意嵌套深度下都成立。
+//
+// 代价是被 ctx 取消、根本没跑起来的节点也占一次配额。这是刻意取舍: 预算的作用是
+// 防失控, 宁可少放一次也不能透支。token 仍在执行后累加 (只有跑完才知道花了多少)。
 type BudgetManager struct {
 	budget  Budget
 	started time.Time
 
-	mu       sync.Mutex
+	mu sync.Mutex
 	// appendEv 记 budget.consumed/exceeded 事件; nil = 不记账 (判定照常执行)。
 	// 由 Engine.Run 经 attachJournal 注入 (见 journalAware), 受 mu 保护:
 	// Engine 可被复用跑多张图, 每次 Run 都会重新注入。
@@ -193,7 +198,7 @@ func (m *BudgetManager) Name() string { return "budget" }
 
 // Around 见 NodeInterceptor。
 func (m *BudgetManager) Around(ctx context.Context, node NodeSpec, in NodeInput, next NodeExec) NodeResult {
-	if ex := m.check(node.ID); ex != nil {
+	if ex := m.admit(node.ID); ex != nil {
 		status := NodeStatusFailed
 		if strings.EqualFold(m.budget.OnExceed, "skip") {
 			status = NodeStatusSkipped
@@ -212,8 +217,11 @@ func (m *BudgetManager) Around(ctx context.Context, node NodeSpec, in NodeInput,
 	return res
 }
 
-// check 执行前判定。返回非 nil 表示应拒绝。
-func (m *BudgetManager) check(nodeID string) *budgetExceeded {
+// admit 准入判定 + 记账 (原子)。返回非 nil 表示应拒绝, 此时**不记账**。
+//
+// 判定与记账必须在同一把锁里: 分成两步会让 N 个并发节点同时通过"还差 1 个配额"
+// 的判定, 于是并发度就是透支量。
+func (m *BudgetManager) admit(nodeID string) *budgetExceeded {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.exceeded != nil {
@@ -238,14 +246,15 @@ func (m *BudgetManager) check(nodeID string) *budgetExceeded {
 		m.exceeded = &budgetExceeded{"tokens", fmt.Sprint(b.MaxTokens), fmt.Sprint(m.tokens)}
 		return m.exceeded
 	}
+	// 放行 = 占用一次配额 (见类型注释"准入即记账")。
+	m.nodeRuns++
+	m.perNode[nodeID]++
 	return nil
 }
 
-// observe 执行后记账。
+// observe 执行后累加 token 用量 (次数已在 admit 时记过)。
 func (m *BudgetManager) observe(nodeID string, res NodeResult) {
 	m.mu.Lock()
-	m.nodeRuns++
-	m.perNode[nodeID]++
 	m.tokens += res.Tokens
 	runs, tokens, total := m.perNode[nodeID], m.tokens, m.nodeRuns
 	m.mu.Unlock()

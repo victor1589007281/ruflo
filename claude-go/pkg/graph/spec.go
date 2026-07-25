@@ -79,6 +79,11 @@ type NodeSpec struct {
 	Reduce *ReducePolicy `json:"reduce,omitempty"`
 	// Group 仅 Kind=="loop-group" 有效: 组内子图 + 组级循环 (§4.4)。
 	Group *GroupPolicy `json:"group,omitempty"`
+	// Spawn 声明本节点**可以**派生子图 (§4.8 SpawnSubgraph)。
+	// 未声明时 NodeInput.Spawn 为 nil —— 授权缺失表现为"没有这个能力", 而不是
+	// 调用了才报错。与 Expand 同一原则: 派生能力必须由图显式授予, 否则任何 runner
+	// 都能凭工具调用往编排里塞执行单元。
+	Spawn *SpawnSpec `json:"spawn,omitempty"`
 	// Expand 声明本节点**可以**动态展开子图 (§4.2)。
 	// 未声明时 runner 返回的 Expansion 被引擎忽略 —— 展开能力必须由图显式授予,
 	// 否则任何 runner 都能凭产出往运行图里塞节点。

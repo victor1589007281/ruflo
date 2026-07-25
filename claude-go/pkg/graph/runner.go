@@ -41,6 +41,11 @@ type NodeInput struct {
 	// 记录与 journal 对齐。故分两个字段: node.ID 是语义名, NodeRef 是归因名。
 	NodeRef string
 
+	// Spawn 派生子图的入口 (§4.8)。**仅当节点声明了 NodeSpec.Spawn 时非 nil** ——
+	// runner 应把它暴露给节点内 agent 的工具, 取代"自己造裸 QueryEngine"那条路
+	// (那条路对编排层不可见: 无 NodeID、不进 Journal、不受预算)。
+	Spawn Spawner
+
 	// nested 引擎内部调度标记: 本次执行属于嵌套层叶子 (map 分片 / loop-group 组内),
 	// 需要先取 run 级并发票。不导出 —— 它是调度细节, 不属于 runner 契约。
 	nested bool

@@ -40,6 +40,14 @@ const (
 	// Data: iteration / status / output / score。**resume 按已完成轮次续跑**。
 	EvGroupIteration = "loop.group.iteration"
 
+	// EvSubgraphSpawned 节点内 agent 派生了子图 (design/01 §4.8)。
+	// Data: spawn(请求指纹) / namespace / nodes / result_from / depth / subgraph。
+	// 有它 subagent 才对编排层可见 —— 改造前派生的裸 QueryEngine 一条痕迹都不留。
+	EvSubgraphSpawned = "subgraph.spawned"
+	// EvSubgraphRejected 派生被边界闸拦下 (深度/次数/条数/总量/结构非法)。
+	// 没有它, "agent 说它派生了但图里什么都没有"在事后完全不可解释。
+	EvSubgraphRejected = "subgraph.rejected"
+
 	// EvBudgetConsumed 一次节点执行后的预算记账 (design/01 §4.3 事件枚举 + §4.10)。
 	// Data: node_runs / node_runs_this, 以及 runner 真回报用量时的 tokens / tokens_total。
 	// **重放时不重建台账**: 预算是"本次运行"的量, resume 后续跑应按新预算重新计,

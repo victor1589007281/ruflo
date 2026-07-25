@@ -383,6 +383,8 @@ type dagRun struct {
 	// 组循环给全部成员的公共输入 (仅 loop-group 的组内 scope 非零)。
 	feedback  string
 	groupIter int
+	// params 本层专属图参数 (仅派生子图非零, §4.8): 与 rc.params 合并, 同名以它为准。
+	params map[string]string
 	// basePrev 组**外**上游的产出: 组内成员照样要看得到 (组是个容器, 不是隔离舱),
 	// 否则组内第一个节点拿不到进组前的交接内容。组内同名前驱覆盖它。
 	basePrev map[string]string
@@ -490,12 +492,15 @@ func (e *Engine) scheduleDAG(ctx context.Context, rc *runCtx, dr *dagRun) bool {
 					running++
 					rc.appendEv(EvNodeScheduled, dr.scope.evID(id), dr.scope.extra)
 					in := NodeInput{
-						Objective: rc.objective, Params: rc.params,
+						Objective: rc.objective, Params: dr.effectiveParams(rc),
 						PrevOutputs:    dr.prevOutputs(id),
 						Feedback:       dr.feedback,
 						GroupIteration: dr.groupIter,
 						NodeRef:        dr.scope.evID(id),
 					}
+					// 派生入口 (§4.8): 只有声明了 Spawn 的节点拿到非 nil ——
+					// 授权缺失表现为"没有这个能力", 而不是调了才报错。
+					in.Spawn = newNodeSpawner(e, rc, dr.scope, n, in)
 					if n.Kind == NodeKindReduce {
 						in.Shards = dr.gatherShards(n)
 					}
@@ -751,4 +756,20 @@ func (e *Engine) sleep(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+// effectiveParams 本层可见的图参数: 运行级参数叠加本层专属参数 (§4.8 派生子图)。
+// 无本层参数时直接返回运行级 map, 不做无谓拷贝 (每个节点派发都会调到)。
+func (dr *dagRun) effectiveParams(rc *runCtx) map[string]string {
+	if len(dr.params) == 0 {
+		return rc.params
+	}
+	out := make(map[string]string, len(rc.params)+len(dr.params))
+	for k, v := range rc.params {
+		out[k] = v
+	}
+	for k, v := range dr.params { // 同名以本层为准
+		out[k] = v
+	}
+	return out
 }
