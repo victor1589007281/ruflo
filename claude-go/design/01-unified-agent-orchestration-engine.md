@@ -114,9 +114,9 @@ claude-go 当前的编排能力分散在**三套各自独立的引擎**里，外
 
 ## 四、核心抽象
 
-### 4.1 一切皆 AgentNode　　**[🟠 Kind 5/8 已实现 / router·subgraph·human 仍缺]**
+### 4.1 一切皆 AgentNode　　**[✅ Kind 7/8 已实现 · router 论证后判定冗余不实现]**
 
-> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。✅ **map/reduce/loop-group 三种已实现（2026-07-25）**：新增 `pkg/graph/fanout.go`（map 扇出 + reduce 汇聚）与 `expand.go`，`Validate` 相应放开——但**未实现的 Kind 仍明确报错**，不是放开成静默接受。现为 5/8；router/subgraph/human 仍缺——但**它们不是 §五 的阻塞项**：15 个 mode 逐个核实后没有一个真的需要它们（设计文档写 composite 需要 `subgraph`，源码里 `app_composite`/`game_composite` 从不调 `RunTeam`/`TeamManager`，全部在一个 executor 内跑；条件边已能表达 router 的分支路由）。✅ **`AgentSpec` 三个字段已通电（2026-07-25）**：`Deterministic` 由 compile/test/build gate 派生并被 `runGate` 消费；`ToolProfile`/`MaxTurns` 经新增的 `NodeExecHints` ctx 载体下推——`MaxTurns` 通过包装 factory 改写 `ResolvedConfig` 真实生效（必须在 factory：`runAgent` 会在调用前覆盖该 ctx 值），`ToolProfile` 在飞书 runner 侧**优先于角色名子串推断**（退役了 `world-builder` 因含 "build" 被判 coding 档拿到 Bash 那个真实误判）。
+> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。✅ **map/reduce/loop-group 三种已实现（2026-07-25）**：新增 `pkg/graph/fanout.go`（map 扇出 + reduce 汇聚）与 `expand.go`，`Validate` 相应放开——但**未实现的 Kind 仍明确报错**，不是放开成静默接受。✅ **现为 7/8（2026-07-25）**：`subgraph`/`human` 已实现（各带 Replay 事件，满足"恢复出的图与首跑一致"这条红线）。**`router` 经论证判定冗余、不实现**：它的职责是"按前驱结果选下游"，而引擎的**条件边就是**逐条入边对前驱结果求值，加上默认 OR-join 的"无满足入边即 skipped"，分支路由已完整表达；多一种 Kind = 多一套语义 + 多一份 Validate + 多一条 resume 路径。**仍显式报错而不是静默接受**。两条 fail-closed 边界：`subgraph`/`human` 都不得出现在组内/派生子图/展开产物里（前者命名空间再叠一层后 journal 归因与 resume 需要另一套口径；后者是组的轮次与 spawn 的同步语义表达不了"跑到一半等人"，而展开产物来自 LLM 产出——允许了等于让模型自己插入一个审批闸）；`human` 不得再声明 `suspend`（挂起是形态自带的，两个真源会各说一套）。~~它们不是 §五 的阻塞项~~：15 个 mode 逐个核实后没有一个真的需要它们（设计文档写 composite 需要 `subgraph`，源码里 `app_composite`/`game_composite` 从不调 `RunTeam`/`TeamManager`，全部在一个 executor 内跑；条件边已能表达 router 的分支路由）。✅ **`AgentSpec` 三个字段已通电（2026-07-25）**：`Deterministic` 由 compile/test/build gate 派生并被 `runGate` 消费；`ToolProfile`/`MaxTurns` 经新增的 `NodeExecHints` ctx 载体下推——`MaxTurns` 通过包装 factory 改写 `ResolvedConfig` 真实生效（必须在 factory：`runAgent` 会在调用前覆盖该 ctx 值），`ToolProfile` 在飞书 runner 侧**优先于角色名子串推断**（退役了 `world-builder` 因含 "build" 被判 coding 档拿到 Bash 那个真实误判）。
 
 ```go
 // pkg/graph/spec.go —— 图与节点是纯数据，可 JSON 序列化
@@ -192,7 +192,7 @@ type EdgeSpec struct {
   - swarm 动态分解（`swarm.go:523`）→ decompose 节点展开分层并行子图。
 - **子图**：`subgraph` 节点引用命名 GraphSpec，参数注入。composite 类 mode 从"专用执行器"降级为普通子图组合——**双 switch 不一致问题从根上消失**（不再存在第二张模式表）。
 
-### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 事件 17/16 · InvalidateFrom ✅ / 四源已降三源]**
+### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 事件 20/16 · InvalidateFrom · Suspended ✅ / 四源已降三源]**
 
 > **实测**：FileJournal + Replay 真实且有零重跑硬证据（`pkg/graph/engine_test.go:422-423`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。✅ **事件类型已补齐并超出设计（2026-07-25）**：设计列 16 种，现有 17 种——补上了 `map.expanded`/`graph.expanded`/`graph.expand_rejected`/`loop.group.iteration`/`subgraph.spawned`/`subgraph.rejected`/`budget.consumed`/`budget.exceeded`/`node.invalidated`。
 >
@@ -371,7 +371,7 @@ type Placement struct {
 - 远程 runtime（gRPC/A2A worker 拉取模型）在 design/02 R3 落地，接口在此冻结。
 - 团队 cwd 亲和：`Affinity: team` 保证产码工作流的节点落同一工作区（否则经共享存储，design/02）。
 
-### 4.10 全局注入：Interceptor 链　　**[🟠 切面链 ✅ 已通电 / 6 个内置拦截器落地 1 个]**
+### 4.10 全局注入：Interceptor 链　　**[✅ 节点切面 · 调用切面 · 6 个运行级拦截器 · executeWorkflow 282→34 行]**
 
 > **实测（改造前）**：`NodeInterceptor`/`CallInterceptor` 两接口零命中；六个内置拦截器全无。
 >
@@ -391,7 +391,14 @@ type Placement struct {
 >
 > 一处 API 自我修正：`NewBudgetManager` 原本收一个 `evAppender` 参数，但那是**未导出类型**——外部包（装配链的 `pkg/agent`）根本造不出来，靠构造参数传等于生产上一条事件都不落。改为引擎经 `journalAware` 接口注入。
 >
-> ⚠️ **仍缺**：`CallInterceptor`（LLM 调用切面）零实现；6 个内置拦截器只落地 BudgetManager，EvolutionRecorder / GateEnforcer / Notifier / MetricsEmitter / RateLimiter 仍在主流程硬编码（其中 GateEnforcer 的"按 Meta 声明而非工作流名白名单"已单独落地）。`executeWorkflow` **仍是 282 行巨函数**（`pkg/agent/teams.go:646+`）——把它拆成"编译图模板 + 装配拦截器"属 M4，风险在于它是 8+ 平台共用的主路径。
+> ✅ **§4.10 已收尾（2026-07-25）**：
+> - **`CallInterceptor` 已实现**（`pkg/api/call_interceptor.go`）：挂在 client 调用的唯一出口，一处覆盖全部 LLM 调用（含 fallback 降级路径）。链语义与 `NodeInterceptor` **逐条对齐**——两套切面语义不一致会让人写错。进程级注册对全部克隆生效，实例级只影响本实例（`api.Client` 会被 `ConfiguredCloneFull` 大量克隆，只有实例级会漏掉克隆出去的那些）。
+> - **`executeWorkflow` 282 行 → 34 行**：门禁/交付/指标/进化/记忆/通知六个相位成为**可开关的运行级拦截器**，开关语义与 `CLAUDE_GO_GRAPH_INTERCEPTORS` 完全一致（复用 `parseInterceptorSwitch`）。`finalize` 标 `core: true` 不可关——它是交付本身（产物清单/报告落盘）而不是横切关注点，被关掉等于"跑完了但什么都没交"。
+> - 等价性用四维金标准（阶段序列逐项 / 调用次数 / 峰值并发 / **提示词逐字**）+ **变异反证**（去掉 `notify` 相位两个测试立刻 FAIL，回退复绿）。
+>
+> 这轮拆分顺带暴露两处问题，都已修：手写 golden 的依赖块尾部换行多了一个（判据：`buildStagePromptWithRoles` 完全没被拆分改动，所以旧路径产出与新路径逐字相同，那条断言对旧路径同样会红）；以及一处**真的提示词不确定性**——Handoff 上下文直接 `for name := range prevResults` 建切片，map 遍历序每次运行都不同，导致 prompt 前缀缓存整段失效且同一输入产出不可复现（它是被等价性测试**间歇性**抓出来的，3 次里红 1 次）。
+>
+> ⚠️ **仍缺**：AIMD「失败后并发折半」背压尚无等价物（`RateLimiter` 拦截器已有挂载点但未接 AIMD 策略）。
 
 ```go
 // 两个切面：节点执行 与 LLM 调用
@@ -450,7 +457,7 @@ type TaskService interface {
 
 ---
 
-## 五、15 种 mode → 图模板映射　　**[🟠 5/15 已图化（orchestrated 走专属内核）；余 10 逐条记账]**
+## 五、15 种 mode → 图模板映射　　**[🟠 7/15 已图化；余 8 逐条记账]**
 
 > **实测**：`pkg/graph/templates/` **目录不存在**，图模板库零落地；`TranslateWorkflow` 是 WorkflowDef 直译器不是模板库。只有 pipeline/fanout 可经灰度开关切图，而 `CLAUDE_GO_GRAPH_ENGINE` 全仓/全部署清单无处设置。13 个专用 mode 全部仍走各自执行器（`pkg/agent/workflow.go:409-434`）。§5 承诺的「fanout 首次真正实现 map→reduce」未发生——`executeFanOut` 仍原封不动转调 pipeline（`pkg/agent/workflow.go:201-203`）。
 
