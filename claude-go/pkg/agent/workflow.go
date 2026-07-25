@@ -1063,13 +1063,10 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 			return sr
 		}
 
-		// 检测是否为 429 限流
-		isRateLimit := strings.Contains(strings.ToLower(sr.Error), "429") ||
-			strings.Contains(strings.ToLower(sr.Error), "rate limit") ||
-			strings.Contains(strings.ToLower(sr.Error), "限流") ||
-			strings.Contains(strings.ToLower(sr.Error), "throttl")
-
-		if isRateLimit {
+		// 检测是否为 429 限流。判据与图层 AIMD 背压拦截器共用一份
+		// (graph_interceptors.go isRateLimitErrText): 两处各写一份必然漂移, 漂移后
+		// "重试环认为在限流、背压环认为没有" 这种不一致极难排查。
+		if isRateLimit := isRateLimitErrText(sr.Error); isRateLimit {
 			rateLimitAttempt++
 			if rateLimitAttempt > effRateLimitMax {
 				we.notify(we.chatID, fmt.Sprintf(

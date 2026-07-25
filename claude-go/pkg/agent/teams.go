@@ -727,30 +727,26 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 }
 
 // executeWorkflow 在后台执行工作流。isResume=true 时保留检查点, 从上次失败步骤继续。
+//
+// ---------------------------------------------------------------------------
+// 这个函数曾是 282 行的巨函数 (design/01 §4.10 点名的那一处)
+// ---------------------------------------------------------------------------
+//
+// 现在它只做四件事: 起 trace → 分发专用编排器 → 装配 (Coordinator + Executor) 并跑
+// 主体 → 把收尾交给**运行级拦截器链** (run_interceptors.go)。
+//
+// 门禁 / 指标 / 进化 / 记忆 / 通知这五件横切事从这里搬到了那条链上。收益不是行数,
+// 是那五件事的**次序与开关变成一张能读的表** (runBuiltinPhases), 而且第三方
+// (design/01 点名的 aiops 权限桥) 可以追加一环而不必改这个 8+ 下游平台共用的主路径。
+//
+// 拆分口径: 一次写入都没有换位置, 一条文案都没有改。等价性由
+// run_interceptors_equiv_test.go 的九维金标准钉住 (含变异反证)。
 func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *ProductionTeam, isResume ...bool) {
-	// 注入 trace, 确保团队全生命周期有唯一 traceID
-	ctx = logging.WithTrace(ctx)
-	ctx, endSpan := logging.WithSpan(ctx, "team."+team.Name+".execute")
+	ctx, endSpan := ptm.beginRun(ctx, team)
 	defer endSpan()
-	// trace 四元组 RunID (design/03 §4.1 E0): 复用 logging traceID 作后缀,
-	// llm.jsonl 的 RunID 可直接 join 结构化日志; 下游 stage/engine 逐层补 NodeID/TurnID。
-	ctx = trace.With(ctx, trace.IDs{RunID: fmt.Sprintf("run-%s-%s", team.Name, logging.TraceID(ctx))})
-	// 记住本轮 RunID: 运行后才发生的奖励 (用户评分 / 精修负信号) 只能靠它归因。
-	team.mu.Lock()
-	team.LastRunID = trace.From(ctx).RunID
-	team.mu.Unlock()
-	logging.Event(ctx, "team.start", "team", team.Name, "workflow", team.Workflow, "objective", team.Objective)
-	logging.IncrCounter("team.start." + team.Workflow)
 
-	// 蜂群模式: 使用 SwarmOrchestrator
-	if team.Workflow == "swarm" {
-		ptm.executeSwarm(ctx, team)
-		return
-	}
-
-	// 群体智能预测模式: 使用 SwarmIntelligenceEngine
-	if team.Workflow == "predict" {
-		ptm.executePrediction(ctx, team)
+	// 专用编排器 (蜂群 / 群体智能预测) 自带完整收尾, 不走下面这条主路径。
+	if ptm.dispatchDedicatedWorkflow(ctx, team) {
 		return
 	}
 
@@ -760,6 +756,62 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		return
 	}
 
+	coord := ptm.newRunCoordinator(team, len(isResume) > 0 && isResume[0])
+	executor := ptm.newRunExecutor(team, coord)
+
+	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)
+	if err != nil {
+		if ctx.Err() != nil {
+			ptm.failTeam(team, "用户停止")
+			return
+		}
+		ptm.failTeam(team, err.Error())
+		return
+	}
+
+	rc, ok := ptm.computeRunDelivery(team, wf, executor, results)
+	if !ok {
+		return // 存在阻塞性失败阶段, computeRunDelivery 已判团队失败
+	}
+	ptm.runAfterChain(ctx, rc)
+}
+
+// beginRun 起 trace 四元组与团队级 span, 并记开跑事件。返回收尾函数 (调用方 defer)。
+func (ptm *ProductionTeamManager) beginRun(ctx context.Context, team *ProductionTeam) (context.Context, func()) {
+	// 注入 trace, 确保团队全生命周期有唯一 traceID
+	ctx = logging.WithTrace(ctx)
+	ctx, endSpan := logging.WithSpan(ctx, "team."+team.Name+".execute")
+	// trace 四元组 RunID (design/03 §4.1 E0): 复用 logging traceID 作后缀,
+	// llm.jsonl 的 RunID 可直接 join 结构化日志; 下游 stage/engine 逐层补 NodeID/TurnID。
+	ctx = trace.With(ctx, trace.IDs{RunID: fmt.Sprintf("run-%s-%s", team.Name, logging.TraceID(ctx))})
+	// 记住本轮 RunID: 运行后才发生的奖励 (用户评分 / 精修负信号) 只能靠它归因。
+	team.mu.Lock()
+	team.LastRunID = trace.From(ctx).RunID
+	team.mu.Unlock()
+	logging.Event(ctx, "team.start", "team", team.Name, "workflow", team.Workflow, "objective", team.Objective)
+	logging.IncrCounter("team.start." + team.Workflow)
+	return ctx, endSpan
+}
+
+// dispatchDedicatedWorkflow 分发自带完整收尾的专用编排器。返回 true 表示已处理完毕。
+//
+// 这两个 mode **不进运行级拦截器链**, 与拆分前一致: 它们各自在 executeSwarm /
+// executePrediction 里写终态、发通知。把它们并进链是另一件事 (要先让它们产出
+// []StageResult 形态的结果), 不在本轮"行为一字不变"的范围内。
+func (ptm *ProductionTeamManager) dispatchDedicatedWorkflow(ctx context.Context, team *ProductionTeam) bool {
+	switch team.Workflow {
+	case "swarm": // 蜂群模式: 使用 SwarmOrchestrator
+		ptm.executeSwarm(ctx, team)
+		return true
+	case "predict": // 群体智能预测模式: 使用 SwarmIntelligenceEngine
+		ptm.executePrediction(ctx, team)
+		return true
+	}
+	return false
+}
+
+// newRunCoordinator 造本次运行的 Coordinator (带重试/检查点/自动恢复)。
+func (ptm *ProductionTeamManager) newRunCoordinator(team *ProductionTeam, resuming bool) *Coordinator {
 	// 使用 Coordinator 带重试和检查点执行
 	coord := NewCoordinator(ptm.pool, ptm.taskTracker, ptm.notify, CoordinatorConfig{
 		MaxRetries:    6, // 限流场景需要更多重试 (429 + AIMD 退避后可恢复)
@@ -776,7 +828,6 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 			ptm.notify(team.ChatID, fmt.Sprintf("⚠️ 团队 **%s** 自动恢复失败: %v", teamName, err))
 		}
 	})
-	resuming := len(isResume) > 0 && isResume[0]
 	if !resuming {
 		coord.ClearCheckpoints()
 	} else {
@@ -786,8 +837,16 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 			ptm.notify(team.ChatID, fmt.Sprintf("♻️ 检查点恢复: %d 个已完成阶段将跳过", restored))
 		}
 	}
+	return coord
+}
 
-	executor := &WorkflowExecutor{
+// newRunExecutor 造本次运行的 WorkflowExecutor。
+//
+// 这里每一个字段都会影响阶段提示词或执行形态 (roles 决定角色模板、evolution 决定经验
+// 注入、planCfgResolver 决定模型/并发), 所以等价性测试的第 ④ 维 (提示词逐字) 主要就是
+// 在钉这个构造 —— 拆分时漏一个字段, 提示词立刻变形。
+func (ptm *ProductionTeamManager) newRunExecutor(team *ProductionTeam, coord *Coordinator) *WorkflowExecutor {
+	return &WorkflowExecutor{
 		factory:         ptm.factory,
 		planCfgResolver: ptm.planCfgResolver,
 		notify:          ptm.notify,
@@ -802,17 +861,19 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		concurrency:     ptm.concurrency,
 		traceStore:      ptm.traceStore, // design/03 §4.1: 让图节点也产 node Span
 	}
+}
 
-	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)
-	if err != nil {
-		if ctx.Err() != nil {
-			ptm.failTeam(team, "用户停止")
-			return
-		}
-		ptm.failTeam(team, err.Error())
-		return
-	}
-
+// computeRunDelivery 由阶段结果定交付终态, 并造运行级拦截器链的上下文。
+// 返回 false 表示已判团队失败 (调用方直接返回)。
+//
+// 为什么这一步**不在** GateEnforcer 环里, 尽管 §4.10 表把 delivered_with_remediation
+// 归给它: 这是"有阻塞性失败阶段就判失败"的终局判定, 而门禁环是可经开关关掉的。若把它
+// 放进门禁环, 一旦有人用 CLAUDE_GO_RUN_INTERCEPTORS 关掉门禁做回滚, 失败阶段会被
+// 静默当成交付成功 —— 关掉门禁的语义只该是"不跑编译/测试/内容门禁", 绝不该是"把失败
+// 当成功"。所以判定留在主路径, 门禁环只做它自己那三道闸。
+func (ptm *ProductionTeamManager) computeRunDelivery(
+	team *ProductionTeam, wf *WorkflowDef, executor *WorkflowExecutor, results []StageResult,
+) (*teamRunContext, bool) {
 	// 检查是否有失败阶段: 默认 err==nil 但存在 TaskFailed 仍标记团队失败。
 	// development 工作流例外: 若最终本地 E2E 门禁已通过 build/test, 则说明中间
 	// leaf 的失败已被后置确定性门禁修复/兜底, 团队按交付成功处理并保留失败阶段供复盘。
@@ -830,198 +891,13 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		} else {
 			errStr := fmt.Sprintf("%d 个阶段失败: %s", len(failedStages), strings.Join(failedStages, "; "))
 			ptm.failTeam(team, errStr)
-			return
+			return nil, false
 		}
 	}
-
-	// Global Gates: compile, test, and consistency checks after workflow stages complete.
-	//
-	// 注: 当 compile / test gate 失败时, 跑 1-2 轮"修复尝试", 由 coder 角色
-	// 拿到具体错误输出去修源码 (修 bug / 删重复声明 / 修 vet 警告 / 删死循环).
-	// 修完后再跑 gate. 这样团队就有自我恢复能力, 不会因为单个 vet 警告或
-	// 一处明显 bug 就把 30 分钟的工作直接判废.
-	// 编译/测试/一致性门禁仅对"产出可编译代码"的工作流生效。
-	// techblog/creative/novel/research 等写作类工作流不产出代码, 跑 go build 会因
-	// "no main module" 误判失败并触发无意义的修复轮次 (浪费 token)。
-	// 门禁判据改读**图元数据**而非工作流名白名单: 同一份 GraphMeta 现在同时
-	// 供图引擎与这里使用, 动态注册的工作流因此不会再静默丢掉门禁
-	// (WorkflowGateMetaByName 内部仍回落到原来的两个函数, 今天行为完全等价)。
-	if team.Cwd != "" && WorkflowGateMetaByName(team.Workflow).ProducesCode {
-		if gateErr := ptm.tryGateWithRemediation(ctx, team, executor, "compile",
-			ptm.runGlobalCompileGate, 2); gateErr != "" {
-			ptm.failTeam(team, fmt.Sprintf("全局编译门禁失败: %s", gateErr))
-			return
-		}
-		if gateErr := ptm.tryGateWithRemediation(ctx, team, executor, "test",
-			ptm.runGlobalTestGate, 2); gateErr != "" {
-			ptm.failTeam(team, fmt.Sprintf("全局测试门禁失败: %s", gateErr))
-			return
-		}
-		if gateErr := ptm.runGlobalConsistencyCheck(team); gateErr != "" {
-			ptm.failTeam(team, fmt.Sprintf("全局一致性检查失败: %s", gateErr))
-			return
-		}
-	}
-
-	// 内容质量门禁: 写作类(pipeline)工作流的"评审→未达标→自动修订"环 (见 content_gate.go)。
-	// 仅对白名单工作流生效; 跳过用户驱动的精修运行 (PendingFeedback 非空), 避免双重注入。
-	if WorkflowGateMetaByName(team.Workflow).QualityGate == "content" && strings.TrimSpace(team.PendingFeedback) == "" {
-		results = ptm.tryContentQualityGate(ctx, team, executor, wf, results)
-	}
-
-	team.mu.Lock()
-	team.Status = deliveryStatus
-	team.FinishedAt = time.Now()
-	team.Stages = results
-	team.mu.Unlock()
-	ptm.finishRefine(team, true) // 若本轮是精修: 清空反馈并留痕"已采纳", 喂 Evolution 经验闭环
-	team.persist()
-	ptm.runTaskCompletedHooks(results)
-
-	// 结构化运行报告 (可观测性: 供后续 AI 分析团队运行效果)
-	report := logging.TeamRunReport{
-		TeamName: team.Name, Workflow: team.Workflow, Objective: team.Objective,
-		StartTime: team.StartedAt, EndTime: team.FinishedAt,
-		DurationSec: team.FinishedAt.Sub(team.StartedAt).Seconds(),
-		Status:      string(team.Status),
-	}
-	for _, r := range results {
-		durSec := 0.0
-		if d, err := time.ParseDuration(r.Duration); err == nil {
-			durSec = d.Seconds()
-		}
-		report.Stages = append(report.Stages, logging.StageReport{
-			Name: r.Name, Role: r.Role, DurationSec: durSec,
-			Status: string(r.Status), OutputLen: len(r.Output), Error: r.Error,
-		})
-	}
-	logging.LogTeamRun(ctx, report)
-	logging.IncrCounter("team.complete." + team.Workflow)
-
-	// 持续观测指标: 团队运行质量
-	if ptm.metrics != nil {
-		labels := map[string]string{"workflow": team.Workflow, "status": string(team.Status)}
-		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
-		ptm.metrics.RecordRun("team", metrics.MTeamDurationSec, report.DurationSec, team.Name, labels)
-		if isSuccessfulTeamStatus(team.Status) {
-			ptm.metrics.RecordRun("team", metrics.MTeamSuccessCount, 1, team.Name, labels)
-		} else {
-			ptm.metrics.RecordRun("team", metrics.MTeamFailCount, 1, team.Name, labels)
-		}
-		// 阶段通过率
-		total, passed := 0, 0
-		totalOutLen := 0
-		for _, s := range report.Stages {
-			total++
-			if s.Status == string(TaskCompleted) {
-				passed++
-			}
-			totalOutLen += s.OutputLen
-		}
-		if total > 0 {
-			ptm.metrics.RecordRun("team", metrics.MTeamStagePassRate, float64(passed)/float64(total), team.Name, labels)
-			ptm.metrics.RecordRun("team", metrics.MTeamOutputAvgLen, float64(totalOutLen)/float64(total), team.Name, labels)
-		}
-	}
-
-	// episode 级奖励 (design/03 §4.2): 团队终态是最稳定的奖励信号, 统一落 rewards.jsonl。
-	// delivered_with_remediation 记 0.5 —— fail-open 交付语义: 交付了但过程有瑕疵。
-	if ptm.evolution != nil {
-		episodeVal := -1.0
-		switch team.Status {
-		case TeamStatusCompleted:
-			episodeVal = 1.0
-		case TeamStatusDeliveredWithRemediation:
-			episodeVal = 0.5
-		}
-		ptm.evolution.RecordReward(RewardEvent{
-			RunID:  trace.From(ctx).RunID,
-			Source: RewardSourceEpisode,
-			Value:  episodeVal,
-			Raw:    string(team.Status),
-			Team:   team.Name,
-		})
-		// 时长 shaping 负项 (design/03 §4.2 第 8 行, 防"堆 turn 堆 token 刷分")。
-		// 只在超预算时写, 预算内不写 —— 见 recordLatencyReward。
-		ptm.recordLatencyReward(ctx, team, report.DurationSec)
-	}
-
-	// 触发进化学习 (DISTILL: 从轨迹中提炼经验) + 采集进化指标。
-	// 经统一循环提交 (design/03 §4.3), 循环未装配时回落到原来的直调路径。
-	ptm.submitLearn(team.Name)
-
-	// 技能自创建 (design/03 §1.2 开环2 接线): 仅全阶段通过的干净成功才尝试提炼,
-	// 是否值得由 LLM 自判 (AutoCreator 内含判据); 产物 frontmatter 带 status: shadow,
-	// 晋升裁决归进化门禁 (E3), 提炼失败静默不影响交付。
-	if ptm.skillCreator != nil && len(results) > 0 && allStagesCompleted(results) {
-		// design/03 §4.6 必过闸: 全阶段通过只说明"没崩", 不说明"做得好"。这里消费本 run 的
-		// 门禁类奖励 (gate.compile/gate.test/gate.content; 排除与交付状态共线的 episode):
-		// 有证据且为负时不提炼 —— 否则会把一次"编译勉强过但内容评审很差"的做法固化成技能。
-		// 无证据时保持原行为, 否则未接奖励源的工作流永远产不出技能。
-		gateScore, gateEvidence := ptm.evolution.GateRewardScore(trace.From(ctx).RunID, team.Name)
-		if !skillDistillAllowed(gateScore, gateEvidence) {
-			// 只跳过提炼, 不影响后续交付流程 (报告/记忆/Dreaming)。
-			logging.Event(ctx, "skill.distill.skipped", "team", team.Name,
-				"reason", "gate_reward_negative", "gate_score", gateScore)
-		} else {
-			objective := team.Objective
-			chatID := team.ChatID
-			approach := summarizeStageApproach(results)
-			outcome := lastNonEmptyOutput(results, 2000)
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-				defer cancel()
-				if name, err := ptm.skillCreator.MaybeCreate(ctx, objective, approach, outcome); err == nil && name != "" {
-					ptm.notify(chatID, fmt.Sprintf("🧬 已自动提炼 shadow 技能: **%s** (待进化门禁验证晋升)", name))
-				}
-			}()
-		}
-	}
-
-	// 触发 Dreaming 记录 (覆盖 team agent 会话盲区)
-	if ptm.dreamer != nil {
-		for _, r := range results {
-			ptm.dreamer.RecordSession(DreamSessionRecord{
-				ChatID:  team.ChatID,
-				EndTime: time.Now(),
-				Summary: fmt.Sprintf("[Team:%s] [%s/%s] %s", team.Name, r.Name, r.Role, truncateResult(r.Output, 300)),
-			})
-		}
-		// 团队完成后触发 Dreaming 检查 (解决仅有团队工作流时不触发的问题)
-		ptm.dreamer.AfterQuery(context.Background())
-	}
-
-	// 持久化完整报告文件 (解决产出散落、无法检索的问题)
-	reportPath := ptm.saveTeamReport(team, results)
-
-	// 写入高权重记忆 (解决"失忆"问题: 团队名+目标+结果摘要可被 BM25 检索)
-	if ptm.memWriter != nil {
-		var stageSummary string
-		for _, r := range results {
-			if r.Output != "" {
-				stageSummary += fmt.Sprintf("[%s/%s] %s\n", r.Name, r.Role, truncateResult(r.Output, 200))
-			}
-		}
-		ptm.memWriter.AddTeamMemory(team.Name, team.Workflow, team.Objective, stageSummary)
-	}
-
-	var summary string
-	for _, r := range results {
-		if r.Output != "" {
-			summary += fmt.Sprintf("\n\n**[%s]**\n%s", r.Role, truncateResult(r.Output, 500))
-		}
-	}
-	reportNote := ""
-	if reportPath != "" {
-		reportNote = fmt.Sprintf("\n\n📄 **完整报告**: `%s`", reportPath)
-	}
-	ptm.notify(team.ChatID, fmt.Sprintf("✅ 团队 **%s** 执行完成 (耗时 %v)\n\n**成果汇总:**%s%s",
-		team.Name, time.Since(team.StartedAt).Round(time.Second), summary, reportNote))
-
-	// Creative 工作流: 提取 SVG/HTML 多媒体资产，通过媒体通道发送
-	if ptm.mediaNotify != nil && (team.Workflow == "creative") {
-		ptm.sendMediaAssets(team, results)
-	}
+	return &teamRunContext{
+		ptm: ptm, team: team, wf: wf, executor: executor,
+		results: results, status: deliveryStatus,
+	}, true
 }
 
 func hasPassingLocalE2EGate(results []StageResult) bool {
