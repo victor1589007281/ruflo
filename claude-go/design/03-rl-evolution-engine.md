@@ -308,9 +308,9 @@ type RewardEvent struct {
 - 注入点全部走 design/01 拦截器/hook（EvolutionRecorder 拦截器 + MemoryInjectHook），**headless 与飞书同构**——开环 1 从架构上不可能再出现；
 - 每次注入记 `policy_decision` Span（注入了哪些经验/记忆/技能/模板版本）——bandit 更新与 uplift 归因的数据基础（现 RecordInjection 的推广）。
 
-### 4.5 ⑤ 评估与门禁　　**[❌ 回放 harness 未实现]**
+### 4.5 ⑤ 评估与门禁　　**[🟠 回放 harness ✅ / H6 多档冒烟仍缺]**
 
-> **实测**：`tests/eval` 仍是 11 维特性自评分，`replay` 零命中 ⇒ 离线回放 harness 不存在，H6 多档冒烟、H12 harness 工程规范同样无从谈起。uplift 因果评估仅在经验粒度（预存），技能/模板/prompt 粒度无。设计新增的指标（reward 趋势/灰度胜率/回滚率/学习成本占比）只有 `console.Report.RewardMean` 一个**离线 JSON 字段**，未进指标目录。
+> **实测（2026-07-25 实现）**：`pkg/evolution/replay` 落地离线回放 harness，**H12 五条工程规范逐条实现**（并发信号量 / 每任务硬超时 / 每完成一条流式落盘 / 续跑按内容指纹 / 空产出短路不启动 Judge）。两条关键判断：①**确定性断言是硬否决**——Expect 未命中或 Gate 失败直接 0 分且不问 Judge，能确定性判的不该花 LLM 钱也不该让 LLM 的宽容盖过硬事实；②未注入 GateRunner 时在 Reason 注明门禁被跳过，静默跳过会让人以为门禁过了。`Compare` 实现 uplift 配对对照，替代"感觉变好了"。⚠️ 一处自我修正：第一版只把带超时的 ctx 传给 candidate，测试当场抓出**那不算"硬"超时**（不配合 ctx 的实现仍会拖住整轮），改为 goroutine + select ctx，并写明"泄漏一个 goroutine 但整轮继续"的取舍。14 个测试。**仍缺 H6 多档模型冒烟**（回放固定输入，评不了"产物是否让 agent 做出不同动作序列"，那需要真跑）。uplift 因果评估仅在经验粒度（预存），技能/模板/prompt 粒度无。设计新增的指标（reward 趋势/灰度胜率/回滚率/学习成本占比）只有 `console.Report.RewardMean` 一个**离线 JSON 字段**，未进指标目录。
 
 - **离线回放 harness**：扩展 `tests/eval`（现为特性自评分，`bench_test.go:108` 及格线 60%）为**轨迹回放评估**：固定任务集（从历史高置信轨迹沉淀）+ LLM-judge 评分 + 确定性断言（产码任务跑真门禁），任何进化产物晋升前必过；
 - **晋升前多档冒烟（H6，test-before-train 推广为 test-before-promote）**：任何进化产物（新技能/新图模板/新 prompt 版本）先跑小规模冒烟——少量任务 × 多次采样 × **多个模型档位**（如 kimi-k3 / fallback 供应商 / gemma 本地各一），验证注入后 prompt 组装不劣化、解析不崩、奖励覆盖正常，再进 shadow 灰度。多档模型是关键：hermes 用小/中/大三档专测解析鲁棒性——技能/prompt 对弱模型不鲁棒是线上劣化的常见来源；
