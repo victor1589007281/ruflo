@@ -87,9 +87,18 @@ type exDoc struct {
 
 func normKey(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
-func (we *WorkflowExecutor) executeEnsembleExtract(ctx context.Context, _ *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
+func (we *WorkflowExecutor) executeEnsembleExtract(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	if we.llm == nil {
 		return nil, fmt.Errorf("graph-extract-swarm 需要 LLMClient")
+	}
+	// 灰度切图引擎 (design/01 §五): 形状 = loop-group[视角清单 → map(N 路裸 completion)
+	// → reduce(vote) → 文本套壳], 内核是 ensembleNodeRunner (裸 completion), 见
+	// graph_templates_ensemble.go。开关未设时下面的旧路径一字不变。
+	// LLMClient 检查刻意留在前面: 两条路径都需要它, 且错误文案必须相同。
+	// team == nil 时不切图: journal 落在 team.dataDir 下, 图路径对 team 是硬依赖,
+	// 而旧路径只用它发通知 —— 少了这个判断, 一次无团队调用会变成空指针 panic。
+	if graphEngineEnabled() && team != nil {
+		return we.executeEnsembleGraph(ctx, wf, objective, team, ensembleExtractKind())
 	}
 	notify := func(m string) {
 		if team != nil {
@@ -296,9 +305,14 @@ type rvDoc struct {
 	Annotations []rvAnn `json:"annotations"`
 }
 
-func (we *WorkflowExecutor) executeReviewPanel(ctx context.Context, _ *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
+func (we *WorkflowExecutor) executeReviewPanel(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	if we.llm == nil {
 		return nil, fmt.Errorf("review-panel 需要 LLMClient")
+	}
+	// 灰度切图引擎: 同 executeEnsembleExtract, reduce 策略换成 trimmed_mean
+	// (Score = 融合 overall, 可直接挂 `score >= N` 条件边)。默认关; team == nil 不切图。
+	if graphEngineEnabled() && team != nil {
+		return we.executeEnsembleGraph(ctx, wf, objective, team, reviewPanelKind())
 	}
 	notify := func(m string) {
 		if team != nil {
