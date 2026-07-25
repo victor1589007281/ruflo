@@ -572,7 +572,7 @@ func (e *Engine) execNode(ctx context.Context, rc *runCtx, scope execScope, node
 		res, iters, extra = e.runLoopGroup(nctx, rc, scope, node, in)
 		attempts = 1
 	case NodeKindReduce:
-		// 确定性聚合策略 (concat/longest) 由引擎直接算出: 零 LLM、零重试必要,
+		// 确定性聚合策略 (concat/longest/vote/trimmed_mean) 由引擎直接算出: 零 LLM、零重试必要,
 		// 但仍走完整节点生命周期 (本函数的 hook/journal/预算), 符合 §4.1 对
 		// Deterministic 的要求。Strategy=runner 时落回常规 retry 环。
 		nOK := 0
@@ -694,6 +694,12 @@ func (e *Engine) runLoop(ctx context.Context, rc *runCtx, scope execScope, node 
 	if node.Loop == nil {
 		return res, runs
 	}
+	// 可插拔终止器与 Until **互斥** (Validate 强制), 故走完全独立的循环体:
+	// 共用一个循环体就得在里面塞两套退出判定的先后顺序, 而 Until 的现有语义
+	// (含"空 Until = 不设条件"这个特判) 有测试守着, 一字都不能被扰动。
+	if node.Loop.Terminator != nil {
+		return e.runLoopWithTerminator(ctx, rc, scope, node, in, res)
+	}
 	hasUntil := node.Loop.Until != ""
 	until, _ := ParseCondition(node.Loop.Until) // Validate 已保证语法
 	for iter := 1; iter < node.Loop.MaxIterations; iter++ {
@@ -710,6 +716,140 @@ func (e *Engine) runLoop(ctx context.Context, rc *runCtx, scope execScope, node 
 		runs++
 	}
 	return res, runs
+}
+
+// runLoopWithTerminator 终止器驱动的 loop 环 (design/01 §4.4, 见 terminator.go 文件头)。
+// first 是第 0 轮 (runLoop 已跑完) 的结果。返回 (最终结果, 实际执行轮数)。
+//
+// 与 Until 路径的三处差异, 都是"跨轮判断"这件事本身要求的:
+//  1. 每轮结束**都**问一次终止器 (含最后一轮) —— 否则最后一轮的 best-of-N 回滚建议
+//     根本没机会给出;
+//  2. 终止器可以不停但改下一轮回灌 (策略转换), 于是"信号"要落到 loop.iteration 事件上,
+//     不然"第 3 轮的提示词为什么变了"事后不可解释;
+//  3. 终止可能改变**最终产出是哪一轮的** (回滚), 所以终止事件必须记全四种回滚结局
+//     (applied/suppressed/rejected/unresolved), 静默忽略等于凭空丢掉一次决策。
+func (e *Engine) runLoopWithTerminator(ctx context.Context, rc *runCtx, scope execScope, node NodeSpec, in NodeInput, first NodeResult) (NodeResult, int) {
+	pol := node.Loop
+	evID := scope.evID(node.ID)
+	term, err := resolveTerminator(pol.Terminator)
+	if err != nil || term == nil {
+		// Validate 已在开图时解析过同一个声明, 走到这里说明注册表在运行中被改过。
+		// fail-closed: 没有判据就不再循环 (继续跑等于用"跑满轮次"替代判据, 正是本
+		// 机制要消灭的那个静默劣化), 并把原因记进 journal。
+		rc.appendEv(EvLoopTerminated, evID, scope.with(map[string]any{
+			"terminator": pol.Terminator.Name, "signal": "terminator_unavailable",
+			"detail": errText(err), "stop": true, "by": "engine", "iterations": 1,
+		}))
+		return first, 1
+	}
+
+	rounds := []LoopRound{{Iteration: 0, Result: first}}
+	res, runs := first, 1
+	for {
+		d := term.Decide(LoopContext{
+			NodeID: node.ID, Scope: TerminatorScopeNode,
+			MaxIterations: pol.MaxIterations, Rounds: rounds,
+		})
+		if d.Stop {
+			final, note := applyLoopRollback(rounds, d, pol.Terminator.AllowRollback)
+			rc.appendEv(EvLoopTerminated, evID, scope.with(termEvData(pol.Terminator, d, rounds, note)))
+			return final, runs
+		}
+		next := rounds[len(rounds)-1].Iteration + 1
+		if next >= pol.MaxIterations {
+			// 终止器没在最后一轮说停 (自定义实现漏了轮次耗尽这一路)。引擎硬停,
+			// 但**不**替它做回滚 —— 那是判据, 引擎不猜。记账标明是引擎兜的。
+			rc.appendEv(EvLoopTerminated, evID, scope.with(map[string]any{
+				"terminator": pol.Terminator.Name, "signal": "max_iterations", "by": "engine",
+				"detail": fmt.Sprintf("终止器在第 %d/%d 轮仍未终止, 由引擎按 max_iterations 收尾", next, pol.MaxIterations),
+				"stop":   true, "iterations": runs, "last_signal": d.Signal,
+			}))
+			return res, runs
+		}
+		if ctx.Err() != nil {
+			rc.appendEv(EvLoopTerminated, evID, scope.with(map[string]any{
+				"terminator": pol.Terminator.Name, "signal": "cancelled", "by": "engine",
+				"stop": true, "iterations": runs, "last_signal": d.Signal,
+			}))
+			return res, runs
+		}
+		// loop.iteration 与 Until 路径同款 (字段不变, 只**追加**终止器信号):
+		// 既有消费方按 iteration/prev_score 读, 追加键不影响它们。
+		data := map[string]any{"iteration": next, "prev_score": res.Score, "signal": d.Signal}
+		if d.Detail != "" {
+			data["detail"] = d.Detail
+		}
+		rc.appendEv(EvLoopIteration, evID, scope.with(data))
+		in.Iteration = next
+		in.Feedback = replacePrevOutput(pol.Feedback, res.Output)
+		if d.FeedbackSuffix != "" {
+			in.Feedback += d.FeedbackSuffix
+		}
+		res = e.callRunner(ctx, rc, node, in)
+		runs++
+		rounds = append(rounds, LoopRound{Iteration: next, Result: res})
+	}
+}
+
+// applyLoopRollback 按终止器的 best-of-N 建议决定最终产出。
+// 返回 (最终结果, journal 记账载荷)。四种结局都必须留痕 —— "终止器说了回滚但产出
+// 还是最后一轮"如果不记账, 事后无从判断是开关没开、目标轮失败, 还是实现有 bug。
+func applyLoopRollback(rounds []LoopRound, d TerminateDecision, allow bool) (NodeResult, map[string]any) {
+	last := rounds[len(rounds)-1].Result
+	if !d.Rollback {
+		return last, nil
+	}
+	if !allow {
+		return last, map[string]any{"rollback": "suppressed", "best_round": d.BestRound,
+			"rollback_reason": "loop.terminator.allow_rollback 未开启 (回滚会改变'产出是哪一轮的', 必须显式声明)"}
+	}
+	for _, r := range rounds {
+		if r.Iteration != d.BestRound {
+			continue
+		}
+		if r.Result.Status != NodeStatusCompleted {
+			return last, map[string]any{"rollback": "rejected", "best_round": d.BestRound,
+				"rollback_reason": fmt.Sprintf("目标轮状态为 %s, 回滚会把已成功的节点变成失败", r.Result.Status)}
+		}
+		return r.Result, map[string]any{"rollback": "applied", "best_round": d.BestRound,
+			"rolled_back_from": rounds[len(rounds)-1].Iteration}
+	}
+	return last, map[string]any{"rollback": "unresolved", "best_round": d.BestRound,
+		"rollback_reason": "目标轮次不在本次执行的历史里 (resume 续跑时历史不含已完成轮)"}
+}
+
+// termEvData 终止事件的 journal 载荷 (节点级与组级共用同一组键)。
+func termEvData(spec *TerminatorSpec, d TerminateDecision, rounds []LoopRound, note map[string]any) map[string]any {
+	last := rounds[len(rounds)-1]
+	signal := d.Signal
+	if strings.TrimSpace(signal) == "" {
+		// 空信号是实现方的疏漏。不能就这么记一条空事件: "为什么停在这一轮"会永久无解。
+		signal = "unspecified"
+	}
+	out := map[string]any{
+		"terminator": spec.Name,
+		"signal":     signal,
+		"stop":       true,
+		"iteration":  last.Iteration,
+		"iterations": len(rounds),
+		"score":      last.Result.Score,
+		"status":     last.Result.Status,
+	}
+	if d.Detail != "" {
+		out["detail"] = d.Detail
+	}
+	for k, v := range note {
+		out[k] = v
+	}
+	return out
+}
+
+// errText nil-safe 的错误文本 (journal 载荷不放 nil)。
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // callRunner 真正调 runner 的唯一出口。嵌套层的叶子节点在此取并发票

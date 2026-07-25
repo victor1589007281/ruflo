@@ -162,6 +162,10 @@ type StageGraphOverride struct {
 	MaxTurns int `json:"maxTurns,omitempty"`
 	// Deterministic 声明本节点为纯代码判定 (gate 节点走 runGate 的确定性分支, 零 LLM)。
 	Deterministic bool `json:"deterministic,omitempty"`
+	// Placement 本阶段的放置约束 (design/01 §4.9 逐节点放置): 例如需要无头浏览器的
+	// 渲染阶段写 {"require":["browser"]}, 于是它只会被派到有 browser 能力的 runtime。
+	// 不声明时沿用进程级默认 (`--placement-prefer` + 团队亲和), 行为与改造前一致。
+	Placement *graph.PlacementSpec `json:"placement,omitempty"`
 }
 
 // WorkflowGraphOverride 一个工作流的图能力声明。
@@ -188,6 +192,12 @@ type StageGroupOverride struct {
 	MaxIterations int `json:"maxIterations"`
 	// Until 退出条件 (对组产出节点的结果求值), 语法见 pkg/graph/condition.go。
 	Until string `json:"until,omitempty"`
+	// Terminator 可插拔终止器 (与 Until **二选一**, 见 pkg/graph/terminator.go)。
+	// 这是 creative_media / app_composite / game_composite / novel_writing /
+	// swarm_novel 五个 mode 的 AdaptiveTerminator 在图上的表达方式:
+	// 它们的退出条件是"达标/收敛/退化/策略转换/best-of-N 回滚"五路信号的组合,
+	// 其中三路是跨轮判断, Until 只看当前轮结果, 表达不了。
+	Terminator *graph.TerminatorSpec `json:"terminator,omitempty"`
 	// Feedback 每轮回灌模板 ({prev_output} = 上一轮组产出), 下发给全部成员。
 	Feedback string `json:"feedback,omitempty"`
 	// ResultFrom 组产出取哪个成员 (空=组内唯一出度 0 成员; 多个时必须显式)。
@@ -318,6 +328,11 @@ func mergeStageOverride(decl, ov StageGraphOverride) StageGraphOverride {
 	if ov.Deterministic {
 		out.Deterministic = true
 	}
+	// 放置整份替换而不是逐字段合并: Require 是硬约束集合, 半份继承半份覆盖会拼出
+	// 一个谁都没声明过的约束集 (例如覆盖表想放宽到只要 bash, 却留下了阶段声明的 gpu)。
+	if ov.Placement != nil {
+		out.Placement = ov.Placement
+	}
 	return out
 }
 
@@ -422,6 +437,7 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 				ToolProfile:   so.ToolProfile,
 				MaxTurns:      so.MaxTurns,
 				Deterministic: deterministic,
+				Placement:     so.Placement,
 			},
 			Loop:       so.Loop,
 			Retry:      so.Retry,
@@ -558,6 +574,7 @@ func foldStageGroups(spec graph.GraphSpec, groups []StageGroupOverride) (graph.G
 					MaxIterations: g.MaxIterations,
 					Until:         g.Until,
 					Feedback:      g.Feedback,
+					Terminator:    g.Terminator, // 与 Until 二选一, 由 Validate 强制
 				},
 				ResultFrom: strings.TrimSpace(g.ResultFrom),
 			},
@@ -647,6 +664,33 @@ type NodeExecHints struct {
 	MaxTurns      int    // 0=不覆盖
 	Deterministic bool
 	Iteration     int // loop 轮次 (0 起)
+	// Placement 本节点声明的放置约束 (design/01 §4.9 逐节点放置)。
+	// nil = 未声明, 宿主用进程级默认 (与改造前行为一致)。
+	// 指针而不是值: NodeExecHints 被用 `!= NodeExecHints{}` 判空 (worker/factory.go
+	// 与 feishu/session.go 各一处), 放切片进去会让结构体不可比较, 那两处直接编译不过。
+	Placement *Placement
+}
+
+// PlacementFromSpec 把图侧的放置声明镜像转成 agent.Placement。
+//
+// 两个结构体字段一一对应 (见 graph.PlacementSpec 的注释: 内核不 import pkg/agent,
+// 故必须有一份镜像)。转换点只此一处 —— 镜像结构体最大的风险是"加了字段忘了搬",
+// 集中在这里比散在各处好查。
+func PlacementFromSpec(p *graph.PlacementSpec) *Placement {
+	if p == nil {
+		return nil
+	}
+	out := &Placement{
+		Prefer:      strings.TrimSpace(p.Prefer),
+		Affinity:    strings.TrimSpace(p.Affinity),
+		AffinityKey: strings.TrimSpace(p.AffinityKey),
+	}
+	if len(p.Require) > 0 {
+		// 值拷贝: 图规格在整个 run 期间被多个节点 goroutine 共享读, 绝不能让
+		// 下游 (factory 的合并逻辑) 拿到能就地改的底层数组。
+		out.Require = append([]string(nil), p.Require...)
+	}
+	return out
 }
 
 type nodeExecHintsKey struct{}
@@ -685,6 +729,9 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 		Role: node.Agent.Role, Kind: string(node.Kind),
 		ToolProfile: node.Agent.ToolProfile, MaxTurns: node.Agent.MaxTurns,
 		Deterministic: node.Agent.Deterministic, Iteration: in.Iteration,
+		// 逐节点放置 (§4.9): map 分片自动继承 (shardNodeSpec 复制整个 Agent),
+		// 于是"每个分片都要 browser"只需在 map 节点上声明一次。
+		Placement: PlacementFromSpec(node.Agent.Placement),
 	})
 
 	// gate 节点差异化执行 (design/01 §4.1): 门禁节点输出 score, 供条件边
@@ -1305,6 +1352,25 @@ func (we *WorkflowExecutor) executeGraph(ctx context.Context, wf *WorkflowDef, o
 	if err != nil {
 		return nil, err
 	}
+	return we.runGraphSpec(ctx, wf, spec, objective, team, func(s graph.GraphSpec) graph.NodeRunner {
+		return &stageNodeRunner{we: we, team: team, objective: objective, deps: graphNodeDeps(s)}
+	})
+}
+
+// runGraphSpec 图引擎执行的公共骨架: journal + hook 桥 + 拦截器链 + 结果回译。
+//
+// 为什么把 runner 做成参数而不是写死 stageNodeRunner: design/01 M4 退役 pkg/orchestrator
+// 后, orchestrated 模式要在**同一套**调度/journal/hook/预算之上跑
+// 一个不同的执行内核 (裸 LLM completion, 无工具, 见 workflow_orchestrated.go)。
+// 若为它另抄一份引擎装配, journal 目录、hook 桥、拦截器链、结果回译四处都会各自
+// 漂移 —— 那正是这轮归一要消除的形态 (两套调度系统并存)。
+//
+// newRunner 收**最终 spec** 而不是在外面先造好: stageNodeRunner 需要从 spec 抽依赖
+// 声明序 (graphNodeDeps), 而 spec 的来源 (模板/直译/mode 专属构造) 由调用方决定。
+func (we *WorkflowExecutor) runGraphSpec(
+	ctx context.Context, wf *WorkflowDef, spec graph.GraphSpec, objective string,
+	team *ProductionTeam, newRunner func(graph.GraphSpec) graph.NodeRunner,
+) ([]StageResult, error) {
 	// NewFileJournal 收目录名, 内部落 <dir>/journal.jsonl
 	journalDir := filepath.Join(team.dataDir, "graph-journal")
 	journal, err := graph.NewFileJournal(journalDir)
@@ -1315,7 +1381,7 @@ func (we *WorkflowExecutor) executeGraph(ctx context.Context, wf *WorkflowDef, o
 
 	hooks := newTeamGraphHooks(we, team, spec)
 	eng := &graph.Engine{
-		Runner:  &stageNodeRunner{we: we, team: team, objective: objective, deps: graphNodeDeps(spec)},
+		Runner:  newRunner(spec),
 		Journal: journal,
 		Hooks:   hooks, // 生产此前恒 NopBus: 图模式没有阶段级刷盘/指标/心跳
 		// 并发上限与 pipeline 侧对齐: effectiveParallel 会按 API 流控状态动态收敛
@@ -1379,9 +1445,17 @@ func (we *WorkflowExecutor) executeGraph(ctx context.Context, wf *WorkflowDef, o
 			sr.Duration, sr.StartedAt = hs.Duration, hs.StartedAt
 		}
 		results = append(results, sr)
-		// 黑板回写与 pipeline 路径对齐 (下游 harvest/handoff 依赖 <stage>-result 键)
-		if team.Blackboard != nil && nr.Status == graph.NodeStatusCompleted {
-			team.Blackboard.Write(n.ID+"-result", nr.Output, n.Agent.Role, "result")
+		// 黑板回写与 pipeline 路径对齐 (下游 harvest/handoff 依赖 <stage>-result 键)。
+		// -status 这条此前图路径漏写: pipeline 的 executeStage (workflow.go) 与旧
+		// orchestrated 的 convertResults 都写, 只有图路径不写 —— 同一团队在灰度开关
+		// 两侧黑板内容不同形。补上, 键名/分类/作者与 pipeline 侧逐字一致。
+		if team.Blackboard != nil {
+			if nr.Status == graph.NodeStatusCompleted {
+				team.Blackboard.Write(n.ID+"-result", nr.Output, n.Agent.Role, "result")
+				team.Blackboard.Write(n.ID+"-status", "completed", "system", "progress")
+			} else {
+				team.Blackboard.Write(n.ID+"-status", "failed: "+sr.Error, "system", "progress")
+			}
 		}
 	}
 	if runErr != nil {

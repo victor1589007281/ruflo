@@ -205,12 +205,12 @@ func validateNodeShape(n NodeSpec, insideGroup bool) error {
 		if n.Kind == NodeKindLoopGroup {
 			return fmt.Errorf("graph: 节点 %q 是 loop-group, 不得再声明节点级 Loop (组级循环用 group.loop, 两层并存会让轮次相乘)", n.ID)
 		}
-		if n.Loop.MaxIterations <= 0 {
-			return fmt.Errorf("graph: 节点 %q 的 Loop.max_iterations 必须 > 0 (无界循环违法, design/01 §4.4)", n.ID)
+		if err := validateLoopPolicy(*n.Loop, fmt.Sprintf("节点 %q 的 Loop", n.ID)); err != nil {
+			return err
 		}
-		if _, err := ParseCondition(n.Loop.Until); err != nil {
-			return fmt.Errorf("graph: 节点 %q 的 Loop.until 条件语法错误: %w", n.ID, err)
-		}
+	}
+	if err := validatePlacement(n.Agent.Placement, n.ID); err != nil {
+		return err
 	}
 	if n.Expand != nil && n.Expand.MaxNodes <= 0 {
 		return fmt.Errorf("graph: 节点 %q 的 Expand.max_nodes 必须 > 0 (无界展开违法, design/01 §4.2)", n.ID)
@@ -270,10 +270,84 @@ func validateReduceNode(n NodeSpec) error {
 		return nil // 全默认: 聚合全部 map 前驱, 交给 runner
 	}
 	switch n.Reduce.Strategy {
-	case "", ReduceRunner, ReduceConcat, ReduceLongest:
+	case "", ReduceRunner, ReduceConcat, ReduceLongest, ReduceVote, ReduceTrimmedMean:
 	default:
-		return fmt.Errorf("graph: reduce 节点 %q 的 reduce.strategy=%q 未知 (支持 %s|%s|%s)",
-			n.ID, n.Reduce.Strategy, ReduceRunner, ReduceConcat, ReduceLongest)
+		return fmt.Errorf("graph: reduce 节点 %q 的 reduce.strategy=%q 未知 (支持 %s|%s|%s|%s|%s)",
+			n.ID, n.Reduce.Strategy, ReduceRunner, ReduceConcat, ReduceLongest, ReduceVote, ReduceTrimmedMean)
+	}
+	if n.Reduce.MinSamples < 0 {
+		return fmt.Errorf("graph: reduce 节点 %q 的 reduce.min_samples 不得为负 (0 = 取策略缺省)", n.ID)
+	}
+	// min_samples 只有投票/截尾均值读得到。声明在 concat/longest/runner 上是死配置,
+	// 作者多半以为自己设了一道闸 —— 拦住比让它静默无效好查 (与 map.min_shards 同款口径)。
+	if n.Reduce.MinSamples > 0 {
+		switch n.Reduce.Strategy {
+		case ReduceVote, ReduceTrimmedMean:
+		default:
+			return fmt.Errorf("graph: reduce 节点 %q 声明了 reduce.min_samples=%d, 但 strategy=%q 不做样本融合 (只有 %s|%s 读它)",
+				n.ID, n.Reduce.MinSamples, orDefault(n.Reduce.Strategy, ReduceRunner), ReduceVote, ReduceTrimmedMean)
+		}
+	}
+	return nil
+}
+
+// validateLoopPolicy 节点级 Loop 与组级 group.loop 共用的循环策略校验。
+func validateLoopPolicy(l LoopPolicy, where string) error {
+	if l.MaxIterations <= 0 {
+		return fmt.Errorf("graph: %s.max_iterations 必须 > 0 (无界循环违法, design/01 §4.4)", where)
+	}
+	if _, err := ParseCondition(l.Until); err != nil {
+		return fmt.Errorf("graph: %s.until 条件语法错误: %w", where, err)
+	}
+	if l.Terminator == nil {
+		return nil
+	}
+	// Until 与终止器并存 = 两套退出判定, 谁先谁后是纯实现细节。拒绝而不是定个优先级:
+	// 定优先级等于让另一套判据静默失效, 而声明它的人以为两条都在生效。
+	if strings.TrimSpace(l.Until) != "" {
+		return fmt.Errorf("graph: %s 同时声明了 until=%q 与 terminator=%q (二者都能决定退出, 并存等于把'第几轮停'交给求值顺序; 判据请二选一)",
+			where, l.Until, l.Terminator.Name)
+	}
+	// 参数校验交给终止器工厂本身 (同一条解析路径, 于是"能开图"与"能构造"永不漂移)。
+	if _, err := resolveTerminator(l.Terminator); err != nil {
+		return fmt.Errorf("graph: %s.terminator 非法: %w", where, err)
+	}
+	return nil
+}
+
+// validatePlacement 放置约束的形状校验 (design/01 §4.9)。
+//
+// 为什么非法值必须**拒**而不是当成 any: 放置是治理侧约束, 一个写错的
+// prefer="remote" (漏了冒号与 runtime 名) 若被当成 any, 表现是节点随机落在任意
+// 机器上却毫无报错, 而作者以为自己把它钉住了。能力标签 (Require) 反过来不校验 ——
+// 取值域由宿主的 RuntimeCaps 定义, 内核持一张白名单必然与宿主漂移。
+func validatePlacement(p *PlacementSpec, nodeID string) error {
+	if p == nil {
+		return nil
+	}
+	for i, req := range p.Require {
+		if strings.TrimSpace(req) == "" {
+			return fmt.Errorf("graph: 节点 %q 的 placement.require[%d] 为空 (空标签对 RuntimeCaps.Has 恒真, 等于一条不起作用的硬约束)", nodeID, i)
+		}
+	}
+	switch pref := strings.TrimSpace(p.Prefer); {
+	case pref == "" || pref == PlacementPreferLocal || pref == PlacementPreferAny:
+	case strings.HasPrefix(pref, PlacementPreferRemote):
+		if strings.TrimSpace(strings.TrimPrefix(pref, PlacementPreferRemote)) == "" {
+			return fmt.Errorf("graph: 节点 %q 的 placement.prefer=%q 缺少 runtime 名 (格式 %s<name>)", nodeID, p.Prefer, PlacementPreferRemote)
+		}
+	default:
+		return fmt.Errorf("graph: 节点 %q 的 placement.prefer=%q 非法 (支持 %s|%s<name>|%s)",
+			nodeID, p.Prefer, PlacementPreferLocal, PlacementPreferRemote, PlacementPreferAny)
+	}
+	switch aff := strings.TrimSpace(p.Affinity); aff {
+	case "":
+		if strings.TrimSpace(p.AffinityKey) != "" {
+			return fmt.Errorf("graph: 节点 %q 声明了 placement.affinity_key=%q 但没声明 affinity (死配置: 分组键不会被任何人读)", nodeID, p.AffinityKey)
+		}
+	case PlacementAffinityTeam:
+	default:
+		return fmt.Errorf("graph: 节点 %q 的 placement.affinity=%q 未知 (目前只支持 %s)", nodeID, p.Affinity, PlacementAffinityTeam)
 	}
 	return nil
 }
@@ -283,11 +357,8 @@ func validateGroupNode(n NodeSpec) error {
 	if n.Group == nil || len(n.Group.Nodes) == 0 {
 		return fmt.Errorf("graph: loop-group 节点 %q 缺少组内子图 (group.nodes 为空)", n.ID)
 	}
-	if n.Group.Loop.MaxIterations <= 0 {
-		return fmt.Errorf("graph: loop-group 节点 %q 的 group.loop.max_iterations 必须 > 0 (无界循环违法, design/01 §4.4)", n.ID)
-	}
-	if _, err := ParseCondition(n.Group.Loop.Until); err != nil {
-		return fmt.Errorf("graph: loop-group 节点 %q 的 group.loop.until 条件语法错误: %w", n.ID, err)
+	if err := validateLoopPolicy(n.Group.Loop, fmt.Sprintf("loop-group 节点 %q 的 group.loop", n.ID)); err != nil {
+		return err
 	}
 	sub := GraphSpec{Name: n.ID + "-group", Nodes: n.Group.Nodes, Edges: n.Group.Edges}
 	if err := sub.validate(true); err != nil {

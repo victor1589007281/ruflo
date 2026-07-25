@@ -295,6 +295,14 @@ func narrowToParent(parent, child NodeSpec, depth, maxDepth int) NodeSpec {
 	if parent.Agent.MaxTurns > 0 && (out.Agent.MaxTurns <= 0 || out.Agent.MaxTurns > parent.Agent.MaxTurns) {
 		out.Agent.MaxTurns = parent.Agent.MaxTurns
 	}
+	// 放置约束 (§4.9): 与工具画像同理 —— 换放置 = 换机器 = 换能力集 = 放宽,
+	// 是最不能让模型自己决定的一类。父节点声明过就强制继承其 Prefer/Affinity,
+	// Require 取**并集** (只能更严): 子节点少写一条硬约束不该等于把它去掉,
+	// 否则一个声明了 require:["browser"] 的父节点展开出的子节点会落到没有浏览器的
+	// 机器上, 而"约束只收窄"这条不变量在图上看起来还是成立的。
+	if parent.Agent.Placement != nil {
+		out.Agent.Placement = narrowPlacement(parent.Agent.Placement, out.Agent.Placement)
+	}
 	// 再展开: 只在深度还有余量时保留, 且额度不得超过父节点。
 	switch {
 	case depth >= maxDepth:
@@ -310,6 +318,35 @@ func narrowToParent(parent, child NodeSpec, depth, maxDepth int) NodeSpec {
 		out.Expand = &ex
 	}
 	return out
+}
+
+// narrowPlacement 把子节点的放置约束收窄到不弱于父节点 (parent 非 nil)。
+// 返回**新对象**: 父/子的声明都属于图规格, 被多个节点 goroutine 共享读, 不得就地改。
+func narrowPlacement(parent, child *PlacementSpec) *PlacementSpec {
+	out := PlacementSpec{Prefer: parent.Prefer, Affinity: parent.Affinity, AffinityKey: parent.AffinityKey}
+	if child != nil {
+		// 父没表达偏好时才让子的偏好生效 (软偏好不涉及能力, 放宽风险低)。
+		if out.Prefer == "" {
+			out.Prefer = child.Prefer
+		}
+		if out.Affinity == "" {
+			out.Affinity, out.AffinityKey = child.Affinity, child.AffinityKey
+		}
+	}
+	seen := map[string]bool{}
+	add := func(reqs []string) {
+		for _, r := range reqs {
+			if r = strings.TrimSpace(r); r != "" && !seen[r] {
+				seen[r] = true
+				out.Require = append(out.Require, r)
+			}
+		}
+	}
+	add(parent.Require) // 父的硬约束先入, 顺序确定性
+	if child != nil {
+		add(child.Require)
+	}
+	return &out
 }
 
 // expandedNodeID 展开产物的命名空间化 ID: <父节点>/<子节点>。

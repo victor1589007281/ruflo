@@ -41,6 +41,21 @@ const (
 	// Data: iteration / status / output / score。**resume 按已完成轮次续跑**。
 	EvGroupIteration = "loop.group.iteration"
 
+	// EvLoopTerminated 节点级 Loop 被**可插拔终止器**终止 (design/01 §4.4, terminator.go)。
+	// Data: terminator / signal (哪一路信号) / detail / iteration / iterations /
+	// score / status, 以及 best-of-N 回滚的结局 (rollback=applied|suppressed|
+	// rejected|unresolved + best_round + rollback_reason)。
+	// 没有它, "为什么第 3 轮就停了"与"为什么产出不是最后一轮的"事后完全不可解释 ——
+	// 五路信号里有三路 (收敛/退化/回滚) 从产出本身看不出任何痕迹。
+	EvLoopTerminated = "loop.terminated"
+	// EvGroupTerminated loop-group 被终止器终止 (键同 EvLoopTerminated, 另带
+	// result_from / output —— 组的最终产出经 Replay 用于 resume)。
+	//
+	// **它是组循环 resume 的真源**: 组的轮次进度靠 loop.group.iteration 计数,
+	// 但"终止器已经判定该停了"这件事不在轮次里 —— 少了这条事件, resume 会带着一个
+	// 全新 (无历史) 的终止器把剩下的轮次继续跑完, 等于把早停判定作废。
+	EvGroupTerminated = "loop.group.terminated"
+
 	// EvNodeInvalidated 节点被显式失效 (design/01 §4.3 refine 凭 InvalidateFrom)。
 	// Data: reason。Replay 见到它就把该节点从 Completed 里摘掉, 于是下一次 resume
 	// 会重跑它 —— **这才是事件溯源的 refine**: 进度真源始终是 journal, 而不是靠
@@ -258,6 +273,13 @@ type GroupIterState struct {
 	Status string  // 最后一轮 ResultFrom 节点的状态
 	Output string  // 最后一轮产出 (供 Feedback 回灌)
 	Score  float64 // 最后一轮评分 (供 Until 求值)
+	// Terminated 上一次运行里终止器已判定该组结束 (loop.group.terminated)。
+	// resume 见到它就直接拿 Output/Score/Status 收尾, **一轮都不再跑** ——
+	// 否则新进程里的终止器没有历史 (收敛/退化都是跨轮判断), 会把早停判定作废,
+	// 表现为"明明第 2 轮就该停, resume 之后又跑到第 5 轮"。
+	Terminated bool
+	// TermSignal 终止信号名 (仅记账/可观测用)。
+	TermSignal string
 }
 
 // Replay 重放事件序列重建 RunState。
@@ -365,6 +387,28 @@ func Replay(events []Event) *RunState {
 			}
 			if s, ok := ev.Data["output"].(string); ok {
 				gs.Output = s
+			}
+			if f, ok := ev.Data["score"].(float64); ok {
+				gs.Score = f
+			}
+			st.GroupIters[ev.NodeID] = gs
+		case EvGroupTerminated:
+			// 终止事件在最后一条 loop.group.iteration **之后**追加, 故在这里覆盖
+			// Output/Score/Status 得到的正是组真正交付的那一份 (best-of-N 回滚后
+			// 它与最后一轮不同 —— 只看轮次事件会拿到被回滚掉的那份劣化产出)。
+			if ev.NodeID == "" {
+				continue
+			}
+			gs := st.GroupIters[ev.NodeID]
+			gs.Terminated = true
+			if s, ok := ev.Data["signal"].(string); ok {
+				gs.TermSignal = s
+			}
+			if s, ok := ev.Data["output"].(string); ok {
+				gs.Output = s
+			}
+			if s, ok := ev.Data["status"].(string); ok && s != "" {
+				gs.Status = s
 			}
 			if f, ok := ev.Data["score"].(float64); ok {
 				gs.Score = f

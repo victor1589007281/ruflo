@@ -188,9 +188,12 @@ func TestValidateErrors(t *testing.T) {
 		},
 		{
 			name: "reduce聚合策略未知",
+			// 占位名从 "vote" 换成 "加权平均": vote 已成为合法策略 (投票融合,
+			// 见 reduce_fuse.go), 拿它当"未知策略"的样本已经名不副实。
+			// 断言的性质没变 —— 未实现的策略名必须被拒, 而不是静默劣化成 runner。
 			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
 				{ID: "m", Kind: NodeKindMap, Map: &MapPolicy{MaxShards: 2}},
-				{ID: "r", Kind: NodeKindReduce, Reduce: &ReducePolicy{Strategy: "vote"}}},
+				{ID: "r", Kind: NodeKindReduce, Reduce: &ReducePolicy{Strategy: "加权平均"}}},
 				Edges: []EdgeSpec{{From: "m", To: "r"}}},
 			wantSub: "strategy",
 		},

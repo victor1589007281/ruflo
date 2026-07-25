@@ -25,7 +25,9 @@ package graph
 //  1. 等其 map 组全部终态 —— 不需要额外等待机制: map 节点在全部分片终态前不会进入
 //     终态, 而 reduce 有 map→reduce 入边, ready-set 天然满足"等齐";
 //  2. 分片结果经 NodeInput.Shards 下发 (含每片输入/产出/状态) 供 runner 聚合;
-//  3. Strategy=concat/longest 由引擎**直接算出**, 零 LLM, 但仍走完整节点生命周期;
+//  3. Strategy=concat/longest/vote/trimmed_mean 由引擎**直接算出**, 零 LLM, 但仍走
+//     完整节点生命周期; 后两个是投票融合与截尾均值 (见 reduce_fuse.go), 它们额外
+//     受 MinSamples 闸约束 —— 样本不足时**失败而不是降级出数**;
 //  4. RequireAll=true 时任一分片非 completed 即 failed; 零 completed 分片一律 failed
 //     (整个 map 组跑完却没有一份可用产出, 那是真失败, 不是"未走的分支")。
 
@@ -298,6 +300,7 @@ func nonEmptyTrimmed(parts []string) []string {
 func reduceResult(node NodeSpec, in NodeInput) (NodeResult, bool) {
 	pol := node.Reduce
 	strategy, sep, requireAll := ReduceRunner, DefaultReduceSeparator, false
+	minSamples := 0
 	if pol != nil {
 		if pol.Strategy != "" {
 			strategy = pol.Strategy
@@ -306,6 +309,7 @@ func reduceResult(node NodeSpec, in NodeInput) (NodeResult, bool) {
 			sep = pol.Separator
 		}
 		requireAll = pol.RequireAll
+		minSamples = pol.MinSamples
 	}
 
 	var okOuts []string
@@ -338,6 +342,12 @@ func reduceResult(node NodeSpec, in NodeInput) (NodeResult, bool) {
 			}
 		}
 		return NodeResult{Status: NodeStatusCompleted, Output: best}, true
+	case ReduceVote:
+		// 投票融合 (ensemble_extract 的算法, 见 reduce_fuse.go)。
+		return reduceVoteResult(okOuts, minSamples), true
+	case ReduceTrimmedMean:
+		// 每维截尾均值 (review_panel 的算法); Score = 融合 overall, 可直接挂条件边。
+		return reduceTrimmedMeanResult(okOuts, minSamples), true
 	default:
 		return NodeResult{}, false // 交给 runner
 	}
