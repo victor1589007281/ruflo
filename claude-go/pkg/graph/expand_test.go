@@ -190,13 +190,37 @@ func TestExpandBoundsRejected(t *testing.T) {
 			wantSub: "终点必须是本次展开的新节点",
 		},
 		{
+			// router 是**不实现**的形态: 混进展开产物照样被拒 (原案例用 human,
+			// human 现已实现, 见下一个案例 —— 它换了一条更强的理由被拒)。
 			name:   "未实现的Kind混进来",
+			expand: &ExpandSpec{MaxNodes: 5},
+			sub: &Expansion{
+				Nodes: []NodeSpec{{ID: "r", Kind: NodeKindRouter}},
+				Edges: []EdgeSpec{{From: "planner", To: "r"}},
+			},
+			wantSub: "尚未实现",
+		},
+		{
+			// human 已实现, 但**不许由 LLM 产出塞进来**: 那等于让模型自己插入一个
+			// 审批闸并决定"这次运行到哪结束"。
+			name:   "LLM产出里塞human节点",
 			expand: &ExpandSpec{MaxNodes: 5},
 			sub: &Expansion{
 				Nodes: []NodeSpec{{ID: "h", Kind: NodeKindHuman}},
 				Edges: []EdgeSpec{{From: "planner", To: "h"}},
 			},
-			wantSub: "尚未实现",
+			wantSub: "human 不得出现在组内/派生子图/展开产物里",
+		},
+		{
+			// 同理: 声明了 suspend 的展开产物也被拒 (模型不能让运行停在半路)。
+			name:   "LLM产出里声明suspend",
+			expand: &ExpandSpec{MaxNodes: 5},
+			sub: &Expansion{
+				Nodes: []NodeSpec{{ID: "t1", Kind: NodeKindAgent,
+					Agent: AgentSpec{Role: "w"}, Suspend: &SuspendSpec{}}},
+				Edges: []EdgeSpec{{From: "planner", To: "t1"}},
+			},
+			wantSub: "声明了 suspend",
 		},
 		{
 			name:   "子图内ID重复",

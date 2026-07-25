@@ -30,6 +30,11 @@ type GraphMeta struct {
 type GraphPolicies struct {
 	MaxParallel  int          `json:"max_parallel,omitempty"`  // 并发上限, 0=默认4
 	DefaultRetry *RetryPolicy `json:"default_retry,omitempty"` // 节点未声明 Retry 时的图级默认
+	// DefaultJoin 节点未声明 Join 时的图级默认汇聚语义 (JoinOr | JoinAnd)。
+	// 空 = JoinOr —— **未声明时一切照旧**是硬约束: OR-join 是现存全部图的既有行为。
+	// 有图级默认是因为"整图都要 AND"是真实用法 (orchestrated 的 WBS 汇总链每个节点
+	// 都要拿全上游), 逐节点写一遍等于把一个图级决策抄 N 遍。
+	DefaultJoin string `json:"default_join,omitempty"`
 	// MaxTotalNodes 一次运行的**运行图**节点总数上限 (含动态展开产物与 map 分片)。
 	// 0 → DefaultMaxTotalNodes。这是"有界展开"的最后一道闸 (design/01 §4.2):
 	// 单个 ExpandSpec 的深度/条数上限只能约束一次展开, 挡不住"每层都只加 3 个
@@ -39,8 +44,9 @@ type GraphPolicies struct {
 
 // NodeKind 节点形态 (design/01 §4.1 全表 8 种)。
 //
-// 已实现: agent | gate | map | reduce | loop-group。
-// 未实现: router | subgraph | human —— Validate 对它们**显式报错**而不是静默接受
+// 已实现: agent | gate | map | reduce | loop-group | subgraph | human。
+// **不实现: router** —— 不是"还没做", 是核实后判定它是冗余形态 (理由写在 validate.go
+// validateNodeShape 的 router 分支)。Validate 对它**显式报错**而不是静默接受
 // (静默接受等于把一个什么都不做的节点混进图里, 表现为"整条分支莫名 skipped")。
 type NodeKind string
 
@@ -53,11 +59,29 @@ const (
 	NodeKindReduce NodeKind = "reduce" // 等其 map 组全部终态后聚合
 	// —— 组级循环 (§4.4) ——
 	NodeKindLoopGroup NodeKind = "loop-group" // 一组节点 (内嵌子图) 整体循环
-
-	// 以下 Kind 为 design/01 §4.1 全表预留, 尚未实现, Validate 明确拒绝。
-	NodeKindRouter   NodeKind = "router"
+	// —— 图的组合复用 (§4.1/§4.2 子图, 见 subgraph.go) ——
+	// 引用另一张**已注册**的图作为一个节点。与 loop-group (内嵌子图) 和 SpawnSubgraph
+	// (运行期派生) 的三方分工见 subgraph.go 文件头那张表。
 	NodeKindSubgraph NodeKind = "subgraph"
-	NodeKindHuman    NodeKind = "human"
+	// —— 人在环路 (§4.3 human.requested/human.responded, 见 suspend.go) ——
+	// 零 LLM、零 runner: 引擎自己查 journal 里有没有答复, 没有就把节点挂起
+	// (NodeStatusSuspended), 整个 run 以 suspended 收尾, 答复到达后 resume 续跑。
+	NodeKindHuman NodeKind = "human"
+
+	// NodeKindRouter design/01 §4.1 全表预留形态, **刻意不实现** (Validate 拒绝并给出
+	// 替代写法)。理由见 validate.go: 条件边 + OR-join 已完整表达它的分支路由语义。
+	NodeKindRouter NodeKind = "router"
+)
+
+// 汇聚 (join) 语义 (NodeSpec.Join / GraphPolicies.DefaultJoin, engine.go 语义2)。
+//
+// **默认恒为 or**: OR-join 是本仓现存全部图的既有行为, 未声明时一字不变。
+const (
+	// JoinOr 至少一条入边满足即执行, 否则整节点 skipped (v1 唯一语义, 缺省)。
+	JoinOr = "or"
+	// JoinAnd 全部入边都必须满足。不满足时的终态**按成因分两种**, 见 engine.go
+	// joinVerdict: 上游未成功 ⇒ failed (级联); 上游都成功但条件不成立 ⇒ skipped。
+	JoinAnd = "and"
 )
 
 // NodeSpec 节点描述 (design/01 §4.1)。所有 Kind 共享同一 Agent 载体。
@@ -79,6 +103,17 @@ type NodeSpec struct {
 	Reduce *ReducePolicy `json:"reduce,omitempty"`
 	// Group 仅 Kind=="loop-group" 有效: 组内子图 + 组级循环 (§4.4)。
 	Group *GroupPolicy `json:"group,omitempty"`
+	// Subgraph 仅 Kind=="subgraph" 有效: 引用哪张已注册的图 (§4.1, subgraph.go)。
+	Subgraph *SubgraphSpec `json:"subgraph,omitempty"`
+	// Suspend 声明本节点**可以**挂起 (NodeStatusSuspended, 见 suspend.go)。
+	// 未声明时 runner 返回 suspended 会被引擎归一为 failed —— 与 Expand/Spawn 同一
+	// 原则: 能力必须由图显式授予, 否则任何 runner 都能让一次运行停在半路,
+	// 而调用方 (8+ 下游平台) 完全不知道图里有个会挂起的节点。
+	// Kind=="human" 的挂起是形态自带的, 不必 (也不允许) 再声明它。
+	Suspend *SuspendSpec `json:"suspend,omitempty"`
+	// Join 本节点的汇聚语义 (JoinOr | JoinAnd), 空 = 取 GraphPolicies.DefaultJoin,
+	// 两者都空 = JoinOr (既有行为)。
+	Join string `json:"join,omitempty"`
 	// Spawn 声明本节点**可以**派生子图 (§4.8 SpawnSubgraph)。
 	// 未声明时 NodeInput.Spawn 为 nil —— 授权缺失表现为"没有这个能力", 而不是
 	// 调用了才报错。与 Expand 同一原则: 派生能力必须由图显式授予, 否则任何 runner
@@ -207,6 +242,59 @@ type GroupPolicy struct {
 	ResultFrom string `json:"result_from,omitempty"`
 }
 
+// SubgraphSpec subgraph 节点的引用声明 (design/01 §4.1, 实现见 subgraph.go)。
+//
+// 引用**已注册的图名**而不是内嵌一份 GraphSpec, 是这个形态存在的全部理由:
+// 内嵌等于把同一张子流程在每个引用处抄一遍 (那是 loop-group 的形态), 复用才需要引用。
+// 代价是引用要能在开图时解析 —— 故 Validate 会真去注册表里取出被引用的图并递归校验,
+// 未注册即报错, 而不是留到运行期才发现 (那时半张图已经跑掉了)。
+type SubgraphSpec struct {
+	// Graph 被引用的图名 (RegisterGraph 注册的键), 必填。
+	Graph string `json:"graph"`
+	// ResultFrom 取哪个成员的产出作为本节点的产出。空 = 被引用图里唯一的出度 0 节点;
+	// 有多个出度 0 节点时**必须显式声明** (否则"结果是谁"取决于声明顺序 —— 与
+	// loop-group/spawn 的 ResultFrom 同一口径)。
+	ResultFrom string `json:"result_from,omitempty"`
+	// Params 追加给子图的图参数 (与运行级 Params 合并, 同名以它为准)。
+	// 这是"参数化实例化"的落点: 同一张子图被多处引用时靠它区分。
+	Params map[string]string `json:"params,omitempty"`
+	// MaxDepth 子图嵌套深度上限 (子图里还有 subgraph 节点), 0 → DefaultSubgraphDepth。
+	// Validate 已在开图时拒绝引用环, 所以这道闸挡的是**合法但过深**的嵌套
+	// (以及注册表在 Validate 之后被改成环的情形 —— 运行期兜底 fail-closed)。
+	MaxDepth int `json:"max_depth,omitempty"`
+}
+
+// SuspendSpec 挂起授权与边界 (NodeStatusSuspended, 实现见 suspend.go)。
+//
+// 声明它 = 授予本节点"这次先不跑完"的权利。两个上限都是必需的:
+// 没有 MaxRevives, 一个反复回报"再等等"的 runner 能让节点在一次运行里无限重跑;
+// 没有 MaxWaitSec, 一个回报 ReviveAfter=6h 的 runner 能让整张图卡死 6 小时
+// (等待期占着顶层并发槽位, 见 suspend.go 对这个取舍的论证)。
+type SuspendSpec struct {
+	// MaxRevives 一次运行内本节点最多被唤醒 (revive) 几次, 0 → DefaultMaxRevives。
+	// 额度用尽后仍回报挂起 ⇒ 本次运行到此为止 (节点留在 suspended, resume 续跑),
+	// **而不是**判失败: 挂起不是失败, 把它转成失败会让 fail 条件边误触发。
+	MaxRevives int `json:"max_revives,omitempty"`
+	// MaxWaitSec 单次 revive 的等待上限 (秒), 0 → DefaultReviveWaitSec。
+	// 超出即**夹到上限**并记 journal (clamped), 不报错: 等待时长来自运行期观测
+	// (服务端的 Retry-After), 夹紧后仍可执行, 报错反而把一次可恢复的限流变成失败。
+	MaxWaitSec int `json:"max_wait_sec,omitempty"`
+}
+
+func (s *SuspendSpec) maxRevives() int {
+	if s == nil || s.MaxRevives <= 0 {
+		return DefaultMaxRevives
+	}
+	return s.MaxRevives
+}
+
+func (s *SuspendSpec) maxWaitSec() int {
+	if s == nil || s.MaxWaitSec <= 0 {
+		return DefaultReviveWaitSec
+	}
+	return s.MaxWaitSec
+}
+
 // ExpandSpec 动态展开授权与边界 (design/01 §4.2)。
 //
 // 有界是硬要求: 展开的内容来自 LLM 产出 (GoalTree HTN 分解 / WBS / swarm 分解),
@@ -229,6 +317,14 @@ const (
 	GroupIterIDInfix        = "#it"            // 组内 NodeID: <组节点>#it<轮次>/<成员>
 	GroupMemberIDSep        = "/"              //
 	expandedNodeIDSeparator = GroupMemberIDSep // 展开产物 NodeID: <父节点>/<子节点>
+
+	// DefaultSubgraphDepth subgraph 嵌套深度缺省上限 (SubgraphSpec.MaxDepth)。
+	DefaultSubgraphDepth = 3
+	// DefaultMaxRevives 一次运行内单节点被唤醒次数的缺省上限 (SuspendSpec.MaxRevives)。
+	DefaultMaxRevives = 3
+	// DefaultReviveWaitSec 单次 revive 等待时长的缺省上限 (秒, SuspendSpec.MaxWaitSec)。
+	// 5 分钟: 限流退避的量级。更长的等待应该走"跨运行挂起"而不是占着并发槽位干等。
+	DefaultReviveWaitSec = 300
 )
 
 // AgentSpec 节点的 Agent 载体 (design/01 §4.1)。

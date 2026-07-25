@@ -11,18 +11,48 @@ import (
 )
 
 // Validate 校验图结构, 返回首个发现的错误 (中文信息, 含节点/边定位)。
-// 检查项: 图非空; 节点 ID 非空且唯一; Kind 合法 (agent|gate|map|reduce|loop-group,
-// router/subgraph/human 显式报错); 各形态的策略字段完备 (map 切分/reduce 来源/
-// 组内子图递归校验/Expand 边界); Loop.MaxIterations>0; 边端点存在; 无自环;
+// 检查项: 图非空; 节点 ID 非空且唯一; Kind 合法 (agent|gate|map|reduce|loop-group|
+// subgraph|human, router 显式报错); 各形态的策略字段完备 (map 切分/reduce 来源/
+// 组内子图递归校验/被引用子图递归校验与引用环/Expand 边界/Suspend 授权与位置);
+// Loop.MaxIterations>0; join 语义取值合法; 边端点存在; 无自环;
 // 存在入度 0 入口; 全部节点从入口可达; 无有向环 (Kahn 拓扑);
 // 边 Condition 与 Loop.Until 语法合法。
-func (g GraphSpec) Validate() error { return g.validate(false) }
+func (g GraphSpec) Validate() error { return g.validate(validateCtx{}) }
 
-// validate 真正的校验体。insideGroup=true 时用于 loop-group 的组内子图递归校验
-// (差异: 组内不允许再嵌套 loop-group, 见 GroupPolicy 注释的"轮次相乘"论证)。
-func (g GraphSpec) validate(insideGroup bool) error {
+// validateCtx 校验上下文: 递归校验时"我在图的什么位置"。
+//
+// 两个布尔刻意分开而不是合成一个"nested": insideGroup 只管一件历史规则 (组内不许再
+// 嵌套 loop-group, 见 GroupPolicy 的"轮次相乘"论证), 而 nested 管的是**这一层是不是
+// 顶层调度层**。把它们并成一个会改变既有行为 —— 派生子图 (spawn) 现在是允许内嵌
+// loop-group 的, 合并后会连带把那条路禁掉。
+type validateCtx struct {
+	// insideGroup 本层是 loop-group 的组内子图。
+	insideGroup bool
+	// nested 本层**不是顶层调度层**: 组内成员 / 派生子图 (spawn) / 展开产物。
+	// 这些位置一律不许声明挂起 (Suspend / Kind=human), 也不许再引用子图 (Kind=subgraph):
+	//   - 挂起: 组的轮次进度与 spawn 的同步语义都表达不了"跑到一半停下"(见 suspend.go
+	//     与 subgraph.go 文件头四); 展开产物与 spawn 的内容还来自 LLM, 让模型能插入一个
+	//     挂起节点等于把"这次运行到哪结束"交给模型;
+	//   - 引用子图: 组轮次前缀/派生指纹再叠一层子图命名空间, journal 归因与 resume
+	//     都需要另一套口径, 而生产用例 (composite 组合) 全在顶层。
+	// **被引用图的成员不算 nested**: 它自己就是一层完整的顶层调度 (有独立命名空间、
+	// 按限定 ID 吃缓存), 所以子图里可以有 human 节点, 也可以再引用子图 (受深度闸约束)。
+	nested bool
+	// sgPath 当前 subgraph 引用链 (由外到内的图名), 用于查引用环与深度、并定位报错。
+	sgPath []string
+}
+
+// validate 真正的校验体。
+func (g GraphSpec) validate(vc validateCtx) error {
 	if len(g.Nodes) == 0 {
 		return errors.New("graph: 图为空, 至少需要一个节点")
+	}
+	switch j := strings.TrimSpace(g.Policies.DefaultJoin); j {
+	case "", JoinOr, JoinAnd:
+	default:
+		// 写错的 default_join 若被当成 or, 表现是"我明明整图设了 AND 却没生效",
+		// 而 AND 与 OR 的差别是整条汇总链跑不跑 —— 必须拒。
+		return fmt.Errorf("graph: policies.default_join=%q 未知 (支持 %s|%s)", j, JoinOr, JoinAnd)
 	}
 
 	// —— 节点: ID 唯一性 / Kind / Loop 策略 ——
@@ -43,7 +73,7 @@ func (g GraphSpec) validate(insideGroup bool) error {
 		}
 		ids[n.ID] = true
 		kinds[n.ID] = n.Kind
-		if err := validateNodeShape(n, insideGroup); err != nil {
+		if err := validateNodeShape(n, vc); err != nil {
 			return err
 		}
 	}
@@ -172,10 +202,10 @@ func (g GraphSpec) validate(insideGroup bool) error {
 	return nil
 }
 
-// validateNodeShape 单个节点的形态校验 (Kind + 各形态策略 + Loop/Expand 边界)。
+// validateNodeShape 单个节点的形态校验 (Kind + 各形态策略 + Loop/Expand/Suspend/join 边界)。
 // 独立成函数是为了让**动态展开产物**走同一套规则 (expand.go prepareExpansion 调用它):
 // 展开进来的节点若能绕过形态校验, 等于给了 LLM 一条把非法节点塞进运行图的路。
-func validateNodeShape(n NodeSpec, insideGroup bool) error {
+func validateNodeShape(n NodeSpec, vc validateCtx) error {
 	switch n.Kind {
 	case NodeKindAgent, NodeKindGate:
 		// 叶子形态: 一次 runner 调用
@@ -188,22 +218,56 @@ func validateNodeShape(n NodeSpec, insideGroup bool) error {
 			return err
 		}
 	case NodeKindLoopGroup:
-		if insideGroup {
+		if vc.insideGroup {
 			return fmt.Errorf("graph: 节点 %q: loop-group 组内不允许再嵌套 loop-group (轮次相乘后预算无法推理, design/01 §4.4)", n.ID)
 		}
-		if err := validateGroupNode(n); err != nil {
+		if err := validateGroupNode(n, vc); err != nil {
 			return err
 		}
-	case NodeKindRouter, NodeKindSubgraph, NodeKindHuman:
-		// 明确报错而不是静默接受: 静默接受等于把一个什么都不做的节点混进图,
-		// 表现为"整条分支莫名 skipped", 排查成本远高于开图时就失败。
-		return fmt.Errorf("graph: 节点 %q 的 Kind %q 尚未实现 (design/01 §4.1 预留形态, 已实现: agent|gate|map|reduce|loop-group)", n.ID, n.Kind)
+	case NodeKindSubgraph:
+		if vc.nested {
+			return fmt.Errorf("graph: 节点 %q: subgraph 不得出现在组内/派生子图/展开产物里 (命名空间再叠一层后 journal 归因与 resume 需要另一套口径; 图的组合请在顶层做, 见 subgraph.go)", n.ID)
+		}
+		if err := validateSubgraphNode(n, vc); err != nil {
+			return err
+		}
+	case NodeKindHuman:
+		if vc.nested {
+			return fmt.Errorf("graph: 节点 %q: human 不得出现在组内/派生子图/展开产物里 (组的轮次与 spawn 的同步语义表达不了'跑到一半等人'; 展开产物还来自 LLM 产出, 等于让模型自己插入一个审批闸)", n.ID)
+		}
+		if n.Suspend != nil {
+			return fmt.Errorf("graph: human 节点 %q 不得再声明 suspend (human 的挂起是形态自带的, 两个真源会让'能不能挂起/几次'各说一套)", n.ID)
+		}
+	case NodeKindRouter:
+		// **不实现且不计划实现**, 但仍显式报错而不是静默接受: 静默接受等于把一个什么
+		// 都不做的节点混进图, 表现为"整条分支莫名 skipped", 排查成本远高于开图就失败。
+		//
+		// 为什么判定它冗余 (而不是"以后再做"): router 的职责是"按前驱结果选下游", 而
+		// 引擎的条件边**就是**逐条入边对前驱结果求值 (condition.go: ok|fail|score <op> N|
+		// output contains "..."), 加上默认 OR-join 的"无满足入边即 skipped", 分支路由已经
+		// 完整表达。设计文档提到的另一半"LLM 意图判断"也不需要新形态: 让一个 agent/gate
+		// 节点产出分数或关键词, 再用条件边路由即可 —— 那还顺带把判据留在了 journal 里。
+		// 15 个 mode 逐个核实后没有一个需要它。多一种 Kind = 多一套语义 + 多一份
+		// Validate + 多一条 resume 路径, 为一个零收益的形态付这份维护成本不值得。
+		return fmt.Errorf("graph: 节点 %q 的 Kind %q 尚未实现, 且核实后判定不需要实现 —— 分支路由请用条件边 (edge.condition: ok|fail|score <op> N|output contains \"...\"), 语义等价且判据进 journal; 理由见 validate.go 的论证", n.ID, n.Kind)
 	default:
-		return fmt.Errorf("graph: 节点 %q 的 Kind %q 未知 (支持 agent|gate|map|reduce|loop-group)", n.ID, n.Kind)
+		return fmt.Errorf("graph: 节点 %q 的 Kind %q 未知 (支持 agent|gate|map|reduce|loop-group|subgraph|human)", n.ID, n.Kind)
+	}
+	if err := validateJoin(n); err != nil {
+		return err
+	}
+	if err := validateSuspend(n, vc); err != nil {
+		return err
 	}
 	if n.Loop != nil {
 		if n.Kind == NodeKindLoopGroup {
 			return fmt.Errorf("graph: 节点 %q 是 loop-group, 不得再声明节点级 Loop (组级循环用 group.loop, 两层并存会让轮次相乘)", n.ID)
+		}
+		if n.Kind == NodeKindSubgraph {
+			return fmt.Errorf("graph: 节点 %q 是 subgraph, 不得声明节点级 Loop (让整张子图反复是 loop-group 的职责; 轮次不进子图命名空间, 于是同一成员在 journal 里会有多轮同 ID 的产出, resume 分不清该用哪一轮)", n.ID)
+		}
+		if n.Kind == NodeKindHuman {
+			return fmt.Errorf("graph: 节点 %q 是 human, 不得声明节点级 Loop (循环的下一轮要回灌上一轮产出, 而'等人'没有产出可回灌; 多轮询问请用多个 human 节点)", n.ID)
 		}
 		if err := validateLoopPolicy(*n.Loop, fmt.Sprintf("节点 %q 的 Loop", n.ID)); err != nil {
 			return err
@@ -212,8 +276,16 @@ func validateNodeShape(n NodeSpec, insideGroup bool) error {
 	if err := validatePlacement(n.Agent.Placement, n.ID); err != nil {
 		return err
 	}
-	if n.Expand != nil && n.Expand.MaxNodes <= 0 {
-		return fmt.Errorf("graph: 节点 %q 的 Expand.max_nodes 必须 > 0 (无界展开违法, design/01 §4.2)", n.ID)
+	if n.Expand != nil {
+		if n.Expand.MaxNodes <= 0 {
+			return fmt.Errorf("graph: 节点 %q 的 Expand.max_nodes 必须 > 0 (无界展开违法, design/01 §4.2)", n.ID)
+		}
+		if n.Kind == NodeKindSubgraph {
+			return fmt.Errorf("graph: 节点 %q 是 subgraph, 不得声明 Expand (它的产出是子图内某个成员的产出, 让父图按'这个节点展开了'去接线会把展开归因错人; 要动态展开请在被引用图内部声明)", n.ID)
+		}
+		if n.Kind == NodeKindHuman {
+			return fmt.Errorf("graph: 节点 %q 是 human, 不得声明 Expand (它不经 runner, 没有产出 Expansion 的地方)", n.ID)
+		}
 	}
 	// Spawn 的三个上限允许留 0 (走缺省), 但**负值必须拒**: 负数会让 maxXxx() 的
 	// "<=0 取缺省"判定把它当成"没设", 于是一个写错的 -1 会静默变成默认值而不是报错
@@ -222,6 +294,94 @@ func validateNodeShape(n NodeSpec, insideGroup bool) error {
 		if n.Spawn.MaxDepth < 0 || n.Spawn.MaxNodes < 0 || n.Spawn.MaxSpawns < 0 {
 			return fmt.Errorf("graph: 节点 %q 的 Spawn 上限不得为负 (0 = 取缺省, design/01 §4.8)", n.ID)
 		}
+	}
+	return nil
+}
+
+// validateJoin 节点级 join 语义取值校验 (见 join.go)。
+// 非法值必须拒而不是当成 or: 写错的 "AND"/"all" 若被静默当成 or, 表现是"我声明了
+// AND 汇聚但上游挂了下游照跑", 而作者以为自己钉住了"拿不全就不跑"。
+func validateJoin(n NodeSpec) error {
+	switch j := strings.TrimSpace(n.Join); j {
+	case "", JoinOr, JoinAnd:
+		return nil
+	default:
+		return fmt.Errorf("graph: 节点 %q 的 join=%q 未知 (支持 %s|%s, 空 = 取图级 default_join, 再空 = %s)",
+			n.ID, j, JoinOr, JoinAnd, JoinOr)
+	}
+}
+
+// validateSuspend 挂起授权的形状与位置校验 (见 suspend.go)。
+func validateSuspend(n NodeSpec, vc validateCtx) error {
+	if n.Suspend == nil {
+		return nil
+	}
+	if vc.nested {
+		return fmt.Errorf("graph: 节点 %q 声明了 suspend, 但它在组内/派生子图/展开产物里 (那些位置表达不了'跑到一半停下': 组的轮次进度会把挂起的那半轮丢掉, spawn 是 agent 的同步调用停不下来; 见 suspend.go)", n.ID)
+	}
+	// 负值必须拒: maxRevives()/maxWaitSec() 的"<=0 取缺省"会把一个写错的 -1 静默变成
+	// 默认值而不是报错 —— 与 Spawn 上限同款口径 (那个坑已经踩过)。
+	if n.Suspend.MaxRevives < 0 || n.Suspend.MaxWaitSec < 0 {
+		return fmt.Errorf("graph: 节点 %q 的 suspend 上限不得为负 (0 = 取缺省: max_revives=%d, max_wait_sec=%d)",
+			n.ID, DefaultMaxRevives, DefaultReviveWaitSec)
+	}
+	switch n.Kind {
+	case NodeKindAgent, NodeKindGate, NodeKindReduce:
+		// 这三种是**一次 runner 调用**, 挂起有明确含义 ("这次先别跑, 过会儿再来")。
+	case NodeKindMap:
+		return fmt.Errorf("graph: map 节点 %q 不得声明 suspend (分片是 map 节点的副本, 声明会被每个分片继承, 而一个分片挂起在汇总里既不是成功也不是失败 —— 限流退避请声明在分片会调到的重试上, 或把扇出改成 map→reduce 之外的形态)", n.ID)
+	case NodeKindLoopGroup:
+		return fmt.Errorf("graph: loop-group 节点 %q 不得声明 suspend (组的轮次进度靠 loop.group.iteration 计数, 一轮跑到一半挂起表达不了: resume 会从下一轮开始, 挂起的那半轮永久丢失)", n.ID)
+	case NodeKindSubgraph:
+		return fmt.Errorf("graph: subgraph 节点 %q 不得声明 suspend (它自己不调 runner, 声明是死配置; 它的挂起来自成员的挂起并自动向上传播, 见 subgraph.go)", n.ID)
+	default:
+		return fmt.Errorf("graph: 节点 %q (Kind=%q) 不得声明 suspend", n.ID, n.Kind)
+	}
+	if n.Loop != nil {
+		return fmt.Errorf("graph: 节点 %q 同时声明了 loop 与 suspend (循环的下一轮靠回灌上一轮产出, 而挂起意味着这一轮没有产出 —— 拿一份空产出回灌等于把一次等待变成一轮真实迭代, 还会白烧一轮 token)", n.ID)
+	}
+	return nil
+}
+
+// validateSubgraphNode subgraph 节点校验: 引用可解析 + 无引用环 + 深度 + 被引用图递归合法。
+//
+// 为什么在开图时就去注册表把图取出来递归校验 (而不是留到运行期):
+// 引用是**声明期固定**的, 开图时就能解析 —— 而运行期才发现"被引用的图不存在/自己成环"
+// 时, 半张图已经跑掉了 (烧掉的 token 拿不回来), 且那半张图的产出还会被当成正常交付。
+func validateSubgraphNode(n NodeSpec, vc validateCtx) error {
+	if n.Subgraph == nil || strings.TrimSpace(n.Subgraph.Graph) == "" {
+		return fmt.Errorf("graph: subgraph 节点 %q 缺少 subgraph.graph (要引用哪张已注册的图)", n.ID)
+	}
+	if n.Subgraph.MaxDepth < 0 {
+		return fmt.Errorf("graph: subgraph 节点 %q 的 subgraph.max_depth 不得为负 (0 = 取缺省 %d)", n.ID, DefaultSubgraphDepth)
+	}
+	name := strings.TrimSpace(n.Subgraph.Graph)
+	// 引用环: A 引用 B、B 又引用 A ⇒ 运行期是无限递归。深度闸能兜住它 (跑到上限就
+	// 失败), 但那是"跑一半才炸"; 环在开图时是可判定的, 就该在开图时拒。
+	for _, prev := range vc.sgPath {
+		if prev == name {
+			return fmt.Errorf("graph: subgraph 节点 %q 造成图引用环: %s → %s",
+				n.ID, strings.Join(vc.sgPath, " → "), name)
+		}
+	}
+	if d := len(vc.sgPath) + 1; d > subgraphMaxDepth(n.Subgraph) {
+		return fmt.Errorf("graph: subgraph 节点 %q 的引用深度 %d 超过 subgraph.max_depth=%d (链: %s → %s)",
+			n.ID, d, subgraphMaxDepth(n.Subgraph), strings.Join(vc.sgPath, " → "), name)
+	}
+	sub, ok := LookupGraph(name)
+	if !ok {
+		return fmt.Errorf("graph: subgraph 节点 %q 引用的图 %q 未注册 (已注册: %s)",
+			n.ID, name, strings.Join(RegisteredGraphs(), ", "))
+	}
+	// 被引用图按**同一套规则**递归校验 (另写一套必然与顶层漂移)。
+	// nested 保持 false: 被引用图自己就是一层完整的顶层调度层 (独立命名空间 + 按限定 ID
+	// 吃缓存), 所以它里面可以有 human 节点、也可以再引用子图 —— 见 validateCtx.nested。
+	childCtx := validateCtx{sgPath: append(append([]string(nil), vc.sgPath...), name)}
+	if err := sub.validate(childCtx); err != nil {
+		return fmt.Errorf("graph: subgraph 节点 %q 引用的图 %q 非法: %w", n.ID, name, err)
+	}
+	if _, err := subgraphResultFrom(sub, n.Subgraph.ResultFrom); err != nil {
+		return fmt.Errorf("graph: subgraph 节点 %q: %w", n.ID, err)
 	}
 	return nil
 }
@@ -353,7 +513,7 @@ func validatePlacement(p *PlacementSpec, nodeID string) error {
 }
 
 // validateGroupNode loop-group 节点校验: 组级循环策略 + 组内子图**递归**走同一套规则。
-func validateGroupNode(n NodeSpec) error {
+func validateGroupNode(n NodeSpec, vc validateCtx) error {
 	if n.Group == nil || len(n.Group.Nodes) == 0 {
 		return fmt.Errorf("graph: loop-group 节点 %q 缺少组内子图 (group.nodes 为空)", n.ID)
 	}
@@ -361,7 +521,9 @@ func validateGroupNode(n NodeSpec) error {
 		return err
 	}
 	sub := GraphSpec{Name: n.ID + "-group", Nodes: n.Group.Nodes, Edges: n.Group.Edges}
-	if err := sub.validate(true); err != nil {
+	// insideGroup + nested 都置上, 且带上引用链 (组内节点若引用子图会被 nested 拒,
+	// 但链要传下去才能让报错读得懂自己在哪一层)。
+	if err := sub.validate(validateCtx{insideGroup: true, nested: true, sgPath: vc.sgPath}); err != nil {
 		return fmt.Errorf("graph: loop-group 节点 %q 的组内子图非法: %w", n.ID, err)
 	}
 	// ResultFrom: 显式声明须是成员; 未声明则要求组内恰好一个出度 0 节点

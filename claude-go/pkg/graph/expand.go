@@ -124,7 +124,10 @@ func prepareExpansion(parent NodeSpec, req Expansion, dr *dagRun, depth, maxDept
 		if _, exists := dr.byID[child.ID]; exists {
 			return Expansion{}, fmt.Errorf("展开产物节点 %q 与运行图中已有节点重名", child.ID)
 		}
-		if err := validateNodeShape(child, false); err != nil {
+		// nested=true: 展开产物虽然被顶层调度, 但它的**内容来自 LLM** —— 不许它声明
+		// 挂起 (Suspend/human: 等于让模型决定这次运行到哪结束) 或引用子图
+		// (Kind=subgraph: 等于让模型往运行图里塞一整张别人的图)。见 validateCtx.nested。
+		if err := validateNodeShape(child, validateCtx{nested: true}); err != nil {
 			return Expansion{}, fmt.Errorf("展开产物非法: %w", err)
 		}
 		out.Nodes = append(out.Nodes, child)

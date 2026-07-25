@@ -816,10 +816,17 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	// 1. 构建 prompt: 原有模板 + Blackboard 上下文 + Handoff 信息
 	bbContext := ""
 	if team.Blackboard != nil {
-		var completedStages []string
-		for name := range prevResults {
-			completedStages = append(completedStages, name)
-		}
+		// **必须定序**: 这里原本直接 `for name := range prevResults` 建切片, 而 map
+		// 遍历序每次运行都不同 ⇒ "### Completed Work" 段的条目顺序随机 ⇒ **提示词
+		// 逐跑不同**。后果有二: prompt 前缀缓存整段失效(每次都是新前缀), 以及同一份
+		// 输入的产出不可复现。等价性测试实测约 1/3 概率红就是它。
+		//
+		// 定序取**名字序**而不是 DependsOn 声明序: "Completed Work" 列的是**全部**已完成
+		// 工作(含非直接依赖的更上游), 而 DependsOn 只覆盖直接依赖 —— 用声明序会把不在
+		// DependsOn 里的上游一律甩到末尾, 于是 s0 这种根阶段反而排在它的下游后面, 读起来
+		// 是倒的。依赖块那一段仍用声明序(它列的正好就是 DependsOn), 两段的定序依据不同
+		// 是因为它们列的本来就是不同的集合。
+		completedStages := sortedStageNames(prevResults)
 		bbContext = team.Blackboard.HandoffContext(completedStages, stage.Role)
 	}
 	prompt := buildStagePromptWithRoles(stage, objective, prevResults, we.roles)
@@ -2355,4 +2362,18 @@ func directoryHasGoFiles(dir string) bool {
 		}
 	}
 	return false
+}
+
+// sortedStageNames 把 prevResults 的键按名字定序。
+//
+// 存在的唯一理由是**确定性**: 原本直接 `for name := range prevResults` 建切片, map
+// 遍历序每次运行都不同 ⇒ 提示词逐跑不同 ⇒ prompt 前缀缓存整段失效 + 同一输入的产出
+// 不可复现。
+func sortedStageNames(prevResults map[string]string) []string {
+	out := make([]string, 0, len(prevResults))
+	for name := range prevResults {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }

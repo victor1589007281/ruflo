@@ -70,6 +70,31 @@ const (
 	// 没有它, "agent 说它派生了但图里什么都没有"在事后完全不可解释。
 	EvSubgraphRejected = "subgraph.rejected"
 
+	// EvNodeSuspended 节点挂起 (NodeStatusSuspended, 见 suspend.go)。
+	// Data: reason / revive_after_ms / revives / human(bool) / prompt(human 节点)。
+	// **它是挂起态 resume 的真源**: 没有它, 崩溃重启后 Replay 只知道"这个节点没完成",
+	// 分辨不出是"根本没跑过"还是"跑过且在等人" —— 后者要把上次挂起的原因与答复
+	// 一起交回给节点 (NodeInput.Revive), 前者不能。
+	EvNodeSuspended = "node.suspended"
+	// EvNodeRevived 挂起节点在**同一次运行内**被重新派发 (in-run revive)。
+	// Data: revive(第几次) / after_ms / clamped(等待时长是否被夹到上限) / reason。
+	// Replay 见到它就把该节点从挂起态里摘掉 (它已经被叫起来了, 后续要么终态要么再挂)。
+	EvNodeRevived = "node.revived"
+	// EvHumanRequested human 节点第一次发现没有答复 (design/01 §4.3 事件枚举)。
+	// Data: prompt (要问什么) / role。平台读它去问人, 答复经 RespondHuman 写回。
+	EvHumanRequested = "human.requested"
+	// EvHumanResponded 外部答复到达 (design/01 §4.3)。**由平台经 RespondHuman 追加**,
+	// 不是引擎自己发的 —— 引擎在下一次 resume 时凭 Replay 读到它, 于是 human 节点
+	// 完成而不再挂起。Data: response / by。
+	EvHumanResponded = "human.responded"
+	// EvSubgraphEntered subgraph 节点解析出被引用的图并开始执行 (§4.1, subgraph.go)。
+	// Data: graph / version / namespace / nodes / result_from / depth / source
+	// (registry|journal) / subgraph(JSON 字符串)。
+	// **subgraph 载荷是 resume 的真源**: 注册表是进程内可变的 (热注册工作流会改它),
+	// 若 resume 时重新去注册表取, 恢复出的图可能与首跑不是同一张 —— 与
+	// map.expanded/graph.expanded 同一条红线 (恢复出的图必须与首跑一致)。
+	EvSubgraphEntered = "subgraph.entered"
+
 	// EvBudgetConsumed 一次节点执行后的预算记账 (design/01 §4.3 事件枚举 + §4.10)。
 	// Data: node_runs / node_runs_this, 以及 runner 真回报用量时的 tokens / tokens_total。
 	// **重放时不重建台账**: 预算是"本次运行"的量, resume 后续跑应按新预算重新计,
@@ -258,6 +283,42 @@ type RunState struct {
 	Expansions []ExpandRecord
 	// GroupIters loop-group 节点 → 已完成的组轮次状态 (resume 从下一轮续跑)。
 	GroupIters map[string]GroupIterState
+
+	// Suspended 上一次运行结束时仍处于**挂起态**的节点 (按限定 NodeID)。
+	// 挂起节点**不进** Completed —— 它没跑完, 缓存它等于永远挂着。resume 会重跑它,
+	// 并把这里的原因/答复经 NodeInput.Revive 交回去, 于是节点知道自己是续跑
+	// (human 节点据此直接完成而不是再问一遍)。
+	Suspended map[string]SuspendState
+	// HumanResponses 已到达的人工答复 (按限定 NodeID)。由平台经 RespondHuman 追加。
+	HumanResponses map[string]HumanResponse
+	// Subgraphs subgraph 节点 → 上一次运行**实际跑的那张子图**(已冻结)。
+	// resume 时按此重建, 不重新查注册表 —— 注册表是进程内可变的 (热注册),
+	// 重查可能得到与首跑不同的图 (与 Expansions 同一理由)。
+	Subgraphs map[string]SubgraphRecord
+}
+
+// SuspendState 一个节点在上一次运行结束时的挂起态 (Replay 重建)。
+type SuspendState struct {
+	Reason string // 挂起原因 (node.suspended 的 reason)
+	Human  bool   // 是否在等人工答复 (human 节点 / runner 自报 human)
+	Prompt string // 要问什么 (human.requested 的 prompt), 供平台直接展示
+	// Revives 上一次运行内已用掉的唤醒次数 (仅记账与展示)。
+	// **不影响新一轮的额度** —— 见 Revival.Count 的注释。
+	Revives int
+}
+
+// HumanResponse 一条人工答复 (Replay 重建)。
+type HumanResponse struct {
+	Response string
+	TS       int64 // unix milli
+}
+
+// SubgraphRecord 一次 subgraph 节点解析出的子图 (已冻结, 与 journal 一起存档)。
+type SubgraphRecord struct {
+	Graph      string    // 被引用的图名
+	Version    string    // 被引用图的版本 (纯记账: 用于事后判断注册表是否漂移过)
+	ResultFrom string    // 取哪个成员的产出
+	Sub        GraphSpec // 当时真正执行的那张图
 }
 
 // ExpandRecord 一条已生效的动态展开 (节点 ID 已命名空间化)。
@@ -291,9 +352,12 @@ type GroupIterState struct {
 // 直接作为缓存产出跳过执行 (见 engine.go)。
 func Replay(events []Event) *RunState {
 	st := &RunState{
-		Completed:  map[string]NodeResult{},
-		MapShards:  map[string][]string{},
-		GroupIters: map[string]GroupIterState{},
+		Completed:      map[string]NodeResult{},
+		MapShards:      map[string][]string{},
+		GroupIters:     map[string]GroupIterState{},
+		Suspended:      map[string]SuspendState{},
+		HumanResponses: map[string]HumanResponse{},
+		Subgraphs:      map[string]SubgraphRecord{},
 	}
 
 	// —— 只重放"最近一次 run"的事件 ——
@@ -351,6 +415,83 @@ func Replay(events []Event) *RunState {
 				}
 			}
 			st.Completed[ev.NodeID] = r
+			// 终态到了 ⇒ 它不再是挂起态 (同一次运行里"挂起→revive→完成"是常态)。
+			delete(st.Suspended, ev.NodeID)
+		case EvNodeFailed, EvNodeSkipped:
+			// 只做一件事: 摘掉挂起态。挂起是**非终态**, 任何终态事件都终结它;
+			// 不摘的后果是 resume 时把一个已经失败/跳过的节点当成"还在等人"。
+			if ev.NodeID != "" {
+				delete(st.Suspended, ev.NodeID)
+			}
+		case EvNodeSuspended:
+			if ev.NodeID == "" {
+				continue
+			}
+			// 合并而不是覆盖: human.requested 与 node.suspended 各带一半信息
+			// (前者带问题原文, 后者带原因/次数), 两条事件的先后顺序不该影响结果。
+			ss := st.Suspended[ev.NodeID]
+			if s, ok := ev.Data["reason"].(string); ok {
+				ss.Reason = s
+			}
+			if b, ok := ev.Data["human"].(bool); ok && b {
+				ss.Human = true
+			}
+			if s, ok := ev.Data["prompt"].(string); ok && s != "" {
+				ss.Prompt = s
+			}
+			if f, ok := ev.Data["revives"].(float64); ok {
+				ss.Revives = int(f)
+			} else if i, ok := ev.Data["revives"].(int); ok {
+				ss.Revives = i
+			}
+			st.Suspended[ev.NodeID] = ss
+		case EvNodeRevived:
+			// 已被叫起来 ⇒ 不再是"上一次运行结束时还挂着"的状态。
+			// 它之后要么落终态 (上面两支), 要么再发一条 node.suspended。
+			if ev.NodeID != "" {
+				delete(st.Suspended, ev.NodeID)
+			}
+		case EvHumanRequested:
+			if ev.NodeID == "" {
+				continue
+			}
+			ss := st.Suspended[ev.NodeID]
+			ss.Human = true
+			if s, ok := ev.Data["prompt"].(string); ok {
+				ss.Prompt = s
+			}
+			st.Suspended[ev.NodeID] = ss
+		case EvHumanResponded:
+			if ev.NodeID == "" {
+				continue
+			}
+			hr := HumanResponse{TS: ev.TS}
+			if s, ok := ev.Data["response"].(string); ok {
+				hr.Response = s
+			}
+			st.HumanResponses[ev.NodeID] = hr
+		case EvSubgraphEntered:
+			if ev.NodeID == "" {
+				continue
+			}
+			s, _ := ev.Data["subgraph"].(string)
+			if s == "" {
+				continue
+			}
+			rec := SubgraphRecord{}
+			if json.Unmarshal([]byte(s), &rec.Sub) != nil {
+				continue // 载荷坏了就当没记过: 下一次按注册表重新解析 (并重新记账)
+			}
+			if v, ok := ev.Data["graph"].(string); ok {
+				rec.Graph = v
+			}
+			if v, ok := ev.Data["version"].(string); ok {
+				rec.Version = v
+			}
+			if v, ok := ev.Data["result_from"].(string); ok {
+				rec.ResultFrom = v
+			}
+			st.Subgraphs[ev.NodeID] = rec
 		case EvMapExpanded:
 			if ev.NodeID == "" {
 				continue
@@ -423,6 +564,12 @@ func Replay(events []Event) *RunState {
 			delete(st.Completed, ev.NodeID)
 			delete(st.MapShards, ev.NodeID)
 			delete(st.GroupIters, ev.NodeID)
+			// 挂起态/人工答复/子图快照同属"该节点上一轮的进度", 一并摘掉。
+			// 人工答复必须摘: 失效的语义是"这个节点要重新走一遍", 留着旧答复会让
+			// 重跑的 human 节点用一份陈旧答复静默通过, 而人根本没被再问一次。
+			delete(st.Suspended, ev.NodeID)
+			delete(st.HumanResponses, ev.NodeID)
+			delete(st.Subgraphs, ev.NodeID)
 			// 展开产物同理: 该节点上一轮展开出的子图不该在重跑前就存在
 			// (否则重跑会与旧子图并存, 得到一张谁都没声明过的图)。
 			if len(st.Expansions) > 0 {
@@ -434,12 +581,22 @@ func Replay(events []Event) *RunState {
 				}
 				st.Expansions = kept
 			}
-			// 该节点展开/派生出来的子节点缓存也要摘 (它们的 ID 带父节点前缀)。
+			// 该节点展开/派生/子图引用出来的子节点缓存也要摘 (它们的 ID 带父节点前缀)。
+			// SubgraphIDInfix 这一条不能漏: 漏了会让一个被失效的 subgraph 节点重跑时
+			// 直接吃到上一轮全部成员的缓存 ⇒ "失效"只失效了容器, 里面一步没重跑。
 			for id := range st.Completed {
-				if strings.HasPrefix(id, ev.NodeID+"/") ||
-					strings.HasPrefix(id, ev.NodeID+SpawnIDInfix) ||
-					strings.HasPrefix(id, ev.NodeID+"#") {
+				if invalidatedChildID(ev.NodeID, id) {
 					delete(st.Completed, id)
+				}
+			}
+			for id := range st.Suspended {
+				if invalidatedChildID(ev.NodeID, id) {
+					delete(st.Suspended, id)
+				}
+			}
+			for id := range st.HumanResponses {
+				if invalidatedChildID(ev.NodeID, id) {
+					delete(st.HumanResponses, id)
 				}
 			}
 		case EvRunFinished:
@@ -462,8 +619,22 @@ func Replay(events []Event) *RunState {
 		st.MapShards = map[string][]string{}
 		st.Expansions = nil
 		st.GroupIters = map[string]GroupIterState{}
+		// 挂起态/答复/子图快照同理。**答复必须清**: 上一轮已交付, 新一轮是新的一次
+		// 询问, 拿旧答复顶替等于人没被问就替他答了 (与 node.invalidated 同一口径)。
+		st.Suspended = map[string]SuspendState{}
+		st.HumanResponses = map[string]HumanResponse{}
+		st.Subgraphs = map[string]SubgraphRecord{}
 	}
 	return st
+}
+
+// invalidatedChildID 判断限定 ID 是否属于被失效节点派生出的子节点
+// (展开 <父>/<子> / 派生 <父>~sp<指纹>/<子> / 子图 <父>~sg/<成员> / 分片 <父>#<i>)。
+func invalidatedChildID(parent, id string) bool {
+	return strings.HasPrefix(id, parent+GroupMemberIDSep) ||
+		strings.HasPrefix(id, parent+SpawnIDInfix) ||
+		strings.HasPrefix(id, parent+SubgraphIDInfix) ||
+		strings.HasPrefix(id, parent+ShardIDSep)
 }
 
 // InvalidateFrom 显式失效一组节点 (design/01 §4.3: "refine 凭 InvalidateFrom(nodeID) 事件")。

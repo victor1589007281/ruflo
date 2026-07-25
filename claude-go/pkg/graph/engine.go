@@ -8,9 +8,13 @@ package graph
 //  2. 节点就绪 = 全部入边的 From 已达终态 (completed/failed/skipped)。就绪后逐条
 //     入边判定: From=skipped ⇒ 本边不满足; From=completed/failed ⇒ 用边 Condition
 //     对该前驱结果求值 (空条件恒真; `fail` 条件即"失败分支路由")。
-//     join 语义 = OR-join: 至少一条入边满足才执行, 否则整节点 skipped。
-//     这是 v1 决策: 对抗模式"评分不过走重做边、过了走下一步边"两条边汇入同一
-//     下游时, 必然只有一条满足, AND-join 会把该下游永远饿死, 故取 OR。
+//     join 语义**默认 OR-join**: 至少一条入边满足才执行, 否则整节点 skipped。
+//     这是 v1 决策且仍是缺省: 对抗模式"评分不过走重做边、过了走下一步边"两条边汇入
+//     同一下游时, 必然只有一条满足, AND 会把该下游永远饿死, 故默认取 OR。
+//     ✅ 现在可声明 (NodeSpec.Join / GraphPolicies.DefaultJoin = "and"): 汇总类节点
+//     "拿不全上游就是废产出"的语义此前只能在 runner 里手工复刻 (orchestrated 的级联
+//     闸), 那是补丁不是能力。**未声明时逐字节与改造前一致。** AND 不满足的终态按成因
+//     分两种 (joinVerdict): 上游未成功 ⇒ failed(级联); 上游都成功但条件不成立 ⇒ skipped。
 //     入度 0 节点直接就绪执行。skipped 沿"skipped 前驱边不满足"规则自然级联。
 //  3. 就绪节点最多 MaxParallel (默认 4) 并发, goroutine+chan 收结果;
 //     每个节点 ctx 注入 trace NodeID, TimeoutSec>0 时叠加 deadline。
@@ -18,11 +22,17 @@ package graph
 //     agent/gate  = retry 环 (外, 指数退避) 内嵌 loop 环 (内, §4.4);
 //     map         = 扇出 N 个分片, **重试在分片级** (见 fanout.go);
 //     reduce      = 等 map 组终态后聚合 (确定性策略零 LLM, 见 fanout.go);
-//     loop-group  = 组内子图整体循环, 每轮复用同一个 scheduleDAG (见 group.go)。
+//     loop-group  = 组内子图整体循环, 每轮复用同一个 scheduleDAG (见 group.go);
+//     subgraph    = 引用另一张已注册的图, 复用同一个 scheduleDAG (见 subgraph.go);
+//     human       = 零 LLM 零 runner: 查 journal 有无答复, 没有就挂起 (见 suspend.go)。
 //  5. PrevOutputs 只含直接前驱中 completed 的 (与该前驱的边条件是否满足无关)。
 //  6. 全部节点终态后: completed=全 completed; failed=无 completed; 其余 partial。
 //  7. journal 每个状态迁移都 Append; Append 出错不中断执行, 错误累积到返回值。
 //  8. ctx 取消: 未跑节点不再调度, 在跑节点等待收尾, Status=failed, error 含 ctx.Err()。
+//  9. 挂起 (NodeStatusSuspended, 见 suspend.go): 节点跑过但没跑完。**不进终态表**,
+//     于是它的下游永不就绪; 本次运行以 Status=suspended 收尾, 答复/额度到位后 resume
+//     续跑 (Replay 重建挂起态与答复, 经 NodeInput.Revive 交回节点)。
+//     只有声明了 Suspend 的节点与 human 节点能产生它 —— 未声明时该状态不可达。
 //
 // 并发闸有两层, 这是刻意的 (别改成单闸):
 //   - 顶层节点受 running < maxPar 约束 (与改造前完全一致);
@@ -48,6 +58,9 @@ const (
 	RunStatusCompleted = "completed"
 	RunStatusPartial   = "partial"
 	RunStatusFailed    = "failed"
+	// RunStatusSuspended 本次运行有节点挂起 (等人工答复 / 等限流退避), 可 resume 续跑。
+	// **只有声明了 suspend 的节点或 human 节点才能产生它** —— 未声明时一切照旧。
+	RunStatusSuspended = "suspended"
 )
 
 // Engine 图执行引擎。零值不可用: 必须注入 Runner;
@@ -87,6 +100,11 @@ type RunResult struct {
 	// Order 本次运行达到终态的节点顺序 (含 failed/skipped;
 	// resume 缓存命中的节点未执行, 不在其中)。
 	Order []string
+	// Suspended 本次运行结束时仍**挂起**的节点 (见 suspend.go)。
+	// 刻意**不并进 Nodes**: Nodes 的语义是"达到终态的节点", 而挂起不是终态 ——
+	// 并进去会让既有调用方 (graph_adapter 把非 completed/skipped 一律映射成
+	// TaskFailed) 把一次等待记成阶段失败, 而它们一行代码都没改。
+	Suspended map[string]NodeResult
 	// Graph 运行图冻结快照 (design/01 §4.3 GraphRun.Graph): 含动态展开追加的节点与边。
 	// 调用方要判断"这一轮到底跑的是哪张图"只能看它, 不能看传入的 spec。
 	Graph GraphSpec
@@ -191,7 +209,12 @@ type execScope struct {
 	prefix string         // journal/hook 的 NodeID 前缀 ("" = 顶层)
 	nested bool           // true = 嵌套层 (叶子节点要取 nestSem)
 	extra  map[string]any // 附加 journal/hook 载荷 (组内: group/group_iteration)
-	depth  int            // 展开深度 (顶层节点 0)
+	depth  int            // 展开/派生深度 (顶层节点 0)
+	// sgDepth subgraph 引用深度 (顶层 0)。**与 depth 分开计**: depth 管的是"来自 LLM
+	// 产出的动态派生"(展开/spawn) 有多深, sgDepth 管的是声明期的图组合有多深。
+	// 合成一个计数器会让"一个 subgraph 成员还能不能 spawn"取决于它被嵌了几层图,
+	// 于是 spawn 授权会因为一次无关的图组合而静默失效。
+	sgDepth int
 }
 
 // evID journal/hook 里使用的节点 ID (带层前缀)。
@@ -341,6 +364,13 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 	switch {
 	case cancelled: // 语义8: 取消一律 failed
 		status = RunStatusFailed
+	case len(dr.suspended) > 0:
+		// 语义9: 有挂起节点 ⇒ 整个 run 是 suspended, **优先于 partial/failed**。
+		// 它与 failed 的区别是可恢复性: 挂起意味着"答复/额度到了再 resume 就能往下走",
+		// 报 failed 会让平台把一次等待当成失败去做补救 (重跑/告警), 而报 partial
+		// 又看不出"在等什么"。run.finished 带 status=suspended 也让 Replay 保住缓存
+		// (只有 completed 的 run 才清缓存), resume 才能续跑。
+		status = RunStatusSuspended
 	case nOther == 0:
 		status = RunStatusCompleted
 	case nCompleted == 0:
@@ -358,7 +388,8 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 	}
 	final := spec
 	final.Nodes, final.Edges = dr.nodes, dr.edges
-	return RunResult{RunID: runID, Status: status, Nodes: dr.state, Order: dr.order, Graph: final}, retErr
+	return RunResult{RunID: runID, Status: status, Nodes: dr.state, Order: dr.order,
+		Suspended: dr.suspended, Graph: final}, retErr
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +411,13 @@ type dagRun struct {
 	depthOf    map[string]int  // 节点 → 展开深度
 	expanded   map[string]bool // 已展开过的节点 (幂等闸)
 
+	// suspended 本层**终局挂起**的节点 (不再唤醒, 本次运行到此为止, resume 续跑)。
+	// 刻意与 state 分开: 进了 state 就是终态, 下游会据此判定入边 —— 而挂起节点的
+	// 下游必须"永不就绪"(它还没产出), 见 suspend.go 文件头。
+	suspended map[string]NodeResult
+	// revive 挂起后**将在本次运行内被重新派发**的节点进度 (次数/等待/上次原因)。
+	revive map[string]reviveState
+
 	// 组循环给全部成员的公共输入 (仅 loop-group 的组内 scope 非零)。
 	feedback  string
 	groupIter int
@@ -399,6 +437,7 @@ func newDagRun(nodes []NodeSpec, edges []EdgeSpec, scope execScope) *dagRun {
 		preds: map[string][]inEdge{}, succs: map[string][]string{},
 		state: map[string]NodeResult{}, dispatched: map[string]bool{},
 		depthOf: map[string]int{}, expanded: map[string]bool{},
+		suspended: map[string]NodeResult{}, revive: map[string]reviveState{},
 	}
 	for _, n := range dr.nodes {
 		dr.byID[n.ID] = n
@@ -465,23 +504,19 @@ func (e *Engine) scheduleDAG(ctx context.Context, rc *runCtx, dr *dagRun) bool {
 					if !ready {
 						continue
 					}
-					// OR-join 判定 (语义2)。
-					satisfied := len(dr.preds[id]) == 0 // 入度 0 直接就绪执行
-					for _, in := range dr.preds[id] {
-						pr := dr.state[in.from]
-						if pr.Status == NodeStatusSkipped {
-							continue // skipped 前驱: 本边不满足
-						}
-						if in.cond.Eval(pr) {
-							satisfied = true
-							break
-						}
-					}
-					if !satisfied {
-						const reason = "or-join: 无满足的入边"
-						dr.state[id] = NodeResult{Status: NodeStatusSkipped, Err: reason}
+					// join 判定 (语义2): 默认 OR, 可按节点/图声明 AND (见 joinVerdict)。
+					if v := dr.joinVerdict(rc, n); v.status != "" {
+						dr.state[id] = NodeResult{Status: v.status, Err: v.reason}
 						dr.order = append(dr.order, id)
-						rc.appendEv(EvNodeSkipped, dr.scope.evID(id), dr.scope.with(map[string]any{"reason": reason}))
+						// 未执行的节点不发终态 hook (与既有 skipped 口径一致);
+						// journal 记的事件类型随终态走, Data 里带 join 语义便于归因。
+						evType := EvNodeSkipped
+						data := map[string]any{"reason": v.reason, "join": v.mode}
+						if v.status == NodeStatusFailed {
+							evType = EvNodeFailed
+							data = map[string]any{"error": v.reason, "join": v.mode}
+						}
+						rc.appendEv(evType, dr.scope.evID(id), dr.scope.with(data))
 						progress = true
 						continue
 					}
@@ -504,11 +539,24 @@ func (e *Engine) scheduleDAG(ctx context.Context, rc *runCtx, dr *dagRun) bool {
 					if n.Kind == NodeKindReduce {
 						in.Shards = dr.gatherShards(n)
 					}
-					// 嵌套层的**叶子**节点要取 run 级并发票; 容器节点 (map/loop-group)
-					// 不取 —— 见文件头"并发闸有两层"的死锁论证。
-					in.nested = dr.scope.nested && n.Kind != NodeKindMap && n.Kind != NodeKindLoopGroup
+					// 挂起续跑上下文 (本次运行内的 revive / journal 重建的挂起态)。
+					in.Revive = dr.reviveInput(rc, id)
+					// 嵌套层的**叶子**节点要取 run 级并发票; 容器节点 (map/loop-group/
+					// subgraph) 不取 —— 见文件头"并发闸有两层"的死锁论证。
+					in.nested = dr.scope.nested && !containerKind(n.Kind)
 					node := n
+					// 等待 = revive 的退避 (0 = 不等)。刻意与 retry 退避同一处理:
+					// 等待期占着本层槽位, 见 suspend.go"为什么等待要占槽位"。
+					wait := dr.consumeReviveWait(id)
 					go func() {
+						if wait > 0 && !e.sleep(ctx, wait) {
+							// 等待期间 ctx 取消: **保持挂起**而不是判失败 ——
+							// 节点没跑完也没出错, 把它转成 failed 会让 fail 边误触发。
+							results <- doneMsg{id: node.ID, res: NodeResult{
+								Status: NodeStatusSuspended,
+								Err:    "graph: 等待唤醒期间 ctx 取消, 节点保持挂起"}}
+							return
+						}
 						results <- doneMsg{id: node.ID, res: e.execNode(ctx, rc, dr.scope, node, in)}
 					}()
 					progress = true
@@ -521,6 +569,13 @@ func (e *Engine) scheduleDAG(ctx context.Context, rc *runCtx, dr *dagRun) bool {
 		}
 		msg := <-results
 		running--
+		// 挂起是**非终态**: 不进 state / 不进 order / 不触发动态展开。
+		// 在调度器 goroutine 内单线程处理 (与展开同一处), 于是"要不要在本次运行内
+		// 再叫它一次"这个决定与 ready 扫描之间没有竞态。
+		if msg.res.Status == NodeStatusSuspended {
+			e.onNodeSuspended(rc, dr, msg.id, msg.res)
+			continue
+		}
 		dr.state[msg.id] = msg.res
 		dr.order = append(dr.order, msg.id)
 		// 动态展开在**调度器 goroutine 内**并入 (单线程, 无需加锁), 且必须在
@@ -571,6 +626,16 @@ func (e *Engine) execNode(ctx context.Context, rc *runCtx, scope execScope, node
 	case NodeKindLoopGroup:
 		res, iters, extra = e.runLoopGroup(nctx, rc, scope, node, in)
 		attempts = 1
+	case NodeKindSubgraph:
+		// 引用另一张已注册的图 (subgraph.go): 复用 scheduleDAG, 于是子图内的
+		// OR/AND-join、条件边、重试、循环、hook、预算与顶层逐条一致。
+		res, extra = e.runSubgraphNode(nctx, rc, scope, node, in)
+		attempts, iters = 1, 1
+	case NodeKindHuman:
+		// 人在环路 (suspend.go): 零 LLM、**不经 runner** —— 引擎自己查 journal 里
+		// 有没有答复, 没有就挂起。8+ 下游平台的 runner 因此一行都不用改。
+		res, extra = e.runHumanNode(rc, scope, node, in)
+		attempts, iters = 1, 1
 	case NodeKindReduce:
 		// 确定性聚合策略 (concat/longest/vote/trimmed_mean) 由引擎直接算出: 零 LLM、零重试必要,
 		// 但仍走完整节点生命周期 (本函数的 hook/journal/预算), 符合 §4.1 对
@@ -630,6 +695,11 @@ func (e *Engine) execNode(ctx context.Context, rc *runCtx, scope execScope, node
 			Payload: termPayload(res)})
 	case NodeStatusSkipped: // runner 主动跳过 / 新形态的"未走的分支"(空集合的 map 等)
 		rc.appendEv(EvNodeSkipped, evID, scope.with(map[string]any{"reason": res.Err, "by": "runner"}))
+	case NodeStatusSuspended:
+		// 挂起的 journal 记账在**调度器侧** (onNodeSuspended): 只有那里知道这次挂起
+		// 会不会在本次运行内被唤醒 (revive_after/额度), 而"是否终局"是 Replay 重建
+		// 挂起态的关键。分两处记会出现两条语义不同的 node.suspended。
+		// 也不发终态 hook —— 与 skipped 同一口径 (节点没跑完, 没有终态可报)。
 	default: // 防御性归一: runner 返回未知状态按 failed 处理
 		res = NodeResult{Status: NodeStatusFailed, Output: res.Output,
 			Err: fmt.Sprintf("runner 返回未知状态 %q", res.Status)}
@@ -872,7 +942,24 @@ func (e *Engine) callRunner(ctx context.Context, rc *runCtx, node NodeSpec, in N
 		}
 		defer release()
 	}
-	return exec(ctx, node, in)
+	return authorizeSuspend(node, exec(ctx, node, in))
+}
+
+// authorizeSuspend 未声明 suspend 的节点不许挂起 (见 suspend.go 的授权论证)。
+// 归一为 failed 而不是静默当成 completed: runner 回报挂起说明它认为自己没跑完,
+// 当成成功会把一份半成品当交付物送给下游。
+func authorizeSuspend(node NodeSpec, res NodeResult) NodeResult {
+	if res.Status != NodeStatusSuspended || node.Suspend != nil {
+		return res
+	}
+	return NodeResult{Status: NodeStatusFailed, Output: res.Output,
+		Err: fmt.Sprintf("graph: 节点 %q 未声明 suspend, 引擎不接受 runner 回报的挂起 (原因: %s)", node.ID, res.Err)}
+}
+
+// containerKind 容器形态: 自己不调 runner, 只负责调度内层节点。
+// 它们**绝不取嵌套层并发票** —— 容器占着票、内层拿不到票就是死锁 (见文件头)。
+func containerKind(k NodeKind) bool {
+	return k == NodeKindMap || k == NodeKindLoopGroup || k == NodeKindSubgraph
 }
 
 // replacePrevOutput 替换 Feedback 模板中的 {prev_output} 占位。

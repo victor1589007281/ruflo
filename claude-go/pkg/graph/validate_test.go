@@ -65,19 +65,25 @@ func TestValidateErrors(t *testing.T) {
 			}},
 			wantSub: "尚未实现",
 		},
+		// subgraph / human 已实现 (2026-07-25), 所以它们不再报"尚未实现" —— 但**仍必须
+		// 报错**: 缺必填字段的声明如果静默通过, 表现就是"整条分支莫名 skipped", 与
+		// 未实现 Kind 被静默接受是同一种病。这里改断言它们各自的**必填字段**校验。
 		{
-			name: "subgraph尚未实现",
+			name: "subgraph缺graph字段",
 			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
 				{ID: "s", Kind: NodeKindSubgraph},
 			}},
-			wantSub: "尚未实现",
+			wantSub: "subgraph.graph",
 		},
 		{
-			name: "human尚未实现",
+			// human 裸声明是合法的(它没有必填字段), 所以这里断言的是另一条真拒绝:
+			// human 的挂起是形态自带的, 再声明 suspend 就有了两个真源, "能不能挂起 /
+			// 最多几次"会各说一套。
+			name: "human不得再声明suspend",
 			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
-				{ID: "h", Kind: NodeKindHuman},
+				{ID: "h", Kind: NodeKindHuman, Suspend: &SuspendSpec{}},
 			}},
-			wantSub: "尚未实现",
+			wantSub: "两个真源",
 		},
 		{
 			name: "未知Kind",

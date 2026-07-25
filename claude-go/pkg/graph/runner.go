@@ -6,13 +6,23 @@ package graph
 // (QueryEngine 隔离实例、prompt 占位替换、工具画像) 全部由注入的 NodeRunner
 // 决定。引擎只负责调度/循环/重试/journal/hook 生命周期。
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
-// 节点终态 (design/01 §4.3)。skipped 表示未执行 (OR-join 无满足入边 / hook deny)。
+// 节点状态 (design/01 §4.3)。skipped 表示未执行 (join 无满足入边 / hook deny)。
 const (
 	NodeStatusCompleted = "completed"
 	NodeStatusFailed    = "failed"
 	NodeStatusSkipped   = "skipped"
+	// NodeStatusSuspended **唯一的非终态**: 节点跑过但没跑完, 等外部条件 (人工答复 /
+	// 限流退避) 满足后继续。它不是 failed 也不是 skipped, 这个区分是刻意的:
+	//   - 记成 failed ⇒ fail 条件边会误触发, 平台把"在等人"当成"出错了";
+	//   - 记成 skipped ⇒ 下游的无条件入边**恒真**, 于是下游会拿着空产出照跑
+	//     (skipped 前驱只让本边不满足, 而 skipped 不会阻止别的入边满足)。
+	// 挂起节点**不进** dagRun.state, 于是它的下游永不就绪 —— 见 suspend.go 文件头。
+	NodeStatusSuspended = "suspended"
 )
 
 // NodeInput 一次节点执行的输入。
@@ -41,6 +51,12 @@ type NodeInput struct {
 	// 记录与 journal 对齐。故分两个字段: node.ID 是语义名, NodeRef 是归因名。
 	NodeRef string
 
+	// Revive 本次执行是**挂起后的续跑**时非 nil (见 suspend.go)。
+	// nil = 首次执行。runner 靠它区分"第一次跑"与"上次挂起后又被叫起来" ——
+	// 这个区分跨进程也成立 (Replay 会从 journal 重建它), 否则崩溃重启后
+	// 一个等人工答复的节点会以为自己是第一次跑, 再问一遍同样的问题。
+	Revive *Revival
+
 	// Spawn 派生子图的入口 (§4.8)。**仅当节点声明了 NodeSpec.Spawn 时非 nil** ——
 	// runner 应把它暴露给节点内 agent 的工具, 取代"自己造裸 QueryEngine"那条路
 	// (那条路对编排层不可见: 无 NodeID、不进 Journal、不受预算)。
@@ -49,6 +65,22 @@ type NodeInput struct {
 	// nested 引擎内部调度标记: 本次执行属于嵌套层叶子 (map 分片 / loop-group 组内),
 	// 需要先取 run 级并发票。不导出 —— 它是调度细节, 不属于 runner 契约。
 	nested bool
+}
+
+// Revival 一次挂起续跑的上下文 (NodeInput.Revive, 见 suspend.go)。
+type Revival struct {
+	// Reason 上次挂起的原因 (journal 那条 node.suspended 的 reason 原文)。
+	Reason string
+	// Count 本次运行内本节点已被唤醒的次数 (1 起)。
+	// **跨运行不累积**: resume 是新一轮运行, 额度重新计 —— 与 BudgetManager
+	// "重放时不重建台账"同一口径 (否则一个挂起过几次的图永远无法 resume)。
+	Count int
+	// FromJournal true = 本次续跑跨了进程 (挂起记录来自 Replay, 不是本次运行内的 revive)。
+	FromJournal bool
+	// Response 外部答复原文 (human 节点靠 RespondHuman 写入 journal; 空 = 尚无答复)。
+	Response string
+	// RespondedAt 答复时间 (unix milli, 0 = 无答复)。
+	RespondedAt int64
 }
 
 // ShardInput map 分片的输入 (design/01 §4.2)。
@@ -75,10 +107,16 @@ type ShardResult struct {
 
 // NodeResult 节点执行结果。
 type NodeResult struct {
-	Status string  // "completed"|"failed"|"skipped"
+	Status string  // "completed"|"failed"|"skipped"|"suspended"
 	Output string  // 节点产出 (进 journal, 供下游 PrevOutputs / 条件求值)
 	Score  float64 // gate 节点评分, 无则 0
-	Err    string  // 失败/跳过原因
+	Err    string  // 失败/跳过/挂起原因
+
+	// ReviveAfter 仅 Status==suspended 时被读: >0 = 请引擎在**本次运行内**等这么久
+	// 再重新执行本节点 (in-run revive, 典型用途 = 限流后再等等); 0 = 跨运行挂起
+	// (本次运行到此为止, 节点留在 suspended, resume 时续跑)。
+	// 超过 SuspendSpec.MaxWaitSec 会被夹到上限并记 journal。
+	ReviveAfter time.Duration
 
 	// Tokens 本次执行消耗的 token (runner 可选回报, 供 BudgetManager 记账,
 	// design/01 §4.10)。**0 表示"未回报"而非"没花"** —— 两者必须可区分, 否则

@@ -302,8 +302,11 @@ func prepareSpawn(parent NodeSpec, req SpawnRequest, depth, maxDepth int) (Expan
 
 	// 结构合法性: 用一次性 GraphSpec 走同一套 Validate, 不另写检查
 	// (另写必然与顶层校验漂移)。
+	// nested=true 而 insideGroup 仍为 false: 前者禁掉挂起与子图引用 (派生是 agent 的
+	// **同步**调用, 一个进行中的 LLM 会话没法挂起几小时; 且请求内容来自 LLM),
+	// 后者保持原样 —— 派生子图内嵌 loop-group 是既有能力, 不在本次改动范围。
 	probe := GraphSpec{Name: "spawn:" + parent.ID, Nodes: out.Nodes, Edges: out.Edges}
-	if err := probe.Validate(); err != nil {
+	if err := probe.validate(validateCtx{nested: true}); err != nil {
 		return Expansion{}, "", fmt.Errorf("graph: 派生子图非法: %w", err)
 	}
 
