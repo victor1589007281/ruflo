@@ -221,7 +221,16 @@ type GraphRun struct {
 - **重试单层化**：重试只存在于节点 RetryPolicy（引擎执行），瞬态错误判定与限流慢退（base 15s/cap 120s，`coordinator.go:551-576`）收编为内置 RetryClassifier。QueryEngine 内层不再自带无界重试环（`workflow.go:885` 废除）。
 - **watchdog**：图级（进展检测：Journal 尾部 N 分钟无事件即停滞）+ 节点级（activity 心跳）两层，参数沿用 `coordinator.go:155-161`；停滞动作=发 hook 事件+按策略 retry/fail/notify，收编 `orchestrator.go:4055-4083` 的独立实现。
 
-### 4.4 Loop：节点级与组级循环　　**[✅ 节点级已通电 / 组级 loop-group 已实现]**
+### 4.4 Loop：节点级与组级循环　　**[✅ 节点级 · 组级 · 可插拔终止器（默认关）]**
+
+> ✅ **可插拔终止器已落地（2026-07-25）**：`pkg/graph/terminator.go`，内置 `adaptive` 表达 AdaptiveTerminator 的五路信号（加权分达标 / 最小轮数 / 轮次耗尽 / 连续退化 / 策略转换 / 收敛）。设计上四点值得记：
+>
+> - **既给全历史又允许有状态**（看似冗余但必需）：「连续退化计数」**不能**从分数序列唯一还原——`drop>δ` 时 ++、`score>=prev` 时清零，而小幅下降（`0<drop<=δ`）时两个分支都不进、计数保留。
+> - **四个判据阈值必须显式给出，没有缺省**：本仓两种分数量纲都在用（AdaptiveTerminator 是 0-10 加权分，条件边写的是 `score >= 75` 即 gate 的 0-100）。给 6.0/0.5 当缺省，0-100 的图会第一轮就"达标"退出、收敛判据几乎永不满足——**判据变死路且毫无报错**。
+> - **Terminator 与 `Until` 并存 → Validate 拒**，不是定优先级：定优先级等于让另一套判据静默失效，而声明它的人以为两条都在生效。`Until` 现有语义一字未动。
+> - **`AllowRollback` 默认 false**（回滚会改变"产出是哪一轮的"，属行为变更）；开关关着时引擎**忽略并记 `rollback=suppressed`**——静默忽略会让"终止器明明说了回滚却没生效"完全不可考。四种结局全留痕：`applied`/`suppressed`/`rejected`/`unresolved`。
+>
+> ⚠️ **能力边界（不是桩）**：内核判据只有 `NodeResult.Score` 一个标量，所以「任一维度 <4 即不算达标」与多维回归**表达不了**——那属评分语义，该由产出 Score 的 gate 节点自己压成低分，不该让调度内核认识 `EvalScore`。
 
 > **实测**：节点级 LoopPolicy 实现完整且有测试（`pkg/graph/engine.go:360-382`），但 `TranslateWorkflow` 从不设 Loop、`StageDef` 也无对应字段 ⇒ **生产零产生方**。✅ **`loop-group` 已实现（2026-07-25）**：组内子图整体循环，`loop.group.iteration` 入 journal 且 **resume 按已完成轮次续跑**（幂等）。
 
@@ -335,9 +344,9 @@ type SkillSelector struct {
 - 节点内 agent 通过 `SpawnSubgraph(spec, params)` 工具派生子图（受 ConstraintSet 单调性约束、计入父节点预算）。取代"factory 创建裸 QueryEngine"（`teams.go:158`、`feishu/session.go:807-830`、`main.go:2639`）——**subagent 从此对编排层可见**：有 NodeID、进 Journal、受 hook/预算/轨迹覆盖。
 - 现有 `cliAgentRunner`/`sessionAgentRunner` 改为 AgentRuntime 的两个实现（见 4.9），行为不变。
 
-### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[🟠 接口 ✅ · 远程实现 ✅ / 逐节点 Placement、k8s-job 仍缺]**
+### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[🟠 接口 · 远程实现 · 逐节点 Placement ✅ / k8s-job 仍缺]**
 
-> **实测（2026-07-25 实现）**：`pkg/agent/runtime.go` 落地 `AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps`/`Placement`（硬约束过滤 + 软偏好打分 + 团队亲和 + 租约过期剔除），并用 `NewLocalRuntime` 把既有 `CreateAgentFunc` 收编为本地 runtime（**不改动 cliAgentRunner/sessionAgentRunner 两个既有实现**）。⚠️ **一处对设计稿的偏离**：接口定在 `pkg/agent` 而非 `pkg/graph/runtime.go`——要被收编的三个执行器都在 pkg/agent 及其上层，而 pkg/graph 是纯调度内核不认识 agent 语义，放进去会让内核反向依赖 RunMetadata/ToolProfile/团队 cwd。折中是图侧继续用 `NodeRunner`，`stageNodeRunner` 作桥，**pkg/graph 零改动**。⚠️ 澄清名字撞车：`pkg/cluster` 的 `RequireCaps` 是队列标签过滤（布尔匹配无打分），本文的 `Placement` 才是放置策略；前者是后者求解后用于跨机路由的投影。✅ **远程 runtime 已落地（2026-07-25）**：`pkg/worker` 的 `remoteRuntime` 实现本接口并经 `Broker.Sync` 从 `cluster.Registry` 注册进 `RuntimeRegistry`（心跳续租，掉线由既有租约机制剔除），详见 design/02 §3.3。**仍缺**：k8s-job runtime（`pkg/sandbox/k8s_runner.go` 尚未接为 AgentRuntime）；**逐节点 Placement**——`AgentSpec` 没有 `Placement` 字段，现只有进程级默认 + 团队亲和。关键语义：团队亲和权重高于任何 Prefer（产码门禁在 `<cwd>/go.mod` 上跑，节点散落会让上一阶段的代码消失）；同分按名字升序保证放置确定性。11 个测试。
+> **实测（2026-07-25 实现）**：`pkg/agent/runtime.go` 落地 `AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps`/`Placement`（硬约束过滤 + 软偏好打分 + 团队亲和 + 租约过期剔除），并用 `NewLocalRuntime` 把既有 `CreateAgentFunc` 收编为本地 runtime（**不改动 cliAgentRunner/sessionAgentRunner 两个既有实现**）。⚠️ **一处对设计稿的偏离**：接口定在 `pkg/agent` 而非 `pkg/graph/runtime.go`——要被收编的三个执行器都在 pkg/agent 及其上层，而 pkg/graph 是纯调度内核不认识 agent 语义，放进去会让内核反向依赖 RunMetadata/ToolProfile/团队 cwd。折中是图侧继续用 `NodeRunner`，`stageNodeRunner` 作桥，**pkg/graph 零改动**。⚠️ 澄清名字撞车：`pkg/cluster` 的 `RequireCaps` 是队列标签过滤（布尔匹配无打分），本文的 `Placement` 才是放置策略；前者是后者求解后用于跨机路由的投影。✅ **远程 runtime 已落地（2026-07-25）**：`pkg/worker` 的 `remoteRuntime` 实现本接口并经 `Broker.Sync` 从 `cluster.Registry` 注册进 `RuntimeRegistry`（心跳续租，掉线由既有租约机制剔除），详见 design/02 §3.3。**仍缺**：k8s-job runtime（`pkg/sandbox/k8s_runner.go` 尚未接为 AgentRuntime）。✅ **逐节点 Placement 已实现（2026-07-25）**：`AgentSpec.Placement` + graph 本地镜像 `PlacementSpec`（不 import `pkg/agent`，否则调度内核反向依赖 agent 语义）。`Placement()` 是**逐字段合并**而不是"节点声明了就整份替换"——进程默认里的 `Affinity:"team"` 是产码工作流的命脉，一个只想写 `require:["browser"]` 的渲染节点若因此丢掉团队亲和，会被派到另一台机器的另一个工作区，**症状是「渲染节点看不见前面生成的 HTML」，作者完全不会想到是自己那行 require 造成的**。同时补了展开产物的 `narrowPlacement`（父声明 `require:["browser"]` 的子节点原本可以漏写而落到没浏览器的机器上产假货，图上"约束只收窄"看起来还成立）。关键语义：团队亲和权重高于任何 Prefer（产码门禁在 `<cwd>/go.mod` 上跑，节点散落会让上一阶段的代码消失）；同分按名字升序保证放置确定性。11 个测试。
 
 ```go
 // pkg/graph/runtime.go —— 本文只定义接口与调度语义；网络化实现见 design/02
