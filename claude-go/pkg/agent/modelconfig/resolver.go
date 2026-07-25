@@ -1,6 +1,10 @@
 package modelconfig
 
-import "sync"
+import (
+	"os"
+	"strings"
+	"sync"
+)
 
 // ConfigResolver 按 角色 > 团队 > 全局 优先级解析最终配置。
 type ConfigResolver struct {
@@ -97,7 +101,7 @@ func (r *ConfigResolver) Resolve(planName, role string) ResolvedConfig {
 		resolved.MaxTokens = r.global.DefaultMaxTokens
 	}
 
-	return resolved
+	return ApplyGatewayOverride(resolved)
 }
 
 // ResolveAlias 将任意单个 alias 解析为 ResolvedConfig (不含 fallback)。
@@ -127,7 +131,7 @@ func (r *ConfigResolver) resolveAlias(alias string) ResolvedConfig {
 		} else {
 			cfg.ProviderName = alias
 		}
-		return cfg
+		return ApplyGatewayOverride(cfg)
 	}
 
 	cfg.ProviderName = entry.ProviderName
@@ -145,7 +149,7 @@ func (r *ConfigResolver) resolveAlias(alias string) ResolvedConfig {
 	cfg.CallTimeoutSec = entry.Params.CallTimeoutSec
 	cfg.DeadlineRetryBaseSec = entry.Params.DeadlineRetryBaseSec
 
-	return cfg
+	return ApplyGatewayOverride(cfg)
 }
 
 // resolveFallbacks 将 fallback alias 列表解析为实际模型名列表，
@@ -180,4 +184,37 @@ func (r *ConfigResolver) resolveFallbacks(aliases []string, primaryProvider stri
 	}
 
 	return result, fallbackBaseURL, fallbackAPIKey
+}
+
+// gatewayEnv 是 LLM 网关地址的环境变量名 (design/02 §3.1 L1)。
+const gatewayEnv = "CLAUDE_GO_LLM_GATEWAY"
+
+// ApplyGatewayOverride 在设置了 CLAUDE_GO_LLM_GATEWAY 时把出站 BaseURL 改指网关。
+//
+// 为什么需要它: deploy/k8s/distributed.yaml 给 control 与 worker 都注入了
+// CLAUDE_GO_LLM_GATEWAY, 但此前**全仓 Go 代码零读取**——于是分布式拓扑里那个
+// gateway pod 是装饰品, 各副本仍各自直连 provider, design/02 §3.1 承诺的
+// "多副本共享同一网关 = 共享配额观测 + 集中记账"一项都拿不到。
+//
+// 覆盖点选在 ConfigResolver 的出口而非各 api.NewClient 调用点: 后者散落在
+// feishu/CLI/advisor/worker 多处, 逐个改必然漏 (这正是历史上鉴权逐路由包装
+// 漏掉两组的同一类错误)。
+//
+// 路径约定: api.Client 会给 BaseURL 拼 "/messages", 而网关正好在 /messages 与
+// /v1/messages 上服务, 故直接用网关根地址即可, 无需带路径。
+//
+// 注意只改 BaseURL 不改 APIKey: 网关负责向真实 provider 注入凭据, 但客户端
+// 到网关这一跳仍可能需要鉴权头, 保持原样透传由网关决定是否校验。
+func ApplyGatewayOverride(cfg ResolvedConfig) ResolvedConfig {
+	gw := strings.TrimSpace(os.Getenv(gatewayEnv))
+	if gw == "" || cfg.BaseURL == "" {
+		return cfg
+	}
+	cfg.BaseURL = strings.TrimRight(gw, "/")
+	// fallback 端点一并改指网关: 否则主端点走网关而降级路径直连 provider,
+	// 集中记账与配额观测在最需要的时候(主端点故障)恰好失效。
+	if cfg.FallbackBaseURL != "" {
+		cfg.FallbackBaseURL = cfg.BaseURL
+	}
+	return cfg
 }

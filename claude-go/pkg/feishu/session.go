@@ -197,6 +197,7 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 	// 未注入时两者都禁用 (无声降级: 轨迹与续聊都是增强项, 不阻塞对话)。
 	if sm.stateStore != nil {
 		sm.traceStore = tracestore.New(sm.stateStore)
+		// TTL 清理由 Bot 侧启动 (它知道 statestore 的落盘路径), 见 bot.go。
 	}
 
 	// 启动后台清理 goroutine

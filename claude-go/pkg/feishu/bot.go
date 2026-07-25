@@ -32,6 +32,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/cluster"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/dynmcp"
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/mcp"
@@ -358,6 +359,15 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// KV 又是"读整桶 → 改一个 key → 整文件原子写", 交错写必然丢更新。
 	// 使用方: TraceStore 轨迹底座 + 飞书会话历史快照 (经 WithStateStore 注入)。
 	stateStore := statestore.NewFileStore(filepath.Join(layout.Root, "statestore"))
+
+	// 轨迹 TTL 清理 (design/03 §4.1): SweepTraceFiles 此前全仓零调用方, 等于没有
+	// TTL——常驻进程尤其需要它, 否则 statestore/log 与 blob 只增不减。
+	// 由 CLAUDE_GO_TRACE_TTL 控制, 未设则不启动 (保持既有语义)。
+	// 在此启动而非 SessionManager 内: 这一层才知道落盘路径。
+	if ttl := tracestore.TTLFromEnv(); ttl > 0 {
+		tracestore.StartJanitor(context.Background(),
+			filepath.Join(layout.Root, "statestore", "log"), ttl, time.Hour)
+	}
 
 	bot := &Bot{
 		config:     config,

@@ -10,9 +10,12 @@
 package tracestore
 
 import (
+	"context"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -65,9 +68,78 @@ type Store struct {
 	opts     Options
 }
 
-// New 构建 Store (默认全采正文)。
+// New 构建 Store。默认全采正文, 可用环境变量降采样。
+//
+// 此前 New 硬编码 BodySampleRate:1 且 NewWithOptions 无任何生产调用方,
+// 于是 design/03 §4.1 的"采样降存储"是**有能力无开关**——长跑实例的
+// statestore/log 与 blob 只增不减。现在给它一个生产可用的入口:
+//
+//	CLAUDE_GO_TRACE_SAMPLE=0.2   # 正文按 20% 采样; 元数据恒全采
+//	CLAUDE_GO_TRACE_SAMPLE=0     # 只采元数据, 完全不存正文
+//
+// 解析失败或未设时保持全采(1), 即行为与此前完全一致——不给运维制造惊喜。
 func New(ss statestore.StateStore) *Store {
-	return NewWithOptions(ss, Options{BodySampleRate: 1})
+	rate := 1.0
+	if v := strings.TrimSpace(os.Getenv("CLAUDE_GO_TRACE_SAMPLE")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 1 {
+			rate = f
+		} else {
+			log.Printf("[tracestore] CLAUDE_GO_TRACE_SAMPLE=%q 无法解析为 [0,1] 的数, 按全采处理", v)
+		}
+	}
+	return NewWithOptions(ss, Options{BodySampleRate: rate})
+}
+
+// TTLFromEnv 读 CLAUDE_GO_TRACE_TTL (Go duration, 如 "168h")。
+// 未设或不合法返回 0 = 不清理, 与既有行为一致(不给运维制造惊喜)。
+// 放在本包而非各调用方: CLI 与飞书 Bot 都要用, 各写一份必然漂移。
+func TTLFromEnv() time.Duration {
+	v := strings.TrimSpace(os.Getenv("CLAUDE_GO_TRACE_TTL"))
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		log.Printf("[tracestore] CLAUDE_GO_TRACE_TTL=%q 不是合法的正 duration, 不启用 TTL 清理", v)
+		return 0
+	}
+	return d
+}
+
+// StartJanitor 启动后台清理协程, 周期性按 TTL 删除过期的 trace-*.jsonl。
+//
+// 设计成包级函数而非 Store 方法: 它只需要目录, 不碰 Store 的任何状态, 而调用方
+// (Bot / CLI 装配处) 恰好是知道路径的那一层, Store 实例反而在更里面。
+//
+// SweepTraceFiles 此前**全仓零调用方**: 能力写完了但没人跑, 等于没有 TTL。
+// 这里把它接成随 Store 生命周期运行的守护协程, 由 ctx 取消。
+//
+// ttl<=0 或 interval<=0 时直接返回(不启动), 保持"不配置就不清理"的既有语义。
+// 清理只删整个 trace 文件, 不改写文件内部——所以正在写入的当轮 trace 不会被
+// 截断(它的 mtime 是新的, 不会命中 cutoff)。
+func StartJanitor(ctx context.Context, logDir string, ttl, interval time.Duration) {
+	if ttl <= 0 || interval <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				n, err := SweepTraceFiles(logDir, time.Now().Add(-ttl))
+				if err != nil {
+					log.Printf("[tracestore] TTL 清理失败: %v", err)
+					continue
+				}
+				if n > 0 {
+					log.Printf("[tracestore] TTL 清理: 删除 %d 个过期 trace 文件 (ttl=%s)", n, ttl)
+				}
+			}
+		}
+	}()
 }
 
 // NewWithOptions 带采样策略构建。

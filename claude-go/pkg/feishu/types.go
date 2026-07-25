@@ -569,6 +569,12 @@ type HookEntry struct {
 //  3. ./config/claude-go.json
 //  4. ~/.claude-go/config/config.json (新版用户目录)
 //  5. ~/.claude-go/config.json (旧版用户目录)
+//  6. /etc/claude-go/config.json (容器约定路径, K8s ConfigMap 挂载点)
+//
+// 第 6 条是容器部署的关键: deploy/k8s 的清单把 ConfigMap 挂到 /etc/claude-go,
+// 但 control/worker 的 args 里并没有传 --config (只有 gateway 传了)。此前发现
+// 列表不含该路径, 于是**挂载的 ConfigMap 从未被读取**, Pod 一路落到"占位
+// provider"分支——那样跑出来的 K8s 冒烟不接触 LLM, 不构成功能验证。
 func ResolveJSONConfigPath(path string) (string, error) {
 	if path == "" {
 		path = os.Getenv("CLAUDE_GO_CONFIG")
@@ -584,6 +590,9 @@ func ResolveJSONConfigPath(path string) (string, error) {
 				home+"/.claude-go/config.json",
 			)
 		}
+		// 容器约定路径放最后: 本机开发时家目录配置优先, 容器里家目录通常没有
+		// 配置, 自然落到这一条。
+		candidates = append(candidates, "/etc/claude-go/config.json")
 		for _, c := range candidates {
 			if _, err := os.Stat(c); err == nil {
 				path = c

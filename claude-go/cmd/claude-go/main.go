@@ -2960,8 +2960,22 @@ func buildEngine() (*engine.QueryEngine, error) {
 	})
 
 	// TraceStore 轨迹底座 (design/03 §4.1 E1): 落 <state>/statestore/, 采集 turn/tool_call Span。
+	// 采样率由 CLAUDE_GO_TRACE_SAMPLE 控制 (默认全采); TTL 由 CLAUDE_GO_TRACE_TTL
+	// 控制 (默认不清理, 保持既有语义)。此前两者都是"有能力无调用方"。
 	ss := statestore.NewFileStore(filepath.Join(stateDir, "statestore"))
-	eng.TraceStore = tracestore.New(ss)
+	ts := tracestore.New(ss)
+	eng.TraceStore = ts
+	if ttl := tracestore.TTLFromEnv(); ttl > 0 {
+		// 每小时扫一次足够: trace 文件按 run 落, 清理粒度是"整个文件过期"。
+		tracestore.StartJanitor(context.Background(), filepath.Join(stateDir, "statestore", "log"), ttl, time.Hour)
+	}
+
+	// 组件是在 NewQueryEngine **之后**赋的, 必须重建一次 HookChain。
+	// 带 nil 守卫的 hook (MemoryInject 要 MemoryStore/FactStore、TraceCapture 要
+	// TraceStore) 在构造时这些字段还是 nil, 不补这一次就静默缺席——而下游平台
+	// 的全部流量走的正是本路径 (CLI headless)。见 design/03 §4.1/§4.4 标注与
+	// pkg/engine/hook_registration_order_test.go。
+	eng.RefreshHooks()
 
 	return eng, nil
 }

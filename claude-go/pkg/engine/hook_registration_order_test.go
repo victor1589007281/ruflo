@@ -15,7 +15,9 @@ import (
 	"testing"
 
 	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/memory"
+	"github.com/anthropic/claude-go/pkg/statestore"
 )
 
 func hookNamesContain(names []string, want string) bool {
@@ -51,11 +53,31 @@ func TestHookRegistration_重新注册后hook到位(t *testing.T) {
 
 	e.MemoryStore = memory.NewTieredStore()
 	e.FactStore = memory.NewFactStore(t.TempDir())
-	e.registerInternalHooks() // 补这一次
+	e.RefreshHooks() // 补这一次 —— CLI 装配路径用的就是这个公开方法
 
 	pre := e.HookChain.Names(internal_hook.PhasePreRequest)
 	if !hookNamesContain(pre, "memory_inject") {
 		t.Errorf("补注册后 memory_inject 仍缺席, 实际: %v", pre)
+	}
+}
+
+// TraceCaptureHook 同理：构造时 TraceStore 为 nil 则缺席，RefreshHooks 后到位。
+// 这是 CLI 形态丢掉轨迹采集的那一个。
+func TestHookRegistration_TraceCapture需RefreshHooks(t *testing.T) {
+	e := &QueryEngine{Config: &Config{}}
+	e.applyFeatureFlags()
+
+	post := e.HookChain.Names(internal_hook.PhasePostTurn)
+	if hookNamesContain(post, "trace_capture") {
+		t.Fatal("前置条件不成立: TraceStore 为 nil 时 trace_capture 不应注册")
+	}
+
+	e.TraceStore = tracestore.New(statestore.NewMemStore())
+	e.RefreshHooks()
+
+	post = e.HookChain.Names(internal_hook.PhasePostTurn)
+	if !hookNamesContain(post, "trace_capture") {
+		t.Errorf("RefreshHooks 后 trace_capture 仍缺席, 实际: %v", post)
 	}
 }
 

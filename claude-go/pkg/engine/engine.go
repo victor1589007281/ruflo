@@ -88,7 +88,7 @@ type QueryEngine struct {
 	LoopDet       *internal_hook.LoopDetector       // G3 工具循环检测
 	ErrClassifier *internal_hook.ErrorClassifier    // G4 错误族隔离 budget
 	JSONRepair    *internal_hook.JSONRepair         // G5 工具输入 JSON 修复
-	TrajStore     internal_hook.TrajectoryStore // G6 轨迹记忆
+	TrajStore     internal_hook.TrajectoryStore     // G6 轨迹记忆
 	StopDet       *internal_hook.StopSignalDetector // G7 CaRT 停止信号
 	TraceStore    *tracestore.Store                 // design/03 §4.1 E1: 轨迹底座 (可选, nil 则不采集)
 
@@ -251,6 +251,28 @@ func (e *QueryEngine) EnableFrontierOptimizations() {
 		e.Config.EnableTrajectory = true
 	}
 	e.applyFeatureFlags()
+}
+
+// RefreshHooks 在构造引擎**之后**才赋组件（MemoryStore/FactStore/TraceStore/
+// TrajStore 等）的调用方，必须调一次本方法，否则那些带 nil 守卫的内置 hook
+// 静默缺席。
+//
+// 为什么需要它：registerInternalHooks 只在 NewQueryEngine 与
+// EnableFrontierOptimizations 里跑，而多个 hook 的注册带守卫——
+// MemoryInject 要 MemoryStore/FactStore 非 nil、TraceCapture 要 TraceStore
+// 非 nil。CLI 装配路径是「构造 → 赋组件」的顺序，于是曾长期丢掉 L1/L2 记忆
+// 注入与轨迹采集两个 hook，而下游平台的全部流量走的正是 CLI headless。
+//
+// 与 EnableFrontierOptimizations 的区别：后者会顺带把一批 Config.Enable* 翻开
+// （metrics/promptcache/budget/loopdetector…），是行为变更；本方法只按**当前**
+// 组件状态重建 HookChain，不动任何开关。
+//
+// 幂等：registerInternalHooks 每次重建 HookChain，重复调用安全。
+func (e *QueryEngine) RefreshHooks() {
+	if e == nil {
+		return
+	}
+	e.registerInternalHooks()
 }
 
 // applyFeatureFlags 根据 Config.Enable* 懒初始化组件实例。
@@ -702,13 +724,13 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					ch <- m
 				}
 				if preRequestResult.ReturnTerminal != nil {
-						if e.HookRunner != nil {
-							e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
-							e.HookRunner.ExecuteOnErrorHooks(messages, "prerequest_terminal", nil)
-							e.HookRunner.ExecuteStopFailureHooks(messages)
-						}
-						e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "prerequest_terminal", nil, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
-						return messages, *preRequestResult.ReturnTerminal
+					if e.HookRunner != nil {
+						e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+						e.HookRunner.ExecuteOnErrorHooks(messages, "prerequest_terminal", nil)
+						e.HookRunner.ExecuteStopFailureHooks(messages)
+					}
+					e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "prerequest_terminal", nil, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
+					return messages, *preRequestResult.ReturnTerminal
 				}
 			}
 		}
@@ -992,13 +1014,13 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 						}
 					}
 					if errorResult.ReturnTerminal != nil {
-							if e.HookRunner != nil {
-								e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
-								e.HookRunner.ExecuteOnErrorHooks(messages, "error_family_exhausted", streamErr)
-								e.HookRunner.ExecuteStopFailureHooks(messages)
-							}
-							e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "error", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
-							return messages, *errorResult.ReturnTerminal
+						if e.HookRunner != nil {
+							e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+							e.HookRunner.ExecuteOnErrorHooks(messages, "error_family_exhausted", streamErr)
+							e.HookRunner.ExecuteStopFailureHooks(messages)
+						}
+						e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "error", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
+						return messages, *errorResult.ReturnTerminal
 					}
 					if errorResult.Backoff > 0 {
 						select {
@@ -1009,7 +1031,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 								e.HookRunner.ExecuteOnErrorHooks(messages, "aborted", ctx.Err())
 								e.HookRunner.ExecuteStopFailureHooks(messages)
 							}
-								e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "aborted", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, true)
+							e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "aborted", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, true)
 							return messages, types.Terminal{Reason: "aborted"}
 						}
 					}
@@ -1068,7 +1090,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				e.HookRunner.ExecuteOnErrorHooks(messages, "model_error", streamErr)
 				e.HookRunner.ExecuteStopFailureHooks(messages)
 			}
-				e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "model_error", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
+			e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "model_error", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
 			return messages, types.Terminal{Reason: "model_error", Error: streamErr}
 		}
 
@@ -1085,7 +1107,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				e.HookRunner.ExecuteOnErrorHooks(messages, "aborted_streaming", ctx.Err())
 				e.HookRunner.ExecuteStopFailureHooks(messages)
 			}
-				e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "aborted_streaming", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, true)
+			e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "aborted_streaming", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, true)
 			return messages, types.Terminal{Reason: "aborted_streaming"}
 		}
 
@@ -1271,7 +1293,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				}
 				e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
 			}
-				e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "max_turns", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
+			e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "max_turns", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
 			return messages, types.Terminal{Reason: "max_turns"}
 		}
 
@@ -1541,7 +1563,6 @@ func messagesToAPI(messages []types.Message, hookRunner *hooks.Runner) []types.A
 
 	return result
 }
-
 
 // GetMessages 返回当前对话消息列表
 func (e *QueryEngine) GetMessages() []types.Message {
