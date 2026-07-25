@@ -20,7 +20,7 @@ type ConformalCalibrator struct {
 // ConfidenceSet 保形置信集合。
 type ConfidenceSet struct {
 	Outcomes []OutcomePrediction `json:"outcomes"`
-	Width    float64             `json:"width"`   // 区间宽度
+	Width    float64             `json:"width"`    // 区间宽度
 	Coverage float64             `json:"coverage"` // 期望覆盖率
 }
 
@@ -163,12 +163,49 @@ func (bf *ByzantineFuser) UpdateTrust(agentID string, brierDelta float64) {
 	bf.trustScores[agentID] = math.Max(0, math.Min(1, current+brierDelta))
 }
 
-// TrimmedFuse 修剪后融合 — 去掉最极端的预测后再融合。
+// TrimmedFuse 修剪后融合 — 去掉最极端的预测后再融合, **并做跨维归一化**。
+//
+// 归一化把结果当概率分布处理(各维除以总和), 适用于"各维是同一事件的互斥概率"的场景
+// (Predict 那类)。若你的各维是**彼此独立的评分**(如 0-100 的多维评审), 用
+// TrimmedFuseRaw —— 归一会毁掉量纲, 见那个函数的注释。
 func (bf *ByzantineFuser) TrimmedFuse(predictions []AgentPrediction) map[string]float64 {
+	result := bf.trimmedFuse(predictions)
+	if len(predictions) >= trimmedFuseMinSamples {
+		// N<3 走的是 simpleMerge, 它本就不归一 —— 保持既有行为不变。
+		normalize(result)
+	}
+	return result
+}
+
+// TrimmedFuseRaw 逐维截尾均值, **不做跨维归一化**。
+//
+// 为什么需要它: 同一份数据在 N=2 与 N=3 之间会跳变(N<3 走 simpleMerge 不归一,
+// N>=3 归一):
+//
+//	输入 (80/70/60, 82/71/61, 78/69/59):
+//	  N=2 → plot=81.00  character=70.50  prose=60.50   ← 量纲正确
+//	  N=3 → plot=38.10  character=33.33  prose=28.57   ← 归一后量纲崩了
+//
+// 这不是假设: 多维评审(pkg/agent 的 review-panel)一直走 N>=3 那条路, 于是它产出的
+// dimensions 分数与**同一份 JSON 里的 overall**不同量纲。TrimmedFuse 的文档写的是
+// "每维截尾均值", normalize 与该契约矛盾。
+//
+// **刻意不直接把 normalize 从 TrimmedFuse 里删掉**: 它另有依赖归一语义的调用方
+// (概率分布场景), 一刀切会把这个 bug 换成另一个方向的 bug。
+func (bf *ByzantineFuser) TrimmedFuseRaw(predictions []AgentPrediction) map[string]float64 {
+	return bf.trimmedFuse(predictions)
+}
+
+// trimmedFuseMinSamples 截尾需要的最小样本数; 低于它退回普通均值。
+const trimmedFuseMinSamples = 3
+
+// trimmedFuse 截尾均值本体(不归一)。抽出来共用而不是复制一份 ——
+// 窗口大小与信任权重的逻辑只该有一处, 两份必然漂移。
+func (bf *ByzantineFuser) trimmedFuse(predictions []AgentPrediction) map[string]float64 {
 	bf.mu.Lock()
 	defer bf.mu.Unlock()
 
-	if len(predictions) < 3 {
+	if len(predictions) < trimmedFuseMinSamples {
 		return simpleMerge(predictions)
 	}
 
@@ -196,7 +233,6 @@ func (bf *ByzantineFuser) TrimmedFuse(predictions []AgentPrediction) map[string]
 		result[outcome] = sum / float64(len(trimmed))
 	}
 
-	normalize(result)
 	return result
 }
 

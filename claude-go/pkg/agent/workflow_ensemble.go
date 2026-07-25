@@ -289,11 +289,11 @@ type rvAnn struct {
 	Suggestion string `json:"suggestion,omitempty"`
 }
 type rvDoc struct {
-	Overall     float64  `json:"overall"`
-	Consensus   float64  `json:"consensus,omitempty"`
-	Summary     string   `json:"summary,omitempty"`
-	Dimensions  []rvDim  `json:"dimensions"`
-	Annotations []rvAnn  `json:"annotations"`
+	Overall     float64 `json:"overall"`
+	Consensus   float64 `json:"consensus,omitempty"`
+	Summary     string  `json:"summary,omitempty"`
+	Dimensions  []rvDim `json:"dimensions"`
+	Annotations []rvAnn `json:"annotations"`
 }
 
 func (we *WorkflowExecutor) executeReviewPanel(ctx context.Context, _ *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
@@ -369,7 +369,9 @@ func fuseReviews(docs []rvDoc) rvDoc {
 		}
 		preds = append(preds, swarm_intel.AgentPrediction{AgentID: fmt.Sprintf("judge-%d", i), Predictions: pm})
 	}
-	fusedDims := bf.TrimmedFuse(preds)
+	// 用 Raw 版: 各维是彼此独立的 0-100 评分, 跨维归一会毁掉量纲
+	// (归一后 dimensions 与同一份 JSON 里的 overall 不同量纲, 且在 N=2/N=3 间跳变)。
+	fusedDims := bf.TrimmedFuseRaw(preds)
 
 	var dims []rvDim
 	var spreadSum float64
