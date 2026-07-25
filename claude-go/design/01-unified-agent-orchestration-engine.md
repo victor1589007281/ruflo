@@ -236,9 +236,13 @@ type LoopPolicy struct {
 
 覆盖：adversarial `Rounds`、content gate 重做环（`teams.go` 内容质量环）、novel-v3 章节循环、refine 多轮、evaluator-optimizer 模式。`loop-group` 容器把"生成→评审"两节点整体循环，即对抗模式的标准化表达。
 
-### 4.5 Hook 总线：三套合一　　**[🟠 已通电为观测桥 / 三套仍并存]**
+### 4.5 Hook 总线：三套合一　　**[🟠 已通电为观测桥 · 外部 hook 已覆盖图模式 / 归一属 M4]**
 
 > **实测**：`HookBus` 骨架存在（`pkg/graph/hooks.go:16-51`，仅 graph/node scope、仅 deny 被解释），✅ **HookBus 已通电（2026-07-25）**：`teamGraphHooks` 把节点 pre → `TaskRunning` 占位 + `team.Stages` 增量刷盘 + 心跳，post/failure → 终态 StageResult + 刷盘 + 阶段指标（4 个 label 与 `recordStageMetrics` 完全一致，既有 dashboard 不受影响）。**绝不返回 deny**——灰度期观测桥不该新增阻塞路径。这同时补上了此前"图路径无 stage 级增量刷盘与指标、灰度打开后 dashboard 看不到进度"的缺口。三套原物全在：`pkg/hooks/`、`pkg/engine/internal_hook/`（22 文件）、`pkg/orchestrator/hooks.go:20`。
+>
+> ⚠️ **一处此前标注偏保守，已核实更正**：读者容易从"三套并存"推断出「外部 hook 在图模式下不生效」——**不是这样**。逐跳核实过调用链：图路径 `stageNodeRunner.RunNode`（`graph_adapter.go:748`）→ `ExecuteSingleStage` → `we.factory`（`workflow.go:1591`），而生产 factory 就是 `SessionManager.CreateAgentRunner`（`feishu/session.go:1030`，见 `feishu/worker_runtime.go:17`），它造出的 `sessionAgentRunner.Execute` 会触发 `ExecuteSubagentStartHooks`/`ExecuteSubagentStopHooks`（`session.go:1137`/`:1263`）。**所以用户配置的 shell/HTTP/gRPC/OPA hook 在图模式下照样触发**，因为它们挂在 runner 内部而图引擎调的就是这个 runner。
+>
+> 于是 §4.5 的真实剩余工作是**架构归一而非能力缺失**：三套实现的合并卡在删除 `pkg/orchestrator`（它那套 LifecycleHook 要被 `graph|node` 作用域取代），属 M4。设计文档里 `HookEvent` 的完整形态（turn/tool/session 作用域、mutate/approve 决策、Mutation 载荷）在 v1 骨架里仍是子集。
 
 ```go
 // pkg/graph/hooks.go —— 统一事件模型，双维度：作用域 × 相位
