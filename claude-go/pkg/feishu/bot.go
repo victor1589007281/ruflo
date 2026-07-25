@@ -40,6 +40,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/observability"
 	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/skills"
+	"github.com/anthropic/claude-go/pkg/statestore"
 	swarm_intel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	claudesync "github.com/anthropic/claude-go/pkg/sync"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
@@ -219,6 +220,7 @@ type Bot struct {
 	cfgWatcher    *hotreload.Watcher                 // 配置热加载监控器
 	cronSched     *agent.CronScheduler               // 定时任务调度器
 	layout        *basedir.Layout                    // 统一目录布局
+	stateStore    statestore.StateStore              // 进程内唯一 StateStore (轨迹底座 + 会话历史快照共用)
 	wikiEngine    *wiki.Engine                       // LLM Wiki 知识库引擎
 	swarmEngine   *swarm_intel.Engine                // 群体智能预测引擎
 	visionCli     *vision.Client                     // 视觉能力客户端
@@ -350,12 +352,20 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		log.Printf("[Bot] 可观测体系初始化失败: %v", err)
 	}
 
+	// 进程内唯一的 StateStore 实例 (design/02 §3.4.1): <state>/statestore/。
+	// 必须唯一并共享 —— FileStore 的 bucket 锁表挂在实例上 (filestore.go:29-32),
+	// 是 per-instance 而不是 per-path, 同一 root 建两个实例等于没有互斥;
+	// KV 又是"读整桶 → 改一个 key → 整文件原子写", 交错写必然丢更新。
+	// 使用方: TraceStore 轨迹底座 + 飞书会话历史快照 (经 WithStateStore 注入)。
+	stateStore := statestore.NewFileStore(filepath.Join(layout.Root, "statestore"))
+
 	bot := &Bot{
-		config:    config,
-		client:    larkClient,
-		apiClient: aiClient,
-		layout:    layout,
-		startTime: time.Now(),
+		config:     config,
+		client:     larkClient,
+		apiClient:  aiClient,
+		layout:     layout,
+		stateStore: stateStore,
+		startTime:  time.Now(),
 	}
 
 	// 1. 初始化动态 MCP 管理器 (进程级别共享)
@@ -385,8 +395,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	bot.evolution = agent.NewEvolutionEngine(layout.Evolution, aiClient)
 	roleReg := agent.NewRoleRegistry(config.Cwd)
 
-	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles)
-	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore, bot.evolution, roleReg)
+	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles + 唯一 StateStore)
+	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore, bot.evolution, roleReg,
+		WithStateStore(stateStore))
 	bot.sessions.SetMediaSendFn(bot.SendMediaToChat)
 
 	// 9. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)

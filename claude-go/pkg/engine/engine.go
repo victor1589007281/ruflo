@@ -66,6 +66,19 @@ type QueryEngine struct {
 	Ingestor     *memory.Ingestor      // V3: 记忆摄入器 (可选)
 	SessionStore SessionStoreInterface // 会话持久化 (可选, nil 则不启用)
 
+	// SnapshotFn 每轮末的"整份历史"快照回调 (可选, nil 则不落盘)。
+	//
+	// 与 SessionStore 的分工: SessionStore 是逐条追加的 transcript (且历史上只写
+	// user 文本与 assistant 消息, tool_result 从不落盘); SnapshotFn 拿到的是该轮
+	// 结束时的完整 Messages —— 已过 AutoCompact/MicroCompact/BudgetDegrade,
+	// 天然自截断且含 tool_result。飞书会话续聊走这条 (design/02 §七 R2)。
+	//
+	// 调用纪律 (实现方与调用点都必须守):
+	//   - 每轮恰好一次, 在 e.Messages 更新之后;
+	//   - 参数是该轮的局部 finalMsgs, 不是 e.Messages (后者需持锁, 且下一轮会改写它);
+	//   - fail-open: 实现内部自行计数并吞掉错误, 绝不能阻塞或失败掉用户回复。
+	SnapshotFn func([]types.Message)
+
 	// ========== 前沿模型优化组件 (全部可选, nil 则走基线行为) ==========
 	// 设计依据: docs/query-engine-frontier-optimization.md
 	// 开关由 Config.Enable* 字段控制, 默认通过 EnableFrontierOptimizations() 统一启用。
@@ -473,6 +486,12 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 		e.mu.Lock()
 		e.Messages = finalMsgs
 		e.mu.Unlock()
+
+		// 会话历史落盘: 每轮一次, fail-open (详见 SnapshotFn 字段注释)。
+		// 读局部 finalMsgs 而非 e.Messages —— 后者要持锁才安全, 且下一轮会 append 它。
+		if fn := e.SnapshotFn; fn != nil {
+			fn(finalMsgs)
+		}
 	}()
 
 	return ch
@@ -524,6 +543,11 @@ func (e *QueryEngine) SubmitStreamBlocks(ctx context.Context, userContent string
 		e.mu.Lock()
 		e.Messages = finalMsgs
 		e.mu.Unlock()
+
+		// 同 SubmitMessage: 每轮一次整份快照, fail-open。
+		if fn := e.SnapshotFn; fn != nil {
+			fn(finalMsgs)
+		}
 	}()
 
 	return streamCh

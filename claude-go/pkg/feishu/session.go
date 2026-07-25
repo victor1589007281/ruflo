@@ -3,7 +3,7 @@ package feishu
 import (
 	"context"
 	"fmt"
-	"path/filepath"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +20,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/memory"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
+	sessionstore "github.com/anthropic/claude-go/pkg/session"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/statestore"
 	"github.com/anthropic/claude-go/pkg/tool"
@@ -46,6 +47,10 @@ type Session struct {
 	// 消息队列: 当 processing=true 时, 后续消息入队等待, 处理完自动消费
 	pendingMsg   *string      // 最多缓存 1 条待处理消息 (最新的覆盖旧的)
 	pendingReply func(string) // 队列消息的回复回调
+
+	// transcript 会话历史快照句柄 (nil = 未注入 StateStore, 持久化关闭)。
+	// 引擎每轮末经 Engine.SnapshotFn 调它落盘; /clear 经它删盘。
+	transcript *sessionstore.StateStoreTranscript
 }
 
 // IsProcessing 检查当前会话是否正在处理消息
@@ -127,15 +132,34 @@ type SessionManager struct {
 	searcher        builtin.WebSearcher          // Web 搜索适配器 (浏览器)
 	defaultResolved modelconfig.ResolvedConfig   // 默认模型解析配置 (从 alias 解析)
 
+	// stateStore 进程内唯一的状态存储实例 (由 Bot 注入, 见 WithStateStore)。
+	// 承载: TraceStore 轨迹底座 (design/03 §4.1 E1) + 会话历史快照 (design/02 R2)。
+	stateStore statestore.StateStore
+
 	// Advisor 顾问工具 (设计文档 docs/advisor-tool-design.md)
 	advisorClient *api.Client                     // advisor 模型专用客户端 (nil=禁用)
 	advisorTools  map[string]*builtin.AdvisorTool // chatID → 工具实例 (预算按会话隔离, profile 切换不重置)
 	advisorMu     sync.Mutex
 }
 
+// SessionManagerOption NewSessionManager 的可选装配项。
+// 用 options 而不是继续加位置参数: 构造签名已经 10 个参数, 再堆无法读。
+type SessionManagerOption func(*SessionManager)
+
+// WithStateStore 注入进程内唯一的 StateStore 实例。
+//
+// 为什么必须是"唯一实例"而不是各处按同一 root 各建一个 FileStore:
+// FileStore 的 bucket 锁表挂在实例上 (filestore.go:29-32), 锁是 per-instance
+// 而非 per-path (包注释 filestore.go:25 也明说跨进程互斥不在保证范围)。
+// 同进程对同一 root 建两个 FileStore, 两边的写就完全没有互斥 —— 而 KV 又是
+// "读整桶→改一个 key→整文件原子写", 交错写必然丢更新。
+func WithStateStore(ss statestore.StateStore) SessionManagerOption {
+	return func(sm *SessionManager) { sm.stateStore = ss }
+}
+
 // NewSessionManager 创建会话管理器。
 // 所有共享组件由 Bot 创建并传入。
-func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, memStore *memory.TieredStore, hookConfigs []types.HookConfig, taskStore *builtin.TaskStore, evolution *agent.EvolutionEngine, roleRegistry *agent.RoleRegistry) *SessionManager {
+func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.Manager, skillReg *skills.Registry, dreamer *dreaming.Dreamer, memStore *memory.TieredStore, hookConfigs []types.HookConfig, taskStore *builtin.TaskStore, evolution *agent.EvolutionEngine, roleRegistry *agent.RoleRegistry, opts ...SessionManagerOption) *SessionManager {
 	maxSessions := config.MaxSessions
 	if maxSessions <= 0 {
 		maxSessions = 100
@@ -161,12 +185,18 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 		roleRegistry:   roleRegistry,
 	}
 
-	// TraceStore 轨迹底座 (design/03 §4.1 E1): 各 stage 隔离引擎共享一个 Store,
-	// 落 <state>/statestore/。stateDir 从 config.Cwd 推导 (与 basedir 约定一致)。
-	if stateDir := strings.TrimSpace(config.StateDir); stateDir != "" {
-		sm.traceStore = tracestore.New(statestore.NewFileStore(filepath.Join(stateDir, "statestore")))
-	} else if config.Cwd != "" {
-		sm.traceStore = tracestore.New(statestore.NewFileStore(filepath.Join(config.Cwd, ".claude-go", "statestore")))
+	for _, opt := range opts {
+		if opt != nil {
+			opt(sm)
+		}
+	}
+
+	// TraceStore 轨迹底座 (design/03 §4.1 E1) 与会话历史快照共用 Bot 注入的那一个
+	// StateStore 实例 —— 原先这里按 StateDir/Cwd 自行推导路径再 new 一个 FileStore,
+	// 与 Bot 侧的实例是两把互不相干的锁 (见 WithStateStore 注释), 已删除。
+	// 未注入时两者都禁用 (无声降级: 轨迹与续聊都是增强项, 不阻塞对话)。
+	if sm.stateStore != nil {
+		sm.traceStore = tracestore.New(sm.stateStore)
 	}
 
 	// 启动后台清理 goroutine
@@ -268,6 +298,9 @@ func (sm *SessionManager) SetSearcher(s builtin.WebSearcher) {
 	sm.searcher = s
 }
 
+// SetCwd 切换工作目录并丢弃所有内存会话 (工具的执行根变了, 旧引擎的工具注册表已过期)。
+// 同 evictOldest/cleanup: 只卸内存, 不删持久化快照 —— 调用方 (/cwd 命令) 会另外对
+// 当前 chat 调 ClearSession 表达"这个会话清空", 其余 chat 的历史必须留着。
 func (sm *SessionManager) SetCwd(cwd string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -526,12 +559,35 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		eng.EnableFrontierOptimizations()
 	}
 
-	return &Session{
+	// ==================== 会话历史持久化 (design/02 §1.4 + §七 R2) ====================
+	// 修复"飞书会话历史纯内存, 重启即丢": 此前 eng.SessionStore 从未赋值, 历史只活在
+	// QueryEngine.Messages 里, 重启后 sessions map 为空 → 造一个 Messages 为空的新引擎,
+	// 上下文彻底丢失且用户无提示。
+	// 选 KV 整份快照而非 design/02 表里写的 Log 追加日志, 三条理由见
+	// pkg/session/statestore_transcript.go 头部注释 (自截断 / Log 无删除原语表达不了
+	// /clear / 顺带修 tool_result 从不落盘的老缺陷)。
+	tr := sessionstore.NewStateStoreTranscript(sm.stateStore, chatID)
+	sess := &Session{
 		ChatID:      chatID,
 		Engine:      eng,
 		LastActive:  time.Now(),
 		ToolProfile: profile,
+		transcript:  tr,
 	}
+	if tr != nil {
+		// 写: 每轮末一次整份快照, fail-open (Snapshot 内部已计数, 这里吞掉错误,
+		// 绝不让落盘失败阻塞或污染用户回复)。
+		eng.SnapshotFn = func(msgs []types.Message) { _ = tr.Snapshot(msgs) }
+		// 读: 语义与 CLI --resume/--continue 对齐 (cmd/claude-go/main.go 同样是直接
+		// eng.Messages = msgs)。读失败只记日志, 按空历史继续。
+		if msgs, err := tr.Load(); err != nil {
+			log.Printf("[Session] 读回会话历史失败 chat=%s: %v", chatID, err)
+		} else if len(msgs) > 0 {
+			eng.Messages = msgs
+			log.Printf("[Session] 已从快照恢复会话历史 chat=%s, %d 条消息", chatID, len(msgs))
+		}
+	}
+	return sess
 }
 
 // runNestedAgent 创建嵌套 QueryEngine 执行子代理。
@@ -626,7 +682,12 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	return sb.String(), nil
 }
 
-// evictOldest 淘汰最早活跃的会话 (需在锁内调用)
+// evictOldest 淘汰最早活跃的会话 (需在锁内调用)。
+//
+// **淘汰 ≠ 遗忘**: 这里只从内存 map 里卸载会话 (释放引擎/工具注册表/advisor 预算),
+// 绝不删持久化快照。LRU 淘汰是资源管理, 不是用户意图; 该 chat 下次说话时
+// GetOrCreate → createSession 会把历史从快照读回来。只有 /clear (ClearSession)
+// 才代表用户显式"忘记", 才允许删盘。
 func (sm *SessionManager) evictOldest() {
 	var oldestID string
 	var oldestTime time.Time
@@ -663,7 +724,9 @@ func (sm *SessionManager) cleanupLoop() {
 	}
 }
 
-// cleanup 清理超时会话
+// cleanup 清理超时会话。
+// 与 evictOldest 同一条纪律: 只卸载内存, 绝不删持久化快照 —— 闲置 30 分钟被回收的
+// 会话, 用户第二天回来接着聊时历史必须还在。
 func (sm *SessionManager) cleanup() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -679,12 +742,34 @@ func (sm *SessionManager) cleanup() {
 	}
 }
 
-// ClearSession 清除指定会话 (用于 /clear 命令)
+// ClearSession 清除指定会话 (用于 /clear 命令)。
+//
+// 这是唯一允许删持久化快照的路径 (对比 evictOldest/cleanup 只卸内存): /clear 是
+// 用户显式"忘掉之前的对话", 若只删内存, 下一条消息重建会话时历史会从快照里复活。
 func (sm *SessionManager) ClearSession(chatID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	s := sm.sessions[chatID]
 	delete(sm.sessions, chatID)
 	sm.dropAdvisorTool(chatID)
+
+	// 常驻会话直接用它的句柄; 已被淘汰/清理掉 (内存里没有) 的 chat 也必须能删盘,
+	// 所以按 chatID 现建一个句柄 (Delete 幂等)。
+	tr := s.transcriptHandle()
+	if tr == nil && sm.stateStore != nil {
+		tr = sessionstore.NewStateStoreTranscript(sm.stateStore, chatID)
+	}
+	if err := tr.Delete(); err != nil {
+		log.Printf("[Session] 删除会话历史快照失败 chat=%s: %v", chatID, err)
+	}
+}
+
+// transcriptHandle 空安全地取会话的快照句柄。
+func (s *Session) transcriptHandle() *sessionstore.StateStoreTranscript {
+	if s == nil {
+		return nil
+	}
+	return s.transcript
 }
 
 // Stats 返回会话统计
