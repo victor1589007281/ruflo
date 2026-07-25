@@ -754,6 +754,22 @@ func readReferenceFileExcerpt(path string, maxChars int) string {
 	return text
 }
 
+// stageFeedbackScore 决定一个阶段的学习反馈分 (design/03 §4.3a 升级点3):
+// 有 RewardBus 证据时用加权分, 否则回退到 stage 二值 (±1)。
+//
+// 两条约束都是必需的:
+//  1. **必须保留二值回退** —— 绝大多数工作流一条奖励源都没接, 若无证据时直接用聚合分
+//     (那会是 0), 成功和失败会被反馈成同一个值, 学习信号整体归零。
+//  2. **只认同 run 同节点的证据** —— run 级奖励 (全局编译/测试门禁、episode 终态) 都发生在
+//     所有阶段之后; 把它们归因到单个阶段, 会让门禁失败后触发的"修复阶段"被它正要修的
+//     那次失败倒打一耙 (修复阶段执行在失败奖励之后)。
+func stageFeedbackScore(ee *EvolutionEngine, runID, teamName, node string, completed bool) float64 {
+	if s, ok := ee.StageRewardScore(runID, teamName, node); ok {
+		return s
+	}
+	return boolFeedbackScore(completed)
+}
+
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
 	stageStart := time.Now()
 	// trace 四元组 NodeID = stage 名 (design/03 §4.1 E0): 本阶段内所有 LLM 调用
@@ -892,13 +908,16 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		if sr.Status == TaskFailed {
 			we.evolution.LearnCounterfactual(traj)
 		}
+		// 学习反馈: stage 二值 → RewardBus 加权分 (design/03 §4.3a 升级点3)。
+		feedbackScore := stageFeedbackScore(we.evolution, traj.RunID, team.Name, stage.Name,
+			sr.Status == TaskCompleted)
 		if len(injectedExpIDs) > 0 {
-			we.evolution.RecordBatchFeedback(injectedExpIDs, sr.Status == TaskCompleted)
+			we.evolution.RecordBatchFeedbackScored(injectedExpIDs, feedbackScore)
 			// V2注入效果追踪
-			we.evolution.RecordInjection(injectedExpIDs, stage.Name, team.Name, stage.Role, sr.Status == TaskCompleted)
+			we.evolution.RecordInjectionScored(injectedExpIDs, stage.Name, team.Name, stage.Role, feedbackScore)
 		} else {
 			// 无注入: 更新基线成功率 (用于 Uplift 计算)
-			we.evolution.UpdateBaseline(sr.Status == TaskCompleted)
+			we.evolution.UpdateBaselineScored(feedbackScore)
 		}
 	}
 

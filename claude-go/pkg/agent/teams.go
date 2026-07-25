@@ -281,6 +281,16 @@ func allStagesCompleted(results []StageResult) bool {
 	return true
 }
 
+// skillDistillAllowed 判定是否允许把本次运行提炼成 shadow 技能 (design/03 §4.6 必过闸)。
+// hasEvidence=false (本 run 无门禁类奖励) 时一律放行, 保持未接奖励源工作流的原行为;
+// 有证据则要求加权门禁分不为负。
+func skillDistillAllowed(gateScore float64, hasEvidence bool) bool {
+	if !hasEvidence {
+		return true
+	}
+	return gateScore >= 0
+}
+
 // summarizeStageApproach 把阶段序列压成"方法"描述, 供技能提炼 prompt 使用。
 func summarizeStageApproach(results []StageResult) string {
 	var b strings.Builder
@@ -867,17 +877,28 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	// 是否值得由 LLM 自判 (AutoCreator 内含判据); 产物 frontmatter 带 status: shadow,
 	// 晋升裁决归进化门禁 (E3), 提炼失败静默不影响交付。
 	if ptm.skillCreator != nil && len(results) > 0 && allStagesCompleted(results) {
-		objective := team.Objective
-		chatID := team.ChatID
-		approach := summarizeStageApproach(results)
-		outcome := lastNonEmptyOutput(results, 2000)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			if name, err := ptm.skillCreator.MaybeCreate(ctx, objective, approach, outcome); err == nil && name != "" {
-				ptm.notify(chatID, fmt.Sprintf("🧬 已自动提炼 shadow 技能: **%s** (待进化门禁验证晋升)", name))
-			}
-		}()
+		// design/03 §4.6 必过闸: 全阶段通过只说明"没崩", 不说明"做得好"。这里消费本 run 的
+		// 门禁类奖励 (gate.compile/gate.test/gate.content; 排除与交付状态共线的 episode):
+		// 有证据且为负时不提炼 —— 否则会把一次"编译勉强过但内容评审很差"的做法固化成技能。
+		// 无证据时保持原行为, 否则未接奖励源的工作流永远产不出技能。
+		gateScore, gateEvidence := ptm.evolution.GateRewardScore(trace.From(ctx).RunID, team.Name)
+		if !skillDistillAllowed(gateScore, gateEvidence) {
+			// 只跳过提炼, 不影响后续交付流程 (报告/记忆/Dreaming)。
+			logging.Event(ctx, "skill.distill.skipped", "team", team.Name,
+				"reason", "gate_reward_negative", "gate_score", gateScore)
+		} else {
+			objective := team.Objective
+			chatID := team.ChatID
+			approach := summarizeStageApproach(results)
+			outcome := lastNonEmptyOutput(results, 2000)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				if name, err := ptm.skillCreator.MaybeCreate(ctx, objective, approach, outcome); err == nil && name != "" {
+					ptm.notify(chatID, fmt.Sprintf("🧬 已自动提炼 shadow 技能: **%s** (待进化门禁验证晋升)", name))
+				}
+			}()
+		}
 	}
 
 	// 触发 Dreaming 记录 (覆盖 team agent 会话盲区)
@@ -985,7 +1006,7 @@ func workflowProducesCode(workflow string) bool {
 //
 // 注: 用 exec.CommandContext + WithTimeout 包一层超时.
 // 否则 AI 生成的 build.go / cgo 之类的死循环会让整个团队卡死.
-func (ptm *ProductionTeamManager) runGlobalCompileGate(team *ProductionTeam) string {
+func (ptm *ProductionTeamManager) runGlobalCompileGate(ctx context.Context, team *ProductionTeam) string {
 	if team == nil || team.Cwd == "" {
 		return ""
 	}
@@ -993,18 +1014,52 @@ func (ptm *ProductionTeamManager) runGlobalCompileGate(team *ProductionTeam) str
 	if _, err := os.Stat(filepath.Join(team.Cwd, "go.mod")); err != nil {
 		return ""
 	}
+	// 执行超时刻意不挂在 ctx 上 (保持原语义: 门禁自己限时, 不受上游取消影响);
+	// ctx 只用来取 trace RunID 给奖励事件归因。
 	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "go", "build", "./...")
 	cmd.Dir = team.Cwd
 	out, err := cmd.CombinedOutput()
-	if cctx.Err() == context.DeadlineExceeded {
-		return fmt.Sprintf("go build ./... timed out after 5m\n%s", string(out))
+	gateErr := ""
+	switch {
+	case cctx.Err() == context.DeadlineExceeded:
+		gateErr = fmt.Sprintf("go build ./... timed out after 5m\n%s", string(out))
+	case err != nil:
+		gateErr = fmt.Sprintf("go build ./... failed: %v\n%s", err, string(out))
 	}
-	if err != nil {
-		return fmt.Sprintf("go build ./... failed: %v\n%s", err, string(out))
+	ptm.recordGateReward(ctx, team, RewardSourceGateCompile, gateErr)
+	return gateErr
+}
+
+// recordGateReward 把确定性门禁结果发到 RewardBus (design/03 §4.2 价值排第 1 的信号源)。
+//
+// 为什么值得单独发: runGlobalCompileGate/runGlobalTestGate 真跑 go build / go test -race,
+// 只信 exit code, 是全系统最不可能被 AI 说服的信号; 但此前这两处 RecordReward 调用数为 0,
+// 奖励总线上只有 LLM 打分和 episode 终态两类软信号。
+//
+// NodeID 用门禁名而不是某个阶段名: 全局门禁是 run 级信号, 挂到某个阶段上会让该阶段
+// (以及门禁失败后触发的修复阶段) 的学习反馈被"它正要修的失败"污染。
+// 跳过的门禁 (无 go.mod / 无 cwd) 不发奖励 —— 没跑过就不是证据。
+func (ptm *ProductionTeamManager) recordGateReward(ctx context.Context, team *ProductionTeam, source, gateErr string) {
+	if ptm == nil || ptm.evolution == nil || team == nil {
+		return
 	}
-	return ""
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	value, raw := 1.0, any("pass")
+	if gateErr != "" {
+		value, raw = -1.0, any(truncateResult(gateErr, 300))
+	}
+	ptm.evolution.RecordReward(RewardEvent{
+		RunID:  trace.From(ctx).RunID,
+		NodeID: source,
+		Source: source,
+		Value:  value,
+		Raw:    raw,
+		Team:   team.Name,
+	})
 }
 
 // runGlobalTestGate runs a global test check with race detection for the team.
@@ -1014,22 +1069,25 @@ func (ptm *ProductionTeamManager) runGlobalCompileGate(team *ProductionTeam) str
 // 否则 AI 生成的代码里有死循环 (比如 kmeans 中 k > len(vectors) 的 for{} ),
 // 整个团队会卡在这条命令上数十分钟. 12 分钟的超时足够正常单元测试跑完,
 // 又能在病态情况下及时止血.
-func (ptm *ProductionTeamManager) runGlobalTestGate(team *ProductionTeam) string {
+func (ptm *ProductionTeamManager) runGlobalTestGate(ctx context.Context, team *ProductionTeam) string {
 	if team == nil || team.Cwd == "" {
 		return ""
 	}
+	// 同 runGlobalCompileGate: 执行超时独立于 ctx, ctx 只用于奖励事件的 trace 归因。
 	cctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "go", "test", "-race", "-timeout", "120s", "./...")
 	cmd.Dir = team.Cwd
 	out, err := cmd.CombinedOutput()
-	if cctx.Err() == context.DeadlineExceeded {
-		return fmt.Sprintf("go test -race ./... timed out after 12m (very likely an infinite loop in generated code)\n%s", string(out))
+	gateErr := ""
+	switch {
+	case cctx.Err() == context.DeadlineExceeded:
+		gateErr = fmt.Sprintf("go test -race ./... timed out after 12m (very likely an infinite loop in generated code)\n%s", string(out))
+	case err != nil:
+		gateErr = fmt.Sprintf("go test -race ./... failed: %v\n%s", err, string(out))
 	}
-	if err != nil {
-		return fmt.Sprintf("go test -race ./... failed: %v\n%s", err, string(out))
-	}
-	return ""
+	ptm.recordGateReward(ctx, team, RewardSourceGateTest, gateErr)
+	return gateErr
 }
 
 // runGlobalConsistencyCheck runs a global consistency check using the ContractStore.
@@ -1074,13 +1132,18 @@ func (ptm *ProductionTeamManager) tryGateWithRemediation(
 	team *ProductionTeam,
 	executor *WorkflowExecutor,
 	gateName string,
-	gateFn func(*ProductionTeam) string,
+	gateFn func(context.Context, *ProductionTeam) string,
 	maxAttempts int,
 ) string {
 	if gateFn == nil {
 		return ""
 	}
-	gateErr := gateFn(team)
+	// gateFn 收 ctx 只为把门禁结论按 trace RunID 发到 RewardBus (见 recordGateReward);
+	// 门禁自身的执行超时仍由各 gate 内部独立控制。
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	gateErr := gateFn(ctx, team)
 	if gateErr == "" {
 		return ""
 	}
@@ -1135,7 +1198,7 @@ func (ptm *ProductionTeamManager) tryGateWithRemediation(
 		if ctx.Err() != nil {
 			return gateErr
 		}
-		newErr := gateFn(team)
+		newErr := gateFn(ctx, team)
 		if newErr == "" {
 			ptm.notify(team.ChatID, fmt.Sprintf(
 				"✅ 第 %d 次修复成功, 全局 %s 门禁通过", attempt, gateName))

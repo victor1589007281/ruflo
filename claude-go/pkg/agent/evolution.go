@@ -31,6 +31,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -90,11 +91,14 @@ func (e *Experience) InjectionUplift() float64 {
 
 // InjectionRecord 注入追踪记录。
 type InjectionRecord struct {
-	ExpIDs    []string  `json:"expIds"`
-	TaskID    string    `json:"taskId"`
-	TeamName  string    `json:"teamName"`
-	Role      string    `json:"role"`
-	Success   bool      `json:"success"`
+	ExpIDs   []string `json:"expIds"`
+	TaskID   string   `json:"taskId"`
+	TeamName string   `json:"teamName"`
+	Role     string   `json:"role"`
+	Success  bool     `json:"success"`
+	// Score RewardBus 加权分 [-1,1] (design/03 §4.3a)。Success 只是 Score>0 的投影;
+	// 保留连续分是为了不在这一层把加权证据压回 bool 丢掉。老数据无此字段(0)。
+	Score     float64   `json:"score,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -149,8 +153,65 @@ type RewardEvent struct {
 	NodeID string  `json:"node_id,omitempty"` // 阶段/节点粒度奖励时非空
 	Source string  `json:"source"`            // gate.content|gate.compile|episode|user.explicit|...
 	Value  float64 `json:"value"`             // 归一化 [-1,1]
+	Weight float64 `json:"weight,omitempty"`  // 源可信度权重 (0=按 Source 取默认, 见 RewardSourceWeight)
 	Raw    any     `json:"raw,omitempty"`     // 原始值 (0-100 分 / 状态字符串等)
 	Team   string  `json:"team,omitempty"`
+}
+
+// 奖励源可信度权重 (design/03 §4.2 "源可信度"): 确定性门禁 > LLM 评分 > episode 终态。
+//
+// 定值依据 (不是拍脑袋, 而是"这条信号能被伪造/漂移的程度"):
+//   - gate.compile / gate.test: 真跑 go build / go test -race, 只信 exit code,
+//     同一份代码重复跑结论一致, 无主观性 ⇒ 满权重 1.0 (设计里价值排第 1 的那类)。
+//   - user.explicit: 人的显式反馈可信度高, 但稀疏且含情绪噪声 ⇒ 0.8。
+//   - gate.content: 单次 LLM 打分, 同一产出重跑分数方差可达 ±10 分 ⇒ 0.5。
+//   - episode: 团队终态只有 3 档, 且被 fail-open 语义污染
+//     (delivered_with_remediation 也记 0.5), 粒度最粗 ⇒ 0.3。
+//   - 未知源: 0.5 —— 不给 0 (新源接进来不该被静默忽略), 也不给 1.0
+//     (未经校准的信号不该压倒确定性门禁)。
+const (
+	rewardWeightDeterministic = 1.0 // 确定性工具门禁 (编译/测试/lint)
+	rewardWeightUser          = 0.8 // 人的显式反馈
+	rewardWeightLLMJudge      = 0.5 // LLM 评分类
+	rewardWeightEpisode       = 0.3 // 运行终态
+	rewardWeightUnknown       = 0.5 // 未登记的源
+)
+
+// 已接线的奖励源名 (格式即契约: rewards.jsonl 的 source 值 / skillaudit 依赖)。
+const (
+	RewardSourceGateCompile = "gate.compile"
+	RewardSourceGateTest    = "gate.test"
+	RewardSourceGateContent = "gate.content"
+	RewardSourceEpisode     = "episode"
+	// RewardSourceGatePrefix 前缀过滤用: 所有门禁类奖励 (含未来新增的 gate.lint 等)。
+	RewardSourceGatePrefix = "gate."
+)
+
+// RewardSourceWeight 返回某奖励源的默认可信度权重。
+func RewardSourceWeight(source string) float64 {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case RewardSourceGateCompile, RewardSourceGateTest, "gate.lint", "gate.e2e":
+		return rewardWeightDeterministic
+	case "user.explicit", "user.feedback":
+		return rewardWeightUser
+	case RewardSourceGateContent, "gate.review", "llm.judge":
+		return rewardWeightLLMJudge
+	case RewardSourceEpisode:
+		return rewardWeightEpisode
+	default:
+		return rewardWeightUnknown
+	}
+}
+
+// clampReward 把奖励值钳到 [-1,1] (契约: 任何源写入的 value 都在此区间)。
+func clampReward(v float64) float64 {
+	if v > 1 {
+		return 1
+	}
+	if v < -1 {
+		return -1
+	}
+	return v
 }
 
 // RecordReward 追加奖励事件到 rewards.jsonl (追加写, 失败静默——奖励缺一条不应影响交付)。
@@ -161,6 +222,11 @@ func (ee *EvolutionEngine) RecordReward(ev RewardEvent) {
 	if ev.TS == 0 {
 		ev.TS = time.Now().UnixMilli()
 	}
+	// 权重落盘而不是只在读侧算: 权重表将来会调, 已发生的奖励应保留当时的可信度。
+	if ev.Weight <= 0 {
+		ev.Weight = RewardSourceWeight(ev.Source)
+	}
+	ev.Value = clampReward(ev.Value)
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return
@@ -174,6 +240,184 @@ func (ee *EvolutionEngine) RecordReward(ev RewardEvent) {
 	}
 	defer f.Close()
 	_, _ = f.Write(append(b, '\n'))
+}
+
+// ============================================================================
+// RewardBus 读侧: 奖励聚合 (design/03 §4.3a 升级点3 "反馈从 stage 二值 → 加权聚合")
+//
+// 历史缺陷: rewards.jsonl 只有写方, 全仓唯一读方是两个离线 CLI ⇒ RewardBus 是
+// 只写日志而不是总线。这里给学习器一个读侧入口: 按 run(+节点/源) 聚合出一个
+// [-1,1] 的加权分, 替掉 "sr.Status == TaskCompleted" 这个二值。
+// ============================================================================
+
+const (
+	rewardTailScanBytes = 1 << 20 // 默认尾部扫描窗口 1MiB
+	rewardAggMaxEvents  = 200     // 单次聚合最多纳入的事件数
+)
+
+// RewardQuery 奖励聚合的过滤条件。
+//
+// RunID 必填: 跨 run 混算会把别的任务的成败记到本次头上 (rewards.jsonl 是全局流水)。
+type RewardQuery struct {
+	RunID        string // 必填, 空则不聚合
+	Team         string // 非空 = 只算该团队
+	NodeID       string // 非空 = 只算该节点(阶段)粒度的奖励
+	SourcePrefix string // 非空 = 只算 source 以此为前缀的奖励 (如 "gate.")
+	MaxEvents    int    // 参与聚合的最大事件数 (<=0 用默认)
+	MaxScanBytes int64  // 尾部扫描窗口字节数 (<=0 用默认)
+}
+
+// RewardAggregate 一次聚合的结果。
+type RewardAggregate struct {
+	Score     float64        // 加权分, 钳在 [-1,1]; Count=0 时为 0
+	Count     int            // 参与聚合的事件数 (0 = 无奖励证据 ⇒ 调用方必须回退)
+	WeightSum float64        // 权重和 (诊断用)
+	Sources   map[string]int // 各源命中数 (诊断用)
+}
+
+// HasEvidence 是否存在奖励证据。无证据时调用方必须回退到原有信号 (stage 二值),
+// 否则没接奖励源的工作流会从"二值反馈"退化成"无反馈"。
+func (a RewardAggregate) HasEvidence() bool { return a.Count > 0 }
+
+// AggregateRewards 倒序扫 rewards.jsonl 尾部窗口, 聚合出加权奖励分。
+//
+// 三条关键规则:
+//  1. 只读尾部固定窗口 + 事件数上限: rewards.jsonl 是只追加的长流水, 全量 load 会
+//     随运行时长线性变慢并吃内存, 而学习反馈只关心最近的证据。
+//  2. 同 (source, node_id) 只取最新一条: 门禁会在"失败→自动修复→重跑"里对同一节点
+//     打多次分, 若全部平均, 修复后的好结果会被修复前的坏分数拖回去。
+//  3. 权重优先用事件自带的 Weight (落盘时的可信度), 缺失(老数据)才按 source 取默认。
+func (ee *EvolutionEngine) AggregateRewards(q RewardQuery) RewardAggregate {
+	agg := RewardAggregate{Sources: map[string]int{}}
+	if ee == nil || ee.dataDir == "" || strings.TrimSpace(q.RunID) == "" {
+		return agg
+	}
+	maxEvents := q.MaxEvents
+	if maxEvents <= 0 {
+		maxEvents = rewardAggMaxEvents
+	}
+	scanBytes := q.MaxScanBytes
+	if scanBytes <= 0 {
+		scanBytes = rewardTailScanBytes
+	}
+
+	// 与 RecordReward 的追加写互斥, 避免读到写了一半的行 (读锁足够: 聚合不写状态)。
+	ee.mu.RLock()
+	lines := readTailLines(filepath.Join(ee.dataDir, "rewards.jsonl"), scanBytes)
+	ee.mu.RUnlock()
+
+	prefix := strings.ToLower(strings.TrimSpace(q.SourcePrefix))
+	seen := make(map[string]bool, len(lines))
+	weighted := 0.0
+	for i := len(lines) - 1; i >= 0; i-- { // 倒序 = 从最新往回
+		var ev RewardEvent
+		if err := json.Unmarshal(lines[i], &ev); err != nil {
+			continue // 半行/脏行跳过, 不能让一条坏行毁掉整次聚合
+		}
+		if ev.RunID != q.RunID {
+			continue
+		}
+		if q.Team != "" && ev.Team != q.Team {
+			continue
+		}
+		if q.NodeID != "" && ev.NodeID != q.NodeID {
+			continue
+		}
+		if prefix != "" && !strings.HasPrefix(strings.ToLower(ev.Source), prefix) {
+			continue
+		}
+		key := ev.Source + "\x00" + ev.NodeID
+		if seen[key] {
+			continue // 同源同节点的旧观测被新观测取代
+		}
+		seen[key] = true
+
+		w := ev.Weight
+		if w <= 0 {
+			w = RewardSourceWeight(ev.Source)
+		}
+		weighted += w * clampReward(ev.Value)
+		agg.WeightSum += w
+		agg.Count++
+		agg.Sources[ev.Source]++
+		if agg.Count >= maxEvents {
+			break
+		}
+	}
+	if agg.WeightSum > 0 {
+		agg.Score = clampReward(weighted / agg.WeightSum)
+	}
+	return agg
+}
+
+// StageRewardScore 某 run 内某阶段(节点)的加权奖励分。第二返回值=是否有证据。
+//
+// 只认"同 run 同节点"的证据是刻意的: run 级奖励 (全局编译/测试门禁、episode 终态)
+// 都发生在所有阶段之后, 且把它归因到单个阶段会让"修复阶段"被它正要修的那次失败
+// 倒打一耙 (修复门禁失败时, 修复阶段执行在失败奖励之后)。
+func (ee *EvolutionEngine) StageRewardScore(runID, team, node string) (float64, bool) {
+	agg := ee.AggregateRewards(RewardQuery{RunID: runID, Team: team, NodeID: node})
+	return agg.Score, agg.HasEvidence()
+}
+
+// RunRewardScore 整个 run 的加权奖励分 (含 episode 终态)。第二返回值=是否有证据。
+func (ee *EvolutionEngine) RunRewardScore(runID, team string) (float64, bool) {
+	agg := ee.AggregateRewards(RewardQuery{RunID: runID, Team: team})
+	return agg.Score, agg.HasEvidence()
+}
+
+// GateRewardScore 整个 run 的**门禁类**加权奖励分 (gate.compile/gate.test/gate.content...)。
+// 刻意排除 episode: episode 就是本 run 的交付状态, 与"全阶段通过"高度共线, 混进来
+// 会让门禁的坏消息被终态的好消息中和掉。
+func (ee *EvolutionEngine) GateRewardScore(runID, team string) (float64, bool) {
+	agg := ee.AggregateRewards(RewardQuery{RunID: runID, Team: team, SourcePrefix: RewardSourceGatePrefix})
+	return agg.Score, agg.HasEvidence()
+}
+
+// readTailLines 读文件尾部至多 maxBytes 字节, 按行切分并丢弃被截断的首行。
+// 返回顺序与文件顺序一致 (调用方自行倒序遍历)。
+func readTailLines(path string, maxBytes int64) [][]byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return nil
+	}
+	offset := int64(0)
+	size := st.Size()
+	if size > maxBytes {
+		offset = size - maxBytes
+	}
+	buf := make([]byte, size-offset)
+	// 只用真正读到的字节: 并发追加/截断时 ReadAt 会短读并返回 EOF, 若仍用整个 buf,
+	// 尾部的零字节会被当成行内容参与解析。
+	n, err := f.ReadAt(buf, offset)
+	if n <= 0 {
+		return nil
+	}
+	if err != nil && n < len(buf) {
+		buf = buf[:n]
+	}
+	if offset > 0 {
+		// 窗口起点大概率落在某行中间, 丢掉这半行 (否则解析出错误的事件)。
+		if idx := bytes.IndexByte(buf, '\n'); idx >= 0 {
+			buf = buf[idx+1:]
+		} else {
+			return nil
+		}
+	}
+	raw := bytes.Split(buf, []byte("\n"))
+	out := make([][]byte, 0, len(raw))
+	for _, ln := range raw {
+		if len(bytes.TrimSpace(ln)) == 0 {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return out
 }
 
 // NewEvolutionEngine 创建进化引擎。
@@ -605,16 +849,30 @@ func (ee *EvolutionEngine) isDuplicate(content string) bool {
 }
 
 // RecordInjection 记录一次经验注入 (V2: 注入效果追踪)。
+// 二值入口保留 (语义等价于 ±1 分), 老调用方不受影响。
 func (ee *EvolutionEngine) RecordInjection(expIDs []string, taskID, teamName, role string, success bool) {
+	ee.RecordInjectionScored(expIDs, taskID, teamName, role, boolFeedbackScore(success))
+}
+
+// RecordInjectionScored 记录一次经验注入 (加权分版本)。
+// score>0 记为成功 (Uplift 指标口径不变), 同时把连续分落到 InjectionRecord.Score
+// 供后续分析 —— 否则加权证据在这一步又被压回一个 bool 丢掉。
+func (ee *EvolutionEngine) RecordInjectionScored(expIDs []string, taskID, teamName, role string, score float64) {
+	if ee == nil {
+		return
+	}
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
 
+	score = clampReward(score)
+	success := score > 0
 	rec := InjectionRecord{
 		ExpIDs:    expIDs,
 		TaskID:    taskID,
 		TeamName:  teamName,
 		Role:      role,
 		Success:   success,
+		Score:     score,
 		Timestamp: time.Now(),
 	}
 	ee.injections = append(ee.injections, rec)
@@ -668,17 +926,24 @@ func (ee *EvolutionEngine) InjectionUpliftGlobal() float64 {
 }
 
 // UpdateBaseline 更新无注入的基线成功率 (用于 Uplift 计算)。
+// 二值入口保留 (语义等价于 ±1 分)。
 func (ee *EvolutionEngine) UpdateBaseline(success bool) {
+	ee.UpdateBaselineScored(boolFeedbackScore(success))
+}
+
+// UpdateBaselineScored 按加权分更新基线成功率。
+// 把 [-1,1] 线性映到成功率轴 [0,1]: score=+1 → 1.0, score=-1 → 0.0,
+// 端点与旧二值实现完全一致; 中间分给出部分信用 (如内容门禁 60/100 → 0.2)。
+func (ee *EvolutionEngine) UpdateBaselineScored(score float64) {
+	if ee == nil {
+		return
+	}
+	target := (clampReward(score) + 1) / 2
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
 	ee.baselineTotal++
-	if success {
-		alpha := 0.1
-		ee.baselineSuccess = (1-alpha)*ee.baselineSuccess + alpha*1.0
-	} else {
-		alpha := 0.1
-		ee.baselineSuccess = (1-alpha)*ee.baselineSuccess + alpha*0.0
-	}
+	alpha := 0.1
+	ee.baselineSuccess = (1-alpha)*ee.baselineSuccess + alpha*target
 }
 
 // LearnCounterfactual 反事实学习 (V2 P6): 从失败轨迹生成 "如果…会更好" 的假设。
@@ -938,25 +1203,53 @@ func FormatExperiencesForPrompt(experiences []*Experience) string {
 
 // --- EVOLVE: 反馈 + 质量更新 ---
 
+// boolFeedbackScore 把旧的二值反馈映射到 [-1,1] 分轴 (成功 +1 / 失败 -1),
+// 保证"加权分路径"与"二值路径"在端点上完全等价, 老调用方行为不变。
+func boolFeedbackScore(success bool) float64 {
+	if success {
+		return 1
+	}
+	return -1
+}
+
+// scoreToEMAReward 把 [-1,1] 加权奖励分映射到经验质量 EMA 的 reward 轴。
+// 端点与旧二值语义严格一致: score=+1 → 1.0 (成功), score=-1 → -0.1
+// (失败惩罚刻意很轻, 防一次失败就抹掉一条高质经验)。
+// 中间线性: 正分按分给, 负分按 1/10 衰减惩罚。
+func scoreToEMAReward(score float64) float64 {
+	score = clampReward(score)
+	if score >= 0 {
+		return score
+	}
+	return 0.1 * score
+}
+
 // RecordFeedback 记录经验使用反馈 (v2: 质量可降)。
-// 使用 EMA 更新质量分。失败时 reward=0 会降低质量，多次失败会快速淘汰低质经验。
+// 使用 EMA 更新质量分。失败时 reward<0 会降低质量，多次失败会快速淘汰低质经验。
 // 参考: 人类学习中的"负强化" — 错误经验反复验证为无效时应被遗忘。
+//
+// 二值入口保留: 未接奖励源的调用方 (swarm 等) 继续用它, 语义等价于 ±1 分。
 func (ee *EvolutionEngine) RecordFeedback(expID string, success bool) {
+	ee.RecordFeedbackScored(expID, boolFeedbackScore(success))
+}
+
+// RecordFeedbackScored 按 RewardBus 加权分记录经验使用反馈 (design/03 §4.3a)。
+// score ∈ [-1,1]; >0 视为该次使用成功 (计入 SuccessCount)。
+func (ee *EvolutionEngine) RecordFeedbackScored(expID string, score float64) {
+	if ee == nil {
+		return
+	}
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
 
+	reward := scoreToEMAReward(score)
 	for _, exp := range ee.experiences {
 		if exp.ID == expID {
 			exp.UsageCount++
-			if success {
+			if score > 0 {
 				exp.SuccessCount++
 			}
-			// EMA: 成功 reward=1.0, 失败 reward=-0.1 (允许质量下降到 0 以下被剪枝)
 			alpha := 0.3
-			reward := -0.1 // v2: 失败惩罚 (原来是 0，质量几乎不降)
-			if success {
-				reward = 1.0
-			}
 			exp.Quality = (1-alpha)*exp.Quality + alpha*reward
 			if exp.Quality < 0 {
 				exp.Quality = 0
@@ -969,8 +1262,13 @@ func (ee *EvolutionEngine) RecordFeedback(expID string, success bool) {
 
 // RecordBatchFeedback 批量更新: 检索到的经验用于了某次执行, 按结果反馈。
 func (ee *EvolutionEngine) RecordBatchFeedback(expIDs []string, success bool) {
+	ee.RecordBatchFeedbackScored(expIDs, boolFeedbackScore(success))
+}
+
+// RecordBatchFeedbackScored 批量更新 (加权分版本)。
+func (ee *EvolutionEngine) RecordBatchFeedbackScored(expIDs []string, score float64) {
 	for _, id := range expIDs {
-		ee.RecordFeedback(id, success)
+		ee.RecordFeedbackScored(id, score)
 	}
 }
 

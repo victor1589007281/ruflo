@@ -135,7 +135,9 @@ func (ac *AutoCreator) ImproveSkill(ctx context.Context, skillName, feedback str
 		return nil
 	}
 
-	sk, ok := ac.Registry.Get(skillName)
+	// GetAny 而非 Get: 自改进必须能改 shadow 技能 (Get 是运行期视图, 已排除 shadow)。
+	// 配合下面的 preserveStatus, 改进后仍留在 shadow 态, 不静默绕过进化门禁。
+	sk, ok := ac.Registry.GetAny(skillName)
 	if !ok {
 		return fmt.Errorf("技能 %s 不存在", skillName)
 	}
