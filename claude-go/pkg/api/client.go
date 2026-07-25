@@ -428,10 +428,65 @@ func isDeadlineError(err error) bool {
 	return strings.Contains(msg, "deadline") || strings.Contains(msg, "timeout")
 }
 
+// LLMEventRecord 一次 LLM 运行事件的完整描述 (全局 sink 用)。
+//
+// 比 LLMEventFunc 的 (eventType, detail) 多出 Source/Model 两栏: 全局 sink 收的是
+// **所有** api.Client 的事件, 不带来源就没法判断"这条 429 是主模型、advisor 还是
+// dashboard 发的" —— 而这恰恰是它相对旧的单实例回调唯一多出来的信息量。
+type LLMEventRecord struct {
+	// Type: retry / circuit_open / circuit_close / fatal / model_switch / model_restore
+	Type   string
+	Detail string
+	Source string // Client.Tag (feishu / advisor / dashboard / ...); 空则 "unknown"
+	Model  string // Client.Model
+}
+
+// LLMEventSink 全局 LLM 事件汇聚点。
+type LLMEventSink func(rec LLMEventRecord)
+
+// ── 全局 LLM 事件 sink (跨 Client 共用) ──────────────────────────────────────
+//
+// 为什么在实例字段 OnLLMEvent 之外还要一个全局的 (与 globalLLMHook 同款理由,
+// 但这条是**修 bug** 不是加功能): OnLLMEvent 是 Client 的一个普通字段, 只有
+// 装配方显式赋值的那个实例才会发事件, 且 WithModel/ConfiguredCloneFull 靠逐字段
+// 手抄来传播它。实测生产里有 7 处 api.NewClient, 只有 pkg/feishu/bot.go:309 那个
+// 被赋了值 —— advisor 客户端、/model 切换临时客户端、dashboard 诊断客户端的
+// 429 重试 / 熔断 / 连续失败**从来没有任何人收到过**, 而且这种漏是静默的
+// (少赋一个字段不会编译报错)。全局 sink 让"哪个 Client 实例"不再决定
+// "事件能不能被看见"。
+var (
+	globalLLMEventMu   sync.RWMutex
+	globalLLMEventSink LLMEventSink
+)
+
+// SetGlobalLLMEventSink 注册/覆盖全局 LLM 事件 sink。传入 nil 可禁用。
+func SetGlobalLLMEventSink(s LLMEventSink) {
+	globalLLMEventMu.Lock()
+	globalLLMEventSink = s
+	globalLLMEventMu.Unlock()
+}
+
+// fireEvent 同时通知本实例回调与全局 sink。
+//
+// ⚠️ 两者都在**重试/熔断循环内部同步调用**, 实现方必须立刻返回。历史上飞书播报
+// 直接挂在 OnLLMEvent 上, 于是一次 429 重试要等 N 个在跑团队的飞书 HTTP 发完才
+// 继续 —— 观测把背压传染给了执行。现在的接线把播报挪到了 EventBus 订阅方那侧
+// (sink 只做一次非阻塞 Publish), 见 pkg/feishu/bot.go 的 llm.event.* 订阅。
 func (c *Client) fireEvent(eventType, detail string) {
 	if c.OnLLMEvent != nil {
 		c.OnLLMEvent(eventType, detail)
 	}
+	globalLLMEventMu.RLock()
+	sink := globalLLMEventSink
+	globalLLMEventMu.RUnlock()
+	if sink == nil {
+		return
+	}
+	source := c.Tag
+	if source == "" {
+		source = "unknown"
+	}
+	sink(LLMEventRecord{Type: eventType, Detail: detail, Source: source, Model: c.Model})
 }
 
 // ── 全局 LLM 指标采集钩子 (跨 Client 共用) ────────────────────────────────────

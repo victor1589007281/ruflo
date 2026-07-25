@@ -146,6 +146,50 @@ func TestLocalStream(t *testing.T) {
 	}
 }
 
+// TestLocalDiag诊断元数据 网关的 Diag 必须把 api.Client.CompleteDiag 的那一行元数据
+// 原样带回 —— 它是合议扇出区分"空响应 / 被 max_tokens 截断 / 超时"的唯一依据,
+// 只回文本不回 diag 就等于把诊断能力接没了 (而且不会报错)。
+func TestLocalDiag诊断元数据(t *testing.T) {
+	srv := newFakeServer(t)
+	defer srv.Close()
+	gw := newGateway(srv)
+
+	text, diag, err := gw.Diag(context.Background(), "你是回声服务", "ping")
+	if err != nil {
+		t.Fatalf("Diag 失败: %v", err)
+	}
+	if text != "pong" {
+		t.Fatalf("Diag 文本应为 pong, got=%q", text)
+	}
+	// 逐项钉住 CompleteDiag 的四个诊断维度, 而不是只判"非空":
+	// 空串以外的任何残缺 (少了 stop / outTok) 都会让线上排查失去关键那一栏。
+	for _, want := range []string{"stop=end_turn", "outTok=5", "blocks=1", "textLen=4"} {
+		if !strings.Contains(diag, want) {
+			t.Fatalf("diag 缺 %q: %q", want, diag)
+		}
+	}
+}
+
+// TestSimpleClient转调Diag SimpleClient 必须以 **CompleteDiag** 这个名字暴露诊断能力:
+// pkg/agent 用鸭子类型 (agent.DiagLLMClient) 取它, 名字或签名对不上就静默回落
+// SimpleComplete —— 不是编译错误, 是线上少一栏诊断。
+func TestSimpleClient转调Diag(t *testing.T) {
+	srv := newFakeServer(t)
+	defer srv.Close()
+	sc := SimpleClient{GW: newGateway(srv)}
+
+	text, diag, err := sc.CompleteDiag(context.Background(), "你是回声服务", "ping")
+	if err != nil {
+		t.Fatalf("CompleteDiag 失败: %v", err)
+	}
+	if text != "pong" {
+		t.Fatalf("文本应为 pong, got=%q", text)
+	}
+	if !strings.Contains(diag, "stop=end_turn") {
+		t.Fatalf("SimpleClient 丢了诊断元数据: %q", diag)
+	}
+}
+
 // TestLocalStreamError 错误传播: 假端点返回 400 (非可重试), errCh 应收到错误。
 func TestLocalStreamError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

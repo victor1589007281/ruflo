@@ -255,3 +255,37 @@ func TestConcurrency(t *testing.T) {
 	wg.Wait()
 	bus.Drops() // 快照读也参与竞态检查
 }
+
+// TestDefault进程单例 Default() 必须每次返回同一个实例。
+//
+// 为什么值得单独钉: 产生方 (pkg/api 的重试路径, 经全局 sink) 与订阅方
+// (pkg/feishu 的播报桥) 在两个包里各自取一次 Default(), 拿到不同实例的表现是
+// "事件发出去了但没人收到" —— 没有报错、没有 panic, 只有一条静默断链。
+func TestDefault进程单例(t *testing.T) {
+	a := Default()
+	b := Default()
+	if a == nil {
+		t.Fatal("Default() 返回 nil")
+	}
+	if a != b {
+		t.Fatal("Default() 返回了不同实例, 产生方与订阅方会各自挂在不同的总线上")
+	}
+
+	// 真发一条走一遍: 单例拿到的是可用总线, 不是空壳。
+	ch, unsub, err := a.Subscribe("heartbeat.*", "")
+	if err != nil {
+		t.Fatalf("Subscribe 失败: %v", err)
+	}
+	defer unsub()
+	if err := b.Publish("heartbeat.worker", Event{Data: map[string]any{"n": 1}}); err != nil {
+		t.Fatalf("Publish 失败: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Subject != "heartbeat.worker" {
+			t.Fatalf("subject 异常: %q", ev.Subject)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("单例总线上发出的事件没有抵达同一单例的订阅方")
+	}
+}

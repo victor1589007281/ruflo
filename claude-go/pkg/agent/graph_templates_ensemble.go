@@ -60,9 +60,12 @@ package agent
 //  2. **超时两层照搬**: 分支 = MapPolicy 所在节点的 TimeoutSec (分片继承它) 对应
 //     PerBranchTimeout; 整组 = 组节点 TimeoutSec 对应 TotalTimeout。
 //  3. **CompleteDiag 只有 ensemble_extract 用**: 旧 executeEnsembleExtract 在
-//     we.llm 是 *api.Client 时走 CompleteDiag 取诊断元数据, executeReviewPanel 一律走
+//     we.llm 具备 CompleteDiag 时走它取诊断元数据, executeReviewPanel 一律走
 //     SimpleComplete。两者请求体与 max_tokens 完全相同 (见 api/client.go), 但调用形态
 //     照抄, 免得"顺手统一"改掉了一条线上的诊断能力。
+//     (能力判定从 `*api.Client` 具体类型断言改成 DiagLLMClient 鸭子类型, 理由见
+//     workflow_ensemble.go 该接口的注释 —— 具体类型断言会让"把 LLM 收进 L1 网关"
+//     这件事**静默**拆掉诊断。)
 //  4. **空响应/不可解析的分支仍算 completed**: 旧路径把它们从 docs 里剔掉但不当错误
 //     (只进 diag 串)。图上同构 —— 分片 completed, 由 reduce 的样本闸 (fuseParseDocs)
 //     剔除并在 Err 里写清原因。判 failed 会让 map 的 shards_failed 与旧路径的语义分叉。
@@ -93,7 +96,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/graph"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
@@ -124,7 +126,7 @@ type ensembleGraphKind struct {
 	Lenses []string
 	// SysPrefix 系统提示词前缀 ("你是小说设定分析师。" / "你是小说评审专家。")。
 	SysPrefix string
-	// UseCompleteDiag 是否走 *api.Client.CompleteDiag (仅 ensemble_extract)。
+	// UseCompleteDiag 是否走 DiagLLMClient.CompleteDiag (仅 ensemble_extract)。
 	UseCompleteDiag bool
 	// Reduce 聚合策略 (vote / trimmed_mean) 与样本下限。
 	ReduceStrategy string
@@ -359,16 +361,7 @@ func (r *ensembleNodeRunner) runBranch(ctx context.Context, in graph.NodeInput) 
 	sys := r.k.SysPrefix + lens + ensembleJSONOnlySuffix
 	start := time.Now()
 
-	var (
-		text string
-		meta string
-		err  error
-	)
-	if cli, ok := r.we.llm.(*api.Client); ok && r.k.UseCompleteDiag {
-		text, meta, err = cli.CompleteDiag(ctx, sys, r.objective)
-	} else {
-		text, err = r.we.llm.SimpleComplete(ctx, sys, r.objective)
-	}
+	text, meta, err := completeWithDiag(ctx, r.we.llm, r.k.UseCompleteDiag, sys, r.objective)
 	secs := time.Since(start).Seconds()
 	bid := fmt.Sprintf("%s-%d", r.k.BranchNodeID, in.Shard.Index)
 

@@ -19,9 +19,42 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
 )
+
+// DiagLLMClient 是"带诊断元数据的单轮补全"这条**可选能力**的端口 (design/02 §3.1)。
+//
+// 满足者: *api.Client (原生 CompleteDiag) 与 llmgw.SimpleClient (转调
+// LLMGateway.Diag)。合议扇出靠 diag 那一行区分"空响应 / 被 max_tokens 截断 /
+// 超时"三种长得一样的失败, 见 api.Client.CompleteDiag 的注释。
+//
+// **为什么是接口断言而不是 `we.llm.(*api.Client)` 具体类型断言** (这一处是本轮
+// 修的正题): 具体类型断言把"能不能诊断"钉死在"是不是那个结构体"上, 于是
+// TeamManagerConfig.LLM 一旦换成任何接口包装 (哪怕包装转手就调同一个
+// CompleteDiag), 断言必然失败 —— 且失败路径是 `else { SimpleComplete }`,
+// 产出照出、日志照打, 只有 diag 那一栏永远空着。这类**静默降级**没有任何自曝
+// 手段, 只有等下次线上"空响应"排查不动时才会被发现。改成鸭子类型后:
+// *api.Client 与网关包装同时成立, 而真的不具备该能力的 LLMClient (测试假件、
+// 只有 SimpleComplete 的第三方实现) 仍走回落 —— 那是它本来就没有的能力,
+// 不是降级。
+//
+// 与 RawVisionCompleter (vision_critic.go:43) 同款做法, 刻意保持一致。
+type DiagLLMClient interface {
+	CompleteDiag(ctx context.Context, systemPrompt, userPrompt string) (text, diag string, err error)
+}
+
+// completeWithDiag 一次裸 completion: 具备诊断能力就取 diag, 否则回落 SimpleComplete。
+//
+// want=false 时**无条件**走 SimpleComplete —— review_panel 历来只调
+// SimpleComplete, 两个 mode 的调用形态必须各自照旧 (见
+// graph_templates_ensemble.go 文件头第 3 条)。
+func completeWithDiag(ctx context.Context, llm LLMClient, want bool, sys, user string) (text, diag string, err error) {
+	if cli, ok := llm.(DiagLLMClient); ok && want {
+		return cli.CompleteDiag(ctx, sys, user)
+	}
+	text, err = llm.SimpleComplete(ctx, sys, user)
+	return text, "", err
+}
 
 // ensembleFanOutConfig：合议扇出超时【放宽版】。并发保持默认 4(并发从来不是病因——早前误改
 // MaxConcurrency=1 反而更差, 已证伪)。真正需要放宽的是 **单路超时**:
@@ -108,7 +141,7 @@ func (we *WorkflowExecutor) executeEnsembleExtract(ctx context.Context, wf *Work
 	notify(fmt.Sprintf("⚡ **合议抽取**: %d 路差异化视角并行抽取中…", len(extractLenses)))
 
 	// 每路诊断元数据(stop/outTok/blocks/tail),用于定位"空响应/截断/超时"根因。
-	// 走 *api.Client.CompleteDiag 时才有;并发写入,读取发生在 FanOutCollect(wg.Wait)之后。
+	// 走 DiagLLMClient.CompleteDiag 时才有;并发写入,读取发生在 FanOutCollect(wg.Wait)之后。
 	var diagMu sync.Mutex
 	branchMeta := map[string]string{}
 	branches := map[string]swarm_intel.BranchFunc{}
@@ -117,14 +150,13 @@ func (we *WorkflowExecutor) executeEnsembleExtract(ctx context.Context, wf *Work
 		bid := fmt.Sprintf("extractor-%d", i)
 		branches[bid] = func(ctx context.Context) (string, error) {
 			sys := "你是小说设定分析师。" + l + " 严格按用户要求只输出一个 JSON。"
-			if cli, ok := we.llm.(*api.Client); ok {
-				text, meta, err := cli.CompleteDiag(ctx, sys, objective)
+			text, meta, err := completeWithDiag(ctx, we.llm, true, sys, objective)
+			if meta != "" {
 				diagMu.Lock()
 				branchMeta[bid] = meta
 				diagMu.Unlock()
-				return text, err
 			}
-			return we.llm.SimpleComplete(ctx, sys, objective)
+			return text, err
 		}
 	}
 	results := swarm_intel.FanOutCollect(ctx, ensembleFanOutConfig(), branches)

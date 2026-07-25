@@ -221,6 +221,7 @@ type Bot struct {
 	taskStore     *builtin.TaskStore                 // 共享 V2 Task 存储
 	evolution     *agent.EvolutionEngine             // 自动进化引擎
 	cfgWatcher    *hotreload.Watcher                 // 配置热加载监控器
+	llmEventUnsub func()                             // EventBus 上 llm.event.* 的退订函数 (见 llm_event_bus.go)
 	cronSched     *agent.CronScheduler               // 定时任务调度器
 	layout        *basedir.Layout                    // 统一目录布局
 	stateStore    statestore.StateStore              // 进程内唯一 StateStore (轨迹底座 + 会话历史快照共用)
@@ -379,15 +380,29 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		// llmgw.LLMGateway 接口 —— evolution / skillAuto / intentRec / visionCli /
 		// swarmEngine / dreamer / wikiEngine 七处注入点全部经 llmgw.SimpleClient。
 		//
-		// 两处刻意的例外, 都不是漏改:
-		//   ① SessionManager (引擎主链路): QueryEngine 流式 + 工具循环需要
-		//      api.Client 的具体能力 (Guard/熔断/FallbackModels/PromptCache 等
-		//      三十余个字段与方法), 要收进接口得先把这些能力也抽成接口;
-		//   ② TeamManagerConfig.LLM: pkg/agent/workflow_ensemble.go:111 对它做
-		//      `we.llm.(*api.Client)` 断言, 断言成功才走 CompleteDiag 取
-		//      stop/outTok/blocks/tail 那组诊断元数据 (专为定位"空响应/截断/超时"
-		//      而建)。套一层接口后断言失败, 诊断会静默降级 —— 要收进网关得先给
-		//      LLMGateway 加 CompleteDiag 的等价方法。
+		// ② TeamManagerConfig.LLM 已收编 (2026-07-25): 先给 LLMGateway 补了 Diag
+		// (= api.Client.CompleteDiag 的等价方法), 再把 pkg/agent 那处
+		// `we.llm.(*api.Client)` 具体类型断言改成 agent.DiagLLMClient 鸭子类型,
+		// 于是网关包装同样能取到 stop/outTok/blocks/tail 那组诊断元数据 —— 不换这
+		// 两步就直接套接口, 断言会失败并**静默**回落 SimpleComplete: 产出照出、
+		// 日志照打, 只有诊断那一栏永远空着。见本文件 teamMgr 装配处的 LLM 字段。
+		//
+		// ① SessionManager (引擎主链路) **保持不收编, 这是结论不是待办**:
+		// QueryEngine 的流式 + 工具循环拿的不是"发一次请求"这种能力, 而是
+		// api.Client 上三十余个具体字段/方法 —— Guard (RateLimitGuard 全局准入,
+		// 还要被 advisor 客户端共享同一实例以免双客户端各自打满 RPM)、熔断三件套
+		// (cbThreshold/circuitOpen/circuitOpenUntil)、FallbackModels +
+		// FallbackBaseURL/FallbackAPIKey + 429 连续计数触发的模型切换与冷却回退、
+		// PromptCacheMode 及其"因 API 错误自适应关闭"的状态位、
+		// FirstTokenTimeout/CallTimeout/DeadlineRetryBase 三档超时、
+		// PromptDebug 六件套、CallInterceptors、TotalRetries/CircuitTrips 计数器,
+		// 以及 WithModel/ConfiguredCloneFull 这类**克隆语义** (共享 http.Client 与
+		// Guard, 只换端点/模型)。把这些塞进 LLMGateway 等于把接口写成 api.Client
+		// 的镜像, 抽象收益为零; 只挑几个塞进去则是更坏的结果 —— 熔断/配额这类
+		// 状态**跨克隆共享**才有意义, 接口里丢一个字段不会编译报错, 只会让线上
+		// 少一层保护而没人知道。真要收编的前置条件是 design/02 §3.1 的 remote 网关
+		// (熔断/配额/fallback/prompt cache 集中到网关进程内), 那时上层才**不需要**
+		// 这些字段; 在那之前, 包一个降级接口比不包更糟。
 		llmGW:      llmgw.NewLocal(aiClient),
 		layout:     layout,
 		stateStore: stateStore,
@@ -552,9 +567,11 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				return bot.sendFileMessage(ctx, chatID, data, filename, "stream")
 			}
 		},
-		TaskTracker:        &dagTaskAdapter{store: bot.taskStore},
-		Pool:               agentPool,
-		LLM:                aiClient, // 刻意不经网关, 理由见 NewBot 里 llmGW 字段的注释
+		TaskTracker: &dagTaskAdapter{store: bot.taskStore},
+		Pool:        agentPool,
+		// 经 L1 网关 (design/02 §3.1 例外 ② 已收编): 合议扇出要的 CompleteDiag
+		// 由 llmgw.SimpleClient 转调 LLMGateway.Diag, 诊断元数据一字不少。
+		LLM:                llmgw.SimpleClient{GW: bot.llmGW},
 		Evolution:          bot.evolution,
 		EvolutionLoop:      botEvoLoop,
 		TraceStore:         bot.sessions.TraceStore(), // gate Span (design/03 §4.1 第 5 种 Kind)
@@ -577,30 +594,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 10b. 注入记忆写入 (团队完成后高权重记忆可被检索)
 	bot.teamMgr.SetMemoryWriter(&memoryAdapter{store: bot.memStore})
 
-	// 10c-extra. 注入 LLM 事件回调 → 飞书通知 (限流/熔断/致命错误时主动推送)
-	aiClient.OnLLMEvent = func(eventType, detail string) {
-		icon := "ℹ️"
-		switch eventType {
-		case "retry":
-			icon = "🔄"
-		case "circuit_open":
-			icon = "🔴"
-		case "circuit_close":
-			icon = "🟢"
-		case "fatal":
-			icon = "🚨"
-		}
-		msg := fmt.Sprintf("%s **LLM 事件 [%s]**\n%s", icon, eventType, detail)
-		// 广播到所有活跃团队的 chatID
-		if bot.teamMgr != nil {
-			for _, t := range bot.teamMgr.ListAllTeams() {
-				if t.Status == agent.TeamStatusRunning && t.ChatID != "" {
-					bot.sendLongMessage(context.Background(), t.ChatID, msg)
-				}
-			}
-		}
-		log.Printf("[LLM事件] %s: %s", eventType, detail)
-	}
+	// 10c-extra. LLM 运行事件 (限流/熔断/致命错误) → EventBus → 飞书播报。
+	// design/02 §3.4.2 L4 通信系统的第一条生产链路, 详见 startLLMEventBridge。
+	bot.startLLMEventBridge()
 
 	// 10c. 注入持续观测指标到 Dreamer (复用 teamMgr 的 Collector)
 	if bot.dreamer != nil && bot.teamMgr.Metrics() != nil {
@@ -960,6 +956,7 @@ func (b *Bot) Shutdown() {
 	if b.cfgWatcher != nil {
 		b.cfgWatcher.Stop()
 	}
+	b.stopLLMEventBridge()
 	b.mcpMgr.Shutdown()
 }
 

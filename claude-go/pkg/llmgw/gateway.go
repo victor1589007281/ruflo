@@ -56,6 +56,17 @@ type LLMGateway interface {
 	// 网关若不提供这条, 上层就必须同时持有一个 *api.Client —— "L1 是唯一 LLM
 	// 出口"当场破功。宁可把接口做全, 也不留一条绕过口。
 	Raw(ctx context.Context, contentJSON json.RawMessage, maxTokens int) (string, error)
+	// Diag 等价于 Simple, 但额外回传一行诊断元数据 (语义同 api.Client.CompleteDiag:
+	// stop / outTok / blocks / textLen / tail)。
+	//
+	// 为什么它也必须进接口 (与 Raw 同款论证, 但踩过的坑不同):
+	// pkg/agent 的合议扇出 (graph-extract-swarm) 靠这行元数据区分"空响应 / 被
+	// max_tokens 截断 / 超时"三种长得一样的失败。它此前的取法是
+	// `we.llm.(*api.Client)` **具体类型断言** —— 一旦把 TeamManagerConfig.LLM
+	// 换成任何接口包装, 断言必然失败并**静默**回落到 Simple: 产出照出, 只是诊断
+	// 那一栏永远空着, 没有任何报错。也就是说"套个接口"这件事本身会悄悄拆掉一条
+	// 线上的定位能力。所以顺序是: 先给网关补上等价方法, 才谈得上把那处收编。
+	Diag(ctx context.Context, system, user string) (text, diag string, err error)
 }
 
 // Local 本地实现: 直接转调进程内 api.Client (重试/熔断/限流/指标均由 Client 承担)。
@@ -90,6 +101,11 @@ func (l *Local) Raw(ctx context.Context, contentJSON json.RawMessage, maxTokens 
 	return l.Client.RawComplete(ctx, contentJSON, maxTokens)
 }
 
+// Diag 转调 api.Client.CompleteDiag。
+func (l *Local) Diag(ctx context.Context, system, user string) (string, string, error) {
+	return l.Client.CompleteDiag(ctx, system, user)
+}
+
 // withReqTrace 请求里带了 trace 就以它为准, 没带则保留 ctx 里已有的。
 func withReqTrace(ctx context.Context, req ChatRequest) context.Context {
 	if req.Trace.IsZero() {
@@ -120,4 +136,14 @@ func (s SimpleClient) SimpleComplete(ctx context.Context, system, user string) (
 // "文本 + 多模态"两件套。
 func (s SimpleClient) RawComplete(ctx context.Context, contentJSON json.RawMessage, maxTokens int) (string, error) {
 	return s.GW.Raw(ctx, contentJSON, maxTokens)
+}
+
+// CompleteDiag 转调 LLMGateway.Diag。
+//
+// 方法名刻意跟 api.Client 逐字相同 (而不是叫 Diag): pkg/agent 的合议扇出用
+// **鸭子类型**取这条能力 (agent.DiagLLMClient), 名字对不上就等于没有 ——
+// 而"没有"的表现是诊断静默变空, 不是编译错误。签名同理: 三返回值
+// (text, diag, err) 一个都不能省。
+func (s SimpleClient) CompleteDiag(ctx context.Context, system, user string) (string, string, error) {
+	return s.GW.Diag(ctx, system, user)
 }
