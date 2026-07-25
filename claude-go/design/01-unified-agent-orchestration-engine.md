@@ -192,14 +192,14 @@ type EdgeSpec struct {
   - swarm 动态分解（`swarm.go:523`）→ decompose 节点展开分层并行子图。
 - **子图**：`subgraph` 节点引用命名 GraphSpec，参数注入。composite 类 mode 从"专用执行器"降级为普通子图组合——**双 switch 不一致问题从根上消失**（不再存在第二张模式表）。
 
-### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 事件 17/16 ✅ · InvalidateFrom ✅ / 四源归一属 M4]**
+### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 事件 17/16 · InvalidateFrom ✅ / 四源已降三源]**
 
 > **实测**：FileJournal + Replay 真实且有零重跑硬证据（`pkg/graph/engine_test.go:422-423`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。✅ **事件类型已补齐并超出设计（2026-07-25）**：设计列 16 种，现有 17 种——补上了 `map.expanded`/`graph.expanded`/`graph.expand_rejected`/`loop.group.iteration`/`subgraph.spawned`/`subgraph.rejected`/`budget.consumed`/`budget.exceeded`/`node.invalidated`。
 >
 > ✅ **`InvalidateFrom` 已实现**：`pkg/graph/journal.go`，refine 改为追加 `node.invalidated` 事件而不是删快照文件（5 个测试）。**顺带修掉一个静默失效的真 bug**：灰度开关（`CLAUDE_GO_GRAPH_ENGINE`）开着时 `wf.Mode` 仍是 `"pipeline"`，于是「非 pipeline 转整体重跑」那道闸放行了按阶段精修，但它只失效 `checkpoints.json` 而 `graph-journal` 原样保留 → Resume 重放全部 `node.completed` → 零节点执行、直接返回旧产出，**用户的反馈静默消失**。失效必须连带摘掉该节点派生出的运行图形态（分片集/组轮次/展开产物/子节点缓存），否则是"失效了一半"——重跑的节点会继承上一轮的扇出与轮次进度。`InvalidateFrom` 在 runID 为空时**直接报错**而不是写一条注定被 Replay 过滤的事件（静默失败正是这个 bug 原本的形态）。
 >
 > ⚠️ **RunStatus 仍 3 态**（completed/partial/failed）而非设计的 8 态：`paused`/`stopped`/`refining` 在团队层已有对应状态，图层再加一套需要两层状态机对齐，属 M4。
-> ⚠️ **四源归一未达成**：checkpoints.json / goals.json / tasks.json / orchestrator CheckpointStore 仍在，journal 是第五源。删除它们要动 8+ 下游平台共用的主路径，属 M4。✅ **重试单层化已落地（2026-07-25）**：`TranslateWorkflow` 现在总给出 `Policies.DefaultRetry={6,5s}`，`stageNodeRunner` 调 `ExecuteSingleStage` 时打 `WithOuterRetryDriven` 标记使内层退化——**图层负责重试、内层让位**，次数刻意与 pipeline 外层（`Coordinator.MaxRetries=6`）对齐，故总尝试数同量级而非新的乘法放大。另修正一处前提：角色差异化的**单次**超时在图模式下本来就生效，缺的是节点级天花板，现按 `computeStageTimeout×(retries+1)×2` 给预算（复用同一张角色→超时表而非再抄一份）。
+> ✅ **四源已降三源（2026-07-25）**：`orchestrator.CheckpointStore` 随 `pkg/orchestrator` 整包退役而删除，orchestrated 改用 graph FileJournal。仍在的三源：`checkpoints.json` / `goals.json` / `tasks.json`——删它们要动 8+ 下游平台共用的 pipeline 主路径。
 
 ```go
 // pkg/graph/run.go
@@ -245,13 +245,13 @@ type LoopPolicy struct {
 
 覆盖：adversarial `Rounds`、content gate 重做环（`teams.go` 内容质量环）、novel-v3 章节循环、refine 多轮、evaluator-optimizer 模式。`loop-group` 容器把"生成→评审"两节点整体循环，即对抗模式的标准化表达。
 
-### 4.5 Hook 总线：三套合一　　**[🟠 已通电为观测桥 · 外部 hook 已覆盖图模式 / 归一属 M4]**
+### 4.5 Hook 总线：三套合一　　**[🟠 三套已降为两套 / 两者注册进同一总线待续]**
 
 > **实测**：`HookBus` 骨架存在（`pkg/graph/hooks.go:16-51`，仅 graph/node scope、仅 deny 被解释），✅ **HookBus 已通电（2026-07-25）**：`teamGraphHooks` 把节点 pre → `TaskRunning` 占位 + `team.Stages` 增量刷盘 + 心跳，post/failure → 终态 StageResult + 刷盘 + 阶段指标（4 个 label 与 `recordStageMetrics` 完全一致，既有 dashboard 不受影响）。**绝不返回 deny**——灰度期观测桥不该新增阻塞路径。这同时补上了此前"图路径无 stage 级增量刷盘与指标、灰度打开后 dashboard 看不到进度"的缺口。三套原物全在：`pkg/hooks/`、`pkg/engine/internal_hook/`（22 文件）、`pkg/orchestrator/hooks.go:20`。
 >
 > ⚠️ **一处此前标注偏保守，已核实更正**：读者容易从"三套并存"推断出「外部 hook 在图模式下不生效」——**不是这样**。逐跳核实过调用链：图路径 `stageNodeRunner.RunNode`（`graph_adapter.go:748`）→ `ExecuteSingleStage` → `we.factory`（`workflow.go:1591`），而生产 factory 就是 `SessionManager.CreateAgentRunner`（`feishu/session.go:1030`，见 `feishu/worker_runtime.go:17`），它造出的 `sessionAgentRunner.Execute` 会触发 `ExecuteSubagentStartHooks`/`ExecuteSubagentStopHooks`（`session.go:1137`/`:1263`）。**所以用户配置的 shell/HTTP/gRPC/OPA hook 在图模式下照样触发**，因为它们挂在 runner 内部而图引擎调的就是这个 runner。
 >
-> 于是 §4.5 的真实剩余工作是**架构归一而非能力缺失**：三套实现的合并卡在删除 `pkg/orchestrator`（它那套 LifecycleHook 要被 `graph|node` 作用域取代），属 M4。设计文档里 `HookEvent` 的完整形态（turn/tool/session 作用域、mutate/approve 决策、Mutation 载荷）在 v1 骨架里仍是子集。
+> ✅ **三套已降两套（2026-07-25）**：`orchestrator.LifecycleHook` 那套（ExpanderHook/MetricsHook/心跳/ObservabilityBridge）随包删除，被 `graph|node` 作用域的 `teamGraphHooks` 取代。剩 `pkg/hooks`（外部 shell/HTTP/gRPC/OPA）与 `pkg/engine/internal_hook`（每 turn 触发、性能敏感）——设计里这两套本就该**各留原位、注册进同一总线**而不是合成一份，所以剩下的是"注册进同一总线"这一步。
 
 ```go
 // pkg/graph/hooks.go —— 统一事件模型，双维度：作用域 × 相位
@@ -412,9 +412,10 @@ type CallInterceptor interface { Around(ctx context.Context, c LLMCall, next Cal
 
 拦截器配置在图级 Policies 或全局 settings，顺序确定、可开关——第三方横切逻辑（如 aiops 平台的权限桥）也从此注入而非改主流程。
 
-### 4.11 通信机制抽象　　**[🟠 接口与 Watch 已落地 / 双黑板待 M4 归一]**
+### 4.11 通信机制抽象　　**[✅ 接口 · Watch · 双黑板已归一]**
 
-> **实测**：`pkg/graph/blackboard.go` 不存在。双黑板仍并存（`pkg/agent/blackboard.go:29` + `pkg/orchestrator/blackboard.go:69`），跨黑板手工同步仍在 `pkg/agent/workflow_orchestrated.go:133-136`。**设计要「新增」的 `Watch` 只存在于那份要被删的实现里**（`pkg/orchestrator/blackboard.go:210`）。Mailbox 仍是裸 slice。
+> ✅ **双黑板已归一（2026-07-25）**：`pkg/orchestrator` 整包退役（23 文件 / 6879 行），那份黑板与跨黑板手工同步一并消失，`Watch` 语义保住在 `pkg/agent` 那份。⚠️ `BoardFuncs` 原本的存在理由（零依赖适配 `orchestrator.Blackboard`）随之消失；保留它是为 design/02 的分布式后端接入点，注释已改写说明新理由。
+> **实测**：`pkg/graph/blackboard.go` 不存在。~~双黑板并存~~（`pkg/orchestrator/blackboard.go` 已随包删除，跨黑板手工同步随之消失）。**设计要「新增」的 `Watch` 只存在于那份要被删的实现里**（`pkg/orchestrator/blackboard.go:210`）。Mailbox 仍是裸 slice。
 
 ```go
 type Blackboard interface { // 单一接口，收编两份实现
@@ -449,7 +450,7 @@ type TaskService interface {
 
 ---
 
-## 五、15 种 mode → 图模板映射　　**[🟠 4/15 等价且有等价性测试，默认关；余 11 逐条记账能力缺口]**
+## 五、15 种 mode → 图模板映射　　**[🟠 5/15 已图化（orchestrated 走专属内核）；余 10 逐条记账]**
 
 > **实测**：`pkg/graph/templates/` **目录不存在**，图模板库零落地；`TranslateWorkflow` 是 WorkflowDef 直译器不是模板库。只有 pipeline/fanout 可经灰度开关切图，而 `CLAUDE_GO_GRAPH_ENGINE` 全仓/全部署清单无处设置。13 个专用 mode 全部仍走各自执行器（`pkg/agent/workflow.go:409-434`）。§5 承诺的「fanout 首次真正实现 map→reduce」未发生——`executeFanOut` 仍原封不动转调 pipeline（`pkg/agent/workflow.go:201-203`）。
 
