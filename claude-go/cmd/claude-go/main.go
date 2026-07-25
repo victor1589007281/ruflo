@@ -946,6 +946,13 @@ func feishuCmd() *cobra.Command {
 		// placementPrefer 阶段执行的放置偏好 (design/01 §4.9 Placement.Prefer):
 		// "local"(默认, 行为不变) | "any" | "remote:<worker 名>"。
 		placementPrefer string
+		// cwd 三档位 (design/02 §3.3): 全部默认关 —— 不声明档位时行为与改造前一字不变。
+		workspaceMode   string
+		workspaceVolume string
+		gitRemote       string
+		gitBranch       string
+		gitBaseRef      string
+		gitMaxFileMB    int
 	)
 
 	cmd := &cobra.Command{
@@ -1176,6 +1183,25 @@ JSON 配置文件示例:
 			// 见下方 dispatchMode 分支 (挂端点) 与 NewBot 之后的接线 (换执行工厂)。
 			var workerBroker *worker.Broker
 			var runtimeReg agent.RuntimeRegistry
+			// cwd 档位策略 (design/02 §3.3): Broker 与执行工厂必须用**同一份**,
+			// 否则会出现"工厂声明了工作区但 Broker 不下发档位"这类半通电状态。
+			var wsPolicy *worker.WorkspacePolicy
+			if m, mErr := worker.ParseWorkspaceMode(workspaceMode); mErr != nil {
+				return mErr
+			} else if m != worker.WorkspaceModeUnset {
+				wsPolicy = &worker.WorkspacePolicy{
+					Mode: m, Volume: workspaceVolume,
+					GitRemote: gitRemote, GitBranch: gitBranch, GitBaseRef: gitBaseRef,
+					GitMaxFileBytes: int64(gitMaxFileMB) << 20,
+				}
+				// 策略不自洽在启动时就报错 (缺卷名/缺 remote 会让所有任务永远 pending)。
+				if vErr := wsPolicy.Validate(); vErr != nil {
+					return vErr
+				}
+				if dispatchMode != "queue" {
+					return fmt.Errorf("--workspace-mode 需要 --dispatch-mode queue (档位只影响远程执行)")
+				}
+			}
 
 			if config.Wiki.APIPort > 0 {
 				// 与 bot 使用相同的 stateDir 解析逻辑，确保 dashboard 读写 metrics 路径一致。
@@ -1219,7 +1245,8 @@ JSON 配置文件示例:
 					// 没有它, 队列只是"能入队但没人派活、执行体是桩"的空管道。
 					brk, brkErr := worker.NewBroker(worker.BrokerOptions{
 						Queue: clusterQueue, Registry: clusterReg,
-						Logf: func(f string, a ...any) { log.Printf(f, a...) },
+						Workspace: wsPolicy,
+						Logf:      func(f string, a ...any) { log.Printf(f, a...) },
 					})
 					if brkErr != nil {
 						return fmt.Errorf("装配远程 runtime 失败: %w", brkErr)
@@ -1322,10 +1349,18 @@ JSON 配置文件示例:
 					}
 					return worker.RuntimeFactory(runtimeReg, &agent.Placement{
 						Prefer: placementPrefer, Affinity: "team",
-					})
+					}, wsPolicy)
 				})
 				go workerBroker.SyncLoop(ctx, 10*time.Second, runtimeReg, 90*time.Second)
 				fmt.Printf("[Cluster] 远程 runtime 已接线 (placement prefer=%s, 每 10s 同步 worker)\n", placementPrefer)
+				if wsPolicy != nil {
+					fmt.Printf("[Cluster] cwd 档位=%s (要求 worker 具备 %v); 团队 cwd=%s\n",
+						wsPolicy.Mode, wsPolicy.RequireCaps(), config.Cwd)
+					if wsPolicy.Mode == worker.WorkspaceModeGit {
+						fmt.Printf("[Cluster] git 档: remote=%s 分支模板=%s (阶段结束后控制面 ff-only 同步进团队 cwd, 门禁才看得见)\n",
+							wsPolicy.GitRemote, wsPolicy.GitBranch)
+					}
+				}
 			}
 
 			fmt.Println("========================================")
@@ -1361,6 +1396,12 @@ JSON 配置文件示例:
 	cmd.Flags().IntVar(&httpPort, "http-port", 0, "serve 模式 HTTP 端口 (覆盖 wiki.apiPort; 默认 18080)")
 	cmd.Flags().StringVar(&dispatchMode, "dispatch-mode", "", "分布式控制面模式: queue (挂 /cluster/* 任务队列端点)")
 	cmd.Flags().StringVar(&placementPrefer, "placement-prefer", "local", "阶段执行放置偏好: local | any | remote:<worker 名> (需 --dispatch-mode queue)")
+	cmd.Flags().StringVar(&workspaceMode, "workspace-mode", "", "远程执行的 cwd 档位: local | pvc | git (空=不声明, 行为与单机一致)")
+	cmd.Flags().StringVar(&workspaceVolume, "workspace-volume", "", "pvc 档: 共享 RWX 卷名 (worker 必须挂同名卷)")
+	cmd.Flags().StringVar(&gitRemote, "workspace-git-remote", "", "git 档: 约定 git 位置 (bare 仓 URL/路径)")
+	cmd.Flags().StringVar(&gitBranch, "workspace-git-branch", worker.DefaultGitBranchTemplate, "git 档: 工作区分支模板 (支持 {team}/{run})")
+	cmd.Flags().StringVar(&gitBaseRef, "workspace-git-base", "", "git 档: 分支首次创建时的起点 (空=origin/HEAD)")
+	cmd.Flags().IntVar(&gitMaxFileMB, "workspace-git-max-file-mb", 32, "git 档: 单文件上限 (MiB); 超限的阶段直接失败而不是悄悄跳过")
 	cmd.Flags().StringVar(&addr, "addr", "", "serve 模式监听地址 host:port (等价 --http-port, 便于 K8s 声明)")
 
 	return cmd

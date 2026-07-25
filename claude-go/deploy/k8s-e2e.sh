@@ -29,7 +29,9 @@ FAILED=0
 step "1/11 构建静态二进制"
 cd "$REPO" || exit 1
 CGO_ENABLED=0 go build -trimpath -o deploy/claude-go-linux ./cmd/claude-go || exit 1
-ls -la --block-size=M deploy/claude-go-linux | awk '{print "  二进制", $5}'
+# 分布式模式的 worker 用**独立二进制** (claude-go 的 worker 子命令仍是回显桩)。
+CGO_ENABLED=0 go build -trimpath -o deploy/claude-go-worker-linux ./cmd/claude-go-worker || exit 1
+ls -la --block-size=M deploy/claude-go-linux deploy/claude-go-worker-linux | awk '{print "  二进制", $5, $NF}'
 
 step "2/11 构建镜像并导入 kind"
 docker build -q -t "$IMG" -f deploy/Dockerfile deploy/ >/dev/null || exit 1
@@ -127,6 +129,12 @@ echo "  — 团队产物:"
 kubectl -n "$NS" exec "$POD" -- sh -c 'ls /data/.claude-go/teams/e2e-real/ 2>/dev/null' || bad "无团队目录"
 
 step "9/11 验收⑤: 分布式模式 + 网关真被经过"
+# 团队工作区卷 (cwd 的 pvc 档位, design/02 §3.3): distributed.yaml 只引用不创建。
+# kind 的 local-path **拒绝 RWX** (NodePath only supports ReadWriteOnce), 所以这里用
+# hostPath 版 —— 单节点上它是真共享 (同一个节点目录), 已实测 A 写 B 读。
+kubectl apply -f "$REPO/deploy/k8s/workspace-pvc-kind.yaml" >/dev/null \
+  && ok "工作区卷 claude-go-teams 已就绪 (hostPath RWX, 单节点)" \
+  || bad "工作区卷创建失败 —— pvc 档位的 worker 会卡 Pending"
 sed -e "s|image: localhost:5000/claude-go:latest|image: $IMG|g" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|g" \
     "$REPO/deploy/k8s/distributed.yaml" \
@@ -137,6 +145,26 @@ for d in claude-go-gateway claude-go-control claude-go-worker; do
 done
 GWPOD=$(kubectl -n "$NS" get pod -l app=claude-go-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 CTLPOD=$(kubectl -n "$NS" get pod -l app=claude-go-control -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+# cwd 档位 (design/02 §3.3) 真通电的三条实证, 缺一条就是装饰品:
+#   ① worker 上报 ws:pvc / wsvol:<卷名> 标签 (控制面靠它路由, 队列按标签过滤)
+#   ② 控制面日志声明了档位 (说明 --workspace-mode 真被读到)
+#   ③ 控制面与 worker 看到的 /workspace 是**同一份数据** (控制面写, worker 读)
+WPOD=$(kubectl -n "$NS" get pod -l app=claude-go-worker -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -n "$CTLPOD" ] && [ -n "$WPOD" ]; then
+  kubectl -n "$NS" exec "$CTLPOD" -- curl -s localhost:18080/cluster/workers 2>/dev/null \
+    | grep -q 'wsvol:claude-go-teams' \
+    && ok "worker 上报 cwd 档位标签 (ws:pvc + wsvol:claude-go-teams)" \
+    || bad "worker 未上报档位标签 —— 档位路由没通电"
+  kubectl -n "$NS" logs "$CTLPOD" --tail=400 2>/dev/null | grep -q 'cwd 档位=pvc' \
+    && ok "控制面已按 pvc 档位派活" || bad "控制面未声明 cwd 档位"
+  STAMP="ws-probe-$RANDOM"
+  kubectl -n "$NS" exec "$CTLPOD" -- sh -c "echo $STAMP > /workspace/.ws-e2e-probe" >/dev/null 2>&1
+  kubectl -n "$NS" exec "$WPOD" -- sh -c 'cat /workspace/.ws-e2e-probe 2>/dev/null' 2>/dev/null \
+    | grep -q "$STAMP" \
+    && ok "控制面与 worker 的 /workspace 是同一份数据 (RWX 真共享)" \
+    || bad "控制面与 worker 的 /workspace 不是同一份数据 —— 远程产码门禁看不见 (风险④)"
+  kubectl -n "$NS" exec "$CTLPOD" -- rm -f /workspace/.ws-e2e-probe >/dev/null 2>&1
+fi
 if [ -n "$CTLPOD" ]; then
   kubectl -n "$NS" exec "$CTLPOD" -- curl -s -X POST \
     localhost:18080/api/actions/team/create/e2e-gw -H 'Content-Type: application/json' \

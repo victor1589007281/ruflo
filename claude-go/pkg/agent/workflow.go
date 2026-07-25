@@ -1587,6 +1587,8 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 		Workflow: team.Workflow,
 		Role:     role,
 		Team:     team.Name,
+		// Cwd: 远程执行时要靠它声明工作区 (编译门禁跑在 <team.Cwd>/go.mod 上)。
+		Cwd: team.Cwd,
 	})
 
 	runner, err := we.factory(stageCtx, role, "")

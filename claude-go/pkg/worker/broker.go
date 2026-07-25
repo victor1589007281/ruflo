@@ -12,7 +12,7 @@ package worker
 //	  ◀── POST /cluster/complete|fail ────────────────┘
 //	  队列状态 = 终态真源 → NodeEventDone / NodeEventFailed → 关闭事件通道
 //
-// 三条 fail-closed 规则 (这个包存在的意义就是不许静默成功):
+// 四条 fail-closed 规则 (这个包存在的意义就是不许静默成功):
 //
 //  1. 终态只认队列。worker 上报的 done/failed 事件**不会**被转发成终态 —— 事件
 //     走 best-effort HTTP, 若拿它当终态, 丢包/伪造都会变成"成功"。
@@ -21,6 +21,9 @@ package worker
 //  3. worker 掉线 = 失败。任务钉住的 worker 从注册表消失且超过宽限期仍无人拉取,
 //     直接失败, 不让调用方等到节点超时 (等超时也会失败, 但归因会指向 LLM)。
 //     已被拉走却租约过期的任务, 由队列的 reap 判失败 (MaxAttempts=1, 见下)。
+//  4. 产物对控制面不可见 = 失败 (cwd 三档位, 见 settleWorkspace)。pvc 档读不到
+//     worker 回执、git 档同步后找不到它报的提交, 都不许当成功 —— 编译门禁跑在
+//     控制面的 <team.Cwd>/go.mod 上, "worker 说写了"不等于"门禁看得见"。
 
 import (
 	"context"
@@ -28,6 +31,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +71,9 @@ type BrokerOptions struct {
 	// Registry 可空: worker 注册表。为空时 Sync/SyncLoop 不可用, 且失去
 	// "钉住的 worker 已掉线"检查 (退化为等调用方 ctx 超时)。
 	Registry *cluster.Registry
+	// Workspace cwd 档位策略 (design/02 §3.3, 见 workspace.go)。
+	// nil / Mode 空 = 不启用: 任务不带任何档位声明, worker 侧行为与改造前一字不变。
+	Workspace *WorkspacePolicy
 	// MaxAttempts 0 → DefaultMaxAttempts。
 	MaxAttempts int
 	// PollInterval 0 → DefaultPollInterval。
@@ -80,6 +88,8 @@ type BrokerOptions struct {
 type Broker struct {
 	q               *cluster.Queue
 	reg             *cluster.Registry
+	ws              *WorkspacePolicy
+	gitLocks        controlGitLocks
 	maxAttempts     int
 	poll            time.Duration
 	deadWorkerGrace time.Duration
@@ -117,8 +127,13 @@ func NewBroker(opt BrokerOptions) (*Broker, error) {
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
 	}
+	// 策略不自洽必须在启动时报错: "启用了 pvc 档但没写卷名"会让所有任务派成
+	// 永远没人能拉的 pending, 表现为"团队卡住不动"。
+	if err := opt.Workspace.Validate(); err != nil {
+		return nil, err
+	}
 	return &Broker{
-		q: opt.Queue, reg: opt.Registry,
+		q: opt.Queue, reg: opt.Registry, ws: opt.Workspace,
 		maxAttempts: opt.MaxAttempts, poll: opt.PollInterval,
 		deadWorkerGrace: opt.DeadWorkerGrace, logf: opt.Logf,
 		subs: map[string]*subscription{}, cancels: map[string]time.Time{},
@@ -419,20 +434,44 @@ func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	require := MergeCaps(PlacementCaps(task.Placement), []string{WorkerCap(r.worker)})
-	payload, err := EncodeStageTask(StageTask{
+	// 任务 ID 先生成: pvc 档的握手令牌就是它 (Queue.Enqueue 接受调用方指定的 ID)。
+	taskID := trace.NewID("task")
+
+	// cwd 档位声明。团队名取自 Placement.AffinityKey —— 那正是 factory 用
+	// RunMetadata.Team 填的分组键 (factory.go Placement()), 与 git 分支同粒度。
+	team := ""
+	if task.Placement != nil {
+		team = task.Placement.AffinityKey
+	}
+	wsReq, err := r.b.ws.resolve(task.Workspace, team, task.RunID, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("%s: 工作区声明求解失败: %w", r.name, err)
+	}
+
+	require := MergeCaps(PlacementCaps(task.Placement), []string{WorkerCap(r.worker)}, r.b.ws.RequireCaps())
+	st := StageTask{
 		RunID: task.RunID, NodeID: task.NodeID, Role: task.Role,
 		SystemPrompt: task.SystemPrompt, UserPrompt: task.UserPrompt,
 		Workspace: task.Workspace, ToolProfile: task.ToolProfile,
 		MaxTurns: task.MaxTurns, Require: require,
-	})
+	}
+	wsReq.apply(&st)
+
+	// pvc 档: 派任务**之前**在共享卷上写下握手文件。
+	// 同步失败 (卷没挂上/不可写) 直接让 Execute 报错 —— 调用方立刻失败, 而不是拿到
+	// 一个注定被 worker 拒绝的任务再等一轮。
+	if wsReq != nil && wsReq.Mode == WorkspaceModePVC {
+		if err := r.b.writeControlHandshake(wsReq, taskID); err != nil {
+			return nil, fmt.Errorf("%s: %w", r.name, err)
+		}
+	}
+
+	payload, err := EncodeStageTask(st)
 	if err != nil {
 		return nil, err
 	}
 
 	// 先订阅再入队: 反序会漏掉 worker 抢在订阅之前上报的 started 事件。
-	// 任务 ID 由控制面预生成 (Queue.Enqueue 接受调用方指定的 ID)。
-	taskID := trace.NewID("task")
 	sub := r.b.subscribe(taskID)
 
 	if _, err := r.b.q.Enqueue(cluster.Task{
@@ -453,7 +492,7 @@ func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 	r.mu.Unlock()
 
 	out := make(chan agent.NodeEvent, 16)
-	go r.watch(ctx, taskID, key, task, sub, out)
+	go r.watch(ctx, taskID, key, task, wsReq, sub, out)
 	return out, nil
 }
 
@@ -479,10 +518,12 @@ func inflightKey(runID, nodeID string) string { return runID + "/" + nodeID }
 
 // watch 把队列状态 + 事件流归约成一条事件流, 结束时关闭 out。
 func (r *remoteRuntime) watch(ctx context.Context, taskID, key string, task agent.RuntimeNodeTask,
-	sub *subscription, out chan agent.NodeEvent) {
+	wsReq *workspaceRequest, sub *subscription, out chan agent.NodeEvent) {
 
 	defer close(out)
 	defer r.b.unsubscribe(taskID)
+	// 握手文件是 per-task 的, 任务一结束就清掉 (共享卷上不留垃圾)。
+	defer r.b.cleanupHandshake(wsReq, taskID)
 	defer func() {
 		r.mu.Lock()
 		delete(r.inflight, key)
@@ -553,6 +594,13 @@ func (r *remoteRuntime) watch(ctx context.Context, taskID, key string, task agen
 					failed("%s: 任务 %s 回报完成但结果不可解析: %v", r.name, taskID, perr)
 					return
 				}
+				// fail-closed 规则 4 (cwd 三档位): worker 说完成了, 但产物必须**真的
+				// 对控制面可见** —— pvc 档验回执, git 档同步分支并验提交可达。
+				// 不验就等于相信"远程写的文件门禁看得见", 而那恰是上一轮记账的缺口。
+				if wsErr := r.b.settleWorkspace(ctx, wsReq, taskID, res.Workspace); wsErr != nil {
+					failed("%s: %v", r.name, wsErr)
+					return
+				}
 				term(agent.NodeEvent{Kind: agent.NodeEventDone, RunID: task.RunID, NodeID: task.NodeID,
 					Output: res.Output})
 				return
@@ -607,6 +655,95 @@ func (b *Broker) taskState(taskID string) (*cluster.Task, error) {
 		return b.q.Get(taskID)
 	}
 	return ct, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 控制面侧的工作区处理 (design/02 §3.3 cwd 三档位)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// writeControlHandshake pvc 档: 派任务前在共享卷上留下控制面的握手文件。
+func (b *Broker) writeControlHandshake(req *workspaceRequest, taskID string) error {
+	fi, err := os.Stat(req.Path)
+	if err != nil || !fi.IsDir() {
+		return fmt.Errorf("pvc 档: 控制面侧看不到工作区目录 %s (%v) —— "+
+			"pvc 档要求控制面与 worker 挂同一个 RWX 卷且路径一致", req.Path, err)
+	}
+	pruneHandshakes(req.Path)
+	if err := writeHandshake(req.Path, taskID, "control", handshakeNote{
+		Volume: req.Volume, TaskID: taskID, Who: "control-plane", Dir: req.Path}); err != nil {
+		return fmt.Errorf("pvc 档: %w", err)
+	}
+	return nil
+}
+
+// cleanupHandshake 任务结束后清掉本任务的握手文件 (best-effort)。
+func (b *Broker) cleanupHandshake(req *workspaceRequest, taskID string) {
+	if req == nil || req.Mode != WorkspaceModePVC || req.Path == "" {
+		return
+	}
+	_ = os.Remove(handshakePath(req.Path, taskID, "control"))
+	_ = os.Remove(handshakePath(req.Path, taskID, "worker"))
+}
+
+// settleWorkspace worker 回报完成后, 控制面这一侧的"产物真的可见吗"校验。
+//
+//	local  不做额外校验 (路径一致是它唯一能给的保证; 跨机产码请用 pvc/git)。
+//	pvc    必须能读到 worker 写的回执 —— 读不到就说明两边不是同一份数据,
+//	       于是 worker 写的代码门禁也看不见。
+//	git    fetch + ff-only 合入 team.Cwd, 并校验 worker 报的提交在里面。
+//	       这一步做完, <team.Cwd>/go.mod 上的编译门禁才真的看得到远程产码。
+func (b *Broker) settleWorkspace(ctx context.Context, req *workspaceRequest, taskID string, rep *WorkspaceReport) error {
+	if req == nil {
+		return nil
+	}
+	switch req.Mode {
+	case WorkspaceModePVC:
+		note, err := readHandshake(req.Path, taskID, "worker")
+		if err != nil {
+			return fmt.Errorf("pvc 档: worker 回报完成, 但控制面在共享卷 %s 上读不到它的回执 "+
+				"%s (%v) ⇒ 两边不是同一份数据, worker 写的产物对编译门禁不可见, 拒绝当成功",
+				req.Path, filepath.Join(handshakeDir, taskID+".worker"), err)
+		}
+		if req.Volume != "" && note.Volume != "" &&
+			!strings.EqualFold(strings.TrimSpace(note.Volume), strings.TrimSpace(req.Volume)) {
+			return fmt.Errorf("pvc 档: worker 回执声明的卷是 %q, 控制面要求 %q; 拒绝当成功",
+				note.Volume, req.Volume)
+		}
+		return nil
+	case WorkspaceModeGit:
+		if req.Git == nil {
+			return fmt.Errorf("git 档: 内部错误, 任务缺少 git 声明")
+		}
+		commit := ""
+		if rep != nil {
+			commit = strings.TrimSpace(rep.Commit)
+			if !rep.Changed && !rep.Pushed {
+				// 本阶段没产文件 (评审/分析类阶段的正常情况)。仍然要同步一次:
+				// 分支上可能有**并发分片**推上来的提交, 不同步门禁就看不到它们。
+				commit = ""
+			}
+		} else {
+			// 老 worker / 协议漂移: 没有工作区回报就无法判断推没推。仍然同步,
+			// 但不做提交可达校验 (无从校验), 并留日志。
+			b.logf("[broker] git 档: 任务 %s 的结果里没有工作区回报, 只做同步不做提交校验", taskID)
+		}
+		if req.Path != "" {
+			// 串行化: 多个远程节点可能同时完成, 都要往同一个 team.Cwd 里 fetch/merge。
+			unlock := b.gitLocks.lock(req.Path)
+			defer unlock()
+			if err := gitSyncControl(ctx, req.Path, req.Git, commit); err != nil {
+				return err
+			}
+		} else if commit != "" {
+			b.logf("[broker] git 档: 控制面无团队 cwd, 跳过同步 (worker 已推送 %s, 无编译门禁)", shortSHA(commit))
+		}
+		if rep != nil && rep.Changed && !rep.Pushed {
+			return fmt.Errorf("git 档: worker 报告有 %d 个文件改动但没推上去 (note=%q); "+
+				"产物对下一阶段与编译门禁都不可见, 拒绝当成功", rep.Files, rep.Note)
+		}
+		return nil
+	}
+	return nil
 }
 
 func decodeStageResult(raw json.RawMessage) (StageResult, error) {

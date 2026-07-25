@@ -60,6 +60,8 @@ func rootCmd() *cobra.Command {
 		configPath  string
 		cwd         string
 		workspace   string
+		wsMode      string
+		wsVolume    string
 		extraCaps   []string
 		noBash      bool
 		browserCap  bool
@@ -111,6 +113,27 @@ func rootCmd() *cobra.Command {
 				return fmt.Errorf("配置里没有可用模型 (modelAlias/providers): worker 无法真执行, 拒绝以桩的形式启动")
 			}
 
+			// —— cwd 档位 (design/02 §3.3) ——
+			//
+			// 关键约束: 工具的执行根是**进程级**的 (feishu.SessionManager 用
+			// sm.config.Cwd, session.go:654,793,1194), worker 无法逐任务切换它。所以
+			// 声明的工作区必须等于 botCfg.Cwd, 否则 Agent 把文件写到 cwd 而工作区里
+			// 什么都没有 —— 那正是"阶段成功但下一阶段找不到代码"。启动时就钉死。
+			mode, mErr := worker.ParseWorkspaceMode(wsMode)
+			if mErr != nil {
+				return mErr
+			}
+			if mode == worker.WorkspaceModePVC || mode == worker.WorkspaceModeGit {
+				if workspace == "" {
+					workspace = botCfg.Cwd // 未显式声明就用执行 cwd (两者必须一致)
+				}
+				if strings.TrimRight(workspace, "/") != strings.TrimRight(botCfg.Cwd, "/") {
+					return fmt.Errorf("%s 档位要求 --workspace 与执行 cwd 一致, 实得 workspace=%s cwd=%s; "+
+						"不一致时 Agent 会把文件写到 cwd 而工作区里什么都没有 (拒绝启动)",
+						mode, workspace, botCfg.Cwd)
+				}
+			}
+
 			bot, err := feishu.NewBot(botCfg)
 			if err != nil {
 				return fmt.Errorf("装配执行体失败: %w", err)
@@ -143,6 +166,8 @@ func rootCmd() *cobra.Command {
 				Runtime:           rt,
 				ExtraCaps:         extraCaps,
 				Workspace:         workspace,
+				WorkspaceMode:     mode,
+				WorkspaceVolume:   wsVolume,
 				MaxParallel:       maxParallel,
 				PollInterval:      time.Duration(pollMS) * time.Millisecond,
 				HeartbeatInterval: time.Duration(heartbeatS) * time.Second,
@@ -158,9 +183,20 @@ func rootCmd() *cobra.Command {
 			fmt.Printf("[worker] %s → 控制面 %s\n", name, control)
 			fmt.Printf("[worker] caps=%v 并发=%d cwd=%s state=%s\n", w.Caps(), maxParallel, botCfg.Cwd, stateDir)
 			if workspace != "" {
-				fmt.Printf("[worker] 工作区=%s (只接受同工作区的任务)\n", workspace)
+				fmt.Printf("[worker] 工作区=%s 档位=%s\n", workspace, mode.Effective())
 			} else {
-				fmt.Printf("[worker] 未声明工作区: 指定了 workspace 的任务会被拒绝 (--workspace 声明)\n")
+				fmt.Printf("[worker] 未声明工作区 (档位=%s): 指定了 workspace 的任务会被拒绝 (--workspace 声明)\n",
+					mode.Effective())
+			}
+			switch mode.Effective() {
+			case worker.WorkspaceModeLocal:
+				fmt.Printf("[worker] local 档只校验路径一致, **不证明与控制面是同一份数据**; " +
+					"跨机产码请用 --workspace-mode pvc 或 git\n")
+			case worker.WorkspaceModePVC:
+				fmt.Printf("[worker] pvc 档: 卷=%s; 每个任务都要读到控制面写的握手文件才执行\n", wsVolume)
+			case worker.WorkspaceModeGit:
+				fmt.Printf("[worker] git 档: 每阶段 fetch+checkout 后执行, 结束后 commit/push 回约定位置 " +
+					"(并发上限强制为 1)\n")
 			}
 			// 同机与控制面共用 stateDir 时的真实风险, 必须提示 (design/02 §3.4.1:
 			// FileStore 的桶锁是 per-instance, 跨进程无锁 → 交错写会丢更新)。
@@ -190,7 +226,9 @@ func rootCmd() *cobra.Command {
 	f.StringVar(&name, "name", "", "worker 名 (默认 POD_NAME 或 worker-<主机名>)")
 	f.StringVar(&configPath, "config", "", "JSON 配置文件 (providers/skills/stateDir 等)")
 	f.StringVar(&cwd, "cwd", "", "工具执行根目录 (默认配置里的 cwd 或当前目录)")
-	f.StringVar(&workspace, "workspace", "", "本 worker 能提供的团队工作区绝对路径")
+	f.StringVar(&workspace, "workspace", "", "本 worker 能提供的团队工作区绝对路径 (pvc/git 档必须与 --cwd 一致)")
+	f.StringVar(&wsMode, "workspace-mode", "", "cwd 档位: local (默认) | pvc | git; 上报成 ws:<档位> 能力标签")
+	f.StringVar(&wsVolume, "workspace-volume", "", "pvc 档: 本 worker 挂的共享卷名 (须与控制面 --workspace-volume 一致)")
 	f.StringSliceVar(&extraCaps, "caps", nil, "额外能力标签 (如 mcp:playwright,cli:golangci-lint)")
 	f.BoolVar(&noBash, "no-bash", false, "声明本 worker 不提供 shell 执行能力")
 	f.BoolVar(&browserCap, "browser", false, "声明具备无头浏览器")

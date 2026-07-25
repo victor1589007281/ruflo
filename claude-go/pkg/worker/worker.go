@@ -9,11 +9,13 @@ package worker
 // feishu.SessionManager.CreateAgentRunner)`, 即 QueryEngine + prompt 组装 +
 // skills + 工具画像 + MCP 全套)。本包不自造任何 agent 执行逻辑。
 //
-// 五条"失败必须真失败"的处理 (逐条都有测试):
+// 六条"失败必须真失败"的处理 (逐条都有测试):
 //
 //	载荷解码失败      → Fail(原因)      ——不许拿空 prompt 跑出"成功的垃圾"
 //	能力不匹配        → Fail(缺哪些)    ——纵深防御, 队列过滤失灵时不硬跑
 //	工作区无法提供    → Fail(要哪个/有哪个) ——不许在错误目录里产码
+//	                    (含 cwd 三档位: 路径/卷/握手/git 拉取, 见 workspace.go)
+//	产物交不出去      → Fail(交付失败)  ——git push 失败/冲突时不许回报成功
 //	runtime 未给终态  → Fail(未回报终态) ——通道关了却没 done/failed 不算成功
 //	worker 关停       → Fail(关停)      ——在途任务立刻让控制面看到, 不等租约超时
 
@@ -58,7 +60,18 @@ type Options struct {
 	Kinds []string
 	// Workspace 本 worker 能提供的团队工作区 (绝对路径)。空 = 不声明,
 	// 此时任何指定了 Workspace 的任务都会被拒 (fail-closed, 见 checkWorkspace)。
+	//
+	// ⚠️ 三个档位都要求它与**执行体真实的 cwd 一致**: 工具的执行根是进程级的
+	// (feishu.SessionManager 用 sm.config.Cwd, session.go:654,793,1194), worker 无法
+	// 逐任务切换它。声明的工作区与执行 cwd 不一致 = Agent 把文件写到别处,
+	// 而调用方以为写进了工作区。cmd/claude-go-worker 在启动时强校验这一点。
 	Workspace string
+	// WorkspaceMode 本 worker 提供的 cwd 档位 (local/pvc/git; 空 = local)。
+	// 见 workspace.go 的文件头。worker 会把它上报成 ws:<档位> 能力标签, 于是
+	// "档位不匹配的任务根本拉不到"由队列既有的标签过滤实现。
+	WorkspaceMode WorkspaceMode
+	// WorkspaceVolume pvc 档: 本 worker 挂的共享卷名 (上报成 wsvol:<卷名>)。
+	WorkspaceVolume string
 	// MaxParallel 并发执行上限, <=0 → 1。
 	MaxParallel int
 	// PollInterval 无任务时的轮询间隔, <=0 → DefaultPollMS。
@@ -92,6 +105,9 @@ type Worker struct {
 	mu   sync.Mutex
 	done int
 	fail int
+
+	// gitMu git 档位的工作目录互斥 (同一个检出目录不能被两个任务同时用)。
+	gitMu sync.Mutex
 }
 
 // New 构造 worker。缺少 Control/Name/Runtime 直接报错 —— 一个连不上控制面或没有
@@ -106,8 +122,30 @@ func New(opt Options) (*Worker, error) {
 	if opt.Runtime == nil {
 		return nil, fmt.Errorf("worker: Options.Runtime 不能为空 (需要真执行体, 不接受桩)")
 	}
+	if _, err := ParseWorkspaceMode(string(opt.WorkspaceMode)); err != nil {
+		return nil, err
+	}
 	if opt.MaxParallel <= 0 {
 		opt.MaxParallel = 1
+	}
+	switch opt.WorkspaceMode.Effective() {
+	case WorkspaceModePVC:
+		if strings.TrimSpace(opt.Workspace) == "" {
+			return nil, fmt.Errorf("worker: pvc 档位必须声明 Workspace (共享卷的挂载路径)")
+		}
+		if strings.TrimSpace(opt.WorkspaceVolume) == "" {
+			return nil, fmt.Errorf("worker: pvc 档位必须声明 WorkspaceVolume (卷名), 否则控制面无从核对")
+		}
+	case WorkspaceModeGit:
+		if strings.TrimSpace(opt.Workspace) == "" {
+			return nil, fmt.Errorf("worker: git 档位必须声明 Workspace (本地检出目录)")
+		}
+		if opt.MaxParallel > 1 {
+			// 不是保守: 工具的执行根是进程级的, git 档只有一个检出目录。两个任务
+			// 并发就会互相 checkout/reset —— 表现为"文件莫名消失"。宁可拒绝启动。
+			return nil, fmt.Errorf("worker: git 档位下 MaxParallel 必须为 1 (只有一个检出目录, "+
+				"并发会互相 checkout/reset), 实得 %d", opt.MaxParallel)
+		}
 	}
 	if opt.PollInterval <= 0 {
 		opt.PollInterval = DefaultPollMS * time.Millisecond
@@ -128,10 +166,11 @@ func New(opt Options) (*Worker, error) {
 	if len(kinds) == 0 {
 		kinds = []string{TaskKindStage}
 	}
-	// 能力标签 = runtime 自己声明的能力 + 额外标签 + 钉住自己的合成标签。
+	// 能力标签 = runtime 自己声明的能力 + 额外标签 + 钉住自己的合成标签 + cwd 档位。
 	// 以 Runtime.Capabilities() 为准而不是让调用方手填, 避免"上报有 browser 但
 	// runtime 其实没有"这种对不上的情况。
-	caps := MergeCaps(CapsFromRuntime(opt.Runtime.Capabilities()), opt.ExtraCaps, []string{WorkerCap(opt.Name)})
+	caps := MergeCaps(CapsFromRuntime(opt.Runtime.Capabilities()), opt.ExtraCaps,
+		[]string{WorkerCap(opt.Name)}, workspaceCaps(opt))
 	return &Worker{
 		opt:  opt,
 		cli:  newCtlClient(opt.Control, opt.Name, opt.EventsPath, opt.AuthToken, opt.HTTPClient),
@@ -246,10 +285,16 @@ func (w *Worker) execute(parent context.Context, task *cluster.Task) {
 		w.reportFail(task.ID, fmt.Sprintf("worker %s 缺少必需能力 %v (本 worker caps=%v)", w.opt.Name, miss, w.caps))
 		return
 	}
-	if err := w.checkWorkspace(st.Workspace); err != nil {
+	// 工作区按档位准备 (local: 路径判定; pvc: 握手; git: fetch+checkout)。
+	// 准备失败一律拒绝执行 —— 在错误目录/没有上游代码的目录里跑出来的"成功"最难归因。
+	sess, err := w.prepareWorkspace(st)
+	if err != nil {
 		w.reportFail(task.ID, err.Error())
 		return
 	}
+	// 兜底收尾: 任何异常路径都要走一次 finish, 否则 git 档的工作目录锁不会释放。
+	// finish 幂等, 成功路径的显式调用不会被它重复执行。
+	defer sess.abandon()
 
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -263,7 +308,12 @@ func (w *Worker) execute(parent context.Context, task *cluster.Task) {
 		ctx = trace.With(ctx, trace.IDs{RunID: st.RunID, NodeID: st.NodeID})
 	}
 
-	ch, execErr := w.opt.Runtime.Execute(ctx, st.ToRuntimeTask())
+	rtTask := st.ToRuntimeTask()
+	if sess.dir != "" {
+		// 交给执行体的任务里带上**本机真实**工作目录 (git 档下它与控制面路径不同)。
+		rtTask.Workspace = sess.dir
+	}
+	ch, execErr := w.opt.Runtime.Execute(ctx, rtTask)
 	if execErr != nil {
 		w.reportFail(task.ID, fmt.Sprintf("执行体启动失败: %v", execErr))
 		return
@@ -323,7 +373,21 @@ drain:
 		}
 		w.reportFail(task.ID, reason)
 	default:
+		// 产物交付 (git 档 commit/push、pvc 档写回执) 必须在回报成功**之前**完成:
+		// 交不出去的产出等于没产出, 下一阶段照样看不到 —— 那正是要挡的静默成功。
+		wsRep, wsErr := sess.finish(true)
+		if wsErr != nil {
+			w.reportFail(task.ID, fmt.Sprintf("执行体已完成但工作区交付失败: %v", wsErr))
+			return
+		}
 		res := NewStageResult(w.opt.Name, out, time.Since(start).Milliseconds())
+		if wsRep != (WorkspaceReport{}) {
+			r := wsRep
+			res.Workspace = &r
+			if r.Note != "" {
+				w.opt.Logf("[worker] 任务 %s 工作区: %s", task.ID, r.Note)
+			}
+		}
 		if err := w.cli.complete(task.ID, res); err != nil {
 			// 回报失败 = 控制面不知道我们成功了。任务会停在 leased 直到租约过期
 			// 被判失败 (fail-closed): 图层随后重跑该节点。
@@ -352,13 +416,16 @@ func (w *Worker) bump(ok bool) {
 	w.mu.Unlock()
 }
 
-// checkWorkspace 工作区可提供性检查。
+// checkWorkspace 工作区**路径**可提供性检查 (local/pvc 两档共用的第一道闸)。
 //
 // 为什么必须 fail-closed: 产码类节点的产出是文件, 编译门禁在 <cwd>/go.mod 上跑。
 // 若任务要求 /srv/teams/foo 而本 worker 只有 /home/x, 静默在 /home/x 里跑会得到
 // "阶段成功但下一阶段找不到上一阶段的代码"——这类故障极难归因。
-// design/02 §3.3 的 cwd 三档位 (local/pvc/git) 尚未实现, 所以这里只做"能不能提供"
-// 的判定: 一致才跑, 不一致就诚实失败。
+//
+// ⚠️ 它只证明"路径字符串相同", **不证明是同一份数据** (两个 Pod 各挂一个 emptyDir
+// 到 /workspace 也会双双通过)。所以 pvc 档在它之上再做卷身份 + 握手文件校验
+// (见 workspace.go preparePVC), git 档则完全不比路径 —— 身份是 (remote, branch)。
+// 本函数保持原样未动: 三档位建在它之上, 不替换它。
 func (w *Worker) checkWorkspace(want string) error {
 	want = strings.TrimSpace(want)
 	if want == "" {

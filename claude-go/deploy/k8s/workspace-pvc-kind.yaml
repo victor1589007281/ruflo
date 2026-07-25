@@ -1,0 +1,43 @@
+# 单节点集群 (kind/minikube) 的团队工作区卷 —— pvc 档位 (design/02 §3.3) 的替代方案。
+#
+# 为什么需要这个文件: distributed.yaml 里的 claude-go-teams 声明 ReadWriteMany, 而
+# kind 默认的 local-path provisioner **拒绝 RWX**:
+#   ProvisioningFailed: NodePath only supports ReadWriteOnce and ReadWriteOncePod (1.22+)
+# 结果是 PVC 永远 Pending、Pod 卡在 FailedScheduling —— 不换掉它, pvc 档在 kind 上
+# 一步都跑不起来。
+#
+# 用法 (替代 distributed.yaml 里的 PVC):
+#   kubectl apply -f deploy/k8s/workspace-pvc-kind.yaml     # 先建 PV+PVC
+#   kubectl apply -f deploy/k8s/distributed.yaml            # PVC 已存在, 原样复用
+#
+# ⚠️ **只对单节点集群成立**。hostPath 是"每个节点各自的本地目录": 多节点集群上,
+# 落在不同节点的控制面与 worker 会看到**同名路径下的不同数据** —— 那正是 pvc 档
+# 每个任务都做握手校验要挡的情况 (worker 读不到控制面写的 .control 文件 → 阶段
+# 诚实失败, 而不是在错误的目录里产码)。多节点请用真 RWX 存储类或 git 档位。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: claude-go-teams-hostpath
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  # storageClassName 留空 = 不走任何 provisioner, 由下面的 PVC 直接按名字绑定。
+  storageClassName: ""
+  hostPath:
+    path: /var/lib/claude-go/teams
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-go-teams
+  namespace: claude-go
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: ""
+  volumeName: claude-go-teams-hostpath
+  resources:
+    requests:
+      storage: 5Gi

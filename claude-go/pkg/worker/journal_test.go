@@ -75,7 +75,7 @@ func TestJournal_远程节点产出进journal(t *testing.T) {
 	defer j.Close()
 
 	// 放置策略钉住远程 worker: 全部节点都在另一个"进程"里跑。
-	runner := &factoryNodeRunner{f: RuntimeFactory(tc.rr, &agent.Placement{Prefer: "remote:w1", Require: []string{CapBash}})}
+	runner := &factoryNodeRunner{f: RuntimeFactory(tc.rr, &agent.Placement{Prefer: "remote:w1", Require: []string{CapBash}}, nil)}
 	eng := &graph.Engine{Runner: runner, Journal: j}
 	res, err := eng.Run(context.Background(), twoNodeSpec(), graph.RunOpts{RunID: "run-1", Objective: "做个东西"})
 	if err != nil {
@@ -137,7 +137,7 @@ func TestJournal_resume命中远程节点缓存(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := &factoryNodeRunner{f: RuntimeFactory(tc.rr, &agent.Placement{Prefer: "remote:w1"})}
+	runner := &factoryNodeRunner{f: RuntimeFactory(tc.rr, &agent.Placement{Prefer: "remote:w1"}, nil)}
 	eng := &graph.Engine{Runner: runner, Journal: j}
 	res, err := eng.Run(context.Background(), twoNodeSpec(), graph.RunOpts{RunID: "run-1", Objective: "x"})
 	if err != nil {
@@ -164,7 +164,7 @@ func TestJournal_resume命中远程节点缓存(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer j2.Close()
-	runner2 := &factoryNodeRunner{f: RuntimeFactory(tc2.rr, &agent.Placement{Prefer: "remote:w2"})}
+	runner2 := &factoryNodeRunner{f: RuntimeFactory(tc2.rr, &agent.Placement{Prefer: "remote:w2"}, nil)}
 	eng2 := &graph.Engine{Runner: runner2, Journal: j2}
 	res2, err := eng2.Run(context.Background(), twoNodeSpec(),
 		graph.RunOpts{RunID: "run-1", Objective: "x", Resume: true})

@@ -1,0 +1,26 @@
+# 团队工作区卷 —— pvc 档位 (design/02 §3.3) 的标准版本: 真 RWX 存储类。
+#
+# distributed.yaml 里的控制面与 worker 都把它挂到 /workspace 并把 cwd 设成那里:
+# 编译门禁跑在控制面的 <team.Cwd>/go.mod 上, 两边不是同一份数据, 远程产码就永远
+# 编译不到 (design/02 §六 风险④)。
+#
+# 用法:
+#   kubectl apply -f deploy/k8s/workspace-pvc.yaml
+#   kubectl apply -f deploy/k8s/distributed.yaml
+#
+# storageClassName 留给集群默认类。默认类不支持 RWX 时 PVC 会一直 Pending
+# (kind 的 local-path 就会直接报 "NodePath only supports ReadWriteOnce"), 此时:
+#   - 显式填一个真 RWX 的类 (nfs-client / cephfs / longhorn / efs-sc ...);
+#   - 或单节点集群改用 workspace-pvc-kind.yaml;
+#   - 或干脆换 git 档位 —— 那一档不需要共享存储。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-go-teams
+  namespace: claude-go
+spec:
+  accessModes: ["ReadWriteMany"]
+  # storageClassName: nfs-client   # ← 按集群实际的 RWX 存储类填
+  resources:
+    requests:
+      storage: 5Gi

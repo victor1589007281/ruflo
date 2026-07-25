@@ -23,13 +23,16 @@ package worker
 //     漂移的 prompt 组装逻辑。
 //  3. **pkg/graph 零改动**。
 //
-// # 放置策略从哪来 (诚实说明)
+// # 放置策略从哪来
 //
-// design/01 §4.9 设想 `NodeSpec.Agent.Placement`, 但 `graph.AgentSpec` 目前**没有**
-// 这个字段 (spec.go:197), `NodeExecHints` 也不携带它 —— 所以**逐节点**放置声明
-// 现在无法从图规格传到这里。本文件退一步: 取进程级默认 Placement (由部署方注入),
-// 并在 Affinity 非空时用团队名补 AffinityKey (团队亲和是真的, 逐节点约束不是)。
-// 补齐所需的改动见 report 的"需要接的线"。
+// 两级, 逐字段合并 (细节与论证见 runtimeRunner.Placement 的注释):
+//
+//	进程级默认 (RuntimeFactory 的 def 参数, 由部署方经 --placement-prefer 注入)
+//	  ← 逐字段被 **节点级声明** 覆盖
+//	    graph.AgentSpec.Placement → NodeExecHints.Placement → 这里
+//
+// 于是"需要 browser 的那个节点去 browser 池"是可表达的 (design/01 §4.9 逐节点放置)。
+// Affinity 非空且分组键为空时用团队名补 AffinityKey。
 
 import (
 	"context"
@@ -46,10 +49,19 @@ import (
 // 与改造前行为一致)。注意 Prefer 是**软**偏好: 本地 runtime 未注册时, Pick 仍会
 // 选中远程 worker; 反之远程全部掉线时会落回本地。硬约束 (Require) 不满足则
 // Pick 返回 ErrNoRuntime, 这里**直接失败**——不许悄悄降级到能力不足的 runtime。
-func RuntimeFactory(reg agent.RuntimeRegistry, def *agent.Placement) agent.CreateAgentFunc {
+//
+// ws 为 cwd 档位策略 (见 workspace.go), 与 Broker 用同一个实例。
+// nil / Mode 空 ⇒ **任务不带工作区声明**, 与改造前一字不变。
+// 非空时工厂会把团队 cwd (RunMetadata.Cwd) 填进 RuntimeNodeTask.Workspace ——
+// 这是控制面"代码该落在哪"这句话第一次真的说出口 (改造前这个字段从来没人填,
+// 于是远程 worker 一律在自己的目录里产码, 控制面的编译门禁什么都看不见)。
+func RuntimeFactory(reg agent.RuntimeRegistry, def *agent.Placement, ws *WorkspacePolicy) agent.CreateAgentFunc {
 	return func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
 		if reg == nil {
 			return nil, fmt.Errorf("worker: RuntimeFactory 未注入 RuntimeRegistry")
+		}
+		if err := ws.Validate(); err != nil {
+			return nil, err
 		}
 		if ctx == nil {
 			ctx = context.Background()
@@ -64,6 +76,7 @@ func RuntimeFactory(reg agent.RuntimeRegistry, def *agent.Placement) agent.Creat
 			ids:          trace.From(ctx),
 			meta:         agent.RunMetadataFromContext(ctx),
 			def:          def,
+			ws:           ws,
 		}, nil
 	}
 }
@@ -77,15 +90,46 @@ type runtimeRunner struct {
 	ids          trace.IDs
 	meta         agent.RunMetadata
 	def          *agent.Placement
+	ws           *WorkspacePolicy
 }
 
 // Placement 求解本次执行的放置策略 (导出给测试断言 AffinityKey 的补全)。
+//
+// 优先级: **节点声明 (hints.Placement) 逐字段压过进程级默认 (r.def)**。
+//
+// 为什么是逐字段合并而不是"节点声明了就整份替换"(后者更直觉):
+// 进程级默认里的 Affinity:"team" 是产码工作流的命脉 —— 同团队节点必须落同一
+// runtime 才共享 cwd, 否则上一阶段写的代码在下一阶段消失 (编译门禁在 <cwd>/go.mod
+// 上跑)。一个只想声明 `require:["browser"]` 的渲染节点若因此丢掉团队亲和, 就会被
+// 派到另一台机器的另一个工作区, 症状是"渲染节点看不见前面生成的 HTML", 而作者
+// 完全不会想到是自己那行 require 造成的。所以: 节点没提的字段一律继承默认,
+// 提了的字段 (含显式关掉亲和写 affinity:"") 才覆盖。
 func (r *runtimeRunner) Placement() *agent.Placement {
-	if r.def == nil {
+	var p agent.Placement
+	switch {
+	case r.def != nil:
+		p = *r.def // 值拷贝: 绝不能就地改调用方的默认策略 (它被所有节点共享)
+	case r.hints.Placement != nil:
+		// 有节点声明但无进程级默认: 不再补 Prefer:"local" —— 节点显式声明了约束,
+		// 替它塞一个本地偏好等于悄悄改它的放置。
+	default:
 		// 默认偏好本地: 未显式声明放置的节点行为与改造前一致。
 		return &agent.Placement{Prefer: "local"}
 	}
-	p := *r.def // 值拷贝: 绝不能就地改调用方的默认策略 (它被所有节点共享)
+	if h := r.hints.Placement; h != nil {
+		if len(h.Require) > 0 {
+			// 硬约束整份替换: 与默认求并集会让"节点想放宽"变成"节点想加严", 而
+			// Require 是 fail-closed 的 —— 多一条不满足的标签直接让节点无处可跑。
+			p.Require = append([]string(nil), h.Require...)
+		}
+		if h.Prefer != "" {
+			p.Prefer = h.Prefer
+		}
+		if h.Affinity != "" {
+			p.Affinity = h.Affinity
+			p.AffinityKey = h.AffinityKey // 亲和与分组键成对覆盖, 否则会拿旧键去配新口径
+		}
+	}
 	if p.Affinity != "" && p.AffinityKey == "" {
 		// 团队亲和的分组键: 团队名。产码工作流靠它把同团队节点钉在同一 cwd。
 		if k := strings.TrimSpace(r.meta.Team); k != "" {
@@ -139,6 +183,12 @@ func (r *runtimeRunner) Execute(ctx context.Context, userPrompt string) (string,
 		ToolProfile:  r.hints.ToolProfile,
 		MaxTurns:     r.hints.MaxTurns,
 		Placement:    p,
+	}
+	// cwd 档位启用时才声明工作区 (未启用 ⇒ 字段留空 ⇒ worker 侧走原来那条判定)。
+	// 这里填的是**控制面的团队 cwd**: local/pvc 档要求 worker 提供同一路径,
+	// git 档把它作为控制面侧的同步落点 (编译门禁就在那里跑)。
+	if r.ws.Enabled() {
+		task.Workspace = strings.TrimSpace(r.meta.Cwd)
 	}
 
 	// hints/trace 回填 ctx: 命中**本地** runtime 时, 它会把这个 ctx 直接交给宿主

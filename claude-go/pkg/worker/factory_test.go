@@ -43,7 +43,7 @@ func (r *recordRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 func TestRuntimeFactory_放置无解必须失败(t *testing.T) {
 	reg := agent.NewRuntimeRegistry()
 	reg.Register(&recordRuntime{name: "local-a", caps: agent.RuntimeCaps{}}, 0)
-	f := RuntimeFactory(reg, &agent.Placement{Require: []string{"gpu"}})
+	f := RuntimeFactory(reg, &agent.Placement{Require: []string{"gpu"}}, nil)
 	runner, err := f(context.Background(), "coder", "")
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestRuntimeFactory_放置无解必须失败(t *testing.T) {
 		t.Errorf("错误信息应带上未满足的约束: %v", err)
 	}
 	// 未注入注册表时也必须报错而不是空跑。
-	if _, err := RuntimeFactory(nil, nil)(context.Background(), "coder", ""); err == nil {
+	if _, err := RuntimeFactory(nil, nil, nil)(context.Background(), "coder", ""); err == nil {
 		t.Error("未注入 RuntimeRegistry 应报错")
 	}
 }
@@ -74,7 +74,7 @@ func TestRuntimeFactory_节点声明与trace下传(t *testing.T) {
 	})
 	ctx = trace.With(ctx, trace.IDs{RunID: "run-x", NodeID: "impl"})
 
-	f := RuntimeFactory(reg, &agent.Placement{Prefer: "remote:remote-w1"})
+	f := RuntimeFactory(reg, &agent.Placement{Prefer: "remote:remote-w1"}, nil)
 	runner, err := f(ctx, "coder", "系统提示词")
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestRuntimeFactory_团队亲和补全分组键(t *testing.T) {
 	def := &agent.Placement{Affinity: "team", Prefer: "any"}
 
 	ctx := agent.WithRunMetadata(context.Background(), agent.RunMetadata{Team: "trading-v2"})
-	runner, err := RuntimeFactory(reg, def)(ctx, "coder", "")
+	runner, err := RuntimeFactory(reg, def, nil)(ctx, "coder", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestRuntimeFactory_团队亲和补全分组键(t *testing.T) {
 		t.Errorf("默认放置策略被就地修改了: %+v", def)
 	}
 	// 没有任何分组键时必须关掉亲和 —— 否则所有团队共用一条亲和记录, 反而互相钉住。
-	runner2, _ := RuntimeFactory(reg, def)(context.Background(), "coder", "")
+	runner2, _ := RuntimeFactory(reg, def, nil)(context.Background(), "coder", "")
 	if p := runner2.(*runtimeRunner).Placement(); p.Affinity != "" {
 		t.Errorf("无分组键时应关掉亲和, 实得 %+v", p)
 	}
@@ -146,7 +146,7 @@ func TestRuntimeFactory_默认偏好本地(t *testing.T) {
 	reg.Register(local, 0)
 	reg.Register(remote, 0)
 
-	runner, err := RuntimeFactory(reg, nil)(context.Background(), "coder", "")
+	runner, err := RuntimeFactory(reg, nil, nil)(context.Background(), "coder", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestRuntimeFactory_失败归约为error(t *testing.T) {
 	rec := &recordRuntime{name: "w1", caps: agent.RuntimeCaps{}, err: errors.New("worker 掉线")}
 	reg := agent.NewRuntimeRegistry()
 	reg.Register(rec, 0)
-	runner, err := RuntimeFactory(reg, &agent.Placement{})(context.Background(), "coder", "")
+	runner, err := RuntimeFactory(reg, &agent.Placement{}, nil)(context.Background(), "coder", "")
 	if err != nil {
 		t.Fatal(err)
 	}

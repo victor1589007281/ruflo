@@ -11,6 +11,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,11 +35,12 @@ type testControl struct {
 }
 
 type controlOpts struct {
-	taskLease   time.Duration // 队列租约, 0 → 5s
-	workerLease time.Duration // worker 注册表租约, 0 → 5s
-	grace       time.Duration // 掉线宽限期, 0 → 5s
-	poll        time.Duration // 控制面轮询队列间隔, 0 → 5ms
-	authSecret  string        // 非空 → 控制面按 httpauth 保护 /cluster/*
+	taskLease   time.Duration    // 队列租约, 0 → 5s
+	workerLease time.Duration    // worker 注册表租约, 0 → 5s
+	grace       time.Duration    // 掉线宽限期, 0 → 5s
+	poll        time.Duration    // 控制面轮询队列间隔, 0 → 5ms
+	authSecret  string           // 非空 → 控制面按 httpauth 保护 /cluster/*
+	ws          *WorkspacePolicy // cwd 档位策略, nil = 不启用 (默认)
 }
 
 func newTestControl(t *testing.T, o controlOpts) *testControl {
@@ -55,7 +61,7 @@ func newTestControl(t *testing.T, o controlOpts) *testControl {
 	q := cluster.NewQueue(ss, o.taskLease)
 	reg := cluster.NewRegistry(ss, o.workerLease)
 	brk, err := NewBroker(BrokerOptions{
-		Queue: q, Registry: reg,
+		Queue: q, Registry: reg, Workspace: o.ws,
 		PollInterval: o.poll, DeadWorkerGrace: o.grace,
 		Logf: func(f string, a ...any) { t.Logf("[broker] "+f, a...) },
 	})
@@ -226,6 +232,122 @@ func clusterWorker(name string, caps []string) cluster.WorkerInfo {
 
 func clusterWorkerKinds(name string, caps, kinds []string) cluster.WorkerInfo {
 	return cluster.WorkerInfo{Name: name, Caps: caps, Kinds: kinds}
+}
+
+// fileWriterRuntime 一个"会产码"的执行体: 把 files 写进**任务声明的工作目录**。
+//
+// 为什么直接读 task.Workspace 而不像 echoRuntime 那样走 localRuntime: 三档位要验的
+// 恰恰是"worker 把执行放在了哪个目录"。生产里这个目录由 worker 进程级 cwd 决定
+// (工具的执行根), 测试里用 task.Workspace 断言 worker 算出来的目录是对的 ——
+// 若 worker 把控制面的路径而不是本机检出目录传下来, 这些测试会立刻红。
+type fileWriterRuntime struct {
+	files   map[string]string
+	out     string
+	calls   int32
+	failMsg string
+	// check 写文件之前对工作目录的断言 (如"上一阶段的代码在不在")。
+	// 返回错误 ⇒ 阶段失败 —— 与生产症状一致: 看不到上游代码的阶段本就该失败。
+	check func(dir string) error
+	// after 写完文件之后的动作 (模拟真 Agent 用 Bash 干的事: 自己 git commit、切分支…)。
+	after func(dir string) error
+	// gate 执行到一半时的同步点 (并发冲突测试用): 非 nil 则在写完文件后等它。
+	gate chan struct{}
+	// started 收到任务时关闭 (并发编排用)。
+	started chan struct{}
+}
+
+func (f *fileWriterRuntime) Name() string                    { return "local-writer" }
+func (f *fileWriterRuntime) Capabilities() agent.RuntimeCaps { return agent.RuntimeCaps{Bash: true} }
+func (f *fileWriterRuntime) Cancel(string, string) error     { return nil }
+func (f *fileWriterRuntime) Execute(_ context.Context, task agent.RuntimeNodeTask) (<-chan agent.NodeEvent, error) {
+	atomic.AddInt32(&f.calls, 1)
+	ch := make(chan agent.NodeEvent, 3)
+	go func() {
+		defer close(ch)
+		ch <- agent.NodeEvent{Kind: agent.NodeEventStarted, RunID: task.RunID, NodeID: task.NodeID}
+		if f.started != nil {
+			close(f.started)
+		}
+		if f.failMsg != "" {
+			ch <- agent.NodeEvent{Kind: agent.NodeEventFailed, RunID: task.RunID, NodeID: task.NodeID, Err: f.failMsg}
+			return
+		}
+		if f.check != nil {
+			if err := f.check(task.Workspace); err != nil {
+				ch <- agent.NodeEvent{Kind: agent.NodeEventFailed, RunID: task.RunID, NodeID: task.NodeID,
+					Err: "工作区自检失败: " + err.Error()}
+				return
+			}
+		}
+		for name, body := range f.files {
+			p := filepath.Join(task.Workspace, name)
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				ch <- agent.NodeEvent{Kind: agent.NodeEventFailed, Err: err.Error()}
+				return
+			}
+			if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+				ch <- agent.NodeEvent{Kind: agent.NodeEventFailed, Err: err.Error()}
+				return
+			}
+		}
+		if f.after != nil {
+			if err := f.after(task.Workspace); err != nil {
+				ch <- agent.NodeEvent{Kind: agent.NodeEventFailed, RunID: task.RunID, NodeID: task.NodeID,
+					Err: "after 钩子失败: " + err.Error()}
+				return
+			}
+		}
+		if f.gate != nil {
+			<-f.gate // 卡在这里, 让另一个 worker 先把它的提交推上去
+		}
+		out := f.out
+		if out == "" {
+			out = "已写入 " + strconv.Itoa(len(f.files)) + " 个文件"
+		}
+		ch <- agent.NodeEvent{Kind: agent.NodeEventDone, RunID: task.RunID, NodeID: task.NodeID, Output: out}
+	}()
+	return ch, nil
+}
+
+func (f *fileWriterRuntime) called() int { return int(atomic.LoadInt32(&f.calls)) }
+
+// git 测试脚手架 ─────────────────────────────────────────────────────────────
+
+// newBareRepo 造一个真的裸仓当"约定 git 位置"。
+func newBareRepo(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "remote.git")
+	if out, err := gitCmd(context.Background(), "", 30*time.Second, "init", "--bare", "-q", dir); err != nil {
+		t.Fatalf("git init --bare: %v %s", err, out)
+	}
+	return dir
+}
+
+// gitOut 在 dir 里跑一条 git 命令并返回输出 (断言用)。
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := gitCmd(context.Background(), dir, 60*time.Second, args...)
+	if err != nil {
+		t.Fatalf("git %v 失败: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(out)
+}
+
+// gitLsTree 裸仓某分支上的文件清单。
+func gitLsTree(t *testing.T, bare, branch string) []string {
+	t.Helper()
+	out := gitOut(t, bare, "ls-tree", "-r", "--name-only", branch)
+	return splitLines(out)
+}
+
+// emptyDir t.TempDir() 下的一个空子目录 (git 档要求 worker 工作区为空或已是仓库)。
+func emptyDir(t *testing.T, name string) string {
+	t.Helper()
+	d := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return d
 }
 
 func mustJSON(t *testing.T, v any) json.RawMessage {

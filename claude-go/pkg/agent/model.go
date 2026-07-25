@@ -25,6 +25,14 @@ type RunMetadata struct {
 	Role     string
 	Team     string
 	Stage    string
+	// Cwd 本次执行所属团队的工作目录 (team.Cwd)。
+	//
+	// 为什么账本结构体里要有它: 放置感知的执行工厂 (pkg/worker.RuntimeFactory) 需要
+	// 知道"代码该落在哪"才能给远程 worker 下发工作区声明 —— 编译门禁跑在
+	// <team.Cwd>/go.mod 上 (teams.go:1091,1105), 这是唯一能把它传到工厂的既有通道
+	// (CreateAgentFunc 的签名是 (ctx, role, systemPrompt), 团队对象传不进去)。
+	// 空 = 不是团队阶段 / 未配置 cwd, 此时工作区档位不启用。
+	Cwd string
 }
 
 // WithRunMetadata 将团队运行标签写入 context。

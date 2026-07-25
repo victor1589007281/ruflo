@@ -87,6 +87,23 @@ type StageTask struct {
 	NodeKind     string   `json:"node_kind,omitempty"` // 节点形态 (agent/gate/...), 供 worker 侧 hints
 	Iteration    int      `json:"iteration,omitempty"` // loop 轮次 (0 起)
 	Require      []string `json:"require,omitempty"`   // 硬约束回显, 供 worker 自检
+
+	// ── cwd 档位 (design/02 §3.3, 见 workspace.go) ────────────────────────────
+	// 全空 = 控制面未配置 WorkspacePolicy ⇒ worker 走原来那条判定, 行为不变。
+	//
+	// Workspace 的含义随档位变:
+	//   local/pvc → **要求**: worker 声明的工作区必须是同一路径 (否则拒绝执行)。
+	//   git       → 控制面侧的 team.Cwd (门禁跑的地方); worker 用自己的检出目录,
+	//               身份由 (remote, branch) 而不是路径决定。
+	WorkspaceMode WorkspaceMode `json:"workspace_mode,omitempty"`
+	// WorkspaceVolume pvc 档: 共享卷身份 (worker 必须挂同名卷)。
+	WorkspaceVolume string `json:"workspace_volume,omitempty"`
+	// WorkspaceHandshake pvc 档: 握手令牌 (= 任务 ID)。控制面派任务前已在共享卷上
+	// 写好 <workspace>/.claude-go-ws/<token>.control, worker 读不到就拒绝执行 ——
+	// 这是"两边真的是同一份数据"的唯一证据 (光比路径字符串证明不了)。
+	WorkspaceHandshake string `json:"workspace_handshake,omitempty"`
+	// Git git 档: 约定 git 位置与分支。
+	Git *GitWorkspace `json:"git,omitempty"`
 }
 
 // EncodeStageTask 序列化为任务载荷。
@@ -159,6 +176,9 @@ type StageResult struct {
 	Output    string `json:"output"`
 	Worker    string `json:"worker,omitempty"`
 	ElapsedMS int64  `json:"elapsed_ms,omitempty"`
+	// Workspace 工作区处理的据实回报 (git 档: 推没推、推了哪个提交)。
+	// 控制面据此决定要不要同步/校验, 所以它不是纯观测字段。
+	Workspace *WorkspaceReport `json:"workspace,omitempty"`
 }
 
 // NewStageResult 构造带协议标记的结果。
