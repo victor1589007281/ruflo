@@ -48,12 +48,16 @@ const (
 
 // NodeSpec 节点描述 (design/01 §4.1)。所有 Kind 共享同一 Agent 载体。
 type NodeSpec struct {
-	ID         string       `json:"id"`
-	Kind       NodeKind     `json:"kind"`
-	Agent      AgentSpec    `json:"agent"`
-	Loop       *LoopPolicy  `json:"loop,omitempty"`        // 节点级循环 (§4.4)
-	Retry      *RetryPolicy `json:"retry,omitempty"`       // 唯一一层重试 (§4.3 重试单层化)
-	TimeoutSec int          `json:"timeout_sec,omitempty"` // 0=不限 (由 runner 自己的角色级超时兜底)
+	ID    string       `json:"id"`
+	Kind  NodeKind     `json:"kind"`
+	Agent AgentSpec    `json:"agent"`
+	Loop  *LoopPolicy  `json:"loop,omitempty"`  // 节点级循环 (§4.4)
+	Retry *RetryPolicy `json:"retry,omitempty"` // 唯一一层重试 (§4.3 重试单层化)
+	// TimeoutSec 节点**总预算**(秒), 0=不限 (由 runner 自己的角色级超时兜底)。
+	// 注意作用域: 引擎在 retry 环与 loop 环**之外**施加这个 deadline (engine.go
+	// execNode), 即它包住"全部重试 + 全部循环轮次"的墙钟总时长, 不是单次尝试的
+	// 上限——填单次尝试的超时会让第二次重试必然撞墙。
+	TimeoutSec int `json:"timeout_sec,omitempty"`
 }
 
 // AgentSpec 节点的 Agent 载体 (design/01 §4.1)。

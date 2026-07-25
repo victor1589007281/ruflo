@@ -160,7 +160,8 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 	}
 
 	appendEv(EvRunCreated, "", map[string]any{"graph": spec.Name, "objective": opts.Objective, "resume": opts.Resume})
-	hooks.Emit(ctx, HookEvent{Scope: ScopeGraph, Phase: "pre", RunID: runID})
+	hooks.Emit(ctx, HookEvent{Scope: ScopeGraph, Phase: "pre", RunID: runID,
+		Payload: map[string]any{"graph": spec.Name, "nodes": len(spec.Nodes), "resume": opts.Resume}})
 
 	// —— 2/3. ready-set 调度主循环 ——
 	results := make(chan doneMsg)
@@ -274,7 +275,8 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 		status = RunStatusFailed
 	}
 	appendEv(EvRunFinished, "", map[string]any{"status": status})
-	hooks.Emit(ctx, HookEvent{Scope: ScopeGraph, Phase: "post", RunID: runID, Payload: map[string]any{"status": status}})
+	hooks.Emit(ctx, HookEvent{Scope: ScopeGraph, Phase: "post", RunID: runID,
+		Payload: map[string]any{"graph": spec.Name, "status": status, "completed": nCompleted, "other": nOther}})
 
 	jmu.Lock()
 	retErr := errors.Join(jerrs...)
@@ -289,7 +291,10 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 // hook pre (deny→skipped) → retry 环内嵌 loop 环 → journal 终态 + hook post/failure。
 func (e *Engine) execNode(ctx context.Context, spec GraphSpec, node NodeSpec, in NodeInput, hooks HookBus, appendEv evAppender, runID string) NodeResult {
 	// node pre hook: deny 则该节点 skipped 且记 journal node.skipped, reason 入 Data (§4.5)。
-	dec := hooks.Emit(ctx, HookEvent{Scope: ScopeNode, Phase: "pre", RunID: runID, NodeID: node.ID})
+	// Payload 带节点静态信息: 桥接方 (如 pkg/agent 的 teamGraphHooks) 据此立刻落一条
+	// "运行中" 占位记录, 无需自己再查 spec。
+	dec := hooks.Emit(ctx, HookEvent{Scope: ScopeNode, Phase: "pre", RunID: runID, NodeID: node.ID,
+		Payload: map[string]any{"kind": string(node.Kind), "role": node.Agent.Role}})
 	if dec.Action == HookDeny {
 		appendEv(EvNodeSkipped, node.ID, map[string]any{"reason": dec.Reason, "denied_by": "hook"})
 		return NodeResult{Status: NodeStatusSkipped, Err: dec.Reason}
@@ -304,6 +309,7 @@ func (e *Engine) execNode(ctx context.Context, spec GraphSpec, node NodeSpec, in
 	}
 
 	appendEv(EvNodeStarted, node.ID, nil)
+	started := time.Now()
 
 	// 语义4: retry 环 (外)。节点未声明 Retry 时回退图级 DefaultRetry。
 	retry := node.Retry
@@ -317,9 +323,15 @@ func (e *Engine) execNode(ctx context.Context, spec GraphSpec, node NodeSpec, in
 			backoff = retry.BackoffSec
 		}
 	}
-	var res NodeResult
+	var (
+		res      NodeResult
+		attempts int // 实际尝试次数 (1 起)
+		iters    int // 全部尝试累计的 loop 轮数 (无 Loop 时 = attempts)
+	)
 	for attempt := 0; ; attempt++ {
-		res = e.runLoop(nctx, node, in, appendEv)
+		var loopRuns int
+		res, loopRuns = e.runLoop(nctx, node, in, appendEv)
+		attempts, iters = attempt+1, iters+loopRuns
 		if res.Status != NodeStatusFailed || attempt >= maxRetries {
 			break
 		}
@@ -330,15 +342,33 @@ func (e *Engine) execNode(ctx context.Context, spec GraphSpec, node NodeSpec, in
 		}
 	}
 
+	// termPayload 终态 hook 载荷。hook 是唯一"节点刚结束"的同步时机, 桥接方要靠它
+	// 落业务侧的阶段记录与指标 (耗时/重试/产出长度), 所以这里给全: 否则桥接方只能
+	// 回头去解 journal, 既慢又拿不到与本次运行一一对应的耗时。
+	termPayload := func(r NodeResult) map[string]any {
+		return map[string]any{
+			"kind":        string(node.Kind),
+			"role":        node.Agent.Role,
+			"status":      r.Status,
+			"score":       r.Score,
+			"output":      r.Output,
+			"output_len":  len(r.Output),
+			"error":       r.Err,
+			"attempts":    attempts,
+			"iterations":  iters,
+			"duration_ms": time.Since(started).Milliseconds(),
+		}
+	}
+
 	switch res.Status {
 	case NodeStatusCompleted:
 		appendEv(EvNodeCompleted, node.ID, map[string]any{"output": res.Output, "score": res.Score})
 		hooks.Emit(nctx, HookEvent{Scope: ScopeNode, Phase: "post", RunID: runID, NodeID: node.ID,
-			Payload: map[string]any{"score": res.Score}})
+			Payload: termPayload(res)})
 	case NodeStatusFailed:
 		appendEv(EvNodeFailed, node.ID, map[string]any{"error": res.Err})
 		hooks.Emit(nctx, HookEvent{Scope: ScopeNode, Phase: "failure", RunID: runID, NodeID: node.ID,
-			Payload: map[string]any{"error": res.Err}})
+			Payload: termPayload(res)})
 	case NodeStatusSkipped: // runner 主动跳过
 		appendEv(EvNodeSkipped, node.ID, map[string]any{"reason": res.Err, "by": "runner"})
 	default: // 防御性归一: runner 返回未知状态按 failed 处理
@@ -346,7 +376,7 @@ func (e *Engine) execNode(ctx context.Context, spec GraphSpec, node NodeSpec, in
 			Err: fmt.Sprintf("runner 返回未知状态 %q", res.Status)}
 		appendEv(EvNodeFailed, node.ID, map[string]any{"error": res.Err})
 		hooks.Emit(nctx, HookEvent{Scope: ScopeNode, Phase: "failure", RunID: runID, NodeID: node.ID,
-			Payload: map[string]any{"error": res.Err}})
+			Payload: termPayload(res)})
 	}
 	return res
 }
@@ -354,15 +384,17 @@ func (e *Engine) execNode(ctx context.Context, spec GraphSpec, node NodeSpec, in
 // runLoop loop 环 (design/01 §4.4): 先跑一次; 若声明 Loop, 在 Until 满足或达到
 // MaxIterations 硬上限前, 以 Feedback 模板 ({prev_output} 替换为上一轮 Output)
 // 回灌重跑, 每轮记 journal loop.iteration。
+// 第二个返回值 = 本次实际执行的轮数 (≥1), 供 execNode 汇总进 hook 载荷。
 // v1 决策: 循环不区分轮次成败 (失败轮的产出照样回灌), 最终仍 failed 时由外层
 // retry 环接管; Until 为空 = 无退出条件, 只受 MaxIterations 约束
 // (注意: 空串对 ParseCondition 是恒真, 但在 Until 语境下语义是"不设条件", 故特判)。
-func (e *Engine) runLoop(ctx context.Context, node NodeSpec, in NodeInput, appendEv evAppender) NodeResult {
+func (e *Engine) runLoop(ctx context.Context, node NodeSpec, in NodeInput, appendEv evAppender) (NodeResult, int) {
 	in.Iteration = 0
 	in.Feedback = ""
 	res := e.Runner.RunNode(ctx, node, in)
+	runs := 1
 	if node.Loop == nil {
-		return res
+		return res, runs
 	}
 	hasUntil := node.Loop.Until != ""
 	until, _ := ParseCondition(node.Loop.Until) // Validate 已保证语法
@@ -377,8 +409,9 @@ func (e *Engine) runLoop(ctx context.Context, node NodeSpec, in NodeInput, appen
 		in.Iteration = iter
 		in.Feedback = replacePrevOutput(node.Loop.Feedback, res.Output)
 		res = e.Runner.RunNode(ctx, node, in)
+		runs++
 	}
-	return res
+	return res, runs
 }
 
 // replacePrevOutput 替换 Feedback 模板中的 {prev_output} 占位。
