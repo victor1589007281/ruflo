@@ -5,6 +5,25 @@
 
 ---
 
+> ## ⚠️ 实现状态核查（2026-07-25）
+>
+> 本文件是**设计稿**，不是状态报告。下方每个小节已按当前代码（HEAD `9697f13c0`）标注实测状态。
+> 独立核查方法：不采信 `PROGRESS.md` 的自评，逐条到代码追调用链；每条论断带 `file:line`。
+>
+> **图例**：✅ 已实现且生产接线 · 🟠 部分实现 · 🟡 已建成未通电（代码完整但生产零调用）· ❌ 未实现 · 📄 文档失真（实现成了别的样子或描述已过期）
+>
+> **关键前提**：区分「写了」「通电」「部署」三层。本目录全部实现落在 2026-07-24/25，而线上二进制构建于 07-17 ——
+> **截至核查时一行都未上生产**（305 个团队目录中 0 个有 `graph-journal`，`~/.claude-go/statestore` 目录不存在）。
+>
+> **总体判定：≈20% 实现**（分母 = §4 的 12 个核心抽象 + §5 的 15 个 mode 模板 + §6 的 26 行覆盖矩阵 = 53 条，加权 10.5）。
+> 分段：§4 ≈15%（只有 4.2 的 DAG 调度与 4.3 的 Journal 重放真正生产接线）· §5 = **0/15**（图模板库目录都不存在）· §6 ≈17%（26 行里真达成 1 行）。
+> 按里程碑：M0 ≈95% · M1 ≈70% · M2 ≈12% · M3 ≈4% · M4 = 0%。
+>
+> **一句话**：已完成的绝大部分是 M0 的「止血 + 清理」与 M1 的「内核骨架」，而不是本文的目标架构。
+> `pkg/graph` 内核质量不错且真实 LLM E2E 通过，但**生产零流量**：无内置工作流声明 `Mode:"graph"`，37 个线上动态工作流无一使用，灰度开关 `CLAUDE_GO_GRAPH_ENGINE` 未设。
+>
+> 逐条依据与改判清单见 [PROGRESS.md](PROGRESS.md) 的「三方独立核查」小节。
+
 ## 一、背景与问题诊断
 
 claude-go 当前的编排能力分散在**三套各自独立的引擎**里，外加两份黑板实现、四处进度状态、三套 hook 机制。功能是全的（30+ 工作流、15 种执行 mode、检查点恢复、watchdog、门禁、refine），但每加一种新 mode 要改多处、每套引擎各写一遍调度/恢复/背压，且已产生真实缺陷。
@@ -17,7 +36,9 @@ claude-go 当前的编排能力分散在**三套各自独立的引擎**里，外
 | WBS DAG 编排器 | `pkg/agent/orchestrator.go`（263KB 巨类，`Execute` 在 `:3997`） | planner 计划→TaskNode DAG→执行 | 停滞恢复/孤儿节点各写一套（`:4016-4030`、`:4055-4083`） |
 | 通用 DAG 引擎 | `pkg/orchestrator/engine.go`（`Run` 在 `:229`） | K8s 风格 Filter→Score→Dispatch | 与前两者职责重叠，`workflow_orchestrated.go:1-24` 注释自认"两套调度系统" |
 
-### 1.2 已知缺陷清单（重构靶点，均有 file:line）
+### 1.2 已知缺陷清单（重构靶点，均有 file:line）　　**[✅ 已作为靶点修复（部分）]**
+
+> **实测**：双 mode switch 已收敛为 `dedicatedExecutorModes` 单一真源（`pkg/agent/workflow.go:72-89` + `coordinator.go:200`，含守护测试）；嵌套重试已加硬上限。其余缺陷见各节。
 
 1. **双 mode switch 不同步**：`Coordinator.RunWithRecovery`（`coordinator.go:195-221`）与 `WorkflowExecutor.Execute`（`workflow.go:347-380`）各维护一份模式表。`app_composite` / `game_composite` / `fanout` 只在后者有专用执行器（`workflow_app_composite.go:84`、`workflow_game_composite.go:78`），在前者落 default → `runPipelineWithRecovery`（`coordinator.go:218`），**专用跨团队编排被静默降级为普通 pipeline**。历史上加 plot-simulate/plot-predict 也踩过同一坑（两处都要加）。
 2. **黑板双实现**：`pkg/agent/blackboard.go` 与 `pkg/orchestrator/blackboard.go`，orchestrated 模式要跨两者手工同步（`workflow_orchestrated.go:365-373`）。
@@ -30,7 +51,9 @@ claude-go 当前的编排能力分散在**三套各自独立的引擎**里，外
 9. **resume 判定脆弱**：`isResume` 仅凭 `Status==failed && Objective 相同`（`teams.go:551`），objective 文本任何差异即丢弃检查点全量重跑。
 10. **subagent 无一等抽象**：subagent = factory 创建的隔离 QueryEngine（`teams.go:158`、`feishu/session.go:807`），无法被编排层看见、约束、计费。
 
-### 1.3 现有能力盘点（新引擎必须全覆盖）
+### 1.3 现有能力盘点（新引擎必须全覆盖）　　**[🟠 见 §6]**
+
+> **实测**：§6 覆盖矩阵 26 行中，真被新架构覆盖的只有 1 行（AllowedTools 双路径收敛，`pkg/engine/runner.go:278`）。
 
 - **工作流**：~30 个静态注册（`workflow.go:104-133`）+ 动态注册 `RegisterWorkflow`（`dynamic_workflow.go:34-42`，拒绝与内置同名）+ dashboard `POST /api/workflows` 与 `workflows/*.json` 目录加载（`feishu/bot.go:494`）。
 - **15 种 mode**：pipeline / fanout / adversarial / adversarial_dev / trading_debate / creative_media / novel_writing / swarm_novel / plot_simulate / plot_predict / ensemble_extract / review_panel / orchestrated / app_composite / game_composite。
@@ -91,7 +114,9 @@ claude-go 当前的编排能力分散在**三套各自独立的引擎**里，外
 
 ## 四、核心抽象
 
-### 4.1 一切皆 AgentNode
+### 4.1 一切皆 AgentNode　　**[🟠 部分（Kind 2/8）]**
+
+> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。`AgentSpec` 的 ToolProfile/MaxTokens/Deterministic 字段存在但**零消费方**——`TranslateWorkflow` 只填 Role/Prompt（`graph_adapter.go:50-53`）。
 
 ```go
 // pkg/graph/spec.go —— 图与节点是纯数据，可 JSON 序列化
@@ -146,7 +171,9 @@ type AgentSpec struct {
 
 gate/router 设 `Deterministic` 时零 LLM 调用——但仍走同一节点生命周期（hook、预算、轨迹），所以进化引擎能看到全部决策点。
 
-### 4.2 Graph：DAG + 条件边 + 动态展开
+### 4.2 Graph：DAG + 条件边 + 动态展开　　**[🟠 DAG ✅ / 条件边 🟡 / 动态展开 ❌]**
+
+> **实测**：ready-set 并行调度真实且生产接线（`pkg/graph/engine.go:183-252`）。条件边实现为**自研极简条件**而非设计写的 CEL（`condition.go:54-111`，仅 ok/fail/score/contains 四类），且 `TranslateWorkflow` 从不产生 Condition ⇒ 生产图全是无条件边。`ExpandSpec` 全仓零代码（仅 2 处注释）。
 
 ```go
 type EdgeSpec struct {
@@ -165,7 +192,9 @@ type EdgeSpec struct {
   - swarm 动态分解（`swarm.go:523`）→ decompose 节点展开分层并行子图。
 - **子图**：`subgraph` 节点引用命名 GraphSpec，参数注入。composite 类 mode 从"专用执行器"降级为普通子图组合——**双 switch 不一致问题从根上消失**（不再存在第二张模式表）。
 
-### 4.3 执行模型：GraphRun + 事件溯源 Journal
+### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 Journal ✅ / 「唯一真源」❌]**
+
+> **实测**：FileJournal + Replay 真实且有零重跑硬证据（`engine_test.go:427-434`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。事件类型 8/16；RunStatus 3 态而非设计的 7 态；`InvalidateFrom` 不存在，refine 仍只删 checkpoints.json。重试单层化**语义反转**：图层 RetryPolicy 生产恒 0 次，内层环仍是唯一生效层。
 
 ```go
 // pkg/graph/run.go
@@ -187,7 +216,9 @@ type GraphRun struct {
 - **重试单层化**：重试只存在于节点 RetryPolicy（引擎执行），瞬态错误判定与限流慢退（base 15s/cap 120s，`coordinator.go:551-576`）收编为内置 RetryClassifier。QueryEngine 内层不再自带无界重试环（`workflow.go:885` 废除）。
 - **watchdog**：图级（进展检测：Journal 尾部 N 分钟无事件即停滞）+ 节点级（activity 心跳）两层，参数沿用 `coordinator.go:155-161`；停滞动作=发 hook 事件+按策略 retry/fail/notify，收编 `orchestrator.go:4055-4083` 的独立实现。
 
-### 4.4 Loop：节点级与组级循环
+### 4.4 Loop：节点级与组级循环　　**[🟡 节点级建成未通电 / 组级 ❌]**
+
+> **实测**：节点级 LoopPolicy 实现完整且有测试（`engine.go:360-382`），但 `TranslateWorkflow` 从不设 Loop、`StageDef` 也无对应字段 ⇒ **生产零产生方**。`loop-group` 被 Validate 显式拒绝。
 
 ```go
 type LoopPolicy struct {
@@ -200,7 +231,9 @@ type LoopPolicy struct {
 
 覆盖：adversarial `Rounds`、content gate 重做环（`teams.go` 内容质量环）、novel-v3 章节循环、refine 多轮、evaluator-optimizer 模式。`loop-group` 容器把"生成→评审"两节点整体循环，即对抗模式的标准化表达。
 
-### 4.5 Hook 总线：三套合一
+### 4.5 Hook 总线：三套合一　　**[🟠 骨架 + 🟡 生产未挂；三套仍并存]**
+
+> **实测**：`HookBus` 骨架存在（`pkg/graph/hooks.go:16-51`，仅 graph/node scope、仅 deny 被解释），但 `executeGraph` 构造 Engine 时**不传 Hooks**（`graph_adapter.go:189-192`）⇒ 生产恒 `NopBus`。三套原物全在：`pkg/hooks/`、`pkg/engine/internal_hook/`（22 文件）、`pkg/orchestrator/hooks.go:20`。
 
 ```go
 // pkg/graph/hooks.go —— 统一事件模型，双维度：作用域 × 相位
@@ -226,7 +259,9 @@ type Hook interface { Match(HookEvent) bool; Execute(context.Context, HookEvent)
 - **每个节点集成 hook**：NodeSpec.Hooks 绑定节点级 hook；图级 Policies.Hooks 对全部节点生效；hook 本身也可以是 agent（`HookBinding{NodeRef}` 指向一个 gate 节点）——审批型 hook 即 human 节点的语法糖。
 - **fail-open/fail-closed 显式化**：每个 HookBinding 声明 `on_error: ignore|block`，取代当前 PreToolUse 隐式 fail-open（`hooks.go:96-98`）。
 
-### 4.6 规则与约束：ConstraintSet 单一真源
+### 4.6 规则与约束：ConstraintSet 单一真源　　**[❌ 未实现（子项 AllowedTools ✅）]**
+
+> **实测**：`ConstraintSet` 全仓零命中。约束仍散在三处：`pkg/feishu/session.go:421-443` 子串匹配（`world-builder` 命中 Coding 的老坑原样保留）、`pkg/engine/engine.go:185`、`cmd/claude-go/main.go` DisableTools。**唯一达成的子项**是 AllowedTools 双路径收敛到同一 `toolExposed`（`pkg/engine/runner.go:278`）。
 
 ```go
 type ConstraintSet struct {
@@ -245,7 +280,9 @@ type ConstraintSet struct {
 - **运行期强制单点**：约束编译为 QueryEngine 的 `AllowedTools`/`PermissionMode`/hook 配置下发。`toolExposed`（`engine.go:169-178`）保持唯一执行点；`RunIsolated` 的 `gateToolUses` 复刻（`runner.go:247`）改为调用同一函数。**角色→工具不再子串匹配**：RoleDef 增加显式 `tool_profile` 字段，`profileForTeamRole` 仅作为缺省回退并打 deprecation 日志。
 - **slash 直通防护**保留：受限会话不进 slash 分发（`main.go:700-703`），在图层同样成立——受限 GraphRun 无法展开携带更高权限的子图（子图约束只能收窄不能放宽，**约束单调性**）。
 
-### 4.7 Skill 选择与编排
+### 4.7 Skill 选择与编排　　**[❌ 未实现]**
+
+> **实测**：`SkillSelector` 零命中；技能注入仍是 `pkg/agent/roles.go:120-153` 的 `<role_skills>` 块。
 
 ```go
 type SkillSelector struct {
@@ -259,12 +296,16 @@ type SkillSelector struct {
 - 注入路径不变：合并进 `<role_skills>` 块（`MergedPrompt`，`roles.go:105-159`）；Skill 工具按需取全文。
 - **编排能力**：skill 可声明 `graph:` 段——技能不仅是提示词，还能携带一个子图模板（如 mr-chain 类多阶段技能），Skill 选择即子图注入。这为 design/03 的"skill 进化=图模板进化"铺路。
 
-### 4.8 Subagent 派生
+### 4.8 Subagent 派生　　**[❌ 未实现]**
+
+> **实测**：`SpawnSubgraph` 零命中；subagent 仍是裸 QueryEngine（`pkg/feishu/session.go:909`、`cmd/claude-go/main.go:730`），不进 Journal、不受预算。
 
 - 节点内 agent 通过 `SpawnSubgraph(spec, params)` 工具派生子图（受 ConstraintSet 单调性约束、计入父节点预算）。取代"factory 创建裸 QueryEngine"（`teams.go:158`、`feishu/session.go:807-830`、`main.go:2639`）——**subagent 从此对编排层可见**：有 NodeID、进 Journal、受 hook/预算/轨迹覆盖。
 - 现有 `cliAgentRunner`/`sessionAgentRunner` 改为 AgentRuntime 的两个实现（见 4.9），行为不变。
 
-### 4.9 远程 Agent 管理：AgentRuntime 接口
+### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[❌ 未实现（接口都不存在）]**
+
+> **实测**：`AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps` 全零命中。只有单方法的 `NodeRunner`（`pkg/graph/runner.go:39-41`），其注释自称「AgentRuntime 的本地化前身」。三实现（local-cli/local-session/k8s-job）均无；`pkg/sandbox/k8s_runner.go` 与图引擎零关联。**`Placement` 名字被 `pkg/cluster` 降格为一个 `[]string` caps 标签**（`queue.go:30`），无打分、无 Affinity。
 
 ```go
 // pkg/graph/runtime.go —— 本文只定义接口与调度语义；网络化实现见 design/02
@@ -289,7 +330,9 @@ type Placement struct {
 - 远程 runtime（gRPC/A2A worker 拉取模型）在 design/02 R3 落地，接口在此冻结。
 - 团队 cwd 亲和：`Affinity: team` 保证产码工作流的节点落同一工作区（否则经共享存储，design/02）。
 
-### 4.10 全局注入：Interceptor 链
+### 4.10 全局注入：Interceptor 链　　**[❌ 未实现]**
+
+> **实测**：`NodeInterceptor`/`CallInterceptor` 两接口零命中；六个内置拦截器全无。`executeWorkflow` **仍是 282 行巨函数**（`pkg/agent/teams.go:646+`），门禁/进化/记忆/通知仍硬编码在主流程。⚠️ 这是本方案 G5 的核心，也是「便于全局注入预算管理」这一原始诉求的落点。
 
 ```go
 // 两个切面：节点执行 与 LLM 调用
@@ -310,7 +353,9 @@ type CallInterceptor interface { Around(ctx context.Context, c LLMCall, next Cal
 
 拦截器配置在图级 Policies 或全局 settings，顺序确定、可开关——第三方横切逻辑（如 aiops 平台的权限桥）也从此注入而非改主流程。
 
-### 4.11 通信机制抽象
+### 4.11 通信机制抽象　　**[❌ 未实现]**
+
+> **实测**：`pkg/graph/blackboard.go` 不存在。双黑板仍并存（`pkg/agent/blackboard.go:29` + `pkg/orchestrator/blackboard.go:69`），跨黑板手工同步仍在 `workflow_orchestrated.go:133-136`。**设计要「新增」的 `Watch` 只存在于那份要被删的实现里**（`pkg/orchestrator/blackboard.go:210`）。Mailbox 仍是裸 slice。
 
 ```go
 type Blackboard interface { // 单一接口，收编两份实现
@@ -326,7 +371,9 @@ type Mailbox interface { Send(MailMessage) error; Inbox(agent string) []MailMess
 - `pkg/orchestrator/blackboard.go` 删除，orchestrated 跨黑板手工同步（`workflow_orchestrated.go:365-373`）消失。
 - 事件流：GraphRun 的 Journal 本身即对外事件流（dashboard SSE、飞书进度播报订阅之，取代 `updateHeartbeat` 回填 team.json 的轮询观测，`teams.go:1763`）。
 
-### 4.12 任务机制抽象
+### 4.12 任务机制抽象　　**[❌ 未实现]**
+
+> **实测**：`TaskService` 类型全仓不存在；仍 `RunTeam`/`WaitDone`/`tryStartTeam` 去重。:7777 动作队列仍是裸目录，且**全仓无消费方**（写入即烂在盘上）。
 
 ```go
 type TaskService interface {
@@ -343,7 +390,9 @@ type TaskService interface {
 
 ---
 
-## 五、15 种 mode → 图模板映射
+## 五、15 种 mode → 图模板映射　　**[❌ 0/15（宽算 2/15 且默认关）]**
+
+> **实测**：`pkg/graph/templates/` **目录不存在**，图模板库零落地；`TranslateWorkflow` 是 WorkflowDef 直译器不是模板库。只有 pipeline/fanout 可经灰度开关切图，而 `CLAUDE_GO_GRAPH_ENGINE` 全仓/全部署清单无处设置。13 个专用 mode 全部仍走各自执行器（`workflow.go:409-434`）。§5 承诺的「fanout 首次真正实现 map→reduce」未发生——`executeFanOut` 仍原封不动转调 pipeline（`workflow.go:201-203`）。
 
 mode 消失，成为**内置图模板库**（`pkg/graph/templates/`，纯 JSON 数据 + 少量展开函数）。单一分发点=模板实例化。
 
@@ -367,7 +416,9 @@ mode 消失，成为**内置图模板库**（`pkg/graph/templates/`，纯 JSON �
 
 ---
 
-## 六、现有功能覆盖矩阵（编排域）
+## 六、现有功能覆盖矩阵（编排域）　　**[🟠 26 行真覆盖 1 行]**
+
+> **实测**：⚠️ **本矩阵是计划表，不是状态表**。逐行核实后：真覆盖 1 行（#17 AllowedTools 收敛）+ 5 个半行 + 4 行只有字段无消费 ⇒ ≈17%。特别注意 #5「重启恢复」仍是强制置 failed（`teams.go:1902-1904`）、#9 门禁仍按工作流名白名单（`teams.go:757`）。
 
 | 现有功能 | 位置 | 新架构归属 | 状态 |
 |---|---|---|---|
@@ -420,7 +471,9 @@ pkg/graph/
 
 ---
 
-## 八、迁移路线
+## 八、迁移路线　　**[🟠 M0 95% · M1 70% · M2 12% · M3 4% · M4 0%]**
+
+> **实测**：M1 的验收项「kill -9 恢复重放正确」**无对应测试**（`journal_test.go` 只模拟尾部截断行，不是进程 kill）。M2 记 ✅ 的 loop/条件边应为 🟡（生产零产生方）。M4 = 0%：`pkg/orchestrator` 仍生产可达（4 个注册工作流），四大 God File 全在且 `workflow.go` 比设计稿时**更大**。
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
