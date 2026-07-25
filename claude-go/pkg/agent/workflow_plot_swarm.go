@@ -42,31 +42,24 @@ type plotSimJSON struct {
 }
 
 // executePlotSimulate 用 Engine.Simulate 对「当前故事状态 + 一个转折/假设」做多情景群体推演。
-func (we *WorkflowExecutor) executePlotSimulate(ctx context.Context, _ *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
-	notify := func(msg string) {
-		if team != nil {
-			we.notify(team.ChatID, msg)
-		}
-	}
-	if we.llm == nil {
-		return nil, fmt.Errorf("plot-simulate 需要 LLMClient 以创建 swarm_intel.Engine")
-	}
-	notify("⚡ **剧情模拟**: swarm_intel.Engine.Simulate 多情景群体推演中…")
+//
+// 前置 (LLMClient 检查 / 灰度切图判据 / 引擎装配 / 结果包壳) 与 plot-predict 逐字相同,
+// 收在 executePlotSwarm 一处 (graph_templates_plot.go); 本 mode 独有的只剩下面的 core。
+func (we *WorkflowExecutor) executePlotSimulate(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
+	return we.executePlotSwarm(ctx, wf, objective, team, plotSimulateKind())
+}
 
-	cfg := swarm_intel.DefaultConfig()
-	cfg.Notify = func(_, msg string) {
-		notify("  [群体智能] " + msg)
-		if team != nil && team.Blackboard != nil {
-			team.Blackboard.Write("swarm-progress", msg, "engine", "progress")
-		}
-	}
-	engine := swarm_intel.NewEngine(we.llm, cfg)
-
+// runPlotSimulateCore 一次 Engine.Simulate + 产出装配。
+//
+// 旧路径与图路径共用同一份 (它们的差别只在调度外壳)。抄两份的后果是"灰度打开后
+// 产出 JSON 少了一个字段"这类只有下游平台先发现的漂移 —— design/01 §1.2 双 mode
+// switch 那个缺陷的同一形态。
+func runPlotSimulateCore(ctx context.Context, engine *swarm_intel.Engine, chatID, objective string) (string, string, error) {
 	// social 模式 = 人物社会动力学演化，最贴小说「人物驱动的剧情走向」。3 agent × 2 轮兼顾质量与时延。
 	simCfg := swarm_intel.SimulationConfig{Mode: "social", Agents: 3, Rounds: 2}
-	res, err := engine.Simulate(ctx, teamChatID(team), objective, simCfg)
+	res, err := engine.Simulate(ctx, chatID, objective, simCfg)
 	if err != nil {
-		return nil, fmt.Errorf("剧情模拟失败: %w", err)
+		return "", "", fmt.Errorf("剧情模拟失败: %w", err)
 	}
 
 	out := plotSimJSON{Mode: res.Mode, Emergent: res.Emergent, Summary: res.Summary}
@@ -77,8 +70,8 @@ func (we *WorkflowExecutor) executePlotSimulate(ctx context.Context, _ *Workflow
 	}
 	data, _ := json.MarshalIndent(out, "", "  ")
 	output := fmt.Sprintf("剧情模拟结果（%d 个情景）:\n\n```json\n%s\n```\n", len(out.Scenarios), string(data))
-	notify(fmt.Sprintf("✅ 剧情模拟完成: %d 个情景 + %d 条涌现走向", len(out.Scenarios), len(out.Emergent)))
-	return []StageResult{{Name: "plot-simulate", Role: "plot-simulator", Status: TaskCompleted, Output: output}}, nil
+	done := fmt.Sprintf("✅ 剧情模拟完成: %d 个情景 + %d 条涌现走向", len(out.Scenarios), len(out.Emergent))
+	return output, done, nil
 }
 
 // ---- plot-predict: 走向群体评估 ----
@@ -106,29 +99,16 @@ type plotPredictJSON struct {
 }
 
 // executePlotPredict 用 Engine.Predict 对「若干候选走向」做群体辩论评估，返回各走向的可信度分布。
-func (we *WorkflowExecutor) executePlotPredict(ctx context.Context, _ *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
-	notify := func(msg string) {
-		if team != nil {
-			we.notify(team.ChatID, msg)
-		}
-	}
-	if we.llm == nil {
-		return nil, fmt.Errorf("plot-predict 需要 LLMClient 以创建 swarm_intel.Engine")
-	}
-	notify("⚡ **走向评估**: swarm_intel.Engine.Predict 多分析师辩论融合中…")
+// 前置与 plot-simulate 共用 executePlotSwarm (见 graph_templates_plot.go)。
+func (we *WorkflowExecutor) executePlotPredict(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
+	return we.executePlotSwarm(ctx, wf, objective, team, plotPredictKind())
+}
 
-	cfg := swarm_intel.DefaultConfig()
-	cfg.Notify = func(_, msg string) {
-		notify("  [群体智能] " + msg)
-		if team != nil && team.Blackboard != nil {
-			team.Blackboard.Write("swarm-progress", msg, "engine", "progress")
-		}
-	}
-	engine := swarm_intel.NewEngine(we.llm, cfg)
-
-	res, err := engine.Predict(ctx, teamChatID(team), objective)
+// runPlotPredictCore 一次 Engine.Predict + 产出装配 (旧路径与图路径共用, 理由同 simulate)。
+func runPlotPredictCore(ctx context.Context, engine *swarm_intel.Engine, chatID, objective string) (string, string, error) {
+	res, err := engine.Predict(ctx, chatID, objective)
 	if err != nil {
-		return nil, fmt.Errorf("走向评估失败: %w", err)
+		return "", "", fmt.Errorf("走向评估失败: %w", err)
 	}
 
 	out := plotPredictJSON{Consensus: res.Consensus, Summary: res.Summary}
@@ -145,8 +125,8 @@ func (we *WorkflowExecutor) executePlotPredict(ctx context.Context, _ *WorkflowD
 	}
 	data, _ := json.MarshalIndent(out, "", "  ")
 	output := fmt.Sprintf("走向评估结果（共识度 %.0f%%）:\n\n```json\n%s\n```\n", out.Consensus*100, string(data))
-	notify(fmt.Sprintf("✅ 走向评估完成: %d 个走向, 共识度 %.0f%%", len(out.Outcomes), out.Consensus*100))
-	return []StageResult{{Name: "plot-predict", Role: "plot-analyst", Status: TaskCompleted, Output: output}}, nil
+	done := fmt.Sprintf("✅ 走向评估完成: %d 个走向, 共识度 %.0f%%", len(out.Outcomes), out.Consensus*100)
+	return output, done, nil
 }
 
 // teamChatID 安全取团队 ChatID（team 可能为 nil）。

@@ -322,12 +322,31 @@ func TestModeGraph灰度默认关(t *testing.T) {
 	}
 }
 
-// TestModeGraph未做的mode灰度也不改路 未登记模板的 mode 即使开关打开也必须走自己的
-// 执行器 —— 否则"没做"就变成了"悄悄换了实现"。
-func TestModeGraph未做的mode灰度也不改路(t *testing.T) {
+// TestModeGraph未做与专属内核的mode都不进通用分发口 灰度分发口 (workflow.go 的
+// `ModeHasGraphTemplate(wf.Mode)`) 只该认模板表。两类 mode 都必须落空:
+//
+//	未做表的 mode      —— 命中就等于"没做"悄悄变成了"悄悄换了实现";
+//	专属内核表的 mode  —— 命中会把它劫到 stageNodeRunner 路径上 (= 换内核 + 绕过
+//	                     各自入口的 LLMClient 检查/通知/RewardBus 记账)。
+//
+// 后半段的活体验证换了个说法: plot_simulate 现在**有**专属内核 (plotSwarmNodeRunner),
+// 但它的灰度判据在 executePlotSwarm 里、且**排在 LLMClient 检查之后** —— 于是
+// llm==nil 时开关打开也不会开 journal, 错误文案与开关关闭时逐字相同。这条正是
+// "专属内核 mode 的前置动作不能被通用分发口绕过"的活体证据。
+// (plot 自己那半的等价性在 graph_templates_plot_test.go。)
+func TestModeGraph未做与专属内核的mode都不进通用分发口(t *testing.T) {
+	for m := range modeGraphNotTemplated {
+		if ModeHasGraphTemplate(m) {
+			t.Errorf("未做表的 mode %q 被灰度分发口命中了", m)
+		}
+	}
+	for m := range modeGraphNativeKernel {
+		if ModeHasGraphTemplate(m) {
+			t.Errorf("专属内核 mode %q 被灰度分发口命中了 (会被劫到 stageNodeRunner)", m)
+		}
+	}
+
 	t.Setenv("CLAUDE_GO_GRAPH_ENGINE", "1")
-	// plot_simulate 未登记模板, 且其执行器在 we.llm==nil 时会明确报错 —— 拿这个错误
-	// 当"确实进了旧执行器"的证据 (若被图路径接管, 报错会来自图引擎/直译器)。
 	wf := &WorkflowDef{Name: "plot-simulate", Mode: "plot_simulate"}
 	team := newStubTeam(t, "not-templated")
 	_, err := newRecordingExecutor(&tplRecorder{}).Execute(context.Background(), wf, "目标", team)
@@ -335,10 +354,10 @@ func TestModeGraph未做的mode灰度也不改路(t *testing.T) {
 		t.Fatal("plot_simulate 无 LLMClient 时应报错")
 	}
 	if !strings.Contains(err.Error(), "LLMClient") {
-		t.Errorf("错误应来自 plot_simulate 执行器 (含 LLMClient 字样), got %q", err)
+		t.Errorf("错误应来自 plot_simulate 自己的前置检查 (含 LLMClient 字样), got %q", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(team.dataDir, "graph-journal")); !os.IsNotExist(statErr) {
-		t.Error("未登记模板的 mode 不该被图引擎接管 (却产生了 graph-journal)")
+		t.Error("LLMClient 缺失时不该已经开了 journal (说明灰度判据跑到了前置检查之前)")
 	}
 }
 

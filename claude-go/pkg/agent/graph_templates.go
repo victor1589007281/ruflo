@@ -29,28 +29,41 @@ package agent
 // ---------------------------------------------------------------------------
 //
 // 等价的门槛是"同样的阶段、同样的顺序、同样的并发度、同样的门禁"。逐个读完 15 个
-// 执行器后, 剩下 11 个 mode 里 3 个已用**专属节点内核**跑在图引擎上
-// (orchestrated / ensemble_extract / review_panel, 见 modeGraphNativeKernel),
-// 另外 8 个各自缺的东西是**能力级**的, 不是工作量级的, 归为三类:
+// 执行器后, 剩下 11 个 mode 里 5 个已用**专属节点内核**跑在图引擎上
+// (orchestrated / ensemble_extract / review_panel / plot_simulate / plot_predict,
+// 见 modeGraphNativeKernel), 另外 6 个各自缺的东西是**能力级**的, 不是工作量级的:
 //
-//  1. **自适应终止器 (AdaptiveTerminator) 驱动的循环**: 退出条件不是"分数过线",
+//  1. **循环轮次的阶段名在图上回译不出来** —— 本轮复核后这条上升为 5 个 mode 的
+//     **首要**阻塞项 (creative_media / app_composite / game_composite /
+//     novel_writing / swarm_novel)。它们的执行器每轮追加两条带轮次的阶段记录
+//     (html-develop-round1 / visual-review-round1 / chapter-3-write-round2 …),
+//     而图上表达"一组节点整体反复"只有 loop-group; 组内成员的运行期 ID 是
+//     <组>#it<轮次>/<成员> (spec.go), runGraphSpec 回译 []StageResult 时**只遍历
+//     顶层 spec.Nodes** (graph_adapter.go), 组内成员整批不进返回值。teamGraphHooks
+//     的实时快照虽然写了 team.Stages, 但收尾时 teams.go 用 executor 返回值整体覆盖
+//     (team.Stages = results) —— 于是"跑的时候看得见、跑完就没了"。
+//     下游按阶段名取产出的平台会直接读空, 这是行为变更而不是等价迁移。
+//  2. **自适应终止器 (AdaptiveTerminator) 驱动的循环**: 退出条件不是"分数过线",
 //     而是 加权分 ≥6.0 / 收敛 ε=0.5 / 退化 0.3×2 次 / 策略转换 ≤2 次 / best-of-N
 //     回滚 五路信号的组合 (pkg/agent/adversarial.go)。图的 LoopPolicy.Until 只有
 //     ok|fail|score|output contains 四类原子条件 (pkg/graph/condition.go), 表达不了。
 //     **这条缺口已由 pkg/graph/terminator.go 的可插拔终止器补齐** (内置 adaptive
-//     复刻五路信号, 四个判据阈值必须显式给出), 于是它不再是任何 mode 的**唯一**阻塞项;
-//     仍受它影响但另有阻塞项的: creative_media / app_composite / game_composite /
-//     novel_writing / swarm_novel (逐条见下方各自的记账)。
-//  2. **非 agent 执行内核**: 阶段不是一次 ExecuteSingleStage, 而是 裸 LLM completion、
+//     复刻五路信号, 四个判据阈值必须显式给出), 于是它不再是任何 mode 的阻塞项 ——
+//     但补齐它并没有解锁任何 mode, 因为上面第 1 条与下面第 4 条各自独立卡着。
+//     **终止器还有一条自己的前提没满足**: 它的四路判据全读 NodeResult.Score, 而
+//     stageNodeRunner 的 agent 分支从不填 Score (只有 runGate 分支填), 于是 agent
+//     节点组成的循环喂给 adaptive 的恒是 0 分。
+//  3. **非 agent 执行内核**: 阶段不是一次 ExecuteSingleStage, 而是 裸 LLM completion、
 //     swarm_intel 引擎、pkg/media 渲染或本地 shell 门禁。
 //     stageNodeRunner 只会跑 ExecuteSingleStage —— 用它跑这些阶段等于**悄悄换了内核**
 //     (最直接的后果: 裸 completion 阶段突然拿到了工具权限)。
-//     命中: plot_simulate / plot_predict / swarm_novel / game_composite / creative_media。
+//     命中: swarm_novel / game_composite / creative_media / adversarial_dev。
 //     orchestrated 原本也在这一类, M4 的解法不是硬塞进 stageNodeRunner 而是**为它写一个
 //     裸 completion 的 NodeRunner** (orchestrated_runner.go)。ensemble_extract /
-//     review_panel 随后走了同一条路 (graph_templates_ensemble.go 的 ensembleNodeRunner
-//     + 内核新增的 vote/trimmed_mean 聚合), 两者因此从本类毕业。
-//  3. **运行期才知道的图形状**: 节点名/节点数来自 LLM 产出 (WBS 任务标题、章节数、
+//     review_panel (ensembleNodeRunner + 内核新增的 vote/trimmed_mean) 与
+//     plot_simulate / plot_predict (plotSwarmNodeRunner, 内核是 swarm_intel 引擎)
+//     随后走了同一条路, 因此从本类毕业。
+//  4. **运行期才知道的图形状**: 节点名/节点数来自 LLM 产出 (WBS 任务标题、章节数、
 //     时间线数)。图侧对应能力是 ExpandSpec 动态展开, 但它要求 runner 能把上游产出
 //     解析成 []NodeSpec —— 那是每个 mode 一个解析器的活, 且解析失败的降级语义
 //     (fail-open 还是 fail-closed) 各不相同。
@@ -133,29 +146,35 @@ var modeGraphTemplates = map[string]ModeGraphTemplate{
 var modeGraphNotTemplated = map[string]string{
 	"adversarial_dev": "Phase 2 的真实执行体是 pkg/agent.Orchestrator 的 WBS DAG: 节点名/节点数是 " +
 		"ParsePlanToDAGWithRepair 从 planner 产出里解析出来的 (LLM 撰写的任务标题), 运行期才知道; " +
-		"节点内还嵌 L2 编译硬门禁 (4 次内部重试 + CompileRepairGuard(3))。Phase 3 的 E2E 轮次由 " +
-		"产出子串启发式 (含 bug/fail/错误) + AdaptiveTerminator(1,3) + 本地 shell 门禁 runLocalE2EGate 驱动。" +
-		"缺 ExpandSpec 的 WBS 解析器 + 能跑 Orchestrator/shell 门禁的 NodeRunner。" +
+		"节点内还嵌 L2 编译硬门禁 (4 次内部重试 + CompileRepairGuard(3))。缺 ExpandSpec 的 WBS 解析器 + " +
+		"能跑 Orchestrator/shell 门禁的 NodeRunner。" +
+		"**Phase 3 的描述本轮重新核实过并改写**: 它现在只由本地 shell 门禁驱动 —— e2e-local-gate (runLocalE2EGate: " +
+		"经 pkg/sandbox 起真实构建/测试进程) + 至多 2 次 e2e-local-fix-N。旧描述里的\"产出子串启发式 (含 bug/fail/错误) + " +
+		"AdaptiveTerminator(1,3)\"那条 LLM 轮次分支 (阶段名 e2e-roundN / e2e-fix-roundN) **在 HEAD 上不可达**: " +
+		"runLocalE2EGate 的每条 return 路径都返回非 nil, 于是 runE2EAdversarial 里 `if local != nil` 恒真、必定提前返回, " +
+		"e2eTerminator 建了从不使用, buildE2EPrompt 也随之成为死代码。" +
 		"另注: runAdversarialLoop / initAdaptiveTerminator / autoScalePool / runBuildGate / runTestGate " +
-		"在 HEAD 已无调用方 (死代码), design/01 §五 写的 loop-group[coder→reviewer→fixer] 对应的是这段死代码, 不是线上行为。",
-	"plot_simulate": "0 个 Stages, 单次 swarm_intel.Engine.Simulate(Agents=3, Rounds=2) 后包一条 " +
-		"StageResult。整个 mode 没有可调度的阶段结构, 图化只能是 1 节点包壳; 真要收编需要一个 " +
-		"swarm_intel 内核的 NodeRunner, 收益是 journal/hook 统一而非调度。",
-	"plot_predict": "同 plot_simulate: 单次 swarm_intel.Engine.Predict, 阈值全在引擎内部 " +
-		"(DTIThreshold 0.7 / TrimRatio 0.2 / DebateEntropy 0.7)。",
-	// —— 以下五条的"自适应终止器"缺口已由 pkg/graph/terminator.go 补齐 (内置 adaptive
-	// 复刻五路信号)。描述已按**补齐之后**重写: 每条写的是现在真正卡住的那一项, 不是旧缺口。
+		"在 HEAD 已无调用方 (死代码, 连带 runGeneratorRound / runBuildHardGate / runEvaluatorRound / runTestHardGate 也不可达), " +
+		"design/01 §五 写的 loop-group[coder→reviewer→fixer] 对应的是这段死代码, 不是线上行为。",
+	// —— 以下五条: "自适应终止器"缺口已由 pkg/graph/terminator.go 补齐 (内置 adaptive
+	// 复刻五路信号), 但**补齐它并没有解锁任何一条**。本轮逐条复核后, 五条共同的首要
+	// 阻塞项被提到每条开头: **带轮次的阶段名在图上回译不出来**。描述写的是现在真正
+	// 卡住的那一项, 不是旧缺口。
 	"novel_writing": "Phase 1/2 的 4 个阶段静态串行; Phase 3 的章节数来自 parseChapterCount(outline-design 产出), " +
 		"夹到 1..30 (默认 5), 每章一个 NewAdaptiveTerminator(1,3)。终止器本身已可表达, 但仍卡四项: " +
-		"(a) **agent 节点没有 Score** —— stageNodeRunner 只在 runGate 分支填 Score (graph_adapter.go), " +
+		"(a) **2N×R 条 chapter-N-write-roundR / -review-roundR 阶段记录会整批消失** (首要阻塞项) —— " +
+		"runGraphSpec 只回译顶层 spec.Nodes, 组内成员是运行期 ID <组>#it<轮次>/<成员>; teamGraphHooks 的实时快照虽然写了 " +
+		"team.Stages, 但收尾时 teams.go 用 executor 返回值整体覆盖 (team.Stages = results), 下游按阶段名取产出的平台直接读空。" +
+		"(b) **agent 节点没有 Score** —— stageNodeRunner 只在 runGate 分支填 Score (graph_adapter.go), " +
 		"chapter-review 作为 agent 节点恒 Score=0 ⇒ adaptive 的达标/收敛/退化三路判据全读到 0; 改判 gate 节点则打分函数 " +
-		"换成 runContentCriticLLM 的 0-100 通用五维 (被评内容还是 gatePickDeliverable 取的最长上游产出), 而现状是 " +
+		"换成 runContentCriticLLM 的 0-100 单标量 (被评内容还是 gatePickDeliverable 取的最长上游产出), 而现状是 " +
 		"parseNovelScore 的 0-10 七维加权 —— 不同函数/不同量纲/不同被评内容。" +
-		"(b) **loop-group 的产出只能取一个成员** (GroupPolicy.ResultFrom): 章节正文要取 writer, 终止判据要取 reviewer 的分, " +
-		"取一个必丢另一个。(c) **2N×R 条 chapter-N-write-roundR / -review-roundR 阶段记录会整批消失** —— " +
-		"runGraphSpec 只回译 spec.Nodes, 组内成员是运行期 ID <组>#it<轮次>/<成员>, 下游按阶段名取产出的平台直接读空。" +
-		"(d) **\"写作失败照样出章\"这条 fail-open 在图上会变成整组 skipped** (write failed ⇒ review 入边不满足 ⇒ " +
-		"OR-join 判 skipped ⇒ ResultFrom skipped ⇒ 组 skipped ⇒ 结果回译整段丢弃), 内核没有 fail_open/Blocking 节点属性。" +
+		"(c) **loop-group 的产出只能取一个成员** (GroupPolicy.ResultFrom 是单值): 章节正文要取 writer, 终止判据要取 reviewer 的分, " +
+		"取一个必丢另一个。(d) **\"写作失败照样出章\"这条 fail-open 表达不了**: 内核没有 fail_open/Blocking 节点属性 " +
+		"(NodeSpec 全字段里没有), join 只有 or/and 两档 (join.go) 没有 any/count。**本轮修正一处旧描述的因果**: 不是" +
+		"\"review 入边不满足判 skipped\" —— 无条件边解析为恒真 (condition.go), OR-join 只对 skipped 前驱 continue, " +
+		"对 failed 前驱仍求边条件 ⇒ review 会照跑, 但 prevOutputs 只收 completed 上游 (engine.go), 它拿到的是**空依赖块**; " +
+		"而 ResultFrom=writer 且 writer failed 时组是 failed (不是 skipped)。两种后果都不等价, 但机制与旧描述不同。" +
 		"另: 章节展开要认 outline 产出的 total_chapters/chapters 键, 而 parseStageExpansion 只认 " +
 		"nodes/edges/subtasks/tasks, 且展开产物一律 Kind=agent, 展不出 N 个 loop-group; 阶段内核是 we.runAgent " +
 		"(刻意绕过 RoleRegistry.MergedPrompt, 依赖块硬截 6000), 换 ExecuteSingleStage 会多出人格前缀 + antiLoopDirective " +
@@ -163,22 +182,37 @@ var modeGraphNotTemplated = map[string]string{
 	"swarm_novel": "叠加 novel_writing 的全部四项, 另有三项自己的: (a) Phase B 是 swarm_intel.FanOutFirstN 起 " +
 		"TimelineCount+1 条时间线、取前 N 条**成功**的、凑够即 totalCancel 取消富余分支 (时间线数 2..5 / 轮数 3..10 " +
 		"来自 evo-blueprint 的 LLM JSON, 默认 3/5); MapPolicy 只有 MaxShards/MinShards (切少于 MinShards 即整节点 failed), " +
-		"**没有\"容忍 k 条失败 + 早停取消\"这一档**; 四个 reduce 策略里也没有\"按风险调整分 (Probability - 0.5×CI宽度) " +
-		"选单一胜者并保留次优\"这一档 (selectBestFromPrediction / secondBestTimeline)。" +
+		"**没有\"容忍 k 条失败 + 早停取消\"这一档** (reduce 端的 RequireAll/MinSamples 是跑完再看, 不是早停); " +
+		"**五个** reduce 策略 (runner/concat/longest + 本轮新增的 vote/trimmed_mean) 里也没有\"按风险调整分 " +
+		"(Probability - 0.5×CI宽度) 选单一胜者并保留次优\"这一档 (selectBestFromPrediction / secondBestTimeline)。" +
 		"(b) Phase B/C 的内核是 swarm_intel.Engine.Simulate/Predict + RecordOutcome (自建多 agent 辩论 + 贝叶斯融合 + " +
-		"保形校准, 完全不经 agent 工厂), 不是 ExecuteSingleStage。(c) 两处**把 failed 改写回 completed** 的 fail-open: " +
+		"保形校准, 完全不经 agent 工厂), 不是 ExecuteSingleStage。plotSwarmNodeRunner 已证明这类内核可以收编, " +
+		"但那是**整个 mode 一个节点**的形态; 这里 Simulate/Predict 只是 6 个 Phase 里的两个, 收编它等于要求图能同时表达 " +
+		"(a) 的扇出语义与 (c) 的改写语义。(c) 两处**把 failed 改写回 completed** 的 fail-open: " +
 		"Phase C 的 Predict 失败降级 story-judge 后改写 (且那次回退调用从不进阶段列表), Phase F 的统稿降级判据含两个" +
 		"**图外状态** (isStageTransientError 的错误文本正则 + NOVEL.md 是否落盘成功) —— 内核既无节点属性也无拦截器口径可表达。",
-	"creative_media": "对抗轮由 AdaptiveTerminator(1,5) 驱动 (终止器已可表达), 现在卡的是: agent 节点恒 Score=0 " +
-		"⇒ 终止判据拿不到分 (同 novel_writing (a)); Phase 4 的 media-render 是 pkg/media 引擎 (chromedp/ffmpeg) 而非 agent; " +
-		"还有一条视觉质检环 (gemma 视觉后端, 单次修复) 和一条 manim 分支 (IsAlgorithmExplainerVideo 命中时整体换成 " +
-		"3 阶段的另一套形状)。缺确定性渲染节点内核 + agent 节点的评分回报。",
-	"app_composite": "无跨团队编排 (核实: 不调 RunTeam/TeamManager), Phase B 的原型对抗环由 AdaptiveTerminator(1,4) 驱动 " +
-		"(parseCreativeScore 从不设 PassSet, 于是 reviewer 的 pass:false 无法否决)。终止器已可表达, 现在卡的是: " +
-		"media.Engine.RenderAll 是确定性渲染而非 agent (缺渲染节点内核) + agent 节点无 Score 回报 ⇒ 判据读到 0。" +
-		"另注: design/01 §五 写的 subgraph 组合并不需要 —— 它从头到尾在一个 executor 内跑, 没有子团队。",
-	"game_composite": "同 app_composite (AdaptiveTerminator(1,3) + media 渲染 + agent 节点无 Score), 另加 Phase B 的 " +
-		"swarm_intel 三路情景模拟 (硬编码 {5,3}/{4,2}/{3,2}, 自带 sem=3 并发闸)。同样不需要 subgraph。",
+	"creative_media": "对抗轮 (html-develop-roundN / visual-review-roundN, AdaptiveTerminator(1,5) + parseCreativeScore) " +
+		"现在卡三项: (a) **轮次阶段名回译不出来** (首要阻塞项, 机制同 novel_writing (a)); " +
+		"(b) agent 节点恒 Score=0 ⇒ 终止判据拿不到分 (同 novel_writing (b)); " +
+		"(c) Phase 4 的 media-render 内核是 pkg/media 引擎 (chromedp/ffmpeg) 而非 agent —— 注意它**有**一条阶段记录 " +
+		"(Name=media-render, Role 空, 代码手工构造), 所以缺的是\"确定性渲染节点内核\"而不是\"这一步在阶段列表里不存在\"。" +
+		"另有两条会改变整体形状的分支: 视觉质检环 (多模态后端 —— we.llm 实现 RawVisionCompleter 时直接复用它, " +
+		"ollama gemma4 只是兜底; 命中时多插一条 html-develop-vision-fix, 而重渲染与二次质检都不产阶段记录) 与 " +
+		"manim 分支 (IsAlgorithmExplainerVideo && ManimAvailable && 生成成功 三者同时命中时整体换成 " +
+		"manim-generate/manim-render/final-delivery 三阶段的另一套形状, 其内部 3 轮修复同样不产阶段记录)。",
+	"app_composite": "无跨团队编排 (核实: 两个执行器里 RunTeam/TeamManager 零命中) ⇒ **design/01 §五 写的 subgraph 组合并不需要**, " +
+		"subgraph Kind 落地也不解锁本 mode。Phase B 的原型对抗环 (html-prototype-roundN / prototype-review-roundN) 由 " +
+		"AdaptiveTerminator(1,4) 驱动 (parseCreativeScore 既不设 PassSet 也不设 Feedback, 于是 MeetsHardPassThreshold 的两条 " +
+		"否决路径都被短路 —— reviewer 的 pass:false 无法否决)。终止器已可表达, 现在卡的是: " +
+		"(a) **轮次阶段名回译不出来** (首要阻塞项, 同 novel_writing (a)); (b) agent 节点无 Score 回报 ⇒ 判据读到 0; " +
+		"(c) media.Engine.RenderAll 是确定性渲染而非 agent, 且它**只发通知不进阶段列表** (与 creative_media 的 media-render 不同) " +
+		"—— 图上它是一处纯图外副作用, 要么丢掉要么凭空多一条阶段, 两者都不等价。",
+	"game_composite": "同 app_composite 的三项 (轮次阶段名 art-prototype-roundN/art-review-roundN 回译不出来 + " +
+		"agent 节点无 Score + RenderAll 只发通知不进阶段列表), 终止器参数是 AdaptiveTerminator(1,3)。同样不需要 subgraph。" +
+		"另加 Phase B 的 swarm_intel 三路情景模拟 (硬编码 {5,3}/{4,2}/{3,2}, 自带 sem=3 并发闸, 三路各自不产阶段记录, " +
+		"最后合成**一条** narrative-evolution(Role=swarm-intelligence)) —— 内核可用 plotSwarmNodeRunner 同款手法收编, " +
+		"但\"三路模拟不留痕、只留合成的一条\"这件事在图上要么变成 3 条分片记录, 要么就得再包一层只跑 1 轮的 loop-group, " +
+		"而后者正好撞上 (a)。",
 }
 
 // modeGraphNativeKernel 已在图引擎上跑、但**不经 stageNodeRunner 模板路径**的 mode
@@ -195,12 +229,17 @@ var modeGraphNotTemplated = map[string]string{
 //
 // 本表内部还有一层区分, 不写清会误导运维:
 //
-//	orchestrated                    **无条件**跑在图引擎上 (旧 pkg/orchestrator 已退役, 没有回退路)
-//	ensemble_extract / review_panel  **灰度可切**: CLAUDE_GO_GRAPH_ENGINE 未设时仍走旧执行器
+//	orchestrated                     **无条件**跑在图引擎上 (旧 pkg/orchestrator 已退役, 没有回退路)
+//	ensemble_extract / review_panel   **灰度可切**: CLAUDE_GO_GRAPH_ENGINE 未设时仍走旧执行器
+//	plot_simulate / plot_predict      同上 (灰度可切)
 //
 // 后者的灰度判据不在 ModeHasGraphTemplate 而在各自执行器开头的 graphEngineEnabled()
 // (与 executePipeline 同款做法) —— 因为它们的入口还有 LLMClient 前置检查、起始/收尾
 // 通知、review_panel 的 RewardBus 记账这些 mode 专属的前后置动作, 走通用分发口会丢掉。
+//
+// **本表不等于"调度也图化了"**: plot_simulate/plot_predict 的图只有 1 个节点, 收编换来的
+// 是 journal/hook/拦截器/运行参数四样统一能力, 不是调度 (逐条论证见 graph_templates_plot.go
+// 文件头)。把"1 节点包壳"说成"已图化调度"会让这张表变成一份好看但不可信的进度账。
 var modeGraphNativeKernel = map[string]string{
 	"orchestrated": "已迁至 pkg/graph 图引擎 (design/01 M4, 退役 pkg/orchestrator): 图结构 = wf.Stages 的 " +
 		"1:1 DAG, 执行内核换成专属的 orchNodeRunner —— 裸 LLM completion (无工具/无角色模板合并/无黑板交接), " +
@@ -223,6 +262,22 @@ var modeGraphNativeKernel = map[string]string{
 		"**等价性基准以 331f79e 修完跨维归一化之后的 fuseReviews 为准** (修复前 dimensions 被当概率分布 " +
 		"除以总和, 拿旧产出做基准会差一个 1/Σ 系数)。唯一刻意不等价: 3 路里挂 1 路时旧路径用普通均值出数, " +
 		"图路径按 MinSamples=3 拒绝出数 (截尾均值在 2 样本上执行不了, 数字却看起来正常)。",
+	"plot_simulate": "灰度可切 (CLAUDE_GO_GRAPH_ENGINE=1, 判据在 executePlotSwarm, **位于 LLMClient 前置检查之后** " +
+		"—— 同一个配置错误在开关两侧必须报同一句话): 图 = **1 个 agent 节点** (plot-simulate/plot-simulator), " +
+		"内核是专属的 plotSwarmNodeRunner —— swarm_intel.Engine.Simulate(Mode=social, Agents=3, Rounds=2), " +
+		"既不经 agent 工厂也不经 ExecuteSingleStage。**1 个节点是如实描述而非过渡形态**: 把引擎内部的 Phase 拆成节点会把 " +
+		"阶段序列从 1 条变成 N 条 (下游按 Name==plot-simulate 取产出), 且 Phase 间传的是结构体不是文本 —— 逐条论证见 " +
+		"graph_templates_plot.go 文件头。收编换来的是 journal(resume)/hook(dashboard 上阶段第一次可见)/拦截器(预算)/" +
+		"运行参数四样此前对本 mode 完全缺席的能力, 不是调度。零重试 + TimeoutSec=0; 后者是硬约束: " +
+		"Engine.Predict 用 ctx.Deadline() 反推自己的分级预算, 设**任何**超时 (哪怕更宽松) 都会改掉引擎内部行为。" +
+		"等价性由 graph_templates_plot_test.go 四维比对钉住 (阶段序列/LLM 调用次数/峰值并发/提示词) + " +
+		"飞书通知序列逐字 + 产出文本逐字 + 五条变异反证。**唯一已知行为差异**: 图路径开 Resume=true, " +
+		"同一 RunID 重入时已完成节点吃 journal 缓存 (零 LLM、不发收尾通知), 旧路径每次都重跑 —— " +
+		"日常调用不受影响 (每次团队运行取新 RunID), 命中的只有\"中断后按同一 RunID 续跑\"那一种情形。",
+	"plot_predict": "同 plot_simulate (共用 plotSwarmNodeRunner 与同一张 1 节点图), 内核换成 " +
+		"swarm_intel.Engine.Predict —— 阈值全在引擎内部 (DTIThreshold 0.7 / TrimRatio 0.2 / DebateEntropy 0.7), " +
+		"图层不改写也无法改写它们。TimeoutSec=0 这条对本 mode 尤其致命 (Predict 是唯一真的读 ctx.Deadline() 的那个)。" +
+		"已知差异: 无 (阶段序列/调用次数/提示词/产出文本全部逐字相同, 见 graph_templates_plot_test.go)。",
 }
 
 // ModeHasGraphTemplate 该 mode 是否有已验证等价的图模板 (灰度分发的唯一判据)。
