@@ -63,9 +63,10 @@ func (h *httpHandler) pull(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Worker string   `json:"worker"`
 		Kinds  []string `json:"kinds"`
+		Caps   []string `json:"caps"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	task, ok, err := h.q.Pull(req.Worker, req.Kinds)
+	task, ok, err := h.q.PullFor(req.Worker, req.Kinds, req.Caps)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -187,12 +188,17 @@ func (c *Client) Heartbeat(caps, kinds []string) error {
 	return err
 }
 
-// Pull 拉取任务 (无任务返回 nil,nil)。
+// Pull 拉取任务 (无任务返回 nil,nil)。caps 为本 worker 的能力标签, 供控制面路由。
 func (c *Client) Pull(kinds []string) (*Task, error) {
+	return c.PullWithCaps(kinds, nil)
+}
+
+// PullWithCaps 携带能力标签拉取 (control 侧按 RequireCaps ⊆ caps 过滤)。
+func (c *Client) PullWithCaps(kinds, caps []string) (*Task, error) {
 	var out struct {
 		Task *Task `json:"task"`
 	}
-	code, err := c.post("/cluster/pull", map[string]any{"worker": c.worker, "kinds": kinds}, &out)
+	code, err := c.post("/cluster/pull", map[string]any{"worker": c.worker, "kinds": kinds, "caps": caps}, &out)
 	if err != nil {
 		return nil, err
 	}

@@ -62,6 +62,7 @@ type LLMCallRecord struct {
 	Stream              bool
 	DurationSec         float64
 	InputTokens         int
+	InputEstimated      bool // input 由 prompt 字符数估算 (兼容网关不回 input_tokens; design/02 §1.4)
 	OutputTokens        int
 	CacheReadTokens     int
 	CacheCreationTokens int
@@ -95,6 +96,19 @@ type LLMCallRecord struct {
 	NodeID string // 图节点 / workflow stage 级
 	TurnID string // QueryEngine 单轮
 	CallID string // 单次 LLM HTTP 调用 (api.Client 生成, 恒非空)
+}
+
+// estimateInputTokens 按 prompt 组件字符总数估算 input token (chars/4)。
+// 用于兼容网关不回 input_tokens 时的双边记账兜底 (design/02 §1.4)。
+// CJK 偏保守 (1 token≈1.5 汉字), 但显著优于记 0。
+func estimateInputTokens(pc PromptComponentMetrics) int {
+	chars := pc.SystemChars + pc.ToolsSchemaChars + pc.MCPToolsChars +
+		pc.SkillListingChars + pc.RoleSkillsChars + pc.MemoryChars +
+		pc.BlackboardChars + pc.PrevResultChars + pc.MessagesChars
+	if chars <= 0 {
+		return 0
+	}
+	return chars / 4
 }
 
 // stampTraceIDs 把 trace 四元组盖到记录上; CallID 每条记录独立生成。
@@ -642,6 +656,16 @@ func (c *Client) StreamMessage(
 		streamRetries := 0
 		defer func() {
 			streamRec.DurationSec = time.Since(startTS).Seconds()
+			// token 双边记账修复 (design/02 §1.4): Kimi 类兼容网关的 SSE 常不在
+			// message_start 回 input_tokens → InputTokens 恒 0, 下游 >0 守卫跳过 →
+			// 只记了输出。这里 input 缺失时按 prompt 组件字符数估算 (chars/4 近似)
+			// 并打 InputEstimated 标记, 使总量不再系统性偏小。
+			if streamRec.InputTokens == 0 {
+				if est := estimateInputTokens(streamRec.PromptComponents); est > 0 {
+					streamRec.InputTokens = est
+					streamRec.InputEstimated = true
+				}
+			}
 			streamRec.TotalTokens = streamRec.InputTokens + streamRec.OutputTokens + streamRec.CacheReadTokens + streamRec.CacheCreationTokens
 			streamRec.Retries = streamRetries
 			if streamErrMsg != "" {

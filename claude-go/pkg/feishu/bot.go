@@ -29,6 +29,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/browser"
+	"github.com/anthropic/claude-go/pkg/cluster"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/hotreload"
@@ -549,6 +550,12 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 12. 初始化 Cron 定时任务调度器
 	bot.cronSched = agent.NewCronScheduler(layout.Cron, &botCronExecutor{bot: bot})
+	// 分布式 cron 选主 (design/02 §3.4.4): 设了 CLAUDE_GO_CRON_LEASE_DIR (K8s 多副本
+	// 挂共享 PVC 到该目录) 时, 用文件租约防多副本重复触发同一定时任务。单副本不设即原样。
+	if leaseDir := strings.TrimSpace(os.Getenv("CLAUDE_GO_CRON_LEASE_DIR")); leaseDir != "" {
+		bot.cronSched.SetLease(cluster.NewFileLease(leaseDir, 5*time.Minute))
+		log.Printf("[Cron] 分布式选主已启用, 租约目录: %s", leaseDir)
+	}
 	bot.cronSched.Start()
 
 	// 13. 初始化 Vision 客户端 (复用 api.Client)

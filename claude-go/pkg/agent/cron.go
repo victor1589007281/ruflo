@@ -1,21 +1,26 @@
 // Cron — 定时任务调度器, 通过飞书控制和管理。
 //
 // 核心能力:
-//   1. 标准 cron 表达式 (分 时 日 月 周)
-//   2. 支持多种任务类型 (workflow/query/command)
-//   3. 飞书 /cron 命令 + 自然语言创建
-//   4. 持久化: 重启后自动恢复
-//   5. 任务执行结果通过飞书推送
 //
-//	┌────────────────────────────────────────────┐
-//	│ CronScheduler                              │
-//	│  AddJob()      → 添加定时任务              │
-//	│  RemoveJob()   → 删除任务                  │
-//	│  PauseJob()    → 暂停/恢复                 │
-//	│  ListJobs()    → 列出所有任务              │
-//	│  tick()        → 每分钟检查匹配的任务      │
-//	│  executeJob()  → 执行并推送结果到飞书      │
-//	└────────────────────────────────────────────┘
+//  1. 标准 cron 表达式 (分 时 日 月 周)
+//
+//  2. 支持多种任务类型 (workflow/query/command)
+//
+//  3. 飞书 /cron 命令 + 自然语言创建
+//
+//  4. 持久化: 重启后自动恢复
+//
+//  5. 任务执行结果通过飞书推送
+//
+//     ┌────────────────────────────────────────────┐
+//     │ CronScheduler                              │
+//     │  AddJob()      → 添加定时任务              │
+//     │  RemoveJob()   → 删除任务                  │
+//     │  PauseJob()    → 暂停/恢复                 │
+//     │  ListJobs()    → 列出所有任务              │
+//     │  tick()        → 每分钟检查匹配的任务      │
+//     │  executeJob()  → 执行并推送结果到飞书      │
+//     └────────────────────────────────────────────┘
 package agent
 
 import (
@@ -33,19 +38,19 @@ import (
 
 // CronJob 定时任务定义。
 type CronJob struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Schedule    string    `json:"schedule"`    // cron 表达式: "分 时 日 月 周"
-	JobType     string    `json:"jobType"`     // workflow, query, command
-	Payload     string    `json:"payload"`     // 执行内容 (任务目标/消息/命令)
-	ChatID      string    `json:"chatId"`      // 结果推送的飞书 chat_id
-	Workflow    string    `json:"workflow,omitempty"`    // jobType=workflow 时的工作流类型
-	Enabled     bool      `json:"enabled"`
-	CreatedAt   time.Time `json:"createdAt"`
-	LastRunAt   time.Time `json:"lastRunAt,omitempty"`
-	LastResult  string    `json:"lastResult,omitempty"` // 上次执行结果摘要
-	RunCount    int       `json:"runCount"`
-	FailCount   int       `json:"failCount"`
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Schedule   string    `json:"schedule"`           // cron 表达式: "分 时 日 月 周"
+	JobType    string    `json:"jobType"`            // workflow, query, command
+	Payload    string    `json:"payload"`            // 执行内容 (任务目标/消息/命令)
+	ChatID     string    `json:"chatId"`             // 结果推送的飞书 chat_id
+	Workflow   string    `json:"workflow,omitempty"` // jobType=workflow 时的工作流类型
+	Enabled    bool      `json:"enabled"`
+	CreatedAt  time.Time `json:"createdAt"`
+	LastRunAt  time.Time `json:"lastRunAt,omitempty"`
+	LastResult string    `json:"lastResult,omitempty"` // 上次执行结果摘要
+	RunCount   int       `json:"runCount"`
+	FailCount  int       `json:"failCount"`
 }
 
 // CronExecutor 执行器接口, 解耦 Bot 依赖。
@@ -63,6 +68,15 @@ type CronExecutor interface {
 }
 
 // CronScheduler 定时任务调度器。
+// CronLease 定时任务分布式租约 (design/02 §3.4.4 cron 选主)。
+// 多副本控制面下, tick 同一分钟同一 job 时先抢租约, 抢到才执行 → 防重复触发。
+// 单副本部署 lease 为 nil, 退化为原地执行 (零开销)。
+type CronLease interface {
+	// TryAcquire 原子抢占 key 的租约; 返回 true 表示本副本抢到、应执行。
+	// key 形如 "cron/<jobID>/<yyyymmddHHMM>"（分钟粒度幂等）。
+	TryAcquire(key string) bool
+}
+
 type CronScheduler struct {
 	jobs     map[string]*CronJob
 	mu       sync.RWMutex
@@ -70,7 +84,11 @@ type CronScheduler struct {
 	executor CronExecutor
 	stopCh   chan struct{}
 	nextID   int
+	lease    CronLease // 分布式租约 (可为 nil, 单副本)
 }
+
+// SetLease 注入分布式租约 (K8s 多副本控制面用)。
+func (cs *CronScheduler) SetLease(l CronLease) { cs.lease = l }
 
 // NewCronScheduler 创建调度器。
 func NewCronScheduler(dataDir string, executor CronExecutor) *CronScheduler {
@@ -288,7 +306,12 @@ func (cs *CronScheduler) tick(now time.Time) {
 	}
 	cs.mu.RUnlock()
 
+	minute := now.Format("200601021504")
 	for _, j := range toRun {
+		// 分布式租约选主 (design/02 §3.4.4): 多副本下同一 job/分钟只有抢到租约的执行。
+		if cs.lease != nil && !cs.lease.TryAcquire("cron/"+j.ID+"/"+minute) {
+			continue // 别的副本抢到了, 本副本跳过
+		}
 		go cs.executeJob(j)
 	}
 }

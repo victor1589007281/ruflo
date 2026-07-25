@@ -143,6 +143,8 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 
 	c.RecordAtTime("llm", MLLMCallCount, 1, labels, ts)
 	c.RecordAtTime("llm", MLLMDurationSec, rec.DurationSec, labels, ts)
+	// token 双边记账 (design/02 §1.4): 不再用 >0 守卫跳过 —— input 缺失时上游
+	// (api.Client) 已按字符数估算并置 InputEstimated, 此处如实记录, 使总量不偏小。
 	if rec.InputTokens > 0 {
 		c.RecordAtTime("llm", MLLMInputTokens, float64(rec.InputTokens), labels, ts)
 	}

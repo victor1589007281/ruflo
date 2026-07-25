@@ -1520,7 +1520,7 @@ func workerCmd() *cobra.Command {
 					return ctx.Err()
 				default:
 				}
-				task, err := client.Pull(kinds)
+				task, err := client.PullWithCaps(kinds, caps)
 				if err != nil {
 					log.Printf("[worker] 拉取失败: %v", err)
 					time.Sleep(poll)

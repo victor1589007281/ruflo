@@ -27,7 +27,8 @@ type Task struct {
 	RunID       string          `json:"run_id,omitempty"` // trace 四元组
 	NodeID      string          `json:"node_id,omitempty"`
 	Payload     json.RawMessage `json:"payload"`
-	Status      string          `json:"status"` // pending|leased|completed|failed
+	RequireCaps []string        `json:"require_caps,omitempty"` // 需要的能力标签 (bash/browser/k8s-sandbox); worker 须全部具备 (design/01 §4.9 Placement)
+	Status      string          `json:"status"`                 // pending|leased|completed|failed
 	Worker      string          `json:"worker,omitempty"`
 	LeaseUntil  int64           `json:"lease_until,omitempty"` // unix milli
 	Attempts    int             `json:"attempts"`
@@ -73,9 +74,16 @@ func (q *Queue) Enqueue(t Task) (string, error) {
 	return t.ID, q.kv.Put(t.ID, t)
 }
 
-// Pull worker 拉取一个可执行任务 (无任务返回 nil,false)。
-// 先回收过期租约再挑最老的 pending; kinds 为空表示接受全部 Kind。
+// Pull worker 拉取一个可执行任务 (无任务返回 nil,false)。kinds 为空=接受全部 Kind。
+// 不做能力过滤 (向后兼容); 需要能力标签路由用 PullFor。
 func (q *Queue) Pull(worker string, kinds []string) (*Task, bool, error) {
+	return q.PullFor(worker, kinds, nil)
+}
+
+// PullFor 能力感知拉取 (design/01 §4.9 / design/02 §3.3 R3): 只拉取
+// RequireCaps ⊆ workerCaps 的任务 —— 需要 browser/k8s-sandbox 等能力的任务
+// 不会被不具备该能力的 worker 拉走。
+func (q *Queue) PullFor(worker string, kinds, workerCaps []string) (*Task, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if err := q.reapLocked(); err != nil {
@@ -96,10 +104,25 @@ func (q *Queue) Pull(worker string, kinds []string) (*Task, bool, error) {
 		}
 		return false
 	}
+	capsOK := func(require []string) bool {
+		for _, need := range require {
+			has := false
+			for _, have := range workerCaps {
+				if have == need {
+					has = true
+					break
+				}
+			}
+			if !has {
+				return false // worker 缺少必需能力
+			}
+		}
+		return true
+	}
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].CreatedAt < tasks[j].CreatedAt })
 	for i := range tasks {
 		t := tasks[i]
-		if t.Status != "pending" || !kindOK(t.Kind) {
+		if t.Status != "pending" || !kindOK(t.Kind) || !capsOK(t.RequireCaps) {
 			continue
 		}
 		t.Status = "leased"

@@ -132,3 +132,23 @@ func TestWaitCompletes(t *testing.T) {
 		t.Fatalf("Wait 应返回完成态: %+v err=%v", task, err)
 	}
 }
+
+func TestPullForCapsRouting(t *testing.T) {
+	q := newQ(t, time.Minute)
+	// 需要 browser 能力的任务
+	_, _ = q.Enqueue(Task{Kind: "stage", RequireCaps: []string{"browser"}})
+	// 不具备 browser 的 worker 拉不到
+	if task, ok, _ := q.PullFor("w-bash", []string{"stage"}, []string{"bash"}); ok {
+		t.Fatalf("缺 browser 能力的 worker 不应拉到: %+v", task)
+	}
+	// 具备 browser 的 worker 能拉到
+	task, ok, _ := q.PullFor("w-browser", []string{"stage"}, []string{"bash", "browser"})
+	if !ok || task == nil {
+		t.Fatal("具备 browser 能力应拉到")
+	}
+	// 无 RequireCaps 的任务任何 worker 都能拉
+	_, _ = q.Enqueue(Task{Kind: "stage"})
+	if _, ok, _ := q.PullFor("w-any", nil, nil); !ok {
+		t.Fatal("无能力要求的任务应可被任意 worker 拉取")
+	}
+}

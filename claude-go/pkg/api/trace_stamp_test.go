@@ -26,3 +26,14 @@ func TestStampTraceIDs(t *testing.T) {
 	// 空 ids: run/node/turn 允许为空 (非团队路径), 不 panic 即可
 	stampTraceIDs(nil, trace.IDs{}) // nil 记录防御
 }
+
+// TestEstimateInputTokens 守护 design/02 §1.4 token 双边记账兜底。
+func TestEstimateInputTokens(t *testing.T) {
+	pc := PromptComponentMetrics{SystemChars: 400, MessagesChars: 800} // 1200 chars
+	if got := estimateInputTokens(pc); got != 300 {                    // 1200/4
+		t.Fatalf("估算应为 300 token, got %d", got)
+	}
+	if got := estimateInputTokens(PromptComponentMetrics{}); got != 0 {
+		t.Fatalf("无 prompt 应估 0, got %d", got)
+	}
+}
