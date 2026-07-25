@@ -697,18 +697,18 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 	// {prev_result} 占位符替换的就是这个块。此前图路径构造 StageDef 时不填 DependsOn
 	// ⇒ 依赖块恒空 ⇒ **上游产出根本没进 prompt**, {prev_result} 被替换成空串,
 	// 每个阶段都在没有上游交接的情况下干活 (灰度期没被发现是因为桩 runner 只回显
-	// prompt 长度)。这里用 PrevOutputs 的键 (即 completed 的直接前驱) 补上,
-	// 排序保证 prompt 逐次可复现。
-	deps := make([]string, 0, len(in.PrevOutputs))
-	for dep := range in.PrevOutputs {
-		deps = append(deps, dep)
-	}
-	sort.Strings(deps)
+	// prompt 长度)。这里用 PrevOutputs 的键 (即 completed 的直接前驱) 补上。
+	//
+	// 顺序取**图里的边声明序**而不是键名字典序: pipeline 侧拼依赖块遍历的是
+	// StageDef.DependsOn 的声明序, 字典序会让同一个阶段在两条路径上拿到不同的
+	// 提示词 (research 的 cross-verification 声明序是 tech/market/risk, 字典序是
+	// market/risk/tech) —— 那是等价性的直接破口, 也会打散 prompt 前缀缓存。
+	// 查不到声明序时 orderedPrevDeps 退化为字典序 (仍然确定性), 见 graph_templates.go。
 	stage := StageDef{
 		Name:      node.ID,
 		Role:      node.Agent.Role,
 		Prompt:    node.Agent.Prompt,
-		DependsOn: deps,
+		DependsOn: prevDepsWithDynamic(r.deps, node.ID, in.PrevOutputs),
 	}
 	// —— 图特有的执行上下文 (回灌 / 分片 / 待聚合分片) ——
 	var extraCtx strings.Builder
@@ -762,6 +762,32 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 		}
 	}
 	return res
+}
+
+// prevDepsWithDynamic = 声明序上游 (orderedPrevDeps) + **运行期才出现的上游**。
+//
+// orderedPrevDeps 只认声明期的边 (graphNodeDeps 从传入的 spec 抽), 于是动态展开
+// 追加的节点 (<父>/<子>) 虽然经重接线成了下游的真实前驱、产出也在 PrevOutputs 里,
+// 却不会出现在 DependsOn ⇒ 依赖块把它们整段丢掉 ⇒ "先分解、再逐项执行、再汇总"的
+// 汇总阶段看不到任何子任务产出。这里把漏掉的补在声明序之后 (自身按键名升序,
+// 保持确定性)。
+func prevDepsWithDynamic(deps map[string][]string, nodeID string, prev map[string]string) []string {
+	out := orderedPrevDeps(deps, nodeID, prev)
+	if len(out) == len(prev) {
+		return out
+	}
+	covered := make(map[string]bool, len(out))
+	for _, d := range out {
+		covered[d] = true
+	}
+	extra := make([]string, 0, len(prev)-len(out))
+	for k := range prev {
+		if !covered[k] {
+			extra = append(extra, k)
+		}
+	}
+	sort.Strings(extra)
+	return append(out, extra...)
 }
 
 // orNodeID 归因名兜底: 引擎未给 NodeRef (例如被单元测试直接调用) 时退回节点 ID。
@@ -1263,7 +1289,9 @@ func recordGraphStageMetrics(team *ProductionTeam, sr StageResult, retries int) 
 // Journal 落 <team.dataDir>/graph-journal.jsonl; Resume 恒开 —— 重放即恢复,
 // 取代 pipeline 路径的 checkpoints.json (design/01 §4.3)。
 func (we *WorkflowExecutor) executeGraph(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
-	spec, err := TranslateWorkflow(wf)
+	// 图的来源单一入口 (design/01 §五): 该 mode 有等价图模板就用模板展开的阶段序列,
+	// 否则直译 wf.Stages。模板库本身在 graph_templates.go —— 加一个 mode 模板不必碰这里。
+	spec, err := graphSpecForWorkflow(wf)
 	if err != nil {
 		return nil, err
 	}
@@ -1277,7 +1305,7 @@ func (we *WorkflowExecutor) executeGraph(ctx context.Context, wf *WorkflowDef, o
 
 	hooks := newTeamGraphHooks(we, team, spec)
 	eng := &graph.Engine{
-		Runner:  &stageNodeRunner{we: we, team: team, objective: objective},
+		Runner:  &stageNodeRunner{we: we, team: team, objective: objective, deps: graphNodeDeps(spec)},
 		Journal: journal,
 		Hooks:   hooks, // 生产此前恒 NopBus: 图模式没有阶段级刷盘/指标/心跳
 		// 并发上限与 pipeline 侧对齐: effectiveParallel 会按 API 流控状态动态收敛
@@ -1304,6 +1332,7 @@ func (we *WorkflowExecutor) executeGraph(ctx context.Context, wf *WorkflowDef, o
 	rr, runErr := eng.Run(ctx, spec, graph.RunOpts{
 		RunID:     runID,
 		Objective: objective,
+		Params:    graphRunParams(team, wf, runID),
 		Resume:    true, // 重放即恢复: journal 有已完成节点则直接吃缓存
 	})
 
@@ -1367,4 +1396,38 @@ func (h *teamGraphHooks) stageResultByID(id string) (StageResult, bool) {
 func graphEngineEnabled() bool {
 	v := strings.TrimSpace(os.Getenv("CLAUDE_GO_GRAPH_ENGINE"))
 	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// graphRunParams 图运行参数 (design/01 §4.2 MapPolicy.Source="param:<键>" 的来源)。
+//
+// 改造前 executeGraph **不传 Params**, 于是 `param:` 来源在生产恒取空 —— 表现为
+// "map 节点拿到空集合 → 整节点 skipped", 图层支持了但没通电。
+//
+// 这里只把**已存在的团队/工作流字段**暴露成参数, 不新造用户可见概念:
+// 团队上没有通用 params map, 凭空发明一个会让"参数从哪来"变成一个需要贯穿
+// 飞书/dashboard/CLI 三条入口的新设计, 那属另一件事。
+//
+// 键名带 team./wf./run. 前缀是刻意的: 将来真加了用户参数, 可以直接并进同一个 map
+// 而不会与这些派生量撞名。
+func graphRunParams(team *ProductionTeam, wf *WorkflowDef, runID string) map[string]string {
+	p := map[string]string{"run.id": runID}
+	if team != nil {
+		p["team.name"] = team.Name
+		p["team.objective"] = team.Objective
+		if team.Cwd != "" {
+			p["team.cwd"] = team.Cwd
+		}
+		if team.Language != "" {
+			p["team.language"] = team.Language
+		}
+		if team.PendingFeedback != "" {
+			// 精修反馈: 让模板能把它当集合切分 (逐条反馈扇出) 而不只是拼进 prompt。
+			p["team.feedback"] = team.PendingFeedback
+		}
+	}
+	if wf != nil {
+		p["wf.name"] = wf.Name
+		p["wf.mode"] = wf.Mode
+	}
+	return p
 }

@@ -269,6 +269,7 @@ func main() {
 	rootCmd.AddCommand(teamCmd())
 	rootCmd.AddCommand(helpCmd())
 	rootCmd.AddCommand(codeintelMCPServerCmd())
+	rootCmd.AddCommand(platformMCPServerCmd()) // L5 platform-mcp-server (design/02 §3.5)
 	rootCmd.AddCommand(wechatCmd())
 	rootCmd.AddCommand(swarmCmd())
 
@@ -1153,6 +1154,7 @@ JSON 配置文件示例:
 			// dashTeamAction 延迟绑定: 闭包捕获 botRef，在 HTTP 启动时 bot 已初始化。
 			var botRef *feishu.Bot
 			var dashCfgRef *dashboard.Config
+			var taskSvc *agent.FileQueueTaskService
 
 			if config.Wiki.APIPort > 0 {
 				// 与 bot 使用相同的 stateDir 解析逻辑，确保 dashboard 读写 metrics 路径一致。
@@ -1199,6 +1201,27 @@ JSON 配置文件示例:
 						})
 				}
 
+				// 动作队列消费方 (design/01 §4.12)。改造前 :7777 的动作队列有两处写入
+				// (dashboard 的 extra_handlers / v13_handlers) 而**全仓没有消费方** ——
+				// "等待 claude-go 主进程消费"那句提示是假承诺, 写进去的动作烂在盘上。
+				// 这里就是那个缺失的主进程消费方: 没有它, ConsumeActions 只是建成未通电。
+				//
+				// Runner 与 ActionExecutor 都走惰性取 botRef, 与 TeamAction/CronController
+				// 同一模式 —— 本段在 NewBot 内经 APIExtensions 执行, 早于 `botRef = bot`。
+				// Runner 此刻只能留空 (bot 尚未构造), NewBot 返回后经 SetRunner 注入;
+				// 在此之前若已有动作被消费, 任务会诚实地停在 pending 而不假装 running。
+				taskSvc = agent.NewFileQueueTaskService(agent.TaskServiceOptions{
+					Store:      statestore.NewFileStore(filepath.Join(stateDir, "statestore")),
+					ActionsDir: filepath.Join(stateDir, ".dashboard", "actions"),
+					ActionExecutor: agent.TeamActionExecutor(func(action, target string, payload map[string]any) error {
+						if botRef == nil {
+							return fmt.Errorf("bot 尚未初始化")
+						}
+						return botRef.DashboardTeamAction(action, target, payload)
+					}),
+				})
+				dashboard.SetActionSink(taskSvc)
+
 				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 					func(mux *http.ServeMux) {
 						dsrv := dashboard.MountOn(*dashCfgRef, mux)
@@ -1225,6 +1248,11 @@ JSON 配置文件示例:
 			botRef = bot
 			_ = dashCfgRef // suppress unused warning when Wiki.APIPort == 0
 
+			// 团队运行器就位后再注入 (bot 构造完才有 TeamManager)。
+			if taskSvc != nil && bot.TeamManager() != nil {
+				taskSvc.SetRunner(agent.NewTeamRunner(bot.TeamManager()))
+			}
+
 			// 优雅退出: 捕获 SIGINT/SIGTERM
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -1237,6 +1265,13 @@ JSON 配置文件示例:
 				bot.Shutdown()
 				cancel()
 			}()
+
+			// 周期消费动作队列。只靠 HTTP 请求内联 drain 不够: 队列里可能有
+			// 上一次进程退出时残留的 pending 动作, 没人再发请求就永远不被消费。
+			if taskSvc != nil {
+				taskSvc.StartActionConsumer(ctx, 2*time.Second)
+				fmt.Printf("[TaskService] 动作队列消费方已启动 (间隔 2s)\n")
+			}
 
 			fmt.Println("========================================")
 			fmt.Println("  Claude Code (Go) - 飞书长连接模式")

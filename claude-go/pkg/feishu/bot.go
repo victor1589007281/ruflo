@@ -34,6 +34,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/hotreload"
+	"github.com/anthropic/claude-go/pkg/llmgw"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/memory"
@@ -209,6 +210,7 @@ type Bot struct {
 	wsClient      *larkws.Client                     // WebSocket 长连接客户端
 	sessions      *SessionManager                    // 会话管理器
 	apiClient     *api.Client                        // AI API 客户端
+	llmGW         llmgw.LLMGateway                   // L1 网关视图 (design/02 §3.1): apiClient 的接口形态
 	mcpMgr        *dynmcp.Manager                    // 动态 MCP 管理器 (进程级别共享)
 	skillReg      *skills.Registry                   // 技能注册表 (进程级别共享)
 	dreamer       *dreaming.Dreamer                  // Dreaming 记忆整理引擎
@@ -370,9 +372,14 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	}
 
 	bot := &Bot{
-		config:     config,
-		client:     larkClient,
-		apiClient:  aiClient,
+		config:    config,
+		client:    larkClient,
+		apiClient: aiClient,
+		// L1 网关视图 (design/02 §3.1): 从此 bot 的非引擎类 LLM 调用只依赖
+		// llmgw.LLMGateway 接口。引擎主链路 (QueryEngine 流式 + 工具循环) 仍需
+		// api.Client 的具体能力 (Guard/熔断/FallbackModels/PromptCache 等三十余个
+		// 字段与方法), 不在本轮包进接口 —— 那要先把这些能力也抽成接口。
+		llmGW:      llmgw.NewLocal(aiClient),
 		layout:     layout,
 		stateStore: stateStore,
 		startTime:  time.Now(),
@@ -595,7 +602,11 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				wikiRepoDir = layout.Wiki
 			}
 		}
-		bot.wikiEngine = wiki.NewEngineWithLLM(wikiRepoDir, aiClient)
+		// 经 L1 网关注入 (design/02 §3.1): wiki.LLMClient 是"只有 SimpleComplete"
+		// 的最小端口, llmgw.SimpleClient 把网关适配成该端口 —— wiki 包的接口定义
+		// 一字未改, 但 /wiki/query·lint·organize·health-check 四个端点的 LLM 出站
+		// 从此走网关接口。
+		bot.wikiEngine = wiki.NewEngineWithLLM(wikiRepoDir, llmgw.SimpleClient{GW: bot.llmGW})
 		// 设置浏览器抓取器（绕过防爬虫）
 		browserCfg := browser.DefaultConfig()
 		if config.Browser.ChromePath != "" {
@@ -1058,12 +1069,23 @@ func (b *Bot) DashboardReloadSkills() {
 // CronScheduler 返回 bot 的活动定时任务调度器, 供挂载的 dashboard 注入以启用 cron 写接口。
 func (b *Bot) CronScheduler() *agent.CronScheduler { return b.cronSched }
 
+// TeamManager 返回 bot 的生产团队管理器, 供主进程构造 TaskService 的运行器
+// (design/01 §4.12): 动作队列里的 team.run 需要一个真能跑团队的执行体,
+// 否则任务只能建档停在 pending。与 CronScheduler 同一模式: 只读暴露, 不转移所有权。
+func (b *Bot) TeamManager() *agent.ProductionTeamManager { return b.teamMgr }
+
+// LLMGateway 返回 bot 的 L1 网关 (design/02 §3.1)。
+// 供需要 LLM 但不需要 api.Client 具体能力的子系统注入, 只读暴露不转移所有权
+// (与 TeamManager/CronScheduler 同一模式)。
+func (b *Bot) LLMGateway() llmgw.LLMGateway { return b.llmGW }
+
 // DashboardLLMComplete 供 dashboard 调用 bot 的 LLM 客户端 (用于 LLM 生成工作流编排)。
+// 经 L1 网关接口发出, 不再直接触碰 api.Client。
 func (b *Bot) DashboardLLMComplete(ctx context.Context, sys, user string) (string, error) {
-	if b.apiClient == nil {
+	if b.llmGW == nil {
 		return "", fmt.Errorf("LLM 客户端未初始化")
 	}
-	return b.apiClient.SimpleComplete(ctx, sys, user)
+	return b.llmGW.Simple(ctx, sys, user)
 }
 
 // --- Cron 执行器适配器 ---
@@ -3436,7 +3458,9 @@ func (b *Bot) llmDetectComplexity(ctx context.Context, text string) bool {
 		},
 	})
 
-	resp, err := b.apiClient.SimpleComplete(timeoutCtx, sysPrompt, text)
+	// 经 L1 网关接口 (design/02 §3.1)。这是每条飞书消息都会走的分类调用,
+	// 也是"网关接口被生产依赖"最热的一条证据。
+	resp, err := b.llmGW.Simple(timeoutCtx, sysPrompt, text)
 	if err != nil {
 		return heuristicComplexity(text)
 	}
