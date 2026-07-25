@@ -20,17 +20,23 @@ func TestMemoryLoaderBasic(t *testing.T) {
 	loader := memory.NewLoader(dir)
 	files := loader.LoadAll()
 
+	// 必须按**完整路径**匹配, 不能按 basename。LoadAll 会同时加载用户全局的
+	// ~/.claude/CLAUDE.md (这是正确行为), 它的 basename 也叫 CLAUDE.md;
+	// 按 basename 匹配会把全局文件也拿来断言"应含 Rule 1", 于是测试结果取决于
+	// 跑测试的人家目录里有什么 —— 非幂等, 且失败信息会把开发者的私人配置打进日志。
+	want := filepath.Join(dir, "CLAUDE.md")
 	found := false
 	for _, f := range files {
-		if filepath.Base(f.Path) == "CLAUDE.md" {
-			found = true
-			if !containsSubstr(f.Content, "Rule 1") {
-				t.Errorf("CLAUDE.md 内容不正确: %s", f.Content)
-			}
+		if f.Path != want {
+			continue
+		}
+		found = true
+		if !containsSubstr(f.Content, "Rule 1") {
+			t.Errorf("CLAUDE.md 内容不正确: %s", f.Content)
 		}
 	}
 	if !found {
-		t.Error("未找到 CLAUDE.md")
+		t.Errorf("未找到 %s (共加载 %d 个文件)", want, len(files))
 	}
 }
 
@@ -47,12 +53,20 @@ func TestMemoryLoaderInclude(t *testing.T) {
 	loader := memory.NewLoader(dir)
 	files := loader.LoadAll()
 
+	// 同上: 只断言本测试自己写下的那份, 别把用户全局 CLAUDE.md 也算进来
+	want := filepath.Join(dir, "CLAUDE.md")
+	found := false
 	for _, f := range files {
-		if filepath.Base(f.Path) == "CLAUDE.md" {
-			if !containsSubstr(f.Content, "Extra content here") {
-				t.Errorf("@include 未被处理: %s", f.Content)
-			}
+		if f.Path != want {
+			continue
 		}
+		found = true
+		if !containsSubstr(f.Content, "Extra content here") {
+			t.Errorf("@include 未被处理: %s", f.Content)
+		}
+	}
+	if !found {
+		t.Errorf("未找到 %s (共加载 %d 个文件)", want, len(files))
 	}
 }
 

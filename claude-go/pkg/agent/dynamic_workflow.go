@@ -326,6 +326,42 @@ func GenerateWorkflowDef(ctx context.Context, llm LLMClient, objective string, r
 }
 
 // mergedWorkflowList 合并内置 + 自定义工作流, 按名称排序 (供 ListWorkflows)。
+// pseudoWorkflows 是不进注册表、但 CreateTeam 显式放行的"伪工作流"。
+// 目前只有 swarm: 蜂群的初始 Agent 阵容由 LLM 动态决定, 没有预定义阶段表。
+//
+// 注意 predict 不在此列——它在 executeWorkflow 里有特判分支与完整的 runPredict
+// 实现, 却既不在注册表也不被 CreateTeam 放行, 因此**任何创建路径都到不了它**
+// (全部建团队入口都经 CreateTeam)。这是一处待决的不可达路径, 已登记进
+// design/PROGRESS.md 偏差记录; 此处不擅自放行, 因为放行等于恢复一条未经
+// 真实 LLM 验证的执行路径。
+var pseudoWorkflows = []string{"swarm"}
+
+// AvailableWorkflowNames 返回当前真正可用于建团队的工作流名(内置 + 动态注册 + 伪工作流),
+// 已排序去重。
+//
+// 为什么要有这个函数: CreateTeam 的"未知工作流"报错原先硬编码了一串名字, 结果既
+// **漏掉全部动态注册的工作流**(下游平台注册的那些一个都没列), 又**列了 debate 与
+// predict 两个实际拿不到的名字**——用户照着报错里的名字重试, 会拿到同一句报错,
+// 而报错里还写着它可用。名单必须从真源生成, 否则必然漂移。
+func AvailableWorkflowNames() []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(workflowRegistry)+len(pseudoWorkflows))
+	for _, wf := range mergedWorkflowList() {
+		if !seen[wf.Name] {
+			seen[wf.Name] = true
+			out = append(out, wf.Name)
+		}
+	}
+	for _, n := range pseudoWorkflows {
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func mergedWorkflowList() []WorkflowDef {
 	names := make([]string, 0, len(workflowRegistry))
 	for n := range workflowRegistry {

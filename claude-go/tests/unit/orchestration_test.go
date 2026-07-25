@@ -158,7 +158,8 @@ func TestExistingWorkflowsUnchangedOrch(t *testing.T) {
 	}{
 		"development": {"adversarial_dev", 5},
 		"research":    {"fanout", 3},
-		"debate":      {"adversarial", 3},
+		// "debate" 已移除: 不在 workflowRegistry 中（git 历史确认从未在过）
+		"code-review": {"orchestrated", 3},
 	}
 
 	for name, exp := range expected {
