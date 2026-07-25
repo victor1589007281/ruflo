@@ -27,17 +27,17 @@ import (
 type InternalHookPhase int
 
 const (
-	PhasePreCompact InternalHookPhase = iota  // AutoCompact / MicroCompact / BudgetDegrade
-	PhasePostCompact                           // PostCompact 外部 hook 调用
-	PhasePreRequest                            // 记忆注入 / PromptCache / MessageFilter
-	PhasePostRequest                           // XML 回退解析 / PostRequest 外部 hook
-	PhaseOnStreamDelta                         // OnChunk / OnTokenStream
-	PhasePreToolUse                            // JSONRepair / LoopDetector(输入) / DisabledTools
-	PhasePostToolUse                           // LoopDetector(产出) / StopSignal
-	PhaseOnError                               // ErrorClassifier / CircuitBreaker
-	PhaseOnRecovery                            // PTL reactive compact / fallback
-	PhaseOnStop                                // max_tokens 恢复 / Stop 外部 hook
-	PhasePostTurn                              // Turn 结束：指标 + 轨迹
+	PhasePreCompact    InternalHookPhase = iota // AutoCompact / MicroCompact / BudgetDegrade
+	PhasePostCompact                            // PostCompact 外部 hook 调用
+	PhasePreRequest                             // 记忆注入 / PromptCache / MessageFilter
+	PhasePostRequest                            // XML 回退解析 / PostRequest 外部 hook
+	PhaseOnStreamDelta                          // OnChunk / OnTokenStream
+	PhasePreToolUse                             // JSONRepair / LoopDetector(输入) / DisabledTools
+	PhasePostToolUse                            // LoopDetector(产出) / StopSignal
+	PhaseOnError                                // ErrorClassifier / CircuitBreaker
+	PhaseOnRecovery                             // PTL reactive compact / fallback
+	PhaseOnStop                                 // max_tokens 恢复 / Stop 外部 hook
+	PhasePostTurn                               // Turn 结束：指标 + 轨迹
 )
 
 // String 返回阶段的可读名称。
@@ -110,12 +110,12 @@ type HookContext struct {
 	Usage        *types.Usage
 
 	// 跨 phase 状态（由 queryLoop 维护）
-	ConsecutiveErrors int       // CircuitBreaker 用
-	ToolExecStart     time.Time // Trajectory 用
-	TurnToolSigs      []ToolSig // Trajectory 用
-	TurnUserIntent    string    // Trajectory 用
+	ConsecutiveErrors int             // CircuitBreaker 用
+	ToolExecStart     time.Time       // Trajectory 用
+	TurnToolSigs      []ToolSig       // Trajectory 用
+	TurnUserIntent    string          // Trajectory 用
 	TurnPlanMsgs      []types.Message // Trajectory 用
-	TurnStart         time.Time // Trajectory 用
+	TurnStart         time.Time       // Trajectory 用
 }
 
 // ============================================================================
@@ -297,4 +297,21 @@ func (c *HookChain) Execute(phase InternalHookPhase, ctx *HookContext) (*HookRes
 // HasPhase 检查指定 phase 是否有已注册的 hooks。
 func (c *HookChain) HasPhase(phase InternalHookPhase) bool {
 	return len(c.hooks[phase]) > 0
+}
+
+// Names 返回指定 phase 上已注册 hook 的名字（按执行顺序）。
+//
+// 用途是让"某个 hook 到底注册上了没有"可被断言/排查。这不是学术问题：
+// 多个内置 hook 的注册带 nil 守卫（如 MemoryInject 要 MemoryStore 非 nil、
+// TraceCapture 要 TraceStore 非 nil），而 registerInternalHooks 只在
+// NewQueryEngine 与 EnableFrontierOptimizations 里跑。调用方若在构造引擎
+// **之后**才赋这些组件且不再触发一次注册，hook 就静默缺席——只看有没有代码
+// 是发现不了的。
+func (c *HookChain) Names(phase InternalHookPhase) []string {
+	hs := c.hooks[phase]
+	out := make([]string, 0, len(hs))
+	for _, h := range hs {
+		out = append(out, h.Name())
+	}
+	return out
 }

@@ -56,7 +56,7 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 
 ### 1.2 三处关键开环（本方案第一优先修复）　　**[🟠 ①✅ / ②半 / ③仅团队路径]**
 
-> **实测**：① headless 实例化进化 ✅（`cmd/claude-go/main.go:796,808`）。② **只闭一半**：`MaybeCreate` 已接线（`teams.go:877`），但 **`ImproveSkill` 生产调用点仍为 0**。③ **只闭团队路径**：CLI 单轮会话/查询路径无 AfterQuery（飞书有 `session.go:863`）⇒ CLI 只有「跑团队才做梦」。
+> **实测**：① headless 实例化进化 ✅（`cmd/claude-go/main.go:796,808`）。② **只闭一半**：`MaybeCreate` 已接线（`pkg/agent/teams.go:877`），但 **`ImproveSkill` 生产调用点仍为 0**。③ **只闭团队路径**：CLI 单轮会话/查询路径无 AfterQuery（飞书有 `pkg/feishu/session.go:863`）⇒ CLI 只有「跑团队才做梦」。
 
 1. **headless `run` 不实例化进化引擎**：`cmd/claude-go/main.go:768` 的 `NewProductionTeamManager` 未设 `Evolution` 字段 → `workflow.go:758-840` 全部学习分支被 `we.evolution != nil` 守卫跳过。**CLI 跑的所有团队（下游 8+ 平台的全部流量！）零学习**。唯一装配点在飞书：`bot.go:376`。
 2. **技能自进化是死代码**：`AutoCreator` 仅构造（`bot.go:644`），全仓库对 `MaybeCreate`/`ImproveSkill` 的调用点为 **0**。
@@ -64,7 +64,7 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 
 ### 1.3 轨迹不可对齐（RL 的数据地基缺失）　　**[🟠 四元组在 / llm.jsonl 无 run_id]**
 
-> **实测**：四元组注入链真实（`pkg/trace` + `teams.go:653` + `engine.go:760` + `client.go:119`）。但 **E0 验收项「llm.jsonl 可按 run_id 聚合」未达成**：`pkg/metrics/llm_collector.go:108-135` 构造 labels 时四元组一个都没进。⚠️ 另有**三种 run_id 格式并存**：`trace.NewRunID()`（仅图路径）、`teams.go:653` 手拼、指标用裸 `team.Name` ⇒ 即便在有 run_id 的 sink 之间也 join 不上。断点：`swarm.go:770-786` 的 Trajectory 不含 RunID；`X-CG-Run-ID` 有读无写。
+> **实测**：四元组注入链真实（`pkg/trace` + `pkg/agent/teams.go:653` + `pkg/engine/engine.go:760` + `pkg/api/client.go:119`）。但 **E0 验收项「llm.jsonl 可按 run_id 聚合」未达成**：`pkg/metrics/llm_collector.go:108-135` 构造 labels 时四元组一个都没进。⚠️ 另有**三种 run_id 格式并存**：`trace.NewRunID()`（仅图路径）、`pkg/agent/teams.go:653` 手拼、指标用裸 `team.Name` ⇒ 即便在有 run_id 的 sink 之间也 join 不上。断点：`pkg/agent/swarm.go:770-786` 的 Trajectory 不含 RunID；`X-CG-Run-ID` 有读无写。
 
 要重建 (state, action, reward) 三元组，当前缺：
 - **统一 trace-id**：llm.jsonl 无 turn/session/trajectory id，与 transcript/团队轨迹只能按时间戳粗对齐;
@@ -180,7 +180,7 @@ POMDP:  state  s = (任务 objective, 图/节点上下文, 黑板, 注入的记�
 
 ### 4.1 ① TraceStore：轨迹底座　　**[🟠 Ref ✅ / Kind 3/5 / 采样 TTL 🟡]**
 
-> **实测**：Span + Ref 内联/Blob 内容寻址真实且生产接线（`tracestore.go:43-131`）。但只写出 3 种 Kind（tool_call/turn/node），**`llm_call`/`gate` 从不写** ⇒ E1 验收「任一 run 可完整还原 prompt→response→tool 链」不成立。⚠️ **`TraceCaptureHook` 在 CLI 形态永不注册**（`applyFeatureFlags` 只在 `NewQueryEngine` 内跑，而 CLI 在建引擎后才赋 TraceStore 且无 re-register）。采样 `BodySampleRate`/TTL `SweepTraceFiles` **生产调用方均为 0** ⇒ 🟡 能力就绪；长跑实例 log+blob 无限增长。
+> **实测**：Span + Ref 内联/Blob 内容寻址真实且生产接线（`pkg/evolution/tracestore/tracestore.go:43-131`）。但只写出 3 种 Kind（tool_call/turn/node），**`llm_call`/`gate` 从不写** ⇒ E1 验收「任一 run 可完整还原 prompt→response→tool 链」不成立。⚠️ **`TraceCaptureHook` 在 CLI 形态永不注册**（`applyFeatureFlags` 只在 `NewQueryEngine` 内跑，而 CLI 在建引擎后才赋 TraceStore 且无 re-register）。**此结论有可执行证据**：`pkg/engine/hook_registration_order_test.go` 用 `HookChain.Names(phase)` 断言三种赋值顺序下 hook 的有无，可直接 `go test -run TestHookRegistration -v ./pkg/engine/` 复现。采样 `BodySampleRate`/TTL `SweepTraceFiles` **生产调用方均为 0** ⇒ 🟡 能力就绪；长跑实例 log+blob 无限增长。
 
 **统一 trace-id**（与 design/01 Journal、design/02 LLMGateway 同一套）：
 
@@ -215,7 +215,7 @@ type Span struct {
 
 ### 4.2 ② RewardBus：奖励总线　　**[🟠 只写不读（零消费者）]**
 
-> **实测**：`RewardEvent` + rewards.jsonl 落盘真实（`evolution.go:146-177`），但**设计的 `Weight`（源可信度）字段不存在** ⇒ §4.6「奖励源加权」无载体。⚠️ **最关键开环：奖励零消费**——`rewards.jsonl` 的读取方全仓只有两个离线 CLI（console/skillaudit），学习反馈仍走 stage 二值（`workflow.go:896-901`）⇒ **RewardBus 是只写日志，不是总线**。H2 复合 shaped reward、H3 judge 独立性均未实现（judge 用主模型自评，**反向违反 H3**）。
+> **实测**：`RewardEvent` + rewards.jsonl 落盘真实（`pkg/agent/evolution.go:146-177`），但**设计的 `Weight`（源可信度）字段不存在** ⇒ §4.6「奖励源加权」无载体。⚠️ **最关键开环：奖励零消费**——`rewards.jsonl` 的读取方全仓只有两个离线 CLI（console/skillaudit），学习反馈仍走 stage 二值（`pkg/agent/workflow.go:896-901`）⇒ **RewardBus 是只写日志，不是总线**。H2 复合 shaped reward、H3 judge 独立性均未实现（judge 用主模型自评，**反向违反 H3**）。
 
 ```go
 type RewardEvent struct {
@@ -249,7 +249,7 @@ type RewardEvent struct {
 
 ### 4.3 ③ 学习器族：五个学习器、一个循环　　**[🟠 a ✅ / b 🟠 / c 🟠 / d ❌ / e ❌；统一循环 ❌]**
 
-> **实测**：**`EvolutionLoop` 全仓零命中** ⇒ 设计明说要取代的「飞书路径散点触发」原样保留。a 经验学习器预存能力全在 ✅，但**四条升级全未做**（数据源仍读 4k/6k 截断的 trajectories、UCB 未升 contextual bandit、反馈未接 RewardBus、无 actionable 三段式）。b 记忆整理器 ✅ 但选择性更新门/embedding/wiki 双向均无。c 技能进化：创建 ✅、改进 ❌、**影子验证与设计差距最大**（`skillaudit.go:82-87` 用「创建时间之后的全部奖励均值」裁决，**零技能归因**，同批 shadow 裁决必然相同；包注释描述的算法与实现不符）。d 工作流/Prompt 进化（AWM/GEPA/canary）全 0。e 权重导出未启动。
+> **实测**：**`EvolutionLoop` 全仓零命中** ⇒ 设计明说要取代的「飞书路径散点触发」原样保留。a 经验学习器预存能力全在 ✅，但**四条升级全未做**（数据源仍读 4k/6k 截断的 trajectories、UCB 未升 contextual bandit、反馈未接 RewardBus、无 actionable 三段式）。b 记忆整理器 ✅ 但选择性更新门/embedding/wiki 双向均无。c 技能进化：创建 ✅、改进 ❌、**影子验证与设计差距最大**（`pkg/evolution/skillaudit/skillaudit.go:82-87` 用「创建时间之后的全部奖励均值」裁决，**零技能归因**，同批 shadow 裁决必然相同；包注释描述的算法与实现不符）。d 工作流/Prompt 进化（AWM/GEPA/canary）全 0。e 权重导出未启动。
 
 **EvolutionLoop 统一调度**（取代"飞书路径散点触发"）：事件驱动（run 完成→立即小学习）+ 周期批量（空闲期→深度整理，即 dreaming 时机）+ 预算约束（学习自身的 LLM 花费单独记账）。单机跑在进程内 goroutine；分布式由 evolution 服务消费 `evolution.trace` subject（design/02 EventBus）。
 
@@ -303,7 +303,7 @@ type RewardEvent struct {
 
 ### 4.4 ④ 策略应用层　　**[🟠 经验注入同构 / hook 不同构]**
 
-> **实测**：`EvolutionRecorder` 拦截器零命中（依赖 design/01 §4.10，未实现）。经验注入确实同构（`workflow.go:820`，两形态共用）。但 ⚠️ **`MemoryInjectHook` 在 CLI 同样未注册**（与 TraceCaptureHook 同根因）⇒ **L1/L2 记忆注入在 CLI 形态失效**，设计声称的「headless 与飞书同构，开环 1 从架构上不可能再出现」**未达成**。`policy_decision` Span 零命中。
+> **实测**：`EvolutionRecorder` 拦截器零命中（依赖 design/01 §4.10，未实现）。经验注入确实同构（`pkg/agent/workflow.go:820`，两形态共用）。但 ⚠️ **`MemoryInjectHook` 在 CLI 同样未注册**（与 TraceCaptureHook 同根因；实测 CLI 顺序下 `PhasePreRequest` 只有 `[toolresult_level message_filter message_metrics]`，见 `pkg/engine/hook_registration_order_test.go`）⇒ **L1/L2 记忆注入在 CLI 形态失效**，设计声称的「headless 与飞书同构，开环 1 从架构上不可能再出现」**未达成**。`policy_decision` Span 零命中。
 
 - 注入点全部走 design/01 拦截器/hook（EvolutionRecorder 拦截器 + MemoryInjectHook），**headless 与飞书同构**——开环 1 从架构上不可能再出现；
 - 每次注入记 `policy_decision` Span（注入了哪些经验/记忆/技能/模板版本）——bandit 更新与 uplift 归因的数据基础（现 RecordInjection 的推广）。

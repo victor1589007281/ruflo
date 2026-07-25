@@ -176,6 +176,23 @@ R1 token 主路径修复 / R2 sqlite 后端 / R3 cron选主+caps路由 / E1 采�
 - ⚠️ **H1-H14 吸收项实际落地 ≈0.8/14**，本进度账全程未对其做过逐项声明。
 - 📄 design/02 有 13 处文档失真（含 `pkg/feishu/engine.go` 文件不存在、桶名含 `/` 而 `validateBucket` 白名单禁止 `/` 故结构性不可表达、"绑 loopback"在 socket 层不成立）。
 
+### 标注自查发现的自身错误（2026-07-25 二次核实）
+
+用户质疑标注不准后做了第二轮自查，确实查出三类问题，均已修正：
+
+1. **字段名写错**：design/01 §4.1 标注把 `AgentSpec` 的 `MaxTurns` 写成了 `MaxTokens`（`pkg/graph/spec.go:60-68` 实为 MaxTurns）。
+2. **引用歧义**：标注里 24 处用裸文件名（如 `engine.go:360`），而仓内 `engine.go` 有 5 个同名文件（pkg/engine、pkg/graph、pkg/orchestrator、pkg/wiki、pkg/swarm_intel）——一份以"可核验"为卖点的标注出现无法定位的引用，是实质缺陷。已全部补上包路径，并加机械自检：50 处引用现已全部可解析、逐条比对源码内容与断言一致。
+3. **行号偏移**：`pkg/graph/engine_test.go` 的"零重跑"断言在 `:422-423`，标注写成了 `:427-434`。
+4. **一次差点帮倒忙的改动（已回退）**：自动补包路径的脚本一度把**原始设计正文**里 145 处引用也改了。但正文引用是对着设计期基线 `6bd8da22f` 写的、行号早已漂移，只补路径会让它们看起来更精确而实际更误导。已回退，标注只改我自己写的那些行，原始正文保持原样。
+
+**同时把"CLI 两个 hook 不注册"从读码结论升级为可执行证据**：新增 `pkg/engine/internal_hook.HookChain.Names(phase)` 访问器与 `pkg/engine/hook_registration_order_test.go`，实测三种赋值顺序——CLI 顺序下 `PhasePreRequest` 只有 `[toolresult_level message_filter message_metrics]`（`memory_inject` 缺席），补一次 `registerInternalHooks` 或走飞书的 `EnableFrontierOptimizations` 则出现。可 `go test -run TestHookRegistration -v ./pkg/engine/` 复现。
+
+### ⚠️ 更正此前的"测试全绿"表述
+
+此前记的"32 包全通过"是**跑运气跑出来的**。`tests/unit` 有一个**既有 flaky 用例**：`TestFactStore_PersistAndReload`，连跑 5 次失败 1 次（约 20%）。失败信息里出现的是**另一个用例已被清理的临时目录**（`[FactStore] 持久化失败: open /tmp/TestFactStore_CRUD.../memory_facts.json: no such file`），即 tests/unit 内 FactStore 用例之间存在相互干扰（疑似后台衰减/持久化 goroutine 绑到了已失效的实例）。
+
+本轮未改动 `pkg/memory` 与 `tests/unit`，故属预存问题，暂未修（未在本轮范围内）。**但今后不应再用"全绿"描述该套件**——正确表述是"32 包通过，其中 tests/unit 含 1 个约 20% 概率失败的既有 flaky 用例"。
+
 ### 三份设计的独立实现度评估
 
 | 文档 | 独立核查结论 | 分母算法 |
