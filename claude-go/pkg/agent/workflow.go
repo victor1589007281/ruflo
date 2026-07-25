@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"log"
 	"math/rand"
 	"os"
@@ -27,8 +28,8 @@ import (
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/observability"
-	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/sandbox"
+	"github.com/anthropic/claude-go/pkg/trace"
 )
 
 // stageTimeout 单阶段执行超时 (防止 agent 无限循环)
@@ -70,20 +71,20 @@ func isOuterRetryDriven(ctx context.Context) bool {
 // 相邻可见, 不再跨文件漂移。pipeline/fanout 故意不在表内——fanout 目前是
 // pipeline 的空壳转调, 走 Coordinator 的检查点恢复路径收益更大。
 var dedicatedExecutorModes = map[string]bool{
-	"adversarial":     true,
-	"adversarial_dev": true,
-	"orchestrated":    true,
-	"trading_debate":  true,
-	"creative_media":  true,
-	"novel_writing":   true,
-	"swarm_novel":     true,
-	"plot_simulate":   true,
-	"plot_predict":    true,
+	"adversarial":      true,
+	"adversarial_dev":  true,
+	"orchestrated":     true,
+	"trading_debate":   true,
+	"creative_media":   true,
+	"novel_writing":    true,
+	"swarm_novel":      true,
+	"plot_simulate":    true,
+	"plot_predict":     true,
 	"ensemble_extract": true,
-	"review_panel":    true,
-	"app_composite":   true,
-	"game_composite":  true,
-	"graph":           true, // 图引擎自带 Journal 恢复, 不走 pipeline 检查点路径
+	"review_panel":     true,
+	"app_composite":    true,
+	"game_composite":   true,
+	"graph":            true, // 图引擎自带 Journal 恢复, 不走 pipeline 检查点路径
 }
 
 // ModeHasDedicatedExecutor 供 Coordinator 判断是否走 executor 专用分发。
@@ -154,34 +155,34 @@ var mysqlEssentialTargets = []string{
 // workflowRegistry 工作流名 → 构造函数. 注意: 工作流定义本身不带状态,
 // 每次按需 new 一份, 避免不同 team 之间共享同一 WorkflowDef 引用.
 var workflowRegistry = map[string]func() *WorkflowDef{
-	"development":  developmentWorkflow,
-	"app":          appCompositeWorkflow,
-	"game":         gameCompositeWorkflow,
-	"code-review":  codeReviewWorkflow,
-	"testing":      testingWorkflow,
-	"creative-v2":  creativeV2Workflow,
-	"trading-v2":   tradingV2Workflow,
-	"sector-scan":  sectorScanWorkflow,
-	"industry-map": industryMapWorkflow,
-	"novel-v2":     novelV2Workflow,
-	"novel-v3":     novelV3Workflow,
-	"plot-simulate": plotSimulateWorkflow, // 剧情模拟/演化 (swarm_intel.Simulate)
-	"plot-predict":  plotPredictWorkflow,  // 走向群体评估 (swarm_intel.Predict)
-	"graph-extract-swarm": graphExtractSwarmWorkflow, // 合议图谱抽取 (FanOut + 投票融合)
-	"review-panel":        reviewPanelWorkflow,        // 合议评审团 (FanOut + 截尾均值)
-	"ml-training":  mlTrainingWorkflow,
-	"hiring":       hiringWorkflow,
-	"parenting":    parentingWorkflow,
-	"research":     researchWorkflow,
-	"finance":      financeWorkflow,
-	"mr-worker":        mrWorkerWorkflow,        // market-radar 手脚(gemma), 单 agent
-	"quant-strategist": quantStrategistWorkflow, // market-radar 大脑(kimi), 单 agent
-	"mr-chain":         mrChainWorkflow,         // market-radar 产业链建模(kimi), 单 agent
-	"techblog":     techBlogWorkflow,
-	"creative":                       creativeWorkflow,
-	"manager-lab-rehearsal-npc":      managerLabRehearsalNPCWorkflow,
-	"manager-lab-rehearsal-critic":   managerLabRehearsalCriticWorkflow,
-	"manager-lab-simulation-v2":      managerLabSimulationV2Workflow,
+	"development":                  developmentWorkflow,
+	"app":                          appCompositeWorkflow,
+	"game":                         gameCompositeWorkflow,
+	"code-review":                  codeReviewWorkflow,
+	"testing":                      testingWorkflow,
+	"creative-v2":                  creativeV2Workflow,
+	"trading-v2":                   tradingV2Workflow,
+	"sector-scan":                  sectorScanWorkflow,
+	"industry-map":                 industryMapWorkflow,
+	"novel-v2":                     novelV2Workflow,
+	"novel-v3":                     novelV3Workflow,
+	"plot-simulate":                plotSimulateWorkflow,      // 剧情模拟/演化 (swarm_intel.Simulate)
+	"plot-predict":                 plotPredictWorkflow,       // 走向群体评估 (swarm_intel.Predict)
+	"graph-extract-swarm":          graphExtractSwarmWorkflow, // 合议图谱抽取 (FanOut + 投票融合)
+	"review-panel":                 reviewPanelWorkflow,       // 合议评审团 (FanOut + 截尾均值)
+	"ml-training":                  mlTrainingWorkflow,
+	"hiring":                       hiringWorkflow,
+	"parenting":                    parentingWorkflow,
+	"research":                     researchWorkflow,
+	"finance":                      financeWorkflow,
+	"mr-worker":                    mrWorkerWorkflow,        // market-radar 手脚(gemma), 单 agent
+	"quant-strategist":             quantStrategistWorkflow, // market-radar 大脑(kimi), 单 agent
+	"mr-chain":                     mrChainWorkflow,         // market-radar 产业链建模(kimi), 单 agent
+	"techblog":                     techBlogWorkflow,
+	"creative":                     creativeWorkflow,
+	"manager-lab-rehearsal-npc":    managerLabRehearsalNPCWorkflow,
+	"manager-lab-rehearsal-critic": managerLabRehearsalCriticWorkflow,
+	"manager-lab-simulation-v2":    managerLabSimulationV2Workflow,
 }
 
 // GetWorkflow 获取工作流: 先查内置, 再查运行时注册的动态工作流. 都没有返回 nil.
@@ -337,6 +338,7 @@ type WorkflowExecutor struct {
 	checkpoints      CheckpointStore                                                      // 检查点存取 (由 Coordinator 注入, 可为 nil)
 	promptCache      *PromptCache                                                         // 提示词缓存 (参考 Anthropic Prompt Caching)
 	concurrency      ConcurrencySuggestor                                                 // 动态并发建议 (基于 API 流控状态, 可为 nil)
+	traceStore       *tracestore.Store                                                    // 轨迹底座 (design/03 §4.1); nil = 不采集 node Span
 	activityCallback func()                                                               // 活动回调: Coordinator watchdog 心跳 (可为 nil)
 	progressCallback func(phase string, iteration int, bytesWritten int64, taskID string) // 进展上报 (可为 nil)
 }
@@ -524,7 +526,6 @@ func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults ma
 		we.notify(we.chatID, fmt.Sprintf("♻️ 从检查点恢复 %d 个已完成阶段", restored))
 	}
 }
-
 
 func (we *WorkflowExecutor) executePipeline(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	// 灰度切换 (design/01 M1): CLAUDE_GO_GRAPH_ENGINE=1 时 pipeline 走图引擎

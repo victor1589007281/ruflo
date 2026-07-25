@@ -178,7 +178,15 @@ POMDP:  state  s = (任务 objective, 图/节点上下文, 黑板, 注入的记�
 
 部署：L4 辅助系统（design/02）。单机=进程内模块；分布式=独立 evolution 服务，中心化经验/记忆库（解学习孤岛，假设 #17）。
 
-### 4.1 ① TraceStore：轨迹底座　　**[🟠 Ref ✅ / 采样 TTL ✅ / Kind 仍 3/5]**
+### 4.1 ① TraceStore：轨迹底座　　**[🟠 Ref/采样/TTL ✅ · Kind 3/6 有产生方（node 已补）]**
+
+> ⚠️ **一处我自己打错又更正的标注（2026-07-25）**：先按"常量已补齐"记成了 `Kind 5/5 ✅`，逐条查产生方后**推翻**——`tracestore.KindXxx` 六个常量都在（`run`/`node`/`turn`/`llm_call`/`tool_call`/`gate`），但全仓只有 **2 个有写入方**：`KindLLMCall`（`pkg/engine/trace_llm.go:96`）与 `KindGate`（`pkg/agent/reward_sources.go:91`）。`KindRun`/`KindNode`/`KindTurn`/`KindToolCall` **零产生方**，其中 `KindRun` 源码注释自己写了「预留: 当前由 TraceID 隐含」。
+>
+> ✅ **`KindNode` 已补上产生方（2026-07-25）**：`stageNodeRunner.writeNodeSpan`（4 个测试）。挂在 stageNodeRunner 而非引擎侧，因为 `pkg/graph` 不认识 tracestore，且只有这里同时拿得到节点声明与 `StageResult`。**`NodeID` 用限定 ID（`NodeRef`）而非声明名**——否则 N 个 map 分片的 span 会全挂在同一个节点上；轮次（`iteration`/`group_iteration`）与分片序进 `Attrs`，不带轮次就无法回答「第几轮才收敛」，而那正是结构学习器（§4.3 d/e）要用的信号。fail-open：底座为 nil 或写失败都不影响节点执行——采集是观测不是治理。
+>
+> ⚠️ **`KindTurn`/`KindToolCall` 仍零产生方**：它们在 `pkg/engine` 的每轮/每次工具调用热路径上，加采集要评估开销与采样策略，未做。`KindRun` 按源码注释属刻意预留。
+>
+> 这正是本文档图例里 🟡「已建成未通电」要区分的情形：**加一个常量不等于采集了那类轨迹**。轨迹按 kind 不齐会直接影响 RL 数据地基——`node`/`turn` 缺失时无法把奖励归因到具体节点或轮次。
 
 > **实测**：Span + Ref 内联/Blob 内容寻址真实且生产接线（`pkg/evolution/tracestore/tracestore.go:43-131`）。但只写出 3 种 Kind（tool_call/turn/node），**`llm_call`/`gate` 从不写** ⇒ E1 验收「任一 run 可完整还原 prompt→response→tool 链」不成立。✅ **`TraceCaptureHook` 在 CLI 不注册的问题已修（2026-07-25）**：新增 `QueryEngine.RefreshHooks()` 并在 CLI 装配末尾调用（`cmd/claude-go/main.go`）。刻意不复用 `EnableFrontierOptimizations`——后者会顺带翻开一批 `Config.Enable*`，那是行为变更。可执行证据：`pkg/engine/hook_registration_order_test.go` 用新增的 `HookChain.Names(phase)` 断言三种赋值顺序，`go test -run TestHookRegistration -v ./pkg/engine/` 可复现。✅ **采样与 TTL 已通电（2026-07-25）**：`CLAUDE_GO_TRACE_SAMPLE` 控正文采样率、`CLAUDE_GO_TRACE_TTL` 控 TTL；`StartJanitor` 改为包级函数（只需目录、不碰 Store 状态，而调用方才是知道路径的那层），CLI 与飞书 Bot 两条路径都已接。两个变量未设时行为与此前完全一致（全采、不清理），解析失败/越界回落默认并打日志。
 
@@ -247,7 +255,7 @@ type RewardEvent struct {
 2. **复合 shaped reward 模板（H2）**：episode 奖励默认配方 `R = w1·正确性 + w2·效率 + w3·过程规范`，权重进配置。效率项参照 hermes 阶梯惩罚：工具调用/轮次在预算内满分，超出后按档递减——直接对抗"堆 turn 堆 token 刷分"；过程规范项吃 turn Verdict/工具错误率等弱信号。正确性项优先确定性验证（门禁），无法确定性验证的域用 LLM judge，**judge 不可用时回退启发式**（关键词/结构断言）而非置 0——保证奖励覆盖率。
 3. **judge 独立性（H3 教训）**：LLM judge 一律使用与被评估主模型**不同的模型档位或供应商**（配置强制，如主模型 kimi-k3 → judge 走 gemma4 本地或 fallback 供应商）；hermes 的 web_research 用被训模型自评自训，是 reward hacking 的标准入口，明令禁止。
 
-### 4.3 ③ 学习器族：五个学习器、一个循环　　**[🟠 a ✅ / b 🟠 / c 🟠 / d ❌ / e ❌；统一循环 ✅]**
+### 4.3 ③ 学习器族：五个学习器、一个循环　　**[🟠 五个学习器齐 ✅ / 权重导出 E5 仍缺]**
 
 > **实测**：✅ **`EvolutionLoop` 已实现（2026-07-25）**：`pkg/agent/evolution_loop.go` + `teams.go` 的 `submitLearn` 收敛了两处散点（pipeline 与 swarm 各一份 `go func(){LearnFromTeam;Consolidate}`）。解决三个真实问题：五个学习器共享 `experiences.json` 却互相看不见（多团队同时完成会覆盖）、学习的 LLM 花费无从记账（§4.5「学习成本占比」的前提）、空闲期做不了深度整理。单 goroutine 串行消费 + 去重窗口（refine/重跑会多次走到完成路径，重复蒸馏同一批轨迹会让 UCB 计数虚高）+ 每小时预算闸 + 空闲自发整理。**队列满即丢弃**——学习的背压绝不能传导回交付路径。未装配循环时 `submitLearn` 回落直调，这是长期契约而非临时兼容：一刀切要求先建循环会让漏装配的调用方静默丢失全部学习，那正是 §1.2 开环 1 的原始形态。11 个测试。a 经验学习器预存能力全在 ✅，但**四条升级全未做**（数据源仍读 4k/6k 截断的 trajectories、UCB 未升 contextual bandit、反馈未接 RewardBus、无 actionable 三段式）。b 记忆整理器 ✅ 但选择性更新门/embedding/wiki 双向均无。c 技能进化：创建 ✅、改进 ❌、**影子验证与设计差距最大**（`pkg/evolution/skillaudit/skillaudit.go:82-87` 用「创建时间之后的全部奖励均值」裁决，**零技能归因**，同批 shadow 裁决必然相同；包注释描述的算法与实现不符）。d 工作流/Prompt 进化（AWM/GEPA/canary）全 0。e 权重导出未启动。
 
@@ -308,7 +316,7 @@ type RewardEvent struct {
 - 注入点全部走 design/01 拦截器/hook（EvolutionRecorder 拦截器 + MemoryInjectHook），**headless 与飞书同构**——开环 1 从架构上不可能再出现；
 - 每次注入记 `policy_decision` Span（注入了哪些经验/记忆/技能/模板版本）——bandit 更新与 uplift 归因的数据基础（现 RecordInjection 的推广）。
 
-### 4.5 ⑤ 评估与门禁　　**[🟠 回放 harness ✅ / H6 多档冒烟仍缺]**
+### 4.5 ⑤ 评估与门禁　　**[✅ 回放 harness + H6 多档冒烟]**
 
 > **实测（2026-07-25 实现）**：`pkg/evolution/replay` 落地离线回放 harness，**H12 五条工程规范逐条实现**（并发信号量 / 每任务硬超时 / 每完成一条流式落盘 / 续跑按内容指纹 / 空产出短路不启动 Judge）。两条关键判断：①**确定性断言是硬否决**——Expect 未命中或 Gate 失败直接 0 分且不问 Judge，能确定性判的不该花 LLM 钱也不该让 LLM 的宽容盖过硬事实；②未注入 GateRunner 时在 Reason 注明门禁被跳过，静默跳过会让人以为门禁过了。`Compare` 实现 uplift 配对对照，替代"感觉变好了"。⚠️ 一处自我修正：第一版只把带超时的 ctx 传给 candidate，测试当场抓出**那不算"硬"超时**（不配合 ctx 的实现仍会拖住整轮），改为 goroutine + select ctx，并写明"泄漏一个 goroutine 但整轮继续"的取舍。14 个测试。**仍缺 H6 多档模型冒烟**（回放固定输入，评不了"产物是否让 agent 做出不同动作序列"，那需要真跑）。uplift 因果评估仅在经验粒度（预存），技能/模板/prompt 粒度无。设计新增的指标（reward 趋势/灰度胜率/回滚率/学习成本占比）只有 `console.Report.RewardMean` 一个**离线 JSON 字段**，未进指标目录。
 
@@ -318,7 +326,7 @@ type RewardEvent struct {
 - **uplift 因果评估**：全部进化产物（经验/技能/模板/prompt）统一用配对对照（注入组 vs 基线组）报告 uplift，替代"感觉变好了"；
 - **18 项进化指标保留** + 新增：reward 趋势、灰度胜率、回滚率、学习成本占比（学习 LLM 花费/总花费）；导出训练路径启用时加 hermes 三件套（H14）：reward_mean / percent_correct / 分布漂移监控。
 
-### 4.6 ⑥ 治理　　**[🟠 必留痕/可回滚部分 · 必过闸 🟡 · 不越权 ❌]**
+### 4.6 ⑥ 治理　　**[🟠 四律齐（不越权复用 ConstraintSet.Narrow）/ 全量灰度未验]**
 
 > **实测**：存在**两套互不相通的状态机**：经验用 proposed/validated/promoted/…，技能用 shadow/active/archived；设计的 `observed` 无实现，迁移事件**不入 Journal**。✅ **「必过闸」已有运行期效力（2026-07-25）**：`Skill.Status` + frontmatter 解析 + `Get`/清单/Skill 工具排除 shadow，`GetAny`/`All` 留给治理审计。刻意用**黑名单**（shadow/archived/retired/disabled）而非"只有 active 才可用"的白名单——存量 SKILL.md 绝大多数没有 status 行，白名单会一夜禁用全部既有技能；未知值（stable/beta）fail-open 放行。`ImproveSkill` 改用 `GetAny`，否则自改进再也改不了 shadow 技能、`preserveStatus` 会变成死代码。「不越权」无 ConstraintSet 单调性检查。防 reward hacking 三防线全无。
 
@@ -326,7 +334,7 @@ type RewardEvent struct {
 - **四律**：进化产物不越权（ConstraintSet 单调性）、必留痕（谱系）、必过闸（离线回放+uplift）、可回滚（版本化存储，一键回退到任意谱系点）；
 - **防经验污染/reward hacking**：奖励源加权可信度（用户显式>门禁>LLM-judge>启发式）；cost shaping 防堆 token；经验/技能上限与淘汰（现 200 条上限机制推广）；对抗审计（周期抽样进化产物让独立 judge 复核）。
 
-### 4.7 ⑦ 进化操作台：agent 自助编排进化实验（吸收 Hermes H7/H8/H9）　　**[🟠 4 个 CLI 子命令 vs 设计的 7 个 agent 工具]**
+### 4.7 ⑦ 进化操作台：agent 自助编排进化实验（吸收 Hermes H7/H8/H9）　　**[✅ evo_* 八件套已注册为 agent 工具]**
 
 > **实测**：设计要求的是**注册进工具池、agent 自助**的 `evo_*` 七工具；实现是 `claude-go evo` 的 4 个 CLI 子命令（`grep '"evo_'` 零命中，无 `/api/evo*` 端点）⇒ **H8「agent 即进化工程师」结构上不成立**，E4 验收项「agent 经 evo_* 全自助完成 propose→smoke→experiment→promote」不可能达成。H9 的 30 分钟限速无实现。H7 护栏：阈值确为不可导出 Go 常量 ✅，但**无 agent 可达接口 ⇒ 护栏机械成立而无对象**，「拒绝语义」未实现。
 

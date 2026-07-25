@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/graph"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
@@ -745,8 +746,10 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 	// (NodeSpec.Retry / Policies.DefaultRetry), 内层 executeStageWithRetry 必须
 	// 退化为"1 次 + 1 次校验修正", 否则 图(1+6) × 内层(1+3+限流20) 会变成
 	// 嵌套放大 —— 这正是 design/01 §4.3 要消除的东西。
+	nodeStart := time.Now()
 	sr := r.executorForNode(node).ExecuteSingleStage(WithOuterRetryDriven(ctx), stage, objective, in.PrevOutputs, r.team)
 	res := graph.NodeResult{Output: sr.Output, Err: sr.Error}
+	r.writeNodeSpan(ctx, node, in, sr, nodeStart)
 	if sr.Status == TaskCompleted {
 		res.Status = graph.NodeStatusCompleted
 	} else {
@@ -1477,4 +1480,85 @@ func invalidateGraphJournal(ctx context.Context, team *ProductionTeam, stages []
 	}
 	logging.Event(ctx, "graph.invalidate", "team", team.Name, "run", runID, "reason", reason,
 		"nodes", fmt.Sprintf("%d", len(stages)), "stages", strings.Join(stages, ","))
+}
+
+// writeNodeSpan 采集 node 轨迹 (design/03 §4.1 KindNode)。
+//
+// 为什么必须有它: `tracestore.KindNode` 常量早就在, 但**全仓零产生方** —— 于是
+// design/03 的轨迹底座只有 llm_call 与 gate 两类。缺了 node 这一层, 奖励就无法
+// 归因到具体节点 (只能归到整个 run 或某次 LLM 调用), 而"哪个阶段该改"正是结构
+// 学习器 (§4.3 d/e) 要回答的问题。加一个常量不等于采集了那类轨迹。
+//
+// 挂在 stageNodeRunner 而非引擎侧: 引擎 (pkg/graph) 不认识 tracestore, 且这里才
+// 同时拿得到节点声明与 StageResult (角色/状态/产出/重试)。
+//
+// fail-open: traceStore 为 nil 或写失败都不影响节点执行 —— 采集是观测, 不是治理。
+func (r *stageNodeRunner) writeNodeSpan(ctx context.Context, node graph.NodeSpec, in graph.NodeInput, sr StageResult, start time.Time) {
+	if r == nil || r.we == nil || r.we.traceStore == nil {
+		return
+	}
+	ids := trace.From(ctx)
+	attrs := map[string]any{
+		"kind":   string(node.Kind),
+		"role":   node.Agent.Role,
+		"status": string(sr.Status),
+	}
+	if r.team != nil {
+		attrs["team"] = r.team.Name
+	}
+	// 轮次/分片进 attrs: 同一节点在 loop/map 下会产多条 span, 不带轮次无法区分,
+	// 也就无法按"第几轮才收敛"做结构学习。
+	if in.Iteration > 0 {
+		attrs["iteration"] = in.Iteration
+	}
+	if in.GroupIteration > 0 {
+		attrs["group_iteration"] = in.GroupIteration
+	}
+	if in.Shard != nil {
+		attrs["shard_index"] = in.Shard.Index
+		attrs["shard_total"] = in.Shard.Total
+	}
+	// NodeID 用**限定 ID**(NodeRef): 分片与组内成员的 span 必须能各自归因,
+	// 用声明名会把 N 个分片的 span 全挂在同一个节点上。
+	nodeRef := orNodeID(in.NodeRef, node.ID)
+	r.we.traceStore.Write(tracestore.Span{
+		TraceID:   ids.RunID,
+		SpanID:    newSpanID(),
+		ParentID:  ids.RunID,
+		Kind:      tracestore.KindNode,
+		Name:      node.ID,
+		NodeID:    nodeRef,
+		InputRef:  r.we.traceStore.MakeRef(stageSpanInput(node, in)),
+		OutputRef: r.we.traceStore.MakeRef(sr.Output),
+		Attrs:     attrs,
+		TS:        start.UnixMilli(),
+		DurMS:     time.Since(start).Milliseconds(),
+	})
+}
+
+// stageSpanInput 节点输入的可读摘要 (进 InputRef, 长文本由 MakeRef 内容寻址)。
+// 只取"这个节点看到了什么", 不重复整图 objective —— 后者在 run 级已有。
+func stageSpanInput(node graph.NodeSpec, in graph.NodeInput) string {
+	var b strings.Builder
+	b.WriteString("role=" + node.Agent.Role + "\n")
+	if in.Feedback != "" {
+		b.WriteString("feedback=" + in.Feedback + "\n")
+	}
+	if in.Shard != nil {
+		b.WriteString("shard=" + in.Shard.Value + "\n")
+	}
+	for _, dep := range sortedKeys(in.PrevOutputs) {
+		b.WriteString("--- from " + dep + " ---\n" + in.PrevOutputs[dep] + "\n")
+	}
+	return b.String()
+}
+
+// sortedKeys 确定性遍历 (span 内容需可比对)。
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

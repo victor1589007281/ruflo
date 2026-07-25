@@ -43,9 +43,9 @@ import (
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/logging"
-	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
+	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -219,25 +219,25 @@ type ConcurrencySuggestor interface {
 
 // ProductionTeamManager 生产级团队管理器
 type ProductionTeamManager struct {
-	teams       map[string]*ProductionTeam
-	mu          sync.RWMutex
-	baseDir     string
-	cwd         string // 项目工作目录 (传递给团队, 用于编译验证)
-	factory     CreateAgentFunc
-	notify      NotifyFunc
-	mediaNotify MediaNotifyFunc
-	taskTracker TaskTracker          // 复用 V2 Task 系统
-	pool        *AgentPool           // Agent 池 (动态扩缩)
-	llm         LLMClient            // LLM 客户端 (蜂群分解)
-	evolution   *EvolutionEngine     // 自动进化引擎
-	evoLoop     *EvolutionLoop       // 统一学习调度循环 (design/03 §4.3); nil = 回落到直调路径
-	traceStore  *tracestore.Store    // 轨迹底座 (design/03 §4.1); nil = 不采集 gate Span
-	dreamer     DreamRecorder        // Dreaming 接口 (覆盖 team agent 会话)
-	skillCreator SkillAutoCreator    // 技能自创建器 (团队干净成功后提炼 shadow 技能)
-	roles       *RoleRegistry        // 角色注册表
-	memWriter   MemoryWriter         // 记忆写入 (团队完成后写入高权重记忆)
-	metrics     *metrics.Collector   // 持续观测指标采集器
-	concurrency ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
+	teams        map[string]*ProductionTeam
+	mu           sync.RWMutex
+	baseDir      string
+	cwd          string // 项目工作目录 (传递给团队, 用于编译验证)
+	factory      CreateAgentFunc
+	notify       NotifyFunc
+	mediaNotify  MediaNotifyFunc
+	taskTracker  TaskTracker          // 复用 V2 Task 系统
+	pool         *AgentPool           // Agent 池 (动态扩缩)
+	llm          LLMClient            // LLM 客户端 (蜂群分解)
+	evolution    *EvolutionEngine     // 自动进化引擎
+	evoLoop      *EvolutionLoop       // 统一学习调度循环 (design/03 §4.3); nil = 回落到直调路径
+	traceStore   *tracestore.Store    // 轨迹底座 (design/03 §4.1); nil = 不采集 gate Span
+	dreamer      DreamRecorder        // Dreaming 接口 (覆盖 team agent 会话)
+	skillCreator SkillAutoCreator     // 技能自创建器 (团队干净成功后提炼 shadow 技能)
+	roles        *RoleRegistry        // 角色注册表
+	memWriter    MemoryWriter         // 记忆写入 (团队完成后写入高权重记忆)
+	metrics      *metrics.Collector   // 持续观测指标采集器
+	concurrency  ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
 
 	planCfgResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
 	hookRunner      *hooks.Runner       // Hook 执行器 (TeammateIdle / TaskCompleted)
@@ -249,15 +249,15 @@ type ProductionTeamManager struct {
 
 // TeamManagerConfig 团队管理器配置。
 type TeamManagerConfig struct {
-	BaseDir            string
-	Cwd                string // 项目工作目录 (用于编译验证)
-	Factory            CreateAgentFunc
-	Notify             NotifyFunc
-	MediaNotify        MediaNotifyFunc
-	TaskTracker        TaskTracker
-	Pool               *AgentPool
-	LLM                LLMClient
-	Evolution          *EvolutionEngine
+	BaseDir     string
+	Cwd         string // 项目工作目录 (用于编译验证)
+	Factory     CreateAgentFunc
+	Notify      NotifyFunc
+	MediaNotify MediaNotifyFunc
+	TaskTracker TaskTracker
+	Pool        *AgentPool
+	LLM         LLMClient
+	Evolution   *EvolutionEngine
 	// EvolutionLoop 统一学习循环 (design/03 §4.3)。非 nil 时团队完成的学习经它调度
 	// (去重/预算/串行/空闲期整理); nil 则回落到直调, 见 submitLearn。
 	EvolutionLoop *EvolutionLoop
@@ -800,6 +800,7 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		pool:            ptm.pool,
 		checkpoints:     coord, // 注入 Coordinator 作为 CheckpointStore
 		concurrency:     ptm.concurrency,
+		traceStore:      ptm.traceStore, // design/03 §4.1: 让图节点也产 node Span
 	}
 
 	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)

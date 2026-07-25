@@ -127,7 +127,7 @@
 
 依赖方向：L5→L2→L3→L1，L4 被 L2/L3/L5 共享；**严禁反向依赖**（现状 Bot 上帝对象即全层互抱）。
 
-### 3.1 L1 · LLM 引擎层（LLM Gateway）　　**[🟠 网关可接入 / 接口仍未被生产依赖]**
+### 3.1 L1 · LLM 引擎层（LLM Gateway）　　**[🟠 接口已被 9 处生产依赖 · trace 四元组已通电 / 两处客户端例外]**
 
 > **实测**：`LLMGateway` 接口存在（`pkg/llmgw/gateway.go:26-33`）但 **`NewLocal` 全仓唯一调用方是自己的测试**；生产 `pkg/feishu/bot.go:305,419` 直接 `api.NewClient` ⇒「上层只依赖本接口」未发生。`ChatRequest` **无 Trace 字段**（设计要求必带四元组）。网关只做路由 + access.jsonl：**fallback/429 熔断/配额/prompt cache 全无**，OpenAI 协议未实现。✅ **`CLAUDE_GO_LLM_GATEWAY` 已通电（2026-07-25）**：新增 `modelconfig.ApplyGatewayOverride`，覆盖点选在 `ConfigResolver` 的 4 个出口而非各 `api.NewClient` 调用点（后者散落 feishu/CLI/advisor/worker 多处，逐个改必然漏）；**fallback 端点一并改指网关**，否则主端点走网关而降级直连，集中记账在最需要时失效。⚠️ 但 `LLMGateway` **接口本身**仍未被生产依赖（`NewLocal` 唯一调用方仍是自测），故本层整体仍为 🟠：网关可接入了，但"上层只依赖本接口"未达成。
 
@@ -165,7 +165,17 @@ type LLMGateway interface {
 - **节点执行下发**：`NodeTask` 写入任务队列（EventBus 的 task subject），L3 worker 按能力标签拉取；结果以 `node.completed` 事件回流。本地模式下队列=进程内 channel，行为与现状同步调用等价。
 - **watchdog 分布式化**：节点级心跳变为 worker 定期上报 lease 续约；lease 过期=停滞，编排器按 RetryPolicy 重派（等价 `coordinator.go:264` 双层检测）。
 
-### 3.3 L3 · Agent 运行时（Worker）　　**[🟠 拉取循环 ✅ / 执行体是桩]**
+### 3.3 L3 · Agent 运行时（Worker）　　**[🟠 执行体真实 ✅ / 逐节点 Placement、cwd 三档位仍缺]**
+
+> ✅ **执行体已真实（2026-07-25）**：新增 `pkg/worker`（协议/Broker/远程 runtime/worker 循环，29 个测试）+ 独立二进制 `cmd/claude-go-worker`。改造前**两头都断**：控制面侧 `pkg/agent` 零 `pkg/cluster` import、`RuntimeRegistry` 里只有 `localRuntime`——控制面**没有任何办法**把节点派出去；worker 侧 `cmd/claude-go/main.go:1702 executeWorkerTask` 把 payload 回显成 `{"echo":...}` 并自带注释「v1 简化实现」。
+>
+> **接在 `CreateAgentFunc` 而不是 `graph.NodeRunner`**（最关键的决策）：换 factory 让 journal 记账天然一致（事件是引擎在 `RunNode` **外面**记的，远程走同一调用点）、gate/map/reduce/loop 的 prompt 组装一行不用抄、且 **`pkg/graph` 零改动**。自写 NodeRunner 旁路 `stageNodeRunner` 就得复制它的 prompt 组装并自补 journal 语义，两份必然漂移。
+>
+> 几处必须这样定的语义：**终态只认队列，事件流只是观测流**（事件走 best-effort HTTP，拿它当终态时丢包＝静默成功；增量事件非阻塞发、终态阻塞发——否则缓冲满会把终态挤掉，`CollectRuntimeOutput` 读成「空产出＋nil 错误」）；`StageResult` **带协议标记**（旧桩的回显 JSON 能被任何宽松解码器"成功"解析成空产出）；**队列级 `MaxAttempts=1`**（§4.3 重试单层化是本仓成文教训，队列再补一层就是第三层；worker 崩溃靠图层 RetryPolicy 重跑，那时死 worker 已被租约剔除，`Pick` 自然换机器）；**长任务必须续租**（默认租约 5min 而编码阶段动辄 10min+，`Queue.Extend` 此前全仓无执行侧调用方）；**远程 worker 不得叫 `local-*`**（否则 `isLocalRuntimeName` 会让 `Prefer:"local"` 给它加分＝把跨机执行伪装成本机执行）。
+>
+> 顺带修 `pkg/cluster/http.go` 的一处 **fail-open**：`Client.post` 拿到状态码却只是返回它，而 `Heartbeat`/`Complete`/`Fail` 三个调用方全写成 `_, err :=`——401（没配 token）与 400（"任务不在你的租约内"）在 worker 侧**全是静默成功**；上报终态被拒却当成功，任务就永远停在 `leased` 直到租约过期。
+>
+> ⚠️ **仍缺**：**逐节点 Placement**（`graph.AgentSpec` 没有 `Placement` 字段，现只有进程级默认 + 团队亲和，"需要 browser 的那个节点去 browser 池"做不到）；**cwd 三档位（local/pvc/git）未实现**，只做了 fail-closed 的"能不能提供"判定，故**跨机产码工作流仍不可用**（远程写的文件控制面的编译门禁看不到，即设计风险④）；swarm 路径仍纯本地（`AgentPool.factory` 未换）；k8s-job runtime 未接；旧 `claude-go worker` 子命令仍是桩（仓里暂有两个 worker 入口）。
 
 > **实测**：worker 拉取 + 心跳循环真实（`cmd/claude-go/main.go:1548-1600`），但 **`executeWorkerTask` 只回显 payload**（`:1609-1621`，自带注释「v1 简化实现…R3 后续接完整引擎」）⇒ 整条 L3 远程执行为 0。「worker 不依赖本机状态目录」成立只因它什么都不做——没有引擎装配、没有 prompt/skills/tools。cwd 三档位（local/pvc/git）未实现。
 
@@ -256,7 +266,7 @@ design/01 TaskService 落在此层：Submit 幂等键（收编 `teams.go:328` �
 
 design/03 的 Evolution Service 整体作为 L4 组件：单机=进程内模块，分布式=独立服务（中心化经验/记忆库，解假设 #17 学习孤岛）。
 
-### 3.5 L5 · 用户层　　**[❌ 大部分未实现]**
+### 3.5 L5 · 用户层　　**[🟠 契约测试 ✅ · platform-mcp ✅ · 出站地址 ✅ / CLI --server、adapter 拆分、sync→TaskService ❌]**
 
 > **实测**：飞书 Bot 上帝对象原样；CLI `--server` 零命中；`platform-mcp-server` 零命中；dashboard→控制面仍以惰性回调为主路径且 `BotAPIURL` **硬编码回环**（`cmd/claude-go/main.go:2219`）。:18080 端点契约未改 ✅，但 §七风险①要求的**表驱动契约测试不存在**。
 
@@ -274,7 +284,9 @@ design/03 的 Evolution Service 整体作为 L4 组件：单机=进程内模块�
 
 ---
 
-## 四、部署形态　　**[🟠 T0 ✅ / T1 🟡 断链 / T2 🟠 / T3 🟠 声明级]**
+## 四、部署形态　　**[🟠 T0 ✅ / T1 🟡 断链 / T2 worker 腿 ✅ / T3 🟠 声明级]**
+
+> **一处标注更正（2026-07-25）**：此前把「worker 分离」错记在 T1 名下。**T1 是网关分离**（`+claude-go llm-gateway`），它的断链是 remote LLM 实现未落地（属 `pkg/llmgw`）；**worker 分离是 T2**。2026-07-25 接通的是 §3.3 执行体 + T2 的 worker 腿 + R3（worker 拉取 / RuntimeCaps 标签路由 / 心跳续租），**不是 T1**。
 
 > **实测**：⚠️ **「实测跑通」的证据强度需下调**：仓内零 shell 脚本、零 Makefile、零 CI、零 kubectl 输出，V2/V3 结论只存在于 `PROGRESS.md` 文字里。~~且 monolith 与 control 都没传 `--config`，而配置自动发现路径不含 `/etc/claude-go/` ⇒ 挂载的 ConfigMap 从未被读取~~ ✅ **已修（2026-07-25）**：`ResolveJSONConfigPath` 的发现列表补上容器约定路径 `/etc/claude-go/config.json`（放最后，本机开发时家目录配置优先），挂载的 ConfigMap 现在会被读取。⚠️ 但此前记录的 V2/V3"双模式实测全通"仍应按**存活冒烟**理解——那次跑的是修复前的二进制，Pod 落在占位 provider 分支、不接触 LLM。T3 的 control state 是 emptyDir 且 replicas>1 会立即分裂。`layers: {llm,bus,state}` 配置项不存在；「进程间嵌入式 NATS」无依赖。
 

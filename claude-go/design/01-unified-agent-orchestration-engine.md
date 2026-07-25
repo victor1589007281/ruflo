@@ -335,9 +335,9 @@ type SkillSelector struct {
 - 节点内 agent 通过 `SpawnSubgraph(spec, params)` 工具派生子图（受 ConstraintSet 单调性约束、计入父节点预算）。取代"factory 创建裸 QueryEngine"（`teams.go:158`、`feishu/session.go:807-830`、`main.go:2639`）——**subagent 从此对编排层可见**：有 NodeID、进 Journal、受 hook/预算/轨迹覆盖。
 - 现有 `cliAgentRunner`/`sessionAgentRunner` 改为 AgentRuntime 的两个实现（见 4.9），行为不变。
 
-### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[🟠 接口与放置已落地 / 远程实现待 design/02 R3]**
+### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[🟠 接口 ✅ · 远程实现 ✅ / 逐节点 Placement、k8s-job 仍缺]**
 
-> **实测（2026-07-25 实现）**：`pkg/agent/runtime.go` 落地 `AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps`/`Placement`（硬约束过滤 + 软偏好打分 + 团队亲和 + 租约过期剔除），并用 `NewLocalRuntime` 把既有 `CreateAgentFunc` 收编为本地 runtime（**不改动 cliAgentRunner/sessionAgentRunner 两个既有实现**）。⚠️ **一处对设计稿的偏离**：接口定在 `pkg/agent` 而非 `pkg/graph/runtime.go`——要被收编的三个执行器都在 pkg/agent 及其上层，而 pkg/graph 是纯调度内核不认识 agent 语义，放进去会让内核反向依赖 RunMetadata/ToolProfile/团队 cwd。折中是图侧继续用 `NodeRunner`，`stageNodeRunner` 作桥，**pkg/graph 零改动**。⚠️ 澄清名字撞车：`pkg/cluster` 的 `RequireCaps` 是队列标签过滤（布尔匹配无打分），本文的 `Placement` 才是放置策略；前者是后者求解后用于跨机路由的投影。**仍缺**：k8s-job runtime（`pkg/sandbox/k8s_runner.go` 尚未接为 AgentRuntime）与远程 runtime（design/02 R3）。关键语义：团队亲和权重高于任何 Prefer（产码门禁在 `<cwd>/go.mod` 上跑，节点散落会让上一阶段的代码消失）；同分按名字升序保证放置确定性。11 个测试。
+> **实测（2026-07-25 实现）**：`pkg/agent/runtime.go` 落地 `AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps`/`Placement`（硬约束过滤 + 软偏好打分 + 团队亲和 + 租约过期剔除），并用 `NewLocalRuntime` 把既有 `CreateAgentFunc` 收编为本地 runtime（**不改动 cliAgentRunner/sessionAgentRunner 两个既有实现**）。⚠️ **一处对设计稿的偏离**：接口定在 `pkg/agent` 而非 `pkg/graph/runtime.go`——要被收编的三个执行器都在 pkg/agent 及其上层，而 pkg/graph 是纯调度内核不认识 agent 语义，放进去会让内核反向依赖 RunMetadata/ToolProfile/团队 cwd。折中是图侧继续用 `NodeRunner`，`stageNodeRunner` 作桥，**pkg/graph 零改动**。⚠️ 澄清名字撞车：`pkg/cluster` 的 `RequireCaps` 是队列标签过滤（布尔匹配无打分），本文的 `Placement` 才是放置策略；前者是后者求解后用于跨机路由的投影。✅ **远程 runtime 已落地（2026-07-25）**：`pkg/worker` 的 `remoteRuntime` 实现本接口并经 `Broker.Sync` 从 `cluster.Registry` 注册进 `RuntimeRegistry`（心跳续租，掉线由既有租约机制剔除），详见 design/02 §3.3。**仍缺**：k8s-job runtime（`pkg/sandbox/k8s_runner.go` 尚未接为 AgentRuntime）；**逐节点 Placement**——`AgentSpec` 没有 `Placement` 字段，现只有进程级默认 + 团队亲和。关键语义：团队亲和权重高于任何 Prefer（产码门禁在 `<cwd>/go.mod` 上跑，节点散落会让上一阶段的代码消失）；同分按名字升序保证放置确定性。11 个测试。
 
 ```go
 // pkg/graph/runtime.go —— 本文只定义接口与调度语义；网络化实现见 design/02
