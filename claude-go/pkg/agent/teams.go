@@ -229,6 +229,7 @@ type ProductionTeamManager struct {
 	pool        *AgentPool           // Agent 池 (动态扩缩)
 	llm         LLMClient            // LLM 客户端 (蜂群分解)
 	evolution   *EvolutionEngine     // 自动进化引擎
+	evoLoop     *EvolutionLoop       // 统一学习调度循环 (design/03 §4.3); nil = 回落到直调路径
 	dreamer     DreamRecorder        // Dreaming 接口 (覆盖 team agent 会话)
 	skillCreator SkillAutoCreator    // 技能自创建器 (团队干净成功后提炼 shadow 技能)
 	roles       *RoleRegistry        // 角色注册表
@@ -255,6 +256,9 @@ type TeamManagerConfig struct {
 	Pool               *AgentPool
 	LLM                LLMClient
 	Evolution          *EvolutionEngine
+	// EvolutionLoop 统一学习循环 (design/03 §4.3)。非 nil 时团队完成的学习经它调度
+	// (去重/预算/串行/空闲期整理); nil 则回落到直调, 见 submitLearn。
+	EvolutionLoop *EvolutionLoop
 	Dreamer            DreamRecorder
 	Roles              *RoleRegistry
 	MemWriter          MemoryWriter
@@ -348,6 +352,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		pool:            cfg.Pool,
 		llm:             cfg.LLM,
 		evolution:       cfg.Evolution,
+		evoLoop:         cfg.EvolutionLoop,
 		dreamer:         cfg.Dreamer,
 		skillCreator:    cfg.SkillCreator,
 		roles:           cfg.Roles,
@@ -469,6 +474,31 @@ type BGAgent struct {
 	// 实时心跳 (运行中由 Coordinator 心跳回填, 供 team status / dashboard 观测团队内部)。
 	Phase    string    `json:"phase,omitempty"`    // 当前阶段: LLM生成/编译/测试/等待
 	LastBeat time.Time `json:"lastBeat,omitempty"` // 上次心跳时间
+}
+
+// submitLearn 提交一次团队完成的学习请求。
+//
+// 这里刻意保留**两条路径**: 装配了 EvolutionLoop 就走循环 (受去重/预算/串行约束,
+// design/03 §4.3), 否则回落到原来的 `go func(){LearnFromTeam;Consolidate}` 直调。
+// 回落不是临时兼容而是长期契约 —— CLI/headless 与各下游平台的装配各不相同, 一刀切
+// 要求必须先建循环会让任何漏装配的调用方**静默丢失全部学习**, 那正是 design/03
+// §1.2 开环 1 的原始形态。
+func (ptm *ProductionTeamManager) submitLearn(teamName string) {
+	if ptm.evolution == nil {
+		return
+	}
+	if ptm.evoLoop != nil {
+		ptm.evoLoop.Submit(LearnRequest{Kind: LearnTeamDone, Team: teamName})
+		return
+	}
+	mc := ptm.metrics
+	go func() {
+		ptm.evolution.LearnFromTeam(context.Background(), teamName)
+		ptm.evolution.Consolidate()
+		if mc != nil {
+			ptm.evolution.CollectMetrics(mc)
+		}
+	}()
 }
 
 // StageResult 阶段执行结果
@@ -864,17 +894,9 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 		})
 	}
 
-	// 触发进化学习 (DISTILL: 从轨迹中提炼经验) + 采集进化指标
-	if ptm.evolution != nil {
-		mc := ptm.metrics
-		go func() {
-			ptm.evolution.LearnFromTeam(context.Background(), team.Name)
-			ptm.evolution.Consolidate()
-			if mc != nil {
-				ptm.evolution.CollectMetrics(mc)
-			}
-		}()
-	}
+	// 触发进化学习 (DISTILL: 从轨迹中提炼经验) + 采集进化指标。
+	// 经统一循环提交 (design/03 §4.3), 循环未装配时回落到原来的直调路径。
+	ptm.submitLearn(team.Name)
 
 	// 技能自创建 (design/03 §1.2 开环2 接线): 仅全阶段通过的干净成功才尝试提炼,
 	// 是否值得由 LLM 自判 (AutoCreator 内含判据); 产物 frontmatter 带 status: shadow,
@@ -1270,17 +1292,8 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 		}
 	}
 
-	// 触发进化学习 + Dreaming + 进化指标采集
-	if ptm.evolution != nil {
-		mc := ptm.metrics
-		go func() {
-			ptm.evolution.LearnFromTeam(context.Background(), team.Name)
-			ptm.evolution.Consolidate()
-			if mc != nil {
-				ptm.evolution.CollectMetrics(mc)
-			}
-		}()
-	}
+	// 触发进化学习 + Dreaming + 进化指标采集 (同 pipeline 路径, 经统一循环)
+	ptm.submitLearn(team.Name)
 	if ptm.dreamer != nil {
 		for _, r := range results {
 			ptm.dreamer.RecordSession(DreamSessionRecord{
