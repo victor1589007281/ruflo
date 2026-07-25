@@ -958,6 +958,7 @@ func (r *stageNodeRunner) executorForNode(node graph.NodeSpec) *WorkflowExecutor
 //     上游产出非空 + 结构化即通过; 真编译门禁在 GateEnforcer/产码工作流)
 //   - 其余 (content/quality/评审/默认): LLM 内容质量评审 (复用 runContentCritic)
 func (r *stageNodeRunner) runGate(ctx context.Context, node graph.NodeSpec, in graph.NodeInput) graph.NodeResult {
+	gateStart := time.Now()
 	// 取待评审产出: 优先直接前驱的产出, 否则全部上游拼接
 	deliverable := gatePickDeliverable(in.PrevOutputs)
 
@@ -970,10 +971,12 @@ func (r *stageNodeRunner) runGate(ctx context.Context, node graph.NodeSpec, in g
 				score = 90
 			}
 		}
+		out := fmt.Sprintf(`{"gate":"deterministic","score":%.0f}`, score)
+		r.writeGateSpan(ctx, node, in, "deterministic", score, score >= 75, deliverable, out, gateStart)
 		return graph.NodeResult{
 			Status: graph.NodeStatusCompleted,
 			Score:  score,
-			Output: fmt.Sprintf(`{"gate":"deterministic","score":%.0f}`, score),
+			Output: out,
 		}
 	}
 
@@ -992,6 +995,7 @@ func (r *stageNodeRunner) runGate(ctx context.Context, node graph.NodeSpec, in g
 					Team:   r.team.Name,
 				})
 			}
+			r.writeGateSpan(ctx, node, in, "content", float64(v.Score), v.Score >= 75, deliverable, string(out), gateStart)
 			return graph.NodeResult{
 				Status: graph.NodeStatusCompleted,
 				Score:  float64(v.Score),
@@ -999,7 +1003,10 @@ func (r *stageNodeRunner) runGate(ctx context.Context, node graph.NodeSpec, in g
 			}
 		}
 	}
-	// 评审不可用: 给中性分, 不阻断 (fail-open)
+	// 评审不可用: 给中性分, 不阻断 (fail-open)。
+	// **这一支也要留轨迹**: "评审器不可用所以放行"与"评审通过"在事后必须可区分,
+	// 否则一段时间的 LLM 故障会在学习数据里表现为"这些产出质量都还行"。
+	r.writeGateSpan(ctx, node, in, "unavailable", 60, true, deliverable, `{"gate":"unavailable","score":60}`, gateStart)
 	return graph.NodeResult{Status: graph.NodeStatusCompleted, Score: 60, Output: `{"gate":"unavailable","score":60}`}
 }
 
@@ -1561,4 +1568,52 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// writeGateSpan 图 gate 节点的 gate 轨迹 (design/03 §4.1 KindGate)。
+//
+// pipeline 侧的门禁 (teams.go / content_gate.go) 已经产 gate Span, 图侧此前没有 ——
+// 于是同一个团队在灰度开关两侧会产出**不同形状**的轨迹, 学习管线拿到的数据取决于
+// 开关状态。这不是"少一点观测", 是数据地基不一致。
+func (r *stageNodeRunner) writeGateSpan(ctx context.Context, node graph.NodeSpec, in graph.NodeInput,
+	gateKind string, score float64, pass bool, input, detail string, start time.Time) {
+	if r == nil || r.we == nil || r.we.traceStore == nil {
+		return
+	}
+	ids := trace.From(ctx)
+	attrs := map[string]any{
+		"gate":   gateKind,
+		"pass":   pass,
+		"score":  score,
+		"status": gateSpanStatus(gateKind, pass),
+		"path":   "graph", // 与 pipeline 侧同字段但标明来源, 便于比对两条路径
+	}
+	if r.team != nil {
+		attrs["team"] = r.team.Name
+	}
+	r.we.traceStore.Write(tracestore.Span{
+		TraceID:   ids.RunID,
+		SpanID:    newSpanID(),
+		ParentID:  ids.RunID,
+		Kind:      tracestore.KindGate,
+		Name:      node.ID,
+		NodeID:    orNodeID(in.NodeRef, node.ID),
+		InputRef:  r.we.traceStore.MakeRef(input),
+		OutputRef: r.we.traceStore.MakeRef(detail),
+		Attrs:     attrs,
+		TS:        start.UnixMilli(),
+		DurMS:     time.Since(start).Milliseconds(),
+	})
+}
+
+// gateSpanStatus 与 pipeline 侧 gateStatusLabel 口径一致, 外加 unavailable 一档 ——
+// "评审器不可用所以放行"必须与"评审通过"可区分。
+func gateSpanStatus(gateKind string, pass bool) string {
+	if gateKind == "unavailable" {
+		return "unavailable"
+	}
+	if pass {
+		return "pass"
+	}
+	return "fail"
 }

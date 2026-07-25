@@ -221,7 +221,11 @@ type Span struct {
 
 **与上下文压缩的协同（吸收 Hermes H4）**：运行期超大工具结果优先走**"落盘+指针"**而非丢弃/摘要——参照 hermes 三层机制（单结果超阈值→写工作区文件、上下文只留预览+路径、agent 可 Read 取回；Read 结果自身豁免落盘防循环）。对 claude-go：`pkg/compact` 的截断路径增加 persist 档位，被落盘的原文**天然就是 TraceStore 的 Blob**——上下文瘦身与轨迹保真一次解决；LLM 摘要压缩（现 SmartExtractKeyFacts）保留用于会话延续，但 Span 里始终记指针指向无损原文，学习管线永远读得到全文。这直接消解 §1.3 "action 完整文本缺失"中 transcript 截断的那一半。
 
-### 4.2 ② RewardBus：奖励总线　　**[🟠 已进学习器 / 8 源中 3 源]**
+### 4.2 ② RewardBus：奖励总线　　**[🟠 8 源中 6 源已通电（原 3 源）]**
+
+> ✅ **6 源已通电（2026-07-25）**：原有 3 源 + 新增 `user.steer`（`teams.go:1665`，归因必须用**上一轮**的 `LastRunID`，否则把用户对旧产出的不满记到新一轮头上）、`user.explicit`（`/team rate`，此前**完全没有入口**能表达"满意"，正向人类信号恒为零）、`review.panel`（截尾均值 overall）、`latency`（阶梯惩罚，**只罚不奖** —— 给正分会激励偷工，最快的路径是什么都不做；权重 0.2 不与质量判断同权竞争）。
+>
+> **仍缺 2 源（如实记账）**：`gate.e2e`（端点属 `pkg/dashboard`）、`verdict.heuristic`（`RunIsolated` 不走 HookChain，团队路径根本不产 turn verdict）；`cost` 无 per-run token 记账。
 
 > **实测**：`RewardEvent` + rewards.jsonl 落盘真实（`pkg/agent/evolution.go:146-177`），~~但设计的 `Weight`（源可信度）字段不存在 ⇒ §4.6「奖励源加权」无载体~~ ✅ **奖励已进学习器且 Weight 已补（2026-07-25）**：新增 `AggregateRewards`（倒序扫尾部窗口、**同 (source,node) 只取最新一条**——门禁"失败→修复→通过"若取均值会被旧失败拖回去）与 `StageRewardScore`/`RunRewardScore`/`GateRewardScore`；`workflow.go` 三处布尔改为「有同节点证据用加权分，无证据回退二值」（回退必须保留，否则未接奖励源的工作流全部退化）。`RewardEvent` 补 `Weight` 并**落盘**，故将来调权重表时历史奖励保留当时可信度。**归因边界**：stage 反馈只认同 run 同节点证据，不吃 run 级奖励——否则"门禁失败后触发的修复阶段"会被它正要修的失败倒打一耙。奖励源由 1/8 增至 **3/8**：新增 `gate.compile`/`gate.test`（`runGlobalCompileGate`/`runGlobalTestGate` 真跑 `go build`/`go test`，是设计里价值排第一的确定性信号，此前这两个函数内 `RecordReward` 调用数为 0）。⚠️ **H2 复合 shaped reward 与 H3 judge 独立性仍未实现**（judge 仍用主模型自评，反向违反 H3）；且确定性门禁是 run 终端信号、发生在 stage 反馈之后，故**首轮阶段仍走二值回退**，要反哺需一次"run 末回溯反馈"（会与 stage 时已发生的反馈双计，未做），折中是加了 run 级消费者：技能提炼闸（`GateRewardScore<0` 时不提炼）。
 
@@ -255,7 +259,7 @@ type RewardEvent struct {
 2. **复合 shaped reward 模板（H2）**：episode 奖励默认配方 `R = w1·正确性 + w2·效率 + w3·过程规范`，权重进配置。效率项参照 hermes 阶梯惩罚：工具调用/轮次在预算内满分，超出后按档递减——直接对抗"堆 turn 堆 token 刷分"；过程规范项吃 turn Verdict/工具错误率等弱信号。正确性项优先确定性验证（门禁），无法确定性验证的域用 LLM judge，**judge 不可用时回退启发式**（关键词/结构断言）而非置 0——保证奖励覆盖率。
 3. **judge 独立性（H3 教训）**：LLM judge 一律使用与被评估主模型**不同的模型档位或供应商**（配置强制，如主模型 kimi-k3 → judge 走 gemma4 本地或 fallback 供应商）；hermes 的 web_research 用被训模型自评自训，是 reward hacking 的标准入口，明令禁止。
 
-### 4.3 ③ 学习器族：五个学习器、一个循环　　**[🟠 五个学习器齐 ✅ / 权重导出 E5 仍缺]**
+### 4.3 ③ 学习器族：五个学习器、一个循环　　**[🟠 五个学习器齐 ✅ · 统一循环本轮才真通电 / GEPA 需独立档位、E5 权重导出仍缺]**
 
 > **实测**：✅ **`EvolutionLoop` 已实现（2026-07-25）**：`pkg/agent/evolution_loop.go` + `teams.go` 的 `submitLearn` 收敛了两处散点（pipeline 与 swarm 各一份 `go func(){LearnFromTeam;Consolidate}`）。解决三个真实问题：五个学习器共享 `experiences.json` 却互相看不见（多团队同时完成会覆盖）、学习的 LLM 花费无从记账（§4.5「学习成本占比」的前提）、空闲期做不了深度整理。单 goroutine 串行消费 + 去重窗口（refine/重跑会多次走到完成路径，重复蒸馏同一批轨迹会让 UCB 计数虚高）+ 每小时预算闸 + 空闲自发整理。**队列满即丢弃**——学习的背压绝不能传导回交付路径。未装配循环时 `submitLearn` 回落直调，这是长期契约而非临时兼容：一刀切要求先建循环会让漏装配的调用方静默丢失全部学习，那正是 §1.2 开环 1 的原始形态。11 个测试。a 经验学习器预存能力全在 ✅，但**四条升级全未做**（数据源仍读 4k/6k 截断的 trajectories、UCB 未升 contextual bandit、反馈未接 RewardBus、无 actionable 三段式）。b 记忆整理器 ✅ 但选择性更新门/embedding/wiki 双向均无。c 技能进化：创建 ✅、改进 ❌、**影子验证与设计差距最大**（`pkg/evolution/skillaudit/skillaudit.go:82-87` 用「创建时间之后的全部奖励均值」裁决，**零技能归因**，同批 shadow 裁决必然相同；包注释描述的算法与实现不符）。d 工作流/Prompt 进化（AWM/GEPA/canary）全 0。e 权重导出未启动。
 
@@ -316,7 +320,11 @@ type RewardEvent struct {
 - 注入点全部走 design/01 拦截器/hook（EvolutionRecorder 拦截器 + MemoryInjectHook），**headless 与飞书同构**——开环 1 从架构上不可能再出现；
 - 每次注入记 `policy_decision` Span（注入了哪些经验/记忆/技能/模板版本）——bandit 更新与 uplift 归因的数据基础（现 RecordInjection 的推广）。
 
-### 4.5 ⑤ 评估与门禁　　**[✅ 回放 harness + H6 多档冒烟]**
+### 4.5 ⑤ 评估与门禁　　**[🟠 回放 harness ✅ · H6 闸语义 ✅ / 真跑多档未通电（SetEvoTierFactory 零调用方）]**
+
+> ⚠️ **又一处我先打成 ✅ 后下调的标注（2026-07-25）**：H6 的**闸语义**确实全实现且 fail-closed（失败率/覆盖率/`MinTiers>=2`；未配置的档位记 `Available=false` 并计入拒绝理由，绝不当"这档通过了"）。但**真跑多档需要宿主注入 `builtin.SetEvoTierFactory`，它目前零生产调用方** —— `evo_smoke` 只有一个内置的确定性"装配档"（抓"候选丢了 `{objective}`"这类劣化），而装配档不是模型档位，所以单独跑时冒烟**必然拒绝**。这是标准的 🟡「已建成未通电」，不是 ✅。
+>
+> 另一处相关发现：`NewEvolutionLoop` 在本轮之前**全仓零生产调用方**，`submitLearn` 永远走回落直调 —— 我此前标的「统一循环 ✅」其实也是"写了没通电"。现已装在 `cmd/claude-go/main.go:803` 与 `pkg/feishu/bot.go:524`。
 
 > **实测（2026-07-25 实现）**：`pkg/evolution/replay` 落地离线回放 harness，**H12 五条工程规范逐条实现**（并发信号量 / 每任务硬超时 / 每完成一条流式落盘 / 续跑按内容指纹 / 空产出短路不启动 Judge）。两条关键判断：①**确定性断言是硬否决**——Expect 未命中或 Gate 失败直接 0 分且不问 Judge，能确定性判的不该花 LLM 钱也不该让 LLM 的宽容盖过硬事实；②未注入 GateRunner 时在 Reason 注明门禁被跳过，静默跳过会让人以为门禁过了。`Compare` 实现 uplift 配对对照，替代"感觉变好了"。⚠️ 一处自我修正：第一版只把带超时的 ctx 传给 candidate，测试当场抓出**那不算"硬"超时**（不配合 ctx 的实现仍会拖住整轮），改为 goroutine + select ctx，并写明"泄漏一个 goroutine 但整轮继续"的取舍。14 个测试。**仍缺 H6 多档模型冒烟**（回放固定输入，评不了"产物是否让 agent 做出不同动作序列"，那需要真跑）。uplift 因果评估仅在经验粒度（预存），技能/模板/prompt 粒度无。设计新增的指标（reward 趋势/灰度胜率/回滚率/学习成本占比）只有 `console.Report.RewardMean` 一个**离线 JSON 字段**，未进指标目录。
 
