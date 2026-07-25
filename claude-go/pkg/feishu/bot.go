@@ -527,6 +527,16 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	})
 	botEvoLoop.Start(context.Background())
 
+	// 9d. H6 多档冒烟的真实档位构造器 (design/03 §4.5)。
+	// SetEvoTierFactory 此前**零生产调用方** —— 于是 evo_smoke 只有一个确定性"装配档",
+	// 而装配档不是模型档位, MinTiers>=2 必然拒绝: H6 的闸语义写完了但从没真跑过多档。
+	// 注入点必须在装配处: pkg/tool/builtin 不能 import pkg/agent (那正是刚修掉的测试
+	// 导入环的方向)。没配 fallback 模型时只会给出 primary 一档, Smoke 因档位不足而
+	// 拒绝 —— 那是正确行为, 不是缺陷。
+	if f := agent.EvoTierFactory(aiClient); f != nil {
+		builtin.SetEvoTierFactory(f)
+	}
+
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
 		BaseDir: layout.Teams,

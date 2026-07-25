@@ -324,9 +324,15 @@ type RewardEvent struct {
 - 注入点全部走 design/01 拦截器/hook（EvolutionRecorder 拦截器 + MemoryInjectHook），**headless 与飞书同构**——开环 1 从架构上不可能再出现；
 - 每次注入记 `policy_decision` Span（注入了哪些经验/记忆/技能/模板版本）——bandit 更新与 uplift 归因的数据基础（现 RecordInjection 的推广）。
 
-### 4.5 ⑤ 评估与门禁　　**[🟠 回放 harness ✅ · H6 闸语义 ✅ / 真跑多档未通电（SetEvoTierFactory 零调用方）]**
+### 4.5 ⑤ 评估与门禁　　**[✅ 回放 harness · H6 闸语义 · 真实档位构造器已通电]**
 
-> ⚠️ **又一处我先打成 ✅ 后下调的标注（2026-07-25）**：H6 的**闸语义**确实全实现且 fail-closed（失败率/覆盖率/`MinTiers>=2`；未配置的档位记 `Available=false` 并计入拒绝理由，绝不当"这档通过了"）。但**真跑多档需要宿主注入 `builtin.SetEvoTierFactory`，它目前零生产调用方** —— `evo_smoke` 只有一个内置的确定性"装配档"（抓"候选丢了 `{objective}`"这类劣化），而装配档不是模型档位，所以单独跑时冒烟**必然拒绝**。这是标准的 🟡「已建成未通电」，不是 ✅。
+> ⚠️ **又一处我先打成 ✅ 后下调的标注（2026-07-25）**：H6 的**闸语义**确实全实现且 fail-closed（失败率/覆盖率/`MinTiers>=2`；未配置的档位记 `Available=false` 并计入拒绝理由，绝不当"这档通过了"）。但**真跑多档需要宿主注入 `builtin.SetEvoTierFactory`，它当时零生产调用方** —— `evo_smoke` 只有一个内置的确定性"装配档"（抓"候选丢了 `{objective}`"这类劣化），而装配档不是模型档位，所以单独跑时冒烟**必然拒绝**。
+>
+> ✅ **已通电（2026-07-25）**：`pkg/agent/evo_tiers.go` 的 `EvoTierFactory`，注入点在 `pkg/feishu/bot.go` 的装配处（`pkg/tool/builtin` 不能 import `pkg/agent` —— 那正是刚修掉的测试导入环的方向）。档位来源是**真实配置**：primary = 当前主模型，fallback = 配置里声明的备用模型，取法与 `FallbackReflector` 一致（`WithModel` 共享 HTTP 客户端与 `RateLimitGuard`，冒烟调用同样受全局配额约束、不绕过限流偷跑）。
+>
+> 两处刻意的取舍：**候选不套 QueryEngine**——冒烟要验的是"这份产物本身能不能驱动出可用产出"，套上工具循环后失败原因会混进工具与多轮交互，归因不到产物上。**错误绝不吞成空串**——空产出会被覆盖率判定当成"跑了但没评分"，与"根本没跑起来"混成一档，冒烟结论就失真。
+>
+> **没配 fallback 时只给 primary 一档，`Smoke` 因 `MinTiers` 不足而拒绝——这是正确行为不是缺陷**：没有第二档就确实没做过多档验证。用主模型凑第二档只能证明它不随机崩，证不了"换个弱一点的模型也还能用"，而后者才是晋升前真正要问的问题。
 >
 > 另一处相关发现：`NewEvolutionLoop` 在本轮之前**全仓零生产调用方**，`submitLearn` 永远走回落直调 —— 我此前标的「统一循环 ✅」其实也是"写了没通电"。现已装在 `cmd/claude-go/main.go:803` 与 `pkg/feishu/bot.go:524`。
 
