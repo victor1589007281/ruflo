@@ -3,6 +3,7 @@ package modelconfig
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 )
@@ -27,7 +28,7 @@ func LoadFromConfig(cfg ConfigJSON) (*ProviderRegistry, *ConfigResolver, error) 
 	registry := NewProviderRegistry()
 
 	for _, p := range cfg.Providers {
-		registry.RegisterProvider(p)
+		registry.RegisterProvider(applyProviderKeyFromEnv(p))
 	}
 
 	resolver := NewConfigResolver(registry, cfg.AI.GlobalConfig, cfg.AI.Plans)
@@ -131,4 +132,44 @@ func Validate(registry *ProviderRegistry, resolver *ConfigResolver) []string {
 	}
 
 	return errs
+}
+
+// providerKeyEnv 返回某 provider 的 API key 环境变量名, 形如 kimi → KIMI_API_KEY。
+// 非字母数字一律转下划线, 以容纳 "azure-openai" 这类带连字符的 provider 名。
+func providerKeyEnv(providerName string) string {
+	var b strings.Builder
+	for _, r := range providerName {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r - 32)
+		case (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String() + "_API_KEY"
+}
+
+// applyProviderKeyFromEnv 用 <PROVIDER>_API_KEY 环境变量覆盖配置里的 apiKey。
+//
+// 为什么需要它: 容器部署的标准做法是 ConfigMap 只放非敏感结构、密钥从 Secret
+// 经环境变量注入。deploy/k8s 的清单**已经这么做了**——ConfigMap 里 apiKey 写的是
+// "PLACEHOLDER_OVERRIDE_VIA_ENV", Deployment 从 Secret 注入 KIMI_API_KEY——
+// 但此前**全仓没有任何代码读 <PROVIDER>_API_KEY**, 于是占位符原样进了 provider
+// 配置, Pod 拿着假 key 去调 LLM。这与 CLAUDE_GO_LLM_GATEWAY 是同一类"清单设了
+// 环境变量而代码不读"的缺陷。
+//
+// 语义: 环境变量非空则覆盖(12-factor 惯例, 容器里 Secret 应当赢)。启动时打一行
+// 日志说明哪个 provider 的 key 来自环境变量, 但**绝不打印 key 本身**。
+func applyProviderKeyFromEnv(p ProviderConfig) ProviderConfig {
+	if p.Name == "" {
+		return p
+	}
+	env := providerKeyEnv(p.Name)
+	if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+		p.APIKey = v
+		log.Printf("[modelconfig] provider %q 的 apiKey 取自环境变量 %s", p.Name, env)
+	}
+	return p
 }
