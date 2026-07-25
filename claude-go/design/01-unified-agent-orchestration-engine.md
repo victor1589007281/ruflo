@@ -280,9 +280,9 @@ type ConstraintSet struct {
 - **运行期强制单点**：约束编译为 QueryEngine 的 `AllowedTools`/`PermissionMode`/hook 配置下发。`toolExposed`（`engine.go:169-178`）保持唯一执行点；`RunIsolated` 的 `gateToolUses` 复刻（`runner.go:247`）改为调用同一函数。**角色→工具不再子串匹配**：RoleDef 增加显式 `tool_profile` 字段，`profileForTeamRole` 仅作为缺省回退并打 deprecation 日志。
 - **slash 直通防护**保留：受限会话不进 slash 分发（`main.go:700-703`），在图层同样成立——受限 GraphRun 无法展开携带更高权限的子图（子图约束只能收窄不能放宽，**约束单调性**）。
 
-### 4.7 Skill 选择与编排　　**[❌ 未实现]**
+### 4.7 Skill 选择与编排　　**[✅ 已实现并接线]**
 
-> **实测**：`SkillSelector` 零命中；技能注入仍是 `pkg/agent/roles.go:120-153` 的 `<role_skills>` 块。
+> **实测（2026-07-25 实现）**：`pkg/agent/skill_selector.go` 落地 `SkillSelector`，并已接进 `roles.go` 的注入点（`SetSkillSelector`/`NewSkillSelectorForRoles`，**opt-in，默认回落静态逻辑**——否则又是一个"已建成未通电"）。修掉原逻辑的两个问题：①`RecommendedSkills` 只按角色名索引、**完全不看本次 objective**，同一角色不论做什么拿到的技能永远一样；②预算是"条数×单条上限"而非总量，各处上限彼此独立、实际注入量无处可见。现在是**显式声明 > 角色推荐 > objective 关键词相关性补选**，用总量预算取代条数上限，被挤掉的记进 `Dropped`（此前截断是静默的）。取舍：纯确定性打分不引入 LLM（选技能若要调 LLM 就与它要解决的省 token 自相矛盾）；同分按名字升序保证 prompt 可复现否则缓存失效；中文按双字滑窗切分（本仓无 embedding 端点）。11 个测试。
 
 ```go
 type SkillSelector struct {
@@ -303,9 +303,9 @@ type SkillSelector struct {
 - 节点内 agent 通过 `SpawnSubgraph(spec, params)` 工具派生子图（受 ConstraintSet 单调性约束、计入父节点预算）。取代"factory 创建裸 QueryEngine"（`teams.go:158`、`feishu/session.go:807-830`、`main.go:2639`）——**subagent 从此对编排层可见**：有 NodeID、进 Journal、受 hook/预算/轨迹覆盖。
 - 现有 `cliAgentRunner`/`sessionAgentRunner` 改为 AgentRuntime 的两个实现（见 4.9），行为不变。
 
-### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[❌ 未实现（接口都不存在）]**
+### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[🟠 接口与放置已落地 / 远程实现待 design/02 R3]**
 
-> **实测**：`AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps` 全零命中。只有单方法的 `NodeRunner`（`pkg/graph/runner.go:39-41`），其注释自称「AgentRuntime 的本地化前身」。三实现（local-cli/local-session/k8s-job）均无；`pkg/sandbox/k8s_runner.go` 与图引擎零关联。**`Placement` 名字被 `pkg/cluster` 降格为一个 `[]string` caps 标签**（`pkg/cluster/queue.go:30`），无打分、无 Affinity。
+> **实测（2026-07-25 实现）**：`pkg/agent/runtime.go` 落地 `AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps`/`Placement`（硬约束过滤 + 软偏好打分 + 团队亲和 + 租约过期剔除），并用 `NewLocalRuntime` 把既有 `CreateAgentFunc` 收编为本地 runtime（**不改动 cliAgentRunner/sessionAgentRunner 两个既有实现**）。⚠️ **一处对设计稿的偏离**：接口定在 `pkg/agent` 而非 `pkg/graph/runtime.go`——要被收编的三个执行器都在 pkg/agent 及其上层，而 pkg/graph 是纯调度内核不认识 agent 语义，放进去会让内核反向依赖 RunMetadata/ToolProfile/团队 cwd。折中是图侧继续用 `NodeRunner`，`stageNodeRunner` 作桥，**pkg/graph 零改动**。⚠️ 澄清名字撞车：`pkg/cluster` 的 `RequireCaps` 是队列标签过滤（布尔匹配无打分），本文的 `Placement` 才是放置策略；前者是后者求解后用于跨机路由的投影。**仍缺**：k8s-job runtime（`pkg/sandbox/k8s_runner.go` 尚未接为 AgentRuntime）与远程 runtime（design/02 R3）。关键语义：团队亲和权重高于任何 Prefer（产码门禁在 `<cwd>/go.mod` 上跑，节点散落会让上一阶段的代码消失）；同分按名字升序保证放置确定性。11 个测试。
 
 ```go
 // pkg/graph/runtime.go —— 本文只定义接口与调度语义；网络化实现见 design/02
