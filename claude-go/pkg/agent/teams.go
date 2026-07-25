@@ -1525,9 +1525,14 @@ func (ptm *ProductionTeamManager) RefineTeam(name, feedback, targetStage string)
 		}
 		_ = InvalidateCheckpoints(team.dataDir, invalidated)
 	} else {
-		// 整体重跑: 清空检查点
+		// 整体重跑: 清空检查点。
+		// 图引擎路径的进度真源是 graph-journal 而非 checkpoints.json, 必须一并
+		// 清掉——否则 Resume 会重放上一轮的 node.completed, 使"整体重跑"变成
+		// 零节点执行并直接返回旧产出 (Replay 已按 run 隔离, 这里再断掉基线,
+		// 两道一起才能保证重跑真的重跑)。
 		if team.dataDir != "" {
 			os.Remove(filepath.Join(team.dataDir, "checkpoints.json"))
+			os.RemoveAll(filepath.Join(team.dataDir, "graph-journal"))
 		}
 	}
 

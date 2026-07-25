@@ -204,7 +204,41 @@ type RunState struct {
 // 直接作为缓存产出跳过执行 (见 engine.go)。
 func Replay(events []Event) *RunState {
 	st := &RunState{Completed: map[string]NodeResult{}}
-	for _, ev := range events {
+
+	// —— 只重放"最近一次 run"的事件 ——
+	//
+	// journal 在生产是 per-team 而非 per-run 的 (graph_adapter 落
+	// <team.dataDir>/graph-journal/journal.jsonl), 同一团队多次运行会把多轮
+	// 事件追加进同一文件。早期实现只 switch ev.Type、完全不看 ev.RunID,
+	// 于是第二次运行会把上一轮的 node.completed 全部当成本轮已完成 →
+	// ready-set 一开始就发现所有节点都在终态表里 → **调度零个节点、直接返回
+	// 上一轮的产出并报 completed**。refine 与重跑因此静默失效 (且 refine 的
+	// "整体重跑"只删 checkpoints.json, 不碰 journal)。
+	//
+	// 定位方式: 最后一个 run.created 之后的事件即本轮; 同时按该 RunID 过滤,
+	// 双保险防止 journal 里有交错写入 (并发/残留)。
+	start := 0
+	lastRun := ""
+	for i, ev := range events {
+		if ev.Type == EvRunCreated {
+			start, lastRun = i, ev.RunID
+		}
+	}
+	if lastRun == "" {
+		// 无 run.created (老 journal 或只落了节点事件): 退化为取最后一条带
+		// RunID 的事件作为本轮标识, 至少不跨 run 混用。
+		for i := len(events) - 1; i >= 0; i-- {
+			if events[i].RunID != "" {
+				lastRun = events[i].RunID
+				break
+			}
+		}
+	}
+
+	for _, ev := range events[start:] {
+		if lastRun != "" && ev.RunID != "" && ev.RunID != lastRun {
+			continue
+		}
 		switch ev.Type {
 		case EvNodeCompleted:
 			if ev.NodeID == "" {
@@ -224,6 +258,15 @@ func Replay(events []Event) *RunState {
 				st.Status = s
 			}
 		}
+	}
+
+	// 已**完整跑完**的 run 不是"待恢复"的基线: 再次被调用意味着新一轮
+	// (refine / 重跑), 应从头执行。清空缓存但保留 Finished/Status 供调用方判断。
+	//
+	// partial/failed 仍保留缓存: 那是"部分完成待续跑", 复用已成功节点、重试
+	// 其余——与 checkpoints.json 的既有语义一致, 不改变用户可感知行为。
+	if st.Finished && st.Status == RunStatusCompleted {
+		st.Completed = map[string]NodeResult{}
 	}
 	return st
 }

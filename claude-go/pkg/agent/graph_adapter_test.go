@@ -5,10 +5,12 @@ package agent
 import (
 	"context"
 	"fmt"
-	"github.com/anthropic/claude-go/pkg/graph"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/anthropic/claude-go/pkg/graph"
 )
 
 // stubStageRunner 可编程 AgentRunner: 按 prompt 回显, 记录调用次数。
@@ -118,10 +120,59 @@ func TestGraphPipelineEquivalence(t *testing.T) {
 	}
 }
 
-// TestGraphJournalResume 图引擎 resume: 同一 team dataDir 重跑, 已完成节点吃缓存零重跑。
-func TestGraphJournalResume(t *testing.T) {
+// TestGraphJournalResume_崩溃后续跑 图引擎 resume 的**正当用途**: 上一轮跑到一半
+// 进程被 kill (journal 有 node.completed 但无 run.finished), 重启后已完成节点吃缓存。
+//
+// 注意本测试的前身断言的是"同一 dataDir 重跑 → 零 agent 调用", 那其实是把缺陷
+// 当成了期望行为: journal 在生产是 per-team 的, 于是任何第二次运行 (包括 refine
+// 与用户手动重跑) 都会重放上一轮的 completed 事件、调度零个节点、直接返回旧产出
+// 并报 completed。已按"只重放最近一次且未完结的 run"修正, 见 pkg/graph.Replay
+// 与 TestGraphRerunAfterCompleted_不吃旧缓存。
+func TestGraphJournalResume_崩溃后续跑(t *testing.T) {
 	wf := eqTestWorkflow()
 	team := newStubTeam(t, "resume")
+
+	// 手写一个"跑了一半就崩"的 journal: research 已完成, 无 run.finished
+	journalDir := filepath.Join(team.dataDir, "graph-journal")
+	j, err := graph.NewFileJournal(journalDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const runID = "run-resume-crashed"
+	for _, ev := range []graph.Event{
+		{Seq: 1, Type: graph.EvRunCreated, RunID: runID},
+		{Seq: 2, Type: graph.EvNodeCompleted, RunID: runID, NodeID: "research",
+			Data: map[string]any{"output": "上一轮的调研产出"}},
+	} {
+		if err := j.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var calls atomic.Int64
+	res, err := newStubExecutor(&calls).executeGraph(context.Background(), wf, "测试目标", team)
+	if err != nil {
+		t.Fatalf("续跑失败: %v", err)
+	}
+	// research 吃缓存, 只需再跑 draft + review
+	if calls.Load() != 2 {
+		t.Errorf("崩溃续跑应只补跑 2 个节点, 实际调用 %d 次", calls.Load())
+	}
+	if len(res) != 3 {
+		t.Errorf("应返回全部 3 个阶段 (1 缓存 + 2 新跑), got %d", len(res))
+	}
+	for _, r := range res {
+		if r.Name == "research" && r.Output != "上一轮的调研产出" {
+			t.Errorf("research 未吃到缓存产出, got %q", r.Output)
+		}
+	}
+}
+
+// 回归 B-1: 上一轮已**完整跑完**的团队再次运行, 必须真的重跑, 不能把上一轮
+// 的产出当成本轮结果直接返回。这正是 refine / 用户手动重跑走的路径。
+func TestGraphRerunAfterCompleted_不吃旧缓存(t *testing.T) {
+	wf := eqTestWorkflow()
+	team := newStubTeam(t, "rerun")
 
 	var calls1 atomic.Int64
 	if _, err := newStubExecutor(&calls1).executeGraph(context.Background(), wf, "测试目标", team); err != nil {
@@ -131,17 +182,16 @@ func TestGraphJournalResume(t *testing.T) {
 		t.Fatalf("首跑应调用 3 次 agent, got %d", calls1.Load())
 	}
 
-	// 同一 dataDir 重跑: journal 里全部节点已完成 → 零 agent 调用
 	var calls2 atomic.Int64
 	res, err := newStubExecutor(&calls2).executeGraph(context.Background(), wf, "测试目标", team)
 	if err != nil {
 		t.Fatalf("重跑失败: %v", err)
 	}
-	if calls2.Load() != 0 {
-		t.Errorf("resume 应零重跑, 实际调用 %d 次", calls2.Load())
+	if calls2.Load() != 3 {
+		t.Errorf("已完结的 run 再次运行必须全量重跑, 实际只调用 %d 次 (=静默零执行返回旧产出)", calls2.Load())
 	}
 	if len(res) != 3 {
-		t.Errorf("resume 应返回全部 3 个缓存阶段, got %d", len(res))
+		t.Errorf("应返回 3 个阶段, got %d", len(res))
 	}
 }
 
