@@ -4208,6 +4208,11 @@ func testDreamingConsolidate(t *testing.T, report *WikiEvalReport) {
 		Topics: []string{"auth", "error-fix"}, Turns: 10,
 		StartTime: time.Now().Add(-1 * time.Hour), EndTime: time.Now(),
 	})
+	// 非密闭测试防护: Dreamer 的落盘与增量蒸馏是 fire-and-forget goroutine, 测试体
+	// 返回后它们才写盘, 与 t.TempDir() 的清理竞态 —— 症状是"约 1/3 概率红"且报错
+	// (TempDir RemoveAll cleanup: directory not empty) 看起来与被测逻辑毫无关系。
+	defer d.WaitBackground()
+
 	d.RecordSession(dreaming.SessionRecord{
 		ChatID: "test-2", Summary: "简单的闲聊",
 		Topics: []string{"chat"}, Turns: 2,

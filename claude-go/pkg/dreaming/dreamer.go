@@ -13,10 +13,10 @@
 //   - 每 10 分钟最多扫描一次
 //
 // 整理流程 (对应 TS: consolidationPrompt.ts 的 4 阶段):
-//   1. Orient: 读取现有记忆文件，了解当前状态
-//   2. Gather: 收集近期对话的关键信息
-//   3. Consolidate: 合并、更新、去重记忆条目
-//   4. Prune: 清理过时条目，维护索引
+//  1. Orient: 读取现有记忆文件，了解当前状态
+//  2. Gather: 收集近期对话的关键信息
+//  3. Consolidate: 合并、更新、去重记忆条目
+//  4. Prune: 清理过时条目，维护索引
 //
 // 与 TS 的差异:
 //   - TS 使用 forked subagent (runForkedAgent) 执行整理
@@ -81,12 +81,12 @@ func DefaultDreamConfig() *DreamConfig {
 
 // SessionRecord 已完成会话的摘要记录 (v2: 增加重要性评分)
 type SessionRecord struct {
-	ChatID     string    `json:"chatId"`
-	StartTime  time.Time `json:"startTime"`
-	EndTime    time.Time `json:"endTime"`
-	Turns      int       `json:"turns"`
-	Summary    string    `json:"summary"`
-	Topics     []string  `json:"topics"`
+	ChatID    string    `json:"chatId"`
+	StartTime time.Time `json:"startTime"`
+	EndTime   time.Time `json:"endTime"`
+	Turns     int       `json:"turns"`
+	Summary   string    `json:"summary"`
+	Topics    []string  `json:"topics"`
 	// v2: 重要性评分 (0-1), 参考人脑海马体对事件的情感标记
 	// 高分: 团队结果、用户明确指令、错误修复; 低分: 闲聊、重复问题
 	Importance float64 `json:"importance,omitempty"`
@@ -109,15 +109,21 @@ type MemoryEntryForTest struct {
 //   - dreaming: 是否正在整理 (防止并发)
 //   - lockFile: 文件锁路径 (跨进程互斥)
 type Dreamer struct {
-	config            *DreamConfig
-	cwd               string
-	lastDreamTime     time.Time
-	lastScanTime      time.Time
+	config             *DreamConfig
+	cwd                string
+	lastDreamTime      time.Time
+	lastScanTime       time.Time
 	sessionsSinceDream atomic.Int64
-	dreaming          atomic.Bool
-	mu                sync.Mutex
-	recentSessions    []SessionRecord
-	lockFile          string
+	dreaming           atomic.Bool
+	mu                 sync.Mutex
+	// bg 追踪 fire-and-forget 的后台落盘/蒸馏 goroutine, 供 WaitBackground 等待。
+	// 为什么需要它: saveDreamState 与增量蒸馏刻意是异步的(不拖慢主链路), 但那让
+	// Dreamer **不可 join** —— 测试里 t.TempDir() 清理与这些 goroutine 竞态, 表现为
+	// "TempDir RemoveAll cleanup: directory not empty" 的间歇性失败(实测约 1/3)。
+	// 改成同步会改生产的延迟特性; 让组件可等待才是正解。
+	bg             sync.WaitGroup
+	recentSessions []SessionRecord
+	lockFile       string
 
 	// ConsolidateFn 整理函数 (可注入, 用于测试或自定义整理逻辑)
 	// 如果为 nil, 根据 config.ConsolidateMode 选择内置方法
@@ -249,12 +255,15 @@ func (d *Dreamer) RecordSession(record SessionRecord) {
 	d.mu.Unlock()
 	d.sessionsSinceDream.Add(1)
 
-	// 持久化状态 (防止重启后丢失计数)
-	go d.saveDreamState()
+	// 持久化状态 (防止重启后丢失计数)。异步以免拖慢主链路; 经 bg 可被 WaitBackground 等到。
+	d.bg.Add(1)
+	go func() { defer d.bg.Done(); d.saveDreamState() }()
 
 	// V3: 重要事件立即触发增量蒸馏 (不做完整 Dreaming)
 	if record.Importance >= d.ImportantEventThreshold && d.Consolidator != nil {
+		d.bg.Add(1)
 		go func() {
+			defer d.bg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			d.Consolidator.IncrementalDistill(ctx, []SessionRecord{record})
@@ -447,7 +456,8 @@ func (d *Dreamer) executeDream(ctx context.Context) {
 	d.mu.Unlock()
 
 	// 持久化清零后的状态
-	go d.saveDreamState()
+	d.bg.Add(1)
+	go func() { defer d.bg.Done(); d.saveDreamState() }()
 
 	elapsed := time.Since(start)
 	log.Printf("[Dreaming] 整理完成 (耗时 %v, 处理 %d 条会话)", elapsed, len(sessions))
@@ -879,3 +889,13 @@ func (d *Dreamer) ForceDream(ctx context.Context) error {
 	go d.executeDream(ctx)
 	return nil
 }
+
+// WaitBackground 等待全部后台落盘/蒸馏 goroutine 结束。
+//
+// 为什么要导出它: saveDreamState 与增量蒸馏刻意是 fire-and-forget(不拖慢主链路),
+// 但那让 Dreamer **不可 join**。测试里 t.TempDir() 的清理与这些 goroutine 竞态,
+// 表现为 "TempDir RemoveAll cleanup: directory not empty" 的间歇性失败 —— 这类
+// **非密闭测试**的症状是"约 1/3 概率红"且看起来与被测逻辑毫无关系, 排查成本极高。
+//
+// 生产侧无需调用(进程退出即止); 测试应 defer 它。
+func (d *Dreamer) WaitBackground() { d.bg.Wait() }
