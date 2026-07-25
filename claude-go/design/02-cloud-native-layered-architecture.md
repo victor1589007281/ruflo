@@ -127,7 +127,11 @@
 
 依赖方向：L5→L2→L3→L1，L4 被 L2/L3/L5 共享；**严禁反向依赖**（现状 Bot 上帝对象即全层互抱）。
 
-### 3.1 L1 · LLM 引擎层（LLM Gateway）　　**[🟠 接口已被 9 处生产依赖 · trace 四元组已通电 / 两处客户端例外]**
+### 3.1 L1 · LLM 引擎层（LLM Gateway）　　**[🟠 TeamManagerConfig.LLM 已收编 / SessionManager 保持现状（结论）]**
+
+> ✅ **`TeamManagerConfig.LLM` 已收编（2026-07-25）**：给 `LLMGateway` 加 `Diag`，两处 `we.llm.(*api.Client)` 具体类型断言改成 `agent.DiagLLMClient` 接口。**改造前那两处断言的失败分支是 `else { SimpleComplete }`——产出照出、日志照打，只有 diag 那一栏永远空着**，没有 error 没有 panic。
+>
+> ✅ **`SessionManager` 保持现状——这是结论不是待办**：引擎主链路拿的不是"发一次请求"，而是 `api.Client` 上三十余个具体字段/方法（`Guard` 还要与 advisor 客户端**共享同一实例**以免双客户端各自打满 RPM、熔断三件套、`FallbackModels` + 独立端点 + 429 连续计数触发的模型切换与冷却回退、`PromptCacheMode` 及其"因 API 错误自适应关闭"的状态位、克隆语义）。全塞进接口 = 把接口写成 `api.Client` 的镜像，抽象收益为零；**只挑几个塞更坏**——熔断/配额这类状态**跨克隆共享**才有意义，接口里丢一个字段不编译报错、只让线上少一层保护。前置条件是本节的 remote 网关（熔断/配额/fallback/prompt cache 集中到网关进程），那时上层才**不需要**这些字段。
 
 > **实测**：`LLMGateway` 接口存在（`pkg/llmgw/gateway.go:26-33`）但 **`NewLocal` 全仓唯一调用方是自己的测试**；生产 `pkg/feishu/bot.go:305,419` 直接 `api.NewClient` ⇒「上层只依赖本接口」未发生。`ChatRequest` **无 Trace 字段**（设计要求必带四元组）。网关只做路由 + access.jsonl：**fallback/429 熔断/配额/prompt cache 全无**，OpenAI 协议未实现。✅ **`CLAUDE_GO_LLM_GATEWAY` 已通电（2026-07-25）**：新增 `modelconfig.ApplyGatewayOverride`，覆盖点选在 `ConfigResolver` 的 4 个出口而非各 `api.NewClient` 调用点（后者散落 feishu/CLI/advisor/worker 多处，逐个改必然漏）；**fallback 端点一并改指网关**，否则主端点走网关而降级直连，集中记账在最需要时失效。⚠️ 但 `LLMGateway` **接口本身**仍未被生产依赖（`NewLocal` 唯一调用方仍是自测），故本层整体仍为 🟠：网关可接入了，但"上层只依赖本接口"未达成。
 
@@ -200,7 +204,15 @@ type LLMGateway interface {
 
 **MCP/stdio 工具**：stdio MCP 子进程属于 worker 本地资源，在 RuntimeCaps 里声明为能力标签（如 `mcp:playwright`）；需要该工具的节点被路由到具备标签的 worker——不再假设"所有工具处处可用"。
 
-### 3.4 L4 · 辅助系统　　**[🟠 StateStore 齐 / TaskService ✅ / EventBus 仍 🟡]**
+### 3.4 L4 · 辅助系统　　**[🟠 StateStore · TaskService ✅ / EventBus 通了 1 条链路]**
+
+> ⚠️ **一处核实结论：仓里有两条总线**。`pkg/eventbus`（本节说的那个）确实零生产调用方；但 `pkg/observability` 里**另有一条一直在跑的总线**（生产 producer 6 处、consumer 在 `bot.go:354`）。所以"事件总线没通电"这句要拆开说——是本节这个没通电，不是仓里没有总线。两条并存需要一个"谁收编谁"的决定：`observability.Bus.Emit` 是**同步**交付，直接换成 `ChanBus` 会把 jsonl 落盘变成异步可丢。
+>
+> ✅ **已通 1 条链路（2026-07-25）**：LLM 运行事件 → 飞书播报。选它是因为它同时满足产生方真热、消费方真在，且改造能**修掉一个静默缺陷**——生产里有 **7 处 `api.NewClient`**，而播报挂在 `Client.OnLLMEvent` 这个**普通字段**上、只有飞书那个被赋了值，于是 advisor / `/model` 切换 / dashboard 三个客户端的 429 重试、熔断开合、"N 次全部失败"**从来没有任何人收到过，连日志都没有**（少赋一个字段不会编译报错）。顺带一处：`fireEvent` 在重试循环**内部**同步调，旧回调在里面逐个团队发飞书 HTTP——观测把背压传染给了执行。
+>
+> 产生方**不在 `pkg/api` 里直接 import eventbus**（L1 依赖 L4 违反 §3 的依赖方向），改成全局 sink、接线放装配层。播报口径逐字不变：只放行 Tag 以 `feishu` 开头的客户端，advisor/dashboard 事件只进总线与日志、**不进飞书**——否则 `:18080` 的消息量凭空变多，那是下游能感知的默认行为变化。
+>
+> ⚠️ **仍未迁**：黑板 `Watch`、dashboard SSE、轨迹采集三个订阅者；`task.dispatch.*`/`heartbeat.*`/`cron.fire` 未接。**不接的理由是"接了会降级"而不是"没来得及"**：`ChanBus` 满即丢，而团队进度、cron 触发、worker 事件确认都要求无损（`Publish` 没法回答"有没有人在听"，而 worker 的 `ack.Unknown` 正需要这个答案）。
 
 > **实测**：StateStore 三后端齐备，但 **sqlite 零生产调用**（唯一调用方是 regression 测试）、无 `state:` 配置项、FileStore **无跨进程锁**（自己声明不保证）⇒ R2 验收「双进程读写一致」未达成。**`pkg/eventbus` 零生产 import** ⇒ §3.4.2 承诺的全部订阅者一个都没迁。✅ **`TaskService` 已实现**（`pkg/agent/taskservice.go`，含 :7777 动作队列的消费方——此前那个队列只写不读）。cron 选主 ✅（opt-in）。⚠️ §3.4.1 桶映射表大半未落地，且 `bb/<t>`、`journal/<runID>` 这类**层级桶名结构性不可表达**（`validateBucket` 白名单排除 `/`）；生产实际只有 4 个桶。
 

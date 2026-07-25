@@ -182,7 +182,9 @@ POMDP:  state  s = (任务 objective, 图/节点上下文, 黑板, 注入的记�
 
 部署：L4 辅助系统（design/02）。单机=进程内模块；分布式=独立 evolution 服务，中心化经验/记忆库（解学习孤岛，假设 #17）。
 
-### 4.1 ① TraceStore：轨迹底座　　**[🟠 Ref/采样/TTL ✅ · Kind 5/6 有产生方（run 为刻意预留）]**
+### 4.1 ① TraceStore：轨迹底座　　**[✅ Kind 6/6 + policy_decision · Ref/采样/TTL]**
+
+> ✅ **`KindRun` 已补产生方（2026-07-25）——原来的"预留"判断不再合理**：TraceID 隐含的是**身份**，隐含不了**事实**（objective / 工作流 / 终态 / 耗时 / 阶段数一条都不在 TraceStore 里），于是 `ReadRun(runID)` **无法自述**，想知道这次 run 成没成功要 join 三份不同格式的文件——而本节明说 TraceStore 是"学习视图"。挂在 `beginRun` 的 defer 闭包而非运行级链：门禁判失败会中止链、未知工作流连链都进不去，而**失败的 run 恰恰是学习最想要的那批**。另新增 `policy_decision` kind（见 §4.4）。
 
 > ⚠️ **一处我自己打错又更正的标注（2026-07-25）**：先按"常量已补齐"记成了 `Kind 5/5 ✅`，逐条查产生方后**推翻**——`tracestore.KindXxx` 六个常量都在（`run`/`node`/`turn`/`llm_call`/`tool_call`/`gate`），但全仓只有 **2 个有写入方**：`KindLLMCall`（`pkg/engine/trace_llm.go:96`）与 `KindGate`（`pkg/agent/reward_sources.go:91`）。`KindRun`/`KindNode`/`KindTurn`/`KindToolCall` **零产生方**，其中 `KindRun` 源码注释自己写了「预留: 当前由 TraceID 隐含」。
 >
@@ -229,7 +231,13 @@ type Span struct {
 
 **与上下文压缩的协同（吸收 Hermes H4）**：运行期超大工具结果优先走**"落盘+指针"**而非丢弃/摘要——参照 hermes 三层机制（单结果超阈值→写工作区文件、上下文只留预览+路径、agent 可 Read 取回；Read 结果自身豁免落盘防循环）。对 claude-go：`pkg/compact` 的截断路径增加 persist 档位，被落盘的原文**天然就是 TraceStore 的 Blob**——上下文瘦身与轨迹保真一次解决；LLM 摘要压缩（现 SmartExtractKeyFacts）保留用于会话延续，但 Span 里始终记指针指向无损原文，学习管线永远读得到全文。这直接消解 §1.3 "action 完整文本缺失"中 transcript 截断的那一半。
 
-### 4.2 ② RewardBus：奖励总线　　**[🟠 8 源中 6 源已通电（原 3 源）]**
+### 4.2 ② RewardBus：奖励总线　　**[✅ 8 源已通电（原 1 源）]**
+
+> ✅ **8 源已全部通电（2026-07-25）**。最后两源：
+> - **`gate.e2e`**：`POST /api/runs/{runId}/feedback`。三处 fail-closed——**source 锁死**（允许自选源名等于把权重表交给外部，自称 `user.explicit` 就能拿人类权重，是本文档 §4.6 最直接的 reward-hacking 入口）；**run 认领不到即 404 且不落盘**（聚合按 `(run_id, team)` 过滤，team 对不上的事件落盘即死数据）；**既无 pass 也无 score 即 400**（无判据的"反馈"不是弱信号，是没有信号）。
+> - **`verdict.heuristic`**：原记账「团队路径根本不产 turn verdict」**只对了一半**——飞书会话路径**是产**的，但 `internal_hook.Trajectory` 只带 `SessionID`、**没有 RunID**，而聚合强制要 RunID。**真正的卡点是归因不是产出**。走通的路是从已带 run 归因的 TraceStore 轨迹把 verdict 算回来（turn 的 `stop_reason` + tool_call 的 `is_error`），全是真实执行结果。权重 0.15 全表最低：它只回答"这轮跑完没、工具报错没"，一个工具全成功而内容全错的 run 在它眼里是满分。
+>
+> ⚠️ **连带的 fail-closed 修复**：`skillaudit.Audit` 原先取**未加权**均值，接一个弱源进来就变成"跑得越多越容易晋升"。改为加权，变异验证过（把 `weight()` 改成恒返回 1，弱信号压闸测试立刻 FAIL）。
 
 > ✅ **6 源已通电（2026-07-25）**：原有 3 源 + 新增 `user.steer`（`teams.go:1665`，归因必须用**上一轮**的 `LastRunID`，否则把用户对旧产出的不满记到新一轮头上）、`user.explicit`（`/team rate`，此前**完全没有入口**能表达"满意"，正向人类信号恒为零）、`review.panel`（截尾均值 overall）、`latency`（阶梯惩罚，**只罚不奖** —— 给正分会激励偷工，最快的路径是什么都不做；权重 0.2 不与质量判断同权竞争）。
 >
@@ -267,7 +275,11 @@ type RewardEvent struct {
 2. **复合 shaped reward 模板（H2）**：episode 奖励默认配方 `R = w1·正确性 + w2·效率 + w3·过程规范`，权重进配置。效率项参照 hermes 阶梯惩罚：工具调用/轮次在预算内满分，超出后按档递减——直接对抗"堆 turn 堆 token 刷分"；过程规范项吃 turn Verdict/工具错误率等弱信号。正确性项优先确定性验证（门禁），无法确定性验证的域用 LLM judge，**judge 不可用时回退启发式**（关键词/结构断言）而非置 0——保证奖励覆盖率。
 3. **judge 独立性（H3 教训）**：LLM judge 一律使用与被评估主模型**不同的模型档位或供应商**（配置强制，如主模型 kimi-k3 → judge 走 gemma4 本地或 fallback 供应商）；hermes 的 web_research 用被训模型自评自训，是 reward hacking 的标准入口，明令禁止。
 
-### 4.3 ③ 学习器族：五个学习器、一个循环　　**[🟠 五个学习器齐 ✅ · 统一循环本轮才真通电 / GEPA 需独立档位、E5 权重导出仍缺]**
+### 4.3 ③ 学习器族：五个学习器、一个循环　　**[✅ 五个学习器 · 统一循环 · SFT/DPO 导出（均默认关）]**
+
+> ⚠️ **一处记账被推翻**：GEPA 的 reflector **早已通电**，取法与 `EvoTierFactory` 本来就是同一个（都读 `api.Client.FallbackModels`）；没配 fallback 整支跳过是 H3 要求的**正确行为**，不是缺陷。
+>
+> ✅ **真缺口是另外两处，已补（2026-07-25）**：① `SetEvoTierFactory` 只在飞书装配，**CLI 形态下 `evo_smoke` 仍只有确定性"装配档"**、`MinTiers>=2` 必然拒绝；② `ExportDPO` 两处装配都不设、也没 env ⇒ **DPO 分支生产上恒不可达**，补 `CLAUDE_GO_EVO_EXPORT_DPO`（同时打开总开关，避免"设了没反应"）。
 
 > **实测**：✅ **`EvolutionLoop` 已实现（2026-07-25）**：`pkg/agent/evolution_loop.go` + `teams.go` 的 `submitLearn` 收敛了两处散点（pipeline 与 swarm 各一份 `go func(){LearnFromTeam;Consolidate}`）。解决三个真实问题：五个学习器共享 `experiences.json` 却互相看不见（多团队同时完成会覆盖）、学习的 LLM 花费无从记账（§4.5「学习成本占比」的前提）、空闲期做不了深度整理。单 goroutine 串行消费 + 去重窗口（refine/重跑会多次走到完成路径，重复蒸馏同一批轨迹会让 UCB 计数虚高）+ 每小时预算闸 + 空闲自发整理。**队列满即丢弃**——学习的背压绝不能传导回交付路径。未装配循环时 `submitLearn` 回落直调，这是长期契约而非临时兼容：一刀切要求先建循环会让漏装配的调用方静默丢失全部学习，那正是 §1.2 开环 1 的原始形态。11 个测试。a 经验学习器预存能力全在 ✅，但**四条升级全未做**（数据源仍读 4k/6k 截断的 trajectories、UCB 未升 contextual bandit、反馈未接 RewardBus、无 actionable 三段式）。b 记忆整理器 ✅ 但选择性更新门/embedding/wiki 双向均无。c 技能进化：创建 ✅、改进 ❌、**影子验证与设计差距最大**（`pkg/evolution/skillaudit/skillaudit.go:82-87` 用「创建时间之后的全部奖励均值」裁决，**零技能归因**，同批 shadow 裁决必然相同；包注释描述的算法与实现不符）。d 工作流/Prompt 进化（AWM/GEPA/canary）全 0。e 权重导出未启动。
 
@@ -321,7 +333,9 @@ type RewardEvent struct {
 - 目标仅限本地小模型窄任务：意图识别（`IntentRecognizer`）、路由 gate、内容评分器——用 gemma4:26b 微调后替换对应 SimpleComplete 调用，省 token 且可控;
 - 明确不做：主力模型微调（无权重）、在线 RL（风险与算力都不成立）。
 
-### 4.4 ④ 策略应用层　　**[🟠 经验注入与 hook 均已同构 / 拦截器仍缺]**
+### 4.4 ④ 策略应用层　　**[✅ 注入同构 + policy_decision 留痕]**
+
+> ✅ **`policy_decision` 留痕已补（2026-07-25）**。**刻意没做成 `NodeInterceptor`**，两条硬理由：① 节点链挂在 `engine.callRunner`，而 `CLAUDE_GO_GRAPH_ENGINE` 默认关 ⇒ pipeline 类工作流一条都不产，又一个"建成未通电"；② 切面手上只有 `NodeSpec`/`NodeInput`，**看不见**"最终提示词里塞了哪三条经验、哪两个技能"。故写在注入发生的那一行旁边，技能名从提示词 `<role_skills>` 段**反解**——读的是真会发出去的那份，不可能"记的和发的不一致"。
 
 > **实测**：`EvolutionRecorder` 拦截器零命中（依赖 design/01 §4.10，未实现）。经验注入确实同构（`pkg/agent/workflow.go:820`，两形态共用）。但 ✅ **`MemoryInjectHook` 在 CLI 未注册的问题已随 `RefreshHooks()` 一并修（2026-07-25）**；实测修复前 CLI 顺序下 `PhasePreRequest` 只有 `[toolresult_level message_filter message_metrics]`，见 `pkg/engine/hook_registration_order_test.go`⇒ **L1/L2 记忆注入在 CLI 形态失效**，设计声称的「headless 与飞书同构，开环 1 从架构上不可能再出现」**未达成**。`policy_decision` Span 零命中。
 
@@ -348,7 +362,11 @@ type RewardEvent struct {
 - **uplift 因果评估**：全部进化产物（经验/技能/模板/prompt）统一用配对对照（注入组 vs 基线组）报告 uplift，替代"感觉变好了"；
 - **18 项进化指标保留** + 新增：reward 趋势、灰度胜率、回滚率、学习成本占比（学习 LLM 花费/总花费）；导出训练路径启用时加 hermes 三件套（H14）：reward_mean / percent_correct / 分布漂移监控。
 
-### 4.6 ⑥ 治理　　**[🟠 四律齐（不越权复用 ConstraintSet.Narrow）/ 全量灰度未验]**
+### 4.6 ⑥ 治理　　**[✅ 四律齐 + 全生命周期 E2E 已验 / 比例灰度未实现]**
+
+> ✅ **全生命周期 E2E 已验（2026-07-25）**：全走生产函数不 mock。链路 = shadow 运行期不可见 → 攒真奖励 → dry-run 不改盘 → `--apply` 晋升 → **运行期真的看得见**（这就是"全量灰度"的实质）→ 留痕带 `reward_avg/samples` → 回滚后立刻不可见。另钉住两条：越权产物奖励满分也判 `reject_escalation`，且**手动通道 `SetStatus(active)` 同样报错**；弱信号不得压过闸。
+>
+> ⚠️ **比例灰度未实现**：`shadow_ratio` 只落实验 JSON，**运行期零消费方**——本仓的灰度是二值的（shadow 全不可见 / active 全量可见）。
 
 > **实测**：存在**两套互不相通的状态机**：经验用 proposed/validated/promoted/…，技能用 shadow/active/archived；设计的 `observed` 无实现，迁移事件**不入 Journal**。✅ **「必过闸」已有运行期效力（2026-07-25）**：`Skill.Status` + frontmatter 解析 + `Get`/清单/Skill 工具排除 shadow，`GetAny`/`All` 留给治理审计。刻意用**黑名单**（shadow/archived/retired/disabled）而非"只有 active 才可用"的白名单——存量 SKILL.md 绝大多数没有 status 行，白名单会一夜禁用全部既有技能；未知值（stable/beta）fail-open 放行。`ImproveSkill` 改用 `GetAny`，否则自改进再也改不了 shadow 技能、`preserveStatus` 会变成死代码。「不越权」无 ConstraintSet 单调性检查。防 reward hacking 三防线全无。
 
