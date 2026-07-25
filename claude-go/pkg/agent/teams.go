@@ -790,7 +790,15 @@ func (ptm *ProductionTeamManager) beginRun(ctx context.Context, team *Production
 	team.mu.Unlock()
 	logging.Event(ctx, "team.start", "team", team.Name, "workflow", team.Workflow, "objective", team.Objective)
 	logging.IncrCounter("team.start." + team.Workflow)
-	return ctx, endSpan
+	// run Span (design/03 §4.1 第 6 种 Kind) 写在收尾闭包里而不是这里: 它记的是这次
+	// episode 的**自述** (objective / 终态 / 耗时 / 阶段数), 只有跑完才知道。挂在这个
+	// defer 上是因为它是唯一"无论从哪条路径退出都会走一遍"的位置 —— 门禁判失败、
+	// 未知工作流、专用编排器全都覆盖得到。见 run_span.go。
+	runStart := time.Now()
+	return ctx, func() {
+		ptm.writeRunSpan(ctx, team, runStart)
+		endSpan()
+	}
 }
 
 // dispatchDedicatedWorkflow 分发自带完整收尾的专用编排器。返回 true 表示已处理完毕。
@@ -829,7 +837,11 @@ func (ptm *ProductionTeamManager) newRunCoordinator(team *ProductionTeam, resumi
 		}
 	})
 	if !resuming {
-		coord.ClearCheckpoints()
+		coord.ClearCheckpoints() // 内存检查点表 + checkpoints.json
+		// 磁盘上的**其余**进度真源也必须一起清 —— 尤其 graph-journal。
+		// 只清 checkpoints.json 会让"新的一轮"在图路径 (orchestrated 无条件命中)
+		// 变成"重放上一轮": 零节点执行 + 直接返回旧目标的产出。见 clearRunProgress。
+		clearRunProgress(team.dataDir)
 	} else {
 		// 恢复模式: 保留已完成阶段的检查点, 从失败处继续
 		restored := coord.CompletedCount()
@@ -1569,15 +1581,14 @@ func (ptm *ProductionTeamManager) RefineTeam(name, feedback, targetStage string)
 		// **用户的反馈静默消失**。用失效事件补上 (design/01 §4.3 InvalidateFrom)。
 		invalidateGraphJournal(context.Background(), team, invalidated, "refine:"+targetStage)
 	} else {
-		// 整体重跑: 清空检查点。
+		// 整体重跑: 清空全部进度真源。
 		// 图引擎路径的进度真源是 graph-journal 而非 checkpoints.json, 必须一并
 		// 清掉——否则 Resume 会重放上一轮的 node.completed, 使"整体重跑"变成
 		// 零节点执行并直接返回旧产出 (Replay 已按 run 隔离, 这里再断掉基线,
 		// 两道一起才能保证重跑真的重跑)。
-		if team.dataDir != "" {
-			os.Remove(filepath.Join(team.dataDir, "checkpoints.json"))
-			os.RemoveAll(filepath.Join(team.dataDir, "graph-journal"))
-		}
+		// 与 newRunCoordinator 的"新的一轮"共用同一个清空口 (clearRunProgress):
+		// 这里曾是两行内联删除, 与那边各写一份 —— 两份里只改了一份正是本轮修掉的缺陷。
+		clearRunProgress(team.dataDir)
 	}
 
 	team.mu.Lock()
@@ -1684,9 +1695,16 @@ func (ptm *ProductionTeamManager) ForkTeam(src, dst string) (*ProductionTeam, er
 		nt.SetLanguage(lang)
 	}
 	// 复制检查点, 使 fork 能从源团队的阶段产出继续增量精修。
+	//
+	// ⚠️ 已知的两源不对称 (刻意**不**在本轮一并改): 这里只复制 checkpoints.json,
+	// 不复制 graph-journal。于是图路径上 fork 出来的团队没有可复用的进度, 精修时
+	// 从头全跑一遍 —— 与旧路径不等价, 但方向是**多跑**而不是吃旧产出, 属 fail-safe。
+	// 补齐它要连 team.LastRunID 一起搬 (按阶段失效靠它定位 run), 而 LastRunID 同时
+	// 是奖励归因的键 (recordSteerReward): 搬过去会把 fork 的精修负信号记到**源团队**
+	// 那一轮头上, 归因反了。那是 design/03 侧的一次语义决策, 不该顺手在这里做掉。
 	if srcDataDir != "" && nt.dataDir != "" {
-		if data, e := os.ReadFile(filepath.Join(srcDataDir, "checkpoints.json")); e == nil {
-			_ = os.WriteFile(filepath.Join(nt.dataDir, "checkpoints.json"), data, 0644)
+		if data, e := os.ReadFile(filepath.Join(srcDataDir, checkpointsFileName)); e == nil {
+			_ = os.WriteFile(filepath.Join(nt.dataDir, checkpointsFileName), data, 0644)
 		}
 	}
 	nt.mu.Lock()

@@ -595,7 +595,9 @@ func (e *Engine) execNode(ctx context.Context, rc *runCtx, scope execScope, node
 	// "运行中" 占位记录, 无需自己再查 spec。
 	dec := rc.hooks.Emit(ctx, HookEvent{Scope: ScopeNode, Phase: "pre", RunID: rc.runID, NodeID: evID,
 		Payload: scope.with(map[string]any{"kind": string(node.Kind), "role": node.Agent.Role})})
-	if dec.Action == HookDeny {
+	// Blocks() 而不是 `== HookDeny`: 外部 hook (pkg/hooks) 用 block 表达"拦下",
+	// 只认 deny 会让一个明确写了 block 的治理 hook 静默放行 —— 方向是 fail-open。
+	if dec.Blocks() {
 		rc.appendEv(EvNodeSkipped, evID, scope.with(map[string]any{"reason": dec.Reason, "denied_by": "hook"}))
 		return NodeResult{Status: NodeStatusSkipped, Err: dec.Reason}
 	}

@@ -233,17 +233,26 @@ func (c *HookChain) Execute(phase InternalHookPhase, ctx *HookContext) (*HookRes
 	messages := ctx.Messages
 	systemPrompt := ctx.SystemPrompt
 
+	// 总线观测者 (design/01 §4.5: internal_hook 事件对图层可见)。
+	// 每次 Execute 只查一次 ctx —— 这是每 turn 触发 11 次的最热路径, 逐 hook 查
+	// 会把一次 map 查找变成 N 次。无观测者时后续 emit 全是空操作 (零分配)。
+	obs := ObserverFrom(ctx.Ctx)
+
 	for _, hook := range hooks {
 		ctx.Messages = messages
 		ctx.SystemPrompt = systemPrompt
 
 		r, err := hook.Execute(ctx)
 		if err != nil {
+			// 报错事件先发再返回: 链在这里中断, 不发的话图层只看得到"这一轮少了点
+			// 什么", 看不到是谁断的。
+			emit(ctx, obs, phase, hook.Name(), err.Error())
 			return nil, fmt.Errorf("internal hook %s: %w", hook.Name(), err)
 		}
 		if r == nil {
-			continue
+			continue // 没介入就没事件: 见 bus.go 文件头第 3 点
 		}
+		emit(ctx, obs, phase, hook.Name(), "")
 
 		if result == nil {
 			result = &HookResult{}

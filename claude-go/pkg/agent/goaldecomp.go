@@ -20,9 +20,15 @@
 //     t.Error, 即便结果全错也会 PASS)。仓内三个分解器中另两个 (WBS
 //     ParsePlanToDAG、swarm LLM 分解) 才是接线的。
 //   - 按 design/01 §4.2 规划, HTN 分解算法将被吸收为 pkg/graph 的 ExpandSpec
-//     展开器 (planner 节点), 而**持久化与进度层将被删除**: Journal 已取代
-//     goals.json/checkpoints.json/tasks.json 的"四源互相打补丁"恢复逻辑
-//     (design/01 §4.4)。故勿在 save/load/SaveCheckpoint 上继续开发。
+//     展开器 (planner 节点), 而**持久化与进度层将被删除** (design/01 §4.3)。
+//     故勿在 save/load/SaveCheckpoint 上继续开发。
+//   - ⚠️ 这里原先写的是"Journal 已取代 goals.json/checkpoints.json/tasks.json
+//     的四源恢复逻辑" —— **不属实, 已更正**。截至 2026-07-25 归一只做到:
+//     `orchestrator.CheckpointStore` 随包退役; checkpoints.json 与 tasks.json
+//     仍是各自路径上真正在用的进度真源 (前者是旧 pipeline 与各 mode 专用执行器,
+//     后者是 WBS 编排器的 restoreCompletedTasksFromDAG)。goals.json 是唯一
+//     **零生产写入方**的那个 —— 它不是"已被 journal 取代", 是"从来没通过电"。
+//     把没做完的事写成已完成, 会让下一个人以为可以放心删另外两个文件。
 //   - 现在无法接线: ExpandSpec 尚未实现, 且 pkg/graph 的 Validate 目前拒绝
 //     除 agent/gate 之外的全部 Kind。独立接线会重新制造刚消除掉的四源缺陷。
 //   - 已知缺陷 (吸收时必须一并修): GoalFailed/GoalBlocked 两个状态只读不写

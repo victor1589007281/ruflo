@@ -1115,6 +1115,9 @@ type teamGraphHooks struct {
 	mu    sync.Mutex
 	byID  map[string]StageResult
 	start map[string]time.Time
+	// internalHits 节点 → 内置 hook 名 → 干预次数 (design/01 §4.5 turn|tool 作用域)。
+	// 只计数不存明细, 理由见 graph_internal_bridge.go 的 noteInternalHook。
+	internalHits map[string]map[string]int
 }
 
 func newTeamGraphHooks(we *WorkflowExecutor, team *ProductionTeam, spec graph.GraphSpec) *teamGraphHooks {
@@ -1145,7 +1148,13 @@ func (h *teamGraphHooks) Emit(ctx context.Context, ev graph.HookEvent) graph.Hoo
 		case "post", "failure":
 			h.nodeFinished(ctx, ev)
 		}
+	case graph.ScopeTurn, graph.ScopeTool:
+		// design/01 §4.5: internal_hook 保留在引擎内, 但事件注册进同一总线。
+		// 这里**只聚合计数**, 不落盘不打日志 —— 一次团队运行会有成千上万条,
+		// 逐条处理会把最热路径与日志双双淹掉。见 graph_internal_bridge.go。
+		h.noteInternalHook(ev)
 	}
+	// 恒放行。turn|tool 事件更是纯观测: 桥接方也已把决策丢弃 (双保险)。
 	return graph.HookDecision{}
 }
 
@@ -1202,10 +1211,26 @@ func (h *teamGraphHooks) nodeFinished(ctx context.Context, ev graph.HookEvent) {
 		retries = 0
 	}
 	recordGraphStageMetrics(h.team, sr, retries)
-	logging.Event(ctx, "graph.node."+ev.Phase, "team", h.teamName(), "node", ev.NodeID,
+	kv := []string{"team", h.teamName(), "node", ev.NodeID,
 		"role", sr.Role, "status", string(sr.Status), "attempts", fmt.Sprintf("%d", attempts),
 		"iterations", fmt.Sprintf("%d", iterations), "duration_ms", fmt.Sprintf("%d", durMs),
-		"output_len", fmt.Sprintf("%d", len(sr.Output)), "error", sr.Error)
+		"output_len", fmt.Sprintf("%d", len(sr.Output)), "error", sr.Error}
+	// 内置 hook 干预摘要 (§4.5 turn|tool)。**为空时一个字段都不加**:
+	// 没有干预的运行, 这行日志逐字节与改造前一致 (下游有按日志比对的验收)。
+	if s := h.internalHookSummary(ev.NodeID); s != "" {
+		kv = append(kv, "internal_hooks", s)
+	}
+	logging.Event(ctx, "graph.node."+ev.Phase, toAnySlice(kv)...)
+}
+
+// toAnySlice 把 k/v 串切片转成 logging.Event 的可变参形态。
+// 单独提出来是因为 logging.Event 收 ...any 而这里需要先条件追加再一次性传入。
+func toAnySlice(ss []string) []any {
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
 }
 
 // trackDynamic 把运行期才出现的节点 ID 追加进刷盘序 (调用方须持 h.mu)。
@@ -1372,7 +1397,7 @@ func (we *WorkflowExecutor) runGraphSpec(
 	team *ProductionTeam, newRunner func(graph.GraphSpec) graph.NodeRunner,
 ) ([]StageResult, error) {
 	// NewFileJournal 收目录名, 内部落 <dir>/journal.jsonl
-	journalDir := filepath.Join(team.dataDir, "graph-journal")
+	journalDir := filepath.Join(team.dataDir, graphJournalDirName)
 	journal, err := graph.NewFileJournal(journalDir)
 	if err != nil {
 		return nil, fmt.Errorf("graph_adapter: 打开 journal 失败: %w", err)
@@ -1394,6 +1419,10 @@ func (we *WorkflowExecutor) runGraphSpec(
 	if runID == "" {
 		runID = trace.NewRunID(team.Name)
 	}
+	// design/01 §4.5: 让引擎内 internal_hook 的 turn|tool 事件进**同一条**总线。
+	// 挂在 ctx 上而不是各 runner 里 —— ctx 从这里一路流到 sessionAgentRunner →
+	// engine.Query → queryLoop 的 HookChain, 中间各层无需知情。
+	ctx = withInternalHookBridge(ctx, hooks, runID)
 	// 灰度期要能一眼核对"图到底带了哪些能力": 节点数/并发/重试/门禁元数据全打出来。
 	defaultRetries := 0
 	if spec.Policies.DefaultRetry != nil {
@@ -1532,7 +1561,7 @@ func invalidateGraphJournal(ctx context.Context, team *ProductionTeam, stages []
 	if team == nil || team.dataDir == "" || len(stages) == 0 {
 		return
 	}
-	dir := filepath.Join(team.dataDir, "graph-journal")
+	dir := filepath.Join(team.dataDir, graphJournalDirName)
 	if _, err := os.Stat(dir); err != nil {
 		return // 没走过图引擎
 	}

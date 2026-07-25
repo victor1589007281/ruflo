@@ -701,14 +701,14 @@ func (c *Coordinator) persistCheckpoints() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(c.dataDir, "checkpoints.json"), data, 0644)
+	_ = os.WriteFile(filepath.Join(c.dataDir, checkpointsFileName), data, 0644)
 }
 
 func (c *Coordinator) loadCheckpoints() {
 	if c.dataDir == "" {
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(c.dataDir, "checkpoints.json"))
+	data, err := os.ReadFile(filepath.Join(c.dataDir, checkpointsFileName))
 	if err != nil {
 		return
 	}
@@ -734,7 +734,7 @@ func (c *Coordinator) ClearCheckpoints() {
 	defer c.mu.Unlock()
 	c.checkpoints = make(map[string]*Checkpoint)
 	if c.dataDir != "" {
-		os.Remove(filepath.Join(c.dataDir, "checkpoints.json"))
+		os.Remove(filepath.Join(c.dataDir, checkpointsFileName))
 	}
 }
 
@@ -745,7 +745,7 @@ func InvalidateCheckpoints(dataDir string, stageNames []string) error {
 	if dataDir == "" || len(stageNames) == 0 {
 		return nil
 	}
-	path := filepath.Join(dataDir, "checkpoints.json")
+	path := filepath.Join(dataDir, checkpointsFileName)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil // 无检查点文件 → 无需失效
@@ -762,4 +762,46 @@ func InvalidateCheckpoints(dataDir string, stageNames []string) error {
 		return err
 	}
 	return os.WriteFile(path, out, 0644)
+}
+
+// checkpointsFileName / graphJournalDirName 两个进度真源在团队 dataDir 下的落点。
+//
+// 提成常量不是洁癖: 这两个名字此前是散在 coordinator.go / teams.go / graph_adapter.go
+// 里的字面量, 而"清进度"这件事必须同时覆盖两者 —— 少写一处的后果见 clearRunProgress。
+const (
+	checkpointsFileName = "checkpoints.json"
+	graphJournalDirName = "graph-journal"
+)
+
+// clearRunProgress 清空一个团队 dataDir 下**全部磁盘进度真源**, 使下一次运行从零开始。
+//
+// ---------------------------------------------------------------------------
+// 为什么必须一次清两个源, 而不是"清当前生效的那一个"
+// ---------------------------------------------------------------------------
+//
+// design/01 §4.3 要 journal 作唯一进度真源, 但归一是渐进的: 眼下
+// checkpoints.json (旧 pipeline 恢复 + 各 mode 专用执行器) 与 graph-journal
+// (图引擎; **orchestrated 无条件走它, 不看灰度开关**) 并存, 哪个生效由
+// graphEngineEnabled() 与 mode 表联合决定。
+//
+// 在这里复算一遍"谁生效"等于把那张模式表抄第二份 —— 那正是 §1.2 记的
+// "双 switch 漂移"缺陷的形状 (app_composite/game_composite 曾因此被静默降级)。
+// 清一个本轮用不到的源是无害的 (它本就只代表"上一轮"); 漏清一个是数据正确性事故:
+//
+//	用户带**新目标**重跑一个跑挂过的团队 → 旧代码只清 checkpoints.json,
+//	graph-journal 原样留着 → Engine.Run(Resume:true) 重放上一轮全部
+//	node.completed → 本轮**零个节点执行**, 直接把旧目标的产出当成新目标的交付
+//	返回, 且团队报 completed。用户换的那个目标静默消失。
+//
+// 这与 refine 静默失效是同一族缺陷 (一个生命周期动作只认识两个源里的一个),
+// 只是方向相反: 那次是"该失效的没失效", 这次是"该清空的没清空"。
+//
+// 等价性由 progress_source_equiv_test.go 的 S1/S2/S3/S4/S5/S5b 六场景钉住
+// (两条路径逐项比对 + 变异反证)。
+func clearRunProgress(dataDir string) {
+	if dataDir == "" {
+		return
+	}
+	_ = os.Remove(filepath.Join(dataDir, checkpointsFileName))
+	_ = os.RemoveAll(filepath.Join(dataDir, graphJournalDirName))
 }
