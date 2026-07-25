@@ -116,7 +116,7 @@ claude-go 当前的编排能力分散在**三套各自独立的引擎**里，外
 
 ### 4.1 一切皆 AgentNode　　**[🟠 Kind 5/8 已实现 / router·subgraph·human 仍缺]**
 
-> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。✅ **map/reduce/loop-group 三种已实现（2026-07-25）**：新增 `pkg/graph/fanout.go`（map 扇出 + reduce 汇聚）与 `expand.go`，`Validate` 相应放开——但**未实现的 Kind 仍明确报错**，不是放开成静默接受。现为 5/8；router/subgraph/human 仍缺。✅ **`AgentSpec` 三个字段已通电（2026-07-25）**：`Deterministic` 由 compile/test/build gate 派生并被 `runGate` 消费；`ToolProfile`/`MaxTurns` 经新增的 `NodeExecHints` ctx 载体下推——`MaxTurns` 通过包装 factory 改写 `ResolvedConfig` 真实生效（必须在 factory：`runAgent` 会在调用前覆盖该 ctx 值），`ToolProfile` 在飞书 runner 侧**优先于角色名子串推断**（退役了 `world-builder` 因含 "build" 被判 coding 档拿到 Bash 那个真实误判）。
+> **实测**：`NodeKind` 只定义 5 个常量（`pkg/graph/spec.go:39-47`，router/reduce/loop-group 连常量都没有），`Validate` 只接受 `agent|gate`，其余 6 种**显式报错拒绝**（`pkg/graph/validate.go:32-39`）。✅ **map/reduce/loop-group 三种已实现（2026-07-25）**：新增 `pkg/graph/fanout.go`（map 扇出 + reduce 汇聚）与 `expand.go`，`Validate` 相应放开——但**未实现的 Kind 仍明确报错**，不是放开成静默接受。现为 5/8；router/subgraph/human 仍缺——但**它们不是 §五 的阻塞项**：15 个 mode 逐个核实后没有一个真的需要它们（设计文档写 composite 需要 `subgraph`，源码里 `app_composite`/`game_composite` 从不调 `RunTeam`/`TeamManager`，全部在一个 executor 内跑；条件边已能表达 router 的分支路由）。✅ **`AgentSpec` 三个字段已通电（2026-07-25）**：`Deterministic` 由 compile/test/build gate 派生并被 `runGate` 消费；`ToolProfile`/`MaxTurns` 经新增的 `NodeExecHints` ctx 载体下推——`MaxTurns` 通过包装 factory 改写 `ResolvedConfig` 真实生效（必须在 factory：`runAgent` 会在调用前覆盖该 ctx 值），`ToolProfile` 在飞书 runner 侧**优先于角色名子串推断**（退役了 `world-builder` 因含 "build" 被判 coding 档拿到 Bash 那个真实误判）。
 
 ```go
 // pkg/graph/spec.go —— 图与节点是纯数据，可 JSON 序列化
