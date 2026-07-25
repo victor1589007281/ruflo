@@ -17,7 +17,10 @@ package cluster
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -156,12 +159,24 @@ func (h *httpHandler) tasks(w http.ResponseWriter, r *http.Request) {
 type Client struct {
 	base   string
 	worker string
+	token  string
 	http   *http.Client
 }
 
 // NewClient control 为控制面基址 (如 http://claude-go-control:18080)。
 func NewClient(base, worker string) *Client {
 	return &Client{base: base, worker: worker, http: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// WithToken 注入 Bearer token。
+//
+// 为什么必须有: httpauth.DefaultProtectPrefixes 含 `/cluster/`, 所以配了
+// wiki.apiSecret 的部署里, 不带 token 的 worker **每次拉取都是 401**。改造前
+// post 又不检查状态码(见下), 于是这个 401 表现为"一直拉不到活"而不是报错 ——
+// 最难归因的一类故障。
+func (c *Client) WithToken(token string) *Client {
+	c.token = token
+	return c
 }
 
 func (c *Client) post(path string, body, out any) (int, error) {
@@ -171,12 +186,26 @@ func (c *Client) post(path string, body, out any) (int, error) {
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
-	if out != nil && resp.StatusCode == 200 {
+	// **状态码必须判**。改造前这里拿到 code 却只是返回它, 而 Heartbeat/Complete/Fail
+	// 三个调用方都写成 `_, err := c.post(...)` —— 于是 401(没配 token)、400("任务不在
+	// 你的租约内")在 worker 侧全是**静默成功**。fail-open 用在这条路上代价极大:
+	// 上报终态被拒却当成功, 任务就永远停在 leased 直到租约过期。
+	//
+	// 2xx 全算成功: 204 是 /cluster/pull 的合法"无任务"应答(见 PullWithCaps)。
+	if resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return resp.StatusCode, fmt.Errorf("cluster: POST %s 返回 %d: %s",
+			path, resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+	if out != nil {
 		_ = json.NewDecoder(resp.Body).Decode(out)
 	}
 	return resp.StatusCode, nil

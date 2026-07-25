@@ -65,6 +65,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
+	"github.com/anthropic/claude-go/pkg/worker"
 	"github.com/spf13/cobra"
 )
 
@@ -795,6 +796,17 @@ func runCmd() *cobra.Command {
 					evoDir = tasksLayout.Evolution
 				}
 				evoEngine := agent.NewEvolutionEngine(evoDir, eng.APIClient)
+				// 统一学习循环 (design/03 §4.3): 此前 NewEvolutionLoop 全仓零生产调用方,
+				// submitLearn 永远走回落直调 —— 循环写完了但没通电。挂上它才有去重/预算闸/
+				// 空闲期深度整理, 也才有学习器 d/e 的运行相位。
+				evoLoop := agent.NewEvolutionLoop(evoEngine, nil, agent.EvolutionLoopConfig{})
+				evoLoop.EnableStructureLearning(agent.StructureConfig{
+					StateDir: filepath.Dir(evoDir),
+					// Reflector 用 fallback 档位模型 —— §4.2 H3 明令禁止拿被评估的主模型
+					// 自评。没配 fallback 时为 nil, prompt 进化会跳过并记日志, 不静默降级。
+					Reflector: cliEvoReflector(eng.APIClient),
+				})
+				evoLoop.Start(context.Background())
 				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
 					BaseDir:            filepath.Join(tasksStateDir, "teams"),
 					Cwd:                cwd,
@@ -807,6 +819,8 @@ func runCmd() *cobra.Command {
 					Concurrency:        eng.APIClient.Guard,
 					PlanConfigResolver: modelResolver,
 					Evolution:          evoEngine,
+					EvolutionLoop:      evoLoop,
+					TraceStore:         eng.TraceStore, // gate Span (design/03 §4.1 第 5 种 Kind)
 					Dreamer:            &cliDreamAdapter{dreamer: cliDreamer},
 					SkillCreator:       cliSkillCreator(tasksLayout, tasksStateDir, eng),
 				})
@@ -929,6 +943,9 @@ func feishuCmd() *cobra.Command {
 		httpPort       int // serve 模式的 HTTP 端口 (覆盖 wiki.apiPort); 支持 --addr host:port 形式
 		addr           string
 		dispatchMode   string // "" | "queue" (分布式控制面: 挂 cluster 任务队列端点)
+		// placementPrefer 阶段执行的放置偏好 (design/01 §4.9 Placement.Prefer):
+		// "local"(默认, 行为不变) | "any" | "remote:<worker 名>"。
+		placementPrefer string
 	)
 
 	cmd := &cobra.Command{
@@ -1155,6 +1172,10 @@ JSON 配置文件示例:
 			var botRef *feishu.Bot
 			var dashCfgRef *dashboard.Config
 			var taskSvc *agent.FileQueueTaskService
+			// 远程 Agent 运行时 (design/02 §3.3): 仅 --dispatch-mode queue 下装配。
+			// 见下方 dispatchMode 分支 (挂端点) 与 NewBot 之后的接线 (换执行工厂)。
+			var workerBroker *worker.Broker
+			var runtimeReg agent.RuntimeRegistry
 
 			if config.Wiki.APIPort > 0 {
 				// 与 bot 使用相同的 stateDir 解析逻辑，确保 dashboard 读写 metrics 路径一致。
@@ -1194,9 +1215,21 @@ JSON 配置文件示例:
 					ss := statestore.NewFileStore(filepath.Join(stateDir, "statestore"))
 					clusterQueue := cluster.NewQueue(ss, 5*time.Minute)
 					clusterReg := cluster.NewRegistry(ss, 90*time.Second)
+					// Broker 把队列包成 AgentRuntime 的远程实现 (design/02 §3.3):
+					// 没有它, 队列只是"能入队但没人派活、执行体是桩"的空管道。
+					brk, brkErr := worker.NewBroker(worker.BrokerOptions{
+						Queue: clusterQueue, Registry: clusterReg,
+						Logf: func(f string, a ...any) { log.Printf(f, a...) },
+					})
+					if brkErr != nil {
+						return fmt.Errorf("装配远程 runtime 失败: %w", brkErr)
+					}
+					workerBroker = brk
+					runtimeReg = agent.NewRuntimeRegistry()
 					config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 						func(mux *http.ServeMux) {
 							cluster.Mount(mux, clusterQueue, clusterReg)
+							brk.Mount(mux) // /cluster/node-events: worker 的事件回传
 							fmt.Printf("[Cluster] 分布式控制面已挂载 (/cluster/*), 任务队列就绪\n")
 						})
 				}
@@ -1273,6 +1306,28 @@ JSON 配置文件示例:
 				fmt.Printf("[TaskService] 动作队列消费方已启动 (间隔 2s)\n")
 			}
 
+			// 远程 Agent 运行时接线 (design/02 §3.3 / design/01 §4.9)。
+			//
+			//   ① 本地执行体收编为 local-session runtime (lease=0 永不过期);
+			//   ② 阶段执行工厂换成放置感知的工厂: Pick(Placement) → 本地或远程 worker;
+			//   ③ 周期同步 worker 注册表 → RuntimeRegistry (心跳续租, 掉线由租约剔除)。
+			//
+			// 默认 --placement-prefer=local ⇒ 行为与改造前一致 (仍走本机执行);
+			// 设成 remote:<worker 名> 才把阶段派到那个 worker。
+			if workerBroker != nil && runtimeReg != nil && bot.TeamManager() != nil {
+				localCaps := agent.RuntimeCaps{Bash: true, MaxParallel: 8}
+				bot.TeamManager().WrapAgentFactory(func(local agent.CreateAgentFunc) agent.CreateAgentFunc {
+					if rt := agent.NewLocalRuntime("local-session", localCaps, local); rt != nil {
+						runtimeReg.Register(rt, 0)
+					}
+					return worker.RuntimeFactory(runtimeReg, &agent.Placement{
+						Prefer: placementPrefer, Affinity: "team",
+					})
+				})
+				go workerBroker.SyncLoop(ctx, 10*time.Second, runtimeReg, 90*time.Second)
+				fmt.Printf("[Cluster] 远程 runtime 已接线 (placement prefer=%s, 每 10s 同步 worker)\n", placementPrefer)
+			}
+
 			fmt.Println("========================================")
 			fmt.Println("  Claude Code (Go) - 飞书长连接模式")
 			fmt.Println("========================================")
@@ -1305,6 +1360,7 @@ JSON 配置文件示例:
 	cmd.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (包含 feishu/ai/mcpServers/hooks 等)")
 	cmd.Flags().IntVar(&httpPort, "http-port", 0, "serve 模式 HTTP 端口 (覆盖 wiki.apiPort; 默认 18080)")
 	cmd.Flags().StringVar(&dispatchMode, "dispatch-mode", "", "分布式控制面模式: queue (挂 /cluster/* 任务队列端点)")
+	cmd.Flags().StringVar(&placementPrefer, "placement-prefer", "local", "阶段执行放置偏好: local | any | remote:<worker 名> (需 --dispatch-mode queue)")
 	cmd.Flags().StringVar(&addr, "addr", "", "serve 模式监听地址 host:port (等价 --http-port, 便于 K8s 声明)")
 
 	return cmd
@@ -1514,6 +1570,14 @@ func evoCmd() *cobra.Command {
 			}
 			fmt.Printf("技能进化门禁 [%s]\n  评估 shadow 技能: %d\n  晋升: %v\n  退役: %v\n  保持: %v\n",
 				mode, res.Evaluated, res.Promoted, res.Retired, res.Held)
+			// 不越权闸拦下的必须单独显示 (design/03 §4.6): "分数够了但权限面越界"与
+			// "分数不够先等等"要人做的事完全不同, 混进 Held 会让越权被当成还没攒够样本。
+			if len(res.Rejected) > 0 {
+				fmt.Printf("  不越权闸拒绝: %v\n", res.Rejected)
+				for name, reasons := range res.RejectReasons {
+					fmt.Printf("    · %s: %s\n", name, strings.Join(reasons, "; "))
+				}
+			}
 			return nil
 		},
 	}
