@@ -29,7 +29,9 @@ package agent
 // ---------------------------------------------------------------------------
 //
 // 等价的门槛是"同样的阶段、同样的顺序、同样的并发度、同样的门禁"。逐个读完 15 个
-// 执行器后, 剩下 11 个 mode 各自缺的东西是**能力级**的, 不是工作量级的, 归为三类:
+// 执行器后, 剩下 11 个 mode 里 1 个 (orchestrated) 已在 M4 用**专属节点内核**迁到图
+// 引擎 (见 modeGraphNativeKernel), 另外 10 个各自缺的东西是**能力级**的,
+// 不是工作量级的, 归为三类:
 //
 //  1. **自适应终止器 (AdaptiveTerminator) 驱动的循环**: 退出条件不是"分数过线",
 //     而是 加权分 ≥6.0 / 收敛 ε=0.5 / 退化 0.3×2 次 / 策略转换 ≤2 次 / best-of-N
@@ -37,12 +39,15 @@ package agent
 //     ok|fail|score|output contains 四类原子条件 (pkg/graph/condition.go), 表达不了,
 //     硬用 `score >= 6` 顶替会把"收敛/退化/回滚"三种终止悄悄改成"永远跑满轮次"。
 //     命中: creative_media / app_composite / game_composite / novel_writing / swarm_novel。
-//  2. **非 agent 执行内核**: 阶段不是一次 ExecuteSingleStage, 而是 裸 LLM completion
-//     (pkg/orchestrator.LLMRunner)、swarm_intel 引擎、pkg/media 渲染或本地 shell 门禁。
+//  2. **非 agent 执行内核**: 阶段不是一次 ExecuteSingleStage, 而是 裸 LLM completion、
+//     swarm_intel 引擎、pkg/media 渲染或本地 shell 门禁。
 //     stageNodeRunner 只会跑 ExecuteSingleStage —— 用它跑这些阶段等于**悄悄换了内核**
 //     (最直接的后果: 裸 completion 阶段突然拿到了工具权限)。
-//     命中: orchestrated / ensemble_extract / review_panel / plot_simulate /
+//     命中: ensemble_extract / review_panel / plot_simulate /
 //     plot_predict / swarm_novel / game_composite / creative_media。
+//     orchestrated 原本也在这一类, M4 的解法不是硬塞进 stageNodeRunner 而是**为它写一个
+//     裸 completion 的 NodeRunner** (orchestrated_runner.go) —— 这条路对上面几个 mode
+//     同样成立, 是后续里程碑的模板。
 //  3. **运行期才知道的图形状**: 节点名/节点数来自 LLM 产出 (WBS 任务标题、章节数、
 //     时间线数)。图侧对应能力是 ExpandSpec 动态展开, 但它要求 runner 能把上游产出
 //     解析成 []NodeSpec —— 那是每个 mode 一个解析器的活, 且解析失败的降级语义
@@ -50,7 +55,7 @@ package agent
 //     命中: adversarial_dev / novel_writing / swarm_novel。
 //
 // 每条都在 modeGraphNotTemplated 里有一句话的记账, 且有守护测试保证
-// "模板表 ∪ 未做表 = 全部 15 个 mode" —— 将来新增 mode 忘了表态就会红。
+// "模板表 ∪ 专属内核表 ∪ 未做表 = 全部 15 个 mode" —— 将来新增 mode 忘了表态就会红。
 
 import (
 	"fmt"
@@ -131,11 +136,6 @@ var modeGraphNotTemplated = map[string]string{
 		"缺 ExpandSpec 的 WBS 解析器 + 能跑 Orchestrator/shell 门禁的 NodeRunner。" +
 		"另注: runAdversarialLoop / initAdaptiveTerminator / autoScalePool / runBuildGate / runTestGate " +
 		"在 HEAD 已无调用方 (死代码), design/01 §五 写的 loop-group[coder→reviewer→fixer] 对应的是这段死代码, 不是线上行为。",
-	"orchestrated": "图**结构**上就是 wf.Stages 的 1:1 DAG (直译器已能表达), 但执行内核不同: " +
-		"pkg/orchestrator 用 LLMRunner 做裸 completion (无工具), 且 code-review 的 adversarial-challenge " +
-		"走 AdversarialRunner 内层 3 轮 + QualityTermination(7.0, 0.5), 并发闸是 RunnerPool " +
-		"(llm-stage=MaxParallel / llm-adversarial=1)。用 stageNodeRunner 跑等于给这些阶段发了工具权限, " +
-		"是行为变更而非等价迁移。缺一个裸 completion 的 NodeRunner + 组内并发闸。",
 	"ensemble_extract": "工作流声明 0 个 Stages; 真实执行是 3 路差异化 lens 的裸 we.llm 调用 " +
 		"(swarm_intel.FanOutCollect, MaxConcurrency=4/单路 6min/总 450s), 再做投票融合 " +
 		"(confidence = 命中路数/总路数, 证据截 3 条)。map 形态能表达扇出, 但缺 (a) 裸 completion 的 " +
@@ -167,7 +167,30 @@ var modeGraphNotTemplated = map[string]string{
 		"swarm_intel 三路情景模拟 (硬编码 {5,3}/{4,2}/{3,2}, 自带 sem=3 并发闸)。同样不需要 subgraph。",
 }
 
+// modeGraphNativeKernel 已在图引擎上跑、但**不经 stageNodeRunner 模板路径**的 mode
+// (design/01 M4)。第三类的存在理由:
+//
+//	modeGraphTemplates    = "阶段序列可等价展开, 灰度开关命中即切图, 内核仍是 stageNodeRunner"
+//	modeGraphNotTemplated = "现在还不能等价图化, 缺哪项能力逐条记账"
+//	modeGraphNativeKernel = "已无条件在图引擎上跑, 但配的是该 mode 专属的 NodeRunner"
+//
+// 把 orchestrated 塞进前两张表任何一张都会说谎: 它既不是"灰度可切"(已经无条件切了,
+// 入口在 executeOrchestrated —— 那里有 LLMClient 缺失时的降级与飞书通知, 绕过它会
+// 丢掉降级), 也不是"还没图化"。ModeHasGraphTemplate 因此**不含**它, 于是
+// workflow.go 的灰度分发口不会把它劫走。
+var modeGraphNativeKernel = map[string]string{
+	"orchestrated": "已迁至 pkg/graph 图引擎 (design/01 M4, 退役 pkg/orchestrator): 图结构 = wf.Stages 的 " +
+		"1:1 DAG, 执行内核换成专属的 orchNodeRunner —— 裸 LLM completion (无工具/无角色模板合并/无黑板交接), " +
+		"对抗阶段走内层 3 轮 + QualityTermination(7.0, 0.5), 重试按 fatal/transient/permanent 分档 (0/2/7 次), " +
+		"AND-join 与级联取消由 runner 的级联闸复刻。等价性由 orchestrated_equiv_test.go 四维比对钉住 " +
+		"(阶段序列/LLM 调用次数/峰值并发/提示词逐字)。刻意保留的旧行为与刻意丢掉的能力见 " +
+		"workflow_orchestrated.go 文件头。",
+}
+
 // ModeHasGraphTemplate 该 mode 是否有已验证等价的图模板 (灰度分发的唯一判据)。
+//
+// 注意它**不**回答"该 mode 是否跑在图引擎上" —— orchestrated 跑在图引擎上但不在这张表里
+// (见 modeGraphNativeKernel 的说明)。灰度分发口只该认这张表。
 func ModeHasGraphTemplate(mode string) bool {
 	_, ok := modeGraphTemplates[mode]
 	return ok
@@ -175,9 +198,13 @@ func ModeHasGraphTemplate(mode string) bool {
 
 // ModeGraphTemplateEquivalence 返回某 mode 模板的等价性说明 (无模板时返回未做的原因)。
 // 供 CLI/dashboard 在灰度前把边界直接呈现给运维, 而不是让人去翻源码注释。
+// 第二个返回值 = 该 mode 的阶段序列是否已被等价验证 (专属内核 mode 同样为 true)。
 func ModeGraphTemplateEquivalence(mode string) (string, bool) {
 	if tpl, ok := modeGraphTemplates[mode]; ok {
 		return tpl.Equivalence, true
+	}
+	if doc, ok := modeGraphNativeKernel[mode]; ok {
+		return doc, true
 	}
 	if reason, ok := modeGraphNotTemplated[mode]; ok {
 		return reason, false

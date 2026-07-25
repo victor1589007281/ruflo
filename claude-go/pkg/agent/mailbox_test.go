@@ -359,7 +359,8 @@ func TestBoardStopWatchClosesChannel(t *testing.T) {
 }
 
 // TestBoardFuncsAdapter 断言 BoardFuncs 能把"别的黑板实现"适配进 Board
-// (为 M4 退役 pkg/orchestrator 那份铺路), 且 nil 字段 fail-open 不 panic。
+// (当初为 M4 退役 pkg/orchestrator 那份铺路; 那份已删, 现由 design/02 分布式后端承接),
+// 且 nil 字段 fail-open 不 panic。
 func TestBoardFuncsAdapter(t *testing.T) {
 	inner := NewBlackboard("fa", "")
 	var b Board = BoardFuncs{

@@ -10,7 +10,8 @@
 // 执行流程:
 //   代码摄入 ∥ 上下文检索 → 合并上下文 → 4路专家并行审查 → 对抗质疑 → 测试验证 → 报告生成
 //
-// 使用新编排引擎 (pkg/orchestrator) 驱动 DAG 调度。
+// mode=orchestrated: 由 pkg/graph 图引擎驱动 DAG 调度, 节点内核是裸 LLM completion
+// (无工具), 见 pkg/agent/orchestrated_runner.go。M4 之前这条路走的是已删除的 pkg/orchestrator。
 package agent
 
 func codeReviewWorkflow() *WorkflowDef {

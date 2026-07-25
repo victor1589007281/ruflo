@@ -5,3 +5,4 @@ claude-go-bin
 *.so
 *.dylib
 deploy/claude-go-linux
+deploy/claude-go-worker-linux

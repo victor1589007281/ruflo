@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anthropic/claude-go/pkg/orchestrator"
 	"github.com/anthropic/claude-go/pkg/toolskill"
 )
 
@@ -53,14 +52,31 @@ type ExecutionStep struct {
 	Details  map[string]any `json:"details,omitempty"`
 }
 
-// CodeExecutor 代码执行器（实现 orchestrator.TaskRunner）
+// DeprecatedCodeTaskSpec 曾是 orchestrator.Task 的**用到的那个子集**。
+//
+// design/01 M4 删除 pkg/orchestrator 时, CodeExecutor 是它在 pkg/agent 里最后一个
+// 编译期依赖 (它实现的是 orchestrator.TaskRunner)。因为这条链本身零生产调用
+// (见 NewCodeExecutor 的 Deprecated 说明), 解耦方式取"把签名里那两个 orchestrator
+// 类型换成本地等价物"而不是"顺手接到 pkg/graph 的 NodeRunner 上" —— 后者等于给
+// 一条已判弃用的链做新接线, 而它复制的门禁在 teams.go 已有更完善的实现。
+//
+// 原签名还收一个 orchestrator.ReadOnlyBlackboard, 但 parseCodeTask **从未读过它**
+// (函数体只碰 task.ID/task.Config), 故一并去掉, 不留一个恒被忽略的形参。
+//
+// Deprecated: 与 CodeExecutor 一同弃用, 勿在其上新增调用方。
+type DeprecatedCodeTaskSpec struct {
+	ID     string
+	Config map[string]any
+}
+
+// CodeExecutor 代码执行器（原实现 orchestrator.TaskRunner, 该接口已随 pkg/orchestrator 删除）
 type CodeExecutor struct {
 	contractStore    *ContractStore
 	patchApplier     *PatchApplier
 	validationGate   *ValidationGate
 	contextEngine    *ContextEngine
 	skillRuntime     *toolskill.Runtime
-	llmRunner        orchestrator.LLMClient
+	llmRunner        LLMClient // 与 orchestrator.LLMClient 签名相同 (intent.go:34)
 	maxRounds        int
 	promptSkills     []string
 	constitutionPath string
@@ -70,8 +86,8 @@ type CodeExecutor struct {
 // (CodeExecutor + PatchApplier + ValidationGate + ContextEngine, 约 1700 行,
 // 零测试)。该链复制的编译/测试门禁在 teams.go 已有真实且更完善的实现
 // (runGlobalCompileGate / runGlobalTestGate / runGlobalConsistencyCheck +
-// tryGateWithRemediation 两次自动修复), 且它宿主在计划删除的 pkg/orchestrator
-// 之上 (design/01 M4)。链内已知阻塞缺陷见 design/PROGRESS.md 偏差记录。
+// tryGateWithRemediation 两次自动修复), 且它原本宿主在 pkg/orchestrator 之上,
+// 而该包已于 design/01 M4 删除 (本链的签名因此改用本地 DeprecatedCodeTaskSpec)。链内已知阻塞缺陷见 design/PROGRESS.md 偏差记录。
 // 勿在其上继续开发; 需要真实质量门禁请用 pkg/toolskill 接 pkg/graph 的 gate 节点。
 func NewCodeExecutor(
 	cs *ContractStore,
@@ -79,7 +95,7 @@ func NewCodeExecutor(
 	vg *ValidationGate,
 	ce *ContextEngine,
 	sr *toolskill.Runtime,
-	llm orchestrator.LLMClient,
+	llm LLMClient,
 ) *CodeExecutor {
 	return &CodeExecutor{
 		contractStore:  cs,
@@ -97,10 +113,9 @@ func (e *CodeExecutor) Name() string { return "code-executor" }
 
 func (e *CodeExecutor) Execute(
 	ctx context.Context,
-	task *orchestrator.Task,
-	bb orchestrator.ReadOnlyBlackboard,
+	task DeprecatedCodeTaskSpec,
 ) (any, error) {
-	codeTask := e.parseCodeTask(task, bb)
+	codeTask := e.parseCodeTask(task)
 	start := time.Now()
 	result := &CodeResult{
 		TaskID: codeTask.ID,
@@ -632,7 +647,7 @@ func (e *CodeExecutor) buildPatchSummaries(root string, snippets []EditSnippet) 
 	return summaries
 }
 
-func (e *CodeExecutor) parseCodeTask(task *orchestrator.Task, bb orchestrator.ReadOnlyBlackboard) CodeTask {
+func (e *CodeExecutor) parseCodeTask(task DeprecatedCodeTaskSpec) CodeTask {
 	ct := CodeTask{ID: task.ID, Language: "go"}
 	if task.Config != nil {
 		if v, ok := task.Config["objective"].(string); ok {

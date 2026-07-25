@@ -220,7 +220,7 @@ func (l *EvolutionLoop) run(ctx context.Context) {
 		}
 		// Go 1.23+ 起 Stop 后 channel 不再送值, 直接 Reset 即可;
 		// 绝不写 `if !Stop() { <-C }` 那个老 drain 惯用法 —— 本仓的
-		// pkg/orchestrator 死锁就是它造成的。
+		// 已删除的 pkg/orchestrator 里那个预存死锁就是它造成的。
 		idleTimer.Stop()
 		idleTimer.Reset(l.cfg.IdleAfter)
 	}

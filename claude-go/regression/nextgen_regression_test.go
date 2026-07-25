@@ -1,6 +1,7 @@
 // Package regression 是下一代架构（design/01-03）的集成回归套件, 沉淀到测锻平台
 // (testforge) 供未来回归。独立嵌套模块 (replace→claude-go), 只依赖新架构包,
-// 天然规避旧 pkg/orchestrator 的预存死锁, 可经 `go test ./...` 干净运行。
+// 不再受旧 pkg/orchestrator 预存死锁影响 (该包已于 design/01 M4 删除),
+// 可经 `go test ./...` 干净运行。
 //
 // 覆盖: 图引擎执行+恢复 / 集群任务队列崩溃自愈 / StateStore 原子与去重 /
 // TraceStore 内容寻址 / EventBus 队列组 / LLM 网关路由。

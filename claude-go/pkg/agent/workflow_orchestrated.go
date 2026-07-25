@@ -1,391 +1,252 @@
-// workflow_orchestrated.go — 桥接层: 将 WorkflowDef 转换为 pkg/orchestrator.Engine 驱动的执行。
+// workflow_orchestrated.go — orchestrated 模式入口: 图引擎 + 裸 completion 内核。
 //
-// 两套调度系统的关系:
+// ---------------------------------------------------------------------------
+// 这个文件从"第二套调度系统的桥接层"变成了"图引擎的一个装配"
+// ---------------------------------------------------------------------------
 //
-//  系统 A: pkg/agent/coordinator.go + runPipelineWithRecovery
-//    - 轻量级: 简单的拓扑排序 + 并发执行 + 检查点
-//    - 适用: 线性 pipeline 工作流 (顺序阶段 + 偶尔并行组)
-//    - 特点: 每个阶段独立重试, 由 Coordinator 管理
+// 改造前 (design/01 §1.2 记的"双调度系统"):
 //
-//  系统 B: pkg/orchestrator/engine.go (本文件)
-//    - 重量级: K8s 风格三阶段调度 + 背压控制 + 错误分治
-//    - 适用: orchestrated 工作流 (复杂 DAG, 对抗循环, 动态扩展)
-//    - 特点: 统一的 DAG 调度, 错误按类型分治 (瞬态/永久/致命)
+//	系统 A: pkg/agent/coordinator.go + runPipelineWithRecovery / pkg/graph 图引擎
+//	系统 B: pkg/orchestrator/engine.go  ← 本文件曾是它的桥接层
 //
-//  路由: Coordinator.RunWithRecovery() → 根据 workflow mode 选择
-//    - "orchestrated" → executeOrchestrated() → 系统 B
-//    - 其他模式 (pipeline/adversarial/swarm) → 系统 A
+// 系统 B 自带一整套与系统 A 平行的设施: 另一份 DAG (orchestrator.Graph)、另一份黑板
+// (orchestrator.Blackboard, 唯一有 Watch 的那份)、另一套生命周期 Hook
+// (LifecycleHook: ExpanderHook/MetricsHook/心跳/ObservabilityBridge)、另一份检查点
+// (CheckpointStore)、另一套背压 (RPM 令牌桶 + AIMD)。于是三件事全卡在它身上:
+// 双黑板归一 (§4.11)、hook 三套合一 (§4.5)、进度四源归一 (§4.3)。
 //
-// 桥接流程:
-//   WorkflowDef.Stages → orchestrator.Graph.Tasks
-//   StageDef.Role → LLMRunner (通过 RunnerRegistry)
-//   StageDef.DependsOn → Edge (依赖关系)
-//   对抗阶段 → AdversarialRunner (多轮循环 + 质量终止)
-//   可扩展阶段 → LLMExpander (运行时裂变)
+// 改造后 (design/01 M4): orchestrated 与其他 mode 共用 pkg/graph 的 ready-set 调度器,
+// 差异**只在节点执行内核** —— orchNodeRunner 跑裸 LLM completion (无工具、无角色模板
+// 合并、无黑板交接), 见 orchestrated_runner.go。于是:
+//
+//	orchestrator.Graph        → graph.GraphSpec        (本文件 orchestratedGraphSpec)
+//	orchestrator.LLMRunner    → orchNodeRunner         (裸 completion, 提示词逐字照抄)
+//	AdversarialRunner         → orchNodeRunner 的对抗分支
+//	RunnerPool                → Policies.MaxParallel + 对抗节点内部信号量
+//	LifecycleHook 四件套      → graph.HookBus (teamGraphHooks: 刷盘/指标/心跳/日志)
+//	CheckpointStore           → graph FileJournal (事件溯源, 重放即恢复)
+//	orchestrator.Blackboard   → 删除 (上游产出经 NodeInput.PrevOutputs 传递)
+//	RPM 令牌桶 + AIMD          → 删除 (见下方"刻意丢掉的东西")
+//
+// ---------------------------------------------------------------------------
+// 刻意丢掉的东西 (逐条给理由, 因为"少了什么"比"多了什么"更容易埋雷)
+// ---------------------------------------------------------------------------
+//
+//  1. **RPM 令牌桶 + AIMD 自适应并发**: 旧 cfg 把 RPM 设成 120 (2 QPS, 突发 10) 并在
+//     代码里注明"由 api.Client 自身处理限流, 引擎不做额外限速" —— 对 8~12 个阶段的
+//     DAG 这个桶从来不会成为瓶颈。AIMD 那半 (失败后并发折半) 确有价值但没有等价物,
+//     图层的 RateLimiter 拦截器在 design/01 §4.10 里仍是未实现项。记账在此。
+//  2. **Suspended 态 + 停滞恢复**: 瞬态额度耗尽时旧引擎置 Suspended (不级联下游),
+//     等 stallRecovery 唤醒并给一份全新重试额度 (最多 3 次)。3 次用尽后主循环
+//     **永久空转**: isComplete 永假 (任务既不 completed 也不 failed)、无 Ready 任务可派、
+//     stallTicker 每 48s 空转一次, 直到 ctx 取消 —— team.EngineRunning 一直为 true。
+//     新路径瞬态耗尽即判 failed, 少了"再等等"的耐心, 换掉了一条挂死路径。
+//  3. **ExpanderHook / LLMExpander (运行期 LLM 裂变)**: 触发条件是
+//     task.Config["expandable"]==true, 而全仓**没有任何地方设置过它** —— 注册了但恒休眠。
+//     图层的对等能力是 NodeSpec.Expand + parseStageExpansion (graph_adapter.go), 需要时
+//     经覆盖表显式授权即可, 不必搬一份死代码过来。
+//  4. **orchestrator 黑板的 objective / <task>/output / adv/... 三类键**: 全是只写不读
+//     (LLMRunner 只经 <dep>/output 读上游, 这条已由 PrevOutputs 覆盖), 且那份黑板是
+//     纯内存、跑完即弃。删掉不丢任何可观测数据。
+//  5. **每 15 秒的 watchdog 心跳 ticker (callbackHook)**: 它其实早就坏了 ——
+//     stopHeartbeat 用 sync.Once 关同一个 stopCh, 于是**第一个任务完成后**所有后续
+//     startHeartbeat 造出的 goroutine 都立刻退出。真正生效的只有第一个任务那一段。
+//     新路径由 teamGraphHooks 在每个节点开始/结束时 touch (与 pipeline 侧
+//     executeStage 的口径一致), 覆盖面反而更广。watchdog 本身只发通知不终止团队
+//     (coordinator.go teamWatchdog), 所以最坏后果是一条多余的告警。
+//
+// ---------------------------------------------------------------------------
+// 顺带修掉的三处旧缺陷 (等价性测试里逐条钉住)
+// ---------------------------------------------------------------------------
+//
+//  1. **返回的阶段序列此前是随机序**: 旧 convertResults 遍历 `map[taskID]stageInfo`,
+//     Go 的 map 迭代序是随机化的 ⇒ 同一次运行两次调用可以给出不同顺序, 而
+//     REPORT.md / 门禁统计 / dashboard / 下游平台都按这个序读。现在按节点声明序,
+//     与 pipeline 一致。
+//  2. **未执行的阶段被报成 completed**: 旧 convertResults 对 stageMapping 里每个阶段
+//     先置 Status=TaskCompleted, 只有 Errors 里有条目才改 failed。于是 ctx 取消导致
+//     根本没跑的阶段会以"completed + 空产出"出现 —— 静默假成功。现在只回译引擎真正
+//     给出终态的节点。
+//  3. **orchestrated 全程没有 stage 级增量刷盘/指标/journal**: 旧路径只有一个
+//     stageFlushHook 往 team.Stages 追加 (不落盘、不出指标)。现在复用 teamGraphHooks:
+//     running 占位 + 增量刷盘 + 阶段指标 + 心跳 + Journal 事件, 与图路径同形。
 package agent
 
 import (
 	"context"
 	"fmt"
-	"math"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/graph"
 	"github.com/anthropic/claude-go/pkg/logging"
-	"github.com/anthropic/claude-go/pkg/orchestrator"
 )
 
-// executeOrchestrated 使用 pkg/orchestrator.Engine 驱动工作流执行。
-//
-// 与 executePipeline 的关键区别:
-//  1. 对抗阶段使用 AdversarialRunner (真正的多轮对抗, 带反馈回路)
-//  2. DAG 调度由引擎管理 (Filter→Score→Dispatch, 非简单拓扑排序)
-//  3. 背压控制 (RPM 令牌桶 + 自适应并发)
-//  4. 检查点和断点续跑
-//  5. 停滞检测和自动恢复
-//  6. 可选: LLM 裂变 (运行时动态展开子任务)
+// orchDefaultMaxParallel orchestrated 的默认并发上限 (照抄旧 cfg.MaxParallel 的初值)。
+// 刻意不用 we.effectiveParallel() (=6, 且会随 API 流控收敛): 旧路径就是拿这个 4,
+// 换成 6 会让四路专家评审之外多挤进一个阶段, 属并发度变更。
+const orchDefaultMaxParallel = 4
+
+// executeOrchestrated 用图引擎驱动 orchestrated 工作流。
 func (we *WorkflowExecutor) executeOrchestrated(
 	ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam,
 ) ([]StageResult, error) {
 	ctx, endSpan := logging.WithSpan(ctx, "orchestrated."+wf.Name)
 	defer endSpan()
 
+	// LLMClient 缺失时降级 pipeline: 与改造前逐字一致 (裸 completion 没有 LLM 无从下手,
+	// 但 pipeline 走 factory 造 agent, 那条路不依赖 we.llm)。
 	if we.llm == nil {
 		logging.Event(ctx, "orchestrated.fallback", "reason", "LLMClient 未设置, 降级到 pipeline 模式")
 		we.notify(we.chatID, "⚠️ LLMClient 未注入, 降级到 pipeline 模式")
 		return we.executePipeline(ctx, wf, objective, team)
 	}
 
-	// 桥接: pkg/agent.LLMClient → pkg/orchestrator.LLMClient (duck typing 兼容)
-	llmAdapter := &orchLLMAdapter{llm: we.llm}
-
-	// 1. 解析主模型配置, 获取模型专属限流参数
-	maxParallel := 4
-	rpmOverride := 0
-	if we.planCfgResolver != nil {
-		resolved := we.planCfgResolver.Resolve(team.Workflow, "")
-		if resolved.MaxParallel > 0 {
-			maxParallel = resolved.MaxParallel
-		}
-		if resolved.RPM > 0 {
-			rpmOverride = resolved.RPM
-		}
+	maxParallel := we.orchestratedMaxParallel(team)
+	spec, err := orchestratedGraphSpec(wf, maxParallel)
+	if err != nil {
+		return nil, err
 	}
 
-	// 2. 构建 orchestrator 引擎
-	cfg := orchestrator.DefaultEngineConfig()
-	cfg.MaxParallel = maxParallel // 匹配 LLM RunnerPool 上限, 让专家阶段真正并行
-	cfg.DefaultTimeout = 5 * time.Minute
-	cfg.StallTimeout = 8 * time.Minute
-	if rpmOverride > 0 {
-		cfg.RPM = float64(rpmOverride)
-		cfg.RPMBurst = math.Max(1, float64(rpmOverride)/6)
-	} else {
-		cfg.RPM = 120 // 由 api.Client 自身处理限流, 引擎不做额外限速
-		cfg.RPMBurst = 10
-	}
-	cfg.CheckpointEvery = 1
-
-	eng := orchestrator.NewEngine(cfg)
-
-	// 3. 构建 RunnerPool (per-runner 并发控制)
-	pool := orchestrator.NewRunnerPool()
-	pool.SetLimit("llm-stage", maxParallel) // LLM 阶段并发上限 (模型个性化)
-	pool.SetLimit("llm-adversarial", 1)    // 对抗循环串行
-
-	// 3. 注册 Runner
-	baseLLM := orchestrator.NewLLMRunner("llm-stage", llmAdapter)
-	pooledLLM := orchestrator.NewPooledRunner(baseLLM, pool)
-	eng.Runners().Register(pooledLLM)
-
-	// 为对抗阶段注册 AdversarialRunner (如果有的话)
-	advRunner := we.buildAdversarialRunner(wf, pool, llmAdapter)
-	if advRunner != nil {
-		eng.Runners().Register(advRunner)
-	}
-
-	// 4. 将 WorkflowDef 转换为 Graph
-	g, stageMapping := we.buildGraph(wf, objective, team, advRunner != nil)
-
-	// 5. 注册生命周期 Hooks
-	// LLMExpander: 已注册但默认休眠。
-	// 只有当 stage 设置了 `Config["expandable"] = true` 时才会触发裂变。
-	// 当前所有 orchestrated 工作流的阶段都通过 DependsOn 精确控制, 不需要运行时动态裂变。
-	// 需要裂变时, 在 StageDef 的 prompt 中设置 expandable 配置即可启用。
-	expander := orchestrator.NewLLMExpander(llmAdapter, "llm-stage", 8)
-	expanderHook := orchestrator.NewExpanderHook(expander, g)
-
-	metricsHook := orchestrator.NewMetricsHook(nil)
-
-	// 注册 Coordinator 活动回调 Hook, 防止停滞检测误报
-	// 同时注册阶段实时刷新 Hook, 让外部监控能看到中间进度
-	var activityHook orchestrator.LifecycleHook
-	stageFlusher := &stageFlushHook{team: team, stages: &stageMapping}
-	obsBridge := orchestrator.NewObservabilityBridge()
-	if we.activityCallback != nil {
-		activityHook = &callbackHook{fn: we.activityCallback, stopCh: make(chan struct{})}
-		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, activityHook, stageFlusher, obsBridge))
-	} else {
-		eng.SetHook(orchestrator.NewMultiHook(expanderHook, metricsHook, stageFlusher, obsBridge))
-	}
-
-	// 6. 设置 Blackboard
-	bb := orchestrator.NewBlackboard()
-	bb.Write("objective", objective, orchestrator.WriteMeta{Author: "system", Category: "context"})
-	eng.SetBlackboard(bb)
-
-	// 7. 诊断: 确认图构建正确
-	if buildErr := g.Build(); buildErr != nil {
-		return nil, fmt.Errorf("图构建失败: %w", buildErr)
-	}
-	readyTasks := g.ReadyTasks()
+	ready := orchestratedReadyCount(spec)
 	logging.Event(ctx, "orchestrated.graph",
-		"total_tasks", g.TaskCount(),
-		"ready_tasks", len(readyTasks),
-		"max_parallel", cfg.MaxParallel,
-	)
-	for _, rt := range readyTasks {
-		logging.Event(ctx, "orchestrated.ready_task", "id", rt.ID, "runner", rt.Runner)
-	}
-	we.notify(we.chatID, fmt.Sprintf("⚡ **Orchestrated 模式** — 引擎驱动 DAG 调度 (%d 个任务, %d 就绪, 并发≤%d)",
-		g.TaskCount(), len(readyTasks), cfg.MaxParallel))
+		"total_tasks", len(spec.Nodes), "ready_tasks", ready, "max_parallel", maxParallel)
+	we.notify(we.chatID, fmt.Sprintf("⚡ **Orchestrated 模式** — 图引擎驱动 DAG 调度 (%d 个任务, %d 就绪, 并发≤%d)",
+		len(spec.Nodes), ready, maxParallel))
 
-	// 8. 标记引擎正在运行 (供 Coordinator 心跳检测使用)
+	// EngineRunning 供 Coordinator.checkTeamHealth 区分"引擎在独立 goroutine 里跑"
+	// 与"所有 agent 都 idle 却还 running"。orchestrated 的节点不占 team.Agents,
+	// 不打这个标记会让心跳日志每轮误报一次。
 	team.mu.Lock()
 	team.EngineRunning = true
 	team.mu.Unlock()
 	defer func() { team.mu.Lock(); team.EngineRunning = false; team.mu.Unlock() }()
 
-	// 9. 执行 (Build() 已在上面调用, Engine.Run 会再次调用但幂等)
-	result, err := eng.Run(ctx, g)
-	if err != nil && result == nil {
-		return nil, fmt.Errorf("引擎执行失败: %w", err)
-	}
-
-	// 10. 将引擎结果转换回 StageResult
-	return we.convertResults(result, stageMapping, team), err
+	var runner *orchNodeRunner
+	results, runErr := we.runGraphSpec(ctx, wf, spec, objective, team, func(s graph.GraphSpec) graph.NodeRunner {
+		runner = newOrchNodeRunner(we, team, objective, s)
+		return runner
+	})
+	we.notifyOrchestratedSummary(results, runner)
+	return results, runErr
 }
 
-// buildGraph 将 WorkflowDef 的 Stages 转换为 orchestrator.Graph。
+// orchestratedMaxParallel 解析并发上限: 模型配置声明优先, 否则 orchDefaultMaxParallel。
 //
-// 完整映射示例 (parenting 工作流):
+// 旧路径同时读 resolved.RPM 去配引擎的令牌桶; 令牌桶已随 pkg/orchestrator 删除,
+// RPM 由 api.Client 自己管 (旧代码注释也是这么写的), 故此处不再读它。
+func (we *WorkflowExecutor) orchestratedMaxParallel(team *ProductionTeam) int {
+	if we.planCfgResolver == nil || team == nil {
+		return orchDefaultMaxParallel
+	}
+	if resolved := we.planCfgResolver.Resolve(team.Workflow, ""); resolved.MaxParallel > 0 {
+		return resolved.MaxParallel
+	}
+	return orchDefaultMaxParallel
+}
+
+// orchestratedGraphSpec 把 WorkflowDef 直接编成 orchestrated 的 GraphSpec。
 //
-//	WorkflowDef (8 stages):
-//	  1. intake          (no deps)    → Task: go-development-8238/intake           Runner: llm-stage
-//	  2. safety-screen   [intake]     → Task: go-development-8238/safety-screen    Runner: llm-stage
-//	  3. academic-tutor  [safety-screen] → Task: .../academic-tutor                 Runner: llm-stage, Parallel=true
-//	  4. psychology-coach [safety-screen] → Task: .../psychology-coach              Runner: llm-stage, Parallel=true
-//	  5. parenting-advisor [safety-screen] → Task: .../parenting-advisor            Runner: llm-stage, Parallel=true
-//	  6. development-assessor [safety-screen] → Task: .../development-assessor      Runner: llm-stage, Parallel=true
-//	  7. action-plan     [3,4,5,6]    → Task: .../action-plan                      Runner: llm-stage
-//	  8. consultation-report [7]      → Task: .../consultation-report              Runner: llm-stage
+// **为什么不复用 TranslateWorkflow** (graph_adapter.go 的通用直译器) —— 三条硬理由:
 //
-//	产生的边 (Edges):
-//	  intake → safety-screen
-//	  safety-screen → academic-tutor
-//	  safety-screen → psychology-coach
-//	  safety-screen → parenting-advisor
-//	  safety-screen → development-assessor
-//	  academic-tutor → action-plan
-//	  psychology-coach → action-plan
-//	  parenting-advisor → action-plan
-//	  development-assessor → action-plan
-//	  action-plan → consultation-report
+//  1. 它按关键词把阶段推断成 gate 节点 (stageIsGate: 名字/角色含 gate|门禁|...)。
+//     testing 工作流有个叫 `quality-gate` 的普通 LLM 阶段, 一过直译器就变成打分节点,
+//     产出从"质量门禁报告"变成 `{"gate":"...","score":80}` —— 这是最典型的静默行为变更。
+//  2. 它会应用 per-workflow 图覆盖表 (WorkflowGraphOverride), 覆盖表能声明
+//     map/reduce/loop-group/Loop。orchNodeRunner 只认 agent 节点 (裸 completion),
+//     被注入一个 map 节点会拿到 N 个分片却按同一个提示词跑 N 次。授权面不该在这里敞开。
+//  3. 它给的重试与超时是 pipeline 口径 (图级 DefaultRetry={6,5s} + 角色级预算),
+//     而 orchestrated 的重试按错误类型分档且在 runner 内 (见 orchestrated_runner.go)。
 //
-//	Prompt 模板变量替换:
-//	  {prev_result} → 所有上游任务输出的合并 (通过 blackboard 读取)
-//	  {objective}   → 工作流目标
-//	  {dep:taskID}  → 指定上游任务的输出
-//
-// 注意: Parallel 字段在 orchestrated 模式下由 DAG 边决定, 不需要显式标记。
-// 多个阶段依赖同一个上游, 上游完成后它们同时变为 Ready, 引擎会并发执行。
-// stageInfo 携带阶段名称和角色信息，用于结果转换时填充 StageResult。
-type stageInfo struct {
-	name string
-	role string
+// 于是这里手工构图, 三个字段之外一律零值, 图的形状与旧 buildGraph 一一对应:
+// 节点 ID = 阶段名, 边 = DependsOn (声明序, {prev_result} 的拼接序依赖它)。
+func orchestratedGraphSpec(wf *WorkflowDef, maxParallel int) (graph.GraphSpec, error) {
+	if wf == nil || len(wf.Stages) == 0 {
+		return graph.GraphSpec{}, fmt.Errorf("orchestrated: 工作流没有阶段可执行")
+	}
+	// 图层重试恒 0: 重试全部在 orchNodeRunner 里按错误类型分档做。
+	// 两处都填是刻意的 —— NodeSpec.Retry 为 nil 时引擎会回落 Policies.DefaultRetry,
+	// 只填一处将来有人改另一处就会悄悄变成"图层重试 × runner 重试"的乘法放大。
+	noRetry := &graph.RetryPolicy{MaxRetries: 0}
+	spec := graph.GraphSpec{
+		Name:    wf.Name,
+		Version: "orchestrated-v1",
+		Meta:    WorkflowGateMeta(wf),
+		Policies: graph.GraphPolicies{
+			MaxParallel:  maxParallel,
+			DefaultRetry: noRetry,
+		},
+	}
+	attempts := orchDefaultRetryPolicy().orchMaxAttempts()
+	for _, st := range wf.Stages {
+		// 节点**总预算**必须包住全部重试 (引擎在 retry 环之外施加它), 而单次尝试的
+		// 3/4/5 分钟由 runner 自己加。给紧了会让合法的重试序列撞 deadline, 所以按
+		// 最坏情况 (每次尝试都跑满超时) 再乘 2 倍宽裕, 最后由 2h 硬顶夹住。
+		// 它是卡死兜底闸 —— 旧路径连这道闸都没有 (只有单次尝试超时)。
+		budget := capNodeBudget(int(taskTimeout(st).Seconds()) * attempts * orchBudgetSlack)
+		spec.Nodes = append(spec.Nodes, graph.NodeSpec{
+			ID:         st.Name,
+			Kind:       graph.NodeKindAgent, // 一律 agent: 见上文第 1 条
+			Agent:      graph.AgentSpec{Role: st.Role, Prompt: st.Prompt},
+			Retry:      noRetry,
+			TimeoutSec: budget,
+		})
+	}
+	for _, st := range wf.Stages {
+		for _, dep := range st.DependsOn {
+			// 无条件边: 上游失败时的"级联取消"由 orchNodeRunner 的级联闸复刻
+			// (条件边 + OR-join 表达不出 AND-join, 见 orchestrated_runner.go)。
+			spec.Edges = append(spec.Edges, graph.EdgeSpec{From: dep, To: st.Name})
+		}
+	}
+	if err := spec.Validate(); err != nil {
+		return graph.GraphSpec{}, fmt.Errorf("orchestrated: 图非法: %w", err)
+	}
+	return spec, nil
 }
 
-func (we *WorkflowExecutor) buildGraph(
-	wf *WorkflowDef, objective string, team *ProductionTeam, hasAdversarial bool,
-) (*orchestrator.Graph, map[string]stageInfo) {
-	g := orchestrator.NewGraph(team.Name+"-graph", wf.Name)
-	stageMapping := make(map[string]stageInfo) // taskID → stageInfo
+// orchBudgetSlack 节点总预算的宽裕系数 (与 graph_interceptors.go 的 budgetSlack 同义:
+// 这道闸的定位是兜住卡死, 不是精确控成本)。
+const orchBudgetSlack = 2
 
-	for _, stage := range wf.Stages {
-		taskID := fmt.Sprintf("%s/%s", team.Name, stage.Name)
-		stageMapping[taskID] = stageInfo{name: stage.Name, role: stage.Role}
-
-		// 判断是否是对抗阶段 (角色名含 adversarial/skeptical)
-		isAdversarial := hasAdversarial && isAdversarialStage(stage)
-		runnerName := "llm-stage"
-		if isAdversarial {
-			runnerName = "llm-adversarial"
-		}
-
-		// 构建 prompt
-		systemPrompt := stage.Prompt
-
-		// 汇总类阶段需要更长的超时 (需合并多个上游输出)
-		timeout := taskTimeout(stage)
-
-		t := &orchestrator.Task{
-			ID:           taskID,
-			Name:         stage.Name,
-			Priority:     5,
-			Timeout:      timeout,
-			MaxRetries:   1,
-			MaxTransient: 2,
-			Runner:       runnerName,
-			Config: map[string]any{
-				"system_prompt": systemPrompt,
-				"user_prompt":   "{prev_result}\n\n任务目标: {objective}",
-				"objective":     objective,
-				"stage_name":    stage.Name,
-				"role":          stage.Role,
-			},
-			Labels: map[string]string{
-				"workflow": wf.Name,
-				"stage":    stage.Name,
-				"role":     stage.Role,
-			},
-		}
-
-		// 设置依赖
-		for _, dep := range stage.DependsOn {
-			depID := fmt.Sprintf("%s/%s", team.Name, dep)
-			t.DependsOn = append(t.DependsOn, depID)
-		}
-
-		// 调试: 记录 prompt 大小, 方便验证上游输出是否正确传递到下游任务
-		promptLen := len(systemPrompt)
-		logging.Event(context.Background(), "orchestrated.task_prompt",
-			"task", taskID, "prompt_chars", promptLen, "deps", len(stage.DependsOn))
-
-		_ = g.AddTask(t)
+// orchestratedReadyCount 入度 0 的节点数 (通知文案里的"就绪"数)。
+func orchestratedReadyCount(spec graph.GraphSpec) int {
+	hasIn := make(map[string]bool, len(spec.Edges))
+	for _, ed := range spec.Edges {
+		hasIn[ed.To] = true
 	}
-
-	// 添加边
-	for _, stage := range wf.Stages {
-		taskID := fmt.Sprintf("%s/%s", team.Name, stage.Name)
-		for _, dep := range stage.DependsOn {
-			depID := fmt.Sprintf("%s/%s", team.Name, dep)
-			_ = g.AddEdge(orchestrator.Edge{From: depID, To: taskID, Kind: orchestrator.EdgeDependency})
+	n := 0
+	for _, nd := range spec.Nodes {
+		if !hasIn[nd.ID] {
+			n++
 		}
 	}
-
-	return g, stageMapping
+	return n
 }
 
-// buildAdversarialRunner 检测工作流中是否有对抗阶段, 如果有则构建 AdversarialRunner。
-func (we *WorkflowExecutor) buildAdversarialRunner(wf *WorkflowDef, pool *orchestrator.RunnerPool, llm orchestrator.LLMClient) *AdversarialRunnerAdapter {
-	var advStages []StageDef
-	var genStages []StageDef
-
-	for _, stage := range wf.Stages {
-		if isAdversarialStage(stage) {
-			advStages = append(advStages, stage)
+// notifyOrchestratedSummary 收尾通知 (文案与改造前一致, 便于飞书侧观感不变)。
+func (we *WorkflowExecutor) notifyOrchestratedSummary(results []StageResult, runner *orchNodeRunner) {
+	completed, failed := 0, 0
+	for _, r := range results {
+		if r.Status == TaskCompleted {
+			completed++
+		} else {
+			failed++
 		}
 	}
-
-	if len(advStages) == 0 {
-		return nil
-	}
-
-	// 找到对抗阶段依赖的上游 (这些是 generator)
-	for _, adv := range advStages {
-		for _, dep := range adv.DependsOn {
-			for _, stage := range wf.Stages {
-				if stage.Name == dep {
-					genStages = append(genStages, stage)
-				}
-			}
+	if failed == 0 {
+		retries := int64(0)
+		if runner != nil {
+			retries = runner.retries.Load()
 		}
+		we.notify(we.chatID, fmt.Sprintf("✅ Orchestrated 执行完成 — %d 个任务成功, %d 次重试", completed, retries))
+		return
 	}
-
-	generator := orchestrator.NewLLMRunner("adv-generator", llm)
-	var reviewers []orchestrator.TaskRunner
-	for i, adv := range advStages {
-		r := orchestrator.NewLLMRunner(fmt.Sprintf("adv-reviewer-%d", i), llm)
-		_ = adv
-		reviewers = append(reviewers, r)
-	}
-
-	qualityPolicy := orchestrator.NewQualityTermination(7.0, 0.5, nil)
-	inner := orchestrator.NewAdversarialRunner("adversarial-inner", generator, reviewers, qualityPolicy, 3)
-
-	return &AdversarialRunnerAdapter{
-		inner:  inner,
-		stages: advStages,
-		pool:   pool,
-	}
+	we.notify(we.chatID, fmt.Sprintf("⚠️ Orchestrated 执行部分失败 — 成功 %d, 失败 %d", completed, failed))
 }
 
-// AdversarialRunnerAdapter 将 orchestrator.AdversarialRunner 适配为可注册到引擎的 TaskRunner。
-type AdversarialRunnerAdapter struct {
-	inner  *orchestrator.AdversarialRunner
-	stages []StageDef
-	pool   *orchestrator.RunnerPool
-}
-
-func (a *AdversarialRunnerAdapter) Name() string { return "llm-adversarial" }
-
-func (a *AdversarialRunnerAdapter) Execute(ctx context.Context, task *orchestrator.Task, bb orchestrator.ReadOnlyBlackboard) (any, error) {
-	if err := a.pool.Acquire(ctx, "llm-adversarial"); err != nil {
-		return nil, err
-	}
-	defer a.pool.Release("llm-adversarial")
-	return a.inner.Execute(ctx, task, bb)
-}
-
-// convertResults 将 orchestrator.ExecutionResult 转换为 []StageResult。
-func (we *WorkflowExecutor) convertResults(
-	result *orchestrator.ExecutionResult, stageMapping map[string]stageInfo, team *ProductionTeam,
-) []StageResult {
-	if result == nil {
-		return nil
-	}
-	var results []StageResult
-	for taskID, info := range stageMapping {
-		sr := StageResult{
-			Name:   info.name,
-			Role:   info.role,
-			Status: TaskCompleted,
-		}
-
-		if output, ok := result.Outputs[taskID]; ok {
-			sr.Output = fmt.Sprintf("%v", output)
-		}
-		if errStr, ok := result.Errors[taskID]; ok && errStr != "" {
-			sr.Status = TaskFailed
-			sr.Error = errStr
-		}
-		results = append(results, sr)
-
-		// 写入团队 Blackboard
-		if team.Blackboard != nil {
-			if sr.Status == TaskCompleted {
-				team.Blackboard.Write(info.name+"-result", sr.Output, "orchestrator", "result")
-				team.Blackboard.Write(info.name+"-status", "completed", "system", "progress")
-			} else {
-				team.Blackboard.Write(info.name+"-status", "failed: "+sr.Error, "system", "progress")
-			}
-		}
-	}
-
-	// 通知结果
-	if result.Success {
-		we.notify(we.chatID, fmt.Sprintf("✅ Orchestrated 执行完成 — %d 个任务成功, %d 次重试",
-			result.Metrics.CompletedTasks, result.Metrics.TotalRetries))
-	} else {
-		we.notify(we.chatID, fmt.Sprintf("⚠️ Orchestrated 执行部分失败 — 成功 %d, 失败 %d",
-			result.Metrics.CompletedTasks, result.Metrics.FailedTasks))
-	}
-
-	return results
-}
-
-// isAdversarialStage 判断阶段是否为对抗阶段。
+// isAdversarialStage 判断阶段是否为对抗阶段 (判据与改造前逐字相同)。
+// 命中它的阶段走 orchNodeRunner 的对抗分支 (内层多轮 + 质量终止), 而不是单次 completion。
 func isAdversarialStage(stage StageDef) bool {
 	lower := strings.ToLower(stage.Name + " " + stage.Role)
 	return strings.Contains(lower, "adversarial") ||
@@ -394,15 +255,7 @@ func isAdversarialStage(stage StageDef) bool {
 		strings.Contains(lower, "challenge")
 }
 
-// isExpandableStage 判断阶段是否可以 LLM 裂变。
-func isExpandableStage(stage StageDef) bool {
-	lower := strings.ToLower(stage.Name)
-	return strings.Contains(lower, "plan") ||
-		strings.Contains(lower, "decompose") ||
-		strings.Contains(lower, "risk-model")
-}
-
-// taskTimeout 根据阶段类型分配差异化超时。
+// taskTimeout 根据阶段类型分配差异化的**单次尝试**超时 (与改造前逐字相同)。
 // 汇总/报告类阶段需要合并多个上游输出, 耗时更长。
 func taskTimeout(stage StageDef) time.Duration {
 	lower := strings.ToLower(stage.Name + " " + stage.Role)
@@ -420,84 +273,4 @@ func taskTimeout(stage StageDef) time.Duration {
 	}
 	// 默认: 独立专家阶段
 	return 3 * time.Minute
-}
-
-// callbackHook 将 Coordinator 活动回调包装为 LifecycleHook。
-// 每当任务开始/完成时调用 callback, 重置 Coordinator 的停滞检测计时器。
-// 此外, 在任务执行期间每 15 秒周期性调用 TouchActivity,
-// 防止长任务 (如 LLM 生成) 导致 watchdog 误报 "无进展"。
-type callbackHook struct {
-	orchestrator.NoopHook
-	fn       func()
-	stopCh   chan struct{} // 关闭信号
-	stopped  sync.Once
-}
-
-func (h *callbackHook) startHeartbeat() {
-	ticker := time.NewTicker(15 * time.Second)
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				h.fn()
-			case <-h.stopCh:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
-}
-
-func (h *callbackHook) stopHeartbeat() {
-	h.stopped.Do(func() { close(h.stopCh) })
-}
-
-func (h *callbackHook) OnTaskStart(t *orchestrator.Task) {
-	h.fn()
-	h.startHeartbeat()
-}
-
-func (h *callbackHook) OnTaskComplete(t *orchestrator.Task, output any) {
-	h.stopHeartbeat()
-	h.fn()
-}
-
-// stageFlushHook 在每个任务完成时实时更新 team.Stages, 让外部监控能看到中间进度。
-type stageFlushHook struct {
-	orchestrator.NoopHook
-	team   *ProductionTeam
-	stages *map[string]stageInfo
-}
-
-func (h *stageFlushHook) OnTaskComplete(t *orchestrator.Task, output any) {
-	info, ok := (*h.stages)[t.ID]
-	if !ok {
-		return
-	}
-	sr := StageResult{
-		Name:   info.name,
-		Role:   info.role,
-		Status: TaskCompleted,
-		Output: fmt.Sprintf("%v", output),
-	}
-	h.team.mu.Lock()
-	defer h.team.mu.Unlock()
-	// 追加或更新已有阶段
-	for i, existing := range h.team.Stages {
-		if existing.Name == sr.Name {
-			h.team.Stages[i] = sr
-			return
-		}
-	}
-	h.team.Stages = append(h.team.Stages, sr)
-}
-
-// orchLLMAdapter 桥接 pkg/agent.LLMClient → pkg/orchestrator.LLMClient。
-// 两者接口签名完全一致, 但属于不同包, 需要适配器。
-type orchLLMAdapter struct {
-	llm LLMClient
-}
-
-func (a *orchLLMAdapter) SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	return a.llm.SimpleComplete(ctx, systemPrompt, userPrompt)
 }

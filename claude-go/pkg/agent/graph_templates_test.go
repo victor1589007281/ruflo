@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -168,41 +169,64 @@ var tplAllModes = []string{
 	"ensemble_extract", "review_panel", "orchestrated", "app_composite", "game_composite",
 }
 
-// TestModeGraph模板表覆盖全部15种mode 15 个 mode 每个都必须表态: 要么有等价模板,
+// TestModeGraph模板表覆盖全部15种mode 15 个 mode 每个都必须**恰好**表态一次:
+// 要么有等价模板 (灰度可切), 要么有专属节点内核 (已无条件在图引擎上跑),
 // 要么在"已核实不可等价图化"表里写明缺什么能力。
 //
-// 这条守护的是**沉默**: 将来有人加了第 16 个 mode 或改了某个执行器却不更新两张表,
+// 这条守护的是**沉默**: 将来有人加了第 16 个 mode 或改了某个执行器却不更新三张表,
 // 结果会是该 mode 悄悄既没有模板也没有记账 —— 报告上看不出来, 灰度时才发现。
 func TestModeGraph模板表覆盖全部15种mode(t *testing.T) {
-	if n := len(modeGraphTemplates) + len(modeGraphNotTemplated); n != len(tplAllModes) {
-		t.Errorf("模板表(%d) + 未做表(%d) = %d != 15; 若有意增删 mode 请同步更新本测试与 design/01 §五",
-			len(modeGraphTemplates), len(modeGraphNotTemplated), n)
+	tables := map[string]map[string]string{
+		"模板表":   {},
+		"专属内核表": modeGraphNativeKernel,
+		"未做表":   modeGraphNotTemplated,
+	}
+	for m, tpl := range modeGraphTemplates {
+		tables["模板表"][m] = tpl.Equivalence
+	}
+	total := len(tables["模板表"]) + len(tables["专属内核表"]) + len(tables["未做表"])
+	if total != len(tplAllModes) {
+		t.Errorf("模板表(%d) + 专属内核表(%d) + 未做表(%d) = %d != 15; 若有意增删 mode 请同步更新本测试与 design/01 §五",
+			len(tables["模板表"]), len(tables["专属内核表"]), len(tables["未做表"]), total)
 	}
 	for _, mode := range tplAllModes {
-		_, hasTpl := modeGraphTemplates[mode]
-		reason, hasReason := modeGraphNotTemplated[mode]
-		switch {
-		case hasTpl && hasReason:
-			t.Errorf("mode %q 同时出现在模板表与未做表, 语义矛盾", mode)
-		case !hasTpl && !hasReason:
-			t.Errorf("mode %q 既没有图模板也没有记账原因 (design/01 §五 要求逐个交代)", mode)
-		case hasReason && strings.TrimSpace(reason) == "":
-			t.Errorf("mode %q 的未做原因为空", mode)
+		var hit []string
+		for name, tbl := range tables {
+			doc, ok := tbl[mode]
+			if !ok {
+				continue
+			}
+			hit = append(hit, name)
+			if strings.TrimSpace(doc) == "" {
+				t.Errorf("mode %q 在%s里的说明为空", mode, name)
+			}
+		}
+		switch len(hit) {
+		case 1: // 正常
+		case 0:
+			t.Errorf("mode %q 三张表都没记账 (design/01 §五 要求逐个交代)", mode)
+		default:
+			sort.Strings(hit)
+			t.Errorf("mode %q 同时出现在 %v, 语义矛盾", mode, hit)
 		}
 	}
-	// 反向: 两张表里不得出现 15 个之外的 mode (打错字会让守护形同虚设)。
+	// 反向: 三张表里不得出现 15 个之外的 mode (打错字会让守护形同虚设)。
 	known := map[string]bool{}
 	for _, m := range tplAllModes {
 		known[m] = true
 	}
-	for m := range modeGraphTemplates {
-		if !known[m] {
-			t.Errorf("模板表里的 %q 不在 15 种 mode 之列", m)
+	for name, tbl := range tables {
+		for m := range tbl {
+			if !known[m] {
+				t.Errorf("%s里的 %q 不在 15 种 mode 之列", name, m)
+			}
 		}
 	}
-	for m := range modeGraphNotTemplated {
-		if !known[m] {
-			t.Errorf("未做表里的 %q 不在 15 种 mode 之列", m)
+	// 专属内核 mode 必须**不在**灰度分发判据里: ModeHasGraphTemplate 命中会让
+	// workflow.go:408 把它劫到 stageNodeRunner 路径上 (=悄悄换内核 + 绕过降级)。
+	for m := range modeGraphNativeKernel {
+		if ModeHasGraphTemplate(m) {
+			t.Errorf("专属内核 mode %q 不该被 ModeHasGraphTemplate 命中 (会被灰度分发口劫走)", m)
 		}
 	}
 }
@@ -648,8 +672,9 @@ func TestModeGraphTemplateEquivalence文案(t *testing.T) {
 		if strings.TrimSpace(doc) == "" {
 			t.Errorf("mode %q 查不到等价性说明", mode)
 		}
-		if templated != ModeHasGraphTemplate(mode) {
-			t.Errorf("mode %q 的 templated 标记与 ModeHasGraphTemplate 不一致", mode)
+		_, native := modeGraphNativeKernel[mode]
+		if want := ModeHasGraphTemplate(mode) || native; templated != want {
+			t.Errorf("mode %q 的已验证标记 = %v, 期望 %v (模板表或专属内核表命中即为已验证)", mode, templated, want)
 		}
 	}
 	if doc, ok := ModeGraphTemplateEquivalence("不存在的mode"); ok || doc != "" {

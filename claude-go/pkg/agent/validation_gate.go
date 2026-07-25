@@ -117,8 +117,8 @@ func DefaultGateConfigV2() []GateConfig {
 // (CodeExecutor + PatchApplier + ValidationGate + ContextEngine, 约 1700 行,
 // 零测试)。该链复制的编译/测试门禁在 teams.go 已有真实且更完善的实现
 // (runGlobalCompileGate / runGlobalTestGate / runGlobalConsistencyCheck +
-// tryGateWithRemediation 两次自动修复), 且它宿主在计划删除的 pkg/orchestrator
-// 之上 (design/01 M4)。链内已知阻塞缺陷见 design/PROGRESS.md 偏差记录。
+// tryGateWithRemediation 两次自动修复), 且它原本宿主在 pkg/orchestrator 之上,
+// 而该包已于 design/01 M4 删除 (本链的签名因此改用本地 DeprecatedCodeTaskSpec)。链内已知阻塞缺陷见 design/PROGRESS.md 偏差记录。
 // 勿在其上继续开发; 需要真实质量门禁请用 pkg/toolskill 接 pkg/graph 的 gate 节点。
 func NewValidationGate(config []GateConfig, maxRounds int) *ValidationGate {
 	hard := make(map[GateStage]bool)

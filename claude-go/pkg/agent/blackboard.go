@@ -26,17 +26,20 @@ import (
 	"time"
 )
 
-// Board 通信机制抽象 (design/01 §4.11) — 收编两份黑板实现的单一接口。
+// Board 通信机制抽象 (design/01 §4.11) — 黑板的单一接口。
+//
+// **双黑板已归一 (M4)**: 曾经并存的 pkg/orchestrator.Blackboard 随该包一同删除,
+// orchestrated 模式改由图引擎的 NodeInput.PrevOutputs 传递上游产出, 跨黑板手工同步
+// (旧 workflow_orchestrated.go:133-136 的 NewBlackboard + Write("objective")) 消失。
+// 设计稿要"新增"的 Watch 曾只存在于被删的那份实现里, 现已在本文件落地。
 //
 // 为什么用 Board 而不叫 Blackboard: 同包里 Blackboard 已是结构体名 (本文件默认
 // 实现), Go 不允许同名。接口方法名也就地对齐既有实现 (SnapshotForRole /
 // HandoffContext 语义), 而不是照抄设计稿里的 Snapshot(role,budget)/Handoff(from,to)
 // —— 后者会与既有 Snapshot() 冲突, 逼所有调用方改签名, 违背"不破坏现有调用方"。
 //
-// 三个实现方向:
+// 两个实现方向:
 //   - *Blackboard (本文件): 文件后端 + debounce 落盘, 生产默认;
-//   - pkg/orchestrator.Blackboard: orchestrated 模式在用, design/01 M4 退役;
-//     它已有 Put/Snapshot/Watch, 退役前可用 BoardFuncs 适配进本接口 (见下);
 //   - 分布式后端 (design/02): 换实现不动调用方。
 type Board interface {
 	// Put 写入/更新一条黑板条目 (同 key 覆盖)。
@@ -54,10 +57,12 @@ type Board interface {
 
 // BoardFuncs 用函数字段把任意黑板实现适配成 Board。
 //
-// 存在的理由: pkg/orchestrator.Blackboard 仍在生产 orchestrated 路径上跑, 本轮不删;
-// 它的方法名/签名与这里不同 (Put(key,value,author,category) / Snapshot() map / Watch
-// 返回 ChangeEvent)。直接 import 那个包会把 agent→orchestrator 的依赖钉死, 反而给
-// M4 退役添阻。用函数字段适配则零依赖: 接线方在自己那边写 4 个闭包即可。
+// 原始存在理由已消失: 它当初是为了把 pkg/orchestrator.Blackboard 适配进 Board 而**不**
+// 把 agent→orchestrator 的依赖钉死 (钉死了反而给 M4 退役添阻)。M4 完成后那份实现已删,
+// 于是它眼下只有测试调用方。**保留而不删**的理由有二: ① 它是 design/02 分布式后端
+// (以及任何第三方黑板) 唯一的零依赖接入点 —— 换实现不必改调用方, 正是 §4.11 抽象的
+// 目的; ② 它是纯适配器 (无状态、6 个分支), 留着的成本近似为零, 而删掉一个导出符号
+// 要付兼容代价。若日后确认永久无人接线, 再删。
 // 任一字段为 nil 时对应方法退化为零值 (fail-open, 通信降级不该打断交付)。
 type BoardFuncs struct {
 	PutFn      func(e BoardEntry) error
@@ -245,8 +250,8 @@ func (bb *Blackboard) notifyLocked(e BoardEntry) {
 	}
 }
 
-// watchBuffer 每个订阅通道的缓冲深度。与 pkg/orchestrator/blackboard.go:210 保持一致,
-// 便于 M4 退役那份实现时行为无感知变化。
+// watchBuffer 每个订阅通道的缓冲深度。取 64 是照抄已删除的 pkg/orchestrator/blackboard.go
+// 那份实现 —— M4 退役它时订阅方的丢弃行为因此无感知变化。
 const watchBuffer = 64
 
 // Watch 订阅 key 前缀匹配的黑板变更 (prefix 为空 = 订阅全部)。
