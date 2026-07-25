@@ -341,9 +341,27 @@ type Placement struct {
 - 远程 runtime（gRPC/A2A worker 拉取模型）在 design/02 R3 落地，接口在此冻结。
 - 团队 cwd 亲和：`Affinity: team` 保证产码工作流的节点落同一工作区（否则经共享存储，design/02）。
 
-### 4.10 全局注入：Interceptor 链　　**[❌ 未实现]**
+### 4.10 全局注入：Interceptor 链　　**[🟠 切面链 ✅ 已通电 / 6 个内置拦截器落地 1 个]**
 
-> **实测**：`NodeInterceptor`/`CallInterceptor` 两接口零命中；六个内置拦截器全无。`executeWorkflow` **仍是 282 行巨函数**（`pkg/agent/teams.go:646+`），门禁/进化/记忆/通知仍硬编码在主流程。⚠️ 这是本方案 G5 的核心，也是「便于全局注入预算管理」这一原始诉求的落点。
+> **实测（改造前）**：`NodeInterceptor`/`CallInterceptor` 两接口零命中；六个内置拦截器全无。
+>
+> ✅ **切面链已实现并通电（2026-07-25）**：`pkg/graph/interceptor.go` + `pkg/agent/graph_interceptors.go`（29 个测试）。
+>
+> **挂载点只有一处**：`engine.callRunner`——它自称"真正调 runner 的唯一出口"，实测确实是（agent/gate 的重试环与 loop 环、map 分片、loop-group 组内节点全部经它）。挂这一处就自动覆盖全部 Kind 与全部重试/循环轮次，有测试专门证明「重试每一轮都过链」与「map 分片也过链」——嵌套调度路径若绕过链，扇出就是预算黑洞。
+>
+> **链语义定得比设计稿严**，因为拦截器是第三方注入点（设计文档明说 aiops 的权限桥要从此注入）：
+> - `next` 必须**恰好调一次**。不调 = 节点被悄悄吞掉；调两次 = 绕过引擎的重试计数。链本身检测这两种误用并转为 failed 且**点名是哪个拦截器**，不静默容忍。
+> - 但**明示拒绝**（不调 next 而返回 failed/skipped 终态）是正当用法，与"忘了调 next"可区分——预算拦截器正是走这条路径。
+> - 拦截器 panic 不穿透（不带走整个图运行）但也**不当成放行**——转为节点 failed。
+> - 重名/空名/nil 在开跑前就拒绝：`Name` 是 journal 归因的键，重名会让"谁拒了这个节点"永久不可考。
+>
+> **BudgetManager 已落地**（设计表中第一项、用户点名的例子）：节点执行次数 / 墙钟 / token / 单节点次数四道闸，`budget.consumed` 与 `budget.exceeded` 双事件入 journal——有后者才能区分"节点失败"与"没让它跑"。两个关键取舍：**判定在执行前**（执行后判定意味着预算总会被超出至少一个节点的开销，有测试断言"实际执行恰好等于上限，多一次就是透支"）；**token 报 0 = 未回报而非没花**（否则"用量回报尚未实现"会被当成"这次免费"，闸形同虚设）。
+>
+> **默认值的设计**：默认不限制等于没通电，默认拍一个数又会改变现状行为（8+ 下游平台在用 `:18080`）。折中是从 GraphSpec **算出**一次合法运行的执行次数真上界（节点数 × 重试 × 循环轮次，声明了 map/展开时按 `MaxTotalNodes` 算）再乘 2 倍宽裕——合法运行撞不到、失控运行会撞上。有测试逐场景验证「算出的上界 ≥ 合法运行上限」，也验证它没宽到失去意义。环境变量 `CLAUDE_GO_GRAPH_BUDGET_*` 可设紧，`CLAUDE_GO_GRAPH_INTERCEPTORS=off` 可一键退回。
+>
+> 一处 API 自我修正：`NewBudgetManager` 原本收一个 `evAppender` 参数，但那是**未导出类型**——外部包（装配链的 `pkg/agent`）根本造不出来，靠构造参数传等于生产上一条事件都不落。改为引擎经 `journalAware` 接口注入。
+>
+> ⚠️ **仍缺**：`CallInterceptor`（LLM 调用切面）零实现；6 个内置拦截器只落地 BudgetManager，EvolutionRecorder / GateEnforcer / Notifier / MetricsEmitter / RateLimiter 仍在主流程硬编码（其中 GateEnforcer 的"按 Meta 声明而非工作流名白名单"已单独落地）。`executeWorkflow` **仍是 282 行巨函数**（`pkg/agent/teams.go:646+`）——把它拆成"编译图模板 + 装配拦截器"属 M4，风险在于它是 8+ 平台共用的主路径。
 
 ```go
 // 两个切面：节点执行 与 LLM 调用

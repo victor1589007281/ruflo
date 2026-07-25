@@ -34,6 +34,12 @@ type NodeInput struct {
 	Shard *ShardInput
 	// Shards reduce 节点聚合的上游分片结果 (按 map 节点 + 分片序), 非 reduce 节点为空。
 	Shards []ShardResult
+	// NodeRef 本次执行在 journal/hook 里的**限定 ID** (顶层 = node.ID; map 分片 =
+	// <map>#<i>; loop-group 组内 = <组>#it<轮次>/<成员>)。
+	// 为什么不直接把它塞进 node.ID: 宿主有一堆按"阶段名"生效的既有逻辑 (产出校验、
+	// 角色推断), 换成限定 ID 会静默改变那些判定; 但宿主又需要限定 ID 才能把自己的
+	// 记录与 journal 对齐。故分两个字段: node.ID 是语义名, NodeRef 是归因名。
+	NodeRef string
 
 	// nested 引擎内部调度标记: 本次执行属于嵌套层叶子 (map 分片 / loop-group 组内),
 	// 需要先取 run 级并发票。不导出 —— 它是调度细节, 不属于 runner 契约。
@@ -68,6 +74,11 @@ type NodeResult struct {
 	Output string  // 节点产出 (进 journal, 供下游 PrevOutputs / 条件求值)
 	Score  float64 // gate 节点评分, 无则 0
 	Err    string  // 失败/跳过原因
+
+	// Tokens 本次执行消耗的 token (runner 可选回报, 供 BudgetManager 记账,
+	// design/01 §4.10)。**0 表示"未回报"而非"没花"** —— 两者必须可区分, 否则
+	// "用量回报尚未实现"会被当成"这次免费", 预算闸形同虚设。
+	Tokens int64
 
 	// Shards map 节点各分片结果 (引擎填, runner 不必理); 经 journal 往返以支持 resume。
 	Shards []ShardResult

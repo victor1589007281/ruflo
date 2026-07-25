@@ -39,6 +39,16 @@ const (
 	// EvGroupIteration loop-group 一轮结束 (design/01 §4.4)。
 	// Data: iteration / status / output / score。**resume 按已完成轮次续跑**。
 	EvGroupIteration = "loop.group.iteration"
+
+	// EvBudgetConsumed 一次节点执行后的预算记账 (design/01 §4.3 事件枚举 + §4.10)。
+	// Data: node_runs / node_runs_this, 以及 runner 真回报用量时的 tokens / tokens_total。
+	// **重放时不重建台账**: 预算是"本次运行"的量, resume 后续跑应按新预算重新计,
+	// 否则一个跑了六轮的图永远无法 resume (旧账已把预算吃满)。
+	EvBudgetConsumed = "budget.consumed"
+	// EvBudgetExceeded 预算超限致节点被拒 (design/01 §4.10)。
+	// Data: kind(node_runs|per_node_runs|wall_clock|tokens) / limit / got / action。
+	// 有它才能区分"节点失败"与"没让它跑"。
+	EvBudgetExceeded = "budget.exceeded"
 )
 
 // Event 一条 journal 事件 (design/01 §4.3)。

@@ -58,6 +58,12 @@ type Engine struct {
 	Hooks       HookBus // nil → NopBus
 	MaxParallel int     // 引擎级并发上限; spec.Policies.MaxParallel 优先; 双 0 → 4
 
+	// Interceptors 节点执行切面链 (design/01 §4.10)。[0] 最外层, 顺序即语义:
+	// BudgetManager 必须在 EvolutionRecorder 外层, 否则超预算被拒的节点也会被
+	// 记一条轨迹, 污染 design/03 的学习数据。重名会在 Run 开头被拒 (Name 用于
+	// journal 归因)。空链 = 零开销直通 (chainNode 不包任何一层)。
+	Interceptors []NodeInterceptor
+
 	// sleepFn 重试退避的测试注入点; nil = 真实 ctx 感知休眠。
 	// 返回 false 表示 ctx 已取消, 应停止重试。
 	sleepFn func(ctx context.Context, d time.Duration) bool
@@ -112,6 +118,8 @@ type runCtx struct {
 	maxPar    int
 	replay    *RunState     // resume 的重放状态 (nil = 非 resume)
 	nestSem   chan struct{} // 嵌套层叶子节点的并发票 (见文件头"并发闸有两层")
+	// nodeExec 装配好拦截器链的节点执行入口 (§4.10); 空链时即 Runner.RunNode。
+	nodeExec NodeExec
 
 	mu         sync.Mutex
 	totalNodes int // 运行图当前节点数 (含展开产物与 map 分片), 受 MaxTotalNodes 约束
@@ -210,6 +218,11 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 	if e.Runner == nil {
 		return RunResult{}, errors.New("graph: Engine.Runner 未注入, 无法执行节点")
 	}
+	// 拦截器重名/空名/nil 在开跑前就拒绝: Name 是 journal 归因与开关的键,
+	// 重名会让"哪个拦截器拒了这个节点"永久不可考 (§4.10)。
+	if err := validateInterceptors(e.Interceptors); err != nil {
+		return RunResult{}, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -256,6 +269,16 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 		nestSem:    make(chan struct{}, maxPar),
 		totalNodes: len(spec.Nodes),
 	}
+	// 链一次装配, 全 run 复用 (每层的"恰好一次"计数器是 per-调用 局部变量,
+	// 故同一条链可被多个节点 goroutine 并发使用, 见 chainNode)。
+	rc.nodeExec = chainNode(e.Interceptors, e.Runner.RunNode)
+	// 想记账的拦截器在此拿到 journal 记账函数 (见 journalAware): evAppender 未导出,
+	// 外部包装配链时没法自己造一个, 靠构造参数传等于永远拿不到 → 事件一条不落。
+	for _, ic := range e.Interceptors {
+		if ja, ok := ic.(journalAware); ok {
+			ja.attachJournal(appendEv)
+		}
+	}
 
 	dr := newDagRun(spec.Nodes, spec.Edges, execScope{})
 
@@ -287,7 +310,14 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 		}
 	}
 
-	appendEv(EvRunCreated, "", map[string]any{"graph": spec.Name, "objective": opts.Objective, "resume": opts.Resume})
+	// run.created 全 run 只发一条 —— Replay 靠定位**最后一条** run.created 来划定
+	// "本次运行", 多发一条会让重放范围错位 (这是修过的一个 P0)。拦截器链构成并进
+	// 这条事件的 Data, 不另开事件。
+	runCreated := map[string]any{"graph": spec.Name, "objective": opts.Objective, "resume": opts.Resume}
+	if len(e.Interceptors) > 0 {
+		runCreated["interceptors"] = interceptorNames(e.Interceptors)
+	}
+	appendEv(EvRunCreated, "", runCreated)
 	hooks.Emit(ctx, HookEvent{Scope: ScopeGraph, Phase: "pre", RunID: runID,
 		Payload: map[string]any{"graph": spec.Name, "nodes": len(spec.Nodes), "resume": opts.Resume}})
 
@@ -464,6 +494,7 @@ func (e *Engine) scheduleDAG(ctx context.Context, rc *runCtx, dr *dagRun) bool {
 						PrevOutputs:    dr.prevOutputs(id),
 						Feedback:       dr.feedback,
 						GroupIteration: dr.groupIter,
+						NodeRef:        dr.scope.evID(id),
 					}
 					if n.Kind == NodeKindReduce {
 						in.Shards = dr.gatherShards(n)
@@ -678,7 +709,17 @@ func (e *Engine) runLoop(ctx context.Context, rc *runCtx, scope execScope, node 
 
 // callRunner 真正调 runner 的唯一出口。嵌套层的叶子节点在此取并发票
 // (容器节点不走这里, 故不会自己占票饿死子任务, 见文件头)。
+//
+// 拦截器链 (design/01 §4.10) 也挂在这一处: agent/gate 的重试与 loop 环、map 分片、
+// loop-group 组内节点全部经此, 挂一次就覆盖全部 Kind 与全部轮次。
+//
+// 并发票在拦截器**外层**取: 拦截器可能拒绝执行 (预算超限), 那种情况不该占用嵌套
+// 层的并发票 —— 否则一个被预算拒掉的节点会白占一张票, 让真能跑的分片排队。
 func (e *Engine) callRunner(ctx context.Context, rc *runCtx, node NodeSpec, in NodeInput) NodeResult {
+	exec := rc.nodeExec
+	if exec == nil { // Run 之外的直接调用 (不应发生, 但别 panic)
+		exec = e.Runner.RunNode
+	}
 	if in.nested {
 		release, ok := rc.acquireNested(ctx)
 		if !ok {
@@ -686,7 +727,7 @@ func (e *Engine) callRunner(ctx context.Context, rc *runCtx, node NodeSpec, in N
 		}
 		defer release()
 	}
-	return e.Runner.RunNode(ctx, node, in)
+	return exec(ctx, node, in)
 }
 
 // replacePrevOutput 替换 Feedback 模板中的 {prev_output} 占位。

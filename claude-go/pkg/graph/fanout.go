@@ -129,6 +129,7 @@ func (e *Engine) runMapNode(ctx context.Context, rc *runCtx, scope execScope, no
 		si.nested = true
 		si.Shards = nil
 		si.Shard = &ShardInput{NodeID: sn.ID, MapID: node.ID, Index: i, Total: len(shardVals), Value: val}
+		si.NodeRef = shardScope.evID(sn.ID)
 		// resume: 上一轮已 completed 的分片直接吃缓存 (崩溃恰好发生在扇出中途的场景)。
 		if rc.replay != nil {
 			if cached, ok := rc.replay.Completed[scope.evID(sn.ID)]; ok && cached.Status == NodeStatusCompleted {

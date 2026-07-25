@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -128,9 +129,18 @@ func graphNodeBudgetSec(role string, retries int, deterministic bool) int {
 // StageGraphOverride 单个阶段的图能力声明 (JSON 可序列化, 供外部文件注入)。
 // 全部字段可选; 零值 = 按推导规则处理。
 type StageGraphOverride struct {
-	// Kind 强制节点形态 ""|"agent"|"gate"。显式 "agent" 可压制 stageIsGate 的
-	// 关键词推断 (例如名字里带"门禁"但其实是普通写作阶段)。
+	// Kind 强制节点形态 ""|"agent"|"gate"|"map"|"reduce"。显式 "agent" 可压制
+	// stageIsGate 的关键词推断 (例如名字里带"门禁"但其实是普通写作阶段)。
+	// map/reduce 必须同时给出对应的 Map/Reduce 策略 (直译器强制, 不猜)。
 	Kind string `json:"kind,omitempty"`
+	// Map 扇出策略 (Kind="map" 必填): 集合来源 + 切分策略 + 分片数上下限。
+	// 这是 fanout 类工作流从"转调 pipeline 的空壳"变成真 map→reduce 的入口。
+	Map *graph.MapPolicy `json:"map,omitempty"`
+	// Reduce 聚合策略 (Kind="reduce" 可选, 不填=交给 runner 用 LLM 聚合)。
+	Reduce *graph.ReducePolicy `json:"reduce,omitempty"`
+	// Expand 授权本阶段动态展开子图 (GoalTree/WBS/swarm 三套分解的统一落点)。
+	// 只有声明了它, stageNodeRunner 才会去解析阶段产出里的子图 (见 parseStageExpansion)。
+	Expand *graph.ExpandSpec `json:"expand,omitempty"`
 	// Condition 本阶段**全部入边**的条件 (语法见 pkg/graph/condition.go:
 	// ok | fail | score <op> <数字> | output contains "..." | output not_contains "...")。
 	Condition string `json:"condition,omitempty"`
@@ -158,6 +168,31 @@ type WorkflowGraphOverride struct {
 	MaxParallel  int                           `json:"maxParallel,omitempty"`  // 图级并发上限 (0=用 executor 的 effectiveParallel)
 	DefaultRetry *graph.RetryPolicy            `json:"defaultRetry,omitempty"` // 图级默认重试 (nil=用 graphOuterMaxRetries)
 	Stages       map[string]StageGraphOverride `json:"stages,omitempty"`       // 按阶段名
+	// MaxTotalNodes 运行图节点总数上限 (0=引擎默认): 动态展开与 map 扇出的总闸。
+	MaxTotalNodes int `json:"maxTotalNodes,omitempty"`
+	// Groups 组级循环声明: 把若干**已有阶段**折成一个 loop-group 节点整体循环。
+	// 这是 adversarial 的 Rounds / 内容质量重做环在生产输入上的表达方式 ——
+	// 组成员写阶段名, 不必在覆盖表里重新描述一遍节点 (那必然与工作流定义漂移)。
+	Groups []StageGroupOverride `json:"groups,omitempty"`
+}
+
+// StageGroupOverride 一组阶段的组级循环声明 (design/01 §4.4 loop-group)。
+type StageGroupOverride struct {
+	// ID 组节点 ID (空=loop-<第一个成员>)。它会出现在 journal/hook/阶段记录里。
+	ID string `json:"id,omitempty"`
+	// Members 组内阶段名 (≥1, 必须是本工作流的阶段, 且不得被两个组同时收编)。
+	// 组内阶段之间的 DependsOn 成为组内边; 与组外的依赖被改接到组节点上。
+	Members []string `json:"members"`
+	// MaxIterations 组循环硬上限, 必填 >0 (无界循环违法)。
+	MaxIterations int `json:"maxIterations"`
+	// Until 退出条件 (对组产出节点的结果求值), 语法见 pkg/graph/condition.go。
+	Until string `json:"until,omitempty"`
+	// Feedback 每轮回灌模板 ({prev_output} = 上一轮组产出), 下发给全部成员。
+	Feedback string `json:"feedback,omitempty"`
+	// ResultFrom 组产出取哪个成员 (空=组内唯一出度 0 成员; 多个时必须显式)。
+	ResultFrom string `json:"resultFrom,omitempty"`
+	// Role 组节点角色 (仅用于日志/hook 载荷, 空=coordinator)。
+	Role string `json:"role,omitempty"`
 }
 
 var (
@@ -264,6 +299,15 @@ func mergeStageOverride(decl, ov StageGraphOverride) StageGraphOverride {
 	if ov.Loop != nil {
 		out.Loop = ov.Loop
 	}
+	if ov.Map != nil {
+		out.Map = ov.Map
+	}
+	if ov.Reduce != nil {
+		out.Reduce = ov.Reduce
+	}
+	if ov.Expand != nil {
+		out.Expand = ov.Expand
+	}
 	if ov.ToolProfile != "" {
 		out.ToolProfile = ov.ToolProfile
 	}
@@ -317,8 +361,9 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 		Version: "wfdef-v1",
 		Meta:    WorkflowGateMeta(wf),
 		Policies: graph.GraphPolicies{
-			MaxParallel:  ov.MaxParallel, // 0 → executeGraph 用 effectiveParallel 兜
-			DefaultRetry: defaultRetry,
+			MaxParallel:   ov.MaxParallel, // 0 → executeGraph 用 effectiveParallel 兜
+			DefaultRetry:  defaultRetry,
+			MaxTotalNodes: ov.MaxTotalNodes, // 0 → 引擎默认 (动态展开/扇出的总闸)
 		},
 	}
 	for _, st := range wf.Stages {
@@ -331,12 +376,21 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 			// 显式声明普通 agent: 压制关键词推断
 		case string(graph.NodeKindGate):
 			kind = graph.NodeKindGate
+		case string(graph.NodeKindMap):
+			// map 的策略绝不推导: 集合从哪来、怎么切、最多几片, 猜错就是扇出 800 次
+			// LLM 调用或静默只跑一片。必须显式声明。
+			if so.Map == nil || so.Map.MaxShards <= 0 {
+				return graph.GraphSpec{}, fmt.Errorf("graph_adapter: 阶段 %q 声明 kind=map 但缺少 map 策略 (至少要给 maxShards)", st.Name)
+			}
+			kind = graph.NodeKindMap
+		case string(graph.NodeKindReduce):
+			kind = graph.NodeKindReduce
 		case "":
 			if stageIsGate(st) {
 				kind = graph.NodeKindGate // 门禁阶段 → gate 节点 (输出 score 供条件边路由)
 			}
 		default:
-			return graph.GraphSpec{}, fmt.Errorf("graph_adapter: 阶段 %q 的覆盖 kind=%q 非法 (仅 agent|gate)", st.Name, so.Kind)
+			return graph.GraphSpec{}, fmt.Errorf("graph_adapter: 阶段 %q 的覆盖 kind=%q 非法 (仅 agent|gate|map|reduce; 组级循环用 groups 声明)", st.Name, so.Kind)
 		}
 
 		// Deterministic: 显式声明优先; 否则 compile/test/build 类门禁本来就走 runGate
@@ -350,6 +404,12 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 		timeoutSec := so.TimeoutSec
 		if timeoutSec <= 0 {
 			timeoutSec = graphNodeBudgetSec(st.Role, retries, deterministic)
+			// map 节点的预算要包住**全部分片**: 分片并发但并发度未知 (executeGraph
+			// 才知道 effectiveParallel), 按最坏情况 (全串行) 给, 再由 2h 硬顶夹住。
+			// 给紧了的后果是合法的扇出被 deadline 掐死, 比给松严重得多。
+			if kind == graph.NodeKindMap {
+				timeoutSec = capNodeBudget(timeoutSec * so.Map.MaxShards)
+			}
 		}
 
 		spec.Nodes = append(spec.Nodes, graph.NodeSpec{
@@ -365,6 +425,9 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 			Loop:       so.Loop,
 			Retry:      so.Retry,
 			TimeoutSec: timeoutSec,
+			Map:        so.Map,
+			Reduce:     so.Reduce,
+			Expand:     so.Expand,
 		})
 		for _, dep := range st.DependsOn {
 			cond := so.Condition
@@ -374,8 +437,144 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 			spec.Edges = append(spec.Edges, graph.EdgeSpec{From: dep, To: st.Name, Condition: cond})
 		}
 	}
+	// 组级循环: 把声明的阶段组折成 loop-group 节点 (在 Validate 之前, 折完才是终图)。
+	spec, err := foldStageGroups(spec, ov.Groups)
+	if err != nil {
+		return graph.GraphSpec{}, err
+	}
 	if err := spec.Validate(); err != nil {
 		return graph.GraphSpec{}, fmt.Errorf("graph_adapter: 直译结果非法: %w", err)
+	}
+	return spec, nil
+}
+
+// capNodeBudget 夹住节点预算上限 (卡死兜底闸, 不是省钱闸)。
+func capNodeBudget(sec int) int {
+	if sec > graphNodeBudgetCapSec || sec <= 0 {
+		return graphNodeBudgetCapSec
+	}
+	return sec
+}
+
+// foldStageGroups 把 WorkflowGraphOverride.Groups 声明的阶段组折成 loop-group 节点
+// (design/01 §4.4)。
+//
+// 折叠而不是"引用外部节点": pkg/graph 的 loop-group 把组内子图**内嵌**在节点里
+// (组成员若留在顶层, 顶层的入口可达/无环校验会把它们当孤岛报错, 调度器还会把它们
+// 各跑一次)。所以这里做三件事:
+//  1. 把成员节点从顶层摘出, 放进 GroupPolicy.Nodes;
+//  2. 成员之间的边 → 组内边;
+//  3. 跨组边界的边改接到组节点上 (外→成员 变 外→组; 成员→外 变 组→外, 条件保留 ——
+//     组的结果就是 ResultFrom 成员的结果, 条件语义因此仍然成立)。
+func foldStageGroups(spec graph.GraphSpec, groups []StageGroupOverride) (graph.GraphSpec, error) {
+	if len(groups) == 0 {
+		return spec, nil
+	}
+	consumed := map[string]string{} // 成员阶段 → 收编它的组 ID
+	for _, g := range groups {
+		if len(g.Members) == 0 {
+			return spec, fmt.Errorf("graph_adapter: 组声明 %q 没有成员", g.ID)
+		}
+		if g.MaxIterations <= 0 {
+			return spec, fmt.Errorf("graph_adapter: 组 %q 的 maxIterations 必须 > 0 (无界循环违法)", g.ID)
+		}
+		groupID := strings.TrimSpace(g.ID)
+		if groupID == "" {
+			groupID = "loop-" + g.Members[0]
+		}
+		byID := map[string]graph.NodeSpec{}
+		for _, n := range spec.Nodes {
+			byID[n.ID] = n
+		}
+		if _, clash := byID[groupID]; clash {
+			return spec, fmt.Errorf("graph_adapter: 组 ID %q 与已有阶段同名", groupID)
+		}
+		member := map[string]bool{}
+		var members []graph.NodeSpec
+		for _, name := range g.Members {
+			// 先查"是否已被别的组收编": 前一个组折叠后成员已不在顶层节点表里,
+			// 若先查存在性会报成"不是本工作流的阶段", 把真实病因 (重复收编) 藏起来。
+			if other, dup := consumed[name]; dup {
+				return spec, fmt.Errorf("graph_adapter: 阶段 %q 被两个组同时收编 (%s / %s)", name, other, groupID)
+			}
+			if _, ok := byID[name]; !ok {
+				return spec, fmt.Errorf("graph_adapter: 组 %q 的成员 %q 不是本工作流的阶段", groupID, name)
+			}
+			consumed[name] = groupID
+			member[name] = true
+		}
+		// 成员按**原声明序**入组: 与 pipeline 的阶段顺序一致, 便于灰度期比对。
+		for _, n := range spec.Nodes {
+			if member[n.ID] {
+				members = append(members, n)
+			}
+		}
+		if rf := strings.TrimSpace(g.ResultFrom); rf != "" && !member[rf] {
+			return spec, fmt.Errorf("graph_adapter: 组 %q 的 resultFrom=%q 不是组成员", groupID, rf)
+		}
+
+		var innerEdges, outerEdges []graph.EdgeSpec
+		seen := map[string]bool{}
+		addOuter := func(ed graph.EdgeSpec) {
+			key := ed.From + "→" + ed.To + "|" + ed.Condition
+			if seen[key] || ed.From == ed.To {
+				return // 组内两个成员各自与组外同一节点相连时会重复; 自环直接丢
+			}
+			seen[key] = true
+			outerEdges = append(outerEdges, ed)
+		}
+		for _, ed := range spec.Edges {
+			switch {
+			case member[ed.From] && member[ed.To]:
+				innerEdges = append(innerEdges, ed)
+			case member[ed.To]: // 外 → 成员
+				addOuter(graph.EdgeSpec{From: ed.From, To: groupID, Condition: ed.Condition})
+			case member[ed.From]: // 成员 → 外
+				addOuter(graph.EdgeSpec{From: groupID, To: ed.To, Condition: ed.Condition})
+			default:
+				addOuter(ed)
+			}
+		}
+
+		role := strings.TrimSpace(g.Role)
+		if role == "" {
+			role = "coordinator"
+		}
+		budget := 0
+		for _, m := range members {
+			budget += m.TimeoutSec
+		}
+		groupNode := graph.NodeSpec{
+			ID:    groupID,
+			Kind:  graph.NodeKindLoopGroup,
+			Agent: graph.AgentSpec{Role: role},
+			// 组节点自己不调 runner, 预算只作卡死兜底: 成员预算之和 × 轮次上限。
+			TimeoutSec: capNodeBudget(budget * g.MaxIterations),
+			Group: &graph.GroupPolicy{
+				Nodes: members,
+				Edges: innerEdges,
+				Loop: graph.LoopPolicy{
+					MaxIterations: g.MaxIterations,
+					Until:         g.Until,
+					Feedback:      g.Feedback,
+				},
+				ResultFrom: strings.TrimSpace(g.ResultFrom),
+			},
+		}
+		// 组节点占据第一个成员的位置: 顶层节点序仍与阶段声明序一致。
+		var nodes []graph.NodeSpec
+		placed := false
+		for _, n := range spec.Nodes {
+			if !member[n.ID] {
+				nodes = append(nodes, n)
+				continue
+			}
+			if !placed {
+				nodes = append(nodes, groupNode)
+				placed = true
+			}
+		}
+		spec.Nodes, spec.Edges = nodes, outerEdges
 	}
 	return spec, nil
 }
@@ -436,7 +635,11 @@ func WorkflowGateMetaByName(workflow string) graph.GraphMeta {
 // ExecuteSingleStage 的签名不在本次改动范围内。图层把节点声明放进 ctx, 宿主读到
 // 后即可用**显式声明**取代按名字猜; 读不到就保持现状 (fail-open, 零行为变化)。
 type NodeExecHints struct {
-	Node          string // 节点 ID
+	Node string // 节点 ID (语义名 = 阶段名; 分片为 <阶段>#<序号>)
+	// NodeRef journal/hook 里的限定 ID: 顶层 = Node; loop-group 组内 =
+	// <组>#it<轮次>/<成员>。宿主要把自己的记录与 journal 对齐只能用它
+	// (Node 在组的每一轮都相同, 单看它无法区分是第几轮)。
+	NodeRef       string
 	Role          string
 	Kind          string // agent|gate
 	ToolProfile   string // 显式工具画像 (空=宿主按角色推断, 即现状)
@@ -469,12 +672,16 @@ type stageNodeRunner struct {
 	we        *WorkflowExecutor
 	team      *ProductionTeam
 	objective string
+	// deps 节点 → 上游节点 ID (按**边声明序**), 由 graphNodeDeps 从运行图抽出。
+	// 见 RunNode 里 DependsOn 的注释: pipeline 侧拼依赖块用的是声明序, 这里必须同序。
+	deps map[string][]string
 }
 
 func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in graph.NodeInput) graph.NodeResult {
 	// 节点声明下传 (工具画像 / MaxTurns / 确定性 / loop 轮次), 供宿主 factory 消费。
 	ctx = WithNodeExecHints(ctx, NodeExecHints{
-		Node: node.ID, Role: node.Agent.Role, Kind: string(node.Kind),
+		Node: node.ID, NodeRef: orNodeID(in.NodeRef, node.ID),
+		Role: node.Agent.Role, Kind: string(node.Kind),
 		ToolProfile: node.Agent.ToolProfile, MaxTurns: node.Agent.MaxTurns,
 		Deterministic: node.Agent.Deterministic, Iteration: in.Iteration,
 	})
@@ -485,15 +692,54 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 		return r.runGate(ctx, node, in)
 	}
 
+	// DependsOn 必须填: buildStagePromptWithRoles 是**按 stage.DependsOn 遍历**
+	// prevResults 来拼 "### Dependency output from X" 块的 (workflow.go:1804), 而
+	// {prev_result} 占位符替换的就是这个块。此前图路径构造 StageDef 时不填 DependsOn
+	// ⇒ 依赖块恒空 ⇒ **上游产出根本没进 prompt**, {prev_result} 被替换成空串,
+	// 每个阶段都在没有上游交接的情况下干活 (灰度期没被发现是因为桩 runner 只回显
+	// prompt 长度)。这里用 PrevOutputs 的键 (即 completed 的直接前驱) 补上,
+	// 排序保证 prompt 逐次可复现。
+	deps := make([]string, 0, len(in.PrevOutputs))
+	for dep := range in.PrevOutputs {
+		deps = append(deps, dep)
+	}
+	sort.Strings(deps)
 	stage := StageDef{
-		Name:   node.ID,
-		Role:   node.Agent.Role,
-		Prompt: node.Agent.Prompt,
+		Name:      node.ID,
+		Role:      node.Agent.Role,
+		Prompt:    node.Agent.Prompt,
+		DependsOn: deps,
+	}
+	// —— 图特有的执行上下文 (回灌 / 分片 / 待聚合分片) ——
+	var extraCtx strings.Builder
+	if in.Feedback != "" {
+		// loop 回灌 (节点级或组级): 作为用户反馈注入 (复用 {user_feedback} 管线语义)
+		fmt.Fprintf(&extraCtx, "\n\n## 上一轮反馈\n%s", in.Feedback)
+	}
+	// map 分片: 引擎只做确定性切分, "这一片是什么"必须由 runner 送进 prompt,
+	// 否则 N 个分片会拿到完全一样的输入、产出 N 份重复内容 (还烧 N 倍 token)。
+	if in.Shard != nil {
+		fmt.Fprintf(&extraCtx, "\n\n## 本分片任务 (第 %d/%d 片)\n%s",
+			in.Shard.Index+1, in.Shard.Total, in.Shard.Value)
+	}
+	// reduce (runner 策略): 把各分片产出按序摆给聚合者。
+	if node.Kind == graph.NodeKindReduce && len(in.Shards) > 0 {
+		fmt.Fprintf(&extraCtx, "\n\n## 待聚合的分片产出\n%s", formatShardsForPrompt(in.Shards))
 	}
 	objective := r.objective
-	if in.Feedback != "" {
-		// loop 回灌: 作为用户反馈注入 (复用 {user_feedback} 管线语义)
-		objective = objective + "\n\n## 上一轮反馈\n" + in.Feedback
+	if s := extraCtx.String(); s != "" {
+		// objective 与 stage.Prompt **两处都要挂**, 因为 buildStagePromptWithRoles 有
+		// 三条互斥路径 (workflow.go:1803):
+		//   ① 角色模板已含 {objective} ⇒ **stage.Prompt 被整个丢弃**, 只有 objective 到得了;
+		//   ② 纯人格角色 ⇒ merged + stage.Prompt 的替换结果, 两者都到;
+		//   ③ 无角色注册表 ⇒ 只有 stage.Prompt 的替换结果到得了。
+		// 只挂 objective (改造前对 Feedback 的做法) 在 ③ 和"模板不含 {objective}"的 ②
+		// 下会被静默丢掉 —— 分片内容丢了就是 N 片跑同一个输入、产出 N 份重复内容。
+		// 挂 stage.Prompt 时避开"模板已含 {objective}"的情形, 免得同一段话出现两次。
+		objective += s
+		if !strings.Contains(stage.Prompt, "{objective}") {
+			stage.Prompt += s
+		}
 	}
 	// 重试让位 (design/01 §4.3, 见文件头"重试单层化"): 图层已持有重试策略
 	// (NodeSpec.Retry / Policies.DefaultRetry), 内层 executeStageWithRetry 必须
@@ -506,7 +752,151 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 	} else {
 		res.Status = graph.NodeStatusFailed
 	}
+	// 动态展开: **只有图显式授予了 Expand 才解析**产出里的子图 (design/01 §4.2)。
+	// 解析失败一律当"没给子图"处理 (fail-open): 展开是增量能力, 解析不出来不该把
+	// 一个本来成功的分解阶段判失败; 而引擎侧的边界闸会把非法子图拒掉并留痕。
+	if node.Expand != nil && res.Status == graph.NodeStatusCompleted {
+		if ex := parseStageExpansion(node.ID, node.Agent.Role, sr.Output); ex != nil {
+			res.Expansion = ex
+			logging.Event(ctx, "graph.expand.parsed", "node", node.ID, "nodes", fmt.Sprintf("%d", len(ex.Nodes)))
+		}
+	}
 	return res
+}
+
+// orNodeID 归因名兜底: 引擎未给 NodeRef (例如被单元测试直接调用) 时退回节点 ID。
+func orNodeID(ref, id string) string {
+	if strings.TrimSpace(ref) == "" {
+		return id
+	}
+	return ref
+}
+
+// formatShardsForPrompt 把分片产出排成可读的聚合输入 (按分片序, 带状态)。
+func formatShardsForPrompt(shards []graph.ShardResult) string {
+	var b strings.Builder
+	for _, s := range shards {
+		if s.Status != graph.NodeStatusCompleted {
+			continue // 失败分片不进 prompt: 半截产出只会污染聚合
+		}
+		fmt.Fprintf(&b, "### 分片 %d (%s)\n%s\n\n", s.Index+1, s.NodeID, s.Output)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// ---------------------------------------------------------------------------
+// 动态展开产出解析 (design/01 §4.2: 收编 GoalTree / WBS / swarm 三套分解)
+// ---------------------------------------------------------------------------
+
+// stageSubtask 分解器友好形式的一条子任务。
+//
+// 字段别名刻意对齐**现有 WBS 产出格式** (orchestrator.go wbsJSONTask:
+// tasks[].id/title/role/dependsOn, id 可以是数字) —— 于是既有 planner prompt
+// 一个字都不用改, 它的输出就能被展开器吃下, 这才叫"收编三套分解器"而不是
+// "再发明第四种格式"。id 复用 flexibleWBSID 以容忍数字 ID。
+type stageSubtask struct {
+	ID             flexibleWBSID   `json:"id"`
+	Role           string          `json:"role,omitempty"`
+	Prompt         string          `json:"prompt,omitempty"`
+	Task           string          `json:"task,omitempty"`  // prompt 的别名
+	Title          string          `json:"title,omitempty"` // WBS 用 title
+	DependsOn      []flexibleWBSID `json:"depends_on,omitempty"`
+	DependsOnCamel []flexibleWBSID `json:"dependsOn,omitempty"` // WBS 用 dependsOn
+}
+
+// deps 合并两种依赖字段写法。
+func (s stageSubtask) deps() []flexibleWBSID {
+	if len(s.DependsOn) > 0 {
+		return s.DependsOn
+	}
+	return s.DependsOnCamel
+}
+
+// promptText 取任务描述 (prompt / task / title 三种写法)。
+func (s stageSubtask) promptText() string {
+	for _, v := range []string{s.Prompt, s.Task, s.Title} {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// stageExpansionPayload 阶段产出里可被接受的两种子图形态。
+type stageExpansionPayload struct {
+	// 原生形态: 与 graph.Expansion 同构 (给能直接产 GraphSpec 的调用方)
+	Nodes []graph.NodeSpec `json:"nodes,omitempty"`
+	Edges []graph.EdgeSpec `json:"edges,omitempty"`
+	// 友好形态: 子任务列表 (三套分解器的共同形状)
+	Subtasks []stageSubtask `json:"subtasks,omitempty"`
+	Tasks    []stageSubtask `json:"tasks,omitempty"` // subtasks 的别名
+}
+
+// parseStageExpansion 从阶段产出里抽取要追加的子图; 抽不到返回 nil。
+//
+// 只认**平衡的 JSON 对象**候选 (复用 orchestrator.go 的字符串感知扫描器,
+// 它能正确跳过字符串里的括号 —— 这正是 REPORT.md 里带 ```json 围栏时踩过的坑),
+// 逐个尝试解析, 取第一个能产出节点的。
+func parseStageExpansion(parentID, parentRole, output string) *graph.Expansion {
+	for _, cand := range extractJSONObjectCandidates(output) {
+		var p stageExpansionPayload
+		if json.Unmarshal([]byte(cand), &p) != nil {
+			continue
+		}
+		if len(p.Nodes) > 0 {
+			return &graph.Expansion{Nodes: p.Nodes, Edges: p.Edges}
+		}
+		subs := p.Subtasks
+		if len(subs) == 0 {
+			subs = p.Tasks
+		}
+		if len(subs) == 0 {
+			continue
+		}
+		ex := &graph.Expansion{}
+		ids := map[string]bool{}
+		for _, s := range subs {
+			id := strings.TrimSpace(string(s.ID))
+			if id == "" || ids[id] {
+				continue
+			}
+			ids[id] = true
+			role := strings.TrimSpace(s.Role)
+			if role == "" {
+				role = parentRole // 未给角色: 沿用父节点角色 (最保守的选择)
+			}
+			ex.Nodes = append(ex.Nodes, graph.NodeSpec{
+				ID:    id,
+				Kind:  graph.NodeKindAgent,
+				Agent: graph.AgentSpec{Role: role, Prompt: s.promptText()},
+			})
+		}
+		if len(ex.Nodes) == 0 {
+			continue
+		}
+		for _, s := range subs {
+			id := strings.TrimSpace(string(s.ID))
+			if !ids[id] {
+				continue
+			}
+			deps := 0
+			for _, raw := range s.deps() {
+				d := strings.TrimSpace(string(raw))
+				if d == "" || d == id || !ids[d] {
+					continue // 只认兄弟依赖: 指向图外节点的依赖会被引擎的边界闸整段拒掉
+				}
+				ex.Edges = append(ex.Edges, graph.EdgeSpec{From: d, To: id})
+				deps++
+			}
+			if deps == 0 {
+				// 无依赖的子任务直接挂在父节点下 —— 必须有这条边, 否则它是入度 0 的
+				// 悬空节点, 会脱离父节点抢先执行 (引擎的可达性闸也会整段拒绝)。
+				ex.Edges = append(ex.Edges, graph.EdgeSpec{From: parentID, To: id})
+			}
+		}
+		return ex
+	}
+	return nil
 }
 
 // executorForNode 需要覆盖 MaxTurns 时返回一个包了 factory 的浅拷贝 executor。
@@ -687,6 +1077,7 @@ func (h *teamGraphHooks) nodeStarted(ctx context.Context, ev graph.HookEvent) {
 		Status:    TaskRunning,
 		StartedAt: now,
 	}
+	h.trackDynamic(ev.NodeID)
 	h.mu.Unlock()
 
 	h.flush()
@@ -715,6 +1106,7 @@ func (h *teamGraphHooks) nodeFinished(ctx context.Context, ev graph.HookEvent) {
 	if st, ok := h.start[ev.NodeID]; ok {
 		sr.StartedAt = st
 	}
+	h.trackDynamic(ev.NodeID)
 	// 恒填耗时 (哪怕 0ms): 阶段记录里 Duration 为空会被下游当成"没跑过"。
 	sr.Duration = (time.Duration(durMs) * time.Millisecond).String()
 	h.byID[ev.NodeID] = sr
@@ -731,6 +1123,24 @@ func (h *teamGraphHooks) nodeFinished(ctx context.Context, ev graph.HookEvent) {
 		"role", sr.Role, "status", string(sr.Status), "attempts", fmt.Sprintf("%d", attempts),
 		"iterations", fmt.Sprintf("%d", iterations), "duration_ms", fmt.Sprintf("%d", durMs),
 		"output_len", fmt.Sprintf("%d", len(sr.Output)), "error", sr.Error)
+}
+
+// trackDynamic 把运行期才出现的节点 ID 追加进刷盘序 (调用方须持 h.mu)。
+//
+// 声明期拿不到这些 ID: map 分片 (<阶段>#<序号>)、loop-group 组内成员
+// (<组>#it<轮次>/<成员>)、动态展开产物 (<父>/<子>) 都是引擎在运行中合成的。
+// 不追踪的后果是 flush 按 h.order 过滤时把它们整个丢掉 —— dashboard 上一个 8 分片
+// 的扇出会显示成"什么都没跑", 与图侧 hook 已通电的初衷相违。
+func (h *teamGraphHooks) trackDynamic(id string) {
+	if _, known := h.roles[id]; known {
+		return
+	}
+	for _, existing := range h.order {
+		if existing == id {
+			return
+		}
+	}
+	h.order = append(h.order, id)
 }
 
 // flush 把当前节点快照按声明序增量写回 team (对齐 coordinator.flushTeamStages)。
@@ -873,6 +1283,8 @@ func (we *WorkflowExecutor) executeGraph(ctx context.Context, wf *WorkflowDef, o
 		// 并发上限与 pipeline 侧对齐: effectiveParallel 会按 API 流控状态动态收敛
 		// (图引擎自己的默认是硬编码 4)。覆盖表声明的 Policies.MaxParallel 优先于此。
 		MaxParallel: we.effectiveParallel(),
+		// 拦截器链 (design/01 §4.10)。此前生产恒空链 = 切面建成未通电。
+		Interceptors: graphInterceptors(we, team, spec),
 	}
 	runID := trace.From(ctx).RunID
 	if runID == "" {
