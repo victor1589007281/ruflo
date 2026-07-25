@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/agent"
 )
 
 // =====================================================================
@@ -397,7 +399,16 @@ func (s *Server) handleTeamBlackboardWrite(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	value := valueStr
-	// 同时排队一条 action, 方便主进程订阅黑板变更触发下一步 (pull 模式)
+	// 同时排队一条 action, 让消费方 (ActionSink) 知道黑板被外部改过 (pull 模式)。
+	//
+	// 两个诚实的限制, 写在这里免得下一个人误判:
+	//  ① 本接口直接改 blackboard.json 磁盘文件, **绕过了运行中团队的内存黑板**
+	//     (pkg/agent.Blackboard 只在构造时 load 一次, 之后靠 debounce 覆盖写盘)。
+	//     所以运行中的团队看不到这次修改, 甚至可能把它覆盖掉。真正的推送要走
+	//     agent.Board.Watch —— 那需要 dashboard 能拿到进程内的 *Blackboard 实例,
+	//     属于 design/01 M4 的接线, 不在本轮范围。
+	//  ② 这条动作只有在注入了 ActionExecutor 的进程里才会被真正处理; 否则消费方
+	//     会把它标成 unsupported (而不是假装 done)。
 	queueDir := filepath.Join(s.cfg.StateDir, ".dashboard", "actions")
 	_ = os.MkdirAll(queueDir, 0o755)
 	actionID := fmt.Sprintf("blackboard-%s-%d", name, time.Now().UnixMilli())
@@ -417,12 +428,23 @@ func (s *Server) handleTeamBlackboardWrite(w http.ResponseWriter, r *http.Reques
 	ab, _ := json.MarshalIndent(rec, "", "  ")
 	_ = os.WriteFile(filepath.Join(queueDir, actionID+".json"), ab, 0o644)
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	status, taskID := drainQueuedAction(r.Context(), queueDir, actionID)
+	resp := map[string]interface{}{
 		"ok":       true,
 		"path":     bbPath,
 		"actionId": actionID,
 		"entries":  len(entries),
-	})
+		// consumed 只在真被处理时为真 (unsupported/failed 不算), 详见 handleAction 同处注释。
+		"consumed": status == agent.ActionStatusAccepted || status == agent.ActionStatusDone,
+		"status":   firstNonEmpty(status, agent.ActionStatusPending),
+	}
+	if taskID != "" {
+		resp["taskId"] = taskID
+	}
+	if currentActionSink() == nil {
+		resp["note"] = "黑板已落盘; 本进程未注册动作消费方, 该通知不会被自动处理"
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // =====================================================================
@@ -442,8 +464,8 @@ type llmModelStats struct {
 	CacheRead    int64   `json:"cacheReadTokens"`
 	CacheCreate  int64   `json:"cacheCreationTokens"`
 	SuccessRate  float64 `json:"successRate"`
-	SuccessCost  float64 `json:"successCostSec"`  // 成功调用总耗时
-	ErrorCost    float64 `json:"errorCostSec"`    // 失败调用总耗时
+	SuccessCost  float64 `json:"successCostSec"` // 成功调用总耗时
+	ErrorCost    float64 `json:"errorCostSec"`   // 失败调用总耗时
 	Retries      int     `json:"retries"`
 }
 
@@ -466,12 +488,12 @@ type llmSourceStats struct {
 }
 
 type llmTimePoint struct {
-	Timestamp    time.Time `json:"ts"`
-	Calls        int       `json:"calls"`
-	Success      int       `json:"success"`
-	Errors       int       `json:"errors"`
-	TotalTokens  int64     `json:"totalTokens"`
-	AvgDuration  float64   `json:"avgDuration"`
+	Timestamp   time.Time `json:"ts"`
+	Calls       int       `json:"calls"`
+	Success     int       `json:"success"`
+	Errors      int       `json:"errors"`
+	TotalTokens int64     `json:"totalTokens"`
+	AvgDuration float64   `json:"avgDuration"`
 }
 
 // llmCacheStats 提示词缓存 (prompt cache) 效果统计。
@@ -482,15 +504,15 @@ type llmTimePoint struct {
 //   - CallsWithCache: 该窗口内至少命中过一次缓存的调用数
 //   - CacheCoverage: CallsWithCache / TotalCalls 覆盖率
 type llmCacheStats struct {
-	HitRate           float64            `json:"hitRate"`
-	SavedTokens       int64              `json:"savedTokens"`
-	CacheReadTokens   int64              `json:"cacheReadTokens"`
-	CacheCreateTokens int64              `json:"cacheCreateTokens"`
-	InputTokens       int64              `json:"inputTokens"`
-	CallsWithCache    int                `json:"callsWithCache"`
-	CacheCoverage     float64            `json:"cacheCoverage"`
-	ByModel           []llmCacheByModel  `json:"byModel"`
-	Timeseries        []llmCacheTimePt   `json:"timeseries"`
+	HitRate           float64           `json:"hitRate"`
+	SavedTokens       int64             `json:"savedTokens"`
+	CacheReadTokens   int64             `json:"cacheReadTokens"`
+	CacheCreateTokens int64             `json:"cacheCreateTokens"`
+	InputTokens       int64             `json:"inputTokens"`
+	CallsWithCache    int               `json:"callsWithCache"`
+	CacheCoverage     float64           `json:"cacheCoverage"`
+	ByModel           []llmCacheByModel `json:"byModel"`
+	Timeseries        []llmCacheTimePt  `json:"timeseries"`
 }
 
 type llmCacheByModel struct {
@@ -512,26 +534,26 @@ type llmCacheTimePt struct {
 }
 
 type llmStatsResp struct {
-	Source       string            `json:"source"`     // metrics/llm.jsonl 路径
-	Window       string            `json:"window"`
-	RawEvents    int               `json:"rawEvents"`  // 原始事件数 (调试用)
-	TotalCalls   int               `json:"totalCalls"`
-	Success      int               `json:"success"`
-	Errors       int               `json:"errors"`
-	SuccessRate  float64           `json:"successRate"`
-	TotalRetries int               `json:"totalRetries"`
-	InputTokens  int64             `json:"inputTokens"`
-	OutputTokens int64             `json:"outputTokens"`
-	CacheRead    int64             `json:"cacheReadTokens"`
-	CacheCreate  int64             `json:"cacheCreationTokens"`
-	AvgDuration  float64           `json:"avgDuration"`
-	P95Duration  float64           `json:"p95Duration"`
-	ByModel      []llmModelStats   `json:"byModel"`
-	BySource     []llmSourceStats  `json:"bySource"`
-	Errors5xx    []llmErrorBucket  `json:"errorBuckets"`
-	Timeseries   []llmTimePoint    `json:"timeseries"`
-	Alerts       []string          `json:"alerts,omitempty"`
-	Cache        llmCacheStats     `json:"cache"`
+	Source       string           `json:"source"` // metrics/llm.jsonl 路径
+	Window       string           `json:"window"`
+	RawEvents    int              `json:"rawEvents"` // 原始事件数 (调试用)
+	TotalCalls   int              `json:"totalCalls"`
+	Success      int              `json:"success"`
+	Errors       int              `json:"errors"`
+	SuccessRate  float64          `json:"successRate"`
+	TotalRetries int              `json:"totalRetries"`
+	InputTokens  int64            `json:"inputTokens"`
+	OutputTokens int64            `json:"outputTokens"`
+	CacheRead    int64            `json:"cacheReadTokens"`
+	CacheCreate  int64            `json:"cacheCreationTokens"`
+	AvgDuration  float64          `json:"avgDuration"`
+	P95Duration  float64          `json:"p95Duration"`
+	ByModel      []llmModelStats  `json:"byModel"`
+	BySource     []llmSourceStats `json:"bySource"`
+	Errors5xx    []llmErrorBucket `json:"errorBuckets"`
+	Timeseries   []llmTimePoint   `json:"timeseries"`
+	Alerts       []string         `json:"alerts,omitempty"`
+	Cache        llmCacheStats    `json:"cache"`
 }
 
 func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
@@ -562,17 +584,17 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 	}
 	// 按 (ts.Second, model) 关联同一次调用的多条指标 (我们同批写入)
 	type callAgg struct {
-		model      string
-		status     string
-		errKind    string
-		source     string
-		duration   float64
-		input      int64
-		output     int64
-		cacheRead  int64
+		model       string
+		status      string
+		errKind     string
+		source      string
+		duration    float64
+		input       int64
+		output      int64
+		cacheRead   int64
 		cacheCreate int64
-		retries    int
-		ts         time.Time
+		retries     int
+		ts          time.Time
 	}
 	calls := map[callKey]*callAgg{}
 	bucketForCall := func(e MetricEventDTO) *callAgg {

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
@@ -1035,7 +1036,9 @@ func computeTrend(points []timePointDTO) (trend string, slope float64) {
 //    kind: cron | team
 //    cron actions: enable | disable | trigger | remove
 //    team actions: stop | restart | delete
-// 由于 dashboard 只读原则: 动作只对磁盘 JSON 做标记, 真正调度由 claude-go 主进程消费 action queue
+// 由于 dashboard 只读原则: 动作只对磁盘 JSON 做标记, 真正调度由消费方处理。
+// 消费方 = 注入的 ActionSink (通常是 agent.FileQueueTaskService, 见 SetActionSink);
+// 未注入时本接口如实回报"不会被自动执行", 不再谎称"等待主进程消费"。
 // =====================================================================
 
 type actionResp struct {
@@ -1044,6 +1047,69 @@ type actionResp struct {
 	Message  string `json:"message,omitempty"`
 	Hint     string `json:"hint,omitempty"`
 	ActionID string `json:"actionId,omitempty"`
+	// Consumed/TaskID/Status 是消费方回填的真凭实据 (design/01 §4.12)。
+	// 历史上本接口一律回 "动作已排队, 等待 claude-go 主进程消费", 而全仓根本没有
+	// 消费方 —— 那是假承诺。现在: 有消费方就回真实结果, 没有就明说没有。
+	Consumed bool   `json:"consumed"`
+	TaskID   string `json:"taskId,omitempty"`
+	Status   string `json:"status,omitempty"` // accepted | done | failed | unsupported | pending
+}
+
+// ActionSink 动作队列的消费方 (由主进程注入, 通常是 *agent.FileQueueTaskService)。
+//
+// 为什么用包级注入而不是加 Config 字段: dashboard.Config 在 server.go, 本轮不改那个文件;
+// 而且消费方是"进程级唯一"的 (同一个 stateDir 只应有一个消费者认领动作), 包级变量语义正好。
+type ActionSink interface {
+	ConsumeActions(ctx context.Context) (agent.ActionConsumeStats, error)
+}
+
+var (
+	actionSinkMu sync.RWMutex
+	actionSink   ActionSink
+)
+
+// SetActionSink 注册/注销 (传 nil) 动作队列消费方。
+// 接线点: 主进程 (cmd/claude-go 或 pkg/feishu 启动 dashboard 处) 构造
+// agent.NewFileQueueTaskService({ActionsDir: <stateDir>/.dashboard/actions, Runner: agent.NewTeamRunner(mgr)})
+// 后调用本函数。未注册时接口如实回报"本进程无消费方"。
+func SetActionSink(s ActionSink) {
+	actionSinkMu.Lock()
+	actionSink = s
+	actionSinkMu.Unlock()
+}
+
+func currentActionSink() ActionSink {
+	actionSinkMu.RLock()
+	defer actionSinkMu.RUnlock()
+	return actionSink
+}
+
+// drainQueuedAction 让消费方立刻消费一轮, 并回读该动作文件拿到真实结果。
+//
+// 为什么回读文件而不是信 ConsumeActions 的统计: 统计是聚合值, 同一轮可能消费了别人
+// 排队的动作。只有动作文件里的 status/taskId 才是"这一条"的结论。
+func drainQueuedAction(ctx context.Context, queueDir, actionID string) (status, taskID string) {
+	sink := currentActionSink()
+	if sink == nil {
+		return "", ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if _, err := sink.ConsumeActions(cctx); err != nil {
+		return "", ""
+	}
+	b, err := os.ReadFile(filepath.Join(queueDir, actionID+".json"))
+	if err != nil {
+		return "", ""
+	}
+	var rec struct {
+		Status string `json:"status"`
+		TaskID string `json:"taskId"`
+	}
+	if json.Unmarshal(b, &rec) != nil {
+		return "", ""
+	}
+	return rec.Status, rec.TaskID
 }
 
 func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
@@ -1229,12 +1295,61 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			hint = "无主进程消费, 请通过飞书发送 /team stop " + target
 		}
 	}
+	// 已在本函数内直接执行完的动作 (cron 开关/增删改等): 把队列记录标成 done,
+	// 否则它会永远以 pending 躺在目录里, 还会被消费方当成待办再处理一遍。
+	if immediate != "" {
+		rec["status"] = agent.ActionStatusDone
+		rec["consumedAt"] = time.Now().Format(time.RFC3339)
+		rec["result"] = immediate
+		if nb, err := json.MarshalIndent(rec, "", "  "); err == nil {
+			_ = os.WriteFile(fpath, nb, 0o644)
+		}
+	}
+
+	// 交给消费方 (若已注入) 并回读真实结果。
+	status, taskID := drainQueuedAction(r.Context(), queueDir, actionID)
+	// consumed 只在动作**真被处理**时为真: unsupported/failed 是"看过了但没做成",
+	// 谎报 consumed=true 会让前端以为已经生效, 那就又变成一次假承诺。
+	consumed := status == agent.ActionStatusAccepted || status == agent.ActionStatusDone
+	stillQueued := status == "" || status == agent.ActionStatusPending
+
+	// 上面各 case 里的 hint 多是"无主进程消费, 可手动运行 ..."。动作真被消费掉之后
+	// 这类提示就是错的 (会让用户以为还得自己敲命令), 直接撤掉。
+	if consumed && strings.Contains(hint, "主进程消费") {
+		hint = ""
+	}
+
+	msg := immediate
+	if msg == "" {
+		switch {
+		case status == agent.ActionStatusAccepted && taskID != "":
+			msg = fmt.Sprintf("动作已被 TaskService 消费, 任务 %s 已提交", taskID)
+		case status == agent.ActionStatusDone:
+			msg = "动作已被消费方执行"
+		case status == agent.ActionStatusFailed:
+			msg = "消费方执行失败, 详见动作记录 " + actionID + ".json"
+		case status == agent.ActionStatusUnsupported:
+			msg = "动作已落盘, 但消费方没有执行该动作的能力 (需注入 ActionExecutor)"
+		case currentActionSink() == nil:
+			// 诚实版: 本进程没有消费方, 记录只是落盘, 不会自动执行。
+			msg = "动作已落盘 (.claude-go/.dashboard/actions/), 但本进程未注册消费方 —— 不会被自动执行"
+			if hint == "" {
+				hint = "接线: 主进程调用 dashboard.SetActionSink(agent.NewFileQueueTaskService(...)) 后本动作即可被消费"
+			}
+		default:
+			msg = "动作已排队, 等待消费方处理 (.claude-go/.dashboard/actions/)"
+		}
+	}
+
 	writeJSON(w, http.StatusOK, actionResp{
 		OK:       true,
-		Queued:   immediate == "",
-		Message:  firstNonEmpty(immediate, "动作已排队, 等待 claude-go 主进程消费 (.claude-go/.dashboard/actions/)"),
+		Queued:   immediate == "" && stillQueued,
+		Message:  msg,
 		Hint:     hint,
 		ActionID: actionID,
+		Consumed: consumed || immediate != "",
+		TaskID:   taskID,
+		Status:   firstNonEmpty(status, agent.ActionStatusPending),
 	})
 }
 

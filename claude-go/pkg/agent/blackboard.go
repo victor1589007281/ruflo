@@ -22,8 +22,88 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// Board 通信机制抽象 (design/01 §4.11) — 收编两份黑板实现的单一接口。
+//
+// 为什么用 Board 而不叫 Blackboard: 同包里 Blackboard 已是结构体名 (本文件默认
+// 实现), Go 不允许同名。接口方法名也就地对齐既有实现 (SnapshotForRole /
+// HandoffContext 语义), 而不是照抄设计稿里的 Snapshot(role,budget)/Handoff(from,to)
+// —— 后者会与既有 Snapshot() 冲突, 逼所有调用方改签名, 违背"不破坏现有调用方"。
+//
+// 三个实现方向:
+//   - *Blackboard (本文件): 文件后端 + debounce 落盘, 生产默认;
+//   - pkg/orchestrator.Blackboard: orchestrated 模式在用, design/01 M4 退役;
+//     它已有 Put/Snapshot/Watch, 退役前可用 BoardFuncs 适配进本接口 (见下);
+//   - 分布式后端 (design/02): 换实现不动调用方。
+type Board interface {
+	// Put 写入/更新一条黑板条目 (同 key 覆盖)。
+	Put(e BoardEntry) error
+	// Read 读取指定 key 的值。
+	Read(key string) (string, bool)
+	// SnapshotForRole 为特定角色生成受预算约束的文本快照 (注入 system prompt)。
+	SnapshotForRole(role string, budget int) string
+	// Handoff 构建阶段交接上下文 (已完成阶段 → 下一个角色)。
+	Handoff(completedStages []string, nextRole string) string
+	// Watch 订阅 key 前缀匹配的变更事件 (MetaGPT 消息池风格的发布订阅)。
+	// 无消费者/消费过慢时事件被丢弃, 绝不阻塞写入方 (fail-open)。
+	Watch(prefix string) <-chan BoardEntry
+}
+
+// BoardFuncs 用函数字段把任意黑板实现适配成 Board。
+//
+// 存在的理由: pkg/orchestrator.Blackboard 仍在生产 orchestrated 路径上跑, 本轮不删;
+// 它的方法名/签名与这里不同 (Put(key,value,author,category) / Snapshot() map / Watch
+// 返回 ChangeEvent)。直接 import 那个包会把 agent→orchestrator 的依赖钉死, 反而给
+// M4 退役添阻。用函数字段适配则零依赖: 接线方在自己那边写 4 个闭包即可。
+// 任一字段为 nil 时对应方法退化为零值 (fail-open, 通信降级不该打断交付)。
+type BoardFuncs struct {
+	PutFn      func(e BoardEntry) error
+	ReadFn     func(key string) (string, bool)
+	SnapshotFn func(role string, budget int) string
+	HandoffFn  func(completedStages []string, nextRole string) string
+	WatchFn    func(prefix string) <-chan BoardEntry
+}
+
+var _ Board = BoardFuncs{}
+
+func (f BoardFuncs) Put(e BoardEntry) error {
+	if f.PutFn == nil {
+		return nil
+	}
+	return f.PutFn(e)
+}
+
+func (f BoardFuncs) Read(key string) (string, bool) {
+	if f.ReadFn == nil {
+		return "", false
+	}
+	return f.ReadFn(key)
+}
+
+func (f BoardFuncs) SnapshotForRole(role string, budget int) string {
+	if f.SnapshotFn == nil {
+		return ""
+	}
+	return f.SnapshotFn(role, budget)
+}
+
+func (f BoardFuncs) Handoff(completedStages []string, nextRole string) string {
+	if f.HandoffFn == nil {
+		return ""
+	}
+	return f.HandoffFn(completedStages, nextRole)
+}
+
+func (f BoardFuncs) Watch(prefix string) <-chan BoardEntry {
+	if f.WatchFn == nil {
+		ch := make(chan BoardEntry) // 永不产出的空通道: 订阅方 range 会一直阻塞在读上, 但不会 panic
+		return ch
+	}
+	return f.WatchFn(prefix)
+}
 
 // Blackboard 共享黑板 — Agent 间接通信的中枢。
 type Blackboard struct {
@@ -34,7 +114,17 @@ type Blackboard struct {
 	dirty     bool // 延迟写标记
 	flushOnce sync.Once
 	flushCh   chan struct{} // 触发异步持久化
+
+	// watchers 前缀 → 订阅通道 (design/01 §4.11 新增的发布订阅)。
+	// 受 mu 保护: 派发在写路径的临界区内做, 但全部是非阻塞 send,
+	// 因此不会把慢消费者的延迟传染给写入方。
+	watchers map[string][]chan BoardEntry
+	// watchDrops 因通道满而丢弃的事件数。参照 tracestore.writeErr 的风格:
+	// 降级必须可观测, 但绝不反压写入方 (黑板写入在交付主路径上)。
+	watchDrops atomic.Int64
 }
+
+var _ Board = (*Blackboard)(nil)
 
 // BoardEntry 黑板上的一条记录。
 type BoardEntry struct {
@@ -52,6 +142,7 @@ func NewBlackboard(teamName, dataDir string) *Blackboard {
 		entries:  make([]*BoardEntry, 0),
 		dataDir:  dataDir,
 		flushCh:  make(chan struct{}, 1),
+		watchers: make(map[string][]chan BoardEntry),
 	}
 	bb.load()
 	bb.startFlusher()
@@ -90,23 +181,113 @@ func (bb *Blackboard) startFlusher() {
 func (bb *Blackboard) Write(key, value, author, category string) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
-
-	for _, e := range bb.entries {
-		if e.Key == key {
-			e.Value = value
-			e.Author = author
-			e.Category = category
-			e.Timestamp = time.Now()
-			bb.markDirty()
-			return
-		}
-	}
-
-	bb.entries = append(bb.entries, &BoardEntry{
+	bb.writeLocked(BoardEntry{
 		Key: key, Value: value, Author: author,
 		Category: category, Timestamp: time.Now(),
 	})
+}
+
+// Put 实现 Board 接口: 写入一条条目。Timestamp 为零值时取当前时间。
+// key 为空直接报错 —— 空 key 会在覆盖查找里匹配到任意未命名条目, 是数据污染。
+func (bb *Blackboard) Put(e BoardEntry) error {
+	if strings.TrimSpace(e.Key) == "" {
+		return fmt.Errorf("blackboard: 条目 key 不能为空")
+	}
+	if e.Timestamp.IsZero() {
+		e.Timestamp = time.Now()
+	}
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	bb.writeLocked(e)
+	return nil
+}
+
+// writeLocked 写入的唯一实现 (调用方须持有 bb.mu 写锁)。
+// 覆盖与新增两条路径都在这里派发 watch 事件, 避免将来漏派发。
+func (bb *Blackboard) writeLocked(e BoardEntry) {
+	for _, old := range bb.entries {
+		if old.Key == e.Key {
+			old.Value = e.Value
+			old.Author = e.Author
+			old.Category = e.Category
+			old.Timestamp = e.Timestamp
+			bb.markDirty()
+			bb.notifyLocked(*old)
+			return
+		}
+	}
+	entry := e
+	bb.entries = append(bb.entries, &entry)
 	bb.markDirty()
+	bb.notifyLocked(entry)
+}
+
+// notifyLocked 向匹配前缀的订阅者派发变更事件 (调用方须持有 bb.mu 写锁)。
+//
+// 关键纪律: send 一律带 default 分支。黑板写入在交付主路径上, 若某个订阅者
+// (dashboard SSE、飞书播报) 卡住, 绝不允许把整个团队执行拖死 —— 宁可丢事件并
+// 计数 (WatchDrops), 事后可观测。
+func (bb *Blackboard) notifyLocked(e BoardEntry) {
+	if len(bb.watchers) == 0 {
+		return
+	}
+	for prefix, chans := range bb.watchers {
+		if prefix != "" && !strings.HasPrefix(e.Key, prefix) {
+			continue
+		}
+		for _, ch := range chans {
+			select {
+			case ch <- e:
+			default:
+				bb.watchDrops.Add(1)
+			}
+		}
+	}
+}
+
+// watchBuffer 每个订阅通道的缓冲深度。与 pkg/orchestrator/blackboard.go:210 保持一致,
+// 便于 M4 退役那份实现时行为无感知变化。
+const watchBuffer = 64
+
+// Watch 订阅 key 前缀匹配的黑板变更 (prefix 为空 = 订阅全部)。
+// 通道缓冲 watchBuffer 条, 消费过慢时丢弃新事件而不阻塞写入方。
+// 订阅方用完应调用 StopWatch 归还通道, 否则该通道会一直参与派发 (仅浪费一次 select)。
+func (bb *Blackboard) Watch(prefix string) <-chan BoardEntry {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	if bb.watchers == nil {
+		bb.watchers = make(map[string][]chan BoardEntry)
+	}
+	ch := make(chan BoardEntry, watchBuffer)
+	bb.watchers[prefix] = append(bb.watchers[prefix], ch)
+	return ch
+}
+
+// StopWatch 取消订阅并关闭通道。
+// 先从派发表摘除再 close, 且全程持写锁 —— 保证 notifyLocked 绝不会向已关闭通道 send。
+func (bb *Blackboard) StopWatch(prefix string, ch <-chan BoardEntry) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	chans := bb.watchers[prefix]
+	for i, c := range chans {
+		if (<-chan BoardEntry)(c) != ch {
+			continue
+		}
+		bb.watchers[prefix] = append(chans[:i:i], chans[i+1:]...)
+		if len(bb.watchers[prefix]) == 0 {
+			delete(bb.watchers, prefix)
+		}
+		close(c)
+		return
+	}
+}
+
+// WatchDrops 返回因订阅通道满而丢弃的事件数 (可观测的降级证据)。
+func (bb *Blackboard) WatchDrops() int64 { return bb.watchDrops.Load() }
+
+// Handoff 实现 Board 接口, 等价于 HandoffContext (保留旧名给现有调用方)。
+func (bb *Blackboard) Handoff(completedStages []string, nextRole string) string {
+	return bb.HandoffContext(completedStages, nextRole)
 }
 
 // Read 读取指定 key 的值。
