@@ -50,7 +50,12 @@ type fileReadInput struct {
 // FileReadTool 文件读取工具
 type FileReadTool struct {
 	mu             sync.Mutex
-	lastReadHashes map[string]string // path -> content hash (不含内容，仅去重)
+	// lastReadHashes: "path|offset|limit" -> content hash (不含内容，仅去重)。
+	// 键必须含 offset/limit：同一文件的"整读"与"读第 2-3 行"是两个不同的
+	// 请求，内容 hash 却相同。早期只用 path 作键，导致先整读、再带
+	// offset/limit 重读同一文件时命中去重，返回 "<unchanged since last read>"
+	// 而不是调用方要的那几行——agent 想回看某个片段就会拿到一句无用的提示。
+	lastReadHashes map[string]string
 }
 
 func NewFileReadTool() *FileReadTool {
@@ -213,9 +218,10 @@ func (t *FileReadTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 
 	// 优化2: Read 工具 hash 缓存 — 只存 hash，不含内容
 	currentHash := hashBytes(data)
+	viewKey := fmt.Sprintf("%s|%d|%d", filePath, in.Offset, in.Limit)
 	t.mu.Lock()
-	lastHash, exists := t.lastReadHashes[filePath]
-	t.lastReadHashes[filePath] = currentHash
+	lastHash, exists := t.lastReadHashes[viewKey]
+	t.lastReadHashes[viewKey] = currentHash
 	t.mu.Unlock()
 	if exists && lastHash == currentHash {
 		return &tool.ToolResult{Content: fmt.Sprintf("<file %s unchanged since last read (hash: %s)>", filePath, currentHash[:8])}, nil
