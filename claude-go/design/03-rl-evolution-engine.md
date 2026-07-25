@@ -54,7 +54,7 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 | 技能 | AutoCreator | MaybeCreate/ImproveSkill 写 SKILL.md+Reload | `autocreate.go:42,108` |
 | 知识 | wiki 引擎 | LLM-Wiki 三层概念库（独立，不回流） | `wiki/engine.go` |
 
-### 1.2 三处关键开环（本方案第一优先修复）　　**[🟠 ①✅ / ②半 / ③仅团队路径]**
+### 1.2 三处关键开环（本方案第一优先修复）　　**[✅ 三处均已闭环]**
 
 > **实测**：① headless 实例化进化 ✅（`cmd/claude-go/main.go:796,808`）。② **只闭一半**：`MaybeCreate` 已接线（`pkg/agent/teams.go:877`），但 **`ImproveSkill` 生产调用点仍为 0**。③ **只闭团队路径**：CLI 单轮会话/查询路径无 AfterQuery（飞书有 `pkg/feishu/session.go:863`）⇒ CLI 只有「跑团队才做梦」。
 
@@ -62,7 +62,11 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 2. **技能自进化是死代码**：`AutoCreator` 仅构造（`bot.go:644`），全仓库对 `MaybeCreate`/`ImproveSkill` 的调用点为 **0**。
 3. **Dreaming headless 只建不触发**：`AfterQuery`/`RecordSession` 仅飞书路径调用（`feishu/session.go:770`、`bot.go:183`）；CLI 创建 dreamer 只为取 MemoryDir（`main.go:2547`）。
 
-### 1.3 轨迹不可对齐（RL 的数据地基缺失）　　**[🟠 四元组在 / llm.jsonl 无 run_id]**
+### 1.3 轨迹不可对齐（RL 的数据地基缺失）　　**[🟠 四元组已端到端通电 / llm.jsonl 仍无 run_id]**
+
+> ✅ **trace 四元组已端到端通电（2026-07-25）**：`{RunID,NodeID,TurnID,CallID}` 经 `pkg/api/trace.go` 落出站请求头，`pkg/llmgw/server.go` 读入 `access.jsonl`。改造前 llmgw **早就在读 `X-CG-Run-ID`，但全仓无客户端发它** ⇒ 字段恒空——典型的"两头都写了、中间没接"。
+>
+> ⚠️ **`llm.jsonl` 仍无 run_id**：那是 `LLMCallRecord` 的落盘格式，改它会动 Grafana 与 `/api/llm/stats` 的既有契约，故刻意未动。要按 run_id 对账**本地**日志需单独一轮。
 
 > **实测**：四元组注入链真实（`pkg/trace` + `pkg/agent/teams.go:653` + `pkg/engine/engine.go:760` + `pkg/api/client.go:119`）。但 **E0 验收项「llm.jsonl 可按 run_id 聚合」未达成**：`pkg/metrics/llm_collector.go:108-135` 构造 labels 时四元组一个都没进。⚠️ 另有**三种 run_id 格式并存**：`trace.NewRunID()`（仅图路径）、`pkg/agent/teams.go:653` 手拼、指标用裸 `team.Name` ⇒ 即便在有 run_id 的 sink 之间也 join 不上。断点：`pkg/agent/swarm.go:770-786` 的 Trajectory 不含 RunID；`X-CG-Run-ID` 有读无写。
 
@@ -71,7 +75,7 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 - **action 完整文本**：llm.jsonl 只存计数不存 prompt/response 正文；transcript 不落 tool_result（`engine.go` 只 Append user 初始消息与 assistant 消息）；进化轨迹 Input/Output 被截断；
 - **headless 团队路径** trajectories.json 根本不产生（开环 1）。
 
-### 1.4 奖励贫乏　　**[🟠 仍然贫乏（1/8）]**
+### 1.4 奖励贫乏　　**[🟠 8 源中 6 源已通电（原 1 源）]**
 
 > **实测**：生产写出的 Source 字面量只有 2 个：`gate.content`（两个调用点用**同一字面量**）与 `episode`（设计外自加）。按设计 8 源口径是 **1/8**。设计里价值排第一的 `gate.compile`/`gate.test` 在真门禁函数内 `RecordReward` 调用数为 **0**；价值最高的用户显式反馈（👍/`/rate`）零命中。
 
@@ -108,7 +112,7 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 
 **权重内进化（可选导出路径）**：GRPO（DeepSeek-R1）/ RLVR（可验证奖励）/ RFT / DPO——本机有 ollama+gemma，轨迹+奖励可导出为 DPO 对/RFT 数据集微调本地小模型（如意图识别、路由、gate 评分等窄任务），主力模型不动。
 
-### 2.1 实地调研：Hermes-Agent 的 RL 引擎（Tinker-Atropos）　　**[🟠 吸收项落地 ≈0.8/14]**
+### 2.1 实地调研：Hermes-Agent 的 RL 引擎（Tinker-Atropos）　　**[🟠 吸收项 9/14（H3/H5/H6/H7/H8/H9/H10/H12/H13）]**
 
 > **实测**：⚠️ 本节列的 H1-H14 是落地最少的一节：H1 🟠（事实成立但无 `RewardEvaluator`/`WorkspaceHandle` 契约）· H7 🟡（阈值锁定但无对象）· H14 🟠（只有 reward_mean 且是离线字段）· **其余 11 项全 ❌**。其中 **H3（judge 独立性）被反向违反**——content gate 的 judge 用主模型自评，正是 H3 明令禁止的。
 
