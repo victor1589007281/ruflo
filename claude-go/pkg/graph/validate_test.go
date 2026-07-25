@@ -142,6 +142,100 @@ func TestValidateErrors(t *testing.T) {
 				Edges: []EdgeSpec{{From: "c", To: "d"}, {From: "d", To: "c"}}},
 			wantSub: "不可达",
 		},
+		// —— 新形态的策略字段: 缺了就在开图时失败, 不留到运行期 ——
+		{
+			name: "map缺策略",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{{ID: "m", Kind: NodeKindMap}}},
+			wantSub: "缺少 map 策略",
+		},
+		{
+			name: "map无扇出上限",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "m", Kind: NodeKindMap, Map: &MapPolicy{}}}},
+			wantSub: "max_shards",
+		},
+		{
+			name: "map下限大于上限",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "m", Kind: NodeKindMap, Map: &MapPolicy{MaxShards: 2, MinShards: 5}}}},
+			wantSub: "恒不可满足",
+		},
+		{
+			name: "map切分策略未知",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "m", Kind: NodeKindMap, Map: &MapPolicy{MaxShards: 2, Split: "chunks"}}}},
+			wantSub: "split",
+		},
+		{
+			name: "map来源未知",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "m", Kind: NodeKindMap, Map: &MapPolicy{MaxShards: 2, Source: "magic"}}}},
+			wantSub: "source",
+		},
+		{
+			name:    "reduce无map前驱",
+			g:       GraphSpec{Name: "x", Nodes: []NodeSpec{{ID: "r", Kind: NodeKindReduce}}},
+			wantSub: "没有 map 类直接前驱",
+		},
+		{
+			name: "reduce的from不是map节点",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				vNode("a"),
+				{ID: "m", Kind: NodeKindMap, Map: &MapPolicy{MaxShards: 2}},
+				{ID: "r", Kind: NodeKindReduce, Reduce: &ReducePolicy{From: []string{"a"}}}},
+				Edges: []EdgeSpec{{From: "a", To: "m"}, {From: "m", To: "r"}, {From: "a", To: "r"}}},
+			wantSub: "reduce.from",
+		},
+		{
+			name: "reduce聚合策略未知",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "m", Kind: NodeKindMap, Map: &MapPolicy{MaxShards: 2}},
+				{ID: "r", Kind: NodeKindReduce, Reduce: &ReducePolicy{Strategy: "vote"}}},
+				Edges: []EdgeSpec{{From: "m", To: "r"}}},
+			wantSub: "strategy",
+		},
+		{
+			name:    "loop-group缺子图",
+			g:       GraphSpec{Name: "x", Nodes: []NodeSpec{{ID: "g", Kind: NodeKindLoopGroup}}},
+			wantSub: "缺少组内子图",
+		},
+		{
+			name: "loop-group无轮次上限",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "g", Kind: NodeKindLoopGroup, Group: &GroupPolicy{Nodes: []NodeSpec{vNode("a")}}}}},
+			wantSub: "max_iterations",
+		},
+		{
+			name: "loop-group组内子图非法",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "g", Kind: NodeKindLoopGroup, Group: &GroupPolicy{
+					Nodes: []NodeSpec{vNode("a"), vNode("b")},
+					Edges: []EdgeSpec{{From: "a", To: "b"}, {From: "b", To: "a"}},
+					Loop:  LoopPolicy{MaxIterations: 2},
+				}}}},
+			wantSub: "组内子图非法",
+		},
+		{
+			name: "loop-group的result_from不是成员",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "g", Kind: NodeKindLoopGroup, Group: &GroupPolicy{
+					Nodes:      []NodeSpec{vNode("a")},
+					Loop:       LoopPolicy{MaxIterations: 2},
+					ResultFrom: "ghost",
+				}}}},
+			wantSub: "不是组内成员",
+		},
+		{
+			name: "展开无条数上限",
+			g: GraphSpec{Name: "x", Nodes: []NodeSpec{
+				{ID: "a", Kind: NodeKindAgent, Expand: &ExpandSpec{}}}},
+			wantSub: "max_nodes",
+		},
+		{
+			name:    "声明期节点ID含保留分隔符",
+			g:       GraphSpec{Name: "x", Nodes: []NodeSpec{vNode("a#1")}},
+			wantSub: "保留分隔符",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -353,6 +353,9 @@ type dagRun struct {
 	// 组循环给全部成员的公共输入 (仅 loop-group 的组内 scope 非零)。
 	feedback  string
 	groupIter int
+	// basePrev 组**外**上游的产出: 组内成员照样要看得到 (组是个容器, 不是隔离舱),
+	// 否则组内第一个节点拿不到进组前的交接内容。组内同名前驱覆盖它。
+	basePrev map[string]string
 }
 
 func newDagRun(nodes []NodeSpec, edges []EdgeSpec, scope execScope) *dagRun {
@@ -383,7 +386,10 @@ func (dr *dagRun) addEdge(ed EdgeSpec) {
 
 // prevOutputs 直接前驱中 completed 的产出 (语义5)。
 func (dr *dagRun) prevOutputs(id string) map[string]string {
-	outs := map[string]string{}
+	outs := make(map[string]string, len(dr.basePrev)+len(dr.preds[id]))
+	for k, v := range dr.basePrev {
+		outs[k] = v
+	}
 	for _, in := range dr.preds[id] {
 		if r, ok := dr.state[in.from]; ok && r.Status == NodeStatusCompleted {
 			outs[in.from] = r.Output

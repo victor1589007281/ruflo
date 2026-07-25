@@ -182,6 +182,20 @@ func TestWarnRoleNameInference_按来源去重(t *testing.T) {
 	}
 }
 
+// TestWarnRoleNameInference_去重表有上限 钉住那条内存边界: 嵌套 agent 的来源含
+// 模型可控的 SubagentType, 去重表必须有顶, 否则模型胡编名字就能让它无界增长。
+func TestWarnRoleNameInference_去重表有上限(t *testing.T) {
+	before := roleInferWarnedCount.Load()
+	roleInferWarnedCount.Store(roleInferWarnCap) // 模拟已到顶
+	defer roleInferWarnedCount.Store(before)
+
+	key := "team-role:overflow-" + t.Name()
+	warnRoleNameInference(key, builtin.ToolProfileCoding)
+	if _, ok := roleInferWarned.Load(key + "|" + string(builtin.ToolProfileCoding)); ok {
+		t.Error("到顶后不应再往去重表里塞新条目")
+	}
+}
+
 // TestApplyConstraints_档位声明不会带来名单副作用:
 // 团队/嵌套那两条线的 ConstraintSet 只带档位, 装配到引擎必须什么名单都不产生 ——
 // 否则就是凭空变严, 会打断现有工作流。

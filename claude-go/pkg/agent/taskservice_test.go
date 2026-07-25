@@ -534,6 +534,47 @@ func TestConsumeActionTurnsIntoTask(t *testing.T) {
 	}
 }
 
+// TestConsumeActionNoRunnerNoFalseAccept 断言未注入运行器时, team.run 不会被标成
+// accepted (那样任务会永远停在 pending, 等于换个说法继续假承诺):
+// 有执行器 → 交给执行器标 done; 都没有 → 如实标 unsupported。
+func TestConsumeActionNoRunnerNoFalseAccept(t *testing.T) {
+	// ① 无运行器、无执行器
+	dir := filepath.Join(t.TempDir(), "actions")
+	svc := NewFileQueueTaskService(TaskServiceOptions{Store: statestore.NewMemStore(), ActionsDir: dir})
+	p1 := writePendingAction(t, dir, "team-run-nr-1", "team", "run", "nr",
+		map[string]any{"workflow": "techblog", "objective": "x"})
+	if _, err := svc.ConsumeActions(context.Background()); err != nil {
+		t.Fatalf("ConsumeActions: %v", err)
+	}
+	act := readActionFile(t, p1)
+	if act.Status != ActionStatusUnsupported || act.TaskID != "" {
+		t.Fatalf("无运行器时不该标 accepted, got %+v", act)
+	}
+
+	// ② 无运行器但有执行器 (主进程只给了 TeamAction 回调的部署形态)
+	dir2 := filepath.Join(t.TempDir(), "actions")
+	var called []string
+	svc2 := NewFileQueueTaskService(TaskServiceOptions{
+		Store: statestore.NewMemStore(), ActionsDir: dir2,
+		ActionExecutor: TeamActionExecutor(func(action, target string, _ map[string]any) error {
+			called = append(called, action+":"+target)
+			return nil
+		}),
+	})
+	p2 := writePendingAction(t, dir2, "team-run-nr-2", "team", "run", "nr2",
+		map[string]any{"workflow": "techblog", "objective": "x"})
+	if _, err := svc2.ConsumeActions(context.Background()); err != nil {
+		t.Fatalf("ConsumeActions: %v", err)
+	}
+	act2 := readActionFile(t, p2)
+	if act2.Status != ActionStatusDone {
+		t.Fatalf("应由执行器完成, got %+v", act2)
+	}
+	if len(called) != 1 || called[0] != "run:nr2" {
+		t.Fatalf("执行器应收到 run:nr2, got %v", called)
+	}
+}
+
 // TestConsumeActionUnsupportedWhenNoExecutor 断言没有注入执行器时, 非任务型动作被标为
 // unsupported 并写明原因 —— 绝不静默标 done (那正是本次要消灭的假承诺)。
 func TestConsumeActionUnsupportedWhenNoExecutor(t *testing.T) {

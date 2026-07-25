@@ -984,6 +984,13 @@ func (s *FileQueueTaskService) handleAction(ctx context.Context, act ActionRecor
 	act.ConsumedAt = time.Now().Format(time.RFC3339)
 	switch act.Kind + "." + act.Action {
 	case "team.run", "team.restart", "team.resume":
+		if s.currentRunner() == nil {
+			// 没有运行器时 Submit 只会让任务停在 pending, 却回报 accepted ——
+			// 那是把旧的假承诺换了个说法。改为交给注入的执行器 (通常就是 dashboard
+			// 的 TeamAction 回调), 都没有就如实标 unsupported。
+			s.delegate(ctx, &act, stats, "未注入 TaskRunner (提交后无人执行)")
+			break
+		}
 		// 提交成任务。IdemScopeForever + action:<id> 为键 = 这条动作只会变成一个任务,
 		// 即使消费进程在回写前崩溃、动作被回收重投也不会跑两遍。
 		rec, err := s.Submit(specFromAction(act), SubmitOpts{
@@ -1002,6 +1009,10 @@ func (s *FileQueueTaskService) handleAction(ctx context.Context, act ActionRecor
 			stats.TaskIDs[act.ID] = rec.ID
 		}
 	case "team.refine":
+		if s.currentRunner() == nil {
+			s.delegate(ctx, &act, stats, "未注入 TaskRunner (提交后无人执行)")
+			break
+		}
 		fb, _ := act.Payload["feedback"].(string)
 		if fb == "" {
 			fb, _ = act.Payload["objective"].(string)

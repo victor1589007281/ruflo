@@ -84,6 +84,7 @@ func (e *Engine) runLoopGroup(ctx context.Context, rc *runCtx, scope execScope, 
 		}
 		dr := newDagRun(g.Nodes, g.Edges, iterScope)
 		dr.groupIter = iter
+		dr.basePrev = in.PrevOutputs // 组外上游产出对组内成员同样可见
 		if iter > start || start > 0 {
 			// 第 2 轮起 (含 resume 续跑的第一轮) 回灌上一轮产出给**全部**成员。
 			dr.feedback = replacePrevOutput(g.Loop.Feedback, last.Output)
