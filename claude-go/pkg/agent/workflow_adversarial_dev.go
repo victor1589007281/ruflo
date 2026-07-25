@@ -1816,18 +1816,20 @@ func workspaceFileManifest(cwd string, since time.Time) string {
 		return ""
 	}
 	var files []string
+	// 剪枝与归属判据统一用 artifacts.go 的公共实现 (artifactSkipDir /
+	// artifactBelongsToTeam), 避免"prompt 里看到的工作区清单"与"产物清单端点采到的
+	// 文件"因两份拷贝漂移而不一致。
 	_ = filepath.Walk(cwd, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		name := info.Name()
 		if info.IsDir() {
-			if name == ".git" || name == "node_modules" || name == ".claude-go" || name == "__pycache__" {
+			if artifactSkipDir(info.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if info.ModTime().After(since) {
+		if artifactBelongsToTeam(info.ModTime(), since) {
 			rel, _ := filepath.Rel(cwd, path)
 			files = append(files, rel)
 		}

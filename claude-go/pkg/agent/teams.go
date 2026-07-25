@@ -413,6 +413,13 @@ type ProductionTeam struct {
 	dataDir    string
 	doneCh     chan struct{} // 关闭信号: 工作流执行完毕时 close
 
+	// materializedFiles MaterializeCode 写到 team.Cwd 下的文件 (相对路径, 已去重)。
+	// cwd 是进程级共享目录, 靠 mtime 猜归属会混进用户自己和别的团队的文件; 这份
+	// 由平台亲手记账的清单是唯一的硬归属证据, 供 artifacts.go 生成产物清单时使用。
+	// 不序列化: 只在本进程本次运行内有意义, 跨重启由 ARTIFACTS.json 承载。
+	materializedFiles []string
+	materializedSeen  map[string]bool
+
 	// EngineRunning 标记 orchestrated 引擎是否正在运行 (供 Coordinator 心跳检测使用)。
 	// 在 executeOrchestrated() 开始时设为 true, 结束时设为 false。
 	EngineRunning bool `json:"-"`
@@ -498,7 +505,7 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 	if workflow != "swarm" {
 		wf := GetWorkflow(workflow)
 		if wf == nil {
-			return nil, fmt.Errorf("未知工作流 %q, 可选: development, research, debate, swarm, finance, techblog, creative, creative-v2, novel-v2, novel-v3, trading-v2, predict, ml-training, app, game, code-review, testing, parenting, hiring", workflow)
+			return nil, fmt.Errorf("未知工作流 %q, 可选: %s", workflow, strings.Join(AvailableWorkflowNames(), ", "))
 		}
 		_ = wf
 	}
@@ -1793,8 +1800,20 @@ func (ptm *ProductionTeamManager) saveTeamReport(team *ProductionTeam, results [
 	}
 
 	reportPath := filepath.Join(team.dataDir, "REPORT.md")
-	if err := os.WriteFile(reportPath, []byte(sb.String()), 0644); err != nil {
-		log.Printf("[Teams] 保存报告失败: %v", err)
+	writeErr := os.WriteFile(reportPath, []byte(sb.String()), 0644)
+
+	// 产物清单必须在报告落盘【之后】生成 (这样 REPORT.md 自身也进清单), 且与报告
+	// 成败解耦: 报告写失败时更需要清单留住"产物到底有没有、采集有没有失败"的证据。
+	// 清单同时覆盖 dataDir 与 team.Cwd 两个落点, 避免下游只扫一处漏采 (媒锻曾因此
+	// 把已完成的音乐成品误置 review)。
+	if manifestPath, err := WriteArtifactManifest(team); err != nil {
+		log.Printf("[Teams] 产物清单生成失败: %v", err)
+	} else {
+		log.Printf("[Teams] 产物清单已保存: %s", manifestPath)
+	}
+
+	if writeErr != nil {
+		log.Printf("[Teams] 保存报告失败: %v", writeErr)
 		return ""
 	}
 	log.Printf("[Teams] 报告已保存: %s", reportPath)

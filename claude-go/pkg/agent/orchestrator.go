@@ -3776,6 +3776,13 @@ func (o *Orchestrator) recordWBSMaterialization(team *ProductionTeam, node *Task
 	if team == nil || node == nil {
 		return
 	}
+	// 路径必须先累积, 且必须早于下面的 metrics 空判断:
+	// ① 指标只留"物化了几个文件"(MWBSMaterializedFiles)这一个数量, 路径一丢, 产物
+	//    清单就只能靠 cwd 侧 mtime 猜归属 (cwd 是进程级共享目录, 构建产物/依赖/别的
+	//    团队的文件都会混进来);
+	// ② 未接指标采集器的进程 (metrics 为 nil) 同样需要这份清单。
+	team.recordMaterialized(written)
+
 	mc := team.metrics()
 	if mc == nil {
 		return

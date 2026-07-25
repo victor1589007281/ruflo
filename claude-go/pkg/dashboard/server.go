@@ -378,6 +378,8 @@ func (s *Server) handleTeamDetail(w http.ResponseWriter, r *http.Request) {
 		s.handleTeamLogs(w, r, name)
 	case "media":
 		s.handleTeamMedia(w, r, name, parts[2:])
+	case "artifacts":
+		s.handleTeamArtifacts(w, r, name, parts[2:])
 	case "swarm-plan":
 		s.handleTeamSwarmPlan(w, r, name)
 	case "refine":
@@ -448,6 +450,10 @@ func (s *Server) handleTeamFork(w http.ResponseWriter, r *http.Request, name str
 //
 // 注: 产出 HTML 为模型生成内容, 通过 CSP sandbox 隔离, 防止注入 dashboard 同源。
 func (s *Server) handleTeamMedia(w http.ResponseWriter, r *http.Request, name string, fileParts []string) {
+	if !safeName(name) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid team name"))
+		return
+	}
 	mediaDir := filepath.Join(s.provider.StateDir(), "teams", name, "media")
 	absDir, err := filepath.Abs(mediaDir)
 	if err != nil {
@@ -456,32 +462,37 @@ func (s *Server) handleTeamMedia(w http.ResponseWriter, r *http.Request, name st
 	}
 
 	if len(fileParts) == 0 || (len(fileParts) == 1 && fileParts[0] == "") {
-		// 列清单
+		// 列清单: 必须【递归】。原实现是非递归 os.ReadDir 且直接 skip 子目录, 于是
+		// media/sub/deep.png 这类嵌套产物永远采不到 (工作流按场景/分镜建子目录很常见),
+		// 前端就显示"该团队暂无媒体产出"。这里复用 agent 侧的统一采集器 (同一份递归 +
+		// 跳过 .git/node_modules/__pycache__ 的规则), 避免又多一份会漂移的实现。
 		type mediaFile struct {
-			Name string `json:"name"`
+			Name string `json:"name"` // 相对 media/ 的路径 (嵌套时形如 sub/deep.png)
 			Ext  string `json:"ext"`
 			Size int64  `json:"size"`
 			URL  string `json:"url"`
 		}
 		files := []mediaFile{}
-		entries, _ := os.ReadDir(absDir)
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			info, _ := e.Info()
-			var sz int64
-			if info != nil {
-				sz = info.Size()
-			}
+		// media 目录是团队专属 (dataDir 内), 不需要 mtime 归属过滤 → 当作 data 根扫。
+		refs, scanErr := agent.CollectArtifactsFor(agent.ArtifactScanSpec{Team: name, DataDir: absDir})
+		for _, ref := range refs {
 			files = append(files, mediaFile{
-				Name: e.Name(),
-				Ext:  strings.ToLower(strings.TrimPrefix(filepath.Ext(e.Name()), ".")),
-				Size: sz,
-				URL:  "/api/teams/" + url.PathEscape(name) + "/media/" + url.PathEscape(e.Name()),
+				Name: ref.Rel,
+				Ext:  strings.ToLower(strings.TrimPrefix(filepath.Ext(ref.Rel), ".")),
+				Size: ref.Size,
+				URL:  "/api/teams/" + url.PathEscape(name) + "/media/" + escapeRelPath(ref.Rel),
 			})
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"files": files})
+		resp := map[string]interface{}{"files": files}
+		// fail-open 语义: 采集出错时必须说出来, 不能让"扫失败"和"真的没有产物"长得
+		// 一样 —— 下游据此误判过一次 (把已完成的成品置成待审)。
+		if scanErr != nil {
+			resp["scanned"] = false
+			resp["error"] = scanErr.Error()
+		} else {
+			resp["scanned"] = true
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
@@ -506,6 +517,149 @@ func (s *Server) handleTeamMedia(w http.ResponseWriter, r *http.Request, name st
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 	}
 	http.ServeFile(w, r, full)
+}
+
+// escapeRelPath 逐段转义相对路径, 保留 / 分隔 (整段 PathEscape 会把 / 编成 %2F,
+// 嵌套产物的 URL 就取不到了)。
+func escapeRelPath(rel string) string {
+	segs := strings.Split(rel, "/")
+	for i := range segs {
+		segs[i] = url.PathEscape(segs[i])
+	}
+	return strings.Join(segs, "/")
+}
+
+// artifactsResponse 产物清单响应。source 说明清单来自哪里:
+// manifest = 团队结束时落盘的 ARTIFACTS.json (含物化记账的硬归属证据);
+// live = 本次请求现扫的 (团队还在跑, 或 ?refresh=1)。
+type artifactsResponse struct {
+	agent.ArtifactManifest
+	Source string `json:"source"`
+}
+
+// handleTeamArtifacts 团队产物清单 (合并 dataDir 与 team.Cwd 两个落点)。
+//
+//	GET /api/teams/{name}/artifacts                              → 清单
+//	GET /api/teams/{name}/artifacts/file/{rel...}?root=data|work  → 取单个文件
+//
+// 为什么需要它: /media 只看 <stateDir>/teams/<n>/media, 而 agent 用 Write/Bash 写的
+// 文件、media_gen 六个媒体工具产的媒体、MaterializeCode 落的代码都在 team.Cwd 下,
+// 任何只看一处的入口都会把"有产物"报成"无产物"。
+func (s *Server) handleTeamArtifacts(w http.ResponseWriter, r *http.Request, name string, parts []string) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("GET required"))
+		return
+	}
+	if !safeName(name) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid team name"))
+		return
+	}
+	spec := agent.ArtifactScanSpec{
+		Team:    name,
+		DataDir: filepath.Join(s.provider.StateDir(), "teams", name),
+	}
+	// cwd / startedAt 只能从 team.json 取 (team.Cwd 是序列化字段, dataDir 是私有的)。
+	if detail, err := s.provider.GetTeam(name); err == nil && detail != nil {
+		spec.Cwd = detail.Cwd
+		spec.StartedAt = detail.StartedAt
+		spec.FinishedAt = detail.FinishedAt
+		if spec.StartedAt.IsZero() {
+			spec.StartedAt = detail.CreatedAt
+		}
+	}
+
+	if len(parts) == 0 || (len(parts) == 1 && parts[0] == "") {
+		// 优先返回落盘清单: 它含 MaterializeCode 记账的路径 (进程内私有字段, 事后重扫
+		// 拿不到), 且是那次运行的归档快照。?refresh=1 或还没有清单时现扫。
+		if r.URL.Query().Get("refresh") != "1" {
+			if m, err := agent.ReadArtifactManifest(spec.DataDir); err == nil && m != nil {
+				writeJSON(w, http.StatusOK, artifactsResponse{ArtifactManifest: *m, Source: "manifest"})
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, artifactsResponse{
+			ArtifactManifest: agent.BuildArtifactManifestFor(spec), Source: "live",
+		})
+		return
+	}
+
+	if parts[0] != "file" {
+		writeError(w, http.StatusNotFound, fmt.Errorf("unknown artifacts sub-path %q", parts[0]))
+		return
+	}
+	s.serveTeamArtifactFile(w, r, spec, parts[1:])
+}
+
+// serveTeamArtifactFile 取单个产物文件。三重守卫:
+// ① root 必须白名单化到 ArtifactRoots 真实返回的根 (不接受调用方给路径);
+// ② 拼接后取绝对路径必须仍在该根内 (防 ../ 穿越, 与 media 端点同一形态);
+// ③ work 根额外要求文件通过归属判据 —— cwd 是用户真实 git 仓库, 里面有本团队从未
+//
+//	产出的私有文件 (.env / 密钥 / 源码), 不能因为"在根内"就一律外送。
+func (s *Server) serveTeamArtifactFile(w http.ResponseWriter, r *http.Request, spec agent.ArtifactScanSpec, relParts []string) {
+	kind := r.URL.Query().Get("root")
+	if kind == "" {
+		kind = agent.ArtifactRootData
+	}
+	var rootPath string
+	for _, root := range agent.RootsForScan(spec) {
+		if root.Kind == kind {
+			rootPath = root.Path
+			break
+		}
+	}
+	if rootPath == "" {
+		writeError(w, http.StatusForbidden, fmt.Errorf("root %q 不在白名单内", kind))
+		return
+	}
+	if len(relParts) == 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("file path required"))
+		return
+	}
+	full, err := filepath.Abs(filepath.Join(rootPath, filepath.Join(relParts...)))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if full != rootPath && !strings.HasPrefix(full, rootPath+string(os.PathSeparator)) {
+		writeError(w, http.StatusForbidden, fmt.Errorf("path traversal blocked"))
+		return
+	}
+	info, err := os.Stat(full)
+	if err != nil || !info.Mode().IsRegular() {
+		writeError(w, http.StatusNotFound, fmt.Errorf("artifact not found"))
+		return
+	}
+	if kind == agent.ArtifactRootWork {
+		rel := strings.TrimPrefix(strings.TrimPrefix(full, rootPath), string(os.PathSeparator))
+		if !s.workArtifactAllowed(spec, filepath.ToSlash(rel), info.ModTime()) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("该文件不属于本团队产物"))
+			return
+		}
+	}
+	// 模型生成的 HTML/SVG 用 CSP sandbox 隔离 (与 media 端点一致), 防止注入 dashboard 同源。
+	lower := strings.ToLower(full)
+	if strings.HasSuffix(lower, ".html") || strings.HasSuffix(lower, ".svg") {
+		w.Header().Set("Content-Security-Policy", "sandbox allow-scripts;")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+	}
+	http.ServeFile(w, r, full)
+}
+
+// workArtifactAllowed cwd 侧文件的归属校验: 落在团队的归属时间窗内 (与采集器同一
+// 判据), 或落盘清单里明确记过它 (物化记账的文件可能 mtime 更早)。
+func (s *Server) workArtifactAllowed(spec agent.ArtifactScanSpec, rel string, mod time.Time) bool {
+	if agent.ArtifactAttributed(spec, mod) {
+		return true
+	}
+	if m, err := agent.ReadArtifactManifest(spec.DataDir); err == nil && m != nil {
+		for _, f := range m.Files {
+			if f.Root == agent.ArtifactRootWork && f.Rel == rel {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
