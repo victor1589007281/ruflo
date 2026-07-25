@@ -91,7 +91,7 @@ func (h *TraceCaptureHook) captureToolCalls(ctx *HookContext, ids trace.IDs, now
 			TraceID:   ids.RunID,
 			SpanID:    GenerateUUID(),
 			ParentID:  ids.TurnID,
-			Kind:      "tool_call",
+			Kind:      tracestore.KindToolCall,
 			Name:      tu.Name,
 			NodeID:    ids.NodeID,
 			TurnID:    ids.TurnID,
@@ -126,7 +126,7 @@ func (h *TraceCaptureHook) captureTurn(ctx *HookContext, ids trace.IDs, now time
 	h.store.Write(tracestore.Span{
 		TraceID:   ids.RunID,
 		SpanID:    GenerateUUID(),
-		Kind:      "turn",
+		Kind:      tracestore.KindTurn,
 		Name:      turnName,
 		NodeID:    ids.NodeID,
 		TurnID:    ids.TurnID,

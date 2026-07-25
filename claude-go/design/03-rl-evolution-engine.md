@@ -178,13 +178,17 @@ POMDP:  state  s = (任务 objective, 图/节点上下文, 黑板, 注入的记�
 
 部署：L4 辅助系统（design/02）。单机=进程内模块；分布式=独立 evolution 服务，中心化经验/记忆库（解学习孤岛，假设 #17）。
 
-### 4.1 ① TraceStore：轨迹底座　　**[🟠 Ref/采样/TTL ✅ · Kind 3/6 有产生方（node 已补）]**
+### 4.1 ① TraceStore：轨迹底座　　**[🟠 Ref/采样/TTL ✅ · Kind 5/6 有产生方（run 为刻意预留）]**
 
 > ⚠️ **一处我自己打错又更正的标注（2026-07-25）**：先按"常量已补齐"记成了 `Kind 5/5 ✅`，逐条查产生方后**推翻**——`tracestore.KindXxx` 六个常量都在（`run`/`node`/`turn`/`llm_call`/`tool_call`/`gate`），但全仓只有 **2 个有写入方**：`KindLLMCall`（`pkg/engine/trace_llm.go:96`）与 `KindGate`（`pkg/agent/reward_sources.go:91`）。`KindRun`/`KindNode`/`KindTurn`/`KindToolCall` **零产生方**，其中 `KindRun` 源码注释自己写了「预留: 当前由 TraceID 隐含」。
 >
 > ✅ **`KindNode` 已补上产生方（2026-07-25）**：`stageNodeRunner.writeNodeSpan`（4 个测试）。挂在 stageNodeRunner 而非引擎侧，因为 `pkg/graph` 不认识 tracestore，且只有这里同时拿得到节点声明与 `StageResult`。**`NodeID` 用限定 ID（`NodeRef`）而非声明名**——否则 N 个 map 分片的 span 会全挂在同一个节点上；轮次（`iteration`/`group_iteration`）与分片序进 `Attrs`，不带轮次就无法回答「第几轮才收敛」，而那正是结构学习器（§4.3 d/e）要用的信号。fail-open：底座为 nil 或写失败都不影响节点执行——采集是观测不是治理。
 >
-> ⚠️ **`KindTurn`/`KindToolCall` 仍零产生方**：它们在 `pkg/engine` 的每轮/每次工具调用热路径上，加采集要评估开销与采样策略，未做。`KindRun` 按源码注释属刻意预留。
+> ⚠️ **又一处更正，这次是往好的方向**：我先按常量名 grep 判定 `KindTurn`/`KindToolCall` 零产生方，**真集群 E2E 的轨迹文件推翻了它**——一次图引擎团队跑出 `turn` 7 条、`tool_call` 27 条、`llm_call` 19 条、`node` 6 条、`gate` 1 条，**5 种 kind 都有产生方**。原因是 `pkg/engine/internal_hook/hook_trace.go` 写的是**字面量** `"turn"`/`"tool_call"` 而不是 `tracestore.KindTurn/KindToolCall` 常量，按常量名搜自然搜不到。已把那两处字面量归一到常量——那张常量表存在的全部理由就是"少了哪几种能机械地看出来"，留着字面量它就失效了。
+>
+> 现状：`KindRun` 是唯一无产生方的 kind，源码注释写明属刻意预留（由 TraceID 隐含）。
+>
+> **这件事本身是个教训**：判"有没有产生方"用 grep 常量名会漏掉写字面量的调用点，真跑一遍看产物才是准的。本轮三次标注失误里，两次是 grep 不足、一次是把"类型存在"当成了"已通电"。
 >
 > 这正是本文档图例里 🟡「已建成未通电」要区分的情形：**加一个常量不等于采集了那类轨迹**。轨迹按 kind 不齐会直接影响 RL 数据地基——`node`/`turn` 缺失时无法把奖励归因到具体节点或轮次。
 
