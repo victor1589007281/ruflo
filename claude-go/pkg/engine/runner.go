@@ -150,25 +150,50 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 
 		apiMessages := messagesToAPI(messages, nil)
 
+		callStart := time.Now()
 		resp, err := client.SendMessage(ctx, apiMessages, systemPrompts, apiTools, opts.MaxTokens)
-		if err != nil {
-			return lastAssistantText, err
-		}
-		if resp == nil {
-			return lastAssistantText, fmt.Errorf("nil response")
-		}
 
 		// 收集 assistant 的 content blocks, 区分 text / tool_use
 		var (
 			assistantBlocks []types.ContentBlock
 			toolUseBlocks   []types.ContentBlock
 		)
-		for _, blk := range resp.Content {
-			b := blk
-			if b.Type == types.ContentBlockToolUse {
-				toolUseBlocks = append(toolUseBlocks, b)
+		if resp != nil {
+			for _, blk := range resp.Content {
+				b := blk
+				if b.Type == types.ContentBlockToolUse {
+					toolUseBlocks = append(toolUseBlocks, b)
+				}
+				assistantBlocks = append(assistantBlocks, b)
 			}
-			assistantBlocks = append(assistantBlocks, b)
+		}
+
+		// llm_call Span (design/03 §4.1 E1 第 4 种 Kind)。团队/stage 路径的绝大多数
+		// LLM 流量走这里, 所以这一处比 queryLoop 那处更要紧。写在错误返回**之前**:
+		// 失败的调用也是轨迹 (§1.3 要求能还原完整 prompt→response 链, 含失败)。
+		if e.TraceStore != nil {
+			var usage *types.Usage
+			var stop string
+			if resp != nil {
+				usage, stop = resp.Usage, resp.StopReason
+			}
+			model := client.Model
+			if resp != nil && resp.Model != "" {
+				model = resp.Model // 网关可能换了实际服务模型, 以响应为准
+			}
+			e.writeLLMCallSpan(ctx, llmCallSpan{
+				Start: callStart, Model: model, System: systemPrompts,
+				Messages: apiMessages, Tools: apiTools,
+				Output: internal_hook.JoinAssistantText(assistantBlocks),
+				Usage:  usage, StopReason: stop, Err: err,
+				Attempt: turn, Isolated: true,
+			})
+		}
+		if err != nil {
+			return lastAssistantText, err
+		}
+		if resp == nil {
+			return lastAssistantText, fmt.Errorf("nil response")
 		}
 
 		// 5. XML / bracket 回退: 把文本里的工具调用补齐成 tool_use blocks; 即使

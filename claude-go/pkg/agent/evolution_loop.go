@@ -105,6 +105,11 @@ type EvolutionLoop struct {
 	reqs  chan LearnRequest
 	Stats LearnStats
 
+	// structure 学习器 d/e (工作流/Prompt 进化 + 权重导出), 只在空闲相位跑。
+	// nil = 未装配, 空闲期只做 Consolidate (与本文件最初的行为一致)。
+	// 见 evolution_structure.go。
+	structure *structureLearners
+
 	mu       sync.Mutex
 	lastSeen map[string]time.Time // team → 上次提交时刻 (去重)
 	// 预算窗口: 简单的滑动小时计数, 不引入额外依赖。
@@ -259,6 +264,9 @@ func (l *EvolutionLoop) execute(ctx context.Context, req LearnRequest) {
 	case LearnIdle:
 		// 空闲期只做整合, 不重复蒸馏 (没有新轨迹可蒸馏)。
 		l.engine.Consolidate()
+		// 学习器 d/e 的相位 (design/03 §4.3d/e): 工作流归纳 + prompt 反思 + 语料导出。
+		// 它们的节奏是设计里最慢的两档, 跨多个 run 才有统计意义, 所以只在这里跑。
+		l.runStructureLearners(ctx)
 		l.Stats.IdleRuns.Add(1)
 	}
 	if l.metrics != nil {

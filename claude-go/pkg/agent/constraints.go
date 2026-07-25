@@ -108,6 +108,18 @@ func ProfileCapabilities(profile string) (Capability, bool) {
 	return c, ok
 }
 
+// KnownProfiles 返回全部已识别的档位名 (无序)。
+// 供外部测试核对"档位表与 pkg/tool/builtin 的常量没漂移" —— 那个核对必须在外部
+// 测试包里做 (它要 import pkg/tool/builtin, 而 builtin 经 evotools → evolution/govern
+// 反向依赖本包, 同包测试会构成导入环)。
+func KnownProfiles() []string {
+	out := make([]string, 0, len(profileCaps))
+	for k := range profileCaps {
+		out = append(out, k)
+	}
+	return out
+}
+
 // ProfileNarrows 报告 child 档位是否是 parent 档位的收窄 (相等也算收窄)。
 // 任一档位名不认识时返回 false —— 认不出来就不放行 (fail-closed)。
 func ProfileNarrows(child, parent string) bool {

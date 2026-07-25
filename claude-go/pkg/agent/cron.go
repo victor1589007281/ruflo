@@ -83,6 +83,7 @@ type CronScheduler struct {
 	dataDir  string
 	executor CronExecutor
 	stopCh   chan struct{}
+	stopOnce sync.Once // Stop 幂等: 二次 close(stopCh) 会 panic
 	nextID   int
 	lease    CronLease // 分布式租约 (可为 nil, 单副本)
 }
@@ -108,9 +109,14 @@ func (cs *CronScheduler) Start() {
 	log.Printf("[Cron] 调度器已启动, 当前 %d 个任务", len(cs.jobs))
 }
 
-// Stop 停止调度器。
+// Stop 停止调度器。**幂等** —— 可以安全地重复调用。
+//
+// 此前是裸 close(stopCh): 二次调用直接 panic。这不是理论风险 —— 独立 worker 进程
+// 复用 NewBot 装配真执行体, 需要先 Stop() 掉 cron (worker 跑 cron 会与控制面重复
+// 触发同一 job), 之后又不敢调 bot.Shutdown()(它会再 Stop 一次), 于是 MCP 子进程
+// 只能靠进程退出回收。让 Stop 幂等比让调用方记住"只能停一次"可靠。
 func (cs *CronScheduler) Stop() {
-	close(cs.stopCh)
+	cs.stopOnce.Do(func() { close(cs.stopCh) })
 }
 
 // AddJob 添加定时任务。

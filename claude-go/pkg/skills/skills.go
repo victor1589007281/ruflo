@@ -465,8 +465,46 @@ func parseFrontmatter(fm string, skill *Skill) {
 			// 治理状态 (shadow/active/archived)。此前不解析 ⇒ shadow 技能照常进清单、
 			// 照常可被 Skill 工具加载, `evo promote` 改的是没人读的文本字段。
 			skill.Status = val
+		case "allowed-tools", "allowed_tools":
+			// 声明式工具面。**此前 Skill.AllowedTools 字段存在但全仓没有任何地方给它
+			// 赋值**, 于是 SKILL.md 里写 `allowed-tools: Bash` 在结构体里恒为空 ——
+			// 任何依据它做判断的代码都会得出"该技能没声明工具"这个错误结论。
+			//
+			// 目前唯一消费者是 pkg/evolution/govern 的不越权闸 (design/03 §4.6):
+			// 自动提炼的技能若声明了写/执行类工具, 晋升被拒。运行期的工具可见性仍然
+			// 只由 engine.Config.toolExposed 一处裁决, 本字段不参与 ⇒ 解析它不改变
+			// 任何既有执行行为, 只是让治理层看得见声明。
+			skill.AllowedTools = parseToolList(val)
 		}
 	}
+}
+
+// parseToolList 解析 frontmatter 里的工具清单。
+//
+// 兼容三种写法 (三种在野文件里都出现过): `A, B` / `[A, B]` / `A B`。
+// 逗号优先, 无逗号才按空白切 —— 反过来会把 "Read, Bash" 切成 "Read," 这种带标点的
+// 假工具名, 而治理层对"不认识的工具名"是拒绝晋升, 于是一个格式问题会变成一次误拒。
+func parseToolList(val string) []string {
+	val = strings.TrimSpace(strings.Trim(strings.TrimSpace(val), "[]"))
+	if val == "" {
+		return nil
+	}
+	var fields []string
+	if strings.Contains(val, ",") {
+		fields = strings.Split(val, ",")
+	} else {
+		fields = strings.Fields(val)
+	}
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if n := strings.Trim(strings.TrimSpace(f), `"'`); n != "" {
+			out = append(out, n)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ============================================================================

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -749,5 +750,507 @@ func TestMergeStageOverride(t *testing.T) {
 	}
 	if decl.EdgeConditions["b"] != "fail" || len(ov.EdgeConditions) != 1 {
 		t.Error("合并不得改写入参的 map")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// map/reduce/loop-group/expand 的生产可表达性 (design/01 §4.1/§4.2/§4.4)
+// ---------------------------------------------------------------------------
+
+// fanoutTestWorkflow src → fan(map) → merge(reduce) 三阶段。
+func fanoutTestWorkflow(name string) *WorkflowDef {
+	return &WorkflowDef{
+		Name: name,
+		Mode: "graph",
+		Stages: []StageDef{
+			{Name: "src", Role: "researcher", Prompt: "列清单 {objective}"},
+			{Name: "fan", Role: "writer", Prompt: "处理一片 {prev_result}", DependsOn: []string{"src"}},
+			{Name: "merge", Role: "writer", Prompt: "汇总 {prev_result}", DependsOn: []string{"fan"}},
+		},
+	}
+}
+
+// TestTranslateMapReduceStages 覆盖表能把阶段声明成 map/reduce 节点, 且策略如实落进图。
+func TestTranslateMapReduceStages(t *testing.T) {
+	const name = "graph-fanout-translate"
+	RegisterGraphOverride(name, WorkflowGraphOverride{
+		MaxTotalNodes: 50,
+		// 重试压到 0: 默认的 6 次重试会让单节点预算直接撞 2h 硬顶, 乘 MaxShards
+		// 也还是 2h, 就验不出"预算按分片数放大"这件事了。
+		DefaultRetry: &graph.RetryPolicy{MaxRetries: 0},
+		Stages: map[string]StageGraphOverride{
+			"fan": {Kind: "map", Map: &graph.MapPolicy{
+				Source: graph.SourceObjective, Split: graph.SplitLines, MaxShards: 2, MinShards: 1}},
+			"merge": {Kind: "reduce", Reduce: &graph.ReducePolicy{Strategy: graph.ReduceConcat}},
+		},
+	})
+	t.Cleanup(func() { UnregisterGraphOverride(name) })
+
+	spec, err := TranslateWorkflow(fanoutTestWorkflow(name))
+	if err != nil {
+		t.Fatalf("直译失败: %v", err)
+	}
+	byID := map[string]graph.NodeSpec{}
+	for _, n := range spec.Nodes {
+		byID[n.ID] = n
+	}
+	fan := byID["fan"]
+	if fan.Kind != graph.NodeKindMap || fan.Map == nil || fan.Map.MaxShards != 2 {
+		t.Fatalf("fan 节点 = %+v (map=%+v), 期望 map 形态 + 策略落图", fan, fan.Map)
+	}
+	if byID["merge"].Kind != graph.NodeKindReduce || byID["merge"].Reduce.Strategy != graph.ReduceConcat {
+		t.Fatalf("merge 节点 = %+v", byID["merge"])
+	}
+	if spec.Policies.MaxTotalNodes != 50 {
+		t.Errorf("图级节点总量上限未落图: %+v", spec.Policies)
+	}
+	// map 预算必须包住全部分片, 否则合法的扇出会被 deadline 掐死。
+	single := graphNodeBudgetSec("writer", 0, false)
+	if want := capNodeBudget(single * 2); fan.TimeoutSec != want {
+		t.Errorf("map 节点预算 = %d, 期望 %d (单分片 %d × MaxShards 2, 夹 2h 硬顶)",
+			fan.TimeoutSec, want, single)
+	}
+	if fan.TimeoutSec <= single {
+		t.Errorf("map 节点预算 %d 未按分片数放大 (单分片 %d)", fan.TimeoutSec, single)
+	}
+}
+
+// TestTranslateMapWithoutPolicyRejected kind=map 但缺策略必须开图即失败, 不猜。
+func TestTranslateMapWithoutPolicyRejected(t *testing.T) {
+	const name = "graph-map-nopolicy"
+	RegisterGraphOverride(name, WorkflowGraphOverride{
+		Stages: map[string]StageGraphOverride{"fan": {Kind: "map"}},
+	})
+	t.Cleanup(func() { UnregisterGraphOverride(name) })
+	if _, err := TranslateWorkflow(fanoutTestWorkflow(name)); err == nil ||
+		!strings.Contains(err.Error(), "缺少 map 策略") {
+		t.Fatalf("kind=map 缺策略应被拒绝, 实得 %v", err)
+	}
+}
+
+// TestGraphMapReduceEndToEnd 真跑一次 map→reduce: 分片各自一次 LLM 调用、
+// 分片内容真的进了 prompt、reduce 拿到全部分片产出、分片在 team.Stages 里可见。
+func TestGraphMapReduceEndToEnd(t *testing.T) {
+	const name = "graph-fanout-e2e"
+	RegisterGraphOverride(name, WorkflowGraphOverride{
+		Stages: map[string]StageGraphOverride{
+			// 集合取 objective: executeGraph 只透传 Objective (不传 Params),
+			// 这是生产里最直接可用的确定性来源。
+			"fan":   {Kind: "map", Map: &graph.MapPolicy{Source: graph.SourceObjective, MaxShards: 5}},
+			"merge": {Kind: "reduce"},
+		},
+	})
+	t.Cleanup(func() { UnregisterGraphOverride(name) })
+
+	var mu sync.Mutex
+	shardPrompts := map[string]string{}
+	var mergePrompt string
+	we := newProgExecutor(func(ctx context.Context, role, prompt string) (string, error) {
+		node := NodeExecHintsFromContext(ctx).Node
+		mu.Lock()
+		switch {
+		case strings.Contains(node, "#"):
+			shardPrompts[node] = prompt
+		case node == "merge":
+			mergePrompt = prompt
+		}
+		mu.Unlock()
+		return stubStageOutput(role) + "\n产出于节点 " + node, nil
+	})
+	team := newStubTeam(t, "fanout")
+	results, err := we.executeGraph(context.Background(), fanoutTestWorkflow(name), "任务甲\n任务乙\n任务丙", team)
+	if err != nil {
+		t.Fatalf("图执行失败: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(shardPrompts) != 3 {
+		t.Fatalf("分片执行了 %d 次, 期望 3 (objective 三行 → 三片): %v", len(shardPrompts), shardPrompts)
+	}
+	for i, want := range []string{"任务甲", "任务乙", "任务丙"} {
+		id := fmt.Sprintf("fan#%d", i)
+		p, ok := shardPrompts[id]
+		if !ok {
+			t.Fatalf("缺分片 %s 的调用", id)
+		}
+		if !strings.Contains(p, want) {
+			t.Errorf("分片 %s 的 prompt 未含本片内容 %q (N 片会拿到同样输入 ⇒ 重复产出还烧 N 倍 token)", id, want)
+		}
+		if !strings.Contains(p, "本分片任务") {
+			t.Errorf("分片 %s 的 prompt 缺分片小节: %s", id, truncateForLog(p))
+		}
+	}
+	if !strings.Contains(mergePrompt, "待聚合的分片产出") {
+		t.Fatalf("reduce 的 prompt 未带分片产出小节: %s", truncateForLog(mergePrompt))
+	}
+	for i := 0; i < 3; i++ {
+		if !strings.Contains(mergePrompt, fmt.Sprintf("fan#%d", i)) {
+			t.Errorf("reduce prompt 缺分片 fan#%d 的产出", i)
+		}
+	}
+	// 顶层阶段结果: src/fan/merge (分片不是顶层阶段)
+	got := map[string]TaskStatus{}
+	for _, r := range results {
+		got[r.Name] = r.Status
+	}
+	for _, want := range []string{"src", "fan", "merge"} {
+		if got[want] != TaskCompleted {
+			t.Errorf("阶段 %s = %q, 期望 completed", want, got[want])
+		}
+	}
+	// 分片在 team.Stages 里可见 (dashboard 能逐片看进度)
+	team.mu.Lock()
+	stageNames := map[string]bool{}
+	for _, s := range team.Stages {
+		stageNames[s.Name] = true
+	}
+	team.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		if !stageNames[fmt.Sprintf("fan#%d", i)] {
+			t.Errorf("分片 fan#%d 未出现在 team.Stages (dashboard 上 8 分片扇出会显示成什么都没跑)", i)
+		}
+	}
+}
+
+func truncateForLog(s string) string {
+	if len(s) > 200 {
+		return s[:200] + "…"
+	}
+	return s
+}
+
+// TestFoldStageGroupsIntoLoopGroup 阶段组折叠: 成员进组、组内边保留、跨界边改接组节点。
+func TestFoldStageGroupsIntoLoopGroup(t *testing.T) {
+	const name = "graph-group-fold"
+	wf := &WorkflowDef{
+		Name: name,
+		Mode: "graph",
+		Stages: []StageDef{
+			{Name: "plan", Role: "researcher", Prompt: "计划"},
+			{Name: "gen", Role: "writer", Prompt: "写", DependsOn: []string{"plan"}},
+			{Name: "check", Role: "critic", Prompt: "查 {prev_result}", DependsOn: []string{"gen"}},
+			{Name: "ship", Role: "writer", Prompt: "交付", DependsOn: []string{"check"}},
+		},
+	}
+	RegisterGraphOverride(name, WorkflowGraphOverride{
+		DefaultRetry: &graph.RetryPolicy{MaxRetries: 0}, // 同上: 避开 2h 硬顶才验得出乘法
+		Groups: []StageGroupOverride{{
+			ID: "adv", Members: []string{"gen", "check"}, MaxIterations: 3,
+			Until: `output contains "验收通过"`, Feedback: "上轮: {prev_output}", ResultFrom: "check",
+		}}})
+	t.Cleanup(func() { UnregisterGraphOverride(name) })
+
+	spec, err := TranslateWorkflow(wf)
+	if err != nil {
+		t.Fatalf("直译失败: %v", err)
+	}
+	var ids []string
+	for _, n := range spec.Nodes {
+		ids = append(ids, n.ID)
+	}
+	if len(ids) != 3 || ids[0] != "plan" || ids[1] != "adv" || ids[2] != "ship" {
+		t.Fatalf("顶层节点 = %v, 期望 [plan adv ship] (组成员被折进组节点)", ids)
+	}
+	var grp graph.NodeSpec
+	for _, n := range spec.Nodes {
+		if n.ID == "adv" {
+			grp = n
+		}
+	}
+	if grp.Kind != graph.NodeKindLoopGroup || grp.Group == nil {
+		t.Fatalf("组节点 = %+v", grp)
+	}
+	if len(grp.Group.Nodes) != 2 || grp.Group.Nodes[0].ID != "gen" || grp.Group.Nodes[1].ID != "check" {
+		t.Fatalf("组成员 = %+v, 期望按阶段声明序 [gen check]", grp.Group.Nodes)
+	}
+	if len(grp.Group.Edges) != 1 || grp.Group.Edges[0].From != "gen" || grp.Group.Edges[0].To != "check" {
+		t.Fatalf("组内边 = %+v, 期望 gen→check", grp.Group.Edges)
+	}
+	if grp.Group.Loop.MaxIterations != 3 || grp.Group.ResultFrom != "check" ||
+		grp.Group.Loop.Feedback != "上轮: {prev_output}" {
+		t.Fatalf("组循环策略 = %+v", grp.Group.Loop)
+	}
+	edges := map[string]bool{}
+	for _, e := range spec.Edges {
+		edges[e.From+"→"+e.To] = true
+	}
+	if !edges["plan→adv"] || !edges["adv→ship"] || len(spec.Edges) != 2 {
+		t.Fatalf("跨界边未改接到组节点: %v", spec.Edges)
+	}
+	// 组节点预算 = 成员预算之和 × 轮次上限 (夹 2h 硬顶), 作卡死兜底。
+	sum := grp.Group.Nodes[0].TimeoutSec + grp.Group.Nodes[1].TimeoutSec
+	if want := capNodeBudget(sum * 3); grp.TimeoutSec != want {
+		t.Errorf("组节点预算 = %d, 期望 %d (成员之和 %d × 3 轮)", grp.TimeoutSec, want, sum)
+	}
+}
+
+// TestFoldStageGroupsErrors 组声明的各类误用必须开图即失败。
+func TestFoldStageGroupsErrors(t *testing.T) {
+	base := func() *WorkflowDef {
+		return &WorkflowDef{Name: "g", Mode: "graph", Stages: []StageDef{
+			{Name: "a", Role: "writer", Prompt: "a"},
+			{Name: "b", Role: "critic", Prompt: "b", DependsOn: []string{"a"}},
+			{Name: "c", Role: "writer", Prompt: "c"}, // 与 a 无边: 用于构造组产出歧义
+		}}
+	}
+	cases := []struct {
+		name    string
+		groups  []StageGroupOverride
+		wantSub string
+	}{
+		{"成员不存在", []StageGroupOverride{{Members: []string{"ghost"}, MaxIterations: 2}}, "不是本工作流的阶段"},
+		{"无成员", []StageGroupOverride{{ID: "x", MaxIterations: 2}}, "没有成员"},
+		{"无轮次上限", []StageGroupOverride{{Members: []string{"a"}}}, "maxIterations"},
+		{"组ID与阶段同名", []StageGroupOverride{{ID: "b", Members: []string{"a"}, MaxIterations: 2}}, "与已有阶段同名"},
+		{"resultFrom不是成员", []StageGroupOverride{{Members: []string{"a"}, MaxIterations: 2, ResultFrom: "b"}}, "不是组成员"},
+		{"成员被两组收编", []StageGroupOverride{
+			{ID: "g1", Members: []string{"a"}, MaxIterations: 2},
+			{ID: "g2", Members: []string{"a"}, MaxIterations: 2},
+		}, "被两个组同时收编"},
+		// a 与 c 之间没有边 ⇒ 两个出度 0 成员 ⇒ "组产出是谁"必须显式声明
+		{"组产出歧义", []StageGroupOverride{{ID: "g1", Members: []string{"a", "c"}, MaxIterations: 2}}, "result_from"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wf := base()
+			wf.Name = "grp-err-" + tc.name
+			RegisterGraphOverride(wf.Name, WorkflowGraphOverride{Groups: tc.groups})
+			t.Cleanup(func() { UnregisterGraphOverride(wf.Name) })
+			_, err := TranslateWorkflow(wf)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("应报错 (含 %q), 实得 %v", tc.wantSub, err)
+			}
+		})
+	}
+}
+
+// TestGraphLoopGroupEndToEnd 真跑组级循环: 两轮后 Until 命中, 回灌下发给全部成员。
+func TestGraphLoopGroupEndToEnd(t *testing.T) {
+	const name = "graph-group-e2e"
+	wf := &WorkflowDef{
+		Name: name, Mode: "graph",
+		Stages: []StageDef{
+			{Name: "gen", Role: "writer", Prompt: "写稿"},
+			{Name: "check", Role: "critic", Prompt: "审 {prev_result}", DependsOn: []string{"gen"}},
+			{Name: "ship", Role: "writer", Prompt: "交付", DependsOn: []string{"check"}},
+		},
+	}
+	RegisterGraphOverride(name, WorkflowGraphOverride{Groups: []StageGroupOverride{{
+		ID: "adv", Members: []string{"gen", "check"}, MaxIterations: 4,
+		Until: `output contains "验收通过"`, Feedback: "按上轮意见改: {prev_output}", ResultFrom: "check",
+	}}})
+	t.Cleanup(func() { UnregisterGraphOverride(name) })
+
+	var mu sync.Mutex
+	var genPrompts, refs []string
+	checkCalls := 0
+	we := newProgExecutor(func(ctx context.Context, role, prompt string) (string, error) {
+		h := NodeExecHintsFromContext(ctx)
+		mu.Lock()
+		defer mu.Unlock()
+		// Node = 成员语义名 (每轮相同); NodeRef = 带轮次的限定 ID (与 journal 对齐)。
+		switch h.Node {
+		case "gen":
+			refs = append(refs, h.NodeRef)
+			genPrompts = append(genPrompts, prompt)
+			return stubStageOutput(role) + "\n第 " + fmt.Sprint(len(genPrompts)) + " 稿", nil
+		case "check":
+			checkCalls++
+			if checkCalls >= 2 {
+				return stubStageOutput(role) + "\n验收通过", nil
+			}
+			return stubStageOutput(role) + "\n还需打磨", nil
+		}
+		return stubStageOutput(role), nil
+	})
+	team := newStubTeam(t, "grp")
+	results, err := we.executeGraph(context.Background(), wf, "写点东西", team)
+	if err != nil {
+		t.Fatalf("图执行失败: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(genPrompts) != 2 || checkCalls != 2 {
+		t.Fatalf("组内成员调用 gen=%d check=%d, 期望各 2 轮 (第二轮 Until 命中)", len(genPrompts), checkCalls)
+	}
+	if strings.Contains(genPrompts[0], "按上轮意见改") {
+		t.Error("第一轮不应有回灌")
+	}
+	if !strings.Contains(genPrompts[1], "按上轮意见改") || !strings.Contains(genPrompts[1], "还需打磨") {
+		t.Errorf("第二轮 gen 未收到组回灌: %s", truncateForLog(genPrompts[1]))
+	}
+	// 限定 ID 带轮次: 宿主据此把两轮的记录分开 (Node 两轮都是 "gen")
+	if len(refs) != 2 || refs[0] != "adv#it0/gen" || refs[1] != "adv#it1/gen" {
+		t.Errorf("NodeRef = %v, 期望 [adv#it0/gen adv#it1/gen]", refs)
+	}
+	got := map[string]TaskStatus{}
+	for _, r := range results {
+		got[r.Name] = r.Status
+	}
+	if got["adv"] != TaskCompleted || got["ship"] != TaskCompleted {
+		t.Fatalf("顶层阶段 = %+v, 期望组节点与下游都 completed", got)
+	}
+	// 组产出流向下游 + 黑板回写用组节点 ID
+	if team.Blackboard != nil {
+		if v, ok := team.Blackboard.Read("adv-result"); !ok || !strings.Contains(v, "验收通过") {
+			t.Errorf("黑板 adv-result = %q, 期望组产出 (下游 harvest/handoff 依赖这个键)", v)
+		}
+	}
+	// 组内成员按轮次出现在 team.Stages
+	team.mu.Lock()
+	names := map[string]bool{}
+	for _, s := range team.Stages {
+		names[s.Name] = true
+	}
+	team.mu.Unlock()
+	for _, want := range []string{"adv#it0/gen", "adv#it1/check"} {
+		if !names[want] {
+			t.Errorf("组内成员 %s 未出现在 team.Stages: %v", want, names)
+		}
+	}
+}
+
+// TestParseStageExpansion 三种产出形态都能被解析成子图, 且悬空子任务自动挂到父节点下。
+func TestParseStageExpansion(t *testing.T) {
+	t.Run("原生nodes/edges形态", func(t *testing.T) {
+		out := "分解如下\n```json\n" + `{"nodes":[{"id":"t1","kind":"agent","agent":{"role":"coder"}}],"edges":[{"from":"planner","to":"t1"}]}` + "\n```"
+		ex := parseStageExpansion("planner", "planner", out)
+		if ex == nil || len(ex.Nodes) != 1 || ex.Nodes[0].ID != "t1" || len(ex.Edges) != 1 {
+			t.Fatalf("原生形态解析结果 = %+v", ex)
+		}
+	})
+	t.Run("WBS形态_tasks_title_dependsOn_数字ID", func(t *testing.T) {
+		// 与 orchestrator.go 既有 planner 产出格式一致 (数字 id / title / dependsOn)
+		out := `前言{"tasks":[{"id":1,"title":"做甲","role":"coder"},{"id":2,"title":"做乙","role":"tester","dependsOn":[1]}]}尾巴`
+		ex := parseStageExpansion("plan", "writer", out)
+		if ex == nil || len(ex.Nodes) != 2 {
+			t.Fatalf("WBS 形态解析结果 = %+v", ex)
+		}
+		if ex.Nodes[0].ID != "1" || ex.Nodes[0].Agent.Prompt != "做甲" || ex.Nodes[0].Agent.Role != "coder" {
+			t.Fatalf("节点1 = %+v", ex.Nodes[0])
+		}
+		edges := map[string]bool{}
+		for _, e := range ex.Edges {
+			edges[e.From+"→"+e.To] = true
+		}
+		// 无依赖的挂父节点; 有依赖的连兄弟
+		if !edges["plan→1"] || !edges["1→2"] || len(ex.Edges) != 2 {
+			t.Fatalf("边 = %v, 期望 plan→1 与 1→2", ex.Edges)
+		}
+	})
+	t.Run("subtasks形态_未给角色则继承父角色", func(t *testing.T) {
+		ex := parseStageExpansion("p", "architect", `{"subtasks":[{"id":"x","task":"干活"}]}`)
+		if ex == nil || ex.Nodes[0].Agent.Role != "architect" {
+			t.Fatalf("未给角色应继承父节点角色: %+v", ex)
+		}
+	})
+	t.Run("无子图产出返回nil", func(t *testing.T) {
+		for _, out := range []string{"", "没有任何 JSON", `{"score":80}`, `{"tasks":[]}`, `{"tasks":[{"title":"缺id"}]}`} {
+			if ex := parseStageExpansion("p", "r", out); ex != nil {
+				t.Errorf("产出 %q 不该解析出子图: %+v", out, ex)
+			}
+		}
+	})
+}
+
+// TestGraphExpandEndToEnd 真跑一次动态展开: 分解阶段的产出被并入运行图并执行,
+// 下游阶段等到展开子图跑完。
+func TestGraphExpandEndToEnd(t *testing.T) {
+	const name = "graph-expand-e2e"
+	wf := &WorkflowDef{
+		Name: name, Mode: "graph",
+		Stages: []StageDef{
+			// 刻意不叫 plan / planner 角色: 那会触发 workflow.go 的 WBS 强校验,
+			// 与本测试要验的展开解析无关。
+			{Name: "decompose", Role: "architect", Prompt: "分解 {objective}"},
+			{Name: "sum", Role: "writer", Prompt: "汇总 {prev_result}", DependsOn: []string{"decompose"}},
+		},
+	}
+	RegisterGraphOverride(name, WorkflowGraphOverride{Stages: map[string]StageGraphOverride{
+		"decompose": {Expand: &graph.ExpandSpec{MaxNodes: 4, MaxDepth: 1}},
+	}})
+	t.Cleanup(func() { UnregisterGraphOverride(name) })
+
+	var mu sync.Mutex
+	ran := map[string]int{}
+	var sumPrompt string
+	we := newProgExecutor(func(ctx context.Context, role, prompt string) (string, error) {
+		node := NodeExecHintsFromContext(ctx).Node
+		mu.Lock()
+		ran[node]++
+		if node == "sum" {
+			sumPrompt = prompt
+		}
+		mu.Unlock()
+		if node == "decompose" {
+			return stubStageOutput(role) + "\n```json\n" +
+				`{"subtasks":[{"id":"甲","role":"writer","task":"做甲"},{"id":"乙","role":"writer","task":"做乙"}]}` +
+				"\n```", nil
+		}
+		return stubStageOutput(role) + "\n产出于 " + node, nil
+	})
+	team := newStubTeam(t, "expand")
+	if _, err := we.executeGraph(context.Background(), wf, "干三件事", team); err != nil {
+		t.Fatalf("图执行失败: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, id := range []string{"decompose/甲", "decompose/乙"} {
+		if ran[id] != 1 {
+			t.Fatalf("展开产物 %s 执行 %d 次, 期望 1 (ran=%v)", id, ran[id], ran)
+		}
+	}
+	// 重接线: sum 拿得到展开节点的产出 (否则"先分解再逐项执行再汇总"的汇总是空的)
+	for _, id := range []string{"decompose/甲", "decompose/乙"} {
+		if !strings.Contains(sumPrompt, id) {
+			t.Errorf("sum 的 prompt 未含展开节点 %s 的产出: %s", id, truncateForLog(sumPrompt))
+		}
+	}
+	// journal 里有 graph.expanded
+	j, err := graph.NewFileJournal(filepath.Join(team.dataDir, "graph-journal"))
+	if err != nil {
+		t.Fatalf("打开 journal: %v", err)
+	}
+	defer j.Close()
+	evs, err := j.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	n := 0
+	for _, ev := range evs {
+		if ev.Type == graph.EvGraphExpanded {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("journal 里 graph.expanded 事件数 = %d, 期望 1", n)
+	}
+}
+
+// TestGraphExpandOnlyWhenAuthorized 没声明 Expand 的阶段, 产出里的子图必须被忽略
+// (展开能力必须由图显式授予, 否则任何 runner 都能往运行图塞节点)。
+func TestGraphExpandOnlyWhenAuthorized(t *testing.T) {
+	const name = "graph-expand-unauth"
+	wf := &WorkflowDef{
+		Name: name, Mode: "graph",
+		Stages: []StageDef{{Name: "decompose", Role: "architect", Prompt: "分解"}},
+	}
+	var mu sync.Mutex
+	ran := map[string]int{}
+	we := newProgExecutor(func(ctx context.Context, role, _ string) (string, error) {
+		node := NodeExecHintsFromContext(ctx).Node
+		mu.Lock()
+		ran[node]++
+		mu.Unlock()
+		return stubStageOutput(role) + "\n" + `{"subtasks":[{"id":"甲","task":"做甲"}]}`, nil
+	})
+	if _, err := we.executeGraph(context.Background(), wf, "目标", newStubTeam(t, "unauth")); err != nil {
+		t.Fatalf("图执行失败: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ran) != 1 || ran["decompose"] != 1 {
+		t.Fatalf("未授权展开却多跑了节点: %v", ran)
 	}
 }

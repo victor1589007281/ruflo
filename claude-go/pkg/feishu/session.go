@@ -207,6 +207,19 @@ func NewSessionManager(config *BotConfig, apiClient *api.Client, mcpMgr *dynmcp.
 	return sm
 }
 
+// TraceStore 返回会话共享的轨迹底座 (可能为 nil)。
+//
+// 供 Bot 把同一个 Store 交给 ProductionTeamManager 写 gate Span
+// (design/03 §4.1 第 5 种 Kind: 门禁跑在团队层, 会话引擎看不到它)。
+// 刻意共享而不是让团队侧再 new 一个: Store 背后的 FileStore 锁表是 per-instance,
+// 两个实例写同一个目录等于没有互斥 (见上面 stateStore 的注释)。
+func (sm *SessionManager) TraceStore() *tracestore.Store {
+	if sm == nil {
+		return nil
+	}
+	return sm.traceStore
+}
+
 // teamStageMaxTurnsFloor 是 agent 工具循环的硬下限兜底。
 // 修复: 模型配置 maxTurns=0 经 `if mcfg.MaxTurns>0` 守卫被忽略后, 若 defaultResolved
 // 也为 0, 会让 engine.go 把 0 当"无限", agent 一直循环到 stageTimeout(10min) 才停,

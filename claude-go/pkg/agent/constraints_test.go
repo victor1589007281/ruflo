@@ -3,7 +3,9 @@ package agent
 // constraints_test.go —— design/01 §4.6 的两条硬要求各自对应一组断言:
 //  1. 「约束只能收窄不能放宽」(单调性, 安全属性): Narrow 系列测试逐维度证明放宽被拒,
 //     且被拒时**不返回子约束** —— 否则单调性就只是一句注释。
-//  2. 「单一真源」: TestProfileCaps_与真实注册表双向一致 用 pkg/tool/builtin 的真实
+//  2. 「单一真源」: 与真实工具注册表的双向核对在 constraints_registry_test.go
+//     (外部测试包 agent_test —— 它要 import pkg/tool/builtin, 而 builtin 经
+//     evotools → evolution/govern 反向依赖本包, 同包会构成测试导入环)。原注释:
 //     注册表反查本包的特权位表, 任何人往某档位加工具而忘了同步这里, 测试就红。
 
 import (
@@ -11,8 +13,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/anthropic/claude-go/pkg/tool"
-	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -461,111 +461,3 @@ func TestConstraintSet_nil接收者安全(t *testing.T) {
 // ---------------------------------------------------------------------------
 // 单一真源: 特权位表必须与真实注册表一致
 // ---------------------------------------------------------------------------
-
-// toolNameCaps 真实工具名 → 特权位。这是本测试唯一的"人工事实", 粒度比档位表细
-// 一级; 档位表 (profileCaps) 则必须能从它 + 真实注册内容推导出来。
-var toolNameCaps = map[string]Capability{
-	"Read": CapReadFS, "Glob": CapReadFS, "Grep": CapReadFS, "LSP": CapReadFS,
-	"Write": CapWriteFS, "StrReplace": CapWriteFS,
-	"EnterWorktree": CapWriteFS, "ExitWorktree": CapWriteFS,
-	"Shell": CapExec, "TaskOutput": CapExec, "TaskStop": CapExec,
-	"WebFetch": CapNet, "WebSearch": CapNet, "FetchKLine": CapNet, "FetchQuote": CapNet,
-	"code_intel_query": CapReadIndex, "code_intel_status": CapReadIndex, "code_intel_branch": CapReadIndex,
-	"code_intel_init": CapWriteIndex, "code_intel_update": CapWriteIndex,
-	"EnterPlanMode": CapPlan, "ExitPlanMode": CapPlan,
-	"TodoWrite": CapTask, "TaskCreate": CapTask, "TaskGet": CapTask, "TaskUpdate": CapTask, "TaskList": CapTask,
-	"AskUserQuestion": CapInteract,
-	"GenerateImage":   CapMedia, "GenerateGIF": CapMedia, "GenerateVideo": CapMedia,
-	"GeneratePPTX": CapMedia, "GenerateChart": CapMedia, "GenerateSpeech": CapMedia,
-	"TeamCreate": CapTeam, "TeamDelete": CapTeam, "TeamMailbox": CapTeam,
-	"Config": CapAdminExtra, "Skill": CapAdminExtra, "ComputerUseStatus": CapAdminExtra,
-	"CronCreate": CapAdminExtra, "CronDelete": CapAdminExtra, "CronList": CapAdminExtra,
-	// 不扩大能力边界的输出/检索成型类工具, 不占特权位 (见 Capability 注释)。
-	"StructuredOutput": 0, "ToolSearch": 0,
-}
-
-func realProfileTools(t *testing.T, profile builtin.ToolProfile) []string {
-	t.Helper()
-	reg := tool.NewRegistry()
-	builtin.RegisterProfileToolsWithStore(reg, nil, nil, profile)
-	return reg.Names()
-}
-
-func TestProfileCaps_每个工具都已分类(t *testing.T) {
-	// 往任何档位加新工具而忘了分类, 这里就会红 —— 强制新工具必须明确它的特权维度,
-	// 否则档位偏序 (Narrow 的判据) 会静默失真。
-	for _, p := range []builtin.ToolProfile{
-		builtin.ToolProfileChat, builtin.ToolProfileAnalysis, builtin.ToolProfileTeam,
-		builtin.ToolProfileResearch, builtin.ToolProfileCoding, builtin.ToolProfileAdmin,
-	} {
-		for _, name := range realProfileTools(t, p) {
-			if _, ok := toolNameCaps[name]; !ok {
-				t.Errorf("档位 %s 里的工具 %q 未在 toolNameCaps 分类; "+
-					"请给它定特权维度并同步 profileCaps", p, name)
-			}
-		}
-	}
-}
-
-func TestProfileCaps_与真实注册表双向一致(t *testing.T) {
-	profiles := []builtin.ToolProfile{
-		builtin.ToolProfileChat, builtin.ToolProfileAnalysis, builtin.ToolProfileTeam,
-		builtin.ToolProfileResearch, builtin.ToolProfileCoding, builtin.ToolProfileAdmin,
-	}
-	// 每个档位的"特权工具集" (剔除不占位的成型类工具)。
-	privileged := map[builtin.ToolProfile]map[string]bool{}
-	for _, p := range profiles {
-		set := map[string]bool{}
-		for _, name := range realProfileTools(t, p) {
-			if toolNameCaps[name] != 0 {
-				set[name] = true
-			}
-		}
-		privileged[p] = set
-	}
-
-	subset := func(a, b map[string]bool) bool {
-		for n := range a {
-			if !b[n] {
-				return false
-			}
-		}
-		return true
-	}
-
-	// 双向一致: 「特权位表说 child 可收窄自 parent」⟺「真实特权工具集 child ⊆ parent」。
-	// 少一个方向就只能证明表不冒进 / 表不保守其中一半。
-	for _, child := range profiles {
-		for _, parent := range profiles {
-			byTable := ProfileNarrows(string(child), string(parent))
-			byReal := subset(privileged[child], privileged[parent])
-			if byTable != byReal {
-				t.Errorf("%s ⊆ %s: 特权位表说 %v, 真实注册表说 %v —— profileCaps 与 "+
-					"pkg/tool/builtin/profile.go 漂移了", child, parent, byTable, byReal)
-			}
-		}
-	}
-	// 顺带钉住 admin 是顶元素这一历史行为 (admin = 全部内置工具)。
-	for _, p := range profiles {
-		if !subset(privileged[p], privileged[builtin.ToolProfileAdmin]) {
-			t.Errorf("admin 应是 %s 的超集", p)
-		}
-	}
-}
-
-func TestProfileCaps_档位名与builtin常量逐字一致(t *testing.T) {
-	// 两处字符串必须相同, 否则宿主传进来的档位名会全部"不可识别"→ Narrow 全拒。
-	pairs := map[string]builtin.ToolProfile{
-		ProfileChat: builtin.ToolProfileChat, ProfileResearch: builtin.ToolProfileResearch,
-		ProfileCoding: builtin.ToolProfileCoding, ProfileTeam: builtin.ToolProfileTeam,
-		ProfileAnalysis: builtin.ToolProfileAnalysis, ProfileAdmin: builtin.ToolProfileAdmin,
-	}
-	if len(pairs) != len(profileCaps) {
-		t.Fatalf("档位数量不一致: 本包 %d, 对照 %d", len(profileCaps), len(pairs))
-	}
-	for mine, theirs := range pairs {
-		if mine != string(theirs) {
-			t.Errorf("档位名不一致: %q vs %q", mine, theirs)
-		}
-	}
-}

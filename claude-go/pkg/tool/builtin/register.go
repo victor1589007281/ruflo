@@ -104,6 +104,11 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	reg.Register(NewCodeIntelQueryTool())
 	reg.Register(NewCodeIntelBranchTool())
 
+	// 进化操作台 (design/03 §4.7): agent 自助编排进化实验的 evo_* 七件套。
+	// 放在 admin/base 集里而不是每个档位: 做进化实验是运维/自省动作, 不该出现在
+	// 每个团队角色的工具 schema 里 (那是纯粹的 token 浪费)。
+	RegisterEvolutionTools(reg)
+
 	// Computer Use (截屏/鼠标/键盘控制)
 	computeruse.RegisterAll(reg, nil)
 

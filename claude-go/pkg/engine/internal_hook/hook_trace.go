@@ -138,6 +138,13 @@ func (h *TraceCaptureHook) captureTurn(ctx *HookContext, ids trace.IDs, now time
 	})
 }
 
+// JoinAssistantText 导出 joinTextBlocks, 供 pkg/engine 的 llm_call Span 复用。
+//
+// 刻意不在 engine 侧另写一份: turn Span 与 llm_call Span 的 Output 必须用同一套
+// "assistant 产出文本化"规则 (尤其 tool_use 的呈现), 否则学习管线拿两者做 diff
+// 会看到纯属格式差异的假变更。
+func JoinAssistantText(blocks []types.ContentBlock) string { return joinTextBlocks(blocks) }
+
 // joinTextBlocks 拼接 content blocks 里的 text/thinking (thinking 以标注前缀保留)。
 func joinTextBlocks(blocks []types.ContentBlock) string {
 	var parts []string

@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,8 +14,8 @@ import (
 func RegisterTeamCommands(r *Registry) {
 	r.Register(&Command{
 		Name:        "team",
-		ArgHint:     "[create|run|refine|fork|resume|status|stop|list|delete|workflows]",
-		Description: "团队管理 (create/run/refine/fork/resume/status/stop/list/delete/workflows)",
+		ArgHint:     "[create|run|refine|rate|fork|resume|status|stop|list|delete|workflows]",
+		Description: "团队管理 (create/run/refine/rate/fork/resume/status/stop/list/delete/workflows)",
 		Type:        CommandTypeLocal,
 		Execute: func(args string, ctx *CommandContext) error {
 			if ctx.TeamMgr == nil {
@@ -111,6 +112,31 @@ func RegisterTeamCommands(r *Registry) {
 					}
 				}
 
+			case "rate":
+				// 用户显式评分 (design/03 §4.2 第 3 行 user.explicit)。
+				//
+				// 这是设计里价值最高、此前**完全没有入口**的奖励源: 系统跑完一个团队后,
+				// 人只能选择"再精修"或"什么都不说", 没有办法直接说"这次做得好/不好"。
+				// 精修 (user.steer) 只能表达不满, 满意是表达不出来的 —— 于是正向的人类
+				// 信号在奖励总线上恒为零。
+				if len(parts) < 3 {
+					fmt.Println("用法: /team rate <名称> <1-5> [评语]")
+					fmt.Println("说明: 给团队最近一次运行打分, 作为最高可信度的奖励信号进入学习闭环。")
+					fmt.Println("  1★=很差 3★=可用但平庸(中性) 5★=很好")
+					return nil
+				}
+				stars, convErr := strconv.Atoi(parts[2])
+				if convErr != nil {
+					fmt.Printf("[评分需为 1-5 的整数, 收到 %q]\n", parts[2])
+					return nil
+				}
+				comment := strings.Join(parts[3:], " ")
+				if err := ctx.TeamMgr.RateTeam(parts[1], stars, comment); err != nil {
+					fmt.Printf("[评分失败: %v]\n", err)
+					return nil
+				}
+				fmt.Printf("⭐ 已记录对团队 **%s** 的 %d 星评分 (进入奖励总线, 权重 0.8)\n", parts[1], stars)
+
 			case "fork":
 				if len(parts) < 3 {
 					fmt.Println("用法: /team fork <源团队> <新团队名>")
@@ -200,7 +226,7 @@ func RegisterTeamCommands(r *Registry) {
 				fmt.Println("  hiring       — 应聘招聘 (JD分析→模拟面试)")
 
 			default:
-				fmt.Printf("未知子命令: %s\n用法: /team [create|run|refine|fork|resume|status|stop|list|delete|workflows]\n", sub)
+				fmt.Printf("未知子命令: %s\n用法: /team [create|run|refine|rate|fork|resume|status|stop|list|delete|workflows]\n", sub)
 			}
 			return nil
 		},

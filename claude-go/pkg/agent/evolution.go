@@ -174,6 +174,7 @@ const (
 	rewardWeightUser          = 0.8 // 人的显式反馈
 	rewardWeightLLMJudge      = 0.5 // LLM 评分类
 	rewardWeightEpisode       = 0.3 // 运行终态
+	rewardWeightShaping       = 0.2 // cost/latency 等 shaping 负项 (真实计量但非质量判断)
 	rewardWeightUnknown       = 0.5 // 未登记的源
 )
 
@@ -192,12 +193,16 @@ func RewardSourceWeight(source string) float64 {
 	switch strings.ToLower(strings.TrimSpace(source)) {
 	case RewardSourceGateCompile, RewardSourceGateTest, "gate.lint", "gate.e2e":
 		return rewardWeightDeterministic
-	case "user.explicit", "user.feedback":
+	case RewardSourceUserExplicit, RewardSourceUserSteer, "user.feedback":
 		return rewardWeightUser
-	case RewardSourceGateContent, "gate.review", "llm.judge":
+	case RewardSourceGateContent, RewardSourceReviewPanel, "gate.review", "llm.judge":
 		return rewardWeightLLMJudge
 	case RewardSourceEpisode:
 		return rewardWeightEpisode
+	case RewardSourceLatency, "cost":
+		// shaping 负项: 是真实计量 (时长/token) 而非质量判断, 不该与"做得好不好"
+		// 同权重竞争 —— 它只负责在其他信号打平时把"又慢又贵"的那个往下压。
+		return rewardWeightShaping
 	default:
 		return rewardWeightUnknown
 	}
@@ -1493,6 +1498,17 @@ type EvolutionStats struct {
 	GeneralPrinciples int `json:"generalPrinciples"`
 	TotalUsageCount   int `json:"totalUsageCount"`   // 经验被注入的总次数
 	AvgQuality        float64 `json:"avgQuality"`    // 平均质量分
+}
+
+// DataDir 返回进化数据目录 (<state>/evolution)。
+//
+// 供 pkg/evolution/learners 与 evo 操作台定位 rewards.jsonl / trajectories.json ——
+// 它们读的是"格式即契约"的磁盘文件, 但路径这件事只有引擎自己知道。
+func (ee *EvolutionEngine) DataDir() string {
+	if ee == nil {
+		return ""
+	}
+	return ee.dataDir
 }
 
 // CollectMetrics 采集进化引擎全部 18 项持续观测指标。

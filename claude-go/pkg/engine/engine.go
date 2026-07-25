@@ -1014,6 +1014,21 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			e.HookRunner.ExecutePostRequestHooks(messages, currentModel)
 		}
 
+		// llm_call Span (design/03 §4.1 E1 第 4 种 Kind)。
+		//
+		// 位置必须在读 errCh **之后**、错误分支 continue **之前**: 失败的调用同样是
+		// 轨迹的一部分 (重试次数/PTL/换模型都是 action 的组成), 若只在成功路径写,
+		// 学习管线看到的会是一串"一次就成"的假象。errCh 从 if 语句作用域提出来,
+		// 下面的错误处理逐字未动。
+		streamErr := <-errCh
+		e.writeLLMCallSpan(apiCtx, llmCallSpan{
+			Start: apiCallStart, Model: currentModel, System: systemPrompt,
+			Messages: apiMessages, Tools: apiTools,
+			Output: internal_hook.JoinAssistantText(assistantBlocks),
+			Usage:  usage, StopReason: stopReason, Err: streamErr, Stream: true,
+			Attempt: consecutiveErrors,
+		})
+
 		// ============================================================
 		// 错误处理: PTL / fallback / 断路器
 		// 对应 TS: FallbackTriggeredError, PromptTooLongError 处理
@@ -1024,7 +1039,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		//   - BadRequest/Auth → 立即终止, 不消耗其他族的预算
 		//   - RateLimit/Overload/Network → 按族 backoff
 		// ============================================================
-		if streamErr := <-errCh; streamErr != nil {
+		if streamErr != nil {
 			// PTL (Prompt Too Long) → 触发 reactive compact
 			// 对应 TS: catch PromptTooLongError → runCompaction
 			var ptlErr *api.PromptTooLongError

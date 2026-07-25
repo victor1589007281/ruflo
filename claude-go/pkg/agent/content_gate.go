@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 
 	"fmt"
-	"github.com/anthropic/claude-go/pkg/trace"
 	"strings"
+	"time"
+
+	"github.com/anthropic/claude-go/pkg/trace"
 )
 
 // 内容质量门禁: 给 pipeline 类写作工作流 (techblog/research 等) 补上"评审→未达标→自动修订"环。
@@ -58,17 +60,35 @@ func (ptm *ProductionTeamManager) tryContentQualityGate(ctx context.Context, tea
 		if ctx.Err() != nil {
 			return results
 		}
+		gateStart := time.Now()
 		v := ptm.runContentCritic(ctx, team.Objective, results[idx].Output)
 		if v == nil {
-			return results // 评审不可用 → 不阻塞交付
+			// 评审不可用 → 不阻塞交付, 但留一条 skipped 轨迹: 否则"没评审"与
+			// "评审通过"在事后不可区分 (design/03 §4.5 的静默跳过教训)。
+			ptm.writeGateSpan(ctx, team, gateSpanInput{
+				Gate: RewardSourceGateContent, Node: results[idx].Name,
+				Input: results[idx].Output, Detail: "内容评审不可用 (LLM 无响应或解析失败)",
+				Skipped: true, Start: gateStart,
+			})
+			return results
 		}
+		// gate Span (design/03 §4.1 Kind=gate): 与下面的 gate.content 奖励同源同处。
+		ptm.writeGateSpan(ctx, team, gateSpanInput{
+			Gate: RewardSourceGateContent, Node: results[idx].Name,
+			Input:  results[idx].Output,
+			Detail: strings.Join(v.Issues, "\n"),
+			Score:  float64(v.Score)/50.0 - 1.0,
+			Raw:    v.Score,
+			Pass:   v.Pass || v.Score >= contentQualityThreshold,
+			Start:  gateStart,
+		})
 		// 奖励持久化 (design/03 §4.2): 0-100 分归一化到 [-1,1] 落 rewards.jsonl,
 		// 修复"content_gate 连续分用完即丢"(design/03 §1.4)。
 		if ptm.evolution != nil {
 			ptm.evolution.RecordReward(RewardEvent{
 				RunID:  trace.From(ctx).RunID,
 				NodeID: results[idx].Name,
-				Source: "gate.content",
+				Source: RewardSourceGateContent,
 				Value:  float64(v.Score)/50.0 - 1.0,
 				Raw:    v.Score,
 				Team:   team.Name,

@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/evolution/govern"
 )
 
 // 锁定的治理参数 (design/03 §4.6 四律: 判据不可被 agent 修改)。
@@ -37,7 +39,9 @@ type SkillState struct {
 	CreatedAt string
 	Samples   int     // 参与裁决的奖励样本数
 	RewardAvg float64 // 相关奖励均值
-	Verdict   string  // promote | retire | hold | (空=非 shadow 不裁决)
+	Verdict   string  // promote | retire | hold | reject_escalation | (空=非 shadow 不裁决)
+	// RejectReasons 不越权闸的拒绝理由 (Verdict=reject_escalation 时非空)。
+	RejectReasons []string
 }
 
 // AuditResult 一次审计的汇总。
@@ -46,6 +50,11 @@ type AuditResult struct {
 	Promoted  []string
 	Retired   []string
 	Held      []string
+	// Rejected 奖励达标但被不越权闸拦下的技能 (design/03 §4.6)。
+	// 单列一档而不并进 Held: "分数不够先等等"与"越权被拒"要人做的事完全不同。
+	Rejected []string
+	// RejectReasons 技能名 → 拒绝理由, 供操作台展示。
+	RejectReasons map[string][]string
 }
 
 // rewardRow rewards.jsonl 的最小字段。
@@ -64,7 +73,7 @@ func Audit(skillsDir, rewardsPath string, apply bool) (*AuditResult, error) {
 		return &AuditResult{}, nil
 	}
 
-	res := &AuditResult{}
+	res := &AuditResult{RejectReasons: map[string][]string{}}
 	err := filepath.Walk(skillsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info == nil || info.IsDir() || !strings.HasSuffix(path, "SKILL.md") {
 			return nil
@@ -95,6 +104,19 @@ func Audit(skillsDir, rewardsPath string, apply bool) (*AuditResult, error) {
 			st.Verdict = "hold"
 			res.Held = append(res.Held, st.Name)
 		case st.RewardAvg >= promoteThreshold:
+			// 不越权闸 (design/03 §4.6 四律, 见 pkg/evolution/govern): 奖励够高**不等于**
+			// 可以晋升。一个 LLM 自己提炼出来的技能若在 frontmatter 里声明了 Bash/Write,
+			// 晋升成 active 就等于让被优化的系统自己扩大动作空间。
+			//
+			// 顺序刻意放在奖励判据**之后**: 拒绝理由要能说清"分数够了但权限面越界",
+			// 而不是笼统的"没过闸"。
+			if v := govern.CheckSkillPromotion(path, nil); !v.Allowed {
+				st.Verdict = "reject_escalation"
+				st.RejectReasons = v.Reasons
+				res.Rejected = append(res.Rejected, st.Name)
+				res.RejectReasons[st.Name] = v.Reasons
+				return nil
+			}
 			st.Verdict = "promote"
 			res.Promoted = append(res.Promoted, st.Name)
 			if apply {
@@ -115,11 +137,20 @@ func Audit(skillsDir, rewardsPath string, apply bool) (*AuditResult, error) {
 	return res, err
 }
 
-// Promote/Retire 手动改状态 (evo 操作台的 promote/rollback, 带谱系记录)。
+// SetStatus 手动改状态 (evo 操作台的 promote/rollback, 带谱系记录)。
 // 只在 status 为 shadow/active/archived 间迁移; 锁定判据不受此影响 (人工覆盖需留痕)。
+//
+// **晋升方向 (→active) 同样过不越权闸**: 手动通道若能绕过, 那机械强制就只是给自动
+// 通道加的装饰 —— 而 §4.7 的 evo_promote 工具正是走这条手动通道, agent 可达。
+// 收紧方向 (→shadow/archived) 不检查: 把权限面变小永远不是提权。
 func SetStatus(skillPath, newStatus string) error {
 	if newStatus != "shadow" && newStatus != "active" && newStatus != "archived" {
 		return fmt.Errorf("skillaudit: 非法状态 %q (仅 shadow/active/archived)", newStatus)
+	}
+	if newStatus == "active" {
+		if v := govern.CheckSkillPromotion(skillPath, nil); !v.Allowed {
+			return v.Error()
+		}
 	}
 	return rewriteStatus(skillPath, newStatus, 0, 0)
 }

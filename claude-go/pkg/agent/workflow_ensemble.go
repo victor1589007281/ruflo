@@ -337,6 +337,10 @@ func (we *WorkflowExecutor) executeReviewPanel(ctx context.Context, _ *WorkflowD
 		return nil, fmt.Errorf("合议评审: 无任何可解析的评审结果 [%s]", strings.Join(diag, " | "))
 	}
 	fused := fuseReviews(docs)
+	// review.panel 奖励 (design/03 §4.2 第 5 行): 融合 overall 是截尾均值 (抗单个
+	// 离群评审), 比单次 LLM 打分更稳。此前它只被 MarshalIndent 进 stage 文本,
+	// 学习侧要重新解析散文才能拿到 —— 现在结构化入 RewardBus。
+	recordReviewPanelReward(ctx, we.evolution, team, fused.Overall, fused.Consensus)
 	data, _ := json.MarshalIndent(fused, "", "  ")
 	notify(fmt.Sprintf("✅ 合议评审完成: %d/%d 位有效 → 融合 overall %.0f, 共识 %.0f%%", len(docs), len(reviewLenses), fused.Overall, fused.Consensus*100))
 	output := fmt.Sprintf("合议评审(%d 位, 截尾均值)结果:\n\n```json\n%s\n```\n", len(docs), string(data))

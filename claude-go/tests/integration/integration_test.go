@@ -26,8 +26,8 @@ import (
 )
 
 const (
-	testAPIKey = "sk-sp-b0a692b1b8384b72971fe4d3a42798a1"
-	testModel  = "qwen3.5-plus"
+	testAPIKey  = "sk-sp-b0a692b1b8384b72971fe4d3a42798a1"
+	testModel   = "qwen3.5-plus"
 	testBaseURL = "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1"
 )
 
@@ -371,7 +371,7 @@ func TestRoleRegistry(t *testing.T) {
 	// 注册自定义角色
 	reg.RegisterCustom(&agent.RoleDef{
 		Name: "my-custom", Category: "workflow",
-		Description: "自定义测试角色",
+		Description:  "自定义测试角色",
 		SystemPrompt: "你是测试角色 {objective}",
 	})
 	custom := reg.Get("my-custom")
@@ -408,29 +408,35 @@ func TestAgentPoolAutoScale(t *testing.T) {
 		t.Errorf("初始大小应为 4, 实际: %d", stats.MaxSize)
 	}
 
-	// 模拟 8 个并行任务 → 应扩容
+	// 8 个待办 → **渐进扩容而非一步到位**。
+	//
+	// 这个测试此前断言 "至少扩到 8" 并因此长期失败: 它写在 commit 44b9c2ed2
+	// (AutoScale 防震荡) 之前, 那次改动刻意给扩缩加了"单次最多变化 50%"的步进限制
+	// 与 30s 冷却期。从 4 起步、maxStep=2, 一次调整只能到 6。
+	//
+	// 断言步进上界而不是"扩到 8", 是因为防震荡是**有意的**设计: 池里的 agent 是
+	// 长生命周期对象, 骤增骤降比慢一点收敛代价更大。
 	pool.AutoScale(8)
 	stats = pool.Stats()
-	if stats.MaxSize < 8 {
-		t.Errorf("8 个任务时池应扩容到至少 8, 实际: %d", stats.MaxSize)
+	if stats.MaxSize != 6 {
+		t.Errorf("从 4 起单次调整应受 50%% 步进限制到 6, 实际: %d", stats.MaxSize)
 	}
-	t.Logf("✓ AutoScale(8): 池大小 → %d", stats.MaxSize)
+	t.Logf("✓ AutoScale(8): 4 → %d (渐进步进)", stats.MaxSize)
 
-	// 模拟 2 个任务 → 应缩容到最小
-	pool.AutoScale(2)
+	// 冷却期内的调整必须是空操作 —— 没有它, 待办数抖动会让池跟着抖。
+	before := stats.MaxSize
+	pool.AutoScale(2)  // 想缩
+	pool.AutoScale(20) // 想大幅扩
 	stats = pool.Stats()
-	if stats.MaxSize != 4 {
-		t.Logf("AutoScale(2): 池大小 → %d (最小 4)", stats.MaxSize)
+	if stats.MaxSize != before {
+		t.Errorf("30s 冷却期内不应发生任何调整: %d → %d", before, stats.MaxSize)
 	}
-	t.Logf("✓ AutoScale(2): 池大小 → %d", stats.MaxSize)
+	t.Logf("✓ 冷却期内 AutoScale(2)/AutoScale(20) 均为空操作, 池仍为 %d", stats.MaxSize)
 
-	// 模拟 20 个任务 → 应不超过上限
-	pool.AutoScale(20)
-	stats = pool.Stats()
-	if stats.MaxSize > 16 {
-		t.Errorf("池大小不应超过 16, 实际: %d", stats.MaxSize)
-	}
-	t.Logf("✓ AutoScale(20): 池大小 → %d (上限 16)", stats.MaxSize)
+	// 注: 多轮收敛 (8 待办最终是否真能到 10) 与上限 32 的行为无法在此断言 ——
+	// scaleCooldown 未导出且无可注入时钟, 外部测试包没有推进时间的手段。
+	// 原测试里的"上限 16"实际什么也没测: 代码的 maxCap 是 32, 那条断言只是因为
+	// 冷却期挡住了扩容才碰巧通过。
 }
 
 // TestWorkflowWithEvolution 测试工作流 + 进化引擎端到端
@@ -686,8 +692,8 @@ func (e *testCronExecutor) TriggerSync(_ context.Context, _ string) (string, err
 	return "sync ok", nil
 }
 func (e *testCronExecutor) WikiOrganize(_ context.Context, _ string) (string, error) { return "", nil }
-func (e *testCronExecutor) WikiHealthCheck(_ context.Context) (string, error) { return "", nil }
-func (e *testCronExecutor) WikiLint(_ context.Context) (string, error) { return "", nil }
+func (e *testCronExecutor) WikiHealthCheck(_ context.Context) (string, error)        { return "", nil }
+func (e *testCronExecutor) WikiLint(_ context.Context) (string, error)               { return "", nil }
 func (e *testCronExecutor) Notify(chatID, message string) {
 	if e.onNotify != nil {
 		e.onNotify(chatID, message)
