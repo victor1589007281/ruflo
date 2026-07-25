@@ -62,6 +62,35 @@ type RoleRegistry struct {
 	skillRegistry     *skills.Registry
 	recommendedByRole map[string][]string
 	profile           skills.ProjectProfile
+	// selector 技能选择器 (design/01 §4.7)。nil = 回落到下方的静态拼接逻辑,
+	// 这是默认值 —— 6 个下游平台的注入内容不能因引入选择器而变。
+	selector *SkillSelector
+}
+
+// SetSkillSelector 启用技能选择器 (design/01 §4.7)。
+//
+// 传 nil 可随时关掉回到静态逻辑。选择器只接管"内置技能 + 角色推荐"这部分的取舍,
+// 文件型技能 (role.Skills 指向的路径) 仍按原样逐个读入 —— 它们是显式路径, 不参与
+// 相关性竞争。
+func (rr *RoleRegistry) SetSkillSelector(s *SkillSelector) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	rr.selector = s
+}
+
+// NewSkillSelectorForRoles 用本注册表的技能库构造一个选择器, 便于调用方一行启用。
+func (rr *RoleRegistry) NewSkillSelectorForRoles(cfg SkillSelectorConfig) *SkillSelector {
+	if rr == nil || rr.skillRegistry == nil {
+		return nil
+	}
+	return NewSkillSelector(rr.skillRegistry, cfg)
+}
+
+// currentSelector 读锁下取选择器 (SetSkillSelector 可能并发调用)。
+func (rr *RoleRegistry) currentSelector() *SkillSelector {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	return rr.selector
 }
 
 // NewRoleRegistry 创建角色注册表并注册所有内置角色。
@@ -136,7 +165,21 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 			}
 			skillContent.WriteString(fmt.Sprintf("### Skill: %s\n%s\n\n", filepath.Base(sp), content))
 		}
-		for _, name := range limitRoleSkillNames(uniqueRoleStrings(append(append([]string{}, role.BuiltinSkills...), rr.RecommendedSkills(roleName)...)), maxRoleBuiltinSkills) {
+		// 内置技能名单: 有选择器就交给它 (预算感知 + 相关性补选, design/01 §4.7),
+		// 否则回落到原来的"去重 + 条数截断"。两条路径的差别只在**怎么选**,
+		// 注入格式完全一致。
+		builtinNames := limitRoleSkillNames(uniqueRoleStrings(append(append([]string{}, role.BuiltinSkills...), rr.RecommendedSkills(roleName)...)), maxRoleBuiltinSkills)
+		if sel := rr.currentSelector(); sel != nil {
+			s := sel.Select(role.BuiltinSkills, rr.RecommendedSkills(roleName), objective)
+			builtinNames = s.Names()
+			if len(s.Dropped) > 0 {
+				// 此前被条数截断的技能是静默消失的; 记一行以便回答
+				// "为什么这个技能没被注入"。
+				log.Printf("[skill-selector] 角色 %s: 选中 %d 个(%d 字符), 因预算/条数挤掉 %v",
+					roleName, len(builtinNames), s.UsedChars, s.Dropped)
+			}
+		}
+		for _, name := range builtinNames {
 			if rr.skillRegistry == nil {
 				continue
 			}
