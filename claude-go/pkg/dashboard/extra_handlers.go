@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1228,7 +1229,9 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "cron.trigger":
 		hint = "已排队立即触发, 需要主进程消费 (feishu bot / daemon) 才能真正运行。"
 	case "team.create":
-		if s.cfg.TeamAction != nil && !actionSinkOwns(kind, action) {
+		if im, h, ok := s.forwardActionToControl(r, kind, action, target, payload); ok {
+			immediate, hint = im, h
+		} else if s.cfg.TeamAction != nil && !actionSinkOwns(kind, action) {
 			if err := s.cfg.TeamAction(action, target, payload); err != nil {
 				hint = fmt.Sprintf("操作失败: %v", err)
 			} else {
@@ -1250,7 +1253,9 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case "team.run":
-		if s.cfg.TeamAction != nil && !actionSinkOwns(kind, action) {
+		if im, h, ok := s.forwardActionToControl(r, kind, action, target, payload); ok {
+			immediate, hint = im, h
+		} else if s.cfg.TeamAction != nil && !actionSinkOwns(kind, action) {
 			if err := s.cfg.TeamAction(action, target, payload); err != nil {
 				hint = fmt.Sprintf("操作失败: %v", err)
 			} else {
@@ -1291,38 +1296,8 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			} else {
 				immediate = fmt.Sprintf("团队 %s 已执行 %s", target, action)
 			}
-		} else if base := s.botAPIBase(); base != "" {
-			// 转发到控制面 (飞书 bot 的 wiki API, 已挂载带 TeamAction 的 dashboard)。
-			// 基址经 botAPIBase 解析: 支持 CLAUDE_GO_BOT_API_URL 覆盖回环默认值,
-			// 见 l5_control_plane.go。
-			forwardURL := base + r.URL.Path
-			req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, forwardURL, r.Body)
-			if err != nil {
-				hint = fmt.Sprintf("转发失败: %v", err)
-				break
-			}
-			req.Header.Set("Content-Type", "application/json")
-			// bot 侧启用 wiki.apiSecret 后, 不带 token 的转发会 401。
-			if tok := s.botAPIToken(); tok != "" {
-				req.Header.Set("Authorization", "Bearer "+tok)
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				hint = fmt.Sprintf("转发到 bot API 失败: %v", err)
-				break
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				var fwd actionResp
-				if json.NewDecoder(resp.Body).Decode(&fwd) == nil {
-					immediate = fwd.Message
-					hint = fwd.Hint
-				} else {
-					immediate = fmt.Sprintf("团队 %s 已执行 %s", target, action)
-				}
-			} else {
-				hint = fmt.Sprintf("Bot API 返回 %s", resp.Status)
-			}
+		} else if im, h, ok := s.forwardActionToControl(r, kind, action, target, payload); ok {
+			immediate, hint = im, h
 		} else {
 			hint = "无主进程消费, 请通过飞书发送 /team stop " + target
 		}
@@ -1517,3 +1492,64 @@ func truncateString(s string, max int) string {
 
 // ensure strconv usage (linked here for consistency in case future handlers need it).
 var _ = strconv.Itoa
+
+// forwardActionToControl 把动作转发给控制面 (design/02 §3.5 "dashboard 全部改走控制面")。
+//
+// ok=false 表示"这里不该转发"(没配基址, 或本进程自己就有执行能力), 调用方继续走本地路径。
+//
+// ## 为什么需要它
+//
+// 独立部署的只读 dashboard 没有 TeamAction、也没有队列消费方, 于是 team.create/team.run
+// 只会**落盘无人消费** —— 回包甚至提示用户"可手动运行 claude-go team create ..."。而
+// team.stop/refine 那一组早就有转发。同一个面板上一半动作能生效一半不能, 且不能的那
+// 一半连提示都在教用户绕过产品。
+//
+// ## 修掉一个潜在 bug: 不能复用 r.Body
+//
+// 原转发代码把 `r.Body` 直接交给转发请求, 但 handleAction 在更早处已经
+// `io.ReadAll(io.LimitReader(r.Body, ...))` 把它读空了 —— **转发出去的请求体是空的**。
+// team.stop 那组载荷通常为空所以没暴露; 换成 team.create 就是"工作流和目标全丢"。
+// 这里改为把已解析的 payload 重新编码, 与本地路径拿到的是同一份数据。
+//
+// 本进程有执行能力时**不转发**: 那会把同一个动作在两个进程里各跑一次。
+func (s *Server) forwardActionToControl(r *http.Request, kind, action, target string,
+	payload map[string]interface{}) (immediate, hint string, ok bool) {
+	base := s.botAPIBase()
+	if base == "" {
+		return "", "", false
+	}
+	// 本进程自己能执行 (挂在 bot 里的 dashboard) 就不该转发给自己 —— 那是个回环。
+	if s.cfg.TeamAction != nil || currentActionSink() != nil {
+		return "", "", false
+	}
+
+	body := []byte("{}")
+	if payload != nil {
+		if b, err := json.Marshal(payload); err == nil {
+			body = b
+		}
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, base+r.URL.Path, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Sprintf("转发失败: %v", err), true
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// 控制面启用 wiki.apiSecret 后, 不带 token 的转发会 401 (httpauth 保护 /api/)。
+	if tok := s.botAPIToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Sprintf("转发到控制面失败: %v", err), true
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// 不谎报成功: 控制面拒了就如实说, 否则前端会以为已生效。
+		return "", fmt.Sprintf("控制面返回 %s", resp.Status), true
+	}
+	var fwd actionResp
+	if json.NewDecoder(resp.Body).Decode(&fwd) != nil {
+		return fmt.Sprintf("%s.%s(%s) 已转发控制面", kind, action, target), "", true
+	}
+	return fwd.Message, fwd.Hint, true
+}

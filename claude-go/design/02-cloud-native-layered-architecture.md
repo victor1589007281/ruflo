@@ -266,7 +266,17 @@ design/01 TaskService 落在此层：Submit 幂等键（收编 `teams.go:328` �
 
 design/03 的 Evolution Service 整体作为 L4 组件：单机=进程内模块，分布式=独立服务（中心化经验/记忆库，解假设 #17 学习孤岛）。
 
-### 3.5 L5 · 用户层　　**[🟠 契约测试 ✅ · platform-mcp ✅ · 出站地址 ✅ / CLI --server、adapter 拆分、sync→TaskService ❌]**
+### 3.5 L5 · 用户层　　**[🟠 契约测试 · platform-mcp · 只读面板经控制面 ✅ / CLI --server、adapter 拆分、sync→TaskService ❌]**
+
+> ✅ **只读 dashboard 独立部署并真经控制面（2026-07-25）**：`deploy/k8s/distributed.yaml` 新增 `claude-go-dashboard` Deployment+Service（`CLAUDE_GO_BOT_API_URL` 指向 `claude-go-control:18080`）。
+>
+> ⚠️ **加这个 pod 时验证救了一次**：先只加了清单，真集群一测发现它**是装饰品**——回包说「动作已落盘，但本进程未注册消费方」。查下去发现转发**只对 `team.stop/restart/delete/resume/refine/fork` 存在**，`team.create`/`team.run` 根本不转发，只落盘无人消费，回包甚至提示用户「可手动运行 `claude-go team create ...`」——一半动作能生效一半不能，且不能的那一半连提示都在教用户绕过产品。
+>
+> 顺带修掉一个**潜在 bug**：原转发代码把 `r.Body` 直接交给转发请求，但 `handleAction` 更早处已 `io.ReadAll` 把它读空了——**转发出去的请求体是空的**。`team.stop` 那组载荷通常为空所以从未暴露；换成 `team.create` 就是"工作流和目标全丢"。改为把已解析的 payload 重新编码。
+>
+> 真集群端到端证据：只读面板 POST `team/create/fwd-ok` → 控制面上团队真存在且 `workflow: research`、objective 完整（沿用旧 `r.Body` 时这两项会是空）。本进程自己有执行能力时**不转发**（那是回环且会双跑），控制面拒绝时**不谎报成功**。
+>
+> 只读面板刻意**不给 LLM 凭据**、**不与控制面共享状态卷**——它读的是经 HTTP 拿到的控制面数据，挂同一个卷会让人误以为它能直接改控制面状态。
 
 > **实测**：飞书 Bot 上帝对象原样；CLI `--server` 零命中；`platform-mcp-server` 零命中；dashboard→控制面仍以惰性回调为主路径且 `BotAPIURL` **硬编码回环**（`cmd/claude-go/main.go:2219`）。:18080 端点契约未改 ✅，但 §七风险①要求的**表驱动契约测试不存在**。
 

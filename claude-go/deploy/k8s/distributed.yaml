@@ -83,6 +83,63 @@ spec:
         - name: config
           configMap: { name: claude-go-config }
 ---
+# 只读 dashboard (design/02 §3.5 L5): 与控制面**分开部署**, 出站动作经
+# CLAUDE_GO_BOT_API_URL 转发给控制面而不是硬编码回环。
+#
+# 为什么要有这个 pod: 那个覆盖变量此前**没有任何部署清单设置它** —— 代码路径活着但
+# 拓扑里没有它的消费方, 属"建成未通电"。加它的同时必须能验证转发真的生效, 否则就只是
+# 又一个装饰品。验证方式见 deploy/k8s-e2e.sh 的 dashboard 转发检查。
+#
+# 刻意不给它 KIMI_API_KEY: 只读面板不该有 LLM 凭据。它需要 LLM 的那几个端点
+# (/api/workflows/generate 等) 本来就该转发给控制面执行。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-dashboard
+  namespace: claude-go
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: claude-go-dashboard }
+  template:
+    metadata:
+      labels: { app: claude-go-dashboard }
+    spec:
+      containers:
+        - name: dashboard
+          image: localhost:5000/claude-go:latest
+          imagePullPolicy: IfNotPresent
+          args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open"]
+          env:
+            # 出站动作转发目标 = 控制面。没有它时 dashboard 会拼 127.0.0.1:<port>,
+            # 在独立 pod 里那是自己, 动作永远送不出去。
+            - name: CLAUDE_GO_BOT_API_URL
+              value: "http://claude-go-control:18080"
+          ports: [{ containerPort: 7777 }]
+          readinessProbe:
+            httpGet: { path: /api/health, port: 7777 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: config, mountPath: /etc/claude-go }
+      volumes:
+        # 只读面板与控制面**不共享**状态卷: 它读的是经 HTTP 拿到的控制面数据,
+        # 挂同一个卷会让人误以为它能直接改控制面的状态。
+        - name: state
+          emptyDir: {}
+        - name: config
+          configMap: { name: claude-go-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-dashboard
+  namespace: claude-go
+spec:
+  selector: { app: claude-go-dashboard }
+  ports: [{ port: 7777, targetPort: 7777 }]
+---
 apiVersion: v1
 kind: Service
 metadata:
