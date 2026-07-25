@@ -1084,6 +1084,36 @@ func currentActionSink() ActionSink {
 	return actionSink
 }
 
+// actionSinkOwns 报告"这条动作应由队列消费方独占执行"。
+//
+// 为什么需要它: handleAction 先把动作写进队列, 再在 switch 里**直接**调一次
+// s.cfg.TeamAction, 最后又 drainQueuedAction 让消费方消费一次 —— 于是注册了消费方
+// 之后, 同一条动作走了两条路。真集群 E2E 里的表现是回包自相矛盾:
+//
+//	{"message":"动作已被 TaskService 消费, 任务 t-... 已提交",
+//	 "hint":"操作失败: 团队 \"e2e-real\" 正在执行中"}
+//
+// 观察到的后果被"团队正在执行中"这道守卫挡住了, 没造成真的双跑; 但任务档案的归因
+// 会错(档案说是 TaskService 起的, 实际是直接路径起的), 而对**没有**这类守卫的动作
+// 就是实打实执行两次。
+//
+// 消费方的 ActionExecutor 委托的正是同一个 TeamAction, 所以让路是**无损**的:
+// team.run/restart/resume/refine/stop/pause 由 Runner 跑, 其余经 ActionExecutor
+// 回到 TeamAction —— 两条路的终点相同, 只保留经队列那条即可(它还顺带留了档案)。
+//
+// 未注册消费方时一律返回 false, 直接执行路径行为一字不变(向后兼容)。
+func actionSinkOwns(kind, action string) bool {
+	if currentActionSink() == nil {
+		return false
+	}
+	switch kind {
+	case "team", "swarm":
+		return true
+	}
+	_ = action
+	return false
+}
+
 // drainQueuedAction 让消费方立刻消费一轮, 并回读该动作文件拿到真实结果。
 //
 // 为什么回读文件而不是信 ConsumeActions 的统计: 统计是聚合值, 同一轮可能消费了别人
@@ -1198,7 +1228,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "cron.trigger":
 		hint = "已排队立即触发, 需要主进程消费 (feishu bot / daemon) 才能真正运行。"
 	case "team.create":
-		if s.cfg.TeamAction != nil {
+		if s.cfg.TeamAction != nil && !actionSinkOwns(kind, action) {
 			if err := s.cfg.TeamAction(action, target, payload); err != nil {
 				hint = fmt.Sprintf("操作失败: %v", err)
 			} else {
@@ -1220,7 +1250,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case "team.run":
-		if s.cfg.TeamAction != nil {
+		if s.cfg.TeamAction != nil && !actionSinkOwns(kind, action) {
 			if err := s.cfg.TeamAction(action, target, payload); err != nil {
 				hint = fmt.Sprintf("操作失败: %v", err)
 			} else {
@@ -1255,7 +1285,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		hint = fmt.Sprintf("已排队 swarm.simulate: mode=%s objective=%q. 主进程可调用 swarm_intel.Engine.Simulate(ctx, cfg) 消费。",
 			mode, obj)
 	case "team.stop", "team.restart", "team.delete", "team.resume", "team.refine", "team.fork":
-		if s.cfg.TeamAction != nil {
+		if s.cfg.TeamAction != nil && !actionSinkOwns(kind, action) {
 			if err := s.cfg.TeamAction(action, target, payload); err != nil {
 				hint = fmt.Sprintf("操作失败: %v", err)
 			} else {
