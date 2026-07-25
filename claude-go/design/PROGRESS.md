@@ -243,3 +243,89 @@ R1 token 主路径修复 / R2 sqlite 后端 / R3 cron选主+caps路由 / E1 采�
 `Interceptor` 链与六拦截器 · `ConstraintSet` 单一真源 · `AgentRuntime` 接口与三实现 · `SpawnSubgraph` · `ExpandSpec`（GoalTree 吸收前置） · `TaskService` · `EvolutionLoop` 统一循环 · map/reduce/loop-group 三种节点形态 · 回放 harness 与 `evo_*` agent 工具（H6/H8/H9/H12） · 权重导出（E5）。
 
 另有三条已知遗留：确定性门禁是 run 终端信号故**首轮阶段仍走二值回退**（回溯反馈会与已发生的反馈双计）；`skillaudit` 的晋升判据仍与技能实际使用无关（需运行期 skill-usage 打点）；`runGlobalTestGate` 缺 `go.mod` 守卫（compile gate 有），非 Go 目录会误判失败并写一条 -1 确定性奖励。
+
+---
+
+## 2026-07-25 实施轮：13 个 ❌ 全部落地（章节级）
+
+一轮并行实施，把 design/01/02/03 里章节级标注为 ❌ 的 13 项全部做掉，并把「已建成
+未通电」的项接到生产调用路径上。**章节级 ❌ 清零，但这不等于"全部完成"**——行内仍
+有 🟠 与限定说明，剩余项集中在 M4 归一与三项能力缺口（见文末）。
+
+### 落地清单（按提交序）
+
+| 项 | 设计位置 | 落点 |
+|---|---|---|
+| map / reduce / loop-group 三种 Kind | 01 §4.1/§4.2/§4.4 | `pkg/graph/{fanout,group}.go` |
+| ExpandSpec 有界动态展开 | 01 §4.2 | `pkg/graph/expand.go` |
+| ConstraintSet 单一真源 | 01 §4.6 | `pkg/agent/constraints.go`（46 测试） |
+| TaskService + 动作队列消费方 | 01 §4.12 | `pkg/agent/taskservice.go` |
+| Blackboard.Watch + Mailbox | 01 §4.11 | `pkg/agent/{blackboard,mailbox}.go` |
+| 节点执行切面链 + BudgetManager | 01 §4.10 | `pkg/graph/interceptor.go` + `pkg/agent/graph_interceptors.go` |
+| SpawnSubgraph 图内派生 | 01 §4.8 | `pkg/graph/spawn.go` |
+| InvalidateFrom 事件溯源式 refine | 01 §4.3 | `pkg/graph/journal.go` |
+| 15 mode → 图模板 4/15 | 01 §五 | `pkg/agent/graph_templates.go` |
+| 远程 Agent 运行时真执行体 | 02 §3.3 / R3 | `pkg/worker/` + `cmd/claude-go-worker` |
+| L5 用户层（契约测试 / platform-mcp / 出站地址） | 02 §3.5 | `pkg/platformmcp/` + 61 条契约测试 |
+| LLM 网关接口被生产依赖 + trace 四元组 | 02 §3.1 | 9 个生产调用点 |
+| RL 进化补完（学习器 d/e、H6、不越权、evo_* 八件套） | 03 §4.1-§4.7 | `pkg/evolution/govern/` 等 |
+
+### 三个「写了 ≠ 通电」的补线（本轮最容易漏的一类）
+
+1. **动作队列消费方**：`ConsumeActions` 写完后主进程**没注册消费方**，那么"队列现在
+   真被消费了"在生产上仍是假的——和被批评的原假承诺（"等待 claude-go 主进程消费"）
+   性质相同。补在 `cmd/claude-go/main.go`，含周期消费（只靠 HTTP 内联 drain 不够：
+   上次进程退出残留的 pending 动作没人再发请求就永远不被消费）。
+2. **拦截器链**：`Engine.Interceptors` 生产恒空 = 切面建成未通电。补在 `executeGraph`。
+3. **`RunOpts.Params`**：`executeGraph` 从不传，`MapPolicy.Source="param:<键>"` 生产
+   恒取空（表现为 map 拿到空集合→整节点 skipped）。
+
+### 被自己的测试抓出的真缺陷
+
+- **预算透支**（我的实现）：原本"执行后记账"，嵌套派生时父节点在飞行中一直没被计数，
+  子图便借这个空档多跑几个节点，**透支量正好等于派生深度**。改为**准入即记账**，
+  判定与记账在同一把锁里（分两步会让 N 个并发节点同时通过"还差 1 个配额"的判定，
+  并发度就是透支量）。
+- **按阶段精修在图模式下静默失效**（预存）：灰度开关开着时 `wf.Mode` 仍是 `"pipeline"`，
+  于是"非 pipeline 转整体重跑"那道闸放行了按阶段精修，但它只失效 `checkpoints.json`
+  而 `graph-journal` 原样保留 → Resume 重放全部 `node.completed` → 零节点执行、直接
+  返回旧产出，**用户的反馈静默消失**。
+- **`pkg/cluster` fail-open**（预存）：`Client.post` 拿到状态码却只返回它，而
+  `Heartbeat`/`Complete`/`Fail` 全写成 `_, err :=` —— 401/400 在 worker 侧**全是静默
+  成功**；上报终态被拒却当成功，任务永远停在 `leased` 直到租约过期。
+- **`cron.Stop()` 二次调用 panic**（预存）：裸 `close(stopCh)`。
+- **测试导入环**（本轮引入）：`pkg/evolution/govern` 复用 `agent.ConstraintSet.Narrow`
+  （那是对的），但 `pkg/agent` 的 `constraints_test.go` → `pkg/tool/builtin` →
+  `evotools` → `govern` → `pkg/agent`，**测试二进制导入环**，整包 setup failed。
+  跨注册表核对挪到外部测试包 `agent_test`。
+- **`TestAgentPoolAutoScale` 长期失败**（预存）：断言"8 待办应扩到至少 8"，但写在
+  `44b9c2ed2`（AutoScale 防震荡）之前——那次改动刻意加了 50% 步进限制与 30s 冷却。
+  改测试而非改行为（防震荡是有意的）。顺带发现原测试另两条断言其实什么也没测。
+- **特权位表漂移守护真的响了**：`evo_*` 八个工具进 admin 档位但未分类特权位，
+  `TestProfileCaps_每个工具都已分类` 立刻变红——这正是它被写出来的目的。
+
+### 我给自己打错又推翻的标注
+
+先按"常量已补齐"把 03 §4.1 记成 `Kind 5/5 ✅`。逐条查产生方后推翻：六个 Kind 常量
+都在，但只有 2 个有写入方（`KindLLMCall`/`KindGate`），`KindRun`/`KindNode`/`KindTurn`/
+`KindToolCall` 零产生方。**加一个常量不等于采集了那类轨迹。** 随后补上 `KindNode`
+产生方（缺它奖励无法归因到节点），`KindTurn`/`KindToolCall` 仍缺并已登记。
+
+另更正两处：**T1/T2 混淆**（T1 是网关分离，worker 分离是 T2）；**§4.5 外部 hook**
+（原标注会让人推断外部 hook 在图模式下不生效，逐跳核实后确认照样触发）。
+
+### 剩余项（不是"全部完成"）
+
+**M4 归一**：删 `pkg/orchestrator`（双黑板并存、LifecycleHook 三套合一都卡在它）、
+四源归一（checkpoints/goals/tasks/CheckpointStore + journal 是第五源）、
+`executeWorkflow` 282 行巨函数拆成"编译图模板 + 装配拦截器"、收编飞书两条裸
+QueryEngine 派生路径。
+
+**三项能力缺口**：逐节点 `Placement`（`AgentSpec` 无字段，现只有进程级默认）；
+cwd 三档位（local/pvc/git）未实现故**跨机产码仍不可用**；`LoopPolicy.Until` 只有
+四类原子条件，表达不了 AdaptiveTerminator 的收敛/退化/best-of-N，故 5 个 mode
+永远无法等价。
+
+**其余**：`router`/`subgraph`/`human` 三种 Kind（已核实**不是** §五 的阻塞项）；
+RunStatus 仍 3 态而非 8 态；CLI `--server`、feishu-adapter 拆分、sync→TaskService；
+`KindTurn`/`KindToolCall` 轨迹；k8s-job runtime；swarm 路径仍纯本地。
