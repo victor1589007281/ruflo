@@ -202,3 +202,44 @@ R1 token 主路径修复 / R2 sqlite 后端 / R3 cron选主+caps路由 / E1 采�
 | design/03 | **≈22%** | 79 条可核验条目，加权 17.75 |
 
 **共同结论：已完成的绝大部分是 M0/R0/E0 的"止血、接口抽取、开环修补"，而不是三份设计的目标架构本身。** 且全部实现**尚未部署**（线上二进制 07-17，实现落 07-24/25）。
+
+---
+
+## 2026-07-25 第二轮通电 + K8s 真实 LLM E2E（9/9 全通）
+
+按 design 标注里的 🟡（建成未通电）与 🟠（部分实现）逐项接线。**所有 ❌（完全未实现）项未动**——见文末"本轮未做"。
+
+### 通电完成（各带测试，`go test -race` 全绿）
+
+| 项 | 此前状态 | 现状 |
+|---|---|---|
+| CLI 两个 hook 不注册 | ❌ 下游全部流量无轨迹、无记忆注入 | ✅ 新增 `RefreshHooks()` 并在 CLI 装配末尾调用；刻意不复用 `EnableFrontierOptimizations`（那会顺带翻开一批 `Config.Enable*`，是行为变更）。新增 `HookChain.Names(phase)` 使"hook 注册没注册"可断言 |
+| `CLAUDE_GO_LLM_GATEWAY` | 🟡 死变量，网关是装饰品 | ✅ 覆盖点在 `ConfigResolver` 的 4 个出口（而非各 `api.NewClient` 调用点——后者散落多处，逐个改必然漏）；**fallback 端点一并改指网关**，否则主端点走网关而降级直连，集中记账在最需要时失效 |
+| K8s ConfigMap 从未被读取 | ❌ Pod 落占位 provider | ✅ 发现列表补 `/etc/claude-go/config.json`（放最后，本机开发时家目录优先） |
+| `<PROVIDER>_API_KEY` | ❌ 清单已按标准做法写好但没代码读 | ✅ `applyProviderKeyFromEnv` 在 `RegisterProvider` **之前**套用 |
+| 轨迹采样 / TTL | 🟡 有能力无调用方 | ✅ `CLAUDE_GO_TRACE_SAMPLE` + `CLAUDE_GO_TRACE_TTL`；未设时行为与此前完全一致。`StartJanitor` 改包级函数（只需目录，而调用方才是知道路径的那层） |
+| 奖励零消费（RewardBus 只写不读） | ❌ 学习仍走 stage 二值 | ✅ `AggregateRewards` + 三个 scored 方法；`RewardEvent.Weight` 补齐并**落盘**；三处布尔改加权分并**保留二值回退** |
+| 奖励源 1/8 | 🟠 | ✅ **3/8**：补 `gate.compile`/`gate.test`（真跑 `go build`/`go test`，设计里价值排第一） |
+| shadow 无运行期效力 | 🟡「必过闸」是纸面的 | ✅ `Skill.Status` + 解析 + `Get`/清单/工具排除 shadow。用**黑名单**而非白名单——存量 SKILL.md 多无 status 行，白名单会一夜禁用全部技能 |
+| 图 Retry / Timeout / HookBus / 条件边可表达 | 🟡 生产恒 0 次 / NopBus / 无条件边 | ✅ 图层负责重试内层让位（次数与 pipeline 对齐，非新乘法）；节点级预算复用同一张角色→超时表；HookBus 通电为观测桥（**绝不返回 deny**）；覆盖表让条件边/Loop 可从生产输入表达 |
+| `AgentSpec` 三字段零消费 | 🟡 | ✅ `Deterministic` 被 `runGate` 消费；`ToolProfile`/`MaxTurns` 经 `NodeExecHints` 下推，前者**优先于角色名子串推断**（退役 `world-builder` 因含 "build" 被判 coding 拿到 Bash 那个真实误判） |
+| 门禁读工作流名白名单 | 🟠 | ✅ 改读 `WorkflowGateMetaByName`，与图引擎共用一份元数据（今天行为等价） |
+
+顺手修：`FileJournal` **每次团队运行泄漏一个 fd**；图 `MaxParallel` 硬编码 4（pipeline 侧随流控是 6）；`recordStageMetrics` 34 行重复实现改为委托；`skipped` 节点不再被记成失败阶段（条件边一旦启用，正确未走的分支会杀掉团队）。
+
+### K8s 真实 LLM E2E：9/9 全通（脚本已入库 `deploy/k8s-e2e.sh`）
+
+此前 V2/V3 的"双模式实测"应按**存活冒烟**理解——三个死变量挡着，Pod 落占位 provider 分支、不接触 LLM。本轮修完后实测（kind + 真实 kimi k3）：
+
+- 启动日志确认 `apiKey 取自环境变量 KIMI_API_KEY`，未落占位分支；`/api/health` 200；28 工作流
+- **真实 `research`（fanout 6 阶段）跑到 completed**
+- `trace-run-*.jsonl` **18 行 span** ← TraceCaptureHook 真注册的硬证据
+- `rewards.jsonl` **3 行**（含新接的确定性门禁源）
+- 团队产物含 `ARTIFACTS.json`
+- 分布式三组件全 Running；**网关 `access.jsonl` 10 行**且带双边 token 记账（`input_tokens=12116 input_estimated=true`）← `CLAUDE_GO_LLM_GATEWAY` 真生效
+
+### 本轮未做（诚实登记，均为 2-3 周量级新建）
+
+`Interceptor` 链与六拦截器 · `ConstraintSet` 单一真源 · `AgentRuntime` 接口与三实现 · `SpawnSubgraph` · `ExpandSpec`（GoalTree 吸收前置） · `TaskService` · `EvolutionLoop` 统一循环 · map/reduce/loop-group 三种节点形态 · 回放 harness 与 `evo_*` agent 工具（H6/H8/H9/H12） · 权重导出（E5）。
+
+另有三条已知遗留：确定性门禁是 run 终端信号故**首轮阶段仍走二值回退**（回溯反馈会与已发生的反馈双计）；`skillaudit` 的晋升判据仍与技能实际使用无关（需运行期 skill-usage 打点）；`runGlobalTestGate` 缺 `go.mod` 守卫（compile gate 有），非 Go 目录会误判失败并写一条 -1 确定性奖励。
