@@ -145,6 +145,12 @@ type Client struct {
 	OnLLMMetrics LLMMetricsHook  // 指标回调 (可选, 注入 dashboard metrics collector)
 	Guard        *RateLimitGuard // 全局准入控制器 (可选, 强烈建议设置)
 
+	// CallInterceptors 本客户端专属的 LLM 调用切面 (design/01 §4.10)。
+	// 进程级链见 RegisterCallInterceptor —— 那个对所有克隆生效, 这个只影响本实例
+	// (装配时进程级在外层)。多数场合应该用进程级: Client 被 WithModel/
+	// ConfiguredClone 大量克隆, 逐个装必漏。
+	CallInterceptors []CallInterceptor
+
 	// FallbackModels 备用模型列表: 主模型不可用时按序尝试。
 	// 触发条件: 模型不支持 (400 invalid model) / 超载 (529) / 配额耗尽 (402/403)。
 	FallbackModels []string
@@ -1025,7 +1031,40 @@ func (c *Client) StreamMessage(
 }
 
 // SendMessage 非流式发送消息 (内置全局准入 + 429/5xx 自动重试 + 熔断)。
+//
+// design/01 §4.10: 这里是 CallInterceptor 链的唯一挂载点 (见 call_interceptor.go)。
+// 链为空时**原路直通** sendMessageDirect —— 不构造 LLMCall、不挂记录槽, 空链零开销。
 func (c *Client) SendMessage(
+	ctx context.Context,
+	messages []types.APIMessage,
+	systemPrompt []string,
+	tools []types.APITool,
+	maxTokens int,
+) (*types.APIResponse, error) {
+	ics := c.callChain()
+	if len(ics) == 0 {
+		return c.sendMessageDirect(ctx, messages, systemPrompt, tools, maxTokens)
+	}
+	if err := ValidateCallInterceptors(ics); err != nil {
+		// 链装不起来 = 观测/治理设施坏了。fail-closed: 不偷偷绕过链去发请求。
+		return nil, err
+	}
+	call := LLMCall{
+		Model: c.effectiveModel(), Request: "messages",
+		Messages: messages, SystemPrompt: systemPrompt, Tools: tools,
+		MaxTokens: maxTokens, Trace: trace.From(ctx),
+	}
+	exec := func(ctx context.Context, cl LLMCall) (LLMResult, error) {
+		sinkCtx, sink := withRecordSink(ctx)
+		resp, err := c.sendMessageDirect(sinkCtx, cl.Messages, cl.SystemPrompt, cl.Tools, cl.MaxTokens)
+		return LLMResult{Response: resp, Record: sink.snapshot()}, err
+	}
+	res, err := chainCall(ics, exec)(ctx, call)
+	return res.Response, err
+}
+
+// sendMessageDirect 是 SendMessage 的原实现 (未经切面链)。
+func (c *Client) sendMessageDirect(
 	ctx context.Context,
 	messages []types.APIMessage,
 	systemPrompt []string,
@@ -1041,6 +1080,9 @@ func (c *Client) SendMessage(
 		applyLLMMetricsContext(&rec, callMeta)
 		stampTraceIDs(&rec, traceIDs)
 		debugRec = rec
+		// 把这份记录交给切面链的记录槽 (链为空/未挂槽时是空操作)。放在 emit 里而不是
+		// 各返回点: emit 已经是"这次调用的记录成型点"的单一出口, 另找位置必然漏一条。
+		sinkRecord(ctx, rec)
 		c.emitLLMMetric(rec)
 	}
 	defer func() {
