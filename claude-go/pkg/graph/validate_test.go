@@ -144,8 +144,8 @@ func TestValidateErrors(t *testing.T) {
 		},
 		// —— 新形态的策略字段: 缺了就在开图时失败, 不留到运行期 ——
 		{
-			name: "map缺策略",
-			g: GraphSpec{Name: "x", Nodes: []NodeSpec{{ID: "m", Kind: NodeKindMap}}},
+			name:    "map缺策略",
+			g:       GraphSpec{Name: "x", Nodes: []NodeSpec{{ID: "m", Kind: NodeKindMap}}},
 			wantSub: "缺少 map 策略",
 		},
 		{
