@@ -97,6 +97,14 @@ func (l *EvolutionLoop) EnableStructureLearning(cfg StructureConfig) {
 		// 这种谁也说不清的状态。
 		cfg.ExportEnabled = true
 	}
+	// DPO 偏好对同理需要一个生产开关: 两处装配 (CLI / 飞书) 都不设 ExportDPO,
+	// 于是 ExportSFT 的 IncludeDPO 分支此前**在生产上恒不可达** —— 导出器写了一半
+	// 通电。DPO 单独一个开关而不是跟着 ExportEnabled: 它要求同签名任务有奖励差
+	// (dpoMinGap), 冷启动阶段开了也只会产 0 对, 白扫一遍轨迹。
+	if !cfg.ExportDPO && os.Getenv("CLAUDE_GO_EVO_EXPORT_DPO") == "1" {
+		cfg.ExportDPO = true
+		cfg.ExportEnabled = true // 只要 DPO 一个开关也能生效: 少一个"两个都要设"的坑
+	}
 	l.mu.Lock()
 	l.structure = &structureLearners{cfg: cfg}
 	l.mu.Unlock()

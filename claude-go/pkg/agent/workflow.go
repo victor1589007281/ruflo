@@ -830,7 +830,8 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		bbContext = team.Blackboard.HandoffContext(completedStages, stage.Role)
 	}
 	prompt := buildStagePromptWithRoles(stage, objective, prevResults, we.roles)
-	if referenceContext := buildLocalReferenceContextForStage(stage, objective); referenceContext != "" {
+	referenceContext := buildLocalReferenceContextForStage(stage, objective)
+	if referenceContext != "" {
 		prompt += "\n\n---\n\n" + referenceContext
 	}
 	if bbContext != "" {
@@ -839,8 +840,10 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 
 	// 1a2. 注入用户反馈 (RefineTeam: 运行后用户反馈, 本轮重做的所有阶段都必须针对性处理)。
 	// 支持角色模板里的 {user_feedback} 占位; 无占位则前置整段强约束。
+	injectedUserFeedback := false
 	if team != nil {
 		if fb := strings.TrimSpace(team.PendingFeedback); fb != "" {
+			injectedUserFeedback = true
 			block := "### ⚠️ 用户反馈 (上一轮产出后收到, 本次必须针对性修正, 不得忽略):\n" + fb + "\n"
 			if strings.Contains(prompt, "{user_feedback}") {
 				prompt = strings.ReplaceAll(prompt, "{user_feedback}", block)
@@ -861,6 +864,19 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			}
 		}
 	}
+
+	// 1c. 策略决策留痕 (design/03 §4.4): 这一行必须紧跟在**全部注入之后、执行之前**。
+	// 提前会漏掉后注入的块, 推后到执行之后则拿不到"失败的那次注入了什么" —— 而那正是
+	// uplift 归因最要看的一类。见 policy_decision.go。
+	we.writePolicyDecisionSpan(ctx, policyDecision{
+		Stage: stage.Name, Role: stage.Role, Team: team.Name,
+		ExperienceIDs: injectedExpIDs,
+		Blackboard:    bbContext != "",
+		Reference:     referenceContext != "",
+		UserFeedback:  injectedUserFeedback,
+		Prompt:        prompt,
+		Objective:     objective,
+	})
 
 	// 2. 创建 V2 Task (LLM 可通过 TaskList 看到团队进度)
 	var v2TaskID string

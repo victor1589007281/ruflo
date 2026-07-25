@@ -102,6 +102,10 @@ var dashboardContract = []apiEndpoint{
 	{Pattern: "/api/diag/jobs/", Probe: "/api/diag/jobs/j-1", Prefix: true},
 	{Pattern: "/api/dreaming/trigger", Probe: "/api/dreaming/trigger"},
 
+	// RewardBus 奖励源回传 (design/03 §4.2 gate.e2e, 本轮新增)。
+	// 前缀路由: 只服务 /api/runs/{runId}/feedback 这一个形状, 其余形状 404。
+	{Pattern: "/api/runs/", Probe: "/api/runs/run-1/feedback", Prefix: true},
+
 	// L5 platform-mcp-server (design/02 §3.5, 本轮新增)
 	{Pattern: PlatformMCPPath, Probe: PlatformMCPPath},
 

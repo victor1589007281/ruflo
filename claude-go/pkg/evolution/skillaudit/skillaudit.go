@@ -58,11 +58,50 @@ type AuditResult struct {
 }
 
 // rewardRow rewards.jsonl 的最小字段。
+//
+// Source/Weight 是本轮补的 (design/03 §4.6「奖励源加权可信度」在这道闸上的落地)。
+// 原先取的是**未加权**均值, 于是任何新接进来的弱信号源都会按 1:1 参与晋升判据 ——
+// verdict.heuristic 这类"只说明这轮没崩"的过程信号一旦接上, 数量上会压过确定性门禁,
+// 把一道 fail-closed 的闸稀释成"跑得多就能晋升"。加权后弱源仍在, 但压不动闸。
 type rewardRow struct {
-	TS    int64   `json:"ts"`
-	Value float64 `json:"value"`
-	Team  string  `json:"team,omitempty"`
+	TS     int64   `json:"ts"`
+	Value  float64 `json:"value"`
+	Team   string  `json:"team,omitempty"`
+	Source string  `json:"source,omitempty"`
+	Weight float64 `json:"weight,omitempty"`
 }
+
+// weight 取这条奖励的可信度。
+//
+// 优先用落盘时记下的 Weight (RecordReward 会填, 见 pkg/agent), 缺失才按源名查表 ——
+// 与 learners.weightOf 同一策略: 权重表会调, 已发生的奖励应保留当时的可信度。
+// 认不出的源给 unknownWeight 而不是 0: 新源不该被静默忽略, 也不该压倒确定性门禁。
+func (r rewardRow) weight() float64 {
+	if r.Weight > 0 {
+		return r.Weight
+	}
+	if w, ok := auditFallbackWeights[strings.ToLower(strings.TrimSpace(r.Source))]; ok {
+		return w
+	}
+	return auditUnknownWeight
+}
+
+// auditFallbackWeights 老数据 (Weight 未落盘) 的兜底表。
+//
+// 与 pkg/agent.RewardSourceWeight / learners.fallbackWeights 是同一组定值的第三份副本。
+// 副本本身是坏味道, 换来的是本包不必依赖 pkg/agent 的运行期类型 (本包只读文件);
+// 一致性由 weights_consistency_test.go 焊住 —— 那是外部测试包, 反向 import 只在测试
+// 二进制里发生。
+var auditFallbackWeights = map[string]float64{
+	"gate.compile": 1.0, "gate.test": 1.0, "gate.lint": 1.0, "gate.e2e": 1.0,
+	"user.explicit": 0.8, "user.steer": 0.8, "user.feedback": 0.8,
+	"gate.content": 0.5, "review.panel": 0.5, "gate.review": 0.5, "llm.judge": 0.5,
+	"episode": 0.3,
+	"latency": 0.2, "cost": 0.2,
+	"verdict.heuristic": 0.15,
+}
+
+const auditUnknownWeight = 0.5
 
 // Audit 扫描 skillsDir 下的 shadow 技能, 依据 <state>/evolution/rewards.jsonl 的
 // 奖励证据裁决晋升/退役。apply=true 时真正改写 SKILL.md 的 status; false 为 dry-run。
@@ -86,17 +125,21 @@ func Audit(skillsDir, rewardsPath string, apply bool) (*AuditResult, error) {
 
 		// v1 简化: 用技能创建时间之后的奖励作为"该技能生效期"证据。
 		created := parseTime(st.CreatedAt)
-		var sum float64
+		var weighted, weightSum float64
 		var n int
 		for _, r := range rewards {
 			if created.IsZero() || r.TS >= created.UnixMilli() {
-				sum += r.Value
+				w := r.weight()
+				weighted += w * r.Value
+				weightSum += w
 				n++
 			}
 		}
 		st.Samples = n
-		if n > 0 {
-			st.RewardAvg = sum / float64(n)
+		if weightSum > 0 {
+			// 加权均值 (design/03 §4.6 奖励源加权可信度)。样本数仍用条数计 ——
+			// minSamples 问的是"有没有攒够观测", 那与可信度是两个维度。
+			st.RewardAvg = weighted / weightSum
 		}
 
 		switch {

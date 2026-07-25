@@ -170,12 +170,13 @@ type RewardEvent struct {
 //   - 未知源: 0.5 —— 不给 0 (新源接进来不该被静默忽略), 也不给 1.0
 //     (未经校准的信号不该压倒确定性门禁)。
 const (
-	rewardWeightDeterministic = 1.0 // 确定性工具门禁 (编译/测试/lint)
-	rewardWeightUser          = 0.8 // 人的显式反馈
-	rewardWeightLLMJudge      = 0.5 // LLM 评分类
-	rewardWeightEpisode       = 0.3 // 运行终态
-	rewardWeightShaping       = 0.2 // cost/latency 等 shaping 负项 (真实计量但非质量判断)
-	rewardWeightUnknown       = 0.5 // 未登记的源
+	rewardWeightDeterministic = 1.0  // 确定性工具门禁 (编译/测试/lint)
+	rewardWeightUser          = 0.8  // 人的显式反馈
+	rewardWeightLLMJudge      = 0.5  // LLM 评分类
+	rewardWeightEpisode       = 0.3  // 运行终态
+	rewardWeightShaping       = 0.2  // cost/latency 等 shaping 负项 (真实计量但非质量判断)
+	rewardWeightHeuristic     = 0.15 // turn verdict 等启发式过程信号 (最弱: 只说明没崩)
+	rewardWeightUnknown       = 0.5  // 未登记的源
 )
 
 // 已接线的奖励源名 (格式即契约: rewards.jsonl 的 source 值 / skillaudit 依赖)。
@@ -184,6 +185,13 @@ const (
 	RewardSourceGateTest    = "gate.test"
 	RewardSourceGateContent = "gate.content"
 	RewardSourceEpisode     = "episode"
+	// RewardSourceGateE2E 下游平台回传的 e2e/验收门禁结论 (design/03 §4.2 第 6 行)。
+	// 唯一入口是 dashboard 的 POST /api/runs/{id}/feedback —— 本进程算不出"部署出去
+	// 跑不跑得起来", 只能由下游回传, 所以它与本地确定性门禁同权重。
+	RewardSourceGateE2E = "gate.e2e"
+	// RewardSourceVerdictHeuristic turn 级启发式裁决 (design/03 §4.2 第 7 行)。
+	// 由 stop_reason + 工具成败推断, 是**过程**信号不是质量判断 ⇒ 弱权重。
+	RewardSourceVerdictHeuristic = "verdict.heuristic"
 	// RewardSourceGatePrefix 前缀过滤用: 所有门禁类奖励 (含未来新增的 gate.lint 等)。
 	RewardSourceGatePrefix = "gate."
 )
@@ -191,7 +199,7 @@ const (
 // RewardSourceWeight 返回某奖励源的默认可信度权重。
 func RewardSourceWeight(source string) float64 {
 	switch strings.ToLower(strings.TrimSpace(source)) {
-	case RewardSourceGateCompile, RewardSourceGateTest, "gate.lint", "gate.e2e":
+	case RewardSourceGateCompile, RewardSourceGateTest, "gate.lint", RewardSourceGateE2E:
 		return rewardWeightDeterministic
 	case RewardSourceUserExplicit, RewardSourceUserSteer, "user.feedback":
 		return rewardWeightUser
@@ -203,6 +211,12 @@ func RewardSourceWeight(source string) float64 {
 		// shaping 负项: 是真实计量 (时长/token) 而非质量判断, 不该与"做得好不好"
 		// 同权重竞争 —— 它只负责在其他信号打平时把"又慢又贵"的那个往下压。
 		return rewardWeightShaping
+	case RewardSourceVerdictHeuristic:
+		// 设计原文: "现启发式保留为弱信号 (weight 低)"。它推断的是"这轮跑完没跑完、
+		// 工具报没报错", 与"做出来的东西对不对"是两回事 —— 一个把工具全调成功、
+		// 内容全错的 run 在它眼里是满分。所以必须比 episode 还低: episode 至少还
+		// 反映了交付判定, 而它只反映过程没崩。
+		return rewardWeightHeuristic
 	default:
 		return rewardWeightUnknown
 	}

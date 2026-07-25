@@ -22,7 +22,7 @@ func TestFallbackWeights与pkgAgent权威表一致(t *testing.T) {
 		"gate.compile", "gate.test", "gate.lint", "gate.e2e",
 		"user.explicit", "user.steer", "user.feedback",
 		"gate.content", "review.panel", "gate.review", "llm.judge",
-		"episode", "latency", "cost",
+		"episode", "latency", "cost", "verdict.heuristic",
 		"某个没登记过的源", // 未知源也要一致 (都应是 0.5)
 	}
 	const anchorWeight = 1.0 // gate.compile 的权重, 用作对照锚

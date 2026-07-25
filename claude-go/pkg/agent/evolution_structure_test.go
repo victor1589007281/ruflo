@@ -174,6 +174,25 @@ func TestEnableStructureLearning_env单向打开导出(t *testing.T) {
 	}
 }
 
+// DPO 偏好对需要自己的生产开关: 两处装配 (CLI / 飞书) 都不设 ExportDPO,
+// 没有这个 env 时 ExportSFT 的 IncludeDPO 分支在生产上恒不可达 (E5 导出器写了一半通电)。
+func TestEnableStructureLearning_envDPO开关(t *testing.T) {
+	t.Setenv("CLAUDE_GO_EVO_EXPORT_DPO", "1")
+	l, _ := newStructureLoop(t, StructureConfig{})
+	if !l.structure.cfg.ExportDPO {
+		t.Error("CLAUDE_GO_EVO_EXPORT_DPO=1 应打开 DPO 导出")
+	}
+	if !l.structure.cfg.ExportEnabled {
+		t.Error("只设 DPO 开关也应把导出整体打开 —— 否则是个'设了没反应'的坑")
+	}
+
+	t.Setenv("CLAUDE_GO_EVO_EXPORT_DPO", "0")
+	l2, _ := newStructureLoop(t, StructureConfig{})
+	if l2.structure.cfg.ExportDPO || l2.structure.cfg.ExportEnabled {
+		t.Error("未开启时必须保持默认关 (设计明写导出默认关)")
+	}
+}
+
 // StateDir 未给时应从引擎 dataDir 推导 (dataDir = <state>/evolution)。
 func TestEnableStructureLearning_从引擎推导StateDir(t *testing.T) {
 	state := t.TempDir()

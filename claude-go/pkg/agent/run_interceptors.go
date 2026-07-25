@@ -435,6 +435,10 @@ func (ptm *ProductionTeamManager) runPhaseEvolution(ctx context.Context, rc *tea
 		// 时长 shaping 负项 (design/03 §4.2 第 8 行, 防"堆 turn 堆 token 刷分")。
 		// 只在超预算时写, 预算内不写 —— 见 recordLatencyReward。
 		ptm.recordLatencyReward(ctx, team, rc.report.DurationSec)
+		// turn 级启发式裁决 (design/03 §4.2 第 7 行) —— 从本 run 的轨迹派生。
+		// 必须在这里而不是 turn 发生时: 引擎侧的 turn verdict 没有 run 归因,
+		// 而带 run 归因的轨迹只有 run 收尾时才读得全。见 verdict_reward.go。
+		ptm.recordVerdictRewards(ctx, team)
 	}
 
 	// 触发进化学习 (DISTILL: 从轨迹中提炼经验) + 采集进化指标。

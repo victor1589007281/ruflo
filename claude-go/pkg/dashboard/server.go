@@ -296,6 +296,11 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/diag/jobs/", s.handleDiagJobDetail)
 	mux.HandleFunc("/api/dreaming/trigger", s.handleDreamingTrigger)
 
+	// RewardBus 奖励源 gate.e2e (design/03 §4.2): 下游平台 (testforge 等) 把 e2e /
+	// 验收门禁结论回传到某次 run。见 run_feedback.go —— source 是锁定字段, run 认领
+	// 不到直接 404 且不落盘。
+	mux.HandleFunc("/api/runs/", s.handleRunFeedback) // POST /api/runs/{runId}/feedback
+
 	// Prometheus 端点: 使用 JSONLScraper 包装, 类似 MySQL Exporter 模式, 每次采集前读取 CLI 进程的 JSONL
 	mux.Handle("/metrics", metrics.WrapWithScrape(s.scraper, metrics.PrometheusHandler()))
 

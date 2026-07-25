@@ -3030,6 +3030,15 @@ func buildEngine() (*engine.QueryEngine, error) {
 
 	reg := tool.NewRegistry()
 	builtin.RegisterBaseTools(reg, nil)
+	// H6 多档冒烟的真实档位构造器 (design/03 §4.5)。RegisterBaseTools 上一行注册了
+	// evo_* 八件套, 但 SetEvoTierFactory 此前**只在飞书 bot 装配** —— CLI 形态下
+	// evo_smoke 只有一个确定性"装配档", 而装配档不是模型档位, MinTiers>=2 必然拒绝:
+	// 同一个工具在两条入口下能力不同, 那是"CLI 侧建成未通电"。档位取法与
+	// FallbackReflector 完全一致 (primary + 配置声明的 fallback), 没配 fallback 时
+	// 只给 primary 一档、冒烟照旧拒绝 —— 那是正确行为。
+	if f := agent.EvoTierFactory(apiClient); f != nil {
+		builtin.SetEvoTierFactory(f)
+	}
 	mcp.RegisterMCPTools(reg, mcpConns)
 	if skillReg.Count() > 0 {
 		reg.Register(skills.NewSkillTool(skillReg))

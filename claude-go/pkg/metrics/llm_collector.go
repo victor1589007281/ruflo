@@ -19,7 +19,13 @@ import (
 )
 
 var (
-	llmGlobalMu      sync.Mutex
+	llmGlobalMu sync.Mutex
+	// llmRestoreBG 追踪回放历史事件的后台 goroutine。
+	// 它是 fire-and-forget(不拖慢启动), 但那让采集器**不可 join** —— 测试里
+	// t.TempDir() 的清理与它竞态, 表现为 "TempDir RemoveAll cleanup: directory not
+	// empty" 的间歇性失败, 而报错来自 testing 框架、与被测逻辑看起来毫无关系。
+	// 这是本仓记过的**第三类假测试(非密闭)**, 同一形态在 pkg/dreaming 已修过一次。
+	llmRestoreBG     sync.WaitGroup
 	llmGlobal        *Collector
 	llmGlobalDataDir string // 用于检测 stateDir 变化时重新挂载采集器
 	aliasResolver    func(string) string
@@ -83,7 +89,9 @@ func InitGlobalLLMCollector(stateDir string) *Collector {
 
 	// 首次启动时回放 JSONL 历史事件到 Prometheus, 使重启后 counter/histogram 保留累计值。
 	if !relocating {
+		llmRestoreBG.Add(1)
 		go func() {
+			defer llmRestoreBG.Done()
 			_ = RestorePromFromJSONL(stateDir, 20000)
 		}()
 	}
@@ -301,3 +309,9 @@ func intStr(v int) string {
 	}
 	return string(buf[i:])
 }
+
+// WaitRestore 等待历史事件回放的后台 goroutine 结束。
+//
+// 生产侧无需调用(进程退出即止); **测试应 defer 它** —— 否则 t.TempDir() 的清理会与
+// 回放竞态, 得到一个与被测逻辑毫无关系的间歇性失败。
+func WaitRestore() { llmRestoreBG.Wait() }

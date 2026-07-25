@@ -26,22 +26,31 @@ import (
 // InlineLimit 正文内联上限 (字节)。超过则落 Blob, 只在 Span 存 hash。
 const InlineLimit = 2048
 
-// Span.Kind 取值 (design/03 §4.1 的五种)。
+// Span.Kind 取值 (design/03 §4.1 的五种 + §4.4 的 policy_decision)。
 //
 // 此前这五个值散在四个包里各写一遍字面量 ("tool_call"/"turn"/"node"), 于是
 // "少写了哪两种"这件事没有任何地方能机械看出来 —— 正是 §4.1 长期停在 3/5 的原因。
 // 收成常量后, KindAll 让测试可以断言"每种 Kind 都有生产写入方"。
 const (
-	KindRun      = "run"       // 一次 episode (预留: 当前由 TraceID 隐含)
+	// KindRun 一次 episode 的自述: objective / 工作流 / 终态 / 耗时 / 阶段统计。
+	// 产生方 pkg/agent.ProductionTeamManager.writeRunSpan (挂在 beginRun 的收尾闭包)。
+	// 注释原本写"预留: 当前由 TraceID 隐含"——TraceID 隐含的是身份不是事实, 见 run_span.go。
+	KindRun      = "run"
 	KindNode     = "node"      // 图节点 / workflow stage
 	KindTurn     = "turn"      // QueryEngine 单轮
 	KindLLMCall  = "llm_call"  // 单次 LLM HTTP 调用 (含 prompt 全文与 token 计数)
 	KindToolCall = "tool_call" // 单次工具调用 (含入参与 tool_result 全文)
 	KindGate     = "gate"      // 门禁判定 (编译/测试/内容评审)
+	// KindPolicyDecision 一次策略应用 (design/03 §4.4): 这次节点执行注入了哪些
+	// 经验/技能/记忆/上下文块。它不是"发生了什么", 而是"我们当时选择注入了什么" ——
+	// bandit 更新与 uplift 归因要回答"这条经验被注入后有没有变好", 没有这条 Span
+	// 就只能事后猜。刻意与 node Span 分开: node 记执行结果, 这条记执行**之前**的
+	// 决策, 两者时间点与失效模式都不同 (节点失败时决策记录反而更要留着)。
+	KindPolicyDecision = "policy_decision"
 )
 
-// KindAll 五种 Kind 的全集 (测试与操作台盘点用)。
-var KindAll = []string{KindRun, KindNode, KindTurn, KindLLMCall, KindToolCall, KindGate}
+// KindAll Kind 全集 (测试与操作台盘点用)。
+var KindAll = []string{KindRun, KindNode, KindTurn, KindLLMCall, KindToolCall, KindGate, KindPolicyDecision}
 
 // Span 轨迹跨度 (OTel 风格)。
 type Span struct {

@@ -78,6 +78,8 @@ var fallbackWeights = map[string]float64{
 	"episode":       0.3,
 	"latency":       0.2,
 	"cost":          0.2,
+	// verdict.heuristic 比 episode 还低: 它只说明"这轮没崩", 不说明产出对不对。
+	"verdict.heuristic": 0.15,
 }
 
 const fallbackWeightUnknown = 0.5
