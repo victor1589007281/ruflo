@@ -106,6 +106,29 @@ func (ac *AutoCreator) MaybeCreate(ctx context.Context, objective, approach, out
 	return result.Name, nil
 }
 
+// preserveStatus 读回 SKILL.md 现有 status 值 (无则视为 active)。
+// 用于改进技能时不丢治理状态 —— 否则 shadow 技能被改进后会变成"无 status
+// 字段 = 视为 active", 静默绕过进化门禁 (design/03 §4.6 必过闸)。
+func preserveStatus(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "active"
+	}
+	head := string(data)
+	if len(head) > 800 {
+		head = head[:800]
+	}
+	for _, ln := range strings.Split(head, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "status:") {
+			if v := strings.TrimSpace(strings.TrimPrefix(ln, "status:")); v != "" {
+				return v
+			}
+		}
+	}
+	return "active"
+}
+
 // ImproveSkill 技能自改进: 根据使用反馈优化已有技能。
 func (ac *AutoCreator) ImproveSkill(ctx context.Context, skillName, feedback string, success bool) error {
 	if ac.LLM == nil || ac.Registry == nil {
@@ -138,8 +161,11 @@ func (ac *AutoCreator) ImproveSkill(ctx context.Context, skillName, feedback str
 		return nil
 	}
 
-	skillMD := fmt.Sprintf("---\nname: %s\ndescription: %s\nwhen_to_use: %s\nauto_generated: true\nimproved_at: %s\n---\n\n%s\n",
-		sk.Name, sk.Description, sk.WhenToUse, time.Now().Format(time.RFC3339), improved)
+	// 保留原 status/audit 行: 否则改进一个 shadow 技能会因"无 status 字段 = 视为
+	// active"而静默绕过进化门禁 (design/03 §4.6 必过闸)。
+	statusLine := "status: " + preserveStatus(filepath.Join(ac.SkillDir, sk.Name, "SKILL.md"))
+	skillMD := fmt.Sprintf("---\nname: %s\ndescription: %s\nwhen_to_use: %s\nauto_generated: true\n%s\nimproved_at: %s\n---\n\n%s\n",
+		sk.Name, sk.Description, sk.WhenToUse, statusLine, time.Now().Format(time.RFC3339), improved)
 
 	path := filepath.Join(ac.SkillDir, sk.Name, "SKILL.md")
 	if err := os.WriteFile(path, []byte(skillMD), 0o644); err != nil {

@@ -118,7 +118,7 @@ func (wf *WorkflowDef) Validate(roles *RoleRegistry) error {
 		return fmt.Errorf("workflow %q 至少需要一个 stage", wf.Name)
 	}
 	if !dynamicModes[wf.Mode] {
-		return fmt.Errorf("mode %q 不支持动态定义(含伴生硬编码); 可选: pipeline/fanout/adversarial/adversarial_dev/orchestrated", wf.Mode)
+		return fmt.Errorf("mode %q 不支持动态定义(含伴生硬编码); 可选: pipeline/fanout/graph/adversarial/adversarial_dev/orchestrated", wf.Mode)
 	}
 	names := make(map[string]bool, len(wf.Stages))
 	for _, s := range wf.Stages {

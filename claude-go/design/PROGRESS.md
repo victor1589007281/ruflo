@@ -89,3 +89,22 @@ R1 token 主路径修复 / R2 sqlite 后端 / R3 cron选主+caps路由 / E1 采�
 
 - **[发现] pkg/orchestrator TestEngine_DiamondDAG 预存死锁**（2026-07-24）：旧的独立 K8s 式 DAG 引擎 `pkg/orchestrator`（design/01 §1.1 列出的三引擎之一）的 DiamondDAG 测试在 engine.go:340 的 select 上无限阻塞（90s/600s 均超时）。经 git diff 确认本轮所有提交**均未触碰** pkg/orchestrator，属预存缺陷。**佐证 design/01 收敛决策**：新 pkg/graph 的同款菱形并发测试（TestEngine_DiamondDAG 等价）通过。该引擎按 design/01 M4 计划退役，不在本轮修复，`go test ./pkg/...` 需 `-skip TestEngine_DiamondDAG` 或单独排除 pkg/orchestrator。
 - **[偏差] llmgw 流式记账测试脆弱性**：`access.jsonl` 客户端 ReadAll 与服务端 writeLog 在重负载下有时序窗口，测试改为轮询读取（readFirstRecord，2s 超时），非产品逻辑问题。
+
+### 三轮文档核对暴露的实现偏差（2026-07-24，写手册时逐条源码核实发现）
+
+以下由 docforge 手册重写过程中逐行核对源码发现，**已修的标 ✅，仍存的标 ⚠️ 并已在手册中诚实标注**：
+
+- ✅ **ImproveSkill 会绕过门禁**：重写 SKILL.md 时只写 name/description/when_to_use/auto_generated/improved_at，**丢掉 status 与 audit 行** → shadow 技能被改进后变成"无 status = 视为 active"，静默绕过 §4.6「必过闸」。已修（新增 `preserveStatus` 读回原状态 + 单测）。
+- ✅ **备份漏收 statestore/**：`pkg/backup` 子目录白名单无 `statestore`，轨迹 Span 与正文 blob 不进归档。已加入白名单。
+- ✅ **`dynamic_workflow.go` 校验失败文案漏 graph**：白名单已含 `graph` 但错误提示仍只列 5 种，会误导用户以为 graph 不支持动态注册。已补。
+- ⚠️ **shadow 运行期无隔离效力**：`pkg/skills` 的 `parseFrontmatter` 不解析 `status`、`Registry.All()` 不按状态过滤 → shadow 技能照常进清单、照常可被 Skill 工具加载。门禁裁决的是"是否正式承认"，不是"能否使用"。§4.3c 设计的"shadow 期 50% 随机注入做配对 A/B"需运行期 skill-usage 打点，属 E4。
+- ⚠️ **llm.jsonl 不含 trace 四元组**：`LLMCallRecord` 有四字段且两条 emit 路径都盖章，但 `recordLLMCall` 转 Prometheus labels 时未纳入四元组（防基数爆炸的合理取舍），故 llm.jsonl 行里没有 `run_id`。**E0 验收项"llm.jsonl 可按 run_id 聚合"应修正为"记录对象已带 trace，JSONL 落盘未含"**——跨源关联当前依靠 TraceStore Span 与团队轨迹，不依赖 llm.jsonl。
+- ⚠️ **采样/TTL 有能力无调用方**：生产装配一律 `tracestore.New(ss)`（= 全采），`NewWithOptions`/`SweepTraceFiles` 无生产调用点也无 cron 触发。**E1 的"采样/TTL ✅"应理解为"能力就绪"**，长跑实例的 `statestore/log`+`blob` 仍会无限增长。
+- ⚠️ **`X-CG-Run-ID` 无发送方**：网关读该头写 access.jsonl，但全仓无设置该头的代码 → 网关侧 run_id 恒空。
+- ⚠️ **图 gate 的 compile/test 分支是占位**：只按"产出非空/像代码"给 80/90 分，不真跑编译器。声明一个叫 `compile-gate` 的图节点 ≠ 有硬门禁（真门禁在产码工作流的全局 gate）。
+- ⚠️ **对抗评分维度三重不一致**（预存缺陷，非本轮引入）：`SkepticalReviewerPersona` prompt 枚举 7 个维度却写"六个"；`EvalScore` 只有 5 个字段；`WeightedScore()` 与正则兜底只用前 4 个 → concurrency/performance/idiomatic 被要求、被生成、然后静默丢弃。
+- ⚠️ **一致性门禁不区分 Severity**：`orphan_reference`（零方法接口）是 warning 级，但 `runGlobalConsistencyCheck` 按 `len(inconsistencies)>0` 一律 failTeam → 仓库里一个 `type Marker interface{}` 就能整队判失败，且这道闸无自动修复环。
+- ⚠️ **`MemoryIngestFn` 死代码**：只有声明与使用、全仓无赋值点（进化→记忆交叉学习未通电）。
+- ⚠️ **`/api/dreaming/diagnosis` 容器内会误报**：靠读磁盘上的 `cmd/claude-go/main.go` 源码文本判断接线，容器部署无源码树 → wired=false 误报。运维应用 `evo` 看制品而非该端点猜代码。
+- ⚠️ **`workflow_orchestrated.go:1-24` 注释已部分失真**：仍写"两套调度系统 + Coordinator 按 mode 选择"，未提共享表与图引擎第三路。
+- ⚠️ **未鉴权面因 cluster 扩大**：`/api/*` 与新增 `/cluster/*`（含 enqueue/pull/complete）均无鉴权，仅 `/wiki/*`+`/sync/*` 有 Bearer。

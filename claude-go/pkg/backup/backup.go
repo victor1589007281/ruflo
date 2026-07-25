@@ -5,6 +5,7 @@
 //   - memory/          长期记忆 + dreaming 产出
 //   - metrics/         指标事件与 summary
 //   - evolution/       进化引擎记录 (可选)
+//   - statestore/      轨迹底座: KV/Log/Blob (含 TraceStore Span 与正文 blob)
 //   - swarm_intel/     群体智能预测与信息素
 //   - tasks.json       DAG 任务
 //   - cron_jobs.json   定时任务
@@ -39,6 +40,7 @@ var defaultTargets = []string{
 	"memory",
 	"metrics",
 	"evolution",
+	"statestore", // 轨迹 Span + Blob + KV (design/03 §4.1); 漏收会丢学习制品
 	"swarm_intel",
 	"blackboard",
 	"tasks.json",
@@ -198,9 +200,9 @@ func addPathToTar(tw *tar.Writer, src, rel string, opts CreateOptions) (fileCoun
 		}
 		if i.IsDir() {
 			hdr := &tar.Header{
-				Name:    name,
-				Mode:    0o755,
-				ModTime: i.ModTime(),
+				Name:     name,
+				Mode:     0o755,
+				ModTime:  i.ModTime(),
 				Typeflag: tar.TypeDir,
 			}
 			return tw.WriteHeader(hdr)

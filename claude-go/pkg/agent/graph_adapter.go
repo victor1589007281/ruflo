@@ -19,7 +19,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/anthropic/claude-go/pkg/graph"
 	"github.com/anthropic/claude-go/pkg/logging"
@@ -248,6 +247,3 @@ func graphEngineEnabled() bool {
 	v := strings.TrimSpace(os.Getenv("CLAUDE_GO_GRAPH_ENGINE"))
 	return v == "1" || strings.EqualFold(v, "true")
 }
-
-// 编译期占位引用, 防止未来重构误删 (executeGraph 由 Execute switch 与 executePipeline 灰度共用)。
-var _ = time.Now
