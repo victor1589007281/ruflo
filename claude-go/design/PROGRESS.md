@@ -138,3 +138,50 @@ R1 token 主路径修复 / R2 sqlite 后端 / R3 cron选主+caps路由 / E1 采�
 3. 是否把 `pkg/toolskill` 接成 `pkg/graph` gate 节点的真实现（替换 80/90 占位分）。这会让门禁真的开始拦人，原先靠占位分混过的 graph 工作流可能开始失败。
 4. `predict` 伪工作流是否放行进 `CreateTeam`（现为不可达路径），或反之删除 `runPredict` 与特判分支。
 5. 是否把 `tests/integration` 的 `skipIfNoAPI` 修成"无环境变量就真跳过"（去掉硬编码 key 回落），使 `go test ./...` 变成幂等且不触网。
+
+---
+
+## 2026-07-25 三方独立核查：进度账修正
+
+对 design/01-03 各派一路独立核查（明确要求"不要相信 PROGRESS，到代码里核实并指出高估"）。结论是**本进度账系统性偏乐观**，模式有三类：
+
+1. **把"类型/字段/函数写完 + 单测绿"记成 ✅**，而里程碑验收标准写的是形态级/链路级；
+2. **把设计稿章节记成交付物**（如 P2.4 "AgentRuntime 接口设计在 §4.9"——接口至今不存在）；
+3. **把覆盖矩阵这张计划表当成"已核实无丢项"**（V4）。
+
+### 必须改判的条目
+
+| 原自评 | 应改为 | 依据 |
+|---|---|---|
+| M1 图内核 ✅ | 🟨 ~70% | 验收项"kill -9 恢复重放正确"**无对应测试**（`journal_test.go` 只模拟尾部截断行，非进程 kill）；且 pipeline/fanout 灰度**默认关**，交付物在生产不生效 |
+| M2 的 loop/条件边 ✅ | 🟡 建成未通电 | 代码为真但**生产零产生方**：`TranslateWorkflow` 从不设 `Loop`/`Condition`，`StageDef` 也无对应字段 → 生产图全是无条件边、maxRetries=0 |
+| R1 网关独立 ✅ | 🟨 ~60% | `llmgw.NewLocal` **唯一调用方是自己的测试**，生产 `pkg/feishu/bot.go` 直连 `api.NewClient` → L1 抽象对生产不可见；网关缺 fallback/熔断/配额/双协议；**`CLAUDE_GO_LLM_GATEWAY` 是死环境变量**（distributed.yaml 设了两处，Go 侧零读取）→ T1 拓扑里网关是装饰品 |
+| R2 的 sqlite ✅ | 🟡 | 零生产接线、无配置开关（唯一调用方是 regression 测试）。验收项"双进程读写一致"未达成——FileStore 无跨进程锁且自己声明不保证 |
+| R3 队列/worker ✅ | 🟨 ~35% | **`Enqueue` 唯一生产调用方是 HTTP handler，编排器从不入队**（`pkg/agent` 零 `pkg/cluster` import）；**`executeWorkerTask` 是回显桩**（自带注释"v1 简化实现: 回显 payload"）→ 分布式执行链路为 0。cron 选主漏了 `pkg/sync` 第二个进程内调度器 |
+| R4 双模式实测 ✅ | 🟨 存活冒烟，功能未验 | K8s 清单三处使其无法真正工作：**ConfigMap 从未被读取**（清单不传 `--config`，自动发现路径不含 `/etc/claude-go/`）→ Pod 落到占位 provider 分支；control 的 state 是 emptyDir；网关未被接入。故 V2/V3 的"全通"是不需要 LLM 的存活冒烟 |
+| E0 ✅ | 🟠 ~70% | 开环②只闭一半（`ImproveSkill` 生产调用点仍为 0）；③只闭团队路径（CLI 会话无 AfterQuery）；验收项"llm.jsonl 可按 run_id 聚合"**未达成**（`llm_collector.go` 构造 labels 时四元组一个都没进） |
+| E1 的采样/TTL ✅ | 🟡 | 零生产调用方，本文件 §偏差记录早已自承认——两处自相矛盾 |
+| E2 "8 源中 3 源" | **1/8**（+1 个设计外自加） | 生产写出的 Source 字面量只有 2 个：`gate.content`（两个调用点用**同一字面量**，被我当两源计数）与 `episode`（不在设计的 8 源里）。设计价值排第一的 `gate.compile`/`gate.test` 在真门禁函数内 `RecordReward` 调用数为 0 |
+| E3 审计门禁 ✅ | 🟠 ~27% | `skillaudit` 的裁决是"创建时间之后的**全部**奖励求均值"，**零技能归因**——同批 shadow 技能裁决必然相同；且 `ImproveSkill` 重写 frontmatter 会丢 `created_at`，退化为"有史以来所有奖励"。包注释描述的"配对审计 vs 全局基线"与实现不符 |
+| E4 evo 操作台 ✅ | 🟠 ~16% | 设计要求的是 7 个**注册进工具池、agent 自助**的 `evo_*` 工具；实现是 4 个 CLI 子命令（`grep '"evo_'` 零命中）→ H8"agent 即进化工程师"结构上不成立，H9 限速无实现 |
+| V4 "覆盖矩阵逐项映射，无丢项" | ❌ 撤回 | 三份矩阵是**计划表不是状态表**。实测：design/01 §6 的 26 行里真被新架构覆盖的是 **1 行**（AllowedTools 双路径收敛） |
+
+### 新登记的偏差（此前未记）
+
+- ✅ **已修**：图 journal 跨 run 混用致重跑/refine 静默零执行（P0，见上一节提交）。原 `TestGraphJournalResume` 把该缺陷当期望行为锁死。
+- ⚠️ **CLI 形态两个 hook 从不注册**：`applyFeatureFlags` 只在 `NewQueryEngine` 内跑，而 CLI 在建引擎**之后**才赋 `TraceStore`/`MemoryStore` 且无 re-register → **`TraceCaptureHook` 与 `MemoryInjectHook` 在 CLI 均失效**。后果：下游 8+ 平台的全部流量既没有 turn/tool_call 轨迹，也没有 L1/L2 记忆注入。design/03 §4.4 承诺的"headless 与飞书同构、开环 1 从架构上不可能再出现"未达成。
+- ⚠️ **奖励零消费**：`rewards.jsonl` 的读取方全仓只有两个**离线 CLI**（console/skillaudit）。学习反馈仍走 stage 二值（`workflow.go:896-901`）→ **RewardBus 是只写日志，不是总线**。这是学习闭环的第二层开环。
+- ⚠️ **judge 自评**（违反已吸收的 Hermes H3）：content gate 的 judge 用主模型 `ptm.llm`/`we.llm`，正是 H3 明令禁止的自评。
+- ⚠️ `pkg/eventbus` **零生产 import**；`TaskService` 类型不存在；:7777 动作队列**无消费方**（写入即烂盘）。
+- ⚠️ **H1-H14 吸收项实际落地 ≈0.8/14**，本进度账全程未对其做过逐项声明。
+- 📄 design/02 有 13 处文档失真（含 `pkg/feishu/engine.go` 文件不存在、桶名含 `/` 而 `validateBucket` 白名单禁止 `/` 故结构性不可表达、"绑 loopback"在 socket 层不成立）。
+
+### 三份设计的独立实现度评估
+
+| 文档 | 独立核查结论 | 分母算法 |
+|---|---|---|
+| design/01 | **≈20%** | §4 的 12 抽象 + §5 的 15 mode + §6 的 26 行 = 53 条，加权 10.5 |
+| design/02 | **≈32%** | 102 条可核验承诺，加权 32.75 |
+| design/03 | **≈22%** | 79 条可核验条目，加权 17.75 |
+
+**共同结论：已完成的绝大部分是 M0/R0/E0 的"止血、接口抽取、开环修补"，而不是三份设计的目标架构本身。** 且全部实现**尚未部署**（线上二进制 07-17，实现落 07-24/25）。
