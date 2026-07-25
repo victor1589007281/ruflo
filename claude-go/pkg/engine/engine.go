@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -146,6 +147,11 @@ type Config struct {
 	// 内置工具即使在工具表中也无法调用。白名单在会话构建时锁定。
 	AllowedTools map[string]bool
 
+	// ConstraintOrigin 记录上面两个名单/权限档由哪个 ConstraintSet 装配而来
+	// (design/01 §4.6 审计)。多次 ApplyConstraints 会以 " > " 串成继承链。
+	// 纯观测字段, 不参与任何判定。
+	ConstraintOrigin string
+
 	// ==================== 前沿优化特性开关 (默认关闭) ====================
 	// 详细方案见 docs/query-engine-frontier-optimization.md。
 	// 推荐通过 QueryEngine.EnableFrontierOptimizations() 统一启用 P0/P1 组件。
@@ -191,6 +197,100 @@ func (c *Config) toolExposed(name string) bool {
 		return false
 	}
 	return true
+}
+
+// ToolConstraintSource 是"已编译的约束"的最小读接口, 由 pkg/agent.ConstraintSet
+// **结构性**满足 (design/01 §4.6 单一真源)。
+//
+// 为什么是接口而不是直接 import pkg/agent: pkg/engine 在每轮每工具的热路径上,
+// 让它反向依赖 pkg/agent 那棵重依赖树 (orchestrator/swarm_intel/media/...) 是架构
+// 倒挂, 而且一旦 pkg/agent 将来需要 import pkg/engine 就是依赖环。名单仍然只在
+// ConstraintSet 里声明一次, 执行点仍然只有 toolExposed 一个 —— 单一真源成立。
+type ToolConstraintSource interface {
+	// CompiledToolAllow 白名单。nil = 不设白名单; 非 nil (含空 map) = 仅名单内放行,
+	// 空 map 即全部拒绝 —— 与 Config.AllowedTools 的 fail-closed 语义一致。
+	CompiledToolAllow() map[string]bool
+	// CompiledToolDeny 黑名单 (nil = 不禁)。
+	CompiledToolDeny() map[string]bool
+	// NarrowedPermissionMode 给定引擎当前权限档, 返回应下发的档位; "" = 不覆盖。
+	// **契约**: 返回值只能是 current 或比 current 更严的一档。权限严格度阶梯是
+	// 一张有序表, 全仓只有 pkg/agent/constraints.go 一份 (permissionStrictness);
+	// 这里让实现方回答"收窄后是哪一档", 而不是在 engine 里再抄一份阶梯 —— 抄一份
+	// 就又是一个第二真源, 正是 §4.6 要消除的东西。
+	NarrowedPermissionMode(current string) string
+	// ConstraintOrigin 审计: 约束的来源链。
+	ConstraintOrigin() string
+}
+
+// ApplyConstraints 把一个 ConstraintSet 编译结果装配进 Config。
+//
+// **只收窄, 永不放宽**:
+//   - 黑名单取并集 (只增不减);
+//   - 白名单: 本来没有名单则采用来源的名单 (设名单本身就是收窄); 两边都有则取交集;
+//   - 权限档只接受更严的一档 (由来源方按唯一的严格度阶梯裁决)。
+//
+// 返回非 nil error 表示来源里**有放宽意图已被丢弃**(白名单里出现了当前名单之外的
+// 工具), Config 保持更严的现状。调用方应记日志/告警, 但不必回滚 —— 按构造这里
+// 不可能变松。
+//
+// 不在热路径上: 每个会话/每个 agent 建立时调用一次; toolExposed 一个字节没动。
+func (c *Config) ApplyConstraints(src ToolConstraintSource) error {
+	if c == nil || src == nil {
+		return nil
+	}
+	var rejected []string
+
+	if deny := src.CompiledToolDeny(); len(deny) > 0 {
+		if c.DisabledTools == nil {
+			c.DisabledTools = make(map[string]bool, len(deny))
+		}
+		for name := range deny {
+			c.DisabledTools[name] = true
+		}
+	}
+
+	if allow := src.CompiledToolAllow(); allow != nil {
+		if c.AllowedTools == nil {
+			next := make(map[string]bool, len(allow))
+			for name := range allow {
+				next[name] = true
+			}
+			c.AllowedTools = next
+		} else {
+			next := make(map[string]bool, len(allow))
+			var escaped []string
+			for name := range allow {
+				if c.AllowedTools[name] {
+					next[name] = true
+				} else {
+					escaped = append(escaped, name)
+				}
+			}
+			// 交集: 现有名单外的工具一律丢掉, 绝不因为来源"也允许"就放进来。
+			c.AllowedTools = next
+			if len(escaped) > 0 {
+				sort.Strings(escaped)
+				rejected = append(rejected, "白名单越界工具已丢弃: "+strings.Join(escaped, ","))
+			}
+		}
+	}
+
+	if pm := src.NarrowedPermissionMode(string(c.PermissionMode)); pm != "" {
+		c.PermissionMode = types.PermissionMode(pm)
+	}
+
+	if origin := src.ConstraintOrigin(); origin != "" {
+		if c.ConstraintOrigin == "" {
+			c.ConstraintOrigin = origin
+		} else {
+			c.ConstraintOrigin += " > " + origin
+		}
+	}
+
+	if len(rejected) > 0 {
+		return fmt.Errorf("约束装配拒绝了放宽声明 (%s): %s", src.ConstraintOrigin(), strings.Join(rejected, "; "))
+	}
+	return nil
 }
 
 // NewQueryEngine 创建查询引擎

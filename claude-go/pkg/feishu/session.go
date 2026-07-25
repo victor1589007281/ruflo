@@ -443,6 +443,117 @@ func profileForTeamRole(role, workflow string) builtin.ToolProfile {
 	return builtin.ToolProfileTeam
 }
 
+// ==================== 约束单一真源接线 (design/01 §4.6) ====================
+//
+// 上面三个 profileForXxx / inferFeishuToolProfile 是**启发式**, 各有各的输入
+// (角色名 / RunOptions / 用户文本)。此前它们各自直接决定档位, 没有一个地方能回答
+// "这个 agent 的约束是什么、从哪来、能不能放宽"。现在它们退化为
+// agent.ConstraintSet.ResolveToolProfile 的 fallback: 显式声明优先, 没有声明才回退,
+// 且回退会留痕。**启发式的实现仍只有这一份**, 一行都没有复制到 pkg/agent —— 复制
+// 一份就等于造出第二个真源, 正是 §4.6 要消除的问题。
+
+// 编译期断言: pkg/agent.ConstraintSet 结构性满足 engine 的最小约束接口。
+// 放在 feishu (全仓唯一同时 import 两者的包) 让契约破裂在编译期暴露, 而不是等到
+// 运行时某个调用点才发现装配不上。
+var _ engine.ToolConstraintSource = (*agent.ConstraintSet)(nil)
+
+// feishuSessionConstraints 飞书主会话的工具约束。
+//
+// 语义与改造前 engine.Config.DisabledTools 的 map 字面量**逐项等价**: 飞书会话中
+// 禁止 LLM 自主调用团队内部工具, 团队操作只能通过 /team、/go 命令触发。
+// TeamMailbox/TeamCreate/TeamDelete 是团队内部 Agent 间通信工具, 在飞书对话中无
+// 意义, 且会被 LLM 误用 (如把 TeamMailbox 当成"发消息给用户")。
+// 区别只在于: 名单现在声明在 ConstraintSet 里 (可审计、可被子约束继续收窄),
+// 执行点仍然是 engine 的 toolExposed。
+func feishuSessionConstraints() *agent.ConstraintSet {
+	return agent.NewConstraintSet("feishu-session").
+		WithDeniedTools("TeamCreate", "TeamDelete", "TeamMailbox")
+}
+
+// roleInferWarned 记录已经提醒过的 (来源, 档位) 组合。
+// 高频阶段会反复建 agent, 不去重会刷爆日志。
+var (
+	roleInferWarned      sync.Map
+	roleInferWarnedCount atomic.Int64
+)
+
+// roleInferWarnCap 去重表的容量上限。
+// 为什么需要上限: 嵌套 agent 的来源含 opts.SubagentType, 那是**模型可控的任意字符串**;
+// 无上限的去重表会随模型胡编的 subagent 名无界增长 (慢性内存泄漏)。到顶后停止提醒 ——
+// 到那时该收集的信号早已收齐, 而这条日志只是观测手段, 丢掉不影响任何判定。
+const roleInferWarnCap = 512
+
+// warnRoleNameInference 在真的用了"角色名子串推断"时留下可观测痕迹。
+// design/01 §4.6 要求 profileForTeamRole 仅作缺省回退并打 deprecation 日志 ——
+// 这条日志就是将来退役它的依据: 线上还有哪些角色在依赖猜测, 一目了然。
+func warnRoleNameInference(origin string, prof builtin.ToolProfile) {
+	key := origin + "|" + string(prof)
+	if _, dup := roleInferWarned.Load(key); dup {
+		return
+	}
+	if roleInferWarnedCount.Load() >= roleInferWarnCap {
+		return
+	}
+	if _, dup := roleInferWarned.LoadOrStore(key, struct{}{}); dup {
+		return
+	}
+	roleInferWarnedCount.Add(1)
+	log.Printf("[Constraint][deprecated] 工具档位由角色名子串推断得出 (%s → profile=%s); "+
+		"design/01 §4.6 要求显式声明 tool_profile, 该推断将退役", origin, prof)
+}
+
+// resolveToolProfile 飞书侧**唯一**的工具档位决策入口。
+// 优先级: ConstraintSet 里的显式声明 > fallback 启发式。用了角色名推断就打一次
+// deprecation 日志 (按来源去重)。返回值经 NormalizeToolProfile 兜底, 与改造前一致。
+func resolveToolProfile(cs *agent.ConstraintSet, fallbackSource agent.ProfileSource, fallback func() builtin.ToolProfile) builtin.ToolProfile {
+	name, src := cs.ResolveToolProfile(fallbackSource, func() string {
+		return string(builtin.NormalizeToolProfile(fallback()))
+	})
+	prof := builtin.NormalizeToolProfile(builtin.ToolProfile(name))
+	if src == agent.ProfileSourceRoleNameFallback {
+		warnRoleNameInference(cs.ConstraintOrigin(), prof)
+	}
+	return prof
+}
+
+// nestedExplicitProfile 判定嵌套 agent 能否采用外层图节点的显式档位声明;
+// 返回 "" 表示不采用, 由调用方回退到启发式结果。
+//
+// 为什么不能直接采用: 嵌套 agent 的档位来自本次派生的意图 (opts.ReadOnly /
+// SubagentType), 节点声明可能比它**更宽** —— 例如节点声明 coding, 而这次派生带了
+// opts.ReadOnly=true (原本得 research 档), 直接覆盖就是放宽, 违反 §4.6 的约束单调性,
+// 后果是一个只读子代理拿到了 Shell。
+// 因此只在声明确实是收窄时采用; 声明更宽、或两个档位不可比 (工具集互不包含) 时
+// 一律不采用 —— 保持回退结果, 也就是改造前的行为 (fail-closed)。
+func nestedExplicitProfile(declared, fallback builtin.ToolProfile) builtin.ToolProfile {
+	if declared == "" {
+		return ""
+	}
+	if agent.ProfileNarrows(string(declared), string(builtin.NormalizeToolProfile(fallback))) {
+		return declared
+	}
+	return ""
+}
+
+// resolveSessionToolProfile 主会话 (人在飞书里直接对话) 的档位决策。
+// 用户不会声明档位, 所以恒走文本启发式; 走同一入口是为了让**所有**档位决策只有
+// 一个地方, 且来源可审计。文本启发式不是角色名推断, 不打 deprecation 日志。
+func resolveSessionToolProfile(userText string) builtin.ToolProfile {
+	return resolveToolProfile(
+		agent.NewConstraintSet("feishu-chat"),
+		agent.ProfileSourceTextHeuristic,
+		func() builtin.ToolProfile { return inferFeishuToolProfile(userText) },
+	)
+}
+
+// applyConstraints 把约束装配进引擎配置。约束按构造只会收窄, 返回错误意味着声明里
+// 有放宽意图并已被丢弃 —— 记日志, 保持更严的现状 (fail-closed), 不回滚也不放行。
+func applyConstraints(cfg *engine.Config, cs *agent.ConstraintSet) {
+	if err := cfg.ApplyConstraints(cs); err != nil {
+		log.Printf("[Constraint] 约束装配拒绝了放宽声明, 已保持更严现状: %v", err)
+	}
+}
+
 // Get 获取已有会话（不创建）。如果不存在返回 nil。
 func (sm *SessionManager) Get(chatID string) *Session {
 	sm.mu.RLock()
@@ -533,16 +644,12 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		MetricsSource:    "feishu_main",
 		MetricsPurpose:   chatID,
 		DynamicPlanCheck: builtin.PlanModeActive,
-		// 飞书会话中禁止 LLM 自主调用团队内部工具。
-		// 团队操作只能通过 /team、/go 命令触发。
-		// TeamMailbox/TeamCreate/TeamDelete 是团队内部 Agent 间通信工具，
-		// 在飞书对话中无意义，且会被 LLM 误用（如把 TeamMailbox 当成"发消息给用户"）。
-		DisabledTools: map[string]bool{
-			"TeamCreate":  true,
-			"TeamDelete":  true,
-			"TeamMailbox": true,
-		},
+		// DisabledTools 不再在这里写 map 字面量: 名单已收敛到
+		// feishuSessionConstraints() 一处声明, 下面 applyConstraints 编译下发
+		// (design/01 §4.6)。行为与改造前逐项等价 —— 同样是那三个团队内部工具,
+		// 同样不设白名单。
 	}
+	applyConstraints(cfg, feishuSessionConstraints())
 
 	// Advisor push 模式 (Phase 3): checkpoint hook 与 pull 模式共享同一工具实例的预算
 	if advTool := sm.advisorToolFor(chatID); advTool != nil && sm.config.Advisor != nil {
@@ -650,7 +757,19 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	}
 	runMeta := agent.RunMetadataFromContext(ctx)
 	nestedPurpose := firstNonEmpty(opts.SubagentType, runMeta.Purpose, runMeta.Team)
-	nestedReg := sm.newProfileRegistry(profileForRunOptions(opts, runMeta), registryOptions{})
+
+	// 工具画像: 同样经 ConstraintSet 决策 (design/01 §4.6)。显式声明来自外层图节点
+	// (ctx 里的 NodeExecHints), 但只能"取更窄的那个" —— 理由见 nestedExplicitProfile。
+	nestedFallbackProfile := profileForRunOptions(opts, runMeta)
+	nestedConstraints := agent.NewConstraintSet("nested-agent:" + firstNonEmpty(opts.SubagentType, runMeta.Role, "anonymous"))
+	nestedConstraints.WithToolProfile(string(nestedExplicitProfile(
+		mapExplicitToolProfile(agent.NodeExecHintsFromContext(ctx).ToolProfile),
+		nestedFallbackProfile,
+	)))
+	nestedProfile := resolveToolProfile(nestedConstraints, agent.ProfileSourceRoleNameFallback, func() builtin.ToolProfile {
+		return nestedFallbackProfile
+	})
+	nestedReg := sm.newProfileRegistry(nestedProfile, registryOptions{})
 
 	cfg := &engine.Config{
 		Model:            model,
@@ -666,6 +785,7 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		Workflow:         runMeta.Workflow,
 		Role:             firstNonEmpty(opts.SubagentType, runMeta.Role),
 	}
+	applyConstraints(cfg, nestedConstraints)
 
 	nested := engine.NewQueryEngine(cfg, nestedAPIClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
 
@@ -832,7 +952,7 @@ func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, us
 		}
 	}()
 	session.Touch()
-	sm.configureSessionTools(session, inferFeishuToolProfile(userText))
+	sm.configureSessionTools(session, resolveSessionToolProfile(userText))
 
 	ch := session.Engine.SubmitMessage(ctx, userText)
 
@@ -990,15 +1110,19 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		apiClient.PromptCacheMode = promptCacheMode
 	}
 
-	// 工具画像: **显式声明优先于角色名推断**。
+	// 工具画像: **显式声明优先于角色名推断**, 决策收敛到 ConstraintSet 单一真源
+	// (design/01 §4.6)。
 	// profileForTeamRole 是按角色名子串匹配的 (session.go 上方), 那套推断有真实
-	// 误判——例如 world-builder 因含 "build" 被判成 Coding 档而拿到 Bash。
-	// design/01 §4.6 要求显式声明取代猜测; 图节点若声明了 tool_profile 就用它,
-	// 没声明时保持既有行为 (fail-open, 不改变任何现有工作流)。
-	prof := profileForTeamRole(firstNonEmpty(r.runMeta.Role, r.role), r.runMeta.Workflow)
-	if p := mapExplicitToolProfile(r.hints.ToolProfile); p != "" {
-		prof = p
-	}
+	// 误判——例如 world-builder 因含 "build" 被判成 Coding 档而拿到 Shell。
+	// 图节点若声明了 tool_profile 就用它; 没声明时**行为与改造前逐项等价**
+	// (仍走 profileForTeamRole), 只多一条 deprecation 痕迹 —— 6 个下游平台的
+	// 现行行为一点不变。
+	teamRole := firstNonEmpty(r.runMeta.Role, r.role)
+	constraints := agent.NewConstraintSet("team-role:" + teamRole).
+		WithToolProfile(string(mapExplicitToolProfile(r.hints.ToolProfile)))
+	prof := resolveToolProfile(constraints, agent.ProfileSourceRoleNameFallback, func() builtin.ToolProfile {
+		return profileForTeamRole(teamRole, r.runMeta.Workflow)
+	})
 	nestedReg := r.sm.newProfileRegistry(prof, registryOptions{})
 
 	permMode := types.PermissionMode(r.sm.config.PermissionMode)
@@ -1062,6 +1186,11 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		Workflow:         r.runMeta.Workflow,
 		Role:             firstNonEmpty(r.runMeta.Role, r.role),
 	}
+	// 同一个 ConstraintSet 既决定了工具档位 (上面 newProfileRegistry), 也在这里编译
+	// 成引擎的名单/权限档 —— 这就是 §4.6 的"单一真源": 档位决策与 toolExposed 读的
+	// 是同一份声明。当前团队角色约束只带档位、不带名单, 因此这一步对现有行为是
+	// no-op, 只把来源链写进 cfg.ConstraintOrigin 供审计。
+	applyConstraints(cfg, constraints)
 
 	eng := engine.NewQueryEngine(cfg, apiClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = r.sm.memoryStore
