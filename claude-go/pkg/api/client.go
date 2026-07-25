@@ -775,6 +775,7 @@ func (c *Client) StreamMessage(
 			httpReq.Header.Set("x-api-key", effectiveAPIKey)
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
 			httpReq.Header.Set("Authorization", "Bearer "+effectiveAPIKey)
+			setTraceHeaders(httpReq, ctx) // trace 四元组 (见 trace.go); 未设置时无副作用
 
 			resp, err = c.Client.Do(httpReq)
 			if err != nil {
@@ -1144,6 +1145,7 @@ func (c *Client) SendMessage(
 		httpReq.Header.Set("x-api-key", effectiveAPIKey)
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
 		httpReq.Header.Set("Authorization", "Bearer "+effectiveAPIKey)
+		setTraceHeaders(httpReq, ctx) // trace 四元组 (见 trace.go); 未设置时无副作用
 
 		resp, err := c.Client.Do(httpReq)
 		if err != nil {
@@ -1351,6 +1353,7 @@ func (c *Client) SendMessage(
 			httpReq.Header.Set("x-api-key", fbAPIKey)
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
 			httpReq.Header.Set("Authorization", "Bearer "+fbAPIKey)
+			setTraceHeaders(httpReq, ctx) // 降级路径同样带 trace, 否则 fallback 的调用在网关侧对不上账
 			resp, err := c.Client.Do(httpReq)
 			if err != nil {
 				continue

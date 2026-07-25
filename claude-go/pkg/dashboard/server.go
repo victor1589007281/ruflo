@@ -254,6 +254,9 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/skills/", s.handleSkillDetail)           // GET 详情 / DELETE
 	mux.HandleFunc("/api/tools", s.handleTools)
 	mux.HandleFunc("/api/mcp/servers", s.handleMCPServers)
+	// L5 platform-mcp-server (design/02 §3.5): 平台能力以 MCP 工具对外。
+	// 落在 /api/ 前缀内 ⇒ 自动被 pkg/httpauth 的保护前缀覆盖, 见 platform_mcp.go。
+	s.registerPlatformMCP(mux)
 	mux.HandleFunc("/api/references", s.handleReferences)
 	mux.HandleFunc("/api/workflows/", s.handleWorkflow) // /api/workflows/:name
 	mux.HandleFunc("/api/search", s.handleSearch)

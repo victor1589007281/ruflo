@@ -189,6 +189,18 @@ func (r *ConfigResolver) resolveFallbacks(aliases []string, primaryProvider stri
 // gatewayEnv 是 LLM 网关地址的环境变量名 (design/02 §3.1 L1)。
 const gatewayEnv = "CLAUDE_GO_LLM_GATEWAY"
 
+// GatewayBaseURL 返回 CLAUDE_GO_LLM_GATEWAY 的规范化值 (去空白、去尾斜杠);
+// 未设置时返回空串。
+//
+// 导出的理由: 有些出站端点不经 ConfigResolver 解析 (例如 dashboard 的
+// DASHBOARD_LLM_BASE_URL / ANTHROPIC_BASE_URL 两条 env 直通路径), 它们既要
+// 复用 ApplyGatewayOverride 的覆盖规则, 又要如实报告"这一跳是否经网关"。
+// 让它们各自再 os.Getenv 一遍会把环境变量名散成多份, 迟早漂移 ——
+// 变量名只在本文件出现一次。
+func GatewayBaseURL() string {
+	return strings.TrimRight(strings.TrimSpace(os.Getenv(gatewayEnv)), "/")
+}
+
 // ApplyGatewayOverride 在设置了 CLAUDE_GO_LLM_GATEWAY 时把出站 BaseURL 改指网关。
 //
 // 为什么需要它: deploy/k8s/distributed.yaml 给 control 与 worker 都注入了
@@ -206,11 +218,11 @@ const gatewayEnv = "CLAUDE_GO_LLM_GATEWAY"
 // 注意只改 BaseURL 不改 APIKey: 网关负责向真实 provider 注入凭据, 但客户端
 // 到网关这一跳仍可能需要鉴权头, 保持原样透传由网关决定是否校验。
 func ApplyGatewayOverride(cfg ResolvedConfig) ResolvedConfig {
-	gw := strings.TrimSpace(os.Getenv(gatewayEnv))
+	gw := GatewayBaseURL()
 	if gw == "" || cfg.BaseURL == "" {
 		return cfg
 	}
-	cfg.BaseURL = strings.TrimRight(gw, "/")
+	cfg.BaseURL = gw
 	// fallback 端点一并改指网关: 否则主端点走网关而降级路径直连 provider,
 	// 集中记账与配额观测在最需要的时候(主端点故障)恰好失效。
 	if cfg.FallbackBaseURL != "" {

@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/api"
 )
 
 // Route 一个 provider 的路由项。
@@ -48,6 +50,9 @@ type AccessRecord struct {
 	OutputTokens   int    `json:"output_tokens"`
 	InputEstimated bool   `json:"input_estimated,omitempty"` // input 来自请求字节估算 (len/4)
 	RunID          string `json:"run_id,omitempty"`          // X-CG-Run-ID 透传 (trace 四元组)
+	NodeID         string `json:"node_id,omitempty"`         // X-CG-Node-ID
+	TurnID         string `json:"turn_id,omitempty"`         // X-CG-Turn-ID
+	CallID         string `json:"call_id,omitempty"`         // X-CG-Call-ID
 	Err            string `json:"err,omitempty"`
 }
 
@@ -141,7 +146,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	rec := AccessRecord{
 		TS: start.UnixMilli(), Model: probe.Model, Provider: rt.Provider,
-		Stream: probe.Stream, RunID: r.Header.Get("X-CG-Run-ID"),
+		Stream: probe.Stream,
+		// trace 四元组: 头名用 pkg/api 的常量, 与出站侧 (api.setTraceHeaders) 同一份定义。
+		RunID:  r.Header.Get(api.TraceHeaderRunID),
+		NodeID: r.Header.Get(api.TraceHeaderNodeID),
+		TurnID: r.Header.Get(api.TraceHeaderTurnID),
+		CallID: r.Header.Get(api.TraceHeaderCallID),
 	}
 
 	// 模型名若带 "provider:" 前缀, 出站前剥掉 (上游只认裸模型名)

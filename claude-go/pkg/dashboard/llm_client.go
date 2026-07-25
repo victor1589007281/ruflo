@@ -16,6 +16,12 @@ package dashboard
 // 客户端选择:
 //  - 若 baseURL 非空: api.NewClient(baseURL, key, model)
 //  - 否则: api.NewDashScopeClient(key, model)  (DashScope 默认)
+//
+// L1 层归属 (design/02 §3.1): 本文件是 dashboard 侧唯一的 LLM 出口, 因此也是
+// LLMGateway 接口的接线点 —— 见 SharedGateway 与 LLMComplete。上面第 1/2 条
+// env 直通路径此前不经 ConfigResolver, 于是 CLAUDE_GO_LLM_GATEWAY 对它们无效
+// (设了网关, dashboard 的诊断调用照旧直连 provider); resolveLLMClient 末尾现在
+// 显式复用 modelconfig.ApplyGatewayOverride 补上这一跳。
 
 import (
 	"context"
@@ -30,6 +36,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/feishu"
+	"github.com/anthropic/claude-go/pkg/llmgw"
 )
 
 // ErrLLMNotConfigured 表示无法从 env/配置文件中解析出可用的模型凭据。
@@ -44,6 +51,10 @@ type LLMProfile struct {
 	HasAPIKey bool   `json:"hasApiKey"`
 	// ConfigPath 若使用的是文件配置, 这里记录实际命中的文件路径。
 	ConfigPath string `json:"configPath,omitempty"`
+	// Gateway 非空表示出站这一跳实际打的是 L1 LLM 网关 (CLAUDE_GO_LLM_GATEWAY),
+	// 而不是 BaseURL 里那个 provider 端点。新增字段, 只增不改, /api/llm/status
+	// 的既有字段语义不动。
+	Gateway string `json:"gateway,omitempty"`
 }
 
 var (
@@ -54,6 +65,11 @@ var (
 	llmClientMu   sync.Mutex // 保护 Reload 场景
 	llmCacheUntil time.Time
 	llmInjected   bool // 标记是否由外部注入 (如飞书 bot)
+
+	// llmGW 是 llmClient 的 LLMGateway 视图 (design/02 §3.1)。
+	// llmGWFor 记录它包的是哪个 client, 客户端被重解析/重注入后随之重建。
+	llmGW    llmgw.LLMGateway
+	llmGWFor *api.Client
 )
 
 // SetSharedLLMClient 由外部注入已配置好的 LLM 客户端。
@@ -70,6 +86,8 @@ func SetSharedLLMClient(client *api.Client) {
 	llmProfile = buildProfileFromClient(client)
 	llmInitErr = nil
 	llmInjected = true
+	// 网关视图随之作废, 下次 SharedGateway 会照新 client 重建。
+	llmGW, llmGWFor = nil, nil
 	llmCacheUntil = time.Now().Add(24 * time.Hour) // 注入的客户端长期有效
 }
 
@@ -117,6 +135,29 @@ func GetSharedLLMClient() (*api.Client, LLMProfile, error) {
 	return llmClient, llmProfile, llmInitErr
 }
 
+// SharedGateway 返回共享 LLM 客户端的 LLMGateway 视图 (design/02 §3.1 L1)。
+//
+// 为什么它存在: design/02 要求"上层只依赖 LLMGateway 接口, 不直接触碰
+// api.Client"。dashboard 的诊断/洞察/团队体检三条链路是 :18080 上真实的 LLM
+// 消费方, 全部改经本函数, 接口因此有了生产调用方 (此前 llmgw.NewLocal 全仓只有
+// 自己的测试在调)。
+//
+// 为什么不顺手把 GetSharedLLMClient 换成返回接口: 它是导出符号, /api/llm/status
+// 与 /api/llm/rate 拿它读 BaseURL/Model 等具体字段, 换类型会破坏既有调用方。
+// 两者共用同一份解析与缓存, 不存在第二个客户端。
+func SharedGateway() (llmgw.LLMGateway, LLMProfile, error) {
+	client, profile, err := GetSharedLLMClient()
+	if err != nil {
+		return nil, profile, err
+	}
+	llmClientMu.Lock()
+	defer llmClientMu.Unlock()
+	if llmGW == nil || llmGWFor != client {
+		llmGW, llmGWFor = llmgw.NewLocal(client), client
+	}
+	return llmGW, profile, nil
+}
+
 // ResetSharedLLMClient 强制下次调用时重新加载 (单元测试或配置热更新)。
 func ResetSharedLLMClient() {
 	llmClientMu.Lock()
@@ -124,6 +165,7 @@ func ResetSharedLLMClient() {
 	llmClient = nil
 	llmInjected = false
 	llmCacheUntil = time.Time{}
+	llmGW, llmGWFor = nil, nil
 }
 
 // resolveLLMClient 是无缓存的解析实现。
@@ -243,6 +285,17 @@ func resolveLLMClient() (*api.Client, LLMProfile, error) {
 		if strings.HasSuffix(trimmed, "/anthropic") || strings.HasSuffix(trimmed, "/compatible-mode") {
 			trimmed += "/v1"
 		}
+		// L1 网关最后一跳 (design/02 §3.1)。顺序很重要: 先做 provider 端点的尾部
+		// 修正, 再整体改指网关 —— 反过来会把 /v1 补到网关地址上。
+		// 复用 modelconfig.ApplyGatewayOverride 而非自己读 env: 覆盖规则只有一份,
+		// 上面第 3 条 (ConfigResolver) 路径已被它覆盖过, 这里对已是网关地址的输入
+		// 是幂等的。
+		if ov := modelconfig.ApplyGatewayOverride(modelconfig.ResolvedConfig{BaseURL: trimmed}); ov.BaseURL != "" {
+			trimmed = ov.BaseURL
+		}
+		if gw := modelconfig.GatewayBaseURL(); gw != "" && trimmed == gw {
+			profile.Gateway = gw
+		}
 		client = api.NewClient(trimmed, apiKey, model)
 	} else {
 		client = api.NewDashScopeClient(apiKey, model)
@@ -282,14 +335,14 @@ func loadFeishuJSONConfig() (*feishu.JSONConfig, string, error) {
 	return cfg, "", err
 }
 
-// LLMComplete 封装一次 "system + user" 的对话 (非流式), 自动使用共享 client。
+// LLMComplete 封装一次 "system + user" 的对话 (非流式), 经 L1 网关接口发出。
 // 供 dashboard 的各个诊断 handler 使用。
 //
 // 错误信息里携带 profile.Provider + profile.Model 的原因:
 // 一旦出现 "model X is not supported" / "insufficient quota" 一类的错误,
 // 用户能直接从结果页看出发生在哪个 provider + 哪个模型, 不用再翻日志。
 func LLMComplete(ctx context.Context, system, user string, timeout time.Duration) (string, LLMProfile, error) {
-	client, profile, err := GetSharedLLMClient()
+	gw, profile, err := SharedGateway()
 	if err != nil {
 		return "", profile, err
 	}
@@ -298,7 +351,7 @@ func LLMComplete(ctx context.Context, system, user string, timeout time.Duration
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	out, err := client.SimpleComplete(cctx, system, user)
+	out, err := gw.Simple(cctx, system, user)
 	if err != nil {
 		return "", profile, fmt.Errorf("llm complete (provider=%s, model=%s): %w",
 			profile.Provider, profile.Model, err)

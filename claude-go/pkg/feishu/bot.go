@@ -375,10 +375,19 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		config:    config,
 		client:    larkClient,
 		apiClient: aiClient,
-		// L1 网关视图 (design/02 §3.1): 从此 bot 的非引擎类 LLM 调用只依赖
-		// llmgw.LLMGateway 接口。引擎主链路 (QueryEngine 流式 + 工具循环) 仍需
-		// api.Client 的具体能力 (Guard/熔断/FallbackModels/PromptCache 等三十余个
-		// 字段与方法), 不在本轮包进接口 —— 那要先把这些能力也抽成接口。
+		// L1 网关视图 (design/02 §3.1): bot 的非引擎类 LLM 调用只依赖
+		// llmgw.LLMGateway 接口 —— evolution / skillAuto / intentRec / visionCli /
+		// swarmEngine / dreamer / wikiEngine 七处注入点全部经 llmgw.SimpleClient。
+		//
+		// 两处刻意的例外, 都不是漏改:
+		//   ① SessionManager (引擎主链路): QueryEngine 流式 + 工具循环需要
+		//      api.Client 的具体能力 (Guard/熔断/FallbackModels/PromptCache 等
+		//      三十余个字段与方法), 要收进接口得先把这些能力也抽成接口;
+		//   ② TeamManagerConfig.LLM: pkg/agent/workflow_ensemble.go:111 对它做
+		//      `we.llm.(*api.Client)` 断言, 断言成功才走 CompleteDiag 取
+		//      stop/outTok/blocks/tail 那组诊断元数据 (专为定位"空响应/截断/超时"
+		//      而建)。套一层接口后断言失败, 诊断会静默降级 —— 要收进网关得先给
+		//      LLMGateway 加 CompleteDiag 的等价方法。
 		llmGW:      llmgw.NewLocal(aiClient),
 		layout:     layout,
 		stateStore: stateStore,
@@ -409,7 +418,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	bot.taskStore = builtin.NewTaskStore(layout.TasksFilePath())
 
 	// 7. 创建 Evolution 自动进化引擎 + Role Registry
-	bot.evolution = agent.NewEvolutionEngine(layout.Evolution, aiClient)
+	// 经 L1 网关注入 (design/02 §3.1 / §6「SimpleComplete 消费方全部改经 LLMGateway」):
+	// EvolutionEngine 的 LLM 端口只有 SimpleComplete。
+	bot.evolution = agent.NewEvolutionEngine(layout.Evolution, llmgw.SimpleClient{GW: bot.llmGW})
 	roleReg := agent.NewRoleRegistry(config.Cwd)
 
 	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles + 唯一 StateStore)
@@ -503,7 +514,18 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 9b. 技能自动创建器 (提前到 teamMgr 之前构造, 供 SkillCreator 注入;
 	// 历史上在第 15 步构造导致 teamMgr 拿不到 —— design/03 §1.2 开环2)
-	bot.skillAuto = skills.NewAutoCreator(layout.Skills, aiClient, aiClient.Model, bot.skillReg)
+	// 经 L1 网关注入 (skills.LLMClient 亦只有 SimpleComplete); model 名仍取自具体客户端。
+	bot.skillAuto = skills.NewAutoCreator(layout.Skills, llmgw.SimpleClient{GW: bot.llmGW}, aiClient.Model, bot.skillReg)
+
+	// 9c. 统一学习循环 (design/03 §4.3)。此前 NewEvolutionLoop 全仓零生产调用方,
+	// submitLearn 永远走回落直调 —— 循环写完了但没通电, 于是去重/预算闸/空闲期深度整理
+	// 与学习器 d/e 的运行相位全都不存在。常驻进程尤其需要它 (空闲期才是做梦的时机)。
+	botEvoLoop := agent.NewEvolutionLoop(bot.evolution, nil, agent.EvolutionLoopConfig{})
+	botEvoLoop.EnableStructureLearning(agent.StructureConfig{
+		StateDir:  layout.Root,
+		Reflector: agent.FallbackReflector(aiClient), // 无 fallback 档位时为 nil, prompt 进化跳过 (§4.2 H3)
+	})
+	botEvoLoop.Start(context.Background())
 
 	// 10. 初始化 Agent Teams 管理器 (注入全部依赖)
 	bot.teamMgr = agent.NewProductionTeamManager(agent.TeamManagerConfig{
@@ -522,8 +544,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		},
 		TaskTracker:        &dagTaskAdapter{store: bot.taskStore},
 		Pool:               agentPool,
-		LLM:                aiClient,
+		LLM:                aiClient, // 刻意不经网关, 理由见 NewBot 里 llmGW 字段的注释
 		Evolution:          bot.evolution,
+		EvolutionLoop:      botEvoLoop,
+		TraceStore:         bot.sessions.TraceStore(), // gate Span (design/03 §4.1 第 5 种 Kind)
 		Dreamer:            &dreamAdapter{dreamer: bot.dreamer},
 		Roles:              roleReg,
 		PlanConfigResolver: planCfgResolver,
@@ -574,7 +598,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	}
 
 	// 11. 初始化意图识别器 (中文自然语言 → 自动拆解团队命令)
-	bot.intentRec = agent.NewIntentRecognizer(aiClient)
+	bot.intentRec = agent.NewIntentRecognizer(llmgw.SimpleClient{GW: bot.llmGW}) // 经 L1 网关
 
 	// 12. 初始化 Cron 定时任务调度器
 	bot.cronSched = agent.NewCronScheduler(layout.Cron, &botCronExecutor{bot: bot})
@@ -586,8 +610,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	}
 	bot.cronSched.Start()
 
-	// 13. 初始化 Vision 客户端 (复用 api.Client)
-	bot.visionCli = vision.NewClient(aiClient)
+	// 13. 初始化 Vision 客户端 (经 L1 网关: vision.LLMClient = SimpleComplete + RawComplete,
+	//     两件套都由 llmgw.SimpleClient 转调, 故网关接口必须带 Raw)
+	bot.visionCli = vision.NewClient(llmgw.SimpleClient{GW: bot.llmGW})
 
 	// 14. 初始化 Wiki 引擎 (独立 git 仓库, 从配置加载)
 	if config.Wiki.Enabled {
@@ -689,7 +714,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		siCfg.Notify = func(chatID, msg string) {
 			bot.sendLongMessage(context.Background(), chatID, msg)
 		}
-		bot.swarmEngine = swarm_intel.NewEngine(aiClient, siCfg)
+		bot.swarmEngine = swarm_intel.NewEngine(llmgw.SimpleClient{GW: bot.llmGW}, siCfg) // 经 L1 网关
 		log.Printf("[SwarmIntel] 群体智能引擎已初始化")
 	}
 
@@ -794,8 +819,9 @@ func (b *Bot) initDreaming(config *BotConfig) {
 	}
 	b.dreamer = dreaming.NewDreamer(dreamCfg, config.Cwd)
 
-	// 始终注入 LLM API 客户端，dreamer 自动判断: 有 APIClient 则 LLM 整理, 否则本地整理
-	b.dreamer.SetAPIClient(b.apiClient)
+	// 始终注入 LLM 客户端，dreamer 自动判断: 有 APIClient 则 LLM 整理, 否则本地整理。
+	// 经 L1 网关 (dreaming.LLMClient 只有 SimpleComplete)。
+	b.dreamer.SetAPIClient(llmgw.SimpleClient{GW: b.llmGW})
 }
 
 // parseHookConfigs 解析 Hook 配置

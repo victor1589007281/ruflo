@@ -1261,9 +1261,11 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			} else {
 				immediate = fmt.Sprintf("团队 %s 已执行 %s", target, action)
 			}
-		} else if s.cfg.BotAPIURL != "" {
-			// 转发到 feishu bot 的 wiki API (已挂载带 TeamAction 的 dashboard)
-			forwardURL := strings.TrimRight(s.cfg.BotAPIURL, "/") + r.URL.Path
+		} else if base := s.botAPIBase(); base != "" {
+			// 转发到控制面 (飞书 bot 的 wiki API, 已挂载带 TeamAction 的 dashboard)。
+			// 基址经 botAPIBase 解析: 支持 CLAUDE_GO_BOT_API_URL 覆盖回环默认值,
+			// 见 l5_control_plane.go。
+			forwardURL := base + r.URL.Path
 			req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, forwardURL, r.Body)
 			if err != nil {
 				hint = fmt.Sprintf("转发失败: %v", err)
@@ -1271,8 +1273,8 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			}
 			req.Header.Set("Content-Type", "application/json")
 			// bot 侧启用 wiki.apiSecret 后, 不带 token 的转发会 401。
-			if s.cfg.BotAPIToken != "" {
-				req.Header.Set("Authorization", "Bearer "+s.cfg.BotAPIToken)
+			if tok := s.botAPIToken(); tok != "" {
+				req.Header.Set("Authorization", "Bearer "+tok)
 			}
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {

@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/llmgw"
 )
 
 // DiagJobStatus 作业生命周期状态。
@@ -201,6 +203,14 @@ func (s *Server) handleDiagJobDetail(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runDiagJob(jobID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+
+	// trace 四元组的**生产产生方** (design/02 §3.1 / design/03 轨迹底座):
+	// 一次诊断作业 = 一次 run, 作业 ID 就是 RunID; NodeID 用诊断类型区分 team /
+	// dreaming / evolution。这样在 L1 网关的 access.jsonl 里能按 run_id 把同一次
+	// 作业的 token 归并 —— 网关早就留了 run_id 字段, 此前一直是空的。
+	if j, ok := s.jobs.get(jobID); ok {
+		ctx = llmgw.WithTrace(ctx, llmgw.Trace{RunID: jobID, NodeID: "diag-" + j.Kind})
+	}
 
 	s.jobs.update(jobID, func(j *DiagJob) {
 		j.Status = DiagRunning
