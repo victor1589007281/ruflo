@@ -331,23 +331,25 @@ func (e *Engine) Run(ctx context.Context, g *Graph) (*ExecutionResult, error) {
 			}
 		}
 
-		// 超时排空: 处理正在发送中但还未到达通道的信号 (最多 5ms)
-		// 这减少了高并发下的任务状态短暂不一致窗口
-		// 修复: 使用 time.NewTimer 替代 time.After, 避免主循环每轮泄漏 timer
-		drainTimer := time.NewTimer(5 * time.Millisecond)
-	drainTimeout:
-		for {
-			select {
-			case done := <-doneCh:
-				if !drainTimer.Stop() {
-					<-drainTimer.C
-				}
-				e.handleDone(g, done)
-			case <-drainTimer.C:
-				break drainTimeout
-			}
-		}
-		drainTimer.Stop()
+		// 这里曾有一个"超时排空"块: 建一个 5ms 定时器, 循环 select{doneCh,
+		// drainTimer.C}, 想多等一下"正在发送途中"的完成信号, 以缩小高并发下
+		// 任务状态短暂不一致的窗口。它会**永久死锁**, 已删除。
+		//
+		// 死锁机理 (单 goroutine 的死定时器, 不是两方互锁): 窗口内一旦收到
+		// done, 分支里会 drainTimer.Stop(); Go 1.23+ 起被 Stop 的定时器其
+		// channel 永不再送值, 而这里从不 Reset。于是循环回到 select 时两条臂
+		// 同时永不可满足——doneCh 本轮已无活跃发送者 (在飞任务都已汇报),
+		// drainTimer.C 已死。且该 select 没有 ctx.Done() 兜底, wedge 后连
+		// 取消都救不回来: 引擎 goroutine 永久泄漏、team.EngineRunning 永久为 true。
+		// 线性 DAG 不触发 (宽度 1, 窗口内 done 恒为 0, 定时器总能触发);
+		// 任意并行扇出即可触发, 取消/快失败时多个任务微秒级同时返回则几乎必中。
+		//
+		// 为什么直接删而不修: 上面 323-332 的非阻塞排空已经批处理了所有
+		// "已到达"的信号; 这个块只为"发送途中"的信号多等 5ms, 属纯微优化。
+		// 删掉后这些信号在下一轮循环顶部的阻塞 select 被收走, 代价是多转一圈。
+		// 不丢信号: doneCh 缓冲 maxPar*2 而在飞任务 ≤ maxPar, 每任务只 send
+		// 一次, 故 send 永不阻塞; 不误判完成: isComplete 只数终态任务, 在飞
+		// 任务仍为 TaskRunning, 循环会正常回到阻塞 select 等它。
 	}
 
 	metrics := e.buildMetrics(totalTasks)

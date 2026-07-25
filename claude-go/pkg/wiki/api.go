@@ -11,13 +11,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/httpauth"
 	"github.com/anthropic/claude-go/pkg/sync"
 )
 
 // APIServer 为 Obsidian 插件等外部客户端提供 HTTP API。
+//
+// 注意本结构实际承载的远不止 wiki：dashboard 的 /api/*（50 条）、cluster 的
+// /cluster/*、SPA 与 /metrics 都经 Mux()/Handle() 挂到同一个 ServeMux 上，
+// 由 Start() 统一对外服务。因此 Start() 里的鉴权与监听地址决定了整个
+// :18080 面的暴露程度，改动前务必读 pkg/httpauth 的包注释。
 type APIServer struct {
 	engine    *Engine
 	secret    string
+	host      string // 监听地址的 host 部分；空 = 全部网卡（历史行为）
 	mux       *http.ServeMux
 	server    *http.Server
 	scheduler *sync.Scheduler
@@ -62,16 +69,31 @@ func (s *APIServer) HandleFunc(pattern string, h func(http.ResponseWriter, *http
 	s.mux.HandleFunc(pattern, h)
 }
 
+// SetBindHost 设置监听地址的 host 部分（如 "127.0.0.1"）。
+// 空字符串沿用历史行为：绑全部网卡，局域网与 tailscale 均可访问。
+func (s *APIServer) SetBindHost(host string) { s.host = host }
+
 // Start 启动 HTTP 服务（非阻塞）。
+//
+// 鉴权在 Handler 层统一施加，覆盖挂在同一 mux 上的全部路由（含 dashboard
+// 的 /api/* 与 cluster 的 /cluster/*）。历史上鉴权是逐路由 s.auth(...) 包装的，
+// 结果这两组都漏了——高度不对。secret 为空时中间件是恒等包装，行为完全中性。
 func (s *APIServer) Start(port int) error {
-	addr := fmt.Sprintf(":%d", port)
-	s.server = &http.Server{Addr: addr, Handler: s.mux}
+	addr := fmt.Sprintf("%s:%d", s.host, port)
+	handler := httpauth.Middleware(httpauth.Config{Secret: s.secret})(s.mux)
+	s.server = &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// 防 Slowloris：无此超时时慢速发头的连接可无限占用。
+		ReadHeaderTimeout: 20 * time.Second,
+	}
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("wiki-api: 监听端口 %d 失败: %w", port, err)
+		return fmt.Errorf("wiki-api: 监听 %s 失败: %w", addr, err)
 	}
+	httpauth.WarnIfExposed("wiki-api", addr, s.secret)
 	go func() {
-		log.Printf("[wiki-api] 启动 HTTP 服务 :%d", port)
+		log.Printf("[wiki-api] 启动 HTTP 服务 %s", addr)
 		if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("[wiki-api] 服务异常: %v", err)
 		}
@@ -150,9 +172,9 @@ func (s *APIServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Question string `json:"question"`
-		Archive  bool   `json:"archive"`
-		WebSearch bool  `json:"webSearch"`
+		Question  string `json:"question"`
+		Archive   bool   `json:"archive"`
+		WebSearch bool   `json:"webSearch"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})

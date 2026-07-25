@@ -440,7 +440,7 @@ func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
 // =====================================================================
 
 type searchHitDTO struct {
-	Kind      string   `json:"kind"`   // team | task | cron | stage
+	Kind      string   `json:"kind"` // team | task | cron | stage
 	ID        string   `json:"id"`
 	Title     string   `json:"title"`
 	Snippet   string   `json:"snippet,omitempty"`
@@ -683,9 +683,9 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolveLogPath 选择本实例的日志文件。优先顺序:
-//  1) 查询参数 path 指定 (限制在 state 根目录内)
-//  2) .claude-go/.dashboard/dashboard.log
-//  3) $HOME/.claude-go/history.jsonl
+//  1. 查询参数 path 指定 (限制在 state 根目录内)
+//  2. .claude-go/.dashboard/dashboard.log
+//  3. $HOME/.claude-go/history.jsonl
 func (s *Server) resolveLogPath(r *http.Request) string {
 	root := s.cfg.StateDir
 	if qp := r.URL.Query().Get("path"); qp != "" {
@@ -765,13 +765,13 @@ func tailLines(path string, n int) ([]string, error) {
 // =====================================================================
 
 type hiveMindResp struct {
-	Enabled       bool                     `json:"enabled"`
-	DataDir       string                   `json:"dataDir"`
-	Predictions   []hivePredictionDTO      `json:"predictions,omitempty"`
-	Pheromones    []hivePheromoneDTO       `json:"pheromones,omitempty"`
-	MetricsSeries []hiveMetricPointDTO     `json:"metricsSeries,omitempty"`
-	Summary       map[string]interface{}   `json:"summary"`
-	Notes         []string                 `json:"notes,omitempty"`
+	Enabled       bool                   `json:"enabled"`
+	DataDir       string                 `json:"dataDir"`
+	Predictions   []hivePredictionDTO    `json:"predictions,omitempty"`
+	Pheromones    []hivePheromoneDTO     `json:"pheromones,omitempty"`
+	MetricsSeries []hiveMetricPointDTO   `json:"metricsSeries,omitempty"`
+	Summary       map[string]interface{} `json:"summary"`
+	Notes         []string               `json:"notes,omitempty"`
 }
 type hivePredictionDTO struct {
 	ID         string    `json:"id"`
@@ -884,14 +884,14 @@ type timePointDTO struct {
 	Value     float64   `json:"value"`
 }
 type timeSeriesResp struct {
-	Module  string         `json:"module"`
-	Metric  string         `json:"metric"`
-	Points  []timePointDTO `json:"points"`
-	Trend   string         `json:"trend"`   // improving | degrading | stable | insufficient
-	Slope   float64        `json:"slope"`
-	First   *float64       `json:"first,omitempty"`
-	Last    *float64       `json:"last,omitempty"`
-	ChangePct *float64     `json:"changePct,omitempty"`
+	Module    string         `json:"module"`
+	Metric    string         `json:"metric"`
+	Points    []timePointDTO `json:"points"`
+	Trend     string         `json:"trend"` // improving | degrading | stable | insufficient
+	Slope     float64        `json:"slope"`
+	First     *float64       `json:"first,omitempty"`
+	Last      *float64       `json:"last,omitempty"`
+	ChangePct *float64       `json:"changePct,omitempty"`
 }
 
 func (s *Server) handleTimeSeries(w http.ResponseWriter, r *http.Request) {
@@ -1204,6 +1204,10 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			req.Header.Set("Content-Type", "application/json")
+			// bot 侧启用 wiki.apiSecret 后, 不带 token 的转发会 401。
+			if s.cfg.BotAPIToken != "" {
+				req.Header.Set("Authorization", "Bearer "+s.cfg.BotAPIToken)
+			}
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				hint = fmt.Sprintf("转发到 bot API 失败: %v", err)
@@ -1281,14 +1285,14 @@ func firstNonEmpty(ss ...string) string {
 // =====================================================================
 
 type dreamingDiagnosisResp struct {
-	EnabledInConfig  bool     `json:"enabledInConfig"`
-	DreamerWired     bool     `json:"dreamerWired"` // CLI main.go 是否接入了 Dreamer
-	LastDreamAt      string   `json:"lastDreamAt,omitempty"`
-	SessionsAccum    int      `json:"sessionsAccum"`
-	MemoryDirExists  bool     `json:"memoryDirExists"`
-	DreamLogCount    int      `json:"dreamLogCount"`
-	Reasons          []string `json:"reasons"`
-	Recommendations  []string `json:"recommendations"`
+	EnabledInConfig bool     `json:"enabledInConfig"`
+	DreamerWired    bool     `json:"dreamerWired"` // CLI main.go 是否接入了 Dreamer
+	LastDreamAt     string   `json:"lastDreamAt,omitempty"`
+	SessionsAccum   int      `json:"sessionsAccum"`
+	MemoryDirExists bool     `json:"memoryDirExists"`
+	DreamLogCount   int      `json:"dreamLogCount"`
+	Reasons         []string `json:"reasons"`
+	Recommendations []string `json:"recommendations"`
 }
 
 func (s *Server) handleDreamingDiagnosis(w http.ResponseWriter, r *http.Request) {

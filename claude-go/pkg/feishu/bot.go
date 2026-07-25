@@ -635,6 +635,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		// 避免飞书 bot / dashboard 同时监听多个端口。
 		if config.Wiki.APIPort > 0 {
 			wikiAPI := wiki.NewAPIServer(bot.wikiEngine, config.Wiki.APISecret)
+			wikiAPI.SetBindHost(config.Wiki.APIHost)
 			wikiAPI.SetScheduler(bot.syncScheduler)
 			for _, ext := range config.Wiki.APIExtensions {
 				if ext == nil {

@@ -178,8 +178,14 @@ type WikiConfig struct {
 	AutoOrganize bool
 	// APIPort Wiki HTTP API 端口 (供 Obsidian 等外部客户端调用, 0=不启动)
 	APIPort int
-	// APISecret API 鉴权密钥 (Bearer token)
+	// APISecret API 鉴权密钥 (Bearer token)。
+	// 为空 = 不鉴权 (fail-open, 兼容 8+ 下游平台的历史调用), 详见 pkg/httpauth。
 	APISecret string
+	// APIHost HTTP API 监听地址的 host 部分。空 = 绑全部网卡 (历史行为,
+	// 局域网与 tailscale 均可访问)。想收回本机请设 "127.0.0.1"。
+	// 注意本端口不只承载 /wiki/*, dashboard 的 /api/* 与 cluster 的
+	// /cluster/* 也挂在同一 mux 上, 故此项决定整个 :18080 面的暴露程度。
+	APIHost string
 	// APIExtensions 当 APIPort > 0 时在 wikiAPIServer.Start 前被调用,
 	// 允许外部模块 (dashboard 等) 把自己的路由挂到同一 HTTP 端口,
 	// 避免开多个监听端口。调用方负责保证路由 pattern 与 /wiki/* 不冲突。
@@ -438,6 +444,7 @@ type WikiSection struct {
 	AutoOrganize  *bool    `json:"autoOrganize,omitempty"`
 	APIPort       int      `json:"apiPort,omitempty"`
 	APISecret     string   `json:"apiSecret,omitempty"`
+	APIHost       string   `json:"apiHost,omitempty"`
 }
 
 // SkillsSection 技能配置段
@@ -786,6 +793,9 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		}
 		if jc.Wiki.APISecret != "" {
 			bc.Wiki.APISecret = jc.Wiki.APISecret
+		}
+		if jc.Wiki.APIHost != "" {
+			bc.Wiki.APIHost = jc.Wiki.APIHost
 		}
 	}
 

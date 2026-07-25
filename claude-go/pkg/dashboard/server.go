@@ -17,9 +17,10 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
-	"github.com/anthropic/claude-go/pkg/feishu"
-	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
+	"github.com/anthropic/claude-go/pkg/feishu"
+	"github.com/anthropic/claude-go/pkg/httpauth"
+	"github.com/anthropic/claude-go/pkg/metrics"
 )
 
 // CronController 是 dashboard 写接口所需的定时任务能力子集。
@@ -49,6 +50,12 @@ type Config struct {
 	CacheTTL   time.Duration  // 数据缓存 TTL, 0 禁用
 	TeamAction TeamActionFunc // 团队操作回调 (create/run/stop/restart/delete)，为 nil 时尝试转发到 BotAPIURL
 	BotAPIURL  string         // Feishu bot 的 wiki API URL (如 "http://127.0.0.1:18080"), 用于转发 team 操作
+	// BotAPIToken 转发到 BotAPIURL 时携带的鉴权 token。BotAPIURL 侧启用
+	// wiki.apiSecret 后必须设置, 否则 team 操作转发会 401。
+	BotAPIToken string
+	// Secret 本 dashboard 自身 /api/* 的鉴权 token。空 = 不鉴权 (fail-open),
+	// 详见 pkg/httpauth 的包注释。
+	Secret string
 	// LLMComplete LLM 文本补全回调 (供 LLM 生成工作流编排/skill); nil 时返回 503。
 	// 由主进程(feishu bot)注入其 LLM 客户端。
 	LLMComplete func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
@@ -64,7 +71,7 @@ type Server struct {
 	provider *Provider
 	mux      *http.ServeMux
 	server   *http.Server
-	jobs     *diagJobStore // 异步 LLM 诊断作业
+	jobs     *diagJobStore         // 异步 LLM 诊断作业
 	scraper  *metrics.JSONLScraper // JSONL → Prometheus 采集器 (MySQL Exporter 模式)
 	cronCtl  func() CronController // 定时任务写控制器【解析器】(仅 :18080 飞书进程注入; nil/返回nil 时写接口 501)
 }
@@ -177,8 +184,11 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("dashboard listen %s: %w", s.cfg.Addr, err)
 	}
 	log.Printf("[dashboard] listening on http://%s  (stateDir=%s)", ln.Addr(), s.cfg.StateDir)
-	// 用 panic-recovery 包装 handler, 防止任意 handler panic 导致进程崩溃
-	s.server.Handler = recoverMiddleware{handler: s.mux}
+	httpauth.WarnIfExposed("dashboard", ln.Addr().String(), s.cfg.Secret)
+	// 用 panic-recovery 包装 handler, 防止任意 handler panic 导致进程崩溃;
+	// 鉴权在 recovery 之外, 使未授权请求不进入任何业务 handler。
+	s.server.Handler = httpauth.Middleware(httpauth.Config{Secret: s.cfg.Secret})(
+		recoverMiddleware{handler: s.mux})
 	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -239,13 +249,13 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/intent", s.handleIntent)                       // 会话意图识别 (LLM 语义: 是否需编排 + workflow/objective)
 	mux.HandleFunc("/api/verify-goal", s.handleVerifyGoal)              // 目标验收 (供会话编排目标循环: 未达成带 gap 重跑)
 	// 能力管理: skills / tools / MCP / 引用关系
-	mux.HandleFunc("/api/skills", s.handleSkills)                  // GET 列表 / POST 创建
+	mux.HandleFunc("/api/skills", s.handleSkills)                 // GET 列表 / POST 创建
 	mux.HandleFunc("/api/skills/generate", s.handleSkillGenerate) // LLM 生成 skill 草稿
 	mux.HandleFunc("/api/skills/", s.handleSkillDetail)           // GET 详情 / DELETE
 	mux.HandleFunc("/api/tools", s.handleTools)
 	mux.HandleFunc("/api/mcp/servers", s.handleMCPServers)
 	mux.HandleFunc("/api/references", s.handleReferences)
-	mux.HandleFunc("/api/workflows/", s.handleWorkflow)                 // /api/workflows/:name
+	mux.HandleFunc("/api/workflows/", s.handleWorkflow) // /api/workflows/:name
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/logs/stream", s.handleLogsStream)
 	mux.HandleFunc("/api/logs/tail", s.handleLogsTail)
@@ -432,8 +442,10 @@ func (s *Server) handleTeamFork(w http.ResponseWriter, r *http.Request, name str
 }
 
 // handleTeamMedia 列出/服务团队的媒体产出 (creative-v2 等生成的 PNG/PDF/MP4/GIF/PPTX/HTML)。
-//   GET /api/teams/{name}/media            → 产出文件清单 (JSON)
-//   GET /api/teams/{name}/media/{file...}  → 服务单个文件 (带 path-traversal 守卫)
+//
+//	GET /api/teams/{name}/media            → 产出文件清单 (JSON)
+//	GET /api/teams/{name}/media/{file...}  → 服务单个文件 (带 path-traversal 守卫)
+//
 // 注: 产出 HTML 为模型生成内容, 通过 CSP sandbox 隔离, 防止注入 dashboard 同源。
 func (s *Server) handleTeamMedia(w http.ResponseWriter, r *http.Request, name string, fileParts []string) {
 	mediaDir := filepath.Join(s.provider.StateDir(), "teams", name, "media")
@@ -993,7 +1005,6 @@ func (s *Server) handlePromQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
-
 
 // summarizeEvents 从事件列表构造简易摘要。
 func summarizeEvents(module string, events []MetricEventDTO) map[string]interface{} {
