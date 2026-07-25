@@ -45,6 +45,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/evolution/console"
+	"github.com/anthropic/claude-go/pkg/evolution/skillaudit"
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
@@ -1420,28 +1421,32 @@ func rolesCmd() *cobra.Command {
 }
 
 // dashboardCmd 拉起本地只读可视化 dashboard (支持 run/start/stop/status/open)。
-// evoCmd 进化操作台 (design/03 §4.7): 检视学习闭环健康度 (轨迹/奖励/经验/shadow技能)。
-// v1 只读检视 (evo status); propose/smoke/promote 写操作属 E3/E4 后续。
+// evoCmd 进化操作台 (design/03 §4.7): 检视学习闭环健康度 + shadow 技能审计晋升。
+// 子命令: status(默认健康度检视) / audit(技能进化门禁裁决) / promote|rollback(手动改状态)。
+// 治理护栏: 审计判据/阈值锁定为常量 (design/03 §4.6 四律, 不可经 CLI 改)。
 func evoCmd() *cobra.Command {
 	var (
 		stateDirFlag string
 		jsonOut      bool
 	)
+	resolveStateDir := func() string {
+		if stateDirFlag != "" {
+			return stateDirFlag
+		}
+		jsonCfg, _ := feishu.LoadJSONConfig(flagConfig)
+		cwd, _ := os.Getwd()
+		sdInput := ""
+		if jsonCfg != nil {
+			sdInput = jsonCfg.StateDir
+		}
+		return basedir.ResolveDefault(sdInput, cwd)
+	}
+
 	cmd := &cobra.Command{
 		Use:   "evo",
-		Short: "进化操作台: 检视学习闭环健康度 (design/03 §4.7)",
+		Short: "进化操作台: 学习闭环健康度 + 技能进化门禁 (design/03 §4.7)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			stateDir := stateDirFlag
-			if stateDir == "" {
-				jsonCfg, _ := feishu.LoadJSONConfig(flagConfig)
-				cwd, _ := os.Getwd()
-				sdInput := ""
-				if jsonCfg != nil {
-					sdInput = jsonCfg.StateDir
-				}
-				stateDir = basedir.ResolveDefault(sdInput, cwd)
-			}
-			rep, err := console.Inspect(stateDir)
+			rep, err := console.Inspect(resolveStateDir())
 			if err != nil {
 				return err
 			}
@@ -1454,8 +1459,59 @@ func evoCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&stateDirFlag, "state-dir", "", "状态目录 (默认从 config/cwd 解析)")
-	cmd.Flags().BoolVar(&jsonOut, "json", false, "JSON 输出")
+	cmd.PersistentFlags().StringVar(&stateDirFlag, "state-dir", "", "状态目录 (默认从 config/cwd 解析)")
+	cmd.PersistentFlags().BoolVar(&jsonOut, "json", false, "JSON 输出")
+
+	// evo audit: 依据 rewards.jsonl 裁决 shadow 技能晋升/退役 (design/03 §4.3c)
+	var apply bool
+	auditCmd := &cobra.Command{
+		Use:   "audit",
+		Short: "技能进化门禁: 依据奖励证据裁决 shadow 技能晋升/退役 (--apply 生效, 默认 dry-run)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sd := resolveStateDir()
+			res, err := skillaudit.Audit(filepath.Join(sd, "skills"), filepath.Join(sd, "evolution", "rewards.jsonl"), apply)
+			if err != nil {
+				return err
+			}
+			mode := "dry-run (加 --apply 生效)"
+			if apply {
+				mode = "已应用"
+			}
+			fmt.Printf("技能进化门禁 [%s]\n  评估 shadow 技能: %d\n  晋升: %v\n  退役: %v\n  保持: %v\n",
+				mode, res.Evaluated, res.Promoted, res.Retired, res.Held)
+			return nil
+		},
+	}
+	auditCmd.Flags().BoolVar(&apply, "apply", false, "真正改写 SKILL.md 状态 (默认 dry-run)")
+
+	// evo promote/rollback: 手动改技能状态 (留痕)
+	promoteCmd := &cobra.Command{
+		Use:   "promote <skill-name>",
+		Short: "手动晋升技能到 active (design/03 §4.6 可回滚)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			p := filepath.Join(resolveStateDir(), "skills", args[0], "SKILL.md")
+			if err := skillaudit.SetStatus(p, "active"); err != nil {
+				return err
+			}
+			fmt.Printf("✅ 技能 %s 已晋升 active\n", args[0])
+			return nil
+		},
+	}
+	rollbackCmd := &cobra.Command{
+		Use:   "rollback <skill-name>",
+		Short: "回退技能到 shadow (design/03 §4.6 一键回滚)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			p := filepath.Join(resolveStateDir(), "skills", args[0], "SKILL.md")
+			if err := skillaudit.SetStatus(p, "shadow"); err != nil {
+				return err
+			}
+			fmt.Printf("↩️ 技能 %s 已回退 shadow\n", args[0])
+			return nil
+		},
+	}
+	cmd.AddCommand(auditCmd, promoteCmd, rollbackCmd)
 	return cmd
 }
 
