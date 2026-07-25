@@ -57,9 +57,32 @@
 - ✅ V7 testforge 沉淀回归资产：regression/ 独立嵌套模块 8 测试；注册 testforge 项目「claude-go 下一代架构回归」+ repo SUT + gotest asset，首跑 8/8 pass gate 100%
 - ✅ V8 全部仓库推远程：claude-go→github vdocs（10+ commit）、docforge→gitee master、testforge 无代码变更（资产在 DB+claude-go repo）
 
-## 最终状态（2026-07-24）
-P0-P4 核心阶段全部实现并测试通过；K8s 单体+分布式双模式实测；真实 LLM E2E 打通全新栈（图引擎+trace+奖励+进化）；docforge/testforge 已沉淀；全部推远程。
-**P5（离线回放 harness + evo_* 进化操作台）属 design/03 E3/E4 后续里程碑**（design 自身标注为"持续"演进），已在设计文档 §4.5/§4.7 完整规格化，作为下一轮前向工作；本轮聚焦 P0-P4 可落地内核 + 端到端验证。
+## 里程碑逐项状态（2026-07-24 二轮缺口核对，对照 design M0-M4/R0-R4/E0-E5）
+
+### design/01 编排引擎
+- ✅ **M0 止血**：双 switch 收敛/嵌套重试收敛/清理，全绿
+- ✅ **M1 图内核**：GraphSpec/engine/journal/直译器 + pipeline/fanout 灰度切换 + kill-9 恢复重放
+- 🟨 **M2 全模板**：✅ gate 节点差异化执行（runGate: 确定性+LLM评审分派，score 供条件边路由）+ loop 执行 + 条件边；⬜ 其余 13 mode 模板化、gate/loop-group/expand 全能力、Hook 总线接通外部 hook 配置（后续）
+- ⬜ **M3 注入与约束**：六拦截器/ConstraintSet 单一真源/ToolProfile 显式化（AgentSpec.ToolProfile 已加字段，RoleDef 显式化未接）
+- ⬜ **M4 运行时与收尾**：AgentRuntime 三实现/SpawnSubgraph/旧引擎删除/team.json 投影化
+
+### design/02 分层架构
+- 🟨 **R0 接口抽取**：✅ LLMGateway/StateStore/EventBus 接口+local实现、trace-id 贯穿；⬜ AgentRuntime 接口、Bot 装配改注入接口
+- ✅ **R1 网关独立**：✅ llm-gateway 子命令+反向代理、**token 双边记账修复(主 api.Client 路径 estimateInputTokens + 网关双管)**；⬜ :18080 Bearer 全端点鉴权（部分）
+- 🟨 **R2 状态外置**：✅ sqlite 后端(纯Go modernc)；⬜ transcript/会话历史入库、SkillStore/配置中心化+广播、指标聚合
+- 🟨 **R3 worker 拉取**：✅ 任务队列组+worker子命令、**RuntimeCaps 标签路由(PullFor)**、**cron 选主(FileLease O_EXCL)**、心跳lease；⬜ cwd 三档位 git 模式、worker 真实引擎执行
+- 🟨 **R4 多机**：✅ K8s 部署清单+双模式实测；⬜ NATS/redis+pg 后端、会话一致性哈希、worker 分池（by-design opt-in）
+
+### design/03 RL 进化引擎
+- ✅ **E0 修开环+trace-id**：三开环修复 + trace 四元组，真实 LLM E2E 实证
+- ✅ **E1 轨迹底座**：TraceStore + tool_result 采集 + Blob 内容寻址 + **采样(BodySampleRate)/TTL(SweepTraceFiles)**
+- 🟨 **E2 奖励总线+学习器收编**：✅ content_gate + episode + 图 gate 三源落 rewards.jsonl、content_gate 分数持久化；⬜ 飞书 reaction/`/rate`/steer 负信号/下游回传端点（8源中3源）、经验/记忆学习器迁 EvolutionLoop
+- 🟨 **E3 Skill 进化器**：✅ **shadow 技能审计门禁(skillaudit: 奖励证据裁决晋升/退役, SKILL.md audit 谱系)**、shadow 态创建；⬜ 真配对A/B审计(需运行期skill-usage打点)、version 谱系
+- 🟨 **E4 工作流/Prompt进化+回放**：✅ **evo 操作台(status/audit/promote/rollback + 锁定字段护栏)**；⬜ 离线回放 harness、GEPA prompt 进化、AWM 工作流归纳
+- ⬜ **E5 权重导出**：DPO/RFT 导出器（可选，未启动）
+
+### 本轮二次缺口核对新增（2026-07-24 续）
+R1 token 主路径修复 / R2 sqlite 后端 / R3 cron选主+caps路由 / E1 采样+TTL / E3 技能审计门禁 / E4 evo audit/promote/rollback / M2 gate 节点差异化——7 项缺口关闭，各带单测。剩余 M3/M4/R2 深化/E2 更多源/E4 回放 harness/E5 为后续里程碑（design 自身标注跨多周/持续演进）。
 
 ## 偏差记录
 （设计与实现的偏差在此登记，并回写对应设计文档）

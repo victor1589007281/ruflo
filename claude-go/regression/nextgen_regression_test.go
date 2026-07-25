@@ -192,3 +192,57 @@ func TestTracePropagation(t *testing.T) {
 		t.Fatalf("trace 合并注入丢字段: %+v", ids)
 	}
 }
+
+// --- 二轮缺口关闭的回归 (2026-07-24 续) ---
+
+// TestSQLiteStoreBackend R2: sqlite StateStore 后端语义与 file 一致。
+func TestSQLiteStoreBackend(t *testing.T) {
+	s, err := statestore.NewSQLiteStore(t.TempDir() + "/reg.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	kv := s.KV("reg")
+	_ = kv.Put("k", map[string]int{"v": 7})
+	var out map[string]int
+	if ok, _ := kv.Get("k", &out); !ok || out["v"] != 7 {
+		t.Fatal("sqlite KV roundtrip 失败")
+	}
+	h1, _ := s.Blob().Put([]byte("x"))
+	h2, _ := s.Blob().Put([]byte("x"))
+	if h1 != h2 {
+		t.Fatal("sqlite Blob 去重失败")
+	}
+}
+
+// TestClusterFileLease R3: cron 选主文件租约互斥。
+func TestClusterFileLease(t *testing.T) {
+	l := cluster.NewFileLease(t.TempDir(), time.Minute)
+	if !l.TryAcquire("cron/j/202607241200") {
+		t.Fatal("首次应抢到")
+	}
+	if l.TryAcquire("cron/j/202607241200") {
+		t.Fatal("同 key 不应重抢")
+	}
+}
+
+// TestClusterCapsRouting R3: 能力标签路由。
+func TestClusterCapsRouting(t *testing.T) {
+	q := cluster.NewQueue(statestore.NewMemStore(), time.Minute)
+	_, _ = q.Enqueue(cluster.Task{Kind: "stage", RequireCaps: []string{"browser"}})
+	if _, ok, _ := q.PullFor("w", []string{"stage"}, []string{"bash"}); ok {
+		t.Fatal("缺 browser 的 worker 不应拉到")
+	}
+	if _, ok, _ := q.PullFor("w2", []string{"stage"}, []string{"browser"}); !ok {
+		t.Fatal("具备 browser 应拉到")
+	}
+}
+
+// TestTraceStoreSampling E1: 正文采样降存储, 元数据保留。
+func TestTraceStoreSampling(t *testing.T) {
+	s := tracestore.NewWithOptions(statestore.NewMemStore(), tracestore.Options{BodySampleRate: 0})
+	r := s.MakeRef("body text")
+	if r.Inline != "" || r.Size != 9 {
+		t.Fatalf("rate=0 应不留正文但保留 Size: %+v", r)
+	}
+}
