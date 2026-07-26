@@ -159,8 +159,23 @@ sed -e "s|image: localhost:5000/claude-go:latest|image: $IMG|" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
     "$REPO/deploy/k8s/monolith.yaml" \
   | kubectl apply -f - >/dev/null
+# ⚠️ **显式把三个灰度开关摘掉** —— 否则上一轮第 11 步 `kubectl set env` 加的 env
+# 会**活到这一轮**: `kubectl apply` 只对"自己曾经声明过"的字段做三方合并, 对
+# last-applied 里没有、yaml 里也没有的字段 (正是 set env 加的那些) **一律保留**。
+# 后果是第 7 步宣称"跑 pipeline 默认路径"而实际带着 CLAUDE_GO_GRAPH_ENGINE=1 跑了图引擎,
+# 且第 11 步的 set env 变成空操作 ⇒ 不滚动 ⇒ GPOD 就是第 4 步那个 Pod (实测两处
+# startTime 一模一样, 正是这么发现的)。这是**跨轮状态泄漏**, 与"非密闭测试"同一类,
+# 只是载体从进程内换成了集群里的 Deployment。
+kubectl -n "$NS" set env deploy/claude-go-monolith \
+  CLAUDE_GO_GRAPH_ENGINE- CLAUDE_GO_GRAPH_WATCHDOG- CLAUDE_GO_BOARD_WATCH- >/dev/null 2>&1
 kubectl -n "$NS" rollout status deploy/claude-go-monolith --timeout=180s || bad "单体 rollout 超时"
 POD=$(newest_pod claude-go-monolith)
+# 自证这一轮的第 7 步真的走默认路径 (不是被上一轮的 env 带着跑图引擎)。
+kubectl -n "$NS" get deploy claude-go-monolith \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}{"\n"}{end}' 2>/dev/null \
+  | grep -qE 'CLAUDE_GO_GRAPH_ENGINE|CLAUDE_GO_BOARD_WATCH' \
+  && bad "灰度开关仍在 Deployment 上 —— 第 7 步不是默认路径（跨轮泄漏未清干净）" \
+  || ok "灰度开关已清空，第 7 步走默认 pipeline 路径"
 echo "  pod=$POD"
 
 # 单体 Pod 是后面 9 步的执行载体, 取不到/不新鲜就**立刻退出**而不是继续。
@@ -392,7 +407,9 @@ fi
 # ② 图级 watchdog 观测档: **断言它没有误报**。一个跑得正常的团队若被判停滞,
 #    说明阈值/进展时钟接错了 —— 而观测档下这种错误不会让团队失败, 只会静默污染 journal,
 #    正是需要断言来抓的形态。同时确认它真的在跑 (fail 档才会干预, 这里不该出现干预)。
-GS=$(kubectl -n "$NS" exec "$GPOD" -- sh -c "grep -c graph.stalled $JRN 2>/dev/null")
+# `|| true`: 无命中时 grep -c 退 1, kubectl 会刷一行 "command terminated with exit
+# code 1" —— 而这里"0 命中"恰恰是**期望结果**, 那行噪声会被读成这一步炸了。
+GS=$(kubectl -n "$NS" exec "$GPOD" -- sh -c "grep -c graph.stalled $JRN 2>/dev/null || true")
 if [ "${GS:-0}" -eq 0 ]; then
   ok "图级 watchdog 未误报停滞（正常完成的团队不该被判停滞）"
 else
