@@ -137,6 +137,11 @@ kubectl -n "$NS" create secret generic claude-go-llm \
   --from-literal=kimi-api-key="$KEY" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 ok "Secret 已建（key 长度 ${#KEY}，不落盘不入库）"
 
+# 本轮测试用的模型别名。改这里就够了 —— 下面第 6.5 步会**断言真跑的就是它**,
+# 免得配了个不存在的模型而代码静默退回默认模型 (那属于"验的不是被测物")。
+# k3-256k 已用真 API 探过 (POST /v1/messages → HTTP 200), 不是猜的。
+MODEL_ALIAS=${CLAUDE_GO_E2E_MODEL:-kimi:k3-256k}
+MODEL_NAME=${MODEL_ALIAS#*:}   # 送给 API 的模型名 = 别名去掉 provider 前缀
 # ConfigMap 保留占位符 apiKey —— 正是要验证 <PROVIDER>_API_KEY 覆盖生效
 kubectl -n "$NS" create configmap claude-go-config --from-literal=config.json='{
   "stateDir": "/data/.claude-go",
@@ -146,13 +151,13 @@ kubectl -n "$NS" create configmap claude-go-config --from-literal=config.json='{
       "name": "kimi",
       "baseUrl": "https://api.kimi.com/coding/v1",
       "apiKey": "PLACEHOLDER_OVERRIDE_VIA_ENV",
-      "models": { "kimi:k3": {} }
+      "models": { "'"$MODEL_ALIAS"'": { "maxTokens": 65536, "contextWindow": 262144, "promptCacheMode": "auto", "maxParallel": 4, "rpm": 60 } }
     }
   },
-  "ai": { "modelAlias": "kimi:k3", "maxTurns": 12, "maxTokens": 8192 },
+  "ai": { "modelAlias": "'"$MODEL_ALIAS"'", "maxTurns": 12, "maxTokens": 8192 },
   "wiki": { "enabled": true, "apiPort": 18080 }
 }' --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-ok "ConfigMap 已建（apiKey 故意留占位符）"
+ok "ConfigMap 已建（模型 $MODEL_ALIAS，contextWindow=262144；apiKey 故意留占位符）"
 
 step "4/13 部署单体模式"
 sed -e "s|image: localhost:5000/claude-go:latest|image: $IMG|" \
@@ -215,6 +220,18 @@ step "6/13 验收②: HTTP 面存活"
 kubectl -n "$NS" exec "$POD" -- curl -s -o /dev/null -w '  /api/health → %{http_code}\n' localhost:18080/api/health
 WF=$(kubectl -n "$NS" exec "$POD" -- curl -s localhost:18080/api/workflows | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null)
 echo "  /api/workflows 数量 = ${WF:-取不到}"
+# —— 模型别名真被解析（启动横幅里的 Model 行）——
+# 只声明不断言的话, 配一个不存在的模型时代码可能静默退回默认模型, 而整轮 E2E 照常绿。
+# 这一条查启动横幅; 第 8 步再从 llm.jsonl 的标签查**真正发出去的**模型名, 两头都要对。
+# 横幅打的是 `config.ModelAlias`（main.go:1397 `fmt.Printf("  Model:     %s\n", ...)`),
+# 所以按**子串**匹配模型名而不是写死 `Model: +<名>` —— 后者在打别名 (kimi:k3-256k) 时
+# 会因为中间那段 provider 前缀而不匹配, 给出一条假红。
+BANNER_MODEL=$(grep -m1 -E '^ +Model: +' <<<"$LOG" | sed 's/^ *Model: *//' | tr -d '\r')
+case "${BANNER_MODEL:-}" in
+  *"$MODEL_NAME"*) ok "启动横幅确认模型 = $BANNER_MODEL（含 $MODEL_NAME）" ;;
+  "") bad "启动横幅里找不到 Model 行 —— 无法判断模型是否生效（窗口无效, 不记通过）" ;;
+  *) bad "启动横幅的模型是 $BANNER_MODEL，不含 $MODEL_NAME —— 别名没解析或静默退回默认模型" ;;
+esac
 
 step "7/13 验收③: 真实 LLM 团队执行"
 # 真实端点是 /api/actions/team/{action}/{target}, 载荷 {workflow, objective}
@@ -251,6 +268,38 @@ echo "  — 团队产物:"
 # —— 那会列出**整个 teams 目录**并照常返回 0, 于是"团队目录存在"恒真 (又一条许愿式断言)。
 kubectl -n "$NS" exec "$POD" -- sh -c "ls /data/.claude-go/teams/$T_MONO/ 2>/dev/null" \
   | grep -q . && ok "团队目录有产物 ($T_MONO)" || bad "无团队目录或目录为空 ($T_MONO)"
+# —— **真正发给 API 的模型名**（llm.jsonl 的 model 标签）——
+# 这是模型断言的第二头: 启动横幅只说明配置被解析, 而每次调用实际用的模型来自
+# 请求构造那一路。两头都对才叫"这一轮真的在用 k3-256k"。
+echo "  — 本轮真实调用的模型分布:"
+kubectl -n "$NS" exec "$POD" -- sh -c 'grep llm_call_count /data/.claude-go/metrics/llm.jsonl 2>/dev/null' \
+  | python3 -c "
+import json,sys,collections
+c=collections.Counter()
+for l in sys.stdin:
+    try:
+        L=(json.loads(l).get('labels') or {})
+        c[(L.get('model'),L.get('model_alias'))]+=1
+    except Exception: pass
+if not c: print('    (无 LLM 调用记录)')
+for (m,a),v in c.most_common(): print('    model=%-12s alias=%-16s %d 次'%(m,a,v))
+" 2>/dev/null || echo "    (取不到)"
+MODELS=$(kubectl -n "$NS" exec "$POD" -- sh -c 'grep llm_call_count /data/.claude-go/metrics/llm.jsonl 2>/dev/null' \
+  | python3 -c "
+import json,sys
+seen=set()
+for l in sys.stdin:
+    try: seen.add((json.loads(l).get('labels') or {}).get('model') or '')
+    except Exception: pass
+print(','.join(sorted(x for x in seen if x)))" 2>/dev/null)
+case ",${MODELS:-}," in
+  *",$MODEL_NAME,"*)
+    # 只出现目标模型才算干净: 混进别的模型说明有路径绕过了配置 (硬编码/默认值兜底)。
+    [ "${MODELS}" = "$MODEL_NAME" ] \
+      && ok "全部 LLM 调用都用 $MODEL_NAME（$MODEL_ALIAS 真生效）" \
+      || bad "除 $MODEL_NAME 外还出现了别的模型: $MODELS —— 有路径绕过配置" ;;
+  *) bad "没有任何调用用 $MODEL_NAME（实际: ${MODELS:-空}）—— 模型配置没生效" ;;
+esac
 
 step "9/13 验收⑤: 分布式模式 + 网关真被经过"
 # 团队工作区卷 (cwd 的 pvc 档位, design/02 §3.3): distributed.yaml 只引用不创建。
