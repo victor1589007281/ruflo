@@ -36,6 +36,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -337,6 +338,24 @@ func (ptm *ProductionTeamManager) Metrics() *metrics.Collector {
 // 工厂 —— 于是门禁/journal/重试/黑板全部不动, 只有"这次 agent 由谁执行"变了。
 // wrap 收到当前工厂 (通常是本地执行体), 应当把它作为回退包在新工厂里。
 //
+// # 它同时接管 swarm 路径 (design/02 §3.3 剩余项)
+//
+// 阶段执行不是唯一的 agent 创建出口: swarm 模式的子任务走 `AgentPool.factory`
+// (`swarm.go:702` 的 `s.pool.Acquire` → `pool.go` 的 `currentFactory()`), 那是一个
+// **完全独立的字段**。上一轮只换了 ptm.factory, 于是 swarm 无论怎么配
+// `--placement-prefer` 都只在本机跑。这里一并换掉, 装配处不需要多写一行 ——
+// 多一个接线点就多一个"某个部署忘了调"的静默降级面, 而症状 (swarm 子任务不去
+// 远程) 与"远程 worker 没上线"长得一模一样, 极难归因。
+//
+// **wrap 只会被调用一次**(两个字段同源时), 这是刻意的: wrap 通常带副作用 ——
+// 生产装配处 (`cmd/claude-go/main.go:1346`) 在里面用收到的本地工厂注册
+// `local-session` runtime, 调两次就会用**另一个**本地工厂按同名覆盖前一次注册。
+// 两个字段不同源时才分别 wrap (那时两次注册各自对应真正不同的本地执行体, 是正确的)。
+// 同源判定用 reflect 取函数码指针: Go 不允许直接比较函数值。它对方法值只比较
+// 方法本身而不比较接收者, 这里可接受 —— 唯一的后果是"local runtime 背后是哪个
+// 本地执行体", 而生产里两处传的就是同一个 `bot.sessions.CreateAgentRunner`
+// (`bot.go:447` 与 `bot.go:559`)。
+//
 // ⚠️ 只能在**任何团队启动之前**调用 (进程装配阶段): ptm.factory 在运行期被
 // 读取且不持锁, 运行中替换是数据竞争。
 func (ptm *ProductionTeamManager) WrapAgentFactory(wrap func(CreateAgentFunc) CreateAgentFunc) {
@@ -344,10 +363,31 @@ func (ptm *ProductionTeamManager) WrapAgentFactory(wrap func(CreateAgentFunc) Cr
 		return
 	}
 	ptm.mu.Lock()
-	defer ptm.mu.Unlock()
-	if next := wrap(ptm.factory); next != nil {
+	prev := ptm.factory
+	next := wrap(prev)
+	if next != nil {
 		ptm.factory = next
 	}
+	pool := ptm.pool
+	ptm.mu.Unlock()
+
+	if pool == nil {
+		return
+	}
+	if next != nil && sameFactory(pool.Factory(), prev) {
+		pool.setFactory(next) // 同源: 复用已包好的那个, 不重复触发 wrap 的副作用
+		return
+	}
+	pool.WrapFactory(wrap)
+}
+
+// sameFactory 判两个工厂是否同源 (见 WrapAgentFactory 的说明)。
+// 双 nil 视为同源 —— 那时 wrap 收到的 prev 与 pool.factory 都是 nil, 结果等价。
+func sameFactory(a, b CreateAgentFunc) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return reflect.ValueOf(a).Pointer() == reflect.ValueOf(b).Pointer()
 }
 
 // AgentFactory 返回当前 agent 执行工厂 (装配期只读用途)。

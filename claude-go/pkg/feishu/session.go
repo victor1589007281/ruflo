@@ -361,7 +361,9 @@ func (sm *SessionManager) newProfileRegistry(profile builtin.ToolProfile, opts r
 		reg.Register(skills.NewSkillTool(sm.skillReg))
 	}
 	if opts.includeAgent && opts.runAgentFn != nil {
-		reg.Register(agent.NewAgentTool(opts.runAgentFn))
+		// 带轨迹底座 (design/01 §4.8 图外派生可见性): 每次 Agent 工具派生写一条
+		// KindNode/subagent Span。sm.traceStore 为 nil 时与 NewAgentTool 完全等价。
+		reg.Register(agent.NewAgentToolWithTrace(opts.runAgentFn, sm.traceStore))
 	}
 	// Advisor 顾问工具: 仅主会话 (chatID 非空) 注册; 嵌套 agent 不注册避免预算翻倍。
 	if advTool := sm.advisorToolFor(opts.chatID); advTool != nil {
@@ -802,6 +804,19 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	applyConstraints(cfg, nestedConstraints)
 
 	nested := engine.NewQueryEngine(cfg, nestedAPIClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
+	// 轨迹底座 (design/01 §4.8 / design/03 §4.1 E1)。
+	//
+	// 改造前这一行**不存在**: createSession(:679) 与 stage 引擎(:1211) 都赋了
+	// TraceStore, 唯独嵌套子代理没有 —— 于是"父会话的每次调用有 llm_call Span,
+	// 它派生的子代理一条都没有"。子代理恰恰是烧钱大户 (它自己也跑完整的工具循环),
+	// 这个缺口让 §4.8 那句"一个节点可以在里面烧掉任意多 token 而图这一层什么都
+	// 看不到"在**轨迹**这一维上字面成立。
+	//
+	// 只赋字段、不调 RefreshHooks: 与上面两处赋值口径完全一致 (llm_call Span 由
+	// engine 直接读 e.TraceStore 写出, 不经 HookChain)。turn/tool_call 那两种 Span
+	// 靠 TraceCaptureHook, 而本进程里它从未被注册过 —— 那是本文件之外的既有缺口,
+	// 在这里单独把嵌套引擎打开会让子代理的轨迹形态比父会话还全, 反而不可比对。
+	nested.TraceStore = sm.traceStore
 
 	var sb strings.Builder
 	for msg := range nested.SubmitMessage(ctx, agentPrompt) {

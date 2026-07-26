@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -58,6 +59,9 @@ type RunOptions struct {
 // AgentTool Agent/Task 工具实现
 type AgentTool struct {
 	runAgent RunAgentFunc
+	// trace 图外派生的轨迹底座 (design/01 §4.8, 见 subagent_span.go)。
+	// 可空 —— 未注入时整套可见性采集是零成本 no-op, 行为与改造前一字不变。
+	trace *tracestore.Store
 }
 
 // NewAgentTool 创建 Agent 工具
@@ -117,12 +121,26 @@ func (t *AgentTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.
 		return &tool.ToolResult{Content: "Agent 运行函数未配置", IsError: true}, nil
 	}
 
+	// 图外派生的可见性收编 (design/01 §4.8, 见 subagent_span.go)。
+	//
+	// 挂在**这里**而不是各 runNestedAgent 里: 全仓每一次子代理派生都必经本方法
+	// (feishu/session.go:390,621 与 main.go:3065 的 RunAgentFunc 唯一调用方就是它),
+	// 挂一处就覆盖两条路径, 且将来新增入口自动获得同样的可见性。分别在两个
+	// runNestedAgent 里各写一遍则必然漂移 —— 那正是 §1.2 记的那种漂移形态。
+	start := time.Now()
+	tokensBefore := subagentTokensBefore(ctx)
+	depth := SubagentDepth(ctx) + 1
+	ctx = withSubagentDepth(ctx, depth)
+
 	result, err := t.runAgent(ctx, in.Prompt, RunOptions{
 		SubagentType: in.SubagentType,
 		Model:        in.Model,
 		ReadOnly:     in.ReadOnly,
 		ParentID:     tctx.AgentID,
 	})
+	// 成败两路都要记: 失败的派生同样烧了 token、同样占了墙钟, 只记成功的会让
+	// "为什么这个节点跑了 8 分钟才产出两行"永远解释不了。
+	t.observeSubagent(ctx, in, depth, result, err, start, tokensBefore)
 	if err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("Agent 执行失败: %v", err), IsError: true}, nil
 	}

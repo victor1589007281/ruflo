@@ -104,6 +104,77 @@ func NewAgentPool(factory CreateAgentFunc, maxSize int) *AgentPool {
 	}
 }
 
+// currentFactory 取当前创建工厂 (持锁)。
+//
+// 工厂恒非 nil: NewAgentPool 允许传 nil (历史签名, 测试里就有), 那时返回一个明确
+// 报错的哑工厂而不是让 Acquire panic —— swarm 子任务失败会被 StageResult 记成
+// TaskFailed 并继续, 而 nil 解引用会把整个 bot 进程带走。
+func (p *AgentPool) currentFactory() CreateAgentFunc {
+	p.mu.Lock()
+	f := p.factory
+	p.mu.Unlock()
+	if f == nil {
+		return func(context.Context, string, string) (AgentRunner, error) {
+			return nil, fmt.Errorf("agent pool: 未注入创建工厂")
+		}
+	}
+	return f
+}
+
+// Factory 返回当前创建工厂 (装配期只读用途; 未注入时为 nil)。
+// 与 ProductionTeamManager.AgentFactory 同一用途, 见 WrapFactory。
+func (p *AgentPool) Factory() CreateAgentFunc {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.factory
+}
+
+// WrapFactory 用 wrap 包装池的创建工厂 (design/02 §3.3 swarm 路径的远程 runtime 接线点)。
+//
+// # 为什么 swarm 需要单独接一次
+//
+// 上一轮只换了 `ProductionTeamManager.factory`, 它是 **pipeline / graph 阶段执行**
+// 的出口 (`workflow.go:1580` 的 `we.factory`)。而 swarm 模式的子任务走的是另一条:
+//
+//	SwarmEngine.executeTask → s.pool.Acquire(ctx, role, "") → p.factory(...)
+//	                                   ^ swarm.go:702           ^ 本文件
+//
+// 两个字段互不相干, 于是 swarm 路径无论怎么配 `--placement-prefer` 都只在本机跑
+// —— 建成的远程 runtime 对它完全不存在。
+//
+// # 只能在装配期调用
+//
+// `Acquire` 会在运行期读工厂。改造后读取已持锁 (currentFactory), 所以并发调用不再
+// 是数据竞争; 但**语义上**仍只该在任何团队启动之前调用: 运行到一半换工厂会让同一
+// 次 swarm 的前后子任务落在不同 runtime 上, 而它们可能共享 cwd。
+// 这与 `ProductionTeamManager.WrapAgentFactory` 是同一条纪律。
+//
+// wrap 收到当前工厂 (通常是本地执行体), 应当把它作为回退包在新工厂里;
+// 返回 nil 表示放弃替换 (保持原样)。
+func (p *AgentPool) WrapFactory(wrap func(CreateAgentFunc) CreateAgentFunc) {
+	if p == nil || wrap == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if next := wrap(p.factory); next != nil {
+		p.factory = next
+	}
+}
+
+// setFactory 直接置换工厂 (装配期; 供 ProductionTeamManager 复用已包好的工厂)。
+func (p *AgentPool) setFactory(f CreateAgentFunc) {
+	if p == nil || f == nil {
+		return
+	}
+	p.mu.Lock()
+	p.factory = f
+	p.mu.Unlock()
+}
+
 // Acquire 从池中获取一个执行槽位并创建 Agent。
 // 通过自旋检测 maxSize 限制并发，不替换 channel。
 func (p *AgentPool) Acquire(ctx context.Context, role, systemPrompt string) (*PooledAgent, error) {
@@ -127,7 +198,10 @@ func (p *AgentPool) Acquire(ctx context.Context, role, systemPrompt string) (*Po
 		return nil, fmt.Errorf("agent pool: 等待槽位超时 (%v)", ctx.Err())
 	}
 
-	runner, err := p.factory(ctx, role, systemPrompt)
+	// 取工厂**在锁内**: 见 WrapFactory 的注释。改造前这里是裸读 `p.factory`,
+	// 于是"装配期换工厂"这件事在 -race 下没有 happens-before 保证 —— 一次
+	// 多花几十纳秒的 mutex, 换掉一整类只在生产偶发的读写竞争。
+	runner, err := p.currentFactory()(ctx, role, systemPrompt)
 	if err != nil {
 		<-p.semaphore
 		atomic.AddInt64(&p.totalFailed, 1)
