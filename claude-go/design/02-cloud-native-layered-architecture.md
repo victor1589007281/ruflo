@@ -169,7 +169,7 @@ type LLMGateway interface {
 - **节点执行下发**：`NodeTask` 写入任务队列（EventBus 的 task subject），L3 worker 按能力标签拉取；结果以 `node.completed` 事件回流。本地模式下队列=进程内 channel，行为与现状同步调用等价。
 - **watchdog 分布式化**：节点级心跳变为 worker 定期上报 lease 续约；lease 过期=停滞，编排器按 RetryPolicy 重派（等价 `coordinator.go:264` 双层检测）。
 
-### 3.3 L3 · Agent 运行时（Worker）　　**[🟠 执行体 · Placement · cwd 三档位 ✅ / swarm 路径与 k8s-job 仍缺]**
+### 3.3 L3 · Agent 运行时（Worker）　　**[✅ 执行体 · Placement · cwd 三档位 · swarm · k8s-job]**
 
 > ✅ **执行体已真实（2026-07-25）**：新增 `pkg/worker`（协议/Broker/远程 runtime/worker 循环，29 个测试）+ 独立二进制 `cmd/claude-go-worker`。改造前**两头都断**：控制面侧 `pkg/agent` 零 `pkg/cluster` import、`RuntimeRegistry` 里只有 `localRuntime`——控制面**没有任何办法**把节点派出去；worker 侧 `cmd/claude-go/main.go:1702 executeWorkerTask` 把 payload 回显成 `{"echo":...}` 并自带注释「v1 简化实现」。
 >
@@ -179,7 +179,7 @@ type LLMGateway interface {
 >
 > 顺带修 `pkg/cluster/http.go` 的一处 **fail-open**：`Client.post` 拿到状态码却只是返回它，而 `Heartbeat`/`Complete`/`Fail` 三个调用方全写成 `_, err :=`——401（没配 token）与 400（"任务不在你的租约内"）在 worker 侧**全是静默成功**；上报终态被拒却当成功，任务就永远停在 `leased` 直到租约过期。
 >
-> ⚠️ **仍缺**：**逐节点 Placement**（`graph.AgentSpec` 没有 `Placement` 字段，现只有进程级默认 + 团队亲和，"需要 browser 的那个节点去 browser 池"做不到）；✅ **cwd 三档位已实现且跨机产码闭环（2026-07-25，设计风险④ 已解）**：`pkg/worker/{workspace,gitws}.go`。**pvc 档不是"互相声明就信"**——加了双向握手（控制面派任务前在共享卷写 `.control`，worker 读不到就拒绝执行；worker 完成写 `.worker` 回执，控制面读不到就判失败），这是唯一能检出"同路径不同数据"的手段。**git 档的闭环在控制面这一侧**：worker 推完后 broker `fetch` + **ff-only** 合入 `team.Cwd` 并校验提交可达，做完这步 `<team.Cwd>/go.mod` 上的 `go build` 才真看得见远程产码（真机实测 PASS）。冲突走 rebase 不 merge（保持线性，控制面永远能用 ff-only）、绝不 force push、大文件超闸即失败并列路径（悄悄跳过等于下一阶段找不到它）。真机验证抓出 4 个实现 bug（执行体自己 commit / worker 垃圾进仓 / 第二个团队被 `origin/HEAD` 永不设置卡死 / 跨团队串味），全部修掉并做了反向确认。⚠️ **一处既有约束未修**：`team.Cwd` 是进程级的（`teams.go:609`），并发跑两个产码团队仍会互相污染（git 档表现为控制面 cwd 在两条分支间来回 checkout）——真隔离要动 8+ 平台依赖的 cwd 语义。swarm 路径仍纯本地（`AgentPool.factory` 未换）；k8s-job runtime 未接；旧 `claude-go worker` 子命令仍是桩（仓里暂有两个 worker 入口）。
+> ⚠️ **仍缺**：**逐节点 Placement**（`graph.AgentSpec` 没有 `Placement` 字段，现只有进程级默认 + 团队亲和，"需要 browser 的那个节点去 browser 池"做不到）；✅ **cwd 三档位已实现且跨机产码闭环（2026-07-25，设计风险④ 已解）**：`pkg/worker/{workspace,gitws}.go`。**pvc 档不是"互相声明就信"**——加了双向握手（控制面派任务前在共享卷写 `.control`，worker 读不到就拒绝执行；worker 完成写 `.worker` 回执，控制面读不到就判失败），这是唯一能检出"同路径不同数据"的手段。**git 档的闭环在控制面这一侧**：worker 推完后 broker `fetch` + **ff-only** 合入 `team.Cwd` 并校验提交可达，做完这步 `<team.Cwd>/go.mod` 上的 `go build` 才真看得见远程产码（真机实测 PASS）。冲突走 rebase 不 merge（保持线性，控制面永远能用 ff-only）、绝不 force push、大文件超闸即失败并列路径（悄悄跳过等于下一阶段找不到它）。真机验证抓出 4 个实现 bug（执行体自己 commit / worker 垃圾进仓 / 第二个团队被 `origin/HEAD` 永不设置卡死 / 跨团队串味），全部修掉并做了反向确认。⚠️ **一处既有约束未修**：`team.Cwd` 是进程级的（`teams.go:609`），并发跑两个产码团队仍会互相污染（git 档表现为控制面 cwd 在两条分支间来回 checkout）——真隔离要动 8+ 平台依赖的 cwd 语义。✅ **swarm 路径已接（2026-07-25）**：`AgentPool.factory` 与 `ProductionTeamManager.factory` 是**两个独立字段**，上一轮只换了后者——症状（swarm 子任务在本机跑）与"远程 worker 没上线"一模一样，现场无法归因。现让 `WrapAgentFactory` **同时**接管池，装配处零改动（多一个接线点就多一个"某个部署忘了调"的静默降级面）。✅ **k8s-job runtime 已接**（见 design/01 §4.9）。旧 `claude-go worker` 子命令仍是桩（仓里暂有两个 worker 入口）。
 
 > **实测**：worker 拉取 + 心跳循环真实（`cmd/claude-go/main.go:1548-1600`），但 **`executeWorkerTask` 只回显 payload**（`:1609-1621`，自带注释「v1 简化实现…R3 后续接完整引擎」）⇒ 整条 L3 远程执行为 0。「worker 不依赖本机状态目录」成立只因它什么都不做——没有引擎装配、没有 prompt/skills/tools。cwd 三档位（local/pvc/git）未实现。
 

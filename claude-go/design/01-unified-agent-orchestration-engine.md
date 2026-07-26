@@ -325,7 +325,15 @@ type SkillSelector struct {
 - 注入路径不变：合并进 `<role_skills>` 块（`MergedPrompt`，`roles.go:105-159`）；Skill 工具按需取全文。
 - **编排能力**：skill 可声明 `graph:` 段——技能不仅是提示词，还能携带一个子图模板（如 mr-chain 类多阶段技能），Skill 选择即子图注入。这为 design/03 的"skill 进化=图模板进化"铺路。
 
-### 4.8 Subagent 派生　　**[🟠 图内派生 ✅ / 收编飞书裸 QueryEngine 属 M4]**
+### 4.8 Subagent 派生　　**[🟠 图内派生 ✅ · 图外派生已可见 / 执行路径收编待「会话即单节点图」]**
+
+> ✅ **图外派生已可见（2026-07-25）**，⚠️ **但执行路径收编做不到，前置条件已查明**：`SpawnSubgraph` 的三样好处全部来自复用 `rc`(`runCtx`)，而 `rc` 是 `Engine.Run` 内部构造、**从未离开过 `pkg/graph`** 的运行上下文。会话路径压根没有图；即使派生发生在图节点内部也拿不到它。要传出去就得让调度内核经 ctx 暴露内部运行状态——正是 §4.9 拒绝过的"内核反向依赖上层"。**真正的前置条件是 §4.1 的「会话即单节点图」。**
+>
+> 可见性挂在 `AgentTool.Call`——全仓每一次派生的唯一必经点，挂一处覆盖飞书与 CLI 两条路径。三条痕迹：`KindNode` 轨迹（`attrs.kind=subagent`）/ hook 总线（经既有 bridge 进同一条 `HookBus`）/ 深度累加。
+>
+> **一处最容易做反的地方**：直觉上该给子代理一个自己的 NodeID 并 `trace.With` 回 ctx，看起来归因更干净——**但那会把子代理的 token 从父节点台账里搬走**（`TokenLedger` 按 `(RunID,NodeID)` 记账，图侧 tokens 拦截器取的正是父节点前后差值），父节点的 `MaxTokens` 闸就再也看不见子代理烧的钱，**恰好是本节要修的那个洞**。最终是 **Span 带派生 NodeID（可归因），ctx 不动（可计费）**。
+>
+> 顺带修一个既有缺口：`runNestedAgent` 的嵌套引擎 `TraceStore` **恒 nil**（`createSession` 与 stage 引擎都赋了，唯独它没有）——子代理烧的每次 LLM 调用在轨迹上一条记录都没有。
 
 > **实测（改造前）**：`SpawnSubgraph` 零命中；subagent 是节点内 agent 自己造的裸 QueryEngine（`pkg/feishu/session.go` `runNestedAgent`、`cmd/claude-go/main.go`），**对编排层完全不可见**——没有 NodeID、不进 Journal、不受 hook/预算/轨迹覆盖，一个节点可以在里面烧掉任意多 token 而图这一层什么都看不到。
 >
@@ -344,7 +352,13 @@ type SkillSelector struct {
 - 节点内 agent 通过 `SpawnSubgraph(spec, params)` 工具派生子图（受 ConstraintSet 单调性约束、计入父节点预算）。取代"factory 创建裸 QueryEngine"（`teams.go:158`、`feishu/session.go:807-830`、`main.go:2639`）——**subagent 从此对编排层可见**：有 NodeID、进 Journal、受 hook/预算/轨迹覆盖。
 - 现有 `cliAgentRunner`/`sessionAgentRunner` 改为 AgentRuntime 的两个实现（见 4.9），行为不变。
 
-### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[🟠 接口 · 远程实现 · 逐节点 Placement ✅ / k8s-job 仍缺]**
+### 4.9 远程 Agent 管理：AgentRuntime 接口　　**[✅ 接口 · 远程 · Placement · k8s-job 三种 runtime 齐]**
+
+> ✅ **k8s-job runtime 已落地（2026-07-25）**：形状是**组合而非从零造**——`Execute` = 入队一条钉死在一次性 worker 上的任务 + 创建跑 `claude-go-worker --claim <taskID>` 的 Job，事件与终态一行不改复用 `remoteRuntime`。收编 `K8SRunner` 的是 **Job 下发那一半**（清单/PVC 约定/TTL/kubectl 通路），执行体用既有 worker 二进制——**直接包 `K8SRunner` 只会得到"能跑 shell 不能跑 agent"的假实现**。
+>
+> **与常驻 worker 的分工（不是替代品）**：常驻是热池，稳态继续用它（k8s-job 每节点多一次调度+进程启动，实测约 10s 冷启）。它多提供三件热池给不了的：按节点弹性（真机 fanout 阶段同时起 3 个 pod、跑完即消失）、特殊能力池不必常驻、任务级隔离（**git 档下常驻 worker 被迫 `MaxParallel=1`**——只有一个检出目录，而每个 Job 自带一个）。只跑稳态串行 pvc 档的部署，诚实说不需要它。
+>
+> 真机含**故障注入**验证：镜像不存在时 1 秒内失败、原因是 kubelet 原文（不是"worker 掉线"）、图层重试、起不来的 Job 全被删。两处真机逼出的修正：`ErrImageNeverPull`（kind 常见，kubelet 根本不去拉所以不会退化成 ImagePullBackOff）、探活改用 `auth can-i` 而非 `get namespace`（命名空间是集群级资源，namespaced Role 拿不到，控制面当场 CrashLoop）。
 
 > **实测（2026-07-25 实现）**：`pkg/agent/runtime.go` 落地 `AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps`/`Placement`（硬约束过滤 + 软偏好打分 + 团队亲和 + 租约过期剔除），并用 `NewLocalRuntime` 把既有 `CreateAgentFunc` 收编为本地 runtime（**不改动 cliAgentRunner/sessionAgentRunner 两个既有实现**）。⚠️ **一处对设计稿的偏离**：接口定在 `pkg/agent` 而非 `pkg/graph/runtime.go`——要被收编的三个执行器都在 pkg/agent 及其上层，而 pkg/graph 是纯调度内核不认识 agent 语义，放进去会让内核反向依赖 RunMetadata/ToolProfile/团队 cwd。折中是图侧继续用 `NodeRunner`，`stageNodeRunner` 作桥，**pkg/graph 零改动**。⚠️ 澄清名字撞车：`pkg/cluster` 的 `RequireCaps` 是队列标签过滤（布尔匹配无打分），本文的 `Placement` 才是放置策略；前者是后者求解后用于跨机路由的投影。✅ **远程 runtime 已落地（2026-07-25）**：`pkg/worker` 的 `remoteRuntime` 实现本接口并经 `Broker.Sync` 从 `cluster.Registry` 注册进 `RuntimeRegistry`（心跳续租，掉线由既有租约机制剔除），详见 design/02 §3.3。**仍缺**：k8s-job runtime（`pkg/sandbox/k8s_runner.go` 尚未接为 AgentRuntime）。✅ **逐节点 Placement 已实现（2026-07-25）**：`AgentSpec.Placement` + graph 本地镜像 `PlacementSpec`（不 import `pkg/agent`，否则调度内核反向依赖 agent 语义）。`Placement()` 是**逐字段合并**而不是"节点声明了就整份替换"——进程默认里的 `Affinity:"team"` 是产码工作流的命脉，一个只想写 `require:["browser"]` 的渲染节点若因此丢掉团队亲和，会被派到另一台机器的另一个工作区，**症状是「渲染节点看不见前面生成的 HTML」，作者完全不会想到是自己那行 require 造成的**。同时补了展开产物的 `narrowPlacement`（父声明 `require:["browser"]` 的子节点原本可以漏写而落到没浏览器的机器上产假货，图上"约束只收窄"看起来还成立）。关键语义：团队亲和权重高于任何 Prefer（产码门禁在 `<cwd>/go.mod` 上跑，节点散落会让上一阶段的代码消失）；同分按名字升序保证放置确定性。11 个测试。
 
