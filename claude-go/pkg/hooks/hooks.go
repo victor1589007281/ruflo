@@ -48,18 +48,37 @@ type Runner struct {
 	sessionID string
 	timeout   time.Duration
 
+	// obsCtx 观测 ctx: 仅用于取出 Observer 把事件投到 Hook 总线 (见 bus.go)。
+	// nil = 不观测, 与改造前逐字节等价。**不用于取消/超时** —— 各 hook 执行自带
+	// 独立的 timeout ctx, 把这个 ctx 接进去会让"总线观测"意外变成一条取消路径。
+	obsCtx context.Context
+
 	postMu sync.RWMutex
 	// PostSamplingCallbacks 在 ExecutePostSamplingHooks 中依次调用；请用 RegisterPostSamplingHook 注册以保证并发安全。
 	PostSamplingCallbacks []func(messages []types.Message)
 }
 
-// NewRunner 创建 hook 执行器
+// NewRunner 创建 hook 执行器 (不观测: 事件不进 Hook 总线)。
 func NewRunner(configs []types.HookConfig, sessionID string) *Runner {
 	return &Runner{
 		configs:   configs,
 		sessionID: sessionID,
 		timeout:   10 * time.Second,
 	}
+}
+
+// NewRunnerWithContext 创建带**观测 ctx** 的 hook 执行器
+// (design/01 §4.5 `ExternalHook` 适配器, 见 bus.go)。
+//
+// ctx 里若挂了 Observer (WithObserver), 本 Runner 触发的每个**真的匹配到配置**的
+// hook 事件会投一条到 Hook 总线。没挂 Observer / 没配 hook ⇒ 行为与 NewRunner 一致。
+//
+// 只在**per-run 构造**的 Runner 上用它 (生产是 sessionAgentRunner.Execute 里那个)。
+// 长期复用的 Runner 传 ctx 会串台, 理由见 bus.go 边界 2。
+func NewRunnerWithContext(ctx context.Context, configs []types.HookConfig, sessionID string) *Runner {
+	r := NewRunner(configs, sessionID)
+	r.obsCtx = ctx
+	return r
 }
 
 // RegisterPostSamplingHook 注册后采样回调（在 ExecutePostSamplingHooks 中调用）。
@@ -90,18 +109,30 @@ func (r *Runner) RunPreToolUseHooks(toolName string, input json.RawMessage) (*ty
 		ToolInput: input,
 	}
 
+	// 总线观测 (design/01 §4.5): 一次事件只发一条, 相位=事件名原文。用 defer 是因为
+	// 下面有三条 return 出口 (block / approve / 收尾), 逐条手写 emit 必漏一条 ——
+	// 漏掉的恰好会是 block 那条 (最该被看见的干预)。
+	ev := Event{Scope: ScopeTool, Phase: string(types.HookEventPreToolUse),
+		Matched: len(hooks), Tool: toolName}
+	defer func() { r.observe(ev) }()
+
 	var contexts []string
 	for _, h := range hooks {
 		output, err := r.executeHook(h, hookInput)
 		if err != nil {
+			if ev.Err == "" {
+				ev.Err = err.Error() // 只记第一条: 改造前这里 continue 静默吞掉全部 hook 报错
+			}
 			continue
 		}
 		if output != nil {
 			// Decision 语义: "deny" / "block" = 阻止; "approve" = 显式放行并跳过剩余 hook
 			if output.Decision == "deny" || output.Decision == "block" {
+				ev.Decision = output.Decision
 				return output, nil
 			}
 			if output.Decision == "approve" {
+				ev.Decision = output.Decision
 				// 显式批准: 跳过剩余 hooks，返回 nil 表示不阻止
 				if len(contexts) > 0 {
 					return &types.HookOutput{AdditionalContext: strings.Join(contexts, "\n")}, nil
@@ -136,9 +167,14 @@ func (r *Runner) RunPostToolUseHooks(toolName string, input json.RawMessage, res
 		IsError:    isError,
 	}
 
+	ev := Event{Scope: ScopeTool, Phase: string(types.HookEventPostToolUse),
+		Matched: len(hooks), Tool: toolName}
 	for _, h := range hooks {
-		_, _ = r.executeHook(h, hookInput)
+		if _, err := r.executeHook(h, hookInput); err != nil && ev.Err == "" {
+			ev.Err = err.Error()
+		}
 	}
+	r.observe(ev)
 	return nil
 }
 
@@ -195,18 +231,26 @@ func (r *Runner) executeStopLikeHooks(event types.HookEvent, messages []types.Me
 		Messages:  messages,
 	}
 
+	ev := Event{Scope: ScopeOf(event), Phase: string(event), Matched: len(hooks)}
+	defer func() { r.observe(ev) }()
+
 	var blockingMessages []types.Message
 	for _, h := range hooks {
 		output, err := r.executeHook(h, hookInput)
 		if err != nil {
+			if ev.Err == "" {
+				ev.Err = err.Error()
+			}
 			continue
 		}
 		if output != nil {
 			// ContinueDecision 语义: "deny" / "block" = 阻止并注入恢复消息; "approve" = 不阻止
 			if output.ContinueDecision == "approve" {
+				ev.Decision = output.ContinueDecision
 				return nil
 			}
 			if output.ContinueDecision == "deny" || output.ContinueDecision == "block" {
+				ev.Decision = output.ContinueDecision
 				reason := output.Reason
 				if reason == "" {
 					reason = "Stop hook 要求继续"
@@ -378,16 +422,21 @@ func (r *Runner) RunPostToolUseFailureHooks(toolName string, input json.RawMessa
 		return nil
 	}
 	hookInput := types.HookInput{
-		Event:       types.HookEventPostToolUseFailure,
-		SessionID:   r.sessionID,
-		ToolName:    toolName,
-		ToolInput:   input,
+		Event:        types.HookEventPostToolUseFailure,
+		SessionID:    r.sessionID,
+		ToolName:     toolName,
+		ToolInput:    input,
 		ErrorMessage: errMsg,
-		IsError:     true,
+		IsError:      true,
 	}
+	ev := Event{Scope: ScopeTool, Phase: string(types.HookEventPostToolUseFailure),
+		Matched: len(hooks), Tool: toolName}
 	for _, h := range hooks {
-		_, _ = r.executeHook(h, hookInput)
+		if _, err := r.executeHook(h, hookInput); err != nil && ev.Err == "" {
+			ev.Err = err.Error()
+		}
 	}
+	r.observe(ev)
 	return nil
 }
 
@@ -405,13 +454,26 @@ func (r *Runner) executeMessageHooksWithDecision(event types.HookEvent, messages
 	if messages != nil {
 		in.Messages = messages
 	}
+	// 这是 20+ 个事件 (SubagentStart/SessionStart/PreCompact/OnError/TeammateIdle...)
+	// 的共同漏斗, 所以总线接线只需一处 —— 逐个 Execute*Hooks 方法各接一次的话,
+	// 将来新增一个事件必然忘记接, 表现为"总线上少一类事件"且无人察觉。
+	ev := Event{Scope: ScopeOf(event), Phase: string(event), Matched: len(hooks),
+		Role: base.Role}
+	defer func() { r.observe(ev) }()
 	for _, h := range hooks {
 		output, err := r.executeHook(h, in)
-		if err != nil || output == nil {
+		if err != nil {
+			if ev.Err == "" {
+				ev.Err = err.Error()
+			}
+			continue
+		}
+		if output == nil {
 			continue
 		}
 		// 只要有明确的决策字段就返回（block/deny/approve）
 		if output.Decision != "" || output.ContinueDecision != "" {
+			ev.Decision = decisionOf(output)
 			return output
 		}
 	}

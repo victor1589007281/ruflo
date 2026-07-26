@@ -761,7 +761,10 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		nestedAPIClient.PromptCacheMode = promptCacheMode
 	}
 
-	hookRunner := hooks.NewRunner(sm.hookConfigs, "")
+	// 带观测 ctx (design/01 §4.5 ExternalHook 适配器): 这个 Runner 是 per-调用 构造的,
+	// 且这条路径 (Agent 工具派生的嵌套 agent) 可能发生在图节点内部 —— ctx 上有
+	// hooks.Observer 时它的外部 hook 事件就进图总线, 没有时逐字节等价于 NewRunner。
+	hookRunner := hooks.NewRunnerWithContext(ctx, sm.hookConfigs, "")
 	compactor := compact.NewCompactor(nestedAPIClient, contextWindow)
 	promptMgr := prompt.NewManager(sm.config.Cwd)
 	promptMgr.Model = nestedModel
@@ -1156,7 +1159,11 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 
 	permMode := types.PermissionMode(r.sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)
-	hookRunner := hooks.NewRunner(r.sm.hookConfigs, "")
+	// 带观测 ctx (design/01 §4.5 ExternalHook 适配器)。**这是生产的主产生方**:
+	// 图路径的每个 agent 节点都经 CreateAgentRunner 走到这里, 而这个 Runner 是
+	// per-Execute 构造的 ⇒ 观测 ctx 天然是 per-run 的, 不会串台 (hooks/bus.go 边界 2)。
+	// ctx 上没有 hooks.Observer 时 (非图模式 / 灰度未开) 逐字节等价于 NewRunner。
+	hookRunner := hooks.NewRunnerWithContext(ctx, r.sm.hookConfigs, "")
 	if hookRunner != nil {
 		hookOut := hookRunner.ExecuteSessionHooks(types.HookEventSessionStart)
 		if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {

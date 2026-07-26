@@ -399,16 +399,20 @@ func (s *Server) handleTeamBlackboardWrite(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	value := valueStr
-	// 同时排队一条 action, 让消费方 (ActionSink) 知道黑板被外部改过 (pull 模式)。
+	// 同时排队一条 action, 让消费方 (ActionSink) 把这次写入**送进运行中团队的内存黑板**。
 	//
-	// 两个诚实的限制, 写在这里免得下一个人误判:
-	//  ① 本接口直接改 blackboard.json 磁盘文件, **绕过了运行中团队的内存黑板**
-	//     (pkg/agent.Blackboard 只在构造时 load 一次, 之后靠 debounce 覆盖写盘)。
-	//     所以运行中的团队看不到这次修改, 甚至可能把它覆盖掉。真正的推送要走
-	//     agent.Board.Watch —— 那需要 dashboard 能拿到进程内的 *Blackboard 实例,
-	//     属于 design/01 M4 的接线, 不在本轮范围。
+	// ✅ 队列这一跳现在是真的了: 消费方 `Bot.DashboardTeamAction` 有了
+	// `case "blackboard.write"` → `agent.WriteTeamBlackboard` → `Blackboard.Write`
+	// (会 markDirty 并派发 Watch 事件)。此前那一支**不存在**, 动作落 default 报
+	// "未知操作", 于是本接口只改了磁盘文件, 而内存黑板会在下一次 debounce 全量刷盘时
+	// 把刚写进去的条目**静默覆盖掉** —— 调用方拿到的却是 200 OK。
+	//
+	// 仍在的两个限制, 写在这里免得下一个人误判:
+	//  ① 上面那次磁盘写入**仍然是必要的**: 团队不在本进程内 (已结束/尚未加载) 时
+	//     没有内存黑板可写, 磁盘是唯一落点。两条路都走的代价是团队**正在运行**时
+	//     这一条会写两遍 (磁盘一次 + 内存刷盘一次), 内容相同故幂等。
 	//  ② 这条动作只有在注入了 ActionExecutor 的进程里才会被真正处理; 否则消费方
-	//     会把它标成 unsupported (而不是假装 done)。
+	//     会把它标成 unsupported (而不是假装 done), 此时退化为改造前的"只改磁盘"。
 	queueDir := filepath.Join(s.cfg.StateDir, ".dashboard", "actions")
 	_ = os.MkdirAll(queueDir, 0o755)
 	actionID := fmt.Sprintf("blackboard-%s-%d", name, time.Now().UnixMilli())

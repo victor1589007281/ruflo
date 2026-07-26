@@ -799,6 +799,12 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 	coord := ptm.newRunCoordinator(team, len(isResume) > 0 && isResume[0])
 	executor := ptm.newRunExecutor(team, coord)
 
+	// 黑板 Watch 的生产订阅方 (design/01 §4.11; 默认关, 见 blackboard_watch.go)。
+	// 起在这里而不是 RunWithRecovery 里: 这是**唯一**一处"团队 + Coordinator 都已
+	// 装配好、且无论走哪条执行路径 (pipeline/图/专用模式) 都会经过"的位置。
+	boardWatch := startTeamBoardWatcher(team, coord)
+	defer boardWatch.stop() // nil 安全 (未开启时返回 nil)
+
 	results, err := coord.RunWithRecovery(ctx, wf, team.Objective, team, executor)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -1859,6 +1865,50 @@ func (ptm *ProductionTeamManager) GetTeam(name string) *ProductionTeam {
 	ptm.mu.RLock()
 	defer ptm.mu.RUnlock()
 	return ptm.teams[name]
+}
+
+// WriteTeamBlackboard 向**进程内**团队黑板写一条条目 (design/01 §4.11)。
+//
+// ---------------------------------------------------------------------------
+// 它修的是哪个缺陷
+// ---------------------------------------------------------------------------
+//
+// `POST /api/teams/:name/blackboard` (dashboard/v13_handlers.go) 此前只改磁盘上的
+// `blackboard.json`, 而 `pkg/agent.Blackboard` **只在构造时 load 一次**、之后靠
+// debounce 全量覆盖写盘。后果有两级:
+//
+//	① 运行中的团队看不到这次写入 (它读的是内存 entries);
+//	② 更糟: 下一次 debounce 刷盘会用内存快照**整份覆盖**磁盘文件, 于是刚写进去的
+//	   条目**被静默抹掉** —— 调用方拿到的是 200 OK。
+//
+// 那个接口已经把动作排进 :7777 队列 (`blackboard.write`), 但消费方
+// (`Bot.DashboardTeamAction`) 的 switch 里没有这一支 ⇒ 落到 default 报"未知操作"。
+// 本方法就是那一支缺的实现。
+//
+// 找不到内存实例时**返回错误而不是退回改磁盘**: 退回磁盘正是上面那个静默丢数据的
+// 形态, 而报错至少让调用方知道"这次写入没生效"。
+func (ptm *ProductionTeamManager) WriteTeamBlackboard(name, key, value, author, category string) error {
+	if strings.TrimSpace(key) == "" {
+		return fmt.Errorf("黑板写入需要 key")
+	}
+	team := ptm.GetTeam(name)
+	if team == nil {
+		return fmt.Errorf("团队 %q 不在本进程内 (无内存黑板可写)", name)
+	}
+	if team.Blackboard == nil {
+		return fmt.Errorf("团队 %q 无黑板实例", name)
+	}
+	if author == "" {
+		author = "dashboard"
+	}
+	if category == "" {
+		category = "dashboard_write"
+	}
+	// 走 Write 而不是直接改 entries: Write 会 markDirty (于是这条会随下一次 debounce
+	// 一起落盘, 不再被覆盖掉) **并派发 Watch 事件** —— 订阅方 (blackboard_watch.go)
+	// 因此也能看到外部注入的条目。
+	team.Blackboard.Write(key, value, author, category)
+	return nil
 }
 
 // ListAllTeams 列出所有团队

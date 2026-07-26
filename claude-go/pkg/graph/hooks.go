@@ -9,8 +9,11 @@ package graph
 //	graph|pre,post        本引擎 (Run 首尾)
 //	node |pre,post,failure 本引擎 (每个节点)
 //	turn |...             pkg/engine 的 internal_hook.HookChain, 经 ctx 携带的
-//	                      Observer 桥接 (见 pkg/agent/graph_internal_bridge.go)
+//	                      Observer 桥接 (见 pkg/agent/graph_internal_bridge.go);
+//	                      以及 pkg/hooks 的外部 hook 每轮事件 (见下)
 //	tool |...             同上 (PreToolUse / PostToolUse 两个 phase)
+//	session|...           pkg/hooks 的外部 shell/HTTP/gRPC/OPA hook, 经 ctx 携带的
+//	                      hooks.Observer 桥接 (见 pkg/agent/graph_external_bridge.go)
 //
 // design/01 §4.5 的定位是: `internal_hook` **保留在引擎内**(性能敏感、每 turn
 // 触发), 但它的事件要注册进同一条总线, 使**事件对图层可见**。注意是"可见"不是
@@ -39,18 +42,25 @@ package graph
 import "context"
 
 // HookScope 作用域 (design/01 §4.5 双维度: 作用域 × 相位)。
-//
-// 未列 `session`: 全仓没有 session 级事件的产生方, 加一个没有产生方的常量只会
-// 让读者以为总线上有这类事件。有了产生方再加。
 type HookScope string
 
 const (
 	ScopeGraph HookScope = "graph"
 	ScopeNode  HookScope = "node"
-	// ScopeTurn 引擎内 turn 级事件 (compact / 记忆注入 / 错误分类 / turn 收尾)。
+	// ScopeTurn 引擎内 turn 级事件 (compact / 记忆注入 / 错误分类 / turn 收尾),
+	// 以及外部 hook 的每轮/每请求事件 (PreTurn/PreRequest/Stop/OnError...)。
 	ScopeTurn HookScope = "turn"
-	// ScopeTool 引擎内工具级事件 (ToolGate / LoopDetector / JSONRepair 等)。
+	// ScopeTool 引擎内工具级事件 (ToolGate / LoopDetector / JSONRepair 等),
+	// 以及外部 hook 的 PreToolUse/PostToolUse/PostToolUseFailure。
 	ScopeTool HookScope = "tool"
+	// ScopeSession 会话/子代理生命周期事件 (SessionStart/SessionEnd/
+	// SubagentStart/SubagentStop)。
+	//
+	// 这个常量此前刻意不存在, 理由是"全仓没有产生方, 加一个没有产生方的常量只会让
+	// 读者以为总线上有这类事件"。现在**有了产生方**: `pkg/hooks` 的 ExternalHook
+	// 适配器 (design/01 §4.5 归宿表第 1 行, 见 pkg/agent/graph_external_bridge.go),
+	// 于是按当初写下的条件"有了产生方再加"补上。
+	ScopeSession HookScope = "session"
 )
 
 // Hook 决策动作。空串 = 放行。

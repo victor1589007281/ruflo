@@ -54,6 +54,10 @@ func (g GraphSpec) validate(vc validateCtx) error {
 		// 而 AND 与 OR 的差别是整条汇总链跑不跑 —— 必须拒。
 		return fmt.Errorf("graph: policies.default_join=%q 未知 (支持 %s|%s)", j, JoinOr, JoinAnd)
 	}
+	// 图级 watchdog 声明 (watchdog.go)。未声明 (nil) 时直接过, 与改造前一致。
+	if err := g.Policies.Watchdog.validate(); err != nil {
+		return err
+	}
 
 	// —— 节点: ID 唯一性 / Kind / Loop 策略 ——
 	ids := make(map[string]bool, len(g.Nodes))

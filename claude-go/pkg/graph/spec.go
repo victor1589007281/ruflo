@@ -40,6 +40,10 @@ type GraphPolicies struct {
 	// 单个 ExpandSpec 的深度/条数上限只能约束一次展开, 挡不住"每层都只加 3 个
 	// 但加了 20 层"这种由 LLM 产出驱动的累积膨胀。
 	MaxTotalNodes int `json:"max_total_nodes,omitempty"`
+	// Watchdog **图级**停滞检测 (design/01 §4.3 双层 watchdog 的图级那层, watchdog.go)。
+	// **nil = 完全关闭**, 连巡检 goroutine 都不起 —— 现存全部图行为逐字节不变。
+	// 默认动作只观测 (notify); 要让停滞真的中止运行必须显式写 action:"fail"。
+	Watchdog *WatchdogSpec `json:"watchdog,omitempty"`
 }
 
 // NodeKind 节点形态 (design/01 §4.1 全表 8 种)。

@@ -1076,6 +1076,24 @@ func (b *Bot) DashboardTeamAction(action, teamName string, payload map[string]in
 		}
 		_, err := b.teamMgr.ForkTeam(teamName, newName)
 		return err
+	case "blackboard.write":
+		// dashboard 的 POST /api/teams/:name/blackboard 排进 :7777 队列的动作
+		// (design/01 §4.11)。此前这一支**不存在** ⇒ 落 default 报"未知操作" ⇒ 那个
+		// 接口只改了磁盘文件, 而运行中团队的内存黑板会在下一次 debounce 刷盘时把它
+		// 静默覆盖掉。理由与细节见 agent.WriteTeamBlackboard 的注释。
+		key, value := "", ""
+		if payload != nil {
+			if k, ok := payload["key"].(string); ok {
+				key = k
+			}
+			// value 只认字符串: 该接口在写队列前已把任意 JSON 压成字符串
+			// (v13_handlers.go 的 valueStr), 这里再做一次类型分派等于两处各自解释
+			// 同一个字段 —— 两套解释必然漂移。
+			if v, ok := payload["value"].(string); ok {
+				value = v
+			}
+		}
+		return b.teamMgr.WriteTeamBlackboard(teamName, key, value, "dashboard", "dashboard_write")
 	default:
 		return fmt.Errorf("未知操作: %s", action)
 	}

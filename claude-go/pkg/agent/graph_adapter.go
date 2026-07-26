@@ -1138,6 +1138,21 @@ func newTeamGraphHooks(we *WorkflowExecutor, team *ProductionTeam, spec graph.Gr
 func (h *teamGraphHooks) Emit(ctx context.Context, ev graph.HookEvent) graph.HookDecision {
 	switch ev.Scope {
 	case graph.ScopeGraph:
+		if ev.Phase == "stalled" {
+			// 图级 watchdog 判定停滞 (design/01 §4.3, graph/watchdog.go)。
+			// 单独一支是因为载荷键完全不同: 走上面那行会打出一条四个字段全空的
+			// `graph.stalled` —— 那种日志比没有更糟 (看着有事件, 什么都没说)。
+			// **只打日志不改任何执行**: 干预 (action=fail) 由引擎在取消路径上做,
+			// 这个观测桥一如既往恒放行。
+			logging.For("graph").Warn("图级停滞", "team", h.teamName(),
+				"graph", payloadStr(ev.Payload, "graph"),
+				"stall_ms", payloadStr(ev.Payload, "stall_ms"),
+				"threshold_ms", payloadStr(ev.Payload, "threshold_ms"),
+				"action", payloadStr(ev.Payload, "action"),
+				"repeat", payloadStr(ev.Payload, "repeat"),
+				"events", payloadStr(ev.Payload, "events"))
+			break
+		}
 		logging.Event(ctx, "graph."+ev.Phase, "team", h.teamName(),
 			"graph", payloadStr(ev.Payload, "graph"), "status", payloadStr(ev.Payload, "status"),
 			"nodes", payloadStr(ev.Payload, "nodes"), "completed", payloadStr(ev.Payload, "completed"))
@@ -1148,13 +1163,18 @@ func (h *teamGraphHooks) Emit(ctx context.Context, ev graph.HookEvent) graph.Hoo
 		case "post", "failure":
 			h.nodeFinished(ctx, ev)
 		}
-	case graph.ScopeTurn, graph.ScopeTool:
-		// design/01 §4.5: internal_hook 保留在引擎内, 但事件注册进同一总线。
-		// 这里**只聚合计数**, 不落盘不打日志 —— 一次团队运行会有成千上万条,
-		// 逐条处理会把最热路径与日志双双淹掉。见 graph_internal_bridge.go。
+	case graph.ScopeTurn, graph.ScopeTool, graph.ScopeSession:
+		// design/01 §4.5: internal_hook 保留在引擎内、外部 hook 保留在 pkg/hooks,
+		// 但两者的事件都注册进同一总线。这里**只聚合计数**, 不落盘不打日志 ——
+		// 一次团队运行会有成千上万条, 逐条处理会把最热路径与日志双双淹掉。
+		// 见 graph_internal_bridge.go / graph_external_bridge.go。
+		//
+		// session 与 turn|tool 走同一支而不是单开一支: 图层对这三类的用法完全相同
+		// (按节点 × hook 名计数)。单开一支就要再写一份计数表与一个日志字段, 而
+		// "这个阶段一共被干预了多少次"就得靠调用方相加 —— 相加一定有人漏做。
 		h.noteInternalHook(ev)
 	}
-	// 恒放行。turn|tool 事件更是纯观测: 桥接方也已把决策丢弃 (双保险)。
+	// 恒放行。turn|tool|session 事件更是纯观测: 桥接方也已把决策丢弃 (双保险)。
 	return graph.HookDecision{}
 }
 
@@ -1396,6 +1416,11 @@ func (we *WorkflowExecutor) runGraphSpec(
 	ctx context.Context, wf *WorkflowDef, spec graph.GraphSpec, objective string,
 	team *ProductionTeam, newRunner func(graph.GraphSpec) graph.NodeRunner,
 ) ([]StageResult, error) {
+	// 图级 watchdog (design/01 §4.3): 默认关, 环境开启后才装进 Policies。
+	// 必须在 eng.Run (内部 Validate) 之前、且在三条 spec 来源 (模板/覆盖表/动态注册)
+	// 汇合之后 —— 这里正是那个汇合点。见 graph_watchdog.go。
+	applyGraphWatchdog(&spec)
+
 	// NewFileJournal 收目录名, 内部落 <dir>/journal.jsonl
 	journalDir := filepath.Join(team.dataDir, graphJournalDirName)
 	journal, err := graph.NewFileJournal(journalDir)
@@ -1423,6 +1448,10 @@ func (we *WorkflowExecutor) runGraphSpec(
 	// 挂在 ctx 上而不是各 runner 里 —— ctx 从这里一路流到 sessionAgentRunner →
 	// engine.Query → queryLoop 的 HookChain, 中间各层无需知情。
 	ctx = withInternalHookBridge(ctx, hooks, runID)
+	// design/01 §4.5 归宿表第 1 行: 外部 shell/HTTP/gRPC/OPA hook 的事件也进**同一条**
+	// 总线 (ExternalHook 适配器, 见 graph_external_bridge.go)。同一个 ctx 通道两个
+	// 观测者互不干扰: 各自用自己的 ctx 键。
+	ctx = withExternalHookBridge(ctx, hooks, runID)
 	// 灰度期要能一眼核对"图到底带了哪些能力": 节点数/并发/重试/门禁元数据全打出来。
 	defaultRetries := 0
 	if spec.Policies.DefaultRetry != nil {

@@ -277,13 +277,25 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 		jmu   sync.Mutex
 		jerrs []error
 	)
+	// 图级 watchdog 的进展时钟 (design/01 §4.3, watchdog.go)。
+	//
+	// **恒构造但只在声明了 watchdog 时才被读**: 一次 touch 是一把无竞争的 mutex
+	// 加一次赋值 (纳秒级), 而 journal 追加本身要做 JSON 编码 + 写盘 —— 为省这一下
+	// 给 appendEv 加一个 `if wd != nil` 分支只会多一条要一起维护的路径。
+	// 时钟起点取"运行开始", 而不是零值: 零值会让第一个巡检周期立刻判定停滞。
+	clock := newProgressClock(time.Now())
 	appendEv := evAppender(func(typ, nodeID string, data map[string]any) {
 		jmu.Lock()
 		defer jmu.Unlock()
-		err := journal.Append(Event{TS: time.Now().UnixMilli(), Type: typ, RunID: runID, NodeID: nodeID, Data: data})
+		now := time.Now()
+		err := journal.Append(Event{TS: now.UnixMilli(), Type: typ, RunID: runID, NodeID: nodeID, Data: data})
 		if err != nil {
 			jerrs = append(jerrs, fmt.Errorf("graph: journal 追加 %s(%s) 失败: %w", typ, nodeID, err))
 		}
+		// 刷新在 Append **之后**且不看 err: 图级停滞问的是"这张图还在推进吗",
+		// 而一次写盘失败恰恰说明引擎仍在活动 —— 只在成功时刷新会让"journal 写不进去"
+		// 被误报成"图卡住了", 把两个完全不同的故障混成一个告警。
+		clock.touch(now)
 	})
 
 	rc := &runCtx{
@@ -344,8 +356,31 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 	hooks.Emit(ctx, HookEvent{Scope: ScopeGraph, Phase: "pre", RunID: runID,
 		Payload: map[string]any{"graph": spec.Name, "nodes": len(spec.Nodes), "resume": opts.Resume}})
 
+	// —— 图级 watchdog (design/01 §4.3; Policies.Watchdog 为 nil 时不起 goroutine) ——
+	//
+	// 起在 run.created 之后: 时钟已被那条事件刷新过, 于是"第一个阈值窗口"从真正
+	// 开跑算起。ctx 派生一层是为了 action=fail 能走**引擎既有的取消路径**(语义 8)
+	// 而不必新造终态; 未声明 watchdog 时这一层派生根本不发生 —— 连一次
+	// context.WithCancel 的开销都没有。
+	stopWatchdog := func() {} // 未声明 watchdog 时是空操作
+	if wd := spec.Policies.Watchdog; wd != nil {
+		wdCtx, wdStop := context.WithCancel(ctx)
+		stopWatchdog = wdStop
+		var cancelRun func()
+		if wd.action() == WatchdogFail {
+			// **只有 fail 档**才把调度 ctx 换成 wdCtx。notify 档下调度用的仍是原 ctx,
+			// 于是"观测档绝不可能影响执行"这件事在**结构上**成立 —— 观测档的 watchdog
+			// 手里根本没有一个能影响调度的句柄, 不靠代码走查或注释约定。
+			ctx, cancelRun = wdCtx, wdStop
+		}
+		go runGraphWatchdog(wdCtx, wd, clock, runID, spec.Name, hooks, appendEv, cancelRun, time.Now)
+	}
+
 	// —— 2/3. ready-set 调度 ——
 	cancelled := e.scheduleDAG(ctx, rc, dr)
+	// 立刻停巡检, 不等 Run 返回: 否则下面的 run.finished 与 graph.stalled 有极小
+	// 概率交错追加, journal 里出现"跑完之后又停滞了"这种解释不通的序列。
+	stopWatchdog()
 
 	// —— 6. 汇总终态 (按运行图而非声明图: 展开产物也算) ——
 	nCompleted, nOther := 0, 0

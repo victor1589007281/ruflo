@@ -158,6 +158,14 @@ const watchdogCriticalThreshold = 15 * time.Minute
 // watchdogCheckInterval watchdog 巡检间隔
 const watchdogCheckInterval = 60 * time.Second
 
+// watchdogProgressStaleThreshold L2 进展检测阈值: 超过此时间 phase/iteration 不变
+// 即视为停滞。
+//
+// 原本是 teamWatchdog 内的局部变量。提成包级常量**不改任何数值**, 只是为了让
+// design/01 §4.3 图级 watchdog 的生产接线 (graph_watchdog.go) 能引用同一个数字 ——
+// 设计要求"参数沿用 coordinator.go", 而抄一份字面量就等于两处会各自漂移。
+const watchdogProgressStaleThreshold = 10 * time.Minute
+
 // TouchActivity 标记活动 (供 WorkflowExecutor 回调)
 func (c *Coordinator) TouchActivity() {
 	c.lastActivityMu.Lock()
@@ -256,8 +264,8 @@ func (c *Coordinator) teamWatchdog(ctx context.Context, team *ProductionTeam) {
 	var stagnantRounds int // 连续无进展轮数
 	var autoResumeAttempted bool
 
-	// 进展检测阈值: 超过此时间 phase/iteration 不变即视为停滞
-	progressStaleThreshold := 10 * time.Minute
+	// 进展检测阈值 (包级常量, 图级 watchdog 复用同一个数字, 见其定义处注释)
+	progressStaleThreshold := watchdogProgressStaleThreshold
 
 	for {
 		select {
