@@ -59,6 +59,49 @@ bad()  { echo "  ❌ $*"; FAILED=$((FAILED+1)); }
 FAILED=0
 PASSED=0
 
+# —— 硬断言: 跑的必须是本轮构建的二进制 ——
+# 唯一镜像标签已经让"复用旧 Pod"在结构上不可能, 但这条断言仍要有: 它是**直接观测**
+# (Pod 启动时刻 vs 本轮构建时刻), 与"我相信 apply 会触发滚动"这种推理无关。
+# 一次静默跑旧二进制的 E2E 会通过大半验收却什么都没证明 —— 那种失败方式必须被断言挡住,
+# 不能靠下一个人记得检查。
+# newest_pod <app 标签> —— 选**跑本轮镜像**且 Running 的最新 Pod。
+#
+# 为什么不能用 `-o jsonpath='{.items[0].metadata.name}'`（原写法, 已被真机咬过两次）:
+# 滚动更新期间 `get pod` 会同时列出**正在终止的旧 Pod**与新 Pod, 而 items[0] 的顺序
+# 由 API server 返回序决定 —— 实测取到的正是那个 18 小时前的旧 Pod。表现分两步:
+# 先是断言报"在验陈旧二进制", 紧接着旧 Pod 终止完成, 后面每一个 exec 都
+# `pods not found` —— 而 for 循环仍会照常等满 12 分钟。
+# 按"镜像 == 本轮标签"过滤 + 按 startTime 取最新, 从选择这一步就排除陈旧 Pod。
+newest_pod() {
+  local app=$1 i name
+  for i in $(seq 15); do
+    name=$(kubectl -n "$NS" get pod -l "app=$app" --field-selector=status.phase=Running \
+      -o go-template='{{range .items}}{{.status.startTime}} {{.metadata.name}} {{(index .spec.containers 0).image}}{{"\n"}}{{end}}' 2>/dev/null \
+      | awk -v img="$IMG" '$3==img' | sort -r | head -1 | awk '{print $2}')
+    [ -n "$name" ] && { echo "$name"; return 0; }
+    sleep 2
+  done
+  return 1
+}
+
+assert_fresh_pod() {
+  local pod=$1 what=$2
+  local st img
+  st=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.startTime}' 2>/dev/null)
+  img=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
+  local st_epoch
+  st_epoch=$(date -d "$st" +%s 2>/dev/null || echo 0)
+  if [ "$img" != "$IMG" ]; then
+    bad "$what 用的镜像是 $img，不是本轮的 $IMG —— 在验一个陈旧二进制"
+    return 1
+  fi
+  if [ "$st_epoch" -lt "$BUILD_EPOCH" ]; then
+    bad "$what 启动于 $st，早于本轮构建（$(date -d @"$BUILD_EPOCH" -u +%FT%TZ)）—— 在验一个陈旧二进制"
+    return 1
+  fi
+  ok "$what 跑的是本轮二进制（启动 $st / 镜像 $IMG）"
+}
+
 step "1/13 构建静态二进制"
 cd "$REPO" || exit 1
 CGO_ENABLED=0 go build -trimpath -o deploy/claude-go-linux ./cmd/claude-go || exit 1
@@ -117,32 +160,17 @@ sed -e "s|image: localhost:5000/claude-go:latest|image: $IMG|" \
     "$REPO/deploy/k8s/monolith.yaml" \
   | kubectl apply -f - >/dev/null
 kubectl -n "$NS" rollout status deploy/claude-go-monolith --timeout=180s || bad "单体 rollout 超时"
-POD=$(kubectl -n "$NS" get pod -l app=claude-go-monolith -o jsonpath='{.items[0].metadata.name}')
+POD=$(newest_pod claude-go-monolith)
 echo "  pod=$POD"
 
-# —— 硬断言: 跑的必须是本轮构建的二进制 ——
-# 唯一镜像标签已经让"复用旧 Pod"在结构上不可能, 但这条断言仍要有: 它是**直接观测**
-# (Pod 启动时刻 vs 本轮构建时刻), 与"我相信 apply 会触发滚动"这种推理无关。
-# 一次静默跑旧二进制的 E2E 会通过大半验收却什么都没证明 —— 那种失败方式必须被断言挡住,
-# 不能靠下一个人记得检查。
-assert_fresh_pod() {
-  local pod=$1 what=$2
-  local st img
-  st=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.startTime}' 2>/dev/null)
-  img=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
-  local st_epoch
-  st_epoch=$(date -d "$st" +%s 2>/dev/null || echo 0)
-  if [ "$img" != "$IMG" ]; then
-    bad "$what 用的镜像是 $img，不是本轮的 $IMG —— 在验一个陈旧二进制"
-    return 1
-  fi
-  if [ "$st_epoch" -lt "$BUILD_EPOCH" ]; then
-    bad "$what 启动于 $st，早于本轮构建（$(date -d @"$BUILD_EPOCH" -u +%FT%TZ)）—— 在验一个陈旧二进制"
-    return 1
-  fi
-  ok "$what 跑的是本轮二进制（启动 $st / 镜像 $IMG）"
-}
-assert_fresh_pod "$POD" "单体 Pod"
+# 单体 Pod 是后面 9 步的执行载体, 取不到/不新鲜就**立刻退出**而不是继续。
+# 继续的代价是具体的: 第 7 步与第 11 步各有一个 144×5s 的轮询循环, 会对着一个不存在的
+# Pod 各等满 12 分钟, 最后给出一堆 `pods not found` 与一个毫无意义的汇总。
+if [ -z "$POD" ]; then
+  bad "找不到跑本轮镜像（$IMG）的 Running 单体 Pod —— 放弃本轮（继续下去只会空等 24 分钟）"
+  echo; echo "  通过 $PASSED 项 / 未通过 $FAILED 项"; exit 1
+fi
+assert_fresh_pod "$POD" "单体 Pod" || { echo; echo "  通过 $PASSED 项 / 未通过 $FAILED 项"; exit 1; }
 
 step "5/13 验收①: ConfigMap 真被读取 + 真 key 生效"
 sleep 3
@@ -224,8 +252,8 @@ for d in claude-go-gateway claude-go-control claude-go-worker; do
   kubectl -n "$NS" rollout status "deploy/$d" --timeout=150s 2>/dev/null \
     && ok "$d Running" || bad "$d 未就绪"
 done
-GWPOD=$(kubectl -n "$NS" get pod -l app=claude-go-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-CTLPOD=$(kubectl -n "$NS" get pod -l app=claude-go-control -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+GWPOD=$(newest_pod claude-go-gateway)
+CTLPOD=$(newest_pod claude-go-control)
 # 这三个也要断言新鲜: **上一轮真机验证就是在这里被咬过** —— worker Deployment 是陈旧的
 # (还跑着旧回显桩、caps 为空), 而 rollout status 照常报成功。
 for p in "$GWPOD" "$CTLPOD"; do
@@ -235,7 +263,7 @@ done
 #   ① worker 上报 ws:pvc / wsvol:<卷名> 标签 (控制面靠它路由, 队列按标签过滤)
 #   ② 控制面日志声明了档位 (说明 --workspace-mode 真被读到)
 #   ③ 控制面与 worker 看到的 /workspace 是**同一份数据** (控制面写, worker 读)
-WPOD=$(kubectl -n "$NS" get pod -l app=claude-go-worker -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+WPOD=$(newest_pod claude-go-worker)
 [ -n "$WPOD" ] && assert_fresh_pod "$WPOD" "worker Pod $WPOD"
 if [ -n "$CTLPOD" ] && [ -n "$WPOD" ]; then
   kubectl -n "$NS" exec "$CTLPOD" -- curl -s localhost:18080/cluster/workers 2>/dev/null \
@@ -292,7 +320,7 @@ kubectl -n "$NS" set env deploy/claude-go-monolith \
   CLAUDE_GO_GRAPH_ENGINE=1 CLAUDE_GO_GRAPH_WATCHDOG=1 CLAUDE_GO_BOARD_WATCH=1 >/dev/null 2>&1
 kubectl -n "$NS" rollout status deploy/claude-go-monolith --timeout=180s >/dev/null 2>&1 \
   && ok "已切到图引擎灰度（GRAPH_ENGINE=1 + WATCHDOG=1 观测档 + BOARD_WATCH=1）" || bad "切灰度后 rollout 失败"
-GPOD=$(kubectl -n "$NS" get pod -l app=claude-go-monolith -o jsonpath='{.items[0].metadata.name}')
+GPOD=$(newest_pod claude-go-monolith)
 assert_fresh_pod "$GPOD" "图引擎 Pod"
 kubectl -n "$NS" exec "$GPOD" -- curl -s -X POST \
   localhost:18080/api/actions/team/create/$T_GRAPH -H 'Content-Type: application/json' \
@@ -363,7 +391,7 @@ else
 fi
 
 step "12/13 验收⑨: 本轮新能力真落盘（轨迹 kind / 拦截器链构成）"
-NS_POD=$(kubectl -n "$NS" get pod -l app=claude-go-monolith -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+NS_POD=$(newest_pod claude-go-monolith)
 if [ -n "${NS_POD:-}" ]; then
   echo "  — 轨迹 kind 分布（design/03 §4.1 应有 5-6 种，run 是本轮补的产生方）:"
   kubectl -n "$NS" exec "$NS_POD" -- sh -c 'cat /data/.claude-go/statestore/log/trace-*.jsonl 2>/dev/null' \
