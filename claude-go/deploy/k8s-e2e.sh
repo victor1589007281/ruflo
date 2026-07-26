@@ -425,6 +425,8 @@ else
 fi
 
 step "12/13 验收⑨: 本轮新能力真落盘（轨迹 kind / 拦截器链构成）"
+# mktemp 而非固定路径: 固定路径在同机并发跑两轮时会互相覆盖, 读到别人的数字。
+JOINF=$(mktemp); trap 'rm -f "$JOINF"' EXIT
 NS_POD=$(newest_pod claude-go-monolith)
 if [ -n "${NS_POD:-}" ]; then
   echo "  — 轨迹 kind 分布（design/03 §4.1 应有 5-6 种，run 是本轮补的产生方）:"
@@ -449,6 +451,63 @@ for l in sys.stdin:
 if not c: print('    (无奖励事件)')
 for k,v in sorted(c.items()): print('    %-20s %d'%(k,v))
 " 2>/dev/null || echo "    (取不到)"
+
+  # —— 四源按 run_id 真能对上账（design/03 §1.3）——
+  # 这一条是**跨 sink 的 join**，单测证不了: 每个 sink 的 run_id 都是各自代码路径独立
+  # 写出来的，只有真跑一轮、拿同一个 run_id 去四个文件里各捞一遍才知道它们是不是同一个值。
+  # 曾经的形态是"四处都有 run_id 字段、看着能 join，实际 team.jsonl 里装的是团队名"。
+  echo "  — 四源按 run_id 对账:"
+  kubectl -n "$NS" exec "$NS_POD" -- sh -c '
+    cat /data/.claude-go/metrics/llm.jsonl 2>/dev/null | sed "s/^/LLM /"
+    cat /data/.claude-go/metrics/team.jsonl 2>/dev/null | sed "s/^/TEAM /"
+    cat /data/.claude-go/evolution/rewards.jsonl 2>/dev/null | sed "s/^/RWD /"
+    ls /data/.claude-go/statestore/log/ 2>/dev/null | sed "s/^/SPAN /"' \
+    | python3 -c "
+import json,sys,collections,re
+runs=collections.defaultdict(set)      # run_id -> {源}
+teamfield=0; teamlabel=0; teamname_as_run=0; teamrows=0
+for line in sys.stdin:
+    tag,_,rest=line.partition(' ')
+    rest=rest.strip()
+    if tag=='SPAN':
+        m=re.match(r'trace-(.+)\.jsonl\$', rest)
+        if m: runs[m.group(1)].add('spans')
+        continue
+    try: d=json.loads(rest)
+    except Exception: continue
+    rid=d.get('run_id') or ''
+    if tag=='LLM' and rid: runs[rid].add('llm')
+    elif tag=='RWD' and rid: runs[rid].add('rewards')
+    elif tag=='TEAM':
+        teamrows+=1
+        if d.get('team'): teamfield+=1
+        if (d.get('labels') or {}).get('team') or (d.get('labels') or {}).get('run_id'): teamlabel+=1
+        if rid:
+            runs[rid].add('team')
+            if not rid.startswith('run-'): teamname_as_run+=1
+full=[r for r,s in runs.items() if {'llm','team','rewards','spans'} <= s]
+print('    RUNS_TOTAL=%d FULL4=%d TEAMROWS=%d TEAMFIELD=%d TEAMLABEL=%d BADRUN=%d'
+      % (len(runs), len(full), teamrows, teamfield, teamlabel, teamname_as_run))
+for r,s in sorted(runs.items())[:4]:
+    print('      %-46s %s' % (r, ','.join(sorted(s))))
+" 2>/dev/null > "$JOINF" || echo "    (取不到)"
+  cat "$JOINF" 2>/dev/null
+  JSTAT=$(grep -o 'RUNS_TOTAL=[0-9]* FULL4=[0-9]* TEAMROWS=[0-9]* TEAMFIELD=[0-9]* TEAMLABEL=[0-9]* BADRUN=[0-9]*' "$JOINF" 2>/dev/null)
+  eval "$(tr ' ' '\n' <<<"$JSTAT" | sed 's/^/J_/')" 2>/dev/null || true
+  # ① 至少一个 run_id 同时出现在四个源里 —— 这才叫"能对账"
+  [ "${J_FULL4:-0}" -gt 0 ] \
+    && ok "有 ${J_FULL4} 个 run_id 同时贯穿 llm/team/rewards/spans 四源（E0 验收项）" \
+    || bad "没有任何 run_id 同时出现在四个源里 —— 跨源对账仍是断的"
+  # ② team.jsonl 的 run_id 必须是真 RunID（run- 前缀），不能是团队名
+  [ "${J_BADRUN:-1}" -eq 0 ] \
+    && ok "team.jsonl 的 run_id 都是真 RunID（无团队名冒充）" \
+    || bad "team.jsonl 有 ${J_BADRUN} 行把团队名当 run_id —— 正是本轮修的缺陷"
+  # ③ 团队身份走独立字段，且**没有**溜进 labels（进 labels 会改 Prometheus 序列身份）
+  if [ "${J_TEAMROWS:-0}" -gt 0 ]; then
+    [ "${J_TEAMFIELD:-0}" -gt 0 ] && [ "${J_TEAMLABEL:-1}" -eq 0 ] \
+      && ok "团队身份走独立 team 字段（${J_TEAMFIELD}/${J_TEAMROWS} 行），未溜进 labels" \
+      || bad "团队身份缺失或溜进了 labels（team 字段 ${J_TEAMFIELD:-0} 行 / labels 命中 ${J_TEAMLABEL:-0} 行）"
+  fi
 fi
 
 step "13/13 验收⑩: 三种 runtime 与 cwd 档位声明（design/01 §4.9 / 02 §3.3）"
