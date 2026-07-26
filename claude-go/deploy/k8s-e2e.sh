@@ -21,10 +21,12 @@ NS=claude-go
 CLUSTER=${CLAUDE_GO_E2E_CLUSTER:-dbk8s-e2e}   # kind 集群名; 独立 namespace, 不碰其它项目
 IMG=claude-go:e2e
 step() { echo; echo "━━━ $* ━━━"; }
-TOTAL=11
-ok()   { echo "  ✅ $*"; }
-bad()  { echo "  ❌ $*"; FAILED=1; }
+ok()   { echo "  ✅ $*"; PASSED=$((PASSED+1)); }
+# FAILED 是**计数**不是布尔: 写成 FAILED=1 时结论行恒报"有 1 项未通过",
+# 三项全挂也只报 1 —— 一个把坏消息说小的汇总比没有汇总更危险。
+bad()  { echo "  ❌ $*"; FAILED=$((FAILED+1)); }
 FAILED=0
+PASSED=0
 
 step "1/13 构建静态二进制"
 cd "$REPO" || exit 1
@@ -278,6 +280,7 @@ case "${WCAPS:-}" in
 esac
 
 step "结论"
-[ "$FAILED" -eq 0 ] && echo "  全部验收通过" || echo "  有 $FAILED 项未通过（见上方 ❌）"
+echo "  通过 $PASSED 项 / 未通过 $FAILED 项"
+[ "$FAILED" -eq 0 ] && echo "  ✅ 全部验收通过" || echo "  ❌ 有 $FAILED 项未通过（见上方 ❌）"
 echo
 echo "清理: kubectl delete ns $NS"
