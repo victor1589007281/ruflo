@@ -266,10 +266,20 @@ done
 WPOD=$(newest_pod claude-go-worker)
 [ -n "$WPOD" ] && assert_fresh_pod "$WPOD" "worker Pod $WPOD"
 if [ -n "$CTLPOD" ] && [ -n "$WPOD" ]; then
-  kubectl -n "$NS" exec "$CTLPOD" -- curl -s localhost:18080/cluster/workers 2>/dev/null \
-    | grep -q 'wsvol:claude-go-teams' \
+  # ⚠️ 必须**等**注册: worker 是启动后才向控制面上报心跳的, 而 rollout status 一返回
+  # 就查等于在赌那几秒。实测 Pod 启动 06:46:54 而 first_seen 06:47:25 —— 差 31 秒,
+  # 于是这条断言**假红**报"档位路由没通电", 而 caps 里 ws:pvc / wsvol:claude-go-teams
+  # 一直都在。(上一轮真机把同样的红判成了"陈旧 Deployment", 现在有新鲜度断言兜底,
+  # 才看清真因是竞争。) 最终失败仍会报错, 只是不再把"还没到"当成"没通电"。
+  CAPOK=""
+  for i in $(seq 30); do
+    if kubectl -n "$NS" exec "$CTLPOD" -- curl -s localhost:18080/cluster/workers 2>/dev/null \
+        | grep -q 'wsvol:claude-go-teams'; then CAPOK=1; break; fi
+    sleep 5
+  done
+  [ -n "$CAPOK" ] \
     && ok "worker 上报 cwd 档位标签 (ws:pvc + wsvol:claude-go-teams)" \
-    || bad "worker 未上报档位标签 —— 档位路由没通电"
+    || bad "worker 未上报档位标签 —— 档位路由没通电（已等 150s）"
   kubectl -n "$NS" logs "$CTLPOD" --tail=400 2>/dev/null | grep -q 'cwd 档位=pvc' \
     && ok "控制面已按 pvc 档位派活" || bad "控制面未声明 cwd 档位"
   # ⚠️ 变量名**不能**叫 STAMP: 那是顶上那个"每轮唯一标签/团队名"用的全局量,
@@ -342,25 +352,32 @@ JRN=/data/.claude-go/teams/$T_GRAPH/graph-journal/journal.jsonl
 JL=$(kubectl -n "$NS" exec "$GPOD" -- sh -c "wc -l < $JRN 2>/dev/null")
 [ "${JL:-0}" -gt 0 ] && ok "graph-journal 行数 = $JL（图引擎真的跑了）" \
   || bad "无 graph-journal —— 图引擎未生效"
-# 拦截器链构成进了 run.created 的 Data
-IC=$(kubectl -n "$NS" exec "$GPOD" -- sh -c \
-  "grep -m1 run.created $JRN 2>/dev/null | python3 -c 'import json,sys;print(\",\".join(json.load(sys.stdin).get(\"data\",{}).get(\"interceptors\",[])))'" 2>/dev/null)
+# ⚠️ **JSON 解析一律在宿主做, 不在 Pod 里** —— 运行镜像里**没有 python3**
+# (实测 `command -v python3` → NO_PYTHON3)。此前这两处把 `python3 -c` 写在
+# `kubectl exec ... sh -c` 内部, 于是 Pod 里报 127, 外层 `2>/dev/null` 把报错吞掉,
+# 表现是 IC 恒空 ⇒ **`bad "run.created 无 interceptors"` 是假红**
+# (手工核对同一条 journal: interceptors=['budget'], 一直都在), 事件类型分布则恒
+# "(取不到)"。正确形态是把**原始行**从 Pod 里取出来, 管道交给宿主 python3。
+IC=$(kubectl -n "$NS" exec "$GPOD" -- sh -c "grep -m1 run.created $JRN 2>/dev/null" \
+  | python3 -c 'import json,sys
+try: print(",".join(json.load(sys.stdin).get("data",{}).get("interceptors",[])))
+except Exception: pass' 2>/dev/null)
 [ -n "${IC:-}" ] && ok "拦截器链已装: [$IC]" || bad "run.created 无 interceptors —— 生产仍是空链"
-# 预算台账真记账
-BC=$(kubectl -n "$NS" exec "$GPOD" -- sh -c "grep -c budget.consumed $JRN 2>/dev/null")
+# 预算台账真记账。`grep -c` 无命中时退出码为 1, `|| true` 免得脚本刷一行
+# "command terminated with exit code 1" —— 那行会被读成"这一步炸了", 而真实含义是"0 条"。
+BC=$(kubectl -n "$NS" exec "$GPOD" -- sh -c "grep -c budget.consumed $JRN 2>/dev/null || true")
 [ "${BC:-0}" -gt 0 ] && ok "budget.consumed 事件 = $BC 条（预算台账真通电）" \
   || bad "无 budget.consumed —— 预算拦截器未记账"
-# 事件类型盘点（本轮把事件从 8 种补到 17 种）
+# 事件类型盘点（本轮把事件从 8 种补到 20 种）
 echo "  — journal 事件类型分布:"
-kubectl -n "$NS" exec "$GPOD" -- sh -c \
-  "python3 -c \"
+kubectl -n "$NS" exec "$GPOD" -- sh -c "cat $JRN 2>/dev/null" | python3 -c "
 import json,collections,sys
 c=collections.Counter()
-for l in open('$JRN'):
+for l in sys.stdin:
     try: c[json.loads(l)['type']]+=1
     except Exception: pass
 for k,v in sorted(c.items()): print('    %-24s %d'%(k,v))
-\"" 2>/dev/null || echo "    (取不到)"
+" 2>/dev/null || echo "    (取不到)"
 
 # —— 本轮最后三项在真集群的验收（三项默认关，这里已显式开启两项）——
 # ① 黑板 Watch 生产订阅方: 收尾日志带 applied/board_drops 两个数。
@@ -418,14 +435,31 @@ for k,v in sorted(c.items()): print('    %-20s %d'%(k,v))
 fi
 
 step "13/13 验收⑩: 三种 runtime 与 cwd 档位声明（design/01 §4.9 / 02 §3.3）"
-kubectl -n "$NS" get pod -l app=claude-go-worker -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].command}{"\n"}{end}' 2>/dev/null | head -3
-WCAPS=$(kubectl -n "$NS" exec "$POD" -- curl -s localhost:18080/cluster/workers 2>/dev/null \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" | ".join("%s:%s"%(w.get("name"),",".join(w.get("caps") or [])) for w in (d.get("workers") or [])) or "(无 worker)")' 2>/dev/null)
-echo "  worker 能力标签: ${WCAPS:-取不到}"
-case "${WCAPS:-}" in
-  *ws:pvc*|*ws:git*) ok "worker 上报了 cwd 档位标签（跨机产码闭环的前提）" ;;
-  *) echo "  ⚠ worker 未上报 ws:* 档位标签（可能是陈旧 Deployment，见报告）" ;;
-esac
+# ⚠️ 问的必须是**控制面**而不是单体 Pod: worker 是向 --control 指的那个地址注册的
+# (claude-go-control), 单体 Pod 的 /cluster/workers 里永远是空的。此前这里用 $POD
+# (单体), 于是 WCAPS 恒空、只打一句"可能是陈旧 Deployment"的猜测 —— 一条问错了对象
+# 的检查, 给出的解释也就必然是错的。worker 启动参数从 Deployment 读 (args 才是
+# 真正传进去的档位声明; command 只有二进制路径)。
+kubectl -n "$NS" get deploy claude-go-worker \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null | tr ',' '\n' | tr -d '[]"' \
+  | grep -E 'workspace|cwd' | sed 's/^/    worker 启动参数: /' || true
+WCTL=${CTLPOD:-}
+if [ -z "$WCTL" ]; then WCTL=$(newest_pod claude-go-control); fi
+if [ -z "$WCTL" ]; then
+  bad "取不到控制面 Pod —— 无法核对 worker 档位标签"
+else
+  WCAPS=$(kubectl -n "$NS" exec "$WCTL" -- curl -s localhost:18080/cluster/workers 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(" | ".join("%s:%s"%(w.get("name"),",".join(w.get("caps") or [])) for w in (d.get("workers") or [])) or "(无 worker)")
+except Exception: print("")' 2>/dev/null)
+  echo "  worker 能力标签: ${WCAPS:-取不到}"
+  case "${WCAPS:-}" in
+    *ws:pvc*|*ws:git*) ok "worker 上报了 cwd 档位标签（跨机产码闭环的前提）" ;;
+    *) bad "worker 未上报 ws:* 档位标签 —— 跨机产码闭环的前提不成立" ;;
+  esac
+fi
 
 step "结论"
 echo "  通过 $PASSED 项 / 未通过 $FAILED 项"
