@@ -31,6 +31,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -55,23 +56,25 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	var (
-		control     string
-		name        string
-		configPath  string
-		cwd         string
-		workspace   string
-		wsMode      string
-		wsVolume    string
-		extraCaps   []string
-		noBash      bool
-		browserCap  bool
-		gpuCap      bool
-		k8sCap      bool
-		maxParallel int
-		pollMS      int
-		heartbeatS  int
-		keepaliveS  int
-		token       string
+		control       string
+		name          string
+		configPath    string
+		cwd           string
+		workspace     string
+		wsMode        string
+		wsVolume      string
+		extraCaps     []string
+		noBash        bool
+		browserCap    bool
+		gpuCap        bool
+		k8sCap        bool
+		maxParallel   int
+		pollMS        int
+		heartbeatS    int
+		keepaliveS    int
+		token         string
+		claim         string
+		claimTimeoutS int
 	)
 	cmd := &cobra.Command{
 		Use:   "claude-go-worker",
@@ -212,6 +215,11 @@ func rootCmd() *cobra.Command {
 				cancel()
 			}()
 
+			if strings.TrimSpace(claim) != "" {
+				return runClaim(ctx, w, strings.TrimSpace(claim), time.Duration(claimTimeoutS)*time.Second,
+					time.Duration(pollMS)*time.Millisecond)
+			}
+
 			err = w.Run(ctx)
 			done, failed := w.Stats()
 			fmt.Printf("[worker] 退出: 完成 %d, 失败 %d\n", done, failed)
@@ -239,7 +247,51 @@ func rootCmd() *cobra.Command {
 	f.IntVar(&heartbeatS, "heartbeat-sec", 30, "心跳间隔 (秒); 必须显著小于控制面注册表租约")
 	f.IntVar(&keepaliveS, "keepalive-sec", 15, "事件冲刷/续租/取消检查间隔 (秒)")
 	f.StringVar(&token, "token", "", "控制面 Bearer token (默认取环境变量 CLAUDE_GO_API_TOKEN; 控制面设了 wiki.apiSecret 时必需)")
+	f.StringVar(&claim, "claim", "", "一次性模式: 只认领指定 task id 并在执行完后退出 (k8s-job runtime 下发的 Job 用)")
+	f.IntVar(&claimTimeoutS, "claim-timeout-sec", 300, "一次性模式: 等待该任务出现的上限秒数; 超时退出非零 (让 Job 判失败)")
 	return cmd
+}
+
+// runClaim 一次性认领模式 (k8s-job runtime 起的 Job 走这条路)。
+//
+// 三条与常驻模式不同的语义, 每条都影响控制面能不能看见失败:
+//
+//  1. **退出码 = 认领与回报是否发生**, 不是任务成功与否。任务的成败经队列回报
+//     (终态只认队列, 见 pkg/worker 文件头); 用退出码表达它会变成第二个真源。
+//     所以: 拉到并跑完 → 0 (哪怕 Agent 失败了); 没拉到 / 拉到别人的 → 非 0。
+//  2. **认领不到必须超时退出非零**。若一直挂着, Job 永远不终结, 控制面的监视器
+//     只能等 activeDeadlineSeconds —— 那可能是一小时。
+//  3. **拉到非指派任务立刻退出**, 不重试: 那是 worker 名撞车 (部署级错误), 重试
+//     只会把别人的任务也搅坏。
+func runClaim(ctx context.Context, w *worker.Worker, taskID string, timeout, poll time.Duration) error {
+	if poll <= 0 {
+		poll = 500 * time.Millisecond
+	}
+	fmt.Printf("[worker] 一次性模式: 只认领任务 %s (最长等 %s)\n", taskID, timeout)
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := w.ClaimOnce(ctx, taskID)
+		if ok {
+			done, failed := w.Stats()
+			fmt.Printf("[worker] 任务 %s 已执行并回报 (完成 %d, 失败 %d), 退出\n", taskID, done, failed)
+			return nil
+		}
+		if err != nil {
+			if errors.Is(err, worker.ErrTaskNotAssigned) {
+				return err // 部署级错误, 不重试
+			}
+			// 控制面还没起来 / 网络抖动: 在超时窗口内继续试。
+			fmt.Printf("[worker] 认领 %s 暂未成功: %v\n", taskID, err)
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("认领 %s 期间收到停止信号: %w", taskID, ctx.Err())
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("等待 %s 仍未认领到任务 %s: 控制面没有把它派给本 worker "+
+				"(名字不符/能力标签不匹配/任务已被判失败)", timeout, taskID)
+		}
+		time.Sleep(poll)
+	}
 }
 
 func defaultWorkerName() string {

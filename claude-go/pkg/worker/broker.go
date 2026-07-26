@@ -291,6 +291,12 @@ func (b *Broker) Sync(reg agent.RuntimeRegistry, lease time.Duration) ([]string,
 		if strings.TrimSpace(w.Name) == "" || !acceptsStage(w.Kinds) {
 			continue
 		}
+		if isEphemeral(w.Caps) {
+			// 一次性 worker (k8s-job 起的那种) 不是常驻算力: 它只认领控制面钉给它的
+			// 那一条任务, 跑完就随 pod 一起消失。把它注册成可被 Pick 选中的 runtime,
+			// 会让别的节点被派过去然后一直 pending 到宽限期结束才失败。
+			continue
+		}
 		name := RuntimeName(w.Name)
 		caps := RuntimeCapsFromLabels(w.Caps)
 		sig := capsSignature(w.Caps)
@@ -365,6 +371,16 @@ func acceptsStage(kinds []string) bool {
 	return false
 }
 
+// isEphemeral worker 是否自称一次性 (见 CapEphemeral)。
+func isEphemeral(caps []string) bool {
+	for _, c := range caps {
+		if strings.EqualFold(strings.TrimSpace(c), CapEphemeral) {
+			return true
+		}
+	}
+	return false
+}
+
 func capsSignature(caps []string) string {
 	s := append([]string(nil), caps...)
 	sort.Strings(s)
@@ -408,9 +424,34 @@ type remoteRuntime struct {
 	name   string // runtime 名 (放置策略里的身份)
 	worker string // cluster worker 名 (钉住标签用)
 
+	// workerFor 由任务 ID 推导钉住的 worker 名 (nil = 用固定的 r.worker)。
+	// k8s-job runtime 用它: 那里的 worker 是**现造**的一次性身份, 而 taskID 要到
+	// Execute 内部才生成, 于是两者必须由同一个函数推导 (见 k8sjob.go)。
+	workerFor func(taskID string) string
+	// launch 入队成功之后、开始等待之前的钩子 (nil = 没有额外动作)。
+	//
+	// 远程 runtime 的通用形状是"入队 + 等人来拉"; k8s-job 只是在入队之后多做一件事
+	// —— 把那个拉取者 (一个跑 claude-go-worker 的 Job) 也创建出来。返回的监视器
+	// 会被交给 watch, 让它能看见"Job 起不来"这类队列侧完全看不见的失败。
+	// 返回错误 ⇒ Execute **同步**报错 (调用方立刻失败, 而不是拿到一个永远不出事件
+	// 的通道)。
+	launch func(ctx context.Context, taskID string) (taskSupervisor, error)
+
 	mu       sync.Mutex
 	caps     agent.RuntimeCaps
 	inflight map[string]string // "runID/nodeID" → taskID
+}
+
+// taskSupervisor 一次执行的**执行者侧**监视器 (队列看不见的那一半)。
+//
+// 队列只知道"任务还没人拉"; 它不知道那个本该来拉的东西是不是压根没起来。
+// k8s-job 的实现就在看这个: 镜像拉不到 / PVC 挂不上 / 配置错 / 被 OOMKill。
+type taskSupervisor interface {
+	// check 控制面每个轮询周期调用一次 (任务尚未终态时)。
+	// 返回非 nil ⇒ 立刻判该节点失败, 错误原文带回调用方。
+	check() error
+	// cleanup watch 结束时调用一次 (成功/失败/取消都会走到)。
+	cleanup()
 }
 
 func (r *remoteRuntime) Name() string { return r.name }
@@ -448,7 +489,12 @@ func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 		return nil, fmt.Errorf("%s: 工作区声明求解失败: %w", r.name, err)
 	}
 
-	require := MergeCaps(PlacementCaps(task.Placement), []string{WorkerCap(r.worker)}, r.b.ws.RequireCaps())
+	// 钉住哪个 worker: 固定身份 (常驻 worker) 或由任务 ID 现推 (k8s-job 的一次性 worker)。
+	pinned := r.worker
+	if r.workerFor != nil {
+		pinned = r.workerFor(taskID)
+	}
+	require := MergeCaps(PlacementCaps(task.Placement), []string{WorkerCap(pinned)}, r.b.ws.RequireCaps())
 	st := StageTask{
 		RunID: task.RunID, NodeID: task.NodeID, Role: task.Role,
 		SystemPrompt: task.SystemPrompt, UserPrompt: task.UserPrompt,
@@ -491,8 +537,26 @@ func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 	r.inflight[key] = taskID
 	r.mu.Unlock()
 
+	// 执行者侧的准备 (k8s-job: 创建那个 Job)。失败必须**同步**报错。
+	// 注意: 队列里那条任务此时已经存在, 而它钉住的 worker 永远不会出现 —— 它是一条
+	// 谁也拉不走的死记录。对正确性无害 (没人能执行它), 但确实是垃圾; 彻底清掉要给
+	// Queue 加一个控制面侧的作废接口 (pkg/cluster 改动), 本轮未做。
+	var sup taskSupervisor
+	if r.launch != nil {
+		s, lerr := r.launch(ctx, taskID)
+		if lerr != nil {
+			r.b.unsubscribe(taskID)
+			r.b.cleanupHandshake(wsReq, taskID)
+			r.mu.Lock()
+			delete(r.inflight, key)
+			r.mu.Unlock()
+			return nil, fmt.Errorf("%s: %w", r.name, lerr)
+		}
+		sup = s
+	}
+
 	out := make(chan agent.NodeEvent, 16)
-	go r.watch(ctx, taskID, key, task, wsReq, sub, out)
+	go r.watch(ctx, taskID, key, pinned, task, wsReq, sub, sup, out)
 	return out, nil
 }
 
@@ -517,11 +581,19 @@ func (r *remoteRuntime) Cancel(runID, nodeID string) error {
 func inflightKey(runID, nodeID string) string { return runID + "/" + nodeID }
 
 // watch 把队列状态 + 事件流归约成一条事件流, 结束时关闭 out。
-func (r *remoteRuntime) watch(ctx context.Context, taskID, key string, task agent.RuntimeNodeTask,
-	wsReq *workspaceRequest, sub *subscription, out chan agent.NodeEvent) {
+//
+// pinned 为本任务钉住的 worker 名 (掉线判定用); sup 可空 (k8s-job 才有, 见
+// taskSupervisor)。
+func (r *remoteRuntime) watch(ctx context.Context, taskID, key, pinned string, task agent.RuntimeNodeTask,
+	wsReq *workspaceRequest, sub *subscription, sup taskSupervisor, out chan agent.NodeEvent) {
 
 	defer close(out)
 	defer r.b.unsubscribe(taskID)
+	// 执行者侧收尾 (k8s-job: 删 Job / 还并发名额)。放在最外层 defer:
+	// 无论走哪条返回路径都必须还回去, 漏一次就永久少一个名额。
+	if sup != nil {
+		defer sup.cleanup()
+	}
 	// 握手文件是 per-task 的, 任务一结束就清掉 (共享卷上不留垃圾)。
 	defer r.b.cleanupHandshake(wsReq, taskID)
 	defer func() {
@@ -551,6 +623,19 @@ func (r *remoteRuntime) watch(ctx context.Context, taskID, key string, task agen
 			}
 			break
 		}
+		// 先试非阻塞送: out 有缓冲, 正常情况下这一步就成了。
+		//
+		// ⚠️ 必须先试这一下。若直接写 `select { case out<-ev; case <-ctx.Done() }`,
+		// 在**调用方已取消**的情况下两个分支同时就绪, Go 随机挑一个 —— 终态就有一半
+		// 概率被丢掉, 而丢掉终态正是 CollectRuntimeOutput 读成"空产出 + nil 错误"
+		// = 静默成功的那条路。"因取消而失败"与"静默成功"是两件完全不同的事,
+		// 不能靠掷骰子决定。
+		select {
+		case out <- ev:
+			return
+		default:
+		}
+		// 缓冲真的满了才阻塞等 (调用方连 ctx 都取消了就放弃)。
 		select {
 		case out <- ev:
 		case <-ctx.Done():
@@ -612,19 +697,38 @@ func (r *remoteRuntime) watch(ctx context.Context, taskID, key string, task agen
 				failed("%s: %s", r.name, msg)
 				return
 			case "pending":
+				// 有监视器时 (k8s-job): 用它取代"worker 掉线"判定。
+				// 理由是归因: 一次性 worker 本来就还没出现在注册表里, 拿常驻 worker
+				// 那套去判会得到"worker 已掉线"——对着一个从来没起来过的 Job 说它掉线
+				// 是误导, 而真原因 (ImagePullBackOff / PVC 挂不上) 监视器看得见。
+				if sup != nil {
+					if err := sup.check(); err != nil {
+						failed("%s: %v", r.name, err)
+						return
+					}
+					break
+				}
 				// fail-closed 规则 3: 钉住的 worker 掉线且宽限期已过 → 无人可拉。
 				// 先看等待时长再查注册表: 查注册表要扫一遍 KV 桶, 不该每个轮询周期都做。
 				if time.Since(pendingSince) <= r.b.deadWorkerGrace {
 					break
 				}
-				if since := r.b.workerAbsentSince(r.worker); !since.IsZero() &&
+				if since := r.b.workerAbsentSince(pinned); !since.IsZero() &&
 					time.Since(maxTime(since, pendingSince)) > r.b.deadWorkerGrace {
 					failed("%s: worker %s 已掉线, 任务 %s 无人可拉 (等待 %s)",
-						r.name, r.worker, taskID, time.Since(pendingSince).Round(time.Second))
+						r.name, pinned, taskID, time.Since(pendingSince).Round(time.Second))
 					return
 				}
 			case "leased":
 				pendingSince = time.Now() // 已被拉走: 掉线判定交给队列租约
+				// 已经在跑了也要看一眼执行者: 队列租约默认 5min, 而 pod 被 OOMKilled
+				// 是立刻可见的。不看就要白等一个租约周期。
+				if sup != nil {
+					if err := sup.check(); err != nil {
+						failed("%s: %v", r.name, err)
+						return
+					}
+				}
 			}
 		}
 	}

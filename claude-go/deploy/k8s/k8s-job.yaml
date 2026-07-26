@@ -1,0 +1,156 @@
+# k8s-job runtime 叠加层 (design/01 §4.9 三个内置 runtime 的最后一个)。
+#
+#   kubectl apply -f deploy/k8s/distributed.yaml     # 先: 网关/控制面/常驻 worker
+#   kubectl apply -f deploy/k8s/k8s-job.yaml         # 后: 给控制面加 RBAC 并开 k8s-job
+#
+# 它做三件事: ① 给控制面一个能建 Job 的 ServiceAccount; ② 把控制面换成带 kubectl 的
+# 镜像 (deploy/Dockerfile.k8sjob); ③ 用环境变量打开 k8s-job runtime 并声明 Job 长什么样。
+# **刻意与 distributed.yaml 分开**: 不叠加这一层时那份清单一字不变, 默认行为不变
+# (Deployment 同名, apply 本文件即就地替换控制面)。
+#
+# # 与常驻 worker 的分工 (这一层不是用来取代 distributed.yaml 里那两个 worker 的)
+#
+# 常驻 worker 是热池: 进程常驻, 派任务到开跑是毫秒级 —— 稳态阶段继续用它。
+# k8s-job 补的是热池给不了的三件事:
+#   ① 按节点弹性: 副本数是写死的数字, Job 是按需创建的 (map 扇出 20 个分片就起
+#      20 个 pod, 跑完即消失, 空闲期零占用);
+#   ② 特殊能力池不必常驻: 需要 GPU/浏览器的节点靠 nodeSelector + 镜像 + 资源限额
+#      按需拿, 不必长期挂着一个 GPU pod;
+#   ③ 任务级隔离: 一个节点一个新 pod, 内存/CPU 由 kubelet 真强制; git 档下常驻
+#      worker 被迫 MaxParallel=1 (只有一个检出目录), 而每个 Job 自带一个。
+# 代价是每个节点多一次调度+进程启动 (十几秒起)。**只跑稳态串行阶段的部署不需要它。**
+#
+# 生效方式: 控制面 --placement-prefer remote:k8s-job (下面已设)。改回
+# remote:<worker 名> 或 local 就切回常驻 worker / 本机执行, 无需删本清单。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: claude-go-control
+  namespace: claude-go
+---
+# 权限**只给到刚好够用**: 建/查/删自己创建的 Job, 以及读 pod 状态 (失败归因要看
+# ImagePullBackOff / OOMKilled 这些只有 pod 才有的原因)。
+# 不给 exec/logs/secret 读取 —— 控制面不需要, 给了就是横向移动面。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: claude-go-jobrunner
+  namespace: claude-go
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: claude-go-jobrunner
+  namespace: claude-go
+subjects:
+  - kind: ServiceAccount
+    name: claude-go-control
+    namespace: claude-go
+roleRef:
+  kind: Role
+  name: claude-go-jobrunner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-control
+  namespace: claude-go
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: claude-go-control }
+  template:
+    metadata:
+      labels: { app: claude-go-control }
+    spec:
+      serviceAccountName: claude-go-control
+      containers:
+        - name: control
+          # 带 kubectl 的控制面镜像 (deploy/Dockerfile.k8sjob)。用基础镜像会在启动
+          # 探活时被显式拒绝: "跑不动 kubectl"。
+          image: localhost:5000/claude-go-k8sjob:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "serve"
+            - "--addr"
+            - "0.0.0.0:18080"
+            - "--dispatch-mode"
+            - "queue"
+            - "--cwd"
+            - "/workspace"
+            - "--workspace-mode"
+            - "pvc"
+            - "--workspace-volume"
+            - "claude-go-teams"
+            # 把阶段派给 k8s-job (软偏好: 它挂了仍会落回本地/常驻 worker)。
+            - "--placement-prefer"
+            - "remote:k8s-job"
+          env:
+            - name: CLAUDE_GO_LLM_GATEWAY
+              value: "http://claude-go-gateway:18081"
+            - name: KIMI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+            # ── k8s-job runtime ──────────────────────────────────────────────
+            - name: CLAUDE_GO_K8SJOB
+              value: "1"
+            # Job 里的 worker 靠它回连拉取任务。**没有默认值**: 猜错的后果是每个
+            # Job 都起来然后连不上, 白烧一轮调度。
+            - name: CLAUDE_GO_K8SJOB_CONTROL
+              value: "http://claude-go-control:18080"
+            - name: CLAUDE_GO_K8SJOB_NAMESPACE
+              value: "claude-go"
+            # 跑 claude-go-worker 的镜像。**用基础镜像即可** —— Job 里的 worker
+            # 不需要 kubectl (它不建 Job, 只干活)。
+            - name: CLAUDE_GO_K8SJOB_IMAGE
+              value: "localhost:5000/claude-go:latest"
+            - name: CLAUDE_GO_K8SJOB_PULL_POLICY
+              value: "IfNotPresent"
+            # pvc 档: Job 必须挂与控制面同一个 RWX 卷到同一路径, 否则远程产码
+            # 对 <team.Cwd>/go.mod 上的编译门禁不可见 (design/02 §3.3 风险④)。
+            - name: CLAUDE_GO_K8SJOB_PVC
+              value: "claude-go-teams"
+            - name: CLAUDE_GO_K8SJOB_MOUNT_PATH
+              value: "/workspace"
+            - name: CLAUDE_GO_K8SJOB_CONFIGMAP
+              value: "claude-go-config"
+            # LLM 凭据走 Secret 引用而不是明文 Env: 明文会出现在
+            # `kubectl get job -o yaml` 里, 谁能看 Job 谁就拿到了 key。
+            - name: CLAUDE_GO_K8SJOB_ENV_SECRET
+              value: "KIMI_API_KEY=claude-go-llm/kimi-api-key"
+            - name: CLAUDE_GO_K8SJOB_ENV
+              value: "CLAUDE_GO_LLM_GATEWAY=http://claude-go-gateway:18081"
+            # 同时在飞的 Job 上限。不设上限时一次大扇出会把集群其它工作负载挤掉。
+            - name: CLAUDE_GO_K8SJOB_MAX_PARALLEL
+              value: "4"
+            # Job 硬超时: 编码类节点动辄十几分钟, 给足; 真正的节点超时由图层管,
+            # 这里只兜"pod 卡住永不终结"。
+            - name: CLAUDE_GO_K8SJOB_DEADLINE_SEC
+              value: "1800"
+            # 已终结 Job 的保留时长 (留够 kubectl logs 看崩溃现场)。
+            - name: CLAUDE_GO_K8SJOB_TTL_SEC
+              value: "900"
+          ports: [{ containerPort: 18080 }]
+          readinessProbe:
+            httpGet: { path: /api/health, port: 18080 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: config, mountPath: /etc/claude-go }
+            - { name: teams, mountPath: /workspace }
+      volumes:
+        - name: state
+          emptyDir: {}
+        - name: config
+          configMap: { name: claude-go-config }
+        - name: teams
+          persistentVolumeClaim: { claimName: claude-go-teams }

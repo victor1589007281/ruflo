@@ -1361,6 +1361,22 @@ JSON 配置文件示例:
 							wsPolicy.GitRemote, wsPolicy.GitBranch)
 					}
 				}
+				// k8s-job runtime (design/01 §4.9 三个内置 runtime 的最后一个):
+				// 一个图节点一个一次性 K8s Job, 见 pkg/worker/k8sjob.go。
+				// **默认关**: 只有 CLAUDE_GO_K8SJOB=1 才装配, 未启用时一切照旧。
+				if worker.K8SJobEnabled() {
+					jobRT, jErr := workerBroker.K8SJobRuntime(worker.K8SJobOptionsFromEnv())
+					if jErr != nil {
+						// 探活不通就**拒绝启动**而不是跳过: 悄悄跳过会让声明了
+						// remote:k8s-job 的部署以为自己在用它、实际全落回本地 ——
+						// 那是"配置写了但没生效"这类最难发现的问题。
+						return fmt.Errorf("装配 k8s-job runtime 失败: %w", jErr)
+					}
+					runtimeReg.Register(jobRT, 0) // 它不靠心跳存活, 租约=永不过期
+					fmt.Printf("[Cluster] k8s-job runtime 已注册 (caps=%+v); "+
+						"用 --placement-prefer remote:%s 把阶段派给它\n",
+						jobRT.Capabilities(), worker.K8SJobRuntimeName)
+				}
 			}
 
 			fmt.Println("========================================")
@@ -3048,7 +3064,10 @@ func buildEngine() (*engine.QueryEngine, error) {
 	runAgent = func(ctx context.Context, prompt string, opts agent.RunOptions) (string, error) {
 		return runNestedAgent(ctx, deps, runAgent, prompt, opts)
 	}
-	reg.Register(agent.NewAgentTool(runAgent))
+	// 图外派生可见性 (design/01 §4.8): TraceStore 在下面才构造得出来 (要先算 stateDir),
+	// 故留引用, 见 `agentTool.SetTraceStore(ts)`。
+	agentTool := agent.NewAgentTool(runAgent)
+	reg.Register(agentTool)
 
 	// Advisor 顾问工具 (设计文档 docs/advisor-tool-design.md)
 	// 别名优先级: --advisor flag > config advisor 段; "--advisor off" 强制关闭。
@@ -3114,6 +3133,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 	ss := statestore.NewFileStore(filepath.Join(stateDir, "statestore"))
 	ts := tracestore.New(ss)
 	eng.TraceStore = ts
+	// 图外派生 (Agent 工具 → runNestedAgent 的裸 QueryEngine) 的可见性两件套
+	// (design/01 §4.8): ① 派生本身写 subagent Span; ② 子代理引擎自己的 llm_call
+	// Span —— 改造前 nested 引擎的 TraceStore 恒 nil, 子代理烧的 token 在轨迹上无痕。
+	agentTool.SetTraceStore(ts)
+	deps.traceStore = ts
 	if ttl := tracestore.TTLFromEnv(); ttl > 0 {
 		// 每小时扫一次足够: trace 文件按 run 落, 清理粒度是"整个文件过期"。
 		tracestore.StartJanitor(context.Background(), filepath.Join(stateDir, "statestore", "log"), ttl, time.Hour)
@@ -3387,6 +3411,9 @@ type engineDeps struct {
 	promptMgr   *prompt.Manager
 	mcpConns    []*mcp.Connection
 	skillReg    *skills.Registry
+	// traceStore 供嵌套子代理引擎共用同一份轨迹底座 (design/01 §4.8)。
+	// 在 deps 构造之后才被赋值 (TraceStore 要先算出 stateDir), 故可为 nil。
+	traceStore *tracestore.Store
 }
 
 func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
@@ -3421,7 +3448,10 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 	if deps.skillReg != nil && deps.skillReg.Count() > 0 {
 		nestedReg.Register(skills.NewSkillTool(deps.skillReg))
 	}
-	nestedReg.Register(agent.NewAgentTool(runAgent))
+	// 子代理自己也带轨迹底座: 本条路径**给子代理又注册了一次 Agent 工具**(飞书那条
+	// 不注册), 递归可以很深。这里若用裸 NewAgentTool, 第 2 层及以下的派生就再次不可见,
+	// 而恰恰是深层递归最需要被看见。
+	nestedReg.Register(agent.NewAgentToolWithTrace(runAgent, deps.traceStore))
 
 	nestedCfg := *deps.cfg
 	if opts.Model != "" {
@@ -3442,6 +3472,7 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 	nestedPromptMgr.Model = nestedCfg.Model
 	nestedPromptMgr.SkillListing = deps.promptMgr.SkillListing
 	nested := engine.NewQueryEngine(&nestedCfg, deps.apiClient, nestedReg, deps.hookRunner, perm, deps.compactor, nestedPromptMgr)
+	nested.TraceStore = deps.traceStore // design/01 §4.8: 子代理的 llm_call 轨迹, 改造前恒缺席
 
 	var sb strings.Builder
 	for msg := range nested.SubmitMessage(ctx, agentPrompt) {

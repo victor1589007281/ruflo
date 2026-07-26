@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,6 +45,10 @@ const (
 	DefaultReportRetries    = 3                // 终态回报的重试次数 (丢一次成功结果代价很高)
 	DefaultEventBatchMaxLen = 32
 )
+
+// ErrTaskNotAssigned 一次性 worker 拉到了不属于自己的任务 (见 ClaimOnce)。
+// 这是**不可重试**的部署级错误 (worker 名撞车), 调用方应立刻退出而不是继续轮询。
+var ErrTaskNotAssigned = errors.New("worker: 拉到了非指派任务")
 
 // Options worker 构造参数。
 type Options struct {
@@ -247,6 +252,38 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	if task == nil {
 		return false, nil
+	}
+	w.execute(ctx, task)
+	return true, nil
+}
+
+// ClaimOnce 认领并执行**指定的那一条**任务 (k8s-job 的一次性 worker 用)。
+//
+// 返回 (true, nil) = 已执行 (成功与否经队列回报, 不看返回值);
+// (false, nil) = 队列里暂时还没有它, 调用方该再试一次。
+//
+// 与 RunOnce 的区别只有一处但是全部意义所在: 它**校验拉到的就是派给自己的那一条**。
+// 为什么要校验 —— 一次性 worker 的身份 (worker:<name>) 是控制面现造的, 正常情况下
+// 队列里只有那一条任务能匹配它; 但若出现同名残留 (例如上一轮 Job 的 pod 还没死透),
+// 这个 worker 就会替别人跑一个不该它跑的活, 而它自己那条任务永远没人认领 ——
+// 症状是"某个节点一直卡着直到超时", 归因极难。宁可显式失败。
+func (w *Worker) ClaimOnce(ctx context.Context, taskID string) (bool, error) {
+	if err := w.cli.heartbeat(w.caps, w.kinds); err != nil {
+		return false, err
+	}
+	task, err := w.cli.pull(w.kinds, w.caps)
+	if err != nil {
+		return false, err
+	}
+	if task == nil {
+		return false, nil
+	}
+	if want := strings.TrimSpace(taskID); want != "" && task.ID != want {
+		// 不执行, 并立刻把它交回去: 拿着不放才是最坏的 (那条任务会一直 leased 到
+		// 租约过期)。回报失败让图层立刻重派, 而不是白等一个租约周期。
+		w.reportFail(task.ID, fmt.Sprintf("一次性 worker %s 只认领任务 %s, 却拉到了 %s; 拒绝执行",
+			w.opt.Name, want, task.ID))
+		return false, fmt.Errorf("%w: 拉到了 %s (期望 %s)", ErrTaskNotAssigned, task.ID, want)
 	}
 	w.execute(ctx, task)
 	return true, nil

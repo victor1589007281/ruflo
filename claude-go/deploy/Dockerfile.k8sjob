@@ -1,0 +1,20 @@
+# 控制面镜像的 k8s-job 变体 (design/01 §4.9 的 k8s-job runtime)。
+#
+# 为什么要单独一个镜像: k8s-job runtime 经 `kubectl` 下发 Job (与
+# pkg/sandbox/k8s_runner.go 同一条通路 —— 仓里零 K8s SDK 依赖, 引入 client-go 会
+# 为了一个 runtime 拖进上百个间接依赖)。**只有控制面需要它**, worker 与网关不需要,
+# 所以不往基础镜像里塞 57MB 的 kubectl。
+#
+# 约定与基础镜像一致: 二进制在宿主机准备, 镜像只做打包。
+#   docker build -t claude-go:e2e            -f deploy/Dockerfile        deploy/
+#   cp "$(command -v kubectl)" deploy/kubectl-linux
+#   docker build -t claude-go-k8sjob:e2e --build-arg BASE=claude-go:e2e \
+#                -f deploy/Dockerfile.k8sjob deploy/
+#
+# 不装 kubectl 的后果是**显式的**: k8s-job runtime 在启动探活时就会拒绝装配并说清
+# 原因 (见 jobRuntime.probe), 而不是等到第一个节点被派过来才失败。
+ARG BASE=localhost:5000/claude-go:latest
+FROM ${BASE}
+
+COPY kubectl-linux /usr/local/bin/kubectl
+RUN chmod +x /usr/local/bin/kubectl && kubectl version --client=true >/dev/null
