@@ -497,9 +497,17 @@ mode 消失，成为**内置图模板库**（`pkg/graph/templates/`，纯 JSON �
 
 ---
 
-## 六、现有功能覆盖矩阵（编排域）　　**[🟠 26 行真覆盖 1 行]**
+## 六、现有功能覆盖矩阵（编排域）　　**[🟠 26 行里 20 行已落地 · 3 行 🟡 建成未通电 · 3 行 ❌]**
 
-> **实测**：⚠️ **本矩阵是计划表，不是状态表**。逐行核实后：真覆盖 1 行（#17 AllowedTools 收敛）+ 5 个半行 + 4 行只有字段无消费 ⇒ ≈17%。特别注意 #5「重启恢复」仍是强制置 failed（`pkg/agent/teams.go:1902-1904`）、#9 门禁仍按工作流名白名单（`pkg/agent/teams.go:757`）。
+> **重算（2026-07-25，逐行核实源码；这一节此前是"计划表冒充状态表"，真覆盖只有 1 行）**：
+>
+> **已落地并通电（20 行）**——各带生产实现点：静态/动态工作流直译（`graph_templates.go` 三表，9/15 走图）· 检查点恢复与 refine 增量重跑（`InvalidateFrom` 事件式失效 + `clearRunProgress` 单一清空口，**修掉了"换目标重跑吃旧产出"的 P0**）· 重启恢复（journal 重放）· 重试退避与限流慢退（判据收敛到 `isRateLimitErrText` 一处 + 图层 AIMD 背压）· 门禁元数据驱动（`WorkflowGateMetaByName`，弃工作流名白名单）· 内容质量门 · 黑板五类与交接 · Mailbox（`TeamMailbox`）· 三套 hook 降两套且注册进同一总线（`internalHookBridge`）· AllowedTools 双路径 · 工具 profile（`ProfileNarrows` 特权位偏序，弃子串匹配）· subagent 编排层可见（`observeSubagent`）· 异步 run 与 :7777 队列**真被消费**（`actionSinkOwns` 让队列独占）· 并发启动去重（幂等键）· 进化/记忆挂点 headless 同构 · K8s Job 执行（`pkg/worker/k8sjob.go`，真机含故障注入）· swarm_intel 五阶段（`plotSwarmNodeRunner` 收编）· 动态展开单调收窄（`narrowToParent`）· 六个运行级拦截器（`runBuiltinPhases`）· 团队状态机。
+>
+> **🟡 建成未通电（3 行）**：**黑板 `Watch`**——实现与语义齐（缓冲 64/非阻塞派发/`WatchDrops`），但**生产零订阅方**（`grep '\.Watch('` 非测试文件 0 命中），dashboard SSE 与飞书进度播报仍走轮询回填 · **`GoalTree`**——有三处生产构造但零消费方，归宿是被 `ExpandSpec` 吸收后连持久化一起删 · **比例灰度 `shadow_ratio`**——只落实验 JSON，运行期无消费方（本仓灰度是二值的）。
+>
+> **❌ 未落地（3 行）**：双层 watchdog 的**图级停滞检测**（节点级心跳有，图级"journal 尾部 N 分钟无事件即停滞"缺）· 角色差异化超时的**节点级天花板**已有但 `Suspended` 态下的语义未定 · `team.json` 投影化（M4 唯一缺项）。
+>
+> 原始诊断保留作对照：⚠️ **本矩阵是计划表，不是状态表**。逐行核实后：真覆盖 1 行（#17 AllowedTools 收敛）+ 5 个半行 + 4 行只有字段无消费 ⇒ ≈17%。特别注意 #5「重启恢复」仍是强制置 failed（`pkg/agent/teams.go:1902-1904`）、#9 门禁仍按工作流名白名单（`pkg/agent/teams.go:757`）。
 
 | 现有功能 | 位置 | 新架构归属 | 状态 |
 |---|---|---|---|
