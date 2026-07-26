@@ -403,3 +403,76 @@ fail-closed 的守护改成 fail-open。有专门测试钉住。
   第 12 步盘点轨迹 kind 与奖励源分布、第 13 步查 worker 能力标签——前者是本轮两次
   误判的直接解药，后者曾抓出集群里跑的是**陈旧的** worker Deployment（旧回显桩、
   caps 为空）。
+
+---
+
+## 2026-07-26 K8s 真实 LLM E2E：**33 项全通**（跑了五轮，前四轮都是脚本自己的问题）
+
+**最终验收（第五轮，单轮内全绿，`deploy/k8s-e2e.sh` 13 步 / 33 条断言）**：
+
+| 验收面 | 实测证据 |
+|---|---|
+| 构建新鲜度 | 单体/网关/控制面/worker/图引擎**五个 Pod** 全部通过硬断言（启动晚于本轮构建 + 镜像等于本轮唯一标签 `claude-go:e2e-1785050310`） |
+| 真 key 生效 | `apiKey 取自环境变量 KIMI_API_KEY`；ConfigMap 里故意留占位符，未落占位分支 |
+| 真实 LLM（默认路径） | 团队 `completed`；**该团队无 `graph-journal`** ⇒ 确实走 pipeline 而非图引擎（这一条是第五轮才真正成立的，见下） |
+| 真实 LLM（图引擎） | 团队 `completed`；graph-journal 26 行；拦截器链 `[budget]`；`budget.consumed` 6 条 |
+| 跨源可对账 | 同一 `run_id` 贯穿 **llm.jsonl / trace-<run_id>.jsonl（66 spans）/ rewards.jsonl** —— design/03 §1.3 E0 验收项「llm.jsonl 可按 run_id 聚合」真达成 |
+| 轨迹 kind | 7 种全有产生方：gate 2 / llm_call 17 / node 6 / policy_decision 7 / run 1 / tool_call 13 / turn 8 —— **此前被我按常量名 grep 误判为"零产生方"的 `turn`/`tool_call` 都在** |
+| 奖励源 | 本工作流触发 3 源（episode / gate.content / verdict.heuristic）；8 源是全集，这条工作流只该触发这 3 个 |
+| 网关真在链路上 | `access.jsonl` 15 行 |
+| cwd 三档位 | 两个 worker 均上报 `ws:pvc` + `wsvol:claude-go-teams`；控制面按 pvc 派活；控制面写 / worker 读同一份 `/workspace` |
+| 本轮最后三项 | 黑板 Watch **applied=13 board_drops=0**（订阅方真跑过）· 图级 watchdog **未误报停滞** · 未配 hook 时**零 `ext:` 事件**（零成本那一半；"配了能看见"那一半由 `graph_external_bridge_test.go` 的 `want="AutoCompact=1,ToolGate=2,ext:PreToolUse=2,ext:SubagentStart=1"` 钉住） |
+
+最后一步本该是"部署 + 跑一遍"，结果连跑五轮才拿到一个可信的绿。**前四轮暴露的全是
+验收脚本自己的缺陷，产品侧一次都没红。** 这件事本身是本轮最值得记的一课。
+
+### 第四类假测试：**验的不是被测物**
+
+此前记的三类是「许诺式（断言恒真）/ 非幂等（第二次跑变红）/ 非密闭（组件活到测试
+边界之外）」。这一轮撞出第四类，且它比前三类更危险：
+
+> **断言写得好好的、也会如实红绿，但它指着的不是你刚构建的那个东西。**
+> 于是绿不说明对，红也不说明错——两个方向的结论同时失效。
+
+五轮里它出现了三种形态：
+
+| 形态 | 具体 | 后果 |
+|---|---|---|
+| 验了**陈旧构建** | 镜像标签固定为 `claude-go:e2e` ⇒ 重建后 Deployment spec 一字未变 ⇒ `kubectl apply` 空操作 ⇒ `rollout status` 对着**上一轮的旧 Pod** 报成功。实测 Pod startTime 07-25T11:40Z vs 镜像 Created 07-26T06:24Z，**差 18.8 小时** | 整轮验一个 18 小时前的二进制，而验收照常一条条打勾。**一次"通过了却什么都没证明"的 E2E 比失败危险得多** |
+| 选**错了对象** | ① `items[0]` 在滚动期取到**正在终止**的旧 Pod，随后每个 exec 都 `pods not found`，而两个 144×5s 轮询仍各等满 12 分钟 ② 第 13 步向**单体** Pod 问 `/cluster/workers`，而 worker 是向控制面注册的，那里永远是空 | ①把自己等死 ②WCAPS 恒空，只能打一句"可能是陈旧 Deployment"的**猜测** |
+| 看**错了窗口** | `--tail=200` 要找的启动首行早被 345 行日志挤出窗口 | 一条**假红**；紧邻那条在同一错误窗口上做**否定**断言（"没有 placeholder 字样"），于是**恒真**——退化成许诺式 |
+
+**一个假红会引来一个假解释，然后被写进报告。** 第 9 步"worker 未上报档位标签"这条红，
+上一轮真机被我判成"陈旧 Deployment"——听起来完全合理。这一轮加了新鲜度硬断言（worker
+Pod 已确认跑本轮二进制）之后才看清真因：worker 启动 06:46:54、first_seen 06:47:25，
+**差 31 秒**，caps 一直都在，是检查没等注册。
+
+### 跨轮状态泄漏：非密闭的集群版
+
+第四轮 32/0 全绿，但绿得有一处名不副实，是从一个细节看出来的：第 11 步打印的
+"图引擎 Pod 启动 07:03:00"与第 4 步单体 Pod 的 startTime **一模一样**。
+
+根因是 `kubectl apply` 的三方合并语义：对 last-applied 里没有、yaml 里也没有的字段
+（正是上一轮 `kubectl set env` 加的 `CLAUDE_GO_GRAPH_ENGINE` 等）**一律保留**。于是
+上一轮的灰度开关活到了这一轮——第 7 步注释写着"pipeline 默认路径"而实际跑的是图引擎，
+第 11 步的 `set env` 则变成空操作。两条新鲜度断言都照常 ✅，因为它们回答不了
+"这个 Pod 的开关是什么状态"。**载体从进程内的后台 goroutine 换成集群里的 Deployment，
+但这就是非密闭。** 修法：第 4 步显式 `set env ...-` 摘掉开关并**自证**（查 env 名单，
+仍在就报错）。
+
+### 加固后的四道闸（都在 `deploy/k8s-e2e.sh` 里）
+
+1. **镜像标签每轮唯一** ⇒ spec 必变 ⇒ 新 ReplicaSet ⇒ 跑的一定是刚构建的二进制；
+   附带清理往轮镜像（只匹配 `claude-go:e2e-<数字>`，绝不碰同集群其它项目）。
+2. **`assert_fresh_pod` 硬断言**：Pod 启动时刻必须晚于本轮构建、镜像必须等于本轮标签。
+   对单体/网关/控制面/worker/图引擎五个 Pod 全部施加。它是**直接观测**，不依赖
+   "我相信 apply 会触发滚动"这种推理——而它一上线就立刻抓出了背后的选 Pod 缺陷。
+3. **`newest_pod`**：按"镜像 == 本轮标签 + Running + startTime 最新"选，从选择这一步
+   排除陈旧/终止中的 Pod；取不到就**立刻退出**，不再空等 24 分钟。
+4. **否定断言先自证窗口有效**；等待型状态给等待循环（worker 注册 30×5s）。
+
+另外：`FAILED` 从布尔改成计数（原先三项全挂也只报"有 1 项未通过"——一个把坏消息说小
+的汇总比没有汇总更危险）；团队名每轮唯一（同名团队在 PVC 上持久，复用会撞"已存在"，
+更糟的是 run 走 resume 可能**一次 LLM 都不调**就返回上一轮产出，"真实 LLM 端到端"
+退化成读缓存）；JSON 解析一律在宿主做（**运行镜像里没有 python3**，写在 `exec sh -c`
+里报 127 被 `2>/dev/null` 吞掉 ⇒ 断言恒空 ⇒ 假红）。
