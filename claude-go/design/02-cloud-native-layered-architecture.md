@@ -35,7 +35,15 @@
 - **层间耦合四种形态**：直接函数调用（主）、进程级全局单例（`dynmcp.Manager`、`llmGlobal` 指标、observability bus）、文件系统约定（`~/.claude-go/` 目录树，`basedir.go:15`）、同进程惰性回调（dashboard→Bot 的 `TeamAction/LLMComplete/ReloadSkills/CronController`，`main.go:1091-1127`——唯一被显式设计成可分离的接缝）。
 - **对外只有一个端口 :18080**：wiki API + dashboard 挂同一 mux（`wiki/api.go:66`、`dashboard/server.go:129`）；飞书经 WebSocket 长连接收消息（`bot.go:674,854`）。
 
-### 1.2 单机假设清单（分布式障碍，19 条）　　**[🟠 0 条完全兑现 / 5 条部分 / 14 条原样]**
+### 1.2 单机假设清单（分布式障碍，19 条）　　**[🟠 8 条已破除 / 6 条部分 / 5 条原样]**
+
+> **重算（2026-07-25，逐条核实源码）**：旧数字「0 条完全兑现」是改造前的诊断。
+>
+> **已破除（8 条）**：状态外置（`pkg/statestore/sqlitestore.go` sqlite 后端）· 执行体跨机（`pkg/worker/` 真 worker + `remoteRuntime`）· 共享工作区（cwd 三档位 local/pvc/git，pvc 有双向握手、git 有 ff-only 合入，**跨机产码真机 `go build` PASS**）· 跨进程任务队列（`pkg/cluster` + 租约 + 认领原子性靠 `os.Rename`）· 任务派发不再进程内（k8s-job runtime 按节点起 Job）· LLM 出口集中（网关 9 处生产依赖）· 轨迹归因跨进程（trace 四元组落请求头 → `access.jsonl`）· 动作队列跨进程消费（`ConsumeActions` + 主进程注册消费方）。
+>
+> **部分（6 条）**：事件总线——`ChanBus` 是**进程内**且满即丢，只通了 1 条链路（LLM 事件 → 飞书播报），其余订阅者不迁是因为"接了会降级"而非没来得及 · 团队 cwd 仍**进程级共享**一份（`teams.go:609`，并发产码团队互相污染，git 档下表现为控制面 cwd 在两条分支间来回 checkout）· 会话仍单进程（无一致性哈希）· `FileStore` 锁 per-instance、跨进程无锁（只有动作认领是原子的）· cron 仍单副本（worker 进程显式关掉它以免重复触发）· 技能/配置仍读磁盘目录（R2 的 SkillStore 入库未做）。
+>
+> **原样（5 条）**：NATS/redis+pg 后端 · 会话一致性哈希 · `team.json` 投影化 · RL logprob 采集（**刻意不做**：经网关拿不到）· 比例灰度（本仓灰度是二值的）。
 
 > **实测**：逐条核实（详见 `PROGRESS.md` 的 19 条表）：已部分整改的是 #1 会话（新增 KV 快照但无 owner 路由）、#7 cron（租约真在 tick 路径但**仅当 `CLAUDE_GO_CRON_LEASE_DIR` 非空**，且漏了 `pkg/sync` 第二个进程内调度器）、#11/#12 监听地址（新增 `wiki.apiHost` 但**默认值为空 = 绑 0.0.0.0**）、#14/#15 边缘。其余 14 条原样，包括 #3 输入历史、#4 配置层级、#5 stateDir（27 处直接 `basedir.` 调用横跨 5 文件）、#6 skill 目录、#8 心跳、#13 指标、#16-#19。
 
