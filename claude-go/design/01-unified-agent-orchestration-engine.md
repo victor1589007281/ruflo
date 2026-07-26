@@ -221,6 +221,14 @@ type GraphRun struct {
 - **重试单层化**：重试只存在于节点 RetryPolicy（引擎执行），瞬态错误判定与限流慢退（base 15s/cap 120s，`coordinator.go:551-576`）收编为内置 RetryClassifier。QueryEngine 内层不再自带无界重试环（`workflow.go:885` 废除）。
 - **watchdog**：图级（进展检测：Journal 尾部 N 分钟无事件即停滞）+ 节点级（activity 心跳）两层，参数沿用 `coordinator.go:155-161`；停滞动作=发 hook 事件+按策略 retry/fail/notify，收编 `orchestrator.go:4055-4083` 的独立实现。
 
+> ✅ **图级那层已落地（2026-07-25）**：`pkg/graph/watchdog.go` + 生产接线 `pkg/agent/graph_watchdog.go`（9 测试 + 2 变异反证）。节点级那层本就有（`teamGraphHooks.touch` → `activityCallback`/`progressCallback` → Coordinator L1/L2）。四点值得记：
+>
+> - **默认关，且"关"是连 goroutine 都不起**（`Policies.Watchdog` 为 nil ⇒ 零 ticker、零 `context.WithCancel`）。开启后**缺省动作也只是 notify**。理由不是保守：本仓真实负载上整本小说起草、大仓索引、单章开发几十分钟不产出中间事件是**正常**的（journal 事件粒度是节点不是 turn），一个默认开启并自动判失败的 watchdog 会杀掉合法长阶段，而 8+ 下游平台在用 :18080。干预要显式 `action:"fail"`（环境变量也只认精确字面量 `=fail`，`=1` 拿不到）。
+> - **"观测档不可能干预"是结构性的**：只有 fail 档才把调度 ctx 换成 watchdog 的可取消 ctx（`engine.go:376` 附近），notify 档的 watchdog 手里根本没有能影响调度的句柄——不靠注释约定或代码走查。
+> - **不按字面去 `ReadAll()` 重读 journal 尾部**：`appendEv` 是全引擎唯一 journal 写入口，在它里面记时间戳即可。等价性成立因为没有任何路径绕过它（`InvalidateFrom` 是运行**之外**由平台调的，那时 watchdog 早停了）。刷新刻意**不看 Append 的 err**——写盘失败恰恰说明引擎仍在活动，只在成功时刷新会把"journal 写不进去"误报成"图卡住了"。
+> - **三档只做 notify|fail，`retry` 在 Validate 里显式拒**：卡住的节点此刻正在 runner 里跑（goroutine 活着、可能还持着并发票），硬重试的结果是同一个节点两份 goroutine 写同一个 `NodeResult`。静默退档等于让声明它的人以为策略生效（本仓修过的一类缺陷），所以报错而不是降级。另：`fail` 走引擎**既有**的 ctx 取消路径（语义 8 → `failed`），不新造 `stalled` 终态——新终态要让 8+ 下游平台的 status 分支各长一个 case，漏一个就是静默丢状态。
+> - 阈值**沿用 coordinator.go 既有数字**（10min 停滞 / 60s 巡检，即 L2 那两个；L1 的 5/15min 量的是 activity 心跳，节点级那层已在用）。为此把 `teamWatchdog` 内的局部变量提成包级常量 `watchdogProgressStaleThreshold`，**数值一字未改**——抄一份字面量就等于两处各自漂移。
+
 ### 4.4 Loop：节点级与组级循环　　**[✅ 节点级 · 组级 · 可插拔终止器（默认关）]**
 
 > ✅ **可插拔终止器已落地（2026-07-25）**：`pkg/graph/terminator.go`，内置 `adaptive` 表达 AdaptiveTerminator 的五路信号（加权分达标 / 最小轮数 / 轮次耗尽 / 连续退化 / 策略转换 / 收敛）。设计上四点值得记：
@@ -245,13 +253,22 @@ type LoopPolicy struct {
 
 覆盖：adversarial `Rounds`、content gate 重做环（`teams.go` 内容质量环）、novel-v3 章节循环、refine 多轮、evaluator-optimizer 模式。`loop-group` 容器把"生成→评审"两节点整体循环，即对抗模式的标准化表达。
 
-### 4.5 Hook 总线：三套合一　　**[🟠 三套已降为两套 / 两者注册进同一总线待续]**
+### 4.5 Hook 总线：三套合一　　**[✅ 三套降两套 · 两者均已注册进同一总线]**
 
 > **实测**：`HookBus` 骨架存在（`pkg/graph/hooks.go:16-51`，仅 graph/node scope、仅 deny 被解释），✅ **HookBus 已通电（2026-07-25）**：`teamGraphHooks` 把节点 pre → `TaskRunning` 占位 + `team.Stages` 增量刷盘 + 心跳，post/failure → 终态 StageResult + 刷盘 + 阶段指标（4 个 label 与 `recordStageMetrics` 完全一致，既有 dashboard 不受影响）。**绝不返回 deny**——灰度期观测桥不该新增阻塞路径。这同时补上了此前"图路径无 stage 级增量刷盘与指标、灰度打开后 dashboard 看不到进度"的缺口。三套原物全在：`pkg/hooks/`、`pkg/engine/internal_hook/`（22 文件）、`pkg/orchestrator/hooks.go:20`。
 >
 > ⚠️ **一处此前标注偏保守，已核实更正**：读者容易从"三套并存"推断出「外部 hook 在图模式下不生效」——**不是这样**。逐跳核实过调用链：图路径 `stageNodeRunner.RunNode`（`graph_adapter.go:748`）→ `ExecuteSingleStage` → `we.factory`（`workflow.go:1591`），而生产 factory 就是 `SessionManager.CreateAgentRunner`（`feishu/session.go:1030`，见 `feishu/worker_runtime.go:17`），它造出的 `sessionAgentRunner.Execute` 会触发 `ExecuteSubagentStartHooks`/`ExecuteSubagentStopHooks`（`session.go:1137`/`:1263`）。**所以用户配置的 shell/HTTP/gRPC/OPA hook 在图模式下照样触发**，因为它们挂在 runner 内部而图引擎调的就是这个 runner。
 >
 > ✅ **三套已降两套（2026-07-25）**：`orchestrator.LifecycleHook` 那套（ExpanderHook/MetricsHook/心跳/ObservabilityBridge）随包删除，被 `graph|node` 作用域的 `teamGraphHooks` 取代。剩 `pkg/hooks`（外部 shell/HTTP/gRPC/OPA）与 `pkg/engine/internal_hook`（每 turn 触发、性能敏感）——设计里这两套本就该**各留原位、注册进同一总线**而不是合成一份，所以剩下的是"注册进同一总线"这一步。
+>
+> ✅ **`ExternalHook` 适配器已落地（2026-07-25，归宿表第 1 行）**：`pkg/hooks/bus.go` + 桥接 `pkg/agent/graph_external_bridge.go`（12 测试 + 5 变异反证）。与 `internal_hook` 那条桥**完全同构**，所以补的是**可见性**不是"让外部 hook 生效"（后者本就生效，见上一条）：改造前一个节点里的 agent 被用户 PreToolUse hook 拦掉 5 次工具调用、SubagentStart hook 报错 3 次，图层看到的只有该节点的最终产出。
+>
+> - **决策只作为载荷**：外部 hook 的 deny/block/approve 执行路径**一行没动**（仍在 `hooks.go` 各调用方手里），图层只看见 `Payload["decision"]`。非阻塞是**类型层面**的（`hooks.Observer.Observe` 无返回值），桥接方再把 `bus.Emit` 的决策显式丢弃——双保险。
+> - **Phase 用事件名原文，不压成 `pre|post|failure`**：压了会让 PreTurn/PreCompact/PreRequest 全塌成 `turn|pre`，消费方只能去载荷里反查。与 `HookEvent.Phase` 已有口径一致。
+> - **不复用 `internal_hook` 那一个通道**：混在一起后"这次工具调用是内置 ToolGate 拦的还是用户策略拦的"就分不出来了（处置完全不同）。靠 `Payload["source"]` + hook 名 `ext:` 前缀区分，于是同一份节点摘要里能读到 `AutoCompact=3,ToolGate=1,ext:PreToolUse=5`——内置与用户策略的干预并列可比。
+> - **零成本**：`findHooks` 为空即不发事件 ⇒ 没配外部 hook 的部署一条事件都没有、日志逐字节不变。观测者走 ctx 而非 Runner 长期字段（`NewRunnerWithContext`），因为生产那个 Runner 是 per-Execute 构造的（`feishu/session.go:1166`），per-run 天然成立、并发团队不串台。
+> - ⚠️ **`TeammateIdle`/`TaskCompleted` 映射写了但无产生方**：它们由 `ProductionTeamManager` 那个**长期复用**的 Runner 触发，长期实例不能带 per-run ctx（会串台）。已在 `ScopeOf` 注释里标明。
+> - `graph.ScopeSession` 常量此前刻意不存在（"没有产生方就不加"），现按当初写下的条件补上。
 
 ```go
 // pkg/graph/hooks.go —— 统一事件模型，双维度：作用域 × 相位
@@ -433,9 +450,23 @@ type CallInterceptor interface { Around(ctx context.Context, c LLMCall, next Cal
 
 拦截器配置在图级 Policies 或全局 settings，顺序确定、可开关——第三方横切逻辑（如 aiops 平台的权限桥）也从此注入而非改主流程。
 
-### 4.11 通信机制抽象　　**[✅ 接口 · Watch · 双黑板已归一]**
+### 4.11 通信机制抽象　　**[✅ 接口 · Watch（含生产订阅方）· 双黑板已归一]**
 
 > ✅ **双黑板已归一（2026-07-25）**：`pkg/orchestrator` 整包退役（23 文件 / 6879 行），那份黑板与跨黑板手工同步一并消失，`Watch` 语义保住在 `pkg/agent` 那份。⚠️ `BoardFuncs` 原本的存在理由（零依赖适配 `orchestrator.Blackboard`）随之消失；保留它是为 design/02 的分布式后端接入点，注释已改写说明新理由。
+>
+> ✅ **`Watch` 有了生产订阅方（2026-07-25）**：`pkg/agent/blackboard_watch.go`（6 测试 + 3 变异反证），接线点 `teams.go:805`（`executeWorkflow`——唯一"团队+Coordinator 都装配好、且无论走 pipeline/图/专用模式都会经过"的位置）。设计原文的两个候选逐个核实：
+>
+> | 候选 | 结论 |
+> |---|---|
+> | dashboard SSE | ❌ **接不上**。`pkg/dashboard.Provider` 是纯磁盘实现（全是 `pathIn` + `os.ReadFile`），连 `*ProductionTeam` 都拿不到，更拿不到进程内 `*Blackboard`。要接得把团队管理器引用注进一个只读观测面——属 M4 接线。 |
+> | 飞书进度播报 | ✅ **接上了**。团队执行与 `notify` 同在 `ProductionTeamManager`，拿 `team.Blackboard` 是本地字段访问。 |
+>
+> 所以本轮只接了**一个**订阅方，且默认关（`CLAUDE_GO_BOARD_WATCH`）。它取代的是 `Coordinator.heartbeatLoop` 每 30 秒 → `updateHeartbeat` → 落盘这条**轮询**（一个 8 秒跑完的阶段在 team.json 上可能一次都没出现过），改成每个阶段一落 `<stage>-status` 就推。⚠️ 是**叠加**不是真取代：30 秒轮询照旧在跑，删它是行为变更。
+>
+> - **默认关的三个理由都不是保守**：① 改写盘频率（`persist()` 从 30 秒一次变每阶段一次，有下游按 team.json mtime 判活）；② 会改 `Progress.Phase` 的词表（Coordinator 给的是执行相位 `"LLM生成"`，黑板 key 给的是阶段名）；③ 关时**连 `Watch` 都不调** ⇒ `bb.watchers` 恒空 ⇒ `notifyLocked` 第一行返回 ⇒ 黑板写入路径上一次 select 都不做，逐字节等价于改造前。
+> - **fail-closed 守住了（红线）**：订阅方**绝不**调 `coord.ReportProgress`——那会把 L2 停滞判据的输入换成阶段名并不断刷新 `UpdatedAt`，于是一个在同一阶段空转 40 分钟的团队**永远不被判停滞**（fail-closed → fail-open）。有专门测试钉住。它只在 Coordinator 尚无 Phase 可报时用阶段名补位。
+> - **不订阅精确前缀而是订阅全部再按 category 过滤**：阶段名在 key 开头、`-status` 在结尾，精确前缀表达不了"任意阶段的 status"；而 `category == "progress"` 正是 pipeline / 图路径 / novel-v2/v3 三条产生方**共用**的分类，一处过滤覆盖全部路径。
+> - **顺带修掉一个 v13 缺陷（比原注释写的更严重）**：`POST /api/teams/:name/blackboard` 把动作排进 :7777 队列，但消费方 `Bot.DashboardTeamAction` 的 switch 里**没有 `blackboard.write` 这一支** ⇒ 落 default 报"未知操作" ⇒ 该接口只改了磁盘文件，而内存黑板下一次 debounce **全量覆盖刷盘会把刚写进去的条目静默抹掉**，调用方拿到的是 200 OK。补了 `case` + `ProductionTeamManager.WriteTeamBlackboard`（走 `Blackboard.Write` ⇒ markDirty + 派发 Watch）。团队不在本进程内时**报错而不是退回改磁盘**——退回磁盘正是那个静默丢数据的形态。
 > **实测**：`pkg/graph/blackboard.go` 不存在。~~双黑板并存~~（`pkg/orchestrator/blackboard.go` 已随包删除，跨黑板手工同步随之消失）。**设计要「新增」的 `Watch` 只存在于那份要被删的实现里**（`pkg/orchestrator/blackboard.go:210`）。Mailbox 仍是裸 slice。
 
 ```go
@@ -497,15 +528,17 @@ mode 消失，成为**内置图模板库**（`pkg/graph/templates/`，纯 JSON �
 
 ---
 
-## 六、现有功能覆盖矩阵（编排域）　　**[🟠 26 行里 20 行已落地 · 3 行 🟡 建成未通电 · 3 行 ❌]**
+## 六、现有功能覆盖矩阵（编排域）　　**[🟠 26 行里 22 行已落地 · 2 行 🟡 建成未通电 · 2 行 ❌]**
 
 > **重算（2026-07-25，逐行核实源码；这一节此前是"计划表冒充状态表"，真覆盖只有 1 行）**：
 >
-> **已落地并通电（20 行）**——各带生产实现点：静态/动态工作流直译（`graph_templates.go` 三表，9/15 走图）· 检查点恢复与 refine 增量重跑（`InvalidateFrom` 事件式失效 + `clearRunProgress` 单一清空口，**修掉了"换目标重跑吃旧产出"的 P0**）· 重启恢复（journal 重放）· 重试退避与限流慢退（判据收敛到 `isRateLimitErrText` 一处 + 图层 AIMD 背压）· 门禁元数据驱动（`WorkflowGateMetaByName`，弃工作流名白名单）· 内容质量门 · 黑板五类与交接 · Mailbox（`TeamMailbox`）· 三套 hook 降两套且注册进同一总线（`internalHookBridge`）· AllowedTools 双路径 · 工具 profile（`ProfileNarrows` 特权位偏序，弃子串匹配）· subagent 编排层可见（`observeSubagent`）· 异步 run 与 :7777 队列**真被消费**（`actionSinkOwns` 让队列独占）· 并发启动去重（幂等键）· 进化/记忆挂点 headless 同构 · K8s Job 执行（`pkg/worker/k8sjob.go`，真机含故障注入）· swarm_intel 五阶段（`plotSwarmNodeRunner` 收编）· 动态展开单调收窄（`narrowToParent`）· 六个运行级拦截器（`runBuiltinPhases`）· 团队状态机。
+> **已落地并通电（22 行）**——各带生产实现点：**图级停滞检测**（`pkg/graph/watchdog.go`，默认关、缺省只观测，与节点级心跳合成设计要的双层）· **黑板 `Watch` 有了生产订阅方**（`blackboard_watch.go` 订阅 `Watch("")` 按 `progress` 分类过滤，默认关；顺带修掉 v13 那个 200 OK 却静默丢数据的缺陷）· 静态/动态工作流直译（`graph_templates.go` 三表，9/15 走图）· 检查点恢复与 refine 增量重跑（`InvalidateFrom` 事件式失效 + `clearRunProgress` 单一清空口，**修掉了"换目标重跑吃旧产出"的 P0**）· 重启恢复（journal 重放）· 重试退避与限流慢退（判据收敛到 `isRateLimitErrText` 一处 + 图层 AIMD 背压）· 门禁元数据驱动（`WorkflowGateMetaByName`，弃工作流名白名单）· 内容质量门 · 黑板五类与交接 · Mailbox（`TeamMailbox`）· 三套 hook 降两套且注册进同一总线（`internalHookBridge`）· AllowedTools 双路径 · 工具 profile（`ProfileNarrows` 特权位偏序，弃子串匹配）· subagent 编排层可见（`observeSubagent`）· 异步 run 与 :7777 队列**真被消费**（`actionSinkOwns` 让队列独占）· 并发启动去重（幂等键）· 进化/记忆挂点 headless 同构 · K8s Job 执行（`pkg/worker/k8sjob.go`，真机含故障注入）· swarm_intel 五阶段（`plotSwarmNodeRunner` 收编）· 动态展开单调收窄（`narrowToParent`）· 六个运行级拦截器（`runBuiltinPhases`）· 团队状态机。
 >
-> **🟡 建成未通电（3 行）**：**黑板 `Watch`**——实现与语义齐（缓冲 64/非阻塞派发/`WatchDrops`），但**生产零订阅方**（`grep '\.Watch('` 非测试文件 0 命中），dashboard SSE 与飞书进度播报仍走轮询回填 · **`GoalTree`**——有三处生产构造但零消费方，归宿是被 `ExpandSpec` 吸收后连持久化一起删 · **比例灰度 `shadow_ratio`**——只落实验 JSON，运行期无消费方（本仓灰度是二值的）。
+> **🟡 建成未通电（2 行）**：**`GoalTree`**——有三处生产构造但零消费方，归宿是被 `ExpandSpec` 吸收后连持久化一起删 · **比例灰度 `shadow_ratio`**——只落实验 JSON，运行期无消费方（本仓灰度是二值的）。
 >
-> **❌ 未落地（3 行）**：双层 watchdog 的**图级停滞检测**（节点级心跳有，图级"journal 尾部 N 分钟无事件即停滞"缺）· 角色差异化超时的**节点级天花板**已有但 `Suspended` 态下的语义未定 · `team.json` 投影化（M4 唯一缺项）。
+> **❌ 未落地（2 行）**：角色差异化超时的**节点级天花板**已有但 `Suspended` 态下的语义未定 · `team.json` 投影化（M4 唯一缺项）。
+>
+> **原 🟡 的"黑板 `Watch` 生产零订阅方"与原 ❌ 的"图级停滞检测"已在 2026-07-25 补上**（见 §4.11 / §4.3）。两者都默认关：前者会改写盘频率与 `Progress.Phase` 词表，后者若默认判失败会杀掉合法长阶段——"接线了"与"默认生效"是两件事，这里只兑现前者。
 >
 > 原始诊断保留作对照：⚠️ **本矩阵是计划表，不是状态表**。逐行核实后：真覆盖 1 行（#17 AllowedTools 收敛）+ 5 个半行 + 4 行只有字段无消费 ⇒ ≈17%。特别注意 #5「重启恢复」仍是强制置 failed（`pkg/agent/teams.go:1902-1904`）、#9 门禁仍按工作流名白名单（`pkg/agent/teams.go:757`）。
 
@@ -560,7 +593,7 @@ pkg/graph/
 
 ---
 
-## 八、迁移路线　　**[🟠 M0 ✅ · M1 ✅ · M2 65% · M3 ✅ · M4 85%]**
+## 八、迁移路线　　**[🟠 M0 ✅ · M1 ✅ · M2 80% · M3 ✅ · M4 85%]**
 
 > **重算（2026-07-25，逐项核实源码）**：
 >
@@ -568,7 +601,7 @@ pkg/graph/
 > |---|---|---|---|
 > | M0 止血 | 95% | ✅ | 双 switch 一致性有 `TestModeRoutingConsistency`/`TestDedicatedExecutorModesExact` 守着；三表守护钉住 15 mode 无遗漏 |
 > | M1 图内核 | 70% | ✅ | GraphSpec/engine/journal/直译器齐；pipeline+fanout 已切并有四维等价性测试；**「kill -9 恢复重放正确」的验收项已有测试**（`graph_adapter_test.go` 的 `TestGraphJournalResume_崩溃后续跑` 手写未完结 journal → 只重跑未完成节点） |
-> | M2 全模板 | 12% | **65%** | 15 mode 图化 **9/15**；`gate`/`loop-group`/`expand` 三能力齐，另加 `map`/`reduce`/`subgraph`/`human`/终止器/`Suspended`/可声明 join；**Hook 总线接通外部 hook 未做**（`ExternalHook` 适配器缺，见 §4.5）——这是 M2 未满的主因 |
+> | M2 全模板 | 12% | **80%** | 15 mode 图化 **9/15**；`gate`/`loop-group`/`expand` 三能力齐，另加 `map`/`reduce`/`subgraph`/`human`/终止器/`Suspended`/可声明 join；✅ **Hook 总线已接通外部 hook**（`ExternalHook` 适配器落地，见 §4.5）——此前记的"M2 未满的主因"已消。**余下两项**：① 6/15 mode 未图化，但每条都在 `modeGraphNotTemplated` 里写了**具体能力缺口**（不是工作量问题：如 `adversarial_dev` 缺 WBS 解析器 + 能跑 shell 门禁的 NodeRunner，`novel_writing` 卡在组内成员阶段记录会整批消失 + agent 节点无 Score）；② 验收项"`tests/eval` 增图引擎回放用例"未按字面兑现——等价性测试落在 `pkg/agent`（`orchestrated_equiv_test.go` 四维比对 + `TestGraphJournalResume_崩溃后续跑`）而非 `tests/eval`，实质覆盖到了但位置不同 |
 > | M3 注入与约束 | 4% | ✅ | 六拦截器已装配（`run_interceptors.go` 的 `runBuiltinPhases` 恰好 6 个）+ 节点切面链 + `CallInterceptor`；`ConstraintSet` 单一真源（46 测试）；`ToolProfile` 显式化 |
 > | M4 运行时与收尾 | 0% | **85%** | `AgentRuntime` **三实现齐**（`localRuntime` / `remoteRuntime` / k8s-job 复用 remote 通路）；`SpawnSubgraph` 有；**旧引擎已删**（`pkg/orchestrator` 整包 23 文件 6879 行）；**`team.json` 投影化未做**（全仓无"投影"实现）——这是 M4 未满的唯一缺项 |
 >

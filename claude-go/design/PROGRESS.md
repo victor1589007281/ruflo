@@ -329,3 +329,77 @@ cwd 三档位（local/pvc/git）未实现故**跨机产码仍不可用**；`Loop
 **其余**：`router`/`subgraph`/`human` 三种 Kind（已核实**不是** §五 的阻塞项）；
 RunStatus 仍 3 态而非 8 态；CLI `--server`、feishu-adapter 拆分、sync→TaskService；
 `KindTurn`/`KindToolCall` 轨迹；k8s-job runtime；swarm 路径仍纯本地。
+
+> ⚠️ **上面这份「剩余项」已被下一轮清掉，保留作对照**：`pkg/orchestrator` 已删、
+> cwd 三档位已实现、逐节点 `Placement` 已加、终止器已表达收敛/退化、`subgraph`/
+> `human` 已实现、RunStatus 已 8 态、`KindTurn`/`KindToolCall` 已有产生方、
+> k8s-job runtime 已落地、swarm 已接远程工厂。逐项落点见下一节。
+
+---
+
+## 2026-07-25 🟠 轮：行内「部分实现」全部收口 + 最后三项接线
+
+上一轮清的是**章节级 ❌**；这一轮清的是行内 🟠/🟡（"部分实现"与"建成未通电"）。
+共 60 个提交。**这一轮的判定纪律**：一项算完成，必须给出**生产调用方的行号**或
+**真跑一遍的产物**——按常量名 grep 判"有没有产生方"在本轮**错了两次**
+（`turn`/`tool_call` 轨迹写的是字面量，grep 常量名查不到）。
+
+### 结构性的三件
+
+| 项 | 落点 | 代价与证据 |
+|---|---|---|
+| `pkg/orchestrator` 整包退役 | `orchestrated` 改由图引擎承载（`workflow_orchestrated.go` + `orchNodeRunner`） | 删 23 文件 / 6879 行，净 -5762。等价性由**四维比对**钉住（阶段序列逐项 / LLM 调用次数 / 峰值并发（真 sleep）/ **提示词逐字节**）+ **4 条变异反证**（故意改坏一处确认测试变红再还原）。双黑板并存、LifecycleHook 三套合一、四源归一都卡在它，删掉后一起解 |
+| `executeWorkflow` 282 行 → 34 行 | `run_interceptors.go` 六个运行级拦截器 `gate/finalize/metrics/evolution/memory/notify` | `finalize` 标 `core: true`——它**就是交付本身**，不是横切关注点，可关的话开关一开就没有产出。开关语义与 `CLAUDE_GO_GRAPH_INTERCEPTORS` 完全同形 |
+| cwd 三档位 local/pvc/git | `pkg/worker/` + `--cwd` 优先级修复 | **跨机产码工作流此前全线不通**。真机 `go build` PASS 才算兑现。顺带修掉 `--cwd` 被配置文件盖住（pvc 档在任何写了 `cwd` 的部署下都不生效） |
+
+### 最后三项接线（本节的收尾，2026-07-25）
+
+| 项 | 设计位置 | 落点 | 默认 |
+|---|---|---|---|
+| `ExternalHook` 适配器 | 01 §4.5 归宿表第 1 行 | `pkg/hooks/bus.go` + `pkg/agent/graph_external_bridge.go` | 配了外部 hook 才有事件 |
+| 图级停滞检测 | 01 §4.3 双层 watchdog 的图级那层 | `pkg/graph/watchdog.go` + `pkg/agent/graph_watchdog.go` | **关**（开启后缺省也只 notify） |
+| 黑板 `Watch` 生产订阅方 | 01 §4.11 / §六 🟡 那行 | `pkg/agent/blackboard_watch.go` | **关** |
+
+三项都是开关制，未开启时行为逐字节不变——**因为每一项都有一条会改变生产可感知行为
+的边**：watchdog 自动判失败会杀掉合法长阶段（整本小说起草几十分钟不产出中间事件是
+正常的）；黑板订阅会把 team.json 写盘频率从 30 秒一次变成每阶段一次（有下游按 mtime
+判活）并换掉 `Progress.Phase` 的词表。**"接线了"与"默认生效"是两件事**，这一轮只
+兑现前者。
+
+一条红线守住了：黑板订阅方**绝不**调 `coord.ReportProgress`——那会让同阶段空转 40
+分钟的团队因"阶段名没变但 `UpdatedAt` 一直在刷"而**永远不被判停滞**，即把一个
+fail-closed 的守护改成 fail-open。有专门测试钉住。
+
+`ExternalHook` 这项顺带更正了一个容易误判的前提：外部 hook 在图模式下**本就生效**
+（挂在 runner 内部，而图引擎调的就是这个 runner），缺的是**对图层可见**。
+
+### 本轮修掉的真缺陷（都不是本轮引入的）
+
+- **live P0**：换目标重跑吃旧产出（两份 `clearRunProgress` 内联副本只改了一份 →
+  收敛到单一清空口）。
+- **按阶段精修在图模式下静默失效**：只失效 `checkpoints.json` 而 journal 原样保留。
+- **`review-panel` 多维分数被当概率分布归一化**：实测 N=2 时 plot=81.00、N=3 时
+  38.10——**维度越多每维分数越低**，一个真生产 bug。
+- **`skillaudit` 用未加权均值**冲淡晋升门禁。
+- **`broker.go term()` 的 select 随机性**：50% 概率丢终态。
+- **`pkg/cluster` fail-open**：`Client.post` 拿到状态码却只返回它，三个调用方全写
+  `_, err :=` ⇒ 401/400 在 worker 侧全是静默成功。
+- **`OnLLMEvent` 只在 7 个客户端构造点中的 1 个被赋值**。
+- **`cron.Stop()` 二次调用 panic**（裸 `close`）。
+- **`AgentPool.Acquire` 真数据竞争**：取 factory 未持锁。⚠️ 第一版变异测试（每边一个
+  goroutine）在**有竞争的版本上是绿的**，什么都没证明。
+- **三类非密闭测试**：`RestorePromFromJSONL`/`saveDreamState`/`llm_collector` 的后台
+  goroutine 活到测试边界之外。第二例试错两次才修对——写盘方是**捕获的指针**，
+  重新指向另一个 `t.TempDir()` 无效。
+
+### 本轮的方法沉淀
+
+- **等价性证明 = 四维 + 变异反证**。四维（阶段序列 / 调用次数 / 峰值并发 / 提示词
+  逐字节）任缺一维都能让"等价"是假的；变异反证（故意改坏确认变红）是唯一能证明
+  测试**有牙**的手段。本轮它抓出我自己 3 个无牙的测试。
+- **三类假测试**：许愿式（断言恒真）/ 非幂等（第二次跑变红）/ **非密闭**（组件活到
+  测试边界之外）。第三类最难发现，因为它表现为**偶发**。
+- **判"通电"只认生产调用方行号或真跑产物**。为此把 E2E 脚本从 11 步扩到 13 步：
+  第 12 步盘点轨迹 kind 与奖励源分布、第 13 步查 worker 能力标签——前者是本轮两次
+  误判的直接解药，后者曾抓出集群里跑的是**陈旧的** worker Deployment（旧回显桩、
+  caps 为空）。

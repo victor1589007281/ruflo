@@ -103,45 +103,48 @@ func (c *Collector) RecordWithLabels(module, name string, value float64, labels 
 // 同一批指标共享时间戳, 确保 dashboard 能正确分组聚合。
 // 同时写入 Prometheus 原生指标 (通过 prom_registry.go)。
 func (c *Collector) RecordAtTime(module, name string, value float64, labels map[string]string, ts time.Time) {
-	evt := MetricEvent{
-		Timestamp: ts,
-		Module:    module,
-		Name:      name,
-		Value:     value,
-		Labels:    labels,
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.buffer[module] = append(c.buffer[module], evt)
-
-	// 同时写入 Prometheus 原生指标
-	recordPromMetric(module, name, value, labels)
-
-	// 持久化到 JSONL (供 dashboard scrape)
-	c.appendJSONL(module, evt)
+	c.record(MetricEvent{Timestamp: ts, Module: module, Name: name, Value: value, Labels: labels})
 }
 
 // RecordRun 记录一个带 RunID 的指标值 (用于团队/任务级别追踪)。
 func (c *Collector) RecordRun(module, name string, value float64, runID string, labels map[string]string) {
-	evt := MetricEvent{
-		Timestamp: time.Now(),
-		Module:    module,
-		Name:      name,
-		Value:     value,
-		Labels:    labels,
-		RunID:     runID,
-	}
+	c.record(MetricEvent{Timestamp: time.Now(), Module: module, Name: name, Value: value, Labels: labels, RunID: runID})
+}
+
+// RecordRunAtTime 记录**同时**带 RunID 与指定时间戳的指标值
+// (design/03 §1.3 E0 验收项「llm.jsonl 可按 run_id 聚合」)。
+//
+// 为什么需要第三个变体而不是让调用方二选一: llm 采集器同时要这两件事 ——
+// 一次 LLM 调用的多个指标必须共享同一个时间戳 (dashboard 的 handleLLMStats 按
+// (ts, model) 分组), 而 run_id 是跨源对账的唯一关联键。缺前者聚合会散成多组,
+// 缺后者 llm.jsonl 与团队轨迹只能按时间戳粗对齐。
+//
+// ⚠️ **RunID 刻意只进 JSONL 事件, 不进 Prometheus 标签** —— 这不是遗漏:
+// run_id 每次团队运行一个新值, 做成标签就是无界基数 (一个跑过几千轮的部署会让
+// llm_* 指标炸成几千条时间序列), 且会让既有 Grafana 查询的聚合口径静默改变。
+// JSONL 那一路是逐事件追加的日志, 加字段既不改既有消费方 (读 labels 的代码
+// 一个字不动) 也没有基数问题。这也是 MetricEvent.RunID 从一开始就与 Labels
+// 分开的原因 (RecordRun 就是这么用的)。
+func (c *Collector) RecordRunAtTime(module, name string, value float64, runID string, labels map[string]string, ts time.Time) {
+	c.record(MetricEvent{Timestamp: ts, Module: module, Name: name, Value: value, Labels: labels, RunID: runID})
+}
+
+// record 三个 Record*AtTime/Run 变体的**唯一**落地实现。
+//
+// 合成一处而不是各写一份: 改造前 RecordAtTime 与 RecordRun 是两份逐字节相同的
+// 五行 (缓冲 + Prometheus + JSONL), 再加第三个变体就是三份 —— 而这三份里任何一份
+// 漏掉 Prometheus 或 JSONL, 表现都是"某些指标在某个面板上看不到"。
+func (c *Collector) record(evt MetricEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.buffer[module] = append(c.buffer[module], evt)
+	c.buffer[evt.Module] = append(c.buffer[evt.Module], evt)
 
-	// 同时写入 Prometheus 原生指标
-	recordPromMetric(module, name, value, labels)
+	// 同时写入 Prometheus 原生指标 (注意: 只传 Labels, RunID 不进标签)
+	recordPromMetric(evt.Module, evt.Name, evt.Value, evt.Labels)
 
 	// 持久化到 JSONL (供 dashboard scrape)
-	c.appendJSONL(module, evt)
+	c.appendJSONL(evt.Module, evt)
 }
 
 // appendJSONL 将事件以 JSONL 格式追加到对应模块的文件。

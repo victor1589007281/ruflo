@@ -141,6 +141,14 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 	if rec.HTTPStatus != 0 {
 		labels["http_status"] = intStr(rec.HTTPStatus)
 	}
+	if rec.InputEstimated {
+		// design/02 §1.4 的另一半: 估算值与网关真回的值进的是同一个 llm_input_tokens,
+		// 不打标签的话"总量不偏小是靠字符数估算撑起来的"这件事完全不可见 —— 而有人
+		// 会拿这个数去和账单对账。只在为 true 时加 (与上面各条同风格), 于是没有估算
+		// 发生的部署标签集逐字节不变、既有 Grafana 查询不受影响; 取值只有一个 ("1"),
+		// 基数增量上限是 ×2 而不是无界。
+		labels["input_estimated"] = "1"
+	}
 
 	// 同一次 LLM 调用的所有指标共享同一个时间戳,
 	// 确保 dashboard 的 handleLLMStats 能正确按 (ts, model) 分组聚合。
@@ -149,61 +157,82 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 		ts = time.Now()
 	}
 
-	c.RecordAtTime("llm", MLLMCallCount, 1, labels, ts)
-	c.RecordAtTime("llm", MLLMDurationSec, rec.DurationSec, labels, ts)
-	// token 双边记账 (design/02 §1.4): 不再用 >0 守卫跳过 —— input 缺失时上游
-	// (api.Client) 已按字符数估算并置 InputEstimated, 此处如实记录, 使总量不偏小。
-	if rec.InputTokens > 0 {
-		c.RecordAtTime("llm", MLLMInputTokens, float64(rec.InputTokens), labels, ts)
+	// rec 落 JSONL 时带上 run_id (design/03 §1.3 E0 验收项「llm.jsonl 可按 run_id
+	// 聚合」)。**只进事件不进标签** —— run_id 是无界基数, 做成 Prometheus 标签会把
+	// llm_* 炸成每次运行一条时间序列, 理由详见 RecordRunAtTime 的注释。
+	// rec.RunID 为空 (非团队路径 / 上游未注入) 时 omitempty 生效, llm.jsonl 逐字节
+	// 与改造前一致。
+	rt := func(name string, value float64) {
+		c.RecordRunAtTime("llm", name, value, rec.RunID, labels, ts)
 	}
+
+	rt(MLLMCallCount, 1)
+	rt(MLLMDurationSec, rec.DurationSec)
+	// token 双边记账 (design/02 §1.4): input **不再用 >0 守卫跳过**。
+	//
+	// ⚠️ 改造前这行注释就已经写着"不再用 >0 守卫", 而守卫仍在 —— 注释与代码相反,
+	// 且 design/02 §1.4 早已把它记为"设计承诺没做"。现在真的去掉了。
+	//
+	// 为什么必须显式记 0 而不是跳过: 跳过会让 llm_input_tokens 的样本数**少于**
+	// 调用数, 于是"这次调用的 input 是 0"与"这次调用没有 input 数据"在指标上不可
+	// 区分, 而按样本数算的均值会被**系统性抬高**(只有拿到数的那些被计入)。Kimi 类
+	// 网关经常不回 input_tokens, 这条路径是常态而非边角。
+	//
+	// output/cache/total/retry 四项**保留守卫**且这不是不一致: 它们为 0 时是"这次
+	// 调用确实没有该项"(没走缓存 / 没重试), 显式记 0 只会给每次调用凭空多出四条
+	// 恒零样本, 不带任何信息。input 为 0 才是**信息缺失**这一独立事实。
+	rt(MLLMInputTokens, float64(rec.InputTokens))
 	if rec.OutputTokens > 0 {
-		c.RecordAtTime("llm", MLLMOutputTokens, float64(rec.OutputTokens), labels, ts)
+		rt(MLLMOutputTokens, float64(rec.OutputTokens))
 	}
 	if rec.CacheReadTokens > 0 {
-		c.RecordAtTime("llm", MLLMCacheReadTokens, float64(rec.CacheReadTokens), labels, ts)
+		rt(MLLMCacheReadTokens, float64(rec.CacheReadTokens))
 	}
 	if rec.CacheCreationTokens > 0 {
-		c.RecordAtTime("llm", MLLMCacheCreateTokens, float64(rec.CacheCreationTokens), labels, ts)
+		rt(MLLMCacheCreateTokens, float64(rec.CacheCreationTokens))
 	}
 	if rec.TotalTokens > 0 {
-		c.RecordAtTime("llm", MLLMTotalTokens, float64(rec.TotalTokens), labels, ts)
+		rt(MLLMTotalTokens, float64(rec.TotalTokens))
 	}
 	if rec.Retries > 0 {
-		c.RecordAtTime("llm", MLLMRetryCount, float64(rec.Retries), labels, ts)
+		rt(MLLMRetryCount, float64(rec.Retries))
 	}
 	recordPromptComponentMetrics(c, rec, labels, ts)
 
 	switch rec.Status {
 	case "success", "retry_success":
-		c.RecordAtTime("llm", MLLMSuccessCount, 1, labels, ts)
+		rt(MLLMSuccessCount, 1)
 	case "error":
-		c.RecordAtTime("llm", MLLMErrorCount, 1, labels, ts)
+		rt(MLLMErrorCount, 1)
 	}
 
 	switch rec.ErrorKind {
 	case "rate_limit":
-		c.RecordAtTime("llm", MLLMRateLimitCount, 1, labels, ts)
+		rt(MLLMRateLimitCount, 1)
 	case "overloaded":
-		c.RecordAtTime("llm", MLLMOverloadCount, 1, labels, ts)
+		rt(MLLMOverloadCount, 1)
 	case "timeout":
-		c.RecordAtTime("llm", MLLMTimeoutCount, 1, labels, ts)
+		rt(MLLMTimeoutCount, 1)
 	case "refusal":
-		c.RecordAtTime("llm", MLLMRefusalCount, 1, labels, ts)
+		rt(MLLMRefusalCount, 1)
 	case "prompt_too_long":
-		c.RecordAtTime("llm", MLLMPromptTooLong, 1, labels, ts)
+		rt(MLLMPromptTooLong, 1)
 	}
 
 	// 限流 / 熔断器事件
 	if rec.GuardWaitSec > 0 {
-		c.RecordAtTime("llm", MLLMGuardWaitSec, rec.GuardWaitSec, labels, ts)
+		rt(MLLMGuardWaitSec, rec.GuardWaitSec)
 	}
 	if rec.CircuitOpened {
-		c.RecordAtTime("llm", MLLMCircuitTrips, 1, labels, ts)
+		rt(MLLMCircuitTrips, 1)
 	}
 	if rec.CircuitBlocked {
 		blockedLabels := copyLabels(labels)
 		blockedLabels["blocked"] = "1"
-		c.RecordAtTime("llm", MLLMCircuitOpenGauge, 1, blockedLabels, ts)
+		// 这一条用的是另一份 labels, 所以走不了上面的 rt 闭包; run_id 仍要带上 ——
+		// 一次调用的事件里有的带 run_id 有的不带, 比全都不带更难排障 (按 run_id 过滤
+		// 会**静默漏掉**恰好是熔断那几条, 而那几条正是最该被查到的)。
+		c.RecordRunAtTime("llm", MLLMCircuitOpenGauge, 1, rec.RunID, blockedLabels, ts)
 	}
 }
 
@@ -225,8 +254,10 @@ func recordPromptComponentMetrics(c *Collector, rec api.LLMCallRecord, labels ma
 	for _, part := range parts {
 		componentLabels := copyLabels(labels)
 		componentLabels["component"] = part.name
-		c.RecordAtTime("llm", MLLMPromptComponentChars, float64(part.value), componentLabels, ts)
-		c.RecordAtTime("llm", MLLMPromptComponentTokens, float64(part.value)/4.0, componentLabels, ts)
+		// 同带 run_id: 提示词构成是"这次运行为什么烧了这么多 token"的直接证据,
+		// 恰恰是最需要按 run_id 归因的一路 (design/03 §1.3)。
+		c.RecordRunAtTime("llm", MLLMPromptComponentChars, float64(part.value), rec.RunID, componentLabels, ts)
+		c.RecordRunAtTime("llm", MLLMPromptComponentTokens, float64(part.value)/4.0, rec.RunID, componentLabels, ts)
 	}
 }
 

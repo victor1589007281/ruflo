@@ -78,9 +78,15 @@
 5. **LLM 多端点故障转移**：FallbackModels/FallbackBaseURL + 429 自动切换（`client.go:115-122,1421`）——模型层天然可独立。
 6. **dashboard↔Bot 伪 RPC 接缝**：惰性回调 + `BotAPIURL`（`server.go:51`），改跨进程成本最低。
 
-### 1.4 附带缺陷（分层时一并修）　　**[✅ 2 条已修 / 🟠 1 条部分]**
+### 1.4 附带缺陷（分层时一并修）　　**[✅ token 记账 · 会话历史已修 / 🟠 `/api/*` 鉴权仍 fail-open]**
 
-> **实测**：token 记账已修（`pkg/api/client.go:101-104` 估算回填 + `InputEstimated`），但设计承诺的「去掉 `>0` 守卫改显式记 0」**没做**（守卫仍在 `pkg/metrics/llm_collector.go:148`）。飞书会话历史已落盘 ✅。`/api/*` 鉴权 🟠：中间件真实（`pkg/httpauth`）但 **fail-open 且默认空 secret + 默认绑 0.0.0.0 ⇒ 默认部署仍完全无鉴权**。
+> **实测**：token 记账已修（`pkg/api/client.go:101-104` 估算回填 + `InputEstimated`），~~但设计承诺的「去掉 `>0` 守卫改显式记 0」**没做**（守卫仍在 `pkg/metrics/llm_collector.go:148`）~~。飞书会话历史已落盘 ✅。`/api/*` 鉴权 🟠：中间件真实（`pkg/httpauth`）但 **fail-open 且默认空 secret + 默认绑 0.0.0.0 ⇒ 默认部署仍完全无鉴权**。
+>
+> ✅ **`>0` 守卫已去掉（2026-07-25）**：改造前**那行注释就已经写着"不再用 `>0` 守卫"而守卫还在**——注释与代码相反，正是本仓吃过的"注释漂移"那一类。现在真的去掉了，并补上这个包**第一批测试**（此前 `pkg/metrics` 一个测试文件都没有）+ 3 条变异反证。
+>
+> - **断言的是"input 样本数 == 调用数"**，不是"有一条 `value=0` 的事件"：后者用 `if rec.InputTokens >= 0` 这种假修复也能过。守卫在时该断言给出 `got 1 want 2`。
+> - **`output`/`cache`/`total`/`retry` 四项保留守卫**，这不是不一致：它们为 0 时是"这次调用确实没有该项"（没走缓存 / 没重试），显式记 0 只会给每次调用凭空多出四条恒零样本；**只有 input 为 0 是"信息缺失"这一独立事实**（Kimi 类网关常不回 `input_tokens`，是常态而非边角）。有专门测试防"顺手把四个守卫一起删了"。
+> - **顺带补 `input_estimated` 标签**：估算值与网关真回的值进的是同一个 `llm_input_tokens`，不打标签的话"总量不偏小是靠字符数估算撑起来的"完全不可见——**而有人会拿这个数去和账单对账**。只在为 true 时加（与既有各条同风格），基数增量上限 ×2 而非无界；没有估算发生的部署标签集逐字节不变。
 
 - **token 记账只计输出**：流式 input tokens 只从 `message_start` 读（`client.go:921-924`），Kimi 类网关常不回→`InputTokens=0` 被 `>0` 守卫跳过（`llm_collector.go:146-150`、`metrics_emitter.go:47-51`）。
 - **dashboard `/api/*` 无鉴权**，仅靠绑 127.0.0.1（`wiki/api.go:91-101` 只保护 `/wiki/*`、`/sync/*`）。
