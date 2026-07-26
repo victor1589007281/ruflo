@@ -552,9 +552,19 @@ pkg/graph/
 
 ---
 
-## 八、迁移路线　　**[🟠 M0 95% · M1 70% · M2 12% · M3 4% · M4 0%]**
+## 八、迁移路线　　**[🟠 M0 ✅ · M1 ✅ · M2 65% · M3 ✅ · M4 85%]**
 
-> **实测**：M1 的验收项「kill -9 恢复重放正确」**无对应测试**（`journal_test.go` 只模拟尾部截断行，不是进程 kill）。M2 记 ✅ 的 loop/条件边应为 🟡（生产零产生方）。M4 = 0%：`pkg/orchestrator` 仍生产可达（4 个注册工作流），四大 God File 全在且 `workflow.go` 比设计稿时**更大**。
+> **重算（2026-07-25，逐项核实源码）**：
+>
+> | 里程碑 | 旧 | 新 | 依据 |
+> |---|---|---|---|
+> | M0 止血 | 95% | ✅ | 双 switch 一致性有 `TestModeRoutingConsistency`/`TestDedicatedExecutorModesExact` 守着；三表守护钉住 15 mode 无遗漏 |
+> | M1 图内核 | 70% | ✅ | GraphSpec/engine/journal/直译器齐；pipeline+fanout 已切并有四维等价性测试；**「kill -9 恢复重放正确」的验收项已有测试**（`graph_adapter_test.go` 的 `TestGraphJournalResume_崩溃后续跑` 手写未完结 journal → 只重跑未完成节点） |
+> | M2 全模板 | 12% | **65%** | 15 mode 图化 **9/15**；`gate`/`loop-group`/`expand` 三能力齐，另加 `map`/`reduce`/`subgraph`/`human`/终止器/`Suspended`/可声明 join；**Hook 总线接通外部 hook 未做**（`ExternalHook` 适配器缺，见 §4.5）——这是 M2 未满的主因 |
+> | M3 注入与约束 | 4% | ✅ | 六拦截器已装配（`run_interceptors.go` 的 `runBuiltinPhases` 恰好 6 个）+ 节点切面链 + `CallInterceptor`；`ConstraintSet` 单一真源（46 测试）；`ToolProfile` 显式化 |
+> | M4 运行时与收尾 | 0% | **85%** | `AgentRuntime` **三实现齐**（`localRuntime` / `remoteRuntime` / k8s-job 复用 remote 通路）；`SpawnSubgraph` 有；**旧引擎已删**（`pkg/orchestrator` 整包 23 文件 6879 行）；**`team.json` 投影化未做**（全仓无"投影"实现）——这是 M4 未满的唯一缺项 |
+>
+> 原文的这句判断已过时，保留作为对照：M1 的验收项「kill -9 恢复重放正确」**无对应测试**（`journal_test.go` 只模拟尾部截断行，不是进程 kill）。M2 记 ✅ 的 loop/条件边应为 🟡（生产零产生方）。M4 = 0%：`pkg/orchestrator` 仍生产可达（4 个注册工作流），四大 God File 全在且 `workflow.go` 比设计稿时**更大**。
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
