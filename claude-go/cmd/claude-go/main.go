@@ -1142,11 +1142,21 @@ JSON 配置文件示例:
 				}
 			}
 
-			if cwd == "" {
-				cwd, _ = os.Getwd()
+			// --cwd 显式给了就**覆盖**配置文件, 与该 flag 的帮助文本("优先级最高,
+			// 覆盖配置文件 cwd")一致 —— 改造前是 `if config.Cwd == ""` 才用它, 即配置
+			// 文件反过来盖住了命令行。
+			//
+			// 这不是洁癖: 分布式部署里 distributed.yaml 给控制面传 `--cwd /workspace`
+			// (共享 PVC 挂载点), 而 ConfigMap 里通常也写了 cwd。旧优先级下那个 flag 是
+			// **空操作**, 团队 cwd 落回配置里的值 ⇒ 任务声明 /workspace 而 worker 声明
+			// 配置里的路径, pvc 档的 checkWorkspace 必拒 —— **pvc 档在这类部署下全线
+			// 不通**, 且报错说的是"工作区不一致"而不是"你的 --cwd 没生效"。
+			// worker 二进制里本来就是 flag 覆盖 config, 只有控制面反着。
+			if cwd != "" {
+				config.Cwd = cwd
 			}
 			if config.Cwd == "" {
-				config.Cwd = cwd
+				config.Cwd, _ = os.Getwd()
 			}
 
 			// CLI 参数覆盖
