@@ -75,7 +75,7 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 - **action 完整文本**：llm.jsonl 只存计数不存 prompt/response 正文；transcript 不落 tool_result（`engine.go` 只 Append user 初始消息与 assistant 消息）；进化轨迹 Input/Output 被截断；
 - **headless 团队路径** trajectories.json 根本不产生（开环 1）。
 
-### 1.4 奖励贫乏　　**[🟠 8 源中 6 源已通电（原 1 源）]**
+### 1.4 奖励贫乏　　**[✅ 8 源已全部通电（原 1 源）]**
 
 > **实测**：生产写出的 Source 字面量只有 2 个：`gate.content`（两个调用点用**同一字面量**）与 `episode`（设计外自加）。按设计 8 源口径是 **1/8**。设计里价值排第一的 `gate.compile`/`gate.test` 在真门禁函数内 `RecordReward` 调用数为 **0**；价值最高的用户显式反馈（👍/`/rate`）零命中。
 

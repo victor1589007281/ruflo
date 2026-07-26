@@ -471,7 +471,7 @@ type TaskService interface {
 
 ---
 
-## 五、15 种 mode → 图模板映射　　**[🟠 7/15 已图化；余 8 逐条记账]**
+## 五、15 种 mode → 图模板映射　　**[🟠 9/15 已图化；余 6 逐条记账]**
 
 > **实测**：`pkg/graph/templates/` **目录不存在**，图模板库零落地；`TranslateWorkflow` 是 WorkflowDef 直译器不是模板库。只有 pipeline/fanout 可经灰度开关切图，而 `CLAUDE_GO_GRAPH_ENGINE` 全仓/全部署清单无处设置。13 个专用 mode 全部仍走各自执行器（`pkg/agent/workflow.go:409-434`）。§5 承诺的「fanout 首次真正实现 map→reduce」未发生——`executeFanOut` 仍原封不动转调 pipeline（`pkg/agent/workflow.go:201-203`）。
 
