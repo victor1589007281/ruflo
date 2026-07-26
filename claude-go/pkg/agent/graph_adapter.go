@@ -1366,20 +1366,20 @@ func recordGraphStageMetrics(team *ProductionTeam, sr StageResult, retries int) 
 	}
 	if sr.Duration != "" {
 		if d, err := time.ParseDuration(sr.Duration); err == nil && d > 0 {
-			mc.RecordRun("team", metrics.MTeamStageDurationSec, d.Seconds(), team.Name, labels)
+			recordTeamRun(mc, "team", metrics.MTeamStageDurationSec, d.Seconds(), team, labels)
 		}
 	}
-	mc.RecordRun("team", metrics.MTeamStageCount, 1, team.Name, labels)
+	recordTeamRun(mc, "team", metrics.MTeamStageCount, 1, team, labels)
 	if sr.Status == TaskCompleted {
-		mc.RecordRun("team", metrics.MTeamStageSuccessCount, 1, team.Name, labels)
+		recordTeamRun(mc, "team", metrics.MTeamStageSuccessCount, 1, team, labels)
 	} else {
-		mc.RecordRun("team", metrics.MTeamStageFailCount, 1, team.Name, labels)
+		recordTeamRun(mc, "team", metrics.MTeamStageFailCount, 1, team, labels)
 	}
 	if retries > 0 {
-		mc.RecordRun("team", metrics.MTeamStageRetryCount, float64(retries), team.Name, labels)
+		recordTeamRun(mc, "team", metrics.MTeamStageRetryCount, float64(retries), team, labels)
 	}
 	if sr.Output != "" {
-		mc.RecordRun("team", metrics.MTeamStageOutputLen, float64(len(sr.Output)), team.Name, labels)
+		recordTeamRun(mc, "team", metrics.MTeamStageOutputLen, float64(len(sr.Output)), team, labels)
 	}
 }
 

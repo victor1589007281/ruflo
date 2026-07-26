@@ -32,6 +32,19 @@ type MetricEvent struct {
 	Value     float64           `json:"value"`
 	Labels    map[string]string `json:"labels,omitempty"`
 	RunID     string            `json:"run_id,omitempty"`
+	// Team 团队名 (design/03 §1.3 跨源对账的第二个键)。
+	//
+	// 为什么必须与 RunID **分成两个字段**: 改造前全仓 59 个 RecordRun 调用点**无一例外**
+	// 把 `team.Name` 传进 RunID —— 一个叫 run_id 的字段里装的是团队名。于是
+	// llm.jsonl (真 run_id) 与 team.jsonl (团队名) 按 run_id 根本 join 不上, 而字段名
+	// 让人以为能。
+	//
+	// 直觉修法是"把团队名挪进 labels" —— **不行**: labels 会进 Prometheus, 加一个标签
+	// 就改变序列身份 (旧序列停更、counter 历史断开)。而 Team 与 RunID 一样**只进 JSONL**,
+	// 于是既恢复了 run_id 的语义、又保住了团队身份、还不碰任何 Prometheus 序列。
+	// 这与 dashboard 那边奖励聚合早就在用的 `(run_id, team)` 二元组口径一致
+	// (run_feedback.go: "AggregateRewards 按 (run_id, team) 过滤")。
+	Team string `json:"team,omitempty"`
 }
 
 // ModuleSummary 单模块指标摘要 (供 AI 分析)。
@@ -107,8 +120,21 @@ func (c *Collector) RecordAtTime(module, name string, value float64, labels map[
 }
 
 // RecordRun 记录一个带 RunID 的指标值 (用于团队/任务级别追踪)。
+//
+// ⚠️ 新代码请用 RecordRunTeam: 本方法的 runID 参数历史上被全部调用方传成了**团队名**
+// (见 MetricEvent.Team 的注释), 只保留它是因为它是公开 API。
 func (c *Collector) RecordRun(module, name string, value float64, runID string, labels map[string]string) {
 	c.record(MetricEvent{Timestamp: time.Now(), Module: module, Name: name, Value: value, Labels: labels, RunID: runID})
+}
+
+// RecordRunTeam 记录一个同时带 **RunID 与团队名**的指标值 (design/03 §1.3)。
+//
+// 两个键分开传而不是拼成一个字符串: 拼起来的话消费方要靠约定的分隔符切开, 而团队名
+// 里出现分隔符就静默切错 —— 本仓的团队名来自用户输入。
+// 两者都**只进 JSONL, 不进 Prometheus 标签**, 理由见 MetricEvent.Team 与 RecordRunAtTime。
+func (c *Collector) RecordRunTeam(module, name string, value float64, runID, team string, labels map[string]string) {
+	c.record(MetricEvent{Timestamp: time.Now(), Module: module, Name: name, Value: value,
+		Labels: labels, RunID: runID, Team: team})
 }
 
 // RecordRunAtTime 记录**同时**带 RunID 与指定时间戳的指标值

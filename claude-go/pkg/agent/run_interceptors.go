@@ -375,12 +375,12 @@ func (ptm *ProductionTeamManager) runPhaseMetrics(ctx context.Context, rc *teamR
 	// 持续观测指标: 团队运行质量
 	if ptm.metrics != nil {
 		labels := map[string]string{"workflow": team.Workflow, "status": string(rc.status)}
-		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
-		ptm.metrics.RecordRun("team", metrics.MTeamDurationSec, rc.report.DurationSec, team.Name, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamRunCount, 1, team, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamDurationSec, rc.report.DurationSec, team, labels)
 		if isSuccessfulTeamStatus(rc.status) {
-			ptm.metrics.RecordRun("team", metrics.MTeamSuccessCount, 1, team.Name, labels)
+			recordTeamRun(ptm.metrics, "team", metrics.MTeamSuccessCount, 1, team, labels)
 		} else {
-			ptm.metrics.RecordRun("team", metrics.MTeamFailCount, 1, team.Name, labels)
+			recordTeamRun(ptm.metrics, "team", metrics.MTeamFailCount, 1, team, labels)
 		}
 		// 阶段通过率
 		total, passed := 0, 0
@@ -393,8 +393,8 @@ func (ptm *ProductionTeamManager) runPhaseMetrics(ctx context.Context, rc *teamR
 			totalOutLen += s.OutputLen
 		}
 		if total > 0 {
-			ptm.metrics.RecordRun("team", metrics.MTeamStagePassRate, float64(passed)/float64(total), team.Name, labels)
-			ptm.metrics.RecordRun("team", metrics.MTeamOutputAvgLen, float64(totalOutLen)/float64(total), team.Name, labels)
+			recordTeamRun(ptm.metrics, "team", metrics.MTeamStagePassRate, float64(passed)/float64(total), team, labels)
+			recordTeamRun(ptm.metrics, "team", metrics.MTeamOutputAvgLen, float64(totalOutLen)/float64(total), team, labels)
 		}
 	}
 	return true

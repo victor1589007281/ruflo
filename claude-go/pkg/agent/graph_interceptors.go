@@ -237,9 +237,9 @@ func (r *graphRateLimiter) onThrottled(ctx context.Context, nodeID string) {
 		"limit", fmt.Sprintf("%d", newLimit), "cuts", fmt.Sprintf("%d", r.cuts.Load()))
 	if r.team != nil {
 		if mc := r.team.metrics(); mc != nil {
-			mc.RecordRun("llm", metrics.MLLMGuardAIMDCut, 1, r.team.Name,
+			recordTeamRun(mc, "llm", metrics.MLLMGuardAIMDCut, 1, r.team,
 				map[string]string{"layer": "graph", "workflow": r.team.Workflow})
-			mc.RecordRun("llm", metrics.MLLMGuardMaxParallel, float64(newLimit), r.team.Name,
+			recordTeamRun(mc, "llm", metrics.MLLMGuardMaxParallel, float64(newLimit), r.team,
 				map[string]string{"layer": "graph", "workflow": r.team.Workflow})
 		}
 	}

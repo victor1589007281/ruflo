@@ -3720,8 +3720,8 @@ func (o *Orchestrator) recordWBSPlanMetrics(team *ProductionTeam) {
 		return
 	}
 	baseLabels := map[string]string{"workflow": team.Workflow}
-	mc.RecordRun("team", metrics.MWBSSplitCount, float64(o.wbsSplitCount), team.Name, baseLabels)
-	mc.RecordRun("team", metrics.MWBSTimeoutSplitCount, float64(o.wbsTimeoutSplitCount), team.Name, baseLabels)
+	recordTeamRun(mc, "team", metrics.MWBSSplitCount, float64(o.wbsSplitCount), team, baseLabels)
+	recordTeamRun(mc, "team", metrics.MWBSTimeoutSplitCount, float64(o.wbsTimeoutSplitCount), team, baseLabels)
 
 	o.mu.Lock()
 	nodes := make([]*TaskNode, 0, len(o.nodes))
@@ -3734,14 +3734,14 @@ func (o *Orchestrator) recordWBSPlanMetrics(team *ProductionTeam) {
 	for _, node := range nodes {
 		labels := node.wbsMetricLabels(team)
 		if node.EstimatedMin > 0 {
-			mc.RecordRun("team", metrics.MWBSTaskEstimatedMinutes, float64(node.EstimatedMin), team.Name, labels)
+			recordTeamRun(mc, "team", metrics.MWBSTaskEstimatedMinutes, float64(node.EstimatedMin), team, labels)
 		}
 		if node.TaskType == wbsTaskTypeLeaf || node.TaskType == wbsTaskTypeVerification {
 			fileCount := len(node.WriteFiles)
 			if fileCount == 0 {
 				fileCount = len(node.TargetFiles)
 			}
-			mc.RecordRun("team", metrics.MWBSLeafFiles, float64(fileCount), team.Name, labels)
+			recordTeamRun(mc, "team", metrics.MWBSLeafFiles, float64(fileCount), team, labels)
 		}
 		if node.ParallelGroup != "" {
 			groupSizes[node.ParallelGroup]++
@@ -3749,7 +3749,7 @@ func (o *Orchestrator) recordWBSPlanMetrics(team *ProductionTeam) {
 	}
 	for group, size := range groupSizes {
 		labels := map[string]string{"workflow": team.Workflow, "parallel_group": group}
-		mc.RecordRun("team", metrics.MWBSParallelGroupSize, float64(size), team.Name, labels)
+		recordTeamRun(mc, "team", metrics.MWBSParallelGroupSize, float64(size), team, labels)
 	}
 }
 
@@ -3760,7 +3760,7 @@ func (o *Orchestrator) recordWBSTaskDuration(team *ProductionTeam, node *TaskNod
 	}
 	labels := node.wbsMetricLabels(team)
 	labels["status"] = string(status)
-	mc.RecordRun("team", metrics.MWBSTaskActualDurationSec, duration.Seconds(), team.Name, labels)
+	recordTeamRun(mc, "team", metrics.MWBSTaskActualDurationSec, duration.Seconds(), team, labels)
 }
 
 func (o *Orchestrator) recordWBSFailedBlockedDependents(team *ProductionTeam, node *TaskNode, cascaded int) {
@@ -3769,7 +3769,7 @@ func (o *Orchestrator) recordWBSFailedBlockedDependents(team *ProductionTeam, no
 		return
 	}
 	labels := node.wbsMetricLabels(team)
-	mc.RecordRun("team", metrics.MWBSFailedBlockedDependents, float64(cascaded), team.Name, labels)
+	recordTeamRun(mc, "team", metrics.MWBSFailedBlockedDependents, float64(cascaded), team, labels)
 }
 
 func (o *Orchestrator) recordWBSMaterialization(team *ProductionTeam, node *TaskNode, written []string, buildCwd string) {
@@ -3788,13 +3788,13 @@ func (o *Orchestrator) recordWBSMaterialization(team *ProductionTeam, node *Task
 		return
 	}
 	labels := node.wbsMetricLabels(team)
-	mc.RecordRun("team", metrics.MWBSMaterializedFiles, float64(len(written)), team.Name, labels)
+	recordTeamRun(mc, "team", metrics.MWBSMaterializedFiles, float64(len(written)), team, labels)
 	if buildCwd == "" {
 		return
 	}
 	rootLabels := node.wbsMetricLabels(team)
 	rootLabels["build_root"] = buildRootMetricLabel(team.Cwd, buildCwd)
-	mc.RecordRun("team", metrics.MWBSBuildRootDetected, 1, team.Name, rootLabels)
+	recordTeamRun(mc, "team", metrics.MWBSBuildRootDetected, 1, team, rootLabels)
 }
 
 func buildRootMetricLabel(cwd, buildCwd string) string {
@@ -4756,7 +4756,7 @@ func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, ob
 		if mc := team.metrics(); mc != nil {
 			labels := node.wbsMetricLabels(team)
 			labels["split_source"] = splitSource
-			mc.RecordRun("team", metrics.MWBSTimeoutSplitCount, 1, team.Name, labels)
+			recordTeamRun(mc, "team", metrics.MWBSTimeoutSplitCount, 1, team, labels)
 		}
 	}
 	if splitErr == nil && children > 0 {
@@ -4991,12 +4991,12 @@ func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNo
 			for _, childNode := range childNodes {
 				labels := childNode.wbsMetricLabels(team)
 				labels["split_source"] = splitSource
-				mc.RecordRun("team", metrics.MWBSTaskEstimatedMinutes, float64(childNode.EstimatedMin), team.Name, labels)
-				mc.RecordRun("team", metrics.MWBSLeafFiles, float64(len(childNode.TargetFiles)), team.Name, labels)
+				recordTeamRun(mc, "team", metrics.MWBSTaskEstimatedMinutes, float64(childNode.EstimatedMin), team, labels)
+				recordTeamRun(mc, "team", metrics.MWBSLeafFiles, float64(len(childNode.TargetFiles)), team, labels)
 			}
 			labels := node.wbsMetricLabels(team)
 			labels["split_source"] = splitSource
-			mc.RecordRun("team", metrics.MWBSSplitCount, float64(len(childNodes)), team.Name, labels)
+			recordTeamRun(mc, "team", metrics.MWBSSplitCount, float64(len(childNodes)), team, labels)
 		}
 	}
 	return len(childNodes), splitSource, nil

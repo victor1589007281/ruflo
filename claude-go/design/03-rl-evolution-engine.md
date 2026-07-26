@@ -62,7 +62,7 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 2. **技能自进化是死代码**：`AutoCreator` 仅构造（`bot.go:644`），全仓库对 `MaybeCreate`/`ImproveSkill` 的调用点为 **0**。
 3. **Dreaming headless 只建不触发**：`AfterQuery`/`RecordSession` 仅飞书路径调用（`feishu/session.go:770`、`bot.go:183`）；CLI 创建 dreamer 只为取 MemoryDir（`main.go:2547`）。
 
-### 1.3 轨迹不可对齐（RL 的数据地基缺失）　　**[✅ 四元组端到端通电 · llm.jsonl 已按 run_id 可聚合]**
+### 1.3 轨迹不可对齐（RL 的数据地基缺失）　　**[✅ 四元组端到端通电 · 四源均可按 run_id 对账]**
 
 > ✅ **trace 四元组已端到端通电（2026-07-25）**：`{RunID,NodeID,TurnID,CallID}` 经 `pkg/api/trace.go` 落出站请求头，`pkg/llmgw/server.go` 读入 `access.jsonl`。改造前 llmgw **早就在读 `X-CG-Run-ID`，但全仓无客户端发它** ⇒ 字段恒空——典型的"两头都写了、中间没接"。
 >
@@ -79,8 +79,14 @@ claude-go 已经拥有一套在**飞书常驻模式**下形式完整的学习栈
 >
 > **本轮核实后把"格式并存"这条收窄成一个更准的结论（仍未修，理由具体）**：
 >
-> - ✅ **llm.jsonl ↔ 奖励 ↔ TraceStore spans 三者已能 join**：都取同一个 `trace.From(ctx).RunID`（`teams.go:832` 造 `run-<team>-<traceID>`，`RewardEvent.RunID`/gate span 取同一个值）。这是 RL 真正需要的那条 join。
-> - ❌ **llm.jsonl ↔ team.jsonl 仍 join 不上**：`workflow_adversarial_dev.go` 的 20+ 处 `RecordRun("team", …, team.Name, …)` 用**裸团队名**当 run_id。**不能简单替换**——那些样本的 labels 里只有 `round`，`team.Name` 是团队身份的**唯一载体**，改成 trace run_id 会让"这条 build-pass-rate 属于哪个团队"彻底消失；要同时补一个 `team` 标签，而**加标签会改变 Prometheus 的序列身份**（旧序列停止更新、counter 历史断开），代价大于收益。留作单独一轮，届时应连 Grafana 面板一起改。
+> - ✅ **llm.jsonl ↔ 奖励 ↔ TraceStore spans 三者已能 join**：都取同一个 `trace.From(ctx).RunID`（`teams.go:832` 造 `run-<team>-<traceID>`，`RewardEvent.RunID`/gate span 取同一个值）。这是 RL 真正需要的那条 join。**已在真集群实测**：同一个 `run-e2e-real-…` 下 llm.jsonl 574 条 / trace spans 73 条 / rewards 8 条，且轨迹文件名就是 `trace-<run_id>.jsonl`。
+> - ✅ **llm.jsonl ↔ team.jsonl 已能 join（2026-07-26）**：`pkg/agent/team_metrics.go`（4 测试 + 3 变异反证）。逐条核实后发现范围比原记录**大得多**：不是"`workflow_adversarial_dev.go` 的 20+ 处"，而是**全仓 59 个 `RecordRun` 调用点无一例外**把 `team.Name` 传进那个叫 `runID` 的参数——`team.jsonl` 的 `run_id` 字段里装的一直是团队名。
+>
+>   ⚠️ **我此前把它记成"代价大于收益、留作单独一轮"，那个理由是错的**：它默认了"团队身份只能靠 labels 携带"。`MetricEvent.RunID` 从一开始就与 `Labels` 分离且**不进 Prometheus**；给它加一个同样不进 Prometheus 的 `Team` 字段，三件事同时成立——① `run_id` 恢复本义（真 RunID）⇒ 与 llm.jsonl / trace spans / rewards 可 join；② 团队身份不丢；③ **一个 Prometheus 序列都没动**（labels 一字未改）⇒ 既有 Grafana 查询不受影响。这与 dashboard 侧奖励聚合早就在用的 `(run_id, team)` 二元组口径一致（`run_feedback.go`）。
+>
+>   - **RunID 不靠穿 ctx 拿**：59 个调用点里只有约一半的外层函数带 ctx（另一半只拿到 `*ProductionTeam`）。为 8 个函数加 ctx 参数是过度改动——`team.LastRunID` 里已经是同一个值（`teams.go:835` 写入 `trace.From(ctx).RunID`），而每个调用点都握着 team。于是把 (team → RunID, 团队名) 收到 `recordTeamRun` 一处。
+>   - **拿不到 RunID 时留空，不回填团队名**：回填正是要修的那个缺陷换个位置。空 `run_id` 如实表示"这条指标不属于任何一次已开始的运行"（团队创建、重启后补记）。
+>   - **一个自己写出来的 bug 被自己的测试抓住**：helper 第一版把采集器参数写成接口以便注入，而调用点传的是 `*metrics.Collector`——它为 nil 时装进接口是**带类型的 nil**，`m == nil` 为 false ⇒ 照样调进去 ⇒ `c.mu.Lock()` 在 nil 上 panic。那道"兜一层"的守卫在最需要它的场景下恰好失效。改收具体类型。
 
 要重建 (state, action, reward) 三元组，当前缺：
 - **统一 trace-id**：llm.jsonl 无 turn/session/trajectory id，与 transcript/团队轨迹只能按时间戳粗对齐;

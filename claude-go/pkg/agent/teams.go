@@ -1286,9 +1286,9 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 	if ptm.metrics != nil {
 		labels := map[string]string{"workflow": "swarm"}
 		dur := team.FinishedAt.Sub(team.StartedAt).Seconds()
-		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
-		ptm.metrics.RecordRun("team", metrics.MTeamDurationSec, dur, team.Name, labels)
-		ptm.metrics.RecordRun("team", metrics.MTeamSuccessCount, 1, team.Name, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamRunCount, 1, team, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamDurationSec, dur, team, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamSuccessCount, 1, team, labels)
 		total, passed := 0, 0
 		for _, s := range results {
 			total++
@@ -1297,7 +1297,7 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 			}
 		}
 		if total > 0 {
-			ptm.metrics.RecordRun("team", metrics.MTeamStagePassRate, float64(passed)/float64(total), team.Name, labels)
+			recordTeamRun(ptm.metrics, "team", metrics.MTeamStagePassRate, float64(passed)/float64(total), team, labels)
 		}
 	}
 
@@ -1423,10 +1423,10 @@ func (ptm *ProductionTeamManager) failTeam(team *ProductionTeam, reason string) 
 	// 失败路径也要补齐整团队级指标, 否则 dashboard 的成败对比/故障分析会缺数据。
 	if ptm.metrics != nil {
 		labels := map[string]string{"workflow": team.Workflow, "status": "failed"}
-		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
-		ptm.metrics.RecordRun("team", metrics.MTeamFailCount, 1, team.Name, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamRunCount, 1, team, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamFailCount, 1, team, labels)
 		if !startedAt.IsZero() {
-			ptm.metrics.RecordRun("team", metrics.MTeamDurationSec, time.Since(startedAt).Seconds(), team.Name, labels)
+			recordTeamRun(ptm.metrics, "team", metrics.MTeamDurationSec, time.Since(startedAt).Seconds(), team, labels)
 		}
 	}
 
@@ -2167,10 +2167,10 @@ func (ptm *ProductionTeamManager) executePrediction(ctx context.Context, team *P
 	// 补齐 predict 工作流的团队级指标 (之前遗漏)
 	if ptm.metrics != nil {
 		labels := map[string]string{"workflow": team.Workflow, "status": "completed"}
-		ptm.metrics.RecordRun("team", metrics.MTeamRunCount, 1, team.Name, labels)
-		ptm.metrics.RecordRun("team", metrics.MTeamSuccessCount, 1, team.Name, labels)
-		ptm.metrics.RecordRun("team", metrics.MTeamDurationSec,
-			team.FinishedAt.Sub(team.StartedAt).Seconds(), team.Name, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamRunCount, 1, team, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamSuccessCount, 1, team, labels)
+		recordTeamRun(ptm.metrics, "team", metrics.MTeamDurationSec,
+			team.FinishedAt.Sub(team.StartedAt).Seconds(), team, labels)
 	}
 
 	if team.Blackboard != nil {

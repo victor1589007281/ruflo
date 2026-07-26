@@ -389,15 +389,15 @@ func (we *WorkflowExecutor) runBuildHardGate(
 		if todos := scanForTodos(team.Cwd); len(todos) > 0 {
 			we.notify(we.chatID, fmt.Sprintf("🟡 第 %d 轮: 编译通过但发现 %d 处未实现项, 启动内部修复", round, len(todos)))
 			if we.metrics != nil {
-				we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+				recordTeamRun(we.metrics, "team", metrics.MTeamBuildPassRate, 0, team, map[string]string{"round": fmt.Sprint(round)})
 			}
 			// 进入内部修复循环 (和编译失败同路径)
 			buildErrors = fmt.Sprintf("TODO/STUB 检测失败, 发现 %d 处未实现项", len(todos))
 		} else {
-			 tc := GetToolchain(lang)
+			tc := GetToolchain(lang)
 			we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译通过且无未实现项 (%s)", round, tc.BuildCheckLabel()))
 			if we.metrics != nil {
-				we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+				recordTeamRun(we.metrics, "team", metrics.MTeamBuildPassRate, 1, team, map[string]string{"round": fmt.Sprint(round)})
 			}
 			return true
 		}
@@ -405,7 +405,7 @@ func (we *WorkflowExecutor) runBuildHardGate(
 
 	we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译失败, 启动内部修复 (最多 %d 次)...", round, maxBuildRetries))
 	if we.metrics != nil {
-		we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		recordTeamRun(we.metrics, "team", metrics.MTeamBuildPassRate, 0, team, map[string]string{"round": fmt.Sprint(round)})
 	}
 
 	guard := NewCompileRepairGuard(3)
@@ -468,9 +468,9 @@ func (we *WorkflowExecutor) runBuildHardGate(
 			}
 			decision := guard.RecordRound(round)
 			if decision.Action == "abort" {
-					we.notify(we.chatID, fmt.Sprintf("🔴 编译修复被守卫终止: %s", decision.Reason))
-					return false
-				}
+				we.notify(we.chatID, fmt.Sprintf("🔴 编译修复被守卫终止: %s", decision.Reason))
+				return false
+			}
 			we.notify(we.chatID, fmt.Sprintf("  🔴 编译修复第 %d 次仍失败", retry))
 			continue
 		}
@@ -484,7 +484,7 @@ func (we *WorkflowExecutor) runBuildHardGate(
 
 		we.notify(we.chatID, fmt.Sprintf("  🟢 编译+实现均通过 (第 %d 次重试)", retry))
 		if we.metrics != nil {
-			we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name,
+			recordTeamRun(we.metrics, "team", metrics.MTeamBuildPassRate, 1, team,
 				map[string]string{"round": fmt.Sprint(round), "build_retry": fmt.Sprint(retry)})
 		}
 		return true
@@ -514,13 +514,13 @@ func (we *WorkflowExecutor) runTestHardGate(
 		if err != "" {
 			we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮 MySQL 集成测试不通过, 启动修复", round))
 			if we.metrics != nil {
-				we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+				recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 0, team, map[string]string{"round": fmt.Sprint(round)})
 			}
 			return we.runTestFixCycle(ctx, genStages, round, err, lastGenOutput, objective, prevResults, team, allResults)
 		}
 		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮 MySQL 集成测试通过", round))
 		if we.metrics != nil {
-			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 1, team, map[string]string{"round": fmt.Sprint(round)})
 		}
 		return true
 	}
@@ -528,17 +528,17 @@ func (we *WorkflowExecutor) runTestHardGate(
 	// 标准语言测试
 	testErrors := runTestCheckLang(team.Cwd, lang)
 	if testErrors == "" {
-		 tc := GetToolchain(lang)
+		tc := GetToolchain(lang)
 		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮测试通过 (%s)", round, tc.TestCheckLabel()))
 		if we.metrics != nil {
-			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 1, team, map[string]string{"round": fmt.Sprint(round)})
 		}
 		return true
 	}
 
 	we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮测试失败, 启动内部修复 (最多 %d 次)...", round, maxTestRetries))
 	if we.metrics != nil {
-		we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 0, team, map[string]string{"round": fmt.Sprint(round)})
 	}
 
 	return we.runTestFixCycle(ctx, genStages, round, testErrors, lastGenOutput, objective, prevResults, team, allResults)
@@ -604,7 +604,7 @@ func (we *WorkflowExecutor) runTestFixCycle(
 
 		we.notify(we.chatID, fmt.Sprintf("  🟢 测试通过 (第 %d 次重试)", retry))
 		if we.metrics != nil {
-			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name,
+			recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 1, team,
 				map[string]string{"round": fmt.Sprint(round), "test_retry": fmt.Sprint(retry)})
 		}
 		return true
@@ -735,7 +735,7 @@ func (we *WorkflowExecutor) runBuildGate(ctx context.Context, team *ProductionTe
 		we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮编译检查失败", round))
 		logging.Event(ctx, "adversarial.build_fail", "round", round)
 		if we.metrics != nil {
-			we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			recordTeamRun(we.metrics, "team", metrics.MTeamBuildPassRate, 0, team, map[string]string{"round": fmt.Sprint(round)})
 		}
 		buildPrefix := "### 编译错误 (必须优先修复):\n" + buildErrors
 		if prevFeedback == "" {
@@ -745,7 +745,7 @@ func (we *WorkflowExecutor) runBuildGate(ctx context.Context, team *ProductionTe
 	}
 	we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮编译检查通过", round))
 	if we.metrics != nil {
-		we.metrics.RecordRun("team", metrics.MTeamBuildPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		recordTeamRun(we.metrics, "team", metrics.MTeamBuildPassRate, 1, team, map[string]string{"round": fmt.Sprint(round)})
 	}
 	return prevFeedback
 }
@@ -765,7 +765,7 @@ func (we *WorkflowExecutor) runTestGate(ctx context.Context, team *ProductionTea
 		if err := we.runMySQLIntegrationTest(team.Cwd); err != "" {
 			we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮 MySQL 集成测试失败", round))
 			if we.metrics != nil {
-				we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+				recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 0, team, map[string]string{"round": fmt.Sprint(round)})
 			}
 			testPrefix := "### MySQL 集成测试错误 (必须修复):\n" + err
 			if prevFeedback == "" {
@@ -775,7 +775,7 @@ func (we *WorkflowExecutor) runTestGate(ctx context.Context, team *ProductionTea
 		}
 		we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮 MySQL 集成测试通过", round))
 		if we.metrics != nil {
-			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 1, team, map[string]string{"round": fmt.Sprint(round)})
 		}
 		return prevFeedback
 	}
@@ -784,7 +784,7 @@ func (we *WorkflowExecutor) runTestGate(ctx context.Context, team *ProductionTea
 	if testErrors != "" {
 		we.notify(we.chatID, fmt.Sprintf("🔴 第 %d 轮测试检查失败", round))
 		if we.metrics != nil {
-			we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 0, team.Name, map[string]string{"round": fmt.Sprint(round)})
+			recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 0, team, map[string]string{"round": fmt.Sprint(round)})
 		}
 		testPrefix := "### 测试错误 (必须优先修复):\n" + testErrors
 		if prevFeedback == "" {
@@ -794,7 +794,7 @@ func (we *WorkflowExecutor) runTestGate(ctx context.Context, team *ProductionTea
 	}
 	we.notify(we.chatID, fmt.Sprintf("🟢 第 %d 轮测试检查通过", round))
 	if we.metrics != nil {
-		we.metrics.RecordRun("team", metrics.MTeamTestPassRate, 1, team.Name, map[string]string{"round": fmt.Sprint(round)})
+		recordTeamRun(we.metrics, "team", metrics.MTeamTestPassRate, 1, team, map[string]string{"round": fmt.Sprint(round)})
 	}
 	return prevFeedback
 }
@@ -901,9 +901,9 @@ func (we *WorkflowExecutor) recordEvalMetrics(team *ProductionTeam, round int, s
 	if score.MeetsHardPassThreshold() {
 		val = 1.0
 	}
-	we.metrics.RecordRun("team", metrics.MTeamEvalPassRate, val, team.Name,
+	recordTeamRun(we.metrics, "team", metrics.MTeamEvalPassRate, val, team,
 		map[string]string{"round": fmt.Sprint(round), "termination": reason})
-	we.metrics.RecordRun("team", metrics.MTeamRoundCount, float64(round), team.Name, nil)
+	recordTeamRun(we.metrics, "team", metrics.MTeamRoundCount, float64(round), team, nil)
 }
 
 // runE2EAdversarial Phase 3: E2E 对抗测试 (tester↔coder 自适应循环)。

@@ -485,17 +485,17 @@ func (we *WorkflowExecutor) flushStagesLive(team *ProductionTeam, results []Stag
 			}
 			if sr.Duration != "" {
 				if d, err := time.ParseDuration(sr.Duration); err == nil {
-					mc.RecordRun("team", metrics.MTeamStageDurationSec, d.Seconds(), team.Name, labels)
+					recordTeamRun(mc, "team", metrics.MTeamStageDurationSec, d.Seconds(), team, labels)
 				}
 			}
-			mc.RecordRun("team", metrics.MTeamStageCount, 1, team.Name, labels)
+			recordTeamRun(mc, "team", metrics.MTeamStageCount, 1, team, labels)
 			if sr.Status == TaskCompleted {
-				mc.RecordRun("team", metrics.MTeamStageSuccessCount, 1, team.Name, labels)
+				recordTeamRun(mc, "team", metrics.MTeamStageSuccessCount, 1, team, labels)
 			} else if sr.Status == TaskFailed {
-				mc.RecordRun("team", metrics.MTeamStageFailCount, 1, team.Name, labels)
+				recordTeamRun(mc, "team", metrics.MTeamStageFailCount, 1, team, labels)
 			}
 			if sr.Output != "" {
-				mc.RecordRun("team", metrics.MTeamStageOutputLen, float64(len(sr.Output)), team.Name, labels)
+				recordTeamRun(mc, "team", metrics.MTeamStageOutputLen, float64(len(sr.Output)), team, labels)
 			}
 		}
 	}
