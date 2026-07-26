@@ -167,7 +167,11 @@ type LLMGateway interface {
 
 **thinking/effort**：网关统一注入 provider 方言（Kimi thinking 开关、effort 映射），下游只声明抽象档位；Kimi「thinking 计入 max_tokens」的坑（`client.go:1463-1466`）在网关内集中处理。
 
-### 3.2 L2 · Agent 编排层（控制面）　　**[🟠 部分]**
+### 3.2 L2 · Agent 编排层（控制面）　　**[🟠 队列/注册表/派发 ✅ · 单副本假设仍在]**
+
+> **细化（2026-07-25）**：原标注只写"部分"，太笼统。已落地：任务队列 + worker 注册表 + 租约续期 + 能力标签路由（`pkg/cluster` + `pkg/worker/broker.go`）· 三种 `AgentRuntime` 的放置求解（硬约束过滤 + 软偏好打分 + 团队亲和，同分按名字升序保证确定性）· 动作队列真被消费。
+>
+> **仍在的单副本假设**：cron 单副本（worker 进程显式 `Stop()` 掉它以免重复触发同一 job）· 会话无一致性哈希 · 控制面 `taskState` 每 300ms 轮询 `Queue.Get`（file 后端下是整桶读，T2 规模够用、大规模需队列侧 watch）。
 
 > **实测**：Journal + Replay 真实，但 journal 是 `os.OpenFile` 本地文件、**不经 StateStore**（`pkg/graph/journal.go:98`）。`NodeTask` 类型不存在；**编排器从不入队**——`Enqueue` 唯一生产调用方是 HTTP handler（`pkg/cluster/http.go:54`），`pkg/agent` 零 `pkg/cluster` import。per-run 单主租约 `orchestrator-lease/<runID>` 零命中；`Queue.Extend` 无执行侧调用方。
 
@@ -354,7 +358,17 @@ design/03 的 Evolution Service 整体作为 L4 组件：单机=进程内模块�
 
 ---
 
-## 六、现有功能覆盖矩阵（接入与服务域）　　**[🟠 ≈47%]**
+## 六、现有功能覆盖矩阵（接入与服务域）　　**[🟠 ≈75%：契约已冻结并有测试守护 / 三项拆分未做]**
+
+> **重算（2026-07-25，逐行核实）**：≈47% → ≈75%。变化主要来自三件事：
+>
+> ① **契约从"靠人记得"变成"测试守着"**：`:18080` 与 wiki 侧共 60+ 条表驱动契约测试。四维断言里最要紧的一条是**比 `mux.Handler(req)` 返回的 pattern 而不是只看状态码**——dashboard 是 SPA 用 `/` 兜底路由，只看状态码的测试会因为拿到 `200 + index.html` 而全绿；另一条是**表与源码双向一致**（正则扫源文件枚举注册点），它防的正是"悄悄加端点没登记"，`/cluster/*` 漏鉴权就是这个错。
+>
+> ② **新增接入面**：`platform-mcp-server` 8 个工具（HTTP + stdio 两传输**共用同一 Backend**，不会出现"HTTP 有这工具 stdio 没有"）· 只读 dashboard 独立部署且动作**真转发**控制面（5 处 `forwardActionToControl`，含修掉"转发请求体是空的"那个潜在 bug）。
+>
+> ③ **出口收敛**：飞书/dashboard 侧 9 处 LLM 调用改经网关；LLM 事件从"只有 1 个客户端被赋值"变成全局 sink。
+>
+> **仍未做的三项拆分**（都在 §3.5 逐条记账）：CLI `--server`（前置条件是 `:18080` 上没有"执行一次 prompt"的端点，那牵涉会话 owner 路由）· feishu-adapter 拆分（上帝对象原样）· sync→TaskService（`TaskSpec` 是团队形状，硬塞得先加通用任务类型）。
 
 > **实测**：⚠️ 本矩阵是计划表不是状态表。其中「:7777 动作队列 → TaskService file-queue · 等价」**不成立**：无 TaskService，且该队列全仓无消费方。
 
