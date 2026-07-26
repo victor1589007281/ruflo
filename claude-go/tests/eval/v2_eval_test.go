@@ -1602,15 +1602,28 @@ func testDreamingV2(t *testing.T, report *WikiEvalReport) {
 	}
 
 	// 24.4 自定义整理函数
+	//
+	// ⚠️ 这里原本是 `consolidated := false` + `time.Sleep(200ms)` + 裸读, 两个缺陷:
+	//  ① **数据竞争**: 回调跑在 ForceDream 起的后台 goroutine 里, 写 consolidated;
+	//     测试主 goroutine 读它。`-race` 会如实报 WARNING: DATA RACE (已实测)。
+	//  ② **靠睡眠等后台完成**: 200ms 在全量并发跑 (CPU 争抢) 下不够, 于是这一项
+	//     时不时静默少给 2 分 —— 一个会随机改变结论的断言。
+	// 改用 `WaitBackground()`(dreaming 包为此加的等待点) + 互斥保护的标志位。
+	var consolidatedMu sync.Mutex
 	consolidated := false
 	d.SetConsolidateFn(func(ctx context.Context, sessions []dreaming.SessionRecord, memDir string) error {
+		consolidatedMu.Lock()
 		consolidated = true
+		consolidatedMu.Unlock()
 		// 验证 sessions 按重要性排序
 		return nil
 	})
 	d.ForceDream(context.Background())
-	time.Sleep(200 * time.Millisecond)
-	if consolidated {
+	d.WaitBackground() // 等后台整理真正收敛, 不猜时间
+	consolidatedMu.Lock()
+	didConsolidate := consolidated
+	consolidatedMu.Unlock()
+	if didConsolidate {
 		score += 2
 		t.Log("✓ ForceDream 触发整理")
 	}

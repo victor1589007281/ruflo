@@ -371,7 +371,30 @@ func (d *Dreamer) AfterQuery(ctx context.Context) {
 		_ = triggerSource // label 将在后续 RecordWithLabels 支持时使用
 	}
 
-	go d.executeDream(ctx)
+	d.startDream(ctx)
+}
+
+// startDream 起一次整理并**登记进 d.bg**。
+//
+// ⚠️ 这一步是 WaitBackground 能成立的前提, 而它最初漏了 —— 那是个真 bug, 由 -race 在
+// tests/eval 里抓到 (`WaitBackground` 的 Wait 与 executeDream 内的 `bg.Add(1)` 互撞):
+//
+//	改造前: ForceDream → `go d.executeDream(ctx)`   ← **没登记**
+//	        测试     → WaitBackground() = bg.Wait() ← 计数器此刻是 0, **立刻返回**
+//	        随后     executeDream 内部才 `bg.Add(1)` ← 与已开始的 Wait 并发 = WaitGroup 误用
+//
+// 两个后果叠在一起: ① `sync.WaitGroup` 明确规定"计数器为 0 时开始的 Add 必须发生在 Wait
+// 之前", 违反即数据竞争; ② WaitBackground **提前返回**, 于是它本来要修的那个"靠睡眠等
+// 后台"的问题根本没被修好 —— 一个看起来已修的修复。
+//
+// 登记外层 goroutine 之后, 计数器在 executeDream 全程 ≥1, 内层那些 Add 都发生在计数器
+// 非 0 时, 契约成立且 Wait 不会早退。
+func (d *Dreamer) startDream(ctx context.Context) {
+	d.bg.Add(1)
+	go func() {
+		defer d.bg.Done()
+		d.executeDream(ctx)
+	}()
 }
 
 // recordGateBlock 记录门控拦截原因 (可观测性)
@@ -886,7 +909,7 @@ func (d *Dreamer) ForceDream(ctx context.Context) error {
 		d.dreaming.Store(false)
 		return fmt.Errorf("无法获取锁（可能其他进程正在整理）")
 	}
-	go d.executeDream(ctx)
+	d.startDream(ctx)
 	return nil
 }
 

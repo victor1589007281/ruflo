@@ -7,27 +7,32 @@
 //   - RAPTOR (Sarthi et al. 2024): 递归抽象 + 树状检索
 //
 // v2 改进 (解决"失忆"根因):
-//   1. 移除 2h CreatedAt 硬截断 → 完全依赖 Ebbinghaus Retention() 做软衰减
-//   2. 新增磁盘持久化 (JSON) → 进程重启后恢复记忆
-//   3. 团队产出写入高权重 (Importance=0.9) 记忆 → 团队名可被检索
-//   4. 多路检索: BM25 + 实体匹配 bonus → 提高召回质量
-//   5. 重要性分级: team_result(0.9) > pre_compact(0.7) > extraction(0.6) > agent(0.5)
 //
-//	┌──────────────────────────────────────────────────┐
-//	│  Working Memory (工作记忆 / 短期)                 │
-//	│  = QueryEngine.Messages (当前对话上下文)          │
-//	└──────────────────┬───────────────────────────────┘
-//	                   │ compact → extractKeyFacts
-//	┌──────────────────▼───────────────────────────────┐
-//	│  Episodic Memory (情景记忆 / 中期)  ← 本文件     │
-//	│  = TieredStore (BM25 + Ebbinghaus)               │
-//	│  持久化: episodic_memory.json                     │
-//	└──────────────────┬───────────────────────────────┘
-//	                   │ Dreaming 整理
-//	┌──────────────────▼───────────────────────────────┐
-//	│  Semantic Memory (语义记忆 / 长期)                │
-//	│  = .claude/memory/*.md                            │
-//	└──────────────────────────────────────────────────┘
+//  1. 移除 2h CreatedAt 硬截断 → 完全依赖 Ebbinghaus Retention() 做软衰减
+//
+//  2. 新增磁盘持久化 (JSON) → 进程重启后恢复记忆
+//
+//  3. 团队产出写入高权重 (Importance=0.9) 记忆 → 团队名可被检索
+//
+//  4. 多路检索: BM25 + 实体匹配 bonus → 提高召回质量
+//
+//  5. 重要性分级: team_result(0.9) > pre_compact(0.7) > extraction(0.6) > agent(0.5)
+//
+//     ┌──────────────────────────────────────────────────┐
+//     │  Working Memory (工作记忆 / 短期)                 │
+//     │  = QueryEngine.Messages (当前对话上下文)          │
+//     └──────────────────┬───────────────────────────────┘
+//     │ compact → extractKeyFacts
+//     ┌──────────────────▼───────────────────────────────┐
+//     │  Episodic Memory (情景记忆 / 中期)  ← 本文件     │
+//     │  = TieredStore (BM25 + Ebbinghaus)               │
+//     │  持久化: episodic_memory.json                     │
+//     └──────────────────┬───────────────────────────────┘
+//     │ Dreaming 整理
+//     ┌──────────────────▼───────────────────────────────┐
+//     │  Semantic Memory (语义记忆 / 长期)                │
+//     │  = .claude/memory/*.md                            │
+//     └──────────────────────────────────────────────────┘
 package memory
 
 import (
@@ -66,10 +71,26 @@ func (e *MemoryEntry) Retention() float64 {
 	return e.Importance * math.Exp(-decay*hoursSinceAccess/spacedRepetition)
 }
 
-// Touch 标记记忆被访问 (增强间隔重复效应)
+// Touch 标记记忆被访问 (增强间隔重复效应)。
+//
+// ⚠️ 调用方必须持 TieredStore 的**写锁**: 它改的两个字段会被 PersistToDisk 读到
+// (见那里的注释)。`Retrieve` 是这么做的。
 func (e *MemoryEntry) Touch() {
 	e.AccessCount++
 	e.LastAccess = time.Now()
+}
+
+// snapshot 返回一份与原对象**无共享**的值拷贝, 供锁外序列化使用。
+//
+// Topics 单独拷一份: 浅拷贝会让快照与原对象共享同一个底层数组, 于是"按值快照"这件事
+// 在唯一的引用字段上恰好不成立 —— 这类半个深拷贝比不拷更难查, 因为大部分字段看着是安全的。
+func (e *MemoryEntry) snapshot() MemoryEntry {
+	c := *e
+	if e.Topics != nil {
+		c.Topics = make([]string, len(e.Topics))
+		copy(c.Topics, e.Topics)
+	}
+	return c
 }
 
 // TieredStore 多层记忆存储 (v2: 含磁盘持久化)。
@@ -84,7 +105,22 @@ type TieredStore struct {
 	persistPath string
 	// dirty 标记是否有未持久化的变更
 	dirty bool
+	// bg 跟踪 Add 内部起的**后台落盘** goroutine, 使本存储可 join (见 WaitPersist)。
+	//
+	// 为什么需要它: `Add` 对高权重记忆 fire-and-forget 一次 PersistToDisk。生产上无所谓
+	// (进程退出即止), 但测试里 `t.TempDir()` 的清理会与那次写盘竞态 —— 表现是
+	// "RemoveAll: directory not empty" 的**间歇性**失败, 且看起来与被测逻辑毫无关系。
+	// 这与 pkg/dreaming 的 bg 是同一条理由 (那边已因此吃过一次亏)。
+	bg sync.WaitGroup
 }
+
+// WaitPersist 等待 Add 触发的后台落盘全部结束。
+//
+// 面向测试与优雅关闭: 调用它的时候**必须已经没有并发的 Add** —— `sync.WaitGroup` 规定
+// "计数器为 0 时开始的 Add 必须发生在 Wait 之前", 违反即数据竞争 (pkg/dreaming 的
+// WaitBackground 正是踩了这一条: 外层 goroutine 没登记, Wait 先看到 0 就早退, 随后
+// 内层 Add 与它并发)。
+func (s *TieredStore) WaitPersist() { s.bg.Wait() }
 
 // NewTieredStore 创建多层记忆存储
 func NewTieredStore() *TieredStore {
@@ -133,6 +169,21 @@ func (s *TieredStore) loadFromDisk() {
 }
 
 // PersistToDisk 将记忆持久化到磁盘。定期调用或在写入高权重记忆后调用。
+//
+// ⚠️ **快照必须按值拷贝, 不能只拷指针** —— 这里曾是一个真实的数据竞争 (由 `-race`
+// 在 tests/eval 里抓到, 三条 WARNING: DATA RACE):
+//
+//	Add() 对高权重记忆 `go s.PersistToDisk()`  ← 后台 goroutine 序列化 entries
+//	Retrieve() 在写锁内 `c.entry.Touch()`      ← 同时改 AccessCount / LastAccess
+//
+// 改造前只在 RLock 里拷**指针切片**, 然后**在锁外**对指针指向的对象做 JSON 序列化,
+// 于是序列化正在读的 entry 可以被 Touch 并发改写。后果不只是 race 检测器报警:
+// `time.Time` 是多字长值, 撕裂读能写出一个**无意义的时间戳**落到磁盘, 而下次
+// LoadFromDisk 会拿它去算 Retention() —— 一条记忆可能因此被判成早该遗忘并**丢弃**。
+//
+// 为什么不是"把序列化搬进 RLock" (更短的改动): 那会把整个记忆库的 JSON 编码 + 写盘
+// 时间都攥在读锁里, 而 Retrieve 要拿写锁 —— 记忆检索在交付主路径上, 会被写盘卡住。
+// 按值快照的代价只是一次浅拷贝 (MemoryEntry 全是值字段, Topics 单独拷一份)。
 func (s *TieredStore) PersistToDisk() {
 	if s.persistPath == "" {
 		return
@@ -142,12 +193,14 @@ func (s *TieredStore) PersistToDisk() {
 		s.mu.RUnlock()
 		return
 	}
-	entries := make([]*MemoryEntry, 0, len(s.episodic))
+	entries := make([]MemoryEntry, 0, len(s.episodic))
 	for _, e := range s.episodic {
-		entries = append(entries, e)
+		entries = append(entries, e.snapshot())
 	}
 	s.mu.RUnlock()
 
+	// 序列化的是快照, 与 s.episodic 里的对象再无共享 ⇒ 锁外编码是安全的。
+	// (JSON 形态与改造前逐字节一致: []MemoryEntry 与 []*MemoryEntry 编码结果相同。)
 	data, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		log.Printf("[Memory] 序列化失败: %v", err)
@@ -182,9 +235,15 @@ func (s *TieredStore) Add(entry *MemoryEntry) {
 	s.episodic[entry.ID] = entry
 	s.dirty = true
 
-	// 高权重记忆立即持久化 (team_result, manual)
+	// 高权重记忆立即持久化 (team_result, manual)。
+	// 登记进 bg 使其可 join —— 理由见 bg 字段的注释 (Add 在 s.mu 内, 计数器递增发生在
+	// 任何 WaitPersist 之前, 契约成立)。
 	if entry.Importance >= 0.8 {
-		go s.PersistToDisk()
+		s.bg.Add(1)
+		go func() {
+			defer s.bg.Done()
+			s.PersistToDisk()
+		}()
 	}
 }
 
@@ -421,4 +480,3 @@ func tokenize(text string) []string {
 	flushCJK()
 	return tokens
 }
-
