@@ -53,15 +53,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/trace"
 )
 
-// 图运行终态 (design/01 §4.3 RunStatus 的 v1 子集)。
-const (
-	RunStatusCompleted = "completed"
-	RunStatusPartial   = "partial"
-	RunStatusFailed    = "failed"
-	// RunStatusSuspended 本次运行有节点挂起 (等人工答复 / 等限流退避), 可 resume 续跑。
-	// **只有声明了 suspend 的节点或 human 节点才能产生它** —— 未声明时一切照旧。
-	RunStatusSuspended = "suspended"
-)
+// 图运行状态常量 (RunStatus*) 与"设计 8 态 vs 图层 6 态"的逐条对账见 runstatus.go。
 
 // Engine 图执行引擎。零值不可用: 必须注入 Runner;
 // Journal 为 nil 时退化为进程内 MemoryJournal (无持久化), Hooks 为 nil 时用 NopBus。
@@ -141,6 +133,10 @@ type runCtx struct {
 
 	mu         sync.Mutex
 	totalNodes int // 运行图当前节点数 (含展开产物与 map 分片), 受 MaxTotalNodes 约束
+	// spent 限定 NodeID → 本次运行内该节点的累计**执行**耗时 (见 node_budget.go)。
+	// 只有声明了 Suspend 的节点会进这张表 —— 别的节点一次运行内只进 execNode 一次,
+	// 记了也没有第二次去读。懒初始化: 生产全仓零 Suspend 声明 ⇒ 恒 nil。
+	spent map[string]time.Duration
 }
 
 // maxTotalNodes 运行图节点总数上限。
@@ -638,15 +634,44 @@ func (e *Engine) execNode(ctx context.Context, rc *runCtx, scope execScope, node
 	}
 
 	// 语义3: trace NodeID 注入 + 节点级超时。
+	//
+	// deadline 取的是**剩余**预算而不是恒取完整 TimeoutSec: 挂起-唤醒会让同一个节点在
+	// 一次运行内多次进入本函数, 每次都给满额等于"节点总预算"这个契约不成立
+	// (见 node_budget.go)。未声明 Suspend 的节点 (= 全仓所有生产节点) 走的是
+	// remainingBudget 的直通支, 与改造前逐字节相同。
 	nctx := trace.With(ctx, trace.IDs{NodeID: evID})
 	if node.TimeoutSec > 0 {
+		left, ok := rc.remainingBudget(evID, node)
+		if !ok {
+			// 预算已在本次运行的前几次尝试里烧完。fail-closed 判 failed 而不是继续挂着
+			// —— 继续挂着意味着下一轮 resume 又发一份完整预算, 天花板就永不封顶
+			// (成因与取舍见 node_budget.go 三)。
+			res := NodeResult{Status: NodeStatusFailed, Err: fmt.Sprintf(
+				"graph: 节点执行预算耗尽 (已用 %s / 上限 %ds; 挂起-唤醒不重置预算)",
+				left, node.TimeoutSec)}
+			rc.appendEv(EvNodeFailed, evID, scope.with(map[string]any{
+				"error": res.Err, "budget_sec": node.TimeoutSec,
+				"spent_ms": left.Milliseconds(), "reason": "node_budget_exhausted",
+			}))
+			rc.hooks.Emit(nctx, HookEvent{Scope: ScopeNode, Phase: "failure", RunID: rc.runID, NodeID: evID,
+				Payload: scope.with(map[string]any{
+					"kind": string(node.Kind), "role": node.Agent.Role,
+					"status": res.Status, "error": res.Err,
+					"attempts": 0, "iterations": 0, "duration_ms": int64(0),
+				})})
+			return res
+		}
 		var cancel context.CancelFunc
-		nctx, cancel = context.WithTimeout(nctx, time.Duration(node.TimeoutSec)*time.Second)
+		nctx, cancel = context.WithTimeout(nctx, left)
 		defer cancel()
 	}
 
 	rc.appendEv(EvNodeStarted, evID, scope.extra)
 	started := time.Now()
+	// 本次尝试的实际耗时记进累计执行预算 (只对声明了 Suspend 的节点发生)。
+	// defer 而不是写在 switch 之后: 中间任何一条 return 路径都不该漏记, 否则一个
+	// 提前返回的形态就能把预算"洗掉"。
+	defer func() { rc.chargeBudget(evID, node, time.Since(started)) }()
 
 	var (
 		res      NodeResult

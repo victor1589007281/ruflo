@@ -829,6 +829,10 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		completedStages := sortedStageNames(prevResults)
 		bbContext = team.Blackboard.HandoffContext(completedStages, stage.Role)
 	}
+	// 1a1. shadow 比例灰度 (design/03 §4.6/§4.7): 必须在组装提示词**之前**问,
+	// 因为它换的就是 StageDef.Prompt 本身。无实验/无 RunID 时原样返回 stage,
+	// 提示词与改造前逐字节一致。见 prompt_canary.go。
+	stage, promptCanary := we.applyPromptCanary(ctx, stage, team)
 	prompt := buildStagePromptWithRoles(stage, objective, prevResults, we.roles)
 	referenceContext := buildLocalReferenceContextForStage(stage, objective)
 	if referenceContext != "" {
@@ -876,7 +880,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		UserFeedback:  injectedUserFeedback,
 		Prompt:        prompt,
 		Objective:     objective,
-	})
+	}, promptCanary)
 
 	// 2. 创建 V2 Task (LLM 可通过 TaskList 看到团队进度)
 	var v2TaskID string

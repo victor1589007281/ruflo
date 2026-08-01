@@ -86,7 +86,14 @@ func (s TaskState) Terminal() bool {
 // 现在生产入口 (:7777 动作队列 / 飞书 /team run / CLI) 携带的全部信息就是
 // team+workflow+objective+参数, 用 GraphSpec 反而要在这里凭空造图。等 pkg/graph 的
 // GraphSpec 成为唯一分发点后, 给本结构加一个 Graph 字段即可平滑过渡。
+// Kind 是**唯一**的非团队扩展点 (design/02 §3.5 "sync→TaskService" 的前置条件):
+// 本结构此前完全是团队形状, 于是 pkg/sync 这类"不是团队"的执行体没地方落 ——
+// 设计稿把这条记为"硬塞得先加通用任务类型"。空值 = 团队编排 (历史唯一形态),
+// 故既有调用方一个字都不用改, 派生幂等键也逐字节不变 (见 DeriveIdemKey)。
+// 分派由 KindRunner 负责, 且**未注册的 kind 一律报错**而不是落到团队执行器 ——
+// 否则一个 kind="sync" 的任务会被当成"团队名为空的团队"跑, 而那是静默错行为。
 type TaskSpec struct {
+	Kind      string         `json:"kind,omitempty"`     // 任务类型; 空 = 团队编排
 	Team      string         `json:"team"`               // 团队名 (= 运行的身份)
 	Workflow  string         `json:"workflow,omitempty"` // 工作流名; 团队已存在时可省
 	Objective string         `json:"objective"`          // 目标描述
@@ -328,23 +335,33 @@ func shortHash(s string) string {
 	return hex.EncodeToString(sum[:])[:8]
 }
 
-// DeriveIdemKey 由规格派生默认幂等键: 同 team + 同 workflow + 同 objective 视为同一次提交。
-// 用哈希而非原文: objective 可能有几 KB, 直接当 KV key 会把 bucket 文件撑爆。
-func DeriveIdemKey(spec TaskSpec) string {
-	return "derived-" + shortHash(strings.Join([]string{
+// idemParts 拼幂等/活跃索引的哈希输入。
+//
+// Kind 只在**非空时**才追加, 这一点是刻意的: 既有全部任务的 Kind 都是空,
+// 追加 "kind=" 之类的固定后缀会让所有派生键改值 —— 升级瞬间正在跑的任务在
+// 新二进制里查不到自己的幂等键, 于是同一次提交被建成第二份档案并**并发跑两遍**。
+// 只在新形态上加后缀, 老键逐字节不变。
+func idemParts(spec TaskSpec) string {
+	parts := []string{
 		strings.TrimSpace(spec.Team),
 		strings.TrimSpace(spec.Workflow),
 		strings.TrimSpace(spec.Objective),
-	}, "\x00"))
+	}
+	if k := strings.TrimSpace(spec.Kind); k != "" {
+		parts = append(parts, "kind="+k)
+	}
+	return strings.Join(parts, "\x00")
+}
+
+// DeriveIdemKey 由规格派生默认幂等键: 同 team + 同 workflow + 同 objective 视为同一次提交。
+// 用哈希而非原文: objective 可能有几 KB, 直接当 KV key 会把 bucket 文件撑爆。
+func DeriveIdemKey(spec TaskSpec) string {
+	return "derived-" + shortHash(idemParts(spec))
 }
 
 // activeKey 活跃索引的键 (与幂等键同构, 但独立成表: 显式幂等键不该绕过"同团队不并发跑")。
 func activeKey(spec TaskSpec) string {
-	return "active-" + shortHash(strings.Join([]string{
-		strings.TrimSpace(spec.Team),
-		strings.TrimSpace(spec.Workflow),
-		strings.TrimSpace(spec.Objective),
-	}, "\x00"))
+	return "active-" + shortHash(idemParts(spec))
 }
 
 // newTaskID 生成任务 ID: 时间有序 + 序号防撞 + 内容短哈希便于肉眼归类。

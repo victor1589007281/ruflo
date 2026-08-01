@@ -75,7 +75,10 @@ var safeFields = map[string]bool{
 }
 
 // maxShadowRatio design/03 §4.7 明写的 shadow 比例上限。
-const maxShadowRatio = 0.5
+//
+// 定值与钳制逻辑现在住在 pkg/evolution/learners/canary.go —— 因为**运行期**也要
+// 夹一次 (实验记录是磁盘 JSON, 手改一行就能绕过写盘这道闸)。护栏长在两侧才算护栏。
+const maxShadowRatio = learners.MaxShadowRatio
 
 // evoStatusMinInterval H9: 同一实验的状态查询最小间隔。
 const evoStatusMinInterval = 30 * time.Minute
@@ -534,17 +537,12 @@ func (t *EvoRunExperimentTool) InputSchema() json.RawMessage {
 }
 func (t *EvoRunExperimentTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
-// Experiment 一次 shadow 配对实验的登记。
-type Experiment struct {
-	ID          string  `json:"id"`
-	Proposal    string  `json:"proposal"`
-	StartedAtMS int64   `json:"started_at_ms"` // 基线切分点: 之前的奖励算基线, 之后算实验组
-	SamplesWant int     `json:"samples_want"`
-	ShadowRatio float64 `json:"shadow_ratio"`
-	Note        string  `json:"note,omitempty"`
-	// LastCheckedMS H9 限速: 上次 evo_status 的时刻, 持久化以便进程重启不重置限速。
-	LastCheckedMS int64 `json:"last_checked_ms,omitempty"`
-}
+// Experiment 一次 shadow 配对实验的登记 (定义在 pkg/evolution/learners)。
+//
+// 别名而非副本: 记录的读方在运行期 (pkg/agent 按 shadow_ratio 分流), 而
+// pkg/tool/builtin 传递依赖 pkg/agent (经 pkg/evolution/govern) ⇒ 反向 import 会成环,
+// 故类型下沉到双方都能 import 的 learners。留别名是为了本包与 evo_* 的返回体形状不变。
+type Experiment = learners.Experiment
 
 func (t *EvoRunExperimentTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
@@ -587,44 +585,17 @@ func (t *EvoRunExperimentTool) Call(_ context.Context, input json.RawMessage, tc
 	return okResult(out)
 }
 
-func clampShadowRatio(r float64) (float64, bool) {
-	if r <= 0 {
-		return maxShadowRatio, false // 未指定: 用上限 (配对实验要 50/50 才最省样本)
-	}
-	if r > maxShadowRatio {
-		return maxShadowRatio, true
-	}
-	return r, false
-}
-
-func experimentsDir(stateDir string) string {
-	return filepath.Join(stateDir, "evolution", "experiments")
-}
+// 下面四个是 learners 的薄转发。留着而不是让调用点直接写 learners.XxX:
+// 写盘那一侧的语义 ("未指定 ⇒ 用上限") 与决策那一侧 ("0 ⇒ 一条都不注入") 不同,
+// 本包只该碰写盘这一套, 名字保持小写就不会有人从这里拿去做运行期判定。
+func clampShadowRatio(r float64) (float64, bool) { return learners.ClampShadowRatio(r) }
 
 func saveExperiment(stateDir string, e Experiment) error {
-	dir := experimentsDir(stateDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(e, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, filepath.Base(e.ID)+".json"), data, 0o644)
+	return learners.SaveExperiment(stateDir, e)
 }
 
 func loadExperiment(stateDir, id string) (*Experiment, error) {
-	// 只取 basename, 防路径穿越 (id 来自 agent 入参)。
-	path := filepath.Join(experimentsDir(stateDir), filepath.Base(id)+".json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("实验 %q 不存在 (先用 evo_run_experiment 启动)", id)
-	}
-	var e Experiment
-	if err := json.Unmarshal(data, &e); err != nil {
-		return nil, fmt.Errorf("实验 %q 记录损坏: %w", id, err)
-	}
-	return &e, nil
+	return learners.LoadExperiment(stateDir, id)
 }
 
 // ---------------------------------------------------------------------------

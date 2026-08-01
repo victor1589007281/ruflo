@@ -7,8 +7,10 @@ FROM debian:bookworm-slim
 
 # git 是 cwd 的 git 档位 (design/02 §3.3) 的硬依赖: worker 每阶段 fetch/commit/push,
 # 控制面 ff-only 同步。不装它, git 档位会在第一条 git 命令上失败。
+# python3: if-jd-analysis 等团队工作流明确要求用 `python3 json.dump` 写盘产物,
+# 不装它会导致写盘步骤在容器内失败。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git curl \
+      ca-certificates git curl python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY claude-go-linux /usr/local/bin/claude-go

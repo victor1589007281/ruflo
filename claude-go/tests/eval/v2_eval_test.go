@@ -159,9 +159,8 @@ func TestV2Eval(t *testing.T) {
 	t.Run("TesterE2ECapability", func(t *testing.T) {
 		testTesterE2ECapability(t, report)
 	})
-	t.Run("GoalDecomposition", func(t *testing.T) {
-		testGoalDecomposition(t, report)
-	})
+	// GoalDecomposition 用例随 pkg/agent/goaldecomp.go 一并删除 (design/01 §4.2:
+	// HTN 分解已被 pkg/graph 的 ExpandSpec 收编, GoalTree 全仓零生产调用方)。
 	t.Run("DynamicRolePool", func(t *testing.T) {
 		testDynamicRolePool(t, report)
 	})
@@ -2404,67 +2403,15 @@ func testTesterE2ECapability(t *testing.T, report *WikiEvalReport) {
 	report.Add("tester-e2e", "测试人员E2E能力", score, 10, "E2E测试+跨模块+竞态检测+角色增强")
 }
 
-// --- 39. 层级目标分解 (超长上下文方案) ---
-
-func testGoalDecomposition(t *testing.T, report *WikiEvalReport) {
-	t.Helper()
-	score := 0.0
-
-	dir := t.TempDir()
-	gt := agent.NewGoalTree(dir)
-
-	// 39.1 创建根目标
-	root := gt.AddRoot("重构MySQL系统", "将MySQL数据库系统从单体架构重构为微服务架构")
-	if root != nil && root.ID != "" && root.Status == agent.GoalActive {
-		score += 1
-		t.Log("✓ 根目标创建成功")
-	}
-
-	// 39.2 层级分解 (HTN decomposition)
-	children := gt.Decompose(root.ID, []agent.SubGoalDef{
-		{Title: "解析器重构", Description: "SQL解析器模块化", Owner: "coder-1", AcceptCriteria: []string{"go build通过", "覆盖率>80%"}, Priority: 2},
-		{Title: "存储引擎重构", Description: "存储引擎解耦", Owner: "coder-2", AcceptCriteria: []string{"benchmark不退化"}, Priority: 1},
-		{Title: "查询优化器重构", Description: "优化器模块化", Owner: "coder-3", AcceptCriteria: []string{"TPC-H基准测试通过"}, Priority: 1},
-	})
-	if len(children) == 3 {
-		score += 2
-		t.Log("✓ 三级子目标分解成功")
-	}
-
-	// 39.3 根目标变为 decomposed 状态
-	gt2 := agent.NewGoalTree(dir) // 重新加载验证持久化
-	if node, ok := gt2.Nodes[root.ID]; ok && node.Status == agent.GoalDecomposed {
-		score += 1
-		t.Log("✓ 根目标变为decomposed状态 + 持久化成功")
-	}
-
-	// 39.4 上下文构建 (O(depth) 而非 O(n))
-	if len(children) > 0 {
-		ctx := gt.ContextForGoal(children[0].ID)
-		if strings.Contains(ctx, "重构MySQL") && strings.Contains(ctx, "解析器重构") {
-			score += 2
-			t.Log("✓ ContextForGoal 包含祖先链+当前目标信息")
-		}
-	}
-
-	// 39.5 完成子目标 → 自动聚合到父目标
-	for _, c := range children {
-		gt.Complete(c.ID, "已完成: "+c.Title)
-	}
-	completed, total := gt.Progress()
-	if completed == 3 && total == 3 {
-		score += 2
-		t.Logf("✓ 进度追踪: %d/%d 完成", completed, total)
-	}
-
-	// 39.6 所有子目标完成后父目标自动完成
-	if node, ok := gt.Nodes[root.ID]; ok && node.Status == agent.GoalCompleted {
-		score += 2
-		t.Log("✓ 所有子目标完成后父目标自动标记完成")
-	}
-
-	report.Add("goal-decomp", "层级目标分解(长上下文)", score, 10, "根目标+HTN分解+持久化+上下文构建+进度聚合+自动完成")
-}
+// --- 39. (已删除) 层级目标分解 ---
+//
+// 原 39 号用例测的是 `agent.GoalTree` (pkg/agent/goaldecomp.go)。该文件已随
+// design/01 §4.2 的收编删除: HTN 分解由 pkg/graph 的 ExpandSpec 承担, GoalTree
+// 的持久化层 (goals.json) 一并退役 (§4.3 三源降两源)。
+//
+// 顺带记下这条用例本身的问题, 免得将来有人照它的形式再写一个: 它 6 处断言全部只
+// t.Log 不 t.Error, 即便结果全错也 PASS —— 打分式用例只喂 report.Add 的分数,
+// 不构成回归防线。新增用例请写成真断言。
 
 // --- 40. 动态角色Agent Pool ---
 

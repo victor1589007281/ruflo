@@ -1613,6 +1613,14 @@ func (c *Client) onSuccess429Reset() {
 //      对其它调用方零副作用。注意:此值硬编码, 若日后调大 config AI.maxTokens 需同步(未做动态解析)。
 const simpleCompleteMaxTokens = 65536
 
+// SimpleCompleteMaxTokens 是上面那个上限的导出形态, 给 L1 网关的 remote 实现
+// (pkg/llmgw/remote.go) 复用同一个值。
+//
+// 为什么不让那边自己写 65536: 两处各写一份的漂移表现很具体 ——
+// "同一段 prompt 在 local 档能出完整 JSON, 换成 remote 档就被截断在半途",
+// 而截断的现场只会留下一句 stop=max_tokens, 没人会想到是两个常量不一样。
+const SimpleCompleteMaxTokens = simpleCompleteMaxTokens
+
 func (c *Client) SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
 	messages := []types.APIMessage{{
 		Role:    "user",

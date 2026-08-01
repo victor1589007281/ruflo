@@ -28,6 +28,9 @@ type APIServer struct {
 	mux       *http.ServeMux
 	server    *http.Server
 	scheduler *sync.Scheduler
+	// submitter 非 nil 时 /sync/ima|weread 的执行体走 TaskService，
+	// 而**不再**经 scheduler.RunNow 起进程内 goroutine（见 SetSyncSubmitter）。
+	submitter sync.TaskSubmitter
 }
 
 // NewAPIServer 创建 Wiki HTTP API 服务器。
@@ -53,6 +56,28 @@ func NewAPIServer(engine *Engine, secret string) *APIServer {
 // SetScheduler 设置同步调度器，启用 /sync/* 端点。
 func (s *APIServer) SetScheduler(sched *sync.Scheduler) {
 	s.scheduler = sched
+}
+
+// SetSyncSubmitter 把 /sync/ima|weread 的**执行体**改成提交 L2 任务服务
+// （design/02 §3.5 通道表 sync 那一行）。
+//
+// 端点的路径、方法语义与响应形态**一个字节都不变**：
+//   - POST /sync/ima|weread   → 202 {"jobId": "<id>"}
+//   - GET  /sync/status/<id>  → 200 <sync.Job> / 404 / 503
+//
+// 变的只是 jobId 指向谁：此前是 Scheduler 内存 map 里的一条记录（进程重启即丢，
+// 于是重启后查状态一律 404），现在是 TaskService 里一份落盘的任务档案。
+//
+// ⚠️ 关键：submitter 非 nil 时 handleSyncTrigger **不再**调用
+// scheduler.RunNow —— 否则一次触发会跑两遍（本仓在动作队列上吃过完全同型的
+// 事故：注册消费方后 team 动作执行了两次）。而 RunSync 在 LoadIndex 与
+// SaveIndex 之间无锁，双跑的后果是 index.json 互相覆盖。
+//
+// 为什么用 setter 而不是构造参数：APIServer 由 pkg/feishu 在 NewBot 内构造，
+// 而 TaskService 由 cmd/claude-go 装配；加构造参数要改 NewAPIServer 的签名
+// （它在测试与 wiki 独立路径上有多个调用方），setter 则对不接线的进程完全中性。
+func (s *APIServer) SetSyncSubmitter(sub sync.TaskSubmitter) {
+	s.submitter = sub
 }
 
 // Mux 返回 APIServer 内部的 ServeMux, 便于调用方追加路由 (如 dashboard 复用
@@ -290,6 +315,24 @@ func (s *APIServer) handleSyncTrigger(w http.ResponseWriter, r *http.Request, so
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
 		return
 	}
+	// 执行体走 TaskService（design/02 §3.5）。放在 scheduler 判空之前：接了
+	// TaskService 的进程不该因为"没有 Scheduler"而 503 —— 它已经有执行能力了。
+	if s.submitter != nil {
+		job, err := s.submitter.SubmitSync(source)
+		if err != nil {
+			// 未知 source 仍是 400（与老路一致，是下游能观察到的语义）；
+			// 其余提交失败按 500，绝不回落到进程内执行——那样就双跑了。
+			code := http.StatusInternalServerError
+			if strings.Contains(err.Error(), "未知同步源") {
+				code = http.StatusBadRequest
+			}
+			writeJSON(w, code, map[string]string{"error": err.Error()})
+			return
+		}
+		log.Printf("[sync/api] 已提交 %s 同步任务 %s (TaskService)", source, job.ID)
+		writeJSON(w, http.StatusAccepted, map[string]string{"jobId": job.ID})
+		return
+	}
 	if s.scheduler == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "sync scheduler not configured"})
 		return
@@ -329,7 +372,7 @@ func (s *APIServer) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only"})
 		return
 	}
-	if s.scheduler == nil {
+	if s.scheduler == nil && s.submitter == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "sync scheduler not configured"})
 		return
 	}
@@ -339,12 +382,21 @@ func (s *APIServer) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID := strings.TrimPrefix(r.URL.Path, prefix)
-	job, ok := s.scheduler.JobStatusByID(jobID)
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
-		return
+	// 两处都查：切到 TaskService 之前触发的 job 仍活在 Scheduler 的内存台账里，
+	// 只查新路会让那些 jobId 立刻变 404（下游正拿着它轮询）。
+	if s.submitter != nil {
+		if job, ok := s.submitter.SyncJob(jobID); ok {
+			writeJSON(w, http.StatusOK, job)
+			return
+		}
 	}
-	writeJSON(w, http.StatusOK, job)
+	if s.scheduler != nil {
+		if job, ok := s.scheduler.JobStatusByID(jobID); ok {
+			writeJSON(w, http.StatusOK, job)
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {

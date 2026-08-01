@@ -233,6 +233,7 @@ type Bot struct {
 	modelRegistry *modelconfig.ProviderRegistry      // 模型注册表 (新模式)
 	modelResolver *modelconfig.ConfigResolver        // 模型配置解析器 (新模式)
 	syncScheduler *claudesync.Scheduler              // 外部数据源同步调度器
+	syncSubmitter claudesync.TaskSubmitter           // 非 nil = 同步执行体交 TaskService (design/02 §3.5)
 	startTime     time.Time                          // 启动时间
 
 	// 消息去重: 防止同一条消息触发多个团队
@@ -372,6 +373,16 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			filepath.Join(layout.Root, "statestore", "log"), ttl, time.Hour)
 	}
 
+	// L1 网关档位选择 (design/02 §3.1 "实现两态" / §四 T1)。
+	// 默认 local ⇒ 与改造前逐字节一致; CLAUDE_GO_LLM_GATEWAY_MODE=remote 时上层
+	// 拿到的是 llmgw.Remote (本进程不做重试/熔断/fallback, 全部归网关进程)。
+	// 档位配错 (remote 但没给网关地址 / 档位名拼错) **直接启动失败**, 不静默退回
+	// local —— 那会让"流量经网关"这个部署事实变成谎话而运维看不出来。
+	llmGW, err := llmgw.NewFromEnv(aiClient)
+	if err != nil {
+		return nil, fmt.Errorf("装配 L1 LLM 网关失败: %w", err)
+	}
+
 	bot := &Bot{
 		config:    config,
 		client:    larkClient,
@@ -403,7 +414,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		// 少一层保护而没人知道。真要收编的前置条件是 design/02 §3.1 的 remote 网关
 		// (熔断/配额/fallback/prompt cache 集中到网关进程内), 那时上层才**不需要**
 		// 这些字段; 在那之前, 包一个降级接口比不包更糟。
-		llmGW:      llmgw.NewLocal(aiClient),
+		llmGW:      llmGW,
 		layout:     layout,
 		stateStore: stateStore,
 		startTime:  time.Now(),
@@ -688,7 +699,10 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			}
 		})
 
-		// 初始化外部数据源同步调度器
+		// 初始化外部数据源同步调度器。
+		// syncSubmitter 必须在 registerSyncJobs 之前就位: 注册的 job 闭包按它
+		// 决定"提交任务"还是"进程内直跑", 晚一步注册的就全是老路。
+		bot.syncSubmitter = config.Wiki.SyncTaskSubmitter
 		bot.syncScheduler = claudesync.NewScheduler(config.Sync)
 		bot.registerSyncJobs(config.Sync)
 		bot.syncScheduler.Start()
@@ -700,6 +714,11 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			wikiAPI := wiki.NewAPIServer(bot.wikiEngine, config.Wiki.APISecret)
 			wikiAPI.SetBindHost(config.Wiki.APIHost)
 			wikiAPI.SetScheduler(bot.syncScheduler)
+			// design/02 §3.5: /sync/* 端点路径与响应形态不变, 执行体改提交 TaskService。
+			// 必须在 Start 之前设置 —— 之后再设会留一个"已在听但还走老路"的窗口。
+			if config.Wiki.SyncTaskSubmitter != nil {
+				wikiAPI.SetSyncSubmitter(config.Wiki.SyncTaskSubmitter)
+			}
 			for _, ext := range config.Wiki.APIExtensions {
 				if ext == nil {
 					continue
@@ -1163,19 +1182,32 @@ func (e *botCronExecutor) RunCommand(ctx context.Context, chatID, command string
 }
 
 // TriggerSync 触发外部数据源(ima/weread)同步 (供定时任务 jobType=sync), 返回结果摘要。
-func (e *botCronExecutor) TriggerSync(_ context.Context, source string) (string, error) {
+//
+// design/02 §3.5: 这是同步的第三条触发路径 (cron job 的 jobType=sync)。接了
+// TaskService 就提交给它 —— 摘要文案由 synctask.formatResult 产出, 与本函数
+// 原来那行 Sprintf 逐字相同 (那条文案会进飞书通知, 改了用户就看得见)。
+func (e *botCronExecutor) TriggerSync(ctx context.Context, source string) (string, error) {
+	if e.bot.syncSubmitter != nil {
+		job, err := e.bot.syncSubmitter.SubmitSync(source)
+		if err != nil {
+			return "", err
+		}
+		done, err := e.bot.syncSubmitter.WaitSync(ctx, job.ID)
+		if err != nil {
+			return "", err
+		}
+		if done.Status != claudesync.JobCompleted {
+			return "", fmt.Errorf("同步失败: %s", done.Message)
+		}
+		return done.Message, nil
+	}
 	if e.bot.syncScheduler == nil {
 		return "", fmt.Errorf("同步调度器未初始化")
 	}
 	cfg := e.bot.syncScheduler.Config()
-	var adapter claudesync.Adapter
-	switch source {
-	case "ima":
-		adapter = claudesync.NewIMAAdapter(cfg.IMA.ClientID, cfg.IMA.APIKey)
-	case "weread":
-		adapter = claudesync.NewWeReadAdapter(cfg.WeRead.APIKey)
-	default:
-		return "", fmt.Errorf("未知同步源 %q (应为 ima 或 weread)", source)
+	adapter, err := syncAdapterFor(cfg, source)
+	if err != nil {
+		return "", err
 	}
 	res, err := claudesync.RunSync(cfg, adapter.Source(), adapter)
 	if err != nil {
@@ -3754,20 +3786,53 @@ func deref(s *string) string {
 }
 
 // registerSyncJobs 根据配置注册 IMA / 微信读书定时同步任务。
+//
+// design/02 §3.5「执行体改提交 TaskService」：syncSubmitter 非 nil 时 tick 只负责
+// **提交 + 等结果**，真正的 RunSync 由 TaskService 的执行器跑。日志口径保持不变。
+//
+// 这是本仓的第二条同步执行路径（第一条是 /sync/* 端点）。**两条必须一起换**：
+// 只换端点会留下"手动触发经任务服务、cron tick 仍进程内直跑"的局面，而 RunSync
+// 在 LoadIndex 与 SaveIndex 之间无锁 —— 两条路同时跑同一个 source 就是
+// index.json 互相覆盖。走同一个 TaskService 后，活跃索引会把后来那次归并掉。
 func (b *Bot) registerSyncJobs(cfg claudesync.Config) {
 	if cfg.KnowledgeRepo == "" {
 		return
 	}
-	if cfg.IMA.Enabled && cfg.IMA.Cron != "" {
-		if err := b.syncScheduler.Register("ima", cfg.IMA.Cron, func(ctx context.Context) error {
-			adapter := claudesync.NewIMAAdapter(cfg.IMA.ClientID, cfg.IMA.APIKey)
-			res, err := claudesync.RunSync(cfg, adapter.Source(), adapter)
+	// runOnce 单一执行入口：接了 TaskService 就提交，否则维持历史的进程内直跑。
+	runOnce := func(ctx context.Context, source, label string) error {
+		if b.syncSubmitter != nil {
+			job, err := b.syncSubmitter.SubmitSync(source)
 			if err != nil {
-				log.Printf("[Sync] IMA 同步失败: %v", err)
+				log.Printf("[Sync] %s 提交同步任务失败: %v", label, err)
 				return err
 			}
-			log.Printf("[Sync] IMA 同步完成: %+v", res)
+			done, err := b.syncSubmitter.WaitSync(ctx, job.ID)
+			if err != nil {
+				log.Printf("[Sync] %s 同步任务 %s 等待失败: %v", label, job.ID, err)
+				return err
+			}
+			if done.Status != claudesync.JobCompleted {
+				log.Printf("[Sync] %s 同步失败: %s", label, done.Message)
+				return fmt.Errorf("%s 同步失败: %s", label, done.Message)
+			}
+			log.Printf("[Sync] %s 同步完成 (task %s): %s", label, job.ID, done.Message)
 			return nil
+		}
+		adapter, err := syncAdapterFor(cfg, source)
+		if err != nil {
+			return err
+		}
+		res, err := claudesync.RunSync(cfg, adapter.Source(), adapter)
+		if err != nil {
+			log.Printf("[Sync] %s 同步失败: %v", label, err)
+			return err
+		}
+		log.Printf("[Sync] %s 同步完成: %+v", label, res)
+		return nil
+	}
+	if cfg.IMA.Enabled && cfg.IMA.Cron != "" {
+		if err := b.syncScheduler.Register("ima", cfg.IMA.Cron, func(ctx context.Context) error {
+			return runOnce(ctx, "ima", "IMA")
 		}); err != nil {
 			log.Printf("[Sync] 注册 IMA 任务失败: %v", err)
 		} else {
@@ -3776,19 +3841,24 @@ func (b *Bot) registerSyncJobs(cfg claudesync.Config) {
 	}
 	if cfg.WeRead.Enabled && cfg.WeRead.Cron != "" {
 		if err := b.syncScheduler.Register("weread", cfg.WeRead.Cron, func(ctx context.Context) error {
-			adapter := claudesync.NewWeReadAdapter(cfg.WeRead.APIKey)
-			res, err := claudesync.RunSync(cfg, adapter.Source(), adapter)
-			if err != nil {
-				log.Printf("[Sync] 微信读书同步失败: %v", err)
-				return err
-			}
-			log.Printf("[Sync] 微信读书同步完成: %+v", res)
-			return nil
+			return runOnce(ctx, "weread", "微信读书")
 		}); err != nil {
 			log.Printf("[Sync] 注册微信读书任务失败: %v", err)
 		} else {
 			log.Printf("[Sync] 微信读书定时同步已注册: %s", cfg.WeRead.Cron)
 		}
+	}
+}
+
+// syncAdapterFor 按 source 造适配器。集中在一处, 免得"加一个源要改三个 switch"。
+func syncAdapterFor(cfg claudesync.Config, source string) (claudesync.Adapter, error) {
+	switch source {
+	case "ima":
+		return claudesync.NewIMAAdapter(cfg.IMA.ClientID, cfg.IMA.APIKey), nil
+	case "weread":
+		return claudesync.NewWeReadAdapter(cfg.WeRead.APIKey), nil
+	default:
+		return nil, fmt.Errorf("未知同步源 %q (应为 ima 或 weread)", source)
 	}
 }
 

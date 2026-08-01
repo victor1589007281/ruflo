@@ -245,6 +245,14 @@ func (j *FileJournal) Close() error {
 	return j.f.Close()
 }
 
+// DecodeJournal 解码一份 journal.jsonl 的原始字节 (容忍尾部截断行)。
+//
+// 给**只读**旁路用 (团队层的 team.json 投影, 见 pkg/agent/team_projection.go):
+// 那条路要在不创建目录、不持写句柄、不泄 fd 的前提下读整个文件, 而
+// NewFileJournal 会 MkdirAll + 开一个写句柄 —— 遍历全部团队目录时会给每个从未跑过图
+// 的团队凭空造出一个空 journal。
+func DecodeJournal(data []byte) []Event { return decodeJournalLines(data) }
+
 // decodeJournalLines 逐行解码, 容忍尾部截断行与垃圾行 (直接跳过)。
 func decodeJournalLines(data []byte) []Event {
 	if len(data) == 0 {

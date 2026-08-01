@@ -450,6 +450,20 @@ func NewEvolutionEngine(dataDir string, llm LLMClient) *EvolutionEngine {
 	return ee
 }
 
+// StateDir 返回**状态根目录** (dataDir 的父目录)。
+//
+// 全部装配点都按 `<state>/evolution` 传 dataDir (`basedir.Layout.Evolution`、
+// `bot.go:438`、`main.go:798`), 而 pkg/evolution/learners 的 API 一律以 stateDir
+// 为入口 (它自己再拼 evolution/ 子目录)。`main.go:803` 早就在用
+// `filepath.Dir(evoDir)` 做同一件事 —— 这里只是把那句约定收成一个方法, 免得每个
+// 调用点各拼一次。dataDir 为空 (未配持久化) 时返回空串, 调用方据此跳过。
+func (ee *EvolutionEngine) StateDir() string {
+	if ee == nil || ee.dataDir == "" {
+		return ""
+	}
+	return filepath.Dir(ee.dataDir)
+}
+
 // migrateV2Fields 为旧数据补充 V2 新字段默认值。
 func (ee *EvolutionEngine) migrateV2Fields() {
 	for _, exp := range ee.experiences {

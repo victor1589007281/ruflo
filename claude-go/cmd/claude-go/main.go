@@ -58,6 +58,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/session"
+	"github.com/anthropic/claude-go/pkg/synctask"
 	"github.com/anthropic/claude-go/pkg/settings"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/statestore"
@@ -1189,6 +1190,8 @@ JSON 配置文件示例:
 			var botRef *feishu.Bot
 			var dashCfgRef *dashboard.Config
 			var taskSvc *agent.FileQueueTaskService
+			// syncBridge 非 nil = sync 的执行体已交 TaskService (design/02 §3.5)。
+			var syncBridge *synctask.Bridge
 			// 远程 Agent 运行时 (design/02 §3.3): 仅 --dispatch-mode queue 下装配。
 			// 见下方 dispatchMode 分支 (挂端点) 与 NewBot 之后的接线 (换执行工厂)。
 			var workerBroker *worker.Broker
@@ -1292,6 +1295,19 @@ JSON 配置文件示例:
 				})
 				dashboard.SetActionSink(taskSvc)
 
+				// sync (IMA/WeRead) 的执行体交 TaskService (design/02 §3.5 通道表)。
+				//
+				// 只在真配了知识库时接线: KnowledgeRepo 为空时 registerSyncJobs 本就
+				// 直接 return, 端点也没有可写的目标 —— 接了只会让 /sync/* 从 503
+				// 变成"能提交但注定失败", 那是把没配置伪装成配置错误。
+				//
+				// 必须在 NewBot **之前**塞进 config: wikiAPI 在 NewBot 内构造并立即
+				// Start, 之后再注入会留一个"已在听但执行体还是老路"的静默窗口。
+				if config.Sync.KnowledgeRepo != "" {
+					syncBridge = synctask.New(synctask.Options{Tasks: taskSvc, Config: config.Sync})
+					config.Wiki.SyncTaskSubmitter = syncBridge
+				}
+
 				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 					func(mux *http.ServeMux) {
 						dsrv := dashboard.MountOn(*dashCfgRef, mux)
@@ -1319,8 +1335,28 @@ JSON 配置文件示例:
 			_ = dashCfgRef // suppress unused warning when Wiki.APIPort == 0
 
 			// 团队运行器就位后再注入 (bot 构造完才有 TeamManager)。
-			if taskSvc != nil && bot.TeamManager() != nil {
-				taskSvc.SetRunner(agent.NewTeamRunner(bot.TeamManager()))
+			//
+			// 有 syncBridge 时套一层 KindRunner 按 TaskSpec.Kind 分派: 不套的话那个
+			// 唯一的 TeamRunner 会拿到 Kind="sync" 的档案并**按团队跑它** (Spec.Team
+			// 是空的), 既不报错也不同步 —— 正是本仓反复吃过的静默错行为。
+			// KindRunner 转发 TaskInterrupter, 否则 team 的 Stop/Pause 会静默失效
+			// (interrupt 走的是 currentRunner().(TaskInterrupter) 类型断言)。
+			if taskSvc != nil {
+				var teamRunner agent.TaskRunner
+				if bot.TeamManager() != nil {
+					teamRunner = agent.NewTeamRunner(bot.TeamManager())
+				}
+				switch {
+				case syncBridge != nil:
+					kr := agent.NewKindRunner(teamRunner)
+					kr.Register(synctask.Kind, syncBridge)
+					taskSvc.SetRunner(kr)
+					fmt.Printf("[TaskService] 执行器已接线 (team + kind=%v)\n", kr.Kinds())
+				case teamRunner != nil:
+					// 无 sync 接线时**不**套 KindRunner: 少一层包装 = 少一处
+					// "包装漏转发某个可选接口" 的面。
+					taskSvc.SetRunner(teamRunner)
+				}
 			}
 
 			// 优雅退出: 捕获 SIGINT/SIGTERM

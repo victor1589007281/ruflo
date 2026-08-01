@@ -638,15 +638,17 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 	os.MkdirAll(dataDir, 0755)
 
 	team := &ProductionTeam{
-		Name:       name,
-		Workflow:   workflow,
-		Objective:  objective,
-		ChatID:     chatID,
-		Status:     TeamStatusCreated,
-		Agents:     make(map[string]*BGAgent),
-		TaskIDs:    make(map[string]string),
-		CreatedAt:  time.Now(),
-		Cwd:        ptm.cwd,
+		Name:      name,
+		Workflow:  workflow,
+		Objective: objective,
+		ChatID:    chatID,
+		Status:    TeamStatusCreated,
+		Agents:    make(map[string]*BGAgent),
+		TaskIDs:   make(map[string]string),
+		CreatedAt: time.Now(),
+		// 工作区: 默认仍是进程 cwd; 开了 CLAUDE_GO_TEAM_WORKSPACE 才每团队独占一份
+		// (并发产码团队互相覆盖, design/02 §1.2)。见 team_workspace.go。
+		Cwd:        teamWorkspaceDir(ptm.cwd, name),
 		Blackboard: NewBlackboard(name, dataDir),
 		mgr:        ptm,
 		dataDir:    dataDir,
@@ -1996,6 +1998,27 @@ func (ptm *ProductionTeamManager) GetTeamReport(name string) (content string, pa
 // marshal 在 t.mu 下做一致性快照, 避免与 runAgent / 心跳等并发写者产生撕裂
 // 快照或数据竞争; 文件 I/O 放锁外以免长时间持锁。
 // 约定: 调用方【不得】持有 t.mu(本函数内部自锁, 否则重入死锁)。
+//
+// ---------------------------------------------------------------------------
+// team.json 的定位: 下游契约 + 投影产物, **运行进度不再是它说了算**
+// ---------------------------------------------------------------------------
+//
+// design/01 §4.3 定的是"journal 是唯一进度真源"。在图引擎路径上这条已经落地:
+// 阶段进度 (Stages / StartedAt / FinishedAt / LastRunID) 由
+// `<dataDir>/graph-journal/journal.jsonl` 派生, team.json 只是它的**缓存/投影**
+// (投影函数与逐字段核实见 team_projection.go)。两处若不一致, **以 journal 为准**。
+//
+// 但 team.json 的**格式与文件位置是下游契约**, 不能删也不能改形:
+// pkg/dashboard 直接读盘 (v14_handlers.go:651 合成实时 DAG、run_feedback.go:216
+// 靠 lastRunId 认领 run), `team status` / 飞书卡片 / 8+ 下游平台都按现有形状分支。
+//
+// 仍然**只**由 team.json 承载 (journal 里没有, 也不该有) 的是**声明与团队层自己的账**:
+// Name/Workflow/Objective/ChatID/Cwd/Language/CreatedAt/TaskIDs/Mailbox/
+// RefineHistory/PendingFeedback/FeedbackTarget/Error/Status/Agents/Progress。
+// 逐条理由见 team_projection.go 文件头二。
+//
+// ⚠️ 未覆盖: pipeline 路径不产 journal (它的进度真源仍是 checkpoints.json),
+// 那条路上 team.json 依然是独立真源。边界记在 design/01 §六。
 func (t *ProductionTeam) persist() {
 	if t.dataDir == "" {
 		return
@@ -2056,11 +2079,22 @@ func (ptm *ProductionTeamManager) loadPersistedTeams() {
 			team.mgr = ptm
 			team.dataDir = filepath.Join(ptm.baseDir, entry.Name())
 			team.Blackboard = NewBlackboard(team.Name, team.dataDir)
+			// 运行进度以 journal 为准 (design/01 §六 投影化的**恢复路径**接线点;
+			// 默认关, 见 team_projection.go)。放在状态机之前是刻意的: 补进度不改
+			// team.Status, 而下面那段要按 Status 决定是否落盘 —— 先补再判, 补进去的
+			// 阶段才会随那次 persist 一起落盘, 不必额外多写一次盘。
+			backfilled := backfillTeamProgressFromJournal(&team)
 			if team.Status == TeamStatusRunning {
 				team.Status = TeamStatusFailed
 				team.Error = "进程重启"
 				team.FinishedAt = time.Now()
 				team.persist()
+			} else if backfilled > 0 {
+				team.persist()
+			}
+			if backfilled > 0 {
+				logging.For("teams").Info("按 journal 补齐团队运行进度",
+					"team", team.Name, "added", backfilled)
 			}
 			ptm.teams[team.Name] = &team
 		}

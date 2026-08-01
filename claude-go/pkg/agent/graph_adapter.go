@@ -1134,6 +1134,49 @@ func newTeamGraphHooks(we *WorkflowExecutor, team *ProductionTeam, spec graph.Gr
 	return h
 }
 
+// seedFromJournal 用 journal 投影给 flush() 的快照打底 (design/01 §六 team.json
+// 投影化的**运行期**接线点; 默认关, 见 team_projection.go)。
+//
+// 修的是一处**永久性漂移**: resume 时 Replay 命中缓存的节点不会被派发 ⇒ 一条 hook 都
+// 不发 ⇒ 不进 h.byID ⇒ flush() 用"这一轮真跑了的那几个"整体覆盖 team.Stages。
+// 正常收尾时 run_interceptors.go:331 会用引擎返回值 (含缓存命中) 覆盖回来, 但这一轮
+// **又失败**时走的是 failTeam —— 它不碰 Stages, 截断后的 Stages 就永久落盘了。
+//
+// 只打底不覆盖: 本轮真跑的节点在 nodeStarted/nodeFinished 里会把同名条目改写掉,
+// 于是"实测耗时/产出"永远来自本轮 hook, journal 投影只负责补上没跑的那些。
+//
+// **只认还在图里的节点**: 与 engine.go 重建展开记录时那道闸同一口径 ("展开记录的父节点
+// 已不在图里 ⇒ 整段丢弃")。工作流改过之后, journal 里的老节点不会再被 Replay 命中,
+// 把它们打进快照等于在 dashboard 上显示一个这张图里根本没有的阶段。
+func (h *teamGraphHooks) seedFromJournal(dataDir string) int {
+	if h == nil || h.team == nil || !teamProjectionEnabled() {
+		return 0
+	}
+	p, ok := projectTeamProgressFromJournal(dataDir)
+	if !ok {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	seeded := 0
+	for _, s := range p.Stages {
+		if _, declared := h.roles[baseNodeID(s.Name)]; !declared {
+			continue
+		}
+		if _, live := h.byID[s.Name]; live {
+			continue
+		}
+		// Role 不在 journal 里 (它是声明, 见 team_projection.go 文件头二): 按声明侧补。
+		if s.Role == "" {
+			s.Role = h.roles[baseNodeID(s.Name)]
+		}
+		h.byID[s.Name] = s
+		h.trackDynamic(s.Name)
+		seeded++
+	}
+	return seeded
+}
+
 // Emit 实现 graph.HookBus。恒返回放行决策。
 func (h *teamGraphHooks) Emit(ctx context.Context, ev graph.HookEvent) graph.HookDecision {
 	switch ev.Scope {
@@ -1430,6 +1473,13 @@ func (we *WorkflowExecutor) runGraphSpec(
 	defer journal.Close() // 不关会每跑一次团队泄一个 fd
 
 	hooks := newTeamGraphHooks(we, team, spec)
+	// team.json 的运行进度以 journal 为准 (design/01 §六 投影化; 默认关)。
+	// 必须在 eng.Run **之前**: 引擎一旦开始跑, 第一个 nodeStarted 就会 flush 一次,
+	// 那时快照里若还没有缓存命中的历史阶段, dashboard 上就已经闪过一次"阶段变少"。
+	if n := hooks.seedFromJournal(team.dataDir); n > 0 {
+		logging.Event(ctx, "graph.projection.seed", "team", team.Name,
+			"stages", fmt.Sprintf("%d", n), "source", "graph-journal")
+	}
 	eng := &graph.Engine{
 		Runner:  newRunner(spec),
 		Journal: journal,
@@ -1519,8 +1569,16 @@ func (we *WorkflowExecutor) runGraphSpec(
 	if runErr != nil {
 		return results, runErr
 	}
-	if rr.Status == graph.RunStatusFailed {
-		return results, fmt.Errorf("graph_adapter: 图执行失败 (无节点完成)")
+	// 两层状态机对齐走**显式映射表** (design/01 §4.3, graph_run_status.go):
+	// 改造前这里只认 failed 一个字面量, 其余取值落到隐式 else = "继续交付" ——
+	// 于是 suspended (还在等人答复) 会被当成一次成功交付, 而日后新增的图层终态
+	// 也会默认放行。未知取值在表里是 fail-closed 的报错, 不是退档。
+	verdict, vErr := graphRunStatusVerdict(rr.Status)
+	if vErr != nil {
+		return results, vErr
+	}
+	if !verdict.Deliver {
+		return results, fmt.Errorf("%s", verdict.Reason)
 	}
 	logging.Event(ctx, "graph.run.finish", "team", team.Name, "status", rr.Status)
 	return results, nil

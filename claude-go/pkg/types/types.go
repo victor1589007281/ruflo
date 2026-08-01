@@ -64,6 +64,24 @@ type ContentBlock struct {
 	Source *MediaSource `json:"source,omitempty"`
 }
 
+// MarshalJSON 定制 thinking 块的出站序列化。
+//
+// 背景: 团队 agent 多轮对话会把上一轮 assistant 消息原样重发。当模型产出的
+// thinking 块文本为空时, `Thinking` 字段因 `omitempty` 被省略, 序列化成
+// `{"type":"thinking"}` —— deepseek/kimi 的网关对请求体做 serde 严格反序列化,
+// 缺 `thinking` 字段即报 400 `missing field 'thinking'`。实测空串 `"thinking":""`
+// 两个网关均接受。这里只对 thinking 块强制输出该字段, 其它块类型序列化不变。
+func (c ContentBlock) MarshalJSON() ([]byte, error) {
+	if c.Type == ContentBlockThinking {
+		return json.Marshal(struct {
+			Type     ContentBlockType `json:"type"`
+			Thinking string           `json:"thinking"`
+		}{Type: c.Type, Thinking: c.Thinking})
+	}
+	type contentBlockAlias ContentBlock
+	return json.Marshal(contentBlockAlias(c))
+}
+
 // MediaSource 图片/文档内容块的数据源。
 // 对应 Anthropic API: {"type":"base64","media_type":"image/png","data":"..."}
 // 或 {"type":"url","url":"https://..."}

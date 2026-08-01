@@ -153,7 +153,15 @@ func SharedGateway() (llmgw.LLMGateway, LLMProfile, error) {
 	llmClientMu.Lock()
 	defer llmClientMu.Unlock()
 	if llmGW == nil || llmGWFor != client {
-		llmGW, llmGWFor = llmgw.NewLocal(client), client
+		// 档位由 llmgw.NewFromEnv 统一决定 (默认 local), 不在这里自己读 env:
+		// 两个装配点各判一次档位就会出现"飞书走 remote 而 dashboard 仍直连",
+		// 而两边日志长得一模一样, 现场无法归因。
+		gw, err := llmgw.NewFromEnv(client)
+		if err != nil {
+			// fail-closed: 档位配错时报错, 绝不退回 local 静默直连 provider。
+			return nil, profile, err
+		}
+		llmGW, llmGWFor = gw, client
 	}
 	return llmGW, profile, nil
 }

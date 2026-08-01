@@ -201,6 +201,12 @@ func GatewayBaseURL() string {
 	return strings.TrimRight(strings.TrimSpace(os.Getenv(gatewayEnv)), "/")
 }
 
+// GatewayEnvName 返回网关地址环境变量的名字, 供报错信息引用。
+//
+// 为什么不让调用方写字面量: "设 CLAUDE_GO_LLM_GATEWAY" 这句话出现在报错里最有用,
+// 而报错里的字面量是不会跟着改名的那一份 —— 变量名仍只在本文件定义一次。
+func GatewayEnvName() string { return gatewayEnv }
+
 // ApplyGatewayOverride 在设置了 CLAUDE_GO_LLM_GATEWAY 时把出站 BaseURL 改指网关。
 //
 // 为什么需要它: deploy/k8s/distributed.yaml 给 control 与 worker 都注入了

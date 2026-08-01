@@ -522,3 +522,34 @@ Pod 已确认跑本轮二进制）之后才看清真因：worker 启动 06:46:54
 **还有一次自我纠错**：dreaming 那条契约测试的变异反证第一版**没红**（0.003s 就 ok）——标志位
 写在 sleep **之前**，早退路径也可能读到 true，断言退化成"看谁先跑到"。挪到 sleep 之后才拿到
 3/3 确定性红。**一个无牙的测试，正是它要抓的那类缺陷的同构物。**
+
+---
+
+## 2026-07-27 四轮标注核对：三份设计文档的标注逐条对源码复核并修正
+
+对 design/01/02/03 全部 ~120 处实现状态标注按当前工作区（HEAD b41930b2a + 未提交改动）逐条复核。
+结论：**标注主体准确**（绝大多数 ✅/🟠 及其 file:line 证据仍成立），但存在三类需修正的问题，共 ~30 处，已全部改入文档（过时句删除线保留作对照，新结论带日期与 file:line）：
+
+1. **三个文件头总判定块整体过时**（≈20%/32%/22%、"生产零流量"、"双层开环"、"分布式零字节"等）——它们是 2026-07-25
+   首轮核查快照，从未随其后两轮实施同步，与各文档尾部里程碑重算表直接矛盾。已在各头块下加"历史快照"更正段，现状以重算表为准。
+2. **六处"新 ✅ 与旧实测段并存"的矛盾残留**：01 §4.9（k8s-job "仍缺"句）、01 §4.10（AIMD "仍缺"——实为 `graphRateLimiter`
+   已落地）、01 §4.11（"Mailbox 仍裸 slice"——已有 TeamMailbox）、03 §4.1（"KindRun 唯一无产生方"）、03 §2.1（"11 项全 ❌"）、
+   03 §4.7（"evo_* 零命中"）。均以新状态为准打删除线。
+3. **两处标题高估被降回**：03 §1.2/§五 "✅ 三处均已闭环" → 🟠（`ImproveSkill` 生产调用点至今为 0；CLI 会话路径仍无
+   AfterQuery——其下旧实测段反而一直是准的）；03 §八 E3 "配对审计" → "时序 uplift 审计"（skillaudit 包注释自认 v1 简化，无 per-skill 归因）。
+
+另有一批 2026-07-26 工作区未提交改动使旧标注过时，已同步：RunStatus 6 态 + `graph_run_status.go` 映射表（01 §4.3"仍 3 态"撤）；
+journal 事件 26 种（标注写 17）；GoalTree/`goaldecomp.go` 已删（goals.json 源消失，"三源"降二源，01 §六 🟡 撤）；
+`team.json` 投影化已实现默认关（`team_projection.go`，01 §六 ❌ 撤、"M4 唯一缺项"更正——M4 实际仍缺 runNestedAgent 收编 +
+CLI DisableTools 两口）；比例灰度 prompt 层通电（`learners/canary.go`+`prompt_canary.go`，skill 层仍二值）；
+sync→TaskService 已做（`pkg/synctask` + `TaskSpec.Kind`/`KindRunner`，02 §3.5 ❌ 撤）；团队 cwd 可隔离默认关（02 §3.3 同步 §1.2）；
+`llmgw` 已被生产依赖 + remote 档已实现（02 §3.1/§七 R1 更正）；`Queue.Extend` 已有 worker 续租、`RuntimeNodeTask` 已存在、
+编排器经 broker 入队（02 §3.2 旧段三句撤）；契约测试 68 条已存在、`CLAUDE_GO_BOT_API_URL` 可覆盖（02 §3.5 旧段撤）；
+`deploy/k8s-e2e.sh` 已入库（02 §四"零脚本"撤）。文档缺陷一处：02 §1.2 "原样（5 条）"重复粘贴两遍，已合并为"原样（3 条）"。
+
+**复核确认仍成立的关键"未做"清单**（防止误判为已完成）：`ImproveSkill` 零调用点 · CLI 会话路径无 AfterQuery ·
+content gate judge 仍主模型自评（H3 半违反）· H1 `RewardEvaluator` 契约已写零调用方（工作区新文件）· H2/H11/H14 缺
+（`learn_round_*` 指标写了但 metrics=nil 未通电）· `MemoryIngestFn` 仍死代码 · 重启恢复仍强制置 failed（仅补 journal 进度回填）·
+`executeFanOut` 空壳仍在（真 map→reduce 走覆盖表 opt-in）· CLI DisableTools/slash 嗅探未接 ConstraintSet（行号漂移至
+main.go:3313/718）· `orchestrator-lease` 零命中 · sqlite 零生产接线 · NATS/一致性哈希/SkillStore 入库未做 ·
+`RefreshHooks` 仅 CLI 一处调用（飞书会话路径仍不产 turn/tool_call Span）· 默认部署仍无鉴权（fail-open + 绑 0.0.0.0）。

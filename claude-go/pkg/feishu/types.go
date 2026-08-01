@@ -190,6 +190,15 @@ type WikiConfig struct {
 	// 允许外部模块 (dashboard 等) 把自己的路由挂到同一 HTTP 端口,
 	// 避免开多个监听端口。调用方负责保证路由 pattern 与 /wiki/* 不冲突。
 	APIExtensions []func(mux *http.ServeMux) `json:"-"`
+	// SyncTaskSubmitter 非 nil 时，IMA/微信读书同步的**执行体**改成提交
+	// TaskService（design/02 §3.5 通道表 sync 那一行），两条触发路径
+	// （/sync/* 端点 与 进程内 cron tick）都走它，进程内直跑 RunSync 一并摘掉。
+	//
+	// 为什么走配置字段而不是 NewBot 之后 setter 注入：wikiAPI 在 NewBot 内构造
+	// **并立即 Start**，返回后再 set 会留一个"服务已在听、执行体还没换"的窗口，
+	// 那期间的请求静默走老路——正是"一半动作走新路一半走老路"那类现场无法归因
+	// 的故障。类型是 pkg/sync 里的窄接口，本文件已 import 该包。
+	SyncTaskSubmitter sync.TaskSubmitter `json:"-"`
 }
 
 // DefaultBotConfig 返回默认配置

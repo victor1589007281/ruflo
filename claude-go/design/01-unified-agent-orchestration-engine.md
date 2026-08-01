@@ -23,6 +23,8 @@
 > `pkg/graph` 内核质量不错且真实 LLM E2E 通过，但**生产零流量**：无内置工作流声明 `Mode:"graph"`，37 个线上动态工作流无一使用，灰度开关 `CLAUDE_GO_GRAPH_ENGINE` 未设。
 >
 > 逐条依据与改判清单见 [PROGRESS.md](PROGRESS.md) 的「三方独立核查」小节。
+>
+> ⚠️ **本块总判定是 2026-07-25 首轮核查的历史快照，多项已被其后两轮实施推翻（2026-07-27 复核，基线 b41930b2a + 工作区未提交改动），保留作对照；现状以 §八 重算表为准（M0 ✅ · M1 ✅ · M2 80% · M3 ✅ · M4 85%）**。已失效的关键句：「§5 = 0/15」→ 现 **9/15** 走图（`pkg/agent/graph_templates.go` 三表 + 守护测试钉住并集=15）；「灰度开关 `CLAUDE_GO_GRAPH_ENGINE` 未设」→ `deploy/k8s-e2e.sh:394` 已设置并在真集群跑通（生产清单 `distributed.yaml` 仍未设，默认关是现状）；「生产零流量」按当时部署口径成立，其后 K8s 真实 LLM E2E 已让图引擎路径真跑出产物（graph-journal / 拦截器链 / 预算台账）。
 
 ## 一、背景与问题诊断
 
@@ -192,14 +194,14 @@ type EdgeSpec struct {
   - swarm 动态分解（`swarm.go:523`）→ decompose 节点展开分层并行子图。
 - **子图**：`subgraph` 节点引用命名 GraphSpec，参数注入。composite 类 mode 从"专用执行器"降级为普通子图组合——**双 switch 不一致问题从根上消失**（不再存在第二张模式表）。
 
-### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[🟠 事件 20/16 · InvalidateFrom · Suspended ✅ / 四源已降三源]**
+### 4.3 执行模型：GraphRun + 事件溯源 Journal　　**[✅ 事件 26/16 · InvalidateFrom · RunStatus 6 态（含 suspended）/ 三源已降二源]**
 
-> **实测**：FileJournal + Replay 真实且有零重跑硬证据（`pkg/graph/engine_test.go:422-423`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。✅ **事件类型已补齐并超出设计（2026-07-25）**：设计列 16 种，现有 17 种——补上了 `map.expanded`/`graph.expanded`/`graph.expand_rejected`/`loop.group.iteration`/`subgraph.spawned`/`subgraph.rejected`/`budget.consumed`/`budget.exceeded`/`node.invalidated`。
+> **实测**：FileJournal + Replay 真实且有零重跑硬证据（`pkg/graph/engine_test.go:422-423`）。但**「取代四源」未达成**：checkpoints.json/goals.json/tasks.json/orchestrator CheckpointStore 全在，journal 是**第五源**。✅ **事件类型已补齐并超出设计（2026-07-25 记 17 种；2026-07-27 复点为 26 种）**：设计列 16 种，现有 **26** 种——设计清单之外补上了 `map.expanded`/`graph.expanded`/`graph.expand_rejected`/`loop.iteration`/`loop.terminated`/`loop.group.iteration`/`loop.group.terminated`/`subgraph.entered`/`subgraph.spawned`/`subgraph.rejected`/`budget.consumed`/`budget.exceeded`/`node.invalidated`/`node.skipped`/`node.suspended`/`node.revived`/`graph.stalled`（watchdog）；设计名单中 `node.output`/`gate.verdict`/`hook.decision`/`run.paused`/`run.resumed` 五个未按原名实现（产出与 verdict 并入 `node.completed`，挂起走 `node.suspended`/`node.revived`）。
 >
 > ✅ **`InvalidateFrom` 已实现**：`pkg/graph/journal.go`，refine 改为追加 `node.invalidated` 事件而不是删快照文件（5 个测试）。**顺带修掉一个静默失效的真 bug**：灰度开关（`CLAUDE_GO_GRAPH_ENGINE`）开着时 `wf.Mode` 仍是 `"pipeline"`，于是「非 pipeline 转整体重跑」那道闸放行了按阶段精修，但它只失效 `checkpoints.json` 而 `graph-journal` 原样保留 → Resume 重放全部 `node.completed` → 零节点执行、直接返回旧产出，**用户的反馈静默消失**。失效必须连带摘掉该节点派生出的运行图形态（分片集/组轮次/展开产物/子节点缓存），否则是"失效了一半"——重跑的节点会继承上一轮的扇出与轮次进度。`InvalidateFrom` 在 runID 为空时**直接报错**而不是写一条注定被 Replay 过滤的事件（静默失败正是这个 bug 原本的形态）。
 >
-> ⚠️ **RunStatus 仍 3 态**（completed/partial/failed）而非设计的 8 态：`paused`/`stopped`/`refining` 在团队层已有对应状态，图层再加一套需要两层状态机对齐，属 M4。
-> ✅ **四源已降三源（2026-07-25）**：`orchestrator.CheckpointStore` 随 `pkg/orchestrator` 整包退役而删除，orchestrated 改用 graph FileJournal。仍在的三源：`checkpoints.json` / `goals.json` / `tasks.json`——删它们要动 8+ 下游平台共用的 pipeline 主路径。
+> ~~⚠️ **RunStatus 仍 3 态**（completed/partial/failed）而非设计的 8 态：属 M4~~ ✅ **已扩为 6 态并与团队层显式对齐（2026-07-26 工作区）**：`created/running/completed/partial/failed/suspended`（`pkg/graph/runstatus.go`，文件头含与设计 8 态的逐条对账 + `IsTerminalRunStatus` + 从 journal 推生命周期态）；团队层新增显式映射表 `pkg/agent/graph_run_status.go`——6 个取值逐条列出、`default` fail-closed 拒绝（修掉「图层新增终态被团队层默认当交付成功」的 fail-open），`suspended` 刻意落 `failed` 复用既有 resume 判据而非新增团队终态（team.json 的 status 是 8+ 下游平台的对外契约）。
+> ✅ **四源已降三源（2026-07-25）**：`orchestrator.CheckpointStore` 随 `pkg/orchestrator` 整包退役而删除，orchestrated 改用 graph FileJournal。~~仍在的三源：`checkpoints.json` / `goals.json` / `tasks.json`~~ ✅ **再降二源（2026-07-26 工作区）**：`goals.json` 随 GoalTree/`goaldecomp.go` 整体删除（归宿正是 §六 预言的「被 ExpandSpec 吸收后连持久化一起删」，全仓 `GoalTree`/`goals.json` 代码零命中）。仍在的二源：`checkpoints.json` / `tasks.json`——删它们要动 8+ 下游平台共用的 pipeline 主路径；图路径上 `team.json` 已降为 journal 的投影（`team_projection.go`，默认关，见 §六）。
 
 ```go
 // pkg/graph/run.go
@@ -307,7 +309,7 @@ type Hook interface { Match(HookEvent) bool; Execute(context.Context, HookEvent)
 > - **向后兼容**：`profileForTeamRole` 子串匹配一行没搬没抄，降级为 `ResolveToolProfile` 的 fallback（6 个下游平台依赖它，不能一刀切删），可被显式声明覆盖且用回退时打 deprecation 日志（按 role+profile 去重、**上限 512 条**——`nested-agent:<SubagentType>` 来源是模型可控字符串，无上限就是慢性内存泄漏）。20 组 (role, workflow) 逐项等价有测试。
 > - **嵌套 agent 只采纳"更窄的"节点声明**：直接覆盖会放宽——节点声明 `coding` + `opts.ReadOnly=true`（本该 research）会让只读子代理拿到 Shell。
 >
-> ⚠️ **仍未接的最后一跳**：`cmd/claude-go/main.go:2877` 的 CLI DisableTools 尚未改从 ConstraintSet 读；且 `main.go:715` 的 slash 直通防护目前靠嗅探 `eng.Config.AllowedTools == nil` 判断"是否受限会话"——拿 map 的 nil 性当权限标志，应改读 `ConstraintOrigin`。另 `Paths`/`ModelTier`/`Conflicts` 有类型有单调性有校验但**运行期还无消费者**（`Provides/Requires` 仍活在待删的 `pkg/agent/orchestrator.go` WBS 里）。
+> ⚠️ **仍未接的最后一跳（2026-07-27 复核仍全部成立，行号已漂移）**：`cmd/claude-go/main.go:3313` 的 CLI DisableTools 尚未改从 ConstraintSet 读（仍按角色名 switch）；且 `main.go:718` 的 slash 直通防护目前靠嗅探 `eng.Config.AllowedTools == nil` 判断"是否受限会话"——拿 map 的 nil 性当权限标志，应改读 `ConstraintOrigin`。另 `Paths`/`ModelTier`/`Conflicts` 有类型有单调性有校验但**运行期还无消费者**（`Provides/Requires` 仍活在待删的 `pkg/agent/orchestrator.go` WBS 里）。
 
 ```go
 type ConstraintSet struct {
@@ -377,7 +379,7 @@ type SkillSelector struct {
 >
 > 真机含**故障注入**验证：镜像不存在时 1 秒内失败、原因是 kubelet 原文（不是"worker 掉线"）、图层重试、起不来的 Job 全被删。两处真机逼出的修正：`ErrImageNeverPull`（kind 常见，kubelet 根本不去拉所以不会退化成 ImagePullBackOff）、探活改用 `auth can-i` 而非 `get namespace`（命名空间是集群级资源，namespaced Role 拿不到，控制面当场 CrashLoop）。
 
-> **实测（2026-07-25 实现）**：`pkg/agent/runtime.go` 落地 `AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps`/`Placement`（硬约束过滤 + 软偏好打分 + 团队亲和 + 租约过期剔除），并用 `NewLocalRuntime` 把既有 `CreateAgentFunc` 收编为本地 runtime（**不改动 cliAgentRunner/sessionAgentRunner 两个既有实现**）。⚠️ **一处对设计稿的偏离**：接口定在 `pkg/agent` 而非 `pkg/graph/runtime.go`——要被收编的三个执行器都在 pkg/agent 及其上层，而 pkg/graph 是纯调度内核不认识 agent 语义，放进去会让内核反向依赖 RunMetadata/ToolProfile/团队 cwd。折中是图侧继续用 `NodeRunner`，`stageNodeRunner` 作桥，**pkg/graph 零改动**。⚠️ 澄清名字撞车：`pkg/cluster` 的 `RequireCaps` 是队列标签过滤（布尔匹配无打分），本文的 `Placement` 才是放置策略；前者是后者求解后用于跨机路由的投影。✅ **远程 runtime 已落地（2026-07-25）**：`pkg/worker` 的 `remoteRuntime` 实现本接口并经 `Broker.Sync` 从 `cluster.Registry` 注册进 `RuntimeRegistry`（心跳续租，掉线由既有租约机制剔除），详见 design/02 §3.3。**仍缺**：k8s-job runtime（`pkg/sandbox/k8s_runner.go` 尚未接为 AgentRuntime）。✅ **逐节点 Placement 已实现（2026-07-25）**：`AgentSpec.Placement` + graph 本地镜像 `PlacementSpec`（不 import `pkg/agent`，否则调度内核反向依赖 agent 语义）。`Placement()` 是**逐字段合并**而不是"节点声明了就整份替换"——进程默认里的 `Affinity:"team"` 是产码工作流的命脉，一个只想写 `require:["browser"]` 的渲染节点若因此丢掉团队亲和，会被派到另一台机器的另一个工作区，**症状是「渲染节点看不见前面生成的 HTML」，作者完全不会想到是自己那行 require 造成的**。同时补了展开产物的 `narrowPlacement`（父声明 `require:["browser"]` 的子节点原本可以漏写而落到没浏览器的机器上产假货，图上"约束只收窄"看起来还成立）。关键语义：团队亲和权重高于任何 Prefer（产码门禁在 `<cwd>/go.mod` 上跑，节点散落会让上一阶段的代码消失）；同分按名字升序保证放置确定性。11 个测试。
+> **实测（2026-07-25 实现）**：`pkg/agent/runtime.go` 落地 `AgentRuntime`/`RuntimeRegistry`/`RuntimeCaps`/`Placement`（硬约束过滤 + 软偏好打分 + 团队亲和 + 租约过期剔除），并用 `NewLocalRuntime` 把既有 `CreateAgentFunc` 收编为本地 runtime（**不改动 cliAgentRunner/sessionAgentRunner 两个既有实现**）。⚠️ **一处对设计稿的偏离**：接口定在 `pkg/agent` 而非 `pkg/graph/runtime.go`——要被收编的三个执行器都在 pkg/agent 及其上层，而 pkg/graph 是纯调度内核不认识 agent 语义，放进去会让内核反向依赖 RunMetadata/ToolProfile/团队 cwd。折中是图侧继续用 `NodeRunner`，`stageNodeRunner` 作桥，**pkg/graph 零改动**。⚠️ 澄清名字撞车：`pkg/cluster` 的 `RequireCaps` 是队列标签过滤（布尔匹配无打分），本文的 `Placement` 才是放置策略；前者是后者求解后用于跨机路由的投影。✅ **远程 runtime 已落地（2026-07-25）**：`pkg/worker` 的 `remoteRuntime` 实现本接口并经 `Broker.Sync` 从 `cluster.Registry` 注册进 `RuntimeRegistry`（心跳续租，掉线由既有租约机制剔除），详见 design/02 §3.3。~~**仍缺**：k8s-job runtime（`pkg/sandbox/k8s_runner.go` 尚未接为 AgentRuntime）~~（已过时残留，与本节顶部 ✅ 矛盾，以顶部为准：`pkg/worker/k8sjob.go:404` 已落地——组合 Job 下发 + worker `--claim`，刻意**不是**包装 K8SRunner）。✅ **逐节点 Placement 已实现（2026-07-25）**：`AgentSpec.Placement` + graph 本地镜像 `PlacementSpec`（不 import `pkg/agent`，否则调度内核反向依赖 agent 语义）。`Placement()` 是**逐字段合并**而不是"节点声明了就整份替换"——进程默认里的 `Affinity:"team"` 是产码工作流的命脉，一个只想写 `require:["browser"]` 的渲染节点若因此丢掉团队亲和，会被派到另一台机器的另一个工作区，**症状是「渲染节点看不见前面生成的 HTML」，作者完全不会想到是自己那行 require 造成的**。同时补了展开产物的 `narrowPlacement`（父声明 `require:["browser"]` 的子节点原本可以漏写而落到没浏览器的机器上产假货，图上"约束只收窄"看起来还成立）。关键语义：团队亲和权重高于任何 Prefer（产码门禁在 `<cwd>/go.mod` 上跑，节点散落会让上一阶段的代码消失）；同分按名字升序保证放置确定性。11 个测试。
 
 ```go
 // pkg/graph/runtime.go —— 本文只定义接口与调度语义；网络化实现见 design/02
@@ -429,7 +431,7 @@ type Placement struct {
 >
 > 这轮拆分顺带暴露两处问题，都已修：手写 golden 的依赖块尾部换行多了一个（判据：`buildStagePromptWithRoles` 完全没被拆分改动，所以旧路径产出与新路径逐字相同，那条断言对旧路径同样会红）；以及一处**真的提示词不确定性**——Handoff 上下文直接 `for name := range prevResults` 建切片，map 遍历序每次运行都不同，导致 prompt 前缀缓存整段失效且同一输入产出不可复现（它是被等价性测试**间歇性**抓出来的，3 次里红 1 次）。
 >
-> ⚠️ **仍缺**：AIMD「失败后并发折半」背压尚无等价物（`RateLimiter` 拦截器已有挂载点但未接 AIMD 策略）。
+> ~~⚠️ **仍缺**：AIMD「失败后并发折半」背压尚无等价物~~ ✅ **AIMD 背压已落地（2026-07-25，提交 df6c56a69）**：`ratelimit` 节点拦截器 `graphRateLimiter`（`pkg/agent/graph_interceptors.go:128`）——限流失败并发折半（乘性减，夹到硬下限，`CLAUDE_GO_GRAPH_AIMD_MIN` 可调）、连续 5 次成功并发 +1（加性增），限流判据复用 `isRateLimitErrText` 单一真源；§六 的「图层 AIMD 背压」即指此处。
 
 ```go
 // 两个切面：节点执行 与 LLM 调用
@@ -467,7 +469,7 @@ type CallInterceptor interface { Around(ctx context.Context, c LLMCall, next Cal
 > - **fail-closed 守住了（红线）**：订阅方**绝不**调 `coord.ReportProgress`——那会把 L2 停滞判据的输入换成阶段名并不断刷新 `UpdatedAt`，于是一个在同一阶段空转 40 分钟的团队**永远不被判停滞**（fail-closed → fail-open）。有专门测试钉住。它只在 Coordinator 尚无 Phase 可报时用阶段名补位。
 > - **不订阅精确前缀而是订阅全部再按 category 过滤**：阶段名在 key 开头、`-status` 在结尾，精确前缀表达不了"任意阶段的 status"；而 `category == "progress"` 正是 pipeline / 图路径 / novel-v2/v3 三条产生方**共用**的分类，一处过滤覆盖全部路径。
 > - **顺带修掉一个 v13 缺陷（比原注释写的更严重）**：`POST /api/teams/:name/blackboard` 把动作排进 :7777 队列，但消费方 `Bot.DashboardTeamAction` 的 switch 里**没有 `blackboard.write` 这一支** ⇒ 落 default 报"未知操作" ⇒ 该接口只改了磁盘文件，而内存黑板下一次 debounce **全量覆盖刷盘会把刚写进去的条目静默抹掉**，调用方拿到的是 200 OK。补了 `case` + `ProductionTeamManager.WriteTeamBlackboard`（走 `Blackboard.Write` ⇒ markDirty + 派发 Watch）。团队不在本进程内时**报错而不是退回改磁盘**——退回磁盘正是那个静默丢数据的形态。
-> **实测**：`pkg/graph/blackboard.go` 不存在。~~双黑板并存~~（`pkg/orchestrator/blackboard.go` 已随包删除，跨黑板手工同步随之消失）。**设计要「新增」的 `Watch` 只存在于那份要被删的实现里**（`pkg/orchestrator/blackboard.go:210`）。Mailbox 仍是裸 slice。
+> **实测（改造前快照，两句已过时）**：`pkg/graph/blackboard.go` 不存在（仍真——接口落在 `pkg/agent`）。~~双黑板并存~~（`pkg/orchestrator/blackboard.go` 已随包删除，跨黑板手工同步随之消失）。~~**设计要「新增」的 `Watch` 只存在于那份要被删的实现里**~~（现生产 `Watch` 在 `pkg/agent/blackboard.go:260`，订阅方见上方 ✅）。~~Mailbox 仍是裸 slice~~（`pkg/agent/mailbox.go:262` `TeamMailbox` 已把裸 slice 适配成 `Mailbox` 接口：Send/Inbox/Take）。
 
 ```go
 type Blackboard interface { // 单一接口，收编两份实现
@@ -504,7 +506,7 @@ type TaskService interface {
 
 ## 五、15 种 mode → 图模板映射　　**[🟠 9/15 已图化；余 6 逐条记账]**
 
-> **实测**：`pkg/graph/templates/` **目录不存在**，图模板库零落地；`TranslateWorkflow` 是 WorkflowDef 直译器不是模板库。只有 pipeline/fanout 可经灰度开关切图，而 `CLAUDE_GO_GRAPH_ENGINE` 全仓/全部署清单无处设置。13 个专用 mode 全部仍走各自执行器（`pkg/agent/workflow.go:409-434`）。§5 承诺的「fanout 首次真正实现 map→reduce」未发生——`executeFanOut` 仍原封不动转调 pipeline（`pkg/agent/workflow.go:201-203`）。
+> **实测（2026-07-25 改造前快照，保留作对照；现状见标题 9/15）**：`pkg/graph/templates/` 目录至今不存在——模板落在 `pkg/agent/graph_templates.go` 的 Go 三表（4 模板 mode + 5 原生内核 mode + 6 未图化记账，守护测试钉住并集=15）而非设计稿的 JSON 库形态。~~只有 pipeline/fanout 可经灰度切图、`CLAUDE_GO_GRAPH_ENGINE` 全仓/全部署清单无处设置、13 个专用 mode 全走各自执行器~~：现 4 个模板 mode + 4 个内核 mode 可经灰度切图、orchestrated **无条件**走图（无回退路），`CLAUDE_GO_GRAPH_ENGINE=1` 已在 `deploy/k8s-e2e.sh:394` 设置并真集群跑通（生产清单 `distributed.yaml` 仍未设，默认关）。仍真的一句：`executeFanOut` 空壳仍在（`workflow.go:201-204` 转调 pipeline）——真 map→reduce 已在 `pkg/graph/fanout.go` 实现但须经覆盖表 opt-in（fanout 模板刻意与 pipeline 同构以保行为等价），「首次真正实现 map→reduce」以 opt-in 形式部分兑现。
 
 mode 消失，成为**内置图模板库**（`pkg/graph/templates/`，纯 JSON 数据 + 少量展开函数）。单一分发点=模板实例化。
 
@@ -528,15 +530,15 @@ mode 消失，成为**内置图模板库**（`pkg/graph/templates/`，纯 JSON �
 
 ---
 
-## 六、现有功能覆盖矩阵（编排域）　　**[🟠 26 行里 22 行已落地 · 2 行 🟡 建成未通电 · 2 行 ❌]**
+## 六、现有功能覆盖矩阵（编排域）　　**[🟠 26 行：24 已落地 · GoalTree 已按归宿删除 · 1 行 ❌（Suspended×超时语义待复核）]**
 
 > **重算（2026-07-25，逐行核实源码；这一节此前是"计划表冒充状态表"，真覆盖只有 1 行）**：
 >
 > **已落地并通电（22 行）**——各带生产实现点：**图级停滞检测**（`pkg/graph/watchdog.go`，默认关、缺省只观测，与节点级心跳合成设计要的双层）· **黑板 `Watch` 有了生产订阅方**（`blackboard_watch.go` 订阅 `Watch("")` 按 `progress` 分类过滤，默认关；顺带修掉 v13 那个 200 OK 却静默丢数据的缺陷）· 静态/动态工作流直译（`graph_templates.go` 三表，9/15 走图）· 检查点恢复与 refine 增量重跑（`InvalidateFrom` 事件式失效 + `clearRunProgress` 单一清空口，**修掉了"换目标重跑吃旧产出"的 P0**）· 重启恢复（journal 重放）· 重试退避与限流慢退（判据收敛到 `isRateLimitErrText` 一处 + 图层 AIMD 背压）· 门禁元数据驱动（`WorkflowGateMetaByName`，弃工作流名白名单）· 内容质量门 · 黑板五类与交接 · Mailbox（`TeamMailbox`）· 三套 hook 降两套且注册进同一总线（`internalHookBridge`）· AllowedTools 双路径 · 工具 profile（`ProfileNarrows` 特权位偏序，弃子串匹配）· subagent 编排层可见（`observeSubagent`）· 异步 run 与 :7777 队列**真被消费**（`actionSinkOwns` 让队列独占）· 并发启动去重（幂等键）· 进化/记忆挂点 headless 同构 · K8s Job 执行（`pkg/worker/k8sjob.go`，真机含故障注入）· swarm_intel 五阶段（`plotSwarmNodeRunner` 收编）· 动态展开单调收窄（`narrowToParent`）· 六个运行级拦截器（`runBuiltinPhases`）· 团队状态机。
 >
-> **🟡 建成未通电（2 行）**：**`GoalTree`**——有三处生产构造但零消费方，归宿是被 `ExpandSpec` 吸收后连持久化一起删 · **比例灰度 `shadow_ratio`**——只落实验 JSON，运行期无消费方（本仓灰度是二值的）。
+> ~~**🟡 建成未通电（2 行）**：`GoalTree` · 比例灰度 `shadow_ratio`~~ **两行均已处置（2026-07-26 工作区，2026-07-27 核实）**：**`GoalTree`** 已按预言的归宿删除——`goaldecomp.go` 整文件删掉、全仓 `GoalTree`/`goals.json` 代码零命中（只余收编说明注释），HTN 展开由 `ExpandSpec`（`pkg/graph/expand.go`）承接 · **比例灰度 `shadow_ratio`** 已有运行期消费方——`pkg/evolution/learners/canary.go`（FNV-1a 万分桶确定性分臂、上限 0.5、RunID 空 fail-closed）+ `pkg/agent/prompt_canary.go` 接进 `executeStage`（pipeline 与图两路共用），**范围限 prompt 实验，skill 层灰度仍二值**。
 >
-> **❌ 未落地（2 行）**：角色差异化超时的**节点级天花板**已有但 `Suspended` 态下的语义未定 · `team.json` 投影化（M4 唯一缺项）。
+> **❌ 未落地（1 行）**：角色差异化超时的**节点级天花板**已有但 `Suspended` 态下的语义未重新核对（`suspend.go`/`node.suspended`/`node.revived` 已落地，超时×挂起的交互口径待复核）。~~`team.json` 投影化（M4 唯一缺项）~~ ✅ **投影化已实现（2026-07-26 工作区，默认关）**：`pkg/agent/team_projection.go`（`projectTeamProgress` 纯函数投影 + 开关 `CLAUDE_GO_TEAM_PROJECTION`）+ 运行期 `seedFromJournal`（graph_adapter.go）+ 恢复路径 `backfillTeamProgressFromJournal`（`teams.go:2086`）；图路径上运行进度以 journal 为准、team.json 降为投影（`persist()` 注释明写口径）。**边界：pipeline 路径不产 journal，那条路 team.json 仍是独立真源**。
 >
 > **原 🟡 的"黑板 `Watch` 生产零订阅方"与原 ❌ 的"图级停滞检测"已在 2026-07-25 补上**（见 §4.11 / §4.3）。两者都默认关：前者会改写盘频率与 `Progress.Phase` 词表，后者若默认判失败会杀掉合法长阶段——"接线了"与"默认生效"是两件事，这里只兑现前者。
 >
@@ -603,7 +605,7 @@ pkg/graph/
 > | M1 图内核 | 70% | ✅ | GraphSpec/engine/journal/直译器齐；pipeline+fanout 已切并有四维等价性测试；**「kill -9 恢复重放正确」的验收项已有测试**（`graph_adapter_test.go` 的 `TestGraphJournalResume_崩溃后续跑` 手写未完结 journal → 只重跑未完成节点） |
 > | M2 全模板 | 12% | **80%** | 15 mode 图化 **9/15**；`gate`/`loop-group`/`expand` 三能力齐，另加 `map`/`reduce`/`subgraph`/`human`/终止器/`Suspended`/可声明 join；✅ **Hook 总线已接通外部 hook**（`ExternalHook` 适配器落地，见 §4.5）——此前记的"M2 未满的主因"已消。**余下两项**：① 6/15 mode 未图化，但每条都在 `modeGraphNotTemplated` 里写了**具体能力缺口**（不是工作量问题：如 `adversarial_dev` 缺 WBS 解析器 + 能跑 shell 门禁的 NodeRunner，`novel_writing` 卡在组内成员阶段记录会整批消失 + agent 节点无 Score）；② 验收项"`tests/eval` 增图引擎回放用例"未按字面兑现——等价性测试落在 `pkg/agent`（`orchestrated_equiv_test.go` 四维比对 + `TestGraphJournalResume_崩溃后续跑`）而非 `tests/eval`，实质覆盖到了但位置不同 |
 > | M3 注入与约束 | 4% | ✅ | 六拦截器已装配（`run_interceptors.go` 的 `runBuiltinPhases` 恰好 6 个）+ 节点切面链 + `CallInterceptor`；`ConstraintSet` 单一真源（46 测试）；`ToolProfile` 显式化 |
-> | M4 运行时与收尾 | 0% | **85%** | `AgentRuntime` **三实现齐**（`localRuntime` / `remoteRuntime` / k8s-job 复用 remote 通路）；`SpawnSubgraph` 有；**旧引擎已删**（`pkg/orchestrator` 整包 23 文件 6879 行）；**`team.json` 投影化未做**（全仓无"投影"实现）——这是 M4 未满的唯一缺项 |
+> | M4 运行时与收尾 | 0% | **85%** | `AgentRuntime` **三实现齐**（`localRuntime` / `remoteRuntime` / k8s-job 复用 remote 通路）；`SpawnSubgraph` 有；**旧引擎已删**（`pkg/orchestrator` 整包 23 文件 6879 行）；~~`team.json` 投影化未做——唯一缺项~~ ✅ 投影化已实现（`team_projection.go`，默认关，2026-07-26）。**M4 实际仍缺**（「唯一缺项」当时就说小了）：`runNestedAgent`/CLI 裸 QueryEngine 执行路径收编（§4.8，`session.go:726`/`main.go:3490`）与 CLI DisableTools 接 ConstraintSet（§4.6，`main.go:3313`）两口仍开 |
 >
 > 原文的这句判断已过时，保留作为对照：M1 的验收项「kill -9 恢复重放正确」**无对应测试**（`journal_test.go` 只模拟尾部截断行，不是进程 kill）。M2 记 ✅ 的 loop/条件边应为 🟡（生产零产生方）。M4 = 0%：`pkg/orchestrator` 仍生产可达（4 个注册工作流），四大 God File 全在且 `workflow.go` 比设计稿时**更大**。
 

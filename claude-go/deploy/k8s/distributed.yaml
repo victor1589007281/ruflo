@@ -97,6 +97,15 @@ spec:
           env:
             - name: CLAUDE_GO_LLM_GATEWAY
               value: "http://claude-go-gateway:18081"
+            # L1 网关档位 (pkg/llmgw/remote.go)。**刻意不设 = local 档**:
+            # local 档下出站 BaseURL 已被 ApplyGatewayOverride 改指上面那个网关,
+            # 字节照样经网关 (k8s-e2e.sh 第 9 步断言的就是这条); 而进程内仍保留
+            # 重试/熔断/fallback。
+            # 打开下面这行改为 remote 档 = 本进程不再重试/熔断/持有 provider 凭据,
+            # 全部集中到网关进程。这是**可感知的行为变更**, 要与网关侧的重试/熔断
+            # 能力一起上线, 故默认不开。
+            # - name: CLAUDE_GO_LLM_GATEWAY_MODE
+            #   value: "remote"
             - name: KIMI_API_KEY
               valueFrom:
                 secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }

@@ -72,7 +72,7 @@ type policyDecision struct {
 //
 // fail-open: 底座未装配就零成本 no-op。与 gate Span 同一条理由 —— 采集是观测不是治理,
 // 记不下来不该影响这个阶段跑不跑。
-func (we *WorkflowExecutor) writePolicyDecisionSpan(ctx context.Context, d policyDecision) {
+func (we *WorkflowExecutor) writePolicyDecisionSpan(ctx context.Context, d policyDecision, canary *promptCanaryRecord) {
 	if we == nil || we.traceStore == nil {
 		return
 	}
@@ -97,6 +97,10 @@ func (we *WorkflowExecutor) writePolicyDecisionSpan(ctx context.Context, d polic
 	}
 	if len(skills) > 0 {
 		attrs["skills"] = skills
+	}
+	// shadow 比例灰度臂标记 (design/03 §4.6/§4.7): nil = 本阶段无灰度。
+	if canary != nil {
+		canary.canaryAttrs(attrs)
 	}
 	we.traceStore.Write(tracestore.Span{
 		TraceID:  ids.RunID,
