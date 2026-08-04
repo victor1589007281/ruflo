@@ -33,6 +33,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/mcp"
 )
 
 // ============================================================================
@@ -153,6 +155,10 @@ func (t *httpTransport) Name() string { return "http" }
 
 func (t *httpTransport) Run(srv *MCPServerV2) error {
 	mux := http.NewServeMux()
+	// 2026-07-28 无状态单端点: 路由经 Mcp-Method 头 / body method, 版本经
+	// MCP-Protocol-Version 头 / _meta, 响应为 JSON-RPC 信封。
+	mux.HandleFunc("/mcp", srv.handleHTTPMCP)
+	// 兼容旧客户端 (2024-11-05 / 2025-11-25 裸端点)。
 	mux.HandleFunc("/mcp/v1/initialize", srv.handleHTTPInitialize)
 	mux.HandleFunc("/mcp/v1/tools/list", srv.handleHTTPToolsList)
 	mux.HandleFunc("/mcp/v1/tools/call", srv.handleHTTPToolsCall)
@@ -406,11 +412,25 @@ func (s *MCPServerV2) handleMessage(raw string) {
 
 	isNotification := req.ID == nil
 
+	// 2026-07-28: 协议版本经 _meta 每次请求携带; 不在支持列表 → 报错并带 supported。
+	if v := metaVersionFromParams(req.Params); v != "" && !mcp.IsSupported(v) {
+		s.writeError(req.ID, mcp.ErrorUnsupportedProtocolVersion, "Unsupported protocol version",
+			map[string]interface{}{
+				"supported": mcp.SupportedProtocolVersions,
+				"requested": v,
+			})
+		return
+	}
+
 	switch req.Method {
 	case "initialize":
 		s.handleInitialize(req)
 	case "notifications/initialized":
 		// 无需响应
+	case "server/discover":
+		s.handleDiscover(req)
+	case "ping":
+		s.writeResult(req.ID, map[string]interface{}{})
 	case "tools/list":
 		s.handleToolsList(req)
 	case "tools/call":
@@ -422,22 +442,75 @@ func (s *MCPServerV2) handleMessage(raw string) {
 	}
 }
 
+// metaVersionFromParams 从 JSON-RPC params 的 _meta 提取协议版本。
+func metaVersionFromParams(params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	var p map[string]interface{}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return ""
+	}
+	return metaVersionFromMap(p)
+}
+
+func metaVersionFromMap(p map[string]interface{}) string {
+	raw, ok := p["_meta"]
+	if !ok {
+		return ""
+	}
+	meta, ok := raw.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	v, _ := meta[mcp.MetaKeyProtocolVersion].(string)
+	return v
+}
+
 func (s *MCPServerV2) handleInitialize(req mcpRequest) {
 	result := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": mcp.ProtocolVersion,
 		"capabilities": map[string]interface{}{
 			"tools": map[string]interface{}{},
 		},
-		"serverInfo": map[string]string{
-			"name":    "claude-go-codeintel",
-			"version": "1.0.0",
-		},
+		"serverInfo": s.serverInfo(),
 	}
 	s.writeResult(req.ID, result)
 }
 
+// handleDiscover 处理 server/discover（2026-07-28 新增 RPC，可选）。
+// 让客户端免握手即可取回 supportedVersions / capabilities / serverInfo。
+func (s *MCPServerV2) handleDiscover(req mcpRequest) {
+	result := map[string]interface{}{
+		"protocolVersion":   mcp.ProtocolVersion,
+		"supportedVersions": mcp.SupportedProtocolVersions,
+		"capabilities": map[string]interface{}{
+			"tools": map[string]interface{}{},
+		},
+		"serverInfo": s.serverInfo(),
+	}
+	s.writeResult(req.ID, result)
+}
+
+// serverInfo 返回服务器身份（含 host，便于多实例部署时确认请求落到哪个 Pod）。
+func (s *MCPServerV2) serverInfo() map[string]string {
+	info := map[string]string{
+		"name":    "claude-go-codeintel",
+		"version": "1.0.0",
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		info["host"] = host
+	}
+	return info
+}
+
 func (s *MCPServerV2) handleToolsList(req mcpRequest) {
-	tools := []mcpTool{
+	s.writeResult(req.ID, map[string]interface{}{"tools": s.toolsList()})
+}
+
+// toolsList 返回全部 codeintel 工具声明（stdio / HTTP / stateless 三入口共用）。
+func (s *MCPServerV2) toolsList() []mcpTool {
+	return []mcpTool{
 		{
 			Name:        "code_intel_init",
 			Description: "Initialize code intelligence for a repository by running GitNexus analyze and Graphify update. Zero LLM tokens consumed during indexing.",
@@ -464,7 +537,6 @@ func (s *MCPServerV2) handleToolsList(req mcpRequest) {
 			InputSchema: json.RawMessage(`{"type":"object","properties":{"repo_path":{"type":"string","description":"Absolute path to the indexed repository."},"action":{"type":"string","enum":["switch","detect_changes","status","reindex"],"description":"Action to perform."},"branch_name":{"type":"string"}},"required":["repo_path","action"]}`),
 		},
 	}
-	s.writeResult(req.ID, map[string]interface{}{"tools": tools})
 }
 
 func (s *MCPServerV2) handleToolsCall(req mcpRequest) {
@@ -584,11 +656,34 @@ func estimateRepoSize(repoPath string) (fileCount int, sourceMB int) {
 	return fileCount, int(totalBytes / (1024 * 1024))
 }
 
+// withRepoLock 为"同一仓库分支"获取跨进程排他锁（多实例共享 PV 场景）。
+// 返回的释放函数供 defer；未启用集中索引（IndexBaseDir 为空）时为 no-op。
+func (s *MCPServerV2) withRepoLock(repoPath string) (func(), error) {
+	if s.IndexBaseDir == "" {
+		return func() {}, nil
+	}
+	im := NewIndexManager(s.IndexBaseDir)
+	if im == nil {
+		return func() {}, nil
+	}
+	lk, err := im.LockRepo(repoPath)
+	if err != nil {
+		return func() {}, fmt.Errorf("acquire repo lock: %w", err)
+	}
+	return func() { _ = lk.Release() }, nil
+}
+
 func (s *MCPServerV2) toolInit(args json.RawMessage) (string, bool) {
 	var in struct{ RepoPath string `json:"repo_path"` }
 	if err := json.Unmarshal(args, &in); err != nil {
 		return fmt.Sprintf("parse error: %v", err), true
 	}
+	release, err := s.withRepoLock(in.RepoPath)
+	if err != nil {
+		return err.Error(), true
+	}
+	defer release()
+
 	gn := NewGitNexus(in.RepoPath)
 	gn.IndexBaseDir = s.IndexBaseDir
 	gn.MaxHeapMB = calcHeapMB(in.RepoPath, s.GitNexusCfg)
@@ -614,6 +709,12 @@ func (s *MCPServerV2) toolUpdate(args json.RawMessage) (string, bool) {
 	if err := json.Unmarshal(args, &in); err != nil {
 		return fmt.Sprintf("parse error: %v", err), true
 	}
+	release, err := s.withRepoLock(in.RepoPath)
+	if err != nil {
+		return err.Error(), true
+	}
+	defer release()
+
 	gn := NewGitNexus(in.RepoPath)
 	gn.IndexBaseDir = s.IndexBaseDir
 	gn.MaxHeapMB = calcHeapMB(in.RepoPath, s.GitNexusCfg)
@@ -758,7 +859,12 @@ func (s *MCPServerV2) toolBranch(args json.RawMessage) (string, bool) {
 			"graphify_indexed": gf.IsIndexed(),
 		}
 	case "reindex":
+		release, lockErr := s.withRepoLock(in.RepoPath)
+		if lockErr != nil {
+			return lockErr.Error(), true
+		}
 		o := RunIndex(gn, gf)
+		release()
 		result = map[string]interface{}{
 			"action":         "reindex",
 			"gitnexus":       safeMCPResult(o.GitNexus),
@@ -828,14 +934,11 @@ func (s *MCPServerV2) handleHTTPInitialize(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	result := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": mcp.ProtocolVersion,
 		"capabilities": map[string]interface{}{
 			"tools": map[string]interface{}{},
 		},
-		"serverInfo": map[string]string{
-			"name":    "claude-go-codeintel",
-			"version": "1.0.0",
-		},
+		"serverInfo": s.serverInfo(),
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -845,34 +948,7 @@ func (s *MCPServerV2) handleHTTPToolsList(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	tools := []mcpTool{
-		{
-			Name:        "code_intel_init",
-			Description: "Initialize code intelligence for a repository by running GitNexus analyze and Graphify update. Zero LLM tokens consumed during indexing.",
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"repo_path":{"type":"string","description":"Absolute path to the git repository to index."}},"required":["repo_path"]}`),
-		},
-		{
-			Name:        "code_intel_update",
-			Description: "Incrementally update the code intelligence index by re-running GitNexus analyze and Graphify update. Zero LLM tokens consumed.",
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"repo_path":{"type":"string","description":"Absolute path to the indexed repository."}},"required":["repo_path"]}`),
-		},
-		{
-			Name:        "code_intel_status",
-			Description: "Get the status of code intelligence index from GitNexus and Graphify.",
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"repo_path":{"type":"string","description":"Absolute path to the indexed repository."}},"required":["repo_path"]}`),
-		},
-		{
-			Name:        "code_intel_query",
-			Description: "Query the code intelligence graph via GitNexus or Graphify CLI. Query types: navigate, impact, find_refs, path, explain, communities, god_nodes, surprises, cross_shard.",
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"repo_path":{"type":"string","description":"Absolute path to the indexed repository."},"query_type":{"type":"string","enum":["navigate","impact","find_refs","communities","god_nodes","path","surprises","cross_shard","query","explain"],"description":"Query type."},"shard":{"type":"string"},"symbol":{"type":"string"},"file_path":{"type":"string"},"depth":{"type":"integer"},"top_n":{"type":"integer"},"target_shard":{"type":"string"},"target_symbol":{"type":"string"}},"required":["repo_path","query_type"]}`),
-		},
-		{
-			Name:        "code_intel_branch",
-			Description: "Branch management for code intelligence: detect_changes, status, reindex.",
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"repo_path":{"type":"string","description":"Absolute path to the indexed repository."},"action":{"type":"string","enum":["switch","detect_changes","status","reindex"],"description":"Action to perform."},"branch_name":{"type":"string"}},"required":["repo_path","action"]}`),
-		},
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"tools": tools})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"tools": s.toolsList()})
 }
 
 func (s *MCPServerV2) handleHTTPToolsCall(w http.ResponseWriter, r *http.Request) {
@@ -910,13 +986,130 @@ func (s *MCPServerV2) handleHTTPHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]interface{}{
 		"ok":      true,
-		"version": "1.0.0",
+		"version": mcp.ProtocolVersion,
 		"time":    time.Now(),
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		resp["host"] = host
 	}
 	if s.RepoPath != "" {
 		resp["repoPath"] = s.RepoPath
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// rpcError 统一 /mcp 端点内部错误结构。
+type rpcError struct {
+	code    int
+	message string
+	data    interface{}
+}
+
+// handleHTTPMCP 处理 2026-07-28 无状态统一端点 POST /mcp。
+//
+// 请求: MCP-Protocol-Version 头（或 body _meta）声明协议版本; Mcp-Method 头
+// 声明要调用的方法（tools/list / tools/call / server/discover / ping）;
+// body 为 JSON-RPC 信封 {jsonrpc,id,method,params}。
+// 响应: JSON-RPC 信封 {jsonrpc,id,result|error}, 附 MCP-Protocol-Version 与
+// X-Claude-Go-Backend（Pod hostname, 用于多实例部署下验证粘性/均衡）。
+func (s *MCPServerV2) handleHTTPMCP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	// 解析 JSON-RPC 信封（空 body 也允许，路由全靠头）。
+	var body mcpRequest
+	if bodyBytes, err := io.ReadAll(r.Body); err == nil && len(bodyBytes) > 0 {
+		_ = json.Unmarshal(bodyBytes, &body)
+	}
+
+	// 版本协商: MCP-Protocol-Version 头优先, 否则 body _meta。
+	declared := r.Header.Get(mcp.HeaderProtocolVersion)
+	if declared == "" {
+		declared = metaVersionFromParams(body.Params)
+	}
+	w.Header().Set(mcp.HeaderProtocolVersion, mcp.ProtocolVersion)
+	if host, err := os.Hostname(); err == nil && host != "" {
+		w.Header().Set(mcp.HeaderBackend, host)
+	}
+	if declared != "" && !mcp.IsSupported(declared) {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      body.ID,
+			"error": map[string]interface{}{
+				"code":    mcp.ErrorUnsupportedProtocolVersion,
+				"message": "Unsupported protocol version",
+				"data": map[string]interface{}{
+					"supported": mcp.SupportedProtocolVersions,
+					"requested": declared,
+				},
+			},
+		})
+		return
+	}
+
+	// 路由: Mcp-Method 头（2026-07-28）优先, 回退 body method。
+	method := r.Header.Get(mcp.HeaderMethod)
+	if method == "" {
+		method = body.Method
+	}
+
+	var result interface{}
+	var rpcErr *rpcError
+	switch method {
+	case "server/discover":
+		result = map[string]interface{}{
+			"protocolVersion":   mcp.ProtocolVersion,
+			"supportedVersions": mcp.SupportedProtocolVersions,
+			"capabilities":      map[string]interface{}{"tools": map[string]interface{}{}},
+			"serverInfo":        s.serverInfo(),
+		}
+	case "tools/list":
+		result = map[string]interface{}{"tools": s.toolsList()}
+	case "tools/call":
+		name, args, err := decodeToolCall(body.Params)
+		if err != nil {
+			rpcErr = &rpcError{code: mcp.ErrorInvalidParams, message: "Invalid params"}
+			break
+		}
+		text, isErr := s.executeTool(name, args)
+		if isErr && text == "" {
+			rpcErr = &rpcError{code: mcp.ErrorUnknownTool, message: "Tool not found: " + name}
+			break
+		}
+		result = mcpToolResult{Content: []mcpContent{{Type: "text", Text: text}}, IsError: isErr}
+	case "ping":
+		result = map[string]interface{}{}
+	default:
+		rpcErr = &rpcError{code: mcp.ErrorMethodNotFound, message: "Method not found: " + method}
+	}
+
+	if rpcErr != nil {
+		errObj := map[string]interface{}{"code": rpcErr.code, "message": rpcErr.message}
+		if rpcErr.data != nil {
+			errObj["data"] = rpcErr.data
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"jsonrpc": "2.0", "id": body.ID, "error": errObj,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"jsonrpc": "2.0", "id": body.ID, "result": result,
+	})
+}
+
+// decodeToolCall 从 tools/call 的 params 解出工具名与参数。
+func decodeToolCall(params json.RawMessage) (name string, args json.RawMessage, err error) {
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return "", nil, err
+	}
+	return p.Name, p.Arguments, nil
 }
 
 // ============================================================================

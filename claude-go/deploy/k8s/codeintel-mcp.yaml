@@ -1,0 +1,102 @@
+# 多实例 codeintel MCP 服务 —— 共享 PV + 会话粘性负载均衡。
+#
+# 背景: 单个 codeintel MCP 服务进程内只有一把 sync.Mutex, 跨实例(不同 Pod /
+# 不同进程)并发写同一仓库分支的 .gitnexus / graphify-out / index.json 会互相
+# 踩踏。本清单把 3 个实例挂到同一 claude-go-teams(RWX) 卷上, 实例间用跨进程
+# flock(IndexManager.LockRepo) 对"同一仓库分支"的索引操作串行化 —— 见
+# pkg/codeintel/filelock.go 与 mcp_transport.go 的 withRepoLock。
+#
+# 均衡与粘性: 2026-07-28 无状态协议下无协议层会话, 客户端按会话键(AgentID /
+# 会话 UUID)做一致性哈希选后端(见 pkg/mcp/protocol.go ConsistentHash), 同一会话
+# 恒命中同一实例以保留进程内查询缓存/索引热态, 不同会话自然散开。服务端在响应
+# X-Claude-Go-Backend 头携带 Pod 名, 便于验证粘性/分布。
+#
+# 工具链: node / gitnexus 预注入共享卷 /mnt/data/tools(多实例共用同一份), 经
+# env 覆盖指向; graphify 依赖大量 C 扩展(容器内不可用), 留空触发 gitnexus-only
+# 降级(见 pkg/codeintel/wrapper.go DiscoverTools)。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeintel-mcp
+  namespace: claude-go
+  labels:
+    app: codeintel-mcp
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: codeintel-mcp
+  template:
+    metadata:
+      labels:
+        app: codeintel-mcp
+    spec:
+      containers:
+        - name: codeintel-mcp
+          image: claude-go:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - codeintel-mcp-server
+            - --transport
+            - http
+            - --addr
+            - 0.0.0.0:18080
+            - --index-base-dir
+            - /mnt/data/codeintel
+          env:
+            - name: CLAUDE_GO_NODE_PATH
+              value: /mnt/data/tools/node/bin/node
+            - name: CLAUDE_GO_GITNEXUS_PATH
+              value: /mnt/data/tools/gitnexus/dist/cli/index.js
+            - name: CLAUDE_GO_GRAPHIFY_PATH
+              value: ""
+            # 仓库/工具链从宿主以 UID 1000 拷入共享卷, 容器内 git 以 root 运行会
+            # 触发 "dubious ownership"。信任全部目录以让 git rev-parse / analyze 通过。
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: safe.directory
+            - name: GIT_CONFIG_VALUE_0
+              value: "*"
+          ports:
+            - name: mcp
+              containerPort: 18080
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /mcp/v1/health
+              port: 18080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /mcp/v1/health
+              port: 18080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: teams
+              mountPath: /mnt/data
+      volumes:
+        - name: teams
+          persistentVolumeClaim:
+            claimName: claude-go-teams
+---
+# Headless Service: 客户端可把 URLs 配成 codeintel-mcp 解析到全部 Pod IP,
+# 或显式列出 Pod IP。所有实例必须均衡请求(会话粘性见上文)。
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeintel-mcp
+  namespace: claude-go
+spec:
+  clusterIP: None
+  selector:
+    app: codeintel-mcp
+  ports:
+    - name: mcp
+      port: 18080
+      targetPort: 18080

@@ -47,6 +47,13 @@ type IndexManager struct {
 	mu      sync.Mutex
 }
 
+// setupMu 进程级串行化 symlink 建链/迁移。RunIndex 同进程并行跑 Analyze 与 Update，
+// 二者各自 setupIndex → NewIndexManager → SetupRepoIndex，对同一 .gitnexus /
+// graphify-out 做 ensureSymlink。若用实例级互斥锁，两个 goroutine 持的是两把
+// 不相干的锁，仍会同时 Lstat 到 ENOENT 后双双 symlink → 后者 EEXIST。必须进程级。
+// （跨进程已由 flock 串行，进程内由它兜底。）
+var setupMu sync.Mutex
+
 // NewIndexManager 创建索引管理器。baseDir 为空时不启用集中管理。
 func NewIndexManager(baseDir string) *IndexManager {
 	if baseDir == "" {
@@ -90,6 +97,10 @@ func (im *IndexManager) SetupRepoIndex(repoPath string) (gnDir, gfDir string, er
 	}
 
 	name := repoNameFromPath(repoPath)
+
+	// 进程级互斥: 同进程 Analyze/Update 并行 setupIndex，串行化建链与迁移。
+	setupMu.Lock()
+	defer setupMu.Unlock()
 
 	// 集中目录
 	gnDir = filepath.Join(im.BaseDir, "gitnexus", name, branch)
@@ -197,8 +208,20 @@ func (im *IndexManager) saveMeta(m *IndexMeta) error {
 	return os.WriteFile(p, append(data, '\n'), 0o644)
 }
 
-// updateMeta 更新或追加仓库索引记录（带文件锁）。
+// updateMeta 更新或追加仓库索引记录。
+// 跨进程安全：多实例共享同一 PV 时，对 index.json 的读-改-写必须加 flock，
+// 否则两个实例同时写会互相覆盖（读旧值→各自写→丢记录）。进程内 im.mu 只
+// 挡单进程并发，flock 挡跨进程并发。
 func (im *IndexManager) updateMeta(name, repoPath, branch, commit, gnDir, gfDir string) error {
+	// 跨进程排他锁：覆盖 loadMeta → saveMeta 整段读-改-写。
+	fl, err := AcquireFileLock(im.locksDir(), "index.json", 30*time.Second)
+	if err != nil {
+		// 拿不到锁（如只读挂载）不致命，退化为仅进程内互斥。
+		_ = err
+	} else {
+		defer fl.Release()
+	}
+
 	im.mu.Lock()
 	defer im.mu.Unlock()
 

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,12 +38,19 @@ import (
 
 // ServerConfig MCP 服务器配置
 // 对应 TS: services/mcp/types.ts 中的 McpStdioServerConfig 等
+//
+// 多实例部署（2026-07-28 无状态协议）时用 URLs 配置后端列表：
+//   - 会话粘性: 同一会话键（StickyKey 或每请求传入）经一致性哈希恒命中同一后端，
+//     保留该实例的进程内查询缓存热态;
+//   - 均衡: 不同会话键哈希散开，请求均匀分布到各后端。
 type ServerConfig struct {
 	Name      string            `json:"name"`
 	Transport string            `json:"transport"` // stdio, http
 	Command   string            `json:"command,omitempty"`
 	Args      []string          `json:"args,omitempty"`
 	URL       string            `json:"url,omitempty"`
+	URLs      []string          `json:"urls,omitempty"` // 多后端列表（HTTP，优先于 URL）
+	StickyKey string            `json:"stickyKey,omitempty"` // 会话粘性键；空则按连接生成
 	Env       map[string]string `json:"env,omitempty"`
 }
 
@@ -57,6 +65,32 @@ type Connection struct {
 	httpClient *http.Client
 	mu         sync.Mutex
 	nextID     atomic.Int64
+
+	// 2026-07-28 无状态协议 + 多后端粘性负载均衡。
+	protocolVersion string            // 协商后的协议版本
+	backends        []string          // HTTP 后端基址列表
+	ring            *ConsistentHash   // 一致性哈希环（会话粘性）
+	stickyKey       string            // 连接级默认粘性键
+
+	// 多后端诊断: 记录最近一次 HTTP 请求实际落到的后端基址与服务端 Pod host
+	// （X-Claude-Go-Backend 响应头）。用于多实例部署下验证会话粘性/负载分布。
+	lastBackend     string
+	lastBackendHost string
+}
+
+// LastBackend 返回最近一次 HTTP 请求实际落到的后端基址。
+func (conn *Connection) LastBackend() string {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.lastBackend
+}
+
+// LastBackendHost 返回最近一次 HTTP 响应中服务端上报的 Pod host
+// （X-Claude-Go-Backend），空串表示后端未上报。
+func (conn *Connection) LastBackendHost() string {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.lastBackendHost
 }
 
 // ToolInfo MCP 服务器声明的工具信息
@@ -83,8 +117,28 @@ type jsonrpcResponse struct {
 }
 
 type jsonrpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+// envelopeResponse 2026-07-28 统一 /mcp 端点的 JSON-RPC 信封响应。
+type envelopeResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *jsonrpcError   `json:"error,omitempty"`
+}
+
+// ProtocolError 带协议语义的 MCP 错误（含 data.supported 等协商信息）。
+type ProtocolError struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+func (e *ProtocolError) Error() string {
+	return fmt.Sprintf("MCP error %d: %s", e.Code, e.Message)
 }
 
 // Client MCP 客户端管理器
@@ -198,9 +252,12 @@ func (c *Client) connectStdio(ctx context.Context, conn *Connection) error {
 	conn.stdout = bufio.NewScanner(stdout)
 	conn.stdout.Buffer(make([]byte, 1024*1024), 1024*1024)
 
+	conn.protocolVersion = ProtocolVersion
+
 	// 发送 initialize。启动阶段必须继承调用方 ctx, 避免异常 MCP 进程卡死 Bot 初始化。
+	// stdio 下 2026-07-28 为建议性变更: 仍走握手, 但从响应协商实际协议版本。
 	initResult, err := conn.sendRequestCtx(ctx, "initialize", map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": ProtocolVersion,
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]string{
 			"name":    "claude-go",
@@ -210,7 +267,14 @@ func (c *Client) connectStdio(ctx context.Context, conn *Connection) error {
 	if err != nil {
 		return fmt.Errorf("initialize 失败: %w", err)
 	}
-	_ = initResult
+	if len(initResult) > 0 {
+		var ir struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		if err := json.Unmarshal(initResult, &ir); err == nil && ir.ProtocolVersion != "" {
+			conn.protocolVersion = ir.ProtocolVersion
+		}
+	}
 
 	// 发送 initialized 通知
 	_ = conn.sendNotification("notifications/initialized", nil)
@@ -233,44 +297,150 @@ func (c *Client) connectStdio(ctx context.Context, conn *Connection) error {
 	return nil
 }
 
-// connectHTTP 通过 HTTP 传输连接 MCP 服务器
+// connectHTTP 通过 HTTP 传输连接 MCP 服务器。
+//
+// 2026-07-28 无状态流程: server/discover 协商协议版本 → tools/list 取工具。
+// 服务器不支持 stateless（返回 UnsupportedProtocolVersionError）时回退旧
+// initialize 流程（/mcp/v1/initialize），保证对旧版 MCP 服务器向后兼容。
 func (c *Client) connectHTTP(ctx context.Context, conn *Connection) error {
-	if conn.Config.URL == "" {
-		return fmt.Errorf("HTTP 传输需要配置 url")
+	if conn.Config.URL == "" && len(conn.Config.URLs) == 0 {
+		return fmt.Errorf("HTTP 传输需要配置 url 或 urls")
 	}
-	conn.httpClient = &http.Client{Timeout: 30 * time.Second}
+	conn.httpClient = &http.Client{Timeout: 60 * time.Second}
 
-	// 发送 initialize
+	// 多后端: URLs 优先，其次单 URL；一致性哈希环实现会话粘性。
+	conn.backends = append([]string{}, conn.Config.URLs...)
+	if len(conn.backends) == 0 {
+		conn.backends = []string{conn.Config.URL}
+	}
+	conn.ring = NewConsistentHash(conn.backends, 0)
+	if conn.Config.StickyKey != "" {
+		conn.stickyKey = conn.Config.StickyKey
+	} else {
+		conn.stickyKey = fmt.Sprintf("conn-%d", conn.nextID.Add(1))
+	}
+	conn.protocolVersion = ProtocolVersion
+
+	// 无状态协商。
+	if err := conn.discover(ctx); err != nil {
+		if v := conn.downgradeFromErr(err); v != "" {
+			conn.protocolVersion = v
+			if lerr := conn.legacyConnect(ctx, v); lerr != nil {
+				conn.Status = "error"
+				return lerr
+			}
+			conn.Status = "connected"
+			return nil
+		}
+		conn.Status = "error"
+		return fmt.Errorf("server/discover 失败: %w", err)
+	}
+	if err := conn.fetchTools(ctx); err != nil {
+		conn.Status = "connected" // 工具列表失败不影响连接
+		return nil
+	}
+	conn.Status = "connected"
+	return nil
+}
+
+// discover 调用 server/discover（2026-07-28）协商协议版本。
+func (conn *Connection) discover(ctx context.Context) error {
+	res, err := conn.sendRequestCtx(ctx, "server/discover", nil)
+	if err != nil {
+		return err
+	}
+	var d struct {
+		ProtocolVersion    string   `json:"protocolVersion"`
+		SupportedVersions  []string `json:"supportedVersions"`
+	}
+	if err := json.Unmarshal(res, &d); err == nil && d.ProtocolVersion != "" {
+		conn.protocolVersion = d.ProtocolVersion
+	}
+	return nil
+}
+
+// fetchTools 拉取工具列表。
+func (conn *Connection) fetchTools(ctx context.Context) error {
+	res, err := conn.sendRequestCtx(ctx, "tools/list", nil)
+	if err != nil {
+		return err
+	}
+	var tl struct {
+		Tools []ToolInfo `json:"tools"`
+	}
+	if err := json.Unmarshal(res, &tl); err != nil {
+		return err
+	}
+	conn.Tools = tl.Tools
+	return nil
+}
+
+// legacyConnect 旧协议（≤2025-11-25）回退: initialize 握手 + tools/list。
+func (conn *Connection) legacyConnect(ctx context.Context, version string) error {
 	initBody, _ := json.Marshal(map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": version,
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]string{
 			"name":    "claude-go",
 			"version": "1.0.0",
 		},
 	})
-	resp, err := conn.httpClient.Post(conn.Config.URL+"/mcp/v1/initialize", "application/json", bytes.NewReader(initBody))
+	backend := conn.backends[0]
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(backend, "/")+"/mcp/v1/initialize", bytes.NewReader(initBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := conn.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("initialize 请求失败: %w", err)
 	}
 	_ = resp.Body.Close()
 
-	// 获取工具列表
-	toolsResp, err := conn.httpClient.Post(conn.Config.URL+"/mcp/v1/tools/list", "application/json", nil)
+	res, err := conn.httpRequest(ctx, "tools/list", nil, backend)
 	if err != nil {
-		conn.Status = "connected"
-		return nil
+		return err
 	}
-	var toolsList struct {
+	var tl struct {
 		Tools []ToolInfo `json:"tools"`
 	}
-	if err := json.NewDecoder(toolsResp.Body).Decode(&toolsList); err == nil {
-		conn.Tools = toolsList.Tools
+	if err := json.Unmarshal(res, &tl); err == nil {
+		conn.Tools = tl.Tools
 	}
-	_ = toolsResp.Body.Close()
-
-	conn.Status = "connected"
 	return nil
+}
+
+// downgradeFromErr 从 UnsupportedProtocolVersionError 的 data.supported 解析
+// 可用的最高兼容版本；非版本类错误返回空串。
+func (conn *Connection) downgradeFromErr(err error) string {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) {
+		return ""
+	}
+	if pe.Code != ErrorUnsupportedProtocolVersion {
+		return ""
+	}
+	var data struct {
+		Supported []string `json:"supported"`
+	}
+	if len(pe.Data) > 0 {
+		_ = json.Unmarshal(pe.Data, &data)
+	}
+	for _, v := range SupportedProtocolVersions {
+		for _, s := range data.Supported {
+			if s == v {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// clientCaps 声明客户端能力（2026-07-28 每次请求经 _meta 携带）。
+func (conn *Connection) clientCaps() map[string]interface{} {
+	return map[string]interface{}{
+		"tools": map[string]interface{}{"listChanged": false},
+	}
 }
 
 // sendRequest 发送 JSON-RPC 请求并等待响应
@@ -284,34 +454,17 @@ func (conn *Connection) sendRequestCtx(ctx context.Context, method string, param
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
-	// HTTP 传输: 直接发送 RESTful POST
+	// HTTP 传输: 会话粘性一致性哈希选后端 → 2026-07-28 无状态端点。
 	if conn.Config.Transport == "http" {
-		var body []byte
-		if params != nil {
-			var err error
-			body, err = json.Marshal(params)
-			if err != nil {
-				return nil, err
-			}
+		sticky := StickyKeyFromContext(ctx)
+		if sticky == "" {
+			sticky = conn.stickyKey
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, conn.Config.URL+"/mcp/v1/"+method, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
+		backend := conn.ring.Get(sticky)
+		if backend == "" {
+			backend = conn.backends[0]
 		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := conn.httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		result, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode >= 400 {
-			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(result))
-		}
-		return result, nil
+		return conn.httpRequest(ctx, method, params, backend)
 	}
 
 	id := conn.nextID.Add(1)
@@ -319,7 +472,11 @@ func (conn *Connection) sendRequestCtx(ctx context.Context, method string, param
 		JSONRPC: "2.0",
 		ID:      id,
 		Method:  method,
-		Params:  params,
+	}
+	if pm, ok := params.(map[string]interface{}); ok {
+		req.Params = WithMetaParams(pm, conn.protocolVersion, "claude-go", "1.0.0", conn.clientCaps())
+	} else {
+		req.Params = params
 	}
 
 	data, err := json.Marshal(req)
@@ -364,6 +521,79 @@ func (conn *Connection) sendRequestCtx(ctx context.Context, method string, param
 		}
 		return resp.Result, nil
 	}
+}
+
+// httpRequest 向指定后端发送 2026-07-28 无状态 JSON-RPC 请求。
+// body 为 JSON-RPC 信封 + _meta（协议版本/客户端身份/能力）; 请求头带
+// MCP-Protocol-Version 与 Mcp-Method（头级路由）。响应为 JSON-RPC 信封，
+// 返回 result 原始 JSON。
+func (conn *Connection) httpRequest(ctx context.Context, method string, params interface{}, backend string) (json.RawMessage, error) {
+	body := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      conn.nextID.Add(1),
+		"method":  method,
+	}
+	if paramsMap, ok := params.(map[string]interface{}); ok {
+		body["params"] = WithMetaParams(paramsMap, conn.protocolVersion, "claude-go", "1.0.0", conn.clientCaps())
+	} else if params != nil {
+		body["params"] = params
+	} else {
+		body["params"] = WithMetaParams(nil, conn.protocolVersion, "claude-go", "1.0.0", conn.clientCaps())
+	}
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(backend, "/")+"/mcp", bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set(HeaderProtocolVersion, conn.protocolVersion)
+	req.Header.Set(HeaderMethod, method)
+
+	resp, err := conn.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// 多后端诊断: 记录实际落到的后端与 Pod host（供粘性/分布验证）。
+	conn.lastBackend = backend
+	conn.lastBackendHost = resp.Header.Get(HeaderBackend)
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusBadRequest {
+		return nil, parseEnvelopeError(respBytes)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var env envelopeResponse
+	if err := json.Unmarshal(respBytes, &env); err != nil {
+		return nil, fmt.Errorf("解析 MCP 响应失败: %w", err)
+	}
+	if env.Error != nil {
+		return nil, &ProtocolError{Code: env.Error.Code, Message: env.Error.Message, Data: env.Error.Data}
+	}
+	return env.Result, nil
+}
+
+// parseEnvelopeError 从错误响应体解析 ProtocolError（含协商 data.supported）。
+func parseEnvelopeError(body []byte) error {
+	var env envelopeResponse
+	if err := json.Unmarshal(body, &env); err != nil || env.Error == nil {
+		return fmt.Errorf("HTTP 400: %s", string(body))
+	}
+	return &ProtocolError{Code: env.Error.Code, Message: env.Error.Message, Data: env.Error.Data}
 }
 
 // sendNotification 发送 JSON-RPC 通知 (无 ID, 不期望响应)
@@ -484,12 +714,33 @@ func (t *MCPTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *type
 	return nil
 }
 
-func (t *MCPTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
+func (t *MCPTool) Call(ctx context.Context, input json.RawMessage, toolCtx *tool.ToolContext) (*tool.ToolResult, error) {
+	// 会话粘性: 从工具上下文推导粘性键写入 ctx，多后端时经一致性哈希命中同一实例。
+	if key := stickyKeyFromToolCtx(toolCtx); key != "" {
+		ctx = WithStickyKey(ctx, key)
+	}
 	result, err := t.conn.CallTool(ctx, t.info.Name, input)
 	if err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("MCP 工具调用失败: %v", err), IsError: true}, nil
 	}
 	return &tool.ToolResult{Content: result}, nil
+}
+
+// stickyKeyFromToolCtx 从工具上下文推导会话粘性键：
+// 优先 AgentID（子代理隔离），其次第一条消息 UUID（会话隔离）。
+func stickyKeyFromToolCtx(tctx *tool.ToolContext) string {
+	if tctx == nil {
+		return ""
+	}
+	if tctx.AgentID != "" {
+		return "agent:" + string(tctx.AgentID)
+	}
+	for i := range tctx.Messages {
+		if m := tctx.Messages[i]; m.UUID != "" {
+			return "session:" + m.UUID
+		}
+	}
+	return ""
 }
 
 // RegisterMCPTools 将 MCP 连接中发现的工具注册到工具注册表。

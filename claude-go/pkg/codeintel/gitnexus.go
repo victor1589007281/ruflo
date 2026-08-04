@@ -226,9 +226,14 @@ func gitnexusIndexedFrom(qr *QueryResult, err error) bool {
 		}
 	}
 	// 已索引判据：状态行含索引提交或"已是最新/需要更新"（后者=已索引但需增量更新）。
+	// 同时匹配英文输出（gitnexus CLI 随版本在中/英之间变动，实测最新版输出
+	// "Status: ✅ up-to-date" / "Indexed commit:"，纯中文匹配会误判未索引）。
 	return strings.Contains(out, "索引提交") ||
 		strings.Contains(out, "已是最新") ||
-		strings.Contains(out, "需要更新")
+		strings.Contains(out, "需要更新") ||
+		strings.Contains(out, "up-to-date") ||
+		strings.Contains(out, "up to date") ||
+		strings.Contains(out, "Indexed commit")
 }
 
 // IsIndexed 检查当前仓库是否已被 GitNexus 索引。
