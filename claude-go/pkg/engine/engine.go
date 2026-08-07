@@ -116,7 +116,11 @@ type SessionStoreInterface interface {
 
 // Config 引擎配置
 type Config struct {
-	Model            string
+	Model string
+	// ExecutionModel 自动相位路由的快速执行模型 (Path B)。
+	// 设置后, 工具消费回合 (消息尾部携带 tool_result) 自动路由到该模型,
+	// 规划/推理回合仍走 Model。留空 = 关闭自动路由, 全部回合走 Model。
+	ExecutionModel   string
 	FallbackModel    string
 	MaxTokens        int
 	MaxTurns         int    // queryLoop 最大迭代次数 (0 = 无限)
@@ -722,6 +726,23 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 	}
 
 	for {
+		// ============ Path B: 自动相位路由 (工具消费回合 → ExecutionModel) ============
+		// 判定信号: 消息尾部最后一条是 User 消息且携带 tool_result (由上一轮工具执行 append,
+		// 见下方 toolResults 追加处)。缓存感知: 连续工具回合 sticky 在同一模型,
+		// 每轮用户请求至多切换 1 次 (主模型 → 执行模型 → 主模型), 同一模型连续回合共享前缀 KV 缓存。
+		// ExecutionModel 为空 = 关闭, 行为与旧版完全一致。WithModel 是共享 HTTP/限流器的轻量副本。
+		// 路由例外: 委派工具 (delegate_task/Agent/Task) 的报告需要主模型综合,
+		// 该消费回合回主模型, 不切执行模型 (见 isDelegationResultTurn)。
+		client := e.APIClient
+		turnModel := e.Config.Model
+		if e.Config.ExecutionModel != "" && isToolExecTurn(messages) && !isDelegationResultTurn(messages) {
+			turnModel = e.Config.ExecutionModel
+		}
+		if turnModel != client.Model {
+			client = client.WithModel(turnModel)
+		}
+		currentModel = turnModel
+
 		// PreTurn Hook: 单轮开始
 		if e.HookRunner != nil {
 			hookOut := e.HookRunner.ExecutePreTurnHooks(messages, turnCount)
@@ -882,7 +903,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		apiCtx = trace.With(apiCtx, trace.IDs{TurnID: fmt.Sprintf("t%d", turnCount)})
 
 		apiCallStart := time.Now()
-		eventCh, errCh := e.APIClient.StreamMessage(apiCtx, apiMessages, systemPrompt, apiTools, e.Config.MaxTokens)
+		eventCh, errCh := client.StreamMessage(apiCtx, apiMessages, systemPrompt, apiTools, e.Config.MaxTokens)
 
 		var assistantBlocks []types.ContentBlock
 		var toolUseBlocks []types.ContentBlock
@@ -1422,6 +1443,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			Cwd:                e.Config.Cwd,
 			PermissionMode:     effectivePerm,
 			MainLoopModel:      currentModel,
+			ExecutionModel:     e.Config.ExecutionModel, // delegate_task 用它确定子代理模型
 			IsNonInteractive:   e.Config.IsNonInteractive,
 			Debug:              e.Config.Debug,
 			Messages:           messages,
@@ -1501,6 +1523,70 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
 		}
 	}
+}
+
+// isToolExecTurn 判定下一轮 LLM 调用是否处于"工具消费回合":
+// 消息尾部最后一条是 User 消息且携带 tool_result 内容块 (工具执行后 append 的形态)。
+// Path B 用它把工具消费回合路由到快速执行模型, 规划/推理回合留在主模型。
+func isToolExecTurn(messages []types.Message) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	last := messages[len(messages)-1]
+	if last.Type != types.MessageTypeUser {
+		return false
+	}
+	for _, b := range last.Content {
+		if b.Type == types.ContentBlockToolResult {
+			return true
+		}
+	}
+	return false
+}
+
+// isDelegationResultTurn 判定当前工具消费回合消费的是否是"子代理委派"的结果:
+// 委派报告需要主模型综合, 不应路由到快速执行模型 (Path B 路由例外)。
+func isDelegationResultTurn(messages []types.Message) bool {
+	return tool.IsDelegationTool(lastToolUseName(messages))
+}
+
+// lastToolUseName 从消息尾部最近一条 tool_result 的 ToolUseID, 反向找到对应的
+// assistant tool_use 并返回其工具名。找不到返回 ""。
+// 同一回合混用委派+普通工具时, 取**最后完成**的工具 (tool_results 追加顺序),
+// 这是可接受启发式 —— nudge 引导规划方分开委派。
+func lastToolUseName(messages []types.Message) string {
+	// ① 尾部最近的 tool_result 的 ToolUseID
+	var id string
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Type != types.MessageTypeUser {
+			continue
+		}
+		for _, b := range m.Content {
+			if b.Type == types.ContentBlockToolResult && b.ToolUseID != "" {
+				id = b.ToolUseID
+			}
+		}
+		if id != "" {
+			break
+		}
+	}
+	if id == "" {
+		return ""
+	}
+	// ② 反向找携带该 ID 的 assistant tool_use
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Type != types.MessageTypeAssistant {
+			continue
+		}
+		for _, b := range m.Content {
+			if b.Type == types.ContentBlockToolUse && b.ID == id {
+				return b.Name
+			}
+		}
+	}
+	return ""
 }
 
 // extractLatestUserIntent 从消息尾部反向找到最近的用户自然语言意图。

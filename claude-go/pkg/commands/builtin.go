@@ -85,7 +85,39 @@ func RegisterBuiltins(r *Registry) {
 			}
 			old := ctx.Engine.Config.Model
 			ctx.Engine.Config.Model = args
+			// Path A 修复: 之前 /model 只改 Config.Model 标签, 实际推理走的是
+			// e.APIClient.Model (构造时固定), 切换从未真正生效。
+			// WithModel 返回共享同一 HTTP 客户端/限流器的轻量副本, 仅覆盖 Model 字段。
+			ctx.Engine.APIClient = ctx.Engine.APIClient.WithModel(args)
 			fmt.Printf("模型已切换: %s → %s\n", old, args)
+			return nil
+		},
+	})
+
+	r.Register(&Command{
+		Name:        "execution-model",
+		ArgHint:     "[name|off]",
+		Description: "查看/设置自动路由的快速执行模型 (工具消费回合用; off 关闭)",
+		Type:        CommandTypeLocal,
+		Execute: func(args string, ctx *CommandContext) error {
+			if ctx.Engine == nil {
+				return nil
+			}
+			if args == "" {
+				if ctx.Engine.Config.ExecutionModel == "" {
+					fmt.Println("执行模型: 未启用 (全部回合走主模型)")
+				} else {
+					fmt.Printf("执行模型: %s (工具消费回合)\n", ctx.Engine.Config.ExecutionModel)
+				}
+				return nil
+			}
+			if args == "off" {
+				ctx.Engine.Config.ExecutionModel = ""
+				fmt.Println("执行模型路由已关闭")
+				return nil
+			}
+			ctx.Engine.Config.ExecutionModel = args
+			fmt.Printf("执行模型路由已启用: 工具消费回合 → %s\n", args)
 			return nil
 		},
 	})

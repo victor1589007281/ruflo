@@ -367,5 +367,5 @@ func Test图外派生_nil守卫(t *testing.T) {
 	}
 	var nilTool *AgentTool
 	nilTool.SetTraceStore(nil) // 不 panic
-	(&AgentTool{}).observeSubagent(context.Background(), agentInput{}, 1, "", nil, time.Now(), 0)
+	observeSubagent(nil, context.Background(), agentInput{}, 1, "", nil, time.Now(), 0)
 }

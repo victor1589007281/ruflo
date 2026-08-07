@@ -54,6 +54,9 @@ type RunOptions struct {
 	Model        string
 	ReadOnly     bool
 	ParentID     types.AgentID
+	// MaxTurns 子代理最大循环回合数; 0 = 不限制 (沿用主会话 Config.MaxTurns)。
+	// delegate_task 用它给每个子代理兜底, 防跑量任务失控。
+	MaxTurns int
 }
 
 // AgentTool Agent/Task 工具实现
@@ -140,7 +143,7 @@ func (t *AgentTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.
 	})
 	// 成败两路都要记: 失败的派生同样烧了 token、同样占了墙钟, 只记成功的会让
 	// "为什么这个节点跑了 8 分钟才产出两行"永远解释不了。
-	t.observeSubagent(ctx, in, depth, result, err, start, tokensBefore)
+	observeSubagent(t.trace, ctx, in, depth, result, err, start, tokensBefore)
 	if err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("Agent 执行失败: %v", err), IsError: true}, nil
 	}

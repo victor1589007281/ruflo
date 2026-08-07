@@ -17,6 +17,22 @@ import (
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
+// DelegateToolName 子代理分解工具名 (Path B)。
+// 规划方 (主模型) 用它把工具密集/可并行的子任务拆给在快速执行模型上运行的
+// 独立子代理执行。engine 与 agent 包都引用它 —— 放在 tool 包避免 agent↔engine 环。
+const DelegateToolName = "delegate_task"
+
+// delegationTools 委派工具集合: 其 tool_result 消费回合应回主模型综合,
+// 不应路由到快速执行模型 (路由例外见 engine.isDelegationResultTurn)。
+var delegationTools = map[string]bool{
+	DelegateToolName: true,
+	"Agent":          true,
+	"Task":           true, // Agent 的遗留别名
+}
+
+// IsDelegationTool 判定工具名是否属于子代理委派类。
+func IsDelegationTool(name string) bool { return delegationTools[name] }
+
 // GlobalPermissionChecker 全局权限与单工具 CheckPermissions 的合并入口；
 // 由 pkg/permissions.Checker 实现。
 type GlobalPermissionChecker interface {
@@ -88,6 +104,7 @@ type ToolContext struct {
 	AbortCh            <-chan struct{}      `json:"-"` // 对应 TS: abortController.signal
 	Messages           []types.Message      `json:"messages,omitempty"`
 	MainLoopModel      string               `json:"mainLoopModel,omitempty"`
+	ExecutionModel     string               `json:"executionModel,omitempty"` // 自动路由的快速执行模型 (Path B); 空=未配置
 	AgentID            types.AgentID        `json:"agentId,omitempty"`
 	IsNonInteractive   bool                 `json:"isNonInteractive"`
 	Debug              bool                 `json:"debug"`

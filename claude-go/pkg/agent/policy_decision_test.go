@@ -26,7 +26,7 @@ func TestWritePolicyDecisionSpan_记下注入了什么(t *testing.T) {
 		ExperienceIDs: []string{"exp-1", "exp-2"},
 		Blackboard:    true, Reference: false, UserFeedback: true,
 		Prompt: prompt, Objective: "实现登录",
-	})
+	}, nil)
 
 	spans := readSpans(t, ts, "run-p")
 	if len(spans) != 1 {
@@ -64,7 +64,7 @@ func TestWritePolicyDecisionSpan_记下注入了什么(t *testing.T) {
 func TestWritePolicyDecisionSpan_无底座时noop(t *testing.T) {
 	we := &WorkflowExecutor{}
 	// 不 panic 即通过 (fail-open: 采集是观测不是治理)
-	we.writePolicyDecisionSpan(context.Background(), policyDecision{Stage: "s"})
+	we.writePolicyDecisionSpan(context.Background(), policyDecision{Stage: "s"}, nil)
 }
 
 func TestInjectedSkillNames(t *testing.T) {

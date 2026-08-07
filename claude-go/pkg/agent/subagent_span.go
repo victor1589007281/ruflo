@@ -145,11 +145,12 @@ func NewAgentToolWithTrace(runFn RunAgentFunc, ts *tracestore.Store) *AgentTool 
 //
 // **fail-open 且绝不改变返回值**: 观测是观测, 派生成败与产出由 Call 原样透传。
 // 这与 writeNodeSpan/writeGateSpan 同一条纪律 (graph_adapter.go:1595)。
-func (t *AgentTool) observeSubagent(ctx context.Context, in agentInput, depth int,
+//
+// 包级函数而非 *AgentTool 方法: AgentTool 与 DelegateTool (delegate_task, 见
+// delegate_tool.go) 都派生子代理, 挂一处就覆盖两条路径, 将来新增入口自动获得
+// 同样的可见性。trace 可空 (未注入轨迹底座时整套采集零成本 no-op)。
+func observeSubagent(ts *tracestore.Store, ctx context.Context, in agentInput, depth int,
 	out string, runErr error, start time.Time, tokensBefore int64) {
-	if t == nil {
-		return
-	}
 	status := "success"
 	errText := ""
 	if runErr != nil {
@@ -162,7 +163,7 @@ func (t *AgentTool) observeSubagent(ctx context.Context, in agentInput, depth in
 	// 只做计数, 发两条会让 "Subagent=2" 实际只是一次派生, 那种计数没人敢用。
 	if obs := internal_hook.ObserverFrom(ctx); obs != nil {
 		obs.Observe(ctx, internal_hook.Event{
-			Scope: "tool", // Agent 工具确实是一次工具调用; 与 internal_hook.scopeOf 同口径
+			Scope: "tool", // 委派工具确实是一次工具调用; 与 internal_hook.scopeOf 同口径
 			Phase: "SubagentDone",
 			Hook:  subagentHookName,
 			Err:   errText,
@@ -170,7 +171,7 @@ func (t *AgentTool) observeSubagent(ctx context.Context, in agentInput, depth in
 	}
 
 	// ② 轨迹。
-	if t.trace == nil {
+	if ts == nil {
 		return
 	}
 	ids := trace.From(ctx)
@@ -203,7 +204,7 @@ func (t *AgentTool) observeSubagent(ctx context.Context, in agentInput, depth in
 		attrs["tokens"] = delta
 	}
 
-	t.trace.Write(tracestore.Span{
+	ts.Write(tracestore.Span{
 		TraceID: ids.RunID,
 		SpanID:  trace.NewID("s"),
 		// ParentID 优先挂父节点: 这样"这个节点里派生了什么"在 Span 树上是一条边,
@@ -213,8 +214,8 @@ func (t *AgentTool) observeSubagent(ctx context.Context, in agentInput, depth in
 		Name:      subagentSpanName(in),
 		NodeID:    ids.NodeID, // 刻意=父节点, 与同一次执行的 llm_call/tool_call 对得上
 		TurnID:    ids.TurnID,
-		InputRef:  t.trace.MakeRef(in.Prompt),
-		OutputRef: t.trace.MakeRef(out),
+		InputRef:  ts.MakeRef(in.Prompt),
+		OutputRef: ts.MakeRef(out),
 		Attrs:     attrs,
 		TS:        start.UnixMilli(),
 		DurMS:     time.Since(start).Milliseconds(),

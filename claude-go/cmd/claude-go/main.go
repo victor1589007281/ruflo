@@ -58,11 +58,11 @@ import (
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/session"
-	"github.com/anthropic/claude-go/pkg/synctask"
 	"github.com/anthropic/claude-go/pkg/settings"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/statestore"
 	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
+	"github.com/anthropic/claude-go/pkg/synctask"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -144,26 +144,27 @@ const fullHelpGuide = `Claude Code (Go) - AI 编程助手
 `
 
 var (
-	flagModel        string
-	flagAttach       []string
-	flagCwd          string
-	flagFinalOnly    bool
-	flagEmitSession  bool
-	flagAPIKey       string
-	flagBaseURL      string
-	flagMaxTokens    int
-	flagMaxTurns     int
-	flagPermission   string
-	flagSystemPrompt string
-	flagPrint        bool
-	flagDebug        bool
-	flagMCPConfig    string
-	flagConfig       string
-	flagResume       string // --resume <sessionID>
-	flagContinue     bool   // --continue / -c
-	flagAdvisor      string // --advisor <provider:model|off>
-	flagAllowedTools string // --allowed-tools t1,t2 (whitelist; non-empty = only these)
-	flagOutputFormat string // --output-format text|json
+	flagModel          string
+	flagExecutionModel string
+	flagAttach         []string
+	flagCwd            string
+	flagFinalOnly      bool
+	flagEmitSession    bool
+	flagAPIKey         string
+	flagBaseURL        string
+	flagMaxTokens      int
+	flagMaxTurns       int
+	flagPermission     string
+	flagSystemPrompt   string
+	flagPrint          bool
+	flagDebug          bool
+	flagMCPConfig      string
+	flagConfig         string
+	flagResume         string // --resume <sessionID>
+	flagContinue       bool   // --continue / -c
+	flagAdvisor        string // --advisor <provider:model|off>
+	flagAllowedTools   string // --allowed-tools t1,t2 (whitelist; non-empty = only these)
+	flagOutputFormat   string // --output-format text|json
 )
 
 func main() {
@@ -235,6 +236,7 @@ func main() {
 	}
 
 	rootCmd.PersistentFlags().StringVar(&flagModel, "model", "qwen3.5-plus", "模型名称")
+	rootCmd.PersistentFlags().StringVar(&flagExecutionModel, "execution-model", "", "工具消费回合自动路由的快速模型 (留空=关闭; 例: lfm2.5:2.6b-q4_k_m)")
 	rootCmd.PersistentFlags().StringVar(&flagAPIKey, "api-key", "", "API Key (或设置 ANTHROPIC_API_KEY 环境变量)")
 	rootCmd.PersistentFlags().StringVar(&flagBaseURL, "base-url", "", "API base URL")
 	rootCmd.PersistentFlags().IntVar(&flagMaxTokens, "max-tokens", 16384, "最大输出 token 数")
@@ -3069,6 +3071,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	}
 	cfg := &engine.Config{
 		Model:            effectiveModel,
+		ExecutionModel:   flagExecutionModel,
 		MaxTokens:        effectiveMaxTokens,
 		MaxTurns:         effectiveMaxTurns,
 		ContextWindow:    contextWindow,
@@ -3114,6 +3117,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 	// 故留引用, 见 `agentTool.SetTraceStore(ts)`。
 	agentTool := agent.NewAgentTool(runAgent)
 	reg.Register(agentTool)
+	// delegate_task 子代理分解工具 (Path B): 规划方把工具密集/可并行的子任务拆给
+	// 在快速执行模型上运行的独立子代理, 报告回主模型综合。模型固定取
+	// tctx.ExecutionModel, 见 pkg/agent/delegate_tool.go。cap=80 为子代理回合数兜底。
+	delegateTool := agent.NewDelegateTool(runAgent, 80)
+	reg.Register(delegateTool)
 
 	// Advisor 顾问工具 (设计文档 docs/advisor-tool-design.md)
 	// 别名优先级: --advisor flag > config advisor 段; "--advisor off" 强制关闭。
@@ -3128,6 +3136,21 @@ func buildEngine() (*engine.QueryEngine, error) {
 	}
 
 	eng := engine.NewQueryEngine(cfg, apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
+
+	// Path B 子代理分解引导: 配置了执行模型时, 提示规划方把工具密集/可并行子任务
+	// 拆给 delegate_task 在快速执行模型上跑, 报告由主模型综合。TaskInstruction 由
+	// engine 每回合追加到 system prompt 尾部 (engine.go Phase 2); 子代理新建引擎
+	// 无此引导 (它们是被委派的执行者)。
+	if cfg.ExecutionModel != "" {
+		eng.TaskInstruction = fmt.Sprintf(`
+## 子代理分解
+你运行在主模型 %s, 本机配置了快速执行模型 %s。
+遇到工具密集/重复性/可并行的子任务时, 用 %s 工具拆给在 %s 上运行的独立子代理执行:
+- 子代理有全新上下文、自带工具循环, 但看不到本对话历史 → 子任务描述必须自包含 (目标+约束+验收标准)。
+- 相互独立的子任务放进 tasks 数组一次并行委派。
+- 委派只做执行, 综合判断与最终回答由你完成。简单任务不要委派。`,
+			cfg.Model, cfg.ExecutionModel, tool.DelegateToolName, cfg.ExecutionModel)
+	}
 
 	// V3 Anti-Amnesia: CLI 模式统一接入记忆系统
 	stateDirInput := ""
@@ -3183,6 +3206,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	// (design/01 §4.8): ① 派生本身写 subagent Span; ② 子代理引擎自己的 llm_call
 	// Span —— 改造前 nested 引擎的 TraceStore 恒 nil, 子代理烧的 token 在轨迹上无痕。
 	agentTool.SetTraceStore(ts)
+	delegateTool.SetTraceStore(ts)
 	deps.traceStore = ts
 	if ttl := tracestore.TTLFromEnv(); ttl > 0 {
 		// 每小时扫一次足够: trace 文件按 run 落, 清理粒度是"整个文件过期"。
@@ -3496,12 +3520,25 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 	}
 	// 子代理自己也带轨迹底座: 本条路径**给子代理又注册了一次 Agent 工具**(飞书那条
 	// 不注册), 递归可以很深。这里若用裸 NewAgentTool, 第 2 层及以下的派生就再次不可见,
-	// 而恰恰是深层递归最需要被看见。
+	// 而恰恰是深层递归最需要被看见。delegate_task 同样注册, 子代理也能继续分解。
 	nestedReg.Register(agent.NewAgentToolWithTrace(runAgent, deps.traceStore))
+	nestedReg.Register(agent.NewDelegateToolWithTrace(runAgent, deps.traceStore, 80))
 
 	nestedCfg := *deps.cfg
+	client := deps.apiClient
 	if opts.Model != "" {
+		// 子代理模型确定化烘焙: 既改 Config.Model 标签, 又把模型写进 client 副本,
+		// 并清空 ExecutionModel —— 子代理全程单模型, 不套用主会话的相位路由。
+		// (原实现只改 nestedCfg.Model 标签, 实际 client 仍是规划方模型, 靠首回合
+		// WithModel 恰好救回; 这里把"恰好"变成"确定"。)
 		nestedCfg.Model = opts.Model
+		nestedCfg.ExecutionModel = ""
+		if opts.Model != client.Model {
+			client = client.WithModel(opts.Model)
+		}
+	}
+	if opts.MaxTurns > 0 {
+		nestedCfg.MaxTurns = opts.MaxTurns
 	}
 	perm := deps.permChecker
 	if opts.ReadOnly {
@@ -3517,7 +3554,7 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 	nestedPromptMgr.AgentPrompt = deps.promptMgr.AgentPrompt
 	nestedPromptMgr.Model = nestedCfg.Model
 	nestedPromptMgr.SkillListing = deps.promptMgr.SkillListing
-	nested := engine.NewQueryEngine(&nestedCfg, deps.apiClient, nestedReg, deps.hookRunner, perm, deps.compactor, nestedPromptMgr)
+	nested := engine.NewQueryEngine(&nestedCfg, client, nestedReg, deps.hookRunner, perm, deps.compactor, nestedPromptMgr)
 	nested.TraceStore = deps.traceStore // design/01 §4.8: 子代理的 llm_call 轨迹, 改造前恒缺席
 
 	var sb strings.Builder
