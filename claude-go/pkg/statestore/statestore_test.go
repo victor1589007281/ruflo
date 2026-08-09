@@ -9,6 +9,8 @@ import (
 )
 
 // forEachStore 对 FileStore 与 MemStore 各跑一遍同一组语义测试。
+// agentdbstore 后端在同一语义契约下另有独立测试 (见 pkg/statestore/agentdbstore),
+// 父包测试不引入子包以避免 Go 测试导入环。
 func forEachStore(t *testing.T, fn func(t *testing.T, s StateStore)) {
 	t.Helper()
 	t.Run("file", func(t *testing.T) {
