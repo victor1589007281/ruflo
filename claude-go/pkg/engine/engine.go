@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/agentdbsemantic"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
 	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
@@ -125,7 +126,15 @@ type Config struct {
 	MaxTokens        int
 	MaxTurns         int    // queryLoop 最大迭代次数 (0 = 无限)
 	ContextWindow    int    // 模型上下文窗口 (tokens, 0 = 默认 200000)
-	Cwd              string // 当前工作目录
+
+	// AgentDBSemantic 层 2 语义增强面: agentDB 语义引擎客户端 (可选, nil 则不注册
+	// AgentDBSemanticInjectHook)。经 serve /v1/memory|retrieve|files 跨源检索并注入
+	// system prompt (MemoryInject 的 agentDB 后端, 规划 14.1.4.3)。
+	AgentDBSemantic     *agentdbsemantic.Client
+	SemanticTopK        int // 每源检索条数 (默认 5)
+	SemanticTokenBudget int // 注入上下文 token 预算 (默认 600)
+	SemanticReserve     int // 为任务正文预留 token (默认 200)
+	Cwd                 string // 当前工作目录
 	PermissionMode   types.PermissionMode
 	IsNonInteractive bool
 	Debug            bool
@@ -476,6 +485,19 @@ func (e *QueryEngine) registerInternalHooks() {
 	e.HookChain.Register(internal_hook.NewMessageMetricsHook(e.Metrics))
 	if e.MemoryStore != nil || e.FactStore != nil {
 		e.HookChain.Register(internal_hook.NewMemoryInjectHook(e.MemoryStore, e.FactStore))
+	}
+	if e.Config.AgentDBSemantic != nil {
+		topK, budget, reserve := e.Config.SemanticTopK, e.Config.SemanticTokenBudget, e.Config.SemanticReserve
+		if topK <= 0 {
+			topK = 5
+		}
+		if budget <= 0 {
+			budget = 600
+		}
+		if reserve <= 0 {
+			reserve = 200
+		}
+		e.HookChain.Register(internal_hook.NewAgentDBSemanticInjectHook(e.Config.AgentDBSemantic, topK, budget, reserve))
 	}
 	if e.PromptCache != nil {
 		e.HookChain.Register(internal_hook.NewPromptCacheHook(e.PromptCache, e.Metrics))
