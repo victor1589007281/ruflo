@@ -154,9 +154,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		CallID: r.Header.Get(api.TraceHeaderCallID),
 	}
 
-	// 模型名若带 "provider:" 前缀, 出站前剥掉 (上游只认裸模型名)
+	// 模型名若带 "provider:" 前缀, 出站前剥掉 (上游只认裸模型名)。
+	// 注意只剥 provider 前缀: 冒号后段本身可含冒号 —— ollama 等本地模型的
+	// 裸名就是 "家族:tag" 形态 (如 "gemma4:26b-a4b-it-qat"), 此时冒号是
+	// 模型名的一部分而非 provider 分隔符。若无条件按第一个冒号剥壳,
+	// 会把 "gemma4:" 误剥成 "26b-a4b-it-qat", 上游返回 404。
+	// 判定: 第一个冒号前段必须 == 已路由的 provider 名, 才是前缀形态。
 	outBody := body
-	if i := strings.IndexByte(probe.Model, ':'); i > 0 {
+	if i := strings.IndexByte(probe.Model, ':'); i > 0 && probe.Model[:i] == rt.Provider {
 		bare := probe.Model[i+1:]
 		outBody = bytes.Replace(body,
 			[]byte(`"model":"`+probe.Model+`"`),

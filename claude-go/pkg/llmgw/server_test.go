@@ -112,6 +112,50 @@ func TestGatewayNonStreamRoutingAuthAndAccounting(t *testing.T) {
 	}
 }
 
+func TestGatewayOllamaColonModelNotStripped(t *testing.T) {
+	// 回归: ollama 等本地模型的裸名是 "家族:tag" 形态, 冒号是模型名一部分。
+	// 客户端发短名 "gemma4:26b-a4b-it-qat" (无 provider 前缀), 路由精确匹配
+	// ollama 路由的 Models 表, 但出站**不得**按第一个冒号剥壳 —— 否则上游
+	// 收到 "26b-a4b-it-qat" 直接 404。反之带 provider 前缀的全别名
+	// "ollama:gemma4:26b-a4b-it-qat" 应剥掉前缀、保留 tag 冒号。
+	var sawAuth, sawModel string
+	up := fakeUpstream(t, &sawAuth, &sawModel)
+	defer up.Close()
+	dir := t.TempDir()
+	srv, err := NewServer([]Route{
+		{Provider: "kimi", BaseURL: "http://127.0.0.1:1", APIKey: "sk-kimi", Models: []string{"k3"}},
+		{Provider: "ollama", BaseURL: up.URL, APIKey: "sk-ollama", Models: []string{"gemma4:26b-a4b-it-qat", "lfm2.5:2.6b-q4_k_m"}},
+	}, "ollama", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := httptest.NewServer(srv.Handler())
+	defer gw.Close()
+
+	// 短名 (无 provider 前缀): 不剥壳, 精确匹配 ollama 路由。
+	_, err = http.Post(gw.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"gemma4:26b-a4b-it-qat","messages":[{"role":"user","content":"ping"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sawAuth != "sk-ollama" {
+		t.Fatalf("短名应精确匹配 ollama 路由, got auth=%q", sawAuth)
+	}
+	if sawModel != "gemma4:26b-a4b-it-qat" {
+		t.Fatalf("ollama 带 tag 冒号的短名不应被剥壳, got %q", sawModel)
+	}
+
+	// 全别名 (带 provider 前缀): 剥掉前缀, 保留 tag 冒号。
+	_, err = http.Post(gw.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"ollama:gemma4:26b-a4b-it-qat","messages":[{"role":"user","content":"ping"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sawModel != "gemma4:26b-a4b-it-qat" {
+		t.Fatalf("全别名应剥掉 provider 前缀但保留 tag 冒号, got %q", sawModel)
+	}
+}
+
 func TestGatewayStreamPassthroughAndUsageTee(t *testing.T) {
 	var sawAuth, sawModel string
 	up := fakeUpstream(t, &sawAuth, &sawModel)
