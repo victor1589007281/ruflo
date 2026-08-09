@@ -48,6 +48,14 @@ type EngineMetrics struct {
 	// Advisor push 模式主动咨询次数
 	AdvisorCheckpoints atomic.Int64
 
+	// AutoMode 引擎级自判断 (复杂任务 → 自动 Plan + Advisor) 指标
+	// ComplexityChecks 复杂度判定执行次数
+	ComplexityChecks atomic.Int64
+	// AutoPlanEntered 自动开启规划模式次数
+	AutoPlanEntered atomic.Int64
+	// AutoAdvisorInjected 自动咨询 advisor 并注入建议次数
+	AutoAdvisorInjected atomic.Int64
+
 	// 延迟 (单调累加, 平均需除以 TurnsTotal)
 	TotalTurnLatencyMs atomic.Int64
 
@@ -243,6 +251,9 @@ func (m *EngineMetrics) Snapshot() map[string]any {
 		"cache_hit_rate":            m.CacheHitRate(),
 		"stop_suggestions_emitted":  m.StopSuggestionsEmitted.Load(),
 		"stop_suggestions_honored":  m.StopSuggestionsHonored.Load(),
+		"complexity_checks":         m.ComplexityChecks.Load(),
+		"auto_plan_entered":         m.AutoPlanEntered.Load(),
+		"auto_advisor_injected":     m.AutoAdvisorInjected.Load(),
 		"traj_success":              m.TrajSuccessRecorded.Load(),
 		"traj_fail":                 m.TrajFailRecorded.Load(),
 		"avg_turn_latency_ms":       m.AvgTurnLatencyMs(),

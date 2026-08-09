@@ -9,9 +9,15 @@ FROM debian:bookworm-slim
 # 控制面 ff-only 同步。不装它, git 档位会在第一条 git 命令上失败。
 # python3: if-jd-analysis 等团队工作流明确要求用 `python3 json.dump` 写盘产物,
 # 不装它会导致写盘步骤在容器内失败。
+# golang-go: 引擎级 AutoMode 让模型在容器内"写代码 → go test 验证"闭环;
+# 不装 go, 模型写完 .go 文件后无法自测 (实测 exit 127)。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git curl python3 \
+      ca-certificates git curl python3 golang-go \
     && rm -rf /var/lib/apt/lists/*
+
+# go test 需要可写缓存目录; stateDir 挂载的 /data 够用, 显式指到 /tmp 避免
+# 与部署卷权限纠缠。
+ENV GOCACHE=/tmp/go-build GOTMPDIR=/tmp
 
 COPY claude-go-linux /usr/local/bin/claude-go
 # 真执行体的 worker 进程 (cmd/claude-go/main.go 的 worker 子命令仍是回显桩,

@@ -13,6 +13,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/compact"
+	"github.com/anthropic/claude-go/pkg/complexity"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/engine"
@@ -141,6 +142,12 @@ type SessionManager struct {
 	advisorClient *api.Client                     // advisor 模型专用客户端 (nil=禁用)
 	advisorTools  map[string]*builtin.AdvisorTool // chatID → 工具实例 (预算按会话隔离, profile 切换不重置)
 	advisorMu     sync.Mutex
+
+	// planClient 规划期独立模型客户端 (Tag=plan, nil=禁用)。plan flag ON (规划期) 时
+	// createSession 把该客户端塞进 engine.Config.PlanClient, queryLoop 全程路由到它,
+	// 类似 advisor 独立客户端。由 Bot 初始化时经 SetPlanClient 注入。
+	planClient *api.Client
+	planMu     sync.Mutex
 }
 
 // SessionManagerOption NewSessionManager 的可选装配项。
@@ -249,6 +256,14 @@ func (sm *SessionManager) SetAdvisorClient(client *api.Client) {
 	}
 }
 
+// SetPlanClient 注入规划期独立模型客户端 (Tag=plan)。在 Bot 初始化完成后调用；
+// nil 表示禁用 (规划期沿用主模型)。
+func (sm *SessionManager) SetPlanClient(client *api.Client) {
+	sm.planMu.Lock()
+	defer sm.planMu.Unlock()
+	sm.planClient = client
+}
+
 // AdvisorEnabled 返回 advisor 是否已启用。
 func (sm *SessionManager) AdvisorEnabled() bool {
 	sm.advisorMu.Lock()
@@ -301,6 +316,23 @@ func (sm *SessionManager) advisorToolFor(chatID string) *builtin.AdvisorTool {
 // SetMediaSendFn 注入飞书媒体发送回调。在 Bot 初始化完成后调用。
 func (sm *SessionManager) SetMediaSendFn(fn MediaSendFunc) {
 	sm.mediaSendFn = fn
+}
+
+// complexityLLMClassifier 构造 LLM 复杂度分类器 (llm/hybrid 模式用)。
+// 用主 apiClient.SimpleComplete + pkg/complexity 的分类器 system prompt,
+// 失败时回落启发式判定 (由 complexity.Judge 内部处理)。
+func complexityLLMClassifier(client *api.Client) func(ctx context.Context, text string) (bool, string, error) {
+	if client == nil {
+		return nil
+	}
+	return func(ctx context.Context, text string) (bool, string, error) {
+		out, err := client.SimpleComplete(ctx, complexity.ClassifierSystemPrompt, text)
+		if err != nil {
+			return false, "", err
+		}
+		// 分类器只回 COMPLEX / SIMPLE (+ reason), 保守判定: 含 COMPLEX 即复杂。
+		return strings.Contains(out, "COMPLEX"), strings.TrimSpace(out), nil
+	}
 }
 
 // SetTeamManager 注入团队管理器，让 LLM 能通过 TeamQuery 工具查询团队信息。
@@ -648,8 +680,22 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		promptMgr.DreamMemoryDir = sm.dreamer.Stats().MemoryDir
 	}
 
+	// 计划文件目录: ExitPlanMode 将计划落盘, 实施阶段模型读取。
+	// 未显式配置时按 <StateDir>/plans 推导, StateDir 缺失则回落 <Cwd>/plans。
+	planFileDir := sm.config.PlanFileDir
+	if planFileDir == "" {
+		base := sm.config.StateDir
+		if base == "" {
+			base = sm.config.Cwd
+		}
+		if base != "" {
+			planFileDir = base + "/plans"
+		}
+	}
+
 	cfg := &engine.Config{
 		Model:            sm.apiClient.Model,
+		ExecutionModel:   sm.config.ExecutionModel,
 		MaxTokens:        sm.defaultResolved.MaxTokens,
 		MaxTurns:         clampTurns(sm.defaultResolved.MaxTurns),
 		ContextWindow:    contextWindow,
@@ -659,11 +705,28 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		Debug:            sm.config.Debug,
 		MetricsSource:    "feishu_main",
 		MetricsPurpose:   chatID,
-		DynamicPlanCheck: builtin.PlanModeActive,
+		SessionID:        chatID, // EnterPlanMode/ExitPlanMode 写会话级 plan flag
+		// 单一 plan 状态源: AutoModeHook 自动开启 / 模型 EnterPlanMode/ExitPlanMode 工具
+		// 共用同一会话级 flag, 多会话互不污染 (此前 PlanModeActive 扫描所有会话会跨会话泄漏)。
+		DynamicPlanCheck: builtin.NewPlanModeChecker(chatID),
+		PlanModeSetter:   func(on bool) { builtin.SetPlanModeForSession(chatID, on) },
+		// AutoMode: 引擎级复杂度自判断 → 自动 Plan + Advisor (内建能力)。
+		AutoPlanMode:   sm.config.AutoPlanMode,
+		ComplexityMode: sm.config.ComplexityMode,
+		AutoAdvisor:    sm.config.AutoAdvisor,
+		// PlanFileDir: ExitPlanMode 将计划落盘, 实施阶段模型读取。默认 <StateDir>/plans。
+		PlanFileDir: planFileDir,
+		// PlanClient: 规划期独立模型客户端 (Tag=plan); nil = 规划期沿用主模型。
+		PlanClient: sm.planClient,
 		// DisabledTools 不再在这里写 map 字面量: 名单已收敛到
 		// feishuSessionConstraints() 一处声明, 下面 applyConstraints 编译下发
 		// (design/01 §4.6)。行为与改造前逐项等价 —— 同样是那三个团队内部工具,
 		// 同样不设白名单。
+	}
+	// llm/hybrid 复杂度判定: 用主 apiClient 的 SimpleComplete + 分类器 system prompt。
+	// heuristic 模式零 LLM 开销, 不注入。
+	if sm.config.ComplexityMode == "llm" || sm.config.ComplexityMode == "hybrid" {
+		cfg.LLMComplexityFn = complexityLLMClassifier(sm.apiClient)
 	}
 	applyConstraints(cfg, feishuSessionConstraints())
 
@@ -1210,6 +1273,7 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 
 	cfg := &engine.Config{
 		Model:            modelOverride,
+		ExecutionModel:   r.sm.config.ExecutionModel,
 		MaxTokens:        maxTokens,
 		MaxTurns:         clampTurns(maxTurns),
 		ContextWindow:    contextWindow,

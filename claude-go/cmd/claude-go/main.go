@@ -41,6 +41,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/codeintel"
 	"github.com/anthropic/claude-go/pkg/commands"
 	"github.com/anthropic/claude-go/pkg/compact"
+	"github.com/anthropic/claude-go/pkg/complexity"
 	"github.com/anthropic/claude-go/pkg/dashboard"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/engine"
@@ -146,6 +147,7 @@ const fullHelpGuide = `Claude Code (Go) - AI 编程助手
 var (
 	flagModel          string
 	flagExecutionModel string
+	flagPlanModel      string // --plan-model <provider:model> 规划期独立模型 (类似 advisor 独立客户端)
 	flagAttach         []string
 	flagCwd            string
 	flagFinalOnly      bool
@@ -163,6 +165,8 @@ var (
 	flagResume         string // --resume <sessionID>
 	flagContinue       bool   // --continue / -c
 	flagAdvisor        string // --advisor <provider:model|off>
+	flagAutoPlan       string // --auto-plan on|off (空=读配置, 默认开)
+	flagComplexityMode string // --complexity-mode heuristic|llm|hybrid
 	flagAllowedTools   string // --allowed-tools t1,t2 (whitelist; non-empty = only these)
 	flagOutputFormat   string // --output-format text|json
 )
@@ -237,6 +241,7 @@ func main() {
 
 	rootCmd.PersistentFlags().StringVar(&flagModel, "model", "qwen3.5-plus", "模型名称")
 	rootCmd.PersistentFlags().StringVar(&flagExecutionModel, "execution-model", "", "工具消费回合自动路由的快速模型 (留空=关闭; 例: lfm2.5:2.6b-q4_k_m)")
+	rootCmd.PersistentFlags().StringVar(&flagPlanModel, "plan-model", "", "规划期独立模型 (plan mode 专用, provider:model; 留空=规划期沿用主模型; 例: kimi:kimi-k2)")
 	rootCmd.PersistentFlags().StringVar(&flagAPIKey, "api-key", "", "API Key (或设置 ANTHROPIC_API_KEY 环境变量)")
 	rootCmd.PersistentFlags().StringVar(&flagBaseURL, "base-url", "", "API base URL")
 	rootCmd.PersistentFlags().IntVar(&flagMaxTokens, "max-tokens", 16384, "最大输出 token 数")
@@ -254,6 +259,8 @@ func main() {
 	rootCmd.PersistentFlags().BoolVar(&flagEmitSession, "emit-session-id", false, "结束时输出 __CLAUDE_GO_SESSION__=<id> 行, 供调用方记录以便 --resume 续聊")
 	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
 	rootCmd.PersistentFlags().StringVar(&flagAdvisor, "advisor", "", "启用 advisor 顾问工具并指定模型别名 (provider:model); \"off\" 强制关闭 (覆盖配置文件)")
+	rootCmd.PersistentFlags().StringVar(&flagAutoPlan, "auto-plan", "", "引擎级复杂任务自判断 → 自动 Plan Mode (on|off); 空=读配置, 默认开")
+	rootCmd.PersistentFlags().StringVar(&flagComplexityMode, "complexity-mode", "", "复杂度判定模式: heuristic|llm|hybrid (空=读配置, 默认 heuristic)")
 	rootCmd.PersistentFlags().StringVar(&flagAllowedTools, "allowed-tools", "", "工具白名单 (逗号分隔); 非空时仅这些工具可见且可执行, 其余硬拒 (用于受限托管 agent)")
 	rootCmd.PersistentFlags().StringVar(&flagOutputFormat, "output-format", "text", "输出格式: text (默认) | json (final/is_error/error_kind/session_id 顶层 envelope, 供程序化调用; token 用量见 metrics JSONL)")
 
@@ -2739,6 +2746,35 @@ func buildAdvisorClient(jsonCfg *feishu.JSONConfig, projectSettings *settings.Se
 	return client, opts, true
 }
 
+// buildPlanClient 构造规划期独立模型客户端 (Tag=plan), 类似 advisor 独立客户端:
+// 独立 provider/模型, 会话 plan flag ON (规划期) 时 queryLoop 全程路由到此客户端。
+// alias 格式 "provider:model" 或短名; 解析失败时打印警告并返回 nil (不阻断启动)。
+func buildPlanClient(jsonCfg *feishu.JSONConfig, alias string) (*api.Client, bool) {
+	planResolved, ok, err := resolveRuntimeModelConfig(jsonCfg, alias)
+	if err != nil || !ok || planResolved.BaseURL == "" || planResolved.APIKey == "" || planResolved.ProviderName == "" {
+		fmt.Fprintf(os.Stderr, "警告: plan 模型别名 %q 解析失败 (请检查 providers 配置), 规划期将沿用主模型\n", alias)
+		return nil, false
+	}
+	var client *api.Client
+	if api.IsLocalEndpoint(planResolved.BaseURL) {
+		client = api.NewOllamaClient(planResolved.BaseURL, planResolved.ProviderName)
+		client.APIKey = planResolved.APIKey
+	} else {
+		client = api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.ProviderName)
+	}
+	client.Tag = "plan"
+	if planResolved.CallTimeoutSec > 0 {
+		client.CallTimeout = time.Duration(planResolved.CallTimeoutSec) * time.Second
+	}
+	if planResolved.FirstTokenTimeoutSec > 0 {
+		client.FirstTokenTimeout = time.Duration(planResolved.FirstTokenTimeoutSec) * time.Second
+	}
+	if flagDebug {
+		fmt.Fprintf(os.Stderr, "[PlanModel] 已启用, 规划期模型: %s\n", alias)
+	}
+	return client, true
+}
+
 func applyRuntimePromptDebug(apiClient *api.Client, jsonCfg *feishu.JSONConfig) {
 	if apiClient == nil {
 		return
@@ -3069,9 +3105,71 @@ func buildEngine() (*engine.QueryEngine, error) {
 	if effectiveMaxTurns == 0 && projectSettings.MaxTurns > 0 {
 		effectiveMaxTurns = projectSettings.MaxTurns
 	}
+	// Path B 执行模型 (工具消费回合): 配置优先, flag 覆盖。
+	// serve/run 两条路径共用 buildEngine, 此前只认 --execution-model flag,
+	// 配置文件里的 ai.executionModel 在此路径被静默丢弃 —— 部署控制面用
+	// config.json 而非 flag 注入时, 双模型路由完全不生效。
+	effectiveExecutionModel := flagExecutionModel
+	if effectiveExecutionModel == "" && jsonCfg != nil && jsonCfg.AI != nil && jsonCfg.AI.ExecutionModel != "" {
+		effectiveExecutionModel = jsonCfg.AI.ExecutionModel
+	}
+	// AutoMode 有效配置: flag > jsonCfg.ai.autoPlan > 默认 (开 + heuristic)。
+	// 仅当已处于显式 plan 权限时禁用 (自动规划本身即会强制只读, 尊重已规划意图);
+	// bypass 权限下保持开启 —— 规划阶段的只读强制由 DynamicPlanCheck 独立生效,
+	// 与 CLI/飞书入口无关, 这是"引擎自带能力"的默认形态。
+	autoPlanMode := true
+	complexityMode := "heuristic"
+	if jsonCfg != nil && jsonCfg.AI != nil && jsonCfg.AI.AutoPlan != nil {
+		if jsonCfg.AI.AutoPlan.Enabled != nil {
+			autoPlanMode = *jsonCfg.AI.AutoPlan.Enabled
+		}
+		if jsonCfg.AI.AutoPlan.Mode != "" {
+			complexityMode = jsonCfg.AI.AutoPlan.Mode
+		}
+	}
+	switch flagAutoPlan {
+	case "off":
+		autoPlanMode = false
+	case "on":
+		autoPlanMode = true
+	}
+	if flagComplexityMode != "" {
+		complexityMode = flagComplexityMode
+	}
+	if permMode == types.PermissionModePlan {
+		autoPlanMode = false
+	}
+
+	// AutoAdvisor: 复杂任务自动咨询 advisor 并注入建议。默认开 (有 advisor 时生效),
+	// 可经 config ai.autoPlan.autoAdvisor:false 关闭。真正生效还需下方 advisor 已装配
+	// (buildAdvisorClient ok 时 cfg.AutoAdvisor 才置位)。
+	autoAdvisor := true
+	if jsonCfg != nil && jsonCfg.AI != nil && jsonCfg.AI.AutoPlan != nil && jsonCfg.AI.AutoPlan.AutoAdvisor != nil {
+		autoAdvisor = *jsonCfg.AI.AutoPlan.AutoAdvisor
+	}
+
+	// 计划文件目录: ExitPlanMode 将计划落盘, 实施阶段模型读取。默认 <stateDir>/plans。
+	planDir := ""
+	if jsonCfg != nil && strings.TrimSpace(jsonCfg.StateDir) != "" {
+		planDir = filepath.Join(jsonCfg.StateDir, "plans")
+	} else {
+		planDir = filepath.Join(cwd, ".claude-go", "plans")
+	}
+
+	// Plan 模型客户端: 规划期独立模型 (类似 advisor 独立客户端, Tag=plan)。
+	// 别名优先级: --plan-model flag > config ai.planModel; 空 = 关闭 (规划期沿用主模型)。
+	var planClient *api.Client
+	effectivePlanModel := flagPlanModel
+	if effectivePlanModel == "" && jsonCfg != nil && jsonCfg.AI != nil && jsonCfg.AI.PlanModel != "" {
+		effectivePlanModel = jsonCfg.AI.PlanModel
+	}
+	if effectivePlanModel != "" {
+		planClient, _ = buildPlanClient(jsonCfg, effectivePlanModel)
+	}
+
 	cfg := &engine.Config{
 		Model:            effectiveModel,
-		ExecutionModel:   flagExecutionModel,
+		ExecutionModel:   effectiveExecutionModel,
 		MaxTokens:        effectiveMaxTokens,
 		MaxTurns:         effectiveMaxTurns,
 		ContextWindow:    contextWindow,
@@ -3080,6 +3178,20 @@ func buildEngine() (*engine.QueryEngine, error) {
 		IsNonInteractive: flagPrint,
 		Debug:            flagDebug,
 		AllowedTools:     parseAllowedTools(flagAllowedTools),
+		SessionID:        "_global", // EnterPlanMode/ExitPlanMode 写全局会话 plan flag
+		// 单一 plan 状态源: AutoModeHook 自动开启 / 模型工具共用同一 flag。
+		DynamicPlanCheck: builtin.NewPlanModeChecker("_global"),
+		PlanModeSetter:   func(on bool) { builtin.SetPlanModeForSession("_global", on) },
+		AutoPlanMode:     autoPlanMode,
+		ComplexityMode:   complexityMode,
+		// AutoAdvisor 在 advisor 装配成功后才置位 (见下方 buildAdvisorClient 分支)。
+		PlanFileDir: planDir,
+		// PlanClient 规划期独立模型客户端 (Tag=plan); nil = 规划期沿用主模型。
+		PlanClient: planClient,
+	}
+	// llm/hybrid 复杂度判定: 用主 apiClient 的 SimpleComplete + 分类器 system prompt。
+	if autoPlanMode && (complexityMode == "llm" || complexityMode == "hybrid") {
+		cfg.LLMComplexityFn = cliComplexityClassifier(apiClient)
 	}
 
 	deps := &engineDeps{
@@ -3128,8 +3240,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 	if advisorClient, advisorOpts, ok := buildAdvisorClient(jsonCfg, projectSettings); ok {
 		advTool := builtin.NewAdvisorTool(advisorClient, advisorOpts)
 		reg.Register(advTool)
+		// AdvisorConsultFn 供 AutoModeHook 自动咨询 + AdvisorCheckpointHook 周期咨询共用。
+		// 只要 advisor 已装配就接上; 周期触发 (checkpoint) 与 AutoAdvisor 各按自己的开关生效。
+		cfg.AdvisorConsultFn = advTool.Consult
+		cfg.AutoAdvisor = autoAdvisor // 复杂任务自动咨询 advisor 并注入建议
 		if adv := advisorSectionFromConfig(jsonCfg, projectSettings); adv != nil && (adv.CheckpointEveryTurns > 0 || adv.CheckpointOnLoop) {
-			cfg.AdvisorConsultFn = advTool.Consult
 			cfg.AdvisorCheckpointEveryTurns = adv.CheckpointEveryTurns
 			cfg.AdvisorCheckpointOnLoop = adv.CheckpointOnLoop
 		}
@@ -3528,11 +3643,14 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 	client := deps.apiClient
 	if opts.Model != "" {
 		// 子代理模型确定化烘焙: 既改 Config.Model 标签, 又把模型写进 client 副本,
-		// 并清空 ExecutionModel —— 子代理全程单模型, 不套用主会话的相位路由。
+		// 并清空 ExecutionModel/PlanClient —— 子代理全程单模型, 不套用主会话的
+		// 相位路由 (含规划期 plan 模型路由, 否则 delegate_task 在规划期会被 plan
+		// 客户端劫持, 违背"子代理固定取指定模型"契约)。
 		// (原实现只改 nestedCfg.Model 标签, 实际 client 仍是规划方模型, 靠首回合
 		// WithModel 恰好救回; 这里把"恰好"变成"确定"。)
 		nestedCfg.Model = opts.Model
 		nestedCfg.ExecutionModel = ""
+		nestedCfg.PlanClient = nil
 		if opts.Model != client.Model {
 			client = client.WithModel(opts.Model)
 		}
@@ -3656,6 +3774,22 @@ func codeintelMCPServerCmd() *cobra.Command {
 	cmd.Flags().StringVar(&configPath, "config", "", "JSON 配置文件路径 (读取其中的 codeIntel 段)")
 	cmd.Flags().StringVar(&indexBaseDir, "index-base-dir", "", "集中索引根目录 (如 /mnt/data/codeintel)")
 	return cmd
+}
+
+// cliComplexityClassifier 构造 CLI 的 LLM 复杂度分类器 (llm/hybrid 模式用)。
+// 用主 apiClient.SimpleComplete + pkg/complexity 的分类器 system prompt,
+// 失败时回落启发式判定 (由 complexity.Judge 内部处理)。
+func cliComplexityClassifier(client *api.Client) func(ctx context.Context, text string) (bool, string, error) {
+	if client == nil {
+		return nil
+	}
+	return func(ctx context.Context, text string) (bool, string, error) {
+		out, err := client.SimpleComplete(ctx, complexity.ClassifierSystemPrompt, text)
+		if err != nil {
+			return false, "", err
+		}
+		return strings.Contains(out, "COMPLEX"), strings.TrimSpace(out), nil
+	}
 }
 
 // noopSwarmLLM 离线占位 LLM, 仅供 swarm history 等只读子命令构造引擎用 (不会真正发起调用)。

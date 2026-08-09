@@ -150,8 +150,25 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 
 		apiMessages := messagesToAPI(messages, nil)
 
+		// Path B 相位路由 (与主循环 queryLoop 同口径): 工具消费回合
+		// (尾部是 tool_result 的 user 消息) 路由到配置的快速执行模型。
+		// RunIsolated 是团队 stage 的执行路径, 此前单模型 client 直调,
+		// 配置了 ExecutionModel 也完全不生效 —— 操作型角色 (coder/tester/
+		// reviewer) 的多轮工具循环全部跑在主模型上。补上后工具消费回合
+		// 走 lfm 等快模型, 推理回合仍走主模型。
+		//
+		// Plan 模型路由优先于 ExecutionModel: 会话 plan flag ON (规划期) 时
+		// 全程路由到独立 plan 客户端 (Tag=plan, 类似 advisor)。PlanClient=nil
+		// 或 flag OFF 时此分支空转, 行为与旧版一致。
+		turnClient := client
+		if e.Config.PlanClient != nil && e.Config.DynamicPlanCheck != nil && e.Config.DynamicPlanCheck() {
+			turnClient = e.Config.PlanClient
+		} else if e.Config.ExecutionModel != "" && isToolExecTurn(messages) {
+			turnClient = client.WithModel(e.Config.ExecutionModel)
+		}
+
 		callStart := time.Now()
-		resp, err := client.SendMessage(ctx, apiMessages, systemPrompts, apiTools, opts.MaxTokens)
+		resp, err := turnClient.SendMessage(ctx, apiMessages, systemPrompts, apiTools, opts.MaxTokens)
 
 		// 收集 assistant 的 content blocks, 区分 text / tool_use
 		var (
@@ -177,7 +194,7 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			if resp != nil {
 				usage, stop = resp.Usage, resp.StopReason
 			}
-			model := client.Model
+			model := turnClient.Model // turnClient 已按 Path B 路由选好模型
 			if resp != nil && resp.Model != "" {
 				model = resp.Model // 网关可能换了实际服务模型, 以响应为准
 			}
@@ -280,6 +297,8 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			IsNonInteractive: e.Config.IsNonInteractive,
 			Debug:            e.Config.Debug,
 			Messages:         messages,
+			SessionID:        e.Config.SessionID,  // EnterPlanMode/ExitPlanMode 用会话级 plan flag
+			PlanFileDir:      e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
 			GlobalPerm:       e.PermChecker,
 		}
 		toolResults := tool.RunTools(ctx, toolUseBlocks, e.Tools, tctx, e.HookRunner)

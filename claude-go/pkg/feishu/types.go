@@ -118,6 +118,26 @@ type BotConfig struct {
 	// ModelAlias 全局默认模型别名 (格式: "provider:modelName")
 	ModelAlias string
 
+	// ExecutionModel 自动相位路由的快速执行模型 (Path B, 工具消费回合用)。
+	// 取 alias 后半段 (短名, 如 "lfm2.5:2.6b-q4_k_m"); 留空 = 关闭自动路由。
+	// 规划/推理回合仍走 ModelAlias。
+	ExecutionModel string
+	// PlanModel 规划期独立模型别名 (格式 "provider:modelName"); 留空 = 规划期沿用主模型。
+	// 类似 advisor 独立客户端: 会话 plan flag ON (规划期) 时引擎全程路由到独立 plan 客户端。
+	PlanModel string
+
+	// AutoPlanMode 引擎级复杂度自判断 → 自动 Plan Mode + 自动 Advisor。
+	// 复杂任务在首轮自动开启会话级只读规划并注入 system-reminder 引导,
+	// 由模型自行调用 ExitPlanMode 进入实施。默认 true。
+	AutoPlanMode bool
+	// ComplexityMode 复杂度判定模式: "heuristic"(默认, 零 LLM 开销)/"llm"/"hybrid"。
+	ComplexityMode string
+	// AutoAdvisor 复杂任务自动咨询 advisor (需 Advisor 已装配)。
+	AutoAdvisor bool
+	// PlanFileDir 计划文件目录: ExitPlanMode 将计划落盘, 实施阶段模型读取。
+	// 空 = 由装配方推导为 <StateDir>/plans。
+	PlanFileDir string
+
 	// FallbackAliases 全局默认备用模型别名列表
 	FallbackAliases []string
 
@@ -212,6 +232,8 @@ func DefaultBotConfig() *BotConfig {
 		WelcomeMessage:              "你好！我是 Claude Code (Go) 机器人。发送消息与我对话，我可以帮你编程、分析代码、执行命令等。",
 		ThinkingMessage:             "正在思考中...",
 		EnableFrontierOptimizations: true,
+		AutoPlanMode:                true,
+		ComplexityMode:              "heuristic",
 		PromptDebugMaxFiles:         500,
 		PromptDebugMaxBytes:         200 * 1024 * 1024,
 		PromptDebugRedact:           true,
@@ -523,11 +545,24 @@ type PlanModelConfig struct {
 // AISection AI 模型配置段 (只保留别名模式)。
 type AISection struct {
 	ModelAlias      string                     `json:"modelAlias,omitempty"`      // 全局默认模型别名
+	ExecutionModel  string                     `json:"executionModel,omitempty"`  // 自动相位路由的快速执行模型 (Path B, 工具消费回合); 空=关闭
+	PlanModel       string                     `json:"planModel,omitempty"`       // 规划期独立模型 (plan mode 专用, 类似 advisor 独立客户端); 空=关闭
 	FallbackAliases []string                   `json:"fallbackAliases,omitempty"` // 全局默认备用模型别名
 	PromptCacheMode string                     `json:"promptCacheMode,omitempty"` // "auto"(默认)/"on"/"off"
 	MaxTurns        int                        `json:"maxTurns,omitempty"`        // 全局默认最大回合数 (0=不限); 防 agent 无界循环
 	MaxTokens       int                        `json:"maxTokens,omitempty"`       // 全局默认最大输出 token (0=用引擎默认)
 	Plans           map[string]PlanModelConfig `json:"plans,omitempty"`           // 按 plan 名称覆盖模型配置
+	AutoPlan        *AutoPlanSection           `json:"autoPlan,omitempty"`        // AutoMode: 复杂度自判断 → 自动 Plan + Advisor
+}
+
+// AutoPlanSection AutoMode 配置段 (引擎级复杂度自判断)。
+type AutoPlanSection struct {
+	// Enabled 总开关 (默认 true)。
+	Enabled *bool `json:"enabled,omitempty"`
+	// Mode 复杂度判定模式: "heuristic"(默认, 零 LLM 开销)/"llm"/"hybrid"。
+	Mode string `json:"mode,omitempty"`
+	// AutoAdvisor 复杂任务自动咨询 advisor (需 advisor 已装配)。
+	AutoAdvisor *bool `json:"autoAdvisor,omitempty"`
 }
 
 // ProvidersSection providers 配置段 (新模式)。
@@ -729,6 +764,12 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 				bc.ModelAlias = jc.AI.ModelAlias
 			}
 		}
+		if bc.ExecutionModel == "" && jc.AI.ExecutionModel != "" {
+			bc.ExecutionModel = jc.AI.ExecutionModel
+		}
+		if bc.PlanModel == "" && jc.AI.PlanModel != "" {
+			bc.PlanModel = jc.AI.PlanModel
+		}
 		if jc.AI.PromptCacheMode != "" && bc.PromptCacheMode == "" {
 			bc.PromptCacheMode = jc.AI.PromptCacheMode
 		}
@@ -739,6 +780,17 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 			bc.Plans = make(map[string]PlanModelConfig, len(jc.AI.Plans))
 			for name, pc := range jc.AI.Plans {
 				bc.Plans[name] = pc
+			}
+		}
+		if ap := jc.AI.AutoPlan; ap != nil {
+			if ap.Enabled != nil {
+				bc.AutoPlanMode = *ap.Enabled
+			}
+			if ap.Mode != "" {
+				bc.ComplexityMode = ap.Mode
+			}
+			if ap.AutoAdvisor != nil {
+				bc.AutoAdvisor = *ap.AutoAdvisor
 			}
 		}
 	}

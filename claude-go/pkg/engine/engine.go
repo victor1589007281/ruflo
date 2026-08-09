@@ -187,6 +187,35 @@ type Config struct {
 	AdvisorCheckpointEveryTurns int
 	// AdvisorCheckpointOnLoop LoopDetector 触发时联动主动咨询。
 	AdvisorCheckpointOnLoop bool
+
+	// ==================== AutoMode 引擎级自判断 (复杂任务 → 自动 Plan + Advisor) ====================
+	// 对齐 Claude 客户端: 会话思考中引擎自行判断任务复杂度, 复杂任务自动进入只读规划
+	// (plan mode) 并可选自动咨询 advisor; 模型规划完调 ExitPlanMode 自动转入实施, 全程无人参与。
+	// AutoPlanMode 总开关。开启后 AutoModeHook 在 PhasePreRequest 首轮判定复杂度,
+	// 复杂则经 PlanModeSetter 写入会话级 plan flag → DynamicPlanCheck 读到 → 只读强制。
+	AutoPlanMode bool
+	// ComplexityMode 复杂度判定模式: heuristic(默认,零额外 LLM)|llm|hybrid。
+	ComplexityMode string
+	// LLMComplexityFn 可选 LLM 分类器: (是否复杂, 原因, 错误)。错误时回落启发式。
+	LLMComplexityFn func(ctx context.Context, text string) (bool, string, error)
+	// AutoAdvisor 复杂任务是否自动咨询 advisor 并注入建议。
+	AutoAdvisor bool
+	// PlanModeSetter 写会话级 plan flag 的回调 (装配方注入, 绑定 builtin.SetPlanModeForSession)。
+	// 与模型 EnterPlanMode/ExitPlanMode 工具共用**同一个** flag, 保证自动开启与模型
+	// ExitPlanMode 天然衔接 (自动结束自动放行)。
+	PlanModeSetter func(on bool)
+	// PlanFileDir 计划文件目录。配置后 ExitPlanMode 会把提交的计划落盘,
+	// 实施阶段模型可读取该文件作为执行依据 (对齐 Claude 客户端计划持久化)。
+	// 空 = 不落盘 (仅回显计划文本)。
+	PlanFileDir string
+	// PlanClient 规划期独立模型客户端 (Tag=plan, 类似 advisor 独立客户端)。
+	// 会话 plan flag ON (规划期) 时 queryLoop 全程路由到此客户端:
+	//   - 独立 provider/模型, 规划质量更高, 不挤占主模型配额;
+	//   - 优先于 ExecutionModel 相位路由 (规划期连续回合 sticky, 共享前缀 KV 缓存);
+	//   - nil = 不启用, 规划期沿用 主模型/ExecutionModel 现有路由。
+	// 判定时机放在 PhasePreRequest 之后: AutoModeHook 在该 phase 置位 plan flag,
+	// 首个规划回合 (TurnCount==0) 也能命中 plan 客户端。
+	PlanClient *api.Client
 }
 
 // toolExposed reports whether a tool may be shown to the model and executed,
@@ -429,9 +458,21 @@ func (e *QueryEngine) registerInternalHooks() {
 		e.HookChain.Register(internal_hook.NewBudgetDegradeHook(e.Budget, e.HookRunner, e.Metrics))
 	}
 
-	// PhasePreRequest: ToolResultLevel(38) + MessageFilter(40) + MessageMetrics(48) + MemoryInject(50) + PromptCache(55)
+	// PhasePreRequest: ToolResultLevel(38) + MessageFilter(40) + AutoMode(45) + MessageMetrics(48) + MemoryInject(50) + PromptCache(55)
 	e.HookChain.Register(internal_hook.NewToolResultLevelHook(nil, e.Metrics))
 	e.HookChain.Register(internal_hook.NewMessageFilterHook())
+	if h := internal_hook.NewAutoModeHook(
+		e.Config.AutoPlanMode,
+		e.Config.ComplexityMode,
+		e.Config.LLMComplexityFn,
+		e.Config.AutoAdvisor,
+		e.Config.AdvisorConsultFn,
+		e.Config.PlanModeSetter,
+		e.Config.PlanFileDir,
+		e.Metrics,
+	); h != nil {
+		e.HookChain.Register(h)
+	}
 	e.HookChain.Register(internal_hook.NewMessageMetricsHook(e.Metrics))
 	if e.MemoryStore != nil || e.FactStore != nil {
 		e.HookChain.Register(internal_hook.NewMemoryInjectHook(e.MemoryStore, e.FactStore))
@@ -854,6 +895,18 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					return messages, *preRequestResult.ReturnTerminal
 				}
 			}
+		}
+
+		// ============ Plan 模型路由: 规划期独立模型 (类似 advisor 独立客户端) ============
+		// 放在 PhasePreRequest 之后判定: AutoModeHook 在该 phase 已置位会话级 plan flag,
+		// 因此首个规划回合 (TurnCount==0) 也能切到 plan 客户端 (顶部 Path B 路由在此
+		// 时点还读不到 flag)。优先级高于 ExecutionModel 相位路由: 规划期连续回合
+		// sticky 在 plan 模型上 (共享前缀 KV 缓存), 直到模型调用 ExitPlanMode 清 flag
+		// 才回落 主模型/ExecutionModel 现有路由。PlanClient=nil 或 flag OFF 时此块
+		// 为空操作, 行为与旧版完全一致。
+		if e.Config.PlanClient != nil && e.Config.DynamicPlanCheck != nil && e.Config.DynamicPlanCheck() {
+			client = e.Config.PlanClient
+			currentModel = e.Config.PlanClient.Model
 		}
 
 		// ============================================================
@@ -1448,6 +1501,8 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			Debug:              e.Config.Debug,
 			Messages:           messages,
 			MaxToolResultChars: internal_hook.MicroCompactMaxChars,
+			SessionID:          e.Config.SessionID,  // EnterPlanMode/ExitPlanMode 用会话级 plan flag
+			PlanFileDir:        e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
 			GlobalPerm:         e.PermChecker,
 		}
 

@@ -491,6 +491,34 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		}
 	}
 
+	// Plan 模型客户端: 规划期独立模型 (类似 advisor 独立客户端, Tag=plan)。
+	// config.PlanModel 非空时解析并注入; 规划期 (plan flag ON) queryLoop 全程路由到该客户端。
+	if config.PlanModel != "" {
+		planResolved := resolver.ResolveAlias(config.PlanModel)
+		if planResolved.BaseURL == "" || planResolved.APIKey == "" || planResolved.ProviderName == "" {
+			log.Printf("[Bot] Plan 模型配置无效: 无法解析别名 %q (缺 baseURL/apiKey), 规划期将沿用主模型", config.PlanModel)
+		} else {
+			planClient := api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.ProviderName)
+			planClient.Tag = "plan"
+			if planResolved.CallTimeoutSec > 0 {
+				planClient.CallTimeout = time.Duration(planResolved.CallTimeoutSec) * time.Second
+			}
+			if planResolved.FirstTokenTimeoutSec > 0 {
+				planClient.FirstTokenTimeout = time.Duration(planResolved.FirstTokenTimeoutSec) * time.Second
+			}
+			// plan 与主模型共享同一 provider 时复用限流 guard, 避免双客户端各自满额打爆 RPM
+			if planResolved.Provider == defaultResolved.Provider {
+				planClient.Guard = aiClient.Guard
+			}
+			bot.sessions.SetPlanClient(planClient)
+			if planResolved.ProviderName == defaultResolved.ProviderName {
+				log.Printf("[Bot] Plan 模型已启用: %s (警告: 与主模型相同)", config.PlanModel)
+			} else {
+				log.Printf("[Bot] Plan 模型已启用: %s (规划期专用)", config.PlanModel)
+			}
+		}
+	}
+
 	// 初始化全局 LLM 指标采集器 (让 feishu bot 的指标走全局 JSONL + Prometheus 路径)
 	metrics.InitGlobalLLMCollector(layout.Root)
 	if config.Sandbox != nil {
@@ -3395,11 +3423,9 @@ func formatTimeSince(t time.Time) string {
 func (b *Bot) processAndReply(chatID, messageID, userText string) {
 	ctx := context.Background()
 
-	// Auto Plan: LLM 判断复杂度 → 自动注入 Plan+Build 指令
-	if b.llmDetectComplexity(ctx, userText) {
-		userText = "[AutoPlanBuild] 复杂任务: 先 EnterPlanMode 规划, 再 ExitPlanMode 后执行并验证。\n原始任务:\n" + userText
-		b.sendTextReply(ctx, messageID, "🧠 LLM 判定为复杂任务，自动启用 Plan→Build 流程...")
-	}
+	// 复杂任务自动 Plan Mode 已内建于引擎 (AutoModeHook): 首轮自动注入 system-reminder
+	// 引导 + 会话级只读规划, 由模型自行 ExitPlanMode 进入实施。此处不再注入
+	// [AutoPlanBuild] 文本前缀 (旧 hack, 不进真正的 Plan Mode)。
 
 	// 发送「正在思考」提示
 	if b.config.ThinkingMessage != "" {
@@ -3504,83 +3530,6 @@ func svgToPNGData(svg string) []byte {
 		}
 	}
 	return nil
-}
-
-// llmDetectComplexity 使用 LLM 判断任务复杂度。
-// 先做快速启发式筛选(极短消息直接跳过)，再调用 LLM 做精确判断。
-func (b *Bot) llmDetectComplexity(ctx context.Context, text string) bool {
-	runeLen := len([]rune(text))
-	if runeLen < 15 {
-		return false
-	}
-
-	sysPrompt := `你是一个任务复杂度分类器。用户发来一条消息，你需要判断它是"简单任务"还是"复杂任务"。
-
-复杂任务的特征(满足任一即可):
-- 涉及多个步骤或子任务(>2步)
-- 需要架构设计、方案评估
-- 涉及多文件或多模块改动
-- 需要调研、对比、分析
-- 包含明确的编号列表(1.2.3.)
-- 同时涉及编码+测试+部署等多阶段
-- 需要协作(多角色参与)
-
-简单任务: 单一查询、简单指令、一句话修改、翻译、问答等。
-
-只回复一个单词: COMPLEX 或 SIMPLE`
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	timeoutCtx = api.WithLLMMetrics(timeoutCtx, api.LLMMetricsContext{
-		Source:   "feishu_main",
-		Purpose:  "complexity_classifier",
-		Workflow: "auto_plan",
-		PromptComponents: api.PromptComponentMetrics{
-			SystemChars:   len(sysPrompt),
-			MessagesChars: len(text),
-		},
-	})
-
-	// 经 L1 网关接口 (design/02 §3.1)。这是每条飞书消息都会走的分类调用,
-	// 也是"网关接口被生产依赖"最热的一条证据。
-	resp, err := b.llmGW.Simple(timeoutCtx, sysPrompt, text)
-	if err != nil {
-		return heuristicComplexity(text)
-	}
-
-	resp = strings.TrimSpace(strings.ToUpper(resp))
-	if strings.Contains(resp, "COMPLEX") {
-		return true
-	}
-	if strings.Contains(resp, "SIMPLE") {
-		return false
-	}
-	return heuristicComplexity(text)
-}
-
-// heuristicComplexity 启发式降级: LLM 不可用时的快速判断。
-func heuristicComplexity(text string) bool {
-	runeLen := len([]rune(text))
-	if runeLen > 300 {
-		return true
-	}
-	conjunctions := []string{"并且", "然后", "同时", "另外", "还需要", "以及", "此外", "接着"}
-	conjCount := 0
-	for _, c := range conjunctions {
-		if strings.Contains(text, c) {
-			conjCount++
-		}
-	}
-	if conjCount >= 2 {
-		return true
-	}
-	numberedItems := 0
-	for _, prefix := range []string{"1.", "2.", "3.", "4.", "5.", "1、", "2、", "3、"} {
-		if strings.Contains(text, prefix) {
-			numberedItems++
-		}
-	}
-	return numberedItems >= 3
 }
 
 // sendTextReply 回复指定消息 (引用回复)

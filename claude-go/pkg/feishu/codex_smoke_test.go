@@ -63,9 +63,7 @@ func TestCodexOptimizedFeishuScenarios(t *testing.T) {
 	chatID := "codex-smoke-optimized-6"
 
 	analysisText := "帮我分析 claude-go 的飞书 Bot 架构，并给出改造计划。"
-	if bot.llmDetectComplexity(ctx, analysisText) {
-		analysisText = "[AutoPlanBuild] 复杂任务: 先 EnterPlanMode 规划, 再 ExitPlanMode 后执行并验证。\n原始任务:\n" + analysisText
-	}
+	// 复杂任务自动 Plan Mode 已内建于引擎 (AutoModeHook), 无需再注入 [AutoPlanBuild] 前缀。
 	response, err := bot.sessions.ProcessMessage(ctx, chatID, analysisText)
 	if err != nil {
 		t.Fatalf("analysis message: %v", err)

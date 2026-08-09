@@ -50,13 +50,23 @@ func (t *FileWriteTool) IsReadOnly(_ json.RawMessage) bool { return false }
 func (t *FileWriteTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
 func (t *FileWriteTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
-	if tctx.PermissionMode == types.PermissionModePlan {
-		return &types.PermissionResult{
-			Behavior: types.PermissionDeny,
-			Reason:   "Plan mode: 写入操作不可用",
+	if tctx == nil || tctx.PermissionMode != types.PermissionModePlan {
+		return nil
+	}
+	// 规划期唯一可写例外: 计划文件目录 (PlanFileDir)。模型可在此起草/更新计划,
+	// 对齐 Claude 客户端 plan mode 只放行 plans 目录的语义; 其余路径一律拒写。
+	if tctx.PlanFileDir != "" {
+		var in fileWriteInput
+		if json.Unmarshal(input, &in) == nil && in.Path != "" {
+			if tctx.PathInPlanDir(expandPath(in.Path, tctx.Cwd)) {
+				return nil
+			}
 		}
 	}
-	return nil
+	return &types.PermissionResult{
+		Behavior: types.PermissionDeny,
+		Reason:   "Plan mode: 写入操作不可用 (唯一例外: 计划文件目录)",
+	}
 }
 
 // Call 执行文件写入。

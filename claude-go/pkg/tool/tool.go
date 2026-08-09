@@ -12,6 +12,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/anthropic/claude-go/pkg/types"
@@ -103,6 +105,8 @@ type ToolContext struct {
 	PermissionMode     types.PermissionMode `json:"permissionMode"`
 	AbortCh            <-chan struct{}      `json:"-"` // 对应 TS: abortController.signal
 	Messages           []types.Message      `json:"messages,omitempty"`
+	SessionID          string               `json:"sessionId,omitempty"` // 会话级状态工具 (plan mode) 用
+	PlanFileDir        string               `json:"planFileDir,omitempty"` // 计划文件目录: ExitPlanMode 将计划落盘, 实施阶段可读取
 	MainLoopModel      string               `json:"mainLoopModel,omitempty"`
 	ExecutionModel     string               `json:"executionModel,omitempty"` // 自动路由的快速执行模型 (Path B); 空=未配置
 	AgentID            types.AgentID        `json:"agentId,omitempty"`
@@ -111,6 +115,24 @@ type ToolContext struct {
 	MaxToolResultChars int                  `json:"maxToolResultChars,omitempty"`
 	// GlobalPerm 若非 nil，RunToolUse 会用其 CheckGlobal 合并全局策略与工具自带权限结果
 	GlobalPerm GlobalPermissionChecker `json:"-"`
+}
+
+// PathInPlanDir 判定展开后的绝对路径是否位于计划文件目录 (PlanFileDir) 内。
+// 规划期 (PermissionModePlan) 的唯一可写例外就是计划文件目录 —— 模型可在此起草/
+// 更新计划, 对齐 Claude 客户端 plan mode 只放行 plans 目录的语义; 其余路径一律拒写。
+// 子路径判定用 filepath.Rel (仿 pkg/agent/team_workspace.go:106), 杜绝 `../` 逃逸。
+// PlanFileDir 为空 (未配置) 时恒 false (无例外, 规划期全拒写)。
+func (t *ToolContext) PathInPlanDir(path string) bool {
+	if t == nil || strings.TrimSpace(t.PlanFileDir) == "" {
+		return false
+	}
+	base := filepath.Clean(t.PlanFileDir)
+	target := filepath.Clean(path)
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 // Registry 工具注册表，管理所有可用工具。

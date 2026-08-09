@@ -12,7 +12,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -59,10 +63,13 @@ func NewPlanModeChecker(sessionID string) func() bool {
 }
 
 func setPlanMode(on bool) {
-	setPlanModeForSession("_global", on)
+	SetPlanModeForSession("_global", on)
 }
 
-func setPlanModeForSession(sessionID string, on bool) {
+// SetPlanModeForSession 写指定会话的 plan mode 标志。导出给装配方 (CLI/飞书) 注入
+// engine.Config.PlanModeSetter, 使引擎自动 Plan 与模型 EnterPlanMode/ExitPlanMode
+// 工具共用**同一个**会话级 flag (单一状态源)。
+func SetPlanModeForSession(sessionID string, on bool) {
 	planSessionsMu.Lock()
 	defer planSessionsMu.Unlock()
 	if on {
@@ -70,6 +77,15 @@ func setPlanModeForSession(sessionID string, on bool) {
 	} else {
 		delete(planSessions, sessionID)
 	}
+}
+
+// planSessionID 从 ToolContext 取会话 key, 未携带时回落全局 "_global"。
+// 会话级隔离: 多会话进程 (飞书) 下 A 会话进入 plan 不再污染 B 会话。
+func planSessionID(tctx *tool.ToolContext) string {
+	if tctx != nil && tctx.SessionID != "" {
+		return tctx.SessionID
+	}
+	return "_global"
 }
 
 // --- EnterPlanModeTool ---
@@ -105,7 +121,7 @@ func (t *EnterPlanModeTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolCont
 }
 
 // Call 打开计划模式标志并返回中文提示。
-func (t *EnterPlanModeTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
+func (t *EnterPlanModeTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	if len(input) > 0 && string(input) != "{}" && string(input) != "null" {
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(input, &m); err != nil {
@@ -115,7 +131,7 @@ func (t *EnterPlanModeTool) Call(_ context.Context, input json.RawMessage, _ *to
 			return &tool.ToolResult{Content: "EnterPlanMode 不需要任何字段，请传入空对象 {}。", IsError: true}, nil
 		}
 	}
-	setPlanMode(true)
+	SetPlanModeForSession(planSessionID(tctx), true)
 	return &tool.ToolResult{
 		Content: "已进入计划模式：请先用只读方式调研与规划，确认方案后再退出计划模式执行改动。",
 	}, nil
@@ -163,19 +179,68 @@ func (t *ExitPlanModeTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolConte
 	return nil
 }
 
-// Call 关闭计划模式；若提供 plan，则在返回内容中回显。
-func (t *ExitPlanModeTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
+// Call 关闭计划模式；若提供 plan，则写入计划文件 (PlanFileDir 已配置时) 并在返回内容中回显路径。
+func (t *ExitPlanModeTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in exitPlanModeInput
 	if len(input) > 0 && string(input) != "null" {
 		if err := json.Unmarshal(input, &in); err != nil {
 			return &tool.ToolResult{Content: fmt.Sprintf("输入解析错误: %v", err), IsError: true}, nil
 		}
 	}
-	setPlanMode(false)
-	if in.Plan != "" {
-		return &tool.ToolResult{
-			Content: fmt.Sprintf("已退出计划模式。\n\n附带的计划摘要：\n%s", in.Plan),
-		}, nil
+	SetPlanModeForSession(planSessionID(tctx), false)
+
+	savedPath := ""
+	if in.Plan != "" && tctx != nil && strings.TrimSpace(tctx.PlanFileDir) != "" {
+		if path, err := persistPlanFile(tctx.PlanFileDir, planSessionID(tctx), in.Plan); err == nil {
+			savedPath = path
+		} else {
+			// 落盘失败不阻断退出计划模式, 只在结果里提示。
+			savedPath = fmt.Sprintf("(计划文件写入失败: %v)", err)
+		}
 	}
-	return &tool.ToolResult{Content: "已退出计划模式。"}, nil
+
+	var b strings.Builder
+	b.WriteString("已退出计划模式。")
+	if in.Plan != "" {
+		b.WriteString("\n\n附带的计划摘要：\n")
+		b.WriteString(in.Plan)
+	}
+	if savedPath != "" {
+		b.WriteString("\n\n计划已保存至: " + savedPath)
+		b.WriteString("\n实施阶段请先读取该计划文件，严格按其执行。")
+	}
+	return &tool.ToolResult{Content: b.String()}, nil
+}
+
+// persistPlanFile 把提交的计划写入 <PlanFileDir>/plan-<session>-<timestamp>.md。
+// 目录不存在时自动创建。返回写入的绝对路径。
+func persistPlanFile(dir, sessionID, plan string) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("创建计划目录失败: %w", err)
+	}
+	name := "plan-" + sanitizePlanName(sessionID) + "-" + time.Now().Format("20060102-150405") + ".md"
+	path := filepath.Join(dir, name)
+	content := fmt.Sprintf("# 实施计划\n\n- 会话: %s\n- 提交时间: %s\n\n%s\n",
+		sessionID, time.Now().Format("2006-01-02 15:04:05"), plan)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// sanitizePlanName 清理 sessionID 用于文件名 (仅保留字母数字与 .-_ )。
+func sanitizePlanName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "global"
+	}
+	return b.String()
 }
