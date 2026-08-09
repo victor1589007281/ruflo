@@ -34,6 +34,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
+	"github.com/anthropic/claude-go/pkg/agentdbsemantic"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/backup"
 	"github.com/anthropic/claude-go/pkg/basedir"
@@ -169,6 +170,13 @@ var (
 	flagComplexityMode string // --complexity-mode heuristic|llm|hybrid
 	flagAllowedTools   string // --allowed-tools t1,t2 (whitelist; non-empty = only these)
 	flagOutputFormat   string // --output-format text|json
+	// agentDB 语义增强面 (规划 14.1.4.3): --agentdb-url <serve 地址> 装配
+	// AgentDBSemanticInjectHook, 使真实引擎经 serve /v1/memory|retrieve|files
+	// 跨源检索并注入 system prompt。nil = 不装配 (默认)。
+	flagAgentDBURL       string // --agentdb-url http://127.0.0.1:PORT
+	flagAgentDBTopK      int    // --agentdb-topk 每源检索条数 (默认 5)
+	flagAgentDBBudget    int    // --agentdb-budget 注入上下文 token 预算 (默认 600)
+	flagAgentDBReserve   int    // --agentdb-reserve 为任务正文预留 token (默认 200)
 )
 
 func main() {
@@ -263,6 +271,10 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagComplexityMode, "complexity-mode", "", "复杂度判定模式: heuristic|llm|hybrid (空=读配置, 默认 heuristic)")
 	rootCmd.PersistentFlags().StringVar(&flagAllowedTools, "allowed-tools", "", "工具白名单 (逗号分隔); 非空时仅这些工具可见且可执行, 其余硬拒 (用于受限托管 agent)")
 	rootCmd.PersistentFlags().StringVar(&flagOutputFormat, "output-format", "text", "输出格式: text (默认) | json (final/is_error/error_kind/session_id 顶层 envelope, 供程序化调用; token 用量见 metrics JSONL)")
+	rootCmd.PersistentFlags().StringVar(&flagAgentDBURL, "agentdb-url", "", "agentDB serve 地址 (如 http://127.0.0.1:8787); 设置后装配层2语义增强注入 (AgentDBSemanticInjectHook)")
+	rootCmd.PersistentFlags().IntVar(&flagAgentDBTopK, "agentdb-topk", 5, "agentDB 每源检索条数")
+	rootCmd.PersistentFlags().IntVar(&flagAgentDBBudget, "agentdb-budget", 600, "agentDB 注入上下文 token 预算")
+	rootCmd.PersistentFlags().IntVar(&flagAgentDBReserve, "agentdb-reserve", 200, "agentDB 注入为任务正文预留 token")
 
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(runCmd())
@@ -3192,6 +3204,17 @@ func buildEngine() (*engine.QueryEngine, error) {
 	// llm/hybrid 复杂度判定: 用主 apiClient 的 SimpleComplete + 分类器 system prompt。
 	if autoPlanMode && (complexityMode == "llm" || complexityMode == "hybrid") {
 		cfg.LLMComplexityFn = cliComplexityClassifier(apiClient)
+	}
+
+	// agentDB 语义增强面 (规划 14.1.4.3): --agentdb-url 装配 AgentDBSemanticInjectHook,
+	// 使真实引擎经 serve /v1/memory|retrieve|files 跨源检索并注入 system prompt。
+	if url := strings.TrimSpace(flagAgentDBURL); url != "" {
+		cfg.AgentDBSemantic = agentdbsemantic.New(strings.TrimRight(url, "/"))
+		cfg.SemanticTopK = flagAgentDBTopK
+		cfg.SemanticTokenBudget = flagAgentDBBudget
+		cfg.SemanticReserve = flagAgentDBReserve
+		log.Printf("[agentdb] 已装配层2语义增强注入: url=%s topK=%d budget=%d reserve=%d",
+			url, flagAgentDBTopK, flagAgentDBBudget, flagAgentDBReserve)
 	}
 
 	deps := &engineDeps{

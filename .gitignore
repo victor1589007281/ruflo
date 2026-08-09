@@ -161,6 +161,7 @@ claude-go/claude-go-bin
 .claude-flow/data/
 .claude-flow/logs/
 claude-go/.claude-go/
+claude-go/**/.claude-go/
 
 # Environment variables
 .env
