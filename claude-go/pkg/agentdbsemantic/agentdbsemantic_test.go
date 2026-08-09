@@ -170,6 +170,14 @@ func TestAssembleContext(t *testing.T) {
 func TestFilesSearch(t *testing.T) {
 	c := newSemanticServer(t)
 	ctx := context.Background()
+	// 索引 → 元信息
+	meta, err := c.IndexFile(ctx, "note.md", []byte("# 集群部署\nDeployAgentDB 备注\n"))
+	if err != nil {
+		t.Fatalf("IndexFile: %v", err)
+	}
+	if meta.Path != "note.md" {
+		t.Fatalf("IndexFile 元信息 path=%q", meta.Path)
+	}
 	hits, err := c.SearchFiles(ctx, "DeployAgentDB", 5)
 	if err != nil {
 		t.Fatalf("SearchFiles: %v", err)
@@ -177,10 +185,17 @@ func TestFilesSearch(t *testing.T) {
 	if len(hits) == 0 {
 		t.Fatal("BM25 应召回 deploy.go")
 	}
-	if !strings.Contains(hits[0].Meta.Path, "deploy.go") {
-		t.Fatalf("命中路径应含 deploy.go, got %+v", hits[0])
+	var hitPath string
+	for _, h := range hits {
+		if strings.Contains(h.Meta.Path, "deploy.go") {
+			hitPath = h.Meta.Path
+			break
+		}
 	}
-	raw, err := c.GetFileContent(ctx, hits[0].Meta.Path)
+	if hitPath == "" {
+		t.Fatalf("命中列表应含 deploy.go, got %+v", hits)
+	}
+	raw, err := c.GetFileContent(ctx, hitPath)
 	if err != nil {
 		t.Fatalf("GetFileContent: %v", err)
 	}

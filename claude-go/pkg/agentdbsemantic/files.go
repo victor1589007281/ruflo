@@ -21,6 +21,20 @@ type FileHit struct {
 	Meta  FileMeta `json:"Meta"`
 }
 
+// IndexFile 索引一个文件 (POST /v1/files/index), 供 BM25 检索与内容重组读取。
+func (c *Client) IndexFile(ctx context.Context, path string, content []byte) (*FileMeta, error) {
+	req := map[string]any{"path": path, "content": string(content)}
+	resp, _, err := c.doJSON(ctx, "POST", "/v1/files/index", req)
+	if err != nil {
+		return nil, err
+	}
+	var meta FileMeta
+	if err := json.Unmarshal(resp, &meta); err != nil {
+		return nil, fmt.Errorf("agentdbsemantic: 解析 files/index 响应: %w", err)
+	}
+	return &meta, nil
+}
+
 // SearchFiles 按文本检索索引文件 (GET /v1/files/search, BM25)。
 func (c *Client) SearchFiles(ctx context.Context, query string, topK int) ([]FileHit, error) {
 	if topK <= 0 {
