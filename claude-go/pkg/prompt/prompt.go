@@ -57,6 +57,12 @@ type Manager struct {
 	ProductName string
 	// FastMode 是否启用快速/精简模式 (环境块展示)
 	FastMode bool
+	// WeakModelHints 弱模型规划指引 (方案三 L6b): 在默认 prompt 的 plan_mode 段后
+	// 注入 <planning_checklist>——先列 3-7 条计划再动手、失败换策略、收尾即停。
+	WeakModelHints bool
+	// ExperienceHints 经验卡注入段 (方案三 L7): 非空时在 long_term_memory 后
+	// 注入 <experience> 块。由调用方用 learners.RetrieveExperience 预渲染。
+	ExperienceHints string
 }
 
 // NewManager 创建提示词管理器
@@ -209,6 +215,19 @@ func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 	sb.WriteString("Skip plan mode for simple, single-file changes.\n")
 	sb.WriteString("</plan_mode>\n\n")
 
+	// 方案三 L6b: 弱模型 checklist 规划指引 (冻结权重的推理时脚手架)。
+	// 显式计划为弱模型提供外部状态, 减少长轨迹迷失; 三条纪律直接对治
+	// 本地小模型的三大高发失败: 不规划就动手 / 失败原样重试 / 完成不收尾。
+	if m.WeakModelHints {
+		sb.WriteString("<planning_checklist>\n")
+		sb.WriteString("For any non-trivial task:\n")
+		sb.WriteString("1. FIRST output a numbered plan of 3-7 concrete steps (one tool action per step).\n")
+		sb.WriteString("2. Execute steps in order; after each tool result, note which step you are on.\n")
+		sb.WriteString("3. If a tool call fails, read the error and CHANGE your approach; never repeat the same call unchanged.\n")
+		sb.WriteString("4. When all steps are done, reply with a short final summary and STOP calling tools.\n")
+		sb.WriteString("</planning_checklist>\n\n")
+	}
+
 	// CLAUDE.md 记忆内容
 	// 对应 TS: prompts.ts 中整合 claudemd 的部分
 	memoryFiles := m.MemoryLoader.LoadAll()
@@ -227,6 +246,11 @@ func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 			sb.WriteString(dreamContent)
 			sb.WriteString("</long_term_memory>\n\n")
 		}
+	}
+
+	// 方案三 L7: 经验卡注入 (检索已由调用方完成, 这里只做落位)
+	if strings.TrimSpace(m.ExperienceHints) != "" {
+		sb.WriteString(m.ExperienceHints)
 	}
 
 	return sb.String()

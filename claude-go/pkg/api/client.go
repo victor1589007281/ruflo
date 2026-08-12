@@ -151,6 +151,11 @@ type Client struct {
 	// ConfiguredClone 大量克隆, 逐个装必漏。
 	CallInterceptors []CallInterceptor
 
+	// ForceToolChoiceAny 强制 tool_choice=any (方案三 L1 裁定项)。
+	// 默认 false; 由 WithToolChoiceAny 副本开启, 仅对携带 tools 的请求生效。
+	// 纪律: 全局强制会令模型无法 end_turn 自然收尾, 只允许在执行回合临时启用。
+	ForceToolChoiceAny bool
+
 	// FallbackModels 备用模型列表: 主模型不可用时按序尝试。
 	// 触发条件: 模型不支持 (400 invalid model) / 超载 (529) / 配额耗尽 (402/403)。
 	FallbackModels []string
@@ -651,6 +656,15 @@ func NewOllamaClient(baseURL, model string) *Client {
 	return c
 }
 
+// WithToolChoiceAny 返回一个强制 tool_choice=any 的轻量副本。
+// 用结构体值拷贝而非逐字段罗列: Client 字段一直在长 (WithModel 逐字段拷贝
+// 已经漂过), 值拷贝天然免疫漂移。
+func (c *Client) WithToolChoiceAny() *Client {
+	cc := *c
+	cc.ForceToolChoiceAny = true
+	return &cc
+}
+
 // IsLocalEndpoint 判断 baseURL 是否指向本机端点 (localhost/127.0.0.1/0.0.0.0/::1)。
 // 本机端点 (如 Ollama) 通常无需 API Key。
 func IsLocalEndpoint(baseURL string) bool {
@@ -799,6 +813,9 @@ func (c *Client) StreamMessage(
 		}
 		if len(tools) > 0 {
 			req.Tools = tools
+			if c.ForceToolChoiceAny {
+				req.ToolChoice = &types.APIToolChoice{Type: "any"}
+			}
 		}
 
 		body, err := json.Marshal(req)

@@ -113,6 +113,12 @@ type ToolContext struct {
 	IsNonInteractive   bool                 `json:"isNonInteractive"`
 	Debug              bool                 `json:"debug"`
 	MaxToolResultChars int                  `json:"maxToolResultChars,omitempty"`
+	// WeakResultPostprocess 弱模型 tool_result 确定性后处理 (方案三 L3):
+	// 单行截断 + 超行数保头尾, 在 compactToolResultContent 入口生效。
+	WeakResultPostprocess bool `json:"weakResultPostprocess,omitempty"`
+	// WeakEditGuard 写入前语法护栏 (方案三 L2): edit/write 拒写语法坏内容
+	// 并回注错误 (SWE-agent ACI), 覆盖 .go/.py/.json。
+	WeakEditGuard bool `json:"weakEditGuard,omitempty"`
 	// GlobalPerm 若非 nil，RunToolUse 会用其 CheckGlobal 合并全局策略与工具自带权限结果
 	GlobalPerm GlobalPermissionChecker `json:"-"`
 }

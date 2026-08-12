@@ -79,6 +79,11 @@ func (t *FileWriteTool) Call(ctx context.Context, input json.RawMessage, tctx *t
 
 	filePath := expandPath(in.Path, tctx.Cwd)
 
+	// 方案三 L2 护栏: 写入前语法校验 (弱模型模式), 坏内容拒写并回注错误
+	if res := guardWriteSyntax(filePath, in.Contents, tctx); res != nil {
+		return res, nil
+	}
+
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("创建目录失败: %v", err), IsError: true}, nil
 	}

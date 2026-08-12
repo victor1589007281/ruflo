@@ -47,6 +47,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/evolution/console"
+	"github.com/anthropic/claude-go/pkg/evolution/learners"
 	"github.com/anthropic/claude-go/pkg/evolution/skillaudit"
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/feishu"
@@ -68,6 +69,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
+	"github.com/anthropic/claude-go/pkg/weakmodel"
 	"github.com/anthropic/claude-go/pkg/worker"
 	"github.com/spf13/cobra"
 )
@@ -160,6 +162,8 @@ var (
 	flagPermission     string
 	flagSystemPrompt   string
 	flagPrint          bool
+	flagVerify         string
+	flagBestOf         int
 	flagDebug          bool
 	flagMCPConfig      string
 	flagConfig         string
@@ -266,6 +270,8 @@ func main() {
 	rootCmd.PersistentFlags().BoolVar(&flagFinalOnly, "final-only", false, "仅输出最终回答文本 (不输出 thinking 过程, 供程序化调用解析)")
 	rootCmd.PersistentFlags().BoolVar(&flagEmitSession, "emit-session-id", false, "结束时输出 __CLAUDE_GO_SESSION__=<id> 行, 供调用方记录以便 --resume 续聊")
 	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
+	rootCmd.PersistentFlags().StringVar(&flagVerify, "verify", "", "任务验收命令 (方案三 L6a): run 结束后在 cwd 执行, 非零即未过; 配 --best-of 启用择优")
+	rootCmd.PersistentFlags().IntVar(&flagBestOf, "best-of", 1, "任务级 best-of-N 尝试次数 (1=关; 2-4, 需配 --verify; 每次全新会话)")
 	rootCmd.PersistentFlags().StringVar(&flagAdvisor, "advisor", "", "启用 advisor 顾问工具并指定模型别名 (provider:model); \"off\" 强制关闭 (覆盖配置文件)")
 	rootCmd.PersistentFlags().StringVar(&flagAutoPlan, "auto-plan", "", "引擎级复杂任务自判断 → 自动 Plan Mode (on|off); 空=读配置, 默认开")
 	rootCmd.PersistentFlags().StringVar(&flagComplexityMode, "complexity-mode", "", "复杂度判定模式: heuristic|llm|hybrid (空=读配置, 默认 heuristic)")
@@ -885,13 +891,73 @@ func runCmd() *cobra.Command {
 				return err
 			}
 			jsonMode := flagOutputFormat == "json"
-			streamCh := eng.SubmitStreamBlocks(ctx, userPrompt, attachBlocks)
-			// In JSON mode the deltas are collected, not streamed, so the only
-			// thing on stdout is the final envelope — safe to parse.
-			final, errKind := consumeStreamEvents(streamCh, jsonMode)
+			// 方案三 L6a: 任务级 best-of-N——配 --verify 时每次尝试跑全新会话,
+			// 首个过验收命令的尝试胜出 (Large Language Monkeys 的 pass@k 幂律,
+			// 只作用于"最终可验证产物", 步级不做——13.3.3 L6 纪律)。
+			attempts := 1
+			if flagVerify != "" && flagBestOf > 1 {
+				attempts = flagBestOf
+				if attempts > 4 {
+					attempts = 4
+				}
+			}
+			var final, errKind string
+			verifyPassed := false
+			for attempt := 1; ; attempt++ {
+				if attempt > 1 {
+					eng, err = buildEngine() // 全新会话, 避免上次轨迹污染本次采样
+					if err != nil {
+						return err
+					}
+				}
+				wmlInjectExperience(eng, userPrompt) // L7 注入半环 (每次尝试一致)
+				streamCh := eng.SubmitStreamBlocks(ctx, userPrompt, attachBlocks)
+				var ek string
+				final, ek = consumeStreamEvents(streamCh, jsonMode)
+				errKind = ek
+				if flagVerify == "" || errKind != "" {
+					break
+				}
+				if verr := wmlVerifyRun(eng.Config.Cwd, flagVerify); verr == nil {
+					verifyPassed = true
+					break
+				} else {
+					log.Printf("[best-of] 第 %d/%d 次尝试未过验收: %v", attempt, attempts, verr)
+				}
+				if attempt >= attempts {
+					break
+				}
+			}
+			if flagVerify != "" {
+				log.Printf("[best-of] 验收结论: passed=%v (attempts=%d)", verifyPassed, attempts)
+			}
 			sessionID := ""
 			if store != nil {
 				sessionID = store.SessionID()
+			}
+			// 方案三 L7 蒸馏半环: 会话末把轨迹交独立档位反思器蒸馏经验卡。
+			// 默认关 (env CLAUDE_GO_WML_EXPERIENCE=1 开): 蒸馏是一次额外的强模型调用,
+			// 不能悄悄加在每个 run 末尾。H3: 反思器别名经 CLAUDE_GO_WML_REFLECTOR 指定,
+			// 与主模型同名即拒 (不同源纪律)。
+			if eng.Config.WeakModel.Enabled && errKind == "" && wmlExperienceEnabled() {
+				if reflAlias := strings.TrimSpace(os.Getenv("CLAUDE_GO_WML_REFLECTOR")); reflAlias != "" {
+					if reflClient, err := buildClientFromAlias(reflAlias); err == nil && reflClient.Model != eng.Config.Model {
+						transcript := summarizeMessagesForDistill(eng.Messages)
+						if cards, err := learners.DistillExperience(ctx, reflClient, transcript, "cli-run:"+sessionID); err == nil {
+							jsonCfgL, _, _ := loadRuntimeJSONConfig()
+							cwdL, _ := os.Getwd()
+							sdInput := ""
+							if jsonCfgL != nil {
+								sdInput = jsonCfgL.StateDir
+							}
+							if err := learners.AppendExperienceCards(basedir.ResolveDefault(sdInput, cwdL), cards); err == nil {
+								log.Printf("[weakmodel] 经验卡蒸馏入库 %d 条", len(cards))
+							}
+						} else {
+							log.Printf("[weakmodel] 经验蒸馏未入库: %v", err)
+						}
+					}
+				}
 			}
 			if jsonMode {
 				return emitRunEnvelope(final, sessionID, errKind)
@@ -902,6 +968,87 @@ func runCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// wmlInjectExperience L7 注入半环: 弱模型模式下按任务文本检索经验卡注入 system prompt。
+// 检索是确定性关键词重合 (learners.RetrieveExperience), 不多花一次模型调用。
+func wmlInjectExperience(eng *engine.QueryEngine, userPrompt string) {
+	if eng == nil || !eng.Config.WeakModel.Enabled {
+		return
+	}
+	jsonCfgL, _, _ := loadRuntimeJSONConfig()
+	cwdL, _ := os.Getwd()
+	sdInput := ""
+	if jsonCfgL != nil {
+		sdInput = jsonCfgL.StateDir
+	}
+	expStateDir := basedir.ResolveDefault(sdInput, cwdL)
+	cards, _ := learners.LoadExperienceCards(expStateDir)
+	if len(cards) == 0 {
+		return
+	}
+	top := learners.RetrieveExperience(cards, userPrompt, 3)
+	if hints := learners.FormatExperienceHints(top); hints != "" {
+		eng.PromptMgr.ExperienceHints = hints
+		log.Printf("[weakmodel] 注入经验卡 %d 条 (库共 %d 条)", len(top), len(cards))
+	}
+}
+
+// wmlVerifyRun L6a 验收命令执行器: cwd 下 sh -c, 3 分钟超时, 零退出码即过。
+func wmlVerifyRun(cwd, cmd string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c.Dir = cwd
+	out, err := c.CombinedOutput()
+	if err != nil {
+		tail := strings.TrimSpace(string(out))
+		if len(tail) > 300 {
+			tail = tail[:300] + "…"
+		}
+		return fmt.Errorf("%v: %s", err, tail)
+	}
+	return nil
+}
+
+// wmlExperienceEnabled L7 蒸馏开关 (默认关: 会话末多一次强模型调用必须是显式选择)。
+func wmlExperienceEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CLAUDE_GO_WML_EXPERIENCE"))) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
+// summarizeMessagesForDistill 把会话消息渲染成蒸馏用摘要 (尾部 20 条, 各截 300 字符)。
+func summarizeMessagesForDistill(msgs []types.Message) string {
+	var b strings.Builder
+	start := 0
+	if len(msgs) > 20 {
+		start = len(msgs) - 20
+	}
+	for _, m := range msgs[start:] {
+		for _, blk := range m.Content {
+			var text string
+			switch blk.Type {
+			case types.ContentBlockText:
+				text = blk.Text
+			case types.ContentBlockToolUse:
+				text = "调用工具 " + blk.Name + " " + string(blk.Input)
+			case types.ContentBlockToolResult:
+				text = "工具结果: " + blk.Content
+			}
+			text = strings.TrimSpace(text)
+			if text == "" {
+				continue
+			}
+			if len(text) > 300 {
+				text = text[:300] + "…"
+			}
+			b.WriteString(string(m.Type) + ": " + text + "\n")
+		}
+	}
+	return b.String()
 }
 
 // runEnvelope is the --output-format json result: a single parseable object
@@ -1734,7 +1881,10 @@ func evoCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.AddCommand(auditCmd, promoteCmd, rollbackCmd)
+	cmd.AddCommand(auditCmd, promoteCmd, rollbackCmd,
+		evoReplayCmd(resolveStateDir), evoGepaStepCmd(resolveStateDir),
+		evoGepaLoopCmd(resolveStateDir), // 方案三 L5: 回放打分 + GEPA 完整版单步/多轮
+		evoDistillCmd())                 // 方案三数据通道: T1 示例/T5 分布/T6 修复模式挖掘
 	return cmd
 }
 
@@ -3200,6 +3350,29 @@ func buildEngine() (*engine.QueryEngine, error) {
 		PlanFileDir: planDir,
 		// PlanClient 规划期独立模型客户端 (Tag=plan); nil = 规划期沿用主模型。
 		PlanClient: planClient,
+	}
+	// 方案三 (手册 13.3): 弱模型 harness 增强——本地小模型 (Ollama 接入) 的
+	// 低级失败 (schema 违背/选错工具/上下文腐烂/不规划) 用冻结权重的确定性机制消除。
+	// 开关解析: CLAUDE_GO_WEAK_MODEL=1|0 显式控制 > 自动 (provider=="ollama" 时开)。
+	{
+		wmlProvider := ""
+		if hasResolvedModel {
+			wmlProvider = resolvedModel.Provider
+		} else if i := strings.Index(effectiveModel, ":"); i > 0 {
+			wmlProvider = effectiveModel[:i]
+		}
+		cfg.WeakModel = weakmodel.Resolve(wmlProvider, os.Getenv)
+		if cfg.WeakModel.Enabled {
+			promptMgr.WeakModelHints = cfg.WeakModel.PlanningHints
+			log.Printf("[weakmodel] 弱模型增强已启用 (provider=%s): schemaRetry=%v resultPostprocess=%v toolMasking=%v planningHints=%v toolChoiceAny=%v",
+				wmlProvider, cfg.WeakModel.SchemaRetry, cfg.WeakModel.ResultPostprocess,
+				cfg.WeakModel.ToolMasking, cfg.WeakModel.PlanningHints, cfg.WeakModel.ToolChoiceAny)
+		}
+	}
+	// 方案三 L8: 引擎级 FallbackModel (确定性失败信号升级的目标档位)。
+	// 与客户端 FallbackModels 同源; 此前引擎字段从未被装配 (L8 是第一个消费方)。
+	if cfg.FallbackModel == "" && hasResolvedModel && len(resolvedModel.FallbackModels) > 0 {
+		cfg.FallbackModel = resolvedModel.FallbackModels[0]
 	}
 	// llm/hybrid 复杂度判定: 用主 apiClient 的 SimpleComplete + 分类器 system prompt。
 	if autoPlanMode && (complexityMode == "llm" || complexityMode == "hybrid") {

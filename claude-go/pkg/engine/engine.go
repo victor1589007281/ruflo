@@ -41,6 +41,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
+	"github.com/anthropic/claude-go/pkg/weakmodel"
 )
 
 // 断路器常量已迁移到 internal_hook 包: MaxConsecutiveErrors, MicroCompactMaxChars, MessageCompactChars
@@ -164,6 +165,11 @@ type Config struct {
 	// (design/01 §4.6 审计)。多次 ApplyConstraints 会以 " > " 串成继承链。
 	// 纯观测字段, 不参与任何判定。
 	ConstraintOrigin string
+
+	// WeakModel 弱模型 harness 增强 (手册 13.3 方案三: L2 schema 校验修复环 /
+	// L3 tool_result 后处理 / L4 工具掩码 / L6b 规划指引)。零值 = 全关,
+	// 不改变任何既有行为。装配入口见 cmd/claude-go main.go weakmodel.Resolve。
+	WeakModel weakmodel.Profile
 
 	// ==================== 前沿优化特性开关 (默认关闭) ====================
 	// 详细方案见 docs/query-engine-frontier-optimization.md。
@@ -362,6 +368,21 @@ func NewQueryEngine(
 		PromptMgr:     promptMgr,
 		ContextBudget: contextBudget,
 	}
+	// L4 工具掩码 (方案三): 弱模型 Profile 生效时把默认掩码清单并入 DisabledTools
+	// (并集幂等, RefreshHooks 重注册 ToolGateHook 也拿到合并后的集合),
+	// 从而 API 面过滤 (queryLoop) 与执行面拦截 (ToolGateHook) 共用同一真源。
+	if cfg.WeakModel.Enabled && cfg.WeakModel.ToolMasking {
+		if cfg.DisabledTools == nil {
+			cfg.DisabledTools = make(map[string]bool, len(weakmodel.DefaultMaskedTools))
+		}
+		for _, name := range weakmodel.DefaultMaskedTools {
+			cfg.DisabledTools[name] = true
+		}
+		for _, name := range cfg.WeakModel.MaskedExtra {
+			cfg.DisabledTools[name] = true
+		}
+		logging.For("engine").Info("weak-model tool masking active", "masked", len(cfg.DisabledTools))
+	}
 	// 按 Config 开关懒加载对应组件。调用 EnableFrontierOptimizations() 可一次性启用 P0/P1。
 	e.applyFeatureFlags()
 	if e.LoopDet != nil {
@@ -506,9 +527,23 @@ func (e *QueryEngine) registerInternalHooks() {
 	// PhasePostRequest: XMLToolFallback(130)
 	e.HookChain.Register(internal_hook.NewXMLToolFallbackHook())
 
-	// PhasePreToolUse: JSONRepair(70) + LoopDetectorInput(80) + DisabledTool(150)
+	// PhasePreToolUse: JSONRepair(70) + SchemaValidate(75) + LoopDetectorInput(80) + DisabledTool(150)
 	if e.JSONRepair != nil {
 		e.HookChain.Register(internal_hook.NewJSONRepairHook(e.JSONRepair, e.Metrics))
+	}
+	// 方案三 L2: 弱模型 schema 校验修复环 —— 执行前校验 tool_use 入参,
+	// 失败回注错误让模型原地重填 (≤2 次), 替代 JSONRepair 的沉默修复。
+	// schema 表按掩码后的可见工具集构建 (与下发给模型的一致, 避免"拦可见工具以外"的错杀)。
+	if e.Config.WeakModel.Enabled && e.Config.WeakModel.SchemaRetry && e.Tools != nil {
+		schemas := make(map[string]json.RawMessage)
+		for _, t := range e.Tools.APITools() {
+			if e.Config.toolExposed(t.Name) && len(t.InputSchema) > 0 {
+				schemas[t.Name] = t.InputSchema
+			}
+		}
+		if h := internal_hook.NewSchemaValidateHook(schemas, e.Metrics, 2); h != nil {
+			e.HookChain.Register(h)
+		}
 	}
 	if e.LoopDet != nil {
 		e.HookChain.Register(internal_hook.NewLoopDetectorInputHook(e.LoopDet, e.Metrics))
@@ -775,6 +810,9 @@ func (e *QueryEngine) SubmitStreamBlocks(ctx context.Context, userContent string
 func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message, streamCh chan<- types.StreamEvent) ([]types.Message, types.Terminal) {
 	turnCount := 0
 	currentModel := e.Config.Model
+	// 方案三 L8: 确定性失败信号升级 (单向棘轮)。信号全部来自 harness 自有 hook 的
+	// 标记文本 (schema_validate 终态拦截 / loop_detector 抑制), 绝不取模型自评置信度。
+	escalated := false
 	consecutiveErrors := 0 // 断路器: 连续错误计数 (ErrClassifier 启用后被绕过)
 	stopReason := ""       // 模型停止原因
 
@@ -801,8 +839,17 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		if e.Config.ExecutionModel != "" && isToolExecTurn(messages) && !isDelegationResultTurn(messages) {
 			turnModel = e.Config.ExecutionModel
 		}
+		// L8: 升级优先于相位路由——已升级则本 run 剩余回合全部走 FallbackModel。
+		if escalated {
+			turnModel = e.Config.FallbackModel
+		}
 		if turnModel != client.Model {
 			client = client.WithModel(turnModel)
+		}
+		// L1 裁定项 (D2): tool_choice=any 只在"执行回合"且显式 opt-in 时启用,
+		// 其余回合保持 auto——全局强制会破坏自然收尾 (13.3.9 探针实录)。
+		if e.Config.WeakModel.ToolChoiceAny && isToolExecTurn(messages) {
+			client = client.WithToolChoiceAny()
 		}
 		currentModel = turnModel
 
@@ -964,6 +1011,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 		} else {
 			apiTools = allTools
+		}
+		// 方案三 L4 动态掩码 (使用感知渐进披露): API 面收窄到
+		// 核心集 ∪ 本会话已实际调用的工具 ∪ ToolSearch; 执行面不拦。
+		if e.Config.WeakModel.Enabled && e.Config.WeakModel.ToolMasking {
+			apiTools = filterDynamicMaskedTools(apiTools, messages)
 		}
 
 		components := internal_hook.BuildPromptComponentMetrics(systemPrompt, apiTools, messages)
@@ -1474,6 +1526,22 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				for _, m := range preToolResult.AppendMsgs {
 					ch <- m
 					messages = append(messages, m)
+					// L8: 检测 harness 自有 hook 的失败标记文本, 触发升级棘轮
+					if !escalated && e.Config.FallbackModel != "" {
+						for _, b := range m.Content {
+							if b.Type != types.ContentBlockToolResult || !b.IsError {
+								continue
+							}
+							schemaTerminal := strings.Contains(b.Content, "[schema_validate]") && strings.Contains(b.Content, "被终止")
+							loopSuppressed := strings.Contains(b.Content, "系统检测到你连续") && strings.Contains(b.Content, "参数完全相同")
+							if schemaTerminal || loopSuppressed {
+								escalated = true
+								logging.For("engine").Warn("L8 确定性失败信号触发升级",
+									"to", e.Config.FallbackModel,
+									"schema_terminal", schemaTerminal, "loop_suppressed", loopSuppressed)
+							}
+						}
+					}
 				}
 				if preToolResult.InjectContinue && len(toolUseBlocks) == 0 {
 					continue
@@ -1523,6 +1591,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			Debug:              e.Config.Debug,
 			Messages:           messages,
 			MaxToolResultChars: internal_hook.MicroCompactMaxChars,
+			// 方案三 L3: 弱模型 tool_result 确定性后处理 (单行截断+保头尾)。
+			WeakResultPostprocess: e.Config.WeakModel.Enabled && e.Config.WeakModel.ResultPostprocess,
+			// 方案三 L2 护栏: edit/write 写入前语法校验 (与 SchemaRetry 同属 L2 开关)。
+			WeakEditGuard: e.Config.WeakModel.Enabled && e.Config.WeakModel.SchemaRetry,
 			SessionID:          e.Config.SessionID,  // EnterPlanMode/ExitPlanMode 用会话级 plan flag
 			PlanFileDir:        e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
 			GlobalPerm:         e.PermChecker,
@@ -1601,6 +1673,39 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		}
 	}
 }
+
+// filterDynamicMaskedTools 方案三 L4 动态掩码 (使用感知渐进披露)。
+//
+// 可见 = CoreVisibleTools ∪ 本会话已实际调用过的工具 (粘性) ∪ ToolSearch (逃生通道)。
+// 与静态掩码 (DisabledTools, 进硬门) 的分工: 这里只收窄下发给模型的工具表,
+// 不影响执行面——模型经 ToolSearch 发现未暴露工具后仍可调用成功, 这正是
+// "渐进披露"与"硬掩码"的安全差异 (13.3.9 偏差 B2 的动态版落地)。
+func filterDynamicMaskedTools(tools []types.APITool, messages []types.Message) []types.APITool {
+	used := make(map[string]bool, 16)
+	for _, m := range messages {
+		for _, b := range m.Content {
+			if b.Type == types.ContentBlockToolUse && b.Name != "" {
+				used[b.Name] = true
+			}
+		}
+	}
+	out := make([]types.APITool, 0, len(tools))
+	for _, t := range tools {
+		if weakmodelCoreSet[t.Name] || used[t.Name] || t.Name == "ToolSearch" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// weakmodelCoreSet CoreVisibleTools 的查找集 (包级初始化一次)。
+var weakmodelCoreSet = func() map[string]bool {
+	m := make(map[string]bool, len(weakmodel.CoreVisibleTools))
+	for _, n := range weakmodel.CoreVisibleTools {
+		m[n] = true
+	}
+	return m
+}()
 
 // isToolExecTurn 判定下一轮 LLM 调用是否处于"工具消费回合":
 // 消息尾部最后一条是 User 消息且携带 tool_result 内容块 (工具执行后 append 的形态)。

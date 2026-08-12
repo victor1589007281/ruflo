@@ -318,7 +318,47 @@ func RunToolUse(
 
 const defaultMaxToolResultChars = 24000
 
+// 弱模型确定性后处理阈值 (方案三 L3, 手册 13.3.3):
+// 单行 2000 字符截断 (防单行 minified 文件/二进制 dump 挤爆上下文),
+// 总行数 >4000 时保头 2000 行 + 尾 1000 行 (错误信息通常在尾部,
+// 命令回显在头部——中间是大段重复输出, lost-in-the-middle 对弱模型最毒)。
+const (
+	weakMaxLineChars  = 2000
+	weakMaxTotalLines = 4000
+	weakHeadLines     = 2000
+	weakTailLines     = 1000
+)
+
+// deterministicToolResultPostprocess 零成本确定性后处理: 单行截断 + 保头尾。
+// 不用模型压缩 (LLMLingua 式压缩本身要花调用, 对本地弱模型不划算)。
+func deterministicToolResultPostprocess(content string) string {
+	lines := strings.Split(content, "\n")
+	changed := false
+	for i, line := range lines {
+		if len(line) > weakMaxLineChars {
+			lines[i] = line[:weakMaxLineChars] + "…[line truncated]"
+			changed = true
+		}
+	}
+	if len(lines) > weakMaxTotalLines {
+		omitted := len(lines) - weakHeadLines - weakTailLines
+		out := make([]string, 0, weakHeadLines+weakTailLines+1)
+		out = append(out, lines[:weakHeadLines]...)
+		out = append(out, fmt.Sprintf("...[omitted %d lines / 省略中段 %d 行, 完整结果见 artifact 或重跑收窄命令]...", omitted, omitted))
+		out = append(out, lines[len(lines)-weakTailLines:]...)
+		return strings.Join(out, "\n")
+	}
+	if !changed {
+		return content
+	}
+	return strings.Join(lines, "\n")
+}
+
 func compactToolResultContent(toolName, content string, tctx *ToolContext) string {
+	// 方案三 L3: 弱模型后处理先做 (单行+总行整形), 再走既有字符预算逻辑。
+	if tctx != nil && tctx.WeakResultPostprocess {
+		content = deterministicToolResultPostprocess(content)
+	}
 	maxChars := defaultMaxToolResultChars
 	if tctx != nil && tctx.MaxToolResultChars > 0 {
 		maxChars = tctx.MaxToolResultChars

@@ -118,6 +118,11 @@ func (t *FileEditTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 		newContent = strings.Replace(content, in.OldString, in.NewString, 1)
 	}
 
+	// 方案三 L2 护栏: 写入前语法校验 (弱模型模式), 坏 diff 拒写并回注错误
+	if res := guardWriteSyntax(filePath, newContent, tctx); res != nil {
+		return res, nil
+	}
+
 	if err := os.WriteFile(filePath, []byte(newContent), 0o644); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("写入文件失败: %v", err), IsError: true}, nil
 	}

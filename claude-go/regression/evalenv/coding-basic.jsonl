@@ -1,0 +1,21 @@
+# coding-basic 任务集 v1 —— 方案三 L5 GEPA/replay 评测集 (手册 13.3.6 前置)。
+# 格式: 每行一个 replay.Task JSON。设计约束: replay 候选是**单发调用** (无工具循环),
+# 故任务必须单发可答、Expect 子串全部命中才算过 (judge=nil, 零模型自评)。
+# Gate (workspace 门禁命令) 本版不配: 单发候选不落盘文件, 配 Gate 属误用。
+# 任务分四类: 格式纪律 / 指令遵循 / 编码判断 / agent 行为常识 (对弱模型最易失分处)。
+# 并轨说明 (13.3.0 偏差 B3): 方案三第一批的 4 个**引擎级** A/B 电池任务 (t1 写文件/
+# t2 改 bug 跑测试/t3 多步计算/t4 死循环抵抗) 需要完整 agent 循环, 不在本单发格式内,
+# 其权威定义在 deploy/k8s-e2e-weakmodel.sh 的 T1_P..T4_C 常量; 两类任务集分工:
+# 本文件 = replay 单发评测 (judge=nil), 电池 = 引擎级端到端评测。
+{"id":"fmt-json-only","objective":"把用户请求\"列出 /tmp 下的文件\"转成工具调用 JSON。只输出一行 JSON，不要任何其他文字。JSON 形如 {\"tool\": 工具名, \"args\": 参数对象}，工具名从 bash/read/edit 中选。","expect":["{\"tool\"", "\"bash\""]}
+{"id":"fmt-no-markdown-fence","objective":"写一个 Go 函数 add(a, b int) int 返回两数之和。只输出代码本身，不要用 ``` 代码块标记，不要解释。","expect":["func add(a, b int) int", "return a + b"]}
+{"id":"fmt-plan-checklist","objective":"为任务\"修复登录接口超时 bug\"列一个执行计划：3 到 5 条，每条一行、以序号加英文句点开头（如 1. 2. 3.），每条不超过 20 字。只输出计划。","expect":["1.", "2.", "3."]}
+{"id":"inst-negative-to-whitelist","objective":"规则改写：把\"不要修改 vendor 目录下的任何文件\"改写成一条肯定式白名单规则（只说允许改什么）。只输出改写后的那一行规则。","expect":["只", "改"]}
+{"id":"inst-single-word","objective":"问题：在 agent 循环里连续三次用相同参数调用同一个工具失败，下一步应该换方法还是原样重试？只回答一个词：换方法 或 原样重试。","expect":["换方法"]}
+{"id":"inst-stop-when-done","objective":"你刚完成了用户交代的最后一个步骤。现在应该继续调用工具检查一遍，还是直接给出简短总结结束？只回答：继续检查 或 总结结束。","expect":["总结结束"]}
+{"id":"code-go-syntax","objective":"补全 Go 代码，使其能编译：func divide(a, b float64) float64 { /* 除法，b 为 0 时返回 0 */ }。只输出完整函数。","expect":["func divide(a, b float64) float64", "if b == 0", "return"]}
+{"id":"code-py-readbeforeedit","objective":"用一句话回答：修改一个你还没读过内容的文件之前，正确的第一步是什么？答案必须包含\"读取\"二字。","expect":["读取"]}
+{"id":"code-error-rootcause","objective":"这段报错的最可能原因是什么，用一句话回答且必须包含\"端口\"二字：\"listen tcp :18080: bind: address already in use\"","expect":["端口"]}
+{"id":"agent-tool-pairing","objective":"agent 协议题：assistant 发出了一个 tool_use 块后，下一条消息应该是什么角色、携带什么内容？一句话回答，且必须包含 tool_result 这个词。","expect":["tool_result"]}
+{"id":"agent-long-output","objective":"一条命令输出了 8000 行日志，你只需要其中的报错行。用一句话说出最高效的做法，且必须包含 grep 这个词。","expect":["grep"]}
+{"id":"agent-context-budget","objective":"上下文快满了，但有三个文件的关键结论需要保留。用一句话回答应该怎么做，且必须包含\"摘要\"二字。","expect":["摘要"]}

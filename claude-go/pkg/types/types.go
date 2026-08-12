@@ -517,12 +517,20 @@ type APIRequest struct {
 	Temperature   *float64       `json:"temperature,omitempty"`
 	StopSequences []string       `json:"stop_sequences,omitempty"`
 	CacheControl  *CacheControl  `json:"cache_control,omitempty"`
+	ToolChoice    *APIToolChoice `json:"tool_choice,omitempty"`
 }
 
 // APIMessage API 格式的消息
 type APIMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+}
+
+// APIToolChoice 工具选择控制 (方案三 L1 裁定项: tool_choice=any 场景化启用)。
+// 仅 "any" 被使用: 强制本轮必须调用工具。风险见手册 13.3.9——全局强制会破坏
+// 自然收尾, 故只在执行回合 + 显式 opt-in 时由引擎设置。
+type APIToolChoice struct {
+	Type string `json:"type"` // "auto"(默认) | "any" | "tool" | "none"
 }
 
 // APITool API 格式的工具定义

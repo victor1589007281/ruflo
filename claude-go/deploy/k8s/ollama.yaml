@@ -1,0 +1,58 @@
+# 集群内 Ollama (方案三 E2E 专用)。
+#
+# 为什么不是直连宿主 Ollama: 2026-08-12 实测 dbk8s-e2e (kind) 节点到宿主
+# 全部端口 (22/4500/11434/…) 均被宿主防火墙 DROP (docker bridge → INPUT),
+# 无 sudo 不能放行 —— 故把 Ollama 跑进集群, 模型 GGUF 经 docker cp 进 kind
+# 节点 hostPath, 再 ollama create 注册。纯 CPU 推理, 仅供 E2E 验证。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-ollama
+  namespace: claude-go
+spec:
+  replicas: 1
+  strategy: { type: Recreate } # hostPath 单点挂载, 不能滚动
+  selector:
+    matchLabels: { app: claude-go-ollama }
+  template:
+    metadata:
+      labels: { app: claude-go-ollama }
+    spec:
+      containers:
+        - name: ollama
+          # 用宿主既有 ollama-kind:0.30.6 (与宿主 Ollama 同版本, RENDERER/PARSER 指令可用)。
+          # docker.io 在本网络不可达, 该镜像经 docker save | ctr import 导入 kind 节点。
+          image: ollama-kind:0.30.6
+          imagePullPolicy: Never
+          env:
+            - { name: OLLAMA_MODELS, value: /var/ollama/models }
+            - { name: OLLAMA_KEEP_ALIVE, value: "-1" }      # 模型常驻, 免重复装载
+            - { name: OLLAMA_NUM_PARALLEL, value: "2" }     # CPU 推理, 并发保守
+            - { name: OLLAMA_KV_CACHE_TYPE, value: q8_0 }   # KV 量化省内存
+            - { name: OLLAMA_MAX_LOADED_MODELS, value: "1" }# 单机单模型, 防双开撑爆内存
+          ports:
+            - { containerPort: 11434 }
+          readinessProbe:
+            httpGet: { path: /api/tags, port: 11434 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "1", memory: 4Gi }
+            limits: { cpu: "8", memory: 20Gi } # gemma4-12b Q8 + KV@16K
+          volumeMounts:
+            - { name: ollama-store, mountPath: /var/ollama }
+      volumes:
+        - name: ollama-store
+          hostPath:
+            path: /var/ollama-weakmodel # kind 节点容器内路径 (docker cp 入口)
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-ollama
+  namespace: claude-go
+spec:
+  selector: { app: claude-go-ollama }
+  ports:
+    - { port: 11434, targetPort: 11434 }

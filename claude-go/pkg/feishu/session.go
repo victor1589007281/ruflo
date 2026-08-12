@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"context"
+	"os"
 	"fmt"
 	"log"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/statestore"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
+	"github.com/anthropic/claude-go/pkg/weakmodel"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -723,6 +725,9 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		// (design/01 §4.6)。行为与改造前逐项等价 —— 同样是那三个团队内部工具,
 		// 同样不设白名单。
 	}
+	// 方案三: 弱模型 harness 增强装配 (与 CLI 同规则——env 显式 > provider=="ollama" 自动)。
+	// kimi 等云端 provider 恒为关, 生产零变化; ollama 别名会话自动获得 L2/L3/L4/L6b/L8 护栏。
+	cfg.WeakModel = weakmodel.Resolve(sm.defaultResolved.Provider, os.Getenv)
 	// llm/hybrid 复杂度判定: 用主 apiClient 的 SimpleComplete + 分类器 system prompt。
 	// heuristic 模式零 LLM 开销, 不注入。
 	if sm.config.ComplexityMode == "llm" || sm.config.ComplexityMode == "hybrid" {
@@ -867,6 +872,9 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		Workflow:         runMeta.Workflow,
 		Role:             firstNonEmpty(opts.SubagentType, runMeta.Role),
 	}
+	// 方案三: 弱模型 harness 增强装配 (与 CLI 同规则——env 显式 > provider=="ollama" 自动)。
+	// kimi 等云端 provider 恒为关, 生产零变化; ollama 别名会话自动获得 L2/L3/L4/L6b/L8 护栏。
+	cfg.WeakModel = weakmodel.Resolve(sm.defaultResolved.Provider, os.Getenv)
 	applyConstraints(cfg, nestedConstraints)
 
 	nested := engine.NewQueryEngine(cfg, nestedAPIClient, nestedReg, hookRunner, permChecker, compactor, promptMgr)
@@ -1286,6 +1294,9 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		Workflow:         r.runMeta.Workflow,
 		Role:             firstNonEmpty(r.runMeta.Role, r.role),
 	}
+	// 方案三: 弱模型 harness 增强装配 (与 CLI 同规则——env 显式 > provider=="ollama" 自动)。
+	// kimi 等云端 provider 恒为关, 生产零变化; ollama 别名会话自动获得 L2/L3/L4/L6b/L8 护栏。
+	cfg.WeakModel = weakmodel.Resolve(r.sm.defaultResolved.Provider, os.Getenv)
 	// 同一个 ConstraintSet 既决定了工具档位 (上面 newProfileRegistry), 也在这里编译
 	// 成引擎的名单/权限档 —— 这就是 §4.6 的"单一真源": 档位决策与 toolExposed 读的
 	// 是同一份声明。当前团队角色约束只带档位、不带名单, 因此这一步对现有行为是

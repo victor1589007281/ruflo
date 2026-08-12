@@ -31,6 +31,10 @@ type EngineMetrics struct {
 	JSONRepairsApplied   atomic.Int64
 	JSONRepairsFailed    atomic.Int64
 
+	// Schema 校验修复环 (方案三 L2): Retried=回注重填次数, Blocked=触顶终止次数
+	SchemaValidationRetried atomic.Int64
+	SchemaValidationBlocked atomic.Int64
+
 	// Prompt Cache
 	CacheHits   atomic.Int64
 	CacheMisses atomic.Int64
@@ -246,6 +250,8 @@ func (m *EngineMetrics) Snapshot() map[string]any {
 		"progress_loops_detected":   m.ProgressLoopsDetected.Load(),
 		"json_repairs_applied":      m.JSONRepairsApplied.Load(),
 		"json_repairs_failed":       m.JSONRepairsFailed.Load(),
+		"schema_validation_retried": m.SchemaValidationRetried.Load(),
+		"schema_validation_blocked": m.SchemaValidationBlocked.Load(),
 		"cache_hits":                m.CacheHits.Load(),
 		"cache_misses":              m.CacheMisses.Load(),
 		"cache_hit_rate":            m.CacheHitRate(),
