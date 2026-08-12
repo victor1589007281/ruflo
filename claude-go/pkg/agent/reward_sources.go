@@ -174,6 +174,29 @@ func (ptm *ProductionTeamManager) recordSteerReward(team *ProductionTeam, runID,
 //
 // 返回错误而不是静默忽略: 评分是人主动给的, 拿不到 run 或团队不存在时必须让人知道
 // (静默丢弃人类反馈是最不该做的 fail-open)。
+// LastRunForChat 找某会话最近一个团队的已完成 run (steer 奖励挂点用)。
+// 没有则 ok=false——纯聊天会话不产生 steer 奖励, 这是刻意的: 没有运行上下文
+// 的打断不是"对某次运行的修正", 记了只会污染奖励流。
+func (ptm *ProductionTeamManager) LastRunForChat(chatID string) (teamName, runID string, ok bool) {
+	if ptm == nil {
+		return "", "", false
+	}
+	ptm.mu.RLock()
+	defer ptm.mu.RUnlock()
+	for _, t := range ptm.teams {
+		if t.ChatID != chatID {
+			continue
+		}
+		t.mu.Lock()
+		rid := t.LastRunID
+		t.mu.Unlock()
+		if rid != "" {
+			return t.Name, rid, true
+		}
+	}
+	return "", "", false
+}
+
 func (ptm *ProductionTeamManager) RateTeam(name string, stars int, comment string) error {
 	if ptm == nil {
 		return fmt.Errorf("团队管理器未初始化")

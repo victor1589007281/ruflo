@@ -36,6 +36,7 @@
 package memory
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"math"
@@ -58,6 +59,8 @@ type MemoryEntry struct {
 	CreatedAt   time.Time `json:"createdAt"`
 	LastAccess  time.Time `json:"lastAccess"`
 	ChatID      string    `json:"chatId,omitempty"`
+	// Embedding 可选向量 (embed.go 可选后端写入; 为空时检索退化为纯 BM25)。
+	Embedding []float32 `json:"embedding,omitempty"`
 }
 
 // Retention 计算当前保留度 (Ebbinghaus 遗忘曲线 + 间隔重复)
@@ -98,6 +101,8 @@ func (e *MemoryEntry) snapshot() MemoryEntry {
 type TieredStore struct {
 	mu       sync.RWMutex
 	episodic map[string]*MemoryEntry // id → entry
+	// embedder 可选向量化后端 (默认 nil = 纯 BM25, 手册 7.0.6 缺口的可选修复)。
+	embedder Embedder
 	idSeq    int
 	// ForgetThreshold 低于此保留度的记忆将被标记为可清理
 	ForgetThreshold float64
@@ -216,7 +221,18 @@ func (s *TieredStore) PersistToDisk() {
 }
 
 // Add 添加一条记忆
+// SetEmbedder 装配可选向量化后端 (nil 即纯 BM25)。在首批 Add 前调用。
+func (s *TieredStore) SetEmbedder(e Embedder) { s.embedder = e }
+
 func (s *TieredStore) Add(entry *MemoryEntry) {
+	// 向量化在锁外 best-effort (10s 级网络调用不能持锁): 失败静默, 记忆照常落盘。
+	if s.embedder != nil && entry != nil && len(entry.Embedding) == 0 && strings.TrimSpace(entry.Content) != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		if vec, err := s.embedder.Embed(ctx, entry.Content); err == nil {
+			entry.Embedding = vec
+		}
+		cancel()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry.ID == "" {
@@ -360,6 +376,34 @@ func (s *TieredStore) Retrieve(query string, topK int) []*MemoryEntry {
 		candidates = append(candidates, scored{doc.entry, score})
 	}
 	s.mu.RUnlock()
+
+	// 可选向量化混合 (手册 7.0.6): embedder 装配且查询向量化成功时,
+	// final = 0.6×BM25(归一) + 0.4×cosine; 任何一步失败都静默退回纯 BM25。
+	if s.embedder != nil && len(candidates) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		qv, err := s.embedder.Embed(ctx, query)
+		cancel()
+		if err == nil {
+			maxBM := 0.0
+			for _, c := range candidates {
+				if c.score > maxBM {
+					maxBM = c.score
+				}
+			}
+			if maxBM > 0 {
+				for i, c := range candidates {
+					cos := 0.0
+					if len(c.entry.Embedding) > 0 {
+						cos = Cosine(qv, c.entry.Embedding)
+						if cos < 0 {
+							cos = 0
+						}
+					}
+					candidates[i].score = 0.6*(c.score/maxBM) + 0.4*cos
+				}
+			}
+		}
+	}
 
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].score > candidates[j].score

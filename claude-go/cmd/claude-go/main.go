@@ -63,7 +63,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/session"
 	"github.com/anthropic/claude-go/pkg/settings"
 	"github.com/anthropic/claude-go/pkg/skills"
-	"github.com/anthropic/claude-go/pkg/statestore"
+	storedual "github.com/anthropic/claude-go/pkg/statestore/dual"
 	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/synctask"
 	"github.com/anthropic/claude-go/pkg/tool"
@@ -824,6 +824,15 @@ func runCmd() *cobra.Command {
 					evoDir = tasksLayout.Evolution
 				}
 				evoEngine := agent.NewEvolutionEngine(evoDir, eng.APIClient)
+				// 第七章缺口修复: Evolution→Memory 交叉学习接线——MemoryIngestFn
+				// 此前全仓零赋值点 (声明 evolution.go:143, 消费 :568), 高质量团队经验
+				// (质量≥0.6 且 5 分钟内新提炼) 注入 L1 情景记忆供后续会话检索。
+				if eng.MemoryStore != nil {
+					ms := eng.MemoryStore
+					evoEngine.MemoryIngestFn = func(content, source string, topics []string) {
+						ms.Add(&memory.MemoryEntry{Content: content, Source: source, Topics: topics, Importance: 0.7})
+					}
+				}
 				// 统一学习循环 (design/03 §4.3): 此前 NewEvolutionLoop 全仓零生产调用方,
 				// submitLearn 永远走回落直调 —— 循环写完了但没通电。挂上它才有去重/预算闸/
 				// 空闲期深度整理, 也才有学习器 d/e 的运行相位。
@@ -934,6 +943,11 @@ func runCmd() *cobra.Command {
 			sessionID := ""
 			if store != nil {
 				sessionID = store.SessionID()
+			}
+			// 第七章缺口修复: CLI 单查询 Dreaming 触发 (此前仅团队收尾/飞书会话触发,
+			// 单查询路径零触发)。AfterQuery 自带全部门控 (enable/时间/会话数), 幂等安全。
+			if cliDreamer != nil {
+				cliDreamer.AfterQuery(ctx)
 			}
 			// 方案三 L7 蒸馏半环: 会话末把轨迹交独立档位反思器蒸馏经验卡。
 			// 默认关 (env CLAUDE_GO_WML_EXPERIENCE=1 开): 蒸馏是一次额外的强模型调用,
@@ -1419,7 +1433,7 @@ JSON 配置文件示例:
 				// 暴露任务队列 + worker 注册表, 供 worker 拉取执行。
 				if dispatchMode == "queue" {
 					stateDir := basedir.ResolveDefault(config.StateDir, config.Cwd)
-					ss := statestore.NewFileStore(filepath.Join(stateDir, "statestore"))
+					ss := storedual.OpenForStateDir(filepath.Join(stateDir, "statestore"), os.Getenv) // 双写: 文件+agentDB, 读源 CLAUDE_GO_STATESTORE_READ
 					clusterQueue := cluster.NewQueue(ss, 5*time.Minute)
 					clusterReg := cluster.NewRegistry(ss, 90*time.Second)
 					// Broker 把队列包成 AgentRuntime 的远程实现 (design/02 §3.3):
@@ -1452,7 +1466,7 @@ JSON 配置文件示例:
 				// Runner 此刻只能留空 (bot 尚未构造), NewBot 返回后经 SetRunner 注入;
 				// 在此之前若已有动作被消费, 任务会诚实地停在 pending 而不假装 running。
 				taskSvc = agent.NewFileQueueTaskService(agent.TaskServiceOptions{
-					Store:      statestore.NewFileStore(filepath.Join(stateDir, "statestore")),
+					Store:      storedual.OpenForStateDir(filepath.Join(stateDir, "statestore"), os.Getenv), // 双写: 文件+agentDB, 读源 CLAUDE_GO_STATESTORE_READ
 					ActionsDir: filepath.Join(stateDir, ".dashboard", "actions"),
 					ActionExecutor: agent.TeamActionExecutor(func(action, target string, payload map[string]any) error {
 						if botRef == nil {
@@ -1826,6 +1840,7 @@ func evoCmd() *cobra.Command {
 
 	// evo audit: 依据 rewards.jsonl 裁决 shadow 技能晋升/退役 (design/03 §4.3c)
 	var apply bool
+	var improveModel string
 	auditCmd := &cobra.Command{
 		Use:   "audit",
 		Short: "技能进化门禁: 依据奖励证据裁决 shadow 技能晋升/退役 (--apply 生效, 默认 dry-run)",
@@ -1849,10 +1864,35 @@ func evoCmd() *cobra.Command {
 					fmt.Printf("    · %s: %s\n", name, strings.Join(reasons, "; "))
 				}
 			}
+			// 第七章缺口修复: ImproveSkill 接线——审计判低 (退役/拒绝) 的技能
+			// 交 LLM 反思改写, 改进产物仍留 shadow 态 (preserveStatus 不越门禁)。
+			// 需 --apply 且 --improve-model 显式给出模型别名 (改进是 LLM 调用,
+			// 不能在 dry-run 或未知模型下静默发生)。
+			if apply && improveModel != "" {
+				targets := append(append([]string{}, res.Retired...), res.Rejected...)
+				if len(targets) > 0 {
+					if ac := buildImproveCreator(sd, improveModel); ac != nil {
+						for _, name := range targets {
+							reason := "审计裁决: " + name
+							if rs, ok := res.RejectReasons[name]; ok {
+								reason = strings.Join(rs, "; ")
+							}
+							if err := ac.ImproveSkill(cmd.Context(), name, reason, false); err != nil {
+								fmt.Printf("    改进失败 %s: %v\n", name, err)
+							} else {
+								fmt.Printf("    已触发改进 %s (仍留 shadow, 待复审)\n", name)
+							}
+						}
+					} else {
+						fmt.Println("  ⚠ 改进器构造失败 (模型别名/registry), 跳过 ImproveSkill")
+					}
+				}
+			}
 			return nil
 		},
 	}
 	auditCmd.Flags().BoolVar(&apply, "apply", false, "真正改写 SKILL.md 状态 (默认 dry-run)")
+	auditCmd.Flags().StringVar(&improveModel, "improve-model", "", "审计判低后触发 ImproveSkill 反思改写的模型别名 (如 ollama:gemma4:26b-a4b-it-qat)")
 
 	// evo promote/rollback: 手动改技能状态 (留痕)
 	promoteCmd := &cobra.Command{
@@ -3250,7 +3290,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	skillReg.LoadDefaults(cwd)
 	if skillReg.Count() > 0 {
 		// 0 = 不设软上限, 由描述字符预算约束; 所有技能名称始终可见, 保证 Skill 工具可被正确调用。
-		promptMgr.SkillListing = skillReg.FormatShortListing(0)
+		promptMgr.SkillListing = skillReg.FormatShortListingForDir(0, cwd) // paths 命中的技能才进清单 (第七章缺口修复)
 	}
 
 	effectiveMaxTokens := flagMaxTokens
@@ -3474,6 +3514,12 @@ func buildEngine() (*engine.QueryEngine, error) {
 
 	// L1: TieredStore (情景记忆)
 	tieredStore := memory.NewTieredStoreWithPersist(memDir)
+	// 第七章缺口修复: 记忆检索向量化可选后端 (默认关=纯 BM25 现状;
+	// CLAUDE_GO_MEMORY_EMBEDDER=ollama:bge-m3 开启 BM25+余弦混合检索)。
+	if emb := memory.EmbedderFromEnv(os.Getenv); emb != nil {
+		tieredStore.SetEmbedder(emb)
+		log.Printf("[memory] 向量化混合检索已启用 (embedder=%s)", os.Getenv("CLAUDE_GO_MEMORY_EMBEDDER"))
+	}
 	eng.MemoryStore = tieredStore
 
 	// L2: FactStore (结构化记忆)
@@ -3510,7 +3556,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	// TraceStore 轨迹底座 (design/03 §4.1 E1): 落 <state>/statestore/, 采集 turn/tool_call Span。
 	// 采样率由 CLAUDE_GO_TRACE_SAMPLE 控制 (默认全采); TTL 由 CLAUDE_GO_TRACE_TTL
 	// 控制 (默认不清理, 保持既有语义)。此前两者都是"有能力无调用方"。
-	ss := statestore.NewFileStore(filepath.Join(stateDir, "statestore"))
+	ss := storedual.OpenForStateDir(filepath.Join(stateDir, "statestore"), os.Getenv) // 双写: 文件+agentDB, 读源 CLAUDE_GO_STATESTORE_READ
 	ts := tracestore.New(ss)
 	eng.TraceStore = ts
 	// 图外派生 (Agent 工具 → runNestedAgent 的裸 QueryEngine) 的可见性两件套

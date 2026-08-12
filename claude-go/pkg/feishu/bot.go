@@ -43,6 +43,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/statestore"
+	storedual "github.com/anthropic/claude-go/pkg/statestore/dual"
 	swarm_intel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	claudesync "github.com/anthropic/claude-go/pkg/sync"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
@@ -362,7 +363,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 是 per-instance 而不是 per-path, 同一 root 建两个实例等于没有互斥;
 	// KV 又是"读整桶 → 改一个 key → 整文件原子写", 交错写必然丢更新。
 	// 使用方: TraceStore 轨迹底座 + 飞书会话历史快照 (经 WithStateStore 注入)。
-	stateStore := statestore.NewFileStore(filepath.Join(layout.Root, "statestore"))
+	stateStore := storedual.OpenForStateDir(filepath.Join(layout.Root, "statestore"), os.Getenv) // 双写: 文件+agentDB
 
 	// 轨迹 TTL 清理 (design/03 §4.1): SweepTraceFiles 此前全仓零调用方, 等于没有
 	// TTL——常驻进程尤其需要它, 否则 statestore/log 与 blob 只增不减。
@@ -447,6 +448,13 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 经 L1 网关注入 (design/02 §3.1 / §6「SimpleComplete 消费方全部改经 LLMGateway」):
 	// EvolutionEngine 的 LLM 端口只有 SimpleComplete。
 	bot.evolution = agent.NewEvolutionEngine(layout.Evolution, llmgw.SimpleClient{GW: bot.llmGW})
+	// 第七章缺口修复: Evolution→Memory 交叉学习接线 (MemoryIngestFn 此前零赋值点)。
+	if bot.memStore != nil {
+		ms := bot.memStore
+		bot.evolution.MemoryIngestFn = func(content, source string, topics []string) {
+			ms.Add(&memory.MemoryEntry{Content: content, Source: source, Topics: topics, Importance: 0.7})
+		}
+	}
 	roleReg := agent.NewRoleRegistry(config.Cwd)
 
 	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles + 唯一 StateStore)
@@ -2675,6 +2683,25 @@ func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text str
 			return
 		}
 		b.sendTextReply(ctx, messageID, fmt.Sprintf("🚀 团队 **%s** 已启动, 后台执行中...\n发送 `/team status %s` 查看进度", name, name))
+
+	case "rate":
+		// 第七章缺口修复: 飞书侧 user.explicit 显式评分入口 (最高可信度奖励源)。
+		// 与 CLI /team rate 同一 RateTeam 路径 (reward_sources.go)。
+		if len(parts) < 4 {
+			b.sendTextReply(ctx, messageID, "用法: /team rate <名称> <1-5> [评语]\n1★=很差 3★=平庸 5★=很好; 给最近一次运行打分, 进入奖励总线")
+			return
+		}
+		stars, convErr := strconv.Atoi(parts[3])
+		if convErr != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("评分需为 1-5 的整数, 收到 %q", parts[3]))
+			return
+		}
+		comment := strings.Join(parts[4:], " ")
+		if err := b.teamMgr.RateTeam(parts[2], stars, comment); err != nil {
+			b.sendTextReply(ctx, messageID, fmt.Sprintf("评分失败: %v", err))
+			return
+		}
+		b.sendTextReply(ctx, messageID, fmt.Sprintf("⭐ 已记录对团队 **%s** 的 %d 星评分 (user.explicit 入奖励总线)", parts[2], stars))
 
 	case "resume":
 		if len(parts) < 3 {

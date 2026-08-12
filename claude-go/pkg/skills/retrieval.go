@@ -1,3 +1,9 @@
+// Package skills — retrieval.go 孤儿代码裁定 (2026-08-13, 手册 7.0.6)。
+//
+// Deprecated: SkillLibrary/SkillTemplate 源自一次性大批次提交 (a283dede7),
+// 全仓零生产调用点、无文档、无加载器 (runtime/go 模板库同)。技能检索的现行
+// 路径是 Registry.Get/Active + FormatShortListing(ForDir) —— 本文件保留仅为
+// 考古参考, 新代码请勿使用; 待下一轮清理批次删除。
 package skills
 
 import (

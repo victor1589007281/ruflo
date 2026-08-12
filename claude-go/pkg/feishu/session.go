@@ -407,11 +407,17 @@ func (sm *SessionManager) newProfileRegistry(profile builtin.ToolProfile, opts r
 }
 
 func shortSkillListing(reg *skills.Registry) string {
+	return shortSkillListingInDir(reg, "")
+}
+
+// shortSkillListingInDir 带工作目录的变体: paths 声明命中的技能才进清单
+// (第七章缺口修复: SKILL.md paths 从死字段变为运行期可见性条件)。
+func shortSkillListingInDir(reg *skills.Registry, dir string) string {
 	if reg == nil || reg.Count() == 0 {
 		return ""
 	}
 	// 0 = 不设软上限, 由描述字符预算约束; 所有技能名称始终可见 (可发现性)。
-	return reg.FormatShortListing(0)
+	return reg.FormatShortListingForDir(0, dir)
 }
 
 func (sm *SessionManager) configureSessionTools(session *Session, profile builtin.ToolProfile) {
@@ -675,7 +681,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		promptMgr.CustomPrompt = sm.config.SystemPrompt
 	}
 	promptMgr.Model = sm.apiClient.Model
-	promptMgr.SkillListing = shortSkillListing(sm.skillReg)
+	promptMgr.SkillListing = shortSkillListingInDir(sm.skillReg, sm.config.Cwd)
 	promptMgr.ProductName = "Claude Code (Go) - Feishu Bot"
 	promptMgr.HookConfigs = sm.hookConfigs
 	if sm.dreamer != nil {
@@ -836,7 +842,7 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 	compactor := compact.NewCompactor(nestedAPIClient, contextWindow)
 	promptMgr := prompt.NewManager(sm.config.Cwd)
 	promptMgr.Model = nestedModel
-	promptMgr.SkillListing = shortSkillListing(sm.skillReg)
+	promptMgr.SkillListing = shortSkillListingInDir(sm.skillReg, sm.config.Cwd)
 
 	model := nestedModel
 	if opts.Model != "" {
@@ -1044,6 +1050,20 @@ func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, us
 		session.SetProcessing(false)
 		// 自动消费队列中的下一条消息
 		if pendingText, pendingReply := session.DequeuePending(); pendingText != nil && pendingReply != nil {
+			// 第七章缺口修复: user.steer 奖励源——用户在处理中追加消息 = 对上一轮
+			// 产出的实时修正信号 (设计值 -0.5)。只在该会话确有团队 run 时记录,
+			// 纯聊天打断不记 (无上下文的打断不是奖励证据)。
+			if sm.evolution != nil && sm.teamMgr != nil {
+				if teamName, runID, ok := sm.teamMgr.LastRunForChat(chatID); ok {
+					sm.evolution.RecordReward(agent.RewardEvent{
+						RunID:  runID,
+						Source: agent.RewardSourceUserSteer,
+						Value:  -0.5,
+						Raw:    map[string]any{"steer_text": *pendingText, "via": "pending_consume"},
+						Team:   teamName,
+					})
+				}
+			}
 			go func() {
 				resp, err := sm.processMessageInternal(context.Background(), chatID, *pendingText)
 				if err != nil {
@@ -1248,7 +1268,7 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	compactor := compact.NewCompactor(apiClient, contextWindow)
 	promptMgr := prompt.NewManager(r.sm.config.Cwd)
 	promptMgr.Model = modelOverride
-	promptMgr.SkillListing = shortSkillListing(r.sm.skillReg)
+	promptMgr.SkillListing = shortSkillListingInDir(r.sm.skillReg, r.sm.config.Cwd)
 
 	// 角色提示词: 优先使用外部传入的, 再尝试从 RoleRegistry 获取 (含专属 Skills)
 	effectivePrompt := r.systemPrompt

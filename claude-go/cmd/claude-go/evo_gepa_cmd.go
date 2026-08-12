@@ -12,9 +12,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/skills"
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
@@ -431,4 +434,17 @@ func evoGepaLoopCmd(resolveSD func() string) *cobra.Command {
 	_ = c.MarkFlagRequired("tasks")
 	_ = c.MarkFlagRequired("model")
 	return c
+}
+
+// buildImproveCreator 为 evo audit 的 ImproveSkill 接线构造 AutoCreator
+// (LLM + 真实 Registry——ImproveSkill 对两者缺一静默 nil, 这里必须都给)。
+func buildImproveCreator(stateDir, modelAlias string) *skills.AutoCreator {
+	client, err := buildClientFromAlias(modelAlias)
+	if err != nil || client == nil {
+		return nil
+	}
+	reg := skills.NewRegistry()
+	cwd, _ := os.Getwd()
+	reg.LoadDefaults(cwd)
+	return skills.NewAutoCreator(filepath.Join(stateDir, "skills"), client, client.Model, reg)
 }

@@ -1019,6 +1019,16 @@ func (r *stageNodeRunner) runGate(ctx context.Context, node graph.NodeSpec, in g
 			}
 		}
 		out := fmt.Sprintf(`{"gate":"deterministic","score":%.0f}`, score)
+		// 第七章缺口修复: 确定性门禁此前只写 gate Span 不发奖励——编译/测试类
+		// 确定性结果是最高保真的奖励源, 不进 rewards.jsonl 等于白跑。
+		if r.we != nil && r.we.evolution != nil {
+			r.we.evolution.RecordReward(RewardEvent{
+				RunID:  trace.From(ctx).RunID,
+				NodeID: node.ID,
+				Source: "gate.deterministic",
+				Value:  score/50.0 - 1.0,
+			})
+		}
 		r.writeGateSpan(ctx, node, in, "deterministic", score, score >= 75, deliverable, out, gateStart)
 		return graph.NodeResult{
 			Status: graph.NodeStatusCompleted,

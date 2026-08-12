@@ -103,6 +103,9 @@ type Registry struct {
 	mu     sync.RWMutex
 	skills map[string]*Skill // name → skill
 	dirs   []scanDir         // 已扫描的目录
+	// pathsCache paths 可见性缓存 (dir|skill → 是否命中), Register/Reload 时清空。
+	// 清单注入每轮都可能调, 不能每次全目录 walk。
+	pathsCache map[string]bool
 }
 
 type scanDir struct {
@@ -198,6 +201,7 @@ func defaultSkillDirs(cwd string) []scanDir {
 func (r *Registry) Register(skill *Skill) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.pathsCache = nil // 技能集合变了, paths 可见性缓存失效
 	r.skills[skill.Name] = skill
 }
 
@@ -294,6 +298,7 @@ func (r *Registry) Count() int {
 
 // Reload 重新加载所有已知目录的技能
 func (r *Registry) Reload() int {
+	defer func() { r.mu.Lock(); r.pathsCache = nil; r.mu.Unlock() }()
 	r.mu.Lock()
 	dirs := make([]scanDir, len(r.dirs))
 	copy(dirs, r.dirs)
@@ -437,15 +442,28 @@ func ParseSkillContent(content string, sourcePath string, source string) (*Skill
 
 // parseFrontmatter 简单的 YAML frontmatter 解析器
 func parseFrontmatter(fm string, skill *Skill) {
+	inPaths := false // paths 字段的 YAML 列表延续行状态
 	for _, line := range strings.Split(fm, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// paths 的多行列表形态:
+		//   paths:
+		//     - "**/*.go"
+		//     - "cmd/**"
+		if inPaths && strings.HasPrefix(line, "-") {
+			item := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "-")), `"'`)
+			if item != "" {
+				skill.Paths = append(skill.Paths, item)
+			}
 			continue
 		}
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
 			continue
 		}
+		inPaths = false // 新 key 行结束列表延续
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 		val = strings.Trim(val, `"'`)
@@ -475,6 +493,16 @@ func parseFrontmatter(fm string, skill *Skill) {
 			// 只由 engine.Config.toolExposed 一处裁决, 本字段不参与 ⇒ 解析它不改变
 			// 任何既有执行行为, 只是让治理层看得见声明。
 			skill.AllowedTools = parseToolList(val)
+		case "paths":
+			// 行内形态 paths: ["**/*.go", "cmd/**"] (复用工具清单解析);
+			// 多行 YAML 列表形态由上面的 inPaths 延续行处理 (val 为空时开启)。
+			// paths 语义: 声明本技能适用的文件 glob——只在目录里存在命中文件时
+			// 才进注入清单 (见 VisibleInDir)。此前字段存在但零解析零消费, 死字段。
+			if val != "" {
+				skill.Paths = parseToolList(val)
+			} else {
+				inPaths = true
+			}
 		}
 	}
 }

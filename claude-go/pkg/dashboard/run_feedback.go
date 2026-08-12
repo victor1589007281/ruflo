@@ -107,10 +107,20 @@ func (s *Server) handleRunFeedback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("请求体不是合法 JSON: %w", err))
 		return
 	}
-	if src := strings.TrimSpace(req.Source); src != "" && src != agent.RewardSourceGateE2E {
+	// 第七章缺口修复: 白名单从单一 gate.e2e 放宽到三类可信源——
+	// 下游平台验收回传 (downstream.feedback, 设计源终落地) 与人工显式反馈
+	// (user.explicit)。其余源一律拒绝 (design/03 §4.6 防 reward hacking 纪律不变:
+	// 不是任何客户端都能自报任意源)。
+	src := strings.TrimSpace(req.Source)
+	switch src {
+	case "", agent.RewardSourceGateE2E:
+		src = agent.RewardSourceGateE2E
+	case agent.RewardSourceUserExplicit, "downstream.feedback":
+		// 放行 (白名单内)
+	default:
 		writeError(w, http.StatusBadRequest, fmt.Errorf(
-			"source 是锁定字段: 本端点只接受 %q, 收到 %q (design/03 §4.6 防 reward hacking)",
-			agent.RewardSourceGateE2E, src))
+			"source 白名单外: 只接受 %q / %q / %q, 收到 %q (design/03 §4.6 防 reward hacking)",
+			agent.RewardSourceGateE2E, agent.RewardSourceUserExplicit, "downstream.feedback", src))
 		return
 	}
 
@@ -140,7 +150,7 @@ func (s *Server) handleRunFeedback(w http.ResponseWriter, r *http.Request) {
 	ee.RecordReward(agent.RewardEvent{
 		RunID:  runID,
 		NodeID: strings.TrimSpace(req.Node),
-		Source: agent.RewardSourceGateE2E,
+		Source: src,
 		Value:  value,
 		Raw:    raw,
 		Team:   team,
