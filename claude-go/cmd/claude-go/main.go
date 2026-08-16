@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1504,6 +1505,18 @@ JSON 配置文件示例:
 								return cs
 							}
 							return nil
+						})
+						// 可用模型别名清单 (providers 注册的 alias), 供 /api/models →
+						// webapp cron 面板的任务模型下拉。配置进程内本就持有, 只做只读枚举。
+						dsrv.SetModelLister(func() []string {
+							aliases := make([]string, 0, 16)
+							for _, p := range config.Providers {
+								for alias := range p.Models {
+									aliases = append(aliases, alias)
+								}
+							}
+							sort.Strings(aliases)
+							return aliases
 						})
 						fmt.Printf("[Dashboard] 已挂载到 wiki API 端口 %d (stateDir=%s)\n",
 							config.Wiki.APIPort, stateDir)

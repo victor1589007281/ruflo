@@ -35,6 +35,8 @@ type CronController interface {
 	UpdateJob(id string, patch *agent.CronJob) error
 	GetJob(id string) *agent.CronJob
 	ListJobs() []*agent.CronJob
+	// TriggerJob 立即执行一次任务 (手动触发; 不动调度计划)。
+	TriggerJob(id string) error
 }
 
 //go:embed web/*
@@ -74,6 +76,7 @@ type Server struct {
 	jobs     *diagJobStore         // 异步 LLM 诊断作业
 	scraper  *metrics.JSONLScraper // JSONL → Prometheus 采集器 (MySQL Exporter 模式)
 	cronCtl  func() CronController // 定时任务写控制器【解析器】(仅 :18080 飞书进程注入; nil/返回nil 时写接口 501)
+	modelLister func() []string    // 可用模型别名【解析器】(SetModelLister 注入; nil 时 /api/models 501)
 }
 
 // SetCronController 注入活动定时任务调度器的【解析器】, 启用 /api/cron 写接口 (创建/更新/启停/删除)。
@@ -81,6 +84,11 @@ type Server struct {
 // botRef 尚为 nil(botRef 在 NewBot 返回后才赋值), 必须请求期再解析 —— 与 TeamAction/
 // LLMComplete 等同进程回调同一惰性模式。解析器返回 nil 时写接口 501。
 func (s *Server) SetCronController(fn func() CronController) { s.cronCtl = fn }
+
+// SetModelLister 注入可用模型别名的【解析器】 (providers 注册的 alias 清单),
+// 启用 GET /api/models —— webapp 的 cron 任务模型下拉等"可选模型"消费方从这里取数。
+// 同一惰性解析模式: 主进程配置在挂载时就绪, 但保持解析器形态与 SetCronController 一致。
+func (s *Server) SetModelLister(fn func() []string) { s.modelLister = fn }
 
 // resolveCron 请求期解析活动调度器; 未注入或主进程未就绪时返回 nil (写接口据此 501)。
 func (s *Server) resolveCron() CronController {
@@ -234,7 +242,8 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/metrics/", s.handleMetricsModule)
 	mux.HandleFunc("/api/cron", s.handleCron)      // GET 列表 / POST 创建
-	mux.HandleFunc("/api/cron/", s.handleCronItem) // /api/cron/{id}: PATCH 更新/启停 · DELETE 删除
+	mux.HandleFunc("/api/cron/", s.handleCronItem) // /api/cron/{id}: PATCH 更新/启停 · DELETE 删除; /api/cron/{id}/trigger: POST 立即触发
+	mux.HandleFunc("/api/models", s.handleModels)  // GET 可用模型别名 (SetModelLister 注入)
 	mux.HandleFunc("/api/dreaming", s.handleDreaming)
 	mux.HandleFunc("/api/evolution", s.handleEvolution)
 	mux.HandleFunc("/api/tasks", s.handleTasks)
@@ -858,8 +867,25 @@ func (s *Server) handleCron(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleModels 处理 GET /api/models: 返回 providers 注册的可用模型别名清单。
+// 消费方: webapp cron 面板的任务模型下拉等。未注入解析器时 501。
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("不支持的方法 %s", r.Method))
+		return
+	}
+	if s.modelLister == nil {
+		writeError(w, http.StatusNotImplemented, fmt.Errorf("此实例未注入模型清单解析器"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"models": s.modelLister()})
+}
+
 // handleCronItem 处理 /api/cron/{id}: PATCH/PUT 更新或启停, DELETE 删除。
 // 仅在注入了活动调度器的实例 (:18080) 上可用; 否则返回 501。
+// 另: POST /api/cron/{id}/trigger 立即触发一次 (经 CronScheduler.TriggerJob 真实执行,
+// 取代此前全仓无消费方的 "cron.trigger" 动作队列假承诺)。
 func (s *Server) handleCronItem(w http.ResponseWriter, r *http.Request) {
 	ctl := s.resolveCron()
 	if ctl == nil {
@@ -867,6 +893,27 @@ func (s *Server) handleCronItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/cron/")
+
+	// POST /api/cron/{id}/trigger: 立即触发一次 (真实执行, 非动作队列)。
+	if strings.HasSuffix(id, "/trigger") {
+		jobID := strings.TrimSuffix(id, "/trigger")
+		if jobID == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("缺少任务 id"))
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("不支持的方法 %s", r.Method))
+			return
+		}
+		if err := ctl.TriggerJob(jobID); err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "id": jobID, "triggered": true})
+		return
+	}
+
 	if id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("缺少或非法的任务 id"))
 		return
@@ -881,13 +928,14 @@ func (s *Server) handleCronItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "id": id})
 	case http.MethodPatch, http.MethodPut:
 		var body struct {
-			Name     string `json:"name"`
-			Schedule string `json:"schedule"`
-			JobType  string `json:"jobType"`
-			Payload  string `json:"payload"`
-			Workflow string `json:"workflow"`
-			ChatID   string `json:"chatId"`
-			Enabled  *bool  `json:"enabled"` // 指针: 仅在请求显式提供时才启停
+			Name     string  `json:"name"`
+			Schedule string  `json:"schedule"`
+			JobType  string  `json:"jobType"`
+			Payload  string  `json:"payload"`
+			Workflow string  `json:"workflow"`
+			ChatID   string  `json:"chatId"`
+			Model    *string `json:"model"`   // 指针: 显式提供才更新; 空串 = 清除回默认
+			Enabled  *bool   `json:"enabled"` // 指针: 仅在请求显式提供时才启停
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("请求体解析失败: %w", err))
@@ -906,11 +954,18 @@ func (s *Server) handleCronItem(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// 字段更新 (任一非空字段)
-		if body.Name != "" || body.Schedule != "" || body.JobType != "" || body.Payload != "" || body.Workflow != "" || body.ChatID != "" {
+		// 字段更新 (任一非空字段, 或显式提供的 model)
+		if body.Name != "" || body.Schedule != "" || body.JobType != "" || body.Payload != "" || body.Workflow != "" || body.ChatID != "" || body.Model != nil {
 			patch := &agent.CronJob{
 				Name: body.Name, Schedule: body.Schedule, JobType: body.JobType,
 				Payload: body.Payload, Workflow: body.Workflow, ChatID: body.ChatID,
+			}
+			if body.Model != nil {
+				m := strings.TrimSpace(*body.Model)
+				if m == "" {
+					m = "-" // 显式空串 → 清除哨兵 (UpdateJob: 空 = 不动, "-" = 清除)
+				}
+				patch.Model = m
 			}
 			if err := ctl.UpdateJob(id, patch); err != nil {
 				writeError(w, http.StatusBadRequest, err)

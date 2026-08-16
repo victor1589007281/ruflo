@@ -1,0 +1,286 @@
+# claude-go 分布式部署 —— hakit agents ns (2026-08-16)。
+# 拓扑 (deploy/k8s/distributed.yaml 的 hakit 适配版):
+#   gateway (llm-gateway :18081) → control (serve 队列编排 :18080) → worker×2 (真执行体)
+#   dashboard (:7777 只读面板) + codeintel-mcp (:29234) + agentdb (:9090, 单独清单)
+# 适配点:
+#   - 镜像 claude-go:agents3-* (ruflo 仓最新编译, 含方案三 + 双写)
+#   - 状态/工作区全部落宿主 /mnt/data (bindmnt 注入节点的 hostPath)
+#   - control+worker: statestore dual 双写 (文件 + agentdb), 读 fallback (agentdb 优先)
+#   - 状态卷纪律保留: 每组件独立 state (FileStore 无跨进程锁), 共享的只有 /workspace
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-gateway
+  namespace: agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: claude-go-gateway }
+  template:
+    metadata:
+      labels: { app: claude-go-gateway }
+    spec:
+      securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      containers:
+        - name: gateway
+          image: claude-go:agents5-1786878655
+          imagePullPolicy: Never
+          args: ["llm-gateway", "--addr", "0.0.0.0:18081", "--config", "/etc/claude-go/config.json"]
+          env:
+            - { name: HOME, value: "/tmp" }
+          ports: [{ containerPort: 18081 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 18081 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - { name: config, mountPath: /etc/claude-go }
+      volumes:
+        - name: config
+          configMap: { name: agents-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-gateway
+  namespace: agents
+spec:
+  selector: { app: claude-go-gateway }
+  ports: [{ port: 18081, targetPort: 18081 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-control
+  namespace: agents
+spec:
+  replicas: 1
+  strategy: { type: Recreate } # hostPath 单点
+  selector:
+    matchLabels: { app: claude-go-control }
+  template:
+    metadata:
+      labels: { app: claude-go-control }
+    spec:
+      securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      containers:
+        - name: control
+          image: claude-go:agents5-1786878655
+          imagePullPolicy: Never
+          args:
+            - "serve"
+            - "--addr"
+            - "0.0.0.0:18080"
+            - "--config"
+            - "/etc/claude-go/config.json"
+            - "--dispatch-mode"
+            - "queue"
+            - "--cwd"
+            - "/workspace"
+            - "--workspace-mode"
+            - "pvc"
+            - "--workspace-volume"
+            - "claude-go-teams"
+          env:
+            - name: CLAUDE_GO_LLM_GATEWAY
+              value: "http://claude-go-gateway:18081"
+            - { name: CLAUDE_GO_STATESTORE_BACKEND, value: "dual" }
+            - { name: CLAUDE_GO_STATESTORE_READ, value: "fallback" }
+            - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
+            - { name: HOME, value: "/tmp" }
+          ports: [{ containerPort: 18080 }]
+          readinessProbe:
+            httpGet: { path: /api/health, port: 18080 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: state, mountPath: /mnt/data/claude-go }
+            - { name: config, mountPath: /etc/claude-go }
+            - { name: teams, mountPath: /workspace }
+            - { name: knowledge, mountPath: /home/victor/base/git/gitee/knowledge }
+            - { name: ima-skill, mountPath: /home/victor/.claude/skills/ima-skill, readOnly: true }
+      volumes:
+        - name: state
+          hostPath:
+            path: /mnt/data/claude-go
+            type: Directory
+        - name: config
+          configMap: { name: agents-config }
+        - name: teams
+          hostPath:
+            path: /mnt/data/claude-go/workspace
+            type: DirectoryOrCreate
+        - name: knowledge
+          hostPath:
+            path: /home/victor/base/git/gitee/knowledge
+            type: Directory
+        - name: ima-skill
+          hostPath:
+            path: /home/victor/.claude/skills/ima-skill
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-control
+  namespace: agents
+spec:
+  selector: { app: claude-go-control }
+  ports:
+    - { name: http, port: 18080, targetPort: 18080, nodePort: 31080 }
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-dashboard
+  namespace: agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: claude-go-dashboard }
+  template:
+    metadata:
+      labels: { app: claude-go-dashboard }
+    spec:
+      securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      containers:
+        - name: dashboard
+          image: claude-go:agents5-1786878655
+          imagePullPolicy: Never
+          args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open", "--config", "/etc/claude-go/config.json"]
+          env:
+            - name: CLAUDE_GO_BOT_API_URL
+              value: "http://claude-go-control:18080"
+            - { name: HOME, value: "/tmp" }
+          ports: [{ containerPort: 7777 }]
+          readinessProbe:
+            httpGet: { path: /api/health, port: 7777 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: config, mountPath: /etc/claude-go }
+      volumes:
+        # 只读面板与控制面不共享状态卷 (经 HTTP 读控制面)
+        - name: state
+          emptyDir: {}
+        - name: config
+          configMap: { name: agents-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-dashboard
+  namespace: agents
+spec:
+  selector: { app: claude-go-dashboard }
+  ports:
+    - { name: http, port: 7777, targetPort: 7777, nodePort: 31777 }
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-worker
+  namespace: agents
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: claude-go-worker }
+  template:
+    metadata:
+      labels: { app: claude-go-worker }
+    spec:
+      securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      containers:
+        - name: worker
+          image: claude-go:agents5-1786878655
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/claude-go-worker"]
+          args:
+            - "--control"
+            - "http://claude-go-control:18080"
+            - "--config"
+            - "/etc/claude-go/config.json"
+            - "--cwd"
+            - "/workspace"
+            - "--workspace"
+            - "/workspace"
+            - "--workspace-mode"
+            - "pvc"
+            - "--workspace-volume"
+            - "claude-go-teams"
+          env:
+            - name: CLAUDE_GO_LLM_GATEWAY
+              value: "http://claude-go-gateway:18081"
+            - { name: CLAUDE_GO_STATESTORE_BACKEND, value: "dual" }
+            - { name: CLAUDE_GO_STATESTORE_READ, value: "fallback" }
+            - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            # 状态目录每 worker 独立 (FileStore 无跨进程锁); 文件侧空即失,
+            # 持久面由 agentdb 侧承担 (dual 双写)。
+            - name: CLAUDE_GO_STATE_DIR
+              value: "/data/.claude-go"
+            - { name: HOME, value: "/tmp" }
+          volumeMounts:
+            - { name: config, mountPath: /etc/claude-go }
+            - { name: state, mountPath: /data }
+            - { name: teams, mountPath: /workspace }
+      volumes:
+        - name: config
+          configMap: { name: agents-config-worker }
+        - name: state
+          emptyDir: {}
+        - name: teams
+          hostPath:
+            path: /mnt/data/claude-go/workspace
+            type: DirectoryOrCreate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-go-mcp
+  namespace: agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: claude-go-mcp }
+  template:
+    metadata:
+      labels: { app: claude-go-mcp }
+    spec:
+      securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      containers:
+        - name: mcp
+          image: claude-go:agents5-1786878655
+          imagePullPolicy: Never
+          args: ["codeintel-mcp-server", "--transport", "http", "--addr", "0.0.0.0:29234", "--config", "/etc/claude-go/config.json"]
+          env:
+            - { name: HOME, value: "/tmp" }
+          ports: [{ containerPort: 29234 }]
+          resources:
+            limits: { cpu: "4", memory: 8Gi }
+            requests: { cpu: "500m", memory: 1Gi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/claude-go }
+            - { mountPath: /mnt/data/claude-go, name: cgdata }
+      volumes:
+        - name: config
+          configMap: { name: agents-config }
+        - name: cgdata
+          hostPath:
+            path: /mnt/data/claude-go
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-go-mcp
+  namespace: agents
+spec:
+  selector: { app: claude-go-mcp }
+  ports:
+    - { name: http, port: 29234, targetPort: 29234, nodePort: 31234 }
+  type: NodePort

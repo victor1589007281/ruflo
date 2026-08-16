@@ -12,7 +12,7 @@ FROM debian:bookworm-slim
 # golang-go: 引擎级 AutoMode 让模型在容器内"写代码 → go test 验证"闭环;
 # 不装 go, 模型写完 .go 文件后无法自测 (实测 exit 127)。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git curl python3 golang-go \
+      ca-certificates git curl python3 golang-go nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # go test 需要可写缓存目录; stateDir 挂载的 /data 够用, 显式指到 /tmp 避免

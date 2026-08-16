@@ -655,6 +655,13 @@ func (sm *SessionManager) GetOrCreate(chatID string) *Session {
 //  2. 从共享的 MCP 连接中获取工具列表 (RegisterMCPTools)
 //  3. 注册 Agent 工具 (支持嵌套 queryLoop)
 func (sm *SessionManager) createSession(chatID string) *Session {
+	return sm.createSessionWithClient(chatID, sm.apiClient)
+}
+
+// createSessionWithClient 同 createSession, 但用指定的 API 客户端构造引擎。
+// 用途: cron query 任务级模型覆盖 (apiClient.WithModel(别名) 的轻量副本) ——
+// 一次性会话独占该客户端, 不改动共享默认客户端, 既有会话模型不受污染。
+func (sm *SessionManager) createSessionWithClient(chatID string, cli *api.Client) *Session {
 	profile := builtin.ToolProfileChat
 	var runAgentFn agent.RunAgentFunc
 	runAgentFn = func(ctx context.Context, agentPrompt string, opts agent.RunOptions) (string, error) {
@@ -675,12 +682,12 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	hookRunner := hooks.NewRunner(sm.hookConfigs, "")
 
 	contextWindow := contextWindowOrDefault(sm.defaultResolved.ContextWindow)
-	compactor := compact.NewCompactor(sm.apiClient, contextWindow)
+	compactor := compact.NewCompactor(cli, contextWindow)
 	promptMgr := prompt.NewManager(sm.config.Cwd)
 	if sm.config.SystemPrompt != "" {
 		promptMgr.CustomPrompt = sm.config.SystemPrompt
 	}
-	promptMgr.Model = sm.apiClient.Model
+	promptMgr.Model = cli.Model
 	promptMgr.SkillListing = shortSkillListingInDir(sm.skillReg, sm.config.Cwd)
 	promptMgr.ProductName = "Claude Code (Go) - Feishu Bot"
 	promptMgr.HookConfigs = sm.hookConfigs
@@ -702,7 +709,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	}
 
 	cfg := &engine.Config{
-		Model:            sm.apiClient.Model,
+		Model:            cli.Model,
 		ExecutionModel:   sm.config.ExecutionModel,
 		MaxTokens:        sm.defaultResolved.MaxTokens,
 		MaxTurns:         clampTurns(sm.defaultResolved.MaxTurns),
@@ -733,11 +740,19 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 	}
 	// 方案三: 弱模型 harness 增强装配 (与 CLI 同规则——env 显式 > provider=="ollama" 自动)。
 	// kimi 等云端 provider 恒为关, 生产零变化; ollama 别名会话自动获得 L2/L3/L4/L6b/L8 护栏。
-	cfg.WeakModel = weakmodel.Resolve(sm.defaultResolved.Provider, os.Getenv)
-	// llm/hybrid 复杂度判定: 用主 apiClient 的 SimpleComplete + 分类器 system prompt。
+	// 注意按**生效客户端**的别名解析 provider: cron query 任务用 WithModel 覆盖成
+	// ollama 别名时, 护栏必须跟着别名走, 不能还看默认模型的 provider。
+	weakProvider := sm.defaultResolved.Provider
+	if cli != sm.apiClient {
+		if p, _, ok := strings.Cut(cli.Model, ":"); ok && p != "" {
+			weakProvider = p
+		}
+	}
+	cfg.WeakModel = weakmodel.Resolve(weakProvider, os.Getenv)
+	// llm/hybrid 复杂度判定: 用生效客户端的 SimpleComplete + 分类器 system prompt。
 	// heuristic 模式零 LLM 开销, 不注入。
 	if sm.config.ComplexityMode == "llm" || sm.config.ComplexityMode == "hybrid" {
-		cfg.LLMComplexityFn = complexityLLMClassifier(sm.apiClient)
+		cfg.LLMComplexityFn = complexityLLMClassifier(cli)
 	}
 	applyConstraints(cfg, feishuSessionConstraints())
 
@@ -750,7 +765,7 @@ func (sm *SessionManager) createSession(chatID string) *Session {
 		}
 	}
 
-	eng := engine.NewQueryEngine(cfg, sm.apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
+	eng := engine.NewQueryEngine(cfg, cli, reg, hookRunner, permChecker, compactor, promptMgr)
 	eng.MemoryStore = sm.memoryStore
 	eng.TraceStore = sm.traceStore // design/03 §4.1 E1
 	if sm.config.EnableFrontierOptimizations {
@@ -1026,6 +1041,24 @@ func (sm *SessionManager) ProcessMessage(ctx context.Context, chatID, userText s
 	return sm.processMessageInternal(ctx, chatID, userText)
 }
 
+// ProcessMessageWithModel 用指定模型别名处理一次性查询 (cron query 任务的模型覆盖)。
+// 别名为空时退化为 ProcessMessage。覆盖路径与缓存会话完全隔离:
+//   - 一次性会话, 不进 sm.sessions 缓存, 用完即弃;
+//   - 合成会话键 (cron:<chatID>:<别名>) —— 不与用户真实会话共享 plan flag /
+//     历史文件 (两个会话对象同写一个 chatID 的历史会互相覆盖);
+//   - 客户端是 apiClient.WithModel(别名) 的轻量副本, 共享底层 HTTP/限流器。
+func (sm *SessionManager) ProcessMessageWithModel(ctx context.Context, chatID, userText, modelAlias string) (string, error) {
+	if strings.TrimSpace(modelAlias) == "" {
+		return sm.ProcessMessage(ctx, chatID, userText)
+	}
+	cli := sm.apiClient.WithModel(modelAlias)
+	synthID := "cron:" + chatID + ":" + modelAlias
+	sm.mu.Lock()
+	session := sm.createSessionWithClient(synthID, cli)
+	sm.mu.Unlock()
+	return sm.runSessionMessage(ctx, session, userText)
+}
+
 // ProcessMessageWithQueue 处理消息, 如果会话繁忙则排队等待
 // reply 回调用于异步发送排队消息的回复
 func (sm *SessionManager) ProcessMessageWithQueue(ctx context.Context, chatID, userText string, reply func(string)) (string, bool, error) {
@@ -1039,7 +1072,12 @@ func (sm *SessionManager) ProcessMessageWithQueue(ctx context.Context, chatID, u
 }
 
 func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, userText string) (string, error) {
-	session := sm.GetOrCreate(chatID)
+	return sm.runSessionMessage(ctx, sm.GetOrCreate(chatID), userText)
+}
+
+// runSessionMessage 在指定会话上跑一条消息 (processMessageInternal 的会话来源是
+// 缓存, ProcessMessageWithModel 的是一次性会话; 流程本体两者共用)。
+func (sm *SessionManager) runSessionMessage(ctx context.Context, session *Session, userText string) (string, error) {
 
 	if session.IsProcessing() {
 		return "上一条消息还在处理中，请稍候...", nil
@@ -1054,7 +1092,7 @@ func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, us
 			// 产出的实时修正信号 (设计值 -0.5)。只在该会话确有团队 run 时记录,
 			// 纯聊天打断不记 (无上下文的打断不是奖励证据)。
 			if sm.evolution != nil && sm.teamMgr != nil {
-				if teamName, runID, ok := sm.teamMgr.LastRunForChat(chatID); ok {
+				if teamName, runID, ok := sm.teamMgr.LastRunForChat(session.ChatID); ok {
 					sm.evolution.RecordReward(agent.RewardEvent{
 						RunID:  runID,
 						Source: agent.RewardSourceUserSteer,
@@ -1065,7 +1103,7 @@ func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, us
 				}
 			}
 			go func() {
-				resp, err := sm.processMessageInternal(context.Background(), chatID, *pendingText)
+				resp, err := sm.processMessageInternal(context.Background(), session.ChatID, *pendingText)
 				if err != nil {
 					pendingReply(fmt.Sprintf("处理排队消息失败: %v", err))
 				} else {
@@ -1097,7 +1135,7 @@ func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, us
 			Content:    truncateForDream(response),
 			Source:     "extraction",
 			Importance: 0.6,
-			ChatID:     chatID,
+			ChatID:     session.ChatID,
 			Topics:     extractTopics(response),
 		})
 	}
@@ -1105,7 +1143,7 @@ func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, us
 	// 触发 Dreaming 检查 (对应 TS: stopHooks.ts → executeAutoDream)
 	if sm.dreamer != nil {
 		sm.dreamer.RecordSession(dreaming.SessionRecord{
-			ChatID:  chatID,
+			ChatID:  session.ChatID,
 			EndTime: time.Now(),
 			Summary: truncateForDream(response),
 		})

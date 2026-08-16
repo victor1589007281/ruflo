@@ -1,0 +1,51 @@
+# agentdb —— claude-go 的远程状态存储后端 (hakit agents ns)。
+# 数据落 hostPath /mnt/data/agentdb (经 bindmnt 挂载 = 宿主 /mnt/data/agentdb)。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentdb
+  namespace: agents
+spec:
+  replicas: 1
+  strategy: { type: Recreate } # hostPath 单点
+  selector:
+    matchLabels: { app: agentdb }
+  template:
+    metadata:
+      labels: { app: agentdb }
+    spec:
+      securityContext:
+        runAsUser: 1000   # victor —— 宿主侧文件保持 victor 属主
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: agentdb
+          image: agentdb:v11-1786870167
+          imagePullPolicy: Never
+          args: ["serve", "-data", "/data", "-addr", "0.0.0.0:9090"]
+          ports:
+            - { containerPort: 9090 }
+          readinessProbe:
+            tcpSocket: { port: 9090 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "100m", memory: 128Mi }
+            limits: { cpu: "2", memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          hostPath:
+            path: /mnt/data/agentdb
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentdb
+  namespace: agents
+spec:
+  selector: { app: agentdb }
+  ports:
+    - { port: 9090, targetPort: 9090 }

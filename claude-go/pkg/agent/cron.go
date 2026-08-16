@@ -45,6 +45,12 @@ type CronJob struct {
 	Payload    string    `json:"payload"`            // 执行内容 (任务目标/消息/命令)
 	ChatID     string    `json:"chatId"`             // 结果推送的飞书 chat_id
 	Workflow   string    `json:"workflow,omitempty"` // jobType=workflow 时的工作流类型
+	// Model 任务级执行模型别名 (provider:model, 如 ollama:lfm2.5:2.6b-q4_k_m); 空 = 默认模型。
+	// 消费面: 当前仅 jobType=query 真实消费 (一次性覆盖会话模型, 不污染既有会话)。
+	// workflow 的模型走 ai.plans.<type>.modelAlias 配置 (按工作流类型, 本身可配);
+	// sync (ima/weread) 是纯 HTTP 数据拉取, 不调用任何模型 —— 给它配模型是无效旋钮,
+	// 刻意不接线 (本仓纪律: 不建"建成未通电"的假开关)。
+	Model      string    `json:"model,omitempty"`
 	Enabled    bool      `json:"enabled"`
 	CreatedAt  time.Time `json:"createdAt"`
 	LastRunAt  time.Time `json:"lastRunAt,omitempty"`
@@ -65,6 +71,13 @@ type CronExecutor interface {
 	WikiLint(ctx context.Context) (string, error)
 	// TriggerSync 触发外部数据源(ima/weread)同步, 返回结果摘要。
 	TriggerSync(ctx context.Context, source string) (string, error)
+}
+
+// CronModelExecutor 可选扩展接口: 执行器支持按任务级模型跑 query 时实现。
+// executeJob 发现 job.Model 非空时做类型断言; 未实现则回退 SendQuery 并记日志
+// (模型配置被忽略必须可观测, 不能静默)。
+type CronModelExecutor interface {
+	SendQueryWithModel(ctx context.Context, chatID, message, model string) (string, error)
 }
 
 // CronScheduler 定时任务调度器。
@@ -222,8 +235,32 @@ func (cs *CronScheduler) UpdateJob(id string, patch *CronJob) error {
 	if patch.ChatID != "" {
 		job.ChatID = patch.ChatID
 	}
+	// Model: 空 = 不动; "default"/"-" = 清除回默认; 其他 = 设置为该别名。
+	// (patch 语义与其他字段一致 —— 空值不覆盖, 故清除需要哨兵值。)
+	switch patch.Model {
+	case "":
+	case "default", "-":
+		job.Model = ""
+	default:
+		job.Model = patch.Model
+	}
 	cs.persist()
 	log.Printf("[Cron] 更新任务: %s (%s) [%s]", job.Name, job.Schedule, job.JobType)
+	return nil
+}
+
+// TriggerJob 立即执行一次任务 (不动调度计划与启停状态)。
+// 供 dashboard /api/cron/{id}/trigger 手动触发 —— 此前 "cron.trigger" 动作
+// 全仓没有消费方, 提示"等待主进程消费"是假承诺; 本方法就是那个诚实的消费方。
+func (cs *CronScheduler) TriggerJob(id string) error {
+	cs.mu.RLock()
+	job, ok := cs.jobs[id]
+	cs.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("任务 %q 不存在", id)
+	}
+	go cs.executeJob(job)
+	log.Printf("[Cron] 手动触发任务: %s (%s) [%s]", job.Name, job.ID, job.JobType)
 	return nil
 }
 
@@ -276,6 +313,9 @@ func (cs *CronScheduler) FormatJobList() string {
 		}
 		sb.WriteString(fmt.Sprintf("%s **%s** (`%s`)\n", icon, j.Name, j.ID))
 		sb.WriteString(fmt.Sprintf("  调度: `%s` | 类型: %s\n", j.Schedule, j.JobType))
+		if j.Model != "" {
+			sb.WriteString(fmt.Sprintf("  模型: `%s`\n", j.Model))
+		}
 		sb.WriteString(fmt.Sprintf("  内容: %s\n", truncateResult(j.Payload, 80)))
 		sb.WriteString(fmt.Sprintf("  运行: %d 次 | 失败: %d 次", j.RunCount, j.FailCount))
 		if !j.LastRunAt.IsZero() {
@@ -338,6 +378,18 @@ func (cs *CronScheduler) executeJob(job *CronJob) {
 		execErr = cs.executor.RunWorkflow(ctx, teamName, job.Workflow, job.Payload, job.ChatID)
 
 	case "query":
+		if job.Model != "" {
+			if me, ok := cs.executor.(CronModelExecutor); ok {
+				result, err := me.SendQueryWithModel(ctx, job.ChatID, job.Payload, job.Model)
+				if err != nil {
+					execErr = err
+				} else if result != "" {
+					cs.executor.Notify(job.ChatID, fmt.Sprintf("⏰ 定时任务 **%s** 结果 (模型 %s):\n\n%s", job.Name, job.Model, result))
+				}
+				break
+			}
+			log.Printf("[Cron] 任务 %s 配置了模型 %s 但执行器不支持按模型执行, 回退默认模型", job.ID, job.Model)
+		}
 		result, err := cs.executor.SendQuery(ctx, job.ChatID, job.Payload)
 		if err != nil {
 			execErr = err

@@ -1212,6 +1212,12 @@ func (e *botCronExecutor) SendQuery(ctx context.Context, chatID, message string)
 	return e.bot.sessions.ProcessMessage(ctx, chatID, message)
 }
 
+// SendQueryWithModel 实现 agent.CronModelExecutor: cron query 任务按任务级模型别名执行
+// (一次性隔离会话, 不污染用户会话; 见 SessionManager.ProcessMessageWithModel)。
+func (e *botCronExecutor) SendQueryWithModel(ctx context.Context, chatID, message, model string) (string, error) {
+	return e.bot.sessions.ProcessMessageWithModel(ctx, chatID, message, model)
+}
+
 func (e *botCronExecutor) RunCommand(ctx context.Context, chatID, command string) error {
 	_, err := e.bot.sessions.ProcessMessage(ctx, chatID, command)
 	return err
