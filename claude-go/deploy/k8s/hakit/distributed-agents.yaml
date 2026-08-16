@@ -23,7 +23,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: gateway
-          image: claude-go:agents5-1786878655
+          image: claude-go:agents6-ssh
           imagePullPolicy: Never
           args: ["llm-gateway", "--addr", "0.0.0.0:18081", "--config", "/etc/claude-go/config.json"]
           env:
@@ -65,7 +65,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: control
-          image: claude-go:agents5-1786878655
+          image: claude-go:agents6-ssh
           imagePullPolicy: Never
           args:
             - "serve"
@@ -88,6 +88,7 @@ spec:
             - { name: CLAUDE_GO_STATESTORE_READ, value: "fallback" }
             - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
             - { name: HOME, value: "/tmp" }
+            - { name: GIT_SSH_COMMAND, value: "ssh -i /home/victor/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/home/victor/.ssh/known_hosts" }
           ports: [{ containerPort: 18080 }]
           readinessProbe:
             httpGet: { path: /api/health, port: 18080 }
@@ -99,6 +100,7 @@ spec:
             - { name: teams, mountPath: /workspace }
             - { name: knowledge, mountPath: /home/victor/base/git/gitee/knowledge }
             - { name: ima-skill, mountPath: /home/victor/.claude/skills/ima-skill, readOnly: true }
+            - { name: ssh, mountPath: /home/victor/.ssh, readOnly: true }
       volumes:
         - name: state
           hostPath:
@@ -117,6 +119,10 @@ spec:
         - name: ima-skill
           hostPath:
             path: /home/victor/.claude/skills/ima-skill
+            type: Directory
+        - name: ssh
+          hostPath:
+            path: /home/victor/.ssh
             type: Directory
 ---
 apiVersion: v1
@@ -146,7 +152,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: dashboard
-          image: claude-go:agents5-1786878655
+          image: claude-go:agents6-ssh
           imagePullPolicy: Never
           args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open", "--config", "/etc/claude-go/config.json"]
           env:
@@ -195,7 +201,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: worker
-          image: claude-go:agents5-1786878655
+          image: claude-go:agents6-ssh
           imagePullPolicy: Never
           command: ["/usr/local/bin/claude-go-worker"]
           args:
@@ -254,7 +260,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: mcp
-          image: claude-go:agents5-1786878655
+          image: claude-go:agents6-ssh
           imagePullPolicy: Never
           args: ["codeintel-mcp-server", "--transport", "http", "--addr", "0.0.0.0:29234", "--config", "/etc/claude-go/config.json"]
           env:

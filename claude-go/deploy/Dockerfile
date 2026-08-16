@@ -12,8 +12,13 @@ FROM debian:bookworm-slim
 # golang-go: 引擎级 AutoMode 让模型在容器内"写代码 → go test 验证"闭环;
 # 不装 go, 模型写完 .go 文件后无法自测 (实测 exit 127)。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git curl python3 golang-go nodejs \
-    && rm -rf /var/lib/apt/lists/*
+      ca-certificates git curl python3 golang-go nodejs openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 1000 -M -s /usr/sbin/nologin claude
+# nodejs: IMA 同步适配器 exec node ima_api.cjs (pkg/sync/ima.go)。
+# openssh-client: 同步后知识库 git push (ssh remote)。
+# useradd: pod 以 runAsUser 1000 运行时, openssh 启动即要 getpwuid(1000) 成功,
+# 没有 passwd 条目会直接 "No user exists for uid 1000" 退出, git push 全灭。
 
 # go test 需要可写缓存目录; stateDir 挂载的 /data 够用, 显式指到 /tmp 避免
 # 与部署卷权限纠缠。

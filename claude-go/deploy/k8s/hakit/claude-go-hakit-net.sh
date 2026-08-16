@@ -12,6 +12,8 @@ grep -q 'nvme1n1p1 /mnt/data' /proc/$PID/mounts 2>/dev/null || \
   python3 /usr/local/bin/bindmnt.py "$PID" /mnt/data /mnt/data
   nsenter -t "$PID" -m -- mkdir -p /home/victor/base/git/gitee/knowledge
   grep -q "gitee/knowledge" /proc/$PID/mounts 2>/dev/null || python3 /usr/local/bin/bindmnt.py "$PID" /home/victor/base/git/gitee/knowledge /home/victor/base/git/gitee/knowledge
+  nsenter -t "$PID" -m -- mkdir -p /home/victor/.ssh
+  grep -q "victor/.ssh" /proc/$PID/mounts 2>/dev/null || python3 /usr/local/bin/bindmnt.py "$PID" /home/victor/.ssh /home/victor/.ssh
 sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null
 iptables -C INPUT -p tcp --dport 11434 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 11434 -j ACCEPT
 # 2) 端口转发 (宿主 -> NodePort)
