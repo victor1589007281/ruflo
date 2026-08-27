@@ -48,6 +48,8 @@ func buildClientFromAlias(alias string) (*api.Client, error) {
 	} else {
 		client = api.NewClient(resolved.BaseURL, resolved.APIKey, resolved.ProviderName)
 	}
+	client.Protocol = resolved.Protocol
+	client.SetProxy(resolved.Proxy)
 	if resolved.CallTimeoutSec > 0 {
 		client.CallTimeout = time.Duration(resolved.CallTimeoutSec) * time.Second
 	}

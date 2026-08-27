@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,10 @@ type Route struct {
 	BaseURL  string // 形如 https://api.kimi.com/coding/v1 (末尾无 /messages)
 	APIKey   string
 	Models   []string // 该 provider 可服务的模型名 (裸名, 不含 "provider:" 前缀)
+	// Proxy 出站 HTTP 代理 URL。模型级配置: 只有 Proxy 非空的 route 才走代理
+	// (如 muse-spark 大陆不可达, 须经东京 tailnet 代理出口), 直连组 Proxy 为空。
+	// main.go 构建路由时同一 provider 按 Proxy 分组, 保证"没配置代理的模型绝不走代理"。
+	Proxy string
 }
 
 // AccessRecord 网关访问日志行 (access.jsonl)。
@@ -61,6 +66,9 @@ type Server struct {
 	routes       []Route
 	defaultRoute *Route
 	client       *http.Client
+	// proxyClients 按 (Provider+"\x00"+Proxy) 索引的代理客户端。
+	// 只对配置了 proxy 的 route 构建, 未配置的 route 始终用 s.client 直连。
+	proxyClients map[string]*http.Client
 	logMu        sync.Mutex
 	logPath      string
 }
@@ -77,10 +85,21 @@ func NewServer(routes []Route, defaultProvider, stateDir string) (*Server, error
 			MaxIdleConnsPerHost:   16,
 			ResponseHeaderTimeout: 120 * time.Second,
 		}},
+		proxyClients: map[string]*http.Client{},
 	}
 	for i := range routes {
 		if routes[i].Provider == defaultProvider {
 			s.defaultRoute = &routes[i]
+		}
+		if routes[i].Proxy == "" {
+			continue
+		}
+		// 带代理的 route: 独立 http.Client, 注入 http.ProxyURL transport。
+		// 只有这些 route 的出站请求经代理转发, 不污染直连组。
+		if u, err := url.Parse(routes[i].Proxy); err == nil && u.Host != "" {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			tr.Proxy = http.ProxyURL(u)
+			s.proxyClients[routes[i].Provider+"\x00"+routes[i].Proxy] = &http.Client{Transport: tr}
 		}
 	}
 	if s.defaultRoute == nil {
@@ -102,23 +121,48 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/messages", s.handleMessages)
 	mux.HandleFunc("/v1/messages", s.handleMessages)
+	// OpenAI 协议 (opencode 建议 mimo-v2.5 走 /v1/chat/completions, 见 pkg/api/openai.go)。
+	// 与 /messages 一样按模型路由, 上游路径固定拼 /chat/completions (避免 baseURL 自带
+	// /v1 时 double-v1)。
+	mux.HandleFunc("/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	// OpenAI Responses API (opencode 对 muse-spark 等 Meta 模型推荐 /v1/responses,
+	// 见 pkg/api/responses.go)。同样按模型路由, 上游路径拼 /responses。
+	mux.HandleFunc("/responses", s.handleResponses)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
 	return mux
 }
 
-// route 按模型名选 provider: 精确命中该 provider 的模型表, 否则 default。
+// handleChatCompletions 与 handleMessages 同构, 转发到 baseURL + "/chat/completions"。
+func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.handleMessagesWithPath(w, r, "/chat/completions")
+}
+
+// handleResponses 转发到 baseURL + "/responses" (OpenAI Responses API)。
+func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+	s.handleMessagesWithPath(w, r, "/responses")
+}
+
+// route 按模型名选路由。同一 provider 可能拆成多个 route (按 proxy 分组),
+// 因此必须先按 (provider + 裸模型名) 精确命中, 再回退 provider 前缀匹配。
+// 这样 "opencode:muse-spark-1.2-contributor" 精确落到带 proxy 的 route,
+// 不会因非 proxy 的 opencode route 在前而被误选。
 func (s *Server) route(model string) *Route {
-	// "provider:model" 别名形态直接取 provider 段
+	bare, provider := model, ""
 	if i := strings.IndexByte(model, ':'); i > 0 {
-		name := model[:i]
-		for j := range s.routes {
-			if s.routes[j].Provider == name {
+		provider, bare = model[:i], model[i+1:]
+	}
+	for j := range s.routes {
+		for _, m := range s.routes[j].Models {
+			if m == bare && (provider == "" || s.routes[j].Provider == provider) {
 				return &s.routes[j]
 			}
 		}
 	}
-	for j := range s.routes {
-		for _, m := range s.routes[j].Models {
-			if m == model {
+	// provider 前缀兜底 (裸模型名不在任何 Models 表时)
+	if provider != "" {
+		for j := range s.routes {
+			if s.routes[j].Provider == provider {
 				return &s.routes[j]
 			}
 		}
@@ -126,7 +170,24 @@ func (s *Server) route(model string) *Route {
 	return s.defaultRoute
 }
 
+// clientFor 返回该 route 的出站 http.Client: 配置了 proxy 的 route 用代理客户端,
+// 否则用共享直连客户端 (不消耗代理出口流量)。
+func (s *Server) clientFor(rt *Route) *http.Client {
+	if rt == nil || rt.Proxy == "" {
+		return s.client
+	}
+	if c, ok := s.proxyClients[rt.Provider+"\x00"+rt.Proxy]; ok {
+		return c
+	}
+	return s.client
+}
+
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	s.handleMessagesWithPath(w, r, "/messages")
+}
+
+// handleMessagesWithPath 把请求转发到 rt.BaseURL + upstreamPath (原样透传 body)。
+func (s *Server) handleMessagesWithPath(w http.ResponseWriter, r *http.Request, upstreamPath string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
@@ -169,7 +230,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
-		strings.TrimRight(rt.BaseURL, "/")+"/messages", bytes.NewReader(outBody))
+		strings.TrimRight(rt.BaseURL, "/")+upstreamPath, bytes.NewReader(outBody))
 	if err != nil {
 		s.fail(w, &rec, http.StatusBadGateway, "build request: "+err.Error())
 		return
@@ -186,7 +247,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
-	resp, err := s.client.Do(req)
+	resp, err := s.clientFor(rt).Do(req)
 	if err != nil {
 		s.fail(w, &rec, http.StatusBadGateway, "upstream: "+err.Error())
 		return
@@ -207,15 +268,29 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	} else {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		_, _ = w.Write(respBody)
-		// 非流式: 直接解析 usage
+		// 非流式: 直接解析 usage (兼容 Anthropic input_tokens/output_tokens 与
+		// OpenAI prompt_tokens/completion_tokens 两套字段名)
 		var ur struct {
 			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens     int `json:"input_tokens"`
+				OutputTokens    int `json:"output_tokens"`
+				PromptTokens    int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
 			} `json:"usage"`
 		}
 		if json.Unmarshal(respBody, &ur) == nil {
-			rec.InputTokens, rec.OutputTokens = ur.Usage.InputTokens, ur.Usage.OutputTokens
+			if ur.Usage.InputTokens > 0 {
+				rec.InputTokens = ur.Usage.InputTokens
+			}
+			if ur.Usage.OutputTokens > 0 {
+				rec.OutputTokens = ur.Usage.OutputTokens
+			}
+			if ur.Usage.PromptTokens > 0 {
+				rec.InputTokens = ur.Usage.PromptTokens
+			}
+			if ur.Usage.CompletionTokens > 0 {
+				rec.OutputTokens = ur.Usage.CompletionTokens
+			}
 		}
 	}
 
@@ -266,6 +341,22 @@ func (s *Server) pipeStream(w http.ResponseWriter, body io.Reader, rec *AccessRe
 					if ev.Usage.InputTokens > 0 { // 部分网关在末帧才给 input
 						rec.InputTokens = ev.Usage.InputTokens
 					}
+				}
+			}
+			// OpenAI 协议流式末帧 (stream_options.include_usage) 无 event.type,
+			// 直接带 usage.prompt_tokens / completion_tokens。
+			var ou struct {
+				Usage *struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+				} `json:"usage"`
+			}
+			if json.Unmarshal(data, &ou) == nil && ou.Usage != nil {
+				if ou.Usage.PromptTokens > 0 {
+					rec.InputTokens = ou.Usage.PromptTokens
+				}
+				if ou.Usage.CompletionTokens > 0 {
+					rec.OutputTokens = ou.Usage.CompletionTokens
 				}
 			}
 		}

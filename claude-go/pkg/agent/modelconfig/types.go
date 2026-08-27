@@ -32,7 +32,16 @@ type ModelConfig struct {
 	MaxTokens       int    `json:"maxTokens,omitempty"`       // 默认 max_tokens
 	MaxTurns        int    `json:"maxTurns,omitempty"`        // 默认 max_turns
 	PromptCacheMode string `json:"promptCacheMode,omitempty"` // "auto" / "on" / "off"
-	ContextWindow   int    `json:"contextWindow,omitempty"`   // 上下文窗口长度
+	// Protocol 出站协议: "anthropic"(默认, /messages)、"openai"(/chat/completions)
+	// 或 "openai-responses"(/v1/responses)。模型级配置 —— 如 opencode:mimo-v2.5 的
+	// tool_use 必须走 OpenAI 协议 (opencode Anthropic→OpenAI 转换层丢 name 字段返回 400),
+	// opencode:muse-spark-1.2-contributor 走 OpenAI Responses API, 其余 opencode 模型走 Anthropic。
+	Protocol      string `json:"protocol,omitempty"`
+	ContextWindow int    `json:"contextWindow,omitempty"` // 上下文窗口长度
+	// Proxy 出站 HTTP 代理 URL (http://host:port)。模型级配置 —— 只有配置了 proxy 的
+	// 模型才走代理 (如 muse-spark 大陆不可达, 须经东京 tailnet 代理出口), 其余模型
+	// 保持直连, 不消耗代理出口流量额度。
+	Proxy string `json:"proxy,omitempty"`
 	// 模型专属限流参数 (0 = 使用全局默认值)
 	RPM         int `json:"rpm,omitempty"`         // 每分钟最大请求数
 	MaxParallel int `json:"maxParallel,omitempty"` // 最大并发请求数
@@ -80,7 +89,9 @@ type ResolvedConfig struct {
 	MaxTokens       int
 	MaxTurns        int
 	PromptCacheMode string
+	Protocol        string // "anthropic"(默认) | "openai" | "openai-responses"; 见 ModelConfig.Protocol
 	ContextWindow   int
+	Proxy           string // 出站 HTTP 代理 URL, 仅配置了 proxy 的模型走代理 (见 ModelConfig.Proxy)
 	// 模型专属限流参数 (0 = 使用全局默认值)
 	RPM         int
 	MaxParallel int

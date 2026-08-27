@@ -24,6 +24,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,7 +131,21 @@ type Client struct {
 	BaseURL string
 	APIKey  string
 	Model   string
-	Client  *http.Client
+
+	// Protocol 出站协议: ""/"anthropic"(默认, POST /messages)、"openai"
+	// (POST /chat/completions, 走 OpenAI 翻译层) 或 "openai-responses"
+	// (POST /v1/responses, OpenAI Responses API 翻译层)。按模型配置注入 ——
+	// 例如 opencode:mimo-v2.5 的 tool_use 必须走 OpenAI 协议 (opencode 的
+	// Anthropic→OpenAI 转换层丢 name 字段返回 400), opencode:muse-spark-1.2-contributor
+	// 走 OpenAI Responses API (见 pkg/api/openai.go / responses.go 头注)。
+	Protocol string
+
+	// Proxy 出站 HTTP 代理 URL (如 http://100.96.50.63:8888)。模型级配置:
+	// 只有配置了 proxy 的模型才走代理 (经 SetProxy 注入 http.Transport.Proxy),
+	// 其余模型保持直连, 不消耗代理出口流量。
+	Proxy string
+
+	Client *http.Client
 
 	RetryCount int           // 最大重试次数 (429/5xx), 默认 4
 	RetryBase  time.Duration // 退避基数, 默认 3s
@@ -212,6 +227,8 @@ func (c *Client) WithModel(model string) *Client {
 		BaseURL:               c.BaseURL,
 		APIKey:                c.APIKey,
 		Model:                 model,
+		Protocol:              c.Protocol,
+		Proxy:                 c.Proxy,
 		Client:                c.Client,
 		Guard:                 c.Guard,
 		RetryCount:            c.RetryCount,
@@ -247,6 +264,8 @@ func (c *Client) ConfiguredCloneFull(baseURL, apiKey, model string, fallbackMode
 		BaseURL:               strings.TrimRight(baseURL, "/"),
 		APIKey:                apiKey,
 		Model:                 model,
+		Protocol:              c.Protocol,
+		Proxy:                 c.Proxy,
 		Client:                c.Client,
 		Guard:                 c.Guard,
 		RetryCount:            c.RetryCount,
@@ -307,6 +326,29 @@ func (c *Client) SetTag(tag string) *Client {
 	}
 	c.Tag = tag
 	return c
+}
+
+// SetProxy 为该 Client 配置出站 HTTP 代理 (仅配置了 proxy 的模型调用此方法)。
+// proxy 为空是安全的 no-op (保持直连); 非空时在共享 http.Client 上注入带
+// http.ProxyURL 的 Transport, 让该模型的所有出站请求经代理转发。
+// 注意: Transport 是进程共享的 (NewClient/克隆共享 c.Client), 因此这里
+// 用 Clone() 复制一份再改 Proxy, 避免污染其他 Client 的直连行为。
+func (c *Client) SetProxy(proxy string) {
+	if c == nil || c.Client == nil {
+		return
+	}
+	c.Proxy = proxy
+	if proxy == "" {
+		return
+	}
+	u, err := url.Parse(proxy)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		log.Printf("[api.Client] 忽略非法 proxy %q (err=%v): 该模型保持直连", proxy, err)
+		return
+	}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.Proxy = http.ProxyURL(u)
+	c.Client.Transport = base
 }
 
 // CircuitSnapshot 熔断器的结构化状态, 供 dashboard / diagnose 端点使用。
@@ -384,6 +426,28 @@ func isAnthropicEndpoint(baseURL string) bool {
 		strings.Contains(lower, "moonshot") || // Moonshot Anthropic 兼容端点 (api.moonshot.ai|cn/anthropic)
 		strings.Contains(lower, "kimi.com") || // Kimi coding 端点 (api.kimi.com/coding, Claude Code 兼容, 支持 cache_control)
 		strings.Contains(lower, "/apps/anthropic") // Anthropic 兼容代理路径
+}
+
+// isOpenAI 判断当前客户端是否走 OpenAI chat/completions 协议。
+func (c *Client) isOpenAI() bool {
+	return strings.EqualFold(c.Protocol, ProtocolOpenAI)
+}
+
+// isOpenAIResponses 判断当前客户端是否走 OpenAI Responses API 协议 (/v1/responses)。
+func (c *Client) isOpenAIResponses() bool {
+	return strings.EqualFold(c.Protocol, ProtocolOpenAIResponses)
+}
+
+// endpointPath 返回协议对应的消息端点路径
+// (anthropic: /messages, openai: /chat/completions, openai-responses: /responses)。
+func (c *Client) endpointPath() string {
+	if c.isOpenAI() {
+		return "/chat/completions"
+	}
+	if c.isOpenAIResponses() {
+		return "/responses"
+	}
+	return "/messages"
 }
 
 // isCacheRelatedError 检测 API 错误是否与 prompt caching 相关。
@@ -818,10 +882,34 @@ func (c *Client) StreamMessage(
 			}
 		}
 
-		body, err := json.Marshal(req)
-		if err != nil {
-			errCh <- fmt.Errorf("序列化请求失败: %w", err)
-			return
+		// 协议分支: openai 协议走 /chat/completions, openai-responses 走 /responses,
+		// 各自配流式翻译器 (把上游 SSE 事件翻译回 Anthropic 事件序列)。
+		var err error
+		var body []byte
+		var oaiReq *openAIRequest
+		var oaiTranslator *openAIStreamTranslator
+		var respReq *responsesRequest
+		var respTranslator *openAIResponsesStreamTranslator
+		if c.isOpenAI() {
+			oaiReq, body, err = c.buildOpenAIRequest(req, true)
+			if err != nil {
+				errCh <- fmt.Errorf("构建 OpenAI 请求失败: %w", err)
+				return
+			}
+			oaiTranslator = newOpenAIStreamTranslator(req.Model)
+		} else if c.isOpenAIResponses() {
+			respReq, body, err = c.buildOpenAIResponsesRequest(req, true)
+			if err != nil {
+				errCh <- fmt.Errorf("构建 OpenAI Responses 请求失败: %w", err)
+				return
+			}
+			respTranslator = newOpenAIResponsesStreamTranslator(req.Model)
+		} else {
+			body, err = json.Marshal(req)
+			if err != nil {
+				errCh <- fmt.Errorf("序列化请求失败: %w", err)
+				return
+			}
 		}
 		debug = c.newPromptDebugCapture("stream_messages", true)
 
@@ -840,10 +928,10 @@ func (c *Client) StreamMessage(
 				return
 			}
 			if debug != nil {
-				debug.addAttempt(attempt+1, effectiveBaseURL+"/messages", req.Model, body)
+				debug.addAttempt(attempt+1, effectiveBaseURL+c.endpointPath(), req.Model, body)
 			}
 
-			httpReq, err := http.NewRequestWithContext(ctx, "POST", effectiveBaseURL+"/messages", bytes.NewReader(body))
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", effectiveBaseURL+c.endpointPath(), bytes.NewReader(body))
 			if err != nil {
 				errCh <- fmt.Errorf("创建请求失败: %w", err)
 				return
@@ -931,7 +1019,15 @@ func (c *Client) StreamMessage(
 				// 智能模型切换: 连续 429 达阈值时切换备用模型
 				if newModel := c.on429OrFallback(); newModel != "" {
 					req.Model = newModel
-					body, _ = json.Marshal(req)
+					if respReq != nil {
+						respReq.Model = newModel
+						body, _ = json.Marshal(respReq)
+					} else if oaiReq != nil {
+						oaiReq.Model = newModel
+						body, _ = json.Marshal(oaiReq)
+					} else {
+						body, _ = json.Marshal(req)
+					}
 					if c.FallbackBaseURL != "" {
 						effectiveBaseURL = c.FallbackBaseURL
 					}
@@ -982,7 +1078,15 @@ func (c *Client) StreamMessage(
 					log.Printf("[api] Stream 主模型失败, 尝试备用模型: %s", fbModel)
 					c.fireEvent("retry", fmt.Sprintf("Stream 切换备用模型 %s", fbModel))
 					req.Model = fbModel
-					body, _ = json.Marshal(req)
+					if respReq != nil {
+						respReq.Model = fbModel
+						body, _ = json.Marshal(respReq)
+					} else if oaiReq != nil {
+						oaiReq.Model = fbModel
+						body, _ = json.Marshal(oaiReq)
+					} else {
+						body, _ = json.Marshal(req)
+					}
 					// 若配置了独立的 fallback 端点, 切换局部 baseURL/apiKey (不污染 client 实例)
 					if c.FallbackBaseURL != "" {
 						effectiveBaseURL = c.FallbackBaseURL
@@ -1032,69 +1136,89 @@ func (c *Client) StreamMessage(
 				continue
 			}
 
-			var delta types.StreamDelta
-			if err := json.Unmarshal([]byte(data), &delta); err != nil {
-				continue
+			// 协议分支: openai / openai-responses 流式 chunk 需翻译成 Anthropic
+			// 事件序列 (可能一帧多事件)。
+			var deltas []types.StreamDelta
+			if oaiTranslator != nil {
+				evs, oerr := oaiTranslator.translate([]byte(data))
+				if oerr != nil {
+					continue
+				}
+				deltas = evs
+			} else if respTranslator != nil {
+				evs, oerr := respTranslator.translate([]byte(data))
+				if oerr != nil {
+					continue
+				}
+				deltas = evs
+			} else {
+				var d types.StreamDelta
+				if err := json.Unmarshal([]byte(data), &d); err != nil {
+					continue
+				}
+				deltas = []types.StreamDelta{d}
 			}
 			if debug != nil {
 				debug.addStreamEvent(data)
 			}
 
-			// 采集 token 使用量 (message_start / message_delta)
-			if delta.Message != nil && delta.Message.Usage != nil {
-				u := delta.Message.Usage
-				if u.InputTokens > 0 {
-					streamRec.InputTokens = u.InputTokens
+			for _, delta := range deltas {
+				// 采集 token 使用量 (message_start / message_delta)
+				if delta.Message != nil && delta.Message.Usage != nil {
+					u := delta.Message.Usage
+					if u.InputTokens > 0 {
+						streamRec.InputTokens = u.InputTokens
+					}
+					if u.OutputTokens > 0 {
+						streamRec.OutputTokens = u.OutputTokens
+					}
+					if u.CacheReadInputTokens > 0 {
+						streamRec.CacheReadTokens = u.CacheReadInputTokens
+					}
+					if u.CacheCreationInputTokens > 0 {
+						streamRec.CacheCreationTokens = u.CacheCreationInputTokens
+					}
 				}
-				if u.OutputTokens > 0 {
-					streamRec.OutputTokens = u.OutputTokens
+				if delta.Usage != nil {
+					if delta.Usage.OutputTokens > 0 {
+						streamRec.OutputTokens = delta.Usage.OutputTokens
+					}
+					if delta.Usage.InputTokens > 0 {
+						streamRec.InputTokens = delta.Usage.InputTokens
+					}
 				}
-				if u.CacheReadInputTokens > 0 {
-					streamRec.CacheReadTokens = u.CacheReadInputTokens
+				if delta.Delta != nil && delta.Delta.StopReason != "" {
+					streamRec.StopReason = delta.Delta.StopReason
 				}
-				if u.CacheCreationInputTokens > 0 {
-					streamRec.CacheCreationTokens = u.CacheCreationInputTokens
-				}
-			}
-			if delta.Usage != nil {
-				if delta.Usage.OutputTokens > 0 {
-					streamRec.OutputTokens = delta.Usage.OutputTokens
-				}
-				if delta.Usage.InputTokens > 0 {
-					streamRec.InputTokens = delta.Usage.InputTokens
-				}
-			}
-			if delta.Delta != nil && delta.Delta.StopReason != "" {
-				streamRec.StopReason = delta.Delta.StopReason
-			}
 
-			// 处理 signature_delta (签名验证增量)
-			// 对应 TS: content_block_delta 中 delta.type=="signature_delta"
-			if delta.Delta != nil && delta.Delta.Signature != "" {
-				// 签名数据附加到当前块，不做额外处理
-			}
-
-			// 处理 server_tool_use / server_tool_result 块
-			// 对应 TS: 服务端工具（如 web_search_tool）直接由 API 执行
-			if delta.ContentBlock != nil {
-				switch delta.ContentBlock.Type {
-				case types.ContentBlockServerToolUse:
-					// 服务端工具调用 - 传递给消费者
-				case types.ContentBlockServerToolResult:
-					// 服务端工具结果 - 传递给消费者
+				// 处理 signature_delta (签名验证增量)
+				// 对应 TS: content_block_delta 中 delta.type=="signature_delta"
+				if delta.Delta != nil && delta.Delta.Signature != "" {
+					// 签名数据附加到当前块，不做额外处理
 				}
-			}
 
-			// 处理 message_delta 中的 stop_reason
-			// 对应 TS: stop_reason=="refusal" 时的特殊处理
-			if delta.Delta != nil && delta.Delta.StopReason == string(types.StopReasonRefusal) {
-				// 模型拒绝继续: 在 engine 层处理
-			}
+				// 处理 server_tool_use / server_tool_result 块
+				// 对应 TS: 服务端工具（如 web_search_tool）直接由 API 执行
+				if delta.ContentBlock != nil {
+					switch delta.ContentBlock.Type {
+					case types.ContentBlockServerToolUse:
+						// 服务端工具调用 - 传递给消费者
+					case types.ContentBlockServerToolResult:
+						// 服务端工具结果 - 传递给消费者
+					}
+				}
 
-			select {
-			case eventCh <- delta:
-			case <-ctx.Done():
-				return
+				// 处理 message_delta 中的 stop_reason
+				// 对应 TS: stop_reason=="refusal" 时的特殊处理
+				if delta.Delta != nil && delta.Delta.StopReason == string(types.StopReasonRefusal) {
+					// 模型拒绝继续: 在 engine 层处理
+				}
+
+				select {
+				case eventCh <- delta:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
@@ -1225,9 +1349,26 @@ func (c *Client) sendMessageDirect(
 		req.Tools = tools
 	}
 
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("序列化请求失败: %w", err)
+	// 协议分支: openai 走 /chat/completions, openai-responses 走 /responses。
+	var err error
+	var body []byte
+	var oaiReq *openAIRequest
+	var respReq *responsesRequest
+	if c.isOpenAI() {
+		oaiReq, body, err = c.buildOpenAIRequest(req, false)
+		if err != nil {
+			return nil, err
+		}
+	} else if c.isOpenAIResponses() {
+		respReq, body, err = c.buildOpenAIResponsesRequest(req, false)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		body, err = json.Marshal(req)
+		if err != nil {
+			return nil, fmt.Errorf("序列化请求失败: %w", err)
+		}
 	}
 	debug = c.newPromptDebugCapture("messages", false)
 
@@ -1247,10 +1388,10 @@ func (c *Client) sendMessageDirect(
 			return nil, ctx.Err()
 		}
 		if debug != nil {
-			debug.addAttempt(attempt+1, effectiveBaseURL+"/messages", req.Model, body)
+			debug.addAttempt(attempt+1, effectiveBaseURL+c.endpointPath(), req.Model, body)
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", effectiveBaseURL+"/messages", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", effectiveBaseURL+c.endpointPath(), bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("创建请求失败: %w", err)
 		}
@@ -1311,7 +1452,17 @@ func (c *Client) sendMessageDirect(
 				c.Guard.OnSuccess()
 			}
 			var result types.APIResponse
-			if err := json.Unmarshal(respBody, &result); err != nil {
+			if respReq != nil {
+				result, err = parseOpenAIResponsesResponse(req.Model, respBody)
+				if err != nil {
+					return nil, err
+				}
+			} else if oaiReq != nil {
+				result, err = parseOpenAIResponse(req.Model, respBody)
+				if err != nil {
+					return nil, err
+				}
+			} else if err := json.Unmarshal(respBody, &result); err != nil {
 				return nil, fmt.Errorf("解析响应失败: %w", err)
 			}
 			c.onSuccess429Reset()
@@ -1383,7 +1534,15 @@ func (c *Client) sendMessageDirect(
 			// 智能模型切换: 连续 429 达阈值时切换备用模型, 用新模型重试
 			if newModel := c.on429OrFallback(); newModel != "" {
 				req.Model = newModel
-				body, _ = json.Marshal(req)
+				if respReq != nil {
+					respReq.Model = newModel
+					body, _ = json.Marshal(respReq)
+				} else if oaiReq != nil {
+					oaiReq.Model = newModel
+					body, _ = json.Marshal(oaiReq)
+				} else {
+					body, _ = json.Marshal(req)
+				}
 				if c.FallbackBaseURL != "" {
 					effectiveBaseURL = c.FallbackBaseURL
 				}
@@ -1452,14 +1611,23 @@ func (c *Client) sendMessageDirect(
 			c.fireEvent("retry", fmt.Sprintf("切换备用模型 %s", fbModel))
 
 			req.Model = fbModel
-			fbBody, err := json.Marshal(req)
+			var fbBody []byte
+			if respReq != nil {
+				respReq.Model = fbModel
+				fbBody, err = json.Marshal(respReq)
+			} else if oaiReq != nil {
+				oaiReq.Model = fbModel
+				fbBody, err = json.Marshal(oaiReq)
+			} else {
+				fbBody, err = json.Marshal(req)
+			}
 			if err != nil {
 				continue
 			}
 			if debug != nil {
-				debug.addAttempt(maxRetry+fi+2, fbBaseURL+"/messages", req.Model, fbBody)
+				debug.addAttempt(maxRetry+fi+2, fbBaseURL+c.endpointPath(), req.Model, fbBody)
 			}
-			httpReq, err := http.NewRequestWithContext(ctx, "POST", fbBaseURL+"/messages", bytes.NewReader(fbBody))
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", fbBaseURL+c.endpointPath(), bytes.NewReader(fbBody))
 			if err != nil {
 				continue
 			}
@@ -1483,7 +1651,17 @@ func (c *Client) sendMessageDirect(
 			if resp.StatusCode == 200 {
 				c.recordSuccess()
 				var result types.APIResponse
-				if err := json.Unmarshal(respBody, &result); err != nil {
+				if respReq != nil {
+					result, err = parseOpenAIResponsesResponse(fbModel, respBody)
+					if err != nil {
+						continue
+					}
+				} else if oaiReq != nil {
+					result, err = parseOpenAIResponse(fbModel, respBody)
+					if err != nil {
+						continue
+					}
+				} else if err := json.Unmarshal(respBody, &result); err != nil {
 					continue
 				}
 				rec := LLMCallRecord{

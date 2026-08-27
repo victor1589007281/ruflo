@@ -141,7 +141,9 @@ func (r *ConfigResolver) resolveAlias(alias string) ResolvedConfig {
 	cfg.MaxTokens = entry.Params.MaxTokens
 	cfg.MaxTurns = entry.Params.MaxTurns
 	cfg.PromptCacheMode = entry.Params.PromptCacheMode
+	cfg.Protocol = entry.Params.Protocol
 	cfg.ContextWindow = entry.Params.ContextWindow
+	cfg.Proxy = entry.Params.Proxy
 	cfg.RPM = entry.Params.RPM
 	cfg.MaxParallel = entry.Params.MaxParallel
 	cfg.MinParallel = entry.Params.MinParallel

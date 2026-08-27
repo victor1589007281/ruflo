@@ -516,6 +516,13 @@ type ProviderModelConfig struct {
 	MaxTurns        int    `json:"maxTurns,omitempty"`
 	PromptCacheMode string `json:"promptCacheMode,omitempty"`
 	ContextWindow   int    `json:"contextWindow,omitempty"`
+	// Protocol 出站协议: ""(默认 anthropic /messages) | "openai" (/chat/completions)
+	// | "openai-responses" (/v1/responses, opencode 对 muse-spark 等 Meta 模型推荐)。
+	Protocol string `json:"protocol,omitempty"`
+	// Proxy 出站 HTTP 代理 URL (http://host:port)。模型级配置 —— 只有配置了 proxy 的
+	// 模型才走代理 (如 muse-spark 大陆不可达, 须经东京 tailnet 代理出口), 其余模型
+	// 保持直连, 不消耗代理出口流量额度。
+	Proxy string `json:"proxy,omitempty"`
 	// 模型专属限流参数 (0 = 使用全局默认值)
 	RPM         int `json:"rpm,omitempty"`         // 每分钟最大请求数
 	MaxParallel int `json:"maxParallel,omitempty"` // 最大并发请求数 (本地 Ollama 对应 OLLAMA_NUM_PARALLEL)
@@ -683,6 +690,8 @@ func (jc *JSONConfig) ToModelConfigJSON() modelconfig.ConfigJSON {
 					MaxTurns:             mc.MaxTurns,
 					PromptCacheMode:      mc.PromptCacheMode,
 					ContextWindow:        mc.ContextWindow,
+					Protocol:             mc.Protocol,
+					Proxy:                mc.Proxy,
 					RPM:                  mc.RPM,
 					MaxParallel:          mc.MaxParallel,
 					MinParallel:          mc.MinParallel,

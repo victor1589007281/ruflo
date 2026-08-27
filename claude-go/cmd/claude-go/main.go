@@ -2074,20 +2074,40 @@ func llmGatewayCmd() *cobra.Command {
 			}
 			var routes []llmgw.Route
 			for name, p := range botCfg.Providers {
-				rt := llmgw.Route{Provider: name, BaseURL: p.BaseURL, APIKey: p.APIKey}
-				// 环境变量覆盖 key (K8s Secret 注入形态): <PROVIDER>_API_KEY
-				if env := os.Getenv(strings.ToUpper(name) + "_API_KEY"); env != "" {
-					rt.APIKey = env
+				// 同一 provider 下按 proxy 分组: 配置了 proxy 的模型 (如 muse-spark)
+				// 拆成独立 route, 其余保持直连组 —— 保证"没配置代理的模型绝不走代理"。
+				type grp struct {
+					rt  *llmgw.Route
+					key string
 				}
-				for alias := range p.Models {
+				var groups []grp
+				for alias, mc := range p.Models {
+					var found *llmgw.Route
+					for i := range groups {
+						if groups[i].key == mc.Proxy {
+							found = groups[i].rt
+							break
+						}
+					}
+					if found == nil {
+						rt := llmgw.Route{Provider: name, BaseURL: p.BaseURL, APIKey: p.APIKey, Proxy: mc.Proxy}
+						// 环境变量覆盖 key (K8s Secret 注入形态): <PROVIDER>_API_KEY
+						if env := os.Getenv(strings.ToUpper(name) + "_API_KEY"); env != "" {
+							rt.APIKey = env
+						}
+						groups = append(groups, grp{rt: &rt, key: mc.Proxy})
+						found = &rt
+					}
 					// 别名 "provider:model" → 裸模型名入路由表
 					if i := strings.IndexByte(alias, ':'); i >= 0 {
-						rt.Models = append(rt.Models, alias[i+1:])
+						found.Models = append(found.Models, alias[i+1:])
 					} else {
-						rt.Models = append(rt.Models, alias)
+						found.Models = append(found.Models, alias)
 					}
 				}
-				routes = append(routes, rt)
+				for _, g := range groups {
+					routes = append(routes, *g.rt)
+				}
 			}
 			defaultProvider := ""
 			if i := strings.IndexByte(botCfg.ModelAlias, ':'); i > 0 {
@@ -2948,6 +2968,8 @@ func buildAdvisorClient(jsonCfg *feishu.JSONConfig, projectSettings *settings.Se
 	} else {
 		client = api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.ProviderName)
 	}
+	client.Protocol = advResolved.Protocol
+	client.SetProxy(advResolved.Proxy)
 	client.Tag = "advisor"
 	if advResolved.CallTimeoutSec > 0 {
 		client.CallTimeout = time.Duration(advResolved.CallTimeoutSec) * time.Second
@@ -2977,6 +2999,8 @@ func buildPlanClient(jsonCfg *feishu.JSONConfig, alias string) (*api.Client, boo
 	} else {
 		client = api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.ProviderName)
 	}
+	client.Protocol = planResolved.Protocol
+	client.SetProxy(planResolved.Proxy)
 	client.Tag = "plan"
 	if planResolved.CallTimeoutSec > 0 {
 		client.CallTimeout = time.Duration(planResolved.CallTimeoutSec) * time.Second
@@ -3195,6 +3219,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 		apiClient.FallbackBaseURL = resolvedModel.FallbackBaseURL
 		apiClient.FallbackAPIKey = resolvedModel.FallbackAPIKey
 		apiClient.PromptCacheMode = resolvedModel.PromptCacheMode
+		// 出站协议路由: anthropic(/messages) | openai(/chat/completions) | openai-responses(/responses)。
+		// 漏设会导致 chat/responses 模型 (glm/mimo/muse-spark) 全部被路由到 /messages 而失败。
+		apiClient.Protocol = resolvedModel.Protocol
+		// 模型级出站代理: 只有配置了 proxy 的模型 (如 muse-spark 走东京 tinyproxy) 走代理。
+		apiClient.SetProxy(resolvedModel.Proxy)
 		// 模型级超时覆盖 (本地 Ollama 解码慢, 配置中可调大)
 		if resolvedModel.FirstTokenTimeoutSec > 0 {
 			apiClient.FirstTokenTimeout = time.Duration(resolvedModel.FirstTokenTimeoutSec) * time.Second

@@ -309,6 +309,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 3. 创建 AI API 客户端 (从解析后的配置)
 	aiClient := api.NewClient(defaultResolved.BaseURL, defaultResolved.APIKey, defaultResolved.ProviderName)
+	aiClient.Protocol = defaultResolved.Protocol
+	aiClient.SetProxy(defaultResolved.Proxy) // 仅默认模型配置了 proxy 时启用 (如 muse-spark 经东京代理)
 	aiClient.Tag = "feishu"
 	if len(defaultResolved.FallbackModels) > 0 {
 		aiClient.FallbackModels = defaultResolved.FallbackModels
@@ -479,6 +481,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			log.Printf("[Bot] Advisor 配置无效: 无法解析别名 %q (缺 baseURL/apiKey), advisor 已禁用", adv.ModelAlias)
 		} else {
 			advisorClient := api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.ProviderName)
+			advisorClient.Protocol = advResolved.Protocol
+			advisorClient.SetProxy(advResolved.Proxy)
 			advisorClient.Tag = "advisor"
 			if advResolved.CallTimeoutSec > 0 {
 				advisorClient.CallTimeout = time.Duration(advResolved.CallTimeoutSec) * time.Second
@@ -507,6 +511,8 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			log.Printf("[Bot] Plan 模型配置无效: 无法解析别名 %q (缺 baseURL/apiKey), 规划期将沿用主模型", config.PlanModel)
 		} else {
 			planClient := api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.ProviderName)
+			planClient.Protocol = planResolved.Protocol
+			planClient.SetProxy(planResolved.Proxy)
 			planClient.Tag = "plan"
 			if planResolved.CallTimeoutSec > 0 {
 				planClient.CallTimeout = time.Duration(planResolved.CallTimeoutSec) * time.Second
@@ -3374,6 +3380,8 @@ func (b *Bot) handleAdvisorCommand(ctx context.Context, messageID, text string) 
 			return
 		}
 		client := api.NewClient(resolved.BaseURL, resolved.APIKey, resolved.ProviderName)
+		client.Protocol = resolved.Protocol
+		client.SetProxy(resolved.Proxy)
 		client.Tag = "advisor"
 		if resolved.CallTimeoutSec > 0 {
 			client.CallTimeout = time.Duration(resolved.CallTimeoutSec) * time.Second
@@ -3856,6 +3864,8 @@ func buildModelConfigJSON(cfg *BotConfig) modelconfig.ConfigJSON {
 				MaxTurns:        mc.MaxTurns,
 				PromptCacheMode: mc.PromptCacheMode,
 				ContextWindow:   mc.ContextWindow,
+				Protocol:        mc.Protocol,
+				Proxy:           mc.Proxy,
 			}
 		}
 		out.Providers[name] = modelconfig.ProviderConfig{

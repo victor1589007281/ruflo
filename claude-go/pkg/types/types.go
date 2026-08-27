@@ -7,6 +7,7 @@ package types
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -80,6 +81,98 @@ func (c ContentBlock) MarshalJSON() ([]byte, error) {
 	}
 	type contentBlockAlias ContentBlock
 	return json.Marshal(contentBlockAlias(c))
+}
+
+// UnmarshalJSON 容错解析 tool_result.content 的两种形态。
+//
+// 背景: Anthropic 规范允许 tool_result.content 为 string 或 content block 数组
+// (如 [{"type":"text","text":"..."}])。Claude Code 在长上下文 / 工具返回大段文本
+// 时会发数组形态，而本结构之前将 Content 定义为 string，严格反序列化会在此
+// 触发 `json: cannot unmarshal array into Go struct field ContentBlock`，进而
+// 在 openai.go / responses.go 翻译层以 502 抛出并触发 10 次重试风暴。
+// 这里对 content 字段做 string | array 兼容：数组时抽取各块的 text 字段并以
+// 换行拼接，无法识别的块则回退为 JSON 文本，保证翻译层不因形态差异而失败。
+func (c *ContentBlock) UnmarshalJSON(data []byte) error {
+	type rawBlock struct {
+		Type      ContentBlockType `json:"type"`
+		Text      string           `json:"text"`
+		ID        string           `json:"id"`
+		Name      string           `json:"name"`
+		Input     json.RawMessage  `json:"input"`
+		ToolUseID string           `json:"tool_use_id"`
+		Content   json.RawMessage  `json:"content"`
+		IsError   bool             `json:"is_error"`
+		Thinking  string           `json:"thinking"`
+		Source    *MediaSource     `json:"source"`
+	}
+	var r rawBlock
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	c.Type = r.Type
+	c.Text = r.Text
+	c.ID = r.ID
+	c.Name = r.Name
+	c.Input = r.Input
+	c.ToolUseID = r.ToolUseID
+	c.IsError = r.IsError
+	c.Thinking = r.Thinking
+	c.Source = r.Source
+	if len(r.Content) == 0 || string(r.Content) == "null" {
+		c.Content = ""
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(r.Content, &s); err == nil {
+		c.Content = s
+		return nil
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(r.Content, &arr); err == nil {
+		var sb strings.Builder
+		for _, raw := range arr {
+			var es string
+			if err := json.Unmarshal(raw, &es); err == nil {
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(es)
+				continue
+			}
+			var obj map[string]interface{}
+			if err := json.Unmarshal(raw, &obj); err == nil {
+				if txt, ok := obj["text"].(string); ok && txt != "" {
+					if sb.Len() > 0 {
+						sb.WriteString("\n")
+					}
+					sb.WriteString(txt)
+					continue
+				}
+				// 非文本块回退为紧凑 JSON，避免丢信息
+				b, _ := json.Marshal(obj)
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(string(b))
+				continue
+			}
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(string(raw))
+		}
+		c.Content = sb.String()
+		return nil
+	}
+	// 其它形态（如 object）回退为 JSON 字符串
+	var anyVal interface{}
+	if err := json.Unmarshal(r.Content, &anyVal); err == nil {
+		b, _ := json.Marshal(anyVal)
+		c.Content = string(b)
+		return nil
+	}
+	c.Content = string(r.Content)
+	return nil
 }
 
 // MediaSource 图片/文档内容块的数据源。

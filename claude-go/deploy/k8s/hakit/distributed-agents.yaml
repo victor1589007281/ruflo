@@ -23,7 +23,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: gateway
-          image: claude-go:agents6-ssh
+          image: claude-go:agents8-responses
           imagePullPolicy: Never
           args: ["llm-gateway", "--addr", "0.0.0.0:18081", "--config", "/etc/claude-go/config.json"]
           env:
@@ -65,7 +65,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: control
-          image: claude-go:agents6-ssh
+          image: claude-go:agents8-responses
           imagePullPolicy: Never
           args:
             - "serve"
@@ -152,7 +152,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: dashboard
-          image: claude-go:agents6-ssh
+          image: claude-go:agents8-responses
           imagePullPolicy: Never
           args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open", "--config", "/etc/claude-go/config.json"]
           env:
@@ -201,7 +201,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: worker
-          image: claude-go:agents6-ssh
+          image: claude-go:agents8-responses
           imagePullPolicy: Never
           command: ["/usr/local/bin/claude-go-worker"]
           args:
@@ -260,7 +260,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: mcp
-          image: claude-go:agents6-ssh
+          image: claude-go:agents8-responses
           imagePullPolicy: Never
           args: ["codeintel-mcp-server", "--transport", "http", "--addr", "0.0.0.0:29234", "--config", "/etc/claude-go/config.json"]
           env:
