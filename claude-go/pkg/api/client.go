@@ -1221,6 +1221,30 @@ func (c *Client) StreamMessage(
 				}
 			}
 		}
+
+		// 流结束 (EOF): openai 翻译器可能因 usage 独立尾帧挂起了 message_delta
+		// (finishPending)。若 usage 尾帧始终未到 (上游忽略 include_usage 的退化情形),
+		// 在此补发, 保证引擎总能收到 stop_reason 收尾。
+		if oaiTranslator != nil {
+			for _, delta := range oaiTranslator.Flush() {
+				if delta.Usage != nil {
+					if delta.Usage.OutputTokens > 0 {
+						streamRec.OutputTokens = delta.Usage.OutputTokens
+					}
+					if delta.Usage.InputTokens > 0 {
+						streamRec.InputTokens = delta.Usage.InputTokens
+					}
+				}
+				if delta.Delta != nil && delta.Delta.StopReason != "" {
+					streamRec.StopReason = delta.Delta.StopReason
+				}
+				select {
+				case eventCh <- delta:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
 	}()
 
 	return eventCh, errCh
@@ -1800,12 +1824,13 @@ func (c *Client) onSuccess429Reset() {
 // simpleCompleteMaxTokens 是 SimpleComplete / CompleteDiag 的输出上限。
 // 与单 agent 路径(executePipeline 用配置 AI.maxTokens=32768/子配置 65536)看齐并从宽取 65536。
 // 演进史(踩坑记录):
-//   ① 原 4096 → 大章节抽取 JSON 中途截断 → ParseJSON 失败;
-//   ② 抬到 16384 修好多数, 但后端模型(kimi)会输出 thinking 块且 thinking token 计入本上限,
-//      密集章节 thinking+JSON >16384 → stop=max_tokens: 要么 JSON 截断在半途(不可解析),
-//      要么 thinking 吃光 16384 令 text 为空("空响应")。单 agent 走 32768 故同内容不炸。
-//   ③ 故从宽取 65536, 给 thinking+完整 JSON 充足余量。是"上限非目标", 短输出正常 end_turn 早停,
-//      对其它调用方零副作用。注意:此值硬编码, 若日后调大 config AI.maxTokens 需同步(未做动态解析)。
+//
+//	① 原 4096 → 大章节抽取 JSON 中途截断 → ParseJSON 失败;
+//	② 抬到 16384 修好多数, 但后端模型(kimi)会输出 thinking 块且 thinking token 计入本上限,
+//	   密集章节 thinking+JSON >16384 → stop=max_tokens: 要么 JSON 截断在半途(不可解析),
+//	   要么 thinking 吃光 16384 令 text 为空("空响应")。单 agent 走 32768 故同内容不炸。
+//	③ 故从宽取 65536, 给 thinking+完整 JSON 充足余量。是"上限非目标", 短输出正常 end_turn 早停,
+//	   对其它调用方零副作用。注意:此值硬编码, 若日后调大 config AI.maxTokens 需同步(未做动态解析)。
 const simpleCompleteMaxTokens = 65536
 
 // SimpleCompleteMaxTokens 是上面那个上限的导出形态, 给 L1 网关的 remote 实现
@@ -1837,10 +1862,12 @@ func (c *Client) SimpleComplete(ctx context.Context, systemPrompt, userPrompt st
 // CompleteDiag 等价于 SimpleComplete(相同请求/maxTokens),但额外回传一行诊断元数据(diag):
 // stop=停止原因 / outTok=输出token / blocks=内容块数与类型 / textLen=文本长度 / tail=文本尾部。
 // 供合议扇出(graph-extract-swarm)定位"空响应/截断/超时"的确切根因:
-//   · 空响应 + stop=max_tokens + outTok 大 → 内容进了非 text 块(如 thinking), 我们没取到;
-//   · 空响应 + outTok=0 → 后端确实返回空(模型/网关问题);
-//   · 非空但 parseOK=false + stop=max_tokens → 输出被上限截断在 JSON 中途(需再抬上限/减输入);
-//   · err=context deadline → PerBranchTimeout 截断(需放宽超时)。
+//
+//	· 空响应 + stop=max_tokens + outTok 大 → 内容进了非 text 块(如 thinking), 我们没取到;
+//	· 空响应 + outTok=0 → 后端确实返回空(模型/网关问题);
+//	· 非空但 parseOK=false + stop=max_tokens → 输出被上限截断在 JSON 中途(需再抬上限/减输入);
+//	· err=context deadline → PerBranchTimeout 截断(需放宽超时)。
+//
 // 仅诊断用途, 不改变 SimpleComplete 的行为与其它调用方。
 func (c *Client) CompleteDiag(ctx context.Context, systemPrompt, userPrompt string) (text, diag string, err error) {
 	messages := []types.APIMessage{{

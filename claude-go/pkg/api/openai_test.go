@@ -136,3 +136,70 @@ func TestOpenAIStreamTranslator(t *testing.T) {
 		t.Fatalf("accumulated tool input wrong: %q", curInput.String())
 	}
 }
+
+// TestOpenAIStreamTranslatorUsageTailFrame 覆盖 opencode/omen/hy3 的上游行为:
+// usage 不在 finish_reason 帧里, 而在其后的 {choices:[],usage:{...}} 独立尾帧。
+// message_delta 必须挂起到尾帧吸收 usage 后补发, 且 stop_reason/usage 都正确。
+func TestOpenAIStreamTranslatorUsageTailFrame(t *testing.T) {
+	tr := newOpenAIStreamTranslator("omen-alpha")
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,       // finish 帧无 usage
+		`{"id":"c1","choices":[],"usage":{"prompt_tokens":500,"completion_tokens":88}}`, // 独立 usage 尾帧
+	}
+	var all []types.StreamDelta
+	for _, c := range chunks {
+		evs, err := tr.translate([]byte(c))
+		if err != nil {
+			t.Fatalf("translate %q: %v", c, err)
+		}
+		all = append(all, evs...)
+	}
+	last := all[len(all)-1]
+	if last.Type != "message_delta" {
+		t.Fatalf("last event want message_delta, got %s", last.Type)
+	}
+	if last.Delta == nil || last.Delta.StopReason != "max_tokens" {
+		t.Fatalf("stop_reason want max_tokens (finish length), got %+v", last.Delta)
+	}
+	if last.Usage == nil || last.Usage.InputTokens != 500 || last.Usage.OutputTokens != 88 {
+		t.Fatalf("usage not propagated from tail frame: %+v", last.Usage)
+	}
+	// message_delta 发完即 finished: 后续帧被忽略
+	if evs, _ := tr.translate([]byte(`{"id":"c1","usage":{"prompt_tokens":9}}`)); len(evs) != 0 {
+		t.Fatalf("expected no events after finished, got %d", len(evs))
+	}
+	// Flush 此时应为 no-op (未挂起)
+	if evs := tr.Flush(); len(evs) != 0 {
+		t.Fatalf("Flush after tail-frame finish should be empty, got %d", len(evs))
+	}
+}
+
+// TestOpenAIStreamTranslatorFlushNoUsageTail 覆盖上游忽略 include_usage、始终不送
+// usage 尾帧的退化情形: Flush() 兜底补发 message_delta, 保证引擎收到 stop_reason。
+func TestOpenAIStreamTranslatorFlushNoUsageTail(t *testing.T) {
+	tr := newOpenAIStreamTranslator("omen-alpha")
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		// 没有 usage-only 尾帧, 直接 EOF
+	}
+	for _, c := range chunks {
+		if _, err := tr.translate([]byte(c)); err != nil {
+			t.Fatalf("translate %q: %v", c, err)
+		}
+	}
+	evs := tr.Flush()
+	if len(evs) != 1 {
+		t.Fatalf("Flush want 1 deferred message_delta, got %d", len(evs))
+	}
+	if evs[0].Type != "message_delta" || evs[0].Delta == nil || evs[0].Delta.StopReason != "end_turn" {
+		t.Fatalf("flush delta wrong: %+v", evs[0])
+	}
+	// 第二次 Flush 应为 no-op
+	if evs := tr.Flush(); len(evs) != 0 {
+		t.Fatalf("second Flush should be empty, got %d", len(evs))
+	}
+}

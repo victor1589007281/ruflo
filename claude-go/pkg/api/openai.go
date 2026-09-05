@@ -26,8 +26,8 @@ import (
 
 // ProtocolOpenAI / ProtocolAnthropic 客户端出站协议。
 const (
-	ProtocolOpenAI     = "openai"
-	ProtocolAnthropic  = "anthropic"
+	ProtocolOpenAI    = "openai"
+	ProtocolAnthropic = "anthropic"
 )
 
 // ── 出站请求 wire 类型 ──────────────────────────────────────────────────────
@@ -54,10 +54,10 @@ type openAIContentPart struct {
 }
 
 type openAIMessage struct {
-	Role       string             `json:"role"`
-	Content    interface{}        `json:"content,omitempty"` // string | []openAIContentPart | null
-	ToolCallID string             `json:"tool_call_id,omitempty"`
-	ToolCalls  []openAIToolCall   `json:"tool_calls,omitempty"`
+	Role       string           `json:"role"`
+	Content    interface{}      `json:"content,omitempty"` // string | []openAIContentPart | null
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type openAITool struct {
@@ -312,8 +312,8 @@ type openAIResponse struct {
 	Choices []struct {
 		Index   int `json:"index"`
 		Message struct {
-			Role      string          `json:"role"`
-			Content   json.RawMessage `json:"content"`
+			Role      string           `json:"role"`
+			Content   json.RawMessage  `json:"content"`
 			ToolCalls []openAIToolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
@@ -394,6 +394,8 @@ type openAIStreamTranslator struct {
 	model          string
 	started        bool
 	finished       bool
+	finishPending  bool   // finish_reason 已到但 usage 未到账(独立尾帧), message_delta 挂起待补发
+	finishReason   string // 挂起中的 stop_reason (Anthropic 枚举)
 	id             string
 	nextBlockIndex int
 
@@ -418,6 +420,28 @@ func newOpenAIStreamTranslator(model string) *openAIStreamTranslator {
 	return &openAIStreamTranslator{model: model, toolBlocks: map[int]*openAIToolState{}}
 }
 
+// openAIUsage 流式 usage (chat.completion.chunk 尾帧 / 非流式 usage)。opencode 等上游
+// 在 finish_reason 之后单独发一个 {choices:[], usage:{...}} 帧, 而非与 finish 同帧。
+type openAIUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// captureUsage 把上游 usage 存入翻译器, 供 message_delta 记账。
+func (t *openAIStreamTranslator) captureUsage(u *openAIUsage) {
+	if u == nil {
+		return
+	}
+	t.usage = &types.Usage{
+		InputTokens:          u.PromptTokens,
+		OutputTokens:         u.CompletionTokens,
+		CacheReadInputTokens: u.PromptTokensDetails.CachedTokens,
+	}
+}
+
 // translate 处理一个 OpenAI SSE data 行, 返回 0..N 个 Anthropic 事件。
 func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, error) {
 	var chunk struct {
@@ -438,13 +462,7 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
-		Usage *struct {
-			PromptTokens        int `json:"prompt_tokens"`
-			CompletionTokens    int `json:"completion_tokens"`
-			PromptTokensDetails struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+		Usage *openAIUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &chunk); err != nil {
 		return nil, err
@@ -454,6 +472,23 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 	}
 
 	var out []types.StreamDelta
+
+	// finish_reason 已见但 usage 未随帧 (finishPending): 等待紧随其后的 usage-only 尾帧。
+	// opencode/omen/hy3 就是 finish 后单独发 {choices:[],usage:{...}} → 这里吸收并补发挂起的
+	// message_delta, 否则引擎收不到 stop_reason 且 usage 永远落 0。
+	if t.finishPending {
+		if chunk.Usage != nil {
+			t.captureUsage(chunk.Usage)
+			t.finishPending = false
+			t.finished = true
+			out = append(out, types.StreamDelta{
+				Type:  "message_delta",
+				Delta: &types.DeltaContent{StopReason: t.finishReason},
+				Usage: t.usage,
+			})
+		}
+		return out, nil
+	}
 
 	if !t.started {
 		t.started = true
@@ -467,13 +502,7 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 			},
 		})
 	}
-	if chunk.Usage != nil {
-		t.usage = &types.Usage{
-			InputTokens:          chunk.Usage.PromptTokens,
-			OutputTokens:         chunk.Usage.CompletionTokens,
-			CacheReadInputTokens: chunk.Usage.PromptTokensDetails.CachedTokens,
-		}
-	}
+	t.captureUsage(chunk.Usage)
 
 	for _, ch := range chunk.Choices {
 		// 1) 文本增量
@@ -569,15 +598,40 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 				out = append(out, types.StreamDelta{Type: "content_block_delta", Index: bi, Delta: &types.DeltaContent{Type: "text_delta", Text: t.trailing.String()}})
 				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: bi})
 			}
-			out = append(out, types.StreamDelta{
-				Type: "message_delta",
-				Delta: &types.DeltaContent{StopReason: openAIFinishToStop(ch.FinishReason)},
-				Usage: t.usage,
-			})
-			t.finished = true
+			if t.usage != nil {
+				// usage 与 finish_reason 同帧 (deepseek/glm 等 OpenAI 标准): 直接收尾记账。
+				out = append(out, types.StreamDelta{
+					Type:  "message_delta",
+					Delta: &types.DeltaContent{StopReason: openAIFinishToStop(ch.FinishReason)},
+					Usage: t.usage,
+				})
+				t.finished = true
+			} else {
+				// usage 在 finish 之后的独立尾帧 (opencode/omen/hy3): 块已关完,
+				// 但 message_delta 挂起 —— 等 usage-only 尾帧吸收后补发 (见 finishPending 分支),
+				// 流末仍没来则由 Flush() 兜底, 保证引擎总能收到 stop_reason。
+				t.finishPending = true
+				t.finishReason = openAIFinishToStop(ch.FinishReason)
+			}
 		}
 	}
 	return out, nil
+}
+
+// Flush 在流结束 (EOF / [DONE]) 调用: 若 finish 后 usage 尾帧始终未到 (上游忽略
+// include_usage 的退化情形), 补发挂起的 message_delta (usage 可能仍为 nil), 防止引擎
+// 因缺 stop_reason 把回复标记为中断。
+func (t *openAIStreamTranslator) Flush() []types.StreamDelta {
+	if !t.finishPending || t.finished {
+		return nil
+	}
+	t.finishPending = false
+	t.finished = true
+	return []types.StreamDelta{{
+		Type:  "message_delta",
+		Delta: &types.DeltaContent{StopReason: t.finishReason},
+		Usage: t.usage,
+	}}
 }
 
 // openAIContentText 从 OpenAI delta/message.content (string | 块数组) 提取纯文本。
@@ -625,4 +679,3 @@ func openAIFinishToStop(f string) string {
 		return f
 	}
 }
-

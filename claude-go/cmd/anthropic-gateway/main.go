@@ -35,6 +35,11 @@ import (
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
+// upstreamTimeout 翻译路径单次上游调用上限。omen-alpha 等隐藏推理模型要先烧
+// 数万 reasoning token 才吐正文, 单次可达 10+ 分钟; 原默认 10min/5min 的硬超时
+// 会误掐 (502 context deadline exceeded)。per-model max_tokens 仍自限生成长度。
+var upstreamTimeout = flag.Duration("upstream-timeout", 30*time.Minute, "翻译路径单次上游调用上限 (omen 长推理需 >10min)")
+
 func main() {
 	var (
 		addr          = flag.String("addr", "127.0.0.1:18989", "监听地址")
@@ -156,6 +161,12 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := buildClient(rc)
+	// NewClient 默认把 http.Client.Timeout 设为 5min (300s), 会先于上面 ctx 上限
+	// 误掐长推理 (omen 可达 7+ min 才首 token); 归一到 --upstream-timeout。
+	// WithToolChoiceAny 只是 Client 值拷贝、共享同一个 *http.Client 指针, 此覆盖在克隆后仍生效。
+	if *upstreamTimeout > 0 && client.Client != nil {
+		client.Client.Timeout = *upstreamTimeout
+	}
 	if req.ToolChoice != nil && req.ToolChoice.Type == "any" {
 		client = client.WithToolChoiceAny()
 	}
@@ -166,7 +177,9 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 		maxTokens = 16384
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	// 翻译路径单次调用的硬上限用 --upstream-timeout (默认 30min)。omen-alpha 等
+	// 隐藏推理模型先烧数万 reasoning token 才吐正文, 原来 10min 的 ctx 会误掐 (502)。
+	ctx, cancel := context.WithTimeout(r.Context(), *upstreamTimeout)
 	defer cancel()
 
 	if req.Stream {
