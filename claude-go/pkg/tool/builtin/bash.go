@@ -206,7 +206,10 @@ func (t *BashTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 				IsError: true,
 			}, nil
 		}
-		if exitCode < 0 {
+		// FailureSetup (logdir MkdirAll / pipe / Start 失败) 时 ExitCode 保持零值 0,
+		// 若先判 exitCode<0 会漏掉它并穿进成功路径 → "Exit code: 0 (no output)"。
+		// 必须在 exitCode<0 之前按 err 优先拦截。
+		if err != nil && exitCode < 0 || (result != nil && result.FailureKind != sandbox.FailureNone && result.FailureKind != sandbox.FailureOutputLimit && result.FailureKind != sandbox.FailureTimeout) {
 			return &tool.ToolResult{
 				Content: fmt.Sprintf("命令执行失败: %v\n%s", err, text),
 				IsError: true,
