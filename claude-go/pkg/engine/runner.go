@@ -74,18 +74,22 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			if finalErr != nil {
 				status = "failed"
 			}
-			e.TraceStore.Write(tracestore.Span{
-				TraceID:   ids.RunID,
-				SpanID:    internal_hook.GenerateUUID(),
-				Kind:      "node",
-				Name:      ids.NodeID,
-				NodeID:    ids.NodeID,
-				TurnID:    ids.TurnID,
-				InputRef:  e.TraceStore.MakeRef(userPrompt),
-				OutputRef: e.TraceStore.MakeRef(finalText),
-				Attrs:     map[string]any{"status": status, "isolated": true},
-				TS:        start.UnixMilli(),
-				DurMS:     time.Since(start).Milliseconds(),
+			// F6 compaction 事件锁 (planning-dsh-adopt): node Span 与 llm_call Span
+			// 同属折叠后才有意义的事件链, 经折叠窗口门落盘 (窗口内排队, 关闭后放行)。
+			e.Compactor.GateEventWrite(func() {
+				e.TraceStore.Write(tracestore.Span{
+					TraceID:   ids.RunID,
+					SpanID:    internal_hook.GenerateUUID(),
+					Kind:      "node",
+					Name:      ids.NodeID,
+					NodeID:    ids.NodeID,
+					TurnID:    ids.TurnID,
+					InputRef:  e.TraceStore.MakeRef(userPrompt),
+					OutputRef: e.TraceStore.MakeRef(finalText),
+					Attrs:     map[string]any{"status": status, "isolated": true},
+					TS:        start.UnixMilli(),
+					DurMS:     time.Since(start).Milliseconds(),
+				})
 			})
 		}()
 	}
@@ -297,8 +301,10 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			IsNonInteractive: e.Config.IsNonInteractive,
 			Debug:            e.Config.Debug,
 			Messages:         messages,
-			SessionID:        e.Config.SessionID,  // EnterPlanMode/ExitPlanMode 用会话级 plan flag
+			SessionID:        e.Config.SessionID,   // EnterPlanMode/ExitPlanMode 用会话级 plan flag
 			PlanFileDir:      e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
+			Team:             e.Config.Team,        // 13.7-P1 池个性化身份 (与 queryLoop 同口径)
+			Role:             e.Config.Role,
 			GlobalPerm:       e.PermChecker,
 		}
 		toolResults := tool.RunTools(ctx, toolUseBlocks, e.Tools, tctx, e.HookRunner)

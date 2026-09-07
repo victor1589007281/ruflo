@@ -66,7 +66,10 @@ type DistillationResult struct {
 	MergedFacts    int
 	Contradictions int
 	PatternsFound  int
-	Duration       time.Duration
+	// 13.8.6 P1 更新门裁决分布: Superseded=裁决(旧条目归档), GateKept=低置信矛盾只追加
+	Superseded int
+	GateKept   int
+	Duration   time.Duration
 }
 
 // IncrementalDistill 增量蒸馏: 从 SessionRecord 提取事实并整合进 FactStore
@@ -83,7 +86,21 @@ func (c *Consolidator) IncrementalDistill(ctx context.Context, sessions []Sessio
 		}
 		facts := c.extractFactsFromSession(ctx, sess)
 		for _, f := range facts {
-			c.factStore.Add(f)
+			// 13.8.6 P1 记忆更新门: 低置信矛盾事实只追加不覆盖, 冲突需反思级
+			// 置信 (Importance >= memory.ReflectThreshold) 才裁决旧条目。
+			// dream:pattern 事实 (0.8 置信的跨事实模式) 走老 Add —— 它是新归纳
+			// 而非对既有事实的更正。
+			if strings.HasPrefix(f.Source, "dream:pattern") {
+				c.factStore.Add(f)
+				result.NewFacts++
+				continue
+			}
+			switch c.factStore.AddWithGate(f) {
+			case memory.GateSuperseded:
+				result.Superseded++
+			case memory.GateKeptBoth:
+				result.GateKept++
+			}
 			result.NewFacts++
 		}
 	}

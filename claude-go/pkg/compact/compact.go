@@ -22,6 +22,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -34,12 +36,74 @@ const TokenThreshold = 0.8
 const CompactMaxOutputTokens = 8192
 
 // Compactor 上下文压缩器
+//
+// # 13.6-P1 F6: compaction 事件锁 (docforge planning-dsh-adopt)
+//
+// 规划语义: 「压缩期间事件写入阻塞排队，杜绝折叠竞态」。此前 pkg/compact 与引擎
+// 主循环只有时序约定 (同 goroutine 内顺序执行), 无显式锁语义 —— 跨 goroutine 的
+// 事件落盘 (llm_call/node Span 来自团队并发路径) 与折叠窗口交错时, 轨迹上会出现
+// 折叠后事件链与摘要边界错序的窗口。现在把该约定物化为显式锁:
+//
+//   - 折叠窗口: runCompaction 全程 (含 PreCompact 蒸馏与摘要 LLM 调用) 持
+//     eventMu 写锁; 并发折叠在同锁上自然串行。
+//   - 事件写入门: GateEventWrite 让"折叠后才有意义的事件写入"在窗口内阻塞排队,
+//     窗口关闭后按 Lock 顺序放行 —— 事件链要么完整在折叠前, 要么完整在折叠后,
+//     不会横跨折叠边界。
+//
+// Compactor 是 per-engine 实例 (feishu 主会话/嵌套代理/团队 runner 各一份), 锁
+// 作用域即单引擎, 与 feishu per-chat busy 串行化正交。存储层 (tracestore/
+// statestore) 本身线程安全, 此锁补的是顺序性语义而非数据损坏防护。
 type Compactor struct {
 	apiClient        *api.Client
 	maxContextTokens int // 模型最大上下文窗口
 
+	// eventMu 折叠窗口锁 (F6): runCompaction 持写锁; 事件写入侧经
+	// GateEventWrite 持读锁阻塞排队。RWMutex 而非 Mutex: 无折叠时事件写入
+	// 零阻塞 (读锁共享), 只有窗口真正打开时才出现排队。
+	eventMu      sync.RWMutex
+	compacting   atomic.Bool  // 窗口状态位: 写锁内置位, Compacting() 快照精确
+	compactions  atomic.Int64 // 折叠窗口累计打开次数 (观测用)
+	eventsQueued atomic.Int64 // 事件写入过门总次数 (观测用; 排队与否见窗口期时延)
+
 	// PreCompact 蒸馏: 压缩前将关键信息提取到持久记忆
 	PreCompactFn func(facts []string, source string)
+}
+
+// Compacting 报告折叠窗口当前是否打开 (测试/观测用; 快照语义, 返回后可能变化)。
+// 状态位在写锁内置位/清除, 与窗口开关精确同步。
+func (c *Compactor) Compacting() bool {
+	if c == nil {
+		return false
+	}
+	return c.compacting.Load()
+}
+
+// Stats 返回 F6 锁的观测计数: compactions=折叠窗口打开总次数,
+// events_queued=事件写入过门总次数。
+func (c *Compactor) Stats() (compactions, eventsQueued int64) {
+	if c == nil {
+		return 0, 0
+	}
+	return c.compactions.Load(), c.eventsQueued.Load()
+}
+
+// GateEventWrite 把事件写入 fn 包进折叠窗口门: 窗口打开时阻塞排队, 关闭后立即
+// 通过; 与进行中的折叠互斥 (读锁 vs 写锁)。
+//
+// fn 纪律: 只做事件落盘, 不得再经 GateEventWrite 嵌套取门, 也不得触发折叠 ——
+// 否则同一 goroutine 读锁内再取写锁将死锁。fail-open: c 为 nil (未装配压缩器,
+// 例如 RunIsolated 的独立小循环) 时直接执行, 与无锁语义等价。
+func (c *Compactor) GateEventWrite(fn func()) {
+	if c == nil || fn == nil {
+		if fn != nil {
+			fn()
+		}
+		return
+	}
+	c.eventMu.RLock()
+	defer c.eventMu.RUnlock()
+	c.eventsQueued.Add(1) // 无竞态误差: 未阻塞时也计一次"过门", 排队与否见窗口期时延
+	fn()
 }
 
 // NewCompactor 创建压缩器
@@ -79,12 +143,23 @@ func (c *Compactor) AutoCompact(ctx context.Context, messages []types.Message, m
 //   1. 保留最近 N 条消息 (尾部保护)
 //   2. 将其余消息发送给模型, 要求生成摘要
 //   3. 构建新的消息序列: [boundary, summary_user_msg, ...tail]
+//
+// 全程处于 F6 折叠窗口 (eventMu 写锁) 内。
 // SetPreCompactFn 设置 PreCompact 蒸馏回调
 func (c *Compactor) SetPreCompactFn(fn func(facts []string, source string)) {
 	c.PreCompactFn = fn
 }
 
 func (c *Compactor) runCompaction(ctx context.Context, messages []types.Message, model string) ([]types.Message, error) {
+	// F6 折叠窗口: 写锁自蒸馏起、至摘要落定止。窗口内事件写入侧 (GateEventWrite)
+	// 阻塞排队, 折叠完成后按序放行 —— 折叠竞态在此显式收口。写锁不可重入, 故
+	// 窗口内绝不调 GateEventWrite, PreCompactFn 实现方亦不得 (见其纪律注释)。
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	c.compacting.Store(true)
+	c.compactions.Add(1)
+	defer c.compacting.Store(false)
+
 	// PreCompact 蒸馏: 在压缩前提取关键信息到持久记忆
 	if c.PreCompactFn != nil {
 		facts := c.SmartExtractKeyFacts(ctx, messages)

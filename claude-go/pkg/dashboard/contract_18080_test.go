@@ -51,6 +51,12 @@ var dashboardContract = []apiEndpoint{
 	{Pattern: "/api/cron/", Probe: "/api/cron/job-1", Prefix: true},
 	{Pattern: "/api/dreaming", Probe: "/api/dreaming"},
 	{Pattern: "/api/evolution", Probe: "/api/evolution"},
+	// 13.8.5 量化驾驶舱 (FoldSnapshot L1/L2 + 阈值告警位); 比 /api/evolution 更具体。
+	{Pattern: "/api/evolution/quant", Probe: "/api/evolution/quant"},
+	// 13.7.9 池观测聚合 (SetPoolLister 注入 worker 摘要; 未注入时 workers 缺省)。
+	{Pattern: "/api/pool", Probe: "/api/pool"},
+	// 可用模型别名 (SetModelLister 注入; 未注入时 501)。
+	{Pattern: "/api/models", Probe: "/api/models"},
 	{Pattern: "/api/tasks", Probe: "/api/tasks"},
 	{Pattern: "/api/insights", Probe: "/api/insights"},
 	{Pattern: "/api/projects", Probe: "/api/projects"},

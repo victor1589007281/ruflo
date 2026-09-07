@@ -89,19 +89,26 @@ func (e *QueryEngine) writeLLMCallSpan(ctx context.Context, in llmCallSpan) {
 	if start.IsZero() {
 		start = time.Now()
 	}
-	e.TraceStore.Write(tracestore.Span{
-		TraceID:   ids.RunID,
-		SpanID:    internal_hook.GenerateUUID(),
-		ParentID:  ids.TurnID,
-		Kind:      tracestore.KindLLMCall,
-		Name:      in.Model,
-		NodeID:    ids.NodeID,
-		TurnID:    ids.TurnID,
-		InputRef:  e.TraceStore.MakeRef(renderLLMRequest(in.System, in.Messages, in.Tools)),
-		OutputRef: e.TraceStore.MakeRef(in.Output),
-		Attrs:     attrs,
-		TS:        start.UnixMilli(),
-		DurMS:     time.Since(start).Milliseconds(),
+	// F6 compaction 事件锁 (planning-dsh-adopt): llm_call Span 属"折叠后才有意义
+	// 的事件链", 落盘经折叠窗口门 —— 折叠窗口内阻塞排队, 窗口关闭后按序放行, 杜绝
+	// Span 链横跨折叠边界。queryLoop 与 RunIsolated 两个调用点共用此收口; Compactor
+	// 未装配时门是直通 no-op (fail-open)。RunIsolated 持有写锁的场景不存在 (独立
+	// 循环不触发折叠), 无重入死锁面。
+	e.Compactor.GateEventWrite(func() {
+		e.TraceStore.Write(tracestore.Span{
+			TraceID:   ids.RunID,
+			SpanID:    internal_hook.GenerateUUID(),
+			ParentID:  ids.TurnID,
+			Kind:      tracestore.KindLLMCall,
+			Name:      in.Model,
+			NodeID:    ids.NodeID,
+			TurnID:    ids.TurnID,
+			InputRef:  e.TraceStore.MakeRef(renderLLMRequest(in.System, in.Messages, in.Tools)),
+			OutputRef: e.TraceStore.MakeRef(in.Output),
+			Attrs:     attrs,
+			TS:        start.UnixMilli(),
+			DurMS:     time.Since(start).Milliseconds(),
+		})
 	})
 }
 

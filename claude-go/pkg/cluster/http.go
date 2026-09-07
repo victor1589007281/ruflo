@@ -22,6 +22,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/tool"
 )
 
 // Mount 把 cluster 端点挂到 mux。
@@ -211,9 +213,9 @@ func (c *Client) post(path string, body, out any) (int, error) {
 	return resp.StatusCode, nil
 }
 
-// Heartbeat 注册/续约。
-func (c *Client) Heartbeat(caps, kinds []string) error {
-	_, err := c.post("/cluster/heartbeat", WorkerInfo{Name: c.worker, Caps: caps, Kinds: kinds}, nil)
+// Heartbeat 注册/续约。pool 摘要可选 (nil = 未观测到池)。
+func (c *Client) Heartbeat(caps, kinds []string, pool *tool.PoolSnapshot) error {
+	_, err := c.post("/cluster/heartbeat", WorkerInfo{Name: c.worker, Caps: caps, Kinds: kinds, Pool: pool}, nil)
 	return err
 }
 

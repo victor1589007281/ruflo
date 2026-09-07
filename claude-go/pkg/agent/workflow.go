@@ -952,8 +952,11 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			sr.Status == TaskCompleted)
 		if len(injectedExpIDs) > 0 {
 			we.evolution.RecordBatchFeedbackScored(injectedExpIDs, feedbackScore)
-			// V2注入效果追踪
-			we.evolution.RecordInjectionScored(injectedExpIDs, stage.Name, team.Name, stage.Role, feedbackScore)
+			// V2注入效果追踪。带 RunID (13.8.4): 注入配对 uplift 以 (节点, 目标签名)
+			// 分桶后, 同桶内"有注入 run"要按 RunID join 回 run 级事实 —— 没有 RunID
+			// 的注入记录无法成为配对的一臂。
+			we.evolution.RecordInjectionScoredRun(injectedExpIDs, stage.Name, team.Name, stage.Role,
+				feedbackScore, traj.RunID)
 		} else {
 			// 无注入: 更新基线成功率 (用于 Uplift 计算)
 			we.evolution.UpdateBaselineScored(feedbackScore)
@@ -1347,6 +1350,7 @@ func marshalRawTasksAsWBSJSON(tasks []rawTask) (string, error) {
 		WriteFiles      []string `json:"writeFiles,omitempty"`
 		ReadFiles       []string `json:"readFiles,omitempty"`
 		ConflictKeys    []string `json:"conflictKeys,omitempty"`
+		WriteScopes     []string `json:"writeScopes,omitempty"` // F13: 写域, 与 parseWBSFromJSON round-trip
 		TargetPackages  []string `json:"targetPackages,omitempty"`
 		Acceptance      string   `json:"acceptance,omitempty"`
 		VerifyCommand   string   `json:"verifyCommand,omitempty"`
@@ -1383,6 +1387,7 @@ func marshalRawTasksAsWBSJSON(tasks []rawTask) (string, error) {
 			WriteFiles:      task.writeFiles,
 			ReadFiles:       task.readFiles,
 			ConflictKeys:    task.conflictKeys,
+			WriteScopes:     task.writeScopes,
 			TargetPackages:  task.targetPackages,
 			Acceptance:      task.accept,
 			VerifyCommand:   task.verifyCommand,

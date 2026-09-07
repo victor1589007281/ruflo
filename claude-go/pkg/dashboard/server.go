@@ -18,6 +18,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
+	"github.com/anthropic/claude-go/pkg/cluster"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/httpauth"
 	"github.com/anthropic/claude-go/pkg/metrics"
@@ -77,6 +78,7 @@ type Server struct {
 	scraper  *metrics.JSONLScraper // JSONL → Prometheus 采集器 (MySQL Exporter 模式)
 	cronCtl  func() CronController // 定时任务写控制器【解析器】(仅 :18080 飞书进程注入; nil/返回nil 时写接口 501)
 	modelLister func() []string    // 可用模型别名【解析器】(SetModelLister 注入; nil 时 /api/models 501)
+	poolLister func() ([]cluster.WorkerInfo, error) // worker 池摘要【解析器】(13.7.9; nil 时 /api/pool 只报本进程)
 }
 
 // SetCronController 注入活动定时任务调度器的【解析器】, 启用 /api/cron 写接口 (创建/更新/启停/删除)。
@@ -89,6 +91,11 @@ func (s *Server) SetCronController(fn func() CronController) { s.cronCtl = fn }
 // 启用 GET /api/models —— webapp 的 cron 任务模型下拉等"可选模型"消费方从这里取数。
 // 同一惰性解析模式: 主进程配置在挂载时就绪, 但保持解析器形态与 SetCronController 一致。
 func (s *Server) SetModelLister(fn func() []string) { s.modelLister = fn }
+
+// SetPoolLister 注入 worker 池摘要【解析器】(13.7.9), 启用 GET /api/pool 的
+// workers 段。control 进程装配时传 clusterReg.Alive; 独立 dashboard (:7777)
+// 不注入 —— 池摘要只来自本进程 (tool.ObservedPool), workers 字段缺省。
+func (s *Server) SetPoolLister(fn func() ([]cluster.WorkerInfo, error)) { s.poolLister = fn }
 
 // resolveCron 请求期解析活动调度器; 未注入或主进程未就绪时返回 nil (写接口据此 501)。
 func (s *Server) resolveCron() CronController {
@@ -246,6 +253,8 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/models", s.handleModels)  // GET 可用模型别名 (SetModelLister 注入)
 	mux.HandleFunc("/api/dreaming", s.handleDreaming)
 	mux.HandleFunc("/api/evolution", s.handleEvolution)
+	mux.HandleFunc("/api/evolution/quant", s.handleEvolutionQuant) // 13.8.5 量化驾驶舱 (更具体, 优先于上面)
+	mux.HandleFunc("/api/pool", s.handlePool)                     // 13.7.9 池摘要聚合 (SetPoolLister 注入)
 	mux.HandleFunc("/api/tasks", s.handleTasks)
 	mux.HandleFunc("/api/insights", s.handleInsights)
 	mux.HandleFunc("/api/projects", s.handleProjects)

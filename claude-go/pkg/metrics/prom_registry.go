@@ -42,6 +42,7 @@ var (
 	llmTotalTokens           *prometheus.HistogramVec
 	llmPromptComponentChars  *prometheus.HistogramVec
 	llmPromptComponentTokens *prometheus.HistogramVec
+	llmPromptSurfaceTokens   *prometheus.HistogramVec
 
 	// LLM Guard / Circuit
 	llmGuardInFlight     *prometheus.GaugeVec
@@ -123,6 +124,14 @@ var (
 	evoDistillCount    *prometheus.CounterVec
 	evoPruneCount      *prometheus.CounterVec
 	evoFailTrajectory  *prometheus.GaugeVec
+
+	// 13.8.2 六新指标
+	evoLearnLLMTokens     *prometheus.CounterVec
+	evoLearningCostRatio  *prometheus.GaugeVec
+	evoRewardDistKS       *prometheus.GaugeVec
+	evoCanaryWinRate      *prometheus.GaugeVec
+	evoPromoteSurvival30d *prometheus.GaugeVec
+	evoRollbackCount      *prometheus.CounterVec
 
 	// Task
 	taskCreatedCount   *prometheus.CounterVec
@@ -243,6 +252,9 @@ func initPrometheusMetrics() {
 	}, llmComponentLabels)
 	llmPromptComponentTokens = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "claude_go", Name: "llm_prompt_component_tokens", Help: "Prompt 组件估算 token 分布", Buckets: defaultLLMBuckets(),
+	}, llmComponentLabels)
+	llmPromptSurfaceTokens = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "claude_go", Name: "llm_prompt_surface_tokens", Help: "Prompt 组件 usage 锚定 token 分布 (真实 InputTokens 按占比再分配)", Buckets: defaultLLMBuckets(),
 	}, llmComponentLabels)
 
 	llmGuardInFlight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -459,6 +471,26 @@ func initPrometheusMetrics() {
 		Namespace: "claude_go", Name: "evo_fail_trajectory_pct", Help: "失败轨迹占比",
 	}, evoLabels)
 
+	// ── Evolution: 13.8.2 六新指标 ──
+	evoLearnLLMTokens = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "learn_llm_tokens", Help: "学习路径 LLM token 消耗",
+	}, evoLabels)
+	evoLearningCostRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "learning_cost_ratio", Help: "学习成本占比 (学习token÷总token, 闸≤0.10)",
+	}, evoLabels)
+	evoRewardDistKS = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "reward_dist_ks", Help: "奖励分布漂移 KS 统计量 (>0.3 告警)",
+	}, evoLabels)
+	evoCanaryWinRate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "canary_win_rate", Help: "灰度实验 uplift>0 占比 (周<0.4 告警)",
+	}, evoLabels)
+	evoPromoteSurvival30d = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "promote_survival_30d", Help: "晋升30天生存率 (<0.7 告警)",
+	}, evoLabels)
+	evoRollbackCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "evo_rollback_count", Help: "回滚触发数",
+	}, evoLabels)
+
 	// ── Task ──
 	taskCreatedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "claude_go", Name: "task_created", Help: "任务创建数",
@@ -578,7 +610,7 @@ func initPrometheusMetrics() {
 		llmCallCount, llmSuccessCount, llmErrorCount, llmRetryCount,
 		llmRateLimitCount, llmOverloadCount, llmTimeoutCount, llmRefusalCount, llmPromptTooLong,
 		llmInputTokens, llmOutputTokens, llmCacheReadTokens, llmCacheCreateTokens, llmTotalTokens,
-		llmPromptComponentChars, llmPromptComponentTokens,
+		llmPromptComponentChars, llmPromptComponentTokens, llmPromptSurfaceTokens,
 		llmGuardInFlight, llmGuardMaxParallel, llmGuardRPMTokens, llmGuardPauseSec, llmGuardWaitSec,
 		llmCircuitTrips, llmCircuitOpenGauge, llmCircuitFailStreak,
 		teamRunCount, teamSuccessCount, teamFailCount, teamStageCount,
@@ -596,6 +628,8 @@ func initPrometheusMetrics() {
 		amnesiaRiskScore, precompactFactsSaved,
 		evoExperienceCount, evoTrajectoryCount, evoSuccessRate, evoUtilizationRate,
 		evoAvgQuality, evoQualityMin, evoQualityMax, evoDistillCount, evoPruneCount, evoFailTrajectory,
+		evoLearnLLMTokens, evoLearningCostRatio, evoRewardDistKS, evoCanaryWinRate,
+		evoPromoteSurvival30d, evoRollbackCount,
 		taskCreatedCount, taskCompletedCount, taskFailedCount, taskCompletionRate,
 		swarmRunCount, swarmSuccessCount, swarmConsensus, swarmBrierScore,
 		swarmDiversity, swarmLatencyMs, swarmDebateSkipRate, swarmLLMCalls,
@@ -697,6 +731,8 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 		llmPromptComponentChars.With(fillLabels(llmComponentNeed, labels)).Observe(value)
 	case MLLMPromptComponentTokens:
 		llmPromptComponentTokens.With(fillLabels(llmComponentNeed, labels)).Observe(value)
+	case MLLMPromptSurfaceTokens:
+		llmPromptSurfaceTokens.With(fillLabels(llmComponentNeed, labels)).Observe(value)
 	case MLLMGuardWaitSec:
 		llmGuardWaitSec.With(fillLabels(llmNeed, labels)).Observe(value)
 
@@ -859,6 +895,20 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 		evoDistillCount.With(fillLabels(evoNeed, labels)).Add(value)
 	case MEvoPruneCount:
 		evoPruneCount.With(fillLabels(evoNeed, labels)).Add(value)
+
+	// Evolution: 13.8.2 六新指标
+	case MEvoLearnLLMTokens:
+		evoLearnLLMTokens.With(fillLabels(evoNeed, labels)).Add(value)
+	case MEvoRollbackCount:
+		evoRollbackCount.With(fillLabels(evoNeed, labels)).Add(value)
+	case MEvoLearningCostRatio:
+		evoLearningCostRatio.With(fillLabels(evoNeed, labels)).Set(value)
+	case MEvoRewardDistKS:
+		evoRewardDistKS.With(fillLabels(evoNeed, labels)).Set(value)
+	case MEvoCanaryWinRate:
+		evoCanaryWinRate.With(fillLabels(evoNeed, labels)).Set(value)
+	case MEvoPromoteSurvival30d:
+		evoPromoteSurvival30d.With(fillLabels(evoNeed, labels)).Set(value)
 
 	// Task counters
 	case MTaskCreatedCount:

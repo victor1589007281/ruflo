@@ -42,8 +42,9 @@ type v2TaskRecord struct {
 	ActiveForm  string   `json:"activeForm,omitempty"`
 	Status      string   `json:"status"`
 	Owner       string   `json:"owner,omitempty"`
-	DependsOn   []string `json:"dependsOn,omitempty"` // DAG: 前置依赖的 task ID 列表
-	Priority    int      `json:"priority,omitempty"`  // 0=normal, 1=high, 2=critical
+	DependsOn   []string `json:"dependsOn,omitempty"`  // DAG: 前置依赖的 task ID 列表
+	Priority    int      `json:"priority,omitempty"`   // 0=normal, 1=high, 2=critical
+	WriteScopes []string `json:"writeScopes,omitempty"` // F13: 任务声明的写域 (共享核心状态/契约/manifest 等领域键), 供规划层串行化与观测
 	CreatedAt   string   `json:"createdAt"`
 	UpdatedAt   string   `json:"updatedAt"`
 }
@@ -119,6 +120,31 @@ func genTaskUUID() string {
 	buf[8] = (buf[8] & 0x3f) | 0x80
 	h := hex.EncodeToString(buf[:])
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// uniqueTrimmedStringsTask 对字符串列表做 trim + 去重 + 丢弃空串 (F13 写域/依赖清洗用;
+// builtin 包不依赖 pkg/agent, 本地实现)。
+func uniqueTrimmedStringsTask(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // --- TaskCreate ---
@@ -403,6 +429,7 @@ type TaskSummary struct {
 	Owner       string   `json:"owner"`
 	DependsOn   []string `json:"dependsOn,omitempty"`
 	Priority    int      `json:"priority,omitempty"`
+	WriteScopes []string `json:"writeScopes,omitempty"`
 	CreatedAt   string   `json:"createdAt"`
 	UpdatedAt   string   `json:"updatedAt"`
 }
@@ -415,6 +442,13 @@ func (s *TaskStore) AddTask(subject, description, owner string) (string, error) 
 // AddTaskWithDeps 创建带依赖的任务 (DAG 支持)。
 // dependsOn: 前置依赖的 task ID 列表, priority: 0=normal, 1=high, 2=critical
 func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
+	return s.AddTaskFull(subject, description, owner, dependsOn, priority, nil)
+}
+
+// AddTaskFull 创建带依赖与写域的任务 (F13 writeScopes)。
+// writeScopes: 任务声明的写域键列表 (如 "contract:store"、"state:mvcc")。
+// 复用已完成/未完成同名任务时, 写域作为可观测元数据随任务保留, 不参与匹配。
+func (s *TaskStore) AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -482,7 +516,8 @@ func (s *TaskStore) AddTaskWithDeps(subject, description, owner string, dependsO
 	rec := v2TaskRecord{
 		ID: id, Subject: subject, Description: description,
 		Status: status, Owner: owner, DependsOn: dependsOn,
-		Priority: priority, CreatedAt: now, UpdatedAt: now,
+		Priority: priority, WriteScopes: uniqueTrimmedStringsTask(writeScopes),
+		CreatedAt: now, UpdatedAt: now,
 	}
 	if s.byID == nil {
 		s.byID = make(map[string]v2TaskRecord)
@@ -633,7 +668,8 @@ func (s *TaskStore) ReadyTasks() []TaskSummary {
 			ready = append(ready, TaskSummary{
 				ID: r.ID, Subject: r.Subject, Description: r.Description,
 				Status: r.Status, Owner: r.Owner, DependsOn: r.DependsOn,
-				Priority: r.Priority, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+				Priority: r.Priority, WriteScopes: r.WriteScopes,
+				CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 			})
 		}
 	}
@@ -669,7 +705,8 @@ func (s *TaskStore) GetAllTasks() []TaskSummary {
 		result = append(result, TaskSummary{
 			ID: r.ID, Subject: r.Subject, Description: r.Description,
 			Status: r.Status, Owner: r.Owner, DependsOn: r.DependsOn,
-			Priority: r.Priority, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+			Priority: r.Priority, WriteScopes: r.WriteScopes,
+			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		})
 	}
 	return result

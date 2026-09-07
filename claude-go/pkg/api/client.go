@@ -156,6 +156,12 @@ type Client struct {
 	CallTimeout       time.Duration // 整体调用超时, 默认 600s
 	DeadlineRetryBase time.Duration // deadline exceeded 退避基数, 默认 10s
 
+	// ExtraHeaders 附加到每次出站 HTTP 请求的自定义头 (与默认头重名时覆盖默认值)。
+	// 请求级注入: 调用方在 SendMessage / StreamMessage 之前设置, 不参与 Client 克隆。
+	// 用途: anthropic-gateway 等协议网关按入站会话注入 x-opencode-session /
+	// User-Agent (opencode zen/go 上游缺失会话头会拒 400 MissingSessionID)。
+	ExtraHeaders http.Header
+
 	OnLLMEvent   LLMEventFunc    // 事件回调 (可选, 注入飞书通知)
 	OnLLMMetrics LLMMetricsHook  // 指标回调 (可选, 注入 dashboard metrics collector)
 	Guard        *RateLimitGuard // 全局准入控制器 (可选, 强烈建议设置)
@@ -460,6 +466,20 @@ func isCacheRelatedError(statusCode int, body string) bool {
 		strings.Contains(lower, "cache") && strings.Contains(lower, "breakpoint") ||
 		strings.Contains(lower, "cache") && strings.Contains(lower, "not supported") ||
 		strings.Contains(lower, "unknown") && strings.Contains(lower, "cache")
+}
+
+// applyExtraHeaders 把调用方注入的 ExtraHeaders 合并到出站请求头 (覆盖同名默认头,
+// 因此可覆盖 User-Agent 等 Go http 默认值)。nil ExtraHeaders 时为空操作。
+// 每个实际发往上游的 http.Request 构造点都必须调用它 (主路径 + fallback 模型路径)。
+func (c *Client) applyExtraHeaders(httpReq *http.Request) {
+	if len(c.ExtraHeaders) == 0 {
+		return
+	}
+	for k, vs := range c.ExtraHeaders {
+		for _, v := range vs {
+			httpReq.Header.Set(k, v)
+		}
+	}
 }
 
 // retryDelay 计算退避时间 (指数退避 + jitter, 429 用 3x 基数, deadline exceeded 用 DeadlineRetryBase)
@@ -942,6 +962,7 @@ func (c *Client) StreamMessage(
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
 			httpReq.Header.Set("Authorization", "Bearer "+effectiveAPIKey)
 			setTraceHeaders(httpReq, ctx) // trace 四元组 (见 trace.go); 未设置时无副作用
+			c.applyExtraHeaders(httpReq)  // 调用方注入的会话头等 (覆盖默认头)
 
 			resp, err = c.Client.Do(httpReq)
 			if err != nil {
@@ -1425,6 +1446,7 @@ func (c *Client) sendMessageDirect(
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
 		httpReq.Header.Set("Authorization", "Bearer "+effectiveAPIKey)
 		setTraceHeaders(httpReq, ctx) // trace 四元组 (见 trace.go); 未设置时无副作用
+		c.applyExtraHeaders(httpReq)  // 调用方注入的会话头等 (覆盖默认头)
 
 		resp, err := c.Client.Do(httpReq)
 		if err != nil {
@@ -1660,6 +1682,7 @@ func (c *Client) sendMessageDirect(
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
 			httpReq.Header.Set("Authorization", "Bearer "+fbAPIKey)
 			setTraceHeaders(httpReq, ctx) // 降级路径同样带 trace, 否则 fallback 的调用在网关侧对不上账
+			c.applyExtraHeaders(httpReq)  // 降级路径保持同一会话头
 			resp, err := c.Client.Do(httpReq)
 			if err != nil {
 				continue

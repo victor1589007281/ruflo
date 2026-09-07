@@ -59,11 +59,53 @@ type Skill struct {
 	Version      string   `json:"version,omitempty"`
 	// Status 治理状态 (frontmatter `status:`): active | shadow | archived。
 	// 空 = active (绝大多数存量 SKILL.md 没有 status 行, 见 statusDisabled 注释)。
-	Status     string `json:"status,omitempty"`
+	Status string `json:"status,omitempty"`
+	// Rank 来源优先级 (13.6 F2 rank 分层): 数值越小优先级越高,
+	// 同名技能高优先级来源覆盖低优先级来源。project(100) > user(200) > builtin(600)。
+	// 直接 Register 未标来源的技能取中间值 300。见 SourceRank。
+	Rank int `json:"rank,omitempty"`
+	// ModelInvocable / UserInvocable 双向调用策略 (13.6 F3, frontmatter
+	// `model-invocable:` / `user-invocable:`)。指针三态: nil = 未声明 = 双向可用
+	// (向后兼容硬要求 —— 存量 SKILL.md 没有这两个键)。false 时:
+	//   ModelInvocable=false → 只作为用户命令存在, 不进模型清单、Skill 工具拒载;
+	//   UserInvocable=false  → 只作为模型可选项, 不进用户侧技能展示。
+	ModelInvocable *bool `json:"model_invocable,omitempty"`
+	UserInvocable  *bool `json:"user_invocable,omitempty"`
+	// Digest 技能内容指纹 (13.6 F1): Register 时对 name/description/when_to_use/
+	// version/body 计算的 sha256, 用于"已注入且未变则不再重复加载"记账。
+	Digest     string `json:"digest,omitempty"`
 	SkillDir   string `json:"skill_dir"`   // 技能所在目录
 	SourcePath string `json:"source_path"` // SKILL.md 完整路径
 	LoadedFrom string `json:"loaded_from"` // project/user/managed
 	Body       string `json:"body"`        // Markdown 正文
+}
+
+// SourceRank 来源 → rank (13.6 F2)。数字员工自训练会产生大量同名/近名技能
+// (不同团队各自提炼"code-review"变体), 没有覆盖语义时同名技能会在清单里重复
+// 出现, 浪费预算并误导模型。对齐 dsh: project(100) > user(200) > bundled(600)。
+// claude-go 的目录来源映射: state(项目状态目录)随 project、config(用户配置目录)
+// 随 user。未知来源/直接 Register 给中间值 300 —— 既不被项目技能覆盖, 也不覆盖用户技能。
+func SourceRank(source string) int {
+	switch source {
+	case "project", "state":
+		return 100
+	case "user", "user-state", "config":
+		return 200
+	case "builtin":
+		return 600
+	default:
+		return 300
+	}
+}
+
+// ModelCallable 模型可否经清单发现并加载 (nil = 未声明 = 可用, 向后兼容)。
+func (s *Skill) ModelCallable() bool {
+	return s != nil && (s.ModelInvocable == nil || *s.ModelInvocable)
+}
+
+// UserCallable 用户可否作为命令/技能查看调用 (nil = 未声明 = 可用)。
+func (s *Skill) UserCallable() bool {
+	return s != nil && (s.UserInvocable == nil || *s.UserInvocable)
 }
 
 // 治理状态取值 (与 pkg/evolution/skillaudit 的 rewriteStatus 写入值一致)。
@@ -106,6 +148,12 @@ type Registry struct {
 	// pathsCache paths 可见性缓存 (dir|skill → 是否命中), Register/Reload 时清空。
 	// 清单注入每轮都可能调, 不能每次全目录 walk。
 	pathsCache map[string]bool
+	// injected 已注入记账 (name → 注入时的 digest) (13.6 F1)。
+	// 供持久注入方判断"已注入且内容未变"跳过重复注入。跨 Reload 保留。
+	injected map[string]string
+	// ranker 清单描述位配给的排序评分 (13.7-P2 L1 配给, SetRanker 注入;
+	// 由池装配方接 bandit 后验)。nil = 名称序 (默认, 行为零变化)。
+	ranker func(name string) float64
 }
 
 type scanDir struct {
@@ -197,10 +245,33 @@ func defaultSkillDirs(cwd string) []scanDir {
 	return dirs
 }
 
-// Register 注册一个技能 (同名覆盖)
+// Register 注册一个技能。
+//
+// 13.6 F2 rank 分层覆盖语义: 同名技能按 Rank 比较, 只有更高优先级 (rank 数值更小)
+// 才覆盖既有注册, 低优先级/同 rank 的后来者丢弃。同 rank 丢弃 (而非后来者覆盖) 保证
+// Reload 结果与目录扫描顺序无关 —— 确定性要求。此前是无条件"后来者覆盖": 数字员工
+// 自训练会产生大量同名变体 (不同团队各自提炼"code-review"), 后加载的 user 技能会
+// 静默顶掉更具体的 project 技能, 清单里既重复又误导。
+//
+// 副作用: 为未显式赋值的 Rank (直接构造的 *Skill, 非文件解析路径) 按 LoadedFrom
+// 推导; 为空 Digest 计算 sha256 指纹 (13.6 F1 已注入记账的比对键)。
 func (r *Registry) Register(skill *Skill) {
+	if skill == nil || skill.Name == "" {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if skill.Rank == 0 {
+		skill.Rank = SourceRank(skill.LoadedFrom)
+	}
+	if skill.Digest == "" {
+		skill.Digest = ComputeDigest(skill)
+	}
+	if old, ok := r.skills[skill.Name]; ok {
+		if skill.Rank >= old.Rank {
+			return // 优先级不高于既有注册, 丢弃 (同 rank 先到先得)
+		}
+	}
 	r.pathsCache = nil // 技能集合变了, paths 可见性缓存失效
 	r.skills[skill.Name] = skill
 }
@@ -238,6 +309,38 @@ func (r *Registry) GetAny(name string) (*Skill, bool) {
 	return s, ok
 }
 
+// SetRanker 注入清单描述位配给的排序评分 (13.7-P2 L1 配给): 描述位预算
+// (shortListingDescBudget) 按 ranker(name) 降序分配 —— 高后验资产的描述先占位,
+// 低频资产只留名称。nil / 返回负值视同无评分 (落到名称序)。
+// 由池装配方在装配时注入 (skills 不能反向 import builtin, 走函数注入)。
+// 与 rank 分层 (F2, 同名覆盖) 正交: ranker 只改**渲染顺序**, 不碰注册覆盖语义。
+func (r *Registry) SetRanker(fn func(name string) float64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ranker = fn
+}
+
+// sortForListing 清单渲染前的排序: 有 ranker 时按 (评分降序, 名称同分确定性),
+// 无 ranker = 纯名称序 (All() 已排好, 稳定透传)。
+func (r *Registry) sortForListing(skills []*Skill) {
+	r.mu.RLock()
+	ranker := r.ranker
+	r.mu.RUnlock()
+	if ranker == nil {
+		return
+	}
+	sort.SliceStable(skills, func(i, j int) bool {
+		ri, rj := ranker(skills[i].Name), ranker(skills[j].Name)
+		if ri != rj {
+			return ri > rj
+		}
+		return skills[i].Name < skills[j].Name
+	})
+}
+
 // All 列出所有已加载技能 (含 shadow/archived) —— 管理视图。
 //
 // 注意: 要往 prompt 里塞的"技能清单"一律用 Active()/FormatListing(), 不要用 All(),
@@ -262,6 +365,21 @@ func (r *Registry) Active() []*Skill {
 	result := make([]*Skill, 0, len(all))
 	for _, s := range all {
 		if s.IsActive() {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// ModelVisibleActive Active 且模型可调用 (13.6 F3)。
+// 模型清单注入 (FormatListing/FormatShortListing/ForDir) 与 Skill 工具加载
+// 一律走本视图 —— ModelInvocable=false 的技能只作用户命令, 对模型不存在。
+// 治理/用户展示视图不受此过滤 (Active 语义不变, 保证既有测试全绿)。
+func (r *Registry) ModelVisibleActive() []*Skill {
+	all := r.Active()
+	result := make([]*Skill, 0, len(all))
+	for _, s := range all {
+		if s.ModelCallable() {
 			result = append(result, s)
 		}
 	}
@@ -316,7 +434,9 @@ func (r *Registry) Reload() int {
 // FormatListing 格式化技能列表 (用于系统提示词)。
 // 对应 TS: formatCommandsWithinBudget
 func (r *Registry) FormatListing() string {
-	skills := r.Active() // 只暴露 active: shadow 技能未过进化门禁, 不进模型上下文
+	// 只暴露 active (shadow 未过进化门禁不进模型上下文) 且模型可调用 (F3:
+	// ModelInvocable=false 的技能只作用户命令, 不进模型清单)。
+	skills := r.ModelVisibleActive()
 	if len(skills) == 0 {
 		return ""
 	}
@@ -360,7 +480,8 @@ func truncateRunes(s string, max int) string {
 //   - 描述受字符预算约束, 预算耗尽后只保留名称, 保证清单体积随技能增长平滑可控;
 //   - limit (>0) 作为"展示完整描述的技能数"软上限; <=0 表示不设上限, 仅由预算约束。
 func (r *Registry) FormatShortListing(limit int) string {
-	skills := r.Active() // 已按名称确定性排序; 排除 shadow/archived
+	skills := r.ModelVisibleActive() // 已按名称确定性排序; 排除 shadow/archived 与模型不可调用
+	r.sortForListing(skills)         // 13.7-P2 L1 配给: 有 ranker 时描述位按后验优先分配
 	if len(skills) == 0 {
 		return ""
 	}
@@ -483,6 +604,15 @@ func parseFrontmatter(fm string, skill *Skill) {
 			// 治理状态 (shadow/active/archived)。此前不解析 ⇒ shadow 技能照常进清单、
 			// 照常可被 Skill 工具加载, `evo promote` 改的是没人读的文本字段。
 			skill.Status = val
+		case "model-invocable", "model_invocable":
+			// 13.6 F3 双向调用策略: false → 技能只作用户命令, 不进模型清单、
+			// Skill 工具拒载。缺省 (键不存在) = 双向可用, 向后兼容。
+			b := parseBoolFM(val)
+			skill.ModelInvocable = &b
+		case "user-invocable", "user_invocable":
+			// 13.6 F3: false → 只作模型可选项, 不进用户侧技能展示。
+			b := parseBoolFM(val)
+			skill.UserInvocable = &b
 		case "allowed-tools", "allowed_tools":
 			// 声明式工具面。**此前 Skill.AllowedTools 字段存在但全仓没有任何地方给它
 			// 赋值**, 于是 SKILL.md 里写 `allowed-tools: Bash` 在结构体里恒为空 ——
@@ -504,6 +634,18 @@ func parseFrontmatter(fm string, skill *Skill) {
 				inPaths = true
 			}
 		}
+	}
+}
+
+// parseBoolFM frontmatter 布尔值解析 (13.6 F3)。宽容: 1/t/T/true/TRUE/yes/on = true,
+// 其余一律 false (写错配置按"关闭该侧调用"处理, fail-safe —— 配置错误不应把技能
+// 悄悄暴露给模型)。
+func parseBoolFM(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "1", "t", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -600,9 +742,17 @@ func (t *SkillTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolC
 			IsError: true,
 		}, nil
 	}
+	// 13.6 F3: ModelInvocable=false 的技能对模型不可见, Skill 工具拒载 (用户侧仍可用)。
+	if ok && !skill.ModelCallable() {
+		return &tool.ToolResult{
+			Content: fmt.Sprintf("技能 %q 配置为仅用户可调用 (model-invocable: false), 模型侧不可加载。", in.Name),
+			IsError: true,
+		}, nil
+	}
 	if !ok {
+		// 提示清单与模型清单同口径: 只列 active 且模型可调用的技能
 		available := make([]string, 0)
-		for _, s := range t.registry.Active() {
+		for _, s := range t.registry.ModelVisibleActive() {
 			available = append(available, s.Name)
 		}
 		return &tool.ToolResult{
@@ -615,6 +765,10 @@ func (t *SkillTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolC
 	if skill.SkillDir != "" {
 		content += fmt.Sprintf("\n\n---\nSkill directory: %s", skill.SkillDir)
 	}
+
+	// 13.6 F1 已注入记账: 记录注入时刻的 digest, 供持久注入方
+	// (WasInjectedUnchanged) 判断"已注入且未变, 跳过重复注入"。
+	t.registry.MarkInjected(skill.Name)
 
 	return &tool.ToolResult{Content: content}, nil
 }

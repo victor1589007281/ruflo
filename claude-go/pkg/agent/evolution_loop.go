@@ -32,6 +32,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	evoledger "github.com/anthropic/claude-go/pkg/evolution"
 )
 
 // LearnKind 学习触发的来源。不同来源对应不同的学习器组合。
@@ -271,10 +273,19 @@ func (l *EvolutionLoop) execute(ctx context.Context, req LearnRequest) {
 	}
 	if l.metrics != nil {
 		l.engine.CollectMetrics(l.metrics)
-		// 学习成本占比的前置指标 (design/03 §4.5): 先把耗时与轮次记上,
-		// token 口径待 §4.2 的 run 级回溯反馈落地后再补。
+		// 学习成本占比的前置指标 (design/03 §4.5): 先把耗时与轮次记上。
 		l.metrics.Record("evolution", "learn_round_duration_sec", time.Since(start).Seconds())
 		l.metrics.Record("evolution", "learn_round_count", 1)
+		// 13.8.2 learn_llm_tokens: 本轮学习窗口 [start, now) 的账本增量。
+		// 半开区间天然不含上轮尾 —— 窗口内只有本轮蒸馏/反思打上 source=evolution
+		// 标签的 LLM 调用 (evolution.go LearnFromTeam / evolution_structure.go
+		// evolvePrompts)。账本 (llm.jsonl) 是真值来源, 这里只是 prom 计数器的
+		// 转发产方: Fold 折叠窗口增量, 计数器做 +Add。
+		if sd := l.engine.StateDir(); sd != "" {
+			if v, ok := evoledger.Fold(sd, start, time.Now(), evoledger.LearnLLMTokensSpec)["learn_llm_tokens"]; ok {
+				l.metrics.Record("evolution", "learn_llm_tokens", v)
+			}
+		}
 	}
 	l.Stats.Executed.Add(1)
 }

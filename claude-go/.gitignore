@@ -8,3 +8,6 @@ deploy/claude-go-linux
 deploy/claude-go-worker-linux
 # k8s-job runtime 的控制面镜像变体要把宿主的 kubectl 打进去 (deploy/Dockerfile.k8sjob)
 deploy/kubectl-linux
+
+# 编译产物 (agent session 2026-09-07): cmd/anthropic-gateway 的本地构建输出
+/anthropic-gateway

@@ -785,6 +785,7 @@ func runCmd() *cobra.Command {
 						out[i] = agent.DAGTaskSummary{
 							ID: t.ID, Subject: t.Subject, Description: t.Description,
 							Status: t.Status, Owner: t.Owner, DependsOn: t.DependsOn, Priority: t.Priority,
+							WriteScopes: t.WriteScopes,
 						}
 					}
 					return out
@@ -795,6 +796,7 @@ func runCmd() *cobra.Command {
 						out[i] = agent.DAGTaskSummary{
 							ID: t.ID, Subject: t.Subject, Description: t.Description,
 							Status: t.Status, Owner: t.Owner, DependsOn: t.DependsOn, Priority: t.Priority,
+							WriteScopes: t.WriteScopes,
 						}
 					}
 					return out
@@ -837,7 +839,14 @@ func runCmd() *cobra.Command {
 				// 统一学习循环 (design/03 §4.3): 此前 NewEvolutionLoop 全仓零生产调用方,
 				// submitLearn 永远走回落直调 —— 循环写完了但没通电。挂上它才有去重/预算闸/
 				// 空闲期深度整理, 也才有学习器 d/e 的运行相位。
-				evoLoop := agent.NewEvolutionLoop(evoEngine, nil, agent.EvolutionLoopConfig{})
+				// 13.8.2: 把 LLM 计量器接进循环, learn_llm_tokens (source=evolution) 才有
+				// 记账落点。typed-nil: GlobalLLMCollector 可能返回 nil *Collector, 直接
+				// 传接口会把 nil 包成非 nil 接口, l.metrics != nil 误判为真。
+				var evoSink agent.MetricsSink
+				if c := metrics.GlobalLLMCollector(); c != nil {
+					evoSink = c
+				}
+				evoLoop := agent.NewEvolutionLoop(evoEngine, evoSink, agent.EvolutionLoopConfig{})
 				evoLoop.EnableStructureLearning(agent.StructureConfig{
 					StateDir: filepath.Dir(evoDir),
 					// Reflector 用 fallback 档位模型 —— §4.2 H3 明令禁止拿被评估的主模型
@@ -1379,6 +1388,9 @@ JSON 配置文件示例:
 			// 见下方 dispatchMode 分支 (挂端点) 与 NewBot 之后的接线 (换执行工厂)。
 			var workerBroker *worker.Broker
 			var runtimeReg agent.RuntimeRegistry
+			// clusterRegRef 分布式控制面 worker 注册表 (13.7.9 池观测注入用):
+			// 仅 --dispatch-mode queue 下赋值; dashboard 池聚合经它只读 Alive()。
+			var clusterRegRef *cluster.Registry
 			// cwd 档位策略 (design/02 §3.3): Broker 与执行工厂必须用**同一份**,
 			// 否则会出现"工厂声明了工作区但 Broker 不下发档位"这类半通电状态。
 			var wsPolicy *worker.WorkspacePolicy
@@ -1449,6 +1461,7 @@ JSON 配置文件示例:
 					}
 					workerBroker = brk
 					runtimeReg = agent.NewRuntimeRegistry()
+					clusterRegRef = clusterReg
 					config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
 						func(mux *http.ServeMux) {
 							cluster.Mount(mux, clusterQueue, clusterReg)
@@ -1517,6 +1530,14 @@ JSON 配置文件示例:
 							}
 							sort.Strings(aliases)
 							return aliases
+						})
+						// 13.7.9 池观测: control 装配时注入 worker 注册表【解析器】, 启用
+						// /api/pool 的 workers 段 (clusterRegRef 仅 queue 模式赋值)。
+						dsrv.SetPoolLister(func() ([]cluster.WorkerInfo, error) {
+							if clusterRegRef == nil {
+								return nil, nil
+							}
+							return clusterRegRef.Alive()
 						})
 						fmt.Printf("[Dashboard] 已挂载到 wiki API 端口 %d (stateDir=%s)\n",
 							config.Wiki.APIPort, stateDir)
@@ -1859,7 +1880,11 @@ func evoCmd() *cobra.Command {
 		Short: "技能进化门禁: 依据奖励证据裁决 shadow 技能晋升/退役 (--apply 生效, 默认 dry-run)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sd := resolveStateDir()
-			res, err := skillaudit.Audit(filepath.Join(sd, "skills"), filepath.Join(sd, "evolution", "rewards.jsonl"), apply)
+			// 13.8.6 P1: 传 trace log 目录启用配对归因 (policy_decision 留痕);
+			// 目录不存在时 readPolicySkills 返回空映射 → 自动回退时序判据。
+			res, err := skillaudit.AuditWithTraces(
+				filepath.Join(sd, "skills"), filepath.Join(sd, "evolution", "rewards.jsonl"),
+				filepath.Join(sd, "statestore", "log"), apply)
 			if err != nil {
 				return err
 			}
@@ -1980,13 +2005,13 @@ func workerCmd() *cobra.Command {
 			go func() {
 				t := time.NewTicker(30 * time.Second)
 				defer t.Stop()
-				_ = client.Heartbeat(caps, kinds) // 立即注册一次
+				_ = client.Heartbeat(caps, kinds, nil) // 立即注册一次
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					case <-t.C:
-						if err := client.Heartbeat(caps, kinds); err != nil {
+						if err := client.Heartbeat(caps, kinds, nil); err != nil {
 							log.Printf("[worker] 心跳失败: %v", err)
 						}
 					}
@@ -3106,6 +3131,11 @@ func cliSkillCreator(layout *basedir.Layout, stateDir string, eng *engine.QueryE
 // P0 过渡方案: P2 分层接口 (design/02 R0) 落地后由显式依赖注入取代。
 var cliDreamer *dreaming.Dreamer
 
+// cliPoolPolicy 池个性化 policy 的两段式注入载体 (13.7-P1): buildEngine 装配点
+// 先建空 policy 传给包装三件, TraceStore 创建后补 SetStateDir/SetTraceStore。
+// 仅在统一池开启时非 nil。
+var cliPoolPolicy *builtin.PoolPolicy
+
 // cliDreamAdapter 适配 dreaming.Dreamer → agent.DreamRecorder (与 feishu.dreamAdapter 同构)。
 type cliDreamAdapter struct{ dreamer *dreaming.Dreamer }
 
@@ -3528,6 +3558,25 @@ func buildEngine() (*engine.QueryEngine, error) {
 		}
 	}
 
+	// 13.7-P0 统一池 (§13.7.2「注册不懒、广告懒」): env 开关默认关, 开启后
+	// 自训练/动态资产 (evo_*/Media/CodeIntel) 下沉池内、广告面只发包装三件+已加载面。
+	// 开关解析与 WeakModel 同模式 (显式 > 默认关); 治理集与 toolExposed 同源拷贝。
+	if tool.PoolEnabled(os.Getenv) {
+		// 13.7-P1 两段式注入: 装配点早于 stateDir/ts 创建 (下方 :3569/:3621), 先建
+		// 空 policy 挂上包装三件, ts 就绪后再 SetStateDir/SetTraceStore 补齐
+		// (仿 agentTool.SetTraceStore 先例)。CLI 路径无团队语义 (Team/Role 空),
+		// 个性化不表达, 但留痕 Span 与 α>0 手动实验 (CLAUDE_GO_POOL_ALPHA) 均可用。
+		pp := builtin.NewPoolPolicy("", nil)
+		pool := builtin.RegisterPoolTools(reg, skillReg, cfg.DisabledTools, cfg.AllowedTools, pp)
+		// 13.7-P2 L1 配给: 描述位按 bandit 后验配给 (CLI 无团队语义, 空键后验)。
+		// SkillListing 是启动快照, 冷启动后验要等下方 SetStateDir 回灌完才可见 ——
+		// 那里再重渲染一次 (系统提示词逐轮重建, 读的是同一字符串)。
+		skillReg.SetRanker(pp.RankScore)
+		log.Printf("[toolpool] 统一池已启用: 池内 %d 项下沉 (evo_*/Media/CodeIntel), 广告面=基础+包装三件+已加载",
+			len(pool.MemberNames()))
+		cliPoolPolicy = pp // 存活到 TraceStore 创建后补注入
+	}
+
 	eng := engine.NewQueryEngine(cfg, apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
 
 	// Path B 子代理分解引导: 配置了执行模型时, 提示规划方把工具密集/可并行子任务
@@ -3607,9 +3656,27 @@ func buildEngine() (*engine.QueryEngine, error) {
 	agentTool.SetTraceStore(ts)
 	delegateTool.SetTraceStore(ts)
 	deps.traceStore = ts
+	// 13.7-P1 池 policy 后置注入第二段: stateDir/ts 此刻已就绪, 补齐 bandit 持久化
+	// (<state>/evolution/poolbandit.json + trace 回灌) 与选择留痕 Span (两段式, 见
+	// 上方池装配点)。
+	if cliPoolPolicy != nil {
+		cliPoolPolicy.SetStateDir(stateDir)
+		cliPoolPolicy.SetTraceStore(ts)
+		// 13.7-P2 L1 配给第二段: coldStart 回灌后后验可见, SkillListing 重渲染
+		// (启动时快照 + 逐轮重建读同一字段, 引擎下轮即用新序)。
+		promptMgr.SkillListing = skillReg.FormatShortListingForDir(0, cwd)
+	}
 	if ttl := tracestore.TTLFromEnv(); ttl > 0 {
 		// 每小时扫一次足够: trace 文件按 run 落, 清理粒度是"整个文件过期"。
 		tracestore.StartJanitor(context.Background(), filepath.Join(stateDir, "statestore", "log"), ttl, time.Hour)
+	}
+
+	// 13.6-P1 F4: 技能目录热刷新 (长驻 REPL 期间增删改 SKILL.md 即时生效)。
+	// 清单/快照型消费方 (promptMgr.SkillListing) 不在此刷新 —— 下轮 runIsolated
+	// 的引擎各自现读注册表; 进程退出随进程结束, 无需显式 Stop。失败降级不阻塞。
+	skillWatcher := skills.NewDirWatcher(skillReg)
+	if err := skillWatcher.Start(); err != nil {
+		log.Printf("[Skills] 热刷新未启用 (%v), 手动 /skill reload 仍可用", err)
 	}
 
 	// 组件是在 NewQueryEngine **之后**赋的, 必须重建一次 HookChain。

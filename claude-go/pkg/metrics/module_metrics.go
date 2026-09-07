@@ -433,6 +433,19 @@ const (
 	MEvoDistillCount    = "evo_distill_count"       // 提炼次数
 	MEvoPruneCount      = "evo_prune_count"         // 剪枝数量
 	MEvoFailTrajectory  = "evo_fail_trajectory_pct" // 失败轨迹占比
+
+	// 13.8.2 六新指标（三层金字塔 L1 健康度 / L2 效果）。折叠口径见
+	// pkg/evolution/ledger.go；产方：CollectMetrics（gauge 快照）与
+	// EvoRollbackTool（rollback counter），学习路径 token 由 llm.jsonl 标签折叠。
+	MEvoLearnRoundCount       = "learn_round_count"        // 学习轮次 (counter)
+	MEvoLearnRoundDuration    = "learn_round_duration_sec" // 单轮学习耗时 (gauge)
+	MEvoLearnLLMTokens        = "learn_llm_tokens"         // 学习路径 LLM token (counter, source=evolution)
+	MEvoLearningCostRatio     = "learning_cost_ratio"      // 学习 token ÷ 总 token (gauge, 闸 ≤0.10)
+	MEvoRewardDistKS          = "reward_dist_ks"           // 奖励分布漂移 KS (gauge, >0.3 告警)
+	MEvoCanaryWinRate         = "canary_win_rate"          // 灰度实验 uplift>0 占比 (gauge, 周<0.4 告警)
+	MEvoPromoteSurvival30d    = "promote_survival_30d"     // 晋升 30 天生存率 (gauge, <0.7 告警)
+	MEvoRollbackCount         = "evo_rollback_count"       // 回滚触发数 (counter)
+	MEvoInjectionUpliftPaired = "injection_uplift_paired"  // 配对注入 uplift (gauge, NaN=无可判定桶不落盘)
 )
 
 // Task 指标
@@ -565,6 +578,7 @@ const (
 	MLLMPromptTooLong         = "llm_prompt_too_long"         // prompt 超长次数
 	MLLMPromptComponentChars  = "llm_prompt_component_chars"  // prompt 组件字符数
 	MLLMPromptComponentTokens = "llm_prompt_component_tokens" // prompt 组件估算 token 数
+	MLLMPromptSurfaceTokens   = "llm_prompt_surface_tokens"   // prompt 组件 usage 锚定 token (F10 表面定价)
 )
 
 // LLM 限流/熔断 指标 (与 RateLimitGuard / Client 熔断器状态绑定, 周期性采样)
@@ -620,6 +634,7 @@ var MetricType = map[string]MetricKind{
 	MLLMTotalTokens:           "histogram",
 	MLLMPromptComponentChars:  "histogram",
 	MLLMPromptComponentTokens: "histogram",
+	MLLMPromptSurfaceTokens:   "histogram",
 
 	// Team 计数器
 	MTeamRunCount:          "counter",

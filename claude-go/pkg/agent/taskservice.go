@@ -28,6 +28,14 @@
 //     per-instance。两个 claude-go 进程指向同一 stateDir 并发 Submit 仍可能各建一份档案。
 //     动作队列的认领走 os.Rename, 那一步是跨进程原子的。
 //
+// F12 (goal 事件溯源 CAS): 本服务的任务状态机是规格里"目标状态机"的现实落点
+// (GoalTree 已删除, 见 orch-dynamic)。分工: 档案 KV 是状态机的**投影**,
+// tasks-journal 事件流 (taskJournalEvent) 是唯一真源 —— from/to/rev/seq 链条
+// 连续即可重放出状态机演进史 (ReadJournal)。并发纪律: 内部迁移 (transition)
+// 保持"最后写者胜"不改既有行为; 外部多 agent 更新必须走 TransitionCAS /
+// Refine 的乐观并发检查, Revision 不匹配即拒绝 (ErrStateConflict), 不再允许
+// 无版本检查的读改写静默覆盖。
+//
 // 向后兼容: 本文件不改 RunTeam/WaitDone/tryStartTeam 的任何签名或行为。TeamRunner 是
 // 骑在它们上面的适配器, 两套入口可以并存。
 package agent
@@ -37,6 +45,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,6 +58,10 @@ import (
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/statestore"
 )
+
+// ErrStateConflict 乐观并发冲突: 更新携带的期望修订号与档案当前修订号不符
+// (或档案已被并发方迁移到别的状态)。调用方应重读档案重试, 而不是盲写覆盖。
+var ErrStateConflict = errors.New("taskservice: 状态迁移冲突 (乐观并发 CAS)")
 
 // ---------------------------------------------------------------------------
 // 数据模型
@@ -129,10 +142,15 @@ type TaskRefine struct {
 }
 
 // TaskRecord 任务档案 (KV 中的持久形态)。
+//
+// Revision 是乐观并发版本号: 每次对档案的落盘更新 +1, 外部更新者 (TransitionCAS)
+// 必须携带它读到的 Revision 作为期望值, 不匹配即被拒绝 —— 这是"多 agent 同时改
+// 目标有冲突检测"的那一刀。零值兼容旧档案 (视作 rev=0, 首次 CAS 带期望 0 仍可命中)。
 type TaskRecord struct {
 	ID          string            `json:"id"`
 	Spec        TaskSpec          `json:"spec"`
 	State       TaskState         `json:"state"`
+	Revision    int64             `json:"revision,omitempty"`
 	IdemKey     string            `json:"idemKey"`
 	IdemScope   IdemScope         `json:"idemScope"`
 	Source      string            `json:"source,omitempty"`
@@ -182,6 +200,14 @@ type TaskService interface {
 	Refine(id, feedback, fromNode string) error
 	// List 列出任务档案 (按提交时间倒序)。
 	List(f TaskFilter) []TaskRecord
+	// TransitionCAS 目标状态机的乐观并发更新 (F12): 携带读到的 Revision 做
+	// 期望检查, 冲突返回 ErrStateConflict。mutate 拿到**未加锁的档案副本**, 在
+	// 其上声明目标状态与字段变更 (改 State 即一次状态迁移, 只改字段则是纯更新);
+	// 返回 (nil, nil) 表示本次不落盘。apply=0 让本服务按 mutate 声明的目标态
+	// 迁移; 档案修订号由本服务维护, mutate 不必也不能自增。
+	TransitionCAS(id string, expectRevision int64, mutate func(rec *TaskRecord) error) (TaskRecord, error)
+	// ReadJournal 重放事件流 (唯一真源, 按追加序); 不存在/为空返回空切片。
+	ReadJournal(id string) ([]TaskJournalEvent, error)
 }
 
 // TaskRunner 任务执行器: 把一份任务档案真正跑到终态。
@@ -252,6 +278,12 @@ type FileQueueTaskService struct {
 
 	submitMu sync.Mutex // 让"查重 + 建档"在本实例内原子 (跨进程不保证)
 
+	// recMu 保护 CAS 读改写循环: 每个任务档案一把, per-instance
+	// (跨进程边界与包注释"不承诺跨进程幂等"一致 —— 跨进程的竞争方仍须靠
+	// TransitionCAS 的 Revision 检查拒绝, 本锁只保证本进程的 Get→Put 不被打断)。
+	recMu   sync.Mutex
+	recLock map[string]*sync.Mutex
+
 	mu       sync.Mutex
 	cancels  map[string]context.CancelFunc // id → 运行 ctx 的 cancel
 	desired  map[string]TaskState          // id → 被中断后应落到的终态 (paused/stopped)
@@ -289,6 +321,7 @@ func NewFileQueueTaskService(opts TaskServiceOptions) *FileQueueTaskService {
 		actionsDir: opts.ActionsDir,
 		staleClaim: stale,
 		executor:   opts.ActionExecutor,
+		recLock:    make(map[string]*sync.Mutex),
 		cancels:    make(map[string]context.CancelFunc),
 		desired:    make(map[string]TaskState),
 		waiters:    make(map[string][]chan struct{}),
@@ -359,6 +392,31 @@ func DeriveIdemKey(spec TaskSpec) string {
 	return "derived-" + shortHash(idemParts(spec))
 }
 
+// TaskJournalEvent 状态机事件流 (tasks-journal) 的一条记录 —— 目标状态机的唯一真源。
+//
+// 与 pkg/graph/journal.go 的 Event 同一构型 (Seq + TS + 类型 + 数据), 但只服务本
+// 状态机: Seq 由追加时从流尾推得 (重放即可重建), Revision 记录事件发生后档案的
+// 修订号。From→To 构成状态迁移链; To=="" 的纯字段更新事件 From 仍记录更新时状态。
+type TaskJournalEvent struct {
+	Seq      int64  `json:"seq"`                // 事件序号 (从 1 起, 重放校验用)
+	TS       int64  `json:"ts"`                 // UnixMilli
+	Task     string `json:"task"`               // 任务 ID
+	From     string `json:"from"`               // 迁移前状态 (submit 事件为空)
+	To       string `json:"to"`                 // 迁移后状态; 纯字段更新时与 From 相同
+	Revision int64  `json:"revision,omitempty"` // 事件后档案修订号 (F12 起; 旧事件缺省)
+	Note     string `json:"note,omitempty"`     // 事件语义: submit / running / failed:<err> / cas / refine / resume / conflict
+	Conflict bool   `json:"conflict,omitempty"` // CAS 冲突被拒绝 (更新被拒也要留痕, 这正是审计价值)
+}
+
+// journalParse 把一行 JSON 反序列化成事件; 解析失败 (崩溃残行) 返回 false。
+func journalParse(line []byte) (TaskJournalEvent, bool) {
+	var ev TaskJournalEvent
+	if err := json.Unmarshal(line, &ev); err != nil {
+		return TaskJournalEvent{}, false
+	}
+	return ev, true
+}
+
 // activeKey 活跃索引的键 (与幂等键同构, 但独立成表: 显式幂等键不该绕过"同团队不并发跑")。
 func activeKey(spec TaskSpec) string {
 	return "active-" + shortHash(idemParts(spec))
@@ -383,6 +441,18 @@ func (s *FileQueueTaskService) currentRunner() TaskRunner {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.runner
+}
+
+// recordMu 取任务档案对应的 CAS 锁 (惰性创建, per-instance)。
+func (s *FileQueueTaskService) recordMu(id string) *sync.Mutex {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	l, ok := s.recLock[id]
+	if !ok {
+		l = &sync.Mutex{}
+		s.recLock[id] = l
+	}
+	return l
 }
 
 // Submit 见 TaskService.Submit。
@@ -427,6 +497,7 @@ func (s *FileQueueTaskService) Submit(spec TaskSpec, opts SubmitOpts) (TaskRecor
 		SubmittedAt: time.Now(),
 		Meta:        opts.Meta,
 	}
+	rec.Revision = 1 // 建档即 rev=1 (KV 投影初值); 后续每次落盘 +1
 	if err := s.records.Put(rec.ID, rec); err != nil {
 		return TaskRecord{}, fmt.Errorf("taskservice: 建档失败: %w", err)
 	}
@@ -439,7 +510,7 @@ func (s *FileQueueTaskService) Submit(spec TaskSpec, opts SubmitOpts) (TaskRecor
 		s.writeErr.Add(1)
 		logging.For("taskservice").Warn("活跃索引写入失败", "task", rec.ID, "err", err)
 	}
-	s.appendJournal(rec.ID, "", TaskStatePending, "submit")
+	s.appendJournal(rec.ID, "", TaskStatePending, rec.Revision, "submit")
 	s.startRun(rec)
 	return rec, nil
 }
@@ -650,7 +721,16 @@ func (s *FileQueueTaskService) startRun(rec TaskRecord) {
 }
 
 // transition 落一次状态迁移 (档案 + 审计流 + 唤醒 waiter), 返回迁移后的档案。
+//
+// 内部迁移保持"最后写者胜" (加 per-record 锁避免读改写被打断, 但不做版本拒绝):
+// 执行 goroutine 与 Pause/Stop 的竞态已有 desired/interrupted 协议裁决, 这里引入
+// 版本拒绝只会让运行器完成后的 completed 落盘被 Pause 的 archived 迁移挡掉。
+// 外部多 agent 更新必须走 TransitionCAS —— 那条路上冲突即拒绝。
 func (s *FileQueueTaskService) transition(id string, to TaskState, output, errMsg string) TaskRecord {
+	lock := s.recordMu(id)
+	lock.Lock()
+	defer lock.Unlock()
+
 	rec, ok := s.Get(id)
 	if !ok {
 		return TaskRecord{}
@@ -677,17 +757,101 @@ func (s *FileQueueTaskService) transition(id string, to TaskState, output, errMs
 		}
 		rec.Error = errMsg
 	}
-	if err := s.records.Put(id, rec); err != nil {
-		// fail-open: 档案写不进去不回滚执行 (活已经干了), 但计数 + 告警。
-		s.writeErr.Add(1)
-		logging.For("taskservice").Warn("任务档案落盘失败", "task", id, "state", string(to), "err", err)
-	}
+	rec.Revision++
+	s.putRecord(rec)
 	if to.Terminal() {
 		s.clearActive(rec)
 	}
-	s.appendJournal(id, from, to, errMsg)
+	s.appendJournal(id, from, to, rec.Revision, errMsg)
 	s.notifyWaiters(id)
 	return rec
+}
+
+// putRecord 档案落盘的统一出口: 失败不回滚 (活已经干了) 但计数 + 告警。
+func (s *FileQueueTaskService) putRecord(rec TaskRecord) {
+	if err := s.records.Put(rec.ID, rec); err != nil {
+		s.writeErr.Add(1)
+		logging.For("taskservice").Warn("任务档案落盘失败", "task", rec.ID, "state", string(rec.State), "err", err)
+	}
+}
+
+// TransitionCAS 见 TaskService.TransitionCAS —— F12 的落点: 外部更新者携带读到的
+// Revision, 命中才写, 冲突即拒绝 (ErrStateConflict) 并留 conflict 事件。
+func (s *FileQueueTaskService) TransitionCAS(id string, expectRevision int64, mutate func(rec *TaskRecord) error) (TaskRecord, error) {
+	lock := s.recordMu(id)
+	lock.Lock()
+	defer lock.Unlock()
+
+	rec, ok := s.Get(id)
+	if !ok {
+		return TaskRecord{}, fmt.Errorf("taskservice: 任务 %q 不存在", id)
+	}
+	if rec.Revision != expectRevision {
+		s.appendJournal(id, rec.State, rec.State, rec.Revision, "conflict")
+		return rec, fmt.Errorf("%w: 任务 %s 期望 rev=%d 实际 rev=%d (当前态=%s)", ErrStateConflict, id, expectRevision, rec.Revision, rec.State)
+	}
+	from := rec.State
+	// mutate 拿副本: 它对 rec 的修改在声明点上生效, Revision 由本服务维护。
+	if mutate != nil {
+		if err := mutate(&rec); err != nil {
+			return rec, err
+		}
+	}
+	to := rec.State
+	// 走与 transition 相同的字段不变式 (时间戳/Attempts/Output/Error 语义)。
+	if to != from {
+		now := time.Now()
+		switch to {
+		case TaskStateRunning:
+			rec.StartedAt = now
+			rec.Attempts++
+			rec.Error = ""
+		case TaskStatePending:
+			rec.FinishedAt = time.Time{}
+			rec.Error = ""
+		default:
+			if to.Terminal() || to == TaskStatePaused {
+				rec.FinishedAt = now
+			}
+			// Error/Output 由 mutate 声明, 这里不覆盖
+		}
+	}
+	rec.Revision++
+	note := "cas"
+	if to != from {
+		note = "cas:" + string(to)
+	}
+	s.putRecord(rec)
+	if to != from && to.Terminal() {
+		s.clearActive(rec)
+	}
+	s.appendJournal(id, from, to, rec.Revision, note)
+	s.notifyWaiters(id)
+	return rec, nil
+}
+
+// ReadJournal 见 TaskService.ReadJournal: 重放事件流, Seq 必须连续 (1..N)。
+// 尾部崩溃残行静默跳过 (与 AppendLog 的容忍语义一致), 其余按追加序返回。
+func (s *FileQueueTaskService) ReadJournal(id string) ([]TaskJournalEvent, error) {
+	var out []TaskJournalEvent
+	var seq int64
+	err := s.journal.ReadAll(func(line []byte) error {
+		ev, ok := journalParse(line)
+		if !ok {
+			return nil // 崩溃残行: 事件溯源容忍尾部截断
+		}
+		if id != "" && ev.Task != id {
+			return nil
+		}
+		seq++
+		ev.Seq = seq // 重放时按追加序重建序号, 校验由调用方用返回值核对
+		out = append(out, ev)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("taskservice: 重放事件流失败: %w", err)
+	}
+	return out, nil
 }
 
 // clearActive 释放活跃索引 (只在仍指向本任务时删, 免得踩掉后来者)。
@@ -703,12 +867,15 @@ func (s *FileQueueTaskService) clearActive(rec TaskRecord) {
 	}
 }
 
-func (s *FileQueueTaskService) appendJournal(id string, from, to TaskState, note string) {
-	err := s.journal.Append(map[string]any{
-		"ts": time.Now().UnixMilli(), "task": id,
-		"from": string(from), "to": string(to), "note": note,
-	})
-	if err != nil {
+func (s *FileQueueTaskService) appendJournal(id string, from, to TaskState, rev int64, note string) {
+	ev := TaskJournalEvent{
+		TS: time.Now().UnixMilli(), Task: id,
+		From: string(from), To: string(to), Revision: rev, Note: note,
+	}
+	if strings.HasPrefix(note, "conflict") {
+		ev.Conflict = true
+	}
+	if err := s.journal.Append(ev); err != nil {
 		s.writeErr.Add(1)
 	}
 }
@@ -781,6 +948,8 @@ func (s *FileQueueTaskService) Resume(id string) error {
 // Refine 见 TaskService.Refine。
 // 反馈写进 Spec.Params (feedback/fromNode), 由运行器决定怎么用 —— TeamRunner 会
 // 转成 RefineTeam(name, feedback, targetStage)。
+// 留痕走 TransitionCAS (F12): 精修会改写目标参数, 是典型的外部多 agent 更新,
+// 必须带版本检查, 两个并发精修只有一个能落上。
 func (s *FileQueueTaskService) Refine(id, feedback, fromNode string) error {
 	if strings.TrimSpace(feedback) == "" {
 		return fmt.Errorf("taskservice: 精修反馈不能为空")
@@ -795,13 +964,17 @@ func (s *FileQueueTaskService) Refine(id, feedback, fromNode string) error {
 	if s.currentRunner() == nil {
 		return fmt.Errorf("taskservice: 未注入 TaskRunner, 无法精修")
 	}
-	rec.Refines = append(rec.Refines, TaskRefine{At: time.Now(), Feedback: feedback, FromNode: fromNode})
-	if rec.Spec.Params == nil {
-		rec.Spec.Params = map[string]any{}
-	}
-	rec.Spec.Params["feedback"] = feedback
-	rec.Spec.Params["fromNode"] = fromNode
-	if err := s.records.Put(rec.ID, rec); err != nil {
+	expect := rec.Revision
+	_, err := s.TransitionCAS(id, expect, func(r *TaskRecord) error {
+		r.Refines = append(r.Refines, TaskRefine{At: time.Now(), Feedback: feedback, FromNode: fromNode})
+		if r.Spec.Params == nil {
+			r.Spec.Params = map[string]any{}
+		}
+		r.Spec.Params["feedback"] = feedback
+		r.Spec.Params["fromNode"] = fromNode
+		return nil
+	})
+	if err != nil {
 		return fmt.Errorf("taskservice: 精修留痕失败: %w", err)
 	}
 	if err := s.active.Put(activeKey(rec.Spec), rec.ID); err != nil {

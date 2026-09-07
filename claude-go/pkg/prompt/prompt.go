@@ -146,8 +146,14 @@ func (m *Manager) buildDefaultSystemPrompt(tools *tool.Registry) string {
 	var mcpTools []string
 	var builtinTools []string
 	sb.WriteString("<available_tools>\n")
+	// 13.7-P0: available_tools 段与 API 广告面同口径 —— 池内未加载资产不写进
+	// system prompt (模型侧声明面 = API 工具表 = 已加载面 + 池外 + 包装三件)。
+	// 池未挂载 (默认关) 时 Pool() 为 nil, Advertised 恒 true, 行为零变化。
 	for _, t := range tools.All() {
 		name := t.Name()
+		if !tools.Pool().Advertised(name) {
+			continue
+		}
 		desc := firstLine(t.Description())
 		sb.WriteString(fmt.Sprintf("- %s: %s\n", name, desc))
 		if strings.HasPrefix(name, "mcp_") {

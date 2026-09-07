@@ -29,7 +29,7 @@ func TestClusterHTTPRoundTrip(t *testing.T) {
 	client := NewClient(srv.URL, "w-test")
 
 	// 心跳注册
-	if err := client.Heartbeat([]string{"bash"}, []string{"stage"}); err != nil {
+	if err := client.Heartbeat([]string{"bash"}, []string{"stage"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	alive, _ := reg.Alive()

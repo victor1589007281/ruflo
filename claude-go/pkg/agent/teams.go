@@ -77,6 +77,7 @@ type DAGTaskSummary struct {
 	Owner       string   `json:"owner"`
 	DependsOn   []string `json:"dependsOn,omitempty"`
 	Priority    int      `json:"priority,omitempty"`
+	WriteScopes []string `json:"writeScopes,omitempty"` // F13: 任务声明的写域
 }
 
 // TaskStoreForDAG 是 builtin.TaskStore 暴露给 agent 层的最小接口。
@@ -95,6 +96,7 @@ type TaskStoreDAGAdapter struct {
 		AddTask(subject, description, owner string) (string, error)
 		SetTaskStatus(id, status string) error
 		AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
+		AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error)
 		SetTaskStatusAndUnblock(id, status string) (int, error)
 		ReevaluateBlockedTasks() int
 	}
@@ -109,6 +111,7 @@ func NewTaskStoreDAGAdapter(
 		AddTask(subject, description, owner string) (string, error)
 		SetTaskStatus(id, status string) error
 		AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
+		AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error)
 		SetTaskStatusAndUnblock(id, status string) (int, error)
 		ReevaluateBlockedTasks() int
 	},
@@ -126,6 +129,9 @@ func (a *TaskStoreDAGAdapter) SetTaskStatus(id, status string) error {
 }
 func (a *TaskStoreDAGAdapter) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
 	return a.store.AddTaskWithDeps(subject, description, owner, dependsOn, priority)
+}
+func (a *TaskStoreDAGAdapter) AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error) {
+	return a.store.AddTaskFull(subject, description, owner, dependsOn, priority, writeScopes)
 }
 func (a *TaskStoreDAGAdapter) ReadyTasks() []DAGTaskSummary {
 	return a.readyFunc()

@@ -176,6 +176,11 @@ func (l *EvolutionLoop) evolvePrompts(ctx context.Context, cfg StructureConfig) 
 			"prompt 进化跳过 (design/03 §4.2 H3 禁止用主模型自评)", len(weak), weak[0].Node, weak[0].MeanScore)
 		return
 	}
+	// 13.8.2 learn_llm_tokens 口径: prompt 反思的 LLM 调用打上 source=evolution 标签,
+	// 与 LearnFromTeam 的蒸馏路径同构。ctx 会透传进 Reflector.SimpleComplete
+	// (learners/workflow.go), SendMessage 处 applyLLMMetricsContext 读到标签后写入
+	// llm.jsonl, FoldLearnLLMTokens 才能把它从总 token 里分出来。
+	ctx = api.WithLLMMetrics(ctx, api.LLMMetricsContext{Source: "evolution", Purpose: "prompt_evolve"})
 	done := 0
 	for _, w := range weak {
 		if done >= cfg.MaxPromptEvolvePerRound {

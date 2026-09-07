@@ -40,6 +40,12 @@ type SkillState struct {
 	Samples   int     // 参与裁决的奖励样本数
 	RewardAvg float64 // 相关奖励均值
 	Verdict   string  // promote | retire | hold | reject_escalation | (空=非 shadow 不裁决)
+	// 13.8.6 P1 配对归因: Paired=true 表示裁决用的是配对差值 Delta (带/不带该技能
+	// 的 run 对照, 见 paired.go), 而非时序均值 RewardAvg —— RewardAvg 仍保留供对照。
+	Paired   bool
+	Delta    float64 // 配对差值 = 带该技能 run 均值 − 不带 run 均值
+	WithN    int     // 带该技能的 run 数
+	WithoutN int     // 不带该技能的 run 数
 	// RejectReasons 不越权闸的拒绝理由 (Verdict=reject_escalation 时非空)。
 	RejectReasons []string
 }
@@ -69,6 +75,7 @@ type rewardRow struct {
 	Team   string  `json:"team,omitempty"`
 	Source string  `json:"source,omitempty"`
 	Weight float64 `json:"weight,omitempty"`
+	RunID  string  `json:"run_id,omitempty"` // 13.8.6 P1 配对归因的 join 键 (与 RewardEvent 同 tag)
 }
 
 // weight 取这条奖励的可信度。
@@ -105,11 +112,27 @@ const auditUnknownWeight = 0.5
 
 // Audit 扫描 skillsDir 下的 shadow 技能, 依据 <state>/evolution/rewards.jsonl 的
 // 奖励证据裁决晋升/退役。apply=true 时真正改写 SKILL.md 的 status; false 为 dry-run。
+//
+// v1 兼容入口: 无 trace 留痕 → 全部走时序均值 (v1 行为)。生产装配请用 AuditWithTraces。
 func Audit(skillsDir, rewardsPath string, apply bool) (*AuditResult, error) {
+	return AuditWithTraces(skillsDir, rewardsPath, "", apply)
+}
+
+// AuditWithTraces 审计主入口 (13.8.6 P1)。traceLogDir 为 tracestore FileStore 的
+// log 目录 (<state>/statestore/log), 供配对归因读 policy_decision Span; 传空则
+// 完全回退 v1 时序判据。
+func AuditWithTraces(skillsDir, rewardsPath, traceLogDir string, apply bool) (*AuditResult, error) {
 	rewards := loadRewards(rewardsPath)
 	// 全局奖励均值作基线; 无奖励时无法裁决
 	if len(rewards) == 0 {
 		return &AuditResult{}, nil
+	}
+	// 13.8.6 P1: 配对证据一次读入, 全体 shadow 技能共用。
+	var traces map[string]runEvidence
+	var scores map[string]runScore
+	if traceLogDir != "" {
+		traces = readPolicySkills(traceLogDir)
+		scores = runScores(rewards)
 	}
 
 	res := &AuditResult{RejectReasons: map[string][]string{}}
@@ -142,8 +165,27 @@ func Audit(skillsDir, rewardsPath string, apply bool) (*AuditResult, error) {
 			st.RewardAvg = weighted / weightSum
 		}
 
+		// 13.8.6 P1 配对归因: 奖励好可能只是同期整体就好。有 policy_decision
+		// 留痕时, 用同池"带/不带该技能"的 run 加权均值差替代时序均值做判据;
+		// 配对证据不足 (任一侧 run 数 < minSamples) 或无留痕 → 回退时序判据。
+		// 判据值仍写 st.RewardAvg 字段 (rewriteStatus 留痕与测试断言的口径不变)。
+		if traces != nil {
+			var createdUnixMilli int64
+			if !created.IsZero() {
+				createdUnixMilli = created.UnixMilli()
+			}
+			if delta, withN, withoutN, ok := pairedDelta(traces, scores, st.Name, createdUnixMilli); ok {
+				st.Paired = true
+				st.Delta = delta
+				st.WithN = withN
+				st.WithoutN = withoutN
+				st.Samples = withN + withoutN
+				st.RewardAvg = delta // 判据值换成配对差值, 阈值/promote 闸语义不变
+			}
+		}
+
 		switch {
-		case n < minSamples:
+		case st.Samples < minSamples:
 			st.Verdict = "hold"
 			res.Held = append(res.Held, st.Name)
 		case st.RewardAvg >= promoteThreshold:
@@ -163,13 +205,13 @@ func Audit(skillsDir, rewardsPath string, apply bool) (*AuditResult, error) {
 			st.Verdict = "promote"
 			res.Promoted = append(res.Promoted, st.Name)
 			if apply {
-				_ = rewriteStatus(path, "active", st.RewardAvg, n)
+				_ = rewriteStatus(path, "active", st.RewardAvg, st.Samples)
 			}
 		case st.RewardAvg <= retireThreshold:
 			st.Verdict = "retire"
 			res.Retired = append(res.Retired, st.Name)
 			if apply {
-				_ = rewriteStatus(path, "archived", st.RewardAvg, n)
+				_ = rewriteStatus(path, "archived", st.RewardAvg, st.Samples)
 			}
 		default:
 			st.Verdict = "hold"

@@ -9,25 +9,28 @@
 //
 // 四步进化流水线 (RECORD → DISTILL → RETRIEVE → EVOLVE):
 //
-//   1. RECORD: 每次 Agent 执行后记录完整轨迹 (输入/输出/错误/耗时/角色)
-//   2. DISTILL: LLM 从成功/失败轨迹中提炼战略原则和错误模式
-//   3. RETRIEVE: 下次执行前按角色+目标检索相关经验, 注入 Agent prompt
-//   4. EVOLVE: 根据使用反馈更新质量分, 晋升/淘汰/去重
+//  1. RECORD: 每次 Agent 执行后记录完整轨迹 (输入/输出/错误/耗时/角色)
+//  2. DISTILL: LLM 从成功/失败轨迹中提炼战略原则和错误模式
+//  3. RETRIEVE: 下次执行前按角色+目标检索相关经验, 注入 Agent prompt
+//  4. EVOLVE: 根据使用反馈更新质量分, 晋升/淘汰/去重
 //
 // 三类经验:
+//
 //   - RoleExperience: 角色特定知识 ("architect 设计API时应...")
+//
 //   - ErrorPattern: 报错→解决方案 ("遇到X错误时, 用Y方法")
+//
 //   - GeneralPrinciple: 跨角色通用原则 ("并行任务注意资源竞争")
 //
-//	┌──────────────────────────────────────────────────────────┐
-//	│ EvolutionEngine                                          │
-//	│  RecordTrajectory()  → 记录执行轨迹                      │
-//	│  LearnFromTeam()     → LLM 批量提炼经验 (团队完成后)     │
-//	│  RetrieveFor()       → BM25 检索相关经验 (执行前)        │
-//	│  FormatForPrompt()   → 格式化为 Agent 可用的 prompt 段   │
-//	│  RecordFeedback()    → 更新经验质量分 (EMA)              │
-//	│  Consolidate()       → 去重/剪枝/晋升 (后台定期)         │
-//	└──────────────────────────────────────────────────────────┘
+//     ┌──────────────────────────────────────────────────────────┐
+//     │ EvolutionEngine                                          │
+//     │  RecordTrajectory()  → 记录执行轨迹                      │
+//     │  LearnFromTeam()     → LLM 批量提炼经验 (团队完成后)     │
+//     │  RetrieveFor()       → BM25 检索相关经验 (执行前)        │
+//     │  FormatForPrompt()   → 格式化为 Agent 可用的 prompt 段   │
+//     │  RecordFeedback()    → 更新经验质量分 (EMA)              │
+//     │  Consolidate()       → 去重/剪枝/晋升 (后台定期)         │
+//     └──────────────────────────────────────────────────────────┘
 package agent
 
 import (
@@ -43,19 +46,22 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/api"
+	evoledger "github.com/anthropic/claude-go/pkg/evolution"
 )
 
 // Experience 经验条目 (V2: 结构化+生命周期+注入追踪)。
 type Experience struct {
 	ID           string    `json:"id"`
-	Category     string    `json:"category"`              // "role", "error", "general"
-	Role         string    `json:"role,omitempty"`         // 角色 (category=role 时有值)
-	Content      string    `json:"content"`                // 经验/原则文本
-	Quality      float64   `json:"quality"`                // 0.0-1.0 (EMA 更新)
-	UsageCount   int       `json:"usageCount"`             // 被检索使用的次数
-	SuccessCount int       `json:"successCount"`           // 使用后任务成功的次数
-	Tags         []string  `json:"tags,omitempty"`         // 标签
-	Source       string    `json:"source"`                 // 来源 (team/stage)
+	Category     string    `json:"category"`       // "role", "error", "general"
+	Role         string    `json:"role,omitempty"` // 角色 (category=role 时有值)
+	Content      string    `json:"content"`        // 经验/原则文本
+	Quality      float64   `json:"quality"`        // 0.0-1.0 (EMA 更新)
+	UsageCount   int       `json:"usageCount"`     // 被检索使用的次数
+	SuccessCount int       `json:"successCount"`   // 使用后任务成功的次数
+	Tags         []string  `json:"tags,omitempty"` // 标签
+	Source       string    `json:"source"`         // 来源 (team/stage)
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`
 
@@ -64,6 +70,14 @@ type Experience struct {
 	Lifecycle  string   `json:"lifecycle,omitempty"`  // "proposed"|"validated"|"promoted"|"active"|"decaying"|"archived"
 	SourceTeam string   `json:"sourceTeam,omitempty"` // 来源团队 (跨团队迁移追踪)
 	MinHashSig []uint64 `json:"minHash,omitempty"`    // MinHash 签名 (快速去重)
+
+	// 三段式 (13.8.6 P2, Trajectory-Informed Memory, arXiv:2603.10600):
+	// 经验蒸馏输出强制 {现象→根因→下一步动作} 结构, 纯叙述性经验不入库。
+	// Content 由 renderTriad 从这三段确定性渲染 —— 检索/注入路径只读 Content,
+	// 既有契约不变; 三段字段本身是 M3 验收 ("新增条目 100% 三段式") 的机械判据。
+	Symptom   string `json:"symptom,omitempty"`   // 现象: 发生了什么 (可观察)
+	RootCause string `json:"rootCause,omitempty"` // 根因: 为什么 (可解释)
+	Action    string `json:"action,omitempty"`    // 下一步动作: 怎么办 (可执行)
 
 	// 注入效果追踪 (参考 Live-Evo 动态权重)
 	InjectionCount   int `json:"injectionCount,omitempty"`   // 被注入次数
@@ -79,6 +93,19 @@ func (e *Experience) SuccessRate() float64 {
 		return 0.5
 	}
 	return float64(e.SuccessCount) / float64(e.UsageCount)
+}
+
+// IsTriadic 是否三段式完备 (13.8.6 P2): 现象+根因+动作三段齐备才算结构化经验。
+// 纯叙述条目 (三段缺任一) 在入库前被拒收 —— M3 验收「经验库新增条目 100% 三段式」
+// 的机械判据。
+func (e *Experience) IsTriadic() bool {
+	return e.Symptom != "" && e.RootCause != "" && e.Action != ""
+}
+
+// renderTriad 把三段渲染为单行 Content (检索/注入路径只读 Content, 契约不变)。
+// 缺段时该段整段省略; 调用方保证入库前已通过 IsTriadic 检查。
+func renderTriad(symptom, rootCause, action string) string {
+	return fmt.Sprintf("现象: %s → 根因: %s → 动作: %s", symptom, rootCause, action)
 }
 
 // InjectionUplift 注入效果: 注入后成功率。
@@ -98,7 +125,11 @@ type InjectionRecord struct {
 	Success  bool     `json:"success"`
 	// Score RewardBus 加权分 [-1,1] (design/03 §4.3a)。Success 只是 Score>0 的投影;
 	// 保留连续分是为了不在这一层把加权证据压回 bool 丢掉。老数据无此字段(0)。
-	Score     float64   `json:"score,omitempty"`
+	Score float64 `json:"score,omitempty"`
+	// RunID trace 四元组 episode id (13.8.4): 注入配对 uplift 的 join 键。
+	// 没有它, 注入记录无法和 run 级事实 (目标签名/总线奖励) 对齐, 配对归因无从做起。
+	// 老数据无此字段(空) —— FoldInjectionUplift 跳过无 RunID 的记录, 不猜。
+	RunID     string    `json:"runId,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -110,8 +141,8 @@ type Trajectory struct {
 	StageName string    `json:"stageName"`
 	Role      string    `json:"role"`
 	Objective string    `json:"objective"`
-	Input     string    `json:"input"`            // 截断的 prompt
-	Output    string    `json:"output"`           // 截断的结果
+	Input     string    `json:"input"`  // 截断的 prompt
+	Output    string    `json:"output"` // 截断的结果
 	Error     string    `json:"error,omitempty"`
 	Success   bool      `json:"success"`
 	Duration  string    `json:"duration"`
@@ -556,6 +587,9 @@ func (ee *EvolutionEngine) LearnFromTeam(ctx context.Context, teamName string) {
 	if ee.llm != nil {
 		distillCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()
+		// 13.8.2 learn_llm_tokens 口径: 学习路径的 LLM 调用打上 source=evolution 标签,
+		// llm.jsonl 据此折叠出学习 token (SimpleComplete→SendMessage 会读 ctx 标签)。
+		distillCtx = api.WithLLMMetrics(distillCtx, api.LLMMetricsContext{Source: "evolution", Purpose: "distill"})
 		ee.llmDistill(distillCtx, teamTrajs, teamName)
 	} else {
 		ee.heuristicDistill(teamTrajs, teamName)
@@ -578,58 +612,94 @@ func (ee *EvolutionEngine) LearnFromTeam(ctx context.Context, teamName string) {
 }
 
 // LearnFromStage 单阶段增量学习 (双向: 成功+失败都提炼, 参考 MiniMax M2.7)。
+// 13.8.6 P2: 两个分支都产出三段式经验 (现象→根因→动作), 叙述性描述不入库。
 func (ee *EvolutionEngine) LearnFromStage(traj Trajectory) {
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
 
 	if traj.Error != "" && !traj.Success {
-		content := fmt.Sprintf("[%s] 执行「%s」失败: %s → 建议: 检查参数和前置依赖",
-			traj.Role, truncateResult(traj.Objective, 80), truncateResult(traj.Error, 150))
-		if !ee.isDuplicate(content) {
+		// 失败分支: 现象=目标+报错, 根因=错误分类, 动作=suggestFix 给的针对性建议。
+		// 叙述性失败记录 (只说"失败了") 不再入库 —— 没有动作的经验不可复用。
+		errType := classifyError(traj.Error)
+		action := suggestFix(errType, traj.Error)
+		if action == "" {
+			return
+		}
+		symptom := fmt.Sprintf("执行「%s」失败: %s",
+			truncateResult(traj.Objective, 80), truncateResult(traj.Error, 150))
+		exp := &Experience{
+			ID:         fmt.Sprintf("exp-inc-%d-%d", time.Now().Unix(), ee.nextID+1),
+			Category:   "error",
+			Role:       traj.Role,
+			Symptom:    symptom,
+			RootCause:  "错误类型: " + errType,
+			Action:     action,
+			Content:    renderTriad(symptom, "错误类型: "+errType, action),
+			Quality:    0.4,
+			Source:     traj.TeamName + "/" + traj.StageName,
+			Tags:       []string{traj.Role, "incremental", "failure", errType},
+			Pattern:    "antidote",
+			Lifecycle:  "proposed",
+			SourceTeam: traj.TeamName,
+			CreatedAt:  time.Now(),
+			UpdatedAt:  time.Now(),
+		}
+		if ee.appendTriadicLocked(exp) {
 			ee.nextID++
 			ee.totalDistilled++
-			ee.experiences = append(ee.experiences, &Experience{
-				ID:         fmt.Sprintf("exp-inc-%d-%d", time.Now().Unix(), ee.nextID),
-				Category:   "error",
-				Role:       traj.Role,
-				Content:    content,
-				Quality:    0.4,
-				Source:     traj.TeamName + "/" + traj.StageName,
-				Tags:       []string{traj.Role, "incremental", "failure"},
-				Pattern:    "antidote",
-				Lifecycle:  "proposed",
-				SourceTeam: traj.TeamName,
-				MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
-				CreatedAt:  time.Now(),
-				UpdatedAt:  time.Now(),
-			})
 		}
 	} else if traj.Success && traj.Output != "" && len(traj.Output) > 100 {
-		content := ee.distillSuccessHeuristic(traj)
-		if content != "" && !ee.isDuplicate(content) {
+		symptom, rootCause, action := ee.distillSuccessHeuristic(traj)
+		if action == "" {
+			return
+		}
+		if rootCause == "" {
+			rootCause = "关键模式有效"
+		}
+		exp := &Experience{
+			ID:         fmt.Sprintf("exp-suc-%d-%d", time.Now().Unix(), ee.nextID+1),
+			Category:   "role",
+			Role:       traj.Role,
+			Symptom:    symptom,
+			RootCause:  rootCause,
+			Action:     action,
+			Content:    renderTriad(symptom, rootCause, action),
+			Quality:    0.6,
+			Source:     traj.TeamName + "/" + traj.StageName,
+			Tags:       []string{traj.Role, "incremental", "success"},
+			Pattern:    "strategy",
+			Lifecycle:  "proposed",
+			SourceTeam: traj.TeamName,
+			CreatedAt:  time.Now(),
+			UpdatedAt:  time.Now(),
+		}
+		if ee.appendTriadicLocked(exp) {
 			ee.nextID++
 			ee.totalDistilled++
-			ee.experiences = append(ee.experiences, &Experience{
-				ID:         fmt.Sprintf("exp-suc-%d-%d", time.Now().Unix(), ee.nextID),
-				Category:   "role",
-				Role:       traj.Role,
-				Content:    content,
-				Quality:    0.6,
-				Source:     traj.TeamName + "/" + traj.StageName,
-				Tags:       []string{traj.Role, "incremental", "success"},
-				Pattern:    "strategy",
-				Lifecycle:  "proposed",
-				SourceTeam: traj.TeamName,
-				MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
-				CreatedAt:  time.Now(),
-				UpdatedAt:  time.Now(),
-			})
 		}
 	}
 }
 
-// distillSuccessHeuristic 从成功执行中启发式提炼经验。
-func (ee *EvolutionEngine) distillSuccessHeuristic(traj Trajectory) string {
+// appendTriadicLocked 入库前唯一闸口: 三段不全的经验直接拒收 (纯叙述不入库),
+// 三段齐备但与库内高度相似的按既有 MinHash+Jaccard 去重丢弃。
+// 返回 true = 真的入了一条 (调用方才推进 nextID/totalDistilled, 计数不虚增)。
+// 调用方必须已持有 ee.mu 写锁。
+func (ee *EvolutionEngine) appendTriadicLocked(exp *Experience) bool {
+	if !exp.IsTriadic() {
+		return false
+	}
+	if ee.isDuplicate(exp.Content) {
+		return false
+	}
+	exp.MinHashSig = computeMinHash(evolutionTokenize(strings.ToLower(exp.Content)), 64)
+	ee.experiences = append(ee.experiences, exp)
+	return true
+}
+
+// distillSuccessHeuristic 从成功执行中启发式提炼三段式经验 (现象→根因→动作)。
+// 返回 (空,空,空) = 无可复用模式, 调用方不入库 —— 成功但说不出"为什么有效"
+// 的条目是纯叙述, 按 13.8.6 P2 纪律拒收。
+func (ee *EvolutionEngine) distillSuccessHeuristic(traj Trajectory) (symptom, rootCause, action string) {
 	output := traj.Output
 	if len(output) > 500 {
 		output = output[:500]
@@ -651,10 +721,13 @@ func (ee *EvolutionEngine) distillSuccessHeuristic(traj Trajectory) string {
 		}
 	}
 	if len(patterns) == 0 {
-		return ""
+		return "", "", ""
 	}
-	return fmt.Sprintf("[%s] 成功执行「%s」— 关键模式: %s",
-		traj.Role, truncateResult(traj.Objective, 60), strings.Join(patterns, "; "))
+	// 现象 = 任务目标; 根因 = 提取到的关键模式 (为什么有效); 动作 = 复用指令。
+	symptom = fmt.Sprintf("执行「%s」成功", truncateResult(traj.Objective, 60))
+	rootCause = fmt.Sprintf("关键模式: %s", strings.Join(patterns, "; "))
+	action = fmt.Sprintf("%s 后续同类任务复用该模式", traj.Role)
+	return symptom, rootCause, action
 }
 
 func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, teamName string) {
@@ -683,19 +756,21 @@ func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, t
 
 	sysPrompt := `你是经验提炼专家。分析多Agent团队的执行轨迹，提炼可复用的经验教训。
 
-输出严格JSON数组 (不要解释):
+每条经验必须是三段式结构 (现象→根因→动作)，输出严格JSON数组 (不要解释):
 [
-  {"category":"role","role":"角色名","content":"该角色的具体经验教训","tags":["关键词"]},
-  {"category":"error","role":"相关角色","content":"问题描述→解决方案","tags":["错误类型"]},
-  {"category":"general","content":"跨角色的通用原则","tags":["关键词"]}
+  {"category":"role","role":"角色名","symptom":"发生了什么(可观察的事实)","rootCause":"为什么(原因/机制)","action":"下一步怎么做(可执行的指令)","tags":["关键词"]},
+  {"category":"error","role":"相关角色","symptom":"报错/异常现象","rootCause":"失败根因","action":"如何避免或修复","tags":["错误类型"]},
+  {"category":"general","symptom":"共性现象","rootCause":"跨角色的共同原因","action":"通用做法","tags":["关键词"]}
 ]
 
 提炼规则:
 1. 从成功轨迹提炼"什么做得好、为什么有效" (category=role 或 general)
 2. 从失败轨迹提炼"出了什么问题、如何避免/解决" (category=error)
-3. 每条经验必须是具体、可操作的 (不要泛泛而谈)
-4. 最多提炼10条最有价值的经验
-5. content 用中文, 简洁明确 (1-3句话)`
+3. 每条必须三段齐备: symptom(现象)、rootCause(根因)、action(动作) 缺一不可
+4. 纯描述性叙述 (只说做了什么/发生了什么, 没有根因或动作) 不要输出
+5. 每段具体、可操作, 不要泛泛而谈
+6. 最多提炼10条最有价值的经验
+7. 用中文, 简洁明确 (每段1-2句话)`
 
 	resp, err := ee.llm.SimpleComplete(ctx, sysPrompt, sb.String())
 	if err != nil {
@@ -715,10 +790,13 @@ func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, t
 	resp = strings.TrimSpace(resp)
 
 	var extracted []struct {
-		Category string   `json:"category"`
-		Role     string   `json:"role"`
-		Content  string   `json:"content"`
-		Tags     []string `json:"tags"`
+		Category  string   `json:"category"`
+		Role      string   `json:"role"`
+		Content   string   `json:"content"` // 老格式兼容字段 (13.8.6 前的模型输出); 三段式判据只看 symptom/rootCause/action
+		Symptom   string   `json:"symptom"`
+		RootCause string   `json:"rootCause"`
+		Action    string   `json:"action"`
+		Tags      []string `json:"tags"`
 	}
 	if err := json.Unmarshal([]byte(resp), &extracted); err != nil {
 		log.Printf("[Evolution] 解析 LLM 结果失败: %v", err)
@@ -730,12 +808,13 @@ func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, t
 	defer ee.mu.Unlock()
 
 	for _, ext := range extracted {
-		if ext.Content == "" {
-			continue
+		// 13.8.6 P2 三段式闸口: 缺根因或缺动作 = 纯叙述, 不入库。
+		// 纯叙述条目没有可复用的"为什么"和"怎么办", 注入只是给下游喂噪声。
+		if ext.Symptom == "" && ext.Content != "" {
+			// 老格式兜底: content 里按"现象→根因→动作"约定分段解析, 解析不出即拒。
+			ext.Symptom, ext.RootCause, ext.Action = parseTriadContent(ext.Content)
 		}
-
-		// 去重: 检查是否已有高度相似的经验
-		if ee.isDuplicate(ext.Content) {
+		if ext.Symptom == "" || ext.RootCause == "" || ext.Action == "" {
 			continue
 		}
 
@@ -752,23 +831,52 @@ func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, t
 			ID:         fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
 			Category:   ext.Category,
 			Role:       ext.Role,
-			Content:    ext.Content,
+			Symptom:    ext.Symptom,
+			RootCause:  ext.RootCause,
+			Action:     ext.Action,
+			Content:    renderTriad(ext.Symptom, ext.RootCause, ext.Action),
 			Quality:    0.5,
 			Tags:       ext.Tags,
-			Source:      teamName,
+			Source:     teamName,
 			Pattern:    pattern,
 			Lifecycle:  "proposed",
 			SourceTeam: teamName,
-			MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(ext.Content)), 64),
+			MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(ext.Symptom+" "+ext.RootCause+" "+ext.Action)), 64),
 			CreatedAt:  time.Now(),
 			UpdatedAt:  time.Now(),
+		}
+		if ee.isDuplicate(exp.Content) {
+			ee.nextID--
+			ee.totalDistilled--
+			continue
 		}
 		ee.experiences = append(ee.experiences, exp)
 	}
 }
 
-// heuristicDistill 启发式经验提炼 (v2: 增强失败记录 + 模式提取)。
+// parseTriadContent 老格式 content 的三段兜底解析: "A → B → C" 或 "现象: A → 根因: B → 动作: C"。
+// 返回空段 = 解析失败 = 调用方拒收 (纯叙述不入库)。
+func parseTriadContent(content string) (symptom, rootCause, action string) {
+	// 剥掉 "现象:/根因:/动作:" 前缀 (若有), 再按 → 切三段。
+	normalized := strings.NewReplacer("现象:", "", "根因:", "", "动作:", "",
+		"现象：", "", "根因：", "", "动作：", "").Replace(content)
+	parts := strings.Split(normalized, "→")
+	if len(parts) != 3 {
+		// 全角箭头兼容
+		parts = strings.Split(normalized, "→")
+	}
+	if len(parts) != 3 {
+		return "", "", ""
+	}
+	symptom = strings.TrimSpace(parts[0])
+	rootCause = strings.TrimSpace(parts[1])
+	action = strings.TrimSpace(parts[2])
+	return symptom, rootCause, action
+}
+
+// heuristicDistill 启发式经验提炼 (v2: 增强失败记录 + 模式提取; 13.8.6 P2: 三段式)。
 // 参考: 人类从错误中学习比从成功中学习更高效 (负强化学习)。
+// 叙述性条目 (无根因或无动作) 不再入库 —— LLM 路径与启发式路径执行同一闸口。
 func (ee *EvolutionEngine) heuristicDistill(trajs []Trajectory, teamName string) {
 	ee.mu.Lock()
 	defer ee.mu.Unlock()
@@ -777,52 +885,78 @@ func (ee *EvolutionEngine) heuristicDistill(trajs []Trajectory, teamName string)
 		// v2: 失败轨迹增强 — 提取具体错误类型并记录上下文
 		if t.Error != "" || !t.Success {
 			errorType := classifyError(t.Error)
-			content := fmt.Sprintf("[%s/%s] 执行「%s」失败 (%s): %s\n建议: %s",
-				t.Role, t.StageName, truncateResult(t.Objective, 80),
-				errorType, truncateResult(t.Error, 150),
-				suggestFix(errorType, t.Error))
-			if !ee.isDuplicate(content) {
+			fix := suggestFix(errorType, t.Error)
+			symptom := fmt.Sprintf("执行「%s」失败 (%s): %s",
+				truncateResult(t.Objective, 80), errorType, truncateResult(t.Error, 150))
+			exp := &Experience{
+				ID:         fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID+1),
+				Category:   "error",
+				Role:       t.Role,
+				Symptom:    symptom,
+				RootCause:  "错误类型: " + errorType,
+				Action:     fix,
+				Content:    renderTriad(symptom, "错误类型: "+errorType, fix),
+				Quality:    0.4,
+				Source:     teamName,
+				Tags:       []string{t.Role, "error", errorType},
+				Pattern:    "antidote",
+				Lifecycle:  "proposed",
+				SourceTeam: teamName,
+				CreatedAt:  time.Now(),
+				UpdatedAt:  time.Now(),
+			}
+			if ee.appendTriadicLocked(exp) {
 				ee.nextID++
 				ee.totalDistilled++
-				ee.experiences = append(ee.experiences, &Experience{
-					ID:         fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
-					Category:   "error",
-					Role:       t.Role,
-					Content:    content,
-					Quality:    0.4,
-					Source:     teamName,
-					Tags:       []string{t.Role, "error", errorType},
-					Pattern:    "antidote",
-					Lifecycle:  "proposed",
-					SourceTeam: teamName,
-					MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
-					CreatedAt:  time.Now(),
-					UpdatedAt:  time.Now(),
-				})
 			}
 		}
 
 		if t.Success && t.Output != "" {
-			content := fmt.Sprintf("[%s/%s] 成功完成「%s」(耗时 %s)",
-				t.Role, t.StageName, truncateResult(t.Objective, 100), t.Duration)
-			if !ee.isDuplicate(content) {
+			// 成功分支: 纯"成功完成"叙述没有根因和动作, 入库前必须能说出模式。
+			output := t.Output
+			if len(output) > 500 {
+				output = output[:500]
+			}
+			var patterns []string
+			for _, line := range strings.Split(output, "\n") {
+				line = strings.TrimSpace(line)
+				isPattern := strings.Contains(line, "func ") || strings.Contains(line, "type ") ||
+					strings.Contains(line, "interface") || strings.Contains(line, "package ") ||
+					strings.Contains(line, "决策") || strings.Contains(line, "选择") ||
+					strings.Contains(line, "方案") || strings.Contains(line, "设计")
+				if isPattern && len(line) > 10 && len(line) < 200 {
+					patterns = append(patterns, line)
+					if len(patterns) >= 3 {
+						break
+					}
+				}
+			}
+			if len(patterns) == 0 {
+				continue // 无根因可说的成功 = 纯叙述, 不入库
+			}
+			symptom := fmt.Sprintf("执行「%s」成功", truncateResult(t.Objective, 100))
+			rootCause := fmt.Sprintf("关键模式: %s", strings.Join(patterns, "; "))
+			action := fmt.Sprintf("%s 后续同类任务复用该模式", t.Role)
+			exp := &Experience{
+				ID:         fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID+1),
+				Category:   "role",
+				Role:       t.Role,
+				Symptom:    symptom,
+				RootCause:  rootCause,
+				Action:     action,
+				Content:    renderTriad(symptom, rootCause, action),
+				Quality:    0.5,
+				Source:     teamName,
+				Tags:       []string{t.Role, "success"},
+				Pattern:    "strategy",
+				Lifecycle:  "proposed",
+				SourceTeam: teamName,
+				CreatedAt:  time.Now(),
+				UpdatedAt:  time.Now(),
+			}
+			if ee.appendTriadicLocked(exp) {
 				ee.nextID++
 				ee.totalDistilled++
-				ee.experiences = append(ee.experiences, &Experience{
-					ID:         fmt.Sprintf("exp-%d-%d", time.Now().Unix(), ee.nextID),
-					Category:   "role",
-					Role:       t.Role,
-					Content:    content,
-					Quality:    0.5,
-					Source:     teamName,
-					Tags:       []string{t.Role, "success"},
-					Pattern:    "strategy",
-					Lifecycle:  "proposed",
-					SourceTeam: teamName,
-					MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
-					CreatedAt:  time.Now(),
-					UpdatedAt:  time.Now(),
-				})
 			}
 		}
 	}
@@ -891,6 +1025,18 @@ func (ee *EvolutionEngine) RecordInjection(expIDs []string, taskID, teamName, ro
 // score>0 记为成功 (Uplift 指标口径不变), 同时把连续分落到 InjectionRecord.Score
 // 供后续分析 —— 否则加权证据在这一步又被压回一个 bool 丢掉。
 func (ee *EvolutionEngine) RecordInjectionScored(expIDs []string, taskID, teamName, role string, score float64) {
+	// 13.8.4: RunID 走单独入口 —— 既有调用方 (老测试/二值路径) 不必跟着改签名。
+	ee.recordInjectionRun(expIDs, taskID, teamName, role, score, "")
+}
+
+// RecordInjectionScoredRun 加权分版本 + RunID (13.8.4 注入留痕通电的落点)。
+// 生产路径 (executeStage) 走这里: 配对 uplift 要按 RunID 把注入记录 join 回
+// run 级事实 (目标签名/总线奖励), 没有 RunID 的注入记录永远成不了"配对的臂"。
+func (ee *EvolutionEngine) RecordInjectionScoredRun(expIDs []string, taskID, teamName, role string, score float64, runID string) {
+	ee.recordInjectionRun(expIDs, taskID, teamName, role, score, runID)
+}
+
+func (ee *EvolutionEngine) recordInjectionRun(expIDs []string, taskID, teamName, role string, score float64, runID string) {
 	if ee == nil {
 		return
 	}
@@ -906,6 +1052,7 @@ func (ee *EvolutionEngine) RecordInjectionScored(expIDs []string, taskID, teamNa
 		Role:      role,
 		Success:   success,
 		Score:     score,
+		RunID:     runID,
 		Timestamp: time.Now(),
 	}
 	ee.injections = append(ee.injections, rec)
@@ -980,6 +1127,7 @@ func (ee *EvolutionEngine) UpdateBaselineScored(score float64) {
 }
 
 // LearnCounterfactual 反事实学习 (V2 P6): 从失败轨迹生成 "如果…会更好" 的假设。
+// 13.8.6 P2: 反事实假设天然是三段式 —— 现象=失败本身, 根因=错误类型, 动作=替代策略。
 func (ee *EvolutionEngine) LearnCounterfactual(traj Trajectory) {
 	if traj.Success || traj.Error == "" {
 		return
@@ -989,26 +1137,27 @@ func (ee *EvolutionEngine) LearnCounterfactual(traj Trajectory) {
 
 	errType := classifyError(traj.Error)
 	fix := suggestFix(errType, traj.Error)
-	content := fmt.Sprintf("[反事实] %s 执行「%s」失败(%s), 如果采用以下策略可能更好: %s",
-		traj.Role, truncateResult(traj.Objective, 60), errType, fix)
-
-	if !ee.isDuplicate(content) {
+	symptom := fmt.Sprintf("[反事实] 执行「%s」失败(%s)", truncateResult(traj.Objective, 60), errType)
+	rootCause := fmt.Sprintf("%s 的既有策略失效", traj.Role)
+	exp := &Experience{
+		ID:         fmt.Sprintf("exp-cf-%d-%d", time.Now().Unix(), ee.nextID+1),
+		Category:   "general",
+		Role:       traj.Role,
+		Symptom:    symptom,
+		RootCause:  rootCause,
+		Action:     fmt.Sprintf("如果采用以下策略可能更好: %s", fix),
+		Content:    renderTriad(symptom, rootCause, fmt.Sprintf("如果采用以下策略可能更好: %s", fix)),
+		Quality:    0.35,
+		Source:     traj.TeamName + "/" + traj.StageName,
+		Tags:       []string{traj.Role, "counterfactual", errType},
+		Pattern:    "strategy",
+		Lifecycle:  "proposed",
+		SourceTeam: traj.TeamName,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if ee.appendTriadicLocked(exp) {
 		ee.nextID++
-		ee.experiences = append(ee.experiences, &Experience{
-			ID:        fmt.Sprintf("exp-cf-%d-%d", time.Now().Unix(), ee.nextID),
-			Category:  "general",
-			Role:      traj.Role,
-			Content:   content,
-			Quality:   0.35,
-			Source:    traj.TeamName + "/" + traj.StageName,
-			Tags:      []string{traj.Role, "counterfactual", errType},
-			Pattern:   "strategy",
-			Lifecycle: "proposed",
-			SourceTeam: traj.TeamName,
-			MinHashSig: computeMinHash(evolutionTokenize(strings.ToLower(content)), 64),
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
-		})
 		ee.totalDistilled++
 	}
 }
@@ -1385,7 +1534,7 @@ func (ee *EvolutionEngine) Consolidate() {
 
 	// 3. MinHash+LSH 去重 (V2: O(n*k) 替代 O(n²))
 	buckets := make(map[uint64][]int) // LSH 桶 → 候选索引
-	bands, rows := 8, 8              // 64 hash → 8 bands * 8 rows
+	bands, rows := 8, 8               // 64 hash → 8 bands * 8 rows
 	for i, exp := range kept {
 		if len(exp.MinHashSig) < bands*rows {
 			continue
@@ -1519,13 +1668,13 @@ func (ee *EvolutionEngine) Stats() EvolutionStats {
 
 // EvolutionStats 进化统计。
 type EvolutionStats struct {
-	TotalExperiences  int `json:"totalExperiences"`
-	TotalTrajectories int `json:"totalTrajectories"`
-	RoleExperiences   int `json:"roleExperiences"`
-	ErrorPatterns     int `json:"errorPatterns"`
-	GeneralPrinciples int `json:"generalPrinciples"`
-	TotalUsageCount   int `json:"totalUsageCount"`   // 经验被注入的总次数
-	AvgQuality        float64 `json:"avgQuality"`    // 平均质量分
+	TotalExperiences  int     `json:"totalExperiences"`
+	TotalTrajectories int     `json:"totalTrajectories"`
+	RoleExperiences   int     `json:"roleExperiences"`
+	ErrorPatterns     int     `json:"errorPatterns"`
+	GeneralPrinciples int     `json:"generalPrinciples"`
+	TotalUsageCount   int     `json:"totalUsageCount"` // 经验被注入的总次数
+	AvgQuality        float64 `json:"avgQuality"`      // 平均质量分
 }
 
 // DataDir 返回进化数据目录 (<state>/evolution)。
@@ -1540,7 +1689,9 @@ func (ee *EvolutionEngine) DataDir() string {
 }
 
 // CollectMetrics 采集进化引擎全部 18 项持续观测指标。
-func (ee *EvolutionEngine) CollectMetrics(c interface{ Record(module, name string, value float64) }) {
+func (ee *EvolutionEngine) CollectMetrics(c interface {
+	Record(module, name string, value float64)
+}) {
 	if c == nil {
 		return
 	}
@@ -1752,6 +1903,44 @@ func (ee *EvolutionEngine) CollectMetrics(c interface{ Record(module, name strin
 		c.Record("evolution", "evo_quality_min", qualMin)
 		c.Record("evolution", "evo_quality_max", qualMax)
 	}
+
+	// 13.8.2 六新指标: 从账本折叠导出 (13.8.3 ledger 折叠器, pkg/evolution/ledger.go)。
+	// 指标=纯函数, 账本=唯一输入; 缺数据时折叠器返回键缺失 → 不落 0 (0 是合法值,
+	// 与「无数据」必须可区分)。折叠读盘每次轮询一次 (学习循环分钟级触发, 可接受)。
+	if stateDir := filepath.Dir(ee.dataDir); stateDir != "" && stateDir != "." {
+		ee.recordLedgerMetrics(c, stateDir)
+	}
+}
+
+// recordLedgerMetrics 六新指标的账本折叠快照 (CollectMetrics 尾段)。
+// 前置条件: caller 已持 ee.mu 读锁 (CollectMetrics 持 RLock) —— 本方法只读账本
+// 文件, 不碰 ee 内部状态。
+func (ee *EvolutionEngine) recordLedgerMetrics(c interface {
+	Record(module, name string, value float64)
+}, stateDir string) {
+	now := time.Now()
+	snap := evoledger.FoldSnapshot(stateDir, now)
+
+	// L1 健康度: 学习成本占比 (闸 ≤10%, design/03 §4.5)。
+	// 指标名与 pkg/metrics MEvo* 常量逐字一致 (agent 不 import metrics, 字面量双写)。
+	c.Record("evolution", "learning_cost_ratio", snap.LearningCostRatio)
+	// 奖励分布漂移: NaN=样本不足, 不落盘 (键缺失语义)。
+	if !math.IsNaN(snap.RewardDistKS) {
+		c.Record("evolution", "reward_dist_ks", snap.RewardDistKS)
+	}
+
+	// L2 效果: 灰度胜率 / 晋升 30 天生存 (分母为 0 → 不落盘)。
+	if snap.CanaryTotal > 0 {
+		c.Record("evolution", "canary_win_rate", float64(snap.CanaryWins)/float64(snap.CanaryTotal))
+	}
+	if snap.Promoted > 0 {
+		c.Record("evolution", "promote_survival_30d", snap.PromoteSurvival)
+	}
+	// 注入配对 uplift (13.8.4): NaN=无可判定桶, 不落盘 (键缺失语义, 沿 reward_dist_ks 先例)。
+	if !math.IsNaN(snap.InjectionUplift.Uplift) {
+		c.Record("evolution", "injection_uplift_paired", snap.InjectionUplift.Uplift)
+	}
+	// rollback counter 由产方 (EvoRollbackTool) 直接 Record, 不在快照里重放。
 }
 
 // --- 工具函数 ---

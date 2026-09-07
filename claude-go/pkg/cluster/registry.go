@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/statestore"
+	"github.com/anthropic/claude-go/pkg/tool"
 )
 
 // WorkerInfo worker 注册信息 (design/02 §3.4.5 心跳①: runtime 级 lease)。
@@ -15,6 +16,9 @@ type WorkerInfo struct {
 	LastBeat  int64    `json:"last_beat"` // unix milli
 	FirstSeen int64    `json:"first_seen"`
 	TasksDone int      `json:"tasks_done"`
+	// 池观测摘要 (13.7.9): worker 心跳经 tool.ObservedPool() 取包级快照上报。
+	// nil = 未观测到池 (池开关未开或本进程无会话装配) —— 控制面渲染"池未启用"。
+	Pool *tool.PoolSnapshot `json:"pool,omitempty"`
 }
 
 // Registry worker 注册表, lease 过期即摘除 (List 时惰性清理)。
@@ -42,6 +46,8 @@ func (r *Registry) Heartbeat(w WorkerInfo) error {
 	if ok {
 		cur.LastBeat = now
 		cur.Caps, cur.Kinds = w.Caps, w.Kinds
+		// 池摘要整体替换 (nil 也写回: worker 侧关池/未装配时摘要随之消失)。
+		cur.Pool = w.Pool
 		if w.TasksDone > cur.TasksDone {
 			cur.TasksDone = w.TasksDone
 		}

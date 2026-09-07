@@ -42,6 +42,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/evolution/learners"
 	"github.com/anthropic/claude-go/pkg/evolution/replay"
 	"github.com/anthropic/claude-go/pkg/evolution/skillaudit"
+	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -762,6 +763,7 @@ func (t *EvoRollbackTool) Call(_ context.Context, input json.RawMessage, tctx *t
 		if err := skillaudit.SetStatus(p, to); err != nil {
 			return errResult("回滚失败: %v", err)
 		}
+		recordRollback(tctx)
 		return okResult(map[string]any{"skill": in.Name, "status": to})
 	case "proposal":
 		to := "proposed"
@@ -771,9 +773,23 @@ func (t *EvoRollbackTool) Call(_ context.Context, input json.RawMessage, tctx *t
 		if err := learners.SetProposalStatus(stateDir, in.Name, to); err != nil {
 			return errResult("回滚失败: %v", err)
 		}
+		recordRollback(tctx)
 		return okResult(map[string]any{"proposal": in.Name, "status": to})
 	default:
 		return errResult("未知 target %q (仅 skill / proposal)", in.Target)
+	}
+}
+
+// recordRollback 是 evo_rollback_count (13.8.2 六新指标之一) 的唯一产方: 回滚成功的
+// 动作记一次 counter。放在工具层而不是账本折叠 —— 回滚是离散事件, 折叠只能事后从
+// 指标快照重放, 而产方直记是即时且不重不漏的。
+func recordRollback(tctx *tool.ToolContext) {
+	if c := metrics.GlobalLLMCollector(); c != nil {
+		labels := map[string]string{}
+		if tctx != nil && tctx.SessionID != "" {
+			labels["session"] = tctx.SessionID
+		}
+		c.RecordWithLabels("evolution", "evo_rollback_count", 1, labels)
 	}
 }
 

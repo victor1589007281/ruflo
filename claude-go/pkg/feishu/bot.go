@@ -78,6 +78,9 @@ func (d *dagTaskAdapter) SetTaskStatus(id, status string) error {
 func (d *dagTaskAdapter) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
 	return d.store.AddTaskWithDeps(subject, description, owner, dependsOn, priority)
 }
+func (d *dagTaskAdapter) AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error) {
+	return d.store.AddTaskFull(subject, description, owner, dependsOn, priority, writeScopes)
+}
 func (d *dagTaskAdapter) ReadyTasks() []agent.DAGTaskSummary {
 	v2Tasks := d.store.ReadyTasks()
 	result := make([]agent.DAGTaskSummary, len(v2Tasks))
@@ -85,7 +88,7 @@ func (d *dagTaskAdapter) ReadyTasks() []agent.DAGTaskSummary {
 		result[i] = agent.DAGTaskSummary{
 			ID: t.ID, Subject: t.Subject, Description: t.Description,
 			Status: t.Status, Owner: t.Owner, DependsOn: t.DependsOn,
-			Priority: t.Priority,
+			Priority: t.Priority, WriteScopes: t.WriteScopes,
 		}
 	}
 	return result
@@ -100,7 +103,7 @@ func (d *dagTaskAdapter) GetAllTasks() []agent.DAGTaskSummary {
 		result[i] = agent.DAGTaskSummary{
 			ID: t.ID, Subject: t.Subject, Description: t.Description,
 			Status: t.Status, Owner: t.Owner, DependsOn: t.DependsOn,
-			Priority: t.Priority,
+			Priority: t.Priority, WriteScopes: t.WriteScopes,
 		}
 	}
 	return result
@@ -230,6 +233,7 @@ type Bot struct {
 	swarmEngine   *swarm_intel.Engine                // 群体智能预测引擎
 	visionCli     *vision.Client                     // 视觉能力客户端
 	skillAuto     *skills.AutoCreator                // 技能自动创建器
+	skillWatcher  *skills.DirWatcher                 // 技能目录热刷新监视器 (13.6-P1 F4)
 	aliasMetrics  *modelconfig.AliasMetricsCollector // 别名级 LLM 指标采集器
 	modelRegistry *modelconfig.ProviderRegistry      // 模型注册表 (新模式)
 	modelResolver *modelconfig.ConfigResolver        // 模型配置解析器 (新模式)
@@ -588,7 +592,13 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 9c. 统一学习循环 (design/03 §4.3)。此前 NewEvolutionLoop 全仓零生产调用方,
 	// submitLearn 永远走回落直调 —— 循环写完了但没通电, 于是去重/预算闸/空闲期深度整理
 	// 与学习器 d/e 的运行相位全都不存在。常驻进程尤其需要它 (空闲期才是做梦的时机)。
-	botEvoLoop := agent.NewEvolutionLoop(bot.evolution, nil, agent.EvolutionLoopConfig{})
+	// 13.8.2: 接上 LLM 计量器, learn_llm_tokens (source=evolution) 才有记账落点。
+	// typed-nil: nil *Collector 包进接口后 != nil, 必须显式判空再赋值。
+	var botEvoSink agent.MetricsSink
+	if c := metrics.GlobalLLMCollector(); c != nil {
+		botEvoSink = c
+	}
+	botEvoLoop := agent.NewEvolutionLoop(bot.evolution, botEvoSink, agent.EvolutionLoopConfig{})
 	botEvoLoop.EnableStructureLearning(agent.StructureConfig{
 		StateDir:  layout.Root,
 		Reflector: agent.FallbackReflector(aiClient), // 无 fallback 档位时为 nil, prompt 进化跳过 (§4.2 H3)
@@ -867,6 +877,16 @@ func (b *Bot) initSkills(config *BotConfig) {
 	if loaded > 0 {
 		log.Printf("[飞书Bot] Skills: 已加载 %d 个技能", loaded)
 	}
+	// 13.6-P1 F4: 技能目录热刷新 (增删改 SKILL.md 即时生效)。清单是 per-run
+	// 现读注册表 (session.go shortSkillListingInDir), Reload 后新会话自动用新
+	// 技能集; 失败 (无可监视目录) 静默降级, 与未启用等价。
+	b.skillWatcher = skills.NewDirWatcher(b.skillReg)
+	b.skillWatcher.SetOnReload(func(int) {
+		log.Printf("[飞书Bot] Skills: 目录变更热刷新, 现有 %d 个技能", b.skillReg.Count())
+	})
+	if err := b.skillWatcher.Start(); err != nil {
+		log.Printf("[飞书Bot] Skills: 热刷新未启用 (%v), 手动 /skill reload 仍可用", err)
+	}
 }
 
 // initDreaming 初始化 Dreaming 引擎
@@ -1016,6 +1036,9 @@ func (b *Bot) Shutdown() {
 	}
 	if b.cfgWatcher != nil {
 		b.cfgWatcher.Stop()
+	}
+	if b.skillWatcher != nil {
+		b.skillWatcher.Stop()
 	}
 	b.stopLLMEventBridge()
 	b.mcpMgr.Shutdown()

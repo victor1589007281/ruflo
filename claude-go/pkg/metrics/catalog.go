@@ -52,6 +52,7 @@ var catalog = []MetricDesc{
 	{Module: "llm", Name: MLLMTotalTokens, ZH: "总 token 消耗", EN: "Total tokens", Unit: "tokens", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMPromptComponentChars, ZH: "Prompt 组件字符数", EN: "Prompt component chars", Unit: "chars", Kind: KindHistogram, Panel: "llm"},
 	{Module: "llm", Name: MLLMPromptComponentTokens, ZH: "Prompt 组件估算 token", EN: "Estimated prompt component tokens", Unit: "tokens", Kind: KindHistogram, Panel: "llm"},
+	{Module: "llm", Name: MLLMPromptSurfaceTokens, ZH: "Prompt 组件锚定 token (usage 再分配)", EN: "Usage-anchored prompt component tokens", Unit: "tokens", Kind: KindHistogram, Panel: "llm"},
 	{Module: "llm", Name: MLLMRateLimitCount, ZH: "限流 (429) 次数", EN: "Rate-limited (429) count", Unit: "count", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMOverloadCount, ZH: "过载 (503/529) 次数", EN: "Overloaded (503/529) count", Unit: "count", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMTimeoutCount, ZH: "超时次数", EN: "Timeout count", Unit: "count", Kind: KindCounter, Panel: "llm"},
@@ -100,6 +101,17 @@ var catalog = []MetricDesc{
 	{Module: "evolution", Name: MEvoDistillCount, ZH: "经验提炼次数", EN: "Distillations", Unit: "count", Kind: KindCounter, Panel: "evolution"},
 	{Module: "evolution", Name: MEvoPruneCount, ZH: "经验剪枝数", EN: "Pruned experiences", Unit: "count", Kind: KindCounter, Panel: "evolution"},
 	{Module: "evolution", Name: MEvoFailTrajectory, ZH: "失败轨迹占比", EN: "Failed trajectory %", Unit: "ratio", Kind: KindGauge, Panel: "evolution"},
+
+	// 13.8.2 六新指标 (三层金字塔 L1 健康度 / L2 效果, 折叠口径见 pkg/evolution/ledger.go)
+	{Module: "evolution", Name: MEvoLearnRoundCount, ZH: "学习轮次", EN: "Learn rounds", Unit: "count", Kind: KindCounter, Panel: "evolution"},
+	{Module: "evolution", Name: MEvoLearnRoundDuration, ZH: "单轮学习耗时", EN: "Learn round duration", Unit: "sec", Kind: KindGauge, Panel: "evolution"},
+	{Module: "evolution", Name: MEvoLearnLLMTokens, ZH: "学习 LLM token", EN: "Learn LLM tokens", Unit: "tokens", Kind: KindCounter, Panel: "evolution"},
+	{Module: "evolution", Name: MEvoLearningCostRatio, ZH: "学习成本占比", EN: "Learning cost ratio", Unit: "ratio", Kind: KindGauge, Panel: "evolution"},
+	{Module: "evolution", Name: MEvoRewardDistKS, ZH: "奖励分布漂移 KS", EN: "Reward dist KS", Unit: "statistic", Kind: KindGauge, Panel: "evolution"},
+	{Module: "evolution", Name: MEvoCanaryWinRate, ZH: "灰度胜率", EN: "Canary win rate", Unit: "ratio", Kind: KindGauge, Panel: "evolution"},
+	{Module: "evolution", Name: MEvoPromoteSurvival30d, ZH: "晋升30天生存率", EN: "Promote survival 30d", Unit: "ratio", Kind: KindGauge, Panel: "evolution"},
+	{Module: "evolution", Name: MEvoRollbackCount, ZH: "回滚次数", EN: "Rollbacks", Unit: "count", Kind: KindCounter, Panel: "evolution"},
+	{Module: "evolution", Name: MEvoInjectionUpliftPaired, ZH: "配对注入uplift", EN: "Paired injection uplift", Unit: "ratio", Kind: KindGauge, Panel: "evolution"},
 
 	// ── Task ──────────────────────────────────────────────
 	{Module: "task", Name: MTaskCreatedCount, ZH: "任务创建总数", EN: "Tasks created", Unit: "count", Kind: KindCounter, Panel: "task"},

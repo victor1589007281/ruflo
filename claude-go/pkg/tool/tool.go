@@ -105,7 +105,7 @@ type ToolContext struct {
 	PermissionMode     types.PermissionMode `json:"permissionMode"`
 	AbortCh            <-chan struct{}      `json:"-"` // 对应 TS: abortController.signal
 	Messages           []types.Message      `json:"messages,omitempty"`
-	SessionID          string               `json:"sessionId,omitempty"` // 会话级状态工具 (plan mode) 用
+	SessionID          string               `json:"sessionId,omitempty"`   // 会话级状态工具 (plan mode) 用
 	PlanFileDir        string               `json:"planFileDir,omitempty"` // 计划文件目录: ExitPlanMode 将计划落盘, 实施阶段可读取
 	MainLoopModel      string               `json:"mainLoopModel,omitempty"`
 	ExecutionModel     string               `json:"executionModel,omitempty"` // 自动路由的快速执行模型 (Path B); 空=未配置
@@ -119,6 +119,11 @@ type ToolContext struct {
 	// WeakEditGuard 写入前语法护栏 (方案三 L2): edit/write 拒写语法坏内容
 	// 并回注错误 (SWE-agent ACI), 覆盖 .go/.py/.json。
 	WeakEditGuard bool `json:"weakEditGuard,omitempty"`
+	// Team / Role 池个性化身份 (13.7-P1): pool_search 排序按 (team, role, asset)
+	// 的 Beta 后验加成。engine.Config.Team/Role 经 RunTools 透传到这里;
+	// 空串 = 无身份 (个性化不表达, 恒 α·0)。
+	Team string `json:"team,omitempty"`
+	Role string `json:"role,omitempty"`
 	// GlobalPerm 若非 nil，RunToolUse 会用其 CheckGlobal 合并全局策略与工具自带权限结果
 	GlobalPerm GlobalPermissionChecker `json:"-"`
 }
@@ -153,6 +158,7 @@ type Registry struct {
 	tools   map[string]Tool
 	aliases map[string]string // alias → primary name
 	order   []string          // 保持注册顺序
+	pool    *Pool             // 13.7-P0 池状态 (nil = 池化未开, 广告面=全量)
 }
 
 // NewRegistry 创建空的工具注册表

@@ -108,6 +108,7 @@ type TaskNode struct {
 	ReadFiles      []string  `json:"readFiles,omitempty"`
 	WriteFiles     []string  `json:"writeFiles,omitempty"`
 	ConflictKeys   []string  `json:"conflictKeys,omitempty"`
+	WriteScopes    []string  `json:"writeScopes,omitempty"` // F13: 任务声明的写域, 供串行化与观测
 	EstimatedLOC   int       `json:"estimatedChangedLOC,omitempty"`
 	ParentID       string    `json:"parentId,omitempty"`
 	EstimatedMin   int       `json:"estimatedMinutes,omitempty"`
@@ -189,6 +190,7 @@ type rawTask struct {
 	readFiles      []string
 	writeFiles     []string
 	conflictKeys   []string
+	writeScopes    []string // F13: 声明写域 (共享状态/契约/manifest 等领域键), 供规划层串行化
 	estimatedLOC   int
 	parentID       string
 	estimatedMin   int
@@ -451,6 +453,8 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 	fileLastNum := make(map[string]string)
 	conflictLastV2ID := make(map[string]string)
 	conflictLastNum := make(map[string]string)
+	scopeLastV2ID := make(map[string]string)
+	scopeLastNum := make(map[string]string)
 	widthTasks := make([]rawTask, 0, len(rawTasks))
 
 	// Phase 3.3: Build symbol-level conflict key map for finer-grained parallelism
@@ -475,6 +479,21 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 				rt.depNums = append(rt.depNums, prevNum)
 			}
 		}
+		// F13: 同写域写任务串行化 (只读任务跳过, 与 conflictKeys 同款 last-writer 模式)
+		if !isReadOnlyRawTask(rt) {
+			for _, scope := range rt.writeScopes {
+				scope = strings.TrimSpace(scope)
+				if scope == "" {
+					continue
+				}
+				if prev, ok := scopeLastV2ID[scope]; ok && !containsString(depV2IDs, prev) {
+					depV2IDs = append(depV2IDs, prev)
+				}
+				if prevNum, ok := scopeLastNum[scope]; ok && !containsString(rt.depNums, prevNum) {
+					rt.depNums = append(rt.depNums, prevNum)
+				}
+			}
+		}
 		for _, file := range rawTaskWriteFiles(rt) {
 			file = strings.TrimSpace(file)
 			if file == "" {
@@ -490,13 +509,26 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 		depV2IDs = uniqueTrimmedStrings(depV2IDs)
 
 		subject := orchestratorTaskSubject(teamName, rt.title)
-		v2ID, err := o.dag.AddTaskWithDeps(subject, rt.accept, rt.role, depV2IDs, rt.priority)
+		// F13: 若 dag 实现 AddTaskFull 则透传写域, 否则回退 AddTaskWithDeps (wbsFakeDAG 等测试桩不实现)
+		type addTaskFullDAG interface {
+			AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error)
+		}
+		v2ID, err := func() (string, error) {
+			if full, ok := o.dag.(addTaskFullDAG); ok {
+				return full.AddTaskFull(subject, rt.accept, rt.role, depV2IDs, rt.priority, rt.writeScopes)
+			}
+			return o.dag.AddTaskWithDeps(subject, rt.accept, rt.role, depV2IDs, rt.priority)
+		}()
 		if err != nil {
 			return nodes, fmt.Errorf("创建V2 DAG任务失败: %w", err)
 		}
 		if containsString(depV2IDs, v2ID) {
 			depV2IDs = removeString(depV2IDs, v2ID)
-			v2ID, err = o.dag.AddTaskWithDeps(subject, rt.accept, rt.role, depV2IDs, rt.priority)
+			if full, ok := o.dag.(addTaskFullDAG); ok {
+				v2ID, err = full.AddTaskFull(subject, rt.accept, rt.role, depV2IDs, rt.priority, rt.writeScopes)
+			} else {
+				v2ID, err = o.dag.AddTaskWithDeps(subject, rt.accept, rt.role, depV2IDs, rt.priority)
+			}
 			if err != nil {
 				return nodes, fmt.Errorf("修正V2 DAG自依赖失败: %w", err)
 			}
@@ -524,6 +556,7 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 			ReadFiles:      rt.readFiles,
 			WriteFiles:     rt.writeFiles,
 			ConflictKeys:   rt.conflictKeys,
+			WriteScopes:    rt.writeScopes,
 			EstimatedLOC:   rt.estimatedLOC,
 			ParentID:       rt.parentID,
 			EstimatedMin:   rt.estimatedMin,
@@ -547,6 +580,17 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 			}
 			fileLastV2ID[file] = v2ID
 			fileLastNum[file] = rt.num
+		}
+		// F13: 回写写域 last-writer map
+		if !isReadOnlyRawTask(rt) {
+			for _, scope := range rt.writeScopes {
+				scope = strings.TrimSpace(scope)
+				if scope == "" {
+					continue
+				}
+				scopeLastV2ID[scope] = v2ID
+				scopeLastNum[scope] = rt.num
+			}
 		}
 		widthTasks = append(widthTasks, rt)
 	}
@@ -586,6 +630,7 @@ type wbsJSONTask struct {
 	ReadFiles      []string        `json:"readFiles,omitempty"`
 	WriteFiles     []string        `json:"writeFiles,omitempty"`
 	ConflictKeys   []string        `json:"conflictKeys,omitempty"`
+	WriteScopes    []string        `json:"writeScopes,omitempty"` // F13
 	EstimatedLOC   int             `json:"estimatedChangedLOC,omitempty"`
 	ParentID       flexibleWBSID   `json:"parentId,omitempty"`
 	EstimatedMin   int             `json:"estimatedMinutes,omitempty"`
@@ -666,6 +711,7 @@ func rawTasksFromWBS(wbs wbsJSON) []rawTask {
 			readFiles:      t.ReadFiles,
 			writeFiles:     t.WriteFiles,
 			conflictKeys:   t.ConflictKeys,
+			writeScopes:    t.WriteScopes,
 			estimatedLOC:   t.EstimatedLOC,
 			parentID:       strings.TrimSpace(string(t.ParentID)),
 			estimatedMin:   t.EstimatedMin,
@@ -2035,6 +2081,10 @@ func shouldKeepRawDependency(cur, dep rawTask) bool {
 	if rawStringSetsOverlap(nonGlobalRawTaskConflictKeys(cur), nonGlobalRawTaskConflictKeys(dep)) {
 		return true
 	}
+	// F13: 写域交集也算共享变更面, 保留依赖 (防 relaxOverSerialRawDeps 剪掉写域串行边)
+	if rawStringSetsOverlap(cur.writeScopes, dep.writeScopes) {
+		return true
+	}
 	if rawStringSetsOverlap(cur.readFiles, rawTaskWriteFiles(dep)) {
 		return true
 	}
@@ -2224,6 +2274,7 @@ func normalizeRawTaskDefaults(rt rawTask) rawTask {
 	rt.targetFiles = normalizePlanFiles(rt.targetFiles)
 	rt.targetPackages = uniqueTrimmedStrings(rt.targetPackages)
 	rt.conflictKeys = uniqueTrimmedStrings(rt.conflictKeys)
+	rt.writeScopes = uniqueTrimmedStrings(rt.writeScopes)
 	rt.parentID = strings.TrimSpace(rt.parentID)
 	rt.verifyCommand = strings.TrimSpace(rt.verifyCommand)
 	rt.parallelGroup = strings.TrimSpace(rt.parallelGroup)
@@ -2823,6 +2874,7 @@ func expandFileTargetRawTask(rt rawTask, reason string, files []string, adapter 
 		}
 		child.parallelGroup = group + ":" + sanitizeParallelGroupSegment(path.Base(filepath.ToSlash(file)))
 		child.conflictKeys = nil
+		child.writeScopes = []string{"file:" + file} // F13: 收窄到单文件写域
 		child.blockingPolicy = wbsBlockingFailBlocks
 		child.splitReason = appendSplitReason(rt.splitReason, "sizing-gate:"+reason+";file-target")
 		child.complexity = "medium"
@@ -3229,6 +3281,7 @@ func expandDirectoryTargetRawTask(rt rawTask, reason string, dirs []string, adap
 			child.estimatedMin = spec.Minutes
 			child.parallelGroup = group + ":" + dir
 			child.conflictKeys = []string{child.parallelGroup}
+			child.writeScopes = []string{"dir:" + dir} // F13: 收窄到目录写域
 			child.blockingPolicy = wbsBlockingFailBlocks
 			child.splitReason = appendSplitReason(rt.splitReason, "sizing-gate:"+reason)
 			child.accept = spec.Acceptance
@@ -5142,6 +5195,7 @@ func sanitizeLLMTimeoutSplitTasks(tasks []rawTask, parent *TaskNode) ([]rawTask,
 		targetPackages: parent.TargetPackages,
 		targetFiles:    parent.TargetFiles,
 		taskType:       wbsTaskTypeMacro,
+		writeScopes:    parent.WriteScopes,
 		estimatedMin:   max(parent.EstimatedMin, 6),
 		riskLevel:      wbsRiskHigh,
 		parallelGroup:  parent.ParallelGroup,
@@ -5275,6 +5329,7 @@ func (o *Orchestrator) prepareTimeoutSplitChildren(children []rawTask, parent *T
 		accept:         parent.AcceptCriteria,
 		targetPackages: parent.TargetPackages,
 		targetFiles:    parent.TargetFiles,
+		writeScopes:    parent.WriteScopes,
 		parallelGroup:  parent.ParallelGroup,
 	}
 	for i := range children {

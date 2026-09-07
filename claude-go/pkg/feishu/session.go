@@ -229,6 +229,16 @@ func (sm *SessionManager) TraceStore() *tracestore.Store {
 	return sm.traceStore
 }
 
+// stateRoot 池 bandit 的持久化状态根 (13.7-P1): 取 sm.evolution.StateDir()
+// (= <state>, 与 rewards.jsonl/poolbandit.json/轨迹同根)。evolution 未注入
+// (未配进化) 时返回空串, 调用方据此跳过 bandit 初始化。
+func (sm *SessionManager) stateRoot() string {
+	if sm == nil {
+		return ""
+	}
+	return sm.evolution.StateDir()
+}
+
 // teamStageMaxTurnsFloor 是 agent 工具循环的硬下限兜底。
 // 修复: 模型配置 maxTurns=0 经 `if mcfg.MaxTurns>0` 守卫被忽略后, 若 defaultResolved
 // 也为 0, 会让 engine.go 把 0 当"无限", agent 一直循环到 stageTimeout(10min) 才停,
@@ -393,6 +403,29 @@ func (sm *SessionManager) newProfileRegistry(profile builtin.ToolProfile, opts r
 	}
 	if sm.skillReg != nil && sm.skillReg.Count() > 0 {
 		reg.Register(skills.NewSkillTool(sm.skillReg))
+	}
+	// 13.7-P0 统一池 (§13.7.2): env 开关默认关; 开启后自训练/动态资产下沉池内,
+	// 广告面=基础+包装三件+已加载。worker/k8s 路径的引擎构建全在 NewBot→这里,
+	// 接线点选注册末尾保证覆盖全部 profile 与嵌套/stage 会话面。
+	if tool.PoolEnabled(os.Getenv) {
+		// 治理集: 会话级 DisabledTools/AllowedTools 在 engine.Config 里, 池侧
+		// 拷贝同名集 (受限档位 profile 已把工具排除在注册表外, 治理集为空=全放行)。
+		// 13.7-P1 选择策略: bandit 持久化自状态根 (sm.evolution.StateDir() =
+		// <state>, 与 rewards.jsonl/轨迹同根, 冷启动回灌直接扫这两处);
+		// traceStore 直传 (装配时已就绪, 见 NewSessionManager), 留痕即刻生效。
+		// sm.evolution 为 nil (未配进化) 时无状态根, bandit 不初始化 —— 留痕
+		// (sm.traceStore) 与排序增强仍按各自的 nil 安全语义独立降级。
+		pp := builtin.NewPoolPolicy(sm.stateRoot(), sm.traceStore)
+		pool := builtin.RegisterPoolTools(reg, sm.skillReg, nil, nil, pp)
+		// 13.7-P2 L1 配给: 描述位按 bandit 后验配给 (skillReg 是进程级共享注册表,
+		// 每次 profile 装配都重注入, 以最后一次装配的 policy 为准)。
+		sm.skillReg.SetRanker(pp.RankScore)
+		if sm.config != nil && sm.config.Debug {
+			log.Printf("[toolpool] profile=%s 池已启用: %d 项下沉", profile, len(pool.MemberNames()))
+		}
+	} else if sm.skillReg != nil {
+		// 未开池: 清掉可能残留的 ranker (上一会话 profile 开过池), 回名称序。
+		sm.skillReg.SetRanker(nil)
 	}
 	if opts.includeAgent && opts.runAgentFn != nil {
 		// 带轨迹底座 (design/01 §4.8 图外派生可见性): 每次 Agent 工具派生写一条
@@ -892,6 +925,7 @@ func (sm *SessionManager) runNestedAgent(ctx context.Context, runAgentFn agent.R
 		MetricsPurpose:   nestedPurpose,
 		Workflow:         runMeta.Workflow,
 		Role:             firstNonEmpty(opts.SubagentType, runMeta.Role),
+		Team:             runMeta.Team, // 13.7-P1 池个性化身份 (嵌套子代理继承团队名)
 	}
 	// 方案三: 弱模型 harness 增强装配 (与 CLI 同规则——env 显式 > provider=="ollama" 自动)。
 	// kimi 等云端 provider 恒为关, 生产零变化; ollama 别名会话自动获得 L2/L3/L4/L6b/L8 护栏。
@@ -1351,6 +1385,9 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		MetricsPurpose:   firstNonEmpty(r.runMeta.Purpose, r.runMeta.Team),
 		Workflow:         r.runMeta.Workflow,
 		Role:             firstNonEmpty(r.runMeta.Role, r.role),
+		// 13.7-P1 池个性化身份: 团队 stage 的引擎配置带 Team, 池工具经 ToolContext
+		// 拿到 (team, role, asset) 三元组记 trial。
+		Team: r.runMeta.Team,
 	}
 	// 方案三: 弱模型 harness 增强装配 (与 CLI 同规则——env 显式 > provider=="ollama" 自动)。
 	// kimi 等云端 provider 恒为关, 生产零变化; ollama 别名会话自动获得 L2/L3/L4/L6b/L8 护栏。

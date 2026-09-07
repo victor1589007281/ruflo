@@ -126,8 +126,9 @@ func matchTailGlob(suffix, path string) bool {
 }
 
 // ActiveInDir Active 的目录相关变体: 再按 paths 命中过滤。
+// 供模型侧清单注入使用 → 用 ModelVisibleActive (F3: ModelInvocable=false 不进模型视图)。
 func (r *Registry) ActiveInDir(dir string) []*Skill {
-	active := r.Active()
+	active := r.ModelVisibleActive()
 	if dir == "" {
 		return active
 	}
@@ -166,13 +167,14 @@ func (r *Registry) FormatShortListingForDir(limit int, dir string) string {
 	if dir == "" {
 		return r.FormatShortListing(limit)
 	}
-	skillsAll := r.Active()
+	skillsAll := r.ModelVisibleActive()
 	filtered := make([]*Skill, 0, len(skillsAll))
 	for _, s := range skillsAll {
 		if len(s.Paths) == 0 || s.VisibleInDir(dir) {
 			filtered = append(filtered, s)
 		}
 	}
+	r.sortForListing(filtered) // 13.7-P2 L1 配给: 与 FormatShortListing 同一排序语义
 	// 复用原渲染: 临时换 skills 视图太侵入, 这里直接按同格式渲染。
 	if len(filtered) == 0 {
 		return ""

@@ -12,6 +12,7 @@ package metrics
 import (
 	"log"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -258,6 +259,30 @@ func recordPromptComponentMetrics(c *Collector, rec api.LLMCallRecord, labels ma
 		// 恰恰是最需要按 run_id 归因的一路 (design/03 §1.3)。
 		c.RecordRunAtTime("llm", MLLMPromptComponentChars, float64(part.value), rec.RunID, componentLabels, ts)
 		c.RecordRunAtTime("llm", MLLMPromptComponentTokens, float64(part.value)/4.0, rec.RunID, componentLabels, ts)
+	}
+
+	// F10 表面定价: 启发式分量 (上面两条) 只回答"构成大概长什么样", 回答不了
+	// "这次调用里 skill 清单吃掉多少 token"。锚定分量把真实 InputTokens 按
+	// 组件启发式占比再分配, 是 llm_prompt_component_tokens 的 usage 锚定孪生
+	// (dsh token-meter 的 estimate/usage 双轨)。没有锚点 (InputTokens<=0 且
+	// 无估算兜底) 或零组件时不发 —— 拿启发式冒充总量是 dsh projection.ts
+	// 明文禁止的呈现方式。
+	anchor := rec.InputTokens
+	if anchor > 0 {
+		meas := api.AllocatePromptSurface(rec.PromptComponents, anchor, rec.InputEstimated)
+		if len(meas.Surfaces) > 0 {
+			// logRevision (规格 F10): 每条定价事件都携带规则版本, 历史样本与新样本
+			// 混在同一文件里时口径可辨。它不进 Prometheus 标签 (不在 llmComponentNeed
+			// 里, fillLabels 会滤掉) —— series 身份保持与启发式孪生一致, 版本只随
+			// JSONL 事件走。
+			surfaceLabels := copyLabels(labels)
+			surfaceLabels["pricing_rev"] = strconv.FormatInt(api.TokenPricingRevision, 10)
+			for _, node := range meas.Surfaces {
+				sl := copyLabels(surfaceLabels)
+				sl["component"] = node.Component
+				c.RecordRunAtTime("llm", MLLMPromptSurfaceTokens, float64(node.Tokens), rec.RunID, sl, ts)
+			}
+		}
 	}
 }
 

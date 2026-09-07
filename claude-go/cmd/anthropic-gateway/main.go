@@ -19,6 +19,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -171,6 +173,17 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 		client = client.WithToolChoiceAny()
 	}
 
+	// opencode 上游 (zen/go) 要求每个请求带 x-opencode-session (会话级稳定 ID) 与
+	// 自有 User-Agent, 缺失会被拒 400 MissingSessionID。Claude Code CLI 出站请求自带
+	// X-Claude-Code-Session-Id (每对话稳定), 原样透传最贴合 opencode 的会话语义;
+	// 该头缺失时兜底生成随机 ID (仍能消除 400, 代价仅是跨请求缓存/路由不共享)。
+	if isOpenCodeUpstream(rc) {
+		client.ExtraHeaders = http.Header{
+			"x-opencode-session": {opencodeSessionID(r)},
+			"User-Agent":         {"anthropic-gateway/" + gatewayVersion},
+		}
+	}
+
 	systemPrompt := extractSystem(req.System)
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
@@ -278,8 +291,13 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", rc.APIKey)
 	req.Header.Set("Authorization", "Bearer "+rc.APIKey)
+	req.Header.Set("User-Agent", "anthropic-gateway/"+gatewayVersion)
 	if v := r.Header.Get("anthropic-version"); v != "" {
 		req.Header.Set("anthropic-version", v)
+	}
+	// opencode zen/go 原生 /v1/messages 同样强制要求 x-opencode-session (缺失 → 400)。
+	if isOpenCodeUpstream(rc) {
+		req.Header.Set("x-opencode-session", opencodeSessionID(r))
 	}
 
 	// 模型级代理: 复用与翻译路径相同的代理语义 (http://host:port)。
@@ -345,6 +363,59 @@ func protoName(p string) string {
 		return "anthropic"
 	}
 	return p
+}
+
+// gatewayVersion 出站 User-Agent 标识, 便于 opencode 等上游按客户端维度计量/限流。
+const gatewayVersion = "1.0"
+
+// claudeSessionHeader Claude Code CLI 的原生会话头 (每对话稳定), opencode 文档中
+// "Go recognizes its native session header" 即指它; 网关转译时将其映射为上游要求的
+// x-opencode-session。
+const claudeSessionHeader = "X-Claude-Code-Session-Id"
+
+// isOpenCodeUpstream 判断该 ResolvedConfig 是否指向 opencode zen/go 上游。
+// 判定依据: provider 名为 "opencode", 或 baseUrl 主机是 opencode.ai (含子域)。
+func isOpenCodeUpstream(rc modelconfig.ResolvedConfig) bool {
+	if strings.EqualFold(strings.TrimSpace(rc.ProviderName), "opencode") {
+		return true
+	}
+	u, err := neturl.Parse(strings.TrimSpace(rc.BaseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "opencode.ai" || strings.HasSuffix(host, ".opencode.ai")
+}
+
+// opencodeSessionID 取本次入站请求对应的 opencode 会话 ID。
+// 优先透传 Claude Code 原生 X-Claude-Code-Session-Id (跨请求稳定, 让 opencode 的
+// 路由/提示缓存命中同会话); 无该头 (curl/其他客户端) 时生成随机 UUID 兜底。
+func opencodeSessionID(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get(claudeSessionHeader)); v != "" {
+		return v
+	}
+	return newSessionID()
+}
+
+// newSessionID 生成一个 v4 风格随机 UUID 字符串。
+func newSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("gw-%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	dst := make([]byte, 36)
+	hex.Encode(dst[0:8], b[0:4])
+	dst[8] = '-'
+	hex.Encode(dst[9:13], b[4:6])
+	dst[13] = '-'
+	hex.Encode(dst[14:18], b[6:8])
+	dst[18] = '-'
+	hex.Encode(dst[19:23], b[8:10])
+	dst[23] = '-'
+	hex.Encode(dst[24:36], b[10:16])
+	return string(dst)
 }
 
 // rewriteModelField 把请求体里的 model 字段替换为上游裸模型 ID。

@@ -34,6 +34,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/cluster"
+	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/trace"
 )
 
@@ -243,7 +244,7 @@ loop:
 
 // RunOnce 拉取并执行至多一个任务 (测试与单发模式)。返回是否真的执行了任务。
 func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
-	if err := w.cli.heartbeat(w.caps, w.kinds); err != nil {
+	if err := w.cli.heartbeat(w.caps, w.kinds, poolSnapshot()); err != nil {
 		return false, err
 	}
 	task, err := w.cli.pull(w.kinds, w.caps)
@@ -268,7 +269,7 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 // 这个 worker 就会替别人跑一个不该它跑的活, 而它自己那条任务永远没人认领 ——
 // 症状是"某个节点一直卡着直到超时", 归因极难。宁可显式失败。
 func (w *Worker) ClaimOnce(ctx context.Context, taskID string) (bool, error) {
-	if err := w.cli.heartbeat(w.caps, w.kinds); err != nil {
+	if err := w.cli.heartbeat(w.caps, w.kinds, poolSnapshot()); err != nil {
 		return false, err
 	}
 	task, err := w.cli.pull(w.kinds, w.caps)
@@ -291,7 +292,7 @@ func (w *Worker) ClaimOnce(ctx context.Context, taskID string) (bool, error) {
 
 func (w *Worker) heartbeatLoop(ctx context.Context) {
 	// 立即注册一次: 控制面 Sync 要先看到 worker 才会把 runtime 注册进 RuntimeRegistry。
-	if err := w.cli.heartbeat(w.caps, w.kinds); err != nil {
+	if err := w.cli.heartbeat(w.caps, w.kinds, poolSnapshot()); err != nil {
 		w.opt.Logf("[worker] 首次注册失败: %v", err)
 	}
 	t := time.NewTicker(w.opt.HeartbeatInterval)
@@ -301,7 +302,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := w.cli.heartbeat(w.caps, w.kinds); err != nil {
+			if err := w.cli.heartbeat(w.caps, w.kinds, poolSnapshot()); err != nil {
 				// 心跳失败不退出: 控制面短暂不可用时继续重试; 租约到期后控制面
 				// 会把本 worker 从 RuntimeRegistry 剔除, 不会有任务再派进来。
 				w.opt.Logf("[worker] 心跳失败: %v", err)
@@ -599,9 +600,19 @@ func (c *ctlClient) post(path string, body, out any) (int, error) {
 	return resp.StatusCode, nil
 }
 
-func (c *ctlClient) heartbeat(caps, kinds []string) error {
-	_, err := c.post("/cluster/heartbeat", cluster.WorkerInfo{Name: c.worker, Caps: caps, Kinds: kinds}, nil)
+func (c *ctlClient) heartbeat(caps, kinds []string, pool *tool.PoolSnapshot) error {
+	_, err := c.post("/cluster/heartbeat", cluster.WorkerInfo{Name: c.worker, Caps: caps, Kinds: kinds, Pool: pool}, nil)
 	return err
+}
+
+// poolSnapshot 池观测摘要 (13.7.9): 经 pkg/tool 包级最近池登记取数, 与 bot/
+// 会话装配解耦 —— 未装配过池 (nil) 时返回 nil, 心跳照常只带 caps/kinds。
+func poolSnapshot() *tool.PoolSnapshot {
+	if p := tool.ObservedPool(); p != nil {
+		s := p.Snapshot()
+		return &s
+	}
+	return nil
 }
 
 func (c *ctlClient) pull(kinds, caps []string) (*cluster.Task, error) {

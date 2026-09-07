@@ -65,7 +65,11 @@ func NewFactStore(persistDir string) *FactStore {
 func (fs *FactStore) Add(fact *MemoryFact) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.addLocked(fact)
+}
 
+// addLocked 填默认值并落库 (调用方持写锁)。
+func (fs *FactStore) addLocked(fact *MemoryFact) {
 	if fact.ID == "" {
 		fs.idSeq++
 		fact.ID = fmt.Sprintf("fact-%s-%04d", time.Now().Format("20060102-150405"), fs.idSeq)
@@ -89,6 +93,103 @@ func (fs *FactStore) Add(fact *MemoryFact) {
 	if fact.Importance >= 0.8 {
 		go fs.PersistToDisk()
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 记忆更新门 (13.8.6 P1: The Past Is Prologue, arXiv:2606.31121)
+// ---------------------------------------------------------------------------
+
+// ReflectThreshold 反思级置信阈值。与既有事实矛盾的新事实, 只有达到反思级置信
+// 才允许裁决 (归档旧条目); 低置信矛盾事实只追加 + 记连接, 不覆盖既有记忆。
+const ReflectThreshold = 0.8
+
+// GateDecision 更新门的裁决结果 (供调用方观测与测试断言)
+type GateDecision string
+
+const (
+	// GateAppended 无矛盾 → 直接追加 (与 Add 等价)
+	GateAppended GateDecision = "appended"
+	// GateSuperseded 矛盾且新事实达反思级置信 → 裁决: 旧条目归档, 新事实入库, 记 supersedes 连接
+	GateSuperseded GateDecision = "superseded"
+	// GateKeptBoth 矛盾但置信不足 (或旧条目为 evergreen) → 只追加 + 记 contradicts 连接, 既有记忆不动
+	GateKeptBoth GateDecision = "kept_both"
+)
+
+// AddWithGate 带更新门的入库 (13.8.6 P1)。守门语义:
+//  1. 新事实与既有活跃事实无矛盾 → 直接追加;
+//  2. 有矛盾、新事实 Importance >= ReflectThreshold、旧条目非 evergreen
+//     → 裁决: 旧条目归档, 新事实入库, 记 supersedes 连接;
+//  3. 其余矛盾情况 (低置信, 或矛盾对象是 evergreen 永久记忆) → 只追加 +
+//     记 contradicts 连接, 既有记忆不动。
+//
+// 为什么做成 store 内的原子操作而不是调用方"先查后写": 矛盾扫描与裁决必须在
+// 同一把锁里完成, 否则并发整合下有 check-then-act 竞态。
+func (fs *FactStore) AddWithGate(fact *MemoryFact) GateDecision {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// 矛盾扫描: 与 DetectContradictions 同语义 (同主题 + 标记词命中)。
+	var contradictIDs []string // 可裁决的矛盾旧条目
+	var evergreenIDs []string  // evergreen 矛盾对象 (不可裁决)
+	for _, old := range fs.facts {
+		if old.Archived || !sharesTopic(fact.Topics, old.Topics) || !isContradiction(fact.Content, old.Content) {
+			continue
+		}
+		if old.Evergreen {
+			evergreenIDs = append(evergreenIDs, old.ID)
+			continue
+		}
+		contradictIDs = append(contradictIDs, old.ID)
+	}
+
+	switch {
+	case len(contradictIDs) == 0 && len(evergreenIDs) == 0:
+		fs.addLocked(fact)
+		return GateAppended
+
+	case len(contradictIDs) > 0 && len(evergreenIDs) == 0 && fact.Importance >= ReflectThreshold:
+		for _, id := range contradictIDs {
+			fs.facts[id].Archived = true
+		}
+		fs.addLocked(fact)
+		for _, id := range contradictIDs {
+			fs.connections = append(fs.connections, FactConnection{
+				FactIDA: fact.ID, FactIDB: id, Relation: "supersedes", Strength: 0.9, Created: time.Now(),
+			})
+		}
+		return GateSuperseded
+
+	default:
+		// 低置信矛盾, 或矛盾对象是 evergreen —— 只追加不覆盖, 记连接留证。
+		fs.addLocked(fact)
+		for _, id := range append(contradictIDs, evergreenIDs...) {
+			fs.connections = append(fs.connections, FactConnection{
+				FactIDA: fact.ID, FactIDB: id, Relation: "contradicts", Strength: 0.8, Created: time.Now(),
+			})
+		}
+		return GateKeptBoth
+	}
+}
+
+// sharesTopic 两事实是否共享至少一个主题 (与 DetectContradictions 的同主题分桶一致)
+func sharesTopic(a, b []string) bool {
+	for _, ta := range a {
+		for _, tb := range b {
+			if ta == tb {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Connections 返回全部事实间关联的副本 (只读检视用)
+func (fs *FactStore) Connections() []FactConnection {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	out := make([]FactConnection, len(fs.connections))
+	copy(out, fs.connections)
+	return out
 }
 
 // AddConnection 添加事实间关联

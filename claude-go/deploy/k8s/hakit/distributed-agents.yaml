@@ -23,7 +23,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: gateway
-          image: claude-go:agents8-responses
+          image: claude-go:agents9
           imagePullPolicy: Never
           args: ["llm-gateway", "--addr", "0.0.0.0:18081", "--config", "/etc/claude-go/config.json"]
           env:
@@ -65,7 +65,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: control
-          image: claude-go:agents8-responses
+          image: claude-go:agents9
           imagePullPolicy: Never
           args:
             - "serve"
@@ -87,6 +87,7 @@ spec:
             - { name: CLAUDE_GO_STATESTORE_BACKEND, value: "dual" }
             - { name: CLAUDE_GO_STATESTORE_READ, value: "fallback" }
             - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
+            - { name: CLAUDE_GO_TOOLS_POOL, value: "1" }
             - { name: HOME, value: "/tmp" }
             - { name: GIT_SSH_COMMAND, value: "ssh -i /home/victor/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/home/victor/.ssh/known_hosts" }
           ports: [{ containerPort: 18080 }]
@@ -152,7 +153,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: dashboard
-          image: claude-go:agents8-responses
+          image: claude-go:agents9
           imagePullPolicy: Never
           args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open", "--config", "/etc/claude-go/config.json"]
           env:
@@ -199,9 +200,26 @@ spec:
       labels: { app: claude-go-worker }
     spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      # hostPath 卷不吃 fsGroup: kubelet 以 root 建 subPathExpr 子目录, uid 1000
+      # 的主容器 mkdir /data/.claude-go 直接 permission denied (agents9 实测)。
+      # initContainer 以 root 预建并把属主交给 1000:1000。
+      initContainers:
+        - name: init-state-dir
+          # 不用 busybox: kind 节点无外网, docker.io 拉不动 (agents9 实测 ImagePullBackOff)。
+          # agents9 基于 debian-slim 自带 sh+chown, 直接复用镜像内已有能力。
+          image: claude-go:agents9
+          imagePullPolicy: Never
+          # 显式 root: 否则继承 pod 级 runAsUser 1000, chown 反向被拒 (agents9 实测 Init:Error)。
+          securityContext: { runAsUser: 0, runAsGroup: 0 }
+          command: ["sh", "-c", "mkdir -p /data/.claude-go && chown -R 1000:1000 /data"]
+          volumeMounts:
+            - { name: state, mountPath: /data, subPathExpr: "$(POD_NAME)" }
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
       containers:
         - name: worker
-          image: claude-go:agents8-responses
+          image: claude-go:agents9
           imagePullPolicy: Never
           command: ["/usr/local/bin/claude-go-worker"]
           args:
@@ -225,20 +243,24 @@ spec:
             - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
             - name: POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
-            # 状态目录每 worker 独立 (FileStore 无跨进程锁); 文件侧空即失,
-            # 持久面由 agentdb 侧承担 (dual 双写)。
+            # 状态目录每 worker 独立 (FileStore 无跨进程锁), 卷为 hostPath 常驻卷 +
+            # subPathExpr 按 POD_NAME 切子目录: 持久 (pod 重建不丢 skills/metrics/
+            # evolution 账本/trace span/bandit 状态) 与独立兼得。
             - name: CLAUDE_GO_STATE_DIR
               value: "/data/.claude-go"
             - { name: HOME, value: "/tmp" }
+            - { name: CLAUDE_GO_TOOLS_POOL, value: "1" }
           volumeMounts:
             - { name: config, mountPath: /etc/claude-go }
-            - { name: state, mountPath: /data }
+            - { name: state, mountPath: /data, subPathExpr: "$(POD_NAME)" }
             - { name: teams, mountPath: /workspace }
       volumes:
         - name: config
           configMap: { name: agents-config-worker }
         - name: state
-          emptyDir: {}
+          hostPath:
+            path: /mnt/data/claude-go-worker
+            type: DirectoryOrCreate
         - name: teams
           hostPath:
             path: /mnt/data/claude-go/workspace
@@ -260,7 +282,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: mcp
-          image: claude-go:agents8-responses
+          image: claude-go:agents9
           imagePullPolicy: Never
           args: ["codeintel-mcp-server", "--transport", "http", "--addr", "0.0.0.0:29234", "--config", "/etc/claude-go/config.json"]
           env:

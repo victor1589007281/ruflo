@@ -18,7 +18,7 @@ func TestClient_非2xx必须报错(t *testing.T) {
 		}))
 		c := NewClient(srv.URL, "w1")
 
-		if err := c.Heartbeat(nil, []string{"stage"}); err == nil {
+		if err := c.Heartbeat(nil, []string{"stage"}, nil); err == nil {
 			t.Errorf("Heartbeat 遇到 %d 未报错 —— 静默成功", code)
 		}
 		if err := c.Complete("t1", json.RawMessage(`{}`)); err == nil {
@@ -60,14 +60,14 @@ func TestClient_Bearer头(t *testing.T) {
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	}))
 	defer srv.Close()
-	if err := NewClient(srv.URL, "w1").WithToken("s3cr3t").Heartbeat(nil, nil); err != nil {
+	if err := NewClient(srv.URL, "w1").WithToken("s3cr3t").Heartbeat(nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got != "Bearer s3cr3t" {
 		t.Errorf("Authorization = %q, 期望 Bearer s3cr3t", got)
 	}
 	// 未配 token 时不发头 (默认形态不变)
-	if err := NewClient(srv.URL, "w1").Heartbeat(nil, nil); err != nil {
+	if err := NewClient(srv.URL, "w1").Heartbeat(nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got != "" {

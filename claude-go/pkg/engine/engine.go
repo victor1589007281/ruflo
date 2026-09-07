@@ -144,6 +144,10 @@ type Config struct {
 	MetricsPurpose   string // 额外维度: chatID / team / stage / compact 等
 	Workflow         string // Agent Team 工作流名
 	Role             string // Agent 角色名
+	// Team 池个性化身份 (13.7-P1): 经 ToolContext.Team 透传给 pool_search/pool_load,
+	// 供 Beta 后验按 (team, role, asset) 记 trial。engine 不 import pkg/agent
+	// (避免 agent↔engine 环), 团队名由装配方显式填入, 不走 RunMetadataFromContext。
+	Team string // Agent Team 名 (池个性化身份)
 	// DynamicPlanCheck 动态计划模式检查。
 	// 当 LLM 调用 EnterPlanMode 时返回 true, 引擎自动切换到只读权限。
 	// 对应 TS: QueryEngine 中 permissionMode 与 PlanModeActive 联动。
@@ -1017,6 +1021,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		if e.Config.WeakModel.Enabled && e.Config.WeakModel.ToolMasking {
 			apiTools = filterDynamicMaskedTools(apiTools, messages)
 		}
+		// 13.7-P0 统一池 (§13.7.2「注册不懒、广告懒」): 池内未加载资产移出广告面
+		// (基础工具+包装三件+已加载面保留); 执行面不拦 —— 未加载资产仍可直调,
+		// 结果不变 (平滑迁移: reg.pool 为 nil 时原样返回)。
+		apiTools = e.Tools.Pool().FilterAPITools(apiTools)
 
 		components := internal_hook.BuildPromptComponentMetrics(systemPrompt, apiTools, messages)
 		apiCtx := api.WithLLMMetrics(ctx, api.LLMMetricsContext{
@@ -1595,9 +1603,12 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			WeakResultPostprocess: e.Config.WeakModel.Enabled && e.Config.WeakModel.ResultPostprocess,
 			// 方案三 L2 护栏: edit/write 写入前语法校验 (与 SchemaRetry 同属 L2 开关)。
 			WeakEditGuard: e.Config.WeakModel.Enabled && e.Config.WeakModel.SchemaRetry,
-			SessionID:          e.Config.SessionID,  // EnterPlanMode/ExitPlanMode 用会话级 plan flag
+			SessionID:          e.Config.SessionID, // EnterPlanMode/ExitPlanMode 用会话级 plan flag
 			PlanFileDir:        e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
-			GlobalPerm:         e.PermChecker,
+			// 13.7-P1 池个性化身份透传 (team_stage 路径才有值; CLI/主会话为空)。
+			Team:       e.Config.Team,
+			Role:       e.Config.Role,
+			GlobalPerm: e.PermChecker,
 		}
 
 		toolExecStart := time.Now()
