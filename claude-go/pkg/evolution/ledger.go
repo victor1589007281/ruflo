@@ -29,7 +29,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/evolution/learners"
@@ -452,14 +454,68 @@ const (
 	PromoteSurvivalFloor = 0.7
 )
 
+// snapshotCacheKey FoldSnapshot 结果缓存的账本指纹：文件数 + 每文件 (名字, 大小, mtime)。
+// mtime/size 任一变化（产方 append 一行）→ 指纹变 → 缓存失效。文件名集合也参与
+// （新增/删除模块文件同样失效）。
+type snapshotCacheKey struct {
+	files string
+}
+
+// snapshotCache FoldSnapshot 的进程内结果缓存。账本 300MB+ 量级时全量重折叠
+// 一次 ~15s，而驾驶舱前端会连续刷新——同一账本指纹直接复用上次快照。
+// 账本 append-only，指纹只随新行变化，不会掩盖真实更新。
+var snapshotCache = struct {
+	mu     sync.Mutex
+	key    snapshotCacheKey
+	expiresAt time.Time
+	value  Snapshot
+	has    bool
+}{}
+
+// snapshotCacheTTL 缓存有效期。指纹未变时也无条件到期（墙上时钟推进本身改变
+// 快照语义：1h 窗口滑动、dayStart 换日），TTL 取分钟级与驾驶舱刷新节奏对齐。
+const snapshotCacheTTL = 60 * time.Second
+
 // FoldSnapshot 一次驾驶舱快照：六新指标 + 阈值判定，L1/L2 分层返回。
 // 全部由既有账本折叠导出，无新采集管线。
+//
+// 两次优化（治「进化量化页 15s」）：
+//  1. 账本全量只读一次，三个折叠窗口（1h token / 单日 KS / 7d 回滚）共享同一
+//     entries 切片走 foldEntries 纯核心——旧实现经 Fold() 各自 readLedger 一遍，
+//     300MB 账本读+解析 3 遍。
+//  2. 结果缓存：按账本指纹（各 jsonl 的 size+mtime）+ 60s TTL 复用上次快照，
+//     连续刷新 / 多个调用方（dashboard handler + agent CollectMetrics）不再
+//     重复全量折叠。
 func FoldSnapshot(stateDir string, now time.Time) Snapshot {
+	key := fingerprintLedger(stateDir)
+	snapshotCache.mu.Lock()
+	if snapshotCache.has && snapshotCache.key == key && now.Before(snapshotCache.expiresAt) {
+		v := snapshotCache.value
+		snapshotCache.mu.Unlock()
+		return v
+	}
+	snapshotCache.mu.Unlock()
+
+	snap := foldSnapshotUncached(stateDir, now)
+
+	snapshotCache.mu.Lock()
+	snapshotCache.key, snapshotCache.value = key, snap
+	snapshotCache.expiresAt = now.Add(snapshotCacheTTL)
+	snapshotCache.has = true
+	snapshotCache.mu.Unlock()
+	return snap
+}
+
+// foldSnapshotUncached FoldSnapshot 的无缓存实现（单测与缓存回退用）。
+func foldSnapshotUncached(stateDir string, now time.Time) Snapshot {
 	snap := Snapshot{Now: now}
+
+	// 账本全量只读一次；窗口折叠（1h / 单日 / 7d）与奖励 KS 共享同一 entries。
+	entries := readLedger(stateDir)
 
 	// L1: 近 1 小时窗口的学习成本。
 	t1h := now.Add(-time.Hour)
-	toks := Fold(stateDir, t1h, now, FoldLearnLLMTokens(), FoldTotalLLMTokens())
+	toks := foldEntries(entries, t1h, now, FoldLearnLLMTokens(), FoldTotalLLMTokens())
 	snap.LearnLLMTokens1h = toks["learn_llm_tokens"]
 	snap.TotalLLMTokens1h = toks["total_llm_tokens"]
 	snap.LearningCostRatio = FoldLearningCostRatio(snap.LearnLLMTokens1h, snap.TotalLLMTokens1h)
@@ -467,7 +523,6 @@ func FoldSnapshot(stateDir string, now time.Time) Snapshot {
 
 	// L1: 单日奖励分布漂移。
 	dayStart := now.Truncate(24 * time.Hour)
-	entries := readLedger(stateDir)
 	snap.RewardDistKS = ksRewardWindow(entries, dayStart, now)
 	snap.RewardDistKSHot = !math.IsNaN(snap.RewardDistKS) && snap.RewardDistKS > RewardDistKSWarn
 
@@ -482,13 +537,37 @@ func FoldSnapshot(stateDir string, now time.Time) Snapshot {
 	snap.PromoteSurvivalLow = snap.Promoted > 0 && snap.PromoteSurvival < PromoteSurvivalFloor
 
 	// L2: 回滚次数（近 7 天）。
-	rollbacks := Fold(stateDir, now.Add(-7*24*time.Hour), now, FoldRollbackCount())
+	rollbacks := foldEntries(entries, now.Add(-7*24*time.Hour), now, FoldRollbackCount())
 	snap.RollbackCount7d = rollbacks["rollback_count"]
 
 	// L2: 注入配对 uplift (13.8.4) —— 折叠器在 ledger_uplift.go。
 	snap.InjectionUplift = FoldInjectionUplift(stateDir)
 
 	return snap
+}
+
+// fingerprintLedger 账本指纹：metrics/*.jsonl + evolution/rewards.jsonl 每文件的
+// (相对路径, size, mtime-nano) 拼接。任一文件追加/换出 → 指纹变。读失败（目录
+// 尚未建立）返回空指纹——空账本折叠本来就便宜，缓存是否命中无所谓。
+func fingerprintLedger(stateDir string) snapshotCacheKey {
+	var sb strings.Builder
+	for _, pattern := range []string{"metrics/*.jsonl", "evolution/rewards.jsonl"} {
+		paths, _ := filepath.Glob(filepath.Join(stateDir, pattern))
+		sort.Strings(paths)
+		for _, p := range paths {
+			info, err := os.Stat(p)
+			if err != nil {
+				continue
+			}
+			sb.WriteString(p)
+			sb.WriteByte('\x00')
+			sb.WriteString(strconv.FormatInt(info.Size(), 10))
+			sb.WriteByte('\x00')
+			sb.WriteString(strconv.FormatInt(info.ModTime().UnixNano(), 10))
+			sb.WriteByte('\x00')
+		}
+	}
+	return snapshotCacheKey{files: sb.String()}
 }
 
 // Snapshot 驾驶舱四象限快照（L1 健康度 + L2 效果，L3 资产由既有库存指标覆盖）。
