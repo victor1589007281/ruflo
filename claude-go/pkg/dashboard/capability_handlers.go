@@ -36,6 +36,10 @@ func (s *Server) projectCwd() string { return filepath.Dir(s.cfg.StateDir) }
 func (s *Server) freshSkillRegistry() *skills.Registry {
 	sr := skills.NewRegistry()
 	sr.LoadDefaults(s.projectCwd())
+	// stateDir/skills 是进化产物与自定义 skill 的落点（handleSkillCreate /
+	// evo_skill_promote 都写这里），但 LoadDefaults 只扫 cwd 与 HOME 的
+	// .claude{,-go}/skills —— 不补这一刀，能力中心就永远看不到这些技能。
+	sr.LoadFromDirs([]string{filepath.Join(s.cfg.StateDir, "skills")}, "state")
 	return sr
 }
 
