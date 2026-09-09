@@ -391,7 +391,7 @@ design/03 的 Evolution Service 整体作为 L4 组件：单机=进程内模块�
 |---|---|---|---|
 | 飞书 WS 全部消息/命令/steer | `bot.go`、`session.go:698` | feishu-adapter + 会话 actor | 等价 |
 | :18080 wiki 9 端点（status/ingest/query/lint/organize/health-check/sync-ima/sync-weread/sync-status） | `wiki/api.go:33-42` | L5 兼容层→wiki 服务 | 等价 |
-| :18080 dashboard ~50 端点（teams/cron/dreaming/evolution/workflows/skills/tools/mcp/logs/backups/llm/prom/diag/actions/SSE…） | `dashboard/server.go:220-290` | L5 兼容层→控制面 API | 等价（补鉴权） |
+| :18080 dashboard ~50 端点（teams/cron/dreaming/evolution/quant+trends/workflows/skills/tools/mcp/logs/backups/llm/prom/diag/actions/SSE…） | `dashboard/server.go:220-290` | L5 兼容层→控制面 API | 等价（补鉴权） |
 | :7777 只读 dashboard + 动作队列 | `extra_handlers.go:1089-1094` | TaskService file-queue | 等价 |
 | CLI 全部子命令（run/dashboard/doctor/tools/wechat…） | `main.go` | 本地直连 + `--server` | 等价+新增 |
 | REPL 斜杠命令与 slash 直通防护 | `main.go:700-703` | 不变（约束单调性，design/01） | 等价 |

@@ -53,6 +53,8 @@ var dashboardContract = []apiEndpoint{
 	{Pattern: "/api/evolution", Probe: "/api/evolution"},
 	// 13.8.5 量化驾驶舱 (FoldSnapshot L1/L2 + 阈值告警位); 比 /api/evolution 更具体。
 	{Pattern: "/api/evolution/quant", Probe: "/api/evolution/quant"},
+	// 13.8.9 进化趋势 (日折叠序列 + 7d 三态 delta + 回归计数 + 学习轮次)。
+	{Pattern: "/api/evolution/trends", Probe: "/api/evolution/trends"},
 	// 13.7.9 池观测聚合 (SetPoolLister 注入 worker 摘要; 未注入时 workers 缺省)。
 	{Pattern: "/api/pool", Probe: "/api/pool"},
 	// 可用模型别名 (SetModelLister 注入; 未注入时 501)。
