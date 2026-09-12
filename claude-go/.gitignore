@@ -6,6 +6,7 @@ claude-go-bin
 *.dylib
 deploy/claude-go-linux
 deploy/claude-go-worker-linux
+deploy/anthropic-gateway-linux
 # k8s-job runtime 的控制面镜像变体要把宿主的 kubectl 打进去 (deploy/Dockerfile.k8sjob)
 deploy/kubectl-linux
 

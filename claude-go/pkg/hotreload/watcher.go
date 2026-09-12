@@ -171,3 +171,37 @@ func (mw *MultiWatcher) Stop() {
 		w.Stop()
 	}
 }
+
+// ─── 主配置热加载入口 (2026-09-12) ──────────────────────────────────────────
+//
+// 此前全仓只有飞书 Bot 用了本包，而且监控的是 MCP 配置文件、只重装 MCP+skills；
+// 其余可独立部署的服务 (anthropic-gateway / serve 控制面 / worker / dashboard /
+// llm-gateway / codeintel-mcp-server) 都是启动时读一次 config.json，之后再不改。
+// 结果就是改完配置必须 rollout 重启 —— 而配置里的 providers/models/ai 这些
+// 恰恰是最常改的。
+//
+// 这里收敛成同一个入口，各服务只需给一个 apply 函数。两点刻意的选择：
+//
+//  1. **内容比对而不是 inotify**。k8s 的 ConfigMap 卷更新走的是 `..data` 符号
+//     链接的原子替换（写新目录再 rename 链接），基于 inode 的监视会跟丢或重复
+//     触发。NewWatcher 按 SHA-256 比对文件内容，对符号链接替换天然正确。
+//
+//  2. **apply 失败不回滚、不退出**。热加载失败时保持旧配置继续服务，只打日志 ——
+//     一份写坏的 config.json 不该把一个正在跑的网关打挂；rollout 有启动期硬校验
+//     兜底，热加载没有，所以这里宁可降级。
+func WatchConfig(path string, interval time.Duration, name string, apply func(string) error) *Watcher {
+	if path == "" {
+		return nil
+	}
+	w := NewWatcher(path, interval)
+	w.OnChange(func(p string) {
+		if err := apply(p); err != nil {
+			log.Printf("[hotreload] %s 配置重载失败, 继续用旧配置: %v", name, err)
+			return
+		}
+		log.Printf("[hotreload] %s 配置已热更新: %s", name, p)
+	})
+	w.Start()
+	log.Printf("[hotreload] %s 已启用配置热加载: %s (每 %s 比对一次内容)", name, path, interval)
+	return w
+}

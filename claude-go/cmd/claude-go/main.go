@@ -53,6 +53,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hooks"
+	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/llmgw"
 	"github.com/anthropic/claude-go/pkg/mcp"
 	"github.com/anthropic/claude-go/pkg/media"
@@ -178,10 +179,10 @@ var (
 	// agentDB 语义增强面 (规划 14.1.4.3): --agentdb-url <serve 地址> 装配
 	// AgentDBSemanticInjectHook, 使真实引擎经 serve /v1/memory|retrieve|files
 	// 跨源检索并注入 system prompt。nil = 不装配 (默认)。
-	flagAgentDBURL       string // --agentdb-url http://127.0.0.1:PORT
-	flagAgentDBTopK      int    // --agentdb-topk 每源检索条数 (默认 5)
-	flagAgentDBBudget    int    // --agentdb-budget 注入上下文 token 预算 (默认 600)
-	flagAgentDBReserve   int    // --agentdb-reserve 为任务正文预留 token (默认 200)
+	flagAgentDBURL     string // --agentdb-url http://127.0.0.1:PORT
+	flagAgentDBTopK    int    // --agentdb-topk 每源检索条数 (默认 5)
+	flagAgentDBBudget  int    // --agentdb-budget 注入上下文 token 预算 (默认 600)
+	flagAgentDBReserve int    // --agentdb-reserve 为任务正文预留 token (默认 200)
 )
 
 func main() {
@@ -1548,6 +1549,14 @@ JSON 配置文件示例:
 				return fmt.Errorf("创建飞书机器人失败: %w", err)
 			}
 			botRef = bot
+
+			// 配置热加载: providers/models/ai 改了立即生效, 不必重启控制面。
+			// 控制面是 k8s 里长跑的 serve 进程, 重启会打断队列里在跑的任务。
+			{
+				cfgPath, _ := feishu.ResolveJSONConfigPath(configPath)
+				hotreload.WatchConfig(cfgPath, 5*time.Second, "claude-go-serve",
+					func(p string) error { return bot.ReloadModelConfig(p) })
+			}
 			_ = dashCfgRef // suppress unused warning when Wiki.APIPort == 0
 
 			// 团队运行器就位后再注入 (bot 构造完才有 TeamManager)。
@@ -2097,47 +2106,52 @@ func llmGatewayCmd() *cobra.Command {
 			if len(botCfg.Providers) == 0 {
 				return fmt.Errorf("配置中无 providers, 网关无路由可用 (--config 指定含 providers 的配置)")
 			}
-			var routes []llmgw.Route
-			for name, p := range botCfg.Providers {
-				// 同一 provider 下按 proxy 分组: 配置了 proxy 的模型 (如 muse-spark)
-				// 拆成独立 route, 其余保持直连组 —— 保证"没配置代理的模型绝不走代理"。
-				type grp struct {
-					rt  *llmgw.Route
-					key string
-				}
-				var groups []grp
-				for alias, mc := range p.Models {
-					var found *llmgw.Route
-					for i := range groups {
-						if groups[i].key == mc.Proxy {
-							found = groups[i].rt
-							break
+			// 抽成闭包: 启动与热加载共用同一段构建逻辑, 免得两处漂移
+			buildRoutes := func(cfg *feishu.BotConfig) ([]llmgw.Route, string) {
+				var routes []llmgw.Route
+				for name, p := range cfg.Providers {
+					// 同一 provider 下按 proxy 分组: 配置了 proxy 的模型 (如 muse-spark)
+					// 拆成独立 route, 其余保持直连组 —— 保证"没配置代理的模型绝不走代理"。
+					type grp struct {
+						rt  *llmgw.Route
+						key string
+					}
+					var groups []grp
+					for alias, mc := range p.Models {
+						var found *llmgw.Route
+						for i := range groups {
+							if groups[i].key == mc.Proxy {
+								found = groups[i].rt
+								break
+							}
+						}
+						if found == nil {
+							rt := llmgw.Route{Provider: name, BaseURL: p.BaseURL, APIKey: p.APIKey, Proxy: mc.Proxy}
+							// 环境变量覆盖 key (K8s Secret 注入形态): <PROVIDER>_API_KEY
+							if env := os.Getenv(strings.ToUpper(name) + "_API_KEY"); env != "" {
+								rt.APIKey = env
+							}
+							groups = append(groups, grp{rt: &rt, key: mc.Proxy})
+							found = &rt
+						}
+						// 别名 "provider:model" → 裸模型名入路由表
+						if i := strings.IndexByte(alias, ':'); i >= 0 {
+							found.Models = append(found.Models, alias[i+1:])
+						} else {
+							found.Models = append(found.Models, alias)
 						}
 					}
-					if found == nil {
-						rt := llmgw.Route{Provider: name, BaseURL: p.BaseURL, APIKey: p.APIKey, Proxy: mc.Proxy}
-						// 环境变量覆盖 key (K8s Secret 注入形态): <PROVIDER>_API_KEY
-						if env := os.Getenv(strings.ToUpper(name) + "_API_KEY"); env != "" {
-							rt.APIKey = env
-						}
-						groups = append(groups, grp{rt: &rt, key: mc.Proxy})
-						found = &rt
-					}
-					// 别名 "provider:model" → 裸模型名入路由表
-					if i := strings.IndexByte(alias, ':'); i >= 0 {
-						found.Models = append(found.Models, alias[i+1:])
-					} else {
-						found.Models = append(found.Models, alias)
+					for _, g := range groups {
+						routes = append(routes, *g.rt)
 					}
 				}
-				for _, g := range groups {
-					routes = append(routes, *g.rt)
+				dp := ""
+				if i := strings.IndexByte(cfg.ModelAlias, ':'); i > 0 {
+					dp = cfg.ModelAlias[:i]
 				}
+				return routes, dp
 			}
-			defaultProvider := ""
-			if i := strings.IndexByte(botCfg.ModelAlias, ':'); i > 0 {
-				defaultProvider = botCfg.ModelAlias[:i]
-			}
+			routes, defaultProvider := buildRoutes(botCfg)
 			gwStateDir := basedir.ResolveDefault("", ".")
 			if jsonCfg != nil && jsonCfg.StateDir != "" {
 				gwStateDir = jsonCfg.StateDir
@@ -2145,6 +2159,21 @@ func llmGatewayCmd() *cobra.Command {
 			srv, err := llmgw.NewServer(routes, defaultProvider, filepath.Join(gwStateDir, "llm-gateway"))
 			if err != nil {
 				return err
+			}
+			// 配置热加载: providers / models / proxy / apiKey 改了原地换路由表。
+			// 用 SetRoutes 而不是重建 Server —— 重建会丢掉已建的直连与代理连接池。
+			{
+				cfgPath, _ := feishu.ResolveJSONConfigPath(gwConfigPath)
+				hotreload.WatchConfig(cfgPath, 5*time.Second, "llm-gateway", func(path string) error {
+					c, e := feishu.LoadJSONConfig(path)
+					if e != nil || c == nil {
+						return fmt.Errorf("重新加载失败: %v", e)
+					}
+					nc := feishu.DefaultBotConfig()
+					c.ApplyToBot(nc)
+					nr, ndp := buildRoutes(nc)
+					return srv.SetRoutes(nr, ndp)
+				})
 			}
 			fmt.Printf("[llm-gateway] 监听 %s | providers=%d 默认=%s\n", gwAddr, len(routes), defaultProvider)
 			return http.ListenAndServe(gwAddr, srv.Handler())
@@ -4107,6 +4136,35 @@ func codeintelMCPServerCmd() *cobra.Command {
 			srv := codeintel.NewMCPServerV2(repoPath)
 			srv.IndexBaseDir = indexBaseDir
 			srv.GitNexusCfg = gnCfg
+
+			// 配置热加载: 这个服务的可热更新面很窄 —— repo / transport / addr /
+			// indexBaseDir 都是启动期绑定的 (监听地址、索引目录), 改它们只能重启;
+			// 真正能在运行中换的是 codeIntel.gitnexus 那段调优 (堆上限、超时、并行度),
+			// 它们在每次索引请求时现读 (pkg/codeintel/mcp_transport.go:689/720/828)。
+			// 所以这里只热更新这一段, 并在日志里说明其余项要重启 —— 不做"看起来
+			// 热加载了其实没生效"的假象。
+			if configPath != "" {
+				if cfgPath, e := feishu.ResolveJSONConfigPath(configPath); e == nil {
+					hotreload.WatchConfig(cfgPath, 5*time.Second, "codeintel-mcp", func(path string) error {
+						c, e := feishu.LoadJSONConfig(path)
+						if e != nil || c == nil || c.CodeIntel == nil {
+							return fmt.Errorf("重新加载失败: %v", e)
+						}
+						g := c.CodeIntel.GitNexus
+						if g == nil {
+							return nil
+						}
+						srv.GitNexusCfg = &codeintel.GitNexusConfig{
+							DefaultHeapMB:        g.DefaultHeapMB,
+							MaxHeapMB:            g.MaxHeapMB,
+							PerThousandFilesMB:   g.PerThousandFilesMB,
+							PerHundredMBSourceMB: g.PerHundredMBSourceMB,
+							IndexTimeoutMin:      g.IndexTimeoutMin,
+						}
+						return nil
+					})
+				}
+			}
 			var t codeintel.MCPTransport
 			switch transport {
 			case "http":

@@ -63,6 +63,7 @@ type AccessRecord struct {
 
 // Server 网关服务。
 type Server struct {
+	mu           sync.RWMutex // 保护 routes/defaultRoute —— 热加载会原地替换 (见 SetRoutes)
 	routes       []Route
 	defaultRoute *Route
 	client       *http.Client
@@ -113,6 +114,42 @@ func NewServer(routes []Route, defaultProvider, stateDir string) (*Server, error
 }
 
 // Handler 返回 http.Handler (便于测试与挂载)。
+// SetRoutes 原地替换路由表 (配置热加载用)。
+//
+// 与 NewServer 的区别只在"不动已建好的 http.Client": 直连池与已有代理池复用,
+// 不为一次热加载丢掉连接池; 只有新出现的 proxy 才补建 client。
+// 加 RWMutex 是因为 handleMessages 在读 routes 的同时可能有热加载在写。
+func (s *Server) SetRoutes(routes []Route, defaultProvider string) error {
+	if len(routes) == 0 {
+		return fmt.Errorf("llm-gateway: 至少需要一个 provider 路由")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.routes = routes
+	s.defaultRoute = nil
+	for i := range routes {
+		if routes[i].Provider == defaultProvider {
+			s.defaultRoute = &routes[i]
+		}
+		if routes[i].Proxy == "" {
+			continue
+		}
+		key := routes[i].Provider + "\x00" + routes[i].Proxy
+		if _, ok := s.proxyClients[key]; ok {
+			continue
+		}
+		if u, err := url.Parse(routes[i].Proxy); err == nil && u.Host != "" {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			tr.Proxy = http.ProxyURL(u)
+			s.proxyClients[key] = &http.Client{Transport: tr}
+		}
+	}
+	if s.defaultRoute == nil {
+		s.defaultRoute = &s.routes[0]
+	}
+	return nil
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -148,26 +185,31 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 // 这样 "opencode:muse-spark-1.2-contributor" 精确落到带 proxy 的 route,
 // 不会因非 proxy 的 opencode route 在前而被误选。
 func (s *Server) route(model string) *Route {
+	// 取一次快照再查 —— 热加载可能在任意时刻替换 routes
+	s.mu.RLock()
+	routes, def := s.routes, s.defaultRoute
+	s.mu.RUnlock()
+
 	bare, provider := model, ""
 	if i := strings.IndexByte(model, ':'); i > 0 {
 		provider, bare = model[:i], model[i+1:]
 	}
-	for j := range s.routes {
-		for _, m := range s.routes[j].Models {
-			if m == bare && (provider == "" || s.routes[j].Provider == provider) {
-				return &s.routes[j]
+	for j := range routes {
+		for _, m := range routes[j].Models {
+			if m == bare && (provider == "" || routes[j].Provider == provider) {
+				return &routes[j]
 			}
 		}
 	}
 	// provider 前缀兜底 (裸模型名不在任何 Models 表时)
 	if provider != "" {
-		for j := range s.routes {
-			if s.routes[j].Provider == provider {
-				return &s.routes[j]
+		for j := range routes {
+			if routes[j].Provider == provider {
+				return &routes[j]
 			}
 		}
 	}
-	return s.defaultRoute
+	return def
 }
 
 // clientFor 返回该 route 的出站 http.Client: 配置了 proxy 的 route 用代理客户端,
@@ -272,9 +314,9 @@ func (s *Server) handleMessagesWithPath(w http.ResponseWriter, r *http.Request, 
 		// OpenAI prompt_tokens/completion_tokens 两套字段名)
 		var ur struct {
 			Usage struct {
-				InputTokens     int `json:"input_tokens"`
-				OutputTokens    int `json:"output_tokens"`
-				PromptTokens    int `json:"prompt_tokens"`
+				InputTokens      int `json:"input_tokens"`
+				OutputTokens     int `json:"output_tokens"`
+				PromptTokens     int `json:"prompt_tokens"`
 				CompletionTokens int `json:"completion_tokens"`
 			} `json:"usage"`
 		}

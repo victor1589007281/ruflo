@@ -43,6 +43,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/feishu"
+	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/worker"
 	"github.com/spf13/cobra"
 )
@@ -98,6 +99,9 @@ func rootCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("加载配置失败: %w", err)
 			}
+			// 热加载监视器要的是"确定存在"的路径: --config 留空时 LoadJSONConfig 走
+			// 自动发现, 这里把解析结果记下来喂给监视器。
+			cfgPath, _ := feishu.ResolveJSONConfigPath(configPath)
 			if jsonCfg != nil {
 				jsonCfg.ApplyToBot(botCfg)
 			}
@@ -141,6 +145,11 @@ func rootCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("装配执行体失败: %w", err)
 			}
+
+			// 配置热加载: config.json 里 providers/models/ai 改了立即生效, 不必重启
+			// worker。worker 是长跑进程, 重启代价高 (会打断在跑的任务), 所以这条最值。
+			hotreload.WatchConfig(cfgPath, 5*time.Second, "claude-go-worker-"+name,
+				func(p string) error { return bot.ReloadModelConfig(p) })
 			// NewBot 内部无条件 cronSched.Start(), 必须在这里停掉。
 			// 注意: 不调用 bot.Shutdown() —— 它会再 Stop 一次 cron, 而
 			// CronScheduler.Stop 是 close(stopCh), 二次调用会 panic

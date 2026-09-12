@@ -107,7 +107,10 @@ cd "$REPO" || exit 1
 CGO_ENABLED=0 go build -trimpath -o deploy/claude-go-linux ./cmd/claude-go || exit 1
 # 分布式模式的 worker 用**独立二进制** (claude-go 的 worker 子命令仍是回显桩)。
 CGO_ENABLED=0 go build -trimpath -o deploy/claude-go-worker-linux ./cmd/claude-go-worker || exit 1
-ls -la --block-size=M deploy/claude-go-linux deploy/claude-go-worker-linux | awk '{print "  二进制", $5, $NF}'
+# deploy/Dockerfile 也 COPY anthropic-gateway（agents ns 的 gateway 部署要用）,
+# 少这一步 docker build 会直接在 COPY 上失败。
+CGO_ENABLED=0 go build -trimpath -o deploy/anthropic-gateway-linux ./cmd/anthropic-gateway || exit 1
+ls -la --block-size=M deploy/claude-go-linux deploy/claude-go-worker-linux deploy/anthropic-gateway-linux | awk '{print "  二进制", $5, $NF}'
 
 step "2/13 构建镜像并导入 kind"
 docker build -q -t "$IMG" -f deploy/Dockerfile deploy/ >/dev/null || exit 1

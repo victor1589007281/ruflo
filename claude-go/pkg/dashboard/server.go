@@ -20,6 +20,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/cluster"
 	"github.com/anthropic/claude-go/pkg/feishu"
+	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/httpauth"
 	"github.com/anthropic/claude-go/pkg/metrics"
 )
@@ -70,15 +71,15 @@ type Config struct {
 
 // Server HTTP 服务。
 type Server struct {
-	cfg      Config
-	provider *Provider
-	mux      *http.ServeMux
-	server   *http.Server
-	jobs     *diagJobStore         // 异步 LLM 诊断作业
-	scraper  *metrics.JSONLScraper // JSONL → Prometheus 采集器 (MySQL Exporter 模式)
-	cronCtl  func() CronController // 定时任务写控制器【解析器】(仅 :18080 飞书进程注入; nil/返回nil 时写接口 501)
-	modelLister func() []string    // 可用模型别名【解析器】(SetModelLister 注入; nil 时 /api/models 501)
-	poolLister func() ([]cluster.WorkerInfo, error) // worker 池摘要【解析器】(13.7.9; nil 时 /api/pool 只报本进程)
+	cfg         Config
+	provider    *Provider
+	mux         *http.ServeMux
+	server      *http.Server
+	jobs        *diagJobStore                        // 异步 LLM 诊断作业
+	scraper     *metrics.JSONLScraper                // JSONL → Prometheus 采集器 (MySQL Exporter 模式)
+	cronCtl     func() CronController                // 定时任务写控制器【解析器】(仅 :18080 飞书进程注入; nil/返回nil 时写接口 501)
+	modelLister func() []string                      // 可用模型别名【解析器】(SetModelLister 注入; nil 时 /api/models 501)
+	poolLister  func() ([]cluster.WorkerInfo, error) // worker 池摘要【解析器】(13.7.9; nil 时 /api/pool 只报本进程)
 }
 
 // SetCronController 注入活动定时任务调度器的【解析器】, 启用 /api/cron 写接口 (创建/更新/启停/删除)。
@@ -128,6 +129,23 @@ func NewServer(cfg Config) *Server {
 	if err == nil && cfg2 != nil {
 		if registry, _, err := modelconfig.LoadFromConfig(cfg2.ToModelConfigJSON()); err == nil && registry != nil {
 			metrics.SetAliasResolver(registry.LookupAliasByModelName)
+			// 配置热加载: dashboard 只消费 alias 解析（它自己做 LLM 诊断时按请求现读
+			// 配置，本就免疫变更），所以这里只需在 config.json 变化时重设这个全局
+			// 函数指针 —— 不重设，指标里的 model_alias 会一直按启动时的注册表解析。
+			if p, perr := feishu.ResolveJSONConfigPath(""); perr == nil {
+				hotreload.WatchConfig(p, 5*time.Second, "dashboard", func(path string) error {
+					c, e := feishu.LoadJSONConfig(path)
+					if e != nil || c == nil {
+						return fmt.Errorf("重新加载失败: %v", e)
+					}
+					r, _, e := modelconfig.LoadFromConfig(c.ToModelConfigJSON())
+					if e != nil || r == nil {
+						return fmt.Errorf("构建注册表失败: %v", e)
+					}
+					metrics.SetAliasResolver(r.LookupAliasByModelName)
+					return nil
+				})
+			}
 		}
 	}
 	// 从 Swarm Intel / Cron JSON 数据回放历史指标到 Prometheus
@@ -255,7 +273,7 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/evolution", s.handleEvolution)
 	mux.HandleFunc("/api/evolution/quant", s.handleEvolutionQuant)   // 13.8.5 量化驾驶舱 (更具体, 优先于上面)
 	mux.HandleFunc("/api/evolution/trends", s.handleEvolutionTrends) // 13.8.9 进化趋势 (日折叠+7d delta+回归+轮次)
-	mux.HandleFunc("/api/pool", s.handlePool)                     // 13.7.9 池摘要聚合 (SetPoolLister 注入)
+	mux.HandleFunc("/api/pool", s.handlePool)                        // 13.7.9 池摘要聚合 (SetPoolLister 注入)
 	mux.HandleFunc("/api/tasks", s.handleTasks)
 	mux.HandleFunc("/api/insights", s.handleInsights)
 	mux.HandleFunc("/api/projects", s.handleProjects)

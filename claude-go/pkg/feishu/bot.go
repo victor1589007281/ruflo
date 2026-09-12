@@ -937,6 +937,59 @@ func (b *Bot) parseHookConfigs(config *BotConfig) []types.HookConfig {
 	return hookConfigs
 }
 
+// ReloadModelConfig 热更新模型配置 (providers / models / ai.*)。
+//
+// 与 reloadConfig 是两回事: 那个监控的是 MCP 配置文件、只重装 MCP 与 skills, 不碰模型;
+// 这个专治 config.json 里最常改的那几段。
+//
+// 覆盖范围与**边界** (写清楚, 免得以为改了全都生效):
+//   - modelRegistry / modelResolver 原地重载 (自带 RWMutex), 别名解析、模型清单、
+//     apiKey / baseUrl / proxy / protocol 立即对新请求生效
+//   - metrics 的全局 alias 解析器必须重设 —— 它存的是函数指针, 不重设就仍指向旧注册表,
+//     指标里的 model_alias 会继续按旧模型名解析
+//   - 主客户端 apiClient 的 baseUrl / apiKey / proxy 原地更新。刻意**不重建**客户端:
+//     api.Client 上的限流 Guard / 熔断计数 / PromptCache 状态位要跨克隆共享, 换实例
+//     等于把这些计数清零
+//   - 新会话的默认模型配置 (sessions.SetDefaultModelConfig)
+//
+// 不覆盖 (与 /advisor、/cwd 的既有语义一致): 存量会话的 engine.Config 是创建时的快照,
+// 需要 /clear 开新会话才吃到新配置; 飞书 WebSocket、MCP 连接、cron/团队调度器不在此列。
+func (b *Bot) ReloadModelConfig(path string) error {
+	if b.modelRegistry == nil || b.modelResolver == nil {
+		return fmt.Errorf("模型注册表未初始化, 无法热加载")
+	}
+	// 走与启动期完全相同的转换路径 —— 原始 config.json 的形状 (如
+	// ai.plans.*.roles 是 []string) 与 modelconfig 的 ConfigJSON 并不一致,
+	// 直接 ReloadFromJSON 会稳定解析失败。
+	jc, err := LoadJSONConfig(path)
+	if err != nil {
+		return fmt.Errorf("加载配置失败: %w", err)
+	}
+	if jc == nil {
+		return fmt.Errorf("配置为空")
+	}
+	if err := modelconfig.ReloadFromConfig(jc.ToModelConfigJSON(), b.modelRegistry, b.modelResolver); err != nil {
+		return err
+	}
+	metrics.SetAliasResolver(b.modelRegistry.LookupAliasByModelName)
+
+	rc := b.modelResolver.Resolve("", "")
+	if rc.BaseURL == "" || rc.APIKey == "" {
+		return fmt.Errorf("新配置解析不出可用的默认模型 (modelAlias=%q)", b.config.ModelAlias)
+	}
+	if b.apiClient != nil {
+		b.apiClient.SetEndpoint(rc.BaseURL, rc.APIKey)
+		b.apiClient.SetProxy(rc.Proxy)
+		if rc.Protocol != "" {
+			b.apiClient.Protocol = rc.Protocol
+		}
+	}
+	if b.sessions != nil {
+		b.sessions.SetDefaultModelConfig(rc)
+	}
+	return nil
+}
+
 // startConfigWatcher 启动配置文件热加载监控
 func (b *Bot) startConfigWatcher(configPath string) {
 	b.cfgWatcher = hotreload.NewWatcher(configPath, 5*time.Second)

@@ -173,3 +173,33 @@ func applyProviderKeyFromEnv(p ProviderConfig) ProviderConfig {
 	}
 	return p
 }
+
+// ReloadFromConfig 用**已转换**的 ConfigJSON 原地热更新注册表与解析器。
+//
+// 为什么需要它而不是直接用 ReloadFromJSON: 后者把原始 config.json 直接反序列化
+// 成 modelconfig.ConfigJSON, 但原始文件的形状与这里并不一致 —— 例如
+// ai.plans.*.roles 在 claude-go 的 config.json 里是 []string, 而 modelconfig
+// 期望 []RoleConfig。实测网关热加载时会稳定报
+//   `cannot unmarshal string into Go struct field PlanConfig.ai.plans.roles`
+// (这也解释了 ReloadFromJSON 此前全仓零调用方: 它跑不通真实配置)。
+//
+// 正确姿势与启动期完全一致:
+//   jc, err := feishu.LoadJSONConfig(path)
+//   modelconfig.ReloadFromConfig(jc.ToModelConfigJSON(), registry, resolver)
+// 调用方做转换 (modelconfig 不能反向 import feishu, 否则成环)。
+func ReloadFromConfig(cfg ConfigJSON, registry *ProviderRegistry, resolver *ConfigResolver) error {
+	if registry == nil || resolver == nil {
+		return fmt.Errorf("注册表或解析器为空")
+	}
+	providers := make([]ProviderConfig, 0, len(cfg.Providers))
+	for _, p := range cfg.Providers {
+		providers = append(providers, p)
+	}
+	if len(providers) == 0 {
+		return fmt.Errorf("新配置里没有 providers, 拒绝清空注册表")
+	}
+	registry.Reload(providers)
+	resolver.SetGlobal(cfg.AI.GlobalConfig)
+	resolver.SetPlans(cfg.AI.Plans)
+	return nil
+}

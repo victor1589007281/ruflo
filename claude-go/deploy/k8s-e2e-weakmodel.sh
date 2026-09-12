@@ -47,6 +47,9 @@ step "1/6 构建二进制与镜像 ($IMG)"
 cd "$REPO" || exit 1
 CGO_ENABLED=0 go build -trimpath -o deploy/claude-go-linux ./cmd/claude-go || exit 1
 CGO_ENABLED=0 go build -trimpath -o deploy/claude-go-worker-linux ./cmd/claude-go-worker || exit 1
+# deploy/Dockerfile 也 COPY anthropic-gateway（agents ns 的 gateway 部署要用）,
+# 少这一步 docker build 会直接在 COPY 上失败。
+CGO_ENABLED=0 go build -trimpath -o deploy/anthropic-gateway-linux ./cmd/anthropic-gateway || exit 1
 docker build -q -t "$IMG" -f deploy/Dockerfile deploy/ >/dev/null || exit 1
 docker save "$IMG" | docker exec -i "${CLUSTER}-control-plane" ctr -n k8s.io images import - >/dev/null || exit 1
 ok "镜像已导入 kind (唯一标签, 防验到陈旧二进制)"

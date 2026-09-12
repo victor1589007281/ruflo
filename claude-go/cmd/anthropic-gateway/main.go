@@ -34,8 +34,22 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/feishu"
+	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/types"
 )
+
+// resolveWatchPath 把 --config 入参解析成"确定存在"的文件路径, 供热加载监视器用。
+// 入参留空时走 feishu 的自动发现 (含 /etc/claude-go/config.json, 正是 k8s ConfigMap
+// 挂载点) —— 监视器拿不到真实路径等于没启用。
+func resolveWatchPath(p string) string {
+	if p != "" {
+		return p
+	}
+	if r, err := feishu.ResolveJSONConfigPath(""); err == nil {
+		return r
+	}
+	return ""
+}
 
 // upstreamTimeout 翻译路径单次上游调用上限。omen-alpha 等隐藏推理模型要先烧
 // 数万 reasoning token 才吐正文, 单次可达 10+ 分钟; 原默认 10min/5min 的硬超时
@@ -68,8 +82,40 @@ func main() {
 
 	gw := &gateway{registry: registry, resolver: resolver, tryPrefix: tryPrefix}
 
+	// 配置热加载: providers / models / ai 改了立即生效, 不必重启网关。
+	// 网关的 api.Client 本来就是每请求按 rc 重建的 (buildClient), 所以注册表与解析器
+	// 一换, apiKey / baseUrl / proxy / protocol / 模型清单全部跟着换 —— 这是几个服务里
+	// 最容易做成真热加载的一个, 不需要动任何并发结构 (Reload 自带 RWMutex)。
+	hotreload.WatchConfig(resolveWatchPath(*configPath), 5*time.Second, "anthropic-gateway",
+		func(path string) error {
+			// 与启动期同一条路径: 原始 config.json 要先经 feishu 转换才能喂给
+			// modelconfig —— 直接 ReloadFromJSON 形状对不上 (ai.plans.roles)。
+			jc, err := feishu.LoadJSONConfig(path)
+			if err != nil {
+				return fmt.Errorf("加载配置失败: %w", err)
+			}
+			if jc == nil {
+				return fmt.Errorf("配置为空")
+			}
+			return modelconfig.ReloadFromConfig(jc.ToModelConfigJSON(), registry, resolver)
+		})
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages", gw.handleMessages)
+	// 裸 /messages: claude-go 内部客户端 (api.Client endpointPath) 向 {网关}/messages
+	// 发 Anthropic 协议请求 (CLAUDE_GO_LLM_GATEWAY 裸根地址 + "/messages")。部署里的
+	// pathfix.py 虽会把 /messages 改写成 /v1/messages, 但直挂本进程 (无 pathfix) 的
+	// 实例 (如宿主 18989) 之前会在 Go mux 上裸 404 "404 page not found", 这里原生
+	// 注册双保险。
+	mux.HandleFunc("/messages", gw.handleMessages)
+	// OpenAI 协议透传: claude-go 内部客户端对 protocol=openai 模型 (omen-alpha 等)
+	// 向 {网关}/chat/completions 发 OpenAI 格式请求体。此前未注册该路由, 全部裸
+	// 404 (pathfix 只改写 /messages), 导致走本网关的团队作业 (interviewforge 增量
+	// 出题等) 在"增量出题"阶段反复 404、重试 6 次后失败。
+	mux.HandleFunc("/v1/chat/completions", gw.handleChatCompletions)
+	mux.HandleFunc("/chat/completions", gw.handleChatCompletions)
+	mux.HandleFunc("/v1/responses", gw.handleResponses)
+	mux.HandleFunc("/responses", gw.handleResponses)
 	mux.HandleFunc("/v1/models", gw.handleModels)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 
@@ -103,10 +149,20 @@ func (g *gateway) resolveModel(model string) (modelconfig.ResolvedConfig, error)
 	if rc.BaseURL != "" && rc.APIKey != "" && rc.ProviderName != "" {
 		return rc, nil
 	}
-	if g.tryPrefix != "" && !strings.Contains(model, ":") {
-		rc2 := g.resolver.ResolveAlias(g.tryPrefix + ":" + model)
-		if rc2.BaseURL != "" && rc2.APIKey != "" && rc2.ProviderName != "" {
-			return rc2, nil
+	if !strings.Contains(model, ":") {
+		// 裸模型名: claude-go 客户端走 ProviderName(后半段) 路径时只发裸名。
+		// 先全表反查 alias (如 "k3" -> "kimi:k3"), 再退 default-prefix;
+		// 否则非默认前缀 provider (kimi 等) 的模型会被 404/误路由到默认上游。
+		if alias := g.registry.LookupAliasByModelName(model); alias != model {
+			if rc3 := g.resolver.ResolveAlias(alias); rc3.BaseURL != "" && rc3.APIKey != "" && rc3.ProviderName != "" {
+				return rc3, nil
+			}
+		}
+		if g.tryPrefix != "" {
+			rc2 := g.resolver.ResolveAlias(g.tryPrefix + ":" + model)
+			if rc2.BaseURL != "" && rc2.APIKey != "" && rc2.ProviderName != "" {
+				return rc2, nil
+			}
 		}
 	}
 	return modelconfig.ResolvedConfig{}, fmt.Errorf("model %q 在 providers 中未找到 (baseURL/apiKey/providerName 不全)", model)
@@ -158,6 +214,10 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// anthropic 协议模型 → 原样透传 (保真, 避免重编码丢 metadata/tool_choice/stop_sequences 等)。
 	if rc.Protocol == "" || rc.Protocol == "anthropic" {
+		// 裸名请求 (客户端 ProviderName 路径) 须把 model 改写为限定别名再透传:
+		// opencode/kimi 这类聚合上游按 "provider:model" 限定名路由, 裸名会被拒
+		// ("Model k3 is not supported")。已是限定名时改写为同值, 无副作用。
+		body = rewriteModelField(body, rc.Provider+":"+rc.ProviderName)
 		g.proxyPassthrough(w, r, body, rc)
 		return
 	}
@@ -331,6 +391,107 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				log.Printf("[anthropic-gateway] passthrough 回传写入失败: %v", werr)
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// handleChatCompletions OpenAI Chat Completions 透传入口: claude-go 内部客户端
+// (api.Client protocol=openai, 如 omen-alpha) 向 {网关}/chat/completions 发的是
+// OpenAI 格式请求体, 网关无需翻译, 按模型解析上游后原样转发即可。
+func (g *gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	g.proxyOpenAIFormat(w, r, "/chat/completions")
+}
+
+// handleResponses OpenAI Responses API 透传入口 (muse-spark 等 protocol=openai-responses 模型)。
+func (g *gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
+	g.proxyOpenAIFormat(w, r, "/responses")
+}
+
+// proxyOpenAIFormat OpenAI 系协议原样透传。入站已是 OpenAI 格式请求体 (与 Claude CLI
+// 的 Anthropic 格式入口不同), 网关职责只有: 解析模型 → 解析上游 → 剥 provider 前缀 →
+// 注入鉴权/会话头 → 转发到 {base}{upstreamPath} → 原样回传 (流式逐块 flush)。
+func (g *gateway) proxyOpenAIFormat(w http.ResponseWriter, r *http.Request, upstreamPath string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	if err != nil {
+		writeError(w, 400, "invalid_request_error", err.Error())
+		return
+	}
+	var probe struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil || probe.Model == "" {
+		writeError(w, 400, "invalid_request_error", "请求体缺少 model 字段")
+		return
+	}
+	rc, err := g.resolveModel(probe.Model)
+	if err != nil {
+		writeError(w, 404, "model_not_found", err.Error())
+		return
+	}
+	log.Printf("[anthropic-gateway] openai-passthrough model=%s resolved=%s path=%s",
+		probe.Model, rc.ProviderName, upstreamPath)
+
+	upstream := strings.TrimRight(rc.BaseURL, "/") + upstreamPath
+	forwardBody := rewriteModelField(body, rc.ProviderName)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(forwardBody))
+	if err != nil {
+		writeError(w, 502, "upstream_error", err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", rc.APIKey)
+	req.Header.Set("Authorization", "Bearer "+rc.APIKey)
+	req.Header.Set("User-Agent", "anthropic-gateway/"+gatewayVersion)
+	// opencode zen/go 上游强制 x-opencode-session (缺失 → 400 MissingSessionID)。
+	if isOpenCodeUpstream(rc) {
+		req.Header.Set("x-opencode-session", opencodeSessionID(r))
+	}
+	// omen-alpha 等隐藏推理模型首 token 可达 7+ 分钟: 用 --upstream-timeout (默认 30min),
+	// 不能用 proxyPassthrough 那样的 10min 短超时 (会中途 502 context deadline exceeded)。
+	client := &http.Client{Timeout: *upstreamTimeout}
+	if rc.Proxy != "" {
+		if pu, perr := neturl.Parse(rc.Proxy); perr == nil && pu.Host != "" && (pu.Scheme == "http" || pu.Scheme == "https") {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			tr.Proxy = http.ProxyURL(pu)
+			client.Transport = tr
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeError(w, 502, "upstream_error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.WriteHeader(resp.StatusCode)
+	if resp.StatusCode >= 400 {
+		io.Copy(w, resp.Body)
+		return
+	}
+	// 流式/非流式都原样回传, 逐块 flush, 不让客户端等完整响应。
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 16*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				log.Printf("[anthropic-gateway] openai-passthrough 回传写入失败: %v", werr)
 				return
 			}
 			if flusher != nil {

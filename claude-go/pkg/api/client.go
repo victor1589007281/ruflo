@@ -334,6 +334,26 @@ func (c *Client) SetTag(tag string) *Client {
 	return c
 }
 
+// SetEndpoint 原地更新上游地址与密钥 (配置热加载用)。
+//
+// 刻意做成"改原对象"而不是"返回新 Client": Client 上的限流 Guard、熔断计数、
+// PromptCache 状态位要跨克隆共享 (见 pkg/feishu/bot.go 里 SessionManager 那段
+// 注释), 换一个新实例等于把这些计数清零 —— 热加载一次就丢掉配额与熔断记录。
+// 与 SetTag/SetProxy 同一约定: 直接修改原 Client, 不做拷贝。
+//
+// 空值跳过: 热加载时若新配置缺某字段, 保持原值比清空更安全。
+func (c *Client) SetEndpoint(baseURL, apiKey string) {
+	if c == nil {
+		return
+	}
+	if baseURL != "" {
+		c.BaseURL = baseURL
+	}
+	if apiKey != "" {
+		c.APIKey = apiKey
+	}
+}
+
 // SetProxy 为该 Client 配置出站 HTTP 代理 (仅配置了 proxy 的模型调用此方法)。
 // proxy 为空是安全的 no-op (保持直连); 非空时在共享 http.Client 上注入带
 // http.ProxyURL 的 Transport, 让该模型的所有出站请求经代理转发。
@@ -408,6 +428,52 @@ func isRetryableStatus(code int) bool {
 }
 
 // shouldEnablePromptCache 判断当前请求是否应启用 prompt caching。
+
+// markMessageCacheBreakpoint 给最后一条消息的最后一个内容块贴 cache_control。
+//
+// 位置选"最后一条"而不是"中间某条": 缓存按前缀匹配, 断点越靠后覆盖的 token 越多。
+// Content 是 json.RawMessage, 所以要先解出来再按形态处理 —— 纯字符串形态要包成
+// 内容块才能挂字段。已有 cache_control 的块不重复标记 (上游对重复标记会报错)。
+func markMessageCacheBreakpoint(messages []types.APIMessage) {
+	if len(messages) == 0 {
+		return
+	}
+	last := &messages[len(messages)-1]
+	if last.Role != "user" && last.Role != "assistant" {
+		return
+	}
+	var content any
+	if err := json.Unmarshal(last.Content, &content); err != nil {
+		return // 解不出来就原样放行, 不动它
+	}
+	switch c := content.(type) {
+	case string:
+		if c == "" {
+			return
+		}
+		content = []map[string]any{
+			{"type": "text", "text": c, "cache_control": map[string]string{"type": "ephemeral"}},
+		}
+	case []any:
+		if len(c) == 0 {
+			return
+		}
+		blk, ok := c[len(c)-1].(map[string]any)
+		if !ok {
+			return
+		}
+		if _, dup := blk["cache_control"]; dup {
+			return
+		}
+		blk["cache_control"] = map[string]string{"type": "ephemeral"}
+	default:
+		return
+	}
+	if raw, err := json.Marshal(content); err == nil {
+		last.Content = raw
+	}
+}
+
 func (c *Client) shouldEnablePromptCache() bool {
 	if c.promptCacheDisabledByError {
 		return false
@@ -861,6 +927,21 @@ func (c *Client) StreamMessage(
 			guardRelease = c.Guard.Acquire()
 			streamRec.GuardWaitSec = time.Since(waitStart).Seconds()
 			defer guardRelease()
+		}
+
+		// 对话历史的缓存断点 (2026-09-12)。
+		//
+		// 此前 cache_control 只贴在 system 上, Messages 上一次都没有 —— 而 Anthropic
+		// 的 prompt cache 是**前缀匹配**: 只标 system, 缓存就只覆盖 system 那一段,
+		// 之后每轮增长的历史全按"新内容"计费。实测 claude-go 的 cache 命中只有
+		// 48~53%, 而 Claude Code 在历史里打了多个断点, 能到 98%。两者差距主要在这。
+		//
+		// 这里给最后一条消息的最后一个块打断点: 它覆盖的正是"到目前为止的全部前缀",
+		// 是单断点里收益最大的位置。多断点(最多 4 个)留给后续按命中率调优。
+		// 只在 shouldEnablePromptCache() 为真时打 —— 不支持该字段的上游已有
+		// "400 后自适应关闭" 的兜底 (见下方重试分支)。
+		if c.shouldEnablePromptCache() && len(messages) > 0 {
+			markMessageCacheBreakpoint(messages)
 		}
 
 		var system interface{}

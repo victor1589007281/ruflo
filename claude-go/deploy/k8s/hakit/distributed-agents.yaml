@@ -23,9 +23,17 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: gateway
-          image: claude-go:agents9
+          image: claude-go:agents9-omen4
           imagePullPolicy: Never
-          args: ["llm-gateway", "--addr", "0.0.0.0:18081", "--config", "/etc/claude-go/config.json"]
+          # anthropic-gateway (协议翻译/透传, omen 长推理 30min + x-opencode-session
+          # 注入) + pathfix (18081→18085, 兼容老客户端 /messages 路径改写)。
+          # 注意: claude-go 内部客户端 (CLAUDE_GO_LLM_GATEWAY) 会用裸路径
+          # /messages 与 /chat/completions, anthropic-gateway 必须原生注册这两组
+          # 路由 (omen3 起支持) —— 只开 /v1/messages 会让团队作业 LLM 调用裸 404
+          # (interviewforge 增量出题 "超过最大重试次数" 事故根因)。
+          command: ["/bin/sh", "-c"]
+          args:
+            - "python3 /usr/local/bin/pathfix.py >>/tmp/pathfix.log 2>&1 & exec /usr/local/bin/anthropic-gateway --addr 127.0.0.1:18085 --config /etc/claude-go/config.json --default-prefix opencode --upstream-timeout 30m"
           env:
             - { name: HOME, value: "/tmp" }
           ports: [{ containerPort: 18081 }]
