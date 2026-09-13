@@ -25,9 +25,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -497,12 +502,120 @@ func writeToolResultArtifact(toolName, content string, tctx *ToolContext) string
 	path := filepath.Join(dir, fmt.Sprintf("%s-%s.txt", sanitizeArtifactName(toolName), hex.EncodeToString(sum[:])[:12]))
 	// 同一内容已落过盘就复用: 语义相同, 省一次写。
 	if _, err := os.Stat(path); err == nil {
+		maybeSweepToolArtifacts(dir)
 		return path
 	}
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		return ""
 	}
+	maybeSweepToolArtifacts(dir)
 	return path
+}
+
+// ─── artifact 目录清理 ────────────────────────────────────────────────────────
+//
+// 目录跨 run 共享且只增不减 (内容寻址能去重, 但不同内容仍会累积), 长期跑下去会把
+// 工作区撑满。策略两条, 都可配:
+//
+//	CLAUDE_GO_TOOL_ARTIFACT_MAX_FILES     条数上限, 默认 1000, 0 = 不限
+//	CLAUDE_GO_TOOL_ARTIFACT_MAX_AGE_DAYS  天数上限, 默认 30,  0 = 不限
+//
+// 先按年龄删, 再按条数删最旧的 (两条独立生效, 不是二选一)。
+//
+// 保守之处: 只删本目录下的普通文件, 不动子目录; 出错一律静默放弃 —— 清理失败不该
+// 影响工具结果本身 (原文已经返回给模型了)。磁盘配额只是兜底, 不是正确性依赖。
+const (
+	envArtifactMaxFiles   = "CLAUDE_GO_TOOL_ARTIFACT_MAX_FILES"
+	envArtifactMaxAgeDays = "CLAUDE_GO_TOOL_ARTIFACT_MAX_AGE_DAYS"
+
+	defaultArtifactMaxFiles   = 1000
+	defaultArtifactMaxAgeDays = 30
+
+	// 两次清理的最小间隔: 每次落盘都 ReadDir 不划算, 而目录涨到需要清理的量级
+	// 是分钟级的, 十秒一次足够及时。
+	artifactSweepInterval = 10 * time.Second
+)
+
+// lastArtifactSweep 上次清理时间 (UnixNano)。进程内共享, 多 run 并发时也只需一个。
+var lastArtifactSweep atomic.Int64
+
+func artifactLimitFromEnv(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		// 配错就退回默认值而不是当成"不限" —— 一个拼错的变量名不该静默关掉清理
+		logging.For("toolartifact").Warn("清理配置无效, 用默认值", "key", key, "value", v, "default", def)
+		return def
+	}
+	return n
+}
+
+func maybeSweepToolArtifacts(dir string) {
+	now := time.Now()
+	if prev := lastArtifactSweep.Load(); prev != 0 && now.Sub(time.Unix(0, prev)) < artifactSweepInterval {
+		return
+	}
+	// 竞争失败也不重试: 另一个 goroutine 正在扫, 让它扫完就是。
+	if !lastArtifactSweep.CompareAndSwap(lastArtifactSweep.Load(), now.UnixNano()) {
+		return
+	}
+	sweepToolArtifacts(dir, artifactLimitFromEnv(envArtifactMaxFiles, defaultArtifactMaxFiles),
+		artifactLimitFromEnv(envArtifactMaxAgeDays, defaultArtifactMaxAgeDays), now)
+}
+
+// sweepToolArtifacts 执行一次清理。单独拆出来便于测试直接驱动 (绕过节流)。
+func sweepToolArtifacts(dir string, maxFiles, maxAgeDays int, now time.Time) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type artifact struct {
+		name string
+		mod  time.Time
+	}
+	items := make([]artifact, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue // 不碰子目录: 目录结构不是本机制建的, 语义不明
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		items = append(items, artifact{name: e.Name(), mod: info.ModTime()})
+	}
+	removedAge, removedCap := 0, 0
+	live := items[:0:0]
+	if maxAgeDays > 0 {
+		cutoff := now.AddDate(0, 0, -maxAgeDays)
+		for _, it := range items {
+			if it.mod.Before(cutoff) {
+				if os.Remove(filepath.Join(dir, it.name)) == nil {
+					removedAge++
+				}
+				continue
+			}
+			live = append(live, it)
+		}
+	} else {
+		live = items
+	}
+	if maxFiles > 0 && len(live) > maxFiles {
+		// 按修改时间升序, 从最旧的开始删到刚好剩 maxFiles 条
+		sort.Slice(live, func(i, j int) bool { return live[i].mod.Before(live[j].mod) })
+		for i := 0; i < len(live)-maxFiles; i++ {
+			if os.Remove(filepath.Join(dir, live[i].name)) == nil {
+				removedCap++
+			}
+		}
+	}
+	if removedAge+removedCap > 0 {
+		logging.For("toolartifact").Info("tool_result artifact 清理",
+			"dir", dir, "按年龄", removedAge, "按条数", removedCap, "剩余", len(live)-removedCap)
+	}
 }
 
 func sanitizeArtifactName(s string) string {

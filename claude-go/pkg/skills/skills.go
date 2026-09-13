@@ -482,6 +482,39 @@ func truncateRunes(s string, max int) string {
 func (r *Registry) FormatShortListing(limit int) string {
 	skills := r.ModelVisibleActive() // 已按名称确定性排序; 排除 shadow/archived 与模型不可调用
 	r.sortForListing(skills)         // 13.7-P2 L1 配给: 有 ranker 时描述位按后验优先分配
+	return renderShortListing(skills, limit)
+}
+
+// FormatShortListingForNames 只列出给定名字的技能 (仍按名称确定性排序)。
+//
+// 用途: 团队 stage 的清单按**角色**裁剪。全量清单会把内置库里 28 个跨项目技能
+// (Django / C++ / C# / 并发审查 / 品牌规范…) 塞进每一次请求 —— 实测某 stage 的
+// system[0] 里 <available_skills> 占 3133 字节 / 35 条, 而 Skill 工具在全部
+// 8516 次工具调用里 **0 次**被用过, 纯成本。
+//
+// 没列出来的技能并没有消失: RegisterPoolTools 把 ModelVisibleActive 全部登记为
+// 池成员, 需要时 pool_search 检索 + pool_load 展开即可 —— 池对技能这一路此前
+// 形同虚设, 恰恰因为清单本来就全量可见, 没人需要去搜。
+func (r *Registry) FormatShortListingForNames(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	out := make([]*Skill, 0, len(names))
+	for _, n := range names {
+		s, ok := r.Get(n) // Get 已按运行期语义过滤 shadow/archived
+		if !ok || !s.ModelCallable() {
+			continue
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return renderShortListing(out, 0)
+}
+
+func renderShortListing(skills []*Skill, limit int) string {
 	if len(skills) == 0 {
 		return ""
 	}

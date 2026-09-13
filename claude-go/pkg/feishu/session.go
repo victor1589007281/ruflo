@@ -453,6 +453,57 @@ func shortSkillListingInDir(reg *skills.Registry, dir string) string {
 	return reg.FormatShortListingForDir(0, dir)
 }
 
+// interactiveOnlyTools 在团队 stage 里**结构性不可能用上**的工具。
+//
+// 判据是"能不能用", 不是"用得少":
+//   - AskUserQuestion: 工具自己的描述就写着 "In non-interactive mode the tool cannot
+//     run", 而团队 stage 的引擎配置恒为 IsNonInteractive: true —— 暴露它等于摆一个
+//     必然失败的动作。
+//   - EnterPlanMode/ExitPlanMode: 计划模式的生命线是 cfg.DynamicPlanCheck 与
+//     PlanFileDir, 而这两个只在主会话路径 (createSessionWithClient) 里赋值, 团队
+//     stage 的 cfg 里是零值 —— 进了计划模式也既无状态也无落盘出口。
+//
+// 两条都有 8516 次工具调用的数据背书: 三者合计 **0 次**被调用。
+// 每个省下的 schema 都会在**每一轮**重发, 所以这属于纯赚的减法。
+func dropInteractiveOnlyTools(reg *tool.Registry) {
+	if reg == nil {
+		return
+	}
+	for _, name := range []string{
+		builtin.AskUserQuestionToolName,
+		builtin.EnterPlanModeToolName,
+		builtin.ExitPlanModeToolName,
+	} {
+		reg.Remove(name)
+	}
+}
+
+// roleScopedSkillListing 只列**该角色声明过或推荐过的**技能 (团队 stage 用)。
+//
+// 为什么不能列全量: 内置技能库 (pkg/skills/builtin, 28 个 go:embed 的 SKILL.md) 是
+// 跨项目沉淀的, 全局清单会把 Django / C++ / C# / Dart / 并发审查 / 品牌规范 之类
+// 与当前任务毫无关系的条目塞进**每一次**请求。实测某个出题 stage 的 system[0] 里
+// <available_skills> 占 3133 字节 / 35 条, 而 Skill 工具在全部 8516 次工具调用里
+// **0 次**被使用 —— 花了成本, 一次都没换来收益。
+//
+// 这不是"砍掉能力": 没列出的技能仍在统一池里 (RegisterPoolTools 把
+// ModelVisibleActive 全量登记为池成员), 模型用 pool_search 按关键词就能找回来,
+// 再 pool_load 展开正文。池对技能这一路此前形同虚设, 恰恰因为清单本就全量可见 ——
+// 既然什么都在眼前, 就没有"检索"这一步。
+//
+// 角色未声明任何技能时返回空串 (宁可不列, 也不要把整个技能库倒进去)。
+func (sm *SessionManager) roleScopedSkillListing(role string) string {
+	if sm.skillReg == nil || sm.skillReg.Count() == 0 {
+		return ""
+	}
+	if sm.roleRegistry == nil {
+		// 没有角色注册表就没有"角色相关"这个判据, 此时保持旧行为 (全量短清单),
+		// 不要因为缺一个可选项就把技能面整段抹掉。
+		return shortSkillListingInDir(sm.skillReg, sm.config.Cwd)
+	}
+	return sm.skillReg.FormatShortListingForNames(sm.roleRegistry.RoleSkills(role))
+}
+
 func (sm *SessionManager) configureSessionTools(session *Session, profile builtin.ToolProfile) {
 	profile = builtin.NormalizeToolProfile(profile)
 	if session.ToolProfile == profile && session.Engine != nil && session.Engine.Tools != nil {
@@ -1319,6 +1370,7 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 		return profileForTeamRole(teamRole, r.runMeta.Workflow)
 	})
 	nestedReg := r.sm.newProfileRegistry(prof, registryOptions{})
+	dropInteractiveOnlyTools(nestedReg)
 
 	permMode := types.PermissionMode(r.sm.config.PermissionMode)
 	permChecker := permissions.NewChecker(permMode)
@@ -1340,7 +1392,8 @@ func (r *sessionAgentRunner) Execute(ctx context.Context, userPrompt string) (st
 	compactor := compact.NewCompactor(apiClient, contextWindow)
 	promptMgr := prompt.NewManager(r.sm.config.Cwd)
 	promptMgr.Model = modelOverride
-	promptMgr.SkillListing = shortSkillListingInDir(r.sm.skillReg, r.sm.config.Cwd)
+	// 角色相关技能才列出; 其余走统一池按需检索 (见 roleScopedSkillListing 注释)。
+	promptMgr.SkillListing = r.sm.roleScopedSkillListing(r.role)
 
 	// 角色提示词: 优先使用外部传入的, 再尝试从 RoleRegistry 获取 (含专属 Skills)
 	effectivePrompt := r.systemPrompt
