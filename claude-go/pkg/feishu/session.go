@@ -2,9 +2,9 @@ package feishu
 
 import (
 	"context"
-	"os"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,8 +28,8 @@ import (
 	"github.com/anthropic/claude-go/pkg/statestore"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
-	"github.com/anthropic/claude-go/pkg/weakmodel"
 	"github.com/anthropic/claude-go/pkg/types"
+	"github.com/anthropic/claude-go/pkg/weakmodel"
 )
 
 // Session 单个飞书会话。
@@ -491,7 +491,7 @@ func dropInteractiveOnlyTools(reg *tool.Registry) {
 // 再 pool_load 展开正文。池对技能这一路此前形同虚设, 恰恰因为清单本就全量可见 ——
 // 既然什么都在眼前, 就没有"检索"这一步。
 //
-// 角色未声明任何技能时返回空串 (宁可不列, 也不要把整个技能库倒进去)。
+// 角色未声明任何技能时不再倒整个技能库, 只留一句"其余在池里"的指路 (见下)。
 func (sm *SessionManager) roleScopedSkillListing(role string) string {
 	if sm.skillReg == nil || sm.skillReg.Count() == 0 {
 		return ""
@@ -501,7 +501,29 @@ func (sm *SessionManager) roleScopedSkillListing(role string) string {
 		// 不要因为缺一个可选项就把技能面整段抹掉。
 		return shortSkillListingInDir(sm.skillReg, sm.config.Cwd)
 	}
-	return sm.skillReg.FormatShortListingForNames(sm.roleRegistry.RoleSkills(role))
+	out := sm.skillReg.FormatShortListingForNames(sm.roleRegistry.RoleSkills(role))
+	if out != "" {
+		return out
+	}
+	return poolPointerListing()
+}
+
+// poolPointerListing 在清单被裁空时给一句指路。
+//
+// 为什么必须有: 裁剪把技能藏起来之后, 模型**不知道自己不知道什么** —— 眼前没有的
+// 东西它不会去找。实测某次增量出题 run 的 4 次工具调用全是 Read/Write/Bash, 一次
+// pool_search 都没有: 不是池坏了, 是没有任何线索提示"还有可检索的东西"。
+// 池开着时才有意义 (没开池就真的没得搜), 所以按 CLAUDE_GO_TOOLS_POOL 判。
+//
+// 成本 ~110 字节, 对比原来全量清单的 3133 字节可以忽略。
+func poolPointerListing() string {
+	if !tool.PoolEnabled(os.Getenv) {
+		return ""
+	}
+	return "<available_skills summary=\"short\">\n" +
+		"（本角色没有专属技能；其余技能与已下沉的工具都在统一池中，" +
+		"可用 pool_search 按关键词检索，命中后再 pool_load 展开完整说明。）\n" +
+		"</available_skills>\n"
 }
 
 func (sm *SessionManager) configureSessionTools(session *Session, profile builtin.ToolProfile) {
