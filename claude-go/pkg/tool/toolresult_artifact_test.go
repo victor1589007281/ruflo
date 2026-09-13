@@ -2,6 +2,7 @@ package tool
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,8 +27,13 @@ func TestCompactSpillsOversizeResultWithReadableCoordinate(t *testing.T) {
 		t.Fatalf("超预算结果应被压缩, 得:\n%s", out[:200])
 	}
 	// 关键: 预览必须给出**可执行**的续读坐标, 而不是只丢一个路径
-	if !strings.Contains(out, "read_hint:") || !strings.Contains(out, "offset=1") {
+	if !strings.Contains(out, "read_hint:") || !strings.Contains(out, "offset=") {
 		t.Error("预览应给出 Read 的续读坐标 (read_hint / offset)")
+	}
+	// 续读起点要**跳过预览已经展示过的开头**, 而不是从第 1 行重来 ——
+	// 从 1 重来会让模型把刚看过的内容再读一遍, 这正是"翻页翻不完"的来源。
+	if want := fmt.Sprintf("offset=%d", compactHeadLines+1); !strings.Contains(out, want) {
+		t.Errorf("续读应从预览之后开始 (%s), 得:\n%s", want, out)
 	}
 	if !strings.Contains(out, "不要重跑命令") {
 		t.Error("预览应明确告知不必重跑命令")
@@ -126,6 +132,23 @@ func TestArtifactPathIsContentAddressed(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Errorf("同内容应去重, 目录里应只有 2 个文件, 实得 %d", len(entries))
+	}
+}
+
+// 续读坐标应指向**原始来源**而不是 artifact: artifact 存的是 Read 的渲染结果
+// (每行带 "N|" 前缀), 拿它当原文续读会叠一层行号。
+func TestCompactPrefersSourcePathForContinuation(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "bank.txt")
+	input, _ := json.Marshal(map[string]string{"path": src})
+
+	out := compactToolResultContent("Read", input, bigContent(defaultMaxToolResultChars+4000), &ToolContext{Cwd: dir})
+	if !strings.Contains(out, fmt.Sprintf("path=%q", src)) {
+		t.Errorf("续读应指向原始文件 %s, 得:\n%s", src, out[:400])
+	}
+	// 同时仍要给出 artifact 作为"全文"兜底
+	if !strings.Contains(out, "full_artifact: ") {
+		t.Error("仍应保留 artifact 路径")
 	}
 }
 

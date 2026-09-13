@@ -12,8 +12,11 @@ FROM debian:bookworm-slim
 # 不装它会导致写盘步骤在容器内失败。
 # golang-go: 引擎级 AutoMode 让模型在容器内"写代码 → go test 验证"闭环;
 # 不装 go, 模型写完 .go 文件后无法自测 (实测 exit 127)。
+# ripgrep: Grep 工具是 exec rg 的实现, 镜像里没有就直接 "exec: rg: executable not
+# found in $PATH" —— 模型每次想搜索都白烧一个 turn (实测 if-question-expand 的
+# 一次 run 里就这么废掉一轮)。apt 的包名是 ripgrep, 二进制叫 rg。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git curl python3 golang-go nodejs openssh-client \
+      ca-certificates git curl python3 golang-go nodejs openssh-client ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 1000 -M -s /usr/sbin/nologin claude
 # nodejs: IMA 同步适配器 exec node ima_api.cjs (pkg/sync/ima.go)。

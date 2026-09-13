@@ -319,6 +319,10 @@ func RunToolUse(
 
 const defaultMaxToolResultChars = 24000
 
+// compactHeadLines 压缩预览展示的开头行数。摘要实现与 read_hint 的续读起点
+// 必须同源 —— 各写一个 20 会让"提示从第 21 行续读"与"实际展示了前 19 行"对不上。
+const compactHeadLines = 20
+
 // 弱模型确定性后处理阈值 (方案三 L3, 手册 13.3.3):
 // 单行 2000 字符截断 (防单行 minified 文件/二进制 dump 挤爆上下文),
 // 总行数 >4000 时保头 2000 行 + 尾 1000 行 (错误信息通常在尾部,
@@ -437,17 +441,35 @@ func compactToolResultContent(toolName string, input json.RawMessage, content st
 	}
 	summary := summarizeLongToolResult(content, summaryLimit)
 
+	totalLines := strings.Count(content, "\n") + 1
+	shownHead := compactHeadLines
+	if shownHead > totalLines {
+		shownHead = totalLines
+	}
+
 	var b strings.Builder
 	b.WriteString("[tool_result compacted]\n")
 	b.WriteString(fmt.Sprintf("tool: %s\n", toolName))
 	b.WriteString(fmt.Sprintf("original_chars: %d\n", len(content)))
-	b.WriteString(fmt.Sprintf("original_lines: %d\n", strings.Count(content, "\n")+1))
+	b.WriteString(fmt.Sprintf("original_lines: %d\n", totalLines))
 	if artifactPath != "" {
 		b.WriteString(fmt.Sprintf("full_artifact: %s\n", artifactPath))
+		b.WriteString(fmt.Sprintf("shown: 开头 %d 行 + 结尾片段\n", shownHead))
 		// 给可执行的续读坐标, 而不是只丢一个路径让模型自己试:
-		// 告诉它 (a) 不必重跑命令, (b) 怎么翻页, (c) 读这个文件不会再次被压缩。
-		b.WriteString("artifact_note: 完整结果已落盘, **不要重跑命令来再看一遍**; 需要正文时用 Read 分段读取。\n")
-		b.WriteString(fmt.Sprintf("read_hint: Read(path=%q, offset=1, limit=2000) 起读, 按返回里的续读入口继续翻页; 读 artifact 本身不会再被压缩。\n", artifactPath))
+		// 告诉它 (a) 不必重跑命令, (b) **从预览已经展示过的位置之后**接着读, (c) 一次别要太多行。
+		b.WriteString("artifact_note: 完整结果已落盘, **不要重跑命令来再看一遍**。\n")
+		// 续读优先指向**原始来源**(Read/Bash 入参里的文件路径), 而不是 artifact:
+		// artifact 存的是 Read 的渲染结果(每行带 "N|" 前缀), 拿它当"原文"续读会叠一层行号。
+		// 从 shownHead+1 起而不是从 1 起 —— 从 1 起会让模型把刚看过的开头再读一遍。
+		if srcPath := toolInputPath(input); srcPath != "" {
+			b.WriteString(fmt.Sprintf(
+				"read_hint: 续读用 Read(path=%q, offset=%d, limit=200); 单次读太多行会被再次压缩, 按返回里的续读入口往下翻。\n",
+				srcPath, shownHead+1))
+		} else {
+			b.WriteString(fmt.Sprintf(
+				"read_hint: 续读用 Read(path=%q, offset=%d, limit=200); 读 artifact 本身不会再被压缩。\n",
+				artifactPath, shownHead+1))
+		}
 	} else {
 		// 落盘失败 (无 cwd / 磁盘只读): 明说拿不到全文, 免得模型以为还能读到。
 		b.WriteString("full_artifact: (落盘失败, 本次无全文留存)\n")
@@ -512,7 +534,7 @@ func summarizeLongToolResult(raw string, maxChars int) string {
 	lines := strings.Split(raw, "\n")
 	var picked []string
 	for i, line := range lines {
-		if i >= 20 {
+		if i >= compactHeadLines {
 			break
 		}
 		picked = append(picked, line)
