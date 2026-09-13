@@ -31,6 +31,19 @@ const (
 	TraceHeaderCallID = "X-CG-Call-ID"
 )
 
+// SessionHeader 是 opencode zen/go 上游要求的会话头 (Claude Code CLI 的原生头名)。
+//
+// 它决定**提示缓存能不能命中**: opencode 用会话 ID 选路由与缓存分片, 同一个会话内
+// 前缀不变就命中, 换会话就全额重算。实测同一段 4.4K token 前缀:
+//
+//	同会话第二次 → cache_read=4224, input=214
+//	换会话第二次 → cache_read=0,    input=4438
+//
+// anthropic-gateway 的 opencodeSessionID() 优先透传本头、缺失才随机兜底, 所以
+// **不发这个头 = 每次请求都是新会话 = 缓存命中率恒为 0**。这正是 opencode 路由下
+// 全量 265 次 llm_call cache_read 全 0 的原因: 客户端从未发过它。
+const SessionHeader = "X-Claude-Code-Session-Id"
+
 // Trace 是 design/02 §3.1 要求 ChatRequest "必带"的四元组。
 // 四个字段都是可选的: 只有 RunID 的调用方 (如 dashboard 的诊断作业) 照样有用,
 // 网关侧能把同一次作业的多次调用归并到一起。
@@ -80,6 +93,15 @@ func setTraceHeaders(req *http.Request, ctx context.Context) {
 	t := TraceFromContext(ctx)
 	if t.IsZero() {
 		return
+	}
+	// 会话头 (缓存命中与否的关键, 见 SessionHeader 注释): 用 RunID 当会话 ID ——
+	// 同一次 run 内恒定, 所以前缀不变的那些轮能命中同一份缓存; 跨 run 会变,
+	// 而跨 run 的 system 前缀本来就不一样 (objective 里带 team_name), 该重建。
+	//
+	// 放在这里而不是各调用点: 三个请求出口 (流式/非流式/降级) 都走本函数,
+	// 而 applyExtraHeaders 在其后执行 —— 调用方显式注入的会话头仍能覆盖这个默认值。
+	if t.RunID != "" {
+		req.Header.Set(SessionHeader, t.RunID)
 	}
 	for h, v := range map[string]string{
 		TraceHeaderRunID:  t.RunID,

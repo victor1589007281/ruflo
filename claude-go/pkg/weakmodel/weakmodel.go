@@ -107,7 +107,7 @@ func Resolve(provider string, getenv func(string) string) Profile {
 // 这正是"渐进披露"与"硬掩码"的安全差异)。
 var CoreVisibleTools = []string{
 	// 编码核心
-	"Shell", "Read", "Write", "StrReplace", "Glob", "Grep",
+	"Bash", "Shell", "Read", "Write", "StrReplace", "Glob", "Grep",
 	// 规划与任务跟踪
 	"TodoWrite", "EnterPlanMode", "ExitPlanMode",
 	"TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",

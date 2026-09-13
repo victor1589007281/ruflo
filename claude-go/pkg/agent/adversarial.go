@@ -727,7 +727,7 @@ func (e *RuleEngine) checkNoDeleteNonTarget(toolName string, input json.RawMessa
 	}
 	tn := strings.TrimSpace(toolName)
 	switch tn {
-	case "Shell":
+	case "Bash", "Shell":
 		var in struct {
 			Command string `json:"command"`
 		}
@@ -811,7 +811,7 @@ func tokenizePathsFromShell(cmd string) []string {
 func checkNoCommitSecrets(toolName string, input json.RawMessage) error {
 	tn := strings.TrimSpace(toolName)
 	switch tn {
-	case "Shell":
+	case "Bash", "Shell":
 		var in struct {
 			Command string `json:"command"`
 		}
@@ -873,7 +873,7 @@ func detectSecretPatterns(s string) []string {
 }
 
 func checkNoInfiniteLoopPatterns(toolName string, input json.RawMessage) error {
-	if strings.TrimSpace(toolName) != "Shell" {
+	if tn := strings.TrimSpace(toolName); tn != "Bash" && tn != "Shell" {
 		return nil
 	}
 	var in struct {

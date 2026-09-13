@@ -267,7 +267,7 @@ func (d *LoopDetector) checkEditOscillationLocked(tool string, input []byte) (bo
 // checkCompileErrorLoopLocked 检测同一编译/命令错误是否连续重复出现。
 // 要求调用方已持有 d.mu。
 func (d *LoopDetector) checkCompileErrorLoopLocked(tool string, result string, isError bool) (bool, string) {
-	if tool != "Shell" || !isError {
+	if (tool != "Bash" && tool != "Shell") || !isError {
 		return false, ""
 	}
 

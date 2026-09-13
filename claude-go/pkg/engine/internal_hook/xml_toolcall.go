@@ -75,11 +75,12 @@ var bracketArgRe = regexp.MustCompile(`--([a-zA-Z_][a-zA-Z0-9_]*)\s+("(?:\\.|[^"
 
 // toolNameAlias 把 LLM 误用的别名映射到实际注册的工具名.
 // MiniMax / Qwen 经常按 Claude 训练语料里的命名 (Edit/Bash) 来写, 但我们
-// 实际注册的是 StrReplace/Shell.
+// 实际注册的可能是 StrReplace 等别的名字。Bash 自 2026-09-13 起已是规范名,
+// 这里收的是反方向的旧名 "Shell"。
 var toolNameAlias = map[string]string{
 	"Edit":      "StrReplace",
 	"FileEdit":  "StrReplace",
-	"Bash":      "Shell",
+	"Shell":     "Bash", // 2026-09-13 前的旧名; 现规范名是 Bash (见 builtin.BashToolName)
 	"FileRead":  "Read",
 	"FileWrite": "Write",
 }
@@ -106,7 +107,7 @@ var paramAlias = map[string]map[string]string{
 	"Grep": {
 		// pattern 字段名一致
 	},
-	"Shell": {
+	"Bash": {
 		// command 字段名一致
 	},
 }

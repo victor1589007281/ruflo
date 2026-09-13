@@ -318,7 +318,7 @@ func buildSessionToolHints(tools *tool.Registry) string {
 		"StrReplace":  "Use StrReplace for surgical edits instead of sed/awk one-liners.",
 		"Glob":        "Use Glob for path patterns instead of find(1) when possible.",
 		"Grep":        "Use Grep for repository search instead of spawning shell grep/rg.",
-		"Shell":       "Reserve Shell for operations that have no first-class tool; prefer file tools when applicable.",
+		"Bash":        "Reserve Bash for operations that have no first-class tool; prefer file tools when applicable.",
 		"TodoWrite":   "Use TodoWrite to track multi-step tasks and mark progress.",
 		"TaskCreate":  "Use TaskCreate / Task tools to break work into trackable sub-tasks.",
 		"TaskUpdate":  "Use TaskUpdate to advance structured sub-tasks.",

@@ -23,7 +23,8 @@ var toolNameCaps = map[string]agent.Capability{
 	"Read": agent.CapReadFS, "Glob": agent.CapReadFS, "Grep": agent.CapReadFS, "LSP": agent.CapReadFS,
 	"Write": agent.CapWriteFS, "StrReplace": agent.CapWriteFS,
 	"EnterWorktree": agent.CapWriteFS, "ExitWorktree": agent.CapWriteFS,
-	"Shell": agent.CapExec, "TaskOutput": agent.CapExec, "TaskStop": agent.CapExec,
+	"Bash": agent.CapExec, "Shell": agent.CapExec, // Shell 是 Bash 的旧名 (别名), 两者同维
+	"TaskOutput": agent.CapExec, "TaskStop": agent.CapExec,
 	"WebFetch": agent.CapNet, "WebSearch": agent.CapNet, "FetchKLine": agent.CapNet, "FetchQuote": agent.CapNet,
 	"code_intel_query": agent.CapReadIndex, "code_intel_status": agent.CapReadIndex, "code_intel_branch": agent.CapReadIndex,
 	"code_intel_init": agent.CapWriteIndex, "code_intel_update": agent.CapWriteIndex,

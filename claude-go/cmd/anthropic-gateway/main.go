@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -29,6 +30,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
@@ -239,7 +241,7 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// 该头缺失时兜底生成随机 ID (仍能消除 400, 代价仅是跨请求缓存/路由不共享)。
 	if isOpenCodeUpstream(rc) {
 		client.ExtraHeaders = http.Header{
-			"x-opencode-session": {opencodeSessionID(r)},
+			"x-opencode-session": {opencodeSessionID(r, rc.ProviderName+"\n"+strings.Join(extractSystem(req.System), "\n"))},
 			"User-Agent":         {"anthropic-gateway/" + gatewayVersion},
 		}
 	}
@@ -357,7 +359,7 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 	}
 	// opencode zen/go 原生 /v1/messages 同样强制要求 x-opencode-session (缺失 → 400)。
 	if isOpenCodeUpstream(rc) {
-		req.Header.Set("x-opencode-session", opencodeSessionID(r))
+		req.Header.Set("x-opencode-session", opencodeSessionID(r, ""))
 	}
 
 	// 模型级代理: 复用与翻译路径相同的代理语义 (http://host:port)。
@@ -459,7 +461,7 @@ func (g *gateway) proxyOpenAIFormat(w http.ResponseWriter, r *http.Request, upst
 	req.Header.Set("User-Agent", "anthropic-gateway/"+gatewayVersion)
 	// opencode zen/go 上游强制 x-opencode-session (缺失 → 400 MissingSessionID)。
 	if isOpenCodeUpstream(rc) {
-		req.Header.Set("x-opencode-session", opencodeSessionID(r))
+		req.Header.Set("x-opencode-session", opencodeSessionID(r, ""))
 	}
 	// omen-alpha 等隐藏推理模型首 token 可达 7+ 分钟: 用 --upstream-timeout (默认 30min),
 	// 不能用 proxyPassthrough 那样的 10min 短超时 (会中途 502 context deadline exceeded)。
@@ -549,13 +551,34 @@ func isOpenCodeUpstream(rc modelconfig.ResolvedConfig) bool {
 }
 
 // opencodeSessionID 取本次入站请求对应的 opencode 会话 ID。
+//
 // 优先透传 Claude Code 原生 X-Claude-Code-Session-Id (跨请求稳定, 让 opencode 的
-// 路由/提示缓存命中同会话); 无该头 (curl/其他客户端) 时生成随机 UUID 兜底。
-func opencodeSessionID(r *http.Request) string {
+// 路由/提示缓存命中同会话)。该头缺失时**按 seed 派生稳定 ID**, 而不是随机 UUID:
+//
+// 随机 ID 让每个请求落进不同的会话分片, 提示缓存永远命中不了 —— 实测同一段 4.4K
+// token 前缀, 同会话第二次 cache_read=4224 / input=214, 换会话则是 cache_read=0 /
+// input=4438 (全额重算)。会话 ID 在这里只影响路由与缓存分片, 不影响正确性, 所以
+// "内容相同 → 同一会话" 是安全且严格更优的策略: 与"缓存按前缀命中"的语义天然一致。
+// seed 为空时退化为进程级常量 (仍然可复用), 不再是每次请求都换。
+func opencodeSessionID(r *http.Request, seed string) string {
 	if v := strings.TrimSpace(r.Header.Get(claudeSessionHeader)); v != "" {
 		return v
 	}
-	return newSessionID()
+	if seed == "" {
+		seed = gatewaySessionSeed() // 进程级兜底: 整个网关进程共用一个会话
+	}
+	sum := sha256.Sum256([]byte(seed))
+	return "gw-" + hex.EncodeToString(sum[:16])
+}
+
+var (
+	gatewaySessionSeedOnce sync.Once
+	gatewaySessionSeedVal  string
+)
+
+func gatewaySessionSeed() string {
+	gatewaySessionSeedOnce.Do(func() { gatewaySessionSeedVal = newSessionID() })
+	return gatewaySessionSeedVal
 }
 
 // newSessionID 生成一个 v4 风格随机 UUID 字符串。

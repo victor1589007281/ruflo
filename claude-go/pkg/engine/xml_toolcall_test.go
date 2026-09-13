@@ -74,8 +74,9 @@ func TestExtractXMLToolCalls_NameAliases(t *testing.T) {
 	if blocks[0].Name != "StrReplace" {
 		t.Fatalf("expected Edit aliased to StrReplace, got %q", blocks[0].Name)
 	}
-	if blocks[1].Name != "Shell" {
-		t.Fatalf("expected Bash aliased to Shell, got %q", blocks[1].Name)
+	// Bash 自 2026-09-13 起是规范名, 不再是别名(反过来 Shell 才是别名)
+	if blocks[1].Name != "Bash" {
+		t.Fatalf("expected Bash kept as-is, got %q", blocks[1].Name)
 	}
 
 	var in0, in1 map[string]any
@@ -392,9 +393,9 @@ func TestExtractBracketToolCalls_BashWithMultipleArgs(t *testing.T) {
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
-	// Bash should be aliased to Shell
-	if blocks[0].Name != "Shell" {
-		t.Fatalf("expected Bash aliased to Shell, got %q", blocks[0].Name)
+	// Bash 是规范名, 原样保留
+	if blocks[0].Name != "Bash" {
+		t.Fatalf("expected Bash kept as-is, got %q", blocks[0].Name)
 	}
 	var in map[string]any
 	_ = json.Unmarshal(blocks[0].Input, &in)

@@ -24,7 +24,14 @@ import (
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
-const BashToolName = "Shell"
+// BashToolName 是命令执行工具对外暴露的名字。
+//
+// 2026-09-13 之前叫 "Shell"。改成 "Bash" 是为了跟 Claude Code 的工具面对齐:
+// 模型 (尤其按 Claude 语料训练的) 会直接写 tool_use name="Bash", 旧名只能靠
+// xml_toolcall 的别名表兜底, 而直连原生 tool_use 的模型没有这层兜底。
+// 旧名不作废: Aliases() 仍报 "Shell", 治理配置 (AllowedTools/DisabledTools)、
+// 持久化会话状态里残留的 "Shell" 继续生效。
+const BashToolName = "Bash"
 
 const maxResultSizeChars = 30000
 
@@ -46,8 +53,16 @@ func NewBashTool() *BashTool { return &BashTool{} }
 
 func (t *BashTool) Name() string { return BashToolName }
 
+// Aliases 保留 2026-09-13 之前的旧名, 供治理配置与历史会话状态继续按 "Shell" 引用它。
+func (t *BashTool) Aliases() []string { return []string{"Shell"} }
+
 func (t *BashTool) Description() string {
-	return `Executes a given command in a shell session with optional working directory.`
+	// 描述里不用反引号 —— 整个字符串是 raw literal, 反引号会把它截断。
+	return `Executes a given command in a shell session.
+- Pass the command as the "command" field; use "working_directory" to run it somewhere other than the default cwd (it does not persist between calls).
+- Prefer the dedicated tools when one applies (Read / Write / StrReplace / Glob / Grep) — they are permission-checked and render better than cat/sed/echo/find/grep.
+- Never start commands that wait for interactive input: they hang until the timeout.
+- The tool blocks up to "block_until_ms" (default 30000) and returns what has been collected so far; output beyond 30000 characters is truncated with a note.`
 }
 
 func (t *BashTool) InputSchema() json.RawMessage {
@@ -86,7 +101,7 @@ func (t *BashTool) IsConcurrencySafe(input json.RawMessage) bool {
 // 对应 TS: BashTool.ts 中的 checkPermissions + bashPermissions.ts
 func (t *BashTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx.PermissionMode == types.PermissionModePlan {
-		return &types.PermissionResult{Behavior: types.PermissionDeny, Reason: "Plan mode: Shell 命令不可用"}
+		return &types.PermissionResult{Behavior: types.PermissionDeny, Reason: "Plan mode: 命令执行工具不可用"}
 	}
 	return nil
 }
