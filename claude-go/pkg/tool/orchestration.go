@@ -19,13 +19,14 @@ package tool
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -292,7 +293,7 @@ func RunToolUse(
 	if preHookContext != "" {
 		content = preHookContext + "\n\n" + content
 	}
-	content = compactToolResultContent(toolName, content, tctx)
+	content = compactToolResultContent(toolName, block.Input, content, tctx)
 
 	resultBlocks := []types.ContentBlock{{
 		Type:      types.ContentBlockToolResult,
@@ -354,7 +355,62 @@ func deterministicToolResultPostprocess(content string) string {
 	return strings.Join(lines, "\n")
 }
 
-func compactToolResultContent(toolName, content string, tctx *ToolContext) string {
+// toolResultArtifactDir 超大 tool_result 的落盘目录。空串 = 不可用 (无 cwd)。
+func toolResultArtifactDir(tctx *ToolContext) string {
+	if tctx == nil || strings.TrimSpace(tctx.Cwd) == "" {
+		return ""
+	}
+	return filepath.Join(tctx.Cwd, ".claude-go", "artifacts", "tool-results")
+}
+
+// toolInputPath 从工具入参里取"这次操作的文件路径"。各工具字段名不统一, 都试一遍。
+func toolInputPath(input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if json.Unmarshal(input, &m) != nil {
+		return ""
+	}
+	for _, k := range []string{"path", "file_path", "notebook_path", "file"} {
+		if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// readsArtifact 判断这次调用读的是不是落盘的 tool_result 本身。
+//
+// 这是溢出逻辑的**自指保护**: artifact 是"把超大结果搬出上下文"的目的地, 如果模型
+// 去 Read 它、读回来的内容又超预算、于是再落一份 artifact…… 每一轮都只把上一轮的
+// 预览再预览一遍, 正文永远进不了上下文, 而且每轮多一个文件。必须在入口掐掉。
+//
+// 判定按**目录**而不是按文件名: 落盘文件名带内容哈希, 换个名字照样落在同一目录。
+func readsArtifact(input json.RawMessage, tctx *ToolContext) bool {
+	dir := toolResultArtifactDir(tctx)
+	if dir == "" {
+		return false
+	}
+	p := toolInputPath(input)
+	if p == "" {
+		return false
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(tctx.Cwd, p)
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(dir, abs)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func compactToolResultContent(toolName string, input json.RawMessage, content string, tctx *ToolContext) string {
 	// 方案三 L3: 弱模型后处理先做 (单行+总行整形), 再走既有字符预算逻辑。
 	if tctx != nil && tctx.WeakResultPostprocess {
 		content = deterministicToolResultPostprocess(content)
@@ -364,6 +420,10 @@ func compactToolResultContent(toolName, content string, tctx *ToolContext) strin
 		maxChars = tctx.MaxToolResultChars
 	}
 	if maxChars <= 0 || len(content) <= maxChars {
+		return content
+	}
+	// 自指保护先于落盘: 读 artifact 的结果不再落 artifact (见 readsArtifact 注释)。
+	if readsArtifact(input, tctx) {
 		return content
 	}
 
@@ -381,24 +441,42 @@ func compactToolResultContent(toolName, content string, tctx *ToolContext) strin
 	b.WriteString("[tool_result compacted]\n")
 	b.WriteString(fmt.Sprintf("tool: %s\n", toolName))
 	b.WriteString(fmt.Sprintf("original_chars: %d\n", len(content)))
+	b.WriteString(fmt.Sprintf("original_lines: %d\n", strings.Count(content, "\n")+1))
 	if artifactPath != "" {
 		b.WriteString(fmt.Sprintf("full_artifact: %s\n", artifactPath))
+		// 给可执行的续读坐标, 而不是只丢一个路径让模型自己试:
+		// 告诉它 (a) 不必重跑命令, (b) 怎么翻页, (c) 读这个文件不会再次被压缩。
+		b.WriteString("artifact_note: 完整结果已落盘, **不要重跑命令来再看一遍**; 需要正文时用 Read 分段读取。\n")
+		b.WriteString(fmt.Sprintf("read_hint: Read(path=%q, offset=1, limit=2000) 起读, 按返回里的续读入口继续翻页; 读 artifact 本身不会再被压缩。\n", artifactPath))
+	} else {
+		// 落盘失败 (无 cwd / 磁盘只读): 明说拿不到全文, 免得模型以为还能读到。
+		b.WriteString("full_artifact: (落盘失败, 本次无全文留存)\n")
 	}
 	b.WriteString("summary:\n")
 	b.WriteString(summary)
 	return b.String()
 }
 
+// writeToolResultArtifact 把超大结果落盘, 返回路径 (失败返回空串)。
+//
+// 文件名用**内容哈希**而不是时间戳: 同一份输出被反复产生 (重跑同一条命令、重复
+// Read 同一文件) 是常态, 时间戳命名每次都新建一份, 目录里全是重复内容; 内容寻址
+// 天然去重, 且同一份内容恒得同一路径 —— 模型上下文里引用过的路径不会因为换了一次
+// 时间戳而失效。
 func writeToolResultArtifact(toolName, content string, tctx *ToolContext) string {
-	if tctx == nil || strings.TrimSpace(tctx.Cwd) == "" {
+	dir := toolResultArtifactDir(tctx)
+	if dir == "" {
 		return ""
 	}
-	dir := filepath.Join(tctx.Cwd, ".claude-go", "artifacts", "tool-results")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return ""
 	}
-	name := sanitizeArtifactName(toolName)
-	path := filepath.Join(dir, fmt.Sprintf("%s-%s.txt", time.Now().Format("20060102-150405.000000"), name))
+	sum := sha256.Sum256([]byte(content))
+	path := filepath.Join(dir, fmt.Sprintf("%s-%s.txt", sanitizeArtifactName(toolName), hex.EncodeToString(sum[:])[:12]))
+	// 同一内容已落过盘就复用: 语义相同, 省一次写。
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		return ""
 	}

@@ -50,11 +50,11 @@ func TestCompactToolResultContentWeakPostprocessGate(t *testing.T) {
 	long := strings.Repeat("y", 5000)
 	in := long // 单行 5000 字符, 低于默认 maxChars 阈值
 	// 关: 不动 (未超字符预算)
-	if out := compactToolResultContent("Shell", in, &ToolContext{}); out != in {
+	if out := compactToolResultContent("Shell", nil, in, &ToolContext{}); out != in {
 		t.Error("WeakResultPostprocess 关闭时不应做行截断")
 	}
 	// 开: 单行截断生效
-	out := compactToolResultContent("Shell", in, &ToolContext{WeakResultPostprocess: true})
+	out := compactToolResultContent("Shell", nil, in, &ToolContext{WeakResultPostprocess: true})
 	if !strings.Contains(out, "[line truncated]") {
 		t.Error("WeakResultPostprocess 开启后应截断超长行")
 	}
