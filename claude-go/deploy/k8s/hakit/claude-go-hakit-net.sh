@@ -12,6 +12,12 @@ grep -q 'nvme1n1p1 /mnt/data' /proc/$PID/mounts 2>/dev/null || \
   python3 /usr/local/bin/bindmnt.py "$PID" /mnt/data /mnt/data
   nsenter -t "$PID" -m -- mkdir -p /home/victor/base/git/gitee/knowledge
   grep -q "gitee/knowledge" /proc/$PID/mounts 2>/dev/null || python3 /usr/local/bin/bindmnt.py "$PID" /home/victor/base/git/gitee/knowledge /home/victor/base/git/gitee/knowledge
+  # claude-go 的团队产物目录: 模型按 workflow 指令把 questions.json 等写这里,
+  # 宿主侧 interviewforge 再读回去。不 bind 进节点的话, hostPath 落的是节点容器
+  # 自己的空目录, 写入静默丢失(实测 ~/.claude-go/teams 下只有 claude-go 自己写的
+  # REPORT.md/blackboard.json, 没有模型脚本写的 questions.json)。
+  nsenter -t "$PID" -m -- mkdir -p /home/victor/.claude-go/teams
+  grep -q "claude-go/teams" /proc/$PID/mounts 2>/dev/null || python3 /usr/local/bin/bindmnt.py "$PID" /home/victor/.claude-go/teams /home/victor/.claude-go/teams
   nsenter -t "$PID" -m -- mkdir -p /home/victor/.ssh
   grep -q "victor/.ssh" /proc/$PID/mounts 2>/dev/null || python3 /usr/local/bin/bindmnt.py "$PID" /home/victor/.ssh /home/victor/.ssh
 sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null

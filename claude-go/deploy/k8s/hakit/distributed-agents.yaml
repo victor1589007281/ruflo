@@ -23,7 +23,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: gateway
-          image: claude-go:agents9-omen4
+          image: claude-go:agents-20260912-233823
           imagePullPolicy: Never
           # anthropic-gateway (协议翻译/透传, omen 长推理 30min + x-opencode-session
           # 注入) + pathfix (18081→18085, 兼容老客户端 /messages 路径改写)。
@@ -73,7 +73,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: control
-          image: claude-go:agents9
+          image: claude-go:agents-20260912-233823
           imagePullPolicy: Never
           args:
             - "serve"
@@ -107,6 +107,7 @@ spec:
             - { name: state, mountPath: /mnt/data/claude-go }
             - { name: config, mountPath: /etc/claude-go }
             - { name: teams, mountPath: /workspace }
+            - { name: teams-visible, mountPath: /home/victor/.claude-go/teams }
             - { name: knowledge, mountPath: /home/victor/base/git/gitee/knowledge }
             - { name: ima-skill, mountPath: /home/victor/.claude/skills/ima-skill, readOnly: true }
             - { name: ssh, mountPath: /home/victor/.ssh, readOnly: true }
@@ -115,12 +116,18 @@ spec:
           hostPath:
             path: /mnt/data/claude-go
             type: Directory
+        - name: teams-visible
+          hostPath:
+            path: /home/victor/.claude-go/teams
+            type: DirectoryOrCreate
+
         - name: config
           configMap: { name: agents-config }
         - name: teams
           hostPath:
             path: /mnt/data/claude-go/workspace
             type: DirectoryOrCreate
+
         - name: knowledge
           hostPath:
             path: /home/victor/base/git/gitee/knowledge
@@ -161,7 +168,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: dashboard
-          image: claude-go:agents9
+          image: claude-go:agents-20260912-233823
           imagePullPolicy: Never
           args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open", "--config", "/etc/claude-go/config.json"]
           env:
@@ -215,7 +222,7 @@ spec:
         - name: init-state-dir
           # 不用 busybox: kind 节点无外网, docker.io 拉不动 (agents9 实测 ImagePullBackOff)。
           # agents9 基于 debian-slim 自带 sh+chown, 直接复用镜像内已有能力。
-          image: claude-go:agents9
+          image: claude-go:agents-20260912-233823
           imagePullPolicy: Never
           # 显式 root: 否则继承 pod 级 runAsUser 1000, chown 反向被拒 (agents9 实测 Init:Error)。
           securityContext: { runAsUser: 0, runAsGroup: 0 }
@@ -227,7 +234,7 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
       containers:
         - name: worker
-          image: claude-go:agents9
+          image: claude-go:agents-20260912-233823
           imagePullPolicy: Never
           command: ["/usr/local/bin/claude-go-worker"]
           args:
@@ -262,6 +269,7 @@ spec:
             - { name: config, mountPath: /etc/claude-go }
             - { name: state, mountPath: /data, subPathExpr: "$(POD_NAME)" }
             - { name: teams, mountPath: /workspace }
+            - { name: teams-visible, mountPath: /home/victor/.claude-go/teams }
       volumes:
         - name: config
           configMap: { name: agents-config-worker }
@@ -272,6 +280,10 @@ spec:
         - name: teams
           hostPath:
             path: /mnt/data/claude-go/workspace
+            type: DirectoryOrCreate
+        - name: teams-visible
+          hostPath:
+            path: /home/victor/.claude-go/teams
             type: DirectoryOrCreate
 ---
 apiVersion: apps/v1
@@ -290,7 +302,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: mcp
-          image: claude-go:agents9
+          image: claude-go:agents-20260912-233823
           imagePullPolicy: Never
           args: ["codeintel-mcp-server", "--transport", "http", "--addr", "0.0.0.0:29234", "--config", "/etc/claude-go/config.json"]
           env:
