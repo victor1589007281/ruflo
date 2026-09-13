@@ -173,13 +173,6 @@ func readFileLimited(path string, maxBytes int64) (data []byte, truncated bool, 
 	return buf, false, nil
 }
 
-func truncateApproxTokens(s string) string {
-	if len(s) <= maxApproxCharsFromTokens {
-		return s
-	}
-	return s[:maxApproxCharsFromTokens] + "\n... (output truncated: approx token limit)"
-}
-
 // Call 执行文件读取。
 func (t *FileReadTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	_ = ctx
@@ -255,17 +248,39 @@ func (t *FileReadTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 	}
 
 	var sb strings.Builder
-	if truncatedBytes {
-		sb.WriteString(fmt.Sprintf("(File read truncated to first %d bytes)\n", maxReadBytes))
-	}
+	// 逐行累计并在超预算处停下 (而不是先拼整段再按字节切): 只有知道**最后一行是
+	// 第几行**, 才能在截断提示里给出可用的续读坐标。旧实现只写一句 "truncated",
+	// 模型既不知道被截在哪、也不知道怎么接着读, 只能靠反复猜 offset —— 这是
+	// "留坐标按需读取"在工具结果这一侧长期缺失的那一半。
 	maxLineNumWidth := len(fmt.Sprintf("%d", endLine))
+	lastEmitted := startLine - 1
+	overBudget := false
 	for i := startLine; i < endLine; i++ {
-		lineNum := i + 1
-		sb.WriteString(fmt.Sprintf("%*d|%s\n", maxLineNumWidth, lineNum, lines[i]))
+		line := fmt.Sprintf("%*d|%s\n", maxLineNumWidth, i+1, lines[i])
+		if sb.Len()+len(line) > maxApproxCharsFromTokens {
+			overBudget = true
+			break
+		}
+		sb.WriteString(line)
+		lastEmitted = i
 	}
 
-	out := truncateApproxTokens(sb.String())
-	return &tool.ToolResult{Content: out}, nil
+	if truncatedBytes || overBudget {
+		shownFrom, shownTo := startLine+1, lastEmitted+1
+		reason := "输出已达单次上限"
+		if truncatedBytes {
+			reason = fmt.Sprintf("文件超过单次读取字节上限 %d", maxReadBytes)
+		}
+		if lastEmitted < startLine {
+			shownFrom, shownTo = startLine+1, startLine // 一行都没装下: 用 limit 缩小
+		}
+		sb.WriteString(fmt.Sprintf(
+			"\n... (%s, 本次只返回第 %d-%d 行, 文件共 %d 行。续读同一份内容请用 Read(path=%q, offset=%d)；"+
+				"或用 Grep 先定位关键字再定向 Read，避免整读。)\n",
+			reason, shownFrom, shownTo, totalLines, filePath, shownTo+1))
+	}
+
+	return &tool.ToolResult{Content: sb.String()}, nil
 }
 
 // expandPath 展开路径 (支持 ~ 和相对路径)

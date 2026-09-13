@@ -672,6 +672,31 @@ func (e *QueryEngine) GetContextUsage() ContextUsageInfo {
 	}
 }
 
+// taskInstructionPointer 是 TaskInstruction 已进 system 时首条 user 消息的占位文本。
+//
+// 为什么不是空串: 部分 provider 要求消息序列以非空 user 轮开始, 而 SubmitStreamBlocks
+// 的图片路径也依赖有一条 user 消息承载 content blocks。留一句指向 system 的短提示
+// 既不丢语义, 也不复制正文。
+const taskInstructionPointer = "（任务指令已置于 system prompt 末尾，请按其中的任务目标与产出要求执行。）"
+
+// initialUserTextLocked 计算首条 user 消息的文本 (调用方须持有 e.mu)。
+//
+// 历史坑: TaskInstruction 同时被 queryLoop 追加到 system prompt 末尾 (§Phase 2)
+// **和**这里塞进 user message, 于是每次 llm_call 把整份阶段提示词发两遍 —— 实测
+// TraceStore 里团队 stage 的 user 段与最后一个 system 段逐字节相同, if-question-expand
+// 单次请求 76KB 里有 29KB 是这份重复 (38%), 全量 5645 次 llm_call 100% 命中, 浪费
+// 26.6MB 请求体。TaskInstruction 字段注释写的就是"移到 system、避免 user message
+// 重复膨胀", 这里的兜底与那个意图正好相反, 是改造时漏删的遗留分支。
+func (e *QueryEngine) initialUserTextLocked(userContent string) string {
+	if userContent != "" {
+		return userContent
+	}
+	if e.TaskInstruction != "" {
+		return taskInstructionPointer
+	}
+	return "."
+}
+
 // SubmitMessage 提交用户消息，返回响应消息通道。
 // 对应 TS: QueryEngine.submitMessage()
 //
@@ -684,13 +709,7 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 	ch := make(chan types.Message, 50)
 
 	e.mu.Lock()
-	text := userContent
-	if text == "" && e.TaskInstruction != "" {
-		text = e.TaskInstruction
-	}
-	if text == "" {
-		text = "."
-	}
+	text := e.initialUserTextLocked(userContent)
 	userMsg := types.Message{
 		Type:      types.MessageTypeUser,
 		UUID:      internal_hook.GenerateUUID(),
@@ -737,13 +756,7 @@ func (e *QueryEngine) SubmitStreamBlocks(ctx context.Context, userContent string
 	msgCh := make(chan types.Message, 50)
 
 	e.mu.Lock()
-	text := userContent
-	if text == "" && e.TaskInstruction != "" {
-		text = e.TaskInstruction
-	}
-	if text == "" {
-		text = "."
-	}
+	text := e.initialUserTextLocked(userContent)
 	content := make([]types.ContentBlock, 0, len(extraBlocks)+1)
 	content = append(content, extraBlocks...)
 	content = append(content, types.ContentBlock{Type: types.ContentBlockText, Text: text})
