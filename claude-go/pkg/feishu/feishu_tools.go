@@ -48,8 +48,8 @@ func (t *FeishuSendFileTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *FeishuSendFileTool) IsReadOnly(_ json.RawMessage) bool          { return true }
-func (t *FeishuSendFileTool) IsConcurrencySafe(_ json.RawMessage) bool   { return true }
+func (t *FeishuSendFileTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+func (t *FeishuSendFileTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 func (t *FeishuSendFileTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }

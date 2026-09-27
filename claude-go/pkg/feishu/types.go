@@ -28,10 +28,12 @@
 package feishu
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
@@ -153,6 +155,11 @@ type BotConfig struct {
 	// EnableFrontierOptimizations QueryEngine 前沿优化特性开关 (默认 true)
 	EnableFrontierOptimizations bool
 
+	// EnableStopSignal CaRT 停止信号开关 (实验性, 不在上面的一键包里)。
+	// 指针: 缺省 = 按各路径原行为 (飞书主会话不开 / 团队 agent 开 / CLI 不开),
+	// 显式 true/false 才覆盖。见 EngineSection.EnableStopSignal。
+	EnableStopSignal *bool
+
 	// PromptDebug 开启后将完整 LLM 请求/响应落盘到 PromptDebugDir。
 	PromptDebug bool
 	// PromptDebugDir 提示词调试文件目录。为空时使用 stateDir/prompt-debug。
@@ -161,6 +168,26 @@ type BotConfig struct {
 	PromptDebugMaxBytes   int64
 	PromptDebugSampleRate float64
 	PromptDebugRedact     bool
+
+	// EnvironmentDate 是否在系统提示的 <environment> 块里写当前日期。默认 false ——
+	// 该行靠前且每天变一次, 会让它之后的整段前缀天天作废。时间无关的业务不需要它。
+	EnvironmentDate bool
+
+	// MemoryIndexMode 记忆注入形态: false(默认) = 注入正文, true = 只注入索引
+	// (id + 标题 + 预览), 正文由模型按需调 memory_read 取回。
+	//
+	// 默认关的理由是缓存: 正文形态实测单次注入 ~18.5K 字符 (7 条 × 截断到 4096),
+	// 而记忆库每次 run 结尾都被写一次, 于是下一次 run 的 BM25 top-K 必然不同 ——
+	// 这块自己就是漂移源。索引形态把它压到 ~1K, 漂移的绝对代价随之降一个数量级。
+	//
+	// 代价是模型得自己发现该去取: 打开后 memory_read 的实际调用率是个未知数,
+	// 先量一段再决定要不要默认开 (见 builtin.MemoryIndexModeEnabled 的注释)。
+	//
+	// 指针而非 bool: 这个值要**原样**转交给 engine.Config.MemoryIndexMode, 而后者
+	// 靠 nil 区分「没配」与「显式配了 false」(见 QueryEngine.resolvedMemoryIndexMode)。
+	// 用值类型的话这一层就把 nil 压成了 false, 于是「没配」被当成「显式关」——
+	// CLAUDE_GO_MEMORY_INDEX_MODE 这条兜底在飞书路径上会彻底失效。
+	MemoryIndexMode *bool
 
 	// Plans 按工作流名称覆盖模型配置 (供 Agent Teams 使用)
 	Plans map[string]PlanModelConfig
@@ -347,6 +374,38 @@ type JSONConfig struct {
 	// Hooks Hook 配置列表
 	Hooks []HookEntry `json:"hooks,omitempty"`
 
+	// AllowedTools 工具白名单。与 CLI --allowed-tools 同义, 优先级低于 flag:
+	// flag 非空时以 flag 为准。
+	//
+	// 存在的理由是**托管 Agent 的部署态**: 平台用配置文件下发岗位的工具面,
+	// 而此前白名单只能拼命令行 —— 命令行参数不可回读、不可版本化、不可对账。
+	// 语义与 engine.Config.AllowedTools 逐字一致: 缺省 = 不设白名单 (全部可见);
+	// 显式给出即白名单, 且**空表是 fail-closed**(拒绝一切工具), 不是"不设限" ——
+	// 调用方的岗位模板若渲染成空, 宁可拒绝启动也不能静默放开全部工具。
+	// 两种写法等价: "a,b,c" 或是 ["a","b","c"]。
+	AllowedTools StringList `json:"allowedTools,omitempty"`
+
+	// TicketID / InstanceID 运维工单与实例的索引维度 (可选)。
+	//
+	// 平台侧用它们回答"这个实例上周发生了什么""这张工单当时怎么判的", 而
+	// 会话 ID 回答不了这两个问题。设置后写进 trace IDs, 随 span 落盘。
+	TicketID   string `json:"ticketId,omitempty"`
+	InstanceID string `json:"instanceId,omitempty"`
+
+	// AssemblyProfile 装配描述符 (方案 20.6.3): 平台认为它下发了一份怎样的装配。
+	//
+	// 存在的理由是把"一个数字员工是什么"从三处散落 (平台侧 ManagedAgent 字段、
+	// 拼出来的命令行、这份 config 的模型与预算段) 收敛成一个**平台生成、harness
+	// 装载、可版本化、可回读**的单一对象。命令行参数做不到这件事: 不可回读 (进程
+	// 起来后没人知道当时传了什么)、不可版本化 (改一次没法 diff / 回滚 / 回答"上周
+	// 那次事故时的装配是什么")、不可对账 (只有下发没有生效的回程)。
+	//
+	// 本字段是**声明侧的唯一来源**。对账 (pkg/assembly.Reconcile) 拿它跟运行期
+	// 采集的装配自报逐项比。刻意不让 harness 从别的配置字段"推断"出声明: 推断出来
+	// 的是一份**期望**不是一份**声明** —— 期望由 harness 自己写, 拿它去对账等于
+	// 自己判自己, 报出来的差异谁也修不了。声明必须能指回一份平台签发的版本。
+	AssemblyProfile *AssemblyProfile `json:"assemblyProfile,omitempty"`
+
 	// SystemPrompt 自定义系统提示词
 	SystemPrompt string `json:"systemPrompt,omitempty"`
 
@@ -465,6 +524,32 @@ type EngineSection struct {
 	PromptDebugMaxBytes   int64   `json:"promptDebugMaxBytes,omitempty"`
 	PromptDebugSampleRate float64 `json:"promptDebugSampleRate,omitempty"`
 	PromptDebugRedact     *bool   `json:"promptDebugRedact,omitempty"`
+
+	// EnvironmentDate 是否在系统提示的 <environment> 块里写当前日期。默认 false。
+	//
+	// 默认关的理由是缓存而非偏好: 该行排在系统提示靠前处, 跨零点一变就让它之后的
+	// 整段前缀失效。时间无关的业务 (面试平台的 JD 分析/题库生成等) 不需要它;
+	// 需要时效的业务显式置 true。
+	EnvironmentDate *bool `json:"environmentDate,omitempty"`
+
+	// MemoryIndexMode 记忆注入形态开关: true = 只注入索引 (id + 标题 + 预览),
+	// 正文由模型按需 memory_read 取回; false/缺省 = 注入正文 (旧行为)。
+	//
+	// 指针类型 + omitempty 与同段其它开关一致: 缺省与显式 false 必须能区分,
+	// 否则将来改默认值时老配置会被静默反向覆盖。
+	MemoryIndexMode *bool `json:"memoryIndexMode,omitempty"`
+
+	// EnableStopSignal 启用 CaRT 停止信号检测 (实验性, 见 engine.Config.EnableStopSignal)。
+	//
+	// 这个字段存在的理由是**消除一条路径不对称**: 该组件此前只在飞书侧被打开
+	// (pkg/feishu/session.go 团队 agent 路径), CLI headless —— 也就是平台实际走的
+	// 那条 —— 永远拿不到它, 而两条路径读的是同一份配置文件。20.6.2 记的正是这一类
+	// "配置面建好了、只在一半路径上通电"的缺陷, 顺着自报能被照出来 (装配自报里
+	// components.stop_signal 会如实报 false), 但要能**修**, 得让平台有地方声明它。
+	//
+	// 缺省 nil = 保持各路径原有行为 (CLI 不开 / 飞书团队路径开), 所以加上这个字段
+	// 本身不改变任何现网行为; 显式 true/false 才会覆盖。
+	EnableStopSignal *bool `json:"enableStopSignal,omitempty"`
 }
 
 // WikiSection Wiki 配置段 (JSON)
@@ -551,15 +636,18 @@ type PlanModelConfig struct {
 
 // AISection AI 模型配置段 (只保留别名模式)。
 type AISection struct {
-	ModelAlias      string                     `json:"modelAlias,omitempty"`      // 全局默认模型别名
-	ExecutionModel  string                     `json:"executionModel,omitempty"`  // 自动相位路由的快速执行模型 (Path B, 工具消费回合); 空=关闭
-	PlanModel       string                     `json:"planModel,omitempty"`       // 规划期独立模型 (plan mode 专用, 类似 advisor 独立客户端); 空=关闭
-	FallbackAliases []string                   `json:"fallbackAliases,omitempty"` // 全局默认备用模型别名
-	PromptCacheMode string                     `json:"promptCacheMode,omitempty"` // "auto"(默认)/"on"/"off"
-	MaxTurns        int                        `json:"maxTurns,omitempty"`        // 全局默认最大回合数 (0=不限); 防 agent 无界循环
-	MaxTokens       int                        `json:"maxTokens,omitempty"`       // 全局默认最大输出 token (0=用引擎默认)
-	Plans           map[string]PlanModelConfig `json:"plans,omitempty"`           // 按 plan 名称覆盖模型配置
-	AutoPlan        *AutoPlanSection           `json:"autoPlan,omitempty"`        // AutoMode: 复杂度自判断 → 自动 Plan + Advisor
+	ModelAlias      string   `json:"modelAlias,omitempty"`      // 全局默认模型别名
+	ExecutionModel  string   `json:"executionModel,omitempty"`  // 自动相位路由的快速执行模型 (Path B, 工具消费回合); 空=关闭
+	PlanModel       string   `json:"planModel,omitempty"`       // 规划期独立模型 (plan mode 专用, 类似 advisor 独立客户端); 空=关闭
+	FallbackAliases []string `json:"fallbackAliases,omitempty"` // 全局默认备用模型别名
+	PromptCacheMode string   `json:"promptCacheMode,omitempty"` // "auto"(默认)/"on"/"off"
+	MaxTurns        int      `json:"maxTurns,omitempty"`        // 全局默认最大回合数 (0=不限); 防 agent 无界循环
+	MaxTokens       int      `json:"maxTokens,omitempty"`       // 全局默认最大输出 token (0=用引擎默认)
+	// LongHorizonMaxTurns 长程任务档的回合上限 (H4-3)。产码/测试/修复这类没有自然
+	// 下界的任务取这个值; 常规任务仍取 maxTurns。0 = 不开分层 (长程档回落 maxTurns)。
+	LongHorizonMaxTurns int                        `json:"longHorizonMaxTurns,omitempty"`
+	Plans               map[string]PlanModelConfig `json:"plans,omitempty"`    // 按 plan 名称覆盖模型配置
+	AutoPlan            *AutoPlanSection           `json:"autoPlan,omitempty"` // AutoMode: 复杂度自判断 → 自动 Plan + Advisor
 }
 
 // AutoPlanSection AutoMode 配置段 (引擎级复杂度自判断)。
@@ -627,31 +715,165 @@ type HookEntry struct {
 // 列表不含该路径, 于是**挂载的 ConfigMap 从未被读取**, Pod 一路落到"占位
 // provider"分支——那样跑出来的 K8s 冒烟不接触 LLM, 不构成功能验证。
 func ResolveJSONConfigPath(path string) (string, error) {
-	if path == "" {
-		path = os.Getenv("CLAUDE_GO_CONFIG")
+	p, _, err := ResolveJSONConfigPathWithOrigin(path)
+	return p, err
+}
+
+// ConfigOrigin* 是配置命中的查找链环节, 供装配自报 (pkg/assembly.ConfigSource) 回填。
+//
+// 为什么要报"哪一环"而不只是路径: 现场最常见的浪费是"你改的不是它读的那一份" ——
+// 宿主上改了 /etc/claude-go/config.json, 实际生效的却是 $HOME/.claude-go/config.json,
+// 而两者只给出路径时看不出谁赢了 (改的那份也是合法路径, 也真实存在)。
+// 环节名让人一眼看到优先级链上是谁截胡了。
+const (
+	ConfigOriginFlag      = "flag --config"
+	ConfigOriginEnv       = "env CLAUDE_GO_CONFIG"
+	ConfigOriginCwd       = "cwd ./claude-go.json"
+	ConfigOriginCwdConfig = "cwd ./config/claude-go.json"
+	ConfigOriginHomeNew   = "home ~/.claude-go/config/config.json"
+	ConfigOriginHomeOld   = "home ~/.claude-go/config.json"
+	ConfigOriginEtc       = "container /etc/claude-go/config.json"
+	// ConfigOriginNone 六环都没命中 —— 走的是纯默认值, 不是"读到了空配置"。
+	ConfigOriginNone = "default"
+)
+
+// ResolveJSONConfigPathWithOrigin 与 ResolveJSONConfigPath 同源, 额外返回命中的环节。
+//
+// 返回的 path 语义与老函数逐字节一致 (仅加了一个来源标注), 老函数改为调用本函数,
+// 保证两条入口不可能在"选哪一份"这件事上分叉 —— 分叉过一次的查找链, 自报就会
+// 报出一份与生效配置不同的来源, 那比不报还坏。
+func ResolveJSONConfigPathWithOrigin(path string) (string, string, error) {
+	if path != "" {
+		return path, ConfigOriginFlag, nil
 	}
-	if path == "" {
-		candidates := []string{
-			"claude-go.json",
-			"config/claude-go.json",
-		}
-		if home, err := os.UserHomeDir(); err == nil {
-			candidates = append(candidates,
-				home+"/.claude-go/config/config.json",
-				home+"/.claude-go/config.json",
-			)
-		}
-		// 容器约定路径放最后: 本机开发时家目录配置优先, 容器里家目录通常没有
-		// 配置, 自然落到这一条。
-		candidates = append(candidates, "/etc/claude-go/config.json")
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				path = c
-				break
-			}
+	if env := os.Getenv("CLAUDE_GO_CONFIG"); env != "" {
+		return env, ConfigOriginEnv, nil
+	}
+	type candidate struct{ path, origin string }
+	candidates := []candidate{
+		{"claude-go.json", ConfigOriginCwd},
+		{"config/claude-go.json", ConfigOriginCwdConfig},
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates,
+			candidate{home + "/.claude-go/config/config.json", ConfigOriginHomeNew},
+			candidate{home + "/.claude-go/config.json", ConfigOriginHomeOld},
+		)
+	}
+	// 容器约定路径放最后: 本机开发时家目录配置优先, 容器里家目录通常没有
+	// 配置, 自然落到这一条。
+	candidates = append(candidates, candidate{"/etc/claude-go/config.json", ConfigOriginEtc})
+	for _, c := range candidates {
+		if _, err := os.Stat(c.path); err == nil {
+			return c.path, c.origin, nil
 		}
 	}
-	return path, nil
+	return "", ConfigOriginNone, nil
+}
+
+// StringList 是一个"字符串数组或逗号分隔字符串"都能解析的配置类型。
+//
+// 之所以不直接用 []string: 配置文件是人手写的, "a,b,c" 比 ["a","b","c"] 好写,
+// 而平台生成的又是数组 —— 两种写法都要能读。不直接用 string: 数组写法会直接
+// 解析失败, 而不是退化成一个叫 `["a"` 的工具名。
+//
+// **DoesNotExist 时是 nil 切片**: nil 在这里是语义的一部分 (区别于空切片),
+// 调用方靠它区分"没配白名单"与"配了空白名单" —— 后者是 fail-closed 的拒绝一切。
+// AssemblyProfile 装配描述符 (方案 20.6.3)。
+//
+// 每一段都是**声明**: "平台签发时认为这个员工应当装配成这样"。它不描述"配置里
+// 写了什么", 而是描述"平台要的是什么" —— 两者的差距正是对账要照出来的东西。
+//
+// 字段刻意都是可选的: 未声明的段**不参与对账** (而不是"声明为空")。一份只声明
+// 工具面的描述符, 不该在模型面上报出一条"声明了但没生效"。
+type AssemblyProfile struct {
+	// Version 描述符版本 (平台签发, 如 "2026-09-20.3")。空 = 平台未盖章。
+	// 它是对账结论的坐标系: 差异要能指回"哪一版描述符", 否则修完无从复核。
+	Version string `json:"version,omitempty"`
+
+	// Tools 声明的工具白名单。nil = 未声明 (不参与对账);
+	// 非 nil (含空切片) = 声明了白名单, 空切片即"应当拒绝一切"。
+	Tools StringList `json:"tools,omitempty"`
+
+	// Hooks 声明的外部 hook。序号 Index 由数组下标决定 (与运行期自报的编号口径
+	// 一致), 不接受手填 —— 两个编号口径一旦分家, 对账会报出一堆"没装上"的幻觉。
+	Hooks []AssemblyProfileHook `json:"hooks,omitempty"`
+
+	// Components 声明的前沿优化组件名 (metrics / prompt_cache / budget_degrade /
+	// loop_detector / error_classifier / json_repair / trajectory / stop_signal)。
+	// 这是 20.6.2 那个缺陷 (CLI 路径六个组件为 nil) 能被照出来的地方。
+	Components StringList `json:"components,omitempty"`
+
+	// Model 声明的主模型; 空 = 未声明。
+	Model string `json:"model,omitempty"`
+
+	// PermissionMode 声明的权限档; 空 = 未声明。
+	PermissionMode string `json:"permissionMode,omitempty"`
+}
+
+// AssemblyProfileHook 描述符里的一条 hook 声明。
+type AssemblyProfileHook struct {
+	Event string `json:"event"`
+	Type  string `json:"type,omitempty"`
+}
+
+type StringList []string
+
+// UnmarshalJSON 接受三种形态: 字符串 (按逗号切)、数组、null。
+func (s *StringList) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		*s = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var arr []string
+		if err := json.Unmarshal(trimmed, &arr); err != nil {
+			return err
+		}
+		*s = cleanStringList(arr)
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err != nil {
+		return fmt.Errorf("allowedTools 取值既不是数组也不是字符串: %w", err)
+	}
+	*s = splitStringList(str)
+	return nil
+}
+
+// MarshalJSON 写回数组形态 (回读一致性: 写出去的一定能被自己解析回来)。
+func (s StringList) MarshalJSON() ([]byte, error) {
+	if s == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal([]string(s))
+}
+
+// splitStringList 按逗号切分并丢掉空项。
+func splitStringList(csv string) StringList {
+	parts := strings.Split(csv, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return cleanStringList(out)
+}
+
+// cleanStringList 去空白、去空项、去重 (保序)。
+func cleanStringList(in []string) StringList {
+	seen := make(map[string]bool, len(in))
+	out := make(StringList, 0, len(in))
+	for _, v := range in {
+		if v = strings.TrimSpace(v); v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 // LoadJSONConfig 从文件加载 JSON 配置。
@@ -715,6 +937,11 @@ func (jc *JSONConfig) ToModelConfigJSON() modelconfig.ConfigJSON {
 			DefaultPromptCacheMode: jc.AI.PromptCacheMode,
 			DefaultMaxTurns:        jc.AI.MaxTurns,
 			DefaultMaxTokens:       jc.AI.MaxTokens,
+			// H4-3 长程档。不填 (0) 时 GlobalConfig.MaxTurnsFor 会回落 Standard,
+			// 行为与改造前逐字相同 —— 这个映射漏了不会报错, 只会静默退回未分层,
+			// 所以配了 longHorizonMaxTurns 而读不到时, 判据是**执行侧解析出的
+			// maxTurns 仍是 standard 值**, 不是"字段有没有被赋值"。
+			LongHorizonMaxTurns: jc.AI.LongHorizonMaxTurns,
 		}
 		out.AI.Plans = make(map[string]modelconfig.PlanConfig, len(jc.AI.Plans))
 		for planName, pc := range jc.AI.Plans {
@@ -893,6 +1120,12 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 	} else {
 		bc.EnableFrontierOptimizations = true
 	}
+	// CaRT 停止信号: 原样透传指针 (nil = 不表态, 由各路径按自己的原行为决定)。
+	// 这里刻意不给默认值 —— 给一个就把"缺省"与"显式设置"压成了同一个值,
+	// 而那正是这个字段要消除的那类静默不对称。
+	if jc.Engine != nil {
+		bc.EnableStopSignal = jc.Engine.EnableStopSignal
+	}
 	if jc.Engine != nil {
 		if jc.Engine.PromptDebug != nil {
 			bc.PromptDebug = *jc.Engine.PromptDebug
@@ -912,6 +1145,12 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		if jc.Engine.PromptDebugRedact != nil {
 			bc.PromptDebugRedact = *jc.Engine.PromptDebugRedact
 		}
+		if jc.Engine.EnvironmentDate != nil {
+			bc.EnvironmentDate = *jc.Engine.EnvironmentDate
+		}
+		// 直接转交指针而不是解引用: 这里唯一的作用是搬运, 解引用会把「没配」压成
+		// 「显式 false」, 而两者的区别要一路传到 engine (见字段注释)。
+		bc.MemoryIndexMode = jc.Engine.MemoryIndexMode
 	}
 
 	if jc.Sync != nil {

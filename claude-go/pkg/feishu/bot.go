@@ -27,6 +27,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/asset"
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/browser"
 	"github.com/anthropic/claude-go/pkg/cluster"
@@ -118,7 +119,7 @@ type memoryAdapter struct {
 	store *memory.TieredStore
 }
 
-func (ma *memoryAdapter) AddTeamMemory(teamName, workflow, objective, summary string) {
+func (ma *memoryAdapter) AddTeamMemory(teamName, workflow, objective, summary, original string) {
 	if ma.store == nil {
 		return
 	}
@@ -127,12 +128,15 @@ func (ma *memoryAdapter) AddTeamMemory(teamName, workflow, objective, summary st
 	if len(content) > 3000 {
 		content = content[:3000] + "...(截断)"
 	}
-	ma.store.Add(&memory.MemoryEntry{
+	// 原文走快照而不是塞进 Content: 这里砍到 3000 是为了让**注入**保持有界,
+	// 而原文的完整副本由 store 单独保管, 模型需要时按 Ref 取回 (见 MemoryEntry.Ref)。
+	ma.store.AddWithOriginal(&memory.MemoryEntry{
 		Content:    content,
 		Topics:     []string{teamName, workflow, "team_result"},
 		Source:     "team_result",
 		Importance: 0.9, // 高权重: 团队产出是重要的长期记忆
-	})
+	}, fmt.Sprintf("团队 %s (工作流: %s)\n目标: %s\n\n完整产出:\n%s",
+		teamName, workflow, objective, original))
 }
 
 // wikiBrowserAdapter 适配 browser.Client 到 wiki.BrowserFetcher 接口。
@@ -228,6 +232,7 @@ type Bot struct {
 	llmEventUnsub func()                             // EventBus 上 llm.event.* 的退订函数 (见 llm_event_bus.go)
 	cronSched     *agent.CronScheduler               // 定时任务调度器
 	layout        *basedir.Layout                    // 统一目录布局
+	assetRoots    asset.LoadRoots                    // 资产装载根 (DashboardReloadAssets 重扫时要用同一组根)
 	stateStore    statestore.StateStore              // 进程内唯一 StateStore (轨迹底座 + 会话历史快照共用)
 	wikiEngine    *wiki.Engine                       // LLM Wiki 知识库引擎
 	swarmEngine   *swarm_intel.Engine                // 群体智能预测引擎
@@ -312,7 +317,12 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	}
 
 	// 3. 创建 AI API 客户端 (从解析后的配置)
-	aiClient := api.NewClient(defaultResolved.BaseURL, defaultResolved.APIKey, defaultResolved.ProviderName)
+	//
+	// 模型名走 OutboundModelName: 这是 aiClient.Model 的初值, 也就是**未被
+	// ModelConfigKey 覆盖时的出站模型名**。它经网关时给完整别名 (带 provider
+	// 前缀, 网关的查找键), 直连 provider 时给裸厂商模型名 (厂商端点不认前缀,
+	// 发 "opencode:xxx" 会被 401 拒)。判据是 ResolvedConfig.ViaGateway。
+	aiClient := api.NewClient(defaultResolved.BaseURL, defaultResolved.APIKey, defaultResolved.OutboundModelName())
 	aiClient.Protocol = defaultResolved.Protocol
 	aiClient.SetProxy(defaultResolved.Proxy) // 仅默认模型配置了 proxy 时启用 (如 muse-spark 经东京代理)
 	aiClient.Tag = "feishu"
@@ -461,11 +471,44 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			ms.Add(&memory.MemoryEntry{Content: content, Source: source, Topics: topics, Importance: 0.7})
 		}
 	}
-	roleReg := agent.NewRoleRegistry(config.Cwd)
+	// 角色来源与 dashboard 的四个校验点、CLI 的团队装配**同一对**: (cwd, stateRoot)。
+	// 此前这里只传 config.Cwd, 于是 dashboard 用 <stateDir> 校验通过的工作流在这一侧
+	// 可能查不到它的角色, 静默退化成内联 prompt —— 一个通过了校验的工作流, 运行时
+	// 静默地不按它校验时的样子跑 (21.8.12 W1 / 21.8.7)。
+	roleReg := agent.NewRoleRegistryFor(config.Cwd, stateRoot)
+
+	// 8a. 资产索引 (21.8.12 P0/P1): 六种资产 (agent/workflow/plugin/skill/tool/hook)
+	// 按标准布局装载一次, 装进进程级索引。
+	//
+	// 这一段存在之前, basedir.Layout 声明了 Agents 与 Hooks 两个目录并幂等创建它们,
+	// 但**全仓除了 EnsureAll 没有任何地方读过** —— 每台机器上都存在一个永远为空的
+	// <state>/agents, 于是"把 agent 定义放进去就会生效"从外部看完全成立。
+	//
+	// 加载不返回 error: 目录不存在是常态 (新机器上一个资产都没有), 真正的异常
+	// (文件读不了 / frontmatter 坏了 / kind 与目录不符) 全部进 problems。所以这里
+	// 分两句日志: 一句如实汇报装到了什么、扫了哪些真实存在的根, 每个 problem 一条
+	// Warn —— "降级必须可见"要求坏掉的文件不能只表现为"这个资产没生效"。
+	//
+	// ★ 位置: 它在会话管理器**之前** (P3 之前它在 9e, 在管理器之后)。两个消费者都
+	// 需要它: agent 查表 (agent.SetAgentCatalog) 与池装配 (WithAssetSet)。而
+	// SessionManager 的选项是**构造期**生效的 —— 排在后面就只能靠一个事后 setter,
+	// 那会引入"先建的会话看不到资产"这种只在启动竞态里现形的差异。
+	assetRoots := asset.DefaultRoots(config.Cwd, layout.Root)
+	assetSet := asset.LoadStandard(assetRoots)
+	agent.SetAgentCatalog(assetSet)
+	bot.assetRoots = assetRoots // 供 DashboardReloadAssets 重扫 (同一组根, 见该函数的注释)
+	log.Printf("[asset] %s", assetSet.Describe(assetRoots))
+	for _, p := range assetSet.DedupReport() {
+		log.Printf("[asset][warn] %s", p)
+	}
 
 	// 8. 创建会话管理器 (传入共享组件, 包括 Evolution + Roles + 唯一 StateStore)
 	bot.sessions = NewSessionManager(config, aiClient, bot.mcpMgr, bot.skillReg, bot.dreamer, bot.memStore, hookConfigs, bot.taskStore, bot.evolution, roleReg,
-		WithStateStore(stateStore))
+		WithStateStore(stateStore),
+		// 资产索引与 agent 查表**同一份实例** (上面 SetAgentCatalog 装入的那份):
+		// 池装配要枚举 hook 资产, 两份索引会让"agent 查得到、池里没有它"成为一条
+		// 只在一个方向上现形的差异。
+		WithAssetSet(assetSet))
 	bot.sessions.SetMediaSendFn(bot.SendMediaToChat)
 
 	// 9. 创建 Agent Pool (动态扩缩, 参考 ruflo v3)
@@ -477,6 +520,9 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 注入默认解析配置到 SessionManager (用于 createSession 的 maxTokens/maxTurns)
 	bot.sessions.SetDefaultModelConfig(defaultResolved)
+	// 同时注入解析器本身: 会话身份声明 (spec) 里的 modelAlias 要在建会话时按别名
+	// 另建客户端, 而那需要有东西能回答"这个别名解析成什么" (见 clientForAlias)。
+	bot.sessions.SetModelResolver(resolver)
 
 	// Advisor 顾问工具客户端 (设计文档 docs/advisor-tool-design.md)
 	if adv := config.Advisor; adv != nil && adv.Enabled && adv.ModelAlias != "" {
@@ -484,7 +530,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		if advResolved.BaseURL == "" || advResolved.APIKey == "" || advResolved.ProviderName == "" {
 			log.Printf("[Bot] Advisor 配置无效: 无法解析别名 %q (缺 baseURL/apiKey), advisor 已禁用", adv.ModelAlias)
 		} else {
-			advisorClient := api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.ProviderName)
+			advisorClient := api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.OutboundModelName())
 			advisorClient.Protocol = advResolved.Protocol
 			advisorClient.SetProxy(advResolved.Proxy)
 			advisorClient.Tag = "advisor"
@@ -499,7 +545,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				advisorClient.Guard = aiClient.Guard
 			}
 			bot.sessions.SetAdvisorClient(advisorClient)
-			if advResolved.ProviderName == defaultResolved.ProviderName {
+			if advResolved.PreferredModelName() == defaultResolved.PreferredModelName() {
 				log.Printf("[Bot] Advisor 已启用: %s (警告: 与主模型相同, self-consult 模式)", adv.ModelAlias)
 			} else {
 				log.Printf("[Bot] Advisor 已启用: %s (checkpoint: every=%d, onLoop=%v)", adv.ModelAlias, adv.CheckpointEveryTurns, adv.CheckpointOnLoop)
@@ -514,7 +560,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		if planResolved.BaseURL == "" || planResolved.APIKey == "" || planResolved.ProviderName == "" {
 			log.Printf("[Bot] Plan 模型配置无效: 无法解析别名 %q (缺 baseURL/apiKey), 规划期将沿用主模型", config.PlanModel)
 		} else {
-			planClient := api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.ProviderName)
+			planClient := api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.OutboundModelName())
 			planClient.Protocol = planResolved.Protocol
 			planClient.SetProxy(planResolved.Proxy)
 			planClient.Tag = "plan"
@@ -529,7 +575,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 				planClient.Guard = aiClient.Guard
 			}
 			bot.sessions.SetPlanClient(planClient)
-			if planResolved.ProviderName == defaultResolved.ProviderName {
+			if planResolved.PreferredModelName() == defaultResolved.PreferredModelName() {
 				log.Printf("[Bot] Plan 模型已启用: %s (警告: 与主模型相同)", config.PlanModel)
 			} else {
 				log.Printf("[Bot] Plan 模型已启用: %s (规划期专用)", config.PlanModel)
@@ -632,6 +678,11 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		},
 		TaskTracker: &dagTaskAdapter{store: bot.taskStore},
 		Pool:        agentPool,
+		// 信箱后端 (21.8.9-D6): 复用进程内唯一 StateStore, 于是团队消息与轨迹/会话
+		// 快照共用同一份存储实现, 而不是再开一个只有信箱知道的目录。
+		// 传 nil 会回落到进程内 MemStore —— 那对飞书长驻 bot 是**静默丢消息**,
+		// 所以这里必须显式给。
+		StateStore: bot.stateStore,
 		// 经 L1 网关 (design/02 §3.1 例外 ② 已收编): 合议扇出要的 CompleteDiag
 		// 由 llmgw.SimpleClient 转调 LLMGateway.Diag, 诊断元数据一字不少。
 		LLM:                llmgw.SimpleClient{GW: bot.llmGW},
@@ -647,8 +698,41 @@ func NewBot(config *BotConfig) (*Bot, error) {
 
 	// 10-extra. 加载用户自定义动态工作流 (~/.claude-go/workflows/*.json), 启动即注册到进程内,
 	// 与 dashboard POST /api/workflows 注册的共用同一进程注册表 (此进程即 :18080 挂载 dashboard 的进程)。
-	if loaded, failed, details := agent.LoadWorkflowsFromDir(filepath.Join(bot.layout.Root, "workflows"), roleReg); loaded > 0 || failed > 0 {
-		log.Printf("[bot] 动态工作流加载: 成功 %d, 失败 %d %v", loaded, failed, details)
+	//
+	// 报了降级明细 (21.8.12 W3): 装载失败此前有 details 但**日志里只打了两句数**,
+	// 而"装载成功但某个 stage 正在用内联 prompt"这一类与完全正常同形。现在两种
+	// 都逐条打出来, 并且**成功但零降级时不打** —— 保持启动日志的常态洁净。
+	wfDir := filepath.Join(bot.layout.Root, "workflows")
+	if rep := agent.LoadWorkflowsFromDirReport(wfDir, roleReg); rep.Loaded > 0 || rep.Failed > 0 || len(rep.Deferred) > 0 {
+		log.Printf("[bot] 动态工作流加载: %s", rep.Summary(wfDir))
+		for _, d := range rep.Details {
+			log.Printf("[bot][workflow][fail] %s", d)
+		}
+		for _, d := range rep.Deferred {
+			log.Printf("[bot][workflow][degraded] %s", d)
+		}
+	}
+
+	// 10-extra-2. 内置工作流自检 (21.8.12 W4)。内置是唯一零校验的路径 —— 它们的
+	// stage 用哪个 agent 写死在 Go 字面量里, 与角色注册表是两份独立的表, 谁改了
+	// 一边另一边不会有任何提示。这里让它们走适合内置的那条校验路径, 只报不拦
+	// (内置定义编译期固定, 拦下来没有可修的动作, 还会连累其余几十条)。
+	//
+	// ★ unchecked 一并打出来: 一部分内置的 stage 在图模板里 (WorkflowDef.Stages 为空),
+	// 它们一个 stage 都查不到。少了这个数, "全部查过且全绿"与"一大半没查"读数相同。
+	if issues := agent.AuditBuiltinWorkflows(roleReg); len(issues) > 0 {
+		for _, is := range issues {
+			if is.Hard != "" {
+				log.Printf("[bot][workflow][builtin][fail] %s: %s", is.Name, is.Hard)
+				continue
+			}
+			for _, w := range is.Warnings {
+				log.Printf("[bot][workflow][builtin][degraded] %s: %s", is.Name, w)
+			}
+		}
+		total, hard, degraded, unchecked := agent.BuiltinAuditSummary(issues)
+		log.Printf("[bot] 内置工作流自检: 共 %d 条, 硬错 %d, 静默降级 %d, stage 不在定义中(无从检查) %d",
+			total, hard, degraded, unchecked)
 	}
 
 	// 10a. 修复: SetTeamManager 必须在 teamMgr 创建后调用 (之前因时序 bug 注入了 nil)
@@ -990,6 +1074,34 @@ func (b *Bot) ReloadModelConfig(path string) error {
 	return nil
 }
 
+// ApplyEngineSwitches 应用 engine 段里那些**运行期可翻转**的开关。
+//
+// 与 ReloadModelConfig 分开, 是因为两者的失败面完全不同, 而热加载的约定是
+// 「apply 失败不回滚、不退出, 保持旧配置继续服务」(见 hotreload.WatchConfig)。
+// 混在一个函数里的话, 模型段解析失败会把开关更新一起吞掉 —— 反过来也一样。
+//
+// 目前只有一处: engine.memoryIndexMode。挑它的理由见
+// engine.QueryEngine.SetMemoryIndexMode —— 改配置即生效, 不必重建 HookChain,
+// 也就不会连带重置其它 hook 的会话态。
+//
+// 幂等: 配置没动时重复调用等价于把同一个值再写一遍 (atomic.Store)。
+func (b *Bot) ApplyEngineSwitches(path string) error {
+	if b.sessions == nil {
+		return nil // 无会话管理器的形态 (如 CLI headless) 没有可变引擎, 不算错
+	}
+	jc, err := LoadJSONConfig(path)
+	if err != nil {
+		return fmt.Errorf("加载配置失败: %w", err)
+	}
+	if jc == nil || jc.Engine == nil || jc.Engine.MemoryIndexMode == nil {
+		return nil // 未配置 = 不动 (不是"关"; 关要显式写 false)
+	}
+	on := *jc.Engine.MemoryIndexMode
+	b.sessions.SetMemoryIndexMode(on)
+	log.Printf("[HotReload] 记忆注入形态已切换: memoryIndexMode=%v", on)
+	return nil
+}
+
 // startConfigWatcher 启动配置文件热加载监控
 func (b *Bot) startConfigWatcher(configPath string) {
 	b.cfgWatcher = hotreload.NewWatcher(configPath, 5*time.Second)
@@ -1138,6 +1250,15 @@ func (b *Bot) periodicMemoryMetrics(ctx context.Context) {
 	}
 }
 
+// payloadString 从动作 payload 里取一个字符串字段 (缺失/类型不符都返回空串)。
+func payloadString(payload map[string]interface{}, key string) string {
+	if payload == nil {
+		return ""
+	}
+	s, _ := payload[key].(string)
+	return strings.TrimSpace(s)
+}
+
 // DashboardTeamAction 供 dashboard 直接调用的团队操作 (create/run/stop/restart/delete/resume)。
 func (b *Bot) DashboardTeamAction(action, teamName string, payload map[string]interface{}) error {
 	if b.teamMgr == nil {
@@ -1158,10 +1279,16 @@ func (b *Bot) DashboardTeamAction(action, teamName string, payload map[string]in
 		if workflow == "" {
 			return fmt.Errorf("create 操作需要 workflow 参数")
 		}
-		if _, err := b.teamMgr.CreateTeam(teamName, workflow, objective, "dashboard"); err != nil {
+		// create 必须是**幂等**的: 调用方给的团队名是一份跨次稳定的身份 (面试平台按
+		// "同一个 JD 的同一个功能" 派生), 所以同一个名字被反复 create 是常态。
+		// 早先这里有且只有新建一条路, 第二次点击会撞 "团队已存在" 直接返回 ——
+		// 团队没被启动, 而调用方还在轮询那个上一次跑完的团队, 于是**静默拿到旧产出**。
+		// 这正是"名字稳定"这个改造会踩到的坑: 名字唯一的那些调用方从来看不到它。
+		if _, err := b.teamMgr.CreateTeam(teamName, workflow, objective, "dashboard"); err != nil &&
+			!strings.Contains(err.Error(), "已存在") {
 			return err
 		}
-		return b.teamMgr.RunTeam(teamName, objective)
+		return b.teamMgr.RunTeamWithSession(teamName, objective, payloadString(payload, "session_id"))
 	case "run":
 		objective := ""
 		if payload != nil {
@@ -1254,6 +1381,45 @@ func (b *Bot) DashboardReloadSkills() {
 	}
 }
 
+// DashboardReloadAssets 在 agent 资产被创建/删除之后重扫索引 (供挂载的 dashboard 注入)。
+//
+// ---------------------------------------------------------------------------
+// 为什么必须同时刷新**两处**, 而不是只调 agent.SetAgentCatalog
+// ---------------------------------------------------------------------------
+//
+// 资产索引在这个进程里被两个地方持有:
+//
+//	agent 包里的进程级单例   ← agent.SetAgentCatalog 装入, 被 --agent / 子代理查表用
+//	SessionManager.assetSet   ← WithAssetSet 注入, 被池装配 (RegisterPoolTools) 用
+//
+// 只刷第一个的表现是"CLI 里 --agent 认得新 agent, 飞书/团队里查不到它"; 只刷第二个
+// 则反过来。两处都要刷, 否则"新建成功了"这句话在两个入口上给出的答案会不一样 ——
+// 而那种差异不会报任何错。
+//
+// ★ 为什么是**重扫**而不是往现有 Set 里 Add 一份新解析的资产: Set.Add 的覆盖语义是
+//   后加载覆盖先加载 (user < project < state), 单独 Add 一份会把它放在"最后一个"的
+//   位置, 于是 state 里刚删掉的那一份仍然留在索引里 (它没有被任何东西移除), 而
+//   project/user 里的同名资产也永远浮不上来。重扫是唯一能让"覆盖关系"重新正确的做法。
+//
+// ★ 重扫会把同一个 *asset.Set 换成一个新的指针。这在**创建/删除**这种低频动作上
+//   是可以的: 换掉之后两个持有者都指向同一份新实例 (下面两句), 不存在"一半新一半旧"
+//   的窗口 —— 而高频路径 (每次请求) 读的是 agent.AgentCatalog(), 它自己带读写锁。
+func (b *Bot) DashboardReloadAssets() {
+	if b.layout == nil {
+		return
+	}
+	roots := b.assetRoots
+	set := asset.LoadStandard(roots)
+	agent.SetAgentCatalog(set)
+	if b.sessions != nil {
+		b.sessions.SetAssetSet(set)
+	}
+	for _, p := range set.DedupReport() {
+		log.Printf("[asset][warn] %s", p)
+	}
+	log.Printf("[asset] 重载: %s", set.Describe(roots))
+}
+
 // CronScheduler 返回 bot 的活动定时任务调度器, 供挂载的 dashboard 注入以启用 cron 写接口。
 func (b *Bot) CronScheduler() *agent.CronScheduler { return b.cronSched }
 
@@ -1261,6 +1427,11 @@ func (b *Bot) CronScheduler() *agent.CronScheduler { return b.cronSched }
 // (design/01 §4.12): 动作队列里的 team.run 需要一个真能跑团队的执行体,
 // 否则任务只能建档停在 pending。与 CronScheduler 同一模式: 只读暴露, 不转移所有权。
 func (b *Bot) TeamManager() *agent.ProductionTeamManager { return b.teamMgr }
+
+// Sessions 返回 bot 的会话管理器, 供主进程把它适配成 sessionapi.Host 挂到
+// HTTP 面上 (见 session_host.go 的 SessionHost)。与 CronScheduler/TeamManager
+// 同一模式: 只读暴露, 不转移所有权。
+func (b *Bot) Sessions() *SessionManager { return b.sessions }
 
 // LLMGateway 返回 bot 的 L1 网关 (design/02 §3.1)。
 // 供需要 LLM 但不需要 api.Client 具体能力的子系统注入, 只读暴露不转移所有权
@@ -2922,7 +3093,7 @@ func (b *Bot) handleTeamCommand(ctx context.Context, chatID, messageID, text str
 				if i > 0 {
 					sb.WriteString(" → ")
 				}
-				sb.WriteString(s.Role)
+				sb.WriteString(s.Agent)
 			}
 			sb.WriteString("\n\n")
 		}
@@ -3455,7 +3626,7 @@ func (b *Bot) handleAdvisorCommand(ctx context.Context, messageID, text string) 
 			b.sendTextReply(ctx, messageID, fmt.Sprintf("无法解析别名 `%s`: 请检查 providers 配置", arg))
 			return
 		}
-		client := api.NewClient(resolved.BaseURL, resolved.APIKey, resolved.ProviderName)
+		client := api.NewClient(resolved.BaseURL, resolved.APIKey, resolved.OutboundModelName())
 		client.Protocol = resolved.Protocol
 		client.SetProxy(resolved.Proxy)
 		client.Tag = "advisor"

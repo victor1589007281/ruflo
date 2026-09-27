@@ -9,6 +9,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/mcp"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -236,8 +237,5 @@ func compactJSON(raw json.RawMessage) string {
 }
 
 func truncateText(s string, max int) string {
-	if max <= 0 || len(s) <= max {
-		return s
-	}
-	return s[:max] + "...(truncated)"
+	return textutil.Truncate(s, max, "...(truncated)")
 }

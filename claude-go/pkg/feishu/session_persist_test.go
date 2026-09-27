@@ -309,36 +309,45 @@ func (f alwaysFailStateStore) KV(string) statestore.KVStore {
 func (f alwaysFailStateStore) Log(b string) statestore.AppendLog { return f.inner.Log(b) }
 func (f alwaysFailStateStore) Blob() statestore.BlobStore        { return f.inner.Blob() }
 
+// writeFakeSSE 往响应里写一条最小合法 SSE 流 (单个文本块, end_turn, 无工具调用)。
+//
+// 抽成函数是为了让"抓请求的假服务"与"不抓请求的假服务"共用同一份响应体: 响应一
+// 分叉, 两个用例测的就不是同一条路径了, 而差异会以"只有某个用例挂"的形式出现。
+func writeFakeSSE(w http.ResponseWriter, t *testing.T, reply string) {
+	t.Helper()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	send := func(d types.StreamDelta) {
+		b, err := json.Marshal(d)
+		if err != nil {
+			t.Errorf("序列化 SSE 事件失败: %v", err)
+			return
+		}
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	send(types.StreamDelta{Type: "message_start", Message: &types.APIResponse{
+		Usage: &types.Usage{InputTokens: 12},
+	}})
+	send(types.StreamDelta{Type: "content_block_start",
+		ContentBlock: &types.ContentBlock{Type: types.ContentBlockText}})
+	send(types.StreamDelta{Type: "content_block_delta",
+		Delta: &types.DeltaContent{Type: "text_delta", Text: reply}})
+	send(types.StreamDelta{Type: "content_block_stop"})
+	send(types.StreamDelta{Type: "message_delta",
+		Delta: &types.DeltaContent{StopReason: "end_turn"},
+		Usage: &types.Usage{OutputTokens: 7}})
+	send(types.StreamDelta{Type: "message_stop"})
+}
+
 // newFakeLLMServer 返回一条最小合法 SSE 流 (单个文本块, end_turn, 无工具调用)。
 func newFakeLLMServer(t *testing.T, reply string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher, _ := w.(http.Flusher)
-		send := func(d types.StreamDelta) {
-			b, err := json.Marshal(d)
-			if err != nil {
-				t.Errorf("序列化 SSE 事件失败: %v", err)
-				return
-			}
-			fmt.Fprintf(w, "data: %s\n\n", b)
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		send(types.StreamDelta{Type: "message_start", Message: &types.APIResponse{
-			Usage: &types.Usage{InputTokens: 12},
-		}})
-		send(types.StreamDelta{Type: "content_block_start",
-			ContentBlock: &types.ContentBlock{Type: types.ContentBlockText}})
-		send(types.StreamDelta{Type: "content_block_delta",
-			Delta: &types.DeltaContent{Type: "text_delta", Text: reply}})
-		send(types.StreamDelta{Type: "content_block_stop"})
-		send(types.StreamDelta{Type: "message_delta",
-			Delta: &types.DeltaContent{StopReason: "end_turn"},
-			Usage: &types.Usage{OutputTokens: 7}})
-		send(types.StreamDelta{Type: "message_stop"})
+		writeFakeSSE(w, t, reply)
 	}))
 }
 

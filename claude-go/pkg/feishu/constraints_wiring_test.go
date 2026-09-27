@@ -20,9 +20,13 @@ import (
 //
 //	DisabledTools: map[string]bool{"TeamCreate": true, "TeamDelete": true, "TeamMailbox": true}
 //
+// 注: TeamMailbox 这一项已于 2026-09-25 从两边同时移除 (工具本身被删, 见 21.8.9-D6)。
+// 本测试仍逐项断言, 只是现在断言的是**现状**而不是历史 —— 留着不存在的名字会让它变成
+// 一条查无实据的绿。
+//
 // 现在这份名单声明在 ConstraintSet 里再编译下发, 结果必须一字不差。
 func TestFeishuSessionConstraints_与改造前的DisabledTools字面量逐项等价(t *testing.T) {
-	want := map[string]bool{"TeamCreate": true, "TeamDelete": true, "TeamMailbox": true}
+	want := map[string]bool{"TeamCreate": true, "TeamDelete": true}
 
 	cfg := &engine.Config{}
 	applyConstraints(cfg, feishuSessionConstraints())

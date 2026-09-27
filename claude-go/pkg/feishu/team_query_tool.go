@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -160,8 +161,5 @@ func (t *TeamQueryTool) Call(_ context.Context, input json.RawMessage, _ *tool.T
 }
 
 func truncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
+	return textutil.Truncate(s, maxLen, "...")
 }
