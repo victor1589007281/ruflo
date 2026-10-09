@@ -1,9 +1,12 @@
 package sync
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -17,9 +20,79 @@ type IMAAdapter struct {
 }
 
 // NewIMAAdapter 创建 IMA 适配器。
+//
+// 脚本路径必须**现场探测**, 不能硬编码单一绝对路径 —— 硬编码正是 cron-1
+// "IMA 笔记同步" 跑了 90 次挂 56 次的根因:
+//
+//   - 控制面跑在 k8s pod 里时, `/home/victor/.claude/skills/ima-skill` 这个 hostPath
+//     是在 **kind 节点自己的文件系统**上解析的, 那里是个空目录; 宿主上的同名目录
+//     其实有文件, 但两边看不见彼此。于是 node 报 MODULE_NOT_FOUND。
+//   - pod 里真实存在的是 `/mnt/data/claude-go/skills/ima-skill` (state hostPath,
+//     与宿主是同一份 ext4, 已实测 ima_api.cjs md5 一致)。
+//
+// 所以按候选列表逐个探测, 谁真实存在就用谁; 一个都不中就由 call() 报一条
+// 把试过的路径全列出来的错。
 func NewIMAAdapter(clientID, apiKey string) *IMAAdapter {
-	script := "/home/victor/.claude/skills/ima-skill/ima_api.cjs"
-	return &IMAAdapter{ClientID: clientID, APIKey: apiKey, Script: script}
+	a := &IMAAdapter{ClientID: clientID, APIKey: apiKey}
+	a.Script = firstExistingFile(imaScriptCandidates())
+	return a
+}
+
+// imaScriptCandidates 返回 ima_api.cjs 的候选路径, 按优先级排列。
+func imaScriptCandidates() []string {
+	var out []string
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		for _, e := range out {
+			if e == p {
+				return
+			}
+		}
+		out = append(out, p)
+	}
+
+	// ① 显式覆盖: 部署方要对冲这里的探测逻辑时, 用环境变量指死路径即可。
+	add(strings.TrimSpace(os.Getenv("IMA_SCRIPT")))
+
+	// ② 状态卷 (部署首选): state 目录在 pod 与宿主是同一份, 已实测存在。
+	if d := strings.TrimSpace(os.Getenv("CLAUDE_GO_STATE_DIR")); d != "" {
+		add(filepath.Join(d, "skills", "ima-skill", "ima_api.cjs"))
+	}
+	add("/mnt/data/claude-go/skills/ima-skill/ima_api.cjs")
+
+	// ③ 宿主 skills 目录: 在交互机上直接跑控制面时它是对的。
+	add("/home/victor/.claude/skills/ima-skill/ima_api.cjs")
+
+	// ④ 相对 cwd 兜底 (源码树里直接跑)。
+	if wd, err := os.Getwd(); err == nil {
+		add(filepath.Join(wd, ".claude", "skills", "ima-skill", "ima_api.cjs"))
+	}
+	return out
+}
+
+// firstExistingFile 返回 candidates 中第一个真实存在的普通文件; 全不存在返回 ""。
+func firstExistingFile(candidates []string) string {
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// nodeBinary 返回可用的 node 解释器; 找不到返回 ""。
+// 显式覆盖(IMA_NODE_BIN)直接返回, 不在人间校验 —— 路径写错时由 exec 报出一条
+// 带完整路径的错, 比在这里预检再报一句"文件不存在"更可操作。
+func nodeBinary() string {
+	if v := strings.TrimSpace(os.Getenv("IMA_NODE_BIN")); v != "" {
+		return v
+	}
+	if p, err := exec.LookPath("node"); err == nil {
+		return p
+	}
+	return ""
 }
 
 // Source 返回数据源名称。
@@ -136,15 +209,32 @@ func (a *IMAAdapter) optionsJSON() string {
 }
 
 func (a *IMAAdapter) call(apiPath, bodyJSON, optsJSON string) ([]byte, error) {
+	if a.Script == "" {
+		return nil, fmt.Errorf("找不到 ima_api.cjs: 已尝试 %s; "+
+			"可用环境变量 IMA_SCRIPT 指死路径",
+			strings.Join(imaScriptCandidates(), ", "))
+	}
+	node := nodeBinary()
+	if node == "" {
+		return nil, fmt.Errorf("PATH 上找不到 node 解释器 (ima_api.cjs 要求 node >= 18); " +
+			"可用环境变量 IMA_NODE_BIN 指死路径")
+	}
+
+	// 子进程超时: node 挂住(网络直连 ima.qq.com 无代理时会发生)不该把一个
+	// cron 任务拖成 15 分钟僵尸。上层 List() 逐页调用, 每页独立计时。
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
 	args := []string{a.Script, apiPath, bodyJSON, optsJSON}
-	cmd := exec.Command("node", args...)
+	cmd := exec.CommandContext(ctx, node, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		stderr := ""
 		if ee, ok := err.(*exec.ExitError); ok {
 			stderr = string(ee.Stderr)
 		}
-		return nil, fmt.Errorf("调用 ima_api.cjs %s 失败: %w (stderr: %s)", apiPath, err, stderr)
+		return nil, fmt.Errorf("调用 ima_api.cjs %s 失败 (script=%s node=%s): %w (stderr: %s)",
+			apiPath, a.Script, node, err, stderr)
 	}
 	out = []byte(strings.TrimSpace(string(out)))
 	// 检查业务错误码

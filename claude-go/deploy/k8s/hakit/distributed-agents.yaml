@@ -132,9 +132,18 @@ spec:
           hostPath:
             path: /home/victor/base/git/gitee/knowledge
             type: Directory
+        # ima-skill 的 hostPath **不能**写 /home/victor/.claude/skills/ima-skill:
+        # hostPath 是在 kubelet 所在节点的文件系统上解析的, 而 kind 节点自己的
+        # /home/victor 与宿主那份同名目录互不相干 (2026-10-10 实测: 节点上这个目录
+        # 只有 . 和 .., mtime Aug 16 —— 从建集群起就没被填过的空壳)。于是容器里
+        # /home/victor/.claude/skills/ima-skill 恒为空, IMAAdapter 硬编码该路径时
+        # node 报 MODULE_NOT_FOUND, cron-1 "IMA 笔记同步" 90 次挂 56 次。
+        # state 卷同源的 /mnt/data 是节点与宿主同一份真实设备 (/dev/nvme1n1p1),
+        # 其中 skills/ima-skill/ima_api.cjs 已实测 md5 与宿主逐字节一致。
+        # 改指向那里: 容器内挂载点不变, 改的只是**源**, 不动代码里的任何路径。
         - name: ima-skill
           hostPath:
-            path: /home/victor/.claude/skills/ima-skill
+            path: /mnt/data/claude-go/skills/ima-skill
             type: Directory
         - name: ssh
           hostPath:

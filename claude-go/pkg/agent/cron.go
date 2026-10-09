@@ -4,7 +4,7 @@
 //
 //  1. 标准 cron 表达式 (分 时 日 月 周)
 //
-//  2. 支持多种任务类型 (workflow/query/command)
+//  2. 支持多种任务类型 (workflow/query/command/sync/wiki-*)
 //
 //  3. 飞书 /cron 命令 + 自然语言创建
 //
@@ -41,15 +41,16 @@ type CronJob struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Schedule string `json:"schedule"`           // cron 表达式: "分 时 日 月 周"
-	JobType  string `json:"jobType"`            // workflow, query, command
-	Payload  string `json:"payload"`            // 执行内容 (任务目标/消息/命令)
+	JobType  string `json:"jobType"`            // workflow, query, command, sync, wiki-*
+	Payload  string `json:"payload"`            // 执行内容 (任务目标/消息/命令/数据源)
 	ChatID   string `json:"chatId"`             // 结果推送的飞书 chat_id
 	Workflow string `json:"workflow,omitempty"` // jobType=workflow 时的工作流类型
 	// Model 任务级执行模型别名 (provider:model, 如 ollama:lfm2.5:2.6b-q4_k_m); 空 = 默认模型。
 	// 消费面: 当前仅 jobType=query 真实消费 (一次性覆盖会话模型, 不污染既有会话)。
 	// workflow 的模型走 ai.plans.<type>.modelAlias 配置 (按工作流类型, 本身可配);
-	// sync (ima/weread) 是纯 HTTP 数据拉取, 不调用任何模型 —— 给它配模型是无效旋钮,
-	// 刻意不接线 (本仓纪律: 不建"建成未通电"的假开关)。
+	// sync 是**外部数据拉取**, 不走 LLM (weread 纯 HTTP; ima 是 node 子进程调
+	// IMA OpenAPI, 同样不碰模型) —— 给它配模型是无效旋钮, 刻意不接线
+	// (本仓纪律: 不建"建成未通电"的假开关)。
 	Model      string    `json:"model,omitempty"`
 	Enabled    bool      `json:"enabled"`
 	CreatedAt  time.Time `json:"createdAt"`
