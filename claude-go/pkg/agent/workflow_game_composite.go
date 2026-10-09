@@ -1,11 +1,12 @@
 // workflow_game_composite.go — 游戏研发跨团队协调工作流。
 //
 // 核心理念: 整合现有团队资源, 构建全新游戏团队:
-//   Phase A: 游戏设计 — 游戏设计师产出 GDD
-//   Phase B: 剧情演化 — 复用群体智能引擎(predict&simulate)做多线叙事衍生
-//   Phase C: 美术原型 — 复用 Creative-v2 的 HTML 原型 + 对抗审查
-//   Phase D: 技术开发 — 扩展研发团队: 新增 2D/3D 引擎专属角色
-//   Phase E: 集成测试 — 可玩性验证 + 性能优化
+//
+//	Phase A: 游戏设计 — 游戏设计师产出 GDD
+//	Phase B: 剧情演化 — 复用群体智能引擎(predict&simulate)做多线叙事衍生
+//	Phase C: 美术原型 — 复用 Creative-v2 的 HTML 原型 + 对抗审查
+//	Phase D: 技术开发 — 扩展研发团队: 新增 2D/3D 引擎专属角色
+//	Phase E: 集成测试 — 可玩性验证 + 性能优化
 //
 // 参考:
 //   - Genie 2 (DeepMind): 文本→可交互世界
@@ -25,6 +26,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/media"
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 func gameCompositeWorkflow() *WorkflowDef {
@@ -35,39 +37,39 @@ func gameCompositeWorkflow() *WorkflowDef {
 		Rounds:      0,
 		Stages: []StageDef{
 			// Phase A: 游戏设计
-			{Name: "game-concept", Role: "game-designer",
+			{Name: "game-concept", Agent: "game-designer",
 				Prompt: gameConceptPrompt},
 
 			// Phase B: 剧情演化 (swarm_intel)
-			{Name: "narrative-evolution", Role: "game-designer",
+			{Name: "narrative-evolution", Agent: "game-designer",
 				DependsOn: []string{"game-concept"},
 				Prompt:    "群体智能剧情演化阶段 (由 executor 内部驱动)"},
 
 			// Phase C: 美术原型 (creative-v2)
-			{Name: "art-plan", Role: "creative-planner",
+			{Name: "art-plan", Agent: "creative-planner",
 				DependsOn: []string{"game-concept"},
 				Prompt:    gameArtPlanPrompt},
-			{Name: "art-prototype", Role: "html-developer",
+			{Name: "art-prototype", Agent: "html-developer",
 				DependsOn: []string{"art-plan"},
 				Prompt:    gameArtPrototypePrompt},
-			{Name: "art-review", Role: "art-director",
+			{Name: "art-review", Agent: "art-director",
 				DependsOn: []string{"art-prototype"},
 				Prompt:    gameArtReviewPrompt},
 
 			// Phase D: 技术开发 (扩展研发团队)
-			{Name: "tech-architecture", Role: "game-architect",
+			{Name: "tech-architecture", Agent: "game-architect",
 				DependsOn: []string{"game-concept", "narrative-evolution"}},
-			{Name: "engine-dev", Role: "game-engine-dev",
+			{Name: "engine-dev", Agent: "game-engine-dev",
 				DependsOn: []string{"tech-architecture"}, Parallel: true},
-			{Name: "logic-dev", Role: "game-logic-dev",
+			{Name: "logic-dev", Agent: "game-logic-dev",
 				DependsOn: []string{"tech-architecture"}, Parallel: true},
-			{Name: "level-design", Role: "level-designer",
+			{Name: "level-design", Agent: "level-designer",
 				DependsOn: []string{"tech-architecture", "narrative-evolution"}, Parallel: true},
 
 			// Phase E: 集成测试 + 优化
-			{Name: "game-integration", Role: "game-tester",
+			{Name: "game-integration", Agent: "game-tester",
 				DependsOn: []string{"engine-dev", "logic-dev", "level-design", "art-prototype"}},
-			{Name: "game-optimization", Role: "game-optimizer",
+			{Name: "game-optimization", Agent: "game-optimizer",
 				DependsOn: []string{"game-integration"}},
 		},
 	}
@@ -394,10 +396,7 @@ func (we *WorkflowExecutor) executeGameComposite(ctx context.Context, wf *Workfl
 // ═══════════════════════════════════════════════════════════
 
 func truncateForPrompt(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "\n...(已截断)"
+	return textutil.Truncate(s, maxLen, "\n...(已截断)")
 }
 
 func formatGameNarrative(result *swarm_intel.SimulationResult, name string) string {

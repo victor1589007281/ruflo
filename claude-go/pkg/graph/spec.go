@@ -337,6 +337,33 @@ type AgentSpec struct {
 	Prompt      string `json:"prompt,omitempty"`       // 模板, 支持 {objective}/{prev_result}/{node.<id>} 占位 (替换由 runner 负责, 引擎只透传)
 	ToolProfile string `json:"tool_profile,omitempty"` // 显式声明工具画像, 替代角色名子串匹配
 	MaxTurns    int    `json:"max_turns,omitempty"`
+	// Tools 显式工具白名单 (21.8.12 P3/W5)。**指针**: nil = 未声明 (不限制);
+	// 非 nil 空切片 = 显式空名单 (拒绝一切)。与 ToolProfile 是正交的两维 ——
+	// 档位决定"哪一套工具注册进来", 名单决定"其中哪些允许"。
+	//
+	// 引擎**不解释**它 (与 ToolProfile/MaxTurns 同一分工): 内核不认识工具名, 只做形状
+	// 校验并经 NodeExecHints 透传给宿主 —— 与 Placement 同一条理由, 让纯调度内核持有
+	// 一张会与宿主漂移的工具白名单是明确的依赖倒挂。
+	Tools *[]string `json:"tools,omitempty"`
+	// DisallowedTools 追加的工具黑名单 (并集, 只会让可见面更小)。
+	DisallowedTools []string `json:"disallowed_tools,omitempty"`
+	// Model 本节点的模型覆盖 (空 = 按 plan/agent 层级解析, 与改造前一致)。
+	//
+	// 与 ToolProfile/MaxTurns 同一分工: 引擎**不解释**它 —— 内核不认识 provider
+	// 与别名 (别名解析要 provider 注册表, 那是宿主的东西), 只经 NodeExecHints
+	// 透传给宿主。
+	//
+	// 为什么必须落在 AgentSpec 而不是只在 StageDef 上声明: 图节点是从 StageDef
+	// 直译出来的, 而运行期回译 (stageNodeRunner 重建 StageDef) 之后原件就不在了
+	// —— 只在 StageDef 上声明, 结果是 "pipeline 路径用上了、graph 路径静默还是
+	// 老模型"。这正是 stageDeclaredOverride 那段注释论证过的同一条失效形态。
+	Model string `json:"model,omitempty"`
+	// Hooks 本节点额外挂的外部 hook 声明。格式与资产 hooks: 段逐字节一致
+	// (<event>:<type>:<target>[:<if>]), 解析共用 hooks.ParseAssetHooks。
+	// 与 Tools 同样只透传: 引擎不 spawn 进程。
+	Hooks []string `json:"hooks,omitempty"`
+	// Skills 本节点额外声明的技能名 (须已在技能注册表里; 未注册的由宿主点名报告)。
+	Skills []string `json:"skills,omitempty"`
 	// Deterministic gate 节点纯代码策略 (零 LLM, design/01 §4.1)。
 	// 引擎不区分, runner 自解释——但仍走同一节点生命周期 (hook/journal/trace)。
 	Deterministic bool `json:"deterministic,omitempty"`

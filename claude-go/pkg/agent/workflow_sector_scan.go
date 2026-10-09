@@ -1,10 +1,12 @@
 // 放置到 claude-go: pkg/agent/workflow_sector_scan.go
 // 并在 pkg/agent/workflow.go 的 workflowRegistry 注册:
-//     "sector-scan": sectorScanWorkflow,
+//
+//	"sector-scan": sectorScanWorkflow,
 //
 // market-radar 经 :18080 调用:
-//     POST /api/actions/team/create/{name}  body {"workflow":"sector-scan","objective":"<环节+企业清单+快照数据>"}
-//     POST /api/actions/team/run/{name}
+//
+//	POST /api/actions/team/create/{name}  body {"workflow":"sector-scan","objective":"<环节+企业清单+快照数据>"}
+//	POST /api/actions/team/run/{name}
 //
 // 用途: 对某产业链环节的一组企业做"横向"对比(谁低估/谁过热), 与 market-radar 的
 // 规则打分互为印证。区别于 trading-v2 的单标的纵深分析。
@@ -17,7 +19,7 @@ func sectorScanWorkflow() *WorkflowDef {
 		Mode:        "pipeline",
 		Stages: []StageDef{
 			{
-				Name: "cross-valuation", Role: "fundamentals-analyst", Parallel: false,
+				Name: "cross-valuation", Agent: "fundamentals-analyst", Parallel: false,
 				Prompt: `你是产业链研究专家。下面给定某产业链环节的一组企业及其截面数据。
 
 环节与企业清单:
@@ -32,7 +34,7 @@ func sectorScanWorkflow() *WorkflowDef {
 | 企业 | PE | PB | 相对环节 | 便宜原因/错杀? |`,
 			},
 			{
-				Name: "fundamental-rank", Role: "financial-analyst",
+				Name: "fundamental-rank", Agent: "financial-analyst",
 				DependsOn: []string{"cross-valuation"},
 				Prompt: `基于上一步估值对比, 对这组企业做**基本面质量排序**。
 
@@ -47,7 +49,7 @@ func sectorScanWorkflow() *WorkflowDef {
 | 排名 | 企业 | 成长 | 质量 | 地位 | 一句话 |`,
 			},
 			{
-				Name: "catalyst-scan", Role: "news-tracker",
+				Name: "catalyst-scan", Agent: "news-tracker",
 				DependsOn: []string{"fundamental-rank"},
 				Prompt: `对这组企业逐一扫描近期**催化剂与风险事件**(必须 WebSearch 取真实新闻)。
 
@@ -57,7 +59,7 @@ func sectorScanWorkflow() *WorkflowDef {
 | 企业 | 近期催化剂 | 风险点 | 净影响(利多/利空) |`,
 			},
 			{
-				Name: "sector-judge", Role: "trade-advisor",
+				Name: "sector-judge", Agent: "trade-advisor",
 				DependsOn: []string{"catalyst-scan"},
 				Prompt: `你是首席策略师。综合估值对比 + 基本面排名 + 催化剂扫描, 对该环节下结论。
 

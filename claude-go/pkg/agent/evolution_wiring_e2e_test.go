@@ -51,8 +51,8 @@ func wireWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name: wireWorkflowName, Description: "进化采集接线验收夹具", Mode: "pipeline",
 		Stages: []StageDef{
-			{Name: "s0", Role: "wire-lead", Prompt: "S0 目标: {objective}"},
-			{Name: "s1", Role: "wire-two", Prompt: "S1 依据: {prev_result}", DependsOn: []string{"s0"}},
+			{Name: "s0", Agent: "wire-lead", Prompt: "S0 目标: {objective}"},
+			{Name: "s1", Agent: "wire-two", Prompt: "S1 依据: {prev_result}", DependsOn: []string{"s0"}},
 		},
 	}
 }

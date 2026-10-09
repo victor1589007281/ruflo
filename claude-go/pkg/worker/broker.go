@@ -496,7 +496,7 @@ func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 	}
 	require := MergeCaps(PlacementCaps(task.Placement), []string{WorkerCap(pinned)}, r.b.ws.RequireCaps())
 	st := StageTask{
-		RunID: task.RunID, NodeID: task.NodeID, Role: task.Role,
+		RunID: task.RunID, NodeID: task.NodeID, SessionID: task.SessionID, Role: task.Role,
 		SystemPrompt: task.SystemPrompt, UserPrompt: task.UserPrompt,
 		Workspace: task.Workspace, ToolProfile: task.ToolProfile,
 		MaxTurns: task.MaxTurns, Require: require,

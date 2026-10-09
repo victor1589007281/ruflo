@@ -20,6 +20,9 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
+
+	"github.com/anthropic/claude-go/pkg/trace"
 )
 
 // trace 四元组的请求头名。命名沿用 pkg/llmgw/server.go 已在读的 X-CG-Run-ID,
@@ -84,24 +87,78 @@ func TraceFromContext(ctx context.Context) Trace {
 	return Trace{}
 }
 
+// TraceFromContextAny 按 api.Trace → pkg/trace 的顺序找 ctx 里的 trace 四元组。
+//
+// 为什么要找**两个** key: 两条注入通道历史上是分开的 —— 团队/引擎路径一贯只注入
+// pkg/trace (trace.With), 而 api.WithTrace 只有 llmgw 的诊断作业在用。setTraceHeaders
+// 一直只认后者, 于是**团队路径的出站 X-CG-Run-ID 恒为空**, 而 llm.jsonl 里的 run_id
+// 却是好的 —— 因为那个字段走的是 pkg/trace (client.go 的 stampTraceIDs)。
+//
+// 这个不一致在"会话头"上变成了实打实的损失: 会话头由本函数按 trace.RunID 派生,
+// 团队路径喂不进来就退化成 pkg/api/sessionKeyForTrace 拿不到 RunID → **不发出站会话头**
+// → 上游 opencode 侧 `opencodeSessionID()` 收不到 Claude Code 原生会话头 → 走 seed 兜底,
+// 把所有行的请求压进同一个进程级会话分片。既拿不到跨 run 复用, 还让互不相干的团队
+// 互相顶掉缓存条目。
+//
+// 顺序: api.Trace 优先 (显式调用方语义更强), 缺失字段用 pkg/trace 补 —— 不是整份
+// 二选一, 否则团队路径下 NodeID/TurnID 依然传不出去。
+func TraceFromContextAny(ctx context.Context) Trace {
+	t := TraceFromContext(ctx)
+	ids := trace.From(ctx)
+	if t.RunID == "" {
+		t.RunID = ids.RunID
+	}
+	if t.NodeID == "" {
+		t.NodeID = ids.NodeID
+	}
+	if t.TurnID == "" {
+		t.TurnID = ids.TurnID
+	}
+	if t.CallID == "" {
+		t.CallID = ids.CallID
+	}
+	return t
+}
+
+// sessionKeyWithExplicit 在 sessionKeyForTrace 的基础上优先采用显式 SessionID。
+//
+// 分工: 本函数管"用哪个 ID 做会话键", sessionKeyForTrace 管"这个 ID 要不要再并进
+// NodeID"(后者是 sessionshard.go 的 A/B 实验, 0% 时逐字节等价于只认 RunID)。
+//
+// 显式 SessionID 是**跨 run 稳定**的业务会话身份, 正是提示缓存要的分片粒度;
+// 没给就完全退回原行为, 一个字节不差。
+func sessionKeyWithExplicit(t Trace, explicit string) string {
+	if explicit = strings.TrimSpace(explicit); explicit != "" {
+		return explicit
+	}
+	return sessionKeyForTrace(t)
+}
+
 // setTraceHeaders 把 ctx 里的 trace 写成出站请求头。
 // 空字段不发头 (而不是发空值), 避免在直连 provider 的形态下多带无意义的头。
 func setTraceHeaders(req *http.Request, ctx context.Context) {
 	if req == nil {
 		return
 	}
-	t := TraceFromContext(ctx)
+	t := TraceFromContextAny(ctx)
 	if t.IsZero() {
 		return
 	}
-	// 会话头 (缓存命中与否的关键, 见 SessionHeader 注释): 用 RunID 当会话 ID ——
-	// 同一次 run 内恒定, 所以前缀不变的那些轮能命中同一份缓存; 跨 run 会变,
-	// 而跨 run 的 system 前缀本来就不一样 (objective 里带 team_name), 该重建。
+	// 会话头 (缓存命中与否的关键, 见 SessionHeader 注释): 会话 ID 怎么算由
+	// sessionKeyForTrace 决定 —— 默认就是 RunID (同一次 run 内恒定, 所以前缀不变
+	// 的那些轮能命中同一份缓存; 跨 run 会变, 而跨 run 的 system 前缀本来就不一样
+	// (objective 里带 team_name), 该重建)。
+	//
+	// 会话 ID 在上游同时是**路由亲和键**, 所以"把 NodeID 也并进会话键"是一个有
+	// 反向代价的实验 —— 见 sessionshard.go 的包注释。实验由
+	// CLAUDE_GO_SESSION_SHARD 驱动, 占比 0 时本函数的行为与改造前逐字节一致。
 	//
 	// 放在这里而不是各调用点: 三个请求出口 (流式/非流式/降级) 都走本函数,
 	// 而 applyExtraHeaders 在其后执行 —— 调用方显式注入的会话头仍能覆盖这个默认值。
-	if t.RunID != "" {
-		req.Header.Set(SessionHeader, t.RunID)
+	if sid := sessionKeyWithExplicit(t, trace.From(ctx).SessionID); sid != "" {
+		req.Header.Set(SessionHeader, sid)
+		// 臂标识随行: 归因靠显式证据, 不靠事后按哈希重算对账。
+		req.Header.Set(SessionArmHeader, string(SessionArmForTrace(t)))
 	}
 	for h, v := range map[string]string{
 		TraceHeaderRunID:  t.RunID,

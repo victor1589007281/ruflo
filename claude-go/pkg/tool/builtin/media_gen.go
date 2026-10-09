@@ -86,8 +86,8 @@ func (t *GenerateImageTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *GenerateImageTool) IsReadOnly(json.RawMessage) bool          { return false }
-func (t *GenerateImageTool) IsConcurrencySafe(json.RawMessage) bool   { return false }
+func (t *GenerateImageTool) IsReadOnly(json.RawMessage) bool        { return false }
+func (t *GenerateImageTool) IsConcurrencySafe(json.RawMessage) bool { return false }
 func (t *GenerateImageTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	return denyInPlanMode(tctx, "GenerateImage")
 }
@@ -677,4 +677,45 @@ func tailStr(s string, n int) string {
 		return s
 	}
 	return "..." + s[len(s)-n:]
+}
+
+// ============================================================================
+// 检索别名 (tool.RecallAliasProvider) —— D4.2「漏召率趋零」
+// ============================================================================
+//
+// ── 这五个工具为什么需要它 ──────────────────────────────────────────────
+//
+// 它们的描述**全是英文**, 而且是被 schema 术语写满的英文 (output_path / .mp4 /
+// 环境变量名)。模型用中文要东西 ("做个视频"、"画张图") 时, 词面检索一个共同
+// 字符都没有 —— 结构上召不回, 不是排序没排好。
+//
+// 别名是那条通路, 且它**不动产品面**: 描述是下发给模型的原文, 把它写长会影响
+// 每一次调用; 别名只进池检索索引。
+//
+// ⚠️ 匹配的是**整串小写子串** (recall.go 的 textHits), 不是关键词拼盘 —— 所以
+// 下面每条都写成"人可能原样打出来的说法", 而不是把词拆开。写 "视频" 与写
+// "视频生成" 在这里是两件事: 后者要求查询里连着出现这五个字。
+
+func (t *GenerateImageTool) RecallAliases() []string {
+	return []string{"图片生成", "生成图片", "画图", "画一张图", "生成图片文件"}
+}
+
+func (t *GenerateVideoTool) RecallAliases() []string {
+	return []string{"视频生成", "生成视频", "做视频", "生成一个视频", "动画文件"}
+}
+
+func (t *GenerateSpeechTool) RecallAliases() []string {
+	return []string{"语音合成", "文字转语音", "文本转语音", "读出来", "生成音频", "配音"}
+}
+
+func (t *GenerateGIFTool) RecallAliases() []string {
+	return []string{"动图", "生成动图", "gif 动画", "做一个动图"}
+}
+
+func (t *GenerateChartTool) RecallAliases() []string {
+	return []string{"图表", "生成图表", "画个图", "数据可视化", "柱状图", "折线图", "饼图"}
+}
+
+func (t *GeneratePPTXTool) RecallAliases() []string {
+	return []string{"幻灯片", "做个PPT", "生成PPT", "演示文稿", "汇报材料"}
 }

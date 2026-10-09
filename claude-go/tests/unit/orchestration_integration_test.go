@@ -84,8 +84,8 @@ func TestPipelineWithRecoveryDeadlockDetection(t *testing.T) {
 		Name: "test-deadlock",
 		Mode: "pipeline",
 		Stages: []agent.StageDef{
-			{Name: "a", Role: "coder", Prompt: "do a", DependsOn: []string{"b"}},
-			{Name: "b", Role: "coder", Prompt: "do b", DependsOn: []string{"a"}},
+			{Name: "a", Agent: "coder", Prompt: "do a", DependsOn: []string{"b"}},
+			{Name: "b", Agent: "coder", Prompt: "do b", DependsOn: []string{"a"}},
 		},
 	}
 
@@ -142,7 +142,7 @@ func TestDevelopmentWorkflowStructure(t *testing.T) {
 	// 验证必须存在的角色
 	roleSet := make(map[string]bool)
 	for _, s := range wf.Stages {
-		roleSet[s.Role] = true
+		roleSet[s.Agent] = true
 	}
 
 	required := []string{"researcher", "architect", "planner"}

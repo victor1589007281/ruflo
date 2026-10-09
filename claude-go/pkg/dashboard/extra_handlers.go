@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,11 @@ type workflowStageDTO struct {
 	Prompt    string   `json:"prompt,omitempty"` // 供编辑预填 (列表里多数为空/简短)
 	DependsOn []string `json:"dependsOn,omitempty"`
 	Parallel  bool     `json:"parallel,omitempty"`
+
+	// Tools 阶段的显式工具声明 (21.8.12 P3/W5)。**必须双向**: 前端 GET 到它才能
+	// 在编辑表单里显示, PUT 回它才能保住 —— 只做单向会让"打开编辑器 → 保存"这条
+	// 最普通的动作把工具声明静默抹掉, 而用户在界面上看不到任何差别。
+	Tools *agent.StageTools `json:"tools,omitempty"`
 }
 
 type workflowDefDTO struct {
@@ -41,6 +47,11 @@ type workflowDefDTO struct {
 	Custom       bool               `json:"custom,omitempty"`       // 运行时定义的动态工作流
 	ProducesCode bool               `json:"producesCode,omitempty"` // 跑编译/测试门禁
 	QualityGate  string             `json:"qualityGate,omitempty"`  // 内容质量门禁策略
+
+	// Revision 乐观并发版本号 (21.8.12 P3)。**必须出现在 GET 的响应里** ——
+	// 客户端改写时要把它原样回传, 拿不到它就永远只能走"不知道覆盖了谁"的那条路。
+	// 内置工作流没有版本概念, 这一栏为空 (omitempty), 与"动态工作流 r1" 区分得开。
+	Revision int64 `json:"revision,omitempty"`
 }
 
 // handleWorkflows: GET 列出所有工作流(内置+动态); POST 注册一个动态工作流。
@@ -60,16 +71,24 @@ func (s *Server) handleWorkflows(w http.ResponseWriter, r *http.Request) {
 
 // handleWorkflowCreate POST /api/workflows: 校验并注册一个动态工作流, 同时落盘 (重启可恢复)。
 // 必须在 :18080 (飞书挂载、与 teamMgr 同进程的 dashboard) 调用, 注册才能即时被团队执行使用。
+//
+// 重名是**拒绝** (409), 不是覆盖 —— 覆盖走 handleWorkflowUpdate (PUT)。
+// 这两条路此前是同一条, 而它们的失败后果完全不同: 见 agent/dynamic_workflow.go 的版本守卫说明。
 func (s *Server) handleWorkflowCreate(w http.ResponseWriter, r *http.Request) {
 	var def agent.WorkflowDef
 	if err := json.NewDecoder(r.Body).Decode(&def); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("JSON 解析失败: %w", err))
 		return
 	}
-	// 用内置角色注册表校验 (registerBuiltins 同步加载, 与 cwd 无关)
-	roles := agent.NewRoleRegistry(s.cfg.StateDir)
+	// 校验用的角色表必须与**运行时用的那张**同源 (21.8.12 W1)。
+	//
+	// 此前这里只传 StateDir, 而运行时 (飞书 bot / CLI) 用的是 cwd —— 于是
+	// "用一个只在 <stateDir> 里存在的角色写的工作流"能通过校验、落盘, 然后在
+	// 运行时查不到那个角色并**静默**退化成内联 prompt。这里改走 s.roleRegistry()
+	// (与 projectCwd() 同一对来源), 校验与执行看到的是同一张表。
+	roles := s.roleRegistry()
 	if err := agent.RegisterWorkflow(&def, roles); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeWorkflowErr(w, err)
 		return
 	}
 	// 落盘持久化 (失败不阻断: 已在进程内注册, 仅重启后丢失)
@@ -80,6 +99,60 @@ func (s *Server) handleWorkflowCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"workflow": toWorkflowDTO(&def), "persisted": true})
+}
+
+// handleWorkflowUpdate PUT /api/workflows/{name} —— 改写一个动态工作流 (21.8.12 P3 版本守卫)。
+//
+// 请求体 = WorkflowDef + 一个**必填**的期望版本:
+//
+//	{"revision": 3, "mode": "...", "stages": [...]}
+//
+// 为什么 revision 放在请求体里而不是 If-Match 头 / 查询串: 现有的三个调用方
+// (webapp 表单、WorkflowRunDetail 另存、平台直连) 全都发 JSON body, 而**其中两个是
+// 人点的按钮** —— 让它们同时学会一个新头, 就是在每个调用点上各留一次"忘了带"的机会。
+// 放进 body 则"漏了字段"这件事在服务端是一个显式的 0, 能被守卫识别并给出**说得清**
+// 的报错 (而不是一条 all-or-nothing 的 CAS 失败)。
+//
+// 路径里的 {name} 是权威名字: body 里的 name 若不一致**以路径为准**, 防止改写
+// A 的时候顺手把 B 也改了。这是一条硬约束, 不是便利。
+func (s *Server) handleWorkflowUpdate(w http.ResponseWriter, r *http.Request, name string) {
+	var in struct {
+		agent.WorkflowDef
+		Revision int64 `json:"revision"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("JSON 解析失败: %w", err))
+		return
+	}
+	def := in.WorkflowDef
+	def.Name = name // 路径权威
+	roles := s.roleRegistry()
+	updated, err := agent.UpdateWorkflow(&def, roles, in.Revision)
+	if err != nil {
+		writeWorkflowErr(w, err)
+		return
+	}
+	// 落盘同样以**已注册的那一份**为准 (它带着服务端算出的 Revision), 而不是请求体 —
+	// 否则落盘文件里的版本号会退回到客户端传来的值, 重启后又变回旧版本。
+	if err := agent.SaveWorkflowToDir(filepath.Join(s.cfg.StateDir, "workflows"), updated); err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"workflow": toWorkflowDTO(updated), "persisted": false, "warn": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"workflow": toWorkflowDTO(updated), "persisted": true})
+}
+
+// writeWorkflowErr 把 agent 侧的工作流错误映射成状态码。
+//
+// 409 与 400 必须分开: 版本冲突时用户的定义**一个字都没写错**, 提示他去改定义
+// 只会让他改坏一份本来对的东西。前端据此决定是"刷新重试"还是"改你的表单"。
+func writeWorkflowErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, agent.ErrWorkflowRevisionConflict) {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }
 
 // dashLLMAdapter 把 dashboard Config.LLMComplete 回调适配成 agent.LLMClient。
@@ -265,7 +338,9 @@ func (s *Server) handleVerifyGoal(w http.ResponseWriter, r *http.Request) {
 // handleRoles GET /api/roles?names=a,b,c — 批量返回角色富信息 (description/systemPrompt/真实skills/tags)。
 // 注: tools/MCP 是全局的(角色无 per-role 工具映射), 不在此返回, 由前端如实标注。
 func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request) {
-	reg := agent.NewRoleRegistry(s.cfg.StateDir)
+	// 这是"列表里有没有这个角色"的唯一读数来源, 必须与运行时同源 (21.8.12 W1):
+	// 它列出来而运行时查不到, 就是一个通过了面板检查却跑不对的编排。
+	reg := s.roleRegistry()
 	out := []roleInfoDTO{}
 	seen := map[string]bool{}
 	describe := func(n string) {
@@ -338,18 +413,29 @@ func (s *Server) handleWorkflowGenerate(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	roles := agent.NewRoleRegistry(s.cfg.StateDir)
+	// 这里把 roles.Names() 直接当**生成器的角色词表**用 —— 也就是说喂给模型的名字
+	// 必须都是运行时可解析的那些, 否则生成出来的编排里会有一个"看着合法、跑起来
+	// 退化成内联 prompt"的角色 (21.8.12 W1 / 21.8.5-C)。
+	roles := s.roleRegistry()
 	def, err := agent.GenerateWorkflowDef(r.Context(), dashLLMAdapter{s.cfg.LLMComplete}, body.Objective, roles.Names(), body.Current, body.Instruction)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
+	// 校验分两级回给前端 (21.8.12 W3): 硬错是 "这个编排跑不起来" (非致命, 用户在
+	// 审核时修正), 降级告警是 "跑得起来, 但某个 stage 用的不是它声明那个 agent 的
+	// prompt"。后者此前**完全不回**: 生成器写了一个不存在的角色名, 用户看到的是一份
+	// 干净、可保存、能跑的编排 —— 直到它跑出内联 prompt 的结果, 而那时候已经很难
+	// 把它与"就是这个结果"分开了。这正是本批次要消灭的"读数正常而东西没生效"。
+	warns, verr := def.ValidateAll(roles)
 	valErr := ""
-	if e := def.Validate(roles); e != nil {
-		valErr = e.Error() // 非致命: 生成可能不完美, 用户在审核时修正
+	if verr != nil {
+		valErr = verr.Error()
 	}
 	// 返回完整 def (含每阶段 prompt, 供前端预填编辑器)
-	writeJSON(w, http.StatusOK, map[string]interface{}{"workflow": def, "validationError": valErr})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"workflow": def, "validationError": valErr, "validationWarnings": warns,
+	})
 }
 
 // handleTeamSwarmPlan GET /api/teams/{name}/swarm-plan
@@ -397,6 +483,10 @@ func (s *Server) handleWorkflow(w http.ResponseWriter, r *http.Request) {
 		s.handleWorkflowDelete(w, r, name)
 		return
 	}
+	if r.Method == http.MethodPut || r.Method == http.MethodPatch {
+		s.handleWorkflowUpdate(w, r, name)
+		return
+	}
 	wf := agent.GetWorkflow(name)
 	if wf == nil {
 		writeError(w, http.StatusNotFound, fmt.Errorf("workflow %q not found", name))
@@ -426,14 +516,48 @@ func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
 		Name: wf.Name, Description: wf.Description, Mode: wf.Mode, Rounds: wf.Rounds,
 		Custom: wf.Custom, ProducesCode: wf.ProducesCode, QualityGate: wf.QualityGate,
 	}
+	// Revision 走 agent.RevisionOf 而不是 wf.Revision: 内置工作流从工厂出来时
+	// Revision 恒为 0 (它们没有版本), 而 0 在上面的 DTO 里被 omitempty 吃掉 —— 这正好
+	// 是想要的 (客户端看到没有 revision 就知道这是内置的, 不该走改写)。动态工作流
+	// 则一定从注册表里取到归一后的值 (≥1), 不依赖调用方传进来的是什么。
+	if wf.Custom {
+		dto.Revision = agent.RevisionOf(wf.Name)
+	}
 	for _, st := range wf.Stages {
 		dto.Stages = append(dto.Stages, workflowStageDTO{
-			Name: st.Name, Role: st.Role, Prompt: st.Prompt,
+			Name: st.Name, Role: st.Agent, Prompt: st.Prompt,
 			DependsOn: append([]string(nil), st.DependsOn...),
 			Parallel:  st.Parallel,
+			Tools:     cloneStageTools(st.Tools), // 深拷贝: StageTools 里有指针与切片
 		})
 	}
 	return dto
+}
+
+// cloneStageTools 深拷贝一份阶段工具声明。
+//
+// 不深拷贝的后果是**注册表被面板改坏**: toWorkflowDTO 拿到的 StageDef 来自
+// listCustomWorkflows, 而那里对 Stages 做了 copy-on-read —— 但 StageTools 里有一个
+// 指针 (Allow) 与一个切片 (Deny), 浅拷贝会让 DTO 与注册表共享同一份底层数组。
+// 于是"响应体序列化"这个纯读动作之后, 任何对 DTO 的就地修改都会改到注册表里那份定义。
+//
+// 与 registerWorkflowLocked 里 `cp.Stages = append([]StageDef(nil), def.Stages...)`
+// 是同一条理由, 只是深了一层: 切片元素的**内部指针**也要一起复制, 否则外层切片的
+// 隔离是假的。
+func cloneStageTools(st *agent.StageTools) *agent.StageTools {
+	if st == nil {
+		return nil
+	}
+	out := &agent.StageTools{Profile: st.Profile}
+	if st.Allow != nil {
+		// nil 与 &[] 必须分别保留: 前者"没写白名单", 后者"显式空白名单 (拒绝一切)"。
+		allow := append([]string{}, (*st.Allow)...)
+		out.Allow = &allow
+	}
+	if len(st.Deny) > 0 {
+		out.Deny = append([]string(nil), st.Deny...)
+	}
+	return out
 }
 
 // =====================================================================

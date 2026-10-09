@@ -24,10 +24,12 @@ type CodeIntelInitTool struct{}
 
 func NewCodeIntelInitTool() *CodeIntelInitTool { return &CodeIntelInitTool{} }
 
-func (t *CodeIntelInitTool) Name() string        { return "code_intel_init" }
-func (t *CodeIntelInitTool) IsReadOnly(_ json.RawMessage) bool         { return false }
-func (t *CodeIntelInitTool) IsConcurrencySafe(_ json.RawMessage) bool  { return false }
-func (t *CodeIntelInitTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
+func (t *CodeIntelInitTool) Name() string                             { return "code_intel_init" }
+func (t *CodeIntelInitTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+func (t *CodeIntelInitTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+func (t *CodeIntelInitTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
+	return nil
+}
 
 func (t *CodeIntelInitTool) Description() string {
 	return `Initialize code intelligence for a repository by running GitNexus analyze and Graphify update.
@@ -79,10 +81,12 @@ type CodeIntelUpdateTool struct{}
 
 func NewCodeIntelUpdateTool() *CodeIntelUpdateTool { return &CodeIntelUpdateTool{} }
 
-func (t *CodeIntelUpdateTool) Name() string        { return "code_intel_update" }
-func (t *CodeIntelUpdateTool) IsReadOnly(_ json.RawMessage) bool         { return false }
-func (t *CodeIntelUpdateTool) IsConcurrencySafe(_ json.RawMessage) bool  { return false }
-func (t *CodeIntelUpdateTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
+func (t *CodeIntelUpdateTool) Name() string                             { return "code_intel_update" }
+func (t *CodeIntelUpdateTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+func (t *CodeIntelUpdateTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+func (t *CodeIntelUpdateTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
+	return nil
+}
 
 func (t *CodeIntelUpdateTool) Description() string {
 	return `Incrementally update the code intelligence index by re-running GitNexus analyze and Graphify update.
@@ -133,10 +137,12 @@ type CodeIntelStatusTool struct{}
 
 func NewCodeIntelStatusTool() *CodeIntelStatusTool { return &CodeIntelStatusTool{} }
 
-func (t *CodeIntelStatusTool) Name() string        { return "code_intel_status" }
-func (t *CodeIntelStatusTool) IsReadOnly(_ json.RawMessage) bool         { return true }
-func (t *CodeIntelStatusTool) IsConcurrencySafe(_ json.RawMessage) bool  { return true }
-func (t *CodeIntelStatusTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
+func (t *CodeIntelStatusTool) Name() string                             { return "code_intel_status" }
+func (t *CodeIntelStatusTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+func (t *CodeIntelStatusTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+func (t *CodeIntelStatusTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
+	return nil
+}
 
 func (t *CodeIntelStatusTool) Description() string {
 	return `Get the status of code intelligence index from GitNexus and Graphify.`
@@ -177,10 +183,12 @@ type CodeIntelQueryTool struct{}
 
 func NewCodeIntelQueryTool() *CodeIntelQueryTool { return &CodeIntelQueryTool{} }
 
-func (t *CodeIntelQueryTool) Name() string        { return "code_intel_query" }
-func (t *CodeIntelQueryTool) IsReadOnly(_ json.RawMessage) bool         { return true }
-func (t *CodeIntelQueryTool) IsConcurrencySafe(_ json.RawMessage) bool  { return true }
-func (t *CodeIntelQueryTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
+func (t *CodeIntelQueryTool) Name() string                             { return "code_intel_query" }
+func (t *CodeIntelQueryTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+func (t *CodeIntelQueryTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+func (t *CodeIntelQueryTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
+	return nil
+}
 
 func (t *CodeIntelQueryTool) Description() string {
 	return `Query the code intelligence graph via GitNexus or Graphify CLI.
@@ -292,10 +300,12 @@ type CodeIntelBranchTool struct{}
 
 func NewCodeIntelBranchTool() *CodeIntelBranchTool { return &CodeIntelBranchTool{} }
 
-func (t *CodeIntelBranchTool) Name() string        { return "code_intel_branch" }
-func (t *CodeIntelBranchTool) IsReadOnly(_ json.RawMessage) bool         { return false }
-func (t *CodeIntelBranchTool) IsConcurrencySafe(_ json.RawMessage) bool  { return false }
-func (t *CodeIntelBranchTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult { return nil }
+func (t *CodeIntelBranchTool) Name() string                             { return "code_intel_branch" }
+func (t *CodeIntelBranchTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+func (t *CodeIntelBranchTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+func (t *CodeIntelBranchTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
+	return nil
+}
 
 func (t *CodeIntelBranchTool) Description() string {
 	return `Branch management for code intelligence.
@@ -344,9 +354,9 @@ func (t *CodeIntelBranchTool) Call(ctx context.Context, input json.RawMessage, _
 	case "detect_changes":
 		qr, e := gn.DetectChanges()
 		result = map[string]interface{}{
-			"action":           "detect_changes",
-			"gitnexus":         safeMap(qr),
-			"gitnexus_error":   errString(e),
+			"action":         "detect_changes",
+			"gitnexus":       safeMap(qr),
+			"gitnexus_error": errString(e),
 		}
 	case "status":
 		gnQr, gnErr := gn.Status()
@@ -393,4 +403,32 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// RecallAliases 声明"这句话问的是我"的检索通路 (tool.RecallAliasProvider)。
+//
+// ── 为什么这里必须有这么一段 ────────────────────────────────────────────
+//
+// 描述是**英文 + 引擎术语** (navigate / find_refs / impact), 而问的人说的是
+// "谁调用了这个函数"。这两边一个共同字符都没有, 词面检索**结构上**过不去 ——
+// 不是排序没排好, 是没有可排的东西。
+//
+// 别名是那条绕过去的通路, 且是**可审计**的: 一条别名错了, 你看得见是谁写的。
+// 对照 embedder 那条路 (pkg/memory/embed.go): 它召回错了你只知道"距离近"。
+//
+// ⚠️ 这里匹配的是**整串小写子串** (见 recall.go 的 textHits / substringHits),
+// 不是分词后的词。所以条目要写成"用户可能原样打出来的整句话", 而不是关键词
+// 拼盘 —— 写成 "调用方" 这种两字词, 只有当查询里**连着出现**这三个字时才命中,
+// 它长什么样本身不影响分词 (别名与描述走同一条 textHits)。
+//
+// 也正因为它只对子串生效, 这一档**永远只能修一部分**: 覆盖的是"有人预见到了
+// 这种说法", 不是"任意说法都能召回"。保留集里 ④ 跨语言那一档如实记着这个天花板。
+func (t *CodeIntelQueryTool) RecallAliases() []string {
+	return []string{
+		// 英文侧: 描述里是 find_refs / impact 这种引擎术语, 不写这句就问不到
+		"who calls this function", "who calls", "find callers", "call hierarchy",
+		"find references", "impact analysis", "what breaks if",
+		// 中文侧: 描述全是英文, 一个字都对不上
+		"调用方", "谁调用", "引用关系", "影响面", "改了会怎样", "谁会受影响",
+	}
 }

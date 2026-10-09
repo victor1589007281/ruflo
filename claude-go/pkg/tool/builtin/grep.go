@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -27,18 +28,18 @@ const GrepToolName = "Grep"
 const defaultGrepHeadLimit = 250
 
 type grepInput struct {
-	Pattern           string `json:"pattern"`
-	Path              string `json:"path,omitempty"`
-	Glob              string `json:"glob,omitempty"`
-	Type              string `json:"type,omitempty"`
-	OutputMode        string `json:"output_mode,omitempty"` // content, files_with_matches, count; default files_with_matches
-	CaseInsensitive   bool   `json:"case_insensitive,omitempty"`
-	BeforeContext     int    `json:"before_context,omitempty"`
-	AfterContext      int    `json:"after_context,omitempty"`
-	Context           int    `json:"context,omitempty"`
-	Multiline         bool   `json:"multiline,omitempty"`
-	HeadLimit         *int   `json:"head_limit,omitempty"` // nil → default 250; 0 → unlimited
-	Offset            *int   `json:"offset,omitempty"`
+	Pattern         string `json:"pattern"`
+	Path            string `json:"path,omitempty"`
+	Glob            string `json:"glob,omitempty"`
+	Type            string `json:"type,omitempty"`
+	OutputMode      string `json:"output_mode,omitempty"` // content, files_with_matches, count; default files_with_matches
+	CaseInsensitive bool   `json:"case_insensitive,omitempty"`
+	BeforeContext   int    `json:"before_context,omitempty"`
+	AfterContext    int    `json:"after_context,omitempty"`
+	Context         int    `json:"context,omitempty"`
+	Multiline       bool   `json:"multiline,omitempty"`
+	HeadLimit       *int   `json:"head_limit,omitempty"` // nil → default 250; 0 → unlimited
+	Offset          *int   `json:"offset,omitempty"`
 }
 
 type GrepTool struct{}
@@ -72,7 +73,7 @@ func (t *GrepTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *GrepTool) IsReadOnly(_ json.RawMessage) bool { return true }
+func (t *GrepTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *GrepTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 func (t *GrepTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
@@ -213,9 +214,7 @@ func (t *GrepTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 	output, _ = grepApplyLineLimit(output, in.HeadLimit, off)
 
 	const maxOutputLen = 50000
-	if len(output) > maxOutputLen {
-		output = output[:maxOutputLen] + "\n... (results truncated)"
-	}
+	output = textutil.Truncate(output, maxOutputLen, "\n... (results truncated)")
 
 	return &tool.ToolResult{Content: output}, nil
 }

@@ -49,6 +49,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/api"
 	evoledger "github.com/anthropic/claude-go/pkg/evolution"
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // Experience 经验条目 (V2: 结构化+生命周期+注入追踪)。
@@ -2075,16 +2076,7 @@ func simpleBM25(queryTerms, docTerms []string) float64 {
 // smartTruncateEvolution 智能截断: 保留前部+后部，中间用省略号连接。
 // 避免只保留开头导致丢失关键的输出/错误信息。
 func smartTruncateEvolution(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	headLen := maxLen * 2 / 3
-	tailLen := maxLen - headLen - 30
-	if tailLen < 100 {
-		tailLen = 100
-		headLen = maxLen - tailLen - 30
-	}
-	return s[:headLen] + "\n...(truncated middle)...\n" + s[len(s)-tailLen:]
+	return textutil.TruncateMiddle(s, maxLen, "\n...(truncated middle)...\n")
 }
 
 // computeMinHash 计算 MinHash 签名 (V2: 替代 O(n²) Jaccard)。

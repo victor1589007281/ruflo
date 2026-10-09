@@ -26,8 +26,8 @@ func TestPlacement_覆盖表声明直译进图(t *testing.T) {
 	wf := &WorkflowDef{
 		Name: name, Mode: "graph",
 		Stages: []StageDef{
-			{Name: "plan", Role: "planner", Prompt: "规划 {objective}"},
-			{Name: "render", Role: "designer", Prompt: "渲染 {prev_result}", DependsOn: []string{"plan"}},
+			{Name: "plan", Agent: "planner", Prompt: "规划 {objective}"},
+			{Name: "render", Agent: "designer", Prompt: "渲染 {prev_result}", DependsOn: []string{"plan"}},
 		},
 	}
 	want := &graph.PlacementSpec{Require: []string{"browser"}, Prefer: "remote:render-pool"}
@@ -65,7 +65,7 @@ func TestPlacement_覆盖表声明直译进图(t *testing.T) {
 func TestPlacement_非法声明开图即拒(t *testing.T) {
 	const name = "graph-placement-bad"
 	wf := &WorkflowDef{Name: name, Mode: "graph",
-		Stages: []StageDef{{Name: "render", Role: "designer", Prompt: "x"}}}
+		Stages: []StageDef{{Name: "render", Agent: "designer", Prompt: "x"}}}
 	RegisterGraphOverride(name, WorkflowGraphOverride{Stages: map[string]StageGraphOverride{
 		"render": {Placement: &graph.PlacementSpec{Prefer: "remote:"}},
 	}})
@@ -111,8 +111,8 @@ func TestPlacement_节点声明下传给factory(t *testing.T) {
 	t.Cleanup(func() { UnregisterGraphOverride(name) })
 
 	wf := &WorkflowDef{Name: name, Mode: "graph", Stages: []StageDef{
-		{Name: "plan", Role: "planner", Prompt: "规划 {objective}"},
-		{Name: "render", Role: "designer", Prompt: "渲染 {prev_result}", DependsOn: []string{"plan"}},
+		{Name: "plan", Agent: "planner", Prompt: "规划 {objective}"},
+		{Name: "render", Agent: "designer", Prompt: "渲染 {prev_result}", DependsOn: []string{"plan"}},
 	}}
 	var mu sync.Mutex
 	seen := map[string]*Placement{}
@@ -167,8 +167,8 @@ func TestGroupTerminator_轮数由判据决定(t *testing.T) {
 		wf := &WorkflowDef{
 			Name: name, Mode: "graph",
 			Stages: []StageDef{
-				{Name: "gen", Role: "writer", Prompt: "写稿"},
-				{Name: "check", Role: "critic", Prompt: "审 {prev_result}", DependsOn: []string{"gen"}},
+				{Name: "gen", Agent: "writer", Prompt: "写稿"},
+				{Name: "check", Agent: "critic", Prompt: "审 {prev_result}", DependsOn: []string{"gen"}},
 			},
 		}
 		RegisterGraphOverride(name, WorkflowGraphOverride{Groups: []StageGroupOverride{{
@@ -213,8 +213,8 @@ func TestGroupTerminator_轮数由判据决定(t *testing.T) {
 func TestGroupTerminator_声明落图与互斥(t *testing.T) {
 	const name = "graph-group-term-xlate"
 	wf := &WorkflowDef{Name: name, Mode: "graph", Stages: []StageDef{
-		{Name: "gen", Role: "writer", Prompt: "写稿"},
-		{Name: "check", Role: "critic", Prompt: "审", DependsOn: []string{"gen"}},
+		{Name: "gen", Agent: "writer", Prompt: "写稿"},
+		{Name: "check", Agent: "critic", Prompt: "审", DependsOn: []string{"gen"}},
 	}}
 	term := &graph.TerminatorSpec{Name: graph.TerminatorAdaptive, PassScore: 90,
 		ConvergeEpsilon: 2, DegradeDelta: 3, DegradeRounds: 2, AllowRollback: true}
@@ -245,8 +245,8 @@ func TestGroupTerminator_声明落图与互斥(t *testing.T) {
 func TestGroupTerminator_与Until并存开图即拒(t *testing.T) {
 	const name = "graph-group-term-conflict"
 	wf := &WorkflowDef{Name: name, Mode: "graph", Stages: []StageDef{
-		{Name: "gen", Role: "writer", Prompt: "写稿"},
-		{Name: "check", Role: "critic", Prompt: "审", DependsOn: []string{"gen"}},
+		{Name: "gen", Agent: "writer", Prompt: "写稿"},
+		{Name: "check", Agent: "critic", Prompt: "审", DependsOn: []string{"gen"}},
 	}}
 	RegisterGraphOverride(name, WorkflowGraphOverride{Groups: []StageGroupOverride{{
 		ID: "adv", Members: []string{"gen", "check"}, MaxIterations: 4, ResultFrom: "check",

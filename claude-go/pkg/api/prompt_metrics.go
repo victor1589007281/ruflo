@@ -17,6 +17,27 @@ type PromptComponentMetrics struct {
 	BlackboardChars   int `json:"blackboard_chars"`
 	PrevResultChars   int `json:"prev_result_chars"`
 	MessagesChars     int `json:"messages_chars"`
+
+	// ToolsSchemaDigest 是本请求**实际下发**的工具段 (按顺序逐条 name+description+
+	// schema) 的 sha256 前 16 个十六进制字符。
+	//
+	// ── 为什么长度不够, 非要一个摘要 (D4.2 第三条验收口径) ────────────────────
+	//
+	// 那一条口径是「前缀命中率上升」。前缀缓存只认**开头逐字节相同**, 所以问题
+	// 是"工具段这一轮与上一轮是不是逐字节一样", 而 ToolsSchemaChars 回答不了
+	// 这个问题 —— 它是**长度**, 而"长度没变"与"内容没变"是两回事:
+	//
+	//	· 池化的设计让广告面**每次调用都可能换人** (pool_load 让一件进、一件出
+	//	  是常态)。长度完全可以在"换了三件同样大小的工具"时纹丝不动。
+	//	· 而缓存恰恰在这一刻失效 —— 前缀从工具段起就不同了, 后面的 system 与
+	//	  messages 全部重算。
+	//
+	// 所以长度这个数在池化场景下**恰好失去了分辨力**, 而它看起来是有分辨力的
+	// ("我量了工具段啊")。摘要才是那个能把"没变"与"变得看不出来"分开的判据。
+	//
+	// 空工具段取空串 (不是空串的哈希) —— 没下发工具与下发了一个空列表在这里
+	// 是同一件事, 都给一个可比较的确定值。
+	ToolsSchemaDigest string `json:"tools_schema_digest,omitempty"`
 }
 
 // LLMMetricsContext 是 QueryEngine 传给 api.Client 的单次调用标签与 prompt 账本。

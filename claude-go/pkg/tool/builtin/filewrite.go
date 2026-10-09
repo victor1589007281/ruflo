@@ -46,7 +46,7 @@ func (t *FileWriteTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *FileWriteTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *FileWriteTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *FileWriteTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
 func (t *FileWriteTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
@@ -79,10 +79,23 @@ func (t *FileWriteTool) Call(ctx context.Context, input json.RawMessage, tctx *t
 
 	filePath := expandPath(in.Path, tctx.Cwd)
 
+	// H3-4 并发写闸: 同一个文件同时被两个并行子代理写 ⇒ 显式拒绝, 不静默覆盖。
+	// 位置在所有别的守卫**之前**: 这是一条关于"谁有权动这个文件"的判据, 与内容是否
+	// 合法无关 —— 一份语法完全正确的覆盖同样是数据丢失, 先做语法校验会让坏内容被拒、
+	// 好内容被放行, 而覆盖这件事本身才是要挡的。
+	if err := tctx.ClaimWrite(filePath); err != nil {
+		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
+	}
+
 	// 方案三 L2 护栏: 写入前语法校验 (弱模型模式), 坏内容拒写并回注错误
 	if res := guardWriteSyntax(filePath, in.Contents, tctx); res != nil {
 		return res, nil
 	}
+
+	// 文件级检查点: 写入前记下当前修订, 写入后再记新修订 ——
+	// 于是最高版本恒等于磁盘内容, "回退一步"即恢复上一个修订。
+	// 位置在语法护栏等全部拒写分支之后: 被拒的写入没有产生新修订。
+	snapshotRef := checkpointBeforeWrite(filePath, tctx)
 
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("创建目录失败: %v", err), IsError: true}, nil
@@ -91,6 +104,11 @@ func (t *FileWriteTool) Call(ctx context.Context, input json.RawMessage, tctx *t
 	if err := os.WriteFile(filePath, []byte(in.Contents), 0o644); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("写入文件失败: %v", err), IsError: true}, nil
 	}
+	checkpointAfterWrite(filePath, tctx)
 
-	return &tool.ToolResult{Content: fmt.Sprintf("Successfully wrote %d bytes to %s", len(in.Contents), filePath)}, nil
+	msg := fmt.Sprintf("Successfully wrote %d bytes to %s", len(in.Contents), filePath)
+	if snapshotRef != "" {
+		msg += fmt.Sprintf("\n[file-history] 写前版本: %s", snapshotRef)
+	}
+	return &tool.ToolResult{Content: msg}, nil
 }

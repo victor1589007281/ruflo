@@ -33,6 +33,28 @@ func toolRegistry() *tool.Registry {
 
 func (s *Server) projectCwd() string { return filepath.Dir(s.cfg.StateDir) }
 
+// roleRegistry 建**校验/展示用**的角色表, 来源与运行时那两个入口同一对 (21.8.12 W1)。
+//
+// 此前 dashboard 的四个校验点各写各的 —— handleWorkflowCreate / Update / handleRoles /
+// handleWorkflowGenerate 用 cfg.StateDir, capability_handlers 用 projectCwd()。两种
+// 根扫出来的角色表可以不同, 而差异只在"某个 stage 静默退化成内联 prompt"上现形。
+//
+// 收成一处不是为了少写几个字, 是为了让"面板看到的角色"与"运行时用的角色"在代码里
+// **同源可见**: 它们现在是同一个表达式, 而不需要读者去比对四个调用点的实参。
+//
+// projectCwd 仍从 StateDir 反推 (dashboard 的 Config 没有独立 Cwd 字段, 加一个字段
+// 意味着三个构造点都要改, 而它们手上并没有比 StateDir 更权威的 cwd)。这是与
+// 21.8.12 W1 原议 (三处根统一到一个显式 root) 的**一处有意保留的近似**: 反推出来的
+// cwd 在 <stateDir> 与项目同根时正确, 不同根时会少扫一个来源 —— 但它少扫的是
+// **同一个** 来源, 校验与运行时一起少, 于是"两边不一致"这条缺陷不复现。真正的
+// 修法是给 dashboard.Config 加 Cwd, 那是独立一项, 不该埋在这里。
+func (s *Server) roleRegistry() *agent.RoleRegistry {
+	if s == nil {
+		return agent.NewRoleRegistry("")
+	}
+	return agent.NewRoleRegistryFor(s.projectCwd(), s.cfg.StateDir)
+}
+
 func (s *Server) freshSkillRegistry() *skills.Registry {
 	sr := skills.NewRegistry()
 	sr.LoadDefaults(s.projectCwd())
@@ -269,7 +291,7 @@ func (s *Server) handleMCPServers(w http.ResponseWriter, r *http.Request) {
 
 // handleReferences GET /api/references?skill=X | ?role=Y
 func (s *Server) handleReferences(w http.ResponseWriter, r *http.Request) {
-	rr := agent.NewRoleRegistry(s.projectCwd())
+	rr := s.roleRegistry()
 	skill := strings.TrimSpace(r.URL.Query().Get("skill"))
 	role := strings.TrimSpace(r.URL.Query().Get("role"))
 
@@ -293,8 +315,8 @@ func (s *Server) handleReferences(w http.ResponseWriter, r *http.Request) {
 		refs := []wfRef{}
 		for _, wf := range agent.ListWorkflows() {
 			for _, st := range wf.Stages {
-				if containsStr(roles, st.Role) {
-					refs = append(refs, wfRef{wf.Name, st.Name, st.Role})
+				if containsStr(roles, st.Agent) {
+					refs = append(refs, wfRef{wf.Name, st.Name, st.Agent})
 				}
 			}
 		}
@@ -310,8 +332,8 @@ func (s *Server) handleReferences(w http.ResponseWriter, r *http.Request) {
 		refs := []wfRef{}
 		for _, wf := range agent.ListWorkflows() {
 			for _, st := range wf.Stages {
-				if st.Role == role {
-					refs = append(refs, wfRef{wf.Name, st.Name, st.Role})
+				if st.Agent == role {
+					refs = append(refs, wfRef{wf.Name, st.Name, st.Agent})
 				}
 			}
 		}

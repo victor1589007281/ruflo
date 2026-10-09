@@ -91,8 +91,18 @@ type NodeEvent struct {
 // **自包含**是关键 (design/02 §3.3): 远程 runtime 不该依赖本机状态目录, 所以
 // prompt/角色/工作区都在这里显式带上, 而不是让对端去读 ~/.claude-go。
 type RuntimeNodeTask struct {
-	RunID        string
-	NodeID       string
+	RunID  string
+	NodeID string
+	// SessionID 是**跨 run 稳定**的会话身份, 随任务过线发给远程 runtime。
+	//
+	// 为什么它必须跟 RunID 一起走: 控制面按业务键派生的会话身份挂在 ctx 上, 而
+	// 任务一旦离开本进程, ctx 就断了 —— 远程 worker 重建 ctx 时只补 RunID/NodeID,
+	// 会话身份就丢了 (见 pkg/worker/worker.go 的 trace 续接)。丢了不报错, 只是
+	// 出站会话头缺位、上游提示缓存恒不命中 —— 正是本次要修的那个静默损失。
+	//
+	// 与 RunID 的分工见 pkg/trace.IDs: RunID 每次运行唯一 (奖励归因), SessionID
+	// 跨次稳定 (缓存分片)。空 = 不指定, 对端退回按 RunID 分片, 与改造前一致。
+	SessionID    string
 	Role         string
 	SystemPrompt string
 	UserPrompt   string

@@ -667,6 +667,25 @@ func (s *SwarmOrchestrator) executeSubTask(
 		}
 	}
 
+	// 注入定向消息 (21.8.9-D6-3)。蜂群这条路**必须单独接**: 它自己拼 prompt 后直调
+	// agent.Runner.Execute, 不经过 workflow.go 的 executeStage —— 那边的一处接线覆盖
+	// 另外四条路径, 唯独覆盖不到这里。
+	if team != nil {
+		// 两个地址: 团队列表给用户看的是 `- **<任务ID>** (<角色>)`, 而 /team msg 没说
+		// <Agent> 该填哪个。去重由 takeMailFor 做。
+		msgs, err := takeMailFor(team.mailStore(), team.Name, task.Role, task.ID)
+		if err != nil {
+			// 不阻断子任务, 但留痕: 静默失联与"没人发消息"同形。
+			log.Printf("[Mailbox] 取定向消息失败 (不阻断蜂群子任务): team=%s task=%s role=%s err=%v",
+				team.Name, task.ID, task.Role, err)
+		}
+		if mailBlock := FormatMailboxForPrompt(msgs); mailBlock != "" {
+			sb.WriteString("\n")
+			sb.WriteString(mailBlock)
+			sb.WriteString("\n")
+		}
+	}
+
 	sb.WriteString("\n请深入执行你的任务, 给出详细、高质量的结果。使用可用的工具来完成工作。")
 	// 蜂群通用质量约束: 防止空壳/编译失败/架构脱节
 	sb.WriteString(`
@@ -927,10 +946,10 @@ func (s *SwarmOrchestrator) checkpointPath(teamName string) string {
 
 func (s *SwarmOrchestrator) saveCheckpoint(teamName string, plan *DecompositionPlan, resultMap map[string]string, level int) {
 	cp := SwarmCheckpoint{
-		Plan:        plan,
-		ResultMap:   resultMap,
+		Plan:         plan,
+		ResultMap:    resultMap,
 		CurrentLevel: level,
-		Timestamp:   time.Now(),
+		Timestamp:    time.Now(),
 	}
 	for id := range resultMap {
 		cp.CompletedIDs = append(cp.CompletedIDs, id)

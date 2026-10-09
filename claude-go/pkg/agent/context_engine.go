@@ -1,6 +1,5 @@
 package agent
 
-
 import (
 	"fmt"
 	"path/filepath"
@@ -9,18 +8,18 @@ import (
 
 // ContextRequest 上下文检索请求
 type ContextRequest struct {
-	TaskType      string   `json:"task_type"`       // implement/fix/refactor
-	TargetFile    string   `json:"target_file"`
-	TargetLine    int      `json:"target_line"`
-	Diagnostic    string   `json:"diagnostic"`      // 原始诊断文本
-	Category      string   `json:"category"`        // missing_method/wrong_import/type_mismatch
-	Symbol        string   `json:"symbol"`          // 涉及的符号
-	RelatedFiles  []string `json:"related_files,omitempty"`
+	TaskType     string   `json:"task_type"` // implement/fix/refactor
+	TargetFile   string   `json:"target_file"`
+	TargetLine   int      `json:"target_line"`
+	Diagnostic   string   `json:"diagnostic"` // 原始诊断文本
+	Category     string   `json:"category"`   // missing_method/wrong_import/type_mismatch
+	Symbol       string   `json:"symbol"`     // 涉及的符号
+	RelatedFiles []string `json:"related_files,omitempty"`
 }
 
 // ContextChunk 上下文片段
 type ContextChunk struct {
-	Source    string  `json:"source"`    // contract/import/test/doc
+	Source    string  `json:"source"` // contract/import/test/doc
 	File      string  `json:"file"`
 	Line      int     `json:"line"`
 	Content   string  `json:"content"`

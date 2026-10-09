@@ -3,9 +3,10 @@
 // 动机: 一次性让 LLM 写原始 HTML/CSS 动画质量波动大; 对"算法/数据结构/协议原理"这类
 // 题材, 业界做法是让 LLM 写 manim (3Blue1Brown 同款引擎) 代码, 由成熟引擎确定性渲染
 // (参考 TheoremExplainAgent: planner+coder, 93.8% 成功率)。本路径:
-//   1) genre 路由: 命中算法/技术原理类视频 → 走 manim;
-//   2) LLM 写 manim Scene 代码 → 渲染 → 出错把"执行日志"喂回去定向修复 (有限轮);
-//   3) 渲染成功后用视觉评审器对真实画面把关。
+//  1. genre 路由: 命中算法/技术原理类视频 → 走 manim;
+//  2. LLM 写 manim Scene 代码 → 渲染 → 出错把"执行日志"喂回去定向修复 (有限轮);
+//  3. 渲染成功后用视觉评审器对真实画面把关。
+//
 // 非算法题材或 manim 不可用时, 调用方回退到 HTML 路径。
 package agent
 
@@ -18,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // manimBin 解析 manim 可执行文件 (env MANIM_BIN > PATH > ~/.local/bin/manim)。空串=不可用。
@@ -132,8 +134,8 @@ func (we *WorkflowExecutor) GenerateManimVideo(ctx context.Context, objective, w
 		lastErr = renderErr.Error()
 		// 把执行日志(截尾)喂回, 让模型定向修复
 		tail := lastErr
-		if len(tail) > 1500 {
-			tail = tail[len(tail)-1500:]
+		if n := utf8.RuneCountInString(tail); n > 1500 {
+			tail = string([]rune(tail)[n-1500:])
 		}
 		fixHint = fmt.Sprintf("\n上一版脚本渲染失败, 请修复后重新输出完整脚本。错误日志(节选):\n%s\n", tail)
 		we.notify(we.chatID, fmt.Sprintf("  ⚠️ manim 第 %d 轮渲染失败, 按错误日志修复重试...", round))
@@ -264,4 +266,3 @@ func (we *WorkflowExecutor) runManimVideoPath(ctx context.Context, objective str
 		{Name: "final-delivery", Role: "media-producer", Status: TaskCompleted, Output: report},
 	}, true
 }
-

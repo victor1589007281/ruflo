@@ -42,6 +42,7 @@ import (
 	"sync"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // runFeedbackMaxBody 请求体上限。回传的是门禁结论不是日志正文, 64KiB 足够;
@@ -196,9 +197,7 @@ func runFeedbackValue(req runFeedbackReq) (float64, map[string]any, error) {
 		raw["suite"] = s
 	}
 	if d := strings.TrimSpace(req.Detail); d != "" {
-		if len(d) > runFeedbackDetailMax {
-			d = d[:runFeedbackDetailMax] + "…[truncated]"
-		}
+		d = textutil.Truncate(d, runFeedbackDetailMax, "…[truncated]")
 		raw["detail"] = d
 	}
 	switch {

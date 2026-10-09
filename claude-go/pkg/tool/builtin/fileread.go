@@ -49,7 +49,7 @@ type fileReadInput struct {
 
 // FileReadTool 文件读取工具
 type FileReadTool struct {
-	mu             sync.Mutex
+	mu sync.Mutex
 	// lastReadHashes: "path|offset|limit" -> content hash (不含内容，仅去重)。
 	// 键必须含 offset/limit：同一文件的"整读"与"读第 2-3 行"是两个不同的
 	// 请求，内容 hash 却相同。早期只用 path 作键，导致先整读、再带
@@ -88,7 +88,7 @@ func (t *FileReadTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *FileReadTool) IsReadOnly(_ json.RawMessage) bool { return true }
+func (t *FileReadTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *FileReadTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 func (t *FileReadTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil

@@ -171,8 +171,20 @@ func (fs *FactStore) AddWithGate(fact *MemoryFact) GateDecision {
 	}
 }
 
-// sharesTopic 两事实是否共享至少一个主题 (与 DetectContradictions 的同主题分桶一致)
+// sharesTopic 两事实是否"够得着彼此" —— 同主题, 或任一方压根没声明主题。
+//
+// **两侧都有主题时才要求交集**: 主题在这里的作用只是一层廉价的预筛, 真正的判据是
+// isContradiction 的标记词。而 Ingestor 自动摄入传的 topics 一直是 nil —— 按
+// "无交集即跳过" 判, 自动摄入产生的每一条事实都永远撞不上任何矛盾, 守门等于没接线
+// (这条路走到底, AddWithGate 会恒返回 GateAppended, 看起来一切正常)。
+//
+// 漏判与错判在这里并不对称: 漏判只是退回"两条都留着"的旧行为, 而**误判会归档掉
+// 一条真实记忆**。所以预筛放宽是对的 —— 放过去的候选仍要过 isContradiction 那道
+// 强判据, 放宽的只是"值不值得判"。
 func sharesTopic(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return true
+	}
 	for _, ta := range a {
 		for _, tb := range b {
 			if ta == tb {

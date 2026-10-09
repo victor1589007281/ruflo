@@ -264,3 +264,52 @@ func TestCompactingNilSafe(t *testing.T) {
 		t.Errorf("nil Compactor 计数应为 0, got %d/%d", co, eq)
 	}
 }
+
+// TestEstimateTokensCountsThinkingAndToolInput 锁定 token 估算口径: 参与出站
+// 序列化的字段都必须计入。
+//
+// 这两类块在长会话里是体量大头, 却曾被 estimateTokens 漏掉:
+//   - thinking 块 (扩展思考): 每个可达成千 token, 且随历史逐轮累积;
+//   - tool_use 的 Input (工具入参 JSON): Write/Edit 类工具单次可达上万字符。
+//
+// 漏算的后果不是"估算略偏", 而是**压缩触发点被系统性推迟** —— 真实上下文已
+// 逼近/越过窗口, 估算值仍显示安全, 直到上游返回 prompt_too_long 才被动补救。
+// 此处以精确断言钉死口径, 防回归。
+func TestEstimateTokensCountsThinkingAndToolInput(t *testing.T) {
+	const n = 4
+	mk := func(v int) string { return strings.Repeat("x", v) }
+
+	msgs := make([]types.Message, 0, n)
+	for i := 0; i < n; i++ {
+		msgs = append(msgs, types.Message{
+			Type: types.MessageTypeAssistant,
+			UUID: fmt.Sprintf("a-%d", i),
+			Content: []types.ContentBlock{
+				{Type: types.ContentBlockText, Text: mk(4000)},                                                  // 1000 tok
+				{Type: types.ContentBlockThinking, Thinking: mk(8000)},                                          // 2000 tok (曾漏)
+				{Type: types.ContentBlockToolUse, Name: "Write", Input: json.RawMessage(`"` + mk(12000) + `"`)}, // 3000+ tok (曾漏)
+			},
+		})
+	}
+
+	got := estimateTokens(msgs)
+
+	// 只算 Text/Content 时 n 条共 4000*n/4 = 4000 —— 即修复前的错误值。
+	legacyOnly := 4000 * n / 4
+	if got == legacyOnly {
+		t.Fatalf("thinking/tool_input 未被计入: got=%d 恰等于只算 Text/Content 的 %d", got, legacyOnly)
+	}
+
+	// 下界: Text(4000) + Thinking(8000) 的字符量, 按 chars/4。
+	// Input 因 JSON 引号包裹会额外多 2 字节, 故仅作下界校验。
+	minWant := (4000 + 8000) * n / 4
+	if got < minWant {
+		t.Errorf("估算偏低: got=%d, 至少应为 %d (Text+Thinking, 不含 Input)", got, minWant)
+	}
+
+	// 上界: 三类字段全计入后的字符量。
+	maxWant := (4000 + 8000 + 12000 + 2) * n / 4
+	if got > maxWant {
+		t.Errorf("估算偏高: got=%d, 至多为 %d", got, maxWant)
+	}
+}

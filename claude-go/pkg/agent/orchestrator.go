@@ -41,6 +41,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // Bottleneck micro-test 识别的瓶颈 (参考 GLM 5.1 benchmark-driven 优化)。
@@ -4461,6 +4462,18 @@ func (o *Orchestrator) cleanupResidualTasks() {
 	if residualCount > 0 {
 		o.notify(o.chatID, fmt.Sprintf("⚠️ 清理 %d 个残留任务 (已标记 %d 个为 failed)", residualCount, len(residualIDs)))
 	}
+
+	// 3. 收尾对账。上面两步只处理**本次编排看得见**的节点 (o.nodes 里有的那些);
+	//    台账里还躺着历史遗留的 blocked —— 它们的上游早已 failed, 却没有任何事件
+	//    会再来解锁它们。实测台账 1246 条 blocked 里有 245 条属于这一类。
+	//
+	//    TTL 传 (0,0): 收尾时只想**解锁**被上游失败卡住的条目, 不想给刚提交、
+	//    只是还没轮到执行的 pending 判死。
+	if o.dag != nil {
+		if swept := o.dag.SweepStaleTasks(0, 0); swept > 0 {
+			o.notify(o.chatID, fmt.Sprintf("🧹 收尾对账: %d 条卡死任务已解锁", swept))
+		}
+	}
 }
 
 func (o *Orchestrator) roundBudgetFor(node *TaskNode, objective string) int {
@@ -7612,9 +7625,7 @@ func summarizeGoPackageAPI(root string, maxChars int) string {
 		return ""
 	}
 	out := strings.Join(lines, "\n")
-	if maxChars > 0 && len(out) > maxChars {
-		out = out[:maxChars] + "\n...(API summary truncated)"
-	}
+	out = textutil.Truncate(out, maxChars, "\n...(API summary truncated)")
 	return out + "\n"
 }
 

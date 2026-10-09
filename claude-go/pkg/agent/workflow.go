@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"log"
@@ -25,10 +26,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
+	"github.com/anthropic/claude-go/pkg/graph"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/observability"
 	"github.com/anthropic/claude-go/pkg/sandbox"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/trace"
 )
 
@@ -185,6 +189,131 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"manager-lab-simulation-v2":    managerLabSimulationV2Workflow,
 }
 
+// BuiltinWorkflowNames 列出全部内置工作流名 (排序)。
+//
+// 单独提出来是给自检用的: 自检要遍历的正是"内置"这一档, 而**内置的名字只能从
+// 这张表里问** —— 从 ListWorkflows() 反推 (减去 custom) 会把"某个内置构造器返回
+// 了 nil"这种情形悄悄漏掉, 而那种情形恰好是自检最该报的。
+func BuiltinWorkflowNames() []string {
+	out := make([]string, 0, len(workflowRegistry))
+	for n := range workflowRegistry {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WorkflowDefFromBuiltin 取一份内置工作流的**全新副本** (不存在返回 nil)。
+func WorkflowDefFromBuiltin(name string) *WorkflowDef {
+	f, ok := workflowRegistry[name]
+	if !ok {
+		return nil
+	}
+	return f()
+}
+
+// BuiltinWorkflowIssue 一条内置工作流的自检结果。
+type BuiltinWorkflowIssue struct {
+	Name     string
+	Hard     string   // 硬错 (空 = 无)
+	Warnings []string // 降级告警
+	// Stages 本次**真正检查过**的 stage 数。
+	//
+	// 有它的理由: 一部分内置 (graph-extract-swarm / review-panel / plot-predict /
+	// plot-simulate) 的 stage 活在各自的图模板里, WorkflowDef.Stages 本来就是空的 ——
+	// 它们一个 stage 都查不到。若只报"无硬错无告警", 那种"0 条问题"与"0 个被检查
+	// 对象"在输出上完全同形 ([[empty-hard-gate-set-is-vacuous-truth]])。消费方据此
+	// 能如实报出"共 N 条, 其中 M 条不在此处定义, 无从检查"。
+	Stages int
+}
+
+// AuditBuiltinWorkflows 让内置工作流走**内置适用的那条校验路径**并回报 (21.8.12 W4)。
+//
+// ---------------------------------------------------------------------------
+// 为什么内置需要这一条
+// ---------------------------------------------------------------------------
+//
+// 内置是唯一零校验的路径: 动态工作流在注册/装载时必过 Validate, 而内置定义是
+// 直接写进 workflowRegistry 的 Go 字面量 —— 它们从来没有任何一步问过"这个 stage
+// 的 agent 在角色表里吗"。
+//
+// 而它们恰恰是问题最集中的一批: 内置定义里 stage 的 Agent 写的是角色名, 这张表
+// 与角色注册表是**两份独立的字面量**, 谁改了一边另一边不会有任何提示。改名 D2
+// (Role → Agent) 之所以要改 188 处字面量, 根源就在这里。
+//
+// 内置**不能**因为校验不过就拒绝装载 (那是几十条里的一条坏了, 其余不该受影响,
+// 而且内置定义编译期就固定了, 拒绝装载没有可修的动作)。所以这里只回报, 不阻断:
+// 由调用方决定打到日志里还是 doctor 的检查项里。
+//
+// ★ 不缓存结果: 角色注册表可以随会话变 (/cwd 会重建), 缓存的审计结果会与"现在
+// 这张表"脱节 —— 而脱节的审计报告比没有更糟, 它是一份看起来确定的错误答案。
+//
+// ---------------------------------------------------------------------------
+// ★ 为什么调 ValidateStagesOnly 而不是 ValidateAll
+// ---------------------------------------------------------------------------
+//
+// ValidateAll 有三道闸门**只对本进程执行的定义成立**, 拿它们卡内置会造出固定的误报:
+//
+//   - `mode ∈ dynamicModes`: 那张表的定义就是"除有伴生硬编码执行器的模式之外"
+//     (见其注释)。而内置里恰好有 app_composite / creative_media / game_composite /
+//     novel_writing / swarm_novel / trading_debate 这些**有**伴生执行器的模式 ——
+//     它们被 dynamicModes 拒是必然的, 不是缺陷。6 条。
+//   - `至少一个 stage`: graph-extract-swarm / review-panel / plot-predict /
+//     plot-simulate 的 stage 活在各自的图模板里 (workflow_ensemble.go 的
+//     ensembleExtractKind 等), WorkflowDef.Stages 本来就是空的。4 条。
+//   - `DependsOn 指向已声明的 stage`: novel-v3 的 outline-design 依赖
+//     best-narrative / second-narrative / evaluation —— 那是它自己的 Phase B
+//     (swarm_intel 模拟) 注入的**数据键**, 不是它声明的阶段。1 条。
+//
+// 合计 11 条固定误报 (接近内置总数的四成), 而且每次启动都打印。一批永远不变、又永远不修的
+// ERROR 只会训练人跳过这一整行输出 —— 那正是 [[steady-error-is-a-filtered-error]]
+// 记的失效形态: 真的有一条坏掉时没人看得见。
+//
+// 所以只跑内置真正适用的那一档 (阶段名 + agent 解析 —— 后者才是内置唯一没人查过的
+// 东西)。检查不到的 stage 数如实进 Stages 字段, 而不是让"没有告警"冒充"全都查过了"。
+func AuditBuiltinWorkflows(roles *RoleRegistry) []BuiltinWorkflowIssue {
+	names := BuiltinWorkflowNames()
+	out := make([]BuiltinWorkflowIssue, 0, len(names))
+	for _, n := range names {
+		def := WorkflowDefFromBuiltin(n)
+		if def == nil {
+			// 构造器返回 nil 而键还在表里: 这条工作流在 GetWorkflow 上是**不可达**的,
+			// 与"没注册"同形 —— 而它占着一个名字, 于是 ListWorkflows 里也不会出现。
+			out = append(out, BuiltinWorkflowIssue{Name: n, Hard: "构造函数返回 nil (该工作流不可达)"})
+			continue
+		}
+		warns, err := def.ValidateStagesOnly(roles)
+		issue := BuiltinWorkflowIssue{Name: n, Warnings: warns, Stages: len(def.Stages)}
+		if err != nil {
+			issue.Hard = err.Error()
+		}
+		out = append(out, issue)
+	}
+	return out
+}
+
+// BuiltinAuditSummary 把自检结果压成几个数 (供启动日志与 doctor 的一行汇总)。
+//
+// 存在的理由与 BuiltinWorkflowIssue.Stages 同源: 汇总必须同时报出"几条有问题"与
+// "几条的 stage 不在此处定义所以无从检查"。只报前者时, 一个全绿的汇总既可能是
+// "全都查过且都对", 也可能是"一大半根本没被查" —— 后者会让人对这份自检建立
+// 错误的信心, 而它的全部价值就是"内置与角色表有没有脱节"这个判断。
+func BuiltinAuditSummary(issues []BuiltinWorkflowIssue) (total, hard, degraded, unchecked int) {
+	for _, is := range issues {
+		total++
+		if is.Hard != "" {
+			hard++
+		}
+		if len(is.Warnings) > 0 {
+			degraded++
+		}
+		if is.Stages == 0 {
+			unchecked++
+		}
+	}
+	return
+}
+
 // GetWorkflow 获取工作流: 先查内置, 再查运行时注册的动态工作流. 都没有返回 nil.
 func GetWorkflow(name string) *WorkflowDef {
 	if factory, ok := workflowRegistry[name]; ok {
@@ -263,10 +392,7 @@ func looksLikeCodeArtifact(s string) bool {
 // 普通文本走关键行摘要(小上限, 防上下文膨胀)。
 func summarizeDependency(output string) string {
 	if looksLikeCodeArtifact(output) {
-		if len(output) > maxCodeDepOutputLen {
-			return output[:maxCodeDepOutputLen] + "\n...(truncated)"
-		}
-		return output
+		return textutil.Truncate(output, maxCodeDepOutputLen, "\n...(truncated)")
 	}
 	return SummarizeOldOutput(output, maxDepOutputLen)
 }
@@ -313,14 +439,206 @@ type WorkflowDef struct {
 	ProducesCode bool   `json:"producesCode,omitempty"` // 是否跑编译/测试门禁
 	QualityGate  string `json:"qualityGate,omitempty"`  // ""|"content"|"none": 内容质量门禁策略
 	Custom       bool   `json:"custom,omitempty"`       // 运行时注册的动态工作流标记
+
+	// Revision 乐观并发版本号 (21.8.12 P3)。每次**改写**一个已注册的动态工作流 +1。
+	//
+	// 为什么必须有它: 在本次改造之前, 同名 re-POST 走的是 RegisterWorkflow, 它 Lock 之后
+	// 直接 `customWFs[name] = &cp` —— **后到者静默覆盖先到者, 双方都不知情**。对一个
+	// 工作流定义而言, 这意味着"改写"是不可撤销的: 被覆盖掉的那一版再也拿不回来。
+	// 而进化引擎 (learners.Proposal 的 Parent 谱系 + evo_promote/rollback) 的前提正是
+	// "旧版本还在, 能回退"。没有版本守卫, 那条回退链在资产这一层是断的。
+	//
+	// 语义与 pkg/agent.TaskRecord.Revision 逐条一致 (外改者必须携带读到的值, 不匹配即拒),
+	// 不新造版本机制 —— 两处语义不一致会让"我按任务那套传了怎么不对"变成一个要分别记住的问题。
+	//
+	// 0 表示"这份文件写在版本守卫之前"。装载时归一到 1 (见 normalizeRevision),
+	// 于是 GET 出去的值永远 ≥1, 客户端拿到的就是可回传的期望值。
+	Revision int64 `json:"revision,omitempty"`
+
+	// Graph 本工作流声明的**工作流级**图能力 (21.8.12 P5 / X3)。
+	//
+	// ---------------------------------------------------------------------------
+	// 它补的是 X3 那个缺口: "不用改 env 重启"的那个入口
+	// ---------------------------------------------------------------------------
+	//
+	// 改造前, 图覆盖表只有两个投放面, 而且两个都不适合工作流定义自己用:
+	//   - CLAUDE_GO_GRAPH_OVERRIDES=<file.json> —— 要改 env、要重启, 且**全局**一份文件,
+	//     一个工作流的声明住在所有工作流共用的文件里;
+	//   - RegisterGraphOverride —— 全仓**零生产调用方**。graph_adapter.go 的文件头注释
+	//     一直写着它会由"内置或动态工作流注册时一并声明", 而实际上没有任何一处调它:
+	//     那是本仓反复出现的"注释里说接上了、代码里没有"的又一例。
+	//
+	// 于是"给一个自定义工作流派 loop-group / 定图级并发"这件事, 在落盘 JSON 里
+	// **根本没有写法** —— 能力齐备 (foldStageGroups 全套在)、也有注入面, 缺的是
+	// "随定义走"这一条。这个字段就是那条。
+	//
+	// 为什么这里只声明**工作流级**的四个, 阶段级的九个不在这里: 它们已经搬进 StageDef
+	// 了 (P4/X1), 同一个语义只能有一条送达路径。详见 WorkflowGraphPolicy 的注释。
+	//
+	// 为空 (nil) 时行为与改造前**逐字节一致**: 不注册覆盖表、不遮蔽 env、不产生任何
+	// 额外告警。这一点是硬要求 —— 已落盘的 40 个工作流一个都没有这个字段。
+	Graph *WorkflowGraphPolicy `json:"graph,omitempty"`
 }
 
 type StageDef struct {
-	Name      string   `json:"name"`                // 阶段名称
-	Role      string   `json:"role"`                // agent 角色
+	Name string `json:"name"` // 阶段名称
+
+	// Agent 本阶段由**哪个 agent 资产**执行 (21.8.12 P4 / D2: 取代原来的 Role)。
+	//
+	// ---------------------------------------------------------------------------
+	// 为什么是改名而不是加一个别名
+	// ---------------------------------------------------------------------------
+	//
+	// 目标形态里 role 不是资产, agent 才是: role 是"提示词槽位", agent 是"可寻址、
+	// 可单独运行、可被编排的实体"。两名字并存会让这两层永远分不清 —— 而本仓正是
+	// 因为它们分不清才出现了"工作流做全 / role 半通 / agent 没通电"的三块对照。
+	//
+	// 影响面是整个 28 条内置工作流的词表 (188 处字面量, 跨 40 个文件)。风险最高,
+	// 但**改错了编译不过**; 真正不可用编译器兜住的只有一处 —— 落盘的 JSON, 见
+	// UnmarshalJSON。
+	Agent string `json:"agent"`
+
 	Prompt    string   `json:"prompt,omitempty"`    // 系统提示词模板 (支持 {objective}, {prev_result}, {user_feedback} 占位符)
 	DependsOn []string `json:"dependsOn,omitempty"` // 依赖的前置阶段
 	Parallel  bool     `json:"parallel,omitempty"`  // 是否可与同级并行
+
+	// Model 本阶段的模型覆盖 (空=按 plan/agent 层级解析, 与改造前一致)。
+	//
+	// 消费方: WorkflowExecutor 经 planCfgResolver 解析该阶段的连接参数时优先读它
+	// (见 stageModelOverride)。声明了它, "这个阶段用便宜模型、那个阶段用强模型"
+	// 才第一次能在工作流定义里写出来 —— 改造前只能在进程级配置里按角色名配。
+	Model string `json:"model,omitempty"`
+
+	// Hooks 本阶段额外挂的 hook 声明 (格式与资产 hooks: 段**逐字节一致**:
+	// <event>:<type>:<target>[:<if>]; 解析共用 hooks.ParseAssetHooks 那一份实现)。
+	//
+	// 消费方: 该阶段 agent 的 hook 运行器在装配时把这批 hook 与全局配置的合并
+	// (见 stageExtraHooks)。合并而非替换 —— 全局 hook 是操作员的治理面, 一个阶段
+	// 不该能把它关掉 (那会是一条"声明即越权"的路)。
+	Hooks []string `json:"hooks,omitempty"`
+
+	// Skills 本阶段额外声明的技能名 (须已在技能注册表里; 未注册的会被点名报告,
+	// 不静默忽略)。消费方: 装配该阶段 agent 时并入注入面 (见 stageExtraSkills)。
+	Skills []string `json:"skills,omitempty"`
+
+	// Tools 本阶段的**显式**工具声明 (21.8.12 P3 / W5)。nil = 没写这一栏。
+	//
+	// 加它的理由是"能力从哪来"必须可读: 改造前一个 stage 拿到什么工具, 由宿主按
+	// **角色名的子串**猜 (pkg/feishu/session.go 的 profileForTeamRole), 于是
+	// `world-builder` 因为名字里含 "build" 被判成 coding 档、拿到 Shell。
+	// 那份猜测是 6 个下游平台的现行行为, 不能一刀切删掉 (删 = 替生产改行为),
+	// 所以它保留为 fallback; 而**只要这里声明了, 猜测就不再被问**。
+	//
+	// 指针而不是值: nil (没写) 与 &StageTools{} (写了但三项全空) 在 StageTools.Declares
+	// 下都是"未声明"; 真正需要区分的是 Allow 那一栏的 nil 与 &[] —— 见 StageTools 的注释。
+	Tools *StageTools `json:"tools,omitempty"`
+
+	// ---------------------------------------------------------------------------
+	// 图能力声明 (21.8.12 P4 / X1 的 9 字段)
+	// ---------------------------------------------------------------------------
+	//
+	// 这九个字段此前**只能**经 StageGraphOverride 表达, 而覆盖表的唯一生产入口是
+	// 环境变量 CLAUDE_GO_GRAPH_OVERRIDES (graph_adapter.go:341) —— 能力早已接好
+	// (LookupGraphOverride 在生产路径被调用), 但"改一次要动 env + 重启"让它不是
+	// 配置化, 是运维手工注入。自定义工作流的 JSON 因此一个图能力都表达不了。
+	//
+	// 名字与 StageGraphOverride 的 json 名**逐字一致** —— 这是 stageDeclaredOverride
+	// 能"只搬字段、不改直译器"的前提 (那份注释论证过为什么其余代码一行都不用改)。
+	//
+	// ★ 优先级: **覆盖表 > 这里声明的**。覆盖表是运维的紧急制动闸, 让它被工作流
+	// 定义盖过去, 会得到"改了 env 不生效"这种没有读数的故障。合并规则在直译器里,
+	// 本次一行未动。
+
+	// Kind 强制节点形态 ""|"agent"|"gate"|"map"|"reduce" (见 StageGraphOverride.Kind)。
+	Kind string `json:"kind,omitempty"`
+	// Condition 本阶段全部入边的条件 (语法见 pkg/graph/condition.go)。
+	Condition string `json:"condition,omitempty"`
+	// EdgeConditions 精确到上游阶段名的入边条件, 优先于 Condition。
+	EdgeConditions map[string]string `json:"edgeConditions,omitempty"`
+	// Retry 节点级重试策略。
+	Retry *graph.RetryPolicy `json:"retry,omitempty"`
+	// TimeoutSec 节点总预算 (0=按 agent 推导, 见 graphNodeBudgetSec)。
+	TimeoutSec int `json:"timeoutSec,omitempty"`
+	// Loop 节点级循环 (max_iterations 必填 >0)。
+	Loop *graph.LoopPolicy `json:"loop,omitempty"`
+	// MaxTurns 本节点模型最大轮数 (0=不覆盖)。
+	MaxTurns int `json:"maxTurns,omitempty"`
+	// Deterministic 本节点为纯代码判定 (gate 节点走 runGate 的确定性分支, 零 LLM)。
+	Deterministic bool `json:"deterministic,omitempty"`
+	// Placement 本阶段的放置约束 (design/01 §4.9 逐节点放置)。
+	Placement *graph.PlacementSpec `json:"placement,omitempty"`
+
+	// AllowUnregisteredRole 显式承认"这个Agent 不在注册表里, 就走内联 prompt"
+	// (21.8.12 W3)。
+	//
+	// ---------------------------------------------------------------------------
+	// 为什么需要它: 降级本身合法, 但"降级了"必须看得见
+	// ---------------------------------------------------------------------------
+	//
+	// 校验里有一条由来已久的放宽: Agent 未注册但写了内联 prompt 时**放行**。它不是
+	// 权宜之计 —— 落盘的 40 条工作流里绝大多数用的都是宿主平台自己的角色名
+	// (storyloom-agent / qa-case-designer ...), 这些名字永远不会进 claude-go 的角色表,
+	// 而它们每一条都自带完整 prompt, 跑起来完全正确。所以这条放宽必须保留。
+	//
+	// 问题是它**同时也盖住了真正的错**: 把 `coder` 打成 `codr`、或者写了一个本该
+	// 注册却忘了注册的角色名, 症状与上面那 40 条**完全一样** —— 都是内联 prompt
+	// 生效。而"内联 prompt 生效"在看板上没有任何形态 (它就是一个正常的 stage)。
+	// 一个通过了校验的工作流, 运行时静默地不按它校验时的样子跑。
+	//
+	// 于是: 默认**告警**(点名 stage 与角色名, 见 WorkflowDef.ValidateAll), 而这一栏
+	// 置 true 表示"我知道它不在表里, 这是有意的" —— 告警消失。
+	//
+	// ★ 为什么不改成硬性要求这一栏 (即"未注册就必须置 true"): 那会让 40 条已落盘的
+	// 工作流在启动装载时全部失败被**丢掉** —— 用一次部署事故换一条告警, 方向反了。
+	// 告警默认开、开口显式关, 才是"保留降级能力但让它可见"。
+	//
+	// 消费方: WorkflowDef.ValidateAll (唯一的判定处)。它**不参与运行**: 声明为 true
+	// 只影响校验输出, 不改执行路径上一个字节。
+	AllowUnregisteredRole bool `json:"allowUnregisteredRole,omitempty"`
+}
+
+// legacyStageRole 是 StageDef 改造前用的 JSON 键 (21.8.12 P4 / D2 的迁移动作)。
+//
+// ---------------------------------------------------------------------------
+// 为什么必须有它: 这是 D2 里唯一编译器兜不住的地方
+// ---------------------------------------------------------------------------
+//
+// 其余连带改动全在 Go 源码里, 改错了编译不过, 改完才算数。而落盘的工作流 JSON 是
+// **运行时数据**: 改名之后, 37 条已注册工作流 (<state>/workflows/*.json) 里的
+// "role" 键会被 encoding/json **静默忽略**, Agent 字段为空 ⇒ 走内联 prompt 降级。
+//
+// 这与 21.7.5-1「截断状态被读成新任务」是同一类: 读不出来的东西与从没写过的东西,
+// 在下游是同一个分支。所以不能不做, 也不能只写一份文档说"记得迁移"。
+const legacyStageRole = "role"
+
+// UnmarshalJSON 读 StageDef, 兼容改造前落盘的 "role" 键。
+//
+// 兼容是**单向**的 (读旧写新): 落盘时只写 "agent"。双向会让新文件带着一个永远为
+// 空的 legacy 键, 而"文件里有两个 agent 名字且只有一个生效"是下一个人一定会踩的坑。
+//
+// 两个键**同时**出现时以 "agent" 为准, legacy 只作回退 —— 迁移期可能存在手工改过
+// 一半的文件, 让新键赢是唯一能预测的规则。
+func (s *StageDef) UnmarshalJSON(data []byte) error {
+	// 别名类型: 去掉本方法, 否则 Unmarshal 会递归调回自己。
+	type stageAlias StageDef
+	var a stageAlias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*s = StageDef(a)
+	if strings.TrimSpace(s.Agent) != "" {
+		return nil
+	}
+	// legacy 键: 单独解一次 map (不能加进 alias —— 那样新文件也会带 legacy 字段,
+	// 与"单向兼容"的取舍矛盾)。
+	var legacy struct {
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	s.Agent = strings.TrimSpace(legacy.Role)
+	return nil
 }
 
 type WorkflowExecutor struct {
@@ -513,11 +831,11 @@ func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults ma
 		}
 		prevResults[stage.Name] = cp.Output
 		// 角色别名也注入 (design 阶段的 key 可能是 role name)
-		if stage.Role != "" {
-			prevResults[stage.Role] = cp.Output
+		if stage.Agent != "" {
+			prevResults[stage.Agent] = cp.Output
 		}
 		*allResults = append(*allResults, StageResult{
-			Name: stage.Name, Role: stage.Role, Status: TaskCompleted,
+			Name: stage.Name, Role: stage.Agent, Status: TaskCompleted,
 			Output: cp.Output, StartedAt: cp.SavedAt,
 		})
 		restored++
@@ -641,7 +959,7 @@ func (we *WorkflowExecutor) ExecuteSingleStage(ctx context.Context, stage StageD
 }
 
 func buildLocalReferenceContextForStage(stage StageDef, objective string) string {
-	role := strings.ToLower(strings.TrimSpace(stage.Role))
+	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
 	if role != "researcher" && role != "architect" && name != "research" && name != "design" {
 		return ""
@@ -759,11 +1077,9 @@ func readReferenceFileExcerpt(path string, maxChars int) string {
 	if err != nil || len(data) == 0 {
 		return ""
 	}
-	text := string(data)
-	if len(text) > maxChars {
-		text = text[:maxChars] + "\n[truncated]\n"
-	}
-	return text
+	// 按字符数截断 (不是字节): 这里读的是参考文档, 中英混排是常态, 按字节切
+	// 会把中文劈成半个非法 UTF-8 序列。
+	return textutil.Truncate(string(data), maxChars, "\n[truncated]\n")
 }
 
 // stageFeedbackScore 决定一个阶段的学习反馈分 (design/03 §4.3a 升级点3):
@@ -787,6 +1103,27 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	// trace 四元组 NodeID = stage 名 (design/03 §4.1 E0): 本阶段内所有 LLM 调用
 	// 的 llm.jsonl 记录都可按 (RunID, NodeID) 聚合回本 stage。
 	ctx = trace.With(ctx, trace.IDs{NodeID: stage.Name})
+
+	// 阶段声明的工具面下发 (21.8.12 P3 / W5)。
+	//
+	// 放在 executeStage 而不是各个执行器里, 是因为**四条路径全过这里**:
+	// pipeline / fanout / adversarial 直接调, graph 经 stageNodeRunner →
+	// ExecuteSingleStage 也调。接一次 = 四条都通。
+	// 只接 pipeline 一处的后果本仓已经见过一次: 信箱接线只接了 workflow.go,
+	// 图路径上的 agent 就永远收不到信 (21.8.9 D6-3 缺口 2)。
+	//
+	// 这里只**下发声明**, 不在这里决定档位 —— 决策点是宿主的 CreateAgentRunner,
+	// 因为只有它同时看得到图覆盖表 (NodeExecHints) 与本声明, 才知道该按什么优先级来。
+	ctx = WithStageTools(ctx, stage.Tools)
+	// 同一个注入点的另外三项 (21.8.12 P4 / X1): Model / Hooks / Skills。
+	// 与上面 StageTools 是同一条理由 —— 四条路径全过这里, 接一次四条都通。
+	//
+	// 图路径的这三项要**先在直译器里搬进 AgentSpec、再由 stageNodeRunner 搬回
+	// StageDef** (见 graph_adapter.go 的两处 stageDeclFromAgentSpec 邻居), 否则
+	// 它们只对 pipeline/fanout/adversarial 生效, 对 graph 静默失效 —— 一份声明在
+	// 两条执行路径上给出两个结果, 而读数上分不出哪条路在跑。
+	ctx = WithStageDecl(ctx, StageDecl{Model: stage.Model, Hooks: stage.Hooks, Skills: stage.Skills})
+
 	traceCtx := observability.TraceFromContext(ctx)
 
 	observability.Emit(observability.Event{
@@ -800,13 +1137,13 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			"team_id":    team.Name,
 			"workflow":   team.Workflow,
 			"stage_name": stage.Name,
-			"agent_role": stage.Role,
+			"agent_role": stage.Agent,
 		},
 	})
 
 	ctx, endSpan := logging.WithSpan(ctx, "stage."+stage.Name)
 	defer endSpan()
-	logging.Event(ctx, "stage.start", "stage", stage.Name, "role", stage.Role, "team", team.Name)
+	logging.Event(ctx, "stage.start", "stage", stage.Name, "role", stage.Agent, "team", team.Name)
 
 	// watchdog 心跳: 标记有活动
 	if we.activityCallback != nil {
@@ -827,7 +1164,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 		// 是倒的。依赖块那一段仍用声明序(它列的正好就是 DependsOn), 两段的定序依据不同
 		// 是因为它们列的本来就是不同的集合。
 		completedStages := sortedStageNames(prevResults)
-		bbContext = team.Blackboard.HandoffContext(completedStages, stage.Role)
+		bbContext = team.Blackboard.HandoffContext(completedStages, stage.Agent)
 	}
 	// 1a1. shadow 比例灰度 (design/03 §4.6/§4.7): 必须在组装提示词**之前**问,
 	// 因为它换的就是 StageDef.Prompt 本身。无实验/无 RunID 时原样返回 stage,
@@ -840,6 +1177,33 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	}
 	if bbContext != "" {
 		prompt = bbContext + "\n\n---\n\n" + prompt
+	}
+
+	// 1a1b. 定向消息 (21.8.9-D6-3): 取**发给本阶段角色**的未读消息注入。
+	//
+	// 接在这里而不是各执行器里, 是因为**四条路径全过 executeStage** (pipeline / fanout /
+	// adversarial / graph 经 ExecuteSingleStage 都调到这里) —— 与上面 StageTools 的
+	// 下发点同一条理由。只接 pipeline 的话, 另外三条路径上的 agent 永远收不到信,
+	// 而那与"根本没人给他发消息"完全同形, 不报任何错。
+	//
+	// 收件人给**两个地址** (角色与阶段名): 团队列表给用户看的是 `- **<阶段名>** (<角色>)`,
+	// 两个名字都在眼前, 而 /team msg 的 <Agent> 参数没有任何一处说"必须是角色"。
+	// 只认一个的后果是发到另一个地址的消息静默丢弃 —— 用户看到"已发送", agent 什么都没有。
+	// 去重由 takeMailFor 做 (否则广播会被取到两次)。
+	//
+	// 位置在用户反馈**之前**、黑板上下文**之后**: 信箱是增量 (每人每信一次), 反馈是
+	// 本轮强约束 —— 后者离执行更近, 不与外部内容抢注意力。
+	if team != nil {
+		msgs, err := takeMailFor(team.mailStore(), team.Name, stage.Agent, stage.Name)
+		if err != nil {
+			// 不阻断本阶段 (信箱是增量通道, 不是前置条件), 但必须留痕:
+			// 静默失联看起来就是"没人给他发消息"。
+			logging.For("mailbox").Warn("取定向消息失败 (不阻断本阶段执行)",
+				"team", team.Name, "stage", stage.Name, "role", stage.Agent, "err", err)
+		}
+		if mailBlock := FormatMailboxForPrompt(msgs); mailBlock != "" {
+			prompt = mailBlock + "\n\n---\n\n" + prompt
+		}
 	}
 
 	// 1a2. 注入用户反馈 (RefineTeam: 运行后用户反馈, 本轮重做的所有阶段都必须针对性处理)。
@@ -860,7 +1224,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	// 1b. 注入进化经验 (RETRIEVE: 执行前检索相关经验)
 	var injectedExpIDs []string
 	if we.evolution != nil {
-		exps := we.evolution.RetrieveFor(stage.Role, objective, 3)
+		exps := we.evolution.RetrieveFor(stage.Agent, objective, 3)
 		if len(exps) > 0 {
 			prompt = FormatExperiencesForPrompt(exps) + "\n" + prompt
 			for _, e := range exps {
@@ -873,7 +1237,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	// 提前会漏掉后注入的块, 推后到执行之后则拿不到"失败的那次注入了什么" —— 而那正是
 	// uplift 归因最要看的一类。见 policy_decision.go。
 	we.writePolicyDecisionSpan(ctx, policyDecision{
-		Stage: stage.Name, Role: stage.Role, Team: team.Name,
+		Stage: stage.Name, Role: stage.Agent, Team: team.Name,
 		ExperienceIDs: injectedExpIDs,
 		Blackboard:    bbContext != "",
 		Reference:     referenceContext != "",
@@ -886,30 +1250,30 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	var v2TaskID string
 	if we.taskTracker != nil {
 		taskSubject := fmt.Sprintf("[%s] %s", team.Name, stage.Name)
-		id, err := we.taskTracker.AddTask(taskSubject, objective, stage.Role)
+		id, err := we.taskTracker.AddTask(taskSubject, objective, stage.Agent)
 		if err == nil {
 			v2TaskID = id
 			_ = we.taskTracker.SetTaskStatus(id, "in_progress")
 		}
 	}
 
-	we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 开始执行...", stage.Name, stage.Role))
+	we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 开始执行...", stage.Name, stage.Agent))
 
 	// 3. 执行 Agent (带智能重试)
 	sr := we.executeStageWithRetry(ctx, stage, prompt, objective, team, injectedExpIDs)
 	sr.Name = stage.Name
-	sr.Role = stage.Role
+	sr.Role = stage.Agent
 	sr.V2TaskID = v2TaskID
 
 	// 4. 将结果写入 Blackboard (bMAS 核心: Agent 执行后写回黑板)
 	if team.Blackboard != nil {
 		if sr.Status == TaskCompleted {
-			team.Blackboard.Write(stage.Name+"-result", sr.Output, stage.Role, "result")
+			team.Blackboard.Write(stage.Name+"-result", sr.Output, stage.Agent, "result")
 			team.Blackboard.Write(stage.Name+"-status", "completed", "system", "progress")
 			// 修复 handoff key 不匹配: 对抗轮次阶段 (如 implement-round3) 同时写入
 			// 基础名 (如 implement-result), 确保 HandoffContext 能正确查找。
 			if baseName := stripRoundSuffix(stage.Name); baseName != stage.Name {
-				team.Blackboard.Write(baseName+"-result", sr.Output, stage.Role, "result")
+				team.Blackboard.Write(baseName+"-result", sr.Output, stage.Agent, "result")
 			}
 		} else {
 			team.Blackboard.Write(stage.Name+"-status", "failed: "+sr.Error, "system", "progress")
@@ -931,7 +1295,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			RunID:     trace.From(ctx).RunID,
 			TeamName:  team.Name,
 			StageName: stage.Name,
-			Role:      stage.Role,
+			Role:      stage.Agent,
 			Objective: objective,
 			Input:     prompt,
 			Output:    sr.Output,
@@ -955,7 +1319,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 			// V2注入效果追踪。带 RunID (13.8.4): 注入配对 uplift 以 (节点, 目标签名)
 			// 分桶后, 同桶内"有注入 run"要按 RunID join 回 run 级事实 —— 没有 RunID
 			// 的注入记录无法成为配对的一臂。
-			we.evolution.RecordInjectionScoredRun(injectedExpIDs, stage.Name, team.Name, stage.Role,
+			we.evolution.RecordInjectionScoredRun(injectedExpIDs, stage.Name, team.Name, stage.Agent,
 				feedbackScore, traj.RunID)
 		} else {
 			// 无注入: 更新基线成功率 (用于 Uplift 计算)
@@ -977,7 +1341,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 				"team_id":      team.Name,
 				"workflow":     team.Workflow,
 				"stage_name":   stage.Name,
-				"agent_role":   stage.Role,
+				"agent_role":   stage.Agent,
 				"duration_sec": stageDur,
 				"success":      true,
 				"output_len":   len(sr.Output),
@@ -995,7 +1359,7 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 				"team_id":      team.Name,
 				"workflow":     team.Workflow,
 				"stage_name":   stage.Name,
-				"agent_role":   stage.Role,
+				"agent_role":   stage.Agent,
 				"duration_sec": stageDur,
 				"success":      false,
 				"error":        sr.Error,
@@ -1020,12 +1384,12 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 	}
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
-			return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled"}
+			return StageResult{Role: stage.Agent, Status: TaskFailed, Error: "cancelled"}
 		}
 
 		// 动态超时: 根据角色和尝试次数调整
 		// 限流时增加超时预算, 给 RateLimitGuard 足够的等待时间
-		timeout := we.computeStageTimeout(stage.Role, attempt)
+		timeout := we.computeStageTimeout(stage.Agent, attempt)
 		if rateLimitAttempt > 0 {
 			// 限流时增加 50% 超时预算, 让 API client 的 RateLimitGuard 有机会等待
 			timeout = time.Duration(float64(timeout) * 1.5)
@@ -1040,14 +1404,14 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 			attemptLabel = fmt.Sprintf("%d (限流第 %d 次)", attempt+1, rateLimitAttempt)
 		}
 		we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 第 %s 次尝试...",
-			stage.Name, stage.Role, attemptLabel))
+			stage.Name, stage.Agent, attemptLabel))
 
-		sr := we.runAgent(stageCtx, stage.Role, prompt, team)
+		sr := we.runAgent(withStage(stageCtx, stage.Name), stage.Agent, prompt, team)
 		stageCancel()
 
 		if sr.Status == TaskCompleted {
 			if validationErr := validateStageOutputForRetry(stage, objective, sr.Output); validationErr != "" {
-				lastErr = StageResult{Role: stage.Role, Status: TaskFailed, Error: validationErr, Output: sr.Output}
+				lastErr = StageResult{Role: stage.Agent, Status: TaskFailed, Error: validationErr, Output: sr.Output}
 				if fallback := deterministicStageValidationFallback(stage, objective, validationErr); fallback.Status == TaskCompleted && shouldUseStageValidationFallback(stage, objective, validationErr, attempt) {
 					we.notify(we.chatID, fmt.Sprintf("🧭 阶段 **%s** 输出越界, 使用确定性 fallback: %s", stage.Name, validationErr))
 					return fallback
@@ -1071,6 +1435,29 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 		}
 
 		lastErr = sr
+
+		// P0-1: 这里**故意没有** run 预算的分支。
+		//
+		// 看似该有 —— 预算闸门是事后记账, 每次重试都是真的再花一笔钱 —— 但下面那条
+		// isStageTransientError 已经把它接住了: RunBudgetError 的文案含
+		// "run token budget exhausted", 命中瞬态模式表里的 "retry", 于是 !transient
+		// 为假, 落进"永久错误, 不重试"分支直接返回。变异测试实测: 把这条显式分支
+		// 整块注释掉, 本包的预算判据一条不红 —— 它从未通电。
+		//
+		// 冗余不等于无害: 它插在 isStageTransientError 之前, 会把"预算失败不重试"
+		// 从一个可读的既有规则变成一条隐式依赖 (删了它也不报错, 于是没人知道它在)。
+		// 真正做分流的是外层 Coordinator.executeStageWithRetry 里的 cause 判据,
+		// 那条是通电的 (见 budget_retry_test.go 的对照臂)。
+		//
+		// 这个断言把隐式依赖变成显式的。危险的方向只有一个: 往瞬态模式表里**加**一条
+		// 能命中预算文案的词 (如 "budget" / "exhausted") —— 那一刻预算失败就变成了
+		// "瞬态错误", 内层环会开始反复重试。反之删掉 "retry" 是安全的 (它让预算错误
+		// 落进非瞬态分支, 正是想要的结果)。变异测试两个方向都跑过: 加 "budget" ⇒
+		// 立刻 panic; 删 "retry" ⇒ 不 panic 且行为不变。
+		if sr.cause != nil && isStageTransientError(sr.Error) &&
+			errors.Is(sr.cause, internal_hook.ErrRunBudgetExhausted) {
+			panic("run 预算耗尽被判成了瞬态错误 —— 内层重试环会把它当普通瞬态错误反复重试")
+		}
 
 		if isStageRetryableOutputError(sr.Error) {
 			if fallback := deterministicStageValidationFallback(stage, objective, sr.Error); fallback.Status == TaskCompleted && shouldUseStageValidationFallback(stage, objective, sr.Error, attempt) {
@@ -1103,7 +1490,7 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 					"❌ 阶段 **%s** 限流重试达硬上限 (%d 次), 交由上层处理: %s",
 					stage.Name, effRateLimitMax, sr.Error))
 				return StageResult{
-					Role:   stage.Role,
+					Role:   stage.Agent,
 					Status: TaskFailed,
 					Error:  fmt.Sprintf("限流重试达硬上限 (%d): %s", effRateLimitMax, sr.Error),
 				}
@@ -1124,7 +1511,7 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
-				return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled during retry"}
+				return StageResult{Role: stage.Agent, Status: TaskFailed, Error: "cancelled during retry"}
 			}
 			continue // 限流重试不计入普通 attempt 上限, 但受 effRateLimitMax 硬上限约束
 		}
@@ -1141,13 +1528,13 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
-			return StageResult{Role: stage.Role, Status: TaskFailed, Error: "cancelled during retry"}
+			return StageResult{Role: stage.Agent, Status: TaskFailed, Error: "cancelled during retry"}
 		}
 	}
 
 	// 非限流瞬态错误重试耗尽
 	return StageResult{
-		Role:   stage.Role,
+		Role:   stage.Agent,
 		Status: TaskFailed,
 		Error:  fmt.Sprintf("超过最大重试次数 (%d): %s", effMaxRetries, lastErr.Error),
 	}
@@ -1171,7 +1558,7 @@ func isStageRetryableOutputError(errStr string) bool {
 }
 
 func deterministicPlannerFallbackStageResult(stage StageDef, objective, reason string) StageResult {
-	role := strings.ToLower(strings.TrimSpace(stage.Role))
+	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
 	if role != "planner" && name != "plan" {
 		return StageResult{Status: TaskFailed}
@@ -1192,7 +1579,7 @@ func deterministicPlannerFallbackStageResult(stage StageDef, objective, reason s
 	}
 	return StageResult{
 		Name:   stage.Name,
-		Role:   stage.Role,
+		Role:   stage.Agent,
 		Status: TaskCompleted,
 		Output: out,
 	}
@@ -1202,7 +1589,7 @@ func deterministicStageValidationFallback(stage StageDef, objective, reason stri
 	if fallback := deterministicPlannerFallbackStageResult(stage, objective, reason); fallback.Status == TaskCompleted {
 		return fallback
 	}
-	role := strings.ToLower(strings.TrimSpace(stage.Role))
+	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
 	switch {
 	case role == "researcher" || name == "research":
@@ -1215,7 +1602,7 @@ func deterministicStageValidationFallback(stage StageDef, objective, reason stri
 }
 
 func shouldUseStageValidationFallback(stage StageDef, objective, reason string, attempt int) bool {
-	role := strings.ToLower(strings.TrimSpace(stage.Role))
+	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
 	if role == "researcher" || role == "architect" || name == "research" || name == "design" {
 		if objectiveRequiresDesignCompleteMode(objective) && attempt == 0 {
@@ -1250,7 +1637,7 @@ func deterministicResearchFallbackStageResult(stage StageDef, objective, reason 
 - 采用 design-complete execution: contract/base layer -> core engines -> query/adapters -> protocol/CLI -> global verification。
 - 每个 leaf 仍必须小于 2-4 分钟、只改 1-3 个文件、scoped build/test 通过; 但禁止用 V1 fallback 替代设计覆盖。
 `, objective, truncateResult(reason, 600))
-		return StageResult{Name: stage.Name, Role: stage.Role, Status: TaskCompleted, Output: out}
+		return StageResult{Name: stage.Name, Role: stage.Agent, Status: TaskCompleted, Output: out}
 	}
 	out := fmt.Sprintf(`## HEV 调研报告 (deterministic fallback)
 
@@ -1268,7 +1655,7 @@ func deterministicResearchFallbackStageResult(stage StageDef, objective, reason 
 - 采用本地库/CLI 优先的 V1 vertical slice: manifest、入口、核心 API/types、最小本地 store、最小查询/search、测试与本地验证。
 - 所有 leaf 必须小于 2-4 分钟, scoped build/test 通过后再进入下游。
 `, objective, truncateResult(reason, 600))
-	return StageResult{Name: stage.Name, Role: stage.Role, Status: TaskCompleted, Output: out}
+	return StageResult{Name: stage.Name, Role: stage.Agent, Status: TaskCompleted, Output: out}
 }
 
 func deterministicArchitectFallbackStageResult(stage StageDef, objective, reason string) StageResult {
@@ -1304,7 +1691,7 @@ func deterministicArchitectFallbackStageResult(stage StageDef, objective, reason
 
 fallback reason: %s
 `, objective, targetRoot, adapter.ID, truncateResult(reason, 600))
-		return StageResult{Name: stage.Name, Role: stage.Role, Status: TaskCompleted, Output: out}
+		return StageResult{Name: stage.Name, Role: stage.Agent, Status: TaskCompleted, Output: out}
 	}
 	out := fmt.Sprintf(`## 架构设计 (deterministic fallback)
 
@@ -1330,7 +1717,7 @@ fallback reason: %s
 
 fallback reason: %s
 `, objective, targetRoot, adapter.ID, truncateResult(reason, 600))
-	return StageResult{Name: stage.Name, Role: stage.Role, Status: TaskCompleted, Output: out}
+	return StageResult{Name: stage.Name, Role: stage.Agent, Status: TaskCompleted, Output: out}
 }
 
 func marshalRawTasksAsWBSJSON(tasks []rawTask) (string, error) {
@@ -1409,7 +1796,7 @@ func marshalRawTasksAsWBSJSON(tasks []rawTask) (string, error) {
 }
 
 func buildStageOutputRetryPrompt(base string, stage StageDef, reason, previousOutput string) string {
-	role := strings.ToLower(strings.TrimSpace(stage.Role))
+	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	var required string
 	switch role {
 	case "researcher":
@@ -1429,7 +1816,7 @@ func buildStageOutputRetryPrompt(base string, stage StageDef, reason, previousOu
 }
 
 func validateStageOutputForRetry(stage StageDef, objective, output string) string {
-	role := strings.ToLower(strings.TrimSpace(stage.Role))
+	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
 	if role == "planner" || name == "plan" {
 		if containsPseudoToolCall(output) {
@@ -1606,9 +1993,37 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	}
 	defer stageCancel()
 
-	// 模型层级解析: role > plan > 全局默认
+	// 模型层级解析: **阶段显式声明 > role > plan > 全局默认**。
+	//
+	// 阶段声明排在最前, 是因为它的粒度**比 role 更细** —— 同一个 role 可以在
+	// "写" 的阶段用强模型、"审" 的阶段用便宜模型, 而这正是 StageDef.Model 存在的
+	// 全部理由 (见其注释)。让它排在 role 之后等于永远不生效: 只要 plan.Roles 里
+	// 配了这个 role (生产配置里配了大量 role), Resolve 就必然给得出一个答案。
+	//
+	// ★ 必须在这里解析而不能提前塞进 ctx: 本行**覆写** ModelConfigKey, 任何在
+	// executeStage 里放进去的值都会被它整体冲掉 —— 这就是 graph_adapter.go 的
+	// executorForNode 为什么要包一层 factory 而不是直接写 ctx 的同一条理由。
 	if we.planCfgResolver != nil {
-		stageCtx = context.WithValue(stageCtx, ModelConfigKey{}, we.planCfgResolver.Resolve(team.Workflow, role))
+		resolved := we.planCfgResolver.Resolve(team.Workflow, role)
+		if decl := StageDeclFromContext(ctx); decl.Model != "" {
+			if mc := we.planCfgResolver.ResolveAlias(decl.Model); mc.ProviderName != "" {
+				// 别名解析出来的这一份**完整**取代 plan 解析的那一份: 别名一旦指向
+				// 另一个厂商, baseURL/apiKey/protocol 跟着换 —— 只换模型名会把请求
+				// 带着别人的模型名发到默认端点去 (与 session.go 里 spec.ModelAlias
+				// 的处置逐字同一条)。
+				resolved = mc
+				logging.Event(ctx, "stage.model_declared",
+					"stage", stageFrom(ctx), "alias", decl.Model, "model", mc.ProviderName)
+			} else {
+				// 解析不出来时**保留原配置并留痕**, 不静默按原模型跑 ——
+				// "声明的模型没生效"与"没声明"在读数上完全一样, 只有这条日志能把
+				// 它们分开 (与 resolveToolProfile 的 deprecation 痕迹同一口径)。
+				logging.Event(ctx, "stage.model_declared_unresolved",
+					"stage", stageFrom(ctx), "alias", decl.Model,
+					"reason", "别名解析不出 provider (可能未在 providers 段注册)")
+			}
+		}
+		stageCtx = context.WithValue(stageCtx, ModelConfigKey{}, resolved)
 	}
 	stageCtx = WithRunMetadata(stageCtx, RunMetadata{
 		Source:   "team_stage",
@@ -1616,6 +2031,8 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 		Workflow: team.Workflow,
 		Role:     role,
 		Team:     team.Name,
+		// Stage 让隔离运行的中间态按阶段分账 (H3-2, 见 withStage)
+		Stage: stageFrom(ctx),
 		// Cwd: 远程执行时要靠它声明工作区 (编译门禁跑在 <team.Cwd>/go.mod 上)。
 		Cwd: team.Cwd,
 	})
@@ -1624,6 +2041,18 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	if err != nil {
 		return StageResult{Role: role, Status: TaskFailed, Error: err.Error(), StartedAt: start, Duration: time.Since(start).String()}
 	}
+
+	// 运行中信箱投递 (21.8.12 P5 / D6-3 缺口 2 级 2)。
+	//
+	// 接在**这一处**而不是 executeStage: 只有这里拿得到 runner (也就是唯一可能实现
+	// MidRunMailInjector 的那个对象), 而 executeStage 拿到的是 runner 已经跑完之后的
+	// 返回串。四条路径 (pipeline/fanout/adversarial/graph) 全过 runAgent, 所以这一处
+	// 覆盖四条 —— 与阶段起点那个注入点 (executeStage 的 takeMailFor) 是同一条理由。
+	//
+	// stage 名从 ctx 回读 (withStage 只在 executeStage 标注), 因此不支持的路径
+	// (adversarial/novel 不带 stage) 收件人退化成 {role}, 而不是编一个名字出来。
+	stopRelay := startMidRunMailRelay(stageCtx, runner, team, role, stageFrom(ctx))
+	defer stopRelay()
 
 	timeout := remainingContextTimeout(stageCtx, stageTimeout)
 	if timeout <= 0 {
@@ -1649,7 +2078,9 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	team.persist()
 
 	if err != nil {
-		return StageResult{Role: role, Status: TaskFailed, Error: err.Error(), StartedAt: start, Duration: duration.Round(time.Second).String()}
+		// cause 保留原始 error (含 budget 哨兵), 供 executeStageWithRetry 判定
+		// "这个失败重试多少次都一样"。Error 字符串是给人看的, cause 是给控制流看的。
+		return StageResult{Role: role, Status: TaskFailed, Error: err.Error(), cause: err, StartedAt: start, Duration: duration.Round(time.Second).String()}
 	}
 
 	// 产出验证: 防止 Agent "角色扮演空转"（仅声明就绪但无实际产出）
@@ -1855,13 +2286,13 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 
 	// 代码类角色额外注入"先索引后精读"铁律
 	extra := antiLoopDirective
-	if roles != nil && isCodeAnalysisRole(roles.Get(stage.Role)) {
+	if roles != nil && isCodeAnalysisRole(roles.Get(stage.Agent)) {
 		extra += codeIntelDirective
 	}
 
 	// 优先从角色注册表获取 (包含专属 Skills)
 	if roles != nil {
-		if merged := roles.MergedPrompt(stage.Role, objective, prevOutput.String()); merged != "" {
+		if merged := roles.MergedPrompt(stage.Agent, objective, prevOutput.String()); merged != "" {
 			// 角色模板已承载任务目标 (SystemPrompt 含 {objective} 占位并已替换) → 保持原行为,
 			// 不重复注入, 避免 70+ 个正常角色出现任务双写。
 			if strings.TrimSpace(objective) == "" || strings.Contains(merged, objective) {

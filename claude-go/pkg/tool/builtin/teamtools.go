@@ -18,27 +18,25 @@ import (
 )
 
 const (
-	sendMessageToolName = "TeamMailbox"
-	teamCreateToolName  = "TeamCreate"
-	teamDeleteToolName  = "TeamDelete"
+	teamCreateToolName = "TeamCreate"
+	teamDeleteToolName = "TeamDelete"
 )
 
-// teamMessage 表示信箱中的一条消息。
-type teamMessage struct {
-	To      string `json:"to"`
-	Message string `json:"message"`
-	Summary string `json:"summary,omitempty"`
-	SentAt  string `json:"sentAt"`
-}
-
-// teamEntity 表示一个团队及其信箱。
+// teamEntity 表示一个团队。
+//
+// 曾经这里还有一份 Mailboxes map[string][]teamMessage (json:"-")，由 TeamMailbox
+// 工具写入。它在 2026-09-25 被删除，理由是**它是一份空承诺而不是一份冗余**:
+// 该工具已注册进工具池，模型真的会调，工具返回「已投递消息给 %q」，而那条消息
+// 落进一个**全仓没有任何读者**的 map —— 模型因此相信消息已送达，不再用别的方式
+// 传达。这比"未接线"更糟: 未接线只是没效果，这个是**主动误导**。
+//
+// 全仓的信箱收敛为 pkg/agent 的 PersistentMailbox 一份 (见 pkg/agent/mailbox.go)。
 type teamEntity struct {
-	Name        string                    `json:"name"`
-	Description string                    `json:"description,omitempty"`
-	Mailboxes   map[string][]teamMessage `json:"-"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
-// teamStore 共享的团队与信箱存储。
+// teamStore 共享的团队存储。
 type teamStore struct {
 	mu          sync.Mutex
 	teams       map[string]*teamEntity
@@ -54,82 +52,6 @@ func NewTeamStore() *teamStore {
 }
 
 // --- SendMessage ---
-
-type sendMessageInput struct {
-	To      string `json:"to"`
-	Message string `json:"message"`
-	Summary string `json:"summary,omitempty"`
-}
-
-// SendMessageTool 向指定接收方（代理人名称）投递一条消息到当前团队的信箱。
-type SendMessageTool struct {
-	store *teamStore
-}
-
-// NewSendMessageTool 构造 SendMessage 工具。
-func NewSendMessageTool(store *teamStore) *SendMessageTool {
-	return &SendMessageTool{store: store}
-}
-
-func (t *SendMessageTool) Name() string { return sendMessageToolName }
-
-func (t *SendMessageTool) Description() string {
-	return `[团队内部工具] 向当前团队内某 Agent 成员的信箱投递消息。仅用于 Agent 间通信，不能用于向用户发送消息或文件。`
-}
-
-func (t *SendMessageTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"to": {"type": "string", "description": "接收方（例如队友名称）。"},
-			"message": {"type": "string", "description": "消息正文。"},
-			"summary": {"type": "string", "description": "可选短摘要。"}
-		},
-		"required": ["to", "message"]
-	}`)
-}
-
-func (t *SendMessageTool) IsReadOnly(_ json.RawMessage) bool { return false }
-func (t *SendMessageTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
-
-func (t *SendMessageTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
-	if tctx != nil && tctx.PermissionMode == types.PermissionModePlan {
-		return &types.PermissionResult{Behavior: types.PermissionDeny, Reason: "计划模式：禁止发送团队消息"}
-	}
-	return nil
-}
-
-func (t *SendMessageTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
-	var in sendMessageInput
-	if err := json.Unmarshal(input, &in); err != nil {
-		return &tool.ToolResult{Content: fmt.Sprintf("输入解析错误: %v", err), IsError: true}, nil
-	}
-	if in.To == "" || in.Message == "" {
-		return &tool.ToolResult{Content: "to 与 message 不能为空", IsError: true}, nil
-	}
-
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
-	if t.store.currentTeam == "" {
-		return &tool.ToolResult{Content: "当前没有活动团队，请先调用 TeamCreate", IsError: true}, nil
-	}
-	ent, ok := t.store.teams[t.store.currentTeam]
-	if !ok {
-		return &tool.ToolResult{Content: "当前团队不存在，请先调用 TeamCreate", IsError: true}, nil
-	}
-	if ent.Mailboxes == nil {
-		ent.Mailboxes = make(map[string][]teamMessage)
-	}
-	msg := teamMessage{
-		To:      in.To,
-		Message: in.Message,
-		Summary: in.Summary,
-		SentAt:  time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	ent.Mailboxes[in.To] = append(ent.Mailboxes[in.To], msg)
-
-	return &tool.ToolResult{Content: fmt.Sprintf("已投递消息给 %q（团队 %q）", in.To, ent.Name)}, nil
-}
 
 // --- TeamCreate ---
 
@@ -165,7 +87,7 @@ func (t *TeamCreateTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TeamCreateTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *TeamCreateTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *TeamCreateTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 func (t *TeamCreateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
@@ -199,7 +121,6 @@ func (t *TeamCreateTool) Call(_ context.Context, input json.RawMessage, _ *tool.
 	ent := &teamEntity{
 		Name:        in.TeamName,
 		Description: in.Description,
-		Mailboxes:   make(map[string][]teamMessage),
 	}
 	t.store.teams[key] = ent
 	t.store.currentTeam = key
@@ -239,7 +160,7 @@ func (t *TeamDeleteTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TeamDeleteTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *TeamDeleteTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *TeamDeleteTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 func (t *TeamDeleteTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {

@@ -17,9 +17,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/bmatcuk/doublestar/v4"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
+	"github.com/bmatcuk/doublestar/v4"
 )
 
 const GlobToolName = "Glob"
@@ -54,7 +54,7 @@ func (t *GlobTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *GlobTool) IsReadOnly(_ json.RawMessage) bool { return true }
+func (t *GlobTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *GlobTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 func (t *GlobTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil

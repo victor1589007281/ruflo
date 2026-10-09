@@ -1,9 +1,6 @@
 package agent
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,16 +8,19 @@ import (
 )
 
 // 本文件覆盖 design/01 §4.11 通信机制抽象的两半:
-// 前半 = Mailbox (三个实现), 后半 = Board 接口 + 新增的 Watch。
+// 前半 = Mailbox (唯一实现 PersistentMailbox), 后半 = Board 接口 + 新增的 Watch。
+//
+// "内存邮箱"不再是一个独立的实现类型: 传 statestore.NewMemStore() 就是内存语义
+// (MemStore 同时提供 Log 与 KV)。原先的 MemMailbox 与它逐字节等价, 已删 (21.8.9-D6)。
 
 // ---------------------------------------------------------------------------
 // Mailbox
 // ---------------------------------------------------------------------------
 
-// TestMemMailboxTakeCursor 断言 Take 的"只投递一次"语义与广播处理:
+// TestMailboxTakeCursor 断言 Take 的"只投递一次"语义与广播处理:
 // 第一次 Take 拿到定向 + 广播消息, 第二次 Take 为空 (游标已推进), 新消息只拿到新的。
-func TestMemMailboxTakeCursor(t *testing.T) {
-	mb := NewMemMailbox()
+func TestMailboxTakeCursor(t *testing.T) {
+	mb := NewPersistentMailbox(statestore.NewMemStore(), "cursor-team")
 	must := func(err error) {
 		t.Helper()
 		if err != nil {
@@ -58,21 +58,19 @@ func TestMemMailboxTakeCursor(t *testing.T) {
 	if n := len(mb.Inbox("coder")); n != 3 {
 		t.Fatalf("Inbox 应返回全部 3 条 (定向2+广播1), got %d", n)
 	}
-	if mb.Len() != 4 {
-		t.Fatalf("总消息数应为 4, got %d", mb.Len())
-	}
 }
 
 // TestMailboxRejectsEmptyContent 断言空内容被拒 (空消息拼进 prompt 是纯噪声)。
 func TestMailboxRejectsEmptyContent(t *testing.T) {
-	if err := NewMemMailbox().Send(MailMessage{From: "a", To: "b", Content: "   "}); err == nil {
+	mb := NewPersistentMailbox(statestore.NewMemStore(), "reject-empty")
+	if err := mb.Send(MailMessage{From: "a", To: "b", Content: "   "}); err == nil {
 		t.Fatal("空内容应被拒绝")
 	}
 }
 
 // TestMailboxDefaultsFilled 断言默认字段补齐 (Type=message, Timestamp 非零)。
 func TestMailboxDefaultsFilled(t *testing.T) {
-	mb := NewMemMailbox()
+	mb := NewPersistentMailbox(statestore.NewMemStore(), "defaults")
 	if err := mb.Send(MailMessage{From: "a", To: "b", Content: "hi"}); err != nil {
 		t.Fatal(err)
 	}
@@ -122,65 +120,81 @@ func TestPersistentMailboxSurvivesRestart(t *testing.T) {
 	}
 }
 
-// TestTeamMailboxWritesTeamAndBoard 断言 ProductionTeam 适配器与 SendMailMessage 行为一致:
-// 消息进 team.Mailbox、同时进黑板 (agent 今天是经黑板看到消息的)、并落盘 team.json。
-func TestTeamMailboxWritesTeamAndBoard(t *testing.T) {
-	tmp := t.TempDir()
-	team := &ProductionTeam{
-		Name:       "mbteam",
-		dataDir:    tmp,
-		Blackboard: NewBlackboard("mbteam", tmp),
-	}
-	mb := TeamMailbox(team)
-	if err := mb.Send(MailMessage{From: "lead", To: "coder", Content: "按接口写"}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-
-	if n := len(team.Mailbox); n != 1 {
-		t.Fatalf("消息应进 team.Mailbox, got %d", n)
-	}
-	found := false
-	for _, e := range team.Blackboard.ReadByCategory("context") {
-		if e.Value == "From lead: 按接口写" {
-			found = true
+// boardHasValue 扫黑板里有没有某条正文 (按 value 精确匹配)。
+func boardHasValue(bb *Blackboard, want string) bool {
+	for _, e := range bb.ReadByCategory("context") {
+		if e.Value == want {
+			return true
 		}
 	}
-	if !found {
-		t.Fatal("消息应同步写入黑板 (否则 agent 看不到)")
-	}
-	// 落盘: team.json 里应能读回这条消息
-	b, err := os.ReadFile(filepath.Join(tmp, "team.json"))
-	if err != nil {
-		t.Fatalf("team.json 未落盘: %v", err)
-	}
-	var persisted struct {
-		Mailbox []MailMessage `json:"mailbox"`
-	}
-	if err := json.Unmarshal(b, &persisted); err != nil {
-		t.Fatal(err)
-	}
-	if len(persisted.Mailbox) != 1 || persisted.Mailbox[0].Content != "按接口写" {
-		t.Fatalf("team.json 中的邮箱不对: %+v", persisted.Mailbox)
+	return false
+}
+
+// TestSendMailMessage_定向不进黑板_广播进黑板 是 D6-3 缺口 1 的回归测试。
+//
+// 改动前 SendMailMessage 无条件把消息写进黑板, 而黑板是**全员广播**通道 ——
+// 于是一条 To="coder" 的定向消息也变成了每个 agent 都看得见。MailMessage.To 的
+// 存在意义当场被抹掉, 而这不会有任何报错: 收件人确实收到了, 只是还有 8 个
+// 不该收到的人也收到了。所以这条判据必须**双向**断:
+//
+//	正: 广播 (To=="") 必须进黑板 —— 否则修完定向语义, 广播也没人看得见了;
+//	负: 定向 (To!="") 必须不进黑板, 同时在信箱里按 To 可投递。
+func TestSendMailMessage_定向不进黑板_广播进黑板(t *testing.T) {
+	tmp := t.TempDir()
+	store := statestore.NewMemStore()
+	bb := NewBlackboard("mbteam", tmp)
+	ptm := &ProductionTeamManager{
+		teams:      map[string]*ProductionTeam{"mbteam": {Name: "mbteam", Blackboard: bb}},
+		stateStore: store,
 	}
 
-	got, err := mb.Take("coder")
-	if err != nil {
-		t.Fatalf("Take: %v", err)
+	if err := ptm.SendMailMessage("mbteam", "lead", "coder", "按接口写"); err != nil {
+		t.Fatalf("定向 SendMailMessage: %v", err)
 	}
-	if len(got) != 1 {
+	// 负: 定向消息不在黑板里 (它在信箱里, 见下)
+	if boardHasValue(bb, "From lead: 按接口写") {
+		t.Fatal("定向消息进了黑板 —— 黑板是全员广播通道, 定向语义当场变成广播")
+	}
+	// 正: 定向消息确实进了信箱, 且只有 coder 收得到
+	mb := NewPersistentMailbox(store, "mbteam")
+	if got := mb.Inbox("coder"); len(got) != 1 || got[0].Content != "按接口写" {
+		t.Fatalf("定向消息应进 coder 的信箱, got %+v", got)
+	}
+	if got := mb.Inbox("tester"); len(got) != 0 {
+		t.Fatalf("定向消息不该出现在别人的信箱里: %+v", got)
+	}
+	// 游标: 同一条只投递一次
+	if got, _ := mb.Take("coder"); len(got) != 1 {
 		t.Fatalf("Take 应取到 1 条, got %d", len(got))
 	}
 	if again, _ := mb.Take("coder"); len(again) != 0 {
 		t.Fatalf("同一条不该被投递两次, got %+v", again)
 	}
+
+	// 正: 广播进黑板 (所有人经黑板可见), 同时也进每个人的信箱
+	if err := ptm.SendMailMessage("mbteam", "lead", "", "全员注意"); err != nil {
+		t.Fatalf("广播 SendMailMessage: %v", err)
+	}
+	if !boardHasValue(bb, "From lead: 全员注意") {
+		t.Fatal("广播消息没进黑板 —— 修定向语义时把广播一起改没了")
+	}
+	if got := mb.Inbox("tester"); len(got) != 1 || got[0].Content != "全员注意" {
+		t.Fatalf("广播应进所有人的信箱, tester got %+v", got)
+	}
+
+	// 不存在的团队仍必须报错 (收敛不能把错误路径一起吞掉)
+	if err := ptm.SendMailMessage("nope", "lead", "coder", "x"); err == nil {
+		t.Fatal("不存在的团队应报错")
+	}
 }
 
-// TestMailboxInterfaceCompliance 断言三个实现都满足接口 (编译期 + 运行期都过一遍)。
+// TestMailboxInterfaceCompliance 断言唯一实现满足接口 (编译期 + 运行期都过一遍)。
+//
+// 只剩一个实现, 这个测试仍有意义: 它断的是**接口与实现的契约** (Send 一条后 Take
+// 必得一条), 将来若引入分布式后端, 加进这个列表即可获得同样的断言。
 func TestMailboxInterfaceCompliance(t *testing.T) {
 	var impls = []MailboxConsumer{
-		NewMemMailbox(),
-		NewPersistentMailbox(statestore.NewMemStore(), "x"),
-		TeamMailbox(&ProductionTeam{Name: "y", Blackboard: NewBlackboard("y", "")}),
+		NewPersistentMailbox(statestore.NewMemStore(), "compliance"),
 	}
 	for i, mb := range impls {
 		if err := mb.Send(MailMessage{From: "a", To: "b", Content: "ping"}); err != nil {

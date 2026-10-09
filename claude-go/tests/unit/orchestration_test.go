@@ -342,7 +342,7 @@ func TestOrchestratorConfigDefaults(t *testing.T) {
 func TestAllWorkflowStagesHaveRoles(t *testing.T) {
 	for _, wf := range agent.ListWorkflows() {
 		for _, s := range wf.Stages {
-			if s.Role == "" {
+			if s.Agent == "" {
 				t.Errorf("workflow %q stage %q has empty role", wf.Name, s.Name)
 			}
 		}

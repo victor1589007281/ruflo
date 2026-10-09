@@ -16,9 +16,10 @@
 //   - 意图不明时不拦截 — 交给正常 LLM 对话处理
 //
 // 用户体验:
-//   "帮我组3个agent调研kubernetes最佳实践" → 自动创建 research 团队并执行
-//   "团队进展如何" → 查看所有团队状态
-//   "停止调研任务" → 停止指定团队
+//
+//	"帮我组3个agent调研kubernetes最佳实践" → 自动创建 research 团队并执行
+//	"团队进展如何" → 查看所有团队状态
+//	"停止调研任务" → 停止指定团队
 package agent
 
 import (
@@ -37,11 +38,11 @@ type LLMClient interface {
 
 // TeamIntent 识别出的团队协作意图。
 type TeamIntent struct {
-	Action     string  `json:"action"`               // create_and_run, check_status, stop, list, none
-	TeamName   string  `json:"teamName,omitempty"`    // 团队名称
-	Workflow   string  `json:"workflow,omitempty"`     // development, research, debate
-	Objective  string  `json:"objective,omitempty"`    // 任务目标
-	Confidence float64 `json:"confidence"`             // 0.0-1.0
+	Action     string  `json:"action"`              // create_and_run, check_status, stop, list, none
+	TeamName   string  `json:"teamName,omitempty"`  // 团队名称
+	Workflow   string  `json:"workflow,omitempty"`  // development, research, debate
+	Objective  string  `json:"objective,omitempty"` // 任务目标
+	Confidence float64 `json:"confidence"`          // 0.0-1.0
 }
 
 // IntentRecognizer 基于关键词 + LLM 的混合意图识别器。
@@ -114,12 +115,12 @@ var wfDetect = map[string][]string{
 
 // CronIntent cron 定时任务意图。
 type CronIntent struct {
-	Action   string `json:"action"`   // add_cron, list_cron, remove_cron
-	Schedule string `json:"schedule"` // cron 表达式
+	Action    string `json:"action"`    // add_cron, list_cron, remove_cron
+	Schedule  string `json:"schedule"`  // cron 表达式
 	SchedDesc string `json:"schedDesc"` // 调度描述
-	JobType  string `json:"jobType"`  // workflow, query
-	Workflow string `json:"workflow"` // 工作流类型
-	Payload  string `json:"payload"`  // 执行内容
+	JobType   string `json:"jobType"`   // workflow, query
+	Workflow  string `json:"workflow"`  // 工作流类型
+	Payload   string `json:"payload"`   // 执行内容
 }
 
 var cronKW = []string{

@@ -342,8 +342,8 @@ func (w *Worker) execute(parent context.Context, task *cluster.Task) {
 	}
 	// trace 四元组跨进程续上: 远程执行的 LLM 调用记账 (llm.jsonl) 才能与控制面的
 	// run/node 对齐, 否则远程节点的 token 账是孤儿。
-	if st.RunID != "" || st.NodeID != "" {
-		ctx = trace.With(ctx, trace.IDs{RunID: st.RunID, NodeID: st.NodeID})
+	if st.RunID != "" || st.NodeID != "" || st.SessionID != "" {
+		ctx = trace.With(ctx, trace.IDs{RunID: st.RunID, NodeID: st.NodeID, SessionID: st.SessionID})
 	}
 
 	rtTask := st.ToRuntimeTask()

@@ -39,6 +39,7 @@ package agent
 // 顺序反了就会变成第四处各自为政的约束。
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -82,7 +83,7 @@ const (
 	CapTask                              // TodoWrite / Task* 任务板
 	CapInteract                          // AskUserQuestion (打断并索取人类输入)
 	CapMedia                             // Generate* 媒体产出
-	CapTeam                              // TeamCreate / TeamDelete / TeamMailbox
+	CapTeam                              // TeamCreate / TeamDelete (团队编排)
 	CapAdminExtra                        // LSP / Config / Skill / Cron* / ComputerUse* 等运维面
 )
 
@@ -899,4 +900,199 @@ func appendUniqueStrings(dst []string, add ...string) []string {
 		dst = append(dst, v)
 	}
 	return dst
+}
+
+// ---------------------------------------------------------------------------
+// StageTools —— stage 级的工具声明 (21.8.12 P3 / W5)
+// ---------------------------------------------------------------------------
+//
+// W5 的原文: "把 profileForTeamRole 的名字猜测改成 StageDef.Tools 显式声明 ——
+// 让'能力从哪来'可读, 而不是靠字符串包含"。
+//
+// 那套名字猜测有两处真实误判, 都不是理论问题:
+//
+//	world-builder  含 "build" ⇒ 被判成 coding 档 ⇒ 拿到 Shell。一个写世界观设定的
+//	               角色因此能执行任意命令。
+//	tech-investigator 含 "investigat" 但不含 "research"/"review" ⇒ 落到 team 档,
+//	               而那是一个**只读调研**角色。
+//
+// 改成显式声明之后, "这个阶段能拿什么工具"写在定义里, 读得到、能审、不随名字变。
+//
+// ---------------------------------------------------------------------------
+// 为什么是"三态"而不是两个字段
+// ---------------------------------------------------------------------------
+//
+// 需要能分开表达三件事, 而它们不能合并:
+//
+//	没写            ⇒ 与改造前逐项等价 (仍走名字猜测), 6 个下游平台行为一字节不变
+//	写了档位        ⇒ 明确的能力画像, 取代猜测
+//	写了 tools 名单 ⇒ 精确到工具的边界
+//
+// 用一个 `Tools []string` 加一个 `ToolProfile string` 是做不到的 ——
+// Go 的零值会把"没写"和"写了空"压成同一个 (len==0 / "")。这正是
+// pkg/agentbind 里 HasTools/HasDisallowedTools 那对存在性位的同一个理由, 也是
+// `tools: []` 在 P2′ 差一点退化成"完全放行"的原因。所以这里显式带存在性:
+// 用指针表达"键写没写", 与 pkg/sessionapi.AllowedTools 是同一手法。
+//
+// nil 与空切片的差别在这里有**实际后果**, 不是风格问题:
+//
+//	Tools == nil  ⇒ 没声明白名单 (不限制)
+//	Tools == &[]{} ⇒ 显式空白名单 ⇒ fail-closed, 拒绝一切工具
+//
+// 后者在 ApplyStageTools 里经 WithToolAllowList 走 CompiledToolAllow, 而那里
+// `Allow != nil` 即"仅名单内放行, 空 map 即全部拒绝" —— 语义与
+// engine.Config.AllowedTools 严格一致, 不在本层二次解释。
+type StageTools struct {
+	// Profile 显式工具档位 (chat|research|coding|team|analysis|admin)。
+	// 空 = 未声明 ⇒ 回退到宿主的角色名推断, 并留痕 (ProfileSourceRoleNameFallback)。
+	Profile string `json:"profile,omitempty"`
+	// Allow 工具白名单。**指针**: nil = 没写这一栏; &[] = 显式空名单 (拒绝一切)。
+	// 与 Profile 是两件事, 各自独立生效 —— 同时写时先定档位再取交集,
+	// 按构造只会更窄 (见 ApplyStageTools)。
+	Allow *[]string `json:"tools,omitempty"`
+	// Deny 工具黑名单 (并集, 只会让可见面更小)。
+	Deny []string `json:"disallowedTools,omitempty"`
+}
+
+// Declares 报告这份声明是否真的写了东西。
+//
+// 存在的理由: 调用方要能区分"这个 stage 声明了工具面"与"它的 StageTools 是零值"。
+// 判据必须是**逐键**(Allow 看指针非 nil), 不能是 `!= StageTools{}` —— 后者在
+// 有人往结构体里加了切片字段之后就不可比较, 编译期才发现, 而那时的修法往往是
+// 随手改成 len() 判断, 于是 `tools: []` 又被吞掉一次。
+func (st *StageTools) Declares() bool {
+	if st == nil {
+		return false
+	}
+	return st.Profile != "" || st.Allow != nil || len(st.Deny) > 0
+}
+
+// ApplyStageTools 把 stage 的显式工具声明接进约束集 —— **唯一**的应用点。
+//
+// 只有一处是刻意的。同一条声明有两条送达路径时, 拆掉任意一条都不改变行为: 一份
+// "看起来接了、实际可以整条删掉"的接线比明摆着没接更难发现。这个坑在本仓已经踩过
+// 一次 (assetProfile 同时经 WithToolProfile 与 fallback 闭包送达, 删掉任一条测试
+// 依然全绿 —— 见 agent_assets.go 文件头), 所以这里不再重演:
+// 工作流路径 (pkg/feishu/session.go 的 teamRole 分支) 与图路径 (stageNodeRunner)
+// 都调**这一个**函数, 没有第二个写者。
+//
+// 返回值是"哪些字段真的应用了", 供调用方记审计 —— 静默应用与静默不应用都是本仓
+// 明令要避免的形态。
+func ApplyStageTools(cs *ConstraintSet, st *StageTools) []string {
+	if cs == nil || st == nil || !st.Declares() {
+		return nil
+	}
+	var applied []string
+	if st.Profile != "" {
+		// 经 WithToolProfile ⇒ ProfileSourceExplicit。于是 ResolveToolProfile 会
+		// 走"显式优先"分支, 名字猜测那条 fallback 闭包根本不会被调用 —— 这不是
+		// 巧合, 是 W5 的实现方式: 旧路径留着 (下游 platform 不声明时仍用它), 而
+		// 声明一出现, 它就自动退居其次。
+		cs.WithToolProfile(st.Profile)
+		applied = append(applied, "profile="+st.Profile)
+	}
+	if st.Allow != nil {
+		// 复制而不是传引用: 约束集会被 Narrow/审计读很多次, 而 StageDef 的那份
+		// 声明属于注册表, 让两者共享底层数组意味着任何一侧的原地修改都会串台。
+		// 空切片要显式构造成非 nil —— WithToolAllowList(nil) 是 no-op。
+		if len(*st.Allow) == 0 {
+			cs.WithToolAllowList([]string{})
+			applied = append(applied, "tools=<empty/deny-all>")
+		} else {
+			cs.WithToolAllowList(append([]string{}, (*st.Allow)...))
+			applied = append(applied, "tools="+strings.Join(*st.Allow, ","))
+		}
+	}
+	if len(st.Deny) > 0 {
+		cs.WithDeniedTools(st.Deny...)
+		applied = append(applied, "disallowedTools="+strings.Join(st.Deny, ","))
+	}
+	return applied
+}
+
+// ---------------------------------------------------------------------------
+// stage 声明的下发通道
+// ---------------------------------------------------------------------------
+//
+// 走 context 而不是改 CreateAgentFunc 的签名 ("(ctx, role, systemPrompt)"), 理由与
+// RunMetadata.Cwd / NodeExecHints 完全相同: 那个签名被 6 个下游平台的工厂实现共用,
+// 加参数等于要求它们全部改一遍, 而这次要下发的只是一个"可以没有"的声明。
+//
+// ★ 为什么不是复用 NodeExecHints: 那个通道上已经挂了**图覆盖表**的声明, 而两者的
+// 优先级不同 —— 覆盖表是运维/灰度期的最后一跳, 必须压得住工作流定义里的声明
+// (见 mergeStageOverride)。两条来源挤进同一个字段, "谁赢"就取决于哪个先写,
+// 而这个顺序在以后任何一次重构里都可能被无声地改掉。分成两个键之后, 优先级由
+// 消费点 (pkg/feishu/session.go) 显式地按顺序调用表达。
+//
+// 注入点是 executeStage —— pipeline / fanout / adversarial / graph **四条路径全过它**
+// (图路径经 stageNodeRunner → ExecuteSingleStage → executeStage), 所以这里是
+// "接一次, 四条都通"的那个点。只接一条路径的后果在本仓已经写过一次:
+// 信箱只接 workflow.go 一处, 图路径上的 agent 就永远收不到信。
+type stageToolsKey struct{}
+
+// WithStageTools 把当前阶段声明的工具面写入 context (nil 是合法的 no-op)。
+func WithStageTools(ctx context.Context, st *StageTools) context.Context {
+	if ctx == nil || st == nil || !st.Declares() {
+		return ctx
+	}
+	return context.WithValue(ctx, stageToolsKey{}, st)
+}
+
+// StageToolsFromContext 读回当前阶段声明的工具面 (未声明返回 nil)。
+func StageToolsFromContext(ctx context.Context) *StageTools {
+	if ctx == nil {
+		return nil
+	}
+	st, _ := ctx.Value(stageToolsKey{}).(*StageTools)
+	return st
+}
+
+// StageDecl 本阶段在**工具面之外**的三项声明 (21.8.12 P4 / X1):
+// Model (模型覆盖) / Hooks (阶段专属 hook) / Skills (阶段专属技能)。
+//
+// 为什么与 StageTools 分成两个键而不是并成一个 "StageDecl":
+//  1. 工具面那三项有**图覆盖表**这个上游 (NodeExecHints.ToolProfile), 于是消费点
+//     必须显式表达"覆盖表 > 声明"的先后 (见 stageConstraints); 这三项没有覆盖表
+//     对应物, 消费点就是一句直读。把两者塞进同一个键, 会让"哪些字段需要让位给
+//     覆盖表"这件事从类型上消失。
+//  2. StageTools 的存在性有语义 (nil vs &StageTools{}) —— 它承载 "tools: [] 是显式
+//     空名单" 这条 fail-closed 声明。这三项都是空值即未声明, 混在一起会让那个
+//     区分多一个无关的邻居。
+type StageDecl struct {
+	// Model 声明本阶段用哪个模型别名。空 = 未声明, 按 plan/agent 层级解析。
+	Model string
+	// Hooks 本阶段的 hook 声明原文 (<event>:<type>:<target>[:<if>])。**原文**而不是
+	// 解析结果: 解析器在 pkg/hooks, 而这个通道的消费者 (宿主的 runner 装配点) 本来
+	// 就要 import 它 —— 在这里先解析一遍, 等于把同一份解析实现引到 pkg/agent。
+	Hooks []string
+	// Skills 本阶段额外声明的技能名 (须已在技能注册表里)。
+	Skills []string
+}
+
+// Declares 三项全空时返回 false —— 与 StageTools.Declares 同一语义:
+// "没写这一栏"不该在消费点上与"写了但都是空"分岔。
+func (d StageDecl) Declares() bool {
+	return strings.TrimSpace(d.Model) != "" || len(d.Hooks) > 0 || len(d.Skills) > 0
+}
+
+type stageDeclKey struct{}
+
+// WithStageDecl 把本阶段的 Model/Hooks/Skills 声明写入 context (全空是 no-op)。
+//
+// 与 WithStageTools 同一个注入点 (executeStage, 四条路径的交汇), 同一套理由:
+// 接一次四条路径都通, 只接一条的结果是"某个 mode 下这三项静默不生效"。
+func WithStageDecl(ctx context.Context, d StageDecl) context.Context {
+	if ctx == nil || !d.Declares() {
+		return ctx
+	}
+	return context.WithValue(ctx, stageDeclKey{}, d)
+}
+
+// StageDeclFromContext 读回本阶段的 Model/Hooks/Skills 声明 (未声明返回零值)。
+func StageDeclFromContext(ctx context.Context) StageDecl {
+	if ctx == nil {
+		return StageDecl{}
+	}
+	d, _ := ctx.Value(stageDeclKey{}).(StageDecl)
+	return d
 }

@@ -1,9 +1,13 @@
 // evo_gepa_cmd.go —— evo replay / evo gepa-step 子命令 (手册 13.3.3 L5, 方案三第二批)。
 //
 // evo replay: 拿一份 prompt 正文 + 一个模型档位, 在任务集上跑确定性回放打分,
-//   分数向量写入 GEPA Pareto 池 (<state>/evolution/gepa_pool.jsonl)。
+//
+//	分数向量写入 GEPA Pareto 池 (<state>/evolution/gepa_pool.jsonl)。
+//
 // evo gepa-step: 一步完整 GEPA —— T3 差距参照反思 (26B 等独立档位, H3 守恒)
-//   → 产出 proposed 草案 → 立即回放打分 → 入池 → 打印当前前沿。
+//
+//	→ 产出 proposed 草案 → 立即回放打分 → 入池 → 打印当前前沿。
+//
 // 晋升仍走既有门禁 (evo promote / 自动 gate), 本命令只负责"产候选 + 打分",
 // 不越权直接上线 —— 13.3.6 纪律: 反思产物不过 replay 门禁不冻结。
 package main
@@ -42,11 +46,13 @@ func buildClientFromAlias(alias string) (*api.Client, error) {
 		return nil, fmt.Errorf("别名 %q 解析失败 (err=%v) —— 检查 providers 里是否注册了该别名", alias, err)
 	}
 	var client *api.Client
+	// 出站模型名走 OutboundModelName, 见 ResolvedConfig.OutboundModelName。
+	clientModel := resolved.OutboundModelName()
 	if api.IsLocalEndpoint(resolved.BaseURL) {
-		client = api.NewOllamaClient(resolved.BaseURL, resolved.ProviderName)
+		client = api.NewOllamaClient(resolved.BaseURL, clientModel)
 		client.APIKey = resolved.APIKey
 	} else {
-		client = api.NewClient(resolved.BaseURL, resolved.APIKey, resolved.ProviderName)
+		client = api.NewClient(resolved.BaseURL, resolved.APIKey, clientModel)
 	}
 	client.Protocol = resolved.Protocol
 	client.SetProxy(resolved.Proxy)

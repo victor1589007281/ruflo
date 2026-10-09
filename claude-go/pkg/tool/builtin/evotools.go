@@ -820,3 +820,24 @@ func RegisterEvolutionTools(reg *tool.Registry) {
 	reg.Register(NewEvoPromoteTool())
 	reg.Register(NewEvoRollbackTool())
 }
+
+// ============================================================================
+// 检索别名 (tool.RecallAliasProvider) —— D4.2「漏召率趋零」
+// ============================================================================
+//
+// 这两个工具的描述**本来就是中文的**, 所以别名的收益不如 media_gen 那边明显 ——
+// 但仍然有: 真描述被 schema 术语写满 ("kind=induce"、"proposed 态"、"shadow 技能"),
+// 而人是按**意图**问的 ("哪些经验可以固化下来")。意图与术语之间同样没有词面通路。
+//
+// ⚠️ evo_propose 与 evo_inspect 同前缀, 是保留集里的误召试金石: 给其中一个加
+// 别名时要顺带确认另一个没被抢走。
+
+// RecallAliases 声明"这句话问的是我"。
+func (t *EvoProposeTool) RecallAliases() []string {
+	return []string{"提交进化候选", "提交候选", "固化经验", "沉淀流程", "改进提示词", "把这次的经验留下来"}
+}
+
+// RecallAliases 声明"这句话问的是我"。
+func (t *EvoInspectTool) RecallAliases() []string {
+	return []string{"查看进化环境", "看进化状态", "进化闭环健康度", "进化产物", "学习闭环", "看看晋升的证据"}
+}

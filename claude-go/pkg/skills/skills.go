@@ -42,6 +42,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/anthropic/claude-go/pkg/asset"
 	"sync"
 
 	"github.com/anthropic/claude-go/pkg/tool"
@@ -61,7 +63,7 @@ type Skill struct {
 	// 空 = active (绝大多数存量 SKILL.md 没有 status 行, 见 statusDisabled 注释)。
 	Status string `json:"status,omitempty"`
 	// Rank 来源优先级 (13.6 F2 rank 分层): 数值越小优先级越高,
-	// 同名技能高优先级来源覆盖低优先级来源。project(100) > user(200) > builtin(600)。
+	// 同名技能高优先级来源覆盖低优先级来源。project(100) > plugin(150) > user(200) > builtin(600)。
 	// 直接 Register 未标来源的技能取中间值 300。见 SourceRank。
 	Rank int `json:"rank,omitempty"`
 	// ModelInvocable / UserInvocable 双向调用策略 (13.6 F3, frontmatter
@@ -84,11 +86,15 @@ type Skill struct {
 // (不同团队各自提炼"code-review"变体), 没有覆盖语义时同名技能会在清单里重复
 // 出现, 浪费预算并误导模型。对齐 dsh: project(100) > user(200) > bundled(600)。
 // claude-go 的目录来源映射: state(项目状态目录)随 project、config(用户配置目录)
-// 随 user。未知来源/直接 Register 给中间值 300 —— 既不被项目技能覆盖, 也不覆盖用户技能。
+// 随 user。plugin(150) 夹在 project 与 user 之间: 插件包是**显式启用**的第三方包
+// (run --plugin / agent 资产的 plugins: 声明), 输给项目自己的技能, 赢过用户级与内置。
+// 未知来源/直接 Register 给中间值 300 —— 既不被项目技能覆盖, 也不覆盖用户技能。
 func SourceRank(source string) int {
 	switch source {
 	case "project", "state":
 		return 100
+	case "plugin":
+		return 150
 	case "user", "user-state", "config":
 		return 200
 	case "builtin":
@@ -299,6 +305,20 @@ func (r *Registry) Get(name string) (*Skill, bool) {
 		return nil, false
 	}
 	return s, true
+}
+
+// HasSkill 报告某个技能名在**运行期视图**里是否解析得了。
+//
+// 存在的理由: agentbind (组装器) 要判"资产声明的那条技能, 池里到底有没有", 而它
+// 不该为了这一句话把整个技能注册表连同它的扫盘行为一起拖进来。语义与 Get 完全一致
+// (存在 **且** active) —— shadow/archived 必须报 false: 一条影子技能本来就不该被
+// 资产声明激活, 报 true 会让组装器说"接上了"而运行期仍把那条技能当不存在。
+func (r *Registry) HasSkill(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.Get(name)
+	return ok
 }
 
 // GetAny 获取指定技能, 不过滤治理状态 (审计/晋升/自改进用)。
@@ -567,18 +587,15 @@ func ParseSkillContent(content string, sourcePath string, source string) (*Skill
 	skill.Name = filepath.Base(filepath.Dir(sourcePath))
 
 	// 解析 YAML frontmatter
-	if strings.HasPrefix(content, "---\n") {
-		end := strings.Index(content[4:], "\n---")
-		if end >= 0 {
-			frontmatter := content[4 : 4+end]
-			skill.Body = strings.TrimSpace(content[4+end+4:])
-			parseFrontmatter(frontmatter, skill)
-		} else {
-			skill.Body = content
-		}
-	} else {
-		skill.Body = content
-	}
+	// 拆 frontmatter 走 pkg/asset 的**唯一一份**解析器 (2026-09-25, 21.8.12 P1)。
+	//
+	// 此前这里自带一份私有解析器, 于是每多一种带 frontmatter 的资产格式就多一份,
+	// 分歧已经真实发生过: 旧实现只认 "---\n" (CRLF 文件整块丢弃) 且只对 paths 认
+	// 多行列表。asset.SplitFrontmatter 修了这两条, 且对既有 SKILL.md 是纯扩展 ——
+	// 它多收进来的键, 本函数只查它认识的那几个。
+	fm := asset.SplitFrontmatter(content)
+	skill.Body = fm.Body
+	parseFrontmatter(fm, skill)
 
 	if skill.Description == "" {
 		lines := strings.SplitN(skill.Body, "\n", 3)
@@ -595,39 +612,18 @@ func ParseSkillContent(content string, sourcePath string, source string) (*Skill
 }
 
 // parseFrontmatter 简单的 YAML frontmatter 解析器
-func parseFrontmatter(fm string, skill *Skill) {
-	inPaths := false // paths 字段的 YAML 列表延续行状态
-	for _, line := range strings.Split(fm, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		// paths 的多行列表形态:
-		//   paths:
-		//     - "**/*.go"
-		//     - "cmd/**"
-		if inPaths && strings.HasPrefix(line, "-") {
-			item := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "-")), `"'`)
-			if item != "" {
-				skill.Paths = append(skill.Paths, item)
-			}
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		inPaths = false // 新 key 行结束列表延续
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-		val = strings.Trim(val, `"'`)
-
-		switch key {
+func parseFrontmatter(fm asset.Frontmatter, skill *Skill) {
+	// 键名已由 asset.SplitFrontmatter 归一 (小写 + '_'→'-'), 故这里每个键只写一遍 ——
+	// 旧写法每个键要写两遍 (`case "model-invocable", "model_invocable":`), 漏一遍
+	// 就是一个"配置写了不生效"的静默失败。
+	for _, k := range fm.Keys() {
+		val := fm.Get(k)
+		switch k {
 		case "name":
 			skill.Name = val
 		case "description":
 			skill.Description = val
-		case "when_to_use":
+		case "when-to-use":
 			skill.WhenToUse = val
 		case "version":
 			skill.Version = val
@@ -637,16 +633,16 @@ func parseFrontmatter(fm string, skill *Skill) {
 			// 治理状态 (shadow/active/archived)。此前不解析 ⇒ shadow 技能照常进清单、
 			// 照常可被 Skill 工具加载, `evo promote` 改的是没人读的文本字段。
 			skill.Status = val
-		case "model-invocable", "model_invocable":
+		case "model-invocable":
 			// 13.6 F3 双向调用策略: false → 技能只作用户命令, 不进模型清单、
 			// Skill 工具拒载。缺省 (键不存在) = 双向可用, 向后兼容。
-			b := parseBoolFM(val)
+			b := asset.ParseBool(val)
 			skill.ModelInvocable = &b
-		case "user-invocable", "user_invocable":
+		case "user-invocable":
 			// 13.6 F3: false → 只作模型可选项, 不进用户侧技能展示。
-			b := parseBoolFM(val)
+			b := asset.ParseBool(val)
 			skill.UserInvocable = &b
-		case "allowed-tools", "allowed_tools":
+		case "allowed-tools":
 			// 声明式工具面。**此前 Skill.AllowedTools 字段存在但全仓没有任何地方给它
 			// 赋值**, 于是 SKILL.md 里写 `allowed-tools: Bash` 在结构体里恒为空 ——
 			// 任何依据它做判断的代码都会得出"该技能没声明工具"这个错误结论。
@@ -655,60 +651,32 @@ func parseFrontmatter(fm string, skill *Skill) {
 			// 自动提炼的技能若声明了写/执行类工具, 晋升被拒。运行期的工具可见性仍然
 			// 只由 engine.Config.toolExposed 一处裁决, 本字段不参与 ⇒ 解析它不改变
 			// 任何既有执行行为, 只是让治理层看得见声明。
-			skill.AllowedTools = parseToolList(val)
+			skill.AllowedTools = asset.ParseInlineList(val)
 		case "paths":
-			// 行内形态 paths: ["**/*.go", "cmd/**"] (复用工具清单解析);
-			// 多行 YAML 列表形态由上面的 inPaths 延续行处理 (val 为空时开启)。
+			// 行内形态 paths: ["**/*.go", "cmd/**"]; 多行 YAML 列表形态由下面的
+			// List 分支处理。两条路都要走 —— asset.SplitFrontmatter 把行内值放在
+			// Values、多行值放在 Lists, 只看一边会让另一边静默变成空列表。
+			//
 			// paths 语义: 声明本技能适用的文件 glob——只在目录里存在命中文件时
 			// 才进注入清单 (见 VisibleInDir)。此前字段存在但零解析零消费, 死字段。
 			if val != "" {
-				skill.Paths = parseToolList(val)
-			} else {
-				inPaths = true
+				skill.Paths = asset.ParseInlineList(val)
 			}
 		}
 	}
-}
-
-// parseBoolFM frontmatter 布尔值解析 (13.6 F3)。宽容: 1/t/T/true/TRUE/yes/on = true,
-// 其余一律 false (写错配置按"关闭该侧调用"处理, fail-safe —— 配置错误不应把技能
-// 悄悄暴露给模型)。
-func parseBoolFM(val string) bool {
-	switch strings.ToLower(strings.TrimSpace(val)) {
-	case "1", "t", "true", "yes", "on":
-		return true
-	default:
-		return false
+	// 多行列表形态 (旧实现只对 paths 认, 现在对所有键都认)。
+	if p := fm.List("paths"); len(p) > 0 {
+		skill.Paths = p
 	}
 }
 
-// parseToolList 解析 frontmatter 里的工具清单。
+// parseBoolFM / parseToolList 已删除 (2026-09-25, 21.8.12 P1): 两者逐字节等价于
+// asset.ParseBool / asset.ParseInlineList, 收敛后成为死代码。
 //
-// 兼容三种写法 (三种在野文件里都出现过): `A, B` / `[A, B]` / `A B`。
-// 逗号优先, 无逗号才按空白切 —— 反过来会把 "Read, Bash" 切成 "Read," 这种带标点的
-// 假工具名, 而治理层对"不认识的工具名"是拒绝晋升, 于是一个格式问题会变成一次误拒。
-func parseToolList(val string) []string {
-	val = strings.TrimSpace(strings.Trim(strings.TrimSpace(val), "[]"))
-	if val == "" {
-		return nil
-	}
-	var fields []string
-	if strings.Contains(val, ",") {
-		fields = strings.Split(val, ",")
-	} else {
-		fields = strings.Fields(val)
-	}
-	out := make([]string, 0, len(fields))
-	for _, f := range fields {
-		if n := strings.Trim(strings.TrimSpace(f), `"'`); n != "" {
-			out = append(out, n)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
+// 删而不是留: 留着它们, 下一个做新资产格式的人会照着这里的签名再抄一份解析器 ——
+// 那正是本轮要消除的形态 (本包自己的 frontmatter 解析器就是上一次留下的副本,
+// 它对 CRLF 与多行列表的处理已经与别处不一致了)。要不要解析 frontmatter 现在只有
+// 一个答案: pkg/asset。
 
 // ============================================================================
 // SkillTool — 将技能注册为 LLM 可调用的工具
@@ -724,6 +692,24 @@ type SkillTool struct {
 // NewSkillTool 创建 Skill 工具
 func NewSkillTool(reg *Registry) *SkillTool {
 	return &SkillTool{registry: reg}
+}
+
+// Registry 返回本工具背后的技能注册表 (21.8.12 P4/X1)。
+//
+// 存在的理由: 阶段声明的技能 (StageDef.Skills) 要在**没有** registry 引用的地方
+// 也能渲染成清单。CLI 的 cliAgentRunner 手上只有 *engine.QueryEngine, 而 Skill
+// 工具就注册在它的 Tools 里 —— 在此之前 "拿回 registry" 这件事只能靠包级变量
+// (main.go 的 deps.skillReg), 那条路在嵌套子代理里指向的是**另一个** registry,
+// 而且 buildEngine 与用它的 runner 之间没有任何东西保证它们是同一个。
+//
+// 让工具自己答它背后是谁, 拿到的必然是**真正在服务这次调用**的那一份 —— 这正是
+// "阶段声明的技能"该问的对象。返回 nil 合法 (工具是用 nil registry 造的, 或
+// 注册表里没有技能), 调用方按"渲染不出清单"处理并留痕。
+func (t *SkillTool) Registry() *Registry {
+	if t == nil {
+		return nil
+	}
+	return t.registry
 }
 
 func (t *SkillTool) Name() string { return "Skill" }

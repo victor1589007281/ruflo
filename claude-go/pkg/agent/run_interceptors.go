@@ -286,10 +286,12 @@ func (ptm *ProductionTeamManager) runPhaseGate(ctx context.Context, rc *teamRunC
 	// 拿到具体错误输出去修源码 (修 bug / 删重复声明 / 修 vet 警告 / 删死循环).
 	// 修完后再跑 gate. 这样团队就有自我恢复能力, 不会因为单个 vet 警告或
 	// 一处明显 bug 就把 30 分钟的工作直接判废.
-	// 编译/测试/一致性门禁仅对"产出可编译代码"的工作流生效。
+	// 编译/测试/一致性门禁对"产出可编译代码"的工作流生效 —— 判据是
+	// gateApplies: 声明产码, **或** 本次 run 真的写了 Go 文件 (后者是为了收住
+	// "没声明产码但实际改了代码"这类不设防的 run, 见该函数注释)。
 	// techblog/creative/novel/research 等写作类工作流不产出代码, 跑 go build 会因
-	// "no main module" 误判失败并触发无意义的修复轮次 (浪费 token)。
-	if team.Cwd != "" && WorkflowGateMetaByName(team.Workflow).ProducesCode {
+	// "no main module" 误判失败并触发无意义的修复轮次 (浪费 token), 故仍被守卫挡住。
+	if ptm.gateApplies(team) {
 		if gateErr := ptm.tryGateWithRemediation(ctx, team, rc.executor, "compile",
 			ptm.runGlobalCompileGate, 2); gateErr != "" {
 			ptm.failTeam(team, fmt.Sprintf("全局编译门禁失败: %s", gateErr))
@@ -506,13 +508,16 @@ func (ptm *ProductionTeamManager) runPhaseMemory(_ context.Context, rc *teamRunC
 
 	// 写入高权重记忆 (解决"失忆"问题: 团队名+目标+结果摘要可被 BM25 检索)
 	if ptm.memWriter != nil {
-		var stageSummary string
+		// 摘要喂检索, 全文另存快照供按需取回 (见 MemoryWriter 注释)。两者只在这里
+		// 同时存在 —— 摘要生成之后, 原文就再也拼不回来了。
+		var stageSummary, stageFull string
 		for _, r := range rc.results {
 			if r.Output != "" {
 				stageSummary += fmt.Sprintf("[%s/%s] %s\n", r.Name, r.Role, truncateResult(r.Output, 200))
+				stageFull += fmt.Sprintf("[%s/%s]\n%s\n\n", r.Name, r.Role, r.Output)
 			}
 		}
-		ptm.memWriter.AddTeamMemory(team.Name, team.Workflow, team.Objective, stageSummary)
+		ptm.memWriter.AddTeamMemory(team.Name, team.Workflow, team.Objective, stageSummary, stageFull)
 	}
 	return true
 }

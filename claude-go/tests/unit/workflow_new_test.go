@@ -91,7 +91,7 @@ func TestMLTrainingWorkflowStages(t *testing.T) {
 	expectedRoles := []string{"data-analyst", "ml-engineer", "ml-architect", "ml-trainer", "ml-evaluator", "ml-optimizer", "synthesizer"}
 	stageRoles := make(map[string]bool)
 	for _, s := range wf.Stages {
-		stageRoles[s.Role] = true
+		stageRoles[s.Agent] = true
 	}
 
 	for _, role := range expectedRoles {
@@ -125,8 +125,8 @@ func TestAppCompositeWorkflow(t *testing.T) {
 	}
 
 	for _, s := range wf.Stages {
-		if _, ok := crossTeamRoles[s.Role]; ok {
-			crossTeamRoles[s.Role] = true
+		if _, ok := crossTeamRoles[s.Agent]; ok {
+			crossTeamRoles[s.Agent] = true
 		}
 	}
 
@@ -171,8 +171,8 @@ func TestGameCompositeWorkflow(t *testing.T) {
 	}
 
 	for _, s := range wf.Stages {
-		if _, ok := crossTeamRoles[s.Role]; ok {
-			crossTeamRoles[s.Role] = true
+		if _, ok := crossTeamRoles[s.Agent]; ok {
+			crossTeamRoles[s.Agent] = true
 		}
 	}
 

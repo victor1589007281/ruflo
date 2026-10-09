@@ -8,7 +8,8 @@
 //   - CBT (认知行为疗法): 情绪管理和积极心理
 //
 // 覆盖: 婴儿(0-1) → 幼儿(1-3) → 学龄前(3-6) → 小学(6-12) → 初中(12-15)
-//        → 高中(15-18) → 大学(18-22), 包括心理/学习/情感/能力培养
+//
+//	→ 高中(15-18) → 大学(18-22), 包括心理/学习/情感/能力培养
 //
 // 安全机制: SafetyScreen 作为硬前置, 危机情况立即转介专业机构
 package agent
@@ -20,7 +21,7 @@ func parentingWorkflow() *WorkflowDef {
 		Mode:        "orchestrated",
 		Stages: []StageDef{
 			{
-				Name: "intake", Role: "intake-counselor",
+				Name: "intake", Agent: "intake-counselor",
 				Prompt: `你是**育儿教育信息采集专家**。
 
 咨询问题: {objective}
@@ -44,7 +45,7 @@ func parentingWorkflow() *WorkflowDef {
 - 推荐的咨询路径`,
 			},
 			{
-				Name: "safety-screen", Role: "safety-screener",
+				Name: "safety-screen", Agent: "safety-screener",
 				DependsOn: []string{"intake"},
 				Prompt: `你是**儿童安全筛查专家**。这是最重要的环节, 必须严格执行。
 
@@ -78,7 +79,7 @@ func parentingWorkflow() *WorkflowDef {
 - 安全筛查通过标记 (PASS/REFER)`,
 			},
 			{
-				Name: "academic-tutor", Role: "academic-tutor",
+				Name: "academic-tutor", Agent: "academic-tutor",
 				DependsOn: []string{"safety-screen"},
 				Prompt: `你是**学科辅导专家** (参考 Khanmigo 苏格拉底式引导 + Vygotsky 最近发展区)。
 
@@ -114,7 +115,7 @@ func parentingWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "psychology-coach", Role: "child-psychologist",
+				Name: "psychology-coach", Agent: "child-psychologist",
 				DependsOn: []string{"safety-screen"},
 				Prompt: `你是**儿童心理辅导专家** (参考 CBT + 积极心理学)。
 
@@ -148,7 +149,7 @@ func parentingWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "parenting-advisor", Role: "parent-coach",
+				Name: "parenting-advisor", Agent: "parent-coach",
 				DependsOn: []string{"safety-screen"},
 				Prompt: `你是**家庭教育指导专家**。
 
@@ -178,7 +179,7 @@ func parentingWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "development-assessor", Role: "dev-assessor",
+				Name: "development-assessor", Agent: "dev-assessor",
 				DependsOn: []string{"safety-screen"},
 				Prompt: `你是**儿童发展评估专家** (参考 Piaget + Erikson 理论)。
 
@@ -209,7 +210,7 @@ func parentingWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "action-plan", Role: "action-planner",
+				Name: "action-plan", Agent: "action-planner",
 				DependsOn: []string{"academic-tutor", "psychology-coach", "parenting-advisor", "development-assessor"},
 				Prompt: `你是**综合行动计划制定者**。
 
@@ -233,7 +234,7 @@ func parentingWorkflow() *WorkflowDef {
 - **评估节点**: 何时检查进度, 何时调整方案`,
 			},
 			{
-				Name: "consultation-report", Role: "report-writer",
+				Name: "consultation-report", Agent: "report-writer",
 				DependsOn: []string{"action-plan"},
 				Prompt: `你是**咨询报告撰写专家**。
 

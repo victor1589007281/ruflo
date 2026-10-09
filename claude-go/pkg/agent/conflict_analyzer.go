@@ -21,11 +21,11 @@ func NewConflictAnalyzer() *ConflictAnalyzer {
 
 // SymbolRef represents a symbol reference within a file.
 type SymbolRef struct {
-	File      string
-	Package   string
-	Name      string
-	Kind      string // "type", "func", "var", "const", "method", "interface"
-	Position  int
+	File     string
+	Package  string
+	Name     string
+	Kind     string // "type", "func", "var", "const", "method", "interface"
+	Position int
 }
 
 // AnalyzeFile extracts symbol-level conflict keys from a Go source file.

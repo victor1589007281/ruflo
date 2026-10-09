@@ -28,6 +28,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // 锁定的归纳判据 (design/03 §4.6 四律: 判据不在 agent 的动作空间里)。
@@ -298,6 +300,12 @@ func EvolvePrompt(ctx context.Context, stateDir string, r Reflector, in PromptEv
 	}
 	if strings.TrimSpace(in.Target) == "" || strings.TrimSpace(in.Current) == "" {
 		return nil, fmt.Errorf("learners: Target/Current 不能为空")
+	}
+	// 形状闸 (21.8.12 P1)。此前这里只有非空检查, 于是拼错一个字母的对象名会一路
+	// 写进磁盘, 直到消费方 match 不上为止 —— 而"草案没生效"与"没有这份草案"
+	// 在下游看起来完全一样, 都不会有任何报错。
+	if err := ValidateTarget(in.Target); err != nil {
+		return nil, err
 	}
 	if in.MeanScore >= 0 {
 		return nil, fmt.Errorf("learners: %s 的加权奖励均值 %.3f 不为负, 没有可反思的失败证据", in.Target, in.MeanScore)
@@ -580,8 +588,5 @@ func stripFence(s string) string {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
+	return textutil.Truncate(s, n, "…")
 }

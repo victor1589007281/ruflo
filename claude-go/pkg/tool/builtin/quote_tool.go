@@ -43,7 +43,7 @@ func (t *QuoteTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *QuoteTool) IsReadOnly(_ json.RawMessage) bool       { return true }
+func (t *QuoteTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *QuoteTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 func (t *QuoteTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil

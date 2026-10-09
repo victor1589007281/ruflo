@@ -126,6 +126,19 @@ type ToolContext struct {
 	Role string `json:"role,omitempty"`
 	// GlobalPerm 若非 nil，RunToolUse 会用其 CheckGlobal 合并全局策略与工具自带权限结果
 	GlobalPerm GlobalPermissionChecker `json:"-"`
+
+	// WriteClaim 本次运行对"我写过哪些文件"的占用 (H3-4)。非 nil 时, Write/Edit 等
+	// 落盘工具在写之前先申请占用; 该路径已被另一个**仍然活着**的写者占用则拒写。
+	//
+	// 判等用指针身份, 所以**不能**由调用方现造一个: 每次新建 *WriteClaimant 会让每个
+	// 写者都以为是独占的, 占用表也就永远不报冲突 —— "看起来装了护栏、实际全程 no-op"。
+	// 取句柄的唯一正确姿势是 engine 在 run 开始时 BeginWriter 一次, 存活到 run 结束
+	// (见 pkg/tool/writeclaim.go)。
+	//
+	// 为 nil 是**正常**情形: 主会话循环不登记写者 (生命周期是整个会话, 登记会把一次
+	// 早年的写变成对后续所有子代理的长期封锁), 工具被单独调用时也没有引擎装配它。
+	// nil 语义 = 未参与, 与改造前逐字节相同。
+	WriteClaim *WriteClaimant `json:"-"`
 }
 
 // PathInPlanDir 判定展开后的绝对路径是否位于计划文件目录 (PlanFileDir) 内。

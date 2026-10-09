@@ -78,6 +78,53 @@ type Pool struct {
 	// 拷贝进来, pool_load 用它在加载点 fail-closed)。
 	denied  map[string]bool
 	allowed map[string]bool // nil = 未设白名单
+
+	// hookSink 池内 hook 资产的运行时装卸口 (21.8.12 P3「hook 进池」)。
+	//
+	// nil = 本池不接 hook 资产: pool_load 一条 hook 会**如实报"运行时不支持"**,
+	// 而不是静默成功。为 nil 是常态而不是缺陷 —— 池装配早于 Runner 构造 (CLI 与
+	// 飞书两条路径都如此), 所以它由装配方在 Runner 就绪后补注入 (SetHookSink),
+	// 与 PoolPolicy 的 SetStateDir/SetTraceStore 是同一个两段式先例。
+	hookSink HookGroupSink
+}
+
+// HookGroupSink hook 资产的运行时装卸口。
+//
+// 定义在 pkg/tool 而不是 pkg/hooks: 池 (本包) 是消费方, 而 pkg/hooks **已经**依赖
+// 本包 (它的 Runner 实现 tool.HookRunner), 反向引即成环。实现方 *hooks.Runner 在
+// pkg/hooks/runner_groups.go 有一处**编译期断言**把签名钉住 —— 接口定义方与实现方
+// 必须有一处强制对齐, 否则漂移的表现是"注入时类型断言失败 ⇒ 静默不接线":
+// 池里列着 hook、加载回成功、而 Runner 一条都没装上。
+type HookGroupSink interface {
+	// InstallHookGroup 装入 (或整体替换) 一组 hook 配置, 返回装入条数。
+	// 返回 0 表示没装 (空组 / 空名) —— 调用方据此区别"装上了"与"什么都没发生"。
+	InstallHookGroup(name string, cfgs []types.HookConfig) int
+	// UninstallHookGroup 卸下一组, 返回是否真的卸掉了东西。
+	// false = 本来就没装: pool_release 拿它区分"已卸载"(行为变了) 与"没装过"(什么都没发生)。
+	UninstallHookGroup(name string) bool
+}
+
+// SetHookSink 注入 hook 资产的运行时装卸口 (装配方在 Runner 就绪后调用)。
+//
+// 传 nil 不覆盖已注入的 sink —— "还没就绪"与"明确不要"在调用方是两件事, 而把
+// 前者实现成清空会让一次时序上的早调静默关掉整条 hook 池化。
+func (p *Pool) SetHookSink(s HookGroupSink) {
+	if p == nil || s == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.hookSink = s
+}
+
+// HookSink 返回已注入的装卸口 (可能为 nil = 未注入)。
+func (p *Pool) HookSink() HookGroupSink {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.hookSink
 }
 
 // NewPool 创建空池。

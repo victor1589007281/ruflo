@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // Simulator 场景模拟器。
@@ -271,10 +273,7 @@ func parseSimulationResult(mode string, rounds int, raw string) *SimulationResul
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return textutil.Truncate(s, n, "...")
 }
 
 // crisisSimulation 危机推演模拟。

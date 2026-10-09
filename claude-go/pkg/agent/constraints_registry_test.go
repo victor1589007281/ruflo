@@ -22,6 +22,13 @@ import (
 var toolNameCaps = map[string]agent.Capability{
 	"Read": agent.CapReadFS, "Glob": agent.CapReadFS, "Grep": agent.CapReadFS, "LSP": agent.CapReadFS,
 	"Write": agent.CapWriteFS, "StrReplace": agent.CapWriteFS,
+	// Rewind (H3-1) 是**整文件覆盖回旧版本** —— 与 Write/StrReplace 同维, 不是只读。
+	// 它天然只出现在可写档位里 (registerFileMutationTools), 所以归到哪一维对
+	// profileCaps 的表值没有影响; 但**必须归维**: 标 0 等于宣称"任何档位都可以
+	// 安全持有它", 而一个能覆盖整个文件的工具显然不是。
+	"Rewind": agent.CapWriteFS,
+	// Task 是 TaskCreate/Get/List/Stop/Output 的统一入口 (子代理委派), 与那一族同维。
+	"Task":          agent.CapTask,
 	"EnterWorktree": agent.CapWriteFS, "ExitWorktree": agent.CapWriteFS,
 	"Bash": agent.CapExec, "Shell": agent.CapExec, // Shell 是 Bash 的旧名 (别名), 两者同维
 	"TaskOutput": agent.CapExec, "TaskStop": agent.CapExec,
@@ -33,7 +40,7 @@ var toolNameCaps = map[string]agent.Capability{
 	"AskUserQuestion": agent.CapInteract,
 	"GenerateImage":   agent.CapMedia, "GenerateGIF": agent.CapMedia, "GenerateVideo": agent.CapMedia,
 	"GeneratePPTX": agent.CapMedia, "GenerateChart": agent.CapMedia, "GenerateSpeech": agent.CapMedia,
-	"TeamCreate": agent.CapTeam, "TeamDelete": agent.CapTeam, "TeamMailbox": agent.CapTeam,
+	"TeamCreate": agent.CapTeam, "TeamDelete": agent.CapTeam,
 	"Config": agent.CapAdminExtra, "Skill": agent.CapAdminExtra, "ComputerUseStatus": agent.CapAdminExtra,
 	"CronCreate": agent.CapAdminExtra, "CronDelete": agent.CapAdminExtra, "CronList": agent.CapAdminExtra,
 	// 进化操作台 evo_*(design/03 §4.7)。归 CapAdminExtra 而非新开一维, 因为它们是

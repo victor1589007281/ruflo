@@ -669,7 +669,45 @@ func (s *FileQueueTaskService) notifyWaiters(id string) {
 
 // startRun 启动执行 goroutine。runner 为 nil 时任务停在 pending —— 这是有意的诚实:
 // 没有执行器就不该把状态写成 running 假装在跑。
+//
+// ---------------------------------------------------------------------------
+// running 是**同步**落上的, 这一条是并发正确性的前提, 不是风格问题
+// ---------------------------------------------------------------------------
+//
+// 直到最近, 这里的 `transition(..., TaskStateRunning, ...)` 还写在 goroutine 内部。
+// 于是从本函数返回到那个 goroutine 被调度之间, 任务处在一个**任何人都会读成
+// pending** 的状态 —— 而 transition/Refine 的前置检查恰恰就是按状态判的:
+//
+//	A: CAS 成功 → Pending → startRun 返回 (running 还没落)
+//	B:            Get → 读到 Pending ⇒ "不在跑, 可以精修" ⇒ 放行 → 也成功
+//
+// 两次并发精修双双落上, 而 Refine 的 CAS 拦不住它 —— 那个 CAS 的 expect 是它自己
+// 刚刚 Get 到的那一个 revision, 两次调用读到的是**同一个**值, 谁都不会冲突。
+// `TestRefineIsCASGuarded` 的 -count=20 实测约 1/4 概率红, 单跑常绿。
+//
+// 同步落 running 把窗口整个消掉: 本函数返回时任务已经是 running, 后到的调用方要么
+// 被前置检查挡下 (报"正在运行"), 要么在 CAS 上撞到 revision 冲突。
+//
+// 对既有调用方是纯收紧: 它们本来就在本函数之前先把状态挪出终态了 (Resume/Refine 的
+// 注释写着这个理由), 所以"返回时是什么状态"从 pending 变成 running, 只影响那些
+// 本来就在抢跑的读写方。
 func (s *FileQueueTaskService) startRun(rec TaskRecord) {
+	if s.currentRunner() == nil {
+		return // 没有执行器: 停在 pending, 不假装在跑
+	}
+	// 同步置 running —— 见上方的论证。
+	cur := s.transition(rec.ID, TaskStateRunning, "", "")
+	s.launchRunner(cur)
+}
+
+// launchRunner 注册取消器并起执行 goroutine, 跑的是**传进来的那个档案**。
+//
+// 与 startRun 拆开, 是为了让它能被**已经持有 recordMu(id)** 的调用方 (Refine) 调用:
+// 它自己不碰 recordMu, 只碰 s.mu (另一把锁, 无嵌套关系), 所以不存在自锁。
+//
+// 传档案而不是传 id、也不在里面重新 Get: 调用方刚在临界区里决定"就是这个档案开始
+// 跑", 这里再读一次就又是两次独立的读 —— 正是本次要消掉的那类窗口。
+func (s *FileQueueTaskService) launchRunner(rec TaskRecord) {
 	runner := s.currentRunner()
 	if runner == nil {
 		return
@@ -696,8 +734,7 @@ func (s *FileQueueTaskService) startRun(rec TaskRecord) {
 			}
 		}()
 
-		cur := s.transition(rec.ID, TaskStateRunning, "", "")
-		out, err := runner.Run(ctx, cur)
+		out, err := runner.Run(ctx, rec)
 
 		// 被 Pause/Stop 中断时, 落到请求的那个状态而不是 failed —— 否则用户点了
 		// "暂停" 却在界面上看到 "失败", 是误导。
@@ -735,6 +772,16 @@ func (s *FileQueueTaskService) transition(id string, to TaskState, output, errMs
 	if !ok {
 		return TaskRecord{}
 	}
+	return s.transitionLocked(rec, to, output, errMsg)
+}
+
+// transitionLocked 是 transition 的主体, **调用方必须已持有 recordMu(id)**。
+//
+// 存在的理由只有一个: 有些状态迁移必须与"读当前状态"发生在**同一次持锁**里才正确
+// (Refine 就是这么用的 —— 见那里的论证)。不把它拆出来的话, 那些地方只能"先 Get 再
+// transition" —— 而那是两次独立的读, 中间的状态可以被别人观测到并据此做出错误决定。
+func (s *FileQueueTaskService) transitionLocked(rec TaskRecord, to TaskState, output, errMsg string) TaskRecord {
+	id := rec.ID
 	from := rec.State
 	rec.State = to
 	now := time.Now()
@@ -786,6 +833,16 @@ func (s *FileQueueTaskService) TransitionCAS(id string, expectRevision int64, mu
 	if !ok {
 		return TaskRecord{}, fmt.Errorf("taskservice: 任务 %q 不存在", id)
 	}
+	return s.transitionCASLocked(rec, expectRevision, mutate)
+}
+
+// transitionCASLocked 是 TransitionCAS 的主体, **调用方必须已持有 recordMu(id)**。
+//
+// 与 transitionLocked 拆出来的理由相同, 但更硬: 有些调用方需要在"判过状态之后、
+// 放锁之前"就把 CAS 落上, 否则中间那段又成了可被别人观测并据以决策的窗口
+// (Refine 就是这么用的 —— 见那里的论证)。
+func (s *FileQueueTaskService) transitionCASLocked(rec TaskRecord, expectRevision int64, mutate func(rec *TaskRecord) error) (TaskRecord, error) {
+	id := rec.ID
 	if rec.Revision != expectRevision {
 		s.appendJournal(id, rec.State, rec.State, rec.Revision, "conflict")
 		return rec, fmt.Errorf("%w: 任务 %s 期望 rev=%d 实际 rev=%d (当前态=%s)", ErrStateConflict, id, expectRevision, rec.Revision, rec.State)
@@ -950,22 +1007,81 @@ func (s *FileQueueTaskService) Resume(id string) error {
 // 转成 RefineTeam(name, feedback, targetStage)。
 // 留痕走 TransitionCAS (F12): 精修会改写目标参数, 是典型的外部多 agent 更新,
 // 必须带版本检查, 两个并发精修只有一个能落上。
+// 并发精修的两道闸必须**共用同一把 recordMu(id)**, 整段是一个临界区。
+//
+// 改造前它是"四次各自持锁的读改写": Get → (放锁) TransitionCAS → (放锁) transition
+// → startRun。于是两次并发 Refine 各自都能看到"不在跑"并各自把自己的 revision 当
+// 成 expect —— 谁也不冲突, 两条反馈都落上, 而 CAS 看起来明明在那儿。
+// 详细序列见函数体内那一段; 这里只留一句判据:
+//
+//	凡是"读状态 → 据此决定要不要改"的地方, 读与改必须在同一把锁里, 否则那个状态
+//	只是一个**快照**, 而不是一个前提。
+//
+// 换成 CAS 仍然必要 (它挡的是**外部**更新者: 面板、其它 agent), 只是它挡不住同一条
+// 路径上的并发调用 —— 那要靠这里的锁。
 func (s *FileQueueTaskService) Refine(id, feedback, fromNode string) error {
 	if strings.TrimSpace(feedback) == "" {
 		return fmt.Errorf("taskservice: 精修反馈不能为空")
 	}
+	if s.currentRunner() == nil {
+		return fmt.Errorf("taskservice: 未注入 TaskRunner, 无法精修")
+	}
+
+	// 判状态 → 留痕(CAS) → 置 Pending → 置 Running, **整段一次临界区**。
+	//
+	// ---------------------------------------------------------------------------
+	// 为什么这四步必须同锁 (并发精修曾经双双成功, -count=20 约 1/4 红)
+	// ---------------------------------------------------------------------------
+	//
+	// 拆开看, 两道闸各自都对, 合起来却一道也不挡:
+	//
+	//	① `State == Running` 前置检查 —— 拦不住, 因为 Refine **自己**紧接着会把状态
+	//	   写成 Pending (下面那句"先同步挪出终态"), 而 Pending 不是 Running;
+	//	② 用刚读到的 revision 做 CAS —— 也拦不住, 因为 expect 就是它自己刚 Get 到的
+	//	   那个值, 两次并发调用读到的是**同一个**数, 谁都不会冲突。
+	//
+	// 于是真正的序列是 (refinePending+exit 那对常量把窗口量到了 2:0):
+	//
+	//	A: 检查(非Running) → CAS → Pending(rev=2) ──── startRun: Running
+	//	B:                          检查: 读到 Pending ⇒ 放行 → CAS(expect=2) 也命中
+	//
+	// 关键窗口是 **A 写下的 Pending 到 Running 之间**。把 Running 提前到 startRun 的
+	// 同步部分**不够** —— 那只是把窗口挪了个位置, B 仍可在 A 走完 startRun 之前完成
+	// 自己那两步 (实测: 那样改完失败率反而从 1/4 升到 ~100%, 因为 Pending 的可见
+	// 窗口被拉长了)。唯一消得掉它的办法是让这四步成为一次临界区。
+	//
+	// 入口读一次: 记下本次调用**看到的**版本号, 它就是下面 CAS 的 expect。
+	//
+	// 这一读刻意留在锁外。锁内重读会把 expect 变成"接锁那一刻的当前值", CAS 于是
+	// 恒真 —— 两条并发精修双双成功而 CAS 一次都没拒过 (实测: 这样改完
+	// TestRefineIsCASGuarded -count=20 全红, 报的是"got 2 (errs=[<nil> <nil>])")。
+	// 乐观并发的语义本来就是"我读到的是第 N 版, 只有它还是第 N 版我才落" —— 把 N
+	// 换成"最新版"不是加强它, 而是把它变成一句空话。
+	entry, ok := s.Get(id)
+	if !ok {
+		return fmt.Errorf("taskservice: 任务 %q 不存在", id)
+	}
+
+	lock := s.recordMu(id)
+	lock.Lock()
+	defer lock.Unlock()
+
 	rec, ok := s.Get(id)
 	if !ok {
 		return fmt.Errorf("taskservice: 任务 %q 不存在", id)
 	}
+	// 这道检查就在锁内: 锁把 A 的整个"判→Pending→Running"与 B 的这次读隔开了,
+	// 挪到锁外它就只是一行装饰。
 	if rec.State == TaskStateRunning {
-		return fmt.Errorf("taskservice: 任务 %q 正在运行, 先 Pause/Stop 再精修", id)
+		return fmt.Errorf("%w: 任务 %q 正在运行, 先 Pause/Stop 再精修", ErrStateConflict, id)
 	}
-	if s.currentRunner() == nil {
-		return fmt.Errorf("taskservice: 未注入 TaskRunner, 无法精修")
-	}
-	expect := rec.Revision
-	_, err := s.TransitionCAS(id, expect, func(r *TaskRecord) error {
+
+	// 精修留痕: 改 Param 是外部可见的更新, 走 CAS (F12) 并留 conflict 事件。
+	// expect 用**入口那一次**读到的 revision, 不是这次锁内读到的 —— 这才让"两次并发
+	// 精修恰好一个落上"成立: 两者读到同一个 N, 先到的把版本抬走, 后到的 CAS 撞车。
+	// 失败**原样返回** (不裹成"精修留痕失败"): 那个包裹会让 errors.Is 认不出
+	// ErrStateConflict, 而调用方与用例正是靠它分辨"该重试"还是"真出错"。
+	after, err := s.transitionCASLocked(rec, entry.Revision, func(r *TaskRecord) error {
 		r.Refines = append(r.Refines, TaskRefine{At: time.Now(), Feedback: feedback, FromNode: fromNode})
 		if r.Spec.Params == nil {
 			r.Spec.Params = map[string]any{}
@@ -975,14 +1091,22 @@ func (s *FileQueueTaskService) Refine(id, feedback, fromNode string) error {
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("taskservice: 精修留痕失败: %w", err)
+		return err
 	}
 	if err := s.active.Put(activeKey(rec.Spec), rec.ID); err != nil {
 		s.writeErr.Add(1)
 	}
-	// 同 Resume: 先同步挪出终态, 再异步开跑 (让紧随其后的 Wait 等的是这一轮)。
-	rec = s.transition(rec.ID, TaskStatePending, "", "")
-	s.startRun(rec)
+	// 同 Resume: 先同步挪出终态, 再开跑 —— 且**本段仍未放锁**, 所以后到的 Refine
+	// 只可能看到 running (被上面那句挡下) 而不会看到一个"可以抢跑"的 pending。
+	//
+	// 起点用 CAS 返回的 after 而不是上面那个 rec: rec 是 CAS **之前**的副本, 它
+	// 的 Revision 已经过期 (transitionLocked 不看 Revision, 所以这是"碰巧能跑对"),
+	// 而且它身上没有刚追加的那条 Refine 留痕。
+	cur := s.transitionLocked(after, TaskStatePending, "", "")
+	// 置 running 与起 goroutine 都还在临界区里。起 goroutine 本可以放到放锁之后
+	// (状态已是 running, B 照样被挡), 留在里面是为了让"本函数返回时这一轮真的在跑"
+	// 成为无条件的 —— 调用方紧接着 Wait 时, 不存在一个"已 running 但没人跑"的瞬间。
+	s.launchRunner(s.transitionLocked(cur, TaskStateRunning, "", ""))
 	return nil
 }
 

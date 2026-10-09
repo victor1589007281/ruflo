@@ -1050,15 +1050,29 @@ func testSafeOnlyIntent(t *testing.T, report *WikiEvalReport) {
 		t.Log("✓ '停止团队' 正确识别为 stop")
 	}
 
-	// 15.5 TeamMailbox 名称更新
+	// 15.5 假投递工具 TeamMailbox 已从工具池消失 (2026-09-25, 21.8.9-D6)。
+	//
+	// 原先这一格断的是"SendMessage 已重命名为 TeamMailbox" —— 一条**只证明改名发生过**
+	// 的断言。改名后的那个工具把消息写进一个零读者的 map 却回「已投递消息给 %q」,
+	// 于是模型相信送达了、不再用别的方式传达。所以这一格现在断的是它**不存在**,
+	// 双向都断: 它没了 (负), 而团队编排工具还在 (正, 否则等于把整组一起删了)。
 	ts := builtin.NewTeamStore()
-	sendTool := builtin.NewSendMessageTool(ts)
-	if sendTool.Name() == "TeamMailbox" {
+	reg := tool.NewRegistry()
+	reg.Register(builtin.NewTeamCreateTool(ts))
+	reg.Register(builtin.NewTeamDeleteTool(ts))
+	names := map[string]bool{}
+	for _, n := range reg.Names() {
+		names[n] = true
+	}
+	if !names["TeamMailbox"] && names["TeamCreate"] && names["TeamDelete"] {
 		score += 2
-		t.Log("✓ SendMessage 已重命名为 TeamMailbox")
+		t.Log("✓ 假投递工具 TeamMailbox 已移除, 团队编排工具仍在")
+	} else {
+		t.Errorf("工具池状态不对: TeamMailbox=%v TeamCreate=%v TeamDelete=%v",
+			names["TeamMailbox"], names["TeamCreate"], names["TeamDelete"])
 	}
 
-	report.Add("safe-intent", "安全意图识别+工具重命名", score, 10, "创建阻断+状态查询+停止+TeamMailbox")
+	report.Add("safe-intent", "安全意图识别+假投递工具移除", score, 10, "创建阻断+状态查询+停止+TeamMailbox移除")
 }
 
 // --- 16. 团队报告持久化 ---
@@ -1189,7 +1203,7 @@ func testResearchRoleDiff(t *testing.T, report *WikiEvalReport) {
 	// 18.1 角色应各不相同
 	roles := make(map[string]bool)
 	for _, stage := range wf.Stages {
-		roles[stage.Role] = true
+		roles[stage.Agent] = true
 	}
 	if len(roles) >= 3 {
 		score += 3
@@ -1199,7 +1213,7 @@ func testResearchRoleDiff(t *testing.T, report *WikiEvalReport) {
 	// 18.2 不应该全是 "researcher"
 	allResearcher := true
 	for _, stage := range wf.Stages {
-		if stage.Role != "researcher" && stage.Role != "synthesizer" {
+		if stage.Agent != "researcher" && stage.Agent != "synthesizer" {
 			allResearcher = false
 			break
 		}
@@ -1929,7 +1943,7 @@ func testTestShiftLeft(t *testing.T, report *WikiEvalReport) {
 	}
 
 	// 29.2 test 角色是 tester
-	if testStage != nil && testStage.Role == "tester" {
+	if testStage != nil && testStage.Agent == "tester" {
 		score += 2
 		t.Log("✓ test 使用 tester 角色")
 	}
@@ -2070,7 +2084,7 @@ func testCrossRoundContext(t *testing.T, report *WikiEvalReport) {
 
 	// 32.1 adversarial_dev 模式支持 {adversarial_feedback} 占位符
 	for _, s := range wf.Stages {
-		if s.Role == "coder" && strings.Contains(s.Prompt, "{adversarial_feedback}") {
+		if s.Agent == "coder" && strings.Contains(s.Prompt, "{adversarial_feedback}") {
 			score += 2
 			t.Log("✓ coder prompt 包含 {adversarial_feedback} 占位符")
 			break
@@ -2315,7 +2329,7 @@ func testArchitectPlanDesign(t *testing.T, report *WikiEvalReport) {
 
 	// 37.1 架构师 prompt 包含任务计划 (WBS) 要求
 	for _, s := range wf.Stages {
-		if s.Role == "architect" {
+		if s.Agent == "architect" {
 			if strings.Contains(s.Prompt, "任务") && strings.Contains(s.Prompt, "验收标准") {
 				score += 2
 				t.Log("✓ 架构师 prompt 包含任务分解+验收标准要求")
@@ -2369,7 +2383,7 @@ func testTesterE2ECapability(t *testing.T, report *WikiEvalReport) {
 
 	// 38.1 tester prompt 包含三层测试金字塔
 	for _, s := range wf.Stages {
-		if s.Role == "tester" {
+		if s.Agent == "tester" {
 			if strings.Contains(s.Prompt, "端到端") || strings.Contains(s.Prompt, "E2E") {
 				score += 3
 				t.Log("✓ tester prompt 包含端到端测试要求")
@@ -2619,7 +2633,7 @@ func testDesignDriftDetection(t *testing.T, report *WikiEvalReport) {
 	wf := agent.GetWorkflow("development")
 	if wf != nil {
 		for _, s := range wf.Stages {
-			if s.Role == "reviewer" {
+			if s.Agent == "reviewer" {
 				if strings.Contains(s.Prompt, "design_alignment") {
 					score += 2
 					t.Log("✓ Reviewer prompt 包含 design_alignment 评分维度")
@@ -2654,7 +2668,7 @@ func testRoleSeparation(t *testing.T, report *WikiEvalReport) {
 	// 44.1 工作流包含 research 阶段
 	hasResearch := false
 	for _, s := range wf.Stages {
-		if s.Name == "research" && s.Role == "researcher" {
+		if s.Name == "research" && s.Agent == "researcher" {
 			hasResearch = true
 			score += 2
 			t.Log("✓ development 包含独立的 research 阶段")
@@ -2681,7 +2695,7 @@ func testRoleSeparation(t *testing.T, report *WikiEvalReport) {
 
 	// 44.3 plan 阶段存在且依赖 design
 	for _, s := range wf.Stages {
-		if s.Name == "plan" && s.Role == "planner" {
+		if s.Name == "plan" && s.Agent == "planner" {
 			for _, dep := range s.DependsOn {
 				if dep == "design" {
 					score += 2
@@ -2752,7 +2766,7 @@ func testPlannerAgent(t *testing.T, report *WikiEvalReport) {
 	found := false
 	if wf != nil {
 		for _, s := range wf.Stages {
-			if s.Role == "planner" {
+			if s.Agent == "planner" {
 				found = true
 				break
 			}
@@ -2907,6 +2921,11 @@ func (m *mockDAGTracker) ReevaluateBlockedTasks() int {
 	return unblocked
 }
 
+// SweepStaleTasks 与真实 TaskStore 同语义的假实现 (TTL 维度在假实现里不建模)。
+func (m *mockDAGTracker) SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int {
+	return m.ReevaluateBlockedTasks()
+}
+
 // --- 46. DAG 编排器 (V2 TaskStore 复用 + DynTaskMAS) ---
 
 func testOrchestratorDAG(t *testing.T, report *WikiEvalReport) {
@@ -3016,7 +3035,7 @@ func testMicroTestInLoop(t *testing.T, report *WikiEvalReport) {
 	if wf != nil {
 		hasTester := false
 		for _, s := range wf.Stages {
-			if s.Role == "tester" {
+			if s.Agent == "tester" {
 				hasTester = true
 				break
 			}
@@ -3051,7 +3070,7 @@ func testE2EPhase3(t *testing.T, report *WikiEvalReport) {
 	// 48.1 tester 作为 Parallel 收尾阶段
 	hasTesterParallel := false
 	for _, s := range wf.Stages {
-		if s.Role == "tester" && s.Parallel {
+		if s.Agent == "tester" && s.Parallel {
 			hasTesterParallel = true
 			break
 		}
@@ -3065,7 +3084,7 @@ func testE2EPhase3(t *testing.T, report *WikiEvalReport) {
 	_, _, _, parallel := agent.ClassifyStages(wf.Stages)
 	hasTesterInParallel := false
 	for _, s := range parallel {
-		if s.Role == "tester" {
+		if s.Agent == "tester" {
 			hasTesterInParallel = true
 			break
 		}

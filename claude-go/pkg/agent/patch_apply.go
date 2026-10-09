@@ -1,6 +1,5 @@
 package agent
 
-
 import (
 	"fmt"
 	"go/ast"
@@ -17,26 +16,26 @@ import (
 // Replacement 中可包含 "//...existing code..." 占位符来保留原内容。
 type EditSnippet struct {
 	File        string `json:"file"`
-	StartMarker string `json:"start_marker"` // 唯一标识定位点（精确匹配代码片段）
+	StartMarker string `json:"start_marker"`         // 唯一标识定位点（精确匹配代码片段）
 	EndMarker   string `json:"end_marker,omitempty"` // 可选结束标记
-	Replacement string `json:"replacement"`  // 新代码
+	Replacement string `json:"replacement"`          // 新代码
 }
 
 // ApplyResult 应用结果
 type ApplyResult struct {
-	Success      bool            `json:"success"`
-	Changed      []string        `json:"changed"`
-	Conflicts    []EditConflict  `json:"conflicts,omitempty"`
-	SyntaxErrors []SyntaxError   `json:"syntax_errors,omitempty"`
+	Success      bool           `json:"success"`
+	Changed      []string       `json:"changed"`
+	Conflicts    []EditConflict `json:"conflicts,omitempty"`
+	SyntaxErrors []SyntaxError  `json:"syntax_errors,omitempty"`
 }
 
 // EditConflict 编辑冲突
 type EditConflict struct {
-	File1    string `json:"file1"`
-	Marker1  string `json:"marker1"`
-	File2    string `json:"file2"`
-	Marker2  string `json:"marker2"`
-	Reason   string `json:"reason"`
+	File1   string `json:"file1"`
+	Marker1 string `json:"marker1"`
+	File2   string `json:"file2"`
+	Marker2 string `json:"marker2"`
+	Reason  string `json:"reason"`
 }
 
 // SyntaxError 语法错误

@@ -26,9 +26,15 @@ package agent
 //     这一份角色超时真源); 门禁关键词 → gate 形态与 Deterministic; 工作流元数据
 //     → GraphMeta; 图级默认重试策略 (见下文"重试让位")。
 //  2. **per-workflow 图覆盖表** (WorkflowGraphOverride): 按 工作流名 + 阶段名
-//     声明条件边 / Loop / 重试 / 超时 / 工具画像 / MaxTurns。两个注入入口:
-//     进程内 RegisterGraphOverride (内置或动态工作流注册时一并声明),
-//     以及 CLAUDE_GO_GRAPH_OVERRIDES=<file.json> (免重编译, 运维可注入)。
+//     声明条件边 / Loop / 重试 / 超时 / 工具画像 / MaxTurns。三个注入入口:
+//     工作流定义里的 WorkflowDef.Graph (21.8.12 P5/X3, 随定义落盘, 优先级最高)、
+//     进程内 RegisterGraphOverride (registerWorkflowLocked / UpdateWorkflow 调用),
+//     以及 CLAUDE_GO_GRAPH_OVERRIDES=<file.json> (免重编译, 运维可注入, 兜底)。
+//
+//     ★ 这句注释曾与代码相反: 上面写的"注册时一并声明"在 X3 之前**没有对应的调用点**
+//     (RegisterGraphOverride 全仓零生产调用方), 于是"给自定义工作流派 loop-group"
+//     在落盘 JSON 里根本没有写法。现在那条路真的通了, 三个入口的优先级也是**构造性**的
+//     (定义 > 进程内 > env), 不依赖首次 Lookup 的相对时序 —— 见 graphOverrideEnvTbl。
 //
 // **条件边只接受显式声明, 绝不从阶段名猜**: 从名字推断路由等于把 design/01 明确
 // 反对的"按工作流名白名单"搬到调度层; 而且猜错的代价是静默跳过整条分支
@@ -158,6 +164,11 @@ type StageGraphOverride struct {
 	// ToolProfile 显式工具画像, 取代宿主按角色名子串猜 (design/01 §4.1)。
 	// 经 NodeExecHints 下传给 CreateAgentFunc 实现消费。
 	ToolProfile string `json:"toolProfile,omitempty"`
+	// Tools 显式工具白名单 (21.8.12 P3/W5)。**指针**: nil = 覆盖表没写这一栏,
+	// &[] = 显式空名单 (拒绝一切) —— 与 StageTools.Allow 逐条同义。
+	Tools *[]string `json:"tools,omitempty"`
+	// DisallowedTools 追加的工具黑名单 (并集)。
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
 	// MaxTurns 覆盖本节点的模型最大轮数 (0=不覆盖)。
 	MaxTurns int `json:"maxTurns,omitempty"`
 	// Deterministic 声明本节点为纯代码判定 (gate 节点走 runGate 的确定性分支, 零 LLM)。
@@ -166,6 +177,16 @@ type StageGraphOverride struct {
 	// 渲染阶段写 {"require":["browser"]}, 于是它只会被派到有 browser 能力的 runtime。
 	// 不声明时沿用进程级默认 (`--placement-prefer` + 团队亲和), 行为与改造前一致。
 	Placement *graph.PlacementSpec `json:"placement,omitempty"`
+	// Subgraph 把本阶段声明成"引用另一张已注册的图" (nodeKind=subgraph)。
+	//
+	// 缺了它, graph.NodeKindSubgraph 在生产上**不可达**: 直译器的 kind 白名单里没有
+	// subgraph, 而 RegisterGraph 全仓零调用 —— 于是"子流程复用"这件事只在 pkg/graph
+	// 的测试里跑过 (21.8.12 P1/D4 的判据)。
+	//
+	// 引用的图名必须已被 RegisterGraph 注册; 这里只做形状校验 (**存在性由开图时的
+	// spec.Validate 裁决**), 因为同名图的注册可能发生在本次直译之后 (工作流之间的
+	// 注册顺序不该决定合法性 —— 与 RegisterGraph 自己的注释同一口径)。
+	Subgraph *graph.SubgraphSpec `json:"subgraph,omitempty"`
 }
 
 // WorkflowGraphOverride 一个工作流的图能力声明。
@@ -211,9 +232,30 @@ var (
 	graphOverrideTbl  = map[string]WorkflowGraphOverride{}
 	graphOverrideOnce sync.Once
 	graphOverrideErr  error
+
+	// graphOverrideEnvTbl 由 CLAUDE_GO_GRAPH_OVERRIDES 指向的文件装入的那一份。
+	//
+	// ★ 与 graphOverrideTbl **分成两张表**是 21.8.12 P5/X3 的一部分, 不是洁癖:
+	// 改造前只有一张表, 而 env 文件的载入是**懒**的 (首次 Lookup 才发生)。
+	// 于是"谁赢"取决于**调用顺序**: 进程内先注册、env 后载入 ⇒ env 静默盖掉它。
+	// 那是本仓最忌讳的一类缺陷 —— 两个来源写同一个位置, 结果由时序决定, 而两边
+	// 都以为自己是唯一的声明方。
+	//
+	// 分表之后优先级是**构造性**的, 与时序无关: 进程内声明恒优先, env 只是兜底。
+	// 这个方向也是刻意的 —— 定义里的声明受版本守卫保护、随资产一起走, 而 env 是
+	// 一次性的运维注入。按优先级丢掉后者是可解释的; 反过来的话, 一个被 revision
+	// 管理着的声明会静默失效, 那正是"声明了但没人读"。
+	graphOverrideEnvTbl = map[string]WorkflowGraphOverride{}
+	// graphOverrideShadowWarned 记录已为哪些名字报过"env 条目被遮蔽"。
+	// 逐名一次: Lookup 在直译热路径上 (每次跑工作流都会走到), 每次都报会把日志刷爆,
+	// 而这条信息本身是**每名字恒真**的 —— 恒真的告警只会训练人跳过它。
+	graphOverrideShadowWarned = map[string]bool{}
 )
 
 // RegisterGraphOverride 注册 (或整体替换) 一个工作流的图能力声明。并发安全。
+//
+// 它对 env 文件里的同名条目**恒胜** (见 graphOverrideEnvTbl 的注释)。遮蔽会有一次
+// 告警, 在 Lookup 处发出 (那里两张表都可见)。
 func RegisterGraphOverride(workflow string, ov WorkflowGraphOverride) {
 	name := strings.TrimSpace(workflow)
 	if name == "" {
@@ -221,29 +263,60 @@ func RegisterGraphOverride(workflow string, ov WorkflowGraphOverride) {
 	}
 	graphOverrideMu.Lock()
 	graphOverrideTbl[name] = ov
+	delete(graphOverrideShadowWarned, name) // 重新注册后允许再报一次
 	graphOverrideMu.Unlock()
 }
 
-// UnregisterGraphOverride 移除一个工作流的图能力声明 (动态工作流被删除时应同时清理)。
+// UnregisterGraphOverride 移除一个工作流的**进程内**图能力声明 (动态工作流被删除或
+// 改写为不再声明时应同时清理)。
+//
+// 只清进程内那一张: env 条目属于运维, 删一个工作流不该顺手改运维的注入面。
 func UnregisterGraphOverride(workflow string) {
+	name := strings.TrimSpace(workflow)
 	graphOverrideMu.Lock()
-	delete(graphOverrideTbl, strings.TrimSpace(workflow))
+	delete(graphOverrideTbl, name)
+	delete(graphOverrideShadowWarned, name)
 	graphOverrideMu.Unlock()
 }
 
 // LookupGraphOverride 读取某工作流的图能力声明 (第二返回值 = 是否声明过)。
 // 首次调用时懒加载 CLAUDE_GO_GRAPH_OVERRIDES 指向的文件。
+//
+// 优先级: **进程内声明 > env 文件**。优先的那个生效, 被遮蔽的那个只报一次告警 ——
+// 运维按 env 配置完之后发现没生效, 必须有个地方说得出为什么。
 func LookupGraphOverride(workflow string) (WorkflowGraphOverride, bool) {
 	graphOverrideOnce.Do(loadGraphOverridesFromEnv)
+	name := strings.TrimSpace(workflow)
+	graphOverrideMu.RLock()
+	ov, ok := graphOverrideTbl[name]
+	_, inEnv := graphOverrideEnvTbl[name]
+	needWarn := ok && inEnv && !graphOverrideShadowWarned[name]
+	graphOverrideMu.RUnlock()
+	if needWarn {
+		graphOverrideMu.Lock()
+		graphOverrideShadowWarned[name] = true
+		graphOverrideMu.Unlock()
+		logging.For("agent").Warn(
+			"工作流的图能力声明遮蔽了 CLAUDE_GO_GRAPH_OVERRIDES 里的同名条目 (进程内声明优先); "+
+				"想让 env 那份生效, 请先去掉工作流定义里的 graph 段",
+			"workflow", name)
+	}
+	if ok {
+		return ov, true
+	}
 	graphOverrideMu.RLock()
 	defer graphOverrideMu.RUnlock()
-	ov, ok := graphOverrideTbl[strings.TrimSpace(workflow)]
+	ov, ok = graphOverrideEnvTbl[name]
 	return ov, ok
 }
 
 // LoadGraphOverridesJSON 从 JSON 载入覆盖表, 形如
 // {"<工作流名>": {"maxParallel":2, "stages": {"<阶段名>": {...}}}}。
 // 同名工作流整体替换。
+//
+// ★ 它写的是 **env/文件那一张表**: 本函数就是 CLAUDE_GO_GRAPH_OVERRIDES 的解析器
+// (loadGraphOverridesFromEnv 调它), 对外也当"按文件语义注入一份覆盖表"用。因此它
+// 不覆盖进程内注册 —— 与 RegisterGraphOverride 是两个投放面, 不是同一个。
 func LoadGraphOverridesJSON(data []byte) error {
 	var tbl map[string]WorkflowGraphOverride
 	if err := json.Unmarshal(data, &tbl); err != nil {
@@ -252,11 +325,133 @@ func LoadGraphOverridesJSON(data []byte) error {
 	graphOverrideMu.Lock()
 	for name, ov := range tbl {
 		if n := strings.TrimSpace(name); n != "" {
-			graphOverrideTbl[n] = ov
+			graphOverrideEnvTbl[n] = ov
 		}
 	}
 	graphOverrideMu.Unlock()
 	return nil
+}
+
+// WorkflowGraphPolicy 工作流**自己**声明的图能力 (21.8.12 P5 / X3), 写在 WorkflowDef.Graph。
+//
+// ---------------------------------------------------------------------------
+// 为什么它是 WorkflowGraphOverride 的一个真子集, 而不是直接复用它
+// ---------------------------------------------------------------------------
+//
+// 覆盖表里有两层东西, 它们的**归宿不同**:
+//
+//   - 阶段级的那些 (kind/condition/retry/loop/tools/...): P4 已经把它们搬到 StageDef
+//     上了, 阶段自己就能声明。若这里再开一个 Stages 字段, 同一个语义就有了两条送达
+//     路径 —— 而本仓的纪律是"同一条声明只能有一条送达路径"(见 agent_assets.go 文件头
+//     那条实测反证: 两条路送达时, 删掉任意一条测试都依然全绿)。
+//   - 工作流级的四个 (maxParallel / defaultRetry / maxTotalNodes / groups): StageDef
+//     **表达不了**, 它们不属于任何单个阶段。改造前这四个只能用 CLAUDE_GO_GRAPH_OVERRIDES
+//     注入, 或调 RegisterGraphOverride —— 而后者全仓**零生产调用方**, 于是"给一个
+//     自定义工作流派 loop-group"在落盘 JSON 里根本没有写法。
+//
+// 所以这个类型只装后者。**字段名与 JSON 标签逐条对齐 WorkflowGraphOverride** —— 同一份
+// 覆盖表可以在 env 文件与工作流定义之间整段搬运。
+type WorkflowGraphPolicy struct {
+	MaxParallel   int                  `json:"maxParallel,omitempty"`   // 图级并发上限 (0=用 executor 的 effectiveParallel)
+	DefaultRetry  *graph.RetryPolicy   `json:"defaultRetry,omitempty"`  // 图级默认重试 (nil=用 graphOuterMaxRetries)
+	MaxTotalNodes int                  `json:"maxTotalNodes,omitempty"` // 运行图节点总数上限 (0=引擎默认)
+	Groups        []StageGroupOverride `json:"groups,omitempty"`        // 组级循环声明 (见 StageGroupOverride)
+}
+
+// toOverride 把工作流级策略并进一份覆盖表条目 (阶段级留空 —— 那由 StageDef 声明)。
+func (p *WorkflowGraphPolicy) toOverride() WorkflowGraphOverride {
+	if p == nil {
+		return WorkflowGraphOverride{}
+	}
+	return WorkflowGraphOverride{
+		MaxParallel:   p.MaxParallel,
+		DefaultRetry:  p.DefaultRetry,
+		MaxTotalNodes: p.MaxTotalNodes,
+		Groups:        append([]StageGroupOverride(nil), p.Groups...),
+	}
+}
+
+// Validate 校验工作流级图能力声明, 供 ValidateAll 在**书写期**调用。
+//
+// ---------------------------------------------------------------------------
+// 为什么这些检查要在书写期做, 而不是留给直译期
+// ---------------------------------------------------------------------------
+//
+// foldStageGroups 已经把这一套全查了 —— 但它是**直译期**的检查, 也就是"唯一一次
+// 真的跑起来的时候"。一个 maxIterations=0 的组声明若能存下来, 它就是一枚定时炸弹:
+// POST 返回 200、GET 回来一字不差、直到某次真跑才炸, 而那时报出来的是图引擎的错误,
+// 排查方向完全在别处。
+//
+// 这些检查**不依赖任何注册表状态** (成员是否存在、是否被两个组收编、resultFrom 是否
+// 是成员、ID 是否与阶段撞名 —— 全是这份定义自己就能回答的), 所以不存在"留到开图时
+// 才判"的理由。与之相对, subgraph 的**存在性**必须留到开图时 (被引用的图可能注册在
+// 本次之后), 那一条不走这里 —— 两者的分界就是"能不能只靠这份定义回答"。
+//
+// 报错文案与 foldStageGroups 的**逐字一致**: 同一条声明写错, 用户在 POST 时看到的
+// 与在运行日志里看到的必须是同一句话, 否则这两条信息会被当成两个不同的毛病。
+func (p *WorkflowGraphPolicy) Validate(stageNames map[string]bool) error {
+	if p == nil {
+		return nil
+	}
+	if p.MaxParallel < 0 {
+		return fmt.Errorf("graph_adapter: maxParallel 不能为负 (%d)", p.MaxParallel)
+	}
+	if p.MaxTotalNodes < 0 {
+		return fmt.Errorf("graph_adapter: maxTotalNodes 不能为负 (%d)", p.MaxTotalNodes)
+	}
+	consumed := map[string]string{} // 成员阶段 → 收编它的组 ID
+	seenID := map[string]bool{}
+	for _, g := range p.Groups {
+		if len(g.Members) == 0 {
+			return fmt.Errorf("graph_adapter: 组声明 %q 没有成员", g.ID)
+		}
+		if g.MaxIterations <= 0 {
+			return fmt.Errorf("graph_adapter: 组 %q 的 maxIterations 必须 > 0 (无界循环违法)", g.ID)
+		}
+		groupID := strings.TrimSpace(g.ID)
+		if groupID == "" {
+			groupID = "loop-" + g.Members[0]
+		}
+		if stageNames[groupID] {
+			return fmt.Errorf("graph_adapter: 组 ID %q 与已有阶段同名", groupID)
+		}
+		if seenID[groupID] {
+			return fmt.Errorf("graph_adapter: 组 ID %q 重复", groupID)
+		}
+		seenID[groupID] = true
+		member := map[string]bool{}
+		for _, name := range g.Members {
+			if other, dup := consumed[name]; dup {
+				return fmt.Errorf("graph_adapter: 阶段 %q 被两个组同时收编 (%s / %s)", name, other, groupID)
+			}
+			if !stageNames[name] {
+				return fmt.Errorf("graph_adapter: 组 %q 的成员 %q 不是本工作流的阶段", groupID, name)
+			}
+			consumed[name] = groupID
+			member[name] = true
+		}
+		if rf := strings.TrimSpace(g.ResultFrom); rf != "" && !member[rf] {
+			return fmt.Errorf("graph_adapter: 组 %q 的 resultFrom=%q 不是组成员", groupID, rf)
+		}
+	}
+	return nil
+}
+
+// Clone 深拷贝一份 (Groups 切片与 DefaultRetry 都不与调用方共享)。
+//
+// 需要它的理由与 StageDef 的深拷贝一致: 注册表里存的是定义, 而进出注册表的都是
+// **副本** —— 共享一个切片指针的话, 调用方改一下自己那份就改了运行时那份。
+func (p *WorkflowGraphPolicy) Clone() *WorkflowGraphPolicy {
+	if p == nil {
+		return nil
+	}
+	out := *p
+	out.Groups = append([]StageGroupOverride(nil), p.Groups...)
+	if p.DefaultRetry != nil {
+		r := *p.DefaultRetry
+		out.DefaultRetry = &r
+	}
+	return &out
 }
 
 // GraphOverrideLoadError 返回 CLAUDE_GO_GRAPH_OVERRIDES 的加载错误 (nil=无错)。
@@ -271,19 +466,77 @@ func GraphOverrideLoadError() error {
 
 // stageDeclaredOverride 读取 StageDef **自身**声明的图能力。
 //
-// 现在恒返回零值 —— StageDef 只有五个字段 (定义在 workflow.go, 不在本次改动范围)。
-// 这里是唯一的接线口: 一旦给 StageDef 补上字段 (建议 json 名与 StageGraphOverride
-// 保持一致: kind/condition/edgeConditions/retry/timeoutSec/loop/toolProfile/
-// maxTurns/deterministic), 只需在此把字段搬进 StageGraphOverride —— 直译器与
-// "覆盖表优先"的合并规则一行都不用改, 动态工作流的 JSON 也就自动能表达图能力。
-func stageDeclaredOverride(_ StageDef) StageGraphOverride {
-	return StageGraphOverride{}
+// 这里是唯一的接线口: 给 StageDef 补字段时只需在此把字段搬进 StageGraphOverride ——
+// 直译器与"覆盖表优先"的合并规则一行都不用改, 动态工作流的 JSON 也就自动能表达图能力。
+//
+// P3/W5 搬进来的是 Tools 的三项; P4 把原来"还在覆盖表侧"的九个
+// (kind/condition/edgeConditions/retry/timeoutSec/loop/maxTurns/deterministic/placement)
+// 一次补齐 —— 这正是 P4 把 X1 与 X2 合并成一次改动的原因 (同一个结构体不该改两遍)。
+//
+// 搬完之后, **StageDef 上没有任何一个图能力字段是只写在覆盖表里的**:
+// 缺口 ① 的判据 ("自定义工作流的 JSON 表达不出任何图能力") 到此为止。
+//
+// ★ 为什么不把字段直接挂到 StageDef 上就完事: 从 StageDef 到运行期的宿主
+// 之间隔着图直译器 (WorkflowDef → GraphSpec → NodeSpec → stageNodeRunner 重建的
+// StageDef), 那条路上没有一个环节持有原 StageDef。只把字段加在 StageDef 上而不经这里
+// 搬一次, 结果就是"pipeline 路径生效、graph 路径静默不生效" —— 一份声明在两条执行
+// 路径上给出两个结果, 而读数上看不出哪条路在跑。
+func stageDeclaredOverride(st StageDef) StageGraphOverride {
+	var out StageGraphOverride
+	// —— 图能力九项 (P4/X1) ——
+	//
+	// 逐字段照搬, 不做任何取值判断: 零值就保持零值。这一层的职责是"搬运", 判断
+	// 留给 mergeStageOverride 与直译器 —— 在这里顺手加一个"空串就不搬"会让
+	// "显式声明为空"与"没声明"在这里就被抹平, 而 downstream 恰恰依赖那个区分
+	// (Deterministic 这类布尔字段的语义正是靠它)。
+	out.Kind = st.Kind
+	out.Condition = st.Condition
+	if len(st.EdgeConditions) > 0 {
+		// 复制: 与下面 Allow 同一条理由, 这份 map 会被就地改。
+		m := make(map[string]string, len(st.EdgeConditions))
+		for k, v := range st.EdgeConditions {
+			m[k] = v
+		}
+		out.EdgeConditions = m
+	}
+	out.Retry = st.Retry
+	out.TimeoutSec = st.TimeoutSec
+	out.Loop = st.Loop
+	out.MaxTurns = st.MaxTurns
+	out.Deterministic = st.Deterministic
+	out.Placement = st.Placement
+
+	// —— 工具面三项 (P3/W5) ——
+	if st.Tools == nil {
+		return out
+	}
+	out.ToolProfile = st.Tools.Profile
+	if st.Tools.Allow != nil {
+		// 复制: 覆盖表这份会被直译器读很多次并可能被就地改, 而它现在指着的还是
+		// **注册表里那一份** StageDef 的底层数组 —— 与 registerWorkflowLocked 里
+		// 深拷贝 Stages 是同一条理由。
+		allow := append([]string{}, (*st.Tools.Allow)...)
+		out.Tools = &allow
+	}
+	if len(st.Tools.Deny) > 0 {
+		out.DisallowedTools = append([]string(nil), st.Tools.Deny...)
+	}
+	return out
 }
 
 // mergeStageOverride 合并"阶段自身声明"(decl) 与"覆盖表声明"(ov), **覆盖表优先**。
 // 覆盖表是运维/灰度期的最后一跳 (可经 JSON 热注入), 必须压得住工作流定义里的声明;
 // 逐字段合并而非整体替换, 是为了让覆盖表只写要改的那一项 (例如只补一条条件边)。
 func mergeStageOverride(decl, ov StageGraphOverride) StageGraphOverride {
+	// ⚠️ 这里逐字段手抄合并规则, 所以**加一个 StageGraphOverride 字段就要在这里加一行**。
+	//
+	// 忘了加的表现是"覆盖表里写了不生效", 而不是任何形式的报错: 覆盖表是 JSON 反序列化
+	// 出来的, 缺的那一行的字段在 out 里保持 decl 的值 (通常是零值), 于是声明被静默丢弃。
+	// 本轮加 Subgraph 时就是这样被自己的测试抓到的 (TestTranslateSubgraphNode 报
+	// "声明 kind=subgraph 但缺少 subgraph 策略")。
+	//
+	// 没有改成反射式的"非零即覆盖": 那会让"显式声明为 false/0"与"没声明"变得不可区分,
+	// 而本类型里 Deterministic 这类布尔字段的语义恰恰依赖这个区分。
 	out := decl
 	if ov.Kind != "" {
 		out.Kind = ov.Kind
@@ -319,8 +572,20 @@ func mergeStageOverride(decl, ov StageGraphOverride) StageGraphOverride {
 	if ov.Expand != nil {
 		out.Expand = ov.Expand
 	}
+	if ov.Subgraph != nil {
+		out.Subgraph = ov.Subgraph
+	}
 	if ov.ToolProfile != "" {
 		out.ToolProfile = ov.ToolProfile
+	}
+	// 两份名单: 覆盖表**整份替换**而不是与阶段声明求并/交 —— 与 Placement 同一条理由。
+	// 合并语义(交/并)是实现细节, 而"覆盖表要说什么"是一个完整意图; 半份继承半份覆盖
+	// 会拼出谁都没声明过的名单 (例如想放宽到只留三个工具, 却继承了阶段声明的十个)。
+	if ov.Tools != nil {
+		out.Tools = ov.Tools
+	}
+	if ov.DisallowedTools != nil {
+		out.DisallowedTools = append([]string(nil), ov.DisallowedTools...)
 	}
 	if ov.MaxTurns > 0 {
 		out.MaxTurns = ov.MaxTurns
@@ -401,17 +666,24 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 			kind = graph.NodeKindMap
 		case string(graph.NodeKindReduce):
 			kind = graph.NodeKindReduce
+		case string(graph.NodeKindSubgraph):
+			// 引用另一张已注册的图 (design/01 §4.1 第 6 种形态)。
+			// 与 map 同理**绝不推导**: 猜错是"跑了一张完全不相干的图", 而它不会报错。
+			if so.Subgraph == nil || strings.TrimSpace(so.Subgraph.Graph) == "" {
+				return graph.GraphSpec{}, fmt.Errorf("graph_adapter: 阶段 %q 声明 kind=subgraph 但缺少 subgraph 策略 (至少要给 graph 图名)", st.Name)
+			}
+			kind = graph.NodeKindSubgraph
 		case "":
 			if stageIsGate(st) {
 				kind = graph.NodeKindGate // 门禁阶段 → gate 节点 (输出 score 供条件边路由)
 			}
 		default:
-			return graph.GraphSpec{}, fmt.Errorf("graph_adapter: 阶段 %q 的覆盖 kind=%q 非法 (仅 agent|gate|map|reduce; 组级循环用 groups 声明)", st.Name, so.Kind)
+			return graph.GraphSpec{}, fmt.Errorf("graph_adapter: 阶段 %q 的覆盖 kind=%q 非法 (仅 agent|gate|map|reduce|subgraph; 组级循环用 groups 声明)", st.Name, so.Kind)
 		}
 
 		// Deterministic: 显式声明优先; 否则 compile/test/build 类门禁本来就走 runGate
 		// 的纯代码分支, 这里把它显式化, 使字段与实际行为一致 (也让预算按秒级给)。
-		deterministic := so.Deterministic || (kind == graph.NodeKindGate && gateIsDeterministic(st.Name, st.Role))
+		deterministic := so.Deterministic || (kind == graph.NodeKindGate && gateIsDeterministic(st.Name, st.Agent))
 
 		retries := defaultRetry.MaxRetries
 		if so.Retry != nil {
@@ -419,7 +691,7 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 		}
 		timeoutSec := so.TimeoutSec
 		if timeoutSec <= 0 {
-			timeoutSec = graphNodeBudgetSec(st.Role, retries, deterministic)
+			timeoutSec = graphNodeBudgetSec(st.Agent, retries, deterministic)
 			// map 节点的预算要包住**全部分片**: 分片并发但并发度未知 (executeGraph
 			// 才知道 effectiveParallel), 按最坏情况 (全串行) 给, 再由 2h 硬顶夹住。
 			// 给紧了的后果是合法的扇出被 deadline 掐死, 比给松严重得多。
@@ -432,10 +704,19 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 			ID:   st.Name,
 			Kind: kind,
 			Agent: graph.AgentSpec{
-				Role:          st.Role,
-				Prompt:        st.Prompt,
-				ToolProfile:   so.ToolProfile,
-				MaxTurns:      so.MaxTurns,
+				Role:            st.Agent,
+				Prompt:          st.Prompt,
+				ToolProfile:     so.ToolProfile,
+				MaxTurns:        so.MaxTurns,
+				Tools:           so.Tools,
+				DisallowedTools: so.DisallowedTools,
+				// 三项能力声明 (P4/X1) 一并搬进 AgentSpec。**不是为了**让图引擎
+				// 解释它们 —— 引擎一个字都不读。理由是**回程**: 运行期 stageNodeRunner
+				// 重建 StageDef 时原件已不在手上, 它只能从 node.Agent 取数 (见
+				// stageDeclFromAgentSpec)。不搬 = 这三项在 graph 路径上静默回零值。
+				Model:         st.Model,
+				Hooks:         st.Hooks,
+				Skills:        st.Skills,
 				Deterministic: deterministic,
 				Placement:     so.Placement,
 			},
@@ -445,6 +726,7 @@ func TranslateWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 			Map:        so.Map,
 			Reduce:     so.Reduce,
 			Expand:     so.Expand,
+			Subgraph:   so.Subgraph,
 		})
 		for _, dep := range st.DependsOn {
 			cond := so.Condition
@@ -752,11 +1034,22 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 	// 提示词 (research 的 cross-verification 声明序是 tech/market/risk, 字典序是
 	// market/risk/tech) —— 那是等价性的直接破口, 也会打散 prompt 前缀缓存。
 	// 查不到声明序时 orderedPrevDeps 退化为字典序 (仍然确定性), 见 graph_templates.go。
+	// 回程: 图节点 → StageDef。**每一个直译器搬进去的字段都要在这里搬回来**,
+	// 漏一个的表现是"那条声明在 graph 路径上进得来、到不了 executeStage" ——
+	// 不报错, 只是静默不起作用, 而 pipeline 路径上它是对的。
+	//
+	// 图能力九项**不在**这里搬运: 它们的作用域是引擎 (NodeSpec 上的 Loop/Retry/
+	// TimeoutSec/Map/... 与 EdgeSpec.Condition), 引擎自己会读, 不必回到 StageDef。
+	// 唯一要回来的正是"交给宿主 agent 的那几个能力维度"。
 	stage := StageDef{
 		Name:      node.ID,
-		Role:      node.Agent.Role,
+		Agent:     node.Agent.Role,
 		Prompt:    node.Agent.Prompt,
 		DependsOn: prevDepsWithDynamic(r.deps, node.ID, in.PrevOutputs),
+		Tools:     stageToolsFromAgentSpec(node.Agent),
+		Model:     node.Agent.Model,
+		Hooks:     node.Agent.Hooks,
+		Skills:    node.Agent.Skills,
 	}
 	// —— 图特有的执行上下文 (回灌 / 分片 / 待聚合分片) ——
 	var extraCtx strings.Builder
@@ -812,6 +1105,31 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 		}
 	}
 	return res
+}
+
+// stageToolsFromAgentSpec 把图节点的工具声明还原成 StageTools。
+//
+// 这一趟"StageDef → AgentSpec → StageDef"看着绕, 但它不是空转: 中间的图直译器是
+// **覆盖表合并**发生的地方 (mergeStageOverride 覆盖表优先), 所以从 AgentSpec 还原
+// 出来的才是**生效值**, 而不是定义者原样写下的那份。直接从原 StageDef 拿会绕过覆盖表,
+// 于是"运维在覆盖表里改了这个阶段的工具面"对图路径失效。
+//
+// 全空 (三项都没声明) 时返回 nil, 而不是一个空 StageTools: Declares() 会把两者都判为
+// 未声明, 但下游的 WithStageTools(nil) 是显式 no-op —— 让"没声明"这条路上一个字节都
+// 不进 ctx, 是"下游平台行为不变"这条硬要求的一部分。
+func stageToolsFromAgentSpec(a graph.AgentSpec) *StageTools {
+	if a.ToolProfile == "" && a.Tools == nil && len(a.DisallowedTools) == 0 {
+		return nil
+	}
+	st := &StageTools{Profile: a.ToolProfile}
+	if a.Tools != nil {
+		allow := append([]string{}, (*a.Tools)...)
+		st.Allow = &allow
+	}
+	if len(a.DisallowedTools) > 0 {
+		st.Deny = append([]string(nil), a.DisallowedTools...)
+	}
+	return st
 }
 
 // prevDepsWithDynamic = 声明序上游 (orderedPrevDeps) + **运行期才出现的上游**。
@@ -1070,7 +1388,7 @@ func (r *stageNodeRunner) runGate(ctx context.Context, node graph.NodeSpec, in g
 // stageIsGate 判断一个 stage 是否门禁阶段 (按 role/name 关键词)。
 // 门禁阶段被译为 gate 节点, 输出 score 供条件边路由, 不做常规 agent 产出。
 func stageIsGate(st StageDef) bool {
-	key := strings.ToLower(st.Name + " " + st.Role)
+	key := strings.ToLower(st.Name + " " + st.Agent)
 	for _, kw := range []string{"gate", "门禁", "quality-gate", "content-gate"} {
 		if strings.Contains(key, kw) {
 			return true

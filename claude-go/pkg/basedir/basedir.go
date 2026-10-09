@@ -24,7 +24,11 @@ type Layout struct {
 	Wiki      string // Wiki 知识库
 	Hooks     string // Hook 脚本
 	Vision    string // 视觉能力缓存
-	Agents    string // Agent 角色定义
+	Agents    string // Agent 资产 (.md + frontmatter)
+	Sessions  string // 会话身份声明 (sessionapi.Spec: 人格/工具白名单/cwd/模型)
+	Workflows string // 工作流资产 (动态 WorkflowDef 的 .json 与 .md 声明)
+	Plugins   string // 插件资产
+	Tools     string // 工具资产 (声明式, 补充内置工具集)
 }
 
 // NewLayout 根据根目录创建完整的目录布局。
@@ -50,6 +54,10 @@ func NewLayout(root string) (*Layout, error) {
 		Hooks:     filepath.Join(abs, "hooks"),
 		Vision:    filepath.Join(abs, "vision"),
 		Agents:    filepath.Join(abs, "agents"),
+		Sessions:  filepath.Join(abs, "sessions"),
+		Workflows: filepath.Join(abs, "workflows"),
+		Plugins:   filepath.Join(abs, "plugins"),
+		Tools:     filepath.Join(abs, "tools"),
 	}, nil
 }
 
@@ -58,7 +66,8 @@ func (l *Layout) EnsureAll() error {
 	dirs := []string{
 		l.Root, l.Logs, l.Memory, l.Teams, l.Cron,
 		l.Evolution, l.Tasks, l.Skills, l.Wiki,
-		l.Hooks, l.Vision, l.Agents,
+		l.Hooks, l.Vision, l.Agents, l.Sessions,
+		l.Workflows, l.Plugins, l.Tools,
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -66,6 +75,26 @@ func (l *Layout) EnsureAll() error {
 		}
 	}
 	return nil
+}
+
+// AssetDirs 按资产种类返回标准目录。
+//
+// 键与 pkg/asset.Kind 的取值同名, 但返回 map[string]string 而不是 map[asset.Kind]string:
+// basedir 是零依赖的叶子包 (它连 pkg/logging 都不引), 为了一个 map 的键类型去引
+// 资产包会让它不再零依赖。消费方 (pkg/asset.Set.LoadStandard) 负责把键解析回 kind,
+// 认不出的键会被报成 problem 而不是静默忽略。
+//
+// 六种资产目录都在这里, 而不是"用到的才列": 目录清单只有一处声明, 少列一种的后果是
+// 那种资产的文件放进去**没有任何反应** (LoadDir 把目录不存在视为空目录)。
+func (l *Layout) AssetDirs() map[string]string {
+	return map[string]string{
+		"agent":    l.Agents,
+		"workflow": l.Workflows,
+		"plugin":   l.Plugins,
+		"skill":    l.Skills,
+		"tool":     l.Tools,
+		"hook":     l.Hooks,
+	}
 }
 
 // TasksFilePath 返回 tasks.json 的完整路径。

@@ -115,7 +115,7 @@ func newOrchNodeRunner(we *WorkflowExecutor, team *ProductionTeam, objective str
 		advSem:      make(chan struct{}, orchAdversarialRunnerCap),
 	}
 	for _, n := range spec.Nodes {
-		if isAdversarialStage(StageDef{Name: n.ID, Role: n.Agent.Role}) {
+		if isAdversarialStage(StageDef{Name: n.ID, Agent: n.Agent.Role}) {
 			r.adversarial[n.ID] = true
 			r.reviewers++
 		}
@@ -159,7 +159,7 @@ func (r *orchNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in gr
 	// 单次尝试的超时: 旧 executeTask 每次派发都新建 context.WithTimeout(ctx, t.Timeout),
 	// 所以每次重试都拿到完整的 3/4/5 分钟。这里同构 —— **不能**把它填进
 	// NodeSpec.TimeoutSec, 那是包住全部重试的总预算 (见 graph_adapter.go 的说明)。
-	attemptTimeout := taskTimeout(StageDef{Name: node.ID, Role: node.Agent.Role})
+	attemptTimeout := taskTimeout(StageDef{Name: node.ID, Agent: node.Agent.Role})
 
 	var (
 		out string

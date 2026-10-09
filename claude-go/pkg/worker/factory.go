@@ -169,6 +169,12 @@ func (r *runtimeRunner) Execute(ctx context.Context, userPrompt string) (string,
 			ids.NodeID = cur.NodeID
 		}
 	}
+	// 会话身份单独取: 它可能只挂在 ctx 上 (控制面按业务键注入的那一份), 而上面那个
+	// 分支以 RunID/NodeID 任一非空为条件。会话身份随任务过线是独立需求, 不该搭车 ——
+	// 少带一次不报错, 只是远程节点静默丢掉缓存分片, 正是本次要修的那种损失。
+	if cur := trace.From(ctx); cur.SessionID != "" {
+		ids.SessionID = cur.SessionID
+	}
 	nodeID := ids.NodeID
 	if nodeID == "" {
 		nodeID = r.hints.Node
@@ -177,6 +183,7 @@ func (r *runtimeRunner) Execute(ctx context.Context, userPrompt string) (string,
 	task := agent.RuntimeNodeTask{
 		RunID:        ids.RunID,
 		NodeID:       nodeID,
+		SessionID:    ids.SessionID,
 		Role:         r.role,
 		SystemPrompt: r.systemPrompt,
 		UserPrompt:   userPrompt,

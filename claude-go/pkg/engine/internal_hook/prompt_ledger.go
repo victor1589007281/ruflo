@@ -1,6 +1,8 @@
 package internal_hook
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 
@@ -24,8 +26,36 @@ func BuildPromptComponentMetrics(systemPrompt []string, tools []types.APITool, m
 		BlackboardChars:   countHandoffChars(messageText),
 		PrevResultChars:   countPrevResultChars(systemText) + countPrevResultChars(messageText),
 		MessagesChars:     MessageChars(messages),
+		// 工具段摘要 (D4.2): 长度量不出"换了同样大的三件工具", 见那个字段的说明。
+		// 传的是**最终下发**的那份 tools —— 与 ToolsSchemaChars 同源, 两者对不上
+		// 就说明这里量错了对象。
+		ToolsSchemaDigest: ToolsSurfaceDigest(tools),
 	}
 	return metrics
+}
+
+// ToolsSurfaceDigest 算工具段的顺序敏感摘要。
+//
+// 顺序敏感是**必须的**: 前缀缓存看的是字节序列, 把同样一组工具换个顺序下发,
+// 内容集合没变而前缀变了 —— 摘要若与顺序无关, 就会把这一次真实的缓存失效
+// 报成"没变"。所以这里按切片顺序逐条喂进哈希。
+//
+// 字段之间用 \x00 分隔 (而不是直接拼接): 否则 description 末尾多一个字符、
+// 下一个 name 少一个字符的两次请求会算出同一个摘要。
+func ToolsSurfaceDigest(tools []types.APITool) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	h := sha256.New()
+	for _, t := range tools {
+		h.Write([]byte(t.Name))
+		h.Write([]byte{0})
+		h.Write([]byte(t.Description))
+		h.Write([]byte{0})
+		h.Write(t.InputSchema)
+		h.Write([]byte{0, 1}) // 条与条之间的另一个分隔符, 防止跨条拼接歧义
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 func jsonLen(v any) int {

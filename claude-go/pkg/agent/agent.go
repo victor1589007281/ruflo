@@ -1,6 +1,7 @@
 // Package agent 实现 Agent/Task 子代理系统。
 // 对应 TS 源码: review/claude/src/tools/AgentTool/AgentTool.tsx
-//                review/claude/src/tools/AgentTool/runAgent.ts
+//
+//	review/claude/src/tools/AgentTool/runAgent.ts
 //
 // Agent 工具是 Claude Code 最强大的功能之一:
 //   - LLM 可以通过 "Agent" 工具派生子代理
@@ -9,10 +10,8 @@
 //   - 子代理可以连接额外的 MCP 服务器
 //   - 子代理执行完毕后，结果返回给父循环
 //
-// Agent Teams:
-//   - 多个子代理可以协作 (Team)
-//   - 通过 mailbox 进行消息传递
-//   - 支持 InProcess 和 Tmux 两种后端
+// Agent Teams: 见 pkg/agent/teams.go (ProductionTeam) 与 pkg/agent/mailbox.go
+// (PersistentMailbox)。本文件只负责子代理派生, 不再自带一套团队抽象。
 //
 // 旧名称: "Task" (现在 "Task" 是 LEGACY_AGENT_TOOL_NAME)
 package agent
@@ -21,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
@@ -79,9 +77,21 @@ func (t *AgentTool) Name() string { return AgentToolName }
 // Aliases returns legacy tool names accepted by the API (e.g. "Task").
 func (t *AgentTool) Aliases() []string { return []string{LegacyToolName} }
 
+// Description Agent 工具的描述, **含当前可用的 agent 清单** (21.8.12 P5)。
+//
+// 为什么把清单拼进描述而不是另加一个工具: 描述是模型的唯一入口 —— 模型看得到什么
+// 名字, 才可能填对 subagent_type。改造前这里是一段写死的英文, 一个名字都没有,
+// 于是模型只能"猜一个像样的" (P5 记录的缺口 B)。
+//
+// 清单为空 (没装资产体系) 时逐字节等于改造前的那段 —— 空资产体系不该改变任何
+// 既有请求。这是判据而不是口号: 大部分部署上 assets 目录是空的。
 func (t *AgentTool) Description() string {
-	return `Launch a new agent to handle complex, multi-step tasks autonomously.
+	const base = `Launch a new agent to handle complex, multi-step tasks autonomously.
 The agent runs in a separate context and returns results when complete.`
+	if m := AgentManifest(); m != "" {
+		return base + m
+	}
+	return base
 }
 
 func (t *AgentTool) InputSchema() json.RawMessage {
@@ -99,7 +109,7 @@ func (t *AgentTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *AgentTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *AgentTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *AgentTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 func (t *AgentTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
@@ -109,11 +119,11 @@ func (t *AgentTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *ty
 // 对应 TS: AgentTool.tsx 中的 call() → runAgent.ts 中的 runAgent()
 //
 // 流程:
-//   1. 解析输入
-//   2. 创建子代理上下文 (createSubagentContext)
-//   3. 调用 runAgent (本质是嵌套的 queryLoop)
-//   4. 收集子代理的所有输出
-//   5. 返回最终结果
+//  1. 解析输入
+//  2. 创建子代理上下文 (createSubagentContext)
+//  3. 调用 runAgent (本质是嵌套的 queryLoop)
+//  4. 收集子代理的所有输出
+//  5. 返回最终结果
 func (t *AgentTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in agentInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -153,128 +163,22 @@ func (t *AgentTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.
 
 // ============================================================================
 // Agent Teams (团队管理)
-// 对应 TS: tools/TeamCreateTool/, tools/TeamDeleteTool/, tools/SendMessageTool/
 // ============================================================================
-
-// Team 代理团队
-type Team struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Members     map[string]*TeamMember `json:"members"`
-	Mailbox     []TeamMessage          `json:"mailbox"`
-	CreatedAt   time.Time              `json:"createdAt"`
-	mu          sync.Mutex
-}
-
-// TeamMember 团队成员
-type TeamMember struct {
-	ID     types.AgentID `json:"id"`
-	Name   string        `json:"name"`
-	Status string        `json:"status"` // idle, busy, stopped
-}
-
-// TeamMessage 团队消息
-type TeamMessage struct {
-	From      string    `json:"from"`
-	To        string    `json:"to"`
-	Content   string    `json:"content"`
-	Type      string    `json:"type"` // message, shutdown_request
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// TeamManager 团队管理器
-// 对应 TS: utils/teamDiscovery.ts + utils/teammateMailbox.ts
-type TeamManager struct {
-	teams map[string]*Team
-	mu    sync.Mutex
-}
-
-// NewTeamManager 创建团队管理器
-func NewTeamManager() *TeamManager {
-	return &TeamManager{
-		teams: make(map[string]*Team),
-	}
-}
-
-// CreateTeam 创建团队
-func (tm *TeamManager) CreateTeam(name, description string) *Team {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	team := &Team{
-		Name:        name,
-		Description: description,
-		Members:     make(map[string]*TeamMember),
-		CreatedAt:   time.Now(),
-	}
-	tm.teams[name] = team
-	return team
-}
-
-// DeleteTeam 删除团队
-func (tm *TeamManager) DeleteTeam(name string) bool {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	if _, ok := tm.teams[name]; ok {
-		delete(tm.teams, name)
-		return true
-	}
-	return false
-}
-
-// SendMessage 发送消息到指定成员
-func (tm *TeamManager) SendMessage(teamName, from, to, content, msgType string) error {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	team, ok := tm.teams[teamName]
-	if !ok {
-		return fmt.Errorf("团队 %q 不存在", teamName)
-	}
-
-	team.mu.Lock()
-	defer team.mu.Unlock()
-
-	team.Mailbox = append(team.Mailbox, TeamMessage{
-		From:      from,
-		To:        to,
-		Content:   content,
-		Type:      msgType,
-		Timestamp: time.Now(),
-	})
-	return nil
-}
-
-// GetMessages 获取指定成员的消息
-func (tm *TeamManager) GetMessages(teamName, memberName string) []TeamMessage {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	team, ok := tm.teams[teamName]
-	if !ok {
-		return nil
-	}
-
-	team.mu.Lock()
-	defer team.mu.Unlock()
-
-	var msgs []TeamMessage
-	for _, msg := range team.Mailbox {
-		if msg.To == memberName || msg.To == "" {
-			msgs = append(msgs, msg)
-		}
-	}
-	return msgs
-}
-
-// ListTeams 列出所有团队
-func (tm *TeamManager) ListTeams() []*Team {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	result := make([]*Team, 0, len(tm.teams))
-	for _, t := range tm.teams {
-		result = append(result, t)
-	}
-	return result
-}
+//
+// 这里曾经有一整套并行的团队抽象: Team / TeamMember / TeamManager + 2 参版
+// CreateTeam / DeleteTeam / ListTeams, 以及它的 Team.Mailbox []TeamMessage 与
+// SendMessage / GetMessages。2026-09-25 整体删除 (21.8.9-D6 收敛)。
+//
+// 删掉的理由不是"没接线", 是三件叠加:
+//
+//  1. **零调用方**。NewTeamManager() 全仓零调用; 2 参 CreateTeam(name, description)
+//     与真实在用的 ProductionTeamManager.CreateTeam(name, workflow, objective, chatID)
+//     参数个数都不同, 不存在"换个名字被调到"的可能。
+//  2. **重名而同形不同义**。它叫 Team, 生产在用的叫 ProductionTeam; 它叫 TeamManager,
+//     在用的叫 ProductionTeamManager。读代码的人无法从名字判断哪个是活的 —— 这正是
+//     本轮"四份邮箱"乱象的生成机制: 一份死抽象留在原地, 下一个人会照着它再抄一份。
+//  3. **它自带的那份邮箱是坏的**。Team.Mailbox 是裸 slice, GetMessages 每次全量返回,
+//     没有"只投递一次"的游标语义 —— 重跑/精修阶段会把老消息重复拼进 prompt。
+//
+// 全仓的团队与信箱唯一实现: pkg/agent/teams.go (ProductionTeam/ProductionTeamManager)
+// 与 pkg/agent/mailbox.go (PersistentMailbox)。见 21.8.9-D6。

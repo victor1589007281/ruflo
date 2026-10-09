@@ -186,16 +186,16 @@ func (we *WorkflowExecutor) autoScalePool(wf *WorkflowDef, design, generators []
 	}
 	roleNeeds := make(map[string]int)
 	for _, s := range design {
-		roleNeeds[s.Role]++
+		roleNeeds[s.Agent]++
 	}
 	for _, s := range generators {
-		roleNeeds[s.Role] += maxRounds
+		roleNeeds[s.Agent] += maxRounds
 	}
 	if eval != nil {
-		roleNeeds[eval.Role] += maxRounds
+		roleNeeds[eval.Agent] += maxRounds
 	}
 	for _, s := range parallel {
-		roleNeeds[s.Role]++
+		roleNeeds[s.Agent]++
 	}
 	complexity := 0
 	if maxRounds >= 3 {
@@ -438,7 +438,7 @@ func (we *WorkflowExecutor) runBuildHardGate(
 			fixStage.Name = fmt.Sprintf("%s-round%d-buildfix%d", genStage.Name, round, retry)
 
 			label := map[bool]string{true: "TODO", false: "编译"}[isTodoFix]
-			we.notify(we.chatID, fmt.Sprintf("  🔧 %s修复 %d/%d — %s...", label, retry, maxBuildRetries, genStage.Role))
+			we.notify(we.chatID, fmt.Sprintf("  🔧 %s修复 %d/%d — %s...", label, retry, maxBuildRetries, genStage.Agent))
 			sr := we.executeStage(ctx, fixStage, objective, prevResults, team)
 			sr.Name = fixStage.Name
 			*allResults = append(*allResults, sr)
@@ -568,7 +568,7 @@ func (we *WorkflowExecutor) runTestFixCycle(
 			fixStage := genStage
 			fixStage.Prompt = strings.ReplaceAll(fixStage.Prompt, "{adversarial_feedback}", fixPrompt)
 			fixStage.Name = fmt.Sprintf("%s-round%d-testfix%d", genStage.Name, round, retry)
-			we.notify(we.chatID, fmt.Sprintf("  🧪 测试修复 %d/%d — %s...", retry, maxTestRetries, genStage.Role))
+			we.notify(we.chatID, fmt.Sprintf("  🧪 测试修复 %d/%d — %s...", retry, maxTestRetries, genStage.Agent))
 			sr := we.executeStage(ctx, fixStage, objective, prevResults, team)
 			sr.Name = fixStage.Name
 			*allResults = append(*allResults, sr)
@@ -655,14 +655,14 @@ func (we *WorkflowExecutor) runGeneratorRound(
 
 		var roleRestore func()
 		if we.roles != nil {
-			if role := we.roles.Get(genStage.Role); role != nil && strings.Contains(role.SystemPrompt, "{adversarial_feedback}") {
+			if role := we.roles.Get(genStage.Agent); role != nil && strings.Contains(role.SystemPrompt, "{adversarial_feedback}") {
 				orig := role.SystemPrompt
 				role.SystemPrompt = strings.ReplaceAll(role.SystemPrompt, "{adversarial_feedback}", feedbackSection)
 				roleRestore = func() { role.SystemPrompt = orig }
 			}
 		}
 
-		we.notify(we.chatID, fmt.Sprintf("🔨 对抗第 %d/%d 轮 — %s (%s)...", round, maxRounds, genStage.Name, genStage.Role))
+		we.notify(we.chatID, fmt.Sprintf("🔨 对抗第 %d/%d 轮 — %s (%s)...", round, maxRounds, genStage.Name, genStage.Agent))
 		sr := we.executeStage(ctx, tempStage, objective, prevResults, team)
 		if roleRestore != nil {
 			roleRestore()
@@ -823,7 +823,7 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 	tempStage.Name = fmt.Sprintf("%s-round%d", evalStage.Name, round)
 
 	we.notify(we.chatID, fmt.Sprintf("🔍 对抗第 %d/%d 轮 — 审查中...", round, maxRounds))
-	sr := we.runAgent(ctx, evalStage.Role, buildStagePromptWithRoles(tempStage, objective, evalPrevResults, we.roles), team)
+	sr := we.runAgent(ctx, evalStage.Agent, buildStagePromptWithRoles(tempStage, objective, evalPrevResults, we.roles), team)
 	sr.Name = tempStage.Name
 	results = append(results, sr)
 
@@ -913,7 +913,7 @@ func (we *WorkflowExecutor) recordEvalMetrics(team *ProductionTeam, round int, s
 func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStages []StageDef, objective string, prevResults map[string]string, team *ProductionTeam) []StageResult {
 	var testerStage *StageDef
 	for i, ps := range parallelStages {
-		if ps.Role == "tester" {
+		if ps.Agent == "tester" {
 			testerStage = &parallelStages[i]
 			break
 		}
@@ -951,7 +951,7 @@ func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStage
 
 		// E2E Tester
 		e2ePrompt := we.buildE2EPrompt(objective, prevResults, lastE2EOutput, round)
-		e2eStageDef := StageDef{Name: fmt.Sprintf("e2e-round%d", round), Role: "tester", Prompt: e2ePrompt}
+		e2eStageDef := StageDef{Name: fmt.Sprintf("e2e-round%d", round), Agent: "tester", Prompt: e2ePrompt}
 		e2eResult := we.executeStage(roundCtx, e2eStageDef, objective, prevResults, team)
 		roundCancel()
 		e2eResult.Name = e2eStageDef.Name
@@ -992,7 +992,7 @@ func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStage
 
 修复后确保编译和测试通过。
 `, round, e2eResult.Output)
-		fixStage := StageDef{Name: fmt.Sprintf("e2e-fix-round%d", round), Role: "coder", Prompt: fixPrompt}
+		fixStage := StageDef{Name: fmt.Sprintf("e2e-fix-round%d", round), Agent: "coder", Prompt: fixPrompt}
 		fixResult := we.executeStage(ctx, fixStage, objective, prevResults, team)
 		fixResult.Name = fixStage.Name
 		results = append(results, fixResult)
@@ -1645,7 +1645,7 @@ func (we *WorkflowExecutor) buildE2EPrompt(objective string, prevResults map[str
 func (we *WorkflowExecutor) runFinishPhase(ctx context.Context, parallelStages []StageDef, objective string, prevResults map[string]string, team *ProductionTeam) []StageResult {
 	var nonTestStages []StageDef
 	for _, ps := range parallelStages {
-		if ps.Role != "tester" {
+		if ps.Agent != "tester" {
 			nonTestStages = append(nonTestStages, ps)
 		}
 	}

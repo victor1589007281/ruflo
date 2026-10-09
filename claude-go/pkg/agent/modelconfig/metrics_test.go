@@ -222,13 +222,13 @@ func TestAliasMetricsCollector_JSONLPersistence(t *testing.T) {
 	c := NewAliasMetricsCollector(buildMetricsRegistry(), t.TempDir())
 
 	c.Record(api.LLMCallRecord{
-		Model:       "qwen3.6-plus",
-		Status:      "success",
-		InputTokens: 100,
+		Model:        "qwen3.6-plus",
+		Status:       "success",
+		InputTokens:  100,
 		OutputTokens: 50,
-		TotalTokens: 150,
-		DurationSec: 1.0,
-		Timestamp:   time.Now(),
+		TotalTokens:  150,
+		DurationSec:  1.0,
+		Timestamp:    time.Now(),
 	})
 
 	// 文件应该已创建

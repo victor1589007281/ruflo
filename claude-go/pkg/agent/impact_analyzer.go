@@ -14,20 +14,20 @@ import (
 
 // ImpactReport aggregates the results of an impact analysis.
 type ImpactReport struct {
-	ChangedFiles   []string          `json:"changed_files"`
-	ModifiedSymbols []string         `json:"modified_symbols"`
-	References     []SymbolReference `json:"references"`
-	AffectedPackages []string        `json:"affected_packages"`
-	AffectedFiles  []string          `json:"affected_files"`
+	ChangedFiles     []string          `json:"changed_files"`
+	ModifiedSymbols  []string          `json:"modified_symbols"`
+	References       []SymbolReference `json:"references"`
+	AffectedPackages []string          `json:"affected_packages"`
+	AffectedFiles    []string          `json:"affected_files"`
 }
 
 // SymbolReference represents a reference to a modified symbol.
 type SymbolReference struct {
-	Symbol   string `json:"symbol"`
-	File     string `json:"file"`
-	Line     int    `json:"line"`
-	Column   int    `json:"column"`
-	Context  string `json:"context"` // e.g., "func_call", "type_use", "assignment"
+	Symbol  string `json:"symbol"`
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Column  int    `json:"column"`
+	Context string `json:"context"` // e.g., "func_call", "type_use", "assignment"
 }
 
 // ImpactAnalyzer parses changed files to find modified symbols and searches for references.

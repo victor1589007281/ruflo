@@ -121,16 +121,39 @@ func (h *CircuitBreakerHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhaseOnError}
 }
 
-// Execute 仅在 ErrorClassifier 未启用时检查连续错误次数，达到阈值则熔断。
+// Execute 检查两条**互相独立**的熔断判据, 任一成立即返回 Terminal。
+//
+// 判据 A (连续错误): ctx.ConsecutiveErrors 达到 MaxConsecutiveErrors。
+// 判据 B (无进展空转): run 级错误账本达到 RunFailureLedgerWindow。
+//
+// 关于判据 B 的必要性 —— 这是本 hook 此前最大的缺口。在分类器启用时
+// (生产默认) 原实现直接 `return nil, nil`, 使整个 hook 成为死代码; 而单靠
+// 分类器又抓不住"失败→成功→失败"的交错形态 (族计数被 ResetAll 清空)。
+// 实测 209 个 run 中由系统判据主动终止的为 0, 而熔断事件 8738 条, 即此故。
+//
+// 优先级上 ErrorClassifierHook (110) 先于本 hook (120) 执行; 若分类器已判定
+// 某族预算耗尽, 它返回的 ReturnTerminal 会先被 HookChain 采信 (见 hook.go 的
+// "遇到非空立即终止并返回"), 走不到这里。所以到达本 hook 意味着分类器选择了
+// 继续重试 —— 此时判据 A/B 是最后一道闸门。
 func (h *CircuitBreakerHook) Execute(ctx *HookContext) (*HookResult, error) {
-	// 仅在 ErrorClassifier 未启用时作为兜底
-	if h.classifier != nil {
+	consecutiveErrors := ctx.ConsecutiveErrors
+
+	streakTripped := consecutiveErrors >= MaxConsecutiveErrors
+	stallTripped := h.classifier != nil && h.classifier.ShouldAbortRun()
+
+	if !streakTripped && !stallTripped {
 		return nil, nil
 	}
 
-	consecutiveErrors := ctx.ConsecutiveErrors
-	if consecutiveErrors < MaxConsecutiveErrors {
-		return nil, nil
+	reason := "circuit_breaker"
+	var text string
+	if streakTripped {
+		text = fmt.Sprintf("断路器触发: 连续 %d 次 API 错误, 最后错误: %v", consecutiveErrors, ctx.Error)
+	} else {
+		// 交错失败形态: 单次连续计数不高 (每次成功响应都清零), 但 run 已长期无产出。
+		reason = "circuit_breaker_no_progress"
+		text = fmt.Sprintf("断路器触发: 自上次进展以来累计 %d 次 API 错误且无产出, 最后错误: %v",
+			h.classifier.FailuresSinceProgress(), ctx.Error)
 	}
 
 	errMsg := types.Message{
@@ -138,7 +161,7 @@ func (h *CircuitBreakerHook) Execute(ctx *HookContext) (*HookResult, error) {
 		UUID: GenerateUUID(),
 		Content: []types.ContentBlock{{
 			Type: types.ContentBlockText,
-			Text: fmt.Sprintf("断路器触发: 连续 %d 次 API 错误, 最后错误: %v", consecutiveErrors, ctx.Error),
+			Text: text,
 		}},
 		IsApiErrorMessage: true,
 		CreatedAt:         time.Now(),
@@ -150,6 +173,6 @@ func (h *CircuitBreakerHook) Execute(ctx *HookContext) (*HookResult, error) {
 	return &HookResult{
 		AppendMsgs:     []types.Message{errMsg},
 		StreamEvents:   events,
-		ReturnTerminal: &types.Terminal{Reason: "circuit_breaker", Error: ctx.Error},
+		ReturnTerminal: &types.Terminal{Reason: reason, Error: ctx.Error},
 	}, nil
 }

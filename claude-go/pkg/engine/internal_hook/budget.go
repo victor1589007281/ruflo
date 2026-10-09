@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -235,8 +236,6 @@ func summarizeToolResult(raw string, maxChars int) string {
 	}
 	sb.WriteString(fmt.Sprintf("... [truncated by budget red, original_len=%d]", len(raw)))
 	out := sb.String()
-	if len(out) > maxChars {
-		out = out[:maxChars]
-	}
+	out = textutil.Truncate(out, maxChars, "")
 	return out
 }

@@ -8,8 +8,8 @@
 //   - EU AI Act / NYC AEDT: 自动化招聘法规
 //
 // 两大模式:
-//   1. 求职准备: JD分析 → 差距分析 → 简历优化 → 学习计划 → 模拟面试
-//   2. 招聘辅助: 需求分析 → 候选人评估 → 面试设计
+//  1. 求职准备: JD分析 → 差距分析 → 简历优化 → 学习计划 → 模拟面试
+//  2. 招聘辅助: 需求分析 → 候选人评估 → 面试设计
 package agent
 
 func hiringWorkflow() *WorkflowDef {
@@ -19,7 +19,7 @@ func hiringWorkflow() *WorkflowDef {
 		Mode:        "orchestrated",
 		Stages: []StageDef{
 			{
-				Name: "parse-jd", Role: "jd-analyst",
+				Name: "parse-jd", Agent: "jd-analyst",
 				Prompt: `你是**职位描述分析专家**。
 
 任务: {objective}
@@ -42,7 +42,7 @@ func hiringWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "parse-resume", Role: "resume-parser",
+				Name: "parse-resume", Agent: "resume-parser",
 				Prompt: `你是**简历解析专家**。
 
 任务: {objective}
@@ -64,7 +64,7 @@ func hiringWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "gap-analysis", Role: "gap-analyzer",
+				Name: "gap-analysis", Agent: "gap-analyzer",
 				DependsOn: []string{"parse-jd", "parse-resume"},
 				Prompt: `你是**差距分析专家**。
 
@@ -88,7 +88,7 @@ JD 和简历分析:
 - **竞争策略**: 如何扬长避短`,
 			},
 			{
-				Name: "resume-optimize", Role: "resume-coach",
+				Name: "resume-optimize", Agent: "resume-coach",
 				DependsOn: []string{"gap-analysis"},
 				Prompt: `你是**简历优化专家** (精通 ATS 系统和招聘官视角)。
 
@@ -116,7 +116,7 @@ JD 和简历分析:
 				Parallel: true,
 			},
 			{
-				Name: "story-bank", Role: "story-coach",
+				Name: "story-bank", Agent: "story-coach",
 				DependsOn: []string{"gap-analysis"},
 				Prompt: `你是**STAR 故事库构建专家**。
 
@@ -150,7 +150,7 @@ JD 和简历分析:
 				Parallel: true,
 			},
 			{
-				Name: "study-plan", Role: "study-planner",
+				Name: "study-plan", Agent: "study-planner",
 				DependsOn: []string{"gap-analysis"},
 				Prompt: `你是**面试学习计划制定专家**。
 
@@ -178,7 +178,7 @@ JD 和简历分析:
 				Parallel: true,
 			},
 			{
-				Name: "mock-behavioral", Role: "behavioral-interviewer",
+				Name: "mock-behavioral", Agent: "behavioral-interviewer",
 				DependsOn: []string{"story-bank"},
 				Prompt: `你是**行为面试官** (参考 Amazon Leadership Principles 风格)。
 
@@ -211,7 +211,7 @@ JD 和简历分析:
 				Parallel: true,
 			},
 			{
-				Name: "mock-technical", Role: "technical-interviewer",
+				Name: "mock-technical", Agent: "technical-interviewer",
 				DependsOn: []string{"study-plan"},
 				Prompt: `你是**技术面试官**。
 
@@ -244,7 +244,7 @@ JD 和简历分析:
 				Parallel: true,
 			},
 			{
-				Name: "score-feedback", Role: "interview-evaluator",
+				Name: "score-feedback", Agent: "interview-evaluator",
 				DependsOn: []string{"mock-behavioral", "mock-technical"},
 				Prompt: `你是**面试综合评估专家**。
 
@@ -270,7 +270,7 @@ JD 和简历分析:
 - **具体改进建议**: 每个弱项的练习方法`,
 			},
 			{
-				Name: "improvement-report", Role: "career-coach",
+				Name: "improvement-report", Agent: "career-coach",
 				DependsOn: []string{"score-feedback"},
 				Prompt: `你是**求职改进报告撰写专家**。
 

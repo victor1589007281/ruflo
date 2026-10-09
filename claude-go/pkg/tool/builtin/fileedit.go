@@ -53,7 +53,7 @@ func (t *FileEditTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *FileEditTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *FileEditTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *FileEditTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
 func (t *FileEditTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
@@ -76,11 +76,11 @@ func (t *FileEditTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolCo
 // 对应 TS: FileEditTool.ts 中的 call()
 //
 // 算法:
-//   1. 读取文件全文
-//   2. 计算 old_string 出现次数
-//   3. 非 replace_all 模式下要求恰好 1 次匹配
-//   4. 执行替换
-//   5. 原子写回文件
+//  1. 读取文件全文
+//  2. 计算 old_string 出现次数
+//  3. 非 replace_all 模式下要求恰好 1 次匹配
+//  4. 执行替换
+//  5. 原子写回文件
 func (t *FileEditTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in fileEditInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -88,6 +88,13 @@ func (t *FileEditTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 	}
 
 	filePath := expandPath(in.Path, tctx.Cwd)
+
+	// H3-4 并发写闸。位置在**读文件之前**: 两个并行子代理各自读到旧内容、各自基于
+	// 那一份算新内容, 正是覆盖的成因 —— 读到一半才拦, 另一方已经按过期内容构造好了
+	// 它的写入。拦在入口, 冲突的一侧连读都不必发生, 报错也就干净。
+	if err := tctx.ClaimWrite(filePath); err != nil {
+		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
+	}
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -123,13 +130,22 @@ func (t *FileEditTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 		return res, nil
 	}
 
+	// 文件级检查点: 留存写前内容。位置在唯一性校验与语法护栏之后 ——
+	// 那些分支不改动文件, 不该产生快照。
+	snapshotRef := checkpointBeforeWrite(filePath, tctx)
+
 	if err := os.WriteFile(filePath, []byte(newContent), 0o644); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("写入文件失败: %v", err), IsError: true}, nil
 	}
+	checkpointAfterWrite(filePath, tctx)
 
 	replacements := count
 	if !in.ReplaceAll {
 		replacements = 1
 	}
-	return &tool.ToolResult{Content: fmt.Sprintf("Successfully replaced %d occurrence(s) in %s", replacements, filePath)}, nil
+	msg := fmt.Sprintf("Successfully replaced %d occurrence(s) in %s", replacements, filePath)
+	if snapshotRef != "" {
+		msg += fmt.Sprintf("\n[file-history] 写前版本: %s", snapshotRef)
+	}
+	return &tool.ToolResult{Content: msg}, nil
 }

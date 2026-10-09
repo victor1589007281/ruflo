@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/memory"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -120,13 +121,46 @@ func (s *MemoryBackedTrajectoryStore) Append(t *Trajectory) {
 	})
 }
 
+// taskInstructionPointerText 是 engine.taskInstructionPointer 的**字面副本**。
+//
+// 为什么是副本而不是引用: 该常量定义在 pkg/engine (engine.go), 而本包被
+// pkg/engine 依赖 —— 反向 import 会成环。两个包之间的常量同步靠这条注释与
+// TestTaskInstructionPointerInSync 守住 (测试里硬编码同一字符串, 改一处忘另一处
+// 会直接失败)。
+const taskInstructionPointerText = "（任务指令已置于 system prompt 末尾，请按其中的任务目标与产出要求执行。）"
+
+// IsTaskInstructionPointer 判断一段文本是否为 engine 的 TaskInstruction 占位符。
+//
+// 占位符的含义是"真正的任务指令在 system prompt 末尾"。它出现在 user 消息里只是
+// 为了满足"消息序列以非空 user 轮开始"的协议约束, 本身**不含任何任务信息**。
+// 任何拿它做检索 key / 意图摘要 / 记忆内容的地方都会得到零信息量的结果 ——
+// 见 MemoryInjectHook.retrievalQuery 与 Trajectory.Format。
+func IsTaskInstructionPointer(s string) bool {
+	return strings.TrimSpace(s) == taskInstructionPointerText
+}
+
 // Format 把 Trajectory 格式化为人类可读的 markdown 摘要（也便于被 BM25 检索）。
+//
+// 两个"稳定性"约束 —— 这段文本会被写进记忆库, 再被检索出来注入 system prompt:
+//
+//  1. **不含时间戳**。原先第一行是 "[verdict@2026-09-16T12:34:56Z] ...", 时间戳
+//     每次都不同, 于是即便是逻辑上同一条记忆, 跨 run 渲染出的字节也不同 ——
+//     记忆块所在位置之后的前缀缓存全部失效。这正是"27 对缓存断裂里 8 对是块
+//     内容变了"的主因。时间属于元数据 (MemoryEntry.CreatedAt 已有), 不该进正文。
+//
+//  2. **占位符不进正文**。UserIntent 是 taskInstructionPointer 时, 把它写进正文
+//     会让**每一条记忆都以同一句废话开头**, BM25 索引被这句话污染: 任何查询都
+//     容易匹配到它, 于是检索结果退化成"随机捞几条"。占位符直接省略。
 func (t *Trajectory) Format() string {
 	if t == nil {
 		return ""
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "[%s@%s] %s\n", t.Verdict, t.At.Format(time.RFC3339), TruncateStr(t.UserIntent, 160))
+	if intent := t.formatIntent(); intent != "" {
+		fmt.Fprintf(&sb, "[%s] %s\n", t.Verdict, intent)
+	} else {
+		fmt.Fprintf(&sb, "[%s]\n", t.Verdict)
+	}
 	if t.Plan != "" {
 		fmt.Fprintf(&sb, "plan: %s\n", TruncateStr(t.Plan, 240))
 	}
@@ -216,12 +250,20 @@ func ExtractPlan(msgs []types.Message) string {
 // 辅助函数
 // ============================================================================
 
-// TruncateStr 截断字符串到指定长度，超出部分加 "..."。
-func TruncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
+// formatIntent 返回可写入正文的意图描述。
+//
+// 占位符返回空串 —— 它不是意图, 是"意图在别处"的指针。把指针当内容写进记忆,
+// 只会让每条记忆都长着同一张脸。
+func (t *Trajectory) formatIntent() string {
+	if t.UserIntent == "" || IsTaskInstructionPointer(t.UserIntent) {
+		return ""
 	}
-	return s[:n] + "..."
+	return TruncateStr(t.UserIntent, 160)
+}
+
+// TruncateStr 截断字符串到指定长度 (按**字符**), 超出部分加 "..."。
+func TruncateStr(s string, n int) string {
+	return textutil.Truncate(s, n, "...")
 }
 
 // uniqStrings 去重字符串切片（保持顺序）。

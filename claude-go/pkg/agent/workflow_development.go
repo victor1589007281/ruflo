@@ -30,7 +30,7 @@ func developmentWorkflow() *WorkflowDef {
 			// 参考 MetaGPT SOP: Product Manager → Architect → Engineer
 			// 改进: 调研由专门角色完成, 架构师聚焦设计决策
 			{
-				Name: "research", Role: "researcher",
+				Name: "research", Agent: "researcher",
 				Prompt: `你是深度技术调研专家。使用 **假设→证据→验证** 方法论调研 (参考 Kimi K2 Thinking)。
 
 需求: {objective}
@@ -67,7 +67,7 @@ func developmentWorkflow() *WorkflowDef {
 			},
 			// === Phase 1: 架构设计 (聚焦设计决策, 不再兼顾调研) ===
 			{
-				Name: "design", Role: "architect", DependsOn: []string{"research"},
+				Name: "design", Agent: "architect", DependsOn: []string{"research"},
 				Prompt: `你是高级软件架构师。基于调研结果, 使用 **多方案对比** 方法产出设计文档。
 
 需求: {objective}
@@ -109,7 +109,7 @@ func developmentWorkflow() *WorkflowDef {
 			// 参考: Plan-then-Execute (P-t-E) 范式 (arXiv:2510.08517)
 			// 分离"规划"与"设计", Planner 评估设计完整性 + 分解任务
 			{
-				Name: "plan", Role: "planner", DependsOn: []string{"design"},
+				Name: "plan", Agent: "planner", DependsOn: []string{"design"},
 				Prompt: `你是开发计划制定者 (独立于架构师的第三方视角)。
 
 需求: {objective}
@@ -210,7 +210,7 @@ targetFiles/writeFiles 必须是相对路径并以用户目标根目录开头, �
 			},
 			// === Phase 3: 对抗循环 (Coder + Reviewer 含偏差检测) ===
 			{
-				Name: "implement", Role: "coder", DependsOn: []string{"plan"},
+				Name: "implement", Agent: "coder", DependsOn: []string{"plan"},
 				Prompt: `你是高级软件工程师(对抗式开发中的 Generator 角色)。
 严格按照架构设计和开发计划实现完整的可编译、可运行的代码。
 
@@ -250,7 +250,7 @@ targetFiles/writeFiles 必须是相对路径并以用户目标根目录开头, �
 			// 仅保留 DependsOn: plan 的版本，因为 plan 已经包含 design 上下文。
 			// 重复 stage 导致对抗循环中 coder 每轮执行两次，浪费 token 和时间。
 			{
-				Name: "evaluate", Role: "reviewer", DependsOn: []string{"implement"},
+				Name: "evaluate", Agent: "reviewer", DependsOn: []string{"implement"},
 				Prompt: `你是对抗式开发中的 Evaluator(只读、多疑的审查者)。
 你的核心使命不仅是审查代码质量, 更要检测实现与设计方案的偏差。
 
@@ -308,7 +308,7 @@ Generator 第 {adversarial_round} 轮产出:
 通过门槛: ALL 5 dimensions >= 6 AND pass == true。`,
 			},
 			{
-				Name: "test", Role: "tester", DependsOn: []string{"implement"},
+				Name: "test", Agent: "tester", DependsOn: []string{"implement"},
 				Prompt: `你是高级质量工程师。为实现的代码编写多层次的完整测试体系。
 
 目标: {objective}

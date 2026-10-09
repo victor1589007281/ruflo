@@ -51,7 +51,7 @@ func setupPool(t *testing.T, sk *skills.Skill) (*tool.Registry, *tool.Pool, *ski
 		skillReg = skills.NewRegistry()
 		skillReg.Register(sk)
 	}
-	pool := RegisterPoolTools(reg, skillReg, nil, nil)
+	pool := RegisterPoolTools(reg, skillReg, nil, nil, nil)
 	return reg, pool, skillReg
 }
 
@@ -204,9 +204,24 @@ func TestPoolSearchLoadCallE2E(t *testing.T) {
 	}
 
 	// search 未命中: 回注引导文案。
+	//
+	// ⚠️ 这里原来断言的是 `strings.Contains(res.Content, "没有匹配")` —— 也就是
+	// **把那句假话钉在了测试里**。池里明明有 2 件资产, "池内没有匹配资产" 对
+	// "zzz-no-such" 这个查询是假的: 真的是"没有一件与它共享词", 假的是读者会
+	// 得到的那句"池内没有这个能力"。模型读到后者会直接放弃。
+	//
+	// 所以判据改成两条**性质**, 而不是一句措辞:
+	//	① 不是错误 (检索落空不是失败);
+	//	② 说清了池里有几件、以及检索是词面匹配。
 	res = poolCall(t, reg, PoolSearchName, `{"query":"zzz-no-such"}`)
-	if res.IsError || !strings.Contains(res.Content, "没有匹配") {
-		t.Fatalf("search 未命中应回引导: %+v", res)
+	if res.IsError {
+		t.Fatalf("search 未命中不该是错误: %+v", res)
+	}
+	if strings.Contains(res.Content, "池内没有匹配") {
+		t.Fatalf("池里有资产时不得说「池内没有匹配」—— 那是一句假话, 模型会据此判定能力不存在: %+v", res)
+	}
+	if !strings.Contains(res.Content, "2 件") || !strings.Contains(res.Content, "词面") {
+		t.Fatalf("未命中回注要报出池里有多少件、以及检索是词面匹配 (否则读者分不出该换词还是该查装配): %+v", res)
 	}
 }
 
@@ -219,7 +234,7 @@ func TestPoolGovernanceRejection(t *testing.T) {
 		reg := tool.NewRegistry()
 		reg.Register(&fakeTool{name: "Base1"})
 		reg.Register(&fakeTool{name: "evo_inspect"})
-		pool := RegisterPoolTools(reg, nil, map[string]bool{"evo_inspect": true}, nil)
+		pool := RegisterPoolTools(reg, nil, nil, map[string]bool{"evo_inspect": true}, nil)
 		_ = pool
 
 		res := poolCall(t, reg, PoolLoadName, `{"name":"evo_inspect"}`)
@@ -241,7 +256,7 @@ func TestPoolGovernanceRejection(t *testing.T) {
 		reg.Register(&fakeTool{name: "Base1"})
 		reg.Register(&fakeTool{name: "evo_inspect"})
 		reg.Register(&fakeTool{name: "evo_status"})
-		pool := RegisterPoolTools(reg, nil, nil, map[string]bool{"evo_inspect": true})
+		pool := RegisterPoolTools(reg, nil, nil, nil, map[string]bool{"evo_inspect": true})
 		_ = pool
 
 		// 白名单内可加载。

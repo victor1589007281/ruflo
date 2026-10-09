@@ -138,7 +138,7 @@ func buildTwoAssetPool(t *testing.T) (*tool.Pool, *tool.Registry, *poolIndex) {
 	pool := tool.NewPool()
 	pool.AddMember("asset-a")
 	pool.AddMember("asset-b")
-	idx := buildPoolIndex(pool, reg, nil)
+	idx := buildPoolIndex(pool, reg, nil, nil)
 	return pool, reg, idx
 }
 
@@ -214,8 +214,8 @@ func poolCallE2E(t *testing.T, runID string, call func(ctx context.Context, st *
 	t.Helper()
 	pp, ts := newTestPoolPolicy(t)
 	pool, reg, _ := buildTwoAssetPool(t)
-	st := NewPoolSearchTool(pool, reg, nil, pp)
-	lt := NewPoolLoadTool(pool, reg, nil, pp)
+	st := NewPoolSearchTool(pool, reg, nil, nil, pp)
+	lt := NewPoolLoadTool(pool, reg, nil, nil, pp)
 	ctx := context.Background()
 	if runID != "" {
 		ctx = trace.With(ctx, trace.IDs{RunID: runID, TurnID: "turn-1", NodeID: "node-1"})
@@ -276,7 +276,7 @@ func TestPoolLoadSpanAndTrial(t *testing.T) {
 	// 挂上 bandit 再走完整路径。
 	mustBandit(pp)
 	pool, reg, _ := buildTwoAssetPool(t)
-	lt := NewPoolLoadTool(pool, reg, nil, pp)
+	lt := NewPoolLoadTool(pool, reg, nil, nil, pp)
 	ctx := trace.With(context.Background(), trace.IDs{RunID: "run-y", TurnID: "t2", NodeID: "n2"})
 	res, err := lt.Call(ctx, json.RawMessage(`{"name":"asset-a"}`), &tool.ToolContext{Team: "team-A", Role: "worker"})
 	if err != nil || res.IsError {
@@ -319,7 +319,7 @@ func TestPoolLoadSkillPath(t *testing.T) {
 	reg := tool.NewRegistry()
 	pool := tool.NewPool()
 	pool.AddMember("deploy-skill")
-	lt := NewPoolLoadTool(pool, reg, skillReg, pp)
+	lt := NewPoolLoadTool(pool, reg, skillReg, nil, pp)
 	ctx := trace.With(context.Background(), trace.IDs{RunID: "run-s"})
 	res, err := lt.Call(ctx, json.RawMessage(`{"name":"deploy-skill"}`), &tool.ToolContext{Team: "team-T"})
 	if err != nil || res.IsError {

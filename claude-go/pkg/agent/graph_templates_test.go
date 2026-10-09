@@ -142,9 +142,9 @@ func tplAdversarialWorkflow() *WorkflowDef {
 		Mode:   "adversarial",
 		Rounds: 3,
 		Stages: []StageDef{
-			{Name: "propose", Role: "proposer", Prompt: "提出方案: {objective}"},
-			{Name: "oppose", Role: "opponent", Prompt: "反驳: {prev_result}", DependsOn: []string{"propose"}},
-			{Name: "judge", Role: "critic", Prompt: "裁决: {prev_result}", DependsOn: []string{"propose", "oppose"}},
+			{Name: "propose", Agent: "proposer", Prompt: "提出方案: {objective}"},
+			{Name: "oppose", Agent: "opponent", Prompt: "反驳: {prev_result}", DependsOn: []string{"propose"}},
+			{Name: "judge", Agent: "critic", Prompt: "裁决: {prev_result}", DependsOn: []string{"propose", "oppose"}},
 		},
 	}
 }
@@ -716,7 +716,7 @@ func TestBuildModeGraph拒绝无模板与空阶段(t *testing.T) {
 		t.Error("零阶段的 pipeline 应报错")
 	}
 	// trading_debate 模板要求至少 4 个分析阶段 (执行器按下标取 wf.Stages[0..3])
-	short := &WorkflowDef{Name: "short", Mode: "trading_debate", Stages: []StageDef{{Name: "a", Role: "r"}}}
+	short := &WorkflowDef{Name: "short", Mode: "trading_debate", Stages: []StageDef{{Name: "a", Agent: "r"}}}
 	if _, err := BuildModeGraph(short); err == nil {
 		t.Error("trading_debate 阶段不足 4 个时应报错, 而不是越界 panic")
 	}

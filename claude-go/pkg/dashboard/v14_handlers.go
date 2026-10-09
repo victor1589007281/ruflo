@@ -667,12 +667,12 @@ func (s *Server) handleTeamDAG(w http.ResponseWriter, r *http.Request, name stri
 	if wf := agent.GetWorkflow(detail.Workflow); wf != nil {
 		for _, st := range wf.Stages {
 			brief := stageBriefFromPrompt(st.Prompt)
-			if brief == "" && st.Role != "" {
-				brief = "角色: " + st.Role
+			if brief == "" && st.Agent != "" {
+				brief = "角色: " + st.Agent
 			}
 			agents := []string{}
-			if st.Role != "" {
-				agents = append(agents, st.Role)
+			if st.Agent != "" {
+				agents = append(agents, st.Agent)
 			}
 			wfMap[st.Name] = wfMeta{
 				DependsOn: append([]string(nil), st.DependsOn...),
@@ -784,7 +784,7 @@ func (s *Server) handleTeamDAG(w http.ResponseWriter, r *http.Request, name stri
 			for _, st := range wf.Stages {
 				meta := wfMap[st.Name]
 				resp.Stages = append(resp.Stages, dagStageDTO{
-					Name: st.Name, Role: st.Role, Status: "pending",
+					Name: st.Name, Role: st.Agent, Status: "pending",
 					DependsOn:      meta.DependsOn,
 					Parallel:       st.Parallel,
 					TaskBrief:      meta.Brief,

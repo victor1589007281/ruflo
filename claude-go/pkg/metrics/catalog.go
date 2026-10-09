@@ -173,6 +173,10 @@ var catalog = []MetricDesc{
 	{Module: "memory", Name: MMemAvgAccessCount, ZH: "平均访问次数", EN: "Avg access count", Unit: "count", Kind: KindGauge, Panel: "memory"},
 	{Module: "memory", Name: MMemPruneCount, ZH: "记忆修剪次数", EN: "Memory prunes", Unit: "count", Kind: KindCounter, Panel: "memory"},
 	{Module: "memory", Name: MMemRetrievalCount, ZH: "记忆检索次数", EN: "Retrievals", Unit: "count", Kind: KindCounter, Panel: "memory"},
+	// V4: 检索遥测 —— 按层拆开 (L1 才是注入大头, 旧口径看不见)
+	{Module: "memory", Name: MMemRetrievalCountL1, ZH: "L1 命中条数", EN: "L1 hits", Unit: "count", Kind: KindCounter, Panel: "memory"},
+	{Module: "memory", Name: MMemRetrievalCountL2, ZH: "L2 命中条数", EN: "L2 hits", Unit: "count", Kind: KindCounter, Panel: "memory"},
+	{Module: "memory", Name: MMemInjectionChars, ZH: "记忆注入字符数", EN: "Injected chars", Unit: "count", Kind: KindGauge, Panel: "memory"},
 	// V3: L2 FactStore + 失忆风险
 	{Module: "memory", Name: MFactTotalCount, ZH: "L2 事实总数", EN: "Total facts (L2)", Unit: "count", Kind: KindGauge, Panel: "memory"},
 	{Module: "memory", Name: MFactActiveCount, ZH: "活跃事实数", EN: "Active facts", Unit: "count", Kind: KindGauge, Panel: "memory"},

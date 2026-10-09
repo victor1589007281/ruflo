@@ -542,7 +542,14 @@ const (
 	MMemEntryCount     = "mem_entry_count"      // 记忆条目数
 	MMemAvgAccessCount = "mem_avg_access_count" // 平均访问次数
 	MMemPruneCount     = "mem_prune_count"      // 修剪次数
-	MMemRetrievalCount = "mem_retrieval_count"  // 检索次数
+	MMemRetrievalCount = "mem_retrieval_count"  // 检索次数 (全层合计)
+
+	// V4: 按层拆开的检索遥测。旧口径 mem_retrieval_count 分不出 L1/L2, 而
+	// **L1 才是注入的大头** (实测 top-7 合计 ~19K 字符, L2 为 0) —— 于是
+	// "记忆到底注入了多少、命中几条"在账本上此前完全没有落点。
+	MMemRetrievalCountL1 = "mem_retrieval_count_l1" // L1 (情景记忆) 命中条数
+	MMemRetrievalCountL2 = "mem_retrieval_count_l2" // L2 (结构化事实) 命中条数
+	MMemInjectionChars   = "mem_injection_chars"    // 单次检索注入的字符数
 
 	// V3: L2 FactStore 指标
 	MFactTotalCount         = "fact_total_count"          // L2 事实总数
@@ -696,6 +703,8 @@ var MetricType = map[string]MetricKind{
 	// Memory 计数器
 	MMemPruneCount:          "counter",
 	MMemRetrievalCount:      "counter",
+	MMemRetrievalCountL1:    "counter",
+	MMemRetrievalCountL2:    "counter",
 	MFactIngestCount:        "counter",
 	MFactDecayArchivedCount: "counter",
 	MPrecompactFactsSaved:   "counter",
@@ -703,6 +712,7 @@ var MetricType = map[string]MetricKind{
 	// Memory 状态 (gauge)
 	MMemEntryCount:       "gauge",
 	MMemAvgAccessCount:   "gauge",
+	MMemInjectionChars:   "gauge",
 	MFactTotalCount:      "gauge",
 	MFactActiveCount:     "gauge",
 	MFactArchivedCount:   "gauge",

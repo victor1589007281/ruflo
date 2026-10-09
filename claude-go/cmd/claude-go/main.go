@@ -30,13 +30,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
+	"github.com/anthropic/claude-go/pkg/agentbind"
 	"github.com/anthropic/claude-go/pkg/agentdbsemantic"
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/assembly"
+	"github.com/anthropic/claude-go/pkg/asset"
 	"github.com/anthropic/claude-go/pkg/backup"
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/cluster"
@@ -47,6 +52,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dashboard"
 	"github.com/anthropic/claude-go/pkg/dreaming"
 	"github.com/anthropic/claude-go/pkg/engine"
+	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
 	"github.com/anthropic/claude-go/pkg/evolution/console"
 	"github.com/anthropic/claude-go/pkg/evolution/learners"
 	"github.com/anthropic/claude-go/pkg/evolution/skillaudit"
@@ -63,13 +69,17 @@ import (
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/sandbox"
 	"github.com/anthropic/claude-go/pkg/session"
+	"github.com/anthropic/claude-go/pkg/sessionapi"
 	"github.com/anthropic/claude-go/pkg/settings"
 	"github.com/anthropic/claude-go/pkg/skills"
+	"github.com/anthropic/claude-go/pkg/statestore"
 	storedual "github.com/anthropic/claude-go/pkg/statestore/dual"
 	swarmintel "github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/synctask"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
+	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/anthropic/claude-go/pkg/weakmodel"
 	"github.com/anthropic/claude-go/pkg/worker"
@@ -157,6 +167,9 @@ var (
 	flagCwd            string
 	flagFinalOnly      bool
 	flagEmitSession    bool
+	flagRunLabel       string // --run-label <名字> 本次 run 在轨迹页上的显示名 (空=回落成 session id)
+	flagAgent          string // --agent <名字> 以单个 agent 的身份运行本次任务 (角色名或 agent 资产名)
+	flagPlugins        []string // --plugin <名字> 启用插件包 (可重复); 展开其 agents/skills/hooks 并装进本次运行
 	flagAPIKey         string
 	flagBaseURL        string
 	flagMaxTokens      int
@@ -186,6 +199,13 @@ var (
 )
 
 func main() {
+	// 会话分片 A/B (见 pkg/api/sessionshard.go): 决定出站 X-Claude-Code-Session-Id
+	// 是否把 NodeID 也算进会话键。默认 0 = 关闭, 出站头与改造前逐字节一致。
+	// 放在 cobra 之前: 它必须在第一个出站请求之前生效。
+	if pct := api.InitSessionShardFromEnv(); pct > 0 {
+		log.Printf("[claude-go] 会话分片实验: %d%% 的 run 走 run+node 会话键 (CLAUDE_GO_SESSION_SHARD)", pct)
+	}
+
 	rootCmd := &cobra.Command{
 		Use:   "claude-go",
 		Short: "Claude Code (Go) - AI 编程助手",
@@ -271,6 +291,9 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagCwd, "cwd", "", "工作目录 (优先级最高, 覆盖配置文件 cwd; 工具相对路径与会话存储均锚定于此)")
 	rootCmd.PersistentFlags().BoolVar(&flagFinalOnly, "final-only", false, "仅输出最终回答文本 (不输出 thinking 过程, 供程序化调用解析)")
 	rootCmd.PersistentFlags().BoolVar(&flagEmitSession, "emit-session-id", false, "结束时输出 __CLAUDE_GO_SESSION__=<id> 行, 供调用方记录以便 --resume 续聊")
+	rootCmd.PersistentFlags().StringVar(&flagRunLabel, "run-label", "", "本次运行在轨迹页上的显示名 (空=用 session id)。供 claude-go coder 这类调用方按任务名标注, 使运行可按名检索")
+	rootCmd.PersistentFlags().StringVar(&flagAgent, "agent", "", "以单个 agent 的身份运行本次任务 (角色名或 agent 资产名); 命中后该 agent 的 systemPrompt/skills/工具面/模型/回合上限生效。名字两层都查不到时报错退出, 不回落成普通 run")
+	rootCmd.PersistentFlags().StringArrayVar(&flagPlugins, "plugin", nil, "启用插件包 (可重复, 每个旗标一个名字): 展开 <root>/plugins/<name>/ 的 agents/skills/hooks 并装进本次运行, 先于 --agent 解析 (插件可提供本次要跑的 agent)。找不到该插件时报错退出, 不静默跳过")
 	rootCmd.PersistentFlags().BoolVarP(&flagContinue, "continue", "c", false, "恢复最近一次对话")
 	rootCmd.PersistentFlags().StringVar(&flagVerify, "verify", "", "任务验收命令 (方案三 L6a): run 结束后在 cwd 执行, 非零即未过; 配 --best-of 启用择优")
 	rootCmd.PersistentFlags().IntVar(&flagBestOf, "best-of", 1, "任务级 best-of-N 尝试次数 (1=关; 2-4, 需配 --verify; 每次全新会话)")
@@ -286,6 +309,7 @@ func main() {
 
 	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(runCmd())
+	rootCmd.AddCommand(coderCmd())
 	rootCmd.AddCommand(feishuCmd())
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.AddCommand(toolsCmd())
@@ -611,7 +635,7 @@ func chatCmd() *cobra.Command {
 
   # 指定模型与调试输出
   claude-go chat --model qwen3.5-plus --debug`,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (retErr error) {
 			eng, err := buildEngine()
 			if err != nil {
 				return err
@@ -641,6 +665,42 @@ func chatCmd() *cobra.Command {
 					}
 				}
 			}
+
+			// 交互式会话的 trace ctx 与 run span 挂点。
+			//
+			// 缺 RunID 时, 这一轮里的每一次 llm_call / turn 都会经
+			// tracestore.bucketName("") 落进 **trace-orphan** 桶 —— 而 webapp 的轨迹页
+			// 只列 trace-run-*(见 pkg/feishu/session_trace.go 的包注释, 那儿有完整的
+			// 因果链), 于是整段交互式会话在页面上**不存在**。实测: 一次 chat 往
+			// orphan 写 2 条 (llm_call + turn), 而这个桶自 8 月起累积到 1.8 万条 /
+			// 10 MB 且一直在涨 —— 它就是这个泄漏的唯一剩余产生方。
+			//
+			// RunID 在**进程开始时发一次**, 不是每轮一次: REPL 的一次进程就是一个会话
+			// (与 pkg/feishu 的 session 语义对齐)。每轮换一个 RunID 会把一次对话撕成
+			// N 个桶, "这次会话里到底发生了什么"就再也拼不回来 —— 而这正是轨迹页要
+			// 回答的那个问题。
+			//
+			// defer 的位置与 run 路径同理: 它是唯一"无论从哪条出口退出都会走一遍"的
+			// 地方 (/exit、EOF、EOF 后的正常 return 三条)。它按引用读 runID, 所以下面
+			// 那句赋值晚于这里也没关系; runID 仍为空时 recordRunSpan 自己的守卫会跳过
+			// —— 拿不到 session id 时硬编一个会造出"看起来属于某个会话"的假归属。
+			sessionStart := time.Now()
+			ctx, runID := beginCLISessionTrace(store)
+			defer func() {
+				if eng == nil {
+					return
+				}
+				// 状态取自**本函数的返回值**而不是"跑完了就当成功": 成功路径也必须
+				// 报数, 但报什么数要由驱动侧决定 (与 run 路径读 errKind 同一纪律)。
+				status, errText := tracestore.RunStatusOK, ""
+				if retErr != nil {
+					status, errText = tracestore.RunStatusFailed, retErr.Error()
+				}
+				// objective 传空: 一次 REPL 会话没有单一任务目标, 拿第一轮输入冒充
+				// 会让"这条 run 干了什么"看起来比实际确定。
+				recordCLISessionRunSpan(eng.TraceStore, runID, flagRunLabel, store,
+					eng.Config.Model, status, errText, sessionStart)
+			}()
 
 			history, _ := session.NewPromptHistory()
 
@@ -709,7 +769,9 @@ func chatCmd() *cobra.Command {
 					history.Append(input, sid)
 				}
 
-				ctx := context.Background()
+				// 用上面那个带 RunID 的 ctx —— 每轮重新 context.Background()
+				// 会把 RunID 丢掉, 于是本轮的 Span 又回到 orphan 桶 (这正是改造前
+				// 的形态: 有 session 存储、却没有会话级的轨迹归属)。
 				streamCh := eng.SubmitStream(ctx, input)
 
 				printStreamEvents(streamCh)
@@ -741,6 +803,36 @@ func runCmd() *cobra.Command {
 
 			userPrompt := strings.Join(args, " ")
 
+			// H4-3 长程档上限: 在这里 (命令作用域) 读一次 —— agentFactory 闭包与
+			// 它同在 runCmd 里, Execute 时的 ctx 拿不到配置。读不到 (无配置文件 /
+			// ai 段缺失) 时留 0, cliAgentRunner.Execute 回落到编译期兜底值。
+			//
+			// 独立读一次而不复用下面那个 jsonCfg: 那一份在 `/` 前缀分支内部, 而
+			// 这个值要覆盖的是整条 run 路径。多读一次磁盘的代价是几毫秒, 换来的是
+			// "配置读取点"与"使用点"在同一个作用域里 —— 复用会让以后的读者以为
+			// 只有 slash 命令才认这个配置。
+			cliLongHorizonTurns := 0
+			if cfgLong, _, cfgErr := loadRuntimeJSONConfig(); cfgErr == nil && cfgLong != nil && cfgLong.AI != nil {
+				cliLongHorizonTurns = cfgLong.AI.LongHorizonMaxTurns
+			}
+
+			// --agent: 以单个 agent 的身份跑这一条 prompt。
+			//
+			// ★ 位置在 slash 分发**之前**, 有两个都不能省的理由:
+			//
+			//  1. 语义上 `--agent` 是"不要编排, 只要这一个 agent"。让它先进斜杠分支就等于
+			//     "某个 agent 的 prompt 以 / 开头时, 它会变成一次团队编排" —— 而那个分支
+			//     里 agentFactory 装出来的是**角色**, 与 --agent 指定的那个不是同一个东西。
+			//  2. 安全上 --agent 会写 eng.Config 的工具面 (applyAgentToolFace), 而斜杠分支
+			//     拥有全量能力。先进去再出来, 白名单可能已经被那条路径的能力面绕过。
+			//
+			// 这里**不看** eng.Config.AllowedTools: 上面那条闸门管的是"不可信输入里的 /",
+			// 而 --agent 是调用方显式给的旗标 (不是 prompt 内容), 且它自己的工具面已经
+			// 在 applyAgentToolFace 里与既有白名单求过交 —— 是收窄方向, 不需要再挡。
+			if strings.TrimSpace(flagAgent) != "" {
+				return runAsAgent(cmd, eng, userPrompt, cliLongHorizonTurns)
+			}
+
 			// 受限会话 (--allowed-tools 已设置) 绝不进入 slash-command 分发:
 			// /team 等编排路径拥有全量能力, 会绕过白名单 — 不可信输入以 "/"
 			// 开头时按普通 prompt 处理 (安全前提: 白名单只对引擎路径强制)。
@@ -759,7 +851,25 @@ func runCmd() *cobra.Command {
 
 				agentFactory := func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
 					mcfg, _ := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig)
-					return &cliAgentRunner{eng: eng, role: role, systemPrompt: systemPrompt, modelCfg: mcfg}, nil
+					// stage 从**创建时的** ctx 读: RunMetadata 由编排层在装配这个
+					// runner 之前写进 ctx (agent.runAgent), Execute 时的 ctx 已被
+					// 换过, 拿不到。与 feishu 的 sessionAgentRunner 同一理由。
+					meta := agent.RunMetadataFromContext(ctx)
+					// 阶段声明的 Hooks/Skills (21.8.12 P4/X1) 同样在**创建时**捕获 ——
+					// 与上面两句同一条理由: 声明由 executeStage 写进创建 ctx, Execute
+					// 时 ctx 已被换过 (agent.runAgent 会重建), 那时候读回来是空的。
+					// 读回是空值不报错, 只是静默不生效 —— 所以必须在这里接入。
+					//
+					// Model 不在这里捕获: 它的消费点在 runAgent 内部 (那个函数**覆写**
+					// ModelConfigKey, 提前塞进 ctx 的值会被整体冲掉, 见其注释), 所以
+					// mcfg 读到的已经是"阶段声明解析之后"的最终值。
+					decl := agent.StageDeclFromContext(ctx)
+					// H4-3 长程档上限 (装配期捕获, Execute 时手边没有 jsonCfg)。
+					return &cliAgentRunner{
+						eng: eng, role: role, stage: meta.Stage,
+						systemPrompt: systemPrompt, modelCfg: mcfg, stageDecl: decl,
+						longHorizonMaxTurns: cliLongHorizonTurns,
+					}, nil
 				}
 				agentPool := agent.NewAgentPool(agentFactory, 8)
 
@@ -779,6 +889,11 @@ func runCmd() *cobra.Command {
 					tasksFilePath = tasksLayout.TasksFilePath()
 				}
 				taskStore := builtin.NewTaskStore(tasksFilePath)
+
+				// 信箱后端 (21.8.9-D6): 落在 <state>/statestore 下, 与团队数据同根。
+				// 传 nil 会回落到**进程内** MemStore —— CLI 一次 run 结束进程就退, 那条
+				// 路径上等于所有消息当场蒸发, 而且不会有任何报错。所以必须显式给。
+				teamStateStore := statestore.NewFileStore(filepath.Join(tasksStateDir, "statestore"))
 				dagAdapter := agent.NewTaskStoreDAGAdapter(taskStore, func() []agent.DAGTaskSummary {
 					raw := taskStore.ReadyTasks()
 					out := make([]agent.DAGTaskSummary, len(raw))
@@ -815,9 +930,46 @@ func runCmd() *cobra.Command {
 				// 加载用户自定义动态工作流 (<state>/workflows/*.json) —— 与飞书 bot 路径对齐
 				// (design/02 §六: 工作流应跨入口一致)。此前仅飞书 bot 加载, CLI headless run
 				// 无法跑自定义/图模式工作流。
+				// 角色表与 dashboard 的校验点用**同一份来源** (21.8.12 W1):
+				// 只认 cwd 的话, dashboard 用 <stateDir> 校验通过的工作流, 在这里
+				// 会查不到它的角色并静默退化成内联 prompt —— 一个通过了校验的
+				// 工作流, 运行时静默地不按它校验时的样子跑。
+				// 失败明细与降级明细都要打出来。此前这里把 details 丢成 `_`,
+				// 于是"40 个文件里 3 个装载失败"在这条路径上只表现为一个数字,
+				// 而那 3 个是谁、为什么, 只有翻日志才知道 (而且日志里也没有)。
+				//
+				// 装载在这里做一次并把 roles 存下来给下面 teamMgr 用: 装载用的
+				// 角色表与执行时用的**必须同一份实例**, 否则"装载时解析得出的结论"
+				// 与"执行时解析得出的结论"可以在同一个进程里不同 —— 这是 21.8.12
+				// W1 那条"校验通过、运行时静默降级"在进程内部的微型版本。
+				runRoles := agent.NewRoleRegistryFor(cwd, tasksStateDir)
 				if wfDir := filepath.Join(tasksStateDir, "workflows"); wfDir != "" {
-					if loaded, failed, _ := agent.LoadWorkflowsFromDir(wfDir, agent.NewRoleRegistry(cwd)); loaded > 0 || failed > 0 {
-						fmt.Printf("[run] 自定义工作流加载: 成功 %d 失败 %d\n", loaded, failed)
+					rep := agent.LoadWorkflowsFromDirReport(wfDir, runRoles)
+					if rep.Loaded > 0 || rep.Failed > 0 || len(rep.Deferred) > 0 {
+						fmt.Printf("[run] 自定义工作流加载: %s\n", rep.Summary(wfDir))
+						for _, d := range rep.Details {
+							fmt.Printf("[run][workflow][fail] %s\n", d)
+						}
+						for _, d := range rep.Deferred {
+							fmt.Printf("[run][workflow][degraded] %s\n", d)
+						}
+					}
+				}
+				// 内置工作流自检 (21.8.12 W4): 与 bot 路径同一份实现、同一口径。
+				// CLI 的单跑是最容易撞上"某个内置 stage 的 agent 名字写错了"的场景
+				// —— 因为它不经过任何 dashboard 校验, 直接跑。
+				//
+				// 这里只打印**有问题**的那几条 (不像 bot 那样无条件打一行汇总):
+				// bot 一次启动只走一次, 而 run 是频繁路径 —— 每次 run 都刷一行
+				// "全绿"只会把这一整段变成噪声, 而它真正要传递的信息是"有坏的吗"。
+				// 需要完整读数时走 `claude-go doctor`。
+				for _, is := range agent.AuditBuiltinWorkflows(runRoles) {
+					if is.Hard != "" {
+						fmt.Printf("[run][workflow][builtin][fail] %s: %s\n", is.Name, is.Hard)
+						continue
+					}
+					for _, w := range is.Warnings {
+						fmt.Printf("[run][workflow][builtin][degraded] %s: %s\n", is.Name, w)
 					}
 				}
 				// 进化引擎: headless run 路径与飞书路径同构装配 (design/03 §1.2 开环1 修复)。
@@ -856,14 +1008,19 @@ func runCmd() *cobra.Command {
 				})
 				evoLoop.Start(context.Background())
 				teamMgr := agent.NewProductionTeamManager(agent.TeamManagerConfig{
-					BaseDir:            filepath.Join(tasksStateDir, "teams"),
-					Cwd:                cwd,
-					Factory:            agentFactory,
-					Pool:               agentPool,
-					Notify:             func(_, msg string) { fmt.Println(msg) },
-					LLM:                eng.APIClient,
-					Roles:              agent.NewRoleRegistry(cwd),
+					BaseDir: filepath.Join(tasksStateDir, "teams"),
+					Cwd:     cwd,
+					Factory: agentFactory,
+					Pool:    agentPool,
+					Notify:  func(_, msg string) { fmt.Println(msg) },
+					LLM:     eng.APIClient,
+					// 与上面那次装载**同一个实例** (21.8.12 W1): 装载工作流用的是哪张
+					// 角色表, 执行时就该是哪张。两处各建一份 (哪怕参数相同) 也会在
+					// 装载与执行之间留下一个可观测的窗口 —— 期间自定义角色文件若变了,
+					// 两张表就不同, 而差异只在"某个 stage 退化成内联 prompt"上现形。
+					Roles:              runRoles,
 					TaskTracker:        dagAdapter,
+					StateStore:         teamStateStore,
 					Concurrency:        eng.APIClient.Guard,
 					PlanConfigResolver: modelResolver,
 					Evolution:          evoEngine,
@@ -872,6 +1029,16 @@ func runCmd() *cobra.Command {
 					Dreamer:            &cliDreamAdapter{dreamer: cliDreamer},
 					SkillCreator:       cliSkillCreator(tasksLayout, tasksStateDir, eng),
 				})
+
+				// 资产索引 (21.8.12 P0/P1): 六种资产按标准布局装载一次, 装进进程级索引。
+				// 这是 Agent 工具的 subagent_type 能被查表 (P5) 的前提 —— 没有索引,
+				// 清单为空、查表恒 miss, 模型填什么名字都只会走角色名子串猜测。
+				fmt.Printf("[run] 资产装载: %s\n", loadAssetCatalog(cwd, tasksStateDir))
+				// 与 runAsAgent 同理: 上一行重建了进程级目录, --plugin 合并进去的
+				// 插件 agents 要重新合并进这份新目录的副本, 否则团队路径查不到它们。
+				if cliPlugins != nil {
+					mergePluginAgents(agent.AgentCatalog(), cliPlugins.bundles)
+				}
 
 				cmdCtx := &commands.CommandContext{
 					Engine:     eng,
@@ -905,7 +1072,67 @@ func runCmd() *cobra.Command {
 				}
 			}
 
-			ctx := context.Background()
+			// trace 上下文: 装配点 (buildEngine) 已把配置声明的工单/实例索引写进
+			// runTraceIDs, 这里把它挂到本次运行的 ctx 上 —— 之后引擎内每一层
+			// (TraceCapture / api.setTraceHeaders / 落盘 record) 都从 ctx 读, 不需要
+			// 逐层传参。空 IDs 时 trace.With 是恒等操作 (逐字段判空合并), 行为与改造前
+			// 逐字节一致。
+			ctx := trace.With(context.Background(), runTraceIDs)
+
+			// 会话级轨迹: 把 RunID 补上, 否则本次运行的 Span 会落进 trace-orphan 桶
+			// (tracestore.bucketName("") -> trace-orphan), 而 webapp 的轨迹页只列
+			// trace-run-*(见 pkg/feishu/session_trace.go 的包注释, 那儿有完整的因果链)。
+			//
+			// 只补 RunID/SessionID 两个键, **不覆盖** runTraceIDs 里已有的工单/实例索引
+			// —— trace.With 逐字段判空合并, 上面那行已经把它们挂上去了, 这里再 With
+			// 一次是叠加而不是替换。
+			//
+			// store 为 nil (没有 home 目录等) 时跳过: 没有 session id 就没有可辨的桶名,
+			// 硬编一个会造出"看起来属于某个会话"的假归属。
+			runID := ""
+			if store != nil {
+				sid := store.SessionID()
+				runID = fmt.Sprintf("run-%s-%d", sid, runTraceSeq.Add(1))
+				ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: sid})
+			}
+
+			// run span 的挂点。**位置就是全部要害**: defer 是唯一"无论从哪条 return
+			// 退出都会走一遍"的地方, 而本 RunE 里有多条提前 return —— 那些恰恰是最
+			// 该被看见的失败运行 (与 pkg/agent/run_span.go 文件头第 22-31 行同源论证)。
+			//
+			// 此前 run span 只有两个产生方: 团队路径 (pkg/agent/run_span.go, 挂在
+			// beginRun 的收尾闭包) 与飞书会话路径 (pkg/feishu/session_trace.go)。CLI 的
+			// run 路径**一个都没有** —— 而 webapp 的轨迹页只从第一条 kind:"run" 的 span
+			// 派生 name/workflow/status/duration (traces.ts:526 summarizeTrace)。缺了它,
+			// 这些运行在页面上就是一行裸哈希 + 一个灰点, 按任何关键字都搜不到。
+			// 实测: 234 个 trace-run-* 里 24 个如此, mtime 恰好落在 coder 长跑那一晚。
+			//
+			// 注意这与"桶名对不上"是**两个**问题: 上面那段已经补了 RunID, 所以文件
+			// 正确落在 trace-run-* 桶里、被 glob 收得到 —— 缺的是文件里的内容。
+			//
+			// errKind 提前到这里声明 (下面原本是 `var final, errKind string`), 是为了让
+			// 这个 defer 能排在它前面: 延迟闭包按引用捕获, 但被捕获的变量**声明必须在
+			// defer 语句之前**才是合法的。
+			start := time.Now()
+			var errKind string
+			defer func() {
+				if eng == nil {
+					return
+				}
+				// 显示名在收尾时现算 —— 回落顺序与 pkg/feishu 的 Session.displayName
+				// 一致: 显式标签优先, 没有就用 session id。session id 是**有意义**的
+				// 身份而不是占位符, 所以不印 "(未命名)" 之类会掩盖真实取值的东西。
+				name := strings.TrimSpace(flagRunLabel)
+				if name == "" && store != nil {
+					name = store.SessionID()
+				}
+				status := tracestore.RunStatusOK
+				if errKind != "" {
+					status = tracestore.RunStatusFailed
+				}
+				recordRunSpan(eng.TraceStore, runID, name, eng.Config.Model, status, errKind, userPrompt, start)
+			}()
+
 			attachBlocks, err := ingestAttachments(flagAttach)
 			if err != nil {
 				return err
@@ -921,7 +1148,8 @@ func runCmd() *cobra.Command {
 					attempts = 4
 				}
 			}
-			var final, errKind string
+			// errKind 已提前到上面的 run span 挂点处声明 (deferred 闭包要捕获它)。
+			var final string
 			verifyPassed := false
 			for attempt := 1; ; attempt++ {
 				if attempt > 1 {
@@ -984,8 +1212,16 @@ func runCmd() *cobra.Command {
 					}
 				}
 			}
+			// 装配自报的索引字段在此补全: buildEngine 采集时还不知道会话 ID
+			// (SessionStore 是它返回之后才建的), 而报告要能被"按会话反查"。
+			// 只补索引, 不动任何装配实质 —— 故 fingerprint 不受影响。
+			if cliAssembly != nil {
+				cliAssembly.SessionID = sessionID
+				cliAssembly.TicketID = runTraceIDs.TicketID
+				cliAssembly.InstanceID = runTraceIDs.InstanceID
+			}
 			if jsonMode {
-				return emitRunEnvelope(final, sessionID, errKind)
+				return emitRunEnvelope(final, sessionID, errKind, cliAssembly, cliAssemblyReconcile)
 			}
 			if flagEmitSession && store != nil {
 				fmt.Printf("\n__CLAUDE_GO_SESSION__=%s\n", sessionID)
@@ -993,6 +1229,91 @@ func runCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// beginCLISessionTrace 给出**交互式会话**这一轮的 trace 上下文: ctx + 本次运行的
+// RunID (拿不到会话 id 时为空)。
+//
+// 抽成函数而不是留在 chat 的 RunE 里, 是为了让它有一条**能测**的判据 —— 这个修复
+// 的失效形态恰恰是无声的: 少一句 trace.With, 整段交互式会话就落回 orphan 桶,
+// 没有任何一层会报错, 界面也不报错 (只是那一屏什么都没有)。
+//
+// RunID 在进程开始时发一次, 不是每轮一次: REPL 的一次进程就是一个会话 (与
+// pkg/feishu 的 session 语义对齐)。每轮换一个 RunID 会把一次对话撕成 N 个桶,
+// "这次会话里到底发生了什么"就再也拼不回来。
+//
+// store 为 nil 时**刻意不发号**: 没有会话 id 就没有可辨的桶名, 硬编一个会造出
+// "看起来属于某个会话"的假归属 (与 run 路径同一条守卫)。
+func beginCLISessionTrace(store *session.SessionStore) (context.Context, string) {
+	ctx := trace.With(context.Background(), runTraceIDs)
+	if store == nil {
+		return ctx, ""
+	}
+	sid := store.SessionID()
+	runID := fmt.Sprintf("run-%s-%d", sid, runTraceSeq.Add(1))
+	return trace.With(ctx, trace.IDs{RunID: runID, SessionID: sid}), runID
+}
+
+// recordCLISessionRunSpan 写交互式会话的自述 run span。
+//
+// 与 recordRunSpan 同底座同 attrs 键, 差别只有取名回落顺序的输入 (这里直接收
+// store 与原始 label, 因为会话 id 只有 store 知道)。抽出来同样是为了可测。
+func recordCLISessionRunSpan(ts *tracestore.Store, runID, label string, store *session.SessionStore,
+	model, status, errText string, start time.Time) {
+	// 回落顺序与 pkg/feishu 的 Session.displayName 一致: 显式标签优先, 没有就用
+	// session id。session id 是**有意义**的身份而不是占位符, 所以不印 "(未命名)"。
+	name := strings.TrimSpace(label)
+	if name == "" && store != nil {
+		name = store.SessionID()
+	}
+	// objective 传空: 一次 REPL 会话没有单一任务目标, 拿第一轮输入冒充会让
+	// "这条 run 干了什么"看起来比实际确定。
+	recordRunSpan(ts, runID, name, model, status, errText, "", start)
+}
+
+// recordRunSpan 写本次 CLI run 的自述 span (KindRun)。
+//
+// 与 pkg/feishu/session_trace.go 的收尾闭包**同形、同 attrs 键** —— 两条路径的运行
+// 在轨迹页上应当长得一样, 不能一条有名字一条只有哈希。差异只有一处且是刻意的:
+// 那边 InputRef 传空串 (会话路径的 objective 在别处), 这里传真正的 userPrompt。
+//
+// fail-open 且零分配退出: store 未装配 (裸调/测试/没有 home 目录) 时直接返回, 与
+// pkg/agent/run_span.go:50「无 trace 的执行不产 run span, 免得写出挂不上任何桶的
+// 孤儿」同一守卫。runID 为空同理 —— 空 TraceID 会被 tracestore 归进 trace-orphan。
+func recordRunSpan(ts *tracestore.Store, runID, name, model, status, errText, objective string, start time.Time) {
+	if ts == nil || runID == "" {
+		return
+	}
+	attrs := map[string]any{
+		// workflow 取 session: 如实描述"这条运行走的是 CLI 会话路径, 不属于任何团队
+		// 工作流"。留空会让它落进页面的「(未知工作流)」桶, 与"真的没归因"混在一起。
+		"workflow": tracestore.SessionWorkflowLabel,
+		"status":   status, // "completed" | "failed" —— 页面的 StatusDot 按这两个字面量判色
+		"team":     name,   // 页面按 team 分组, 与 workflow 是两个维度
+	}
+	// model 为空时不写这个键而不是写空串: 空串与"模型就是空"在读数上不可分
+	// (同 session_trace.go:114)。
+	if model != "" {
+		attrs["model"] = model
+	}
+	if errText != "" {
+		// 与 pkg/feishu/session_trace.go 的 truncateResult(errText, 500) 输出逐字节相同
+		// (那边就是 textutil.Truncate 的本地包装), 只是这里直接用底座的那个,
+		// 免得 cmd 包再抄一份同义函数。
+		attrs["error"] = textutil.Truncate(errText, 500, "...")
+	}
+	ts.Write(tracestore.Span{
+		TraceID: runID,
+		SpanID:  internal_hook.GenerateUUID(),
+		Kind:    tracestore.KindRun,
+		Name:    name,
+		// 刻意不设 ParentID: run 是这棵树的根 (与 run_span.go:88 同一处理)。
+		InputRef:  ts.MakeRef(objective),
+		OutputRef: ts.MakeRef(errText),
+		Attrs:     attrs,
+		TS:        start.UnixMilli(),
+		DurMS:     time.Since(start).Milliseconds(),
+	})
 }
 
 // wmlInjectExperience L7 注入半环: 弱模型模式下按任务文本检索经验卡注入 system prompt。
@@ -1084,14 +1405,37 @@ type runEnvelope struct {
 	SessionID string `json:"session_id,omitempty"`
 	IsError   bool   `json:"is_error"`
 	ErrorKind string `json:"error_kind,omitempty"`
+	// Assembly 是本次运行的装配自报 (方案 20.6.4 D0.7)。
+	//
+	// 随 envelope 一起出而不是单独落一个文件: 平台已经在按 envelope 判定结果, 多一个
+	// 文件就多一次"忘了取/取错版本"的机会; 而自我报告的**及时性**正是它的全部价值 ——
+	// 它在这一份响应里, 就绝不会与这次运行错位。
+	//
+	// 指针 + omitempty: 采集失败 (引擎未构造等) 时整段缺席, 而不是给一个空对象假装
+	// "装配为空" —— 后者在对账侧会读成"声明了但一项没装上", 把采集失败误报成装配失败。
+	Assembly *assembly.Report `json:"assembly,omitempty"`
+
+	// AssemblyReconcile 是**声明**与上面那份自报的对账差异 (方案 20.6.4 D0.7)。
+	//
+	// 与 Assembly 并排出、且用独立字段而不是塞进 Report 里: 自报是"实际装成了什么"
+	// (可观测事实), 对账差异是"两者之差" (结论)。混成一个对象, 消费方就没法只信
+	// 事实而不接受结论 —— 而事实与结论的可信度并不相同。差异为空数组与整段缺席也
+	// 是两回事: 前者是"对过账, 一致", 后者是"没对账", 面板上必须分得开。
+	//
+	// 注意本字段是**本进程自比**: 声明来自本进程读到的配置, 实际来自本进程的引擎。
+	// 平台手里那份岗位模板是另一份声明, 它要在平台侧拿同一份报告再对一次 ——
+	// 两处都报, 才能分出"下发丢了"与"下发到了但没装配上"。
+	AssemblyReconcile *assembly.ReconcileResult `json:"assembly_reconcile,omitempty"`
 }
 
-func emitRunEnvelope(final, sessionID, errKind string) error {
+func emitRunEnvelope(final, sessionID, errKind string, report *assembly.Report, reconcile *assembly.ReconcileResult) error {
 	env := runEnvelope{
-		Final:     final,
-		SessionID: sessionID,
-		IsError:   errKind != "",
-		ErrorKind: errKind,
+		Final:             final,
+		SessionID:         sessionID,
+		IsError:           errKind != "",
+		ErrorKind:         errKind,
+		Assembly:          report,
+		AssemblyReconcile: reconcile,
 	}
 	b, err := json.Marshal(env)
 	if err != nil {
@@ -1440,6 +1784,14 @@ JSON 配置文件示例:
 							botRef.DashboardReloadSkills()
 						}
 					},
+					// 与 ReloadSkills 同形, 但刷的是**另一份**索引 —— 见
+					// Bot.DashboardReloadAssets 的注释: 资产索引有两处持有者,
+					// 漏一处会让"新建的 agent"只在一个入口上可见。
+					ReloadAgents: func() {
+						if botRef != nil {
+							botRef.DashboardReloadAssets()
+						}
+					},
 				}
 				dashCfgRef = &dashCfg
 
@@ -1506,6 +1858,29 @@ JSON 配置文件示例:
 				}
 
 				config.Wiki.APIExtensions = append(config.Wiki.APIExtensions,
+					// 会话 HTTP 面 (/api/sessions/*): 建会话 / 发消息 / 轮询回复。
+					//
+					// 挂在这**同一个 mux** 上而不是自开端口: 鉴权是 httpauth.Middleware
+					// 在 wiki API 的 Start 里对整条 mux 统一施加的 (pkg/wiki/api.go:126),
+					// 自开 listener 会绕开它 —— dashboard 与 cluster 两组路由历史上就是这么
+					// 漏掉的 (api.go 的 Start 注释里记着这件事)。
+					//
+					// botRef 惰性取: 本闭包在 NewBot 内经 APIExtensions 执行, 早于
+					// `botRef = bot`。此刻取一个已构造好的值会拿到 nil 并让装配崩掉。
+					func(mux *http.ServeMux) {
+						sessionapi.Mount(mux, func() sessionapi.Host {
+							if botRef == nil {
+								return nil
+							}
+							sm := botRef.Sessions()
+							if sm == nil {
+								return nil
+							}
+							return sm.SessionHost()
+						})
+						fmt.Printf("[Sessions] 已挂载 /api/sessions 到 wiki API 端口 %d\n",
+							config.Wiki.APIPort)
+					},
 					func(mux *http.ServeMux) {
 						dsrv := dashboard.MountOn(*dashCfgRef, mux)
 						// 注入活动定时任务调度器的【解析器】, 启用 /api/cron 写接口(创建/更新/启停/删除)。
@@ -1552,10 +1927,24 @@ JSON 配置文件示例:
 
 			// 配置热加载: providers/models/ai 改了立即生效, 不必重启控制面。
 			// 控制面是 k8s 里长跑的 serve 进程, 重启会打断队列里在跑的任务。
+			//
+			// 两个 apply 分开调、各自返回错误: 模型段解析失败不该连带吞掉引擎开关
+			// 的更新, 反之亦然。WatchConfig 在两个都失败时才报"重载失败", 任一成功
+			// 都算这次配置变更已被吸收。
 			{
 				cfgPath, _ := feishu.ResolveJSONConfigPath(configPath)
 				hotreload.WatchConfig(cfgPath, 5*time.Second, "claude-go-serve",
-					func(p string) error { return bot.ReloadModelConfig(p) })
+					func(p string) error {
+						errModel := bot.ReloadModelConfig(p)
+						errSw := bot.ApplyEngineSwitches(p)
+						if errModel != nil && errSw != nil {
+							return fmt.Errorf("模型配置: %v; 引擎开关: %v", errModel, errSw)
+						}
+						if errModel != nil {
+							log.Printf("[HotReload] 模型配置重载失败 (引擎开关已应用, 继续用旧模型配置): %v", errModel)
+						}
+						return nil
+					})
 			}
 			_ = dashCfgRef // suppress unused warning when Wiki.APIPort == 0
 
@@ -1722,8 +2111,100 @@ func doctorCmd() *cobra.Command {
 			loader := prompt.NewManager(cwd)
 			files := loader.MemoryLoader.LoadAll()
 			fmt.Printf("✓ CLAUDE.md 文件: 发现 %d 个\n", len(files))
+
+			// 角色表与工作流自检 (21.8.12 W1/W3/W4)。
+			//
+			// doctor 是"这台机器上的东西对不对"的入口, 而这三项恰好都是**静默**
+			// 失效的: 角色来源少扫一档 (只看 cwd 不看 stateDir)、落盘工作流的 agent
+			// 名不在表里 (退化成内联 prompt)、内置工作流的名字写错。三者都不会报错,
+			// 只会在某次运行里给出一个不属于你的结果。
+			stateDir := ""
+			if jsonCfg, _, err := loadRuntimeJSONConfig(); err == nil && jsonCfg != nil {
+				stateDir = basedir.ResolveDefault(jsonCfg.StateDir, jsonCfg.Cwd)
+			}
+			if stateDir == "" {
+				stateDir = resolveStateDir("")
+			}
+			roles := agent.NewRoleRegistryFor(cwd, stateDir)
+			fmt.Printf("✓ 角色表: %s\n", roles.DescribeSources())
+			for _, issue := range roles.LoadIssues() {
+				fmt.Printf("  ✗ %s\n", issue)
+			}
+
+			// doctor **不注册**工作流 —— 装载会写进程内的注册表, 而 doctor 的诊断
+			// 动作不该有副作用 (那正是"验收脚本不许改被测对象")。所以这里走的是
+			// **只读**自检 inspectWorkflowDir, 而不是会注册的 LoadWorkflowsFromDirReport。
+			wfDir := ""
+			if stateDir != "" {
+				wfDir = filepath.Join(stateDir, "workflows")
+			}
+			if inspected, hard, degraded := inspectWorkflowDir(wfDir, roles); inspected > 0 {
+				fmt.Printf("✓ 落盘工作流自检: 共 %d 条, 硬错 %d, 静默降级 %d\n", inspected, hard, degraded)
+			}
+			if issues := agent.AuditBuiltinWorkflows(roles); len(issues) > 0 {
+				for _, is := range issues {
+					if is.Hard != "" {
+						fmt.Printf("  ✗ 内置 %s: %s\n", is.Name, is.Hard)
+						continue
+					}
+					for _, w := range is.Warnings {
+						fmt.Printf("  ! 内置 %s: %s\n", is.Name, w)
+					}
+				}
+				// unchecked 必须报: 一部分内置的 stage 在图模板里, WorkflowDef.Stages
+				// 为空 —— 它们一个 stage 都查不到。不报这个数的话, "全部查过且全绿"与
+				// "一大半根本没查"在 doctor 的输出上完全一样, 而 doctor 的全部价值
+				// 就是让人相信"内置与角色表没脱节"。
+				total, hard, degraded, unchecked := agent.BuiltinAuditSummary(issues)
+				fmt.Printf("✓ 内置工作流自检: 共 %d 条, 硬错 %d, 静默降级 %d, stage 不在定义中(无从检查) %d\n",
+					total, hard, degraded, unchecked)
+			}
 		},
 	}
+}
+
+// inspectWorkflowDir 只读地自检一个工作流目录 (21.8.12 W4 的落盘半边)。
+//
+// **不注册、不落盘、不改任何全局状态** —— doctor 是诊断入口, 而诊断动作若带副作用,
+// 它报出来的结论就不再是"你现在的状态", 而是"我检查过之后的状态"。这条纪律在
+// 21.8.12 的验收方法论里写作"验收脚本不许改被测对象"。
+//
+// 与 LoadWorkflowsFromDirReport 的关系: 那个会注册, 是本函数的写版本。两份都保留
+// 是因为它们的**时机**不同 —— 启动装载必须注册, doctor 必须不注册; 而校验收敛在
+// ValidateAll 一处, 所以两份给出的判定必然一致 (不会出现"doctor 说好、启动说坏")。
+func inspectWorkflowDir(dir string, roles *agent.RoleRegistry) (inspected, hard, degraded int) {
+	if strings.TrimSpace(dir) == "" {
+		return 0, 0, 0
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0, 0
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var def agent.WorkflowDef
+		if err := json.Unmarshal(data, &def); err != nil {
+			continue
+		}
+		inspected++
+		warns, verr := def.ValidateAll(roles)
+		if verr != nil {
+			hard++
+			fmt.Printf("  ✗ 工作流 %s: %s\n", e.Name(), verr)
+			continue
+		}
+		for _, w := range warns {
+			degraded++
+			fmt.Printf("  ! 工作流 %s: %s\n", e.Name(), w)
+		}
+	}
+	return inspected, hard, degraded
 }
 
 // toolsCmd 列出可用工具
@@ -1803,7 +2284,22 @@ func rolesCmd() *cobra.Command {
   claude-go roles go-reviewer`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cwd, _ := os.Getwd()
-			reg := agent.NewRoleRegistry(cwd)
+			// 来源与 run/飞书/dashboard 一致 (21.8.12 W1): 这个子命令的用途就是
+			// "查得到底装了哪些角色", 它列出来的表若与服务时用的那张不同, 它给出的
+			// 就是一份会误导排查的答案 —— 而它恰恰是排查时第一个被跑的命令。
+			//
+			// stateDir 从**运行时配置**里取, 而不是直接 resolveStateDir(""):
+			// 后者只看 CLI 旗标与 cwd 回落, 会漏掉配置文件里写的 stateDir ——
+			// 而那恰是生产上这份部署真正的状态目录 (见 loadRuntimeJSONConfig)。
+			stateDir := ""
+			if jsonCfg, _, err := loadRuntimeJSONConfig(); err == nil && jsonCfg != nil {
+				stateDir = basedir.ResolveDefault(jsonCfg.StateDir, jsonCfg.Cwd)
+			}
+			if stateDir == "" {
+				stateDir = resolveStateDir("")
+			}
+			reg := agent.NewRoleRegistryFor(cwd, stateDir)
+			fmt.Println(reg.DescribeSources())
 
 			if len(args) == 0 {
 				fmt.Println("Available Roles:")
@@ -2921,18 +3417,29 @@ func normalizeProviderModelAlias(model string) string {
 }
 
 func loadRuntimeJSONConfig() (*feishu.JSONConfig, string, error) {
-	path, err := feishu.ResolveJSONConfigPath(flagConfig)
+	cfg, path, _, err := loadRuntimeJSONConfigWithOrigin()
+	return cfg, path, err
+}
+
+// loadRuntimeJSONConfigWithOrigin 同 loadRuntimeJSONConfig, 额外返回命中的环节名。
+//
+// 环节名只给装配自报用 (pkg/assembly.ConfigSource.Origin): 查找链有六环, 出问题时
+// "你改的不是它读的那一份"是最常见的浪费, 而两条路径都是合法存在的文件, 只给路径
+// 看不出谁赢了。选哪一份的逻辑只有 ResolveJSONConfigPathWithOrigin 一处, 两条入口
+// 不可能在这里分叉。
+func loadRuntimeJSONConfigWithOrigin() (*feishu.JSONConfig, string, string, error) {
+	path, origin, err := feishu.ResolveJSONConfigPathWithOrigin(flagConfig)
 	if err != nil {
-		return nil, "", err
+		return nil, "", origin, err
 	}
 	if path == "" {
-		return nil, "", nil
+		return nil, "", origin, nil
 	}
 	cfg, err := feishu.LoadJSONConfig(path)
 	if err != nil {
-		return nil, path, err
+		return nil, path, origin, err
 	}
-	return cfg, path, nil
+	return cfg, path, origin, nil
 }
 
 func resolveRuntimeModelConfig(jsonCfg *feishu.JSONConfig, preferredModel string) (modelconfig.ResolvedConfig, bool, error) {
@@ -3020,7 +3527,7 @@ func buildAdvisorClient(jsonCfg *feishu.JSONConfig, projectSettings *settings.Se
 		client = api.NewOllamaClient(advResolved.BaseURL, advResolved.ProviderName)
 		client.APIKey = advResolved.APIKey
 	} else {
-		client = api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.ProviderName)
+		client = api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.OutboundModelName())
 	}
 	client.Protocol = advResolved.Protocol
 	client.SetProxy(advResolved.Proxy)
@@ -3051,7 +3558,7 @@ func buildPlanClient(jsonCfg *feishu.JSONConfig, alias string) (*api.Client, boo
 		client = api.NewOllamaClient(planResolved.BaseURL, planResolved.ProviderName)
 		client.APIKey = planResolved.APIKey
 	} else {
-		client = api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.ProviderName)
+		client = api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.OutboundModelName())
 	}
 	client.Protocol = planResolved.Protocol
 	client.SetProxy(planResolved.Proxy)
@@ -3165,6 +3672,38 @@ var cliDreamer *dreaming.Dreamer
 // 仅在统一池开启时非 nil。
 var cliPoolPolicy *builtin.PoolPolicy
 
+// cliAssembly 保存最近一次 buildEngine 的装配自报 (方案 20.6.4 D0.7)。
+//
+// 与 cliDreamer/cliPoolPolicy 同一套路 (buildEngine 无返回值通道可带, 又要在 callRunE
+// 里取用): 装完就存在这里, envelope 与日志再从这里取。
+//
+// 为什么不在 callRunE 里现采: 采集要读引擎的活对象, 而 best-of-N 会**重建**引擎
+// (attempt>1 时 buildEngine 再来一次), 那时早先采集的那份就代表不了最后一次尝试。
+// 由 buildEngine 在装配收尾点自己采, 每次构造对应一份, 语义上不会错位。
+//
+// 每次 buildEngine 覆盖写: 单进程同一时刻只服务一个 run (runCmd 是前台命令),
+// 不构成共享状态。团队路径不经过这里, 故为 nil 时一切照旧。
+var cliAssembly *assembly.Report
+
+// cliAssemblyReconcile 是本进程自比的对账结论 (方案 20.6.4 D0.7):
+// 声明侧取自配置与 Enable* 开关, 实际侧取自 cliAssembly。与 cliAssembly 同生共死,
+// 都在 buildEngine 的装配收尾点产出。
+var cliAssemblyReconcile *assembly.ReconcileResult
+
+// runTraceIDs 配置声明的运维索引维度 (工单 / 实例), 由 buildEngine 装配点写入。
+//
+// 与 SessionID 一样是**跨 run 稳定**的业务键, 但不参与会话分片 (那是 SessionID 的
+// 职责): 它只回答"这条记录属于哪个工单 / 哪个实例"。两者刻意不合并 —— 一张工单会
+// 跨多次运行, 拿它当缓存分片键会让两次运行互相顶掉缓存, 见 pkg/trace.IDs 的说明。
+var runTraceIDs trace.IDs
+
+// runTraceSeq 是 `claude-go run` 的 RunID 发号器 (session_trace.go 同款理由)。
+//
+// 进程内全局递增: 一次 run 进程通常只跑一次, 序号主要为 best-of-N 那几次尝试
+// 与将来的常驻调用方留出唯一性 —— 否则同一 session id 的两次尝试会写进同一个
+// 桶文件, 而它们本该是两次独立运行 (奖励归因要求 RunID 每次唯一)。
+var runTraceSeq atomic.Uint64
+
 // cliDreamAdapter 适配 dreaming.Dreamer → agent.DreamRecorder (与 feishu.dreamAdapter 同构)。
 type cliDreamAdapter struct{ dreamer *dreaming.Dreamer }
 
@@ -3189,9 +3728,16 @@ func (da *cliDreamAdapter) AfterQuery(ctx context.Context) {
 func buildEngine() (*engine.QueryEngine, error) {
 	cwd, _ := os.Getwd()
 
-	jsonCfg, jsonConfigPath, err := loadRuntimeJSONConfig()
+	jsonCfg, jsonConfigPath, configOrigin, err := loadRuntimeJSONConfigWithOrigin()
 	if err != nil {
 		return nil, fmt.Errorf("加载配置文件失败: %w", err)
+	}
+	// 运维索引维度 (方案 20.6.4): 工单与实例是本次运行的业务归属, 配置里声明一次,
+	// 由 buildEngine 在装配点写进 trace.IDs, 之后所有出站请求头 / Span / 落盘记录
+	// 都带着它 —— 这是"给一个 instance_id, 30 秒内拉出全部决策链"的地基 (D0.5)。
+	// 空 = 交互式使用, 属正常状态而非缺失, 故只在非空时注入。
+	if jsonCfg != nil && (jsonCfg.TicketID != "" || jsonCfg.InstanceID != "") {
+		runTraceIDs = trace.IDs{TicketID: jsonCfg.TicketID, InstanceID: jsonCfg.InstanceID}
 	}
 	if jsonCfg != nil && jsonCfg.Cwd != "" {
 		cwd = jsonCfg.Cwd
@@ -3223,7 +3769,10 @@ func buildEngine() (*engine.QueryEngine, error) {
 
 	effectiveModel := flagModel
 	if hasResolvedModel {
-		effectiveModel = resolvedModel.ProviderName
+		// 出站模型名取完整别名 (带 provider 前缀)。注意与下面 normalizeProviderModelAlias
+		// 的分工: 那条分支跑在 !hasResolvedModel 时, 处理的是"裸 provider:model 字面量";
+		// 这里是已解析配置, 别名本身就是权威值, 不能再剥前缀。
+		effectiveModel = resolvedModel.PreferredModelName()
 	}
 	if effectiveModel == "qwen3.5-plus" && projectSettings.Model != "" {
 		effectiveModel = projectSettings.Model
@@ -3274,6 +3823,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 		apiClient = api.NewDashScopeClient(apiKey, effectiveModel)
 	}
 	if hasResolvedModel {
+		// 出站 model 值与上面 effectiveModel 的分工: effectiveModel 是**身份**
+		// (进 transcript / metrics, 别名带 provider 更利于归因); 这里改的是
+		// **发到线上的字节**, 取决于链路形态 —— 经网关发别名 (网关的查找键),
+		// 直连 provider 发裸名 (厂商端点不认前缀)。见 OutboundModelName。
+		apiClient.Model = resolvedModel.OutboundModelName()
 		apiClient.FallbackModels = resolvedModel.FallbackModels
 		apiClient.FallbackBaseURL = resolvedModel.FallbackBaseURL
 		apiClient.FallbackAPIKey = resolvedModel.FallbackAPIKey
@@ -3377,9 +3931,33 @@ func buildEngine() (*engine.QueryEngine, error) {
 			})
 		}
 	}
+	// 外部 hook 的装载点。config 段的 hooks 与飞书路径读的是同一个 JSONConfig
+	// 字段, 所以两条入口在这里**逐字节同构** —— 这是修掉装配不对称的一半 (另一半
+	// 是下面的 EnableFrontierOptimizations)。
 	hookRunner := hooks.NewRunner(hookConfigs, "")
+	if n := hookRunner.Count(); n > 0 {
+		log.Printf("[assembly] 已装载外部 hook %d 条 (来自 %s)", n, jsonConfigPath)
+	}
+	// 插件展开 (run --plugin, 实现见 plugin_flags.go)。位置是全部要害: 必须在技能
+	// 注册表装载 (下方 skillReg)、池装配 (RegisterPoolTools) 与 runAsAgent 的 agent
+	// 解析之前 —— `--plugin foo --agent <来自 foo 的 agent>` 依赖这个顺序。
+	// hook 走 Runner 的可装卸组 (装配期装上 = 引擎开跑前生效); 同时并入 hookConfigs
+	// 变量 —— deps.hookConfigs 会把它们带给子代理的 nested runner (runNestedAgent
+	// 的合并读的是这个切片, 只装组的话插件 hook 在"子代理自己有资产 hook"的那条
+	// 分支上会静默消失)。
+	if wiring, err := wireFlagPlugins(cwd, jsonCfg, hookRunner); err != nil {
+		return nil, err
+	} else if wiring != nil {
+		cliPlugins = wiring
+		hookConfigs = append(hookConfigs, wiring.hookCfgs...)
+	}
 	compactor := compact.NewCompactor(apiClient, contextWindow)
 	promptMgr := prompt.NewManager(cwd)
+	// 日期默认不写进系统提示 (见 prompt.Manager.ShowEnvironmentDate):
+	// 它每天变一次, 而它之后还有工具说明/记忆/角色指令, 等于让整段前缀天天作废。
+	if jsonCfg != nil && jsonCfg.Engine != nil && jsonCfg.Engine.EnvironmentDate != nil {
+		promptMgr.ShowEnvironmentDate = *jsonCfg.Engine.EnvironmentDate
+	}
 	if flagSystemPrompt != "" {
 		promptMgr.CustomPrompt = flagSystemPrompt
 	} else if jsonCfg != nil && jsonCfg.SystemPrompt != "" {
@@ -3389,6 +3967,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 	}
 	skillReg := skills.NewRegistry()
 	skillReg.LoadDefaults(cwd)
+	// 插件技能 (run --plugin): 在 Skill 工具注册判定与清单渲染 (下方两处) 之前进
+	// 注册表, source="plugin" (rank 150 —— 见 skills.SourceRank: 输给项目, 赢过用户级)。
+	if cliPlugins != nil {
+		loadPluginSkillDirs(skillReg, cliPlugins.bundles)
+	}
 	if skillReg.Count() > 0 {
 		// 0 = 不设软上限, 由描述字符预算约束; 所有技能名称始终可见, 保证 Skill 工具可被正确调用。
 		promptMgr.SkillListing = skillReg.FormatShortListingForDir(0, cwd) // paths 命中的技能才进清单 (第七章缺口修复)
@@ -3459,6 +4042,25 @@ func buildEngine() (*engine.QueryEngine, error) {
 		planDir = filepath.Join(cwd, ".claude-go", "plans")
 	}
 
+	// 文件级检查点: Write/StrReplace 每次改动前留一份修订版本, 供回退。
+	// stateDir 显式取自配置 (与 planDir 同一口径), 不再让工具侧二次推断 ——
+	// 推断规则一旦和这里分叉, 快照会落到另一个目录, 回退时找不到。
+	fileHistoryStateDir := ""
+	if jsonCfg != nil {
+		fileHistoryStateDir = jsonCfg.StateDir
+	}
+	builtin.SetFileHistory(builtin.NewFileHistory(fileHistoryStateDir, cwd))
+
+	// H3-2 隔离运行的中间态 (RunIsolated 的落盘与断点恢复)。与上面 file-history
+	// 同根: 两者都是"这个工作区上发生过什么"的旁路账本, 分到两个根目录只会让清理
+	// 与备份漏掉一个。空 StateDir 时按同一套 ResolveDefault 解析 ——
+	// NewFileHistory 内部也是这么退化的, 这里显式算一次是为了让两个目录真的落在
+	// 同一处, 而不是各自推各自的。
+	//
+	// 真正的装配在引擎构造之后 (SetRunStateDir 是 *QueryEngine 的方法)。取值先算
+	// 在这里, 是因为 fileHistoryStateDir 只在这个作用域里有。
+	runStateDir := basedir.ResolveDefault(fileHistoryStateDir, cwd)
+
 	// Plan 模型客户端: 规划期独立模型 (类似 advisor 独立客户端, Tag=plan)。
 	// 别名优先级: --plan-model flag > config ai.planModel; 空 = 关闭 (规划期沿用主模型)。
 	var planClient *api.Client
@@ -3472,6 +4074,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 
 	cfg := &engine.Config{
 		Model:            effectiveModel,
+		OutboundModel:    apiClient.Model, // 身份(Model)与出站名分离, 见 engine.Config.OutboundModel
 		ExecutionModel:   effectiveExecutionModel,
 		MaxTokens:        effectiveMaxTokens,
 		MaxTurns:         effectiveMaxTurns,
@@ -3480,7 +4083,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 		PermissionMode:   permMode,
 		IsNonInteractive: flagPrint,
 		Debug:            flagDebug,
-		AllowedTools:     parseAllowedTools(flagAllowedTools),
+		AllowedTools:     effectiveAllowedTools(flagAllowedTools, jsonCfg),
 		SessionID:        "_global", // EnterPlanMode/ExitPlanMode 写全局会话 plan flag
 		// 单一 plan 状态源: AutoModeHook 自动开启 / 模型工具共用同一 flag。
 		DynamicPlanCheck: builtin.NewPlanModeChecker("_global"),
@@ -3491,6 +4094,13 @@ func buildEngine() (*engine.QueryEngine, error) {
 		PlanFileDir: planDir,
 		// PlanClient 规划期独立模型客户端 (Tag=plan); nil = 规划期沿用主模型。
 		PlanClient: planClient,
+	}
+	// 记忆注入形态 (配置项 engine.memoryIndexMode)。nil = 未配置, 由
+	// QueryEngine.resolvedMemoryIndexMode 回落到 CLAUDE_GO_MEMORY_INDEX_MODE。
+	// headless 进程是一次性的: 改配置要下次启动才生效 —— 这正是配置项存在的
+	// 意义 (env 要改容器清单并 rollout, 配置改完下次拉起即带上)。
+	if jsonCfg != nil && jsonCfg.Engine != nil && jsonCfg.Engine.MemoryIndexMode != nil {
+		cfg.MemoryIndexMode = jsonCfg.Engine.MemoryIndexMode
 	}
 	// 方案三 (手册 13.3): 弱模型 harness 增强——本地小模型 (Ollama 接入) 的
 	// 低级失败 (schema 违背/选错工具/上下文腐烂/不规划) 用冻结权重的确定性机制消除。
@@ -3540,10 +4150,25 @@ func buildEngine() (*engine.QueryEngine, error) {
 		promptMgr:   promptMgr,
 		mcpConns:    mcpConns,
 		skillReg:    skillReg,
+		hookConfigs: hookConfigs,
 	}
 
 	reg := tool.NewRegistry()
-	builtin.RegisterBaseTools(reg, nil)
+	todoTool := builtin.RegisterBaseTools(reg, nil)
+	// H1-3: 把待办清单接到压缩器上。压缩会把摘要之前的历史整个折掉 —— 包括模型
+	// 写过的 TodoWrite 调用 —— 于是"还剩什么没做完"在压缩后对模型不可见。
+	// 传的是 Snapshot (有序) 而不是 GetTodos (map 顺序随机): 这份清单每轮重发,
+	// 顺序一抖前缀缓存就从插入点起全废。
+	if todoTool != nil {
+		cfg.TaskRoster = func() []internal_hook.TaskRosterItem {
+			snaps := todoTool.Snapshot()
+			out := make([]internal_hook.TaskRosterItem, 0, len(snaps))
+			for _, s := range snaps {
+				out = append(out, internal_hook.TaskRosterItem{ID: s.ID, Content: s.Content, Status: s.Status})
+			}
+			return out
+		}
+	}
 	// H6 多档冒烟的真实档位构造器 (design/03 §4.5)。RegisterBaseTools 上一行注册了
 	// evo_* 八件套, 但 SetEvoTierFactory 此前**只在飞书 bot 装配** —— CLI 形态下
 	// evo_smoke 只有一个确定性"装配档", 而装配档不是模型档位, MinTiers>=2 必然拒绝:
@@ -3596,17 +4221,24 @@ func buildEngine() (*engine.QueryEngine, error) {
 		// (仿 agentTool.SetTraceStore 先例)。CLI 路径无团队语义 (Team/Role 空),
 		// 个性化不表达, 但留痕 Span 与 α>0 手动实验 (CLAUDE_GO_POOL_ALPHA) 均可用。
 		pp := builtin.NewPoolPolicy("", nil)
-		pool := builtin.RegisterPoolTools(reg, skillReg, cfg.DisabledTools, cfg.AllowedTools, pp)
+		// 资产索引用**进程级**的那一份 (loadAssetCatalog 装入) —— 与 BindAgentAsset
+		// 的解析路径同源。已装则 hook 资产一并进池 (21.8.12 P3); 未装 (nil) 时
+		// 池里不收 hook, 与改造前逐字节一致。
+		pool := builtin.RegisterPoolTools(reg, skillReg, agent.AgentCatalog(), cfg.DisabledTools, cfg.AllowedTools, pp)
 		// 13.7-P2 L1 配给: 描述位按 bandit 后验配给 (CLI 无团队语义, 空键后验)。
 		// SkillListing 是启动快照, 冷启动后验要等下方 SetStateDir 回灌完才可见 ——
 		// 那里再重渲染一次 (系统提示词逐轮重建, 读的是同一字符串)。
 		skillReg.SetRanker(pp.RankScore)
-		log.Printf("[toolpool] 统一池已启用: 池内 %d 项下沉 (evo_*/Media/CodeIntel), 广告面=基础+包装三件+已加载",
+		log.Printf("[toolpool] 统一池已启用: 池内 %d 项下沉 (evo_*/Media/CodeIntel/hook), 广告面=基础+包装三件+已加载",
 			len(pool.MemberNames()))
 		cliPoolPolicy = pp // 存活到 TraceStore 创建后补注入
 	}
 
 	eng := engine.NewQueryEngine(cfg, apiClient, reg, hookRunner, permChecker, compactor, promptMgr)
+
+	// H3-2 中间态通电。团队 stage 的引擎在 cliAgentRunner.Execute 里**复用这一个**
+	// eng (见 agentFactory), 所以这里装配一次就覆盖了整条 CLI 团队路径。
+	eng.SetRunStateDir(runStateDir)
 
 	// Path B 子代理分解引导: 配置了执行模型时, 提示规划方把工具密集/可并行子任务
 	// 拆给 delegate_task 在快速执行模型上跑, 报告由主模型综合。TaskInstruction 由
@@ -3641,6 +4273,12 @@ func buildEngine() (*engine.QueryEngine, error) {
 		log.Printf("[memory] 向量化混合检索已启用 (embedder=%s)", os.Getenv("CLAUDE_GO_MEMORY_EMBEDDER"))
 	}
 	eng.MemoryStore = tieredStore
+
+	// 按需取回两件套 (memory_search / memory_read)。注册在这里而不是 RegisterBaseTools
+	// 那一段: 那时 tieredStore 还没建出来 (要先解析 stateDir 才知道记忆目录), 拿不到
+	// 句柄就只能注册两个永远报"不可用"的空工具。工具必须指向**活的** store ——
+	// 记忆在运行期一直在增长, 构造时快照一份绕不开这个顺序问题。
+	builtin.RegisterMemoryTools(reg, tieredStore)
 
 	// L2: FactStore (结构化记忆)
 	factStore := memory.NewFactStore(memDir)
@@ -3715,6 +4353,101 @@ func buildEngine() (*engine.QueryEngine, error) {
 	// pkg/engine/hook_registration_order_test.go。
 	eng.RefreshHooks()
 
+	// 前沿优化组件的装配 —— **必须在 RefreshHooks 之后**。
+	//
+	// 这是修掉 "CLI 路径六个组件为 nil" 的那一半。改造前 EnableFrontierOptimizations
+	// 只在飞书路径 (pkg/feishu/session.go) 被调用, 于是下游平台走的 CLI headless 下:
+	// error_classifier / json_repair / loop_detector / prompt_cache / budget_degrade
+	// 的组件字段全是 nil, 对应的内置 hook **从未注册**, 而 `--output-format json` 的
+	// 响应与退出码一切正常 —— 看板上"配置已下发", 实际装配里那一半是空的。
+	//
+	// 范围刻意与飞书**主会话**路径 (session.go:923) 逐字对齐: 只调
+	// EnableFrontierOptimizations, 不额外开 EnableStopSignal —— 后者是实验性的
+	// CaRT 停止信号, 连飞书侧也只有团队 agent 路径显式打开 (session.go:1550)。
+	// 借这次修复顺手把它也开了, 是搭便车的行为变更, 不是接线修复。
+	//
+	// 顺序要紧: applyFeatureFlags 会懒初始化组件, 而注册这些组件的 hook 认的是**构造
+	// 时**的字段状态。先 RefreshHooks 再开开关的话, 那批 hook 也已经错过了这一趟 ——
+	// 所以下面还要再 RefreshHooks 一次 (幂等, 重建 HookChain)。
+	//
+	// 开关读 config 的同名字段 (EngineSection.EnableFrontierOptimizations), 缺省 true
+	// —— 与飞书路径的默认值一致。默认开是因为这几个组件都是**护栏性质**的: 错误分类、
+	// JSON 修复、循环检测、前缀缓存、预算降级。关掉它们不会让 Agent 更聪明, 只会让它
+	// 更不受约束。要省成本应当调预算, 不该拆护栏。
+	if jsonCfg == nil || jsonCfg.Engine == nil || jsonCfg.Engine.EnableFrontierOptimizations == nil ||
+		*jsonCfg.Engine.EnableFrontierOptimizations {
+		// CaRT 停止信号不在一键包里 (实验性), 此前只有飞书团队路径开、CLI 永不开。
+		// 现在由配置显式声明: 平台想让岗位带上它就置 true, 缺省仍按 CLI 原行为 (不开)
+		// —— 加这个开关不改变任何现网默认值, 只是把"哪条路径开"从代码里的分支
+		// 变成配置里的一句声明 (方案 20.6.5 项 2: 修掉两条路径的装配不对称)。
+		if jsonCfg != nil && jsonCfg.Engine != nil && jsonCfg.Engine.EnableStopSignal != nil {
+			eng.Config.EnableStopSignal = *jsonCfg.Engine.EnableStopSignal
+		}
+		// 必须在 EnableFrontierOptimizations 之前设好: 该函数内部的 applyFeatureFlags
+		// 按构造时的字段状态懒初始化组件, 事后再改开关组件不会被补建。
+		eng.EnableFrontierOptimizations()
+		eng.RefreshHooks()
+		log.Printf("[assembly] 前沿优化组件已装配 (CLI 路径, stop_signal=%v); 实际内置 hook: %d 个相位有注册",
+			eng.Config.EnableStopSignal, len(eng.InternalHookPhases()))
+	} else {
+		log.Printf("[assembly] 前沿优化组件被配置显式关闭 (enableFrontierOptimizations=false): " +
+			"错误分类 / JSON 修复 / 循环检测 / 前缀缓存 / 预算降级 均不启用")
+	}
+
+	// 装配自报 (方案 20.6.4 D0.7): 在**装配收尾点**采集, 且必须在上面那次
+	// EnableFrontierOptimizations + RefreshHooks **之后** —— 报告的职责是照出
+	// "实际装了什么", 提前采会把刚补上的那六个组件报成缺席, 那是自报造假。
+	//
+	// 采集只读引擎字段, 不改任何开关 (见 assembly_report.go 的包注释)。
+	cliAssembly = engine.CollectAssemblyReport(eng, engine.AssemblyReportInput{
+		DeclarationVersion: declarationVersionOf(jsonCfg),
+		Config: &assembly.ConfigSource{
+			Path:   jsonConfigPath,
+			Origin: configOrigin,
+			Found:  jsonConfigPath != "",
+		},
+		StateDir: stateDir,
+	})
+	if cliAssembly != nil {
+		visible, registered := 0, 0
+		if cliAssembly.Tools != nil {
+			visible, registered = len(cliAssembly.Tools.Visible), cliAssembly.Tools.Registered
+		}
+		log.Printf("[assembly] 装配自报已采集: fingerprint=%s config=%s 工具可见 %d/%d 内置 hook %d 相位 外部 hook %d 条",
+			cliAssembly.Fingerprint(), configOrigin,
+			visible, registered,
+			len(cliAssembly.InternalHooks), len(cliAssembly.ExternalHooks))
+		for _, w := range cliAssembly.Warnings {
+			log.Printf("[assembly][warn] %s", w)
+		}
+
+		// 自报之后立刻对账 (方案 20.6.4 的顺序: 先自报, 再对账, 最后才是面板)。
+		// 对账只比"声明 vs 实际", 不产生新的观测 —— 所以它必须紧跟采集, 且拿的是
+		// 同一份刚采下来的报告, 而不是回头再采一次 (再采一次就可能与面板看到的不是
+		// 同一份, 那正是 20.6 要消灭的错位)。
+		//
+		// 声明侧只认平台的装配描述符 (20.6.3)。没有描述符就如实报"未对账" ——
+		// 而不是退回"用配置推断一份声明": 那样得到的是一份**恒等**的对账 (配置与
+		// 它自己比), 看起来全绿, 而真正要照的那条缝恰好被盖住了。
+		if decl := declarationFromProfile(jsonCfg); decl != nil {
+			cliAssemblyReconcile = assembly.NewReconcileResult(decl, cliAssembly)
+			if len(cliAssemblyReconcile.Diffs) > 0 {
+				log.Printf("[assembly] 对账 (描述符版本 %s): %s",
+					jsonCfg.AssemblyProfile.Version, cliAssemblyReconcile.Summary)
+				for _, diff := range cliAssemblyReconcile.Diffs {
+					log.Printf("[assembly][diff] %s %s/%s 声明=%q 实际=%q",
+						diff.Kind, diff.Facet, diff.Item, diff.Declared, diff.Actual)
+				}
+			} else {
+				log.Printf("[assembly] 对账 (描述符版本 %s): %s",
+					jsonCfg.AssemblyProfile.Version, cliAssemblyReconcile.Summary)
+			}
+		} else {
+			log.Printf("[assembly] 未对账: 本次配置没有 assemblyProfile (装配描述符); " +
+				"声明侧只能由平台签发, harness 不自行推断")
+		}
+	}
+
 	return eng, nil
 }
 
@@ -3780,12 +4513,713 @@ func printMessage(msg types.Message) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// --agent: 让"一个 agent"成为可运行的实体 (能力中心调试台的后端)
+// ---------------------------------------------------------------------------
+
+// agentRunSpec 是"以某个 agent 身份跑一次"所需的全部参数, 已从资产层/角色层解析完毕。
+//
+// 它是**只读读数** (解析结果), 不含任何运行时对象 —— 同一份 spec 可以被打印、
+// 落库、喂给 runner, 三条路看到的是同一个东西。把 eng/client 之类塞进来会让
+// "这台机器上会怎么跑"与"声明说要怎么跑"再次分成两个真相源。
+type agentRunSpec struct {
+	// Name 请求的名字 (原样保留, 即使只命中了一层)。
+	Name string
+	// Source 命中哪一层: "asset" | "role"。UI 要如实显示 —— 这两层的优先级、
+	// 可覆盖字段、失效方式都不同, 合并成一个"已命中"会让用户以为自己在改资产。
+	Source string
+	// SystemPrompt 该 agent 的人格正文 (含其专属 skills 内容)。
+	SystemPrompt string
+	// Model 声明的模型 (空 = 跟随外层/全局默认)。
+	Model string
+	// MaxTurns 声明的回合上限 (0 = 跟随外层长程档)。
+	MaxTurns int
+	// PermissionMode 声明的权限档 (空 = 不覆盖)。
+	PermissionMode string
+	// ToolProfile / HasToolProfile 声明的工具档位。
+	//
+	// 与 AssetBinding 一样必须**配对读**: 空档位与"没声明档位"是两回事。
+	ToolProfile    builtin.ToolProfile
+	HasToolProfile bool
+	// Tools / HasTools 显式白名单。
+	//
+	// ★ HasTools 这一位不能省。`tools: []` 是**显式空白名单** (fail-closed, 拒绝
+	// 一切工具), 它解析出来的切片与"根本没写 tools:"一样长都是 0。少了存在性这一位,
+	// 一份 fail-closed 声明会在下游静默退化成完全放行 —— 见
+	// AssetBinding.AssemblyDeclaration 里同一段论证。
+	Tools    []string
+	HasTools bool
+	// DisallowedTools / HasDisallowedTools 显式黑名单。
+	DisallowedTools    []string
+	HasDisallowedTools bool
+	// Skills 声明解析出的技能名 (资产层已与技能池对过账)。
+	Skills []string
+	// Hooks 声明解析出的外部 hook。
+	Hooks []types.HookConfig
+	// Plugins 声明依赖的插件包名 (frontmatter `plugins:`), 由 runAsAgent 在解析后
+	// 展开并与 --plugin 旗标去重合并 (pkg/pluginrun)。
+	Plugins []string
+}
+
+// resolveAgentRunSpec 按名字解析出运行规格。
+//
+// 查表顺序 (高 → 低):
+//
+//	1. agent 资产 (asset.Meta, 经 agentbind.BindAgentAsset) —— 它是"这个 agent"最强的
+//	   身份声明: 有正文、有档位、有权限档, 且可被下游按目录覆盖。
+//	2. 角色注册表 (pkg/agent.RoleRegistry) —— 93 个内置人格, 只有正文与技能。
+//
+// 两层都没命中就**报错**。绝不静默回落成"普通 run":
+// 回落会让一个拼错的 agent 名与一个正确的 agent 名从外面**完全不可区分** ——
+// 两种情况都是"跑起来了, 输出了一段文本", 而唯一能区分它们的证据被那条回落吃掉了。
+// 与 21.8.12 里"档位写错静默掰成 chat"是同一类缺陷, 不在这里重犯。
+func resolveAgentRunSpec(name string, roles *agent.RoleRegistry, skillReg *skills.Registry) (*agentRunSpec, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("--agent 的名字为空")
+	}
+
+	spec := &agentRunSpec{Name: name}
+
+	// 1) 资产层。
+	if b := cliBindAgentAsset(name, skillReg); b != nil && b.Asset != nil {
+		if !b.Active {
+			// 影子/归档资产一律不装配 —— 与 P5 的查表口径一致 (清单里没有它,
+			// 运行时也不该能被激活; 两句话必须是同一句)。
+			return nil, fmt.Errorf("agent 资产 %q 不是 active 状态 (shadow/archived), 不能作为运行身份", name)
+		}
+		spec.Source = "asset"
+		spec.SystemPrompt = b.Prompt
+		spec.Model = b.Model
+		spec.MaxTurns = b.MaxTurns
+		if b.HasPermissionMode {
+			spec.PermissionMode = string(b.PermissionMode)
+		}
+		spec.ToolProfile = b.ToolProfile
+		spec.HasToolProfile = b.HasToolProfile
+		spec.Tools = append([]string(nil), b.Tools...)
+		spec.HasTools = b.HasTools
+		spec.DisallowedTools = append([]string(nil), b.DisallowedTools...)
+		spec.HasDisallowedTools = b.HasDisallowedTools
+		spec.Skills = append([]string(nil), b.Skills...)
+		spec.Hooks = b.Hooks
+		// 插件依赖原样带上 —— 展开发生在 runAsAgent (那时引擎与目录都已就绪),
+		// 这里只负责"声明了哪些名字"。
+		spec.Plugins = append([]string(nil), b.Asset.MetaList("plugins")...)
+		return spec, nil
+	}
+
+	// 2) 角色注册表。
+	if roles != nil {
+		if rd := roles.Get(name); rd != nil {
+			spec.Source = "role"
+			// MergedPrompt 的 objective/prevResult 传空: 这里的 prompt 是**人格底座**,
+			// 任务正文由调用方作为 user 消息传 (与 executeStage 把 objective 作为
+			// 第三参传进来同构)。在解析层就把任务拼进系统提示词, 会让同一份 spec
+			// 与某一次具体的运行绑死, 而这正是"运行时配置"要解耦的东西。
+			spec.SystemPrompt = roles.MergedPrompt(rd.Name, "", "")
+			spec.Skills = append([]string(nil), rd.BuiltinSkills...)
+			return spec, nil
+		}
+	}
+
+	// 两层都空: 把"查过哪两层"写进错误里 —— 只报"没找到"会让人以为只有一层可查。
+	hint := ""
+	if roles != nil {
+		if names := roles.Names(); len(names) > 0 {
+			hint = fmt.Sprintf(" (角色注册表里有 %d 个角色可用, 例: %s)", len(names), strings.Join(firstN(names, 3), ", "))
+		}
+	}
+	return nil, fmt.Errorf("找不到 agent %q: 既不是 agent 资产, 也不在角色注册表里%s", name, hint)
+}
+
+// firstN 返回切片前 n 项 (不足则全给)。仅用于把候选写进错误信息。
+func firstN(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// agentTurnCap 摘出"这次跑的回合上限声明"。
+//
+// ★ 显式旗标 --max-turns 优先于 agent 自身的声明。这条优先级是必须的, 不是口味:
+//   实测在 --agent 路径上, --max-turns 2 / 5 / 不传 三种跑法发出的请求数**完全相同**
+//   (都是 151 = 150 轮兜底 + 1 次收尾), 也就是说缺了这一步时, 旗标在这条路径上
+//   是个只显示不生效的字段 —— 而调试台上它恰恰是用户最主要的调参手段。
+//   与 run 路径的 effectiveMaxTurns 同一条"flag 覆盖配置"纪律。
+//
+//   思考型角色的 1 轮短路仍在最前面 (由 cliStageMaxTurns 保证): 那条短路同时关掉
+//   工具循环, 绕开它会让 architect 这类角色拿到一个开着工具的多轮循环。
+func agentTurnCap(spec *agentRunSpec, longHorizonTurns int) int {
+	if flagMaxTurns > 0 {
+		return flagMaxTurns
+	}
+	return spec.MaxTurns
+}
+
+// buildAgentRunner 把一份解析好的 agent 规格装成一个可执行的 runner。
+//
+// 直接构造包级的 cliAgentRunner, **不绕 agentFactory 闭包** —— 那个闭包被限在
+// runCmd 的 `/` 前缀分支内部 (它依赖 commands.Registry / swarmintel / 持久化任务库
+// 那一整套斜杠编排设施), 而 `--agent` 恰恰是"不要编排、只要一个 agent"。把
+// agentFactory 提到分支外面会让一次普通 run 也去构造整套编排设施。
+//
+// 复用 cliAgentRunner 而不是新写一个 runner, 是为了让两条路径共用同一段执行语义:
+// 回合上限的判定链 (cliStageMaxTurns)、思考型角色的关工具规则、阶段技能的并入方式、
+// 中途注入队列 —— 各写一份的结果是"同一个 agent 在两条路径上跑出不同轮数/不同工具面",
+// 而那种差异从任何单侧看都是不可见的。
+func buildAgentRunner(eng *engine.QueryEngine, spec *agentRunSpec, mcfg modelconfig.ResolvedConfig, longHorizonTurns int) *cliAgentRunner {
+	r := &cliAgentRunner{
+		eng:          eng,
+		role:         spec.Name,
+		systemPrompt: spec.SystemPrompt,
+		modelCfg:     mcfg,
+		// stage 用 agent 名: 它进 trace span 的 Stage 字段与日志前缀, 是"这次跑的是谁"
+		// 在产物上唯一的落点。留空会让中间态退化成按 Role+Cwd 分账 (见 withStage)。
+		stage:               spec.Name,
+		longHorizonMaxTurns: longHorizonTurns,
+	}
+	if cap := agentTurnCap(spec, longHorizonTurns); cap > 0 {
+		// 回合上限接进**既有**判定链: cliStageMaxTurns(role, modelTurns, longTurns)
+		// 里 modelTurns 的语义就是"这次跑的回合上限", 且它是最优先的一档
+		// (思考型角色的 1 轮短路仍在最前面)。不在这里另加一条分支 —— 另加就会与它
+		// 分叉成"同一个 agent 在两条路径上跑不同轮数"。
+		//
+		// 取值走 agentTurnCap (旗标 > agent 声明), 与 runAsAgent 印日志时用的是
+		// 同一个函数: 两处各写一遍的话, 日志会印一个数、实际跑另一个数。
+		r.modelCfg.MaxTurns = cap
+	}
+	// 资产声明的技能交给既有渲染路径 (stageDeclSkillListing → FormatShortListingForNames)。
+	// 只对资产层设: 角色层的 MergedPrompt **已经把** Skills/BuiltinSkills 的正文拼进
+	// 人格里了 (见 RoleRegistry.MergedPrompt), 再设一遍等于同一份技能在提示词里出现两次。
+	if spec.Source == "asset" {
+		r.stageDecl.Skills = spec.Skills
+	}
+	// 资产 hook 已是解析结果 (types.HookConfig), 不能塞进 stageDecl.Hooks —— 那个字段
+	// 的契约是**声明原文** (<event>:<type>:<target>[:<if>]), 交给 hooksFromDecl 再解析
+	// 一次会把一个合法的 HookConfig 当成拼错的声明丢掉。故单开一个字段原样带上。
+	r.declHooks = spec.Hooks
+	return r
+}
+
+// engineSkillRegistry 从引擎身上取当前真正在服务这次调用的技能注册表。
+//
+// 路径与 cliAgentRunner.stageDeclSkillListing **完全一致** (从 Skill 工具自己身上拿,
+// 而不是包级变量): 引擎里那个 SkillTool 是装配时按本次运行的工具面注册的, 只有它
+// 知道"哪一份技能库在服务这次调用"。用另一份去解析资产声明的技能名, 会让
+// "资产里 skills: 写了但没生效"与"写了、生效了"从外面分不出来。
+//
+// 取不到时返回 nil —— 调制解调器会把它当成"这条路径上没有技能池可查"并如实留痕
+// (AssetBinding.bindSkills 的 SkillPool==nil 分支), 不是静默当作"没有技能"。
+func engineSkillRegistry(eng *engine.QueryEngine) *skills.Registry {
+	if eng == nil || eng.Tools == nil {
+		return nil
+	}
+	raw, ok := eng.Tools.Get("Skill")
+	if !ok {
+		return nil
+	}
+	st, ok := raw.(*skills.SkillTool)
+	if !ok || st.Registry() == nil {
+		return nil
+	}
+	return st.Registry()
+}
+
+// modelCfgForAgentRun 解析本次 agent 运行要用的模型配置。
+//
+// 返回零值表示"跟随引擎默认客户端" (cliAgentRunner.Execute: modelCfg.ProviderName
+// 为空时不克隆, 直接用 eng.APIClient) —— agent 没声明模型时的正确行为是跟随外层,
+// 而不是在这里替它挑一个。
+func modelCfgForAgentRun(spec *agentRunSpec) (modelconfig.ResolvedConfig, error) {
+	name := strings.TrimSpace(spec.Model)
+	if name == "" {
+		return modelconfig.ResolvedConfig{}, nil
+	}
+	jsonCfg, _, err := loadRuntimeJSONConfig()
+	if err != nil {
+		return modelconfig.ResolvedConfig{}, fmt.Errorf("agent %q 声明了模型 %q, 但读配置失败: %w", spec.Name, name, err)
+	}
+	mcfg, ok, err := resolveRuntimeModelConfig(jsonCfg, name)
+	if err != nil {
+		return modelconfig.ResolvedConfig{}, fmt.Errorf("agent %q 声明的模型 %q 解析失败: %w", spec.Name, name, err)
+	}
+	if !ok {
+		// 解析不出来时**报错**而不是回落: 一个写错的模型名与一个正确的模型名,
+		// 在"跑起来了, 输出了一段文本"这个读数上完全同形 —— 回落会把唯一的证据吃掉。
+		return modelconfig.ResolvedConfig{}, fmt.Errorf("agent %q 声明的模型 %q 在 providers 配置里解析不出结果", spec.Name, name)
+	}
+	return mcfg, nil
+}
+
+// runAsAgent 是 `--agent` 的整条执行路径: 解析 → 应用工具面 → 跑一次 → 出结果。
+//
+// 独立成函数而不是内联在 runCmd 的 RunE 里, 是因为它要**自己**建会话存储与 trace
+// 上下文: runCmd 里那一段 (session.NewSessionStore + trace.With(RunID)) 排在斜杠
+// 分支**之后**, 而 --agent 在它之前就 return 了。不自己建的话, 本次运行的 span
+// 会因为没有 RunID 落进 trace-orphan 桶 (tracestore.bucketName("")), 而轨迹页只列
+// trace-run-* —— 那正是这个调试台首先要解决的"看不见"。
+func runAsAgent(cmd *cobra.Command, eng *engine.QueryEngine, userPrompt string, longHorizonTurns int) error {
+	cwd := eng.Config.Cwd
+	// stateDir 的算法与斜杠分支**逐字一致** (jsonCfg.StateDir 优先, 否则按 cwd 推)。
+	//
+	// 传空串会少掉一个资产根 (state) —— 而部署里 agent 资产正是放在 stateDir 下的
+	// (/mnt/data/claude-go/agents)。少这一个根的表现是"资产明明在磁盘上, 却查不到",
+	// 于是所有 --agent 都会静默退到角色层, 从外面完全看不出资产层从来没被查过。
+	stateDirInput := ""
+	if jsonCfg, _, cfgErr := loadRuntimeJSONConfig(); cfgErr == nil && jsonCfg != nil {
+		stateDirInput = jsonCfg.StateDir
+	}
+	stateDir := basedir.ResolveDefault(stateDirInput, cwd)
+
+	// 资产目录: 必须在 resolveAgentRunSpec **之前**装载 —— 它读的是包里那份全局索引
+	// (agent.LookupAgentAsset), 没装载过时资产层恒为空, 于是所有资产名都会"查不到"
+	// 而静默退到角色层, 表现是"资产总是没命中"。runCmd 的另一处 (斜杠分支) 也调它。
+	log.Printf("[agent] 资产装载: %s", loadAssetCatalog(cwd, stateDir))
+	// 上面那行**重建**了进程级目录: buildEngine 展开 --plugin 时合并进去的插件
+	// agents 随旧目录一起被换掉, 这里把同一批 agents 重新合并进新目录的副本
+	// (仍是复制合并, 共享目录不被改污)。技能与 hook 已装在同一个引擎上, 不重复装。
+	if cliPlugins != nil {
+		mergePluginAgents(agent.AgentCatalog(), cliPlugins.bundles)
+	}
+
+	rr := agent.NewRoleRegistryFor(cwd, stateDir)
+	spec, err := resolveAgentRunSpec(flagAgent, rr, engineSkillRegistry(eng))
+	if err != nil {
+		return err
+	}
+	// 显式 --system-prompt 覆盖 agent 自身的人格 —— 与 run 路径同一条纪律
+	// (那里是 flagSystemPrompt → promptMgr.CustomPrompt, 也是整段替换)。
+	//
+	// ★ 实测: 不加这一步时, `--agent researcher --system-prompt <标记>` 发出的请求里
+	//   system 字段**只有 researcher 的人格**, 标记一个字都没有 —— 而同一个旗标不带
+	//   --agent 时是生效的 (对照实测 system 长度 19 = 只有标记)。也就是说这是个
+	//   只显示不生效的字段。调试台上"覆盖 system prompt"是最主要的试验手段之一:
+	//   用户改一版提示词、跑一次、看产出变没变 —— 而这条路径会让他每次都看到**同一个**
+	//   结果, 从而得出"提示词对行为没影响"这个完全错误的结论。
+	if strings.TrimSpace(flagSystemPrompt) != "" {
+		spec.SystemPrompt = flagSystemPrompt
+	}
+	// agent 资产 frontmatter `plugins:` 声明的插件: 与 --plugin 旗标去重后展开。
+	// 引擎已在 buildEngine 建好, 三条成员各走自己的接缝: agents 仍合并进目录副本,
+	// skills 走引擎里真正服役的那份注册表 (engineSkillRegistry —— 包级变量可能是
+	// 另一份), hooks 走 Runner 的可装卸组。找不到的插件名直接报错退出, 不静默跳过。
+	if extra := pluginNamesDifference(spec.Plugins, flagPlugins); len(extra) > 0 {
+		bundles, err := expandRunPlugins(agent.AgentCatalog(), extra)
+		if err != nil {
+			return err
+		}
+		mergePluginAgents(agent.AgentCatalog(), bundles)
+		loadPluginSkillDirs(engineSkillRegistry(eng), bundles)
+		installPluginHookGroups(eng.HookRunner, bundles)
+	}
+	if err := applyAgentToolFace(eng, spec); err != nil {
+		return err
+	}
+	mcfg, err := modelCfgForAgentRun(spec)
+	if err != nil {
+		return err
+	}
+
+	// 会话存储 + trace 上下文 (与 runCmd 的默认路径同一套语义, 见那里的长注释)。
+	ctx := trace.With(context.Background(), runTraceIDs)
+	sessionID := ""
+	runID := ""
+	if store, storeErr := session.NewSessionStore(cwd); storeErr == nil {
+		eng.SessionStore = store
+		defer store.Close()
+		sessionID = store.SessionID()
+		runID = fmt.Sprintf("run-%s-%d", sessionID, runTraceSeq.Add(1))
+		ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: sessionID})
+	}
+	// store 拿不到时不发号 (与默认路径同一条守卫): 硬编一个 RunID 会造出"看着有归属、
+	// 其实归属错了"的假记录。
+
+	// run span 的挂点。与默认路径同为 defer —— 位置就是全部要害: 无论从哪条 return
+	// 退出都会走一遍, 而那些提前 return 恰恰是最该被看见的失败运行。
+	start := time.Now()
+	var errKind string
+	defer func() {
+		name := strings.TrimSpace(flagRunLabel)
+		if name == "" {
+			name = spec.Name
+		}
+		status := tracestore.RunStatusOK
+		if errKind != "" {
+			status = tracestore.RunStatusFailed
+		}
+		recordRunSpan(eng.TraceStore, runID, name, eng.Config.Model, status, errKind, userPrompt, start)
+	}()
+
+	// 轨迹页要按 agent 名检索: 调用方没给 --run-label 时自动填, 与 coder 的
+	// "coder:<任务名>" 同一套机制。显式给了就不覆盖 —— 调用方的标注更具体。
+	if strings.TrimSpace(flagRunLabel) == "" {
+		flagRunLabel = "agent:" + spec.Name
+	}
+
+	// 印的是**实际生效**的回合上限, 不是 agent 的声明值。
+	//
+	// ★ 这里曾经印 spec.MaxTurns, 那是个会说谎的读数: 一个 agent 没声明 maxTurns
+	//   时它印 0, 而实际跑的是 150 轮 (longHorizonMaxTurnsOr 的兜底)。声明了 maxTurns
+	//   而角色恰好是思考型时, 它印声明的值, 而实际是 1。调试台上"实际生效值"面板
+	//   直接吃这一行, 印错了就是让用户拿着一个从没生效过的数字去调优。
+	//   取值走与 Execute 同一个 cliStageMaxTurns —— 两处各算一遍迟早分叉。
+	effectiveTurns := cliStageMaxTurns(spec.Name, agentTurnCap(spec, longHorizonTurns), longHorizonMaxTurnsOr(longHorizonTurns))
+
+	log.Printf("[agent] 以 %q 运行 (来源: %s, 模型: %q, 回合上限: %d, 工具档位: %s)",
+		spec.Name, spec.Source, spec.Model, effectiveTurns, spec.ToolProfile)
+	// 印的是**实际发给模型的**工具数, 不是注册表里的工具总数。
+	//
+	// ★ 这一行与上面那行是同一类错误的两半, 一起修的: 原先无条件印
+	//   len(eng.VisibleTools()) —— 而 Execute 里 disableTools(= 思考型角色) 会把
+	//   apiTools 直接置空 (pkg/engine/runner.go:241), **一个工具描述都不发给模型**。
+	//   实测: researcher 发出的请求体里 tools 字段**整个不存在**, 而这一行印 433。
+	//   调试台的"实际生效值"面板直接吃这个数, 于是对一个根本没拿到工具的 agent
+	//   显示"可见工具 433 个" —— 用户会据此以为工具是通的, 转而去查别的方向。
+	//
+	//   判据必须是驱动实际行为的那个谓词 IsThinkingRole, 与 Execute 里
+	//   disableTools 用的是同一个函数 —— 这里再列一遍"哪些算思考型"迟早分叉。
+	//   工具面的**档位**(spec.ToolProfile / --allowed-tools 白名单)是另一层,
+	//   它改的是 VisibleTools() 的内容, 与这里的置空是叠加关系。
+	toolsDisabled := modelconfig.IsThinkingRole(spec.Name)
+	if toolsDisabled {
+		log.Printf("[agent] 本次可见工具 0 个 (思考型角色 %q: 该角色关闭工具循环, 不向模型暴露任何工具)", spec.Name)
+	} else {
+		vis := eng.VisibleTools()
+		log.Printf("[agent] 本次可见工具 %d 个: %s", len(vis), strings.Join(firstN(vis, 20), ", "))
+	}
+
+	runner := buildAgentRunner(eng, spec, mcfg, longHorizonTurns)
+	final, runErr := runner.Execute(ctx, userPrompt)
+	if runErr != nil {
+		errKind = "agent_run_error"
+		// 产物一并带回: RunIsolated 在出错时已经把收集到的文本给了, 丢掉它等于让
+		// 调试台只能看到"失败了"而看不到失败前跑到了哪一步。
+		if final != "" {
+			log.Printf("[agent] 失败前的部分产出 (%d 字节): 见 --output-format json 的 final 字段", len(final))
+		}
+	}
+
+	if flagOutputFormat == "json" {
+		// 用默认路径同一个信封 —— 调试台按 final/is_error/error_kind/session_id
+		// 四个字段解析, 两条路径的信封形状必须一致, 否则前端要写两套解析。
+		if eerr := emitRunEnvelope(final, sessionID, errKind, nil, nil); eerr != nil {
+			return eerr
+		}
+	} else if !flagFinalOnly {
+		fmt.Println(final)
+	}
+	if flagEmitSession && sessionID != "" {
+		fmt.Printf("\n__CLAUDE_GO_SESSION__=%s\n", sessionID)
+	}
+	// 出错时把错误原样返回: 退出码要非零。**但产物已经打出去了** —— 调试台需要
+	// 两样都拿到 (is_error 为真 + final 有内容), 只给其一都不足以定位。
+	if runErr != nil {
+		return runErr
+	}
+	return nil
+}
+
+// applyAgentToolFace 把 agent 声明的工具面/权限档写进引擎, 并重建 hook 链。
+//
+// ★ 前提: 只在"构造引擎 → 跑一次 → 进程退出"的用法下安全。它改的是 eng.Config
+// (进程级状态), 同一进程内第二次 run 会带着上一次的残留。v1 的 `--agent` 是单次
+// 运行即退出, 所以成立; **长驻进程 (serve / dashboard / feishu) 里不要复用这个函数** ——
+// 那样一个 agent 的工具面会漏到下一个请求上, 而漏的方向可能是放宽。
+//
+// RefreshHooks 是赋值语义 (registerInternalHooks 里 `e.HookChain = NewHookChain()`,
+// 不是追加), 所以重复调用安全。不改工具面时**也必须调它**: ToolGateHook 是在那里面
+// 按当前的 AllowedTools/DisabledTools 决定要不要注册的, 顺序反了就是"白名单写进去了
+// 但那条闸门没通电", 表现是 agent 的工具面看起来生效了、实际全放行。
+func applyAgentToolFace(eng *engine.QueryEngine, spec *agentRunSpec) error {
+	if eng == nil || eng.Config == nil {
+		return fmt.Errorf("引擎未就绪, 无法应用 agent %q 的工具面", spec.Name)
+	}
+
+	// 1) 档位 → 黑名单 (只削**内置**工具)。
+	//
+	// 用 DisabledTools 而不是 AllowedTools, 理由是这个档位的语义: profile 决定的是
+	// "注册哪些内置工具", 而引擎的注册表里除内置工具外还有 Skill / 池工具 / 记忆工具 /
+	// MCP —— 飞书那条路径也是先按档位注册、**再把这几类添上去**的。若改用白名单
+	// (AllowedTools = 该档注册的内置工具名), 一个 `tool-profile: coding` 的 agent
+	// 会连 Skill 工具一起丢掉, 与飞书路径同名的 agent 行为不一致。
+	//
+	// 求差而不是替换 DisabledTools: 配置里那份可能已经含弱模型掩码 (L4) 等既有禁用,
+	// 覆盖会把它们悄悄放开。
+	if spec.HasToolProfile {
+		allowedByProfile := map[string]bool{}
+		for _, n := range builtin.ToolNameCatalog(spec.ToolProfile) {
+			allowedByProfile[n] = true
+		}
+		// 问 admin 档要"全部内置工具"当分母 —— 它等于 RegisterBaseTools 注册的集合,
+		// 也就是本引擎写入 reg 的那一批 (见 buildEngine)。ToolNameCatalog 的注释
+		// 明确要求判"是不是真工具"问 admin 档。
+		for _, n := range builtin.ToolNameCatalog(builtin.ToolProfileAdmin) {
+			if allowedByProfile[n] {
+				continue
+			}
+			if eng.Config.DisabledTools == nil {
+				eng.Config.DisabledTools = map[string]bool{}
+			}
+			eng.Config.DisabledTools[n] = true
+		}
+	}
+
+	// 2) 显式白名单。
+	//
+	// ★ 与既有白名单**求交**, 不是替换。`--allowed-tools` 已经把引擎限死时, 替换会让
+	// 一次受限会话被一个 `--agent` 悄悄放宽 —— 而这是调试入口, 恰恰最可能被喂来路
+	// 不明的名字。求交是唯一fail-closed 的方向。
+	if spec.HasTools {
+		declared := make(map[string]bool, len(spec.Tools))
+		for _, t := range spec.Tools {
+			if t = strings.TrimSpace(t); t != "" {
+				declared[t] = true
+			}
+		}
+		// 注意 HasTools 为真但列表为空 = **显式空白名单** (拒绝一切)。上面那个循环
+		// 留下的空 map 正是这个语义, 不要因为它"看起来是空的"就跳过分派。
+		if eng.Config.AllowedTools != nil {
+			for name := range eng.Config.AllowedTools {
+				if !declared[name] {
+					delete(eng.Config.AllowedTools, name)
+				}
+			}
+		} else {
+			eng.Config.AllowedTools = declared
+		}
+	}
+
+	// 3) 显式黑名单。
+	if spec.HasDisallowedTools {
+		for _, t := range spec.DisallowedTools {
+			if t = strings.TrimSpace(t); t != "" {
+				if eng.Config.DisabledTools == nil {
+					eng.Config.DisabledTools = map[string]bool{}
+				}
+				eng.Config.DisabledTools[t] = true
+			}
+		}
+	}
+
+	// 4) 权限档。两处都要改: Config.PermissionMode 是引擎自己读的 (Plan Mode 判定
+	// 等), PermChecker.Mode 是工具执行路径读的。只改一处会让"引擎以为自己是什么档"
+	// 与"闸门按什么档放行"分叉, 而那正是权限类缺陷最典型的形态。
+	if spec.PermissionMode != "" {
+		mode := types.PermissionMode(spec.PermissionMode)
+		eng.Config.PermissionMode = mode
+		if eng.PermChecker != nil {
+			eng.PermChecker.Mode = mode
+		}
+	}
+
+	eng.RefreshHooks()
+	return nil
+}
+
 // cliAgentRunner 为 CLI run 模式提供的简单 AgentRunner。
 type cliAgentRunner struct {
 	eng          *engine.QueryEngine
 	role         string
 	systemPrompt string
-	modelCfg     modelconfig.ResolvedConfig // 为空则使用 eng.APIClient 默认
+	// stage 稳定阶段标识 (agent.RunMetadata.Stage), 供 H3-2 中间态按阶段分账。
+	stage    string
+	modelCfg modelconfig.ResolvedConfig // 为空则使用 eng.APIClient 默认
+	// longHorizonMaxTurns 长程档的回合上限 (H4-3), 来自 ai.longHorizonMaxTurns。
+	// 0 = 未配置, Execute 用编译期兜底 (与改造前硬编码的 150 同值)。
+	longHorizonMaxTurns int
+	// stageDecl 本阶段声明的 Hooks / Skills (21.8.12 P4/X1)。
+	//
+	// 装配期从创建 ctx 捕获 (见 agentFactory), 因为 Execute 的 ctx 是另一份。
+	// Model 不在这里 —— 它在 agent.runAgent 内部就被消费掉了 (那条路径覆写
+	// ModelConfigKey), 到这里时已经体现在 modelCfg 里。
+	stageDecl agent.StageDecl
+
+	// declHooks 装配期就已解析好的 hook 配置 (types.HookConfig), 来自 --agent 的资产声明。
+	//
+	// 单开一个字段而不是塞进 stageDecl.Hooks: 后者的契约是**声明原文**
+	// (<event>:<type>:<target>[:<if>]), 由 hooksFromDecl 在 Execute 里解析。把一份
+	// 已解析的 HookConfig 放进去, 会被当成一条拼错的声明整条丢掉 —— 而丢的表现是
+	// "资产声明的 hook 没跑", 不报任何错。
+	declHooks []types.HookConfig
+
+	// mu 保护 inject。中继 (agent 包的 startMidRunMailRelay) 在另一个 goroutine 上
+	// 读它, 而 Execute 在起/收时写它 —— 不锁就是数据竞态。
+	mu     sync.Mutex
+	inject *engine.InjectQueue // 仅在 Execute 进行中非 nil (21.8.12 P5)
+}
+
+// CanInjectMidRun / InjectMidRun 实现 agent.MidRunMailInjector (21.8.12 P5)。
+//
+// ★ 队列在这里**每次 Execute 新建一个**, 而不是复用 r.eng 上那个 (main.go 里
+// cliAgentRunner 持有的 eng 是全进程共享的一个):
+//
+//	agentPool 8 并发共用同一个 eng (见 agentFactory 的注释), 引擎级队列下
+//	"A 阶段的更正"会被"B 阶段"收走 —— 而两边都看不出异常: 收到的那个当真去做,
+//	没收到的那个以为没人给它发信。队列的身份必须是**这次运行**。
+func (r *cliAgentRunner) CanInjectMidRun() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inject != nil && r.inject.Active()
+}
+
+func (r *cliAgentRunner) InjectMidRun(text string) bool {
+	r.mu.Lock()
+	q := r.inject
+	r.mu.Unlock()
+	if q == nil {
+		return false
+	}
+	return q.Inject(midRunMessage(text))
+}
+
+// midRunMessage 把一段注入正文包成 user 消息 (与 pkg/feishu 的同名助手逐字同形)。
+//
+// 两处各写一份的代价落在 role 上: InjectQueue 按 role 拒, 而拒的表现只是"没送出去" ——
+// 一个 role 写错的副本会静默地永不投递, 且没有任何报错指向它。
+func midRunMessage(text string) types.Message {
+	return types.Message{
+		Type:      types.MessageTypeUser,
+		UUID:      internal_hook.GenerateUUID(),
+		CreatedAt: time.Now(),
+		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: text}},
+	}
+}
+
+// cliStageMaxTurns 决定 CLI 路径一个 stage 的回合上限 (H4-3)。
+//
+// 抽成纯函数是为了能被直接断言: 这段逻辑此前是三个互相覆盖的赋值
+// (先 150 → 再被模型级覆盖 → 再被思考型覆盖成 1), 顺序错一次就是一处静默偏差,
+// 而它的外部表现只有"某类 stage 多跑或少跑了几十轮"。
+//
+// 判据与 pkg/feishu 的 stageMaxTurns **同序**:
+//  1. 思考型 ⇒ 1 (它与"关工具"是同一个决定, 关工具之后多一轮都没有意义)
+//  2. 模型级 maxTurns ⇒ 原样 (kimi 系配的 40 是按那个模型的回合开销定的)
+//  3. 长程档
+//
+// longTurns 由调用方兜到 150 之后再传进来 (见 longHorizonMaxTurnsOr) ——
+// 本函数不关心"没配置时用什么", 只关心优先级。
+func cliStageMaxTurns(role string, modelTurns, longTurns int) int {
+	if modelconfig.IsThinkingRole(role) {
+		return 1
+	}
+	if modelTurns > 0 {
+		return modelTurns
+	}
+	return longTurns
+}
+
+// longHorizonMaxTurnsOr 长程档上限, 未配置 (=0) 时取编译期兜底。
+//
+// 兜底值是 150 —— 与 pkg/feishu 的 stageMaxTurns **不同**: 那里未配置时回落到
+// 基线 (不动), 这里回落到 150 (等于改造前 CLI 路径的硬编码值)。两处刻意不一致,
+// 因为两条路径的**改造前行为**本来就不一致: 团队侧是 40, CLI 侧是 150。
+// "未配置 = 改造前" 是这一整项的唯一纪律, 各自对各自的改造前负责。
+func longHorizonMaxTurnsOr(n int) int {
+	if n > 0 {
+		return n
+	}
+	return modelconfig.DefaultLongHorizonMaxTurns
+}
+
+// maxTokensOrDefault 取一个 >0 的 maxTokens, 否则回落默认。
+func maxTokensOrDefault(n, def int) int {
+	if n > 0 {
+		return n
+	}
+	return def
+}
+
+// hooksFromDecl 把阶段声明的 hook 原文解析成引擎可用的配置 (21.8.12 P4/X1)。
+//
+// 解析走 hooks.ParseHookDecls —— 与资产 hooks: 段**同一份实现**。在这里再写一遍
+// `<event>:<type>:<target>[:<if>]` 的切分, 就是同一套取值域有两个真相源, 而漂移的
+// 表现是"同一种写法在资产里读得出、在 stage 里读不出", 不报错。
+//
+// 解析问题逐条点名、其余照常生效: 一份声明里三条 hook 两条合法一条拼错时, 合法的
+// 两条该跑, 拼错的那条该被看见 —— 整份作废会让作者以为"格式整个没写对"。
+// effectiveHooks 汇总本次执行要并入引擎 Runner 的外部 hook。
+//
+// 两条来源**相加**而不是二选一: 资产声明的 hook (declHooks, 已解析) 与阶段声明的
+// hook (stageDecl.Hooks, 待解析)。只取一条的后果是"某一种写法在资产里读得出、
+// 在 stage 里读不出", 且不报错。
+func (r *cliAgentRunner) effectiveHooks() []types.HookConfig {
+	out := hooksFromDecl(r.stageDecl, r.stage)
+	if len(r.declHooks) == 0 {
+		return out
+	}
+	// append 到新切片: out 可能直接持有 hooksFromDecl 的返回值, 原地追加会让
+	// 两次 Execute 共用同一段底层数组 (本 runner 是可复用的)。
+	merged := make([]types.HookConfig, 0, len(out)+len(r.declHooks))
+	merged = append(merged, out...)
+	merged = append(merged, r.declHooks...)
+	return merged
+}
+
+func hooksFromDecl(decl agent.StageDecl, stage string) []types.HookConfig {
+	if len(decl.Hooks) == 0 {
+		return nil
+	}
+	cfgs, probs := hooks.ParseHookDecls(decl.Hooks)
+	for _, p := range probs {
+		log.Printf("[Hooks] 阶段 %q 声明的 hook 问题: %s", stage, p)
+	}
+	return cfgs
+}
+
+// stageDeclSkillListing 把阶段声明的技能名渲染成短清单 (21.8.12 P4/X1)。
+//
+// 取注册表的路径是**这一处最讲究的地方**: 从 Skill 工具自己身上拿
+// (skills.SkillTool.Registry), 而不是用包级的 deps.skillReg。
+//
+// 理由是"哪一份技能库真正在服务这次调用"只有工具知道: 嵌套子代理路径
+// (runNestedAgent) 会另造一个 nestedReg 并注册一个新 SkillTool, 那时包级变量指向
+// 的仍是**父**的那一份 —— 用包级变量渲染出来的清单与模型按名字 load 得出来的结果
+// 不是同一份注册表, 而两者的失配不报错, 只表现为"清单里有、load 说没有"。
+// 让工具自答则必然一致。
+//
+// 渲染不出清单的三条路各自点名: 没有 Skill 工具 (被白名单挡了 / 思考型关工具)、
+// 注册表为空、名字没注册。三者都表现为"声明了却什么都没发生", 只有日志能分开它们 ——
+// 与 pkg/feishu 的 stageSkillListing 同一口径。
+func (r *cliAgentRunner) stageDeclSkillListing() string {
+	if len(r.stageDecl.Skills) == 0 {
+		return ""
+	}
+	if r.eng == nil || r.eng.Tools == nil {
+		log.Printf("[Skills] 阶段 %q 声明了技能 %v, 但引擎没有工具注册表, 这部分声明不生效",
+			r.stage, r.stageDecl.Skills)
+		return ""
+	}
+	raw, ok := r.eng.Tools.Get("Skill")
+	if !ok {
+		// 思考型角色 (DisableTools) 与 --allowed-tools 白名单都会走到这里, 而两者的
+		// **都是**"这条路径上技能面整个不存在" —— 声明无效是必然的, 值得点名的是
+		// 作者在关工具的 stage 上声明了技能这个组合本身。
+		log.Printf("[Skills] 阶段 %q 声明了技能 %v, 但本次执行没有 Skill 工具 (思考型关工具 / 白名单挡下), 这部分声明不生效",
+			r.stage, r.stageDecl.Skills)
+		return ""
+	}
+	st, ok := raw.(*skills.SkillTool)
+	if !ok || st.Registry() == nil || st.Registry().Count() == 0 {
+		log.Printf("[Skills] 阶段 %q 声明了技能 %v, 但 Skill 工具背后的注册表为空, 这部分声明不生效",
+			r.stage, r.stageDecl.Skills)
+		return ""
+	}
+	reg := st.Registry()
+	var unknown []string
+	for _, n := range r.stageDecl.Skills {
+		if _, known := reg.GetAny(n); !known {
+			unknown = append(unknown, n)
+		}
+	}
+	if len(unknown) > 0 {
+		// "没注册" 与 "注册了但不可注入 (shadow/archived)" 在清单上同形, 所以这里
+		// 只报前者 —— 后者是运维已知的状态, 前者一定是打错了字 (与 pkg/feishu 同口径)。
+		log.Printf("[Skills] 阶段 %q 声明的技能未在注册表里, 这部分声明不生效: %s",
+			r.stage, strings.Join(unknown, ", "))
+	}
+	return reg.FormatShortListingForNames(r.stageDecl.Skills)
 }
 
 func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
@@ -3798,38 +5232,71 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 	// 操作型 (coder/tester/reviewer) 开放工具循环, 让它真的去读/写/编译代码.
 	client := r.eng.APIClient
 	if r.modelCfg.ProviderName != "" {
+		// 出站模型名走 OutboundModelName —— 与 feishu 侧一致,
+		// 见 modelconfig.ResolvedConfig.OutboundModelName。
 		client = client.ConfiguredCloneFull(
-			r.modelCfg.BaseURL, r.modelCfg.APIKey, r.modelCfg.ProviderName,
+			r.modelCfg.BaseURL, r.modelCfg.APIKey, r.modelCfg.OutboundModelName(),
 			r.modelCfg.FallbackModels, r.modelCfg.FallbackBaseURL, r.modelCfg.FallbackAPIKey,
 		)
 	}
 	role := strings.ToLower(strings.TrimSpace(r.role))
-	disableTools := false
-	// 做事型角色 (coder/tester/reviewer): 写 20+ 文件, 边读边改, 默认 30 turns 远远不够.
-	// 实测 Phase1+Phase2 全量实现 6 分多钟才跑了 30 turns, 还没接近完成. 提到 150 留足空间.
-	maxTurns := 150
-	maxTokens := 16384
-	if r.modelCfg.MaxTokens > 0 {
-		maxTokens = r.modelCfg.MaxTokens
-	}
-	switch role {
-	case "architect", "researcher", "planner",
-		"outline-architect", "evo-architect", "game-architect":
-		disableTools = true
-		maxTurns = 1
+
+	// 回合上限 (H4-3): 判定顺序与取值收在 cliStageMaxTurns 里, 见那里的注释。
+	//
+	// 改动前后各有一条要交代:
+	//   - **改前**: 这里无条件给 150, 之后再也没有读过 r.modelCfg.MaxTurns ——
+	//     模型配置里写的 maxTurns 在这条路径上**从来不起作用** (kimi 系配的 40
+	//     也被一起丢掉)。现在它原样优先。
+	//   - **改后**: 未配置 ai.longHorizonMaxTurns 时仍是 150
+	//     (longHorizonMaxTurnsOr 的兜底), 与改造前逐字相同。
+	maxTokens := maxTokensOrDefault(r.modelCfg.MaxTokens, 16384)
+	maxTurns := cliStageMaxTurns(role, r.modelCfg.MaxTurns, longHorizonMaxTurnsOr(r.longHorizonMaxTurns))
+	// 思考型角色 = 关工具 = 单轮。判据与名单走 modelconfig 的同一份定义 ——
+	// "思考型" 是一个集合成员判断, 而这个集合在团队路径上也要用 (见 pkg/feishu
+	// 的档位分类)。两处各列一遍名单迟早分叉成"同一个角色在两条路径上跑不同的轮数"。
+	disableTools := modelconfig.IsThinkingRole(role)
+	if disableTools {
 		// 思考型一次性吐完整设计稿; 优先使用模型配置里的 maxTokens
-		if r.modelCfg.MaxTokens > 0 {
-			maxTokens = r.modelCfg.MaxTokens
+		maxTokens = maxTokensOrDefault(r.modelCfg.MaxTokens, 65536)
+	}
+	// 阶段专属技能并入 system prompt (21.8.12 P4/X1)。**追加**在装配期那一段之后,
+	// 不替换 —— 见 stageDeclSkillListing 的论证。
+	stageSystem := r.stageDeclSkillListing()
+	systemPrompt := r.systemPrompt
+	if stageSystem != "" {
+		if strings.TrimSpace(systemPrompt) == "" {
+			systemPrompt = stageSystem
 		} else {
-			maxTokens = 65536
+			systemPrompt = systemPrompt + "\n" + stageSystem
 		}
 	}
+
+	// 运行中入站队列 (21.8.12 P5 / D6-3 缺口 2 级 2)。每次 Execute 一个 —— 见
+	// cliAgentRunner 上那两个方法关于"不能用引擎级队列"的论证 (8 并发共用一个 eng)。
+	inject := engine.NewInjectQueue()
+	r.mu.Lock()
+	r.inject = inject
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.inject = nil
+		r.mu.Unlock()
+	}()
+
 	out, err := r.eng.RunIsolated(ctx, userPrompt, engine.IsolatedRunOptions{
-		SystemPrompt: r.systemPrompt,
+		SystemPrompt: systemPrompt,
 		MaxTurns:     maxTurns,
 		MaxTokens:    maxTokens,
 		Client:       client,
 		DisableTools: disableTools,
+		Stage:        r.stage, // H3-2 中间态身份; 空 = 身份退化为 Role+Cwd
+		Inject:       inject,
+		// 阶段声明的 hook 交给引擎并入它既有的 Runner (见 IsolatedRunOptions.Hooks):
+		// 这里手上没有那份基线配置 (Runner 构造完就把入参丢了), 而且**替换**会让
+		// 平台侧的审计/门禁 hook 在这条执行路径上静默消失。解析与资产 hooks: 段
+		// 走同一份实现 —— 两处各写一份的话, `<event>:<type>:<target>[:<if>]` 的
+		// 切分规则会漂移成"同一种写法在资产里读得出、在 stage 里读不出"。
+		Hooks: r.effectiveHooks(),
 	})
 	if err != nil {
 		// 把目前为止收集到的文本一并带回, 方便上游写 checkpoint / debug.
@@ -3952,6 +5419,37 @@ func parseAllowedTools(csv string) map[string]bool {
 	return set
 }
 
+// effectiveAllowedTools 合并工具白名单的两个来源, 优先级 flag > config。
+//
+// 为什么需要 config 这一侧: 托管 Agent 的部署态由平台下发岗位的工具面, 而此前
+// 白名单只能拼命令行 —— 命令行参数**不可回读** (进程起来后没人知道当时传了什么)、
+// **不可版本化** (改一次没法 diff / 回滚)、**不可对账** (只有下发没有生效的回程)。
+// 平台 launcher 传的正是空 --allowed-tools 加一份 config, 所以这一侧不通就等于
+// 岗位模板下发不了工具面。
+//
+// 三态语义 (与 engine.Config.AllowedTools 逐字一致, 不做任何"友好化"):
+//
+//	flag 非空          → 用 flag 解析结果 (非 nil, 空串" , "会解析成空集 = 拒绝一切)
+//	flag 空, config 有 → 用 config 那份 (非 nil; 空数组同样是拒绝一切)
+//	两边都空           → nil = 不设白名单 (全部工具可见)
+//
+// 最后一行的区分是**实质**的: 前两种是"有人声明了白名单" (哪怕声明成空), 第三种是
+// "没人声明"。把第三种也当成拒绝一切, 会让每一次没配白名单的交互式运行一个工具都
+// 调不动 —— fail-closed 要防的是"岗位模板渲染成空却当成全放行", 不是"本来就没设限"。
+func effectiveAllowedTools(flagCSV string, jsonCfg *feishu.JSONConfig) map[string]bool {
+	if strings.TrimSpace(flagCSV) != "" {
+		return parseAllowedTools(flagCSV)
+	}
+	if jsonCfg == nil || jsonCfg.AllowedTools == nil {
+		return nil
+	}
+	set := make(map[string]bool, len(jsonCfg.AllowedTools))
+	for _, t := range jsonCfg.AllowedTools {
+		set[t] = true
+	}
+	return set
+}
+
 func firstLine(s string) string {
 	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
 		return s[:idx]
@@ -3976,6 +5474,11 @@ type engineDeps struct {
 	promptMgr   *prompt.Manager
 	mcpConns    []*mcp.Connection
 	skillReg    *skills.Registry
+	// hookConfigs 是构造 hookRunner 用的那一份配置, 与 hookRunner 并排留着是因为
+	// 子代理要给自己的 Runner **追加**资产声明的 hook (21.8.12 P2): 只留 Runner 的话
+	// 那份配置在构造完之后就取不回来了, 于是子代理只能要么复用父 Runner (资产 hook
+	// 装到父会话身上, 而父引擎同时在跑自己的轮次) 要么丢掉继承来的 hook。两者都错。
+	hookConfigs []types.HookConfig
 	// traceStore 供嵌套子代理引擎共用同一份轨迹底座 (design/01 §4.8)。
 	// 在 deps 构造之后才被赋值 (TraceStore 要先算出 stateDir), 故可为 nil。
 	traceStore *tracestore.Store
@@ -4006,9 +5509,77 @@ func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
 	return out, nil
 }
 
+// ==================== P5: subagent_type 的资产查表 (21.8.12) ====================
+//
+// 与 pkg/feishu/session.go 同名的两个函数是**故意的重复**, 不是抄漏——但它们的重复
+// 方式值得写清楚: 飞书那侧返回的档位经 ConstraintSet (ProfileSourceExplicit, 有来源
+// 可审计), 这侧的 CLI 没有约束体系, 直接决定注册哪个档位。两处都只做同一件事:
+// 查表 + 校验声明取值是否合法, 非法就留痕并当作"没声明"。
+//
+// 判据是 cmd/claude-go/p5_asset_wiring_test.go: 它直接调 runNestedAgent, 从
+// 出站请求里数工具集。
+
+// cliBindAgentAsset 按 subagent_type 装配出这份 agent 的全部声明 (21.8.12 P2)。
+//
+// 与飞书那条路径**共用同一个组装器** (pkg/agentbind): 档位合法性、技能对池、
+// hook 解析、权限档宽严判定这几条规则只有一处定义。分成两份会让"同一样的 .md 在
+// 两条路径上装出不同结果", 而那种差异从任何单侧看都是不可见的。
+//
+// 返回 nil 表示"没查到 / 非 active", 调用方照旧走各自的基线。
+func cliBindAgentAsset(subagentType string, skillReg *skills.Registry) *agentbind.AssetBinding {
+	if strings.TrimSpace(subagentType) == "" {
+		return nil
+	}
+	b := agentbind.BindAgentAsset(subagentType, skillReg)
+	for _, w := range b.Warnings() {
+		log.Printf("[P2][warn] %s", w)
+	}
+	return b
+}
+
+// loadAssetCatalog 装载资产索引 (21.8.12 P0/P1), 返回一行摘要供调用方打日志。
+//
+// CLI 与飞书两条启动路径都要调它: 资产目录的读取方此前**一处都没有**, 只在其中
+// 一条路径上补, 会让"CLI 里能用的 agent 定义, 飞书里查不到"成为一条没人知道的规则。
+func loadAssetCatalog(cwd, stateDir string) string {
+	roots := asset.DefaultRoots(cwd, stateDir)
+	set := asset.LoadStandard(roots)
+	agent.SetAgentCatalog(set)
+	for _, p := range set.DedupReport() {
+		log.Printf("[asset][warn] %s", p)
+	}
+	return set.Describe(roots)
+}
+
 func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
 	nestedReg := tool.NewRegistry()
-	builtin.RegisterBaseTools(nestedReg, nil)
+	// P5 查表 (21.8.12): subagent_type 先按 agent 资产查表, 查到就用资产声明的档位。
+	//
+	// 这条路径改造前比飞书那条更彻底: 它**根本不按档位装配**, 一律 RegisterBaseTools
+	// (全量内置工具)。所以资产声明的 tool-profile 在这里原本连一个可能的落点都没有。
+	//
+	// 这里**不做 ProfileNarrows 收窄判定**, 理由不是"不想做"而是"在这条路径上它恒
+	// 成立因此没有信息": 基线是全量内置工具集, 六个档位注册的每一件都在它的子集里,
+	// 没有任何一份声明能放宽。反过来说, 加一道恒真的闸只会制造一种"看起来有防护"的
+	// 假象 —— 而它还会真的挡掉合法声明: 我第一版就是拿 coding 当基线去判, 结果
+	// `analysis` 与 `coding` 互不包含 (analysis 有 WebSearch、coding 有 Bash/Write),
+	// ProfileNarrows 两个方向都返回 false, 于是最该生效的那份声明被静默拒掉了。
+	//
+	// 真正该挡的是**取值不认识**: 那由 cliAgentAssetProfile 负责 (它把非法取值当作
+	// "没声明"并记日志) —— 不挡的话 NormalizeToolProfile 会把 `codign` 静默掰成 chat,
+	// 子代理会突然什么都没有, 而日志上一个字都没有。
+	//
+	// 注意下面几个注册 (Agent/delegate_task/MCP/Skill) 在**两种分支之外**, 无论走哪个
+	// 档位都注册 —— 档位收窄不该切断递归派生能力 (那是"削错了东西")。
+	assetBind := cliBindAgentAsset(opts.SubagentType, deps.skillReg)
+	if assetBind == nil {
+		assetBind = &agentbind.AssetBinding{} // 空读数: 下面的声明一律空, 走基线
+	}
+	if assetBind.HasToolProfile {
+		builtin.RegisterProfileToolsWithStore(nestedReg, nil, nil, assetBind.ToolProfile)
+	} else {
+		builtin.RegisterBaseTools(nestedReg, nil)
+	}
 	mcp.RegisterMCPTools(nestedReg, deps.mcpConns)
 	if deps.skillReg != nil && deps.skillReg.Count() > 0 {
 		nestedReg.Register(skills.NewSkillTool(deps.skillReg))
@@ -4021,6 +5592,15 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 
 	nestedCfg := *deps.cfg
 	client := deps.apiClient
+	// P2 声明: 资产声明的模型 / 回合上限 —— 只在真的声明了时才生效, 且**弱于**
+	// 调用方显式传的 opts (显式参数 > 资产默认: 一个派生点说"这个子任务用快模型"
+	// 比资产里那句常驻默认更具体)。
+	if assetBind.Model != "" && opts.Model == "" {
+		opts.Model = assetBind.Model
+	}
+	if assetBind.MaxTurns > 0 && opts.MaxTurns <= 0 {
+		opts.MaxTurns = assetBind.MaxTurns
+	}
 	if opts.Model != "" {
 		// 子代理模型确定化烘焙: 既改 Config.Model 标签, 又把模型写进 client 副本,
 		// 并清空 ExecutionModel/PlanClient —— 子代理全程单模型, 不套用主会话的
@@ -4043,17 +5623,174 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 		nestedCfg.PermissionMode = types.PermissionModePlan
 		perm = permissions.NewChecker(types.PermissionModePlan)
 	}
+	// P2 权限档声明: **只许收窄**。资产目录是 state/project/user 三层都写得进去的
+	// 地方, 一份 .md 里写 `permission-mode: bypass` 若无条件生效, 就是一条从文件到
+	// 权限的提升路径 —— 而且完全静默。口径与飞书那条路径、与 ApplyConstraints 的
+	// "约束按构造只会收窄"一致。
+	if assetBind.HasPermissionMode {
+		if permissions.Widens(nestedCfg.PermissionMode, assetBind.PermissionMode) {
+			log.Printf("[P2][warn] agent 资产 %q 声明的 permission-mode=%q 比外层 (%q) 更宽, 已拒绝"+
+				" —— 声明只能收窄权限面", assetBind.Name, assetBind.PermissionMode, nestedCfg.PermissionMode)
+		} else {
+			nestedCfg.PermissionMode = assetBind.PermissionMode
+			perm = permissions.NewChecker(assetBind.PermissionMode)
+		}
+	}
+
+	// 工具名单 (P2′): 资产声明的 `tools:` 白名单与 `disallowed-tools:` 黑名单。
+	//
+	// ★ 这里补的是一个**已经存在的洞**, 不是新功能。改造前 assetBind 已经把这两份名单
+	// 解析出来、也写进了装配读数 (Binding.Declared), 但**没有任何一行把它们送进运行时**
+	// —— 于是 `disallowed-tools: [Bash]` 的效果是"报告里写着挡了, 实际一个没挡"。
+	//
+	// 本条路径不用 ConstraintSet (那是飞书路径的机制), 所以直接写 cfg 的两个字段 ——
+	// 但仍然照 ApplyConstraints 的**同两条规则**: 黑名单取并集, 白名单取交集。
+	// 只按自己的来源"放行"是权限提升: nestedCfg 是从父引擎拷来的, 它的 AllowedTools
+	// 是父会话的有效约束, 拿资产那份整个盖上去等于把父会话的白名单**放宽**成资产的。
+	//
+	// ★ 门槛是 HasTools (键写没写), **不是** `Tools != nil` 也不是 `len(Tools) > 0`。
+	//
+	// 这两个更"自然"的写法都会把 `tools: []` 吃掉: 依赖 nil-ness 就等于依赖
+	// bindTools 记得把空名单补成非 nil 空切片 (一条别处一改就悄悄失效的隐式约定),
+	// 用长度当门槛则连"空名单"这个分支都进不来。而 `tools: []` 的语义正是
+	// fail-closed 拒绝一切 —— 它被吃掉之后, 这份声明在运行时的效果与"没写 tools:"
+	// 逐字相同: 子代理拿到父会话的全部工具。一份刻意收紧的声明静默变成完全放行,
+	// 是本条分支最不能出的错。
+	if assetBind.HasTools {
+		if nestedCfg.AllowedTools == nil {
+			next := make(map[string]bool, len(assetBind.Tools))
+			for _, n := range assetBind.Tools {
+				next[n] = true
+			}
+			nestedCfg.AllowedTools = next
+		} else {
+			next := make(map[string]bool, len(assetBind.Tools))
+			for _, n := range assetBind.Tools {
+				if nestedCfg.AllowedTools[n] {
+					next[n] = true
+				}
+			}
+			// 交集之后的空 map 是**合法**的 (父会话白名单与资产白名单不相交 ⇒
+			// 这个子代理什么工具都不给)。这不是误配, 但它是"什么都不给", 必须
+			// 让人看得见 —— 否则下一个现象是"子代理一个工具都没调, 也没有报错"。
+			//
+			// 两条成因分开关照: 显式空白名单是**作者要求**的拒绝一切 (设计如此),
+			// 交集为空才是"两份名单各写各的、恰好不相交"(通常是要修的配置)。
+			if len(next) == 0 {
+				if len(assetBind.Tools) == 0 {
+					log.Printf("[P2] agent 资产 %q 声明了显式空白名单 (tools: []), 子代理 %q 将按声明拒绝一切工具",
+						assetBind.Name, opts.SubagentType)
+				} else {
+					log.Printf("[P2][warn] agent 资产 %q 的 tools 白名单与父会话白名单不相交, "+
+						"子代理 %q 将**没有任何工具可用** (资产=%v)", assetBind.Name, opts.SubagentType, assetBind.Tools)
+				}
+			}
+			nestedCfg.AllowedTools = next
+		}
+	}
+	// 黑名单这一维用 HasDisallowedTools 而不是 len()>0: `disallowed-tools: []` 是
+	// "声明了一份空黑名单" (一处都不挡), 与"没写这一行"在本条路径上**行为**确实一样
+	// (空集合的并集是空), 但存在那一侧不同 —— 对账要拿它去回答"这份声明到底管了没有"。
+	// 用长度当门槛会让这份声明在对账里彻底隐形。行为相同、读数不同, 正是这类键的共性。
+	if assetBind.HasDisallowedTools {
+		if nestedCfg.DisabledTools == nil {
+			nestedCfg.DisabledTools = make(map[string]bool, len(assetBind.DisallowedTools))
+		}
+		for _, n := range assetBind.DisallowedTools {
+			nestedCfg.DisabledTools[n] = true
+		}
+	}
 
 	nestedPromptMgr := prompt.NewManager(nestedCfg.Cwd)
 	nestedPromptMgr.CustomPrompt = deps.promptMgr.CustomPrompt
 	nestedPromptMgr.AppendPrompt = deps.promptMgr.AppendPrompt
+	// P2: 资产正文追加在**继承来的** AppendPrompt 之后, 而不是替换它 —— 父会话经
+	// --append-system-prompt 传下来的指令与这份 agent 自己的角色指令是两回事, 一份
+	// 都不该吃掉另一份。
+	if p := assetBind.Prompt; p != "" {
+		if nestedPromptMgr.AppendPrompt != "" {
+			nestedPromptMgr.AppendPrompt = nestedPromptMgr.AppendPrompt + "\n\n" + p
+		} else {
+			nestedPromptMgr.AppendPrompt = p
+		}
+	}
 	nestedPromptMgr.OverridePrompt = deps.promptMgr.OverridePrompt
 	nestedPromptMgr.CoordinatorPrompt = deps.promptMgr.CoordinatorPrompt
 	nestedPromptMgr.AgentPrompt = deps.promptMgr.AgentPrompt
 	nestedPromptMgr.Model = nestedCfg.Model
 	nestedPromptMgr.SkillListing = deps.promptMgr.SkillListing
-	nested := engine.NewQueryEngine(&nestedCfg, client, nestedReg, deps.hookRunner, perm, deps.compactor, nestedPromptMgr)
+	// P2 skill 绑定: 资产声明的技能并进这份子代理的技能清单。并进而非替换 ——
+	// 继承来的那份是父会话的池视图, 整个换掉等于资产声明顺带撤销了父会话的技能面。
+	// 没有技能池 (deps.skillReg 为空) 时组装器已经报过 unknown_name, 这里不重复留痕。
+	if len(assetBind.Skills) > 0 && deps.skillReg != nil {
+		if extra := deps.skillReg.FormatShortListingForNames(assetBind.Skills); strings.TrimSpace(extra) != "" {
+			if nestedPromptMgr.SkillListing != "" {
+				nestedPromptMgr.SkillListing = nestedPromptMgr.SkillListing + "\n" + extra
+			} else {
+				nestedPromptMgr.SkillListing = extra
+			}
+		}
+	}
+	nestedPromptMgr.ShowEnvironmentDate = deps.promptMgr.ShowEnvironmentDate
+
+	// P2 hook 绑定: 资产声明的外部 hook **追加**在继承来的 Runner 的配置之后。
+	//
+	// Runner 是 per-调用 构造的 (deps.hookRunner 属于父引擎), 所以这里要给子代理
+	// 单独建一个 —— 复用父的那个会让资产 hook 装到父会话身上 (而那个引擎同时还在
+	// 跑父会话自己的轮次)。没有声明时**逐字节复用** deps.hookRunner: 这是常态路径,
+	// 不该因为多了一次无意义的构造而改变任何行为。
+	nestedHookRunner := deps.hookRunner
+	if len(assetBind.Hooks) > 0 {
+		merged := make([]types.HookConfig, 0, len(deps.hookConfigs)+len(assetBind.Hooks))
+		merged = append(merged, deps.hookConfigs...)
+		merged = append(merged, assetBind.Hooks...)
+		nestedHookRunner = hooks.NewRunnerWithContext(ctx, merged, "")
+	}
+
+	// 生命周期 hook 的**开始**两拍 (与 pkg/feishu/session.go 的 runNestedAgent 逐条对齐)。
+	//
+	// 只把资产声明的 hook 装进 Runner 而从不触发, 它就是一个装配读数上的 wired、
+	// 对账上的干净、运行上永远不跑的脚本 —— 声明了但没人读。
+	//
+	// 为什么放在这里而不是更早: SessionStart/SubagentStart 必须发生在**本轮引擎开始
+	// 跑之前**、且只发生一次。放在 SubmitMessage 之前是这个函数里唯一同时满足这两条
+	// 的位置。
+	//
+	// 只对**新构造的** Runner 触发 (deps.hookRunner 由父引擎创建并会在父会话的各轮里
+	// 重复使用, 在这里再触发一次会让父会话的 SessionStart 变成每个子代理一次)。
+	// 没有资产声明时逐字节维持改造前的行为 —— 存量部署 (config.json 无 hooks 键) 零变化。
+	if nestedHookRunner != deps.hookRunner && nestedHookRunner != nil {
+		if hookOut := nestedHookRunner.ExecuteSessionHooks(types.HookEventSessionStart); hookOut != nil &&
+			(hookOut.Decision == "block" || hookOut.Decision == "deny") {
+			return "", fmt.Errorf("SessionStart blocked by hook: %s", hookOut.Reason)
+		}
+		// 角色名取 opts.SubagentType —— 与上面查资产用的键**同一个来源**。这里不能
+		// 回落到 nestedCfg.Role: 那条路径上它是从父引擎继承的 (本函数一处都不改它),
+		// 于是 SubagentStart 会报出父会话的角色, 而 hook 里写的 If 判据正是拿这个名字
+		// 匹配的 —— 一个报错名字的 hook 与不触发在运维上分不出来。
+		if hookOut := nestedHookRunner.ExecuteSubagentStartHooks(opts.SubagentType, agentPrompt); hookOut != nil &&
+			(hookOut.Decision == "block" || hookOut.Decision == "deny") {
+			return "", fmt.Errorf("SubagentStart blocked by hook: %s", hookOut.Reason)
+		}
+	}
+
+	nested := engine.NewQueryEngine(&nestedCfg, client, nestedReg, nestedHookRunner, perm, deps.compactor, nestedPromptMgr)
 	nested.TraceStore = deps.traceStore // design/01 §4.8: 子代理的 llm_call 轨迹, 改造前恒缺席
+
+	// P2 对账: 装完之后立刻把"这份资产声明要什么"与"这台引擎实际装成了什么"比一次
+	// (先自报, 再对账, 最后才轮到面板)。自报取自**活引擎** —— 读配置得到的报告会
+	// 一路全绿, 而那正是本仓修过的那个缺陷 (配置里都有, 引擎里那一半是空的)。
+	//
+	// Config 留 nil: 这是一个程序化装配出来的子引擎, 不是从配置查找链读出来的。
+	if decl := assetBind.AssemblyDeclaration(); decl != nil {
+		_, rec := engine.ReconcileAssembly(nested, engine.AssemblyReportInput{}, decl)
+		if rec != nil {
+			log.Printf("[P2] agent 资产 %q 的装配对账: %s", assetBind.Name, rec.Summary)
+			for _, d := range rec.Diffs {
+				log.Printf("[P2][diff] %s %s/%s 声明=%q 实际=%q", d.Kind, d.Facet, d.Item, d.Declared, d.Actual)
+			}
+		}
+	}
 
 	var sb strings.Builder
 	for msg := range nested.SubmitMessage(ctx, agentPrompt) {

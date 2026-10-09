@@ -12,7 +12,7 @@ func industryMapWorkflow() *WorkflowDef {
 		Mode:        "pipeline",
 		Stages: []StageDef{
 			{
-				Name: "chain-architect", Role: "architect",
+				Name: "chain-architect", Agent: "architect",
 				Prompt: `你是产业链分析专家。请拆解给定产业的完整产业链。
 
 目标产业: {objective}
@@ -26,7 +26,7 @@ func industryMapWorkflow() *WorkflowDef {
 | 层级 | 环节 | 作用 | 壁垒 |`,
 			},
 			{
-				Name: "company-mapper", Role: "researcher",
+				Name: "company-mapper", Agent: "researcher",
 				DependsOn: []string{"chain-architect"},
 				Prompt: `基于环节拆解, 为每个环节找出**代表企业 + 股票代码**(必须 WebSearch 取真实代码)。
 
@@ -41,7 +41,7 @@ func industryMapWorkflow() *WorkflowDef {
 | 环节 | 企业 | 市场 | 代码 | 定位 |`,
 			},
 			{
-				Name: "share-researcher", Role: "fundamentals-analyst",
+				Name: "share-researcher", Agent: "fundamentals-analyst",
 				DependsOn: []string{"company-mapper"},
 				Prompt: `为上述企业补充**市场份额**与龙头判断(WebSearch 取研报数据, 标注来源与日期)。
 
@@ -53,7 +53,7 @@ func industryMapWorkflow() *WorkflowDef {
 注意: 份额数据须标注来源, 不确定的标"待确认", 不要编造。`,
 			},
 			{
-				Name: "graph-builder", Role: "architect",
+				Name: "graph-builder", Agent: "architect",
 				DependsOn: []string{"share-researcher"},
 				Prompt: `把以上汇总成**机器可读的结构化产业链图**, 直接输出 YAML(与 market-radar 种子格式一致)。
 

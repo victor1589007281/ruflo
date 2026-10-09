@@ -84,8 +84,23 @@ type HookContext struct {
 	TurnCount int
 	Model     string
 
+	// SentUpTo 是 queryLoop 维护的"已发给过上游的消息条数"水位线。
+	//
+	// 压缩类 hook 只能改 [SentUpTo, len(Messages)) —— 即本轮新增、尚未进入任何
+	// 已发出请求的消息。[0, SentUpTo) 已经在缓存里, 改一个字节就让该位置之后的
+	// 前缀缓存全部失效。0 表示"没有任何历史被保护"(单轮场景/测试)。
+	SentUpTo int
+
 	// PhasePreCompact / PhasePostRequest / PhasePreRequest 使用
 	SystemPrompt []string
+
+	// TaskInstruction 是本轮的任务指令正文 (engine.TaskInstruction)。
+	//
+	// 它在 PhasePreRequest 的 hook **执行时还没有进 SystemPrompt** —— engine 刻意
+	// 把它排在所有稳定块之后 (见 engine.go 的稳定/可变分层)。需要任务正文做检索
+	// key 的 hook (MemoryInjectHook) 只能从这里取, 不能再去扫 SystemPrompt 末段:
+	// 那是稳定段, 扫出来的是 base 提示词, 与真正要处理的任务无关。
+	TaskInstruction string
 
 	// PhasePostRequest / PhasePreToolUse / PhasePostToolUse 使用
 	AssistantBlocks []types.ContentBlock
@@ -323,4 +338,60 @@ func (c *HookChain) Names(phase InternalHookPhase) []string {
 		out = append(out, h.Name())
 	}
 	return out
+}
+
+// Hooks 返回指定 phase 上已注册的 hook 实例 (按执行顺序)。
+//
+// 与 Names 的分工: Names 回答"谁在链上", 这里回答"那个实例现在是什么状态" ——
+// 有些接线不在 Name() 里 (例如 CompactionSink 装了没有), 只有拿到实例才问得出。
+// 返回的是链上真实持有的指针, **调用方不得改动其内部字段**。
+func (c *HookChain) Hooks(phase InternalHookPhase) []InternalHook {
+	if c == nil {
+		return nil
+	}
+	hs := c.hooks[phase]
+	out := make([]InternalHook, len(hs))
+	copy(out, hs)
+	return out
+}
+
+// AllPhases 返回**所有** phase (含当前一个 hook 都没注册的), 顺序固定。
+//
+// 与 Names 的差别是这里不筛空: 装配自报要回答的恰恰包含"这个相位上什么都没有"
+// —— 11 个相位里有 3 个 (PostCompact/OnStreamDelta/OnRecovery) 是专为外部 hook
+// 留的空位, "空"是它们的预期状态而不是故障。只报有 hook 的相位, 就把这三行
+// 从报告里抹掉了, 而抹掉之后没人能分辨"留了位子等外部 hook"与"这一相位不存在"。
+//
+// 这里只列内置链的相位。外部 hook 的 27 个事件是另一套枚举 (types.HookEvent),
+// 由 hooks.Runner 自报, 两者在装配报告里并列而不合并 —— 合并会掩盖
+// "事件名对得上、但在内置链上没有对应相位"这一类真实的接线缺口。
+func AllPhases() []InternalHookPhase {
+	return []InternalHookPhase{
+		PhasePreCompact, PhasePostCompact, PhasePreRequest, PhasePostRequest,
+		PhaseOnStreamDelta, PhasePreToolUse, PhasePostToolUse,
+		PhaseOnError, PhaseOnRecovery, PhaseOnStop, PhasePostTurn,
+	}
+}
+
+// PhaseHooks 返回每个 phase 上已注册 hook 的名字 (按执行顺序), 覆盖全部相位。
+//
+// 键是 phase 的可读名 (与 String() 一致), 值即使为空也保留 —— 见 AllPhases 的
+// 说明: 空相位是报告要表达的信息之一。
+func (c *HookChain) PhaseHooks() map[string][]string {
+	out := make(map[string][]string, len(AllPhases()))
+	for _, p := range AllPhases() {
+		out[p.String()] = c.Names(p)
+	}
+	return out
+}
+
+// Count 返回链上已注册的 hook 实例数 (一个 hook 挂多个 phase 只算一次)。
+func (c *HookChain) Count() int {
+	seen := make(map[InternalHook]bool)
+	for _, hs := range c.hooks {
+		for _, h := range hs {
+			seen[h] = true
+		}
+	}
+	return len(seen)
 }

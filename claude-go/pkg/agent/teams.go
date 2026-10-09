@@ -32,6 +32,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -45,6 +46,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/metrics"
+	"github.com/anthropic/claude-go/pkg/statestore"
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
 	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -66,6 +68,12 @@ type DAGTaskTracker interface {
 	SetTaskStatusAndUnblock(id, status string) (int, error)
 	GetAllTasks() []DAGTaskSummary
 	ReevaluateBlockedTasks() int
+	// SweepStaleTasks 对账: 解锁依赖已全部终态的 blocked, 并把无人认领的
+	// pending/blocked 推进终态。返回值 = 本次改动的条目数。
+	//
+	// TTL <= 0 表示该维度不做过期。清残留路径传 (0,0) —— 那一刻只想**解锁**
+	// 被上游失败卡住的条目, 不想给刚提交的任务判死。
+	SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int
 }
 
 // DAGTaskSummary 面向调度器的任务摘要 (与 builtin.TaskSummary 结构对齐)。
@@ -87,6 +95,7 @@ type TaskStoreForDAG interface {
 	AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error)
 	ReadyTasksRaw() []map[string]interface{}
 	SetTaskStatusAndUnblock(id, status string) (int, error)
+	SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int
 }
 
 // TaskStoreDAGAdapter 将 builtin.TaskStore 适配为 DAGTaskTracker。
@@ -99,6 +108,7 @@ type TaskStoreDAGAdapter struct {
 		AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error)
 		SetTaskStatusAndUnblock(id, status string) (int, error)
 		ReevaluateBlockedTasks() int
+		SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int
 	}
 	readyFunc  func() []DAGTaskSummary
 	getAllFunc func() []DAGTaskSummary
@@ -114,6 +124,7 @@ func NewTaskStoreDAGAdapter(
 		AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error)
 		SetTaskStatusAndUnblock(id, status string) (int, error)
 		ReevaluateBlockedTasks() int
+		SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int
 	},
 	readyFn func() []DAGTaskSummary,
 	getAllFn func() []DAGTaskSummary,
@@ -147,6 +158,9 @@ func (a *TaskStoreDAGAdapter) GetAllTasks() []DAGTaskSummary {
 }
 func (a *TaskStoreDAGAdapter) ReevaluateBlockedTasks() int {
 	return a.store.ReevaluateBlockedTasks()
+}
+func (a *TaskStoreDAGAdapter) SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int {
+	return a.store.SweepStaleTasks(pendingTTL, blockedTTL)
 }
 
 // DreamRecorder Dreaming 记录接口, 解耦 dreaming 包依赖。
@@ -214,8 +228,12 @@ const (
 )
 
 // MemoryWriter 写入记忆的抽象接口 (解耦对 memory 包的依赖)。
+//
+// original 是**未截断的完整产出**, summary 是喂给检索的摘要。两者同时给, 是因为
+// 只有调用方同时握着它们 —— 摘要一旦生成, 原文就不可还原了 (见 memory.AddWithOriginal)。
+// original 为空即退化成"只存摘要"的老行为。
 type MemoryWriter interface {
-	AddTeamMemory(teamName, workflow, objective, summary string)
+	AddTeamMemory(teamName, workflow, objective, summary, original string)
 }
 
 // ConcurrencySuggestor 基于 LLM API 流控状态建议并发度 (解耦 api.RateLimitGuard)。
@@ -233,18 +251,19 @@ type ProductionTeamManager struct {
 	factory      CreateAgentFunc
 	notify       NotifyFunc
 	mediaNotify  MediaNotifyFunc
-	taskTracker  TaskTracker          // 复用 V2 Task 系统
-	pool         *AgentPool           // Agent 池 (动态扩缩)
-	llm          LLMClient            // LLM 客户端 (蜂群分解)
-	evolution    *EvolutionEngine     // 自动进化引擎
-	evoLoop      *EvolutionLoop       // 统一学习调度循环 (design/03 §4.3); nil = 回落到直调路径
-	traceStore   *tracestore.Store    // 轨迹底座 (design/03 §4.1); nil = 不采集 gate Span
-	dreamer      DreamRecorder        // Dreaming 接口 (覆盖 team agent 会话)
-	skillCreator SkillAutoCreator     // 技能自创建器 (团队干净成功后提炼 shadow 技能)
-	roles        *RoleRegistry        // 角色注册表
-	memWriter    MemoryWriter         // 记忆写入 (团队完成后写入高权重记忆)
-	metrics      *metrics.Collector   // 持续观测指标采集器
-	concurrency  ConcurrencySuggestor // 动态并发建议 (基于 API 流控状态)
+	taskTracker  TaskTracker           // 复用 V2 Task 系统
+	pool         *AgentPool            // Agent 池 (动态扩缩)
+	llm          LLMClient             // LLM 客户端 (蜂群分解)
+	evolution    *EvolutionEngine      // 自动进化引擎
+	evoLoop      *EvolutionLoop        // 统一学习调度循环 (design/03 §4.3); nil = 回落到直调路径
+	traceStore   *tracestore.Store     // 轨迹底座 (design/03 §4.1); nil = 不采集 gate Span
+	dreamer      DreamRecorder         // Dreaming 接口 (覆盖 team agent 会话)
+	skillCreator SkillAutoCreator      // 技能自创建器 (团队干净成功后提炼 shadow 技能)
+	roles        *RoleRegistry         // 角色注册表
+	memWriter    MemoryWriter          // 记忆写入 (团队完成后写入高权重记忆)
+	metrics      *metrics.Collector    // 持续观测指标采集器
+	concurrency  ConcurrencySuggestor  // 动态并发建议 (基于 API 流控状态)
+	stateStore   statestore.StateStore // 信箱后端 (nil → 进程内 MemStore)
 
 	planCfgResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
 	hookRunner      *hooks.Runner       // Hook 执行器 (TeammateIdle / TaskCompleted)
@@ -278,6 +297,13 @@ type TeamManagerConfig struct {
 	PlanConfigResolver *PlanConfigResolver // 模型/连接参数解析器 (可选)
 	HookConfigs        []types.HookConfig  // Hook 配置 (用于 TeammateIdle / TaskCompleted 等)
 	SkillCreator       SkillAutoCreator    // 技能自创建器 (可选; design/03 §1.2 开环2 接线)
+	// StateStore 信箱后端 (design/01 §4.11)。非 nil 时团队消息走 PersistentMailbox
+	// (游标进 KV, 跨重启不重复投递); nil 则回落到进程内 MemStore —— 语义一致,
+	// 只是跨重启会重投一次。收敛后全仓只有这一份信箱实现 (21.8.9-D6)。
+	//
+	// 为什么从配置注入而不是内部新建: 进程内应当只有一个 StateStore 实例
+	// (design/02 §3.4.1), 飞书 bot 已持有它并与轨迹底座共用。
+	StateStore statestore.StateStore
 }
 
 // SkillAutoCreator 技能自创建接口 (实现者: skills.AutoCreator, duck typing 解耦包依赖)。
@@ -442,6 +468,7 @@ func NewProductionTeamManager(cfg TeamManagerConfig) *ProductionTeamManager {
 		metrics:         metrics.NewCollector(stateDir),
 		concurrency:     cfg.Concurrency,
 		planCfgResolver: cfg.PlanConfigResolver,
+		stateStore:      cfg.StateStore,
 		starting:        make(map[string]bool),
 	}
 	if len(cfg.HookConfigs) > 0 {
@@ -494,7 +521,6 @@ type ProductionTeam struct {
 	CreatedAt  time.Time           `json:"createdAt"`
 	StartedAt  time.Time           `json:"startedAt,omitempty"`
 	FinishedAt time.Time           `json:"finishedAt,omitempty"`
-	Mailbox    []MailMessage       `json:"mailbox,omitempty"`
 	Error      string              `json:"error,omitempty"`
 	Cwd        string              `json:"cwd,omitempty"`      // 工作目录 (用于编译验证和文件清单)
 	Language   string              `json:"language,omitempty"` // 编程语言 ("go","cpp","rust","python"), 空=""go"
@@ -537,6 +563,19 @@ func (t *ProductionTeam) metrics() *metrics.Collector {
 		return nil
 	}
 	return t.mgr.metrics
+}
+
+// mailStore 返回本团队信箱的后端 (可能为 nil)。
+//
+// 与 metrics 同一条理由走管理器: 信箱后端必须与**生产方**
+// (ProductionTeamManager.SendMailMessage) 是同一个 StateStore 实例。各消费点自己
+// NewPersistentMailbox(statestore.NewMemStore(), …) 的话, 写在一个实例上、从另一个
+// 实例读 —— 读到的永远是空, 而"空"与"没人给你发消息"完全同形, 是查不出来的那种错。
+func (t *ProductionTeam) mailStore() statestore.StateStore {
+	if t == nil || t.mgr == nil {
+		return nil
+	}
+	return t.mgr.stateStore
 }
 
 // SetLanguage 设置团队的编程语言 (go/cpp/rust/python)。
@@ -602,6 +641,16 @@ type StageResult struct {
 	V2TaskID  string     `json:"v2TaskId,omitempty"` // 关联的 V2 Task ID
 	StartedAt time.Time  `json:"startedAt,omitempty"`
 	Duration  string     `json:"duration,omitempty"`
+
+	// cause 是阶段失败背后的**原始 error** (如果有)。
+	//
+	// 为什么不能只留 Error 文本: 重试环要按 error 的类型分流, 而不是按文案 ——
+	// 尤其是 P0-1 的预算耗尽, 它的文案里带 limit/spent 两个每次都在变的数字,
+	// 任何基于文本的比较都会把一个终态误判成"又一个新失败"然后继续重试。
+	//
+	// 刻意不导出: 它是进程内控制流信号, 写进 JSON 只会让台账多一个没人读、
+	// 却会被序列化进 checkpoint 的字段 (checkpoint 的兼容性比它值钱)。
+	cause error
 }
 
 // RefineEntry 一次精修迭代的记录 (供审计与 Evolution 经验闭环)。
@@ -665,9 +714,9 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 		wf := GetWorkflow(workflow)
 		if wf != nil {
 			for _, stage := range wf.Stages {
-				team.Agents[stage.Role] = &BGAgent{
-					Name:   stage.Role,
-					Role:   stage.Role,
+				team.Agents[stage.Agent] = &BGAgent{
+					Name:   stage.Agent,
+					Role:   stage.Agent,
 					Status: AgentStatusIdle,
 				}
 			}
@@ -712,7 +761,29 @@ func (ptm *ProductionTeamManager) CreateTeamWithUniquePrefix(prefix, workflow, o
 // RunTeam 启动团队执行。
 // 如果团队之前因 LLM 限流/错误而失败, 重新激活时会从上次的检查点恢复 (跳过已完成的阶段)。
 // 修复: 使用 starting 标志防止并发 run 导致的双重工作流执行。
+//
+// 等价于 RunTeamWithSession(name, objective, "") —— 不给会话身份时行为与改造前逐字节相同。
 func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
+	return ptm.RunTeamWithSession(name, objective, "")
+}
+
+// RunTeamWithSession 同 RunTeam, 但可带一个**跨 run 稳定**的会话身份 (sessionID)。
+//
+// 会话身份只做一件事: 决定出站请求的 X-Claude-Code-Session-Id, 也就是上游
+// opencode zen/go 的提示缓存分片键 (见 pkg/api/sessionshard.go 的包注释)。
+// 传空串 = 与 RunTeam 完全一致。
+//
+// **它不参与 RunID 的计算, 这是刻意的。** RunID 是奖励归因的 episode 键
+// (team.LastRunID / 进化账本), 必须每次运行唯一; 而会话身份要的恰恰是跨次稳定。
+// 把两者合成一个值, 无论偏向哪边都会坏掉另一边的语义:
+//
+//	复用 RunID 当会话键 → 两次运行的奖励记到同一 episode 上;
+//	拿会话键当 RunID    → 两次运行在账本里不可区分。
+//
+// 调用方 (面试平台) 按业务键派生会话 ID —— 例如 sha256(功能 + JD 内容哈希) 截断,
+// 于是"同一个 JD 的同一个功能"反复点就是同一个会话, 上游前缀缓存得以复用;
+// JD 一改哈希就变, 自然开新会话, 不需要额外的失效逻辑。
+func (ptm *ProductionTeamManager) RunTeamWithSession(name, objective, sessionID string) error {
 	ptm.mu.RLock()
 	team, ok := ptm.teams[name]
 	ptm.mu.RUnlock()
@@ -752,6 +823,11 @@ func (ptm *ProductionTeamManager) RunTeam(name, objective string) error {
 	}
 	team.Error = ""
 	ctx, cancel := context.WithCancel(context.Background())
+	// 会话身份从这里进入整条运行链: beginRun → trace.With → pkg/api.setTraceHeaders
+	// → 出站 X-Claude-Code-Session-Id。只在非空时注入, 空串下 ctx 与改造前一致。
+	if sessionID != "" {
+		ctx = trace.With(ctx, trace.IDs{SessionID: sessionID})
+	}
 	team.cancel = cancel
 	team.doneCh = make(chan struct{})
 	team.mu.Unlock()
@@ -832,8 +908,17 @@ func (ptm *ProductionTeamManager) executeWorkflow(ctx context.Context, team *Pro
 
 // beginRun 起 trace 四元组与团队级 span, 并记开跑事件。返回收尾函数 (调用方 defer)。
 func (ptm *ProductionTeamManager) beginRun(ctx context.Context, team *ProductionTeam) (context.Context, func()) {
-	// 注入 trace, 确保团队全生命周期有唯一 traceID
-	ctx = logging.WithTrace(ctx)
+	// 注入 trace, 确保团队全生命周期有唯一 traceID。
+	//
+	// 调用方已经注入过就沿用, 不覆盖 —— HTTP 入口按业务键带来的会话身份 (SessionID)
+	// 也挂在这条链上, 无条件重写会把外部注入整条丢掉。
+	//
+	// 沿用**只影响日志 trace_id 与显式给过的 SessionID**: 下面的 RunID 照常按
+	// logging.TraceID 拼、每次运行仍然唯一 —— 奖励归因要的正是"每次唯一", 而提示
+	// 缓存分片要的是"跨次稳定", 两个需求由 SessionID 分别承担 (见 pkg/trace.IDs)。
+	if logging.TraceID(ctx) == "" {
+		ctx = logging.WithTrace(ctx)
+	}
 	ctx, endSpan := logging.WithSpan(ctx, "team."+team.Name+".execute")
 	// trace 四元组 RunID (design/03 §4.1 E0): 复用 logging traceID 作后缀,
 	// llm.jsonl 的 RunID 可直接 join 结构化日志; 下游 stage/engine 逐层补 NodeID/TurnID。
@@ -1228,7 +1313,7 @@ func (ptm *ProductionTeamManager) tryGateWithRemediation(
 
 		fixStage := StageDef{
 			Name:   fmt.Sprintf("remediation-%s-%d", gateName, attempt),
-			Role:   "coder",
+			Agent:   "coder",
 			Prompt: fixPrompt,
 		}
 		// 给修复阶段一个相对充裕的超时 (25min), 走 executor 的 retry/timeout 机制.
@@ -1249,6 +1334,92 @@ func (ptm *ProductionTeamManager) tryGateWithRemediation(
 		gateErr = newErr
 	}
 	return gateErr
+}
+
+// gateApplies 判定本次 run 是否需要跑代码门禁 (编译/测试/一致性)。
+//
+// 原判据只看工作流**声明** (WorkflowGateMetaByName(...).ProducesCode), 于是
+// "没声明产码、但实际改了 Go 源码"的 run 完全不设防 —— 实测 210 个 trace 里
+// gate span 只有 19 条且全是内容闸门, gate.compile / gate.test 为 0,
+// 即这两个门禁在这批运行上是死代码。
+//
+// 放宽为: 声明产码 **或** 本次 run 真的写了 Go 文件。第二条取文件系统这一手证据
+// (存在 .go 文件且 mtime 晚于团队开始时间), 而不是再读一个声明字段 —— 声明与实际
+// 的偏离正是本次要修的病, 不能用一个新声明去覆盖旧声明。
+//
+// 两道守卫, 都由仓库既有事故换来的:
+//   - 必须是 Go module (cwd 下有 go.mod): 否则 go build 会因 "no main module"
+//     误判失败, 再触发 coder 修复轮, 见 workflowProducesCode 注释里那句
+//     "单团队曾因此烧掉数百万 token"。
+//   - 必须真的有 .go 文件被写: 只读/写作类工作流恰好跑在 Go 仓库里时, 不该被
+//     拉去编译 (那正是上述事故的形态)。
+//
+// 判据刻意 fail-safe: 任一守卫不满足即不跑门禁, 保持原有行为 —— 门禁自身的
+// fail-closed 语义 (失败即判团队失败) 不因本函数改变。
+func (ptm *ProductionTeamManager) gateApplies(team *ProductionTeam) bool {
+	if team == nil || team.Cwd == "" {
+		return false
+	}
+	if WorkflowGateMetaByName(team.Workflow).ProducesCode {
+		return true
+	}
+	if !hasGoModule(team.Cwd) {
+		return false
+	}
+	return wroteGoFileSince(team.Cwd, team.StartedAt)
+}
+
+// hasGoModule 报告 dir 下是否存在 go.mod (即这个目录有可编译的 Go 目标)。
+func hasGoModule(dir string) bool {
+	fi, err := os.Stat(filepath.Join(dir, "go.mod"))
+	return err == nil && !fi.IsDir()
+}
+
+// wroteGoFileSince 报告 dir 下是否存在 mtime 晚于 since 的 .go 文件。
+//
+// 这是"本次 run 写了代码"的一手证据。遍历带三重上界, 避免在巨型仓库上拖慢
+// 每次收尾: 命中即返回 (写出代码的 run 通常立刻命中), 并跳过 vendor/.git 与
+// 测试用的 t 目录。找不到时最多走 maxScanEntries 个条目即放弃 ——
+// 放弃按"没写"算, 与守卫的 fail-safe 取向一致。
+func wroteGoFileSince(dir string, since time.Time) bool {
+	if since.IsZero() {
+		// 没有开始时间就无法判定"本次写的", 按未写入处理。
+		return false
+	}
+	const maxScanEntries = 20000
+	scanned := 0
+	found := false
+
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // 权限等错误跳过, 不影响判定
+		}
+		if scanned++; scanned > maxScanEntries {
+			return fs.SkipAll
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case "vendor", ".git", "node_modules", "testdata":
+				if path != dir {
+					return fs.SkipDir
+				}
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".go") {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		if info.ModTime().After(since) {
+			found = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // gateCommandFor 把 gateName 映射成等价的 go 命令字符串, 用于喂给修复 prompt.
@@ -1325,15 +1496,16 @@ func (ptm *ProductionTeamManager) executeSwarm(ctx context.Context, team *Produc
 	// 持久化完整报告文件
 	reportPath := ptm.saveTeamReport(team, results)
 
-	// 写入高权重记忆
+	// 写入高权重记忆 (摘要给检索, 全文另存快照供按需取回, 见 MemoryWriter 注释)
 	if ptm.memWriter != nil {
-		var stageSummary string
+		var stageSummary, stageFull string
 		for _, r := range results {
 			if r.Output != "" {
 				stageSummary += fmt.Sprintf("[%s/%s] %s\n", r.Name, r.Role, truncateResult(r.Output, 200))
+				stageFull += fmt.Sprintf("[%s/%s]\n%s\n\n", r.Name, r.Role, r.Output)
 			}
 		}
-		ptm.memWriter.AddTeamMemory(team.Name, team.Workflow, team.Objective, stageSummary)
+		ptm.memWriter.AddTeamMemory(team.Name, team.Workflow, team.Objective, stageSummary, stageFull)
 	}
 
 	var summary string
@@ -1701,8 +1873,11 @@ func (ptm *ProductionTeamManager) finishRefine(team *ProductionTeam, accepted bo
 	team.mu.Unlock()
 
 	if accepted && ptm.memWriter != nil {
+		// 反馈原文同样另存: 摘要里的 300 字符常常正好砍掉"要改成什么样"那半句,
+		// 而精修反馈恰恰是后续团队最需要照着做的东西。
 		ptm.memWriter.AddTeamMemory(team.Name, workflow, objective,
-			fmt.Sprintf("[精修反馈·已采纳] 用户要求: %s", truncateResult(fb, 300)))
+			fmt.Sprintf("[精修反馈·已采纳] 用户要求: %s", truncateResult(fb, 300)),
+			fmt.Sprintf("[精修反馈·已采纳]\n%s", fb))
 	}
 }
 
@@ -1841,30 +2016,38 @@ func (ptm *ProductionTeamManager) DeleteTeam(name string) error {
 	return nil
 }
 
-// SendMailMessage 向团队 agent 发送消息
+// SendMailMessage 向团队 agent 发送消息。
+//
+// 收敛后唯一的投递入口: 走 PersistentMailbox (游标进 KV, 跨重启不重复投递)。
+// 原先这里直接 append 到 ProductionTeam.Mailbox 裸 slice —— 那份 slice 已删,
+// 它既无跨重启游标, 又随团队一起落盘 (改的是磁盘格式而不是通信)。
 func (ptm *ProductionTeamManager) SendMailMessage(teamName, from, to, content string) error {
 	ptm.mu.RLock()
 	team, ok := ptm.teams[teamName]
+	store := ptm.stateStore
 	ptm.mu.RUnlock()
 
 	if !ok {
 		return fmt.Errorf("团队 %q 不存在", teamName)
 	}
 
-	team.mu.Lock()
-	team.Mailbox = append(team.Mailbox, MailMessage{
-		From: from, To: to, Content: content,
-		Type: "message", Timestamp: time.Now(),
-	})
-	team.mu.Unlock()
+	mb := NewPersistentMailbox(store, teamName)
+	if err := mb.Send(MailMessage{From: from, To: to, Content: content, Type: "message"}); err != nil {
+		return err
+	}
 
-	// 同时写入黑板, 使消息对所有 Agent 可见
-	team.Blackboard.Write(
-		fmt.Sprintf("msg-%s-%d", to, time.Now().UnixMilli()),
-		fmt.Sprintf("From %s: %s", from, content),
-		from, "context",
-	)
-	team.persist()
+	// 黑板只承接**广播** (To 为空)。
+	//
+	// 21.8.9-D6-3 缺口 1: 改动前这里无条件把消息写进黑板, 于是一条定向消息
+	// (To 非空) 也被所有 agent 看到 —— 定向语义当场变成广播, 与 MailMessage.To
+	// 的存在意义直接矛盾。H 类修复: 定向不进黑板, 只有广播进。
+	if to == "" && team.Blackboard != nil {
+		team.Blackboard.Write(
+			fmt.Sprintf("msg-%s-%d", to, time.Now().UnixMilli()),
+			fmt.Sprintf("From %s: %s", from, content),
+			from, "context",
+		)
+	}
 	return nil
 }
 

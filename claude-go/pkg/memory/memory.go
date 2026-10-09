@@ -28,6 +28,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -236,9 +237,7 @@ func (l *Loader) loadMemoryEntrypoint(priority int) *types.MemoryFile {
 		return nil
 	}
 	content = truncateEntrypoint(content)
-	if len(content) > MaxMemoryCharCount {
-		content = content[:MaxMemoryCharCount] + "\n\n> WARNING: File truncated (exceeded character limit)"
-	}
+	content = textutil.Truncate(content, MaxMemoryCharCount, "\n\n> WARNING: File truncated (exceeded character limit)")
 	l.processedPaths[absPath] = true
 	return &types.MemoryFile{
 		Path:     absPath,
@@ -272,9 +271,7 @@ func (l *Loader) loadFile(path string, memType types.MemoryType, priority int) *
 		return nil
 	}
 
-	if len(content) > MaxMemoryCharCount {
-		content = content[:MaxMemoryCharCount] + "\n\n> WARNING: File truncated (exceeded character limit)"
-	}
+	content = textutil.Truncate(content, MaxMemoryCharCount, "\n\n> WARNING: File truncated (exceeded character limit)")
 
 	l.processedPaths[absPath] = true
 
@@ -360,9 +357,7 @@ func (l *Loader) processIncludes(content string, baseDir string, depth int) stri
 						included = stripFrontmatter(included)
 						included = stripHTMLComments(included)
 						included = strings.TrimSpace(included)
-						if len(included) > MaxMemoryCharCount/2 {
-							included = included[:MaxMemoryCharCount/2] + "\n... (included file truncated)"
-						}
+						included = textutil.Truncate(included, MaxMemoryCharCount/2, "\n... (included file truncated)")
 						// 递归处理嵌套的 @include
 						included = l.processIncludes(included, filepath.Dir(includePath), depth+1)
 						result = append(result, fmt.Sprintf("<!-- included from %s -->", ref))

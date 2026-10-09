@@ -104,10 +104,13 @@ type riMemWriter struct {
 	rows []string
 }
 
-func (m *riMemWriter) AddTeamMemory(teamName, workflow, objective, summary string) {
+func (m *riMemWriter) AddTeamMemory(teamName, workflow, objective, summary, original string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.rows = append(m.rows, fmt.Sprintf("%s|%s|%s|len=%d", teamName, workflow, objective, len(summary)))
+	// 原文长度也记进来: 两条路径 (legacy / 拦截器) 都必须把未截断产出带到底,
+	// 只比摘要的话, 某一边漏传 original 是看不出来的。
+	m.rows = append(m.rows, fmt.Sprintf("%s|%s|%s|len=%d|orig=%d",
+		teamName, workflow, objective, len(summary), len(original)))
 }
 
 func (m *riMemWriter) snapshot() []string {
@@ -165,10 +168,10 @@ func riWorkflow() *WorkflowDef {
 		Description: "运行级拦截器等价性夹具",
 		Mode:        "pipeline",
 		Stages: []StageDef{
-			{Name: "s0", Role: "ri-lead", Prompt: "S0 目标: {objective}"},
-			{Name: "s1", Role: "ri-one", Prompt: "S1 依据: {prev_result}", DependsOn: []string{"s0"}, Parallel: true},
-			{Name: "s2", Role: "ri-two", Prompt: "S2 依据: {prev_result}", DependsOn: []string{"s0"}, Parallel: true},
-			{Name: "s3", Role: "ri-sum", Prompt: "S3 汇总: {prev_result}", DependsOn: []string{"s1", "s2"}},
+			{Name: "s0", Agent: "ri-lead", Prompt: "S0 目标: {objective}"},
+			{Name: "s1", Agent: "ri-one", Prompt: "S1 依据: {prev_result}", DependsOn: []string{"s0"}, Parallel: true},
+			{Name: "s2", Agent: "ri-two", Prompt: "S2 依据: {prev_result}", DependsOn: []string{"s0"}, Parallel: true},
+			{Name: "s3", Agent: "ri-sum", Prompt: "S3 汇总: {prev_result}", DependsOn: []string{"s1", "s2"}},
 		},
 	}
 }
@@ -196,8 +199,10 @@ func newRIHarness(t *testing.T, delay time.Duration) *riHarness {
 	mem := &riMemWriter{}
 	ptm := NewProductionTeamManager(TeamManagerConfig{
 		BaseDir: filepath.Join(tmp, "state", "teams"),
-		Factory: func(_ context.Context, role, _ string) (AgentRunner, error) { return &riRunner{role: role, rec: rec}, nil },
-		Notify:  func(_, msg string) { sink.add(msg) },
+		Factory: func(_ context.Context, role, _ string) (AgentRunner, error) {
+			return &riRunner{role: role, rec: rec}, nil
+		},
+		Notify: func(_, msg string) { sink.add(msg) },
 	})
 	// 记忆写入器只能经 setter 注入: TeamManagerConfig.MemWriter 是**死字段** ——
 	// NewProductionTeamManager 从不读它 (生产也走 SetMemoryWriter, 见 feishu/bot.go)。
@@ -443,6 +448,7 @@ func riOut(role string) string {
 //   - 末尾的防死循环指令引用 antiLoopDirective 常量 —— 那段话本身不是本次拆分的
 //     被测对象, 抄成字面量只会让"以后改指令措辞"多红一次假警报。
 //     结构上"它必须出现在末尾且只出现一次"仍被本比对钉住。
+//
 // ⚠️ 依赖块的尾部换行是 **2 个**而不是 3 个。初版手写成 3 个, 三个有依赖的角色全部
 // 报"1 字节不等价" —— 那不是拆分引入的偏移, 是 golden 写错了: 依赖块写入处是
 // `...blackboard key \`%s-result\`.\n\n`(workflow.go buildStagePromptWithRoles),

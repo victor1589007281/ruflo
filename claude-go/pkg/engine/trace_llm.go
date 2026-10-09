@@ -27,6 +27,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -49,6 +50,14 @@ type llmCallSpan struct {
 	Stream     bool
 	Attempt    int // 本 turn 内第几次调用 (0 起); 重试/fallback 时递增
 	Isolated   bool
+	// Handoff 标记这条 span 是 H3-3 的交接请求 (run 到了上限、让模型写下"进度 +
+	// 下一步"的那一次调用)。
+	//
+	// 为什么要单独标: 它长得像一次普通的 llm_call (同一套请求/响应字段), 但语义
+	// 完全不同 —— 它不推进任务, 且**只在 run 临终时**出现。不标的话, "这个 run 多
+	// 花了 5% token"在账本上无从解释, 而看见一次带工具的普通调用还会让人以为
+	// run 是被别的东西打断的。
+	Handoff bool
 }
 
 // writeLLMCallSpan 写一条 llm_call Span。TraceStore 未装配时是零成本 no-op。
@@ -73,9 +82,29 @@ func (e *QueryEngine) writeLLMCallSpan(ctx context.Context, in llmCallSpan) {
 	if in.Isolated {
 		attrs["isolated"] = true
 	}
+	// Handoff 与 "tools": 0 的关系是**充分不必要**: 交接请求天然不带工具, 但不带
+	// 工具的调用不止它一个 (见 RunIsolated 里 DisableTools 的思考型角色)。所以这枚
+	// 标记不能用 tools==0 推出来, 必须显式落 —— 账本里"这一次是临终交代"与
+	// "这一次是别的无工具调用"分不开时, 交接的成本就统计不出来。
+	if in.Handoff {
+		attrs["handoff"] = true
+	}
 	if in.Err != nil {
 		attrs["error"] = truncateForAttr(in.Err.Error())
 	}
+	// usage_reported 把"上游没报用量"与"上游报了 0"分开。
+	//
+	// 此前只有 in.Usage != nil 时才写 token 字段, 于是两种完全不同的情况
+	// 在 trace 里长得一模一样: 调用**失败**(流没有 message_start/message_delta,
+	// usage 天然为 nil) 与 provider **不上报用量**。实测 21226 条 llm_call 里
+	// 14697 条是 error (全部无 usage), 6529 条 success 里 6524 条有 —— 按整体
+	// 统计会得到"仅 30% 带 usage"这个**误导性**数字, 让人以为采集侧漏了 70%。
+	//
+	// 显式标记之后, "带用量比例"这类判据可以正确地按 status=success 分组计算,
+	// 不必再靠猜。同理 cache_creation_tokens: OpenAI 兼容与 Responses 两条
+	// 解析路径根本不构造该字段 (见 pkg/api/openai.go / responses.go), 所以
+	// 它恒为 0 是**语义缺失**, 不是"上游报了 0" —— 这也是靠本标记区分的。
+	attrs["usage_reported"] = in.Usage != nil
 	if in.Usage != nil {
 		attrs["input_tokens"] = in.Usage.InputTokens
 		attrs["output_tokens"] = in.Usage.OutputTokens
@@ -192,10 +221,7 @@ func renderAPIContent(content json.RawMessage) string {
 
 func truncateForAttr(s string) string {
 	const max = 300
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "…"
+	return textutil.Truncate(s, max, "…")
 }
 
 // itoa 避免为两处整数拼接引入 strconv (本文件其余部分不需要它)。
@@ -219,4 +245,21 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// UsageReported 判定一条 llm_call Span 是否带上游上报的用量。
+//
+// 存在的意义是把"没报"与"报了 0"分开 (见 writeLLMCallSpan 里的 usage_reported)。
+// 消费方 (预算闸门 / 看板 / 成本核算) 应当用本函数过滤, 而不是直接看
+// input_tokens 是否存在 —— 后者会把失败的调用误算成"零消耗"。
+func UsageReported(attrs map[string]any) bool {
+	v, ok := attrs["usage_reported"]
+	if !ok {
+		// 旧 Span 没有该字段: 退化为"有 input_tokens 即认为报过"。
+		// 兼容路径, 新 Span 一律显式带 usage_reported。
+		_, hasInput := attrs["input_tokens"]
+		return hasInput
+	}
+	b, ok := v.(bool)
+	return ok && b
 }

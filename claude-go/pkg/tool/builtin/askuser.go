@@ -9,8 +9,8 @@
 // 算法说明:
 //  1. 校验 question 非空，options 至少 2 项且每项 id、label 非空，id 互不重复。
 //  2. 将问题与选项打印到 stdout，提示输入格式：
-//       - 单选: 输入一个 option id
-//       - 多选: 输入多个 id，以英文逗号分隔
+//     - 单选: 输入一个 option id
+//     - 多选: 输入多个 id，以英文逗号分隔
 //  3. 使用 bufio 从 stdin 读取一行，trim 后解析。
 //  4. 校验所选 id 均为合法选项；多选去重保序；将最终选择格式化为明确文本返回给模型。
 package builtin

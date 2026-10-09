@@ -26,6 +26,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -34,6 +35,7 @@ import (
 	"sync"
 
 	"github.com/anthropic/claude-go/pkg/skills"
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 const (
@@ -65,6 +67,24 @@ type RoleRegistry struct {
 	// selector 技能选择器 (design/01 §4.7)。nil = 回落到下方的静态拼接逻辑,
 	// 这是默认值 —— 6 个下游平台的注入内容不能因引入选择器而变。
 	selector *SkillSelector
+	// sources 本注册表的装载来源 (21.8.12 W1), 与 asset.LoadRoots 的三档一一对应。
+	//
+	// 留下它 (而不只是在构造时用一次就丢) 是为了让**降级可见**: "这份角色表是从
+	// 哪几个目录来的、哪些目录根本没扫"与"表里有什么"是两个问题, 而后者正常
+	// 不代表前者正常 —— 一个来源全空与那个来源压根没被扫到, 在 Names() 上同形。
+	sources []RoleSource
+	// builtinCount 本注册表装了多少内置角色 (构造后不变)。
+	//
+	// 单独存一个数的理由: 读数里 "表里 40 个, 其中 37 个内置" 与 "表里 40 个"
+	// 回答的是不同的问题 —— 前者一眼看得出自定义那层贡献了几个, 后者看不出。
+	// 而"我放的文件生效了吗"正是靠这个差问出来的。
+	builtinCount int
+	// loadIssues 装载自定义角色时逐条记下的问题 (读不了 / JSON 坏 / 重名 / 名空)。
+	//
+	// 与日志并存的理由: 日志是滚动的, 而"现在这份注册表是怎么来的"必须能随时
+	// 回答 —— 面板与自报要的就是这个。注册表只增不减, 一张看起来正常的表既可能
+	// 是全部装载成功, 也可能是有三个文件因为重名被整份丢掉了。
+	loadIssues []string
 }
 
 // SetSkillSelector 启用技能选择器 (design/01 §4.7)。
@@ -93,14 +113,89 @@ func (rr *RoleRegistry) currentSelector() *SkillSelector {
 	return rr.selector
 }
 
-// NewRoleRegistry 创建角色注册表并注册所有内置角色。
+// RoleSource 一个角色定义的来源根 (21.8.12 W1)。
+//
+// Source 只用于读数 ("state:... 装了 3 个"), 不参与排序 —— 顺序就是优先级
+// (低 → 高), 由调用方给的顺序决定。与 asset.LoadRoots 的三档同名同序, 这不是
+// 巧合而是要求: 角色表与资产索引必须对"哪个目录里的定义赢"给出一致的答案,
+// 否则同一个文件在两处会表现出不同的可见性, 且不报错。
+type RoleSource struct {
+	Source string // "user" | "project" | "state"
+	Root   string
+}
+
+// ProductionRoleSources 按生产约定列出角色来源: user < project < state。
+//
+// 这是**唯一**拼来源的地方, 与 asset.DefaultRoots 同一条理由 —— 三个入口
+// (飞书 bot / CLI / dashboard) 各拼一遍必然漂移, 而漂移的表现是 21.8.7 记的那个
+// 症状: "在 A 处注册通过的工作流, 在 B 处运行时查不到它的角色, 静默降级到内联
+// prompt"。一个通过了校验的工作流, 运行时静默地不按它校验时的样子跑。
+//
+// home 取不到时该来源为空 (不报错); cwd / stateDir 为空时同理 —— CLI 的许多子命令
+// 没有 stateDir, 那不是异常。
+func ProductionRoleSources(cwd, stateDir string) []RoleSource {
+	var out []RoleSource
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		out = append(out, RoleSource{Source: "user", Root: home})
+	}
+	if cwd = strings.TrimSpace(cwd); cwd != "" {
+		out = append(out, RoleSource{Source: "project", Root: cwd})
+	}
+	if stateDir = strings.TrimSpace(stateDir); stateDir != "" {
+		out = append(out, RoleSource{Source: "state", Root: stateDir})
+	}
+	return out
+}
+
+// NewRoleRegistry 创建一个**只从 cwd 装载**自定义角色的注册表。
+//
+// 保留这个入口是给测试与 roles 子命令用的 (它们没有 stateDir 这个概念)。
+// **生产入口一律走 NewRoleRegistryForSources**: 只认 cwd 正是 21.8.7 那条
+// 功能正确性缺陷的形状 —— dashboard 用 <stateDir> 校验, 运行时用 cwd, 两条路
+// 看到的角色表不同, 而差异只在"某个 stage 静默退化成内联 prompt"上现形。
 func NewRoleRegistry(cwd string) *RoleRegistry {
+	return NewRoleRegistryFrom([]RoleSource{{Source: "project", Root: cwd}})
+}
+
+// NewRoleRegistryFor 按生产约定 (ProductionRoleSources) 建注册表。
+//
+// 三个生产入口都调这一个: 飞书 bot、CLI 的团队装配、dashboard 的四个校验点。
+// 它们此前各自传一个不同的根 (config.Cwd / cfg.StateDir / projectCwd()), 而
+// 同一个工作流在"校验"与"运行"两处看到的角色表因此可以不同。
+func NewRoleRegistryFor(cwd, stateDir string) *RoleRegistry {
+	return NewRoleRegistryFrom(ProductionRoleSources(cwd, stateDir))
+}
+
+// NewRoleRegistryFrom 创建角色注册表: 内置角色 + 各来源目录下的自定义角色。
+//
+// 来源按给定顺序装载, **先加载者优先**: 重名一律拒绝 (见 registerLocked 与 21.8.12
+// P3 负 3), 所以先扫到的那个来源赢。
+//
+// ⚠️ 这与 asset.standardSources 的覆盖方向**相反**, 是刻意的, 别顺手"改齐":
+// 资产索引的覆盖语义是"后一个根里的同名资产盖掉前一个"; 角色表这里重名是**拒绝**
+// 而不是覆盖 —— 覆盖一个角色名会让一批既有工作流在定义一个字没改的情况下换行为
+// (读它的 stage / subagent_type / 工具档位回退全按名字取), 而拒绝 + 一条装载问题
+// 至少是可发现的。两条纪律方向不同, 是因为"资产"与"角色名"被引用的方式不同。
+//
+// 顺序因此仍然重要 (它决定谁赢), ProductionRoleSources 给的是 user < project < state。
+func NewRoleRegistryFrom(sources []RoleSource) *RoleRegistry {
+	// cwd 仍取 project 来源的根: 它只用于解析角色专属技能的相对路径
+	// (skills.DetectProjectProfile 与文件型 skill), 与"去哪几个目录找角色"无关。
+	cwd := ""
+	for _, s := range sources {
+		if s.Source == "project" {
+			cwd = s.Root
+			break
+		}
+	}
 	rr := &RoleRegistry{
-		roles: make(map[string]*RoleDef),
-		cwd:   cwd,
+		roles:   make(map[string]*RoleDef),
+		cwd:     cwd,
+		sources: append([]RoleSource(nil), sources...),
 	}
 	rr.profile = skills.DetectProjectProfile(cwd)
 	rr.registerBuiltins()
+	rr.builtinCount = len(rr.roles)
 
 	// market-radar 专用：格式中立的结构化输出器（不套 HEV/投资报告等模板，避免污染 JSON 产出）
 	rr.roles["mr-emitter"] = &RoleDef{
@@ -113,13 +208,79 @@ func NewRoleRegistry(cwd string) *RoleRegistry {
 			"第一个字符必须是 { ，最后一个字符必须是 } 。\n\n任务: {objective}",
 	}
 
-	// 尝试从磁盘加载用户自定义角色
-	for _, customDir := range defaultRoleDirs(cwd) {
-		rr.loadCustomRoles(customDir)
+	// 从磁盘加载用户自定义角色。逐来源**逐目录**扫, 每一条问题都带来源名 ——
+	// "哪个目录里的东西没生效"是 W3 要回答的第一个问题。
+	for _, src := range sources {
+		for _, dir := range roleDirsFor(src) {
+			rr.loadCustomRoles(dir, src.Source)
+		}
 	}
 	rr.initRecommendedSkills()
 
+	// 装载收尾一行汇总: 内置个数 + 各来源贡献 + 问题条数。降级可见的最低要求是
+	// "这份表从哪来"能被一眼读到, 而不是靠翻一串 [Roles] 行数着看。
+	log.Printf("[Roles] %s", rr.DescribeSources())
 	return rr
+}
+
+// DescribeSources 一行说明这份角色表的来源与装载结果 (W3 的读数面)。
+//
+// 列出**每一个**来源根 (含那些一个角色都没装到的), 因为"某来源没贡献角色"与
+// "某来源压根没被扫"是两件事: 前者通常是正常的 (新机器上 .claude/agents 不存在),
+// 后者一定是接线漏了。只列有贡献的来源, 恰好把这个区分抹掉。
+func (rr *RoleRegistry) DescribeSources() string {
+	if rr == nil {
+		return "role registry: (nil)"
+	}
+	rr.mu.RLock()
+	total := len(rr.roles)
+	issues := len(rr.loadIssues)
+	rr.mu.RUnlock()
+	var b strings.Builder
+	fmt.Fprintf(&b, "角色表 %d 个 (内置 %d, 自定义 %d)", total, rr.builtinCount, total-rr.builtinCount)
+	if len(rr.sources) == 0 {
+		b.WriteString(" | 无自定义来源 (只装了内置角色)")
+	}
+	for _, s := range rr.sources {
+		dirs := roleDirsFor(s)
+		var present []string
+		for _, d := range dirs {
+			if st, err := os.Stat(d); err == nil && st.IsDir() {
+				present = append(present, d)
+			}
+		}
+		if len(present) == 0 {
+			fmt.Fprintf(&b, " | %s:根 %s 下无 agents 目录", s.Source, s.Root)
+			continue
+		}
+		fmt.Fprintf(&b, " | %s:%s", s.Source, strings.Join(present, ","))
+	}
+	if issues > 0 {
+		fmt.Fprintf(&b, " | 装载问题 %d 条 (见上文 [Roles] 行)", issues)
+	}
+	return b.String()
+}
+
+// LoadIssues 返回装载自定义角色时记下的问题 (副本)。
+func (rr *RoleRegistry) LoadIssues() []string {
+	if rr == nil {
+		return nil
+	}
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	return append([]string(nil), rr.loadIssues...)
+}
+
+// recordLoadIssue 记一条装载问题 (日志与可回读清单各一份)。
+//
+// 两者都要: 日志回答"刚才启动时发生了什么"(它带时间戳, 能对上别的组件的日志),
+// 清单回答"现在这份表是怎么来的"(面板/自报要, 且不受日志轮转影响)。
+func (rr *RoleRegistry) recordLoadIssue(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	log.Printf("[Roles] %s", msg)
+	rr.mu.Lock()
+	rr.loadIssues = append(rr.loadIssues, msg)
+	rr.mu.Unlock()
 }
 
 // Get 获取角色定义 (不存在则返回 nil)。
@@ -159,10 +320,7 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 			if err != nil {
 				continue
 			}
-			content := string(data)
-			if len(content) > maxRoleFileSkillChars {
-				content = content[:maxRoleFileSkillChars] + "...(truncated)"
-			}
+			content := textutil.Truncate(string(data), maxRoleFileSkillChars, "...(truncated)")
 			skillContent.WriteString(fmt.Sprintf("### Skill: %s\n%s\n\n", filepath.Base(sp), content))
 		}
 		// 内置技能名单: 有选择器就交给它 (预算感知 + 相关性补选, design/01 §4.7),
@@ -187,10 +345,7 @@ func (rr *RoleRegistry) MergedPrompt(roleName, objective, prevResult string) str
 			if !ok {
 				continue
 			}
-			content := skill.Body
-			if len(content) > maxRoleBuiltinSkillChars {
-				content = content[:maxRoleBuiltinSkillChars] + "...(truncated)"
-			}
+			content := textutil.Truncate(skill.Body, maxRoleBuiltinSkillChars, "...(truncated)")
 			skillContent.WriteString(fmt.Sprintf("### Skill: %s\n%s\n\n", skill.Name, content))
 		}
 		skillContent.WriteString("</role_skills>")
@@ -213,38 +368,107 @@ func (rr *RoleRegistry) ListByCategory(category string) []*RoleDef {
 	return result
 }
 
-// RegisterCustom 注册用户自定义角色。
-func (rr *RoleRegistry) RegisterCustom(role *RoleDef) {
-	if role == nil || role.Name == "" {
-		return
+// ErrRoleNameTaken 角色名与**内置角色**冲突 (21.8.12 P3 负 3)。
+//
+// 单独成哨兵: 与"磁盘文件坏了"不同, 这一条是**用法错误**, 调用方该报给用户看,
+// 而加载器该把它当成一次**拒绝**而不是一次降级。
+var ErrRoleNameTaken = errors.New("agent: 角色名与内置角色冲突")
+
+// NameTakenError 一次被拒的注册, 带上撞上的那个名字。
+type NameTakenError struct {
+	Name   string
+	Source string // 撞上的是内置还是另一个自定义角色 (供报错说清楚)
+}
+
+func (e *NameTakenError) Error() string {
+	return fmt.Sprintf("角色名 %q 已被%s占用; 自定义角色不得覆盖它 (要改内置, 请另起一个名字)", e.Name, e.Source)
+}
+
+func (e *NameTakenError) Unwrap() error { return ErrRoleNameTaken }
+
+// RegisterCustom 注册用户自定义角色。**重名一律拒绝**, 不覆盖 (21.8.12 P3 负 3)。
+//
+// 改造前这里是 `rr.roles[role.Name] = role`, 无条件覆盖 —— 注册一个叫 `coder` 的角色
+// 会**无声吃掉内置的 coder**。这是"调用点凭名字继承角色归属"的姊妹形态: 覆盖者与被
+// 覆盖者双方都不知道发生了替换, 而下游 (工作流阶段、`subagent_type`、工具档位回退)
+// 全部按名字取, 于是一次注册能让一批既有工作流在**定义一个字没改**的情况下换行为。
+//
+// 返回 error 而不是静默忽略: 改造前的签名是 `func(role *RoleDef)`, 调用方无从知道
+// 自己有没有生效 —— "注册了但列表里没有"这个症状在 21.7.3 已经报过一次了。
+//
+// 顺带把原有的两条静默路径也变成显式的: 传 nil / 名字为空此前是**无声 return**,
+// 现在报错。它们在生产上只可能来自调用方的 bug, 静默只会让 bug 晚一步被发现。
+func (rr *RoleRegistry) RegisterCustom(role *RoleDef) error {
+	if role == nil {
+		return fmt.Errorf("角色定义为空")
 	}
+	name := strings.TrimSpace(role.Name)
+	if name == "" {
+		return fmt.Errorf("角色名不能为空")
+	}
+	role.Name = name
+	return rr.registerLocked(role, "内置角色")
+}
+
+// registerLocked 唯一一处往 rr.roles 里写自定义角色的地方 (带重名守卫)。
+//
+// 收成一处是必要的: 改造前 RegisterCustom 与 loadCustomRoles 各自 `rr.roles[name] = role`
+// 了一遍, 而**守卫只要落在一处, 另一处就是个洞** —— 手工 PUT 会被拒、放进目录里的
+// 同名文件却照样覆盖。这正是 [[redundant-defenses-mask-each-other-in-mutation]] 里
+// "同一条声明在多条路径上各有独立实现"的形态。
+func (rr *RoleRegistry) registerLocked(role *RoleDef, source string) error {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
+	if _, exists := rr.roles[role.Name]; exists {
+		return &NameTakenError{Name: role.Name, Source: source}
+	}
 	rr.roles[role.Name] = role
+	return nil
 }
 
 // loadCustomRoles 从磁盘加载用户自定义角色。
-// 目录结构: .claude/agents/{role-name}.json
-func (rr *RoleRegistry) loadCustomRoles(dir string) {
+// 目录结构: <root>/.claude/agents/{role-name}.json 或 <root>/.claude-go/agents/{role-name}.json
+//
+// 四类失败 (读不了 / JSON 坏 / 名空 / 重名) 此前一律 `continue` 一个字都不报 —— 见
+// pkg/asset/load.go 文件头把这一段当作反面教材的论证。这里改为**同时进日志与
+// 可回读清单** (recordLoadIssue): 目录里放一个与内置同名的文件是用户看得见的动作,
+// 而它的后果 (整个文件被无声忽略) 必须能在这台机器的日志里查到, 否则"我放进去
+// 怎么没反应"无从查起。
+//
+// source 是来源档位名 (user/project/state), 进每一条问题里 —— 只报路径不报档位,
+// 排查时要先自己判断这个路径属于哪个入口, 而判断依据 (这次是用 cwd 还是 stateDir
+// 建的注册表) 恰恰是看不见的那一项。
+func (rr *RoleRegistry) loadCustomRoles(dir, source string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return // 目录不存在是常态 (新机器上一个自定义角色都没有)
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
 		if err != nil {
+			rr.recordLoadIssue("[%s] 跳过 %s: 读取失败: %v", source, path, err)
 			continue
 		}
 		var role RoleDef
-		if json.Unmarshal(data, &role) == nil && role.Name != "" {
-			rr.mu.Lock()
-			rr.roles[role.Name] = &role
-			rr.mu.Unlock()
-			log.Printf("[Roles] 加载自定义角色: %s (%s)", role.Name, role.Category)
+		if err := json.Unmarshal(data, &role); err != nil {
+			rr.recordLoadIssue("[%s] 跳过 %s: JSON 解析失败: %v", source, path, err)
+			continue
 		}
+		if strings.TrimSpace(role.Name) == "" {
+			rr.recordLoadIssue("[%s] 跳过 %s: 缺少 name 字段", source, path)
+			continue
+		}
+		// 磁盘上的自定义角色之间重名也拒绝: 后加载的目录 (后加载者优先的方向)
+		// 会静默吃掉先加载的, 而两个目录里的文件**都在**, 用户看得见两份。
+		if err := rr.registerLocked(&role, "已有角色 (含更早加载的自定义角色)"); err != nil {
+			rr.recordLoadIssue("[%s] 跳过 %s: %v", source, path, err)
+			continue
+		}
+		log.Printf("[Roles] 加载自定义角色: %s (%s, 来源 %s)", role.Name, role.Category, source)
 	}
 }
 
@@ -467,15 +691,36 @@ func baseRoleFor(name string) string {
 	}
 }
 
-func defaultRoleDirs(cwd string) []string {
-	var dirs []string
-	if cwd != "" {
-		dirs = append(dirs,
-			filepath.Join(cwd, ".claude", "agents"),
-			filepath.Join(cwd, ".claude-go", "agents"),
-		)
+// roleDirsFor 一个来源根下的角色目录 (21.8.12 W1)。
+//
+// ★ 这里有一处**必须交代的不对称**: 角色目录是 `<root>/.claude/agents` 与
+// `<root>/.claude-go/agents`, 而资产 (asset.standardSources) 在同名根下扫的是
+// `<root>/agents`。两者只差一个路径段, 正是"统一 root"这件事看起来可以直接替换、
+// 实则不能的地方。
+//
+// 不统一的原因很实在: `.claude/agents/*.md` 是 Claude Code 的既有约定, 用户机器上
+// 已经存在的那些文件必须继续被认; 而 `<state>/agents` 是 basedir.Layout 声明并由
+// EnsureAll 幂等创建的 claude-go 目录, 资产索引读的就是它。同一个根下两个约定并存,
+// 是兼容性要求而不是设计选择 —— 把它"统一"成其中一个, 代价是另一批文件静默失效。
+//
+// 于是这里的口径是: **同一个来源根, 两处都要扫到**, 而不是"两处扫同一个子目录"。
+// 只有来源根 (user/project/state 三档) 才是必须一致的那一层 —— 它一致了,
+// "校验时看到的角色表"与"运行时用的角色表"就一致; 子目录差异只影响"哪个文件被认",
+// 且两个约定都认, 不存在一方看得见另一方看不见的形态。
+//
+// 顺序: `.claude` 在前、`.claude-go` 在后 ⇒ 同名时后者赢 (claude-go 自己的约定
+// 优先于兼容约定)。这与 asset 的 .claude-go → .claude 顺序**相反**, 是有意的:
+// 资产那边没有"更早存在的用户文件"这层包袱 (它扫的是 <root>/agents 一个目录),
+// 而角色这边 .claude 常常装着用户别处拷来的历史文件, 不该压过 claude-go 自己的。
+func roleDirsFor(src RoleSource) []string {
+	root := strings.TrimSpace(src.Root)
+	if root == "" {
+		return nil
 	}
-	return dirs
+	return []string{
+		filepath.Join(root, ".claude", "agents"),
+		filepath.Join(root, ".claude-go", "agents"),
+	}
 }
 
 func uniqueRoleStrings(values []string) []string {

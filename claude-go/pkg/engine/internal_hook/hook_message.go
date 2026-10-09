@@ -35,23 +35,23 @@ func (h *MessageFilterHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreRequest}
 }
 
-// Execute 执行消息过滤与压缩。若消息数量无变化则仍返回过滤后的结果（内容可能被压缩）。
+// Execute 已停用历史改写。
+//
+// 原先这里做两件改写历史的事, 两件都会打碎前缀缓存:
+//
+//  1. FilterPureToolUseUnits(msgs, 6) —— 每轮重算的滑动窗口。窗口随 len(messages)
+//     前移, 一条上一轮还在的消息这轮被删, 其后所有位置的字节整体前移;
+//  2. CompressMessageContent —— 对 i < len-4 的**全部**古老 tool_result 做停用词级
+//     压缩, 作用范围随消息增长而扩大, 且结果不是内容的纯函数 (依赖行数、停用词
+//     命中率), 同一段文本在不同轮次可能压出不同字节。
+//
+// 现在两者都不再作用于历史。历史的收敛统一交给 AutoCompact 的折叠边界 (一次性、
+// 纯函数占位), 本轮新增消息的瘦身交给 MicroCompactHook 的水位线区间。
+//
+// 返回 nil 表示"不介入", HookChain 原样透传 ctx.Messages —— 不产生覆盖写, 也就
+// 不会有任何意外改写。
 func (h *MessageFilterHook) Execute(ctx *HookContext) (*HookResult, error) {
-	// 优化1: 过滤不含 reasoning 的古老 assistant + tool_result 原子单元
-	messages := FilterPureToolUseUnits(ctx.Messages, 6)
-
-	// 优化5: 对古老的 user tool_result 做轻量级内容压缩
-	for i := range messages {
-		if messages[i].Type == types.MessageTypeUser && i < len(messages)-4 {
-			messages[i] = CompressMessageContent(messages[i])
-		}
-	}
-
-	if len(messages) != len(ctx.Messages) {
-		logging.For("engine").Debug("MessageFilter applied", "before", len(ctx.Messages), "after", len(messages))
-	}
-
-	return &HookResult{Messages: messages}, nil
+	return nil, nil
 }
 
 // ============================================================================

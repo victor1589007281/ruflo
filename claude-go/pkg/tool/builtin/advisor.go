@@ -18,8 +18,10 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -378,16 +380,15 @@ func renderTranscriptEntry(msg types.Message) string {
 
 // truncateHead 保留头部。
 func truncateHead(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + fmt.Sprintf("... [+%d chars]", len(s)-max)
+	return textutil.Truncate(s, max, fmt.Sprintf("... [+%d chars]", utf8.RuneCountInString(s)-max))
 }
 
 // truncateTail 保留尾部 (tool_result 的错误信息/结论通常在尾部)。
 func truncateTail(s string, max int) string {
-	if len(s) <= max {
+	n := utf8.RuneCountInString(s)
+	if n <= max {
 		return s
 	}
-	return fmt.Sprintf("[%d chars truncated] ...", len(s)-max) + s[len(s)-max:]
+	r := []rune(s)
+	return fmt.Sprintf("[%d chars truncated] ...", n-max) + string(r[n-max:])
 }

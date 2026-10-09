@@ -52,9 +52,9 @@ func eqTestWorkflow() *WorkflowDef {
 		Name: "graph-eq-test",
 		Mode: "pipeline",
 		Stages: []StageDef{
-			{Name: "research", Role: "researcher", Prompt: "调研 {objective}"},
-			{Name: "draft", Role: "writer", Prompt: "基于 {prev_result} 起草", DependsOn: []string{"research"}},
-			{Name: "review", Role: "critic", Prompt: "评审 {prev_result}", DependsOn: []string{"draft"}},
+			{Name: "research", Agent: "researcher", Prompt: "调研 {objective}"},
+			{Name: "draft", Agent: "writer", Prompt: "基于 {prev_result} 起草", DependsOn: []string{"research"}},
+			{Name: "review", Agent: "critic", Prompt: "评审 {prev_result}", DependsOn: []string{"draft"}},
 		},
 	}
 }
@@ -238,8 +238,8 @@ func TestGateConditionRouting(t *testing.T) {
 		Name: "gate-routing",
 		Mode: "graph",
 		Stages: []StageDef{
-			{Name: "coder", Role: "coder", Prompt: "写代码 {objective}"},
-			{Name: "compile-gate", Role: "gate", Prompt: "", DependsOn: []string{"coder"}},
+			{Name: "coder", Agent: "coder", Prompt: "写代码 {objective}"},
+			{Name: "compile-gate", Agent: "gate", Prompt: "", DependsOn: []string{"coder"}},
 		},
 	}
 	spec, err := TranslateWorkflow(wf)
@@ -259,13 +259,13 @@ func TestGateConditionRouting(t *testing.T) {
 }
 
 func TestStageIsGate(t *testing.T) {
-	if !stageIsGate(StageDef{Name: "compile-gate", Role: "gate"}) {
+	if !stageIsGate(StageDef{Name: "compile-gate", Agent: "gate"}) {
 		t.Error("含 gate 应识别为门禁")
 	}
-	if !stageIsGate(StageDef{Name: "质量门禁", Role: "critic"}) {
+	if !stageIsGate(StageDef{Name: "质量门禁", Agent: "critic"}) {
 		t.Error("含门禁应识别")
 	}
-	if stageIsGate(StageDef{Name: "coder", Role: "coder"}) {
+	if stageIsGate(StageDef{Name: "coder", Agent: "coder"}) {
 		t.Error("普通 coder 不应识别为门禁")
 	}
 }
@@ -306,8 +306,8 @@ func TestTranslateFillsRetryBudgetAndMeta(t *testing.T) {
 		Name: "development", // 内置产码工作流: 元数据必须判定为 ProducesCode
 		Mode: "pipeline",
 		Stages: []StageDef{
-			{Name: "plan", Role: "architect", Prompt: "设计 {objective}"},
-			{Name: "code", Role: "coder", Prompt: "实现 {prev_result}", DependsOn: []string{"plan"}},
+			{Name: "plan", Agent: "architect", Prompt: "设计 {objective}"},
+			{Name: "code", Agent: "coder", Prompt: "实现 {prev_result}", DependsOn: []string{"plan"}},
 		},
 	}
 	spec, err := TranslateWorkflow(wf)
@@ -352,9 +352,9 @@ func TestTranslateGateDeterministic(t *testing.T) {
 		Name: "graph-gate-meta",
 		Mode: "graph",
 		Stages: []StageDef{
-			{Name: "coder", Role: "coder", Prompt: "写码"},
-			{Name: "compile-gate", Role: "gate", DependsOn: []string{"coder"}},
-			{Name: "content-gate", Role: "critic", DependsOn: []string{"coder"}},
+			{Name: "coder", Agent: "coder", Prompt: "写码"},
+			{Name: "compile-gate", Agent: "gate", DependsOn: []string{"coder"}},
+			{Name: "content-gate", Agent: "critic", DependsOn: []string{"coder"}},
 		},
 	}
 	spec, err := TranslateWorkflow(wf)
@@ -392,10 +392,10 @@ func TestGraphOverrideRoutesByGateScoreAndSkipIsNotFailure(t *testing.T) {
 		Name: name,
 		Mode: "graph",
 		Stages: []StageDef{
-			{Name: "coder", Role: "coder", Prompt: "写码 {objective}"},
-			{Name: "compile-gate", Role: "gate", DependsOn: []string{"coder"}},
-			{Name: "ship", Role: "writer", Prompt: "交付 {prev_result}", DependsOn: []string{"compile-gate"}},
-			{Name: "fix", Role: "coder", Prompt: "修 {prev_result}", DependsOn: []string{"compile-gate"}},
+			{Name: "coder", Agent: "coder", Prompt: "写码 {objective}"},
+			{Name: "compile-gate", Agent: "gate", DependsOn: []string{"coder"}},
+			{Name: "ship", Agent: "writer", Prompt: "交付 {prev_result}", DependsOn: []string{"compile-gate"}},
+			{Name: "fix", Agent: "coder", Prompt: "修 {prev_result}", DependsOn: []string{"compile-gate"}},
 		},
 	}
 	RegisterGraphOverride(name, WorkflowGraphOverride{Stages: map[string]StageGraphOverride{
@@ -471,7 +471,7 @@ func TestGraphNodeRetryTakesEffect(t *testing.T) {
 	t.Cleanup(func() { UnregisterGraphOverride(name) })
 
 	wf := &WorkflowDef{Name: name, Mode: "graph", Stages: []StageDef{
-		{Name: "solo", Role: "writer", Prompt: "干活 {objective}"},
+		{Name: "solo", Agent: "writer", Prompt: "干活 {objective}"},
 	}}
 	var calls atomic.Int64
 	we := newProgExecutor(func(_ context.Context, _, _ string) (string, error) {
@@ -562,7 +562,7 @@ func TestGraphOverrideLoopFeedback(t *testing.T) {
 	t.Cleanup(func() { UnregisterGraphOverride(name) })
 
 	wf := &WorkflowDef{Name: name, Mode: "graph", Stages: []StageDef{
-		{Name: "polish", Role: "writer", Prompt: "润色 {objective}"},
+		{Name: "polish", Agent: "writer", Prompt: "润色 {objective}"},
 	}}
 	spec, err := TranslateWorkflow(wf)
 	if err != nil {
@@ -602,7 +602,7 @@ func TestGraphOverrideToolProfileAndMaxTurns(t *testing.T) {
 	t.Cleanup(func() { UnregisterGraphOverride(name) })
 
 	wf := &WorkflowDef{Name: name, Mode: "graph", Stages: []StageDef{
-		{Name: "dig", Role: "researcher", Prompt: "调研 {objective}"},
+		{Name: "dig", Agent: "researcher", Prompt: "调研 {objective}"},
 	}}
 	var gotProfile atomic.Value
 	var gotTurns atomic.Int64
@@ -647,8 +647,8 @@ func TestGraphOverridesFromJSON(t *testing.T) {
 	}
 
 	wf := &WorkflowDef{Name: name, Mode: "graph", Stages: []StageDef{
-		{Name: "a", Role: "writer", Prompt: "一"},
-		{Name: "b", Role: "critic", Prompt: "二", DependsOn: []string{"a"}},
+		{Name: "a", Agent: "writer", Prompt: "一"},
+		{Name: "b", Agent: "critic", Prompt: "二", DependsOn: []string{"a"}},
 	}}
 	spec, err := TranslateWorkflow(wf)
 	if err != nil {
@@ -685,7 +685,7 @@ func TestGraphOverrideKindAgentSuppressesGateKeyword(t *testing.T) {
 	}})
 	t.Cleanup(func() { UnregisterGraphOverride(name) })
 	wf := &WorkflowDef{Name: name, Mode: "graph", Stages: []StageDef{
-		{Name: "质量门禁说明", Role: "writer", Prompt: "写说明"},
+		{Name: "质量门禁说明", Agent: "writer", Prompt: "写说明"},
 	}}
 	spec, err := TranslateWorkflow(wf)
 	if err != nil {
@@ -763,9 +763,9 @@ func fanoutTestWorkflow(name string) *WorkflowDef {
 		Name: name,
 		Mode: "graph",
 		Stages: []StageDef{
-			{Name: "src", Role: "researcher", Prompt: "列清单 {objective}"},
-			{Name: "fan", Role: "writer", Prompt: "处理一片 {prev_result}", DependsOn: []string{"src"}},
-			{Name: "merge", Role: "writer", Prompt: "汇总 {prev_result}", DependsOn: []string{"fan"}},
+			{Name: "src", Agent: "researcher", Prompt: "列清单 {objective}"},
+			{Name: "fan", Agent: "writer", Prompt: "处理一片 {prev_result}", DependsOn: []string{"src"}},
+			{Name: "merge", Agent: "writer", Prompt: "汇总 {prev_result}", DependsOn: []string{"fan"}},
 		},
 	}
 }
@@ -927,10 +927,10 @@ func TestFoldStageGroupsIntoLoopGroup(t *testing.T) {
 		Name: name,
 		Mode: "graph",
 		Stages: []StageDef{
-			{Name: "plan", Role: "researcher", Prompt: "计划"},
-			{Name: "gen", Role: "writer", Prompt: "写", DependsOn: []string{"plan"}},
-			{Name: "check", Role: "critic", Prompt: "查 {prev_result}", DependsOn: []string{"gen"}},
-			{Name: "ship", Role: "writer", Prompt: "交付", DependsOn: []string{"check"}},
+			{Name: "plan", Agent: "researcher", Prompt: "计划"},
+			{Name: "gen", Agent: "writer", Prompt: "写", DependsOn: []string{"plan"}},
+			{Name: "check", Agent: "critic", Prompt: "查 {prev_result}", DependsOn: []string{"gen"}},
+			{Name: "ship", Agent: "writer", Prompt: "交付", DependsOn: []string{"check"}},
 		},
 	}
 	RegisterGraphOverride(name, WorkflowGraphOverride{
@@ -989,9 +989,9 @@ func TestFoldStageGroupsIntoLoopGroup(t *testing.T) {
 func TestFoldStageGroupsErrors(t *testing.T) {
 	base := func() *WorkflowDef {
 		return &WorkflowDef{Name: "g", Mode: "graph", Stages: []StageDef{
-			{Name: "a", Role: "writer", Prompt: "a"},
-			{Name: "b", Role: "critic", Prompt: "b", DependsOn: []string{"a"}},
-			{Name: "c", Role: "writer", Prompt: "c"}, // 与 a 无边: 用于构造组产出歧义
+			{Name: "a", Agent: "writer", Prompt: "a"},
+			{Name: "b", Agent: "critic", Prompt: "b", DependsOn: []string{"a"}},
+			{Name: "c", Agent: "writer", Prompt: "c"}, // 与 a 无边: 用于构造组产出歧义
 		}}
 	}
 	cases := []struct {
@@ -1031,9 +1031,9 @@ func TestGraphLoopGroupEndToEnd(t *testing.T) {
 	wf := &WorkflowDef{
 		Name: name, Mode: "graph",
 		Stages: []StageDef{
-			{Name: "gen", Role: "writer", Prompt: "写稿"},
-			{Name: "check", Role: "critic", Prompt: "审 {prev_result}", DependsOn: []string{"gen"}},
-			{Name: "ship", Role: "writer", Prompt: "交付", DependsOn: []string{"check"}},
+			{Name: "gen", Agent: "writer", Prompt: "写稿"},
+			{Name: "check", Agent: "critic", Prompt: "审 {prev_result}", DependsOn: []string{"gen"}},
+			{Name: "ship", Agent: "writer", Prompt: "交付", DependsOn: []string{"check"}},
 		},
 	}
 	RegisterGraphOverride(name, WorkflowGraphOverride{Groups: []StageGroupOverride{{
@@ -1163,8 +1163,8 @@ func TestGraphExpandEndToEnd(t *testing.T) {
 		Stages: []StageDef{
 			// 刻意不叫 plan / planner 角色: 那会触发 workflow.go 的 WBS 强校验,
 			// 与本测试要验的展开解析无关。
-			{Name: "decompose", Role: "architect", Prompt: "分解 {objective}"},
-			{Name: "sum", Role: "writer", Prompt: "汇总 {prev_result}", DependsOn: []string{"decompose"}},
+			{Name: "decompose", Agent: "architect", Prompt: "分解 {objective}"},
+			{Name: "sum", Agent: "writer", Prompt: "汇总 {prev_result}", DependsOn: []string{"decompose"}},
 		},
 	}
 	RegisterGraphOverride(name, WorkflowGraphOverride{Stages: map[string]StageGraphOverride{
@@ -1234,7 +1234,7 @@ func TestGraphExpandOnlyWhenAuthorized(t *testing.T) {
 	const name = "graph-expand-unauth"
 	wf := &WorkflowDef{
 		Name: name, Mode: "graph",
-		Stages: []StageDef{{Name: "decompose", Role: "architect", Prompt: "分解"}},
+		Stages: []StageDef{{Name: "decompose", Agent: "architect", Prompt: "分解"}},
 	}
 	var mu sync.Mutex
 	ran := map[string]int{}

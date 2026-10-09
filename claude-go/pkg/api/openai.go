@@ -404,8 +404,11 @@ type openAIStreamTranslator struct {
 	trailing       strings.Builder // 工具块打开后到来的文本 (极少数交错), finish 时补发
 
 	toolBlocks map[int]*openAIToolState
-	toolOrder  []int // 出现顺序, 用于关闭
-	usage      *types.Usage
+	// openTool 当前**开着**的工具块 (OpenAI tool_call index); -1 = 没有。
+	// 引擎同一时刻只跟踪一个当前块, 所以它是"该关谁"的唯一依据 ——
+	// 不能靠遍历全部工具块去关, 那正是并行开块的成因 (见包注释)。
+	openTool int
+	usage    *types.Usage
 }
 
 type openAIToolState struct {
@@ -417,7 +420,7 @@ type openAIToolState struct {
 }
 
 func newOpenAIStreamTranslator(model string) *openAIStreamTranslator {
-	return &openAIStreamTranslator{model: model, toolBlocks: map[int]*openAIToolState{}}
+	return &openAIStreamTranslator{model: model, toolBlocks: map[int]*openAIToolState{}, openTool: -1}
 }
 
 // openAIUsage 流式 usage (chat.completion.chunk 尾帧 / 非流式 usage)。opencode 等上游
@@ -529,11 +532,22 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 
 		// 2) 工具调用增量
 		for _, tc := range ch.Delta.ToolCalls {
+			// 切到新的 tool_call index 之前, 先把上一个工具块关掉 —— 引擎同一时刻
+			// 只跟踪一个当前块 (见包注释 "绝不并行开两个块")。若把关闭一路推迟到
+			// finish_reason, ≥2 个工具调用就会同时开着: content_block_start 覆盖
+			// currentBlock, 结果是**丢掉前一个、复制最后一个** (实测 opencode 双工具
+			// 回合: Glob 被丢, Shell 出现两次), 两份 tool 结果因此带上同一个
+			// tool_call_id, 上游直接判 400 invalid request。
+			if t.openTool >= 0 && t.openTool != tc.Index {
+				if prev := t.toolBlocks[t.openTool]; prev != nil && prev.started {
+					out = append(out, types.StreamDelta{Type: "content_block_stop", Index: prev.blockIndex})
+				}
+				t.openTool = -1
+			}
 			st := t.toolBlocks[tc.Index]
 			if st == nil {
 				st = &openAIToolState{id: tc.ID}
 				t.toolBlocks[tc.Index] = st
-				t.toolOrder = append(t.toolOrder, tc.Index)
 			}
 			if tc.ID != "" {
 				st.id = tc.ID
@@ -548,6 +562,7 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 			}
 			if !st.started {
 				st.started = true
+				t.openTool = tc.Index
 				st.blockIndex = t.nextBlockIndex
 				t.nextBlockIndex++
 				id := st.id
@@ -588,8 +603,13 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 				t.textOpen = false
 				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: t.textBlockIndex})
 			}
-			for _, idx := range t.toolOrder {
-				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: t.toolBlocks[idx].blockIndex})
+			// 关掉仍开着的那一个工具块。其余工具块在切换 index 时已经逐个关过 ——
+			// 引擎只跟踪一个当前块, 这里不能遍历全部去关。
+			if t.openTool >= 0 {
+				if st := t.toolBlocks[t.openTool]; st != nil && st.started {
+					out = append(out, types.StreamDelta{Type: "content_block_stop", Index: st.blockIndex})
+				}
+				t.openTool = -1
 			}
 			if t.trailing.Len() > 0 {
 				bi := t.nextBlockIndex

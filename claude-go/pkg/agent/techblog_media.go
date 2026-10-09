@@ -118,10 +118,10 @@ func stripMarkdownForTTS(md string) string {
 
 // articleImageSpec 一张配图的规格 (由 LLM 从文章提炼)。
 type articleImageSpec struct {
-	Title   string `json:"title"`   // 图标题/要点
+	Title   string   `json:"title"`  // 图标题/要点
 	Points  []string `json:"points"` // 卡片要点 (2-4 条)
-	Visual  string `json:"visual"`  // 视觉/示意描述 (AI 插画风格用)
-	IsCover bool   `json:"is_cover"`
+	Visual  string   `json:"visual"` // 视觉/示意描述 (AI 插画风格用)
+	IsCover bool     `json:"is_cover"`
 }
 
 // ExtractImageSpecs 让 LLM 从文章提炼 n 张配图规格 (第一张作封面)。

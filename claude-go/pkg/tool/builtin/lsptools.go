@@ -20,18 +20,18 @@ import (
 )
 
 const (
-	LSPToolName                = "LSP"
-	ConfigToolName             = "Config"
-	SkillToolName              = "Skill"
-	StructuredOutputToolName   = "StructuredOutput"
-	ToolSearchToolName         = "ToolSearch"
+	LSPToolName              = "LSP"
+	ConfigToolName           = "Config"
+	SkillToolName            = "Skill"
+	StructuredOutputToolName = "StructuredOutput"
+	ToolSearchToolName       = "ToolSearch"
 )
 
 var validLSPOperations = map[string]struct{}{
-	"goToDefinition":   {},
-	"findReferences": {},
-	"hover":          {},
-	"documentSymbol": {},
+	"goToDefinition":  {},
+	"findReferences":  {},
+	"hover":           {},
+	"documentSymbol":  {},
 	"workspaceSymbol": {},
 }
 

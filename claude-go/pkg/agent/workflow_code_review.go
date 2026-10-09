@@ -8,7 +8,8 @@
 //   - Qodo PR-Agent: 开源 PR 审查工具
 //
 // 执行流程:
-//   代码摄入 ∥ 上下文检索 → 合并上下文 → 4路专家并行审查 → 对抗质疑 → 测试验证 → 报告生成
+//
+//	代码摄入 ∥ 上下文检索 → 合并上下文 → 4路专家并行审查 → 对抗质疑 → 测试验证 → 报告生成
 //
 // mode=orchestrated: 由 pkg/graph 图引擎驱动 DAG 调度, 节点内核是裸 LLM completion
 // (无工具), 见 pkg/agent/orchestrated_runner.go。M4 之前这条路走的是已删除的 pkg/orchestrator。
@@ -21,7 +22,7 @@ func codeReviewWorkflow() *WorkflowDef {
 		Mode:        "orchestrated",
 		Stages: []StageDef{
 			{
-				Name: "ingest", Role: "ingester",
+				Name: "ingest", Agent: "ingester",
 				Prompt: `你是**代码摄入专家**。
 
 审查任务: {objective}
@@ -40,7 +41,7 @@ func codeReviewWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "static-analysis", Role: "static-analyzer",
+				Name: "static-analysis", Agent: "static-analyzer",
 				Prompt: `你是**静态分析专家**。
 
 审查任务: {objective}
@@ -64,7 +65,7 @@ func codeReviewWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "context-retrieve", Role: "context-retriever",
+				Name: "context-retrieve", Agent: "context-retriever",
 				Prompt: `你是**代码上下文检索专家**。
 
 审查任务: {objective}
@@ -83,7 +84,7 @@ func codeReviewWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "logic-review", Role: "logic-reviewer",
+				Name: "logic-review", Agent: "logic-reviewer",
 				DependsOn: []string{"ingest", "static-analysis", "context-retrieve"},
 				Prompt: `你是**逻辑正确性审查专家** (参考 CodeReviewQA 的推理分解方法)。
 
@@ -105,7 +106,7 @@ func codeReviewWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "security-review", Role: "security-reviewer",
+				Name: "security-review", Agent: "security-reviewer",
 				DependsOn: []string{"ingest", "static-analysis", "context-retrieve"},
 				Prompt: `你是**安全审查专家** (Red Team 视角, 参考 OWASP Top 10 + CWE)。
 
@@ -130,7 +131,7 @@ func codeReviewWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "performance-review", Role: "performance-reviewer",
+				Name: "performance-review", Agent: "performance-reviewer",
 				DependsOn: []string{"ingest", "static-analysis", "context-retrieve"},
 				Prompt: `你是**性能审查专家**。
 
@@ -150,7 +151,7 @@ func codeReviewWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "style-review", Role: "style-reviewer",
+				Name: "style-review", Agent: "style-reviewer",
 				DependsOn: []string{"ingest", "static-analysis", "context-retrieve"},
 				Prompt: `你是**代码风格与可维护性审查专家**。
 
@@ -171,7 +172,7 @@ severity 一般为 low 或 nit, 除非严重影响可维护性。`,
 				Parallel: true,
 			},
 			{
-				Name: "adversarial-challenge", Role: "skeptical-reviewer",
+				Name: "adversarial-challenge", Agent: "skeptical-reviewer",
 				DependsOn: []string{"logic-review", "security-review", "performance-review", "style-review"},
 				Prompt: `你是**Skeptical Reviewer** (对抗质疑者, 参考 BlueCodeAgent)。
 
@@ -197,7 +198,7 @@ severity 一般为 low 或 nit, 除非严重影响可维护性。`,
 - Top 3 必修问题`,
 			},
 			{
-				Name: "test-verify", Role: "test-verifier",
+				Name: "test-verify", Agent: "test-verifier",
 				DependsOn: []string{"adversarial-challenge"},
 				Prompt: `你是**测试驱动验证专家** (Test-Driven Review)。
 
@@ -219,7 +220,7 @@ severity 一般为 low 或 nit, 除非严重影响可维护性。`,
 - 测试覆盖的边界条件列表`,
 			},
 			{
-				Name: "report", Role: "report-writer",
+				Name: "report", Agent: "report-writer",
 				DependsOn: []string{"test-verify"},
 				Prompt: `你是**审查报告撰写专家**。
 

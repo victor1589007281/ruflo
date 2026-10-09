@@ -97,10 +97,13 @@ var (
 	dreamConsolidatorPatterns  *prometheus.GaugeVec
 
 	// Memory
-	memEntryCount     *prometheus.GaugeVec
-	memAvgAccessCount *prometheus.GaugeVec
-	memPruneCount     *prometheus.CounterVec
-	memRetrievalCount *prometheus.CounterVec
+	memEntryCount       *prometheus.GaugeVec
+	memAvgAccessCount   *prometheus.GaugeVec
+	memPruneCount       *prometheus.CounterVec
+	memRetrievalCount   *prometheus.CounterVec
+	memRetrievalCountL1 *prometheus.CounterVec
+	memRetrievalCountL2 *prometheus.CounterVec
+	memInjectionChars   *prometheus.GaugeVec
 
 	factTotalCount         *prometheus.GaugeVec
 	factActiveCount        *prometheus.GaugeVec
@@ -407,6 +410,15 @@ func initPrometheusMetrics() {
 	memRetrievalCount = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "claude_go", Name: "mem_retrieval_count", Help: "记忆检索次数",
 	}, memLabels)
+	memRetrievalCountL1 = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "mem_retrieval_count_l1", Help: "L1 情景记忆命中条数",
+	}, memLabels)
+	memRetrievalCountL2 = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "claude_go", Name: "mem_retrieval_count_l2", Help: "L2 结构化事实命中条数",
+	}, memLabels)
+	memInjectionChars = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "claude_go", Name: "mem_injection_chars", Help: "单次检索注入 system prompt 的字符数",
+	}, memLabels)
 
 	factTotalCount = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "claude_go", Name: "fact_total_count", Help: "事实总数 (L2)",
@@ -623,6 +635,7 @@ func initPrometheusMetrics() {
 		dreamGateBlockLockHeld, dreamGateBlockScanThrottle,
 		dreamConsolidatorFacts, dreamConsolidatorContra, dreamConsolidatorPatterns,
 		memEntryCount, memAvgAccessCount, memPruneCount, memRetrievalCount,
+		memRetrievalCountL1, memRetrievalCountL2, memInjectionChars,
 		factTotalCount, factActiveCount, factArchivedCount, factEvergreenCount,
 		factAvgRetention, factIngestCount, factDecayArchivedCount, factConnectionCount,
 		amnesiaRiskScore, precompactFactsSaved,
@@ -859,12 +872,18 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 		factConnectionCount.With(fillLabels(memNeed, labels)).Set(value)
 	case MAmnesiaRiskScore:
 		amnesiaRiskScore.With(fillLabels(memNeed, labels)).Set(value)
+	case MMemInjectionChars:
+		memInjectionChars.With(fillLabels(memNeed, labels)).Set(value)
 
 	// Memory counters
 	case MMemPruneCount:
 		memPruneCount.With(fillLabels(memNeed, labels)).Add(value)
 	case MMemRetrievalCount:
 		memRetrievalCount.With(fillLabels(memNeed, labels)).Add(value)
+	case MMemRetrievalCountL1:
+		memRetrievalCountL1.With(fillLabels(memNeed, labels)).Add(value)
+	case MMemRetrievalCountL2:
+		memRetrievalCountL2.With(fillLabels(memNeed, labels)).Add(value)
 	case MFactIngestCount:
 		factIngestCount.With(fillLabels(memNeed, labels)).Add(value)
 	case MFactDecayArchivedCount:

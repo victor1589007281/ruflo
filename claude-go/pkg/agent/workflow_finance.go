@@ -9,7 +9,7 @@ func financeWorkflow() *WorkflowDef {
 		Mode:        "pipeline",
 		Stages: []StageDef{
 			{
-				Name: "market-analysis", Role: "market-analyst",
+				Name: "market-analysis", Agent: "market-analyst",
 				Prompt: `你是资深量化交易分析师。对给定标的进行全面技术分析。
 
 分析标的: {objective}
@@ -36,7 +36,7 @@ func financeWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "sentiment-analysis", Role: "sentiment-analyst",
+				Name: "sentiment-analysis", Agent: "sentiment-analyst",
 				Prompt: `你是金融情绪分析专家，擅长从多维度解读市场情绪。
 
 分析标的: {objective}
@@ -59,7 +59,7 @@ func financeWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "financial-report", Role: "financial-analyst",
+				Name: "financial-report", Agent: "financial-analyst",
 				Prompt: `你是高级财务分析师 (CFA)，擅长财报深度解读。
 
 分析标的: {objective}
@@ -77,7 +77,7 @@ func financeWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "news-tracking", Role: "news-tracker",
+				Name: "news-tracking", Agent: "news-tracker",
 				Prompt: `你是金融新闻追踪专家，擅长从新闻事件中提取投资信号。
 
 分析标的: {objective}
@@ -99,7 +99,7 @@ func financeWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "risk-assessment", Role: "risk-assessor",
+				Name: "risk-assessment", Agent: "risk-assessor",
 				DependsOn: []string{"market-analysis", "sentiment-analysis", "financial-report", "news-tracking"},
 				Prompt: `你是高级风险管理专家 (FRM)。综合前置分析，进行全面风险评估。
 
@@ -124,7 +124,7 @@ func financeWorkflow() *WorkflowDef {
 ## 综合风险等级: 🔴高风险 / 🟡中风险 / 🟢低风险`,
 			},
 			{
-				Name: "trade-recommendation", Role: "trade-advisor",
+				Name: "trade-recommendation", Agent: "trade-advisor",
 				DependsOn: []string{"risk-assessment"},
 				Prompt: `你是首席投资策略师。综合所有分析，给出最终交易建议。
 
@@ -163,4 +163,3 @@ func financeWorkflow() *WorkflowDef {
 		},
 	}
 }
-

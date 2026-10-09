@@ -30,6 +30,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/logging"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -429,48 +431,232 @@ func isRetryableStatus(code int) bool {
 
 // shouldEnablePromptCache 判断当前请求是否应启用 prompt caching。
 
-// markMessageCacheBreakpoint 给最后一条消息的最后一个内容块贴 cache_control。
+// MaxCacheBreakpoints 是上游允许的 cache_control 块数上限 (Anthropic 文档: 最多 4)。
 //
-// 位置选"最后一条"而不是"中间某条": 缓存按前缀匹配, 断点越靠后覆盖的 token 越多。
+// 超出的标记会被上游拒绝 —— 而"拒绝"表现为整个请求 400, 不是静默丢弃断点。
+// 所以这里是硬上限, 不是建议值。
+const MaxCacheBreakpoints = 4
+
+// markCacheBreakpointAt 给 messages[idx] 的最后一个内容块贴 cache_control。
+// 返回是否真的贴上了 (目标不存在 / 形态不支持 / 已有断点 都返回 false)。
+//
 // Content 是 json.RawMessage, 所以要先解出来再按形态处理 —— 纯字符串形态要包成
-// 内容块才能挂字段。已有 cache_control 的块不重复标记 (上游对重复标记会报错)。
+// 内容块才能挂字段。已有 cache_control 的块不重复贴 (上游对重复标记会报错)。
+//
+// ★ 插入必须**只加字段, 不动其余任何一个字节**。
+//
+// 这里原先走的是 `var content any` → 改最后一个块 → `json.Marshal(content)` 回写。
+// 那条路会把整条消息的**全部内容块**重新序列化一遍, 而 tool_use 的 input 是
+// json.RawMessage —— 解进 any 就成了 map[string]any, 再 Marshal 出来**键按字典序
+// 重排**。实测 (if-question-expand 2fd81b6e):
+//
+//	模型原文        {"path":"/workspace/write_questions.py","contents":"..."}
+//	贴了断点那轮    {"contents":"...","path":"/workspace/write_questions.py"}
+//	下一轮          {"path":"...","contents":"..."}     ← 又变回去了
+//
+// 为什么"下一轮又变回去": 断点的**落点每轮都在移动** (BP3=最后一条消息,
+// BP2=最后一条 assistant), 于是同一条 tool_use 这轮被打上、下轮不被打上, 两轮渲染
+// 的字节不同 —— 前缀缓存断在它身上, 它后面整段作废。这与 run 长短无关, **每轮必中**
+// (实测 t3→t4 首个不同字节 @29796、t5→t6 @35895, 都恰好是这个 tool_use 的参数串)。
+//
+// 所以改成字节级插入: 把最后那个块的收尾 `}` 前塞进 cache_control, 其余字节原样保留。
+// 这类"只加不改"的改写才是缓存友好的 —— 同一条消息无论这轮贴不贴断点, 贴之前的那段
+// 前缀都逐字节相同。
+func markCacheBreakpointAt(messages []types.APIMessage, idx int) bool {
+	if idx < 0 || idx >= len(messages) {
+		return false
+	}
+	target := &messages[idx]
+	if target.Role != "user" && target.Role != "assistant" {
+		return false
+	}
+
+	// 纯字符串形态 (部分调用方直接传字符串): 没有可保留的原文, 包成内容块即可。
+	var s string
+	if json.Unmarshal(target.Content, &s) == nil {
+		if s == "" {
+			return false
+		}
+		raw, err := json.Marshal([]map[string]any{
+			{"type": "text", "text": s, "cache_control": map[string]string{"type": "ephemeral"}},
+		})
+		if err != nil {
+			return false
+		}
+		target.Content = raw
+		return true
+	}
+
+	// 内容块数组: 逐个保持**原始字节**, 只对最后一块做插入。
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(target.Content, &blocks); err != nil {
+		return false // 解不出来就原样放行, 不动它
+	}
+	if len(blocks) == 0 {
+		return false
+	}
+	last := bytes.TrimRight(blocks[len(blocks)-1], " \t\r\n")
+	if len(last) < 2 || last[0] != '{' || last[len(last)-1] != '}' {
+		return false // 最后一块不是对象, 挂不上字段
+	}
+	// 重复检查只读不改: 解出来看一眼键集合即可, 不用它的序列化结果。
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(last, &probe); err != nil {
+		return false
+	}
+	if _, dup := probe["cache_control"]; dup {
+		return false
+	}
+	withBP := make([]byte, 0, len(last)+40)
+	withBP = append(withBP, last[:len(last)-1]...) // 去掉收尾的 '}'
+	withBP = append(withBP, `,"cache_control":{"type":"ephemeral"}}`...)
+	blocks[len(blocks)-1] = withBP
+
+	raw, err := json.Marshal(blocks) // []json.RawMessage: 各元素逐字节原样输出
+	if err != nil {
+		return false
+	}
+	target.Content = raw
+	return true
+}
+
+// cacheBreakpointIndexes 选出消息序列里该打断点的位置 (从后往前, 最多 max 个)。
+//
+// 为什么不是一个断点: prompt cache 是**前缀**匹配 —— 一次请求里断点之前的全部内容
+// 构成一个可复用单元。只有一个断点时, 它覆盖"到目前为止的全部前缀", 听起来最优,
+// 但代价是全有全无: 只要最新那条消息与上一轮不同 (几乎必然), 上一轮那份缓存就
+// 完全用不上, 每次都要把整个前缀重新写一遍。多个断点让"上一轮已经写过的部分"
+// 有独立的缓存条目可以命中, 新增内容另外成段。
+//
+// 位置选择:
+//
+//	BP3 = 最后一条消息末尾        —— 覆盖到最新
+//	BP2 = 上一轮最后一条 (最近一条 assistant) —— 上一轮的完整边界
+//
+// 为什么 BP2 取"最近的 assistant"而不是简单的 len-2: 一轮里 assistant 之后可能跟着
+// 多条 tool_result user 消息 (一次 assistant 发起多个工具调用)。取 len-2 会落在这
+// 组 tool_result 中间 —— 那是一轮**内部**的边界, 下一轮还会继续增长, 拿它当缓存
+// 边界既不稳定也没额外收益。assistant 消息才是一轮真正的收口处。
+//
+// 返回的下标不重复 (BP2 可能与 BP3 重合, 如消息不足两轮时)。
+func cacheBreakpointIndexes(messages []types.APIMessage, max int) []int {
+	if len(messages) == 0 || max <= 0 {
+		return nil
+	}
+	out := make([]int, 0, max)
+	seen := make(map[int]bool, max)
+	add := func(i int) {
+		if i < 0 || i >= len(messages) || seen[i] || len(out) >= max {
+			return
+		}
+		seen[i] = true
+		out = append(out, i)
+	}
+
+	// BP3: 最新
+	add(len(messages) - 1)
+
+	// BP2: 上一条 assistant (上一轮的收口)
+	for i := len(messages) - 2; i >= 0; i-- {
+		if messages[i].Role == "assistant" {
+			add(i)
+			break
+		}
+	}
+
+	return out
+}
+
+// markMessageCacheBreakpoint 在消息序列上打 BP2/BP3 两个断点。
+//
+// 保留这个包装是为了既有调用点与测试; 真正的选点逻辑在 cacheBreakpointIndexes。
 func markMessageCacheBreakpoint(messages []types.APIMessage) {
-	if len(messages) == 0 {
-		return
+	for _, idx := range cacheBreakpointIndexes(messages, 2) {
+		markCacheBreakpointAt(messages, idx)
 	}
-	last := &messages[len(messages)-1]
-	if last.Role != "user" && last.Role != "assistant" {
-		return
+}
+
+// markSystemCacheBreakpoint 在 system 上打两个断点: 块 0 与稳定段末尾。
+//
+// 断点缓存的是它**之前**(含自身)的全部前缀, 所以打在越靠后的稳定块上覆盖得越多。
+// engine 按「base(稳定) → memory(检索结果) → task(本轮任务)」分层, 任务指令
+// **永远**是最后一块 (每轮都变), 打在它上面等于每轮换一次缓存键, 绝不选它。
+//
+//	BP1 = 块 0        —— base, 跨**运行**稳定
+//	BP2 = 倒数第二块  —— 通常是 memory 块, 稳定段的最末尾
+//
+// 为什么是**两个** (改前只打 block 0 一个):
+//
+// 改前断点打在 block 0 = base, 于是缓存条目止步于 base —— 它**后面**的 memory
+// 块永远进不了缓存, 哪怕它在同一个 run 内逐轮完全没变。而 memory 恰恰是这块
+// 提示里最大的一截 (面试团队实测 21K 字符, 占 system 的 2/5)。只覆盖 base 等于
+// 把这 21K 每轮都按未命中计费。
+//
+// 补上第二个断点 (稳定段末尾) 后, base 与 memory 各有一段缓存。两者的**失效
+// 节奏不同**才是这么切的理由: base 跨运行不变, memory 每跑一次就变 (记忆库被
+// 运行自身改写, BM25 的 top-K 排序随之漂移)。打在两个位置, base 那截不会因为
+// memory 变动而陪葬; 而 run 内 memory 不变, 第二个断点又能在逐轮对话里吃满。
+//
+// 两个是上限: 消息侧还要用掉 2 个 (BP3/BP4, 见 cacheBreakpointIndexes),
+// 正好等于 MaxCacheBreakpoints=4; 再多会被上游 400, 不是静默丢弃。
+//
+// ⚠️ 实测边界 (2026-09-18, 直连 deepseek 端点): 不是所有上游都按 cache_control
+// 行事。deepseek **一个断点都不打**也照样命中前缀缓存 —— 同样的 system 第二次
+// 调用 input 从 3332 掉到 134、cache_read=3198。对这类端点, 断点布局是无害但也
+// 无益的冗余; 只有真正按断点切分的上游 (Anthropic 官方等) 才吃这个改动。
+// 别把"改了断点"直接当成"缓存一定变好" —— 先确认上游属于哪一类。
+//
+// 返回本次是否**新打上**了断点 (全都有则返回 false)。
+func markSystemCacheBreakpoint(blocks []map[string]interface{}) bool {
+	if len(blocks) == 0 {
+		return false
 	}
-	var content any
-	if err := json.Unmarshal(last.Content, &content); err != nil {
-		return // 解不出来就原样放行, 不动它
+	// 稳定段末尾: 最后一块是变量 (任务指令) 时退一格; 只有一个块时就是它自己。
+	stableIdx := len(blocks) - 1
+	if stableIdx > 0 {
+		stableIdx--
 	}
-	switch c := content.(type) {
-	case string:
-		if c == "" {
-			return
+	marked := false
+	// 顺序刻意从 0 开始: 两个下标在单块/双块时可能重合, 靠 dup 判断去重即可。
+	for _, idx := range []int{0, stableIdx} {
+		if _, dup := blocks[idx]["cache_control"]; dup {
+			continue
 		}
-		content = []map[string]any{
-			{"type": "text", "text": c, "cache_control": map[string]string{"type": "ephemeral"}},
+		blocks[idx]["cache_control"] = map[string]string{"type": "ephemeral"}
+		marked = true
+	}
+	return marked
+}
+
+// buildSystemParam 组装出站的 system 字段, 并在启用缓存时打上 BP1。
+//
+// cacheEnabled 为 false 时**完全不输出 cache_control** —— 上游不支持该字段的情况
+// 由调用方的"400 后自适应关闭"兜底, 这里只负责不自找麻烦。
+func buildSystemParam(systemPrompt []string, cacheEnabled bool) interface{} {
+	switch len(systemPrompt) {
+	case 0:
+		return nil
+	case 1:
+		if !cacheEnabled {
+			return systemPrompt[0]
 		}
-	case []any:
-		if len(c) == 0 {
-			return
+		return []map[string]interface{}{
+			{"type": "text", "text": systemPrompt[0], "cache_control": map[string]string{"type": "ephemeral"}},
 		}
-		blk, ok := c[len(c)-1].(map[string]any)
-		if !ok {
-			return
-		}
-		if _, dup := blk["cache_control"]; dup {
-			return
-		}
-		blk["cache_control"] = map[string]string{"type": "ephemeral"}
 	default:
-		return
-	}
-	if raw, err := json.Marshal(content); err == nil {
-		last.Content = raw
+		blocks := make([]map[string]interface{}, len(systemPrompt))
+		for i, s := range systemPrompt {
+			blocks[i] = map[string]interface{}{
+				"type": "text",
+				"text": s,
+			}
+		}
+		if cacheEnabled {
+			// G1 PromptCache: cache_control 贴在第一个稳定块 (block 0),
+			// 而非最后一个动态块 (memory), 避免动态内容污染缓存键。
+			markSystemCacheBreakpoint(blocks)
+		}
+		return blocks
 	}
 }
 
@@ -717,10 +903,8 @@ func classifyErrorKind(status int, errStr string) string {
 }
 
 func truncateErr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
+	// 错误信息里常含中文/上游返回的多字节内容, 按 rune 截避免劈字。
+	return textutil.Truncate(s, n, "…")
 }
 
 func (c *Client) isCircuitOpen() bool {
@@ -944,30 +1128,7 @@ func (c *Client) StreamMessage(
 			markMessageCacheBreakpoint(messages)
 		}
 
-		var system interface{}
-		if len(systemPrompt) == 1 {
-			if c.shouldEnablePromptCache() {
-				system = []map[string]interface{}{
-					{"type": "text", "text": systemPrompt[0], "cache_control": map[string]string{"type": "ephemeral"}},
-				}
-			} else {
-				system = systemPrompt[0]
-			}
-		} else if len(systemPrompt) > 1 {
-			blocks := make([]map[string]interface{}, len(systemPrompt))
-			for i, s := range systemPrompt {
-				blocks[i] = map[string]interface{}{
-					"type": "text",
-					"text": s,
-				}
-			}
-			if c.shouldEnablePromptCache() {
-				// G1 PromptCache: cache_control 贴在第一个稳定块 (block 0),
-				// 而非最后一个动态块 (memory), 避免动态内容污染缓存键。
-				blocks[0]["cache_control"] = map[string]string{"type": "ephemeral"}
-			}
-			system = blocks
-		}
+		system := buildSystemParam(systemPrompt, c.shouldEnablePromptCache())
 
 		req := types.APIRequest{
 			Model:     c.effectiveModel(),
@@ -1099,6 +1260,38 @@ func (c *Client) StreamMessage(
 					errCh <- fmt.Errorf("模型拒绝回答 (refusal): %s", apiErr.Error.Message)
 					return
 				}
+			}
+
+			// 自适应关闭 prompt cache (流式路径)。
+			//
+			// 这是主路径 —— 引擎所有实际调用都走 StreamMessage, 非流式那条分支
+			// 只在少数诊断场景触发。多断点策略会把 cache_control 贴到更多位置,
+			// 碰到"不认识该字段"的上游概率也随之上升, 所以这里必须有一道兜底:
+			// 一旦上游以 400/422 明确抱怨 cache, 就**本次请求立刻去掉全部断点重试**,
+			// 并把该客户端后续请求的缓存整体关掉。
+			//
+			// 关键性质: 关掉缓存只是退化成"全部按新 token 计费", 请求照常成功 ——
+			// 缓冲收益是**偏好**, 不是可用性前提。
+			if c.shouldEnablePromptCache() && isCacheRelatedError(resp.StatusCode, string(respBody)) {
+				logging.For("api").Warn("上游不支持 cache_control, 本次请求已去断点重试并关闭后续缓存",
+					"status", resp.StatusCode, "body", textutil.TruncateBytes(string(respBody), 200, "…"))
+				c.promptCacheDisabledByError = true
+				// 注意: system 是 interface{} (可能是 string, 也可能是 []map), 不能
+				// 就地改——重建一次请求体最稳妥。
+				req.System = buildSystemParam(systemPrompt, false)
+				if c.isOpenAI() {
+					oaiReq, body, err = c.buildOpenAIRequest(req, true)
+				} else if c.isOpenAIResponses() {
+					respReq, body, err = c.buildOpenAIResponsesRequest(req, true)
+				} else {
+					body, err = json.Marshal(req)
+				}
+				if err != nil {
+					errCh <- fmt.Errorf("重建去缓存请求失败: %w", err)
+					return
+				}
+				streamRec.ErrorKind = "cache_unsupported"
+				continue streamRetryLoop
 			}
 
 			if !isRetryableStatus(resp.StatusCode) {

@@ -17,7 +17,7 @@ func managerLabRehearsalNPCWorkflow() *WorkflowDef {
 		Stages: []StageDef{
 			{
 				Name: "npc",
-				Role: "coach",
+				Agent: "coach",
 				Prompt: `你正在扮演一名带人设的下属/同事。请严格按人设与关系记忆回应用户（管理者）的这句话术。
 
 ## 角色与人设
@@ -41,7 +41,7 @@ func managerLabRehearsalCriticWorkflow() *WorkflowDef {
 		Stages: []StageDef{
 			{
 				Name: "critic",
-				Role: "critic",
+				Agent: "critic",
 				Prompt: `你是管理沟通教练。请只针对学员在演练中实际说的话进行评分，不要评价 NPC。
 
 ## 输入
@@ -83,7 +83,7 @@ func managerLabSimulationV2Workflow() *WorkflowDef {
 		Stages: []StageDef{
 			{
 				Name: "intake",
-				Role: "researcher",
+				Agent: "researcher",
 				Prompt: `你是一名严谨的需求解析员。请阅读下面的管理训练情景与用户决策，提炼关键信息。
 
 ## 原始输入
@@ -108,7 +108,7 @@ func managerLabSimulationV2Workflow() *WorkflowDef {
 			},
 			{
 				Name:      "situate",
-				Role:      "researcher",
+				Agent:      "researcher",
 				DependsOn: []string{"intake"},
 				Prompt: `你是一名情境领导诊断员。请根据 intake 结果与原始情景，判断用户对每位下属采取的管理风格是否合适。
 
@@ -133,7 +133,7 @@ func managerLabSimulationV2Workflow() *WorkflowDef {
 			},
 			{
 				Name:      "simulator",
-				Role:      "architect",
+				Agent:      "architect",
 				DependsOn: []string{"intake", "situate"},
 				Prompt: `你是一名公司运行模拟器。请根据情景、用户决策与情境领导匹配结果，推演接下来一段时间内的运行结果。
 
@@ -169,7 +169,7 @@ func managerLabSimulationV2Workflow() *WorkflowDef {
 			},
 			{
 				Name:      "reflect",
-				Role:      "reviewer",
+				Agent:      "reviewer",
 				DependsOn: []string{"simulator"},
 				Prompt: `你是一名反思引导员。请根据模拟结果生成反思问题，引导用户从经验中提取洞察。
 
@@ -194,7 +194,7 @@ func managerLabSimulationV2Workflow() *WorkflowDef {
 			},
 			{
 				Name:      "evaluator",
-				Role:      "critic",
+				Agent:      "critic",
 				DependsOn: []string{"simulator", "situate", "reflect"},
 				Prompt: `你是一名管理决策评分员。请根据模拟结果、情境领导匹配度与阶段成功标准给出评分。
 
@@ -236,7 +236,7 @@ func managerLabSimulationV2Workflow() *WorkflowDef {
 			},
 			{
 				Name:      "coach",
-				Role:      "coach",
+				Agent:      "coach",
 				DependsOn: []string{"evaluator"},
 				Prompt: `你是一名管理教练。请针对以下决策、结果、情境领导匹配度与胜任力成长，给出建设性反馈。
 

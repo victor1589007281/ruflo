@@ -61,7 +61,7 @@ func TestAvailableWorkflowNames_含动态注册(t *testing.T) {
 		Name:        name,
 		Mode:        "pipeline",
 		Description: "临时动态工作流",
-		Stages:      []StageDef{{Name: "only", Role: "researcher"}},
+		Stages:      []StageDef{{Name: "only", Agent: "researcher"}},
 	}, roles); err != nil {
 		t.Skipf("动态注册被拒(可能是角色校验), 跳过: %v", err)
 	}

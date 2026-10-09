@@ -81,7 +81,7 @@ func TestRegisterRankDeterministicAcrossReload(t *testing.T) {
 
 func TestParseInvocableFrontmatter(t *testing.T) {
 	sk := &Skill{}
-	parseFrontmatter("name: x\ndescription: d\nmodel-invocable: false\nuser-invocable: true\n", sk)
+	parseFM("name: x\ndescription: d\nmodel-invocable: false\nuser-invocable: true\n", sk)
 	if sk.ModelInvocable == nil || *sk.ModelInvocable {
 		t.Errorf("model-invocable: false 应解析为 false, 得 %+v", sk.ModelInvocable)
 	}
@@ -91,14 +91,14 @@ func TestParseInvocableFrontmatter(t *testing.T) {
 
 	// 下划线变体 + 引号值
 	sk2 := &Skill{}
-	parseFrontmatter("model_invocable: \"false\"\n", sk2)
+	parseFM("model_invocable: \"false\"\n", sk2)
 	if sk2.ModelInvocable == nil || *sk2.ModelInvocable {
 		t.Errorf("带引号的 model_invocable: false 应解析为 false")
 	}
 
 	// 非法值 fail-safe → false (关闭该侧调用)
 	sk3 := &Skill{}
-	parseFrontmatter("model-invocable: banana\n", sk3)
+	parseFM("model-invocable: banana\n", sk3)
 	if sk3.ModelInvocable == nil || *sk3.ModelInvocable {
 		t.Errorf("非法布尔值应解析为 false")
 	}
@@ -211,7 +211,7 @@ func TestInjectedLedger(t *testing.T) {
 
 func TestRegisterNilSkill(t *testing.T) {
 	r := NewRegistry()
-	r.Register(nil)          // 不得 panic
+	r.Register(nil)              // 不得 panic
 	r.Register(&Skill{Name: ""}) // 无名, 忽略
 	if r.Count() != 0 {
 		t.Errorf("nil/无名注册应被忽略, 得 %d", r.Count())

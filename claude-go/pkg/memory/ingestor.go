@@ -12,6 +12,33 @@ type Ingestor struct {
 	factStore   *FactStore
 	tieredStore *TieredStore
 	idSeq       int
+
+	// lastDecisions 最近一次摄入里两条存储通道各自的裁决 (H2-4)。
+	//
+	// 上报的理由: 自动摄入是**没有人在旁边看**的写入路径 —— 它每次跑完都会往记忆
+	// 里加东西, 而"这次加的东西顶掉了一条旧记忆"与"两条矛盾记忆现在并存"这两种
+	// 结局, 事后从库内容里反推不出来 (前者被归档的条目还在, 后者恰恰是两条都在)。
+	lastDecisions []IngestDecision
+}
+
+// IngestDecision 一次摄入对**一条通道**的裁决。
+type IngestDecision struct {
+	// Store 通道名: "fact" (FactStore) 或 "tiered" (L1 TieredStore)。
+	Store string
+	// FactID 本次写入的 ID。
+	FactID string
+	// Decision 守门裁决 (GateAppended / GateSuperseded / GateKeptBoth)。
+	Decision GateDecision
+	// Stats 该通道那次守门的扫描读数 (TieredStore 侧才有; FactStore 侧为零值)。
+	Stats ResolveStats
+}
+
+// LastDecisions 返回最近一次摄入的裁决 (只读检视用)。
+func (ig *Ingestor) LastDecisions() []IngestDecision {
+	if ig == nil {
+		return nil
+	}
+	return append([]IngestDecision(nil), ig.lastDecisions...)
 }
 
 // NewIngestor 创建记忆摄入器
@@ -34,12 +61,22 @@ func (ig *Ingestor) IngestText(content, source string, topics []string) *MemoryF
 
 	fact := NewMemoryFact(id, content, cat, importance, source, topics)
 
+	// 收口点的历史: 这里原来直接调 Add / AddWithGate 之前的 factStore.Add —— 两条
+	// 通道**都绕过了守门**。FactStore 侧的守门 (AddWithGate) 早就写好了, 自动摄入
+	// 却走的是不带门的 Add, 于是"已修复"与"仍存在"这类矛盾在自动摄入这条路上一路
+	// 绿灯。守门写在库里但没人走它, 等于不存在 —— 这类"守卫没通电"是本批里反复
+	// 出现的一个形态 (见验收方法论里的"冗余守卫没通电就该删")。
+	ig.lastDecisions = ig.lastDecisions[:0]
+
 	if ig.factStore != nil {
-		ig.factStore.Add(fact)
+		dec := ig.factStore.AddWithGate(fact)
+		ig.lastDecisions = append(ig.lastDecisions, IngestDecision{
+			Store: "fact", FactID: fact.ID, Decision: dec,
+		})
 	}
 
 	if ig.tieredStore != nil {
-		ig.tieredStore.Add(&MemoryEntry{
+		dec := ig.tieredStore.AddWithGate(&MemoryEntry{
 			ID:         id,
 			Content:    content,
 			Topics:     topics,
@@ -47,6 +84,10 @@ func (ig *Ingestor) IngestText(content, source string, topics []string) *MemoryF
 			Importance: importance,
 			CreatedAt:  time.Now(),
 			LastAccess: time.Now(),
+		})
+		ig.lastDecisions = append(ig.lastDecisions, IngestDecision{
+			Store: "tiered", FactID: id, Decision: dec,
+			Stats: ig.tieredStore.LastResolveStats(),
 		})
 	}
 

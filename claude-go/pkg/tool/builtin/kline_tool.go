@@ -59,7 +59,7 @@ func (t *KLineTool) InputSchema() json.RawMessage {
 }
 
 func (t *KLineTool) IsReadOnly(_ json.RawMessage) bool        { return true }
-func (t *KLineTool) IsConcurrencySafe(_ json.RawMessage) bool  { return true }
+func (t *KLineTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 func (t *KLineTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }

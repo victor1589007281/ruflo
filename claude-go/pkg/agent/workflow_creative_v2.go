@@ -33,29 +33,29 @@ func creativeV2Workflow() *WorkflowDef {
 		Rounds:      0, // 0 = 自适应 AdaptiveTerminator
 		Stages: []StageDef{
 			// Phase 1: 策划
-			{Name: "creative-plan", Role: "creative-planner",
+			{Name: "creative-plan", Agent: "creative-planner",
 				Prompt: creativePlannerPrompt},
-			{Name: "task-decompose", Role: "creative-planner",
+			{Name: "task-decompose", Agent: "creative-planner",
 				DependsOn: []string{"creative-plan"},
 				Prompt:    taskDecomposePrompt},
 
 			// Phase 2: 内容生成
-			{Name: "html-develop", Role: "html-developer",
+			{Name: "html-develop", Agent: "html-developer",
 				DependsOn: []string{"task-decompose"},
 				Prompt:    htmlDeveloperPrompt},
 
 			// Phase 3: 视觉审查 (evaluator — 包含 "pass" 关键字)
-			{Name: "visual-review", Role: "art-director",
+			{Name: "visual-review", Agent: "art-director",
 				DependsOn: []string{"html-develop"},
 				Prompt:    creativeReviewPrompt},
 
 			// Phase 4: 媒体输出 (代码驱动)
-			{Name: "media-render", Role: "media-producer",
+			{Name: "media-render", Agent: "media-producer",
 				DependsOn: []string{"html-develop"},
 				Parallel:  true},
 
 			// Phase 5: 整合交付
-			{Name: "final-delivery", Role: "media-producer",
+			{Name: "final-delivery", Agent: "media-producer",
 				DependsOn: []string{"media-render", "visual-review"}},
 		},
 	}

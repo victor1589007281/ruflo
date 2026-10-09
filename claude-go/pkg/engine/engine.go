@@ -23,7 +23,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,9 +38,11 @@ import (
 	"github.com/anthropic/claude-go/pkg/hooks"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/memory"
+	"github.com/anthropic/claude-go/pkg/metrics"
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/tool"
+	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/trace"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/anthropic/claude-go/pkg/weakmodel"
@@ -68,6 +72,10 @@ type QueryEngine struct {
 	FactStore    *memory.FactStore     // V3 Anti-Amnesia: L2 结构化记忆 (可选)
 	Ingestor     *memory.Ingestor      // V3: 记忆摄入器 (可选)
 	SessionStore SessionStoreInterface // 会话持久化 (可选, nil 则不启用)
+
+	// runStateDir 隔离运行 (RunIsolated) 的中间态目录 (H3-2; 空 = 不持久化)。
+	// 由 SetRunStateDir 装配, 见 runner_state.go。
+	runStateDir string
 
 	// SnapshotFn 每轮末的"整份历史"快照回调 (可选, nil 则不落盘)。
 	//
@@ -106,7 +114,113 @@ type QueryEngine struct {
 	// HookChain 内置 Hook 执行链，将 queryLoop 中所有硬编码功能点解耦为 InternalHook。
 	HookChain *internal_hook.HookChain
 
+	// memHook 是注册进 HookChain 的那个 MemoryInjectHook 句柄。
+	//
+	// 持有它只为热改注入形态 (SetMemoryIndexMode): 形态开关要在**不重建
+	// HookChain、不影响正在跑的 run** 的前提下翻转, 而 HookChain 只提供遍历、
+	// 不提供按名字取。重建链是另一条路, 但会连带重置其它 hook 的会话态。
+	memHook *internal_hook.MemoryInjectHook
+
+	// RunBudget run 级 token 预算闸门 (P0-1)。nil = 不设限。
+	//
+	// 与 CumulativeUsage 的区别是**这件事的全部要害**: 后者只累加、从不与上限比较
+	// (唯一读者 GetContextUsage 算的是单次请求的窗口占用), 而闸门管的是累计成本。
+	// 两者的口径必须一致, 所以累加写在同一处 (见 queryLoop 里的 usage 累计点)。
+	//
+	// 复用语义: 引擎是会话级复用的, 而闸门要的是 **run 级**。run 边界由 RunID 变化
+	// 识别 (queryLoop 每轮比对 lastBudgetRunID), 识别到就 Reset —— 不这么做的话,
+	// 长会话跑到第 N 个 run 会被前面所有 run 的累计消耗呛死, 那不是"这个 run 太贵",
+	// 是判据挂错了对象。
+	RunBudget *internal_hook.RunBudgetGate
+	// lastBudgetRunID 上一次计费时的 RunID, 用于识别 run 边界。仅由 queryLoop 读改写。
+	lastBudgetRunID string
+
+	// lastTerminal 最近一次 queryLoop 的终态。见 SubmitMessage 里的赋值处。
+	lastTerminal types.Terminal
+
+	// ========== 运行中入站通道 (21.8.12 P5 / D6-3 缺口 2 级 2) ==========
+	//
+	// 改造前 QueryEngine **没有**"往运行中的 loop 注入内容"的入口: SubmitMessage /
+	// SubmitStream / SubmitStreamBlocks 三个全是**开新一轮** —— 它们 append 一条 user
+	// 消息再从头跑, 而一个正在跑的 run 是独立的 goroutine, 调这三个只会并发起第二轮。
+	//
+	// 而"运行中送达"这件事在本仓有真实需求: 团队阶段跑着的时候用户发来一条更正,
+	// 今天只能等这一轮结束才看得到 (信箱注入在阶段起点发生**一次**, 见
+	// workflow.go 的 takeMailFor)。等到的可能是十分钟后, 而那时基于旧信息的活已经干完了。
+	//
+	// ★ 队列挂在这里而不是用引擎级的一个字段: 主循环 (queryLoop) 天然一次只有一个
+	// run, 所以引擎自己那一个队列身份无歧义。**RunIsolated 不用它** —— 那条路是
+	// 8 并发共用一个引擎 (agentPool), 引擎级队列会让 A 阶段的注入被 B 阶段收走。
+	// 那批 run 各自从 IsolatedRunOptions.Inject 拿一个自己的队列。判据与理由
+	// 见 pkg/engine/inject.go 的文件头。
+	//
+	// ★ 注入物只能是 **user 消息**, 不能是任意 role: 见 InjectQueue.Inject 的注释。
+	inbox InjectQueue
+
 	mu sync.Mutex
+}
+
+// InjectMessage 往**正在运行的**主循环 (queryLoop) 注入一条 user 消息 (21.8.12 P5)。
+//
+// 返回值:
+//   - true  —— 已入队, 下一个轮次边界 (queryLoop 顶部) 会被取走并投递给模型;
+//   - false —— 没有循环在跑 (见 InjectQueue.Inject 关于"不降级成新 run"的论证)。
+func (e *QueryEngine) InjectMessage(msg types.Message) bool { return e.inbox.Inject(msg) }
+
+// Running 报告主循环当前是否在跑 (即 InjectMessage 会不会被接受)。
+//
+// ★ 存在的理由是**取信是破坏性的**: 中继必须先问"现在能不能接"再取信, 否则引擎
+// 空闲期间会"取出来又退回去", 每轮轮询都在信箱日志里追加一条。
+func (e *QueryEngine) Running() bool { return e.inbox.Active() }
+
+// CountInjectionsDropped 报告"运行结束后仍留在队列里、已被丢弃"的注入条数。
+// 见 InjectQueue.Pending 关于这个差额为什么必须数得出来。
+func (e *QueryEngine) CountInjectionsDropped() int { return e.inbox.Pending() }
+
+// CountInjectionsPending 报告主循环**此刻**还没取走的注入条数 (运行中也可读)。
+//
+// 与 CountInjectionsDropped 的区别只在读的时机: 那个是 run 结束时取的 (队列已清空,
+// 剩下的就是丢弃数), 这个是任意时刻的瞬时值 —— 运行中非零是**正常的** (注入按轮次
+// 边界投递, 两条工具调用之间就是几秒), 而"结束时"非零才是丢弃。
+func (e *QueryEngine) CountInjectionsPending() int { return e.inbox.Pending() }
+
+// SetMemoryIndexMode 热改记忆注入形态 (正文 ⇄ 索引)。
+//
+// 供配置热加载回调调用: 改配置即生效, 不必重启进程、也不必重建 HookChain ——
+// 后者会连带重置其它 hook 的会话态, 而队列里可能有正在跑的任务。
+//
+// 生效边界由 MemoryInjectHook 决定: 检索本身每个 run 只跑一次 (t0), 热改不重跑
+// 它; 但**呈现形态**会在本 run 的下一个 turn 按新取值重渲染。所以"活跃会话立即
+// 生效"成立 —— 代价是那一个 turn 的前缀缓存从 memory 块起失效一次, 而该块排在
+// system 末尾, 这已经是最便宜的失效点。
+//
+// 未接入记忆 (memHook 为 nil) 时静默返回 —— 没有记忆的部署改这个开关本就没有
+// 意义, 不该因此让热加载报错。调用方要分清这种情况用 MemoryHookBound。
+func (e *QueryEngine) SetMemoryIndexMode(on bool) {
+	if e == nil || e.memHook == nil {
+		return
+	}
+	e.memHook.SetIndexMode(on)
+}
+
+// MemoryIndexMode 返回当前记忆注入形态 (未接入记忆时为 false)。
+//
+// 注意"未接入"与"接入但为关"都返回 false —— 要分清用 MemoryHookBound。
+func (e *QueryEngine) MemoryIndexMode() bool {
+	if e == nil || e.memHook == nil {
+		return false
+	}
+	return e.memHook.IndexMode()
+}
+
+// MemoryHookBound 报告记忆注入 hook 是否已接上。
+//
+// 为什么需要它: memHook 只在 registerInternalHooks 跑、且 MemoryStore/FactStore
+// 至少有一个非 nil 时才赋值, 而引擎是**构造之后**才赋组件的 (见 RefreshHooks)。
+// 于是"开关怎么改都不生效"有两种完全不同的原因 —— 配置没送到, 或者 hook 压根
+// 没建出来。只看 MemoryIndexMode 的话两者都是 false, 分不开。
+func (e *QueryEngine) MemoryHookBound() bool {
+	return e != nil && e.memHook != nil
 }
 
 // SessionStoreInterface 会话存储抽象。
@@ -116,34 +230,83 @@ type SessionStoreInterface interface {
 	SessionID() string
 }
 
+// outboundModel 把**身份名**翻译成**出站名**。
+//
+// 只对主模型生效: 相位路由的目标 (ExecutionModel/FallbackModel) 是配置里直接写下的
+// 模型名, 没有"别名 vs 裸名"这一层, 原样发出即可。主模型是唯一被装配方拆成两半
+// (身份带前缀 / 出站剥前缀) 的那个, 所以也只有它需要翻译 —— 判据是"这两个名字是不是
+// 同一个模型", 而不是调用点在哪。
+func (c *Config) outboundModel(identity string) string {
+	if identity == c.Model && c.OutboundModel != "" {
+		return c.OutboundModel
+	}
+	return identity
+}
+
 // Config 引擎配置
 type Config struct {
 	Model string
+	// OutboundModel 是 Model 的**出站形态** —— 身份与实际发到线上的字节未必相同,
+	// 留空 = 与 Model 相同 (旧行为)。
+	//
+	// 为什么需要这个字段: Model 是**身份** (进 transcript/metrics, 带 provider 前缀
+	// 更利于归因), 而出站发什么是**链路形态的函数** —— 经网关发完整别名 (别名是网关
+	// 的查找键), 直连 provider 发裸名 (厂商端点与 Ollama 的 /v1/messages 兼容层只认
+	// 裸名, 发前缀直接 400 invalid model name)。这一分工在装配方 (cmd/claude-go) 定下,
+	// 见 modelconfig.ResolvedConfig.OutboundModelName。
+	//
+	// 引擎里必须显式带上它, 否则下面的相位路由会把它抹掉: 那段代码按
+	// "turnModel != client.Model 才换客户端" 判断, 比的是身份名, 换上去的也是身份名。
+	// 装配方把 client.Model 设成裸名之后, turnModel (别名) 与之不等 → 第一回合就把
+	// 客户端"纠正"回别名 → 出站重新变成前缀, 直连端点 400。故引擎里凡是要拿 Model
+	// 去写客户端的地方, 都该改用 OutboundModel。
+	OutboundModel string
 	// ExecutionModel 自动相位路由的快速执行模型 (Path B)。
 	// 设置后, 工具消费回合 (消息尾部携带 tool_result) 自动路由到该模型,
 	// 规划/推理回合仍走 Model。留空 = 关闭自动路由, 全部回合走 Model。
-	ExecutionModel   string
-	FallbackModel    string
-	MaxTokens        int
-	MaxTurns         int    // queryLoop 最大迭代次数 (0 = 无限)
-	ContextWindow    int    // 模型上下文窗口 (tokens, 0 = 默认 200000)
+	ExecutionModel string
+	FallbackModel  string
+	MaxTokens      int
+	MaxTurns       int // queryLoop 最大迭代次数 (0 = 无限)
+	ContextWindow  int // 模型上下文窗口 (tokens, 0 = 默认 200000)
+
+	// MaxRunTokens 一个 run 的 token 消耗上限 (0 = 不设限; 也可经
+	// CLAUDE_GO_MAX_RUN_TOKENS 配置)。超过即终止, 终态 Reason = "budget_exhausted"。
+	//
+	// 为什么必须有这一条: maxTurns 是**步数**上限不是成本上限 —— 一次 WebFetch 与
+	// 一次 Read 都算 1 轮, 成本可能差三个数量级 (实测 209 个 run 里 WebSearch +
+	// WebFetch 合计 3206 次)。步数跑满 ≠ 钱没花超, 所以需要一道按 tokens 计的止损线。
+	//
+	// 口径 = 输入 + 输出 + 缓存读 + 缓存写 (与 CumulativeUsage 的四项一致)。
+	// 只在**成功**调用上累加: 失败调用不带 usage 是正常的 (流里没有 message_start),
+	// 把它当 0 计入会让失败的 run 显得没花钱。
+	MaxRunTokens int
+
+	// TaskRoster 提供"还剩什么没做完"的快照, 压缩时会被嵌进摘要 (H1-3)。
+	//
+	// 用函数签名而不是具体类型: 提供服务的是 pkg/tool/builtin 的 TodoWriteTool,
+	// 而 builtin 经 evotools → evolution/govern 与引擎侧成环, 引擎 import 不了它。
+	// 装配处 (cmd / feishu) 把 todo 工具的 Snapshot 方法包一层传进来。
+	//
+	// nil = 不注入清单, 行为与改造前逐字节相同。
+	TaskRoster func() []internal_hook.TaskRosterItem
 
 	// AgentDBSemantic 层 2 语义增强面: agentDB 语义引擎客户端 (可选, nil 则不注册
 	// AgentDBSemanticInjectHook)。经 serve /v1/memory|retrieve|files 跨源检索并注入
 	// system prompt (MemoryInject 的 agentDB 后端, 规划 14.1.4.3)。
 	AgentDBSemantic     *agentdbsemantic.Client
-	SemanticTopK        int // 每源检索条数 (默认 5)
-	SemanticTokenBudget int // 注入上下文 token 预算 (默认 600)
-	SemanticReserve     int // 为任务正文预留 token (默认 200)
+	SemanticTopK        int    // 每源检索条数 (默认 5)
+	SemanticTokenBudget int    // 注入上下文 token 预算 (默认 600)
+	SemanticReserve     int    // 为任务正文预留 token (默认 200)
 	Cwd                 string // 当前工作目录
-	PermissionMode   types.PermissionMode
-	IsNonInteractive bool
-	Debug            bool
-	SessionID        string
-	MetricsSource    string // LLM 指标来源: feishu_main / nested_agent / team_stage / cli
-	MetricsPurpose   string // 额外维度: chatID / team / stage / compact 等
-	Workflow         string // Agent Team 工作流名
-	Role             string // Agent 角色名
+	PermissionMode      types.PermissionMode
+	IsNonInteractive    bool
+	Debug               bool
+	SessionID           string
+	MetricsSource       string // LLM 指标来源: feishu_main / nested_agent / team_stage / cli
+	MetricsPurpose      string // 额外维度: chatID / team / stage / compact 等
+	Workflow            string // Agent Team 工作流名
+	Role                string // Agent 角色名
 	// Team 池个性化身份 (13.7-P1): 经 ToolContext.Team 透传给 pool_search/pool_load,
 	// 供 Beta 后验按 (team, role, asset) 记 trial。engine 不 import pkg/agent
 	// (避免 agent↔engine 环), 团队名由装配方显式填入, 不走 RunMetadataFromContext。
@@ -183,6 +346,16 @@ type Config struct {
 	EnableMetrics bool
 	// EnablePromptCache 启用 prompt 稳定前缀布局与 cache 命中追踪 (G1)。
 	EnablePromptCache bool
+
+	// MemoryIndexMode 记忆注入形态: nil = 未配置 (回落到环境变量), true = 只注入
+	// 索引 (id + 标题 + 预览), false = 注入正文。
+	//
+	// 指针而非 bool: 「没配」与「显式配了 false」必须能区分 —— 前者要回落到
+	// CLAUDE_GO_MEMORY_INDEX_MODE, 后者不该被 env 覆盖。见 resolvedMemoryIndexMode。
+	//
+	// 运行期翻转走 SetMemoryIndexMode (配置热加载调用), 不要直接改这个字段:
+	// 它只在 registerInternalHooks 读一次, 改了要下次重建链才生效。
+	MemoryIndexMode *bool
 	// EnableBudget 启用 Token 预算分级降级 (G2)。
 	// 到 Red/Critical 会对旧 tool_result 做摘要压缩, 可能影响老消息可回溯性。
 	EnableBudget bool
@@ -387,6 +560,21 @@ func NewQueryEngine(
 		}
 		logging.For("engine").Info("weak-model tool masking active", "masked", len(cfg.DisabledTools))
 	}
+	// hook 池化 (21.8.12 P3) 的两段式收口: 池在 hook 运行器之前装配 (工具注册期),
+	// 所以"运行期装载 hook"的装卸口只能在这里注入 —— 它是全仓唯一同时拿得到
+	// **工具注册表**与**hook 运行器**的地方, 而那两样正是这条接头需要的两端。
+	//
+	// 放在这里而不是每个调用点各写一遍: 调用点有 5 处 (飞书 3 + CLI 2), 而漏掉
+	// 其中任意一处的表现是"那条路径上 pool_load 一条 hook 报'运行时不支持'" ——
+	// 一个看起来像配置问题的行为差异, 查起来要去数调用点。一处收口则 5 条全通。
+	//
+	// 两端任一为 nil 时是**无操作**: 池没装配 (env 开关默认关) 或本次运行没有
+	// Runner, 这时 pool_load 一条 hook 会如实报"不支持", 不静默成功。
+	if tools != nil && hookRunner != nil {
+		if p := tools.Pool(); p != nil {
+			p.SetHookSink(hookRunner)
+		}
+	}
 	// 按 Config 开关懒加载对应组件。调用 EnableFrontierOptimizations() 可一次性启用 P0/P1。
 	e.applyFeatureFlags()
 	if e.LoopDet != nil {
@@ -442,6 +630,192 @@ func (e *QueryEngine) RefreshHooks() {
 	e.registerInternalHooks()
 }
 
+// VisibleTools 返回**当前实际可见**的工具名 (已排序), 即经 toolExposed 过滤后的
+// 结果。nil 接收者返回 nil。
+//
+// 与 Tools.Names() 的差别就在过滤: Names() 是注册表里有什么, 本方法是这次装配
+// 下模型**能看见**什么。装配自报要的是后者 —— 白名单误配的表现恰恰是"注册表
+// 里全都在, 但对模型一个都不可见", 拿注册表去报会把这件事完全掩盖掉。
+//
+// 注意它反映的是**调用时刻**的 Config: 平台可在运行期经 ApplyConstraints 收窄,
+// 收窄之后要重取一次才准。
+func (e *QueryEngine) VisibleTools() []string {
+	if e == nil || e.Tools == nil {
+		return nil
+	}
+	names := e.Tools.Names()
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if e.Config.toolExposed(n) {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// HiddenTools 返回被约束挡在模型视野之外的工具名 (已排序)。
+//
+// 单列出来是因为"看不见"有两种成因且处置完全不同: 被 DisabledTools 拉黑的
+// (工具坏了/不该用) 与被白名单挡掉的 (不在本岗位职责内)。装配对账要能区分它们,
+// 否则一次白名单写错看起来就像"这台机器上没装那个工具"。
+func (e *QueryEngine) HiddenTools() []string {
+	if e == nil || e.Tools == nil {
+		return nil
+	}
+	names := e.Tools.Names()
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if !e.Config.toolExposed(n) {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// InternalHookPhases 返回内置 Hook 链上每个相位已注册的 hook 名 (含空相位)。
+// 引擎未构造 HookChain / 链为 nil 时返回 nil。
+func (e *QueryEngine) InternalHookPhases() map[string][]string {
+	if e == nil || e.HookChain == nil {
+		return nil
+	}
+	return e.HookChain.PhaseHooks()
+}
+
+// resolvedMemoryIndexMode 决定记忆注入形态的初值。
+//
+// 优先级: 配置项 engine.memoryIndexMode > 环境变量 CLAUDE_GO_MEMORY_INDEX_MODE。
+//
+// 为什么配置优先而不是环境变量优先: 环境变量是**进程启动时读一次**的, 改了要
+// rollout 重启; 而配置走 hotreload.WatchConfig, 5 秒比对一次内容, 改完即生效,
+// 对 k8s 里长跑、队列里还压着任务的进程尤其重要。环境变量保留作兜底 ——
+// 容器里没有配置文件、只有 env 的部署仍然能用。
+//
+// Config.MemoryIndexMode 是指针: nil(未配置) 与 false(显式关) 必须区分开,
+// 否则显式关会被 env 的兜底值反向覆盖。
+func (e *QueryEngine) resolvedMemoryIndexMode() bool {
+	if e != nil && e.Config != nil && e.Config.MemoryIndexMode != nil {
+		return *e.Config.MemoryIndexMode
+	}
+	return builtin.MemoryIndexModeEnabled(os.Getenv)
+}
+
+// mergeUsage 把一帧用量并入已收集的用量。nil 安全 (两帧都可能缺席)。
+//
+// # 为什么是"按非零填写"而不是"后者整体覆盖"
+//
+// 一次流式响应里用量被拆在两个地方, 拆法**随协议而异**:
+//
+//	anthropic (Protocol 零值, 即默认) —— message_start 带 input/cache_read/cache_creation,
+//	  message_delta 只带 output_tokens;
+//	openai / openai-responses —— 翻译器把 message_start 的 usage 造成空对象,
+//	  全部真实用量挂在 message_delta 上。
+//
+// 原实现是 `usage = event.X` 的整体覆盖, 于是 anthropic 协议下输入侧会被 message_delta
+// 那一帧抹掉, 累计只剩输出 —— 而输入通常是输出的一到两个数量级。这个丢失是**静默**的:
+// run 照常成功、终态正常, 只有账不对。P0-1 的预算闸门正建立在这个账上, 所以它必须先对。
+//
+// 按非零填写对两种拆法都成立: 拆开时两帧各填一半, 合起来正好; 两帧都报全量时
+// 后一帧的值覆盖同名的前一帧的值, 不会翻倍。
+//
+// 代价 (需明说): 同一个字段在两帧里分别报 x 与 y (y≠x, 都非零) 时, 以 y 为准。
+// 这不是本函数的选择, 是协议本身没给"谁是最终值"的语义; 取后到的那帧是唯一合理的读法。
+//
+// # 两处调用点里真正承重的是哪一处 (变异测试结论, 不是推测)
+//
+// 把 message_delta 那处改回整体覆盖 ⇒ TestUsage_MergesBothFrames 立刻失败;
+// 把 message_start 那处改回整体覆盖 ⇒ 测试**仍然通过** (因为后到的 message_delta
+// 会把输入侧补回来)。所以修掉这个缺陷的是 message_delta 那一处。
+//
+// message_start 那处保留 merge 不是冗余: 它让本函数的语义在**任意帧序**下都成立,
+// 而上游发帧顺序不在我们控制之内 (翻译器、网关都可能改序)。但读代码的人该知道
+// 哪一行在承重 —— 否则将来有人"简化"掉 message_delta 那处时会以为两处对等。
+func mergeUsage(dst, src *types.Usage) *types.Usage {
+	if src == nil {
+		return dst // 这一帧没带用量, 保持已收集的
+	}
+	if dst == nil {
+		cp := *src
+		return &cp
+	}
+	if src.InputTokens != 0 {
+		dst.InputTokens = src.InputTokens
+	}
+	if src.OutputTokens != 0 {
+		dst.OutputTokens = src.OutputTokens
+	}
+	if src.CacheReadInputTokens != 0 {
+		dst.CacheReadInputTokens = src.CacheReadInputTokens
+	}
+	if src.CacheCreationInputTokens != 0 {
+		dst.CacheCreationInputTokens = src.CacheCreationInputTokens
+	}
+	return dst
+}
+
+// chargeRunBudget 把一次成功调用的用量记进 run 级闸门, 并识别 run 边界。
+//
+// run 边界的识别方式 (RunID 变化) 是刻意的: CumulativeUsage 的注释写着"本会话累积",
+// 而闸门要的是 run 级语义。不复位的话, 长会话跑到第 N 个 run 时会被前 N-1 个 run 的
+// 累计消耗呛死。判据取 trace 四元组里的 RunID 而不是"重新构造了引擎" —— 后者在
+// 复用引擎的编排路径上是假的 (agent 的 factory 复用同一个 eng 跑每个 stage)。
+//
+// 只在这里被调用, 由 queryLoop 单线程驱动, 故 lastBudgetRunID 无需加锁。
+func (e *QueryEngine) chargeRunBudget(ctx context.Context, usage *types.Usage) {
+	if e == nil || e.RunBudget == nil || usage == nil {
+		return
+	}
+	if runID := trace.From(ctx).RunID; runID != e.lastBudgetRunID {
+		e.RunBudget.Reset()
+		e.lastBudgetRunID = runID
+	}
+	// 四项求和与 CumulativeUsage 的累计项逐一对应 (含缓存读写)。合计为 0 的调用
+	// 不报账: 一个报了全 0 用量的响应不该占用一次计费事件。
+	total := usage.InputTokens + usage.OutputTokens +
+		usage.CacheReadInputTokens + usage.CacheCreationInputTokens
+	if total <= 0 {
+		return
+	}
+	e.RunBudget.Spend(total)
+}
+
+// runTokenBudget 解析一次调用的预算上限: Config.MaxRunTokens 优先, 未配置时回落
+// 到 CLAUDE_GO_MAX_RUN_TOKENS; 都不可用则返回 0 = 不设限 (保持现状行为)。
+//
+// **必须允许配置一个显式关闭**: "没配" 与 "配成 0 (不设限)" 在部署上都会出现, 而
+// 后者是有意的运营选择。两者都返回 0, 但只有前者会去看 env —— 这正是配置优先于
+// env 的落点 (与 resolvedMemoryIndexMode 同一族: 显式配置不该被 env 反向覆盖)。
+func (e *QueryEngine) runTokenBudget() int {
+	if e == nil || e.Config == nil {
+		return 0
+	}
+	if e.Config.MaxRunTokens > 0 {
+		return e.Config.MaxRunTokens
+	}
+	if e.Config.MaxRunTokens < 0 {
+		return 0 // 显式负值 = 明确关闭, 不再看 env
+	}
+	return runTokenLimitFromEnv()
+}
+
+func runTokenLimitFromEnv() int {
+	v := strings.TrimSpace(os.Getenv("CLAUDE_GO_MAX_RUN_TOKENS"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		// 解析不了就当作没配。**不 fail-closed 成 0 上限** —— 那会把一个手滑的
+		// 环境变量变成"所有 run 一步都跑不了", 而配置错误该是吵一声然后走默认。
+		if err != nil {
+			logging.For("engine").Warn("CLAUDE_GO_MAX_RUN_TOKENS 不是整数, 忽略", "value", v)
+		}
+		return 0
+	}
+	return n
+}
+
 // applyFeatureFlags 根据 Config.Enable* 懒初始化组件实例。
 // 幂等: 多次调用安全, 已存在的组件不会被替换。
 func (e *QueryEngine) applyFeatureFlags() {
@@ -456,6 +830,16 @@ func (e *QueryEngine) applyFeatureFlags() {
 	}
 	if e.Config.EnableBudget && e.Budget == nil {
 		e.Budget = internal_hook.NewTokenBudgetManager(e.ContextBudget)
+	}
+	// P0-1 run 级预算闸门。与上面那道 EnableBudget 是**两件事**, 不要合并:
+	// TokenBudgetManager 管的是"这一轮请求的上下文窗口还剩多少"(超了压缩旧消息),
+	// RunBudgetGate 管的是"整个 run 累计花了多少钱"(超了停止 run)。
+	// 前者是质量治理, 后者是成本止损; 混在一起的后果是"上下文还很空所以继续烧钱"。
+	if e.RunBudget == nil {
+		if limit := e.runTokenBudget(); limit > 0 {
+			e.RunBudget = internal_hook.NewRunBudgetGate(limit)
+			logging.For("engine").Info("run 级 token 预算已启用", "limit", limit)
+		}
 	}
 	if e.Config.EnableLoopDetector && e.LoopDet == nil {
 		e.LoopDet = internal_hook.NewLoopDetector()
@@ -475,6 +859,30 @@ func (e *QueryEngine) applyFeatureFlags() {
 	e.registerInternalHooks()
 }
 
+// HasCompactionSink 报告折叠读数出口是否已接线 (H2-1)。
+//
+// 给"接线本身"一条可断言的判据: 采集逻辑的单测直接构造 hook, 测不到引擎有没有把
+// sink 装上 —— 而漏装的线上表现恰好是"折叠照常发生、轨迹里一条读数都没有"。这种
+// "逻辑对、接线漏"的形态两边测试都绿 (design/03 §4.1 记过同一类教训)。
+func (e *QueryEngine) HasCompactionSink() bool {
+	if e == nil || e.HookChain == nil {
+		return false
+	}
+	for _, h := range e.HookChain.Hooks(internal_hook.PhasePreCompact) {
+		switch v := h.(type) {
+		case *internal_hook.AutoCompactHook:
+			if v.HasCompactionSink() {
+				return true
+			}
+		case *internal_hook.MicroCompactHook:
+			if v.HasCompactionSink() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // registerInternalHooks 根据当前引擎组件状态注册所有内置 Hook。
 // 幂等：每次调用会重建 HookChain，确保组件懒加载后被正确注册。
 func (e *QueryEngine) registerInternalHooks() {
@@ -485,9 +893,32 @@ func (e *QueryEngine) registerInternalHooks() {
 
 	// PhasePreCompact: AutoCompact(10) + MicroCompact(20) + BudgetDegrade(30)
 	if e.Compactor != nil {
-		e.HookChain.Register(internal_hook.NewAutoCompactHook(e.Compactor, e.MemoryStore, e.Ingestor, e.HookRunner))
+		// 折叠边界那次折叠也走文件引用 (与 MicroCompact 同目录), 否则被摘要
+		// 掉的那段历史里的大 tool_result 就永久丢了 —— 而那恰恰是模型刚据以
+		// 推理过、最可能要回读的一段。
+		e.Compactor.SetToolResultRefStore(e.Config.Cwd)
+		acHook := internal_hook.NewAutoCompactHook(e.Compactor, e.MemoryStore, e.Ingestor, e.HookRunner)
+		// H1-3: 压缩时把待办清单嵌进摘要。清单原先只活在摘要之前的历史里, 折掉
+		// 之后模型就看不见"还剩什么没做完"了 —— 这是长任务跑到第 80 轮时进度
+		// 不可信的直接成因。
+		if e.Config.TaskRoster != nil {
+			acHook.SetTaskRosterSource(e.Config.TaskRoster)
+		}
+		// H2-1 压缩可观测: 把折叠读数接到 compaction Span。装在 compactor 上
+		// (SetOnCompact) 而不是只报本 hook 这一次 —— 折叠还有 PTL 应急压缩与
+		// queryLoop 直调两条路径, 只报这里就漏掉那两条。
+		if e.TraceStore != nil {
+			acHook.SetCompactionSink(e)
+		}
+		e.HookChain.Register(acHook)
 	}
-	e.HookChain.Register(internal_hook.NewMicroCompactHook())
+	// 传 Cwd: 折叠原文落盘到 <cwd>/.claude-go/tool-results/, 占位里给出可 Read
+	// 回读的路径。Cwd 为空时自动退化为纯截断 (行为与改造前一致)。
+	microHook := internal_hook.NewMicroCompactHook(e.Config.Cwd)
+	if e.TraceStore != nil {
+		microHook.SetCompactionSink(e)
+	}
+	e.HookChain.Register(microHook)
 	if e.Budget != nil {
 		e.HookChain.Register(internal_hook.NewBudgetDegradeHook(e.Budget, e.HookRunner, e.Metrics))
 	}
@@ -509,7 +940,25 @@ func (e *QueryEngine) registerInternalHooks() {
 	}
 	e.HookChain.Register(internal_hook.NewMessageMetricsHook(e.Metrics))
 	if e.MemoryStore != nil || e.FactStore != nil {
-		e.HookChain.Register(internal_hook.NewMemoryInjectHook(e.MemoryStore, e.FactStore))
+		memHook := internal_hook.NewMemoryInjectHook(e.MemoryStore, e.FactStore)
+		// 检索遥测 (mem_retrieval_count_l1/l2 + mem_injection_chars)。落点取全局
+		// LLM 采集器: 它由进程启动时按 stateDir 初始化, 与 llm.jsonl 同目录, 于是
+		// "记忆注入多少"和"这次调用烧了多少 token"能在同一块面板上对账。
+		//
+		// 必须先判 c != nil 再传: GlobalLLMCollector 返回的是 *Collector, 未初始化
+		// 时是个**带类型的 nil**。直接塞进 SetMetrics(MemoryMetricsRecorder) 会被
+		// 装箱成一个**非 nil 的接口**, hook 里那句 `h.metrics == nil` 于是拦不住,
+		// 第一次检索就 Record 到 nil 接收者上 panic —— 而且只在"没初始化采集器 +
+		// 真跑到记忆检索"这个组合下出现, 探针与单测正好都符合, 生产因为采集器总
+		// 是开着的反而看不见。想"不采集"就必须把 nil 挡在这里。
+		if c := metrics.GlobalLLMCollector(); c != nil {
+			memHook.SetMetrics(c)
+		}
+		// 索引注入形态 (默认关)。配置项优先, 环境变量作兜底 —— 见
+		// resolvedMemoryIndexMode 的注释说明为什么是这个优先级。
+		memHook.SetIndexMode(e.resolvedMemoryIndexMode())
+		e.memHook = memHook // 热加载路径要能 Set, 见 SetMemoryIndexMode
+		e.HookChain.Register(memHook)
 	}
 	if e.Config.AgentDBSemantic != nil {
 		topK, budget, reserve := e.Config.SemanticTopK, e.Config.SemanticTokenBudget, e.Config.SemanticReserve
@@ -728,9 +1177,12 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, userContent string) <-c
 	go func() {
 		defer close(ch)
 		finalMsgs, terminal := e.queryLoop(ctx, messages, ch, nil)
-		_ = terminal
-
+		// 记下终态。**这不是给测试开的后门, 而是补一个真实缺口**: 在此之前
+		// queryLoop 的返回值被 `_ = terminal` 丢掉, 于是"这个 run 为什么结束"
+		// 只有 firePhasePostTurn 的 span 侧知道, 进程内的调用方无从判断。
+		// H0-2/H0-5 的验收都要求"终态原因可断言且带身份", 没有这块就只剩日志。
 		e.mu.Lock()
+		e.lastTerminal = terminal
 		e.Messages = finalMsgs
 		e.mu.Unlock()
 
@@ -754,6 +1206,24 @@ func (e *QueryEngine) SubmitStream(ctx context.Context, userContent string) <-ch
 func (e *QueryEngine) SubmitStreamBlocks(ctx context.Context, userContent string, extraBlocks []types.ContentBlock) <-chan types.StreamEvent {
 	streamCh := make(chan types.StreamEvent, 200)
 	msgCh := make(chan types.Message, 50)
+
+	// msgCh 必须有人排空, 否则**长会话必然死锁**。
+	//
+	// queryLoop 同时往两个通道写 (消息流 ch + 事件流 streamCh), 但本函数的返回值
+	// 只有 streamCh —— 调用方 (cmd/claude-go 的 REPL 与 run) 也只读 streamCh。
+	// 于是 msgCh 没有读者, 它的 50 格缓冲一满, queryLoop 就永远卡在 `ch <- m` 上,
+	// 而 main 永远等在 streamCh 上: 两边互等, 谁也不会退出。
+	//
+	// 实测: 一个只产生 50 条以内消息的短会话跑得好好的 (缓冲吃得下), 一个跑了 10
+	// 分钟、消息数超过 50 的长会话则**永久挂住** —— 进程还在, CPU 0%, 无网络连接,
+	// 协程 dump 里 queryLoop 停在 chansend。这个缺陷只在长任务上现形。
+	//
+	// 消息本身不会因此丢失: 它们同样经由下面的 e.Messages = finalMsgs 与
+	// SessionStore 落盘, msgCh 只是 SubmitMessage 那条路径的历史遗留。
+	go func() {
+		for range msgCh {
+		}
+	}()
 
 	e.mu.Lock()
 	text := e.initialUserTextLocked(userContent)
@@ -779,9 +1249,10 @@ func (e *QueryEngine) SubmitStreamBlocks(ctx context.Context, userContent string
 		defer close(streamCh)
 		defer close(msgCh)
 		finalMsgs, terminal := e.queryLoop(ctx, messages, msgCh, streamCh)
-		_ = terminal
 
+		// 同 SubmitMessage: 记下终态供调用方判断"这个 run 为什么结束"。
 		e.mu.Lock()
+		e.lastTerminal = terminal
 		e.Messages = finalMsgs
 		e.mu.Unlock()
 
@@ -824,9 +1295,80 @@ func (e *QueryEngine) SubmitStreamBlocks(ctx context.Context, userContent string
 //	  toolResults = runTools(toolUseBlocks, registry, context)
 //	  messages = append(messages, assistantMsgs, toolResults)
 //	}
+//
+// injectHookContext 把 hook 返回的 AdditionalContext 作为**非 meta 的 user 消息**追加进
+// 消息序列。这是 P0「去装饰」的核心: 在本次改动之前, hookOut.AdditionalContext 全仓
+// 只有 PreToolUse 一个消费方 (pkg/tool/orchestration.go:241), 其余 20+ 处只读 Decision/Reason
+// —— 一条 prompt 型 hook 挂在 PreTurn/PreRequest/PostCompact 上时,
+// **跑了、返回了、文本静默消失**。这正是 21.8.2「声明了但没接线」的典型形态。
+//
+// 两条设计约束:
+//
+//  1. **不加 IsMeta**。IsMeta 的消息在组装 API 请求时会被过滤掉, 加了就等于重新把这行
+//     代码变回装饰。是否投递与"是不是 hook 注入"是两件事, 用 Metadata 标记而不是 IsMeta。
+//
+//  2. **不破坏 prompt 前缀缓存**。同一 hook 每轮可能返回同样的内容, 无条件追加会让前缀
+//     每轮都在变。所以逐字符比对: 内容已出现在序列里就跳过 (同时挡连续重复与跨轮重复)。
+//     空内容直接不注入 —— 注入一条空 user 消息会白白改变前缀, 是纯亏损。
+func (e *QueryEngine) injectHookContext(messages []types.Message, hookOut *types.HookOutput, where string) []types.Message {
+	if hookOut == nil {
+		return messages
+	}
+	ctxText := strings.TrimSpace(hookOut.AdditionalContext)
+	if ctxText == "" {
+		return messages
+	}
+	for _, m := range messages {
+		if m.IsMeta {
+			continue // meta 消息不参与去重: 它本来就不会被投递
+		}
+		for _, b := range m.Content {
+			if b.Type == types.ContentBlockText && strings.TrimSpace(b.Text) == ctxText {
+				return messages // 已经在序列里了, 不重复注入
+			}
+		}
+	}
+	if messages == nil {
+		messages = make([]types.Message, 0, 1)
+	}
+	logging.For("engine").Debug("hook AdditionalContext 注入", "where", where, "len", len(ctxText))
+	return append(messages, types.Message{
+		Type:      types.MessageTypeUser,
+		CreatedAt: time.Now(),
+		Content: []types.ContentBlock{{
+			Type: types.ContentBlockText,
+			Text: ctxText,
+		}},
+	})
+}
+
 func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message, streamCh chan<- types.StreamEvent) ([]types.Message, types.Terminal) {
 	turnCount := 0
 	currentModel := e.Config.Model
+
+	// 运行中入站通道 (21.8.12 P5) 的两半之一: 标记"有 loop 可以接注入"。
+	//
+	// 计数而不是布尔: 同一个引擎上可能同时跑着多个 queryLoop (嵌套派生 / 多阶段复用
+	// 同一个引擎), 用 bool 的话先结束的那个会把标记清掉, 而另一个还在跑 —— 于是注入
+	// 被拒, 而拒的理由 (running==0) 是假的。
+	e.inbox.Enter()
+	// defer 而不是在每条 return 前手动减: 这个函数有十几条 return (abort / 各类终态),
+	// 手写的必然漏掉其中几条, 而漏掉的后果是**队列永久认为有人接** —— 之后所有
+	// 注入都被收下、永远不被消费, 且没有任何信号。
+	defer e.inbox.Leave()
+	// sentUpTo 是"已经发给过上游的消息条数"水位线。
+	//
+	// 用途: 缓存感知的压缩只能动 [sentUpTo, len(messages)) —— 即本轮新增、尚未
+	// 出现在任何已发出请求里的消息。**[0, sentUpTo) 是已经躺在缓存里的前缀, 一个
+	// 字节都不能改**: 前缀缓存按字节比对, 改动位置之后的全部缓存当场失效。
+	//
+	// 这在改造前是没有约束的: MicroCompact 每轮遍历全部历史、FilterPureToolUseUnits
+	// 每轮删历史尾部以外的纯 tool_use 单元, 于是同一条 tool_result 在第 1 轮和第 3
+	// 轮发出去的字节不一样。实测 if-question-expand 的相邻请求 LCP 只有 64.6%。
+	//
+	// 注意它也必须跟着 AutoCompact 一起挪: 折叠换掉的是整段序列, 旧水位线在新序列
+	// 上不再有意义 (且折叠后的新前缀尚未发出, 理应可再折)。
+	sentUpTo := 0
 	// 方案三 L8: 确定性失败信号升级 (单向棘轮)。信号全部来自 harness 自有 hook 的
 	// 标记文本 (schema_validate 终态拦截 / loop_detector 抑制), 绝不取模型自评置信度。
 	escalated := false
@@ -861,7 +1403,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			turnModel = e.Config.FallbackModel
 		}
 		if turnModel != client.Model {
-			client = client.WithModel(turnModel)
+			client = client.WithModel(e.Config.outboundModel(turnModel))
 		}
 		// L1 裁定项 (D2): tool_choice=any 只在"执行回合"且显式 opt-in 时启用,
 		// 其余回合保持 auto——全局强制会破坏自然收尾 (13.3.9 探针实录)。
@@ -877,6 +1419,27 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				logging.For("engine").Warn("PreTurn blocked by hook", "reason", hookOut.Reason)
 				continue
 			}
+			// AdditionalContext 是 prompt 型 hook 的唯一产出。不接这一行, 挂在
+			// PreTurn 上的 hook 就是"跑了、返回了、文本静默消失"。
+			messages = e.injectHookContext(messages, hookOut, "PreTurn")
+		}
+
+		// 运行中入站消息 (21.8.12 P5 / D6-3 缺口 2 级 2): 取走交给本引擎的注入。
+		//
+		// 位置在 PreTurn 之后、Phase 0 (abort 检查) 之前, 理由是三条:
+		//
+		//  1. **轮次边界**: 每完成一次工具调用就回到这里, 于是注入的延迟是"到下一次
+		//     模型调用", 而不是整个 run 的时长 —— 后者正是改造前信箱注入 (只在阶段
+		//     起点一次) 的处境。
+		//  2. **前缀缓存安全**: 注入只发生在**本轮新增、尚未发出**的区域, 已发出的前缀
+		//     一个字节不动 (与上面 sentUpTo 那条纪律同一口径)。
+		//  3. **与 abort 检查的相对位置**: 放在它之后的话, 一个即将退出的 run 会先收下
+		//     消息再退出, 消息落进 inbox 无人消费 —— 而它本该被 CountInjectionsDropped
+		//     如实报出来。放在之前, 同样的处境下消息**根本没被收下** (InjectMessage
+		//     已经拒了), 少一条路径。
+		for _, m := range e.inbox.Drain() {
+			logging.For("engine").Info("运行中注入 user 消息", "turn", turnCount, "len", len(m.Content))
+			messages = append(messages, m)
 		}
 
 		// ============================================================
@@ -903,6 +1466,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				Messages:  messages,
 				TurnCount: turnCount,
 				Model:     currentModel,
+				SentUpTo:  sentUpTo,
 			}
 			preCompactResult, err := e.HookChain.Execute(internal_hook.PhasePreCompact, preCompactCtx)
 			if err != nil {
@@ -933,6 +1497,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			if hookOut != nil && (hookOut.Decision == "block" || hookOut.Decision == "deny") {
 				logging.For("engine").Warn("PostCompact blocked by hook", "reason", hookOut.Reason)
 			}
+			// 压缩把上下文换掉了, 这里注入的是"压缩后还想让模型记住什么"——
+			// 典型用途正是把被压掉的约束重新钉回来。丢掉它等于压缩后失忆。
+			messages = e.injectHookContext(messages, hookOut, "PostCompact")
 		}
 
 		// ============================================================
@@ -941,8 +1508,24 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// ============================================================
 		systemPrompt := e.PromptMgr.BuildEffectiveSystemPrompt(e.Tools)
 
-		// 将动态任务指令追加到 system prompt 末尾（作为最后一个 block）。
-		// 这样 system prompt 前缀仍可享受 cache，任务指令不占用 user message 空间。
+		// 稳定/可变分层: 任务指令排在 hook 追加块**之前**。
+		//
+		// 顺序是「base(稳定) → task(本轮任务) → memory(检索结果)」, 理由是把
+		// **易变的放最后**:
+		//
+		//   · task 块同一个业务键下每轮逐字节相同 (10K 字符级), 而 memory 块是
+		//     BM25 对当前记忆库算出来的 top-K, 记忆库在每次 run 结尾被 memory
+		//     拦截器写一次, 于是**下一次 run 的 top-K 与上一次必然不同** ——
+		//     实测两次 t0 之间库从 21 条涨到 24 条, 注入从 18576 掉到 17939。
+		//   · 前缀缓存断在第一个不同的字节。memory 排在 task 前面时, 那 637 字符
+		//     的漂移会让它**后面**的整个 task 块一起作废: 实测跨 run 首轮只读到
+		//     1024 token, 而仅仅把两者对调就能读到 ~4200。
+		//
+		// 历史: 这段注释原先写着"任务指令排在所有 hook 追加的块之后", 且拿
+		// if-question-expand 的 system_chars 从 4.8KB 涨到 23.8KB 作为依据。那个
+		// 观察本身没错, 但结论只对**同一个 run 内**成立 —— memory 在 t0 检索一次后
+		// 整个 run 复用 (见 MemoryInjectHook.cachedIn), 所以 run 内它看着是稳定的。
+		// 跨 run 时恰恰相反: 稳定的是 task, 漂移的是 memory。
 		if e.TaskInstruction != "" {
 			systemPrompt = append(systemPrompt, e.TaskInstruction)
 		}
@@ -956,6 +1539,12 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				TurnCount:    turnCount,
 				Model:        currentModel,
 				SystemPrompt: systemPrompt,
+				SentUpTo:     sentUpTo,
+				// 任务指令此刻**已经在** system 里 (见上方"稳定/可变分层", 它排在
+				// hook 追加块之前)。仍然单独传一份, 是因为 hook 需要的是"本轮任务
+				// 正文"这个语义 —— 让它们各自去 SystemPrompt 里翻找是脆的: 末段在
+				// 记忆块注入后就变成了记忆本身。
+				TaskInstruction: e.TaskInstruction,
 			}
 			preRequestResult, err := e.HookChain.Execute(internal_hook.PhasePreRequest, preRequestCtx)
 			if err != nil {
@@ -982,6 +1571,16 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				}
 			}
 		}
+
+		// (任务指令已在 PhasePreRequest 之前追加, 见上方"稳定/可变分层"一段。)
+
+		// 水位线推进点: 到这里 messages 已经定型, 下面就要发出去。
+		//
+		// 放在所有改写历史的 phase **之后**、StreamMessage **之前**。此刻的
+		// len(messages) 就是"即将进入缓存前缀"的条数, 从此往后任何 hook 都不得
+		// 再触碰 [0, sentUpTo)。重试分支 (fallback / PTL reactive compact) 会
+		// 重新走一遍循环体, 届时水位线随新的 messages 一并刷新。
+		sentUpTo = len(messages)
 
 		// ============ Plan 模型路由: 规划期独立模型 (类似 advisor 独立客户端) ============
 		// 放在 PhasePreRequest 之后判定: AutoModeHook 在该 phase 已置位会话级 plan flag,
@@ -1016,11 +1615,27 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				})
 				continue
 			}
+			// PreRequest 是"每次调模型前"的位置 —— 挂在这里的 prompt hook 想影响的
+			// 就是**这一次**请求, 所以必须在 messagesToAPI 之前落下。
+			messages = e.injectHookContext(messages, hookOut, "PreRequest")
 		}
 		apiMessages := messagesToAPI(messages, e.HookRunner)
 		allTools := e.Tools.APITools()
 		var apiTools []types.APITool
-		if len(e.Config.DisabledTools) > 0 || len(e.Config.AllowedTools) > 0 {
+		// ★ 白名单这一维的判据是 **!= nil (存在性)**, 不是 len() > 0。
+		//
+		// 这个 else 分支原本写着 `if len(DisabledTools) > 0 || len(AllowedTools) > 0`,
+		// 而 AllowedTools 的契约是 "非 nil 的空集 = 拒绝一切" (见本文件 toolExposed 与
+		// Config.AllowedTools 的注释)。空集长度是 0 ⇒ 走进 else ⇒ **apiTools 直接等于
+		// 全部工具, 一次过滤都不做**。于是一份显式写的 fail-closed 白名单, 在唯一的
+		// 单源判据之外被这个前置闸门整个架空: `toolExposed` 那几行是对的、被调用时也
+		// 判得对, 只是**根本没人调它**。
+		//
+		// 更坏的是它对不上账: VisibleTools() 走的是 toolExposed (报告里"零个工具可见"),
+		// 而出站请求走的是这里 (21 个工具照发) —— 装配对账会因为两边读的不是同一段代码
+		// 而报"一致"。黑名单用 len() 无妨 (空黑名单与没有黑名单行为相同), 但为省掉一次
+		// 遍历而把语义判错的收益是负数, 所以两维统一按存在性判。
+		if e.Config.DisabledTools != nil || e.Config.AllowedTools != nil {
 			for _, t := range allTools {
 				if e.Config.toolExposed(t.Name) {
 					apiTools = append(apiTools, t)
@@ -1068,7 +1683,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			switch event.Type {
 			case "message_start":
 				if event.Message != nil {
-					usage = event.Message.Usage
+					usage = mergeUsage(usage, event.Message.Usage)
 				}
 			case "ping":
 				// DashScope 发送 ping 心跳, 忽略
@@ -1170,7 +1785,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				}
 			case "message_delta":
 				if event.Usage != nil {
-					usage = event.Usage
+					usage = mergeUsage(usage, event.Usage)
 				}
 				if event.Delta != nil && event.Delta.StopReason != "" {
 					stopReason = event.Delta.StopReason
@@ -1328,8 +1943,18 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			// ---- 原始路径 (ErrorClassifier 未启用且 CircuitBreaker 未触发) ----
 			consecutiveErrors++
 			if consecutiveErrors >= internal_hook.MaxConsecutiveErrors {
-				// 理论上 CircuitBreakerHook 已处理此情况，保留兜底
-				consecutiveErrors = 0
+				// 兜底: 走到这里说明 OnError 链上的 error_classifier 与
+				// circuit_breaker 都没返回 Terminal (例如 HookChain 为 nil)。
+				// 此前这里是 `consecutiveErrors = 0` —— 重置计数器后继续跑,
+				// 这正是"系统从不主动终止"的直接来源: 计到阈值只换来一次清零。
+				// 现在改为真终止, 理由与 hook 侧区分开, 便于事后归因。
+				if e.HookRunner != nil {
+					e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+					e.HookRunner.ExecuteOnErrorHooks(messages, "circuit_breaker_no_hookchain", streamErr)
+					e.HookRunner.ExecuteStopFailureHooks(messages)
+				}
+				e.firePhasePostTurn(ctx, messages, turnCount, currentModel, "circuit_breaker", assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
+				return messages, types.Terminal{Reason: "circuit_breaker", Error: streamErr}
 			}
 
 			// Withheld error: 将错误作为 assistant 消息暂存, 继续循环等待恢复
@@ -1460,6 +2085,14 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				e.CumulativeUsage.CacheReadInputTokens += usage.CacheReadInputTokens
 				e.CumulativeUsage.CacheCreationInputTokens += usage.CacheCreationInputTokens
 				e.mu.Unlock()
+				// P0-1: 同一个 usage 也记进 run 级闸门。**必须写在这一处** ——
+				// 口径与 CumulativeUsage 逐项一致是这道闸门可信的前提, 两处各算一遍
+				// 必然漂移 (漂移的表现是"闸门说没超、账单说超了")。
+				//
+				// 只有在 usage != nil (即调用成功且有上报) 时才计费: 失败调用不带
+				// usage 是正常的 (流里没有 message_start), 当成 0 计入会让失败的 run
+				// 显得没花钱, 闸门等于没设。
+				e.chargeRunBudget(ctx, usage)
 			}
 			messages = append(messages, assistantMsg)
 		}
@@ -1570,8 +2203,38 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 		}
 
-		// maxTurns 检查 (在 tool 执行后检查, 对应 TS)
+		// run 级预算检查 (P0-1)。**放在 tool 执行之后**, 与 maxTurns 同一位置。
+		//
+		// 为什么不放在 usage 累加的那一刻就返回: 那时 assistant 消息里的 tool_use
+		// 还没执行, 直接返回会让 transcript 以一条**没有 tool_result 的 tool_use**
+		// 收尾 —— 那不是"提前停下", 是留下了一段任何后续 turn 都发不出去的畸形历史
+		// (H1/H3 要的正是"停下之后还能接着干")。代价是超支一个工具回合, 而那不会
+		// 再触发下一次 LLM 调用, 上界是确定的。
+		//
+		// 顺序上让 max_turns 优先: 两个判据同时命中时, "步数用完了"是更准确的自述。
 		turnCount++
+		if e.RunBudget != nil && e.RunBudget.Exhausted() {
+			stopped := fmt.Sprintf(
+				"⛔ 本 run 的 token 预算已耗尽 (上限 %d, 已消耗 %d), 停止继续调用模型。",
+				e.RunBudget.Limit(), e.RunBudget.Spent())
+			logging.For("engine").Warn("run 预算耗尽, 终止",
+				"limit", e.RunBudget.Limit(), "spent", e.RunBudget.Spent(),
+				"turn", turnCount, "run", e.lastBudgetRunID)
+			messages = append(messages, types.Message{
+				Type:    types.MessageTypeUser,
+				Content: []types.ContentBlock{{Type: types.ContentBlockText, Text: stopped}},
+				IsMeta:  true,
+			})
+			if e.HookRunner != nil {
+				e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
+			}
+			e.firePhasePostTurn(ctx, messages, turnCount, currentModel, internal_hook.RunBudgetExhaustedReason, assistantBlocks, turnToolSigs, turnUserIntent, turnPlanMsgs, turnStart, false)
+			return messages, types.Terminal{
+				Reason: internal_hook.RunBudgetExhaustedReason,
+				Error: fmt.Errorf("run token budget exhausted: limit=%d spent=%d",
+					e.RunBudget.Limit(), e.RunBudget.Spent()),
+			}
+		}
 		if e.Config.MaxTurns > 0 && turnCount > e.Config.MaxTurns {
 			if e.HookRunner != nil {
 				hookOut := e.HookRunner.ExecuteOnMaxTurnsReachedHooks(messages, turnCount)
@@ -1616,8 +2279,8 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			WeakResultPostprocess: e.Config.WeakModel.Enabled && e.Config.WeakModel.ResultPostprocess,
 			// 方案三 L2 护栏: edit/write 写入前语法校验 (与 SchemaRetry 同属 L2 开关)。
 			WeakEditGuard: e.Config.WeakModel.Enabled && e.Config.WeakModel.SchemaRetry,
-			SessionID:          e.Config.SessionID, // EnterPlanMode/ExitPlanMode 用会话级 plan flag
-			PlanFileDir:        e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
+			SessionID:     e.Config.SessionID,   // EnterPlanMode/ExitPlanMode 用会话级 plan flag
+			PlanFileDir:   e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
 			// 13.7-P1 池个性化身份透传 (team_stage 路径才有值; CLI/主会话为空)。
 			Team:       e.Config.Team,
 			Role:       e.Config.Role,
@@ -1627,6 +2290,17 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		toolExecStart := time.Now()
 		toolResults := tool.RunTools(ctx, toolUseBlocks, e.Tools, tctx, e.HookRunner)
 		toolExecLatency := time.Since(toolExecStart)
+
+		// run 级进展: 有任何一个工具**成功执行**, 就认为这个 run 还在产出,
+		// 清空无进展错误账本 (见 internal_hook.RunFailureLedgerWindow)。
+		//
+		// 判据刻意用"工具成功"而不是"模型回了话": 后者在退避重试的 run 里
+		// 每次都会发生, 拿它当进展就等于从不推进基线 —— 那正是交错失败
+		// 一路空转到 maxTurns 的原因。也不计入 IsError 的结果, 因为失败的工具
+		// 调用不构成产出 (与上方 TrajStore 的 ok 判定同源)。
+		if e.ErrClassifier != nil && toolProducedWork(toolResults) {
+			e.ErrClassifier.NoteProgress()
+		}
 
 		// 用于 G6 Trajectory: 记录本批工具签名
 		if e.TrajStore != nil {
@@ -1817,6 +2491,32 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// toolProducedWork 报告本批工具调用里是否至少有一个**成功**完成。
+//
+// 语义是 run 级"有没有产出", 供 ErrorClassifier.NoteProgress 使用:
+// 全部失败 = 没有产出, 账本继续累积; 任一成功 = 有产出, 账本清零。
+//
+// 空批次 (模型没调工具) 返回 false —— 那种情况下 run 的进展由模型自己
+// 的终止决定, 不该被记为产出。
+func toolProducedWork(toolResults []types.Message) bool {
+	for _, msg := range toolResults {
+		hasResult, failed := false, false
+		for _, cb := range msg.Content {
+			if cb.Type != types.ContentBlockToolResult {
+				continue
+			}
+			hasResult = true
+			if cb.IsError {
+				failed = true
+			}
+		}
+		if hasResult && !failed {
+			return true
+		}
+	}
+	return false
+}
+
 // sanitizeToolPairing 移除"孤儿"工具块: 保证每个 tool_use 都有对应 tool_result, 反之亦然。
 // 消息过滤/预算降级/压缩可能破坏 tool_use↔tool_result 配对, 严格网关 (Kimi/OpenAI 协议) 会 400。
 func sanitizeToolPairing(messages []types.Message) []types.Message {
@@ -1899,8 +2599,15 @@ func messagesToAPI(messages []types.Message, hookRunner *hooks.Runner) []types.A
 		}
 	}
 
-	// 优化1: 过滤不含 reasoning 的古老 assistant + tool_result 原子单元
-	messages = internal_hook.FilterPureToolUseUnits(messages, 6)
+	// 优化1 [已停用]: 过滤不含 reasoning 的古老 assistant + tool_result 原子单元。
+	//
+	// 停用原因: 它是**每轮重算**的滑动窗口 —— 窗口随 len(messages) 前移, 于是一条
+	// 上一轮还在的消息这轮被删掉, 后面所有消息整体前移一个位置。前缀缓存按字节
+	// 比对, "删中间" 比"改写"更彻底: 改写至少还留着断点之前的部分, 删除点之后的
+	// 全部前缀一起作废。历史长度应当由 AutoCompact 的折叠边界一次性收敛, 而不是
+	// 每轮动态裁剪。
+	//
+	// 若将来要恢复类似能力, 必须做成"只作用本轮新增消息"的形态, 而不是全量重算。
 
 	// 优化1b: 修复工具配对 —— 过滤/压缩可能产生孤儿 tool_use 或 tool_result,
 	// Anthropic 原生 API 容忍, 但 Kimi 等严格网关 (OpenAI 协议翻译层) 会 400

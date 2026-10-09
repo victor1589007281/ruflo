@@ -127,7 +127,7 @@ func (ptm *ProductionTeamManager) tryContentQualityGate(ctx context.Context, tea
 		if sr.Status == TaskCompleted && strings.TrimSpace(sr.Output) != "" {
 			results[idx].Output = sr.Output
 			if team.Blackboard != nil {
-				team.Blackboard.Write(stage.Name+"-result", sr.Output, stage.Role, "result")
+				team.Blackboard.Write(stage.Name+"-result", sr.Output, stage.Agent, "result")
 			}
 		} else {
 			return results // 重做失败 → 保留原产出

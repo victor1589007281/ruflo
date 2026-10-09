@@ -97,8 +97,8 @@ func goodPipeline(name string) *WorkflowDef {
 	return &WorkflowDef{
 		Name: name, Mode: "pipeline", QualityGate: "content",
 		Stages: []StageDef{
-			{Name: "research", Role: "researcher", Prompt: "调研 {objective}"},
-			{Name: "write", Role: "writer", Prompt: "写作 {prev_result}", DependsOn: []string{"research"}},
+			{Name: "research", Agent: "researcher", Prompt: "调研 {objective}"},
+			{Name: "write", Agent: "writer", Prompt: "写作 {prev_result}", DependsOn: []string{"research"}},
 		},
 	}
 }
@@ -113,7 +113,7 @@ func TestWorkflowValidate(t *testing.T) {
 		"空名":      {Name: "", Mode: "pipeline", Stages: []StageDef{{Name: "a", Prompt: "x"}}},
 		"无阶段":     {Name: "n", Mode: "pipeline"},
 		"非纯数据模式":  {Name: "n", Mode: "creative_media", Stages: []StageDef{{Name: "a", Prompt: "x"}}},
-		"角色缺失无内联": {Name: "n", Mode: "pipeline", Stages: []StageDef{{Name: "a", Role: "nope"}}},
+		"角色缺失无内联": {Name: "n", Mode: "pipeline", Stages: []StageDef{{Name: "a", Agent: "nope"}}},
 		"依赖不存在":   {Name: "n", Mode: "pipeline", Stages: []StageDef{{Name: "a", Prompt: "x", DependsOn: []string{"ghost"}}}},
 		"阶段名重复": {Name: "n", Mode: "pipeline", Stages: []StageDef{
 			{Name: "a", Prompt: "x"}, {Name: "a", Prompt: "y"}}},

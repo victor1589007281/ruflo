@@ -26,7 +26,7 @@ import (
 type distillRec struct {
 	Type    string `json:"type"`
 	Message struct {
-			Content json.RawMessage `json:"content"`
+		Content json.RawMessage `json:"content"`
 	} `json:"message"`
 	IsMeta bool `json:"isMeta"`
 }

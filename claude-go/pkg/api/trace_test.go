@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	cgtrace "github.com/anthropic/claude-go/pkg/trace"
 )
 
 func TestTrace_零值判定(t *testing.T) {
@@ -74,6 +76,56 @@ func TestTrace_未设置时零副作用(t *testing.T) {
 		t.Errorf("头数量从 %d 变成 %d", before, len(req.Header))
 	}
 	setTraceHeaders(nil, context.Background()) // 不该 panic
+}
+
+// 团队路径只注入 pkg/trace, 从不碰 api.WithTrace —— 而会话头是这块代码算的,
+// 于是它此前**发不出会话头**。这条钉住补齐的那一半。
+func TestTrace_认pkgTrace注入的四元组(t *testing.T) {
+	ctx := cgtrace.With(context.Background(), cgtrace.IDs{
+		RunID: "run-team-abc", NodeID: "stage-1", TurnID: "t9",
+	})
+	req := httptest.NewRequest(http.MethodPost, "http://x/messages", nil)
+	setTraceHeaders(req, ctx)
+
+	if got := req.Header.Get(TraceHeaderRunID); got != "run-team-abc" {
+		t.Errorf("团队路径的 RunID 头丢了: %q", got)
+	}
+	if got := req.Header.Get(TraceHeaderNodeID); got != "stage-1" {
+		t.Errorf("NodeID 头丢了: %q", got)
+	}
+	// 会话头必须跟着出来 —— 团队成员只注入 pkg/trace, 没有它上游就按 seed 兜底。
+	if got := req.Header.Get(SessionHeader); got == "" {
+		t.Error("团队路径没发出会话头 (上游会落到进程级兜底分片)")
+	}
+}
+
+// 显式 SessionID 必须**压过** RunID 之外的默认分片: 这是跨 run 复用的全部依据。
+// 同一条业务会话的两次运行 RunID 不同, 但会话头必须完全相同。
+func TestTrace_显式会话ID跨run稳定(t *testing.T) {
+	sid := "if-sess-deadbeef"
+	hdrFor := func(runID string) string {
+		ctx := cgtrace.With(context.Background(), cgtrace.IDs{RunID: runID, SessionID: sid})
+		req := httptest.NewRequest(http.MethodPost, "http://x/messages", nil)
+		setTraceHeaders(req, ctx)
+		return req.Header.Get(SessionHeader)
+	}
+	a, b := hdrFor("run-1"), hdrFor("run-2")
+	if a != sid {
+		t.Fatalf("出站会话头应为显式值 %q, got %q", sid, a)
+	}
+	if a != b {
+		t.Fatalf("跨 run 会话头不稳定: %q vs %q —— 缓存每次都从头算", a, b)
+	}
+}
+
+// 对照组: 没给 SessionID 时行为必须与改造前逐字节相同 (按 RunID 分片)。
+func TestTrace_无显式会话ID时退回RunID(t *testing.T) {
+	ctx := cgtrace.With(context.Background(), cgtrace.IDs{RunID: "run-only"})
+	req := httptest.NewRequest(http.MethodPost, "http://x/messages", nil)
+	setTraceHeaders(req, ctx)
+	if got := req.Header.Get(SessionHeader); got != "run-only" {
+		t.Errorf("无显式会话 ID 时应按 RunID 分片, got %q", got)
+	}
 }
 
 // trace 与 LLMMetricsContext 各用一个 key, 互不覆盖 ——

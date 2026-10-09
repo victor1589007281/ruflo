@@ -24,6 +24,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
+
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // Board 通信机制抽象 (design/01 §4.11) — 黑板的单一接口。
@@ -439,7 +442,7 @@ func extractKeyContent(text string, maxLen int) string {
 	}
 
 	if len(parts) == 0 {
-		return text[:maxLen] + "..."
+		return textutil.Truncate(text, maxLen, "...")
 	}
 	return strings.Join(parts, "\n\n---\n\n")
 }
@@ -470,25 +473,25 @@ func extractFirstParagraph(text string) string {
 	if idx > 0 && idx < 500 {
 		return text[:idx]
 	}
-	if len(text) > 300 {
-		return text[:300]
-	}
-	return text
+	return textutil.Truncate(text, 300, "")
 }
 
 func smartTruncate(s string, max int) string {
-	if len(s) <= max {
+	if utf8.RuneCountInString(s) <= max {
 		return s
 	}
 	cut := max - 20
 	if cut < 0 {
 		cut = max
 	}
+	// head 是前 cut 个字符 (rune 边界安全); 换行查找与"是否在前半段"的
+	// 判断都在 head 内进行, 因此下标与长度同为 head 的字节口径。
+	head := textutil.Truncate(s, cut, "")
 	// 尝试在换行处截断
-	if idx := strings.LastIndex(s[:cut], "\n"); idx > cut/2 {
-		return s[:idx] + "\n...(truncated)"
+	if idx := strings.LastIndex(head, "\n"); idx > len(head)/2 {
+		return head[:idx] + "\n...(truncated)"
 	}
-	return s[:cut] + "...(truncated)"
+	return head + "...(truncated)"
 }
 
 // HandoffContext 构建结构化的阶段交接上下文。

@@ -236,7 +236,7 @@ func resolveStagePrompt(node string) (target, prompt string, ok bool) {
 			if strings.TrimSpace(st.Prompt) == "" {
 				continue // 阶段用角色 SystemPrompt 而非 StageDef.Prompt: 不在本支线范围
 			}
-			hits = append(hits, wf.Name+"/"+st.Name)
+			hits = append(hits, learners.StageTarget(wf.Name, st.Name))
 			hitPrompt = st.Prompt
 		}
 	}

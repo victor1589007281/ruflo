@@ -5,12 +5,13 @@
 // 后半段复用 v2 的 Phase 2-4 (大纲设计 → 章节对抗循环 → 全书整合) 进行实际写作。
 //
 // 六阶段:
-//   Phase A: 创世播种 (Genesis) — 世界规则+角色灵魂+命运催化剂+演化蓝图
-//   Phase B: 群体演化 (Swarm Evolution) — Engine.Simulate("social") 多时间线并行
-//   Phase C: 命运审判 (Evaluation) — Engine.Predict() 多分析师辩论+融合
-//   Phase D: 大纲设计 (Outline Design) — 复用 v2 outline-architect
-//   Phase E: 章节写作 (Chapter Writing) — 复用 v2 novelist↔editor 对抗循环
-//   Phase F: 全书整合 (Book Assembly) — 复用 v2 全书审阅
+//
+//	Phase A: 创世播种 (Genesis) — 世界规则+角色灵魂+命运催化剂+演化蓝图
+//	Phase B: 群体演化 (Swarm Evolution) — Engine.Simulate("social") 多时间线并行
+//	Phase C: 命运审判 (Evaluation) — Engine.Predict() 多分析师辩论+融合
+//	Phase D: 大纲设计 (Outline Design) — 复用 v2 outline-architect
+//	Phase E: 章节写作 (Chapter Writing) — 复用 v2 novelist↔editor 对抗循环
+//	Phase F: 全书整合 (Book Assembly) — 复用 v2 全书审阅
 //
 // 复用基础设施:
 //   - swarm_intel.Engine: 群体智能引擎 (Simulate + Predict 流水线)
@@ -44,14 +45,14 @@ func novelV3Workflow() *WorkflowDef {
 		Rounds:      0,
 		Stages: []StageDef{
 			// Phase A: Genesis
-			{Name: "world-forge", Role: "world-forger", Prompt: worldForgerPrompt},
-			{Name: "soul-forge", Role: "soul-forger", DependsOn: []string{"world-forge"}, Prompt: soulForgerPrompt},
-			{Name: "catalyst", Role: "fate-weaver", DependsOn: []string{"world-forge", "soul-forge"}, Prompt: fateWeaverPrompt},
-			{Name: "evo-blueprint", Role: "evo-architect", DependsOn: []string{"world-forge", "soul-forge", "catalyst"}, Prompt: evoArchitectPrompt},
+			{Name: "world-forge", Agent: "world-forger", Prompt: worldForgerPrompt},
+			{Name: "soul-forge", Agent: "soul-forger", DependsOn: []string{"world-forge"}, Prompt: soulForgerPrompt},
+			{Name: "catalyst", Agent: "fate-weaver", DependsOn: []string{"world-forge", "soul-forge"}, Prompt: fateWeaverPrompt},
+			{Name: "evo-blueprint", Agent: "evo-architect", DependsOn: []string{"world-forge", "soul-forge", "catalyst"}, Prompt: evoArchitectPrompt},
 			// Phase D: 复用 v2 大纲设计
 			// best-narrative(胜出时间线) + second-narrative(次优时间线, #3 跨线亮点) + evaluation(审判团共识/依据/融合建议)
-		// 一并注入, 让大纲建立在 swarm 模拟结果之上, 而非仅凭世界观/角色空想 —— 否则 Phase B/C 沦为装饰。
-		{Name: "outline-design", Role: "outline-architect", DependsOn: []string{"best-narrative", "second-narrative", "evaluation", "world-forge", "soul-forge", "catalyst"}, Prompt: v3OutlinePrompt},
+			// 一并注入, 让大纲建立在 swarm 模拟结果之上, 而非仅凭世界观/角色空想 —— 否则 Phase B/C 沦为装饰。
+			{Name: "outline-design", Agent: "outline-architect", DependsOn: []string{"best-narrative", "second-narrative", "evaluation", "world-forge", "soul-forge", "catalyst"}, Prompt: v3OutlinePrompt},
 			// Phase E-F: 由编排器动态驱动 (复用 v2 章节循环 + 全书整合)
 		},
 	}

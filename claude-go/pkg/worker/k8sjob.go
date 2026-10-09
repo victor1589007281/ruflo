@@ -93,6 +93,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/sandbox"
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // K8SJobRuntimeName k8s-job runtime 的名字 (design/01 §4.9 冻结的名字)。
@@ -952,8 +953,5 @@ func envInt(name string) int {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
+	return textutil.Truncate(s, n, "…")
 }

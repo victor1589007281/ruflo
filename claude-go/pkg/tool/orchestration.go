@@ -31,8 +31,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/anthropic/claude-go/pkg/logging"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -345,8 +347,8 @@ func deterministicToolResultPostprocess(content string) string {
 	lines := strings.Split(content, "\n")
 	changed := false
 	for i, line := range lines {
-		if len(line) > weakMaxLineChars {
-			lines[i] = line[:weakMaxLineChars] + "…[line truncated]"
+		if utf8.RuneCountInString(line) > weakMaxLineChars {
+			lines[i] = textutil.Truncate(line, weakMaxLineChars, "…[line truncated]")
 			changed = true
 		}
 	}
@@ -366,10 +368,20 @@ func deterministicToolResultPostprocess(content string) string {
 
 // toolResultArtifactDir 超大 tool_result 的落盘目录。空串 = 不可用 (无 cwd)。
 func toolResultArtifactDir(tctx *ToolContext) string {
-	if tctx == nil || strings.TrimSpace(tctx.Cwd) == "" {
+	return ToolResultArtifactDir(tctx.Cwd)
+}
+
+// ToolResultArtifactDir 由工作区路径推出执行期溢出的落盘目录。
+//
+// 导出是给 pkg/compact 用的: 压缩期折叠也要认出"这条 tool_result 是把溢出 artifact
+// 读回来的", 否则读回的正文 (比原文更大, 因为 Read 给每行加了行号) 会被再折一次,
+// 模型永远看不到自己刚要求回读的内容。目录字面量只此一处, 避免两包各写一遍、挪了
+// 一处另一处失配 —— 那种失配是静默的 (保护只是不生效, 不报错)。
+func ToolResultArtifactDir(cwd string) string {
+	if strings.TrimSpace(cwd) == "" {
 		return ""
 	}
-	return filepath.Join(tctx.Cwd, ".claude-go", "artifacts", "tool-results")
+	return filepath.Join(cwd, ".claude-go", "artifacts", "tool-results")
 }
 
 // toolInputPath 从工具入参里取"这次操作的文件路径"。各工具字段名不统一, 都试一遍。
@@ -396,17 +408,49 @@ func toolInputPath(input json.RawMessage) string {
 // 预览再预览一遍, 正文永远进不了上下文, 而且每轮多一个文件。必须在入口掐掉。
 //
 // 判定按**目录**而不是按文件名: 落盘文件名带内容哈希, 换个名字照样落在同一目录。
+//
+// 覆盖两个目录, 缺一不可:
+//   - pkg/tool 的溢出目录 (artifacts/tool-results): 结果在**执行时**就超预算。
+//   - pkg/compact 的折叠引用目录 (tool-results): 结果执行时没超, 后来被压缩期折叠。
+//
+// 第二个目录是必需的, 否则两条路互相拆台: 折叠给出引用 -> 模型 Read 回来 ->
+// 读回内容又超预算 -> 再落一份 artifact 并只给预览 -> 正文永远进不了上下文, 且
+// 每轮多一个文件 —— 正是自指保护要防的那个循环, 只是绕了一层。
 func readsArtifact(input json.RawMessage, tctx *ToolContext) bool {
-	dir := toolResultArtifactDir(tctx)
-	if dir == "" {
+	if tctx == nil {
 		return false
 	}
-	p := toolInputPath(input)
-	if p == "" {
+	for _, dir := range []string{
+		toolResultArtifactDir(tctx),
+		compactToolResultRefDir(tctx),
+	} {
+		if pathWithin(toolInputPath(input), dir, tctx.Cwd) {
+			return true
+		}
+	}
+	return false
+}
+
+// compactToolResultRefDir 是 pkg/compact 折叠引用的落盘目录。
+//
+// 字符串必须与 compact.ToolResultRefDir() 保持一致 —— 这里是 pkg/tool, 不能反向
+// import pkg/compact (compact 依赖 api/types, 反过来绕成环)。一致性由 pkg/engine 的
+// 端到端测试守住: TestLargeToolResultFoldedWithFileRef 走真引擎落盘, 本函数按同一
+// 路径判定"读的是不是引用文件", 目录名改一处忘另一处会让该测试或自指保护失效。
+func compactToolResultRefDir(tctx *ToolContext) string {
+	if tctx == nil || strings.TrimSpace(tctx.Cwd) == "" {
+		return ""
+	}
+	return filepath.Join(tctx.Cwd, ".claude-go", "tool-results")
+}
+
+// pathWithin 判断 p 是否位于 dir 之内 (相对路径按 cwd 解析)。dir 为空返回 false。
+func pathWithin(p, dir, cwd string) bool {
+	if p == "" || dir == "" {
 		return false
 	}
 	if !filepath.IsAbs(p) {
-		p = filepath.Join(tctx.Cwd, p)
+		p = filepath.Join(cwd, p)
 	}
 	abs, err := filepath.Abs(p)
 	if err != nil {
@@ -669,14 +713,12 @@ func summarizeLongToolResult(raw string, maxChars int) string {
 		}
 	}
 	tail := raw
-	if len(tail) > 1200 {
-		tail = tail[len(tail)-1200:]
+	if n := utf8.RuneCountInString(tail); n > 1200 {
+		tail = string([]rune(tail)[n-1200:])
 	}
 	picked = append(picked, "", "[tail excerpt]", tail)
 	out := strings.Join(picked, "\n")
-	if len(out) > maxChars {
-		out = out[:maxChars] + "\n...(summary truncated)"
-	}
+	out = textutil.Truncate(out, maxChars, "\n...(summary truncated)")
 	return out
 }
 

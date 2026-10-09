@@ -17,8 +17,8 @@ func TestProbePrevResult(t *testing.T) {
 		notify: func(_, _ string) {},
 	}
 	wf := &WorkflowDef{Name: "probe", Mode: "pipeline", Stages: []StageDef{
-		{Name: "a", Role: "researcher", Prompt: "第一阶段 {objective}"},
-		{Name: "b", Role: "writer", Prompt: "第二阶段 上游=[{prev_result}] 具名=[{a}]", DependsOn: []string{"a"}},
+		{Name: "a", Agent: "researcher", Prompt: "第一阶段 {objective}"},
+		{Name: "b", Agent: "writer", Prompt: "第二阶段 上游=[{prev_result}] 具名=[{a}]", DependsOn: []string{"a"}},
 	}}
 	_, err := we.executeGraph(context.Background(), wf, "目标X", newStubTeam(t, "probe"))
 	if err != nil {

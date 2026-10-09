@@ -35,30 +35,30 @@ func novelV2Workflow() *WorkflowDef {
 		Rounds:      0, // 自适应 AdaptiveTerminator
 		Stages: []StageDef{
 			// Phase 1: 世界构建
-			{Name: "story-plan", Role: "story-planner",
+			{Name: "story-plan", Agent: "story-planner",
 				Prompt: storyPlannerPrompt},
-			{Name: "world-build", Role: "world-builder",
+			{Name: "world-build", Agent: "world-builder",
 				DependsOn: []string{"story-plan"},
 				Prompt:    worldBuilderPrompt},
-			{Name: "char-design", Role: "char-designer",
+			{Name: "char-design", Agent: "char-designer",
 				DependsOn: []string{"story-plan", "world-build"},
 				Prompt:    charDesignerPrompt},
 
 			// Phase 2: 大纲设计
-			{Name: "outline-design", Role: "outline-architect",
+			{Name: "outline-design", Agent: "outline-architect",
 				DependsOn: []string{"story-plan", "world-build", "char-design"},
 				Prompt:    outlineArchitectPrompt},
 
 			// Phase 3: 章节写作 (对抗循环, 由编排器驱动)
-			{Name: "chapter-write", Role: "novelist",
+			{Name: "chapter-write", Agent: "novelist",
 				DependsOn: []string{"outline-design"},
 				Prompt:    novelistPrompt},
-			{Name: "chapter-review", Role: "novel-editor",
+			{Name: "chapter-review", Agent: "novel-editor",
 				DependsOn: []string{"chapter-write"},
 				Prompt:    novelEditorPrompt},
 
 			// Phase 4: 全书整合
-			{Name: "book-assembly", Role: "novel-editor",
+			{Name: "book-assembly", Agent: "novel-editor",
 				DependsOn: []string{"chapter-write"}},
 		},
 	}
@@ -179,9 +179,9 @@ func (we *WorkflowExecutor) executeNovelWriting(ctx context.Context, wf *Workflo
 
 			writeStage := StageDef{
 				Name: fmt.Sprintf("chapter-%d-write-round%d", chapterNum, round),
-				Role: "novelist",
+				Agent: "novelist",
 			}
-			sr := we.runAgent(ctx, writeStage.Role, writePrompt, team)
+			sr := we.runAgent(ctx, writeStage.Agent, writePrompt, team)
 			sr.Name = writeStage.Name
 			allResults = append(allResults, sr)
 
@@ -199,9 +199,9 @@ func (we *WorkflowExecutor) executeNovelWriting(ctx context.Context, wf *Workflo
 			reviewPrompt := buildChapterReviewPrompt(objective, prevResults, chapterOutput, chapterNum)
 			reviewStage := StageDef{
 				Name: fmt.Sprintf("chapter-%d-review-round%d", chapterNum, round),
-				Role: "novel-editor",
+				Agent: "novel-editor",
 			}
-			srReview := we.runAgent(ctx, reviewStage.Role, reviewPrompt, team)
+			srReview := we.runAgent(ctx, reviewStage.Agent, reviewPrompt, team)
 			srReview.Name = reviewStage.Name
 			allResults = append(allResults, srReview)
 
@@ -265,8 +265,8 @@ func (we *WorkflowExecutor) executeNovelWriting(ctx context.Context, wf *Workflo
 	notify("📦 **Phase 4/4**: 全书整合 (统稿/伏笔验证/风格统一)")
 
 	assemblyPrompt := buildBookAssemblyPrompt(objective, prevResults, allChapters)
-	assemblyStage := StageDef{Name: "book-assembly", Role: "novel-editor"}
-	srAssembly := we.runAgent(ctx, assemblyStage.Role, assemblyPrompt, team)
+	assemblyStage := StageDef{Name: "book-assembly", Agent: "novel-editor"}
+	srAssembly := we.runAgent(ctx, assemblyStage.Agent, assemblyPrompt, team)
 	srAssembly.Name = "book-assembly"
 	allResults = append(allResults, srAssembly)
 
@@ -309,15 +309,15 @@ func (we *WorkflowExecutor) runNovelStage(ctx context.Context, stage StageDef, o
 	prompt = strings.ReplaceAll(prompt, "{objective}", objective)
 	prompt = strings.ReplaceAll(prompt, "{prev_result}", prevOutput.String())
 
-	we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 开始执行...", stage.Name, stage.Role))
+	we.notify(we.chatID, fmt.Sprintf("🔄 阶段 **%s** (%s) 开始执行...", stage.Name, stage.Agent))
 
-	sr := we.runAgent(ctx, stage.Role, prompt, team)
+	sr := we.runAgent(ctx, stage.Agent, prompt, team)
 	sr.Name = stage.Name
-	sr.Role = stage.Role
+	sr.Role = stage.Agent
 
 	if team.Blackboard != nil {
 		if sr.Status == TaskCompleted {
-			team.Blackboard.Write(stage.Name+"-result", sr.Output, stage.Role, "result")
+			team.Blackboard.Write(stage.Name+"-result", sr.Output, stage.Agent, "result")
 			team.Blackboard.Write(stage.Name+"-status", "completed", "system", "progress")
 		} else {
 			team.Blackboard.Write(stage.Name+"-status", "failed: "+sr.Error, "system", "progress")

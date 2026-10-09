@@ -17,23 +17,23 @@ import (
 // 以内存为主，支持增量刷新，不持久化到文件。
 type ContractStore struct {
 	mu       sync.RWMutex
-	root     string                    // repo 根目录
-	module   string                    // go module path
-	packages map[string]*PackageInfo   // import path → PackageInfo
-	symbols  map[string]*SymbolInfo    // 全局符号索引
+	root     string                  // repo 根目录
+	module   string                  // go module path
+	packages map[string]*PackageInfo // import path → PackageInfo
+	symbols  map[string]*SymbolInfo  // 全局符号索引
 	fset     *token.FileSet
 }
 
 // PackageInfo 包级信息
 type PackageInfo struct {
-	Path       string                 `json:"path"`
-	ImportPath string                 `json:"import_path"`
-	Files      []string               `json:"files"`
-	Imports    []ImportInfo           `json:"imports"`
-	Types      map[string]TypeInfo    `json:"types"`
-	Funcs      map[string]FuncInfo    `json:"funcs"`
-	Vars       map[string]VarInfo     `json:"vars"`
-	Consts     map[string]VarInfo     `json:"consts"`
+	Path       string              `json:"path"`
+	ImportPath string              `json:"import_path"`
+	Files      []string            `json:"files"`
+	Imports    []ImportInfo        `json:"imports"`
+	Types      map[string]TypeInfo `json:"types"`
+	Funcs      map[string]FuncInfo `json:"funcs"`
+	Vars       map[string]VarInfo  `json:"vars"`
+	Consts     map[string]VarInfo  `json:"consts"`
 }
 
 // ImportInfo import 信息
@@ -45,29 +45,29 @@ type ImportInfo struct {
 
 // TypeInfo 类型信息
 type TypeInfo struct {
-	Name       string        `json:"name"`
-	Kind       string        `json:"kind"` // struct/interface/func/type-alias/map/slice/chan/array
-	Package    string        `json:"package"`
-	File       string        `json:"file"`
-	Line       int           `json:"line"`
-	Column     int           `json:"column"`
-	Exported   bool          `json:"exported"`
-	Fields     []FieldInfo   `json:"fields,omitempty"`
-	Methods    []MethodInfo  `json:"methods,omitempty"`
-	ElemType   string        `json:"elem_type,omitempty"` // for slice/map/chan/pointer
-	KeyType    string        `json:"key_type,omitempty"`  // for map
-	Underlying string        `json:"underlying,omitempty"` // for type alias
-	Implements []string      `json:"implements,omitempty"` // 实现的接口列表（全限定名）
+	Name       string       `json:"name"`
+	Kind       string       `json:"kind"` // struct/interface/func/type-alias/map/slice/chan/array
+	Package    string       `json:"package"`
+	File       string       `json:"file"`
+	Line       int          `json:"line"`
+	Column     int          `json:"column"`
+	Exported   bool         `json:"exported"`
+	Fields     []FieldInfo  `json:"fields,omitempty"`
+	Methods    []MethodInfo `json:"methods,omitempty"`
+	ElemType   string       `json:"elem_type,omitempty"`  // for slice/map/chan/pointer
+	KeyType    string       `json:"key_type,omitempty"`   // for map
+	Underlying string       `json:"underlying,omitempty"` // for type alias
+	Implements []string     `json:"implements,omitempty"` // 实现的接口列表（全限定名）
 }
 
 // FieldInfo 字段信息
 type FieldInfo struct {
-	Name     string   `json:"name,omitempty"`
-	Type     string   `json:"type"`
-	Tag      string   `json:"tag,omitempty"`
-	Embedded bool     `json:"embedded,omitempty"`
-	Offset   int      `json:"offset,omitempty"`
-	Doc      string   `json:"doc,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Type     string `json:"type"`
+	Tag      string `json:"tag,omitempty"`
+	Embedded bool   `json:"embedded,omitempty"`
+	Offset   int    `json:"offset,omitempty"`
+	Doc      string `json:"doc,omitempty"`
 }
 
 // MethodInfo 方法信息
@@ -651,8 +651,8 @@ func (cs *ContractStore) FindType(pkgPath, name string) (TypeInfo, bool) {
 	if !ok {
 		return TypeInfo{}, false
 	}
-	 ti, ok := pkg.Types[name]
-	 return ti, ok
+	ti, ok := pkg.Types[name]
+	return ti, ok
 }
 
 // FindTypeByQName 通过全限定名查找类型
@@ -855,7 +855,7 @@ type lockState struct {
 
 // Inconsistency represents a discovered contract inconsistency.
 type Inconsistency struct {
-	Type     string `json:"type"`     // "missing_method", "broken_signature", "orphan_reference"
+	Type     string `json:"type"` // "missing_method", "broken_signature", "orphan_reference"
 	Symbol   string `json:"symbol"`
 	File     string `json:"file"`
 	Line     int    `json:"line"`

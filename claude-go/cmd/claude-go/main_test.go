@@ -4,10 +4,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/sandbox"
+	"github.com/anthropic/claude-go/pkg/session"
+	"github.com/anthropic/claude-go/pkg/statestore"
+	"github.com/anthropic/claude-go/pkg/trace"
 )
 
 func TestNormalizeProviderModelAlias(t *testing.T) {
@@ -308,5 +314,79 @@ func TestClassifyRunError(t *testing.T) {
 	}
 	if classifyRunError(nil) != "" {
 		t.Fatal("nil error must classify to empty string")
+	}
+}
+
+// TestCLISessionTraceKeepsSpansOutOfOrphanBucket 钉住交互式会话的轨迹归属。
+//
+// 这是**修掉的泄漏**的判据。改造前 chat 的主循环每轮 `ctx := context.Background()`,
+// 于是整段交互式会话的 llm_call / turn 经 tracestore.bucketName("") 全部落进
+// trace-orphan 桶, 而 webapp 的轨迹页只列 trace-run-* —— 那一屏什么都没有,
+// 且**没有任何一层会报错**。实测: 一次 chat 往 orphan 写 2 条, 该桶累积到 1.8 万条。
+//
+// 为什么要真的走 TraceStore 而不是只断言 ctx 里有 RunID: RunID 进了 ctx 而落盘
+// 那一步仍用局部空值, 是完全可能的实现 —— 两种写法在"ctx 里有没有 RunID"上同绿。
+// 所以判据落在**桶文件**上, 那是这条链唯一的成品形态。
+func TestCLISessionTraceKeepsSpansOutOfOrphanBucket(t *testing.T) {
+	dir := t.TempDir()
+	ss := statestore.NewFileStore(dir)
+	ts := tracestore.New(ss)
+
+	ctx, runID := beginCLISessionTrace(nil) // nil store: 拿不到会话 id
+	if runID != "" {
+		t.Fatalf("store 为 nil 时不该发号 (硬编号会造出假归属), 却拿到 %q", runID)
+	}
+	if trace.From(ctx).RunID != "" {
+		t.Fatalf("store 为 nil 时 ctx 里不该有 RunID")
+	}
+
+	// TraceStore 未装配时也照写不误 —— recordRunSpan 自己守卫, 不该 panic。
+	recordCLISessionRunSpan(nil, runID, "", nil, "m", tracestore.RunStatusOK, "", time.Now())
+
+	// 真会话: 用一个真 SessionStore 换出 RunID, 再按 chat 主循环的写法落一条 span。
+	store, err := session.NewSessionStore(dir)
+	if err != nil {
+		t.Skipf("本环境建不出 SessionStore: %v", err)
+	}
+	defer store.Close()
+	ctx, runID = beginCLISessionTrace(store)
+	if runID == "" {
+		t.Fatal("有会话时 RunID 不该为空 —— 空 TraceID 会被归进 trace-orphan 桶")
+	}
+	if got := trace.From(ctx).RunID; got != runID {
+		t.Fatalf("ctx 里的 RunID=%q 与返回值 %q 不一致", got, runID)
+	}
+
+	// ★ 主循环那条形态: span 的 TraceID 必须取自 **ctx**, 不是局部空值。
+	ts.Write(tracestore.Span{
+		TraceID: trace.From(ctx).RunID,
+		SpanID:  "span-1",
+		Kind:    tracestore.KindLLMCall,
+		Name:    "test-model",
+		TS:      time.Now().UnixMilli(),
+	})
+	recordCLISessionRunSpan(ts, runID, "会话名", store, "test-model", tracestore.RunStatusOK, "", time.Now())
+
+	files, err := os.ReadDir(filepath.Join(dir, "log"))
+	if err != nil {
+		t.Fatalf("读不到桶目录: %v", err)
+	}
+	var sawRunBucket bool
+	for _, f := range files {
+		if f.Name() == "trace-orphan.jsonl" {
+			t.Fatalf("交互式会话的 span 落进了 trace-orphan —— webapp 轨迹页只列 trace-run-*, "+
+				"这条运行在页面上不存在 (桶目录: %v)", files)
+		}
+		if strings.HasPrefix(f.Name(), "trace-run-") {
+			sawRunBucket = true
+		}
+	}
+	if !sawRunBucket {
+		t.Fatalf("没有 trace-run-* 桶 —— 说明 span 根本没写出去; 桶目录: %v", files)
+	}
+
+	// RunID 不得重复: 每条 REPL 进程/run 必须唯一, 否则奖励归因会把两次记到一起。
+	if _, runID2 := beginCLISessionTrace(store); runID2 == runID {
+		t.Fatalf("两次 beginCLISessionTrace 拿到同一个 RunID %q", runID)
 	}
 }

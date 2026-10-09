@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -70,7 +71,7 @@ func (t *TodoWriteTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TodoWriteTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *TodoWriteTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *TodoWriteTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 func (t *TodoWriteTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
@@ -125,4 +126,53 @@ func (t *TodoWriteTool) GetTodos() map[string]types.TodoItem {
 		result[k] = v
 	}
 	return result
+}
+
+// TodoSnapshot 是清单的一条扁平快照。字段与 internal_hook.TaskRosterItem 对齐,
+// 但两组类型分属不同的包 —— 引擎侧用函数签名注入正是为了绕开直接依赖。
+type TodoSnapshot struct {
+	ID      string
+	Content string
+	Status  string
+}
+
+// Snapshot 返回待办清单的稳定快照 (按 ID 排序)。
+//
+// **为什么需要这个方法**: GetTodos 返回的是 map, 遍历顺序随机。清单会被嵌进压缩
+// 摘要并逐轮重发, 顺序一抖前缀缓存就从插入点起全废。这里排好序, 保证同一份清单
+// 在任何进程里都渲染出逐字节相同的文本。
+//
+// 这是 GetTodos 的第一个非测试调用方 —— 在此之前它零调用方, 清单写进去就沉底。
+func (t *TodoWriteTool) Snapshot() []TodoSnapshot {
+	// 两段式加锁: map 的遍历顺序随机, 要先在锁内取出键、锁外排序, 再锁内取值。
+	t.mu.Lock()
+	ids := make([]string, 0, len(t.todos))
+	for id := range t.todos {
+		ids = append(ids, id)
+	}
+	t.mu.Unlock()
+
+	sort.Strings(ids)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]TodoSnapshot, 0, len(ids))
+	for _, id := range ids {
+		item, ok := t.todos[id]
+		if !ok {
+			continue // 两次加锁之间被删掉了
+		}
+		out = append(out, TodoSnapshot{ID: item.ID, Content: item.Content, Status: item.Status})
+	}
+	return out
+}
+
+// GetTodosSorted 是 GetTodos 的有序版本, 供需要稳定输出顺序的调用方使用。
+func (t *TodoWriteTool) GetTodosSorted() []types.TodoItem {
+	snaps := t.Snapshot()
+	out := make([]types.TodoItem, 0, len(snaps))
+	for _, s := range snaps {
+		out = append(out, types.TodoItem{ID: s.ID, Content: s.Content, Status: s.Status})
+	}
+	return out
 }

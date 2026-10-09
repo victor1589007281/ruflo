@@ -75,10 +75,10 @@ func TestInvalidateCheckpoints(t *testing.T) {
 
 func TestExtractJSONObject(t *testing.T) {
 	cases := map[string]string{
-		`{"score":80,"pass":true}`:                              `{"score":80,"pass":true}`,
-		"前缀 ```json\n{\"score\":60}\n``` 后缀":                    `{"score":60}`,
-		`噪声 {"a":{"b":"}"},"c":1} 尾巴`:                            `{"a":{"b":"}"},"c":1}`,
-		`含转义 {"s":"a\"b}","n":2}`:                               `{"s":"a\"b}","n":2}`,
+		`{"score":80,"pass":true}`:           `{"score":80,"pass":true}`,
+		"前缀 ```json\n{\"score\":60}\n``` 后缀": `{"score":60}`,
+		`噪声 {"a":{"b":"}"},"c":1} 尾巴`:        `{"a":{"b":"}"},"c":1}`,
+		`含转义 {"s":"a\"b}","n":2}`:            `{"s":"a\"b}","n":2}`,
 	}
 	for in, want := range cases {
 		if got := extractJSONObject(in); got != want {

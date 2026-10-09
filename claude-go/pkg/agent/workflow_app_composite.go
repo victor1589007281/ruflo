@@ -1,11 +1,12 @@
 // workflow_app_composite.go — APP & 小程序跨团队协调工作流。
 //
 // 核心理念: 不是独立团队, 而是整合调度现有团队能力:
-//   Phase A: 需求分析 — 复用 Research 团队的 fanout 调研能力
-//   Phase B: UI/UX 原型 — 复用 Creative-v2 团队的 HTML 原型 + 对抗审查
-//   Phase C: 研发实现 — 复用 Development 团队的 adversarial_dev 对抗循环
-//   Phase D: 小程序适配 — 扩展: 专属小程序开发角色
-//   Phase E: 集成测试 — 复用 Development 团队的 tester 角色
+//
+//	Phase A: 需求分析 — 复用 Research 团队的 fanout 调研能力
+//	Phase B: UI/UX 原型 — 复用 Creative-v2 团队的 HTML 原型 + 对抗审查
+//	Phase C: 研发实现 — 复用 Development 团队的 adversarial_dev 对抗循环
+//	Phase D: 小程序适配 — 扩展: 专属小程序开发角色
+//	Phase E: 集成测试 — 复用 Development 团队的 tester 角色
 //
 // 参考:
 //   - AgentMesh (arXiv:2507.19902): 多智能体软件工程
@@ -17,9 +18,9 @@ package agent
 import (
 	"context"
 	"fmt"
+	"github.com/anthropic/claude-go/pkg/media"
 	"log"
 	"path/filepath"
-	"github.com/anthropic/claude-go/pkg/media"
 )
 
 func appCompositeWorkflow() *WorkflowDef {
@@ -30,50 +31,50 @@ func appCompositeWorkflow() *WorkflowDef {
 		Rounds:      0,
 		Stages: []StageDef{
 			// Phase A: 需求分析 (复用 Research 团队 fanout 模式)
-			{Name: "requirements-planning", Role: "synthesizer",
+			{Name: "requirements-planning", Agent: "synthesizer",
 				Prompt: appRequirementsPlanningPrompt},
-			{Name: "user-research", Role: "researcher",
+			{Name: "user-research", Agent: "researcher",
 				DependsOn: []string{"requirements-planning"}, Parallel: true,
 				Prompt: appUserResearchPrompt},
-			{Name: "tech-research", Role: "researcher",
+			{Name: "tech-research", Agent: "researcher",
 				DependsOn: []string{"requirements-planning"}, Parallel: true,
 				Prompt: appTechResearchPrompt},
-			{Name: "requirements-synthesis", Role: "synthesizer",
+			{Name: "requirements-synthesis", Agent: "synthesizer",
 				DependsOn: []string{"user-research", "tech-research"},
 				Prompt:    appRequirementsSynthesisPrompt},
 
 			// Phase B: UI/UX 原型 (复用 Creative-v2 的 HTML 对抗生成)
-			{Name: "creative-plan", Role: "creative-planner",
+			{Name: "creative-plan", Agent: "creative-planner",
 				DependsOn: []string{"requirements-synthesis"},
 				Prompt:    appCreativePlanPrompt},
-			{Name: "html-prototype", Role: "html-developer",
+			{Name: "html-prototype", Agent: "html-developer",
 				DependsOn: []string{"creative-plan"},
 				Prompt:    appHTMLPrototypePrompt},
-			{Name: "prototype-review", Role: "art-director",
+			{Name: "prototype-review", Agent: "art-director",
 				DependsOn: []string{"html-prototype"},
 				Prompt:    appPrototypeReviewPrompt},
 
 			// Phase C: 研发实现 (复用 Development 团队角色)
-			{Name: "architecture", Role: "architect",
+			{Name: "architecture", Agent: "architect",
 				DependsOn: []string{"requirements-synthesis", "html-prototype"}},
-			{Name: "backend-dev", Role: "coder",
+			{Name: "backend-dev", Agent: "coder",
 				DependsOn: []string{"architecture"},
 				Prompt:    appBackendPrompt},
-			{Name: "frontend-dev", Role: "coder",
+			{Name: "frontend-dev", Agent: "coder",
 				DependsOn: []string{"architecture", "html-prototype"},
 				Parallel:  true,
 				Prompt:    appFrontendPrompt},
 
 			// Phase D: 小程序适配 (扩展能力)
-			{Name: "miniprogram-dev", Role: "miniprogram-dev",
+			{Name: "miniprogram-dev", Agent: "miniprogram-dev",
 				DependsOn: []string{"architecture", "html-prototype"},
 				Parallel:  true,
 				Prompt:    appMiniprogramPrompt},
 
 			// Phase E: 集成测试 + 审查
-			{Name: "integration-test", Role: "tester",
+			{Name: "integration-test", Agent: "tester",
 				DependsOn: []string{"backend-dev", "frontend-dev", "miniprogram-dev"}},
-			{Name: "code-review", Role: "reviewer",
+			{Name: "code-review", Agent: "reviewer",
 				DependsOn: []string{"integration-test"}},
 		},
 	}

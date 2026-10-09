@@ -76,7 +76,7 @@ func TestRefineTeamEndToEnd(t *testing.T) {
 	team.mu.Lock()
 	team.Status = TeamStatusCompleted
 	for _, st := range wf.Stages {
-		team.Stages = append(team.Stages, StageResult{Name: st.Name, Role: st.Role, Status: TaskCompleted, Output: "原始:" + st.Name})
+		team.Stages = append(team.Stages, StageResult{Name: st.Name, Role: st.Agent, Status: TaskCompleted, Output: "原始:" + st.Name})
 	}
 	team.mu.Unlock()
 	team.persist()

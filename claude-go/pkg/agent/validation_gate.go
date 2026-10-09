@@ -1,6 +1,5 @@
 package agent
 
-
 import (
 	"context"
 	"encoding/json"
@@ -71,20 +70,20 @@ type GateWarning struct {
 // ValidationGate 验证门禁
 type ValidationGate struct {
 	mu          sync.RWMutex
-	stages      []GateConfig          // 验证阶段配置（有序）
-	hardStages  map[GateStage]bool    // 哪些 stage 失败必须阻断
-	maxRounds   int                   // 单 work unit 最大修复轮数
-	roundBudget int                   // 当前已用轮数
-	autoFix     map[string]bool       // 哪些 rule 可以自动修复
+	stages      []GateConfig       // 验证阶段配置（有序）
+	hardStages  map[GateStage]bool // 哪些 stage 失败必须阻断
+	maxRounds   int                // 单 work unit 最大修复轮数
+	roundBudget int                // 当前已用轮数
+	autoFix     map[string]bool    // 哪些 rule 可以自动修复
 }
 
 // GateConfig 阶段配置
 type GateConfig struct {
-	Stage       GateStage `json:"stage"`
-	SkillName   string    `json:"skill_name"`   // 对应的 Tool Skill 名
-	Required    bool      `json:"required"`     // 是否必须执行
-	AutoRetry   bool      `json:"auto_retry"`   // 失败时是否允许自动修复
-	MaxAutoFix  int       `json:"max_auto_fix"` // 自动修复最大尝试次数
+	Stage      GateStage `json:"stage"`
+	SkillName  string    `json:"skill_name"`   // 对应的 Tool Skill 名
+	Required   bool      `json:"required"`     // 是否必须执行
+	AutoRetry  bool      `json:"auto_retry"`   // 失败时是否允许自动修复
+	MaxAutoFix int       `json:"max_auto_fix"` // 自动修复最大尝试次数
 }
 
 // DefaultGateConfig 返回默认验证阶段配置（5 阶段，保留向后兼容）

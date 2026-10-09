@@ -86,9 +86,9 @@ func TestMediaToolsCall(t *testing.T) {
 
 	// GenerateGIF (HTML CSS动画 → GIF)
 	r = call(NewGenerateGIFTool(), map[string]any{
-		"output_path":  "anim.gif",
-		"html":         `<!doctype html><html><head><style>.b{width:40px;height:40px;background:#e74c3c;position:absolute;animation:m 1s linear infinite}@keyframes m{from{left:0}to{left:160px}}</style></head><body><div class="b"></div></body></html>`,
-		"width":        220, "height": 80, "fps": 10, "duration_sec": 1,
+		"output_path": "anim.gif",
+		"html":        `<!doctype html><html><head><style>.b{width:40px;height:40px;background:#e74c3c;position:absolute;animation:m 1s linear infinite}@keyframes m{from{left:0}to{left:160px}}</style></head><body><div class="b"></div></body></html>`,
+		"width":       220, "height": 80, "fps": 10, "duration_sec": 1,
 	})
 	if r.IsError {
 		t.Fatalf("GenerateGIF 失败: %s", r.Content)

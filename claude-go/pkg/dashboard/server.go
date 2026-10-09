@@ -67,6 +67,16 @@ type Config struct {
 	MCPServers func() interface{}
 	// ReloadSkills 创建 skill 后让主进程技能库即时重载 (可选)。
 	ReloadSkills func()
+	// ReloadAgents 创建/删除 agent **或插件**资产后让主进程资产索引即时重载 (可选)。
+	// 名字带 Agents 是历史遗留: 装配处接到的实现 (Bot.DashboardReloadAssets) 是
+	// LoadStandard **全六种**重扫, 插件 (KindPlugin) 就在其中, 插件端点直接复用本钩子。
+	//
+	// ★ 与 ReloadSkills 不是同一件事的两半, 而是**必须都有**的两半: 资产索引在两个
+	//   地方被持有 (agent 包里的进程级单例 + SessionManager.assetSet), 创建 agent 只
+	//   刷新前者的表现是"CLI 能跑、飞书/团队里查不到它"; 只刷新后者则反过来。
+	//   没接这个钩子时接口仍然写盘成功, 只是要重启进程才生效 —— 那是可接受的降级,
+	//   但必须由调用方显式决定 (主进程两个都刷, 独立 dashboard :7777 两个都不刷)。
+	ReloadAgents func()
 }
 
 // Server HTTP 服务。
@@ -283,8 +293,20 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/workflows", s.handleWorkflows)
 	mux.HandleFunc("/api/workflows/generate", s.handleWorkflowGenerate) // LLM 生成编排 (更具体, 优先于下面)
 	mux.HandleFunc("/api/roles", s.handleRoles)                         // 角色富信息 (DAG 节点面板 / Agents 展示页; 无 names 则列全部)
-	mux.HandleFunc("/api/intent", s.handleIntent)                       // 会话意图识别 (LLM 语义: 是否需编排 + workflow/objective)
-	mux.HandleFunc("/api/verify-goal", s.handleVerifyGoal)              // 目标验收 (供会话编排目标循环: 未达成带 gap 重跑)
+	// agent **资产**的查看与创建。与上面那行是**两层不同的东西**: /api/roles 只列角色
+	// 注册表 (93 个内置人格, 只读), 这组管的是 <stateDir>/agents/*.md —— 优先级更高、
+	// 可声明字段更多的那一层。见 agent_handlers.go 的包注释。
+	mux.HandleFunc("/api/agents", s.handleAgents)                 // GET 列表 / POST 创建
+	mux.HandleFunc("/api/agents/generate", s.handleAgentGenerate) // LLM 生成草稿 (不落盘)
+	mux.HandleFunc("/api/agents/", s.handleAgentDetail)           // GET 详情 / DELETE
+	// 插件包 (plugin bundle) 资产: <stateDir>/plugins/<名>/PLUGIN.md + 成员子目录。
+	// 与上面 agent 那组同层同形, 差别只在插件是**目录形式**的资产, 成员展开由
+	// pkg/pluginrun.Expand 算 (归属规则只有一份, 在展开器里)。见 plugin_handlers.go。
+	mux.HandleFunc("/api/plugins", s.handlePlugins)                 // GET 列表 / POST 创建 (目录形式)
+	mux.HandleFunc("/api/plugins/generate", s.handlePluginGenerate) // LLM 生成插件包草稿 (不落盘)
+	mux.HandleFunc("/api/plugins/", s.handlePluginDetail)           // GET 详情 (含成员清单) / DELETE
+	mux.HandleFunc("/api/intent", s.handleIntent)                   // 会话意图识别 (LLM 语义: 是否需编排 + workflow/objective)
+	mux.HandleFunc("/api/verify-goal", s.handleVerifyGoal)          // 目标验收 (供会话编排目标循环: 未达成带 gap 重跑)
 	// 能力管理: skills / tools / MCP / 引用关系
 	mux.HandleFunc("/api/skills", s.handleSkills)                 // GET 列表 / POST 创建
 	mux.HandleFunc("/api/skills/generate", s.handleSkillGenerate) // LLM 生成 skill 草稿

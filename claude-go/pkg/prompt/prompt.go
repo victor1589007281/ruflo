@@ -57,6 +57,16 @@ type Manager struct {
 	ProductName string
 	// FastMode 是否启用快速/精简模式 (环境块展示)
 	FastMode bool
+	// ShowEnvironmentDate 是否在 <environment> 块里写当前日期 (默认关)。
+	//
+	// 为什么默认关: 日期行排在系统提示**靠前**的位置, 而它每跨一天就变一次 ——
+	// 一变, 它之后的整段前缀全部作废 (工具说明 / 记忆 / 角色指令)。对按次计费的
+	// 提示缓存来说, 这等于每天固定"重算一次全部前缀", 且发生在所有会话上。
+	//
+	// 更关键的是: 多数业务场景**根本不需要知道今天是几号**。面试平台这类
+	// "分析一段固定文本、产出结构化结果"的任务里日期是纯噪声。所以交给业务按场景
+	// 开: 需要时效的 (日程/新闻/行情) 显式打开, 其余保持关闭。
+	ShowEnvironmentDate bool
 	// WeakModelHints 弱模型规划指引 (方案三 L6b): 在默认 prompt 的 plan_mode 段后
 	// 注入 <planning_checklist>——先列 3-7 条计划再动手、失败换策略、收尾即停。
 	WeakModelHints bool
@@ -275,7 +285,12 @@ func buildEnvironmentSection(m *Manager) string {
 		sb.WriteString(fmt.Sprintf("Model: %s\n", m.Model))
 	}
 	sb.WriteString(fmt.Sprintf("OS: %s %s\n", runtime.GOOS, runtime.GOARCH))
-	sb.WriteString(fmt.Sprintf("Date: %s\n", time.Now().Format("2006-01-02")))
+	// 日期是**可选的**: 它每天变一次, 而它后面还有工具说明/记忆/角色指令 ——
+	// 排在这里等于让整段前缀每天作废一回。时间无关的场景 (如面试平台的 JD 分析、
+	// 题库生成) 不需要它, 默认不写; 需要时效的场景显式打开 ShowEnvironmentDate。
+	if m.ShowEnvironmentDate {
+		sb.WriteString(fmt.Sprintf("Date: %s\n", time.Now().Format("2006-01-02")))
+	}
 	sb.WriteString(fmt.Sprintf("Working Directory: %s\n", m.Cwd))
 	if shell := os.Getenv("SHELL"); shell != "" {
 		sb.WriteString(fmt.Sprintf("Shell: %s\n", shell))
@@ -316,6 +331,7 @@ func buildSessionToolHints(tools *tool.Registry) string {
 		"Read":        "Use Read to inspect file contents instead of Shell cat/head/tail.",
 		"Write":       "Use Write for new files or full rewrites instead of shell redirection/heredoc.",
 		"StrReplace":  "Use StrReplace for surgical edits instead of sed/awk one-liners.",
+		"Rewind":      "Use Rewind to undo a file edit that turned out wrong — every Write/StrReplace is checkpointed, so it still works many turns later. Do not hand-revert from memory.",
 		"Glob":        "Use Glob for path patterns instead of find(1) when possible.",
 		"Grep":        "Use Grep for repository search instead of spawning shell grep/rg.",
 		"Bash":        "Reserve Bash for operations that have no first-class tool; prefer file tools when applicable.",

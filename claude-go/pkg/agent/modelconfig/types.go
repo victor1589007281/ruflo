@@ -19,9 +19,9 @@ import (
 
 // ProviderConfig 单个厂商的 API 连接参数。
 type ProviderConfig struct {
-	Name    string            `json:"name"`
-	BaseURL string            `json:"baseUrl"`
-	APIKey  string            `json:"apiKey"`
+	Name    string                 `json:"name"`
+	BaseURL string                 `json:"baseUrl"`
+	APIKey  string                 `json:"apiKey"`
 	Models  map[string]ModelConfig `json:"models"` // key = alias ("provider:modelName")
 }
 
@@ -61,6 +61,68 @@ type GlobalConfig struct {
 	// 当模型/plan/role 未显式指定时生效; 需要更多回合/输出的场景可在 model 级单独调大覆盖。
 	DefaultMaxTurns  int `json:"defaultMaxTurns,omitempty"`
 	DefaultMaxTokens int `json:"defaultMaxTokens,omitempty"`
+
+	// LongHorizonMaxTurns 长程任务档的回合上限 (H4-3, 见 taskclass.go)。
+	//
+	// 与 DefaultMaxTurns 是**两个不同的量**: 后者是常规任务的止损线, 前者是
+	// 产码/测试/修复这类没有自然下界的任务的止损线。用一个数兼顾两者必然顾此失彼
+	// (调大则冒烟任务跑飞, 调小则长程任务跑不完)。
+	//
+	// 0 = **未开启分层**, 长程档回落到 DefaultMaxTurns —— 与改造前逐字节相同。
+	// 刻意的: 分层的默认行为必须等于改造前的行为, 否则这次改动会在没人配置的
+	// 情况下改掉每一个任务的止损线。
+	LongHorizonMaxTurns int `json:"longHorizonMaxTurns,omitempty"`
+}
+
+// PreferredModelName 返回应发给上游的 model 值。
+//
+// 优先 Alias (完整别名, 如 "opencode:deepseek-v4.1-flash") 而不是
+// ProviderName (仅后半段的厂商模型名, 如 "deepseek-v4.1-flash")。
+//
+// 为什么: provider 前缀是路由信息的一部分 —— 网关/上游靠它决定把请求发给
+// 哪个后端池。只发裸模型名时, 同一个模型名在不同 provider 下会撞车
+// (deepseek:deepseek-v4.1-flash 与 opencode:deepseek-v4.1-flash 的裸名完全
+// 相同), 请求会被路由到默认池而非配置指定的池; 上游按模型名做的提示缓存
+// 分片键也跟着变, 跨轮命中率随之抖动。
+//
+// ProviderName 的语义 (厂商实际模型名) 保留不动 —— metrics / dashboard 的
+// LookupAliasByModelName 反查等 20+ 处消费点依赖它。这里只改"出站发什么"。
+func (c ResolvedConfig) PreferredModelName() string {
+	if c.Alias != "" {
+		return c.Alias
+	}
+	return c.ProviderName
+}
+
+// OutboundModelName 返回**出站请求**该带的 model 值 —— 与请求实际发往哪里有关:
+//
+//	经网关 (ViaGateway) → 完整别名。别名是网关的查找键, 网关据它选出 provider 的
+//	端点/凭据/协议, 再把 model 剥成裸名转发上游 (见 cmd/anthropic-gateway 的
+//	proxyPassthrough)。发裸名也能解析, 但发别名让网关日志与指标里的 model 字段
+//	带得上 provider, 归因不丢。
+//
+//	直连 provider → 裸名。providers 的 baseUrl 已经指向具体厂商, 厂商端点只认
+//	自己的模型 ID: 把 "opencode:deepseek-v4.1-flash" 直发给 opencode 会被拒
+//	(401 ModelError), kimi 同理; 本机 Ollama 的 /v1/messages 也会 400
+//	invalid model name。
+//
+// 所以"发什么"不能是配置层的静态属性 —— 它是**这条链路形态**的函数。用错方向的
+// 代价是不对称的: 直连发别名是硬失败 (请求被拒), 经网关发裸名只是少了个标签。
+// 因此判据取肯定性证据 (ViaGateway / LocalEndpoint), 而不是"看着像网关"的猜测。
+//
+// **判据顺序要紧, 两条都不能省。** 本机端点那条是踩过的坑: 它此前按"非网关即裸名"
+// 的推论**隐式**成立, 只因为当时没有任何一处覆盖过客户端上的 Model 值; 一旦改为
+// 显式赋值 (或将来让网关把 BaseURL 改指一个本机代理 —— 那时两条同时为真), 推论就
+// 断了, 请求会带着 "ollama:xxx" 打到一个只认裸名的端点。显式判据写出来之后, 与
+// ViaGateway 谁先谁后也是一句话说得清的事, 而不再是某处赋值顺序的副作用。
+func (c ResolvedConfig) OutboundModelName() string {
+	if c.ViaGateway {
+		return c.PreferredModelName()
+	}
+	if c.LocalEndpoint {
+		return c.ProviderName
+	}
+	return c.ProviderName
 }
 
 // RoleConfig 角色级别的模型别名配置。
@@ -100,6 +162,25 @@ type ResolvedConfig struct {
 	FirstTokenTimeoutSec int // 首token等待时间(秒)
 	CallTimeoutSec       int // 单次agent调用总时间(秒)
 	DeadlineRetryBaseSec int // deadline exceeded退避基数(秒)
+
+	// ViaGateway 表示 BaseURL 已被 ApplyGatewayOverride 改指 LLM 网关
+	// (即进程设了 CLAUDE_GO_LLM_GATEWAY)。它决定 OutboundModelName 发别名还是裸名。
+	//
+	// 做成字段而不是各调用点再读一次环境变量: 覆盖动作发生在 ApplyGatewayOverride
+	// 一处, "这一跳是否经网关" 的结论就只该在那处产生 —— 下游各自 os.Getenv 会在
+	// "env 设了但 BaseURL 为空没被覆盖" 这类边界上给出与事实相反的答案。
+	ViaGateway bool
+
+	// LocalEndpoint 表示 BaseURL 指向本机端点 (Ollama 等, 见 api.IsLocalEndpoint)。
+	//
+	// 与 ViaGateway 取同一种做法: 在解析出口把结论定下来, 下游不再各自 os/字符串比对。
+	// 这里必须一致 —— OutboundModelName 是个纯函数, 而判据散在两处的话, 迟早出现
+	// "网关把 BaseURL 改指本机代理 (经网关) 但某处仍按本机裸名发" 这类两面都自认正确的错。
+	//
+	// 为什么本机端点要发裸名: Ollama 的 /v1/messages 兼容层把 model 字段当**真实模型
+	// 名**解析 (不是别名), 收到 "ollama:gemma4:..." 会直接 400 invalid model name。
+	// 这与厂商端点拒前缀是同一个原因的两个实例。
+	LocalEndpoint bool
 }
 
 // ConfigJSON 顶层 JSON 配置结构 (对应 config.json 中的 ai 段 + providers 段)。
@@ -121,7 +202,7 @@ type ProviderRegistry struct {
 // ModelEntry 内部索引结构，保存 alias -> (ProviderName + Provider + Params)。
 type ModelEntry struct {
 	Alias        string
-	ProviderName string         // 实际模型名（alias 后半段）
+	ProviderName string // 实际模型名（alias 后半段）
 	Provider     *ProviderConfig
 	Params       ModelConfig
 }

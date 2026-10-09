@@ -19,6 +19,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // Client 是 agentDB 语义引擎的 HTTP 客户端。
@@ -84,8 +86,5 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any) ([]b
 func pathEscape(s string) string { return url.PathEscape(s) }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return textutil.Truncate(s, n, "...")
 }

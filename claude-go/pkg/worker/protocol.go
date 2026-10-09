@@ -78,6 +78,10 @@ func WorkerCap(name string) string { return CapWorkerPrefix + name }
 type StageTask struct {
 	RunID        string   `json:"run_id,omitempty"`
 	NodeID       string   `json:"node_id,omitempty"`
+	// SessionID 跨 run 稳定的会话身份, 见 pkg/trace.IDs。它不参与 RunID 的推导,
+	// 只决定对端出站请求的 X-Claude-Code-Session-Id (上游提示缓存分片键)。
+	// 缺省省略: 老控制面不带这个字段, 新 worker 解出来是空串, 退回按 RunID 分片。
+	SessionID    string   `json:"session_id,omitempty"`
 	Role         string   `json:"role"`
 	SystemPrompt string   `json:"system_prompt,omitempty"`
 	UserPrompt   string   `json:"user_prompt"`
@@ -136,6 +140,7 @@ func (st StageTask) ToRuntimeTask() agent.RuntimeNodeTask {
 	return agent.RuntimeNodeTask{
 		RunID:        st.RunID,
 		NodeID:       st.NodeID,
+		SessionID:    st.SessionID,
 		Role:         st.Role,
 		SystemPrompt: st.SystemPrompt,
 		UserPrompt:   st.UserPrompt,

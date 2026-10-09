@@ -203,3 +203,154 @@ func TestOpenAIStreamTranslatorFlushNoUsageTail(t *testing.T) {
 		t.Fatalf("second Flush should be empty, got %d", len(evs))
 	}
 }
+
+// TestOpenAIStreamTranslatorMultiToolCalls 一个回合里 ≥2 个工具调用必须串行开块。
+//
+// 这是实测事故的回归测试, 不是假想的边界: opencode:space-bunny-free 在"实现 Greet()"
+// 这种普通任务的首个回合就同时返回 Glob(index=0) 与 Shell(index=1)。
+//
+// 修复前的失败形态 (逐字节复现过): 翻译器把两个 content_block_stop 都推迟到
+// finish_reason, 于是两个工具块**同时开着**。engine.go:1516 的 content_block_start
+// 会覆盖 currentBlock 并清空缓冲, 结果 assistant 消息里变成
+//
+//	Shell(id=call_2)  ← Glob 被丢掉
+//	Shell(id=call_2)  ← 最后一个被复制
+//
+// 两条 tool 结果于是带上同一个 tool_call_id, 上游判 400 invalid request; 而引擎把
+// 这个 400 吞掉之后以"模型说了句话"收尾 —— exit 0、is_error=false、实际一行没改。
+//
+// 因此断言必须落在**消费端形状**上 (引擎看到的块序列), 而不是"事件个数对得上":
+// 个数在"丢一个+复制一个"的形态下完全可能还是对的。
+func TestOpenAIStreamTranslatorMultiToolCalls(t *testing.T) {
+	tr := newOpenAIStreamTranslator("space-bunny-free")
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"先看看项目结构。"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Glob","arguments":"{\"glob_pattern\": \"**/*.go\"}"}}]},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"Shell","arguments":"{\"command\": \"ls -la\"}"}}]},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":99,"completion_tokens":30}}`,
+	}
+	var all []types.StreamDelta
+	for _, c := range chunks {
+		evs, err := tr.translate([]byte(c))
+		if err != nil {
+			t.Fatalf("translate %q: %v", c, err)
+		}
+		all = append(all, evs...)
+	}
+
+	// 按引擎的语义重放: 它只跟踪一个当前块, start 覆盖 currentBlock, stop 才落盘。
+	type blk struct {
+		kind string
+		id   string
+		name string
+		text string
+		args strings.Builder
+	}
+	var blocks []*blk
+	var cur *blk
+	openDepth := 0
+	for _, e := range all {
+		switch e.Type {
+		case "content_block_start":
+			if openDepth != 0 {
+				t.Fatalf("前一个块还没关就又开了新块 (index=%d) —— 引擎的 currentBlock 会被覆盖, "+
+					"前一个块整块丢失; 这正是多工具调用那个 400 的成因。事件序列: %s",
+					e.Index, describeDeltas(all))
+			}
+			openDepth++
+			cur = &blk{}
+			if e.ContentBlock != nil {
+				cur.kind = string(e.ContentBlock.Type)
+				cur.id = e.ContentBlock.ID
+				cur.name = e.ContentBlock.Name
+			}
+		case "content_block_delta":
+			if openDepth == 0 {
+				t.Fatalf("没有开着的块却收到 delta (index=%d)", e.Index)
+			}
+			if e.Delta != nil {
+				switch e.Delta.Type {
+				case "text_delta":
+					cur.text += e.Delta.Text
+				case "input_json_delta":
+					cur.args.WriteString(e.Delta.PartialJSON)
+				}
+			}
+		case "content_block_stop":
+			if openDepth == 0 {
+				t.Fatalf("块已经关了却又收到 content_block_stop (index=%d)", e.Index)
+			}
+			openDepth--
+			blocks = append(blocks, cur)
+			cur = nil
+		}
+	}
+	if openDepth != 0 {
+		t.Fatalf("流结束时还有 %d 个块没关", openDepth)
+	}
+
+	// 必须恰好是: 文本块 + Glob + Shell, 顺序与内容都对。
+	var toolIDs, toolNames []string
+	for _, b := range blocks {
+		if b.kind == "tool_use" {
+			toolIDs = append(toolIDs, b.id)
+			toolNames = append(toolNames, b.name)
+		}
+	}
+	if len(toolNames) != 2 {
+		t.Fatalf("工具块数 = %d (%v), 期望 2 —— 丢一个/复制一个都会让这个数看着"+
+			"「差不多」, 所以这里同时核名字与 id 的**集合**", len(toolNames), toolNames)
+	}
+	if toolNames[0] != "Glob" || toolNames[1] != "Shell" {
+		t.Fatalf("工具块名字/顺序 = %v, 期望 [Glob Shell]", toolNames)
+	}
+	if toolIDs[0] != "call_1" || toolIDs[1] != "call_2" {
+		t.Fatalf("工具块 id = %v, 期望 [call_1 call_2] —— 两个 tool 结果必须能各自对上"+
+			"一个 id, 重复 id 会被上游判 invalid request", toolIDs)
+	}
+	if toolIDs[0] == toolIDs[1] {
+		t.Fatal("两个工具块的 id 相同 —— assistant 消息里会出现两条同 id 的 tool_calls")
+	}
+
+	// 每个工具块只拿到自己的参数 (互相串了会体现在这里)。
+	if got := blocks[1].args.String(); got != `{"glob_pattern": "**/*.go"}` {
+		t.Fatalf("Glob 的入参 = %q", got)
+	}
+	if got := blocks[2].args.String(); got != `{"command": "ls -la"}` {
+		t.Fatalf("Shell 的入参 = %q", got)
+	}
+	// 交错期之前的正文不能被工具块吞掉。
+	if blocks[0].kind != "text" || !strings.Contains(blocks[0].text, "先看看项目结构") {
+		t.Fatalf("首个块应为正文, 实得 kind=%q text=%q", blocks[0].kind, blocks[0].text)
+	}
+
+	last := all[len(all)-1]
+	if last.Delta == nil || last.Delta.StopReason != "tool_use" {
+		t.Fatalf("最后一个事件的 stop_reason = %+v, 期望 tool_use", last)
+	}
+}
+
+// describeDeltas 把事件序列压成一行, 失败时能直接看出形状。
+func describeDeltas(evs []types.StreamDelta) string {
+	var parts []string
+	for _, e := range evs {
+		switch e.Type {
+		case "content_block_start":
+			if e.ContentBlock != nil {
+				parts = append(parts, "start:"+string(e.ContentBlock.Type)+"/"+e.ContentBlock.Name)
+			} else {
+				parts = append(parts, "start:?")
+			}
+		case "content_block_delta":
+			if e.Delta != nil {
+				parts = append(parts, "delta:"+e.Delta.Type)
+			}
+		case "content_block_stop":
+			parts = append(parts, "stop")
+		default:
+			parts = append(parts, e.Type)
+		}
+	}
+	return strings.Join(parts, " ")
+}

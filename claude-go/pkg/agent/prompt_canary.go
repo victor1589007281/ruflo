@@ -101,7 +101,7 @@ func (we *WorkflowExecutor) applyPromptCanary(ctx context.Context, stage StageDe
 	if strings.TrimSpace(stage.Prompt) == "" || strings.TrimSpace(team.Workflow) == "" {
 		return stage, nil
 	}
-	target := team.Workflow + "/" + stage.Name
+	target := learners.StageTarget(team.Workflow, stage.Name)
 	runID := trace.From(ctx).RunID
 
 	c, refused := learners.ResolvePromptCanary(stateDir, target, runID, stage.Prompt)

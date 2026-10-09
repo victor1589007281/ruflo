@@ -18,6 +18,8 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // Config 公众号凭证。
@@ -322,10 +324,7 @@ func (c *Client) postJSON(u string, payload []byte) ([]byte, error) {
 }
 
 func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
+	return textutil.Truncate(s, n, "")
 }
 
 // DeleteDraft 删除草稿。对应 cgi-bin/draft/delete。

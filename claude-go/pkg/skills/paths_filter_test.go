@@ -10,13 +10,13 @@ func TestParseFrontmatterPaths(t *testing.T) {
 	// YAML 列表形态
 	fm := "name: x\ndescription: d\npaths:\n  - \"**/*.go\"\n  - \"cmd/**\"\nstatus: active\n"
 	sk := &Skill{}
-	parseFrontmatter(fm, sk)
+	parseFM(fm, sk)
 	if len(sk.Paths) != 2 || sk.Paths[0] != "**/*.go" || sk.Paths[1] != "cmd/**" {
 		t.Errorf("YAML 列表 paths 解析失败: %+v", sk.Paths)
 	}
 	// 行内形态
 	sk2 := &Skill{}
-	parseFrontmatter(`name: y
+	parseFM(`name: y
 paths: ["**/*.py", "scripts/**"]
 `, sk2)
 	if len(sk2.Paths) != 2 || sk2.Paths[0] != "**/*.py" {
@@ -24,7 +24,7 @@ paths: ["**/*.py", "scripts/**"]
 	}
 	// 无 paths → 空
 	sk3 := &Skill{}
-	parseFrontmatter("name: z\ndescription: d\n", sk3)
+	parseFM("name: z\ndescription: d\n", sk3)
 	if len(sk3.Paths) != 0 {
 		t.Errorf("无 paths 应为空, 得 %+v", sk3.Paths)
 	}

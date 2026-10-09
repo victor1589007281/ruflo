@@ -273,11 +273,50 @@ func TestCASPerRecordLockAllowsParallelDifferentTasks(t *testing.T) {
 	}
 }
 
+// stageRunner 前 free 次调用立刻返回, 之后每次调用都阻塞到 release 关闭。
+//
+// 用它而不是 instantRunner, 是因为本用例要判的是**"后到的那次精修看到的是什么"**,
+// 而不是"两次调用谁先抢到锁"。instantRunner 每次都在微秒级跑完, 于是第二次 Refine
+// 常常在第一轮**整体跑完之后**才开口 —— 那时任务已回到 completed, 它是一次完全
+// 合法的顺序精修, 两次都成功才是对的。实测 (探针打进 Refine 的入口读):
+//
+//	entry 版本=[3 3] → 两次真的重叠 → 恰好 1 个成功 (被 running 挡下)
+//	entry 版本=[7 3] → 第二个在第一个整体跑完后才进 → 两个都成功 (顺序, 非并发)
+//
+// 后一种情形下单看"got 2"会误判成并发缺陷。把第 2 次起的 Run 钉住不放, running
+// 状态就不会自己消失, 判据于是与调度时序无关。
+type stageRunner struct {
+	free    int32 // 前几次调用放行
+	calls   atomic.Int64
+	release chan struct{}
+}
+
+func (r *stageRunner) Run(ctx context.Context, rec TaskRecord) (string, error) {
+	if r.calls.Add(1) <= int64(r.free) {
+		return "done:" + rec.Spec.Objective, nil
+	}
+	select {
+	case <-r.release:
+		return "released", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
 // TestRefineIsCASGuarded 断言 Refine 的留痕走乐观并发: 并发 Refine 恰好一个落上,
 // 另一个被拒 (反馈不是静默丢失, 而是显式报错)。
+//
+// "并发"由 stageRunner 保证而不是靠碰运气: 第一次精修启动的那一轮被钉在 running 上,
+// 所以第二个精修无论早到还是晚到, 看到的都是 running。
 func TestRefineIsCASGuarded(t *testing.T) {
-	runner := newInstantRunner()
+	// free=1: 让 Submit 那一轮跑完 (任务落到 completed), 精修启动的那一轮起全部钉住。
+	runner := &stageRunner{free: 1, release: make(chan struct{})}
 	svc := newTestSvc(t, runner)
+	t.Cleanup(func() {
+		close(runner.release) // 放开被钉住的那一轮, 否则 Close 会等到测试超时
+		svc.Close()
+	})
+
 	rec, err := svc.Submit(TaskSpec{Team: "cas-6", Workflow: "techblog", Objective: "初稿"}, SubmitOpts{})
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
@@ -316,5 +355,20 @@ func TestRefineIsCASGuarded(t *testing.T) {
 	got, _ := svc.Get(rec.ID)
 	if len(got.Refines) != 1 {
 		t.Fatalf("留痕应恰好 1 条, got %+v", got.Refines)
+	}
+	// 落上的那一轮必须真的在跑 —— 否则上面"被拒"可能只是因为任务压根没被启动,
+	// 那样这道闸门测的就是别的东西了。
+	if got.State != TaskStateRunning {
+		t.Errorf("精修后任务应在 running (被钉住的那一轮还没放), got %s", got.State)
+	}
+	// 状态已是 running 是在临界区里同步写的, 但那一轮的 goroutine 进到 Run() 里还要
+	// 被调度 —— 所以这里按仓库既有的"等一个落地计数"写法轮询, 而不是当场读一次,
+	// 否则量到的是调度延迟而不是"那一轮有没有真的被拉起来"。
+	deadline := time.Now().Add(2 * time.Second)
+	for runner.calls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if n := runner.calls.Load(); n != 2 {
+		t.Errorf("运行器应恰好被调用 2 次 (Submit 一轮 + 精修一轮), got %d", n)
 	}
 }

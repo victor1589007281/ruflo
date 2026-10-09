@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/logging"
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -385,7 +386,7 @@ func DefaultToolResultLevelConfig() *ToolResultLevelConfig {
 		Level1KeepRounds:    2,
 		Level2KeepRounds:    3,
 		Level1MaxChars:      500,
-		Level3SuccessMarker: "[历史操作] %s: %s (已完成)",
+		Level3SuccessMarker: "[历史操作结果: %s]",
 		Level3ErrorSummary:  200,
 		PreserveErrors:      true,
 	}
@@ -426,7 +427,30 @@ func (h *ToolResultLevelHook) Execute(ctx *HookContext) (*HookResult, error) {
 
 	var changed bool
 	var levelStats [4]int64
+	var blockedByWatermark int
 	for i := range messages {
+		// ★ 只能动 [SentUpTo, len) —— 即本轮新增、尚未进入任何已发出请求的消息。
+		//
+		// 纪律见 hook.go 的 SentUpTo 字段注释, 以及 engine.go:2049 那条停用注释:
+		// 「历史长度应当由 AutoCompact 的折叠边界一次性收敛, 而不是每轮动态裁剪」。
+		// MicroCompactHook 一直守着它; 本 hook 之前**没读** ctx.SentUpTo, 于是每轮
+		// 都在最老的历史上动刀。
+		//
+		// 为什么"删除"比"改写"更致命: [0, SentUpTo) 已经躺在缓存前缀里, 删掉其中
+		// 一条消息会让它**后面所有消息整体前移**, 首个不同字节落在删除点, 其后整段
+		// 前缀一起作废。实测 (if-question-expand 2fd81b6e, t7→t8) 级联为:
+		//   删最老 tool_result → 该 user 消息 Content 变空被 messagesToAPI 整条丢弃
+		//   → 与之配对的 tool_use 成孤儿被 sanitizeToolPairing 摘掉
+		//   → 前后两条 assistant 相邻被合并成一条。
+		// 首个不同字节 @19307, 当轮 19438B 作废; 且位移此后每轮继续往下带
+		// (t8→t9 再 15965B、t9→t10 13464B、t10→t11 9307B, 合计约 58KB)。
+		if i < ctx.SentUpTo {
+			if messages[i].Type == types.MessageTypeUser &&
+				h.determineLevel(msgRound[i]) != Level0 {
+				blockedByWatermark++
+			}
+			continue
+		}
 		if messages[i].Type != types.MessageTypeUser {
 			continue
 		}
@@ -448,17 +472,26 @@ func (h *ToolResultLevelHook) Execute(ctx *HookContext) (*HookResult, error) {
 				newBlocks = append(newBlocks, *degraded)
 			}
 		}
-		if len(newBlocks) != len(messages[i].Content) {
+		// 比对**内容**而不是块数。
+		//
+		// 原来这里是 `len(newBlocks) != len(messages[i].Content)`, 而 L1(截断)与
+		// L2(换成 [历史操作结果: 成功]) 都是**原地改写**、块数不变 —— 于是这两档
+		// 算完就被丢掉, 成了不留任何痕迹的死代码 (产出里搜不到 truncated by level1 /
+		// [历史操作结果, 但那是"没生效"不是"没跑过", grep 无果不能当判据)。
+		// 只有 L3 的 `return nil` 会改块数, 所以整个 hook 实际只剩"删"这一档在动。
+		// MicroCompactHook 判"改没改"用的就是逐块比内容, 这里对齐它。
+		if !contentEqual(newBlocks, messages[i].Content) {
 			messages[i].Content = newBlocks
 			changed = true
 		}
 	}
 
-	if changed {
+	if changed || blockedByWatermark > 0 {
 		logging.For("engine").Debug("ToolResultLevelHook applied",
 			"l1", levelStats[Level1],
 			"l2", levelStats[Level2],
 			"l3", levelStats[Level3],
+			"blocked_by_watermark", blockedByWatermark,
 		)
 	}
 
@@ -505,17 +538,14 @@ func (h *ToolResultLevelHook) degradeLevel1(b types.ContentBlock) *types.Content
 	return &types.ContentBlock{
 		Type:      b.Type,
 		ToolUseID: b.ToolUseID,
-		Content:   b.Content[:h.config.Level1MaxChars] + "\n... (truncated by level1)",
+		Content:   textutil.Truncate(b.Content, h.config.Level1MaxChars, "\n... (truncated by level1)"),
 		IsError:   b.IsError,
 	}
 }
 
 func (h *ToolResultLevelHook) degradeLevel2(b types.ContentBlock) *types.ContentBlock {
 	if h.config.PreserveErrors && b.IsError {
-		summary := b.Content
-		if len(summary) > 300 {
-			summary = summary[:300] + "..."
-		}
+		summary := textutil.Truncate(b.Content, 300, "...")
 		return &types.ContentBlock{
 			Type:      b.Type,
 			ToolUseID: b.ToolUseID,
@@ -535,12 +565,23 @@ func (h *ToolResultLevelHook) degradeLevel2(b types.ContentBlock) *types.Content
 	}
 }
 
+// degradeLevel3 最老一档: 成功结果换成一行占位, 失败结果换摘要。
+//
+// ★ 这里曾经对成功类 `return nil` —— 静默把整个 tool_result 删掉。那是级联崩溃的
+// 源头, 不是"降级": 块数 1→0 导致该 user 消息 Content 变空, messagesToAPI 的
+// `len(kept)==0 → continue` 把**整条消息**丢掉; 与之配对的 tool_use 随即成孤儿,
+// 被 sanitizeToolPairing 摘掉; 于是前后两条 assistant 相邻, 又被合并循环拼成一条。
+// 实测 (if-question-expand 2fd81b6e t7→t8) 三条消息塌成一条, 首个不同字节 @19307,
+// 后面 19438B 全部作废, 且位移此后每轮继续往下带。
+//
+// 留一行占位就没有这个问题: 块还在, 配对不破, 消息不空, 结构零位移 —— 只是内容
+// 变短。省下的 token 几乎一样 (几千字符 → 一行), 却把"删除"降级成"改写", 而改写
+// 只影响它自己那一段, 不会让后面的消息整体前移。
+//
+// 配置里本来就有 Level3SuccessMarker 字段却一直没被使用 —— 占位才是它原本的意图。
 func (h *ToolResultLevelHook) degradeLevel3(b types.ContentBlock) *types.ContentBlock {
 	if b.IsError {
-		summary := b.Content
-		if len(summary) > h.config.Level3ErrorSummary {
-			summary = summary[:h.config.Level3ErrorSummary] + "..."
-		}
+		summary := textutil.Truncate(b.Content, h.config.Level3ErrorSummary, "...")
 		return &types.ContentBlock{
 			Type:      b.Type,
 			ToolUseID: b.ToolUseID,
@@ -548,12 +589,36 @@ func (h *ToolResultLevelHook) degradeLevel3(b types.ContentBlock) *types.Content
 			IsError:   true,
 		}
 	}
-	return nil
+	return &types.ContentBlock{
+		Type:      b.Type,
+		ToolUseID: b.ToolUseID,
+		Content:   fmt.Sprintf(h.config.Level3SuccessMarker, "成功"),
+		IsError:   false,
+	}
 }
 
 // ============================================================================
 // 辅助函数
 // ============================================================================
+
+// contentEqual 逐块比较两组 content 是否相同 (只比降级会碰的字段)。
+//
+// 存在的理由: 降级里有"原地改写"(截断 / 换摘要)与"删除"(返回 nil)两种形态,
+// 前者不改变块数。任何用 len() 判断"改没改"的闸门都会把原地改写静默丢掉。
+func contentEqual(a, b []types.ContentBlock) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Type != b[i].Type ||
+			a[i].ToolUseID != b[i].ToolUseID ||
+			a[i].Content != b[i].Content ||
+			a[i].IsError != b[i].IsError {
+			return false
+		}
+	}
+	return true
+}
 
 func computeMessageRounds(messages []types.Message) []int {
 	n := len(messages)

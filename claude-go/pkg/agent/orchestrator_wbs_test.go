@@ -115,6 +115,30 @@ func (d *wbsFakeDAG) ReevaluateBlockedTasks() int {
 	return 0
 }
 
+// SweepStaleTasks 与真实 TaskStore 同语义: 把依赖已全部终态的 blocked 解锁成 pending。
+// 假实现也必须跟上接口, 否则它会变成唯一没跟上生产的那一处。
+func (d *wbsFakeDAG) SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int {
+	swept := 0
+	for taskID, task := range d.tasks {
+		if task.Status != "blocked" {
+			continue
+		}
+		allDone := true
+		for _, dep := range task.DependsOn {
+			if d.tasks[dep].Status != "completed" && d.tasks[dep].Status != "failed" {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			task.Status = "pending"
+			d.tasks[taskID] = task
+			swept++
+		}
+	}
+	return swept
+}
+
 type sleepingRunner struct{}
 
 func (sleepingRunner) Execute(ctx context.Context, userPrompt string) (string, error) {

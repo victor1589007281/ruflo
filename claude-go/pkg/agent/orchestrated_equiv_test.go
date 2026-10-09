@@ -453,7 +453,7 @@ func TestOrchestrated瞬态重试额度(t *testing.T) {
 	defer func() { orchSleepFn = restore }()
 
 	wf := &WorkflowDef{Name: "orch-transient", Mode: "orchestrated", Stages: []StageDef{
-		{Name: "only", Role: "worker", Prompt: "干活"},
+		{Name: "only", Agent: "worker", Prompt: "干活"},
 	}}
 	llm := &orchStubLLM{failSys: "干活", failMsg: "429 rate limit exceeded"}
 	res, _ := newOrchStubExecutor(llm).executeOrchestrated(

@@ -108,6 +108,9 @@ func Resolve(provider string, getenv func(string) string) Profile {
 var CoreVisibleTools = []string{
 	// 编码核心
 	"Bash", "Shell", "Read", "Write", "StrReplace", "Glob", "Grep",
+	// 回滚出口 (H3-1): 弱模型改坏文件的概率本来就高, 而它恰恰最不擅长"凭记忆
+	// 把文件改回去"。把 Rewind 留在核心可见集里是这套掩码里最划算的一格。
+	"Rewind",
 	// 规划与任务跟踪
 	"TodoWrite", "EnterPlanMode", "ExitPlanMode",
 	"TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
@@ -122,7 +125,7 @@ var DefaultMaskedTools = []string{
 	// 金融行情 (垂直场景)
 	"FetchKLine", "FetchQuote",
 	// 团队/定时编排 (headless 单跑场景无意义)
-	"TeamCreate", "TeamDelete", "TeamMailbox",
+	"TeamCreate", "TeamDelete",
 	"CronCreate", "CronDelete", "CronList",
 	// 进化实验八件套 (治理面, 非执行任务)
 	"evo_inspect", "evo_list_envs", "evo_promote", "evo_propose",

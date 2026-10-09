@@ -516,7 +516,7 @@ func tradingDebateTemplateStages(wf *WorkflowDef) ([]StageDef, error) {
 		for _, side := range debateSides {
 			name := fmt.Sprintf("%s-round%d", side.name, round)
 			stages = append(stages, StageDef{
-				Name: name, Role: side.role,
+				Name: name, Agent: side.role,
 				// 三个 %s = 标的 / 分析师报告 / 辩论历史
 				Prompt:    fmt.Sprintf(side.prompt, "{objective}", analysisRef, placeholderRefs(debateNames)),
 				DependsOn: concatNames(analysisNames, debateNames),
@@ -525,14 +525,14 @@ func tradingDebateTemplateStages(wf *WorkflowDef) ([]StageDef, error) {
 		}
 	}
 	stages = append(stages, StageDef{
-		Name: "research-manager", Role: "research-manager",
+		Name: "research-manager", Agent: "research-manager",
 		Prompt:    fmt.Sprintf(researchManagerPrompt, "{objective}", analysisRef, placeholderRefs(debateNames)),
 		DependsOn: concatNames(analysisNames, debateNames),
 	})
 
 	// —— Phase 3: Trader ——
 	stages = append(stages, StageDef{
-		Name: "trader", Role: "trader",
+		Name: "trader", Agent: "trader",
 		// 两个 %s = 标的 / research-manager 结论
 		Prompt:    fmt.Sprintf(traderPrompt, "{objective}", "{research-manager}"),
 		DependsOn: []string{"research-manager"},
@@ -549,7 +549,7 @@ func tradingDebateTemplateStages(wf *WorkflowDef) ([]StageDef, error) {
 		for _, p := range riskPerspectives {
 			name := fmt.Sprintf("%s-round%d", p.name, round)
 			stages = append(stages, StageDef{
-				Name: name, Role: p.role,
+				Name: name, Agent: p.role,
 				// 三个 %s = 标的 / 交易方案 / 风险辩论历史
 				Prompt:    fmt.Sprintf(p.prompt, "{objective}", "{trader}", placeholderRefs(riskNames)),
 				DependsOn: concatNames([]string{"trader"}, riskNames),
@@ -558,7 +558,7 @@ func tradingDebateTemplateStages(wf *WorkflowDef) ([]StageDef, error) {
 		}
 	}
 	stages = append(stages, StageDef{
-		Name: "portfolio-manager", Role: "portfolio-manager",
+		Name: "portfolio-manager", Agent: "portfolio-manager",
 		Prompt:    fmt.Sprintf(portfolioManagerPrompt, "{objective}", "{trader}", placeholderRefs(riskNames)),
 		DependsOn: concatNames([]string{"trader"}, riskNames),
 	})
@@ -567,7 +567,7 @@ func tradingDebateTemplateStages(wf *WorkflowDef) ([]StageDef, error) {
 	// 注意: 量化风控 applyRiskGuardrails 只影响通知文案, 不写回任何 StageResult
 	// (workflow_trading_v2.go), 所以它不属于阶段序列, 模板里也不该出现。
 	stages = append(stages, StageDef{
-		Name: "signal-extractor", Role: "portfolio-manager",
+		Name: "signal-extractor", Agent: "portfolio-manager",
 		Prompt:    fmt.Sprintf(signalExtractorPrompt, "{portfolio-manager}"),
 		DependsOn: []string{"portfolio-manager"},
 	})

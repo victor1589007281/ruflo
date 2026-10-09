@@ -26,6 +26,24 @@ func NormalizeToolProfile(profile ToolProfile) ToolProfile {
 	}
 }
 
+// ValidToolProfile reports whether the value is one of the profiles defined here.
+//
+// 存在的理由只有一个: NormalizeToolProfile 对**拼错的**档位静默返回 chat, 且不留痕。
+// 调用方在"声明来自外部 (资产 frontmatter / 平台下发)"的那条路上必须先问这一句 ——
+// `tool-profile: codign` 会得到一个连 Read 都没有的子代理, 而日志上一个字都没有,
+// 从外面看与"这个角色本来就不需要文件工具"完全一样。
+//
+// 与 Normalize 的分工: 内部枚举/常量传参用 Normalize (它不会错), 外来字符串先
+// 过 Valid 再决定"作废并留痕"还是"接受并归一"。
+func ValidToolProfile(profile ToolProfile) bool {
+	switch profile {
+	case ToolProfileChat, ToolProfileResearch, ToolProfileCoding, ToolProfileTeam, ToolProfileAnalysis, ToolProfileAdmin:
+		return true
+	default:
+		return false
+	}
+}
+
 // RegisterProfileToolsWithStore registers a bounded built-in tool set for the
 // given profile. Admin intentionally preserves the historical all-tools behavior.
 func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searcher WebSearcher, profile ToolProfile) (*TodoWriteTool, *TaskStore) {
@@ -91,6 +109,9 @@ func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searche
 func registerFileMutationTools(reg *tool.Registry) {
 	reg.Register(NewFileWriteTool())
 	reg.Register(NewFileEditTool())
+	// 回滚出口与写工具同档: 能改文件的地方才需要能撤 —— 只读档位 (research /
+	// analysis / team) 注册它只会白白多出一份 schema, 而它们没有任何东西可退。
+	reg.Register(NewRewindTool())
 }
 
 func registerReadSearchTools(reg *tool.Registry) {

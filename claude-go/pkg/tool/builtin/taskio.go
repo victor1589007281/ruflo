@@ -140,7 +140,7 @@ func (t *TaskOutputTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TaskOutputTool) IsReadOnly(_ json.RawMessage) bool { return true }
+func (t *TaskOutputTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *TaskOutputTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 func (t *TaskOutputTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
@@ -220,7 +220,7 @@ func (t *TaskStopTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TaskStopTool) IsReadOnly(_ json.RawMessage) bool { return false }
+func (t *TaskStopTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *TaskStopTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 func (t *TaskStopTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {

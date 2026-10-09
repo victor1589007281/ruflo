@@ -48,6 +48,26 @@ type Runner struct {
 	sessionID string
 	timeout   time.Duration
 
+	// cfgMu 保护**组**那三件 (groups/groupOrder) 与 configs 的读取。
+	//
+	// configs 本身构造后**永不变** (这正是它此前不必加锁的原因), 它一并放进锁里
+	// 是为了让 findHooks/Count/Describe 读到的是一个**一致的两层视图** ——
+	// 只锁组、不锁基线的话, "基线 + 组" 这个整体在读的那一瞬间仍可能半新半旧。
+	//
+	// 为什么非有锁不可: 工具调用是**并发批次** (pkg/tool/orchestration.go 的
+	// runConcurrentBatch), 每个分支都调 findHooks; 而 pool_load 会在另一个
+	// goroutine 上改装/卸组。map 的并发读写会直接 fatal, 不是"偶发错误"。
+	cfgMu sync.RWMutex
+	// groups 运行期装入的 hook 组 (21.8.12 P3「hook 进池」), 键 = 资产名。
+	//
+	// 与 configs 分层而不是合并进同一个切片: 基线来自操作员配置, 组来自模型经
+	// pool_load 的请求 —— 来源与权限都不同。混一个切片之后, "把模型装的东西全卸掉"
+	// 没有下手处 (而那是会话结束/治理回退唯一要走的一步)。
+	groups map[string][]types.HookConfig
+	// groupOrder 组名装入序。执行顺序是**语义** (同一事件上多条 hook 谁先 deny
+	// 会改变结果), 所以它必须是稳定序而不是 map 遍历序。
+	groupOrder []string
+
 	// obsCtx 观测 ctx: 仅用于取出 Observer 把事件投到 Hook 总线 (见 bus.go)。
 	// nil = 不观测, 与改造前逐字节等价。**不用于取消/超时** —— 各 hook 执行自带
 	// 独立的 timeout ctx, 把这个 ctx 接进去会让"总线观测"意外变成一条取消路径。
@@ -79,6 +99,119 @@ func NewRunnerWithContext(ctx context.Context, configs []types.HookConfig, sessi
 	r := NewRunner(configs, sessionID)
 	r.obsCtx = ctx
 	return r
+}
+
+// MergeConfigs 返回一个**新** Runner: 本 Runner 的基线配置 + extra (extra 排在后)。
+//
+// ---------------------------------------------------------------------------
+// 为什么需要它: 追加配置此前只有"调用方自己拼一份"这一条路
+// ---------------------------------------------------------------------------
+//
+// 在它出现之前, "在既有 hook 之上再追加几条"这件事是调用方各自拼的 ——
+// pkg/feishu/session.go 与 cmd/claude-go/main.go 的嵌套子代理路径都是
+// `merged := append(基线, 新增...)` 再 NewRunnerWithContext。那份基线之所以拼得出来,
+// 只因为两条路径**顺手持有**了构造 Runner 用的 configs (engineDeps.hookConfigs /
+// sm.hookConfigs)。而 StageDef.Hooks (21.8.12 P4/X1) 的第三个消费点 (CLI 的
+// cliAgentRunner) 手上只有 *engine.QueryEngine, 没有那份 configs —— Runner 构造完
+// 就把入参丢掉了, 没人答得出"它现在挂着哪些配置"。
+//
+// 三条出路: ① 让调用方也能拿到基线 configs (等于把"谁持有配置"这件事再复制一遍,
+// 且要求每个构造点都记得并排存一份); ② 在 cliAgentRunner 里另起一个 Runner 只装
+// 阶段 hook (结果是同一轮的工具调用要问两个 Runner, 而**先问谁**决定了 deny 的
+// 赢家 —— 一份 deny 语义被拆到两处); ③ 让 Runner 自己会合并。取 ③。
+//
+// ---------------------------------------------------------------------------
+// 为什么返回新 Runner 而不是就地装入一个 hook 组 (InstallHookGroup)
+// ---------------------------------------------------------------------------
+//
+// 组是**会话级**的生命周期: 装进去之后所有后续轮次都看得见, 直到 Uninstall。
+// 阶段声明的 hook 生命周期是**一次 Execute**, 用完就该消失 —— 而 Execute 是可能
+// 并发的 (cmd/claude-go 的 agentPool 是 8 并发, 各 worker 共享同一个 eng)。
+// 用组来实现, 就必须给每次 Execute 编一个不会撞的名字, 并在所有返回路径上卸干净;
+// 漏卸的那条路径留下的 hook 会挂到**别人**的轮次上, 而且没有任何读数看得出来。
+//
+// 返回新 Runner 则天然是每调用一份, 没有共享就没有泄漏。代价是每次多构造一个
+// 几十字节的结构体 —— 换掉一整类"钩子串台"的失效形态, 划算。
+//
+// ★ 顺序是语义: extra 排在基线**之后**。同一事件上多条 hook 谁先 deny 会改变结果,
+// 而基线的口径是"部署方/操作员配置" —— 作者的阶段声明不该抢在它前面 (与 pkg/feishu
+// 三段来源的排列一致)。
+func (r *Runner) MergeConfigs(extra []types.HookConfig) *Runner {
+	if r == nil {
+		if len(extra) == 0 {
+			return nil
+		}
+		return NewRunner(extra, "")
+	}
+	out := &Runner{
+		sessionID: r.sessionID,
+		timeout:   r.timeout,
+		obsCtx:    r.obsCtx,
+	}
+	if len(extra) == 0 {
+		// 空追加重放一行没有任何好处, 但**必须**返回一个独立的 Runner 而不是 r:
+		// 调用方拿到的要么是"基线 + 阶段", 要么就是基线本身, 不该有一条路径
+		// 悄悄把共享对象漏出去 —— 那会让"这次执行挂了什么"重新取决于别人。
+		out.configs = append([]types.HookConfig(nil), r.configs...)
+		return out
+	}
+	out.configs = make([]types.HookConfig, 0, len(r.configs)+len(extra))
+	out.configs = append(out.configs, r.configs...)
+	out.configs = append(out.configs, extra...)
+	return out
+}
+
+// HookSummary 是 Runner 上一份 hook 配置的**可回读快照**, 供装配自报使用。
+//
+// 存在的理由: 到改造为止, "这次运行到底挂了哪些外部 hook"只活在 NewRunner 的入参
+// 里 —— 进程起来之后没人能回答, 配置里写了什么与实际装了什么是两件事 (CLI 与飞书
+// 两条路径装出来的还不一样)。装配对账要的就是这一份"实际"。
+//
+// **只报名称与形状, 不报命令原文与 URL**: hook 的 command/env 里常有凭据与内网
+// 地址, 而装配报告是要落盘、要展示到面板上的东西。要看原文应当去看配置文件本身。
+type HookSummary struct {
+	// Event 事件名 (如 PreToolUse / PostTurn)。
+	Event string `json:"event"`
+	// Type 生效的 hook 类型; 配置里留空时是 command (与 effectiveHookType 同源)。
+	Type string `json:"type"`
+	// Index 在配置列表里的下标 —— 同一事件上挂多条同名 hook 时唯一的区分手段。
+	Index int `json:"index"`
+	// HasCondition 是否带 If 条件 (带条件的 hook 只在部分调用上触发, 统计时不可比)。
+	HasCondition bool `json:"has_condition,omitempty"`
+	// Timeout 秒; 0 = 用默认值 (10s)。
+	Timeout int `json:"timeout,omitempty"`
+	// Group 这条 hook 来自哪个运行期装入的组 (P3 池化 hook); 空 = 基线配置。
+	//
+	// 为什么要报出来: 基线是操作员给的, 组是模型经 pool_load 装上来的 —— 两者在
+	// 治理上不是一回事 (回退时该卸的只有后者)。读数里分不出来, "这条 hook 谁装的"
+	// 就只能靠人回忆。
+	Group string `json:"group,omitempty"`
+}
+
+// Describe 返回**生效面** hook 配置的快照 (基线在前, 运行期装入的组按装入序在后)。
+//
+// 走 describeAll: 它是唯一一处把两层拼起来的地方。曾经这里直接遍历 r.configs —
+// 那样 pool_load 装上的 hook 在装配报告里**一条都看不到**, 而报告正是"声明有没有
+// 落地"的唯一出口: 装上了却不在 Describe 里, 与没装上的报告长得一样。
+func (r *Runner) Describe() []HookSummary {
+	return r.describeAll()
+}
+
+// Count 返回**生效面**的 hook 配置条数 (基线 + 运行期装入的组)。
+//
+// 与 BaselineCount 的分工见 BaselineCount 的注释: 这一个回答"一共挂了几条",
+// 那一个回答"配置/装配给了几条"。
+func (r *Runner) Count() int {
+	if r == nil {
+		return 0
+	}
+	r.cfgMu.RLock()
+	defer r.cfgMu.RUnlock()
+	n := len(r.configs)
+	for _, g := range r.groups {
+		n += len(g)
+	}
+	return n
 }
 
 // RegisterPostSamplingHook 注册后采样回调（在 ExecutePostSamplingHooks 中调用）。
@@ -480,17 +613,36 @@ func (r *Runner) executeMessageHooksWithDecision(event types.HookEvent, messages
 	return nil
 }
 
-// findHooks 查找匹配事件与 If 条件的 hooks
+// findHooks 查找匹配事件与 If 条件的 hooks。基线在前、运行期装入的组按装入序在后。
+//
+// ★ 这是"hook 进池"**唯一**的行为落点: pool_load 一条 hook 之后到底生不生效,
+// 取决于这个函数看不看得见组。看不见的表现是——池里列着它、加载回"已加载"、
+// 装配读数 wired、而对这条 hook 的执行**一次都没有**发生 (与"没人配它"同形)。
+//
+// 锁只包住"取匹配列表"这一段, 返回值是**拷贝**: executeHook (可能 spawn 进程 /
+// 发 HTTP) 全部发生在锁外。把执行放进锁里, 一条慢 hook 会阻塞所有并发工具调用,
+// 那是比数据竞争更难查的性能故障。
 func (r *Runner) findHooks(event types.HookEvent, toolName string) []types.HookConfig {
+	if r == nil {
+		return nil
+	}
+	r.cfgMu.RLock()
+	defer r.cfgMu.RUnlock()
 	var result []types.HookConfig
-	for _, h := range r.configs {
-		if h.Event != event {
-			continue
+	appendMatches := func(cfgs []types.HookConfig) {
+		for _, h := range cfgs {
+			if h.Event != event {
+				continue
+			}
+			if !matchHookIf(toolName, h.If) {
+				continue
+			}
+			result = append(result, h)
 		}
-		if !matchHookIf(toolName, h.If) {
-			continue
-		}
-		result = append(result, h)
+	}
+	appendMatches(r.configs)
+	for _, name := range r.groupOrder {
+		appendMatches(r.groups[name])
 	}
 	return result
 }

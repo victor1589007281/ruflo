@@ -7,7 +7,7 @@ func techBlogWorkflow() *WorkflowDef {
 		Mode:        "pipeline",
 		Stages: []StageDef{
 			{
-				Name: "source-analysis", Role: "source-analyst",
+				Name: "source-analysis", Agent: "source-analyst",
 				Prompt: `你是资深源码分析专家，擅长深入阅读和分析开源项目代码。
 
 写作主题: {objective}
@@ -27,7 +27,7 @@ func techBlogWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "investigation", Role: "tech-investigator",
+				Name: "investigation", Agent: "tech-investigator",
 				Prompt: `你是技术调查记者，擅长全方位搜集和整理技术信息。
 
 写作主题: {objective}
@@ -47,7 +47,7 @@ func techBlogWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "fact-checking", Role: "fact-checker",
+				Name: "fact-checking", Agent: "fact-checker",
 				DependsOn: []string{"source-analysis", "investigation"},
 				Prompt: `你是严谨的技术事实核验专家。验证前面调研的准确性。
 
@@ -75,7 +75,7 @@ func techBlogWorkflow() *WorkflowDef {
 ## 建议删除/修改的内容`,
 			},
 			{
-				Name: "article-writing", Role: "tech-writer",
+				Name: "article-writing", Agent: "tech-writer",
 				DependsOn: []string{"fact-checking"},
 				Prompt: `你是顶级技术自媒体作者 (10万+阅读量级)。基于经过核验的素材撰写专业文章。
 
@@ -115,7 +115,7 @@ func techBlogWorkflow() *WorkflowDef {
 ## 必须包含: 至少 1 个 benchmark 或性能数据 + 至少 1 个生产环境案例`,
 			},
 			{
-				Name: "self-critique", Role: "tech-critic",
+				Name: "self-critique", Agent: "tech-critic",
 				DependsOn: []string{"article-writing"},
 				Prompt: `你是**资深技术自媒体主编** (借鉴 Qwen3 Thinking Mode: 先深度思考再输出)。
 
@@ -152,7 +152,7 @@ func techBlogWorkflow() *WorkflowDef {
 **如果总分 < 35, 输出修改后的完整文章。**`,
 			},
 			{
-				Name: "formatting", Role: "article-formatter",
+				Name: "formatting", Agent: "article-formatter",
 				DependsOn: []string{"self-critique"},
 				Prompt: `你是微信公众号排版和视觉设计专家。将文章优化为适合公众号发布的格式。
 
@@ -182,4 +182,3 @@ func techBlogWorkflow() *WorkflowDef {
 		},
 	}
 }
-

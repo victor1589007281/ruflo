@@ -69,6 +69,17 @@ var dashboardContract = []apiEndpoint{
 	{Pattern: "/api/workflows/generate", Probe: "/api/workflows/generate"},
 	{Pattern: "/api/workflows/", Probe: "/api/workflows/novel-v2", Prefix: true},
 	{Pattern: "/api/roles", Probe: "/api/roles"},
+	// agent **资产** (stateDir/agents/*.md) 的查看与创建。与上面的 /api/roles 是两层
+	// 不同的东西: 角色表是 93 个内置人格的只读视图, 这里管的是优先级更高、可声明
+	// 字段更多、且**可写**的那一层。见 agent_handlers.go 的包注释。
+	{Pattern: "/api/agents", Probe: "/api/agents"},
+	{Pattern: "/api/agents/generate", Probe: "/api/agents/generate"},
+	{Pattern: "/api/agents/", Probe: "/api/agents/some-agent", Prefix: true},
+	// 插件包资产 (stateDir/plugins/<名>/PLUGIN.md + 成员子目录)。与上面 agent 那组
+	// 同层同形, 差别只在插件是目录形式的资产; 成员展开由 pkg/pluginrun.Expand 算。
+	{Pattern: "/api/plugins", Probe: "/api/plugins"},
+	{Pattern: "/api/plugins/generate", Probe: "/api/plugins/generate"},
+	{Pattern: "/api/plugins/", Probe: "/api/plugins/some-plugin", Prefix: true},
 	{Pattern: "/api/intent", Probe: "/api/intent"},
 	{Pattern: "/api/verify-goal", Probe: "/api/verify-goal"},
 	{Pattern: "/api/skills", Probe: "/api/skills"},

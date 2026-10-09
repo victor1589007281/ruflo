@@ -706,7 +706,7 @@ func TestTeamRunnerRunsRealTeam(t *testing.T) {
 	if err := RegisterWorkflow(&WorkflowDef{
 		Name: wfName, Mode: "pipeline", QualityGate: "none",
 		Stages: []StageDef{{
-			Name: "draft", Role: "tsq-writer",
+			Name: "draft", Agent: "tsq-writer",
 			Prompt: "你是一个撰稿人, 根据目标写一段内容。目标: {objective}",
 		}},
 	}, nil); err != nil {

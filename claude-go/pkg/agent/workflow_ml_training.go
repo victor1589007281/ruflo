@@ -9,7 +9,8 @@
 //   - LoRA/QLoRA/DoRA: 参数高效微调
 //
 // 执行流程:
-//   数据分析 ∥ 特征工程 → 模型设计 → 训练执行 → 评估分析 → 优化/蒸馏 → 综合报告
+//
+//	数据分析 ∥ 特征工程 → 模型设计 → 训练执行 → 评估分析 → 优化/蒸馏 → 综合报告
 package agent
 
 func mlTrainingWorkflow() *WorkflowDef {
@@ -19,7 +20,7 @@ func mlTrainingWorkflow() *WorkflowDef {
 		Mode:        "pipeline",
 		Stages: []StageDef{
 			{
-				Name: "data-analysis", Role: "data-analyst",
+				Name: "data-analysis", Agent: "data-analyst",
 				Prompt: `你是**资深数据科学家** (参考 AutoML-Agent 数据分析模块)。
 
 ML任务: {objective}
@@ -41,7 +42,7 @@ ML任务: {objective}
 				Parallel: true,
 			},
 			{
-				Name: "feature-engineering", Role: "ml-engineer",
+				Name: "feature-engineering", Agent: "ml-engineer",
 				Prompt: `你是**特征工程专家** (参考 FeRG-LLM + LLM-FE: LLM驱动的特征生成与选择)。
 
 ML任务: {objective}
@@ -63,7 +64,7 @@ ML任务: {objective}
 				Parallel: true,
 			},
 			{
-				Name: "model-design", Role: "ml-architect",
+				Name: "model-design", Agent: "ml-architect",
 				DependsOn: []string{"data-analysis"},
 				Prompt: `你是**ML架构师** (参考 AutoML-Agent 模型选择 + Centaur 混合HPO)。
 
@@ -92,7 +93,7 @@ ML任务: {objective}
 输出完整的模型定义代码和超参搜索配置。`,
 			},
 			{
-				Name: "training", Role: "ml-trainer",
+				Name: "training", Agent: "ml-trainer",
 				DependsOn: []string{"feature-engineering", "model-design"},
 				Prompt: `你是**ML训练工程师** (参考 DSPy 声明式训练 + MLflow 实验追踪)。
 
@@ -123,7 +124,7 @@ ML任务: {objective}
 所有代码必须可直接运行。训练脚本包含完整的数据加载、训练循环、指标记录、模型保存。`,
 			},
 			{
-				Name: "evaluation", Role: "ml-evaluator",
+				Name: "evaluation", Agent: "ml-evaluator",
 				DependsOn: []string{"training"},
 				Prompt: `你是**模型评估专家** (参考 AutoGluon 评估框架)。
 
@@ -150,7 +151,7 @@ ML任务: {objective}
 - 模型是否达标的结论`,
 			},
 			{
-				Name: "optimization-distillation", Role: "ml-optimizer",
+				Name: "optimization-distillation", Agent: "ml-optimizer",
 				DependsOn: []string{"evaluation"},
 				Prompt: `你是**模型优化与蒸馏专家** (参考 On-Policy Distillation + GaLore)。
 
@@ -178,7 +179,7 @@ ML任务: {objective}
 所有优化代码必须可运行, 包含性能基准测试。`,
 			},
 			{
-				Name: "synthesis", Role: "synthesizer",
+				Name: "synthesis", Agent: "synthesizer",
 				DependsOn: []string{"optimization-distillation"},
 				Prompt: `你是**ML项目负责人**, 负责综合所有阶段产出, 撰写最终报告。
 

@@ -1,10 +1,30 @@
 // tasktools.go 实现 V2 任务系统的四个内置工具（TaskCreate / TaskGet / TaskUpdate / TaskList）。
-// 对应 Claude Code Agent Teams 风格的共享任务列表，数据持久化到系统临时目录下的 JSON 文件。
+// 对应 Claude Code Agent Teams 风格的共享任务列表，数据持久化到项目作用域下的 JSON 文件。
 //
 // 设计要点:
 //   - 所有工具共享同一 TaskStore，内部 sync.Mutex 保证并发安全；
-//   - 任务以 UUID 为主键，创建/更新后落盘，进程间可复用同一路径（默认固定文件名）；
+//   - 任务以 UUID 为主键，创建/更新后落盘；
 //   - TaskCreate、TaskUpdate 为写入类工具；TaskGet、TaskList 为只读工具。
+//
+// # 三个任务系统里谁是唯一真源
+//
+// 仓库里并存三套任务状态。它们的地位**不相等**，混用会让"还剩什么没做完"失去可信度：
+//
+//	真源   pkg/agent/taskservice.go 的 FileQueueTaskService
+//	       —— 唯一有 CAS (TransitionCAS) / revision / append-only journal / 终态的台账。
+//	视图①  TodoWriteTool (todowrite.go): 模型自己的草稿纸, 纯内存, 不落盘, 不进台账。
+//	视图②  本文件的 TaskStore: 真源在 pkg/agent 不可达时的降级台账。
+//
+// **为什么真源不能是这里**：pkg/agent 不能 import pkg/tool/builtin —— builtin 经
+// evotools → evolution/govern 反向成环（见 pkg/agent/constraints.go:112-113 的记录）。
+// 因此团队编排层（它才是"谁还没做完"的消费者）在编译期就看不见本包，只能看见
+// taskservice。把真源放在这里，等于把编排层最需要的那份状态放在它拿不到的地方。
+//
+// # 路径必须是项目作用域
+//
+// 本项目早期默认落 os.TempDir()/claude-go-v2-tasks.json —— 那是**全机器共享**的单文件，
+// 两个项目并发跑会互相覆盖，且重启后 /tmp 被清理即丢。TaskStorePathFor 从项目目录派生，
+// 不同项目得到不同路径（H1-1 的验收判据就是"两个项目的任务文件路径不相等"）。
 package builtin
 
 import (
@@ -19,6 +39,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -28,8 +49,6 @@ const (
 	taskGetToolName    = "TaskGet"
 	taskUpdateToolName = "TaskUpdate"
 	taskListToolName   = "TaskList"
-
-	defaultTaskStoreFile = "claude-go-v2-tasks.json"
 )
 
 // v2TaskRecord 表示持久化的一条任务记录（与 types.Task 语义相近，独立定义以避免与全局类型耦合）。
@@ -42,8 +61,8 @@ type v2TaskRecord struct {
 	ActiveForm  string   `json:"activeForm,omitempty"`
 	Status      string   `json:"status"`
 	Owner       string   `json:"owner,omitempty"`
-	DependsOn   []string `json:"dependsOn,omitempty"`  // DAG: 前置依赖的 task ID 列表
-	Priority    int      `json:"priority,omitempty"`   // 0=normal, 1=high, 2=critical
+	DependsOn   []string `json:"dependsOn,omitempty"`   // DAG: 前置依赖的 task ID 列表
+	Priority    int      `json:"priority,omitempty"`    // 0=normal, 1=high, 2=critical
 	WriteScopes []string `json:"writeScopes,omitempty"` // F13: 任务声明的写域 (共享核心状态/契约/manifest 等领域键), 供规划层串行化与观测
 	CreatedAt   string   `json:"createdAt"`
 	UpdatedAt   string   `json:"updatedAt"`
@@ -60,10 +79,44 @@ type TaskStore struct {
 	byID map[string]v2TaskRecord
 }
 
-// NewTaskStore 创建任务存储。若 path 为空，则使用 os.TempDir() 下的默认文件名。
+// TaskStorePathFor 解析任务文件的项目作用域路径。
+//
+// 解析顺序与 basedir.ResolveDefault 同源，保证任务文件与其他模块数据目录落在同一个根下：
+//
+//	stateDir 非空            → <stateDir>/tasks/tasks.json
+//	stateDir 空, projectDir   → <projectDir>/.claude-go/tasks/tasks.json
+//
+// **刻意不回退到 os.TempDir()**：/tmp 是全机器共享的，两个项目并发跑会互相覆盖，
+// 这正是 H1-1 要修掉的形态。stateDir 与 projectDir 都为空时才退回相对路径 ".claude-go"。
+func TaskStorePathFor(stateDir, projectDir string) string {
+	root := basedir.ResolveDefault(stateDir, projectDir)
+	layout, err := basedir.NewLayout(root)
+	if err != nil {
+		// NewLayout 只在 root 为空时报错，而 ResolveDefault 保证了非空；真出错时
+		// 也要给一个项目相对路径，绝不落到共享的临时目录。
+		return filepath.Join(".claude-go", "tasks", "tasks.json")
+	}
+	return layout.TasksFilePath()
+}
+
+// DefaultTaskStorePath 返回当前进程的项目作用域任务文件路径。
+//
+// 读 CLAUDE_GO_STATE_DIR：该变量此前**只被写、从没被读**（pkg/worker/k8sjob.go:639
+// 给 worker job 注入它），所以 k8s worker 里任务文件其实一直落在容器的 cwd 下。
+// 在这里读它是补上写入侧本来就期望的那一半。
+func DefaultTaskStorePath() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = ""
+	}
+	return TaskStorePathFor(os.Getenv("CLAUDE_GO_STATE_DIR"), cwd)
+}
+
+// NewTaskStore 创建任务存储。若 path 为空，则使用项目作用域下的默认路径
+// （见 DefaultTaskStorePath），**不是** os.TempDir()。
 func NewTaskStore(path string) *TaskStore {
 	if path == "" {
-		path = filepath.Join(os.TempDir(), defaultTaskStoreFile)
+		path = DefaultTaskStorePath()
 	}
 	s := &TaskStore{
 		path: path,
@@ -72,6 +125,9 @@ func NewTaskStore(path string) *TaskStore {
 	_ = s.load()
 	return s
 }
+
+// Path 返回该存储实际使用的文件路径。用于验收"两个项目的任务文件路径不相等"。
+func (s *TaskStore) Path() string { return s.path }
 
 func (s *TaskStore) load() error {
 	s.mu.Lock()
@@ -637,9 +693,10 @@ func (s *TaskStore) UnblockDependents(doneID string) int {
 //
 // 依赖满足语义 (all_done): completed 或 failed 都算"已处理完毕"。
 // 这与 SetTaskStatusAndUnblock 的 unblock 语义保持一致 — 否则会出现:
-//   1. 上游任务 hard-gate failed → SetTaskStatusAndUnblock 将下游 blocked → pending (用 all_done)
-//   2. ReadyTasks 仍要求依赖 completed → 已 pending 的下游永远进不了 ready 队列
-//   3. 调度器 10 分钟后触发 stall recovery → 把 failed 任务重置成 pending → 重新执行 → 再失败
+//  1. 上游任务 hard-gate failed → SetTaskStatusAndUnblock 将下游 blocked → pending (用 all_done)
+//  2. ReadyTasks 仍要求依赖 completed → 已 pending 的下游永远进不了 ready 队列
+//  3. 调度器 10 分钟后触发 stall recovery → 把 failed 任务重置成 pending → 重新执行 → 再失败
+//
 // 死循环的根因。修复后, failed 依赖也视为已满足, 下游可正常向前推进。
 func (s *TaskStore) ReadyTasks() []TaskSummary {
 	s.mu.Lock()
@@ -683,6 +740,16 @@ func (s *TaskStore) ReadyTasks() []TaskSummary {
 }
 
 // SetTaskStatus 按 ID 更新任务状态 (供团队编排使用)。
+//
+// 终态 (completed/failed) 会**顺带做一次 all_done 解锁扫描**, 与 SetTaskStatusAndUnblock
+// 同语义。这不是锦上添花 —— 生产里所有失败路径走的都是**这一个**函数
+// (pkg/agent/workflow.go:922、pkg/agent/swarm.go:762、pkg/agent/orchestrator.go:7321),
+// 而它此前只改这一个字段、不做任何下游联动。后果实测在台账上:
+// 1246 条 blocked 里有 **245 条**的上游已经是 failed, 即永远不会再被解锁的僵尸条目。
+//
+// 语义是"解锁"不是"级联失败": 上游 failed 计为已处理完毕, 下游 blocked → pending,
+// 让模型仍有机会基于残缺上下文推进。硬级联 failed 的老行为已被刻意废弃
+// (见 cascadeFailureLocked 的注释: 单点 fail 会炸掉 50+ 兄弟分支)。
 func (s *TaskStore) SetTaskStatus(id, status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -693,7 +760,169 @@ func (s *TaskStore) SetTaskStatus(id, status string) error {
 	rec.Status = status
 	rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	s.byID[id] = rec
+	if status == "completed" || status == "failed" {
+		s.unblockAllDoneLocked()
+	}
 	return s.saveLocked()
+}
+
+// unblockAllDoneLocked 把所有"依赖均已处理完毕"的 blocked 任务置为 pending。
+// 调用方必须已持有 s.mu。返回解锁条数。
+func (s *TaskStore) unblockAllDoneLocked() int {
+	unblocked := 0
+	for id, rec := range s.byID {
+		if rec.Status != "blocked" {
+			continue
+		}
+		// 注意: 这里**不要**再单独判一次 len(DependsOn)==0。空依赖列表走下面的
+		// allDone 循环会自然得到 allDone==true, 与专门的分支行为完全一致 ——
+		// 变异测试证实那条分支从不承重。
+		allDone := true
+		for _, dep := range rec.DependsOn {
+			d, exists := s.byID[dep]
+			if !exists {
+				allDone = false
+				break
+			}
+			if d.Status != "completed" && d.Status != "failed" {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			rec.Status = "pending"
+			rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			s.byID[id] = rec
+			unblocked++
+		}
+	}
+	return unblocked
+}
+
+// pending 与 blocked 的默认存活上限。超过即判为无人认领的孤儿条目。
+//
+// 取值依据: pending 的正常寿命是"被 Submit 到 runner 接手"这一段, 生产上是秒级;
+// 30 分钟给了"先 Submit、稍后才注入 runner"的余量 (Resume 明确支持这条路, 见
+// taskservice.go 的 `case TaskStatePending` 分支)。blocked 还要叠加上游的真实执行
+// 时间, 所以给到 6 小时。
+const (
+	DefaultPendingTTL = 30 * time.Minute
+	DefaultBlockedTTL = 6 * time.Hour
+)
+
+// TaskSweepResult 是一次对账的结果计数, 分原因返回以便定位。
+type TaskSweepResult struct {
+	Unblocked      int // blocked → pending (依赖已全部处理完毕)
+	ExpiredPending int // pending → failed (超时无人认领)
+	ExpiredBlocked int // blocked → failed (依赖悬空, 见 DanglingDeps)
+	DanglingDeps   int // 其中因依赖 ID 在台账里根本不存在而作废的
+}
+
+// Total 返回本次对账改动的条目总数。
+func (r TaskSweepResult) Total() int {
+	return r.Unblocked + r.ExpiredPending + r.ExpiredBlocked
+}
+
+// SweepStale 对台账做一次对账, 消灭两类吸收态。调用方必须自己决定何时调用
+// (它**不会**在 NewTaskStore 里自动跑 —— 打开一个台账不该顺手改用户数据)。
+//
+// 两类吸收态:
+//  1. blocked 而依赖已全部终态 (或依赖 ID 悬空): 没有任何事件会再来解锁它。
+//     512 条台账实测里 245 条属于这一类。
+//  2. pending 超过 pendingTTL: 提交后没有任何执行器接手。taskservice 的
+//     startRun 在 runner == nil 时**静默返回**, 任务就此永久停在 pending。
+//
+// TTL <= 0 表示该维度不做过期 (用于只想解锁、不想判死的场景)。
+func (s *TaskStore) SweepStale(now time.Time, pendingTTL, blockedTTL time.Duration) TaskSweepResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var res TaskSweepResult
+
+	// 第 1 遍: 依赖悬空的 blocked 先判死 —— 它们等的是一个不存在的 ID。
+	for id, rec := range s.byID {
+		if rec.Status != "blocked" {
+			continue
+		}
+		dangling := false
+		for _, dep := range rec.DependsOn {
+			if _, ok := s.byID[dep]; !ok {
+				dangling = true
+				break
+			}
+		}
+		if dangling {
+			s.failLocked(id, &rec, "依赖的任务 ID 不在台账里 (悬空引用)")
+			res.ExpiredBlocked++
+			res.DanglingDeps++
+		}
+	}
+
+	// 第 2 遍: 依赖已全部终态的 blocked → pending。放在过期之前, 因为被解锁的条目
+	// UpdatedAt 会被刷新, 于是它不会在同一轮里又被当成超时条目判死。
+	res.Unblocked = s.unblockAllDoneLocked()
+
+	// 第 3 遍: 超时。
+	if pendingTTL > 0 {
+		for id, rec := range s.byID {
+			if rec.Status != "pending" {
+				continue
+			}
+			if s.staleLocked(rec, now, pendingTTL) {
+				s.failLocked(id, &rec, fmt.Sprintf("pending 超过 %s 无人接手", pendingTTL))
+				res.ExpiredPending++
+			}
+		}
+	}
+	if blockedTTL > 0 {
+		for id, rec := range s.byID {
+			if rec.Status != "blocked" {
+				continue
+			}
+			if s.staleLocked(rec, now, blockedTTL) {
+				s.failLocked(id, &rec, fmt.Sprintf("blocked 超过 %s 仍未解锁", blockedTTL))
+				res.ExpiredBlocked++
+			}
+		}
+	}
+
+	if res.Total() > 0 {
+		_ = s.saveLocked()
+	}
+	return res
+}
+
+// SweepStaleTasks 是 pkg/agent 那侧 DAGTaskTracker 接口要的形态 (返回改动条数而非结果结构),
+// 让编排层不必 import 本包就能对账。语义与 SweepStale 完全一致。
+func (s *TaskStore) SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int {
+	return s.SweepStale(time.Now().UTC(), pendingTTL, blockedTTL).Total()
+}
+
+// staleLocked 判断一条记录是否已超过 TTL。时间戳用 UpdatedAt, 缺省回退 CreatedAt;
+// 两者都读不出来的记录算作 stale —— 一条无法判断年龄的条目正是对账要处理的对象。
+func (s *TaskStore) staleLocked(rec v2TaskRecord, now time.Time, ttl time.Duration) bool {
+	ts := rec.UpdatedAt
+	if ts == "" {
+		ts = rec.CreatedAt
+	}
+	if ts == "" {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return true
+	}
+	return now.Sub(t) > ttl
+}
+
+// failLocked 把一条记录推入 failed 终态并记下原因。调用方必须已持有 s.mu。
+func (s *TaskStore) failLocked(id string, rec *v2TaskRecord, reason string) {
+	rec.Status = "failed"
+	rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if rec.Description == "" {
+		rec.Description = reason
+	}
+	s.byID[id] = *rec
 }
 
 // GetAllTasks 返回所有任务的摘要列表。

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/statestore"
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // InlineLimit 正文内联上限 (字节)。超过则落 Blob, 只在 Span 存 hash。
@@ -47,10 +48,46 @@ const (
 	// 就只能事后猜。刻意与 node Span 分开: node 记执行结果, 这条记执行**之前**的
 	// 决策, 两者时间点与失效模式都不同 (节点失败时决策记录反而更要留着)。
 	KindPolicyDecision = "policy_decision"
+
+	// KindCompaction 一次上下文折叠 (H2-1)。
+	//
+	// 为什么它是独立 kind 而不是挂在 turn 的 attrs 上: 折叠是**改变后续所有轮次
+	// 输入**的事件 —— 一次 run 里前 40 轮看得见的东西, 第 41 轮之后看不见了。
+	// 长程任务"模型忘了前面做过什么"的归因, 第一步永远是"那件事是在哪次折叠里
+	// 掉出去的"; 挂在 turn 上就要按 turn 逐条扫 attrs, 且 turn 与折叠不是一一对应
+	// (一次 turn 可触发压缩, 压缩也可能在 PhaseOnRecovery 由 PTL 触发)。
+	//
+	// 记的是**读数不是结论**: 折了多少条 / 省了多少 token / 摘要多大 / 保住没保住
+	// 工具结果引用。这四个数之外怎么解释, 是消费方的事。
+	KindCompaction = "compaction"
 )
 
 // KindAll Kind 全集 (测试与操作台盘点用)。
-var KindAll = []string{KindRun, KindNode, KindTurn, KindLLMCall, KindToolCall, KindGate, KindPolicyDecision}
+var KindAll = []string{KindRun, KindNode, KindTurn, KindLLMCall, KindToolCall, KindGate, KindPolicyDecision, KindCompaction}
+
+// run span 的 attrs 取值。这些字面量**被 webapp 的轨迹页直接读**, 所以它们是
+// 跨仓库契约而不是实现细节:
+//
+//	webapp-service/backend/src/lib/traces.ts:328  if (a.status === 'failed') failedRuns = 1
+//	webapp-service/backend/src/lib/traces.ts:314  按 a.team / a.workflow 分组
+//
+// 为什么收在底座而不是留在产生方: 现在有三个 run span 产生方 (团队 pkg/agent、
+// 飞书会话 pkg/feishu、CLI cmd/claude-go)。各写各的字面量时, "什么算 completed"
+// 就有了三份真相源 —— 改一处而漏一处不会有任何编译错误, 只会让某一类运行在页面上
+// 悄悄变灰 (没有 status 就是灰点, 见 TracesPanel.tsx 的 StatusDot)。
+const (
+	// RunStatusOK / RunStatusFailed 是写在 run Span 上的终态。
+	RunStatusOK     = "completed"
+	RunStatusFailed = "failed"
+
+	// SessionWorkflowLabel 是"这次运行走的是会话路径, 不属于任何团队工作流"的
+	// workflow 维度标签。
+	//
+	// 为什么不是空: 页面按 a.team / a.workflow 分组, 不设就全落进「(未知团队)」
+	// 「(未知工作流)」两个桶 —— 会话运行与"真的没归因"混在一起, 分不开。
+	// 这不是编造: 它如实描述了这次的运行路径。
+	SessionWorkflowLabel = "session"
+)
 
 // Span 轨迹跨度 (OTel 风格)。
 type Span struct {
@@ -223,7 +260,7 @@ func (s *Store) MakeRef(text string) Ref {
 	hash, err := s.blob.Put([]byte(text))
 	if err != nil {
 		s.writeErr.Add(1)
-		return Ref{Inline: text[:limit], Size: len(text), Sampled: true}
+		return Ref{Inline: textutil.TruncateBytes(text, limit, ""), Size: len(text), Sampled: true}
 	}
 	return Ref{Blob: hash, Size: len(text), Sampled: true}
 }

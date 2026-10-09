@@ -8,7 +8,7 @@ func creativeWorkflow() *WorkflowDef {
 		Rounds:      2,
 		Stages: []StageDef{
 			{
-				Name: "creative-brief", Role: "creative-director",
+				Name: "creative-brief", Agent: "creative-director",
 				Prompt: `你是资深创意总监，擅长将模糊需求转化为精确的视觉创意方案。
 
 创作需求: {objective}
@@ -36,7 +36,7 @@ func creativeWorkflow() *WorkflowDef {
 - 节奏控制: 快节奏/慢节奏/张弛有度`,
 			},
 			{
-				Name: "prompt-engineer", Role: "prompt-engineer",
+				Name: "prompt-engineer", Agent: "prompt-engineer",
 				DependsOn: []string{"creative-brief"},
 				Prompt: `你是专业的 AI 视觉生成提示词工程师，精通 SVG/HTML 视觉创作指令。
 
@@ -72,7 +72,7 @@ func creativeWorkflow() *WorkflowDef {
 确保提示词足够精确，使 LLM 能生成高质量 SVG/HTML 代码。`,
 			},
 			{
-				Name: "asset-generate", Role: "visual-artist",
+				Name: "asset-generate", Agent: "visual-artist",
 				DependsOn: []string{"prompt-engineer"},
 				Prompt: `你是专业的 SVG/HTML 视觉创作专家。根据提示词指令实际生成视觉素材代码。
 
@@ -109,7 +109,7 @@ func creativeWorkflow() *WorkflowDef {
 - 输出每个素材的完整代码块和渲染说明`,
 			},
 			{
-				Name: "visual-review", Role: "art-director",
+				Name: "visual-review", Agent: "art-director",
 				DependsOn: []string{"asset-generate"},
 				Prompt: `你是资深艺术指导/视觉审查员(Evaluator 角色)。以挑剔的专业眼光审查生成的视觉素材。
 
@@ -142,7 +142,7 @@ Hard pass threshold: ALL ≥ 7 AND pass == true.
 如不通过，给出具体、可操作的修改建议。`,
 			},
 			{
-				Name: "post-production", Role: "post-producer",
+				Name: "post-production", Agent: "post-producer",
 				DependsOn: []string{"asset-generate"},
 				Prompt: `你是后期制作专家。将通过审查的素材组装为最终交付物。
 
@@ -172,4 +172,3 @@ Hard pass threshold: ALL ≥ 7 AND pass == true.
 		},
 	}
 }
-

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/textutil"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -203,8 +204,5 @@ print("".join(s.text for s in segs))
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return textutil.Truncate(s, n, "...")
 }

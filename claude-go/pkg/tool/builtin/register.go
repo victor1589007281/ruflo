@@ -24,10 +24,11 @@ func RegisterBaseTools(reg *tool.Registry, searcher WebSearcher) *TodoWriteTool 
 // If store is nil, creates a new one with default path.
 // Returns the TodoWriteTool and the (possibly newly created) TaskStore for reuse.
 func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher WebSearcher) (*TodoWriteTool, *TaskStore) {
-	// Core file tools
+	// Core file tools. 写工具走 registerFileMutationTools 而不是各写一行 ——
+	// 回滚出口 (H3-1) 必须与写工具同进同出, 抄成两份迟早会分叉成
+	// "有的档位能改不能撤", 那种分叉没有任何一处会报错。
 	reg.Register(NewFileReadTool())
-	reg.Register(NewFileWriteTool())
-	reg.Register(NewFileEditTool())
+	registerFileMutationTools(reg)
 
 	// Search tools
 	reg.Register(NewGlobTool())
@@ -71,8 +72,11 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	reg.Register(NewTaskListTool(store))
 
 	// Team tools
+	//
+	// TeamMailbox 已移除 (2026-09-25)：它把消息写进一个**零读者**的 map 却回"已投递"，
+	// 是**对模型撒谎**而非未接线 —— 模型会因此不再用别的方式传达。全仓信箱收敛为
+	// pkg/agent.PersistentMailbox 一份 (见 pkg/agent/mailbox.go 与 21.8.9-D6)。
 	ts := NewTeamStore()
-	reg.Register(NewSendMessageTool(ts))
 	reg.Register(NewTeamCreateTool(ts))
 	reg.Register(NewTeamDeleteTool(ts))
 

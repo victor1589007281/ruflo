@@ -351,6 +351,26 @@ const (
 	PermissionModeAcceptEdits PermissionMode = "acceptEdits"  // 自动接受文件类编辑工具
 )
 
+// ValidPermissionMode 报告取值是否是上面定义的某一档。
+//
+// 与 permissions.modeDecision 的 default 分支配对使用: 未知模式会落到与 default
+// **完全相同**的分支 (写入类工具走 Ask), 而在一个非交互的子代理里 Ask 等于挂起或
+// 被自动拒绝 —— 也就是说, 一个拼错的权限档 (`plan ` 带空格 / `Plan` 大小写 /
+// `readonly`) 的后果是"这个子代理什么也写不了", 且没有任何报错。
+//
+// 大小写敏感: 六个常量用的就是这种大小写混排 (`acceptEdits`), 做大小写不敏感匹配
+// 会把这个枚举变成第二个真相源 —— 从此 "Plan" 与 "plan" 都合法, 而 JSON 里记的是
+// 哪个就看写的人。
+func ValidPermissionMode(m PermissionMode) bool {
+	switch m {
+	case PermissionModeDefault, PermissionModeAuto, PermissionModePlan,
+		PermissionModeBypass, PermissionModeDontAsk, PermissionModeAcceptEdits:
+		return true
+	default:
+		return false
+	}
+}
+
 // PermissionResult 权限检查结果
 // 对应 TS: utils/permissions/PermissionResult.ts
 type PermissionResult struct {
@@ -430,6 +450,58 @@ const (
 	HookTypeFunction HookType = "function"
 	HookTypeGRPC     HookType = "grpc"
 )
+
+// hookEventNames 全部合法事件名。新增事件时**只改这一处** —— 与下面那个 switch
+// 不同, 它是可以被遍历的, 于是测试与错误信息能列出可选值, 而不是让人去翻源码。
+var hookEventNames = []HookEvent{
+	HookEventPreToolUse, HookEventPostToolUse, HookEventPostToolUseFailure,
+	HookEventStop, HookEventStopFailure, HookEventPreCompact, HookEventPostCompact,
+	HookEventSessionStart, HookEventSessionEnd, HookEventSubagentStart, HookEventSubagentStop,
+	HookEventTeammateIdle, HookEventTaskCompleted, HookEventNotification,
+	HookEventPreTurn, HookEventPostTurn, HookEventPreRequest, HookEventPostRequest,
+	HookEventOnContextOverflow, HookEventOnMaxTurnsReached, HookEventOnError, HookEventOnRecovery,
+	HookEventOnRateLimit, HookEventOnRetry, HookEventOnMessageFilter, HookEventOnChunk,
+	HookEventOnTokenStream,
+}
+
+// HookEventNames 返回全部合法事件名 (副本)。
+func HookEventNames() []HookEvent { return append([]HookEvent(nil), hookEventNames...) }
+
+// ValidHookEvent 报告事件名是否合法。
+//
+// 与 hooks.Runner.findHooks 配对: 那里按事件名做一次相等比较, 拼错的事件名会让这条
+// hook **永远不触发**, 而装载、注册、日志一路都是成功的 —— 这是外部 hook 最常见的
+// 静默失效形态 (`PostToolUse` 写成 `PostTooluse`)。
+func ValidHookEvent(e HookEvent) bool {
+	for _, n := range hookEventNames {
+		if n == e {
+			return true
+		}
+	}
+	return false
+}
+
+var hookTypeNames = []HookType{
+	HookTypeCommand, HookTypePrompt, HookTypeHTTP, HookTypeMCP,
+	HookTypePlugin, HookTypeOPA, HookTypeFunction, HookTypeGRPC,
+}
+
+// HookTypeNames 返回全部合法执行方式 (副本)。
+func HookTypeNames() []HookType { return append([]HookType(nil), hookTypeNames...) }
+
+// ValidHookType 报告执行方式是否合法。空串**合法** —— 见 HookType 的注释:
+// 空值按 command 处理是既有约定, 把它判非法会让所有没写 type 的在野 hook 一起失效。
+func ValidHookType(t HookType) bool {
+	if t == "" {
+		return true
+	}
+	for _, n := range hookTypeNames {
+		if n == t {
+			return true
+		}
+	}
+	return false
+}
 
 // HookConfig 用户自定义 hook 配置
 // 对应 TS: utils/hooks/hooksConfigManager.ts 中的 hook 定义
@@ -524,20 +596,17 @@ type CompactionResult struct {
 // Agent 类型 (对应 TS: tools/AgentTool/)
 // ============================================================================
 
-// AgentDefinition 代理定义
-// 对应 TS: tools/AgentTool/loadAgentsDir.ts 中的 AgentDefinition
-type AgentDefinition struct {
-	AgentType       string            `json:"agentType"`
-	Name            string            `json:"name"`
-	Description     string            `json:"description"`
-	SystemPrompt    string            `json:"systemPrompt,omitempty"`
-	AllowedTools    []string          `json:"allowedTools,omitempty"`
-	DisallowedTools []string          `json:"disallowedTools,omitempty"`
-	Model           string            `json:"model,omitempty"`
-	MCPServers      []string          `json:"mcpServers,omitempty"`
-	Memory          string            `json:"memory,omitempty"`
-	Source          string            `json:"source,omitempty"` // built-in, user, plugin
-}
+// AgentDefinition 已删除 (2026-09-25, 21.8.12 P1)。
+//
+// 它从落地起就是**完全死的**: 全仓零 reader、零 writer (grep AgentDefinition 只剩
+// 本注释)。它对应 TS 的 loadAgentsDir.ts, 而那件事在 Go 侧由另外两处承担:
+//
+//   - pkg/agent.RoleDef + RoleRegistry —— 运行期真在用的角色定义 (JSON 形态);
+//   - pkg/asset.Asset (kind=agent) —— 带 frontmatter 的 .md 资产声明 (P1 新增)。
+//
+// 留着它的代价不是编译时间, 是**误导**: 一个叫 AgentDefinition、字段齐全
+// (AllowedTools/Model/MCPServers/Memory) 的结构体躺在公共包里, 下一个人会以为
+// "agent 定义已经实现了", 于是照着它去写解析器 —— 那正是本轮要消除的形态。
 
 // AgentID 代理唯一标识
 type AgentID string

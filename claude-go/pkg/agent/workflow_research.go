@@ -7,7 +7,7 @@ func researchWorkflow() *WorkflowDef {
 		Mode:        "fanout",
 		Stages: []StageDef{
 			{
-				Name: "research-planning", Role: "synthesizer",
+				Name: "research-planning", Agent: "synthesizer",
 				Prompt: `你是**首席分析师**，在调研团队出发前负责制定调研框架。
 (借鉴 Claude Extended Thinking: 先想后做，避免研究员盲目调研)
 
@@ -26,7 +26,7 @@ func researchWorkflow() *WorkflowDef {
 结构化 Markdown，按"技术/市场/风险"三个维度列出问题清单。`,
 			},
 			{
-				Name: "research-tech", Role: "tech-researcher",
+				Name: "research-tech", Agent: "tech-researcher",
 				DependsOn: []string{"research-planning"},
 				Prompt: `你是**技术深度研究员** (专注技术架构和实现)。对以下主题进行技术层面的深度调研。
 
@@ -53,7 +53,7 @@ func researchWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "research-market", Role: "market-analyst",
+				Name: "research-market", Agent: "market-analyst",
 				DependsOn: []string{"research-planning"},
 				Prompt: `你是**市场与商业分析师** (专注商业价值和竞争格局)。对以下主题进行市场和商业层面的调研。
 
@@ -80,7 +80,7 @@ func researchWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "research-risk", Role: "risk-auditor",
+				Name: "research-risk", Agent: "risk-auditor",
 				DependsOn: []string{"research-planning"},
 				Prompt: `你是**风险审计员** (专注风险评估和合规)。对以下主题进行风险和安全层面的深度审计。
 
@@ -111,7 +111,7 @@ func researchWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "cross-verification", Role: "fact-checker",
+				Name: "cross-verification", Agent: "fact-checker",
 				DependsOn: []string{"research-tech", "research-market", "research-risk"},
 				Prompt: `你是**交叉验证审查员** (借鉴 CoVe: Chain of Verification)。
 
@@ -143,7 +143,7 @@ func researchWorkflow() *WorkflowDef {
 ### Step 5: 标注需要综合报告特别注意的分歧点`,
 			},
 			{
-				Name: "synthesize", Role: "synthesizer",
+				Name: "synthesize", Agent: "synthesizer",
 				DependsOn: []string{"cross-verification"},
 				Prompt: `你是**首席分析师**，负责深度综合所有调研结果并撰写最终报告。
 
@@ -178,4 +178,3 @@ func researchWorkflow() *WorkflowDef {
 		},
 	}
 }
-

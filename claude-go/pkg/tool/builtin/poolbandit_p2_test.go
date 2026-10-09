@@ -188,7 +188,7 @@ func TestRankScoreAssetMean(t *testing.T) {
 func TestPoolSearchMissFallbackSpan(t *testing.T) {
 	pp, ts := newTestPoolPolicy(t)
 	pool, reg, _ := buildTwoAssetPool(t)
-	st := NewPoolSearchTool(pool, reg, nil, pp)
+	st := NewPoolSearchTool(pool, reg, nil, nil, pp)
 	st.getenv = func(string) string { return "" } // 未设置 = 默认开
 	ctx := trace.With(context.Background(), trace.IDs{RunID: "run-miss"})
 
@@ -222,7 +222,7 @@ func TestPoolSearchMissFallbackSpan(t *testing.T) {
 	// 显式关闭回退: 提示不带回退语义。
 	pp2, _ := newTestPoolPolicy(t)
 	pool2, reg2, _ := buildTwoAssetPool(t)
-	st2 := NewPoolSearchTool(pool2, reg2, nil, pp2)
+	st2 := NewPoolSearchTool(pool2, reg2, nil, nil, pp2)
 	st2.getenv = func(k string) string {
 		if k == tool.EnvPoolFallback {
 			return "0"
@@ -243,7 +243,7 @@ func TestPoolSearchHitReaggregatesResident(t *testing.T) {
 	pool, reg, _ := buildTwoAssetPool(t)
 	seedResident(b, "t", "r", "asset-b", 5, 0) // 5 全成功, 达常驻双门槛
 
-	st := NewPoolSearchTool(pool, reg, nil, pp)
+	st := NewPoolSearchTool(pool, reg, nil, nil, pp)
 	if pool.IsResident("asset-b") {
 		t.Fatal("search 前 asset-b 不应在常驻面 (未聚合)")
 	}

@@ -9,7 +9,8 @@
 //   - Qodo Gen: IDE 级测试生成
 //
 // 执行流程:
-//   代码分析 → 风险建模 → 测试计划分解 → 4路并行生成 → 执行 → Flake检测 → 变异分析 → 门禁 → 报告
+//
+//	代码分析 → 风险建模 → 测试计划分解 → 4路并行生成 → 执行 → Flake检测 → 变异分析 → 门禁 → 报告
 package agent
 
 func testingWorkflow() *WorkflowDef {
@@ -19,7 +20,7 @@ func testingWorkflow() *WorkflowDef {
 		Mode:        "orchestrated",
 		Stages: []StageDef{
 			{
-				Name: "code-analysis", Role: "code-analyst",
+				Name: "code-analysis", Agent: "code-analyst",
 				Prompt: `你是**代码分析专家**。
 
 测试任务: {objective}
@@ -38,7 +39,7 @@ func testingWorkflow() *WorkflowDef {
 - 需要重点测试的模块列表`,
 			},
 			{
-				Name: "risk-model", Role: "risk-assessor",
+				Name: "risk-model", Agent: "risk-assessor",
 				DependsOn: []string{"code-analysis"},
 				Prompt: `你是**风险评估专家** (参考 Risk-Based Testing 理论)。
 
@@ -58,7 +59,7 @@ func testingWorkflow() *WorkflowDef {
 每个模块的推荐测试类型和深度`,
 			},
 			{
-				Name: "test-plan", Role: "test-planner",
+				Name: "test-plan", Agent: "test-planner",
 				DependsOn: []string{"risk-model"},
 				Prompt: `你是**测试计划架构师**。
 
@@ -80,7 +81,7 @@ func testingWorkflow() *WorkflowDef {
 - 总体资源和时间估算`,
 			},
 			{
-				Name: "gen-unit-tests", Role: "unit-generator",
+				Name: "gen-unit-tests", Agent: "unit-generator",
 				DependsOn: []string{"test-plan"},
 				Prompt: `你是**单元测试生成专家**。
 
@@ -105,7 +106,7 @@ func testingWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "gen-integration-tests", Role: "integration-generator",
+				Name: "gen-integration-tests", Agent: "integration-generator",
 				DependsOn: []string{"test-plan"},
 				Prompt: `你是**集成测试设计专家**。
 
@@ -126,7 +127,7 @@ func testingWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "gen-property-tests", Role: "property-generator",
+				Name: "gen-property-tests", Agent: "property-generator",
 				DependsOn: []string{"test-plan"},
 				Prompt: `你是**属性测试和模糊测试专家** (参考 QuickCheck, testing/quick)。
 
@@ -149,7 +150,7 @@ func testingWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "gen-chaos-tests", Role: "chaos-engineer",
+				Name: "gen-chaos-tests", Agent: "chaos-engineer",
 				DependsOn: []string{"test-plan"},
 				Prompt: `你是**混沌测试工程师** (参考 Netflix Chaos Engineering 原则)。
 
@@ -173,7 +174,7 @@ func testingWorkflow() *WorkflowDef {
 				Parallel: true,
 			},
 			{
-				Name: "run-tests", Role: "test-runner",
+				Name: "run-tests", Agent: "test-runner",
 				DependsOn: []string{"gen-unit-tests", "gen-integration-tests", "gen-property-tests", "gen-chaos-tests"},
 				Prompt: `你是**测试执行和分析专家**。
 
@@ -195,7 +196,7 @@ func testingWorkflow() *WorkflowDef {
 - 失败测试的根因分析`,
 			},
 			{
-				Name: "compile-check", Role: "compile-validator",
+				Name: "compile-check", Agent: "compile-validator",
 				DependsOn: []string{"run-tests"},
 				Prompt: `你是**编译验证专家**。
 
@@ -224,7 +225,7 @@ func testingWorkflow() *WorkflowDef {
 **重要: 如果发现问题, 必须输出完整修正后的 _test.go 文件代码。**`,
 			},
 			{
-				Name: "mutation-analysis", Role: "mutation-analyst",
+				Name: "mutation-analysis", Agent: "mutation-analyst",
 				DependsOn: []string{"compile-check"},
 				Prompt: `你是**变异测试分析专家** (参考 PIT/go-mutesting)。
 
@@ -246,7 +247,7 @@ func testingWorkflow() *WorkflowDef {
 - 最终变异杀死率`,
 			},
 			{
-				Name: "quality-gate", Role: "gate-keeper",
+				Name: "quality-gate", Agent: "gate-keeper",
 				DependsOn: []string{"mutation-analysis"},
 				Prompt: `你是**质量门禁审判者**。
 
@@ -271,7 +272,7 @@ func testingWorkflow() *WorkflowDef {
 - 下次迭代的测试增强方向`,
 			},
 			{
-				Name: "test-report", Role: "test-reporter",
+				Name: "test-report", Agent: "test-reporter",
 				DependsOn: []string{"quality-gate"},
 				Prompt: `你是**测试报告撰写专家**。
 

@@ -15,7 +15,7 @@ func mrWorkerWorkflow() *WorkflowDef {
 		QualityGate: "none",
 		Stages: []StageDef{
 			{
-				Name: "worker", Role: "mr-emitter",
+				Name: "worker", Agent: "mr-emitter",
 				Prompt: `你是一个数据处理器。你的**唯一输出是一个 JSON 对象**。禁止任何前后说明、禁止分析过程、禁止 markdown 代码围栏、禁止 "以下是"/"我将" 之类的话。第一个字符必须是 { ，最后一个字符必须是 } 。
 
 任务:
@@ -38,7 +38,7 @@ func mrChainWorkflow() *WorkflowDef {
 		QualityGate: "none",
 		Stages: []StageDef{
 			{
-				Name: "chain-builder", Role: "mr-emitter",
+				Name: "chain-builder", Agent: "mr-emitter",
 				Prompt: `你是产业链分析师。为给定产业输出一份【完整的产业链图】，只输出一个合法 JSON 对象：不要任何解释、不要 markdown、不要代码围栏。第一个字符是 { 。
 
 产业: {objective}
@@ -66,7 +66,7 @@ func quantStrategistWorkflow() *WorkflowDef {
 		QualityGate: "none",
 		Stages: []StageDef{
 			{
-				Name: "strategist", Role: "mr-emitter",
+				Name: "strategist", Agent: "mr-emitter",
 				Prompt: `你是量化策略研究员。根据输入完成"提出策略"或"复盘归因"，并且【只输出一个合法的 JSON 对象】：不要解释、不要 markdown 围栏。
 
 输入:

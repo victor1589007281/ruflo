@@ -32,6 +32,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -40,6 +41,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
 )
 
 // Checkpoint 阶段执行检查点。
@@ -488,6 +491,13 @@ func (c *Coordinator) executeStageWithRetry(
 	team *ProductionTeam,
 	executor *WorkflowExecutor,
 ) StageResult {
+	// H0-4 重试诊断状态: 上一次失败的指纹, 以及本阶段是否已提升过超时。
+	// 两者都是跨尝试状态 —— 没有它们, "重试"就退化成"原样重跑",
+	// 实测代价是 mr-trading-v2 约 48 分钟的墙钟空转。
+	prevSignature := ""
+	escalated := false
+	stageTimeoutForRun := stageTimeout
+
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if ctx.Err() != nil {
 			return StageResult{Name: stage.Name, Status: TaskFailed, Error: "cancelled"}
@@ -500,9 +510,13 @@ func (c *Coordinator) executeStageWithRetry(
 		// (10min). 否则 WorkflowExecutor.executeStageWithRetry 内层即便把
 		// timeout 设到 25min, 也会被 Coordinator 的这个 10min 包裹截断,
 		// 导致大功能 (Phase1+Phase2) 阶段反复在 10min 处被杀.
-		stageTimeoutForRole := stageTimeout
+		stageTimeoutForRole := stageTimeoutForRun
 		if executor != nil {
-			stageTimeoutForRole = executor.computeStageTimeout(stage.Role, attempt)
+			stageTimeoutForRole = executor.computeStageTimeout(stage.Agent, attempt)
+			// 提升只在原值之上, 不被角色超时压回去 (提升的目的就是突破原值)。
+			if stageTimeoutForRun > stageTimeoutForRole {
+				stageTimeoutForRole = stageTimeoutForRun
+			}
 		}
 		stageCtx, stageCancel := context.WithTimeout(ctx, stageTimeoutForRole)
 		// 标记外层重试驱动: 内层 WorkflowExecutor.executeStageWithRetry 见此标记
@@ -516,9 +530,45 @@ func (c *Coordinator) executeStageWithRetry(
 			return sr
 		}
 
+		// 先落检查点再判分流: 分流的三条出口 (预算/放弃/重试耗尽) 都会直接 return,
+		// 漏掉这一句会让 checkpoint 永远停在上面那句 "running" —— 磁盘上留下的
+		// 最后一条记录说"这个阶段正在跑", 而进程早就走了。
 		c.saveCheckpoint(stage.Name, "failed", attempt, sr.Error)
 
+		// P0-1 run 预算耗尽: 不进重试环。
+		//
+		// 为什么这条要**独立于**下面那个 classifyStageFailureWith (它也会对预算
+		// 返回 stageRetryAbort): 那个调用点在 `if attempt < c.maxRetries` 里, 而
+		// c.maxRetries 是可配的 —— 取 0 时分类器**一次都不会被调用**, 循环直接落到
+		// 末尾返回一句合成的 "超过最大重试次数 (0)", 把 cause 整个丢掉。闸门刚判完
+		// "这个 run 花超了", 台账上却记成"重试次数用完了", 这是两件不同的事。
+		// 预算终止是**终态**, 它的判据不该依赖重试预算配了几次。
+		if errors.Is(sr.cause, internal_hook.ErrRunBudgetExhausted) {
+			c.notify(c.chatID, fmt.Sprintf("⛔ 阶段 **%s** 终止: run 预算已耗尽", stage.Name))
+			return sr
+		}
+
 		if attempt < c.maxRetries {
+			// H0-4: 重试前先诊断 —— 该不该重试、要不要改变状态。
+			action, sig, why := classifyStageFailureWith(sr.Error, sr.cause, prevSignature, escalated)
+			switch action {
+			case stageRetryAbort:
+				c.notify(c.chatID, fmt.Sprintf("⛔ 阶段 **%s** 不再重试: %s", stage.Name, why))
+				// cause 必须原样带出去。上面那句 fmt.Sprintf 会把它变成纯文本,
+				// 而文本不是类型 —— 调用方 (RunWithRecovery / 上层团队编排) 再想
+				// 区分"预算耗尽"与"输出不合格"就只能去猜字符串。
+				sr.Error = fmt.Sprintf("%s (已放弃重试: %s)", sr.Error, why)
+				return sr
+			case stageRetryEscalate:
+				// 改变状态后再试: 同一失败原样重跑没有信息增益, 提升超时才是新尝试。
+				stageTimeoutForRun = stageRetryEscalation(stageTimeoutForRun)
+				escalated = true
+				c.notify(c.chatID, fmt.Sprintf(
+					"🔧 阶段 **%s** 同一失败复现, 超时提升至 %s 后重试",
+					stage.Name, stageTimeoutForRun))
+			}
+			prevSignature = sig
+
 			base := 2 * time.Second
 			errLower := strings.ToLower(sr.Error)
 			isRateLimit := strings.Contains(sr.Error, "429") ||
@@ -565,6 +615,117 @@ func (c *Coordinator) executeStageWithRetry(
 		Status: TaskFailed,
 		Error:  fmt.Sprintf("超过最大重试次数 (%d)", c.maxRetries),
 	}
+}
+
+// stageRetryAction 是阶段失败后的处置决定。
+type stageRetryAction int
+
+const (
+	// stageRetryAsIs 原样重试 (失败原因与上次不同, 再试一次有意义)。
+	stageRetryAsIs stageRetryAction = iota
+	// stageRetryEscalate 提升超时后重试 —— 即"改变状态"。
+	stageRetryEscalate
+	// stageRetryAbort 不再重试, 直接判该阶段失败。
+	stageRetryAbort
+)
+
+// stageNonRetryableMarkers 是不会因重试而改变的错误族。
+//
+// 判据来源是引擎侧 ErrorClassifier 的 DefaultBudgets: BadRequest 与 Auth 的
+// MaxAttempts 都是 0 (即不重试)。这里保持一致 —— 同一个错误在 LLM 层不重试、
+// 到了阶段层却重试 3 次, 是两套语义打架。
+var stageNonRetryableMarkers = []string{
+	"400", "401", "403", "422",
+	"bad request", "invalid request", "unauthorized", "forbidden",
+	"context canceled", "cancelled", "取消",
+}
+
+// stageFailureSignature 归一化错误文本, 作为"是不是同一个失败"的指纹。
+//
+// 归一化掉数字与时长: `agent execution timeout after 15m59.7s` 与
+// `after 16m01.2s` 是**同一个**失败, 若按原文比较会被当成两次不同失败,
+// 于是无限重试 —— 这正是实测中 ~48 分钟空转的成因。
+func stageFailureSignature(errMsg string) string {
+	lower := strings.ToLower(errMsg)
+	var b strings.Builder
+	b.Grow(len(lower))
+	prevDigit := false
+	for _, r := range lower {
+		switch {
+		case r >= '0' && r <= '9':
+			// 连续数字折叠成单个 #, 使 15.7 / 16.2 / 3 归一到同一个指纹。
+			if !prevDigit {
+				b.WriteByte('#')
+			}
+			prevDigit = true
+		case r == ' ' || r == '\t' || r == '\n':
+			prevDigit = false
+		default:
+			b.WriteRune(r)
+			prevDigit = false
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// classifyStageFailure 决定一个失败的阶段该重试、该换策略、还是该放弃。
+//
+// 返回 (处置, 本次失败指纹, 处置理由)。
+//
+// 三条判据, 按优先级:
+//  1. 不可重试族 (400/401/403/422/cancelled) ⇒ 立即放弃。重试不会改变它们,
+//     只会把一次确定性失败放大成 3 次。
+//  2. 与上一次**同一指纹** ⇒ 提升超时后重试 (改变状态)。原样重试同一个失败
+//     是纯浪费: 实测 mr-trading-v2 的三个阶段各自撞同一个 16 分钟硬超时、
+//     各重试 3 次, 约 48 分钟墙钟花在重跑注定失败的事上。
+//  3. 已提升过超时、且仍是同一指纹 ⇒ 放弃。继续加超时是在赌, 不是修。
+//  4. 指纹不同 ⇒ 原样重试 (新原因, 再试一次有意义)。
+//
+// escalated 由调用方维护 (本阶段此前是否已提升过超时), 因为"是否已改变过状态"
+// 是跨尝试的状态, 不是单次失败的属性。
+func classifyStageFailure(errMsg, prevSignature string, escalated bool) (stageRetryAction, string, string) {
+	return classifyStageFailureWith(errMsg, nil, prevSignature, escalated)
+}
+
+// classifyStageFailureWith 带原始 error 的版本, 用于识别类型化终态 (预算耗尽)。
+//
+// 为什么不能只看文本: "预算耗尽"的文案里带 limit 与 spent 两个数字, 而两次重试
+// 之间的累计消耗必然不同 ⇒ 归一化后的指纹也不同 ⇒ 文本判据会把它当成"新原因"
+// 而继续重试。那是这道闸门存在的反面: 闸门刚判完"这个 run 花超了", 重试环立刻
+// 再花一笔。只有拿到 error 本身, errors.Is 才能给出一条不依赖文案的分流。
+func classifyStageFailureWith(errMsg string, cause error, prevSignature string, escalated bool) (stageRetryAction, string, string) {
+	sig := stageFailureSignature(errMsg)
+	lower := strings.ToLower(errMsg)
+
+	// 预算耗尽**先于**一切文本判据 —— 它是终态, 不是"又一个失败"。
+	if cause != nil && errors.Is(cause, internal_hook.ErrRunBudgetExhausted) {
+		return stageRetryAbort, sig, "run 预算已耗尽, 重试只会继续烧钱"
+	}
+
+	for _, marker := range stageNonRetryableMarkers {
+		if strings.Contains(lower, marker) {
+			// "cancelled" 是用户/上下文取消, 同样不该重试。
+			return stageRetryAbort, sig, "不可重试的错误族 (" + marker + ")"
+		}
+	}
+
+	if prevSignature != "" && sig == prevSignature {
+		if escalated {
+			return stageRetryAbort, sig, "同一失败重复出现且已提升过超时, 停止重试"
+		}
+		return stageRetryEscalate, sig, "同一失败重复出现, 提升超时后重试"
+	}
+
+	return stageRetryAsIs, sig, ""
+}
+
+// stageRetryEscalation 返回提升后的阶段超时 (翻倍, 封顶 2 倍原值)。
+func stageRetryEscalation(cur time.Duration) time.Duration {
+	next := cur * 2
+	if cap := stageTimeout * 2; next > cap {
+		next = cap
+	}
+	return next
 }
 
 // executeParallelWithRetry 并行执行多个阶段 (每个阶段带重试)。

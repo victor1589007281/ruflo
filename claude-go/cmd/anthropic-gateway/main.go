@@ -29,6 +29,7 @@ import (
 	"log"
 	"net/http"
 	neturl "net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +66,11 @@ func main() {
 		defaultPrefix = flag.String("default-prefix", "opencode", "model 无 provider 前缀时的默认 provider")
 	)
 	flag.Parse()
+
+	// 会话分片 A/B (见 pkg/api/sessionshard.go)。默认 0 = 关闭, 行为与改造前一致。
+	if pct := api.InitSessionShardFromEnv(); pct > 0 {
+		log.Printf("[anthropic-gateway] 会话分片实验: %d%% 的 run 走 run+node 会话键 (CLAUDE_GO_SESSION_SHARD)", pct)
+	}
 
 	jsonCfg, err := feishu.LoadJSONConfig(*configPath)
 	if err != nil {
@@ -132,6 +138,101 @@ type gateway struct {
 	registry  *modelconfig.ProviderRegistry
 	resolver  *modelconfig.ConfigResolver
 	tryPrefix string
+
+	// lastGood 记住每个会话最近一次**成功解析且已声明**的别名, 供未声明的模型名兜底。
+	//
+	// 为什么按会话记而不是只备一个全局默认: 子 agent 派发时模型自己往 Agent 工具的
+	// model 字段里填名字 (CLI 侧该字段是无 enum 的自由字符串, 见 pkg/agent/agent.go 的
+	// InputSchema), 填出来的常常是它"以为"该用的模型。此时最贴近事实的答案是
+	// "这个会话正在用什么" —— 子 agent 与父会话共用 X-Claude-Code-Session-Id,
+	// 所以按会话记就等于"继承父会话的模型"。
+	//
+	// 只记已声明的别名, 于是这张表里永远不会出现网关没有的名字。
+	lastGood map[string]lastGoodEntry
+	lgMu     sync.Mutex
+}
+
+// lastGoodEntry 一次会话级的成功解析记录。
+type lastGoodEntry struct {
+	alias string
+	at    time.Time
+}
+
+// lastGoodTTL / lastGoodMax 给 lastGood 定界。
+// 不设 TTL 与上限的话, 这张表会随会话数单调增长 —— 长跑进程里那就是一条稳定的内存泄漏。
+const (
+	lastGoodTTL = 24 * time.Hour
+	lastGoodMax = 4096
+)
+
+// rememberGood 记下某会话最近一次成功解析的别名, 并顺手做过期清理。
+func (g *gateway) rememberGood(session, alias string) {
+	if session == "" || alias == "" {
+		return
+	}
+	g.lgMu.Lock()
+	defer g.lgMu.Unlock()
+	if g.lastGood == nil {
+		g.lastGood = make(map[string]lastGoodEntry, 64)
+	}
+	now := time.Now()
+	// 清理与写入放在同一把锁里: 分成两次加锁的话, 中间那段窗口里表是超限的。
+	for k, e := range g.lastGood {
+		if now.Sub(e.at) > lastGoodTTL {
+			delete(g.lastGood, k)
+		}
+	}
+	// 清完仍超上限: 再删最旧的一批。删到上限的 3/4, 免得每来一个新会话都要全表扫一遍。
+	if len(g.lastGood) >= lastGoodMax {
+		type kv struct {
+			k string
+			t time.Time
+		}
+		all := make([]kv, 0, len(g.lastGood))
+		for k, e := range g.lastGood {
+			all = append(all, kv{k, e.at})
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].t.Before(all[j].t) })
+		for i := 0; i < len(all)-lastGoodMax*3/4; i++ {
+			delete(g.lastGood, all[i].k)
+		}
+	}
+	g.lastGood[session] = lastGoodEntry{alias: alias, at: now}
+}
+
+// sessionKey 取本请求的会话键 (与 opencodeSessionID 同源), 空串表示拿不到会话身份。
+func sessionKey(r *http.Request) string {
+	return normalizeSessionKey(strings.TrimSpace(r.Header.Get(claudeSessionHeader)))
+}
+
+// fallbackForModel 决定一个**未声明**的模型名该被换成什么。
+//
+// 顺序: 本会话上次成功用过的 → 全局默认。两者都没有则返回 false, 调用方按原样报错 ——
+// 兜底不是"无论如何都得放行", 配错了就该看得见地失败。
+func (g *gateway) fallbackForModel(r *http.Request) (modelconfig.ResolvedConfig, string, bool) {
+	sess := sessionKey(r)
+	if sess != "" {
+		g.lgMu.Lock()
+		e, ok := g.lastGood[sess]
+		g.lgMu.Unlock()
+		if ok && time.Since(e.at) <= lastGoodTTL {
+			if rc, good := g.registeredOnly(e.alias); good {
+				return rc, sess, true
+			}
+		}
+	}
+	// 冷会话 (新会话的第一个请求就是子 agent) 没有记忆, 退到全局默认。
+	//
+	// 这里用 ResolveAlias(DefaultAlias()) 而不是 Resolve("", ""): 后者末尾会调
+	// ApplyGatewayOverride, 网关进程若自己设了 CLAUDE_GO_LLM_GATEWAY, 兜底结果会被
+	// 改指到网关自己。DefaultAlias 读的是 GlobalConfig.DefaultModelAlias, 由
+	// feishu.ToModelConfigJSON 从 config.json 的 ai.modelAlias 翻译而来。
+	if def := g.resolver.DefaultAlias(); def != "" {
+		if rc, good := g.registeredOnly(def); good {
+			return rc, sess, true
+		}
+	}
+	return modelconfig.ResolvedConfig{}, sess, false
 }
 
 func orDefault(s, d string) string {
@@ -141,14 +242,38 @@ func orDefault(s, d string) string {
 	return s
 }
 
+// registeredOnly 解析别名, 且要求它是 config.json 里**声明过**的模型。
+//
+// 判据取 registry.GetModel(alias) != nil —— ModelEntry 只在 provider 的 models 段里
+// 有该键时才建 (见 pkg/agent/modelconfig/types.go 的 RegisterProvider), 所以它正是
+// "声明过"的精确判据。
+//
+// 为什么不能沿用原先那套 "baseURL/apiKey/providerName 三者齐全" 的判据:
+// resolver.resolveAlias 查不到 ModelEntry 时会退到 splitAlias + GetProvider, 于是
+// **只要 provider 名存在**, 任何后缀都能凑齐这三个字段。实测 "opencode:claude-opus-4-8"
+// (opencode 的 33 个模型里没有任何 claude) 就被这样放行, 一路透传上游换回 401
+// "Model claude-opus-4-8 is not supported" —— 子 agent 派发失败、主会话徽章报
+// "上游异常" 的根因就在这里。字段齐 != 模型存在, 这两件事必须分开判。
+func (g *gateway) registeredOnly(alias string) (modelconfig.ResolvedConfig, bool) {
+	if g.registry.GetModel(alias) == nil {
+		return modelconfig.ResolvedConfig{}, false
+	}
+	rc := g.resolver.ResolveAlias(alias)
+	if rc.BaseURL == "" || rc.APIKey == "" || rc.ProviderName == "" {
+		return rc, false
+	}
+	return rc, true
+}
+
 // resolveModel 解析 model 字符串为 ResolvedConfig。
 // 规则: 先按完整别名 (provider:model) 精确查找; 未命中且无冒号时, 用 default-prefix 拼接重试。
+//
+// 三个候选分支全部经 registeredOnly, 判据统一 —— 漏一个分支就等于没修。
 func (g *gateway) resolveModel(model string) (modelconfig.ResolvedConfig, error) {
 	if model == "" {
 		return modelconfig.ResolvedConfig{}, fmt.Errorf("model 为空")
 	}
-	rc := g.resolver.ResolveAlias(model)
-	if rc.BaseURL != "" && rc.APIKey != "" && rc.ProviderName != "" {
+	if rc, ok := g.registeredOnly(model); ok {
 		return rc, nil
 	}
 	if !strings.Contains(model, ":") {
@@ -156,18 +281,17 @@ func (g *gateway) resolveModel(model string) (modelconfig.ResolvedConfig, error)
 		// 先全表反查 alias (如 "k3" -> "kimi:k3"), 再退 default-prefix;
 		// 否则非默认前缀 provider (kimi 等) 的模型会被 404/误路由到默认上游。
 		if alias := g.registry.LookupAliasByModelName(model); alias != model {
-			if rc3 := g.resolver.ResolveAlias(alias); rc3.BaseURL != "" && rc3.APIKey != "" && rc3.ProviderName != "" {
+			if rc3, ok := g.registeredOnly(alias); ok {
 				return rc3, nil
 			}
 		}
 		if g.tryPrefix != "" {
-			rc2 := g.resolver.ResolveAlias(g.tryPrefix + ":" + model)
-			if rc2.BaseURL != "" && rc2.APIKey != "" && rc2.ProviderName != "" {
+			if rc2, ok := g.registeredOnly(g.tryPrefix + ":" + model); ok {
 				return rc2, nil
 			}
 		}
 	}
-	return modelconfig.ResolvedConfig{}, fmt.Errorf("model %q 在 providers 中未找到 (baseURL/apiKey/providerName 不全)", model)
+	return modelconfig.ResolvedConfig{}, fmt.Errorf("model %q 未在 providers 中声明 (注册表里没有这个模型)", model)
 }
 
 // buildClient 按 resolved 配置构造 api.Client (协议 + 模型级代理)。
@@ -208,8 +332,19 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	rc, err := g.resolveModel(req.Model)
 	if err != nil {
-		writeError(w, 404, "model_not_found", err.Error())
-		return
+		sub, sess, ok := g.fallbackForModel(r)
+		if !ok {
+			writeError(w, 404, "model_not_found", err.Error())
+			return
+		}
+		// 这条日志是本次修复的验收面: 它同时记录了"原来是什么名字"与"换成了什么",
+		// 所以事后能数出拦截次数, 而不是只能看到"没报错了"。
+		log.Printf("[anthropic-gateway] 模型名 %q 未在 providers 中声明 → 按会话回退到 %s (session=%s)",
+			req.Model, sub.Alias, orDefault(sess, "(无会话头)"))
+		req.Model = sub.Alias // 换掉后, 下面的透传改写/日志与事实上游一致
+		rc = sub
+	} else {
+		g.rememberGood(sessionKey(r), rc.Alias)
 	}
 	log.Printf("[anthropic-gateway] model=%s resolved=%s protocol=%s proxy=%s stream=%v messages=%d tools=%d",
 		req.Model, rc.ProviderName, protoName(rc.Protocol), rc.Proxy, req.Stream, len(req.Messages), len(req.Tools))
@@ -442,8 +577,17 @@ func (g *gateway) proxyOpenAIFormat(w http.ResponseWriter, r *http.Request, upst
 	}
 	rc, err := g.resolveModel(probe.Model)
 	if err != nil {
-		writeError(w, 404, "model_not_found", err.Error())
-		return
+		sub, sess, ok := g.fallbackForModel(r)
+		if !ok {
+			writeError(w, 404, "model_not_found", err.Error())
+			return
+		}
+		log.Printf("[anthropic-gateway] 模型名 %q 未在 providers 中声明 → 按会话回退到 %s (session=%s, path=%s)",
+			probe.Model, sub.Alias, orDefault(sess, "(无会话头)"), upstreamPath)
+		probe.Model = sub.Alias
+		rc = sub
+	} else {
+		g.rememberGood(sessionKey(r), rc.Alias)
 	}
 	log.Printf("[anthropic-gateway] openai-passthrough model=%s resolved=%s path=%s",
 		probe.Model, rc.ProviderName, upstreamPath)
@@ -536,6 +680,9 @@ const gatewayVersion = "1.0"
 // x-opencode-session。
 const claudeSessionHeader = "X-Claude-Code-Session-Id"
 
+// sessionKeyAliasMax 归一化缓存的上界 (见 normalizeSessionKey)。
+const sessionKeyAliasMax = 4096
+
 // isOpenCodeUpstream 判断该 ResolvedConfig 是否指向 opencode zen/go 上游。
 // 判定依据: provider 名为 "opencode", 或 baseUrl 主机是 opencode.ai (含子域)。
 func isOpenCodeUpstream(rc modelconfig.ResolvedConfig) bool {
@@ -562,13 +709,51 @@ func isOpenCodeUpstream(rc modelconfig.ResolvedConfig) bool {
 // seed 为空时退化为进程级常量 (仍然可复用), 不再是每次请求都换。
 func opencodeSessionID(r *http.Request, seed string) string {
 	if v := strings.TrimSpace(r.Header.Get(claudeSessionHeader)); v != "" {
-		return v
+		// 热加载关掉实验后, 旧会话键 (run\x00node) 与对照键 (run) 会并存一段时间。
+		// 归一让新旧两个键落到**同一个**会话上, 而不是各自占一个缓存分片 ——
+		// 否则关开关这个动作本身就会造成一次全量重算。每个新节点只在首次出现时
+		// 插一次, 表大小以 run 内的节点数为界。
+		if v = normalizeSessionKey(v); v != "" {
+			return v
+		}
 	}
 	if seed == "" {
 		seed = gatewaySessionSeed() // 进程级兜底: 整个网关进程共用一个会话
 	}
 	sum := sha256.Sum256([]byte(seed))
 	return "gw-" + hex.EncodeToString(sum[:16])
+}
+
+var (
+	sessionKeyAliasMu sync.Mutex
+	sessionKeyAlias   = map[string]string{}
+)
+
+// normalizeSessionKey 把 "run\x00node" 形态的会话键归一为 "run"。
+//
+// 只有实验臂会产生 \x00 分隔的键 (见 pkg/api.shardJoin), 所以"含 \x00"即
+// "实验臂产物" —— 不需要额外判别字段。
+func normalizeSessionKey(v string) string {
+	if !strings.ContainsRune(v, '\x00') {
+		return v
+	}
+	i := strings.IndexByte(v, '\x00')
+	base := v[:i]
+	if base == "" {
+		return v
+	}
+	sessionKeyAliasMu.Lock()
+	defer sessionKeyAliasMu.Unlock()
+	if got, ok := sessionKeyAlias[v]; ok {
+		return got
+	}
+	// 表满即清空重建: 这是**归一化缓存**, 不是账本, 丢掉只意味着下次多算一次。
+	// 有界性比命中率重要 —— 它是被外部输入驱动写的一张常驻 map。
+	if len(sessionKeyAlias) >= sessionKeyAliasMax {
+		sessionKeyAlias = map[string]string{}
+	}
+	sessionKeyAlias[v] = base
+	return base
 }
 
 var (

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/anthropic/claude-go/pkg/contract"
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // GoRepairDiagnosis diagnoses compilation errors and outputs repair strategies.
@@ -186,8 +187,5 @@ func (t *GoRepairDiagnosis) diagnose(errorText, filePath, contractHint, snippet 
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return textutil.Truncate(s, n, "...")
 }

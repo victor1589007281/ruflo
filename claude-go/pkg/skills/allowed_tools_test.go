@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"github.com/anthropic/claude-go/pkg/asset"
 	"reflect"
 	"testing"
 )
@@ -25,7 +26,7 @@ func TestParseFrontmatter_解析allowedTools三种写法(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var sk Skill
-			parseFrontmatter(c.fm, &sk)
+			parseFM(c.fm, &sk)
 			if !reflect.DeepEqual(sk.AllowedTools, c.want) {
 				t.Errorf("got %#v, want %#v", sk.AllowedTools, c.want)
 			}
@@ -36,7 +37,7 @@ func TestParseFrontmatter_解析allowedTools三种写法(t *testing.T) {
 // 逗号写法绝不能按空白切: "Read, Bash" 若切成 ["Read," "Bash"] 会让治理层看到一个
 // 带标点的"不认识的工具名", 而不认识就拒绝 ⇒ 一个格式问题变成一次误拒。
 func TestParseToolList_逗号优先于空白(t *testing.T) {
-	got := parseToolList("Read, Bash, WebFetch")
+	got := asset.ParseInlineList("Read, Bash, WebFetch")
 	want := []string{"Read", "Bash", "WebFetch"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
@@ -51,7 +52,7 @@ func TestParseToolList_逗号优先于空白(t *testing.T) {
 // 解析 allowed-tools 不得影响运行期可用性判定 (IsActive 只看 status)。
 func TestAllowedTools不影响IsActive(t *testing.T) {
 	var sk Skill
-	parseFrontmatter("name: a\nallowed-tools: Bash", &sk)
+	parseFM("name: a\nallowed-tools: Bash", &sk)
 	if !sk.IsActive() {
 		t.Error("声明工具不该让技能变成停用状态 —— 运行期可见性只由 toolExposed 裁决")
 	}

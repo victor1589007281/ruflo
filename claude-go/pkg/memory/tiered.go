@@ -38,6 +38,7 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -46,6 +47,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
 // MemoryEntry 单条记忆
@@ -61,6 +64,33 @@ type MemoryEntry struct {
 	ChatID      string    `json:"chatId,omitempty"`
 	// Embedding 可选向量 (embed.go 可选后端写入; 为空时检索退化为纯 BM25)。
 	Embedding []float32 `json:"embedding,omitempty"`
+	// Ref 指向本条记忆**未截断原文**的句柄 (AddWithOriginal 存下后回填, 见 blob.go)。
+	// 空表示原文没有超出 Content, 没有额外可取回的东西。
+	//
+	// 为什么要有它: Content 是**面向提示词**的有界摘要 —— 团队产出的每个阶段在
+	// 写入前就被 truncateResult 砍到几百字符, 再被 FormatForPrompt 按 4096 截一刀。
+	// 摘要够让模型判断"这条记忆讲的是什么", 却不够让它照着做。原文留在快照里,
+	// 模型先用摘要认出相关性, 再按 Ref 取回全文 —— 渐进披露: 检索阶段只付摘要的钱,
+	// 真要用了才付全文的钱。
+	Ref string `json:"ref,omitempty"`
+
+	// —— H2-4 冲突消解 (见 resolve.go) ——
+	//
+	// SupersededBy 取代了本条的记忆 ID。**非空 = 本条已归档, 检索不再返回它**,
+	// 但条目本身留在库里 (与 Prune 的删除不同): 一条记忆为什么消失, 必须查得到。
+	SupersededBy string `json:"supersededBy,omitempty"`
+	// SupersededAt 被取代的时刻 (审计用; SupersededBy 为空时无意义)。
+	SupersededAt time.Time `json:"supersededAt,omitempty"`
+	// Supersedes 本条取代掉的记忆 ID 列表 (与 SupersededBy 构成双向链)。
+	Supersedes []string `json:"supersedes,omitempty"`
+	// Contradicts 与本条矛盾、但**没有被取代**的记忆 ID (置信不足 / 对方是永久记忆)。
+	// 非空意味着提示词里可能同时出现两条互斥陈述 —— 这是如实留证, 不是正常状态。
+	Contradicts []string `json:"contradicts,omitempty"`
+	// Evergreen 永久豁免遗忘与取代 (与 MemoryFact.Evergreen 同义)。
+	//
+	// 一条被标为永久的记忆**不会**被新记忆顶掉 —— 这是人工声明"这条永远算数"的
+	// 唯一出口, 缺了它, 守门就只能靠 Importance, 而 Importance 是启发式打的分。
+	Evergreen bool `json:"evergreen,omitempty"`
 }
 
 // Retention 计算当前保留度 (Ebbinghaus 遗忘曲线 + 间隔重复)
@@ -93,6 +123,10 @@ func (e *MemoryEntry) snapshot() MemoryEntry {
 		c.Topics = make([]string, len(e.Topics))
 		copy(c.Topics, e.Topics)
 	}
+	if e.Embedding != nil {
+		c.Embedding = make([]float32, len(e.Embedding))
+		copy(c.Embedding, e.Embedding)
+	}
 	return c
 }
 
@@ -117,6 +151,10 @@ type TieredStore struct {
 	// "RemoveAll: directory not empty" 的**间歇性**失败, 且看起来与被测逻辑毫无关系。
 	// 这与 pkg/dreaming 的 bg 是同一条理由 (那边已因此吃过一次亏)。
 	bg sync.WaitGroup
+
+	// lastResolve 最近一次带守门入库的消解读数 (见 resolve.go 的 LastResolveStats)。
+	// 由 mu 保护。
+	lastResolve ResolveStats
 }
 
 // WaitPersist 等待 Add 触发的后台落盘全部结束。
@@ -224,43 +262,21 @@ func (s *TieredStore) PersistToDisk() {
 // SetEmbedder 装配可选向量化后端 (nil 即纯 BM25)。在首批 Add 前调用。
 func (s *TieredStore) SetEmbedder(e Embedder) { s.embedder = e }
 
-func (s *TieredStore) Add(entry *MemoryEntry) {
-	// 向量化在锁外 best-effort (10s 级网络调用不能持锁): 失败静默, 记忆照常落盘。
-	if s.embedder != nil && entry != nil && len(entry.Embedding) == 0 && strings.TrimSpace(entry.Content) != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-		if vec, err := s.embedder.Embed(ctx, entry.Content); err == nil {
-			entry.Embedding = vec
-		}
-		cancel()
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if entry.ID == "" {
-		s.idSeq++
-		entry.ID = time.Now().Format("20060102-150405") + "-" + strings.Repeat("0", 4-len(itoa(s.idSeq))) + itoa(s.idSeq)
-	}
-	if entry.CreatedAt.IsZero() {
-		entry.CreatedAt = time.Now()
-	}
-	if entry.LastAccess.IsZero() {
-		entry.LastAccess = entry.CreatedAt
-	}
-	if entry.Importance == 0 {
-		entry.Importance = 0.5
-	}
-	s.episodic[entry.ID] = entry
-	s.dirty = true
+// Add 添加一条记忆 (不带原文快照)。等价于 AddWithOriginal(entry, "")。
+func (s *TieredStore) Add(entry *MemoryEntry) { s.AddWithOriginal(entry, "") }
 
-	// 高权重记忆立即持久化 (team_result, manual)。
-	// 登记进 bg 使其可 join —— 理由见 bg 字段的注释 (Add 在 s.mu 内, 计数器递增发生在
-	// 任何 WaitPersist 之前, 契约成立)。
-	if entry.Importance >= 0.8 {
-		s.bg.Add(1)
-		go func() {
-			defer s.bg.Done()
-			s.PersistToDisk()
-		}()
-	}
+// AddWithOriginal 添加一条记忆, 并把**未截断原文**另存为快照、把句柄写进 entry.Ref。
+//
+// original 传空, 或没有比 Content 长出足够多时, 一个字节都不落 (Ref 留空)。
+//
+// 为什么原文要单独传进来而不是从 Content 里推断: Content 是**已经截过的摘要**,
+// 原文在截断那一刻就丢了 —— Add 无论如何都还原不出它。所以只有调用方能提供,
+// 而调用方恰好是唯一同时握着两份文本的地方 (见 runPhaseMemory)。
+// 实现体已挪到 resolve.go 的 addWithOriginal (守门与非守门两条路共用同一段入库逻辑,
+// 只有"扫不扫矛盾"这一个 bit 不同 —— 抄成两份的话, 向量化/快照/落盘这三件事早晚会
+// 分叉, 而分叉的表现是"某一条路径上的记忆不持久化", 极难归因)。
+func (s *TieredStore) AddWithOriginal(entry *MemoryEntry, original string) {
+	s.addWithOriginal(entry, original, false)
 }
 
 func itoa(n int) string {
@@ -307,6 +323,17 @@ func (s *TieredStore) Retrieve(query string, topK int) []*MemoryEntry {
 
 	for _, entry := range s.episodic {
 		if entry.Retention() < s.ForgetThreshold*0.5 {
+			continue
+		}
+		// 已被取代的记忆**不进检索** (H2-4)。
+		//
+		// 这一条是整条链上唯一会改变模型所见的地方 —— 归档只是把标记写进库里,
+		// 真正"消解"掉冲突的动作在这里: 不排除的话, 被推翻的旧陈述照样会被 BM25
+		// 捞出来进提示词, 与取代它的新陈述并排出现, 问题一点没解决。
+		//
+		// 删掉条目 (而不是只过滤) 会让"这条记忆为什么不见了"永久无人可查, 所以
+		// 条目留在库里, 只在检索这一处让路 —— 审计路径 (GetAll / Get) 照常看得见。
+		if entry.SupersededBy != "" {
 			continue
 		}
 		contentTerms := tokenize(entry.Content)
@@ -456,6 +483,22 @@ func (s *TieredStore) Count() int {
 	return len(s.episodic)
 }
 
+// Get 按 ID 取一条记忆的**值拷贝** (不存在时 ok=false)。
+//
+// 返回值拷贝而不是 `*MemoryEntry`: 调用方 (memory_read 工具) 拿到指针后会在锁外
+// 读它, 而 `Retrieve` / `Touch` 会在写锁内改同一条对象的 AccessCount/LastAccess
+// —— memory 包刚因为这类"锁外读活对象"吃过一次 -race (见 snapshot 的注释)。
+// 拷贝一次比每次都去论证"我只读了不会变的字段"便宜得多。
+func (s *TieredStore) Get(id string) (MemoryEntry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.episodic[id]
+	if !ok {
+		return MemoryEntry{}, false
+	}
+	return e.snapshot(), true
+}
+
 // FormatForPrompt 格式化检索到的记忆为系统提示词片段。
 // 对应 TS: readMemoriesForSurfacing + 4096 bytes/file cap
 func FormatForPrompt(entries []*MemoryEntry) string {
@@ -468,10 +511,10 @@ func FormatForPrompt(entries []*MemoryEntry) string {
 	totalBytes := 0
 	maxBytes := 60 * 1024 // 60KB session budget (对应 TS: RELEVANT_MEMORIES_CONFIG.MAX_SESSION_BYTES)
 	for _, e := range entries {
-		content := e.Content
-		if len(content) > 4096 {
-			content = content[:4096] + "...(truncated)"
-		}
+		// 单条上限 (字符数, 不是字节数): 中文一个字 3 字节, 按字节切会把字劈成
+		// 半个非法 UTF-8 序列 —— 出站序列化时被替换成 U+FFFD, 同一段记忆在不同
+		// 轮次可能渲染出不同字节, 记忆块之后的前缀缓存随之失效。
+		content := textutil.Truncate(e.Content, 4096, "...(truncated)")
 		entry := "- " + content + "\n"
 		if totalBytes+len(entry) > maxBytes {
 			break
@@ -481,6 +524,55 @@ func FormatForPrompt(entries []*MemoryEntry) string {
 	}
 	sb.WriteString("</relevant_memories>\n\n")
 	return sb.String()
+}
+
+// IndexPreviewRunes 是索引里每条记忆保留的正文预览长度 (字符数)。
+// 定在 120: 够看出"这条讲的是什么", 又不至于让索引本身变成第二份正文。
+const IndexPreviewRunes = 120
+
+// FormatIndexForPrompt 把检索结果格式化为**索引**而不是正文。
+//
+// 与 FormatForPrompt 的关系: 两者回答的是同一个问题 ("把哪些记忆端给模型"),
+// 但付的钱差一个数量级。实测这套部署里 top-7 的正文合计 ~19K 字符 —— 占掉系统
+// 提示的 2/3 —— 而其中 5 条是按表面词重叠捞上来的别的业务的记忆。索引版本把这
+// 同一批结果压到 ~1K 字符, 模型认出哪条相关之后再按 id 取全文。
+//
+// 为什么要带 id 而不是只给标题: 模型必须有个**稳定的句柄**去调 memory_read。
+// 标题会重复、会变, id 是落盘时定下的。
+//
+// 空结果返回空串 (与 FormatForPrompt 同约定): 调用方据此决定要不要注入这个块。
+func FormatIndexForPrompt(entries []*MemoryEntry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("<memory_index>\n")
+	sb.WriteString(fmt.Sprintf("%d memories from past sessions may be relevant (titles only).\n", len(entries)))
+	sb.WriteString("Call memory_read with an id to get the full text, or memory_search to re-query with other keywords.\n\n")
+	for _, e := range entries {
+		preview := textutil.Truncate(oneLine(e.Content), IndexPreviewRunes, "…")
+		topics := ""
+		if len(e.Topics) > 0 {
+			topics = " [" + strings.Join(e.Topics, ", ") + "]"
+		}
+		// 有 Ref 的标注可得全文 —— 模型据此知道这条**值得**取; 没有的说明
+		// 正文即全部, 取了也只是同一段文字。
+		full := ""
+		if e.Ref != "" {
+			full = " full=yes"
+		}
+		sb.WriteString(fmt.Sprintf("- id=%s (%s)%s%s: %s\n",
+			e.ID, e.CreatedAt.Format("2006-01-02"), topics, full, preview))
+	}
+	sb.WriteString("</memory_index>\n\n")
+	return sb.String()
+}
+
+// oneLine 把多行正文压成一行: 索引按条占一行, 换行会把"一条"读成"好几条"。
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // tokenize 中英文混合分词。

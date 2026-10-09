@@ -36,10 +36,10 @@ type CheckerInterfaceCheck struct {
 
 // CheckerGlobalConsistencyReport aggregates all consistency checks across a codebase.
 type CheckerGlobalConsistencyReport struct {
-	ScannedAt    time.Time               `json:"scanned_at"`
-	Packages     int                     `json:"packages"`
-	Interfaces   int                     `json:"interfaces"`
-	Implementors int                     `json:"implementors"`
+	ScannedAt    time.Time                 `json:"scanned_at"`
+	Packages     int                       `json:"packages"`
+	Interfaces   int                       `json:"interfaces"`
+	Implementors int                       `json:"implementors"`
 	Issues       []CheckerConsistencyIssue `json:"issues,omitempty"`
 	Checks       []CheckerInterfaceCheck   `json:"checks,omitempty"`
 }
@@ -72,8 +72,8 @@ func (cc *ConsistencyChecker) Check() (*CheckerGlobalConsistencyReport, error) {
 	}
 
 	// First pass: collect all interfaces and structs
-	interfaces := make(map[string]*ast.InterfaceType) // pkg.Name -> *ast.InterfaceType
-	structs := make(map[string]*ast.StructType)       // pkg.Name -> *ast.StructType
+	interfaces := make(map[string]*ast.InterfaceType)          // pkg.Name -> *ast.InterfaceType
+	structs := make(map[string]*ast.StructType)                // pkg.Name -> *ast.StructType
 	structMethods := make(map[string]map[string]*ast.FuncDecl) // pkg.Name -> methodName -> *ast.FuncDecl
 	interfacePositions := make(map[string]token.Position)
 	structPositions := make(map[string]token.Position)

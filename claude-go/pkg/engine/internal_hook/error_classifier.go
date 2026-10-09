@@ -87,11 +87,35 @@ func DefaultBudgets() map[ErrorFamily]FamilyBudget {
 	}
 }
 
-// ErrorClassifier 按族隔离的错误分类器。
+// RunFailureLedgerWindow 是 run 级错误账本的窗口: 自上次真实进展以来,
+// 累计这么多次失败就必须终止该 run。
+//
+// 为什么需要它 (而不是只用各族 budget): 运行态实测 (209 run / 33175 事件) 显示
+// 54 个 failed run 中**由系统判据主动终止的 = 0**, 同时产生 8738 条
+// "LLM 熔断器开启: 连续多次失败, 30s 后重试" —— 系统识别到了连续失败,
+// 却只做退避。根因是族计数在每次成功响应后被 ResetAll 清空, 于是
+// "失败→成功→失败→成功" 的交错形态永远到不了族预算, run 一路空转到 maxTurns。
+//
+// 账本与族计数是**两套语义**, 不可合并:
+//   - 族计数 (family budget):  瞬时重试预算, 成功响应即清零 —— 管的是"这一族还能再试几次"
+//   - run 账本 (this ledger):  只由 NoteProgress() 推进 —— 管的是"这个 run 还有没有在产出"
+//
+// 取值 12: 高于任一族的 MaxAttempts (最大 5), 使正常重试不会触发;
+// 又远低于长程任务的典型轮数, 使"卡死的 run"能在分钟内而不是小时后被止损。
+const RunFailureLedgerWindow = 12
+
+// ErrorClassifier 按族隔离的错误分类器 + run 级错误账本。
 type ErrorClassifier struct {
 	mu       sync.Mutex
 	budgets  map[ErrorFamily]FamilyBudget
 	counters map[ErrorFamily]int
+
+	// sinceProgress 是自上次真实进展以来累计的失败次数。
+	//
+	// 刻意**不**被 ResetAll (成功响应) 清空 —— 一次成功的 LLM 响应只说明
+	// "模型还能说话", 不说明 run 在产出。只有 NoteProgress (工具调用真正产出)
+	// 才推进基线。这是"交错失败"能被抓住、而正常长任务不被误杀的分界线。
+	sinceProgress int
 }
 
 // NewErrorClassifier 构造带默认预算的分类器。
@@ -171,11 +195,55 @@ func (c *ErrorClassifier) Observe(err error) (family ErrorFamily, abort bool, ba
 	c.counters[family]++
 	attempt := c.counters[family]
 
+	// run 级账本: 每次失败都记, 只有 NoteProgress 才清零。
+	// 与族计数分开累加 —— 见 RunFailureLedgerWindow 的说明。
+	c.sinceProgress++
+
 	if attempt > budget.MaxAttempts {
 		return family, true, 0, budget.UseCompact
 	}
 	backoff = computeBackoff(budget, attempt)
 	return family, false, backoff, budget.UseCompact
+}
+
+// NoteProgress 标记 run 取得了一次**真实进展**, 清空 run 级错误账本。
+//
+// 调用点必须代表"这个 run 确实产出了东西"(成功完成的工具调用),
+// 而不是"模型回了一句话"。判据一松, R2 风险 (误杀正常长任务) 就会兑现:
+// 一个能持续调用工具的长任务永远不会累积到 RunFailureLedgerWindow。
+//
+// 与 ResetAll 的区别: ResetAll 清的是各族瞬时重试预算 (成功响应即调),
+// 本方法清的是 run 账本 (只有真实产出才调)。两者不可互相替代。
+func (c *ErrorClassifier) NoteProgress() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.sinceProgress = 0
+	c.mu.Unlock()
+}
+
+// ShouldAbortRun 判断 run 是否已在无进展状态下空转太久, 应当终止。
+//
+// 返回 true 表示: 自上次真实进展以来, 累计失败已达 RunFailureLedgerWindow。
+// 调用方 (CircuitBreakerHook) 据此返回 Terminal, 而不是继续退避重试。
+func (c *ErrorClassifier) ShouldAbortRun() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sinceProgress >= RunFailureLedgerWindow
+}
+
+// FailuresSinceProgress 返回自上次进展以来的累计失败数 (测试与指标用)。
+func (c *ErrorClassifier) FailuresSinceProgress() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sinceProgress
 }
 
 // ResetFamily 重置某族计数 (成功响应后调用)。
@@ -189,6 +257,11 @@ func (c *ErrorClassifier) ResetFamily(family ErrorFamily) {
 }
 
 // ResetAll 重置所有族计数 (成功响应后调用)。
+//
+// 注意: 本方法**不**清 run 级账本 (sinceProgress)。成功响应只说明模型还能说话,
+// 不说明 run 在产出; 清 run 账本要用 NoteProgress。这条区分是 H0-2 的核心 ——
+// 此前引擎只有一个 counters, 成功响应即清零, 于是"失败→成功→失败"的交错形态
+// 永远到不了预算, 实测 209 个 run 中系统判据终止数为 0。
 func (c *ErrorClassifier) ResetAll() {
 	if c == nil {
 		return

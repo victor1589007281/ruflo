@@ -33,6 +33,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -41,6 +42,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/basedir"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hotreload"
@@ -49,6 +51,12 @@ import (
 )
 
 func main() {
+	// 会话分片 A/B (见 pkg/api/sessionshard.go)。worker 是团队阶段的真实执行体,
+	// 它的出站请求同样带会话头 —— 不在这里初始化, 实验就只覆盖 control 一侧,
+	// 而团队流量的主体恰恰在 worker 上, 等于没测。
+	if pct := api.InitSessionShardFromEnv(); pct > 0 {
+		log.Printf("[claude-go-worker] 会话分片实验: %d%% 的 run 走 run+node 会话键 (CLAUDE_GO_SESSION_SHARD)", pct)
+	}
 	if err := rootCmd().Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
@@ -148,8 +156,23 @@ func rootCmd() *cobra.Command {
 
 			// 配置热加载: config.json 里 providers/models/ai 改了立即生效, 不必重启
 			// worker。worker 是长跑进程, 重启代价高 (会打断在跑的任务), 所以这条最值。
+			//
+			// 两个 apply 分开调、各自返回错误, 与 serve 侧同形 (见 cmd/claude-go/main.go):
+			// 引擎开关 (memoryIndexMode) 与模型段是两个失败面, 混在一起的话模型段解析
+			// 失败会把开关更新一起吞掉。worker 尤其不能省这一条 —— 它才是真正执行任务的
+			// 那个进程, 漏了的话控制面把开关推下来了, 干活的人还在用旧形态。
 			hotreload.WatchConfig(cfgPath, 5*time.Second, "claude-go-worker-"+name,
-				func(p string) error { return bot.ReloadModelConfig(p) })
+				func(p string) error {
+					errModel := bot.ReloadModelConfig(p)
+					errSw := bot.ApplyEngineSwitches(p)
+					if errModel != nil && errSw != nil {
+						return fmt.Errorf("模型配置: %v; 引擎开关: %v", errModel, errSw)
+					}
+					if errModel != nil {
+						log.Printf("[HotReload] 模型配置重载失败 (引擎开关已应用, 继续用旧模型配置): %v", errModel)
+					}
+					return nil
+				})
 			// NewBot 内部无条件 cronSched.Start(), 必须在这里停掉。
 			// 注意: 不调用 bot.Shutdown() —— 它会再 Stop 一次 cron, 而
 			// CronScheduler.Stop 是 close(stopCh), 二次调用会 panic

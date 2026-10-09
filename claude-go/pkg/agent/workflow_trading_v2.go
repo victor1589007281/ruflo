@@ -6,11 +6,12 @@
 //   - Trading-R1 (arXiv:2509.11420): 结构化推理 + 证据链接
 //
 // 架构 (5 层):
-//   Layer 1: 4 个并行分析师 (技术/情绪/基本面/新闻)
-//   Layer 2: Bull/Bear 对抗辩论 → Research Manager 裁决
-//   Layer 3: Trader 制定交易方案
-//   Layer 4: Aggressive/Conservative/Neutral 三方风险辩论 → Portfolio Manager 裁决
-//   Layer 5: Signal Extractor (结构化信号提取 + 量化风控)
+//
+//	Layer 1: 4 个并行分析师 (技术/情绪/基本面/新闻)
+//	Layer 2: Bull/Bear 对抗辩论 → Research Manager 裁决
+//	Layer 3: Trader 制定交易方案
+//	Layer 4: Aggressive/Conservative/Neutral 三方风险辩论 → Portfolio Manager 裁决
+//	Layer 5: Signal Extractor (结构化信号提取 + 量化风控)
 package agent
 
 import (
@@ -30,27 +31,27 @@ func tradingV2Workflow() *WorkflowDef {
 		Mode:        "trading_debate",
 		Stages: []StageDef{
 			// Layer 1: 并行分析
-			{Name: "tech-analysis", Role: "market-analyst", Parallel: true,
+			{Name: "tech-analysis", Agent: "market-analyst", Parallel: true,
 				Prompt: techAnalystPrompt},
-			{Name: "sentiment-analysis", Role: "sentiment-analyst", Parallel: true,
+			{Name: "sentiment-analysis", Agent: "sentiment-analyst", Parallel: true,
 				Prompt: sentimentAnalystPrompt},
-			{Name: "fundamentals-analysis", Role: "fundamentals-analyst", Parallel: true,
+			{Name: "fundamentals-analysis", Agent: "fundamentals-analyst", Parallel: true,
 				Prompt: fundamentalsAnalystPrompt},
-			{Name: "news-analysis", Role: "news-analyst", Parallel: true,
+			{Name: "news-analysis", Agent: "news-analyst", Parallel: true,
 				Prompt: newsAnalystPrompt},
 			// Layer 2: 辩论 (由 debate engine 驱动, 不在 pipeline 中)
-			{Name: "bull-researcher", Role: "bull-researcher"},
-			{Name: "bear-researcher", Role: "bear-researcher"},
-			{Name: "research-manager", Role: "research-manager",
+			{Name: "bull-researcher", Agent: "bull-researcher"},
+			{Name: "bear-researcher", Agent: "bear-researcher"},
+			{Name: "research-manager", Agent: "research-manager",
 				DependsOn: []string{"tech-analysis", "sentiment-analysis", "fundamentals-analysis", "news-analysis"}},
 			// Layer 3: 交易
-			{Name: "trader", Role: "trader",
+			{Name: "trader", Agent: "trader",
 				DependsOn: []string{"research-manager"}},
 			// Layer 4: 风险辩论
-			{Name: "aggressive-risk", Role: "aggressive-risk"},
-			{Name: "conservative-risk", Role: "conservative-risk"},
-			{Name: "neutral-risk", Role: "neutral-risk"},
-			{Name: "portfolio-manager", Role: "portfolio-manager",
+			{Name: "aggressive-risk", Agent: "aggressive-risk"},
+			{Name: "conservative-risk", Agent: "conservative-risk"},
+			{Name: "neutral-risk", Agent: "neutral-risk"},
+			{Name: "portfolio-manager", Agent: "portfolio-manager",
 				DependsOn: []string{"trader"}},
 		},
 	}
@@ -108,7 +109,7 @@ func (we *WorkflowExecutor) executeTradingDebate(ctx context.Context, wf *Workfl
 	// ── Phase 3: Trader 制定交易方案 ──
 	we.notify(we.chatID, "💼 **Phase 3/5**: Trader 制定交易方案")
 	traderStage := StageDef{
-		Name: "trader", Role: "trader",
+		Name: "trader", Agent: "trader",
 		Prompt: fmt.Sprintf(traderPrompt, objective, prevResults["research-manager"]),
 	}
 	traderSR := we.executeStage(ctx, traderStage, objective, prevResults, team)
@@ -136,7 +137,7 @@ func (we *WorkflowExecutor) executeTradingDebate(ctx context.Context, wf *Workfl
 	// ── Phase 5: Signal 提取 + 风控 ──
 	we.notify(we.chatID, "🎯 **Phase 5/5**: 信号提取 + 量化风控")
 	signalStage := StageDef{
-		Name: "signal-extractor", Role: "portfolio-manager",
+		Name: "signal-extractor", Agent: "portfolio-manager",
 		Prompt: fmt.Sprintf(signalExtractorPrompt, prevResults["portfolio-manager"]),
 	}
 	signalSR := we.executeStage(ctx, signalStage, objective, prevResults, team)
@@ -166,7 +167,7 @@ func (we *WorkflowExecutor) runResearchDebate(ctx context.Context, objective, an
 		// Bull turn
 		we.notify(we.chatID, fmt.Sprintf("  🐂 辩论第 %d 轮: Bull Researcher", round))
 		bullPrompt := fmt.Sprintf(bullResearcherPrompt, objective, analysisReport, strings.Join(debateHistory, "\n\n"))
-		bullStage := StageDef{Name: fmt.Sprintf("bull-round%d", round), Role: "bull-researcher", Prompt: bullPrompt}
+		bullStage := StageDef{Name: fmt.Sprintf("bull-round%d", round), Agent: "bull-researcher", Prompt: bullPrompt}
 		bullSR := we.executeStage(ctx, bullStage, objective, nil, team)
 		results = append(results, bullSR)
 		if bullSR.Status == TaskCompleted {
@@ -180,7 +181,7 @@ func (we *WorkflowExecutor) runResearchDebate(ctx context.Context, objective, an
 		// Bear turn
 		we.notify(we.chatID, fmt.Sprintf("  🐻 辩论第 %d 轮: Bear Researcher", round))
 		bearPrompt := fmt.Sprintf(bearResearcherPrompt, objective, analysisReport, strings.Join(debateHistory, "\n\n"))
-		bearStage := StageDef{Name: fmt.Sprintf("bear-round%d", round), Role: "bear-researcher", Prompt: bearPrompt}
+		bearStage := StageDef{Name: fmt.Sprintf("bear-round%d", round), Agent: "bear-researcher", Prompt: bearPrompt}
 		bearSR := we.executeStage(ctx, bearStage, objective, nil, team)
 		results = append(results, bearSR)
 		if bearSR.Status == TaskCompleted {
@@ -191,7 +192,7 @@ func (we *WorkflowExecutor) runResearchDebate(ctx context.Context, objective, an
 	// Research Manager 裁决
 	we.notify(we.chatID, "  👨‍💼 Research Manager 裁决中...")
 	managerPrompt := fmt.Sprintf(researchManagerPrompt, objective, analysisReport, strings.Join(debateHistory, "\n\n"))
-	managerStage := StageDef{Name: "research-manager", Role: "research-manager", Prompt: managerPrompt}
+	managerStage := StageDef{Name: "research-manager", Agent: "research-manager", Prompt: managerPrompt}
 	managerSR := we.executeStage(ctx, managerStage, objective, nil, team)
 	results = append(results, managerSR)
 
@@ -227,7 +228,7 @@ func (we *WorkflowExecutor) runRiskDebate(ctx context.Context, objective, trader
 			we.notify(we.chatID, fmt.Sprintf("  %s 风险辩论第 %d 轮: %s", icon, round, p.name))
 
 			prompt := fmt.Sprintf(p.prompt, objective, traderPlan, strings.Join(riskHistory, "\n\n"))
-			stage := StageDef{Name: fmt.Sprintf("%s-round%d", p.name, round), Role: p.role, Prompt: prompt}
+			stage := StageDef{Name: fmt.Sprintf("%s-round%d", p.name, round), Agent: p.role, Prompt: prompt}
 			sr := we.executeStage(ctx, stage, objective, nil, team)
 			results = append(results, sr)
 			if sr.Status == TaskCompleted {
@@ -239,7 +240,7 @@ func (we *WorkflowExecutor) runRiskDebate(ctx context.Context, objective, trader
 	// Portfolio Manager 最终裁决
 	we.notify(we.chatID, "  🏦 Portfolio Manager 最终裁决...")
 	pmPrompt := fmt.Sprintf(portfolioManagerPrompt, objective, traderPlan, strings.Join(riskHistory, "\n\n"))
-	pmStage := StageDef{Name: "portfolio-manager", Role: "portfolio-manager", Prompt: pmPrompt}
+	pmStage := StageDef{Name: "portfolio-manager", Agent: "portfolio-manager", Prompt: pmPrompt}
 	pmSR := we.executeStage(ctx, pmStage, objective, nil, team)
 	results = append(results, pmSR)
 

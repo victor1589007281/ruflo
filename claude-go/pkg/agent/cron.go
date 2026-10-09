@@ -38,13 +38,13 @@ import (
 
 // CronJob 定时任务定义。
 type CronJob struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Schedule   string    `json:"schedule"`           // cron 表达式: "分 时 日 月 周"
-	JobType    string    `json:"jobType"`            // workflow, query, command
-	Payload    string    `json:"payload"`            // 执行内容 (任务目标/消息/命令)
-	ChatID     string    `json:"chatId"`             // 结果推送的飞书 chat_id
-	Workflow   string    `json:"workflow,omitempty"` // jobType=workflow 时的工作流类型
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Schedule string `json:"schedule"`           // cron 表达式: "分 时 日 月 周"
+	JobType  string `json:"jobType"`            // workflow, query, command
+	Payload  string `json:"payload"`            // 执行内容 (任务目标/消息/命令)
+	ChatID   string `json:"chatId"`             // 结果推送的飞书 chat_id
+	Workflow string `json:"workflow,omitempty"` // jobType=workflow 时的工作流类型
 	// Model 任务级执行模型别名 (provider:model, 如 ollama:lfm2.5:2.6b-q4_k_m); 空 = 默认模型。
 	// 消费面: 当前仅 jobType=query 真实消费 (一次性覆盖会话模型, 不污染既有会话)。
 	// workflow 的模型走 ai.plans.<type>.modelAlias 配置 (按工作流类型, 本身可配);
@@ -369,6 +369,34 @@ func (cs *CronScheduler) executeJob(job *CronJob) {
 	start := time.Now()
 	var execErr error
 
+	// ★ 具名会话闸门 (fail-closed): query / command / workflow 这三类任务都是
+	// "去和某个会话说话" —— chatID 就是那个会话的身份。
+	//
+	// 空 chatID 时**拒绝执行**, 而不是让它跑进一个匿名会话:
+	//
+	//   - 会话级轨迹 (pkg/feishu/session_trace.go) 按 chatID 命名桶。空 chatID 的
+	//     运行会写进 `trace-run--<n>` 这种桶, 轨迹页上归不了任何团队 —— 一次真实
+	//     运行, 在页面上与"没跑过"长得一样。
+	//   - 用具名会话当 chatID 的作业 (调度唤醒某个员工) 若 id 打错成空串, 结果是
+	//     **静默**起了一个新会话: 那个员工没被唤醒, 但任务报"成功", 且盘上多出一个
+	//     谁也不认识的会话。
+	//
+	// 所以这里发一条明确失败 (进 FailCount 与 LastResult), 让它在 dashboard 上看得见。
+	// 与 sessionapi 的 409 同一条纪律: "现在不行"必须是可重试的明确信号, 不是静默降级。
+	if needsSessionTarget(job.JobType) && strings.TrimSpace(job.ChatID) == "" {
+		execErr = fmt.Errorf("任务类型 %s 必须指定会话 (chatID): 空值会让这次运行跑进一个匿名会话, "+
+			"轨迹归不了团队且报成功", job.JobType)
+		cs.executor.Notify(job.ChatID, fmt.Sprintf("❌ 定时任务 **%s** 未执行: %v", job.Name, execErr))
+		cs.mu.Lock()
+		job.LastRunAt = time.Now()
+		job.RunCount++
+		job.FailCount++
+		job.LastResult = "失败: " + execErr.Error()
+		cs.persist()
+		cs.mu.Unlock()
+		return
+	}
+
 	cs.executor.Notify(job.ChatID, fmt.Sprintf("⏰ 定时任务 **%s** 开始执行...\n类型: %s\n内容: %s",
 		job.Name, job.JobType, truncateResult(job.Payload, 100)))
 
@@ -663,4 +691,19 @@ func ParseNaturalSchedule(text string) (string, string) {
 
 	// 默认每天
 	return fmt.Sprintf("0 %d * * *", hour), fmt.Sprintf("每天%d点", hour)
+}
+
+// needsSessionTarget 报告该任务类型是否必须有一个具名会话 (chatID) 才能执行。
+//
+// 单列成函数而不是写在开关里: 将来加一类任务时, "它要不要会话"是一个必须被
+// **显式回答**的问题 —— 漏答的默认是 false (不需要), 而 false 的后果就是这次
+// 改动要消灭的那种静默。
+func needsSessionTarget(jobType string) bool {
+	switch jobType {
+	case "query", "command", "workflow":
+		return true
+	default:
+		// sync / wiki-* 只用 chatID 发通知, 不寻址会话, 空值可接受。
+		return false
+	}
 }

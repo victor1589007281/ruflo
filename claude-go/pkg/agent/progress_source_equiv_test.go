@@ -93,7 +93,7 @@ func (p *stageProbe) stages(wf *WorkflowDef) []string {
 	}
 	var out []string
 	for _, st := range wf.Stages {
-		if seen[st.Role] {
+		if seen[st.Agent] {
 			out = append(out, st.Name)
 		}
 	}

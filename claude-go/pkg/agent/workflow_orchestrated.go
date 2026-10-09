@@ -187,7 +187,7 @@ func orchestratedGraphSpec(wf *WorkflowDef, maxParallel int) (graph.GraphSpec, e
 		spec.Nodes = append(spec.Nodes, graph.NodeSpec{
 			ID:         st.Name,
 			Kind:       graph.NodeKindAgent, // 一律 agent: 见上文第 1 条
-			Agent:      graph.AgentSpec{Role: st.Role, Prompt: st.Prompt},
+			Agent:      graph.AgentSpec{Role: st.Agent, Prompt: st.Prompt},
 			Retry:      noRetry,
 			TimeoutSec: budget,
 		})
@@ -248,7 +248,7 @@ func (we *WorkflowExecutor) notifyOrchestratedSummary(results []StageResult, run
 // isAdversarialStage 判断阶段是否为对抗阶段 (判据与改造前逐字相同)。
 // 命中它的阶段走 orchNodeRunner 的对抗分支 (内层多轮 + 质量终止), 而不是单次 completion。
 func isAdversarialStage(stage StageDef) bool {
-	lower := strings.ToLower(stage.Name + " " + stage.Role)
+	lower := strings.ToLower(stage.Name + " " + stage.Agent)
 	return strings.Contains(lower, "adversarial") ||
 		strings.Contains(lower, "skeptic") ||
 		strings.Contains(lower, "red-team") ||
@@ -258,7 +258,7 @@ func isAdversarialStage(stage StageDef) bool {
 // taskTimeout 根据阶段类型分配差异化的**单次尝试**超时 (与改造前逐字相同)。
 // 汇总/报告类阶段需要合并多个上游输出, 耗时更长。
 func taskTimeout(stage StageDef) time.Duration {
-	lower := strings.ToLower(stage.Name + " " + stage.Role)
+	lower := strings.ToLower(stage.Name + " " + stage.Agent)
 	// 汇总报告类: 需要整合多个上游阶段输出
 	if strings.Contains(lower, "report") ||
 		strings.Contains(lower, "summary") ||
