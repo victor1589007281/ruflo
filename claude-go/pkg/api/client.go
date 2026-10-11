@@ -195,6 +195,15 @@ type Client struct {
 	PromptCacheMode            string
 	promptCacheDisabledByError bool // 因 API 错误自适应关闭
 
+	// ReasoningPlayback 出站回传上一轮推理所用的 OpenAI 字段名。
+	// "" = 不回传; "reasoning" = messages[].reasoning; "reasoning_content" =
+	// messages[].reasoning_content。**只对 protocol:"openai" 有意义**, anthropic
+	// 原生协议不需要 (它的 thinking 块本来就跟着历史走), responses 协议另有形态。
+	//
+	// 模型级配置 (见 modelconfig.ModelConfig.ReasoningPlayback): 各家对回传的接受度
+	// 相反, DeepSeek 会直接拒, 所以这里不做自动嗅探也不提供全局开关 —— 由配置逐台决定。
+	ReasoningPlayback string
+
 	// PromptDebugEnabled 开启后将每次发给 LLM 的请求和响应落盘。
 	// 注意: 文件包含完整 prompt / tool schema / user content, 仅建议排查 token 问题时短期开启。
 	PromptDebugEnabled    bool
@@ -236,6 +245,7 @@ func (c *Client) WithModel(model string) *Client {
 		APIKey:                c.APIKey,
 		Model:                 model,
 		Protocol:              c.Protocol,
+		ReasoningPlayback:     c.ReasoningPlayback,
 		Proxy:                 c.Proxy,
 		Client:                c.Client,
 		Guard:                 c.Guard,
@@ -273,6 +283,7 @@ func (c *Client) ConfiguredCloneFull(baseURL, apiKey, model string, fallbackMode
 		APIKey:                apiKey,
 		Model:                 model,
 		Protocol:              c.Protocol,
+		ReasoningPlayback:     c.ReasoningPlayback,
 		Proxy:                 c.Proxy,
 		Client:                c.Client,
 		Guard:                 c.Guard,

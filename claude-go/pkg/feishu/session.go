@@ -27,11 +27,11 @@ import (
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	sessionstore "github.com/anthropic/claude-go/pkg/session"
+	"github.com/anthropic/claude-go/pkg/sessionapi"
 	"github.com/anthropic/claude-go/pkg/skills"
 	"github.com/anthropic/claude-go/pkg/statestore"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/tool/builtin"
-	"github.com/anthropic/claude-go/pkg/sessionapi"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/anthropic/claude-go/pkg/weakmodel"
 )
@@ -431,6 +431,7 @@ func (sm *SessionManager) clientForAlias(alias string) *api.Client {
 	}
 	cli := api.NewClient(rc.BaseURL, rc.APIKey, rc.OutboundModelName())
 	cli.Protocol = rc.Protocol
+	cli.ReasoningPlayback = rc.ReasoningPlayback
 	cli.SetProxy(rc.Proxy)
 	if rc.CallTimeoutSec > 0 {
 		cli.CallTimeout = time.Duration(rc.CallTimeoutSec) * time.Second

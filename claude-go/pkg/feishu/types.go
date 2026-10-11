@@ -604,6 +604,12 @@ type ProviderModelConfig struct {
 	// Protocol 出站协议: ""(默认 anthropic /messages) | "openai" (/chat/completions)
 	// | "openai-responses" (/v1/responses, opencode 对 muse-spark 等 Meta 模型推荐)。
 	Protocol string `json:"protocol,omitempty"`
+	// ReasoningPlayback 出站回传上一轮推理的 OpenAI 字段名; 只对 protocol:"openai"
+	// 有意义 (""=不回传, "reasoning", "reasoning_content")。
+	// 与 Protocol 一样是模型级开关: DeepSeek 拒绝在请求里回传 reasoning_content,
+	// opencode step-5 接受, 全球开会让同一份 provider 列表里的兜底模型整批报错。
+	// 完整说明见 modelconfig.ModelConfig.ReasoningPlayback。
+	ReasoningPlayback string `json:"reasoningPlayback,omitempty"`
 	// Proxy 出站 HTTP 代理 URL (http://host:port)。模型级配置 —— 只有配置了 proxy 的
 	// 模型才走代理 (如 muse-spark 大陆不可达, 须经东京 tailnet 代理出口), 其余模型
 	// 保持直连, 不消耗代理出口流量额度。
@@ -913,6 +919,7 @@ func (jc *JSONConfig) ToModelConfigJSON() modelconfig.ConfigJSON {
 					PromptCacheMode:      mc.PromptCacheMode,
 					ContextWindow:        mc.ContextWindow,
 					Protocol:             mc.Protocol,
+					ReasoningPlayback:    mc.ReasoningPlayback,
 					Proxy:                mc.Proxy,
 					RPM:                  mc.RPM,
 					MaxParallel:          mc.MaxParallel,

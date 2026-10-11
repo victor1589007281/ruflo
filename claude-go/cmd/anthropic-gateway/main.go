@@ -309,6 +309,7 @@ func buildClient(rc modelconfig.ResolvedConfig) *api.Client {
 		c = api.NewClient(baseURL, rc.APIKey, rc.ProviderName)
 	}
 	c.Protocol = rc.Protocol
+	c.ReasoningPlayback = rc.ReasoningPlayback
 	c.SetProxy(rc.Proxy)
 	c.Tag = "anthropic-gateway"
 	return c

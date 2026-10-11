@@ -55,6 +55,7 @@ func buildClientFromAlias(alias string) (*api.Client, error) {
 		client = api.NewClient(resolved.BaseURL, resolved.APIKey, clientModel)
 	}
 	client.Protocol = resolved.Protocol
+	client.ReasoningPlayback = resolved.ReasoningPlayback
 	client.SetProxy(resolved.Proxy)
 	if resolved.CallTimeoutSec > 0 {
 		client.CallTimeout = time.Duration(resolved.CallTimeoutSec) * time.Second

@@ -30,6 +30,21 @@ const (
 	ProtocolAnthropic = "anthropic"
 )
 
+// ReasoningPlayback 出站回传上一轮推理所用的 OpenAI 字段名 (见 Client.ReasoningPlayback)。
+// 两家上游收在不同字段上, 不能互相替代:
+//
+//	ReasoningPlaybackReasoning        = "reasoning"          // opencode 系 (step-5 等)
+//	ReasoningPlaybackReasoningContent = "reasoning_content"  // DeepSeek / R1 系
+//
+// 空字符串 = 不回传, 是默认值。**不做自动嗅探**: DeepSeek 官方文档明确拒绝在请求里
+// 回传 reasoning_content (传了直接报错), 而 opencode:step-5 实测接受; 两家要求相反,
+// 猜错一边就是"修一个模型打死另一个模型"。所以这是模型级配置项, 由 config.json
+// 逐台决定, 不在代码里推断。
+const (
+	ReasoningPlaybackReasoning        = "reasoning"
+	ReasoningPlaybackReasoningContent = "reasoning_content"
+)
+
 // ── 出站请求 wire 类型 ──────────────────────────────────────────────────────
 
 type openAIToolCall struct {
@@ -58,6 +73,22 @@ type openAIMessage struct {
 	Content    interface{}      `json:"content,omitempty"` // string | []openAIContentPart | null
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
+	// Reasoning / ReasoningContent 出站回传上一轮的思维链 (仅 assistant 消息)。
+	//
+	// 两家上游收在不同字段名上, 所以两个都留, 由 ReasoningPlayback 决定填哪个:
+	//   - reasoning:          opencode 系的 step-5 等
+	//   - reasoning_content:  DeepSeek / R1 系
+	//
+	// 两个都是 omitempty: 不开回传时这两个字段**不出现在线上报文里**, 与改造前
+	// 逐字节相同 —— 不能因为"结构体上加了字段"就改变默认请求的形状, 那会让所有
+	// 没配这个开关的模型白白多背一份请求体, 也可能撞上不认该字段的上游。
+	//
+	// 必要性: 网关是无状态的 (openAIRequest 里没有 previous_response_id 之类的
+	// 服务端会话键), 每轮都全量重发 messages[]。上游"知道"自己上一轮推理的唯一
+	// 前提是那段推理在这次的 body 里。此前它被 assistantBlocksToOpenAI 丢弃,
+	// 于是多轮工具循环里模型看不到自己上一轮的推理。
+	Reasoning        string `json:"reasoning,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type openAITool struct {
@@ -82,7 +113,7 @@ type openAIRequest struct {
 // buildOpenAIRequest 把 Anthropic 请求翻译为 OpenAI body。
 // 返回可重序列化的请求体 (重试换模型时需要改 Model 再 marshal)。
 func (c *Client) buildOpenAIRequest(req types.APIRequest, stream bool) (*openAIRequest, []byte, error) {
-	oreq, err := anthropicToOpenAI(req, stream)
+	oreq, err := anthropicToOpenAI(req, stream, c.ReasoningPlayback)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -99,10 +130,15 @@ func (c *Client) buildOpenAIRequest(req types.APIRequest, stream bool) (*openAIR
 //   - system → messages[0] role=system (拼成单一字符串)
 //   - user 消息里的 tool_result 块 → 独立的 role=tool 消息 (保持紧跟 assistant),
 //     其余 text/image 块 → 一个 role=user 消息 (排在工具消息之后)
-//   - assistant 消息的 tool_use 块 → tool_calls 数组; thinking 块丢弃
+//   - assistant 消息的 tool_use 块 → tool_calls 数组; thinking 块按 reasoningPlayback
+//     回传 (见 ReasoningPlayback), 为空则丢弃
 //   - tools input_schema → OpenAI function.parameters
 //   - tool_choice any/tool → "required"
-func anthropicToOpenAI(req types.APIRequest, stream bool) (*openAIRequest, error) {
+//
+// reasoningPlayback 一路显式传参而不是读 Client 字段: 翻译层是纯函数, 调用方从
+// 哪来 (Client / 探针 / 测试) 与它无关。读到全局字段上的话, 单测就得先构造一个
+// Client 才能验一个字符串该落在哪个字段里。
+func anthropicToOpenAI(req types.APIRequest, stream bool, reasoningPlayback string) (*openAIRequest, error) {
 	oreq := &openAIRequest{
 		Model:       req.Model,
 		MaxTokens:   req.MaxTokens,
@@ -118,7 +154,7 @@ func anthropicToOpenAI(req types.APIRequest, stream bool) (*openAIRequest, error
 		oreq.Messages = append(oreq.Messages, openAIMessage{Role: "system", Content: sys})
 	}
 	for _, m := range req.Messages {
-		ms, err := anthropicMessageToOpenAI(m)
+		ms, err := anthropicMessageToOpenAI(m, reasoningPlayback)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +190,7 @@ func anthropicToOpenAI(req types.APIRequest, stream bool) (*openAIRequest, error
 }
 
 // anthropicMessageToOpenAI 翻译单条 Anthropic 消息为 0..N 条 OpenAI 消息。
-func anthropicMessageToOpenAI(msg types.APIMessage) ([]openAIMessage, error) {
+func anthropicMessageToOpenAI(msg types.APIMessage, reasoningPlayback string) ([]openAIMessage, error) {
 	var blocks []types.ContentBlock
 	if err := json.Unmarshal(msg.Content, &blocks); err != nil {
 		// 纯字符串 content (部分调用方直接传字符串)
@@ -166,7 +202,7 @@ func anthropicMessageToOpenAI(msg types.APIMessage) ([]openAIMessage, error) {
 	}
 	switch msg.Role {
 	case "assistant":
-		return assistantBlocksToOpenAI(blocks)
+		return assistantBlocksToOpenAI(blocks, reasoningPlayback)
 	case "user":
 		return userBlocksToOpenAI(blocks)
 	case "system":
@@ -217,10 +253,16 @@ func userBlocksToOpenAI(blocks []types.ContentBlock) ([]openAIMessage, error) {
 	return out, nil
 }
 
-// assistantBlocksToOpenAI 把 assistant 消息的 text 块拼成 content, tool_use 块转 tool_calls。
-func assistantBlocksToOpenAI(blocks []types.ContentBlock) ([]openAIMessage, error) {
+// assistantBlocksToOpenAI 把 assistant 消息的 text 块拼成 content, tool_use 块转
+// tool_calls, thinking 块按 reasoningPlayback 回传。
+//
+// reasoningPlayback 为空时 thinking 块依旧丢弃 —— 与改造前逐字节相同。这一点是硬要求:
+// 默认请求的形状不能因为结构体多了两个字段就改变, 否则没配这个开关的模型会平白多背
+// 一份请求体, 还可能撞上不认该字段的上游。
+func assistantBlocksToOpenAI(blocks []types.ContentBlock, reasoningPlayback string) ([]openAIMessage, error) {
 	var sb strings.Builder
 	var calls []openAIToolCall
+	var reasoning strings.Builder
 	for _, b := range blocks {
 		switch b.Type {
 		case types.ContentBlockText:
@@ -241,17 +283,39 @@ func assistantBlocksToOpenAI(blocks []types.ContentBlock) ([]openAIMessage, erro
 				},
 			})
 		case types.ContentBlockThinking:
-			// 丢弃
+			// 上一轮的思维链。回传是**整段重发**, 不是增量: 上游要在这一轮看到
+			// 完整推理, 只发新的一段会让它对着半截推理"接上下文", 比不发更容易出
+			// 矛盾结论。多个 thinking 块按出现顺序拼接 (同一条 assistant 消息里
+			// 正常只有一个, 但压缩/重试路径上可能出现多个分段)。
+			if reasoningPlayback != "" && b.Thinking != "" {
+				if reasoning.Len() > 0 {
+					reasoning.WriteString("\n")
+				}
+				reasoning.WriteString(b.Thinking)
+			}
 		}
 	}
 	var content interface{}
 	if sb.Len() > 0 {
 		content = sb.String()
 	}
-	if len(calls) == 0 {
-		return []openAIMessage{{Role: "assistant", Content: content}}, nil
+	msg := openAIMessage{Role: "assistant", Content: content}
+	if reasoning.Len() > 0 {
+		switch reasoningPlayback {
+		case ReasoningPlaybackReasoningContent:
+			msg.ReasoningContent = reasoning.String()
+		default:
+			// "reasoning" 以及任何未登记的值都走这个字段 —— 保守的一侧:
+			// 空值已经在上面被挡住 (不进这个分支), 而写错字段名最多是上游忽略
+			// 一个它不认识的键, 不会把字段内容漏给另一个语义不同的位。
+			msg.Reasoning = reasoning.String()
+		}
 	}
-	return []openAIMessage{{Role: "assistant", Content: content, ToolCalls: calls}}, nil
+	if len(calls) == 0 {
+		return []openAIMessage{msg}, nil
+	}
+	msg.ToolCalls = calls
+	return []openAIMessage{msg}, nil
 }
 
 // systemToOpenAIString 把 Anthropic system 字段 (string | []map 块 | []string) 摊平为纯文本。
@@ -315,6 +379,11 @@ type openAIResponse struct {
 			Role      string           `json:"role"`
 			Content   json.RawMessage  `json:"content"`
 			ToolCalls []openAIToolCall `json:"tool_calls"`
+			// Reasoning / ReasoningContent: 隐藏推理模型的思维链 (非流式同样给)。
+			// 同帧三个字段内容重复, parseOpenAIResponse 取最长的一个。
+			Reasoning        string                `json:"reasoning"`
+			ReasoningContent string                `json:"reasoning_content"`
+			ReasoningDetails []openAIReasoningItem `json:"reasoning_details"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -350,7 +419,7 @@ func parseOpenAIResponse(model string, raw []byte) (types.APIResponse, error) {
 	}
 	if len(r.Choices) > 0 {
 		ch := r.Choices[0]
-		resp.Content = openAIContentToBlocks(ch.Message.Content, ch.Message.ToolCalls)
+		resp.Content = openAIContentToBlocks(ch.Message.Content, ch.Message.ToolCalls, openAIReasoningText(ch.Message.Reasoning, ch.Message.ReasoningContent, ch.Message.ReasoningDetails))
 		resp.StopReason = openAIFinishToStop(ch.FinishReason)
 	}
 	resp.Usage = &types.Usage{
@@ -364,9 +433,14 @@ func parseOpenAIResponse(model string, raw []byte) (types.APIResponse, error) {
 	return resp, nil
 }
 
-// openAIContentToBlocks 把 OpenAI message.content (string | 块数组) + tool_calls → Anthropic 块。
-func openAIContentToBlocks(content json.RawMessage, calls []openAIToolCall) []types.ContentBlock {
+// openAIContentToBlocks 把 OpenAI message.content (string | 块数组) + tool_calls →
+// Anthropic 块。reasoning 非空时以 thinking 块**排在正文之前** —— 上游的处理顺序
+// 就是先推理后作答, 引擎/轨迹也按这个顺序读 (ExtractPlan 取首个 thinking 块)。
+func openAIContentToBlocks(content json.RawMessage, calls []openAIToolCall, reasoning string) []types.ContentBlock {
 	var out []types.ContentBlock
+	if reasoning != "" {
+		out = append(out, types.ContentBlock{Type: types.ContentBlockThinking, Thinking: reasoning})
+	}
 	if txt := openAIContentText(content); txt != "" {
 		out = append(out, types.ContentBlock{Type: types.ContentBlockText, Text: txt})
 	}
@@ -402,6 +476,15 @@ type openAIStreamTranslator struct {
 	textOpen       bool
 	textBlockIndex int
 	trailing       strings.Builder // 工具块打开后到来的文本 (极少数交错), finish 时补发
+
+	// thinking 块状态。与 text/tool 一样遵循"同一时刻只开一个块": reasoning
+	// 到达时若 text 开着就先关 text, 反之亦然。
+	thinkingOpen       bool
+	thinkingBlockIndex int
+	// reasoningSeen / reasoningLen 记录已发出过的思维链前缀。不同上游对
+	// reasoning 字段的语义不同 (增量串 vs 累计快照), reasoningDelta 靠这对值判别。
+	reasoningSeen string
+	reasoningLen  int
 
 	toolBlocks map[int]*openAIToolState
 	// openTool 当前**开着**的工具块 (OpenAI tool_call index); -1 = 没有。
@@ -445,6 +528,101 @@ func (t *openAIStreamTranslator) captureUsage(u *openAIUsage) {
 	}
 }
 
+// reasoningText 非流式思维的归一: 三个候选字段取最长的非空值。
+// 为什么取最长而不是固定某一个: 同一个 reasoning 概念在不同上游的字段名不同
+// (opencode/GLM 用 reasoning, DeepSeek 用 reasoning_content), 而三个字段同帧出现时
+// 内容是**同一段文字**, 取任意一个都等于全部内容 —— 取最长只是为了让"某个上游
+// 把推理切片到 reasoning_details 而主字段为空"的情形也不丢内容。
+func reasoningText(fields ...string) string {
+	longest := ""
+	for _, f := range fields {
+		if len([]rune(f)) > len([]rune(longest)) {
+			longest = f
+		}
+	}
+	return longest
+}
+
+// openAIReasoningText 把非流式 message 的三个推理字段归一为一个字符串。
+// 签名收 []openAIReasoningItem 而不是 string: reasoning_details 是**数组**, 收 string
+// 会让调用方为了凑类型把整段拼好的文字再塞进来 —— 那种"先拼后拆"的签名是给重构挖坑。
+func openAIReasoningText(reasoning, reasoningContent string, details []openAIReasoningItem) string {
+	return reasoningText(reasoning, reasoningContent, reasoningDetailText(details))
+}
+
+// openAIReasoningItem 是上游 reasoning_details[] 的一个分片 (opencode/OpenRouter
+// 风格: 每片只有文本, 正文之间是同一段思维链的连续部分)。
+type openAIReasoningItem struct {
+	Type  string `json:"type"`
+	Text  string `json:"text"`
+	Index *int   `json:"index"`
+}
+
+// reasoningDetailText 把 reasoning_details[] 拼回整段思维链。
+func reasoningDetailText(items []openAIReasoningItem) string {
+	var sb strings.Builder
+	for _, it := range items {
+		if it.Text != "" {
+			sb.WriteString(it.Text)
+		}
+	}
+	return sb.String()
+}
+
+// reasoningCandidates 汇总一帧里所有可能出现推理的字段。三个字段内容重复
+// (opencode 同帧给 reasoning 与 reasoning_details), 所以调用方按"取最长"归一,
+// 而不是叠加 —— 叠加会让同一句话在轨迹里出现两遍。
+func reasoningCandidates(reasoning, reasoningContent string, details []openAIReasoningItem) []string {
+	return []string{reasoning, reasoningContent, reasoningDetailText(details)}
+}
+
+// reasoningDelta 从一帧的上游推理字段里取出"尚未发过的思维链增量"。
+//
+// 为什么需要归一: 同一个"思维链"概念在不同上游的名字和语义都不同 ——
+//   - opencode step-5: delta.reasoning 是**增量**, 同帧还带一份内容完全相同的
+//     reasoning_details[{text}] (不是两份内容, 别叠加);
+//   - 智谱 GLM: delta.reasoning 是**累计快照** (chunk1="a", chunk2="ab");
+//   - DeepSeek/R1: delta.reasoning_content, 增量。
+//
+// 判据不靠字段名 (名字会漂, 且同名字段在不同上游语义相反), 而靠**内容关系**:
+// 若本帧最长的那个字段以上一帧的前缀开头, 它就是快照, 只发多出来的那一截;
+// 否则当增量整段发。多候选字段并存时取最长的那一个作为"本帧新值", 这样
+// reasoning 与 reasoning_details 的重复就不会让同一句话翻倍。
+func (t *openAIStreamTranslator) reasoningDelta(fields []string) string {
+	newest := ""
+	for _, f := range fields {
+		if f == "" {
+			continue
+		}
+		if len([]rune(f)) > len([]rune(newest)) {
+			newest = f
+		}
+	}
+	if newest == "" {
+		return ""
+	}
+	runes := []rune(newest)
+	cur := t.reasoningLen
+	if cur > len(runes) {
+		// 上游缩短了 (重试/换 key 后的新一轮): 之前的积累全部作废, 按增量重开。
+		t.reasoningSeen, t.reasoningLen = "", 0
+		cur = 0
+	}
+	if cur == 0 || string(runes[:cur]) == t.reasoningSeen[:cur] {
+		// 前缀吻合: 本帧是在已发内容之后追加 (快照形态, 或增量的首个分片)。
+		delta := string(runes[cur:])
+		t.reasoningSeen = newest
+		t.reasoningLen = len(runes)
+		return delta
+	}
+	// 前缀不吻合: 上游换了路子 (例如先发快照后改发增量)。此时不能再按偏移量裁,
+	// 否则会把没发过的内容裁掉; 整段发, 并把已发记录重置为本帧 —— 重复的那部分
+	// 由前缀判据在下一次自动吸收。
+	t.reasoningSeen = newest
+	t.reasoningLen = len(runes)
+	return newest
+}
+
 // translate 处理一个 OpenAI SSE data 行, 返回 0..N 个 Anthropic 事件。
 func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, error) {
 	var chunk struct {
@@ -462,6 +640,17 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 						Arguments string `json:"arguments"`
 					} `json:"function"`
 				} `json:"tool_calls"`
+				// Reasoning: 隐藏推理模型的思维链增量。opencode 的 step-5 系列
+				// 每个 reasoning chunk 都同时给 `reasoning` (增量串) 与
+				// `reasoning_details[0].text` (**同一段文字**, 不是两份), 所以只取
+				// 最长的那一个, 否则同一句话会翻倍。智谱 GLM 同名字段是全量快照,
+				// 由 reasoningDelta 的前缀判据分开。
+				Reasoning string `json:"reasoning"`
+				// ReasoningContent: DeepSeek / 智谱把推理放在这个字段 (同为增量)。
+				ReasoningContent string `json:"reasoning_content"`
+				// ReasoningDetails: OpenRouter 风格的分片数组, 每片只有 text/type。
+				// 它与上面两个字段**内容重复**, 不独立取用。
+				ReasoningDetails []openAIReasoningItem `json:"reasoning_details"`
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -508,8 +697,49 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 	t.captureUsage(chunk.Usage)
 
 	for _, ch := range chunk.Choices {
+		// 0) 思维链增量 (先于正文: 上游的处理顺序是 reasoning → content)
+		//
+		// 隐藏推理模型 (opencode:step-5-preview-free, GLM 等) 会把大半个
+		// max_tokens 烧在 reasoning 上; 不透传时轨迹里只剩一个空的 text 块 ——
+		// 看着像"模型什么都没说", 而 content 其实压根还没开始。这里把它翻成
+		// Anthropic 的 thinking 块 (engine.go 已有 thinking_delta 消费路径,
+		// pkg/engine/runner.go 会把它并进本轮文本)。
+		if rt := t.reasoningDelta(reasoningCandidates(ch.Delta.Reasoning, ch.Delta.ReasoningContent, ch.Delta.ReasoningDetails)); rt != "" {
+			// thinking 与 text 同属"当前块", 开 thinking 前必须先关 text。
+			if t.textOpen {
+				t.textOpen = false
+				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: t.textBlockIndex})
+			}
+			if t.openTool >= 0 {
+				// 不会发生 (tool_calls 与 reasoning 不同帧), 但保持串行不变量:
+				// 真出现就先关工具块, 否则两个块同时开着。
+				if st := t.toolBlocks[t.openTool]; st != nil && st.started {
+					out = append(out, types.StreamDelta{Type: "content_block_stop", Index: st.blockIndex})
+				}
+				t.openTool = -1
+			}
+			if !t.thinkingOpen {
+				t.thinkingOpen = true
+				t.thinkingBlockIndex = t.nextBlockIndex
+				t.nextBlockIndex++
+				out = append(out, types.StreamDelta{
+					Type: "content_block_start", Index: t.thinkingBlockIndex,
+					ContentBlock: &types.ContentBlock{Type: types.ContentBlockThinking},
+				})
+			}
+			out = append(out, types.StreamDelta{
+				Type: "content_block_delta", Index: t.thinkingBlockIndex,
+				Delta: &types.DeltaContent{Type: "thinking_delta", Thinking: rt},
+			})
+		}
+
 		// 1) 文本增量
 		if text := openAIContentText(ch.Delta.Content); text != "" {
+			// thinking 开着就先关 (引擎同一时刻只跟踪一个当前块)。
+			if t.thinkingOpen {
+				t.thinkingOpen = false
+				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: t.thinkingBlockIndex})
+			}
 			if len(t.toolBlocks) == 0 && !t.textOpen {
 				t.textOpen = true
 				t.textBlockIndex = t.nextBlockIndex
@@ -555,7 +785,11 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 			if tc.Function.Name != "" {
 				st.name = tc.Function.Name
 			}
-			// 文本块若开着, 先关闭 (引擎只跟踪一个当前块)
+			// 文本块 / thinking 块若开着, 先关闭 (引擎只跟踪一个当前块)
+			if t.thinkingOpen {
+				t.thinkingOpen = false
+				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: t.thinkingBlockIndex})
+			}
 			if t.textOpen {
 				t.textOpen = false
 				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: t.textBlockIndex})
@@ -599,6 +833,10 @@ func (t *openAIStreamTranslator) translate(data []byte) ([]types.StreamDelta, er
 
 		// 3) finish_reason → 逐个关闭块, 补发交错文本, 收尾 message_delta
 		if ch.FinishReason != "" {
+			if t.thinkingOpen {
+				t.thinkingOpen = false
+				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: t.thinkingBlockIndex})
+			}
 			if t.textOpen {
 				t.textOpen = false
 				out = append(out, types.StreamDelta{Type: "content_block_stop", Index: t.textBlockIndex})

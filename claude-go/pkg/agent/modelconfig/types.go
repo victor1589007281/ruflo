@@ -38,6 +38,23 @@ type ModelConfig struct {
 	// opencode:muse-spark-1.2-contributor 走 OpenAI Responses API, 其余 opencode 模型走 Anthropic。
 	Protocol      string `json:"protocol,omitempty"`
 	ContextWindow int    `json:"contextWindow,omitempty"` // 上下文窗口长度
+	// ReasoningPlayback 出站回传上一轮推理的字段名 —— 只对 protocol:"openai" 有意义。
+	//
+	//    ""                    = 不回传 (默认, 与改造前逐字节相同)
+	//    "reasoning"           = 写 messages[].reasoning          (opencode step-5 等)
+	//    "reasoning_content"   = 写 messages[].reasoning_content  (DeepSeek/R1 系)
+	//
+	// 为什么必须是模型级开关而不是全局打开: 各家对"请求里带回传推理"的接受度
+	// 相反。DeepSeek 官方文档明确**拒绝**在请求中回传 reasoning_content, 传了直接
+	// 报错; 而 opencode:step-5-preview-free 实测接受。全局打开会让默认兜底模型
+	// (deepseek-v4.1-flash 就在同一个 provider 列表里) 整批 400 —— 这正是"修一个
+	// 模型而打死另一个模型"的典型形状, 所以闸门放在模型上, 由配置逐台决定。
+	//
+	// 现状: 上一轮推理此前**已被网关收到并存进本地 messages[]** (runner.go 把带
+	// thinking 块的 assistant 消息 append 进历史), 只是翻译成 OpenAI 格式时被丢弃
+	// (openai.go assistantBlocksToOpenAI 的 case ContentBlockThinking)。这个开关
+	// 只是让那段已经存在的数据继续往下游走, 不产生新的推理。
+	ReasoningPlayback string `json:"reasoningPlayback,omitempty"`
 	// Proxy 出站 HTTP 代理 URL (http://host:port)。模型级配置 —— 只有配置了 proxy 的
 	// 模型才走代理 (如 muse-spark 大陆不可达, 须经东京 tailnet 代理出口), 其余模型
 	// 保持直连, 不消耗代理出口流量额度。
@@ -152,8 +169,11 @@ type ResolvedConfig struct {
 	MaxTurns        int
 	PromptCacheMode string
 	Protocol        string // "anthropic"(默认) | "openai" | "openai-responses"; 见 ModelConfig.Protocol
-	ContextWindow   int
-	Proxy           string // 出站 HTTP 代理 URL, 仅配置了 proxy 的模型走代理 (见 ModelConfig.Proxy)
+	// ReasoningPlayback 出站回传推理用的 OpenAI 字段名; 见 ModelConfig.ReasoningPlayback。
+	// "" = 不回传。指向 api.Client.ReasoningPlayback。
+	ReasoningPlayback string
+	ContextWindow     int
+	Proxy             string // 出站 HTTP 代理 URL, 仅配置了 proxy 的模型走代理 (见 ModelConfig.Proxy)
 	// 模型专属限流参数 (0 = 使用全局默认值)
 	RPM         int
 	MaxParallel int

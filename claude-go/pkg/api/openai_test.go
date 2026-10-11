@@ -25,7 +25,7 @@ func TestAnthropicToOpenAI(t *testing.T) {
 		},
 		ToolChoice: &types.APIToolChoice{Type: "any"},
 	}
-	oreq, err := anthropicToOpenAI(req, true)
+	oreq, err := anthropicToOpenAI(req, true, "") // 空 reasoningPlayback = 不回传 (默认行为)
 	if err != nil {
 		t.Fatalf("anthropicToOpenAI: %v", err)
 	}
@@ -331,6 +331,258 @@ func TestOpenAIStreamTranslatorMultiToolCalls(t *testing.T) {
 	}
 }
 
+// replayAnthropicBlocks 按**引擎的语义**重放事件序列 (pkg/engine/engine.go):
+// 只跟踪一个当前块, content_block_start 覆盖 currentBlock 并清空缓冲,
+// content_block_stop 才落盘。翻译器若同时开两个块, 这里会当场报错 —— 断言落在
+// 消费端形状上, 而不是"事件个数对得上" (丢一个+复制一个时个数可能还是对的)。
+func replayAnthropicBlocks(t *testing.T, evs []types.StreamDelta) []*replayedBlock {
+	t.Helper()
+	var blocks []*replayedBlock
+	var cur *replayedBlock
+	openDepth := 0
+	for _, e := range evs {
+		switch e.Type {
+		case "content_block_start":
+			if openDepth != 0 {
+				t.Fatalf("前一个块还没关就又开了新块 (index=%d) —— 引擎的 currentBlock 会被覆盖, "+
+					"前一个块整块丢失。事件序列: %s", e.Index, describeDeltas(evs))
+			}
+			openDepth++
+			cur = &replayedBlock{}
+			if e.ContentBlock != nil {
+				cur.kind = string(e.ContentBlock.Type)
+				cur.id = e.ContentBlock.ID
+				cur.name = e.ContentBlock.Name
+			}
+		case "content_block_delta":
+			if openDepth == 0 {
+				t.Fatalf("没有开着的块却收到 delta (index=%d)", e.Index)
+			}
+			if e.Delta != nil {
+				switch e.Delta.Type {
+				case "text_delta":
+					cur.text += e.Delta.Text
+				case "thinking_delta":
+					cur.thinking += e.Delta.Thinking
+				case "input_json_delta":
+					cur.args.WriteString(e.Delta.PartialJSON)
+				}
+			}
+		case "content_block_stop":
+			if openDepth == 0 {
+				t.Fatalf("块已经关了却又收到 content_block_stop (index=%d)", e.Index)
+			}
+			openDepth--
+			blocks = append(blocks, cur)
+			cur = nil
+		}
+	}
+	if openDepth != 0 {
+		t.Fatalf("流结束时还有 %d 个块没关", openDepth)
+	}
+	return blocks
+}
+
+type replayedBlock struct {
+	kind     string
+	id       string
+	name     string
+	text     string
+	thinking string
+	args     strings.Builder
+}
+
+// TestOpenAIStreamTranslatorReasoningThinking 是本次修复的主回归: 上游把思维链放在
+// delta.reasoning, 而 Anthropic 侧必须变成 thinking 块, 否则轨迹里只剩一个正文块 ——
+// opencode:step-5-preview-free 这种把大半个 max_tokens 烧在推理上的模型, 看起来就像
+// "什么都没说"。
+//
+// 第二个断言同样关键: opencode 每帧**同时**给 delta.reasoning (增量串) 和
+// delta.reasoning_details[0].text (**同一段文字**, 不是两份内容)。两个字段都发就会
+// 让思维链在轨迹里翻倍。
+func TestOpenAIStreamTranslatorReasoningThinking(t *testing.T) {
+	tr := newOpenAIStreamTranslator("step-5-preview-free")
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning":"Let","reasoning_details":[{"type":"reasoning.text","text":"Let","format":"unknown","index":0}]},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning":" me think","reasoning_details":[{"type":"reasoning.text","text":" me think","format":"unknown","index":1}]},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"光合作用"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":40}}`,
+	}
+	var all []types.StreamDelta
+	for _, c := range chunks {
+		evs, err := tr.translate([]byte(c))
+		if err != nil {
+			t.Fatalf("translate %q: %v", c, err)
+		}
+		all = append(all, evs...)
+	}
+	blocks := replayAnthropicBlocks(t, all)
+
+	if len(blocks) != 2 {
+		t.Fatalf("块数 = %d, 期望 2 (thinking + text): %s", len(blocks), describeDeltas(all))
+	}
+	if blocks[0].kind != string(types.ContentBlockThinking) {
+		t.Fatalf("首个块应为 thinking, 实得 %q —— 上游先推理后作答, 顺序必须保持 (轨迹的"+
+			" ExtractPlan 取首个 thinking 块)", blocks[0].kind)
+	}
+	// thinking 与 reasoning_details 内容重复, 各分片只能发一次。
+	if got := blocks[0].thinking; got != "Let me think" {
+		t.Fatalf("thinking 内容 = %q, 期望 \"Let me think\" (reasoning 与 reasoning_details "+
+			"同帧重复, 叠加会变成 %q)", got, "LetLet me thinkme think")
+	}
+	if blocks[1].kind != string(types.ContentBlockText) || blocks[1].text != "光合作用" {
+		t.Fatalf("正文块 = %+v, 期望 text/光合作用", blocks[1])
+	}
+	// 不能合成 signature: 上游没有该字段, 造一个假签名只会让下游校验失败。
+	for _, e := range all {
+		if e.Delta != nil && e.Delta.Type == "signature_delta" {
+			t.Fatal("合成了 signature_delta, 但上游响应里没有任何签名/加密推理字段")
+		}
+	}
+}
+
+// TestOpenAIStreamTranslatorReasoningSnapshot 覆盖智谱 GLM 一类上游: delta.reasoning
+// 是**累计快照** (chunk1=" Think", chunk2=" Think harder"), 不是增量。
+// 按增量整段发会让思维链呈平方级重复。判据是内容前缀关系, 不是字段名。
+func TestOpenAIStreamTranslatorReasoningSnapshot(t *testing.T) {
+	tr := newOpenAIStreamTranslator("glm-5.1")
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning":" Think"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning":" Think harder"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning":" Think harder! done"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`,
+	}
+	var all []types.StreamDelta
+	for _, c := range chunks {
+		evs, err := tr.translate([]byte(c))
+		if err != nil {
+			t.Fatalf("translate %q: %v", c, err)
+		}
+		all = append(all, evs...)
+	}
+	blocks := replayAnthropicBlocks(t, all)
+	if len(blocks) != 2 || blocks[0].kind != string(types.ContentBlockThinking) {
+		t.Fatalf("块形状不对: %s", describeDeltas(all))
+	}
+	if got := blocks[0].thinking; got != " Think harder! done" {
+		t.Fatalf("thinking = %q, 期望 \" Think harder! done\" —— 累计快照只该发多出来的那一截, "+
+			"整段重发会得到 %q", got, " Think Think harder Think harder! done")
+	}
+}
+
+// TestOpenAIStreamTranslatorReasoningThenTool 思维链与工具调用同回合: thinking 块必须
+// 在工具块之前关掉。这条走的是与多工具调用同一个引擎不变量 (只跟踪一个当前块),
+// 但触发路径不同 —— 之前 thinking 压根不开, 所以没人验证过它关不关。
+func TestOpenAIStreamTranslatorReasoningThenTool(t *testing.T) {
+	tr := newOpenAIStreamTranslator("step-5-preview-free")
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning":"先看目录"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Glob","arguments":"{\"glob_pattern\":\"**/*.go\"}"}}]},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":9}}`,
+	}
+	var all []types.StreamDelta
+	for _, c := range chunks {
+		evs, err := tr.translate([]byte(c))
+		if err != nil {
+			t.Fatalf("translate %q: %v", c, err)
+		}
+		all = append(all, evs...)
+	}
+	blocks := replayAnthropicBlocks(t, all)
+	if len(blocks) != 2 {
+		t.Fatalf("块数 = %d, 期望 2 (thinking + tool_use): %s", len(blocks), describeDeltas(all))
+	}
+	if blocks[0].kind != string(types.ContentBlockThinking) || blocks[0].thinking != "先看目录" {
+		t.Fatalf("thinking 块 = %+v", blocks[0])
+	}
+	if blocks[1].kind != string(types.ContentBlockToolUse) || blocks[1].name != "Glob" {
+		t.Fatalf("工具块 = %+v", blocks[1])
+	}
+	if got := blocks[1].args.String(); got != `{"glob_pattern":"**/*.go"}` {
+		t.Fatalf("工具入参 = %q", got)
+	}
+	// thinking 块不能被工具块覆盖: 引擎的 currentBlock 语义下, 忘了关 thinking 会让
+	// 推理文字落进工具块的 input 里 (或整块消失)。
+	if all[len(all)-1].Delta == nil || all[len(all)-1].Delta.StopReason != "tool_use" {
+		t.Fatalf("stop_reason 不对: %+v", all[len(all)-1])
+	}
+}
+
+// TestOpenAIStreamTranslatorReasoningAfterText 上游先发正文再发推理 (非标准但存在:
+// 某些代理会把 reasoning 重排到尾部)。此时 thinking 块必须关掉先前的正文块, 且
+// 两个块都得留住。
+func TestOpenAIStreamTranslatorReasoningAfterText(t *testing.T) {
+	tr := newOpenAIStreamTranslator("glm-5.1")
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"正文"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning":"事后补的推理"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+	}
+	var all []types.StreamDelta
+	for _, c := range chunks {
+		evs, err := tr.translate([]byte(c))
+		if err != nil {
+			t.Fatalf("translate %q: %v", c, err)
+		}
+		all = append(all, evs...)
+	}
+	blocks := replayAnthropicBlocks(t, all)
+	if len(blocks) != 2 {
+		t.Fatalf("块数 = %d, 期望 2: %s", len(blocks), describeDeltas(all))
+	}
+	if blocks[0].kind != string(types.ContentBlockText) || blocks[0].text != "正文" {
+		t.Fatalf("文本块 = %+v", blocks[0])
+	}
+	if blocks[1].kind != string(types.ContentBlockThinking) || blocks[1].thinking != "事后补的推理" {
+		t.Fatalf("thinking 块 = %+v", blocks[1])
+	}
+}
+
+// TestParseOpenAIResponseReasoningThinking 非流式路径: thinking 块必须排在正文前,
+// 否则 pkg/engine/runner.go 的 ExtractPlan (取首个 thinking 块) 拿不到东西, 且
+// thinking-only 回合会被 runner.go:428 的"空回复"判据判死。
+func TestParseOpenAIResponseReasoningThinking(t *testing.T) {
+	raw := `{"id":"chatcmpl-r","model":"step-5-preview-free","choices":[{"index":0,"message":{"role":"assistant","content":"9","reasoning":"设 x 为所求, x 的三倍是 ","reasoning_details":[{"type":"reasoning.text","text":"27, 所以 x=9","index":0}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":60}}`
+	resp, err := parseOpenAIResponse("step-5-preview-free", []byte(raw))
+	if err != nil {
+		t.Fatalf("parseOpenAIResponse: %v", err)
+	}
+	if len(resp.Content) != 2 {
+		t.Fatalf("块数 = %d, 期望 2 (thinking + text): %+v", len(resp.Content), resp.Content)
+	}
+	if resp.Content[0].Type != types.ContentBlockThinking {
+		t.Fatalf("首块应为 thinking, 实得 %q", resp.Content[0].Type)
+	}
+	// reasoning 是完整思维链, reasoning_details[0] 只是它的一片 —— 取最长的那一个,
+	// 不能把两段拼起来 (拼出来是 "设 x 为所求, x 的三倍是 27, 所以 x=927, 所以 x=9")。
+	if resp.Content[0].Thinking != "设 x 为所求, x 的三倍是 " {
+		t.Fatalf("thinking 内容 = %q, 期望 \"设 x 为所求, x 的三倍是 \" (details 是主字段的**子串**, "+
+			"不是独立内容)", resp.Content[0].Thinking)
+	}
+	if resp.Content[1].Type != types.ContentBlockText || resp.Content[1].Text != "9" {
+		t.Fatalf("正文块 = %+v", resp.Content[1])
+	}
+}
+
+// TestOpenAIContentToBlocksReasoningOnly 只有推理没有正文的回合: thinking 块必须独立
+// 存在。此前它会被整段丢掉, assistant 内容为 nil, runner 报 "assistant returned
+// empty content" —— 而那正是一个"模型想了很多但还没开口"的正常中间态。
+func TestOpenAIContentToBlocksReasoningOnly(t *testing.T) {
+	blocks := openAIContentToBlocks(json.RawMessage(`""`), nil, "只推理不答话")
+	if len(blocks) != 1 || blocks[0].Type != types.ContentBlockThinking || blocks[0].Thinking != "只推理不答话" {
+		t.Fatalf("reasoning-only 应产出单个 thinking 块, 实得 %+v", blocks)
+	}
+	// 没有推理时行为不能变 (旧路径的回归)。
+	plain := openAIContentToBlocks(json.RawMessage(`"hi"`), nil, "")
+	if len(plain) != 1 || plain[0].Type != types.ContentBlockText || plain[0].Text != "hi" {
+		t.Fatalf("无推理时行为回归: %+v", plain)
+	}
+}
+
 // describeDeltas 把事件序列压成一行, 失败时能直接看出形状。
 func describeDeltas(evs []types.StreamDelta) string {
 	var parts []string
@@ -353,4 +605,227 @@ func describeDeltas(evs []types.StreamDelta) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// --- 出站回传上一轮推理 (ReasoningPlayback) -------------------------------
+//
+// 背景: 网关是无状态的, 每一轮都把完整 messages[] 重新 POST 给上游
+// (runner.go:310), 所以上游从来没"见过"上一轮的思维链 —— 不是忘了, 是根本没收到。
+// 回传开关让那段已被网关收到并存进本地历史的数据继续往下游走。
+//
+// 这一组用例钉住三件事:
+//   1. 空值 = 一个字节都不多发 (与改造前逐字节相同);
+//   2. "reasoning" / "reasoning_content" 各写各的字段, 互不串台;
+//   3. 整段重发而非只发新片段, 且与 tool_calls / text 共存。
+
+// thinkingBlocks 造一条"上一轮真的会出现在 messages[] 里"的 assistant 消息:
+// thinking + text + tool_use 三块齐全。
+func thinkingBlocks() []types.ContentBlock {
+	return []types.ContentBlock{
+		{Type: types.ContentBlockThinking, Thinking: "先看 A 再决定 B"},
+		{Type: types.ContentBlockText, Text: "调 calc"},
+		{Type: types.ContentBlockToolUse, ID: "toolu_1", Name: "calc", Input: json.RawMessage(`{"a":2,"b":2}`)},
+	}
+}
+
+// TestAssistantBlocksThinkingDroppedByDefault 空开关: thinking 块必须一个字节都不外流。
+//
+// 这是"默认行为不变"的硬要求。变异靶: 把 `reasoningPlayback != ""` 从条件里去掉,
+// 或者把两个字段的 omitempty 去掉 —— 两者都会让本用例失败。
+func TestAssistantBlocksThinkingDroppedByDefault(t *testing.T) {
+	msgs, err := assistantBlocksToOpenAI(thinkingBlocks(), "")
+	if err != nil {
+		t.Fatalf("assistantBlocksToOpenAI: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message, got %d", len(msgs))
+	}
+	m := msgs[0]
+	if m.Reasoning != "" || m.ReasoningContent != "" {
+		t.Fatalf("空开关必须两个字段都为空, got reasoning=%q reasoning_content=%q", m.Reasoning, m.ReasoningContent)
+	}
+	if len(m.ToolCalls) != 1 {
+		t.Fatalf("tool_calls 应保持 1 个 (thinking 丢弃不该影响它), got %d", len(m.ToolCalls))
+	}
+	if m.Content != "调 calc" {
+		t.Fatalf("content 应保持 text 原值, got %v", m.Content)
+	}
+	// 走完整 JSON: 字节里连字段名都不该出现 (omitempty 的验收)。
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "reasoning") {
+		t.Fatalf("默认路径的 wire body 出现 reasoning 字段: %s", b)
+	}
+}
+
+// TestAssistantBlocksPlaybackReasoning 填 messages[].reasoning (opencode step-5 那侧)。
+func TestAssistantBlocksPlaybackReasoning(t *testing.T) {
+	msgs, err := assistantBlocksToOpenAI(thinkingBlocks(), ReasoningPlaybackReasoning)
+	if err != nil {
+		t.Fatalf("assistantBlocksToOpenAI: %v", err)
+	}
+	m := msgs[0]
+	if m.Reasoning != "先看 A 再决定 B" {
+		t.Fatalf("reasoning 字段错: %q", m.Reasoning)
+	}
+	if m.ReasoningContent != "" {
+		t.Fatalf("填 reasoning 时 reasoning_content 必须留空, got %q", m.ReasoningContent)
+	}
+	// 回传不该挤掉原有字段: text 与 tool_calls 都还得在。
+	if m.Content != "调 calc" || len(m.ToolCalls) != 1 {
+		t.Fatalf("回传推理时 text/tool_calls 丢了: content=%v calls=%d", m.Content, len(m.ToolCalls))
+	}
+	b, _ := json.Marshal(m)
+	if !strings.Contains(string(b), `"reasoning":"先看 A 再决定 B"`) {
+		t.Fatalf("wire body 缺 reasoning 字段: %s", b)
+	}
+}
+
+// TestAssistantBlocksPlaybackReasoningContent 填 messages[].reasoning_content
+// (DeepSeek/R1 那侧)。两个字段是互斥的: 同时填会让上游按错的那份推理接上下文。
+func TestAssistantBlocksPlaybackReasoningContent(t *testing.T) {
+	msgs, err := assistantBlocksToOpenAI(thinkingBlocks(), ReasoningPlaybackReasoningContent)
+	if err != nil {
+		t.Fatalf("assistantBlocksToOpenAI: %v", err)
+	}
+	m := msgs[0]
+	if m.ReasoningContent != "先看 A 再决定 B" {
+		t.Fatalf("reasoning_content 字段错: %q", m.ReasoningContent)
+	}
+	if m.Reasoning != "" {
+		t.Fatalf("填 reasoning_content 时 reasoning 必须留空, got %q", m.Reasoning)
+	}
+	b, _ := json.Marshal(m)
+	if !strings.Contains(string(b), `"reasoning_content":"先看 A 再决定 B"`) {
+		t.Fatalf("wire body 缺 reasoning_content 字段: %s", b)
+	}
+}
+
+// TestAssistantBlocksPlaybackMultipleThinkingConcatenated 多个 thinking 块要整段
+// 重发, 不是只发最后一段。
+//
+// 变异靶: 把 `reasoning.Len() > 0 { reasoning.WriteString("\n") }` 去掉, 或把
+// `reasoning.WriteString` 换成覆盖赋值。
+func TestAssistantBlocksPlaybackMultipleThinkingConcatenated(t *testing.T) {
+	blocks := []types.ContentBlock{
+		{Type: types.ContentBlockThinking, Thinking: "第一段"},
+		{Type: types.ContentBlockThinking, Thinking: "第二段"},
+	}
+	msgs, err := assistantBlocksToOpenAI(blocks, ReasoningPlaybackReasoning)
+	if err != nil {
+		t.Fatalf("assistantBlocksToOpenAI: %v", err)
+	}
+	want := "第一段\n第二段"
+	if msgs[0].Reasoning != want {
+		t.Fatalf("多段应整段拼接, want %q got %q", want, msgs[0].Reasoning)
+	}
+}
+
+// TestAssistantBlocksPlaybackEmptyThinkingNoField 空 thinking 块不该凭空产出一个
+// 空字符串字段 (omitempty 的验收: wire 上不留 `"reasoning":""`)。
+func TestAssistantBlocksPlaybackEmptyThinkingNoField(t *testing.T) {
+	blocks := []types.ContentBlock{
+		{Type: types.ContentBlockThinking}, // Thinking == ""
+		{Type: types.ContentBlockText, Text: "只有文字"},
+	}
+	msgs, err := assistantBlocksToOpenAI(blocks, ReasoningPlaybackReasoning)
+	if err != nil {
+		t.Fatalf("assistantBlocksToOpenAI: %v", err)
+	}
+	b, _ := json.Marshal(msgs[0])
+	if strings.Contains(string(b), "reasoning") {
+		t.Fatalf("空 thinking 不该产生 reasoning 字段: %s", b)
+	}
+}
+
+// TestAnthropicToOpenAIThreadsPlayback 端到端: 回传开关要能从 anthropicToOpenAI
+// 一路传到 messages[] 里那条历史 assistant 消息上。
+//
+// 这条盯的是"参数有没有真的串起来" —— 逐层传参漏一层, 只测
+// assistantBlocksToOpenAI 是发现不了的。
+func TestAnthropicToOpenAIThreadsPlayback(t *testing.T) {
+	req := types.APIRequest{
+		Model:     "step-5-preview-free",
+		MaxTokens: 1024,
+		Messages: []types.APIMessage{
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"上一轮的推理"},{"type":"text","text":"好的"}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"继续"}]`)},
+		},
+	}
+	oreq, err := anthropicToOpenAI(req, false, ReasoningPlaybackReasoning)
+	if err != nil {
+		t.Fatalf("anthropicToOpenAI: %v", err)
+	}
+	var found bool
+	for _, m := range oreq.Messages {
+		if m.Role == "assistant" && m.Reasoning == "上一轮的推理" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("回传没串到 messages[].reasoning: %+v", oreq.Messages)
+	}
+
+	// 同一条请求喂空开关, assistant 消息上一个相关字节都不该有。
+	oreq2, err := anthropicToOpenAI(req, false, "")
+	if err != nil {
+		t.Fatalf("anthropicToOpenAI(默认): %v", err)
+	}
+	for _, m := range oreq2.Messages {
+		if m.Role == "assistant" && (m.Reasoning != "" || m.ReasoningContent != "") {
+			t.Fatalf("默认路径漏出推理: %+v", m)
+		}
+	}
+}
+
+// TestWithModelKeepsPlayback WithModel 副本必须带走回传开关。
+//
+// plan/role 走的就是这条链: 主 client 按模型配置了 reasoningPlayback, 换模型名的
+// 副本若不带, 开关在副本上静默失效 —— 而失效的表现是"上游没收到推理", 不报错。
+func TestWithModelKeepsPlayback(t *testing.T) {
+	c := &Client{ReasoningPlayback: ReasoningPlaybackReasoning}
+	if got := c.WithModel("opencode:step-5-preview-free").ReasoningPlayback; got != ReasoningPlaybackReasoning {
+		t.Fatalf("WithModel 丢了 ReasoningPlayback: %q", got)
+	}
+	if got := c.ConfiguredCloneFull("http://x", "k", "m", nil, "", "").ReasoningPlayback; got != ReasoningPlaybackReasoning {
+		t.Fatalf("ConfiguredCloneFull 丢了 ReasoningPlayback: %q", got)
+	}
+}
+
+// TestBuildOpenAIRequestReadsClientField 从 Client 字段出发的收口测试。
+//
+// 上面几条都从 assistantBlocksToOpenAI / anthropicToOpenAI 喂字符串常量, 有一条
+// 链它们盖不住: buildOpenAIRequest 有没有真的把 c.ReasoningPlayback 读出来往下传。
+// 那段一旦写成常量 "" (或读错字段), 单测全绿而线上一个字节都不回传 —— 因为
+// 所有上游可见的现象都"没有", 而不是"出错"。所以必须有一例从 Client 起跳。
+func TestBuildOpenAIRequestReadsClientField(t *testing.T) {
+	req := types.APIRequest{
+		Model:     "step-5-preview-free",
+		MaxTokens: 1024,
+		Messages: []types.APIMessage{
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"推理"},{"type":"text","text":"ok"}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"go"}]`)},
+		},
+	}
+	c := &Client{ReasoningPlayback: ReasoningPlaybackReasoning}
+	oreq, body, err := c.buildOpenAIRequest(req, false)
+	if err != nil {
+		t.Fatalf("buildOpenAIRequest: %v", err)
+	}
+	if !strings.Contains(string(body), `"reasoning":"推理"`) {
+		t.Fatalf("Client.ReasoningPlayback 没传到 wire body: %s", body)
+	}
+	_ = oreq
+
+	// 反向: 同一个 client 结构的空值字段, wire 上什么都不能有。
+	c2 := &Client{}
+	_, body2, err := c2.buildOpenAIRequest(req, false)
+	if err != nil {
+		t.Fatalf("buildOpenAIRequest(默认): %v", err)
+	}
+	if strings.Contains(string(body2), "reasoning") {
+		t.Fatalf("默认 client 漏出推理: %s", body2)
+	}
 }

@@ -324,6 +324,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 	// 发 "opencode:xxx" 会被 401 拒)。判据是 ResolvedConfig.ViaGateway。
 	aiClient := api.NewClient(defaultResolved.BaseURL, defaultResolved.APIKey, defaultResolved.OutboundModelName())
 	aiClient.Protocol = defaultResolved.Protocol
+	aiClient.ReasoningPlayback = defaultResolved.ReasoningPlayback
 	aiClient.SetProxy(defaultResolved.Proxy) // 仅默认模型配置了 proxy 时启用 (如 muse-spark 经东京代理)
 	aiClient.Tag = "feishu"
 	if len(defaultResolved.FallbackModels) > 0 {
@@ -532,6 +533,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		} else {
 			advisorClient := api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.OutboundModelName())
 			advisorClient.Protocol = advResolved.Protocol
+			advisorClient.ReasoningPlayback = advResolved.ReasoningPlayback
 			advisorClient.SetProxy(advResolved.Proxy)
 			advisorClient.Tag = "advisor"
 			if advResolved.CallTimeoutSec > 0 {
@@ -562,6 +564,7 @@ func NewBot(config *BotConfig) (*Bot, error) {
 		} else {
 			planClient := api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.OutboundModelName())
 			planClient.Protocol = planResolved.Protocol
+			planClient.ReasoningPlayback = planResolved.ReasoningPlayback
 			planClient.SetProxy(planResolved.Proxy)
 			planClient.Tag = "plan"
 			if planResolved.CallTimeoutSec > 0 {
@@ -1067,6 +1070,11 @@ func (b *Bot) ReloadModelConfig(path string) error {
 		if rc.Protocol != "" {
 			b.apiClient.Protocol = rc.Protocol
 		}
+		// 与 Protocol 不同, 这一项**无条件**赋值: 空值的含义是"不回传", 它本身就是
+		// 合法终态 (而 Protocol 的空值会被上面那句挡掉, 因为空 = 默认 anthropic 由别处决定)。
+		// 若也加 if != "" 守卫, 配置里删掉 reasoningPlayback 之后这个 client 会一直留着
+		// 上一次的字段名 —— 热重载的语义是"以新配置为准", 不是"只加不减"。
+		b.apiClient.ReasoningPlayback = rc.ReasoningPlayback
 	}
 	if b.sessions != nil {
 		b.sessions.SetDefaultModelConfig(rc)
@@ -1397,13 +1405,15 @@ func (b *Bot) DashboardReloadSkills() {
 // 而那种差异不会报任何错。
 //
 // ★ 为什么是**重扫**而不是往现有 Set 里 Add 一份新解析的资产: Set.Add 的覆盖语义是
-//   后加载覆盖先加载 (user < project < state), 单独 Add 一份会把它放在"最后一个"的
-//   位置, 于是 state 里刚删掉的那一份仍然留在索引里 (它没有被任何东西移除), 而
-//   project/user 里的同名资产也永远浮不上来。重扫是唯一能让"覆盖关系"重新正确的做法。
+//
+//	后加载覆盖先加载 (user < project < state), 单独 Add 一份会把它放在"最后一个"的
+//	位置, 于是 state 里刚删掉的那一份仍然留在索引里 (它没有被任何东西移除), 而
+//	project/user 里的同名资产也永远浮不上来。重扫是唯一能让"覆盖关系"重新正确的做法。
 //
 // ★ 重扫会把同一个 *asset.Set 换成一个新的指针。这在**创建/删除**这种低频动作上
-//   是可以的: 换掉之后两个持有者都指向同一份新实例 (下面两句), 不存在"一半新一半旧"
-//   的窗口 —— 而高频路径 (每次请求) 读的是 agent.AgentCatalog(), 它自己带读写锁。
+//
+//	是可以的: 换掉之后两个持有者都指向同一份新实例 (下面两句), 不存在"一半新一半旧"
+//	的窗口 —— 而高频路径 (每次请求) 读的是 agent.AgentCatalog(), 它自己带读写锁。
 func (b *Bot) DashboardReloadAssets() {
 	if b.layout == nil {
 		return
@@ -3628,6 +3638,7 @@ func (b *Bot) handleAdvisorCommand(ctx context.Context, messageID, text string) 
 		}
 		client := api.NewClient(resolved.BaseURL, resolved.APIKey, resolved.OutboundModelName())
 		client.Protocol = resolved.Protocol
+		client.ReasoningPlayback = resolved.ReasoningPlayback
 		client.SetProxy(resolved.Proxy)
 		client.Tag = "advisor"
 		if resolved.CallTimeoutSec > 0 {
@@ -4112,7 +4123,10 @@ func buildModelConfigJSON(cfg *BotConfig) modelconfig.ConfigJSON {
 				PromptCacheMode: mc.PromptCacheMode,
 				ContextWindow:   mc.ContextWindow,
 				Protocol:        mc.Protocol,
-				Proxy:           mc.Proxy,
+				// 与 Protocol 同源: 这里漏一个字段, 配置热重载后这条链路上的回传开关
+				// 就永远停在零值 —— 而零值恰好是"不回传", 于是开关看起来"没生效"而不是报错。
+				ReasoningPlayback: mc.ReasoningPlayback,
+				Proxy:             mc.Proxy,
 			}
 		}
 		out.Providers[name] = modelconfig.ProviderConfig{

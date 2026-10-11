@@ -167,8 +167,8 @@ var (
 	flagCwd            string
 	flagFinalOnly      bool
 	flagEmitSession    bool
-	flagRunLabel       string // --run-label <名字> 本次 run 在轨迹页上的显示名 (空=回落成 session id)
-	flagAgent          string // --agent <名字> 以单个 agent 的身份运行本次任务 (角色名或 agent 资产名)
+	flagRunLabel       string   // --run-label <名字> 本次 run 在轨迹页上的显示名 (空=回落成 session id)
+	flagAgent          string   // --agent <名字> 以单个 agent 的身份运行本次任务 (角色名或 agent 资产名)
 	flagPlugins        []string // --plugin <名字> 启用插件包 (可重复); 展开其 agents/skills/hooks 并装进本次运行
 	flagAPIKey         string
 	flagBaseURL        string
@@ -3530,6 +3530,7 @@ func buildAdvisorClient(jsonCfg *feishu.JSONConfig, projectSettings *settings.Se
 		client = api.NewClient(advResolved.BaseURL, advResolved.APIKey, advResolved.OutboundModelName())
 	}
 	client.Protocol = advResolved.Protocol
+	client.ReasoningPlayback = advResolved.ReasoningPlayback
 	client.SetProxy(advResolved.Proxy)
 	client.Tag = "advisor"
 	if advResolved.CallTimeoutSec > 0 {
@@ -3561,6 +3562,7 @@ func buildPlanClient(jsonCfg *feishu.JSONConfig, alias string) (*api.Client, boo
 		client = api.NewClient(planResolved.BaseURL, planResolved.APIKey, planResolved.OutboundModelName())
 	}
 	client.Protocol = planResolved.Protocol
+	client.ReasoningPlayback = planResolved.ReasoningPlayback
 	client.SetProxy(planResolved.Proxy)
 	client.Tag = "plan"
 	if planResolved.CallTimeoutSec > 0 {
@@ -3835,6 +3837,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 		// 出站协议路由: anthropic(/messages) | openai(/chat/completions) | openai-responses(/responses)。
 		// 漏设会导致 chat/responses 模型 (glm/mimo/muse-spark) 全部被路由到 /messages 而失败。
 		apiClient.Protocol = resolvedModel.Protocol
+		apiClient.ReasoningPlayback = resolvedModel.ReasoningPlayback
 		// 模型级出站代理: 只有配置了 proxy 的模型 (如 muse-spark 走东京 tinyproxy) 走代理。
 		apiClient.SetProxy(resolvedModel.Proxy)
 		// 模型级超时覆盖 (本地 Ollama 解码慢, 配置中可调大)
@@ -4565,9 +4568,9 @@ type agentRunSpec struct {
 //
 // 查表顺序 (高 → 低):
 //
-//	1. agent 资产 (asset.Meta, 经 agentbind.BindAgentAsset) —— 它是"这个 agent"最强的
-//	   身份声明: 有正文、有档位、有权限档, 且可被下游按目录覆盖。
-//	2. 角色注册表 (pkg/agent.RoleRegistry) —— 93 个内置人格, 只有正文与技能。
+//  1. agent 资产 (asset.Meta, 经 agentbind.BindAgentAsset) —— 它是"这个 agent"最强的
+//     身份声明: 有正文、有档位、有权限档, 且可被下游按目录覆盖。
+//  2. 角色注册表 (pkg/agent.RoleRegistry) —— 93 个内置人格, 只有正文与技能。
 //
 // 两层都没命中就**报错**。绝不静默回落成"普通 run":
 // 回落会让一个拼错的 agent 名与一个正确的 agent 名从外面**完全不可区分** ——
@@ -4644,13 +4647,14 @@ func firstN(s []string, n int) []string {
 // agentTurnCap 摘出"这次跑的回合上限声明"。
 //
 // ★ 显式旗标 --max-turns 优先于 agent 自身的声明。这条优先级是必须的, 不是口味:
-//   实测在 --agent 路径上, --max-turns 2 / 5 / 不传 三种跑法发出的请求数**完全相同**
-//   (都是 151 = 150 轮兜底 + 1 次收尾), 也就是说缺了这一步时, 旗标在这条路径上
-//   是个只显示不生效的字段 —— 而调试台上它恰恰是用户最主要的调参手段。
-//   与 run 路径的 effectiveMaxTurns 同一条"flag 覆盖配置"纪律。
 //
-//   思考型角色的 1 轮短路仍在最前面 (由 cliStageMaxTurns 保证): 那条短路同时关掉
-//   工具循环, 绕开它会让 architect 这类角色拿到一个开着工具的多轮循环。
+//	实测在 --agent 路径上, --max-turns 2 / 5 / 不传 三种跑法发出的请求数**完全相同**
+//	(都是 151 = 150 轮兜底 + 1 次收尾), 也就是说缺了这一步时, 旗标在这条路径上
+//	是个只显示不生效的字段 —— 而调试台上它恰恰是用户最主要的调参手段。
+//	与 run 路径的 effectiveMaxTurns 同一条"flag 覆盖配置"纪律。
+//
+//	思考型角色的 1 轮短路仍在最前面 (由 cliStageMaxTurns 保证): 那条短路同时关掉
+//	工具循环, 绕开它会让 architect 这类角色拿到一个开着工具的多轮循环。
 func agentTurnCap(spec *agentRunSpec, longHorizonTurns int) int {
 	if flagMaxTurns > 0 {
 		return flagMaxTurns
