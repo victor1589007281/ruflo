@@ -44,12 +44,14 @@ import (
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/basedir"
+	"github.com/anthropic/claude-go/pkg/decision"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hotreload"
 	"github.com/anthropic/claude-go/pkg/worker"
 	"github.com/spf13/cobra"
 )
 
+// main 是 claude-go-worker 进程入口: 先初始化会话分片实验, 再把控制权交给 rootCmd。
 func main() {
 	// 会话分片 A/B (见 pkg/api/sessionshard.go)。worker 是团队阶段的真实执行体,
 	// 它的出站请求同样带会话头 —— 不在这里初始化, 实验就只覆盖 control 一侧,
@@ -63,6 +65,8 @@ func main() {
 	}
 }
 
+// rootCmd 装配 worker 命令行: 校验工作区档位与 cwd 一致、装载配置并关掉中心职责
+// (HTTP/cron), 然后用 feishu.NewBot 的执行体跑常驻拉取或一次性认领。
 func rootCmd() *cobra.Command {
 	var (
 		control       string
@@ -247,6 +251,16 @@ func rootCmd() *cobra.Command {
 				cancel()
 			}()
 
+			// 决策模型保活：Ollaya 默认对空闲模型到期卸载，CPU 上 snap:2b/jeb:4b 冷加载
+			// 是 10–17s，会撞 qualityGate 的 20s 预算并造成大面积 FellBack（实测
+			// with_jev_score 率只有 20%）。这里起一个后台 goroutine 每 3 分钟
+			// 发一次 1-token decide 续租（Decide 已带 keep_alive=24h，见 pkg/decision/warm.go）。
+			// 不设 CLAUDE_GO_DECISION_URL 就完全不启动 —— 本地调试/单元测试不引依赖。
+			if u := os.Getenv("CLAUDE_GO_DECISION_URL"); u != "" {
+				go decision.WarmModels(ctx, &decision.Client{BaseURL: u},
+					[]string{decision.ModelRecall, decision.ModelScore})
+			}
+
 			if strings.TrimSpace(claim) != "" {
 				return runClaim(ctx, w, strings.TrimSpace(claim), time.Duration(claimTimeoutS)*time.Second,
 					time.Duration(pollMS)*time.Millisecond)
@@ -326,6 +340,7 @@ func runClaim(ctx context.Context, w *worker.Worker, taskID string, timeout, pol
 	}
 }
 
+// defaultWorkerName 推导 worker 名: 优先 POD_NAME (K8s 注入), 否则 worker-<主机名>。
 func defaultWorkerName() string {
 	if pod := strings.TrimSpace(os.Getenv("POD_NAME")); pod != "" {
 		return pod
@@ -346,6 +361,7 @@ func warnSharedState(stateDir string) {
 	}
 }
 
+// isCanceled 判断错误是否为 context 取消 (含被包装成字符串的 "context canceled")。
 func isCanceled(err error) bool {
 	return err == context.Canceled || strings.Contains(err.Error(), "context canceled")
 }

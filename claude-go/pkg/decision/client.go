@@ -174,10 +174,15 @@ func (c *Client) maxRetries() int {
 }
 
 // decideRequest 是 /api/decide 的请求体。Questions 是 map[id]question。
+// KeepAlive 是 Ollaya 的续租参数（"24h"/"1h30m"/"300ms" 等）：本次调用会把该
+// 模型的过期窗口推后该时长。默认 24h——决策模型一旦加载，几乎都希望常驻
+// （CPU 冷加载 10–17s，按需加载会击穿 qualityGate 的 20s 预算）；要按需释放
+// 由 WarmModels 的反向调用方显式设置 0。
 type decideRequest struct {
 	Model     string              `json:"model"`
 	State     any                 `json:"state"`
 	Questions map[string]Question `json:"questions"`
+	KeepAlive string              `json:"keep_alive,omitempty"`
 }
 
 // Decide 用 model 对 state 做一次决策，返回按问题 id 键控的答案。
@@ -200,7 +205,14 @@ func (c *Client) Decide(ctx context.Context, model string, state any, questions 
 		}
 		qm[q.ID] = q
 	}
-	reqBody := decideRequest{Model: model, State: state, Questions: qm}
+	reqBody := decideRequest{
+		Model:     model,
+		State:     state,
+		Questions: qm,
+		// 默认 24h 续租：每次真实调用都把模型过期窗口推后一天，
+		// 配合 WarmModels 的 3 分钟心跳，模型在常驻 worker 上实际不会卸载。
+		KeepAlive: "24h",
+	}
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, &Error{Code: "INVALID_REQUEST", Message: err.Error(), Retryable: false}

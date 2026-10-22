@@ -43,8 +43,12 @@ type JevStatsResponse struct {
 	ByKind map[string]int `json:"by_kind"`
 	// ByModel 按决策模型统计条数（snap:2b / jeb:4b / ...）。
 	ByModel map[string]int `json:"by_model"`
-	// FellBack 是按 kind 统计的 fail-open 次数。
+	// FellBack 是按 kind 统计的 fail-open 次数（含 no_candidates 这类"没活干"的回退）。
 	FellBack map[string]int `json:"fell_back"`
+	// FellBackReal 是剔除 no_candidates 后的真实故障回退（超时/5xx/解析错）。
+	// 召回侧 5/6 的 FellBack 是 BM25 粗筛没出候选（本就无活可判），混在率里会把
+	// 29% 读成故障——面板应以本字段展示真实故障率。优化③。
+	FellBackReal map[string]int `json:"fell_back_real"`
 
 	// RecallDual 聚合 recall_dual：BM25 与 Jev 的一致性指标。
 	RecallDual JevRecallDualStats `json:"recall_dual"`
@@ -76,6 +80,15 @@ type JevRecallStats struct {
 	ConfidenceAvg float64 `json:"confidence_avg"`
 	ConfidenceP50 float64 `json:"confidence_p50"`
 	ConfidenceP95 float64 `json:"confidence_p95"`
+
+	// 优化④：候选相关性对照。置信度单独看无法区分「模型不自信」还是「候选库本来就没相关经验」，
+	// 需要候选池维度才能解读。
+	// CandidatesAvg 是每次召回喂给 Jev 的候选数均值。
+	CandidatesAvg float64 `json:"candidates_avg"`
+	// WithCandidates 是有候选（n_candidates>0）的召回条数；EmptyCandidates 是 no_candidates 条数。
+	// EmptyCandidates 占比高说明经验库对该任务覆盖不足——低置信的更可能原因是「没货」而非「模型不行」。
+	WithCandidates  int `json:"with_candidates"`
+	EmptyCandidates int `json:"empty_candidates"`
 }
 
 // JevQualityStats quality_gate 的聚合：核心对照是 length_conf（长度先验）vs jev_conf（真分数）。
@@ -213,14 +226,19 @@ func (s *Server) handleJevStats(w http.ResponseWriter, r *http.Request) {
 // aggregateJevStats 在内存里聚合流水。recs 按 at 升序假定（agentDB 是追加顺序）。
 func aggregateJevStats(recs []jevRecord, recentN int) *JevStatsResponse {
 	out := &JevStatsResponse{
-		ByKind:   map[string]int{},
-		ByModel:  map[string]int{},
-		FellBack: map[string]int{},
-		Latency:  map[string]JevLatencyStats{},
+		ByKind:       map[string]int{},
+		ByModel:      map[string]int{},
+		FellBack:     map[string]int{},
+		FellBackReal: map[string]int{},
+		Latency:      map[string]JevLatencyStats{},
 	}
 
 	latByKind := map[string][]int64{}
 	confidences := []float64{}
+
+	// 优化④：候选相关性对照的累计量。
+	var recallCandSum float64
+	var recallWithCand, recallEmptyCand int
 
 	var dualAgree, dualCount int
 	var overlapSum, top1MatchSum, uniqueJevSum float64
@@ -239,6 +257,11 @@ func aggregateJevStats(recs []jevRecord, recentN int) *JevStatsResponse {
 		}
 		if r.FellBack {
 			out.FellBack[r.Kind]++
+			// 优化③：no_candidates 是「BM25 粗筛没出候选，本就无活可判」，不是真实故障。
+			// 从 FellBackReal 剔除，让面板故障率读数回归真实（recall 的 5/6 FB 是这类）。
+			if reason, _ := r.Extra["reason"].(string); reason != "no_candidates" {
+				out.FellBackReal[r.Kind]++
+			}
 		}
 		if r.At != "" {
 			if t, err := time.Parse(time.RFC3339Nano, r.At); err == nil {
@@ -268,6 +291,15 @@ func aggregateJevStats(recs []jevRecord, recentN int) *JevStatsResponse {
 		case "recall":
 			if c, ok := r.Extra["jev_confidence"].(float64); ok {
 				confidences = append(confidences, c)
+			}
+			// 优化④：候选相关性对照。n_candidates 由 recall.go 在埋点时写入。
+			if nc, ok := r.Extra["n_candidates"].(float64); ok {
+				recallCandSum += nc
+				if nc > 0 {
+					recallWithCand++
+				} else {
+					recallEmptyCand++
+				}
 			}
 
 		case "quality_gate":
@@ -318,15 +350,25 @@ func aggregateJevStats(recs []jevRecord, recentN int) *JevStatsResponse {
 		}
 	}
 
-	// recall 置信度
-	if len(confidences) > 0 {
-		sort.Float64s(confidences)
-		out.Recall = JevRecallStats{
-			Count:         len(confidences),
-			ConfidenceAvg: avg(confidences),
-			ConfidenceP50: percentile(confidences, 0.5),
-			ConfidenceP95: percentile(confidences, 0.95),
+	// recall 置信度 + 候选相关性对照。置信度只对拿到真分数的样本算；
+	// 候选统计（优化④）按全部 recall 条数算，即使某条 FB 也计入候选池维度。
+	recallTotal := out.ByKind["recall"]
+	if len(confidences) > 0 || recallTotal > 0 {
+		rs := JevRecallStats{
+			Count:           len(confidences),
+			WithCandidates:  recallWithCand,
+			EmptyCandidates: recallEmptyCand,
 		}
+		if len(confidences) > 0 {
+			sort.Float64s(confidences)
+			rs.ConfidenceAvg = avg(confidences)
+			rs.ConfidenceP50 = percentile(confidences, 0.5)
+			rs.ConfidenceP95 = percentile(confidences, 0.95)
+		}
+		if n := recallWithCand + recallEmptyCand; n > 0 {
+			rs.CandidatesAvg = recallCandSum / float64(n)
+		}
+		out.Recall = rs
 	}
 
 	// quality_gate 聚合

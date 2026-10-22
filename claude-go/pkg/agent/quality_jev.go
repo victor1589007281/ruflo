@@ -22,9 +22,11 @@ import (
 )
 
 // qualityJevTimeout 是 qualityGate 双跑决策打分的超时上限。
-// 无 GPU 机器上 jeb:4b CPU 推理随子任务输出规模上升：实测输出 6–13KB 时单次 >8s；
-// 双跑是观察模式、不阻塞主路径，给 20s 上限换真数据，超过则放弃本次双跑（fail-open）。
-const qualityJevTimeout = 20 * time.Second
+// 无 GPU 机器上 jeb:4b CPU 推理随子任务输出规模上升：实测输出 6–13KB 时单次 >8s，
+// 20s 也不够（一次 6KB 输出实测 18s 拿到真分数、13KB 超过 20s 超时）。
+// 双跑是观察模式、不阻塞主路径（qualityGate 同步调用本函数），这里把上限抬到 60s
+// 换真数据；超出再 fail-open。生产化后应换 GPU 或更小模型，或把该路径改异步。
+const qualityJevTimeout = 60 * time.Second
 
 // jevScoreOutput 用决策模型给子任务输出打质量分，与长度先验并行（双跑）。
 //
