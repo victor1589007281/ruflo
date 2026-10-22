@@ -209,6 +209,7 @@ type recoverMiddleware struct {
 	handler http.Handler
 }
 
+// ServeHTTP 转发到内层 handler, 并用 recover 兜住 panic 转成 500 JSON。
 func (r recoverMiddleware) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer func() {
 		if err := recover(); err != nil {
@@ -221,6 +222,19 @@ func (r recoverMiddleware) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.handler.ServeHTTP(w, req)
 }
 
+// ListenAndServe 起独立监听 (Addr 来自 Config), 阻塞到 Serve 返回。
+//
+// 算法解读：
+//
+//	原理：先 net.Listen 拿到真实端口 (便于 Addr() 回报, 也避免 :0 场景下日志说谎),
+//	      再把 handler 包成 httpauth.Middleware(recoverMiddleware(mux)) 后交给 Serve。
+//	关键不变量：**鉴权必须在 recovery 之外** —— 未授权请求不进任何业务 handler,
+//	      连 panic 恢复路径都不该被它触发; 反过来若把 auth 放里层, 一个 panic 的
+//	      业务 handler 会先于鉴权执行。
+//	代价与边界：Middleware 是进程级包装, 只在本函数 (独立监听) 生效; 用 MountOn
+//	      嵌入外部 mux 时, 鉴权由宿主服务的中间件负责, 这里不参与。
+//	设计权衡：WarnIfExposed 只在启动时告警不阻断 —— 空 Secret 是刻意保留的 fail-open
+//	      语义 (见 pkg/httpauth 包注释), 暴露风险交给部署方判断。
 func (s *Server) ListenAndServe() error {
 	ln, err := net.Listen("tcp", s.cfg.Addr)
 	if err != nil {
@@ -257,10 +271,24 @@ func (s *Server) RegisterOn(mux *http.ServeMux) {
 	s.registerRoutesOn(mux)
 }
 
+// registerRoutes 把全部路由挂到本 Server 自己的 mux 上 (独立监听路径)。
 func (s *Server) registerRoutes() {
 	s.registerRoutesOn(s.mux)
 }
 
+// registerRoutesOn 把静态资源、全部 /api/* 与 SPA fallback 挂到给定 mux 上。
+//
+// 算法解读：
+//
+//	原理：一张扁平的 http.ServeMux 路由表 —— /static/ 走 embed 的 FileServer,
+//	      每条 /api/* 显式绑一个 handler, 最后 "/" 兜底成 SPA。
+//	关键不变量：同一个 pattern **不能注册两次** (ServeMux 会 panic), 所以
+//	      MountOn/RegisterOn 的调用方必须保证外部 mux 上没有冲突的 pattern;
+//	      注释里"更具体, 优先于下面"说的是**最长前缀匹配**的结果, 不是注册顺序。
+//	代价与边界：所有 /api/* 前缀由 pkg/httpauth 的 DefaultProtectPrefixes 统一保护,
+//	      这里不逐条声明鉴权 —— 新增端点只要落在 /api/ 下就自动被覆盖。
+//	设计权衡：/metrics 是唯一不走 /api/ 前缀的端点, 因此**不受**鉴权保护 (Prometheus
+//	      抓取端点的既定取舍); 需要保护时应在外层反代上做。
 func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	// 静态资源
 	sub, err := fs.Sub(webFS, "web")
@@ -322,6 +350,7 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/logs/stream", s.handleLogsStream)
 	mux.HandleFunc("/api/logs/tail", s.handleLogsTail)
 	mux.HandleFunc("/api/hivemind", s.handleHiveMind)
+	mux.HandleFunc("/api/jev/stats", s.handleJevStats) // Jev 决策层可观测聚合 (agentDB decision JSONL)
 	mux.HandleFunc("/api/timeseries/", s.handleTimeSeries) // /api/timeseries/:module/:metric
 	mux.HandleFunc("/api/actions/", s.handleAction)        // /api/actions/{kind}/{target}
 	mux.HandleFunc("/api/dreaming/diagnosis", s.handleDreamingDiagnosis)
@@ -369,6 +398,7 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 
 // ============== Handlers ==============
 
+// handleHealth 健康探针: 返回固定 ok/version 与 stateDir 是否存在。
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":       true,
@@ -379,6 +409,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleOverview 汇总首页概览 (provider 侧带 TTL 缓存)。
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.provider.BuildOverview()
 	if err != nil {
@@ -388,6 +419,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleTeams 列出全部团队 (列表视图)。
 func (s *Server) handleTeams(w http.ResponseWriter, r *http.Request) {
 	list, err := s.provider.ListTeams()
 	if err != nil {
@@ -397,6 +429,19 @@ func (s *Server) handleTeams(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// handleTeamDetail 处理 /api/teams/{name}[/{sub}...] 的子路径分派。
+//
+// 算法解读：
+//
+//	原理：手工切 URL 路径 —— parts[0] 是团队名, parts[1] 是子资源名, 其余片段
+//	      (media/artifacts 的文件相对路径) 原样透传给对应 handler。
+//	关键不变量：**团队名必填且不得为空** (parts[0] == "" 直接 404); 子资源名
+//	      走白名单 switch, 未列出的一律 404 —— 不做"猜测式"回退, 否则一个拼错的
+//	      子路径会静默拿到详情页。
+//	代价与边界：纯字符串切分, 不做 URL 解码外的规范化; 团队名的合法性 (防穿越)
+//	      由下游 handler 各自的 safeName 负责, 这里不重复校验。
+//	设计权衡：用 if/switch 而不是引入 router 库 —— 与整个 dashboard 的
+//	      net/http 原生风格一致, 代价是新增子资源必须同时改这里和 handler。
 func (s *Server) handleTeamDetail(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/teams/")
 	parts := strings.Split(rest, "/")
@@ -474,6 +519,7 @@ func (s *Server) execTeamActionDirect(w http.ResponseWriter, action, name string
 }
 
 // handleTeamRefine POST /api/teams/{name}/refine  body: {feedback, targetStage?}
+// handleTeamRefine 处理 POST /api/teams/{name}/refine: 把反馈交回团队做定向重跑。
 func (s *Server) handleTeamRefine(w http.ResponseWriter, r *http.Request, name string) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
@@ -494,6 +540,7 @@ func (s *Server) handleTeamRefine(w http.ResponseWriter, r *http.Request, name s
 }
 
 // handleTeamFork POST /api/teams/{name}/fork  body: {newName}
+// handleTeamFork 处理 POST /api/teams/{name}/fork: 以现有团队为模板复制出新团队。
 func (s *Server) handleTeamFork(w http.ResponseWriter, r *http.Request, name string) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
@@ -729,6 +776,7 @@ func (s *Server) workArtifactAllowed(spec agent.ArtifactScanSpec, rel string, mo
 	return false
 }
 
+// handleMetrics 列出全部模块的指标摘要。
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	list, err := s.provider.AllMetricSummaries()
 	if err != nil {
@@ -738,6 +786,17 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// handleMetricsModule 返回单模块的 events + summary 组合体 (?format=csv 时改出 CSV)。
+//
+// 算法解读：
+//
+//	原理：since 参数接受**两种写法** —— 时长 (如 "24h", 相对现在回溯) 或 RFC3339
+//	      绝对时刻; 先按时长解析, 失败再按时刻解析, 都不成立则 since 保持零值 (不限时间)。
+//	关键不变量：limit 与 since 只是**过滤条件**, 不改变 summary 的计算口径 —— summary
+//	      由 provider 侧独立算, 与 events 的分页窗口无关。
+//	代价与边界：默认 limit=2000; CSV 分支不做流式写出, 整段拼在内存里。
+//	设计权衡：events 与 summary 一次返回, 省掉前端两次请求; 代价是 summary 无法按
+//	      events 的 limit/since 对齐 (两者口径本就不同, 前端需自知)。
 func (s *Server) handleMetricsModule(w http.ResponseWriter, r *http.Request) {
 	module := strings.TrimPrefix(r.URL.Path, "/api/metrics/")
 	module = strings.Trim(module, "/")
@@ -797,6 +856,7 @@ func writeMetricsCSV(w http.ResponseWriter, module string, events []MetricEventD
 	}
 }
 
+// csvEscape 按 CSV 规则转义单个字段: 含逗号/换行/引号时整体加引号并把内层引号翻倍。
 func csvEscape(s string) string {
 	if strings.ContainsAny(s, ",\n\"") {
 		return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
@@ -804,6 +864,7 @@ func csvEscape(s string) string {
 	return s
 }
 
+// handleInsights 返回洞察聚合; ?llm=1 时额外附一段 LLM 摘要 (失败只记 LLMError, 不整体失败)。
 func (s *Server) handleInsights(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.provider.BuildInsights()
 	if err != nil {
@@ -822,6 +883,7 @@ func (s *Server) handleInsights(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleProjects 列出项目 (?root= 指定扫描根)。
 func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	root := r.URL.Query().Get("root")
 	list, err := s.provider.ListProjects(root)
@@ -878,6 +940,18 @@ func (s *Server) handleStreamOverview(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleCron 处理 /api/cron: GET 列表, POST 创建; 其余方法 405 并带 Allow 头。
+//
+// 算法解读：
+//
+//	原理：读路径**双源** —— 有活动调度器 (:18080 飞书进程) 时直接读它的内存态,
+//	      没有时回退读 cron_jobs.json (parser 已兼容 map/array 两种历史格式)。
+//	关键不变量：写路径**必须**有活动调度器, 否则返回 501 —— 写文件而不入调度器
+//	      会让任务"存在但永不执行", 那是本接口最该避免的假成功。
+//	代价与边界：内存态与文件可能短暂不一致 (内存态是权威); 创建时强制清空 job.ID,
+//	      ID 一律由调度器生成。
+//	设计权衡：用 501 (NotImplemented) 而非 503 —— 语义是"本实例没挂这项能力",
+//	      与"临时不可用"区分开, 调用方可据此决定是否改直连 :18080。
 func (s *Server) handleCron(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -1033,6 +1107,7 @@ func (s *Server) handleCronItem(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleDreaming 返回 dreaming (离线反思) 的最近产出。
 func (s *Server) handleDreaming(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.provider.LoadDreaming()
 	if err != nil {
@@ -1042,6 +1117,7 @@ func (s *Server) handleDreaming(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleEvolution 返回进化 (技能/资产晋升) 的最近状态。
 func (s *Server) handleEvolution(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.provider.LoadEvolution()
 	if err != nil {
@@ -1051,6 +1127,7 @@ func (s *Server) handleEvolution(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleTasks 列出任务列表 (来自状态目录的任务记录)。
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	list, err := s.provider.ListTasks()
 	if err != nil {
@@ -1060,6 +1137,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// handleIndex SPA fallback: 非 /api/ 非 /static/ 的路径一律吐内嵌的 index.html。
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	// 所有非 API / 非 static 路径返回 index.html (SPA)
 	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/static/") {
@@ -1078,6 +1156,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // ============== Helpers ==============
 
+// writeJSON 写 JSON 响应 (统一 no-store, 先落状态码再编码 body)。
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -1085,10 +1164,12 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeError 以统一错误体 (APIError) 返回非 2xx。
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, APIError{Error: err.Error()})
 }
 
+// parseIntQuery 取整数查询参数; 缺失或非法一律回落默认值 (不报错, 不让请求失败)。
 func parseIntQuery(r *http.Request, key string, def int) int {
 	v := r.URL.Query().Get(key)
 	if v == "" {
