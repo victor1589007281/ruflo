@@ -92,6 +92,7 @@ var dashboardContract = []apiEndpoint{
 	{Pattern: "/api/logs/stream", Probe: "/api/logs/stream"},
 	{Pattern: "/api/logs/tail", Probe: "/api/logs/tail"},
 	{Pattern: "/api/hivemind", Probe: "/api/hivemind"},
+	{Pattern: "/api/jev/stats", Probe: "/api/jev/stats"},
 	{Pattern: "/api/timeseries/", Probe: "/api/timeseries/llm/tokens", Prefix: true},
 	{Pattern: "/api/actions/", Probe: "/api/actions/team/run/demo", Prefix: true},
 	{Pattern: "/api/dreaming/diagnosis", Probe: "/api/dreaming/diagnosis"},
