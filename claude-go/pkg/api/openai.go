@@ -502,6 +502,7 @@ type openAIToolState struct {
 	started    bool
 }
 
+// newOpenAIStreamTranslator 构造流式翻译器; openTool 初始为 -1, 表示当前没有打开的工具块。
 func newOpenAIStreamTranslator(model string) *openAIStreamTranslator {
 	return &openAIStreamTranslator{model: model, toolBlocks: map[int]*openAIToolState{}, openTool: -1}
 }

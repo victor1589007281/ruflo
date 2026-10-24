@@ -83,6 +83,7 @@ func (ps *PheromoneStore) Load(domain string) ([]*PheromoneTrail, error) {
 	return trails, nil
 }
 
+// domainFile 把领域名映射成该领域的 JSONL 文件路径 (小写 + 空格转下划线; 空名回落 "general")。
 func (ps *PheromoneStore) domainFile(domain string) string {
 	safe := strings.ReplaceAll(strings.ToLower(domain), " ", "_")
 	if safe == "" {

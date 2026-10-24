@@ -39,6 +39,7 @@ type AdvisorOptions struct {
 	MaxOutputTokens int
 }
 
+// withDefaults 把未设置/越界的选项填成默认值 (次数 8 / 冷却 2 轮 / transcript 60000 / 输出 3000)。
 func (o AdvisorOptions) withDefaults() AdvisorOptions {
 	if o.MaxCallsPerSession <= 0 {
 		o.MaxCallsPerSession = 8
@@ -106,9 +107,13 @@ func NewAdvisorTool(client *api.Client, opts AdvisorOptions) *AdvisorTool {
 	return &AdvisorTool{client: client, opts: opts.withDefaults()}
 }
 
+// Name 返回工具名 advisor。
 func (t *AdvisorTool) Name() string        { return "advisor" }
+// Description 返回主模型看到的工具描述 (移植官方引导 prompt)。
 func (t *AdvisorTool) Description() string { return advisorDescription }
 
+// InputSchema 返回空参数 schema —— advisor 刻意无参数, 主模型既无法用问题框架带偏它,
+// 也无法只转发部分上下文。
 func (t *AdvisorTool) InputSchema() json.RawMessage {
 	// 无参数 (对齐官方)。additionalProperties:false 防止模型自作主张塞参数。
 	return json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
@@ -118,8 +123,10 @@ func (t *AdvisorTool) InputSchema() json.RawMessage {
 // 且建议必须基于最新历史，不应与写工具并发。
 func (t *AdvisorTool) IsConcurrencySafe(json.RawMessage) bool { return false }
 
+// IsReadOnly 返回 true: advisor 只做咨询, 不产生任何副作用。
 func (t *AdvisorTool) IsReadOnly(json.RawMessage) bool { return true }
 
+// CheckPermissions 返回 nil 表示不额外拦截 —— 只读咨询无需用户确认。
 func (t *AdvisorTool) CheckPermissions(json.RawMessage, *tool.ToolContext) *types.PermissionResult {
 	return nil // 只读咨询，无需确认
 }
@@ -192,6 +199,8 @@ func (t *AdvisorTool) Consult(ctx context.Context, messages []types.Message) (st
 	return advice, nil
 }
 
+// consultOnce 做一次 advisor LLM 调用: 序列化 transcript → 不带工具发一次请求 → 取文本块;
+// 文本为空时降级取 thinking 块尾部 (推理模型可能把预算全花在 thinking 上)。
 func (t *AdvisorTool) consultOnce(ctx context.Context, messages []types.Message, transcriptBudget int) (string, error) {
 	transcript := BuildAdvisorTranscript(messages, transcriptBudget)
 	apiMsgs := []types.APIMessage{{
@@ -246,6 +255,7 @@ func (t *AdvisorTool) CallCount() int {
 	return t.calls
 }
 
+// isPromptTooLong 判定错误是否为 prompt 超长 (先类型断言, 再按多种上游文案子串匹配)。
 func isPromptTooLong(err error) bool {
 	if err == nil {
 		return false
@@ -259,6 +269,7 @@ func isPromptTooLong(err error) bool {
 		strings.Contains(msg, "maximum context")
 }
 
+// countAssistantMessages 统计消息里 assistant 角色的条数 (冷却判定的轮数依据)。
 func countAssistantMessages(messages []types.Message) int {
 	n := 0
 	for _, m := range messages {
@@ -269,6 +280,7 @@ func countAssistantMessages(messages []types.Message) int {
 	return n
 }
 
+// mustMarshalBlocks 把内容块序列化成 JSON; 失败时退回一个空文本块, 调用方无需处理 error。
 func mustMarshalBlocks(blocks []types.ContentBlock) json.RawMessage {
 	data, err := json.Marshal(blocks)
 	if err != nil {
@@ -343,6 +355,8 @@ func BuildAdvisorTranscript(messages []types.Message, maxTokens int) string {
 	return header + strings.Join(parts, "\n")
 }
 
+// renderTranscriptEntry 把一条消息渲染成轨迹文本行: 按块类型分别渲染, 跳过 thinking
+// (主模型内部状态, 且部分后端不允许跨模型转发) 与 advisor 自身的调用块 (无参数、无结果)。
 func renderTranscriptEntry(msg types.Message) string {
 	var sb strings.Builder
 	role := string(msg.Type)

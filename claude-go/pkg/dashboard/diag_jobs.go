@@ -67,6 +67,7 @@ type diagJobStore struct {
 	max   int
 }
 
+// newDiagJobStore 创建作业登记表; max<=0 时保留最近 100 条。
 func newDiagJobStore(max int) *diagJobStore {
 	if max <= 0 {
 		max = 100
@@ -74,6 +75,7 @@ func newDiagJobStore(max int) *diagJobStore {
 	return &diagJobStore{jobs: map[string]*DiagJob{}, max: max}
 }
 
+// add 登记一个作业, 并按插入顺序淘汰最旧的, 使条目数不超过 max。
 func (s *diagJobStore) add(j *DiagJob) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -87,6 +89,7 @@ func (s *diagJobStore) add(j *DiagJob) {
 	}
 }
 
+// get 按 ID 取作业; 返回的是**内部指针**, 调用方读到的字段可能被后台 goroutine 并发改写。
 func (s *diagJobStore) get(id string) (*DiagJob, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -94,6 +97,7 @@ func (s *diagJobStore) get(id string) (*DiagJob, bool) {
 	return j, ok
 }
 
+// update 在写锁内对指定作业施加 mut; 作业已被淘汰时静默跳过。
 func (s *diagJobStore) update(id string, mut func(*DiagJob)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -102,6 +106,7 @@ func (s *diagJobStore) update(id string, mut func(*DiagJob)) {
 	}
 }
 
+// list 返回全部在册作业, 最新的排在最前。
 func (s *diagJobStore) list() []*DiagJob {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -131,6 +136,7 @@ type diagJobCreateResp struct {
 	Target string        `json:"target,omitempty"`
 }
 
+// handleDiagJobs 分派 /api/diag/jobs: GET 列历史作业, POST 新建作业, 其余 405。
 func (s *Server) handleDiagJobs(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -143,6 +149,8 @@ func (s *Server) handleDiagJobs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleDiagJobCreate 校验 kind/target 后登记作业并起后台 goroutine, 立即回 202 + jobID。
+// 请求体容错: 空 body 或非法 JSON 都不报错, 只当没传参数 (校验失败由 kind 必填兜住)。
 func (s *Server) handleDiagJobCreate(w http.ResponseWriter, r *http.Request) {
 	var req diagJobCreateReq
 	if r.Body != nil {
@@ -180,6 +188,7 @@ func (s *Server) handleDiagJobCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDiagJobDetail 返回单个作业的当前快照 (轮询用); 未知 ID 回 404。
 func (s *Server) handleDiagJobDetail(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/diag/jobs/")
 	id = strings.Trim(id, "/")
@@ -537,6 +546,7 @@ R1~R7 逐条, 证据=字段名+值, 不得杜撰.
 	}, err
 }
 
+// dirExists 路径存在且确实是目录 (文件不算)。
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
@@ -558,6 +568,8 @@ type dreamingTriggerResp struct {
 	Hint    string `json:"hint,omitempty"`
 }
 
+// handleDreamingTrigger 落一个 dream-*.json 触发文件到 .dashboard/triggers, 由主进程 watcher 消费。
+// 只负责"排队", 不保证被执行: 主进程没在跑时文件只是躺着, 故响应里带 hint 说明这一点。
 func (s *Server) handleDreamingTrigger(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("POST only"))

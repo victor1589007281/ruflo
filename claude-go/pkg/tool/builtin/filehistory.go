@@ -455,6 +455,7 @@ func checkpointAfterWrite(filePath string, tctx *tool.ToolContext) {
 	}
 }
 
+// sessionIDOf 从 ToolContext 取会话 ID; tctx 为 nil 时返回空串 (调用方据此跳过记录)。
 func sessionIDOf(tctx *tool.ToolContext) string {
 	if tctx == nil {
 		return ""

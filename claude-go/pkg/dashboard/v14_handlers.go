@@ -279,6 +279,7 @@ func (s *Server) handleLLMRate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// parseWindowList 解析逗号分隔的时间窗口列表 (单位秒), 丢弃非数字、<=0 与 >24h 的项。
 func parseWindowList(s string) []int {
 	parts := strings.Split(s, ",")
 	out := make([]int, 0, len(parts))
@@ -310,6 +311,8 @@ type llmGuardResp struct {
 	Hint []string `json:"hints,omitempty"`
 }
 
+// handleLLMGuard 返回限流器 (Guard) 与熔断器 (Circuit) 的实时快照, 顺带把本次采样写入
+// gauge 供时序图使用, 并生成人类可读的健康提示 (Hint)。
 func (s *Server) handleLLMGuard(w http.ResponseWriter, r *http.Request) {
 	client, profile, err := GetSharedLLMClient()
 	resp := llmGuardResp{
@@ -375,6 +378,7 @@ type catalogResp struct {
 	ByModule  map[string][]metrics.MetricDesc `json:"byModule"`
 }
 
+// handleMetricsCatalog 返回全部指标定义 (中英文), 并按 module 分组、module 名排序。
 func (s *Server) handleMetricsCatalog(w http.ResponseWriter, r *http.Request) {
 	cat := metrics.Catalog()
 	byMod := metrics.CatalogByModule()
@@ -428,6 +432,8 @@ type coverageResp struct {
 // coverageKey 指标覆盖查询的复合键。
 type coverageKey struct{ module, name string }
 
+// handleMetricsCoverage 做"声明 vs 实际采集"的全量对账: 逐指标给出 declared/collected/
+// lastValue/lastSeen, 并列出实际采集到但 catalog 未声明 (缺中英文) 的指标。
 func (s *Server) handleMetricsCoverage(w http.ResponseWriter, r *http.Request) {
 	cat := metrics.Catalog()
 	// Step 1: build declared index
@@ -857,6 +863,7 @@ type checkpointResp struct {
 	Checkpoints []agent.Checkpoint  `json:"checkpoints"`
 }
 
+// handleTeamCheckpoints 读取指定团队的 checkpoints.json (存在才读, 不存在则 Exists=false 且 Count=0)。
 func (s *Server) handleTeamCheckpoints(w http.ResponseWriter, r *http.Request, name string) {
 	dir := s.provider.pathIn("teams", name)
 	file := filepath.Join(dir, "checkpoints.json")

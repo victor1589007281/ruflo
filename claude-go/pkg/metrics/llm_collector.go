@@ -107,6 +107,7 @@ func GlobalLLMCollector() *Collector {
 	return llmGlobal
 }
 
+// recordLLMCall 为一次 LLM 调用构造标签集合, 并记录各维度指标(别名解析后 model 与 model_alias 分别打标)。
 func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 	modelAlias := firstNonEmptyStr(rec.Model, "unknown")
 	if aliasResolver != nil {
@@ -237,6 +238,14 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 	}
 }
 
+// recordPromptComponentMetrics 记录提示词各组成部分的字符数与估算 token, 并在有锚点时按占比再分配真实用量。
+//
+// 算法解读：
+//
+//	原理：先按固定分量表逐个记录启发式读数(chars, 以及 chars/4 的粗估 token); 再以真实 InputTokens 为锚, 按各分量的启发式占比把总量重新分配到各组件上。
+//	关键不变量：没有锚点(InputTokens<=0)时绝不发锚定分量——拿启发式冒充总量是设计上明文禁止的呈现方式。
+//	代价与边界：chars/4 对中文明显偏低; 占比再分配在分量全为 0 时无解, 因此零组件直接跳过。
+//	设计权衡：启发式与锚定两条轨并存, 分别回答「构成大概长什么样」与「这次调用里某个组件究竟吃掉多少」。
 func recordPromptComponentMetrics(c *Collector, rec api.LLMCallRecord, labels map[string]string, ts time.Time) {
 	parts := []struct {
 		name  string
@@ -326,6 +335,7 @@ func SampleGuardSnapshot(module string, g *GuardSample, cb *CircuitSample) {
 	}
 }
 
+// copyLabels 浅拷贝标签 map, 供调用方安全地追加维度而不污染共享标签。
 func copyLabels(src map[string]string) map[string]string {
 	out := make(map[string]string, len(src)+1)
 	for k, v := range src {
@@ -334,6 +344,9 @@ func copyLabels(src map[string]string) map[string]string {
 	return out
 }
 
+// firstNonEmptyStr 返回第一个非空字符串; 全都为空时返回空串。
+//
+// 注意：这里只判 == "" 而不过滤纯空白, 与 pkg/evolution/learners 里的同名函数口径不同(那个用 TrimSpace), 两者不可互换。
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {
@@ -343,6 +356,7 @@ func firstNonEmptyStr(vals ...string) string {
 	return ""
 }
 
+// intStr 把整数转成十进制字符串(避免为此引入 strconv 包)。
 func intStr(v int) string {
 	// 避免引入 strconv 包 (已经间接依赖但保持简洁)。
 	if v == 0 {

@@ -114,6 +114,7 @@ func NewPersistentMailbox(store statestore.StateStore, team string) *PersistentM
 	}
 }
 
+// Send 归一化后把消息追加到持久日志; 追加失败时累加 writeErr 计数并返回错误。
 func (p *PersistentMailbox) Send(msg MailMessage) error {
 	norm, err := normalizeMail(msg)
 	if err != nil {
@@ -145,6 +146,7 @@ func (p *PersistentMailbox) readAllLocked() []MailMessage {
 	return out
 }
 
+// Inbox 返回收件人匹配的全部消息, 不推进游标(可重复读取, 供展示用)。
 func (p *PersistentMailbox) Inbox(agent string) []MailMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -157,6 +159,14 @@ func (p *PersistentMailbox) Inbox(agent string) []MailMessage {
 	return out
 }
 
+// Take 取出该收件人在上次游标之后的新消息, 并把游标推进到日志末尾。
+//
+// 算法解读：
+//
+//	原理：游标记的是「已消费到日志的第几条」, 与收件人无关; 取出时只对游标之后的消息做收件人匹配, 最后无条件把游标推到当前日志长度。
+//	关键不变量：游标必须以「整条日志的位置」而非「该收件人的第几条」为单位——按后者记, 其他收件人的消息会让下标错位, 造成漏投或重复投。
+//	代价与边界：游标读失败时 fail-open 退回 0, 宁可重复投递也不丢消息; 日志被轮转/截断导致游标越界时退回末尾(丢弃历史而非重放)。
+//	设计权衡：每次 Take 都全量读日志再过滤, 换取「不必按收件人建索引」; 消息量大时应改成按收件人分片。
 func (p *PersistentMailbox) Take(agent string) ([]MailMessage, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -258,6 +268,14 @@ func truncateBytes(s string, max int) string {
 	return s[:cut]
 }
 
+// FormatMailboxForPrompt 把邮箱消息渲染成注入 prompt 的一段文本, 受条数与字节双预算约束。
+//
+// 算法解读：
+//
+//	原理：逐条拼接, 每轮先看「条数是否达上限」与「已用字节是否达预算」, 再用扣除表头与截断提示后的剩余字节截断本条正文。
+//	关键不变量：预算以**字节**为单位, 且截断必须回退到 UTF-8 字符边界——按 rune 截断会让中文超预算三倍(见 truncateBytes 的注释)。
+//	代价与边界：单条超长消息会被截成半个句子并标注「本条被预算截断」; 未注入的条数只汇总成一行提示, 不再逐条列举。
+//	设计权衡：表头只拼一次并复用于预算计算——同一字面量出现两处就会漂移, 而「超预算」这个失效方向不报错, 只是提示词悄悄变大。
 func FormatMailboxForPrompt(msgs []MailMessage) string {
 	if len(msgs) == 0 {
 		return ""

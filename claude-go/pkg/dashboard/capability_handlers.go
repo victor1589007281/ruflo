@@ -23,6 +23,9 @@ var (
 	cachedToolReg *tool.Registry
 )
 
+// toolRegistry 返回**展示用**的内置工具注册表 (sync.Once 惰性建一次, 只注册基础工具)。
+//
+// 与运行时那份注册表是两回事: 这里不注入 LLM/上下文, 只为了让能力中心列得出工具清单。
 func toolRegistry() *tool.Registry {
 	toolRegOnce.Do(func() {
 		cachedToolReg = tool.NewRegistry()
@@ -31,6 +34,7 @@ func toolRegistry() *tool.Registry {
 	return cachedToolReg
 }
 
+// projectCwd 从 StateDir 反推项目根 (StateDir 默认就是 <项目根>/.claude-go)。
 func (s *Server) projectCwd() string { return filepath.Dir(s.cfg.StateDir) }
 
 // roleRegistry 建**校验/展示用**的角色表, 来源与运行时那两个入口同一对 (21.8.12 W1)。
@@ -55,6 +59,10 @@ func (s *Server) roleRegistry() *agent.RoleRegistry {
 	return agent.NewRoleRegistryFor(s.projectCwd(), s.cfg.StateDir)
 }
 
+// freshSkillRegistry 每次调用都新建并重新加载一份技能注册表 (不缓存, 保证刚创建的技能立刻可见)。
+//
+// 三个来源: LoadDefaults 扫 cwd 与 HOME 下的 .claude{,-go}/skills, 再补一刀
+// stateDir/skills —— 后者是进化产物与自定义 skill 的落点, 不补就永远看不到。
 func (s *Server) freshSkillRegistry() *skills.Registry {
 	sr := skills.NewRegistry()
 	sr.LoadDefaults(s.projectCwd())
@@ -96,6 +104,9 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSkillDetail GET/DELETE /api/skills/{name}
+// handleSkillDetail GET/DELETE /api/skills/{name}: 取单个技能详情, 或删除非内置技能。
+//
+// 删除只对 stateDir/skills 下的目录生效 (路径必须含 "skills"), 内置技能直接 400 拒绝。
 func (s *Server) handleSkillDetail(w http.ResponseWriter, r *http.Request) {
 	name := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/skills/"), "/")
 	if name == "" {
@@ -139,6 +150,9 @@ type skillCreateInput struct {
 	AllowedTools []string `json:"allowed_tools,omitempty"`
 }
 
+// validSkillName 校验技能名: 非空、长度 <= 64、且只含小写字母/数字/连字符。
+//
+// 限制字符集不只是风格问题 —— 名字会直接当目录名用, 放开就等于开了路径穿越。
 func validSkillName(s string) bool {
 	if s == "" || len(s) > 64 {
 		return false
@@ -151,6 +165,9 @@ func validSkillName(s string) bool {
 	return true
 }
 
+// handleSkillCreate POST /api/skills: 把自定义 skill 写成 stateDir/skills/<name>/SKILL.md。
+//
+// 落盘后调 ReloadSkills 让运行中的会话立刻看到; 未注入该回调时静默跳过 (下次启动才生效)。
 func (s *Server) handleSkillCreate(w http.ResponseWriter, r *http.Request) {
 	var in skillCreateInput
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -186,6 +203,10 @@ func (s *Server) handleSkillCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "name": in.Name})
 }
 
+// buildSkillMarkdown 把表单输入拼成带 YAML frontmatter 的 SKILL.md 文本。
+//
+// description/when_to_use 都过 oneLine 压成单行 —— 多行值会把 frontmatter 的
+// 键值结构冲掉, 解析器读到的就是一堆认不出的键。
 func buildSkillMarkdown(in skillCreateInput) string {
 	var b strings.Builder
 	b.WriteString("---\n")
@@ -210,6 +231,7 @@ func buildSkillMarkdown(in skillCreateInput) string {
 	return b.String()
 }
 
+// oneLine 把任意文本压成单行 (换行与回车替换成空格, 再去掉首尾空白)。
 func oneLine(s string) string {
 	return strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " "))
 }
@@ -262,6 +284,7 @@ func (s *Server) handleSkillGenerate(w http.ResponseWriter, r *http.Request) {
 
 // ---- Tools ----
 
+// handleTools GET /api/tools: 列出内置工具的名称/描述/输入 schema。
 func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 	reg := toolRegistry()
 	type toolDTO struct {
@@ -279,6 +302,7 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 
 // ---- MCP ----
 
+// handleMCPServers GET /api/mcp-servers: 返回 MCP server 配置; 未注入时返回空数组而不是 null。
 func (s *Server) handleMCPServers(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.MCPServers == nil {
 		writeJSON(w, http.StatusOK, []interface{}{})
@@ -290,6 +314,10 @@ func (s *Server) handleMCPServers(w http.ResponseWriter, r *http.Request) {
 // ---- References (谁引用了) ----
 
 // handleReferences GET /api/references?skill=X | ?role=Y
+// handleReferences GET /api/references?skill=X | ?role=Y: 反向查引用关系。
+//
+// 两个方向: 给了 skill 就查"哪些角色用了它 → 这些角色又被哪些工作流阶段引用";
+// 给了 role 就查"它用了哪些技能 + 被哪些阶段引用"。两者都缺则 400。
 func (s *Server) handleReferences(w http.ResponseWriter, r *http.Request) {
 	rr := s.roleRegistry()
 	skill := strings.TrimSpace(r.URL.Query().Get("skill"))
@@ -343,6 +371,7 @@ func (s *Server) handleReferences(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusBadRequest, fmt.Errorf("需要 ?skill= 或 ?role= 参数"))
 }
 
+// containsStr 线性查找字符串是否在切片里 (集合很小, 不值得建 map)。
 func containsStr(arr []string, s string) bool {
 	for _, a := range arr {
 		if a == s {
@@ -353,6 +382,18 @@ func containsStr(arr []string, s string) bool {
 }
 
 // extractJSONObj 从可能含散文/代码块的文本里抽取首个平衡 JSON 对象。
+//
+// 算法解读：
+//
+//	原理：单遍扫描, 从第一个 `{` 起用 depth 计花括号配平, 归零处即为对象结束。
+//	      同时用 inStr/esc 两个状态位跟踪"当前是否在字符串字面量里、上一个字符
+//	      是否转义", 使字符串里的 `{`/`}`/`"` 不参与配平。
+//	关键不变量：字符串内的花括号必须被忽略 —— 漏掉状态机的话, 一个值里带 `}`
+//	      的 JSON 会提前截断, 而截断后的片段**可能仍是合法 JSON**, 于是错误静默。
+//	代价与边界：不认识注释、单引号字符串、嵌套模板串; 没有闭合的 `{` 时返回 ""。
+//	      它只负责"切出候选", 合法性由调用方的 json.Unmarshal 判定。
+//	设计权衡：不用正则 —— 正则无法处理任意深度的嵌套与转义; 也不整段 Unmarshal
+//	      重试 —— 那要枚举所有子串 (O(n²)) 且模型输出里常带前后缀散文。
 func extractJSONObj(s string) string {
 	start := strings.IndexByte(s, '{')
 	if start < 0 {

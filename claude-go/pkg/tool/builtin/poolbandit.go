@@ -99,6 +99,7 @@ type banditState struct {
 	RewardLines int64              `json:"reward_lines"`
 }
 
+// banditKey 把 (团队, 角色, 资产) 三元组用分隔符拼成后验表的键。
 func banditKey(team, role, asset string) string {
 	return team + keySep + role + keySep + asset
 }
@@ -272,6 +273,7 @@ type runAgg struct {
 	weightSum float64
 }
 
+// positive 判定该 run 的加权分是否为正; 无有效权重 (weightSum<=0) 时视为非正。
 func (a runAgg) positive() bool {
 	if a.weightSum <= 0 {
 		return false

@@ -54,8 +54,11 @@ func NewAdvisorCheckpointHook(consult AdvisorConsultFn, everyNTurns int, onLoop 
 	}
 }
 
+// Name 返回 hook 名 "advisor_checkpoint"。
 func (h *AdvisorCheckpointHook) Name() string  { return "advisor_checkpoint" }
+// Priority 返回执行优先级 95(处于 LoopDetectorResult 与 StopSignal 之间)。
 func (h *AdvisorCheckpointHook) Priority() int { return 95 } // LoopDetectorResult(90) 之后, StopSignal(100) 之前
+// Phases 声明本 hook 只挂在 PhasePostToolUse 阶段。
 func (h *AdvisorCheckpointHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePostToolUse}
 }

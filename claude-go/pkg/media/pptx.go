@@ -22,6 +22,19 @@ import (
 	"strings"
 )
 
+// buildSimplePPTX 把一列幻灯片 PNG 打包成最小可用的 Open XML .pptx。
+//
+// 算法解读：
+//
+//	原理：PPTX 是 ZIP + 固定骨架。先写内容类型表与 rels, 再按**幻灯片数**动态生成
+//	      presentation.xml 的 sldIdLst 与 rels (rId 从 10 起, 与写死的 rId1=master 错开),
+//	      最后逐页写 slideN.xml 与图片。每页版式都是"整页背景图"。
+//	关键不变量：**图片 rId 与 slide rels 里的 rId1 必须一一对应**; 且 [Content_Types].xml
+//	      必须为每一页都声明 Override, 少一页 PowerPoint 会拒绝打开整个文件。
+//	代价与边界：图片在内存里整张读入 (os.ReadFile) 再写 ZIP, 大图会吃内存; 单页读图
+//	      或创建条目失败时**静默 continue** —— 结果是页数变少但不报错。
+//	设计权衡：不引第三方 pptx 库, 用纯 Go + 字符串模板拼 XML; 代价是版式能力仅限于
+//	      "一张整页图", 没有占位符/文本/动画。
 func buildSimplePPTX(outPath string, slidePNGs []string) error {
 	if len(slidePNGs) == 0 {
 		return fmt.Errorf("无幻灯片图片")
@@ -155,6 +168,7 @@ func buildSimplePPTX(outPath string, slidePNGs []string) error {
 	return nil
 }
 
+// addFile 往 ZIP 里写一个文本条目; Create/Write 失败一律静默忽略 (返回 void)。
 func addFile(w *zip.Writer, name, content string) {
 	fw, err := w.Create(name)
 	if err != nil {

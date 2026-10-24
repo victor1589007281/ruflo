@@ -116,8 +116,11 @@ func (h *MemoryInjectHook) SetIndexMode(on bool) {
 // IndexMode 返回当前注入形态 (供遥测/测试断言, 不必读私有字段)。
 func (h *MemoryInjectHook) IndexMode() bool { return h.indexMode.Load() }
 
+// Name 返回 hook 名 "memory_inject"。
 func (h *MemoryInjectHook) Name() string                { return "memory_inject" }
+// Priority 返回执行优先级 50。
 func (h *MemoryInjectHook) Priority() int               { return 50 }
+// Phases 声明本 hook 只在 PhasePreRequest 阶段生效。
 func (h *MemoryInjectHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreRequest}
 }
@@ -319,8 +322,11 @@ func NewPromptCacheHook(cache *PromptCacheBuilder, metrics *EngineMetrics) *Prom
 	return &PromptCacheHook{cache: cache, metrics: metrics}
 }
 
+// Name 返回 hook 名 "prompt_cache"。
 func (h *PromptCacheHook) Name() string                { return "prompt_cache" }
+// Priority 返回执行优先级 55 (排在 memory_inject 之后)。
 func (h *PromptCacheHook) Priority() int               { return 55 }
+// Phases 声明本 hook 只在 PhasePreRequest 阶段生效。
 func (h *PromptCacheHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreRequest}
 }

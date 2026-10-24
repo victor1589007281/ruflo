@@ -14,6 +14,9 @@ jd_title: 高级 Go 存储研发工程师
 company: 云锻科技
 team_name: if-jd-analysis-e694e6e47758`
 
+// main 复现团队 stage 注入的记忆块并打印各段字符数, 用于核对 memory_chars 口径。
+//
+// 注意：defer recover() 把 panic 静默吞掉 —— 探针崩了就只留半截输出, 退出码仍是 0。
 func main() {
 	defer func() { recover() }()
 	dir := "/tmp/memprobe/memory"

@@ -34,14 +34,18 @@ type globInput struct {
 
 type GlobTool struct{}
 
+// NewGlobTool 构造 Glob 工具。
 func NewGlobTool() *GlobTool { return &GlobTool{} }
 
+// Name 返回工具名 "Glob"。
 func (t *GlobTool) Name() string { return GlobToolName }
 
+// Description 返回工具描述 (英文, 与 TS 源码保持一致)。
 func (t *GlobTool) Description() string {
 	return `Tool to search for files matching a glob pattern. Returns matching file paths sorted by modification time.`
 }
 
+// InputSchema 返回 JSON Schema (glob_pattern 必填, target_directory / limit 可选)。
 func (t *GlobTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -54,8 +58,11 @@ func (t *GlobTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true —— Glob 只遍历文件系统, 不写任何东西。
 func (t *GlobTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 恒为 true —— 无共享可变状态, 多次调用互不干扰。
 func (t *GlobTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+// CheckPermissions 不额外设限, 交回通用权限流程。
 func (t *GlobTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }

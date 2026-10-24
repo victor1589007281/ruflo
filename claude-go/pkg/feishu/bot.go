@@ -70,18 +70,23 @@ type dagTaskAdapter struct {
 	store *builtin.TaskStore
 }
 
+// AddTask 创建无依赖的任务, 直接委托给 V2 TaskStore。
 func (d *dagTaskAdapter) AddTask(subject, description, owner string) (string, error) {
 	return d.store.AddTask(subject, description, owner)
 }
+// SetTaskStatus 更新任务状态, 直接委托给 V2 TaskStore。
 func (d *dagTaskAdapter) SetTaskStatus(id, status string) error {
 	return d.store.SetTaskStatus(id, status)
 }
+// AddTaskWithDeps 创建带依赖与优先级的任务, 直接委托给 V2 TaskStore。
 func (d *dagTaskAdapter) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
 	return d.store.AddTaskWithDeps(subject, description, owner, dependsOn, priority)
 }
+// AddTaskFull 创建带依赖/优先级/写作用域的任务, 直接委托给 V2 TaskStore。
 func (d *dagTaskAdapter) AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error) {
 	return d.store.AddTaskFull(subject, description, owner, dependsOn, priority, writeScopes)
 }
+// ReadyTasks 返回依赖已满足的可执行任务, 并把 builtin.TaskSummary 逐字段转成 agent.DAGTaskSummary。
 func (d *dagTaskAdapter) ReadyTasks() []agent.DAGTaskSummary {
 	v2Tasks := d.store.ReadyTasks()
 	result := make([]agent.DAGTaskSummary, len(v2Tasks))
@@ -94,9 +99,11 @@ func (d *dagTaskAdapter) ReadyTasks() []agent.DAGTaskSummary {
 	}
 	return result
 }
+// SetTaskStatusAndUnblock 更新任务状态并解锁因此就绪的后继任务, 返回被解锁的任务数。
 func (d *dagTaskAdapter) SetTaskStatusAndUnblock(id, status string) (int, error) {
 	return d.store.SetTaskStatusAndUnblock(id, status)
 }
+// GetAllTasks 返回全部任务 (含已完成), 并把 builtin.TaskSummary 逐字段转成 agent.DAGTaskSummary。
 func (d *dagTaskAdapter) GetAllTasks() []agent.DAGTaskSummary {
 	v2Tasks := d.store.GetAllTasks()
 	result := make([]agent.DAGTaskSummary, len(v2Tasks))
@@ -109,6 +116,7 @@ func (d *dagTaskAdapter) GetAllTasks() []agent.DAGTaskSummary {
 	}
 	return result
 }
+// ReevaluateBlockedTasks 重算被阻塞任务的可执行性 (依赖已满足的转就绪), 返回状态变化的任务数。
 func (d *dagTaskAdapter) ReevaluateBlockedTasks() int {
 	return d.store.ReevaluateBlockedTasks()
 }
@@ -119,6 +127,8 @@ type memoryAdapter struct {
 	store *memory.TieredStore
 }
 
+// AddTeamMemory 把团队产出写入高权重长期记忆 (Importance 0.9): 摘要截断到 3000 字符,
+// 完整原文另存为快照, 供模型需要时按 Ref 取回。
 func (ma *memoryAdapter) AddTeamMemory(teamName, workflow, objective, summary, original string) {
 	if ma.store == nil {
 		return
@@ -144,10 +154,12 @@ type wikiBrowserAdapter struct {
 	client *browser.Client
 }
 
+// Available 报告底层浏览器客户端是否可用 (不可用时 wiki 抓取会走降级路径)。
 func (w *wikiBrowserAdapter) Available() bool {
 	return w.client.Available()
 }
 
+// Fetch 抓取指定 URL 并返回标题/正文/HTML; 失败时三者均为空串。
 func (w *wikiBrowserAdapter) Fetch(ctx context.Context, url string) (title, text, html string, err error) {
 	result, err := w.client.Fetch(ctx, url)
 	if err != nil {
@@ -156,6 +168,7 @@ func (w *wikiBrowserAdapter) Fetch(ctx context.Context, url string) (title, text
 	return result.Title, result.Text, result.HTML, nil
 }
 
+// Search 按查询词检索并返回标题/正文/HTML; 失败时三者均为空串。
 func (w *wikiBrowserAdapter) Search(ctx context.Context, query string) (title, text, html string, err error) {
 	result, err := w.client.Search(ctx, query)
 	if err != nil {
@@ -169,6 +182,7 @@ type browserSearchAdapter struct {
 	client *browser.Client
 }
 
+// Search 把 browser.Client 适配成 builtin.WebSearcher, 返回标题/正文/HTML。
 func (a *browserSearchAdapter) Search(ctx context.Context, query string) (title, text, html string, err error) {
 	result, err := a.client.Search(ctx, query)
 	if err != nil {
@@ -177,6 +191,7 @@ func (a *browserSearchAdapter) Search(ctx context.Context, query string) (title,
 	return result.Title, result.Text, result.HTML, nil
 }
 
+// RecordSession 把会话摘要转成 dreaming.SessionRecord 记录, 供 Dreaming 引擎择机整理; dreamer 未注入时静默跳过。
 func (da *dreamAdapter) RecordSession(record agent.DreamSessionRecord) {
 	if da.dreamer == nil {
 		return
@@ -188,6 +203,7 @@ func (da *dreamAdapter) RecordSession(record agent.DreamSessionRecord) {
 	})
 }
 
+// AfterQuery 在一次查询结束后触发 Dreaming 的整理判定; dreamer 未注入时静默跳过。
 func (da *dreamAdapter) AfterQuery(ctx context.Context) {
 	if da.dreamer == nil {
 		return
@@ -947,6 +963,8 @@ func (b *Bot) initMCPServers(config *BotConfig) {
 	}
 }
 
+// addMCPServerWithTimeout 在 30 秒超时内注册一个 MCP server; 失败只记日志,
+// 不中断机器人启动 (缺一个 MCP 不应让整机起不来)。
 func (b *Bot) addMCPServerWithTimeout(parent context.Context, sc mcp.ServerConfig) {
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
@@ -1463,6 +1481,7 @@ type botCronExecutor struct {
 	bot *Bot
 }
 
+// RunWorkflow 供定时任务调用: 先按工作流建团队, 再同步运行到结束。
 func (e *botCronExecutor) RunWorkflow(ctx context.Context, name, workflow, objective, chatID string) error {
 	_, err := e.bot.teamMgr.CreateTeam(name, workflow, objective, chatID)
 	if err != nil {
@@ -1471,6 +1490,7 @@ func (e *botCronExecutor) RunWorkflow(ctx context.Context, name, workflow, objec
 	return e.bot.teamMgr.RunTeam(name, objective)
 }
 
+// SendQuery 供定时任务调用: 把消息交给会话管理器处理并返回回复文本。
 func (e *botCronExecutor) SendQuery(ctx context.Context, chatID, message string) (string, error) {
 	return e.bot.sessions.ProcessMessage(ctx, chatID, message)
 }
@@ -1481,6 +1501,7 @@ func (e *botCronExecutor) SendQueryWithModel(ctx context.Context, chatID, messag
 	return e.bot.sessions.ProcessMessageWithModel(ctx, chatID, message, model)
 }
 
+// RunCommand 供定时任务调用: 把命令当普通消息处理, 丢弃回复文本只返回错误。
 func (e *botCronExecutor) RunCommand(ctx context.Context, chatID, command string) error {
 	_, err := e.bot.sessions.ProcessMessage(ctx, chatID, command)
 	return err
@@ -1522,10 +1543,12 @@ func (e *botCronExecutor) TriggerSync(ctx context.Context, source string) (strin
 		res.Created, res.Updated, res.Unchanged, res.Deleted, res.Errors), nil
 }
 
+// Notify 把通知文本按飞书长度上限分片发送到指定会话。
 func (e *botCronExecutor) Notify(chatID, message string) {
 	e.bot.sendLongMessage(context.Background(), chatID, message)
 }
 
+// WikiOrganize 执行知识库整理: mode=="incremental" 走增量, 否则全量; 返回更新页数与整理日志。
 func (e *botCronExecutor) WikiOrganize(ctx context.Context, mode string) (string, error) {
 	if e.bot.wikiEngine == nil {
 		return "", fmt.Errorf("wiki 引擎未初始化")
@@ -1543,6 +1566,7 @@ func (e *botCronExecutor) WikiOrganize(ctx context.Context, mode string) (string
 	return fmt.Sprintf("更新 %d 个页面\n%s", result.UpdatedPages, result.Log), nil
 }
 
+// WikiHealthCheck 执行知识库体检并返回报告摘要。
 func (e *botCronExecutor) WikiHealthCheck(ctx context.Context) (string, error) {
 	if e.bot.wikiEngine == nil {
 		return "", fmt.Errorf("wiki 引擎未初始化")
@@ -1554,6 +1578,7 @@ func (e *botCronExecutor) WikiHealthCheck(ctx context.Context) (string, error) {
 	return report.Summary, nil
 }
 
+// WikiLint 执行知识库静态检查, 返回页面/原始文件/坏链/孤立页的计数摘要。
 func (e *botCronExecutor) WikiLint(ctx context.Context) (string, error) {
 	if e.bot.wikiEngine == nil {
 		return "", fmt.Errorf("wiki 引擎未初始化")
@@ -1578,6 +1603,23 @@ func (e *botCronExecutor) WikiLint(ctx context.Context) (string, error) {
 //  6. 发送处理中提示 → 等待结果 → 发送回复
 //
 // 注意: 此回调必须在 3 秒内返回, 所以 AI 处理放在 goroutine 中
+//
+// 算法解读：
+//
+//	原理：一条飞书事件可能被重复投递多次 (webhook 重试、长连接重连后的补投),
+//	      而重复处理的代价不是"多回一条消息", 而是**多创建一个团队** —— 那会真的
+//	      起 goroutine、真的烧 token。所以在进入业务逻辑之前用三层判据把重投挡掉:
+//	      ① messageID 精确去重 (保留 30 分钟, 覆盖飞书重试窗口);
+//	      ② 消息时间戳超过 10 分钟直接丢弃 (覆盖延迟投递);
+//	      ③ chatID+正文 的内容指纹在 5 秒内视为重投。
+//	关键不变量：三层判据必须在任何有副作用的调用**之前**全部跑完, 且"查重"与
+//	      "记录"必须是一次原子的 LoadOrStore —— 拆成先 Load 再 Store, 两条并发
+//	      重投会同时判为"没处理过"而双双通过。
+//	代价与边界：指纹层只看 chatID+正文, 因此用户在 5 秒内**主动**重发同一句话会被
+//	      吞掉 (超过 5 秒则放行, 见函数内注释); processedMsgs 是进程内 sync.Map,
+//	      多副本部署时各副本各自去重, 跨副本的重投仍可能穿透。
+//	设计权衡：没有引入消息序号/水位线 (飞书不保证单调递增), 也没有做持久化去重 ——
+//	      那会给每个事件加一次落盘 IO, 而三层内存判据已覆盖实际观察到的重投形态。
 func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
 	if event == nil || event.Event == nil || event.Event.Message == nil {
 		return nil
@@ -1697,6 +1739,8 @@ func (b *Bot) onMessageReceive(ctx context.Context, event *larkim.P2MessageRecei
 		}
 		// 超过 5 秒的相同内容视为用户主动重发, 允许处理
 		b.processedMsgs.Store(fpKey, time.Now().Unix())
+		// 时间戳被刷新成"这一次": 于是间隔 >5s 的连续重发都能通过, 且每次都把窗口
+		// 往后推 —— 只有用户停手 5 秒以上, 后续那条才可能再被当作重投挡掉。
 	}
 
 	// 定期清理 (messageID 保留 30 分钟覆盖飞书重试窗口, 指纹仅保留 60 秒)
@@ -2328,6 +2372,19 @@ func ExtractInteractiveContent(content string) (text string, urls []string) {
 	return strings.TrimSpace(sb.String()), urls
 }
 
+// extractFromJSON 递归遍历任意嵌套的卡片 JSON, 把白名单 key 上的文本与 URL 抽出来。
+//
+// 算法解读：
+//
+//	原理：飞书 interactive/post 卡片是无 schema 的嵌套 JSON, 文案可能出现在对象、
+//	      数组或数组里的字符串元素中。这里做一次无 schema 的递归下降: 逐个 key 试探
+//	      字符串 / 子对象 / 数组三种形态, 命中白名单 key 才取值。
+//	关键不变量：只取白名单 key (textKeys/urlKeys) 的值, 不做任何"位置推断" ——
+//	      否则卡片里的按钮 id、回调 token 也会被当成正文喂给模型。
+//	代价与边界：白名单是硬编码的, 飞书新增卡片字段不会被识别; 递归没有深度上限,
+//	      极端嵌套的卡片理论上会加深调用栈。
+//	设计权衡：宁可漏 (少提取一段文案) 也不可多 —— 多提取的内容会直接进模型上下文,
+//	      而用户在飞书里看到的卡片与模型看到的正文对不上时极难归因。
 func extractFromJSON(m map[string]json.RawMessage, sb *strings.Builder, urls *[]string) {
 	textKeys := []string{"title", "content", "text", "value", "label", "tag_content", "alt", "description", "summary"}
 	urlKeys := []string{"url", "href", "multi_url", "android_url", "ios_url", "pc_url"}
@@ -2349,6 +2406,8 @@ func extractFromJSON(m map[string]json.RawMessage, sb *strings.Builder, urls *[]
 			continue
 		}
 
+		// 字符串 / 对象 / 数组依次试探; 三者都解不出的值 (数字、布尔、null) 直接跳过,
+		// 不会被当成正文 —— 卡片里的宽高、状态码这类数字不应进模型上下文。
 		var subMap map[string]json.RawMessage
 		if json.Unmarshal(val, &subMap) == nil {
 			extractFromJSON(subMap, sb, urls)
@@ -2373,6 +2432,7 @@ func extractFromJSON(m map[string]json.RawMessage, sb *strings.Builder, urls *[]
 	}
 }
 
+// truncateResult 按**字符** (而非字节) 截断字符串并追加省略号; 未超长时原样返回。
 func truncateResult(s string, max int) string {
 	r := []rune(s)
 	if len(r) <= max {
@@ -2405,6 +2465,7 @@ func DetectWikiIntent(text string) string {
 	return ""
 }
 
+// removeWikiKeywords 剥掉"收藏到 wiki"一类意图关键词, 返回待入库的正文; 与 DetectWikiIntent 的关键词表同源。
 func removeWikiKeywords(text string) string {
 	lower := strings.ToLower(text)
 	for _, kw := range []string{"收藏到wiki", "收藏到知识库", "保存到wiki", "保存到知识库", "存到wiki", "添加到wiki", "加入wiki", "wiki收藏"} {
@@ -2413,6 +2474,7 @@ func removeWikiKeywords(text string) string {
 	return strings.TrimSpace(lower)
 }
 
+// removeWikiQueryKeywords 剥掉"从 wiki 查"一类意图关键词, 剩下的就是真正的问题。
 func removeWikiQueryKeywords(text string) string {
 	lower := strings.ToLower(text)
 	for _, kw := range []string{"从wiki查", "从知识库查", "wiki查询", "知识库查询", "问问wiki", "问下知识库", "wiki里有没有"} {
@@ -2424,6 +2486,7 @@ func removeWikiQueryKeywords(text string) string {
 // extractURLs 从文本中提取 HTTP(S) URL。
 var urlRegexp = regexp.MustCompile(`https?://[^\s<>"{}|\\^` + "`" + `\[\]]+`)
 
+// extractURLs 用正则从文本中提取全部 HTTP(S) URL (按出现顺序, 允许重复)。
 func extractURLs(text string) []string {
 	return urlRegexp.FindAllString(text, -1)
 }
@@ -2785,6 +2848,8 @@ func (b *Bot) handleSkillCommand(ctx context.Context, chatID, messageID, text st
 	}
 }
 
+// handleRoleCommand 处理 /role 命令: list 列出全部角色, show <name> 展示该角色解析后
+// 实际注入的技能与预计注入字符数 (用于核对角色→技能的绑定是否与预期一致)。
 func (b *Bot) handleRoleCommand(ctx context.Context, messageID, text string) {
 	if b.sessions == nil || b.sessions.roleRegistry == nil {
 		b.sendTextReply(ctx, messageID, "角色注册表未初始化。")
@@ -2831,6 +2896,7 @@ func (b *Bot) handleRoleCommand(ctx context.Context, messageID, text string) {
 	}
 }
 
+// formatNames 把名字列表拼成逗号分隔的一行; 空列表显示 (none) 而不是空串。
 func formatNames(items []string) string {
 	if len(items) == 0 {
 		return "(none)"
@@ -3656,6 +3722,8 @@ func (b *Bot) handleAdvisorCommand(ctx context.Context, messageID, text string) 
 	}
 }
 
+// handleCwdCommand 处理 /cwd 命令: 无参数时显示当前工作目录, set <path> 时校验路径存在后
+// 临时切换 cwd 并清空当前会话 (团队与会话都按新目录重建)。
 func (b *Bot) handleCwdCommand(ctx context.Context, chatID, messageID, text string) {
 	parts := strings.Fields(text)
 	if len(parts) == 1 {

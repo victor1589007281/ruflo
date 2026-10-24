@@ -100,6 +100,10 @@ func (ptm *ProductionTeamManager) writeGateSpan(ctx context.Context, team *Produ
 	})
 }
 
+// gateStatusLabel 把门禁结果映射成轨迹状态标签: skipped / pass / fail。
+//
+// 顺序有讲究: skipped 优先于 pass —— 门禁没真跑过就不算"通过", 否则轨迹里
+// "没编译"与"编译过了"会印成同一个字。
 func gateStatusLabel(in gateSpanInput) string {
 	switch {
 	case in.Skipped:
@@ -111,6 +115,7 @@ func gateStatusLabel(in gateSpanInput) string {
 	}
 }
 
+// firstNonEmpty 返回第一个非空白字符串; 全为空白时返回空串。
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -197,6 +202,10 @@ func (ptm *ProductionTeamManager) LastRunForChat(chatID string) (teamName, runID
 	return "", "", false
 }
 
+// RateTeam 记录用户对某团队产出的显式评分 (1-5 星), 线性映射到 [-1,1] 后落奖励流水。
+//
+// 注意：本函数的详细设计说明 (为什么 3 星映射到 0、为什么失败要返回错误) 目前挂在
+// 上一个函数的注释块里 (见 LastRunForChat 上方), 这里只留一句话摘要。
 func (ptm *ProductionTeamManager) RateTeam(name string, stars int, comment string) error {
 	if ptm == nil {
 		return fmt.Errorf("团队管理器未初始化")

@@ -24,6 +24,7 @@ func NewGitNexus(repoPath string) *GitNexus {
 	return &GitNexus{RepoPath: repoPath}
 }
 
+// ensurePaths 惰性发现并缓存 GitNexus/Graphify 的工具路径。
 func (g *GitNexus) ensurePaths() (*ToolPaths, error) {
 	if g.paths != nil {
 		return g.paths, nil
@@ -36,6 +37,7 @@ func (g *GitNexus) ensurePaths() (*ToolPaths, error) {
 	return paths, nil
 }
 
+// setupIndex 在配置了索引基目录时把仓库注册进 IndexManager; 未配置或管理器不可用则跳过。
 func (g *GitNexus) setupIndex() error {
 	if g.IndexBaseDir == "" {
 		return nil

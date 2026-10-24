@@ -76,12 +76,27 @@ type eventLog struct {
 	notify chan struct{} // 每次 append 后关闭并换新的广播 chan
 }
 
+// newEventLog 建一个空事件缓冲 (notify 必须是**已打开的** chan, append 时才关它)。
 func newEventLog() *eventLog {
 	return &eventLog{notify: make(chan struct{})}
 }
 
 // append 追加一条事件并广播。连续的同类 delta/thinking 合并进上一条:
 // token 级流式会在几秒内产生几千条事件, 全留既浪费内存又让重连回放变慢。
+//
+// 算法解读：
+//
+//	原理：两级背压。① **同类合并** —— 若新事件与末尾事件的 Kind 相同且属于
+//	      delta/thinking, 就把文本追加到末尾那条上, 不新增条数; ② **条数封顶** ——
+//	      条数已达 maxBufferedDeltaEvents 时, 新 delta 仍并入末尾 (内容不丢),
+//	      只是不再增长。两种情况下 Seq 都不重新编号。
+//	关键不变量：合并只发生在**末尾且同类**时 —— 一旦中间插入了工具事件,
+//	      后续 delta 就是新的一条。这保证了"事件顺序 = 内容顺序", 客户端按序
+//	      拼接文本不会串行; 若允许跨 Kind 合并, 工具调用前后的文字会被缝在一起。
+//	代价与边界：合并后单条事件的 Text 会变得很大 (几万字符), 重连回放时
+//	      一次性吐出; 内存占用与**内容总量**成正比, 与 token 数成正比而非事件数。
+//	设计权衡：不丢内容 (宁可长也不丢字) —— 这是给用户看的流式输出, 丢字比
+//	      占内存严重得多; 封顶保护的只是"交替刷屏"这种病态序列的条数。
 func (l *eventLog) append(ev Event) {
 	l.mu.Lock()
 	if n := len(l.events); n > 0 {
@@ -106,6 +121,11 @@ func (l *eventLog) append(ev Event) {
 	l.broadcast()
 }
 
+// broadcast 关掉当前 notify 唤醒所有等待者, 并换上新的 chan (关旧开新的换手广播)。
+//
+// 换手而不是只 close: 已关的 chan 无法复用, 而等待方拿到的句柄必须是"下一次 append
+// 会被关掉的那个"。等待方从 snapshot 拿句柄后再 select 它, 中间若有 append 发生,
+// 句柄已被关闭 —— select 立即返回, 因此不会漏事件 (只会多一次空转)。
 func (l *eventLog) broadcast() {
 	l.mu.Lock()
 	close(l.notify)

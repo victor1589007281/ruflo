@@ -32,6 +32,9 @@ type SessionMeta struct {
 	Model        string    `json:"model"`
 }
 
+// generateSessionID 生成 16 字节随机数的十六进制字符串作为会话 ID。
+//
+// 注意：rand.Read 的错误被显式忽略——熵源不可用时 b 保持全零, 会退化成固定 ID, 调用方不应把它当作唯一性保证。
 func generateSessionID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)

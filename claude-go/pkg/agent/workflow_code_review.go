@@ -15,6 +15,18 @@
 // (无工具), 见 pkg/agent/orchestrated_runner.go。M4 之前这条路走的是已删除的 pkg/orchestrator。
 package agent
 
+// codeReviewWorkflow 构造 "code-review" 工作流定义 (10 个阶段)。
+//
+// 阶段编排 (DependsOn 即图的边):
+//
+//	ingest ∥ static-analysis ∥ context-retrieve   三路并行摄入
+//	  → logic / security / performance / style     四路专家审查 (各自依赖上面三路)
+//	  → adversarial-challenge                      对抗质疑 (合并四路结论)
+//	  → test-verify                                对高严重发现做测试驱动验证
+//	  → report                                     汇总报告
+//
+// mode=orchestrated 表示由 pkg/graph 图引擎按依赖调度, 节点内核是裸 LLM completion
+// (无工具)。
 func codeReviewWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "code-review",

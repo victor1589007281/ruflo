@@ -180,6 +180,7 @@ func runManimRender(ctx context.Context, bin, pyPath, workDir string) (string, e
 	return mp4, nil
 }
 
+// findNewestMP4 递归找 root 下修改时间最新的 mp4, 跳过 manim 的 partial_movie_files 中间分片。
 func findNewestMP4(root string) string {
 	var newest string
 	var newestT time.Time

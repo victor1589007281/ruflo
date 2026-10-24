@@ -242,6 +242,7 @@ func SetStatus(skillPath, newStatus string) error {
 
 // --- helpers ---
 
+// loadRewards 按行读 rewards.jsonl; 空行与坏 JSON 一律跳过 (一条坏记录不该让整份奖励不可读)。
 func loadRewards(path string) []rewardRow {
 	f, err := os.Open(path)
 	if err != nil {
@@ -264,6 +265,8 @@ func loadRewards(path string) []rewardRow {
 	return out
 }
 
+// parseSkill 从 SKILL.md 头部 frontmatter 解析 name/status/created_at;
+// 无 status 默认 active, 无 name 回退到所在目录名。
 func parseSkill(path string) *SkillState {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -338,6 +341,7 @@ func rewriteStatus(path, status string, rewardAvg float64, samples int) error {
 	return os.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644)
 }
 
+// parseTime 依次尝试 RFC3339 / 无时区 / 纯日期三种布局, 全失败返回零值。
 func parseTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}

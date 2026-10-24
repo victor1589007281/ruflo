@@ -232,6 +232,18 @@ func (s *Server) HandleRPC(raw []byte) ([]byte, bool) {
 	}
 }
 
+// handleToolsCall 处理 tools/call: 解析参数 → 执行工具 → 把结果或失败包成 JSON-RPC 响应。
+//
+// 算法解读：
+//
+//	原理：先解 params (name + arguments), 再交给 execute; 未找到工具 → -32601 协议错误,
+//	      其余执行失败 → 包成 isError 结果正常返回。
+//	关键不变量：**协议错误与工具失败走两条不同的信道** —— 参数不合法/工具不存在是调用方
+//	      (客户端) 的问题, 用 JSON-RPC error; 工具自己跑失败是"结果内容", 必须用 isError
+//	      结果, 否则会被客户端当成传输故障而中断整条会话。
+//	代价与边界：arguments 原样透传给工具, 不做 schema 预校验 (由工具自己解)。
+//	设计权衡：失败原因进 content 而非 error —— 调用方 (agent) 需要把失败原因读进上下文
+//	      才能自我纠正, 而 JSON-RPC error 通常不进入模型上下文。
 func (s *Server) handleToolsCall(req rpcRequest) []byte {
 	var params struct {
 		Name      string          `json:"name"`
@@ -260,6 +272,7 @@ func (s *Server) handleToolsCall(req rpcRequest) []byte {
 
 var errToolNotFound = errors.New("tool not found")
 
+// execute 按工具名分派到 Backend 的对应方法, 并把结果序列化成 JSON 文本。
 func (s *Server) execute(name string, args json.RawMessage) (string, error) {
 	if s.be == nil {
 		switch name {
@@ -320,6 +333,7 @@ func (s *Server) execute(name string, args json.RawMessage) (string, error) {
 	}
 }
 
+// decodeArgs 把 JSON-RPC 的 arguments 解进 v; 空参数视为合法 (无参工具), 直接返回 nil。
 func decodeArgs(args json.RawMessage, v any) error {
 	if len(args) == 0 {
 		return nil
@@ -330,6 +344,7 @@ func decodeArgs(args json.RawMessage, v any) error {
 	return nil
 }
 
+// jsonOf 把 (值, 错误) 归一成 (缩进 JSON 文本, 错误): 上游有错则原样返回, 否则序列化。
 func jsonOf(v any, err error) (string, error) {
 	if err != nil {
 		return "", err
@@ -341,6 +356,7 @@ func jsonOf(v any, err error) (string, error) {
 	return string(b), nil
 }
 
+// marshalResponse 序列化 JSON-RPC 响应; 连响应都序列化不了时兜底返回一条合法的内部错误。
 func marshalResponse(resp rpcResponse) []byte {
 	b, err := json.Marshal(resp)
 	if err != nil {
@@ -403,6 +419,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSONStatus(w, http.StatusOK, resp)
 }
 
+// writeJSONStatus 按指定状态码写一段 JSON body (固定 Content-Type, 禁缓存)。
 func writeJSONStatus(w http.ResponseWriter, code int, body []byte) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

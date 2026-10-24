@@ -9,6 +9,7 @@
 // 参考设计：manager-lab/design/CLAUDE-GO-WORKFLOW.md §2–§9
 package agent
 
+// managerLabRehearsalNPCWorkflow 返回行为演练 NPC 工作流 (单阶段 pipeline, 只出角色台词)。
 func managerLabRehearsalNPCWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "manager-lab-rehearsal-npc",
@@ -33,6 +34,7 @@ func managerLabRehearsalNPCWorkflow() *WorkflowDef {
 	}
 }
 
+// managerLabRehearsalCriticWorkflow 返回行为演练 critic 工作流 (按 rubric 逐句评分并给改写建议)。
 func managerLabRehearsalCriticWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "manager-lab-rehearsal-critic",

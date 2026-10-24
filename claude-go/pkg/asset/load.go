@@ -61,6 +61,7 @@ type sourceUnit struct {
 	layout map[Kind]string
 }
 
+// dir 返回该来源下某种资产的目录 (相对 root); layout 里没有登记这个 kind 时返回空串。
 func (u sourceUnit) dir(k Kind) string {
 	sub, ok := u.layout[k]
 	if !ok {

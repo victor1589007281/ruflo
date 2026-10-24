@@ -124,6 +124,7 @@ func memberNames(in []*asset.Asset) []string {
 	return out
 }
 
+// joinNames 把名字列表拼成 ", " 分隔的字符串; 空列表返回 "(未命名)"。
 func joinNames(names []string) string {
 	if len(names) == 0 {
 		return "(未命名)"

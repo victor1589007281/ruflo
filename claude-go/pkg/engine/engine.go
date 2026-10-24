@@ -410,6 +410,9 @@ type Config struct {
 	PlanClient *api.Client
 }
 
+// toolExposed 报告某工具能否暴露给模型并执行: 先过 DisabledTools 黑名单, 再过 AllowedTools 白名单。
+// 白名单非 nil (含空集) 即"仅名单内放行", 空集拒绝一切; nil 表示未设置。
+// 注意: 这是与 ToolGateHook 互为镜像的**单一真源**, 两处判据必须一起改。
 // toolExposed reports whether a tool may be shown to the model and executed,
 // applying DisabledTools (blacklist) and AllowedTools (whitelist, when set).
 // This is the single source of truth mirrored by ToolGateHook at PreToolUse.
@@ -799,6 +802,7 @@ func (e *QueryEngine) runTokenBudget() int {
 	return runTokenLimitFromEnv()
 }
 
+// runTokenLimitFromEnv 读 CLAUDE_GO_MAX_RUN_TOKENS 得到 run 级 token 上限; 未配或非法都返回 0 (不限)。
 func runTokenLimitFromEnv() int {
 	v := strings.TrimSpace(os.Getenv("CLAUDE_GO_MAX_RUN_TOKENS"))
 	if v == "" {
@@ -1342,6 +1346,19 @@ func (e *QueryEngine) injectHookContext(messages []types.Message, hookOut *types
 	})
 }
 
+// queryLoop 是引擎的主回合循环: 组装请求 → 流式取回 → 执行工具 → 收敛判定, 直到某个终态。
+//
+// 算法解读：
+//
+//	原理：每轮把当前消息序列发给选定的客户端, 取回 assistant 内容, 执行其中的工具调用并把
+//	      结果追加回消息序列, 然后判定是否该停。相位路由 (主模型 / 执行模型 / 规划模型) 与
+//	      各种压缩都挂在"每轮至多切一次模型、连续同类回合 sticky"这条约束下。
+//	关键不变量：sentUpTo 之前的消息**一个字节都不能改** —— 前缀缓存按字节比对, 改动点之后
+//	      的全部缓存当场失效。所有压缩/裁剪只能作用于 [sentUpTo, len)。
+//	代价与边界：单轮内的连续错误计数是断路器而不是重试器, 达到上限直接走终态; 它不区分
+//	      错误是否可重试, 因此上限必须留够瞬态抖动 (如 429) 的余地。
+//	设计权衡：模型切换以"回合"为粒度而不是以"请求"为粒度, 用一次可能的切换成本换同模型
+//	      连续回合的前缀 KV 缓存命中。
 func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message, streamCh chan<- types.StreamEvent) ([]types.Message, types.Terminal) {
 	turnCount := 0
 	currentModel := e.Config.Model
@@ -2484,6 +2501,7 @@ func extractLatestUserIntent(messages []types.Message) string {
 	return ""
 }
 
+// maxInt 返回两整数中的较大者。
 func maxInt(a, b int) int {
 	if a > b {
 		return a

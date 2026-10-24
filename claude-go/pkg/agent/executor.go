@@ -109,8 +109,23 @@ func NewCodeExecutor(
 	}
 }
 
+// Name 返回执行器名 "code-executor"。
 func (e *CodeExecutor) Name() string { return "code-executor" }
 
+// Execute 跑一轮"生成 → 应用补丁 → 门禁校验"的修复循环, 直到通过或轮次耗尽。
+//
+// 算法解读：
+//
+//	原理：把代码生成当成一个有界修复循环 —— 首轮让 LLM 按契约生成, 之后每轮拿上一轮门禁的
+//	      blocking 诊断去驱动修复, 直到门禁通过或 maxRounds 用尽。
+//	关键不变量：只有 gateResult.Passed 为真才算成功。ShouldRetry 判定"错误是否可修",
+//	      CanProceed 判定"预算还剩不剩"; 两者为假时必须立刻返回失败, 不能继续空转 ——
+//	      否则会把同一批修不好的诊断反复喂给 LLM, 白烧轮次。
+//	代价与边界：每轮都要真跑一次编译/测试门禁 (最贵的部分) 加一次 LLM 调用, 因此轮次上限
+//	      既是质量闸门也是成本闸门。SelfRefine 只认 undefined/wrong_import/format 三类诊断,
+//	      其余一律走通用修复。
+//	设计权衡：自修复成功后用 goto 直接跳到应用补丁, 省掉一次 LLM 调用; 代价是控制流出现
+//	      非结构化跳转。另注意本类型整体已判弃用, 见 NewCodeExecutor 的 Deprecated 说明。
 func (e *CodeExecutor) Execute(
 	ctx context.Context,
 	task DeprecatedCodeTaskSpec,
@@ -144,6 +159,7 @@ func (e *CodeExecutor) Execute(
 			snippets, stepErr = e.generateCode(ctx, codeTask)
 		} else {
 			// Try self-refine first for auto-fixable blockers
+			// 顺序刻意如此: 机械能改对的诊断不值得再花一次 LLM 调用。
 			if result.Validation != nil && !result.Validation.Passed && len(result.Validation.Diagnostics) > 0 {
 				autoFixable := true
 				for _, d := range result.Validation.Diagnostics {
@@ -156,6 +172,8 @@ func (e *CodeExecutor) Execute(
 						}
 					}
 				}
+				// 只有这三类是"不用推理就能改对"的; 只要冒出一个别的 blocking 诊断, 就说明需要
+				// 读懂语义, 退回下面的通用修复路径。
 				if autoFixable {
 					refined, refineErr := e.SelfRefine(ctx, codeTask, result.Validation.Diagnostics)
 					if refineErr == nil && len(refined) > 0 {
@@ -247,6 +265,7 @@ func (e *CodeExecutor) Execute(
 			return result, nil
 		}
 
+		// ShouldRetry=false = 这类错误再修一次也好不了, 立刻退出, 不把同一批诊断重复喂给 LLM。
 		if !gateResult.ShouldRetry() {
 			result.Status = "failed"
 			result.Duration = time.Since(start)
@@ -254,6 +273,7 @@ func (e *CodeExecutor) Execute(
 			return result, fmt.Errorf("%s", result.Error)
 		}
 
+		// CanProceed=false = 轮次预算已经用完。
 		if !e.validationGate.CanProceed(gateResult) {
 			result.Status = "failed"
 			result.Duration = time.Since(start)
@@ -267,12 +287,14 @@ func (e *CodeExecutor) Execute(
 		}
 	}
 
+	// 循环自然走完 = 轮次耗尽仍未通过; RoundCount 是最后一轮的编号, 供上层区分"预算用尽"。
 	result.Status = "failed"
 	result.Duration = time.Since(start)
 	result.Error = fmt.Sprintf("execution failed after %d rounds", result.RoundCount)
 	return result, fmt.Errorf("%s", result.Error)
 }
 
+// initContractStore 首次调用时按 module path 与仓库内容构建契约库; 已有契约则跳过。
 func (e *CodeExecutor) initContractStore(task CodeTask) error {
 	if e.contractStore.GetModule() == "" && task.ModulePath != "" {
 		e.contractStore.module = task.ModulePath
@@ -283,6 +305,7 @@ func (e *CodeExecutor) initContractStore(task CodeTask) error {
 	return nil
 }
 
+// generateCode 用契约优先提示词让 LLM 生成编辑片段, 并解析成 EditSnippet 列表。
 func (e *CodeExecutor) generateCode(ctx context.Context, task CodeTask) ([]EditSnippet, error) {
 	prompt := e.buildGenerationPrompt(task)
 	output, err := e.llmRunner.SimpleComplete(ctx, "", prompt)
@@ -292,6 +315,7 @@ func (e *CodeExecutor) generateCode(ctx context.Context, task CodeTask) ([]EditS
 	return e.parseEditSnippets(output)
 }
 
+// SelfRefine 在提交 Validator 之前先自行修复可自动修复的诊断 (undefined/wrong_import/format)。
 // SelfRefine attempts to fix diagnostics internally before submitting to Validator.
 func (e *CodeExecutor) SelfRefine(ctx context.Context, task CodeTask, diags []toolskill.Diagnostic) ([]EditSnippet, error) {
 	var autoFixDiags []toolskill.Diagnostic
@@ -345,6 +369,7 @@ Return ONLY a JSON array:
 	return e.parseEditSnippets(output)
 }
 
+// PreFlightCompileCheck 在生成实现之前先跑一次 go test -c 探编译基线; 缺桩/未定义符号属正常。
 // PreFlightCompileCheck verifies that tests compile before generating implementation.
 func (e *CodeExecutor) PreFlightCompileCheck(task CodeTask) error {
 	if task.RepoRoot == "" {
@@ -368,6 +393,7 @@ func (e *CodeExecutor) PreFlightCompileCheck(task CodeTask) error {
 	return fmt.Errorf("pre-flight compile check failed: %s", outStr)
 }
 
+// repairFromDiagnostics 按 blocking 诊断逐条检索上下文, 拼出修复提示词让 LLM 产出补丁。
 func (e *CodeExecutor) repairFromDiagnostics(
 	ctx context.Context,
 	task CodeTask,
@@ -409,6 +435,7 @@ func (e *CodeExecutor) repairFromDiagnostics(
 	return e.parseEditSnippets(output)
 }
 
+// buildGenerationPrompt 拼装契约优先模式的生成提示词 (契约上下文 + 宪法 + 技能策略 + think 阶段要求)。
 func (e *CodeExecutor) buildGenerationPrompt(task CodeTask) string {
 	var contractCtx strings.Builder
 	for _, file := range task.TargetFiles {
@@ -500,6 +527,7 @@ First output your <think> block, then return ONLY a JSON array:
 	return prompt.String()
 }
 
+// buildRepairPrompt 拼装修复提示词: 门禁失败项 + 高相关度上下文 + 修复建议 + 技能策略。
 func (e *CodeExecutor) buildRepairPrompt(
 	task CodeTask,
 	gate *GateResult,
@@ -572,6 +600,7 @@ First output your <think> block, then return ONLY a JSON array of EditSnippet ob
 		strings.Join(suggestions, "\n"), strategy)
 }
 
+// parseEditSnippets 剥掉 markdown 代码围栏后解析 JSON 数组, 并逐条校验 file/start_marker/replacement 必填。
 func (e *CodeExecutor) parseEditSnippets(output string) ([]EditSnippet, error) {
 	output = strings.TrimSpace(output)
 
@@ -609,6 +638,7 @@ func (e *CodeExecutor) parseEditSnippets(output string) ([]EditSnippet, error) {
 	return snippets, nil
 }
 
+// buildPatchSummaries 按文件汇总增删行数: 增行数按 replacement 的换行计, 删行数按 start/end marker 之间计。
 func (e *CodeExecutor) buildPatchSummaries(root string, snippets []EditSnippet) []PatchSummary {
 	byFile := make(map[string][]EditSnippet)
 	for _, s := range snippets {
@@ -647,6 +677,7 @@ func (e *CodeExecutor) buildPatchSummaries(root string, snippets []EditSnippet) 
 	return summaries
 }
 
+// parseCodeTask 把弃用的通用任务规格 (map 配置) 解成强类型 CodeTask, 缺省语言为 go。
 func (e *CodeExecutor) parseCodeTask(task DeprecatedCodeTaskSpec) CodeTask {
 	ct := CodeTask{ID: task.ID, Language: "go"}
 	if task.Config != nil {
@@ -666,6 +697,7 @@ func (e *CodeExecutor) parseCodeTask(task DeprecatedCodeTaskSpec) CodeTask {
 	return ct
 }
 
+// loadPromptSkillContent 优先从 skills/<name>.md 读技能正文, 读不到时回退到内置的一行策略。
 func (e *CodeExecutor) loadPromptSkillContent(skillName string) string {
 	// Try loading from skills/ subdirectory if available
 	if e.skillRuntime != nil {
@@ -683,14 +715,17 @@ func (e *CodeExecutor) loadPromptSkillContent(skillName string) string {
 	}
 }
 
+// SetMaxRounds 设置修复循环的最大轮次。
 func (e *CodeExecutor) SetMaxRounds(n int) {
 	e.maxRounds = n
 }
 
+// SetPromptSkills 覆盖生成/修复时使用的技能名列表。
 func (e *CodeExecutor) SetPromptSkills(skills []string) {
 	e.promptSkills = skills
 }
 
+// SetConstitutionPath 设置"Go 代码宪法"文件路径; 为空则不注入宪法段。
 func (e *CodeExecutor) SetConstitutionPath(path string) {
 	e.constitutionPath = path
 }

@@ -64,6 +64,7 @@ func IngestFile(path string) ([]types.ContentBlock, error) {
 	return nil, fmt.Errorf("不支持的附件类型 %q (支持图片 png/jpg/gif/webp、视频 mp4/mov/webm/avi/mkv、音频 wav/mp3/m4a/ogg/flac)", ext)
 }
 
+// imageBlockFromBytes 把图片字节编成 base64 的 image 内容块 (Anthropic 的原生图片输入形态)。
 func imageBlockFromBytes(data []byte, mime string) types.ContentBlock {
 	return types.ContentBlock{
 		Type: types.ContentBlockImage,
@@ -75,6 +76,7 @@ func imageBlockFromBytes(data []byte, mime string) types.ContentBlock {
 	}
 }
 
+// ingestImage 读整张图片文件并转成单个 image 内容块 (不缩放、不裁剪)。
 func ingestImage(path, mime string) ([]types.ContentBlock, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -203,6 +205,7 @@ print("".join(s.text for s in segs))
 	return string(out), nil
 }
 
+// truncate 委托 textutil.Truncate: 超长时截到 n 个字符并补省略号。
 func truncate(s string, n int) string {
 	return textutil.Truncate(s, n, "...")
 }

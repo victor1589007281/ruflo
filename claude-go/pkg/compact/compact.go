@@ -270,6 +270,24 @@ func (c *Compactor) runCompaction(ctx context.Context, messages []types.Message,
 	return out, nil
 }
 
+// compactLocked 在 F6 折叠窗口内完成一次完整折叠, 返回新序列与统计。
+//
+// 算法解读：
+//
+//	原理：把历史消息折成 [boundary, summary, ...tail] —— 一次 LLM 摘要请求换掉前缀的
+//	      N 条消息, 尾部最近 6 条原样保留 (它们是模型当下正在推理的上下文)。摘要前先
+//	      抽硬约束, 摘要后再核验约束是否被保住, 缺了则带缺失清单重压一次。
+//	关键不变量：(1) 约束抽取必须在**折叠之前**、在原文上完成 —— 折叠一旦发生, 判据
+//	      (原句与判别 token) 就随历史一起没了, 顺序反了整条 H2-2 自检就失效;
+//	      (2) 全程持 eventMu 写锁, 窗口内不得调用 GateEventWrite 或让 PreCompactFn
+//	      回调写事件 (写锁不可重入, 会死锁); (3) 折叠产物是"消息 + call_id"的纯函数,
+//	      同一段新消息重放得到逐字节相同的结果。
+//	代价与边界：一次摘要请求, 约束缺失时最坏两次; 消息数 <= 尾部保护数时直接返回
+//	      (nil, st, nil) —— nil 表示"没折", 调用方据此不报数 (报一条 0 收益的折叠比
+//	      不报更坏)。单次摘要的上下文长度随被折历史线性增长。
+//	设计权衡：重压只做一次。第二次仍缺说明"模型认为这条不该进摘要"或判据本身过严,
+//	      再试是拿线性成本换边际为负的收益; 且只在 Missing **总量下降**时才采纳重压
+//	      结果, 避免模型整篇重组把已保住的约束挤掉。
 func (c *Compactor) compactLocked(ctx context.Context, messages []types.Message, model string) ([]types.Message, CompactionStats, error) {
 	st := CompactionStats{
 		MessagesBefore: len(messages),
@@ -354,6 +372,9 @@ func (c *Compactor) compactLocked(ctx context.Context, messages []types.Message,
 	st.SummaryTokens = len(summaryText) / 4 // 与 estimateTokens 同口径
 
 	// 构建压缩后的消息序列
+	// boundary 必须是 IsCompactBoundary=true 的 system 消息: GetMessagesAfterCompactBoundary
+	// 靠扫描最后一个 boundary 判断"哪些消息还在上下文里", 漏掉这个标记, 后续轮次会把已经
+	// 被摘要掉的整段历史重新当成有效上下文。
 	result := []types.Message{
 		{
 			Type:              types.MessageTypeSystem,
@@ -370,6 +391,8 @@ func (c *Compactor) compactLocked(ctx context.Context, messages []types.Message,
 			}},
 		},
 	}
+	// 尾部若干条按原样追加: 它们是刚发生、且很可能已随上一轮请求发出的历史, 逐字节保持
+	// 原样才能让前缀缓存继续命中 (改写任何一条都会让该位置之后的缓存全部失效)。
 	result = append(result, tail...)
 
 	// 折叠尾部之前的全部 tool_result。
@@ -689,6 +712,7 @@ func GetMessagesAfterCompactBoundary(messages []types.Message) []types.Message {
 // tool_use 入参, 漏算的版本读出来的"折叠前后"是同一套谎言)。
 func EstimateTokens(messages []types.Message) int { return estimateTokens(messages) }
 
+// estimateTokens 按 chars/4 粗估消息的 token 数, 逐块累加四类文本字段 (见上方口径说明)。
 func estimateTokens(messages []types.Message) int {
 	total := 0
 	for _, msg := range messages {
@@ -702,6 +726,11 @@ func estimateTokens(messages []types.Message) int {
 	return total
 }
 
+// extractText 把一条消息的 text 块与 tool_result 正文拼成纯文本 (换行分隔)。
+//
+// 注意: 这里只取 Text 与 Content, 不含 Thinking 与 Input —— 与 estimateTokens 的口径
+// 刻意不同: 估 token 要计全量 (否则触发点被推迟), 而喂给摘要模型的正文不带思考块与
+// 工具入参 JSON (后者体量最大, 全量塞进摘要请求会把提示词撑爆)。
 func extractText(msg types.Message) string {
 	var parts []string
 	for _, block := range msg.Content {
@@ -722,6 +751,7 @@ func truncate(s string, max int) string {
 	return textutil.Truncate(s, max, "...")
 }
 
+// mustMarshal 序列化为 JSON; 出错时返回 nil —— 只喂必然可序列化的结构 (如内容块切片)。
 func mustMarshal(v interface{}) json.RawMessage {
 	data, _ := json.Marshal(v)
 	return data

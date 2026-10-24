@@ -63,6 +63,7 @@ func blockText(raw json.RawMessage) string {
 	return ""
 }
 
+// distillBlocks 把 message.content 归一成 block 列表: 数组原样解析, 纯字符串包成一个 text block。
 func distillBlocks(raw json.RawMessage) []distillBlock {
 	var arr []distillBlock
 	if err := json.Unmarshal(raw, &arr); err == nil {
@@ -75,6 +76,22 @@ func distillBlocks(raw json.RawMessage) []distillBlock {
 	return nil
 }
 
+// evoDistillCmd 构造 `evo distill` 子命令: 遍历转录目录, 逐会话挖掘 T1/T5/T6 三类产物。
+//
+// 算法解读：
+//
+//	原理：对每个 .jsonl 转录做一次**单遍流式扫描**, 在同一次遍历里同时喂三个挖掘器 ——
+//	      T5 数工具频次; T1 记任务首句与前 3 个工具调用; T6 用"上一条 is_error 的
+//	      (工具, 错误类型)" 与"下一个成功的 tool_use"配对成修复模式。
+//	关键不变量：T6 配对依赖 pendingErr 这个**跨行小状态机** —— 一旦配对成功必须立即清空,
+//	      否则一个错误会被后续每个 tool_use 反复计入, 修复模式频次被系统性放大。
+//	      tool_result 不自带工具名, 必须先由 tool_use 的 id→name 表回填 (idToName),
+//	      否则错误类型只能落在 "?" 上, 修复模式退化成"某工具出错后干了什么"。
+//	代价与边界：错误归类是关键词匹配 (中英各几条), 归不到类一律 "generic", 所以
+//	      repair.jsonl 的 errKind 只是粗分; 会话内错误数 > 8 直接判 sessionOK=false,
+//	      该会话不出 T1 示例 (错误缠身的会话会把坏习惯当范例)。
+//	设计权衡：全程零 LLM —— 宁可产物粗糙、可复现, 也不要引入一次调用带来的不确定性与成本;
+//	      排序与 top 200 截断放在最后, 用确定性排序保证同一批转录两次运行结果逐字节一致。
 func evoDistillCmd() *cobra.Command {
 	var projectsDir, outDir string
 	c := &cobra.Command{

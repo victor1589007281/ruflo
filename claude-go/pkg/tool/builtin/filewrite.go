@@ -27,14 +27,18 @@ type fileWriteInput struct {
 
 type FileWriteTool struct{}
 
+// NewFileWriteTool 创建 FileWrite 工具实例 (无状态, 每次调用都返回新对象)。
 func NewFileWriteTool() *FileWriteTool { return &FileWriteTool{} }
 
+// Name 返回工具名 "Write" (与权限规则、acceptEdits 的文件编辑工具名单对齐)。
 func (t *FileWriteTool) Name() string { return FileWriteToolName }
 
+// Description 返回给模型看的工具说明; 强调**覆盖语义** —— 路径上已有文件会被直接覆盖。
 func (t *FileWriteTool) Description() string {
 	return `Writes a file to the local filesystem. This tool will overwrite the existing file if there is one at the provided path.`
 }
 
+// InputSchema 返回入参 JSON Schema (path 与 contents 均必填)。
 func (t *FileWriteTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -46,9 +50,14 @@ func (t *FileWriteTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false —— 本工具会写文件。
 func (t *FileWriteTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+
+// IsConcurrencySafe 恒为 false —— 并行写同一路径会互相覆盖 (并发保护另见 Call 里的 ClaimWrite)。
 func (t *FileWriteTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
+// CheckPermissions 只在 Plan 模式下表态: 除计划文件目录外一律拒绝写入, 其余模式返回
+// nil 交给全局权限链裁决。
 func (t *FileWriteTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx == nil || tctx.PermissionMode != types.PermissionModePlan {
 		return nil

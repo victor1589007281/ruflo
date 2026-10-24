@@ -192,8 +192,23 @@ type compileGateEvaluator struct{}
 
 var _ RewardEvaluator = compileGateEvaluator{}
 
+// Source 返回奖励源名 gate.compile, 同时用作 gate Span 的 gate/node 名。
 func (compileGateEvaluator) Source() string { return RewardSourceGateCompile }
 
+// Evaluate 在工作区里跑 `go build ./...`, 据退出码判定并通过/失败。
+//
+// 算法解读：
+//
+//	原理：H1 的第一批落地 —— 直接拿 run 结束后那个还活着的工作区跑编译, 只信 exit code,
+//	      既不重放快照也不读模型自述。这是价值排第 1 的确定性信号。
+//	关键不变量：命令超时**不挂在上游 ctx 上** (用 context.Background()) —— 门禁自己限时
+//	      5 分钟, 不受上游取消影响; 上游 ctx 只用来取 trace RunID 给奖励归因 (那一步在
+//	      recordGateReward 里)。
+//	代价与边界：无 go.mod 时返回 Skipped 而不是失败 —— 非 Go 模块上 go build 必然报
+//	      "no main module", 那是环境问题不是产物问题, 不该扣分。超时与编译失败分成两个
+//	      Verdict (Raw 分别为 timeout 与截断的报错)。
+//	设计权衡：超时单独成档, 因为它给 AI 的修复提示与"编译不过"完全不同 (超时八成是生成
+//	      代码里的死循环)。
 func (compileGateEvaluator) Evaluate(_ context.Context, ws WorkspaceHandle) (RewardVerdict, error) {
 	// 兜底: 无 go.mod 的目录不是 Go 模块, go build ./... 必然报 "no main module", 跳过。
 	if !ws.Exists("go.mod") {
@@ -220,8 +235,21 @@ type testGateEvaluator struct{}
 
 var _ RewardEvaluator = testGateEvaluator{}
 
+// Source 返回奖励源名 gate.test, 同时用作 gate Span 的 gate/node 名。
 func (testGateEvaluator) Source() string { return RewardSourceGateTest }
 
+// Evaluate 在工作区里跑 `go test -race -timeout 120s ./...`, 据退出码判定。
+//
+// 算法解读：
+//
+//	原理：第二个确定性门禁, 与编译门禁同构; 加 -race 是因为并发缺陷只有竞态检测器能稳定
+//	      复现, 而 AI 生成的并发代码正是高危区。
+//	关键不变量：外层超时 (12 分钟) 必须**大于**内层 -timeout (120s) —— 内层先到点会留下
+//	      可读的测试超时输出, 外层先到点只能拿到一句"进程被杀"。
+//	代价与边界：-race 让内存与耗时成倍增长, 大仓上可能压到 12 分钟上限, 那时报的是
+//	      timeout 而不是测试失败 (两者在 Verdict 里可区分)。与编译门禁不同, 这里**不检查
+//	      有无 go.mod** —— 非 Go 模块会直接落到 go test 的报错上。
+//	设计权衡：与编译门禁一样不挂上游 ctx, 门禁自己限时; 代价是上游取消后门禁仍会跑满。
 func (testGateEvaluator) Evaluate(_ context.Context, ws WorkspaceHandle) (RewardVerdict, error) {
 	// 12 分钟: 足够正常单元测试跑完, 又能在 AI 生成死循环 (如 kmeans 中 k > len(vectors)
 	// 的 for{}) 时及时止血。
@@ -289,6 +317,7 @@ func newWorkspaceHandle(dir string) (WorkspaceHandle, error) {
 	return &workspaceFS{root: real}, nil
 }
 
+// Dir 返回工作区根目录的绝对路径 (构造时已 EvalSymlinks 定死)。
 func (w *workspaceFS) Dir() string { return w.root }
 
 // resolve 把相对路径解析成工作区内的绝对路径; 越界或绝对路径一律拒绝。
@@ -325,6 +354,7 @@ func withinRoot(root, p string) bool {
 	return strings.HasPrefix(p, root+string(os.PathSeparator))
 }
 
+// Exists 判断工作区内某个相对路径是否存在; 越界或解析失败一律返回 false (不 panic)。
 func (w *workspaceFS) Exists(rel string) bool {
 	p, err := w.resolve(rel)
 	if err != nil {
@@ -369,6 +399,8 @@ func (w *workspaceFS) Verify(ctx context.Context, c VerifyCmd) VerifyResult {
 	}
 }
 
+// allowedSubs 把白名单子命令集合渲染成 "a/b/c" 形状的可读串 (只用于报错文案, 故先排序
+// 以保证同一集合每次报出同一个顺序)。
 func allowedSubs(subs map[string]bool) string {
 	names := make([]string, 0, len(subs))
 	for s := range subs {

@@ -352,12 +352,15 @@ func NewPoolSearchToolWithIndex(pool *tool.Pool, reg *tool.Registry, policy *Poo
 	return &PoolSearchTool{pool: pool, reg: reg, idx: idx, policy: policy}
 }
 
+// Name 返回工具对外名 "pool_search"。
 func (t *PoolSearchTool) Name() string { return PoolSearchName }
 
+// Description 返回给模型看的说明: 只回名称 + 一句话, 不下发 schema, 命中后要 pool_load。
 func (t *PoolSearchTool) Description() string {
 	return "Search the deferred tool, skill & hook pool by keyword. Returns names and one-line descriptions only (no schemas); call pool_load to surface a hit's full schema/instructions on the next turn."
 }
 
+// InputSchema 返回入参 JSON Schema (query 可空 = 列首页; limit 默认 8)。
 func (t *PoolSearchTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -368,12 +371,29 @@ func (t *PoolSearchTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒只读: 检索不改变池状态 (写 Span 属观测, 不算副作用)。
 func (t *PoolSearchTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 恒可并发: 检索只读索引快照。
 func (t *PoolSearchTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+// CheckPermissions 不附加 Deny —— 池检索本身不构成越权 (治理在 pool_load 侧把关)。
 func (t *PoolSearchTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 按 query 检索池并渲染成"名称 (类别): 一句话 [状态]"清单回给模型。
+//
+// 算法解读：
+//
+//	原理：检索走 searchPersonalized —— BM25 + 词面覆盖两路召回, RRF 融合后再乘
+//	      (1 + α·ThompsonSample) 的个性化加成; 本函数只做 limit 归一、命中渲染、
+//	      未命中回退提示与选择留痕。
+//	关键不变量：α=0 (policy 为 nil 或 bandit 不可用) 时排序必须与纯相关性逐位一致 ——
+//	      boost 是乘在相关性分上的, 相关性那边若已因登记顺序产生名次差, boost 会去
+//	      放大一个纯粹的偶然 (对拍测试 poolbandit_test.go 盯的就是这条)。
+//	代价与边界：每次调用对全池做一次 BM25 + 覆盖打分 (池规模 ~40, 可忽略); 命中路径
+//	      末尾还会顺手刷一次常驻面聚合 (内存扫描, 下一轮广告面才生效)。
+//	设计权衡：未命中时不再说"池内没有匹配资产", 而是给 EmptyRecallNote —— 池里明明
+//	      有资产、只是没有共同词时, 前一种说法是假话, 模型会照它行事 (判定能力不存在)。
 func (t *PoolSearchTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		Query string `json:"query"`
@@ -405,6 +425,8 @@ func (t *PoolSearchTool) Call(ctx context.Context, input json.RawMessage, tctx *
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("池内命中 %d 项 (pool_load 加载后下一轮生效):\n", len(hits)))
 	for _, h := range hits {
+		// 状态标记只用于**告知**, 不改变检索结果: 受治理限制的资产仍会被列出,
+		// 只是提前说明它加载不了 (否则模型会去 load 一次再吃一个拒载错误)。
 		status := ""
 		switch {
 		case t.pool.IsLoaded(h.Name):
@@ -465,12 +487,15 @@ func NewPoolLoadTool(pool *tool.Pool, reg *tool.Registry, skillReg *skills.Regis
 	return &PoolLoadTool{pool: pool, reg: reg, skillReg: skillReg, policy: p, idx: idx}
 }
 
+// Name 返回工具对外名 "pool_load"。
 func (t *PoolLoadTool) Name() string { return PoolLoadName }
 
+// Description 返回给模型看的说明: 加载下一轮生效; 工具加载前也可直接调用, 结果不变。
 func (t *PoolLoadTool) Description() string {
 	return "Load a deferred asset into this session (takes effect next turn). Tools/skills: surfaces their schema/instructions. Hooks: installs them into this session's hook runner. Tools stay executable even before loading."
 }
 
+// InputSchema 返回入参 JSON Schema (name 必填)。
 func (t *PoolLoadTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -481,12 +506,28 @@ func (t *PoolLoadTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 报只读: 加载只改本会话的广告面, 不写盘也不改远端状态。
 func (t *PoolLoadTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 报可并发: 加载标记与 Runner 装卸各自有锁, 不依赖调用序。
 func (t *PoolLoadTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+// CheckPermissions 不附加 Deny —— 治理集外的资产由 Call 内的 pool.Governed 拒绝并回注原因。
 func (t *PoolLoadTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 把一件池内资产加载进本会话 (下一轮起生效)。
+//
+// 算法解读：
+//
+//	原理：按资产类别分派到三条语义完全不同的路径 —— 工具只置加载标记 (下一轮广告面
+//	      带上它的 schema)、技能即时回注正文并 MarkInjected、hook 真的装进 Runner 的
+//	      运行期组。分派顺序是 技能 → hook → 工具。
+//	关键不变量：**加载成功必须真的发生** —— sink 为 nil (池装配早于 Runner 构造) 时
+//	      必须显式报错而不是回"已加载"; 否则读数说装了而 Runner 上什么都没有。
+//	代价与边界：每次调用最多一次 map 查表 + 一次 InstallHookGroup; 幂等分支会**重装**
+//	      一次 hook 组, 因为"加载标记"与"Runner 上的组"是两处可能不同步的状态。
+//	设计权衡：hook 只认索引里登记过的名字 (t.idx.hookCfgs), 这一句同时充当成员与合法性
+//	      判定, 不再另查一遍池 —— 代价是索引与登记表必须成对维护 (见 buildPoolIndex)。
 func (t *PoolLoadTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		Name string `json:"name"`
@@ -634,12 +675,15 @@ func NewPoolReleaseTool(pool *tool.Pool, skillReg *skills.Registry, idx *poolInd
 	return &PoolReleaseTool{pool: pool, skillReg: skillReg, idx: idx}
 }
 
+// Name 返回工具对外名 "pool_release"。
 func (t *PoolReleaseTool) Name() string { return PoolReleaseName }
 
+// Description 返回给模型看的说明: 只收回广告面/卸载 hook, 执行面从不拦截。
 func (t *PoolReleaseTool) Description() string {
 	return "Release a deferred asset from this session (next turn). Tools/skills: drops them from the advertised surface; execution is never blocked — the tool stays callable by name. Hooks: uninstalls them from this session's hook runner (they stop firing)."
 }
 
+// InputSchema 返回入参 JSON Schema (name 必填)。
 func (t *PoolReleaseTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -650,12 +694,27 @@ func (t *PoolReleaseTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 报只读: 释放只收广告面/卸 hook, 不动磁盘与远端。
 func (t *PoolReleaseTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 报可并发: 释放是幂等的标记操作。
 func (t *PoolReleaseTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+// CheckPermissions 不附加 Deny —— 卸载自己的加载面不需要额外授权。
 func (t *PoolReleaseTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 把一件资产移出本会话的加载面; hook 走"真卸载", 工具/技能只收回广告位。
+//
+// 算法解读：
+//
+//	原理：工具与技能的"加载"只是广告面的可见性, 所以释放 = 收回标记; hook 的"加载"
+//	      是真的把配置装进了 Runner, 所以释放必须**真的卸下**, 否则模型以为关掉了,
+//	      实际每次工具调用还在过它。
+//	关键不变量：hook 分支里 `released` 与 `uninstalled` 必须分别如实上报 —— 两者本
+//	      不该不同步, 一旦只剩一个成立就是状态不一致, 不能糊成一句"已释放"。
+//	代价与边界：O(1) 查表 + 一次 UninstallHookGroup; 未加载时是无操作, 不报错。
+//	设计权衡：不因"没装 hook sink"而跳过卸载尝试 —— sink 为 nil 时按未卸下报, 让
+//	      "运行时不支持 hook"这件事保持可见。
 func (t *PoolReleaseTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		Name string `json:"name"`
@@ -842,6 +901,7 @@ func countActiveSkills(skillReg *skills.Registry) int {
 	return len(skillReg.Active())
 }
 
+// countShadowSkills 影子态技能数 (护栏"影子积压"一路的输入; skillReg nil = 0)。
 func countShadowSkills(skillReg *skills.Registry) int {
 	if skillReg == nil {
 		return 0
@@ -858,6 +918,7 @@ func evolutionToolNames() []string {
 	}
 }
 
+// mediaToolNames 第一期下沉的媒体工具名 (GenerateImage/GIF/Video/PPTX/Chart/Speech)。
 func mediaToolNames() []string {
 	return []string{
 		"GenerateImage", "GenerateGIF", "GenerateVideo",
@@ -865,6 +926,7 @@ func mediaToolNames() []string {
 	}
 }
 
+// codeIntelToolNames 第一期下沉的 CodeIntel 五件 (init/update/status/query/branch)。
 func codeIntelToolNames() []string {
 	return []string{
 		"code_intel_init", "code_intel_update", "code_intel_status",

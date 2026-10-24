@@ -271,6 +271,7 @@ func (c *Consolidator) detectPatterns(ctx context.Context) []*memory.MemoryFact 
 
 // --- 辅助函数 ---
 
+// parseCategoryLine 按 [fact]/[preference]/[goal]/[event]/[context] 前缀判定记忆类别, 无前缀时归入 context。
 func parseCategoryLine(line string) (memory.MemoryCategory, string) {
 	catMap := map[string]memory.MemoryCategory{
 		"[fact]":       memory.CategoryFact,
@@ -289,6 +290,7 @@ func parseCategoryLine(line string) (memory.MemoryCategory, string) {
 	return memory.CategoryContext, line
 }
 
+// classifyContent 用关键词启发式归类: 命中事实信号归 fact, 命中事件信号归 event, 否则 context。
 func classifyContent(content string) memory.MemoryCategory {
 	lower := strings.ToLower(content)
 	factSignals := []string{"func ", "type ", "api", "架构", "决策", "interface"}
@@ -306,6 +308,7 @@ func classifyContent(content string) memory.MemoryCategory {
 	return memory.CategoryContext
 }
 
+// truncStr 按**字符**(而非字节)截断字符串, 超长时补省略号。
 func truncStr(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {

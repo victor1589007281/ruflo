@@ -272,6 +272,10 @@ func buildPrompt(cfg Config, st State, lastVerifyOut string, firstRun bool) stri
 	return sb.String()
 }
 
+// truncate 按**字节**截断 (不是 rune), 超限时追加"已截断 + 原长度"提示。
+//
+// 注意：按字节切会落在 UTF-8 序列中间, 中文内容被截断处可能产生一个乱码尾字符。
+// 当前调用点 (拼接给模型的验证输出) 容忍这一点, 但换成需要展示给人看的文案时应改用 rune。
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

@@ -310,6 +310,7 @@ func baseNodeID(id string) string {
 	return id
 }
 
+// msToTime 把毫秒时间戳转成 time.Time; 非正数视为"未设置", 返回零值时间。
 func msToTime(ms int64) time.Time {
 	if ms <= 0 {
 		return time.Time{}
@@ -317,6 +318,7 @@ func msToTime(ms int64) time.Time {
 	return time.UnixMilli(ms)
 }
 
+// durSince 返回两个毫秒时间戳之间的时长字符串; 任一缺失或时序倒置时返回空串。
 func durSince(startTS, endTS int64) string {
 	if startTS <= 0 || endTS < startTS {
 		return ""
@@ -324,6 +326,7 @@ func durSince(startTS, endTS int64) string {
 	return (time.Duration(endTS-startTS) * time.Millisecond).String()
 }
 
+// evStr 从事件 Data 里取一个字符串字段; 缺失或类型不符都返回空串。
 func evStr(ev graph.Event, key string) string {
 	if ev.Data == nil {
 		return ""

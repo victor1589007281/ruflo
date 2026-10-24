@@ -39,6 +39,8 @@ type OutputLimiter struct {
 	stderr *limitedStream
 }
 
+// NewOutputLimiter 创建输出限流器: 补齐零值选项 (总量 4MiB / 预览 128KiB / 日志 16MiB),
+// 建出日志目录, 并为 stdout 与 stderr 各开一个日志文件。
 func NewOutputLimiter(opts OutputOptions) (*OutputLimiter, error) {
 	if opts.ID == "" {
 		opts.ID = newID()
@@ -80,10 +82,13 @@ func NewOutputLimiter(opts OutputOptions) (*OutputLimiter, error) {
 	return l, nil
 }
 
+// Stdout 返回 stdout 流, 可直接当 io.Writer 挂给子进程。
 func (l *OutputLimiter) Stdout() *limitedStream { return l.stdout }
 
+// Stderr 返回 stderr 流。
 func (l *OutputLimiter) Stderr() *limitedStream { return l.stderr }
 
+// Close 关闭两个日志文件; 两个都会尝试关闭, 返回先出现的那个错误。
 func (l *OutputLimiter) Close() error {
 	var first error
 	if l.stdout != nil && l.stdout.file != nil {
@@ -99,6 +104,7 @@ func (l *OutputLimiter) Close() error {
 	return first
 }
 
+// Result 汇总本次执行的结果: 两侧预览、合并文本、日志目录、是否截断与总字节数。
 func (l *OutputLimiter) Result() OutputResult {
 	stdout := l.stdout.previewString()
 	stderr := l.stderr.previewString()
@@ -119,6 +125,7 @@ func (l *OutputLimiter) Result() OutputResult {
 	}
 }
 
+// addBytes 累加全局已写字节数; 一旦超过总量上限就触发限流 (回调至多一次)。
 func (l *OutputLimiter) addBytes(n int64) {
 	if n <= 0 {
 		return
@@ -129,6 +136,7 @@ func (l *OutputLimiter) addBytes(n int64) {
 	}
 }
 
+// triggerLimit 置位限流标记, 并用 sync.Once 保证 onLimit 回调全局只触发一次。
 func (l *OutputLimiter) triggerLimit() {
 	l.limited.Store(true)
 	l.once.Do(func() {
@@ -150,6 +158,19 @@ type limitedStream struct {
 	truncated  atomic.Bool
 }
 
+// Write 实现 io.Writer: 先计入全局总量, 再把字节同时喂给预览缓冲与日志文件, 两级各自封顶。
+//
+// 算法解读：
+//
+//	原理：一份输出流要同时满足三个互相独立的预算 —— 全局总量 (maxTotal, stdout+stderr
+//	  合算)、内存预览 (maxPreview, 回给模型看的片段)、落盘日志 (maxLog, 事后排障用)。
+//	  每次 Write 对三者分别裁剪, 任一被裁就把 truncated 置位。
+//	关键不变量：**恒返回 (len(p), nil)**。若按实际留存字节数返回短写, os/exec 会把它
+//	  当成写失败并中断子进程 —— 限流是"我们主动丢字节", 不能伪装成 IO 错误。
+//	代价与边界：每次写都要拿一次互斥锁 (预览是 bytes.Buffer, 非并发安全); 字节照收照
+//	  算, 只是不再留存 —— 所以它限的是**留存**, 不是进程的输出速率。
+//	设计权衡：超限后不关管道、不杀进程, 只静默丢弃并打 truncated 标记。相比"写满就断",
+//	  长输出的任务仍能跑完 (不影响结果正确性), 代价是丢了尾部输出。
 func (s *limitedStream) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -190,6 +211,7 @@ func (s *limitedStream) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// previewString 加锁读回已缓存的预览文本 (与并发中的 Write 安全)。
 func (s *limitedStream) previewString() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

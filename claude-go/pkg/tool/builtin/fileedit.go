@@ -30,16 +30,20 @@ type fileEditInput struct {
 
 type FileEditTool struct{}
 
+// NewFileEditTool 构造 FileEdit 工具实例 (无状态, 可直接复用)。
 func NewFileEditTool() *FileEditTool { return &FileEditTool{} }
 
+// Name 返回工具名 "StrReplace"。
 func (t *FileEditTool) Name() string { return FileEditToolName }
 
+// Description 返回给模型看的工具说明; 强调 old_string 必须唯一, 否则调用失败。
 func (t *FileEditTool) Description() string {
 	return `Performs exact string replacements in files.
 The edit will FAIL if old_string is not unique in the file.
 Use replace_all for replacing all occurrences of old_string.`
 }
 
+// InputSchema 返回 JSON Schema; required 里不含 replace_all, 默认按唯一匹配处理。
 func (t *FileEditTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -53,9 +57,13 @@ func (t *FileEditTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false —— 本工具会写文件。
 func (t *FileEditTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+// IsConcurrencySafe 恒为 false —— 并发编辑同一文件会互相覆盖, 由 tctx.ClaimWrite 在调用期兜底。
 func (t *FileEditTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
+// CheckPermissions 规划模式 (Plan) 下默认拒绝写操作, 唯一例外是计划文件目录内的路径。
+// 返回 nil 表示不干预, 交给后续权限链继续判定。
 func (t *FileEditTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx == nil || tctx.PermissionMode != types.PermissionModePlan {
 		return nil

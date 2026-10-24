@@ -48,6 +48,7 @@ func NewSessionStore(projectDir string) (*SessionStore, error) {
 	}, nil
 }
 
+// SessionID 返回本次会话的 ID。
 func (s *SessionStore) SessionID() string { return s.sessionID }
 
 // AppendEntry 追加一条记录到 JSONL 文件。
@@ -225,10 +226,12 @@ func (s *SessionStore) Close() {
 	}
 }
 
+// sessionPath 拼出会话 JSONL 的落盘路径: <baseDir>/<projectKey>/<sid>.jsonl。
 func (s *SessionStore) sessionPath(sid string) string {
 	return filepath.Join(s.baseDir, s.projectKey, sid+".jsonl")
 }
 
+// hashDir 把目录路径哈希成 16 位十六进制串, 用作会话目录的稳定短名 (避免路径分隔符/长度问题)。
 func hashDir(dir string) string {
 	h := sha256.Sum256([]byte(dir))
 	return hex.EncodeToString(h[:8])

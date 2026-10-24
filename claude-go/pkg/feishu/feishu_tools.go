@@ -29,14 +29,17 @@ func NewFeishuSendFileTool(chatID string, sendFn func(ctx context.Context, chatI
 	return &FeishuSendFileTool{chatID: chatID, sendFn: sendFn}
 }
 
+// Name 返回工具名。
 func (t *FeishuSendFileTool) Name() string { return "FeishuSendFile" }
 
+// Description 返回给模型的工具说明 (中文原文)。
 func (t *FeishuSendFileTool) Description() string {
 	return `通过飞书发送本地文件或图片给用户。支持图片(png/jpg/gif/svg)和任意文件。` +
 		`file_path 为服务器上的绝对路径。` +
 		`media_type 可选: "image"(图片)、"file"(文件)，留空则自动检测。`
 }
 
+// InputSchema 返回入参 schema: file_path 必填, media_type 可选 (image/file)。
 func (t *FeishuSendFileTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -48,12 +51,21 @@ func (t *FeishuSendFileTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 返回 true: 只读取本地文件, 不改动被读对象 (发消息是外部副作用, 不算文件系统写)。
 func (t *FeishuSendFileTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 返回 true: 工具本身无共享可变状态。
 func (t *FeishuSendFileTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 一律放行 (返回 nil)。
 func (t *FeishuSendFileTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 读入本地文件后经注入的 sendFn 发到本实例绑定的 chatID; media_type 留空时按扩展名推断。
+//
+// 注意: 这里把整个文件读进内存再发, 没有大小上限 —— 发超大文件会同时压垮进程内存与飞书接口。
+// 调用方 (agent) 需要自己约束文件体积。
 func (t *FeishuSendFileTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in feishuSendInput
 	if err := json.Unmarshal(input, &in); err != nil {

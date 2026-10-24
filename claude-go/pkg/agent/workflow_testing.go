@@ -13,6 +13,11 @@
 //	代码分析 → 风险建模 → 测试计划分解 → 4路并行生成 → 执行 → Flake检测 → 变异分析 → 门禁 → 报告
 package agent
 
+// testingWorkflow 返回研发测试团队工作流定义 (纯静态声明: 12 个阶段 + 依赖边 + 提示词)。
+//
+// 依赖形状: 分析→风险→计划 三段串行, 计划之后四路生成 (单元/集成/属性/混沌) 并行,
+// 再收敛到 执行→编译校验→变异分析→门禁→报告。所有 stage 的产出都靠 {prev_result}
+// 注入, 因此并行分支只能看到 plan 的输出, 彼此不可见。
 func testingWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "testing",

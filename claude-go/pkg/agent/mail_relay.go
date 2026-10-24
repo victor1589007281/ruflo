@@ -137,6 +137,7 @@ func relayMailOnce(inj MidRunMailInjector, store statestore.StateStore, teamName
 	retLog(teamName, role, stage, returnMail(store, teamName, msgs))
 }
 
+// retLog 记录一次"运行中注入落空、消息已退回信箱"的告警 (下一次读取时会照常投递)。
 func retLog(teamName, role, stage string, err error) {
 	logging.For("mailbox").Warn(
 		"运行中注入落空, 消息已退回信箱 (将在下一次读取时投递)",

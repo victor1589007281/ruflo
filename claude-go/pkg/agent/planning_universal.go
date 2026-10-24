@@ -35,6 +35,7 @@ type timeoutClassification struct {
 	AllowSplit bool
 }
 
+// normalizePlanningID 把任意标识符归一为小写、仅含 [a-z0-9._:-] 的 ID, 其余字符折成连字符。
 func normalizePlanningID(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	if s == "" {
@@ -45,6 +46,7 @@ func normalizePlanningID(s string) string {
 	return strings.Trim(s, "-")
 }
 
+// uniqueTrimmedStrings 去首尾空白、丢空串、保序去重。
 func uniqueTrimmedStrings(in []string) []string {
 	if len(in) == 0 {
 		return nil
@@ -62,6 +64,7 @@ func uniqueTrimmedStrings(in []string) []string {
 	return out
 }
 
+// normalizePlanFiles 归一 WBS 里声明的文件路径: 展开花括号、转 slash、Clean; 越界 (绝对/上跳) 路径原样保留。
 func normalizePlanFiles(in []string) []string {
 	if len(in) == 0 {
 		return nil
@@ -84,6 +87,19 @@ func normalizePlanFiles(in []string) []string {
 	return uniqueTrimmedStrings(out)
 }
 
+// expandPlanBracePath 展开单个花括号的路径 (如 src/{a,b}.go); 无花括号或括号体不合法时原样返回。
+//
+// 算法解读：
+//
+//	原理：WBS 里声明的常常是"一组文件", 而落盘与冲突检测需要逐个具体路径, 这一步负责把
+//	      声明展开成路径集合。
+//	关键不变量：只展开**第一个**花括号, 且括号体内不得含 `/`、`\` 或嵌套花括号 —— 任一
+//	      条不满足就原样返回。宁可少展开也不猜: 把 `{a/b,c}` 展开成带目录的路径会让写入
+//	      落到从未声明过的目录里。
+//	代价与边界：不递归, 多个花括号只展开最左边那个; 展开为空时回退原串, 保证"输入非空则
+//	      输出非空"。
+//	设计权衡：这是 glob 的十几行子集, 换来不引依赖且行为完全可预测 —— 路径展开的意外行为
+//	      会直接变成"文件写错地方"。
 func expandPlanBracePath(pathValue string) []string {
 	pathValue = strings.TrimSpace(pathValue)
 	if pathValue == "" || !strings.Contains(pathValue, "{") || !strings.Contains(pathValue, "}") {
@@ -114,6 +130,7 @@ func expandPlanBracePath(pathValue string) []string {
 	return out
 }
 
+// rawTaskWriteFiles 返回任务实际会写的文件: writeFiles 优先, 为空则回退 targetFiles。
 func rawTaskWriteFiles(rt rawTask) []string {
 	if len(rt.writeFiles) > 0 {
 		return rt.writeFiles
@@ -121,12 +138,14 @@ func rawTaskWriteFiles(rt rawTask) []string {
 	return rt.targetFiles
 }
 
+// rawTaskConflictKeys 返回归一 (去空白/去重) 后的冲突键。
 func rawTaskConflictKeys(rt rawTask) []string {
 	var keys []string
 	keys = append(keys, rt.conflictKeys...)
 	return uniqueTrimmedStrings(keys)
 }
 
+// nonGlobalRawTaskConflictKeys 过滤掉 ":global" 结尾的冲突键 —— 全局键不参与文件级互斥。
 func nonGlobalRawTaskConflictKeys(rt rawTask) []string {
 	keys := rawTaskConflictKeys(rt)
 	if len(keys) == 0 {
@@ -143,6 +162,15 @@ func nonGlobalRawTaskConflictKeys(rt rawTask) []string {
 	return uniqueTrimmedStrings(out)
 }
 
+// estimateRawTaskLOC 粗估任务的改动规模 (行数): 先按任务类型定档, 再按文件数与复杂度加成。
+//
+// 算法解读：
+//
+//	原理：在真正写代码之前给出改动规模的量级估计, 供排期与"是否该拆"参考。
+//	关键不变量：verification 类型恒返回 20 行 —— 验证任务的成本与它验证的代码量无关;
+//	      若跟着文件数放大, 终验任务会被系统性误判成超载而反复被拆。
+//	代价与边界：这是**量级**估计 (60/90/140 行每文件), 不是预测; 文件数为 0 时按单文件
+//	      下限取值, 避免估出 0。
 func estimateRawTaskLOC(rt rawTask) int {
 	files := len(rawTaskWriteFiles(rt))
 	if files <= 0 {
@@ -164,6 +192,7 @@ func estimateRawTaskLOC(rt rawTask) int {
 	}
 }
 
+// synthesizedObjectiveWBS 在规划器产出不可用 (校验耗尽) 时, 用 objective 兜底合成一份通用 WBS。
 func synthesizedObjectiveWBS(objective string) []rawTask {
 	adapter := planningLanguageAdapterFor(inferPlanningLanguageID(objective, ""))
 	targetRoot := inferObjectiveTargetRoot(objective)
@@ -177,6 +206,21 @@ func synthesizedObjectiveWBS(objective string) []rawTask {
 	return synthesizedUniversalV1WBS(targetRoot, adapter)
 }
 
+// synthesizedUniversalV1WBS 生成语言无关的兜底 WBS (8 个节点): 骨架 → 入口 → 契约 → 存储构造 →
+// 存储 CRUD → 检索 → 本地用例 → 终验。
+//
+// 算法解读：
+//
+//	原理：规划器校验耗尽时不能把任务判死。这里用一份与目标语言无关的最小可编译骨架接管,
+//	      让"造一个 X"这类空泛 objective 至少产出一个能 build 的项目。
+//	关键不变量：每个叶子只写一个文件、只依赖前一个叶子的产出 (depNums 构成一条链), 且每个
+//	      叶子的 accept 都写明"不做什么"。粒度一旦越界 (一个叶子同时改存储与检索), 失败
+//	      就无法归因到具体一步, 拆分也就失去了意义。
+//	代价与边界：产出的是通用骨架而非贴合 objective 的设计, 只保证可编译可测; 因此每个节点
+//	      的 splitReason 一律标 objective-fallback:planner-validation-exhausted, 让下游能把
+//	      它与真实规划区分开。
+//	设计权衡：宁愿给一条"窄但一定能跑通"的链, 也不给一张"宽但可能互相冲突"的图 ——
+//	      并行的存储/检索叶子在无人协调时极易写出重复接口 (见 accept 里的禁令)。
 func synthesizedUniversalV1WBS(root string, adapter planningLanguageAdapter) []rawTask {
 	if adapter.ID == "" {
 		adapter = planningLanguageAdapterFor("")
@@ -332,6 +376,7 @@ func synthesizedUniversalV1WBS(root string, adapter planningLanguageAdapter) []r
 	}
 }
 
+// universalMainFileForAdapter 返回该语言的项目入口文件 (Python/Rust/TS/JS/C++ 各一条, 默认 Go)。
 func universalMainFileForAdapter(adapter planningLanguageAdapter) string {
 	switch adapter.ID {
 	case "python":
@@ -349,6 +394,7 @@ func universalMainFileForAdapter(adapter planningLanguageAdapter) string {
 	}
 }
 
+// universalCoreFileForAdapter 返回该语言的核心契约文件路径 (默认 internal/core/types.go)。
 func universalCoreFileForAdapter(adapter planningLanguageAdapter) string {
 	switch adapter.ID {
 	case "python":
@@ -366,6 +412,7 @@ func universalCoreFileForAdapter(adapter planningLanguageAdapter) string {
 	}
 }
 
+// universalStoreFileForAdapter 返回该语言的存储实现文件路径 (默认 internal/store/store.go)。
 func universalStoreFileForAdapter(adapter planningLanguageAdapter) string {
 	switch adapter.ID {
 	case "python":
@@ -383,6 +430,7 @@ func universalStoreFileForAdapter(adapter planningLanguageAdapter) string {
 	}
 }
 
+// universalSearchFileForAdapter 返回该语言的检索实现文件路径 (默认 internal/search/search.go)。
 func universalSearchFileForAdapter(adapter planningLanguageAdapter) string {
 	switch adapter.ID {
 	case "python":
@@ -400,6 +448,7 @@ func universalSearchFileForAdapter(adapter planningLanguageAdapter) string {
 	}
 }
 
+// universalTestFileForAdapter 返回该语言的测试文件路径 (Go 用根目录外部测试包, 规避循环导入)。
 func universalTestFileForAdapter(adapter planningLanguageAdapter) string {
 	switch adapter.ID {
 	case "python":
@@ -417,6 +466,7 @@ func universalTestFileForAdapter(adapter planningLanguageAdapter) string {
 	}
 }
 
+// universalTestAcceptanceForAdapter 返回该语言测试叶子的验收措辞 (Go 额外禁止把测试放进 internal/core)。
 func universalTestAcceptanceForAdapter(adapter planningLanguageAdapter) string {
 	switch adapter.ID {
 	case "go":
@@ -426,6 +476,7 @@ func universalTestAcceptanceForAdapter(adapter planningLanguageAdapter) string {
 	}
 }
 
+// universalVerifyCommandForAdapter 返回该语言的本地验证命令 (在 root 下执行)。
 func universalVerifyCommandForAdapter(root string, adapter planningLanguageAdapter) string {
 	switch adapter.ID {
 	case "python":
@@ -441,6 +492,7 @@ func universalVerifyCommandForAdapter(root string, adapter planningLanguageAdapt
 	}
 }
 
+// inferPlanningLanguageID 推断目标语言: 显式声明优先, 否则从 objective 里认关键词; 认不出返回空串。
 func inferPlanningLanguageID(objective, explicit string) string {
 	explicit = strings.ToLower(strings.TrimSpace(explicit))
 	switch explicit {
@@ -479,6 +531,11 @@ func inferPlanningLanguageID(objective, explicit string) string {
 	}
 }
 
+// planningLanguageAdapterFor 返回某语言的规划适配器: 清单文件、测试后缀、验证命令与目录叶子规格。
+// 未知语言回退 Go。
+//
+// 每个目录固定产出三个叶子 (契约 → 实现 → 测试), 这是 WBS 粒度的最小可归因单元:
+// 契约叶子只定义类型与错误边界, 实现叶子只做一个行为闭环, 测试叶子只补最小用例。
 func planningLanguageAdapterFor(language string) planningLanguageAdapter {
 	switch strings.ToLower(strings.TrimSpace(language)) {
 	case "python", "py":
@@ -544,11 +601,13 @@ func planningLanguageAdapterFor(language string) planningLanguageAdapter {
 	}
 }
 
+// renderDirectoryLeafFile 把目录叶子规格渲染成具体文件路径 ({stem} 替换为目录名/文件主名)。
 func (a planningLanguageAdapter) renderDirectoryLeafFile(dir, stem string, spec planningDirectoryLeafSpec) string {
 	suffix := strings.ReplaceAll(spec.Suffix, "{stem}", stem)
 	return filepath.ToSlash(filepath.Join(dir, suffix))
 }
 
+// planningErrorText 取错误文本; err 为 nil 时返回空串。
 func planningErrorText(err error) string {
 	if err == nil {
 		return ""
@@ -695,6 +754,18 @@ func titleSemanticLoad(title string) float64 {
 	return score
 }
 
+// classifyAgentTimeout 把一次 agent 超时归因: 限流 / prompt 膨胀 / 真·超载 / provider 停摆 / 未知。
+//
+// 算法解读：
+//
+//	原理：超时不等于"任务太大"。先排除两个与任务规模无关的成因 (provider 限流、prompt 本身
+//	      超长), 再用认知负载评分决定"该拆"还是"该重试"。
+//	关键不变量：限流与 prompt 膨胀**先于**负载评分判定, 且都禁止拆分 —— 这两类超时重试就好,
+//	      拆任务只会把一个非任务问题变成两个。
+//	代价与边界：负载分是启发式 (关键词 + 文件数 + 风险等级), 不是测量值; 6~8 分是"允许拆"
+//	      的灰区, 判错的方向是拆得过细而不是漏拆。
+//	设计权衡：把 defaultCoderCallTimeout 写死在这里, 是为了让"小负载叶子却超时"这条唯一能
+//	      指向 provider 停摆的证据不被配置漂移带走。
 func classifyAgentTimeout(err error, node *TaskNode, promptChars int, elapsed time.Duration) timeoutClassification {
 	lowerErr := strings.ToLower(planningErrorText(err))
 	if strings.Contains(lowerErr, "rate limit") || strings.Contains(lowerErr, "429") ||
@@ -710,6 +781,7 @@ func classifyAgentTimeout(err error, node *TaskNode, promptChars int, elapsed ti
 	}
 
 	load := cognitiveLoadScore(node)
+	// 阈值是**连续评分**而不是二值: 6~8 分允许拆 (拆了大概率更顺), >8 分明确该拆。
 
 	// 连续评分: >8 分明确拆分, 6~8 分允许拆分, <6 分倾向 provider stall
 	if load > 8.0 {

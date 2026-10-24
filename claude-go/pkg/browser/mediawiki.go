@@ -18,6 +18,7 @@ type MediaWikiClient struct {
 	client *http.Client
 }
 
+// NewMediaWikiClient 构造 MediaWiki API 客户端, 内置 30 秒超时的 http.Client (每次请求各自计时)。
 func NewMediaWikiClient() *MediaWikiClient {
 	return &MediaWikiClient{
 		client: &http.Client{Timeout: 30 * time.Second},
@@ -32,12 +33,24 @@ func IsMediaWiki(rawURL string) bool {
 }
 
 // Fetch 通过 MediaWiki API 获取文章内容。
+//
+// 算法解读：
+//
+//	原理：先用轻量的 action=query&prop=extracts 取纯文本, 失败再退到 action=parse 取渲染后的
+//	      HTML 并用 extractMainText 抽正文 —— 两条路都走不通才报 all methods failed。
+//	关键不变量：两条路径共用 parseWikiURL 解析出的同一组 (apiBase, pageTitle) —— 若各自解析,
+//	      fallback 可能打到另一个页面, 拿到"成功但不对"的内容, 这种错最隐蔽。
+//	代价与边界：失败路径要发两次 HTTP (extracts 的失败多来自该 wiki 未启用扩展或页面不存在,
+//	      后者两条路都会失败); HTML 抽取的正文质量低于 extracts 纯文本, 会带进更多噪声。
+//	设计权衡：不直接走 action=parse —— extracts 更干净也更省带宽, 但 Fandom 一类站点常未启用,
+//	      所以保留 HTML 兜底而不是只留一条路。
 func (m *MediaWikiClient) Fetch(ctx context.Context, rawURL string) (*FetchResult, error) {
 	apiBase, pageTitle, err := parseWikiURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
 
+	// 只有 extracts 失败才退 HTML: 成功即短路, 不为了"更全"再多抓一次。
 	text, err := m.fetchExtract(ctx, apiBase, pageTitle)
 	if err != nil {
 		text, err = m.fetchParsedHTML(ctx, apiBase, pageTitle)

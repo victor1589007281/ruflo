@@ -271,6 +271,7 @@ func Mount(mux *http.ServeMux, host func() Host) *Server {
 
 // ── 路由 ────────────────────────────────────────────────────────────────────
 
+// handleSessions GET/POST /api/sessions: 列出会话 (带 busy 标记, 按 id 排序) 或创建会话。
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	h := s.host()
 	if h == nil {
@@ -424,6 +425,19 @@ func (s *Server) handleSessionItem(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// postMessage POST /api/sessions/{id}/messages: 原子占位后异步跑一轮, 立即 202 返回 runId。
+//
+// 算法解读：
+//
+//	原理：一次消息 = 一次 run。HTTP 层只负责"占位 + 起 goroutine + 立刻 202"; 真正的执行
+//	      结果通过 run 档案表 (轮询) 与 SSE 事件流 (订阅) 两条路回给调用方。
+//	关键不变量：占位 (Reserve) 必须原子 —— 否则两条同时到达的消息会双双通过、双双拿到 202,
+//	      同一个会话上跑起两个 run。收口必须写在 defer 里: 任何一条退出路径 (含 panic) 都要
+//	      落到终态并释放占位, 否则这个会话永久 409。
+//	代价与边界：同一会话同时只能有一个 run, 忙时返回 409 而不是排队; 取消的权威判据是本 run
+//	      的 ctx 而不是 Run 返回的 err —— 引擎被取消时可能只是关掉事件流并正常返回。
+//	设计权衡：异步 + runId 而不是同步长连接, 让慢 run 不占用调用方的连接预算; 代价是调用方
+//	      要多一次轮询或订阅。
 func (s *Server) postMessage(w http.ResponseWriter, r *http.Request, h Host, id string) {
 	if _, err := h.Get(id); err != nil {
 		s.writeHostErr(w, err)
@@ -656,6 +670,7 @@ func (s *Server) runView(h Host, run *Run) map[string]any {
 	return out
 }
 
+// writeHostErr 把 Host 返回的错误映射成 404 (未找到) 或 500。
 func (s *Server) writeHostErr(w http.ResponseWriter, err error) {
 	if errors.Is(err, ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "没有这个会话")
@@ -666,6 +681,7 @@ func (s *Server) writeHostErr(w http.ResponseWriter, err error) {
 
 // ── run 档案表 ──────────────────────────────────────────────────────────────
 
+// remember 把一个 run 记进会话档案表头部, 并按 maxRetainedRuns 截断尾部。
 func (s *Server) remember(run *Run) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -676,6 +692,7 @@ func (s *Server) remember(run *Run) {
 	s.runs[run.SessionID] = list
 }
 
+// findRun 在会话档案表里按 runID 查 run; 查不到返回 nil。
 func (s *Server) findRun(sessionID, runID string) *Run {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -687,6 +704,7 @@ func (s *Server) findRun(sessionID, runID string) *Run {
 	return nil
 }
 
+// lastRun 返回该会话最近一次 run (档案表头); 没有则返回 nil。
 func (s *Server) lastRun(sessionID string) *Run {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -696,6 +714,7 @@ func (s *Server) lastRun(sessionID string) *Run {
 	return nil
 }
 
+// runsFor 返回该会话的 run 列表副本 (新的在前)。
 func (s *Server) runsFor(sessionID string) []*Run {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -704,6 +723,7 @@ func (s *Server) runsFor(sessionID string) []*Run {
 	return out
 }
 
+// runningRunIDs 返回该会话中仍处于 running 状态的 run id。
 func (s *Server) runningRunIDs(sessionID string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -716,6 +736,7 @@ func (s *Server) runningRunIDs(sessionID string) []string {
 	return out
 }
 
+// recentRunIDs 返回最近 n 个 run id (不足 n 个则全部)。
 func (s *Server) recentRunIDs(sessionID string, n int) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -774,6 +795,7 @@ func intAttr(attrs map[string]any, key string) int {
 	return 0
 }
 
+// firstOrEmpty 取字符串切片首元素; 空切片返回空串。
 func firstOrEmpty(ss []string) string {
 	if len(ss) == 0 {
 		return ""
@@ -783,12 +805,14 @@ func firstOrEmpty(ss []string) string {
 
 // ── 响应helpers ─────────────────────────────────────────────────────────────
 
+// writeJSON 以 UTF-8 JSON 写响应。
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeErr 写一个 {"error": msg} 响应。
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
 }

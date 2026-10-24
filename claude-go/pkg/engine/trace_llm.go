@@ -219,6 +219,7 @@ func renderAPIContent(content json.RawMessage) string {
 	return strings.Join(parts, "\n")
 }
 
+// truncateForAttr 把字符串截到 300 字符以内并以 … 收尾, 用于 span 属性值(避免超长属性撑爆轨迹)。
 func truncateForAttr(s string) string {
 	const max = 300
 	return textutil.Truncate(s, max, "…")

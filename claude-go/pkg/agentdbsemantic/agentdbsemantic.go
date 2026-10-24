@@ -83,8 +83,10 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any) ([]b
 	return data, resp.StatusCode, nil
 }
 
+// pathEscape 对 URL 路径段做转义 (一行委托 url.PathEscape)。
 func pathEscape(s string) string { return url.PathEscape(s) }
 
+// truncate 把字符串截到 n 个字符, 超出部分以 "..." 收尾 (委托 textutil.Truncate)。
 func truncate(s string, n int) string {
 	return textutil.Truncate(s, n, "...")
 }

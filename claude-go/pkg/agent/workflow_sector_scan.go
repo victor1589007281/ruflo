@@ -12,6 +12,8 @@
 // 规则打分互为印证。区别于 trading-v2 的单标的纵深分析。
 package agent
 
+// sectorScanWorkflow 返回"产业链环节横向扫描"工作流定义: 估值对比 → 基本面排名 →
+// 催化剂扫描 → 策略裁决 四段 pipeline, 每段以上一段结果 {prev_result} 为输入。
 func sectorScanWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "sector-scan",

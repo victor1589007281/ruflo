@@ -186,6 +186,7 @@ is_error=false、模型说了一段像样的话, 而一个字节没改"的静默
 	return cmd
 }
 
+// splitList 按逗号切分并去掉空白项; 全空输入返回 nil。
 func splitList(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {

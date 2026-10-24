@@ -63,6 +63,10 @@ type promptDebugFile struct {
 	Response    *promptDebugResponse   `json:"response,omitempty"`
 }
 
+// newPromptDebugCapture 为一次 LLM 调用开一个观测记录; 未启用时返回 nil (后续方法全部 nil-safe)。
+//
+// 采样用全局自增序号 seq 对 10000 取模判定, 而不是随机数: 序号单调递增,
+// 所以采样比例在任意长度的窗口内都是**确定性均匀**的, 便于复现"第 N 次调用是否落盘"。
 func (c *Client) newPromptDebugCapture(request string, stream bool) *promptDebugCapture {
 	if c == nil || !c.PromptDebugEnabled {
 		return nil
@@ -92,6 +96,7 @@ func (c *Client) newPromptDebugCapture(request string, stream bool) *promptDebug
 	}
 }
 
+// addAttempt 记录一次上游请求尝试 (重试时会有多条), body 先深拷贝再入列。
 func (d *promptDebugCapture) addAttempt(attempt int, url, model string, body []byte) {
 	if d == nil {
 		return
@@ -107,6 +112,7 @@ func (d *promptDebugCapture) addAttempt(attempt int, url, model string, body []b
 	})
 }
 
+// addStreamEvent 追加一条原始 SSE data 帧 (空串忽略)。
 func (d *promptDebugCapture) addStreamEvent(data string) {
 	if d == nil || data == "" {
 		return
@@ -117,6 +123,7 @@ func (d *promptDebugCapture) addStreamEvent(data string) {
 	d.events = append(d.events, json.RawMessage(dataCopy))
 }
 
+// setResponse 记录非流式响应的 HTTP 状态码与响应体。
 func (d *promptDebugCapture) setResponse(status int, body []byte) {
 	if d == nil {
 		return
@@ -130,6 +137,20 @@ func (d *promptDebugCapture) setResponse(status int, body []byte) {
 	}
 }
 
+// finish 收尾: 组装记录、按需脱敏、落盘一个 <id>.json, 然后触发保留策略清理。
+//
+// 算法解读：
+//
+//	原理：把"要不要落盘"拆成**两个独立判据的析取** —— 命中采样 (sampled) 或这是一次
+//		失败 (isFailure)。失败样本永远落盘, 与采样率无关。
+//	关键不变量：**失败请求不得被采样率丢掉**。采样是有损的, 而失败样本正是最需要被
+//		留存的那一小撮; 若把判据写成 "sampled && ..." 这类合取, 排查线上问题时
+//		会发现在 1% 采样下几乎没有失败记录可看 —— 这个析取方向是刻意的。
+//	代价与边界：先加锁拷出 attempts/events/response 再解锁, 落盘 (Marshal + WriteFile
+//		+ 目录清理) 全程不持锁, 所以写盘慢不会阻塞并发的 addStreamEvent。代价是
+//		finish 之后到达的事件会被丢弃 (capture 已收尾, 不该再有事件)。
+//	设计权衡：落盘错误全部静默吞掉 (MkdirAll/Marshal/WriteFile 的 err 都不返回) ——
+//		观测通道**绝不能**因为磁盘问题让主调用链失败。
 func (d *promptDebugCapture) finish(client *Client, rec LLMCallRecord, errMsg string) {
 	if d == nil {
 		return
@@ -206,6 +227,10 @@ func (d *promptDebugCapture) finish(client *Client, rec LLMCallRecord, errMsg st
 	}
 }
 
+// redactPromptDebugFile 就地脱敏整份记录: BaseURL、每次尝试的 URL/Body、全部流事件、响应体。
+//
+// 注意：脱敏在 **Marshal 之前、finish 内部**执行, 所以只有走 finish 落盘的路径被覆盖;
+// 直接把 capture 的内存字段喂给别的出口 (日志/API) 不会经过这里。
 func redactPromptDebugFile(out *promptDebugFile) {
 	if out == nil {
 		return
@@ -229,6 +254,10 @@ var (
 	skPattern         = regexp.MustCompile(`\bsk-[A-Za-z0-9._-]{12,}\b`)
 )
 
+// redactRawMessage 对一段原始 JSON 做**文本级**脱敏; 空值原样返回。
+//
+// 注意：它不做 JSON 解析, 直接当字符串替换 —— 好处是即使这段 JSON 已被截断/非法也能生效,
+// 代价是替换后的内容可能不再是合法 JSON (例如转义序列被改写)。
 func redactRawMessage(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return raw
@@ -236,6 +265,10 @@ func redactRawMessage(raw json.RawMessage) json.RawMessage {
 	return json.RawMessage(redactSecretsString(string(raw)))
 }
 
+// redactSecretsString 依次套用三条正则抹掉密钥: JSON 字段值、Bearer 头、sk- 前缀 token。
+//
+// 顺序有依赖：JSON 字段那条先跑 (它靠引号定界最精确), Bearer 与 sk- 两条后跑兜住
+// 非 JSON 形态的裸文本。三条都只替换**值**, 保留字段名, 便于事后判断"这里本该有密钥"。
 func redactSecretsString(s string) string {
 	if s == "" {
 		return s
@@ -246,6 +279,20 @@ func redactSecretsString(s string) string {
 	return s
 }
 
+// enforcePromptDebugRetention 按"文件数"与"总字节"两个上限淘汰最旧记录; 两者都为 0 表示不限制。
+//
+// 算法解读：
+//
+//	原理：先按 mtime 升序把 .json 记录排好, 然后**依次**用两道闸门从队首 (最旧) 删除,
+//		先削文件数, 再削总字节。
+//	关键不变量：淘汰顺序必须与排序顺序一致 —— 只删队首。否则删掉新文件、留下旧文件,
+//		观测目录就退化成"越查越旧"。两道闸门是**串行**而非并行: 第一道删完要重新
+//		累计 total, 第二道接着在剩下的集合上判。
+//	代价与边界：整目录读一遍 + 排序, O(n log n); 只在**每次成功落盘后**调用, 所以
+//		并发写会各自跑一遍清理, 重复删除由 os.Remove 的失败被忽略兜住。目录不存在
+//		或不可读时直接返回, 不报错。
+//	设计权衡：不做后台定时清理 —— 那样需要在别处维护生命周期; 挂在写入路径上虽然
+//		把成本摊给写方, 但保证了"目录大小恒有上界"这一条不依赖任何外部调度。
 func enforcePromptDebugRetention(dir string, maxFiles int, maxBytes int64) {
 	if maxFiles <= 0 && maxBytes <= 0 {
 		return
@@ -276,7 +323,9 @@ func enforcePromptDebugRetention(dir string, maxFiles int, maxBytes int64) {
 		})
 		total += info.Size()
 	}
+	// 只删队首 (最旧): 顺序与排序一致, 否则会删掉新文件而留下旧的, 目录越查越旧。
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	// 两道闸门**串行**而非并排: 第一道按文件数削完, 第二道再在剩下的集合上按字节削。
 	for len(files) > 0 && maxFiles > 0 && len(files) > maxFiles {
 		_ = os.Remove(files[0].path)
 		total -= files[0].size
@@ -289,6 +338,7 @@ func enforcePromptDebugRetention(dir string, maxFiles int, maxBytes int64) {
 	}
 }
 
+// firstNonEmpty 返回第一个非空字符串; 全空时返回空串。
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {
@@ -298,6 +348,7 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// clientModel 取 client 上的模型名; nil client 返回空串 (不 panic)。
 func clientModel(c *Client) string {
 	if c == nil {
 		return ""
@@ -305,6 +356,7 @@ func clientModel(c *Client) string {
 	return c.Model
 }
 
+// clientBaseURL 取 client 上的 BaseURL; nil client 返回空串 (不 panic)。
 func clientBaseURL(c *Client) string {
 	if c == nil {
 		return ""

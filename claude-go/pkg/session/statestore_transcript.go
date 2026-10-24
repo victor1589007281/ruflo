@@ -232,6 +232,7 @@ func mediaRefKey(msgIdx, blockIdx int) string {
 	return strconv.Itoa(msgIdx) + "/" + strconv.Itoa(blockIdx)
 }
 
+// parseMediaRefKey 解析侧表 key; 格式不对、任一段非整数或为负都返回 ok=false。
 func parseMediaRefKey(k string) (msgIdx, blockIdx int, ok bool) {
 	slash := strings.IndexByte(k, '/')
 	if slash <= 0 {

@@ -74,12 +74,15 @@ func (t *WebFetchTool) SetBrowser(b BrowserClient) {
 	t.browser = b
 }
 
+// Name 返回工具对外名。
 func (t *WebFetchTool) Name() string { return WebFetchToolName }
 
+// Description 返回给模型看的工具说明 (拉取并简化提取正文, 可带 prompt 附加上下文)。
 func (t *WebFetchTool) Description() string {
 	return `Fetches a URL via HTTP/HTTPS and returns a simplified plain-text extraction of the page (HTML tags stripped, truncated). Optional prompt can supply extra instructions for how to use the fetched content.`
 }
 
+// InputSchema 返回入参 JSON Schema (url 必填且须为绝对 HTTP/HTTPS 地址; prompt 可选)。
 func (t *WebFetchTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -97,8 +100,10 @@ func (t *WebFetchTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒只读: 只发 GET, 不改远端状态。
 func (t *WebFetchTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
+// IsConcurrencySafe 恒可并发: 只读且无共享可变状态。
 func (t *WebFetchTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 // CheckPermissions 只读网络工具：不附加 Deny。

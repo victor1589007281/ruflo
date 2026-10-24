@@ -13,6 +13,15 @@
 //	数据分析 ∥ 特征工程 → 模型设计 → 训练执行 → 评估分析 → 优化/蒸馏 → 综合报告
 package agent
 
+// mlTrainingWorkflow 返回 ML 训练/微调团队的 pipeline 定义。
+//
+// 依赖形状 (与文件头的流程一致, 由 DependsOn 表达):
+//
+//	data-analysis ∥ feature-engineering  →  model-design  →  training
+//	  →  evaluation  →  optimization-distillation  →  synthesis
+//
+// 前两段标了 Parallel: 它们互不依赖 (都只吃 objective), 可以同时跑;
+// 其余各段串行 —— 训练必须等模型设计与特征管线都定稿。
 func mlTrainingWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "ml-training",

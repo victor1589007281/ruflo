@@ -172,6 +172,22 @@ func Create(opts CreateOptions) (*CreateResult, error) {
 	}, nil
 }
 
+// addPathToTar 把一个文件或整棵目录树写进 tar, 返回 (文件数, 字节数, 错误)。
+//
+// 算法解读：
+//
+//	原理：src 是磁盘上的真实路径, rel 是它在包内的相对前缀。单文件直接入包; 目录则 filepath.Walk
+//	      遍历, 每个条目按 Rel(src, path) 换算成包内名, 目录写成 tar.TypeDir 条目 (带尾部 "/")。
+//	关键不变量：包内名必须**始终**基于 rel 而不是绝对路径 —— tar 条目名一旦泄漏宿主绝对路径,
+//	      解包时就会按那个路径落盘 (路径穿越)。同理跳过 socket/pipe 等特殊文件 (ModeType != 0):
+//	      tar 无法忠实表示它们, 强行写入会得到解包失败或语义错误的普通文件。
+//	代价与边界：整棵树串行遍历 + 逐文件 io.Copy, 与备份体量线性; 遍历中任一文件读失败即整体失败
+//	      (不跳过), 因为"备份少了一个文件却报成功"比备份失败更危险。
+//	设计权衡：刻意不跟随符号链接 (Walk 本身不跟随) —— 备份要的是当时的树形状, 跟随链接会把
+//	      目标目录整棵复制进来, 体积和语义都不可控。
+//
+// 注意: 跳过 report.md 的两个条件里, 第二个 (HasSuffix(..., "report.md")) 已覆盖第一个
+// (HasSuffix(..., "/report.md")) —— 前者是死条件, 不改变行为。
 func addPathToTar(tw *tar.Writer, src, rel string, opts CreateOptions) (fileCount int, totalBytes int64, err error) {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -198,6 +214,8 @@ func addPathToTar(tw *tar.Writer, src, rel string, opts CreateOptions) (fileCoun
 				return nil
 			}
 		}
+		// 目录也必须写 Header: tar 靠条目名尾部的 "/" 与 TypeDir 标识目录, 漏掉它解包时
+		// 目录不会被创建, 后续文件条目会因父目录不存在而失败。
 		if i.IsDir() {
 			hdr := &tar.Header{
 				Name:     name,
@@ -222,6 +240,10 @@ func addPathToTar(tw *tar.Writer, src, rel string, opts CreateOptions) (fileCoun
 	return fileCount, totalBytes, err
 }
 
+// writeFileToTar 把一个普通文件按 name 写进 tar, 返回写入字节数。
+//
+// 注意: Header 只填 Name/Mode/Size/ModTime, 不设 Typeflag —— 零值在 archive/tar 里就是普通文件,
+// 这也是它只适用于普通文件的原因 (目录/链接走 addPathToTar 里各自的 Header)。
 func writeFileToTar(tw *tar.Writer, src, name string, info os.FileInfo) (int64, error) {
 	f, err := os.Open(src)
 	if err != nil {
@@ -459,6 +481,10 @@ func Delete(stateDir, archivePath string) error {
 // utils
 // ======================================================================
 
+// sanitizeLabel 把用户给的标签净化成安全文件名片段: 只留 [A-Za-z0-9_-], 并截到 32 字节。
+//
+// 白名单而不是黑名单: 标签会直接拼进 <时间戳>-<label>.tar.gz, 放过 `/` 或 `..` 就能写到
+// backups 目录之外。截断按字节做在这里是安全的 —— 白名单已经排除了多字节字符。
 func sanitizeLabel(s string) string {
 	var b strings.Builder
 	for _, r := range s {

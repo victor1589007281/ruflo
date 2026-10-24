@@ -213,6 +213,7 @@ func deriveVerdictStats(spans []tracestore.Span) []nodeVerdictStat {
 	return out
 }
 
+// accumulate 把一条判定累加进统计: 记录类别计数, 可量化的计入 Sum/Counted, 不可量化则只计 Skipped。
 func accumulate(s *nodeVerdictStat, v verdict) {
 	s.Kinds[string(v)]++
 	val, ok := verdictValue(v)

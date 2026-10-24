@@ -132,33 +132,42 @@ func NewTaskStoreDAGAdapter(
 	return &TaskStoreDAGAdapter{store: store, readyFunc: readyFn, getAllFunc: getAllFn}
 }
 
+// AddTask 委托底层存储创建任务。
 func (a *TaskStoreDAGAdapter) AddTask(subject, description, owner string) (string, error) {
 	return a.store.AddTask(subject, description, owner)
 }
+// SetTaskStatus 委托底层存储更新任务状态。
 func (a *TaskStoreDAGAdapter) SetTaskStatus(id, status string) error {
 	return a.store.SetTaskStatus(id, status)
 }
+// AddTaskWithDeps 委托底层存储创建带依赖 (DAG) 的任务。
 func (a *TaskStoreDAGAdapter) AddTaskWithDeps(subject, description, owner string, dependsOn []string, priority int) (string, error) {
 	return a.store.AddTaskWithDeps(subject, description, owner, dependsOn, priority)
 }
+// AddTaskFull 委托底层存储创建带依赖与写域 (F13) 的任务。
 func (a *TaskStoreDAGAdapter) AddTaskFull(subject, description, owner string, dependsOn []string, priority int, writeScopes []string) (string, error) {
 	return a.store.AddTaskFull(subject, description, owner, dependsOn, priority, writeScopes)
 }
+// ReadyTasks 调用注入的 readyFn 返回就绪任务 (builtin.TaskSummary → DAGTaskSummary 的类型转换在调用方)。
 func (a *TaskStoreDAGAdapter) ReadyTasks() []DAGTaskSummary {
 	return a.readyFunc()
 }
+// SetTaskStatusAndUnblock 委托底层存储原子更新状态并解锁下游。
 func (a *TaskStoreDAGAdapter) SetTaskStatusAndUnblock(id, status string) (int, error) {
 	return a.store.SetTaskStatusAndUnblock(id, status)
 }
+// GetAllTasks 调用注入的 getAllFn 返回全部任务; 未注入时返回 nil。
 func (a *TaskStoreDAGAdapter) GetAllTasks() []DAGTaskSummary {
 	if a.getAllFunc != nil {
 		return a.getAllFunc()
 	}
 	return nil
 }
+// ReevaluateBlockedTasks 委托底层存储重新评估 blocked 任务 (resume 场景)。
 func (a *TaskStoreDAGAdapter) ReevaluateBlockedTasks() int {
 	return a.store.ReevaluateBlockedTasks()
 }
+// SweepStaleTasks 委托底层存储做一次台账对账, 返回本次改动条数。
 func (a *TaskStoreDAGAdapter) SweepStaleTasks(pendingTTL, blockedTTL time.Duration) int {
 	return a.store.SweepStaleTasks(pendingTTL, blockedTTL)
 }
@@ -432,6 +441,7 @@ func (ptm *ProductionTeamManager) AgentFactory() CreateAgentFunc {
 	return ptm.factory
 }
 
+// SetCwd 更新后续创建团队使用的默认工作目录; cwd 为空白时忽略 (不覆盖已有值)。
 // SetCwd updates the default working directory used by subsequently created teams.
 func (ptm *ProductionTeamManager) SetCwd(cwd string) {
 	if ptm == nil || strings.TrimSpace(cwd) == "" {
@@ -732,6 +742,8 @@ func (ptm *ProductionTeamManager) CreateTeam(name, workflow, objective, chatID s
 	return team, nil
 }
 
+// CreateTeamWithUniquePrefix 为快速启动流程创建团队: 名字用 prefix + 纳秒时间戳保证唯一,
+// 撞上历史持久化团队的重名时最多重试 20 次, 非重名错误立即返回。
 // CreateTeamWithUniquePrefix creates a team for quick-start flows and retries
 // name collisions caused by persisted historical teams.
 func (ptm *ProductionTeamManager) CreateTeamWithUniquePrefix(prefix, workflow, objective, chatID string) (*ProductionTeam, error) {
@@ -1051,6 +1063,7 @@ func (ptm *ProductionTeamManager) computeRunDelivery(
 	}, true
 }
 
+// hasPassingLocalE2EGate 从后往前找 e2e-local-gate 阶段, 报告其是否 completed 且输出含"E2E 本地门禁通过"。
 func hasPassingLocalE2EGate(results []StageResult) bool {
 	for i := len(results) - 1; i >= 0; i-- {
 		r := results[i]
@@ -1062,6 +1075,8 @@ func hasPassingLocalE2EGate(results []StageResult) bool {
 	return false
 }
 
+// hasBlockingDevelopmentFailure 判定失败阶段里是否存在硬门禁/级联阻塞这类不可兜底的失败;
+// 存在则不允许把整个 run 按交付成功处理 (仅用于 development 工作流的兜底判定)。
 func hasBlockingDevelopmentFailure(results []StageResult) bool {
 	for _, r := range results {
 		if r.Status != TaskFailed {
@@ -1081,6 +1096,7 @@ func hasBlockingDevelopmentFailure(results []StageResult) bool {
 	return false
 }
 
+// isSuccessfulTeamStatus 判定团队状态是否为交付成功 (completed / delivered_with_remediation)。
 func isSuccessfulTeamStatus(status TeamStatus) bool {
 	return status == TeamStatusCompleted || status == TeamStatusDeliveredWithRemediation
 }
@@ -1217,6 +1233,8 @@ func (ptm *ProductionTeamManager) runGlobalTestGate(ctx context.Context, team *P
 	return gateErr
 }
 
+// runGlobalConsistencyCheck 用 ContractStore 对工作目录做一次全局一致性扫描:
+// 成功返回空串, 失败返回错误文本 (供门禁当作修复反馈)。
 // runGlobalConsistencyCheck runs a global consistency check using the ContractStore.
 // Returns empty string on success, error message on failure.
 func (ptm *ProductionTeamManager) runGlobalConsistencyCheck(team *ProductionTeam) string {
@@ -1590,6 +1608,8 @@ func svgToPNG(svg string) []byte {
 	return nil
 }
 
+// failTeam 把团队置为 failed 终态: 补齐失败指标、给精修轮留痕"未采纳", 并推失败通知;
+// 限流/熔断类失败额外附上"从检查点恢复"的提示。
 func (ptm *ProductionTeamManager) failTeam(team *ProductionTeam, reason string) {
 	team.mu.Lock()
 	team.Status = TeamStatusFailed
@@ -1965,6 +1985,7 @@ func stagesFromTarget(wf *WorkflowDef, target string) []string {
 	return out
 }
 
+// stageNamesOf 返回工作流声明的全部阶段名 (按声明顺序)。
 func stageNamesOf(wf *WorkflowDef) []string {
 	var out []string
 	for _, s := range wf.Stages {
@@ -1973,6 +1994,7 @@ func stageNamesOf(wf *WorkflowDef) []string {
 	return out
 }
 
+// refineScopeLabel 生成精修范围的展示文案 (整体带反馈重跑 / 从某阶段起重跑)。
 func refineScopeLabel(target string, invalidated []string) string {
 	if target == "" {
 		return "整体带反馈重跑"
@@ -2339,6 +2361,8 @@ func (t *ProductionTeam) FormatStatus() string {
 	return status
 }
 
+// truncateResult 把字符串截断到 max 个字符, 超出部分以 "..." 收尾。
+// 按 rune 而非字节截断, 避免在多字节 UTF-8 字符中间切断。
 func truncateResult(s string, max int) string {
 	if len(s) <= max {
 		return s

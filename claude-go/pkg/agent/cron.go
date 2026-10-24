@@ -329,6 +329,7 @@ func (cs *CronScheduler) FormatJobList() string {
 
 // --- 调度核心 ---
 
+// tickLoop 每分钟触发一次 tick, 直到 stopCh 关闭; 退出时停掉 ticker。
 func (cs *CronScheduler) tickLoop() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -343,6 +344,19 @@ func (cs *CronScheduler) tickLoop() {
 	}
 }
 
+// tick 是每分钟一次的调度步: 先快照出本轮命中的任务, 再逐个抢租约后并发执行。
+//
+// 算法解读：
+//
+//	原理：cron 按分钟对齐 —— ticker 每分钟触发, 用当前时刻去匹配每个任务的 5 字段
+//	  表达式, 命中的任务各自在独立 goroutine 里执行, 不阻塞下一分钟。
+//	关键不变量：持锁期间**只做匹配与收集, 不执行任务**。executeJob 会回写 job 的
+//	  RunCount/LastRunAt 并调 persist (需要写锁), 若在 RLock 里直接执行就是自锁死。
+//	代价与边界：每轮 O(任务数); 派发出去的 goroutine 没有上限 —— 同一分钟命中很多
+//	  任务时会同时起同样多的执行体 (各自 15 分钟超时)。
+//	设计权衡：防重复触发靠分布式租约而不是本地去重。单副本下 lease 为 nil, 退化为
+//	  原地执行 (零开销); 多副本下 key 含分钟粒度, 抢不到就静默跳过 —— 幂等交给 key,
+//	  不必让每个副本各自记"这一分钟我跑过了"。
 func (cs *CronScheduler) tick(now time.Time) {
 	cs.mu.RLock()
 	var toRun []*CronJob
@@ -363,6 +377,19 @@ func (cs *CronScheduler) tick(now time.Time) {
 	}
 }
 
+// executeJob 按 jobType 分派任务给 CronExecutor, 并在结尾统一回写运行统计。
+//
+// 算法解读：
+//
+//	原理：一个 switch 把 job.JobType 映射到执行器的对应方法 (workflow/query/command/
+//	  sync/wiki-*), 结果只收敛成一个 execErr, 收尾处再统一记账与通知。
+//	关键不变量：**先校验具名会话再分派**。query/command/workflow 必须带 chatID, 空值
+//	  直接判失败并 return —— 否则会静默跑进一个匿名会话: 任务报"成功", 而那个员工
+//	  根本没被唤醒 (详见下方长注释)。
+//	代价与边界：单任务整体超时 15 分钟, 由 ctx 传导给执行体; 执行体若不理会 ctx,
+//	  这里不会强行中断。未知 JobType 记一条明确失败, 不静默成功。
+//	设计权衡：失败既写 LastResult 又发飞书通知 —— 双写是因为 dashboard 与飞书是两个
+//	  不同的观察面, 只写一个就会出现"页面上看得见但没人知道"或反之。
 func (cs *CronScheduler) executeJob(job *CronJob) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -488,6 +515,7 @@ func (cs *CronScheduler) executeJob(job *CronJob) {
 
 // --- Cron 表达式解析 (最小实现: 分 时 日 月 周) ---
 
+// validateCronExpr 校验 5 字段 cron 表达式 (分 时 日 月 周) 的字段数与各字段取值域。
 func validateCronExpr(expr string) error {
 	fields := strings.Fields(expr)
 	if len(fields) != 5 {
@@ -502,6 +530,10 @@ func validateCronExpr(expr string) error {
 	return nil
 }
 
+// validateField 校验单个 cron 字段: 支持 `*`、`*/N` 步长、逗号分隔与 `a-b` 范围。
+//
+// 注意：只校验**语法与取值域**, 不校验语义 —— 例如 `5-1` 这种 lo>hi 的逆序范围会被
+// 拒绝, 但 `*/0` 之外的退化表达式 (如超大步长) 仍会通过, 匹配时自然永不命中。
 func validateField(field string, min, max int) error {
 	if field == "*" {
 		return nil
@@ -537,6 +569,7 @@ func validateField(field string, min, max int) error {
 	return nil
 }
 
+// matchesCron 判断给定时刻是否命中 cron 表达式 (5 字段逐位与, 全中才算命中)。
 func matchesCron(expr string, t time.Time) bool {
 	fields := strings.Fields(expr)
 	if len(fields) != 5 {
@@ -549,6 +582,18 @@ func matchesCron(expr string, t time.Time) bool {
 		matchField(fields[4], int(t.Weekday()), 0, 7) // 0 和 7 都是周日
 }
 
+// matchField 判断单个 cron 字段是否匹配当前值。
+//
+// 算法解读：
+//
+//	原理：把 `*`、`*/N`、逗号分隔的 `a-b` 范围与裸数字展开成对 value 的判定。
+//	关键不变量：**星期字段的 0 与 7 都表示周日**, 必须双向等价 —— 只做 n==value
+//	  会让 crontab 常见的 "7" 写法永远等不到触发。这里用 max==7 识别星期字段,
+//	  避免把其他字段里的 0/7 也误当等价。
+//	代价与边界：每字段 O(逗号项数); 步长以 (value-min) 为基准取模, 所以日/月字段
+//	  (min 非 0) 的 `*/2` 得到 1,3,5..., 与标准 crontab 一致。
+//	设计权衡：不支持 `?`/`L`/`W` 等扩展语法 —— validateField 同样拒绝它们, 校验与
+//	  匹配两处口径一致, 不会出现"能存进去但永远不触发"的表达式。
 func matchField(field string, value, min, max int) bool {
 	if field == "*" {
 		return true
@@ -584,6 +629,8 @@ func matchField(field string, value, min, max int) bool {
 
 // --- 持久化 ---
 
+// persist 把任务表以 JSON 落盘到 dataDir/cron_jobs.json; dataDir 为空或序列化失败
+// 时静默跳过 (持久化是增强项, 不该让调度本身失败)。
 func (cs *CronScheduler) persist() {
 	if cs.dataDir == "" {
 		return
@@ -596,6 +643,9 @@ func (cs *CronScheduler) persist() {
 	_ = os.WriteFile(filepath.Join(cs.dataDir, "cron_jobs.json"), data, 0644)
 }
 
+// load 从 dataDir/cron_jobs.json 恢复任务表, 并把 nextID 推进到已有 id 的最大序号之后。
+//
+// 不推进 nextID 的话, 重启后 AddJob 会从 cron-1 重新发号, 直接覆盖掉恢复出来的同名任务。
 func (cs *CronScheduler) load() {
 	if cs.dataDir == "" {
 		return
@@ -615,6 +665,7 @@ func (cs *CronScheduler) load() {
 	}
 }
 
+// extractCronID 从 "cron-<n>" 形式的 id 里取出末尾序号; 取不到时返回 0。
 func extractCronID(id string) int {
 	parts := strings.Split(id, "-")
 	if len(parts) >= 2 {

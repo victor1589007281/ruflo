@@ -358,6 +358,7 @@ func graphSpecForWorkflow(wf *WorkflowDef) (graph.GraphSpec, error) {
 	return TranslateWorkflow(wf)
 }
 
+// workflowName 安全取工作流名 (nil 工作流返回空串)。
 func workflowName(wf *WorkflowDef) string {
 	if wf == nil {
 		return ""

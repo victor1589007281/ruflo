@@ -35,6 +35,7 @@ type FinanceClient struct {
 	client *http.Client
 }
 
+// NewFinanceClient 创建金融数据客户端 (15s 超时)。
 func NewFinanceClient() *FinanceClient {
 	return &FinanceClient{
 		client: &http.Client{Timeout: 15 * time.Second},
@@ -230,12 +231,14 @@ func normalizeStockCode(symbol string) string {
 
 var reUSStock = regexp.MustCompile(`^[A-Z]{1,5}$`)
 
+// parseFloat 用 Sscanf 尽力解析浮点数; 解析不出来时静默返回 0 (上游字段缺失/格式变化很常见)。
 func parseFloat(s string) float64 {
 	var f float64
 	fmt.Sscanf(s, "%f", &f)
 	return f
 }
 
+// safeParseFloat 越界安全地取 parts[idx] 再解析 (下标越界返回 0, 不 panic)。
 func safeParseFloat(parts []string, idx int) float64 {
 	if idx >= len(parts) {
 		return 0

@@ -44,12 +44,14 @@ type httpHandler struct {
 	reg *Registry
 }
 
+// writeJSON 以 JSON 形式写响应: 先设 Content-Type 再写状态码。
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// enqueue POST /cluster/enqueue: 解码 Task 入队并返回任务 id。
 func (h *httpHandler) enqueue(w http.ResponseWriter, r *http.Request) {
 	var t Task
 	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
@@ -64,6 +66,7 @@ func (h *httpHandler) enqueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"id": id})
 }
 
+// pull POST /cluster/pull: worker 按 kinds/caps 拉取任务; 无任务返回 204 + task:null。
 func (h *httpHandler) pull(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Worker string   `json:"worker"`
@@ -83,6 +86,7 @@ func (h *httpHandler) pull(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"task": task})
 }
 
+// complete POST /cluster/complete: worker 回报成功结果。
 func (h *httpHandler) complete(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID     string          `json:"id"`
@@ -97,6 +101,7 @@ func (h *httpHandler) complete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// fail POST /cluster/fail: worker 回报失败原因。
 func (h *httpHandler) fail(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID     string `json:"id"`
@@ -111,6 +116,7 @@ func (h *httpHandler) fail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// extend POST /cluster/extend: worker 续租, 避免长任务在租约到期后被重新派发。
 func (h *httpHandler) extend(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID     string `json:"id"`
@@ -124,6 +130,7 @@ func (h *httpHandler) extend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// heartbeat POST /cluster/heartbeat: worker 注册/续约并上报能力标签与池快照。
 func (h *httpHandler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	var info WorkerInfo
 	if err := json.NewDecoder(r.Body).Decode(&info); err != nil {
@@ -137,6 +144,7 @@ func (h *httpHandler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// workers GET /cluster/workers: 列出存活 worker (观测用)。
 func (h *httpHandler) workers(w http.ResponseWriter, r *http.Request) {
 	alive, err := h.reg.Alive()
 	if err != nil {
@@ -146,6 +154,7 @@ func (h *httpHandler) workers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"workers": alive, "count": len(alive)})
 }
 
+// tasks GET /cluster/tasks: 列出任务 (观测用)。
 func (h *httpHandler) tasks(w http.ResponseWriter, r *http.Request) {
 	tasks, err := h.q.List()
 	if err != nil {
@@ -181,6 +190,18 @@ func (c *Client) WithToken(token string) *Client {
 	return c
 }
 
+// post 向控制面发一次 JSON POST; 非 2xx 一律视为错误并带上响应片段。
+//
+// 算法解读：
+//
+//	原理：worker 侧唯一的出站通道。把"HTTP 层成功"与"控制面接受了这次上报"严格分开,
+//	      后者才是调用方关心的。
+//	关键不变量：非 2xx 必须返回 error。上报终态被拒却当成功, 任务会永远停在 leased 直到
+//	      租约过期, 且没有任何日志。
+//	代价与边界：2xx 全算成功 —— 204 是 /cluster/pull 的合法"无任务"应答; 响应体解析失败
+//	      被忽略, 因为此时状态码已经给出了结论。
+//	设计权衡：返回 (code, error) 而不是只返回 error, 是因为 pull 要用 204 与 200 区分
+//	      "无任务"和"有任务", 这个区别塞不进 error 里。
 func (c *Client) post(path string, body, out any) (int, error) {
 	b, _ := json.Marshal(body)
 	req, err := http.NewRequest("POST", c.base+path, bytes.NewReader(b))

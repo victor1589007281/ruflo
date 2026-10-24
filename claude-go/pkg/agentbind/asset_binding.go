@@ -301,6 +301,8 @@ func BindAgentAsset(name string, skillReg SkillPool) *AssetBinding {
 	return b
 }
 
+// bindToolProfile 装配资产声明的 tool-profile 档位; 非法取值整条作废 (回落到调用方基线),
+// 绝不静默掰成 chat。
 func (b *AssetBinding) bindToolProfile(a *asset.Asset) {
 	raw := strings.TrimSpace(a.Meta("tool-profile"))
 	if raw == "" {
@@ -329,6 +331,8 @@ func (b *AssetBinding) bindToolProfile(a *asset.Asset) {
 	})
 }
 
+// bindPermissionMode 装配资产声明的 permission-mode 权限档; 不认识的档整条作废 ——
+// 喂给 permissions.NewChecker 会一路落到"每次询问", 在非交互子代理里等于全部拒绝。
 func (b *AssetBinding) bindPermissionMode(a *asset.Asset) {
 	raw := strings.TrimSpace(a.Meta("permission-mode"))
 	if raw == "" {
@@ -352,6 +356,8 @@ func (b *AssetBinding) bindPermissionMode(a *asset.Asset) {
 	})
 }
 
+// bindMaxTurns 装配资产声明的 max-turns 回合上限; 非正整数整条作废 (0/负数会被引擎读成
+// "不限制", 与作者"限得很紧"的意图相差一个数量级的额度)。
 func (b *AssetBinding) bindMaxTurns(a *asset.Asset) {
 	raw := strings.TrimSpace(a.Meta("max-turns"))
 	if raw == "" {
@@ -374,6 +380,8 @@ func (b *AssetBinding) bindMaxTurns(a *asset.Asset) {
 	})
 }
 
+// bindModel 装配资产声明的 model; 本层不校验该模型在已解析的 provider 上是否存在
+// (那是调用方的池), 写错的名字会在出站请求时 404。
 func (b *AssetBinding) bindModel(a *asset.Asset) {
 	raw := strings.TrimSpace(a.Meta("model"))
 	if raw == "" {
@@ -405,6 +413,24 @@ type SkillPool interface {
 	HasSkill(name string) bool
 }
 
+// bindSkills 把资产声明的技能名与技能池逐名对账, 分成"接上了"与"池里没有"两组。
+//
+// 关键: 部分命中按 BindingUnknownName 报 (而不是 wired) —— 它看起来"生效了", 缺的那几条
+// 要靠逐条比对才看得出来, 正是本文件要防的那类静默少给。池为 nil 时一律算 unknown_name,
+// 因为"没池可查"与"查了没有"在"这条技能会不会生效"上是同一个答案。
+//
+// 算法解读：
+//
+//	原理：对 declared 做一次划分 —— 逐个问 pool.HasSkill, 命中的进 resolved, 其余进
+//	      missing; 再用 (missing 空 / resolved 空 / 两者都非空) 把结果归成三种状态。
+//	      名字先过 dedupeStrings, 保证同一名字不会被计两次。
+//	关键不变量：**只有 missing 为空才报 BindingWired**。部分命中必须降级为 UnknownName,
+//	      因为声明是"一组能力"而非"若干条独立条目": 缺一条就意味着模型看到的清单与资产
+//	      作者写的不是同一份。nil 池与空池走同一条 unknown_name 分支 (见上)。
+//	代价与边界：只做存在性判定, 不校验技能内容是否与 role 匹配 (那是技能治理侧的事);
+//	      对账结果只进 Bindings 与 Warnings, **不阻断装配** —— 少给的能力靠人读报告发现。
+//	设计权衡：不做"部分接上也报 wired 但附注"的折中 —— 状态位只有三档, 让它保持
+//	      "wired = 声明被完整满足"这一单一含义, 否则调用方无法用状态位做判断。
 func (b *AssetBinding) bindSkills(a *asset.Asset, pool SkillPool) {
 	declared := dedupeStrings(a.MetaList("skills"))
 	if len(declared) == 0 {
@@ -701,6 +727,8 @@ func parseAssetHooks(a *asset.Asset) ([]types.HookConfig, []string) {
 	return out, problems
 }
 
+// bindHooks 装配资产声明的外部 hook: 合法的进 b.Hooks, 每条非法声明单独留一条
+// BindingInvalidValue 读数 (不整份作废 —— 三条里坏一条, 好的两条照常生效)。
 func (b *AssetBinding) bindHooks(a *asset.Asset) {
 	hooks, problems := parseAssetHooks(a)
 	for _, p := range problems {
@@ -723,6 +751,8 @@ func (b *AssetBinding) bindHooks(a *asset.Asset) {
 	})
 }
 
+// bindPlugin 处理资产里的 `runtime: plugin` 声明 —— 本仓没有读它的地方, 如实报
+// BindingNoConsumer 而不是假装接上。
 func (b *AssetBinding) bindPlugin(a *asset.Asset) {
 	// 见文件头: 本仓没有 plugin 运行时。资产里写了 `runtime: plugin` 也不会生效。
 	raw := strings.TrimSpace(a.Meta("runtime"))
@@ -742,6 +772,10 @@ func sortBindings(bs []Binding) {
 	sort.SliceStable(bs, func(i, j int) bool { return bs[i].Facet < bs[j].Facet })
 }
 
+// dedupeStrings 去掉首尾空白、去重并保持原顺序; 输入为空时返回 nil。
+//
+// 注意：返回值是 nil 还是空切片, 调用方必须自己区分 —— 本文件多处靠"显式空名单要补回
+// 非 nil 空切片"来保住 fail-closed 语义 (见 bindTools)。
 func dedupeStrings(in []string) []string {
 	if len(in) == 0 {
 		return nil

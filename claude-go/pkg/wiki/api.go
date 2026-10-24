@@ -135,6 +135,7 @@ func (s *APIServer) Stop() {
 	}
 }
 
+// auth 包装 handler, 校验 Authorization: Bearer <secret>; secret 为空时是恒等包装。
 func (s *APIServer) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.secret != "" {
@@ -149,10 +150,12 @@ func (s *APIServer) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// handleStatus 返回引擎状态快照 (GET /wiki/status)。
 func (s *APIServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.engine.Status())
 }
 
+// handleIngest 接收 url 或 text 并调用引擎入库; 单次请求超时 10 分钟。
 func (s *APIServer) handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
@@ -191,6 +194,7 @@ func (s *APIServer) handleIngest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// handleQuery 处理问答请求, 按 webSearch / archive 开关选择引擎查询路径; 超时 2 分钟。
 func (s *APIServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
@@ -240,6 +244,7 @@ func (s *APIServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleLint 触发一次 wiki 体检并返回报告; 超时 1 分钟。
 func (s *APIServer) handleLint(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
@@ -256,6 +261,7 @@ func (s *APIServer) handleLint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, report)
 }
 
+// handleOrganize 按 mode 选择全量或增量整理(默认全量); 超时 5 分钟。
 func (s *APIServer) handleOrganize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
@@ -286,6 +292,7 @@ func (s *APIServer) handleOrganize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// handleHealthCheck 触发深度健康检查并返回报告; 超时 10 分钟。
 func (s *APIServer) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
@@ -302,14 +309,24 @@ func (s *APIServer) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, report)
 }
 
+// handleSyncIMA 处理 /sync/ima 触发, source=ima。
 func (s *APIServer) handleSyncIMA(w http.ResponseWriter, r *http.Request) {
 	s.handleSyncTrigger(w, r, "ima")
 }
 
+// handleSyncWeRead 处理 /sync/weread 触发, source=weread。
 func (s *APIServer) handleSyncWeRead(w http.ResponseWriter, r *http.Request) {
 	s.handleSyncTrigger(w, r, "weread")
 }
 
+// handleSyncTrigger 处理同步触发请求, 按装配情况分派到 TaskService 或进程内 Scheduler。
+//
+// 算法解读：
+//
+//	原理：先看 submitter 是否装配——装了就走 TaskService 提交一份落盘任务档案, 否则回落到 Scheduler.RunNow 起进程内 goroutine。
+//	关键不变量：submitter 非 nil 时绝不能再落到 RunNow, 否则一次触发跑两遍, 而 RunSync 在 LoadIndex 与 SaveIndex 之间无锁, 双跑会让 index.json 互相覆盖。
+//	代价与边界：两条路径的 jobId 台账不同源, 因此查询端 handleSyncStatus 必须两处都查, 否则切换前触发的 job 会立刻变 404。
+//	设计权衡：用 setter 注入而非构造参数, 让不接线的进程(测试、wiki 独立路径)行为逐字节不变。
 func (s *APIServer) handleSyncTrigger(w http.ResponseWriter, r *http.Request, source string) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
@@ -367,6 +384,7 @@ func (s *APIServer) handleSyncTrigger(w http.ResponseWriter, r *http.Request, so
 	writeJSON(w, http.StatusAccepted, map[string]string{"jobId": job.ID})
 }
 
+// handleSyncStatus 按 jobId 查同步任务状态; 依次查 TaskService 与 Scheduler 两处台账, 都未命中才 404。
 func (s *APIServer) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only"})
@@ -399,12 +417,14 @@ func (s *APIServer) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
 }
 
+// writeJSON 先写 JSON Content-Type 与状态码, 再编码响应体。
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+// readJSON 读取至多 1MiB 的请求体并反序列化; 空请求体视为无入参, 直接成功返回。
 func readJSON(r *http.Request, v interface{}) error {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {

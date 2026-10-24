@@ -33,6 +33,10 @@ func ttsBin() (bin, engine string) {
 	return "", ""
 }
 
+// resolveBin 在 PATH 与 ~/.local/bin 两处找可执行文件, 找到返回绝对路径, 否则空串。
+//
+// 补 ~/.local/bin 是因为它常常不在非登录 shell 的 PATH 里, 而 edge-tts 等工具默认
+// 就装在那里 (pip --user)。
 func resolveBin(name string) string {
 	if p, err := exec.LookPath(name); err == nil {
 		return p
@@ -87,6 +91,11 @@ func GenerateArticleAudio(ctx context.Context, text, outDir, voice string) (stri
 	}
 }
 
+// stripMarkdownForTTS 把 Markdown 压成适合朗读的纯文本: 去围栏代码块、标题井号、列表符、
+// 图片行与表格行, 剥掉行内记号, 段落之间用"。"连接。
+//
+// 去掉的每一类都是"读出来没有意义或很难听"的东西; 代码块整段跳过是因为逐字符朗读
+// 的产出比沉默更糟。
 func stripMarkdownForTTS(md string) string {
 	lines := strings.Split(md, "\n")
 	var out []string
@@ -203,6 +212,7 @@ func genIllustrationSVG(ctx context.Context, llm LLMClient, s articleImageSpec) 
 	return ""
 }
 
+// cardPointsHTML 把要点渲染成 <li> 列表片段 (已 HTML 转义)。
 func cardPointsHTML(points []string) string {
 	var sb strings.Builder
 	for _, p := range points {

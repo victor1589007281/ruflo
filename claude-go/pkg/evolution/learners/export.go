@@ -308,6 +308,8 @@ func looksLikeSchemaEcho(s string) bool {
 	return hits >= 2
 }
 
+// writeJSONL 把切片逐行序列化成 JSONL 写盘 (每行一条, 行尾带换行)。
+// 用 strings.Builder 攒满再一次写入, 避免逐条 WriteFile 的开销。
 func writeJSONL[T any](path string, items []T) error {
 	var b strings.Builder
 	for _, it := range items {

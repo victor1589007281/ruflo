@@ -1,5 +1,10 @@
 package agent
 
+// researchWorkflow 返回调研团队的工作流定义: 预规划定框架, 技术/市场/风险三路并行调研,
+// 再经事实核查交叉验证, 最后由综合分析师汇总裁决。
+//
+// Mode=fanout 是形状而非装饰: 中间那一波三方调研彼此无依赖, 并行执行才让 fanout 的调度路径
+// 被真正走到 (见 runPipelineWithRecovery 里 filterParallel 的分支)。
 func researchWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "research",

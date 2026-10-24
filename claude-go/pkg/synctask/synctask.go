@@ -246,6 +246,7 @@ func recordToJob(rec agent.TaskRecord, source string) *claudesync.Job {
 	return job
 }
 
+// mapState 把本地 agent 任务状态映射成 claudesync 的 JobStatus; 未知状态 (pending/paused) 归入 JobPending。
 func mapState(s agent.TaskState) claudesync.JobStatus {
 	switch s {
 	case agent.TaskStateRunning:

@@ -195,8 +195,11 @@ type BaseInternalHook struct {
 	Phases_   []InternalHookPhase
 }
 
+// Name 返回 hook 名 (取嵌入时填的 Name_)。
 func (h *BaseInternalHook) Name() string                { return h.Name_ }
+// Priority 返回优先级, 同 phase 内值小者先执行。
 func (h *BaseInternalHook) Priority() int               { return h.Priority_ }
+// Phases 返回该 hook 要挂载的全部执行阶段。
 func (h *BaseInternalHook) Phases() []InternalHookPhase { return h.Phases_ }
 
 // ============================================================================
@@ -238,6 +241,23 @@ func (c *HookChain) Register(hook InternalHook) {
 //   - ReturnTerminal: 遇到非空立即终止并返回
 //   - StreamEvents: 累积
 //   - Backoff: 取最大值
+//
+// 算法解读：
+//
+//	原理：按 Priority 升序把同一 phase 上的 hook 串成一条链, 每个 hook 拿到的是
+//	      **前序 hook 累积后**的 Messages/SystemPrompt, 返回值再逐字段合并成一个
+//	      聚合 HookResult 交回 queryLoop。
+//	关键不变量：合并的字段语义分三类 —— 覆盖类 (Messages/SystemPrompt/各 Blocks,
+//	      后者胜) 必须同时把局部变量一起更新, 否则下一个 hook 看到的是旧的
+//	      SystemPrompt, "后执行的覆盖"就只体现在最终结果里、不体现在链内传播上;
+//	      累积类 (AppendMsgs/StreamEvents) 只进 result、不进局部变量 —— 追加不该
+//	      被后续 hook 当成已生效的输入; 截断类 (ReturnTerminal/SkipRemaining)
+//	      必须**立即 break**, 继续执行会绕过显式的终止意图。
+//	代价与边界：O(该 phase 的 hook 数), 每 turn 触发 11 次的最热路径; ObserverFrom
+//	      只在进循环前查一次, 无观测者时 emit 退化为零分配空操作。任一 hook 返回
+//	      error 会**中断整条链**并向上抛 (其余 hook 不再执行)。
+//	设计权衡：链内不做并发 (hook 之间有顺序依赖, 如 Compact 必须在 PromptCache 之前),
+//	      也不做 hook 级超时 —— 单个 hook 卡住会卡住整个 turn, 由各 hook 自己保证轻量。
 func (c *HookChain) Execute(phase InternalHookPhase, ctx *HookContext) (*HookResult, error) {
 	hooks := c.hooks[phase]
 	if len(hooks) == 0 {

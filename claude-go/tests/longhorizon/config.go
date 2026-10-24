@@ -120,6 +120,19 @@ func DiffPaths(a, b any) []string {
 	return out
 }
 
+// diffInto 递归比对两份 JSON 文档, 把差异按语义路径追加到 out。
+//
+// 算法解读：
+//
+//	原理：按 Go 的 any 动态类型分派 —— map 走键并集 (逐键递归或记增删), 数组按下标
+//	      展开 (先记长度差再逐位递归), 标量用 jsonEqual 判等。
+//	关键不变量：**键的遍历顺序必须确定** (键并集先 sort 再遍历) —— Go 的 map 迭代
+//	      顺序随机, 不排序会让两次同样的比对产出不同顺序的差异列表, 下游按行断言就成
+//	      了随机失败。
+//	代价与边界：路径拼接用 "/" 且数组下标写成 "[i]"; 标量判等走 json.Marshal 比较
+//	      字符串, 所以 1 与 1.0 是否相等取决于 json.Number 保真 (见 ParseConfigDoc)。
+//	设计权衡：用路径字符串而不是返回结构化 diff —— 报告要给人读, 且断言只需比对
+//	      文本; 代价是下游想程序化消费差异得自己再解析这行文本 (见 pathOf)。
 func diffInto(path string, a, b any, out *[]string) {
 	switch av := a.(type) {
 	case map[string]any:
@@ -176,6 +189,7 @@ func diffInto(path string, a, b any, out *[]string) {
 	}
 }
 
+// pathOrRoot 空路径显示成 "(根)", 免得差异行以 ": " 开头看不出层级。
 func pathOrRoot(p string) string {
 	if p == "" {
 		return "(根)"
@@ -183,12 +197,14 @@ func pathOrRoot(p string) string {
 	return p
 }
 
+// jsonEqual 用 JSON 序列化结果判等 (任一侧 Marshal 失败即判不等)。
 func jsonEqual(a, b any) bool {
 	ab, err1 := json.Marshal(a)
 	bb, err2 := json.Marshal(b)
 	return err1 == nil && err2 == nil && string(ab) == string(bb)
 }
 
+// compact 把值压成单行短串 (超过 60 字节截断为 "..."), 供差异行内联显示。
 func compact(v any) string {
 	b, err := json.Marshal(v)
 	if err != nil || len(b) == 0 {
@@ -201,6 +217,7 @@ func compact(v any) string {
 	return s
 }
 
+// typeName 给出值的类型名 (容器与 null 用中文, 其余用 %T)。
 func typeName(v any) string {
 	switch v.(type) {
 	case map[string]any:
@@ -285,6 +302,7 @@ func (p ConfigPair) DiffSummary() string {
 	return sb.String()
 }
 
+// orNone 空串显示成 "(无)" (开关没配环境变量时的占位)。
 func orNone(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return "(无)"
@@ -352,6 +370,7 @@ func SetPath(doc any, path string, value any) (any, error) {
 	return root, nil
 }
 
+// deepCopy 深拷贝 JSON 文档 (只认 map/slice, 标量原样返回); 供 SetPath 不原地改原文档。
 func deepCopy(v any) any {
 	switch t := v.(type) {
 	case map[string]any:

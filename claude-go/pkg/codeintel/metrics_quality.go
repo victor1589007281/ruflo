@@ -258,6 +258,7 @@ type QualitySnapshot struct {
 // 私有辅助
 // ============================================================================
 
+// computeF1 计算精确率与召回率的调和平均 (F1); 两者都为 0 时返回 0 而不是 NaN。
 func computeF1(precision, recall float64) float64 {
 	if precision+recall == 0 {
 		return 0
@@ -271,6 +272,19 @@ type engineScore struct {
 	latency int64
 }
 
+// pickWinner 在四个检索引擎 (gitnexus/native/graphify/nollm) 里挑一个胜者。
+//
+// 算法解读：
+//
+//	原理：先按"本次是否返回了结果"过滤出候选 (results == 0 的引擎直接出局),
+//	      再对候选按 scoreEngine 打分取最大者; 只有一个候选时直接返回它。
+//	关键不变量：归一化的分母 (maxResults/maxLatency) 取自**过滤后的候选集**而不是
+//	      全部引擎 —— 因此一个很慢的引擎出局后, 剩下的引擎之间的相对分会被放大,
+//	      胜者名次可能随之改变。这是"只跟同场对手比"的口径, 不是绝对分。
+//	代价与边界：结果是单次对比的即时判定, 没有样本量与置信度概念; 全部引擎都
+//	      返回 0 条时返回 "none", 调用方需自行区分"都没结果"与"没跑"。
+//	设计权衡：用 70/30 的结果数/延迟加权而不是纯延迟或纯结果数 —— 纯结果数会
+//	      选出慢到不可用的引擎, 纯延迟会选出"什么都不返回所以最快"的引擎。
 func pickWinner(ec EngineComparisonMetrics) string {
 	engines := []engineScore{
 		{"gitnexus", ec.GitNexusResults, ec.GitNexusLatency},
@@ -306,6 +320,10 @@ func pickWinner(ec EngineComparisonMetrics) string {
 	return best.name
 }
 
+// scoreEngine 给单个引擎打分: 结果数占比 0.7 + 延迟占比 0.3 (延迟越低越好), 取值 0~1。
+//
+// 分母取自 all (候选集) 的最大值; 延迟分被夹到 >= 0, 因此某个引擎比最大延迟还慢时
+// 只会拿 0 分而不会拉出负分。
 func scoreEngine(e engineScore, all []engineScore) float64 {
 	maxResults := 1
 	maxLatency := int64(1)

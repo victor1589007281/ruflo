@@ -13,6 +13,7 @@ type FanOutConfig struct {
 	TotalTimeout     time.Duration
 }
 
+// DefaultFanOutConfig 返回默认并行配置: 最大并发 4、单分支超时 3 分钟、总超时 5 分钟。
 func DefaultFanOutConfig() FanOutConfig {
 	return FanOutConfig{
 		MaxConcurrency:   4,

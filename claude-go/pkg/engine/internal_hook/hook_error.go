@@ -31,8 +31,11 @@ func NewErrorClassifierHook(classifier *ErrorClassifier, compactor *compact.Comp
 	return &ErrorClassifierHook{classifier: classifier, compactor: compactor, metrics: metrics}
 }
 
+// Name 返回 hook 名 "error_classifier"。
 func (h *ErrorClassifierHook) Name() string                { return "error_classifier" }
+// Priority 返回优先级 110 (低于 CircuitBreakerHook 的 120, 故先执行)。
 func (h *ErrorClassifierHook) Priority() int               { return 110 }
+// Phases 声明本 hook 只挂 PhaseOnError 阶段。
 func (h *ErrorClassifierHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhaseOnError}
 }
@@ -115,8 +118,11 @@ func NewCircuitBreakerHook(classifier *ErrorClassifier, metrics *EngineMetrics) 
 	return &CircuitBreakerHook{classifier: classifier}
 }
 
+// Name 返回 hook 名 "circuit_breaker"。
 func (h *CircuitBreakerHook) Name() string                { return "circuit_breaker" }
+// Priority 返回优先级 120 (高于 ErrorClassifierHook 的 110, 故后执行)。
 func (h *CircuitBreakerHook) Priority() int               { return 120 }
+// Phases 声明本 hook 只挂 PhaseOnError 阶段。
 func (h *CircuitBreakerHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhaseOnError}
 }

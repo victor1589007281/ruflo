@@ -44,6 +44,10 @@ type PoolWorkerAgg struct {
 	Pool      *tool.PoolSnapshot `json:"pool"`
 }
 
+// handlePool GET /api/pool: 聚合返回本进程观测池 + 控制面各 worker 的心跳池摘要。
+//
+// 两个来源各自可为空, 且都**不报错**: poolLister 未注入 (独立 dashboard 进程) 时
+// Workers 为 null, 本进程池未装配时 Local 为 null —— 前端据此区分"没装配"与"装配了但空"。
 func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("GET required"))
@@ -117,6 +121,7 @@ type EvoQuantDTO struct {
 	Alerts []string `json:"alerts,omitempty"`
 }
 
+// handleEvolutionQuant GET /api/evolution/quant: 返回进化能力量化驾驶舱的折叠快照。
 func (s *Server) handleEvolutionQuant(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("GET required"))

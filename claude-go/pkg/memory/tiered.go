@@ -279,6 +279,10 @@ func (s *TieredStore) AddWithOriginal(entry *MemoryEntry, original string) {
 	s.addWithOriginal(entry, original, false)
 }
 
+// itoa 把非负 int 转成十进制字符串 (递归实现, 避免引入 strconv)。
+//
+// 注意：只对 n >= 0 正确 —— 负数会走进 n < 10 的分支, 由 string(rune('0'+n)) 产出
+// 一个非数字字符。调用点都传计数/长度, 故实际不会遇到负数。
 func itoa(n int) string {
 	if n < 10 {
 		return string(rune('0' + n))

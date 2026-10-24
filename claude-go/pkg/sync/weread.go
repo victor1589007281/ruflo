@@ -157,6 +157,8 @@ func (a *WeReadAdapter) Fetch(item ExternalItem) (ExternalItem, error) {
 	return item, nil
 }
 
+// postGateway 向微信读书 agent gateway 发一次 POST: 带 Bearer 鉴权, 校验 2xx 后把
+// 响应 JSON 解到 dst (响应体读入上限 1MiB)。
 func (a *WeReadAdapter) postGateway(body interface{}, dst interface{}) error {
 	data, err := json.Marshal(body)
 	if err != nil {

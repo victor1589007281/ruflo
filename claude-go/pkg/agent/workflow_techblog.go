@@ -1,5 +1,6 @@
 package agent
 
+// techBlogWorkflow 返回"技术博客"流水线工作流: 源码分析/信息调查 (并行) → 事实核验 → 专业撰写 → 主编自审 → 排版优化。
 func techBlogWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "techblog",

@@ -50,12 +50,15 @@ func NewAskUserQuestionTool() *AskUserQuestionTool {
 	return &AskUserQuestionTool{}
 }
 
+// Name 返回工具名 "AskUserQuestion"。
 func (t *AskUserQuestionTool) Name() string { return AskUserQuestionToolName }
 
+// Description 返回工具说明, 并明说非交互模式下不可用 (该限制由 CheckPermissions 强制)。
 func (t *AskUserQuestionTool) Description() string {
 	return `Asks the user a multiple-choice or single-choice question via the terminal (stdin). In non-interactive mode the tool cannot run.`
 }
 
+// InputSchema 返回入参 schema: question 与 options 必填, options 至少两项且每项需 id + label。
 func (t *AskUserQuestionTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -86,8 +89,13 @@ func (t *AskUserQuestionTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true: 提问不写文件系统 (只读 stdin、只写终端)。
 func (t *AskUserQuestionTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
+// IsConcurrencySafe 恒为 true: 无共享状态。
+//
+// 注意：这一声明与实现并不严格相符 —— 多个提问并发时会争抢同一份 stdin,
+// 提问内容与用户回答可能错配 (工具层面的声明没把「终端是独占资源」表达出来)。
 func (t *AskUserQuestionTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 // CheckPermissions 非交互模式下拒绝执行，避免挂起或读到意外 stdin。

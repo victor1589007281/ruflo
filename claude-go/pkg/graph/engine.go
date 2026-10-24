@@ -459,6 +459,10 @@ type dagRun struct {
 	basePrev map[string]string
 }
 
+// newDagRun 构造一层的 DAG 运行态: 拷贝节点/边 (不改调用方切片), 建索引与各状态表。
+//
+// 注意: nodes/edges 是**浅拷贝**, NodeSpec 内的切片字段仍与调用方共享; 运行期只读它们,
+// 故无碍, 但若将来有人就地改写 NodeSpec 的切片元素, 会同时改到调用方的数据。
 func newDagRun(nodes []NodeSpec, edges []EdgeSpec, scope execScope) *dagRun {
 	dr := &dagRun{
 		scope: scope,
@@ -480,7 +484,10 @@ func newDagRun(nodes []NodeSpec, edges []EdgeSpec, scope execScope) *dagRun {
 	return dr
 }
 
+// addEdge 把一条边同时登记进前驱表 (带解析后的条件) 与后继表。
 func (dr *dagRun) addEdge(ed EdgeSpec) {
+	// 条件解析错误刻意丢弃: 建图前的 Validate 已保证语法合法, 这里再报一次只会
+	// 把"已校验"的失败重复成两处错误来源。解析失败时 c 为零值 (无条件)。
 	c, _ := ParseCondition(ed.Condition) // Validate 已保证语法
 	dr.preds[ed.To] = append(dr.preds[ed.To], inEdge{from: ed.From, cond: c})
 	dr.succs[ed.From] = append(dr.succs[ed.From], ed.To)

@@ -62,6 +62,9 @@ const (
 	stateFileName       = "state.json"
 )
 
+// NewGlobalIndex 创建或加载全局索引; rootPath 为空时默认 ~/.claude-code-intel。
+// 索引文件不存在视为"空索引"(首次使用), 只有**读取失败或解析失败**才报错。
+//
 // NewGlobalIndex creates or loads a GlobalIndex at the given root path.
 // If rootPath is empty, it defaults to ~/.claude-code-intel.
 func NewGlobalIndex(rootPath string) (*GlobalIndex, error) {
@@ -99,6 +102,8 @@ func NewGlobalIndex(rootPath string) (*GlobalIndex, error) {
 	return gi, nil
 }
 
+// save 把全局索引元数据落盘 (先序列化再释放读锁, 避免持锁做 IO)。
+//
 // save persists the global index metadata to disk.
 func (gi *GlobalIndex) save() error {
 	gi.mu.RLock()
@@ -115,6 +120,10 @@ func (gi *GlobalIndex) save() error {
 	return nil
 }
 
+// repoIDFromPath 由本地路径 + remote URL 生成**确定性**仓库 ID (sha256 前 16 个十六进制位)。
+// 取路径与 remote 两段一起哈希: 同一仓库换目录后 ID 不变 (靠 remote), 而两个不同目录的
+// 同名克隆也不会撞 ID (靠路径)。注意: 移动目录且无 remote 时会得到新 ID, 旧索引不再命中。
+//
 // repoIDFromPath generates a deterministic repo ID from a local path and remote URL.
 func repoIDFromPath(repoPath, remoteURL string) string {
 	h := sha256.New()
@@ -124,6 +133,8 @@ func repoIDFromPath(repoPath, remoteURL string) string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
+// hashString 取字符串 sha256 的前 12 个十六进制位, 用作目录名 (分支名可能含 `/` 等非法字符)。
+//
 // hashString returns a short hash of a string for directory naming.
 func hashString(s string) string {
 	h := sha256.New()
@@ -131,6 +142,9 @@ func hashString(s string) string {
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
+// getRemoteURL 从 .git/config 里抠出 remote "origin" 的 url; 读不到或没有 origin 时返回空串。
+// 只做极简的 INI 解析 (定位 [remote "origin"] 段直到下一个 `[`), 不引 git 依赖。
+//
 // getRemoteURL attempts to read the git remote URL for origin.
 func getRemoteURL(repoPath string) string {
 	gitDir := filepath.Join(repoPath, ".git")
@@ -161,6 +175,22 @@ func getRemoteURL(repoPath string) string {
 	return ""
 }
 
+// RegisterRepo 注册一个本地仓库; 幂等 —— 同一 repoID 已存在时直接返回既有条目。
+//
+// 算法解读：
+//
+//	原理：路径 → ID 的映射是**确定性的** (repoIDFromPath), 所以"注册"本质是一次
+//	      upsert: 先算 ID 查重, 命中即返回, 未命中才建条目、落 global_index.json、
+//	      再写 repos/<id>/info.json 两份元数据。
+//	关键不变量：先写内存 map 再 save, save 失败必须**回滚 map** —— 否则内存里有了
+//	      一个磁盘上没有的仓库, 后续查询会以为它已注册, 重启后却消失, 表现为
+//	      "索引莫名其妙丢了"。同理, 落盘成功但建目录失败时 map 不回滚, 是因为
+//	      索引主体 (global_index.json) 已经生效, 目录缺失只影响 info.json 副本。
+//	代价与边界：持写锁期间做两次文件写 (save + info.json), 属于慢路径; 调用频次极低
+//	      (每个仓库一次), 不构成热点。非 git 目录 remoteURL 为空但仍可注册。
+//	设计权衡：ID 不用自增序号而用路径哈希, 是为了让"同一个仓库在不同机器/不同克隆
+//	      目录"能算出同一个 ID —— 代价是移动目录会产生新 ID。
+//
 // RegisterRepo registers a repository at the given local path.
 func (gi *GlobalIndex) RegisterRepo(repoPath, repoName string) (*RepoEntry, error) {
 	repoPath, err := filepath.Abs(repoPath)
@@ -212,6 +242,8 @@ func (gi *GlobalIndex) RegisterRepo(repoPath, repoName string) (*RepoEntry, erro
 	return entry, nil
 }
 
+// GetRepo 按 ID 取仓库条目的**浅拷贝** (Branches 等 map 字段仍与内部共享, 调用方不要改)。
+//
 // GetRepo retrieves a repository by its ID.
 func (gi *GlobalIndex) GetRepo(repoID string) (*RepoEntry, bool) {
 	gi.mu.RLock()
@@ -225,12 +257,29 @@ func (gi *GlobalIndex) GetRepo(repoID string) (*RepoEntry, bool) {
 	return &copy, true
 }
 
+// branchDir 返回分支索引在磁盘上的目录 (分支名经 hashString 转成合法目录名)。
+//
 // branchDir returns the on-disk directory for a branch.
 func (gi *GlobalIndex) branchDir(repoID, branchName string) string {
 	branchHash := hashString(branchName)
 	return filepath.Join(gi.RootPath, reposDirName, repoID, branchesDirName, branchHash)
 }
 
+// UpdateBranch 把分支的已索引 commit 推进到 commitHash 并持久化元数据 (分支条目不存在则新建)。
+//
+// 算法解读：
+//
+//	原理：一次增量索引完成后, 用"已索引到哪个 commit"这一条记录把索引与代码库对齐。
+//	      写两处: global_index.json 里的 branch.CommitHash (查询前的就绪判据) 与
+//	      分支目录下的 head.json/state.json (索引器自己读)。
+//	关键不变量：CommitHash 与 IndexedAt 必须**同一次**更新 —— 先写 hash 后写时间,
+//	      或者中途失败留下旧时间, 会让"索引是否过期"的判断与实际内容错位。
+//	      另外 branch.IndexPath 只在首次创建时算, 之后固定 —— 分支改名会得到新目录。
+//	代价与边界：持写锁做 3 次文件写 (save + head.json + state.json), 属于慢路径;
+//	      索引本身远慢于此, 不构成瓶颈。commitHash 不做合法性校验 (空串也会被写进去)。
+//	设计权衡：不比对旧 hash 是否相同, 重复索引同一 commit 也照写 —— 幂等比省一次写重要,
+//	      因为调用方 (索引器) 不该为了省写而多维护一份状态。
+//
 // UpdateBranch updates the indexed commit hash for a branch and persists metadata.
 func (gi *GlobalIndex) UpdateBranch(repoID, branchName, commitHash string) error {
 	gi.mu.Lock()
@@ -292,6 +341,8 @@ func (gi *GlobalIndex) writeBranchState(branch *BranchEntry) error {
 	return nil
 }
 
+// GetBranch 按 (仓库, 分支) 取分支条目的浅拷贝; 仓库或分支不存在都返回 false。
+//
 // GetBranch retrieves a branch entry for a repo.
 func (gi *GlobalIndex) GetBranch(repoID, branchName string) (*BranchEntry, bool) {
 	gi.mu.RLock()
@@ -309,6 +360,9 @@ func (gi *GlobalIndex) GetBranch(repoID, branchName string) (*BranchEntry, bool)
 	return &copy, true
 }
 
+// getCurrentHead 读 .git/HEAD 得到当前 commit: 符号引用 (ref: ...) 会再解一层 refs 文件,
+// 游离 HEAD 则直接返回其中写死的 commit。读不到时返回空串 (由调用方判为"无法确定")。
+//
 // getCurrentHead returns the current HEAD commit hash for a repo path by reading .git/HEAD and .git/refs/heads/*.
 func getCurrentHead(repoPath string) string {
 	headFile := filepath.Join(repoPath, ".git", "HEAD")
@@ -331,6 +385,22 @@ func getCurrentHead(repoPath string) string {
 	return content
 }
 
+// CheckQueryReady 判定 (仓库, 分支) 当前能否被查询, 不满足时给出可执行的修复建议。
+//
+// 算法解读：
+//
+//	原理：一条**顺序短路**的就绪判据链 —— 仓库存在 → 分支存在 → HEAD 与已索引 commit
+//	      一致 → 至少一个索引器跑完。任一条不满足就立即返回该条专属的 suggestion,
+//	      让调用方把"为什么查不了"直接讲给用户, 而不是笼统报"无结果"。
+//	关键不变量：Ready 只在**全部**条件满足时为 true, 且 CommitMatch 要求 CurrentHead
+//	      非空 —— 空 HEAD (非 git 目录/读失败) 必须判为不匹配, 否则一个读不到 HEAD 的
+//	      仓库会被当成"最新", 把过期索引当成有效结果返回。
+//	代价与边界：唯一一次磁盘 IO 是 getCurrentHead 读 .git/HEAD (+ 可能的 refs 文件);
+//	      读锁在取条目后就释放, HEAD 读取在锁外做, 因此并发索引推进会让结果略有
+//	      陈旧 —— 这是刻意的, 就绪检查本就允许有一瞬间的偏差。
+//	设计权衡：返回结构体而非 bool, 是为了让"不可用"带上原因与建议; 代价是每个调用方
+//	      都要处理 Suggestion 文案, 但省掉了一整套错误码。
+//
 // CheckQueryReady checks whether a query can be served for the given repo and branch,
 // and returns a QueryReadiness with actionable suggestions when not ready.
 func (gi *GlobalIndex) CheckQueryReady(repoID, branchName string) *QueryReadiness {
@@ -381,6 +451,8 @@ func (gi *GlobalIndex) CheckQueryReady(repoID, branchName string) *QueryReadines
 	return qr
 }
 
+// ListRepos 返回全部已注册仓库的快照 (逐条浅拷贝, 顺序随机 —— 来自 map 遍历)。
+//
 // ListRepos returns a snapshot of all registered repositories.
 func (gi *GlobalIndex) ListRepos() []*RepoEntry {
 	gi.mu.RLock()
@@ -394,6 +466,8 @@ func (gi *GlobalIndex) ListRepos() []*RepoEntry {
 	return result
 }
 
+// GetIndexPath 返回 (仓库, 分支) 的索引目录, 等价于 branchDir。
+//
 // GetIndexPath returns the on-disk index directory for a repo branch.
 func (gi *GlobalIndex) GetIndexPath(repoID, branchName string) string {
 	return gi.branchDir(repoID, branchName)

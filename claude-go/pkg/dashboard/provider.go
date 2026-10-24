@@ -53,6 +53,10 @@ func (p *Provider) Exists() bool {
 	return err == nil && info.IsDir()
 }
 
+// load 带 TTL 缓存的取数封装: 命中未过期缓存直接返回, 否则调用 fn 并把结果写回缓存。
+//
+// 注意：失败**不进缓存** —— fn 返回 error 时直接透传, 所以坏路径每次请求都会重算; 而成功
+// 结果在 ttl 内不失效, 磁盘上的变更最多滞后一个 ttl 才可见。ttl<=0 表示完全禁用缓存。
 func (p *Provider) load(key string, fn func() (interface{}, error)) (interface{}, error) {
 	if p.ttl > 0 {
 		p.mu.RLock()
@@ -74,6 +78,7 @@ func (p *Provider) load(key string, fn func() (interface{}, error)) (interface{}
 	return v, nil
 }
 
+// pathIn 把若干子路径拼到数据根目录下。
 func (p *Provider) pathIn(sub ...string) string {
 	parts := append([]string{p.stateDir}, sub...)
 	return filepath.Join(parts...)
@@ -333,6 +338,8 @@ func parseEvalScoreLine(round int, raw string) AdversaryRoundDTO {
 	return r
 }
 
+// parseFloatSoft 宽松解析浮点数: 先去掉尾部可能的标点, 解析失败返回 0 而不报错
+// (blackboard 里的评分是模型写的自然语言, 容忍脏值比报错更重要)。
 func parseFloatSoft(s string) float64 {
 	s = strings.TrimSpace(s)
 	// 去掉末尾可能的标点
@@ -389,6 +396,8 @@ func (p *Provider) teamRunMetrics(name string) []RunMetricSeries {
 	return out
 }
 
+// matchTeam 判断指标 labels 是否属于指定团队; 依次试 team / team_name / teamName /
+// run / run_name 五个键, 任一命中即为真。
 func matchTeam(labels map[string]string, name string) bool {
 	if labels == nil {
 		return false
@@ -481,6 +490,7 @@ func (p *Provider) Blackboard(name string) (*BlackboardDTO, error) {
 	return dto, nil
 }
 
+// readTeamFile 读取并解析 teams/<name>/team.json; 文件里 name 字段为空时用目录名兜底。
 func (p *Provider) readTeamFile(name string) (*rawTeam, error) {
 	data, err := os.ReadFile(p.pathIn("teams", name, "team.json"))
 	if err != nil {
@@ -496,6 +506,10 @@ func (p *Provider) readTeamFile(name string) (*rawTeam, error) {
 	return &t, nil
 }
 
+// toSummary 把 team.json 压成列表用的摘要: 统计阶段总数/完成数/失败数, 并算出耗时。
+//
+// 耗时口径: 已结束用 finishedAt-startedAt; 仍在跑则用 now-startedAt —— 于是列表里
+// 进行中的团队每次请求耗时值都在涨 (这是刻意的, 表示"已跑了多久")。
 func toSummary(t *rawTeam) TeamSummary {
 	var total, done, fail int
 	total = len(t.Stages)
@@ -832,6 +846,11 @@ func (p *Provider) ModuleMetricEvents(module string, limit int, since time.Time)
 	return out, nil
 }
 
+// readMetricEvents 读取 metrics/<module>.jsonl 的全部事件 (带 TTL 缓存); 文件不存在时
+// 返回空列表而不是错误。
+//
+// 注意：逐行 json.Unmarshal 失败的行被**静默跳过** —— 半个坏行不会让整个模块的数据消失,
+// 但也不会留下任何痕迹, 所以"事件数变少"未必等于"没产生事件"。
 func (p *Provider) readMetricEvents(module string) ([]rawMetricEvent, error) {
 	key := "metrics:events:" + module
 	v, err := p.load(key, func() (interface{}, error) {
@@ -861,6 +880,18 @@ func (p *Provider) readMetricEvents(module string) ([]rawMetricEvent, error) {
 	return v.([]rawMetricEvent), nil
 }
 
+// summarizeModule 把一个模块的全部事件按指标名分桶, 逐桶算统计量并挑出趋势告警。
+//
+// 算法解读：
+//
+//	原理：先按 e.Name 分桶; 每桶取**最近 100 个点**算统计量 (count/last/avg/min/max/stddev/
+//	      trend), 再对全量序列跑 detectTrend 出告警, 最后把告警按桶汇总。
+//	关键不变量：统计量与趋势告警吃的是**不同长度**的序列 —— 统计量用截断后的最近 100 点
+//	      (要"当前状态"), 告警用全量 (要够长的前半/后半对比)。这个不对称是刻意的, 改动
+//	      任一侧都会让"当前状态"与"趋势"指向不同的时间窗。
+//	代价与边界：事件全量常驻内存 (每模块一个切片), 大文件会一直占着; 趋势只看前后半均值
+//	      差, 对周期型指标会误报。
+//	设计权衡：均值/标准差而非分位数 —— 单遍 O(n) 且无需排序, 代价是对离群点不稳健。
 func summarizeModule(module string, events []rawMetricEvent) *ModuleSummaryDTO {
 	grouped := map[string][]float64{}
 	for _, e := range events {
@@ -872,6 +903,8 @@ func summarizeModule(module string, events []rawMetricEvent) *ModuleSummaryDTO {
 		EventCount: len(events),
 	}
 	for name, vs := range grouped {
+		// 统计量只看**最近 100 个点** ("当前状态"), 而下面的趋势告警吃全量序列 ——
+		// 两个循环刻意用不同长度, 别把这里改成 vs。
 		recent := vs
 		if len(recent) > 100 {
 			recent = recent[len(recent)-100:]
@@ -879,6 +912,7 @@ func summarizeModule(module string, events []rawMetricEvent) *ModuleSummaryDTO {
 		out.Metrics[name] = computeStat(name, recent)
 	}
 	// 告警: 使用简单的前半/后半对比
+	// 注: 吃全量序列, 不做截断。
 	for name, vs := range grouped {
 		if alert := detectTrend(name, vs); alert != "" {
 			out.TrendAlerts = append(out.TrendAlerts, alert)
@@ -887,6 +921,20 @@ func summarizeModule(module string, events []rawMetricEvent) *ModuleSummaryDTO {
 	return out
 }
 
+// computeStat 计算一组值的 count/last/avg/min/max/stddev, 并给出 improving / degrading /
+// stable 的趋势标签。
+//
+// 算法解读：
+//
+//	原理：单遍求 sum/min/max, 第二遍求方差 (总体方差, 除以 n), 趋势用相对变化率
+//	      delta = (后半均值 - 前半均值) / (|前半均值| + 1e-10), ±10% 为阈值。
+//	关键不变量：趋势只在 n>=4 时给出 —— 少于 4 个点切两半各不足 2 个, 那个"趋势"是噪声;
+//	      分母加 1e-10 是为了前半均值为 0 时不产生 Inf。
+//	代价与边界：两遍扫描; 对锯齿或周期序列会把"稳定"误判成 improving/degrading。注意
+//	      detectTrend 用的是**另一套**阈值 (±25%, 且只对 rate/ratio/error 类指标告警),
+//	      与这里的标签口径不同, 两者不一致不是 bug。
+//	设计权衡：相对变化率而非线性回归斜率 —— 不需额外中间量, 且对量纲不敏感 (rate 与
+//	      count 共用同一阈值)。
 func computeStat(name string, values []float64) *MetricStatDTO {
 	n := len(values)
 	if n == 0 {
@@ -927,6 +975,7 @@ func computeStat(name string, values []float64) *MetricStatDTO {
 	}
 }
 
+// avg2 求算术平均; 空切片返回 0。
 func avg2(vs []float64) float64 {
 	if len(vs) == 0 {
 		return 0

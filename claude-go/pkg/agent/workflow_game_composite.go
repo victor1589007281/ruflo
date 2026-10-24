@@ -29,6 +29,10 @@ import (
 	"github.com/anthropic/claude-go/pkg/textutil"
 )
 
+// gameCompositeWorkflow 返回 game 整合团队的工作流定义 (设计 → 群体智能剧情 → 美术 → 引擎开发 → 测试优化)。
+//
+// 注意：Rounds 写 0 表示自适应轮数; 剧情阶段接 swarm_intel 的模拟结果, 是本工作流
+// 与 creative-v2 的主要差别。
 func gameCompositeWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "game",
@@ -395,10 +399,12 @@ func (we *WorkflowExecutor) executeGameComposite(ctx context.Context, wf *Workfl
 // 辅助函数
 // ═══════════════════════════════════════════════════════════
 
+// truncateForPrompt 按字符数截断文本, 超长时以 "\n...(已截断)" 收尾 (提示词里要看得见被截)。
 func truncateForPrompt(s string, maxLen int) string {
 	return textutil.Truncate(s, maxLen, "\n...(已截断)")
 }
 
+// formatGameNarrative 把群体智能模拟结果渲染成 Markdown 剧情段落 (场景 + 概率 + 关键事件 + 综述)。
 func formatGameNarrative(result *swarm_intel.SimulationResult, name string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("## %s 模拟结果\n\n", name))

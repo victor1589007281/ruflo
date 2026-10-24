@@ -87,6 +87,7 @@ func Inspect(stateDir string) (*Report, error) {
 	return r, nil
 }
 
+// assess 按"有轨迹 + 有奖励 + 有经验"三环判定学习闭环健康度, 并生成人读备注。
 func (r *Report) assess() {
 	// 学习闭环健康 = 有轨迹 + 有奖励 + 有经验沉淀
 	hasTrace := r.TraceSpans > 0 || r.Trajectories > 0
@@ -141,6 +142,7 @@ func (r *Report) Format() string {
 
 // --- helpers ---
 
+// countLines 数文件里的非空行数; 打开失败按 0 计。
 func countLines(path string) int {
 	f, err := os.Open(path)
 	if err != nil {
@@ -158,6 +160,7 @@ func countLines(path string) int {
 	return n
 }
 
+// forEachJSONL 逐行扫描 JSONL 并对非空行回调; 文件打不开时静默返回。
 func forEachJSONL(path string, fn func([]byte)) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -174,6 +177,7 @@ func forEachJSONL(path string, fn func([]byte)) {
 	}
 }
 
+// countJSONArray 读 JSON 数组长度, 兼容裸数组与 {"xxx":[...]} 包裹两种形态。
 func countJSONArray(path string) int {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -196,6 +200,7 @@ func countJSONArray(path string) int {
 	return 0
 }
 
+// countShadowSkills 统计 skills 目录下 frontmatter 带 status: shadow 的 SKILL.md 数量。
 func countShadowSkills(skillsDir string) int {
 	n := 0
 	_ = filepath.Walk(skillsDir, func(path string, info os.FileInfo, err error) error {

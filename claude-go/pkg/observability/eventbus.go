@@ -75,6 +75,7 @@ type Subscriber interface {
 // SubscriberFunc 函数式订阅者。
 type SubscriberFunc func(e Event)
 
+// OnEvent 让普通函数直接当 Subscriber 用。
 func (f SubscriberFunc) OnEvent(e Event) { f(e) }
 
 // Bus 线程安全的事件总线, 支持多订阅者和非阻塞发布。
@@ -111,6 +112,18 @@ func (b *Bus) UnsubscribeAll() {
 
 // Emit 发布事件到所有订阅者。若某个 subscriber  panic, 捕获并继续。
 // 非阻塞: subscriber 处理是同步的, 但预期 subscriber 自身实现异步缓冲。
+//
+// 算法解读：
+//
+//	原理：先在读锁下把订阅者切片**拷贝**一份再释放锁, 然后逐个同步调用;
+//	      每个调用外面套一层 recover, 单个订阅者 panic 不波及其余订阅者。
+//	关键不变量：分发期间不能持有 b.mu —— subscriber 里再调 Subscribe/Emit
+//	      (自己也算一个订阅者) 就会自死锁。拷贝是为此付的代价, 不是多余的。
+//	代价与边界：慢订阅者会**拖住发射方**, 而发射方在 LLM 调用链路上 —— 所以本方法
+//	      实际是同步的, "非阻塞"指的是不阻塞在锁上, 不是不阻塞在订阅者上。
+//	      dropCount/enqueueCount 两个字段在 Emit 里从不累加 (见 Stats 的注意)。
+//	设计权衡：不做每订阅者一个队列 (那要引入 goroutine 与有界缓冲、退避与丢弃策略),
+//	      换来的是零 goroutine 泄漏与确定的调用顺序; 代价是把背压直接传给发射方。
 func (b *Bus) Emit(e Event) {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now()
@@ -141,6 +154,9 @@ func (b *Bus) EmitTyped(et EventType, traceID, spanID, module, name string, payl
 }
 
 // Stats 返回总线统计。
+//
+// 注意：drops 恒为 0 —— dropCount 字段声明了但全仓没有任何地方累加它 (enqueueCount
+// 同样只声明未使用)。订阅者名单与返回值都还在, 但这个"丢弃计数"目前是死的。
 func (b *Bus) Stats() (subscribers int, drops uint64) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

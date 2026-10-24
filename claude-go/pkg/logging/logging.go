@@ -45,6 +45,7 @@ type lockedWriter struct {
 	w  io.Writer
 }
 
+// Write 加锁后写底层 writer: 模块文件与全局文件会被多个 slog.Logger 共享, 无锁并发写会撕裂行。
 func (lw *lockedWriter) Write(p []byte) (n int, err error) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
@@ -59,6 +60,10 @@ func Init(cfg *LogConfig) error {
 	return initErr
 }
 
+// initInternal 真正做初始化: 合并配置、建目录、打开全局合并文件、装载包级状态。
+//
+// 全局文件用 O_APPEND 打开 (多进程追加同一文件时靠内核保证不互相覆盖);
+// state 在写锁下整体替换, 因此 For() 里读到的要么是旧状态要么是新状态, 不会是半成品。
 func initInternal(cfg *LogConfig) error {
 	merged := mergeConfig(cfg)
 
@@ -84,6 +89,11 @@ func initInternal(cfg *LogConfig) error {
 	return nil
 }
 
+// mergeConfig 把用户配置叠加到默认值上: Dir/Level/Format 为空则用默认, Console 直接取值。
+//
+// 注意：Console 没有"未设置"的表示 (bool 零值就是 false), 所以 cfg 非 nil 且
+// 未显式写 Console: true 时, 控制台输出会被**关掉** —— 与包注释里"默认 true"的
+// 描述只在 cfg == nil 时一致。
 func mergeConfig(cfg *LogConfig) *LogConfig {
 	out := &LogConfig{
 		Dir:     ".claude-go/logs",
@@ -107,6 +117,7 @@ func mergeConfig(cfg *LogConfig) *LogConfig {
 	return out
 }
 
+// parseLevel 把配置里的级别字符串解析成 slog.Level; 认不出的一律回落 info (含 "warning" 变体)。
 func parseLevel(s string) slog.Level {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "debug":
@@ -120,6 +131,7 @@ func parseLevel(s string) slog.Level {
 	}
 }
 
+// newHandler 按 format 建 slog handler: "json" 走 JSONHandler, 其余 (含空串) 走 TextHandler。
 func newHandler(w io.Writer, level slog.Level, format string) slog.Handler {
 	opts := &slog.HandlerOptions{Level: level}
 	switch strings.ToLower(strings.TrimSpace(format)) {
@@ -183,6 +195,9 @@ func For(module string) *slog.Logger {
 	return lg
 }
 
+// fallbackLogger 在模块文件打不开时退回"全局文件 + 可选控制台", 并把失败原因作为属性写进日志。
+//
+// 降级而不是报错: 一个模块的日志文件建不出来, 不该让整个进程起不来。
 func fallbackLogger(st *initState, module string, openErr error) *slog.Logger {
 	var writers []io.Writer
 	writers = append(writers, st.globalLW)
@@ -199,6 +214,9 @@ func fallbackLogger(st *initState, module string, openErr error) *slog.Logger {
 	return lg
 }
 
+// safeFileBase 把模块名净化成安全的文件名: ".."、路径分隔符都替换成 "_", 再去掉首尾的点与空格。
+//
+// 空结果回落 "default" —— 模块名可能来自外部输入, 不净化的后果是日志写到目录之外。
 func safeFileBase(name string) string {
 	if name == "" {
 		return "default"

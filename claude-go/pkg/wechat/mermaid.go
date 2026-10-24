@@ -52,6 +52,10 @@ mermaid.initialize({startOnLoad:false,theme:"default",securityLevel:"loose"});
 // validateAndFix: 用方括号标签加引号等启发式修复常见 mermaid 语法错误 (LLM 易漏引号)。
 var sqBracketLabel = regexp.MustCompile(`\[([^\]\n]*?)\]`)
 
+// repairMermaid 用一组启发式规则修复 LLM 常犯的 mermaid 语法错误 (漏引号、残留代码块围栏等)。
+//
+// 注意：修复是**纯文本改写** —— 先去掉首尾空白与 "mermaid" 语言标记、无条件抹掉所有 ```,
+// 再给含特殊字符的方括号标签补引号。所以正文里本来合法的围栏也会一并被去掉。
 func repairMermaid(code string) string {
 	code = strings.TrimSpace(code)
 	code = strings.TrimPrefix(code, "mermaid\n")

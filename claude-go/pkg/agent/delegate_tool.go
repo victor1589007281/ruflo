@@ -75,12 +75,15 @@ func (t *DelegateTool) SetTraceStore(ts *tracestore.Store) {
 
 var _ tool.Tool = (*DelegateTool)(nil)
 
+// Name 返回工具名 (常量在 pkg/tool, 与本文件解耦)。
 func (t *DelegateTool) Name() string { return tool.DelegateToolName }
 
+// Description 返回给模型看的工具说明: 强调子代理**看不到本对话历史**, 子任务必须自包含。
 func (t *DelegateTool) Description() string {
 	return `Delegate tool-heavy or parallelizable sub-tasks to isolated sub-agents running on the fast execution model. Each sub-agent gets a fresh context and its own tool loop, but cannot see this conversation. You decompose the task and synthesize the results yourself. Pass multiple independent sub-tasks in "tasks" to run them in parallel.`
 }
 
+// InputSchema 返回 delegate_task 的输入 schema (task 与 tasks 二选一, 由 Call 校验)。
 func (t *DelegateTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -97,10 +100,12 @@ func (t *DelegateTool) InputSchema() json.RawMessage {
 // IsConcurrencySafe 返回 false: 并行在 Call 内部以信号量控制, 工具层串行。
 func (t *DelegateTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
+// CheckPermissions 返回 nil: 不做工具级权限判定, 交由子代理各自的工具循环把关。
 func (t *DelegateTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// IsReadOnly 按输入的 readonly 字段声明本次委派是否只读; 输入解析失败时保守地当作可写。
 func (t *DelegateTool) IsReadOnly(input json.RawMessage) bool {
 	var in delegateInput
 	if json.Unmarshal(input, &in) == nil {
@@ -110,6 +115,20 @@ func (t *DelegateTool) IsReadOnly(input json.RawMessage) bool {
 }
 
 // Call 执行委派: 把 task/tasks 交给独立子代理 (执行模型) 运行, 结果按序拼接。
+//
+// 算法解读：
+//
+//	原理：把 N 个子任务丢进 N 个 goroutine 并行跑, 用一个容量 maxDelegateConcurrency
+//	      的信号量通道限制同时在跑的数量; 每个子代理拿到的是**全新上下文**,
+//	      模型固定为执行模型 (tctx.ExecutionModel, 回退 MainLoopModel)。
+//	关键不变量：results 必须按输入下标回填 (results[i]) —— 否则并发完成顺序会打乱
+//	      输出与子任务的对应关系, 而主模型正是靠"第 k 个子任务"这个序号综合结果的。
+//	      另一条: 深度守卫必须在派发**之前**加一, 否则递归委派会失控。
+//	代价与边界：最坏情况下 N 个子任务串行成 ceil(N/4) 批; 单个子任务失败不影响
+//	      其余 (失败只写进该槽位的文案), 但整体仍返回成功 —— 调用方无法从 error 看出
+//	      有子任务失败, 只能读文本。
+//	设计权衡：并行放在 Call 内部而不是靠工具层并发 (IsConcurrencySafe=false):
+//	      runAgent/trace/hookRunner 是共享状态, 跨调用并发会竞态。
 func (t *DelegateTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in delegateInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -136,6 +155,7 @@ func (t *DelegateTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 	if turnCap <= 0 {
 		turnCap = defaultDelegateMaxTurns
 	}
+	// 两道上限取小: 模型自报的 max_turns 不得突破装配期设的 turnCap (后者是运维口径)。
 	if maxTurns > turnCap {
 		maxTurns = turnCap
 	}
@@ -156,6 +176,8 @@ func (t *DelegateTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 	}
 
 	results := make([]string, len(tasks))
+	// 信号量在 goroutine 内部获取: N 个 goroutine 一次性起好, 由信号量决定谁在跑,
+	// 超出的排队等待 (占着栈但不占并发额度)。N 由模型给的 tasks 长度决定。
 	sem := make(chan struct{}, maxDelegateConcurrency)
 	var wg sync.WaitGroup
 	for i, task := range tasks {

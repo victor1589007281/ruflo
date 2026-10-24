@@ -62,6 +62,7 @@ func WithOuterRetryDriven(ctx context.Context) context.Context {
 	return context.WithValue(ctx, outerRetryDrivenKey{}, true)
 }
 
+// isOuterRetryDriven 判断本次执行是否由 Coordinator 恢复路径驱动 (见 outerRetryDrivenKey)。
 func isOuterRetryDriven(ctx context.Context) bool {
 	v, _ := ctx.Value(outerRetryDrivenKey{}).(bool)
 	return v
@@ -397,6 +398,12 @@ func summarizeDependency(output string) string {
 	return SummarizeOldOutput(output, maxDepOutputLen)
 }
 
+// SummarizeOldOutput 把过长输出压成"关键行摘要" (标题/代码声明/决策/结论/推荐/错误行),
+// 加 "[摘要] " 前缀返回; 未超长则原样返回。
+//
+// 注意：兜底分支 result = output[:maxLen] 是按**字节**切, 中文/emoji 混排时可能劈出
+// 半个 UTF-8 序列 (上面的摘要分支同样如此)。上游 textutil.Truncate 已按 rune 截,
+// 这条路径没有 —— 若下游要直接渲染这段文本, 值得复核。
 func SummarizeOldOutput(output string, maxLen int) string {
 	if len(output) <= maxLen {
 		return output
@@ -661,6 +668,7 @@ type WorkflowExecutor struct {
 	progressCallback func(phase string, iteration int, bytesWritten int64, taskID string) // 进展上报 (可为 nil)
 }
 
+// tryInitDAG 惰性探测 taskTracker 是否实现 DAGTaskTracker, 命中则缓存到 dagTracker (只探测一次)。
 func (we *WorkflowExecutor) tryInitDAG() {
 	if we.dagTracker != nil || we.taskTracker == nil {
 		return
@@ -670,6 +678,12 @@ func (we *WorkflowExecutor) tryInitDAG() {
 	}
 }
 
+// Execute 是工作流总入口: 按 wf.Mode 分派到专用执行器, 并全程发 team 级观测事件
+// (EvtTeamStart / EvtTeamComplete / EvtTeamFail)。
+//
+// 分派优先级: 图模板灰度 (CLAUDE_GO_GRAPH_ENGINE 开 + 该 mode 有已验证等价的模板)
+// > switch 里的专用执行器 > 默认 executePipeline。pipeline/fanout/graph 也在 switch 内,
+// default 只是最后兜底 —— 未知 mode 静默按 pipeline 跑。
 func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	start := time.Now()
 	traceCtx := observability.NewRootTrace().WithBaggage("team_id", team.Name).WithBaggage("workflow", wf.Mode)
@@ -765,6 +779,7 @@ func (we *WorkflowExecutor) Execute(ctx context.Context, wf *WorkflowDef, object
 	}
 }
 
+// savePhaseCheckpoints 把终态阶段写入检查点 (completed 存产出, failed 存错误), 供后续恢复。
 func (we *WorkflowExecutor) savePhaseCheckpoints(results []StageResult) {
 	if we.checkpoints == nil {
 		return
@@ -781,6 +796,8 @@ func (we *WorkflowExecutor) savePhaseCheckpoints(results []StageResult) {
 	}
 }
 
+// flushStagesLive 把阶段结果实时回写 team.Stages 并落盘, 同时上报细粒度 stage 指标
+// (与 Coordinator.recordStageMetrics 同口径, 保证两条路径的读数一致)。
 func (we *WorkflowExecutor) flushStagesLive(team *ProductionTeam, results []StageResult) {
 	if team == nil || len(results) == 0 {
 		return
@@ -819,6 +836,8 @@ func (we *WorkflowExecutor) flushStagesLive(team *ProductionTeam, results []Stag
 	}
 }
 
+// restoreCheckpoints 从检查点恢复已完成阶段: 把产出注入 prevResults (同时写阶段名与
+// 角色别名两个键) 并追加到 allResults, 使本轮无需重跑。
 func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults map[string]string, allResults *[]StageResult) {
 	if we.checkpoints == nil {
 		return
@@ -845,6 +864,20 @@ func (we *WorkflowExecutor) restoreCheckpoints(stages []StageDef, prevResults ma
 	}
 }
 
+// executePipeline 按依赖拓扑执行 pipeline 阶段: 每轮挑出"依赖已全部满足"的就绪集,
+// 其中标记 Parallel 的阶段合并成一批并发跑, 否则取第一个串行跑。
+//
+// 算法解读：
+//
+//	原理：反复扫描未完成阶段, 收齐 DependsOn 全部落在 completed 里的那些作为就绪集;
+//	      就绪集 >1 时交给 executeParallel 并发, 否则串行执行 ready[0]。
+//	关键不变量：任一阶段执行前其全部依赖必须已在 completed 中 —— 否则下游会读到缺失
+//	      的 results 条目; 且就绪集为空必须判死锁返回错误, 不能空转 (循环条件只保证
+//	      进度, 不保证有可执行项)。
+//	代价与边界：每轮 O(阶段数 × 依赖数) 全量重扫; 阶段规模在几十量级可忽略。无环假设
+//	      不成立时由"就绪集为空 ⇒ 死锁"兜底, 而不是无限循环。
+//	设计权衡：放弃一次性拓扑排序 + 分层, 换成每轮重扫 —— 省掉独立的环检测与分层结构,
+//	      代价是重复扫描。
 func (we *WorkflowExecutor) executePipeline(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	// 灰度切换 (design/01 M1): CLAUDE_GO_GRAPH_ENGINE=1 时 pipeline 走图引擎
 	// (ready-set 调度 + Journal 恢复), 行为等价验收后成为默认路径。
@@ -880,11 +913,14 @@ func (we *WorkflowExecutor) executePipeline(ctx context.Context, wf *WorkflowDef
 			}
 		}
 
+		// 就绪集为空 = 依赖成环 (或 DependsOn 写了不存在的阶段名); 必须判死锁退出,
+		// 否则外层 for 会永久空转 (循环条件只看 completed 是否增长)。
 		if len(ready) == 0 {
 			return allResults, fmt.Errorf("工作流死锁: 无法找到可执行的阶段")
 		}
 
 		// 检查是否有多个可并行的阶段
+		// 只有显式标了 Parallel 的阶段才合并成一批; 未标记的就绪阶段仍逐个串行, 不隐式并行。
 		parallelGroup := filterParallel(ready)
 		if len(parallelGroup) > 1 {
 			stageResults := we.executeParallel(ctx, parallelGroup, objective, results, team)
@@ -912,6 +948,19 @@ func (we *WorkflowExecutor) executePipeline(ctx context.Context, wf *WorkflowDef
 	return allResults, nil
 }
 
+// estimateDebateDivergence 用关键词计数 + 文本长度比, 启发式估计正反双方的分歧度 ∈ [0,1]。
+//
+// 算法解读：
+//
+//	原理：统计双方文本里"同意/反对"两类标记词的出现次数, 分歧度 = 反对数 / (同意+反对);
+//	      再叠加长度比修正 —— 一方篇幅明显更长 (>2x) 通常意味着它在大量反驳, 此时把
+//	      分歧度按 divergence*0.7+0.3 往高处拉。
+//	关键不变量：结果恒落在 [0,1], 且两端都有确定的兜底 —— 任一输出为空、或两类标记词
+//	      一个都没命中时返回 0.5 (中性), 而不是 0 或 1 这种"确定判断"。
+//	代价与边界：纯词频, 对"我同意...但是"这类条件式同意会误判; 中英文词表各不到 10 个,
+//	      覆盖面有限, 只适合当粗粒度信号而非判决依据。
+//	设计权衡：刻意不调 LLM 做语义分歧判定 —— 那要每轮一次额外 RPC, 而本函数服务于对抗
+//	      循环的收敛判据, 需要便宜、确定、可复现。
 func estimateDebateDivergence(proposerOutput, opponentOutput string) float64 {
 	if proposerOutput == "" || opponentOutput == "" {
 		return 0.5
@@ -954,10 +1003,13 @@ func estimateDebateDivergence(proposerOutput, opponentOutput string) float64 {
 	return divergence
 }
 
+// ExecuteSingleStage 暴露单阶段执行入口 (Coordinator 的恢复路径经此进入 executeStage)。
 func (we *WorkflowExecutor) ExecuteSingleStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
 	return we.executeStage(ctx, stage, objective, prevResults, team)
 }
 
+// buildLocalReferenceContextForStage 为调研/架构阶段拼装本地参考资料摘录块 (总预算 24000 字符);
+// 其他角色直接返回空串 —— 参考资料只喂给形成接口与约束的那一步。
 func buildLocalReferenceContextForStage(stage StageDef, objective string) string {
 	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
@@ -994,6 +1046,7 @@ func buildLocalReferenceContextForStage(stage StageDef, objective string) string
 	return b.String()
 }
 
+// extractLocalReferencePaths 从 objective 文本里抠出绝对路径, 只保留磁盘上真实存在的, 去重后返回。
 func extractLocalReferencePaths(objective string) []string {
 	re := regexp.MustCompile(`/[^\s，,。；;：:)）]+`)
 	matches := re.FindAllString(objective, -1)
@@ -1010,6 +1063,8 @@ func extractLocalReferencePaths(objective string) []string {
 	return uniqueStrings(paths)
 }
 
+// readLocalReferenceExcerpt 读取参考资料摘录: 单文件直读; 目录则按文件名字序遍历其中的
+// 文档类文件 (跳过 .git/vendor/node_modules 等), 每个文件最多取 4000 字符。
 func readLocalReferenceExcerpt(path string, maxChars int) string {
 	if maxChars <= 0 {
 		return ""
@@ -1060,6 +1115,7 @@ func readLocalReferenceExcerpt(path string, maxChars int) string {
 	return b.String()
 }
 
+// isReferenceDocFile 判断扩展名是否属于可当参考资料读取的文档类文件 (md/txt/rst/json/yaml/toml)。
 func isReferenceDocFile(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".md", ".txt", ".rst", ".json", ".yaml", ".yml", ".toml":
@@ -1069,6 +1125,7 @@ func isReferenceDocFile(path string) bool {
 	}
 }
 
+// readReferenceFileExcerpt 读文档类文件并按**字符数** (而非字节) 截断, 避免把中文劈成非法 UTF-8。
 func readReferenceFileExcerpt(path string, maxChars int) string {
 	if maxChars <= 0 || !isReferenceDocFile(path) {
 		return ""
@@ -1098,6 +1155,12 @@ func stageFeedbackScore(ee *EvolutionEngine, runID, teamName, node string, compl
 	return boolFeedbackScore(completed)
 }
 
+// executeStage 执行单个阶段: 组装 prompt (黑板上下文 + 定向消息 + 用户反馈 + 进化经验)
+// → 建 V2 Task → 带重试跑 Agent → 结果写回黑板与 Task → 记录轨迹与学习反馈。
+//
+// 这是四条执行路径 (pipeline / fanout / adversarial / graph) 的唯一汇聚点: 阶段级的
+// 声明下发 (Tools/Model/Hooks/Skills) 与各类注入都接在这里, 接一次四条都通 —— 只接
+// pipeline 一处会让另外三条路径上的 agent 静默收不到, 且与"根本没配"完全同形。
 func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, objective string, prevResults map[string]string, team *ProductionTeam) StageResult {
 	stageStart := time.Now()
 	// trace 四元组 NodeID = stage 名 (design/03 §4.1 E0): 本阶段内所有 LLM 调用
@@ -1370,6 +1433,22 @@ func (we *WorkflowExecutor) executeStage(ctx context.Context, stage StageDef, ob
 	return sr
 }
 
+// executeStageWithRetry 带错误分类的重试环: 输出校验失败→改写 prompt 重试; 瞬态错误→
+// 指数退避重试; 429 限流→长退避 + 独立计数上限; 永久错误→立即返回不重试。
+//
+// 算法解读：
+//
+//	原理：先跑一次 Agent, 再按错误性质分流。成功但输出不合规时, 把校验错误拼回 prompt
+//	      做一次定向修正重试; 失败时用 isStageTransientError 分类 —— 永久错误直接返回,
+//	      瞬态错误按 computeRetryDelay 退避重试, 429 另走独立计数器 (退避 ≥30s 起)。
+//	关键不变量：限流重试**不消耗**普通 attempt 预算 (rateLimitAttempt 与 attempt 两条
+//	      计数分离) —— 否则一段限流会把普通重试次数吃光; 反向也成立, 普通重试不能绕过
+//	      限流硬上限。外层驱动时 (isOuterRetryDriven) 两档上限被压到 1/3, 消除与
+//	      Coordinator.executeStageWithRetry 的嵌套重试乘法。
+//	代价与边界：最坏耗时是各次退避之和, 由外层 stageCtx 的超时兜底; 错误分类是纯子串
+//	      匹配, 上游文案一改分类就会漂 (词表见 isStageTransientError)。
+//	设计权衡：不引入通用重试库 —— 这里要给"输出形态错误"单开一条便宜且有针对性 (拼
+//	      校验反馈) 的修正路径, 通用退避器表达不了这条分支。
 func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage StageDef, prompt, objective string, team *ProductionTeam, injectedExpIDs []string) StageResult {
 	var lastErr StageResult
 	var rateLimitAttempt int // 限流专用重试计数器
@@ -1425,6 +1504,7 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 					return lastErr
 				}
 				we.notify(we.chatID, fmt.Sprintf("⚠️ 阶段 **%s** 输出校验失败, 将重试: %s", stage.Name, validationErr))
+				// 重试不是原样重放: 把校验错误回灌进 prompt, 让下一次尝试带上"上次错在哪"的定向修正。
 				prompt = prompt + "\n\n## 上次输出无效, 必须修正\n" + validationErr + "\n只输出该阶段要求的最终内容; 不要输出工具调用、bash 命令或元任务。\n"
 				continue
 			}
@@ -1540,6 +1620,8 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 	}
 }
 
+// isStageRetryableOutputError 判断错误是否属于"输出形态错误" (可通过改写 prompt 修正),
+// 与瞬态网络错误区分 —— 两者都重试, 但修正手段不同。
 func isStageRetryableOutputError(errStr string) bool {
 	if errStr == "" {
 		return false
@@ -1557,6 +1639,8 @@ func isStageRetryableOutputError(errStr string) bool {
 	return false
 }
 
+// deterministicPlannerFallbackStageResult 为 planner 阶段合成确定性 WBS 兜底产出
+// (仅当目标是 V1 纵切、且失败原因确为 WBS 不可解析/不可执行时, 否则返回失败)。
 func deterministicPlannerFallbackStageResult(stage StageDef, objective, reason string) StageResult {
 	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
@@ -1585,6 +1669,8 @@ func deterministicPlannerFallbackStageResult(stage StageDef, objective, reason s
 	}
 }
 
+// deterministicStageValidationFallback 按角色分派确定性兜底: planner → 合成 WBS,
+// researcher/architect → 模板报告, 其余角色不兜底 (返回失败)。
 func deterministicStageValidationFallback(stage StageDef, objective, reason string) StageResult {
 	if fallback := deterministicPlannerFallbackStageResult(stage, objective, reason); fallback.Status == TaskCompleted {
 		return fallback
@@ -1601,6 +1687,8 @@ func deterministicStageValidationFallback(stage StageDef, objective, reason stri
 	}
 }
 
+// shouldUseStageValidationFallback 判定是否该启用确定性兜底 —— 按角色 + 失败原因 +
+// 尝试次数三重条件, 避免过早放弃真实模型的产出 (首轮通常仍值得重试)。
 func shouldUseStageValidationFallback(stage StageDef, objective, reason string, attempt int) bool {
 	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
@@ -1619,6 +1707,8 @@ func shouldUseStageValidationFallback(stage StageDef, objective, reason string, 
 	return false
 }
 
+// deterministicResearchFallbackStageResult 生成 researcher 阶段的确定性调研报告兜底,
+// 分 design-complete 与 V1 纵切两套模板 (由 objective 判定用哪套)。
 func deterministicResearchFallbackStageResult(stage StageDef, objective, reason string) StageResult {
 	if objectiveRequiresDesignCompleteMode(objective) {
 		out := fmt.Sprintf(`## HEV 调研报告 (deterministic fallback)
@@ -1658,6 +1748,8 @@ func deterministicResearchFallbackStageResult(stage StageDef, objective, reason 
 	return StageResult{Name: stage.Name, Role: stage.Agent, Status: TaskCompleted, Output: out}
 }
 
+// deterministicArchitectFallbackStageResult 生成 architect 阶段的确定性架构设计兜底,
+// 同样分 design-complete 与 V1 纵切两套模板。
 func deterministicArchitectFallbackStageResult(stage StageDef, objective, reason string) StageResult {
 	targetRoot := inferObjectiveTargetRoot(objective)
 	if targetRoot == "" {
@@ -1720,6 +1812,8 @@ fallback reason: %s
 	return StageResult{Name: stage.Name, Role: stage.Agent, Status: TaskCompleted, Output: out}
 }
 
+// marshalRawTasksAsWBSJSON 把内部 rawTask 列表序列化成 WBS JSON, 字段名与
+// parseWBSFromJSON 的读取端对齐 (保证 round-trip 不丢字段)。
 func marshalRawTasksAsWBSJSON(tasks []rawTask) (string, error) {
 	type taskJSON struct {
 		ID              string   `json:"id"`
@@ -1795,6 +1889,8 @@ func marshalRawTasksAsWBSJSON(tasks []rawTask) (string, error) {
 	return string(data), nil
 }
 
+// buildStageOutputRetryPrompt 拼装"输出形态错误"的重试提示: 带上硬性规则 (禁伪工具调用)
+// 与上次无效输出摘录, 并按角色点名必须直接产出的内容。
 func buildStageOutputRetryPrompt(base string, stage StageDef, reason, previousOutput string) string {
 	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	var required string
@@ -1815,6 +1911,8 @@ func buildStageOutputRetryPrompt(base string, stage StageDef, reason, previousOu
 		"上次无效输出摘录:\n" + truncateResult(previousOutput, 1200) + "\n"
 }
 
+// validateStageOutputForRetry 校验阶段产出是否合格: planner 须是可解析且对目标可执行的
+// JSON WBS, 调研/架构角色不得吐伪工具调用。合格返回空串, 否则返回失败原因。
 func validateStageOutputForRetry(stage StageDef, objective, output string) string {
 	role := strings.ToLower(strings.TrimSpace(stage.Agent))
 	name := strings.ToLower(strings.TrimSpace(stage.Name))
@@ -1839,6 +1937,7 @@ func validateStageOutputForRetry(stage StageDef, objective, output string) strin
 	return ""
 }
 
+// containsPseudoToolCall 检测输出里是否出现伪工具调用痕迹 (模型把工具调用当普通文本吐出来)。
 func containsPseudoToolCall(output string) bool {
 	lower := strings.ToLower(output)
 	patterns := []string{
@@ -1857,6 +1956,7 @@ func containsPseudoToolCall(output string) bool {
 	return false
 }
 
+// min 返回两整数中的较小者 (Go 1.21 内置 min 之前的本地实现)。
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -1864,6 +1964,8 @@ func min(a, b int) int {
 	return b
 }
 
+// computeStageTimeout 按角色给阶段基础超时 (coder 25min / tester 15min / 调研架构 6min ...),
+// 每次重试再放大 20%, 硬上限 40min。
 func (we *WorkflowExecutor) computeStageTimeout(role string, attempt int) time.Duration {
 	base := stageTimeout // 默认 10 分钟
 
@@ -1898,6 +2000,8 @@ func (we *WorkflowExecutor) computeStageTimeout(role string, attempt int) time.D
 	return base
 }
 
+// effectiveParallel 取本 workflow 层的并发上限: 有动态建议且未超默认上限时用建议值,
+// 否则用默认上限 (maxWorkflowParallelDefault)。
 func (we *WorkflowExecutor) effectiveParallel() int {
 	if we.concurrency != nil {
 		suggested := we.concurrency.SuggestConcurrency()
@@ -1911,6 +2015,19 @@ func (we *WorkflowExecutor) effectiveParallel() int {
 	return maxWorkflowParallelDefault
 }
 
+// executeParallel 用信号量把并发卡在 effectiveParallel() 以内, 并发执行一组阶段,
+// 结果按下标写回 (与完成顺序无关)。
+//
+// 算法解读：
+//
+//	原理：每个阶段起一个 goroutine, 进入前先抢 sem 令牌, 因此同时在跑的阶段数不超过
+//	      effectiveParallel()。
+//	关键不变量：results 的下标必须与入参 stages 一一对应 —— 消费方按位置取结果, 若改成
+//	      append 收集就变成"完成序", 与入参错位, 且这种错位只在并发时偶发。
+//	代价与边界：无 per-stage 超时, 依赖 executeStage 内部的 stageCtx; 阶段内 panic 没有
+//	      recover, 会带走整个进程。
+//	设计权衡：不用 errgroup —— 需要"即使某个阶段失败也收齐全部结果"的语义, 由调用方
+//	      按 Status 逐个判定, 而不是首个错误即取消其余。
 func (we *WorkflowExecutor) executeParallel(ctx context.Context, stages []StageDef, objective string, prevResults map[string]string, team *ProductionTeam) []StageResult {
 	results := make([]StageResult, len(stages))
 	var wg sync.WaitGroup
@@ -1931,6 +2048,7 @@ func (we *WorkflowExecutor) executeParallel(ctx context.Context, stages []StageD
 	return results
 }
 
+// isStageTransientError 用子串表判定错误是否瞬态 (超时/限流/网络/过载/5xx), 只有瞬态才重试。
 func isStageTransientError(errStr string) bool {
 	if errStr == "" {
 		return false
@@ -1952,6 +2070,17 @@ func isStageTransientError(errStr string) bool {
 	return false
 }
 
+// computeRetryDelay 计算重试退避: 指数增长 (base·2^attempt, 上限 120s) 后取全抖动 random(0, delay)。
+//
+// 算法解读：
+//
+//	原理：指数退避避免重试风暴, 全抖动 (full jitter) 把重试时刻摊成 [0, delay) 上的
+//	      均匀分布。
+//	关键不变量：必须先按 stageRetryMaxDelay 夹住 delay, **再**取抖动 —— 顺序反了
+//	      (先抖动后夹) 会让上限失效, 因为抖动后的值仍可能超过上限。
+//	代价与边界：全抖动下单次等待可能接近 0, 退避效果只体现在期望值 (≈delay/2) 上;
+//	      限流路径 base 从 3s 提到 15s。
+//	设计权衡：全抖动优于等抖动 (AWS 退避建议) —— 多 agent 并发重试时不会同步撞在同一时刻。
 func computeRetryDelay(attempt int, isRateLimit bool) time.Duration {
 	base := stageRetryBaseDelay
 	if isRateLimit {
@@ -1967,6 +2096,8 @@ func computeRetryDelay(attempt int, isRateLimit bool) time.Duration {
 	return jitter
 }
 
+// runAgent 装配并运行单个 agent: 解析模型层级 (阶段声明 > role > plan) → 注入 RunMetadata
+// → 建 runner → 挂运行中信箱投递 → 限时执行 → 产出验证 → 更新 agent 状态。
 func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, team *ProductionTeam) StageResult {
 	start := time.Now()
 
@@ -2111,6 +2242,7 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	}
 }
 
+// remainingContextTimeout 返回 ctx 的剩余时间; 无 deadline 时返回 fallback, 已过期返回 0。
 func remainingContextTimeout(ctx context.Context, fallback time.Duration) time.Duration {
 	if ctx == nil {
 		return fallback
@@ -2125,10 +2257,25 @@ func remainingContextTimeout(ctx context.Context, fallback time.Duration) time.D
 	return fallback
 }
 
+// ValidateAgentOutput 是 validateAgentOutput 的导出包装, 供外部包复用同一套产出校验。
 func ValidateAgentOutput(output, role string) string {
 	return validateAgentOutput(output, role)
 }
 
+// validateAgentOutput 判定 Agent 产出是否合格: 返回空串表示通过, 否则返回失败原因
+// (特殊标记 "__API_ERROR__" 表示这其实是 API 错误文本, 应走瞬态重试)。
+//
+// 算法解读：
+//
+//	原理：分层递进的启发式筛 —— (0) 先认"明显是 API 错误包装文本"并打标; (1) 长度
+//	      < 50 直接判过短; (2) 思考型角色 (architect/researcher/planner) 的"先读文档
+//	      再做事"承诺型 stub; (3) 空转措辞计数 ≥2 且无实质标记; (4) 短且无结构化内容。
+//	关键不变量：**必须先**认 API 错误 —— 否则限流/超时文本会被后面的长度或空转规则
+//	      判成"产出不合格"这种永久错误, 重试环就不再重试它了。
+//	代价与边界：全是关键词表, 对"合法但简短"的产出会误伤; 故对散文类角色 (isProseRole)
+//	      单独放行 (≥50 字即算有实质内容), 否则一段成书点评会被判空转而拖垮整本书。
+//	设计权衡：宁可漏判不可误杀 —— 只有确实像 stub/空转才拦, 因为误判会让整条流水线
+//	      反复重试乃至失败。
 func validateAgentOutput(output, role string) string {
 	trimmed := strings.TrimSpace(output)
 
@@ -2239,6 +2386,8 @@ func isProseRole(roleLower string) bool {
 	return false
 }
 
+// looksLikeAPIErrorOutput 只看输出前 3 行 (最多 800 字符) 判断是否为 API 错误包装文本 ——
+// 限定头部是为了避免正文里正常讨论限流/超时设计被误判。
 func looksLikeAPIErrorOutput(output string) bool {
 	trimmed := strings.TrimSpace(output)
 	if trimmed == "" {
@@ -2274,6 +2423,8 @@ func looksLikeAPIErrorOutput(output string) bool {
 	return false
 }
 
+// buildStagePromptWithRoles 组装阶段提示词: 角色模板优先 (含专属 Skills); 角色模板是
+// 纯人格 (无 {objective} 占位) 时补上 stage 的任务块; 角色表缺失/未命中时降级用内联 Prompt。
 func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map[string]string, roles *RoleRegistry) string {
 	var prevOutput strings.Builder
 	for _, dep := range stage.DependsOn {
@@ -2357,6 +2508,7 @@ func buildExplicitTaskBlock(objective, prevResult string) string {
 	return b.String()
 }
 
+// stripRoundSuffix 去掉对抗轮次后缀 (-round1..-round20), 得到阶段基础名; 无后缀则原样返回。
 func stripRoundSuffix(name string) string {
 	for i := 1; i <= 20; i++ {
 		suffix := fmt.Sprintf("-round%d", i)
@@ -2380,6 +2532,8 @@ type LanguageToolchain struct {
 	CPUQuotaPercent int // CPU 配额百分比, 0=不限制
 }
 
+// GetToolchain 按语言返回对应的工具链定义 (构建/检查/测试命令与内存/CPU 限额);
+// 未知语言与空串一律回退到 Go。
 func GetToolchain(lang string) *LanguageToolchain {
 	switch lang {
 	case "cpp", "c++":
@@ -2467,6 +2621,7 @@ func GetToolchain(lang string) *LanguageToolchain {
 	}
 }
 
+// BuildCheckLabel 返回该语言"编译通过"的人类可读判据文案 (写进交付说明用)。
 func (tc *LanguageToolchain) BuildCheckLabel() string {
 	switch tc.Language {
 	case "cpp":
@@ -2480,6 +2635,7 @@ func (tc *LanguageToolchain) BuildCheckLabel() string {
 	}
 }
 
+// TestCheckLabel 返回该语言"测试通过"的人类可读判据文案。
 func (tc *LanguageToolchain) TestCheckLabel() string {
 	switch tc.Language {
 	case "cpp":
@@ -2493,10 +2649,13 @@ func (tc *LanguageToolchain) TestCheckLabel() string {
 	}
 }
 
+// runBuildCheck 跑 Go 项目的编译检查 (runBuildCheckLang 的 Go 快捷入口), 返回空串表示通过。
 func runBuildCheck(cwd string) string {
 	return runBuildCheckLang(cwd, "go")
 }
 
+// mysqlCMakeConfigureArgs 返回 MySQL 首次 cmake configure 的参数 (关单测省 30-40% 编译时间、
+// 关 debug 走 Release、复用系统 OpenSSL 与 bundled protobuf)。
 func mysqlCMakeConfigureArgs() []string {
 	return []string{
 		"-B", "build",
@@ -2508,6 +2667,8 @@ func mysqlCMakeConfigureArgs() []string {
 	}
 }
 
+// runMySQLBuildCheck 分三阶段做 MySQL 最小编译: 首次 configure → 构建核心库目标
+// (mysqlEssentialTargets) → 链接 mysqld; 任一步失败返回诊断文本, 全通过返回空串。
 func runMySQLBuildCheck(cwd string) string {
 	jobs := CalcSafeMakeJobs()
 
@@ -2564,10 +2725,13 @@ func runMySQLBuildCheck(cwd string) string {
 	return ""
 }
 
+// runLimitedCommand 在沙箱限额下跑命令 (默认禁用网络)。
 func runLimitedCommand(ctx context.Context, cwd string, args []string, memMaxMB, cpuQuotaPercent int) ([]byte, error) {
 	return runLimitedCommandWithNetwork(ctx, cwd, args, memMaxMB, cpuQuotaPercent, true, nil)
 }
 
+// runLimitedCommandWithNetwork 在沙箱 (内存/CPU/进程数/输出字节限额) 下跑命令并返回合并输出;
+// 失败且无输出时补出可诊断信息 (runtime/failureKind/exitCode/args), 让上层 build/test 报错有据可查。
 func runLimitedCommandWithNetwork(ctx context.Context, cwd string, args []string, memMaxMB, cpuQuotaPercent int, networkDisabled bool, env map[string]string) ([]byte, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("empty command")
@@ -2638,6 +2802,12 @@ func buildLimitedCommandDiagnostics(result *sandbox.CommandResult, err error) st
 	return strings.Join(parts, "\n")
 }
 
+// runBuildCheckLang 按语言跑编译检查: Go 项目先确保模块依赖就绪, MySQL 项目走分阶段最小编译,
+// 其余语言返回失败文本。返回空串表示通过。
+//
+// 注意：`if tc.Language != "go" { return runBuildCheckLang(cwd, lang) }` 是**用相同实参
+// 调回自己** —— 非 Go 语言在这里会无限递归直到栈溢出。从调用点 (runBuildCheck 恒传 "go"、
+// runBuildCheckScoped 同款分支) 看, 这里本意应是某个按语言分派的兄弟函数。此处只记录, 未改代码。
 func runBuildCheckLang(cwd, lang string) string {
 	if cwd == "" {
 		return ""
@@ -2687,6 +2857,11 @@ func runBuildCheckLang(cwd, lang string) string {
 	return result
 }
 
+// runBuildCheckScoped 只编译指定包 (scoped build, 产物写临时目录); 包列表为空或语言非 Go 时
+// 退化为全量 runBuildCheckLang。返回空串表示通过。
+//
+// 注意：`if tc.Language != "go" { return runBuildCheckLang(cwd, lang) }` 与 runBuildCheckLang
+// 内同名分支构成互相递归 —— 非 Go 语言会栈溢出 (见 runBuildCheckLang 的注释)。
 func runBuildCheckScoped(cwd, lang string, targetPackages []string) string {
 	if cwd == "" {
 		return ""
@@ -2749,6 +2924,8 @@ func runBuildCheckScoped(cwd, lang string, targetPackages []string) string {
 	return result
 }
 
+// existingGoTargetPackages 把目标包规范成本地相对路径 (剥模块前缀、补 "./"、去重), 并滤掉
+// 磁盘上不存在的目录; 返回空表示没有可编译的本地包。
 func existingGoTargetPackages(cwd string, targetPackages []string) []string {
 	if cwd == "" || len(targetPackages) == 0 {
 		return nil
@@ -2804,6 +2981,7 @@ func existingGoTargetPackages(cwd string, targetPackages []string) []string {
 	return out
 }
 
+// directoryHasGoFiles 判断目录下是否直接存在 .go 文件 (不递归子目录)。
 func directoryHasGoFiles(dir string) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

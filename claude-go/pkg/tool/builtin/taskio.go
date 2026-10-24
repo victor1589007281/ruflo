@@ -41,6 +41,7 @@ func NewSafeBuffer() *SafeBuffer {
 	return &SafeBuffer{}
 }
 
+// Write 并发安全地追加字节; 作为 cmd.Stdout / cmd.Stderr 的 io.Writer 使用。
 func (s *SafeBuffer) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -93,6 +94,7 @@ func (r *BackgroundTaskRegistry) RegisterStreamingTask(taskID string, cmd *exec.
 	return nil
 }
 
+// get 按 taskID 查表; 第二个返回值表示条目是否存在。
 func (r *BackgroundTaskRegistry) get(taskID string) (*bgTaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -100,6 +102,7 @@ func (r *BackgroundTaskRegistry) get(taskID string) (*bgTaskEntry, bool) {
 	return e, ok
 }
 
+// remove 从注册表删除条目(不存在时为无操作)。
 func (r *BackgroundTaskRegistry) remove(taskID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -123,12 +126,15 @@ func NewTaskOutputTool(reg *BackgroundTaskRegistry) *TaskOutputTool {
 	return &TaskOutputTool{reg: reg}
 }
 
+// Name 返回工具名 "TaskOutput"。
 func (t *TaskOutputTool) Name() string { return taskOutputToolName }
 
+// Description 返回工具描述: 按 task_id 读取聚合输出, 可选 timeout 短暂等待。
 func (t *TaskOutputTool) Description() string {
 	return `按 task_id 读取后台任务截至目前写入聚合缓冲区的输出；可选 timeout（毫秒）在短时间窗口内等待更多输出。`
 }
 
+// InputSchema 返回入参 schema: task_id 必填, timeout 为可选等待窗口(毫秒)。
 func (t *TaskOutputTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -140,13 +146,24 @@ func (t *TaskOutputTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true: 只读取已捕获的输出。
 func (t *TaskOutputTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 恒为 true。
 func (t *TaskOutputTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 返回 nil。
 func (t *TaskOutputTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 读取后台任务已捕获的聚合输出; 可选 timeout 在窗口内轮询等待更多输出。
+//
+// 算法解读：
+//
+//	原理：以 10ms 为粒度轮询输出缓冲, 直到无等待窗口或越过 deadline; 每次轮询都重新取一次快照。
+//	关键不变量：wait == 0 时必须立即返回——无 timeout 的调用不能被拖成一次等待, 否则只读工具会阻塞调用方。
+//	代价与边界：轮询而非条件变量通知, 最坏情况下一个窗口发起 timeout/10ms 次读锁; 窗口结束只保证「已有输出可见」, 不保证进程已退出。
+//	设计权衡：用轮询换掉跨 goroutine 通知, 免去在 SafeBuffer 上引入通知原语; 代价是延迟上界由轮询间隔而非事件决定。
 func (t *TaskOutputTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in taskOutputInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -202,14 +219,18 @@ func NewTaskStopTool(reg *BackgroundTaskRegistry) *TaskStopTool {
 	return &TaskStopTool{reg: reg}
 }
 
+// Name 返回工具名 "TaskStop"。
 func (t *TaskStopTool) Name() string { return taskStopToolName }
 
+// Aliases 返回别名 KillShell, 使 LLM 可用任一名字调用本工具。
 func (t *TaskStopTool) Aliases() []string { return []string{killShellAlias} }
 
+// Description 返回工具描述: 尽力终止后台子进程并移除注册项。
 func (t *TaskStopTool) Description() string {
 	return `按 task_id 终止后台子进程（尽力发送 SIGTERM/SIGKILL）；注册表中的条目会被移除。`
 }
 
+// InputSchema 返回入参 schema: task_id 必填。
 func (t *TaskStopTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -220,9 +241,12 @@ func (t *TaskStopTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false: 会终止进程, 属写操作。
 func (t *TaskStopTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+// IsConcurrencySafe 恒为 true。
 func (t *TaskStopTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 在计划模式下拒绝终止后台进程。
 func (t *TaskStopTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx != nil && tctx.PermissionMode == types.PermissionModePlan {
 		return &types.PermissionResult{Behavior: types.PermissionDeny, Reason: "计划模式：禁止终止后台进程"}
@@ -230,6 +254,7 @@ func (t *TaskStopTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContex
 	return nil
 }
 
+// Call 终止指定任务对应的子进程并移除注册项; 进程句柄缺失时仅清理注册项。
 func (t *TaskStopTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in taskStopInput
 	if err := json.Unmarshal(input, &in); err != nil {

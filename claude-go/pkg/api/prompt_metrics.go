@@ -59,6 +59,8 @@ func WithLLMMetrics(ctx context.Context, meta LLMMetricsContext) context.Context
 	return context.WithValue(ctx, llmMetricsContextKey{}, meta)
 }
 
+// llmMetricsFromContext 从 context 取回单次调用的标签与账本; ctx 为 nil 或未注入时
+// 返回零值 (调用方不必判空)。
 func llmMetricsFromContext(ctx context.Context) LLMMetricsContext {
 	if ctx == nil {
 		return LLMMetricsContext{}
@@ -69,6 +71,8 @@ func llmMetricsFromContext(ctx context.Context) LLMMetricsContext {
 	return LLMMetricsContext{}
 }
 
+// applyLLMMetricsContext 把标签补写进调用记录: 标签类字段按非空覆盖, prompt 账本
+// 只在记录里还是全零时才填入 (已有账本不被 context 里的旧值顶掉)。
 func applyLLMMetricsContext(rec *LLMCallRecord, meta LLMMetricsContext) {
 	if rec == nil {
 		return
@@ -90,6 +94,7 @@ func applyLLMMetricsContext(rec *LLMCallRecord, meta LLMMetricsContext) {
 	}
 }
 
+// isZeroPromptComponents 报告 9 个 prompt 组件是否全为 0 (即账本尚未被填过)。
 func isZeroPromptComponents(v PromptComponentMetrics) bool {
 	return v.SystemChars == 0 &&
 		v.ToolsSchemaChars == 0 &&

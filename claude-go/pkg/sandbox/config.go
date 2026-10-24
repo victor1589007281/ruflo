@@ -73,6 +73,9 @@ var (
 	currentConfig = defaultRuntimeConfig()
 )
 
+// defaultRuntimeConfig 返回沙箱的内置默认配置 (启用 / auto 模式 / 团队必需 / 禁网 /
+// 输出 4MiB、预览 128KiB、日志 16MiB / pids 256 / 开指标)。
+// Configure 每次都从这里起步再叠加, 所以这里的值就是"未配置项"的实际取值。
 func defaultRuntimeConfig() runtimeConfig {
 	return runtimeConfig{
 		Enabled:             true,
@@ -97,6 +100,15 @@ func defaultRuntimeConfig() runtimeConfig {
 	}
 }
 
+// Configure 用传入的 Config 覆盖当前沙箱配置, 并让 manager 重新解析。
+//
+// 注意：语义是**整体替换而非增量合并** —— 每次从 defaultRuntimeConfig() 起步, 只把
+// 本次显式给出的项盖上去, 没给的项一律回到默认值 (含 next.StateDir = cfg.StateDir
+// 这种无条件赋值)。因此两次 Configure 之间不会保留上一次的调整。
+//
+// 这也是"零值即未设置"这一约定的来源: 字符串空、数值 <=0 都当作没配; 指针字段
+// (BoolPtr) 用 nil 区分"没配"与"显式配成 false", 其余裸 bool 字段只能表达"开",
+// 想显式关掉一个默认开的开关时它们做不到 (默认值本身就是关的, 所以当前不构成问题)。
 func Configure(cfg Config) {
 	configMu.Lock()
 	defer configMu.Unlock()
@@ -177,12 +189,14 @@ func Configure(cfg Config) {
 	resetDefaultManager()
 }
 
+// CurrentConfig 返回当前生效的运行时配置快照 (读锁下拷贝值, 调用方拿到的是副本)。
 func CurrentConfig() runtimeConfig {
 	configMu.RLock()
 	defer configMu.RUnlock()
 	return currentConfig
 }
 
+// ResetConfigForTest 把配置与 manager 一起复位到默认值, 供测试用例之间清理全局状态。
 func ResetConfigForTest() {
 	configMu.Lock()
 	currentConfig = defaultRuntimeConfig()
@@ -191,6 +205,8 @@ func ResetConfigForTest() {
 	resetDefaultManager()
 }
 
+// MetricsCollector 按当前配置返回指标收集器: 关闭指标时返回 nil; 配了 StateDir 就
+// 落到该目录的独立 collector, 否则用进程级全局 collector。
 func MetricsCollector() *metrics.Collector {
 	cfg := CurrentConfig()
 	if !cfg.MetricsEnabled {

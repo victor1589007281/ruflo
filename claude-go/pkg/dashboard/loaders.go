@@ -528,6 +528,8 @@ func (p *Provider) BuildOverview() (*OverviewResp, error) {
 	return resp, nil
 }
 
+// buildDailyBuckets 把团队按创建日期归入最近 days 天的日桶 (默认 7 天), 统计每日运行数、
+// 成功/失败数与平均耗时; 落在窗口外或无 CreatedAt 的团队直接跳过。
 func buildDailyBuckets(teams []TeamSummary, days int) []DailyBucket {
 	if days <= 0 {
 		days = 7

@@ -46,6 +46,10 @@ func newLRUCache(capacity int) *LRUCache {
 	}
 }
 
+// get 读取缓存值并把该键标记为最近使用; 未命中返回 (nil, false)。
+//
+// 注意: 命中路径会原地改写 order (移尾), 所以本方法**不是**只读的 —— 调用方必须
+// 持写锁而非读锁, 否则并发 get 会竞争同一个 order 切片。
 func (c *LRUCache) get(key string) (interface{}, bool) {
 	ent, ok := c.cache[key]
 	if !ok {
@@ -62,6 +66,22 @@ func (c *LRUCache) get(key string) (interface{}, bool) {
 	return ent.value, true
 }
 
+// set 写入或更新缓存条目, 容量满时淘汰最久未使用的键。
+//
+// 算法解读：
+//
+//	原理：固定容量 LRU —— 用 order 切片维护使用顺序 (尾部最新), 命中与写入都把键
+//	      移到尾部, 容量满时从头部淘汰一个。目的是让热点节点/边常驻内存, 又不让
+//	      内存随图规模无界增长 (全量 graph.json 有 141MB, 不能整个装进内存)。
+//	关键不变量：order 与 cache 的键集合恒等且 order 无重复 —— 淘汰时取 order[0] 后
+//	      必须同时 delete(cache, ...), 否则 order 里会残留指向已删条目的键, 下次淘汰
+//	      就淘汰了个空气, 实际容量被慢慢放大。
+//	代价与边界：命中与写入都要线性扫描 order 定位键 (O(容量)), 容量取 10000 节点 /
+//	      50000 边时这是每次查询的固定开销; 非线程安全, 锁由 DiskGraphIndex.mu 在外层加。
+//	      注意: 零值 LRUCache{}(capacity=0, order 为空) 走到淘汰分支会 panic —— 只能
+//	      经 newLRUCache 构造, 不要直接 new 一个空结构体。
+//	设计权衡：选 slice 而非 container/list + map[string]*list.Element 的组合, 是不想为
+//	      O(1) 定位引入第二个数据结构; 用 O(容量) 的移动代价换实现最短、最好读。
 func (c *LRUCache) set(key string, value interface{}) {
 	if ent, ok := c.cache[key]; ok {
 		ent.value = value
@@ -85,6 +105,7 @@ func (c *LRUCache) set(key string, value interface{}) {
 	c.order = append(c.order, key)
 }
 
+// len 返回当前缓存条目数 (仅用于统计展示)。
 func (c *LRUCache) len() int {
 	return len(c.cache)
 }
@@ -232,12 +253,15 @@ func (d *DiskGraphIndex) GetNode(id string) (*GraphNode, bool) {
 	}
 
 	// 3. 磁盘读取
+	// 磁盘 IO 刻意放在读锁**之外**: readNodeAt 用 ReadAt (不动文件游标, 并发安全),
+	// 持锁做一次冷读会把其他所有查询一起阻塞在 IO 上。
 	node, err := d.readNodeAt(ent)
 	if err != nil {
 		return nil, false
 	}
 
 	// 4. 写入缓存
+	// 回填必须持写锁: set 会改写 LRU 的 order 切片。
 	d.mu.Lock()
 	d.nodeCache.set(id, node)
 	d.mu.Unlock()
@@ -370,6 +394,11 @@ func (d *DiskGraphIndex) Stats() map[string]interface{} {
 // 私有磁盘读取
 // ============================================================================
 
+// readNodeAt 按索引里的 (偏移, 长度) 从 nodes.jsonl 精确读出一条并反序列化为节点。
+//
+// 注意: 用 ReadAt 而非 Seek+Read 是刻意的 —— ReadAt 不改动文件描述符的当前位置,
+// 因此本方法可被多个 goroutine 并发调用而无需持 d.mu, 这正是 GetNode 能把磁盘 IO
+// 放在读锁**之外**执行的前提。
 func (d *DiskGraphIndex) readNodeAt(ent diskIndexEntry) (*GraphNode, error) {
 	buf := make([]byte, ent.Length)
 	if _, err := d.nodesFile.ReadAt(buf, ent.Offset); err != nil {
@@ -385,6 +414,9 @@ func (d *DiskGraphIndex) readNodeAt(ent diskIndexEntry) (*GraphNode, error) {
 	return &node, nil
 }
 
+// readLinkAt 按索引偏移从 edges.jsonl 精确读出一条边并反序列化为 GraphLink。
+//
+// 与 readNodeAt 同构: 同样用 ReadAt 以保证并发安全 (见其注释)。
 func (d *DiskGraphIndex) readLinkAt(ent diskIndexEntry) (*GraphLink, error) {
 	buf := make([]byte, ent.Length)
 	if _, err := d.edgesFile.ReadAt(buf, ent.Offset); err != nil {
@@ -404,6 +436,24 @@ func (d *DiskGraphIndex) readLinkAt(ent diskIndexEntry) (*GraphLink, error) {
 // 索引构建器（一次性）
 // ============================================================================
 
+// buildDiskIndex 一次性把 graph.json 拆成 nodes.jsonl + edges.jsonl + graph.idx.json。
+//
+// 算法解读：
+//
+//	原理：把一个大 JSON 对象流式拆解 —— 用 json.Decoder 逐 token 走, 遇 "nodes" 就把
+//	      数组里每个元素原样追加进 nodes.jsonl, 同时记下它的 (偏移, 长度) 进内存索引;
+//	      "links"/"edges" 同理进 edges.jsonl。之后查询只读索引 + 按偏移 pread, 不再
+//	      需要把整图载入内存。
+//	关键不变量：写 JSONL 与记索引必须**同一次**写出 (writeJSONL 同时返回 offset/length),
+//	      偏移一错后续所有按需读取都会读出半条 JSON; 且 nodes.jsonl 与 edges.jsonl 的
+//	      偏移各自独立, 不能混用 (两个文件各有一个游标)。
+//	代价与边界：全量扫一遍源文件, 时间与图规模成正比, 但内存只需索引 (id→偏移)。
+//	      nodes.jsonl / edges.jsonl / graph.idx.json 三份产物不是原子写出的 —— 中途失败
+//	      会留下半截文件, 下次 OpenDiskGraphIndex 只按 idx 与 graph.json 的 mtime 判断
+//	      是否重建, 半截的 jsonl 不会被察觉。
+//	设计权衡：没有把边按 source/target 分组重排落盘 (那需要先全读一遍再写), 而是保持
+//	      原序 + 内存里存同一段的多个偏移表 (EdgesBySource / EdgesByTarget), 用索引的
+//	      冗余换一次顺序写。
 func buildDiskIndex(repoPath string) error {
 	graphPath := filepath.Join(repoPath, "graphify-out", "graph.json")
 	nodesPath := filepath.Join(repoPath, "graphify-out", "graph.nodes.jsonl")
@@ -465,6 +515,8 @@ func buildDiskIndex(repoPath string) error {
 				return fmt.Errorf("decode edges: %w", err)
 			}
 		default:
+			// 未知顶层键 (version / meta 之类) 整段丢弃: 索引只服务图遍历, 多存一份
+			// 只是给磁盘和后续反序列化加负担。
 			var skip interface{}
 			if err := decoder.Decode(&skip); err != nil {
 				return err
@@ -473,6 +525,8 @@ func buildDiskIndex(repoPath string) error {
 	}
 
 	// 写入索引
+	// 索引最后写: jsonl 已先落盘, 它相当于这批产物的"提交点" —— 先有数据后有索引,
+	// 索引缺失时上层会重建; 反过来 (先写索引后写数据) 则会留下指向空洞的索引。
 	idxData, err := json.Marshal(idx)
 	if err != nil {
 		return fmt.Errorf("marshal index: %w", err)
@@ -484,6 +538,22 @@ func buildDiskIndex(repoPath string) error {
 	return nil
 }
 
+// decodeNodes 流式解析 graph.json 的 "nodes" 数组, 逐条落 JSONL 并登记索引。
+//
+// 算法解读：
+//
+//	原理：用 json.Decoder 的 token 流手写一个数组遍历 —— 先吃掉 '[', 然后 while
+//	      dec.More() 逐元素 Decode 成 RawMessage (原样保留字节, 不重新序列化), 最后
+//	      消费 ']'。选 RawMessage 是为了让落盘的 JSONL 与源文件**逐字节一致**, 顺带
+//	      避免一次 encode 的开销与字段重排。
+//	关键不变量：索引里记的 offset/length 必须与写入 JSONL 的字节完全对应 —— writeJSONL
+//	      把 '\n' 也算进 length, 所以 length 是"含换行的整条长度", 读取端拿它开 buffer
+//	      刚好覆盖一条 (含换行, json.Unmarshal 容忍尾部空白)。
+//	代价与边界：单遍 O(n), 内存只留每条元素的字节切片 (RawMessage) 而非整图。个别节点
+//	      Unmarshal 失败时**跳过** (continue) 而不是报错 —— 该节点不会进索引, 后续查询
+//	      表现为"查不到", 不会中断整个构建。
+//	设计权衡：手写 token 遍历而不是 decoder.Decode 成 map, 是为了不被 json.Decoder 的
+//	      缓冲行为牵着走 (它可能一次预读多字节), 从而保证写入偏移是我们自己算的。
 func decodeNodes(dec *json.Decoder, f *os.File, idx *diskIndex) error {
 	token, err := dec.Token()
 	if err != nil {
@@ -512,6 +582,8 @@ func decodeNodes(dec *json.Decoder, f *os.File, idx *diskIndex) error {
 			return err
 		}
 		ent := diskIndexEntry{Offset: offset, Length: length}
+		// 同一份偏移同时挂到 id 与 label 两张表: 按 id 取是 O(1), 按 label 取是
+		// O(该 label 的节点数), 两者都不需要回扫文件。
 		idx.NodesByID[node.ID] = ent
 		idx.NodesByLabel[node.Label] = append(idx.NodesByLabel[node.Label], ent)
 	}
@@ -527,6 +599,12 @@ func decodeNodes(dec *json.Decoder, f *os.File, idx *diskIndex) error {
 	return nil
 }
 
+// decodeEdges 流式解析 graph.json 的 "links"/"edges" 数组, 逐条落 JSONL 并登记双向索引。
+//
+// 与 decodeNodes 是同一套 token 遍历 (其解读见上), 差别只在这里同时登记
+// EdgesBySource 与 EdgesByTarget 两张偏移表 —— 一条边被记两次, 换取"按任一端点
+// 取邻居"都不需要扫全表。注意: 两个函数除被解析的结构体外几乎逐行相同, 改一处时
+// 另一处容易漏 (当前没有任何抽象把它们合并)。
 func decodeEdges(dec *json.Decoder, f *os.File, idx *diskIndex) error {
 	token, err := dec.Token()
 	if err != nil {

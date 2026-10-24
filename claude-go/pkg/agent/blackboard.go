@@ -77,6 +77,7 @@ type BoardFuncs struct {
 
 var _ Board = BoardFuncs{}
 
+// Put 委托 PutFn; 未注入时静默成功 (fail-open)。
 func (f BoardFuncs) Put(e BoardEntry) error {
 	if f.PutFn == nil {
 		return nil
@@ -84,6 +85,7 @@ func (f BoardFuncs) Put(e BoardEntry) error {
 	return f.PutFn(e)
 }
 
+// Read 委托 ReadFn; 未注入时返回空值 (未命中)。
 func (f BoardFuncs) Read(key string) (string, bool) {
 	if f.ReadFn == nil {
 		return "", false
@@ -91,6 +93,7 @@ func (f BoardFuncs) Read(key string) (string, bool) {
 	return f.ReadFn(key)
 }
 
+// SnapshotForRole 委托 SnapshotFn; 未注入时返回空快照。
 func (f BoardFuncs) SnapshotForRole(role string, budget int) string {
 	if f.SnapshotFn == nil {
 		return ""
@@ -98,6 +101,7 @@ func (f BoardFuncs) SnapshotForRole(role string, budget int) string {
 	return f.SnapshotFn(role, budget)
 }
 
+// Handoff 委托 HandoffFn; 未注入时返回空交接上下文。
 func (f BoardFuncs) Handoff(completedStages []string, nextRole string) string {
 	if f.HandoffFn == nil {
 		return ""
@@ -105,6 +109,7 @@ func (f BoardFuncs) Handoff(completedStages []string, nextRole string) string {
 	return f.HandoffFn(completedStages, nextRole)
 }
 
+// Watch 委托 WatchFn; 未注入时返回永不产出的空通道 (订阅方不会 panic, 只是收不到事件)。
 func (f BoardFuncs) Watch(prefix string) <-chan BoardEntry {
 	if f.WatchFn == nil {
 		ch := make(chan BoardEntry) // 永不产出的空通道: 订阅方 range 会一直阻塞在读上, 但不会 panic
@@ -235,6 +240,18 @@ func (bb *Blackboard) writeLocked(e BoardEntry) {
 // 关键纪律: send 一律带 default 分支。黑板写入在交付主路径上, 若某个订阅者
 // (dashboard SSE、飞书播报) 卡住, 绝不允许把整个团队执行拖死 —— 宁可丢事件并
 // 计数 (WatchDrops), 事后可观测。
+//
+// 算法解读：
+//
+//	原理：一次写入要在**写锁临界区内**完成"前缀匹配 + 扇出", 每个订阅者一次非阻塞 send,
+//	      通道满则丢弃并累加计数。这是把黑板当成消息池 (MetaGPT 风格) 的发布订阅。
+//	关键不变量：派发与 StopWatch 的摘除+close 必须共用同一把 bb.mu —— 否则 close 与
+//	      send 并发会 panic (send on closed channel)。临界区内不得出现阻塞操作,
+//	      否则写锁被订阅方的消费速度绑架, 又回到"慢消费者拖死写入方"。
+//	代价与边界：O(订阅者数 × 匹配前缀数) 的纯内存操作, 无 IO; 代价是事件可能丢,
+//	      因此语义是"至多一次"而非"至少一次" —— 依赖事件不丢的消费方必须改读快照。
+//	设计权衡：选择 fail-open (丢事件 + WatchDrops 计数) 而非反压, 因为黑板写入在交付
+//	      主路径上; 反压会让一个卡住的 dashboard 连接停掉整个团队。
 func (bb *Blackboard) notifyLocked(e BoardEntry) {
 	if len(bb.watchers) == 0 {
 		return
@@ -447,6 +464,7 @@ func extractKeyContent(text string, maxLen int) string {
 	return strings.Join(parts, "\n\n---\n\n")
 }
 
+// extractCodeBlocks 顺序抽取文本中所有 ``` 围栏代码块, 丢弃短于 50 字节的碎片。
 func extractCodeBlocks(text string) []string {
 	var blocks []string
 	rest := text
@@ -468,6 +486,7 @@ func extractCodeBlocks(text string) []string {
 	return blocks
 }
 
+// extractFirstParagraph 取首个空行之前的段落 (通常是摘要); 超过 500 字节则退化为定长截断。
 func extractFirstParagraph(text string) string {
 	idx := strings.Index(text, "\n\n")
 	if idx > 0 && idx < 500 {
@@ -476,6 +495,7 @@ func extractFirstParagraph(text string) string {
 	return textutil.Truncate(text, 300, "")
 }
 
+// smartTruncate 按 rune 数截断, 并尽量在换行处收口, 让截断后的文本不切断半行。
 func smartTruncate(s string, max int) string {
 	if utf8.RuneCountInString(s) <= max {
 		return s
@@ -533,6 +553,7 @@ func (bb *Blackboard) HandoffContext(completedStages []string, nextRole string) 
 	return sb.String()
 }
 
+// filterLocked 按分类过滤条目 (调用方须持有 bb.mu, 读写锁均可)。
 func (bb *Blackboard) filterLocked(category string) []*BoardEntry {
 	var result []*BoardEntry
 	for _, e := range bb.entries {
@@ -567,6 +588,7 @@ func (bb *Blackboard) Flush() {
 	bb.mu.Unlock()
 }
 
+// load 从 blackboard.json 恢复条目; 文件不存在或解析失败时保持空黑板 (冷启动是合法状态)。
 func (bb *Blackboard) load() {
 	if bb.dataDir == "" {
 		return
@@ -581,6 +603,7 @@ func (bb *Blackboard) load() {
 	}
 }
 
+// capitalizeFirst 把首字母转为大写 (仅用于分类名生成小标题)。
 func capitalizeFirst(s string) string {
 	if s == "" {
 		return s

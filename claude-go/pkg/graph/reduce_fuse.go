@@ -104,6 +104,22 @@ func fuseNormKey(s string) string { return strings.ToLower(strings.TrimSpace(s))
 
 // fuseVoteDocs 按同名节点 / 同 (src,dst,type) 边投票融合; confidence = 命中路数/总路数。
 // docs 按分片序传入 —— 属性/标签"取第一个非空"因此是确定性的。
+//
+// 算法解读：
+//
+//	原理：N 路差异化视角各抽一份图, 把"名字归一后相同"的节点/边合并成一个, 用**命中
+//	      路数占有效路数的比例**当作置信度 —— 多路都看到的东西更可信, 这是无监督集成
+//	      里最朴素的共识度量。
+//	关键不变量：同一路内必须先去重 (seen/seenE), 一路重复提到同一个名字**只算一票**;
+//	      否则一份啰嗦的产出能靠自重复把 confidence 顶到 1.0, 而它的分母 n 还是路数。
+//	      另一条: 排序键必须是全键 (confidence, src, dst, type) —— map 遍历序随机,
+//	      排序键有并列就会让同一份输入两次运行产出不同字节, resume 与等价性测试全部失效。
+//	代价与边界：O(总节点数 + 总边数), 纯内存; 证据只留前 3 条 (fuseMaxEvidence),
+//	      samples=0 时 (docs 为空) 分母为 0 —— 由调用方 (reduceVoteResult) 用
+//	      minSamples 闸门挡在前面, 本函数自身不做除零保护。
+//	设计权衡：别名/证据取并集而非"投票选一个", 因为不同视角的别名往往互补而非互斥;
+//	      代价是并集可能很长, 故截断。属性只取第一个非空 (按分片序), 不做深合并 ——
+//	      深合并需要类型感知, 而这里刻意不认识 agent 语义。
 func fuseVoteDocs(docs []voteDoc) voteDoc {
 	n := len(docs)
 	type nodeAgg struct {
@@ -205,6 +221,7 @@ func fuseVoteDocs(docs []voteDoc) voteDoc {
 	return out
 }
 
+// fuseUniqStrings 去空白、去空串、按首次出现顺序去重。
 func fuseUniqStrings(in []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -255,6 +272,21 @@ type reviewDoc struct {
 }
 
 // fuseReviewDocs 每维截尾均值 + overall 中位数 + 共识度 + 批注并集。
+//
+// 算法解读：
+//
+//	原理：N 位差异化人格各自打分, 每维**剔两端各 int(N*0.34) 个**后取均值 (抗单个离群
+//	      评审), overall 取各位自报 overall 的中位数 (比均值稳健), 共识度 =
+//	      1 - 平均极差/100 (极差大 ⇒ 评审分歧大)。
+//	关键不变量：每维的分母是**真给该维打分的评审数**, 缺席者不补 0 —— 把缺席当 0 分
+//	      会让"只有一位评审提到的维度"被剔两端后归零 (见文件头偏离说明 2)。
+//	      同理 samples/trimmed 必须随产出给出: 缺了它们, "一个人打分"与"三个人打同样的分"
+//	      在产出里长得一模一样, 而两者的可信度差一个量级。
+//	代价与边界：O(维数 × 评审数 log 评审数) (每维一次排序); N<3 时截尾退化为普通均值,
+//	      此时 trimmed=false 且抗离群性质消失 —— 调用方 (reduceTrimmedMeanResult)
+//	      默认用 minSamples 拒绝出数, 因为那种产出"看起来完全正常"。
+//	设计权衡：不做跨维归一化 (上游 TrimmedFuse 的 normalize 会把量纲变成概率分布,
+//	      与"每维截尾均值"的契约矛盾) —— 详见文件头偏离说明 1。
 func fuseReviewDocs(docs []reviewDoc) reviewDoc {
 	dimScores := map[string][]float64{} // 只收**真给了分**的评审 (见文件头偏离说明 2)
 	dimSummary := map[string]string{}
@@ -376,6 +408,7 @@ func fuseTrimmedMean(vals []float64) (float64, bool) {
 	return fuseMean(t), true
 }
 
+// fuseMean 算术平均; 空切片返回 0。
 func fuseMean(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0
@@ -398,6 +431,7 @@ func fuseClampScore(x float64) float64 {
 	return x
 }
 
+// fuseClamp01 把值夹到 [0,1] (共识度用)。
 func fuseClamp01(x float64) float64 {
 	switch {
 	case x < 0:
@@ -408,6 +442,7 @@ func fuseClamp01(x float64) float64 {
 	return x
 }
 
+// fuseMaxF 取最大值; 空切片返回 0。
 func fuseMaxF(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0
@@ -421,6 +456,7 @@ func fuseMaxF(xs []float64) float64 {
 	return m
 }
 
+// fuseMinF 取最小值; 空切片返回 0。
 func fuseMinF(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0
@@ -434,6 +470,7 @@ func fuseMinF(xs []float64) float64 {
 	return m
 }
 
+// fuseMedian 中位数 (偶数个取中间两个的均值); 空切片返回 0。会拷贝入参, 不改调用方切片。
 func fuseMedian(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0

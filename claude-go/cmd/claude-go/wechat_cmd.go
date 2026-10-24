@@ -261,8 +261,10 @@ func firstNonHeadingLine(md string, max int) string {
 	return title2OrEmpty(md)
 }
 
+// title2OrEmpty 从 Markdown 推断标题, 推不出时返回空串 (不报错)。
 func title2OrEmpty(md string) string { return inferTitle(md) }
 
+// resolveWechatConfigPath 按 --config > CLAUDE_GO_CONFIG > ~/.claude-go/config/config.json 的顺序解析配置文件路径。
 func resolveWechatConfigPath() string {
 	if flagConfig != "" {
 		return flagConfig
@@ -274,6 +276,10 @@ func resolveWechatConfigPath() string {
 	return filepath.Join(home, ".claude-go", "config", "config.json")
 }
 
+// loadWechatConfig 读取 config.json 的 wechatMP 段与 browser.chromePath, 返回 (配置, Chrome 路径, 错误)。
+//
+// 只校验 appId 非空: 其余字段缺失由 wechat 包在真正调用时各自报错, 在这里做全字段校验
+// 会把"某功能没配"提前变成"整个命令起不来"。
 func loadWechatConfig(path string) (wechat.Config, string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -378,6 +384,9 @@ func stripMermaidFence(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// inferTitle 取 Markdown 里第一个一级标题 (# 开头) 的正文作为标题; 没有则返回空串。
+//
+// 注意：只认 "# " 前缀 (井号后必须有空格), 故 "#标题" 这种写法推不出标题。
 func inferTitle(md string) string {
 	for _, ln := range strings.Split(md, "\n") {
 		ln = strings.TrimSpace(ln)

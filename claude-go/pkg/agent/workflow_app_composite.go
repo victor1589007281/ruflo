@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 )
 
+// appCompositeWorkflow 返回 APP & 小程序整合工作流 (A 需求 → B 原型 → C 研发 → D 适配 → E 集成测试)。
 func appCompositeWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "app",

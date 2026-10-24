@@ -21,6 +21,7 @@ func NewGraphify(repoPath string) *Graphify {
 	return &Graphify{RepoPath: repoPath}
 }
 
+// ensurePaths 惰性发现工具路径并**缓存在结构体上** (首次调用后不再重复探测)。
 func (gf *Graphify) ensurePaths() (*ToolPaths, error) {
 	if gf.paths != nil {
 		return gf.paths, nil
@@ -33,6 +34,7 @@ func (gf *Graphify) ensurePaths() (*ToolPaths, error) {
 	return paths, nil
 }
 
+// setupIndex 在指定索引基目录下准备本仓的索引位置; 未配置 IndexBaseDir 时是 no-op。
 func (gf *Graphify) setupIndex() error {
 	if gf.IndexBaseDir == "" {
 		return nil

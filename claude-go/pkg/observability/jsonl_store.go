@@ -114,6 +114,11 @@ func (s *JSONLStore) RotateDaily() error {
 	return nil
 }
 
+// sanitizeFilename 把任意字符串净化成安全的文件名: 白名单外的字符一律替换成 '_'。
+//
+// 注意：白名单里**保留了 ':'** —— 它在 Windows 上是非法文件名字符, 且 UNC 路径里
+// 有特殊含义; 在 Linux 上无害。另: 白名单不含路径分隔符, 所以 '..' 这类穿越串
+// 会被逐字符改写 ('/' 变 '_'), 但 '.' 本身保留, 纯 ".." 仍会原样通过。
 func sanitizeFilename(name string) string {
 	// 简单过滤危险字符
 	out := make([]byte, 0, len(name))
@@ -181,6 +186,19 @@ func TraceQuery(dir, traceID string, maxEvents int) ([]Event, error) {
 	return result, nil
 }
 
+// scanTraceID 流式扫描单个 .jsonl 文件, 收集 trace_id 匹配的事件 (最多 limit 条)。
+//
+// 算法解读：
+//
+//	原理：用 json.Decoder 顺序解码而不是整文件读入 —— 日志文件可以远大于内存,
+//		流式解码把峰值内存压到"一条事件"的量级。
+//	关键不变量：limit 必须 > 0。循环条件 `len(result) < limit` 在 limit <= 0 时
+//		恒为假, 一条都读不到; 调用方 TraceQuery 用 maxEvents-len(result) 传参,
+//		所以**读满 maxEvents 后本函数会静默返回空**, 那是预期的截断而非故障。
+//	代价与边界：任何一条解码失败就 break 并返回已收集的部分 (不报错) —— 文件中间
+//		损坏会让后面的匹配全部丢失, 且错误被吞掉 (返回的 err 只有打开文件失败)。
+//	设计权衡：不做索引 (按 trace_id 建索引要改写入格式), 用全文件扫描换零维护成本;
+//		这也是 TraceQuery 必须设 maxEvents 上限的原因。
 func scanTraceID(path, traceID string, limit int) ([]Event, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -202,6 +220,7 @@ func scanTraceID(path, traceID string, limit int) ([]Event, error) {
 	return result, nil
 }
 
+// stringsHasSuffix 是 strings.HasSuffix 的本地实现 (避免为此引入依赖)。
 func stringsHasSuffix(s, suffix string) bool {
 	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }
@@ -225,6 +244,20 @@ func StartDailyRotator(store *JSONLStore) *DailyRotator {
 	return r
 }
 
+// loop 轮转定时器主循环: 先对齐到下一个 00:00 触发一次, 之后每 24 小时触发一次。
+//
+// 算法解读：
+//
+//	原理：两段式 —— 第一段用一次性的 time.After 把相位**对齐到本地零点**, 第二段才
+//		换成 24h 的 Ticker 做稳态轮转。若直接开 Ticker, 首次轮转会在启动后 24 小时
+//		才发生, 与"每天零点"这个语义不符。
+//	关键不变量：对齐只在启动时做一次。Ticker 按**固定周期**发信号而不看真实时钟,
+//		所以进程长时间运行后相位会因调度与闰秒缓慢漂移, 不再是精确的 00:00。
+//	代价与边界：stop 关闭后 loop 退出, ticker 由 defer 停掉; 但 Stop() 只关通道,
+//		**不保证 loop 已退出**, 也不重置 r.ticker —— 重复调用 Stop() 会向已关闭的
+//		通道再 close 一次而 panic。
+//	设计权衡：不引入 cron 库, 也不在每轮重新计算"距下一个零点还有多久" (那样能消掉
+//		漂移, 但要多一次时钟读取与一次 select 重排)。当前实现选的是简单。
 func (r *DailyRotator) loop() {
 	// 计算到下一个 00:00 的时间
 	now := time.Now()

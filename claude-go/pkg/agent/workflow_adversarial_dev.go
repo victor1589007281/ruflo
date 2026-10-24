@@ -23,6 +23,18 @@ import (
 //	Phase 2: [Generator ↔ Evaluator] 对抗循环
 //	Phase 3: E2E 对抗测试 (tester↔coder 自适应)
 //	Phase 4: 非测试的收尾阶段
+//
+// 算法解读：
+//
+//	原理：把一次开发任务拆成"设计 → 对抗实现 → E2E 验收 → 收尾"四个相位, 每个相位各自
+//	      落检查点并增量刷盘 (flushStagesLive), 使长任务中断后能从任一相位恢复。
+//	关键不变量：Phase 2 必须由 Orchestrator (DAG) 驱动 —— plan 缺失或 DAG 未配置时直接返回
+//	      错误, 不允许静默回退到对抗循环, 否则"Plan 是唯一入口"的约束会被绕过; E2E 是质量
+//	      门禁, 任一阶段 failed 就终止整个工作流, 不再进入收尾相位。
+//	代价与边界：四个相位各自串行等待, 相位之间不并行; 恢复粒度是阶段级 (restoreCheckpoints),
+//	      因此同一阶段内部的部分产出不会保留。ctx 取消会让 Phase 2 立即返回 ctx.Err()。
+//	设计权衡：相位间只通过 prevResults (阶段名 → 输出) 传数据, 而不是共享结构体 —— 换来每个
+//	      相位可以独立重跑、独立测试, 代价是中间产出的 key 约定必须全局一致。
 func (we *WorkflowExecutor) executeAdversarialDev(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	var allResults []StageResult
 	prevResults := make(map[string]string)
@@ -240,6 +252,20 @@ const maxTestRetries = 2
 
 // runAdversarialLoop Phase 2: Generator ↔ Evaluator 对抗循环。
 // 六层质量保障: L2 编译硬门禁 + L5 上下文压缩 + L6 重采样决策。
+//
+// 算法解读：
+//
+//	原理：每轮先跑 Generator 产出代码, 再跑 L2 编译硬门禁 (内部最多 maxBuildRetries 次修复),
+//	      编译通过后才让 Evaluator 评分, 最后由 AdaptiveTerminator 判定继续 / 重采样 / 终止。
+//	关键不变量：评分只在编译通过后产生 —— 编译失败时用构造的低分 (3/3/5/4, Pass=false) 喂给
+//	      同一个终止判定器, 使"编译一直不过"同样消耗轮次配额并最终终止, 而不是无限循环;
+//	      prevResults[最后一个 generator 阶段名] 始终指向当前采纳的版本, revert 与 best-of-N
+//	      都写回这里, 保证下一轮 Generator 与 Evaluator 看到的是同一份代码。
+//	代价与边界：每轮至少 2 次 LLM 调用 (Generator + Evaluator), 外加最多 maxBuildRetries 次
+//	      编译修复; 上下文按轮次渐进压缩 (8K/4K/2K) 控制 token。ctx 取消立即返回。
+//	设计权衡：编译硬门禁放在 Evaluator 之前 —— 放弃"让评审看到真实缺陷"的信息量, 换取
+//	      Reviewer 的 token 不浪费在必然不可编译的产出上; 重采样只在"连续低完整度 + 编译失败"
+//	      时触发, 避免过早放弃一个可行方向。
 func (we *WorkflowExecutor) runAdversarialLoop(
 	ctx context.Context,
 	generatorStages []StageDef, evalStage *StageDef,
@@ -282,6 +308,8 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 		// Generator 执行
 		genResults, genOutput := we.runGeneratorRound(ctx, generatorStages, round, maxRounds, lastGenOutput, lastEvalFeedback+"\n"+memoryHint, objective, prevResults, team)
 		allResults = append(allResults, genResults...)
+		// 只看最后一个 generator 阶段的状态: 多 generator 阶段时它是产出主版本的那个,
+		// prevResults 也统一按它的阶段名回写。
 		if len(genResults) > 0 && genResults[len(genResults)-1].Status != TaskCompleted {
 			return allResults, fmt.Errorf("generator 第 %d 轮失败", round)
 		}
@@ -328,6 +356,7 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 		}
 
 		// 更新 lastScore
+		// 解析失败时沿用上一轮分数 (hold-last-value), 而不是当成 0 分 —— 否则会误触发"退化"终止。
 		kept := true
 		if len(evalResult) > 0 {
 			if parsed, err := ParseEvalScoreJSON([]byte(evalResult[len(evalResult)-1].Output)); err == nil {
@@ -341,6 +370,8 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 		if terminator != nil {
 			issues := ExtractKeyIssues(lastScore.Feedback)
 			// 即时 Keep/Revert
+			// 注意: revert 只回滚内存里的采纳版本, 不会删除被丢弃那一轮已物化到磁盘的文件;
+			// 若那一轮新增过文件, 残留文件仍会参与后续的编译/测试门禁。
 			if !shouldBreak && round > 1 {
 				if revert, bo, br := terminator.ShouldRevert(lastScore); revert {
 					we.notify(we.chatID, fmt.Sprintf("⏪ 第 %d 轮退化, revert 到第 %d 轮最佳版本", round, br))
@@ -361,6 +392,18 @@ func (we *WorkflowExecutor) runAdversarialLoop(
 
 // runBuildHardGate L2 编译硬门禁: 编译失败时驱动 Coder 内部重试。
 // 返回 true 表示编译通过。内部重试最多 maxBuildRetries 次, 不消耗对抗轮次。
+//
+// 算法解读：
+//
+//	原理：把"编译通过 + 无未实现项"作为进入 Reviewer 的前置条件, 不满足时驱动 Coder 内部
+//	      修复 (最多 maxBuildRetries 次), 这段重试独立于对抗轮次配额。
+//	关键不变量：返回 true 的充要条件是"最后一次编译检查通过 且 TODO/STUB 复扫为空"; 每次
+//	      Coder 修复成功都会同时更新 *lastGenOutput、prevResults 并重新物化磁盘, 使内存中的
+//	      采纳版本与磁盘一致 —— 否则下一轮 Reviewer 审的会是旧代码。
+//	代价与边界：每轮修复 = 1 次 LLM 调用 + 1 次全量编译 (开销与仓库大小成正比); Coder 因 API
+//	      瞬态错误失败时提前返回 false, 把额度让给对抗循环整轮重试, 而不是继续烧修复次数。
+//	设计权衡：TODO/STUB 扫描复用编译失败的修复通道, 省掉第二套循环; 代价是"编译错误"与
+//	      "未实现项"共用同一份重试预算, 两者同时出现时可能都不够用。
 func (we *WorkflowExecutor) runBuildHardGate(
 	ctx context.Context, genStages []StageDef,
 	round, maxRounds int, lastGenOutput *string,
@@ -368,6 +411,7 @@ func (we *WorkflowExecutor) runBuildHardGate(
 	allResults *[]StageResult,
 ) bool {
 	if team.Cwd == "" {
+		// 没有工作目录就没有可编译的产物, 直接放行 —— 缺 Cwd 不应让整个对抗循环卡死。
 		return true
 	}
 
@@ -409,6 +453,8 @@ func (we *WorkflowExecutor) runBuildHardGate(
 	}
 
 	guard := NewCompileRepairGuard(3)
+	// 守卫按"错误签名 + 置信度"判定是否放弃修复, 与 maxBuildRetries 的次数上限互补:
+	// 次数上限防跑飞, 守卫防在同一个错误上反复空转。
 	for retry := 1; retry <= maxBuildRetries; retry++ {
 		if ctx.Err() != nil {
 			return false
@@ -800,6 +846,17 @@ func (we *WorkflowExecutor) runTestGate(ctx context.Context, team *ProductionTea
 }
 
 // runEvaluatorRound 执行一轮 Evaluator
+//
+// 算法解读：
+//
+//	原理：调用 Evaluator 对当前版本打分 (优先解析 JSON, 解析失败则沿用上一轮分数), 写入
+//	      blackboard, 再交给 AdaptiveTerminator 判定继续 / 策略转换 / 终止 (含 best-of-N 回滚)。
+//	关键不变量：评分解析失败一律 hold-last-value —— 绝不把"解析失败"当成低分, 否则会被误判
+//	      成退化并提前终止; 待审版本只取最后一个 generator 阶段的输出, 与其余 prevResults 合并
+//	      后交给评审, 保证评审看到的就是被采纳的那一份。
+//	代价与边界：1 次 LLM 调用 + 1 次 blackboard 写入; evalStage 为 nil 时直接返回, 不评分。
+//	设计权衡：StrategyShift 与 ShouldStop 互斥且策略转换优先 (返回 shouldBreak=false) ——
+//	      在"修补已饱和"时先换思路再谈终止, 代价是可能多跑一轮。
 func (we *WorkflowExecutor) runEvaluatorRound(
 	ctx context.Context, evalStage *StageDef, genStages []StageDef,
 	round, maxRounds int, lastGenOutput string,
@@ -811,6 +868,8 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 		return nil, false, ""
 	}
 
+	// 待审版本只取最后一个 generator 阶段的输出 (与其余阶段回写 prevResults 用的是同一个 key),
+	// 其他 prevResults 原样透传, 使评审看到与其他阶段一致的那一份。
 	genName := genStages[len(genStages)-1].Name
 	evalPrevResults := map[string]string{genName: lastGenOutput}
 	for k, v := range prevResults {
@@ -832,6 +891,7 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 		return results, false, ""
 	}
 
+	// 解析失败不能当低分: 沿用上一轮分数, 只把原始输出当作反馈文本。
 	score, scoreErr := ParseEvalScoreJSON([]byte(sr.Output))
 	if scoreErr != nil {
 		log.Printf("[对抗] 第 %d 轮评分解析失败, hold-last-value: %v", round, scoreErr)
@@ -856,6 +916,7 @@ func (we *WorkflowExecutor) runEvaluatorRound(
 	if terminator != nil {
 		terminator.RecordRoundOutput(round, score, lastGenOutput)
 		decision := terminator.ShouldTerminate(round, score)
+		// 策略转换优先于终止: 这里刻意返回 shouldBreak=false, 让循环再给一次机会。
 		if decision.StrategyShift {
 			we.notify(we.chatID, fmt.Sprintf("🔀 策略转换 (第 %d 次): 当前修补已饱和, 注入结构性变更提示",
 				terminator.StrategyShiftCount))
@@ -964,6 +1025,8 @@ func (we *WorkflowExecutor) runE2EAdversarial(ctx context.Context, parallelStage
 		prevResults["e2e-test"] = e2eResult.Output
 
 		// 评估 E2E 结果: 无 Bug/FAIL 则通过
+		// 注意: 这是纯关键词匹配, 不含否定语义 —— 报告里写"未发现 bug"同样会命中 "bug"
+		// 而被判为有问题, 于是多跑一轮 coder 修复。此处只加注释, 不改判定。
 		hasBugs := strings.Contains(strings.ToLower(e2eResult.Output), "bug") ||
 			strings.Contains(strings.ToLower(e2eResult.Output), "fail") ||
 			strings.Contains(strings.ToLower(e2eResult.Output), "错误")
@@ -1080,6 +1143,7 @@ func (we *WorkflowExecutor) runLocalE2EFixCycle(ctx context.Context, initial *St
 	return &failed, results
 }
 
+// localE2EGateCwd 解析本地 E2E 门禁的工作目录: 目标里点名了输出子目录时下钻到该子目录, 否则用 team 工作目录。
 func localE2EGateCwd(team *ProductionTeam, objective string) string {
 	if team == nil {
 		return ""
@@ -1094,6 +1158,7 @@ func localE2EGateCwd(team *ProductionTeam, objective string) string {
 	return gateCwd
 }
 
+// goModBaseline 记录 go.mod 在 E2E 修复前的 module 行与 require 集合, 用于事后回滚依赖漂移。
 type goModBaseline struct {
 	Exists      bool
 	ModulePath  string
@@ -1101,6 +1166,7 @@ type goModBaseline struct {
 	RequireList []string
 }
 
+// captureGoModBaseline 读取 go.mod 的 module 行与 require 列表, 生成供回滚用的基线; go.mod 不存在时返回空基线。
 func captureGoModBaseline(cwd string) goModBaseline {
 	path := filepath.Join(cwd, "go.mod")
 	if _, err := os.Stat(path); err != nil {
@@ -1122,6 +1188,20 @@ func captureGoModBaseline(cwd string) goModBaseline {
 	}
 }
 
+// restoreGoModBaseline 把 go.mod 恢复到基线: 改写 module 行、修正全仓 import 前缀、删除基线外的 require。
+// 返回被修正的处数 (0 表示无漂移)。
+//
+// 算法解读：
+//
+//	原理：E2E 本地门禁跑在禁网沙盒里, coder 可能为了"让编译过"而改 go.mod 的 module 行或新增
+//	      require; 本函数在每轮修复后把 go.mod 拉回修复前的基线, 阻止依赖漂移被固化。
+//	关键不变量：只认"采集基线时 go.mod 已存在"这一前提 (baseline.Exists), 否则一律不动文件;
+//	      删除 require 以基线的 RequireSet 为白名单, 基线为空即删除全部 require —— 这正是零依赖
+//	      项目想要的, 但也意味着基线必须在任何修复动作之前采集。
+//	代价与边界：仅当 module 行确实被改过时才会触发全仓 .go 文件的 import 前缀替换 (O(仓库大小)
+//	      的遍历 + 一次 gofmt)。cwd 为空或读不到 go.mod 时直接返回 0。
+//	设计权衡：用文本改写而不是 `go mod edit`, 因为沙盒禁网且不保证 go 工具链可用; 代价是字符串级
+//	      替换对出现在非 import 位置的 module 名也会一并改写。
 func restoreGoModBaseline(cwd string, baseline goModBaseline) int {
 	if cwd == "" || !baseline.Exists {
 		return 0
@@ -1155,6 +1235,7 @@ func restoreGoModBaseline(cwd string, baseline goModBaseline) int {
 	return changed
 }
 
+// rewriteGoModModuleLine 把 go.mod 的 module 行改写为指定路径; 原本没有 module 行时补在文件开头。
 func rewriteGoModModuleLine(src, modulePath string) string {
 	modulePath = strings.TrimSpace(modulePath)
 	if modulePath == "" {
@@ -1170,6 +1251,8 @@ func rewriteGoModModuleLine(src, modulePath string) string {
 	return "module " + modulePath + "\n\n" + src
 }
 
+// rewriteGoModuleImportPrefix 把工作区内所有 .go 文件里 fromModule 前缀的 import 路径改写为 toModule。
+// 返回改写的文件数; 跳过 .git/.claude-go/vendor/node_modules, 改写后对涉及文件统一跑一次 gofmt。
 func rewriteGoModuleImportPrefix(cwd, fromModule, toModule string) int {
 	fromModule = strings.TrimSpace(fromModule)
 	toModule = strings.TrimSpace(toModule)
@@ -1214,6 +1297,20 @@ func rewriteGoModuleImportPrefix(cwd, fromModule, toModule string) int {
 	return changed
 }
 
+// removeGoModRequiresNotInBaseline 从 go.mod 文本中删除不在白名单里的 require (同时处理 require 块与单行 require)。
+// 返回新文本与被删除的处数。
+//
+// 算法解读：
+//
+//	原理：单遍扫描 go.mod 文本, 分别处理 `require ( ... )` 块与单行 `require x v`, 把不在白名单
+//	      里的依赖删掉, 其余行原样保留。
+//	关键不变量：块必须整体处理 —— 块内条目被删空时连块头与 `)` 一起丢弃, 只要还剩一条就整块保留,
+//	      否则会留下孤立的 `require (` 让 go.mod 语法失效; 文件在块内结束 (缺 `)` 的残缺输入) 时
+//	      把缓冲区原样吐出, 不丢内容。
+//	代价与边界：O(行数) 单遍, 无额外 IO。判定只看每行第一个字段, 因此带 `// indirect` 注释的条目
+//	      按 module 路径判断, 注释随行保留; 缩进与空行按原样回写。
+//	设计权衡：手写解析而不引入 golang.org/x/mod/modfile —— 与本文件强制的"零外部依赖"门禁自洽,
+//	      代价是只认标准写法, 非常规格式的 go.mod 可能被漏判。
 func removeGoModRequiresNotInBaseline(src string, allowed map[string]bool) (string, int) {
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines))
@@ -1269,6 +1366,7 @@ func removeGoModRequiresNotInBaseline(src string, allowed map[string]bool) (stri
 	return strings.Join(out, "\n"), removed
 }
 
+// buildLocalE2EFixPrompt 构造 E2E 本地门禁失败的修复 prompt (含 go.mod 基线约束与磁盘上的真实 Go API 摘要)。
 func buildLocalE2EFixPrompt(gateCwd, lang, objective, failure string, retry int, team *ProductionTeam, goBaseline goModBaseline) string {
 	manifest := workspaceFileManifest(gateCwd, time.Time{})
 	if strings.TrimSpace(manifest) == "" && team != nil {
@@ -1315,6 +1413,7 @@ func buildLocalE2EFixPrompt(gateCwd, lang, objective, failure string, retry int,
 	return b.String()
 }
 
+// materializeFenceLang 把语言名归一化为代码块围栏标识 (如 py → python, ts → typescript); 未知语言回落 go。
 func materializeFenceLang(lang string) string {
 	switch strings.ToLower(strings.TrimSpace(lang)) {
 	case "python", "py":
@@ -1332,6 +1431,20 @@ func materializeFenceLang(lang string) string {
 	}
 }
 
+// runLocalE2EGate 本地 E2E 质量门禁: 直接跑零依赖策略/编译/测试三项确定性检查, 不调用 tester LLM。
+//
+// 算法解读：
+//
+//	原理：用确定性本地检查 (零外部依赖策略 → build → test) 替代 E2E 的第一轮 tester LLM:
+//	      通过就直接判过并跳过 LLM, 失败才升级给 coder 修复轮。
+//	关键不变量：结果 Status 完全由 failures 是否为空决定; 但 TODO/STUB 是否致命取决于目标语义
+//	      —— 目标要求完整实现时发现未实现项即判失败, 否则只记 warning。同一份扫描结果走两条路
+//	      是刻意的, 不能合并成一条。
+//	代价与边界：每次调用都跑一遍完整 build+test (秒级到分钟级), 外加最多 2 轮确定性 Go 编译修复
+//	      和一次收尾 recheck。team 为空、Cwd 为空、或目标点名的输出目录不存在都直接判失败 (不会
+//	      替用户创建目录)。
+//	设计权衡：把"确定性能判的"全部前置到本地门禁, 换取省掉一次 tester LLM 往返; 代价是 build/test
+//	      的真实开销落在主流程上, 且本地检查覆盖不到跨模块的语义问题。
 func (we *WorkflowExecutor) runLocalE2EGate(team *ProductionTeam, objective string) *StageResult {
 	start := time.Now()
 	result := &StageResult{Name: "e2e-local-gate", Role: "tester", StartedAt: start}
@@ -1367,6 +1480,7 @@ func (we *WorkflowExecutor) runLocalE2EGate(team *ProductionTeam, objective stri
 		we.notify(we.chatID, fmt.Sprintf("🧹 E2E 本地门禁: 清理错误物化元数据目录 %d 个", removed))
 	}
 
+	// 同一份 TODO 扫描结果按目标语义分流: 要求完整实现时是硬失败, 否则只记为警告。
 	todos := scanForTodos(gateCwd)
 	if len(todos) > 0 {
 		if objectiveRequiresCompleteImplementation(objective) {
@@ -1388,6 +1502,7 @@ func (we *WorkflowExecutor) runLocalE2EGate(team *ProductionTeam, objective stri
 	}
 	failures := runLocalE2EChecks(gateCwd, lang, objective)
 	if strings.EqualFold(lang, "go") {
+		// 确定性编译修复是"不花 token 的最后手段", 只给 2 轮; 修不动就交给 coder。
 		for repairRound := 1; repairRound <= 2 && len(failures) > 0; repairRound++ {
 			errText := strings.Join(failures, "\n\n")
 			changed := applyGoCompileErrorRepairs(gateCwd, errText)
@@ -1399,6 +1514,7 @@ func (we *WorkflowExecutor) runLocalE2EGate(team *ProductionTeam, objective stri
 			failures = runLocalE2EChecks(gateCwd, lang, objective)
 		}
 		if len(failures) > 0 {
+			// 收尾再跑一次完整检查, 保证上报给 coder 的失败列表来自最后一次修复之后。
 			settledFailures := runLocalE2EChecks(gateCwd, lang, objective)
 			if len(settledFailures) == 0 {
 				failures = nil
@@ -1426,6 +1542,7 @@ func (we *WorkflowExecutor) runLocalE2EGate(team *ProductionTeam, objective stri
 	return result
 }
 
+// runLocalE2EChecks 依次执行零外部依赖策略、编译、测试三项本地检查, 返回失败信息列表 (空表示全通过)。
 func runLocalE2EChecks(gateCwd, lang, objective string) []string {
 	var failures []string
 	if strings.EqualFold(lang, "go") {
@@ -1443,6 +1560,7 @@ func runLocalE2EChecks(gateCwd, lang, objective string) []string {
 	return failures
 }
 
+// enforceGoExternalDependencyPolicy 目标要求零外部依赖时, 汇总 go.mod require / 外部 import / go.sum 条目并返回失败说明。
 func enforceGoExternalDependencyPolicy(cwd, objective string) string {
 	if cwd == "" || !objectiveRequestsZeroExternalDeps(objective) {
 		return ""
@@ -1493,6 +1611,7 @@ func enforceGoExternalDependencyPolicy(cwd, objective string) string {
 	return b.String()
 }
 
+// objectiveRequestsZeroExternalDeps 判断目标文本 (或其引用的本地文件) 是否要求零外部依赖/单二进制交付。
 func objectiveRequestsZeroExternalDeps(objective string) bool {
 	if containsZeroExternalDepsTerm(objective) {
 		return true
@@ -1506,6 +1625,7 @@ func objectiveRequestsZeroExternalDeps(objective string) bool {
 	return false
 }
 
+// containsZeroExternalDepsTerm 用中英文关键词表匹配文本里是否出现零外部依赖诉求。
 func containsZeroExternalDepsTerm(text string) bool {
 	lower := strings.ToLower(text)
 	terms := []string{
@@ -1529,6 +1649,7 @@ func containsZeroExternalDepsTerm(text string) bool {
 	return false
 }
 
+// objectiveRequiresCompleteImplementation 判断目标文本 (或其引用的本地文件) 是否要求完整实现、禁止降级。
 func objectiveRequiresCompleteImplementation(objective string) bool {
 	if containsCompleteImplementationTerm(objective) {
 		return true
@@ -1542,6 +1663,7 @@ func objectiveRequiresCompleteImplementation(objective string) bool {
 	return false
 }
 
+// containsCompleteImplementationTerm 用中英文关键词表匹配文本里是否出现"完整实现/不得降级/100% 覆盖"这类诉求。
 func containsCompleteImplementationTerm(text string) bool {
 	lower := strings.ToLower(text)
 	terms := []string{
@@ -1572,6 +1694,8 @@ func containsCompleteImplementationTerm(text string) bool {
 	return false
 }
 
+// firstNStrings 截取前 n 个字符串; 被截断时追加一条"...还有 N 处"提示。
+// 注意: 未发生截断时直接返回入参切片本身 (别名), 调用方改动其内容会写回原切片。
 func firstNStrings(values []string, n int) []string {
 	if n <= 0 || len(values) <= n {
 		return values
@@ -1581,6 +1705,7 @@ func firstNStrings(values []string, n int) []string {
 	return out
 }
 
+// summarizeE2EFailureForNotify 把多条失败输出压成单行摘要 (换行替换为 | 并截断), 供通知使用。
 func summarizeE2EFailureForNotify(failures []string) string {
 	joined := strings.TrimSpace(strings.Join(failures, "\n\n"))
 	if joined == "" {
@@ -1590,6 +1715,8 @@ func summarizeE2EFailureForNotify(failures []string) string {
 	return truncateResult(joined, 600)
 }
 
+// cleanupMaterializedMetadataDirs 删除被误当成文件名物化出来的元数据目录 (如 "path=" / "file=" 这类伪路径名)。
+// 返回删除的目录数。
 func cleanupMaterializedMetadataDirs(root string) int {
 	if root == "" {
 		return 0
@@ -1609,11 +1736,13 @@ func cleanupMaterializedMetadataDirs(root string) int {
 	return removed
 }
 
+// isDir 判断路径存在且为目录。
 func isDir(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
 }
 
+// buildE2EPrompt 构造第 round 轮 E2E 测试 prompt (含上轮问题的回归验证项与实现产出摘要)。
 func (we *WorkflowExecutor) buildE2EPrompt(objective string, prevResults map[string]string, lastE2E string, round int) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf(`你是高级质量工程师 (E2E 全量测试, 第 %d 轮)。
@@ -1661,12 +1790,28 @@ func ClassifyStages(stages []StageDef) (design []StageDef, generators []StageDef
 	return classifyStages(stages)
 }
 
+// classifyStages 四趟扫描把阶段分成 design / generators / eval / parallel 四类, 供对抗式工作流按相位调度。
+//
+// 算法解读：
+//
+//	原理：Pass1 按 prompt 里是否同时含 JSON 评分字段找 evaluator; Pass2 收 Parallel 阶段; Pass3 把
+//	      evaluator 的依赖 (以及 prompt 里含 {adversarial_feedback} 的阶段) 认作 generator;
+//	      Pass4 把剩下的全部归为 design。
+//	关键不变量：三类判定互斥 (isEval / isParallel / isGenerator 三张表), evaluator 只取第一个匹配;
+//	      design 是兜底类 —— 任何没被识别的阶段都会落进设计阶段被串行执行, 所以新增阶段类型必须
+//	      显式加判定, 否则会静默改变整个调度结构。
+//	代价与边界：Pass3 对每个依赖全表扫一遍, 是 O(阶段数²), 阶段数在几十量级可忽略; 判定依赖 prompt
+//	      文案而非显式字段, 改措辞就可能改变分类结果。
+//	设计权衡：用 prompt 文本特征识别角色, 省掉了 WorkflowDef 上的新字段; 代价是分类规则隐式且分散
+//	      (三处字符串匹配), 读代码时不易看出阶段究竟是怎么被归类的。
 func classifyStages(stages []StageDef) (design []StageDef, generators []StageDef, eval *StageDef, parallel []StageDef) {
 	isEval := make(map[string]bool)
 	isParallel := make(map[string]bool)
 	isGenerator := make(map[string]bool)
 
 	// Pass 1: 找 evaluator (prompt 中包含 JSON 评分格式)
+	// 注意: eval 是指向入参切片元素的指针 (不是拷贝), 且只取第一个匹配 —— 存在多个评分阶段时,
+	// 后面的会被当成 generator 或 design。
 	for i := range stages {
 		if strings.Contains(stages[i].Prompt, `"correctness"`) && strings.Contains(stages[i].Prompt, `"pass"`) {
 			eval = &stages[i]
@@ -1703,6 +1848,7 @@ func classifyStages(stages []StageDef) (design []StageDef, generators []StageDef
 	}
 
 	// Pass 4: 分类 — 既不是 eval/parallel/generator 的就是 design
+	// design 是兜底类: 新增阶段类型若不在这里加判定, 会静默落进设计阶段被串行执行。
 	for _, s := range stages {
 		switch {
 		case isEval[s.Name], isParallel[s.Name]:

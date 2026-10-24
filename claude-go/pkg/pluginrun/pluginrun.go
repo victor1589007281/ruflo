@@ -199,6 +199,7 @@ func (b *Bundle) AgentsDir() string { return b.subDir("agents") }
 // HooksDir 返回 <Dir>/hooks (无 Dir 返回 "")。
 func (b *Bundle) HooksDir() string { return b.subDir("hooks") }
 
+// subDir 返回 <Dir>/<sub>; Bundle 为 nil 或未设 Dir 时返回空串 (由各 *Dir 方法共用)。
 func (b *Bundle) subDir(sub string) string {
 	if b == nil || b.Dir == "" {
 		return ""

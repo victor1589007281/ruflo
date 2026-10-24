@@ -78,6 +78,7 @@ type memorySearchReq struct {
 	Decay     float64   `json:"decay,omitempty"`
 }
 
+// search 提交检索请求 (文本或向量) 并解出命中列表, 是 SearchMemory / SearchMemoryVec 的公共实现。
 func (c *Client) search(ctx context.Context, req memorySearchReq) ([]MemoryHit, error) {
 	resp, _, err := c.doJSON(ctx, "POST", "/v1/memory/search", req)
 	if err != nil {

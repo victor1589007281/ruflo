@@ -71,6 +71,7 @@ type SpawnSpec struct {
 	MaxSpawns int `json:"max_spawns,omitempty"`
 }
 
+// maxDepth 返回生效的派生深度上限; 未配置 (nil 或 <=0) 时取默认值 1。
 func (s *SpawnSpec) maxDepth() int {
 	if s == nil || s.MaxDepth <= 0 {
 		return DefaultSpawnMaxDepth
@@ -78,6 +79,7 @@ func (s *SpawnSpec) maxDepth() int {
 	return s.MaxDepth
 }
 
+// maxNodes 返回生效的单次派生节点数上限; 未配置时取默认值 8。
 func (s *SpawnSpec) maxNodes() int {
 	if s == nil || s.MaxNodes <= 0 {
 		return DefaultSpawnMaxNodes
@@ -85,6 +87,7 @@ func (s *SpawnSpec) maxNodes() int {
 	return s.MaxNodes
 }
 
+// maxSpawns 返回生效的单次执行派生次数上限; 未配置时取默认值 4。
 func (s *SpawnSpec) maxSpawns() int {
 	if s == nil || s.MaxSpawns <= 0 {
 		return DefaultSpawnMaxSpawns

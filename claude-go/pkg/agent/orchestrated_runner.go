@@ -378,6 +378,7 @@ type orchQualityTermination struct {
 	scores []orchQualityScore
 }
 
+// newOrchQualityTermination 构造质量终止判定器: 注入达标阈值与收敛判定阈值, 分数历史为空。
 func newOrchQualityTermination(passThreshold, convergeDelta float64) *orchQualityTermination {
 	return &orchQualityTermination{passThreshold: passThreshold, convergeDelta: convergeDelta}
 }
@@ -431,6 +432,7 @@ const (
 	orchErrFatal                          // API Key 无效/配额耗尽 — 永不重试
 )
 
+// String 返回错误分类的可读名称 (transient/permanent/fatal), 用于日志与重试决策记录。
 func (k orchErrorKind) String() string {
 	switch k {
 	case orchErrTransient:

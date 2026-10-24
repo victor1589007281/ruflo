@@ -119,6 +119,7 @@ func ResetToolPaths() {
 // 路径发现
 // ============================================================================
 
+// findNode 定位 node 可执行文件: 先查 PATH, 再退到一组常见安装路径 (含 nvm 与用户目录)。
 func findNode() (string, error) {
 	if p, err := exec.LookPath("node"); err == nil {
 		return p, nil
@@ -143,6 +144,8 @@ func findNode() (string, error) {
 	return "", fmt.Errorf("node.js not found in PATH or common locations")
 }
 
+// findGitNexus 定位 gitnexus CLI 入口 (dist/cli/index.js), 依次尝试 npm root -g、
+// npx 缓存目录、常见全局安装路径。
 func findGitNexus(node string) (string, error) {
 	// 1. 尝试 npm root -g
 	npmRoot, _ := exec.Command(node, filepath.Join(filepath.Dir(node), "npm"), "root", "-g").Output()
@@ -190,6 +193,7 @@ func findGitNexus(node string) (string, error) {
 	return "", fmt.Errorf("gitnexus CLI not found; run: npm install -g gitnexus")
 }
 
+// findGraphify 定位 graphify 可执行文件: 先查 PATH, 再退到 /usr/local/bin 等常见位置。
 func findGraphify() (string, error) {
 	if p, err := exec.LookPath("graphify"); err == nil {
 		return p, nil
@@ -259,6 +263,8 @@ func runWithTimeoutEnv(dir string, timeout time.Duration, env []string, name str
 	return stdout.Bytes(), stderr.Bytes(), err
 }
 
+// execTimeout 基于 Background 造一个带超时的 ctx —— 刻意不继承上游取消, 让外部 CLI
+// 的执行只受自己的时限约束。
 func execTimeout(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
 }

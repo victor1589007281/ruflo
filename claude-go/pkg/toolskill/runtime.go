@@ -18,6 +18,7 @@ type Runtime struct {
 	adapters map[string]Adapter // capability -> adapter
 }
 
+// NewRuntime 构造 Tool Skill 运行时: 持有注册表, 并新建工具探测器与一张空的适配器表。
 // NewRuntime creates a new Runtime.
 func NewRuntime(reg *Registry) *Runtime {
 	return &Runtime{
@@ -27,6 +28,7 @@ func NewRuntime(reg *Registry) *Runtime {
 	}
 }
 
+// Init 扫描本机可用工具并注册默认适配器; 同一能力后注册者覆盖先注册者, build/format/import-fix 恒有兜底实现。
 // Init initializes: scans tools, registers default Adapters.
 func (rt *Runtime) Init(ctx context.Context) {
 	rt.detector.Scan(ctx)
@@ -40,6 +42,7 @@ func (rt *Runtime) Init(ctx context.Context) {
 			rt.adapters["static-check"] = &GolangCILintAdapter{cap: cap}
 		}
 	}
+	// 静态检查适配器按探测结果二选一; 两者都没探到时 static-check 能力缺位 (build/format/import-fix 仍可用)。
 	// Always register go vet / go build fallback
 	rt.adapters["build"] = &GoBuildAdapter{}
 	rt.adapters["format"] = &GoFormatAdapter{detector: rt.detector}
@@ -48,6 +51,7 @@ func (rt *Runtime) Init(ctx context.Context) {
 	log.Printf("[ToolSkill] Initialized adapters: %v", rt.AdapterNames())
 }
 
+// AdapterNames 返回已初始化的适配器能力名 (map 序, 无序)。
 // AdapterNames returns all initialized adapter capability names.
 func (rt *Runtime) AdapterNames() []string {
 	var names []string
@@ -57,6 +61,7 @@ func (rt *Runtime) AdapterNames() []string {
 	return names
 }
 
+// Execute 按名执行一个 Tool Skill, 并把 Status/Diagnostics 一并填进 ExecutionResult。
 // Execute executes a Tool Skill by name.
 //
 // Status and Diagnostics must be populated here, not left to the caller.
@@ -84,6 +89,8 @@ func (rt *Runtime) Execute(ctx context.Context, name string, input json.RawMessa
 	}
 }
 
+// hoistDiagnostics 把 Data["diagnostics"] 提升到结果顶层; 同时兼容进程内直传的类型化
+// []Diagnostic 与 JSON 往返后解出的 []any。
 // hoistDiagnostics lifts Data["diagnostics"] to the top level.
 //
 // The []any branch matters: skills invoked in-process hand back a typed
@@ -122,6 +129,20 @@ func hoistDiagnostics(data map[string]any) []Diagnostic {
 	return out
 }
 
+// deriveStatus 把技能的自由产出收敛成闸门能读的三值 (pass / fail / error)。
+//
+// 算法解读：
+//
+//	原理：技能返回的是 (map, error) 二元组, 而闸门要的是"过没过"; 这一层负责把
+//	      前者翻译成后者, 避免每个消费方各自解释一遍。
+//	关键不变量：优先级固定为 执行错误 > 技能自报 error > 存在 error 级诊断。技能自报的
+//	      **非 error** 状态一律不作数 —— 一个报 "completed" 却吐出 error 级诊断的技能
+//	      必须判 fail, 否则闸门会被技能的自评绕过。
+//	代价与边界：只认 Severity == "error", warning 级诊断不拦。布尔型结论
+//	      (performance_regression) 单独兜一条, 因为这类技能不产 diagnostics。
+//	设计权衡：状态词表刻意只有三个 —— 多一个档位就要多一处"谁来判"的约定, 而这三档
+//	      恰好对应调用方三种完全不同的后续动作 (重试 / 修代码 / 放行)。
+//
 // deriveStatus maps a skill's outcome onto the "pass" | "fail" | "error"
 // vocabulary that ExecutionResult.Status documents.
 //
@@ -153,6 +174,7 @@ func deriveStatus(data map[string]any, diags []Diagnostic, err error) string {
 	return "pass"
 }
 
+// RegisterDefaults 注册全部内置 Tool Skill。
 // RegisterDefaults registers all built-in Tool Skills.
 func (rt *Runtime) RegisterDefaults(store *contract.Store) {
 	rt.registry.Register(NewGoContractBuilder(store))

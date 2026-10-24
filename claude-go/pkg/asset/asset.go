@@ -299,6 +299,7 @@ type Problem struct {
 	Err  string `json:"err"`
 }
 
+// Error 让 Problem 满足 error 接口 ("路径: 原因"), 便于把索引期的问题当错误链聚合上报。
 func (p Problem) Error() string { return p.Path + ": " + p.Err }
 
 // Set 资产索引 (按 kind 分桶)。

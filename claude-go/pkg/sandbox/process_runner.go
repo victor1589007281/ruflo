@@ -15,8 +15,10 @@ import (
 
 type ProcessRunner struct{}
 
+// Name 返回后端名 "process-unsafe" —— 名字里的 unsafe 是**如实声明**: 这个后端没有内存隔离。
 func (r *ProcessRunner) Name() string { return "process-unsafe" }
 
+// Probe 汇报本后端的隔离能力: 只做超时与输出限流, 无 memory/pids/cpu cgroup 限制。
 func (r *ProcessRunner) Probe(ctx context.Context) ProbeResult {
 	return ProbeResult{
 		Runtime:   r.Name(),
@@ -28,6 +30,7 @@ func (r *ProcessRunner) Probe(ctx context.Context) ProbeResult {
 	}
 }
 
+// Run 直接在宿主上执行命令 (无 hook、无额外环境变量), 是各受限后端的兜底实现。
 func (r *ProcessRunner) Run(ctx context.Context, spec CommandSpec) (*CommandResult, error) {
 	return runLocalProcess(ctx, spec.normalized(), r.Name(), nil, nil)
 }
@@ -38,6 +41,23 @@ type localProcessHooks struct {
 	AfterWait  func(cmd *exec.Cmd, result *CommandResult)
 }
 
+// runLocalProcess 是各后端的公共执行内核: 起进程、限时限流、回收整棵进程树、归类失败原因。
+//
+// 算法解读：
+//
+//	原理：exec.CommandContext 只能杀**直接子进程**, 而 shell 起的命令会派生出一整棵树
+//		(grandchildren), 所以这里配 setProcessGroup + killProcessTree 做整组回收;
+//		另有一个 goroutine 盯 runCtx.Done() 承担超时/取消时的补刀。
+//	关键不变量：**先 Wait 再 close(done), 最后才排空 copyDone**。顺序反了会有两种错:
+//		提前 close(done) 会让杀进程 goroutine 退出而漏杀; 不等 copyDone 直接读
+//		limiter.Result() 会读到还没被 io.Copy 灌完的输出。processStarted 这个标志
+//		也是必需的 —— OutputLimiter 的 OnLimit 回调可能在 Start 之前就被触发,
+//		那时 cmd.Process 还是 nil。
+//	代价与边界：输出经 OutputLimiter 中转 (每字节过一次判断), 超出上限即杀整组进程
+//		并把结果标成 FailureOutputLimit; 失败归类只看错误文本与输出里的关键词
+//		(classifyProcessFailure), 所以 OOM 判定是**启发式**的, 可能漏判或误判。
+//	设计权衡：用管道 + 自己的限流器, 而不是 cmd.Output() —— 后者会把全部输出读进内存,
+//		恰恰是"输出炸弹"要防的情形。代价是多两个 goroutine 与显式的排空同步。
 func runLocalProcess(ctx context.Context, spec CommandSpec, runtimeName string, hooks *localProcessHooks, extraEnv map[string]string) (*CommandResult, error) {
 	start := time.Now()
 	result := &CommandResult{
@@ -154,6 +174,8 @@ func runLocalProcess(ctx context.Context, spec CommandSpec, runtimeName string, 
 		copyDone <- struct{}{}
 	}()
 
+	// 顺序有依赖: Wait 之后才 close(done) (否则杀进程 goroutine 提前退出而漏杀),
+	// 且必须等两个 io.Copy 都结束才读 limiter.Result() (否则读到未灌完的输出)。
 	waitErr := cmd.Wait()
 	close(done)
 	<-copyDone
@@ -167,6 +189,8 @@ func runLocalProcess(ctx context.Context, spec CommandSpec, runtimeName string, 
 		hooks.AfterWait(cmd, result)
 	}
 
+	// 归类顺序也是刻意的: 输出超限排在超时之前 —— 限流触发的杀进程同样会让 ctx 到期,
+	// 先判超时就会把"输出炸了"误报成"跑太久"。
 	if output.Truncated {
 		result.FailureKind = FailureOutputLimit
 		result.Err = fmt.Errorf("%s: output exceeded %d bytes", FailureOutputLimit, spec.Limits.OutputMaxBytes)
@@ -187,6 +211,7 @@ func runLocalProcess(ctx context.Context, spec CommandSpec, runtimeName string, 
 	return result, nil
 }
 
+// applyOutput 把限流器产出的预览与截断标志回填到命令结果。
 func applyOutput(result *CommandResult, output OutputResult) {
 	result.StdoutPreview = output.StdoutPreview
 	result.StderrPreview = output.StderrPreview
@@ -195,6 +220,9 @@ func applyOutput(result *CommandResult, output OutputResult) {
 	result.OutputTruncated = output.Truncated
 }
 
+// envPairs 把环境变量映射摊平成 "k=v" 切片; 空映射返回 nil。
+//
+// 注意：map 遍历无序, 同一份 map 两次调用产出的顺序可能不同 (对 exec 无影响)。
 func envPairs(env map[string]string) []string {
 	if len(env) == 0 {
 		return nil
@@ -206,6 +234,7 @@ func envPairs(env map[string]string) []string {
 	return out
 }
 
+// exitCode 从 Wait 错误里取退出码; 无错误为 0, 非 ExitError (如被信号杀) 返回 -1。
 func exitCode(err error) int {
 	if err == nil {
 		return 0
@@ -217,6 +246,10 @@ func exitCode(err error) int {
 	return -1
 }
 
+// classifyProcessFailure 按错误与输出的关键词把失败归类为 OOM 或一般进程失败。
+//
+// 注意：这是**文本启发式**而非可靠判据 —— "killed" 也可能来自超时补刀或外部 kill,
+// 都会被归进 FailureOOM; 且仅识别英文关键词, 本地化的错误文本会落到默认分支。
 func classifyProcessFailure(err error, out string) FailureKind {
 	lower := strings.ToLower(out + " " + err.Error())
 	switch {

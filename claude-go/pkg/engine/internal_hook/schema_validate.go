@@ -54,6 +54,19 @@ func ValidateAgainstSchema(input, schema json.RawMessage) error {
 	return validateValue(val, sch, "$")
 }
 
+// validateValue 递归校验单个值: enum 命中 → type 匹配 → object 查 required/properties、
+// array 查 items。通过返回 nil, 否则返回**第一条**人类可读错误 (带 $ 路径)。
+//
+// 算法解读：
+//
+//	原理：JSON Schema 的 stdlib-only 子集实现。先做与结构无关的检查 (enum/type), 再按
+//	      值的实际类型下钻: object 走 required + properties (递归), array 走 items (递归)。
+//	关键不变量：properties 只校验**出现**的字段 —— 缺失由 required 负责。若在此处对缺失
+//	      字段也报错, 可选字段会被误判成非法; 且 properties 的键必须排序后遍历, 否则同一
+//	      份输入每次报出的"第一条错误"都不同, 弱模型收到的反馈不可复现。
+//	代价与边界：只认 required/properties/items/enum/type, 其余关键字
+//	      (additionalProperties/pattern/minLength ...) 一律放行 —— 目标是拦硬伤, 不是全量合规。
+//	设计权衡：schema 不可解析时放行 (见 ValidateAgainstSchema), 宁可漏判也不误杀模型调用。
 func validateValue(v interface{}, sch map[string]interface{}, path string) error {
 	// enum: 值必须命中枚举之一
 	if enumRaw, ok := sch["enum"]; ok {
@@ -142,6 +155,7 @@ func checkJSONType(v interface{}, typeRaw interface{}) bool {
 	return true // type 写法不认识: 放行
 }
 
+// matchJSONType 判定值是否匹配单个 JSON Schema 类型名; 未知类型名一律放行 (不误杀)。
 func matchJSONType(v interface{}, t string) bool {
 	switch t {
 	case "object":
@@ -187,6 +201,7 @@ func typeName(typeRaw interface{}) string {
 	return "any"
 }
 
+// jsonTypeOf 返回值的 JSON 类型名 (仅用于拼装错误信息)。
 func jsonTypeOf(v interface{}) string {
 	switch v.(type) {
 	case map[string]interface{}:
@@ -212,6 +227,10 @@ func jsonDeepEqual(a, b interface{}) bool {
 	return string(aj) == string(bj)
 }
 
+// truncateForErr 把值渲染成字符串并截到 80 字节 (错误信息用)。
+//
+// 注意：按**字节**截, 中文错误值可能劈出半个 UTF-8 序列。只影响错误文案的可读性,
+// 不改判定结果 —— 若要修, 应改成像 textutil.Truncate 那样按 rune 截。
 func truncateForErr(v interface{}) string {
 	s := fmt.Sprintf("%v", v)
 	if len(s) > 80 {
@@ -294,10 +313,13 @@ func NewSchemaValidateHook(schemas map[string]json.RawMessage, metrics *EngineMe
 	}
 }
 
+// Name 返回 hook 名 schema_validate。
 func (h *SchemaValidateHook) Name() string { return "schema_validate" }
+// Priority 返回 75 —— 排在 JSONRepair(70) 之后、LoopDetectorInput(80) 之前。
 func (h *SchemaValidateHook) Priority() int {
 	return 75 // JSONRepair(70) 之后, LoopDetectorInput(80) 之前
 }
+// Phases 声明本 hook 只在 PreToolUse 阶段生效。
 func (h *SchemaValidateHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreToolUse}
 }

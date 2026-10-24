@@ -486,6 +486,7 @@ func (e *Engine) completeLLMWithMaxTokens(ctx context.Context, systemPrompt, use
 	return callLLM(ctx, e.httpClient, e.APIKey, e.BaseURL, e.Model, systemPrompt, userPrompt)
 }
 
+// mustMarshalString 把字符串序列化为 JSON 字符串字面量(含引号与转义); 失败时返回 nil。
 func mustMarshalString(s string) json.RawMessage {
 	data, _ := json.Marshal(s)
 	return data
@@ -868,6 +869,7 @@ type wikiFileInfo struct {
 	links []string
 }
 
+// collectWikiFiles 扫描 wiki 目录下的 .md 文件, 返回文件名、slug 与出链列表。
 func collectWikiFiles(wikiDir string) ([]wikiFileInfo, error) {
 	ents, err := os.ReadDir(wikiDir)
 	if err != nil {
@@ -893,6 +895,14 @@ func collectWikiFiles(wikiDir string) ([]wikiFileInfo, error) {
 	return out, nil
 }
 
+// parseWikiLinks 从 Markdown 文本中抽取 [[...]] 形式的 wiki 出链, 返回去重后的 slug 列表。
+//
+// 算法解读：
+//
+//	原理：正则一次性捞出全部 [[...]] 匹配, 再对每个匹配体取「|」之后的部分作为 slug(没有 | 就用整段), 最后用 map 去重。
+//	关键不变量：返回的 slug 必须已去重且顺序稳定——同一页面重复引用同一条链接只能算一条, 否则索引里的出链数会虚高。
+//	代价与边界：正则不处理嵌套 [[ ]] 或代码块内的字面量, 因此代码示例里写的 [[x]] 也会被当成真实出链。
+//	设计权衡：用「正则 + map」而不是真正的 Markdown 解析器, 换取对畸形文档的鲁棒性(不解析失败, 只是少识别)。
 func parseWikiLinks(md string) []string {
 	found := reWikiLink.FindAllStringSubmatch(md, -1)
 	seen := make(map[string]struct{})
@@ -906,6 +916,7 @@ func parseWikiLinks(md string) []string {
 			continue
 		}
 		part := raw
+		// [[目标|显示名]] 语法: 取「|」之后的部分作为 slug, 没有 | 则整段即 slug。
 		if idx := strings.LastIndex(raw, "|"); idx >= 0 && idx+1 < len(raw) {
 			part = strings.TrimSpace(raw[idx+1:])
 		}
@@ -922,6 +933,7 @@ func parseWikiLinks(md string) []string {
 	return slugs
 }
 
+// pickTitle 依次尝试用 <title> 与 <h1> 抽取标题, 两者都取不到时返回空串。
 func pickTitle(html string) string {
 	if m := reTitle.FindStringSubmatch(html); len(m) > 1 {
 		t := strings.TrimSpace(stripInnerTags(m[1]))
@@ -938,10 +950,19 @@ func pickTitle(html string) string {
 	return ""
 }
 
+// stripInnerTags 把内嵌标签替换成空格再去首尾空白, 用于清洗标题里的标记。
 func stripInnerTags(s string) string {
 	return strings.TrimSpace(reTags.ReplaceAllString(s, " "))
 }
 
+// parseIngestJSON 解析 LLM 返回的入库 JSON, 容忍被 ```json 代码围栏包裹的情况。
+//
+// 算法解读：
+//
+//	原理：先剥离首尾的 Markdown 代码围栏(```json / ```JSON / ```), 再交给 encoding/json 解析, 最后要求 pages 非空。
+//	关键不变量：剥围栏必须在 Unmarshal 之前完成——围栏残留会让解析在第一个反引号处直接失败, 而这是 LLM 输出最常见的形态。
+//	代价与边界：只做前缀/后缀剥离, 不修复截断或多余逗号; pages 为空被当作错误而不是「合法的空结果」。
+//	设计权衡：宁可用窄而确定的清洗规则, 也不引入宽松 JSON 修复器——后者会把真正的解析错误一并吞掉。
 func parseIngestJSON(raw string) ([]ingestLLMPage, error) {
 	s := strings.TrimSpace(raw)
 	s = strings.TrimPrefix(s, "```json")
@@ -959,6 +980,14 @@ func parseIngestJSON(raw string) ([]ingestLLMPage, error) {
 	return res.Pages, nil
 }
 
+// buildWikiContextBundle 把 wiki 目录拼成一段带预算上限的上下文包(页面列表 + 正文摘录)。
+//
+// 算法解读：
+//
+//	原理：先列出全部页面名, 再按目录顺序逐篇追加正文, 累计 rune 数一旦将超过 maxRunes 就在预算耗尽处截断并收尾。
+//	关键不变量：预算按 rune 而非 byte 计——按 byte 计会在中文正文里把可用额度算少一大截, 截断点也会落在多字节字符中间。
+//	代价与边界：目录顺序即优先级, 排在后面的页面在预算紧张时完全进不了上下文; 截断只标注「已截断」, 不保证语义完整。
+//	设计权衡：不做相关性排序(那需要先读全部正文), 用固定顺序换一次目录遍历就能定下预算分配。
 func buildWikiContextBundle(repoDir string, maxRunes int) (string, error) {
 	wikiDir := filepath.Join(repoDir, "wiki")
 	ents, err := os.ReadDir(wikiDir)
@@ -993,6 +1022,7 @@ func buildWikiContextBundle(repoDir string, maxRunes int) (string, error) {
 		}
 		chunk := fmt.Sprintf("\n### %s\n%s\n", n, string(data))
 		runes := []rune(chunk)
+		// 预算耗尽: 只在剩余额度内截取, 并标注截断后收尾, 不再尝试后续页面。
 		if used+len(runes) > maxRunes {
 			remain := maxRunes - used
 			if remain <= 0 {
@@ -1037,6 +1067,7 @@ func buildWikiIndexOnly(repoDir string) (string, error) {
 	return b.String(), nil
 }
 
+// truncateRunes 按 rune 截断字符串; 超长时追加「已截断」提示, 未超长时原样返回。
 func truncateRunes(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {

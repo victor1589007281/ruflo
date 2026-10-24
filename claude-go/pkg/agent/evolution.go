@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/api"
+	"github.com/anthropic/claude-go/pkg/decision"
 	evoledger "github.com/anthropic/claude-go/pkg/evolution"
 	"github.com/anthropic/claude-go/pkg/textutil"
 )
@@ -731,6 +732,20 @@ func (ee *EvolutionEngine) distillSuccessHeuristic(traj Trajectory) (symptom, ro
 	return symptom, rootCause, action
 }
 
+// llmDistill 调 LLM 把一批执行轨迹提炼成三段式经验 (现象→根因→动作) 并入库;
+// LLM 调用失败或返回不可解析时回退到启发式提炼 heuristicDistill。
+//
+// 算法解读：
+//
+//	原理：把该团队的全部轨迹 (每条输出截断 1000 字符) 拼成一段文本, 让模型按固定
+//	      JSON 数组格式吐出经验; 本地只做校验与去重, 不信任模型输出的字段完整性。
+//	关键不变量：只有「三段齐备 + 不与既有经验重复」的条目才入库 —— 少一段就是纯叙述,
+//	      注入下游只是噪声。命中重复时 nextID/totalDistilled 必须一起回退,
+//	      否则计数虚高, 后续 ID 生成与统计口径就与 experiences 的实际条数脱节。
+//	代价与边界：一次 LLM 调用, prompt 随轨迹条数线性增长 (无总量上限);
+//	      模型输出的 ``` 围栏只剥一层, 嵌套代码块会解析失败并整批回退启发式。
+//	设计权衡：LLM 路径与启发式路径执行同一套三段式闸门, 使两条来源入库的条目形态一致,
+//	      下游检索与质量评分不必区分来源; 代价是 LLM 提炼出的优质条目也会被同一闸门拦掉。
 func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, teamName string) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("团队: %s\n\n执行轨迹:\n", teamName))
@@ -847,6 +862,7 @@ func (ee *EvolutionEngine) llmDistill(ctx context.Context, trajs []Trajectory, t
 			UpdatedAt:  time.Now(),
 		}
 		if ee.isDuplicate(exp.Content) {
+			// 判重命中: 把上面刚自增的两个计数一起回退, 否则统计口径与实际条数脱节。
 			ee.nextID--
 			ee.totalDistilled--
 			continue
@@ -998,6 +1014,20 @@ func suggestFix(errorType, _ string) string {
 	}
 }
 
+// isDuplicate 判断一条待入库经验是否与已有经验重复。
+//
+// 算法解读：
+//
+//	原理：两级过滤 —— 先用 MinHash 签名估 Jaccard (O(k) 常数时间), 超过 0.6 才做
+//	      精确的集合 Jaccard 复核 (>0.7 判重); 签名缺失的老数据直接走精确比较。
+//	关键不变量：两个阈值必须同向 (粗筛 0.6 < 精判 0.7), 粗筛阈值一旦高于精判,
+//	      真正重复的条目会在粗筛就被放过 —— 判重形同虚设。
+//	代价与边界：精判是 O(已有条数) 的线性扫描, 且每次都要重新分词; 经验库上限 200 条
+//	      (见整理逻辑), 所以线性扫描可接受, 不引入 LSH 索引。
+//	设计权衡：保留「无签名则走精确比较」的分支是为了兼容旧版落盘的 experiences.json;
+//	      代价是每次加载旧数据后首次判重会退化成全量 O(n²) 分词比较。
+//
+// 注意：调用方必须在持有 ee.mu 的前提下调用 —— 本函数直接读 ee.experiences。
 func (ee *EvolutionEngine) isDuplicate(content string) bool {
 	tokens := evolutionTokenize(strings.ToLower(content))
 	sig := computeMinHash(tokens, 64)
@@ -1037,6 +1067,18 @@ func (ee *EvolutionEngine) RecordInjectionScoredRun(expIDs []string, taskID, tea
 	ee.recordInjectionRun(expIDs, taskID, teamName, role, score, runID)
 }
 
+// recordInjectionRun 三个 RecordInjection* 入口的公共落点: 写注入记录并回填每条经验的注入统计。
+//
+// 算法解读：
+//
+//	原理：注入记录是「经验是否有效」的唯一证据源 —— 既进 ee.injections (供 uplift 统计),
+//	      也回填到对应经验的 InjectionCount/InjectionSuccess (供单条经验的成功率排序)。
+//	关键不变量：success 由 score>0 推导, 而不是由调用方传入的 bool ——
+//	      这样二值入口 (boolFeedbackScore) 与加权入口落到同一条判据上, 口径不会分叉。
+//	代价与边界：注入记录只保留最近 2000 条 (滑窗截断), 超出的历史证据永久丢弃;
+//	      回填是对每条经验 ID 的线性扫描, 未命中 ID 静默忽略 (经验可能已被整理剪枝)。
+//	设计权衡：用内存滑窗而不是全量落盘, 是为了让 uplift 只反映近期行为;
+//	      代价是长期趋势分析看不到 2000 条以前的数据。
 func (ee *EvolutionEngine) recordInjectionRun(expIDs []string, taskID, teamName, role string, score float64, runID string) {
 	if ee == nil {
 		return
@@ -1181,6 +1223,19 @@ func (ee *EvolutionEngine) persistInjections() {
 // RetrieveFor 按角色和目标检索相关经验。
 // V2: BM25+IDF + 同义词扩展 + UCB探索/利用 + 注入Uplift加权 + 生命周期过滤。
 func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Experience {
+	cfg := recallConfigFromEnv()
+	return ee.retrieveForDecision(context.Background(), role, objective, topK, cfg)
+}
+
+// retrieveForDecision 是 RetrieveFor 的实现，借鉴 TencentDB Agent Memory 的两段式召回：
+// BM25 粗筛出候选（扩到 recallCandidateCap）→ Jev 决策模型精判"该召回哪几条"。
+//
+// 两种模式（见 recall.go 头注释）：
+//   - 双跑（默认）：Jev 只判不动——返回 BM25 topK，Jev 判断写 agentDB 流水离线对照。
+//   - 生效（CLAUDE_GO_DECISION_RECALL=1）：返回 Jev 精判结果；Jev 失败回退 BM25 topK。
+//
+// 两种模式共享同一段 BM25 打分代码（下方），区别只在最后用谁的排序。
+func (ee *EvolutionEngine) retrieveForDecision(ctx context.Context, role, objective string, topK int, cfg recallConfig) []*Experience {
 	if topK <= 0 {
 		topK = 5
 	}
@@ -1300,20 +1355,67 @@ func (ee *EvolutionEngine) RetrieveFor(role, objective string, topK int) []*Expe
 		if !isDup {
 			deduped = append(deduped, c)
 		}
-		if len(deduped) >= topK {
+		// P0 召回改造：粗筛阶段扩到 recallCandidateCap（而非 topK），给 Jev 精判留候选空间。
+		if len(deduped) >= recallCandidateCap {
 			break
 		}
 	}
 
-	result := make([]*Experience, len(deduped))
+	// BM25 粗筛出的候选（按启发式分数降序）。
+	bm25Ranked := make([]*Experience, len(deduped))
 	for i, c := range deduped {
-		c.exp.UsageCount++
-		c.exp.SelectionCount++
-		c.exp.UpdatedAt = time.Now()
-		result[i] = c.exp
+		bm25Ranked[i] = c.exp
 	}
-	ee.totalSelections += len(result)
-	return result
+	// BM25 基线结果 = 粗筛的 topK（与改造前的 RetrieveFor 完全一致）。
+	bm25TopK := bm25Ranked
+	if len(bm25TopK) > topK {
+		bm25TopK = bm25TopK[:topK]
+	}
+
+	// P0 召回精判：决策模型从候选里挑该注入的。
+	final := bm25TopK
+	if picked, judged := ee.jevRefineRecall(ctx, role, objective, bm25Ranked, topK, cfg); judged {
+		if cfg.Enabled {
+			final = picked
+		} else {
+			// 双跑模式：显式记一条对照流水（BM25 选了什么 vs Jev 选了什么），
+			// 供攒数据后 ConformalCalibrator 标定。fail-open，不影响返回。
+			ee.logRecallDual(context.Background(), cfg, role, objective, topK, bm25TopK, picked)
+		}
+	}
+
+	// 命中计数：对最终实际返回的经验累加（保持原有行为语义）。
+	for _, e := range final {
+		e.UsageCount++
+		e.SelectionCount++
+		e.UpdatedAt = time.Now()
+	}
+	ee.totalSelections += len(final)
+	return final
+}
+
+// logRecallDual 在双跑模式下把 BM25 与 Jev 的选择对照写进 agentDB 流水。
+// 这是"先喂数据再谈换模型"的数据来源：攒够后用 ConformalCalibrator 标定 Jev 阈值。
+// fail-open：任何失败都只记日志，不影响召回结果。
+func (ee *EvolutionEngine) logRecallDual(ctx context.Context, cfg recallConfig, role, objective string, topK int, bm25, jev []*Experience) {
+	ids := func(xs []*Experience) []string {
+		out := make([]string, 0, len(xs))
+		for _, e := range xs {
+			out = append(out, e.ID)
+		}
+		return out
+	}
+	rec := decision.Record{
+		Kind:  "recall_dual",
+		Model: decision.ModelRecall,
+		Extra: map[string]any{
+			"role": role, "top_k": topK,
+			"objective_trunc": truncateResult(objective, 160),
+			"bm25_picks":      ids(bm25),
+			"jev_picks":       ids(jev),
+		},
+	}
+	_ = decision.NewLogger(cfg.LogURL).Log(ctx, rec)
 }
 
 // synonymMap 中英文同义词表 (V2: 检索增强)。
@@ -1596,6 +1698,7 @@ func (ee *EvolutionEngine) Consolidate() {
 
 // --- 持久化 ---
 
+// persistExperiences 把经验库整体覆盖写到 <dataDir>/experiences.json; dataDir 为空时不做任何事。
 func (ee *EvolutionEngine) persistExperiences() {
 	if ee.dataDir == "" {
 		return
@@ -1608,6 +1711,7 @@ func (ee *EvolutionEngine) persistExperiences() {
 	_ = os.WriteFile(filepath.Join(ee.dataDir, "experiences.json"), data, 0644)
 }
 
+// persistTrajectories 把轨迹整体覆盖写到 <dataDir>/trajectories.json; dataDir 为空时不做任何事。
 func (ee *EvolutionEngine) persistTrajectories() {
 	if ee.dataDir == "" {
 		return
@@ -1620,6 +1724,10 @@ func (ee *EvolutionEngine) persistTrajectories() {
 	_ = os.WriteFile(filepath.Join(ee.dataDir, "trajectories.json"), data, 0644)
 }
 
+// load 从 dataDir 依次读回 experiences / trajectories / injections 三份 JSON。
+//
+// 注意：任一份读取或解析失败都静默跳过 (保持该字段的零值), 不做任何提示 ——
+// 落盘损坏时引擎会以「空经验库」继续跑, 从外部看只是进化效果消失而不是报错。
 func (ee *EvolutionEngine) load() {
 	if ee.dataDir == "" {
 		return
@@ -1990,7 +2098,21 @@ func evolutionTokenize(text string) []string {
 	return tokens
 }
 
+// bm25WithIDF 计算带 IDF 权重的 BM25 相关性分, 供经验检索排序使用。
+//
 // bm25WithIDF BM25 with proper IDF weighting (replaces simpleBM25 for retrieval).
+//
+// 算法解读：
+//
+//	原理：BM25 = 词频饱和项 × IDF × 查询词频。词频饱和项 (k1=1.5) 让同一词出现 10 次
+//	      与 20 次的得分差距远小于线性; 长度归一 (b=0.75) 惩罚长文档, 避免「越长越占优」。
+//	关键不变量：avgDL 被硬编码为 30.0 —— 它必须代表文档平均长度, 否则长度归一失真;
+//	      库里的经验正文普遍在几十词量级, 所以这个常数是经验值而不是实测量。
+//	      此外覆盖率乘子 (1+coverage) 只放大、不缩小, 命中词越多分越高。
+//	代价与边界：docFreq/totalDocs 由调用方预先统计 (见 SearchExperiences), 本函数自身
+//	      不做任何语料统计; 词表外 (df=0) 的词 IDF 最大, 单个稀有词命中即可拉高总分。
+//	设计权衡：用固定 avgDL 换掉「先遍历全库求均值」的一趟扫描, 检索路径少一次 O(n) 遍历;
+//	      代价是文档长度分布发生大变化 (如经验普遍变长) 时需要手工调这个常数。
 func bm25WithIDF(queryTerms, docTerms []string, docFreq map[string]int, totalDocs float64) float64 {
 	if len(docTerms) == 0 {
 		return 0
@@ -2032,6 +2154,11 @@ func bm25WithIDF(queryTerms, docTerms []string, docFreq map[string]int, totalDoc
 	return score
 }
 
+// simpleBM25 无 IDF 的 BM25 变体: 只有词频饱和 + 长度归一 + 覆盖率加成。
+//
+// 注意：检索路径已改用 bm25WithIDF, 本函数当前在仓库内没有任何调用方 (仅保留定义)。
+// 缺少 IDF 意味着高频词 (如「失败」「执行」) 与稀有词权重相同, 用它排序会把
+// 到处都出现的套话排在前面 —— 若将来复用, 需先确认这是想要的排序语义。
 func simpleBM25(queryTerms, docTerms []string) float64 {
 	if len(docTerms) == 0 {
 		return 0
@@ -2138,6 +2265,9 @@ func fnvHash64(vals []uint64) uint64 {
 	return h
 }
 
+// jaccardSimilarity 按分词后的集合计算两段文本的 Jaccard 相似度 (交集/并集), 任一侧无 token 返回 0。
+//
+// 注意：比较的是「去重后的词集合」, 词频信息被丢弃 —— 同词重复多次不会提高相似度。
 func jaccardSimilarity(a, b string) float64 {
 	tokensA := evolutionTokenize(a)
 	tokensB := evolutionTokenize(b)

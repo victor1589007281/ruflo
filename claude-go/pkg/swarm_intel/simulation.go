@@ -272,6 +272,7 @@ func parseSimulationResult(mode string, rounds int, raw string) *SimulationResul
 	return result
 }
 
+// truncate 把字符串截到 n 个字符, 超出部分以 "..." 结尾。
 func truncate(s string, n int) string {
 	return textutil.Truncate(s, n, "...")
 }

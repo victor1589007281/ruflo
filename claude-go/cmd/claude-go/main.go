@@ -198,6 +198,22 @@ var (
 	flagAgentDBReserve int    // --agentdb-reserve 为任务正文预留 token (默认 200)
 )
 
+// main 是 CLI 入口: 装配 cobra 根命令、注册全部子命令, 再交给 cobra 分派。
+//
+// 算法解读：
+//
+//	原理：整个二进制是"一个根命令 + 一棵子命令树"。main 自己不做业务, 只做两件事:
+//	      ①在任何出站请求之前初始化全局开关 (会话分片 A/B); ②把子命令挂到根上。
+//	      真正的装配发生在每个子命令的 RunE 里 (run/chat 走 buildEngine, 其余多数只读)。
+//	关键不变量：**PersistentPreRun 里对 dashboard/feishu 两个子命令提前 return**。
+//	      这两个子命令要按 --config 的 cwd/stateDir 精确定位数据目录, 而根命令这里
+//	      只有 os.Getwd() —— 不跳过就会用错误的工作目录提前创建出一份错位的
+//	      .claude-go/, 之后子命令再想纠正已经晚了 (目录已经建出来, 且指标采集器已绑定)。
+//	代价与边界：所有全局旗标都是包级变量, 因此本进程内只可能跑一条命令 (cobra 天然
+//	      如此), 但也意味着测试里连续跑两个子命令会互相污染旗标状态。
+//	设计权衡：把 init 放在 cobra 之前而不是 PersistentPreRun 里 —— 会话分片必须
+//	      在第一个出站请求前生效, 而 PersistentPreRun 只在命令真正执行时才跑,
+//	      顺序上晚于某些早期初始化。
 func main() {
 	// 会话分片 A/B (见 pkg/api/sessionshard.go): 决定出站 X-Claude-Code-Session-Id
 	// 是否把 NodeID 也算进会话键。默认 0 = 关闭, 出站头与改造前逐字节一致。
@@ -613,6 +629,7 @@ func sandboxCmd() *cobra.Command {
 	return cmd
 }
 
+// helpCmd 构造 help 子命令: 打印完整的静态使用指南 (含飞书配置与机器人命令说明)。
 func helpCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:     "help",
@@ -1428,6 +1445,10 @@ type runEnvelope struct {
 	AssemblyReconcile *assembly.ReconcileResult `json:"assembly_reconcile,omitempty"`
 }
 
+// emitRunEnvelope 把一次 run 的结果以单行 JSON 信封写到 stdout (供程序化调用方解析)。
+//
+// errKind 非空即 IsError 为真 —— 错误种类与"是否失败"共用同一个来源, 避免出现
+// isError=false 但 errorKind 有值这种自相矛盾的信封。
 func emitRunEnvelope(final, sessionID, errKind string, report *assembly.Report, reconcile *assembly.ReconcileResult) error {
 	env := runEnvelope{
 		Final:             final,
@@ -2230,6 +2251,7 @@ func toolsCmd() *cobra.Command {
 	}
 }
 
+// skillsCmd 构造 skills 子命令: 不带参数列出全部已加载技能, 带名字则打印该技能详情。
 func skillsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "skills [name]",
@@ -2275,6 +2297,7 @@ func skillsCmd() *cobra.Command {
 	}
 }
 
+// rolesCmd 构造 roles 子命令: 列出角色及各自解析后绑定的技能, 或查单个角色的技能明细。
 func rolesCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "roles [name]",
@@ -2680,6 +2703,9 @@ func llmGatewayCmd() *cobra.Command {
 	return cmd
 }
 
+// dashboardCmd 构造 dashboard 父命令: 挂 run/start/stop/status/open 五个子命令。
+//
+// 无子命令时等价于 run —— 兼容旧行为 (旧版只有 `claude-go dashboard` 一种用法)。
 func dashboardCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "dashboard",
@@ -2739,6 +2765,7 @@ Dashboard 写入范围有限且只在自己子目录:
 	return cmd
 }
 
+// dashboardRunCmd 构造 dashboard run 子命令: 前台运行, 端口被占时自动顺延。
 func dashboardRunCmd() *cobra.Command {
 	var (
 		addr       string
@@ -2762,6 +2789,10 @@ func dashboardRunCmd() *cobra.Command {
 	return c
 }
 
+// dashboardStartCmd 构造 dashboard start 子命令: 以 setsid 派生子进程做后台运行并写 pid 文件。
+//
+// 就绪判据是轮询 /api/health (最长 5s) 而不是"子进程还活着": 进程起来了但端口没监听
+// 是常见的失败形态, 只看进程存在会把这种失败报成启动成功。超时则清掉 pid 文件。
 func dashboardStartCmd() *cobra.Command {
 	var (
 		addr       string
@@ -2871,6 +2902,7 @@ func dashboardStartCmd() *cobra.Command {
 	return c
 }
 
+// dashboardStopCmd 构造 dashboard stop 子命令: 按 pid 文件停掉后台进程并清理残留。
 func dashboardStopCmd() *cobra.Command {
 	var (
 		stateDir   string
@@ -2903,6 +2935,10 @@ func dashboardStopCmd() *cobra.Command {
 	return c
 }
 
+// dashboardStatusCmd 构造 dashboard status 子命令: 打印后台进程状态 (支持 --json)。
+//
+// 未运行但 pid 文件仍在时**同时报出残留 PID** 并提示用 stop 清理 —— 只报"未运行"会
+// 让人以为没有遗留物。
 func dashboardStatusCmd() *cobra.Command {
 	var (
 		stateDir   string
@@ -2949,6 +2985,7 @@ func dashboardStatusCmd() *cobra.Command {
 	return c
 }
 
+// dashboardOpenCmd 构造 dashboard open 子命令: 用系统默认浏览器打开当前运行的 Dashboard。
 func dashboardOpenCmd() *cobra.Command {
 	var (
 		stateDir   string
@@ -3016,11 +3053,16 @@ func backupCmd() *cobra.Command {
 	return cmd
 }
 
+// resolveStateDir 用当前工作目录兜底解析 stateDir (只看 CLI 旗标与 cwd, 不读配置文件)。
+//
+// 注意：它**看不到** config.json 里写的 stateDir —— 生产上那份配置才是真正的状态目录,
+// 所以需要完整语义的调用点应当先走 loadRuntimeJSONConfig 再回落本函数 (见 rolesCmd)。
 func resolveStateDir(stateDir string) string {
 	cwd, _ := os.Getwd()
 	return basedir.ResolveDefault(stateDir, cwd)
 }
 
+// backupCreateCmd 构造 backup create 子命令: 把运行态关键数据打包成 tar.gz 归档。
 func backupCreateCmd() *cobra.Command {
 	var (
 		stateDir       string
@@ -3052,6 +3094,7 @@ func backupCreateCmd() *cobra.Command {
 	return c
 }
 
+// backupListCmd 构造 backup list 子命令: 列出已有归档的时间/大小/标签。
 func backupListCmd() *cobra.Command {
 	var stateDir string
 	var asJSON bool
@@ -3088,6 +3131,7 @@ func backupListCmd() *cobra.Command {
 	return c
 }
 
+// backupRestoreCmd 构造 backup restore 子命令: 从归档恢复, 默认先自动打一份安全快照。
 func backupRestoreCmd() *cobra.Command {
 	var (
 		stateDir    string
@@ -3126,6 +3170,7 @@ func backupRestoreCmd() *cobra.Command {
 	return c
 }
 
+// backupDeleteCmd 构造 backup delete 子命令: 删除指定归档文件。
 func backupDeleteCmd() *cobra.Command {
 	var stateDir, path string
 	c := &cobra.Command{
@@ -3153,6 +3198,7 @@ type backupCreateSummary struct {
 	Targets   []string
 }
 
+// runBackupCreate 执行一次备份, 把 backup 包的返回压成 CLI 展示用的摘要。
 func runBackupCreate(stateDir, label, out string, includeReports bool) (*backupCreateSummary, error) {
 	res, err := backup.Create(backup.CreateOptions{
 		StateDir:       stateDir,
@@ -3172,10 +3218,12 @@ func runBackupCreate(stateDir, label, out string, includeReports bool) (*backupC
 	}, nil
 }
 
+// runBackupList 列出 stateDir 下的全部备份归档 (backup.List 的薄包装)。
 func runBackupList(stateDir string) ([]backup.ListEntry, error) {
 	return backup.List(stateDir)
 }
 
+// runBackupRestore 从归档恢复 (backup.Restore 的薄包装); skipSafety 跳过恢复前快照, overwrite 允许覆盖。
 func runBackupRestore(stateDir, path string, skipSafety, overwrite bool) (*backup.RestoreResult, error) {
 	return backup.Restore(backup.RestoreOptions{
 		StateDir:         stateDir,
@@ -3185,6 +3233,7 @@ func runBackupRestore(stateDir, path string, skipSafety, overwrite bool) (*backu
 	})
 }
 
+// runBackupDelete 删除一个归档文件并在成功后打印路径。
 func runBackupDelete(stateDir, path string) error {
 	if err := backup.Delete(stateDir, path); err != nil {
 		return err
@@ -3386,6 +3435,10 @@ func runDashboardForeground(addr string, port int, stateDir string, noOpen bool,
 	}
 }
 
+// openBrowser 用系统默认浏览器打开 URL (macOS 走 open, 其余走 xdg-open)。
+//
+// 只看 /usr/bin/open 是否存在来判平台, 不读 runtime.GOOS —— 在非 macOS 上装了
+// 同名工具时会走错分支。返回的 error 只代表"启动器起不来", 不代表浏览器打开了页面。
 func openBrowser(url string) error {
 	var cmd *exec.Cmd
 	switch {
@@ -3399,11 +3452,17 @@ func openBrowser(url string) error {
 	return cmd.Start()
 }
 
+// fileExists 判断路径存在 (目录也算); 权限不足等错误一律当作"不存在"。
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
 }
 
+// normalizeProviderModelAlias 剥掉 "provider:" 前缀只留裸模型名; 无前缀或任一段为空时原样返回。
+//
+// 注意：按**第一个**冒号切分, 故 "ollama:gemma4:26b" 会得到 "gemma4:26b" (正确),
+// 而裸名本身就含冒号的本地模型若被误当成前缀形式, 结果会不对 —— 判据是"冒号前段是否
+// 等于已路由的 provider 名", 本函数拿不到 provider, 因此不做该判定 (见 llmgw 出站剥壳)。
 func normalizeProviderModelAlias(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -3416,6 +3475,9 @@ func normalizeProviderModelAlias(model string) string {
 	return parts[1]
 }
 
+// loadRuntimeJSONConfig 按六环查找链解析并加载运行时 JSON 配置, 返回 (配置, 实际路径, 错误)。
+//
+// 配置不存在是正常情况 (返回 nil 配置而非错误); 只有文件存在但读/解析失败才报错。
 func loadRuntimeJSONConfig() (*feishu.JSONConfig, string, error) {
 	cfg, path, _, err := loadRuntimeJSONConfigWithOrigin()
 	return cfg, path, err
@@ -3442,6 +3504,12 @@ func loadRuntimeJSONConfigWithOrigin() (*feishu.JSONConfig, string, string, erro
 	return cfg, path, origin, nil
 }
 
+// resolveRuntimeModelConfig 从配置的 providers 段解析出本次运行要用的模型; 第二个返回值表示是否真的解析出了 provider。
+//
+// 三种形态各自处理: preferredModel 为空或等于内置默认值 → 直接用配置里的默认解析结果;
+// 不带 ":" 的名字 → 只换别名/provider 名, 保留默认的 baseURL 与凭证 (即"换标签不换连接");
+// 带 ":" 的名字 → 把它当默认别名重跑一次解析, 并清空 fallback 与 plans —— 显式指定
+// 模型时不该再被配置里的兜底链劫持到别的模型上。
 func resolveRuntimeModelConfig(jsonCfg *feishu.JSONConfig, preferredModel string) (modelconfig.ResolvedConfig, bool, error) {
 	if jsonCfg == nil || len(jsonCfg.Providers) == 0 {
 		return modelconfig.ResolvedConfig{}, false, nil
@@ -3577,6 +3645,11 @@ func buildPlanClient(jsonCfg *feishu.JSONConfig, alias string) (*api.Client, boo
 	return client, true
 }
 
+// applyRuntimePromptDebug 把 prompt 调试落盘开关装配到 api.Client 上 (配置为底、环境变量覆盖)。
+//
+// 默认值 (500 文件 / 200MB / 采样率 1.0 / 脱敏开) 只在配置缺项时生效; 未启用时**一个字段
+// 都不写**, 使 api.Client 保持零值 = 关闭。目录三级回落: 配置 > <stateDir>/prompt-debug >
+// ~/.claude-go/prompt-debug > ./.claude-go/prompt-debug。
 func applyRuntimePromptDebug(apiClient *api.Client, jsonCfg *feishu.JSONConfig) {
 	if apiClient == nil {
 		return
@@ -3637,6 +3710,10 @@ func applyRuntimePromptDebug(apiClient *api.Client, jsonCfg *feishu.JSONConfig) 
 	apiClient.PromptDebugRedact = redact
 }
 
+// applyRuntimeSandboxConfig 把配置里的 sandbox 段与解析出的 stateDir 装进 pkg/sandbox 的全局配置。
+//
+// 副作用是全局的 (sandbox.Configure), 因此必须在建引擎之前调用 —— 之后所有
+// sandbox.Run 都会读到这份配置。
 func applyRuntimeSandboxConfig(jsonCfg *feishu.JSONConfig, cwd string) {
 	stateDirInput := ""
 	var cfg sandbox.Config
@@ -3709,6 +3786,7 @@ var runTraceSeq atomic.Uint64
 // cliDreamAdapter 适配 dreaming.Dreamer → agent.DreamRecorder (与 feishu.dreamAdapter 同构)。
 type cliDreamAdapter struct{ dreamer *dreaming.Dreamer }
 
+// RecordSession 把一次会话记录转成 dreaming 的入参登记 (dreamer 为 nil 时静默跳过)。
 func (da *cliDreamAdapter) RecordSession(record agent.DreamSessionRecord) {
 	if da.dreamer == nil {
 		return
@@ -3720,6 +3798,7 @@ func (da *cliDreamAdapter) RecordSession(record agent.DreamSessionRecord) {
 	})
 }
 
+// AfterQuery 转调 dreamer 的查询后整理钩子 (dreamer 为 nil 时静默跳过)。
 func (da *cliDreamAdapter) AfterQuery(ctx context.Context) {
 	if da.dreamer == nil {
 		return
@@ -3727,6 +3806,22 @@ func (da *cliDreamAdapter) AfterQuery(ctx context.Context) {
 	da.dreamer.AfterQuery(ctx)
 }
 
+// buildEngine 装配一次运行所需的全部依赖, 返回可用的 QueryEngine。
+//
+// 算法解读：
+//
+//	原理：这是 CLI 侧的**总装配点**。它把六个来源折叠成一份引擎配置 —— 默认值 →
+//	      config.json → 项目级 settings.json → 环境变量 → 命令行旗标 → 资产/插件声明,
+//	      越靠后优先级越高。沿途顺手完成: 沙箱全局配置、prompt 调试开关、MCP 连接、
+//	      技能注册表、hook Runner、trace 底座、装配自报与对账。
+//	关键不变量：**装配自报 (cliAssembly) 必须在收尾点采集**。best-of-N 会重建引擎,
+//	      在 callRunE 里现采会拿到早先那次尝试的读数, 与"最后一次实际执行"对不上 ——
+//	      所以每次 buildEngine 覆盖写一份, 语义上才不错位。
+//	代价与边界：每次调用都会真的去连 MCP server、扫技能目录、建 trace store, 是重操作;
+//	      中途失败一律返回 error 而不做部分装配 (半个引擎比没有引擎更难排查)。
+//	设计权衡：不用依赖注入容器, 而是让本函数按固定顺序手工串起来 —— 顺序本身就是
+//	      语义 (例如 applyRuntimeSandboxConfig 必须在建引擎前, 否则本次运行读不到沙箱配置),
+//	      容器会把这份顺序藏起来, 而它恰恰是最容易改错的地方。
 func buildEngine() (*engine.QueryEngine, error) {
 	cwd, _ := os.Getwd()
 
@@ -4454,6 +4549,7 @@ func buildEngine() (*engine.QueryEngine, error) {
 	return eng, nil
 }
 
+// getAPIKey 按 --api-key > ANTHROPIC_API_KEY > DASHSCOPE_API_KEY 的顺序取密钥; 都没有则返回空串。
 func getAPIKey() string {
 	if flagAPIKey != "" {
 		return flagAPIKey
@@ -4467,6 +4563,7 @@ func getAPIKey() string {
 	return ""
 }
 
+// checkCommand 在 PATH 里探测一条外部命令并打印 ✓/✗ (doctor 子命令用)。
 func checkCommand(name, desc string) {
 	_, err := exec.LookPath(name)
 	if err == nil {
@@ -4476,6 +4573,9 @@ func checkCommand(name, desc string) {
 	}
 }
 
+// printMessage 把一条消息渲染到 stdout: 助手文本直接打印, 工具调用仅在 --debug 下展开入参。
+//
+// 非助手类型的消息在本函数里没有分支, 即被静默忽略 —— 渲染用户/系统消息是调用方的事。
 func printMessage(msg types.Message) {
 	switch msg.Type {
 	case types.MessageTypeAssistant:
@@ -5068,6 +5168,10 @@ func (r *cliAgentRunner) CanInjectMidRun() bool {
 	return r.inject != nil && r.inject.Active()
 }
 
+// InjectMidRun 把一段正文投进本次运行的入站队列; 队列未装配或已失活时返回 false。
+//
+// 先取局部变量 q 再释放锁, 是因为 Inject 本身可能阻塞 —— 持锁调用会把并发的
+// CanInjectMidRun 一起卡住。
 func (r *cliAgentRunner) InjectMidRun(text string) bool {
 	r.mu.Lock()
 	q := r.inject
@@ -5161,6 +5265,10 @@ func (r *cliAgentRunner) effectiveHooks() []types.HookConfig {
 	return merged
 }
 
+// hooksFromDecl 解析阶段声明的 hook 串, 返回可用的 hook 配置; 解析问题只记日志、不中断。
+//
+// 声明写错时**不报错也不生效** —— 这是刻意的: 一个 hook 写法有误不该让整个 stage 跑不起来。
+// 代价是这类问题只能从日志里发现 (stage 参数就是为了让日志能指回是哪一段声明)。
 func hooksFromDecl(decl agent.StageDecl, stage string) []types.HookConfig {
 	if len(decl.Hooks) == 0 {
 		return nil
@@ -5226,6 +5334,13 @@ func (r *cliAgentRunner) stageDeclSkillListing() string {
 	return reg.FormatShortListingForNames(r.stageDecl.Skills)
 }
 
+// Execute 以某个 stage/角色的身份跑一次隔离的 agent 执行, 返回最终文本。
+//
+// 走 engine.RunIsolated 的完整工具循环 (支持原生 tool_use 与 XML/[TOOL_CALL] 回退),
+// 而不是裸 SendMessage —— 后者会让模型在文本里塞的工具调用永远不执行, stage 形同空转。
+//
+// 每次 Execute 新建一个入站队列并 defer 置回 nil: 8 个并发 stage 共用同一个 eng,
+// 引擎级队列会让"A 阶段的更正"被 B 阶段收走 (见 CanInjectMidRun 的论证)。
 func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
 	// 走完整的工具循环 (engine.RunIsolated): 这里既支持 Anthropic 原生 tool_use,
 	// 也支持 XML / [TOOL_CALL] bracket 风格的工具调用回退.
@@ -5383,6 +5498,13 @@ func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool) (finalText, er
 	return strings.TrimSpace(final.String()), errKind
 }
 
+// classifyRunError 把流式错误粗分成种类 (timeout/rate_limit/overloaded/prompt_too_long/error),
+// 写进 JSON 信封供调用方决定重试策略, 免得去解析自由文本。
+//
+// 判据是**子串匹配错误消息**: 上游改一次措辞就会静默落进 default 分支。分类结果只用于
+// 选择重试策略, 不用于判定成败 (成败看 err 本身), 因此误判的代价是"重试方式不最优",
+// 不是"错误被吞掉"。
+//
 // classifyRunError maps a stream error to a coarse kind for the JSON envelope
 // so callers can pick a retry strategy without parsing free-form messages.
 func classifyRunError(err error) string {
@@ -5404,6 +5526,20 @@ func classifyRunError(err error) string {
 	}
 }
 
+// parseAllowedTools 把逗号分隔的工具白名单解析成集合, 三态语义见 effectiveAllowedTools。
+//
+// 算法解读：
+//
+//	原理：nil 与"非 nil 空集"在这里是**两个不同的值**, 分别表示"没人声明白名单"与
+//	      "有人声明了一个空白名单"。前者放行全部工具, 后者拒绝全部工具 (fail-closed)。
+//	关键不变量：只有**完全为空**的旗标才返回 nil。一个非空但解析不出任何有效项的值
+//	      (如 " , ") 必须返回非 nil 空集 —— 否则调用方模板渲染成空白时会静默地
+//	      把全部工具暴露出去, 而"模板渲染成空"恰恰是最需要 fail-closed 的情形。
+//	代价与边界：只做去空白与切分, 不校验工具名是否存在; 不存在的名字会被引擎当作
+//	      "没有这个工具"而不是"白名单里有笔误"。
+//	设计权衡：不做"友好化" (例如把空集当成 nil), 因为那会把一次真实的声明收紧
+//	      悄悄变成完全放行 —— 两个方向的错都不可接受时, 选 fail-closed 那一侧。
+//
 // parseAllowedTools splits a comma-separated whitelist into a set. Only a
 // fully-empty flag ("") yields nil (no whitelist). A non-empty flag that parses
 // to zero valid entries (e.g. " , ") returns a non-nil EMPTY set, which the
@@ -5454,6 +5590,7 @@ func effectiveAllowedTools(flagCSV string, jsonCfg *feishu.JSONConfig) map[strin
 	return set
 }
 
+// firstLine 取字符串第一行 (无换行时原样返回), 用于把多行描述压成一行展示。
 func firstLine(s string) string {
 	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
 		return s[:idx]
@@ -5461,6 +5598,7 @@ func firstLine(s string) string {
 	return s
 }
 
+// formatNameList 把名字列表拼成逗号分隔串; 空列表返回 "(none)" (而不是空串, 以便区分"没有"与"没打印")。
 func formatNameList(items []string) string {
 	if len(items) == 0 {
 		return "(none)"
@@ -5488,6 +5626,10 @@ type engineDeps struct {
 	traceStore *tracestore.Store
 }
 
+// connectMCP 按 MCP 配置文件的 mcpServers 段逐个建立连接, 返回成功的连接列表。
+//
+// 单个 server 连接失败只告警并跳过, 不让整次启动失败; path 为空直接返回 (nil, nil) ——
+// "没配 MCP"是常态而非错误。
 func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
 	if path == "" {
 		return nil, nil
@@ -5555,6 +5697,23 @@ func loadAssetCatalog(cwd, stateDir string) string {
 	return set.Describe(roots)
 }
 
+// runNestedAgent 以嵌套子代理的身份跑一次执行: 独立工具注册表 + 资产声明的档位/权限/工具面。
+//
+// 算法解读：
+//
+//	原理：子代理的工具面由**基线 + 收窄**两步决定 —— 资产声明了 tool-profile 就按档位
+//	      注册, 否则注册全量内置工具; 之后无论走哪条分支都补上 Agent/delegate_task/MCP/Skill
+//	      四个工具 (档位收窄不该切断递归派生能力)。
+//	关键不变量：资产声明只能**收窄**权限与工具面。权限档走 permissions.Widens 显式判宽,
+//	      更宽的声明被拒绝并记日志; 工具名单则照 ApplyConstraints 的两条规则 ——
+//	      黑名单取并集、白名单取**交集** (nestedCfg 从父引擎拷来, 整个覆盖等于把父会话的
+//	      白名单放宽成资产那份, 那是权限提升)。门槛用 HasTools (键写没写) 而不是
+//	      长度: `tools: []` 的语义是拒绝一切, 用长度当门槛会把它静默吃掉、退化成全放行。
+//	代价与边界：每次派生都新建一个 Registry 并重放全部注册, 深递归下开销可观;
+//	      模型确定化烘焙会清空 ExecutionModel/PlanClient, 子代理全程单模型。
+//	设计权衡：不做 ProfileNarrows 收窄判定 —— 这条路径的基线是全量内置工具集,
+//	      六个档位都在它的子集里, 该判定恒真因而无信息, 加一道恒真的闸只会制造
+//	      "看起来有防护"的假象。
 func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAgentFunc, agentPrompt string, opts agent.RunOptions) (string, error) {
 	nestedReg := tool.NewRegistry()
 	// P5 查表 (21.8.12): subagent_type 先按 agent 资产查表, 查到就用资产声明的档位。
@@ -5814,6 +5973,11 @@ func runNestedAgent(ctx context.Context, deps *engineDeps, runAgent agent.RunAge
 // Code Intelligence MCP Server
 // ============================================================================
 
+// codeintelMCPServerCmd 构造 codeintel-mcp-server 子命令: 以 stdio/http/sse 三种传输暴露代码图谱查询工具。
+//
+// 配置优先级 CLI > --config 的 codeIntel 段 > 默认值; 运行期只热更新 gitnexus 调优段
+// (堆上限/超时/并行度), 其余项 (repo/transport/addr/indexBaseDir) 都是启动期绑定的,
+// 改了只能重启 —— 日志里明说, 不做"看起来热加载了其实没生效"的假象。
 func codeintelMCPServerCmd() *cobra.Command {
 	var (
 		repoPath     string
@@ -5945,6 +6109,7 @@ func cliComplexityClassifier(client *api.Client) func(ctx context.Context, text 
 // noopSwarmLLM 离线占位 LLM, 仅供 swarm history 等只读子命令构造引擎用 (不会真正发起调用)。
 type noopSwarmLLM struct{}
 
+// SimpleComplete 恒返回错误 —— 占位实现, 只读子命令构造引擎时用, 一旦真被调用即暴露。
 func (noopSwarmLLM) SimpleComplete(context.Context, string, string) (string, error) {
 	return "", fmt.Errorf("offline: 只读模式不可调用 LLM")
 }

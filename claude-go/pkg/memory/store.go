@@ -431,6 +431,18 @@ func (fs *FactStore) DetectContradictions() []FactConnection {
 	return contradictions
 }
 
+// isContradiction 用关键词判定两条事实是否互相矛盾: 一方说"已修复/完成", 另一方说"仍存在/未修复"。
+//
+// 算法解读：
+//
+//	原理：不看语义只看标记词 —— 分别扫两串里有没有"已解决"族与"仍存在"族的词, 只要出现
+//	      "A 说好了、B 说没好"(任一方向) 就判矛盾。
+//	关键不变量：判定必须**对称** ((aFixed && bBroken) || (bFixed && aBroken)), 不能只查一个方向;
+//	      否则 (a,b) 与 (b,a) 会得出不同结论, 而调用方是双重循环按 (i,j) 顺序取的。
+//	代价与边界：纯子串匹配, 对否定、时态、同义词一概无感 ("没有问题" 含 "问题" 却含 "未修复" 里的
+//	      "未"…) —— 误报与漏报都真实存在; 且中英标记混在一张表里, 跨语言表达无法识别。
+//	设计权衡：不做 LLM/嵌入判定, 因为它在**每条事实对的 O(n²) 扫描**里被调用, 必须是纯 CPU 且
+//	      零成本; 它产出的是"值得人工/模型复核的候选连接", 不是终局结论。
 func isContradiction(a, b string) bool {
 	aLower := strings.ToLower(a)
 	bLower := strings.ToLower(b)
@@ -512,6 +524,18 @@ func FormatFactsForPrompt(facts []*MemoryFact) string {
 
 // --- 持久化 ---
 
+// PersistToDisk 把事实与连接落盘到 persistDir; 未标脏时直接返回。
+//
+// 算法解读：
+//
+//	原理：脏标记驱动的写回。持读锁快照出事实切片与连接切片的副本, **放锁之后**才做序列化与
+//	      文件写入, 最后重新加锁清脏。
+//	关键不变量：序列化/写盘必须在锁外进行 —— 持锁做磁盘 IO 会把所有并发读写记忆的 goroutine
+//	      一起卡在文件系统上; 而快照必须是副本, 否则写盘期间其他 goroutine 改动 map 会触发
+//	      并发读写 panic。
+//	代价与边界：整表全量重写 (无增量), 每次落盘的开销与记忆总量成正比; 写失败只记日志并返回,
+//	      **不清脏** —— 下次仍会重试, 代价是重复的全量序列化。
+//	设计权衡：清脏放在写盘成功之后, 而不是在快照时清 —— 先清脏再写, 一旦写失败这段改动就永久丢了。
 func (fs *FactStore) PersistToDisk() {
 	if fs.persistDir == "" {
 		return
@@ -544,11 +568,16 @@ func (fs *FactStore) PersistToDisk() {
 		_ = os.WriteFile(filepath.Join(fs.persistDir, "memory_connections.json"), connData, 0644)
 	}
 
+	// 清脏放在两次写盘都成功之后: 先清脏再写, 一旦写失败这段改动就永久丢了。
 	fs.mu.Lock()
 	fs.dirty = false
 	fs.mu.Unlock()
 }
 
+// loadFromDisk 从 persistDir 载入事实与连接; 已归档或留存度过低的事实不入内存。
+//
+// 注意: 加载时按 Retention() >= 0.02 过滤, 而**连接文件不做任何过滤** —— 指向被滤掉事实的连接
+// 会被原样载入, 变成悬空引用 (调用方按 FactID 查不到对应事实)。
 func (fs *FactStore) loadFromDisk() {
 	factsPath := filepath.Join(fs.persistDir, "memory_facts.json")
 	data, err := os.ReadFile(factsPath)

@@ -19,6 +19,7 @@ type PropertyCase struct {
 	CheckCode string `json:"check_code"` // Go code to verify property
 }
 
+// NewPropertyTest 创建 property-test 技能 (只读、可并发, 入参 repo_root + function)。
 // NewPropertyTest creates a new PropertyTest skill.
 func NewPropertyTest() *PropertyTest {
 	return &PropertyTest{
@@ -41,6 +42,11 @@ func NewPropertyTest() *PropertyTest {
 	}
 }
 
+// Execute 解析入参并返回空的属性测试用例列表。
+//
+// 注意：这是**桩实现** —— 它只回显 repo_root/function/package 并把 cases 固定为空,
+// 并不真的生成属性测试 (也不校验函数是否存在)。method 字段回 "skeleton" 就是为了让
+// 消费方能分辨"没生成"与"生成了 0 条", 不要把它当成已完成的能力。
 // Execute runs the property test generator (skeleton).
 func (p *PropertyTest) Execute(ctx context.Context, input json.RawMessage) (map[string]any, error) {
 	var in struct {

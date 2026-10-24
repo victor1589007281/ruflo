@@ -325,6 +325,8 @@ type ensembleFusedStats struct {
 
 var _ graph.NodeRunner = (*ensembleNodeRunner)(nil)
 
+// newEnsembleNodeRunner 构造合议节点 runner; diag 按视角数**预分配定长切片** ——
+// 下标即分片序, 写满不扩容 (setDiag 按下标写, 见其边界检查)。
 func newEnsembleNodeRunner(we *WorkflowExecutor, team *ProductionTeam, objective string, k ensembleGraphKind) *ensembleNodeRunner {
 	return &ensembleNodeRunner{we: we, team: team, objective: objective, k: k,
 		diag: make([]string, len(k.Lenses))}
@@ -403,6 +405,7 @@ func (r *ensembleNodeRunner) runReport(in graph.NodeInput) graph.NodeResult {
 		Output: fmt.Sprintf(r.k.OutputFormat, st.Samples, fused)}
 }
 
+// setDiag 按下标写诊断串; 下标越界静默丢弃 (分片序与预分配长度不符时不该 panic)。
 func (r *ensembleNodeRunner) setDiag(idx int, s string) {
 	r.mu.Lock()
 	if idx >= 0 && idx < len(r.diag) {
@@ -424,6 +427,7 @@ func (r *ensembleNodeRunner) diagLine() string {
 	return strings.Join(parts, " | ")
 }
 
+// fusedStats 取融合统计与其有效性标志; ok=false 表示 report 节点没跑到 (失败路径无统计可报)。
 func (r *ensembleNodeRunner) fusedStats() (ensembleFusedStats, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

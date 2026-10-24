@@ -222,6 +222,7 @@ type TaskRunner interface {
 // TaskRunnerFunc 函数形态的 TaskRunner。
 type TaskRunnerFunc func(ctx context.Context, rec TaskRecord) (string, error)
 
+// Run 以函数形态实现 TaskRunner, 直接调用底层函数。
 func (f TaskRunnerFunc) Run(ctx context.Context, rec TaskRecord) (string, error) {
 	return f(ctx, rec)
 }
@@ -437,6 +438,7 @@ func (s *FileQueueTaskService) SetRunner(r TaskRunner) {
 	s.mu.Unlock()
 }
 
+// currentRunner 取当前任务执行器 (持锁读, 运行中可被 SetRunner 替换)。
 func (s *FileQueueTaskService) currentRunner() TaskRunner {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -631,6 +633,7 @@ func (s *FileQueueTaskService) Wait(ctx context.Context, id string) (TaskResult,
 	}
 }
 
+// subscribe 为任务 id 注册一个唤醒通道 (缓冲 1), 等待方靠它被状态变化唤醒。
 func (s *FileQueueTaskService) subscribe(id string) chan struct{} {
 	ch := make(chan struct{}, 1)
 	s.mu.Lock()
@@ -639,6 +642,7 @@ func (s *FileQueueTaskService) subscribe(id string) chan struct{} {
 	return ch
 }
 
+// unsubscribe 从等待列表移除指定通道; 列表清空时连 key 一起删, 避免 waiters 无限增长。
 func (s *FileQueueTaskService) unsubscribe(id string, ch chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -924,11 +928,14 @@ func (s *FileQueueTaskService) clearActive(rec TaskRecord) {
 	}
 }
 
+// appendJournal 向 append-only 事件流追加一条状态迁移记录。
+// 写入失败只累加 writeErr 计数, 不中断迁移本身 (fail-open: 台账可事后重建, 迁移不能卡住)。
 func (s *FileQueueTaskService) appendJournal(id string, from, to TaskState, rev int64, note string) {
 	ev := TaskJournalEvent{
 		TS: time.Now().UnixMilli(), Task: id,
 		From: string(from), To: string(to), Revision: rev, Note: note,
 	}
+	// note 以 "conflict" 开头即标记为冲突事件 (与 TransitionCAS 的冲突路径约定)。
 	if strings.HasPrefix(note, "conflict") {
 		ev.Conflict = true
 	}
@@ -1163,6 +1170,7 @@ type ActionExecutor interface {
 // ActionExecutorFunc 函数形态的 ActionExecutor。
 type ActionExecutorFunc func(ctx context.Context, act ActionRecord) (string, error)
 
+// Execute 以函数形态实现 ActionExecutor, 直接调用底层函数。
 func (f ActionExecutorFunc) Execute(ctx context.Context, act ActionRecord) (string, error) {
 	return f(ctx, act)
 }
@@ -1189,6 +1197,7 @@ func (s *FileQueueTaskService) SetActionExecutor(x ActionExecutor) {
 	s.execMu.Unlock()
 }
 
+// currentExecutor 取当前动作执行器 (持读锁)。
 func (s *FileQueueTaskService) currentExecutor() ActionExecutor {
 	s.execMu.RLock()
 	defer s.execMu.RUnlock()
@@ -1503,6 +1512,7 @@ func (s *FileQueueTaskService) StartActionConsumer(ctx context.Context, interval
 	}()
 }
 
+// readAction 从磁盘读取一条动作记录 (读文件或解析失败均原样返回错误)。
 func readAction(path string) (ActionRecord, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -1537,6 +1547,7 @@ func writeActionAtomic(path string, act ActionRecord) error {
 	return os.Rename(name, path)
 }
 
+// firstNonEmptyStr 返回第一个去空白后非空的字符串; 全为空时返回空串。
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -1656,12 +1667,14 @@ func teamStatusOf(t *ProductionTeam) TeamStatus {
 	return t.Status
 }
 
+// teamObjectiveOf 持锁读团队目标。
 func teamObjectiveOf(t *ProductionTeam) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.Objective
 }
 
+// teamErrorOf 持锁读团队错误文本。
 func teamErrorOf(t *ProductionTeam) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()

@@ -147,6 +147,11 @@ func (r *runtimeRunner) Placement() *agent.Placement {
 	return &p
 }
 
+// Execute 把一次运行交给放置求解出的 worker 执行: 先 Pick 运行时, 再把 trace 身份
+// (RunID/NodeID/SessionID) 与工作区声明并进任务后下发。
+//
+// 注意：放置求解失败时 fail-closed 直接返回错误, 不做"随便找个能跑的"回落 —— 回落会让
+// 声明了 browser/gpu 的节点在没有该能力的机器上跑出假产出。
 func (r *runtimeRunner) Execute(ctx context.Context, userPrompt string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()

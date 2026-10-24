@@ -23,6 +23,7 @@ type Runner struct {
 	Sleep func(d time.Duration)
 }
 
+// now 返回当前时间, 优先用注入的时钟 (测试需要确定的顺序)。
 func (r *Runner) now() time.Time {
 	if r.Now != nil {
 		return r.Now()
@@ -30,6 +31,7 @@ func (r *Runner) now() time.Time {
 	return time.Now()
 }
 
+// logf 输出进度: 优先用注入的 Logf, 否则默认打到 stderr。
 func (r *Runner) logf(format string, args ...any) {
 	if r.Logf != nil {
 		r.Logf(format, args...)
@@ -38,6 +40,7 @@ func (r *Runner) logf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
+// sleep 优先用注入的 Sleep (测试里不真等), 否则真睡。
 func (r *Runner) sleep(d time.Duration) {
 	if r.Sleep != nil {
 		r.Sleep(d)
@@ -374,6 +377,7 @@ func (r Result) Report() string {
 	return sb.String()
 }
 
+// boolMark 把布尔值渲染成中文"是/否" (逐轮读数展示用)。
 func boolMark(b bool) string {
 	if b {
 		return "是"

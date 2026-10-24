@@ -162,6 +162,7 @@ func SplitStaticDynamic(system []string) (static, dynamic []string) {
 	return static, dynamic
 }
 
+// isDynamicMarker 判断一段 system prompt 是否带 turn-sensitive 标记 (需归入动态后缀)。
 func isDynamicMarker(lower string) bool {
 	markers := []string{
 		"<context_summary>",

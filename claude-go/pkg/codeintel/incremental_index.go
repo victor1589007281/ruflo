@@ -266,6 +266,7 @@ func (m *IncrementalIndexManager) ListDeltas() []DeltaIndex {
 // 持久化
 // ============================================================================
 
+// saveDelta 把增量索引写到 <root>/incremental/<repoID>/<branchName>/delta.json。
 func (m *IncrementalIndexManager) saveDelta(repoID, branchName string, delta *DeltaIndex) error {
 	path := m.deltaPath(repoID, branchName)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -278,6 +279,9 @@ func (m *IncrementalIndexManager) saveDelta(repoID, branchName string, delta *De
 	return os.WriteFile(path, data, 0644)
 }
 
+// loadAll 遍历 incremental 目录, 把每个 delta.json 读回内存表。
+//
+// 目录不存在 (首次启动) 视为正常; 单个仓库/分支/文件读失败逐个跳过, 不整体失败。
 func (m *IncrementalIndexManager) loadAll() error {
 	dir := filepath.Join(m.rootPath, incrementalDirName)
 	entries, err := os.ReadDir(dir)

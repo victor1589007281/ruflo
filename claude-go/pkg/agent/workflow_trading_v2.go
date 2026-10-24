@@ -155,6 +155,17 @@ func (we *WorkflowExecutor) executeTradingDebate(ctx context.Context, wf *Workfl
 
 // ── 研究辩论引擎 (Bull/Bear) ──
 
+// runResearchDebate 驱动 Bull/Bear 两方多轮对抗辩论, 最后由 Research Manager 汇总裁决。
+//
+// 算法解读：
+//
+//	原理：Bull、Bear 两方轮流发言 defaultDebateRounds 轮, 每轮把此前全部发言拼成
+//	      debateHistory 作为上下文喂给对方; 辩论结束后 Research Manager 一次性裁决。
+//	关键不变量：debateHistory 只追加**已完成**的发言 —— 失败轮的输出不进历史,
+//	      否则下一轮会引用一段根本不存在的内容, 辩论变成幻觉接龙。
+//	代价与边界：上下文随轮数线性增长, 每条发言经 truncateForDebate 截断到 2000 字符;
+//	      ctx 取消在每轮/每方前后检查, 中途取消跳出循环但已产出的 results 仍返回。
+//	设计权衡：轮次固定为常量而非按收敛判据自适应, 牺牲"该停就停", 换取可预测的 token 预算。
 func (we *WorkflowExecutor) runResearchDebate(ctx context.Context, objective, analysisReport string, team *ProductionTeam) ([]StageResult, error) {
 	var results []StageResult
 	var debateHistory []string
@@ -201,6 +212,17 @@ func (we *WorkflowExecutor) runResearchDebate(ctx context.Context, objective, an
 
 // ── 三方风险辩论引擎 ──
 
+// runRiskDebate 驱动激进/保守/中性三方多轮风险辩论, 最后由 Portfolio Manager 裁决。
+//
+// 算法解读：
+//
+//	原理：三方每轮各发言一次, 按 perspectives 的固定顺序串行执行, 共 defaultRiskRounds 轮;
+//	      每方都能看到此前所有轮次的 riskHistory, 最后 Portfolio Manager 汇总裁决。
+//	关键不变量：同一轮内后发言者能看到先发言者 —— 但先发言者看不到同轮后者, 保证每轮是
+//	      "对上一轮的回应"而非同轮内循环引用。
+//	代价与边界：每轮 3 次串行 LLM 调用 (共 3*defaultRiskRounds 次), 是整条链最贵的一段;
+//	      ctx 取消在每轮与每方前检查。
+//	设计权衡：发言顺序固定 (激进→保守→中性) 而非随机, 牺牲公平性换可复现的辩论轨迹。
 func (we *WorkflowExecutor) runRiskDebate(ctx context.Context, objective, traderPlan string, team *ProductionTeam) ([]StageResult, error) {
 	var results []StageResult
 	var riskHistory []string
@@ -249,6 +271,7 @@ func (we *WorkflowExecutor) runRiskDebate(ctx context.Context, objective, trader
 
 // ── 辅助函数 ──
 
+// buildAnalysisReport 把四份分析师产出按固定顺序拼成辩论用的汇总报告; 单份超 3000 字符即截断。
 func (we *WorkflowExecutor) buildAnalysisReport(prevResults map[string]string) string {
 	var sb strings.Builder
 	sections := []struct {
@@ -272,6 +295,7 @@ func (we *WorkflowExecutor) buildAnalysisReport(prevResults map[string]string) s
 	return sb.String()
 }
 
+// truncateForDebate 把一条辩论发言截断到 2000 字符, 防止历史越滚越长。
 func truncateForDebate(s string) string {
 	if len(s) > 2000 {
 		return s[:2000] + "\n...(已截断)"
@@ -292,6 +316,17 @@ type TradeSignal struct {
 	Timestamp  string  `json:"timestamp"`
 }
 
+// parseTradeSignal 从模型输出里解析结构化交易信号, 解析不出时逐项回退到保守默认值。
+//
+// 算法解读：
+//
+//	原理：先剥掉 markdown 代码块, 抠出最外层 {...} 做宽松 JSON 解析; 字段缺失或类型不符时
+//	      逐项回退 —— 评级用关键词扫描, 仓位在拿到非数值文本 (如 "Core Long") 时按评级套默认表。
+//	关键不变量：默认评级恒为 HOLD —— 解析不出任何信号时不能凭空给出 BUY/SELL;
+//	      confidence 同时接受 0.82 与 82 两种量纲 (>1 视为百分数, 除以 100)。
+//	代价与边界：用字符串扫描找花括号, 正文里若先出现无关 JSON 会取错片段;
+//	      仓位回退表是硬编码的经验值, 不代表真实风险偏好。
+//	设计权衡：宁可回退到保守默认也不报错, 因为下游是"发通知"而非"下单", 错一次比漏一次代价低。
 func parseTradeSignal(raw string) TradeSignal {
 	signal := TradeSignal{
 		Rating:    "HOLD",
@@ -380,6 +415,8 @@ func parseTradeSignal(raw string) TradeSignal {
 	return signal
 }
 
+// applyRiskGuardrails 对交易信号施加量化风控: 仓位上限 30%, 置信度低于 0.6 降级为 HOLD。
+// 触发的规则会把原因追加进 Rationale, 使降级对用户可见而不是静默改写。
 func applyRiskGuardrails(s TradeSignal) TradeSignal {
 	// 规则 1: 单一标的仓位不超过 30%
 	if s.Position > 30 {
@@ -388,6 +425,7 @@ func applyRiskGuardrails(s TradeSignal) TradeSignal {
 	}
 
 	// 规则 2: 置信度 < 0.6 → 降级为 HOLD
+	// 置信度为 0 (解析缺失) 时不降级 —— 无法判定就不动它, 与"解析失败默认 HOLD"是两回事。
 	if s.Confidence > 0 && s.Confidence < 0.6 {
 		s.Rating = "HOLD"
 		s.Rationale += " [风控: 置信度不足, 降级 HOLD]"
@@ -396,6 +434,7 @@ func applyRiskGuardrails(s TradeSignal) TradeSignal {
 	return s
 }
 
+// formatSignalNotification 把交易信号格式化成飞书通知文本 (按评级配图标, 缺失评级用灰点)。
 func formatSignalNotification(s TradeSignal, objective string) string {
 	icon := map[string]string{
 		"BUY": "🟢", "OVERWEIGHT": "🟢", "HOLD": "🟡",

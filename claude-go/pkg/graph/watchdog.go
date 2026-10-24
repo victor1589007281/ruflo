@@ -205,6 +205,7 @@ type progressClock struct {
 	events int64
 }
 
+// newProgressClock 建一个进展时钟, 起点为给定的 now。
 func newProgressClock(now time.Time) *progressClock {
 	return &progressClock{last: now}
 }

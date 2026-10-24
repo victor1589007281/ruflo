@@ -210,6 +210,8 @@ func (c *Collector) Summary(module string) *ModuleSummary {
 	}
 
 	for name, values := range grouped {
+		// 注意: 这里的 100 只是**读取时**的截断, buffer 本身从不淘汰 ——
+		// 长跑进程的内存里累积着进程启动以来的全部事件 (见 record 的 append)。
 		recent := values
 		if len(recent) > 100 {
 			recent = recent[len(recent)-100:]
@@ -311,9 +313,23 @@ func (c *Collector) AllSummaries() []*ModuleSummary {
 	return result
 }
 
+// Close 空实现 —— Collector 已不再持有文件句柄 (JSONL 每次追加即开关), 无需释放。
 // Close no-op (no longer manages file handles).
 func (c *Collector) Close() {}
 
+// computeStat 对一组取值算统计量: 计数/末值/均值/极值/标准差, 以及"前半 vs 后半"的趋势标签。
+//
+// 算法解读：
+//
+//	原理：两遍扫描 —— 第一遍求均值与极值, 第二遍求总体标准差 (除以 n, 不是 n-1);
+//	      趋势用后半均值相对前半均值的**相对变化**判定, 阈值 ±10%。
+//	关键不变量：趋势只在 n >= 4 时判定 —— 样本少于 4 个时前后半各不足 2 个点,
+//	      算出来的变化纯属噪声。分母用 |前半均值| + 1e-10 而不是绝对值差: 均值
+//	      接近 0 的指标 (如净值) 用绝对差会永远判成 stable。
+//	代价与边界：O(n) 两遍, n 已由调用方截到最近 100 条; 用的是**总体**标准差,
+//	      与样本标准差差一个 sqrt(n/(n-1)) 因子, 跨工具对比时要留意口径。
+//	设计权衡：不做线性回归取斜率 —— 那是更"正确"的趋势判据, 但对 100 个点的
+//	      短窗口而言, 前后半均值差更抗离群点, 也更容易向人解释。
 func computeStat(name string, values []float64) *MetricStat {
 	n := len(values)
 	if n == 0 {
@@ -366,6 +382,7 @@ func computeStat(name string, values []float64) *MetricStat {
 	}
 }
 
+// avg2 求算术平均; 空切片返回 0 (避免 0/0 得到 NaN 污染下游比较)。
 func avg2(values []float64) float64 {
 	if len(values) == 0 {
 		return 0
@@ -377,6 +394,18 @@ func avg2(values []float64) float64 {
 	return sum / float64(len(values))
 }
 
+// detectTrend 判定指标是否"显著下降"并生成告警文案; 未达阈值时返回空串。
+//
+// 算法解读：
+//
+//	原理：与 computeStat 同款的前后半均值比较, 但门槛更严 —— 样本数 >= 6 且
+//	      相对跌幅超过 20% 才报警 (computeStat 的标签是 10%, 只用于展示)。
+//	关键不变量：只有**下降**会告警, 上升返回空串 —— 这个函数是质量告警器而不是
+//	      趋势分类器, 名称叫 detectTrend 但语义是"detectDegradation"。
+//	代价与边界：样本 < 6 或前后半均值都为 0 时静默返回空串 (不报"无法判定");
+//	      因此"指标刚上线还没攒够数据"与"指标健康"在调用方看来完全一样。
+//	设计权衡：阈值硬编码 20%, 不从配置读 —— 告警口径要跨模块可比, 允许逐指标
+//	      配置会让"显著下降"在每张面板上有不同含义。
 func detectTrend(name string, values []float64) string {
 	if len(values) < 6 {
 		return ""

@@ -22,21 +22,31 @@ import (
 
 type CodeIntelInitTool struct{}
 
+// NewCodeIntelInitTool 构造仓库索引初始化工具。
 func NewCodeIntelInitTool() *CodeIntelInitTool { return &CodeIntelInitTool{} }
 
+// Name 返回工具名 "code_intel_init"。
 func (t *CodeIntelInitTool) Name() string                             { return "code_intel_init" }
+
+// IsReadOnly 建索引会写 .gitnexus / graphify 产物, 故非只读。
 func (t *CodeIntelInitTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+
+// IsConcurrencySafe 全量建索引会写同一份索引目录, 并发调用不安全。
 func (t *CodeIntelInitTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+
+// CheckPermissions 工具自身不设门槛, 权限交由上层策略裁决。
 func (t *CodeIntelInitTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Description 返回给模型看的英文说明 (索引全程走外部 CLI, 零 LLM token)。
 func (t *CodeIntelInitTool) Description() string {
 	return `Initialize code intelligence for a repository by running GitNexus analyze and Graphify update.
 Requires GitNexus (npm install -g gitnexus) and Graphify (pip3 install graphifyy) to be installed locally.
 This tool delegates all work to external CLI tools — zero LLM tokens consumed during indexing.`
 }
 
+// InputSchema 声明入参: 仅一个必填的 repo_path (绝对路径)。
 func (t *CodeIntelInitTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -47,6 +57,10 @@ func (t *CodeIntelInitTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// Call 解析 repo_path 后执行一次全量索引 (GitNexus analyze + Graphify update), 回显两侧结果与错误。
+//
+// 两个引擎的失败**不互相阻断**: 各自的结果与 error 分别落在 gitnexus_error / graphify_error,
+// 所以单边可用时工具仍然返回成功 —— 索引是"尽力而为"的增强, 不是硬依赖。
 func (t *CodeIntelInitTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		RepoPath string `json:"repo_path"`
@@ -79,20 +93,30 @@ func (t *CodeIntelInitTool) Call(ctx context.Context, input json.RawMessage, _ *
 
 type CodeIntelUpdateTool struct{}
 
+// NewCodeIntelUpdateTool 构造增量更新工具。
 func NewCodeIntelUpdateTool() *CodeIntelUpdateTool { return &CodeIntelUpdateTool{} }
 
+// Name 返回工具名 "code_intel_update"。
 func (t *CodeIntelUpdateTool) Name() string                             { return "code_intel_update" }
+
+// IsReadOnly 更新会重写索引产物, 故非只读。
 func (t *CodeIntelUpdateTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+
+// IsConcurrencySafe 与 init 共用索引目录, 并发不安全。
 func (t *CodeIntelUpdateTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+
+// CheckPermissions 工具自身不设门槛, 权限交由上层策略裁决。
 func (t *CodeIntelUpdateTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Description 返回给模型看的英文说明 (增量重建, 零 LLM token)。
 func (t *CodeIntelUpdateTool) Description() string {
 	return `Incrementally update the code intelligence index by re-running GitNexus analyze and Graphify update.
 Zero LLM tokens consumed.`
 }
 
+// InputSchema 声明入参: 仅一个必填的 repo_path。
 func (t *CodeIntelUpdateTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -103,6 +127,7 @@ func (t *CodeIntelUpdateTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// Call 解析 repo_path 后重跑一次索引, 语义与 init 相同 (区别只在返回的默认 status 文案)。
 func (t *CodeIntelUpdateTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		RepoPath string `json:"repo_path"`
@@ -135,19 +160,29 @@ func (t *CodeIntelUpdateTool) Call(ctx context.Context, input json.RawMessage, _
 
 type CodeIntelStatusTool struct{}
 
+// NewCodeIntelStatusTool 构造索引状态查询工具。
 func NewCodeIntelStatusTool() *CodeIntelStatusTool { return &CodeIntelStatusTool{} }
 
+// Name 返回工具名 "code_intel_status"。
 func (t *CodeIntelStatusTool) Name() string                             { return "code_intel_status" }
+
+// IsReadOnly 只读索引状态, 不落盘。
 func (t *CodeIntelStatusTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 纯查询, 无共享写入。
 func (t *CodeIntelStatusTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 工具自身不设门槛, 权限交由上层策略裁决。
 func (t *CodeIntelStatusTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Description 返回给模型看的英文说明。
 func (t *CodeIntelStatusTool) Description() string {
 	return `Get the status of code intelligence index from GitNexus and Graphify.`
 }
 
+// InputSchema 声明入参: 仅一个必填的 repo_path。
 func (t *CodeIntelStatusTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -158,6 +193,7 @@ func (t *CodeIntelStatusTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// Call 经 Engine.Status 取索引状态; 硬编码分支名 "main"。
 func (t *CodeIntelStatusTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		RepoPath string `json:"repo_path"`
@@ -181,15 +217,24 @@ func (t *CodeIntelStatusTool) Call(ctx context.Context, input json.RawMessage, _
 
 type CodeIntelQueryTool struct{}
 
+// NewCodeIntelQueryTool 构造图谱查询工具 (本套件的主力)。
 func NewCodeIntelQueryTool() *CodeIntelQueryTool { return &CodeIntelQueryTool{} }
 
+// Name 返回工具名 "code_intel_query"。
 func (t *CodeIntelQueryTool) Name() string                             { return "code_intel_query" }
+
+// IsReadOnly 查询只读。
 func (t *CodeIntelQueryTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 多个查询可并行发起 (引擎侧各自独立进程)。
 func (t *CodeIntelQueryTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 工具自身不设门槛, 权限交由上层策略裁决。
 func (t *CodeIntelQueryTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Description 返回给模型看的英文说明, 并列出 query_type 到两个引擎的分派关系。
 func (t *CodeIntelQueryTool) Description() string {
 	return `Query the code intelligence graph via GitNexus or Graphify CLI.
 Query types:
@@ -198,6 +243,7 @@ Query types:
 - query (generic) → routed to both engines`
 }
 
+// InputSchema 声明入参: repo_path + query_type 必填, 其余字段按查询类型可选。
 func (t *CodeIntelQueryTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -216,6 +262,18 @@ func (t *CodeIntelQueryTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// Call 按 query_type 分派到 GitNexus (结构) 或 Graphify (语义), 并把结果 JSON 回给模型。
+//
+// 算法解读：
+//
+//	原理：一张 switch 表把 10 种 query_type 映射到两个外部引擎的方法; 只有 "query" 与
+//		"explain" 走特例分支 —— 前者要同时问两边再合并, 后者只属于 Graphify。
+//	关键不变量：分支名 "main" 是写死的。两个引擎都不做分支隔离索引, 所以查询永远打在
+//		主分支的索引上; 换了分支不重新索引, 这里返回的就是过期结果。
+//	代价与边界：每次调用都 NewEngine 起一遍外部 CLI 子进程, 无进程内缓存, 单次开销在
+//		百毫秒量级; "query" 分支是两个 goroutine 并行发, 总耗时取两者较慢的一个。
+//	设计权衡：不做 query_type → 引擎的注册表, 而是硬编码 switch —— 换来的是新增查询类型
+//		时必须改代码 (编译器会提醒补分支), 而不是运行期静默路由到错误引擎。
 func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		RepoPath     string `json:"repo_path"`
@@ -298,21 +356,31 @@ func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ 
 
 type CodeIntelBranchTool struct{}
 
+// NewCodeIntelBranchTool 构造分支管理工具。
 func NewCodeIntelBranchTool() *CodeIntelBranchTool { return &CodeIntelBranchTool{} }
 
+// Name 返回工具名 "code_intel_branch"。
 func (t *CodeIntelBranchTool) Name() string                             { return "code_intel_branch" }
+
+// IsReadOnly switch / reindex 会改变仓库或索引状态, 故非只读。
 func (t *CodeIntelBranchTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+
+// IsConcurrencySafe 含切分支与重建索引等写动作, 并发不安全。
 func (t *CodeIntelBranchTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+
+// CheckPermissions 工具自身不设门槛, 权限交由上层策略裁决。
 func (t *CodeIntelBranchTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Description 返回给模型看的英文说明, 并点明两个引擎默认不做分支隔离索引。
 func (t *CodeIntelBranchTool) Description() string {
 	return `Branch management for code intelligence.
 GitNexus and Graphify do not maintain per-branch isolated indexes by default.
 This tool provides: switch (git checkout), detect-changes, and status.`
 }
 
+// InputSchema 声明入参: repo_path + action 必填, branch_name 仅 switch 用。
 func (t *CodeIntelBranchTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -325,6 +393,11 @@ func (t *CodeIntelBranchTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// Call 按 action 分派 switch / detect_changes / status / reindex 四类分支操作。
+//
+// 注意：switch 分支**只拼出 git checkout 命令行文本, 自己并不执行** —— 返回的是给调用方
+// 照着敲的字符串 (见 "git_checkout" 字段)。真正切分支要靠 bash 工具另跑一次, 这是刻意的
+// 分工: 代码智能工具不改工作区状态。
 func (t *CodeIntelBranchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		RepoPath   string `json:"repo_path"`
@@ -391,6 +464,7 @@ func (t *CodeIntelBranchTool) Call(ctx context.Context, input json.RawMessage, _
 // 辅助函数
 // ============================================================================
 
+// safeMap 把可能为 nil 的查询结果转成可直接进 JSON 的值; nil 保持 nil 而不是空对象。
 func safeMap(qr *codeintel.QueryResult) interface{} {
 	if qr == nil {
 		return nil
@@ -398,6 +472,7 @@ func safeMap(qr *codeintel.QueryResult) interface{} {
 	return qr.Results
 }
 
+// errString 把 error 转成字符串; nil 返回空串 (便于直接塞进结果 JSON)。
 func errString(err error) string {
 	if err == nil {
 		return ""

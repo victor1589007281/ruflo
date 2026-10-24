@@ -12,12 +12,14 @@ var activeMetrics = struct {
 	values map[string]float64
 }{values: make(map[string]float64)}
 
+// resetActiveMetrics 清空进程内的活跃计数表 (测试用)。
 func resetActiveMetrics() {
 	activeMetrics.Lock()
 	activeMetrics.values = make(map[string]float64)
 	activeMetrics.Unlock()
 }
 
+// recordProbeMetrics 记录一次运行时探测的延迟与可用性 (可用时另记一次"被选中")。
 func recordProbeMetrics(p ProbeResult) {
 	c := MetricsCollector()
 	if c == nil {
@@ -37,6 +39,7 @@ func recordProbeMetrics(p ProbeResult) {
 	}
 }
 
+// recordActiveMetric 按 runtime/purpose 维护活跃数增量并落一笔 gauge; 结果夹到非负。
 func recordActiveMetric(spec CommandSpec, runtime string, delta float64) {
 	c := MetricsCollector()
 	if c == nil {
@@ -60,6 +63,7 @@ func recordActiveMetric(spec CommandSpec, runtime string, delta float64) {
 	})
 }
 
+// recordRunMetrics 记录一次命令执行的结果、耗时、退出码与各类失败计数。
 func recordRunMetrics(spec CommandSpec, result *CommandResult) {
 	c := MetricsCollector()
 	if c == nil || result == nil {

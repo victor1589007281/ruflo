@@ -77,6 +77,11 @@ type EvolutionLoopConfig struct {
 	MaxRoundsPerHour int
 }
 
+// withDefaults 把零值参数填成默认值 (队列 64 / 去重窗口 2 分钟 / 空闲阈值 15 分钟 /
+// 每小时 60 轮)。
+//
+// 注意：MaxRoundsPerHour 与 IdleAfter 都只在**等于 0** 时取默认值, 负数则是"不限 / 关闭"
+// 的显式取值 (见 allowRound 与 run) —— 于是 0 与负数语义相反, 传参时别混用。
 func (c EvolutionLoopConfig) withDefaults() EvolutionLoopConfig {
 	if c.QueueSize <= 0 {
 		c.QueueSize = 64
@@ -208,6 +213,20 @@ func (l *EvolutionLoop) allowRound() bool {
 	return true
 }
 
+// run 消费协程主体: 串行处理学习请求, 并在队列静默 IdleAfter 之后自发一轮深度整理。
+//
+// 算法解读：
+//
+//	原理：单 goroutine 的 select 循环, 三个来源竞争 —— ctx 取消、Stop 信号、学习请求;
+//	      另有一个空闲定时器, 在"距上次活动超过 IdleAfter"时补一轮 LearnIdle。定时器每次
+//	      被唤醒后都 Reset, 所以它度量的是"距上次活动多久"而不是固定周期。
+//	关键不变量：消费必须**串行** —— 五个学习器共享 experiences.json / 记忆库等进程内状态,
+//	      并行跑等于自找数据竞争 (见文件头"设计取舍")。队列满时由 Submit 侧丢弃, 本循环
+//	      从不产生背压。
+//	代价与边界：IdleAfter<=0 时 idleC 恒为 nil, select 上 nil channel 永久阻塞, 该分支
+//	      永不触发 —— 空闲整理被彻底关闭 (这正是 <=0 的约定语义)。
+//	设计权衡：Reset 而不 drain —— Go 1.23+ 起 Timer.Stop 之后 channel 不再送值, 老式的
+//	      `if !Stop() { <-C }` 反而会死锁 (本仓已删除的 pkg/orchestrator 就栽在这上面)。
 func (l *EvolutionLoop) run(ctx context.Context) {
 	var idleTimer *time.Timer
 	var idleC <-chan time.Time

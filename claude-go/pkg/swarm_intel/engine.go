@@ -129,6 +129,21 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 }
 
 // Predict 执行完整的群体智能预测流水线 (M1-M7, M10 可靠性增强)。
+//
+// 算法解读：
+//
+//	原理：Decompose → Scout → Predict → (DTI/Boids 差异化) → Debate(门控) → Fuse →
+//	      拜占庭修剪 → 保形校准 的线性流水线, 每一步都把上一步的产出当作下一步的输入;
+//	      辩论与差异化是**可选回路**, 只在"预测过于一致"或"分歧过大"时才插入。
+//	关键不变量：每个阶段都必须用 tb.PhaseContext 派生的子 ctx, 且用完立即 cancel ——
+//	      分级预算靠"子预算之和不超过总预算"成立, 漏 cancel 会让父 ctx 的计时器堆积。
+//	      另一条: 门控跳过辩论时 debateRound 保持 0, 指标里的 DebateSkipped 才如实;
+//	      若在跳过分支里也自增轮数, "省了多少 token"就没法从指标里读出来。
+//	代价与边界：总预算默认 15 分钟 (曾为 5 分钟, 高延迟后端下单次 decompose 即超时);
+//	      任一必需阶段 (decompose/predict) 失败即整轮失败, 而 scout/debate 失败是
+//	      可降级的 (scout 退回占位证据, debate 失败保留上一轮预测)。
+//	设计权衡：辩论门控放在预测之后而非之前 —— 先看 N 路独立预测是否已经一致, 一致就
+//	      省掉整轮辩论 (约 6x token); 代价是一致但错误的预测不会被辩论纠偏。
 func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedPrediction, error) {
 	startTime := time.Now()
 	llmCallCount := 0
@@ -348,6 +363,7 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	return result, nil
 }
 
+// avgConfidence 各 Agent 自报置信度的算术平均; 无预测时返回 0 (用于指标口径)。
 func avgConfidence(predictions []AgentPrediction) float64 {
 	if len(predictions) == 0 {
 		return 0
@@ -757,6 +773,11 @@ func (e *Engine) formatResult(result *FusedPrediction) string {
 
 // --- Helpers ---
 
+// extractJSON 去 markdown 围栏后, 用花括号配平截出第一个 JSON 对象; 找不到 `{` 返回 "{}"。
+//
+// 注意: 花括号计数**不感知字符串**, 产出里出现 `"note": "}"` 这类内容会在字符串中间
+// 提前收尾, 截出一段非法 JSON。同仓的 graph.fuseExtractJSON 已用字符串感知扫描修掉
+// 这个坑, 本函数未同步 —— 只影响带花括号/引号内容的产出。
 func extractJSON(s string) string {
 	// 先去掉 markdown 代码块标记
 	cleaned := s
@@ -820,6 +841,7 @@ func extractAllJSON(s string) []string {
 	return results
 }
 
+// buildOutcomeTemplate 把结果列表拼成 `"结果": 0.0` 的 JSON 骨架, 塞进提示词给模型填数。
 func buildOutcomeTemplate(outcomes []string) string {
 	var parts []string
 	for _, o := range outcomes {
@@ -828,6 +850,21 @@ func buildOutcomeTemplate(outcomes []string) string {
 	return strings.Join(parts, ", ")
 }
 
+// parseAgentPrediction 把单个 Agent 的原文解析成 AgentPrediction, 并补齐缺失结果、归一化概率。
+//
+// 算法解读：
+//
+//	原理：模型产出不可信, 所以解析后要做三步**兜底整形**: ① 解析失败就退回一个"均匀分布 +
+//	      置信度 0.5"的默认预测 (绝不返回零值预测); ② 对结果集里**每个** outcome 补默认
+//	      概率 1/len(outcomes), 防止某一路漏了某个结果; ③ 按总和归一化, 使各概率之和为 1。
+//	关键不变量：归一化的分母 total 只累加 **outcomes 里的键**, 而下面的除法循环却遍历
+//	      pred.Predictions 的**全部**键 —— 模型多给的、不在 outcomes 里的键不会被计入
+//	      total 却仍会被缩放。注意: 因此概率和并不恒为 1; 当模型输出越界键时, 各键之和
+//	      会大于 1 (越界键把 sum 顶上去), 下游按分布处理时会得到偏大的结果。
+//	代价与边界：total<=0 (全零概率) 时跳过归一化, 此时概率和不等于 1 —— 后续融合按
+//	      分布处理时会得到退化结果。confidence 越界 (>1 或 <=0) 一律重置为 0.5。
+//	设计权衡：不做"结果集外键"的剔除与告警, 保持解析器极简; 代价是模型的越界输出静默
+//	      影响分布, 只能从最终置信度异常间接察觉。
 func parseAgentPrediction(raw, agentID, agentRole string, outcomes []string) AgentPrediction {
 	jsonStr := extractJSON(raw)
 
@@ -861,7 +898,7 @@ func parseAgentPrediction(raw, agentID, agentRole string, outcomes []string) Age
 		total += pred.Predictions[o]
 	}
 	if total > 0 {
-		for o := range pred.Predictions {
+		for o := range pred.Predictions { // 遍历全部键, 但 total 只含 outcomes 里的键
 			pred.Predictions[o] /= total
 		}
 	}

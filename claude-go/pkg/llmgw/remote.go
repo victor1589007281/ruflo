@@ -425,6 +425,7 @@ func effectiveTrace(ctx context.Context, t Trace) Trace {
 	return traceFromCtx(ctx)
 }
 
+// traceFromCtx 从 context 取 trace 四元组; 未注入时返回零值。
 func traceFromCtx(ctx context.Context) Trace { return api.TraceFromContext(ctx) }
 
 // setRemoteTraceHeaders 把 trace 四元组落成出站请求头。

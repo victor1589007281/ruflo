@@ -63,6 +63,7 @@ type ResilientCallerConfig struct {
 	DeadlineRetryBase time.Duration
 }
 
+// DefaultResilientConfig 返回弹性调用层的默认配置 (3 次重试、2s 起指数退避、180s 首 token、5 次熔断)。
 func DefaultResilientConfig() ResilientCallerConfig {
 	return ResilientCallerConfig{
 		MaxRetries:        3,
@@ -76,6 +77,7 @@ func DefaultResilientConfig() ResilientCallerConfig {
 	}
 }
 
+// NewResilientCaller 构造弹性调用层, 把各字段的零值补齐为默认值, 并保证 notify 非 nil。
 func NewResilientCaller(inner LLMClient, cfg ResilientCallerConfig) *ResilientCaller {
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 3
@@ -193,6 +195,14 @@ const (
 	errClassFatal                     // 400, 401, 403
 )
 
+// classifyError 把错误分成 可重试 / 过载 / 致命 三类, 决定退避基数与是否继续重试。
+//
+// 算法解读：
+//
+//	原理：只看错误文本里的状态码与关键词做分类, 不依赖具体 provider 的错误类型。
+//	关键不变量：default 落在**可重试**而不是致命 —— 分类器的职责是别把瞬态错误判成永久错误;
+//	      反过来 (把永久错误当瞬态) 的代价只是多几次退避重试, 由 maxRetries 兜底。
+//	代价与边界：纯字符串匹配, 依赖 provider 把状态码写进错误文本; 认不出时按可重试处理。
 func classifyError(err error) errClass {
 	msg := err.Error()
 	lower := strings.ToLower(msg)
@@ -216,6 +226,18 @@ func classifyError(err error) errClass {
 	}
 }
 
+// computeDelay 计算第 attempt 次重试的退避时长: 基数 × 2^attempt, 封顶 maxDelay, 再叠加 ±25% 抖动。
+//
+// 算法解读：
+//
+//	原理：指数退避 + 抖动。按错误类别选基数, 按尝试次数指数放大, 再叠加抖动打散同一时刻的
+//	      重试 —— 多个 worker 同时被 429 后会同步重试, 抖动是唯一的解药。
+//	关键不变量：退避恒有下界 (基数 > 0) 且恒有上界 —— 无上界会让第 7 次重试等到几分钟之后,
+//	      而那时上层早已超时。
+//	代价与边界：抖动用全局 rand, 并发下无需同步; 基数按类分档 (过载 3 倍、deadline 用专门
+//	      基数), 类别判错只会让退避偏长或偏短, 不影响正确性。
+//	设计权衡：没有引入退避表/令牌桶 —— 调用方 (swarm 各 agent) 的并发度本身不高, 简单公式
+//	      比"精确的速率控制"更容易解释和调参。
 func (rc *ResilientCaller) computeDelay(attempt int, class errClass, err error) time.Duration {
 	base := rc.baseDelay
 	if class == errClassOverload {
@@ -228,6 +250,7 @@ func (rc *ResilientCaller) computeDelay(attempt int, class errClass, err error) 
 			base = 10 * time.Second
 		}
 	}
+	// 先封顶再抖动: 抖动施加在封顶后的值上, 因此实际等待最长可达 maxDelay 的 1.25 倍。
 
 	delay := time.Duration(float64(base) * math.Pow(2, float64(attempt)))
 	if delay > rc.maxDelay {
@@ -239,6 +262,7 @@ func (rc *ResilientCaller) computeDelay(attempt int, class errClass, err error) 
 	return jitter
 }
 
+// isDeadlineError 判断错误文本里是否含 deadline/timeout 字样。
 func isDeadlineError(err error) bool {
 	if err == nil {
 		return false
@@ -249,6 +273,7 @@ func isDeadlineError(err error) bool {
 
 // --- 熔断器 ---
 
+// isCircuitOpen 读熔断器状态: 冷却期已过则半开复位, 允许一次试探; 否则继续拒绝。
 func (rc *ResilientCaller) isCircuitOpen() bool {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -266,6 +291,7 @@ func (rc *ResilientCaller) isCircuitOpen() bool {
 	return true
 }
 
+// recordSuccess 复位连续失败计数并关闭熔断器。
 func (rc *ResilientCaller) recordSuccess() {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -273,6 +299,7 @@ func (rc *ResilientCaller) recordSuccess() {
 	rc.circuitOpen = false
 }
 
+// recordFailure 累加连续失败; 达到阈值则打开熔断器并记 30s 冷却。
 func (rc *ResilientCaller) recordFailure() {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -284,6 +311,7 @@ func (rc *ResilientCaller) recordFailure() {
 	}
 }
 
+// truncateErr 把错误文本截到 80 字符以内, 供通知展示。
 func truncateErr(err error) string {
 	s := err.Error()
 	if len(s) > 80 {

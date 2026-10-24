@@ -104,6 +104,11 @@ func (e EvalScore) MeetsHardPassThreshold() bool {
 	return true
 }
 
+// feedbackContainsBlockingFailure 判断评估器反馈里是否出现了阻塞性字样 (未实现/占位/编译失败等)。
+//
+// 注意：这里是纯子串匹配, 不做词边界 —— "todo" 会命中 "todos", "stub" 会命中 "stubborn"。
+// 这个粗判是刻意的: 只在 reviewer 没给 pass 字段时兜底 (见 MeetsHardPassThreshold),
+// 宁可误判成阻塞也不要放过真正的空壳实现。
 func feedbackContainsBlockingFailure(feedback string) bool {
 	lower := strings.ToLower(feedback)
 	markers := []string{
@@ -132,6 +137,10 @@ func feedbackContainsBlockingFailure(feedback string) bool {
 	return false
 }
 
+// markEvalScorePassPresence 判断原始输出里是否显式出现过 pass 字段, 并据此置 PassSet。
+//
+// 区分「pass=false」与「压根没写 pass」: 前者是评审者的明确否决, 后者只是漏写,
+// MeetsHardPassThreshold 对这两种情况的处理完全不同。
 func markEvalScorePassPresence(score EvalScore, raw string) EvalScore {
 	lower := strings.ToLower(raw)
 	if strings.Contains(lower, `"pass"`) ||
@@ -695,6 +704,7 @@ func (e *RuleEngine) SetTargetPathPrefixes(prefixes []string) {
 	e.TargetPathPrefixes = append([]string(nil), prefixes...)
 }
 
+// normalizePathKey 规范化路径用于前缀比较: 去首尾空白、反斜杠转正斜杠、剥掉前导 "./"。
 func normalizePathKey(p string) string {
 	p = strings.TrimSpace(p)
 	p = strings.ReplaceAll(p, "\\", "/")
@@ -704,6 +714,11 @@ func normalizePathKey(p string) string {
 	return p
 }
 
+// pathMatchesAnyPrefix 判断路径是否落在任一允许前缀之下 (两侧都先规范化), 空前缀直接跳过。
+//
+// 注意：判定是纯字符串前缀, 不按目录边界对齐 —— 允许前缀 /work/a 同样会放行 /work/abc。
+// 第二个 HasPrefix(path, pre+"/") 分支被第一个分支完全覆盖, 属冗余写法。
+// 前缀由调用方保证以目录结尾 (如 /work/a/) 才能得到符合直觉的语义。
 func pathMatchesAnyPrefix(path string, prefixes []string) bool {
 	path = normalizePathKey(path)
 	for _, pre := range prefixes {
@@ -718,6 +733,18 @@ func pathMatchesAnyPrefix(path string, prefixes []string) bool {
 	return false
 }
 
+// checkNoDeleteNonTarget 规则: 删除类 Shell 命令涉及的每个路径都必须落在允许前缀内。
+//
+// 算法解读：
+//
+//	原理：只看 Bash/Shell 的 command 字符串, 先判它像不像删除命令, 再用启发式
+//	      抠出路径 token, 逐个比对允许前缀白名单。
+//	关键不变量：未配置 TargetPathPrefixes 时必须放行 —— 白名单为空表示「不启用该校验」,
+//	      而不是「禁止一切删除」; 反过来的话所有未配置场景都会被误杀。
+//	代价与边界：路径提取是启发式而非完整 shell 解析, 变量展开、$(...) 子命令、
+//	      以及 xargs/管道后段的删除命令都抓不到; 命令解析失败时一律放行 (fail-open)。
+//	设计权衡：选 fail-open 而不是 fail-closed, 因为这条规则是「护栏」不是「沙箱」——
+//	      真正的隔离应由文件系统权限承担, 规则引擎只挡明显的越界操作。
 func (e *RuleEngine) checkNoDeleteNonTarget(toolName string, input json.RawMessage) error {
 	e.mu.RLock()
 	prefixes := append([]string(nil), e.TargetPathPrefixes...)
@@ -752,6 +779,9 @@ func (e *RuleEngine) checkNoDeleteNonTarget(toolName string, input json.RawMessa
 	}
 }
 
+// looksLikeDeleteCommand 粗判命令是否属于删除类 (rm / unlink / shred / git rm / git clean)。
+//
+// 注意：入参必须已是小写 —— 本函数不做大小写归一, 直接传原始命令会漏判。
 func looksLikeDeleteCommand(cmd string) bool {
 	if strings.Contains(cmd, "rm ") || strings.HasPrefix(cmd, "rm\t") {
 		return true
@@ -808,6 +838,11 @@ func tokenizePathsFromShell(cmd string) []string {
 	return out
 }
 
+// checkNoCommitSecrets 规则: 拦截三类写入路径上的疑似密钥 —— Shell 命令、Write 内容、StrReplace 新串。
+//
+// 注意：git commit 的额外检查只看命令里是否同时出现 .env / id_rsa / credentials 字样,
+// 因此 `git add -A && git commit` 这种把敏感文件夹带进去的写法抓不到 —— 规则是启发式的,
+// 不能当作「提交里保证没有密钥」的证明。
 func checkNoCommitSecrets(toolName string, input json.RawMessage) error {
 	tn := strings.TrimSpace(toolName)
 	switch tn {
@@ -847,6 +882,10 @@ func checkNoCommitSecrets(toolName string, input json.RawMessage) error {
 	return nil
 }
 
+// detectSecretPatterns 按固定前缀/特征表扫描疑似密钥, 返回命中项的标签列表 (空表示未命中)。
+//
+// 注意：这是模式匹配而非熵检测, 且比较前统一转小写, 所以 "API_KEY=" 这类全大写写法也能命中;
+// 代价是任何形如 sk-ant- 的普通文本都会误报 —— 只用来拦明显的密钥, 不用于脱敏。
 func detectSecretPatterns(s string) []string {
 	var hits []string
 	lower := strings.ToLower(s)
@@ -872,6 +911,10 @@ func detectSecretPatterns(s string) []string {
 	return hits
 }
 
+// checkNoInfiniteLoopPatterns 规则: 拦截 Shell 里明显的死循环与 fork bomb 写法。
+//
+// 注意：只覆盖写死的几种字面模式 (while true / while : / for ((;;)) / fork bomb 等),
+// 换个写法 (如 `while [ 1 ]`) 就绕过去了 —— 它是防手滑的护栏, 不是防绕过的沙箱。
 func checkNoInfiniteLoopPatterns(toolName string, input json.RawMessage) error {
 	if tn := strings.TrimSpace(toolName); tn != "Bash" && tn != "Shell" {
 		return nil
@@ -1015,6 +1058,8 @@ type GlobalConsistencyReviewer struct {
 	store *ContractStore
 }
 
+// NewGlobalConsistencyReviewer 构造全局一致性评审器, 只持有一份契约库 (ContractStore) 的引用。
+//
 // NewGlobalConsistencyReviewer creates a new GlobalConsistencyReviewer.
 func NewGlobalConsistencyReviewer(store *ContractStore) *GlobalConsistencyReviewer {
 	return &GlobalConsistencyReviewer{store: store}
@@ -1043,7 +1088,24 @@ type GlobalConsistencyReport struct {
 	InterfaceChecks []InterfaceCheck   `json:"interface_checks"`
 }
 
+// Review 对本次改动做三项跨文件一致性检查, 汇总成报告返回。
+//
 // Review checks global consistency across all changed files.
+//
+// 算法解读：
+//
+//	原理：单文件评审看不出「改了接口但没改实现」这类问题, 所以这里以契约库
+//	      (ContractStore) 为全局事实源, 把改动文件投影到三类检查上:
+//	      ① 被改动的 interface 是否还有已知实现者;
+//	      ② 改动文件里的字段类型是否仍能在全库中找到定义;
+//	      ③ 同一 (接口, 实现者) 组合是否在多个文件里重复实现。
+//	关键不变量：检查只读契约库、只写报告 —— 不触碰被评审的代码, 也不修改 store;
+//	      任一检查发现问题都必须把 Passed 置 false, 否则调用方会把「有 issue 的报告」
+//	      当成通过 (第 ② 项在 append issue 之外单独置了 Passed, 第 ① 项则只追加 issue)。
+//	代价与边界：实现者集合来自契约库静态登记, 检查 ① 里那句「真实实现应比对方法签名」
+//	      并未落地 —— 接口改了签名而实现者仍在登记表中时, 这里照样判通过 (假阴性)。
+//	设计权衡：用「已知实现者为空」当失败信号, 实现简单且零解析成本;
+//	      代价是把「接口是新增的、还没有实现者」也一并报成问题, 需要人再判一次。
 func (r *GlobalConsistencyReviewer) Review(changedFiles []string) (*GlobalConsistencyReport, error) {
 	report := &GlobalConsistencyReport{
 		Passed:          true,
@@ -1190,6 +1252,7 @@ type HandoffResetError struct {
 	Artifact HandoffArtifact
 }
 
+// Error 返回固定的硬重置提示 —— 触发原因在 HandoffArtifact 里, 不在错误文本里重复。
 func (e *HandoffResetError) Error() string {
 	return "context manager: 建议硬重置（已超过 80% Token 预算）"
 }

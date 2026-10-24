@@ -58,6 +58,7 @@ func MemoryIndexModeEnabled(getenv func(string) string) bool {
 	}
 }
 
+// noEnv 是 getenv 的缺省实现: 宿主没注入读环境变量的能力时一律当"未设置"。
 func noEnv(string) string { return "" }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,9 @@ func noEnv(string) string { return "" }
 // ---------------------------------------------------------------------------
 
 // MemorySearchTool 按关键词检索记忆, 只回索引 (id + 标题 + 预览)。
+//
+// 注意：getenv 字段目前**既没有赋值点也没有读取点** —— 注入形态的开关实际由
+// 宿主在别处读 MemoryIndexModeEnabled 决定, 这个字段是接线的残留。
 type MemorySearchTool struct {
 	store  *memory.TieredStore
 	getenv func(string) string
@@ -75,12 +79,15 @@ func NewMemorySearchTool(store *memory.TieredStore) *MemorySearchTool {
 	return &MemorySearchTool{store: store}
 }
 
+// Name 返回工具名 memory_search。
 func (t *MemorySearchTool) Name() string { return "memory_search" }
 
+// Description 返回给模型看的说明: 强调"只回索引不回正文", 并指引用 memory_read 取全文。
 func (t *MemorySearchTool) Description() string {
 	return "Search long-term memory (past team runs and sessions) by keyword. Returns an index only — id, date, topics, one-line preview — not the full text; call memory_read with an id to get a hit's full text. The same memories may already appear as a <memory_index> block in your system prompt."
 }
 
+// InputSchema 返回输入 schema: query 可空 (空 = 列最近的记忆), limit 默认 8。
 func (t *MemorySearchTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -91,12 +98,31 @@ func (t *MemorySearchTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true: 检索不修改记忆库。
 func (t *MemorySearchTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 恒为 true: 检索无副作用, 可并发。
 func (t *MemorySearchTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 返回 nil: 不做工具级权限判定。
 func (t *MemorySearchTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 按关键词检索记忆, 只返回索引 (id + 标题 + 预览)。
+//
+// 算法解读：
+//
+//	原理：把"记忆库为空""检索无命中""命中若干条"三种结局**分开表述** ——
+//	      三者的正确下一步完全不同 (前者不该改写查询, 中者该换更通用的关键词,
+//	      后者该按 id 取正文)。
+//	关键不变量：索引的呈现必须与系统提示里 <memory_index> 块**用同一个格式化函数**
+//	      (memory.FormatIndexForPrompt) —— 两侧长得不一样, 模型就无法把搜到的
+//	      条目与提示里已有的条目对上, 会重复取同一条。
+//	代价与边界：store 为 nil 或返回零条时不报错, 而是返回一段说明文本;
+//	      因此"工具不可用"在 metrics 上表现为正常调用。
+//	设计权衡：只回索引不回正文 —— 一次检索的成本与一次读盘相差一个数量级,
+//	      合成一个工具会让"看一眼有哪些记忆"与"把正文拖进上下文"共用一个名字。
 func (t *MemorySearchTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		Query string `json:"query"`
@@ -139,8 +165,10 @@ func NewMemoryReadTool(store *memory.TieredStore) *MemoryReadTool {
 	return &MemoryReadTool{store: store}
 }
 
+// Name 返回工具名 memory_read。
 func (t *MemoryReadTool) Name() string { return "memory_read" }
 
+// Description 返回给模型看的说明: 按 id 取正文, 有未截断快照时优先给快照。
 func (t *MemoryReadTool) Description() string {
 	return "Read one long-term memory by its id (ids come from the <memory_index> block or from memory_search). Returns the full text — the untruncated original when one was stored, otherwise the summary."
 }
@@ -150,6 +178,7 @@ func (t *MemoryReadTool) Description() string {
 // 取 20000 (约 6K token): 足够一份团队报告的主体, 又不至于一次调用就把预算打满。
 const memoryReadMaxRunes = 20000
 
+// InputSchema 返回输入 schema: id 必填 (取自 <memory_index> 或 memory_search 的结果)。
 func (t *MemoryReadTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -160,12 +189,22 @@ func (t *MemoryReadTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true: 只读记忆库与快照文件。
 func (t *MemoryReadTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 恒为 true: 读取无副作用, 可并发。
 func (t *MemoryReadTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 返回 nil: 不做工具级权限判定。
 func (t *MemoryReadTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 按 id 取回一条记忆的正文: 有未截断快照时给原文, 否则回落摘要, 最后按字符数截断。
+//
+// 注意：id 查不到是**正常结局**而非故障 —— 记忆会被衰减淘汰 (Retention 低于阈值
+// 时 Prune), 所以文案明确给出"可能已被淘汰 + 用 memory_search 重新检索"的下一步,
+// 免得模型以为自己记错了 id 而反复重试同一个。
 func (t *MemoryReadTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		ID string `json:"id"`

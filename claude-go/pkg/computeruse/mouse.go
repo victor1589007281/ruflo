@@ -133,6 +133,7 @@ func linuxMouse(ctx context.Context, bin string, input MouseInput) error {
 	}
 }
 
+// runCmd 执行一条命令, 失败时把命令、参数与输出一并带进错误。
 func runCmd(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {

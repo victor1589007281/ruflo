@@ -35,14 +35,21 @@ type Meta struct {
 // Base provides common method implementations for ToolSkill.
 type Base struct{ meta Meta }
 
+// NewBase 由 Meta 构造一个 Base —— 供各 skill 内嵌, 提供 Name/Description/Schema 等默认实现。
 // NewBase creates a Base from Meta.
 func NewBase(meta Meta) Base { return Base{meta: meta} }
 
+// Name 返回技能名 (注册表的键)。
 func (b *Base) Name() string                  { return b.meta.Name }
+// Description 返回给模型看的技能描述。
 func (b *Base) Description() string           { return b.meta.Description }
+// InputSchema 返回输入 JSON Schema。
 func (b *Base) InputSchema() json.RawMessage  { return b.meta.InputSchema }
+// OutputSchema 返回输出 JSON Schema (可为空)。
 func (b *Base) OutputSchema() json.RawMessage { return b.meta.OutputSchema }
+// IsReadOnly 报告本技能是否只读 (不产生副作用)。
 func (b *Base) IsReadOnly() bool              { return b.meta.ReadOnly }
+// IsConcurrencySafe 报告本技能能否与其他调用并发执行。
 func (b *Base) IsConcurrencySafe() bool       { return b.meta.SafeConcurrent }
 
 // Registry stores registered ToolSkills.
@@ -50,20 +57,24 @@ type Registry struct {
 	skills map[string]ToolSkill
 }
 
+// NewRegistry 创建一个空的技能注册表。
 // NewRegistry creates an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{skills: make(map[string]ToolSkill)}
 }
 
+// Register 注册一个 ToolSkill; 同名会直接覆盖 (不做冲突检测)。
 // Register adds a ToolSkill. Existing skill with same name is overwritten.
 func (r *Registry) Register(ts ToolSkill) { r.skills[ts.Name()] = ts }
 
+// Get 按名取 ToolSkill, 第二个返回值为是否存在。
 // Get retrieves a ToolSkill by name.
 func (r *Registry) Get(name string) (ToolSkill, bool) {
 	ts, ok := r.skills[name]
 	return ts, ok
 }
 
+// All 返回全部已注册的 ToolSkill (map 遍历, 顺序不定)。
 // All returns all registered ToolSkills.
 func (r *Registry) All() []ToolSkill {
 	var list []ToolSkill
@@ -100,6 +111,7 @@ type SkillRequest struct {
 	Extra        map[string]any `json:"extra,omitempty"`
 }
 
+// WrapError 把 error 包成失败的 ExecutionResult (Success=false, Status="error")。
 // WrapError wraps an error into an ExecutionResult.
 func WrapError(err error) ExecutionResult {
 	return ExecutionResult{
@@ -109,6 +121,7 @@ func WrapError(err error) ExecutionResult {
 	}
 }
 
+// ToResult 把 (data, err) 对转成 ExecutionResult: err 非空走 WrapError, 否则记为 pass。
 // ToResult converts a (data, error) pair into an ExecutionResult.
 func ToResult(data map[string]any, err error) ExecutionResult {
 	if err != nil {
@@ -121,6 +134,7 @@ func ToResult(data map[string]any, err error) ExecutionResult {
 	}
 }
 
+// errStr 返回 err.Error(); err 为 nil 时返回空串。
 // errStr returns empty string for nil, otherwise err.Error().
 func errStr(err error) string {
 	if err == nil {

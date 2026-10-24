@@ -17,6 +17,7 @@ import (
 // ----------------------------------------------
 type StaticcheckJSONParser struct{}
 
+// Parse 解析 staticcheck -f json 的逐行 JSON 输出, 把检查项 code 映射成诊断类别。
 func (p *StaticcheckJSONParser) Parse(raw []byte, repoRoot string) (*AdapterResult, error) {
 	var result AdapterResult
 	lines := strings.Split(string(raw), "\n")
@@ -53,6 +54,7 @@ func (p *StaticcheckJSONParser) Parse(raw []byte, repoRoot string) (*AdapterResu
 	return &result, nil
 }
 
+// mapStaticcheckCode 按 staticcheck 检查项前缀归类: SA=bug, S1/ST=style, QF=suggestion, 其余 warning。
 func mapStaticcheckCode(code string) string {
 	prefix := ""
 	if len(code) >= 2 {
@@ -80,6 +82,7 @@ type GoBuildTextParser struct{}
 
 var goBuildPattern = regexp.MustCompile(`^(.+?):(\d+):(?:(\d+):)?\s*(.+)$`)
 
+// Parse 用正则解析 "file:line:col: message" 形态的 go build / go vet 文本输出。
 func (p *GoBuildTextParser) Parse(raw []byte, repoRoot string) (*AdapterResult, error) {
 	var result AdapterResult
 	lines := strings.Split(string(raw), "\n")
@@ -102,6 +105,7 @@ func (p *GoBuildTextParser) Parse(raw []byte, repoRoot string) (*AdapterResult, 
 	return &result, nil
 }
 
+// classifyGoError 按错误文本里的关键词给 Go 编译错误分类。
 func classifyGoError(msg string) string {
 	switch {
 	case strings.Contains(msg, "undefined"):
@@ -127,6 +131,7 @@ func classifyGoError(msg string) string {
 // ----------------------------------------------
 type GolangCILintParser struct{}
 
+// Parse 解析 golangci-lint --out-format=json 的整体 JSON 输出; 解析失败直接返回错误, 不降级。
 func (p *GolangCILintParser) Parse(raw []byte, repoRoot string) (*AdapterResult, error) {
 	var payload struct {
 		Issues []struct {
@@ -160,6 +165,7 @@ func (p *GolangCILintParser) Parse(raw []byte, repoRoot string) (*AdapterResult,
 	return &result, nil
 }
 
+// mapLinterName 把 linter 名映射成诊断类别: errcheck/govet/staticcheck=bug, 其余 style。
 func mapLinterName(name string) string {
 	switch name {
 	case "errcheck", "govet", "staticcheck":
@@ -176,6 +182,7 @@ func mapLinterName(name string) string {
 // ----------------------------------------------
 type GoImportsParser struct{}
 
+// Parse 解析 goimports -l 的文件名列表, 每个文件名产出一条 import/格式告警。
 func (p *GoImportsParser) Parse(raw []byte, repoRoot string) (*AdapterResult, error) {
 	// goimports -l outputs unformatted file names
 	var result AdapterResult
@@ -203,6 +210,7 @@ func (p *GoImportsParser) Parse(raw []byte, repoRoot string) (*AdapterResult, er
 // ----------------------------------------------
 type GoVetParser struct{}
 
+// Parse 复用 go build 文本解析器 (go vet 的输出同格式)。
 func (p *GoVetParser) Parse(raw []byte, repoRoot string) (*AdapterResult, error) {
 	// go vet outputs text in the same format as go build
 	return (&GoBuildTextParser{}).Parse(raw, repoRoot)

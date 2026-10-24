@@ -49,13 +49,16 @@ type bashInput struct {
 
 type BashTool struct{}
 
+// NewBashTool 构造 Bash 工具实例 (无状态, 可安全共享)。
 func NewBashTool() *BashTool { return &BashTool{} }
 
+// Name 返回工具对外名 (常量 BashToolName, 见其注释里的改名由来)。
 func (t *BashTool) Name() string { return BashToolName }
 
 // Aliases 保留 2026-09-13 之前的旧名, 供治理配置与历史会话状态继续按 "Shell" 引用它。
 func (t *BashTool) Aliases() []string { return []string{"Shell"} }
 
+// Description 返回给模型看的工具说明: 优先用专用工具、禁止交互式命令、输出上限 30000 字符。
 func (t *BashTool) Description() string {
 	// 描述里不用反引号 —— 整个字符串是 raw literal, 反引号会把它截断。
 	return `Executes a given command in a shell session.
@@ -65,6 +68,7 @@ func (t *BashTool) Description() string {
 - The tool blocks up to "block_until_ms" (default 30000) and returns what has been collected so far; output beyond 30000 characters is truncated with a note.`
 }
 
+// InputSchema 返回入参 JSON Schema (command 必填, 其余可选)。
 func (t *BashTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -78,6 +82,7 @@ func (t *BashTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// parseBashCommand 从原始入参里抠出 command 字段; 空入参或解析失败一律返回空串。
 func parseBashCommand(input json.RawMessage) string {
 	if len(input) == 0 {
 		return ""
@@ -89,10 +94,12 @@ func parseBashCommand(input json.RawMessage) string {
 	return in.Command
 }
 
+// IsReadOnly 只读判定的对外形状: 命令整条被判为只读时才报只读。
 func (t *BashTool) IsReadOnly(input json.RawMessage) bool {
 	return isReadOnlyCommand(parseBashCommand(input))
 }
 
+// IsConcurrencySafe 与 IsReadOnly 同判据 —— 只有被证明只读的命令才允许并发执行。
 func (t *BashTool) IsConcurrencySafe(input json.RawMessage) bool {
 	return isReadOnlyCommand(parseBashCommand(input))
 }
@@ -142,6 +149,8 @@ func isReadOnlyCommand(cmd string) bool {
 	return isReadOnlySingleCommand(cmd)
 }
 
+// isReadOnlySingleCommand 判断单条命令 (无管道、无连接符) 是否只读: 取 basename 比对
+// 白名单, 并额外放行 git status/log/diff 三个只读子命令。
 func isReadOnlySingleCommand(cmd string) bool {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
@@ -164,6 +173,7 @@ func isReadOnlySingleCommand(cmd string) bool {
 	return false
 }
 
+// truncateToMaxRunes 按**字符**数 (非字节) 截断, 超限时追加截断提示; maxRunes<=0 表示不截断。
 func truncateToMaxRunes(s string, maxRunes int) string {
 	if maxRunes <= 0 {
 		return s
@@ -177,17 +187,32 @@ func truncateToMaxRunes(s string, maxRunes int) string {
 
 // Call 执行 shell 命令。
 // 对应 TS: BashTool.ts 中的 call()
+//
+// 算法解读：
+//
+//	原理：把命令整条交给 sandbox.RunProcessGuarded 在独立进程组里跑, 由它统一施加
+//	      超时、输出上限与整组回收; 本函数只做入参解析、失败分类与回给模型的文案拼装。
+//	关键不变量：失败分类必须**先于** exitCode 判断 —— FailureSetup (logdir/pipe/Start
+//	      失败) 时 ExitCode 保持零值 0, 若先判 exitCode<0 会把它漏进成功路径, 报出
+//	      "Exit code: 0 (no output)" 这种假成功 (见下方注释)。
+//	代价与边界：回给模型的文本按 rune 截断到 30000 字符; 截断只作用于文案, 不影响
+//	      退出码判定, 也不影响 sandbox 侧的完整日志 (LogDir)。
+//	设计权衡：超时同时挂在 ctx 与 ResourceLimits 两处 —— ctx 让本函数及时返回并走
+//	      超时文案分支, ResourceLimits.Timeout 才是真正 SIGKILL 整个进程组的那道闸,
+//	      只挂 ctx 会留下孤儿进程。
 func (t *BashTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in bashInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("输入解析错误: %v", err), IsError: true}, nil
 	}
 
+	// 工作目录: 默认用调用方给的 cwd, 显式指定时才相对它展开 (不跨调用持久化)。
 	cwd := tctx.Cwd
 	if in.WorkingDirectory != "" {
 		cwd = expandPath(in.WorkingDirectory, tctx.Cwd)
 	}
 
+	// block_until_ms 只放宽等待上限, 不给"无上限"留口子 —— 不传就是默认 30s。
 	timeout := defaultBashTimeout
 	if in.BlockUntilMs > 0 {
 		timeout = time.Duration(in.BlockUntilMs) * time.Millisecond
@@ -202,6 +227,7 @@ func (t *BashTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 		PreviewMaxBytes: 192 * 1024,
 		LogMaxBytes:     16 * 1024 * 1024,
 	})
+	// exitCode 预置 -1 而不是 0: 用来区分"进程没起来"(result 为 nil / 无退出码) 与"退出了但码非零"。
 	text := ""
 	exitCode := -1
 	if result != nil {
@@ -239,6 +265,7 @@ func (t *BashTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 		}, nil
 	}
 
+	// 只在成功路径补 "(no output)": 失败路径的文案里已经带了退出码/错误, 再补反而淹没原因。
 	if text == "" {
 		text = "(no output)"
 	}

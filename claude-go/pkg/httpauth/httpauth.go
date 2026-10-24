@@ -51,6 +51,7 @@ type Config struct {
 	ExemptPaths []string
 }
 
+// prefixes 返回生效的保护前缀: 未配置时用 DefaultProtectPrefixes。
 func (c Config) prefixes() []string {
 	if c.ProtectPrefixes == nil {
 		return DefaultProtectPrefixes
@@ -58,6 +59,7 @@ func (c Config) prefixes() []string {
 	return c.ProtectPrefixes
 }
 
+// exempts 返回生效的豁免路径 (精确匹配): 未配置时用 DefaultExemptPaths。
 func (c Config) exempts() []string {
 	if c.ExemptPaths == nil {
 		return DefaultExemptPaths
@@ -125,6 +127,7 @@ func Middleware(cfg Config) func(http.Handler) http.Handler {
 	}
 }
 
+// writeUnauthorized 写 401 响应, 形态与 pkg/wiki 原 auth() 保持一致, 避免下游解析逻辑分叉。
 func writeUnauthorized(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)

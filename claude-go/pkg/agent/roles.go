@@ -380,10 +380,12 @@ type NameTakenError struct {
 	Source string // 撞上的是内置还是另一个自定义角色 (供报错说清楚)
 }
 
+// Error 渲染重名拒绝的原因 (带上撞上的名字与它来自内置还是另一个自定义角色)。
 func (e *NameTakenError) Error() string {
 	return fmt.Sprintf("角色名 %q 已被%s占用; 自定义角色不得覆盖它 (要改内置, 请另起一个名字)", e.Name, e.Source)
 }
 
+// Unwrap 让 errors.Is(err, ErrRoleNameTaken) 成立。
 func (e *NameTakenError) Unwrap() error { return ErrRoleNameTaken }
 
 // RegisterCustom 注册用户自定义角色。**重名一律拒绝**, 不覆盖 (21.8.12 P3 负 3)。
@@ -490,6 +492,7 @@ func (rr *RoleRegistry) Names() []string {
 	return out
 }
 
+// ResolveRoleName 返回实际会被使用的角色名 (可能已被项目画像特化到语言专用角色)。
 // ResolveRoleName returns the specialized role name that will actually be used.
 func (rr *RoleRegistry) ResolveRoleName(roleName string) string {
 	rr.mu.RLock()
@@ -507,6 +510,17 @@ func (rr *RoleRegistry) RecommendedSkills(roleName string) []string {
 	return out
 }
 
+// RoleSkills 返回该角色的内置技能与项目推断技能的合并去重结果, 并按 maxRoleBuiltinSkills 截断。
+//
+// 算法解读：
+//
+//	原理：回答"这个角色最终会拿到哪些技能名" —— 合并内置技能与按项目画像推断出的技能,
+//	      去重后截断。
+//	关键不变量：先按**解析后**的角色名取技能 (特化角色如 go-coder 拿到的是它自己的技能集),
+//	      再截断。顺序反了会让特化角色的技能被基础角色的长名单挤掉。
+//	代价与边界：截断是静默的 (见 limitRoleSkillNames); 想回答"为什么这个技能没被注入",
+//	      得看 MergedPrompt 里选择器路径打的那行日志。
+//
 // RoleSkills returns builtin and inferred skills for a role.
 func (rr *RoleRegistry) RoleSkills(roleName string) []string {
 	rr.mu.RLock()
@@ -533,6 +547,7 @@ type RoleInfo struct {
 	Tags               []string
 }
 
+// limitRoleSkillNames 按条数上限截断技能名 (limit <= 0 表示不限)。
 func limitRoleSkillNames(names []string, limit int) []string {
 	if limit <= 0 || len(names) <= limit {
 		return names
@@ -540,6 +555,7 @@ func limitRoleSkillNames(names []string, limit int) []string {
 	return names[:limit]
 }
 
+// DescribeRole 汇总一个角色的请求名/解析名/各类技能与注入字符数, 供面板与自检读取。
 func (rr *RoleRegistry) DescribeRole(roleName string) *RoleInfo {
 	rr.mu.RLock()
 	defer rr.mu.RUnlock()
@@ -562,6 +578,15 @@ func (rr *RoleRegistry) DescribeRole(roleName string) *RoleInfo {
 	}
 }
 
+// estimateInjectedSkillCharsLocked 估算该角色注入 prompt 的技能字符量 (文件型 + 内置型各按其上限累加)。
+//
+// 算法解读：
+//
+//	原理：为面板与自检回答"这个角色每轮要重发多少字符的技能文本"。
+//	关键不变量：按**注入时的实际上限**累加 (文件型 maxRoleFileSkillChars, 内置型条数 ×
+//	      maxRoleBuiltinSkillChars), 而不是按文件原始大小 —— 注入本身就会截断, 按原文估算
+//	      会系统性高估。
+//	代价与边界：为了拿长度必须真的把文件型技能读一遍, 读失败即跳过, 所以它是估算而非精确值。
 func (rr *RoleRegistry) estimateInjectedSkillCharsLocked(role *RoleDef, injected []string) int {
 	if role == nil {
 		return 0
@@ -602,6 +627,7 @@ func (rr *RoleRegistry) estimateInjectedSkillCharsLocked(role *RoleDef, injected
 	return total
 }
 
+// initRecommendedSkills 加载内置技能库, 并按项目画像为每个已注册角色预计算推荐技能。
 func (rr *RoleRegistry) initRecommendedSkills() {
 	reg := skills.NewRegistry()
 	if reg.LoadDefaults(rr.cwd) == 0 {
@@ -619,6 +645,7 @@ func (rr *RoleRegistry) initRecommendedSkills() {
 	rr.recommendedByRole = roleSkills
 }
 
+// resolveRoleNameLocked 解析角色名: 项目画像的特化名存在则用它, 否则回退原名。
 func (rr *RoleRegistry) resolveRoleNameLocked(roleName string) string {
 	if variant := specializationForProfile(rr.profile, roleName); variant != "" {
 		if _, ok := rr.roles[variant]; ok {
@@ -631,6 +658,16 @@ func (rr *RoleRegistry) resolveRoleNameLocked(roleName string) string {
 	return roleName
 }
 
+// specializationForProfile 按项目画像把 coder/reviewer/tester 特化为语言专用角色名。
+//
+// 算法解读：
+//
+//	原理：项目只涉及一种语言时, 把通用角色名特化成语言专用角色名 (coder → go-coder),
+//	      让提示词与技能都更贴合; 只有 coder/reviewer/tester 三个基础角色参与特化。
+//	关键不变量：语言数必须**恰好为 1** —— 多语言项目里挑任何一种都是错的 (会系统性偏向
+//	      某一侧), 所以宁可返回空串走通用角色。Django 是唯一的显式例外, 且优先于语言计数。
+//	代价与边界：特化名对应的角色可能压根没注册 (registerLanguageSpecialists 在基础角色缺失
+//	      时会静默跳过), 因此调用方 (resolveRoleNameLocked) 必须再查一次注册表。
 func specializationForProfile(profile skills.ProjectProfile, roleName string) string {
 	switch roleName {
 	case "coder", "reviewer", "tester":
@@ -678,6 +715,7 @@ func specializationForProfile(profile skills.ProjectProfile, roleName string) st
 	return ""
 }
 
+// baseRoleFor 从 "go-coder" 这类特化名还原出基础角色名; 认不出则原样返回。
 func baseRoleFor(name string) string {
 	switch {
 	case strings.HasSuffix(name, "-coder"):
@@ -723,6 +761,7 @@ func roleDirsFor(src RoleSource) []string {
 	}
 }
 
+// uniqueRoleStrings 保序去重并丢弃空串。
 func uniqueRoleStrings(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))
@@ -741,6 +780,7 @@ func uniqueRoleStrings(values []string) []string {
 
 // --- 内置角色定义 ---
 
+// registerBuiltins 注册全部内置角色 (workflow / standalone / market-radar 专用等)。
 func (rr *RoleRegistry) registerBuiltins() {
 	// ========== Workflow 角色 ==========
 
@@ -2010,9 +2050,20 @@ HTML 原型输出规范:
 	}
 }
 
+// registerLanguageSpecialists 按基础角色派生语言专用角色 (go-/python-/… -coder|-reviewer|-tester)。
+//
+// 算法解读：
+//
+//	原理：用闭包按基础角色批量派生语言专用角色, 只替换提示词 (追加一段专项要求) 与技能清单,
+//	      其余字段全部继承。
+//	关键不变量：基础角色必须已在注册表里; 缺失时**静默跳过**该特化角色 —— 于是 "go-coder
+//	      不存在" 既可能是没派生, 也可能是 coder 没注册, 两者同形。
+//	代价与边界：派生角色的 Skills 是基础角色 Skills 的**拷贝**, 之后改基础角色不会传导到已
+//	      派生的特化角色。
 func (rr *RoleRegistry) registerLanguageSpecialists() {
 	register := func(name, baseRole, desc, extra string, builtinSkills ...string) {
 		base := rr.roles[baseRole]
+		// 基础角色缺失时静默跳过: 于是 "go-coder 不存在" 既可能是没派生, 也可能是 coder 没注册, 两者同形。
 		if base == nil {
 			return
 		}

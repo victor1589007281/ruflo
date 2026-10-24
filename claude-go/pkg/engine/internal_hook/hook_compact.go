@@ -89,8 +89,11 @@ func NewMicroCompactHook(cwd string) *MicroCompactHook {
 	return &MicroCompactHook{refStore: compact.NewToolResultRefStoreForCwd(cwd)}
 }
 
+// Name 返回 hook 名 "micro_compact"。
 func (h *MicroCompactHook) Name() string  { return "micro_compact" }
+// Priority 返回执行优先级 20: 同一阶段内数值越小越先执行。
 func (h *MicroCompactHook) Priority() int { return 20 }
+// Phases 声明本 hook 只挂在 PhasePreCompact 阶段。
 func (h *MicroCompactHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreCompact}
 }
@@ -248,8 +251,11 @@ func NewAutoCompactHook(
 	}
 }
 
+// Name 返回 hook 名 "auto_compact"。
 func (h *AutoCompactHook) Name() string  { return "auto_compact" }
+// Priority 返回执行优先级 10(高于 micro_compact, 先于它执行)。
 func (h *AutoCompactHook) Priority() int { return 10 }
+// Phases 声明本 hook 只挂在 PhasePreCompact 阶段。
 func (h *AutoCompactHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreCompact}
 }
@@ -403,8 +409,11 @@ func NewBudgetDegradeHook(budget *TokenBudgetManager, hookRunner *hooks.Runner, 
 	return &BudgetDegradeHook{budget: budget, hookRunner: hookRunner, metrics: metrics}
 }
 
+// Name 返回 hook 名 "budget_degrade"。
 func (h *BudgetDegradeHook) Name() string  { return "budget_degrade" }
+// Priority 返回执行优先级 30(排在 micro/auto 之后兜底)。
 func (h *BudgetDegradeHook) Priority() int { return 30 }
+// Phases 声明本 hook 只挂在 PhasePreCompact 阶段。
 func (h *BudgetDegradeHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreCompact}
 }

@@ -242,7 +242,12 @@ func (vg *ValidationGate) AddAutoFixRule(rule string) {
 	vg.autoFix[rule] = true
 }
 
+// HasPerformanceRegression 判断性能闸门是否报了回归。
+//
 // HasPerformanceRegression returns true if the performance gate detected regressions.
+//
+// 注意：证据在 Evidence 里是 interface{} 套 map[string]any, 逐层断言失败一律当「无回归」——
+// 也就是说性能闸门没跑、证据写错类型、字段名写错, 从外部看到的都是同一个 false。
 func (gr *GateResult) HasPerformanceRegression() bool {
 	if gr == nil || gr.Evidence == nil {
 		return false
@@ -408,7 +413,22 @@ func countDiffLines(filePath string) (additions, deletions int) {
 	return 0, 0
 }
 
+// CheckConstitution 按「宪法」条款逐行扫描: 弱加密 import、未加锁的裸 map 访问、业务代码里的 context.Background。
+//
 // CheckConstitution scans code for constitutional violations (hard-coded crypto/md5, bare map access, context.Background in business code).
+//
+// 算法解读：
+//
+//	原理：四条正则做行级匹配, 命中即记一条违规 (带文件与行号); 两个条款还带额外的
+//	      抑制条件 —— 裸 map 访问只在「整个文件里没有任何 sync 原语」时才报,
+//	      硬编码 Background 只对非 _test.go / 非 main.go 报。
+//	关键不变量：读不动的文件必须跳过而不是中断 —— 否则一个不存在或权限不足的路径
+//	      就会让整轮宪法检查返回空, 看起来像「全项目合规」。
+//	代价与边界：纯正则 + 整文件粒度的抑制条件, 误报与漏报都很容易 ——
+//	      同文件任意一处 sync.Mutex 就会让所有裸 map 访问豁免;
+//	      正则也不认注释与字符串字面量, 注释里写一句 "crypto/md5" 同样会报违规。
+//	设计权衡：宁可误报也不要漏报 (违规只是进报告, 不直接阻断), 因此放弃 AST 级分析
+//	      换取零依赖与零解析成本。
 func (vg *ValidationGate) CheckConstitution(files []string) ([]ConstitutionViolation, error) {
 	var violations []ConstitutionViolation
 

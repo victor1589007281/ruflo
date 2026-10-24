@@ -16,6 +16,7 @@ const (
 	ToolProfileAdmin    ToolProfile = "admin"
 )
 
+// NormalizeToolProfile 把未知档位归一为 chat, 保证返回值总是合法档位。
 // NormalizeToolProfile returns a safe profile default.
 func NormalizeToolProfile(profile ToolProfile) ToolProfile {
 	switch profile {
@@ -44,6 +45,18 @@ func ValidToolProfile(profile ToolProfile) bool {
 	}
 }
 
+// RegisterProfileToolsWithStore 按档位注册受限的内置工具集; admin 刻意保留历史的全量行为。
+//
+// 算法解读：
+//
+//	原理：档位 → 工具集的映射。窄档位是对 prompt schema 膨胀的第一道防线: 每轮都要重发全部
+//	      工具 schema, 工具越多越贵, 也越容易让模型选错。
+//	关键不变量：未识别的档位经 NormalizeToolProfile 归一为 chat, 而 chat 是**很窄**的档位;
+//	      因此"拼错的档位"不会意外放开写/执行工具 (fail-closed 方向)。
+//	代价与边界：admin 是唯一不做裁剪的档位, 它保留全量工具 (含写与 Bash)。
+//	设计权衡：各档位手写枚举而不是用"基础集 + 差集", 牺牲一点重复, 换来"这一档到底有哪些
+//	      工具"可以逐行读出来。
+//
 // RegisterProfileToolsWithStore registers a bounded built-in tool set for the
 // given profile. Admin intentionally preserves the historical all-tools behavior.
 func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searcher WebSearcher, profile ToolProfile) (*TodoWriteTool, *TaskStore) {
@@ -106,6 +119,7 @@ func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searche
 	}
 }
 
+// registerFileMutationTools 注册写/编辑/回退三个文件改动工具。
 func registerFileMutationTools(reg *tool.Registry) {
 	reg.Register(NewFileWriteTool())
 	reg.Register(NewFileEditTool())
@@ -114,6 +128,7 @@ func registerFileMutationTools(reg *tool.Registry) {
 	reg.Register(NewRewindTool())
 }
 
+// registerReadSearchTools 注册 Read/Glob/Grep 三个只读检索工具。
 func registerReadSearchTools(reg *tool.Registry) {
 	reg.Register(NewFileReadTool())
 	reg.Register(NewGlobTool())
@@ -136,6 +151,7 @@ func registerCodeIntelTools(reg *tool.Registry) {
 	reg.Register(NewCodeIntelUpdateTool())
 }
 
+// registerWebAndInteractionTools 注册联网抓取/搜索与提问交互工具。
 func registerWebAndInteractionTools(reg *tool.Registry, searcher WebSearcher) {
 	reg.Register(NewWebFetchTool())
 	reg.Register(NewWebSearchTool(searcher))

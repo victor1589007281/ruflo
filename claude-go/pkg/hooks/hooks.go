@@ -352,6 +352,20 @@ func (r *Runner) ExecuteStopFailureHooks(messages []types.Message) []types.Messa
 	return r.executeStopLikeHooks(types.HookEventStopFailure, messages)
 }
 
+// executeStopLikeHooks 是 Stop / StopFailure 两条事件共用的执行体: 依次跑匹配到的 hook, 把
+// deny/block 的裁决翻译成"注入一条用户消息"从而让模型继续处理。
+//
+// 算法解读：
+//
+//	原理：Stop 类 hook 的产物不是"允许/禁止"而是**续跑信号** —— 命中 deny/block 时把 hook 给的
+//	      原因包成一条 IsMeta 的用户消息塞回对话, 模型看到它就会接着干活; 没有任何 hook 阻止时
+//	      返回 nil, 对话正常结束。
+//	关键不变量：approve 必须**立刻返回 nil** (而不是记下决定继续循环)。approve 的语义是"这次
+//	      停止是合法的", 继续跑后面的 hook 会让一个显式放行被另一个 hook 的 block 翻掉。
+//	代价与边界：hook 串行执行, 每个都可能是一次子进程/HTTP 往返, 总耗时是各 hook 之和;
+//	      单个 hook 报错只记录 (ev.Err) 并跳过, 不中断整条链 —— 观测失败不该阻断对话。
+//	设计权衡：只保留最后一条非 approve 的 Decision 供观测, 而阻塞消息则全部累积 —— 观测要的是
+//	      "最终裁决是什么", 而恢复消息是给模型的输入, 少一条就等于少一条线索。
 func (r *Runner) executeStopLikeHooks(event types.HookEvent, messages []types.Message) []types.Message {
 	hooks := r.findHooks(event, "")
 	if len(hooks) == 0 {
@@ -378,6 +392,7 @@ func (r *Runner) executeStopLikeHooks(event types.HookEvent, messages []types.Me
 		}
 		if output != nil {
 			// ContinueDecision 语义: "deny" / "block" = 阻止并注入恢复消息; "approve" = 不阻止
+			// approve 立即放行并结束整条链 —— 后面的 hook 无权翻掉一个显式的"允许停止"。
 			if output.ContinueDecision == "approve" {
 				ev.Decision = output.ContinueDecision
 				return nil
@@ -647,6 +662,10 @@ func (r *Runner) findHooks(event types.HookEvent, toolName string) []types.HookC
 	return result
 }
 
+// matchHookIf 用 path.Match 通配符判定 hook 的 if 条件是否匹配当前工具名; 模式为空表示无条件匹配。
+//
+// 注意: toolName 为空 (非工具事件) 且模式非空时返回 false —— 否则 "Bash*" 这类模式会因为
+// path.Match("Bash*", "") 的失败被误当成"该 hook 适用"。
 func matchHookIf(toolName, ifPattern string) bool {
 	if ifPattern == "" {
 		return true
@@ -658,6 +677,7 @@ func matchHookIf(toolName, ifPattern string) bool {
 	return err == nil && ok
 }
 
+// effectiveHookType 返回 hook 的实际类型; 未声明时默认为 command (与 TS 侧的默认一致)。
 func effectiveHookType(h types.HookConfig) types.HookType {
 	if h.HookType == "" {
 		return types.HookTypeCommand
@@ -691,6 +711,19 @@ func (r *Runner) executeHook(config types.HookConfig, input types.HookInput) (*t
 	}
 }
 
+// executeHTTPHook 把 hook 输入 POST 到配置的 URL, 并按响应的形状决定是否产出裁决。
+//
+// 算法解读：
+//
+//	原理：hook 输入序列化成 JSON POST 出去; 响应体若以 `{` 开头且能反序列化成 HookOutput,
+//	      就直接把它当作裁决返回 (内容协商靠**形状**而不是 Content-Type 或状态码)。
+//	关键不变量：JSON 解析必须排在状态码检查**之前**。hook 服务用 4xx/5xx 携带结构化裁决是常见
+//	      写法 (例如 403 + {"continue": false}), 先查状态码会把这类合法裁决当成传输错误丢掉,
+//	      表现为"hook 明明拒绝了, 工具却照常执行"。
+//	代价与边界：响应体全量读进内存, 无大小上限; 超时取 config.Timeout, 缺省用 Runner 级超时。
+//	      非 JSON 响应且状态码非 2xx 才报错, 2xx 的非 JSON 响应一律当作"无裁决"返回 nil。
+//	设计权衡：不做重试 —— hook 是同步前置闸门, 重试会把延迟直接叠加到每一次工具调用上;
+//	      需要容错的 hook 应在自己那一侧做成幂等 + 自带重试。
 func (r *Runner) executeHTTPHook(config types.HookConfig, input types.HookInput) (*types.HookOutput, error) {
 	urlStr := strings.TrimSpace(config.URL)
 	if urlStr == "" {

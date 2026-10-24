@@ -123,6 +123,7 @@ func (c *Client) GetLease(ctx context.Context, name string) (*Lease, error) {
 	return l, nil
 }
 
+// leaseOp 执行 acquire/renew 类租约操作, 非 200 一律当错误返回。
 func (c *Client) leaseOp(ctx context.Context, op, name, holder string, ttl time.Duration) (*Lease, error) {
 	l, status, err := c.leaseRaw(ctx, op, name, holder, ttl)
 	if err != nil {
@@ -134,11 +135,13 @@ func (c *Client) leaseOp(ctx context.Context, op, name, holder string, ttl time.
 	return l, nil
 }
 
+// leaseRaw 是所有租约操作的公共底座: 返回原始 HTTP 状态码, 让上层区分 200/204/404 等语义。
 func (c *Client) leaseRaw(ctx context.Context, op, name, holder string, ttl time.Duration) (*Lease, int, error) {
 	req := map[string]any{"op": op, "name": name}
 	if holder != "" {
 		req["holder"] = holder
 	}
+	// 亚秒级 TTL 必须用 ttl_ms 传: 服务端按整数秒理解 ttl_seconds, 直接传秒会把 500ms 抹成 0。
 	if ttl > 0 {
 		if ttl < time.Second {
 			req["ttl_ms"] = ttl.Milliseconds()

@@ -150,6 +150,8 @@ func (s *Server) SetRoutes(routes []Route, defaultProvider string) error {
 	return nil
 }
 
+// Handler 构造网关的 HTTP 路由: /healthz + 三套协议 (Anthropic /messages、OpenAI
+// /chat/completions 与 /responses), 每套都同时挂带与不带 /v1 前缀的两个路径。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -224,6 +226,7 @@ func (s *Server) clientFor(rt *Route) *http.Client {
 	return s.client
 }
 
+// handleMessages 处理 Anthropic Messages 协议 (/messages 与 /v1/messages)。
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.handleMessagesWithPath(w, r, "/messages")
 }
@@ -408,6 +411,10 @@ func (s *Server) pipeStream(w http.ResponseWriter, body io.Reader, rec *AccessRe
 	}
 }
 
+// fail 以网关自身的错误信封回应 (Anthropic 风格 {error:{type,message}}), 并先落一条访问日志。
+//
+// 落日志在写响应之前: 客户端拿到 5xx 时日志里必须已经有这条记录, 否则"请求挂了但
+// 日志里查不到"就成了排查时的第一道墙。
 func (s *Server) fail(w http.ResponseWriter, rec *AccessRecord, status int, msg string) {
 	rec.Status = status
 	rec.Err = msg
@@ -418,6 +425,10 @@ func (s *Server) fail(w http.ResponseWriter, rec *AccessRecord, status int, msg 
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"type": "gateway_error", "message": msg}})
 }
 
+// writeLog 把一条访问记录以 JSONL 追加到日志文件; 未配置路径时静默跳过。
+//
+// 每条记录独立 open/append/close (不持有长驻文件句柄), 用 logMu 串行化 —— 换来的是
+// 日志文件可被外部工具随时轮转/删除, 代价是每次调用多两次系统调用。
 func (s *Server) writeLog(rec *AccessRecord) {
 	if s.logPath == "" {
 		return

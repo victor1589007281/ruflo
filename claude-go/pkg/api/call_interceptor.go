@@ -266,6 +266,7 @@ type recordSink struct {
 	set bool
 }
 
+// withRecordSink 在 ctx 上挂一个记录槽并返回它 (链读槽里的记录, 见 sinkRecord)。
 func withRecordSink(ctx context.Context) (context.Context, *recordSink) {
 	s := &recordSink{}
 	return context.WithValue(ctx, recordSinkKey{}, s), s
@@ -285,6 +286,7 @@ func sinkRecord(ctx context.Context, rec LLMCallRecord) {
 	s.mu.Unlock()
 }
 
+// snapshot 取槽里记下的记录; 接收者为 nil (无槽) 时返回零值记录, 不 panic。
 func (s *recordSink) snapshot() LLMCallRecord {
 	if s == nil {
 		return LLMCallRecord{}
@@ -333,6 +335,7 @@ func (l *TokenLedger) Around(ctx context.Context, call LLMCall, next CallExec) (
 	return res, err
 }
 
+// add 累加用量: 有 RunID 时按 (RunID, NodeID) 分桶, 无 RunID 时计入 unattributed。
 func (l *TokenLedger) add(runID, nodeID string, n int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

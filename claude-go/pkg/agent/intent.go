@@ -303,6 +303,18 @@ func (ir *IntentRecognizer) RecognizeCron(ctx context.Context, text string) *Cro
 	}
 }
 
+// keywordDetect 第一层关键词快速检测: 先按优先级短路判定操作类意图, 再对创建类意图做工作流打分。
+//
+// 算法解读：
+//
+//	原理：先用"操作类"关键词 (stop > status > list > delete) 做短路判定, 命中即返回;
+//	      都不命中才进入 create 分支, 遍历 wfDetect 各类关键词打分选出得分最高的工作流。
+//	关键不变量：判定顺序即优先级 —— 操作类必须先于 create, 否则"停止调研"会被 createKW
+//	      里的"帮我调研"抢走, 用户想停却被新建了一个团队。
+//	代价与边界：O(关键词总数) 次 strings.Contains, 无倒排索引; wfDetect 是 map, 遍历顺序
+//	      随机, 只在 score > maxScore 时更新, 故同分时保留先遇到的 —— 结果对同分不保证确定。
+//	设计权衡：给 finance/techblog/creative 加 +1 权重, 是为了让专业团队关键词压过 research
+//	      的泛化词 (如"分析"), 代价是这三个词更容易误触发。
 func (ir *IntentRecognizer) keywordDetect(lower, original string) *TeamIntent {
 	for _, kw := range stopKW {
 		if strings.Contains(lower, kw) {
@@ -398,6 +410,8 @@ const extractSysPrompt = `你是命令解析器。给定用户的中文消息，
 - creative: 画SVG/做图/海报/Logo/封面/SVG视觉设计
 - creative-v2: 做网页/HTML/做PPT/幻灯片/做视频/动画/网页设计/导出PDF/PNG/MP4/APP原型/界面设计/UI设计/产品原型/交互原型`
 
+// extractWithLLM 第二层: 用 LLM 提取工作流/目标/团队名并就地回填到 intent。
+// 任何一步失败 (调用错/解析错) 都静默保留关键词层的判定结果, 不让 LLM 故障反过来降级意图。
 func (ir *IntentRecognizer) extractWithLLM(ctx context.Context, text string, intent *TeamIntent) {
 	resp, err := ir.llm.SimpleComplete(ctx, extractSysPrompt, text)
 	if err != nil {
@@ -430,6 +444,7 @@ func (ir *IntentRecognizer) extractWithLLM(ctx context.Context, text string, int
 		if parsed.TeamName != "" {
 			intent.TeamName = parsed.TeamName
 		}
+		// 只有解析成功才提升置信度: 失败时保留关键词层的 0.7/0.8。
 		intent.Confidence = 0.9
 	}
 }

@@ -499,6 +499,7 @@ func (e *Engine) CrossRepoFindRefs(branchName string, q NavigateQuery) (*QueryRe
 	}, nil
 }
 
+// countHighConfidence 统计置信度不低于 threshold 的条目数。
 func countHighConfidence(entries []CrossRepoRefEntry, threshold float64) int {
 	count := 0
 	for _, e := range entries {

@@ -137,6 +137,7 @@ type ProtocolError struct {
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 
+// Error 实现 error 接口; 只拼 code 与 message, Data 里的协商信息留给调用方按需解析。
 func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("MCP error %d: %s", e.Code, e.Message)
 }
@@ -153,6 +154,12 @@ func NewClient() *Client {
 	return &Client{}
 }
 
+// LoadServerConfigsFromFile 读取 Claude 风格 MCP JSON 配置 (顶层 "mcpServers" 映射),
+// 返回 ServerConfig 列表, 其中 Name 取自各映射键。
+//
+// 注意：配置里没有 name 字段 —— 名字就是 map 的 key, 由本函数回填到 sc.Name;
+// Transport 缺省时补 "stdio"。
+//
 // LoadServerConfigsFromFile reads a Claude-style MCP JSON config (top-level "mcpServers" map)
 // and returns ServerConfig entries with Name set from each map key.
 func LoadServerConfigsFromFile(path string) ([]ServerConfig, error) {
@@ -222,6 +229,20 @@ func (c *Client) Connect(ctx context.Context, config ServerConfig) (*Connection,
 }
 
 // connectStdio 通过 stdio 传输连接 MCP 服务器
+// 流程: 起子进程 → initialize 握手 → initialized 通知 → tools/list。
+//
+// 算法解读：
+//
+//	原理：MCP 的 stdio 握手是"一问一答"的 JSON-RPC: initialize 拿服务端能力与**它自己
+//		的协议版本**, 回发 initialized 通知 (无 ID, 不期待响应), 再 tools/list 取工具表。
+//	关键不变量：**协议版本以服务端的回答为准**。请求里发的 ProtocolVersion 只是提议,
+//		收到响应后必须用 ir.ProtocolVersion 覆盖 conn.protocolVersion —— 之后每个请求
+//		的 _meta 都带上它 (见 sendRequestCtx), 用错了会被服务端按版本拒绝。
+//	代价与边界：stdout 的 Scanner 缓冲**硬编码 1MB** 上限, 超过就 Scan 失败, 大
+//		tools/list 响应会被截断。启动阶段全程继承调用方 ctx, 避免异常的 MCP 进程
+//		把 Bot 初始化卡死; tools/list 失败**不算连接失败** (状态仍置 connected)。
+//	设计权衡：stdio 下 2026-07-28 的无状态改造只是"建议性"的, 所以仍走握手而不是
+//		直接 discover —— 换来的是对旧版服务器零改动兼容。
 func (c *Client) connectStdio(ctx context.Context, conn *Connection) error {
 	args := conn.Config.Args
 	cmd := exec.CommandContext(ctx, conn.Config.Command, args...)
@@ -450,6 +471,21 @@ func (conn *Connection) sendRequest(method string, params interface{}) (json.Raw
 
 // sendRequestCtx 发送 JSON-RPC 请求 (支持 context 取消/超时)。
 // 内部通过 goroutine 包装阻塞 I/O，使 ctx 能够中断挂起的读写。
+//
+// 算法解读：
+//
+//	原理：stdio 一路是**严格串行**的请求-响应: 整函数由 conn.mu 独占, 写一行请求后
+//		起一个 goroutine 阻塞在 stdout.Scan(), 主流程用 select 在"ctx 结束"与
+//		"读到一行"之间二选一。HTTP 一路则完全不同 —— 一致性哈希选后端后直接转发,
+//		不占 stdio 的锁语义。
+//	关键不变量：**一次只允许一个在途请求, 且响应按到达顺序配对**。代码不按 JSON-RPC
+//		的 id 做匹配, 而是把读到的第一行当成当前请求的响应; 这只有在 conn.mu 把
+//		并发调用完全串行化时才成立 —— 去掉这把锁就会张冠李戴。
+//	代价与边界：ctx 先结束时返回错误, 但那个阻塞在 Scan() 上的 goroutine**不会被
+//		回收** (只有下次 Scan 返回时才会向带缓冲的 ch 投递, 无人接收后退出);
+//		这意味着超时后管道里若残留半行, 下一次请求会读到它并配对错误。
+//	设计权衡：用"锁 + 单行读"换取实现简单, 代价是**无法并发**调用同一 stdio 连接,
+//		且没有请求 id 校验这条兜底; HTTP 传输靠无状态端点绕开了整个问题。
 func (conn *Connection) sendRequestCtx(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -492,6 +528,8 @@ func (conn *Connection) sendRequestCtx(ctx context.Context, method string, param
 		data []byte
 		ok   bool
 	}
+	// 注意: 不校验 resp.ID 与请求 id 是否一致 —— 靠 conn.mu 把同一连接的调用串行化,
+	// 才能假定"读到的下一行就是本次请求的响应"。
 	ch := make(chan scanResult, 1)
 	go func() {
 		ok := conn.stdout.Scan()
@@ -689,12 +727,30 @@ func NewMCPTool(conn *Connection, info ToolInfo) *MCPTool {
 	}
 }
 
+// Name 返回注册到本地工具表的名字, 形如 mcp_<服务器名>_<远程工具名> (加前缀避免撞名)。
 func (t *MCPTool) Name() string {
 	return fmt.Sprintf("mcp_%s_%s", t.serverName, t.info.Name)
 }
 
+// Description 直接透传远程工具自带的描述。
 func (t *MCPTool) Description() string          { return t.info.Description }
+
+// InputSchema 直接透传远程工具的 JSON Schema。
 func (t *MCPTool) InputSchema() json.RawMessage { return t.info.InputSchema }
+
+// IsReadOnly 由**工具名启发式**推断是否只读 (MCP 协议本身不携带这个信息)。
+//
+// 算法解读：
+//
+//	原理：MCP 的 tool 描述里没有"是否写"的字段, 所以只能按名字猜: 前缀命中
+//		read/get/list/search/... 或后缀命中 _list/_get/... 即判定为只读。
+//	关键不变量：这是个**只影响权限提示、不影响实际执行**的保守判据 —— 判错只读会让
+//		写工具被当成只读而少一次确认, 所以它**宁可不判**: 默认返回 false (当写工具处理),
+//		只有名字明确像读时才放行。
+//	代价与边界：纯字符串匹配, 不解析 schema、不看服务端能力声明。名字叫 "fetch_and_delete"
+//		这类复合动词会误判为只读 —— 这是已知的边界, 不是 bug。
+//	设计权衡：不做参数级分析 (那要理解每个工具的语义), 用一条廉价的命名约定换取
+//		绝大多数标准 MCP 服务器上的正确率。
 func (t *MCPTool) IsReadOnly(_ json.RawMessage) bool {
 	lower := strings.ToLower(t.info.Name)
 	for _, prefix := range []string{"read", "get", "list", "search", "query", "fetch", "describe", "show", "status", "info", "check", "view"} {
@@ -709,11 +765,15 @@ func (t *MCPTool) IsReadOnly(_ json.RawMessage) bool {
 	}
 	return false
 }
+// IsConcurrencySafe 一律返回 false: 远程工具是否有状态、能否并发, 客户端无从得知。
 func (t *MCPTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+
+// CheckPermissions 工具自身不设门槛, 权限交由上层策略裁决。
 func (t *MCPTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 把本地调用转发为一次 MCP tools/call, 并把失败转成 IsError 结果 (不返回 error)。
 func (t *MCPTool) Call(ctx context.Context, input json.RawMessage, toolCtx *tool.ToolContext) (*tool.ToolResult, error) {
 	// 会话粘性: 从工具上下文推导粘性键写入 ctx，多后端时经一致性哈希命中同一实例。
 	if key := stickyKeyFromToolCtx(toolCtx); key != "" {

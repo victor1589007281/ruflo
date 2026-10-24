@@ -383,6 +383,10 @@ func buildScaffoldFiles(dir string, sc *pluginScaffold) ([]scaffoldFile, error) 
 }
 
 // handlePluginDetail GET/DELETE /api/plugins/{name}
+//
+// handlePluginDetail 取单个插件详情 (含成员展开); DELETE 方法转交 handlePluginDelete。
+// 插件存在但 Expand 失败时**仍返回 200**: 清单本体是可看的, 展开失败只写进 problems ——
+// 用 500 会把"插件不存在"与"成员展开坏了"混成同一件事, 而排查方向完全不同。
 func (s *Server) handlePluginDetail(w http.ResponseWriter, r *http.Request) {
 	name := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/plugins/"), "/")
 	if name == "" {

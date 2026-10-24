@@ -134,6 +134,10 @@ func (r RecallReport) MissSummary() string {
 	return formatMissRate(r)
 }
 
+// formatMissRate 把漏召报告格式化成 "x/y 漏召 (z%)", 并在存在空结果时追加一句解释。
+//
+// 注意：空结果要单独点出来 —— 「召回了但内容为空」会被读成「池内没有这个能力」,
+// 与「真的没命中」是两种不同的故障, 合并成一个百分比会掩盖前者。
 func formatMissRate(r RecallReport) string {
 	rate := r.MissRate()
 	pct := int(rate*100 + 0.5)
@@ -297,6 +301,10 @@ func splitFieldTokens(field string) []string {
 	return out
 }
 
+// dedupeStrings 就地去重并丢弃空串, 保持首次出现的顺序; 入参为空时返回 nil。
+//
+// 注意：复用入参底层数组 (out := in[:0]) —— 调用方持有的原切片会被就地改写,
+// 需要保留原切片时必须先自行拷贝。
 func dedupeStrings(in []string) []string {
 	if len(in) == 0 {
 		return nil

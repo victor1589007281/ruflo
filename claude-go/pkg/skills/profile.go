@@ -21,6 +21,14 @@ type ProjectProfile struct {
 }
 
 // DetectProjectProfile scans a repository and infers the dominant stacks used by claude-go roles.
+// DetectProjectProfile 扫描仓库目录树, 推断当前 cwd 使用的主要语言与技术栈。
+//
+// 算法解读：
+//
+//	原理：一次 WalkDir 遍历, 按扩展名/文件名把命中写入 profile 的各个布尔位; 目录命中黑名单时整棵跳过。
+//	关键不变量：黑名单目录必须 SkipDir——不跳的话 node_modules/vendor 里的依赖会把画像彻底带偏, 而这里要回答的是「本项目用什么」而不是「磁盘上有什么」。
+//	代价与边界：只看文件名与路径片段, 不做内容解析; 遍历出错的条目被静默跳过, 因此空目录与超大仓库会得到「什么都没检测到」的同一结果。
+//	设计权衡：TS/JS 没命中框架特征时按后端兜底(见函数末尾), 宁可多给一套通用技能, 也不让 coder 拿到空技能包。
 func DetectProjectProfile(cwd string) ProjectProfile {
 	var profile ProjectProfile
 	if strings.TrimSpace(cwd) == "" {
@@ -92,11 +100,20 @@ func DetectProjectProfile(cwd string) ProjectProfile {
 }
 
 // RecommendedSkillsForRole returns a stable, deduplicated skill bundle for a role.
+// RecommendedSkillsForRole 按 cwd 检测到的项目画像给出该角色的技能包(便捷包装)。
 func RecommendedSkillsForRole(cwd string, role string) []string {
 	return RecommendedSkillsForRoleFromProfile(DetectProjectProfile(cwd), role)
 }
 
 // RecommendedSkillsForRoleFromProfile maps a detected project profile to role-specific skills.
+// RecommendedSkillsForRoleFromProfile 按项目画像与角色映射出推荐技能清单, 结果已去重。
+//
+// 算法解读：
+//
+//	原理：一串相互独立的条件追加——先按角色加通用项(coder/reviewer/tester 得 coding-standards), 再按画像的每个技术位追加对应技能, 最后统一去重。
+//	关键不变量：返回顺序必须稳定(追加顺序即结果顺序)——调用方拿它做展示与缓存键, 顺序漂移会造成无意义的 diff。
+//	代价与边界：规则是并集而非打分排序, 画像命中越多返回越长, 既没有上限也不做优先级裁剪。
+//	设计权衡：用直白的 if 链而不是规则表, 换取新增技能时改动最小; 代价是「哪条规则加了什么」只能靠通读。
 func RecommendedSkillsForRoleFromProfile(profile ProjectProfile, role string) []string {
 	var out []string
 
@@ -165,6 +182,7 @@ func RecommendedSkillsForRoleFromProfile(profile ProjectProfile, role string) []
 	return uniqueStrings(out)
 }
 
+// uniqueStrings 按原顺序去重, 并丢弃空串。
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))

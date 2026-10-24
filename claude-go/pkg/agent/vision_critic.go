@@ -53,7 +53,10 @@ type VisionBackend interface {
 // --- 后端1: Anthropic 兼容 (kimi 等, 复用 api.Client) ---
 type rawVisionBackend struct{ rc RawVisionCompleter }
 
+// Name 返回后端名 (Anthropic 兼容路径)。
 func (b rawVisionBackend) Name() string { return "anthropic(kimi)" }
+
+// Describe 把图片以 Anthropic image 内容块 + 文本提示发给多模态模型, 返回其回复正文。
 func (b rawVisionBackend) Describe(ctx context.Context, imgB64, prompt string) (string, error) {
 	blocks := []map[string]any{
 		{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": imgB64}},
@@ -69,7 +72,13 @@ func (b rawVisionBackend) Describe(ctx context.Context, imgB64, prompt string) (
 // --- 后端2: OpenAI 兼容 (本地 ollama gemma4 等) ---
 type httpVisionBackend struct{ base, model, key string }
 
+// Name 返回后端名 (带模型名, 便于日志区分)。
 func (b httpVisionBackend) Name() string { return "openai(" + b.model + ")" }
+
+// Describe 走 OpenAI 兼容的 /chat/completions (image_url 内联 base64), 返回首条回复正文。
+//
+// 注意: 这里对 ctx 又叠了一层 3 分钟超时 —— 本地 CPU 推理单帧可慢到 ~70s, 外层 ctx 若更短
+// 会先被取消; 反之这个硬超时也让"模型挂死"不会无限拖住整轮质检。
 func (b httpVisionBackend) Describe(ctx context.Context, imgB64, prompt string) (string, error) {
 	body := map[string]any{
 		"model": b.model, "stream": false,
@@ -108,6 +117,7 @@ func (b httpVisionBackend) Describe(ctx context.Context, imgB64, prompt string) 
 	return out.Choices[0].Message.Content, nil
 }
 
+// visionEnv 读环境变量, 空值/纯空白时回落到默认值。
 func visionEnv(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -246,6 +256,7 @@ func VerdictsFeedback(verdicts []SceneVerdict) (allPass bool, feedback string) {
 	return allPass, b.String()
 }
 
+// probeDurationSec 用 ffprobe 读视频时长 (秒); 失败或解析不出返回 0。
 func probeDurationSec(ctx context.Context, mp4Path string) float64 {
 	out, err := exec.CommandContext(ctx, "ffprobe", "-v", "error",
 		"-show_entries", "format=duration", "-of", "csv=p=0", mp4Path).Output()

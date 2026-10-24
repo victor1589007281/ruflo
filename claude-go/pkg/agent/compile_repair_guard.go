@@ -117,6 +117,18 @@ func ExtractErrorSignatures(buildErrors string) []string {
 	return sigs
 }
 
+// extractErrorSignature 把一行编译错误归一成 "文件:错误类型" 签名; 认不出文件时退化为 "global:错误类型"。
+//
+// 算法解读：
+//
+//	原理：把每轮编译错误压成一组可比较的签名, 使"同一个错误又出现了"可以被计数 ——
+//	      重复计数是编译修复循环唯一的早期终止信号。
+//	关键不变量：签名必须丢掉行号与列号。否则同一处错误每改一次行号就变一次, 计数
+//	      永远到不了阈值, 整个守卫形同虚设。
+//	代价与边界：文件路径不可识别时退化成 global:<类型>, 此时不同文件的同类错误会合并
+//	      计数, 可能提前终止 —— 这是刻意选定的偏保守方向。
+//	设计权衡：不引 n-gram/embedding, 只用"路径 + 关键词"两段结构; 判错的代价只是早停或
+//	      晚停一轮, 不值得为它引入模型依赖。
 func extractErrorSignature(line string) string {
 	// 提取 "path/to/file.go:错误类型" 作为签名
 	if idx := strings.Index(line, ":"); idx > 0 {
@@ -135,6 +147,7 @@ func extractErrorSignature(line string) string {
 	return ""
 }
 
+// extractErrorType 在错误文本里按固定顺序匹配已知错误类型关键词, 命中即返回该关键词, 否则返回空串。
 func extractErrorType(s string) string {
 	lower := strings.ToLower(s)
 	knownErrors := []string{
@@ -147,6 +160,7 @@ func extractErrorType(s string) string {
 		"redeclared", "unused", "not used",
 		"type mismatch", "incompatible", "conversion",
 	}
+	// 顺序敏感: 命中即返回, 因此更精确的措辞必须排在更宽的关键词之前。
 	for _, e := range knownErrors {
 		if strings.Contains(lower, e) {
 			return e
@@ -183,6 +197,7 @@ func ParseConfidenceFromOutput(output string) int {
 	return -1 // 未解析到
 }
 
+// max 返回两整数中的较大者。
 func max(a, b int) int {
 	if a > b {
 		return a

@@ -58,14 +58,17 @@ type FileReadTool struct {
 	lastReadHashes map[string]string
 }
 
+// NewFileReadTool 构造 Read 工具, 并初始化按 (path|offset|limit) 分键的去重表。
 func NewFileReadTool() *FileReadTool {
 	return &FileReadTool{
 		lastReadHashes: make(map[string]string),
 	}
 }
 
+// Name 返回工具名 (固定为 "Read")。
 func (t *FileReadTool) Name() string { return FileReadToolName }
 
+// Description 返回给模型的工具说明 (英文原文, 与 TS 侧保持一致)。
 func (t *FileReadTool) Description() string {
 	return `Reads a file from the local filesystem. You can access any file directly by using this tool.
 If the User provides a path to a file assume that path is valid.
@@ -76,6 +79,7 @@ Usage:
 - If you read a file that exists but has empty contents you will receive 'File is empty.'`
 }
 
+// InputSchema 返回入参 schema: path 必填, offset/limit 可选。
 func (t *FileReadTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -88,8 +92,13 @@ func (t *FileReadTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 返回 true: 只读取文件, 不改动任何东西。
 func (t *FileReadTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 返回 true: 去重表自带 mutex, 并发读互不干扰。
 func (t *FileReadTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 一律放行 (返回 nil), 读权限由外层沙箱/权限系统统一裁定。
 func (t *FileReadTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
@@ -106,6 +115,10 @@ var imageMediaTypes = map[string]string{
 	".webp": "image/webp",
 }
 
+// readImageResult 判断并读取图片文件, 返回 (结果, 是否已按图片处理)。
+//
+// 第二个返回值是"这条路已经负责了"的判据而不是"成功"—— 文件不存在、超限、读失败都以
+// IsError 结果 + true 返回, 让 Call 直接把它交出去, 不再落到后面的文本读取分支。
 func readImageResult(filePath string) (*tool.ToolResult, bool) {
 	mediaType, ok := imageMediaTypes[strings.ToLower(filepath.Ext(filePath))]
 	if !ok {
@@ -144,6 +157,7 @@ func readImageResult(filePath string) (*tool.ToolResult, bool) {
 	}, true
 }
 
+// fileReadKindMessage 对 PDF/Notebook 这类不能按纯文本读的扩展名给出占位提示; skip=true 表示已处理。
 func fileReadKindMessage(filePath string) (msg string, skip bool) {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	switch ext {
@@ -156,6 +170,10 @@ func fileReadKindMessage(filePath string) (msg string, skip bool) {
 	}
 }
 
+// readFileLimited 最多读 maxBytes 字节; truncated 表示文件还有后续内容被丢弃。
+//
+// 多读 1 字节 (LimitReader maxBytes+1) 是为了**区分**"正好等于上限"与"被截断"——
+// 只读 maxBytes 时两者长度相同, 无法判断该不该给续读提示。
 func readFileLimited(path string, maxBytes int64) (data []byte, truncated bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -223,10 +241,15 @@ func (t *FileReadTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 	lines := strings.Split(content, "\n")
 	totalLines := len(lines)
 
+	// 坐标约定 (与 TS 侧一致): offset/limit 都是 1-indexed 行号。offset=0 表示"从头开始",
+	// 负 offset 表示从末尾倒数 (offset=-3 ⇒ 最后 3 行)。内部一律换算成 0-indexed 的半开区间
+	// [startLine, endLine), 且两处都要夹到 [0, totalLines] —— 越界的 offset 必须退化成空区间,
+	// 而不是反向切片或越界访问。
 	startLine := 0
 	endLine := totalLines
 
 	if in.Offset != 0 {
+		// 正数: 1-indexed 转 0-indexed; 负数: 从末尾倒数, 即 totalLines + offset。
 		if in.Offset > 0 {
 			startLine = in.Offset - 1
 		} else {
@@ -240,6 +263,7 @@ func (t *FileReadTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 		}
 	}
 
+	// limit<=0 视为"不限制" (endLine 保持 totalLines); 正数才从 startLine 起算 limit 行。
 	if in.Limit > 0 {
 		endLine = startLine + in.Limit
 		if endLine > totalLines {
@@ -297,6 +321,7 @@ func expandPath(p string, cwd string) string {
 	return filepath.Clean(p)
 }
 
+// fileFindHint 在文件不存在时给模型一句可操作的提示: 目录不存在与路径写错是两种不同建议。
 func fileFindHint(path string) string {
 	dir := filepath.Dir(path)
 	if _, err := os.Stat(dir); err != nil {

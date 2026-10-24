@@ -254,6 +254,7 @@ type plotSwarmNodeRunner struct {
 
 var _ graph.NodeRunner = (*plotSwarmNodeRunner)(nil)
 
+// newPlotSwarmNodeRunner 构造群体智能焦点 mode 的节点执行器 (done/err/ran 由 RunNode 回填)。
 func newPlotSwarmNodeRunner(we *WorkflowExecutor, team *ProductionTeam, objective string, k plotGraphKind) *plotSwarmNodeRunner {
 	return &plotSwarmNodeRunner{we: we, team: team, objective: objective, k: k}
 }

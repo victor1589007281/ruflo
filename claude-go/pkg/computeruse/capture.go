@@ -74,6 +74,7 @@ func CaptureScreen(ctx context.Context, region *Region, scale float64) (*Capture
 	}, nil
 }
 
+// buildDarwinCapture 构造 macOS 截屏命令 (screencapture -x -t png), region 非空时用 -R 截指定区域。
 func buildDarwinCapture(ctx context.Context, outPath string, region *Region) *exec.Cmd {
 	args := []string{"-x", "-t", "png"}
 	if region != nil && region.Width > 0 && region.Height > 0 {
@@ -85,6 +86,8 @@ func buildDarwinCapture(ctx context.Context, outPath string, region *Region) *ex
 	return exec.CommandContext(ctx, "screencapture", args...)
 }
 
+// buildLinuxCapture 按可执行文件名分派 Linux 截屏后端 (grim / scrot / ImageMagick import),
+// 三者的区域参数语法各不相同, 故各写一段而不是拼参数。
 func buildLinuxCapture(ctx context.Context, bin, outPath string, region *Region) *exec.Cmd {
 	base := filepath.Base(bin)
 	switch {

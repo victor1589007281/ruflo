@@ -157,6 +157,7 @@ func commitKnowledge(repoDir, source string) {
 	}
 }
 
+// runGit 在 dir 下跑一条 git 命令, 返回合并后的 stdout+stderr (已 TrimSpace) 与错误。
 func runGit(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
@@ -164,6 +165,10 @@ func runGit(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// buildMarkdown 把一条外部条目渲染成带 YAML frontmatter 的 Markdown 文档。
+//
+// tags 为 nil 时显式补成空数组: 否则 yaml.Marshal 会输出 `tags: null`, 而下游读的是
+// 一个列表 —— null 与 [] 在读取侧表现不同。
 func buildMarkdown(item ExternalItem, source string, syncedAt time.Time) string {
 	front := map[string]interface{}{
 		"source":      source,
@@ -185,6 +190,10 @@ func buildMarkdown(item ExternalItem, source string, syncedAt time.Time) string 
 
 var nonWord = regexp.MustCompile(`[^\w\-一-鿿]+`)
 
+// makeFilePath 生成 "raw/<source>/<日期>_<source>-<类型>-<外部ID>_<标题slug>.md" 形式的相对路径。
+//
+// 三处防坑: 标题先清非法 UTF-8 (否则文件名与索引 JSON 里的值对不上)、按 **rune** 截断
+// 到 60 字 (按字节截会切开多字节字符)、把 slug 里残留的 "/" 换成 "-" (避免多出一层目录)。
 func makeFilePath(source, typ, externalID, title string, t time.Time) string {
 	date := t.UTC().Format("2006-01-02")
 	// 清理非法 UTF-8，避免索引 JSON 与文件名不一致

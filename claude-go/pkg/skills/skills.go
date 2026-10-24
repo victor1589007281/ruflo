@@ -233,6 +233,7 @@ func (r *Registry) LoadDefaults(cwd string) int {
 	return total
 }
 
+// defaultSkillDirs 返回默认技能搜索目录: 项目级/状态目录/用户级/用户状态目录四档。
 // defaultSkillDirs returns the default search paths for skills.
 func defaultSkillDirs(cwd string) []scanDir {
 	var dirs []scanDir
@@ -534,6 +535,18 @@ func (r *Registry) FormatShortListingForNames(names []string) string {
 	return renderShortListing(out, 0)
 }
 
+// renderShortListing 把技能列表渲染成精简清单: 每条只写名字, 描述受 limit 与共享预算约束。
+//
+// 算法解读：
+//
+//	原理：清单进的是每一轮请求的 system 段, 所以按"名称恒写、描述按预算分享"来裁剪 ——
+//	  shortListingDescBudget 是全部条目**共享**的描述字符预算, 用满后剩下的条目只剩名字。
+//	关键不变量：**名称一个都不能省**。名字是模型调用 Skill 工具的唯一凭据, 省掉名字等于
+//	  这条技能不存在; 描述只是提示, 可省。所以裁剪只作用于描述那一半。
+//	代价与边界：单趟 O(条目数); limit<=0 视为不限条数 (但仍受描述预算约束)。描述按 rune
+//	  截到 140 字, 预算也按 rune 计 —— 中文描述不会被按字节腰斩。
+//	设计权衡：不做"每条的固定配额", 而是共享预算先到先得。固定配额在条目多时会把每条都
+//	  压成残缺描述, 共享预算则保证排在前面 (按名字排序, 确定性) 的条目有完整描述。
 func renderShortListing(skills []*Skill, limit int) string {
 	if len(skills) == 0 {
 		return ""
@@ -712,12 +725,15 @@ func (t *SkillTool) Registry() *Registry {
 	return t.registry
 }
 
+// Name 返回工具名 (恒为 "Skill")。
 func (t *SkillTool) Name() string { return "Skill" }
 
+// Description 返回给模型的工具说明 (英文原文, 直接下发)。
 func (t *SkillTool) Description() string {
 	return "Load a skill's full instructions by name. Use this when the short skill listing or task intent indicates a relevant skill; if the name is unknown, ask for a likely name and the error response will list available skills."
 }
 
+// InputSchema 返回入参 schema: 必填 name, 可选 arguments。
 func (t *SkillTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -729,8 +745,11 @@ func (t *SkillTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 返回 true: 加载技能只读注册表, 不产生文件系统副作用。
 func (t *SkillTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 返回 true: 不持有跨调用的可变状态 (注入记账走注册表自身的锁)。
 func (t *SkillTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+// CheckPermissions 不做额外限制, 返回 nil 表示交给通用权限链判定。
 func (t *SkillTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }

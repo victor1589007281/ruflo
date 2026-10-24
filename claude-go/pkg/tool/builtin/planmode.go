@@ -62,6 +62,7 @@ func NewPlanModeChecker(sessionID string) func() bool {
 	}
 }
 
+// setPlanMode 在全局会话键 "_global" 上设置计划模式标志(旧接口, 新代码请用 SetPlanModeForSession)。
 func setPlanMode(on bool) {
 	SetPlanModeForSession("_global", on)
 }
@@ -98,12 +99,15 @@ func NewEnterPlanModeTool() *EnterPlanModeTool {
 	return &EnterPlanModeTool{}
 }
 
+// Name 返回工具名 "EnterPlanMode"。
 func (t *EnterPlanModeTool) Name() string { return EnterPlanModeToolName }
 
+// Description 返回工具描述: 说明进入计划模式后应优先只读调研与规划。
 func (t *EnterPlanModeTool) Description() string {
 	return `进入计划模式：在此模式下应优先制定方案与澄清需求，通常仅使用只读工具，避免直接改文件或执行写入类操作。`
 }
 
+// InputSchema 返回空对象 schema: 不接受任何字段。
 func (t *EnterPlanModeTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -112,10 +116,13 @@ func (t *EnterPlanModeTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true: 只切换内存标志, 不触碰文件。
 func (t *EnterPlanModeTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
+// IsConcurrencySafe 恒为 true。
 func (t *EnterPlanModeTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 返回 nil: 进入计划模式本身不需要额外授权。
 func (t *EnterPlanModeTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
@@ -151,12 +158,15 @@ func NewExitPlanModeTool() *ExitPlanModeTool {
 	return &ExitPlanModeTool{}
 }
 
+// Name 返回工具名 "ExitPlanMode"。
 func (t *ExitPlanModeTool) Name() string { return ExitPlanModeToolName }
 
+// Description 返回工具描述: 退出计划模式, 可选附带计划文本。
 func (t *ExitPlanModeTool) Description() string {
 	return `退出计划模式，并可选择性地提交一份计划文本（plan），用于会话记录或后续执行参考。`
 }
 
+// InputSchema 返回入参 schema: plan 为可选字符串。
 func (t *ExitPlanModeTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -170,8 +180,10 @@ func (t *ExitPlanModeTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false: 可能写入计划文件, 按写入对待。
 func (t *ExitPlanModeTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
+// IsConcurrencySafe 恒为 true。
 func (t *ExitPlanModeTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 // CheckPermissions 允许在计划模式下调用（否则无法退出计划模式）。

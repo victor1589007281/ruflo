@@ -294,6 +294,7 @@ func (d *Dreamer) estimateImportance(record SessionRecord) float64 {
 	return score
 }
 
+// max 返回两个 float64 中较大的一个 (Go 1.21 前无内置 max, 这里保留自有实现)。
 func max(a, b float64) float64 {
 	if a > b {
 		return a
@@ -529,6 +530,7 @@ func (d *Dreamer) saveDreamLog(dir string, sessions []SessionRecord, elapsed tim
 	os.WriteFile(filepath.Join(dir, filename), []byte(sb.String()), 0644)
 }
 
+// truncateDream 按**字符数**截断字符串并补 "..." (先转 []rune, 不会截断多字节字符)。
 func truncateDream(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {

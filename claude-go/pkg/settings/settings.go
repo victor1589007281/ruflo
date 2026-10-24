@@ -256,6 +256,12 @@ func mergeSettings(dst, src *Settings) {
 	}
 }
 
+// mergeCodeIntelSettings 把 src 的 CodeIntel 配置逐字段叠加到 dst 上 (只覆盖 src 里
+// 显式给了值的项, 空的 / 零值的一律跳过, dst 原值保留)。
+//
+// 注意：因为是"零值即未设置", 这里所有裸 bool 都只能**置真** (if src.X { dst.X = true }),
+// 无法用配置文件把某个默认开的开关关掉 —— 想要"关"得靠外层 (例如整体替换该子树)。
+// 指针型子结构 (Cache/MCP/Metrics/AutoUpdate) 用 nil 判断"整块没配", 非 nil 才逐字段合并。
 func mergeCodeIntelSettings(dst, src *CodeIntelSettings) {
 	if src.GlobalIndexRoot != "" {
 		dst.GlobalIndexRoot = src.GlobalIndexRoot

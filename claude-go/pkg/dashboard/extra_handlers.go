@@ -160,6 +160,7 @@ type dashLLMAdapter struct {
 	fn func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
 }
 
+// SimpleComplete 把 dashboard Config.LLMComplete 回调适配成 agent.LLMClient 接口。
 func (a dashLLMAdapter) SimpleComplete(ctx context.Context, sys, user string) (string, error) {
 	return a.fn(ctx, sys, user)
 }
@@ -178,6 +179,7 @@ type roleInfoDTO struct {
 // simpleCompleteFn 把 cfg.LLMComplete 适配为 agent.LLMClient (供意图识别器用)。
 type simpleCompleteFn func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
 
+// SimpleComplete 把裸函数适配成 agent.LLMClient (函数类型版本, 无需构造结构体)。
 func (f simpleCompleteFn) SimpleComplete(ctx context.Context, sys, user string) (string, error) {
 	return f(ctx, sys, user)
 }
@@ -379,6 +381,7 @@ func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// dedupStrings 去重并丢弃空串, 保持首次出现的顺序 (与 fuseUniqStrings 同款语义)。
 func dedupStrings(in []string) []string {
 	seen := map[string]bool{}
 	out := []string{}
@@ -472,6 +475,7 @@ func (s *Server) handleTeamSwarmPlan(w http.ResponseWriter, r *http.Request, nam
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleWorkflow GET /api/workflows/{name}: 返回单个工作流详情; DELETE 与 PUT/PATCH 转交子处理器。
 func (s *Server) handleWorkflow(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/api/workflows/")
 	name = strings.Trim(name, "/")
@@ -511,6 +515,8 @@ func sanitizeWFFile(name string) string {
 	return r.Replace(name)
 }
 
+// toWorkflowDTO 把 WorkflowDef 转成前端 DTO: 阶段与工具声明都深拷贝, 免得响应序列化后
+// 调用方就地改 DTO 却改到注册表里那份定义 (见 cloneStageTools)。
 func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
 	dto := workflowDefDTO{
 		Name: wf.Name, Description: wf.Description, Mode: wf.Mode, Rounds: wf.Rounds,
@@ -576,6 +582,8 @@ type searchHitDTO struct {
 	Timestamp string   `json:"ts,omitempty"`
 }
 
+// handleSearch GET /api/search?q=&type=&limit=: 跨 team / cron / task 三类的全文检索。
+// 按 type 逐面收集, 命中分 >0 的进结果, 最后按分降序取前 limit 条。
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
@@ -650,6 +658,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, hits)
 }
 
+// tokenize 把查询串切成小写 token: 中英文标点一律当分隔符, 再去重 (不做分词/词干化)。
 func tokenize(q string) []string {
 	q = strings.ToLower(q)
 	rep := strings.NewReplacer(",", " ", ";", " ", "，", " ", "。", " ", "、", " ",
@@ -723,6 +732,8 @@ func scoreTokens(fields ...interface{}) float64 {
 // 监听 .claude-go/.dashboard/logs/ 和 stdout 捕获的文件 (本轮 dashboard 启动日志 fallback)
 // =====================================================================
 
+// handleLogsTail GET /api/logs/tail?n=&source=: 返回日志文件末尾 n 行; 日志源不存在时
+// 回 200 + note (而不是 404), 让前端能显示"该组件没在跑"这种正常状态。
 func (s *Server) handleLogsTail(w http.ResponseWriter, r *http.Request) {
 	n := parseIntQuery(r, "n", 500)
 	path := s.resolveLogBySource(r)
@@ -747,6 +758,21 @@ func (s *Server) handleLogsTail(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLogsStream GET /api/logs/stream: 以 SSE 实时 tail 日志 (先补最后 200 行, 之后增量)。
+//
+// 算法解读：
+//
+//	原理：SSE 帧格式是 `event: <名>\ndata: <一行>\n\n`。开流时先一次性补发末尾 200 行,
+//	      再把文件偏移**定位到末尾**, 然后每 800ms 用 ReadString 把新追加的内容全部读干
+//	      并 flush —— 轮询而非阻塞读, 因为文件是别的进程在追加, 没有"读到 EOF 再唤醒"的机制。
+//	关键不变量：Seek(0, End) 必须在补发之后 —— 顺序反了会把补发过的内容再推一遍, 前端
+//	      看到重复行。data 行必须把换行替换成空格: SSE 的 data 以换行为界, 原文里的换行
+//	      会被解析成新的字段行, 帧结构当场破掉。
+//	代价与边界：800ms 的轮询间隔决定了延迟下界, 且每连接一个 goroutine; 客户端断开靠
+//	      r.Context().Done() 退出。行超长 (超过 bufio 默认缓冲) 时 ReadString 会返回
+//	      ErrBufferFull, 该轮循环 break —— 长行会被截断丢弃。
+//	设计权衡：不用 fsnotify 监听文件变化, 因为 tail 的目标是"能看到就行", 轮询实现更短、
+//	      且天然兼容日志轮转 (每轮重新读到 EOF 即可)。
 func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -843,6 +869,7 @@ func (s *Server) resolveLogPath(r *http.Request) string {
 	return ""
 }
 
+// tailLines 读文件末尾 n 行 (n<=0 取 100); 文件短于 n 行时返回全部。
 func tailLines(path string, n int) ([]string, error) {
 	if n <= 0 {
 		n = 100
@@ -920,6 +947,8 @@ type hiveMetricPointDTO struct {
 	Value     float64   `json:"value"`
 }
 
+// handleHiveMind GET /api/hivemind: 汇总 swarm_intel 的落盘面 (预测/信素/指标) 供前端展示。
+// 数据目录不存在时不算错误, 只把 enabled=false 与原因写进 notes。
 func (s *Server) handleHiveMind(w http.ResponseWriter, r *http.Request) {
 	resp := hiveMindResp{
 		Summary: map[string]interface{}{},
@@ -1020,6 +1049,8 @@ type timeSeriesResp struct {
 	ChangePct *float64       `json:"changePct,omitempty"`
 }
 
+// handleTimeSeries GET /api/timeseries/{module}/{metric}: 返回某模块某指标的时间序列与趋势。
+// 配了 CLAUDE_GO_PROMETHEUS_URL 时优先走 Prometheus range query, 否则回落到本地 JSONL 指标。
 func (s *Server) handleTimeSeries(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/timeseries/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
@@ -1203,6 +1234,7 @@ func SetActionSink(s ActionSink) {
 	actionSinkMu.Unlock()
 }
 
+// currentActionSink 返回当前注册的动作队列消费方; 未注册时返回 nil。
 func currentActionSink() ActionSink {
 	actionSinkMu.RLock()
 	defer actionSinkMu.RUnlock()
@@ -1267,6 +1299,10 @@ func drainQueuedAction(ctx context.Context, queueDir, actionID string) (status, 
 	return rec.Status, rec.TaskID
 }
 
+// handleAction POST /api/actions/{kind}/{action}/{target}: 面板动作的统一入口。
+//
+// 路径分三段 (kind/action/target), 可选 JSON body 补充参数。注册了消费方时, 团队类动作
+// 让路给队列独占执行 (见 actionSinkOwns); 未注册时保持直接执行的旧行为。
 func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
@@ -1484,6 +1520,8 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// toggleCron 就地改写 cron_jobs.json 里某个作业的启用状态 (enable/resume ↔ active, disable/pause ↔ paused)。
+// 作业 ID 不存在时报错而非静默成功; 落盘是整文件重写 (无锁, 与主进程并发写有覆盖风险)。
 func (s *Server) toggleCron(id, action string) error {
 	path := s.provider.pathIn("cron", "cron_jobs.json")
 	b, err := os.ReadFile(path)
@@ -1517,6 +1555,7 @@ func (s *Server) toggleCron(id, action string) error {
 	return os.WriteFile(path, newB, 0o644)
 }
 
+// firstNonEmpty 返回第一个非空白字符串; 全空则返回空串。
 func firstNonEmpty(ss ...string) string {
 	for _, s := range ss {
 		if strings.TrimSpace(s) != "" {
@@ -1541,6 +1580,8 @@ type dreamingDiagnosisResp struct {
 	Recommendations []string `json:"recommendations"`
 }
 
+// handleDreamingDiagnosis GET /api/dreaming/diagnosis: 逐项排查 Dreaming 为何没产出
+// (CLI 是否接线 / memory 目录 / dream 文件数 / 配置开关), 并给出对应的修复建议。
 func (s *Server) handleDreamingDiagnosis(w http.ResponseWriter, r *http.Request) {
 	resp := dreamingDiagnosisResp{}
 	// 诊断 1: CLI 是否接入
@@ -1606,6 +1647,7 @@ func pickGoRoot(stateDir string) string {
 
 // ============ small utils ============
 
+// truncateString 按**字符** (rune) 数截断并补省略号, 避免把多字节字符切一半。
 func truncateString(s string, max int) string {
 	if len([]rune(s)) <= max {
 		return s

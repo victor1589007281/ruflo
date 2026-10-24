@@ -373,6 +373,7 @@ func (cs *ConstraintSet) WithBlocking(b string) *ConstraintSet {
 	return cs
 }
 
+// ensureTools 懒初始化 Tools 约束, 让调用方不必先判空。
 func (cs *ConstraintSet) ensureTools() {
 	if cs.Tools == nil {
 		cs.Tools = &ToolConstraint{}

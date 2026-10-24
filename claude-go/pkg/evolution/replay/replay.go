@@ -121,6 +121,7 @@ type Config struct {
 	Gate GateRunner
 }
 
+// withDefaults 补齐零值参数: 并发 2、单任务 5 分钟、及格线 0.6 (与既有 tests/eval 一致)。
 func (c Config) withDefaults() Config {
 	if c.Concurrency <= 0 {
 		c.Concurrency = 2
@@ -283,6 +284,21 @@ func (h *Harness) Run(ctx context.Context, cand Candidate, tasks []Task) (Report
 	return rep, nil
 }
 
+// runOne 评测单条任务: 硬超时跑 Produce → 空产出短路 → 确定性断言/门禁 → Judge 打分。
+//
+// 算法解读：
+//
+//	原理：一条**短路顺序**固定的判定链, 每一步都比后一步便宜且更硬 —— 硬超时 (只花时间)
+//	      → 空产出 (只花一次 TrimSpace) → 确定性断言 (字符串包含) → 确定性门禁 (跑命令)
+//	      → LLM Judge (花钱)。顺序反了就是拿 LLM 的钱去判能确定性判的事。
+//	关键不变量：确定性断言是**硬否决** —— 不过就直接 0 分且不再问 Judge。让 LLM 的宽容
+//	      盖过"产出里根本没有这个子串"这种硬事实, 会把一个明显不合格的产物判成通过。
+//	      另外 Score 必须夹在 [0,1]: Judge 返回越界值会污染 MeanScore 与 Passed。
+//	代价与边界：硬超时靠**泄漏一个 goroutine** 实现 (Produce 不认 ctx 时它不会停) ——
+//	      缓冲通道保证它最终能 send 完退出, 不会永久阻塞。这是刻意的取舍: 泄漏一个
+//	      goroutine 好过整轮评测挂死。
+//	设计权衡：judge 为 nil 时"断言全过即满分" —— 让 harness 在无 LLM 环境下仍可用,
+//	      代价是这种配置下没有质量分, 只能回答"产出在不在"。
 func (h *Harness) runOne(ctx context.Context, cand Candidate, t Task) Result {
 	start := time.Now()
 	res := Result{Fingerprint: t.Fingerprint(), TaskID: t.ID}

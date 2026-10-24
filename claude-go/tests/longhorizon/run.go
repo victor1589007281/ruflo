@@ -200,6 +200,9 @@ func (e *ExecRunner) Run(task Task, spec RunSpec, workDir string) (TaskOutcome, 
 	return out, nil
 }
 
+// envSlice 把环境变量 map 展开成 "k=v" 切片, 供 exec.Cmd.Env 使用。
+//
+// 注意：map 遍历顺序随机, 展开结果顺序不稳定——env 语义上无所谓, 但不要拿它做相等比较。
 func envSlice(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k, v := range m {
@@ -208,6 +211,9 @@ func envSlice(m map[string]string) []string {
 	return out
 }
 
+// truncate 按字节截断字符串并追加「…(截断)」标记。
+//
+// 注意：截断点是字节下标而非字符边界, 中文可能被切成半个字符, 拼出的报告里会出现乱码。
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -223,6 +229,7 @@ func parseTurns(out []byte) int {
 	return lastIntAfter(out, []string{"turns=", "回合数=", "turn_count="})
 }
 
+// parseCompactSpans 从运行输出里读压缩次数; 与 parseTurns 同一条纪律——读不到就是 0, 不给默认值。
 func parseCompactSpans(out []byte) int {
 	return lastIntAfter(out, []string{"compact_spans=", "压缩次数=", "compactions="})
 }

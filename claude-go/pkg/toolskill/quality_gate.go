@@ -15,6 +15,7 @@ type RepoQualityGate struct {
 	runtime *Runtime
 }
 
+// NewRepoQualityGate 构造 repo-quality-gate 技能 (只读、不可并发): 串行跑 build/test/vet/format。
 // NewRepoQualityGate creates a new RepoQualityGate.
 func NewRepoQualityGate(rt *Runtime) *RepoQualityGate {
 	return &RepoQualityGate{
@@ -48,6 +49,20 @@ type CheckResult struct {
 	Errors   string `json:"errors,omitempty"`
 }
 
+// Execute 执行质量门禁: 按 checks 列表**逐项串行**跑 Go 工具链, 全部通过才算 passed。
+//
+// 算法解读：
+//
+//	原理：把每项检查映射成一条 exec.CommandContext (go build / go test / go vet /
+//	      gofmt -l), 以退出码判定通过与否, 收集输出与耗时后汇总。
+//	关键不变量：passed = **所有**检查都通过 (allPassed 一旦置 false 不会再翻回);
+//	      未知的 check 名不匹配任何 case, 会产出一条 Passed=false 的空结果 ——
+//	      即"写错检查名"等于"该项永远失败", 而不是被忽略。
+//	代价与边界：串行执行, 总耗时是各项之和 (test 默认 60s 超时, 由 ctx 传递);
+//	      任一项超时会以非零退出码落进 Passed=false, 与"真有错"不可区分。
+//	设计权衡：不并行 —— build/vet/test 共享同一份构建缓存与工作目录,
+//	      并发跑既抢 CPU 又让失败输出互相穿插, 反而更难定位。
+//
 // Execute runs the quality gate.
 func (t *RepoQualityGate) Execute(ctx context.Context, input json.RawMessage) (map[string]any, error) {
 	var in struct {
@@ -109,6 +124,8 @@ func (t *RepoQualityGate) Execute(ctx context.Context, input json.RawMessage) (m
 			result.Passed = strings.TrimSpace(string(out)) == "" && err == nil
 		}
 
+		// 未知的 check 名不命中任何 case, 会留下 Passed=false 的空结果 ——
+		// 也就是说拼错检查名等价于"该项永远失败", 而不是被静默忽略。
 		if !result.Passed {
 			allPassed = false
 		}
@@ -123,6 +140,7 @@ func (t *RepoQualityGate) Execute(ctx context.Context, input json.RawMessage) (m
 	}, nil
 }
 
+// countPassed 数出通过项个数 (供 failed_count = 总数 - 通过数 使用)。
 func countPassed(results []CheckResult) int {
 	c := 0
 	for _, r := range results {

@@ -314,6 +314,10 @@ func (g *RateLimitGuard) Snapshot() GuardSnapshot {
 
 // ── 内部方法 ──
 
+// waitForPause 阻塞直到全局退避窗口结束 (每轮重新读一次 pauseUntil, 所以期间被延长的退避也会被等到)。
+//
+// 注意：睡眠期间持有**零把锁**, 所以退避窗口可以被 On429 继续推后 —— 这也是循环
+// 而非单次 Sleep 的原因。
 func (g *RateLimitGuard) waitForPause() {
 	for {
 		g.mu.Lock()
@@ -328,6 +332,18 @@ func (g *RateLimitGuard) waitForPause() {
 	}
 }
 
+// acquireRPM 阻塞直到从 RPM 令牌桶里取走一个令牌 (每次请求消耗 1 个)。
+//
+// 算法解读：
+//
+//	原理：令牌桶 —— 桶容量与补充速率都是 RPM, 取不到就按"还差多少令牌 / 每秒补充多少"
+//		算出精确的等待时长再睡, 而不是固定轮询间隔。
+//	关键不变量：**扣减与检查必须在同一把锁内完成** (refillRPMTokens 也要求持锁),
+//		否则两个并发请求会同时看到 rpmTokens >= 1 而双扣同一个令牌。
+//	代价与边界：等待期间锁是放开的 (解锁后才 Sleep), 所以多路并发会各自算出相近的
+//		等待时长并同时醒来 —— 加 0~200ms 抖动就是为了把这一群错开 (防雷群);
+//		抖动让实际速率略低于标称 RPM, 是刻意的。
+//	设计权衡：不做排队唤醒 (FIFO), 用"睡-重试"换实现简单; 代价是唤醒顺序不保证公平。
 func (g *RateLimitGuard) acquireRPM() {
 	for {
 		g.mu.Lock()
@@ -348,6 +364,11 @@ func (g *RateLimitGuard) acquireRPM() {
 	}
 }
 
+// refillRPMTokens 按上次补充至今的时长往桶里加令牌, 上限为 rpmCapacity。
+//
+// 注意：**调用方必须持有 g.mu** (本函数自己不加锁, 见 acquireRPM 与 refillLoop);
+// 按实际经过的时间比例补充 (elapsed * RPM / 60), 所以桶不会因为 goroutine 被调度
+// 延误而少补 —— 它用的是时间差而不是 tick 次数。
 func (g *RateLimitGuard) refillRPMTokens() {
 	now := time.Now()
 	elapsed := now.Sub(g.rpmLastTick).Seconds()
@@ -359,6 +380,10 @@ func (g *RateLimitGuard) refillRPMTokens() {
 	g.rpmLastTick = now
 }
 
+// refillLoop 每秒补一次 RPM 令牌的后台循环。
+//
+// 注意：**永不退出** (没有停止通道, ticker 也不 Stop) —— 每构造一个 guard 就常驻一个
+// goroutine, 生命周期与进程一致; 且它自己不加 select, 所以没有优雅停机路径。
 func (g *RateLimitGuard) refillLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	for range ticker.C {
@@ -368,10 +393,19 @@ func (g *RateLimitGuard) refillLoop() {
 	}
 }
 
+// acquireSem 取走一个并发槽 (阻塞)。
+//
+// 注意：这个信号量是**预填充**的 —— 构造时按 MaxParallel 灌满令牌, 取走即占用、
+// 归还即释放 (与常见的"空桶 + 发送即占用"方向相反, 读代码时容易看反)。
+// 通道容量固定为初始 MaxParallel, 所以 AIMD 想"加槽"只能加到容量上限为止。
 func (g *RateLimitGuard) acquireSem() {
 	<-g.sem
 }
 
+// releaseSem 归还一个并发槽。
+//
+// 注意：带 default 的 select 让**超额归还静默丢弃** (通道满时不阻塞、不 panic) ——
+// 这是为了容忍重复 release; 代价是真正的泄漏 (少还) 也不会在这里暴露。
 func (g *RateLimitGuard) releaseSem() {
 	select {
 	case g.sem <- struct{}{}:

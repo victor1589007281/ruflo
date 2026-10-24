@@ -26,8 +26,11 @@ func NewMetricsCollectHook(metrics *EngineMetrics) *MetricsCollectHook {
 	return &MetricsCollectHook{metrics: metrics}
 }
 
+// Name 返回 hook 名 "metrics_collect"。
 func (h *MetricsCollectHook) Name() string                { return "metrics_collect" }
+// Priority 返回执行优先级 200: 纯观测型, 排在干预型 hook 之后。
 func (h *MetricsCollectHook) Priority() int               { return 200 }
+// Phases 声明本 hook 只挂在 PhasePostToolUse 阶段。
 func (h *MetricsCollectHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePostToolUse}
 }
@@ -69,8 +72,11 @@ func NewTurnMetricsHook(metrics *EngineMetrics, sessionStore SessionStore, trajS
 	return &TurnMetricsHook{metrics: metrics, sessionStore: sessionStore, trajStore: trajStore}
 }
 
+// Name 返回 hook 名 "turn_metrics"。
 func (h *TurnMetricsHook) Name() string                { return "turn_metrics" }
+// Priority 返回执行优先级 10。
 func (h *TurnMetricsHook) Priority() int               { return 10 }
+// Phases 声明本 hook 只挂在 PhasePostTurn 阶段。
 func (h *TurnMetricsHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePostTurn}
 }

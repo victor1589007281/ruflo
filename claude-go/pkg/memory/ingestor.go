@@ -205,6 +205,7 @@ func (ig *Ingestor) scoreImportance(content, source string) float64 {
 	return score
 }
 
+// maxF 返回两浮点数的较大者。
 func maxF(a, b float64) float64 {
 	if a > b {
 		return a

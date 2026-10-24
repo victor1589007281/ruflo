@@ -142,6 +142,7 @@ type budgetExceeded struct {
 	got   string
 }
 
+// String 把超限原因渲染成中文文案 (类别 + 上限 + 实际), 供错误信息与 journal 事件复用。
 func (b budgetExceeded) String() string {
 	return fmt.Sprintf("超出图预算 %s: 上限 %s, 实际 %s", b.kind, b.limit, b.got)
 }

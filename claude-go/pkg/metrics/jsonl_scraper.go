@@ -112,6 +112,7 @@ type ScrapeAndServe struct {
 	handler http.Handler
 }
 
+// ServeHTTP 在转发给内层 handler 之前先 Scrape 一次, 保证本次采集能拿到最新行。
 func (s *ScrapeAndServe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.scraper.Scrape()
 	s.handler.ServeHTTP(w, r)
@@ -122,6 +123,7 @@ func WrapWithScrape(scraper *JSONLScraper, handler http.Handler) http.Handler {
 	return &ScrapeAndServe{scraper: scraper, handler: handler}
 }
 
+// moduleFromPath 从 "<module>.jsonl" 文件名里取回 module 名 (去扩展名)。
 func moduleFromPath(path string) string {
 	base := filepath.Base(path)
 	return base[:len(base)-len(".jsonl")]

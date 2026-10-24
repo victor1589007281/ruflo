@@ -269,12 +269,14 @@ func (o *Orchestrator) SetProgressCallback(fn func(phase string, iteration int, 
 	o.progressCallback = fn
 }
 
+// reportProgress 把进展上报给注入的回调; 未注入时静默跳过。
 func (o *Orchestrator) reportProgress(phase string, iteration int, bytesWritten int64, taskID string) {
 	if o.progressCallback != nil {
 		o.progressCallback(phase, iteration, bytesWritten, taskID)
 	}
 }
 
+// touchActivity 触发活动追踪回调, 让 watchdog 知道编排器仍在推进; 未注入时静默跳过。
 func (o *Orchestrator) touchActivity() {
 	if o.activityCallback != nil {
 		o.activityCallback()
@@ -296,12 +298,14 @@ func (o *Orchestrator) SetDesignContext(designDoc, planDoc string) {
 	o.planDoc = planDoc
 }
 
+// SetPlanningLanguage 显式指定规划语言适配器 (go/python/...); 空串表示让 planningAdapter 按 objective 惰性推断。
 func (o *Orchestrator) SetPlanningLanguage(language string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.planningLang = inferPlanningLanguageID("", language)
 }
 
+// planningAdapter 返回当前规划语言适配器; 未显式设置时按 objective 推断一次并缓存到 o.planningLang。
 func (o *Orchestrator) planningAdapter(objective string) planningLanguageAdapter {
 	if o.planningLang == "" {
 		o.planningLang = inferPlanningLanguageID(objective, "")
@@ -523,6 +527,7 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 		if err != nil {
 			return nodes, fmt.Errorf("创建V2 DAG任务失败: %w", err)
 		}
+		// 自依赖会让 V2 DAG 拒绝入队 (任务永远不就绪); 删掉这条边重建一次即可, 一次重试足够。
 		if containsString(depV2IDs, v2ID) {
 			depV2IDs = removeString(depV2IDs, v2ID)
 			if full, ok := o.dag.(addTaskFullDAG); ok {
@@ -598,6 +603,7 @@ func (o *Orchestrator) rawTasksToDAG(rawTasks []rawTask, teamName string) ([]*Ta
 
 	o.totalCount = len(nodes)
 	o.dagMaxWidth = o.computeDAGWidth(widthTasks)
+	// 并行度上限取"配置值"与"DAG 实际宽度"的较小者: 宽度比配置小说明任务本身偏串行, 强行放大并发没有意义。
 	if o.dagMaxWidth > 0 && (o.config.MaxParallel <= 0 || o.config.MaxParallel > o.dagMaxWidth) {
 		o.config.MaxParallel = o.dagMaxWidth
 	}
@@ -645,6 +651,7 @@ type wbsJSONTask struct {
 
 type flexibleWBSID string
 
+// UnmarshalJSON 让 flexibleWBSID 同时接受 JSON 数字与字符串两种 id 形态。
 func (id *flexibleWBSID) UnmarshalJSON(data []byte) error {
 	s := strings.TrimSpace(string(data))
 	if s == "" || s == "null" {
@@ -660,6 +667,7 @@ func (id *flexibleWBSID) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// stripCodeFences 剥离 ```json 代码围栏返回围栏内正文; 无围栏时原样返回。
 func stripCodeFences(s string) string {
 	re := regexp.MustCompile("(?s)```(?:json)?\\s*\n?(.*?)```")
 	if m := re.FindStringSubmatch(s); len(m) > 1 {
@@ -668,6 +676,7 @@ func stripCodeFences(s string) string {
 	return s
 }
 
+// parseWBSFromJSON 策略 1: 逐个尝试候选 JSON 主体, 返回首个可解析且 tasks 非空的结果。
 func parseWBSFromJSON(planOutput string) []rawTask {
 	for _, body := range wbsJSONCandidateBodies(planOutput) {
 		var wbs wbsJSON
@@ -679,6 +688,7 @@ func parseWBSFromJSON(planOutput string) []rawTask {
 	return nil
 }
 
+// rawTasksFromWBS 把 JSON WBS 结构转成 rawTask 列表, 丢弃 id 为空的任务。
 func rawTasksFromWBS(wbs wbsJSON) []rawTask {
 	if len(wbs.Tasks) == 0 {
 		return nil
@@ -727,6 +737,7 @@ func rawTasksFromWBS(wbs wbsJSON) []rawTask {
 	return tasks
 }
 
+// wbsJSONCandidateBodies 生成候选 JSON 主体: 去围栏文本 → 原文 → 原文中所有顶层 {...} 片段 (去重保序)。
 func wbsJSONCandidateBodies(text string) []string {
 	var candidates []string
 	add := func(s string) {
@@ -749,6 +760,18 @@ func wbsJSONCandidateBodies(text string) []string {
 	return candidates
 }
 
+// extractJSONObjectCandidates 扫描文本, 提取所有顶层平衡的 {...} 片段。
+//
+// 算法解读：
+//
+//	原理：Planner 常把 JSON 夹在解释性文字里, 需要一个不依赖 json.Decoder 的括号配对扫描,
+//	      把每个顶层对象原样切出来再逐个交给 json.Unmarshal 试。
+//	关键不变量：字符串字面量内部的 {} 与转义后的引号绝不能影响深度计数 —— 否则
+//	      {"a":"}{"} 这类合法 JSON 会被切错, 后续 Unmarshal 全部失败, 计划直接降级到 fallback。
+//	代价与边界：单遍 O(n), 除结果切片外无额外分配; 只认顶层对象, 嵌套对象由外层整体带出,
+//	      不单独产出; 括号不配对 (输出被截断) 时该片段被丢弃, 不会 panic。
+//	设计权衡：宁可返回多个候选让上层逐个试, 也不在这里做 JSON 修复 —— 修复逻辑留给上层
+//	      parseWBSFromJSON, 扫描器保持"只切不改"的单一职责。
 func extractJSONObjectCandidates(text string) []string {
 	var out []string
 	start := -1
@@ -794,6 +817,7 @@ func extractJSONObjectCandidates(text string) []string {
 
 // --- 策略 2: 宽松 markdown 表格 ---
 
+// parseWBSFromTable 策略 2: 从宽松 markdown 表格解析任务 (至少 6 列, 跳过表头与空标题行)。
 func parseWBSFromTable(planOutput string) []rawTask {
 	lines := strings.Split(planOutput, "\n")
 	tableRe := regexp.MustCompile(`^\|\s*(\d+)\s*\|`)
@@ -858,6 +882,7 @@ func parseWBSFromTable(planOutput string) []rawTask {
 
 // --- 策略 3: 编号列表启发式 ---
 
+// parseWBSFromNumberedList 策略 3: 从 "1. xxx" 编号列表启发式解析, 顺带剥离 "角色:"/"依赖:" 字段。
 func parseWBSFromNumberedList(planOutput string) []rawTask {
 	lines := strings.Split(planOutput, "\n")
 	listRe := regexp.MustCompile(`^\s*(\d+)[.)]\s+(.+)`)
@@ -900,6 +925,7 @@ func parseWBSFromNumberedList(planOutput string) []rawTask {
 
 // --- Repair Prompt (1 轮 LLM 修复) ---
 
+// repairPlanFormat 用一轮 LLM 把无法解析的计划重写成严格 JSON; 任一步失败返回空串, 由调用方继续走 fallback。
 func (o *Orchestrator) repairPlanFormat(ctx context.Context, badOutput, objective string, factory CreateAgentFunc) string {
 	targetRoot := inferObjectiveTargetRoot(objective)
 	targetRule := ""
@@ -976,6 +1002,7 @@ func (o *Orchestrator) repairPlanFormat(ctx context.Context, badOutput, objectiv
 	return result
 }
 
+// objectiveManifestPath 按 objective 的语言线索推断项目 manifest 路径 (go.mod/pyproject.toml/...), 兜底 README.md。
 func objectiveManifestPath(root, objective string) string {
 	lower := strings.ToLower(objective)
 	switch {
@@ -998,6 +1025,7 @@ func objectiveManifestPath(root, objective string) string {
 
 // --- Fallback: 从自由文本提取最小 DAG ---
 
+// fallbackExtractTasks 兜底策略: 用正则从自由文本抓 task/步骤 行; 抓不到再退化为 markdown 标题。
 func (o *Orchestrator) fallbackExtractTasks(planOutput string) []rawTask {
 	lines := strings.Split(planOutput, "\n")
 	taskRe := regexp.MustCompile(`(?i)(?:task|任务|步骤|step)\s*#?\d*[.:：]?\s*(.{5,80})`)
@@ -1045,6 +1073,7 @@ func (o *Orchestrator) fallbackExtractTasks(planOutput string) []rawTask {
 	return tasks
 }
 
+// validateParsedWBSForObjective 校验原始 WBS: 非全元任务、Leaf 预算、未请求表面, 以及目标目录下的 targetFiles/go.mod 约束。
 func validateParsedWBSForObjective(rawTasks []rawTask, objective string) error {
 	if len(rawTasks) == 0 {
 		return fmt.Errorf("empty WBS")
@@ -1096,6 +1125,7 @@ func validateParsedWBSForObjective(rawTasks []rawTask, objective string) error {
 	return nil
 }
 
+// validateFinalWBSForObjective 校验二次拆分后的最终 WBS: design-complete 目标拒绝确定性 fallback, 且 Leaf 数不超最终预算。
 func validateFinalWBSForObjective(rawTasks []rawTask, objective string) error {
 	if len(rawTasks) == 0 {
 		return fmt.Errorf("empty normalized WBS")
@@ -1111,6 +1141,7 @@ func validateFinalWBSForObjective(rawTasks []rawTask, objective string) error {
 	return nil
 }
 
+// hasObjectiveFallbackRawTask 判断任务是否来自 objective-fallback 合成路径 (按 splitReason 标记识别)。
 func hasObjectiveFallbackRawTask(rawTasks []rawTask) bool {
 	for _, task := range rawTasks {
 		if strings.Contains(strings.ToLower(task.splitReason), "objective-fallback") {
@@ -1120,6 +1151,7 @@ func hasObjectiveFallbackRawTask(rawTasks []rawTask) bool {
 	return false
 }
 
+// validateWBSLeafBudget 校验可执行 Leaf 数非零且不超过 objective 预算。
 func validateWBSLeafBudget(rawTasks []rawTask, objective string) error {
 	leafCount := countExecutableWBSLeaves(rawTasks)
 	if leafCount == 0 {
@@ -1132,6 +1164,7 @@ func validateWBSLeafBudget(rawTasks []rawTask, objective string) error {
 	return nil
 }
 
+// countExecutableWBSLeaves 统计可执行 Leaf 数 (排除 macro/verification 与泛化元任务标题)。
 func countExecutableWBSLeaves(rawTasks []rawTask) int {
 	count := 0
 	for _, task := range rawTasks {
@@ -1147,6 +1180,7 @@ func countExecutableWBSLeaves(rawTasks []rawTask) int {
 	return count
 }
 
+// objectiveWBSLeafBudget 返回入库前的 Leaf 预算: design-complete 72 / 扩展范围 28 / 默认 18。
 func objectiveWBSLeafBudget(objective string) int {
 	if objectiveRequiresDesignCompleteMode(objective) {
 		return designCompleteWBSBudget(objective, 72)
@@ -1157,6 +1191,7 @@ func objectiveWBSLeafBudget(objective string) int {
 	return 18
 }
 
+// objectiveWBSFinalLeafBudget 返回二次拆分后的最终 Leaf 预算 (比入库前宽松, design-complete 至少 120)。
 func objectiveWBSFinalLeafBudget(objective string) int {
 	if objectiveRequiresDesignCompleteMode(objective) {
 		return max(120, designCompleteWBSBudget(objective, 120))
@@ -1167,6 +1202,18 @@ func objectiveWBSFinalLeafBudget(objective string) int {
 	return 20
 }
 
+// designCompleteWBSBudget 按 objective 引用的设计语料规模放大 design-complete 模式的 DAG 预算。
+//
+// 算法解读：
+//
+//	原理：完整设计任务需要足够多的 Leaf 才能把每个设计点拆小; 预算按被引用设计文档的
+//	      数量与字节数线性放大, 而不是写死一个常数。
+//	关键不变量：返回值必须落在 [floor, 260] 闭区间内 —— 上限 260 是防止 Planner 输出
+//	      病态膨胀后把并发压力推到不可控; 下限 floor 保证即使设计语料读不到也不缩减预算。
+//	代价与边界：会遍历目标目录 (localReferenceDocStats 里的 WalkDir), 大目录下有 IO 成本;
+//	      语料读不到时退化为 floor, 不报错。
+//	设计权衡：用文档数 (每篇 +10) 与总字节 (每 2KB +1) 两个口径取较大者, 兼顾"篇数多但都短"
+//	      与"篇数少但很长"两种设计语料形态。
 func designCompleteWBSBudget(objective string, floor int) int {
 	paths := extractLocalReferencePaths(objective)
 	if len(paths) == 0 {
@@ -1179,11 +1226,13 @@ func designCompleteWBSBudget(objective string, floor int) int {
 	// Full-design objectives need enough DAG room to keep leaf tasks small.
 	// Scale with the referenced design corpus, but cap to avoid pathological
 	// planner output from turning into unlimited concurrency pressure.
+	// 两个口径取较大者: 兼顾"篇数多但每篇都短"与"篇数少但单篇很长"两种设计语料形态。
 	byDocs := 80 + docCount*10
 	bySize := 80 + int(totalBytes/2048)
 	return min(260, max(floor, max(byDocs, bySize)))
 }
 
+// localReferenceDocStats 统计 objective 引用的本地设计文档数与总字节数 (目录递归, 跳过 .git/node_modules 等)。
 func localReferenceDocStats(paths []string) (int, int64) {
 	var count int
 	var total int64
@@ -1229,6 +1278,7 @@ func localReferenceDocStats(paths []string) (int, int64) {
 	return count, total
 }
 
+// objectiveRequestsExpandedScope 判断 objective 是否要求扩展范围 (full/完整/分布式 等关键词; design-complete 一律算扩展)。
 func objectiveRequestsExpandedScope(objective string) bool {
 	if objectiveRequiresDesignCompleteMode(objective) {
 		return true
@@ -1248,10 +1298,12 @@ func objectiveRequestsExpandedScope(objective string) bool {
 	return false
 }
 
+// objectiveAllowsDeterministicV1Fallback 只有非 design-complete 目标才允许退化为确定性 V1 fallback DAG。
 func objectiveAllowsDeterministicV1Fallback(objective string) bool {
 	return !objectiveRequiresDesignCompleteMode(objective)
 }
 
+// objectiveRequiresDesignCompleteMode 判断 objective 是否要求完整覆盖设计 (强关键词, 或"指向设计语料 + 参考/基于"的组合)。
 func objectiveRequiresDesignCompleteMode(objective string) bool {
 	lower := strings.ToLower(objective)
 	strongHints := []string{
@@ -1282,6 +1334,7 @@ func objectiveRequiresDesignCompleteMode(objective string) bool {
 	return false
 }
 
+// objectiveReferencesDesignSource 判断 objective 是否指向具体设计来源 (/v2、设计文档 等关键词或路径基名)。
 func objectiveReferencesDesignSource(objective string) bool {
 	lower := strings.ToLower(objective)
 	if strings.Contains(lower, "/v2") || strings.Contains(lower, "\\v2") {
@@ -1305,6 +1358,7 @@ func objectiveReferencesDesignSource(objective string) bool {
 	return false
 }
 
+// validateUnrequestedWBSSurfaces 拒绝 objective 未请求却出现对外协议/服务面的 WBS (最多报 3 个任务名)。
 func validateUnrequestedWBSSurfaces(rawTasks []rawTask, objective string) error {
 	if objectiveRequestsExternalProtocolSurface(objective) {
 		return nil
@@ -1332,6 +1386,7 @@ func validateUnrequestedWBSSurfaces(rawTasks []rawTask, objective string) error 
 	return nil
 }
 
+// objectiveRequestsExternalProtocolSurface 判断 objective 是否显式请求对外协议面 (扩展范围一律视为请求)。
 func objectiveRequestsExternalProtocolSurface(objective string) bool {
 	if objectiveRequestsExpandedScope(objective) {
 		return true
@@ -1339,6 +1394,7 @@ func objectiveRequestsExternalProtocolSurface(objective string) bool {
 	return containsExternalProtocolSurfaceTerm(objective)
 }
 
+// rawTaskUsesExternalProtocolSurface 任务的任一文本字段命中对外协议面关键词即算使用。
 func rawTaskUsesExternalProtocolSurface(task rawTask) bool {
 	parts := []string{task.title, task.designRef, task.accept, task.verifyCommand, task.parentID, task.capabilityID, task.parallelGroup}
 	parts = append(parts, task.targetFiles...)
@@ -1352,6 +1408,7 @@ func rawTaskUsesExternalProtocolSurface(task rawTask) bool {
 	return false
 }
 
+// containsExternalProtocolSurfaceTerm 检测文本里的对外服务/RPC 面词 (grpc/proto/endpoint/http client 等)。
 func containsExternalProtocolSurfaceTerm(text string) bool {
 	lower := strings.ToLower(text)
 	if strings.Contains(lower, ".proto") || strings.Contains(lower, "cmd/server") || strings.Contains(lower, "/server/") ||
@@ -1365,6 +1422,7 @@ func containsExternalProtocolSurfaceTerm(text string) bool {
 	return re.MatchString(lower)
 }
 
+// validateUnrequestedAdvancedCoreSurfaces 拒绝 objective 未请求却出现高级内核面 (HNSW/LSM/WAL 等) 的 WBS。
 func validateUnrequestedAdvancedCoreSurfaces(rawTasks []rawTask, objective string) error {
 	if objectiveRequestsAdvancedCoreSurface(objective) {
 		return nil
@@ -1392,6 +1450,7 @@ func validateUnrequestedAdvancedCoreSurfaces(rawTasks []rawTask, objective strin
 	return nil
 }
 
+// objectiveRequestsAdvancedCoreSurface 判断 objective 是否显式请求高级内核面。
 func objectiveRequestsAdvancedCoreSurface(objective string) bool {
 	if objectiveRequestsExpandedScope(objective) {
 		return true
@@ -1399,6 +1458,7 @@ func objectiveRequestsAdvancedCoreSurface(objective string) bool {
 	return containsAdvancedCoreSurfaceTerm(objective)
 }
 
+// rawTaskUsesAdvancedCoreSurface 任务的任一文本字段命中高级内核面关键词即算使用。
 func rawTaskUsesAdvancedCoreSurface(task rawTask) bool {
 	parts := []string{task.title, task.designRef, task.accept, task.verifyCommand, task.parentID, task.capabilityID, task.parallelGroup, task.splitReason}
 	parts = append(parts, task.targetFiles...)
@@ -1412,6 +1472,7 @@ func rawTaskUsesAdvancedCoreSurface(task rawTask) bool {
 	return false
 }
 
+// containsAdvancedCoreSurfaceTerm 检测文本里的高级内核面词 (HNSW/LSM/MVCC/WAL/量化 等)。
 func containsAdvancedCoreSurfaceTerm(text string) bool {
 	lower := strings.ToLower(text)
 	terms := []string{
@@ -1437,6 +1498,7 @@ func containsAdvancedCoreSurfaceTerm(text string) bool {
 	return false
 }
 
+// applyObjectiveTargetRootToWBS 把所有任务的 target/write/read 文件统一前缀到 objective 指定的目标根目录下。
 func applyObjectiveTargetRootToWBS(rawTasks []rawTask, targetRoot string) {
 	targetRoot = strings.Trim(strings.TrimSpace(filepath.ToSlash(targetRoot)), "/")
 	if targetRoot == "" {
@@ -1454,6 +1516,7 @@ func applyObjectiveTargetRootToWBS(rawTasks []rawTask, targetRoot string) {
 	}
 }
 
+// normalizeGoModToRoot 安全网: 把被 Planner 放到子目录的 go.mod 强制提升到项目根目录。
 func normalizeGoModToRoot(files []string, targetRoot string) []string {
 	prefix := targetRoot + "/"
 	rootGoMod := prefix + "go.mod"
@@ -1469,6 +1532,7 @@ func normalizeGoModToRoot(files []string, targetRoot string) []string {
 	return uniqueTrimmedStrings(out)
 }
 
+// prefixObjectiveTargetFiles 给文件路径补目标根前缀, 兼容 "X/" 占位符、绝对路径与已带前缀的路径。
 func prefixObjectiveTargetFiles(files []string, targetRoot string) []string {
 	if len(files) == 0 {
 		return files
@@ -1504,6 +1568,7 @@ func prefixObjectiveTargetFiles(files []string, targetRoot string) []string {
 	return uniqueTrimmedStrings(out)
 }
 
+// absolutePathUnderTargetRoot 从绝对路径中截出目标根之后的相对部分; 不在目标根下时返回空串。
 func absolutePathUnderTargetRoot(file, targetRoot string) string {
 	targetRoot = strings.Trim(strings.TrimSpace(filepath.ToSlash(targetRoot)), "/")
 	if targetRoot == "" {
@@ -1520,6 +1585,7 @@ func absolutePathUnderTargetRoot(file, targetRoot string) string {
 	return ""
 }
 
+// isGenericMetaWBSTitle 判断标题是否为"读取设计文档/制定计划"这类不可执行的元任务。
 func isGenericMetaWBSTitle(title string) bool {
 	lower := strings.ToLower(strings.TrimSpace(title))
 	if lower == "" {
@@ -1550,6 +1616,7 @@ func isGenericMetaWBSTitle(title string) bool {
 	return false
 }
 
+// objectiveLooksLikeGoProject 从 objective 关键词判断是否为新建 Go 项目 (用于强制要求生成 go.mod)。
 func objectiveLooksLikeGoProject(objective string) bool {
 	lower := strings.ToLower(objective)
 	return strings.Contains(lower, "golang") || strings.Contains(lower, "go ") ||
@@ -1557,6 +1624,7 @@ func objectiveLooksLikeGoProject(objective string) bool {
 		strings.Contains(lower, "go.mod")
 }
 
+// synthesizeObjectiveWBS 合成一个确定性的最小 objective WBS (委托给 synthesizedObjectiveWBS)。
 func synthesizeObjectiveWBS(objective string) []rawTask {
 	return synthesizedObjectiveWBS(objective)
 }
@@ -1625,6 +1693,7 @@ func (o *Orchestrator) normalizeAndSplitRawTasks(rawTasks []rawTask, objective s
 	return normalized
 }
 
+// addContractFirstRawDeps 让非契约任务依赖它们实际消费的契约任务, 再补上锁定接口的串行边。
 func addContractFirstRawDeps(tasks []rawTask) []rawTask {
 	if len(tasks) == 0 {
 		return tasks
@@ -1657,6 +1726,7 @@ func addContractFirstRawDeps(tasks []rawTask) []rawTask {
 	return tasks
 }
 
+// addContractLockSerializationDeps 让引用被锁定接口的写任务依赖"锁定"该接口的契约任务 (last-writer 语义)。
 // addContractLockSerializationDeps adds dependencies for locked interfaces.
 // If an interface is locked, tasks that write files referencing that interface
 // must depend on the task that locked it.
@@ -1701,6 +1771,7 @@ func addContractLockSerializationDeps(tasks []rawTask) []rawTask {
 	return tasks
 }
 
+// isContractRawTask 判断任务是否为契约任务 (workUnitType 或标题/文件里的 contract/接口/类型 关键词)。
 func isContractRawTask(task rawTask) bool {
 	if task.workUnitType == wbsWorkUnitContract {
 		return true
@@ -1714,6 +1785,7 @@ func isContractRawTask(task rawTask) bool {
 		strings.Contains(text, "接口") || strings.Contains(text, "契约") || strings.Contains(text, "类型")
 }
 
+// shouldDependOnContractTask 判断 cur 是否应依赖 contract: 读其产物、消费其 provides, 或冲突键相交。
 func shouldDependOnContractTask(cur, contract rawTask) bool {
 	if cur.num == contract.num {
 		return false
@@ -1736,6 +1808,7 @@ func shouldDependOnContractTask(cur, contract rawTask) bool {
 	return false
 }
 
+// addProjectBootstrapRawDeps 让所有非验证/非骨架任务依赖项目骨架任务。
 func addProjectBootstrapRawDeps(tasks []rawTask) []rawTask {
 	bootstrapIDs := projectBootstrapRawTaskIDs(tasks)
 	if len(bootstrapIDs) == 0 {
@@ -1750,6 +1823,19 @@ func addProjectBootstrapRawDeps(tasks []rawTask) []rawTask {
 	return tasks
 }
 
+// addDesignCompletePhaseBarriers 为 design-complete 目标补阶段屏障依赖, 强制 base → contract → core → query → protocol 的推进顺序。
+//
+// 算法解读：
+//
+//	原理：完整设计目标下若任由 DAG 并行, 上游协议/查询层会先于核心引擎落地, 后续必然返工;
+//	      这里按任务所属阶段补"后阶段依赖前阶段"的边, 把拓扑序钉死。
+//	关键不变量：只加"后阶段依赖前阶段"的边 (dep.phase < cur.phase), 唯一例外是允许同阶段依赖
+//	      "基础契约" (types/errors 一类) —— 这条保证不会成环, 成环会让 orderRawTasksByDeps
+//	      退化为原序, 调度直接失去约束。
+//	代价与边界：O(n²) 的阶段两两比较, n 为任务数 (预算上限 260, 可接受);
+//	      非 design-complete 目标直接短路返回, 零成本。
+//	设计权衡：用"阶段"这种粗粒度屏障而不是逐任务依赖, 牺牲少量并行度换取可预测的落地顺序
+//	      与更少的跨层返工。
 func addDesignCompletePhaseBarriers(tasks []rawTask, objective string) []rawTask {
 	if !objectiveRequiresDesignCompleteMode(objective) || len(tasks) == 0 {
 		return tasks
@@ -1797,6 +1883,7 @@ const (
 	designCompletePhaseProtocol
 )
 
+// designCompleteTaskPhase 把任务归类到 design-complete 的五个阶段 (base/contract/core/query/protocol)。
 func designCompleteTaskPhase(task rawTask) int {
 	if isProjectBootstrapRawTask(task) {
 		return designCompletePhaseBase
@@ -1817,6 +1904,7 @@ func designCompleteTaskPhase(task rawTask) int {
 	return designCompletePhaseCore
 }
 
+// shouldAddDesignPhaseDependency 判断跨阶段任务是否要补屏障边 (骨架/基础契约必依赖, 其余按阶段先后)。
 func shouldAddDesignPhaseDependency(cur, dep rawTask) bool {
 	if dep.taskType == wbsTaskTypeVerification || cur.num == dep.num || containsString(cur.depNums, dep.num) {
 		return false
@@ -1843,6 +1931,7 @@ func shouldAddDesignPhaseDependency(cur, dep rawTask) bool {
 	return false
 }
 
+// shouldDependOnDesignContractPhase 契约阶段的依赖判定: 基础契约优先, 再按消费关系与共享状态域。
 func shouldDependOnDesignContractPhase(cur, dep rawTask) bool {
 	if isDesignCompleteFoundationContractRawTask(dep) && !isDesignCompleteFoundationContractRawTask(cur) {
 		return true
@@ -1855,6 +1944,7 @@ func shouldDependOnDesignContractPhase(cur, dep rawTask) bool {
 	return curDomain != "" && curDomain == depDomain
 }
 
+// isDesignCompleteFoundationContractRawTask 判断是否为"基础契约"任务 (核心类型/错误定义/公共类型, 通常是 types/errors 包)。
 func isDesignCompleteFoundationContractRawTask(task rawTask) bool {
 	if task.taskType != wbsTaskTypeLeaf || task.workUnitType == wbsWorkUnitVerification || isProjectBootstrapRawTask(task) {
 		return false
@@ -1891,6 +1981,7 @@ func isDesignCompleteFoundationContractRawTask(task rawTask) bool {
 	return false
 }
 
+// rawTaskTextForClassification 把任务的所有文本字段拼成小写串, 供关键词分类复用。
 func rawTaskTextForClassification(task rawTask) string {
 	parts := []string{
 		task.title, task.designRef, task.accept, task.verifyCommand, task.parentID,
@@ -1903,6 +1994,7 @@ func rawTaskTextForClassification(task rawTask) string {
 	return strings.ToLower(strings.Join(parts, " "))
 }
 
+// containsProtocolEntrypointTerm 检测文本里的协议入口词 (cmd/server、handler、endpoint、适配器 等)。
 func containsProtocolEntrypointTerm(text string) bool {
 	terms := []string{
 		"cmd/http", "cmd/grpc", "cmd/server", "cmd/cli", "pkg/protocol",
@@ -1918,6 +2010,7 @@ func containsProtocolEntrypointTerm(text string) bool {
 	return false
 }
 
+// containsQueryAdapterTerm 检测文本里的查询/解析适配器词 (sql/query/parser/检索 等)。
 func containsQueryAdapterTerm(text string) bool {
 	terms := []string{
 		"sql", "cypher", "query", "planner", "executor", "parser", "semantic",
@@ -1931,6 +2024,7 @@ func containsQueryAdapterTerm(text string) bool {
 	return false
 }
 
+// containsCoreEngineTerm 检测文本里的核心引擎词 (storage/engine/vector/索引 等)。
 func containsCoreEngineTerm(text string) bool {
 	terms := []string{
 		"storage", "engine", "store", "vector", "graph", "file", "embedding",
@@ -1945,6 +2039,7 @@ func containsCoreEngineTerm(text string) bool {
 	return false
 }
 
+// projectBootstrapRawTaskIDs 收集所有项目骨架任务的编号 (去重, 排除验证任务)。
 func projectBootstrapRawTaskIDs(tasks []rawTask) []string {
 	var ids []string
 	for _, task := range tasks {
@@ -1956,6 +2051,7 @@ func projectBootstrapRawTaskIDs(tasks []rawTask) []string {
 	return uniqueTrimmedStrings(ids)
 }
 
+// collectRawMacroDeps 建立 macro 编号 → 其依赖编号 的映射, 供展开 macro 依赖用。
 func collectRawMacroDeps(tasks []rawTask) map[string][]string {
 	macroDeps := make(map[string][]string)
 	for _, task := range tasks {
@@ -1968,6 +2064,18 @@ func collectRawMacroDeps(tasks []rawTask) map[string][]string {
 	return macroDeps
 }
 
+// expandRawMacroDeps 把依赖里的 macro 编号递归替换成 macro 各自的叶子依赖, 让 leaf 不再挂在不可执行的 macro 上。
+//
+// 算法解读：
+//
+//	原理：macro 不参与执行, 但 Planner 常让 leaf 依赖 macro; 入库前必须把这些边"穿透"到
+//	      macro 实际依赖的叶子, 否则 leaf 永远等不到就绪。
+//	关键不变量：同一条链上每个 macro 最多展开一次 (seen 集合) —— 没有它, 自引用或环状
+//	      macro 会让递归无限展开直到栈溢出。
+//	代价与边界：每个 dep 一份 seen 副本, 复杂度与依赖图边数同阶; 未登记的编号原样保留
+//	      (视为叶子), 不丢弃。
+//	设计权衡：选择"就地展开"而不是"先建 macro 节点再压缩", 少一层中间表示; 代价是 macro
+//	      的依赖顺序语义被扁平化, 只保留可达性。
 func expandRawMacroDeps(deps []string, macroDeps map[string][]string) []string {
 	if len(deps) == 0 || len(macroDeps) == 0 {
 		return deps
@@ -1999,6 +2107,19 @@ func expandRawMacroDeps(deps []string, macroDeps map[string][]string) []string {
 	return uniqueTrimmedStrings(out)
 }
 
+// relaxOverSerialRawDeps 剪掉过度的串行依赖, 只保留真正共享变更面的边。
+//
+// 算法解读：
+//
+//	原理：契约/骨架/文件冲突规则会叠加出大量"保守依赖", 把本可并行的 leaf 串成一条线;
+//	      这里逐条回问 shouldKeepRawDependency, 剪掉没有共享写文件/冲突键/写域/读写/契约
+//	      关系的边, 把 DAG 宽度还回来。
+//	关键不变量：屏障任务 (isBarrierRawTask) 的依赖一条都不能剪 —— 验证/测试节点必须等齐
+//	      它要验证的全部上游, 剪了就会在产物未就绪时开跑, 产生假绿。
+//	代价与边界：O(E) 遍历, 每条边最多问一次; 依赖编号不在本批任务里 (未知 dep) 时保留,
+//	      交给 V2 TaskStore 判定, 不在这里猜测。
+//	设计权衡：宁可漏剪 (保留保守边, 牺牲并行度) 也不错剪 (破坏正确性) —— 剪错的代价是
+//	      数据竞争, 漏剪的代价只是慢。
 func relaxOverSerialRawDeps(tasks []rawTask) []rawTask {
 	if len(tasks) == 0 {
 		return tasks
@@ -2023,6 +2144,17 @@ func relaxOverSerialRawDeps(tasks []rawTask) []rawTask {
 	return tasks
 }
 
+// orderRawTasksByDeps 按依赖关系做稳定拓扑排序, 让 rawTask 列表顺序与 DAG 推进方向一致。
+//
+// 算法解读：
+//
+//	原理：入库时按列表顺序分配 num→V2ID, 且冲突键的 last-writer 串行边依赖这个顺序,
+//	      所以列表必须是拓扑序 (被依赖者在前), 否则串行边会指错方向。
+//	关键不变量：一旦某轮没有任何任务可推进 (说明存在环或依赖悬空), 立即原样返回输入 ——
+//	      绝不为了"排完"而强行输出一个错误顺序。
+//	代价与边界：O(n²) 朴素 Kahn (每轮重扫全表), n 为任务数 (上限几百), 不值得为它建邻接表。
+//	设计权衡：稳定排序 (同层保持原相对顺序) 优先于复杂度 —— 顺序稳定才能让 last-writer
+//	      串行边的归属可复现。
 func orderRawTasksByDeps(tasks []rawTask) []rawTask {
 	if len(tasks) <= 1 {
 		return tasks
@@ -2049,6 +2181,7 @@ func orderRawTasksByDeps(tasks []rawTask) []rawTask {
 			}
 			progressed = true
 		}
+		// 没有任何任务可推进 = 依赖成环或依赖悬空; 此时原样返回输入, 绝不强行输出一个错误的顺序。
 		if !progressed {
 			return tasks
 		}
@@ -2056,6 +2189,7 @@ func orderRawTasksByDeps(tasks []rawTask) []rawTask {
 	return ordered
 }
 
+// rawTaskDepsResolved 判断任务的所有已知依赖是否都已排序完成 (未知编号与自依赖视为已满足)。
 func rawTaskDepsResolved(task rawTask, known, resolved map[string]bool) bool {
 	for _, dep := range task.depNums {
 		dep = strings.TrimSpace(dep)
@@ -2069,6 +2203,7 @@ func rawTaskDepsResolved(task rawTask, known, resolved map[string]bool) bool {
 	return true
 }
 
+// shouldKeepRawDependency 判断 relax 时这条依赖是否必须保留 (共享写文件/冲突键/写域/读写/契约)。
 func shouldKeepRawDependency(cur, dep rawTask) bool {
 	if dep.taskType == wbsTaskTypeMacro || isProjectBootstrapRawTask(dep) {
 		return true
@@ -2095,6 +2230,7 @@ func shouldKeepRawDependency(cur, dep rawTask) bool {
 	return false
 }
 
+// isBarrierRawTask 判断任务是否为屏障任务 (本地验证, 或 tester 角色/测试验证类关键词); 屏障的依赖不参与 relax。
 func isBarrierRawTask(task rawTask) bool {
 	if isLocalVerificationRawTask(task) {
 		return true
@@ -2120,6 +2256,7 @@ func isBarrierRawTask(task rawTask) bool {
 	return false
 }
 
+// isLocalVerificationRawTask 判断是否为 sizing-gate/timeout 拆分出来的本地验证任务。
 func isLocalVerificationRawTask(task rawTask) bool {
 	if task.taskType == wbsTaskTypeVerification &&
 		(strings.Contains(task.splitReason, "sizing-gate") || strings.Contains(task.splitReason, "timeout")) {
@@ -2128,6 +2265,7 @@ func isLocalVerificationRawTask(task rawTask) bool {
 	return false
 }
 
+// isProjectBootstrapRawTask 判断是否为项目骨架/初始化任务 (关键词命中, 或目标里含项目 manifest 文件)。
 func isProjectBootstrapRawTask(task rawTask) bool {
 	text := strings.ToLower(task.title + " " + task.workUnitType + " " + task.capabilityID)
 	if strings.Contains(text, "project-init") ||
@@ -2152,6 +2290,7 @@ func isProjectBootstrapRawTask(task rawTask) bool {
 	return false
 }
 
+// bootstrapBusinessFiles 列出骨架任务里真正属于业务实现的可写文件 (排除骨架/占位文件)。
 func bootstrapBusinessFiles(task rawTask) []string {
 	var business []string
 	for _, file := range concreteWritablePlanFiles(task) {
@@ -2162,6 +2301,7 @@ func bootstrapBusinessFiles(task rawTask) []string {
 	return uniqueTrimmedStrings(business)
 }
 
+// splitBootstrapBusinessRawTask 把"骨架 + 业务文件"混合任务拆成骨架任务 + 每文件一个业务 Leaf。
 func splitBootstrapBusinessRawTask(task rawTask, adapter planningLanguageAdapter) (rawTask, []rawTask) {
 	bootstrap := task
 	bootstrapTargets := make([]string, 0, len(task.targetFiles))
@@ -2205,10 +2345,12 @@ func splitBootstrapBusinessRawTask(task rawTask, adapter planningLanguageAdapter
 	return bootstrap, business
 }
 
+// hasBootstrapSkeletonTargets 判断骨架任务是否还有可写目标 (targetFiles/writeFiles/目录形目标)。
 func hasBootstrapSkeletonTargets(task rawTask) bool {
 	return len(task.targetFiles) > 0 || len(task.writeFiles) > 0 || len(directoryLikeTaskTargets(task)) > 0
 }
 
+// isBootstrapSkeletonTarget 判断文件是否属于项目骨架/占位产物 (manifest、main.go、README、Makefile 等)。
 func isBootstrapSkeletonTarget(file string) bool {
 	clean := strings.TrimSpace(filepath.ToSlash(file))
 	if clean == "" {
@@ -2227,6 +2369,7 @@ func isBootstrapSkeletonTarget(file string) bool {
 	}
 }
 
+// pathIsDirectoryLike 判断路径是否形如目录 (以 / 或 /... 结尾, 或无扩展名且含 /)。
 func pathIsDirectoryLike(file string) bool {
 	clean := strings.TrimSpace(filepath.ToSlash(file))
 	if clean == "" || filepath.IsAbs(clean) {
@@ -2237,6 +2380,7 @@ func pathIsDirectoryLike(file string) bool {
 	return strings.HasSuffix(clean, "/") || strings.HasSuffix(clean, "/...") || (path.Ext(trimmed) == "" && strings.Contains(trimmed, "/"))
 }
 
+// rawStringSetsOverlap 判断两个字符串集合是否有交集 (忽略大小写、路径分隔符与首尾空白)。
 func rawStringSetsOverlap(a, b []string) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return false
@@ -2257,6 +2401,7 @@ func rawStringSetsOverlap(a, b []string) bool {
 	return false
 }
 
+// normalizeRawTaskDefaults 补齐单个任务的默认值: 枚举归一化、文件/依赖去重、冲突键推导与预算兜底。
 func normalizeRawTaskDefaults(rt rawTask) rawTask {
 	rt.num = strings.TrimSpace(rt.num)
 	rt.title = strings.TrimSpace(rt.title)
@@ -2331,6 +2476,7 @@ func normalizeRawTaskDefaults(rt rawTask) rawTask {
 	return rt
 }
 
+// isContractBoundaryRawTask 判断 leaf 是否为契约边界任务 (workUnitType 或标题/验收里的接口/契约关键词)。
 func isContractBoundaryRawTask(rt rawTask) bool {
 	if rt.taskType != wbsTaskTypeLeaf {
 		return false
@@ -2347,6 +2493,7 @@ func isContractBoundaryRawTask(rt rawTask) bool {
 		strings.Contains(text, "type boundary")
 }
 
+// isMixedContractImplementationRawTask 判断任务是否同时声明了契约与实现 (需要拆成契约 Leaf + 实现 Leaf)。
 func isMixedContractImplementationRawTask(rt rawTask) bool {
 	if rt.taskType != wbsTaskTypeLeaf || rt.workUnitType == wbsWorkUnitContract || rt.workUnitType == wbsWorkUnitVerification {
 		return false
@@ -2375,6 +2522,7 @@ func isMixedContractImplementationRawTask(rt rawTask) bool {
 	return hasContract && hasImplementation
 }
 
+// isCoreStateRawTask 判断 leaf 是否触及核心状态 (高风险关键词或高级内核面)。
 func isCoreStateRawTask(rt rawTask) bool {
 	if rt.taskType != wbsTaskTypeLeaf {
 		return false
@@ -2392,6 +2540,7 @@ func isCoreStateRawTask(rt rawTask) bool {
 	return isHighRiskTaskText(text) || containsAdvancedCoreSurfaceTerm(text)
 }
 
+// coreStateConflictKeysForRawTask 为核心状态任务推导冲突键 (core-state:root:component 与 core-domain:root:domain)。
 func coreStateConflictKeysForRawTask(rt rawTask) []string {
 	files := append(append([]string{}, rt.targetFiles...), rt.writeFiles...)
 	root := firstPlanPathSegment(files)
@@ -2415,6 +2564,7 @@ func coreStateConflictKeysForRawTask(rt rawTask) []string {
 	return uniqueTrimmedStrings(keys)
 }
 
+// coreStateDomainForRawTask 把任务归到某个核心状态域 (hnsw/lsm/wal/mvcc/graph/query/vector/pagecache/delta)。
 func coreStateDomainForRawTask(rt rawTask) string {
 	text := strings.ToLower(strings.Join([]string{
 		rt.title,
@@ -2451,6 +2601,7 @@ func coreStateDomainForRawTask(rt rawTask) string {
 	return ""
 }
 
+// coreStateComponentForPlanFiles 从文件路径推断组件名 (internal/pkg/src/lib 下的第一层目录)。
 func coreStateComponentForPlanFiles(files []string) string {
 	for _, file := range files {
 		clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(file)))
@@ -2468,6 +2619,7 @@ func coreStateComponentForPlanFiles(files []string) string {
 	return ""
 }
 
+// packageConflictKeysForPlanFiles 把多组文件路径折算成包级冲突键并去重。
 func packageConflictKeysForPlanFiles(fileGroups ...[]string) []string {
 	var keys []string
 	for _, files := range fileGroups {
@@ -2481,6 +2633,7 @@ func packageConflictKeysForPlanFiles(fileGroups ...[]string) []string {
 	return uniqueTrimmedStrings(keys)
 }
 
+// shouldSerializePackageForRawTask 判断任务是否需要按包串行 (契约/集成/验证任务, 或目标含 manifest/测试文件)。
 func shouldSerializePackageForRawTask(rt rawTask) bool {
 	if rt.taskType == wbsTaskTypeVerification {
 		return true
@@ -2497,6 +2650,7 @@ func shouldSerializePackageForRawTask(rt rawTask) bool {
 	return false
 }
 
+// packageConflictKeyForPlanFile 按扩展名把文件折算成包级冲突键 (pkg:目录), 未知扩展名返回空串。
 func packageConflictKeyForPlanFile(file string) string {
 	clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(file)))
 	if clean == "" || clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "../") {
@@ -2528,6 +2682,7 @@ func packageConflictKeyForPlanFile(file string) string {
 	}
 }
 
+// pythonPackageConflictDir 把 Python 文件目录折算到包目录 (src/lib/tests/test 下取两层)。
 func pythonPackageConflictDir(dir string) string {
 	if dir == "" || dir == "." {
 		return "_root"
@@ -2539,6 +2694,7 @@ func pythonPackageConflictDir(dir string) string {
 	return dir
 }
 
+// rustPackageConflictDir 把 Rust 文件目录折算到 crate 模块目录 (src/ 下取两层)。
 func rustPackageConflictDir(dir string) string {
 	if dir == "" || dir == "." {
 		return "_root"
@@ -2553,6 +2709,7 @@ func rustPackageConflictDir(dir string) string {
 	return dir
 }
 
+// normalizeWBSWorkUnitType 归一化 workUnitType; 非法值按 taskType 兜底 (verification → verification, 其余 implementation)。
 func normalizeWBSWorkUnitType(workUnitType, taskType string) string {
 	switch strings.ToLower(strings.TrimSpace(workUnitType)) {
 	case wbsWorkUnitContract, wbsWorkUnitImplementation, wbsWorkUnitIntegration, wbsWorkUnitVerification:
@@ -2564,6 +2721,7 @@ func normalizeWBSWorkUnitType(workUnitType, taskType string) string {
 	return wbsWorkUnitImplementation
 }
 
+// normalizeWBSTaskType 归一化 taskType (milestone/parent → macro, verify/test → verification, 其余 → leaf)。
 func normalizeWBSTaskType(taskType string) string {
 	switch strings.ToLower(strings.TrimSpace(taskType)) {
 	case wbsTaskTypeMacro, "milestone", "parent":
@@ -2575,6 +2733,7 @@ func normalizeWBSTaskType(taskType string) string {
 	}
 }
 
+// normalizeWBSRisk 归一化风险等级, 未知值一律按 medium 处理。
 func normalizeWBSRisk(risk string) string {
 	switch strings.ToLower(strings.TrimSpace(risk)) {
 	case wbsRiskHigh:
@@ -2586,6 +2745,7 @@ func normalizeWBSRisk(risk string) string {
 	}
 }
 
+// normalizeWBSBlockingPolicy 归一化阻塞策略, 未知值一律按 fail_blocks_dependents 处理。
 func normalizeWBSBlockingPolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
 	case wbsBlockingFailOpen, "continue", "non_blocking":
@@ -2595,6 +2755,18 @@ func normalizeWBSBlockingPolicy(policy string) string {
 	}
 }
 
+// shouldSplitRawTask 判定一个 leaf 是否超过执行预算、需要展开成更小的子 DAG, 并给出可追溯的拆分原因。
+//
+// 算法解读：
+//
+//	原理：单次 agent 调用的预算有限, 过粗的 leaf 会在 LLM 里超时/跑偏; 这里用一组保守阈值
+//	      (预计分钟数、写文件数、预计 LOC、风险关键词) 提前把粗 leaf 拆开。
+//	关键不变量：已带 sizing-gate / objective-fallback 标记的任务一律不再拆 —— 拆分流程会反复
+//	      经过这里, 少了这道闸门, 同一任务会被反复展开, 任务数呈指数膨胀。
+//	代价与边界：纯字符串匹配, 无 IO; 判定顺序即优先级, 前面命中就短路返回, 后面的条件不会
+//	      覆盖前面的 reason。
+//	设计权衡：阈值是"宁可多拆"的偏保守取值; 拆小的代价是任务数与调度开销, 拆不够的代价是
+//	      整条链超时重跑, 后者贵得多。
 func shouldSplitRawTask(rt rawTask, objective string) (bool, string) {
 	if rt.taskType == wbsTaskTypeVerification {
 		return false, ""
@@ -2642,6 +2814,17 @@ func shouldSplitRawTask(rt rawTask, objective string) (bool, string) {
 	return false, ""
 }
 
+// expandRawTask 把超预算的 leaf 按目标形态分派到对应的展开策略。
+//
+// 算法解读：
+//
+//	原理：拆分的"切法"取决于任务声明的目标形态 —— 目录目标按语言适配器的目录规格切,
+//	      多文件按文件切, 单文件高风险按"契约→最小路径→边界"三段切, 无具体目标才走通用切片。
+//	关键不变量：分派顺序必须是 目录 → 多文件 → 单文件 → 推断文件 → 通用, 因为后面的分支
+//	      会基于前面的结果收窄 targetFiles; 顺序颠倒会让目录目标被当成单文件切, 产出无法落地的路径。
+//	代价与边界：每个分支都会重算 concreteWritablePlanFiles (纯字符串处理); 推断文件失败时
+//	      退化为 expandGenericRawTask, 不会返回空切片。
+//	设计权衡：用"形态"而不是"原因字符串"分派, 让 reason 只承担可追溯性, 不参与控制流。
 func expandRawTask(rt rawTask, reason string, adapter planningLanguageAdapter, objective string) []rawTask {
 	if dirs := directoryLikeTaskTargets(rt); len(dirs) > 0 {
 		return expandDirectoryTargetRawTask(rt, reason, dirs, adapter)
@@ -2664,6 +2847,7 @@ func expandRawTask(rt rawTask, reason string, adapter planningLanguageAdapter, o
 	return expandGenericRawTask(rt, reason)
 }
 
+// concreteWritablePlanFiles 过滤出可落地的具体写文件 (排除空路径、绝对路径、目录形路径与无扩展名路径)。
 func concreteWritablePlanFiles(rt rawTask) []string {
 	files := rawTaskWriteFiles(rt)
 	out := make([]string, 0, len(files))
@@ -2680,6 +2864,7 @@ func concreteWritablePlanFiles(rt rawTask) []string {
 	return uniqueTrimmedStrings(out)
 }
 
+// inferRiskyRawTaskTargetFile 为没有具体文件的高风险 leaf 推断一个目标文件 (显式路径优先, 否则按组件/词干渲染)。
 func inferRiskyRawTaskTargetFile(rt rawTask, adapter planningLanguageAdapter, objective string) string {
 	if rt.taskType != wbsTaskTypeLeaf || rt.workUnitType == wbsWorkUnitVerification {
 		return ""
@@ -2725,6 +2910,7 @@ func inferRiskyRawTaskTargetFile(rt rawTask, adapter planningLanguageAdapter, ob
 	return renderInferredRiskyTaskFile(inferObjectiveTargetRoot(objective), component, stem, adapter)
 }
 
+// renderInferredRiskyTaskFile 按语言适配器把 (root, component, stem) 渲染成目标文件路径。
 func renderInferredRiskyTaskFile(root, component, stem string, adapter planningLanguageAdapter) string {
 	root = strings.Trim(strings.TrimSpace(filepath.ToSlash(root)), "/")
 	if root == "" {
@@ -2751,6 +2937,7 @@ func renderInferredRiskyTaskFile(root, component, stem string, adapter planningL
 	}
 }
 
+// inferExplicitPlanFileFromText 从任务文本里正则抓取显式的源码文件路径 (排除测试文件)。
 func inferExplicitPlanFileFromText(text string, adapter planningLanguageAdapter) string {
 	ext := strings.TrimSpace(adapter.SourceExt)
 	if ext == "" {
@@ -2770,6 +2957,7 @@ func inferExplicitPlanFileFromText(text string, adapter planningLanguageAdapter)
 	return ""
 }
 
+// prefixInferredPlanFileWithObjectiveRoot 给推断出的相对路径补上 objective 目标根前缀。
 func prefixInferredPlanFileWithObjectiveRoot(file, objective string) string {
 	file = strings.TrimSpace(filepath.ToSlash(file))
 	root := inferObjectiveTargetRoot(objective)
@@ -2786,6 +2974,7 @@ func prefixInferredPlanFileWithObjectiveRoot(file, objective string) string {
 	return file
 }
 
+// inferRiskyTaskComponentAndStem 按关键词表把高风险任务映射成 (组件, 文件词干), 兜底用 capabilityID 分词。
 func inferRiskyTaskComponentAndStem(text string) (string, string) {
 	lower := strings.ToLower(text)
 	type candidate struct {
@@ -2844,10 +3033,24 @@ func inferRiskyTaskComponentAndStem(text string) (string, string) {
 	return component, stem
 }
 
+// expandFileTargetRawTask 把"多文件 leaf"拆成每文件一个 Leaf, 并追加一个本地验证 Leaf。
+//
+// 算法解读：
+//
+//	原理：一个 leaf 写多个文件时, 单次 LLM 调用要同时保证多个文件的完整性与可编译性,
+//	      失败面太大; 按文件切分后每个 Leaf 只需对一个文件负责, 编译门禁也能精确归因。
+//	关键不变量：每个 child 必须原样继承父任务的全部外部依赖 (depNums 拷贝) —— 丢一条就会在
+//	      上游契约尚未落地时开写, 产出无法编译; 兄弟之间的串行则靠"单文件写域"
+//	      (writeScopes=file:<path>) 交给 rawTasksToDAG 的 last-writer 机制补齐, 而不是写死依赖。
+//	代价与边界：最多取 8 个文件, 超出直接截断 —— 注意：截断是静默的, 被截掉的文件不会有人实现;
+//	      文件名重名时标题会补父目录消歧。
+//	设计权衡：第一个文件强制为 contract 角色 (先定接口), 测试文件强制为 verification 角色,
+//	      用角色而不是额外依赖来表达"先契约后实现"。
 func expandFileTargetRawTask(rt rawTask, reason string, files []string, adapter planningLanguageAdapter) []rawTask {
 	if len(files) == 0 {
 		return expandGenericRawTask(rt, reason)
 	}
+	// 上限 8 个: 再多就说明父任务本身没被规划好, 硬拆只会把 DAG 撑爆; 注意这里是静默截断, 多余的文件无人实现。
 	if len(files) > 8 {
 		files = files[:8]
 	}
@@ -2926,6 +3129,7 @@ func expandFileTargetRawTask(rt rawTask, reason string, files []string, adapter 
 	return children
 }
 
+// shouldMicroSplitFileTarget 判断单文件目标是否还要再切成"契约/最小路径/边界/验证"四段。
 func shouldMicroSplitFileTarget(rt rawTask, file, reason string) bool {
 	if rt.taskType != wbsTaskTypeLeaf || rt.workUnitType == wbsWorkUnitVerification || isPlanTestFile(file) {
 		return false
@@ -2947,6 +3151,7 @@ func shouldMicroSplitFileTarget(rt rawTask, file, reason string) bool {
 	return isHighRiskTaskText(text) || containsAdvancedCoreSurfaceTerm(text) || containsQueryAdapterTerm(text) || isDesignCompleteRiskyPlanFile(file)
 }
 
+// isDesignCompleteRiskySingleFileRawTask 判断 design-complete 目标下的单文件高风险 leaf (需要微切片)。
 func isDesignCompleteRiskySingleFileRawTask(rt rawTask) bool {
 	files := concreteWritablePlanFiles(rt)
 	if len(files) != 1 || rt.taskType != wbsTaskTypeLeaf || rt.workUnitType == wbsWorkUnitVerification {
@@ -2963,6 +3168,7 @@ func isDesignCompleteRiskySingleFileRawTask(rt rawTask) bool {
 	return isHighRiskTaskText(text) || containsAdvancedCoreSurfaceTerm(text) || containsQueryAdapterTerm(text) || isDesignCompleteRiskyPlanFile(files[0])
 }
 
+// isDesignCompleteRiskyPlanFile 按文件名词干判断是否为高风险实现文件 (planner/executor/wal/lsm/hnsw 等)。
 func isDesignCompleteRiskyPlanFile(file string) bool {
 	base := strings.ToLower(path.Base(filepath.ToSlash(file)))
 	stem := strings.TrimSuffix(base, path.Ext(base))
@@ -2977,6 +3183,7 @@ func isDesignCompleteRiskyPlanFile(file string) bool {
 	}
 }
 
+// expandFileTargetMicroRawTask 把 design-complete 的高风险单文件 Leaf 切成"契约 → 最小可运行路径 → 边界 → 本地验证"四段。
 func expandFileTargetMicroRawTask(rt rawTask, reason string) []rawTask {
 	file := ""
 	if len(rt.targetFiles) > 0 {
@@ -3015,6 +3222,7 @@ func expandFileTargetMicroRawTask(rt rawTask, reason string) []rawTask {
 	return children
 }
 
+// sanitizeParallelGroupSegment 把并行组名清洗成安全的标识片段 (小写化、非字母数字折成 '-')。
 func sanitizeParallelGroupSegment(segment string) string {
 	segment = normalizePlanningID(segment)
 	if segment == "" {
@@ -3023,6 +3231,7 @@ func sanitizeParallelGroupSegment(segment string) string {
 	return segment
 }
 
+// duplicatePlanFileBasenames 找出重名的文件名 (只比基名), 供标题消歧用。
 func duplicatePlanFileBasenames(files []string) map[string]bool {
 	counts := make(map[string]int, len(files))
 	for _, file := range files {
@@ -3040,6 +3249,7 @@ func duplicatePlanFileBasenames(files []string) map[string]bool {
 	return out
 }
 
+// isReadOnlyRawTask 判断任务是否只读文件、不写任何文件 (由 workUnitType 与角色标记决定)。
 // isReadOnlyRawTask returns true if the task only reads files and does not write any.
 func isReadOnlyRawTask(rt rawTask) bool {
 	if len(rt.writeFiles) > 0 {
@@ -3055,6 +3265,7 @@ func isReadOnlyRawTask(rt rawTask) bool {
 	return rt.workUnitType == wbsWorkUnitVerification || rt.taskType == wbsTaskTypeVerification
 }
 
+// inferTestFiles 从实现文件推断对应测试文件路径 (按语言适配器的测试文件命名规则)。
 // inferTestFiles infers test file paths from implementation files.
 // For each file, if it ends with a known source extension, appends the corresponding test suffix.
 func inferTestFiles(files []string) []string {
@@ -3087,6 +3298,7 @@ func inferTestFiles(files []string) []string {
 	return uniqueTrimmedStrings(out)
 }
 
+// autoInjectTestDeps 为每个实现 Leaf 自动补一个 test_design 任务, 并让实现 Leaf 依赖它。
 // autoInjectTestDeps automatically creates test_design tasks for implementation tasks
 // that don't already have a test_design dependency.
 func autoInjectTestDeps(tasks []rawTask) []rawTask {
@@ -3154,6 +3366,7 @@ func autoInjectTestDeps(tasks []rawTask) []rawTask {
 	return injected
 }
 
+// fileTargetLeafTitle 为按文件拆出的 Leaf 生成标题; 基名重名时补父目录消歧。
 func fileTargetLeafTitle(parentTitle, file string, duplicateBase map[string]bool) string {
 	slash := filepath.ToSlash(file)
 	base := path.Base(slash)
@@ -3166,6 +3379,7 @@ func fileTargetLeafTitle(parentTitle, file string, duplicateBase map[string]bool
 	return parentTitle + " - " + base
 }
 
+// previousPlanFiles 返回前 idx 个文件的副本 (用于让第 idx 个文件串行依赖前面已写的文件)。
 func previousPlanFiles(files []string, idx int) []string {
 	if idx <= 0 {
 		return nil
@@ -3177,6 +3391,7 @@ func previousPlanFiles(files []string, idx int) []string {
 	return prev
 }
 
+// targetPackagesForFileByLanguage 按语言适配器把文件路径折算成构建目标包名。
 func targetPackagesForFileByLanguage(file, language string) []string {
 	if strings.ToLower(strings.TrimSpace(language)) != "go" {
 		return nil
@@ -3188,28 +3403,33 @@ func targetPackagesForFileByLanguage(file, language string) []string {
 	return targetPackagesForDirByLanguage(dir, "go")
 }
 
+// isPlanContractFile 判断文件是否为契约/接口类文件 (contract/interface/types/api 等词干)。
 func isPlanContractFile(file string) bool {
 	base := strings.ToLower(path.Base(filepath.ToSlash(file)))
 	return strings.Contains(base, "type") || strings.Contains(base, "interface") ||
 		strings.Contains(base, "contract") || strings.Contains(base, "schema")
 }
 
+// isPlanTestFile 判断文件是否为测试文件 (_test.go、test_*.py、*.test.ts 等)。
 func isPlanTestFile(file string) bool {
 	base := strings.ToLower(path.Base(filepath.ToSlash(file)))
 	return strings.Contains(base, "_test.") || strings.Contains(base, ".test.") ||
 		strings.HasPrefix(base, "test_")
 }
 
+// isPlanPlaceholderFile 判断文件是否为占位/骨架文件 (stub/placeholder/skeleton 等词干)。
 func isPlanPlaceholderFile(file string) bool {
 	base := strings.ToLower(path.Base(filepath.ToSlash(file)))
 	return strings.Contains(base, "placeholder") || strings.Contains(base, "stub") ||
 		strings.Contains(base, "doc.go") || strings.Contains(base, "empty")
 }
 
+// directoryLikeTaskTargets 收集 rawTask 里形如目录的目标 (targetFiles 与 writeFiles 合并)。
 func directoryLikeTaskTargets(rt rawTask) []string {
 	return directoryLikePlanPaths(append(append([]string{}, rt.targetFiles...), rt.writeFiles...))
 }
 
+// directoryLikeNodeTargets 收集 TaskNode 里形如目录的目标 (targetFiles 与 writeFiles 合并)。
 func directoryLikeNodeTargets(node *TaskNode) []string {
 	if node == nil {
 		return nil
@@ -3217,6 +3437,7 @@ func directoryLikeNodeTargets(node *TaskNode) []string {
 	return directoryLikePlanPaths(append(append([]string{}, node.TargetFiles...), node.WriteFiles...))
 }
 
+// directoryLikePlanPaths 从文件列表中筛出形如目录的路径。
 func directoryLikePlanPaths(files []string) []string {
 	var dirs []string
 	for _, file := range files {
@@ -3240,6 +3461,18 @@ func directoryLikePlanPaths(files []string) []string {
 	return uniqueTrimmedStrings(dirs)
 }
 
+// expandDirectoryTargetRawTask 把"整目录一个 Leaf"按语言适配器的目录规格拆成多文件 Leaf。
+//
+// 算法解读：
+//
+//	原理：Planner 常写"实现 internal/store 目录"这种粗 Leaf, 一个 Leaf 不可能一次写完整目录;
+//	      这里用适配器的目录规格 (DirectorySpec) 展开成每个文件一个 Leaf。
+//	关键不变量：同一批拆出的 Leaf 必须串成链 (首个继承父任务的外部依赖, 其余依赖前一个) ——
+//	      否则并发写同一目录会互相覆盖包声明/构建清单, 编译必然失败。
+//	代价与边界：目录数最多取 4 个, 每个目录按适配器的 DirectorySpecs 展开; 注意：若适配器没有
+//	      定义任何 DirectorySpec, 这里会返回空切片, 需要调用方兜底保留原任务。
+//	设计权衡：优先让语言适配器决定"一个目录该有哪些文件", 而不是在这里硬编码语言知识,
+//	      代价是适配器接口要承担目录规格的语义。
 func expandDirectoryTargetRawTask(rt rawTask, reason string, dirs []string, adapter planningLanguageAdapter) []rawTask {
 	if len(dirs) == 0 {
 		return expandGenericRawTask(rt, reason)
@@ -3323,6 +3556,7 @@ func expandDirectoryTargetRawTask(rt rawTask, reason string, dirs []string, adap
 	return children
 }
 
+// safePlanFileStem 把词干清洗成合法的文件名词干 (只留字母数字与 '-'/'_')。
 func safePlanFileStem(stem string) string {
 	stem = normalizePlanningID(stem)
 	if stem == "" {
@@ -3331,10 +3565,12 @@ func safePlanFileStem(stem string) string {
 	return strings.ReplaceAll(stem, "-", "_")
 }
 
+// targetPackagesForDir 把目录折算成构建目标包名 (语言未知, 走默认适配器)。
 func targetPackagesForDir(dir string) []string {
 	return targetPackagesForDirByLanguage(dir, "go")
 }
 
+// targetPackagesForDirByLanguage 按指定语言把目录折算成构建目标包名。
 func targetPackagesForDirByLanguage(dir, language string) []string {
 	if strings.ToLower(strings.TrimSpace(language)) != "go" {
 		return nil
@@ -3350,6 +3586,7 @@ func targetPackagesForDirByLanguage(dir, language string) []string {
 	return []string{"./" + dir}
 }
 
+// expandGenericRawTask 没有具体目标的 Leaf 的通用切片: 按 adapter 的通用步骤拆成顺序子任务。
 func expandGenericRawTask(rt rawTask, reason string) []rawTask {
 	if rt.riskLevel == wbsRiskHigh || isCoreStateRawTask(rt) || strings.Contains(reason, "domain-risk-keyword") || strings.Contains(reason, "high-risk") {
 		steps := []struct {
@@ -3381,6 +3618,7 @@ func expandGenericRawTask(rt rawTask, reason string) []rawTask {
 	return buildExpandedTasks(rt, reason, "sizing-gate", steps)
 }
 
+// buildExpandedTasks 把父 Leaf 按 (标题, 角色, 验收) 步骤列表批量构造成子 Leaf, 并串成链。
 func buildExpandedTasks(rt rawTask, reason, groupSuffix string, steps []struct {
 	title    string
 	accept   string
@@ -3454,6 +3692,7 @@ func buildExpandedTasks(rt rawTask, reason, groupSuffix string, steps []struct {
 	return children
 }
 
+// mixedContractImplementationChildTitle 为"契约 + 实现"混合任务拆出的第 index 个孩子生成标题。
 func mixedContractImplementationChildTitle(parent string, index int) string {
 	component := mixedContractImplementationComponentName(parent)
 	switch index {
@@ -3470,6 +3709,7 @@ func mixedContractImplementationChildTitle(parent string, index int) string {
 	}
 }
 
+// mixedContractImplementationChildAcceptance 为混合任务拆出的第 index 个孩子生成验收标准。
 func mixedContractImplementationChildAcceptance(index int, fallback string) string {
 	switch index {
 	case 1:
@@ -3483,6 +3723,7 @@ func mixedContractImplementationChildAcceptance(index int, fallback string) stri
 	}
 }
 
+// mixedContractImplementationComponentName 从父任务标题里提取组件名 (用于给拆分出的孩子命名)。
 func mixedContractImplementationComponentName(parent string) string {
 	parent = strings.TrimSpace(parent)
 	if parent == "" {
@@ -3504,6 +3745,7 @@ func mixedContractImplementationComponentName(parent string) string {
 	return name
 }
 
+// appendSplitReason 把新的拆分原因追加到已有 reason 后面 (去重, 用 ';' 连接)。
 func appendSplitReason(existing, reason string) string {
 	existing = strings.TrimSpace(existing)
 	reason = strings.TrimSpace(reason)
@@ -3516,6 +3758,7 @@ func appendSplitReason(existing, reason string) string {
 	return existing + ";" + reason
 }
 
+// defaultVerifyCommand 按任务目标与语言返回默认的本地验证命令 (go test / pytest / cargo test 等)。
 func defaultVerifyCommand(rt rawTask) string {
 	if strings.TrimSpace(rt.verifyCommand) != "" {
 		return strings.TrimSpace(rt.verifyCommand)
@@ -3526,6 +3769,7 @@ func defaultVerifyCommand(rt rawTask) string {
 	return ""
 }
 
+// rewriteRawTaskDeps 按 rewrite 映射重写依赖编号, 并把重写后等于自身的依赖剔除 (防自环)。
 func rewriteRawTaskDeps(depNums []string, rewrite map[string]string, self string) []string {
 	if len(depNums) == 0 {
 		return nil
@@ -3546,6 +3790,7 @@ func rewriteRawTaskDeps(depNums []string, rewrite map[string]string, self string
 	return out
 }
 
+// isHighRiskTaskText 判断任务文本是否命中高风险关键词 (并发/持久化/协议/索引 等)。
 func isHighRiskTaskText(text string) bool {
 	lower := strings.ToLower(text)
 	keywords := []string{
@@ -3570,6 +3815,7 @@ func isHighRiskTaskText(text string) bool {
 
 // --- 辅助函数 ---
 
+// parseDepsString 把 "1,2 3" 这类依赖字符串切成编号列表 (逗号/空格/顿号分隔)。
 func parseDepsString(deps string) []string {
 	if deps == "" || deps == "-" || deps == "无" || deps == "none" {
 		return nil
@@ -3586,6 +3832,7 @@ func parseDepsString(deps string) []string {
 	return result
 }
 
+// splitTrimNonEmpty 按分隔符切分并去掉空白项, 保持原顺序。
 func splitTrimNonEmpty(s, sep string) []string {
 	if s == "" || s == "-" {
 		return nil
@@ -3600,6 +3847,7 @@ func splitTrimNonEmpty(s, sep string) []string {
 	return result
 }
 
+// containsString 判断字符串切片里是否含目标串。
 func containsString(items []string, target string) bool {
 	for _, item := range items {
 		if item == target {
@@ -3609,6 +3857,7 @@ func containsString(items []string, target string) bool {
 	return false
 }
 
+// removeString 从字符串切片里移除所有等于目标串的元素。
 func removeString(items []string, target string) []string {
 	if len(items) == 0 {
 		return items
@@ -3622,6 +3871,7 @@ func removeString(items []string, target string) []string {
 	return out
 }
 
+// uniqueStrings 对字符串切片去重, 保持首次出现的顺序。
 func uniqueStrings(items []string) []string {
 	if len(items) == 0 {
 		return nil
@@ -3639,6 +3889,7 @@ func uniqueStrings(items []string) []string {
 	return out
 }
 
+// replaceString 把切片里所有等于 oldValue 的元素替换成 newValue。
 func replaceString(items []string, oldValue, newValue string) []string {
 	out := make([]string, 0, len(items))
 	seen := make(map[string]bool)
@@ -3655,10 +3906,12 @@ func replaceString(items []string, oldValue, newValue string) []string {
 	return out
 }
 
+// orchestratorTaskSubject 生成任务主题名 (团队名 + 标题, 带长度截断)。
 func orchestratorTaskSubject(teamName, title string) string {
 	return fmt.Sprintf("%s%s", orchestratorTaskPrefix(teamName), title)
 }
 
+// orchestratorTaskPrefix 返回任务标题的统一前缀 (团队名)。
 func orchestratorTaskPrefix(teamName string) string {
 	return fmt.Sprintf("[%s] [orch] ", teamName)
 }
@@ -3727,6 +3980,7 @@ const (
 	splitPlannerCallTimeout = 2 * time.Minute
 )
 
+// longRunningLeafBudget 按总超时推导"长任务"判定的时间预算 (总超时的一部分)。
 func longRunningLeafBudget(timeout time.Duration) time.Duration {
 	if timeout <= 0 {
 		timeout = coderCallTimeout
@@ -3749,6 +4003,7 @@ type AgentExecutionTimeoutError struct {
 	Cause   error
 }
 
+// Error 实现 error 接口, 返回超时任务的编号与耗时描述。
 func (e *AgentExecutionTimeoutError) Error() string {
 	if e == nil {
 		return ""
@@ -3756,6 +4011,7 @@ func (e *AgentExecutionTimeoutError) Error() string {
 	return fmt.Sprintf("agent execution timeout after %s: %v", e.Timeout, e.Cause)
 }
 
+// Unwrap 暴露底层错误, 让 errors.Is/As 能穿透到真实原因。
 func (e *AgentExecutionTimeoutError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -3763,11 +4019,13 @@ func (e *AgentExecutionTimeoutError) Unwrap() error {
 	return e.Cause
 }
 
+// isAgentExecutionTimeout 判断错误链里是否为 AgentExecutionTimeoutError。
 func isAgentExecutionTimeout(err error) bool {
 	var timeoutErr *AgentExecutionTimeoutError
 	return errors.As(err, &timeoutErr)
 }
 
+// recordWBSPlanMetrics 上报 WBS 计划规模指标 (任务数、宽度、角色分布等)。
 func (o *Orchestrator) recordWBSPlanMetrics(team *ProductionTeam) {
 	mc := team.metrics()
 	if mc == nil {
@@ -3807,6 +4065,7 @@ func (o *Orchestrator) recordWBSPlanMetrics(team *ProductionTeam) {
 	}
 }
 
+// recordWBSTaskDuration 上报单个任务的执行耗时与终态。
 func (o *Orchestrator) recordWBSTaskDuration(team *ProductionTeam, node *TaskNode, duration time.Duration, status TaskStatus) {
 	mc := team.metrics()
 	if mc == nil || node == nil {
@@ -3817,6 +4076,7 @@ func (o *Orchestrator) recordWBSTaskDuration(team *ProductionTeam, node *TaskNod
 	recordTeamRun(mc, "team", metrics.MWBSTaskActualDurationSec, duration.Seconds(), team, labels)
 }
 
+// recordWBSFailedBlockedDependents 上报失败任务连带阻塞的下游任务数。
 func (o *Orchestrator) recordWBSFailedBlockedDependents(team *ProductionTeam, node *TaskNode, cascaded int) {
 	mc := team.metrics()
 	if mc == nil || node == nil || cascaded <= 0 {
@@ -3826,6 +4086,7 @@ func (o *Orchestrator) recordWBSFailedBlockedDependents(team *ProductionTeam, no
 	recordTeamRun(mc, "team", metrics.MWBSFailedBlockedDependents, float64(cascaded), team, labels)
 }
 
+// recordWBSMaterialization 上报任务产物落地情况 (写入文件数、构建目录)。
 func (o *Orchestrator) recordWBSMaterialization(team *ProductionTeam, node *TaskNode, written []string, buildCwd string) {
 	if team == nil || node == nil {
 		return
@@ -3851,6 +4112,7 @@ func (o *Orchestrator) recordWBSMaterialization(team *ProductionTeam, node *Task
 	recordTeamRun(mc, "team", metrics.MWBSBuildRootDetected, 1, team, rootLabels)
 }
 
+// buildRootMetricLabel 生成构建根目录的指标标签 (相对 cwd 的路径, 相同则为空)。
 func buildRootMetricLabel(cwd, buildCwd string) string {
 	if buildCwd == "" {
 		return ""
@@ -3863,6 +4125,7 @@ func buildRootMetricLabel(cwd, buildCwd string) string {
 	return filepath.ToSlash(filepath.Base(buildCwd))
 }
 
+// ensureProjectSkeletonForTeam 按团队与 objective 推断目标根目录, 再确保项目骨架文件存在。
 func ensureProjectSkeletonForTeam(team *ProductionTeam, objective string, adapter planningLanguageAdapter) ([]string, error) {
 	if team == nil || strings.TrimSpace(team.Cwd) == "" {
 		return nil, nil
@@ -3874,6 +4137,7 @@ func ensureProjectSkeletonForTeam(team *ProductionTeam, objective string, adapte
 	return ensureProjectSkeletonForRoot(team, targetRoot, adapter)
 }
 
+// ensureProjectSkeletonForRoot 在指定目标根下补齐缺失的项目骨架文件 (已存在的文件不覆盖)。
 func ensureProjectSkeletonForRoot(team *ProductionTeam, targetRoot string, adapter planningLanguageAdapter) ([]string, error) {
 	if team == nil || strings.TrimSpace(team.Cwd) == "" {
 		return nil, nil
@@ -3917,6 +4181,7 @@ func ensureProjectSkeletonForRoot(team *ProductionTeam, targetRoot string, adapt
 	return written, nil
 }
 
+// projectSkeletonFiles 返回语言适配器定义的项目骨架文件表 (路径 → 初始内容)。
 func projectSkeletonFiles(adapter planningLanguageAdapter, targetRoot string) map[string]string {
 	name := safeProjectIdentifier(targetRoot, "-")
 	if name == "" {
@@ -3978,6 +4243,7 @@ edition = "2021"
 	}
 }
 
+// safeGoPackageName 把任意字符串清洗成合法的 Go 包名 (小写、非字母数字折成 '_'、首字符兜底)。
 func safeGoPackageName(raw string) string {
 	id := safeProjectIdentifier(raw, "_")
 	id = strings.ReplaceAll(id, "-", "_")
@@ -4005,6 +4271,7 @@ func safeGoPackageName(raw string) string {
 	return out
 }
 
+// isGoKeywordPackageName 判断名字是否为 Go 关键字 (关键字不能作包名)。
 func isGoKeywordPackageName(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "break", "default", "func", "interface", "select",
@@ -4018,6 +4285,7 @@ func isGoKeywordPackageName(name string) bool {
 	}
 }
 
+// safeProjectIdentifier 把字符串清洗成合法项目标识符 (按 sep 连接, 保留字母数字)。
 func safeProjectIdentifier(raw, sep string) string {
 	id := normalizePlanningID(raw)
 	id = strings.ReplaceAll(id, "-", sep)
@@ -4029,6 +4297,7 @@ func safeProjectIdentifier(raw, sep string) string {
 	return strings.ToLower(id)
 }
 
+// safeCMakeProjectName 把字符串清洗成合法的 CMake 工程名。
 func safeCMakeProjectName(raw string) string {
 	id := safeProjectIdentifier(raw, "_")
 	if id == "" {
@@ -4037,6 +4306,7 @@ func safeCMakeProjectName(raw string) string {
 	return id
 }
 
+// wbsMetricLabels 构造该任务的指标标签集合 (团队、角色、阶段、状态等)。
 func (n *TaskNode) wbsMetricLabels(team *ProductionTeam) map[string]string {
 	workflow := ""
 	if team != nil {
@@ -4328,6 +4598,19 @@ func (o *Orchestrator) restoreCompletedTasksFromDAG(team *ProductionTeam) int {
 	return restored
 }
 
+// attemptStallRecovery 停滞时尝试恢复: 把可执行但未入队的任务重新挂回 DAG, 返回恢复的任务数。
+//
+// 算法解读：
+//
+//	原理：停滞可能来自"任务卡在 in_progress 久未推进", 也可能来自"瞬态失败后没人再调度";
+//	      这里把这两类任务重置回 pending, 让调度器重新捡起它们。
+//	关键不变量：只重置"正在执行 (in_progress)"或"瞬态失败"的任务 —— 把 failed (含 hard-gate
+//	      判死) 的任务也重置, 会变成失败任务被一次次复活重跑; 这类任务本就已按 all_done
+//	      解除了下游阻塞, 应当让 DAG 顺其自然地推进或终止。
+//	代价与边界：每次恢复要遍历全图并查一遍 checkpoint; 返回 0 表示没有可恢复的, 调用方据此
+//	      停止重试, 避免死循环。
+//	设计权衡：瞬态失败重置 Retries 为 0 (给足重试配额), 卡住的任务只递增 Retries (避免无限
+//	      复活); 两者语义不同, 不能合并成一条路径。
 func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective string, team *ProductionTeam) int {
 	o.mu.Lock()
 	doneIDs := make(map[string]bool)
@@ -4386,6 +4669,7 @@ func (o *Orchestrator) attemptStallRecovery(ctx context.Context, objective strin
 				n.Retries = 0 // 瞬态恢复: 重置重试计数, 给予完整重试配额
 				n.Error = "stall recovery: 瞬态错误恢复, 重新调度"
 			}
+			// 注意：只有瞬态失败这条路径减 failedCount —— 卡住的任务是 in_progress, 从未计入过失败数。
 			o.failedCount-- // 从 failedCount 中减回
 			o.mu.Unlock()
 		}
@@ -4476,6 +4760,7 @@ func (o *Orchestrator) cleanupResidualTasks() {
 	}
 }
 
+// roundBudgetFor 按任务复杂度与 objective 推导最大重试轮数 (简单任务少轮, 高风险多轮)。
 func (o *Orchestrator) roundBudgetFor(node *TaskNode, objective string) int {
 	cfg := o.config.AdversarialRound
 	if cfg <= 0 {
@@ -4516,6 +4801,7 @@ func (o *Orchestrator) roundBudgetFor(node *TaskNode, objective string) int {
 	}
 }
 
+// shouldFastPassSimpleTask 判断简单任务是否可直接放行 (已通过构建、轮次耗尽且无硬伤)。
 func (o *Orchestrator) shouldFastPassSimpleTask(node *TaskNode, maxRounds int, buildPassed bool, team *ProductionTeam) bool {
 	if !buildPassed || team == nil || team.Cwd == "" {
 		return false
@@ -4539,6 +4825,7 @@ func (o *Orchestrator) shouldFastPassSimpleTask(node *TaskNode, maxRounds int, b
 	return len(node.TargetFiles) > 0 && len(node.TargetFiles) <= 2
 }
 
+// effectiveTargetPackagesForBuild 计算构建实际需要的目标包 (无显式目标时退回 "..." 全量)。
 func effectiveTargetPackagesForBuild(node *TaskNode, targetPackages []string) []string {
 	if isProjectSkeletonNode(node) || isManifestOnlyNode(node) {
 		return nil
@@ -4546,6 +4833,7 @@ func effectiveTargetPackagesForBuild(node *TaskNode, targetPackages []string) []
 	return targetPackages
 }
 
+// shouldRunLocalVerification 判断任务是否需要在编排器本地跑一次验证 (而非交给 agent)。
 func (o *Orchestrator) shouldRunLocalVerification(node *TaskNode) bool {
 	if node.TaskType == wbsTaskTypeVerification {
 		return true
@@ -4565,6 +4853,7 @@ func (o *Orchestrator) shouldRunLocalVerification(node *TaskNode) bool {
 			strings.Contains(acceptance, "编译") || strings.Contains(acceptance, "测试"))
 }
 
+// shouldRunLocalDirectoryBootstrap 判断任务是否需要本地补跑一次目录级脚手架生成。
 func (o *Orchestrator) shouldRunLocalDirectoryBootstrap(node *TaskNode) bool {
 	if node == nil || node.TaskType == wbsTaskTypeVerification {
 		return false
@@ -4584,6 +4873,7 @@ func (o *Orchestrator) shouldRunLocalDirectoryBootstrap(node *TaskNode) bool {
 	return len(directoryLikeNodeTargets(node)) > 0
 }
 
+// executeLocalDirectoryBootstrapTask 在编排器本地执行目录级脚手架生成, 返回一个 StageResult。
 func (o *Orchestrator) executeLocalDirectoryBootstrapTask(node *TaskNode, objective string, team *ProductionTeam, start time.Time) StageResult {
 	var ensured []string
 	var failures []string
@@ -4650,6 +4940,7 @@ func (o *Orchestrator) executeLocalDirectoryBootstrapTask(node *TaskNode, object
 	return StageResult{Name: node.Title, Role: node.Role, Status: TaskCompleted, Output: output, StartedAt: start, Duration: duration.Round(time.Second).String()}
 }
 
+// executeLocalVerificationTask 在编排器本地跑验证 (构建/测试), 失败时尝试陈旧失败恢复, 返回 StageResult。
 func (o *Orchestrator) executeLocalVerificationTask(node *TaskNode, objective string, team *ProductionTeam, start time.Time) StageResult {
 	lang := o.runtimeLanguageForTeam(team, "")
 	var checks []string
@@ -4729,6 +5020,7 @@ func (o *Orchestrator) executeLocalVerificationTask(node *TaskNode, objective st
 	return StageResult{Name: node.Title, Role: node.Role, Status: TaskCompleted, Output: output, StartedAt: start, Duration: duration.Round(time.Second).String()}
 }
 
+// recoverStaleVerificationWithProjectTest 用项目级测试重跑一次, 判断先前的失败是否已陈旧 (可翻绿)。
 func (o *Orchestrator) recoverStaleVerificationWithProjectTest(team *ProductionTeam, objective string, node *TaskNode) (bool, string) {
 	if team == nil || team.Cwd == "" || node == nil {
 		return false, ""
@@ -4756,6 +5048,7 @@ func (o *Orchestrator) recoverStaleVerificationWithProjectTest(team *ProductionT
 	return false, ""
 }
 
+// runtimeLanguageForTeam 解析团队当前的运行语言 (显式设置优先, 否则按 objective 推断)。
 func (o *Orchestrator) runtimeLanguageForTeam(team *ProductionTeam, objective string) string {
 	if team != nil && strings.TrimSpace(team.Language) != "" {
 		return inferPlanningLanguageID("", team.Language)
@@ -4769,6 +5062,7 @@ func (o *Orchestrator) runtimeLanguageForTeam(team *ProductionTeam, objective st
 	return "go"
 }
 
+// ensureTaskProjectSkeleton 为单个任务确保项目骨架存在, 返回实际使用的构建根目录。
 func (o *Orchestrator) ensureTaskProjectSkeleton(team *ProductionTeam, objective string, node *TaskNode) string {
 	if team == nil || strings.TrimSpace(team.Cwd) == "" {
 		return ""
@@ -4789,6 +5083,18 @@ func (o *Orchestrator) ensureTaskProjectSkeleton(team *ProductionTeam, objective
 	return ""
 }
 
+// handleTaskTimeout 处理任务超时: 可拆分的长任务走拆分重建, 否则标记失败并回收。
+//
+// 算法解读：
+//
+//	原理：超时不一定是任务本身错, 也可能是粒度太粗; 这里先用 classifyAgentTimeout 按认知负荷
+//	      给超时归因, 只有归因为"任务确实过大"时才允许拆分, 否则直接走重试/失败。
+//	关键不变量：拆分前必须确认归因是 true-oversize —— 把限流/provider 卡顿误判成"任务过大"
+//	      去拆分, 只会把一个重试就能过的任务炸成一堆更小的任务, 徒增调度开销还丢掉原上下文。
+//	代价与边界：拆分需要一次 LLM 规划调用 (可能再失败); 拆分成功后父任务被标记为 macro 并置为
+//	      completed, 它的下游改挂在最后一个子任务上。
+//	设计权衡：宁可把可疑超时判成"不可拆"(走重试) 也不轻易拆 —— 重试的代价是一轮调用,
+//	      误拆的代价是任务图膨胀 + 上下文丢失。
 func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, start time.Time, err error) StageResult {
 	duration := time.Since(start)
 	promptChars := 0
@@ -4804,6 +5110,7 @@ func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, ob
 	node.Error = errText
 	node.SplitReason = appendSplitReason(node.SplitReason, "timeout")
 
+	// 只有归因是"任务确实过大"才允许拆分; 限流/provider 卡顿走重试, 拆了反而把上下文拆散。
 	if !classification.AllowSplit {
 		o.notify(o.chatID, fmt.Sprintf("⏱️ %s 超过 agent %s 预算, 分类为 %s (%s), 不做动态拆分, 进入重试/失败流程",
 			node.Title, o.callTimeout(), classification.Kind, classification.Reason))
@@ -4826,6 +5133,7 @@ func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, ob
 		}
 	}
 	if splitErr == nil && children > 0 {
+		// 父任务转为 macro 并置为 completed: 它此后不再执行, 下游改挂在最后一个子任务上 (见 addTimeoutSplitChildren)。
 		node.TaskType = wbsTaskTypeMacro
 		node.Output = fmt.Sprintf("split-on-timeout: generated %d child leaf tasks via %s after %s", children, splitSource, duration.Round(time.Second))
 		_, _ = o.dag.SetTaskStatusAndUnblock(node.V2TaskID, "completed")
@@ -4856,6 +5164,7 @@ func (o *Orchestrator) handleTaskTimeout(ctx context.Context, node *TaskNode, ob
 	return StageResult{Name: node.Title, Role: node.Role, Status: TaskFailed, Error: errText, StartedAt: start, Duration: duration.Round(time.Second).String()}
 }
 
+// shouldSplitLongRunningLeaf 判断长任务是否已超过长任务预算、应当拆分。
 func (o *Orchestrator) shouldSplitLongRunningLeaf(node *TaskNode, start time.Time) bool {
 	if node == nil || time.Since(start) < longRunningLeafBudget(o.callTimeout()) {
 		return false
@@ -4870,6 +5179,7 @@ func (o *Orchestrator) shouldSplitLongRunningLeaf(node *TaskNode, start time.Tim
 	return true
 }
 
+// handleLongRunningLeaf 处理"跑得太久"的 Leaf: 触发一次主动拆分并返回拆分结果。
 func (o *Orchestrator) handleLongRunningLeaf(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, start time.Time) StageResult {
 	node.SplitReason = appendSplitReason(node.SplitReason, "long-running")
 	budget := longRunningLeafBudget(o.callTimeout())
@@ -4879,6 +5189,18 @@ func (o *Orchestrator) handleLongRunningLeaf(ctx context.Context, node *TaskNode
 	})
 }
 
+// addTimeoutSplitChildren 把超时任务拆成子任务: 先请 LLM 规划, 净化后再挂回 DAG, 返回子任务数与构建目录。
+//
+// 算法解读：
+//
+//	原理：超时任务重跑大概率还会超时, 唯一的出路是换一个更细的切法; 这里让 LLM 基于父任务的
+//	      目标与已写产物重新规划子任务, LLM 规划失败时退化为确定性的 expandRawTask 展开。
+//	关键不变量：下游任务的依赖必须从"父任务 ID"改写成"最后一个子任务 ID" —— 下游原先等的是
+//	      父任务, 而父任务此后不再产出任何东西; 漏改会让下游永远等一个不会完成的任务, 整条链卡死。
+//	代价与边界：一次 LLM 规划 + 一次净化 + 逐个子任务落库, 任一失败即返回错误由调用方回滚;
+//	      子任务依赖里出现本批次之外的编号会直接报错拒绝, 而不是静默丢弃。
+//	设计权衡：LLM 规划失败时用确定性展开兜底 (而不是直接判失败), 至少保证"产物有人接着写";
+//	      代价是兜底拆分的粒度可能不理想。
 func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, timeoutErr error) (int, string, error) {
 	if node == nil || o.dag == nil {
 		return 0, "", fmt.Errorf("missing node or DAG")
@@ -5037,6 +5359,7 @@ func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNo
 		return 0, splitSource, fmt.Errorf("timeout split created no terminal child")
 	}
 
+	// 下游原先依赖的是父任务 ID, 而父任务已不再产出任何东西; 必须把依赖改挂到最后一个子任务, 否则下游永远等不到就绪。
 	for _, task := range downstream {
 		newDeps := replaceString(task.DependsOn, node.V2TaskID, lastChildV2ID)
 		if _, err := o.dag.AddTaskWithDeps(task.Subject, task.Description, task.Owner, newDeps, task.Priority); err != nil {
@@ -5068,6 +5391,7 @@ func (o *Orchestrator) addTimeoutSplitChildren(ctx context.Context, node *TaskNo
 	return len(childNodes), splitSource, nil
 }
 
+// planTimeoutSplitWithLLM 调用一次 LLM 为超时任务规划拆分方案, 返回子任务与规划说明。
 func (o *Orchestrator) planTimeoutSplitWithLLM(ctx context.Context, node *TaskNode, objective string, team *ProductionTeam, timeoutErr error) ([]rawTask, string, error) {
 	if o.factory == nil {
 		return nil, "", fmt.Errorf("split planner factory is nil")
@@ -5095,6 +5419,7 @@ func (o *Orchestrator) planTimeoutSplitWithLLM(ctx context.Context, node *TaskNo
 	return tasks, "llm-split-planner", nil
 }
 
+// buildTimeoutSplitPlannerPrompt 构造超时拆分的规划提示词 (父任务目标、已写文件、失败原因)。
 func (o *Orchestrator) buildTimeoutSplitPlannerPrompt(node *TaskNode, objective string, team *ProductionTeam, timeoutErr error) string {
 	var b strings.Builder
 	b.WriteString("你是 WBS Split Planner。某个 coder Leaf 超过 6 分钟预算, 禁止原样重试。请基于 timeout summary 重新拆成更小的 Leaf DAG。\n\n")
@@ -5184,6 +5509,18 @@ func (o *Orchestrator) buildTimeoutSplitPlannerPrompt(node *TaskNode, objective 
 	return b.String()
 }
 
+// sanitizeLLMTimeoutSplitTasks 净化 LLM 返回的拆分子任务: 补默认值、剔除悬空依赖、强制覆盖父任务目标文件。
+//
+// 算法解读：
+//
+//	原理：LLM 给的子任务依赖经常指向不存在的编号或父任务自己; 这里逐条校验依赖, 只接受
+//	      "指向本批次更早出现的子任务"的边, 并补齐默认值 (目标文件、验证命令、阻断策略)。
+//	关键不变量：任何一条依赖指向本批次之外的编号就整体报错拒绝 —— 宁可让拆分失败、回滚到
+//	      父任务的失败态, 也不留下一条悬空依赖 (悬空边会让子任务永远不就绪, 父任务白白牺牲)。
+//	代价与边界：子任务数上限 12, 超出直接截断; estimatedMin 被强制压到 4 分钟以内 (LLM 给的
+//	      乐观估计在这里不可信); 没有验证任务时自动补一个, 依赖全部终止任务。
+//	设计权衡：用"报错拒绝"而不是"静默删边" —— 删边会得到一个看似合法、实际不满足原意的 DAG,
+//	      比直接失败更难排查。
 func sanitizeLLMTimeoutSplitTasks(tasks []rawTask, parent *TaskNode) ([]rawTask, error) {
 	if parent == nil {
 		return nil, fmt.Errorf("missing timeout parent")
@@ -5232,6 +5569,7 @@ func sanitizeLLMTimeoutSplitTasks(tasks []rawTask, parent *TaskNode) ([]rawTask,
 			if dep == "" || dep == parent.V2TaskID || dep == parent.ParentID {
 				continue
 			}
+			// 只接受"指向本批次更早出现的子任务"的依赖; 指向外部编号一律报错, 绝不静默删边 —— 删边会得到一个看似合法的错 DAG。
 			if !previousIDs[dep] {
 				return nil, fmt.Errorf("split planner task %s depends on non-earlier task %s", task.num, dep)
 			}
@@ -5329,6 +5667,7 @@ func sanitizeLLMTimeoutSplitTasks(tasks []rawTask, parent *TaskNode) ([]rawTask,
 	return cleaned, nil
 }
 
+// prepareTimeoutSplitChildren 为拆分子任务补齐依赖与元数据, 使其可直接挂回 DAG。
 func (o *Orchestrator) prepareTimeoutSplitChildren(children []rawTask, parent *TaskNode) []rawTask {
 	if parent == nil {
 		return children
@@ -5417,6 +5756,7 @@ func (o *Orchestrator) prepareTimeoutSplitChildren(children []rawTask, parent *T
 	return children
 }
 
+// hasVerificationTask 判断任务集合里是否已含验证任务。
 func hasVerificationTask(tasks []rawTask) bool {
 	for _, task := range tasks {
 		if task.taskType == wbsTaskTypeVerification {
@@ -5426,6 +5766,7 @@ func hasVerificationTask(tasks []rawTask) bool {
 	return false
 }
 
+// terminalRawTaskIDs 收集终止任务 (没有被任何其他任务依赖的任务) 的编号。
 func terminalRawTaskIDs(tasks []rawTask) []string {
 	ids := make(map[string]bool)
 	hasDownstream := make(map[string]bool)
@@ -5465,6 +5806,7 @@ func terminalRawTaskIDs(tasks []rawTask) []string {
 	return nil
 }
 
+// fillVerificationDeps 让验证任务依赖全部终止任务, 确保验证在产物齐备后才跑。
 func fillVerificationDeps(tasks []rawTask) {
 	terminals := terminalRawTaskIDs(tasks)
 	barrierTerminals := terminalRawTaskIDsExcludingBarriers(tasks)
@@ -5492,6 +5834,7 @@ func fillVerificationDeps(tasks []rawTask) {
 	}
 }
 
+// scopedTerminalRawTaskIDs 收集"限定范围"的终止任务编号 (排除 parentID 与 self)。
 func scopedTerminalRawTaskIDs(tasks []rawTask, parentID, self string) []string {
 	parentID = strings.TrimSpace(parentID)
 	if parentID == "" {
@@ -5528,6 +5871,7 @@ func scopedTerminalRawTaskIDs(tasks []rawTask, parentID, self string) []string {
 	return uniqueTrimmedStrings(terminals)
 }
 
+// terminalRawTaskIDsExcludingBarriers 收集终止任务编号, 但排除屏障任务本身。
 func terminalRawTaskIDsExcludingBarriers(tasks []rawTask) []string {
 	ids := make(map[string]bool)
 	hasDownstream := make(map[string]bool)
@@ -5567,6 +5911,7 @@ func terminalRawTaskIDsExcludingBarriers(tasks []rawTask) []string {
 	return nil
 }
 
+// excludeRawTaskID 从编号列表里移除指定的一个编号。
 func excludeRawTaskID(ids []string, excluded string) []string {
 	out := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -5578,6 +5923,7 @@ func excludeRawTaskID(ids []string, excluded string) []string {
 	return uniqueTrimmedStrings(out)
 }
 
+// tryDeterministicContractPatch 构建失败时尝试用确定性的契约骨架补丁修复, 返回补丁后的状态与是否成功。
 func (o *Orchestrator) tryDeterministicContractPatch(team *ProductionTeam, objective string, node *TaskNode, lang string, written []string, buildCwd string, targetPackages []string, initialBuildErrors string) (string, []string, string, []string, bool, bool) {
 	if strings.ToLower(strings.TrimSpace(lang)) != "go" || strings.TrimSpace(buildCwd) == "" {
 		return "", written, buildCwd, targetPackages, false, false
@@ -5613,6 +5959,7 @@ func (o *Orchestrator) tryDeterministicContractPatch(team *ProductionTeam, objec
 	return buildErrors, written, buildCwd, targetPackages, true, testsPassed
 }
 
+// tryDeterministicContractSkeletonFallback 确定性契约补丁失败后的兜底: 直接生成最小契约骨架文件。
 func (o *Orchestrator) tryDeterministicContractSkeletonFallback(team *ProductionTeam, node *TaskNode, lang string, written []string, buildCwd string, targetPackages []string) (string, []string, string, []string, bool) {
 	if team == nil || node == nil || strings.ToLower(strings.TrimSpace(lang)) != "go" || !isContractBoundaryNode(node) {
 		return "", written, buildCwd, targetPackages, false
@@ -5656,6 +6003,7 @@ func (o *Orchestrator) tryDeterministicContractSkeletonFallback(team *Production
 	return "", written, buildCwd, targetPackages, true
 }
 
+// goModExists 判断目录下是否存在 go.mod。
 func goModExists(dir string) bool {
 	if dir == "" {
 		return false
@@ -5664,6 +6012,7 @@ func goModExists(dir string) bool {
 	return err == nil
 }
 
+// runGofmtFiles 对给定文件跑 gofmt 格式化 (用于本地补丁后收敛格式)。
 func runGofmtFiles(files []string) error {
 	files = uniqueTrimmedStrings(files)
 	if len(files) == 0 {
@@ -5673,6 +6022,7 @@ func runGofmtFiles(files []string) error {
 	return exec.Command("gofmt", args...).Run()
 }
 
+// firstConcreteGoTargetFile 从任务目标里取第一个具体的 Go 文件 (用于契约骨架落点)。
 func firstConcreteGoTargetFile(node *TaskNode) string {
 	if node == nil {
 		return ""
@@ -5689,6 +6039,7 @@ func firstConcreteGoTargetFile(node *TaskNode) string {
 	return ""
 }
 
+// firstConcreteGoFallbackTargetFile 目标里没有具体 Go 文件时, 从磁盘上找第一个可用的 Go 文件兜底。
 func firstConcreteGoFallbackTargetFile(cwd string, node *TaskNode) string {
 	if target := firstConcreteGoTargetFile(node); target != "" {
 		return target
@@ -5748,6 +6099,7 @@ func firstConcreteGoFallbackTargetFile(cwd string, node *TaskNode) string {
 	return ""
 }
 
+// goFileTokensFromTaskNode 从任务节点提取 Go 文件的词元 (包名、标识符等), 供契约骨架生成。
 func goFileTokensFromTaskNode(node *TaskNode) []string {
 	if node == nil {
 		return nil
@@ -5765,6 +6117,7 @@ func goFileTokensFromTaskNode(node *TaskNode) []string {
 	return uniqueTrimmedStrings(re.FindAllString(text, -1))
 }
 
+// buildGoContractSkeletonSource 生成 Go 契约骨架源码 (包声明 + 占位类型/方法)。
 func buildGoContractSkeletonSource(target string, node *TaskNode) string {
 	pkg := goPackageNameForPlanFile(target)
 	typeStem := exportedIdentifierFromText(node.Title)
@@ -5799,6 +6152,7 @@ type OperationContext = context.Context
 `, pkg, typeStem, typeStem, typeStem, typeStem, typeStem, strings.ToLower(typeStem))
 }
 
+// goPackageNameForPlanFile 从文件路径推断其所属的 Go 包名 (取目录名并清洗)。
 func goPackageNameForPlanFile(file string) string {
 	dir := path.Base(path.Dir(filepath.ToSlash(file)))
 	if dir == "" || dir == "." || dir == string(filepath.Separator) {
@@ -5807,6 +6161,7 @@ func goPackageNameForPlanFile(file string) string {
 	return safeGoPackageName(dir)
 }
 
+// exportedIdentifierFromText 从文本里提取一个可导出的 Go 标识符 (首字母大写、剔除非法字符)。
 func exportedIdentifierFromText(text string) string {
 	parts := regexp.MustCompile(`[^A-Za-z0-9]+`).Split(text, -1)
 	var b strings.Builder
@@ -6480,6 +6835,7 @@ func (o *Orchestrator) executeTaskNode(ctx context.Context, node *TaskNode, obje
 	}
 }
 
+// materializationGateError 判断 agent 输出是否缺少产物落地证据, 缺则返回门禁错误描述。
 func materializationGateError(output string, written []string, lang string) string {
 	if len(written) > 0 || !outputContainsRelevantCodeBlock(output, lang) {
 		return ""
@@ -6487,6 +6843,7 @@ func materializationGateError(output string, written []string, lang string) stri
 	return "未能从 coder 输出中物化任何文件。请使用 `File: path/to/file.go` 或 `### path/to/file.go` 标注每个代码块，并确保输出包含 go.mod。"
 }
 
+// materializationGateErrorForTask 按任务类型细化的产物落地门禁检查 (清单类任务走更宽松的判据)。
 func materializationGateErrorForTask(output string, written []string, lang string, node *TaskNode) string {
 	if containsPseudoToolCall(output) {
 		return "输出包含伪工具调用, 但 coder leaf 必须直接输出目标文件完整内容代码块"
@@ -6503,6 +6860,7 @@ func materializationGateErrorForTask(output string, written []string, lang strin
 	return materializationGateError(output, written, lang)
 }
 
+// validateTaskAgentOutput 校验 agent 输出是否满足任务要求, 不满足返回错误描述。
 func validateTaskAgentOutput(output string, node *TaskNode) string {
 	if isManifestOnlyNode(node) && strings.TrimSpace(output) != "" {
 		return ""
@@ -6514,6 +6872,7 @@ func validateTaskAgentOutput(output string, node *TaskNode) string {
 	return validateAgentOutput(output, role)
 }
 
+// isManifestOnlyNode 判断节点是否只要求产出项目清单文件 (如仅生成 go.mod)。
 func isManifestOnlyNode(node *TaskNode) bool {
 	if node == nil || len(node.TargetFiles) == 0 {
 		return false
@@ -6526,6 +6885,7 @@ func isManifestOnlyNode(node *TaskNode) bool {
 	return true
 }
 
+// isOptionalManifestOnlyNode 判断节点是否只要求产出可选的清单文件。
 func isOptionalManifestOnlyNode(node *TaskNode) bool {
 	if node == nil || len(node.TargetFiles) == 0 {
 		return false
@@ -6538,6 +6898,7 @@ func isOptionalManifestOnlyNode(node *TaskNode) bool {
 	return true
 }
 
+// hasRequiredProjectManifestTarget 判断节点是否要求产出必需的项目清单文件。
 func hasRequiredProjectManifestTarget(node *TaskNode) bool {
 	if node == nil {
 		return false
@@ -6554,6 +6915,7 @@ func hasRequiredProjectManifestTarget(node *TaskNode) bool {
 	return false
 }
 
+// isProjectManifestFile 判断文件是否为项目清单文件 (go.mod/package.json/pyproject.toml 等)。
 func isProjectManifestFile(file string) bool {
 	switch strings.ToLower(path.Base(filepath.ToSlash(file))) {
 	case "go.mod", "go.sum", "package.json", "cargo.toml", "pyproject.toml", "cmakelists.txt":
@@ -6563,10 +6925,12 @@ func isProjectManifestFile(file string) bool {
 	}
 }
 
+// isOptionalProjectManifestFile 判断文件是否为可选的清单文件 (README/LICENSE 等)。
 func isOptionalProjectManifestFile(file string) bool {
 	return strings.EqualFold(path.Base(filepath.ToSlash(file)), "go.sum")
 }
 
+// validateManifestTargets 校验清单类目标文件是否已真实落地, 缺失则返回错误描述。
 func validateManifestTargets(cwd string, targetFiles []string) string {
 	if cwd == "" || len(targetFiles) == 0 {
 		return ""
@@ -6593,6 +6957,7 @@ func validateManifestTargets(cwd string, targetFiles []string) string {
 	return ""
 }
 
+// shouldRunLocalTestsForWritten 判断写了这些文件后是否需要跑本地测试。
 func shouldRunLocalTestsForWritten(written []string) bool {
 	for _, file := range written {
 		if strings.HasSuffix(strings.ToLower(filepath.ToSlash(file)), "_test.go") {
@@ -6602,6 +6967,7 @@ func shouldRunLocalTestsForWritten(written []string) bool {
 	return false
 }
 
+// shouldRunLocalTestsForNode 结合节点类型判断是否需要跑本地测试。
 func shouldRunLocalTestsForNode(node *TaskNode, written []string) bool {
 	if isManifestOnlyNode(node) || isProjectSkeletonNode(node) {
 		return false
@@ -6609,6 +6975,7 @@ func shouldRunLocalTestsForNode(node *TaskNode, written []string) bool {
 	return shouldRunLocalTestsForWritten(written)
 }
 
+// shouldTreatMicroTestAsAdvisory 判断微测试是否只作参考 (不影响硬门禁判定)。
 func shouldTreatMicroTestAsAdvisory(node *TaskNode, written []string) bool {
 	if node == nil || shouldRunLocalTestsForWritten(written) {
 		return false
@@ -6619,7 +6986,20 @@ func shouldTreatMicroTestAsAdvisory(node *TaskNode, written []string) bool {
 	return isContractLikeNode(node)
 }
 
+// taskScoreMeetsHardGate 判定任务是否通过硬门禁 (评分、测试、构建三者同时达标)。
+//
+// 算法解读：
+//
+//	原理：单看 LLM 给的评分会被"自我表扬"骗过, 但反过来把评分一票否决又会让好产物白跑;
+//	      这里做成两条路 —— 评分自己达到硬通过线就直接放行, 否则要求"客观证据 + 分项下限"。
+//	关键不变量：走"客观证据"这条路时, testPassed 与 buildPassed 必须同时为真, 且设计对齐度
+//	      (非零时) 与正确性/完整性/安全/代码质量各项都不低于 4 —— 少任何一条都会让"看着还行、
+//	      实际编译不过"的产物被放行, 下游连锁失败。
+//	代价与边界：纯布尔与数值比较, 无 IO; 只有"契约类节点 + 完整实现目标"才允许走第二条路,
+//	      其余节点仅剩硬通过线一条路。
+//	设计权衡：宁可误杀 (打回重试) 也不误放 —— 重试的代价是多一轮调用, 误放的代价是整条下游返工。
 func taskScoreMeetsHardGate(node *TaskNode, score EvalScore, testPassed, buildPassed bool, objective string) bool {
+	// 快路径: 评分自己达到硬通过线就直接放行; 只有评分不达标时才退到"客观证据 + 分项下限"这条路。
 	if score.MeetsHardPassThreshold() {
 		return true
 	}
@@ -6638,6 +7018,7 @@ func taskScoreMeetsHardGate(node *TaskNode, score EvalScore, testPassed, buildPa
 	return !feedbackContainsConcreteDeliveryFailure(score.Feedback)
 }
 
+// hardGateContinuationFeedback 硬门禁未通过时构造给下一轮的续跑反馈 (汇总评审、测试与构建失败信息)。
 func hardGateContinuationFeedback(reviewFeedback, testResult string, buildPassed, testPassed bool) string {
 	var parts []string
 	if !buildPassed {
@@ -6655,6 +7036,7 @@ func hardGateContinuationFeedback(reviewFeedback, testResult string, buildPassed
 	return strings.Join(parts, "\n\n")
 }
 
+// feedbackContainsConcreteDeliveryFailure 判断反馈里是否含具体的交付失败证据 (而不是泛泛的抱怨)。
 func feedbackContainsConcreteDeliveryFailure(feedback string) bool {
 	lower := strings.ToLower(feedback)
 	markers := []string{
@@ -6682,6 +7064,7 @@ func feedbackContainsConcreteDeliveryFailure(feedback string) bool {
 	return false
 }
 
+// shouldAcceptIncrementalLeaf 判断增量 Leaf 是否可接受 (已通过构建且无具体交付失败证据)。
 func shouldAcceptIncrementalLeaf(node *TaskNode, score EvalScore, testPassed, buildPassed bool, objective string) bool {
 	if node == nil || !buildPassed {
 		return false
@@ -6711,6 +7094,7 @@ func shouldAcceptIncrementalLeaf(node *TaskNode, score EvalScore, testPassed, bu
 	return score.Correctness >= 6 && score.CodeQuality >= 7 && score.Security >= 6
 }
 
+// recoverStaleFailureWithProjectTest 用项目级测试重跑, 判断先前的失败是否已陈旧可翻绿。
 func (o *Orchestrator) recoverStaleFailureWithProjectTest(team *ProductionTeam, objective string, node *TaskNode) (bool, string) {
 	if team == nil || team.Cwd == "" || node == nil || orchNormalizeRole(node.Role) != "coder" || node.TaskType == wbsTaskTypeVerification {
 		return false, ""
@@ -6741,6 +7125,7 @@ func (o *Orchestrator) recoverStaleFailureWithProjectTest(team *ProductionTeam, 
 	return false, ""
 }
 
+// shouldTryEarlyStaleBuildRecovery 判断构建失败是否值得早退重试 (失败信息像是陈旧状态导致)。
 func shouldTryEarlyStaleBuildRecovery(buildErrors string, written []string, node *TaskNode, objective string) bool {
 	if node == nil || orchNormalizeRole(node.Role) != "coder" || node.TaskType == wbsTaskTypeVerification {
 		return false
@@ -6773,6 +7158,7 @@ func shouldTryEarlyStaleBuildRecovery(buildErrors string, written []string, node
 	return true
 }
 
+// requiresStrictLeafLocalIntegrity 判断 Leaf 是否要求严格的本地完整性 (高风险或契约类任务)。
 func requiresStrictLeafLocalIntegrity(node *TaskNode) bool {
 	if node == nil {
 		return false
@@ -6815,6 +7201,17 @@ func requiresStrictLeafLocalIntegrity(node *TaskNode) bool {
 	return false
 }
 
+// enforceTargetFileScope 裁剪越界写入: 只保留属于本任务允许范围的产物文件, 其余剔除。
+//
+// 算法解读：
+//
+//	原理：agent 偶尔会顺手改别的任务负责的文件, 造成静默的跨任务互相覆盖; 这里按任务的
+//	      允许文件集合过滤产物, 把越界写入挡在落库之前。
+//	关键不变量：允许集合为空时不做裁剪 (返回全部) —— 空集合意味着"没有约束", 而不是
+//	      "一个都不许写"; 若按空集裁剪会把所有产物删光, 任务直接空转。
+//	代价与边界：路径比较需要归一化 (绝对/相对、大小写、分隔符); 已存在于允许集合的产物一律保留。
+//	设计权衡：只裁剪、不报错, 越界信息通过 targetScopeViolationError 单独反馈给 agent,
+//	      让它自己纠正而不是直接判失败。
 func enforceTargetFileScope(cwd string, written []string, node *TaskNode) []string {
 	if cwd == "" || len(written) == 0 || node == nil || len(allowedPlanFilesForNode(node)) == 0 {
 		return written
@@ -6841,11 +7238,13 @@ func enforceTargetFileScope(cwd string, written []string, node *TaskNode) []stri
 			filtered = append(filtered, clean)
 			continue
 		}
+		// 越界产物直接从磁盘删掉: 留着会被后续的构建/清单扫描当成真实交付物, 掩盖本任务的缺失。
 		_ = os.Remove(filepath.Join(cwd, clean))
 	}
 	return filtered
 }
 
+// targetScopeViolationError 构造越界写入的错误描述 (列出被剔除的文件)。
 func targetScopeViolationError(rawWritten, kept []string, node *TaskNode) string {
 	if node == nil || len(rawWritten) == 0 || len(allowedPlanFilesForNode(node)) == 0 {
 		return ""
@@ -6886,6 +7285,7 @@ func targetScopeViolationError(rawWritten, kept []string, node *TaskNode) string
 		"。请只输出目标文件完整内容, 不要在本 Leaf 新建其它模块、配置或外部依赖。"
 }
 
+// allowedPlanFilesForNode 汇总节点允许写的文件集合 (目标文件 + 骨架文件)。
 func allowedPlanFilesForNode(node *TaskNode) []string {
 	if node == nil {
 		return nil
@@ -6895,6 +7295,7 @@ func allowedPlanFilesForNode(node *TaskNode) []string {
 	return uniqueTrimmedStrings(files)
 }
 
+// isProjectSkeletonNode 判断节点是否属于项目骨架生成任务。
 func isProjectSkeletonNode(node *TaskNode) bool {
 	if node == nil {
 		return false
@@ -6905,6 +7306,7 @@ func isProjectSkeletonNode(node *TaskNode) bool {
 	return isProjectSkeletonText(node)
 }
 
+// isProjectSkeletonText 判断文本是否描述项目骨架生成。
 func isProjectSkeletonText(node *TaskNode) bool {
 	if node == nil {
 		return false
@@ -6927,6 +7329,7 @@ func isProjectSkeletonText(node *TaskNode) bool {
 		strings.Contains(text, "骨架")
 }
 
+// isContractBoundaryNode 判断节点是否为契约边界节点 (接口/契约类)。
 func isContractBoundaryNode(node *TaskNode) bool {
 	if node == nil {
 		return false
@@ -6970,6 +7373,7 @@ func isContractBoundaryNode(node *TaskNode) bool {
 			strings.Contains(text, "query")))
 }
 
+// isContractLikeNode 判断节点是否形如契约 (按类型、角色与文件名词干)。
 func isContractLikeNode(node *TaskNode) bool {
 	if node == nil {
 		return false
@@ -6996,6 +7400,7 @@ func isContractLikeNode(node *TaskNode) bool {
 				strings.Contains(text, "公开类型")))
 }
 
+// firstPlanPathSegment 取一组文件路径里第一个有意义的路径段。
 func firstPlanPathSegment(files []string) string {
 	for _, file := range files {
 		clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(file)))
@@ -7010,6 +7415,7 @@ func firstPlanPathSegment(files []string) string {
 	return ""
 }
 
+// missingTargetFilesError 构造"目标文件缺失"的错误描述。
 func missingTargetFilesError(cwd string, targetFiles []string) string {
 	if cwd == "" || len(targetFiles) == 0 {
 		return ""
@@ -7033,6 +7439,7 @@ func missingTargetFilesError(cwd string, targetFiles []string) string {
 	return "目标文件缺失, 必须输出完整文件: " + strings.Join(missing, ", ")
 }
 
+// inferTaskBuildCwd 从已写文件推断构建目录 (向上找最近的 manifest 所在目录)。
 func inferTaskBuildCwd(cwd string, written []string) string {
 	if cwd == "" || len(written) == 0 {
 		return ""
@@ -7056,6 +7463,7 @@ func inferTaskBuildCwd(cwd string, written []string) string {
 	return filepath.Join(cwd, filepath.FromSlash(first))
 }
 
+// inferBuildCwdFromTaskScope 从任务的目标文件与目标包推断构建目录。
 func inferBuildCwdFromTaskScope(cwd string, targetFiles, targetPackages []string) string {
 	if cwd == "" {
 		return ""
@@ -7077,6 +7485,7 @@ func inferBuildCwdFromTaskScope(cwd string, targetFiles, targetPackages []string
 	return cwd
 }
 
+// inferBuildCwdFromTaskScopeForObjective 结合 objective 的目标根进一步收敛构建目录。
 func inferBuildCwdFromTaskScopeForObjective(cwd string, targetFiles, targetPackages []string, objective string) string {
 	buildCwd := inferBuildCwdFromTaskScope(cwd, targetFiles, targetPackages)
 	if buildCwd != "" && buildCwd != cwd {
@@ -7091,6 +7500,7 @@ func inferBuildCwdFromTaskScopeForObjective(cwd string, targetFiles, targetPacka
 	return buildCwd
 }
 
+// isLikelyGeneratedProjectRoot 判断目录名是否像一个生成出来的项目根 (build/dist/out 等)。
 func isLikelyGeneratedProjectRoot(name string) bool {
 	if name == "" || strings.HasPrefix(name, ".") {
 		return false
@@ -7103,6 +7513,7 @@ func isLikelyGeneratedProjectRoot(name string) bool {
 	}
 }
 
+// adjustTargetPackagesForBuildRoot 按构建根目录把目标包名换算成相对构建根的形态。
 func adjustTargetPackagesForBuildRoot(cwd, buildCwd string, targetPackages []string) []string {
 	if cwd == "" || buildCwd == "" || len(targetPackages) == 0 || cwd == buildCwd {
 		return targetPackages
@@ -7137,6 +7548,7 @@ var (
 	objectiveTargetRootNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 
+// inferObjectiveTargetRoot 从 objective 文本里推断项目目标根目录。
 func inferObjectiveTargetRoot(objective string) string {
 	objective = strings.TrimSpace(objective)
 	if objective == "" {
@@ -7152,6 +7564,7 @@ func inferObjectiveTargetRoot(objective string) string {
 	return ""
 }
 
+// sanitizeObjectiveTargetRoot 清洗推断出的目标根路径 (去绝对路径、去 '..'、规整分隔符)。
 func sanitizeObjectiveTargetRoot(raw string) string {
 	root := strings.TrimSpace(raw)
 	root = strings.Trim(root, "`'\"“”‘’ ，,。.)）(")
@@ -7219,6 +7632,18 @@ func (o *Orchestrator) executeTaskOnce(ctx context.Context, node *TaskNode, obje
 	}
 }
 
+// executeRunnerBounded 在给定超时内执行一次 agent runner, 超时返回 AgentExecutionTimeoutError。
+//
+// 算法解读：
+//
+//	原理：agent 调用可能永久挂住, 必须由编排器强制加超时; 这里给 runner 一个带 deadline 的
+//	      子 context, 再用 select 在"结果返回"与"超时"之间二选一。
+//	关键不变量：结果通道必须带缓冲 (容量 1) —— 超时后 runner 仍会往通道写一次结果, 无缓冲
+//	      通道会让那个 goroutine 永久阻塞在发送上, 泄漏一个 goroutine。
+//	代价与边界：超时分支不等待 runner 真正退出就返回, 被放弃的 goroutine 只能靠 runner 自己
+//	      响应 ctx 取消; 若 runner 忽略 ctx, 它会一直跑到自然结束 (这是刻意的取舍)。
+//	设计权衡：用"子 context + 缓冲通道"而不是等待 goroutine 收尾 —— 后者会把超时变成无限等待,
+//	      与加超时的目的相悖。
 func executeRunnerBounded(ctx context.Context, runner AgentRunner, prompt string, timeout time.Duration) (string, error) {
 	if runner == nil {
 		return "", fmt.Errorf("agent runner is nil")
@@ -7376,6 +7801,7 @@ func isTransientError(errMsg string) bool {
 	return false
 }
 
+// durationFromStageResult 从 StageResult 的起止时间戳计算耗时。
 func durationFromStageResult(sr StageResult) time.Duration {
 	if !sr.StartedAt.IsZero() {
 		return time.Since(sr.StartedAt)
@@ -7449,6 +7875,7 @@ func (o *Orchestrator) runMicroTest(ctx context.Context, node *TaskNode) {
 	}
 }
 
+// orchDesignRefContext 提取设计参考上下文 (设计文档片段), 供任务提示词注入。
 func (o *Orchestrator) orchDesignRefContext(ref string) string {
 	o.mu.Lock()
 	doc := o.designDoc
@@ -7477,6 +7904,7 @@ func (o *Orchestrator) orchDesignRefContext(ref string) string {
 	return "设计文档参考: " + ref
 }
 
+// orchExtractDriftInfo 从测试输出里提取"偏离设计"的信息片段。
 func orchExtractDriftInfo(testResult string) string {
 	var drifts []string
 	for _, line := range strings.Split(testResult, "\n") {
@@ -7488,6 +7916,7 @@ func orchExtractDriftInfo(testResult string) string {
 	return strings.Join(drifts, "; ")
 }
 
+// orchNormalizeRole 归一化角色名 (别名映射到标准角色)。
 func orchNormalizeRole(role string) string {
 	role = strings.ToLower(strings.TrimSpace(role))
 	switch {
@@ -7502,6 +7931,7 @@ func orchNormalizeRole(role string) string {
 	}
 }
 
+// languageHintForFile 按文件扩展名给出语言提示 (用于构建命令与包名推断)。
 func languageHintForFile(path string) string {
 	switch strings.ToLower(filepath.Base(path)) {
 	case "go.mod", "go.sum":
@@ -7537,6 +7967,7 @@ func languageHintForFile(path string) string {
 	}
 }
 
+// currentGoAPISummaryForTask 汇总当前 Go 包 API 摘要, 供任务提示词注入 (带字符上限)。
 func currentGoAPISummaryForTask(team *ProductionTeam, node *TaskNode, objective string, maxChars int) string {
 	if team == nil || team.Cwd == "" || node == nil {
 		return ""
@@ -7550,6 +7981,7 @@ func currentGoAPISummaryForTask(team *ProductionTeam, node *TaskNode, objective 
 	return summarizeGoPackageAPI(root, maxChars)
 }
 
+// currentGoModulePathForPrompt 取当前模块路径, 供提示词注入。
 func currentGoModulePathForPrompt(team *ProductionTeam, objective string) string {
 	if team == nil || team.Cwd == "" {
 		return ""
@@ -7562,6 +7994,17 @@ func currentGoModulePathForPrompt(team *ProductionTeam, objective string) string
 	return strings.TrimSpace(modulePath)
 }
 
+// summarizeGoPackageAPI 扫描目录下的 Go 包, 生成"类型 + 函数签名"的 API 摘要。
+//
+// 算法解读：
+//
+//	原理：让 agent 知道现有 API 长什么样, 才能避免重复定义与签名冲突; 这里用 go/parser
+//	      解析源码, 只提取类型与函数签名 (不含函数体), 拼成紧凑摘要。
+//	关键不变量：输出必须被 maxChars 硬截断 —— 摘要是注入到提示词里的, 不截断会挤爆上下文预算,
+//	      导致真正的任务描述被挤掉。
+//	代价与边界：每个文件都要 parser.ParseFile (含注释则更慢); 解析失败的文件被跳过,
+//	      不会让整个摘要生成失败。
+//	设计权衡：只摘签名不摘实现 —— 实现细节对"避免重复定义"无用, 却会成倍放大摘要体积。
 func summarizeGoPackageAPI(root string, maxChars int) string {
 	if root == "" {
 		return ""
@@ -7629,6 +8072,7 @@ func summarizeGoPackageAPI(root string, maxChars int) string {
 	return out + "\n"
 }
 
+// summarizeTypeSpec 把类型声明渲染成一行签名 (含字段与接口方法)。
 func summarizeTypeSpec(fset *token.FileSet, spec *ast.TypeSpec) string {
 	if spec == nil {
 		return ""
@@ -7653,6 +8097,7 @@ func summarizeTypeSpec(fset *token.FileSet, spec *ast.TypeSpec) string {
 	return fmt.Sprintf("type %s %s = %s", spec.Name.Name, kind, rendered)
 }
 
+// summarizeFuncDecl 把函数声明渲染成一行签名。
 func summarizeFuncDecl(fset *token.FileSet, fn *ast.FuncDecl) string {
 	if fn == nil {
 		return ""
@@ -7665,6 +8110,7 @@ func summarizeFuncDecl(fset *token.FileSet, fn *ast.FuncDecl) string {
 	return "func " + recv + fn.Name.Name + compactWhitespace(sig)
 }
 
+// renderNode 用 go/printer 把 AST 节点渲染成源码文本。
 func renderNode(fset *token.FileSet, node any) string {
 	var buf bytes.Buffer
 	if err := printer.Fprint(&buf, fset, node); err != nil {
@@ -7673,10 +8119,12 @@ func renderNode(fset *token.FileSet, node any) string {
 	return buf.String()
 }
 
+// compactWhitespace 把连续空白折叠成单个空格。
 func compactWhitespace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// buildTaskPrompt 构造交给 agent 的任务提示词 (目标、约束、现有 API、验收标准等)。
 func (o *Orchestrator) buildTaskPrompt(node *TaskNode, objective string, team *ProductionTeam) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("## 任务: %s\n项目目标: %s\n\n", node.Title, objective))
@@ -7865,6 +8313,7 @@ type AutoInjectTestDepsResult struct {
 	InjectedCount int
 }
 
+// RunAutoInjectTestDeps 供外部调用方使用的便捷包装, 直接对任务列表做测试依赖自动注入。
 // RunAutoInjectTestDeps is a convenience wrapper for external callers.
 func RunAutoInjectTestDeps(tasks []rawTask) AutoInjectTestDepsResult {
 	result := autoInjectTestDeps(tasks)
@@ -7874,6 +8323,7 @@ func RunAutoInjectTestDeps(tasks []rawTask) AutoInjectTestDepsResult {
 	}
 }
 
+// abTestShouldInjectSkill 判断该任务是否属于 A/B 实验的处理组 (需要注入 skill)。
 // abTestShouldInjectSkill returns true for the treatment group (50% split based on task hash).
 // This enables A/B testing of skill injection effects on code quality metrics.
 func abTestShouldInjectSkill(taskKey string) bool {
@@ -7884,6 +8334,7 @@ func abTestShouldInjectSkill(taskKey string) bool {
 	return sum%2 == 1 // 50/50 deterministic split
 }
 
+// ABTestGroup 返回任务所属的 A/B 分组名。
 // ABTestGroup returns the group name for a task key.
 func ABTestGroup(taskKey string) string {
 	if abTestShouldInjectSkill(taskKey) {
@@ -7892,6 +8343,7 @@ func ABTestGroup(taskKey string) string {
 	return "control"
 }
 
+// buildSymbolMapFromRawTasks 建立"文件路径 → 符号级冲突键"的映射, 供符号级串行判定使用。
 // buildSymbolMapFromRawTasks builds a map of file path to symbol-level conflict keys
 // from the Go source files referenced by raw tasks. This enables Phase 3.3
 // symbol-level dependency analysis, replacing coarse file-level conflict keys.
@@ -7928,6 +8380,7 @@ func buildSymbolMapFromRawTasks(tasks []rawTask) map[string][]string {
 	return ca.BuildFileSymbolMap(files)
 }
 
+// smartConflictKeys 优先返回符号级冲突键; 拿不到符号信息时退回文件级冲突键。
 // smartConflictKeys returns symbol-level conflict keys when available,
 // otherwise falls back to rawTaskConflictKeys.
 func smartConflictKeys(rt rawTask, fileSymbols map[string][]string) []string {

@@ -21,6 +21,17 @@ func NewBoidsCoordinator(cfg BoidsConfig) *BoidsCoordinator {
 
 // MeasureDivergence 计算多个 Agent 预测之间的分歧度 (Jensen-Shannon Divergence 均值)。
 // 返回 0 表示完全一致, 1 表示极度分歧。
+//
+// 算法解读：
+//
+//	原理：JSD = 各分布与"平均分布"之间 KL 散度的均值。相比直接两两算 KL, 它对平均分布取散度,
+//	      于是**对称**且天然有界, 适合当作"群体是否分歧"的单一标量。
+//	关键不变量：概率必须先 clampProb 再取 log —— 分布里出现 0 时 log2(0) = -Inf 会把整个
+//	      分歧度污染成 NaN; 夹到 1e-10 是这里唯一挡得住它的地方。
+//	代价与边界：O(预测数 × 结果标签数)。预测数 <2 或没有任何结果标签时直接返回 0 (无从谈
+//	      分歧); 返回值再夹到 [0,1] —— 用 log2 算出的 JSD 上界本就是 1。
+//	设计权衡：用 JSD 而不是投票熵: 后者只看最终选项分布, 看不见"两边都给同一选项 0.5 概率"
+//	      这种一致, 会把高共识误判成高分歧。
 func (bc *BoidsCoordinator) MeasureDivergence(predictions []AgentPrediction) float64 {
 	if len(predictions) < 2 {
 		return 0
@@ -43,6 +54,7 @@ func (bc *BoidsCoordinator) MeasureDivergence(predictions []AgentPrediction) flo
 	for _, p := range predictions {
 		var kl float64
 		for _, o := range outcomes {
+			// 先夹再取 log: 分布里的 0 会让 log2 变成 -Inf, 整个分歧度就废了。
 			pi := clampProb(p.Predictions[o])
 			mi := clampProb(avgDist[o])
 			if pi > 0 && mi > 0 {
@@ -109,6 +121,7 @@ func predictionSimilarity(a, b AgentPrediction) float64 {
 	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
+// collectOutcomes 汇总所有预测出现过的结果标签 (并集)。
 func collectOutcomes(predictions []AgentPrediction) []string {
 	set := make(map[string]bool)
 	for _, p := range predictions {
@@ -123,6 +136,7 @@ func collectOutcomes(predictions []AgentPrediction) []string {
 	return out
 }
 
+// clampProb 把概率夹到 (1e-10, 1-1e-10), 避免 JSD 里出现 log(0)。
 func clampProb(p float64) float64 {
 	if p < 1e-10 {
 		return 1e-10

@@ -463,6 +463,18 @@ func pathWithin(p, dir, cwd string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// compactToolResultContent 对超长工具结果做压缩: 先弱模型整形, 再按字符预算落盘 + 生成摘要与续读指引。
+//
+// 算法解读：
+//
+//	原理：超大工具结果的压缩出口 —— 全文落盘留档, 上下文里那份换成"头部 + 摘要 + 续读指引"。
+//	      目标是让模型知道自己被截断了, 并且知道怎么接着读。
+//	关键不变量：自指保护 —— 读 artifact 的结果**不再**落盘, 否则每读一次就产生一份新 artifact,
+//	      目录指数膨胀。
+//	代价与边界：摘要预算取 maxChars/3 并夹在 [2500, 6000]; 落盘失败时明说"本次无全文留存",
+//	      而不是给一个不存在的路径。
+//	设计权衡：续读指引优先指向**原始来源文件**而不是 artifact —— artifact 存的是带行号前缀的
+//	      渲染结果, 拿它当原文续读会再叠一层行号。
 func compactToolResultContent(toolName string, input json.RawMessage, content string, tctx *ToolContext) string {
 	// 方案三 L3: 弱模型后处理先做 (单行+总行整形), 再走既有字符预算逻辑。
 	if tctx != nil && tctx.WeakResultPostprocess {
@@ -583,6 +595,7 @@ const (
 // lastArtifactSweep 上次清理时间 (UnixNano)。进程内共享, 多 run 并发时也只需一个。
 var lastArtifactSweep atomic.Int64
 
+// artifactLimitFromEnv 读环境变量得到清理阈值; 未配或非法都退回默认值。
 func artifactLimitFromEnv(key string, def int) int {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
@@ -597,6 +610,7 @@ func artifactLimitFromEnv(key string, def int) int {
 	return n
 }
 
+// maybeSweepToolArtifacts 按最小间隔节流地触发一次 artifact 目录清理; 抢不到 CAS 就让给别人扫。
 func maybeSweepToolArtifacts(dir string) {
 	now := time.Now()
 	if prev := lastArtifactSweep.Load(); prev != 0 && now.Sub(time.Unix(0, prev)) < artifactSweepInterval {
@@ -662,6 +676,7 @@ func sweepToolArtifacts(dir string, maxFiles, maxAgeDays int, now time.Time) {
 	}
 }
 
+// sanitizeArtifactName 把工具名归一为安全的文件名 (仅保留字母数字与 -_.), 去首尾连字符并限长 80。
 func sanitizeArtifactName(s string) string {
 	if s == "" {
 		return "tool"
@@ -684,6 +699,15 @@ func sanitizeArtifactName(s string) string {
 	return out
 }
 
+// summarizeLongToolResult 把超长结果压成"头部若干行 + 第一处诊断摘录 + 尾部片段"三段。
+//
+// 算法解读：
+//
+//	原理：保住模型真正会看的两头 (开头与结尾) 与错误信息 —— 中间大段内容对判断没有贡献。
+//	关键不变量：诊断摘录一律在 **lower 坐标系**里取 (偏移与切片都来自 lower)。strings.ToLower
+//	      会把非法 UTF-8 字节替换成 U+FFFD 而变长, 拿 lower 的偏移去切 raw 会越界。
+//	代价与边界：只取**第一处**关键词命中; 摘录固定 800 字符、尾部固定 1200 字符, 最后再整体
+//	      按 maxChars 截断。
 func summarizeLongToolResult(raw string, maxChars int) string {
 	if len(raw) <= maxChars {
 		return raw
@@ -722,6 +746,7 @@ func summarizeLongToolResult(raw string, maxChars int) string {
 	return out
 }
 
+// promptUserApproval 在终端上询问是否允许执行; 返回 (是否允许, 是否"始终允许")。
 func promptUserApproval(toolName string, input json.RawMessage, reason string) (approved bool, alwaysAllow bool) {
 	inputStr := string(input)
 	if len(inputStr) > 200 {

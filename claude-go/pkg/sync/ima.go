@@ -196,6 +196,8 @@ func (a *IMAAdapter) Fetch(item ExternalItem) (ExternalItem, error) {
 	return item, nil
 }
 
+// optionsJSON 把 ClientID / APIKey 序列化成传给 ima_api.cjs 的 opts JSON。
+// 空字段不写进 map, 免得用空串覆盖掉脚本侧的默认凭证来源。
 func (a *IMAAdapter) optionsJSON() string {
 	opts := map[string]string{}
 	if a.ClientID != "" {
@@ -208,6 +210,22 @@ func (a *IMAAdapter) optionsJSON() string {
 	return string(data)
 }
 
+// call 起一个 node 子进程执行 ima_api.cjs 的指定接口, 返回其 stdout。
+//
+// 算法解读：
+//
+//	原理：IMA 只提供 node 版 SDK, 于是每次调用都 fork 一个 node 进程, 把 apiPath /
+//	      body / opts 作为三个位置参数传进去, 从 stdout 拿 JSON。进程即隔离: 脚本崩了
+//	      不会带走控制面, 也无需在 Go 侧复刻签名算法。
+//	关键不变量：① 每页 2 分钟独立超时 (context.WithTimeout), 上层 List() 逐页调用,
+//	      所以"每页"就是计时粒度 —— node 挂住时不会把一个 cron 任务拖成僵尸。
+//	      ② 子进程退出码非 0 时把 stderr 原样拼进错误串, 否则只剩一句 "exit status 1"。
+//	      ③ 业务错误不体现在退出码上: 必须再解一次 {code,msg}, code != 0 才算失败。
+//	      ④ 无重试 —— 重试属于上层调度策略, 这里重试会把超时预算叠成 N 倍。
+//	代价与边界：每页一次 fork, 笔记多时进程数线性增长; 每次调用都新建 ctx,
+//	      没有跨页复用连接或会话。
+//	设计权衡：脚本路径与 node 解释器都**不在这里校验**, 只在使用时由 exec 报错 ——
+//	      报错信息里带上 script/node 全路径, 比预先 Stat 一句"文件不存在"更可操作。
 func (a *IMAAdapter) call(apiPath, bodyJSON, optsJSON string) ([]byte, error) {
 	if a.Script == "" {
 		return nil, fmt.Errorf("找不到 ima_api.cjs: 已尝试 %s; "+

@@ -55,6 +55,10 @@ const apiBase = "https://api.weixin.qq.com"
 // userAgent 用真实浏览器 UA, 规避 Tencent WAF 把 Go 默认 UA 当机器人拦截 (501 page)。
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
+// get 发一个带浏览器 UA 的 GET 请求并读回完整响应体。
+//
+// 注意：只看 HTTP 层错误, 不检查状态码也不解析 errcode —— 调用方必须自己
+// 反序列化响应体并调 wxErr.err(), 否则 WAF 返回的 HTML 页面会被当成正常响应。
 func (c *Client) get(u string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
@@ -74,6 +78,9 @@ type wxErr struct {
 	ErrMsg  string `json:"errmsg"`
 }
 
+// err 把公众号 API 的 errcode 转成 error; errcode=0 表示成功返回 nil。
+//
+// 对 40164 (IP 不在白名单) 附加一句排查提示 —— 这是最常见的部署期失败, 光看 errcode 无从下手。
 func (e wxErr) err() error {
 	if e.ErrCode == 0 {
 		return nil
@@ -323,6 +330,7 @@ func (c *Client) postJSON(u string, payload []byte) ([]byte, error) {
 	return nil, fmt.Errorf("响应被网关/WAF 拦截(HTML), 重试后仍失败: %s", truncate(string(last), 120))
 }
 
+// truncate 截断字符串到 n 个字符, 不追加省略号 (用于错误信息里的响应体片段)。
 func truncate(s string, n int) string {
 	return textutil.Truncate(s, n, "")
 }
@@ -346,6 +354,7 @@ func (c *Client) DeleteDraft(mediaID string) error {
 	return out.err()
 }
 
+// postMultipart 上传单个文件字段 (无附加表单字段), 是 postMultipartFields 的便捷包装。
 func (c *Client) postMultipart(u, field, filename string, data []byte) ([]byte, error) {
 	return c.postMultipartFields(u, field, filename, data, nil)
 }

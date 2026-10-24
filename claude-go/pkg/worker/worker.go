@@ -195,6 +195,18 @@ func (w *Worker) Stats() (done, failed int) {
 }
 
 // Run 阻塞运行: 心跳 goroutine + 拉取-执行循环。ctx 取消后等在途任务收尾再返回。
+//
+// 算法解读：
+//
+//	原理：用容量 MaxParallel 的信号量 sem 兼做并发上限与"取令牌" —— 循环开头先拿
+//	      令牌, 拿到才去拉任务; 拉空/拉错立刻还令牌并退避, 于是空闲时不占并发槽。
+//	关键不变量：**令牌必须在拉取之前拿**: 反过来会出现"拉到了任务却没有槽可跑",
+//	      任务只能被丢弃 (丢活) 或阻塞等待 (白占一个租约)。归还由执行 goroutine 的
+//	      defer 保证, 任何退出路径都不泄漏。
+//	代价与边界：ctx 取消后停止拉新任务, 但必须 wg.Wait() 等在途任务收尾; 它们的 ctx
+//	      已随之取消, 会走"关停"分支上报失败, 不留悬挂租约。
+//	设计权衡：拉取失败与拉空都退避一个 PollInterval —— 控制面抖动时不打热循环,
+//	      代价是空闲任务最多延迟一个轮询周期才被捡起。
 func (w *Worker) Run(ctx context.Context) error {
 	var hbWG sync.WaitGroup
 	hbWG.Add(1)
@@ -213,6 +225,8 @@ loop:
 		case sem <- struct{}{}:
 		}
 
+		// 拉取在拿到令牌之后: 下面两条"没任务"路径都要把令牌还回去再退避,
+		// 否则空闲轮询会把并发槽占满。
 		task, err := w.cli.pull(w.kinds, w.caps)
 		if err != nil {
 			<-sem
@@ -290,6 +304,19 @@ func (w *Worker) ClaimOnce(ctx context.Context, taskID string) (bool, error) {
 	return true, nil
 }
 
+// heartbeatLoop 周期性向控制面续租, 直到 ctx 取消。
+//
+// 算法解读：
+//
+//	原理：先**立刻**发一次心跳再进 ticker 循环 —— 控制面的 Sync 要先看到 worker
+//	      才会把 runtime 注册进 RuntimeRegistry, 迟一拍注册就白等一个心跳周期。
+//	关键不变量：心跳失败**绝不退出循环**。控制面短暂不可用时继续重试; 租约到期后
+//	      控制面自己会把本 worker 从 RuntimeRegistry 剔除, 于是不再有任务派进来 ——
+//	      正确性由租约保证, 不由这里的退出保证。
+//	代价与边界：每个 HeartbeatInterval 一次 HTTP POST (带 caps/kinds/池快照);
+//	      间隔必须显著小于控制面租约, 否则会被误判为掉线。
+//	设计权衡：不在此处做退避/熔断 —— 心跳本身是廉价幂等请求, 退避反而会让"控制面
+//	      恢复后多久重新可见"变得不可预期。
 func (w *Worker) heartbeatLoop(ctx context.Context) {
 	// 立即注册一次: 控制面 Sync 要先看到 worker 才会把 runtime 注册进 RuntimeRegistry。
 	if err := w.cli.heartbeat(w.caps, w.kinds, poolSnapshot()); err != nil {
@@ -358,6 +385,8 @@ func (w *Worker) execute(parent context.Context, task *cluster.Task) {
 	}
 
 	rep := &reporter{cli: w.cli, taskID: task.ID, logf: w.opt.Logf}
+	// sawTerminal 区分"执行体报了终态"与"通道关了但没报终态"—— 后者是执行体的 bug,
+	// 必须当失败处理 (见下方 switch), 不许当成功。
 	var out, failMsg string
 	var sawTerminal bool
 	ka := time.NewTicker(w.opt.KeepaliveInterval)
@@ -437,6 +466,7 @@ drain:
 	}
 }
 
+// reportFail 回报任务失败并计入失败计数 (回报本身失败只记日志, 不再重试)。
 func (w *Worker) reportFail(taskID, msg string) {
 	if err := w.cli.fail(taskID, msg); err != nil {
 		w.opt.Logf("[worker] 任务 %s 回报失败失败: %v (原因: %s)", taskID, err, msg)
@@ -444,6 +474,7 @@ func (w *Worker) reportFail(taskID, msg string) {
 	w.bump(false)
 }
 
+// bump 累加完成/失败计数 (观测用, 不参与任何控制流)。
 func (w *Worker) bump(ok bool) {
 	w.mu.Lock()
 	if ok {
@@ -482,10 +513,13 @@ func (w *Worker) checkWorkspace(want string) error {
 	return nil
 }
 
+// sameDir 只比路径字符串 (去掉结尾 /), **不做 symlink / 设备号解析** —— 见 checkWorkspace
+// 的告警: 它只证明"字符串相同", 不证明是同一份数据。
 func sameDir(a, b string) bool {
 	return strings.TrimRight(a, "/") == strings.TrimRight(b, "/")
 }
 
+// sleepCtx 可被取消的 sleep; 返回 false 表示 ctx 已取消 (调用方应退出循环)。
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -510,12 +544,14 @@ type reporter struct {
 	buf []agent.NodeEvent
 }
 
+// add 把一个节点事件追加进缓冲 (仅执行 goroutine 调用, 加锁是为了与 flush 互斥)。
 func (r *reporter) add(ev agent.NodeEvent) {
 	r.mu.Lock()
 	r.buf = append(r.buf, ev)
 	r.mu.Unlock()
 }
 
+// len 当前缓冲的事件条数 (用于判断是否该提前冲刷)。
 func (r *reporter) len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -561,6 +597,7 @@ type ctlClient struct {
 	http       *http.Client
 }
 
+// newCtlClient 构造控制面客户端; hc 为 nil 时用 30s 超时的默认 client。
 func newCtlClient(base, worker, eventsPath, token string, hc *http.Client) *ctlClient {
 	if hc == nil {
 		hc = &http.Client{Timeout: 30 * time.Second}
@@ -600,6 +637,7 @@ func (c *ctlClient) post(path string, body, out any) (int, error) {
 	return resp.StatusCode, nil
 }
 
+// heartbeat 上报一次心跳 (caps/kinds/池快照), 兼作注册。
 func (c *ctlClient) heartbeat(caps, kinds []string, pool *tool.PoolSnapshot) error {
 	_, err := c.post("/cluster/heartbeat", cluster.WorkerInfo{Name: c.worker, Caps: caps, Kinds: kinds, Pool: pool}, nil)
 	return err
@@ -615,6 +653,7 @@ func poolSnapshot() *tool.PoolSnapshot {
 	return nil
 }
 
+// pull 按 kinds/caps 拉一条任务; 204 No Content 表示当前无任务, 返回 (nil, nil)。
 func (c *ctlClient) pull(kinds, caps []string) (*cluster.Task, error) {
 	var out struct {
 		Task *cluster.Task `json:"task"`
@@ -629,6 +668,7 @@ func (c *ctlClient) pull(kinds, caps []string) (*cluster.Task, error) {
 	return out.Task, nil
 }
 
+// complete 回报成功终态 (带有限重试 —— 丢一次成功结果的代价是整个节点白跑)。
 func (c *ctlClient) complete(id string, res StageResult) error {
 	raw, err := json.Marshal(res)
 	if err != nil {
@@ -641,6 +681,7 @@ func (c *ctlClient) complete(id string, res StageResult) error {
 	})
 }
 
+// fail 回报失败终态 (同样走有限重试)。
 func (c *ctlClient) fail(id, msg string) error {
 	return c.withRetry(func() error {
 		_, err := c.post("/cluster/fail", map[string]any{"id": id, "worker": c.worker, "err": msg}, nil)
@@ -648,11 +689,13 @@ func (c *ctlClient) fail(id, msg string) error {
 	})
 }
 
+// extend 续租一条在跑的任务 (长任务防被队列按租约回收); 不重试。
 func (c *ctlClient) extend(id string) error {
 	_, err := c.post("/cluster/extend", map[string]any{"id": id, "worker": c.worker}, nil)
 	return err
 }
 
+// events 批量回传节点事件, 应答里的 Cancel 是控制面下发的跨进程取消指令。
 func (c *ctlClient) events(taskID string, evs []agent.NodeEvent) (EventAck, error) {
 	var ack EventAck
 	_, err := c.post(c.eventsPath, EventBatch{Worker: c.worker, TaskID: taskID, Events: evs}, &ack)
@@ -676,6 +719,8 @@ func (c *ctlClient) withRetry(fn func() error) error {
 	return last
 }
 
+// isClientError 判断错误串里是否含 4xx 状态码 —— 4xx 是语义错误 (如任务已不在租约内),
+// 重试没有意义。注意: 这里靠**匹配错误文本**而不是类型断言, 与 post 的报错格式强耦合。
 func isClientError(err error) bool {
 	if err == nil {
 		return false

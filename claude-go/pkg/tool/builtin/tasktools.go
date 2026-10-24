@@ -129,6 +129,7 @@ func NewTaskStore(path string) *TaskStore {
 // Path 返回该存储实际使用的文件路径。用于验收"两个项目的任务文件路径不相等"。
 func (s *TaskStore) Path() string { return s.path }
 
+// load 从磁盘载入任务文件到内存索引; 文件不存在视为空台账 (不算错误)。
 func (s *TaskStore) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -149,6 +150,7 @@ func (s *TaskStore) load() error {
 	return nil
 }
 
+// saveLocked 把内存索引落盘; 调用方必须已持有 s.mu (名字里的 Locked 即此意)。
 func (s *TaskStore) saveLocked() error {
 	if s.byID == nil {
 		s.byID = make(map[string]v2TaskRecord)
@@ -162,6 +164,7 @@ func (s *TaskStore) saveLocked() error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	// 先写 .tmp 再 rename: 崩溃时读到的要么是完整旧文件要么是完整新文件, 不会留下半个 JSON。
 	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
@@ -169,6 +172,7 @@ func (s *TaskStore) saveLocked() error {
 	return os.Rename(tmp, s.path)
 }
 
+// genTaskUUID 生成 RFC 4122 v4 格式的 UUID 字符串 (第 7 字节置版本位、第 9 字节置变体位)。
 func genTaskUUID() string {
 	var buf [16]byte
 	_, _ = rand.Read(buf[:])
@@ -221,12 +225,15 @@ func NewTaskCreateTool(store *TaskStore) *TaskCreateTool {
 	return &TaskCreateTool{store: store}
 }
 
+// Name 返回工具名 "TaskCreate"。
 func (t *TaskCreateTool) Name() string { return taskCreateToolName }
 
+// Description 返回工具描述 (在共享任务存储中创建一条新任务并返回任务 ID)。
 func (t *TaskCreateTool) Description() string {
 	return `在共享任务存储中创建一条新任务（V2 Task 系统）。返回任务 ID。`
 }
 
+// InputSchema 返回 JSON Schema (subject 与 description 必填, activeForm 可选)。
 func (t *TaskCreateTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -239,9 +246,12 @@ func (t *TaskCreateTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false —— TaskCreate 会写入任务存储。
 func (t *TaskCreateTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+// IsConcurrencySafe 恒为 true —— 内部靠 TaskStore 的互斥锁串行化写入。
 func (t *TaskCreateTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 在计划模式下拒绝创建任务, 其余情况放行。
 func (t *TaskCreateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx != nil && tctx.PermissionMode == types.PermissionModePlan {
 		return &types.PermissionResult{Behavior: types.PermissionDeny, Reason: "计划模式：禁止创建任务"}
@@ -249,6 +259,7 @@ func (t *TaskCreateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolCont
 	return nil
 }
 
+// Call 校验入参、生成 UUID、以 pending 状态落盘并返回新任务的 JSON。
 func (t *TaskCreateTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in taskCreateInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -300,12 +311,15 @@ func NewTaskGetTool(store *TaskStore) *TaskGetTool {
 	return &TaskGetTool{store: store}
 }
 
+// Name 返回工具名 "TaskGet"。
 func (t *TaskGetTool) Name() string { return taskGetToolName }
 
+// Description 返回工具描述 (按 taskId 读取一条任务)。
 func (t *TaskGetTool) Description() string {
 	return `根据 taskId 从共享任务存储中读取一条任务。`
 }
 
+// InputSchema 返回 JSON Schema (taskId 必填)。
 func (t *TaskGetTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -316,13 +330,17 @@ func (t *TaskGetTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true —— TaskGet 只读任务存储。
 func (t *TaskGetTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 恒为 true —— 只读不改变状态。
 func (t *TaskGetTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 不额外设限, 交回通用权限流程。
 func (t *TaskGetTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 按 taskId 查任务; 未找到时返回 IsError 结果而不是 Go error。
 func (t *TaskGetTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in taskGetInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -361,12 +379,15 @@ func NewTaskUpdateTool(store *TaskStore) *TaskUpdateTool {
 	return &TaskUpdateTool{store: store}
 }
 
+// Name 返回工具名 "TaskUpdate"。
 func (t *TaskUpdateTool) Name() string { return taskUpdateToolName }
 
+// Description 返回工具描述 (仅更新调用方提供的字段)。
 func (t *TaskUpdateTool) Description() string {
 	return `更新指定任务的状态、描述或负责人（可选字段仅更新提供的项）。`
 }
 
+// InputSchema 返回 JSON Schema (taskId 必填, status/description/owner 可选)。
 func (t *TaskUpdateTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -380,9 +401,12 @@ func (t *TaskUpdateTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false —— TaskUpdate 会写入任务存储。
 func (t *TaskUpdateTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+// IsConcurrencySafe 恒为 true —— 内部靠 TaskStore 的互斥锁串行化写入。
 func (t *TaskUpdateTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 在计划模式下拒绝更新任务, 其余情况放行。
 func (t *TaskUpdateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx != nil && tctx.PermissionMode == types.PermissionModePlan {
 		return &types.PermissionResult{Behavior: types.PermissionDeny, Reason: "计划模式：禁止更新任务"}
@@ -390,6 +414,7 @@ func (t *TaskUpdateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolCont
 	return nil
 }
 
+// Call 校验入参、按字段是否为 nil 做局部更新、刷新 UpdatedAt 并落盘, 返回更新后的任务 JSON。
 func (t *TaskUpdateTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in taskUpdateInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -438,12 +463,15 @@ func NewTaskListTool(store *TaskStore) *TaskListTool {
 	return &TaskListTool{store: store}
 }
 
+// Name 返回工具名 "TaskList"。
 func (t *TaskListTool) Name() string { return taskListToolName }
 
+// Description 返回工具描述 (列出全部任务, JSON 数组)。
 func (t *TaskListTool) Description() string {
 	return `列出共享任务存储中的全部任务（JSON 数组）。`
 }
 
+// InputSchema 返回空对象 Schema (TaskList 不接受参数)。
 func (t *TaskListTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -452,13 +480,17 @@ func (t *TaskListTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true —— TaskList 只读任务存储。
 func (t *TaskListTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 恒为 true —— 只读不改变状态。
 func (t *TaskListTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 不额外设限, 交回通用权限流程。
 func (t *TaskListTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 返回存储中全部任务的 JSON 数组; map 遍历顺序随机, 输出不保证稳定序。
 func (t *TaskListTool) Call(_ context.Context, _ json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
@@ -585,6 +617,7 @@ func (s *TaskStore) AddTaskFull(subject, description, owner string, dependsOn []
 	return id, nil
 }
 
+// filterTaskDependsOn 清洗依赖列表: 去空白、丢弃空串/自依赖/重复项。
 func filterTaskDependsOn(dependsOn []string, selfID string) []string {
 	if len(dependsOn) == 0 {
 		return nil

@@ -30,8 +30,11 @@ func NewTraceCaptureHook(store *tracestore.Store) *TraceCaptureHook {
 	return &TraceCaptureHook{store: store}
 }
 
+// Name 返回 hook 名 (观测留痕用)。
 func (h *TraceCaptureHook) Name() string  { return "trace_capture" }
+// Priority 返回执行优先级 5 (观测型 hook, 靠后执行)。
 func (h *TraceCaptureHook) Priority() int { return 5 } // 观测型, 靠后但先于 turn_metrics 无所谓
+// Phases 声明只关心工具调用后与每轮结束后两个相位。
 func (h *TraceCaptureHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePostToolUse, PhasePostTurn}
 }
@@ -162,6 +165,8 @@ func joinTextBlocks(blocks []types.ContentBlock) string {
 	return strings.Join(parts, "\n")
 }
 
+// compactJSON 去掉 JSON 里的空白; 空入参返回空串, 压缩失败时**原样返回**原文
+// (宁可留一点空白, 也不要在留痕里丢掉内容)。
 func compactJSON(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""

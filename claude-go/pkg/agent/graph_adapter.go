@@ -1004,6 +1004,8 @@ type stageNodeRunner struct {
 	deps map[string][]string
 }
 
+// RunNode 执行一个图节点: 先把节点声明下传 (工具画像/放置/确定性/loop 轮次), 再按 Kind 分派 ——
+// gate 节点走 runGate, 其余复用 ExecuteSingleStage。
 func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in graph.NodeInput) graph.NodeResult {
 	// 节点声明下传 (工具画像 / MaxTurns / 确定性 / loop 轮次), 供宿主 factory 消费。
 	ctx = WithNodeExecHints(ctx, NodeExecHints{
@@ -1448,6 +1450,7 @@ type teamGraphHooks struct {
 	internalHits map[string]map[string]int
 }
 
+// newTeamGraphHooks 构造图执行观测桥, 按图里的节点声明序记下 order 与角色兜底表。
 func newTeamGraphHooks(we *WorkflowExecutor, team *ProductionTeam, spec graph.GraphSpec) *teamGraphHooks {
 	h := &teamGraphHooks{
 		we: we, team: team,
@@ -1675,6 +1678,7 @@ func (h *teamGraphHooks) touch(nodeID string, iteration int) {
 	}
 }
 
+// roleOf 取节点角色: 优先用 hook 载荷里带的 role, 缺失时回落到构造时记下的角色表。
 func (h *teamGraphHooks) roleOf(ev graph.HookEvent) string {
 	if r := payloadStr(ev.Payload, "role"); r != "" {
 		return r
@@ -1682,6 +1686,7 @@ func (h *teamGraphHooks) roleOf(ev graph.HookEvent) string {
 	return h.roles[ev.NodeID]
 }
 
+// teamName 返回团队名; 团队为空时返回空串。
 func (h *teamGraphHooks) teamName() string {
 	if h.team == nil {
 		return ""
@@ -1689,6 +1694,7 @@ func (h *teamGraphHooks) teamName() string {
 	return h.team.Name
 }
 
+// payloadStr 从 hook 载荷里取字符串字段, 非字符串值用 fmt 兜底格式化。
 func payloadStr(p map[string]any, key string) string {
 	if p == nil {
 		return ""
@@ -1703,6 +1709,7 @@ func payloadStr(p map[string]any, key string) string {
 	}
 }
 
+// payloadInt 从 hook 载荷里取整数字段 (兼容 int/int64/float64), 取不到返回 0。
 func payloadInt(p map[string]any, key string) int {
 	if p == nil {
 		return 0

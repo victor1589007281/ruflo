@@ -170,6 +170,8 @@ func NewRuntimeRegistry() RuntimeRegistry {
 	return &memRuntimeRegistry{m: map[string]*runtimeEntry{}, affinity: map[string]string{}}
 }
 
+// Register 注册一个 runtime 并记下它的租约; 名字为空或 rt 为 nil 时静默忽略。
+// 同名重复注册是覆盖 (心跳时刻重置)。
 func (r *memRuntimeRegistry) Register(rt AgentRuntime, lease time.Duration) {
 	if rt == nil || rt.Name() == "" {
 		return
@@ -179,6 +181,7 @@ func (r *memRuntimeRegistry) Register(rt AgentRuntime, lease time.Duration) {
 	r.m[rt.Name()] = &runtimeEntry{rt: rt, lease: lease, lastBeat: time.Now()}
 }
 
+// Unregister 注销 runtime, 并一并清掉指向它的亲和记录。
 func (r *memRuntimeRegistry) Unregister(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -191,6 +194,8 @@ func (r *memRuntimeRegistry) Unregister(name string) {
 	}
 }
 
+// Heartbeat 刷新指定 runtime 的最后心跳时刻; 未注册的名字静默忽略 (掉线后迟到的心跳
+// 不该把它复活)。
 func (r *memRuntimeRegistry) Heartbeat(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -199,6 +204,7 @@ func (r *memRuntimeRegistry) Heartbeat(name string) {
 	}
 }
 
+// List 列出当前**未过期**的 runtime 名 (升序)。
 func (r *memRuntimeRegistry) List() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -212,6 +218,7 @@ func (r *memRuntimeRegistry) List() []string {
 	return out
 }
 
+// alive 判断租约是否仍然有效; lease<=0 视为永不过期 (本地 runtime 用这个约定)。
 func (e *runtimeEntry) alive() bool {
 	if e.lease <= 0 {
 		return true // 本地 runtime: 永不过期
@@ -295,6 +302,7 @@ func (r *memRuntimeRegistry) Pick(p *Placement) (AgentRuntime, error) {
 	return win.rt, nil
 }
 
+// placementRequire 安全取出 Placement.Require (p 为 nil 时返回 nil), 仅用于拼错误信息。
 func placementRequire(p *Placement) []string {
 	if p == nil {
 		return nil
@@ -332,10 +340,28 @@ func NewLocalRuntime(name string, caps RuntimeCaps, factory CreateAgentFunc) Age
 	return &localRuntime{name: name, caps: caps, factory: factory, cancels: map[string]context.CancelFunc{}}
 }
 
+// Name 返回注册名 (约定以 "local-" 打头, 使 Prefer:"local" 生效)。
 func (l *localRuntime) Name() string              { return l.name }
+
+// Capabilities 返回构造时声明的能力集。
 func (l *localRuntime) Capabilities() RuntimeCaps { return l.caps }
+
+// cancelKey 拼出取消表的键: "runID/nodeID"。
 func cancelKey(runID, nodeID string) string       { return runID + "/" + nodeID }
 
+// Execute 把一次节点任务交给 CreateAgentFunc 造出的 runner 执行, 并把结果包成事件流。
+//
+// 算法解读：
+//
+//	原理：收编 cliAgentRunner / sessionAgentRunner 的适配层 —— 造 runner → 执行 → 把
+//	      started / (done|failed) 事件写进 channel, 让上层用统一方式消费任意 runtime。
+//	关键不变量：① channel 必须被**关闭** (defer close(ch)), 否则调用方 range 永不结束,
+//	      泄漏 goroutine; ② 取消函数与 cancels 表项必须在协程退出时一并清掉, 否则 Cancel
+//	      会对一个已经结束的节点"成功取消"。两处都用 defer, 保证 panic 路径上也成立。
+//	代价与边界：channel 缓冲只有 4, 生产侧持续产出而不被消费时会阻塞在发送上; 本地实现
+//	      实际只发 2~3 个事件 (从不下发 NodeEventOutput 增量), 所以够用。
+//	设计权衡：panic 被 recover 成一条 NodeEventFailed 事件而不是向上抛 —— 单个节点的
+//	      runner panic 不该带走整个进程; 代价是 panic 现场被压成一行错误串。
 func (l *localRuntime) Execute(ctx context.Context, task RuntimeNodeTask) (<-chan NodeEvent, error) {
 	runner, err := l.factory(ctx, task.Role, task.SystemPrompt)
 	if err != nil {
@@ -376,6 +402,7 @@ func (l *localRuntime) Execute(ctx context.Context, task RuntimeNodeTask) (<-cha
 	return ch, nil
 }
 
+// Cancel 取消指定节点 (runID/nodeID); 没有进行中的该节点时返回错误而不是静默成功。
 func (l *localRuntime) Cancel(runID, nodeID string) error {
 	l.mu.Lock()
 	cancel, ok := l.cancels[cancelKey(runID, nodeID)]

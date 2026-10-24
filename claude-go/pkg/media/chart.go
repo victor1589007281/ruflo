@@ -20,8 +20,10 @@ var (
 	echartsPath     string
 )
 
+// echartsAssetPath 把内嵌的 echarts.min.js 落一份到临时目录并返回路径 (仅首次); 资源缺失时返回空串。
 func echartsAssetPath() string {
 	echartsPathOnce.Do(func() {
+		// 内嵌资源缺失 (未带 assets 构建) 时返回空串, 由调用方回退 CDN。
 		if len(echartsJS) < 1000 {
 			return
 		}
@@ -38,6 +40,7 @@ func echartsAssetPath() string {
 	return echartsPath
 }
 
+// echartsScriptTag 返回加载 ECharts 的 <script> 标签: 优先本地 file://, 回退 jsdelivr CDN。
 func echartsScriptTag() string {
 	if p := echartsAssetPath(); p != "" {
 		return `<script src="file://` + filepath.ToSlash(p) + `"></script>`

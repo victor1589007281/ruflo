@@ -63,6 +63,8 @@ func (h *sessionHost) Ensure(sp sessionapi.Spec) error {
 	return nil
 }
 
+// List 列出全部会话: 先取已声明身份的 spec, 再补上"内存里活着但没人声明过身份"的会话
+// (飞书聊天就是这一类), 按 id 去重避免重复列出。
 func (h *sessionHost) List() []sessionapi.Spec {
 	sm := h.sm
 	out := sm.specs.all()
@@ -84,6 +86,8 @@ func (h *sessionHost) List() []sessionapi.Spec {
 	return out
 }
 
+// Get 返回会话的身份声明; 没有 spec 但内存里活着的会话返回只带 id/名的空壳,
+// 两者都没有才返回 sessionapi.ErrNotFound。
 func (h *sessionHost) Get(id string) (sessionapi.Spec, error) {
 	if sp, ok := h.sm.specs.get(id); ok {
 		return sp, nil
@@ -215,6 +219,8 @@ func (h *sessionHost) Trace(runID string) ([]tracestore.Span, error) {
 // 全文没有任何帮助, 只会先把读它的人 (或 LLM 评委) 的上下文撑爆。
 const traceResolveCap = 64 * 1024
 
+// resolveRefInline 就地把 span 的 blob 引用解析成内联正文, 超过 traceResolveCap 截断并标注;
+// blob 读不到时保留原样 (Size 仍在, 调用方仍能判断"被截了")。
 func resolveRefInline(store *tracestore.Store, ref *tracestore.Ref) {
 	if ref == nil || store == nil || ref.Blob == "" || ref.Inline != "" {
 		return

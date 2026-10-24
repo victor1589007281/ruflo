@@ -12,6 +12,11 @@
 //  2. 招聘辅助: 需求分析 → 候选人评估 → 面试设计
 package agent
 
+// hiringWorkflow 返回应聘招聘团队的工作流定义: JD 分析 → 差距分析 → 简历优化 → STAR 故事 → 模拟面试 → 评估报告。
+//
+// 编排要点: 前两个阶段 (parse-jd / parse-resume) 无依赖, 用 Parallel 并行跑;
+// 其余阶段按 DependsOn 串成链, 并靠 {prev_result} 把上游产出注入下游 prompt。
+// 模式为 orchestrated —— 由 Orchestrator 按依赖图调度, 而不是一次性把所有 prompt 拼给一个模型。
 func hiringWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "hiring",

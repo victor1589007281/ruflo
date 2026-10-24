@@ -7,6 +7,8 @@ type LanguageRegistry struct {
 }
 
 // NewLanguageRegistry creates a new LanguageRegistry with default profiles.
+// 构造语言注册表并预置 Go profile。
+// 注意：Python/Rust profile 虽已定义, 但**未在此注册** —— 需要时得显式 Register。
 func NewLanguageRegistry() *LanguageRegistry {
 	reg := &LanguageRegistry{profiles: make(map[string]*LanguageProfile)}
 	reg.Register(GoProfile())
@@ -14,11 +16,13 @@ func NewLanguageRegistry() *LanguageRegistry {
 }
 
 // Register registers a language profile.
+// 以 profile 的 Name 为键登记 (同名覆盖, 不做冲突检测)。
 func (r *LanguageRegistry) Register(p *LanguageProfile) {
 	r.profiles[p.Name] = p
 }
 
 // Get retrieves a language profile by name.
+// 按名取语言 profile; 第二个返回值表示是否存在。
 func (r *LanguageRegistry) Get(name string) (*LanguageProfile, bool) {
 	p, ok := r.profiles[name]
 	return p, ok
@@ -44,6 +48,11 @@ type ToolPreference struct {
 }
 
 // GoProfile Go language default configuration.
+// 返回 Go 的默认语言配置。
+//
+// 注意：Tools 里有两组 Priority 都是 1 的条目 (staticcheck 与 gofmt/goimports) ——
+// 它们是**不同类别**的工具 (检查器 vs 格式化器), Priority 只在本类别内排序,
+// 不要跨类别比大小。
 func GoProfile() *LanguageProfile {
 	return &LanguageProfile{
 		Name:       "go",
@@ -62,6 +71,7 @@ func GoProfile() *LanguageProfile {
 }
 
 // PythonProfile Python language configuration (placeholder example).
+// 返回 Python 的默认语言配置 (占位示例, 未在 NewLanguageRegistry 里注册)。
 func PythonProfile() *LanguageProfile {
 	return &LanguageProfile{
 		Name:       "python",
@@ -79,6 +89,7 @@ func PythonProfile() *LanguageProfile {
 }
 
 // RustProfile Rust language configuration (placeholder example).
+// 返回 Rust 的默认语言配置 (占位示例, 未在 NewLanguageRegistry 里注册)。
 func RustProfile() *LanguageProfile {
 	return &LanguageProfile{
 		Name:       "rust",

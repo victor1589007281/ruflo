@@ -194,6 +194,7 @@ func clamp01(v float64) float64 {
 	return v
 }
 
+// minInt 返回两整数中的较小者。
 func minInt(a, b int) int {
 	if a < b {
 		return a

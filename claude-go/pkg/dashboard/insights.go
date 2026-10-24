@@ -161,6 +161,7 @@ func (p *Provider) BuildInsights() (*InsightsResp, error) {
 	return resp, nil
 }
 
+// severityFromAlert 从趋势告警文案粗判严重级别: 含"显著下降"或 error 判 critical, 否则 warn。
 func severityFromAlert(s string) string {
 	ls := strings.ToLower(s)
 	if strings.Contains(ls, "显著下降") || strings.Contains(ls, "error") {
@@ -169,6 +170,9 @@ func severityFromAlert(s string) string {
 	return "warn"
 }
 
+// suggestionForTrend 按告警里的指标名给出处置建议; 认不出时给一条通用的"继续观察"。
+//
+// module 参数当前未参与判定 (签名保留给将来按模块细分文案)。
 func suggestionForTrend(module, alert string) string {
 	if strings.Contains(alert, "build_pass_rate") {
 		return "连续编译未通过, 优先检查 Go 错误堆栈与依赖版本。"
@@ -182,6 +186,7 @@ func suggestionForTrend(module, alert string) string {
 	return "关注该指标的下一次采样, 如持续异常请查看对应模块日志。"
 }
 
+// severityScore 把严重级别映射成排序权重 (critical=3 / warn=2 / info=1 / 其它=0), 供降序排布。
 func severityScore(s string) int {
 	switch s {
 	case "critical":
@@ -194,6 +199,7 @@ func severityScore(s string) int {
 	return 0
 }
 
+// fmtDuration 按量级把时长渲染成 s/m/h/d 的紧凑形式 (如 "45s"、"1.5h"、"3.2d")。
 func fmtDuration(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%ds", int(d.Seconds()))
@@ -296,6 +302,10 @@ func (p *Provider) ListProjects(root string) (*ProjectsResp, error) {
 	return resp, nil
 }
 
+// tryProject 探测一个目录是不是 claude-go 项目状态目录, 是则汇总成 ProjectDTO。
+//
+// 第二个返回值表示"这个路径可用" (存在且是目录); teams/metrics/memory/evolution
+// 四个子目录的存在与否只影响布尔标志, 不影响可用性 —— 一个刚建的空项目也该出现在列表里。
 func tryProject(path string) (ProjectDTO, bool) {
 	dto := ProjectDTO{Path: path}
 	info, err := os.Stat(path)

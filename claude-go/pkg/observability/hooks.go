@@ -34,11 +34,17 @@ type LLMHook interface {
 // NoopLLMHook 空实现, 可嵌入后选择性覆盖。
 type NoopLLMHook struct{}
 
+// OnLLMCallStart no-op, LLM 调用开始。
 func (NoopLLMHook) OnLLMCallStart(ev LLMCallEvent)                     {}
+// OnLLMCallComplete no-op, LLM 调用正常结束。
 func (NoopLLMHook) OnLLMCallComplete(ev LLMCallEvent)                  {}
+// OnLLMCallError no-op, LLM 调用失败。
 func (NoopLLMHook) OnLLMCallError(ev LLMCallEvent)                     {}
+// OnLLMCallFallback no-op, 主模型失败后切换到备用模型。
 func (NoopLLMHook) OnLLMCallFallback(primary, fallback string, ev LLMCallEvent) {}
+// OnLLMCacheHit no-op, 提示词缓存命中。
 func (NoopLLMHook) OnLLMCacheHit(model, cacheType string, tokens int)  {}
+// OnLLMCacheMiss no-op, 提示词缓存未命中。
 func (NoopLLMHook) OnLLMCacheMiss(model, cacheType string, tokens int) {}
 
 // ─── 2. StageHook —— 工作流 Stage 生命周期 ──────────────────────────────────
@@ -74,9 +80,13 @@ type StageHook interface {
 
 type NoopStageHook struct{}
 
+// OnStageStart no-op, Stage 开始。
 func (NoopStageHook) OnStageStart(ev StageEvent)                      {}
+// OnStageComplete no-op, Stage 成功结束。
 func (NoopStageHook) OnStageComplete(ev StageEvent)                   {}
+// OnStageFail no-op, Stage 失败。
 func (NoopStageHook) OnStageFail(ev StageEvent)                       {}
+// OnStageRetry no-op, Stage 重试 (携带第几次尝试与退避时长)。
 func (NoopStageHook) OnStageRetry(ev StageEvent, attempt int, delay time.Duration) {}
 
 // ─── 3. TaskHook —— Orchestrator 任务级生命周期 ─────────────────────────────
@@ -110,10 +120,15 @@ type TaskHook interface {
 
 type NoopTaskHook struct{}
 
+// OnTaskReady no-op, 任务依赖满足、进入就绪队列。
 func (NoopTaskHook) OnTaskReady(ev TaskEvent)                         {}
+// OnTaskStart no-op, 任务开始执行。
 func (NoopTaskHook) OnTaskStart(ev TaskEvent)                         {}
+// OnTaskComplete no-op, 任务成功结束。
 func (NoopTaskHook) OnTaskComplete(ev TaskEvent)                      {}
+// OnTaskFail no-op, 任务失败。
 func (NoopTaskHook) OnTaskFail(ev TaskEvent)                          {}
+// OnTaskRetry no-op, 任务重试。
 func (NoopTaskHook) OnTaskRetry(ev TaskEvent, attempt int, delay time.Duration) {}
 
 // ─── 4. TeamHook —— 团队运行全生命周期 ──────────────────────────────────────
@@ -146,9 +161,13 @@ type TeamHook interface {
 
 type NoopTeamHook struct{}
 
+// OnTeamStart no-op, 团队启动。
 func (NoopTeamHook) OnTeamStart(ev TeamEvent)                          {}
+// OnTeamComplete no-op, 团队成功收尾。
 func (NoopTeamHook) OnTeamComplete(ev TeamEvent)                       {}
+// OnTeamFail no-op, 团队失败。
 func (NoopTeamHook) OnTeamFail(ev TeamEvent)                           {}
+// OnTeamStageTransition no-op, 团队内部阶段切换。
 func (NoopTeamHook) OnTeamStageTransition(from, to string, ev TeamEvent) {}
 
 // ─── 5. CollaborationHook —— 多 Agent 协作交互 ──────────────────────────────
@@ -179,9 +198,13 @@ type CollaborationHook interface {
 
 type NoopCollaborationHook struct{}
 
+// OnCollabMessage no-op, Agent 间消息投递。
 func (NoopCollaborationHook) OnCollabMessage(ev CollaborationEvent)    {}
+// OnCollabReview no-op, 评审消息。
 func (NoopCollaborationHook) OnCollabReview(ev CollaborationEvent)     {}
+// OnCollabConsensus no-op, 达成共识。
 func (NoopCollaborationHook) OnCollabConsensus(ev CollaborationEvent)  {}
+// OnCollabHandoff no-op, 角色间交接 (附带上下文摘要)。
 func (NoopCollaborationHook) OnCollabHandoff(from, to, summary string, ev CollaborationEvent) {}
 
 // ─── 6. PromptHook —— 提示词版本管理与 A/B 测试 ─────────────────────────────
@@ -221,10 +244,15 @@ type PromptHook interface {
 
 type NoopPromptHook struct{}
 
+// OnPromptRender no-op, 提示词模板渲染完成。
 func (NoopPromptHook) OnPromptRender(ev PromptEvent)                         {}
+// OnPromptVersion no-op, 提示词产生新版本。
 func (NoopPromptHook) OnPromptVersion(promptID, version, hash string, md map[string]string) {}
+// OnPromptCompare no-op, 两个版本的差异统计。
 func (NoopPromptHook) OnPromptCompare(v1, v2 string, diff map[string]int)    {}
+// OnPromptABStart no-op, A/B 测试开跑。
 func (NoopPromptHook) OnPromptABStart(testID, a, b string, ev PromptEvent)   {}
+// OnPromptABResult no-op, A/B 测试出结果。
 func (NoopPromptHook) OnPromptABResult(res PromptABResult)                   {}
 
 // ─── HookRegistry —— 统一管理所有 Hook 实例 ─────────────────────────────────
@@ -241,10 +269,15 @@ type HookRegistry struct {
 
 // RegisterLLM 注册 LLMHook。
 func (r *HookRegistry) RegisterLLM(h LLMHook)           { r.LLM = append(r.LLM, h) }
+// RegisterStage 注册 StageHook。
 func (r *HookRegistry) RegisterStage(h StageHook)       { r.Stage = append(r.Stage, h) }
+// RegisterTask 注册 TaskHook。
 func (r *HookRegistry) RegisterTask(h TaskHook)         { r.Task = append(r.Task, h) }
+// RegisterTeam 注册 TeamHook。
 func (r *HookRegistry) RegisterTeam(h TeamHook)         { r.Team = append(r.Team, h) }
+// RegisterCollaboration 注册 CollaborationHook。
 func (r *HookRegistry) RegisterCollaboration(h CollaborationHook) { r.Collaboration = append(r.Collaboration, h) }
+// RegisterPrompt 注册 PromptHook。
 func (r *HookRegistry) RegisterPrompt(h PromptHook)     { r.Prompt = append(r.Prompt, h) }
 
 // globalRegistry 全局 hook 注册表。

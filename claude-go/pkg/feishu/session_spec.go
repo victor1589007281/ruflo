@@ -116,6 +116,7 @@ func (s *specStore) load() {
 	})
 }
 
+// put 写入/更新一条 spec: 先更新内存缓存, 再原子落盘 (临时文件 + rename)。
 func (s *specStore) put(sp sessionapi.Spec) error {
 	s.mu.Lock()
 	s.cache[sp.ID] = sp
@@ -139,6 +140,7 @@ func (s *specStore) put(sp sessionapi.Spec) error {
 	return os.Rename(tmp, filepath.Join(s.dir, sp.ID+".json"))
 }
 
+// delete 删除一条 spec: 先清缓存再删盘上文件, 文件本来就不存在不算错误。
 func (s *specStore) delete(id string) error {
 	s.mu.Lock()
 	delete(s.cache, id)
@@ -152,6 +154,7 @@ func (s *specStore) delete(id string) error {
 	return nil
 }
 
+// get 按 id 取 spec; 首次调用会触发一次全量载入 (sync.Once)。
 func (s *specStore) get(id string) (sessionapi.Spec, bool) {
 	s.load()
 	s.mu.RLock()
@@ -160,6 +163,7 @@ func (s *specStore) get(id string) (sessionapi.Spec, bool) {
 	return sp, ok
 }
 
+// all 返回全部 spec (顺序不定); 首次调用会触发一次全量载入。
 func (s *specStore) all() []sessionapi.Spec {
 	s.load()
 	s.mu.RLock()

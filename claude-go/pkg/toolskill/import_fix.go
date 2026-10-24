@@ -20,6 +20,7 @@ type GoImportResolution struct {
 }
 
 // NewGoImportResolution creates a new GoImportResolution.
+// 构造 Go 导入修复技能 (声明为可写、不可并发)。
 func NewGoImportResolution(rt *Runtime) *GoImportResolution {
 	return &GoImportResolution{
 		Base: NewBase(Meta{
@@ -59,6 +60,20 @@ type ModChange struct {
 }
 
 // Execute runs the import resolution.
+// 按 problem 文本匹配四条策略修复 Go 导入问题。
+//
+// 算法解读：
+//
+//	原理：四条策略**按顺序各判各的**, 不是 switch 互斥 —— ① 先对 affected_files
+//	      统一跑 goimports 自动修; ② problem 命中 "no required module provides package"
+//	      时执行 go get; ③ 命中 "ambiguous import" 时给冲突导入加别名; ④ 命中
+//	      "imported and not used" 时列出待删导入。四条都靠正则匹配编译器错误原文。
+//	关键不变量：② 里 go get 失败**直接返回 error**, 不吞成"部分成功" —— 依赖没装上
+//	      而回一份 import_changes 会让上层以为修好了。
+//	代价与边界：依赖编译器错误文案的字面格式, Go 版本改了措辞就会静默漏匹配
+//	      (此时 manual_review 会被置 true, 是唯一的兜底信号)。
+//	设计权衡：③ 的别名回落是 "pkg<行号>" 这种占位名, 仅保证可编译; 语义化别名需
+//	      调用方通过 preferred_alias 显式给。
 func (t *GoImportResolution) Execute(ctx context.Context, input json.RawMessage) (map[string]any, error) {
 	var in struct {
 		RepoRoot       string   `json:"repo_root"`

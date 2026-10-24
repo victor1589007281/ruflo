@@ -257,11 +257,13 @@ type atomicStorage struct {
 	inMisses      int64
 }
 
+// addRead 记一次磁盘读取及其字节数 (计数与字节数各一次原子加)。
 func (s *atomicStorage) addRead(bytes int64) {
 	atomic.AddInt64(&s.diskReads, 1)
 	atomic.AddInt64(&s.diskReadBytes, bytes)
 }
 
+// addHit 按缓存类型 (node/list/in) 累加命中数; 未知类型静默忽略。
 func (s *atomicStorage) addHit(cacheType string) {
 	switch cacheType {
 	case "node":
@@ -273,6 +275,7 @@ func (s *atomicStorage) addHit(cacheType string) {
 	}
 }
 
+// addMiss 按缓存类型 (node/list/in) 累加未命中数; 未知类型静默忽略。
 func (s *atomicStorage) addMiss(cacheType string) {
 	switch cacheType {
 	case "node":
@@ -284,6 +287,7 @@ func (s *atomicStorage) addMiss(cacheType string) {
 	}
 }
 
+// snapshot 把各原子计数器读成一份 StorageMetrics (读取间不保证同一时刻的一致视图)。
 func (s *atomicStorage) snapshot() StorageMetrics {
 	return StorageMetrics{
 		Timestamp:     time.Now(),
@@ -311,6 +315,7 @@ type atomicAutoUpdate struct {
 	rebuildMs   int64
 }
 
+// recordCheck 记一次自动更新检测; changedFiles>0 时**同时**计入触发数 (检测即触发)。
 func (a *atomicAutoUpdate) recordCheck(changedFiles int) {
 	atomic.AddInt64(&a.checks, 1)
 	if changedFiles > 0 {
@@ -319,6 +324,7 @@ func (a *atomicAutoUpdate) recordCheck(changedFiles int) {
 	atomic.AddInt64(&a.changedFiles, int64(changedFiles))
 }
 
+// recordTrigger 记一次重建结果 (成功/失败分桶) 与耗时。
 func (a *atomicAutoUpdate) recordTrigger(success bool, durationMs int64) {
 	if success {
 		atomic.AddInt64(&a.successes, 1)
@@ -328,6 +334,7 @@ func (a *atomicAutoUpdate) recordTrigger(success bool, durationMs int64) {
 	atomic.AddInt64(&a.rebuildMs, durationMs)
 }
 
+// snapshot 把各原子计数器读成一份 AutoUpdateMetrics。
 func (a *atomicAutoUpdate) snapshot() AutoUpdateMetrics {
 	return AutoUpdateMetrics{
 		Timestamp:         time.Now(),
@@ -352,6 +359,7 @@ type ringBuffer[T any] struct {
 	size     int
 }
 
+// newRingBuffer 建一个容量固定的环形缓冲 (data 一次分配, 之后不再增长)。
 func newRingBuffer[T any](capacity int) *ringBuffer[T] {
 	return &ringBuffer[T]{
 		data:     make([]T, capacity),
@@ -359,6 +367,7 @@ func newRingBuffer[T any](capacity int) *ringBuffer[T] {
 	}
 }
 
+// push 写入一个元素并推进 head; 满时**覆盖最旧**的一条 (静默丢弃, 不报错)。
 func (r *ringBuffer[T]) push(v T) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -369,6 +378,17 @@ func (r *ringBuffer[T]) push(v T) {
 	}
 }
 
+// slice 按**从旧到新**的顺序导出全部现存元素 (副本, 不改内部状态)。
+//
+// 算法解读：
+//
+//	原理：head 指向下一个待写位置, 所以现存元素的最旧一条在 (head - size) 处;
+//	      加上 capacity 再取模是为了让减法在 head<size 时仍落在 [0,capacity) 内。
+//	关键不变量：导出顺序必须与 push 顺序一致 —— 调用方 (Snapshot 的平均延迟、
+//	      前端时序图) 都假定最后一条是最近一次采样, 顺序反了会静默给出错误的"最新值"。
+//	代价与边界：O(size) 一次拷贝; size==0 返回 nil 而不是空切片。
+//	设计权衡：导出副本而不是暴露内部切片 —— 读方不持锁, 代价是每次快照一次分配
+//	      (快照频率低, 可接受)。
 func (r *ringBuffer[T]) slice() []T {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

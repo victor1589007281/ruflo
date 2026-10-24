@@ -57,8 +57,10 @@ func taskService() agent.TaskService {
 	return nil
 }
 
+// Teams 列出全部团队 (直接委托给 dashboard 的 Provider, 不额外过滤)。
 func (b platformMCPBackend) Teams() (any, error) { return b.s.provider.ListTeams() }
 
+// Team 按名取单个团队; 名字先过 safeName 再查, 挡住路径穿越式的团队名。
 func (b platformMCPBackend) Team(name string) (any, error) {
 	if !safeName(name) {
 		return nil, fmt.Errorf("非法团队名 %q", name)
@@ -75,6 +77,7 @@ type workflowBrief struct {
 	Stages      []string `json:"stages,omitempty"`
 }
 
+// Workflows 列出全部工作流, 但只投影成 workflowBrief —— 阶段提示词全文不进 MCP 结果。
 func (b platformMCPBackend) Workflows() (any, error) {
 	defs := agent.ListWorkflows()
 	out := make([]workflowBrief, 0, len(defs))
@@ -95,6 +98,7 @@ type skillBrief struct {
 	LoadedFrom  string `json:"loaded_from"`
 }
 
+// Skills 列出全部技能 (含内置/文件/stateDir 三个来源), 投影成 skillBrief。
 func (b platformMCPBackend) Skills() (any, error) {
 	list := b.s.freshSkillRegistry().All()
 	out := make([]skillBrief, 0, len(list))
@@ -113,6 +117,7 @@ type toolBrief struct {
 	InputSchema json.RawMessage `json:"inputSchema,omitempty"`
 }
 
+// Tools 列出内置工具 (名称/描述/输入 schema), 与 /api/tools 同源。
 func (b platformMCPBackend) Tools() (any, error) {
 	all := toolRegistry().All()
 	out := make([]toolBrief, 0, len(all))
@@ -122,6 +127,10 @@ func (b platformMCPBackend) Tools() (any, error) {
 	return out, nil
 }
 
+// Tasks 列出任务: 有 TaskService 时走它 (上限 100 条), 否则退回读磁盘上的 tasks.json。
+//
+// 两条来源用 source 字段自报家门 —— 退回视图里的 id 未必能被 task_status 查到,
+// 不说清楚会让调用方拿着查不到的 id 反复重试。
 func (b platformMCPBackend) Tasks() (any, error) {
 	ts := taskService()
 	if ts == nil {
@@ -139,6 +148,11 @@ func (b platformMCPBackend) Tasks() (any, error) {
 	return map[string]any{"source": "taskservice", "tasks": ts.List(agent.TaskFilter{Limit: 100})}, nil
 }
 
+// SubmitTask 通过注入的 TaskService 提交一次团队运行; 未注入时返回 ErrUnavailable 并指路。
+//
+// 注意：幂等键由 TaskService 从 team|workflow|objective 派生, 因此**同参数重复提交
+// 会被判为同一次运行**而不是排两个队; 想真正再跑一遍必须改动 objective。
+// team 必填且要过 safeName: 它同时是运行身份 (落盘目录名) 与幂等键的一半。
 func (b platformMCPBackend) SubmitTask(spec platformmcp.TaskSubmit) (any, error) {
 	ts := taskService()
 	if ts == nil {
@@ -164,6 +178,7 @@ func (b platformMCPBackend) SubmitTask(spec platformmcp.TaskSubmit) (any, error)
 	return rec, nil
 }
 
+// TaskStatus 按 id 查单个任务; 没有 TaskService 时一律 ErrUnavailable (磁盘视图不提供按 id 查)。
 func (b platformMCPBackend) TaskStatus(id string) (any, error) {
 	ts := taskService()
 	if ts == nil {

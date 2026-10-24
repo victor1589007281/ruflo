@@ -46,6 +46,20 @@ func (s *Server) handleLogsSources(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// collectLogSources 汇总 dashboard 页面「日志」面板要展示的全部日志来源 (已知来源 + logs 目录扫描发现)。
+//
+// 算法解读：
+//
+//	原理：分五批登记 —— dashboard/daemon 等固定路径、按模块名拼出的项目内与 $HOME 两份候选、
+//	      全局汇总日志、以及两个 logs 目录里扫描出的其它 *.log; 全部经 add 闭包登记。
+//	关键不变量：add 用 seen[path] 按**路径**去重, 同一文件不会被登记两次 ——
+//	      但这也意味着两个不同 id 指向同一路径时只有一个能进列表。
+//	      另外排序必须是稳定的 (SliceStable): 已知 id 按 preferredOrder 排, 未知 id 按字母序,
+//	      两者混排时靠 iok/jok 两个分支决定先后, 顺序不能依赖 map 迭代。
+//	代价与边界：每个来源都做一次 os.Stat (来源多时是一串串行 syscall);
+//	      目录扫描不递归, 只认直接子文件里的 .log。
+//	设计权衡：把「存在与否」也作为字段返回 (Exists/SizeBytes/ModTime) 而不是过滤掉不存在的文件,
+//	      让前端能显示「该日志未产生」而不是整行消失 —— 排查缺日志时这本身就是线索。
 func (s *Server) collectLogSources() []LogSourceDTO {
 	root := s.cfg.StateDir
 	homeLogsDir := ""
@@ -200,6 +214,11 @@ type teamDiagnosisResp struct {
 	Prompt  string     `json:"-"`
 }
 
+// handleTeamDiagnose 把团队运行快照 (状态/阶段/黑板/最新指标) 交给 LLM 做一次中文诊断, 返回诊断文本。
+//
+// 注意：快照里各字段都做了截断 (objective 1500 字、阶段输出 600 字、黑板值 400 字、指标只取最后一个点),
+// 所以模型看到的是摘要而不是全量 —— 诊断结论用于「往哪看」, 不能当事实依据。
+// 另外 LLM 调用失败时仍返回 200, 错误放在响应体的 Error 字段里 (前端需要自己判)。
 func (s *Server) handleTeamDiagnose(w http.ResponseWriter, r *http.Request, name string) {
 	detail, err := s.provider.GetTeam(name)
 	if err != nil {
@@ -290,6 +309,21 @@ type blackboardWriteReq struct {
 	Value json.RawMessage `json:"value"`
 }
 
+// handleTeamBlackboardWrite 向指定团队的黑板覆盖写入一个 key-value, 并把这次写入送进运行中团队的内存黑板。
+//
+// 算法解读：
+//
+//	原理：双落点 —— ① 直接改写 <team>/blackboard.json (兼容数组格式与旧 map 格式);
+//	      ② 往 .dashboard/actions 排一条 blackboard.write 动作, 由消费方写进内存黑板。
+//	关键不变量：两次写入必须都做, 且顺序是先磁盘后队列。只写磁盘的话, 团队正在运行时
+//	      内存黑板会在下一次 debounce 全量刷盘时把这条覆盖掉 (调用方却拿到 200 OK);
+//	      只排队的话, 团队不在本进程内 (已结束/未加载) 就没有内存黑板可写, 磁盘是唯一落点。
+//	      两条都走的代价是团队正在运行时写两遍 (内容相同, 幂等)。
+//	代价与边界：请求体限制 256KB; 队列入队与磁盘写入都不是原子的, 中途失败会留下半完成状态;
+//	      队列这一跳只在注入了 ActionExecutor 的进程里才被真正处理, 否则消费方标成 unsupported
+//	      并退化为「只改磁盘」, 响应里的 consumed 字段会如实反映这一点。
+//	设计权衡：用「磁盘 + 动作队列」两条路而不是引入跨进程通知, 换来零额外依赖;
+//	      代价是语义依赖消费方是否在线, 调用方必须读 consumed 而不是看 HTTP 状态码。
 func (s *Server) handleTeamBlackboardWrite(w http.ResponseWriter, r *http.Request, name string) {
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST/PUT required"))
@@ -560,10 +594,28 @@ type llmStatsResp struct {
 	Cache        llmCacheStats    `json:"cache"`
 }
 
+// handleLLMStats 聚合 LLM 指标事件 (llm.jsonl), 产出概览/按模型/按来源/5xx 错误桶/时序/缓存/告警。
+//
+// 算法解读：
+//
+//	原理：窗口内的事件先按 (毫秒截断的时间戳, model) 归并成「一次调用」—— 同一次调用会
+//	      写入多条指标 (耗时、token、缓存、重试各一条), 它们共享同一毫秒与模型名, 靠这个
+//	      复合键重新拼回一个调用; 再在调用粒度上做各项统计。
+//	关键不变量：归并键必须同时含时间与模型 —— 只用时间会把同一时刻的不同模型合并,
+//	      只用模型会把整个窗口的调用压成一条。另外窗口解析失败时静默退回默认 24h,
+//	      不会报错, 因此拼错 window 参数只会得到「看起来正常」的默认结果。
+//	      (注意: 代码里 callKey.ts 用的是 Truncate(time.Millisecond), 下面那行既有注释
+//	      写的 "ts.Second" 与实现不符 —— 同一次调用若跨毫秒边界会被拆成两条。)
+//	代价与边界：一次性拉取最多 20000 条事件到内存再聚合 (窗口很大时会触顶, 更早的事件被丢弃);
+//	      时序分桶的粒度由窗口长度决定, 窗口越长每个点越粗。
+//	设计权衡：在 dashboard 侧现算而不是让写入侧预聚合, 换来指标口径可随时调整;
+//	      代价是每次刷新都要全量重算。
 func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 	windowStr := r.URL.Query().Get("window")
 	window := 24 * time.Hour
 	if windowStr != "" {
+		// 解析失败或非正数都静默沿用默认 24h: 前端把 window 当自由文本传, 这里不报错
+		// 以免一个拼错的参数把整块面板打回 500。
 		if d, err := time.ParseDuration(windowStr); err == nil && d > 0 {
 			window = d
 		}
@@ -921,6 +973,10 @@ func (s *Server) handleLLMStats(w http.ResponseWriter, r *http.Request) {
 // 这里提供专门的 cron CRUD 落盘逻辑
 // =====================================================================
 
+// cronCreate 在 cron_jobs.json 里追加一条定时任务, 返回新建任务的 id; schedule 缺失即拒绝。
+//
+// 注意：读-改-写整份 JSON, 没有文件锁 —— 并发调用 (或与主进程同时写) 会互相覆盖;
+// 调用方传入的 id 与已有任务重复时报错, 不传 id 时用毫秒时间戳生成 (同一毫秒内可能撞车)。
 func (s *Server) cronCreate(payload map[string]interface{}) (string, error) {
 	if payload == nil {
 		return "", errors.New("payload required for cron.create")
@@ -960,6 +1016,10 @@ func (s *Server) cronCreate(payload map[string]interface{}) (string, error) {
 	return id, os.WriteFile(path, b, 0o644)
 }
 
+// cronUpdate 按 id 就地更新定时任务的字段 (不允许改 id), 并打上 updatedAt; 找不到 id 返回错误。
+//
+// 注意：循环里没有 break, 命中后继续遍历 —— id 重复时所有同 id 任务都会被更新;
+// 写回同样是整份文件的读-改-写, 无锁。
 func (s *Server) cronUpdate(id string, payload map[string]interface{}) error {
 	path := s.provider.pathIn("cron", "cron_jobs.json")
 	b, err := os.ReadFile(path)
@@ -991,6 +1051,10 @@ func (s *Server) cronUpdate(id string, payload map[string]interface{}) error {
 	return os.WriteFile(path, nb, 0o644)
 }
 
+// cronDelete 从 cron_jobs.json 里删除指定 id 的任务; 一个都没删掉时报「not found」。
+//
+// 注意：过滤结果复用了原切片的底层数组 (out := arr[:0]) —— 就地压缩, 原数组被改写;
+// 判空靠「长度没变」而不是「是否命中过」, 因此 id 重复时删掉全部同 id 任务也只算一次删除。
 func (s *Server) cronDelete(id string) error {
 	path := s.provider.pathIn("cron", "cron_jobs.json")
 	b, err := os.ReadFile(path)

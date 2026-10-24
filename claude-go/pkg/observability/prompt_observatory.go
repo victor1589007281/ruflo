@@ -276,6 +276,7 @@ func (p *PromptObservatory) ABResult(testID string) (*PromptABResult, error) {
 	return res, nil
 }
 
+// abVariantStats 统计某个 A/B 测试中指定变体的样本数与成功率 (无样本时成功率取 0)。
 func (p *PromptObservatory) abVariantStats(testID, variant string) (count int, successRate float64, err error) {
 	row := p.db.QueryRow(`
 		SELECT COUNT(*), COALESCE(AVG(CASE WHEN success THEN 1.0 ELSE 0.0 END), 0)
@@ -305,6 +306,8 @@ func HashPrompt(prompt string) string {
 
 // ─── schema ────────────────────────────────────────────────────────────────
 
+// initPromptSchema 建表: prompt_versions / prompt_outcomes / prompt_ab_tests / prompt_ab_outcomes
+// 及其索引; 全部 IF NOT EXISTS, 可重复执行。
 func initPromptSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS prompt_versions (
@@ -369,6 +372,8 @@ func initPromptSchema(db *sql.DB) error {
 	return nil
 }
 
+// scanPromptRecord 把一行 prompt_versions 扫描成 PromptRecord; created_at 用 sql.NullTime
+// 承接, 为 NULL 时保留 time.Time 零值。
 func scanPromptRecord(row *sql.Row) (*PromptRecord, error) {
 	var r PromptRecord
 	var createdRaw sql.NullTime
@@ -418,6 +423,7 @@ func (a *PromptHookAdapter) OnPromptVersion(promptID, version, hash string, meta
 	_, _ = a.obs.RecordPrompt(rec)
 }
 
+// OnPromptCompare 是空实现 —— 仅为满足 PromptHook 接口而保留的占位, 不落库。
 // OnPromptCompare no-op。
 func (a *PromptHookAdapter) OnPromptCompare(v1, v2 string, diffStats map[string]int) {}
 

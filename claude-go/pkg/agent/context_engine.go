@@ -323,6 +323,8 @@ func (ce *ContextEngine) retrieveGeneric(req ContextRequest, result *ContextResu
 }
 
 // helper methods
+//
+// parseMethodSymbol 从 "pkg.Type.Method" 形状的符号串里切出类型名与方法名 (取倒数第二、最后一段)。
 func (ce *ContextEngine) parseMethodSymbol(symbol string) (typeName, methodName string) {
 	if symbol == "" {
 		return "", ""
@@ -335,6 +337,7 @@ func (ce *ContextEngine) parseMethodSymbol(symbol string) (typeName, methodName 
 	return
 }
 
+// extractAliasFromDiagnostic 从诊断文本里刮出 import 别名 (取 `":"` 之前那段引号里的内容)。
 func (ce *ContextEngine) extractAliasFromDiagnostic(diag string) string {
 	if idx := strings.Index(diag, `":"`); idx > 0 {
 		start := strings.LastIndex(diag[:idx], `"`)
@@ -345,6 +348,7 @@ func (ce *ContextEngine) extractAliasFromDiagnostic(diag string) string {
 	return ""
 }
 
+// extractTypeFromFieldError 从 "type X has no field Y" 形状的诊断里取 "type " 之后的类型名。
 func (ce *ContextEngine) extractTypeFromFieldError(diag string) string {
 	if idx := strings.Index(diag, "type "); idx >= 0 {
 		return strings.TrimSpace(diag[idx+5:])
@@ -352,6 +356,7 @@ func (ce *ContextEngine) extractTypeFromFieldError(diag string) string {
 	return ""
 }
 
+// extractTypesFromMismatch 从类型不匹配诊断里取期望类型 ("as type X") 与实际类型 ("type X)")。
 func (ce *ContextEngine) extractTypesFromMismatch(diag string) (expected, actual string) {
 	if idx := strings.Index(diag, "as type "); idx >= 0 {
 		expected = strings.TrimSpace(diag[idx+8:])
@@ -365,6 +370,7 @@ func (ce *ContextEngine) extractTypesFromMismatch(diag string) (expected, actual
 	return
 }
 
+// extractTypeFromUndefined 从 "undefined: X" 诊断里取未定义的符号名。
 func (ce *ContextEngine) extractTypeFromUndefined(diag string) string {
 	if idx := strings.Index(diag, "undefined:"); idx >= 0 {
 		return strings.TrimSpace(diag[idx+10:])
@@ -372,6 +378,8 @@ func (ce *ContextEngine) extractTypeFromUndefined(diag string) string {
 	return ""
 }
 
+// formatTypeDefinition 把契约里的类型信息渲染成可直接塞进提示词的 Go 源码片段
+// (struct / interface / 类型别名各一套模板)。
 func (ce *ContextEngine) formatTypeDefinition(ti TypeInfo) string {
 	var sb strings.Builder
 	switch ti.Kind {
@@ -403,6 +411,11 @@ func (ce *ContextEngine) formatTypeDefinition(ti TypeInfo) string {
 	return sb.String()
 }
 
+// retrieveConcurrencyIssue 针对 data_race / goroutine_leak / channel_close / mutex_deadlock
+// 四类并发问题给出固定的排查建议, 并尝试附上 race 报告里那个类型的契约定义。
+//
+// 注意：建议是**静态模板**, 不读本次涉及的现场代码 —— 它只按类别回一份清单, 逐案分析
+// 要靠模型自己。extractTypeFromRaceDiagnostic 的提取同样是启发式的 (见该函数)。
 func (ce *ContextEngine) retrieveConcurrencyIssue(req ContextRequest, result *ContextResult) {
 	// Provide suggestions based on the concurrency issue type
 	switch req.Category {
@@ -447,6 +460,10 @@ func (ce *ContextEngine) retrieveConcurrencyIssue(req ContextRequest, result *Co
 	}
 }
 
+// extractTypeFromRaceDiagnostic 从 race detector 输出里刮出疑似类型/变量名。
+//
+// 注意：取的是第一个含 ".go:" 的行的**最后一个空白分隔字段** (通常是行号或列号), 未必是
+// 类型名 —— 这个提取是启发式的, 命中率取决于 race 报告的排版。这里只记录, 不改代码。
 func (ce *ContextEngine) extractTypeFromRaceDiagnostic(diag string) string {
 	// Extract type/variable name from race detector output
 	// e.g., "Previous write at 0x00c0000 by goroutine 8:"
@@ -464,6 +481,8 @@ func (ce *ContextEngine) extractTypeFromRaceDiagnostic(diag string) string {
 	return ""
 }
 
+// sortChunksByRelevance 按 Relevance 从高到低就地重排片段 (选择排序; 片段数量很小,
+// 且这样无需引入 sort 依赖)。
 func sortChunksByRelevance(chunks []ContextChunk) {
 	for i := 0; i < len(chunks); i++ {
 		for j := i + 1; j < len(chunks); j++ {
@@ -474,6 +493,7 @@ func sortChunksByRelevance(chunks []ContextChunk) {
 	}
 }
 
+// firstOr 取列表首元素; 列表为空时返回 fallback。
 func firstOr(list []string, fallback string) string {
 	if len(list) > 0 {
 		return list[0]
@@ -481,6 +501,7 @@ func firstOr(list []string, fallback string) string {
 	return fallback
 }
 
+// mapKeys 取出 map 的全部键; 顺序不定, 调用方需要稳定输出时应自行排序。
 func mapKeys(m map[string]bool) []string {
 	var keys []string
 	for k := range m {
@@ -489,6 +510,10 @@ func mapKeys(m map[string]bool) []string {
 	return keys
 }
 
+// minInt 返回两数中的较小者。
+//
+// 注意：本文件里真正的截断用的是 Go 1.21 的内建 min (见 retrieveFakeOrUndefined 的
+// matches[:min(5, len(matches))]), 这个函数全仓没有任何调用方 —— 是死代码。
 func minInt(a, b int) int {
 	if a < b {
 		return a

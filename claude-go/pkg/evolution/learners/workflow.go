@@ -410,6 +410,7 @@ func ProposePrompt(stateDir, target, body, reason string) (*Proposal, error) {
 	return &p, nil
 }
 
+// firstNonEmptyStr 返回第一个去掉首尾空白后仍非空的字符串; 全都为空时返回空串。
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -587,6 +588,7 @@ func stripFence(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// truncate 把字符串截到 n 个字符以内, 超出部分以 … 收尾。
 func truncate(s string, n int) string {
 	return textutil.Truncate(s, n, "…")
 }

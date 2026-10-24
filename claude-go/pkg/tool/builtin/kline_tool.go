@@ -24,18 +24,22 @@ type KLineTool struct {
 	client *browser.FinanceClient
 }
 
+// NewKLineTool 构造 K 线工具 (内含一个默认的东财 FinanceClient)。
 func NewKLineTool() *KLineTool {
 	return &KLineTool{client: browser.NewFinanceClient()}
 }
 
+// Name 返回工具对外名 "FetchKLine"。
 func (t *KLineTool) Name() string { return KLineToolName }
 
+// Description 返回给模型看的工具说明 (支持的代码写法与数据源)。
 func (t *KLineTool) Description() string {
 	return `获取 A 股股票 K 线数据（日/周/月线），返回 OHLCV 数据。
 支持代码: 600519(贵州茅台), 000001(平安银行), SH600036, SZ000858 等。
 数据源: 东方财富，免费无需 API key。`
 }
 
+// InputSchema 返回入参 JSON Schema (symbol 必填; period 枚举 daily/weekly/monthly)。
 func (t *KLineTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -58,12 +62,16 @@ func (t *KLineTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒只读: 只发 HTTP 查询, 不落盘也不改远端状态。
 func (t *KLineTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+// IsConcurrencySafe 恒可并发: 只读且 client 无共享可变状态。
 func (t *KLineTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+// CheckPermissions 不附加 Deny —— 只读行情查询交由上层策略决定是否放行。
 func (t *KLineTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 校验 symbol 后向数据源取 K 线, 失败一律以 IsError 结果回注 (不返回 error 给编排层)。
 func (t *KLineTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in klineInput
 	if err := json.Unmarshal(input, &in); err != nil {

@@ -62,6 +62,10 @@ type OutputParser interface {
 	Parse(raw []byte, repoRoot string) (*AdapterResult, error)
 }
 
+// ExecAndParse 在 repoRoot 下执行 a.cmd, 把输出交给 parser 解析成结构化诊断。
+//
+// 解析失败时**不丢原始输出**: 返回带 RawOutput 的结果 + 一个包装过的错误, 让上层
+// 既能显示命令输出, 又知道诊断没解析出来 (CheckPassed 退回只看退出码)。
 // ExecAndParse executes a command and parses the output.
 func (a *BaseAdapter) ExecAndParse(ctx context.Context, args []string, repoRoot string, parser OutputParser) (*AdapterResult, error) {
 	start := time.Now()

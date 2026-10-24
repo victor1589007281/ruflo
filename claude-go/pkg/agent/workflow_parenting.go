@@ -14,6 +14,11 @@
 // 安全机制: SafetyScreen 作为硬前置, 危机情况立即转介专业机构
 package agent
 
+// parentingWorkflow 返回育儿教育顾问工作流定义: 信息采集 → 安全筛查 → 四个并行专家
+// → 行动计划 → 咨询报告。
+//
+// 关键结构: safety-screen 是所有领域专家的共同前置 (DependsOn), 高风险时它输出转介
+// 信息而不是继续分流 —— 安全筛查因此是硬前置而非可跳过的建议步骤。
 func parentingWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "parenting",

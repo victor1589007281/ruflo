@@ -56,6 +56,9 @@ type RunBudgetError struct {
 	Spent int
 }
 
+// Error 拼出"哨兵文案 + 上限 + 实耗", 便于直接读日志归因。
+//
+// 注意：文案里含哨兵原文, 但**分流必须用 errors.Is 而不是字符串匹配** (见下方 Is)。
 func (e *RunBudgetError) Error() string {
 	return fmt.Sprintf("%s (limit=%d spent=%d)", ErrRunBudgetExhausted.Error(), e.Limit, e.Spent)
 }

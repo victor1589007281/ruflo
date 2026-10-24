@@ -154,6 +154,9 @@ func (b *Broker) MountAt(mux *http.ServeMux, path string) {
 	mux.HandleFunc(path, b.handleEvents)
 }
 
+// handleEvents 处理 worker 的事件回传 POST: 校验方法与批次后交给 ingest 归约, 再把应答回写。
+//
+// 应答里带回 cancel 指令 —— 控制面要求取消时, worker 就是这样在下次上报/keepalive 时取回的。
 func (b *Broker) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "仅支持 POST"})
@@ -172,6 +175,7 @@ func (b *Broker) handleEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ack)
 }
 
+// writeJSON 写出一个 JSON 响应 (状态码 + body); 编码失败直接忽略, 此时响应头已发出, 无从补救。
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -210,6 +214,9 @@ func (b *Broker) ingest(batch EventBatch) EventAck {
 	return ack
 }
 
+// pruneCancelsLocked 清掉超过 cancelTombstoneTTL 的取消墓碑, 防 cancels 随任务数无界增长。
+//
+// 调用方必须持有 b.mu (名字里的 Locked 就是这个意思)。
 func (b *Broker) pruneCancelsLocked() {
 	if len(b.cancels) == 0 {
 		return
@@ -222,6 +229,9 @@ func (b *Broker) pruneCancelsLocked() {
 	}
 }
 
+// subscribe 为任务建订阅 (带缓冲的观测通道 + 取消唤醒通道) 并登记进 subs。
+//
+// 必须在 Enqueue **之前**调用: 反序会漏掉 worker 抢在订阅建立前上报的 started 事件。
 func (b *Broker) subscribe(taskID string) *subscription {
 	sub := &subscription{ch: make(chan agent.NodeEvent, DefaultSubBuffer), cancel: make(chan struct{})}
 	b.mu.Lock()
@@ -230,6 +240,7 @@ func (b *Broker) subscribe(taskID string) *subscription {
 	return sub
 }
 
+// unsubscribe 摘掉任务的订阅; 任务结束 (终态/失败/取消) 时调用, 否则 subs 会随任务数一直涨。
 func (b *Broker) unsubscribe(taskID string) {
 	b.mu.Lock()
 	delete(b.subs, taskID)
@@ -274,6 +285,17 @@ func RuntimeName(worker string) string {
 //     (memRuntimeRegistry.alive), 这正是那套机制存在的理由。
 //
 // lease 应显著大于 Sync 间隔 (建议 ≥3 倍), 否则一次抖动就把 worker 摘掉。
+//
+// 算法解读：
+//
+//	原理：以"租约续期"代替显式上下线 —— 每个周期把注册表快照投影成 runtime 集合,
+//	      首次见到或能力变化就 Register(lease), 否则 Heartbeat 续租; 掉线者不主动摘除。
+//	关键不变量：能力签名必须与注册表返回的标签同源归一 (见 capsSignature)。签名不变就
+//	      只能续租 —— 只有"首次/变更"才 Register, 否则注册动作就失去语义, 每轮都重注册。
+//	代价与边界：每轮全量 Alive() 扫一遍注册表 (一次 KV 读), 周期越短开销越线性;
+//	      Broker 未配 cluster.Registry 时本函数直接报错, 掉线判定退化为等调用方 ctx 超时。
+//	设计权衡：掉线不做显式剔除, 交给 RuntimeRegistry 既有的租约过期剔除 —— 在这里再判一次
+//	      会多出第二份"谁还活着"的真相, 两处判定迟早漂移。
 func (b *Broker) Sync(reg agent.RuntimeRegistry, lease time.Duration) ([]string, error) {
 	if reg == nil {
 		return nil, fmt.Errorf("worker: Sync 需要 RuntimeRegistry")
@@ -302,6 +324,8 @@ func (b *Broker) Sync(reg agent.RuntimeRegistry, lease time.Duration) ([]string,
 		sig := capsSignature(w.Caps)
 
 		b.mu.Lock()
+		// 顺手记下"此刻还活着": workerAbsentSince 要拿这个时刻当掉线起算点,
+		// 而它读的是同一份注册表快照, 两处口径必须一致。
 		b.lastAlive[w.Name] = now
 		rt, known := b.runtimes[name]
 		if !known {
@@ -310,6 +334,8 @@ func (b *Broker) Sync(reg agent.RuntimeRegistry, lease time.Duration) ([]string,
 		} else {
 			rt.setCaps(caps)
 		}
+		// 签名比对而不是无条件 Register: 标签顺序无关 (capsSignature 已排序), 所以只有
+		// 真的增删了能力才算"变化", 一次顺序抖动不该触发重注册。
 		changed := b.capsSig[name] != sig
 		b.capsSig[name] = sig
 		b.mu.Unlock()
@@ -359,6 +385,7 @@ func (b *Broker) Runtime(workerName string, caps agent.RuntimeCaps) agent.AgentR
 	return rt
 }
 
+// acceptsStage 判断 worker 声明的 kinds 是否接受 stage 任务; 未声明视为接受全部。
 func acceptsStage(kinds []string) bool {
 	if len(kinds) == 0 {
 		return true // 未声明 = 接受全部 (与 Queue.PullFor 的 kinds 语义一致)
@@ -381,6 +408,9 @@ func isEphemeral(caps []string) bool {
 	return false
 }
 
+// capsSignature 把能力标签归一成签名 (排序后拼接), 用于判断"能力是否变化"。
+//
+// 先排序再拼接是关键: 标签顺序与语义无关, 不归一的话注册表返回顺序一变就会被误判成能力变化。
 func capsSignature(caps []string) string {
 	s := append([]string(nil), caps...)
 	sort.Strings(s)
@@ -454,14 +484,17 @@ type taskSupervisor interface {
 	cleanup()
 }
 
+// Name 返回 runtime 名 (放置策略里的身份, 由 worker 名经 RuntimeName 推导)。
 func (r *remoteRuntime) Name() string { return r.name }
 
+// Capabilities 返回当前能力声明; 能力会被 Sync 热更新, 故加锁读。
 func (r *remoteRuntime) Capabilities() agent.RuntimeCaps {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.caps
 }
 
+// setCaps 更新能力声明 (worker 重新注册时标签可能变化, 同一个 runtime 实例要跟着改)。
 func (r *remoteRuntime) setCaps(c agent.RuntimeCaps) {
 	r.mu.Lock()
 	r.caps = c
@@ -471,6 +504,17 @@ func (r *remoteRuntime) setCaps(c agent.RuntimeCaps) {
 // Execute 入队一个 stage 任务并返回流式事件通道。
 //
 // 通道一定会被关闭 (与 localRuntime 同一契约, 否则调用方 range 不结束)。
+//
+// 算法解读：
+//
+//	原理：派发 = "先钉住一台 worker, 再把任务放进队列"。本函数只做派发的前半段 (求解
+//	      工作区、算能力要求、入队), 真正的等待与状态归约在 watch 里。
+//	关键不变量：订阅必须先于入队 (见下)。worker 一拉到任务就可能立刻上报 started,
+//	      反序会让这批事件落在没有订阅者的窗口里 —— 事件是观测流, 丢了不报错, 只静默少一截。
+//	代价与边界：任务 ID 由控制面先生成, 于是 launch/入队失败时队列里可能留下一条钉着
+//	      不存在 worker 的死记录 (见下方注释); 对正确性无害, 但清掉它要给 pkg/cluster 加接口。
+//	设计权衡：所有失败一律**同步**返回 (工作区求解、握手、入队、launch), 而不是返回一个
+//	      永远不出事件的通道 —— 后者会把"派不出去"变成调用方等到超时, 归因还指向 LLM。
 func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask) (<-chan agent.NodeEvent, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -494,6 +538,8 @@ func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 	if r.workerFor != nil {
 		pinned = r.workerFor(taskID)
 	}
+	// 能力要求是三处求并: 放置策略声明的 + 钉住 worker 的身份标签 (保证只有那台拉得动)
+	// + 工作区档位追加的。少任何一处都会派出一条没人能拉的任务。
 	require := MergeCaps(PlacementCaps(task.Placement), []string{WorkerCap(pinned)}, r.b.ws.RequireCaps())
 	st := StageTask{
 		RunID: task.RunID, NodeID: task.NodeID, SessionID: task.SessionID, Role: task.Role,
@@ -532,6 +578,7 @@ func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 		return nil, fmt.Errorf("%s: 入队失败: %w", r.name, err)
 	}
 
+	// 登记在途表: Cancel 只能靠它把 (runID, nodeID) 映射回 taskID, 进而标记取消。
 	key := inflightKey(task.RunID, task.NodeID)
 	r.mu.Lock()
 	r.inflight[key] = taskID
@@ -578,12 +625,24 @@ func (r *remoteRuntime) Cancel(runID, nodeID string) error {
 	return nil
 }
 
+// inflightKey 拼出在途表的键; Execute 写入与 Cancel 查询必须用同一套键, 否则取消找不到任务。
 func inflightKey(runID, nodeID string) string { return runID + "/" + nodeID }
 
 // watch 把队列状态 + 事件流归约成一条事件流, 结束时关闭 out。
 //
 // pinned 为本任务钉住的 worker 名 (掉线判定用); sup 可空 (k8s-job 才有, 见
 // taskSupervisor)。
+//
+// 算法解读：
+//
+//	原理：一个事件多路复用器 —— 把"worker 推来的增量事件"与"队列里的权威状态"归约成
+//	      调用方看到的单一事件流, 只在队列状态到终态时才产出终态事件。
+//	关键不变量：**终态必须送达**。增量可以丢 (缓冲满即丢), 终态不能丢 —— 丢掉终态会被
+//	      CollectRuntimeOutput 读成"空产出 + nil 错误" = 静默成功 (见 term 的两段式发送)。
+//	代价与边界：每个在途任务一个 goroutine, 且每个 poll 周期查一次任务状态; pending 期间
+//	      还要按宽限期扫注册表判掉线, 所以 poll 间隔直接决定控制面的 KV 读放大。
+//	设计权衡：终态只认队列 (fail-closed 规则 1), worker 的 done/failed 事件一律不转发 ——
+//	      代价是终态比 worker 实际完成晚一个 poll 周期, 换来丢包/伪造不能变成"成功"。
 func (r *remoteRuntime) watch(ctx context.Context, taskID, key, pinned string, task agent.RuntimeNodeTask,
 	wsReq *workspaceRequest, sub *subscription, sup taskSupervisor, out chan agent.NodeEvent) {
 
@@ -734,6 +793,7 @@ func (r *remoteRuntime) watch(ctx context.Context, taskID, key, pinned string, t
 	}
 }
 
+// maxTime 返回两个时刻中较晚的一个。
 func maxTime(a, b time.Time) time.Time {
 	if a.After(b) {
 		return a
@@ -747,11 +807,23 @@ func maxTime(a, b time.Time) time.Time {
 // worker 拉走任务后进程被 kill, 若集群里恰好没有其他 worker 在 Pull, 该任务会
 // 永远停在 leased —— 控制面就永远等不到终态 (静默挂死)。这里主动 List 一次触发
 // 回收, 再读一遍状态。
+//
+// 算法解读：
+//
+//	原理：把"读一次任务状态"变成"读 → 租约过期则触发回收 → 再读", 用一次额外 List 把
+//	      队列里那条不会自愈的 leased 记录推进到终态。
+//	关键不变量：只有真的过期 (LeaseUntil > 0 且早于当前毫秒) 才触发回收。LeaseUntil<=0
+//	      表示"没有租约"而不是"租约过期", 误判会让每次轮询都白跑一遍队列。
+//	代价与边界：回收是**全局**的 —— List 会顺带回收所有过期任务而不只是本任务; 这是刻意的,
+//	      但也意味着这个函数的开销与队列规模相关, 不能放进高频路径。
+//	设计权衡：本可以在 watch 里自己判租约超时, 但那样控制面与队列就有了两份租约判定;
+//	      让队列做唯一裁判, 代价是每个过期任务多一次 List。
 func (b *Broker) taskState(taskID string) (*cluster.Task, error) {
 	ct, err := b.q.Get(taskID)
 	if err != nil {
 		return nil, err
 	}
+	// LeaseUntil 是毫秒时间戳, 0 表示这条任务没有租约 (不是"租约已过期")。
 	if ct.Status == "leased" && ct.LeaseUntil > 0 && ct.LeaseUntil < time.Now().UnixMilli() {
 		if _, lerr := b.q.List(); lerr != nil {
 			return nil, lerr
@@ -850,6 +922,15 @@ func (b *Broker) settleWorkspace(ctx context.Context, req *workspaceRequest, tas
 	return nil
 }
 
+// decodeStageResult 解码 worker 回报的结果载荷, 并校验协议标记。
+//
+// 算法解读：
+//
+//	原理：这是 worker → 控制面的协议入口, 三重把关: 载荷非空、JSON 可解、Proto 标记相符。
+//	关键不变量：标记不符一律**报错**, 绝不返回"空结果 + nil 错误" —— 那会被上层当成
+//	      "模型没话说"的成功, 把协议不匹配洗成一次正常产出 (fail-closed 规则 2)。
+//	代价与边界：只认本包的结果形状, 老 worker / 改造前的回显桩会被判失败; 这是刻意的,
+//	      宁可让协议漂移立刻可见, 也不要它悄悄退化成空产出。
 func decodeStageResult(raw json.RawMessage) (StageResult, error) {
 	var res StageResult
 	if len(raw) == 0 {

@@ -109,14 +109,28 @@ func NewStdioTransport() MCPTransport {
 	return &stdioTransport{}
 }
 
+// Name 返回传输层名称 "stdio"。
 func (t *stdioTransport) Name() string { return "stdio" }
 
+// Run 以「一行一条 JSON-RPC 消息」的帧格式从 stdin 读消息并就地分发, 读到 EOF 视为正常退出。
+//
+// 算法解读：
+//
+//	原理：stdio 是 Claude Desktop 的默认传输 —— 请求与响应共用 stdin/stdout,
+//	      没有长度前缀, 只能靠换行切帧, 每个非空行即一条完整消息。
+//	关键不变量：一条消息必须恰好占一行。响应侧由 writeJSON 用 json.Marshal (紧凑)
+//	      而不是 MarshalIndent 保证 —— 任何一处改成缩进输出, 客户端都会把一行拆成多条。
+//	代价与边界：串行分发, 慢工具会阻塞后续请求 (无并发); 空行被跳过;
+//	      EOF 返回 nil, 因为对端关闭 stdin 是正常结束而非错误。
+//	设计权衡：选换行分帧而非 Content-Length 头, 是为了兼容最朴素的 stdio 客户端;
+//	      代价是消息内不能出现裸换行 (JSON 字符串里的换行会被转义, 所以实际安全)。
 func (t *stdioTransport) Run(srv *MCPServerV2) error {
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
+				// 客户端关闭 stdin = 正常下线, 返回 nil 让上层干净退出而不是报错。
 				return nil
 			}
 			return err
@@ -129,6 +143,7 @@ func (t *stdioTransport) Run(srv *MCPServerV2) error {
 	}
 }
 
+// Stop 无资源可释放 —— stdin/stdout 归进程所有, 停止即让 Run 的读循环随 EOF 退出, 故恒返回 nil。
 func (t *stdioTransport) Stop(_ context.Context) error { return nil }
 
 // ============================================================================
@@ -151,8 +166,13 @@ func NewHTTPTransport(addr string) MCPTransport {
 	return &httpTransport{addr: addr}
 }
 
+// Name 返回传输层名称 "http"。
 func (t *httpTransport) Name() string { return "http" }
 
+// Run 注册 HTTP 路由并阻塞在 Serve 上, 直到 Stop 触发 http.ErrServerClosed (视为正常退出)。
+//
+// 注意：addr 配成 "127.0.0.1:0" 时端口由内核分配, 真实地址要等 Listen 之后才写回 t.addr,
+// 因此调用方必须在 Run 起来之后经 Addr() 读取 —— 启动前拿到的是配置值而不是实际端口。
 func (t *httpTransport) Run(srv *MCPServerV2) error {
 	mux := http.NewServeMux()
 	// 2026-07-28 无状态单端点: 路由经 Mcp-Method 头 / body method, 版本经
@@ -187,6 +207,7 @@ func (t *httpTransport) Run(srv *MCPServerV2) error {
 	return nil
 }
 
+// Stop 优雅关闭 HTTP 服务 (等待在途请求跑完, 受 ctx 截止时间约束); 从未 Run 过时直接返回 nil。
 func (t *httpTransport) Stop(ctx context.Context) error {
 	if t.server == nil {
 		return nil
@@ -232,8 +253,13 @@ func NewSSETransport(addr string) MCPTransport {
 	}
 }
 
+// Name 返回传输层名称 "sse"。
 func (t *sseTransport) Name() string { return "sse" }
 
+// Run 注册 SSE 路由 (/mcp/v1/events 长连接 + /mcp/v1/tools/call 投递入口) 并阻塞在 Serve 上。
+//
+// 与 httpTransport 同构: 真实监听地址同样在 Listen 之后才写回, 且由 muAddr 单独保护
+// (不是 clients 的那把 mu —— 二者保护的数据不同, 混用会让地址读改写与客户端表互相阻塞)。
 func (t *sseTransport) Run(srv *MCPServerV2) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp/v1/events", t.handleSSEEvents)
@@ -262,6 +288,7 @@ func (t *sseTransport) Run(srv *MCPServerV2) error {
 	return nil
 }
 
+// Stop 优雅关闭 SSE 服务; 从未 Run 过时直接返回 nil。
 func (t *sseTransport) Stop(ctx context.Context) error {
 	if t.server == nil {
 		return nil
@@ -403,13 +430,27 @@ type mcpContent struct {
 // MCPServerV2 — 消息处理（兼容 stdio + HTTP + SSE）
 // ============================================================================
 
+// handleMessage 解析一条 JSON-RPC 文本并分发到对应方法; 这是 stdio 与 HTTP 共用的唯一入口。
+//
+// 算法解读：
+//
+//	原理：MCP 的 JSON-RPC 信封里, id 缺失即「通知」(notification), 按规范通知不得有响应。
+//	      分发前先做协议版本闸门: 客户端可在 params._meta 里声明版本, 不在支持列表就报错。
+//	关键不变量：只有 id 非 nil 的请求才允许写响应 —— 给通知回包会让客户端的
+//	      请求-响应配对错位 (它按顺序认领响应), 后面的调用全部串位。
+//	代价与边界：版本不匹配时直接拒绝, 不做降级协商; 未知方法按 id 有无决定
+//	      是回 -32601 还是静默丢弃。
+//	设计权衡：把版本校验放在分发之前而不是各 handler 内部, 避免每个方法各写一遍;
+//	      代价是 server/discover 这类「免握手取版本」的 RPC 也要先过闸。
 func (s *MCPServerV2) handleMessage(raw string) {
 	var req mcpRequest
 	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		// -32700: 连 JSON 都不是, 没有可回的 id (协议要求此时 id 为 null)。
 		s.writeError(nil, -32700, "Parse error", err.Error())
 		return
 	}
 
+	// id 缺失 = 通知, 后续所有错误分支都靠这个标志决定要不要回包。
 	isNotification := req.ID == nil
 
 	// 2026-07-28: 协议版本经 _meta 每次请求携带; 不在支持列表 → 报错并带 supported。
@@ -437,6 +478,7 @@ func (s *MCPServerV2) handleMessage(raw string) {
 		s.handleToolsCall(req)
 	default:
 		if !isNotification {
+			// 通知不回错包: 回了会给客户端送出一个它无法配对的响应, 后面的调用全部串位。
 			s.writeError(req.ID, -32601, "Method not found", req.Method)
 		}
 	}
@@ -454,6 +496,7 @@ func metaVersionFromParams(params json.RawMessage) string {
 	return metaVersionFromMap(p)
 }
 
+// metaVersionFromMap 从已反序列化的 params 里取 _meta 下的协议版本; 任一层缺失或类型不符都返回空串。
 func metaVersionFromMap(p map[string]interface{}) string {
 	raw, ok := p["_meta"]
 	if !ok {
@@ -467,6 +510,7 @@ func metaVersionFromMap(p map[string]interface{}) string {
 	return v
 }
 
+// handleInitialize 响应 initialize: 回报协议版本、tools 能力与服务器身份 (serverInfo)。
 func (s *MCPServerV2) handleInitialize(req mcpRequest) {
 	result := map[string]interface{}{
 		"protocolVersion": mcp.ProtocolVersion,
@@ -504,6 +548,7 @@ func (s *MCPServerV2) serverInfo() map[string]string {
 	return info
 }
 
+// handleToolsList 响应 tools/list, 把 toolsList() 的静态声明原样回给客户端。
 func (s *MCPServerV2) handleToolsList(req mcpRequest) {
 	s.writeResult(req.ID, map[string]interface{}{"tools": s.toolsList()})
 }
@@ -539,6 +584,11 @@ func (s *MCPServerV2) toolsList() []mcpTool {
 	}
 }
 
+// handleToolsCall 响应 tools/call: 解出工具名与参数后执行, 并把结果包成 MCP 的 content 数组。
+//
+// 注意：executeTool 用 ("", true) 同时表示「工具未找到」和「工具本身失败」, 这里靠
+// 「isError 且文本为空」把前者升级为 JSON-RPC 层错误 (-32601), 后者则留在 result 里
+// 以 IsError=true 返回 —— 两种失败对客户端的意义不同, 不能合并。
 func (s *MCPServerV2) handleToolsCall(req mcpRequest) {
 	var params struct {
 		Name      string          `json:"name"`
@@ -673,6 +723,10 @@ func (s *MCPServerV2) withRepoLock(repoPath string) (func(), error) {
 	return func() { _ = lk.Release() }, nil
 }
 
+// toolInit 全量建索引 (GitNexus analyze + Graphify update), 返回两套索引各自的产出或错误。
+//
+// 注意：整段执行被 withRepoLock 串行化, 且锁的粒度是「同一仓库」而不是全局 ——
+// 多实例共享 PV 时, 不同仓库可并行, 同仓库只能有一个索引进程。
 func (s *MCPServerV2) toolInit(args json.RawMessage) (string, bool) {
 	var in struct{ RepoPath string `json:"repo_path"` }
 	if err := json.Unmarshal(args, &in); err != nil {
@@ -704,6 +758,10 @@ func (s *MCPServerV2) toolInit(args json.RawMessage) (string, bool) {
 	return string(out), false
 }
 
+// toolUpdate 增量更新索引 —— 与 toolInit 走同一条 RunIndex 路径, 只是 status 缺省值不同。
+//
+// 注意：GitNexus/Graphify 的 analyze 本身是增量语义, 所以这里没有单独的「增量」实现,
+// 差异仅在返回给模型的 status 文案 (initialized / updated)。
 func (s *MCPServerV2) toolUpdate(args json.RawMessage) (string, bool) {
 	var in struct{ RepoPath string `json:"repo_path"` }
 	if err := json.Unmarshal(args, &in); err != nil {
@@ -735,6 +793,7 @@ func (s *MCPServerV2) toolUpdate(args json.RawMessage) (string, bool) {
 	return string(out), false
 }
 
+// toolStatus 查询索引状态; 固定查 "main" 分支 (GitNexus/Graphify 的索引不做分支隔离)。
 func (s *MCPServerV2) toolStatus(args json.RawMessage) (string, bool) {
 	var in struct{ RepoPath string `json:"repo_path"` }
 	if err := json.Unmarshal(args, &in); err != nil {
@@ -749,6 +808,11 @@ func (s *MCPServerV2) toolStatus(args json.RawMessage) (string, bool) {
 	return string(out), false
 }
 
+// toolQuery 按 query_type 分派到 Engine 的图查询方法, 统一返回 Results 的缩进 JSON。
+//
+// 注意：query 与 explain 两条分支是例外 —— 它们绕开 Engine 直接打 GitNexus/Graphify CLI,
+// 并且自行序列化返回 (query 甚至同时返回两套引擎的结果与错误), 因此不会走到末尾的
+// qr.Results 统一出口; 新增 query_type 时别默认「一定返回 QueryResult」。
 func (s *MCPServerV2) toolQuery(args json.RawMessage) (string, bool) {
 	var in struct {
 		RepoPath     string `json:"repo_path"`
@@ -813,6 +877,11 @@ func (s *MCPServerV2) toolQuery(args json.RawMessage) (string, bool) {
 	return string(out), false
 }
 
+// toolBranch 处理分支相关动作: switch / detect_changes / status / reindex。
+//
+// 注意：只有 reindex 会取仓库锁并真正跑索引 —— 且它用 release() 显式释放而不是 defer,
+// 因为 switch/detect_changes/status 这些无锁分支共用同一个函数, defer 会让无锁路径也持锁。
+// switch 分支不执行 git checkout, 只回一条提示命令: 索引不做分支隔离, 由调用方自己决定何时切。
 func (s *MCPServerV2) toolBranch(args json.RawMessage) (string, bool) {
 	var in struct {
 		RepoPath   string `json:"repo_path"`
@@ -884,6 +953,7 @@ func (s *MCPServerV2) toolBranch(args json.RawMessage) (string, bool) {
 // 响应输出辅助
 // ============================================================================
 
+// writeResult 把 result 包成 JSON-RPC 2.0 成功信封并写出。
 func (s *MCPServerV2) writeResult(id interface{}, result interface{}) {
 	resp := mcpResponse{
 		JSONRPC: "2.0",
@@ -893,6 +963,7 @@ func (s *MCPServerV2) writeResult(id interface{}, result interface{}) {
 	s.writeJSON(resp)
 }
 
+// writeError 把错误包成 JSON-RPC 2.0 错误信封并写出; id 传 nil 表示连请求 id 都无法确定。
 func (s *MCPServerV2) writeError(id interface{}, code int, message string, data interface{}) {
 	resp := mcpResponse{
 		JSONRPC: "2.0",
@@ -902,6 +973,7 @@ func (s *MCPServerV2) writeError(id interface{}, code int, message string, data 
 	s.writeJSON(resp)
 }
 
+// writeJSON 用紧凑 JSON + 换行把信封写到 stdout; 必须保持单行, 否则会破坏 stdio 的换行分帧。
 func (s *MCPServerV2) writeJSON(v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -910,6 +982,7 @@ func (s *MCPServerV2) writeJSON(v interface{}) {
 	fmt.Println(string(data))
 }
 
+// safeMCPResult 取查询结果的 Results 供序列化; 空结果与 nil 结果都归一成 JSON null。
 func safeMCPResult(qr *QueryResult) interface{} {
 	if qr == nil || qr.Results == nil {
 		return nil
@@ -917,6 +990,7 @@ func safeMCPResult(qr *QueryResult) interface{} {
 	return qr.Results
 }
 
+// errMCPString 把 error 转成字符串; nil 转空串, 便于直接塞进结果 JSON。
 func errMCPString(err error) string {
 	if err == nil {
 		return ""
@@ -928,6 +1002,7 @@ func errMCPString(err error) string {
 // HTTP Handlers
 // ============================================================================
 
+// handleHTTPInitialize 处理旧客户端 (2024-11-05 / 2025-11-25) 的裸端点 POST /mcp/v1/initialize。
 func (s *MCPServerV2) handleHTTPInitialize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -943,6 +1018,7 @@ func (s *MCPServerV2) handleHTTPInitialize(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, result)
 }
 
+// handleHTTPToolsList 处理旧客户端的裸端点 POST /mcp/v1/tools/list。
 func (s *MCPServerV2) handleHTTPToolsList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -951,6 +1027,10 @@ func (s *MCPServerV2) handleHTTPToolsList(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]interface{}{"tools": s.toolsList()})
 }
 
+// handleHTTPToolsCall 处理旧客户端的裸端点 POST /mcp/v1/tools/call, 把失败直接映射成 HTTP 状态码。
+//
+// 注意：与 stdio 的 handleToolsCall 不同, 这里没有 JSON-RPC 信封 —— 工具执行失败用
+// 200 + isError, 工具不存在用 404, 参数解不动用 400, 三条错误路径的状态码是接口契约的一部分。
 func (s *MCPServerV2) handleHTTPToolsCall(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -979,6 +1059,7 @@ func (s *MCPServerV2) handleHTTPToolsCall(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, result)
 }
 
+// handleHTTPHealth 探活端点 (GET/POST 皆可): 回报协议版本、时间与 Pod hostname, 便于确认请求落到哪个实例。
 func (s *MCPServerV2) handleHTTPHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -1116,6 +1197,18 @@ func decodeToolCall(params json.RawMessage) (name string, args json.RawMessage, 
 // SSE Handlers
 // ============================================================================
 
+// handleSSEToolsCall 返回 SSE 版 tools/call 的 handler: 立即回 202, 结果异步经 SSE 广播。
+//
+// 算法解读：
+//
+//	原理：SSE 只有服务端到客户端的单向通道, 所以请求-响应被拆成两段 ——
+//	      POST 只负责投递 (202 Accepted), 真正的结果由 broadcast 推给所有在线连接。
+//	关键不变量：投递必须立刻返回, 不能等工具跑完 —— 索引类工具动辄分钟级,
+//	      同步等待会顶穿客户端的 HTTP 超时; 因此执行被放进 goroutine。
+//	代价与边界：payload 里只带 tool 名, 没有请求 id, 多客户端或并发调用时
+//	      无法把结果与请求配对 (只能按工具名和到达顺序自行关联)。
+//	设计权衡：用「广播」而不是「按连接回推」, 实现简单但牺牲了定向性;
+//	      单客户端场景够用, 多客户端共享一个 server 时会互相看到对方的工具结果。
 func (s *MCPServerV2) handleSSEToolsCall(t *sseTransport) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1167,6 +1260,7 @@ func (s *MCPServerV2) handleSSEToolsCall(t *sseTransport) http.HandlerFunc {
 // HTTP 辅助函数
 // ============================================================================
 
+// writeJSON 写出一个 JSON 响应: 统一 UTF-8 + no-store, 并在编码前先落状态码。
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

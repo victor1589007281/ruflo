@@ -83,6 +83,20 @@ func (q *Queue) Pull(worker string, kinds []string) (*Task, bool, error) {
 // PullFor 能力感知拉取 (design/01 §4.9 / design/02 §3.3 R3): 只拉取
 // RequireCaps ⊆ workerCaps 的任务 —— 需要 browser/k8s-sandbox 等能力的任务
 // 不会被不具备该能力的 worker 拉走。
+//
+// 算法解读：
+//
+//	原理：拉取即**占有**。整个"回收过期租约 → 全量读 → 按 CreatedAt 升序找第一个
+//	      可执行任务 → 改状态为 leased 并写回"的过程在一把进程内互斥锁里完成,
+//	      于是同一时刻只有一个 worker 能拿到同一个任务。
+//	关键不变量：先 reapLocked 再 allLocked。顺序反了的话, 上一轮 worker 崩溃留下的
+//	      过期租约任务在本轮仍是 leased 状态, 会被跳过 —— 表现为"任务永远不再被派发",
+//	      而队列看起来是满的。Attempts 也必须在**派发时**自增 (不是完成时), 否则
+//	      一个反复崩溃的 worker 会让 Attempts 永远停在 0, 重试上限形同虚设。
+//	代价与边界：每次拉取都是 O(全队列) —— 读全部任务、排序、再遍历。任务量大时
+//	      这是平方级开销; 控制面单实例假设下可接受, 多副本需要 per-run 单主租约 (T3)。
+//	设计权衡：FIFO 按 CreatedAt 排序而不是优先级队列 —— 先到先得是这里唯一需要的
+//	      公平性, 而优先级会引入饥饿, 需要额外的老化机制才能补回来。
 func (q *Queue) PullFor(worker string, kinds, workerCaps []string) (*Task, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -182,6 +196,7 @@ func (q *Queue) Fail(id, worker, errMsg string) error {
 	return q.kv.Put(id, *t)
 }
 
+// finish 终态收尾: 校验租约归属后写入状态/结果/错误并落库 (Complete 的内部实现)。
 func (q *Queue) finish(id, worker, status string, result json.RawMessage, errMsg string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -234,6 +249,7 @@ func (q *Queue) List() ([]Task, error) {
 	return q.allLocked()
 }
 
+// getLocked 读一个任务; 不存在时返回错误 (调用方须已持 q.mu)。
 func (q *Queue) getLocked(id string) (*Task, error) {
 	var t Task
 	ok, err := q.kv.Get(id, &t)
@@ -246,6 +262,10 @@ func (q *Queue) getLocked(id string) (*Task, error) {
 	return &t, nil
 }
 
+// allLocked 全量读回任务 (调用方须已持 q.mu)。
+//
+// 单个 key 反序列化失败会被静默跳过 (err != nil || !ok 都 continue), 不中断整轮读取 ——
+// 一条坏记录不该让整个队列拉不动。
 func (q *Queue) allLocked() ([]Task, error) {
 	keys, err := q.kv.Keys()
 	if err != nil {

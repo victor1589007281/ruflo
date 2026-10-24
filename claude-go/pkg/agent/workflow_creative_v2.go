@@ -25,6 +25,10 @@ import (
 	"github.com/anthropic/claude-go/pkg/media"
 )
 
+// creativeV2Workflow 返回 creative-v2 的工作流定义 (策划 → HTML 开发 → 视觉审查 → 媒体输出 → 整合交付)。
+//
+// 注意：Rounds 显式写 0, 表示交给 AdaptiveTerminator 自适应轮数而不是固定轮数;
+// media-render 与 visual-review 并行, final-delivery 等两者都完成才起。
 func creativeV2Workflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "creative-v2",
@@ -344,6 +348,7 @@ func (we *WorkflowExecutor) executeCreativeMedia(ctx context.Context, wf *Workfl
 // creativeSecsPerScene A3 确定性拼接里每个场景片段的固定时长 (秒)。
 const creativeSecsPerScene = 5
 
+// containsFormat 判断格式列表里是否已含 f (大小写不敏感)。
 func containsFormat(fs []string, f string) bool {
 	for _, x := range fs {
 		if strings.EqualFold(x, f) {
@@ -353,6 +358,10 @@ func containsFormat(fs []string, f string) bool {
 	return false
 }
 
+// removeFormat 返回去掉 f (大小写不敏感) 之后的新切片。
+//
+// 注意：`fs[:0:0]` 把容量也截成 0, 所以 append 必定重新分配底层数组 —— 这是刻意
+// 为了**不改动入参**; 写成 `fs[:0]` 会就地覆盖调用方的切片。
 func removeFormat(fs []string, f string) []string {
 	out := fs[:0:0]
 	for _, x := range fs {
@@ -454,6 +463,7 @@ func splitHTMLToScenes(html string) []string {
 	return out
 }
 
+// findStage 按名查找阶段定义, 返回指向切片元素的指针; 找不到返回 nil。
 func findStage(wf *WorkflowDef, name string) *StageDef {
 	for i := range wf.Stages {
 		if wf.Stages[i].Name == name {
@@ -594,6 +604,7 @@ func detectOutputFormats(objective, htmlContent string) []string {
 	return formats
 }
 
+// sumDuration 累加全部渲染结果的自报耗时 (含失败项)。
 func sumDuration(results []media.RenderResult) time.Duration {
 	var total time.Duration
 	for _, r := range results {

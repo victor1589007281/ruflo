@@ -14,6 +14,7 @@ type GoFormat struct {
 	runtime *Runtime
 }
 
+// NewGoFormat 构造 go-format 技能: 用 gofmt -l / -w 检查或就地格式化 Go 文件。
 // NewGoFormat creates a new GoFormat.
 func NewGoFormat(rt *Runtime) *GoFormat {
 	return &GoFormat{
@@ -37,6 +38,8 @@ func NewGoFormat(rt *Runtime) *GoFormat {
 	}
 }
 
+// Execute 执行格式化检查或就地修复: write=true 走 gofmt -w, 否则 -l 只列出未格式化的文件。
+// formatted 的判据是"退出码为 0 且没有任何输出", 因此 -w 成功时恒为 true。
 // Execute runs the format check or fix.
 func (t *GoFormat) Execute(ctx context.Context, input json.RawMessage) (map[string]any, error) {
 	var in struct {

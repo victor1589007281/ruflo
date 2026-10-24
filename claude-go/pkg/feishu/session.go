@@ -581,6 +581,7 @@ func (sm *SessionManager) SetCwd(cwd string) {
 	sm.sessions = make(map[string]*Session)
 }
 
+// contextWindowOrDefault 取上下文窗口配置, 未配置 (<=0) 时回落到 200000。
 func contextWindowOrDefault(v int) int {
 	if v > 0 {
 		return v
@@ -632,6 +633,19 @@ func todoRosterSource(reg *tool.Registry) func() []internal_hook.TaskRosterItem 
 	}
 }
 
+// newProfileRegistry 按工具档位装配一张新的工具注册表 (每次会话/嵌套/stage 装配都新建一张)。
+//
+// 算法解读：
+//
+//	原理：先按 profile 注册基础工具集, 再按 opts 逐项追加可选工具 (飞书发文件 / 团队查询 /
+//	      MCP 代理 / 技能 / 统一池 / Agent 派生 / Advisor), 顺序即优先级。
+//	关键不变量：**注册顺序决定治理可见性** —— 记忆工具必须排在 profile 工具之后、治理之前,
+//	      这样 DisabledTools/AllowedTools 才能对它们生效; 池接线点必须在注册末尾,
+//	      才能覆盖全部 profile 与嵌套/stage 会话面。
+//	代价与边界：每次装配都重建整张注册表 (含 MCP 工具刷新); 池未开时必须显式清掉
+//	      上一会话残留的 ranker, 否则技能排序会沿用已失效的 policy。
+//	设计权衡：**进程级句柄 (memoryStore / skillReg / traceStore) 每次重注入同一个** ——
+//	      各档位看到同一批记忆与技能, 这正是要的 (团队产出写进 L1 后任何会话都该查得到)。
 func (sm *SessionManager) newProfileRegistry(profile builtin.ToolProfile, opts registryOptions) *tool.Registry {
 	profile = builtin.NormalizeToolProfile(profile)
 	reg := tool.NewRegistry()
@@ -697,6 +711,7 @@ func (sm *SessionManager) newProfileRegistry(profile builtin.ToolProfile, opts r
 	return reg
 }
 
+// shortSkillListing 返回不带目录过滤的技能短清单 (无 dir 变体的入口)。
 func shortSkillListing(reg *skills.Registry) string {
 	return shortSkillListingInDir(reg, "")
 }
@@ -819,6 +834,7 @@ func poolPointerListing() string {
 		"</available_skills>\n"
 }
 
+// configureSessionTools 给会话装/换工具注册表; 档位未变且已装好时直接返回 (幂等)。
 func (sm *SessionManager) configureSessionTools(session *Session, profile builtin.ToolProfile) {
 	profile = builtin.NormalizeToolProfile(profile)
 	if session.ToolProfile == profile && session.Engine != nil && session.Engine.Tools != nil {
@@ -838,6 +854,17 @@ func (sm *SessionManager) configureSessionTools(session *Session, profile builti
 	session.ToolProfile = profile
 }
 
+// inferFeishuToolProfile 按消息文本猜工具档位 (斜杠命令→Admin, 命中编码/调研关键词→对应档, 否则 Chat)。
+//
+// 算法解读：
+//
+//	原理：先看是否以 "/" 开头 (命令一律 Admin), 再依次扫编码关键词表与调研关键词表, 首个命中者胜。
+//	关键不变量：**编码表必须先于调研表** —— 两条表都含 "分析" 一类词, 顺序决定 "分析一下这段 go 代码"
+//	      落到 Coding 还是 Research, 换序即改变行为。
+//	代价与边界：纯子串匹配, 无词边界意识 (编码表里的 " go " 特意带空格正是为此);
+//	      任一表命中即返回, 不做打分比较, 故一条消息里同时含两类词时只看先命中的那类。
+//	设计权衡：宁可猜错也不给全量工具 —— 档位只影响工具面, 猜错最多是多给/少给几个工具,
+//	      而每次请求都要重发全部工具 schema, 全量给等于每轮都付这份成本。
 func inferFeishuToolProfile(text string) builtin.ToolProfile {
 	lower := strings.ToLower(text)
 	if strings.HasPrefix(strings.TrimSpace(lower), "/") {
@@ -862,6 +889,16 @@ func inferFeishuToolProfile(text string) builtin.ToolProfile {
 	return builtin.ToolProfileChat
 }
 
+// profileForRunOptions 按 RunOptions/RunMetadata 里的角色名与只读标志推断工具档位。
+//
+// 算法解读：
+//
+//	原理：取 SubagentType / Role / Purpose 里第一个非空值转小写, 先判只读或 research/review/plan
+//	      一类 → Research 档; 再判 coder/tester/architect 一类 → Coding 档; 都不命中 → Chat 档。
+//	关键不变量：**ReadOnly 优先级最高** —— 显式只读的运行不允许因为角色名里带 "build" 而拿到写工具。
+//	代价与边界：仍是子串匹配 (与 profileForTeamRole 同源的已知误判面), 角色名含 "build" 者会误落 Coding 档。
+//	设计权衡：与 profileForTeamRole 的差别在于**不看 workflow**: 这里问的是"这一次运行是什么角色",
+//	      而不是"这个团队在跑哪种工作流"。
 func profileForRunOptions(opts agent.RunOptions, meta agent.RunMetadata) builtin.ToolProfile {
 	role := strings.ToLower(firstNonEmpty(opts.SubagentType, meta.Role, meta.Purpose))
 	if opts.ReadOnly || strings.Contains(role, "research") || strings.Contains(role, "review") || strings.Contains(role, "plan") {
@@ -1971,6 +2008,7 @@ func (sm *SessionManager) ProcessMessageWithQueue(ctx context.Context, chatID, u
 	return resp, false, err
 }
 
+// processMessageInternal 按 chatID 取 (或建) 会话后跑一条消息, 是队列消费与同步调用共用的入口。
 func (sm *SessionManager) processMessageInternal(ctx context.Context, chatID, userText string) (string, error) {
 	return sm.runSessionMessage(ctx, sm.GetOrCreate(chatID), userText)
 }
@@ -2084,6 +2122,18 @@ func (sm *SessionManager) ProcessMessageStream(ctx context.Context, chatID, user
 	return sm.runSessionMessageStream(ctx, sm.GetOrCreate(chatID), userText, emit)
 }
 
+// runSessionMessageStream 在指定会话上跑一条消息并把中间事件实时 emit 出去 (流式版 runSessionMessage)。
+//
+// 算法解读：
+//
+//	原理：开 trace 作用域 → 置 processing 标志 → 按档位装配工具 → SubmitStream 拿事件流,
+//	      边遍历边映射成线上协议 emit, 同时把非 thinking 的 delta 累积成回复。
+//	关键不变量：**回复累积只认非 thinking 的 delta** —— thinking 是过程不是回复;
+//	      trace 收尾与 SetProcessing(false) 都必须放在 defer 里, 这是唯一"无论从哪条路径退出都走一遍"的位置。
+//	代价与边界：emit 为 nil 时只累积不发送 (同一函数兼作非流式调用); 事件流必须被完整消费,
+//	      提前 break 会让引擎侧的发送方阻塞。
+//	设计权衡：事件映射 (streamEventToAPI) 刻意留在这里而不是下沉到 sessionapi ——
+//	      让 sessionapi 反向 import types 会把"协议类型"与"引擎内部表示"焊死。
 func (sm *SessionManager) runSessionMessageStream(ctx context.Context, session *Session, userText string, emit func(sessionapi.Event)) (string, error) {
 	if session.IsProcessing() {
 		return "上一条消息还在处理中，请稍候...", nil
@@ -2272,6 +2322,7 @@ func (r *sessionAgentRunner) CanInjectMidRun() bool {
 	return r.eng != nil && r.eng.Running()
 }
 
+// InjectMidRun 把一段正文注入当前正在运行的引擎 (拿不到引擎或引擎未运行则返回 false)。
 func (r *sessionAgentRunner) InjectMidRun(text string) bool {
 	r.mu.Lock()
 	eng := r.eng
@@ -2611,6 +2662,7 @@ func extractMessageText(msg types.Message) string {
 	return text
 }
 
+// firstNonEmpty 返回第一个非空字符串, 全空时返回 ""。
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if v != "" {

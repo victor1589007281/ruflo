@@ -33,8 +33,13 @@ func NewAgentDBSemanticInjectHook(client *agentdbsemantic.Client, topK, budget, 
 	}
 }
 
+// Name 返回 hook 名 agentdb_semantic_inject。
 func (h *AgentDBSemanticInjectHook) Name() string                { return "agentdb_semantic_inject" }
+
+// Priority 返回执行优先级 50 (同相位内值越小越先执行; 排在消息过滤 40 之后、令牌恢复 60 之前)。
 func (h *AgentDBSemanticInjectHook) Priority() int               { return 50 }
+
+// Phases 声明只挂在 PhasePreRequest 一个相位上。
 func (h *AgentDBSemanticInjectHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreRequest}
 }

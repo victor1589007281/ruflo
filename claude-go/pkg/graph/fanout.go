@@ -42,6 +42,20 @@ import (
 
 // runMapNode 执行 map 节点: 切分 → 并发分片 → 汇总。
 // 返回 (节点结果, 累计轮数, 形态特有的 hook 载荷)。
+//
+// 算法解读：
+//
+//	原理：把输入集合确定性切成 N 份, 每份派生一个同构分片 NodeSpec (<节点>#<i>), 在 nestSem
+//	      容量内并发跑, 最后按分片终态做三值汇总: 有 OK⇒completed / 全 failed⇒failed /
+//	      全 skipped⇒skipped (未走的分支不算失败, 与 or-join 同口径)。
+//	关键不变量：results 是预分配切片, 每个 goroutine 只写自己那个下标 —— 正因如此才不需要
+//	      锁; 唯一被并发读写的 iters 由 mu 保护。若改成 append, 竞态与错序会同时出现。
+//	      另一条是 wg.Wait() 必须先于汇总, 否则会读到零值分片。
+//	代价与边界：并发度受两重闸约束 —— nestSem (容量 MaxParallel) 限同时在跑的分片数,
+//	      reserveNodes 限运行图节点总量; 任一闸都是**截断**分片并记进 truncated, 而不是报错。
+//	      全缓存命中时 iters 被补成 1, 避免 hook 载荷出现 iterations=0。
+//	设计权衡：分片复用 execNode 而非自建轻量执行路径 —— 换来与普通节点完全一致的生命周期
+//	      (hook/journal/超时/重试), 代价是每个分片都按完整节点计入运行图配额。
 func (e *Engine) runMapNode(ctx context.Context, rc *runCtx, scope execScope, node NodeSpec, in NodeInput) (NodeResult, int, map[string]any) {
 	evID := scope.evID(node.ID)
 	pol := node.Map
@@ -281,6 +295,7 @@ func splitShards(raw, split string) []string {
 	}
 }
 
+// nonEmptyTrimmed 逐项 TrimSpace 后丢弃空串, 保持原有顺序 (给 split 结果做清洗)。
 func nonEmptyTrimmed(parts []string) []string {
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
@@ -389,6 +404,7 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
+// orDefault 返回 v; v 仅含空白时返回 def (按"空白即未声明"处理, 与空串同义)。
 func orDefault(v, def string) string {
 	if strings.TrimSpace(v) == "" {
 		return def

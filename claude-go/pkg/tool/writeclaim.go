@@ -164,6 +164,7 @@ type WriteConflictError struct {
 	Self string
 }
 
+// Error 渲染冲突消息; 持有者或本次写者未登记身份时显示为 "(未知)"。
 func (e *WriteConflictError) Error() string {
 	holder := e.Holder
 	if holder == "" {

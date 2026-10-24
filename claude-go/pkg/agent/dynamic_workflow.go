@@ -71,6 +71,7 @@ type RevisionConflictError struct {
 	Actual   int64
 }
 
+// Error 渲染版本冲突的人话说明; Expected<=0 表示本次提交根本没带版本, 措辞与"版本过旧"分开。
 func (e *RevisionConflictError) Error() string {
 	// Expected==0 是"没带版本"这一种, 不是"手上有 r0"。分开措辞, 因为两种的
 	// 下一步动作不同: 没带 → 先 GET 拿版本再发; 带旧的 → 重新读取 (有人改过)。
@@ -80,6 +81,7 @@ func (e *RevisionConflictError) Error() string {
 	return fmt.Sprintf("工作流 %q 已被他处改写 (你手上是 r%d, 服务端是 r%d); 请重新读取后再提交", e.Name, e.Expected, e.Actual)
 }
 
+// Unwrap 让调用方能用 errors.Is 判定哨兵错误 ErrWorkflowRevisionConflict。
 func (e *RevisionConflictError) Unwrap() error { return ErrWorkflowRevisionConflict }
 
 // normalizeRevision 把「写在版本守卫之前的文件」的 0 归一到 1。
@@ -625,6 +627,7 @@ func SaveWorkflowToDir(dir string, def *WorkflowDef) error {
 	return os.WriteFile(filepath.Join(dir, sanitizeWorkflowFileName(def.Name)+".json"), data, 0o644)
 }
 
+// sanitizeWorkflowFileName 把工作流名里的路径分隔符、".." 与空格替换掉, 防止落盘时穿出目标目录。
 func sanitizeWorkflowFileName(name string) string {
 	r := strings.NewReplacer("/", "_", "\\", "_", "..", "_", " ", "-")
 	return r.Replace(name)
@@ -757,6 +760,7 @@ func AvailableWorkflowNames() []string {
 	return out
 }
 
+// mergedWorkflowList 合并内置与自定义工作流并按名称排序, 供 ListWorkflows 使用。
 func mergedWorkflowList() []WorkflowDef {
 	names := make([]string, 0, len(workflowRegistry))
 	for n := range workflowRegistry {

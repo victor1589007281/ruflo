@@ -183,6 +183,7 @@ func (c *Client) makeCover(ctx context.Context, opts TypesetOptions) (string, er
 	return c.AddImageThumb(png, "cover.png")
 }
 
+// coverHTML 生成 900x383 的标题封面 HTML (渐变底 + 居中白字标题)。
 func coverHTML(title string) string {
 	return `<!doctype html><html><head><meta charset="utf-8">
 <style>html,body{margin:0;padding:0}
@@ -192,6 +193,7 @@ background:linear-gradient(135deg,#0d3a6e,#1a5fb4 60%,#4a90d9);box-sizing:border
 </style></head><body><div id="cover"><h1>` + html.EscapeString(title) + `</h1></div></body></html>`
 }
 
+// plainExcerpt 极简去标签后压缩空白, 再按**字符**截断到 n 个字符作为摘要。
 func plainExcerpt(htmlStr string, n int) string {
 	// 极简去标签
 	var b strings.Builder
@@ -216,6 +218,7 @@ func plainExcerpt(htmlStr string, n int) string {
 	return s
 }
 
+// firstNonEmptyStr 返回第一个非空白字符串; 全空时返回空串。
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {

@@ -61,6 +61,8 @@ type SmokeConfig struct {
 	OutDir string
 }
 
+// withDefaults 把零值参数填成默认值 (每档采样 2 次 / 最少 2 个档位 / 失败率上限 0.2 /
+// 覆盖率下限 0.8)。
 func (c SmokeConfig) withDefaults() SmokeConfig {
 	if c.Samples <= 0 {
 		c.Samples = 2
@@ -250,6 +252,7 @@ func (r *SmokeReport) Format() string {
 	return b.String()
 }
 
+// passLabel 把布尔判定渲染成对勾 / 叉号。
 func passLabel(ok bool) string {
 	if ok {
 		return "✓"

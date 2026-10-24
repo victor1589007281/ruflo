@@ -52,6 +52,7 @@ func NewGraphifyNoLLM(repoPath string) *GraphifyNoLLM {
 	return &GraphifyNoLLM{RepoPath: repoPath}
 }
 
+// ensureDisk 懒加载磁盘图索引 (带 LRU 缓存), 只在首次查询时打开 graph.json。
 func (g *GraphifyNoLLM) ensureDisk() (*DiskGraphIndex, error) {
 	if g.disk != nil {
 		return g.disk, nil
@@ -355,6 +356,7 @@ func (d *DiskGraphIndex) NodeDegree(id string) int {
 // 私有辅助
 // ============================================================================
 
+// findStartNodes 把问题按空白切词, 取长度 ≥3 的词在节点 label 上做子串匹配, 得到 BFS 起点集合。
 func (g *GraphifyNoLLM) findStartNodes(disk *DiskGraphIndex, question string) []*GraphNode {
 	words := strings.Fields(strings.ToLower(question))
 	var startNodes []*GraphNode
@@ -383,6 +385,7 @@ func (g *GraphifyNoLLM) findStartNodes(disk *DiskGraphIndex, question string) []
 	return startNodes
 }
 
+// matchRelationFilter 判断边的 relation 是否命中过滤器; 过滤器为空表示全放行。
 func matchRelationFilter(relation string, filters []string) bool {
 	if len(filters) == 0 {
 		return true
@@ -395,6 +398,18 @@ func matchRelationFilter(relation string, filters []string) bool {
 	return false
 }
 
+// bfsShortestPath 在图上做 BFS 最短路径, 返回节点 ID 路径与沿途边。
+//
+// 算法解读：
+//
+//	原理：所有边权相同 (皆为 1) 时, BFS 首次到达目标即为最短路径 —— 不需要 Dijkstra 的
+//	      优先队列, 一个普通队列就够。
+//	关键不变量：visited 必须在**入队时**标记, 而不是出队时。若在出队时标记, 同一节点会被
+//	      多个前驱重复入队, 队列膨胀到 O(E), 且回溯取到的可能是非最短的那条前驱。
+//	代价与边界：O(V+E) 时间与 O(V) 内存 (visited / edgeUsed 两张表)。图不可达时返回
+//	      (nil, nil), 由调用方区分"无路径"。
+//	设计权衡：用 map 存 previous / edgeUsed 而不是切片下标 —— 图节点 ID 是任意字符串,
+//	      不保证连续; 换来的是无需先给节点编号。
 func bfsShortestPath(disk *DiskGraphIndex, srcID, dstID string) ([]string, []map[string]interface{}) {
 	if srcID == dstID {
 		return []string{srcID}, nil
@@ -416,6 +431,7 @@ func bfsShortestPath(disk *DiskGraphIndex, srcID, dstID string) ([]string, []map
 				edgeUsed[next] = link
 				if next == dstID {
 					// 回溯路径
+					// 每步前插到头部: previous 链是 终点→起点, 前插后 path 与 edges 才同序对齐。
 					path := []string{dstID}
 					edges := []map[string]interface{}{}
 					for p := dstID; p != srcID; p = visited[p] {
@@ -433,6 +449,7 @@ func bfsShortestPath(disk *DiskGraphIndex, srcID, dstID string) ([]string, []map
 	return nil, nil
 }
 
+// explainSingleNode 汇总一个节点的 1-hop 邻居: 出边取目标、入边取源, 各带上关系与置信度。
 func explainSingleNode(disk *DiskGraphIndex, n *GraphNode) []map[string]interface{} {
 	var out []map[string]interface{}
 	for _, link := range disk.GetEdgesBySource(n.ID) {
@@ -462,6 +479,7 @@ func explainSingleNode(disk *DiskGraphIndex, n *GraphNode) []map[string]interfac
 	return out
 }
 
+// graphNodeToMap 把节点结构转成可直接序列化的 map。
 func graphNodeToMap(n *GraphNode) map[string]interface{} {
 	return map[string]interface{}{
 		"id":              n.ID,
@@ -473,6 +491,7 @@ func graphNodeToMap(n *GraphNode) map[string]interface{} {
 	}
 }
 
+// graphNodesToMaps 批量转换节点; 返回等长切片而非 nil, 便于序列化成 []。
 func graphNodesToMaps(nodes []*GraphNode) []map[string]interface{} {
 	out := make([]map[string]interface{}, len(nodes))
 	for i, n := range nodes {
@@ -481,6 +500,7 @@ func graphNodesToMaps(nodes []*GraphNode) []map[string]interface{} {
 	return out
 }
 
+// graphLinkToMap 把边结构转成可直接序列化的 map。
 func graphLinkToMap(l *GraphLink) map[string]interface{} {
 	return map[string]interface{}{
 		"source":     l.Source,
@@ -491,6 +511,7 @@ func graphLinkToMap(l *GraphLink) map[string]interface{} {
 	}
 }
 
+// graphLinksToMaps 批量转换边。
 func graphLinksToMaps(links []*GraphLink) []map[string]interface{} {
 	out := make([]map[string]interface{}, len(links))
 	for i, l := range links {

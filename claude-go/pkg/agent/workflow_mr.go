@@ -7,6 +7,7 @@ package agent
 //   quant-strategist  -> kimi:kimi-k2                    (高阶"大脑")
 // 二者都要求【只输出一个合法 JSON 对象】，market-radar 侧会剥掉 ```json 围栏后解析。
 
+// mrWorkerWorkflow 构造 "mr-worker" 单阶段工作流: 本地小模型充当 market-radar 的手脚, 只输出一个 JSON 对象。
 func mrWorkerWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "mr-worker",
@@ -30,6 +31,7 @@ func mrWorkerWorkflow() *WorkflowDef {
 	}
 }
 
+// mrChainWorkflow 构造 "mr-chain" 单阶段工作流: 单 agent(kimi) 直出完整 JSON 产业链图。
 func mrChainWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "mr-chain",
@@ -58,6 +60,7 @@ func mrChainWorkflow() *WorkflowDef {
 	}
 }
 
+// quantStrategistWorkflow 构造 "quant-strategist" 单阶段工作流: 高阶模型出量化策略 spec 或复盘归因, 只输出 JSON。
 func quantStrategistWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "quant-strategist",

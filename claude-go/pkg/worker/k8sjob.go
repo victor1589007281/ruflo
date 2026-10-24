@@ -270,6 +270,10 @@ func K8SJobEnabled() bool {
 	return false
 }
 
+// normalize 把选项里空缺的字段补成默认值 (控制面地址去尾斜杠、命名空间/挂载路径/超时等)。
+//
+// 注意：这里**不做校验** —— 缺 Control / Image 这类必填项交给 Validate 报错, 免得默认值
+// 把装配错误掩盖过去。
 func (o *K8SJobOptions) normalize() {
 	o.Control = strings.TrimRight(strings.TrimSpace(o.Control), "/")
 	o.Namespace = firstNonEmptyStr(strings.TrimSpace(o.Namespace), "default")
@@ -362,6 +366,9 @@ type kubeRunner interface {
 // 显式检查它 (见 deploy/Dockerfile.k8sjob)。
 type kubectlRunner struct{ bin string }
 
+// run 执行一条 kubectl 命令, 带固定超时; 失败时把 stderr (退回 stdout) 摘要拼进错误。
+//
+// 注意：失败时仍会返回已读到的 stdout —— 调用方要按 err 判断成败, 不能只看内容非空。
 func (k kubectlRunner) run(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
 	cctx, cancel := context.WithTimeout(ctx, jobKubectlTimeout)
 	defer cancel()
@@ -449,10 +456,29 @@ func (r *jobRuntime) probe(ctx context.Context) error {
 	return nil
 }
 
+// Name 返回 runtime 名 "k8s-job"。
 func (r *jobRuntime) Name() string                    { return K8SJobRuntimeName }
+
+// Capabilities 返回启动时声明的能力 (MaxParallel 已在 normalize 里对齐真实闸值)。
 func (r *jobRuntime) Capabilities() agent.RuntimeCaps { return r.opt.Caps }
 
 // Execute 入队 + 起 Job, 事件流复用 remoteRuntime.watch。
+//
+// 算法解读：
+//
+//	原理：不自己实现一套事件流, 而是临时造一个 remoteRuntime 实例 (ephemeral),
+//		只把它的 launch 钩子换成"建 k8s Job", 其余 (worker 注册、keepalive、
+//		watch、超时) 全部复用远程 runtime 的既有实现。
+//	关键不变量：**并发名额的释放责任是转移的** —— 取到名额后先交给 launch 里造的
+//		jobSupervisor, 由它在 Job 收尾时调用 release; 只有 Execute 自身失败
+//		(入队前出错) 才在这里就地 release。release 内部用 released 标志做幂等,
+//		所以"先成功转移再失败"不会漏放也不会双放。
+//	代价与边界：名额是**整段节点生命周期**占用的, 排队满了就阻塞等待 (而不是让节点
+//		失败) —— 容量不足是排队问题, 把它变成节点失败等于用错误掩盖排队。ctx
+//		在等待期间被取消时返回错误并归还名额。
+//	设计权衡：Job 名由 taskID 推导 (jobNameFor), 因为 worker 名必须在入队**之前**
+//		就定下来 (RequireCaps 要钉住它), 而 taskID 是 Execute 内部才生成的 ——
+//		两边共用同一个函数来保证名字对得上。
 func (r *jobRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask) (<-chan agent.NodeEvent, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -527,6 +553,7 @@ func (r *jobRuntime) Cancel(runID, nodeID string) error {
 	return nil
 }
 
+// forget 从在飞表里摘掉一个节点 (Job 收尾时调用), 使 Cancel 不再命中它。
 func (r *jobRuntime) forget(key string) {
 	r.mu.Lock()
 	delete(r.inflight, key)
@@ -859,6 +886,21 @@ var podBlockers = map[string]bool{
 	"CreateContainerError":       true,
 }
 
+// podFatalReason 查 Job 名下 pod 的容器状态, 返回"再等也好不了"的失败原因; 没命中返回空串。
+//
+// 算法解读：
+//
+//	原理：Job 失败时 kubectl 只告诉你"没成功", 真正的原因藏在 pod 的
+//		containerStatuses 里。这里把两类终局信号翻译成人话: waiting.reason 命中
+//		podBlockers (拉不到镜像 / ConfigMap 不存在) 或 terminated.reason == OOMKilled。
+//	关键不变量：判据必须是**不可自愈**的。Unschedulable / Pending 刻意不在
+//		podBlockers 里 —— 排队等资源会自己好, 判死会让集群一忙就整片节点失败,
+//		那种情况由 activeDeadlineSeconds 兜底。
+//	代价与边界：每次归因多一次 kubectl get pods -o json (含解析整份 JSON);
+//		查询本身失败、JSON 解不开、pod 还没建出来时都返回空串 —— 归因是**尽力而为**的,
+//		调用方必须能接受"没有原因"。
+//	设计权衡：不用 client-go 的 watch/informer (会拖进上百个间接依赖), 用一次性的
+//		get pods 换取零依赖; 代价是归因时点是一次快照而非持续观察。
 func (r *jobRuntime) podFatalReason(ctx context.Context, jobName string) string {
 	raw, err := r.kube.run(ctx, nil, "get", "pods", "-n", r.opt.Namespace,
 		"-l", "job-name="+jobName, "-o", "json")
@@ -910,6 +952,7 @@ func (r *jobRuntime) podFatalReason(ctx context.Context, jobName string) string 
 
 var labelSanitize = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
+// sanitizeLabel 把任意字符串规整成合法 k8s label 值: 非法字符替换成 '-'、截到 63 字符、去首尾分隔符。
 func sanitizeLabel(s string) string {
 	v := labelSanitize.ReplaceAllString(strings.TrimSpace(s), "-")
 	if len(v) > 63 {
@@ -918,6 +961,7 @@ func sanitizeLabel(s string) string {
 	return strings.Trim(v, "-._")
 }
 
+// splitList 按逗号切分并去掉空白项; 无有效项时返回 nil。
 func splitList(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {
@@ -928,6 +972,9 @@ func splitList(s string) []string {
 	return out
 }
 
+// parseKV 把 "K=V" 形式的列表解析成映射 (键值都去空白); 无有效项时返回 nil。
+//
+// 注意：**不含 '=' 的项被静默丢弃**, 不做报错 —— 合法性由 Validate 在启动时统一把关。
 func parseKV(items []string) map[string]string {
 	if len(items) == 0 {
 		return nil
@@ -944,6 +991,7 @@ func parseKV(items []string) map[string]string {
 	return m
 }
 
+// envInt 读整数环境变量; 未设置或解析失败一律返回 0 (调用方按 >0 判断"设过")。
 func envInt(name string) int {
 	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
 	if err != nil {
@@ -952,6 +1000,7 @@ func envInt(name string) int {
 	return v
 }
 
+// truncate 按字符数截断字符串, 超长时以 "…" 收尾。
 func truncate(s string, n int) string {
 	return textutil.Truncate(s, n, "…")
 }

@@ -180,14 +180,17 @@ var (
 	buildInfo prometheus.Gauge
 )
 
+// defaultBuckets 通用耗时直方图的分桶 (秒), 覆盖 0.1s ~ 600s。
 func defaultBuckets() []float64 {
 	return []float64{0.1, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600}
 }
 
+// defaultLLMBuckets LLM 调用延迟的分桶 (秒), 低端更密 —— 首 token 与短调用都落在这里。
 func defaultLLMBuckets() []float64 {
 	return []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120}
 }
 
+// defaultMillisecondBuckets 毫秒口径的分桶 (10ms ~ 600s), 给沙箱启动/探测这类亚秒级耗时用。
 func defaultMillisecondBuckets() []float64 {
 	return []float64{10, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000, 120000, 300000, 600000}
 }
@@ -675,6 +678,11 @@ func PrometheusHandler() http.Handler {
 // ─── recordPromMetric 将 (module, name, value, labels) 路由到对应 Prometheus 指标 ───
 // 这是 Collector.RecordAtTime/RecordRun 的桥接层, 保持向后兼容的 name 常量。
 
+// recordPromMetric 把 (module, name, value, labels) 路由到对应的 Prometheus 指标。
+//
+// 是 Collector.RecordAtTime/RecordRun 的桥接层: 调用方用的是字符串 name 常量, 这里
+// 按 (module, name) 分发到具体指标。缺失的 label 一律补空串 —— Prometheus 对 label
+// 数量不匹配会 panic, 补空比让一次埋点炸掉整个进程划算。
 func recordPromMetric(module, name string, value float64, labels map[string]string) {
 	promOnce.Do(initPrometheusMetrics)
 
@@ -1054,6 +1062,11 @@ func RestorePromFromJSONL(stateDir string, maxEvents int) error {
 	return nil
 }
 
+// replayJSONL 回放一个 JSONL 指标文件到 Prometheus, 返回成功条数。
+//
+// 只保留**最后** maxEvents 行 (扫描时滚动裁剪, 内存上限 maxEvents+100 行), 因为回放
+// 全量历史既慢又会让直方图被早已过期的数据主导。逐条包 recover: 旧格式的 label 与
+// 当前指标定义不匹配时 Prometheus 会 panic, 一条不兼容不该让整个回放失败。
 func replayJSONL(path string, maxEvents int) (int, error) {
 	f, err := os.Open(path)
 	if err != nil {

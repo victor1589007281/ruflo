@@ -84,6 +84,7 @@ var fallbackWeights = map[string]float64{
 
 const fallbackWeightUnknown = 0.5
 
+// weightOf 取奖励事件权重: 事件自带 Weight 优先, 否则按 source 查回退权重表, 都查不到用 0.5。
 func weightOf(r RewardRow) float64 {
 	if r.Weight > 0 {
 		return r.Weight
@@ -191,6 +192,7 @@ func ScoreRuns(rows []RewardRow) map[string]RunScore {
 	return out
 }
 
+// clamp 把值夹到 [-1, 1]。
 func clamp(v float64) float64 {
 	if v > 1 {
 		return 1

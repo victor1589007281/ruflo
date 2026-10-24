@@ -29,12 +29,15 @@ func NewWebSearchTool(searcher WebSearcher) *WebSearchTool {
 	return &WebSearchTool{searcher: searcher}
 }
 
+// Name 返回工具名 (固定为 WebSearchToolName)。
 func (t *WebSearchTool) Name() string { return WebSearchToolName }
 
+// Description 返回给模型的工具说明 (英文原文)。
 func (t *WebSearchTool) Description() string {
 	return `Search the web and return results. Uses a configured search engine (default: Bing). Returns search results as structured text.`
 }
 
+// InputSchema 返回入参 schema: query 必填, allowed_domains 为可选域提示。
 func (t *WebSearchTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 			"type": "object",
@@ -53,8 +56,10 @@ func (t *WebSearchTool) InputSchema() json.RawMessage {
 		}`)
 }
 
+// IsReadOnly 返回 true: 只发出查询请求, 不改动本地状态。
 func (t *WebSearchTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
+// IsConcurrencySafe 返回 true: 工具自身无共享可变状态。
 func (t *WebSearchTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 // CheckPermissions 只读实现：不拒绝。

@@ -1,5 +1,7 @@
 package agent
 
+// creativeWorkflow 返回 creative 工作流定义 (创意策划 → 提示词工程 → 素材生成 → 视觉审查 → 后期合成,
+// adversarial_dev 模式 2 轮)。产出为 SVG/HTML 视觉素材, 属"不产可编译代码"的工作流, 不跑编译/测试门禁。
 func creativeWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "creative",

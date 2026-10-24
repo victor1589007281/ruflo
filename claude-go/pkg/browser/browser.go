@@ -281,6 +281,7 @@ var (
 	reTitleTag   = regexp.MustCompile(`(?is)<title[^>]*>([^<]*)</title>`)
 )
 
+// extractTitle 从 HTML 中提取 <title> 文本 (无则返回空串)。
 func extractTitle(html string) string {
 	m := reTitleTag.FindStringSubmatch(html)
 	if len(m) > 1 {

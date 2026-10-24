@@ -117,6 +117,10 @@ func linuxKeyboard(ctx context.Context, bin string, input KeyboardInput) error {
 	}
 }
 
+// mapKeyDarwin 把通用键名映射成 macOS 原生键名 (如 backspace→delete, up→arrow-up); 未收录的原样返回。
+//
+// 注意：map 里同时存在 "delete"→"fwd-delete" 与 "backspace"→"delete" 两条 ——
+// 通用名 delete 对应的是前向删除, 若想按退格需传 backspace。
 func mapKeyDarwin(key string) string {
 	m := map[string]string{
 		"enter": "return", "return": "return",
@@ -135,6 +139,7 @@ func mapKeyDarwin(key string) string {
 	return key
 }
 
+// mapModifierDarwin 把通用修饰键名映射成 macOS 原生名 (cmd/command/super 统一为 cmd); 未收录的原样返回。
 func mapModifierDarwin(mod string) string {
 	m := map[string]string{
 		"ctrl": "ctrl", "control": "ctrl",
@@ -148,6 +153,9 @@ func mapModifierDarwin(mod string) string {
 	return mod
 }
 
+// mapKeyLinux 把通用键名映射成 X11/xdotool 键名 (首字母大写, pageup→Prior); 未收录的原样返回。
+//
+// 注意：本表只列到 F4, F5 及以后的键名会原样透传 (xdotool 也认 "f5" 这种小写写法, 因此通常无碍)。
 func mapKeyLinux(key string) string {
 	m := map[string]string{
 		"enter": "Return", "return": "Return",
@@ -164,6 +172,7 @@ func mapKeyLinux(key string) string {
 	return key
 }
 
+// mapModifierLinux 把通用修饰键名映射成 xdotool 名 (cmd/command 一律映射为 super); 未收录的原样返回。
 func mapModifierLinux(mod string) string {
 	m := map[string]string{
 		"ctrl": "ctrl", "control": "ctrl",

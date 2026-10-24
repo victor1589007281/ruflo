@@ -15,8 +15,11 @@ import (
 
 type DockerRunner struct{}
 
+// Name 返回运行时名 "docker"。
 func (r *DockerRunner) Name() string { return "docker" }
 
+// Probe 探测 docker CLI 与 daemon 是否可用 (docker info 取 ServerVersion, 3 秒超时);
+// 可用时声明支持内存/PID/CPU 三类限制。
 func (r *DockerRunner) Probe(ctx context.Context) ProbeResult {
 	start := time.Now()
 	if _, err := exec.LookPath("docker"); err != nil {
@@ -32,6 +35,18 @@ func (r *DockerRunner) Probe(ctx context.Context) ProbeResult {
 	return ProbeResult{Runtime: r.Name(), OK: true, Detail: strings.TrimSpace(string(out)), Latency: time.Since(start), CanMemory: true, CanPids: true, CanCPU: true}
 }
 
+// Run 在一次性容器里执行命令, 并把结果归入统一的失败分类。
+//
+// 算法解读：
+//
+//	原理：先 Probe 确认 docker 可用, 再拼参数 docker run 起容器; 输出经 OutputLimiter
+//	      边读边限流; 结束后 docker inspect 取 OOMKilled 与真实退出码, 最后按失败类型归类返回。
+//	关键不变量：失败分类的判据**有优先级**: 输出超限 > 超时 > OOM > 进程失败 ——
+//	      同一结果常同时满足多条 (超时被杀也非零退出), 顺序决定归因, 不能随意调换。
+//	代价与边界：每个容器三次 docker CLI 往返 (run / inspect / rm); ExitCode 优先信 inspect 的值,
+//	      因为 docker run 自身的退出码不含容器内进程的真实退出码。
+//	设计权衡：容器内不留任何持久状态 (tmpfs + 只读工作区外挂载), 代价是拿不到镜像层缓存复用,
+//	      换来的是"可丢弃、可重跑、不污染宿主"。
 func (r *DockerRunner) Run(ctx context.Context, spec CommandSpec) (*CommandResult, error) {
 	spec = spec.normalized()
 	if probe := r.Probe(ctx); !probe.OK {
@@ -168,6 +183,8 @@ func (r *DockerRunner) Run(ctx context.Context, spec CommandSpec) (*CommandResul
 	}
 }
 
+// dockerRunArgs 拼装 docker run 的参数表: 安全加固 (cap-drop / no-new-privileges) +
+// 资源限制 (内存/CPU/PID) + 工作区挂载 + 环境变量。
 func dockerRunArgs(name string, spec CommandSpec) []string {
 	cfg := CurrentConfig()
 	tempSize := cfg.Docker.TempSize
@@ -197,6 +214,7 @@ func dockerRunArgs(name string, spec CommandSpec) []string {
 		"-e", "HOME=/tmp",
 		"-e", "GOCACHE=/tmp/go-cache",
 		"-e", "GOMODCACHE=/tmp/go-mod",
+		// 工作区以 rw 挂载: 容器内的构建产物必须落到宿主机, 这是"沙箱里跑真命令"的前提。
 		"-v", filepath.Clean(spec.Cwd) + ":/workspace:rw",
 	}
 	if userSpec != "" {
@@ -226,6 +244,8 @@ func dockerRunArgs(name string, spec CommandSpec) []string {
 	return args
 }
 
+// dockerInspectState 读容器的 OOMKilled 标志与真实退出码;
+// inspect 失败或输出字段不足时返回 (false, nil), 交回调用方按 wait 结果判定。
 func dockerInspectState(name string) (bool, *int) {
 	cmd := exec.Command("docker", "inspect", "--format", "{{.State.OOMKilled}} {{.State.ExitCode}}", name)
 	out, err := cmd.Output()

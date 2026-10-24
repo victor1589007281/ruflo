@@ -27,6 +27,7 @@ import (
 // /api/backups?path=xxx  (DELETE)
 // ======================================================================
 
+// handleBackupsList 一个 handler 管两种方法: GET 列出备份, DELETE 按 ?path= 删除单条。
 func (s *Server) handleBackupsList(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -67,6 +68,8 @@ type createBackupReq struct {
 	IncludeReports *bool    `json:"includeReports,omitempty"`
 }
 
+// handleBackupCreate 处理 POST /api/backups/create: 请求体可选, 解析失败按零值继续
+// (includeReports 缺省为 true)。
 func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
@@ -106,6 +109,8 @@ type restoreBackupReq struct {
 	Overwrite        *bool  `json:"overwrite,omitempty"`
 }
 
+// handleBackupRestore 处理 POST /api/backups/restore, 只接受 stateDir/backups 之下的
+// 归档路径 (overwrite 缺省为 true)。
 func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
@@ -151,12 +156,14 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 // /api/backups/manifest?path=xxx  GET
 // ======================================================================
 
+// handleBackupManifest 读单条 manifest (不必下载整个包)。
 func (s *Server) handleBackupManifest(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Query().Get("path")
 	if p == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("?path=xxx 必填"))
 		return
 	}
+	// 与 restore 同一条目录边界: 只允许读 backups 之下的文件 (path 来自 query, 必须挡穿越)。
 	root, _ := filepath.Abs(filepath.Join(s.cfg.StateDir, "backups"))
 	abs, _ := filepath.Abs(p)
 	if !strings.HasPrefix(abs, root+string(filepath.Separator)) {
@@ -176,12 +183,14 @@ func (s *Server) handleBackupManifest(w http.ResponseWriter, r *http.Request) {
 // /api/backups/download?path=xxx  GET (serve tar.gz)
 // ======================================================================
 
+// handleBackupDownload 以 attachment 形式直出 .tar.gz 归档。
 func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Query().Get("path")
 	if p == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("?path=xxx 必填"))
 		return
 	}
+	// 这是唯一直接把磁盘字节吐给客户端的入口, 目录边界必须在这里也挡一次。
 	root, _ := filepath.Abs(filepath.Join(s.cfg.StateDir, "backups"))
 	abs, _ := filepath.Abs(p)
 	if !strings.HasPrefix(abs, root+string(filepath.Separator)) {
@@ -210,6 +219,7 @@ func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request) {
 // 返回当前 dashboard 能不能做 LLM 诊断, profile 从哪里读到
 // ======================================================================
 
+// handleLLMStatus 返回 LLM client 解析出的 profile, 供前端判断 LLM 诊断是否可用。
 func (s *Server) handleLLMStatus(w http.ResponseWriter, r *http.Request) {
 	_, profile, err := GetSharedLLMClient()
 	status := map[string]interface{}{

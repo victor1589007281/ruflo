@@ -70,12 +70,15 @@ func NewTeamCreateTool(store *teamStore) *TeamCreateTool {
 	return &TeamCreateTool{store: store}
 }
 
+// Name 返回工具名 "TeamCreate"。
 func (t *TeamCreateTool) Name() string { return teamCreateToolName }
 
+// Description 返回工具描述 (创建团队并自动切换为当前活动团队)。
 func (t *TeamCreateTool) Description() string {
 	return `创建一个新团队（名称唯一），并自动切换为当前活动团队。`
 }
 
+// InputSchema 返回 JSON Schema (team_name 必填, description 可选)。
 func (t *TeamCreateTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -87,9 +90,12 @@ func (t *TeamCreateTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false —— TeamCreate 会写入团队存储。
 func (t *TeamCreateTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+// IsConcurrencySafe 恒为 true —— 内部靠 teamStore 的互斥锁串行化。
 func (t *TeamCreateTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 在计划模式下拒绝创建团队, 其余情况放行。
 func (t *TeamCreateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx != nil && tctx.PermissionMode == types.PermissionModePlan {
 		return &types.PermissionResult{Behavior: types.PermissionDeny, Reason: "计划模式：禁止创建团队"}
@@ -97,6 +103,7 @@ func (t *TeamCreateTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolCont
 	return nil
 }
 
+// Call 校验名称非空与 30 秒创建冷却, 成功后写入团队并切换当前团队指针。
 func (t *TeamCreateTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in teamCreateInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -146,12 +153,15 @@ func NewTeamDeleteTool(store *teamStore) *TeamDeleteTool {
 	return &TeamDeleteTool{store: store}
 }
 
+// Name 返回工具名 "TeamDelete"。
 func (t *TeamDeleteTool) Name() string { return teamDeleteToolName }
 
+// Description 返回工具描述 (删除当前活动团队)。
 func (t *TeamDeleteTool) Description() string {
 	return `删除当前活动团队及其信箱数据；若无当前团队则报错。`
 }
 
+// InputSchema 返回空对象 Schema (TeamDelete 不接受参数, 只删当前团队)。
 func (t *TeamDeleteTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -160,9 +170,12 @@ func (t *TeamDeleteTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false —— TeamDelete 会删除团队数据。
 func (t *TeamDeleteTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+// IsConcurrencySafe 恒为 true —— 内部靠 teamStore 的互斥锁串行化。
 func (t *TeamDeleteTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
+// CheckPermissions 在计划模式下拒绝删除团队, 其余情况放行。
 func (t *TeamDeleteTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx != nil && tctx.PermissionMode == types.PermissionModePlan {
 		return &types.PermissionResult{Behavior: types.PermissionDeny, Reason: "计划模式：禁止删除团队"}
@@ -170,6 +183,7 @@ func (t *TeamDeleteTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolCont
 	return nil
 }
 
+// Call 删除当前团队并清空当前指针; 无当前团队时报错。
 func (t *TeamDeleteTool) Call(_ context.Context, _ json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()

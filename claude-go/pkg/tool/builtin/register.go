@@ -12,6 +12,9 @@ type WebSearcher interface {
 	Search(ctx context.Context, query string) (title, text, html string, err error)
 }
 
+// RegisterBaseTools 注册全部内置工具, 返回 TodoWriteTool 供外部查询清单。
+// 内部自建一份默认 TaskStore; 需要与外部共享同一份 store 时改用 RegisterBaseToolsWithStore。
+//
 // RegisterBaseTools registers all built-in tools.
 // Returns TodoWriteTool for external use.
 // Internally creates a default TaskStore; use RegisterBaseToolsWithStore to share one.
@@ -20,6 +23,9 @@ func RegisterBaseTools(reg *tool.Registry, searcher WebSearcher) *TodoWriteTool 
 	return todo
 }
 
+// RegisterBaseToolsWithStore 用共享的 TaskStore 注册全部内置工具, 并把 (可能新建的)
+// store 回传给调用方复用。
+//
 // RegisterBaseToolsWithStore registers all built-in tools with a shared TaskStore.
 // If store is nil, creates a new one with default path.
 // Returns the TodoWriteTool and the (possibly newly created) TaskStore for reuse.
@@ -63,6 +69,8 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	reg.Register(NewExitPlanModeTool())
 
 	// V2 Task system (shared store)
+	// store 为 nil 表示"由本函数自建一份"并回传 —— 四个 Task 工具必须拿到同一个 store,
+	// 否则 TaskCreate 写进去的任务 TaskGet/TaskList 永远看不到。
 	if store == nil {
 		store = NewTaskStore("")
 	}

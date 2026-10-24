@@ -5,6 +5,8 @@
 // 用于初始化和季度更新 market-radar 的 chain/seed/*.yaml。
 package agent
 
+// industryMapWorkflow 构造 "industry-map" 工作流: 四阶段串行 (环节拆解 → 企业映射 → 份额调研 → 结构化 YAML),
+// 供 market-radar 初始化与季度更新产业链种子文件。
 func industryMapWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "industry-map",

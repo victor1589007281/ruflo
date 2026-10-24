@@ -29,8 +29,11 @@ func NewMessageFilterHook() *MessageFilterHook {
 	return &MessageFilterHook{}
 }
 
+// Name 返回 hook 名。
 func (h *MessageFilterHook) Name() string                { return "message_filter" }
+// Priority 40: 早于 AutoMode(45) 与 MessageMetrics(48), 让后续 hook 看到的是过滤后的消息链。
 func (h *MessageFilterHook) Priority() int               { return 40 }
+// Phases 仅在 PhasePreRequest 生效。
 func (h *MessageFilterHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreRequest}
 }
@@ -68,8 +71,11 @@ func NewMaxTokensRecoveryHook() *MaxTokensRecoveryHook {
 	return &MaxTokensRecoveryHook{}
 }
 
+// Name 返回 hook 名。
 func (h *MaxTokensRecoveryHook) Name() string                { return "max_tokens_recovery" }
+// Priority 60: 在 PhaseOnStop 里跑, 位置由停止原因判定本身决定, 与请求前 hook 无竞争。
 func (h *MaxTokensRecoveryHook) Priority() int               { return 60 }
+// Phases 仅在 PhaseOnStop 生效。
 func (h *MaxTokensRecoveryHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhaseOnStop}
 }
@@ -123,8 +129,11 @@ func NewMessageMetricsHook(metrics *EngineMetrics) *MessageMetricsHook {
 	return &MessageMetricsHook{metrics: metrics}
 }
 
+// Name 返回 hook 名。
 func (h *MessageMetricsHook) Name() string                { return "message_metrics" }
+// Priority 48: 在 MessageFilter(40) 之后, 统计到的是已被前置 hook 处理过的消息链。
 func (h *MessageMetricsHook) Priority() int               { return 48 }
+// Phases 仅在 PhasePreRequest 生效。
 func (h *MessageMetricsHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreRequest}
 }
@@ -290,8 +299,11 @@ func NewXMLToolFallbackHook() *XMLToolFallbackHook {
 	return &XMLToolFallbackHook{}
 }
 
+// Name 返回 hook 名。
 func (h *XMLToolFallbackHook) Name() string                { return "xml_tool_fallback" }
+// Priority 130: 靠后执行, 让原生 tool_use 解析先跑, 回退只在原生结果为空时才补。
 func (h *XMLToolFallbackHook) Priority() int               { return 130 }
+// Phases 仅在 PhasePostRequest 生效。
 func (h *XMLToolFallbackHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePostRequest}
 }

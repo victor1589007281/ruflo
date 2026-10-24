@@ -19,6 +19,10 @@ import (
 	"github.com/anthropic/claude-go/pkg/platformmcp"
 )
 
+// platformMCPServerCmd 构造 platform-mcp-server 子命令: 以 stdio 形态把平台运行态
+// 暴露成 MCP 工具, 与 :18080 的 HTTP 形态共用同一份 Backend。
+//
+// stdout 只留给 JSON-RPC, 一切提示走 stderr —— 往 stdout 写一个字都会破坏协议帧。
 func platformMCPServerCmd() *cobra.Command {
 	var stateDir string
 	cmd := &cobra.Command{

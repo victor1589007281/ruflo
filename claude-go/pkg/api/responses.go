@@ -38,6 +38,10 @@ type responsesInputItem struct {
 	Raw json.RawMessage
 }
 
+// MarshalJSON 直接吐出构造时存下的原始 JSON —— input 数组里是异构 item, 不经过统一结构体。
+//
+// 注意：Raw 为空时返回空字节切片而非 "null", 序列化出来的数组元素会变成非法 JSON;
+// 所有 item 都必须经 responsesItem 构造, 不要手工拼 responsesInputItem。
 func (i responsesInputItem) MarshalJSON() ([]byte, error) { return i.Raw, nil }
 
 // responsesTool Responses API 的工具定义 (平铺字段, 不同于 chat/completions 的
@@ -354,6 +358,9 @@ type responsesToolState struct {
 	stopped    bool // 该工具块是否已在其 output_item.done 处关闭 (防 completed 重复 stop)
 }
 
+// newOpenAIResponsesStreamTranslator 构造 Responses SSE → Anthropic 事件流的翻译器。
+//
+// toolItems 必须在这里初始化 —— 工具块的增删都直接写这张表, 零值 map 会 panic。
 func newOpenAIResponsesStreamTranslator(model string) *openAIResponsesStreamTranslator {
 	return &openAIResponsesStreamTranslator{model: model, toolItems: map[string]*responsesToolState{}}
 }

@@ -300,6 +300,10 @@ func GenerateComparisonReport(summary *MetricsSummary) *ComparisonReport {
 	}
 }
 
+// generateComparisonSummary 统计各维度胜负并拼出结论段 —— 前半段的计数是算出来的, 后半段的定性描述是写死的。
+//
+// 注意：结论段里「在预测精度/效率/安全上显著领先」等论断是固定文案, 不随 dims 的实际胜负变化;
+// 只有第一行的三个计数是真实统计, 因此维度数据被改动后, 定性结论可能与计数自相矛盾。
 func generateComparisonSummary(dims []ComparisonDimension) string {
 	claudeWins, miroWins, ties := 0, 0, 0
 	for _, d := range dims {

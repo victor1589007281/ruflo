@@ -120,6 +120,21 @@ func (c *Checker) applyDontAsk(r types.PermissionResult) types.PermissionResult 
 	return r
 }
 
+// modeDecision 按 PermissionMode 给出该工具的默认裁决 (allow / deny / ask)。
+//
+// 算法解读：
+//
+//	原理：模式是权限链的**第 4 层** (见 CheckGlobal): 前面没人明确表态时, 由模式决定默认
+//	      动作。bypass 全放行; plan 只放行只读; auto / acceptEdits / default 放行只读,
+//	      写入类再按工具与模式细分。
+//	关键不变量：dontAsk **不在这里**把 Ask 转 Deny —— 它 fallthrough 到 default 先生成 Ask,
+//	      再由 applyDontAsk 统一转换。这是刻意的: 让"dontAsk 产生的 Ask"与"内容规则层产生的
+//	      Ask"走同一条转换路径, 全链只留一个转换点。改动这里的分支会让 dontAsk 的语义
+//	      出现第二个真相源。
+//	代价与边界：模式层看不到具体路径与入参 —— 细粒度放行只能靠 ContentRules / AllowRules;
+//	      acceptEdits 的"文件编辑工具"名单写死在 isFileEditTool 里。
+//	设计权衡：Plan 模式用"只读"作为唯一判据而不是工具白名单 —— 只读性由各工具自己声明
+//	      (IsReadOnly), 新模式工具无需在这里登记。
 func (c *Checker) modeDecision(toolName string, isReadOnly bool) types.PermissionResult {
 	switch c.Mode {
 	case types.PermissionModeBypass:
@@ -160,6 +175,11 @@ func (c *Checker) modeDecision(toolName string, isReadOnly bool) types.Permissio
 	}
 }
 
+// isFileEditTool 判断工具名是否属于 acceptEdits 模式下自动放行的"文件编辑工具"。
+//
+// 注意：名单是**写死的** —— 新增一个写文件的工具 (例如 NotebookEdit) 若不同步加进来,
+// acceptEdits 模式下它仍会走 Ask, 表现为"我已经开了 acceptEdits 怎么还问我"。
+// 判据用工具名而非 IsReadOnly, 是因为 acceptEdits 只放宽"改文件", 不放宽其它写入 (如 Bash)。
 func isFileEditTool(name string) bool {
 	switch name {
 	case "Write", "StrReplace", "MultiEdit":
@@ -192,6 +212,7 @@ func matchRule(rule types.PermissionRule, toolName string, input json.RawMessage
 	return patternMatches(rule.Pattern, input)
 }
 
+// matchContentRule 检查 ContentRule 是否命中 (工具名匹配 + 内容模式匹配, 两者都要满足)。
 func matchContentRule(rule types.ContentRule, toolName string, input json.RawMessage) bool {
 	if !toolNameMatches(rule.ToolName, toolName) {
 		return false
@@ -199,6 +220,7 @@ func matchContentRule(rule types.ContentRule, toolName string, input json.RawMes
 	return contentPatternMatches(rule.Pattern, input)
 }
 
+// toolNameMatches 工具名匹配: 规则侧空串或 "*" 视为通配, 否则大小写不敏感地全等。
 func toolNameMatches(ruleTool, actual string) bool {
 	if ruleTool == "" || ruleTool == "*" {
 		return true
@@ -247,6 +269,8 @@ func contentPatternMatches(pattern string, input json.RawMessage) bool {
 	return strings.Contains(compact, pattern)
 }
 
+// compactJSONInput 把工具入参压成紧凑 JSON 串 (去空白), 供内容规则做子串匹配。
+// 解析失败时退回原始文本 —— 规则匹配不该因为入参不是合法 JSON 而全盘失效。
 func compactJSONInput(input json.RawMessage) string {
 	s := strings.TrimSpace(string(input))
 	if s == "" {
@@ -263,6 +287,12 @@ func compactJSONInput(input json.RawMessage) string {
 	return string(b)
 }
 
+// extractPathFromInput 从工具入参里取出路径字段, 用于路径模式的权限规则匹配。
+//
+// 注意：候选键名是**写死的**列表 (path / file_path / filepath / target / ...)。
+// 新增工具若用别的键名装路径 (例如 "notebook_path"), 其路径规则会静默失效 ——
+// 规则看起来配了, 实际永远匹配不到, 而失败方向是"少拦"而不是"多拦"。
+// 多个键同时存在时按列表顺序取第一个非空字符串, 顺序本身也是约定。
 func extractPathFromInput(input json.RawMessage) string {
 	var m map[string]interface{}
 	if json.Unmarshal(input, &m) != nil {

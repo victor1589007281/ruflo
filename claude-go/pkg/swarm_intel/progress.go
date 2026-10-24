@@ -15,6 +15,7 @@ type ProgressReporter struct {
 	stepTs  []time.Time
 }
 
+// NewProgressReporter 构造进度上报器, 记录总步数与起始时刻。
 func NewProgressReporter(notify NotifyFunc, chatID string, totalSteps int) *ProgressReporter {
 	return &ProgressReporter{
 		notify:  notify,
@@ -65,6 +66,14 @@ func (pr *ProgressReporter) Error(err error) {
 	pr.notify(pr.chatID, fmt.Sprintf("❌ 失败 (%.1fs): %v", elapsed.Seconds(), err))
 }
 
+// estimateETA 用已完成步的平均耗时线性外推剩余步数所需时间。
+//
+// 算法解读：
+//
+//	原理：平均每步耗时 = 已用时长 / 已完成步数, 再乘以剩余步数, 得到线性外推的剩余时长。
+//	关键不变量：current == 0 时必须返回 0——否则这里就是一次除零, 调用方也据此跳过 ETA 展示。
+//	代价与边界：current 在 Step 开头就自增, 于是「进行中的这一步」被算成已完成, 平均耗时偏小、ETA 偏乐观; 步长差异大的任务外推误差会被放大。
+//	设计权衡：只用 O(1) 的均值外推, 不做滑动窗口或指数平滑; 注意 stepTs 被写入却从未被读取, 是留给将来做滑动窗口的残留字段。
 func (pr *ProgressReporter) estimateETA() time.Duration {
 	if pr.current == 0 {
 		return 0

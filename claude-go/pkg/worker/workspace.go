@@ -306,6 +306,10 @@ type handshakeNote struct {
 	TS     int64  `json:"ts"`
 }
 
+// handshakePath 返回一侧握手文件的路径: <root>/.claude-go-ws/<token>.<side>。
+//
+// token 是双方约定的握手标识, side 区分 control / worker —— 两侧各写各的文件, 互不覆盖,
+// 于是"对方写了吗"可以直接用文件是否存在来判定。
 func handshakePath(root, token, side string) string {
 	return filepath.Join(root, handshakeDir, token+"."+side)
 }
@@ -406,6 +410,7 @@ func (s *workspaceSession) finish(ok bool) (WorkspaceReport, error) {
 // abandon 兜底收尾 (execute 的 defer): 已收尾过则什么都不做。
 func (s *workspaceSession) abandon() { _, _ = s.finish(false) }
 
+// noopSession 返回一个不做任何准备/收尾的会话 (local 档: 目录已由调用方保证)。
 func noopSession(mode WorkspaceMode, dir string) *workspaceSession {
 	return &workspaceSession{mode: mode, dir: dir}
 }

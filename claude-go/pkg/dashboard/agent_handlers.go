@@ -81,6 +81,10 @@ type agentAssetDTO struct {
 	HasTools    bool     `json:"hasTools,omitempty"` // tools 这个键**写没写**: 写了空列表 = fail-closed 拒一切工具
 }
 
+// dtoFromAsset 把 asset.Asset 转成前端用的 DTO; sourcePath 只在 state 来源时非空。
+//
+// 注意：tools 用 MetaListSet 区分"键写了空列表"(HasTools=true, fail-closed 拒一切工具)
+// 与"键没写"(HasTools=false, 走档位默认) —— 前端必须靠 HasTools 而不是 len(Tools) 判断。
 func dtoFromAsset(a *asset.Asset, sourcePath string) agentAssetDTO {
 	d := agentAssetDTO{
 		Name: a.Name, Description: a.Description, Body: a.Body,
@@ -183,6 +187,20 @@ type agentCreateInput struct {
 	Disallowed  []string `json:"disallowedTools,omitempty"`
 }
 
+// handleAgentCreate 处理 POST /api/agents: 校验入参 → 生成 Markdown → 先解析验一遍 → 落盘 → 回读。
+//
+// 算法解读：
+//
+//	原理：写盘顺序是"**先验后写**"—— 生成的内容先用 asset.ParseContent 解析一遍, 解析
+//		通过才覆盖目标文件。
+//	关键不变量：**解析必须在覆盖之前**。反过来 (先写再验) 一旦验出问题, 盘上留下的
+//		是一份已经覆盖掉旧定义的坏文件: 用户既丢了老版本, 新的又不能用。
+//	代价与边界：一次写操作要解析两遍 (写前验、写后回读) 加一次 ReloadAgents 回调;
+//		回读失败时**文件其实已经写成功了**, 但响应报 500 —— 调用方重试是安全的
+//		(同名覆盖), 只是会重复触发一次 reload。
+//	设计权衡：toolProfile 拼错时**拒绝而不是归一** (NormalizeToolProfile 会静默返回
+//		chat 且不留痕, 一个写成 "codign" 的声明会得到连 Read 都没有的子代理, 而产物
+//		看起来完全正常)。宁可让用户当场看到 400, 也不要运行期才暴露。
 func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 	var in agentCreateInput
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -257,6 +275,10 @@ func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAgentDetail GET/DELETE /api/agents/{name}
+// handleAgentDetail 处理 GET / DELETE /api/agents/{name}: 名字从 URL 路径尾段解析。
+//
+// 注意：名字非法时 GET 返回 400; 删除**只认 state 根下那一个文件在不在**,
+// 不会去删 project / user 来源的同名定义 (见下方 DELETE 分支的注释)。
 func (s *Server) handleAgentDetail(w http.ResponseWriter, r *http.Request) {
 	name := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/agents/"), "/")
 	if name == "" {

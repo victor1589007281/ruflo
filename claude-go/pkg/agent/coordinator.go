@@ -360,6 +360,21 @@ func (c *Coordinator) countRemainingTasks(team *ProductionTeam) int {
 	return total - completed
 }
 
+// runPipelineWithRecovery 按依赖图逐轮推进工作流, 每轮挑出依赖已满足的阶段并发/串行执行, 失败即整体中止。
+//
+// 算法解读：
+//
+//	原理：这是一个"恢复 + 拓扑推进"的调度环。开跑前先把检查点里已完成的阶段灌进 completed 集合,
+//	      于是恢复运行与首次运行共用同一条主循环 —— 恢复不另写一套逻辑, 只是把主循环的起点提前。
+//	      每轮扫一遍全部阶段, 凡是依赖都在 completed 里的就是 ready; ready 多于一个且可并行时
+//	      整组并发执行, 否则只跑第一个。
+//	关键不变量：恢复时**只认当前工作流定义里存在的阶段名** (currentStages 过滤)。工作流定义变更
+//	      (阶段被拆分/改名) 后, 磁盘上残留的旧阶段名检查点若照单全收, completed 的计数会被虚增到
+//	      >= len(wf.Stages), 主循环的退出条件当场成立 —— 尾部阶段被静默跳过, 而团队仍报 completed。
+//	代价与边界：每轮 O(阶段数 × 依赖数) 的扫描, 阶段规模下可忽略; 依赖成环或依赖了不存在的阶段名时
+//	      ready 为空, 循环以"工作流死锁"报错退出而不是空转。
+//	设计权衡：不做真正的拓扑排序预计算 —— 每轮现算 ready 让"运行期动态改变依赖/跳过阶段"这类需求
+//	      不必重建调度结构, 代价只是重复扫描。
 func (c *Coordinator) runPipelineWithRecovery(
 	ctx context.Context,
 	wf *WorkflowDef,
@@ -417,6 +432,8 @@ func (c *Coordinator) runPipelineWithRecovery(
 			}
 		}
 
+		// ready 为空且还有未完成阶段 ⇒ 依赖成环或依赖了不存在的阶段名。这里必须报错退出:
+		// 继续循环只会永远挑不出 ready, 变成静默空转。
 		if len(ready) == 0 {
 			return allResults, fmt.Errorf("工作流死锁: 无可执行阶段")
 		}
@@ -426,6 +443,7 @@ func (c *Coordinator) runPipelineWithRecovery(
 			c.pool.AutoScale(len(ready))
 		}
 
+		// 只有确实多于一个可并行阶段时才走并行路径: 单阶段走并行只会白起一组 goroutine 与等待。
 		parallelGroup := filterParallel(ready)
 		if len(parallelGroup) > 1 {
 			stageResults := c.executeParallelWithRetry(ctx, parallelGroup, objective, results, team, executor)
@@ -442,6 +460,7 @@ func (c *Coordinator) runPipelineWithRecovery(
 				}
 			}
 		} else {
+			// 不可并行时只跑第一个 ready; 其余 ready 阶段不丢, 下一轮会被重新挑出来。
 			stage := ready[0]
 			sr := c.executeStageWithRetry(ctx, stage, objective, results, team, executor)
 			allResults = append(allResults, sr)
@@ -768,6 +787,11 @@ func (c *Coordinator) heartbeatLoop(ctx context.Context, team *ProductionTeam) {
 	}
 }
 
+// checkTeamHealth 周期性体检: 统计各状态 agent 数与引擎活跃标志, 打出心跳日志并在疑似卡死时告警。
+//
+// 注意: 引擎是否活跃只看 team.EngineRunning 这个显式标记, 不靠 team.Stages 之类的启发式推断 ——
+// orchestrated 模式下 engine 跑在独立 goroutine 里, team.Agents 全是 idle, 用 agent 状态推断
+// 会把正常运行的引擎误报成卡死。
 func (c *Coordinator) checkTeamHealth(team *ProductionTeam) {
 	if team == nil {
 		return
@@ -842,6 +866,11 @@ func (c *Coordinator) GetCheckpoint(stageName string) *Checkpoint {
 	return c.checkpoints[stageName]
 }
 
+// saveCheckpoint 写入/覆盖单个阶段的检查点并立即落盘 (持 c.mu)。
+//
+// 注意: status == "failed" 时把 output 挪进 Error 并把 Output 清空 —— 失败阶段的输出是错误文本,
+// 留在 Output 里会被恢复逻辑当成有效产出 (completed 判定要求 Output 非空, 但下游读 Output 的地方
+// 不会再看 Status)。
 func (c *Coordinator) saveCheckpoint(stageName, status string, attempt int, output string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -861,6 +890,10 @@ func (c *Coordinator) saveCheckpoint(stageName, status string, attempt int, outp
 	c.persistCheckpoints()
 }
 
+// persistCheckpoints 把整张检查点表序列化到 dataDir/checkpoints.json。
+//
+// 注意: 调用方 (saveCheckpoint) 持有 c.mu, 所以这里是**持锁做文件 IO**; 且写盘失败与序列化失败
+// 都被静默吞掉 —— 落盘失败不影响内存态, 但下一次 resume 会看不到这次的进度。
 func (c *Coordinator) persistCheckpoints() {
 	if c.dataDir == "" {
 		return
@@ -873,6 +906,9 @@ func (c *Coordinator) persistCheckpoints() {
 	_ = os.WriteFile(filepath.Join(c.dataDir, checkpointsFileName), data, 0644)
 }
 
+// loadCheckpoints 从 dataDir/checkpoints.json 载入检查点表; 文件不存在或解析失败都静默跳过 (从零开始)。
+//
+// 注意: 这里不加锁, 只应在 Coordinator 尚未被并发使用 (装配/启动) 阶段调用。
 func (c *Coordinator) loadCheckpoints() {
 	if c.dataDir == "" {
 		return

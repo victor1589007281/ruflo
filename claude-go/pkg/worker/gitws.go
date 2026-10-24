@@ -95,6 +95,7 @@ func gitCmd(ctx context.Context, dir string, timeout time.Duration, args ...stri
 	return s, nil
 }
 
+// gitOK 跑一条本地 git 命令, 只关心成败 (用于 rev-parse --verify 这类存在性探测)。
 func gitOK(ctx context.Context, dir string, args ...string) bool {
 	_, err := gitCmd(ctx, dir, gitLocalTimeout, args...)
 	return err == nil
@@ -206,6 +207,8 @@ func gitEnsureRepo(ctx context.Context, dir, remote string, allowInitNonEmpty bo
 	return nil
 }
 
+// sameGitRemote 归一化后比较两个 remote URL: 去空白、去尾部 "/"、去 ".git" 后缀 ——
+// 同一个仓的写法差异 (ssh vs https、带不带 .git) 不该被判成"指向不同的仓"。
 func sameGitRemote(a, b string) bool {
 	norm := func(s string) string {
 		s = strings.TrimSpace(s)
@@ -452,6 +455,7 @@ func gitWriteLocalExcludes(dir string) error {
 func gitPushWithRebase(ctx context.Context, dir, branch string) (bool, string, error) {
 	target := "HEAD:refs/heads/" + branch
 	var lastOut string
+	// attempt 从 0 起, push 本身也算一次尝试 —— gitPushRetries=3 即最多推 3 次 (首推 + 2 次变基后重推)。
 	for attempt := 0; attempt < gitPushRetries; attempt++ {
 		out, err := gitCmd(ctx, dir, gitNetworkTimeout, "push", "origin", target)
 		if err == nil {
@@ -470,6 +474,7 @@ func gitPushWithRebase(ctx context.Context, dir, branch string) (bool, string, e
 		if _, ferr := gitCmd(ctx, dir, gitNetworkTimeout, "fetch", "origin", branch); ferr != nil {
 			return false, "", fmt.Errorf("git 档推送被拒后拉取失败: %w", ferr)
 		}
+		// rebase 成功 ⇒ 不 return, 回到循环顶部重推: 这次 HEAD 已基于最新远端, 通常一次即中。
 		if rout, rerr := gitCmd(ctx, dir, gitLocalTimeout, "rebase", "FETCH_HEAD"); rerr != nil {
 			conflicts, _ := gitCmd(ctx, dir, gitLocalTimeout, "diff", "--name-only", "--diff-filter=U")
 			_, _ = gitCmd(ctx, dir, gitLocalTimeout, "rebase", "--abort")
@@ -485,6 +490,8 @@ func gitPushWithRebase(ctx context.Context, dir, branch string) (bool, string, e
 		gitPushRetries, firstLine(lastOut))
 }
 
+// gitPushRejected 判断 push 输出是否为"被并发分片抢先"这一类拒绝 (而非鉴权/网络等硬错) ——
+// 只有这一类才值得 fetch+rebase 重试。
 func gitPushRejected(out string) bool {
 	l := strings.ToLower(out)
 	return strings.Contains(l, "non-fast-forward") || strings.Contains(l, "fetch first") ||
@@ -544,6 +551,7 @@ func gitCountBinary(ctx context.Context, dir string) int {
 	return n
 }
 
+// gitSubject 取提交信息里的人类可读主题: 优先 NodeID, 退到 RunID, 再退到 "stage"。
 func gitSubject(st StageTask) string {
 	s := strings.TrimSpace(st.NodeID)
 	if s == "" {
@@ -620,6 +628,10 @@ type controlGitLocks struct {
 	m  map[string]*sync.Mutex
 }
 
+// lock 取到 path 对应的互斥锁并返回解锁函数。
+//
+// 两段式加锁: 先在 c.mu 下取(或惰性建)那把锁, 再在 c.mu **之外** Lock —— 若在 c.mu
+// 里等 l.Lock, 就会把整个锁表的取用串成一条队, 不同路径之间也互相阻塞。
 func (c *controlGitLocks) lock(path string) func() {
 	c.mu.Lock()
 	if c.m == nil {
@@ -639,6 +651,7 @@ func (c *controlGitLocks) lock(path string) func() {
 // 小工具
 // ─────────────────────────────────────────────────────────────────────────────
 
+// splitLines 按行拆分并丢掉空行/纯空白行。
 func splitLines(s string) []string {
 	var out []string
 	for _, ln := range strings.Split(s, "\n") {
@@ -649,6 +662,7 @@ func splitLines(s string) []string {
 	return out
 }
 
+// firstLine 取首行并去空白 —— git 的错误详情常在后续行, 报错时只取第一行做摘要。
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		return strings.TrimSpace(s[:i])
@@ -656,6 +670,7 @@ func firstLine(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// shortSHA 截成 8 位短 SHA 供日志展示; 空串返回 "(空)"。
 func shortSHA(s string) string {
 	s = strings.TrimSpace(s)
 	if len(s) > 8 {
@@ -667,6 +682,7 @@ func shortSHA(s string) string {
 	return s
 }
 
+// firstNonEmptyStr 返回第一个去空白后非空的参数; 全空返回空串。
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {

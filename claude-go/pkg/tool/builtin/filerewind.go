@@ -71,10 +71,13 @@ type rewindInput struct {
 // RewindTool 把文件回退到 file-history 记录过的某个版本。
 type RewindTool struct{}
 
+// NewRewindTool 构造 Rewind 工具。
 func NewRewindTool() *RewindTool { return &RewindTool{} }
 
+// Name 返回工具名 "Rewind"。
 func (t *RewindTool) Name() string { return RewindToolName }
 
+// Description 返回给模型看的工具说明: 省略 ref 即回退一步, 可连续回退。
 func (t *RewindTool) Description() string {
 	return `Rewind a file to an earlier version recorded by the file-history checkpoint.
 
@@ -88,6 +91,7 @@ The file is restored byte-for-byte. If no version is available the call fails an
 the file is left untouched.`
 }
 
+// InputSchema 返回入参 schema: path 必填, ref 可选。
 func (t *RewindTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -105,9 +109,12 @@ func (t *RewindTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 false —— 回退会写盘。
 func (t *RewindTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+// IsConcurrencySafe 恒为 false —— 回退与其它写操作不可并发。
 func (t *RewindTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
+// CheckPermissions 在 Plan 模式下拒绝回退 (它是一次真实的文件写入)。
 func (t *RewindTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
 	if tctx == nil || tctx.PermissionMode != types.PermissionModePlan {
 		return nil
@@ -121,6 +128,19 @@ func (t *RewindTool) CheckPermissions(input json.RawMessage, tctx *tool.ToolCont
 	}
 }
 
+// Call 执行回退: 省略 ref 时取上一步版本并逐字节恢复; 三种取不到版本的情形分别报错。
+//
+// 算法解读：
+//
+//	原理：把"退回一步"变成模型伸手可及的一个动作。省略 ref 时按**磁盘当前内容**反查上一个
+//	      版本, 而不是按版本清单下标。
+//	关键不变量：回退后**不**记新版本 (不调 checkpointAfterWrite)。若记了, 第二次回退的锚点
+//	      会变成刚写下的那一版, 连按两次等于在原地前后横跳, 且两次都报成功。因此"最高版本 ==
+//	      磁盘内容"这条不变式在回退后被**刻意**暂时打破。
+//	代价与边界：磁盘内容不在版本史里时拒绝回退 (说明文件被本会话之外的东西改过, 硬退会
+//	      覆盖别人的改动); 三种取不到版本的情形分别报错, 因为它们的正确处置完全不同。
+//	设计权衡：给的是**出口**而不是**策略** —— "现在改坏了"没有可自动判定的判据, 唯一知道
+//	      是哪一步引入问题的角色是模型自己。
 func (t *RewindTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in rewindInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -149,6 +169,7 @@ func (t *RewindTool) Call(_ context.Context, input json.RawMessage, tctx *tool.T
 	steppedBack := ref == ""
 	if steppedBack {
 		ref = h.PreviousVersion(filePath, sid)
+		// 省略 ref = 退一步: 锚点是**磁盘当前内容**而不是版本清单下标, 连按两次才会真正往前退。
 		if ref == "" {
 			return t.noTargetResult(h, filePath, sid), nil
 		}

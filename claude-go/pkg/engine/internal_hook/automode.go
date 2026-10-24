@@ -81,12 +81,14 @@ func NewAutoModeHook(enabled bool, mode string, llmClassify func(ctx context.Con
 	}
 }
 
+// Name 返回 hook 名 "auto_mode"。
 func (h *AutoModeHook) Name() string { return "auto_mode" }
 
 // Priority 45: PhasePreRequest 里位于 MessageFilter(40) 之后、MessageMetrics(48)
 // 之前 —— 输入消息已过滤, 判定结果可被后续 hook 观测到。
 func (h *AutoModeHook) Priority() int { return 45 }
 
+// Phases 声明本 hook 只挂 PhasePreRequest 一个阶段。
 func (h *AutoModeHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreRequest}
 }

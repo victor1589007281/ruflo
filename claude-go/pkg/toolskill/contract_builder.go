@@ -24,6 +24,7 @@ type GoContractBuilder struct {
 	store *contract.Store
 }
 
+// NewGoContractBuilder 构造 GoContractBuilder (基于 go/packages 做类型精确的契约扫描)。
 // NewGoContractBuilder creates a new GoContractBuilder.
 func NewGoContractBuilder(store *contract.Store) *GoContractBuilder {
 	return &GoContractBuilder{
@@ -47,6 +48,7 @@ func NewGoContractBuilder(store *contract.Store) *GoContractBuilder {
 	}
 }
 
+// Execute 加载仓库全部包, 抽取接口/类型与实现关系, 写入 Contract Store 并返回统计。
 // Execute runs the contract builder.
 func (t *GoContractBuilder) Execute(ctx context.Context, input json.RawMessage) (map[string]any, error) {
 	var in struct {
@@ -161,6 +163,7 @@ func (t *GoContractBuilder) Execute(ctx context.Context, input json.RawMessage) 
 	}, nil
 }
 
+// typeListFromTypes 把 go/types 的元组展开成类型字符串列表; nil 元组返回 nil。
 func typeListFromTypes(t *types.Tuple) []string {
 	if t == nil {
 		return nil
@@ -172,6 +175,8 @@ func typeListFromTypes(t *types.Tuple) []string {
 	return out
 }
 
+// hasMethodOverlap 判定命名类型是否实现了 methods 里的任意一个方法。
+// 注意: 这里只做方法名子集匹配, 不是 types.Implements 的完整判定 —— 签名不符也会返回 true。
 func hasMethodOverlap(named *types.Named, methods map[string]*contract.MethodSig) bool {
 	// Simplified: check if at least one interface method is implemented
 	// In practice should use types.Implements, but need to construct interface type

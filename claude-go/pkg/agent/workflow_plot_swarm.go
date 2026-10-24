@@ -19,6 +19,8 @@ import (
 
 // ---- plot-simulate: 剧情模拟 / 演化 ----
 
+// plotSimulateWorkflow 构造 plot-simulate 工作流定义: 走 swarm_intel 多情景群体推演,
+// 产出严格 JSON (情景 + 概率 + 关键事件 + 涌现走向)。
 func plotSimulateWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "plot-simulate",
@@ -76,6 +78,8 @@ func runPlotSimulateCore(ctx context.Context, engine *swarm_intel.Engine, chatID
 
 // ---- plot-predict: 走向群体评估 ----
 
+// plotPredictWorkflow 构造 plot-predict 工作流定义: 走 swarm_intel 多分析师辩论融合,
+// 产出各走向的概率与 95% 区间、共识度与理据。
 func plotPredictWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "plot-predict",

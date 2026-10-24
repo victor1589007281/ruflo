@@ -203,6 +203,7 @@ func primaryContentStageIndex(results []StageResult) int {
 	return best
 }
 
+// stageByName 按名字在 workflow 定义里查找阶段; 找不到时返回 nil。
 func stageByName(wf *WorkflowDef, name string) *StageDef {
 	for i := range wf.Stages {
 		if wf.Stages[i].Name == name {

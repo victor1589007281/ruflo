@@ -69,6 +69,21 @@ func (c *ConformalCalibrator) CalibrateSet(pred *FusedPrediction) ConfidenceSet 
 	}
 }
 
+// computeQuantile 取历史保形分数的 (1-alpha) 分位数, 作为区间半宽。
+//
+// 算法解读：
+//
+//	原理：分裂式保形预测的分位数取法 —— 把历史分数排序后取第 ⌈(n+1)(1-alpha)⌉ 个。
+//	      那个 +1 不是凑数: 它让分位数在**有限样本**下仍然满足覆盖率下界
+//	      P(y ∈ C) >= 1-alpha, 少了它覆盖率会系统性偏低。
+//	关键不变量：返回的必须是**已排序**样本里的一个真实取值, 且索引要 clamp 到
+//	      n-1。idx 越界会 panic; 不做 clamp 的话, n 很小时 (n+1)(1-alpha) 会
+//	      直接越出切片末尾 —— 而样本少正是校准器刚启动时的常态。
+//	代价与边界：每次调用都要拷一份并 O(n log n) 排序 (n <= maxHist=500), 无缓存 ——
+//	      因为 AddScore 会不断让排序结果失效。样本为空时返回 0.15 这个保守默认
+//	      (相当于先验认为半宽 15 个百分点), 而不是 0 —— 返回 0 会宣称"完全确定"。
+//	设计权衡：用朴素排序而不是维护有序结构 (插入 O(n)), 因为读取频率远低于写入,
+//	      且 n 有上界。
 func (c *ConformalCalibrator) computeQuantile() float64 {
 	if len(c.scoreHist) == 0 {
 		return 0.15 // 保守默认
@@ -78,6 +93,7 @@ func (c *ConformalCalibrator) computeQuantile() float64 {
 	sort.Float64s(sorted)
 
 	idx := int(math.Ceil(float64(len(sorted)+1) * (1 - c.alpha)))
+	// clamp 上界: n 很小时 (n+1)(1-alpha) 会越出切片末尾, 而"样本少"正是校准器刚启动的常态。
 	if idx >= len(sorted) {
 		idx = len(sorted) - 1
 	}
@@ -247,6 +263,10 @@ func (bf *ByzantineFuser) GetTrust(agentID string) float64 {
 	return score
 }
 
+// simpleMerge 逐维求算术平均 (不截尾、不归一), 供样本不足时退回使用。
+//
+// 注意：分母固定为 len(preds) 而不是"出现了该 outcome 的预测者数" —— 某个 Agent 完全
+// 没提这个 outcome 时, 它按 0 计入平均, 而不是被跳过。这是"缺席即 0 分"的语义。
 func simpleMerge(preds []AgentPrediction) map[string]float64 {
 	result := make(map[string]float64)
 	for _, p := range preds {
@@ -261,6 +281,7 @@ func simpleMerge(preds []AgentPrediction) map[string]float64 {
 	return result
 }
 
+// normalize 就地按总和归一, 使 dist 成为概率分布; 总和 <= 0 时原样返回。
 func normalize(dist map[string]float64) {
 	sum := 0.0
 	for _, v := range dist {
@@ -339,6 +360,9 @@ func (br *BanditRouter) SelectAgents(k int) []string {
 	return result
 }
 
+// betaSample 从 Beta(alpha, beta) 抽一个样本, 用两个 Gamma 变量之比构造。
+//
+// 这是 Thompson Sampling 的采样核心: 每轮为每个 Agent 抽一次后验, 谁抽得大谁上场。
 func betaSample(alpha, beta float64) float64 {
 	x := gammaVariate(alpha)
 	y := gammaVariate(beta)
@@ -348,6 +372,19 @@ func betaSample(alpha, beta float64) float64 {
 	return x / (x + y)
 }
 
+// gammaVariate 用 Marsaglia-Tsang 挤压法从 Gamma(shape, 1) 抽一个样本。
+//
+// 算法解读：
+//
+//	原理：shape >= 1 时用挤压法 —— 从正态提议分布里抽 x, 变换成 d*v 后由两条接受
+//	      判据筛选; shape < 1 时先用 Boost 恒等式 Gamma(a) = Gamma(a+1) * U^(1/a)
+//	      升到 shape+1 再递归 (这是一次递归, 不会退化成长递归)。
+//	关键不变量：内层循环必须拒绝 v <= 0 的样本 (v = 1+c*x 可能为负, 而 v^3 与
+//	      log(v) 都要求 v > 0)。少了这个内层循环, 负数会一路流进 math.Log 变成 NaN。
+//	代价与边界：拒绝采样, 单次调用期望常数次迭代; 用全局 math/rand, 并发调用会
+//	      争用同一把锁, 且不可复现 (没有注入 *rand.Rand 的入口)。
+//	设计权衡：取标准实现而不是自己推公式 —— 挤压法的接受率与数值稳定性都经过检验,
+//	      手写近似会引入难以察觉的分布偏差, 而偏差直接表现为"路由选出的 Agent 不对"。
 func gammaVariate(shape float64) float64 {
 	if shape < 1 {
 		u := rand.Float64()
@@ -410,6 +447,18 @@ func (pm *PredictionMarket) Price(outcome string) float64 {
 	return pm.price(outcome)
 }
 
+// price 无锁版 LMSR 定价 (调用方须已持 pm.mu)。
+//
+// 算法解读：
+//
+//	原理：LMSR 的价格就是 softmax: p(outcome) = exp(q_i/b) / Σ exp(q_j/b)。它保证了
+//	      价格之和恒为 1, 于是"价格"可以直接读作"市场认为的概率"。
+//	关键不变量：指数必须先减去 max(q/b) 再求和 (log-sum-exp 技巧)。直接 exp(q/b)
+//	      在 q/b 较大时会溢出成 +Inf, 于是分子分母同时 Inf, 结果是 NaN —— 而 NaN
+//	      不会报错, 只会让整个市场价格变成一片 NaN。
+//	代价与边界：每次定价 O(结果数) 两次遍历; 结果数通常是个位数, 无需缓存。
+//	设计权衡：为了省一次遍历, maxQ 那轮用了 `if q/liquidity > maxQ` 而不是
+//	      math.Max —— 语义等价, 但少了函数调用开销。
 func (pm *PredictionMarket) price(outcome string) float64 {
 	logSumExp := 0.0
 	maxQ := -math.MaxFloat64
@@ -456,6 +505,10 @@ func (pm *PredictionMarket) Prices() map[string]float64 {
 	return result
 }
 
+// cost 返回把 outcome 的份额增加 deltaQ 所需的成本 (LMSR 成本函数之差)。
+//
+// 先加后减地"试探"而不是复制一份 shares 再算: 成本函数只看各维份额, 原地改完立刻
+// 还原是安全的, 且省一次 map 拷贝。调用方必须已持锁。
 func (pm *PredictionMarket) cost(outcome string, deltaQ float64) float64 {
 	before := pm.costFunction()
 	pm.shares[outcome] += deltaQ
@@ -464,6 +517,10 @@ func (pm *PredictionMarket) cost(outcome string, deltaQ float64) float64 {
 	return after - before
 }
 
+// costFunction 是 LMSR 的成本函数 C(q) = b·ln(Σ exp(q_j/b)), 同样用 log-sum-exp 防溢出。
+//
+// 注意：这里把 maxQ 提出来写成 b·(maxQ + ln Σ exp(q_j/b - maxQ)) —— 与 price 里
+// 减 maxQ 是同一个技巧, 只是提公因子后形式上多了一层括号, 数值上完全等价。
 func (pm *PredictionMarket) costFunction() float64 {
 	maxQ := -math.MaxFloat64
 	for _, q := range pm.shares {

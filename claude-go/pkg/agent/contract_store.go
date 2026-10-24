@@ -869,6 +869,7 @@ var (
 	lockMapMu sync.RWMutex
 )
 
+// LockInterface 为接口加互斥锁, 阻止其他 agent 改动它; 同一 agent 重复加锁是幂等的。
 // LockInterface locks an interface so other agents can't modify it.
 func (cs *ContractStore) LockInterface(name string, agentID string) error {
 	lockMapMu.Lock()
@@ -882,6 +883,7 @@ func (cs *ContractStore) LockInterface(name string, agentID string) error {
 	return nil
 }
 
+// UnlockInterface 释放接口锁, 且只有持锁者本人能解锁; 未加锁或他人来解锁都返回错误。
 // UnlockInterface unlocks an interface (only if LockedBy matches).
 func (cs *ContractStore) UnlockInterface(name string, agentID string) error {
 	lockMapMu.Lock()
@@ -899,6 +901,7 @@ func (cs *ContractStore) UnlockInterface(name string, agentID string) error {
 	return nil
 }
 
+// IsLocked 返回接口是否被锁, 以及持锁的 agent ID (未锁时为空串)。
 // IsLocked returns whether an interface is locked and by which agent.
 func (cs *ContractStore) IsLocked(name string) (bool, string) {
 	lockMapMu.RLock()
@@ -911,6 +914,27 @@ func (cs *ContractStore) IsLocked(name string) (bool, string) {
 	return true, state.lockedBy
 }
 
+// GlobalConsistencyScan 全量扫描: 每个 interface × 每个 struct 判定实现关系, 收集
+// missing_method / broken_signature / orphan_reference 三类不一致。
+//
+// 算法解读：
+//
+//	原理：三层嵌套遍历 —— 外层遍历所有包的 interface, 内层遍历所有包的 struct, 用
+//	      cs.implements 判定是否实现, 再逐方法比对参数与返回值的**个数**。
+//	关键不变量：判定"实现"必须走 cs.implements (结构化匹配) 而非名字相等; 且
+//	      properties 式的**确定性**同样重要 —— 这里虽未排序, 但输出顺序取决于 map
+//	      遍历序, 因此调用方不能依赖不一致项的顺序。
+//	代价与边界：O(包数² × 类型数²), 只在人工触发的审计路径上跑, 不在热路径; 比对只数
+//	      个数不比对类型, 故"参数个数相同但类型不同"会漏报 (cs.implements 里有 TODO)。
+//	设计权衡：不做类型级精确比对 —— 跨包类型名要 import 解析, 而那正是本扫描要避开的
+//	      重依赖; 宁可漏报也不引入解析器。
+//
+// 注意：下面 "Find implementors" 之后的 missing_method 与 broken_signature 两个分支
+// **不可达**。cs.implements 在"缺方法"或"参数/返回值个数不符"时就已经返回 false,
+// 于是 struct 会被 `continue` 跳过, 永远走不到那两个 append。也就是说这两类不一致
+// 目前一条都报不出来, 真正会产出的是末尾的 orphan_reference (接口零方法)。
+// 该处只记录, 未改代码。
+//
 // GlobalConsistencyScan scans all interfaces to find inconsistencies:
 //   - implementors that don't satisfy the current contract
 //   - missing methods in implementors

@@ -27,6 +27,10 @@ import (
 	"os"
 )
 
+// novelV2Workflow 返回 novel-v2 工作流定义 (纯静态声明)。
+//
+// Rounds 刻意留 0: 章节的对抗轮数不写死在定义里, 由 executeNovelWriting 里的
+// AdaptiveTerminator 按每章评分动态决定 (1~3 轮)。
 func novelV2Workflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "novel-v2",
@@ -129,6 +133,8 @@ func (we *WorkflowExecutor) executeNovelWriting(ctx context.Context, wf *Workflo
 	}
 
 	// 解析章节数
+	// 钳制到 [5,30]: 下界防大纲解析失败 (回退值可能偏小), 上界防一次运行烧掉
+	// 上百章的 LLM 预算 —— 两个边界都是成本护栏, 不是业务规则。
 	totalChapters := parseChapterCount(prevResults["outline-design"])
 	if totalChapters < 1 {
 		totalChapters = 5
@@ -145,6 +151,8 @@ func (we *WorkflowExecutor) executeNovelWriting(ctx context.Context, wf *Workflo
 	chapterStartIdx := 0
 
 	// 检查已恢复的章节
+	// 只认**连续**前缀 (chapter-1, chapter-2, ... 一旦断档就停): 后一章的写作依赖
+	// 前面各章的全文, 跳着恢复会让滚动上下文出现空洞。
 	for i := 1; i <= totalChapters; i++ {
 		key := fmt.Sprintf("chapter-%d", i)
 		if content, ok := prevResults[key]; ok {
@@ -219,6 +227,8 @@ func (we *WorkflowExecutor) executeNovelWriting(ctx context.Context, wf *Workflo
 			}
 
 			decision := terminator.ShouldTerminate(round, score)
+			// 终止器回传的 BestOutput 优先级高于本地的 bestChapter: 它拿的是
+			// 全程各轮里评分最高的那一版, 而本地变量只记得"见过的最好版本"。
 			if decision.BestOutput != "" {
 				bestChapter = decision.BestOutput
 			}
@@ -228,6 +238,8 @@ func (we *WorkflowExecutor) executeNovelWriting(ctx context.Context, wf *Workflo
 				break
 			}
 
+			// 反馈通过 prevResults 传给下一轮 (buildChapterWritePrompt 读 chapter-feedback),
+			// 而不是走函数参数 —— 与检查点恢复共用同一条数据通道。
 			prevResults["chapter-feedback"] = score.Feedback
 			notify(fmt.Sprintf("  🔄 第 %d 章第 %d 轮: 均分%.1f, 继续优化", chapterNum, round, score.AvgScore()))
 		}
@@ -329,6 +341,12 @@ func (we *WorkflowExecutor) runNovelStage(ctx context.Context, stage StageDef, o
 
 // ── 辅助函数 ──
 
+// parseChapterCount 从大纲输出里推断总章数, 依次尝试 JSON 的 chapters/outline 数组,
+// 再回退到数 "第"/"chapter" 出现次数, 都不可用时给 5。
+//
+// 注意：回退分支统计的是**子串出现次数**而不是"第N章"的独立编号, 因此大纲里
+// 每提到一次"第X章"(含交叉引用) 都会被计进去, 章数会被系统性高估;
+// 调用方 (executeNovelWriting) 另有 [1,30] 的钳制兜底。
 func parseChapterCount(outlineOutput string) int {
 	lower := strings.ToLower(outlineOutput)
 
@@ -363,6 +381,11 @@ func parseChapterCount(outlineOutput string) int {
 	return 5
 }
 
+// buildNovelContext 组装写第 currentChapter 章时的上下文: 全局设定 (蓝图/世界观/角色/大纲)
+// 各按固定上限摘要, 已完成章节则**近 2 章给全文、更早的给摘要**。
+//
+// 这是 RecurrentGPT 式的滚动上下文: 窗口外的内容不丢弃而是降级成摘要,
+// 让长篇小说在第 30 章时上下文仍装得下。totalChapters 参数当前未被使用。
 func buildNovelContext(prevResults map[string]string, chapters []string, currentChapter, totalChapters int) string {
 	var ctx strings.Builder
 
@@ -414,6 +437,10 @@ func buildNovelContext(prevResults map[string]string, chapters []string, current
 	return ctx.String()
 }
 
+// buildChapterWritePrompt 拼写章节正文的提示词: 创作需求 + 滚动上下文 + 10 条写作要求。
+//
+// round > 1 时追加"这是修改稿"的提示 —— 让模型在上一版基础上改而不是重写,
+// 否则每轮对抗都会得到一篇全新的章节, 评分不再可比。
 func buildChapterWritePrompt(objective string, prevResults map[string]string, chapterContext string, chapterNum, totalChapters, round int) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf(`你是一位才华横溢的小说家。现在写第 %d 章 (共 %d 章)。
@@ -452,6 +479,11 @@ func buildChapterWritePrompt(objective string, prevResults map[string]string, ch
 	return b.String()
 }
 
+// buildChapterReviewPrompt 拼编辑审查提示词: 注入角色设定与大纲作对照基准, 要求输出
+// 七个维度 (1-10 分) + pass + feedback 的严格 JSON。
+//
+// 把设定卡与大纲一并喂给审查方是刻意的: 否则"角色一致性""情节对齐"这两个维度
+// 无从判起 —— 审查方看不到它该对齐的目标。
 func buildChapterReviewPrompt(objective string, prevResults map[string]string, chapterContent string, chapterNum int) string {
 	var b strings.Builder
 
@@ -495,6 +527,11 @@ func buildChapterReviewPrompt(objective string, prevResults map[string]string, c
 	return b.String()
 }
 
+// buildBookAssemblyPrompt 拼全书整合提示词: 世界观/角色设定 + 各章摘要 (每章 800 字上限) +
+// 七项审阅任务 (含伏笔回收核对)。
+//
+// 各章都降级成摘要而不是塞全文: 整本书的正文远超上下文窗口, 而"伏笔有没有回收"
+// 这类全局判断只需要情节骨架。
 func buildBookAssemblyPrompt(objective string, prevResults map[string]string, chapters []string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf(`你是资深文学编辑, 负责全书最终整合审阅。
@@ -555,6 +592,19 @@ func buildBookAssemblyPrompt(objective string, prevResults map[string]string, ch
 }
 
 // parseNovelScore 从审查 JSON 中解析小说评分
+//
+// 算法解读：
+//
+//	原理：把编辑的七维评分按固定权重折成四个通用维度 (Correctness/Completeness/
+//	      Security/CodeQuality), 再取四者均值当单一分数喂给 AdaptiveTerminator ——
+//	      复用现成的终止器, 不为小说另写一套收敛判据。
+//	关键不变量：权重之和恰为 0.9, 除 0.9 才归一化到 10 分制; 改任一权重却忘了
+//	      改除数, 分数会整体偏移 (偏大时阈值可能永远达不到)。
+//	代价与边界：解析失败 (模型没按 JSON 输出) 时**不报错**, 回落成四维各 6 分,
+//	      pass 用子串匹配 `"pass": true` 推断 —— 这条分支下的分数是伪造的,
+//	      但仍会被当作真实评分参与"最佳版本"的比较与终止判据。
+//	设计权衡：四维填同一个均值而不是分别映射 —— 小说没有"安全性"这种维度,
+//	      硬映射只会造噪音; 代价是 EvalScore 的维度差异在小说路径上失去意义。
 func parseNovelScore(output string) EvalScore {
 	type novelReview struct {
 		NarrativeQuality     float64 `json:"narrative_quality"`

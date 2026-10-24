@@ -43,6 +43,7 @@ type PromptTooLongError struct {
 	Message string
 }
 
+// Error 实现 error 接口, 直接返回上游的原始消息。
 func (e *PromptTooLongError) Error() string { return e.Message }
 
 // OverloadedError 标识 API 返回 overloaded 错误 (529)。
@@ -51,6 +52,7 @@ type OverloadedError struct {
 	Message string
 }
 
+// Error 实现 error 接口, 直接返回上游的原始消息。
 func (e *OverloadedError) Error() string { return e.Message }
 
 // LLMEventFunc 回调: LLM 调用发生重试/熔断等事件时通知外部 (如飞书)。
@@ -671,6 +673,8 @@ func buildSystemParam(systemPrompt []string, cacheEnabled bool) interface{} {
 	}
 }
 
+// shouldEnablePromptCache 决定本次请求是否启用 prompt cache: 曾因错误被禁用则恒 false;
+// "on"/"off" 显式生效; auto/空 只在 Anthropic 原生端点启用。
 func (c *Client) shouldEnablePromptCache() bool {
 	if c.promptCacheDisabledByError {
 		return false
@@ -751,9 +755,11 @@ func (c *Client) retryDelay(attempt int, statusCode int, err error) time.Duratio
 	if base <= 0 {
 		base = 3 * time.Second
 	}
+	// 429/503 是"服务器请你慢点", 基线拉长 3 倍 —— 与普通 5xx 区分开。
 	if statusCode == 429 || statusCode == 503 {
 		base = base * 3
 	}
+	// 超时类错误有自己的基线: 网络慢不等于服务端限流, 用更长的基数避免连环超时。
 	if err != nil && isDeadlineError(err) {
 		base = c.DeadlineRetryBase
 		if base <= 0 {
@@ -765,13 +771,16 @@ func (c *Client) retryDelay(attempt int, statusCode int, err error) time.Duratio
 	if maxD <= 0 {
 		maxD = 60 * time.Second
 	}
+	// 封顶: 长跑时 2^attempt 会迅速涨到分钟级, 不封顶等于把重试变成"放弃"。
 	if delay > maxD {
 		delay = maxD
 	}
+	// ±25% 抖动: 让多个客户端别在同一时刻齐步重试, 否则退避反而制造尖峰。
 	jitter := time.Duration(float64(delay) * (0.75 + rand.Float64()*0.5))
 	return jitter
 }
 
+// isDeadlineError 用子串匹配判断错误是否为超时/截止时间类 (deadline / timeout)。
 func isDeadlineError(err error) bool {
 	if err == nil {
 		return false
@@ -913,11 +922,14 @@ func classifyErrorKind(status int, errStr string) string {
 	return ""
 }
 
+// truncateErr 按 rune 截断错误文本 (错误信息里常含中文/上游多字节内容, 按字节截会劈字)。
 func truncateErr(s string, n int) string {
 	// 错误信息里常含中文/上游返回的多字节内容, 按 rune 截避免劈字。
 	return textutil.Truncate(s, n, "…")
 }
 
+// isCircuitOpen 判断熔断器当前是否应拦截请求: 未开则放行; 已开但冷却窗口已过则就地
+// 关闭熔断并清零失败计数 (允许试探), 返回 false; 仍在冷却窗口内返回 true。
 func (c *Client) isCircuitOpen() bool {
 	c.cbMu.Lock()
 	defer c.cbMu.Unlock()
@@ -933,6 +945,7 @@ func (c *Client) isCircuitOpen() bool {
 	return true
 }
 
+// recordSuccess 记一次成功: 清零连续失败计数并关闭熔断器。
 func (c *Client) recordSuccess() {
 	c.cbMu.Lock()
 	defer c.cbMu.Unlock()
@@ -2149,6 +2162,8 @@ const simpleCompleteMaxTokens = 65536
 // 而截断的现场只会留下一句 stop=max_tokens, 没人会想到是两个常量不一样。
 const SimpleCompleteMaxTokens = simpleCompleteMaxTokens
 
+// SimpleComplete 发起一次最简补全 (system + 单条 user 文本), 只回拼文本块 ——
+// 供 advisor/裁判这类内部工具复用, 不挂工具也不做流式。
 func (c *Client) SimpleComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
 	messages := []types.APIMessage{{
 		Role:    "user",
@@ -2208,6 +2223,7 @@ func (c *Client) CompleteDiag(ctx context.Context, systemPrompt, userPrompt stri
 	return text, diag, nil
 }
 
+// mustMarshalString 把字符串序列化成 JSON RawMessage (json.Marshal 对 string 不会失败, 故忽略 error)。
 func mustMarshalString(s string) json.RawMessage {
 	data, _ := json.Marshal(s)
 	return data

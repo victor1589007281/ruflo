@@ -44,14 +44,18 @@ type grepInput struct {
 
 type GrepTool struct{}
 
+// NewGrepTool 构造 Grep 工具 (无状态, 可直接复用同一个实例)。
 func NewGrepTool() *GrepTool { return &GrepTool{} }
 
+// Name 返回工具名 "Grep"。
 func (t *GrepTool) Name() string { return GrepToolName }
 
+// Description 返回给模型看的工具说明。
 func (t *GrepTool) Description() string {
 	return `A powerful search tool built on ripgrep. Supports full regex syntax.`
 }
 
+// InputSchema 返回入参 schema: 只有 pattern 必填, 其余为过滤/分页/上下文开关。
 func (t *GrepTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -73,12 +77,18 @@ func (t *GrepTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true: 只调 rg 读文件, 不产生任何写入。
 func (t *GrepTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 恒为 true: 无共享可变状态, 多个 Grep 可并发执行。
 func (t *GrepTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 一律放行 —— 读操作不设权限门槛, 由上层策略决定是否收紧。
 func (t *GrepTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// grepEffectiveOffset 把可选的 offset 归一成非负整数; nil 或负数一律当 0。
 func grepEffectiveOffset(in *int) int {
 	if in == nil || *in < 0 {
 		return 0
@@ -86,6 +96,19 @@ func grepEffectiveOffset(in *int) int {
 	return *in
 }
 
+// grepApplyLineLimit 对 rg 的原始输出做「先跳过 offset 行、再截断到 head 行」的分页, 并回报是否发生截断。
+//
+// 算法解读：
+//
+//	原理：三态语义的 head_limit —— nil 用默认值 250, 0 表示不限量, 其余取字面值;
+//	      顺序固定为「先 offset 后 limit」, 与常见分页直觉一致 (offset 是跳过量而非起止下标)。
+//	关键不变量：offset 必须被夹到 [0, len(lines)] —— 超出总行数时取空集而不是越界切片;
+//	      另外「不限量」分支不补尾换行、限量分支在非空时补 "\n", 两条路径的输出格式
+//	      因此不同 (前者保持 rg 原样, 后者规整为以换行结尾)。
+//	代价与边界：全量输出先整块读进内存再按行切分, 大结果集下内存占用与结果量同阶;
+//	      截断只发生在尾部, 被砍掉的量不回报给调用方 (只有 truncated 布尔)。
+//	设计权衡：把分页放在工具侧而不是让模型自己翻页, 一次调用就能拿到受控大小的结果;
+//	      代价是模型看不到「还有多少没返回」, 需要自己按 offset 续取。
 func grepApplyLineLimit(s string, head *int, offset int) (out string, truncated bool) {
 	if s == "" {
 		return "", false
@@ -96,6 +119,7 @@ func grepApplyLineLimit(s string, head *int, offset int) (out string, truncated 
 	}
 	off := offset
 	if off > len(lines) {
+		// 只夹上界: 负 offset 已由调用方 grepEffectiveOffset 归一成 0, 这里再夹会掩盖调用方错误。
 		off = len(lines)
 	}
 	rest := lines[off:]

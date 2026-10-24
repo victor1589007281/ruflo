@@ -23,11 +23,15 @@ type teamQueryInput struct {
 	TeamName string `json:"team_name,omitempty"` // get/report 时必填
 }
 
+// NewTeamQueryTool 构造团队查询工具 (mgr 为 nil 时仍注册, 调用时如实报错)。
 func NewTeamQueryTool(mgr *agent.ProductionTeamManager) *TeamQueryTool {
 	return &TeamQueryTool{teamMgr: mgr}
 }
 
+// Name 返回工具名 TeamQuery。
 func (t *TeamQueryTool) Name() string { return "TeamQuery" }
+
+// Description 返回给模型看的说明: 三个 action 的语义 + "用户提到团队名时用它"的触发条件。
 func (t *TeamQueryTool) Description() string {
 	return `查询 Agent Teams 的状态和报告。` +
 		`action="list" 列出所有团队及状态; ` +
@@ -36,6 +40,7 @@ func (t *TeamQueryTool) Description() string {
 		`当用户提到某个团队名称时，用此工具查找。`
 }
 
+// InputSchema 返回输入 schema: action 必填 (list/get/report), team_name 仅 get/report 需要。
 func (t *TeamQueryTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -47,12 +52,24 @@ func (t *TeamQueryTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 恒为 true: 三个 action 都只读团队状态与报告文件。
 func (t *TeamQueryTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 恒为 true: 无共享可变状态, 可与其他工具调用并发。
 func (t *TeamQueryTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 返回 nil: 不做工具级权限判定 (只读查询)。
 func (t *TeamQueryTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
 
+// Call 执行团队查询: list 列全部团队, get 取团队详情, report 取完整执行报告。
+//
+// get/report 在精确名查不到时会退化成**子串模糊匹配** —— 用户往往只记得团队名的一部分,
+// 直接报"未找到"会逼模型去猜; 匹配到多个时把候选列出来让模型自己选。
+//
+// 注意：report 分支的超长截断用的是**字节切片** (content[:8000]), 中文报告正好
+// 切在多字节字符中间时会产出非法 UTF-8; 同文件的 truncateStr 是 rune 安全的。
 func (t *TeamQueryTool) Call(_ context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in teamQueryInput
 	if err := json.Unmarshal(input, &in); err != nil {
@@ -160,6 +177,7 @@ func (t *TeamQueryTool) Call(_ context.Context, input json.RawMessage, _ *tool.T
 	}
 }
 
+// truncateStr 按字符数截断并补 "..." (委托给 textutil, 保证多字节字符不被切断)。
 func truncateStr(s string, maxLen int) string {
 	return textutil.Truncate(s, maxLen, "...")
 }

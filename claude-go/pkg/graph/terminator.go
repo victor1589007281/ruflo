@@ -245,6 +245,23 @@ func newAdaptiveTerminator(spec TerminatorSpec) (LoopTerminator, error) {
 	}, nil
 }
 
+// Decide 按五个判据依次裁决本轮是否终止 (或转为策略转换), 与 pkg/agent 的 AdaptiveTerminator 同口径。
+//
+// 算法解读：
+//
+//	原理：按优先级短路求值 —— ① 分数达标立即停; ② 未达最小轮数继续; ③ 轮次耗尽停并给回滚;
+//	      ④ 连续退化超阈值停并给回滚; ⑤ 收敛/震荡时先消耗策略转换额度 (不停, 回灌反馈),
+//	      额度用尽才停; 都不命中则继续。
+//	关键不变量：判据顺序不可交换 —— ①在②之前, 所以「第一轮就达标」会立刻停而不是先跑满
+//	      min_rounds; ③必须自己判一次轮次耗尽, 否则引擎收尾时最后一轮的回滚建议没机会给出,
+//	      ⑤ 这路信号就只在退化时才生效了。退化计数是**状态**而不是从分数序列算出来的:
+//	      ④的三个分支 (超阈 +1 / 回升清零 / 小幅下降保持不变) 意味着同一串分数在不同
+//	      到达顺序下会得到不同的计数, 因此不能靠重放分数历史复现。
+//	代价与边界：roundNo 取 len(lc.Rounds) (1 起), 与 cur.Iteration 不是同一个量纲 ——
+//	      ②用 roundNo 而 ③用 cur.Iteration, 二者只有在每轮都恰好 push 一次时才对得上。
+//	      另外退化的「小幅下降」既不计数也不清零, 是刻意的抗噪设计。
+//	设计权衡：把策略转换做成「不终止」的第五路信号, 让震荡期有一次换打法的机会;
+//	      代价是 maxShifts 用尽后同一判据立刻翻转为终止, 行为在边界上不连续。
 func (t *adaptiveTerminator) Decide(lc LoopContext) TerminateDecision {
 	cur := lc.Current()
 	roundNo := len(lc.Rounds) // 1 起, 与 AdaptiveTerminator 的 round 同口径

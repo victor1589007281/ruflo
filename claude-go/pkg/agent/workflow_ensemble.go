@@ -73,6 +73,7 @@ func ensembleFanOutConfig() swarm_intel.FanOutConfig {
 
 // ================= graph-extract-swarm =================
 
+// graphExtractSwarmWorkflow 返回"合议图谱抽取"工作流定义 (N 路并行抽取 + 投票融合)。
 func graphExtractSwarmWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "graph-extract-swarm",
@@ -118,8 +119,24 @@ type exDoc struct {
 	Edges []exEdge `json:"edges"`
 }
 
+// normKey 归一化投票键: 去首尾空白 + 转小写, 使 " 张三 " 与 "张三" 计到同一票。
 func normKey(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
+// executeEnsembleExtract 并行跑 N 路差异化视角抽取, 投票融合成一份图谱。
+//
+// 算法解读：
+//
+//	原理：把"一次抽取"升级成"N 次视角不同的抽取 + 投票"。三路视角各有侧重 (人物关系 /
+//	      事件因果 / 伏笔与设定), 但每路都做**全量**抽取 —— 差异只在 system prompt 的
+//	      那句引导上, 于是同一份原文在三路下暴露不同的盲区, 交集即高置信。
+//	关键不变量：confidence 的分母是**有效路数**(docs), 不是总路数(extractLenses)。
+//	      若按总路数算, 一路超时就会把所有节点的置信度整体压低, 而"少了一路"与
+//	      "三路都不认"是两件完全不同的事 —— 前者该看诊断日志, 后者才是低置信。
+//	代价与边界：并发 4、单路 6min、总 7.5min (见 ensembleFanOutConfig 的论证);
+//	      三路全失败时直接报错返回, 不做"退化成单路"的静默降级。
+//	设计权衡：复用 swarm_intel 的 FanOutCollect/ParseJSON 而不是自己起 goroutine ——
+//	      扇出的超时、并发上限、健壮解析只该有一处实现。图引擎开关 (graphEngineEnabled)
+//	      为真且 team 非 nil 时改走图路径, 两条路径产出的 JSON schema 完全相同。
 func (we *WorkflowExecutor) executeEnsembleExtract(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	if we.llm == nil {
 		return nil, fmt.Errorf("graph-extract-swarm 需要 LLMClient")
@@ -191,6 +208,18 @@ func (we *WorkflowExecutor) executeEnsembleExtract(ctx context.Context, wf *Work
 }
 
 // fuseExtractions 按同名节点 / 同 (src,dst,type) 边投票融合；confidence = 命中路数 / 总有效路数。
+//
+// 算法解读：
+//
+//	原理：把 N 份独立抽取当成 N 张选票。节点按归一化名字归并, 边按
+//	      (源, 目标, 类型) 三元组归并, 票数即命中路数。
+//	关键不变量：**同一路内部必须先按 key 去重再计票** (seen 表)。少了它, 一份自己
+//	      重复了 5 次的抽取会被算成 5 票, confidence 直接顶到 1.0 —— 而它只是一路
+//	      的意见。这是"投票"与"计数"的分界, 也是这个函数最容易写错的一处。
+//	代价与边界：O(总节点数 + 总边数), 全内存; 名字归一化只做去空白+小写, 不做
+//	      别名对齐 (别名只在同一 key 上做并集), 故"同一实体两种写法"仍会算成两个节点。
+//	设计权衡：confidence 用命中率而非加权平均 —— 命中率是可直接解释的量, 且与
+//	      "N 路里几路认它"一一对应, 下游按阈值过滤时不必再理解权重。
 func fuseExtractions(docs []exDoc) exDoc {
 	n := len(docs)
 	type nodeAgg struct {
@@ -286,6 +315,7 @@ func fuseExtractions(docs []exDoc) exDoc {
 	return out
 }
 
+// uniqStrings 去重并丢弃空白项, 保持首次出现的顺序。
 func uniqStrings(in []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -302,6 +332,7 @@ func uniqStrings(in []string) []string {
 
 // ================= review-panel =================
 
+// reviewPanelWorkflow 返回"合议评审团"工作流定义 (N 位差异化人格评审 + 截尾均值融合)。
 func reviewPanelWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "review-panel",
@@ -337,6 +368,12 @@ type rvDoc struct {
 	Annotations []rvAnn `json:"annotations"`
 }
 
+// executeReviewPanel 并行跑 N 位差异化人格评审, 每维截尾均值融合并标注分歧。
+//
+// 与 executeEnsembleExtract 同构, 三处差异是有意的: ①走 SimpleComplete 而非 diag
+// 路径 (review_panel 历来如此, 见 completeWithDiag 的 want 参数); ②用
+// DefaultFanOutConfig 而不是放宽版超时 (评审比抽取快得多); ③融合结果额外入
+// RewardBus —— 截尾均值比单次 LLM 打分更稳, 适合当学习信号。
 func (we *WorkflowExecutor) executeReviewPanel(ctx context.Context, wf *WorkflowDef, objective string, team *ProductionTeam) ([]StageResult, error) {
 	if we.llm == nil {
 		return nil, fmt.Errorf("review-panel 需要 LLMClient")
@@ -375,6 +412,8 @@ func (we *WorkflowExecutor) executeReviewPanel(ctx context.Context, wf *Workflow
 		}
 		pr := swarm_intel.ParseJSON[rvDoc](r.Value)
 		diag = append(diag, fmt.Sprintf("%d: len=%d parseOK=%v dims=%d overall=%.0f", id, len(r.Value), pr.OK, len(pr.Value.Dimensions), pr.Value.Overall))
+		// 解析成功但内容全空 (dims 与 overall 都是零) 也判为无效路: 它进不了融合,
+		// 却会把置信度的分母撑大 —— 与 executeEnsembleExtract 同一个判据。
 		if pr.OK && (len(pr.Value.Dimensions) > 0 || pr.Value.Overall > 0) {
 			docs = append(docs, pr.Value)
 		}
@@ -394,6 +433,20 @@ func (we *WorkflowExecutor) executeReviewPanel(ctx context.Context, wf *Workflow
 }
 
 // fuseReviews 每维用 ByzantineFuser 截尾均值(抗单个异常打分)，共识度 = 1 - 平均分歧；批注取并集去重。
+//
+// 算法解读：
+//
+//	原理：三个统计量各司其职 —— 维度分用**截尾均值**(剔掉最高最低各 trimRatio 后取均),
+//	      overall 用**中位数**(比均值更抗单个离群), 共识度用各维极差的均值反过来度量
+//	      (1 - 平均极差/100)。
+//	关键不变量：维度分必须走 TrimmedFuseRaw (不归一)。各维是彼此独立的 0-100 评分,
+//	      跨维归一会把量纲毁掉, 使 dimensions 与同一份 JSON 里的 overall 不同量纲 ——
+//	      详见 ByzantineFuser.TrimmedFuseRaw 的注释。
+//	代价与边界：需要 N>=3 才真的截尾 (trimmedFuseMinSamples), N<3 时退回普通均值且
+//	      不归一; 批注上限 20 条, 超出即停 —— 截断点固定在遍历中途, 故哪些批注被留下
+//	      取决于 docs 顺序。
+//	设计权衡：极差 >= 25 才在 summary 前挂"[评审分歧大]"前缀, 25 是经验阈值 (四分之一
+//	      量程), 目的是让"合议"不被读成"一致同意"。
 func fuseReviews(docs []rvDoc) rvDoc {
 	// 每位评审 → AgentPrediction(Predictions = {dim: score/100})，喂 ByzantineFuser.TrimmedFuse
 	bf := swarm_intel.NewByzantineFuser(0.34) // trimRatio 使 N≥3 时至少剔 1
@@ -495,6 +548,7 @@ func fuseReviews(docs []rvDoc) rvDoc {
 	return rvDoc{Overall: overall, Consensus: consensus, Summary: summary, Dimensions: dims, Annotations: anns}
 }
 
+// clamp01 把 x 夹到 [0,1]; NaN 会原样穿过 (两个比较都为假)。
 func clamp01(x float64) float64 {
 	if x < 0 {
 		return 0
@@ -504,6 +558,7 @@ func clamp01(x float64) float64 {
 	}
 	return x
 }
+// maxF 返回最大值; 空切片返回 0 (不是 -Inf), 便于直接参与算术。
 func maxF(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0
@@ -516,6 +571,7 @@ func maxF(xs []float64) float64 {
 	}
 	return m
 }
+// minF 返回最小值; 空切片返回 0 (与 maxF 对称)。
 func minF(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0
@@ -528,6 +584,9 @@ func minF(xs []float64) float64 {
 	}
 	return m
 }
+// medianF 返回中位数 (偶数个取中间两个的均值); 空切片返回 0。
+//
+// 先拷贝再排序: 调用方传进来的切片不能被就地打乱。
 func medianF(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0

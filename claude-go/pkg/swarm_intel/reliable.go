@@ -29,6 +29,7 @@ type ContextCompressor struct {
 	MaxListItems    int // 列表型字段最大条数 (默认 8)
 }
 
+// DefaultContextCompressor 返回默认压缩参数: 总 6000 字符 / 单字段 500 / 历史 3 条 / 列表 8 条。
 func DefaultContextCompressor() *ContextCompressor {
 	return &ContextCompressor{
 		MaxPromptChars:  6000,
@@ -138,6 +139,10 @@ func (cc *ContextCompressor) CompressDebateView(predictions []AgentPrediction) s
 
 // BuildBudgetedPrompt 按优先级分配 token 预算构建 prompt。
 // parts 按 key 排序, 越靠前优先级越高, 预算耗尽后截断。
+//
+// 注意: 实现里 fields 是 **map**, 遍历顺序随机, 所以"越靠前优先级越高"实际不成立 ——
+// 预算按随机顺序先到先得, 同一份输入两次调用的截断结果可能不同 (每字段预算还取
+// remaining/2, 先处理的字段会吃掉更多剩余)。需要确定性就得把 fields 换成有序切片。
 func (cc *ContextCompressor) BuildBudgetedPrompt(template string, fields map[string]string) string {
 	result := template
 	totalBudget := cc.MaxPromptChars
@@ -166,6 +171,7 @@ func (cc *ContextCompressor) BuildBudgetedPrompt(template string, fields map[str
 	return result
 }
 
+// formatProbMap 把概率分布渲染成 "类:百分比" 的空白分隔串 (顺序随 map 遍历, 不稳定)。
 func formatProbMap(m map[string]float64) string {
 	var parts []string
 	for k, v := range m {

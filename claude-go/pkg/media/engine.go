@@ -409,6 +409,7 @@ func HasFFmpeg() bool {
 	return err == nil
 }
 
+// fileSize 返回文件字节数; Stat 失败时返回 0 (调用方按"未知大小"处理)。
 func fileSize(path string) int64 {
 	info, _ := os.Stat(path)
 	if info != nil {
@@ -417,6 +418,11 @@ func fileSize(path string) int64 {
 	return 0
 }
 
+// splitSlides 从 HTML 里切出各页幻灯片。
+//
+// 两级回退: 先按 <section> 切 (多数模板的写法), 切不出**多于一段**时再按 class 含
+// "slide" 的 <div> 切; 两级都失败返回 nil —— 由调用方决定是整页当一页还是报错。
+// 注意：第二级用非贪婪 .*? 匹配 div, 嵌套 div 会被提前截断 (HTML 结构超出正则能力)。
 func splitSlides(html string) []string {
 	sectionRe := regexp.MustCompile(`(?si)<section[^>]*>(.*?)</section>`)
 	matches := sectionRe.FindAllStringSubmatch(html, -1)
@@ -447,6 +453,9 @@ func splitSlides(html string) []string {
 	return nil
 }
 
+// wrapSlideHTML 把单页内容包成固定 1920x1080 视口的完整 HTML (供无头浏览器截图)。
+//
+// 注意：num/total 只出现在签名里, 模板串中并未使用 —— 页码/总数目前不会渲染进页面。
 func wrapSlideHTML(content string, num, total int) string {
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html><head>

@@ -34,8 +34,11 @@ func NewJSONRepairHook(repair *JSONRepair, metrics *EngineMetrics) *JSONRepairHo
 	return &JSONRepairHook{repair: repair, metrics: metrics}
 }
 
+// Name 返回 hook 名 "json_repair"。
 func (h *JSONRepairHook) Name() string                { return "json_repair" }
+// Priority 返回 70 —— 在输入级死循环检测(80)之前, 先修好 JSON 再判重。
 func (h *JSONRepairHook) Priority() int               { return 70 }
+// Phases 声明本 hook 只挂在 PhasePreToolUse。
 func (h *JSONRepairHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreToolUse}
 }
@@ -88,8 +91,11 @@ func NewLoopDetectorInputHook(detector *LoopDetector, metrics *EngineMetrics) *L
 	return &LoopDetectorInputHook{detector: detector, metrics: metrics}
 }
 
+// Name 返回 hook 名 "loop_detector_input"。
 func (h *LoopDetectorInputHook) Name() string                { return "loop_detector_input" }
+// Priority 返回 80。
 func (h *LoopDetectorInputHook) Priority() int               { return 80 }
+// Phases 声明本 hook 只挂在 PhasePreToolUse。
 func (h *LoopDetectorInputHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreToolUse}
 }
@@ -163,8 +169,11 @@ func NewLoopDetectorResultHook(detector *LoopDetector, metrics *EngineMetrics) *
 	return &LoopDetectorResultHook{detector: detector, metrics: metrics}
 }
 
+// Name 返回 hook 名 "loop_detector_result"。
 func (h *LoopDetectorResultHook) Name() string                { return "loop_detector_result" }
+// Priority 返回 90。
 func (h *LoopDetectorResultHook) Priority() int               { return 90 }
+// Phases 声明本 hook 只挂在 PhasePostToolUse。
 func (h *LoopDetectorResultHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePostToolUse}
 }
@@ -233,7 +242,9 @@ func NewToolGateHook(disabled, allowed map[string]bool) *ToolGateHook {
 	return &ToolGateHook{disabled: disabled, allowed: allowed, hasAllow: allowed != nil}
 }
 
+// blocked 判断工具是否被拦截: 命中黑名单, 或白名单已设置且不含它 (黑名单先判, 同时命中时以黑名单为准)。
 func (h *ToolGateHook) blocked(name string) bool {
+	// 黑名单先判: 同时命中黑白名单时以黑名单为准。
 	if h.disabled != nil && h.disabled[name] {
 		return true
 	}
@@ -243,8 +254,11 @@ func (h *ToolGateHook) blocked(name string) bool {
 	return false
 }
 
+// Name 返回 hook 名 "tool_gate"。
 func (h *ToolGateHook) Name() string  { return "tool_gate" }
+// Priority 返回 150 —— 排在 JSON 修复(70)与输入级死循环检测(80)之后, 拦的是最终要执行的那批工具。
 func (h *ToolGateHook) Priority() int { return 150 }
+// Phases 声明本 hook 只挂在 PhasePreToolUse。
 func (h *ToolGateHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreToolUse}
 }
@@ -310,8 +324,11 @@ func NewStopSignalHook(detector *StopSignalDetector, metrics *EngineMetrics) *St
 	return &StopSignalHook{detector: detector, metrics: metrics}
 }
 
+// Name 返回 hook 名 "stop_signal"。
 func (h *StopSignalHook) Name() string                { return "stop_signal" }
+// Priority 返回 100。
 func (h *StopSignalHook) Priority() int               { return 100 }
+// Phases 声明本 hook 只挂在 PhasePostToolUse。
 func (h *StopSignalHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePostToolUse}
 }
@@ -410,8 +427,11 @@ func NewToolResultLevelHook(config *ToolResultLevelConfig, metrics *EngineMetric
 	return &ToolResultLevelHook{config: config, metrics: metrics}
 }
 
+// Name 返回 hook 名 "toolresult_level"。
 func (h *ToolResultLevelHook) Name() string                { return "toolresult_level" }
+// Priority 返回 38 —— 在 MicroCompact(20)/BudgetDegrade(30) 之后、MessageFilter(40) 之前。
 func (h *ToolResultLevelHook) Priority() int               { return 38 }
+// Phases 声明本 hook 只挂在 PhasePreRequest。
 func (h *ToolResultLevelHook) Phases() []InternalHookPhase {
 	return []InternalHookPhase{PhasePreRequest}
 }
@@ -501,6 +521,7 @@ func (h *ToolResultLevelHook) Execute(ctx *HookContext) (*HookResult, error) {
 	return &HookResult{Messages: messages}, nil
 }
 
+// determineLevel 按轮次年龄把消息分到 Level0~3 四档。
 func (h *ToolResultLevelHook) determineLevel(round int) ToolResultLevel {
 	if round < h.config.Level0KeepRounds {
 		return Level0
@@ -514,6 +535,7 @@ func (h *ToolResultLevelHook) determineLevel(round int) ToolResultLevel {
 	return Level3
 }
 
+// degradeBlock 按等级分派到对应的降级实现; Level0 原样返回。
 func (h *ToolResultLevelHook) degradeBlock(b types.ContentBlock, level ToolResultLevel) *types.ContentBlock {
 	switch level {
 	case Level0:
@@ -528,6 +550,7 @@ func (h *ToolResultLevelHook) degradeBlock(b types.ContentBlock, level ToolResul
 	return &b
 }
 
+// degradeLevel1 截断到 Level1MaxChars; IsError 且 PreserveErrors 为真时原样保留。
 func (h *ToolResultLevelHook) degradeLevel1(b types.ContentBlock) *types.ContentBlock {
 	if h.config.PreserveErrors && b.IsError {
 		return &b
@@ -543,6 +566,7 @@ func (h *ToolResultLevelHook) degradeLevel1(b types.ContentBlock) *types.Content
 	}
 }
 
+// degradeLevel2 把成功结果换成 "[历史操作结果: 成功]" 一行, 错误结果换成 300 字符摘要。
 func (h *ToolResultLevelHook) degradeLevel2(b types.ContentBlock) *types.ContentBlock {
 	if h.config.PreserveErrors && b.IsError {
 		summary := textutil.Truncate(b.Content, 300, "...")
@@ -620,10 +644,21 @@ func contentEqual(a, b []types.ContentBlock) bool {
 	return true
 }
 
+// computeMessageRounds 计算每条消息的"轮次年龄": 两条 assistant 之间的消息算一轮, round 0 为最新。
+//
+// 算法解读：
+//
+//	原理：从后往前扫, 以 assistant 消息为界把消息切成轮 —— 两条 assistant 之间的消息属于同一轮,
+//	      越靠前的轮年龄越大。年龄只用于分级降级, 不参与任何语义判断。
+//	关键不变量：年龄必须**单调不减**地往回增 (下标越小轮次越大)。降级策略假设"老的可以更狠",
+//	      年龄一旦乱序, 就会出现新消息被重降级、老消息被完整保留。
+//	代价与边界：两趟 O(n) 扫描 (倒序定界 + 补最老的一段); 没有 assistant 的消息 (纯
+//	      system/user 前缀) 全部归为同一轮。
 func computeMessageRounds(messages []types.Message) []int {
 	n := len(messages)
 	rounds := make([]int, n)
 	currentRound := 0
+	// 倒序扫: 遇到 assistant 说明"上一轮的边界到了", 把 (它, 下一条 assistant] 之间的消息标成当前轮。
 	lastAssistantIdx := -1
 
 	for i := n - 1; i >= 0; i-- {
@@ -647,6 +682,7 @@ func computeMessageRounds(messages []types.Message) []int {
 	return rounds
 }
 
+// ToolResultStats 统计消息里 tool_result 块的总数、成功数与失败数。
 func ToolResultStats(messages []types.Message) (total, success, errorCount int) {
 	for _, m := range messages {
 		if m.Type != types.MessageTypeUser {
@@ -667,6 +703,7 @@ func ToolResultStats(messages []types.Message) (total, success, errorCount int) 
 	return
 }
 
+// IsSuccessConfirmation 用一组英文成功措辞判断工具结果是否表示成功 (子串匹配)。
 func IsSuccessConfirmation(content string) bool {
 	lower := strings.ToLower(content)
 	patterns := []string{

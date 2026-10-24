@@ -121,6 +121,7 @@ func (s LongHorizonSummary) Describe() string {
 	return sb.String()
 }
 
+// sortedKeys2 返回 map 键的升序切片, 使报告输出顺序确定(不依赖 map 遍历顺序)。
 func sortedKeys2(m map[string][2]int) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

@@ -33,6 +33,7 @@ type MethodSig struct {
 	Results []string `json:"results,omitempty"`
 }
 
+// NewStore 创建空的契约存储 (两个 map 都已初始化, 可直接写入)。
 // NewStore creates an empty contract store.
 func NewStore() *Store {
 	return &Store{
@@ -41,6 +42,7 @@ func NewStore() *Store {
 	}
 }
 
+// Save 把契约存储以缩进 JSON 落盘到 path。
 // Save persists the store to a JSON file.
 func (s *Store) Save(path string) error {
 	s.mu.RLock()
@@ -52,6 +54,7 @@ func (s *Store) Save(path string) error {
 	return os.WriteFile(path, data, 0644)
 }
 
+// Load 从 path 读回 JSON 并**原地覆盖**接收者的字段 (未出现的字段保持原值)。
 // Load reads the store from a JSON file.
 func (s *Store) Load(path string) error {
 	data, err := os.ReadFile(path)
@@ -63,6 +66,7 @@ func (s *Store) Load(path string) error {
 	return json.Unmarshal(data, s)
 }
 
+// GetInterface 按全限定名 (如 "pkg/foo.Bar") 取接口契约。
 // GetInterface retrieves an interface contract by fully qualified name.
 func (s *Store) GetInterface(fqName string) (*InterfaceContract, bool) {
 	s.mu.RLock()
@@ -71,6 +75,7 @@ func (s *Store) GetInterface(fqName string) (*InterfaceContract, bool) {
 	return c, ok
 }
 
+// GetImplementors 返回某接口的全部已知实现者; 未登记时返回 nil (调用方须自行判空)。
 // GetImplementors returns all known implementors of an interface.
 func (s *Store) GetImplementors(fqName string) []string {
 	s.mu.RLock()

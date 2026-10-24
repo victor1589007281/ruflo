@@ -19,6 +19,8 @@ type GoRepairDiagnosis struct {
 	store *contract.Store
 }
 
+// NewGoRepairDiagnosis 构造 Go 编译错误诊断技能: 纯文本分析, 不依赖外部工具。
+//
 // NewGoRepairDiagnosis creates a new GoRepairDiagnosis.
 func NewGoRepairDiagnosis(store *contract.Store) *GoRepairDiagnosis {
 	return &GoRepairDiagnosis{
@@ -56,6 +58,8 @@ type RepairSuggestion struct {
 	ContractCheck string  `json:"contract_check,omitempty"`
 }
 
+// Execute 解析输入并返回诊断建议, 同时把 category/confidence 提到顶层便于调用方分流。
+//
 // Execute runs the diagnosis.
 func (t *GoRepairDiagnosis) Execute(ctx context.Context, input json.RawMessage) (map[string]any, error) {
 	var in struct {
@@ -69,6 +73,7 @@ func (t *GoRepairDiagnosis) Execute(ctx context.Context, input json.RawMessage) 
 		return nil, err
 	}
 
+	// 注意：in.RepoRoot 解析了却从未参与诊断 (diagnose 不接收它), 形同虚设。
 	suggestion := t.diagnose(in.ErrorText, in.FilePath, in.ContractHint, in.SourceSnippet)
 
 	return map[string]any{
@@ -78,7 +83,24 @@ func (t *GoRepairDiagnosis) Execute(ctx context.Context, input json.RawMessage) 
 	}, nil
 }
 
+// diagnose 用有序正则规则表匹配错误文本, 命中即返回该规则的分类/动作/置信度。
+//
+// 算法解读：
+//
+//	原理：把编译错误、竞态报告等文本按一张**有序规则表**逐条正则匹配, 第一条命中的规则
+//	      决定 Category/Action/Confidence/Instructions; 一条都不命中则降级为 other。
+//	关键不变量：规则顺序必须**从具体到宽泛**, 且命中即 return —— 例如 `undefined: X`
+//	      (第 1 条) 必须排在 `X.Y undefined` (第 5 条) 之前, 否则字段错误会被误判成
+//	      未定义符号; 调换两条的顺序会静默改变分类结果, 不会有任何报错。
+//	代价与边界：8 条正则写在函数体内, **每次调用都重新 MustCompile** (固定编译开销);
+//	      置信度是写死的经验值 (0.3~0.95) 而非统计得出, 只表达"这类错误有多好修"。
+//	设计权衡：只输出**单条**最优建议, 不做多假设排序 —— 上游要的是可直接执行的修复指令,
+//	      而不是一组待评估的候选; 代价是命中靠前规则后, 后面的信息 (如同时存在竞态)
+//	      会被完全丢弃。
 func (t *GoRepairDiagnosis) diagnose(errorText, filePath, contractHint, snippet string) RepairSuggestion {
+	// 初始 0.7 只是占位值: 命中规则会被覆盖, 未命中则被 fallback 覆盖成 0.3 —— 它不会出现在返回值里。
+	// 注意：TargetLine 从未被赋值, 恒为 0, 调用方不能拿它定位行号。
+	// 注意：形参 snippet 在本函数内从未被读取 —— Execute 有传, 但规则表不看源码片段。
 	s := RepairSuggestion{TargetFile: filePath, Confidence: 0.7}
 
 	patterns := []struct {
@@ -160,9 +182,11 @@ func (t *GoRepairDiagnosis) diagnose(errorText, filePath, contractHint, snippet 
 			s.Category = p.category
 			s.Action = p.action
 			s.Confidence = p.confidence
+			// 只有带捕获组的规则才能把符号名填进模板; 不带组的模板本身就是完整句子。
 			if len(m) > 1 {
 				s.Diagnosis = fmt.Sprintf(p.msgTemplate, m[1])
 				s.Instructions = fmt.Sprintf(p.instrTmpl, m[1])
+				// 第二个及以后的捕获组拼成 details, 避免丢掉 (如 does not implement 的接口名)。
 				if len(m) > 2 {
 					s.Diagnosis = fmt.Sprintf("%s (details: %s)", s.Diagnosis, strings.Join(m[1:], "."))
 				}
@@ -178,6 +202,7 @@ func (t *GoRepairDiagnosis) diagnose(errorText, filePath, contractHint, snippet 
 	}
 
 	// Fallback
+	// 未识别错误置信度压到 0.3 —— 让调用方知道这条基本不可信, 应转人工或 Context Engine。
 	s.Category = "other"
 	s.Diagnosis = fmt.Sprintf("Unrecognized error. Analyze manually: %s", truncate(errorText, 200))
 	s.Action = "consult_contract"
@@ -186,6 +211,7 @@ func (t *GoRepairDiagnosis) diagnose(errorText, filePath, contractHint, snippet 
 	return s
 }
 
+// truncate 把文本按字符 (rune) 截断到 n 个字符, 超出部分以 "..." 结尾。
 func truncate(s string, n int) string {
 	return textutil.Truncate(s, n, "...")
 }

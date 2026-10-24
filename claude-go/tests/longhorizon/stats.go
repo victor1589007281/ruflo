@@ -90,6 +90,8 @@ func McNemarExact(b, c int) float64 {
 	return p
 }
 
+// binomCoeff 计算二项式系数 C(n,k); 用连乘 n-k+1..n 再逐项除 i 的写法避免阶乘溢出,
+// k 越界 (k<0 或 k>n) 时返回 0。
 func binomCoeff(n, k int) float64 {
 	if k < 0 || k > n {
 		return 0
@@ -118,6 +120,7 @@ type PairedResult struct {
 
 // APass / BPass 两组的通过数。
 func (r PairedResult) APass() int { return r.BothPass + r.AOnly }
+// BPass B 组通过数 = 两组都过 + 仅 B 过。
 func (r PairedResult) BPass() int { return r.BothPass + r.BOnly }
 
 // ARate / BRate 两组成功率。

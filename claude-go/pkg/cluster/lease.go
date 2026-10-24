@@ -63,6 +63,10 @@ func (l *FileLease) sweep() {
 	}
 }
 
+// sanitizeLeaseKey 把租约 key 归一成安全的文件名: 只保留字母/数字/点/下划线/连字符, 其余一律替换为下划线。
+//
+// 注意：替换是「多对一」的 —— 不同 key (如 "cron:backup" 与 "cron/backup") 可能映射到同一个锁文件,
+// 从而互相误判为已持有; key 本身可含路径分隔符时不宜直接当租约 key 用。
 func sanitizeLeaseKey(key string) string {
 	var b strings.Builder
 	for _, r := range key {

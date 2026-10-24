@@ -875,6 +875,10 @@ func (s *SwarmOrchestrator) qualityGate(_ context.Context, sr StageResult, task 
 	sc.Confidence = conf
 	sc.Degraded = conf < 0.4
 
+	// P1 双跑：并行用决策模型打一次真质量分（只进 agentDB 流水，不改变上面的判定）。
+	// 攒数据后用 ConformalCalibrator 标定真阈值再切换。fail-open，失败不影响本函数返回值。
+	s.jevScoreOutput(sr, task, conf)
+
 	return sc
 }
 
@@ -935,6 +939,9 @@ func (s *SwarmOrchestrator) merge(ctx context.Context, results []StageResult, ob
 
 // --- 检查点持久化 ---
 
+// checkpointPath 返回某团队的检查点文件路径; stateDir 为空时回落到 ~/.claude-go/swarm_checkpoints。
+//
+// 注意：这里的 MkdirAll 错误被忽略——建目录失败要到 saveCheckpoint 真正写文件时才会暴露。
 func (s *SwarmOrchestrator) checkpointPath(teamName string) string {
 	dir := s.stateDir
 	if dir == "" {
@@ -944,6 +951,9 @@ func (s *SwarmOrchestrator) checkpointPath(teamName string) string {
 	return filepath.Join(dir, fmt.Sprintf("swarm_%s.json", teamName))
 }
 
+// saveCheckpoint 把当前计划、结果集与所在层级落盘; 序列化或写文件失败只记日志, 不中断执行。
+//
+// 注意：CompletedIDs 由遍历 resultMap 得出, 顺序随 map 遍历随机, 因此同一状态写出的文件字节并不稳定。
 func (s *SwarmOrchestrator) saveCheckpoint(teamName string, plan *DecompositionPlan, resultMap map[string]string, level int) {
 	cp := SwarmCheckpoint{
 		Plan:         plan,
@@ -963,6 +973,7 @@ func (s *SwarmOrchestrator) saveCheckpoint(teamName string, plan *DecompositionP
 	}
 }
 
+// loadCheckpoint 读取检查点; 文件不存在、JSON 解析失败或已超过 2 小时过期时返回 nil。
 func (s *SwarmOrchestrator) loadCheckpoint(teamName string) *SwarmCheckpoint {
 	data, err := os.ReadFile(s.checkpointPath(teamName))
 	if err != nil {
@@ -978,6 +989,7 @@ func (s *SwarmOrchestrator) loadCheckpoint(teamName string) *SwarmCheckpoint {
 	return &cp
 }
 
+// clearCheckpoint 删除团队检查点文件; 删除失败静默忽略(文件本就不存在也是正常路径)。
 func (s *SwarmOrchestrator) clearCheckpoint(teamName string) {
 	_ = os.Remove(s.checkpointPath(teamName))
 }
@@ -1014,6 +1026,7 @@ func computeConfidence(output, role string) float64 {
 	return conf
 }
 
+// fallbackMerge 在 LLM 综合不可用时退化为把各子任务产出按顺序拼接成汇总文本。
 func (s *SwarmOrchestrator) fallbackMerge(results []StageResult) string {
 	var sb strings.Builder
 	sb.WriteString("# 蜂群执行结果汇总\n\n")
@@ -1025,6 +1038,7 @@ func (s *SwarmOrchestrator) fallbackMerge(results []StageResult) string {
 	return sb.String()
 }
 
+// formatPlan 把分解计划渲染成带序号、角色与依赖的纯文本清单。
 func (s *SwarmOrchestrator) formatPlan(plan *DecompositionPlan) string {
 	var sb strings.Builder
 	for i, t := range plan.SubTasks {

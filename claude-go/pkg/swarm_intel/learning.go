@@ -133,6 +133,8 @@ type LearningState struct {
 	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
+// learningStatePath 返回学习状态的落盘路径; dataDir 为空 (未隔离/共享 DataDir 的 Engine) 时返回空串,
+// 调用方据此跳过读写 —— 这是"共享路径零回归"的开关。
 func (e *Engine) learningStatePath() string {
 	if e.dataDir == "" {
 		return ""
@@ -202,6 +204,18 @@ func (e *Engine) saveLearning() {
 // 返回本次 Brier 分数。这是一种"自一致性校准": 群体越决断 (胜选结局概率越高)、
 // nonconformity 越低 → 未来 CI 越窄; 反之群体越犹疑 → CI 越宽 (更诚实的不确定性)。
 // 非外部真值校准, 但对"让 CI 反映群体真实决断力 + 奖励押中委托叙事的分析师"是有效且自洽的。
+//
+// 算法解读：
+//
+//	原理：拿"实际胜选结局"回填四个学习器 —— Brier 分进预测历史与推理库, nonconformity
+//	      (1 − P(actual)) 进保形校准, 信任/路由按各 agent 是否押中做小步更新, 最后用
+//	      0.9/0.1 的 EWMA 维护可观测的 meanBrier。
+//	关键不变量：保形喂的必须是 1 − P(actual) 而不是 1 − P(consensus) —— 前者衡量群体对
+//	      "真结局"的把握, 后者只会让 CI 反映群体自我一致性, 校准就失效了。
+//	代价与边界：EWMA 系数 0.9 意味着有效记忆约 10 本, 单本异常结局最多把 meanBrier 拉动
+//	      10%; 信任更新步长上限 (pa−0.5)×0.2 即每次 ±0.1, 刻意压制单本漂移。
+//	设计权衡：不做外部真值校准, 而是"自一致性校准" —— 放弃与客观真值对齐, 换取对"群体越
+//	      决断 CI 越窄"这一自洽信号的利用 (见上文)。
 func (e *Engine) RecordOutcome(pred *FusedPrediction, actualOutcome string) float64 {
 	if pred == nil || actualOutcome == "" {
 		return 0

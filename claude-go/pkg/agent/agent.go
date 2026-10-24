@@ -72,8 +72,10 @@ func NewAgentTool(runFn RunAgentFunc) *AgentTool {
 
 var _ tool.AliasedTool = (*AgentTool)(nil)
 
+// Name 返回工具名 (Agent)。
 func (t *AgentTool) Name() string { return AgentToolName }
 
+// Aliases 返回 API 侧接受的旧工具名 (如 "Task"), 供别名解析做向后兼容。
 // Aliases returns legacy tool names accepted by the API (e.g. "Task").
 func (t *AgentTool) Aliases() []string { return []string{LegacyToolName} }
 
@@ -94,6 +96,7 @@ The agent runs in a separate context and returns results when complete.`
 	return base
 }
 
+// InputSchema 返回 Agent 工具的输入 JSON Schema (只有 prompt 必填)。
 func (t *AgentTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
@@ -109,8 +112,11 @@ func (t *AgentTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 报告本工具是否只读 —— 子代理会改文件, 恒为 false。
 func (t *AgentTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+// IsConcurrencySafe 报告本工具能否并发调用 —— 子代理并发会争抢同一工作区, 恒为 false。
 func (t *AgentTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+// CheckPermissions 返回权限判定 —— 返回 nil 表示不额外拦截, 交由上层权限模式决定。
 func (t *AgentTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }

@@ -238,8 +238,13 @@ func stripDurations(s string) string {
 	return sb.String()
 }
 
+// isDurationSep 判断字节是否为耗时 token 前的分隔符 (空格/制表符/左括号)。
 func isDurationSep(c byte) bool { return c == ' ' || c == '\t' || c == '(' }
 
+// isDurationChar 判断字节是否可能出现在耗时 token 里: 数字/小数点/时间单位字母, 以及 µ 的两个 UTF-8 字节。
+//
+// 注意: 这里按**字节**而不是 rune 判定 —— 0xC2/0xB5 是 µs 里 µ 的编码片段, 放行它们是为了让
+// "12µs" 这类输出不被误判成非耗时; 代价是单独出现的这两个字节也会被放行。
 func isDurationChar(c byte) bool {
 	return c >= '0' && c <= '9' || c == '.' ||
 		c == 'n' || c == 'u' || c == 'm' || c == 's' ||

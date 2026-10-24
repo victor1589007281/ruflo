@@ -285,6 +285,7 @@ type SuspendSpec struct {
 	MaxWaitSec int `json:"max_wait_sec,omitempty"`
 }
 
+// maxRevives 返回生效的唤醒次数上限; 未配置时取默认值。
 func (s *SuspendSpec) maxRevives() int {
 	if s == nil || s.MaxRevives <= 0 {
 		return DefaultMaxRevives
@@ -292,6 +293,7 @@ func (s *SuspendSpec) maxRevives() int {
 	return s.MaxRevives
 }
 
+// maxWaitSec 返回生效的单次 revive 等待上限 (秒); 未配置时取默认值。
 func (s *SuspendSpec) maxWaitSec() int {
 	if s == nil || s.MaxWaitSec <= 0 {
 		return DefaultReviveWaitSec

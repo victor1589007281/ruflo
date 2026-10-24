@@ -302,6 +302,10 @@ func (e *Engine) UnifiedQuery(branchName string, q UnifiedQuery) (*QueryResult, 
 	}
 
 	// 隐式反馈：记录本次查询，启动超时观察
+	//
+	// 注意: 这里的 cacheHit 是在上面 e.cache.set(cacheKey, qr) **之后**读的, 因此对本
+	// 分支而言它恒为 true —— 真正"本次是否命中缓存"在 L1 那段就已经判过了。要修正得把
+	// 那次判定的结果带到此处, 而不是回读缓存。
 	if e.implicitFeedback != nil {
 		cacheHit := e.cache.get(cacheKey) != nil
 		e.implicitFeedback.TrackQuery(queryText, cacheHit)
@@ -334,6 +338,7 @@ func unifiedQueryText(q UnifiedQuery) string {
 // 降级判断
 // ============================================================================
 
+// isEmptyResult 判断查询结果是否为空 (nil 或 Results 为 nil), 是降级到 Native 的第一道判据。
 func isEmptyResult(qr *QueryResult) bool {
 	if qr == nil || qr.Results == nil {
 		return true
@@ -341,6 +346,23 @@ func isEmptyResult(qr *QueryResult) bool {
 	return false
 }
 
+// isGitNexusMiss 判断 GitNexus 的返回是否应视为"没找到"从而降级到 Native 兜底。
+//
+// 算法解读：
+//
+//	原理：区分三种返回 —— not_found (真没找到) / ambiguous (找到多个候选, 需消歧) /
+//	      正常结果。前者与"ambiguous 但一个候选都没有"都要降级到 Native 兜底查询;
+//	      而 ambiguous **且有**候选时不能降级, 因为 GitNexus 的候选比 Native 的模糊
+//	      匹配更精确, 丢掉它等于用更差的结果覆盖更好的结果。
+//	关键不变量：只有"确实没有可用信息"才返回 true —— 误判为 miss 会多跑一次 Native
+//	      查询 (浪费但不致命), 误判为 hit 则会把一个空/歧义结果当成答案交给上层。
+//	      因此这里的默认方向是**不降级**, 只在能确证无信息时才降级。
+//	代价与边界：靠 map[string]interface{} 的类型断言解析候选, 只认 []interface{} 与
+//	      []map[string]interface{} 两种形态; 其它形态 (如 [][]string) 会落进"无候选"
+//	      分支被当成 miss。末尾那段"没有 symbol/target/candidates 字段才视为 miss"是
+//	      兜底: 一个只有 status 的 map 会被判为 miss。
+//	设计权衡：没有按 status 做白名单 (只放行 "ok"), 因为 GitNexus 各子命令的 status
+//	      取值并不统一 —— 白名单会把新出现的合法状态一并误杀成 miss。
 func isGitNexusMiss(qr *QueryResult) bool {
 	if qr == nil || qr.Results == nil {
 		return true
@@ -390,6 +412,7 @@ type queryCache struct {
 	entries map[string]*cacheEntry
 }
 
+// newQueryCache 创建带 TTL 的查询结果缓存 (条目在读取时惰性过期)。
 func newQueryCache(ttl time.Duration) *queryCache {
 	return &queryCache{
 		ttl:     ttl,
@@ -397,6 +420,12 @@ func newQueryCache(ttl time.Duration) *queryCache {
 	}
 }
 
+// get 按 key 取缓存结果; 已过期则就地删除并返回 nil。
+//
+// 注意: 过期是**惰性**的 —— 只有被再次读取的键才会被清理, 再没被查询过的键会一直
+// 留在 entries 里 (map 没有容量上限, 也没有后台清理)。键由 query_type/symbol/
+// file_path/shard 拼成, 基数随查询过的符号数增长。
+// 注意: entries 是无锁 map, 而 Engine 的查询入口可被多个 handler 并发调用。
 func (c *queryCache) get(key string) *QueryResult {
 	ent, ok := c.entries[key]
 	if !ok {
@@ -409,6 +438,7 @@ func (c *queryCache) get(key string) *QueryResult {
 	return ent.result
 }
 
+// set 写入缓存结果, 过期时间按写入时刻 + ttl 计算 (每次写入都重新计时)。
 func (c *queryCache) set(key string, qr *QueryResult) {
 	c.entries[key] = &cacheEntry{
 		result:    qr,
@@ -420,6 +450,7 @@ func (c *queryCache) set(key string, qr *QueryResult) {
 // 私有辅助
 // ============================================================================
 
+// safeResult 取查询结果的 payload; qr 为 nil 时返回 nil (供状态汇总直接拼进 JSON)。
 func safeResult(qr *QueryResult) interface{} {
 	if qr == nil {
 		return nil
@@ -427,6 +458,7 @@ func safeResult(qr *QueryResult) interface{} {
 	return qr.Results
 }
 
+// errString 把 error 转成字符串; nil 时返回空串 —— 让调用方不必为"无错误"分支写特判。
 func errString(err error) string {
 	if err == nil {
 		return ""

@@ -342,6 +342,8 @@ func Reconcile(decl *Declaration, actual *Report) []Diff {
 	return diffs
 }
 
+// reconcileTools 对账工具白名单: 声明了却不可见 → DeclaredNotActual, 可见却未声明 → ActualNotDeclared。
+// 声明为 nil 表示"未声明该面", 整个面不参与对账; 声明为空切片才是"空白名单 (拒绝一切)"。
 func reconcileTools(decl *Declaration, actual *Report) []Diff {
 	if decl.Tools == nil {
 		return nil // 未声明白名单 ⇒ 不参与对账 (不是"声明了空名单")
@@ -506,6 +508,7 @@ func hiddenReason(t *ToolsInfo, name string) string {
 	return "未注册 (注册表中不存在)"
 }
 
+// reconcileExternalHooks 对账外部 hook: 以 "事件#序号" 为键, 声明未装载/未声明被装载/类型不符各记一条。
 func reconcileExternalHooks(decl *Declaration, actual *Report) []Diff {
 	if decl.ExternalHooks == nil {
 		return nil
@@ -566,6 +569,7 @@ func reconcileComponents(decl *Declaration, actual *Report) []Diff {
 	return diffs
 }
 
+// reconcileScalars 对账单值面 (主模型 / 权限档): 双方都非空且不等才记 DiffMismatch。
 func reconcileScalars(decl *Declaration, actual *Report) []Diff {
 	var diffs []Diff
 	if decl.Model != "" && actual.Model != nil && actual.Model.Primary != "" && decl.Model != actual.Model.Primary {
@@ -584,6 +588,7 @@ func reconcileScalars(decl *Declaration, actual *Report) []Diff {
 	return diffs
 }
 
+// describeTools 把工具名单渲染成对账报告里的一格: 空名单明说"拒绝一切", 长名单只列前三项。
 func describeTools(tools []string) string {
 	if len(tools) == 0 {
 		return "空白名单 (拒绝一切)"

@@ -2,6 +2,8 @@ package agent
 
 // --- 金融专家团队工作流 ---
 
+// financeWorkflow 返回金融专家团队的工作流定义: 4 路并行前置分析 (技术面/情绪面/财报/新闻)
+// 汇入风险评估, 再由首席策略师给出最终交易建议。
 func financeWorkflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "finance",

@@ -117,6 +117,7 @@ func resolveStateDir(tctx *tool.ToolContext) string {
 	return basedir.ResolveDefault("", cwd)
 }
 
+// okResult 把返回值序列化成缩进 JSON 作为成功结果; 序列化失败降级为错误文本而非 panic。
 func okResult(v any) (*tool.ToolResult, error) {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -125,6 +126,7 @@ func okResult(v any) (*tool.ToolResult, error) {
 	return &tool.ToolResult{Content: string(data)}, nil
 }
 
+// errResult 构造一条 IsError 的结果; 返回 Go error 会让上层丢掉理由, 所以失败原因一律走 Content。
 func errResult(format string, args ...any) (*tool.ToolResult, error) {
 	return &tool.ToolResult{Content: fmt.Sprintf(format, args...), IsError: true}, nil
 }
@@ -137,7 +139,10 @@ func errResult(format string, args ...any) (*tool.ToolResult, error) {
 // 闸门而不是权限提示来保证 —— 这正是把治理机械化的意义。
 type evoToolBase struct{}
 
+// IsConcurrencySafe 恒为 true: evo_* 要么真只读, 要么只写 <state>/evolution 下的治理产物。
 func (evoToolBase) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 一律放行 (返回 nil) —— 安全性由治理闸门而不是权限提示来保证。
 func (evoToolBase) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
@@ -149,17 +154,23 @@ func (evoToolBase) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *typ
 // EvoListEnvsTool 列出 EvalEnv (回放任务集 + 验证器种类)。
 type EvoListEnvsTool struct{ evoToolBase }
 
+// NewEvoListEnvsTool 构造 evo_list_envs 工具。
 func NewEvoListEnvsTool() *EvoListEnvsTool { return &EvoListEnvsTool{} }
 
+// Name 返回工具名。
 func (t *EvoListEnvsTool) Name() string { return "evo_list_envs" }
+
+// Description 返回给模型的工具说明 (直接就是描述正文)。
 func (t *EvoListEnvsTool) Description() string {
 	return "列出可用的进化评测环境 EvalEnv (离线回放任务集 + 验证器), 含任务数与验证器种类。" +
 		"任务集放在 <state>/evolution/evalenv/*.jsonl, 每行一个 {id,objective,input,expect,gate} 任务。" +
 		"进化实验的第一步: 先看有哪些环境可用, 再决定用哪个做冒烟/回放。"
 }
+// InputSchema 返回入参 schema: 本工具无参数。
 func (t *EvoListEnvsTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
 }
+// IsReadOnly 返回 true: 只遍历任务集目录, 不产生任何副作用。
 func (t *EvoListEnvsTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
 // EvalEnvInfo 一个任务集的概览。
@@ -172,6 +183,10 @@ type EvalEnvInfo struct {
 	VerifierKinds string `json:"verifier_kinds"`
 }
 
+// Call 扫描 <state>/evolution/evalenv/*.jsonl, 逐集统计任务数、确定性断言数、真门禁数与验证器种类。
+//
+// 注意: 单个任务集解析失败不会中断整体列举 —— 失败的那条以 VerifierKinds="解析失败: ..." 的形式
+// 如实列出, 让 agent 看到"有这个环境但它坏了", 而不是把它从列表里悄悄抹掉。
 func (t *EvoListEnvsTool) Call(_ context.Context, _ json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	stateDir := resolveStateDir(tctx)
 	dir := filepath.Join(stateDir, "evolution", "evalenv")
@@ -230,21 +245,28 @@ func (t *EvoListEnvsTool) Call(_ context.Context, _ json.RawMessage, tctx *tool.
 // EvoInspectTool 查看进化产物的谱系/状态/证据, 以及学习闭环健康度。
 type EvoInspectTool struct{ evoToolBase }
 
+// NewEvoInspectTool 构造 evo_inspect 工具。
 func NewEvoInspectTool() *EvoInspectTool { return &EvoInspectTool{} }
 
+// Name 返回工具名。
 func (t *EvoInspectTool) Name() string { return "evo_inspect" }
+
+// Description 返回给模型的工具说明。
 func (t *EvoInspectTool) Description() string {
 	return "查看进化产物与学习闭环状态。不带参数=闭环健康度总览 (轨迹/奖励/经验/shadow 技能);" +
 		"带 id=看某份草案的谱系(父版本)、归纳依据(样本量/奖励均值/参与的 run)与当前状态。" +
 		"晋升任何东西之前应当先 inspect 它的证据。"
 }
+// InputSchema 返回入参 schema: 可选 id (省略即闭环健康度总览)。
 func (t *EvoInspectTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "id":{"type":"string","description":"草案 ID (如 wf-xxxx / pr-xxxx); 省略则给闭环健康度总览"}
 },"additionalProperties":false}`)
 }
+// IsReadOnly 返回 true: 只读取草案与闭环统计。
 func (t *EvoInspectTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
+// Call 按有无 id 分两种模式: 带 id 取该草案的谱系与证据, 不带 id 给学习闭环健康度总览。
 func (t *EvoInspectTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		ID string `json:"id"`
@@ -294,15 +316,20 @@ func (t *EvoInspectTool) Call(_ context.Context, input json.RawMessage, tctx *to
 // EvoProposeTool 提交候选产物进 proposed 态 / 触发确定性归纳。
 type EvoProposeTool struct{ evoToolBase }
 
+// NewEvoProposeTool 构造 evo_propose 工具。
 func NewEvoProposeTool() *EvoProposeTool { return &EvoProposeTool{} }
 
+// Name 返回工具名。
 func (t *EvoProposeTool) Name() string { return "evo_propose" }
+
+// Description 返回给模型的工具说明。
 func (t *EvoProposeTool) Description() string {
 	return "提交进化候选。kind=induce: 立即跑一次确定性工作流归纳 (AWM, 零 LLM 成本), " +
 		"从高奖励的真实运行里归纳可复用阶段序列; kind=prompt: 提交一份 prompt 候选正文。" +
 		"产物一律落 proposed 态, 不影响运行期行为, 必须经 evo_smoke + evo_promote 才生效。" +
 		"注意: 治理参数 (晋升阈值/uplift 标准/judge 模型/预算/生命周期) 是锁定字段, 请求修改会被拒绝。"
 }
+// InputSchema 返回入参 schema: kind 必填, prompt 类还需 target 与 body。
 func (t *EvoProposeTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "kind":{"type":"string","enum":["induce","prompt"],"description":"induce=确定性工作流归纳; prompt=提交 prompt 候选"},
@@ -312,8 +339,12 @@ func (t *EvoProposeTool) InputSchema() json.RawMessage {
 "config":{"type":"object","description":"可选参数覆盖; 只接受安全字段 (samples/env/shadow_ratio/description/note), 治理参数会被显式拒绝"}
 },"required":["kind"],"additionalProperties":false}`)
 }
+// IsReadOnly 返回 false: 会写入 proposed 态的草案文件。
 func (t *EvoProposeTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
+// Call 按 kind 分派: induce 跑确定性工作流归纳, prompt 提交 prompt 候选; 两者都只产 proposed 态。
+//
+// 注意: 锁定字段检查刻意排在所有副作用之前 —— 先拒绝再干活, 而不是"忽略非法字段但照常执行"。
 func (t *EvoProposeTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		Kind        string          `json:"kind"`
@@ -394,14 +425,19 @@ func rejectLockedFields(raw json.RawMessage) string {
 // EvoSmokeTool 晋升前多档冒烟 (H6)。
 type EvoSmokeTool struct{ evoToolBase }
 
+// NewEvoSmokeTool 构造 evo_smoke 工具。
 func NewEvoSmokeTool() *EvoSmokeTool { return &EvoSmokeTool{} }
 
+// Name 返回工具名。
 func (t *EvoSmokeTool) Name() string { return "evo_smoke" }
+
+// Description 返回给模型的工具说明。
 func (t *EvoSmokeTool) Description() string {
 	return "晋升前多档冒烟: 用少量任务 × 多次采样 × 多个模型档位验证候选产物的解析鲁棒性与奖励覆盖。" +
 		"这是 test-before-promote —— 技能/prompt 对弱模型不鲁棒是线上劣化的常见来源, 只在主模型上验过就晋升等于把风险留给 fallback 生效那一刻。" +
 		"必须先 evo_smoke 通过再 evo_promote。只有一个档位可跑时会明确拒绝 (单档冒烟不是多档冒烟)。"
 }
+// InputSchema 返回入参 schema: id 必填, env/samples 可选。
 func (t *EvoSmokeTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "id":{"type":"string","description":"待冒烟的草案 ID"},
@@ -409,8 +445,23 @@ func (t *EvoSmokeTool) InputSchema() json.RawMessage {
 "samples":{"type":"integer","description":"每任务每档采样次数, 1-8 (安全字段)"}
 },"required":["id"],"additionalProperties":false}`)
 }
+// IsReadOnly 返回 true: 冒烟只把报告写到 <state>/evolution/smoke, 不改产物状态。
 func (t *EvoSmokeTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
+// Call 组装档位 (确定性装配档 + 宿主注入的真实模型档) 并跑多档冒烟, 返回报告与 blocking 列表。
+//
+// 算法解读：
+//
+//	原理：晋升前用"少量任务 × 多次采样 × 多个模型档位"跑一遍候选产物, 看它在弱模型上是否仍能
+//	      稳定解析。候选在强模型上过、在 fallback 档上崩, 是线上劣化最常见的来源, 而这类劣化
+//	      只在 fallback 真正生效那一刻才暴露 —— 冒烟把那一刻提前到晋升之前。
+//	关键不变量：报告里的 blocking 必须如实反映"当前到底跑了几档"。装配档是确定性替换、不是模型,
+//	      所以 evoTierFactory 未注入时档位数只有 1, 此时必须由 MinTiers 判 blocking 而不是判通过 ——
+//	      否则"没注入构造器"会被静默读成"冒烟通过", 闸门形同虚设。
+//	代价与边界：成本 ≈ 任务数 × 采样数 × 档位数 次模型调用, 故 Samples 硬夹在 1-8; 无真实模型档时
+//	      本工具只能验占位符解析, 验不了模型鲁棒性。
+//	设计权衡：宁可返回"档位不足、已 blocking"也不替 agent 拿主模型凑一个假的第二档 —— 假的第二档
+//	      会让 H6 的多档要求变成自欺。
 func (t *EvoSmokeTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		ID      string `json:"id"`
@@ -464,7 +515,22 @@ func (t *EvoSmokeTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 // 未定义的占位符。它**不是**模型档位, 所以不满足 H6 的多档要求, 由 MinTiers 拒绝兜住。
 type assemblyCandidate struct{ body string }
 
+// Name 返回档位名 (与 replay.Tier 的 Name 对应)。
 func (assemblyCandidate) Name() string { return "assembly" }
+
+// Produce 把候选正文按任务做占位符替换后输出, 并检查是否残留未解析的占位符。
+//
+// 算法解读：
+//
+//	原理：不调 LLM 的确定性"装配档"—— 只把 {objective}/{prev_result}/{user_feedback} 替换成
+//	      任务实参。它能抓住两类无需模型的真实劣化: 候选丢了锚点 (上线即静默失效)、
+//	      候选里留了未定义的占位符 (运行时原样吐给模型)。
+//	关键不变量：替换完成后正文里不应再出现 `{...}`。残留检测必须发生在替换之后 —— 只看原文会把
+//	      合法的 {objective} 误报成残留, 只看替换结果才能区分"用掉的锚点"与"没定义的占位符"。
+//	代价与边界：纯字符串扫描, 无 IO/无 RPC。正文为空 (workflow 类草案) 时直接报错, 因为装配档
+//	      对它没有意义, 必须换真实模型档。
+//	设计权衡：用确定性装配而不是"随便调一次小模型"—— 后者会把冒烟结果绑到模型质量上, 让
+//	      "候选本身是否可装配"这个可判定的事实变成不可复现的抽样。
 func (c assemblyCandidate) Produce(_ context.Context, t replay.Task) (string, error) {
 	if strings.TrimSpace(c.body) == "" {
 		return "", fmt.Errorf("草案无正文可装配 (workflow 类草案没有 prompt 正文, 用真实模型档位冒烟)")
@@ -520,14 +586,19 @@ func loadEnvTasks(stateDir, name string) ([]replay.Task, string, error) {
 // EvoRunExperimentTool 开一个 shadow 配对实验。
 type EvoRunExperimentTool struct{ evoToolBase }
 
+// NewEvoRunExperimentTool 构造 evo_run_experiment 工具。
 func NewEvoRunExperimentTool() *EvoRunExperimentTool { return &EvoRunExperimentTool{} }
 
+// Name 返回工具名。
 func (t *EvoRunExperimentTool) Name() string { return "evo_run_experiment" }
+
+// Description 返回给模型的工具说明。
 func (t *EvoRunExperimentTool) Description() string {
 	return "启动 shadow 配对实验: 把草案置 shadow 态并登记实验 (基线时刻/样本目标/shadow 比例), " +
 		"此后真实运行产生的奖励会被 evo_status 用来算 uplift。shadow 比例上限 50%。" +
 		"实验不会自动晋升任何东西 —— 晋升永远是 evo_promote 的显式动作, 且要过不越权闸。"
 }
+// InputSchema 返回入参 schema: id 必填, samples/shadow_ratio/note 为安全字段。
 func (t *EvoRunExperimentTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "id":{"type":"string","description":"草案 ID"},
@@ -536,6 +607,7 @@ func (t *EvoRunExperimentTool) InputSchema() json.RawMessage {
 "note":{"type":"string"}
 },"required":["id"],"additionalProperties":false}`)
 }
+// IsReadOnly 返回 false: 会把草案置 shadow 态并登记实验文件。
 func (t *EvoRunExperimentTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
 // Experiment 一次 shadow 配对实验的登记 (定义在 pkg/evolution/learners)。
@@ -545,6 +617,10 @@ func (t *EvoRunExperimentTool) IsReadOnly(_ json.RawMessage) bool { return false
 // 故类型下沉到双方都能 import 的 learners。留别名是为了本包与 evo_* 的返回体形状不变。
 type Experiment = learners.Experiment
 
+// Call 把草案置 shadow 态并登记一次配对实验 (基线时刻/样本目标/shadow 比例)。
+//
+// 注意: 实验登记本身不晋升任何东西 —— 晋升永远是 evo_promote 的显式动作。shadow 比例先经
+// clampShadowRatio 压到上限再落盘, 被压过时在返回体里显式回告, 不做静默钳制。
 func (t *EvoRunExperimentTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		ID          string  `json:"id"`
@@ -591,10 +667,12 @@ func (t *EvoRunExperimentTool) Call(_ context.Context, input json.RawMessage, tc
 // 本包只该碰写盘这一套, 名字保持小写就不会有人从这里拿去做运行期判定。
 func clampShadowRatio(r float64) (float64, bool) { return learners.ClampShadowRatio(r) }
 
+// saveExperiment 把实验登记落盘 (薄转发 learners.SaveExperiment)。
 func saveExperiment(stateDir string, e Experiment) error {
 	return learners.SaveExperiment(stateDir, e)
 }
 
+// loadExperiment 按 id 读回实验登记 (薄转发 learners.LoadExperiment)。
 func loadExperiment(stateDir, id string) (*Experiment, error) {
 	return learners.LoadExperiment(stateDir, id)
 }
@@ -606,20 +684,39 @@ func loadExperiment(stateDir, id string) (*Experiment, error) {
 // EvoStatusTool 查实验进度与指标, 内建 30 分钟限速。
 type EvoStatusTool struct{ evoToolBase }
 
+// NewEvoStatusTool 构造 evo_status 工具。
 func NewEvoStatusTool() *EvoStatusTool { return &EvoStatusTool{} }
 
+// Name 返回工具名。
 func (t *EvoStatusTool) Name() string { return "evo_status" }
+
+// Description 返回给模型的工具说明。
 func (t *EvoStatusTool) Description() string {
 	return "查 shadow 实验的进度与 uplift。**同一实验 30 分钟内只答一次**, 过于频繁的查询会返回 rate_limited 与剩余秒数 —— " +
 		"实验要靠真实运行攒样本, 分钟级轮询不会让它变快, 只会烧 token。指标坏了应当早停 (evo_rollback) 而不是继续等。"
 }
+// InputSchema 返回入参 schema: 实验 id 必填。
 func (t *EvoStatusTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "id":{"type":"string","description":"实验 ID (形如 exp-wf-xxxx)"}
 },"required":["id"],"additionalProperties":false}`)
 }
+// IsReadOnly 返回 true: 只读奖励账本, 唯一的写是限速时间戳。
 func (t *EvoStatusTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
+// Call 先过 H9 限速闸, 再用实验起始时刻切分奖励账本, 分别算基线/候选的加权均值与 uplift。
+//
+// 算法解读：
+//
+//	原理：把"别轮询"这条纪律做成机械闸 —— 同一实验 30 分钟内第二次调用直接返回 rate_limited 与
+//	      剩余秒数, 而不是靠提示词里的一句请求 (提示词纪律在长会话里必然被遗忘)。指标本身是
+//	      一次时间切分: 以 exp.StartedAtMS 把 rewards.jsonl 劈成前后两段, 各自算 run 级加权均值。
+//	关键不变量：限速时间戳必须落盘 (LastCheckedMS), 否则进程重启即重置, 闸门可被"重启一下"绕过;
+//	      且切分点必须取实验登记时的 StartedAtMS 而非"现在" —— 后者会让基线随每次查询漂移。
+//	代价与边界：每次调用全量读 rewards.jsonl 并按时间线性扫一遍, 账本越大越贵; 样本量由真实运行
+//	      攒出, 所以 candidate_runs < samples_want 时只能给 collecting, 给不出可信 uplift。
+//	设计权衡：不做滑动窗口/EWMA 之类的平滑 —— 配对实验要的是"实验前 vs 实验后"的干净对照,
+//	      平滑会把实验前的历史混进基线, 使 uplift 无法归因到被测产物。
 func (t *EvoStatusTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		ID string `json:"id"`
@@ -681,22 +778,32 @@ func (t *EvoStatusTool) Call(_ context.Context, input json.RawMessage, tctx *too
 // EvoPromoteTool 过闸晋升。
 type EvoPromoteTool struct{ evoToolBase }
 
+// NewEvoPromoteTool 构造 evo_promote 工具。
 func NewEvoPromoteTool() *EvoPromoteTool { return &EvoPromoteTool{} }
 
+// Name 返回工具名。
 func (t *EvoPromoteTool) Name() string { return "evo_promote" }
+
+// Description 返回给模型的工具说明。
 func (t *EvoPromoteTool) Description() string {
 	return "晋升进化产物到 active。target=skill 时晋升某个 shadow 技能, target=proposal 时晋升某份草案。" +
 		"晋升**必过不越权闸** (design/03 §4.6 四律): 声明了写/执行类工具的自动产物、frontmatter 解析失败的技能一律拒绝。" +
 		"晋升阈值与判据是锁定参数, 不接受覆盖。"
 }
+// InputSchema 返回入参 schema: target 与 name 均必填。
 func (t *EvoPromoteTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "target":{"type":"string","enum":["skill","proposal"],"description":"晋升对象类型"},
 "name":{"type":"string","description":"技能名 或 草案 ID"}
 },"required":["target","name"],"additionalProperties":false}`)
 }
+// IsReadOnly 返回 false: 会把产物状态改成 active。
 func (t *EvoPromoteTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
+// Call 按 target 分派晋升: skill 走不越权闸后置 active, proposal 直接置 active。
+//
+// 注意: 不越权闸在这里先跑一遍并**把 Reasons 原样带回给 agent** —— SetStatus 内部也会拦,
+// 但那里只给一句 error, agent 不知道越了哪一项就没法自己改对。
 func (t *EvoPromoteTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	target, name, stateDir, errRes := parsePromoteInput(input, tctx)
 	if errRes != nil {
@@ -727,13 +834,18 @@ func (t *EvoPromoteTool) Call(_ context.Context, input json.RawMessage, tctx *to
 // EvoRollbackTool 一键回滚。
 type EvoRollbackTool struct{ evoToolBase }
 
+// NewEvoRollbackTool 构造 evo_rollback 工具。
 func NewEvoRollbackTool() *EvoRollbackTool { return &EvoRollbackTool{} }
 
+// Name 返回工具名。
 func (t *EvoRollbackTool) Name() string { return "evo_rollback" }
+
+// Description 返回给模型的工具说明。
 func (t *EvoRollbackTool) Description() string {
 	return "回滚进化产物: 技能退回 shadow (或 archived 退役), 草案退回 proposed。" +
 		"指标变坏时应当立刻回滚早停, 而不是等实验跑完。回滚方向永远不需要过闸 —— 收紧权限面不是提权。"
 }
+// InputSchema 返回入参 schema: target/name 必填, retire 控制是否直接退役。
 func (t *EvoRollbackTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "target":{"type":"string","enum":["skill","proposal"]},
@@ -741,8 +853,13 @@ func (t *EvoRollbackTool) InputSchema() json.RawMessage {
 "retire":{"type":"boolean","description":"true=直接退役 (technical: archived), 默认只退回 shadow/proposed"}
 },"required":["target","name"],"additionalProperties":false}`)
 }
+// IsReadOnly 返回 false: 会改写产物状态 (退回 shadow/proposed 或置 archived)。
 func (t *EvoRollbackTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
+// Call 按 target 把产物退回 shadow/proposed (retire=true 时直接置 archived), 并记一次回滚计数。
+//
+// 注意: 回滚方向刻意**不过不越权闸** —— 收紧权限面不是提权, 给它加闸会让"指标变坏时立刻早停"
+// 这条纪律变得比不动还贵。
 func (t *EvoRollbackTool) Call(_ context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in struct {
 		Target string `json:"target"`
@@ -793,6 +910,7 @@ func recordRollback(tctx *tool.ToolContext) {
 	}
 }
 
+// parsePromoteInput 解析 evo_promote 的入参, 统一返回归一化后的 target/name 与状态目录。
 func parsePromoteInput(input json.RawMessage, tctx *tool.ToolContext) (target, name, stateDir string, errRes *tool.ToolResult) {
 	var in struct {
 		Target string `json:"target"`

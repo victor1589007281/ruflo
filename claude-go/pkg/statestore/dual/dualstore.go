@@ -123,6 +123,7 @@ type dualKV struct {
 	read ReadSource
 }
 
+// Get 按读源路由读取: agentdb 严格读, fallback 是 agentDB 未命中/出错时回退文件, 默认只读文件。
 func (d dualKV) Get(key string, out any) (bool, error) {
 	switch d.read {
 	case ReadAgentDB:
@@ -141,6 +142,20 @@ func (d dualKV) Get(key string, out any) (bool, error) {
 	}
 }
 
+// Put 先写文件 (权威副本, 失败即返回错误), 再 best-effort 写 agentDB (失败只记日志)。
+//
+// 算法解读：
+//
+//	原理：双写的一致性策略是「文件权威 + agentDB 观察」—— 文件侧成功才算写成功,
+//	      agentDB 只是第二落点, 失败只记日志 (fail-open), 不阻断主流程。
+//	关键不变量：写入顺序不可颠倒, 且 agentDB 的错误不得冒泡。顺序决定了
+//	      「文件有、agentDB 可能没有」这种偏斜方向; 反过来先写 agentDB 再写文件,
+//	      一旦文件失败, 读源是 agentdb 时就会读到文件侧不存在的状态 ——
+//	      此时文件已不再是权威副本, 整个「以文件为准」的前提被破坏。
+//	代价与边界：两侧不共享事务, 中间崩溃会留下单侧写入; 读侧靠 ReadSource 决定
+//	      容忍哪种偏斜 (file 档只看文件, fallback 档以 agentDB 优先、缺了才回退文件)。
+//	设计权衡：接受「可能不一致」换取「agentDB 挂掉不影响主流程」——
+//	      在 agentDB 的观察期内, 可用性优先于双份数据的严格一致。
 func (d dualKV) Put(key string, v any) error {
 	if err := d.f.Put(key, v); err != nil {
 		return err // 文件是权威副本, 必须成功
@@ -151,6 +166,7 @@ func (d dualKV) Put(key string, v any) error {
 	return nil
 }
 
+// Delete 两侧都删, 但只把文件侧的错误返回给调用方 —— agentDB 删失败仅记日志 (fail-open)。
 func (d dualKV) Delete(key string) error {
 	err := d.f.Delete(key)
 	if aerr := d.a.Delete(key); aerr != nil {
@@ -159,6 +175,10 @@ func (d dualKV) Delete(key string) error {
 	return err
 }
 
+// Keys 按读源路由列出键。
+//
+// 注意：fallback 档与 Get 的语义不一致 —— 这里只要 agentDB 不报错就采信 (哪怕返回空集),
+// 不像 Get 那样要求「命中」; 因此 agentDB 侧数据尚未补齐时, fallback 读会看到空列表而不是回退到文件。
 func (d dualKV) Keys() ([]string, error) {
 	switch d.read {
 	case ReadAgentDB:
@@ -182,6 +202,10 @@ type dualLog struct {
 	read ReadSource
 }
 
+// Append 先追加到文件日志 (失败即返回), 再 best-effort 追加到 agentDB。
+//
+// 注意：两侧是分别追加而非原子双写, 中途失败会让 agentDB 侧缺行 ——
+// 所以 agentDB 的日志只适合观测, 不能当作与文件等价的副本。
 func (d dualLog) Append(v any) error {
 	if err := d.f.Append(v); err != nil {
 		return err
@@ -192,6 +216,10 @@ func (d dualLog) Append(v any) error {
 	return nil
 }
 
+// ReadAll 按读源路由遍历全部日志行。
+//
+// 注意：fallback 档只有 agentDB 报错时才回退文件 —— 与 Get 不同, 它无法感知「读到了空日志」,
+// 因此 agentDB 侧日志缺失时 fallback 会读到空集而不是文件里的全量历史。
 func (d dualLog) ReadAll(fn func(line []byte) error) error {
 	switch d.read {
 	case ReadAgentDB:
@@ -215,6 +243,10 @@ type dualBlob struct {
 	read ReadSource
 }
 
+// Put 先写文件侧 blob 并取回内容哈希, 再 best-effort 写 agentDB; 返回文件侧哈希作为权威地址。
+//
+// 注意：agentDB 返回的哈希若与文件侧不同, 只记一条 warn 日志 —— 内容寻址存储里
+// 哈希不一致意味着两侧存了不同内容, 但调用方拿不到这个信号 (仍返回成功)。
 func (d dualBlob) Put(data []byte) (string, error) {
 	h, err := d.f.Put(data)
 	if err != nil {
@@ -228,6 +260,7 @@ func (d dualBlob) Put(data []byte) (string, error) {
 	return h, nil
 }
 
+// Get 按读源路由取回 blob 内容。
 func (d dualBlob) Get(hash string) ([]byte, error) {
 	switch d.read {
 	case ReadAgentDB:
@@ -244,6 +277,10 @@ func (d dualBlob) Get(hash string) ([]byte, error) {
 	}
 }
 
+// Has 判断 blob 是否存在。
+//
+// 注意：fallback 档用「或」而不是「回退」—— agentDB 说没有、文件说有, 也算存在,
+// 因为双写是 fail-open 的, 只要有一侧落盘成功内容就取得到 (取用走 Get 的同一套路由)。
 func (d dualBlob) Has(hash string) bool {
 	switch d.read {
 	case ReadAgentDB:
@@ -262,6 +299,11 @@ type remoteAdapter struct {
 	c *agentdbclient.Client
 }
 
+// KV 把远程 client 的 KV 返回类型提升为 statestore.KVStore。
 func (r remoteAdapter) KV(bucket string) statestore.KVStore    { return r.c.KV(bucket) }
+
+// Log 把远程 client 的 Log 返回类型提升为 statestore.AppendLog。
 func (r remoteAdapter) Log(bucket string) statestore.AppendLog { return r.c.Log(bucket) }
+
+// Blob 把远程 client 的 Blob 返回类型提升为 statestore.BlobStore。
 func (r remoteAdapter) Blob() statestore.BlobStore             { return r.c.Blob() }

@@ -59,6 +59,9 @@ func resolveWatchPath(p string) string {
 // 会误掐 (502 context deadline exceeded)。per-model max_tokens 仍自限生成长度。
 var upstreamTimeout = flag.Duration("upstream-timeout", 30*time.Minute, "翻译路径单次上游调用上限 (omen 长推理需 >10min)")
 
+// main 解析旗标、加载 config 并起热加载监视器, 构建模型解析器后注册全部路由并监听。
+// 每条路由都同时注册 /v1/* 与裸路径: 部署里的 pathfix 只改写其中一部分, 直挂本进程的
+// 实例 (无 pathfix) 靠裸注册兜底, 否则会裸 404。
 func main() {
 	var (
 		addr          = flag.String("addr", "127.0.0.1:18989", "监听地址")
@@ -235,6 +238,7 @@ func (g *gateway) fallbackForModel(r *http.Request) (modelconfig.ResolvedConfig,
 	return modelconfig.ResolvedConfig{}, sess, false
 }
 
+// orDefault 空串时返回默认值 d, 否则原样返回 s (仅用于日志等可读性场景)。
 func orDefault(s, d string) string {
 	if s == "" {
 		return d
@@ -315,6 +319,23 @@ func buildClient(rc modelconfig.ResolvedConfig) *api.Client {
 	return c
 }
 
+// handleMessages Anthropic /v1/messages 入口: 解析模型 (未声明则按会话回退) 后按协议分派。
+//
+// 算法解读：
+//
+//	原理：这是 Claude Code CLI 唯一的出站协议入口。函数先做模型解析 (精确别名 → 裸名反查
+//	      → default-prefix 兜底, 三个候选分支全部经 registeredOnly), 再按 rc.Protocol 二分支:
+//	      protocol 为空或 "anthropic" 走**逐字节透传**, 其余 (openai / openai-responses) 交给
+//	      pkg/api 的翻译器 —— 流式走 streamMessages, 非流式走 SendMessage。
+//	关键不变量：透传分支必须先把 model 改写为 "provider:model" 限定名 —— opencode 这类聚合
+//	      上游按限定名路由, 裸名会被拒 (Model k3 is not supported); 已是限定名时改写为同值,
+//	      无副作用。翻译分支则必须把 http.Client.Timeout 归一到 --upstream-timeout: NewClient
+//	      默认 5min 会先于 ctx 上限误掐长推理 (omen 可达 7+ min 才首 token)。
+//	代价与边界：透传分支不重编码, tool_choice / stop_sequences / metadata 等字段原样保留,
+//	      保真度最高; 翻译分支经 api 层重建请求, 换来的是非 anthropic 协议模型也能被 CLI 使用。
+//	设计权衡：未声明的模型名不直接报错, 而是按会话回退到上次成功用过的别名 —— 子 agent 派发时
+//	      常填它"以为"该用的名字, 兜底到父会话的模型比 404 更贴近事实, 且回退日志同时记下原名
+//	      与新名, 事后能数出拦截次数而不是只看到"没报错"。
 func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -368,6 +389,7 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 		client.Client.Timeout = *upstreamTimeout
 	}
 	if req.ToolChoice != nil && req.ToolChoice.Type == "any" {
+		// 客户端显式要求"必须调用工具": OpenAI 侧无等价字段, 由 api 层把 tool_choice 钉成 any
 		client = client.WithToolChoiceAny()
 	}
 
@@ -654,6 +676,7 @@ func (g *gateway) proxyOpenAIFormat(w http.ResponseWriter, r *http.Request, upst
 	}
 }
 
+// handleModels 返回 OpenAI 风格的模型清单 {"object":"list","data":[别名...]}, 供客户端探活。
 func (g *gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	ids := g.registry.AllAliases()
 	out := map[string]any{
@@ -666,6 +689,7 @@ func (g *gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 
 // ---- helpers ----
 
+// protoName 协议名归一: 空串视作 "anthropic" (缺省即 Anthropic 协议), 仅供日志可读。
 func protoName(p string) string {
 	if p == "" {
 		return "anthropic"
@@ -762,6 +786,7 @@ var (
 	gatewaySessionSeedVal  string
 )
 
+// gatewaySessionSeed 返回进程级会话种子 (sync.Once 只生成一次), 供无会话头的请求派生稳定 ID。
 func gatewaySessionSeed() string {
 	gatewaySessionSeedOnce.Do(func() { gatewaySessionSeedVal = newSessionID() })
 	return gatewaySessionSeedVal
@@ -847,6 +872,7 @@ func extractSystem(system interface{}) []string {
 	return nil
 }
 
+// writeError 按 Anthropic 错误信封 ({"type":...,"error":{"type":...,"message":...}}) 写回错误响应。
 func writeError(w http.ResponseWriter, status int, etype, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

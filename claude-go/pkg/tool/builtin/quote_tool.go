@@ -22,12 +22,15 @@ const QuoteToolName = "FetchQuote"
 
 type QuoteTool struct{ client *http.Client }
 
+// NewQuoteTool 构造行情工具, 内部 HTTP 客户端超时固定为 12s。
 func NewQuoteTool() *QuoteTool {
 	return &QuoteTool{client: &http.Client{Timeout: 12 * time.Second}}
 }
 
+// Name 返回工具名 FetchQuote。
 func (t *QuoteTool) Name() string { return QuoteToolName }
 
+// Description 返回工具说明, 含代码格式示例与"必须用本工具核实上市状态"的强约束。
 func (t *QuoteTool) Description() string {
 	return `多数据源实时行情 + 上市状态核实（A股/港股/美股）。
 聚合腾讯财经、新浪财经交叉验证，返回最新价/涨跌/名称，并明确标注【是否已上市】。
@@ -35,6 +38,7 @@ func (t *QuoteTool) Description() string {
 代码示例: 600519(A股) / hk00100 或 00100(港股) / NVDA(美股)。`
 }
 
+// InputSchema 返回输入 schema; 只有一个必填字段 symbol。
 func (t *QuoteTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type":"object",
@@ -43,8 +47,13 @@ func (t *QuoteTool) InputSchema() json.RawMessage {
 	}`)
 }
 
+// IsReadOnly 行情查询无副作用, 恒为只读。
 func (t *QuoteTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+
+// IsConcurrencySafe 纯 HTTP 读且无共享状态, 可并发调用。
 func (t *QuoteTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
+// CheckPermissions 只读查询不需要额外授权, 恒返回 nil 表示放行。
 func (t *QuoteTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
 }
@@ -61,11 +70,26 @@ type srcQuote struct {
 	OK     bool
 }
 
+// Call 向多源行情接口取价并交叉验证, 返回最新价/涨跌与【是否已上市】的结论。
+//
+// 算法解读：
+//
+//	原理：向腾讯财经与新浪财经各取一次行情, 只要有一路解析成功就判定该标的已在交易,
+//	      再用两路报价的离散程度给数据可信度打标 —— 存在的意义是让模型不必凭旧知识
+//	      断言"未上市"。
+//	关键不变量：**单源失败不等于未上市** —— 判定"已上市"用的是 len(srcs) > 0, 只有两路
+//	      全空才走未上市分支; 把任一路的失败直接当成结论, 会把已上市标的判成未上市,
+//	      而这正是本工具要消灭的错误。
+//	代价与边界：两路是串行 HTTP, 最坏耗时约两个超时; 无缓存、无重试。价格一致性判据是
+//	      (hi-lo)/hi < 5%, 对停牌/涨跌停/跨市场时差等极端行情会误报"存在差异"。
+//	设计权衡：宁可多打一次网络也不缓存 —— 行情必须实时, 用旧价格误判上市状态的代价
+//	      远高于一次请求; 因此也没有把"网络故障"与"确实查不到"分成两种返回。
 func (t *QuoteTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in quoteInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: "输入解析错误", IsError: true}, nil
 	}
+	// 归一化失败 (空串) 视为输入错误, 此时不发起任何网络请求。
 	code := normalizeQuoteCode(in.Symbol)
 	if code == "" {
 		return &tool.ToolResult{Content: "无法识别的代码: " + in.Symbol, IsError: true}, nil
@@ -79,6 +103,8 @@ func (t *QuoteTool) Call(ctx context.Context, input json.RawMessage, _ *tool.Too
 		srcs = append(srcs, q)
 	}
 
+	// 注意：这里返回的是**正常结果** (IsError=false), 调用方无法靠 IsError 区分
+	// "两路都网络失败"与"确实未上市", 只能靠这段文案。
 	if len(srcs) == 0 {
 		return &tool.ToolResult{Content: fmt.Sprintf(
 			"⚠️ 多源(腾讯/新浪)均未查到 %s 的实时行情。可能未上市或代码有误。"+
@@ -102,6 +128,7 @@ func (t *QuoteTool) Call(ctx context.Context, input json.RawMessage, _ *tool.Too
 				hi = p
 			}
 		}
+		// 5% 是经验阈值: 既容得下不同数据源的报价时滞, 又能在真出现偏差时报警。
 		if hi > 0 && (hi-lo)/hi < 0.05 {
 			sb.WriteString("→ 多源价格一致，数据可信。\n")
 		} else {
@@ -164,6 +191,10 @@ func (t *QuoteTool) sina(ctx context.Context, code string) srcQuote {
 	return srcQuote{}
 }
 
+// get 发一次 GET 并读回原始 body; referer 非空时带上 (新浪不带 Referer 会返 403)。
+//
+// 注意：不检查 HTTP 状态码 —— 403/404 的响应体也会被原样返回, 由各解析函数
+// 的正则不匹配兜底成"该源无数据"。
 func (t *QuoteTool) get(ctx context.Context, url, referer string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -205,6 +236,7 @@ func normalizeQuoteCode(s string) string {
 	return "us" + strings.ToUpper(s) // 字母 = 美股
 }
 
+// parseFloatSafe 尽力解析浮点数, 解析失败或非数字时返回 0 (不报错、不 panic)。
 func parseFloatSafe(s string) float64 {
 	var f float64
 	_, _ = fmt.Sscanf(strings.TrimSpace(s), "%g", &f)

@@ -35,6 +35,10 @@ func DetectPlatform() *Platform {
 	return detectedPlatform
 }
 
+// detectPlatformImpl 按 runtime.GOOS 分派: 探测各平台截图/输入工具的实际路径, 任一缺失即标记不可用并给安装提示。
+//
+// 返回的是**工具绝对路径**而非裸命令名 (Linux 侧的 LookPath 结果直接写回字段), 因为调用方要按
+// 路径 exec; macOS 的截图工具 screencapture 是系统自带, 故不探测直接写名字。
 func detectPlatformImpl() *Platform {
 	p := &Platform{OS: runtime.GOOS}
 

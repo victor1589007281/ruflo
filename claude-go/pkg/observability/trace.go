@@ -70,6 +70,7 @@ func (t TraceContext) BaggageValue(k string) string {
 	return t.Baggage[k]
 }
 
+// copyMap 浅拷贝一个 map[string]string, 让 WithBaggage 的"追加"不会改到原 TraceContext。
 func copyMap(m map[string]string) map[string]string {
 	out := make(map[string]string, len(m))
 	for k, v := range m {
@@ -196,6 +197,11 @@ func (s *ActiveSpanStore) List() []Span {
 	return out
 }
 
+// String 返回紧凑的 trace 标识串 (供日志使用): 无 trace 时是 "trace:none", 有父 span 时附带 parent。
+//
+// 注意: TraceID 只取前 8 位 ([:8]) —— TraceID 短于 8 个字符时会 panic。当前 TraceID 由
+// NewRootTrace 生成, 长度固定, 但外部注入的 TraceContext 若带短 ID 会在这里崩。
+//
 // String returns a compact trace identifier for logging.
 func (t TraceContext) String() string {
 	if t.TraceID == "" {

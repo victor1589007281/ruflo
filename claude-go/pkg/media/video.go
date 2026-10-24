@@ -384,6 +384,9 @@ func MuxAudio(ctx context.Context, videoPath, audioPath, outPath string) error {
 	return nil
 }
 
+// tailBytes 取字节切片的末尾 n 个字节 (超长时前缀省略号), 用于把外部工具的错误输出截进报错信息。
+//
+// 取尾巴而不是取头: ffmpeg 之类的工具把真正的失败原因打在最末几行, 截头部只会留下进度刷屏。
 func tailBytes(b []byte, n int) string {
 	if len(b) <= n {
 		return string(b)

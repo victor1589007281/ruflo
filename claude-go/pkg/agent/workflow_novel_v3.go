@@ -37,6 +37,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
 )
 
+// novelV3Workflow 返回 novel-v3 工作流定义: Phase A 创世播种 + Phase D 大纲设计 (Phase B/C/E/F 由编排器动态驱动)。
 func novelV3Workflow() *WorkflowDef {
 	return &WorkflowDef{
 		Name:        "novel-v3",
@@ -562,6 +563,7 @@ func (we *WorkflowExecutor) executeSwarmNovel(ctx context.Context, wf *WorkflowD
 
 // ── swarm_intel 集成: 构建 Simulate 目标 ──
 
+// buildSimulateObjective 把创作需求与前三阶段产物 (世界规则/角色灵魂/命运催化剂) 拼成群体演化的目标文本。
 func buildSimulateObjective(objective string, prevResults map[string]string, characters []soulCard) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("# 叙事群体演化模拟\n\n## 创作需求\n%s\n\n", objective))
@@ -815,6 +817,17 @@ type evoBluePrint struct {
 	DivergenceStrategy string `json:"divergence_strategy"`
 }
 
+// parseSoulCards 从 soul-forger 输出里解析角色灵魂卡; 解析不到 JSON 数组时退化为按名字抽取。
+//
+// 算法解读：
+//
+//	原理：先取输出里**首个 `[` 到末个 `]`** 的切片当 JSON 数组解析; 成功且非空则每个名字建一张
+//	      soulCard (Core 存整段原文, 供下游注入完整设定); 失败则退到 extractCharacterNames 抽名字,
+//	      再兜底一张名为"主角"的卡 —— 保证下游**至少有一张卡**, 不会因解析失败而空跑。
+//	关键不变量：Core 一律存**整段原文**而非解析出的字段 —— 灵魂卡的富文本细节 (欲望/恐惧/决策风格)
+//	      无法用几个字段穷举, 让下游 prompt 拿全文比拿残缺结构更安全。
+//	代价与边界：`[`...`]` 的取法不校验括号配对, 输出里若先出现别的方括号片段会被误当 JSON 起点;
+//	      但失败即回退到名字抽取, 只是拿不到结构化名字, 不会崩。
 func parseSoulCards(output string) []soulCard {
 	type jsonSoul struct {
 		Name       string `json:"name"`
@@ -829,6 +842,7 @@ func parseSoulCards(output string) []soulCard {
 		if json.Unmarshal([]byte(output[start:end+1]), &souls) == nil && len(souls) > 0 {
 			var result []soulCard
 			for _, s := range souls {
+				// Core 存整段原文而非拼装字段: 下游 prompt 需要完整灵魂设定, 不只是 name/desire/fear
 				result = append(result, soulCard{Name: s.Name, Core: output})
 			}
 			return result
@@ -845,6 +859,16 @@ func parseSoulCards(output string) []soulCard {
 	return cards
 }
 
+// extractCharacterNames 逐字节扫描文本里的 `"name":` 模式, 抽出后随的引号字符串作角色名 (去重)。
+//
+// 算法解读：
+//
+//	原理：滑动一个 7 字节窗口匹配 `"name":` / `"name" :`, 命中后在其后找**成对引号**取名字,
+//	      并用 seen 表去重。刻意不走 json.Unmarshal —— 输入是 LLM 输出, 往往整体不是合法 JSON,
+//	      但局部字段仍可读。
+//	关键不变量：循环上界是 len(text)-10 —— 比窗口宽, 保证 `rest := text[i+7:]` 与后续两次
+//	      Index 都不会越界; 名字长度限 [1,20) 且第二引号距首引号 ≤50 字节, 挡掉长段落被误当名字。
+//	代价与边界：纯字节扫描不识别转义引号, 名字含 \" 会被截断 —— 对中文角色名不构成实际影响。
 func extractCharacterNames(text string) []string {
 	var names []string
 	seen := make(map[string]bool)
@@ -857,7 +881,7 @@ func extractCharacterNames(text string) []string {
 				continue
 			}
 			q2 := strings.Index(rest[q1+1:], `"`)
-			if q2 < 0 || q2 > 50 {
+			if q2 < 0 || q2 > 50 { // 50 字节上限: 再长就不是角色名, 而是把整段文字误当成了引号串
 				continue
 			}
 			name := rest[q1+1 : q1+1+q2]
@@ -870,6 +894,7 @@ func extractCharacterNames(text string) []string {
 	return names
 }
 
+// soulCardNames 把角色卡的名字用 ", " 连成一串, 供 prompt 里点名参与者。
 func soulCardNames(cards []soulCard) string {
 	var names []string
 	for _, c := range cards {
@@ -878,6 +903,16 @@ func soulCardNames(cards []soulCard) string {
 	return strings.Join(names, ", ")
 }
 
+// parseEvoBluePrint 解析演化蓝图 (时间线数/轮数/分歧策略), 越界或缺失的字段一律回落到默认值。
+//
+// 算法解读：
+//
+//	原理：先填一组安全默认 (3 条时间线 / 5 轮 / random), 再取首个 `{` 到末个 `}` 解析 JSON,
+//	      只对**落在合法区间**的字段做覆盖 —— 即每个字段都是"默认值 + 通过校验才替换"。
+//	关键不变量：区间校验是硬闸门 (时间线 2~5, 轮数 3~10): 模型偶尔吐出 0 或 100 这种数,
+//	      直接采信会让模拟要么空转要么爆量烧 token; 钳在区间内则退化为默认值, 保证跑得起来。
+//	设计权衡：不返回 error —— 蓝图是**建议**不是契约, 解析失败用默认值继续, 比让整个 Phase B
+//	      因一段 JSON 崩掉更符合"生成式管线"的容错取向。
 func parseEvoBluePrint(output string) evoBluePrint {
 	bp := evoBluePrint{TimelineCount: 3, Rounds: 5, DivergenceStrategy: "random"}
 
@@ -900,6 +935,14 @@ func parseEvoBluePrint(output string) evoBluePrint {
 	return bp
 }
 
+// parseBestTimeline 从审判输出里取 best_timeline, 换算成 0 基下标; 越界或缺失一律回 0。
+//
+// 算法解读：
+//
+//	原理：取首个 `{` 到末个 `}` 解析 `best_timeline` (1 基), 校验落在 [1, count] 才减 1 返回。
+//	关键不变量：**必须夹在 [1,count] 内**才采信 —— 越界值直接丢弃回 0, 否则下游按该下标取
+//	      timelines[idx] 会 panic 或取到错的时间线。回 0 是"安全默认": 至少指向第一条。
+//	设计权衡：与 parseEvoBluePrint 同构 —— 解析失败不报错, 用默认下标让主流程继续。
 func parseBestTimeline(evaluation string, count int) int {
 	type evalResult struct {
 		BestTimeline int `json:"best_timeline"`
@@ -919,6 +962,7 @@ func parseBestTimeline(evaluation string, count int) int {
 
 // ── Prompt 构建 ──
 
+// buildJudgePrompt 构建文学评委 prompt: 角色设定 (查一致性) + 逐条时间线 (各截 4000 字) + 评分维度与 JSON 输出格式。
 func buildJudgePrompt(objective string, prevResults map[string]string, timelines []string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("你是文学评委。以下是 %d 条不同时间线演化出的故事, 请进行多维度评估。\n\n创作需求: %s\n\n", len(timelines), objective))
