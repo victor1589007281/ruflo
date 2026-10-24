@@ -341,6 +341,7 @@ func main() {
 	rootCmd.AddCommand(helpCmd())
 	rootCmd.AddCommand(codeintelMCPServerCmd())
 	rootCmd.AddCommand(platformMCPServerCmd()) // L5 platform-mcp-server (design/02 §3.5)
+	rootCmd.AddCommand(searchMCPServerCmd())   // search/market 数据面 MCP
 	rootCmd.AddCommand(wechatCmd())
 	rootCmd.AddCommand(swarmCmd())
 

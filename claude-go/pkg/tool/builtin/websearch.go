@@ -24,8 +24,15 @@ type WebSearchTool struct {
 }
 
 // NewWebSearchTool 构造 WebSearch 工具实例。
-// 若 searcher 为 nil，降级为说明性指引。
+//
+// searcher 为 nil 时自动使用进程级数据面 (DefaultDataStack); 只有显式
+// CLAUDE_GO_DATA_DISABLED=1 或数据面装配失败时才没有搜索能力。
 func NewWebSearchTool(searcher WebSearcher) *WebSearchTool {
+	if searcher == nil {
+		if d := DefaultDataStack(); d != nil {
+			searcher = d.Search
+		}
+	}
 	return &WebSearchTool{searcher: searcher}
 }
 
@@ -34,7 +41,7 @@ func (t *WebSearchTool) Name() string { return WebSearchToolName }
 
 // Description 返回给模型的工具说明 (英文原文)。
 func (t *WebSearchTool) Description() string {
-	return `Search the web and return results. Uses a configured search engine (default: Bing). Returns search results as structured text.`
+	return `Search the web through a zero-cost multi-provider layer (Parallel/Exa anonymous MCP, Bing RSS, Wikipedia, GitHub, Stack Exchange, OpenAlex, Crossref, PubMed, Hacker News, npm, PyPI). Returns JSON results with URL, title, snippet, provider and any degradation. No API key required.`
 }
 
 // InputSchema 返回入参 schema: query 必填, allowed_domains 为可选域提示。
@@ -80,8 +87,21 @@ func (t *WebSearchTool) Call(ctx context.Context, input json.RawMessage, _ *tool
 
 	// 尝试真实搜索
 	if t.searcher != nil {
+		// 新的数据面提供结构化 JSON (URL/provider/降级信息齐全); 旧接口只有文本。
+		if js, ok := t.searcher.(interface {
+			SearchJSON(context.Context, string) (string, error)
+		}); ok {
+			out, err := js.SearchJSON(ctx, q)
+			if err != nil {
+				return &tool.ToolResult{Content: fmt.Sprintf("WebSearch error: %v", err), IsError: true}, nil
+			}
+			return &tool.ToolResult{Content: out}, nil
+		}
 		title, text, _, err := t.searcher.Search(ctx, q)
-		if err == nil && strings.TrimSpace(text) != "" {
+		if err != nil {
+			return &tool.ToolResult{Content: fmt.Sprintf("WebSearch error: %v", err), IsError: true}, nil
+		}
+		if strings.TrimSpace(text) != "" {
 			var b strings.Builder
 			if title != "" {
 				fmt.Fprintf(&b, "【搜索结果】%s\n\n", title)
@@ -93,11 +113,12 @@ func (t *WebSearchTool) Call(ctx context.Context, input json.RawMessage, _ *tool
 			}
 			return &tool.ToolResult{Content: strings.TrimSpace(b.String())}, nil
 		}
+		return &tool.ToolResult{Content: fmt.Sprintf("WebSearch: no results for %q (providers returned empty)", q)}, nil
 	}
 
 	// 降级: 说明性指引
 	var b strings.Builder
-	b.WriteString("【WebSearch 未配置浏览器】未发起真实网络搜索。\n\n")
+	b.WriteString("【WebSearch 未装配】本进程没有可用的搜索数据面, 未发起真实网络搜索。\n\n")
 	fmt.Fprintf(&b, "你的查询: %q\n", q)
 
 	if len(in.AllowedDomains) > 0 {

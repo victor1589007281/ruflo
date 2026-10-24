@@ -59,19 +59,36 @@ type BrowserClient interface {
 	Fetch(ctx context.Context, url string) (title, text, html string, err error)
 }
 
+// PageFetcher 是搜索数据面的抓取接口 (SSRF 校验、出口切换、readability 提取)。
+type PageFetcher interface {
+	FetchJSON(ctx context.Context, url string, maxChars int) (string, error)
+}
+
 // WebFetchTool HTTP 拉取并文本化网页内容的工具。
 type WebFetchTool struct {
 	browser BrowserClient
+	fetcher PageFetcher
 }
 
 // NewWebFetchTool 构造 WebFetch 工具实例。
+//
+// 默认接入进程级搜索数据面; 数据面未装配时退回本文件内置的裸 HTTP 实现。
 func NewWebFetchTool() *WebFetchTool {
-	return &WebFetchTool{}
+	t := &WebFetchTool{}
+	if d := DefaultDataStack(); d != nil {
+		t.fetcher = d.Search
+	}
+	return t
 }
 
 // SetBrowser 注入浏览器客户端，增强抓取能力 (stealth + JS 渲染)。
 func (t *WebFetchTool) SetBrowser(b BrowserClient) {
 	t.browser = b
+}
+
+// SetFetcher 注入搜索数据面的抓取实现 (优先于浏览器与内置 HTTP)。
+func (t *WebFetchTool) SetFetcher(f PageFetcher) {
+	t.fetcher = f
 }
 
 // Name 返回工具对外名。
@@ -128,6 +145,19 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return &tool.ToolResult{Content: fmt.Sprintf("错误: 仅支持 http/https，拒绝协议 %q", u.Scheme), IsError: true}, nil
+	}
+
+	// 路由 0: 搜索数据面 (SSRF 校验 + 出口切换 + 正文提取)。
+	//
+	// 数据面已装配时不再回落到下面的裸 HTTP: 那条路径没有逐跳重定向校验,
+	// 也不能按站点切代理, 回退会把一个明确的 blocked/timeout 变成一次
+	// 侥幸成功或一次更慢的失败。
+	if t.fetcher != nil {
+		out, ferr := t.fetcher.FetchJSON(ctx, u.String(), maxWebFetchChars)
+		if ferr != nil {
+			return &tool.ToolResult{Content: fmt.Sprintf("WebFetch error: %v", ferr), IsError: true}, nil
+		}
+		return &tool.ToolResult{Content: out}, nil
 	}
 
 	// 路由 1: 尝试浏览器抓取 (stealth + JS 渲染 + MediaWiki API 自动路由)

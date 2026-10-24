@@ -74,6 +74,7 @@ func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searche
 		todoTool := NewTodoWriteTool()
 		reg.Register(todoTool)
 		registerWebAndInteractionTools(reg, searcher)
+		registerMarketDataTools(reg)
 		reg.Register(NewEnterPlanModeTool())
 		reg.Register(NewExitPlanModeTool())
 		reg.Register(NewToolSearchTool(reg))
@@ -95,6 +96,7 @@ func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searche
 		registerCodeIntelReadTools(reg) // CodeIntelQuery/Status (只读, 精准定位代替地毯式扫描)
 		reg.Register(NewWebFetchTool())
 		reg.Register(NewWebSearchTool(searcher))
+		registerMarketDataTools(reg)
 		reg.Register(NewStructuredOutputTool())
 		reg.Register(NewToolSearchTool(reg))
 		return nil, store

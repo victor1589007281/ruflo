@@ -1,0 +1,15 @@
+{
+  "name": "claude-go-search",
+  "version": "1.0.0",
+  "description": "Zero-cost web search, page fetch, and point-in-time market data for claude-go.",
+  "skills": [
+    "skills/web-search",
+    "skills/market-data"
+  ],
+  "mcpServers": {
+    "claude-go-search": {
+      "command": "claude-go",
+      "args": ["search-mcp-server"]
+    }
+  }
+}

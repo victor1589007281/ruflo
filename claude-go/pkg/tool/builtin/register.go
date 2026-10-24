@@ -60,6 +60,8 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	reg.Register(NewWebSearchTool(searcher))
 	reg.Register(NewKLineTool())
 	reg.Register(NewQuoteTool())
+	// 结构化行情数据面 (时点/复权/多源核价), 与 WebSearch 的叙述性检索分工。
+	registerMarketDataTools(reg)
 
 	// User interaction
 	reg.Register(NewAskUserQuestionTool())
