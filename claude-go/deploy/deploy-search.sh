@@ -34,11 +34,14 @@ fi
 
 # search-mcp sidecar: 把数据面作为独立 MCP 端点暴露 (与 codeintel MCP 同 Pod,
 # 端口 29235)。用 strategic merge 幂等写入, 已存在时只更新镜像与 env。
+# GITHUB_TOKEN 走可选 Secret: 没有建 secret 时 Pod 照常启动 (optional: true),
+# 只是 GitHub 搜索源按未认证的 10 req/min 限流。写入用 deploy/set-github-token.sh。
 SEARCH_ENV=$(cat <<'JSON'
 [
   {"name":"SEARCH_PROXY_URL","value":"http://100.96.50.63:8888"},
   {"name":"SEARCH_NO_PROXY","value":"127.0.0.1,localhost,::1,100.96.50.63"},
-  {"name":"SEARCH_MAX_TIER","value":"L2"}
+  {"name":"SEARCH_MAX_TIER","value":"L2"},
+  {"name":"GITHUB_TOKEN","valueFrom":{"secretKeyRef":{"name":"claude-go-search-github","key":"GITHUB_TOKEN","optional":true}}}
 ]
 JSON
 )
@@ -51,7 +54,7 @@ for pair in "claude-go-control:control" "claude-go-worker:worker"; do
 done
 
 kubectl -n "$NS" patch deploy claude-go-mcp --type=strategic -p "$(cat <<JSON
-{"spec":{"template":{"spec":{"containers":[{"name":"search-mcp","image":"$IMG","imagePullPolicy":"Never","args":["search-mcp-server","--transport","http","--addr","0.0.0.0:29235"],"env":[{"name":"HOME","value":"/tmp"},{"name":"SEARCH_PROXY_URL","value":"http://100.96.50.63:8888"},{"name":"SEARCH_NO_PROXY","value":"127.0.0.1,localhost,::1,100.96.50.63"},{"name":"SEARCH_MAX_TIER","value":"L2"}], "ports":[{"name":"search","containerPort":29235}],"resources":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"cpu":"1","memory":"1Gi"}}}]}}}}
+{"spec":{"template":{"spec":{"containers":[{"name":"search-mcp","image":"$IMG","imagePullPolicy":"Never","args":["search-mcp-server","--transport","http","--addr","0.0.0.0:29235"],"env":[{"name":"HOME","value":"/tmp"},{"name":"SEARCH_PROXY_URL","value":"http://100.96.50.63:8888"},{"name":"SEARCH_NO_PROXY","value":"127.0.0.1,localhost,::1,100.96.50.63"},{"name":"SEARCH_MAX_TIER","value":"L2"},{"name":"GITHUB_TOKEN","valueFrom":{"secretKeyRef":{"name":"claude-go-search-github","key":"GITHUB_TOKEN","optional":true}}}], "ports":[{"name":"search","containerPort":29235}],"resources":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"cpu":"1","memory":"1Gi"}}}]}}}}
 JSON
 )" >/dev/null
 
