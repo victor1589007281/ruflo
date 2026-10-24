@@ -72,12 +72,19 @@ func (m *Manager) scheduleSearch(ctx context.Context, req SearchRequest, candida
 	}()
 
 	out := make([]sourceResult, 0, len(candidates))
-	// gatherWindow 是首个有结果的源返回后, 继续等待第二源的时间窗。
+	// gatherWindow 是首源有结果后, 继续等待第二源的时间窗。
 	//
 	// 目的是拿到 2 源融合的召回, 但不能为了等一个慢源把 p95 拖到搜索超时:
 	// 首源有结果后最多再等 250ms, 到点立即返回并取消其余请求。
+	//
+	// 触发条件限定为"主源已落定"(primaryDone): 若快的是对冲源而主源仍在途,
+	// 立即返回会丢掉偏好最高的源 —— 新闻意图下 bing_rss 400ms 返回、parallel
+	// 冷启动 2s, 早退会让每次检索都退化成 bing 单源且门禁不过。此时必须等
+	// 主源出结果或单源超时 (有硬上限, 不会无限等)。
 	const gatherWindow = 250 * time.Millisecond
 	var gatherC <-chan time.Time
+	primary := candidates[0].Name()
+	primaryDone := false
 
 	for {
 		select {
@@ -86,10 +93,13 @@ func (m *Manager) scheduleSearch(ctx context.Context, req SearchRequest, candida
 				return out
 			}
 			out = append(out, r)
+			if r.name == primary {
+				primaryDone = true
+			}
 			if len(out) == len(candidates) {
 				return out
 			}
-			if r.err == nil && len(r.results) > 0 && gatherC == nil {
+			if r.err == nil && len(r.results) > 0 && gatherC == nil && primaryDone {
 				gatherC = time.NewTimer(gatherWindow).C
 			}
 		case <-gatherC:

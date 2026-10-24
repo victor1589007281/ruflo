@@ -61,13 +61,15 @@ func PlanQuery(query string) QueryPlan {
 	case containsAny(lower, "论文", "paper", "arxiv", "survey", "文献", "crossref", "pubmed"):
 		plan.Intent = IntentAcademic
 		plan.SiteHints = []string{"site:arxiv.org", "site:openalex.org"}
-	case containsAny(lower, "今天", "今日", "最新", "release", "发布", "新闻", "news", "刚刚"):
+	case containsAny(lower, "今天", "今日", "最新", "发布", "新闻", "news", "刚刚"):
+		// 注意不含 "release": "postgres 18 release notes" 是查文档, 不是要上周新闻。
+		// 把它当新闻会强制 week 级新鲜度, 质量门因文档日期旧而恒不过。
 		plan.Intent = IntentNews
 		plan.Freshness = "week"
 	case yearPattern.MatchString(lower):
-		// 带年份多为时效/版本问题, 但不至于强制 day 级新鲜度。
+		// 带年份/版本多为时效问题, 但按"年"而非"周"要求: 版本发布说明通常不是本周的。
 		plan.Intent = IntentNews
-		plan.Freshness = "week"
+		plan.Freshness = "year"
 	}
 
 	if plan.Language == "" {
@@ -164,6 +166,9 @@ func selectProviders(providers []Provider, plan QueryPlan, cfg Config, eg *Egres
 			continue
 		}
 		if !p.Healthy() {
+			// 退避/熔断中的源不参与本次检索, 但必须让调用方看见 —— 否则
+			// 结果看起来像"本来就只有这一个源", 召回变差却无从归因。
+			degraded = append(degraded, "provider_unhealthy:"+p.Name())
 			continue
 		}
 		if quota != nil && quota.cooling(p.Name()) {

@@ -141,6 +141,9 @@ type SearchResponse struct {
 	CacheHit   bool
 	ElapsedMS  int64
 	GatePassed bool
+	// GateReason 是质量门的失败维度 (domains/snippet/lang/duplicate/fresh);
+	// 通过时为 "pass"。只暴露判据, 不暴露内部指标值。
+	GateReason string
 }
 
 // FetchResponse 是 Manager 抓取结果。

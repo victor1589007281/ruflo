@@ -611,7 +611,9 @@ func mcpItemsToResults(items []mcpResultItem) []search.Result {
 			title = url
 		}
 		snippet := firstNonEmpty(it.Snippet, it.Description, strings.Join(it.Excerpts, " "), it.Text, it.Content)
-		published := firstNonEmpty(it.PublishedDate, it.Published)
+		// publish_date 是 Parallel 的字段名; 漏掉它会让新闻结果全部没有时间,
+		// 质量门的 fresh 维度因此恒不过。
+		published := firstNonEmpty(it.PublishedDate, it.Published, it.PublishDate)
 		out = append(out, search.Result{
 			URL:       url,
 			Title:     title,

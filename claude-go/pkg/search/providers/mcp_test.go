@@ -380,3 +380,17 @@ func TestArgsForToolSchemaUsesDeclaredProperties(t *testing.T) {
 		t.Fatalf("exa args wrong: %+v", args)
 	}
 }
+
+// TestParseMCPResultsKeepsPublishDate 验证 Parallel 的 publish_date 不被丢弃。
+//
+// 丢掉时间会让新闻类结果在质量门里全部算"不新鲜", gate 恒为 fresh 失败。
+func TestParseMCPResultsKeepsPublishDate(t *testing.T) {
+	text := `{"search_id":"x","results":[{"url":"https://a.com/1","title":"t","publish_date":"2026-10-23T10:00:00Z","excerpts":["e"]}]}`
+	got, err := parseMCPResults("parallel", text)
+	if err != nil {
+		t.Fatalf("parseMCPResults: %v", err)
+	}
+	if len(got) != 1 || got[0].Published.IsZero() {
+		t.Fatalf("Published 丢失: %+v", got)
+	}
+}

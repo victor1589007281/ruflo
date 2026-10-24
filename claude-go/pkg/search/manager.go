@@ -244,6 +244,7 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 		Degraded:   dedupeStrings(degraded),
 		CostUSD:    0, // 零成本约束: 任何情况下都不上报伪造成本
 		GatePassed: passed,
+		GateReason: quality.gateReason(needFresh),
 	}
 	m.cache.put(cacheKey, resp, m.cacheTTL(plan, req))
 	return resp, nil
@@ -253,9 +254,12 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 //
 // 新闻类或显式 freshness=day 的查询用较短 TTL, 其余用通用 TTL。
 func (m *Manager) cacheTTL(plan QueryPlan, req SearchRequest) time.Duration {
-	fresh := plan.Intent == IntentNews ||
+	// 只有真正要求"天/周"级时效时才用短 TTL; 版本/年份类查询虽走新闻源排序,
+	// 但内容不会 5 秒一变, 用短 TTL 只会白白打源。
+	f := strings.ToLower(strings.TrimSpace(plan.Freshness))
+	fresh := f == "day" || f == "week" ||
 		strings.EqualFold(strings.TrimSpace(req.Freshness), "day") ||
-		strings.EqualFold(strings.TrimSpace(plan.Freshness), "day")
+		strings.EqualFold(strings.TrimSpace(req.Freshness), "week")
 	if fresh && m.cfg.CacheFreshTTL > 0 {
 		return m.cfg.CacheFreshTTL
 	}

@@ -55,9 +55,10 @@ func (l *LegacySearcher) SearchJSON(ctx context.Context, query string) (string, 
 		Degraded   []string `json:"degraded,omitempty"`
 		CacheHit   bool     `json:"cache_hit"`
 		GatePassed bool     `json:"gate_passed"`
+		GateReason string   `json:"gate_reason,omitempty"`
 		ElapsedMS  int64    `json:"elapsed_ms"`
 		CostUSD    float64  `json:"cost_usd"`
-	}{query, resp.Results, resp.Providers, resp.Degraded, resp.CacheHit, resp.GatePassed, resp.ElapsedMS, resp.CostUSD})
+	}{query, resp.Results, resp.Providers, resp.Degraded, resp.CacheHit, resp.GatePassed, resp.GateReason, resp.ElapsedMS, resp.CostUSD})
 }
 
 // SearchRequestJSON 是带参数的检索入口 (语言/时限/域偏好), 供 MCP 工具使用。

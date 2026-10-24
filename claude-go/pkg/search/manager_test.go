@@ -919,3 +919,116 @@ func urls(results []Result) []string {
 	}
 	return out
 }
+
+// TestSelectProvidersMarksUnhealthy 验证退避中的源被跳过时必须留下归因。
+//
+// 不标 degraded 的话, 召回变差会表现为"本来就只有这些源", 运维无从发现
+// 某个源正在退避。
+func TestSelectProvidersMarksUnhealthy(t *testing.T) {
+	ok := newFake("ok", TierL2, nil)
+	down := newFake("down", TierL0, nil)
+	down.healthy.Store(false)
+
+	cfg := DefaultConfig()
+	cfg.Providers = map[string]ProviderConfig{
+		"ok":   {Enabled: true, Tier: TierL2},
+		"down": {Enabled: true, Tier: TierL0},
+	}
+	cands, degraded := selectProviders([]Provider{down, ok}, PlanQuery("x"), cfg, testEgress(t), newQuotaTracker())
+	if len(cands) != 1 || cands[0].Name() != "ok" {
+		t.Fatalf("candidates = %v", cands)
+	}
+	if !contains(degraded, "provider_unhealthy:down") {
+		t.Fatalf("degraded = %v, want provider_unhealthy:down", degraded)
+	}
+}
+
+// TestSearchWaitsForPrimaryWhenHedgeIsFaster 验证快的是对冲源时不能立即返回。
+//
+// 新闻意图的候选顺序是 parallel → bing_rss: bing 往往 400ms 就回来,
+// parallel 冷启动要 2s。若按"任一源有结果"早退, 每次新闻检索都会丢掉主源,
+// 质量门直接不过。
+func TestSearchWaitsForPrimaryWhenHedgeIsFaster(t *testing.T) {
+	primary := newFake("primary", TierL0, func(ctx context.Context, _ SearchRequest) ([]Result, error) {
+		select {
+		case <-time.After(300 * time.Millisecond):
+			return []Result{{URL: "https://a.com/p", Title: "p", Snippet: "s"}}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	// 同 tier 按 name 升序, 用 z 开头保证 primary 是候选第一位。
+	hedge := newFake("zhedge", TierL0, func(context.Context, SearchRequest) ([]Result, error) {
+		return []Result{{URL: "https://b.com/h", Title: "h", Snippet: "s"}}, nil
+	})
+	if hedge.Name() < primary.Name() {
+		t.Fatalf("测试前提不成立: hedge 必须排在 primary 之后")
+	}
+
+	cfg := DefaultConfig()
+	cfg.HedgeDelay = 0
+	m := NewManager(cfg, testEgress(t), []Provider{primary, hedge})
+	defer m.Close()
+
+	start := time.Now()
+	resp, err := m.Search(context.Background(), SearchRequest{Query: "news"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if time.Since(start) < 300*time.Millisecond {
+		t.Fatalf("在 %s 就返回, 没等主源", time.Since(start))
+	}
+	if !contains(resp.Providers, "primary") || !contains(resp.Providers, "zhedge") {
+		t.Fatalf("providers = %v, want both", resp.Providers)
+	}
+}
+
+// TestSearchReturnsEarlyWhenPrimaryIsFast 验证主源先成功时仍只等 250ms 的聚合窗。
+func TestSearchReturnsEarlyWhenPrimaryIsFast(t *testing.T) {
+	primary := newFake("primary", TierL0, func(context.Context, SearchRequest) ([]Result, error) {
+		return []Result{{URL: "https://a.com/p", Title: "p", Snippet: "s"}}, nil
+	})
+	slow := newFake("zslow", TierL0, func(ctx context.Context, _ SearchRequest) ([]Result, error) {
+		select {
+		case <-time.After(3 * time.Second):
+			return []Result{{URL: "https://b.com/s", Title: "s", Snippet: "s"}}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+
+	cfg := DefaultConfig()
+	cfg.HedgeDelay = 0
+	m := NewManager(cfg, testEgress(t), []Provider{primary, slow})
+	defer m.Close()
+
+	start := time.Now()
+	resp, err := m.Search(context.Background(), SearchRequest{Query: "general"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("主源已成功却等了 %s, 聚合窗没有生效", d)
+	}
+	if !contains(resp.Providers, "primary") {
+		t.Fatalf("providers = %v", resp.Providers)
+	}
+}
+
+// TestPlanQueryVersionQueriesAreNotWeeklyNews 验证版本/发布说明类查询不被误判为
+// "最近一周的新闻" —— 那会让质量门因为文档日期旧而恒不过。
+func TestPlanQueryVersionQueriesAreNotWeeklyNews(t *testing.T) {
+	for _, q := range []string{"postgres 18 release notes", "kubernetes 1.34 release date"} {
+		plan := PlanQuery(q)
+		if plan.Freshness == "week" || plan.Freshness == "day" {
+			t.Errorf("%q freshness = %s, want any/year", q, plan.Freshness)
+		}
+	}
+	plan := PlanQuery("kubernetes 1.34 release date 2025")
+	if plan.Freshness != "year" {
+		t.Errorf("带年份 freshness = %s, want year", plan.Freshness)
+	}
+	if got := PlanQuery("今天有什么新闻").Freshness; got != "week" {
+		t.Errorf("新闻 freshness = %s, want week", got)
+	}
+}
