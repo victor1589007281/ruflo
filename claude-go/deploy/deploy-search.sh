@@ -59,17 +59,66 @@ JSON
 kubectl -n "$NS" patch svc claude-go-mcp --type=strategic \
   -p '{"spec":{"ports":[{"name":"search","port":29235,"targetPort":29235}]}}' >/dev/null
 
-echo "==> 滚动更新: $DEPLOYMENTS"
-for d in $DEPLOYMENTS; do
+# 把 search MCP 登记进 config.json 的 mcpServers。
+#
+# 只暴露端口不登记, 能力中心的 MCP 页仍是空的 —— 那里读的是 bot 启动时建立的
+# 连接 (/api/mcp/servers), 不是 k8s Service 清单。控制面与 mcp Pod 在同一个
+# 命名空间, 走 Service DNS 即可; 用 127.0.0.1 会把连接指到控制面自己的 Pod。
+#
+# ConfigMap 里含凭据, 所以整份内容只在管道里流转, 不写临时文件、不落日志。
+echo "==> 登记 search MCP 到 mcpServers"
+NEW_CM=$(kubectl -n "$NS" get cm agents-config -o json | NS="$NS" python3 -c '
+import json, os, sys
+cm = json.load(sys.stdin)
+cfg = json.loads(cm["data"]["config.json"])
+servers = cfg.setdefault("mcpServers", {})
+want = {
+    "transport": "http",
+    "url": "http://claude-go-mcp.%s.svc.cluster.local:29235" % os.environ.get("NS", "agents"),
+}
+if servers.get("claude-go-search") == want:
+    sys.exit(0)
+servers["claude-go-search"] = want
+cm["data"]["config.json"] = json.dumps(cfg, ensure_ascii=False, indent=2)
+print(json.dumps(cm))
+')
+if [ -n "$NEW_CM" ]; then
+  printf '%s' "$NEW_CM" | kubectl -n "$NS" replace -f - >/dev/null
+  echo "    mcpServers.claude-go-search 已写入"
+else
+  echo "    mcpServers.claude-go-search 已存在"
+fi
+unset NEW_CM
+
+# 先切 search-mcp 并等它就绪, 再切控制面。
+#
+# 控制面在启动时只尝试连接 mcpServers 一次, 失败不重试 (pkg/feishu/bot.go:
+# addMCPServerWithTimeout)。两者同时滚动时, 控制面会碰上仍在 Terminating 的旧
+# mcp Pod, 拿到旧二进制返回的 method not found, 于是能力中心一直显示"没有连接
+# 的 MCP 服务器" —— 而镜像、Service、配置全都对。
+switch_image() {
+  local d=$1
   # 一个 Pod 可能有多个容器 (mcp 有 codeintel + search-mcp), 全部切到同一镜像。
   while IFS= read -r c; do
     [ -n "$c" ] || continue
     kubectl -n "$NS" set image "deploy/$d" "$c=$IMG"
   done < <(kubectl -n "$NS" get deploy "$d" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}')
+}
+
+echo "==> 滚动更新: $DEPLOYMENTS"
+rest=""
+for d in $DEPLOYMENTS; do
+  if [ "$d" = "claude-go-mcp" ]; then
+    switch_image "$d"
+    kubectl -n "$NS" rollout status "deploy/$d" --timeout=180s
+  else
+    rest="$rest $d"
+  fi
 done
 
-echo "==> 等待 rollout"
-for d in $DEPLOYMENTS; do
+echo "==> 等待其余 rollout"
+for d in $rest; do
+  switch_image "$d"
   kubectl -n "$NS" rollout status "deploy/$d" --timeout=180s
 done
 

@@ -894,6 +894,23 @@ func renderMarkdown(root *htmlNode) string {
 	return normalizeMarkdown(b.String())
 }
 
+// renderChildren 把 n 的子节点渲染成 Markdown, 供需要"把子树当独立文档"的
+// 块级元素 (目前是 blockquote) 使用。
+//
+// 不能直接调用 renderMarkdown(n): 后者对非根节点会先 renderBlock(n) 一次,
+// 于是 blockquote 会再次进入本分支 —— 页面里只要有一个 <blockquote>,
+// WebFetch 就会递归到栈溢出 (整个进程 fatal, 不是返回错误)。
+func renderChildren(n *htmlNode) string {
+	var b mdBuf
+	if n == nil {
+		return ""
+	}
+	for _, c := range n.children {
+		renderBlock(c, &b, 0)
+	}
+	return normalizeMarkdown(b.String())
+}
+
 // renderBlock 渲染块级节点。
 func renderBlock(n *htmlNode, b *mdBuf, depth int) {
 	if n == nil {
@@ -932,7 +949,7 @@ func renderBlock(n *htmlNode, b *mdBuf, depth int) {
 		b.write("```")
 		b.ensureBlank()
 	case "blockquote":
-		inner := renderMarkdown(n)
+		inner := renderChildren(n)
 		b.ensureBlank()
 		for _, line := range strings.Split(inner, "\n") {
 			b.write("> ")

@@ -88,11 +88,13 @@ func (s *Server) HandleRPC(ctx context.Context, raw []byte) []byte {
 
 	switch req.Method {
 	case "initialize":
-		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-			"protocolVersion": ProtocolVersion,
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "claude-go-search", "version": "1.0.0"},
-		}})
+		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: s.handshake()})
+	case "server/discover":
+		// claude-go 自己的 MCP 客户端 (pkg/mcp) 走 2026-07-28 无状态协商, 第一步就是
+		// server/discover; 只实现 initialize 的服务会在这一步被判连接失败, 且失败
+		// 归因是 "method not found" 而不是 "协议不兼容" —— 能力中心里只会显示
+		// 这个 MCP 服务器压根没连上。discover 与 initialize 返回同一份能力即可。
+		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: s.handshake()})
 	case "ping":
 		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}})
 	case "tools/list":
@@ -117,6 +119,19 @@ func (s *Server) HandleRPC(ctx context.Context, raw []byte) []byte {
 		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: s.callTool(ctx, p)})
 	default:
 		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: " + req.Method}})
+	}
+}
+
+// handshake 是 initialize 与 server/discover 共用的能力声明。
+//
+// supportedVersions 只列本服务真正实现的版本: 客户端会从中挑一个再发后续请求,
+// 多列一个没实现的版本等于把失败推迟到 tools/list。
+func (s *Server) handshake() map[string]any {
+	return map[string]any{
+		"protocolVersion":   ProtocolVersion,
+		"supportedVersions": []string{ProtocolVersion},
+		"capabilities":      map[string]any{"tools": map[string]any{}},
+		"serverInfo":        map[string]any{"name": "claude-go-search", "version": "1.0.0"},
 	}
 }
 
