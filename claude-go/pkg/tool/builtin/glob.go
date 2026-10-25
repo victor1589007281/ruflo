@@ -59,9 +59,11 @@ func (t *GlobTool) InputSchema() json.RawMessage {
 }
 
 // IsReadOnly 恒为 true —— Glob 只遍历文件系统, 不写任何东西。
-func (t *GlobTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+func (t *GlobTool) IsReadOnly(_ json.RawMessage) bool { return true }
+
 // IsConcurrencySafe 恒为 true —— 无共享可变状态, 多次调用互不干扰。
 func (t *GlobTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+
 // CheckPermissions 不额外设限, 交回通用权限流程。
 func (t *GlobTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
 	return nil
@@ -80,6 +82,9 @@ func (t *GlobTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 	rootDir := tctx.Cwd
 	if in.TargetDirectory != "" {
 		rootDir = expandPath(in.TargetDirectory, tctx.Cwd)
+	}
+	if err := guardReadPath(rootDir); err != nil {
+		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 
 	maxResults := in.Limit

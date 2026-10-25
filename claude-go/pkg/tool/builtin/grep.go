@@ -78,7 +78,7 @@ func (t *GrepTool) InputSchema() json.RawMessage {
 }
 
 // IsReadOnly 恒为 true: 只调 rg 读文件, 不产生任何写入。
-func (t *GrepTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+func (t *GrepTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
 // IsConcurrencySafe 恒为 true: 无共享可变状态, 多个 Grep 可并发执行。
 func (t *GrepTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
@@ -162,6 +162,9 @@ func (t *GrepTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 	searchPath := tctx.Cwd
 	if in.Path != "" {
 		searchPath = expandPath(in.Path, tctx.Cwd)
+	}
+	if err := guardReadPath(searchPath); err != nil {
+		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 
 	mode := in.OutputMode

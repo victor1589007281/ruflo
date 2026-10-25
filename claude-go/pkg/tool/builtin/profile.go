@@ -130,11 +130,14 @@ func registerFileMutationTools(reg *tool.Registry) {
 	reg.Register(NewRewindTool())
 }
 
-// registerReadSearchTools 注册 Read/Glob/Grep 三个只读检索工具。
+// registerReadSearchTools 注册 Read/Glob/Grep 三个只读检索工具, 外加受 scope
+// 约束的 GitInspect。GitInspect 放在这一组而不是 admin 档: "看未提交内容"
+// 是分析类角色的正常需求, 而它固定的三个只读动词不会把 Bash 的能力带回来。
 func registerReadSearchTools(reg *tool.Registry) {
 	reg.Register(NewFileReadTool())
 	reg.Register(NewGlobTool())
 	reg.Register(NewGrepTool())
+	reg.Register(NewGitInspectTool())
 }
 
 // registerCodeIntelReadTools 暴露只读的代码智能工具 (查询 + 状态),

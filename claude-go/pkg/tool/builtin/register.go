@@ -39,6 +39,7 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	// Search tools
 	reg.Register(NewGlobTool())
 	reg.Register(NewGrepTool())
+	reg.Register(NewGitInspectTool())
 
 	// Shell
 	reg.Register(NewBashTool())

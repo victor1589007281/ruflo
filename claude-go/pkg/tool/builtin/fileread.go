@@ -93,7 +93,7 @@ func (t *FileReadTool) InputSchema() json.RawMessage {
 }
 
 // IsReadOnly 返回 true: 只读取文件, 不改动任何东西。
-func (t *FileReadTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+func (t *FileReadTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
 // IsConcurrencySafe 返回 true: 去重表自带 mutex, 并发读互不干扰。
 func (t *FileReadTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
@@ -201,6 +201,9 @@ func (t *FileReadTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 	}
 
 	filePath := expandPath(in.Path, tctx.Cwd)
+	if err := guardReadPath(filePath); err != nil {
+		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
+	}
 
 	// 图片文件: 多模态读取 (base64 image 块), 供视觉模型直接查看
 	if res, isImage := readImageResult(filePath); isImage {

@@ -32,6 +32,14 @@ import (
 type IsolatedRunOptions struct {
 	// SystemPrompt 该 Agent 专属的 system prompt (会与 PromptMgr 默认 system 一起注入).
 	SystemPrompt string
+	// DisableDefaultPrompt 为 true 时**只**注入 SystemPrompt，不再追加 PromptMgr 的
+	// 全局/CustomPrompt 与 MCP 指引。
+	//
+	// 窄面 agent（显式 tools 白名单的只读 agent）用的就是这一档：全局提示词会声称
+	// Bash/Write/Edit 可用，而工具面里根本没有它们；MCP 指引也会按注册表全集生成，
+	// 与本次可见工具不一致。提示词与真实工具面互相矛盾时，模型会花轮次试探不存在的
+	// 工具。SystemPrompt 为空时本字段没有意义（不会凭空造出提示词）。
+	DisableDefaultPrompt bool
 	// MaxTurns 最多循环多少轮, <=0 时使用 30.
 	MaxTurns int
 	// MaxTokens 单次请求最大输出 tokens, <=0 时使用 8192.
@@ -271,7 +279,10 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 	if opts.SystemPrompt != "" {
 		systemPrompts = append(systemPrompts, opts.SystemPrompt)
 	}
-	if e.PromptMgr != nil && !(opts.DisableTools && opts.SystemPrompt != "") {
+	// DisableDefaultPrompt 是调用方的显式声明：这个 agent 的提示词就是全部，不要再
+	// 追加会与它的工具面矛盾的全局人格/MCP 指引。与 DisableTools 那条短路并列而不是
+	// 合并：思考型角色关工具，窄面只读 agent 仍要工具。
+	if e.PromptMgr != nil && !opts.DisableDefaultPrompt && !(opts.DisableTools && opts.SystemPrompt != "") {
 		def := e.PromptMgr.BuildEffectiveSystemPrompt(e.Tools)
 		systemPrompts = append(systemPrompts, def...)
 	}

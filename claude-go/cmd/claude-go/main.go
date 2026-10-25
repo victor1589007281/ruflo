@@ -177,19 +177,23 @@ var (
 	flagMaxTurns       int
 	flagPermission     string
 	flagSystemPrompt   string
-	flagPrint          bool
-	flagVerify         string
-	flagBestOf         int
-	flagDebug          bool
-	flagMCPConfig      string
-	flagConfig         string
-	flagResume         string // --resume <sessionID>
-	flagContinue       bool   // --continue / -c
-	flagAdvisor        string // --advisor <provider:model|off>
-	flagAutoPlan       string // --auto-plan on|off (空=读配置, 默认开)
-	flagComplexityMode string // --complexity-mode heuristic|llm|hybrid
-	flagAllowedTools   string // --allowed-tools t1,t2 (whitelist; non-empty = only these)
-	flagOutputFormat   string // --output-format text|json
+	// --system-prompt-only: 显式声明"只注入 agent/--system-prompt 这一段"，不再追加
+	// 全局 config 的 systemPrompt 与 MCP 指引。给窄工具面的只读 agent 用，避免提示词
+	// 声称有 Bash/Write 而实际工具面没有它们。
+	flagSystemPromptOnly bool
+	flagPrint            bool
+	flagVerify           string
+	flagBestOf           int
+	flagDebug            bool
+	flagMCPConfig        string
+	flagConfig           string
+	flagResume           string // --resume <sessionID>
+	flagContinue         bool   // --continue / -c
+	flagAdvisor          string // --advisor <provider:model|off>
+	flagAutoPlan         string // --auto-plan on|off (空=读配置, 默认开)
+	flagComplexityMode   string // --complexity-mode heuristic|llm|hybrid
+	flagAllowedTools     string // --allowed-tools t1,t2 (whitelist; non-empty = only these)
+	flagOutputFormat     string // --output-format text|json
 	// agentDB 语义增强面 (规划 14.1.4.3): --agentdb-url <serve 地址> 装配
 	// AgentDBSemanticInjectHook, 使真实引擎经 serve /v1/memory|retrieve|files
 	// 跨源检索并注入 system prompt。nil = 不装配 (默认)。
@@ -307,6 +311,7 @@ func main() {
 	rootCmd.PersistentFlags().IntVar(&flagMaxTurns, "max-turns", 0, "最大循环次数 (0=无限)")
 	rootCmd.PersistentFlags().StringVar(&flagPermission, "permission-mode", "bypass", "权限模式 (default/auto/plan/bypass)")
 	rootCmd.PersistentFlags().StringVar(&flagSystemPrompt, "system-prompt", "", "自定义系统提示词")
+	rootCmd.PersistentFlags().BoolVar(&flagSystemPromptOnly, "system-prompt-only", false, "只注入 agent/--system-prompt 的提示词，不追加全局 systemPrompt 与 MCP 指引 (窄工具面 agent 用)")
 	rootCmd.PersistentFlags().BoolVarP(&flagPrint, "print", "p", false, "Print 模式 (非交互式)")
 	rootCmd.PersistentFlags().BoolVar(&flagDebug, "debug", false, "调试模式")
 	rootCmd.PersistentFlags().StringVar(&flagMCPConfig, "mcp-config", "", "MCP 配置文件路径 (JSON，顶层 mcpServers)")
@@ -894,7 +899,8 @@ func runCmd() *cobra.Command {
 					// H4-3 长程档上限 (装配期捕获, Execute 时手边没有 jsonCfg)。
 					return &cliAgentRunner{
 						eng: eng, role: role, stage: meta.Stage,
-						systemPrompt: systemPrompt, modelCfg: mcfg, stageDecl: decl,
+						systemPrompt: systemPrompt, systemPromptOnly: flagSystemPromptOnly,
+						modelCfg: mcfg, stageDecl: decl,
 						longHorizonMaxTurns: cliLongHorizonTurns,
 					}, nil
 				}
@@ -4826,10 +4832,11 @@ func agentTurnCap(spec *agentRunSpec, longHorizonTurns int) int {
 // 而那种差异从任何单侧看都是不可见的。
 func buildAgentRunner(eng *engine.QueryEngine, spec *agentRunSpec, mcfg modelconfig.ResolvedConfig, longHorizonTurns int) *cliAgentRunner {
 	r := &cliAgentRunner{
-		eng:          eng,
-		role:         spec.Name,
-		systemPrompt: spec.SystemPrompt,
-		modelCfg:     mcfg,
+		eng:              eng,
+		role:             spec.Name,
+		systemPrompt:     spec.SystemPrompt,
+		systemPromptOnly: flagSystemPromptOnly,
+		modelCfg:         mcfg,
 		// stage 用 agent 名: 它进 trace span 的 Stage 字段与日志前缀, 是"这次跑的是谁"
 		// 在产物上唯一的落点。留空会让中间态退化成按 Role+Cwd 分账 (见 withStage)。
 		stage:               spec.Name,
@@ -5186,6 +5193,9 @@ type cliAgentRunner struct {
 	eng          *engine.QueryEngine
 	role         string
 	systemPrompt string
+	// systemPromptOnly 只注入 systemPrompt，不追加全局 PromptMgr (见 IsolatedRunOptions.DisabledDefaultPrompt)。
+	// 由 --system-prompt-only 设置；默认 false = 改造前行为。
+	systemPromptOnly bool
 	// stage 稳定阶段标识 (agent.RunMetadata.Stage), 供 H3-2 中间态按阶段分账。
 	stage string
 	// finalizeTurns 最后 N 轮强制收口 (0 = 不收口), 来自角色声明。
@@ -5472,18 +5482,19 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 	}()
 
 	out, err := r.eng.RunIsolated(ctx, userPrompt, engine.IsolatedRunOptions{
-		SystemPrompt:        systemPrompt,
-		MaxTurns:            maxTurns,
-		MaxTokens:           maxTokens,
-		Client:              client,
-		DisableTools:        disableTools,
-		FinalizeTurns:       r.finalizeTurns,
-		MergeBashTargets:    r.mergeBashTargets,
-		RestrictWritesToCwd: r.restrictWritesToCwd,
-		CitationGate:        r.citationGate,
-		NormalizeEvidence:   r.normalizeEvidence,
-		Stage:               r.stage, // H3-2 中间态身份; 空 = 身份退化为 Role+Cwd
-		Inject:              inject,
+		SystemPrompt:         systemPrompt,
+		DisableDefaultPrompt: r.systemPromptOnly,
+		MaxTurns:             maxTurns,
+		MaxTokens:            maxTokens,
+		Client:               client,
+		DisableTools:         disableTools,
+		FinalizeTurns:        r.finalizeTurns,
+		MergeBashTargets:     r.mergeBashTargets,
+		RestrictWritesToCwd:  r.restrictWritesToCwd,
+		CitationGate:         r.citationGate,
+		NormalizeEvidence:    r.normalizeEvidence,
+		Stage:                r.stage, // H3-2 中间态身份; 空 = 身份退化为 Role+Cwd
+		Inject:               inject,
 		// 阶段声明的 hook 交给引擎并入它既有的 Runner (见 IsolatedRunOptions.Hooks):
 		// 这里手上没有那份基线配置 (Runner 构造完就把入参丢了), 而且**替换**会让
 		// 平台侧的审计/门禁 hook 在这条执行路径上静默消失。解析与资产 hooks: 段
