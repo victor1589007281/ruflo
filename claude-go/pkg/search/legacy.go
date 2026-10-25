@@ -1,5 +1,10 @@
 package search
 
+// legacy.go —— 旧 WebSearcher 接口到 Manager 的适配层。
+//
+// 历史调用方只认 Search(query) (title, text, html, err) 这一种形状; 新工具
+// 走 SearchJSON/FetchJSON/ResearchJSON 以保留 URL、provider、降级与配额信息。
+// 适配层只做格式转换, 不复制检索逻辑, 避免两套行为分叉。
 import (
 	"context"
 	"encoding/json"

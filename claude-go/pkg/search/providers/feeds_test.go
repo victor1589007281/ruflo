@@ -27,7 +27,7 @@ func TestBingRSSSearch(t *testing.T) {
 		if q.Get("format") != "rss" {
 			t.Errorf("missing format=rss: %s", r.URL.RawQuery)
 		}
-		if q.Get("q") != "golang 检索" {
+		if q.Get("q") != "news" {
 			t.Errorf("unexpected q: %q", q.Get("q"))
 		}
 		if q.Get("count") != "3" {
@@ -42,7 +42,7 @@ func TestBingRSSSearch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newBingRSS: %v", err)
 	}
-	res, err := p.Search(context.Background(), search.SearchRequest{Query: "golang 检索", Limit: 3})
+	res, err := p.Search(context.Background(), search.SearchRequest{Query: "news", Limit: 3})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -60,6 +60,35 @@ func TestBingRSSSearch(t *testing.T) {
 	}
 	if res[0].Provider != "bing_rss" || res[0].Rank != 1 {
 		t.Errorf("provider/rank missing: %+v", res[0])
+	}
+}
+
+// TestBingRSSFiltersOffTopic 钉住兜底源的词面过滤。
+//
+// Bing 在长查询上会回完全不同话题的页面; 过滤只应在 bing_rss 这类兜底源
+// 生效, 且必须保留真正命中查询内容词的那条。
+func TestBingRSSFiltersOffTopic(t *testing.T) {
+	const rss = `<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel>
+<item><title>无关影视站</title><link>https://video.example/1</link><description>花都影视</description></item>
+<item><title>Go 1.24 release notes</title><link>https://go.dev/doc/go1.24</link><description>golang release notes</description></item>
+</channel></rss>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+		fmt.Fprint(w, rss)
+	}))
+	defer srv.Close()
+
+	p, err := newBingRSS(search.DefaultConfig(), search.ProviderConfig{Enabled: true, BaseURL: srv.URL + "/search"}, nil)
+	if err != nil {
+		t.Fatalf("newBingRSS: %v", err)
+	}
+	res, err := p.Search(context.Background(), search.SearchRequest{Query: "golang release notes"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 1 || res[0].URL != "https://go.dev/doc/go1.24" {
+		t.Fatalf("off-topic result not filtered: %+v", res)
 	}
 }
 
@@ -108,6 +137,35 @@ func TestGNewsFollowsRedirectAndParses(t *testing.T) {
 	}
 	if res[0].Lang != "zh" {
 		t.Errorf("want lang zh, got %q", res[0].Lang)
+	}
+}
+
+// TestGNewsDropsRedirectPages 钉住 Google News 站内跳转链的过滤。
+//
+// RSS 里的 /rss/articles/... 打开后只是 Google News 的空壳页, 不是可引用
+// 来源; 继续传给模型会诱导它把跳转链写进证据表。
+func TestGNewsDropsRedirectPages(t *testing.T) {
+	const rss = `<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel>
+<item><title>跳转页</title><link>https://news.google.com/rss/articles/abc</link><description>壳页</description></item>
+<item><title>直接来源</title><link>https://example.com/story</link><description>原文</description></item>
+</channel></rss>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml")
+		fmt.Fprint(w, rss)
+	}))
+	defer srv.Close()
+
+	p, err := newGNews(search.DefaultConfig(), search.ProviderConfig{Enabled: true, BaseURL: srv.URL + "/rss/search"}, nil)
+	if err != nil {
+		t.Fatalf("newGNews: %v", err)
+	}
+	res, err := p.Search(context.Background(), search.SearchRequest{Query: "科技"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 1 || res[0].URL != "https://example.com/story" {
+		t.Fatalf("redirect page not filtered: %+v", res)
 	}
 }
 

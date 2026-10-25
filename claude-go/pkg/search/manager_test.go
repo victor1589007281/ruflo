@@ -314,6 +314,23 @@ func TestSelectProvidersProxyDownFallsBack(t *testing.T) {
 	}
 }
 
+func TestSelectProvidersWithoutProxyIsNotDegraded(t *testing.T) {
+	p := newFake("proxied", TierL2, func(context.Context, SearchRequest) ([]Result, error) { return nil, nil })
+	p.pin = ModeProxy
+
+	cfg := DefaultConfig()
+	cfg.Providers = map[string]ProviderConfig{
+		"proxied": {Enabled: true, Egress: ModeProxy, Tier: TierL2},
+	}
+	cands, degraded := selectProviders([]Provider{p}, PlanQuery("x"), cfg, testEgress(t), newQuotaTracker())
+	if len(cands) != 1 {
+		t.Fatalf("proxy source should still be selected for direct fallback, got %d", len(cands))
+	}
+	if contains(degraded, "proxy_down") {
+		t.Fatalf("degraded = %v, want no proxy_down when no proxy is configured", degraded)
+	}
+}
+
 func TestFuseRRFAndCanonicalDedupe(t *testing.T) {
 	raw := []Result{
 		{URL: "https://a.com/x?utm_source=1", Provider: "p1", Rank: 1},

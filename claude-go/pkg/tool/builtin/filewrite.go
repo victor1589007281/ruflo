@@ -23,6 +23,13 @@ const FileWriteToolName = "Write"
 type fileWriteInput struct {
 	Path     string `json:"path"`
 	Contents string `json:"contents"`
+	// Content 是模型最常写错的别名 (schema 用复数 contents)。
+	//
+	// 实测 DeepSeek 在同一个 run 里先写 `contents`, 后续两次改写 evidence.md
+	// 用了 `content`; Go 的 Unmarshal 对未知字段不报错, 于是 Contents 为空,
+	// Write 把一份 7KB 的证据台账**静默截成 0 字节**。接受别名比让模型重试
+	// 便宜, 也比丢文件安全。
+	Content string `json:"content"`
 }
 
 type FileWriteTool struct{}
@@ -51,7 +58,7 @@ func (t *FileWriteTool) InputSchema() json.RawMessage {
 }
 
 // IsReadOnly 恒为 false —— 本工具会写文件。
-func (t *FileWriteTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+func (t *FileWriteTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
 // IsConcurrencySafe 恒为 false —— 并行写同一路径会互相覆盖 (并发保护另见 Call 里的 ClaimWrite)。
 func (t *FileWriteTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
@@ -85,8 +92,35 @@ func (t *FileWriteTool) Call(ctx context.Context, input json.RawMessage, tctx *t
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("输入解析错误: %v", err), IsError: true}, nil
 	}
+	if in.Contents == "" && in.Content != "" {
+		in.Contents = in.Content
+	}
+	// 缺字段与"显式写空"必须区分: 前者是模型用了别的键名 (此前会静默写 0 字节),
+	// 后者是调用方明确要求清空。缺字段时报错, 让模型拿到可修正的反馈。
+	if in.Contents == "" {
+		var raw map[string]json.RawMessage
+		if json.Unmarshal(input, &raw) == nil {
+			_, hasContents := raw["contents"]
+			_, hasContent := raw["content"]
+			if !hasContents && !hasContent {
+				return &tool.ToolResult{
+					Content: "写入被拒绝: 缺少 contents 字段 (别名为 content)。本工具会整文件覆盖, 空内容会清空目标文件。",
+					IsError: true,
+				}, nil
+			}
+		}
+	}
 
 	filePath := expandPath(in.Path, tctx.Cwd)
+
+	// 写入根限制 (opt-in): 调研/受限角色只许写当前工作目录。位置在并发写闸与
+	// 语法护栏之前 —— 越界写入不是"内容好坏"的问题, 是"本次运行根本不该碰"。
+	if !tctx.PathInWriteRoot(filePath) {
+		return &tool.ToolResult{
+			Content: fmt.Sprintf("写入被拒绝: 本次运行的写入范围限定在 %s, 而目标 %s 不在其中。请改用相对路径写到当前工作目录 (例如 evidence.md)。", tctx.WriteRoot, filePath),
+			IsError: true,
+		}, nil
+	}
 
 	// H3-4 并发写闸: 同一个文件同时被两个并行子代理写 ⇒ 显式拒绝, 不静默覆盖。
 	// 位置在所有别的守卫**之前**: 这是一条关于"谁有权动这个文件"的判据, 与内容是否

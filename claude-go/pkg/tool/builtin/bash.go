@@ -212,6 +212,15 @@ func (t *BashTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.T
 		cwd = expandPath(in.WorkingDirectory, tctx.Cwd)
 	}
 
+	// 目标合并闸: 同一份 PDF/URL 被拆成多条命令重复访问时直接拒绝, 把"合并成
+	// 一条命令"作为 tool_result 回给模型。位置在**执行之前** —— 拒绝的意义就是
+	// 不产生任何 I/O 与新的工具输出。
+	if tctx != nil && tctx.BashMerge != nil {
+		if reason := tctx.BashMerge.CheckAndRecord(cwd, in.Command); reason != "" {
+			return &tool.ToolResult{Content: reason, IsError: true}, nil
+		}
+	}
+
 	// block_until_ms 只放宽等待上限, 不给"无上限"留口子 —— 不传就是默认 30s。
 	timeout := defaultBashTimeout
 	if in.BlockUntilMs > 0 {

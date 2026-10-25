@@ -22,9 +22,14 @@ import (
 const FileEditToolName = "StrReplace"
 
 type fileEditInput struct {
-	Path       string `json:"path"`
-	OldString  string `json:"old_string"`
-	NewString  string `json:"new_string"`
+	Path      string `json:"path"`
+	OldString string `json:"old_string"`
+	NewString string `json:"new_string"`
+	// old_str/new_str 是常见的别名写法。缺字段时 OldString 为空, 而
+	// strings.Count(content, "") = len+1 —— replace_all 会变成"在每个字符间
+	// 插入新串"; new_string 缺失则会把匹配到的原文删掉。两者都必须先校验。
+	OldStr     string `json:"old_str"`
+	NewStr     string `json:"new_str"`
 	ReplaceAll bool   `json:"replace_all,omitempty"`
 }
 
@@ -58,7 +63,8 @@ func (t *FileEditTool) InputSchema() json.RawMessage {
 }
 
 // IsReadOnly 恒为 false —— 本工具会写文件。
-func (t *FileEditTool) IsReadOnly(_ json.RawMessage) bool        { return false }
+func (t *FileEditTool) IsReadOnly(_ json.RawMessage) bool { return false }
+
 // IsConcurrencySafe 恒为 false —— 并发编辑同一文件会互相覆盖, 由 tctx.ClaimWrite 在调用期兜底。
 func (t *FileEditTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
@@ -94,8 +100,37 @@ func (t *FileEditTool) Call(ctx context.Context, input json.RawMessage, tctx *to
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("输入解析错误: %v", err), IsError: true}, nil
 	}
+	if in.OldString == "" && in.OldStr != "" {
+		in.OldString = in.OldStr
+	}
+	if in.NewString == "" && in.NewStr != "" {
+		in.NewString = in.NewStr
+	}
+	// 缺字段与"显式空串"必须区分: 缺 new_string 会把匹配段删掉, 缺 old_string
+	// 在 replace_all 下会变成逐字符插入。两者都是静默数据破坏。
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(input, &raw) == nil {
+		_, hasOld := raw["old_string"]
+		_, hasOldAlias := raw["old_str"]
+		_, hasNew := raw["new_string"]
+		_, hasNewAlias := raw["new_str"]
+		if !hasOld && !hasOldAlias {
+			return &tool.ToolResult{Content: "编辑被拒绝: 缺少 old_string 字段 (别名为 old_str)。", IsError: true}, nil
+		}
+		if !hasNew && !hasNewAlias {
+			return &tool.ToolResult{Content: "编辑被拒绝: 缺少 new_string 字段 (别名为 new_str); 缺省会把匹配段删除。", IsError: true}, nil
+		}
+	}
 
 	filePath := expandPath(in.Path, tctx.Cwd)
+
+	// 写入根限制 (opt-in): 与 FileWrite 同一条判据, 拦在入口。
+	if !tctx.PathInWriteRoot(filePath) {
+		return &tool.ToolResult{
+			Content: fmt.Sprintf("写入被拒绝: 本次运行的写入范围限定在 %s, 而目标 %s 不在其中。请改用相对路径写到当前工作目录。", tctx.WriteRoot, filePath),
+			IsError: true,
+		}, nil
+	}
 
 	// H3-4 并发写闸。位置在**读文件之前**: 两个并行子代理各自读到旧内容、各自基于
 	// 那一份算新内容, 正是覆盖的成因 —— 读到一半才拦, 另一方已经按过期内容构造好了

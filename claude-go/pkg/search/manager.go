@@ -1,5 +1,15 @@
 package search
 
+// manager.go —— 检索数据面的门面 (facade)。
+//
+// Manager 把 provider 集合、出口、缓存、单飞、配额与指标装在一起, 对上层
+// 只暴露三个动作:
+//   - Search: 规划 -> 选源 -> 对冲调度 -> RRF 融合 -> 质量门;
+//   - Fetch: 抓取单页并抽正文 (见 fetch.go);
+//   - Research: 不调用模型的有界研究, 只用逐字证据拼答案 (见 evidence.go)。
+//
+// 并发约束: 同一 Manager 可被多个 goroutine 同时调用; 相同查询会经 singleflight
+// 合并, 只打一次源。Close 之后 Search/Fetch 返回 ErrUnavailable。
 import (
 	"context"
 	"errors"

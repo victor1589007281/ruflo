@@ -80,6 +80,63 @@ func Test持久化_并发检索时无竞争(t *testing.T) {
 	}
 }
 
+// TestPersistMergesConcurrentWriters 钉住"两个进程各写各的、谁都不丢"。
+//
+// 真实故障: 四个调研任务并行跑, 共用同一个 ~/.claude-go/memory/episodic_memory.json。
+// 裸 os.WriteFile 下后写者用自己内存里的快照整份覆盖, 先写者的新增条目全丢 ——
+// 而且没有任何日志, 表现只是"记忆怎么又没了"。
+func TestPersistMergesConcurrentWriters(t *testing.T) {
+	dir := t.TempDir()
+	a := NewTieredStoreWithPersist(dir)
+	b := NewTieredStoreWithPersist(dir)
+
+	a.Add(&MemoryEntry{ID: "a1", Content: "alpha 的产出", Source: "team_result", Importance: 0.9})
+	b.Add(&MemoryEntry{ID: "b1", Content: "beta 的产出", Source: "team_result", Importance: 0.9})
+
+	// 手动落盘, 顺序刻意模拟"a 先写、b 后写"的交错。
+	a.PersistToDisk()
+	b.PersistToDisk()
+
+	reloaded := NewTieredStoreWithPersist(dir)
+	if len(reloaded.episodic) != 2 {
+		t.Fatalf("并发写后应保留两条记忆, got %d: %+v", len(reloaded.episodic), reloaded.episodic)
+	}
+	if _, ok := reloaded.episodic["a1"]; !ok {
+		t.Fatal("先写者的记忆被后写者覆盖丢失")
+	}
+	if _, ok := reloaded.episodic["b1"]; !ok {
+		t.Fatal("后写者的记忆丢失")
+	}
+}
+
+// TestPersistRecoversFromEmptyOrCorruptFile 钉住"半截文件不再让整份记忆作废"。
+//
+// 空文件正是并发截断写留下的形态。修复后 loadFromDisk 仍然会打一条日志 (无法解析),
+// 但下一次落盘必须写出一份**完整**的 JSON, 而不是继续把坏文件传下去。
+func TestPersistRecoversFromEmptyOrCorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "episodic_memory.json")
+	if err := os.WriteFile(path, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewTieredStoreWithPersist(dir)
+	s.Add(&MemoryEntry{ID: "m1", Content: "一条新记忆", Source: "manual", Importance: 0.9})
+	s.PersistToDisk()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []MemoryEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		t.Fatalf("落盘后仍不是合法 JSON: %v", err)
+	}
+	if len(entries) != 1 || entries[0].ID != "m1" {
+		t.Fatalf("落盘内容不对: %+v", entries)
+	}
+}
+
 // Test快照是值拷贝_与原对象无共享 —— 对不变式直接下断言。
 //
 // 为什么不能只靠上面那个并发测试: race 检测器要两个访问真的交错才报, 而"快照拷的是指针"

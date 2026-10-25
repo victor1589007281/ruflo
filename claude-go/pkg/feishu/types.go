@@ -453,6 +453,20 @@ type JSONConfig struct {
 
 	// Advisor 顾问工具配置 (设计文档: docs/advisor-tool-design.md)
 	Advisor *AdvisorSection `json:"advisor,omitempty"`
+
+	// Search 检索数据面配置 (零成本 WebSearch/WebFetch 的凭据与出口)。
+	Search *SearchSection `json:"search,omitempty"`
+}
+
+// SearchSection 检索数据面配置段。
+//
+// 目前只承载 GitHub token: GitHub 搜索源在未认证时只有 10 次/分钟的限额,
+// 配一个 PAT 后提升到 30 次/分钟。放在 config.json 而不是环境变量, 是为了让
+// 同一份配置在本地与集群都能被回读、版本化和对账 (环境变量不可回读, 且
+// settings.json 的 env 合并会静默覆盖进程继承值)。
+type SearchSection struct {
+	// GitHubToken GitHub Personal Access Token (只读公开仓库即可, 无需任何 scope)。
+	GitHubToken string `json:"githubToken,omitempty"`
 }
 
 // AdvisorSection advisor 顾问工具配置段。

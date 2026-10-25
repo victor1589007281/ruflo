@@ -1,5 +1,11 @@
 package search
 
+// scheduler.go —— 单次检索的源调度 (主源 + 对冲)。
+//
+// 调度上限是 2 个并发源: 主源 t=0 启动, 第二源延迟 HedgeDelay 启动; 首源
+// 有结果后再等最多 250ms 收第二源, 避免慢源把 p95 拖到整个搜索超时。每个源
+// 都有独立超时与 panic 隔离, 一个卡死/崩溃的 provider 只产生 degraded 标记,
+// 不影响其它源。
 import (
 	"context"
 	"errors"

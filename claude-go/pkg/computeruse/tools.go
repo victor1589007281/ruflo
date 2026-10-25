@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
@@ -108,7 +109,7 @@ func (t *ScreenCaptureTool) Call(ctx context.Context, input json.RawMessage, tct
 func (t *ScreenCaptureTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 // IsReadOnly 恒为 true —— 截屏不改变屏幕内容。
-func (t *ScreenCaptureTool) IsReadOnly(_ json.RawMessage) bool       { return true }
+func (t *ScreenCaptureTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
 // CheckPermissions 除 bypass 模式外一律要求用户确认 (屏幕内容可能含敏感信息)。
 func (t *ScreenCaptureTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
@@ -191,10 +192,10 @@ func (t *MouseActionTool) Call(ctx context.Context, input json.RawMessage, tctx 
 	}
 
 	resp := map[string]interface{}{
-		"status":  "success",
-		"action":  in.Action,
-		"x":       in.X,
-		"y":       in.Y,
+		"status": "success",
+		"action": in.Action,
+		"x":      in.X,
+		"y":      in.Y,
 	}
 
 	screenshotAfter := true
@@ -215,7 +216,7 @@ func (t *MouseActionTool) Call(ctx context.Context, input json.RawMessage, tctx 
 func (t *MouseActionTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
 // IsReadOnly 恒为 false —— 鼠标操作会改变前台应用的界面状态。
-func (t *MouseActionTool) IsReadOnly(_ json.RawMessage) bool       { return false }
+func (t *MouseActionTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
 // CheckPermissions 除 bypass 模式外一律要求用户确认。
 func (t *MouseActionTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
@@ -322,7 +323,7 @@ func (t *KeyboardActionTool) Call(ctx context.Context, input json.RawMessage, tc
 func (t *KeyboardActionTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
 // IsReadOnly 恒为 false —— 键盘输入会改变前台应用状态 (可能触发提交/删除等)。
-func (t *KeyboardActionTool) IsReadOnly(_ json.RawMessage) bool       { return false }
+func (t *KeyboardActionTool) IsReadOnly(_ json.RawMessage) bool { return false }
 
 // CheckPermissions 除 bypass 模式外一律要求用户确认。
 func (t *KeyboardActionTool) CheckPermissions(_ json.RawMessage, tctx *tool.ToolContext) *types.PermissionResult {
@@ -343,7 +344,7 @@ type ComputerUseStatusTool struct{}
 func NewComputerUseStatusTool() *ComputerUseStatusTool { return &ComputerUseStatusTool{} }
 
 // Name 返回工具名 "ComputerUseStatus"。
-func (t *ComputerUseStatusTool) Name() string          { return "ComputerUseStatus" }
+func (t *ComputerUseStatusTool) Name() string { return "ComputerUseStatus" }
 
 // Description 返回给模型看的说明: 检查 computer-use 工具链是否就绪。
 func (t *ComputerUseStatusTool) Description() string {
@@ -359,10 +360,10 @@ func (t *ComputerUseStatusTool) InputSchema() json.RawMessage {
 func (t *ComputerUseStatusTool) Call(_ context.Context, _ json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	p := DetectPlatform()
 	resp := map[string]interface{}{
-		"os":                p.OS,
-		"available":         p.Available,
-		"screenshot_tool":   p.ScreenCaptureBin,
-		"input_tool":        p.InputBin,
+		"os":              p.OS,
+		"available":       p.Available,
+		"screenshot_tool": p.ScreenCaptureBin,
+		"input_tool":      p.InputBin,
 	}
 	if !p.Available {
 		resp["missing_hint"] = p.MissingHint
@@ -372,10 +373,10 @@ func (t *ComputerUseStatusTool) Call(_ context.Context, _ json.RawMessage, _ *to
 }
 
 // IsConcurrencySafe 恒为 true —— 只读探测, 无共享状态。
-func (t *ComputerUseStatusTool) IsConcurrencySafe(_ json.RawMessage) bool            { return true }
+func (t *ComputerUseStatusTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
 
 // IsReadOnly 恒为 true —— 只探测工具链, 不产生副作用。
-func (t *ComputerUseStatusTool) IsReadOnly(_ json.RawMessage) bool                   { return true }
+func (t *ComputerUseStatusTool) IsReadOnly(_ json.RawMessage) bool { return true }
 
 // CheckPermissions 返回 nil: 状态探测不需要额外授权。
 func (t *ComputerUseStatusTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
@@ -407,6 +408,10 @@ func RegisterAll(registry *tool.Registry, cfg *SecurityConfig) {
 		count += 2
 	}
 
-	fmt.Printf("[computer-use] 已注册 %d 个工具 (平台: %s, 截图: %s, 输入: %s)\n",
+	// 必须写 stderr: 这行是启动期诊断, 不是命令输出。写 stdout 会污染
+	// `--output-format json` (实测 run.json 第一行就是它), 让"整段 stdout 就是一个
+	// JSON"这个契约不成立 —— 现有解析器靠逐行回退才没炸, 但下游用 jq 读整份文件
+	// 就会失败。
+	fmt.Fprintf(os.Stderr, "[computer-use] 已注册 %d 个工具 (平台: %s, 截图: %s, 输入: %s)\n",
 		count, p.OS, p.ScreenCaptureBin, p.InputBin)
 }

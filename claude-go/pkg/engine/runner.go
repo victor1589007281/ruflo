@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,6 +36,41 @@ type IsolatedRunOptions struct {
 	MaxTurns int
 	// MaxTokens 单次请求最大输出 tokens, <=0 时使用 8192.
 	MaxTokens int
+	// FinalizeTurns 最后 N 轮强制收口, <=0 时关闭 (逐字节走改造前行为)。
+	//
+	// 语义分两段:
+	//   - 剩余轮数 == FinalizeTurns 时, 注入一条"停止检索、开始成文"的用户消息;
+	//   - 最后一轮不再向模型暴露任何工具, 并丢弃响应里的 tool_use 块, 只剩文本。
+	//
+	// 为什么必须在执行层做: "最后 2 轮只写报告"写在提示词里只是建议。实测 CBAM
+	// 这类多 PDF 任务会继续读文件直到 MaxTurns 用光, 拿回一份没有结论的半成品,
+	// 而 run 还会报 max_turns 错误。提示词无法让"工具不可用"这件事成立。
+	FinalizeTurns int
+	// MergeBashTargets 启用 run 级 Bash 目标合并闸 (见 pkg/tool/bashguard.go)。
+	//
+	// 为 true 时, 同一份 PDF/URL 被拆成多条单独命令重复访问会被拒绝, 模型收到的
+	// tool_result 要求把下载/解析/提取合并成一条命令。按**目标**判重, 不是按
+	// Bash 调用次数设上限 —— 多目标并行的任务不会被误伤。
+	MergeBashTargets bool
+	// RestrictWritesToCwd 为 true 时, Write/Edit 只能落在 e.Config.Cwd 内。
+	//
+	// 调研角色只该产出工作目录里的 evidence.md, 但 bypass 模式下模型可以把
+	// 绝对路径写到任何地方 (实测写成了 /home/victor/evidence.md)。并发任务还会
+	// 因此互相覆盖同一份文件。默认 false = 改造前行为。
+	RestrictWritesToCwd bool
+	// CitationGate 为 true 时, 模型第一次想结束 (没有 tool_use) 会做一次引用核验:
+	// 若最终文本里过半的 URL 只在搜索结果中出现、从未成功抓取, 就注入一条修订
+	// 指令并让循环再跑一轮 (只给一次机会)。
+	//
+	// 为什么需要: 提示词已经写了"摘录只能来自实际打开的页面", 实测 biomed 任务
+	// 16 条引用里 11 条从未打开 (investor.lilly.com / PubMed 都有), 摘录却写成
+	// 引文。收口提醒也没用 —— 那次 run 18 轮就结束, 根本没到收口阈值。
+	CitationGate bool
+	// NormalizeEvidence 为 true 时, 运行结束把 cwd/evidence.md 表格
+	// 「来源 URL」列里的"同上"展开成上一条真实 URL (见 evidence.go)。
+	//
+	// 只做机械展开: 不改结论、不改其他列、没有前序 URL 时原样保留。
+	NormalizeEvidence bool
 	// Client 可选, 覆盖 engine 默认的 api.Client (用于按 role/plan 切换 provider).
 	Client *api.Client
 	// DisableTools 为 true 时:
@@ -141,6 +177,12 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 	}
 	if opts.MaxTokens <= 0 {
 		opts.MaxTokens = 8192
+	}
+	// FinalizeTurns 不能超过总轮数: 否则 "剩余 == FinalizeTurns" 这个阈值
+	// 永远命不中, 收口提醒一次都不会注入 —— 一个静默失效的配置。
+	finalizeTurns := opts.FinalizeTurns
+	if finalizeTurns > opts.MaxTurns {
+		finalizeTurns = opts.MaxTurns
 	}
 	client := opts.Client
 	if client == nil {
@@ -262,6 +304,75 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		}
 	}
 	var lastAssistantText string
+	// 检索预算软提醒: 只数 WebSearch 调用, 不数 WebFetch —— 打开一个页面是
+	// 兑现证据, 继续换关键词才是扩大检索面。实测 solid 任务 26 次搜索只换回
+	// 4 个可打开页面, 轮次全花在"再搜一次"上, 轮到成文时证据表只有 7 行。
+	const searchSoftBudget = 18
+	webSearchCalls := 0
+	searchBudgetWarned := false
+	// 引用账本: 运行中收集工具实际返回/请求过的 URL, 收口时交给模型,
+	// 结束后审计最终文本 (见 citation.go)。用户 prompt 里的 URL 也算已见 ——
+	// 那是调用方给的来源, 引用它不算编造。
+	ledger := newCitationLedger()
+	ledger.observeText(userPrompt)
+	// 必须包一层闭包: `defer ledger.audit(lastAssistantText)` 会在 defer 语句
+	// 处就求值参数, 那时 lastAssistantText 还是空串 —— 审计永远看不到报告.
+	// 审计对象是命名返回值 finalText, 不是 lastAssistantText: 报告清理 defer
+	// 注册得更晚、执行得更早, 这里拿到的才是**实际交付**的文本。
+	defer func() { ledger.audit(finalText) }()
+	// 交付前清掉起草旁白 (Hmm / Let me ... / 诚实：) 并补齐缺失的一级标题;
+	// 同时修补 evidence.md (展开「同上」, 空文件用报告证据表回填)。
+	//
+	// 只对调研类角色生效: 编码/评审 agent 的最终文本里,"Hmm" 可能是正文的一部分,
+	// 不能按报告体例改写。注册在审计 defer 之后, 因此先执行 —— 审计与 trace
+	// 记录的都是清理后的文本。evidence.md 的回填也依赖这个顺序: 它要拿最终报告
+	// 里的证据表, 而不是带草稿旁白的原文。
+	if opts.NormalizeEvidence {
+		defer func() {
+			raw := finalText
+			finalText = EnsureReportTitle(CleanReportText(raw), userPrompt)
+			// 交付报告的证据表也要展开"同上": 提示词已禁止, 但实测 vdb 仍有 7 行
+			// 这么写。只动 URL 列, 时间列的"同上"保留。
+			if expanded, n := expandSameAsAbove(finalText); n > 0 {
+				finalText = expanded
+				logging.For("engine").Info("最终报告证据表的「同上」已展开", "rows", n)
+			}
+			// 清理前后各量一次正文字数: 审计日志只报交付文本, 没有这条就无法
+			// 解释"报告 2310 字、审计 2464 字"到底是清理删了旁白还是统计口径漂移。
+			if raw != finalText {
+				rawBody, _, _ := reportShape(raw)
+				finalBody, _, _ := reportShape(finalText)
+				logging.For("engine").Info("最终报告已清理",
+					"raw_bytes", len(raw), "final_bytes", len(finalText),
+					"raw_body_cjk", rawBody, "final_body_cjk", finalBody)
+			}
+			if strings.TrimSpace(e.Config.Cwd) == "" {
+				return
+			}
+			path := filepath.Join(e.Config.Cwd, "evidence.md")
+			normalizeEvidenceFile(path)
+			backfillEvidenceFile(path, finalText)
+		}()
+	}
+	// Bash 目标合并闸的账本必须是 **run 级**: 每次 RunIsolated 一个新实例。
+	// 挂在引擎或 BashTool 上都会让并发 run 共享"已访问目标", 表现是 B 任务
+	// 第一次访问某份 PDF 就被拒 (而 A 任务确实访问过它) —— 一条无从归因的误拒。
+	var bashMerge *tool.BashMergeGuard
+	if opts.MergeBashTargets {
+		bashMerge = tool.NewBashMergeGuard()
+	}
+	// 写入根同样按 run 固定: 用 e.Config.Cwd 的绝对形式, 避免相对 cwd 与
+	// expandPath 出来的绝对路径做 Rel 时永远不匹配 (那会让限制变成全拒)。
+	writeRoot := ""
+	if opts.RestrictWritesToCwd && strings.TrimSpace(e.Config.Cwd) != "" {
+		writeRoot = e.Config.Cwd
+		if abs, err := filepath.Abs(writeRoot); err == nil {
+			writeRoot = abs
+		}
+	}
+	// 引用核验闸只触发一次: 第二次仍不达标就交付 (审计日志已记下未抓取清单),
+	// 反复要求修订会把一个"证据不足"的报告变成无限循环。
+	citationGateUsed := false
 	// 运行中入站通道 (21.8.12 P5): 标记"这次 run 能接注入"。
 	//
 	// Enter/Leave 配平用 defer —— 这条路径有 8 处提前 return, 手写必然漏掉几条,
@@ -307,6 +418,40 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			}
 		}
 
+		// 强制收口 (FinalizeTurns): 提醒放在压缩**之后**、请求之前。
+		//
+		// 不能放在注入/压缩之前: 这轮收口提醒正是"别再按旧方向做"的最高优先级
+		// 指令, 被折进摘要就等于没发。放在压缩后也保证它一定是历史里的最后一条。
+		remaining := opts.MaxTurns - turn
+		finalTurn := finalizeTurns > 0 && remaining == 1
+		if finalizeTurns > 0 {
+			// 优先给"成功抓取过"的 URL; 一条都没抓到时退回"见过"的清单
+			// (至少不让模型凭空拼路径)。
+			verified := ledger.sampleFetched(60)
+			if len(verified) == 0 {
+				verified = ledger.sample(60)
+			}
+			switch {
+			case finalTurn:
+				messages = append(messages, finalizeNotice(finalTurn, remaining, verified))
+			case remaining == finalizeTurns:
+				messages = append(messages, finalizeNotice(false, remaining, verified))
+			}
+		}
+		// 检索预算软提醒只发一次, 且不能和收口提醒抢最后一格: 收口提醒
+		// (含最后一轮的禁用工具) 优先级更高, 它已经要求停止检索了。
+		// 条件写 remaining > finalizeTurns 而不是 !finalTurn: 收口提醒在
+		// remaining == finalizeTurns 那一轮就发了, 此时再追加"去打开页面"
+		// 会把它覆盖成相反指令。
+		if remaining > finalizeTurns && !searchBudgetWarned && webSearchCalls >= searchSoftBudget {
+			messages = append(messages, searchBudgetNotice(webSearchCalls))
+			searchBudgetWarned = true
+			logging.Event(ctx, "search.soft_budget_notice",
+				"websearch_calls", webSearchCalls, "turn", turn, "remaining", remaining)
+			// 提醒进了历史, 但服务端按工具结果轮次缓存前缀; 这条消息只发一次,
+			// 不会每轮破坏缓存。
+		}
+
 		apiMessages := messagesToAPI(messages, nil)
 
 		// Path B 相位路由 (与主循环 queryLoop 同口径): 工具消费回合
@@ -326,8 +471,15 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			turnClient = client.WithModel(e.Config.ExecutionModel)
 		}
 
+		// 最后一轮把工具面整个撤掉: 模型即使还想检索, 也没有可调用的工具。
+		// 只靠提示词做不到这件事 —— 提示词是建议, 空工具表是约束。
+		turnTools := apiTools
+		if finalTurn {
+			turnTools = nil
+		}
+
 		callStart := time.Now()
-		resp, err := turnClient.SendMessage(ctx, apiMessages, systemPrompts, apiTools, opts.MaxTokens)
+		resp, err := turnClient.SendMessage(ctx, apiMessages, systemPrompts, turnTools, opts.MaxTokens)
 
 		// 收集 assistant 的 content blocks, 区分 text / tool_use
 		var (
@@ -359,7 +511,7 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			}
 			e.writeLLMCallSpan(ctx, llmCallSpan{
 				Start: callStart, Model: model, System: systemPrompts,
-				Messages: apiMessages, Tools: apiTools,
+				Messages: apiMessages, Tools: turnTools,
 				Output: internal_hook.JoinAssistantText(assistantBlocks),
 				Usage:  usage, StopReason: stop, Err: err,
 				Attempt: turn, Isolated: true,
@@ -378,11 +530,17 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		mergedAssistant, mergedToolUse, _ := internal_hook.MergeXMLToolCalls(assistantBlocks, toolUseBlocks, fmt.Sprintf("iso_t%d", turn))
 		assistantBlocks = mergedAssistant
 		toolUseBlocks = mergedToolUse
+		// WebFetch 的目标 URL 只在入参里; 漏记会让"真的打开过"的页面在收口
+		// 清单里消失, 模型于是被引导去引用搜索结果页而不是原文。
+		ledger.observeToolUses(toolUseBlocks)
 
-		// DisableTools 模式下, 即使解出来工具调用也不执行: 丢弃 tool_use blocks,
-		// 仅保留清洗后的文本. 这样思考型角色 (architect/researcher/planner)
-		// 单轮就返回, 不会陷入多轮工具循环.
-		if opts.DisableTools {
+		// DisableTools / 最后一轮收口: 即使解出来工具调用也不执行, 丢弃 tool_use
+		// blocks, 仅保留清洗后的文本.
+		//
+		// 最后一轮必须双保险: 工具表已置空, 但 XML 回退能从文本里"凭空"解析出
+		// tool_use (DeepSeek/MiniMax 系会这么干). 只撤工具表的话, 这些块会进
+		// toolUseBlocks 分支并被执行 —— 最后一轮的"禁用工具"就被绕过了.
+		if opts.DisableTools || finalTurn {
 			toolUseBlocks = nil
 			kept := assistantBlocks[:0]
 			for _, b := range assistantBlocks {
@@ -396,15 +554,25 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 
 		// 用清洗后的 assistantBlocks 拼接本轮 text. 这样最终返回值不会泄漏
 		// 残留的 XML 包裹标签, 上层 (architect 校验器等) 看到的是纯净文本.
-		// 同时收集 thinking 块文本 (MiniMax 等模型会把推理内容放在 thinking 块).
-		var turnText strings.Builder
+		//
+		// thinking 块只在**本轮没有任何 text 块**时兜底使用 (MiniMax 等模型会把
+		// 整段回答放在 thinking 里)。不能无条件拼接: 实测 DeepSeek 在最后一轮
+		// 同时返回 thinking 和 text, thinking 里是一份带标题的写作提纲, 拼在
+		// 正文前会让交付文本出现两个 H1、清理器把提纲当正文保留。CLI 事后虽然
+		// 会再 sanitize 一次, 但引擎内的引用审计、evidence.md 回填与 trace 都已
+		// 经看到污染后的文本 —— 审计字数比交付报告多 64 字、来源域名多 1 个,
+		// 都是从这里来的。
+		var turnText, thinkingText strings.Builder
 		for _, b := range assistantBlocks {
 			if b.Type == types.ContentBlockText && b.Text != "" {
 				turnText.WriteString(b.Text)
 			}
 			if b.Type == types.ContentBlockThinking && b.Thinking != "" {
-				turnText.WriteString(b.Thinking)
+				thinkingText.WriteString(b.Thinking)
 			}
+		}
+		if turnText.Len() == 0 {
+			turnText = thinkingText
 		}
 		if turnText.Len() > 0 {
 			lastAssistantText = turnText.String()
@@ -423,9 +591,29 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 
 		// 7. 没有 tool_use → 完成, 返回最后文本.
 		if len(toolUseBlocks) == 0 {
+			// 最后一轮仍然没有文本 = 收口失败. 必须报出来, 不能把上一轮的
+			// 中间产物当成最终答案静默返回 —— 那正是"跑完了但交的是半成品"
+			// 的形态, 上游看不出任何异常.
+			if finalTurn && turnText.Len() == 0 {
+				return lastAssistantText, fmt.Errorf("finalization turn produced no text")
+			}
 			// 如果整个 turn 既没有 text 也没有 tool_use, 给个明确错误.
 			if lastAssistantText == "" {
 				return "", fmt.Errorf("assistant returned empty content")
+			}
+			// 引用核验闸: 只给一次机会, 且必须还有下一轮可用 (否则改完没地方写).
+			// 至少留 6 轮才值得开核验: 实测 23/28 轮才触发时, 模型没有余量补抓,
+			// 直接把 6 条引用删掉把比例"修"达标, 报告从 9 个来源缩到 3 个 ——
+			// 时为修一个指标把内容修没了. 宁可跳过并让审计日志留痕.
+			if opts.CitationGate && !citationGateUsed && opts.MaxTurns-turn >= 6 {
+				unfetched, cited := ledger.unfetched(lastAssistantText)
+				if cited >= 3 && len(unfetched)*2 >= cited {
+					citationGateUsed = true
+					messages = append(messages, citationGateNotice(unfetched, cited))
+					logging.For("engine").Warn("最终报告有过半引用未成功抓取, 要求修订一次",
+						"cited", cited, "seen_not_fetched", len(unfetched), "turn", turn)
+					continue
+				}
 			}
 			return lastAssistantText, nil
 		}
@@ -441,6 +629,11 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		gated, deniedResults := gateToolUses(e.Config, toolUseBlocks)
 		messages = append(messages, deniedResults...)
 		toolUseBlocks = gated
+		for _, b := range toolUseBlocks {
+			if b.Name == "WebSearch" {
+				webSearchCalls++
+			}
+		}
 		if len(toolUseBlocks) == 0 {
 			continue // 全部被拒: 错误结果已入上下文, 让模型重新选择
 		}
@@ -462,6 +655,8 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			Role:             e.Config.Role,
 			GlobalPerm:       e.PermChecker,
 			WriteClaim:       claim, // H3-4 并发写占用: 本次 run 的写者身份
+			BashMerge:        bashMerge,
+			WriteRoot:        writeRoot,
 		}
 		// 阶段声明的 hook 在这里**并入**引擎既有的 Runner (见 IsolatedRunOptions.Hooks)。
 		//
@@ -470,6 +665,9 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		// 而排错时要问的恰恰是"它到底带了没带"。opts.Hooks 为空时 hookRunner 就是
 		// e.HookRunner 本身 (逐字节等于改造前, 不多构造对象)。
 		toolResults := tool.RunTools(ctx, toolUseBlocks, e.Tools, tctx, hookRunner)
+		ledger.observeMessages(toolResults)
+		// 入参+结果配对, 只把成功返回的 WebFetch / curl 记为"已抓取"。
+		ledger.observeFetches(toolUseBlocks, toolResults)
 		// RunTools 返回的是 user-role tool_result 消息, 直接追加
 		messages = append(messages, toolResults...)
 
@@ -534,6 +732,77 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		return lastAssistantText, fmt.Errorf("max_turns (%d) reached without final answer", opts.MaxTurns)
 	}
 	return "", fmt.Errorf("max_turns (%d) reached without any text response", opts.MaxTurns)
+}
+
+// finalizeNotice 构造强制收口的用户消息。
+//
+// last=true 时工具面已经撤掉, 文案必须说清"工具不可用", 否则模型会继续输出
+// tool_use 等待结果, 最后一轮白跑。两种情况都要求"用已有材料写完整报告",
+// 并明确允许把缺证据的部分写进局限 —— 否则模型会用编造来填缺口。
+func finalizeNotice(last bool, remaining int, verified []string) types.Message {
+	text := fmt.Sprintf("【收口提醒】本次运行只剩 %d 轮。立即停止一切检索与工具调用: 不要再发起 WebSearch / WebFetch / Bash, 不要再补证据。请直接用已经收集到的材料写出完整报告正文: 第一行是具体的一级标题 (# 开头), 之后是结论、分析、证据表和局限。材料不足的部分如实写进「局限」, 不要编造来源或数字。", remaining)
+	if last {
+		text = "【最后一轮】工具已经禁用, 本轮只能输出文本。不要再调用任何工具, 也不要输出计划或过程说明。现在直接写出最终报告正文: 第一行是具体的一级标题 (# 开头), 随后是完整结论、分析、证据表与局限。材料不足处写进「局限」, 不要臆造。"
+	}
+	if len(verified) > 0 {
+		var b strings.Builder
+		b.WriteString(text)
+		b.WriteString("\n\n本轮工具实际返回/请求过的 URL 如下。证据表**只能**引用其中出现过的 URL; 不在清单内的链接一律不要写 (宁可写进「局限」)。不要根据申请号/DOI/日期自己拼接路径:\n")
+		for _, u := range verified {
+			b.WriteString("- ")
+			b.WriteString(u)
+			b.WriteString("\n")
+		}
+		text = b.String()
+	}
+	return types.Message{
+		Type:      types.MessageTypeUser,
+		UUID:      internal_hook.GenerateUUID(),
+		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: text}},
+		CreatedAt: time.Now(),
+	}
+}
+
+// searchBudgetNotice 构造"检索预算"软提醒 (每次 run 至多发一次)。
+//
+// 它和收口提醒的分工: 收口提醒说"没轮次了, 停手"; 这条说"搜索次数已经很多,
+// 但轮次还有 —— 别再换关键词, 去打开最有希望的结果"。实测失败模式不是搜不到,
+// 而是把 20 多次搜索花在同一个方向上, 最后证据表只有 1-2 个域名。
+func searchBudgetNotice(calls int) types.Message {
+	text := fmt.Sprintf("【检索预算提醒】本次运行已发起 %d 次 WebSearch。停止扩大检索面: 不要再换关键词搜索, 从已有结果里挑 3-5 个最相关的 URL 用 WebFetch 打开, 拿到原文后再成文。证据表需要至少 4 个独立域名; 如果已有结果不足以支撑, 就在「局限」里如实说明, 不要用搜索摘要冒充实读原文。", calls)
+	return types.Message{
+		Type:      types.MessageTypeUser,
+		UUID:      internal_hook.GenerateUUID(),
+		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: text}},
+		CreatedAt: time.Now(),
+	}
+}
+
+// citationGateNotice 构造"引用核验"修订指令 (只注入一次)。
+//
+// 文案必须给出**两条可执行出路**: 打开页面, 或删除/降级该行。只说"不要引用
+// 未抓取 URL"会让模型把整段结论删掉 —— 而结论本身可能是有依据的, 只是来源
+// 写成了搜索结果。同时把格式要求再点一遍: 这是模型最后一次成文机会。
+func citationGateNotice(unfetched []string, cited int) types.Message {
+	var b strings.Builder
+	fmt.Fprintf(&b, "【引用核验】交付前自检: 最终报告引用了 %d 个 URL, 其中 %d 个从未成功抓取, 不能支撑「原文逐字摘录」。请处理后**重新输出完整最终报告**:\n", cited, len(unfetched))
+	b.WriteString("1) **首选保留事实行**, 把该行「置信度」改为「仅搜索摘要, 未核验」, 并在「局限」逐条列出这些 URL;\n")
+	b.WriteString("2) 只有能用已抓取来源替代、或该行本身不支撑结论时, 才删除/替换该行;\n")
+	b.WriteString("3) 若某条证据不可或缺, 最多补抓 3 个 URL; 不要开启新的检索方向。\n")
+	b.WriteString("**不要为了降低未抓取比例而删证据**: 修订后的证据表行数与引用 URL 数都不得少于修订前。\n")
+	b.WriteString("不要凭 snippet 编造引文。需要处理的 URL:\n")
+	for _, u := range firstNStrings(unfetched, 12) {
+		b.WriteString("- ")
+		b.WriteString(u)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n另: 最终回答第一行必须是 \"# \" 开头的一级标题, 正文不超过 2500 字; 证据表每行写完整 URL, 不要写「同上」。")
+	return types.Message{
+		Type:      types.MessageTypeUser,
+		UUID:      internal_hook.GenerateUUID(),
+		Content:   []types.ContentBlock{{Type: types.ContentBlockText, Text: b.String()}},
+		CreatedAt: time.Now(),
+	}
 }
 
 // gateToolUses 对 tool_use 块应用 Config.toolExposed (黑名单 + 白名单):

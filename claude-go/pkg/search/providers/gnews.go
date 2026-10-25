@@ -68,6 +68,12 @@ func (p *gnewsProvider) Search(ctx context.Context, req search.SearchRequest) (o
 		if !isHTTPURL(link) {
 			continue
 		}
+		// Google News RSS 的 <link> 是 news.google.com/rss/articles/... 跳转页,
+		// 打开后只有 Google News 空壳 (实测多份报告抓回来都是壳页)。它不是
+		// 可引用来源, 继续往下传只会诱导模型把跳转链写进证据表。
+		if googleNewsRedirect(link) {
+			continue
+		}
 		results = append(results, search.Result{
 			URL:       link,
 			Title:     snippetText(it.Title, 200),
@@ -77,4 +83,17 @@ func (p *gnewsProvider) Search(ctx context.Context, req search.SearchRequest) (o
 		})
 	}
 	return finishResults(p.name, req, results, limit), nil
+}
+
+// googleNewsRedirect 判断链接是否是 Google News 的站内跳转页。
+func googleNewsRedirect(link string) bool {
+	u, err := url.Parse(link)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	if h != "news.google.com" && h != "www.news.google.com" {
+		return false
+	}
+	return strings.HasPrefix(u.Path, "/rss/articles")
 }

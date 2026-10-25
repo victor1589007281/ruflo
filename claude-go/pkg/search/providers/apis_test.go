@@ -13,6 +13,32 @@ import (
 	"github.com/anthropic/claude-go/pkg/search"
 )
 
+// TestGitHubProviderSendsConfiguredToken 钉住 config.json → ProviderConfig.APIKey
+// 确实变成了出站 Authorization 头。
+//
+// 只测"LoadConfig 里填了 APIKey"不够: 中间任何一层把 pc.APIKey 丢掉, 表现都是
+// GitHub 搜索仍能返回结果 (只是按未认证的 10 req/min 限流), 靠结果数量看不出来。
+func TestGitHubProviderSendsConfiguredToken(t *testing.T) {
+	const want = "Bearer config-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != want {
+			t.Errorf("Authorization = %q, want %q", got, want)
+		}
+		fmt.Fprint(w, `{"items":[]}`)
+	}))
+	defer srv.Close()
+
+	p, err := newGitHub(search.DefaultConfig(), search.ProviderConfig{
+		Enabled: true, BaseURL: srv.URL, APIKey: "config-token",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Search(context.Background(), search.SearchRequest{Query: "go", Limit: 1}); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+}
+
 // TestDirectAPIs 用一个 httptest 服务覆盖全部直连 API 的解析。
 func TestDirectAPIs(t *testing.T) {
 	mux := http.NewServeMux()

@@ -1,11 +1,56 @@
 package search
 
+// config.go —— 检索数据面的配置装载与默认值。
+//
+// 配置分三层, 优先级从高到低:
+//  1. 装配层注入的进程级值 (目前只有 config.json 的 search.githubToken);
+//  2. SEARCH_* 环境变量 (出口/超时/缓存/层级);
+//  3. DefaultConfig 的零成本默认值。
+//
+// 这里刻意不读 HTTP_PROXY/HTTPS_PROXY: 宿主环境的代理变量会与"按 provider
+// 钉死出口"互相污染, 出口只认 SEARCH_PROXY_URL。
 import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// configuredGitHubToken 是装配层从 config.json 的 search.githubToken 注入的 token。
+//
+// 为什么要一个进程级变量而不是参数: 数据面是进程级单例 (builtin.DefaultDataStack
+// 用 sync.Once 装配), 而 LoadConfig 的调用点分散在工具注册、MCP server 与子命令里。
+// 让每个调用点都去读一遍 config.json 会把"读哪一份配置"的分叉带进来; 由装配层
+// 在第一次使用数据面之前注入一次, 只有一处来源。
+//
+// 用读写锁而不是普通变量: dashboard/serve 会在运行期热加载配置并重新注入,
+// 与正在执行的搜索并发。空值表示"配置没给", 此时回退到环境变量以兼容尚未迁移的
+// 旧部署; 环境变量不再是配置入口。
+var (
+	githubTokenMu         sync.RWMutex
+	configuredGitHubToken string
+)
+
+// SetGitHubToken 注入 config.json 的 search.githubToken。
+//
+// 传空字符串表示清除配置值; LoadConfig 会回退到 GITHUB_TOKEN 环境变量。
+func SetGitHubToken(token string) {
+	githubTokenMu.Lock()
+	configuredGitHubToken = strings.TrimSpace(token)
+	githubTokenMu.Unlock()
+}
+
+// githubAPIToken 返回当前生效的 GitHub token: 配置优先, 环境变量兜底。
+func githubAPIToken() string {
+	githubTokenMu.RLock()
+	tok := configuredGitHubToken
+	githubTokenMu.RUnlock()
+	if tok != "" {
+		return tok
+	}
+	return strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+}
 
 // Config 是检索服务的运行配置。零值可用: DefaultConfig 给出一套零成本配置。
 type Config struct {
@@ -82,7 +127,7 @@ func DefaultConfig() Config {
 	}
 }
 
-// LoadConfig 从环境变量加载配置; 未设置的项保持默认。
+// LoadConfig 从环境变量与装配层注入的 config.json search 段加载配置; 未设置的项保持默认。
 //
 // 支持的环境变量:
 //
@@ -91,6 +136,7 @@ func DefaultConfig() Config {
 //	SEARCH_TIMEOUT / SEARCH_FETCH_TIMEOUT / SEARCH_HEDGE_DELAY
 //	SEARCH_CACHE_TTL / SEARCH_CACHE_ENTRIES
 //	PARALLEL_URL / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / JINA_API_KEY
+//	GITHUB_TOKEN (仅兼容旧部署; config.json 的 search.githubToken 优先)
 //
 // 本服务不读取 HTTP_PROXY/HTTPS_PROXY, 避免与宿主环境互相污染。
 func LoadConfig() Config {
@@ -175,7 +221,7 @@ func LoadConfig() Config {
 	} {
 		cfg.Providers[name] = ProviderConfig{Enabled: true, Egress: ModeDirect, Weight: weight, Tier: TierL2}
 	}
-	if v := os.Getenv("GITHUB_TOKEN"); v != "" {
+	if v := githubAPIToken(); v != "" {
 		p := cfg.Providers["github"]
 		p.APIKey = v
 		cfg.Providers["github"] = p

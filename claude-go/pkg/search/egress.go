@@ -1,5 +1,16 @@
 package search
 
+// egress.go —— 按 provider 钉死的出口 (直连 / 代理 / 自动)。
+//
+// 每个 provider 在构造时声明自己的出口模式; 本文件预建两个 http.Client,
+// 由 Client(pin) 返回对应实例:
+//   - direct: 永不走代理;
+//   - proxy: 配了代理且探测健康时走代理, 否则回落到 direct 并把健康位暴露
+//     给上层记 degraded;
+//   - auto: 按代理健康位在两者之间切换。
+//
+// 代理健康由后台探测维护: 连续失败 failThreshold 次后摘除, 持续 recoverAfter
+// 后再探; 不配代理时 auto 直接退化为直连 (这是正常配置, 不是降级)。
 import (
 	"context"
 	"errors"

@@ -1,5 +1,11 @@
 package search
 
+// errors.go —— 检索错误的归一化分类。
+//
+// provider 的原始错误形态各异 (HTTP 状态、超时、挑战页、JSON 解析失败),
+// 调度器只关心"该重试、该熔断还是该降级", 因此统一收敛成 ErrorKind:
+// timeout / rate_limited / blocked / unavailable / invalid_input / unsupported /
+// no_provider。KindOf 用 errors.As 穿透 Wrap 包装, 不依赖错误字符串匹配。
 import (
 	"errors"
 	"fmt"

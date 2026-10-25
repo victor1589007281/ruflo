@@ -34,6 +34,10 @@ func searchMCPServerCmd() *cobra.Command {
   market_quote / market_history / market_fundamentals
   market_filings / market_news / market_macro
 
+配置 (推荐):
+  --config <path>     config.json; 从 search.githubToken 读取 GitHub PAT
+                      (优先级高于 GITHUB_TOKEN 环境变量, 后者仅为兼容旧部署保留)
+
 环境变量 (全部可选):
   SEARCH_PROXY_URL    出口代理, 例如 http://host:8888
   SEARCH_NO_PROXY     逗号分隔的直连名单

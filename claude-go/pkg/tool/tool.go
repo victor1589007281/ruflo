@@ -139,6 +139,20 @@ type ToolContext struct {
 	// 早年的写变成对后续所有子代理的长期封锁), 工具被单独调用时也没有引擎装配它。
 	// nil 语义 = 未参与, 与改造前逐字节相同。
 	WriteClaim *WriteClaimant `json:"-"`
+
+	// BashMerge run 级 Bash 目标合并闸 (见 bashguard.go)。nil = 不启用,
+	// 逐字节走改造前行为。由 RunIsolated 在 opts.MergeBashTargets 为真时
+	// 每次运行建一个 —— 必须按 run 隔离: BashTool 是全局共享实例, 把账本挂在
+	// 工具上会让并发的两个 run 互相把对方的目标算成"已访问"。
+	BashMerge *BashMergeGuard `json:"-"`
+
+	// WriteRoot 非空时, Write/Edit 只允许落在这个目录内 (含子目录)。
+	//
+	// 为什么需要: 调研角色只该产出当前工作目录里的 evidence.md, 但 --
+	// permission-mode bypass 下 Write 对绝对路径照单全收。实测模型把
+	// evidence.md 写成了 /home/victor/evidence.md —— 既污染宿主家目录, 又让
+	// 并发跑的多个任务互相覆盖同一份文件。空串 = 不限制 (改造前行为)。
+	WriteRoot string `json:"writeRoot,omitempty"`
 }
 
 // PathInPlanDir 判定展开后的绝对路径是否位于计划文件目录 (PlanFileDir) 内。
@@ -150,8 +164,23 @@ func (t *ToolContext) PathInPlanDir(path string) bool {
 	if t == nil || strings.TrimSpace(t.PlanFileDir) == "" {
 		return false
 	}
-	base := filepath.Clean(t.PlanFileDir)
-	target := filepath.Clean(path)
+	return pathWithinRoot(t.PlanFileDir, path)
+}
+
+// PathInWriteRoot 判定展开后的绝对路径是否位于本次运行的写入根内。
+// WriteRoot 为空时恒 true (不限制); 非空时用 filepath.Rel 挡住 `../` 逃逸。
+func (t *ToolContext) PathInWriteRoot(path string) bool {
+	if t == nil || strings.TrimSpace(t.WriteRoot) == "" {
+		return true
+	}
+	return pathWithinRoot(t.WriteRoot, path)
+}
+
+// pathWithinRoot 判断 target 是否等于 base 或位于其子目录 (两者都按绝对路径处理)。
+// 与 orchestration.go 的三参 pathWithin 分开命名: 那个按 cwd 解析相对路径, 语义不同。
+func pathWithinRoot(base, target string) bool {
+	base = filepath.Clean(base)
+	target = filepath.Clean(target)
 	rel, err := filepath.Rel(base, target)
 	if err != nil {
 		return false

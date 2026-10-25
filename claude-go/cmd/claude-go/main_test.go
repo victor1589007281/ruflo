@@ -30,7 +30,87 @@ func TestNormalizeProviderModelAlias(t *testing.T) {
 	}
 }
 
+func TestStripReportPreamble(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{
+			name: "planning then report",
+			in:   "Now write the report. Body 1500-2500 字.\n\nStructure:\n1. 结论\n\n# 真正的报告\n\n正文",
+			want: "# 真正的报告\n\n正文",
+		},
+		{
+			name: "planning heading is skipped",
+			in:   "Let me plan.\n\n## Plan\n\n1. search\n\n## 结论\n\n正文",
+			want: "## 结论\n\n正文",
+		},
+		{
+			name: "normal intro is preserved",
+			in:   "这是一段摘要。\n\n# 报告\n\n正文",
+			want: "这是一段摘要。\n\n# 报告\n\n正文",
+		},
+		{
+			name: "report only",
+			in:   "# 报告\n\n正文",
+			want: "# 报告\n\n正文",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripReportPreamble(tc.in); got != tc.want {
+				t.Fatalf("stripReportPreamble() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStripReportPreambleLargePlanningBlock 钉住 4KB 上限的真实回归:
+// CBAM 的一次运行写了 4.2KB 的“数字复核/口径提醒”才出标题, 旧的 4KB 闸门
+// 直接放行, 整段计划原样进 final。
+func TestStripReportPreambleLargePlanningBlock(t *testing.T) {
+	planning := "Now write the report. 字数目标 1500-2500.\n" + strings.Repeat("核对数字与口径，避免把估算写成官方数据。\n", 200)
+	in := planning + "\n# 报告标题\n\n正文"
+	got := stripReportPreamble(in)
+	if got != "# 报告标题\n\n正文" {
+		t.Fatalf("4KB 以上的计划段未被裁掉: got %d bytes, prefix %q", len(got), got[:80])
+	}
+}
+
+func TestKeepLastCompleteReport(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{
+			name: "two drafts keep last",
+			in:   "# 第一稿\n\n## 一、结论\n\n旧\n\n# 第二稿\n\n## 一、结论\n\n新",
+			want: "# 第二稿\n\n## 一、结论\n\n新",
+		},
+		{
+			name: "appendix is not a new draft",
+			in:   "# 报告\n\n## 一、结论\n\n正文\n\n# 附录\n\n表",
+			want: "# 报告\n\n## 一、结论\n\n正文\n\n# 附录\n\n表",
+		},
+		{
+			// 第二稿省略 H1 时, 只按“## 结论”切会丢掉唯一的报告标题。
+			name: "single h1 is kept when second draft omits it",
+			in:   "# 报告\n\n## 一、结论\n\n旧\n\n## 一、结论\n\n新",
+			want: "# 报告\n\n## 一、结论\n\n新",
+		},
+		{
+			name: "single report unchanged",
+			in:   "# 报告\n\n## 一、结论\n\n正文",
+			want: "# 报告\n\n## 一、结论\n\n正文",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := keepLastCompleteReport(tc.in); got != tc.want {
+				t.Fatalf("keepLastCompleteReport() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveRuntimeModelConfigUsesProviderAlias(t *testing.T) {
+	// 本机 shell 可能带着 CLAUDE_GO_LLM_GATEWAY; 不隔离会把 BaseURL 改指
+	// 网关, 让"解析到 provider 端点"的断言在开发机上假失败。
+	t.Setenv("CLAUDE_GO_LLM_GATEWAY", "")
 	cfg := &feishu.JSONConfig{
 		Providers: feishu.ProvidersSection{
 			"dashscope": {
@@ -120,6 +200,8 @@ func TestBuildEngineUsesRuntimeConfigProviders(t *testing.T) {
 	restore := snapshotGlobalFlags()
 	defer restore()
 	defer sandbox.ResetConfigForTest()
+	// 同上: 网关 env 会把出站 BaseURL 改指 127.0.0.1:18989。
+	t.Setenv("CLAUDE_GO_LLM_GATEWAY", "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("DASHSCOPE_API_KEY", "")
 	t.Setenv("API_BASE_URL", "")

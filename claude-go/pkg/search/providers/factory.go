@@ -1,5 +1,10 @@
 package providers
 
+// factory.go —— 配置键到 provider 构造函数的注册表。
+//
+// 只登记本包实现的无 key / 免鉴权源; 付费源 (exa/tavily/firecrawl/jina/...)
+// 必须在配置里给了 APIKey 才会被构造。构造顺序按配置键排序, 保证每次启动的
+// 源列表一致 —— 否则路由排序在 tier/权重相同时会出现不可复现的名次漂移。
 import (
 	"sort"
 

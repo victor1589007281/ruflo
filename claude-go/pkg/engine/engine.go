@@ -1721,6 +1721,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					switch event.Delta.Type {
 					case "text_delta":
 						currentText.WriteString(event.Delta.Text)
+						// 以当前块类型判定思考, 不只信 delta.Type: 部分 OpenAI 兼容
+						// 网关会把 thinking 块内的增量标成 text_delta, 只按 delta.Type
+						// 判断会让思维链漏进 --output-format json 的 final 字段。
+						isThinking := currentBlock != nil && currentBlock.Type == types.ContentBlockThinking
 						skipStream := false
 						if e.HookRunner != nil {
 							hookOut := e.HookRunner.ExecuteOnChunkHooks(event.Delta.Text, event.Index, false)
@@ -1740,6 +1744,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 								Kind:       types.StreamEventDelta,
 								DeltaText:  event.Delta.Text,
 								BlockIndex: event.Index,
+								IsThinking: isThinking,
 							}
 						}
 					case "input_json_delta":

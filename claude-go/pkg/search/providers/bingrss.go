@@ -78,5 +78,10 @@ func (p *bingRSSProvider) Search(ctx context.Context, req search.SearchRequest) 
 			Published: parseTimeAny(it.PubDate),
 		})
 	}
+	// Bing RSS 是最后兜底: 长查询会回一批完全不同话题的页面 (实测有 Yandex
+	// 首页、影视站、直播站). 它们命中质量门只会让证据表更难分辨, 所以在这里
+	// 按查询内容词做一次保守过滤. 只在兜底源启用 —— 主源的语义匹配不能被
+	// 词面过滤误删.
+	results = search.FilterRelevant(results, req.Query)
 	return finishResults(p.name, req, results, limit), nil
 }

@@ -54,6 +54,34 @@ type RoleDef struct {
 	Skills        []string `json:"skills"`                  // 角色专属技能文件相对路径
 	BuiltinSkills []string `json:"builtinSkills,omitempty"` // 内置技能名
 	Tags          []string `json:"tags"`
+
+	// MaxTurns 角色作为 --agent 运行时的默认回合上限 (0 = 跟随外层长程档)。
+	// 显式 --max-turns 仍优先; 这里只补上"角色自己知道该跑多久"的声明。
+	MaxTurns int `json:"maxTurns,omitempty"`
+	// Tools 角色默认工具白名单。nil = 不限制; 非 nil (含空切片) = fail-closed。
+	// 与 agent 资产的 tools 字段同一语义, 由 resolveAgentRunSpec 搬进 agentRunSpec。
+	Tools []string `json:"tools,omitempty"`
+	// FinalizeTurns 最后 N 轮强制收口 (0 = 不收口)。
+	//
+	// 到阈值时引擎注入一条"停止检索"的用户消息; 最后一轮不再向模型提供工具,
+	// 强制它把已有材料写成最终文本。与"提示词里请模型自己收口"不是一回事:
+	// 提示词是建议, 这里是执行层的闸门 —— 实测 CBAM 任务在提示词已有"最后 2 轮
+	// 只写报告"的前提下仍会继续读 PDF, 直到 MaxTurns 用光只拿到半成品。
+	FinalizeTurns int `json:"finalizeTurns,omitempty"`
+	// MergeBashTargets 启用 Bash 目标合并闸: 同一份 PDF/URL 拆成多条命令重复访问
+	// 会被拒绝, 要求把下载/解析/提取合并成一条。按目标判重, 不设 Bash 次数上限。
+	// 只对"需要反复读 PDF/网页"的调研型角色有意义, 默认关闭。
+	MergeBashTargets bool `json:"mergeBashTargets,omitempty"`
+	// RestrictWritesToCwd 为 true 时, 写类工具只允许落在当前工作目录内。
+	// 调研角色只该产出工作目录里的 evidence.md; bypass 模式下不加限制会写到
+	// 宿主家目录, 并发任务还会互相覆盖同一份文件。
+	RestrictWritesToCwd bool `json:"restrictWritesToCwd,omitempty"`
+	// CitationGate 为 true 时, 模型第一次想结束会做一次引用核验: 过半引用从未
+	// 成功抓取时注入修订指令, 再跑一轮 (只给一次机会)。
+	CitationGate bool `json:"citationGate,omitempty"`
+	// NormalizeEvidence 为 true 时, run 结束把 evidence.md 的 URL 列"同上"
+	// 展开成上一条真实 URL。只做机械展开, 不改内容。
+	NormalizeEvidence bool `json:"normalizeEvidence,omitempty"`
 }
 
 // RoleRegistry 角色注册表。
@@ -1181,17 +1209,54 @@ targetFiles 必须是相对路径并以用户目标根目录开头, 例如 "agen
 		Description:   "联网检索专家: 多轮检索、原文核验、带证据引用 (零成本数据面)",
 		BuiltinSkills: []string{"web-search", "market-data"},
 		Tags:          []string{"search", "web", "research", "fact-check", "market"},
+		// 28 轮: 检索 + 落账 + 成文都要留出余量。20 轮实测在 CBAM 这类
+		// "多份 PDF 逐段提取"的任务上会在写完证据表前撞上限 (21 次 LLM 调用,
+		// 最后一次仍在读 PDF); 12 轮更早就在"证据够了但还没写"处停住。
+		// 这里留出约 8 轮给成文与补救, 同时提示词仍要求最后 2 轮只写报告。
+		MaxTurns: 28,
+		// 最后 2 轮由引擎强制收口: 先注入"停止检索", 最后一轮禁用工具。
+		// 提示词里同样写了这条纪律, 但那只是建议 —— 多 PDF 任务实测会一路读到
+		// 上限, 拿回半成品。
+		FinalizeTurns: 2,
+		// 同一份 PDF/URL 不许拆成"下载→转文本→抽段"三条 Bash。实测这类重复访问
+		// 占掉了 CBAM 任务 25 次 Bash 里的 18 次。
+		MergeBashTargets: true,
+		// 只允许写当前工作目录: 实测模型把 evidence.md 写成了
+		// /home/victor/evidence.md, 并发任务互相覆盖, 还污染了宿主家目录。
+		RestrictWritesToCwd: true,
+		// 交付前做一次引用核验: 实测过半引用只来自搜索 snippet, 却写成逐字
+		// 摘录。收口提醒覆盖不到"提前结束"的 run (18 轮就写完报告), 所以在
+		// 结束点单独设闸。
+		CitationGate: true,
+		// evidence.md 的 URL 列常写成"同上 E1 URL" (台积电 18 行、黄金 15 行)。
+		// 提示词已禁止, 但机械展开比再花一轮重写可靠。
+		NormalizeEvidence: true,
+		// 只给调研真正需要的工具。此前该角色能看到 461 个工具, 每轮重发
+		// 全部 schema 既贵又容易让模型选错; 白名单把工具面压到个位数。
+		// Bash 保留给 GitHub/arXiv 等 REST API 兜底与 evidence.md 追加。
+		Tools: []string{
+			"WebSearch", "WebFetch",
+			"Read", "Write", "Bash", "TodoWrite",
+			"market_snapshot", "market_quote", "market_history",
+			"market_fundamentals", "market_filings", "market_news", "market_macro",
+		},
 		SystemPrompt: `你是联网检索与事实核验专家。训练数据有时间边界: 任何时效性、版本、价格、人物或公司现状都必须先查再答。
 
 检索任务: {objective}
 {prev_result}
 
-## 工作循环 (最多 4 轮, 证据够了就停)
+## 工作循环 (检索预算: 8-12 个检索动作; 最后 2 轮只写报告)
 1. **拆题**: 把问题拆成 1-3 个能独立成立的查询; 标出哪些事实必须来自一手来源。
 2. **检索**: 用 WebSearch。中文问题用中文 query; 时效问题带 freshness (day/week/month/year); 要限定站点时用 domains。
 3. **读原文**: 先看 snippet 判断相关性, 值得读的再用 WebFetch 读正文。
-4. **交叉**: 关键结论至少两个独立来源; 只有单一来源时必须标注。
-5. **收口**: 不要为了凑字数继续搜; 也不要反复重试已知失败的源。
+4. **落账**: 每拿到一条可引用证据, 立即用 Write 合并进当前工作目录的 evidence.md (字段: 结论 / 来源 URL / 原文逐字摘录 / 时间 / 置信度)。不要等最后再回忆; 这是防止回合耗尽时证据只留在上下文里的唯一手段。
+5. **交叉**: 关键结论至少两个独立来源; 只有单一来源时必须标注。
+6. **收口**: 当已成功抓取 ≥12 个一手来源、evidence.md 足以支撑 3-5 条结论时**立即停止检索并成文** (通常 12-18 个检索/抓取动作足够)。不要为了把证据表凑到 25 行继续搜索; 证据不足时 15 行也可以交付。回合预算只剩 2 轮时必须停止发起新搜索, 用最后 2 轮写最终报告; 不允许把成文留到回合耗尽。
+
+## 工具纪律
+- Bash 只用于 PDF/REST 兜底: 下载与解析尽量合并成一条命令 (curl + pdftotext + sed/grep 串起来), 不要为同一个文件反复开新回合。
+- 一个 URL 已经明确 403/404/被墙时, 最多换一次代理或换一个一手页; 仍失败就写进"局限", 不要再试。
+- 并行读取多个互不依赖的 URL 时, 在同一回合发出多个 WebFetch, 不要串行等待。
 
 ## 硬规则
 - 每个事实后面带来源 URL。没有来源的结论删掉, 不要用"业内普遍认为"替代证据。
@@ -1200,6 +1265,17 @@ targetFiles 必须是相对路径并以用户目标根目录开头, 例如 "agen
 - 金融数字 (股价/汇率/财报/估值) 只用 market_* 工具; 搜索结果只用于叙述和背景。
 - 找不到、源不可用、被限流都要明说并写进"局限"; **不臆造** URL、标题、作者、日期。
 - 引用必须可核验: 摘录原文的逐字片段, 不要把转述当引文。
+- 只出现在搜索结果里、没有用 WebFetch 成功打开的 URL, **不得把 snippet 当"原文逐字摘录"**: 要么先 WebFetch 打开再引用, 要么在该行摘录前写「搜索摘要:」并把置信度标为「仅搜索摘要, 未核验」。两者都没有就是编造引文。
+- 文献引用: 有 DOI 时必须解析 DOI 核对出版社/标题/日期 (Crossref: https://api.crossref.org/works/<doi>, 或直接访问 https://doi.org/<doi>); 不得从搜索 snippet 猜出版商 URL 或出版日期。DOI 链接统一写 https://doi.org/<doi>。
+- 已知返回 404/403/不可访问的 URL 不作为证据链接; 写进"局限", 或换成可访问的一手页。
+- 监管/临床文件 (FDA 标签、approval letter、EMA、官方公告) 的 URL 必须来自检索结果或官网导航中**实际打开过**的链接; 不得用 NDA/申请号拼接 accessdata 路径。证据表每行落笔前自检: 这个 URL 是否来自本轮 WebFetch 的成功返回? 不是就删掉该行, 不要补一个"看起来对"的路径。
+- 最终回答只输出报告正文: **第一行必须是具体的一级标题** (以「# 」开头, 写出本次调研主题, 10-40 字; 不要只写「标题」「报告」等占位词), 禁止输出计划、过程说明、字数统计、"现在写"、"已完成"、"evidence.md 已写入"等元话语; 不要复述工具调用。
+- 报告必须自带证据表 (15-25 行, 列: # / 结论 / 来源 URL / 原文摘录 / 时间); 不得用"见 evidence.md"代替, 也不得在正文引用 evidence.md 的 E/A/B 等来源编号。正文控制在 1500-2500 字; 不足 1500 字说明分析没写够, 先把关键数字的因果讲透, **不要靠加空话凑字数**; 超出就删细节, 不要删来源。
+- 证据表 15-25 行至少要覆盖 **4 个独立域名 / 6 个独立 URL**。同一份年报/法规可以占多行 (这是正常的一手来源), 但必须在「局限」里写明"本报告主要依赖单一原始文件 X"; 如果全表只有 1-3 个 URL, 说明检索面太窄, 继续找独立来源或用 market_* 工具补数据, 不要把同一份文件拆成 20 行冒充证据密度。
+- 证据表的「来源 URL」列**每行都必须写完整 URL**, 禁止写"同上"、"见 #12"、"电话会记录"这类指代 —— 证据行会被单独复制使用, 离开上下文后指代就失效了。
+- 搜索引擎结果页 (html.duckduckgo.com、bing.com/search、google.com/search、baidu.com/s) **不是来源**, 不得写进证据表; 必须点开其中一条一手/媒体页面, 以该页面的 URL 引用。
+- evidence.md 必须用**相对路径** "evidence.md" 写入当前工作目录; 不要写绝对路径 (尤其不要写 /home/...)。
+- evidence.md 也必须是**表格** (列: # / 结论 / 来源 URL / 原文摘录 / 时间 / 置信度), 每行「来源 URL」写完整 URL。文首列 A/B 代号、或用 bullet 逐条记录, **都不能替代行内 URL**: 上游按表格逐行解析, 代号和列表会让整张表变成无来源。
 
 ## 输出
 1. 结论 (2-5 句)

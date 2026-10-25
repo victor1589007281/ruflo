@@ -276,6 +276,28 @@ func TestBuildAgentRunner_声明的回合上限接进既有判定链(t *testing.
 	}
 }
 
+// TestBuildAgentRunner_收口与Bash合并声明被搬运 钉住两个新开关不会只停在
+// agentRunSpec 上: 少搬一层, 角色声明看起来生效、运行时仍是旧行为.
+func TestBuildAgentRunner_收口与Bash合并声明被搬运(t *testing.T) {
+	spec := &agentRunSpec{Name: "a", Source: "role", FinalizeTurns: 2, MergeBashTargets: true, RestrictWritesToCwd: true, CitationGate: true, NormalizeEvidence: true}
+	r := buildAgentRunner(nil, spec, modelconfig.ResolvedConfig{}, 0)
+	if r.finalizeTurns != 2 {
+		t.Fatalf("finalizeTurns = %d, want 2", r.finalizeTurns)
+	}
+	if !r.mergeBashTargets {
+		t.Fatal("mergeBashTargets = false, want true")
+	}
+	if !r.restrictWritesToCwd {
+		t.Fatal("restrictWritesToCwd = false, want true")
+	}
+	if !r.citationGate {
+		t.Fatal("citationGate = false, want true")
+	}
+	if !r.normalizeEvidence {
+		t.Fatal("normalizeEvidence = false, want true")
+	}
+}
+
 // TestBuildAgentRunner_角色层技能不重复并入 —— 角色层的 MergedPrompt 已经拼过正文。
 func TestBuildAgentRunner_角色层技能不重复并入(t *testing.T) {
 	roleSpec := &agentRunSpec{Name: "r", Source: "role", Skills: []string{"s1"}}

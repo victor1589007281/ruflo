@@ -1,5 +1,13 @@
 package search
 
+// fetch.go —— 单页抓取、正文抽取与字符集处理。
+//
+// 抓取前先做 URL 校验 (只允许 http/https, 解析 DNS 后拒绝私网/环回/链路本地
+// 地址), 防止 WebFetch 被当成 SSRF 跳板; 响应按 Content-Type 选择 HTML 抽取
+// 或纯文本, 字符集从 header/meta 探测后转 UTF-8, 最终按 maxChars 截断。
+//
+// HTML 抽取不引第三方 DOM 依赖, 用一个小型容错解析器挑正文根节点, 再转成
+// 带标题/列表/链接的 Markdown; 解析失败时退回原始文本而不是报错。
 import (
 	"context"
 	"encoding/json"

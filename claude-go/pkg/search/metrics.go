@@ -1,5 +1,9 @@
 package search
 
+// metrics.go —— 进程内的最小指标集合 (counter / gauge / histogram)。
+//
+// 不引 prometheus: 数据面嵌在 CLI 与网关里, 指标只需要被 dashboard 或日志
+// 周期拉取。标签组合按字符串拼 key, 读快照时再解析回来; 所有方法并发安全。
 import (
 	"sort"
 	"strings"

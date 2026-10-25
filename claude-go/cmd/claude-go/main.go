@@ -68,6 +68,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/sandbox"
+	"github.com/anthropic/claude-go/pkg/search"
 	"github.com/anthropic/claude-go/pkg/session"
 	"github.com/anthropic/claude-go/pkg/sessionapi"
 	"github.com/anthropic/claude-go/pkg/settings"
@@ -233,13 +234,21 @@ func main() {
 			// 例外: dashboard / feishu 子命令会自己根据 --config (config.cwd/stateDir)
 			// 解析出精确路径再调用 InitGlobalLLMCollector (支持重定位)。在这里用 os.Getwd()
 			// 做兜底会提前创建错位的 .claude-go 目录, 所以直接跳过, 交给子命令自己初始化。
+			// 先把 search 段的凭据注入数据面。必须早于下面的 dashboard/feishu 提前
+			// return: 这两个子命令也会用到搜索工具, 而且数据面是 sync.Once 单例,
+			// 晚一步注入就再也轮不到它。
+			jsonCfg, _, cfgErr := loadRuntimeJSONConfig()
+			if cfgErr == nil {
+				applySearchConfig(jsonCfg)
+			}
+
 			path := cmd.CommandPath()
 			if strings.Contains(path, " dashboard") || strings.Contains(path, " feishu") {
 				return
 			}
 			cwd, _ := os.Getwd()
 			stateDirInput := ""
-			if jsonCfg, _, err := loadRuntimeJSONConfig(); err == nil && jsonCfg != nil {
+			if jsonCfg != nil {
 				if jsonCfg.Cwd != "" {
 					cwd = jsonCfg.Cwd
 				}
@@ -3484,6 +3493,23 @@ func loadRuntimeJSONConfig() (*feishu.JSONConfig, string, error) {
 	return cfg, path, err
 }
 
+// applySearchConfig 把 config.json 的 search 段注入进程级检索数据面。
+//
+// 数据面是 sync.Once 单例 (builtin.DefaultDataStack), 一旦装配就不再重读配置,
+// 所以必须在任何工具注册/搜索调用之前注入。入口刻意有两处:
+//   - 根命令 PersistentPreRun: search-mcp-server、tools 等不走 buildEngine 的子命令;
+//   - buildEngine: run/chat/continue 的实际运行路径 (测试里直接调 buildEngine 也覆盖)。
+//
+// 两处注入同一份配置, 幂等。传空值会清除旧值并回退到环境变量, 避免热加载时
+// 把上一次配置的 token 留在进程里。
+func applySearchConfig(cfg *feishu.JSONConfig) {
+	if cfg != nil && cfg.Search != nil {
+		search.SetGitHubToken(cfg.Search.GitHubToken)
+		return
+	}
+	search.SetGitHubToken("")
+}
+
 // loadRuntimeJSONConfigWithOrigin 同 loadRuntimeJSONConfig, 额外返回命中的环节名。
 //
 // 环节名只给装配自报用 (pkg/assembly.ConfigSource.Origin): 查找链有六环, 出问题时
@@ -3830,6 +3856,9 @@ func buildEngine() (*engine.QueryEngine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("加载配置文件失败: %w", err)
 	}
+	// 检索数据面的凭据必须在 RegisterBaseTools 之前注入: 那里会经
+	// NewWebSearchTool/NewWebFetchTool 触发 DefaultDataStack 的 sync.Once 装配。
+	applySearchConfig(jsonCfg)
 	// 运维索引维度 (方案 20.6.4): 工单与实例是本次运行的业务归属, 配置里声明一次,
 	// 由 buildEngine 在装配点写进 trace.IDs, 之后所有出站请求头 / Span / 落盘记录
 	// 都带着它 —— 这是"给一个 instance_id, 30 秒内拉出全部决策链"的地基 (D0.5)。
@@ -4638,6 +4667,16 @@ type agentRunSpec struct {
 	Model string
 	// MaxTurns 声明的回合上限 (0 = 跟随外层长程档)。
 	MaxTurns int
+	// FinalizeTurns 最后 N 轮强制收口 (0 = 不收口), 由角色声明搬运。
+	FinalizeTurns int
+	// MergeBashTargets 启用 run 级 Bash 目标合并闸, 由角色声明搬运。
+	MergeBashTargets bool
+	// RestrictWritesToCwd 把写类工具限制在当前工作目录内, 由角色声明搬运。
+	RestrictWritesToCwd bool
+	// CitationGate 交付前做一次引用核验, 由角色声明搬运。
+	CitationGate bool
+	// NormalizeEvidence 把 evidence.md 的 URL 列"同上"机械展开, 由角色声明搬运。
+	NormalizeEvidence bool
 	// PermissionMode 声明的权限档 (空 = 不覆盖)。
 	PermissionMode string
 	// ToolProfile / HasToolProfile 声明的工具档位。
@@ -4722,6 +4761,17 @@ func resolveAgentRunSpec(name string, roles *agent.RoleRegistry, skillReg *skill
 			// 第三参传进来同构)。在解析层就把任务拼进系统提示词, 会让同一份 spec
 			// 与某一次具体的运行绑死, 而这正是"运行时配置"要解耦的东西。
 			spec.SystemPrompt = roles.MergedPrompt(rd.Name, "", "")
+			spec.MaxTurns = rd.MaxTurns
+			spec.FinalizeTurns = rd.FinalizeTurns
+			spec.MergeBashTargets = rd.MergeBashTargets
+			spec.RestrictWritesToCwd = rd.RestrictWritesToCwd
+			spec.CitationGate = rd.CitationGate
+			spec.NormalizeEvidence = rd.NormalizeEvidence
+			// Tools 的三态语义与资产层一致: nil = 不限制, 非 nil (含空切片) =
+			// 显式白名单 (空切片即 fail-closed)。HasTools 单独存, 不能靠 len()==0
+			// 判断 —— 那会把"显式拒绝一切"读成"没声明"。
+			spec.Tools = append([]string(nil), rd.Tools...)
+			spec.HasTools = rd.Tools != nil
 			spec.Skills = append([]string(nil), rd.BuiltinSkills...)
 			return spec, nil
 		}
@@ -4784,6 +4834,11 @@ func buildAgentRunner(eng *engine.QueryEngine, spec *agentRunSpec, mcfg modelcon
 		// 在产物上唯一的落点。留空会让中间态退化成按 Role+Cwd 分账 (见 withStage)。
 		stage:               spec.Name,
 		longHorizonMaxTurns: longHorizonTurns,
+		finalizeTurns:       spec.FinalizeTurns,
+		mergeBashTargets:    spec.MergeBashTargets,
+		restrictWritesToCwd: spec.RestrictWritesToCwd,
+		citationGate:        spec.CitationGate,
+		normalizeEvidence:   spec.NormalizeEvidence,
 	}
 	if cap := agentTurnCap(spec, longHorizonTurns); cap > 0 {
 		// 回合上限接进**既有**判定链: cliStageMaxTurns(role, modelTurns, longTurns)
@@ -4997,6 +5052,9 @@ func runAsAgent(cmd *cobra.Command, eng *engine.QueryEngine, userPrompt string, 
 
 	runner := buildAgentRunner(eng, spec, mcfg, longHorizonTurns)
 	final, runErr := runner.Execute(ctx, userPrompt)
+	// agent 路径不走 consumeStreamEvents, 这里单独清一次写作计划前缀/重复稿; 否则
+	// --output-format json 的 final 会把“Now write / Structure / 字数目标”当成报告。
+	final = sanitizeFinalText(final)
 	if runErr != nil {
 		errKind = "agent_run_error"
 		// 产物一并带回: RunIsolated 在出错时已经把收集到的文本给了, 丢掉它等于让
@@ -5129,8 +5187,18 @@ type cliAgentRunner struct {
 	role         string
 	systemPrompt string
 	// stage 稳定阶段标识 (agent.RunMetadata.Stage), 供 H3-2 中间态按阶段分账。
-	stage    string
-	modelCfg modelconfig.ResolvedConfig // 为空则使用 eng.APIClient 默认
+	stage string
+	// finalizeTurns 最后 N 轮强制收口 (0 = 不收口), 来自角色声明。
+	finalizeTurns int
+	// mergeBashTargets 启用 run 级 Bash 目标合并闸, 来自角色声明。
+	mergeBashTargets bool
+	// restrictWritesToCwd 把写类工具限制在当前工作目录内, 来自角色声明。
+	restrictWritesToCwd bool
+	// citationGate 交付前做一次引用核验, 来自角色声明。
+	citationGate bool
+	// normalizeEvidence 展开 evidence.md 的"同上"引用, 来自角色声明。
+	normalizeEvidence bool
+	modelCfg          modelconfig.ResolvedConfig // 为空则使用 eng.APIClient 默认
 	// longHorizonMaxTurns 长程档的回合上限 (H4-3), 来自 ai.longHorizonMaxTurns。
 	// 0 = 未配置, Execute 用编译期兜底 (与改造前硬编码的 150 同值)。
 	longHorizonMaxTurns int
@@ -5404,13 +5472,18 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 	}()
 
 	out, err := r.eng.RunIsolated(ctx, userPrompt, engine.IsolatedRunOptions{
-		SystemPrompt: systemPrompt,
-		MaxTurns:     maxTurns,
-		MaxTokens:    maxTokens,
-		Client:       client,
-		DisableTools: disableTools,
-		Stage:        r.stage, // H3-2 中间态身份; 空 = 身份退化为 Role+Cwd
-		Inject:       inject,
+		SystemPrompt:        systemPrompt,
+		MaxTurns:            maxTurns,
+		MaxTokens:           maxTokens,
+		Client:              client,
+		DisableTools:        disableTools,
+		FinalizeTurns:       r.finalizeTurns,
+		MergeBashTargets:    r.mergeBashTargets,
+		RestrictWritesToCwd: r.restrictWritesToCwd,
+		CitationGate:        r.citationGate,
+		NormalizeEvidence:   r.normalizeEvidence,
+		Stage:               r.stage, // H3-2 中间态身份; 空 = 身份退化为 Role+Cwd
+		Inject:              inject,
 		// 阶段声明的 hook 交给引擎并入它既有的 Runner (见 IsolatedRunOptions.Hooks):
 		// 这里手上没有那份基线配置 (Runner 构造完就把入参丢了), 而且**替换**会让
 		// 平台侧的审计/门禁 hook 在这条执行路径上静默消失。解析与资产 hooks: 段
@@ -5496,7 +5569,120 @@ func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool) (finalText, er
 	if hasOutput && !quiet {
 		fmt.Println()
 	}
-	return strings.TrimSpace(final.String()), errKind
+	return sanitizeFinalText(strings.TrimSpace(final.String())), errKind
+}
+
+// sanitizeFinalText 同时清掉两类常见污染: 报告前的写作计划, 以及模型把同一份
+// 报告写了两遍 (第二遍通常才是完成稿)。两者都只做结构性裁剪, 不改正文。
+func sanitizeFinalText(s string) string {
+	return keepLastCompleteReport(stripReportPreamble(s))
+}
+
+// keepLastCompleteReport 在输出里出现两份完整报告时保留最后一份。
+//
+// 触发条件很窄: 至少两个一级标题 (# ), 或至少两个“## 一、结论”式章节。
+// 正常报告只有一个一级标题, 不会被裁; 末尾的“附录/参考文献”一级标题不算
+// 完成稿, 会被跳过。
+func keepLastCompleteReport(s string) string {
+	lines := strings.Split(s, "\n")
+	// 先按最后一个“像标题”的一级标题切; 附录/参考文献不当作正文起点。
+	lastTitle := -1
+	titleCount := 0
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, "# ") {
+			continue
+		}
+		title := strings.TrimSpace(strings.TrimLeft(t, "#"))
+		if containsAnyFold(title, "附录", "appendix", "参考文献", "references") {
+			continue
+		}
+		titleCount++
+		lastTitle = i
+	}
+	if titleCount >= 2 && lastTitle > 0 {
+		return strings.TrimLeft(strings.Join(lines[lastTitle:], "\n"), "\n")
+	}
+	// 没有多个 H1 时, 再按重复的“结论”章节切 (有些报告用 ## 当一级)。
+	lastConclusion := -1
+	conclusionCount := 0
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "## ") && strings.Contains(t, "结论") {
+			conclusionCount++
+			lastConclusion = i
+		}
+	}
+	if conclusionCount >= 2 && lastConclusion > 0 {
+		// 第二稿常省略 H1, 只剩一个 H1 时上一分支不会触发; 若直接切到
+		// 最后一个“## 结论”, 报告会丢掉唯一的标题。把最后一个结论之前的
+		// 那个 H1 带上, 保留“标题 + 最后一稿”的形状。
+		start := lastConclusion
+		if titleCount == 1 && lastTitle >= 0 && lastTitle < lastConclusion {
+			return strings.TrimLeft(strings.Join(lines[lastTitle:lastTitle+1], "\n")+"\n\n"+
+				strings.Join(lines[lastConclusion:], "\n"), "\n")
+		}
+		return strings.TrimLeft(strings.Join(lines[start:], "\n"), "\n")
+	}
+	return s
+}
+
+// stripReportPreamble 去掉模型在报告正文前输出的“写作计划”段落。
+//
+// 为什么需要它: 调研角色要求“最终回答只输出报告正文”, 但弱模型/部分网关
+// 仍会把 “Now write the report / Structure: / 字数目标” 当成正文流出来。
+// 这些内容会污染 --output-format json 的 final, 也会让下游把计划当结论。
+//
+// 判据刻意保守: 只在“计划段 + 第一个 Markdown 标题”同时成立时裁剪, 且计划段
+// 不超过 16KB; 正常报告开头的摘要段没有这些词, 不会被误删。计划标题 (Plan/
+// Structure/Outline/步骤/计划) 会被跳过, 继续找下一个标题。
+//
+// 4KB 的上限实测不够: CBAM 的一次运行把“要写什么 + 数字复核 + 口径提醒”写了
+// 4.2KB 才出第一个标题, 于是整段计划原样进了 final。16KB 仍能挡住“把半篇正文
+// 误当计划”的情况, 同时覆盖弱模型的长计划段。
+//
+// stripReportPreamble removes a model's pre-report planning block when it is
+// followed by a Markdown heading. The heuristic is intentionally narrow so a
+// normal executive-summary paragraph is never mistaken for planning.
+func stripReportPreamble(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	meta := []string{
+		"now write", "let me", "i'll write", "i will write", "write the report",
+		"final report", "draft report", "structure:", "word count", "body 1500",
+		"evidence.md written", "evidence.md 已写入", "now produce", "字数目标",
+		"让我", "现在写", "开始写", "已写入", "写作计划",
+	}
+	planningHeading := []string{"plan", "structure", "outline", "steps", "计划", "结构", "步骤", "提纲"}
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if !(strings.HasPrefix(t, "# ") || strings.HasPrefix(t, "## ") || strings.HasPrefix(t, "### ")) {
+			continue
+		}
+		prefix := strings.Join(lines[:i], "\n")
+		if len(prefix) > 16384 || !containsAnyFold(prefix, meta...) {
+			return s
+		}
+		title := strings.TrimSpace(strings.TrimLeft(t, "#"))
+		if containsAnyFold(title, planningHeading...) {
+			continue
+		}
+		return strings.TrimLeft(strings.Join(lines[i:], "\n"), "\n")
+	}
+	return s
+}
+
+// containsAnyFold 判断 s 是否包含任意一个子串 (大小写不敏感)。
+func containsAnyFold(s string, subs ...string) bool {
+	lower := strings.ToLower(s)
+	for _, sub := range subs {
+		if strings.Contains(lower, strings.ToLower(sub)) {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyRunError 把流式错误粗分成种类 (timeout/rate_limit/overloaded/prompt_too_long/error),

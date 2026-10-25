@@ -1,5 +1,10 @@
 package search
 
+// cache.go —— 带 TTL 的进程内 LRU 查询缓存。
+//
+// 只缓存成功响应 (含"成功但零结果"), 不缓存错误: 一次 429/超时不值得在整个
+// TTL 内被放大成确定性失败。key 包含 query、候选源名、语言与时效, 任一变化
+// 都会重新打源; 新闻类查询由 manager.cacheTTL 选择更短的 TTL。
 import (
 	"container/list"
 	"context"

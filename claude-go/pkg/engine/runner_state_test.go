@@ -99,6 +99,12 @@ type stateUpstreamRun struct {
 	// 文件"送进工具 —— 那个路径必须是**两个 run 共享的同一个**, 否则用例退化成
 	// "两个写者写不同文件", 在任何实现下都绿。
 	toolInput string
+	// toolName 是回给模型的 tool_use 名字, 默认 "noop_tool"。检索预算用例需要
+	// 让上游回 WebSearch, 否则引擎数不到搜索次数。
+	toolName string
+	// thinking 非空时在每个回应前加一个 thinking 块, 用于验证"thinking 不得
+	// 混进最终交付文本"。
+	thinking string
 }
 
 // handoffMarker 只出现在交接请求的 prompt 里 (见 runner_handoff.go 的 handoffPrompt)。
@@ -189,11 +195,15 @@ func (u *stateUpstreamRun) start(t *testing.T) {
 			}
 		} else if u.toolTurns < 0 || turn < u.toolTurns {
 			id := "tu" + itoa(turn)
+			name := u.toolName
+			if name == "" {
+				name = "noop_tool"
+			}
 			resp = types.APIResponse{
 				ID: "msg_" + id, Type: "message", Role: "assistant", Model: req.Model,
 				Content: []types.ContentBlock{
 					{Type: types.ContentBlockText, Text: "第" + itoa(turn) + "轮思考"},
-					{Type: types.ContentBlockToolUse, ID: id, Name: "noop_tool", Input: json.RawMessage(u.toolInputOf())},
+					{Type: types.ContentBlockToolUse, ID: id, Name: name, Input: json.RawMessage(u.toolInputOf())},
 				},
 				StopReason: "tool_use",
 				Usage:      &types.Usage{InputTokens: 5, OutputTokens: 5},
@@ -205,6 +215,11 @@ func (u *stateUpstreamRun) start(t *testing.T) {
 				StopReason: "end_turn",
 				Usage:      &types.Usage{InputTokens: 5, OutputTokens: 5},
 			}
+		}
+		if u.thinking != "" {
+			resp.Content = append([]types.ContentBlock{
+				{Type: types.ContentBlockThinking, Thinking: u.thinking},
+			}, resp.Content...)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)

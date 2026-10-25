@@ -7,6 +7,12 @@
 // 语义。另写一套 MCP 专用实现迟早会分叉成"agent 里能用、MCP 里行为不同"。
 package searchmcp
 
+// server.go —— MCP 传输与 JSON-RPC 分发。
+//
+// 同时支持 stdio 与 HTTP: stdio 一帧一行 JSON, stdout 只放协议消息, 日志走
+// stderr; HTTP 用同一套 handler, 便于 sidecar 以 29235 端口被集群内其它服务
+// 挂载。方法集只覆盖 MCP 客户端实际会发的 initialize / tools/list / tools/call
+// 与 server/discover, 工具本身直接复用 pkg/tool/builtin 的注册结果。
 import (
 	"bufio"
 	"bytes"

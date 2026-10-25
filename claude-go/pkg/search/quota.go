@@ -1,5 +1,10 @@
 package search
 
+// quota.go —— 单源限流冷却与剩余配额快照。
+//
+// provider 返回 ErrRateLimited 后, 该源在 quotaPenalty 内不再被选为主源或
+// 对冲源, 到点自动恢复; 其余错误交给 provider 自身的熔断/退避。剩余配额
+// 只在 provider 实现 remainingReporter 时可见, 未知时报 -1。
 import (
 	"sync"
 	"time"

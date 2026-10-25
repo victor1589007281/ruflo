@@ -1,5 +1,13 @@
 package search
 
+// router.go —— 零模型调用的查询规划与源选择。
+//
+// 两段职责:
+//  1. PlanQuery: 用规则识别语言/意图/时效, 拆出 1–3 条子查询。规则保持保守,
+//     只处理信号明确的查询; 复杂语义留给上层 agent 自己换关键词。
+//  2. selectProviders + sortProviders: 先按配置/层级/健康/配额过滤, 再按
+//     "意图偏好 -> tier -> 权重 -> 名字"排序。排序只决定谁先被调度, 不排除
+//     表外源; 真正的并发上限由 scheduler.go 的 maxSourceConcurrency 控制。
 import (
 	"regexp"
 	"sort"
@@ -54,6 +62,9 @@ func PlanQuery(query string) QueryPlan {
 	}
 	lower := strings.ToLower(raw)
 
+	// switch 的分支顺序就是优先级: 代码/学术信号优先于新闻。例如
+	// "postgres 18 release notes" 同时含年份与发布词, 若不先判文档, 会被
+	// 当成新闻并强制 week 级新鲜度, 质量门反而因文档日期旧而恒不过。
 	switch {
 	case containsAny(lower, "github", "golang", "error:", "panic:", "stackoverflow", "源代码", "源码"):
 		plan.Intent = IntentCode
@@ -176,7 +187,9 @@ func selectProviders(providers []Provider, plan QueryPlan, cfg Config, eg *Egres
 			continue
 		}
 		if pin := providerPin(p, cfg, eg); pin == ModeProxy {
-			if eg == nil || !eg.HasProxy() || !eg.Healthy() {
+			// 未配置代理时走直连是预期行为, 不记 proxy_down; 否则每次
+			// 无代理运行都会把整条 proxy 源标成降级, 掩盖真正的代理故障。
+			if eg != nil && eg.HasProxy() && !eg.Healthy() {
 				proxyDown = true
 			}
 		}
@@ -263,12 +276,22 @@ func preferenceOrder(intent Intent, language string) []string {
 	case IntentAcademic:
 		return []string{"exa", "parallel", "openalex", "crossref", "pubmed", "arxiv", "exa_anon", "tavily"}
 	case IntentNews:
-		return []string{"parallel", "tavily", "bing_rss", "gnews", "exa", "exa_anon"}
+		// exa_anon 必须排在 bing_rss 前面: 只调度前 2 个源, parallel 被限流
+		// (实测 6 个任务并发时 quota_exhausted) 后, 旧顺序会让 bing_rss +
+		// gnews 顶上来 —— 前者噪声大, 后者只回跳转链, 整轮调研就废了。
+		// exa_anon 免 key、直连可用, 实测中文时效查询召回质量接近 parallel。
+		return []string{"parallel", "exa_anon", "tavily", "bing_rss", "gnews", "exa"}
 	}
+	// bing_rss 排最后: 它只是"兜底中的兜底", 长查询会回完全不同话题的页面
+	// (实测有 Yandex/影视站/直播站)。主源 quota_exhausted 时, 百科与新闻源
+	// 比它更可能给出同话题结果 —— 此前 bing 排在它们前面, 等于优先选噪声。
 	if zh {
-		return []string{"parallel", "exa", "tavily", "baidu", "sogou", "bing_rss", "wikipedia", "exa_anon"}
+		// baidu / sogou 曾出现在偏好表里, 但 factory 从未注册这两个源 ——
+		// 它们永远不可能被选中, 只会让人误以为"中文有百度兜底"。
+		// 中文事实类真正可用的是 exa_anon, 必须排在 wikipedia/bing 之前。
+		return []string{"parallel", "exa", "exa_anon", "tavily", "wikipedia", "bing_rss"}
 	}
-	return []string{"parallel", "exa", "exa_anon", "tavily", "bing_rss", "wikipedia", "gnews"}
+	return []string{"parallel", "exa", "exa_anon", "tavily", "wikipedia", "gnews", "bing_rss"}
 }
 
 // isHan 判断字符是否汉字。

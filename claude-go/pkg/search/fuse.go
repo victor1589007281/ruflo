@@ -1,5 +1,11 @@
 package search
 
+// fuse.go —— 多源结果融合 (RRF) 与 URL 规范化。
+//
+// 融合按 Reciprocal Rank Fusion: 每个源内部的名次贡献 1/(k+rank), 再按
+// provider 权重加权。RRF 只使用名次, 不使用各源不可比的原始分数, 因此
+// 不需要为每个 provider 做分数校准。CanonicalURL 先做去 fragment/utm/尾斜杠,
+// 让同一资源在不同源里的写法落到同一个 key, 避免刷满结果表。
 import (
 	"net/url"
 	"sort"

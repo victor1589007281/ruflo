@@ -1,5 +1,10 @@
 package search
 
+// evidence.go —— 逐字证据账本与抽取式答案。
+//
+// 不调用模型: 从已抓取文档的 Markdown 里按关键词挑一句原文, 用 strings.Index
+// 回查确认它确实存在于正文, 才允许入库。Answer 只拼接这些已验证的句子, 因此
+// Research 的产出不包含任何新生成的事实。
 import (
 	"crypto/sha256"
 	"encoding/hex"

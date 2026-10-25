@@ -34,14 +34,15 @@ fi
 
 # search-mcp sidecar: 把数据面作为独立 MCP 端点暴露 (与 codeintel MCP 同 Pod,
 # 端口 29235)。用 strategic merge 幂等写入, 已存在时只更新镜像与 env。
-# GITHUB_TOKEN 走可选 Secret: 没有建 secret 时 Pod 照常启动 (optional: true),
-# 只是 GitHub 搜索源按未认证的 10 req/min 限流。写入用 deploy/set-github-token.sh。
+# GitHub token 从 ConfigMap 的 config.json → search.githubToken 读取 (不走 env):
+# 没有配 token 时 GitHub 搜索源按未认证的 10 req/min 限流。写入用
+# deploy/set-github-token.sh。search-mcp 容器必须挂 config 卷才能读到这份配置;
+# 旧版本只在 codeintel 容器上挂了它, 所以这里显式补 volumeMounts。
 SEARCH_ENV=$(cat <<'JSON'
 [
   {"name":"SEARCH_PROXY_URL","value":"http://100.96.50.63:8888"},
   {"name":"SEARCH_NO_PROXY","value":"127.0.0.1,localhost,::1,100.96.50.63"},
-  {"name":"SEARCH_MAX_TIER","value":"L2"},
-  {"name":"GITHUB_TOKEN","valueFrom":{"secretKeyRef":{"name":"claude-go-search-github","key":"GITHUB_TOKEN","optional":true}}}
+  {"name":"SEARCH_MAX_TIER","value":"L2"}
 ]
 JSON
 )
@@ -51,12 +52,17 @@ for pair in "claude-go-control:control" "claude-go-worker:worker"; do
   d=${pair%%:*}; c=${pair##*:}
   kubectl -n "$NS" patch deploy "$d" --type=strategic \
     -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$c\",\"env\":$SEARCH_ENV}]}}}}" >/dev/null
+  # 迁移: 旧版本把 token 以 env 注入; 现在唯一入口是 config.json。删掉残留 env,
+  # 否则"改了配置却没生效"会被这个更高优先级的旧值掩盖。
+  kubectl -n "$NS" set env "deploy/$d" -c "$c" GITHUB_TOKEN- >/dev/null 2>&1 || true
 done
 
 kubectl -n "$NS" patch deploy claude-go-mcp --type=strategic -p "$(cat <<JSON
-{"spec":{"template":{"spec":{"containers":[{"name":"search-mcp","image":"$IMG","imagePullPolicy":"Never","args":["search-mcp-server","--transport","http","--addr","0.0.0.0:29235"],"env":[{"name":"HOME","value":"/tmp"},{"name":"SEARCH_PROXY_URL","value":"http://100.96.50.63:8888"},{"name":"SEARCH_NO_PROXY","value":"127.0.0.1,localhost,::1,100.96.50.63"},{"name":"SEARCH_MAX_TIER","value":"L2"},{"name":"GITHUB_TOKEN","valueFrom":{"secretKeyRef":{"name":"claude-go-search-github","key":"GITHUB_TOKEN","optional":true}}}], "ports":[{"name":"search","containerPort":29235}],"resources":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"cpu":"1","memory":"1Gi"}}}]}}}}
+{"spec":{"template":{"spec":{"containers":[{"name":"search-mcp","image":"$IMG","imagePullPolicy":"Never","args":["search-mcp-server","--transport","http","--addr","0.0.0.0:29235","--config","/etc/claude-go/config.json"],"env":[{"name":"HOME","value":"/tmp"},{"name":"SEARCH_PROXY_URL","value":"http://100.96.50.63:8888"},{"name":"SEARCH_NO_PROXY","value":"127.0.0.1,localhost,::1,100.96.50.63"},{"name":"SEARCH_MAX_TIER","value":"L2"}],"volumeMounts":[{"name":"config","mountPath":"/etc/claude-go"}],"ports":[{"name":"search","containerPort":29235}],"resources":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"cpu":"1","memory":"1Gi"}}}]}}}}
 JSON
 )" >/dev/null
+# codeintel 容器也曾经被注入 GITHUB_TOKEN; 它不消费这个变量, 一并清掉。
+kubectl -n "$NS" set env deploy/claude-go-mcp -c mcp GITHUB_TOKEN- >/dev/null 2>&1 || true
 
 # 独立端口供集群内其它服务/外部 MCP 客户端挂载。
 kubectl -n "$NS" patch svc claude-go-mcp --type=strategic \

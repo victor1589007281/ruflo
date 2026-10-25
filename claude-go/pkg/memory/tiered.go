@@ -46,6 +46,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/textutil"
@@ -242,20 +243,101 @@ func (s *TieredStore) PersistToDisk() {
 	}
 	s.mu.RUnlock()
 
-	// 序列化的是快照, 与 s.episodic 里的对象再无共享 ⇒ 锁外编码是安全的。
-	// (JSON 形态与改造前逐字节一致: []MemoryEntry 与 []*MemoryEntry 编码结果相同。)
-	data, err := json.MarshalIndent(entries, "", "  ")
-	if err != nil {
-		log.Printf("[Memory] 序列化失败: %v", err)
-		return
-	}
-	if err := os.WriteFile(s.persistPath, data, 0644); err != nil {
+	// 落盘必须**跨进程串行 + 原子替换**。
+	//
+	// 改造前是裸 os.WriteFile: 它先截断再写。并行跑多个 claude-go (调研/团队/服务)
+	// 时, 另一个进程恰好在截断与写完之间 loadFromDisk, 读到 0 字节并按 JSON 解析
+	// 失败 ⇒ 该进程整个 run 都用不上历史记忆。实测 3 个并发调研任务**全部**打了
+	// "加载记忆文件失败: unexpected end of JSON input", 而文件本身在别的进程看来
+	// 又是好的 —— 这类故障只发生在并发窗口里, 单跑永远复现不了。
+	//
+	// 两处修复缺一不可:
+	//   1. flock: 多个进程的"读盘-合并-写盘"整体互斥, 不再互相覆盖对方新增的条目;
+	//   2. temp + rename: 任何时刻磁盘上的文件要么是旧的完整内容, 要么是新的完整
+	//      内容, 读者不会看到半截 JSON。
+	if err := s.persistEntries(entries); err != nil {
 		log.Printf("[Memory] 持久化失败: %v", err)
 		return
 	}
 	s.mu.Lock()
 	s.dirty = false
 	s.mu.Unlock()
+}
+
+// persistEntries 在跨进程排他锁内把快照与磁盘上的现有条目合并后原子写回。
+//
+// 合并方向: 磁盘有、快照没有的条目保留 (另一个进程刚写的); 两边都有则用快照
+// (本进程内存里的更近, AccessCount/LastAccess 可能已更新)。
+func (s *TieredStore) persistEntries(entries []MemoryEntry) error {
+	lockPath := s.persistPath + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("打开记忆锁失败: %w", err)
+	}
+	defer lf.Close()
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("获取记忆锁失败: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN) }()
+
+	if disk, err := os.ReadFile(s.persistPath); err == nil && len(strings.TrimSpace(string(disk))) > 0 {
+		var existing []MemoryEntry
+		if err := json.Unmarshal(disk, &existing); err == nil {
+			have := make(map[string]struct{}, len(entries))
+			for _, e := range entries {
+				have[e.ID] = struct{}{}
+			}
+			for _, e := range existing {
+				if _, ok := have[e.ID]; !ok {
+					entries = append(entries, e)
+				}
+			}
+		}
+		// 磁盘内容坏掉时直接覆盖: 继续保留一份无法解析的文件没有意义, 而快照
+		// 至少是本进程这份内存的完整视图。
+	}
+
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化失败: %w", err)
+	}
+
+	dir := filepath.Dir(s.persistPath)
+	tmp, err := os.CreateTemp(dir, ".episodic-*.tmp")
+	if err != nil {
+		return fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		cleanup()
+		return fmt.Errorf("写临时文件失败: %w", err)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		cleanup()
+		return fmt.Errorf("设置临时文件权限失败: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		cleanup()
+		return fmt.Errorf("同步临时文件失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("关闭临时文件失败: %w", err)
+	}
+	if err := os.Rename(tmpName, s.persistPath); err != nil {
+		cleanup()
+		return fmt.Errorf("替换记忆文件失败: %w", err)
+	}
+	// rename 本身原子; 目录项要 fsync 才能在掉电后仍然指向新内容。
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // Add 添加一条记忆
