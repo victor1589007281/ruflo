@@ -48,6 +48,10 @@ func TypesetLocal(ctx context.Context, md, chromePath, imgDir, imgRefBase string
 	}
 	h = ReplaceMermaidPlaceholders(h, urls)
 	h = InlineWechatStyles(h)
+	h, dropped := NeutralizeRelativeLinks(h)
+	if dropped > 0 {
+		warnings = append(warnings, fmt.Sprintf("有 %d 个相对链接被改为纯文本：公众号草稿接口会以 45166 invalid content 拒绝相对 href，配置 PUBLIC_URL 可保留为外链", dropped))
+	}
 	return h, len(blocks), ok, warnings, nil
 }
 
@@ -58,6 +62,9 @@ type TypesetOptions struct {
 	Author     string
 	Digest     string // 摘要 (<=120 字)
 	SourceURL  string // 原文链接
+	// ThumbMediaID 非空时直接用作草稿封面 (公众号永久图片素材 media_id), 不再自动生成封面。
+	// 素材属于具体公众号, 由调用方保证与本次 AppID 一致。
+	ThumbMediaID string
 	// MermaidFixer 可选: 语法校验/渲染失败且启发式修复无效时, 调它(LLM)修复 mermaid。
 	// 入参 (原始代码, 错误信息), 返回修正后的 mermaid (空串=放弃)。
 	MermaidFixer func(code, errMsg string) string
@@ -107,6 +114,10 @@ func (c *Client) Typeset(ctx context.Context, md string, opts TypesetOptions) (*
 	}
 	h = ReplaceMermaidPlaceholders(h, res.ImgURLs)
 	h = InlineWechatStyles(h)
+	h, droppedLinks := NeutralizeRelativeLinks(h)
+	if droppedLinks > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("有 %d 个相对链接被改为纯文本：公众号草稿接口会以 45166 invalid content 拒绝相对 href，配置 PUBLIC_URL 可保留为外链", droppedLinks))
+	}
 	res.ContentHTML = h
 	return res, nil
 }
@@ -117,9 +128,13 @@ func (c *Client) buildArticle(ctx context.Context, md string, opts TypesetOption
 	if err != nil {
 		return DraftArticle{}, res, err
 	}
-	thumbID, terr := c.makeCover(ctx, opts)
-	if terr != nil {
-		return DraftArticle{}, res, fmt.Errorf("封面生成/上传失败: %w", terr)
+	thumbID := strings.TrimSpace(opts.ThumbMediaID)
+	if thumbID == "" {
+		var terr error
+		thumbID, terr = c.makeCover(ctx, opts)
+		if terr != nil {
+			return DraftArticle{}, res, fmt.Errorf("封面生成/上传失败: %w", terr)
+		}
 	}
 	author := opts.Author
 	if author == "" {

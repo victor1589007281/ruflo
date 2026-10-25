@@ -342,3 +342,41 @@ func ReplaceMermaidPlaceholders(html string, imgURLs map[int]string) string {
 		return "<p style=\"text-align:center;margin:18px 0;\"><img src=\"" + u + "\" style=\"max-width:100%;border-radius:8px;\"/></p>"
 	})
 }
+
+var (
+	anchorRe = regexp.MustCompile(`(?is)<a\b([^>]*)>(.*?)</a>`)
+	hrefRe   = regexp.MustCompile(`(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
+	// 公众号 draft/add 只接受带 scheme 的外链；相对 href(如 /p/x)会整篇报
+	// errcode=45166 invalid content，且错误信息不指出是哪一条。保留锚文本、去掉链接。
+	absoluteHrefRe = regexp.MustCompile(`(?i)^(?:[a-z][a-z0-9+.\-]*:|//|#)`)
+)
+
+// NeutralizeRelativeLinks 把相对 href 的 <a> 还原成纯文本, 返回 (HTML, 处理条数)。
+//
+// 这是公众号侧的硬约束, 不是排版偏好: 只要 content 里存在 <a href="/p/x">,
+// draft/add 就返回 45166 invalid content。docforge 在配置 PUBLIC_URL 时会把站内
+// 链接补成绝对地址; 没配时由这里兜底, 保证草稿仍可创建。
+func NeutralizeRelativeLinks(html string) (string, int) {
+	n := 0
+	out := anchorRe.ReplaceAllStringFunc(html, func(m string) string {
+		sub := anchorRe.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		href := ""
+		if hs := hrefRe.FindStringSubmatch(sub[1]); hs != nil {
+			for _, v := range hs[1:] {
+				if v != "" {
+					href = strings.TrimSpace(v)
+					break
+				}
+			}
+		}
+		if absoluteHrefRe.MatchString(href) {
+			return m
+		}
+		n++
+		return sub[2]
+	})
+	return out, n
+}

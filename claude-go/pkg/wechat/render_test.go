@@ -93,3 +93,34 @@ func TestIndentDepth(t *testing.T) {
 		t.Errorf("一级子项应缩进 20px, 实际: %s", out[p2:i2])
 	}
 }
+
+// 相对 href 会让 draft/add 整篇返回 45166 invalid content, 必须降级成纯文本。
+func TestNeutralizeRelativeLinks(t *testing.T) {
+	in := `<p><a href="/p/demo/overview">站内</a> <a href="https://example.com/x">外链</a> ` +
+		`<a href='#frag'>锚点</a> <a href="//cdn.example.com/a">协议相对</a> <a href="mailto:a@b.c">邮件</a> ` +
+		`<a HREF="/other">大写</a></p>`
+	out, n := NeutralizeRelativeLinks(in)
+	if n != 2 {
+		t.Fatalf("期望降级 2 个相对链接, got %d: %s", n, out)
+	}
+	if strings.Contains(out, `href="/p/demo/overview"`) || strings.Contains(out, `HREF="/other"`) {
+		t.Fatalf("相对链接未被移除: %s", out)
+	}
+	for _, keep := range []string{"https://example.com/x", "#frag", "//cdn.example.com/a", "mailto:a@b.c"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("绝对链接被误删: %q -> %s", keep, out)
+		}
+	}
+	for _, txt := range []string{"站内", "外链", "锚点", "协议相对", "邮件", "大写"} {
+		if !strings.Contains(out, txt) {
+			t.Errorf("锚文本丢失: %q -> %s", txt, out)
+		}
+	}
+}
+
+func TestNeutralizeRelativeLinksEmptyHref(t *testing.T) {
+	out, n := NeutralizeRelativeLinks(`<a href="">空</a>`)
+	if n != 1 || strings.Contains(out, "<a") || !strings.Contains(out, "空") {
+		t.Fatalf("空 href 应降级成纯文本, n=%d out=%s", n, out)
+	}
+}

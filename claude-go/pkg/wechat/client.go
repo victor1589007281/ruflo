@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,16 +24,21 @@ import (
 )
 
 // Config 公众号凭证。
+//
+// Proxy 可选 (如 http://127.0.0.1:1080 或 socks5://...): 公众号 API 要求出口 IP 在
+// 「IP 白名单」内, 用固定出口 (代理/出口节点) 时在此指定, 否则留空直连。
 type Config struct {
 	AppID     string `json:"appId"`
 	AppSecret string `json:"appSecret"`
 	Author    string `json:"author,omitempty"`
+	Proxy     string `json:"proxy,omitempty"`
 }
 
 // Client 公众号 API 客户端 (带 access_token 缓存)。
 type Client struct {
-	cfg   Config
-	httpc *http.Client
+	cfg      Config
+	httpc    *http.Client
+	proxyURL string // 规范化后的代理 URL (空=直连); curl 子进程也用它
 
 	mu       sync.Mutex
 	token    string
@@ -42,12 +48,21 @@ type Client struct {
 // NewClient 构造客户端。
 //
 // 强制 HTTP/1.1: Go 默认走 HTTP/2, 其指纹会被 Tencent WAF 拦成 501 page; curl(HTTP/1.1) 正常。
-func NewClient(cfg Config) *Client {
+// proxy 填写非法时直接报错, 避免静默走直连、把白名单问题伪装成"配置没生效"。
+func NewClient(cfg Config) (*Client, error) {
 	tr := &http.Transport{
 		ForceAttemptHTTP2: false,
 		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁用 HTTP/2
 	}
-	return &Client{cfg: cfg, httpc: &http.Client{Timeout: 30 * time.Second, Transport: tr}}
+	proxy := strings.TrimSpace(cfg.Proxy)
+	if proxy != "" {
+		pu, err := url.Parse(proxy)
+		if err != nil || pu.Scheme == "" || pu.Host == "" {
+			return nil, fmt.Errorf("无效的 wechatMP.proxy %q (需形如 http://host:port 或 socks5://host:port)", cfg.Proxy)
+		}
+		tr.Proxy = http.ProxyURL(pu)
+	}
+	return &Client{cfg: cfg, proxyURL: proxy, httpc: &http.Client{Timeout: 30 * time.Second, Transport: tr}}, nil
 }
 
 const apiBase = "https://api.weixin.qq.com"
@@ -313,9 +328,13 @@ func (c *Client) postJSON(u string, payload []byte) ([]byte, error) {
 		if waits[attempt] > 0 {
 			time.Sleep(waits[attempt])
 		}
-		cmd := exec.Command("curl", "-s", "--max-time", "40", "-A", userAgent,
+		args := []string{"-s", "--max-time", "40", "-A", userAgent,
 			"-X", "POST", u, "-H", "Content-Type: application/json",
-			"--data-binary", "@"+tmp.Name())
+			"--data-binary", "@" + tmp.Name()}
+		if c.proxyURL != "" {
+			args = append(args, "--proxy", c.proxyURL)
+		}
+		cmd := exec.Command("curl", args...)
 		out, cerr := cmd.Output()
 		if cerr != nil {
 			last = out

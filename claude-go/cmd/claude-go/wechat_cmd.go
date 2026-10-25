@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,15 +24,24 @@ import (
 //	claude-go wechat --team <团队名> --title "标题"            # 取团队 techblog 产物
 //	claude-go wechat --md article.md --draft                  # 调 API 建草稿 (需 IP 白名单)
 func wechatCmd() *cobra.Command {
-	var mdFile, team, title, author, sourceURL, outDir, updateID string
+	var mdFile, team, title, author, sourceURL, outDir, updateID, thumbMediaID string
 	var draft bool
 	var genImages string
 	var imgCount int
 	var newspic, genAudio, genVideo bool
+	var jsonOut, uploadImages bool
+	var imgBase string
 	cmd := &cobra.Command{
 		Use:   "wechat",
 		Short: "微信公众号自动排版 (Markdown→公众号内联HTML, mermaid→图), 可建草稿",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
+			jr := &wechatResult{Kind: "preview"}
+			if updateID != "" {
+				jr.Kind = "update"
+			} else if draft {
+				jr.Kind = "draft"
+			}
+			defer func() { emitWechatResult(jr, runErr, jsonOut) }()
 			cfgPath := resolveWechatConfigPath()
 			wcfg, chromePath, err := loadWechatConfig(cfgPath)
 			if err != nil {
@@ -44,6 +54,7 @@ func wechatCmd() *cobra.Command {
 			if title == "" {
 				title = t2
 			}
+			jr.Title = title
 			// 列表门禁 (类似 lint): 检测并修复"序号/无序列表内空行"
 			if lf, n := wechat.LintLists(md); n > 0 {
 				fmt.Printf("[wechat] 📋 列表门禁: 检测到并修复 %d 处列表内空行\n", n)
@@ -52,7 +63,36 @@ func wechatCmd() *cobra.Command {
 			if outDir == "" {
 				outDir = filepath.Join(os.TempDir(), "wechat-"+fmt.Sprint(time.Now().Unix()))
 			}
+			jr.OutDir = outDir
 			ctx := context.Background()
+
+			// 可选: 把正文图片上传到公众号并回填 URL (media/uploadimg)。
+			// 仅 API 模式可用 —— 离线预览的契约就是"不调用任何公众号 API"。
+			if uploadImages {
+				if !draft && updateID == "" {
+					fmt.Printf("[wechat] ⚠️ --upload-images 需配合 --draft/--update (离线预览不调用公众号 API), 已忽略\n")
+				} else {
+					base := imgBase
+					if base == "" && mdFile != "" {
+						base = filepath.Dir(mdFile)
+					}
+					if base == "" {
+						base = "."
+					}
+					ic, err := wechat.NewClient(wcfg)
+					if err != nil {
+						return err
+					}
+					ir := ic.UploadMarkdownImages(md, base)
+					md = ir.Markdown
+					jr.ImagesTotal, jr.ImagesUploaded, jr.ImageURLs = ir.Total, ir.Uploaded, ir.URLs
+					jr.Warnings = append(jr.Warnings, ir.Warnings...)
+					fmt.Printf("[wechat] 正文图片: 检测 %d 张, 上传 %d 张\n", ir.Total, ir.Uploaded)
+					for _, w := range ir.Warnings {
+						fmt.Printf("  ⚠️ %s\n", w)
+					}
+				}
+			}
 
 			// ── 可选多媒体生成 (techblog 增强): 配图 / 音频 / 视频 ──
 			style := genImages
@@ -109,6 +149,8 @@ func wechatCmd() *cobra.Command {
 				}
 				htmlPath := filepath.Join(outDir, "preview.html")
 				_ = os.WriteFile(htmlPath, []byte(html), 0o644)
+				jr.PreviewHTML, jr.MermaidTotal, jr.MermaidOK = htmlPath, n, ok
+				jr.Warnings = append(jr.Warnings, warns...)
 				fmt.Printf("[wechat] mermaid 图: %d 个, 成功渲染 %d 个\n", n, ok)
 				for _, w := range warns {
 					fmt.Printf("  ⚠️ %s\n", w)
@@ -129,8 +171,11 @@ func wechatCmd() *cobra.Command {
 			}
 
 			// Tier 2: 调 API 建/更新草稿
-			c := wechat.NewClient(wcfg)
-			opt := wechat.TypesetOptions{ChromePath: chromePath, Title: title, Author: author, SourceURL: sourceURL}
+			c, err := wechat.NewClient(wcfg)
+			if err != nil {
+				return err
+			}
+			opt := wechat.TypesetOptions{ChromePath: chromePath, Title: title, Author: author, SourceURL: sourceURL, ThumbMediaID: thumbMediaID}
 			// LLM mermaid 自动修复 (启发式修不动时兜底)
 			if llm := loadLLMClient(cfgPath); llm != nil {
 				opt.MermaidFixer = func(code, errMsg string) string {
@@ -154,38 +199,46 @@ func wechatCmd() *cobra.Command {
 			}
 			if updateID != "" {
 				fmt.Printf("[wechat] 更新草稿模式 (add-new+delete-old 规避 WAF): 替换 media_id=%s\n", updateID)
-				newID, res, err := c.UpdateDraftFromMarkdown(ctx, updateID, md, opt)
-				if res != nil {
-					fmt.Printf("[wechat] mermaid 图: %d 个, 成功 %d 个\n", res.MermaidCount, res.MermaidOK)
-					for _, w := range res.Warnings {
+				newID, tsres, err := c.UpdateDraftFromMarkdown(ctx, updateID, md, opt)
+				if tsres != nil {
+					fmt.Printf("[wechat] mermaid 图: %d 个, 成功 %d 个\n", tsres.MermaidCount, tsres.MermaidOK)
+					for _, w := range tsres.Warnings {
 						fmt.Printf("  ⚠️ %s\n", w)
 					}
+					jr.MermaidTotal, jr.MermaidOK = tsres.MermaidCount, tsres.MermaidOK
+					jr.Warnings = append(jr.Warnings, tsres.Warnings...)
 				}
 				if err != nil {
 					return fmt.Errorf("更新草稿失败: %w", err)
 				}
+				jr.MediaID, jr.OldMediaID = newID, updateID
 				fmt.Printf("[wechat] ✅ 图文草稿已替换, 新 media_id=%s (旧草稿已删除)\n", newID)
 				publishExtraMedia(c, title, md, imgPaths, audioPath, videoPath, newspic, genAudio, genVideo)
 				fmt.Printf("登录公众号草稿箱/素材库查看最新版。\n")
 				return nil
 			}
 			fmt.Printf("[wechat] 草稿模式: 渲染 mermaid + 上传图片 + 建草稿 (appid=%s)\n", wcfg.AppID)
-			mediaID, res, err := c.PublishDraft(ctx, md, opt)
-			if res != nil {
-				fmt.Printf("[wechat] mermaid 图: %d 个, 成功 %d 个\n", res.MermaidCount, res.MermaidOK)
-				for _, w := range res.Warnings {
+			mediaID, tsres, err := c.PublishDraft(ctx, md, opt)
+			if tsres != nil {
+				fmt.Printf("[wechat] mermaid 图: %d 个, 成功 %d 个\n", tsres.MermaidCount, tsres.MermaidOK)
+				for _, w := range tsres.Warnings {
 					fmt.Printf("  ⚠️ %s\n", w)
 				}
+				jr.MermaidTotal, jr.MermaidOK = tsres.MermaidCount, tsres.MermaidOK
+				jr.Warnings = append(jr.Warnings, tsres.Warnings...)
 			}
 			if err != nil {
 				return fmt.Errorf("建草稿失败: %w", err)
 			}
+			jr.MediaID = mediaID
 			fmt.Printf("[wechat] ✅ 图文草稿已创建 media_id=%s\n", mediaID)
 			publishExtraMedia(c, title, md, imgPaths, audioPath, videoPath, newspic, genAudio, genVideo)
 			fmt.Printf("登录公众号后台「草稿箱/素材库」即可预览。\n")
 			return nil
 		},
 	}
+	// 出错时不要打印整页 usage: --json 契约是 marker 行保持最后一行, usage 会插在它后面。
+	cmd.SilenceUsage = true
 	cmd.Flags().StringVar(&mdFile, "md", "", "Markdown 文件路径")
 	cmd.Flags().StringVar(&team, "team", "", "团队名 (从其 techblog 产物取文章)")
 	cmd.Flags().StringVar(&title, "title", "", "文章标题")
@@ -194,12 +247,66 @@ func wechatCmd() *cobra.Command {
 	cmd.Flags().StringVar(&outDir, "out", "", "输出目录 (预览模式)")
 	cmd.Flags().BoolVar(&draft, "draft", false, "调用公众号 API 建草稿 (需服务器 IP 在白名单)")
 	cmd.Flags().StringVar(&updateID, "update", "", "更新已有草稿的 media_id (配合 --draft, 不新建)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "在 stdout 末尾输出一行机器可读结果: __WECHAT_RESULT__ {json}")
+	cmd.Flags().BoolVar(&uploadImages, "upload-images", false, "把正文 Markdown 图片上传到公众号并回填 URL (仅 --draft/--update)")
+	cmd.Flags().StringVar(&imgBase, "img-base", "", "相对图片路径的基准目录 (默认 --md 所在目录)")
+	cmd.Flags().StringVar(&thumbMediaID, "thumb-media-id", "", "用已有永久图片素材作封面 (media_id, 需属于同一公众号); 缺省自动生成封面")
 	cmd.Flags().StringVar(&genImages, "gen-images", "", "生成文章配图风格: card(要点卡片) | illustration(AI插画)")
 	cmd.Flags().IntVar(&imgCount, "img-count", 4, "生成配图数量 (第一张作封面)")
 	cmd.Flags().BoolVar(&newspic, "newspic", false, "把配图发布为「图片消息」(贴图)草稿 (配合 --draft)")
 	cmd.Flags().BoolVar(&genAudio, "gen-audio", false, "用 edge-tts 生成文章朗读音频 (--draft 时上传为语音素材)")
 	cmd.Flags().BoolVar(&genVideo, "gen-video", false, "用配图合成讲解视频 (--draft 时上传为视频素材)")
 	return cmd
+}
+
+// wechatResult 是 --json 模式输出的机器可读结果。
+//
+// 约定: 无论成功失败, stdout 最后一行都是 "__WECHAT_RESULT__ <json>"。
+// 调用方 (docforge 等) 必须同时检查 ok 与 media_id —— 退出码为 0 但没有 media_id
+// 不能当成功。
+type wechatResult struct {
+	OK             bool              `json:"ok"`
+	Kind           string            `json:"kind"` // preview | draft | update
+	Title          string            `json:"title,omitempty"`
+	OutDir         string            `json:"out_dir,omitempty"`
+	PreviewHTML    string            `json:"preview_html,omitempty"`
+	MediaID        string            `json:"media_id,omitempty"`
+	OldMediaID     string            `json:"old_media_id,omitempty"`
+	MermaidTotal   int               `json:"mermaid_total"`
+	MermaidOK      int               `json:"mermaid_ok"`
+	ImagesTotal    int               `json:"images_total,omitempty"`
+	ImagesUploaded int               `json:"images_uploaded,omitempty"`
+	ImageURLs      map[string]string `json:"image_urls,omitempty"`
+	Warnings       []string          `json:"warnings,omitempty"`
+	Error          string            `json:"error,omitempty"`
+	Errcode        int               `json:"errcode,omitempty"`
+}
+
+// wechatResultPrefix 是结果行的前缀 (与 docforge 侧解析器保持一致)。
+const wechatResultPrefix = "__WECHAT_RESULT__ "
+
+// errcodeRe 从公众号 API 错误文本 "公众号 API 错误 errcode=40164 ..." 里取错误码。
+var errcodeRe = regexp.MustCompile(`errcode=(\d+)`)
+
+// emitWechatResult 在 --json 模式下输出最后一行结果标记。
+// 非 --json 模式完全静默, 不影响原有给人看的输出。
+func emitWechatResult(jr *wechatResult, runErr error, jsonOut bool) {
+	if !jsonOut {
+		return
+	}
+	jr.OK = runErr == nil
+	if runErr != nil {
+		jr.Error = runErr.Error()
+		if m := errcodeRe.FindStringSubmatch(jr.Error); m != nil {
+			fmt.Sscanf(m[1], "%d", &jr.Errcode)
+		}
+	}
+	b, err := json.Marshal(jr)
+	if err != nil {
+		fmt.Printf("%s{\"ok\":false,\"error\":\"结果序列化失败\"}\n", wechatResultPrefix)
+		return
+	}
+	fmt.Println(wechatResultPrefix + string(b))
 }
 
 // publishExtraMedia 在已建图文草稿后, 按勾选追加发布: 图片消息(贴图)草稿 + 视频/音频永久素材。
@@ -294,10 +401,25 @@ func loadWechatConfig(path string) (wechat.Config, string, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return wechat.Config{}, "", fmt.Errorf("解析配置失败: %w", err)
 	}
+	applyWechatEnvOverrides(&raw.WechatMP)
 	if raw.WechatMP.AppID == "" {
 		return wechat.Config{}, "", fmt.Errorf("配置缺少 wechatMP.appId (请在 %s 配置)", path)
 	}
 	return raw.WechatMP, raw.Browser.ChromePath, nil
+}
+
+// applyWechatEnvOverrides 用环境变量覆盖配置文件里的公众号凭证。
+//
+// docforge 按「账号」为每个发布任务注入凭证: 环境变量不会像 argv 那样出现在 ps 输出里,
+// 也不会被写进任务目录/run.log, 比 --app-secret 这类入参安全。空值视为未覆盖,
+// 保留 config.json 的 wechatMP 配置 (兼容直接使用 CLI 的场景)。
+func applyWechatEnvOverrides(c *wechat.Config) {
+	if v := strings.TrimSpace(os.Getenv("CLAUDE_GO_WECHAT_APP_ID")); v != "" {
+		c.AppID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("CLAUDE_GO_WECHAT_APP_SECRET")); v != "" {
+		c.AppSecret = v
+	}
 }
 
 // loadWechatMarkdown 从 --md 文件或 --team 的 techblog 产物取 Markdown, 返回 (md, 推断标题)。
