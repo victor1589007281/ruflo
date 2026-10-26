@@ -204,9 +204,28 @@ func RunToolUse(
 	reg *Registry,
 	tctx *ToolContext,
 	hookRunner HookRunner,
-) types.Message {
+) (resultMessage types.Message) {
 	toolUseID := block.ID
 	toolName := block.Name
+	startedAt := time.Now()
+	if tctx != nil && tctx.ObserveToolCall != nil {
+		defer func() {
+			obs := ToolCallObservation{
+				ToolUseID: toolUseID, ToolName: toolName, Input: block.Input,
+				StartedAt: startedAt, Duration: time.Since(startedAt),
+			}
+			var output []string
+			for _, b := range resultMessage.Content {
+				if b.Type != types.ContentBlockToolResult {
+					continue
+				}
+				output = append(output, b.Content)
+				obs.IsError = obs.IsError || b.IsError
+			}
+			obs.Output = strings.Join(output, "\n")
+			tctx.ObserveToolCall(obs)
+		}()
+	}
 
 	makeErrorResult := func(errMsg string) types.Message {
 		return types.Message{

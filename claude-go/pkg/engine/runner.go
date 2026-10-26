@@ -54,6 +54,11 @@ type IsolatedRunOptions struct {
 	// 这类多 PDF 任务会继续读文件直到 MaxTurns 用光, 拿回一份没有结论的半成品,
 	// 而 run 还会报 max_turns 错误。提示词无法让"工具不可用"这件事成立。
 	FinalizeTurns int
+	// FinalizeInstruction 可选的调用方交付契约, 只在 FinalizeTurns>0 时生效。
+	// 空 = 沿用默认的 Markdown 报告文案; 非空 = 保留"停止检索/末轮无工具"的
+	// 执行约束, 但把输出格式交给调用方。一次性 JSON agent 必须走这一条:
+	// 默认报告文案与 max_turns 后的 handoff 一样, 都会覆盖它的结构化输出契约。
+	FinalizeInstruction string
 	// MergeBashTargets 启用 run 级 Bash 目标合并闸 (见 pkg/tool/bashguard.go)。
 	//
 	// 为 true 时, 同一份 PDF/URL 被拆成多条单独命令重复访问会被拒绝, 模型收到的
@@ -151,8 +156,8 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		return "", fmt.Errorf("nil engine")
 	}
 	// 轨迹采集 (design/03 §4.1 E1): RunIsolated 不经 HookChain, TraceCaptureHook
-	// 不会触发。此处补一个 episode 级 turn span (输入 prompt → 最终产出), 使 CLI
-	// 团队路径也进 TraceStore。tool_call 级细粒度采集属飞书完整循环路径 (已覆盖)。
+	// 不会触发。此处补 episode 级 node span；LLM 与工具调用在执行点分别补
+	// llm_call/tool_call span，工具耗时按单次调用计时而不是并发批次总耗时。
 	if e.TraceStore != nil {
 		start := time.Now()
 		ids := trace.From(ctx)
@@ -173,9 +178,15 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 					TurnID:    ids.TurnID,
 					InputRef:  e.TraceStore.MakeRef(userPrompt),
 					OutputRef: e.TraceStore.MakeRef(finalText),
-					Attrs:     map[string]any{"status": status, "isolated": true},
-					TS:        start.UnixMilli(),
-					DurMS:     time.Since(start).Milliseconds(),
+					Attrs: map[string]any{
+						"status": status, "isolated": true,
+						"permission_mode":   string(e.Config.PermissionMode),
+						"allowed_tools_set": e.Config.AllowedTools != nil,
+						"allowed_tools":     sortedKeys(e.Config.AllowedTools),
+						"disabled_tools":    sortedKeys(e.Config.DisabledTools),
+					},
+					TS:    start.UnixMilli(),
+					DurMS: time.Since(start).Milliseconds(),
 				})
 			})
 		}()
@@ -444,9 +455,9 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			}
 			switch {
 			case finalTurn:
-				messages = append(messages, finalizeNotice(finalTurn, remaining, verified))
+				messages = append(messages, finalizeNotice(finalTurn, remaining, verified, opts.FinalizeInstruction))
 			case remaining == finalizeTurns:
-				messages = append(messages, finalizeNotice(false, remaining, verified))
+				messages = append(messages, finalizeNotice(false, remaining, verified, opts.FinalizeInstruction))
 			}
 		}
 		// 检索预算软提醒只发一次, 且不能和收口提醒抢最后一格: 收口提醒
@@ -675,7 +686,32 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		// 但每轮拼一次意味着"这次运行挂了哪些 hook"在循环内部没有一个稳定读数,
 		// 而排错时要问的恰恰是"它到底带了没带"。opts.Hooks 为空时 hookRunner 就是
 		// e.HookRunner 本身 (逐字节等于改造前, 不多构造对象)。
+		var toolObservations chan tool.ToolCallObservation
+		if e.TraceStore != nil {
+			toolObservations = make(chan tool.ToolCallObservation, len(toolUseBlocks))
+			tctx.ObserveToolCall = func(obs tool.ToolCallObservation) { toolObservations <- obs }
+		}
 		toolResults := tool.RunTools(ctx, toolUseBlocks, e.Tools, tctx, hookRunner)
+		if toolObservations != nil {
+			close(toolObservations)
+			ids := trace.From(ctx)
+			for obs := range toolObservations {
+				status := "completed"
+				if obs.IsError {
+					status = "error"
+				}
+				e.TraceStore.Write(tracestore.Span{
+					TraceID: ids.RunID, SpanID: internal_hook.GenerateUUID(), ParentID: ids.TurnID,
+					Kind: tracestore.KindToolCall, Name: obs.ToolName, NodeID: ids.NodeID, TurnID: ids.TurnID,
+					InputRef: e.TraceStore.MakeRef(string(obs.Input)), OutputRef: e.TraceStore.MakeRef(obs.Output),
+					Attrs: map[string]any{
+						"status": status, "is_error": obs.IsError, "isolated": true,
+						"permission_mode": string(tctx.PermissionMode), "tool_use_id": obs.ToolUseID,
+					},
+					TS: obs.StartedAt.UnixMilli(), DurMS: obs.Duration.Milliseconds(),
+				})
+			}
+		}
 		ledger.observeMessages(toolResults)
 		// 入参+结果配对, 只把成功返回的 WebFetch / curl 记为"已抓取"。
 		ledger.observeFetches(toolUseBlocks, toolResults)
@@ -748,23 +784,32 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 // finalizeNotice 构造强制收口的用户消息。
 //
 // last=true 时工具面已经撤掉, 文案必须说清"工具不可用", 否则模型会继续输出
-// tool_use 等待结果, 最后一轮白跑。两种情况都要求"用已有材料写完整报告",
-// 并明确允许把缺证据的部分写进局限 —— 否则模型会用编造来填缺口。
-func finalizeNotice(last bool, remaining int, verified []string) types.Message {
-	text := fmt.Sprintf("【收口提醒】本次运行只剩 %d 轮。立即停止一切检索与工具调用: 不要再发起 WebSearch / WebFetch / Bash, 不要再补证据。请直接用已经收集到的材料写出完整报告正文: 第一行是具体的一级标题 (# 开头), 之后是结论、分析、证据表和局限。材料不足的部分如实写进「局限」, 不要编造来源或数字。", remaining)
-	if last {
-		text = "【最后一轮】工具已经禁用, 本轮只能输出文本。不要再调用任何工具, 也不要输出计划或过程说明。现在直接写出最终报告正文: 第一行是具体的一级标题 (# 开头), 随后是完整结论、分析、证据表与局限。材料不足处写进「局限」, 不要臆造。"
-	}
-	if len(verified) > 0 {
-		var b strings.Builder
-		b.WriteString(text)
-		b.WriteString("\n\n本轮工具实际返回/请求过的 URL 如下。证据表**只能**引用其中出现过的 URL; 不在清单内的链接一律不要写 (宁可写进「局限」)。不要根据申请号/DOI/日期自己拼接路径:\n")
-		for _, u := range verified {
-			b.WriteString("- ")
-			b.WriteString(u)
-			b.WriteString("\n")
+// tool_use 等待结果, 最后一轮白跑。默认文案面向 Markdown 报告；调用方提供
+// instruction 时只替换交付格式部分，不追加报告章节或证据表假设。这样严格 JSON
+// agent 也能复用同一条"末轮无工具"路径，而不会又被提示词拉回 Markdown。
+func finalizeNotice(last bool, remaining int, verified []string, instruction string) types.Message {
+	var text string
+	if custom := strings.TrimSpace(instruction); custom != "" {
+		text = fmt.Sprintf("【收口提醒】本次运行只剩 %d 轮。立即停止检索，基于已有材料交付；未完成的部分如实写入调用方约定的 warnings/局限字段，不得编造。\n%s", remaining, custom)
+		if last {
+			text = "【最后一轮】工具已经禁用，本轮只能输出文本。不要再调用任何工具，也不要输出计划或交接说明。必须严格遵守以下最终交付契约：\n" + custom
 		}
-		text = b.String()
+	} else {
+		text = fmt.Sprintf("【收口提醒】本次运行只剩 %d 轮。立即停止一切检索与工具调用: 不要再发起 WebSearch / WebFetch / Bash, 不要再补证据。请直接用已经收集到的材料写出完整报告正文: 第一行是具体的一级标题 (# 开头), 之后是结论、分析、证据表和局限。材料不足的部分如实写进「局限」, 不要编造来源或数字。", remaining)
+		if last {
+			text = "【最后一轮】工具已经禁用, 本轮只能输出文本。不要再调用任何工具, 也不要输出计划或过程说明。现在直接写出最终报告正文: 第一行是具体的一级标题 (# 开头), 随后是完整结论、分析、证据表与局限。材料不足处写进「局限」, 不要臆造。"
+		}
+		if len(verified) > 0 {
+			var b strings.Builder
+			b.WriteString(text)
+			b.WriteString("\n\n本轮工具实际返回/请求过的 URL 如下。证据表**只能**引用其中出现过的 URL; 不在清单内的链接一律不要写 (宁可写进「局限」)。不要根据申请号/DOI/日期自己拼接路径:\n")
+			for _, u := range verified {
+				b.WriteString("- ")
+				b.WriteString(u)
+				b.WriteString("\n")
+			}
+			text = b.String()
+		}
 	}
 	return types.Message{
 		Type:      types.MessageTypeUser,

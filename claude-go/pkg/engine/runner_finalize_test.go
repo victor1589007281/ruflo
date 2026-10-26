@@ -81,6 +81,49 @@ func TestFinalizeTurnsStopsToolsAndForcesText(t *testing.T) {
 	}
 }
 
+func TestFinalizeInstructionDeliversJSONInsteadOfHandoff(t *testing.T) {
+	id, cfg := stateIdentity()
+	u := newStateUpstream(t, -1, "unused")
+	e := newStateEngine(t, u, cfg, t.TempDir())
+	const finalJSON = `{"subject":"feat: 保留结构化收尾","files":[],"warnings":["未读完的 diff 已标注"]}`
+
+	// 假上游默认永远回 tool_use。只有真正撤掉工具的那一次业务请求才改回
+	// JSON；如果实现仍先跑满 max_turns，接下来的 handoff 即使同样无工具，
+	// 也只能返回交接说明，测试会随 RunIsolated 的错误一起失败。
+	u.onRequest = func(turn int, req seenRequest) {
+		if len(req.ToolNames) == 0 {
+			u.toolTurns = turn
+			u.text = finalJSON
+		}
+	}
+	got, err := e.RunIsolated(context.Background(), "总结提交", IsolatedRunOptions{
+		MaxTurns:            3,
+		FinalizeTurns:       1,
+		FinalizeInstruction: "只输出 STRICT_JSON_CONTRACT 约定的 JSON，不要 Markdown。",
+		Stage:               id.Stage,
+	})
+	if err != nil {
+		t.Fatalf("结构化收尾不应进入 max_turns/handoff: %v (text=%q)", err, got)
+	}
+	if got != finalJSON || !json.Valid([]byte(got)) {
+		t.Fatalf("最终交付不是预期 JSON: %q", got)
+	}
+	reqs := u.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("应在 3 次业务请求内完成，不应再有 handoff，实际 %d 次", len(reqs))
+	}
+	last := reqs[len(reqs)-1]
+	if last.Handoff || len(last.ToolNames) != 0 {
+		t.Fatalf("最后一次必须是业务收尾且无工具: %+v", last)
+	}
+	if !strings.Contains(last.Flat, "STRICT_JSON_CONTRACT") {
+		t.Fatalf("调用方输出契约没有进入实际请求: %q", last.Flat)
+	}
+	if strings.Contains(last.Flat, "一级标题") {
+		t.Fatalf("默认 Markdown 报告文案污染了 JSON 收尾: %q", last.Flat)
+	}
+}
+
 // TestFinalizeTurnsClampsToMaxTurns 钉住 FinalizeTurns > MaxTurns 的钳位。
 //
 // 不钳位时 "剩余 == FinalizeTurns" 一次都命不中, 收口提醒静默失效 ——

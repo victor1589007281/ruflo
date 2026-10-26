@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -97,6 +98,19 @@ type ToolResult struct {
 	Images []types.MediaSource `json:"images,omitempty"`
 }
 
+// ToolCallObservation 是一次工具调用的实际执行观测。Duration 从 RunToolUse
+// 入口到结果组装完成，包含权限检查与 hook；并发批次中每个调用单独计时，
+// 不把整批 wall time 错算到每个工具头上。
+type ToolCallObservation struct {
+	ToolUseID string
+	ToolName  string
+	Input     json.RawMessage
+	Output    string
+	IsError   bool
+	StartedAt time.Time
+	Duration  time.Duration
+}
+
 // ToolContext 工具执行时的上下文环境。
 // 对应 TS: Tool.ts 中的 ToolUseContext (简化版)。
 // 包含当前工作目录、权限模式、消息历史等运行时信息。
@@ -126,6 +140,9 @@ type ToolContext struct {
 	Role string `json:"role,omitempty"`
 	// GlobalPerm 若非 nil，RunToolUse 会用其 CheckGlobal 合并全局策略与工具自带权限结果
 	GlobalPerm GlobalPermissionChecker `json:"-"`
+	// ObserveToolCall 可选的单次工具完成回调；只用于观测，不改变工具结果。
+	// 并发执行时回调也可能并发，调用方需自行保证写入安全。
+	ObserveToolCall func(ToolCallObservation) `json:"-"`
 
 	// WriteClaim 本次运行对"我写过哪些文件"的占用 (H3-4)。非 nil 时, Write/Edit 等
 	// 落盘工具在写之前先申请占用; 该路径已被另一个**仍然活着**的写者占用则拒写。

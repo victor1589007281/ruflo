@@ -175,8 +175,11 @@ var (
 	flagBaseURL        string
 	flagMaxTokens      int
 	flagMaxTurns       int
-	flagPermission     string
-	flagSystemPrompt   string
+	// 一次性结构化输出任务可覆盖收尾轮数与交付契约；默认保持角色/资产原行为。
+	flagFinalizeTurns       int
+	flagFinalizeInstruction string
+	flagPermission          string
+	flagSystemPrompt        string
 	// --system-prompt-only: 显式声明"只注入 agent/--system-prompt 这一段"，不再追加
 	// 全局 config 的 systemPrompt 与 MCP 指引。给窄工具面的只读 agent 用，避免提示词
 	// 声称有 Bash/Write 而实际工具面没有它们。
@@ -309,6 +312,8 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagBaseURL, "base-url", "", "API base URL")
 	rootCmd.PersistentFlags().IntVar(&flagMaxTokens, "max-tokens", 16384, "最大输出 token 数")
 	rootCmd.PersistentFlags().IntVar(&flagMaxTurns, "max-turns", 0, "最大循环次数 (0=无限)")
+	rootCmd.PersistentFlags().IntVar(&flagFinalizeTurns, "finalize-turns", 0, "最后 N 轮强制收口 (0=跟随 agent 声明; 末轮禁用工具)")
+	rootCmd.PersistentFlags().StringVar(&flagFinalizeInstruction, "finalize-instruction", "", "收口时必须遵守的输出契约; 与 --finalize-turns 连用, 适合严格 JSON 的一次性 agent")
 	rootCmd.PersistentFlags().StringVar(&flagPermission, "permission-mode", "bypass", "权限模式 (default/auto/plan/bypass)")
 	rootCmd.PersistentFlags().StringVar(&flagSystemPrompt, "system-prompt", "", "自定义系统提示词")
 	rootCmd.PersistentFlags().BoolVar(&flagSystemPromptOnly, "system-prompt-only", false, "只注入 agent/--system-prompt 的提示词，不追加全局 systemPrompt 与 MCP 指引 (窄工具面 agent 用)")
@@ -4831,6 +4836,16 @@ func agentTurnCap(spec *agentRunSpec, longHorizonTurns int) int {
 // 中途注入队列 —— 各写一份的结果是"同一个 agent 在两条路径上跑出不同轮数/不同工具面",
 // 而那种差异从任何单侧看都是不可见的。
 func buildAgentRunner(eng *engine.QueryEngine, spec *agentRunSpec, mcfg modelconfig.ResolvedConfig, longHorizonTurns int) *cliAgentRunner {
+	finalizeTurns := spec.FinalizeTurns
+	if flagFinalizeTurns > 0 {
+		finalizeTurns = flagFinalizeTurns
+	}
+	finalizeInstruction := strings.TrimSpace(flagFinalizeInstruction)
+	if finalizeInstruction != "" && finalizeTurns <= 0 {
+		// 显式给了交付契约却没给轮数时，最少保留最后一轮；不能让旗标看起来
+		// 生效、实际因 FinalizeTurns=0 整段静默跳过。
+		finalizeTurns = 1
+	}
 	r := &cliAgentRunner{
 		eng:              eng,
 		role:             spec.Name,
@@ -4841,7 +4856,8 @@ func buildAgentRunner(eng *engine.QueryEngine, spec *agentRunSpec, mcfg modelcon
 		// 在产物上唯一的落点。留空会让中间态退化成按 Role+Cwd 分账 (见 withStage)。
 		stage:               spec.Name,
 		longHorizonMaxTurns: longHorizonTurns,
-		finalizeTurns:       spec.FinalizeTurns,
+		finalizeTurns:       finalizeTurns,
+		finalizeInstruction: finalizeInstruction,
 		mergeBashTargets:    spec.MergeBashTargets,
 		restrictWritesToCwd: spec.RestrictWritesToCwd,
 		citationGate:        spec.CitationGate,
@@ -5036,6 +5052,11 @@ func runAsAgent(cmd *cobra.Command, eng *engine.QueryEngine, userPrompt string, 
 
 	log.Printf("[agent] 以 %q 运行 (来源: %s, 模型: %q, 回合上限: %d, 工具档位: %s)",
 		spec.Name, spec.Source, spec.Model, effectiveTurns, spec.ToolProfile)
+	checkerMode := eng.Config.PermissionMode
+	if eng.PermChecker != nil {
+		checkerMode = eng.PermChecker.Mode
+	}
+	log.Printf("[agent] 实际权限档: config=%s checker=%s", eng.Config.PermissionMode, checkerMode)
 	// 印的是**实际发给模型的**工具数, 不是注册表里的工具总数。
 	//
 	// ★ 这一行与上面那行是同一类错误的两半, 一起修的: 原先无条件印
@@ -5198,8 +5219,10 @@ type cliAgentRunner struct {
 	systemPromptOnly bool
 	// stage 稳定阶段标识 (agent.RunMetadata.Stage), 供 H3-2 中间态按阶段分账。
 	stage string
-	// finalizeTurns 最后 N 轮强制收口 (0 = 不收口), 来自角色声明。
+	// finalizeTurns 最后 N 轮强制收口 (0 = 不收口), 来自角色声明或显式旗标。
 	finalizeTurns int
+	// finalizeInstruction 收口时保留的调用方输出契约 (空 = 默认 Markdown 报告)。
+	finalizeInstruction string
 	// mergeBashTargets 启用 run 级 Bash 目标合并闸, 来自角色声明。
 	mergeBashTargets bool
 	// restrictWritesToCwd 把写类工具限制在当前工作目录内, 来自角色声明。
@@ -5489,6 +5512,7 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 		Client:               client,
 		DisableTools:         disableTools,
 		FinalizeTurns:        r.finalizeTurns,
+		FinalizeInstruction:  r.finalizeInstruction,
 		MergeBashTargets:     r.mergeBashTargets,
 		RestrictWritesToCwd:  r.restrictWritesToCwd,
 		CitationGate:         r.citationGate,

@@ -298,6 +298,19 @@ func TestBuildAgentRunner_收口与Bash合并声明被搬运(t *testing.T) {
 	}
 }
 
+func TestBuildAgentRunner_显式收口旗标覆盖角色声明(t *testing.T) {
+	oldTurns, oldInstruction := flagFinalizeTurns, flagFinalizeInstruction
+	t.Cleanup(func() {
+		flagFinalizeTurns, flagFinalizeInstruction = oldTurns, oldInstruction
+	})
+	flagFinalizeTurns = 1
+	flagFinalizeInstruction = "  只输出 STRICT_JSON  "
+	r := buildAgentRunner(nil, &agentRunSpec{Name: "a", Source: "asset", FinalizeTurns: 4}, modelconfig.ResolvedConfig{}, 0)
+	if r.finalizeTurns != 1 || r.finalizeInstruction != "只输出 STRICT_JSON" {
+		t.Fatalf("显式收口配置没有进入 runner: turns=%d instruction=%q", r.finalizeTurns, r.finalizeInstruction)
+	}
+}
+
 // TestBuildAgentRunner_角色层技能不重复并入 —— 角色层的 MergedPrompt 已经拼过正文。
 func TestBuildAgentRunner_角色层技能不重复并入(t *testing.T) {
 	roleSpec := &agentRunSpec{Name: "r", Source: "role", Skills: []string{"s1"}}

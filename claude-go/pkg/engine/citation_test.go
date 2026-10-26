@@ -232,7 +232,7 @@ func TestCitationLedgerSampleIsSortedAndCapped(t *testing.T) {
 }
 
 func TestFinalizeNoticeIncludesVerifiedURLs(t *testing.T) {
-	msg := finalizeNotice(true, 1, []string{"https://a.example/1", "https://b.example/2"})
+	msg := finalizeNotice(true, 1, []string{"https://a.example/1", "https://b.example/2"}, "")
 	if len(msg.Content) != 1 {
 		t.Fatalf("unexpected content: %+v", msg.Content)
 	}
@@ -243,7 +243,7 @@ func TestFinalizeNoticeIncludesVerifiedURLs(t *testing.T) {
 		}
 	}
 	// 清单为空时不应出现空清单标题.
-	noList := finalizeNotice(false, 2, nil)
+	noList := finalizeNotice(false, 2, nil, "")
 	if strings.Contains(noList.Content[0].Text, "URL 如下") {
 		t.Fatalf("空清单不该输出 URL 段: %s", noList.Content[0].Text)
 	}

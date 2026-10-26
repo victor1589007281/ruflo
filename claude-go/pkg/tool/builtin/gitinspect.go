@@ -38,8 +38,13 @@ const GitInspectToolName = "GitInspect"
 const GitInspectScopeEnv = "CLAUDE_GO_GIT_INSPECT_SCOPE"
 
 const (
-	gitInspectMaxOutput = 160 * 1024
-	gitInspectTimeout   = 30 * time.Second
+	gitInspectMaxOutput       = 160 * 1024
+	gitInspectTimeout         = 30 * time.Second
+	gitInspectDefaultDiffPage = 180
+	gitInspectMaxDiffPage     = 400
+	// 通用工具层在 24KB 时把结果折叠成 artifact。分页字节预算必须低于它，
+	// 否则"支持分页"仍会让模型先读预览、再用 Read 翻 artifact。
+	gitInspectDiffPageBytes = 20 * 1024
 )
 
 type gitInspectScope struct {
@@ -54,7 +59,9 @@ type gitInspectInput struct {
 	// Staged=true 看 index 与 HEAD 的差异; 默认看工作区与 index 的差异。
 	Staged bool `json:"staged,omitempty"`
 	Stat   bool `json:"stat,omitempty"`
-	Limit  int  `json:"limit,omitempty"`
+	// diff 的单文件原生分页坐标；limit 同时保留 log 的条数语义。
+	Offset int `json:"offset,omitempty"`
+	Limit  int `json:"limit,omitempty"`
 }
 
 type GitInspectTool struct{}
@@ -67,7 +74,7 @@ func (t *GitInspectTool) Description() string {
 	return `Read-only git inspection for the current commit-review scope.
 Operations:
 - status: changed files inside the authorized scope (porcelain)
-- diff: worktree-vs-index diff (or staged diff), optionally for one authorized path; stat=true returns a diffstat
+- diff: worktree-vs-index diff (or staged diff), optionally for one authorized path; stat=true returns a diffstat. A path-specific patch is returned one page at a time: offset skips patch lines, limit sets the page size (default 180, max 400). Follow next_offset in the page header; do not read a compacted artifact.
 - log: recent commit subjects (no patches)
 
 The repository root and authorized paths are fixed by the host. You cannot inspect other repositories or files outside the scope. This tool never writes, stages, commits, or pushes.`
@@ -81,7 +88,8 @@ func (t *GitInspectTool) InputSchema() json.RawMessage {
 			"path": {"type": "string", "description": "For diff: one path from the authorized scope. Omit to diff all authorized paths."},
 			"staged": {"type": "boolean", "description": "For diff: compare the index against HEAD instead of the worktree."},
 			"stat": {"type": "boolean", "description": "For diff: return a diffstat instead of the full patch."},
-			"limit": {"type": "integer", "description": "For log: number of commits, 1-30 (default 10)."}
+			"offset": {"type": "integer", "description": "For path-specific diff: skip this many patch lines. Use next_offset from the previous response; default 0."},
+			"limit": {"type": "integer", "description": "For log: commits, 1-30 (default 10). For path-specific diff: patch lines per page, default 180, capped at 400 and a safe byte budget."}
 		},
 		"required": ["operation"]
 	}`)
@@ -115,6 +123,12 @@ func (t *GitInspectTool) Call(ctx context.Context, input json.RawMessage, _ *too
 		}
 		return &tool.ToolResult{Content: capGitOutput(redactGitSecrets(out))}, nil
 	case "diff":
+		if in.Offset < 0 || (in.Offset > 0 && in.Path == "") {
+			return &tool.ToolResult{Content: "GitInspect diff offset 必须非负，且必须同时指定 path", IsError: true}, nil
+		}
+		if in.Limit < 0 {
+			return &tool.ToolResult{Content: "GitInspect limit 不能为负数", IsError: true}, nil
+		}
 		paths := scope.Paths
 		if in.Path != "" {
 			p, ok := normalizeScopePath(in.Path)
@@ -130,7 +144,11 @@ func (t *GitInspectTool) Call(ctx context.Context, input json.RawMessage, _ *too
 		if strings.TrimSpace(out) == "" {
 			out = "(no diff)"
 		}
-		return &tool.ToolResult{Content: capGitOutput(redactGitSecrets(out))}, nil
+		out = redactGitSecrets(out)
+		if in.Path != "" && !in.Stat && strings.TrimSpace(out) != "(no diff)" {
+			out = pageGitInspectDiff(out, in.Offset, in.Limit)
+		}
+		return &tool.ToolResult{Content: capGitOutput(out)}, nil
 	case "log":
 		limit := in.Limit
 		if limit <= 0 {
@@ -304,6 +322,62 @@ func gitInspectDiff(ctx context.Context, root string, paths []string, staged, st
 	args = append(args, "--")
 	args = append(args, paths...)
 	return gitInspectRun(ctx, root, args...)
+}
+
+// pageGitInspectDiff 在**已经生成并脱敏的 patch**上翻页。offset/limit 都是
+// patch 行号，不是源文件行号；next_offset 由原切片终点计算，调用方不用猜。
+//
+// 只在指定单个 path 时启用：全仓 diff 若按总行数硬切，模型会看到缺少文件头的
+// 中间片段；那种调用仍受 160KB 总上限约束。单文件页保留自己的 diff 头，并报告
+// 当前 hunk 头，方便后一页定位。20KB 字节闸在单行超长时也会截断，不能假定
+// “180 行就一定小于 24KB”而再次触发通用 artifact 折叠。
+func pageGitInspectDiff(out string, offset, limit int) string {
+	lines := strings.Split(out, "\n")
+	if offset > len(lines) {
+		offset = len(lines)
+	}
+	if limit <= 0 {
+		limit = gitInspectDefaultDiffPage
+	}
+	if limit > gitInspectMaxDiffPage {
+		limit = gitInspectMaxDiffPage
+	}
+	end := offset + limit
+	if end > len(lines) {
+		end = len(lines)
+	}
+	// 先试整页，再按实际 UTF-8 字节收缩。最后一行没有换行符也要算进预算。
+	body := strings.Join(lines[offset:end], "\n")
+	if len(body) > gitInspectDiffPageBytes {
+		cut := gitInspectDiffPageBytes
+		for cut > 0 && (body[cut]&0xC0) == 0x80 {
+			cut--
+		}
+		body = body[:cut]
+		if i := strings.LastIndexByte(body, '\n'); i >= 0 {
+			// 保留页末换行：它是本页最后一行与下一页第一行之间的 patch
+			// 字节，不是可随意丢弃的展示空白。
+			body = body[:i+1]
+			end = offset + strings.Count(body, "\n")
+		} else {
+			// 一行就超预算：至少返回这一行的安全前缀，下一页从下一行开始。
+			end = offset + 1
+			body += "\n... [GitInspect: current patch line exceeded page byte budget; truncated]"
+		}
+	}
+	hunk := ""
+	for i := offset - 1; i >= 0; i-- {
+		if strings.HasPrefix(lines[i], "@@") {
+			hunk = lines[i]
+			break
+		}
+	}
+	next := -1
+	if end < len(lines) {
+		next = end
+	}
+	return fmt.Sprintf("GIT_INSPECT_DIFF_PAGE offset=%d limit=%d total_lines=%d next_offset=%d\n%s\n%s",
+		offset, limit, len(lines), next, hunk, body)
 }
 
 func gitInspectLog(ctx context.Context, root string, limit int) (string, error) {
