@@ -8,6 +8,7 @@ require (
 	github.com/chromedp/cdproto v0.0.0-20260405000525-47a8ff65b46a
 	github.com/chromedp/chromedp v0.15.1
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/prometheus/client_golang v1.23.2
@@ -22,6 +23,7 @@ require (
 replace gitee.com/lorydb/agentDB => /home/victor/base/git/gitee/agentDB
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/chromedp/sysutil v1.1.0 // indirect

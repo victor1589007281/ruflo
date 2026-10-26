@@ -71,6 +71,9 @@ type IsolatedRunOptions struct {
 	// 绝对路径写到任何地方 (实测写成了 /home/victor/evidence.md)。并发任务还会
 	// 因此互相覆盖同一份文件。默认 false = 改造前行为。
 	RestrictWritesToCwd bool
+	// FinalResponse 可选的窄面 agent 交付契约。首次结构/证据引用不达标时
+	// 撤销工具并完整重写一次；仍不达标则返回错误，不静默交付草稿。
+	FinalResponse *FinalResponseContract
 	// CitationGate 为 true 时, 模型第一次想结束 (没有 tool_use) 会做一次引用核验:
 	// 若最终文本里过半的 URL 只在搜索结果中出现、从未成功抓取, 就注入一条修订
 	// 指令并让循环再跑一轮 (只给一次机会)。
@@ -395,6 +398,8 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 	// 引用核验闸只触发一次: 第二次仍不达标就交付 (审计日志已记下未抓取清单),
 	// 反复要求修订会把一个"证据不足"的报告变成无限循环。
 	citationGateUsed := false
+	responseRepairUsed := false
+	responseRepairPending := false
 	// 运行中入站通道 (21.8.12 P5): 标记"这次 run 能接注入"。
 	//
 	// Enter/Leave 配平用 defer —— 这条路径有 8 处提前 return, 手写必然漏掉几条,
@@ -406,6 +411,8 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		if ctx.Err() != nil {
 			return lastAssistantText, ctx.Err()
 		}
+		responseRepairTurn := responseRepairPending
+		responseRepairPending = false
 
 		// 运行中注入**必须**发生在压缩之前: 一条更正可能正是"别再按原来的方向做",
 		// 而压缩会把旧方向折成摘要 ⇒ 模型先看到摘要、再看到更正, 反而更容易顺着
@@ -496,7 +503,7 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		// 最后一轮把工具面整个撤掉: 模型即使还想检索, 也没有可调用的工具。
 		// 只靠提示词做不到这件事 —— 提示词是建议, 空工具表是约束。
 		turnTools := apiTools
-		if finalTurn {
+		if finalTurn || responseRepairTurn {
 			turnTools = nil
 		}
 
@@ -562,7 +569,7 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		// 最后一轮必须双保险: 工具表已置空, 但 XML 回退能从文本里"凭空"解析出
 		// tool_use (DeepSeek/MiniMax 系会这么干). 只撤工具表的话, 这些块会进
 		// toolUseBlocks 分支并被执行 —— 最后一轮的"禁用工具"就被绕过了.
-		if opts.DisableTools || finalTurn {
+		if opts.DisableTools || finalTurn || responseRepairTurn {
 			toolUseBlocks = nil
 			kept := assistantBlocks[:0]
 			for _, b := range assistantBlocks {
@@ -616,12 +623,26 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			// 最后一轮仍然没有文本 = 收口失败. 必须报出来, 不能把上一轮的
 			// 中间产物当成最终答案静默返回 —— 那正是"跑完了但交的是半成品"
 			// 的形态, 上游看不出任何异常.
-			if finalTurn && turnText.Len() == 0 {
+			if (finalTurn || responseRepairTurn) && turnText.Len() == 0 {
 				return lastAssistantText, fmt.Errorf("finalization turn produced no text")
 			}
 			// 如果整个 turn 既没有 text 也没有 tool_use, 给个明确错误.
 			if lastAssistantText == "" {
 				return "", fmt.Errorf("assistant returned empty content")
+			}
+			if opts.FinalResponse != nil {
+				known := finalResponseEvidenceIDs(messages)
+				if validationErr := validateFinalResponse(lastAssistantText, opts.FinalResponse, known); validationErr != nil {
+					if !responseRepairUsed && opts.MaxTurns-turn > 1 {
+						responseRepairUsed = true
+						responseRepairPending = true
+						messages = append(messages, finalResponseRepairNotice(opts.FinalResponse, validationErr))
+						logging.For("engine").Warn("最终答案契约未通过，撤销工具并要求完整重写一次",
+							"reason", validationErr.Error(), "turn", turn)
+						continue
+					}
+					return lastAssistantText, fmt.Errorf("final response contract: %w", validationErr)
+				}
 			}
 			// 引用核验闸: 只给一次机会, 且必须还有下一轮可用 (否则改完没地方写).
 			// 至少留 6 轮才值得开核验: 实测 23/28 轮才触发时, 模型没有余量补抓,

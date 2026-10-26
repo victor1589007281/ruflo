@@ -97,6 +97,9 @@ func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searche
 		reg.Register(NewWebFetchTool())
 		reg.Register(NewWebSearchTool(searcher))
 		registerMarketDataTools(reg)
+		// 排障取数: 只读、固定采集 SQL、DSN 由运维白名单提供。放在 analysis 档
+		// 是因为它本身就是"只读取证"动作, 不引入写/执行能力。
+		reg.Register(NewOpsInvestigateTool())
 		reg.Register(NewStructuredOutputTool())
 		reg.Register(NewToolSearchTool(reg))
 		return nil, store

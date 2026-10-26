@@ -5504,6 +5504,15 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 		r.mu.Unlock()
 	}()
 
+	var finalResponse *engine.FinalResponseContract
+	if role == "ops-rca" {
+		finalResponse = &engine.FinalResponseContract{
+			RequiredSections:  []string{"## 结论", "## 关键证据", "## 矛盾与缺口", "## 下一步"},
+			RequireEvidenceID: true,
+			RepairInstruction: "固定保留结论、关键证据、矛盾与缺口、下一步四节；关键证据最多 3 条，下一步只保留一个最高信息增益动作，并按采集能力标注“工具支持/需人工/采集面不支持”。不要复述完整证据表或时间线。",
+		}
+	}
+
 	out, err := r.eng.RunIsolated(ctx, userPrompt, engine.IsolatedRunOptions{
 		SystemPrompt:         systemPrompt,
 		DisableDefaultPrompt: r.systemPromptOnly,
@@ -5516,6 +5525,7 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 		MergeBashTargets:     r.mergeBashTargets,
 		RestrictWritesToCwd:  r.restrictWritesToCwd,
 		CitationGate:         r.citationGate,
+		FinalResponse:        finalResponse,
 		NormalizeEvidence:    r.normalizeEvidence,
 		Stage:                r.stage, // H3-2 中间态身份; 空 = 身份退化为 Role+Cwd
 		Inject:               inject,

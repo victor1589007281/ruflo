@@ -64,6 +64,10 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	// 结构化行情数据面 (时点/复权/多源核价), 与 WebSearch 的叙述性检索分工。
 	registerMarketDataTools(reg)
 
+	// 排障只读取证 (MySQL 域)。放在 base 集是为了让 admin 档也拥有同一份工具目录，
+	// 避免"analysis 档有、admin 档没有"的目录分叉。
+	reg.Register(NewOpsInvestigateTool())
+
 	// User interaction
 	reg.Register(NewAskUserQuestionTool())
 
