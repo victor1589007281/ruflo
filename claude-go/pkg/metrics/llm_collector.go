@@ -170,6 +170,11 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 
 	rt(MLLMCallCount, 1)
 	rt(MLLMDurationSec, rec.DurationSec)
+	// 首字耗时只在真的有值时才记：非流式调用/一帧内容都没收到时它是 0，
+	// 显式记 0 会被读成"首字瞬时到达"，与"没测到"不可区分。
+	if rec.TTFTMs > 0 {
+		rt(MLLMTTFTMs, rec.TTFTMs)
+	}
 	// token 双边记账 (design/02 §1.4): input **不再用 >0 守卫跳过**。
 	//
 	// ⚠️ 改造前这行注释就已经写着"不再用 >0 守卫", 而守卫仍在 —— 注释与代码相反,

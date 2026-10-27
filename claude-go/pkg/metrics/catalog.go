@@ -45,6 +45,7 @@ var catalog = []MetricDesc{
 	{Module: "llm", Name: MLLMErrorCount, ZH: "LLM 调用失败数", EN: "Failed LLM calls", Unit: "count", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMRetryCount, ZH: "LLM 重试次数", EN: "LLM retries", Unit: "count", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMDurationSec, ZH: "单次调用耗时 (秒)", EN: "Per-call latency", Unit: "sec", Kind: KindHistogram, Panel: "llm"},
+	{Module: "llm", Name: MLLMTTFTMs, ZH: "首字耗时 (毫秒)", EN: "Time to first token", Unit: "ms", Kind: KindHistogram, Panel: "llm"},
 	{Module: "llm", Name: MLLMInputTokens, ZH: "输入 token 数", EN: "Input tokens", Unit: "tokens", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMOutputTokens, ZH: "输出 token 数", EN: "Output tokens", Unit: "tokens", Kind: KindCounter, Panel: "llm"},
 	{Module: "llm", Name: MLLMCacheReadTokens, ZH: "缓存命中 token", EN: "Cache hit tokens", Unit: "tokens", Kind: KindCounter, Panel: "llm"},

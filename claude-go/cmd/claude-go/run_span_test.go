@@ -60,7 +60,7 @@ func TestRecordRunSpanWritesSearchableRun(t *testing.T) {
 	ts, root := newTestStore(t)
 	start := time.Now().Add(-3 * time.Second)
 
-	recordRunSpan(ts, "run-abc-1", "coder:capstone-toolbox",
+	recordRunSpan(ts, "run-abc-1", "coder:capstone-toolbox", "",
 		"opencode:space-bunny-free", tracestore.RunStatusOK, "", "把 capstone 跑通", start)
 
 	spans := readRunSpans(t, root, "abc-1")
@@ -111,7 +111,7 @@ func TestRecordRunSpanWritesSearchableRun(t *testing.T) {
 // 把它写成 completed 会让页面的失败计数永远为 0。
 func TestRecordRunSpanFailureCarriesError(t *testing.T) {
 	ts, root := newTestStore(t)
-	recordRunSpan(ts, "run-def-1", "coder:x", "m",
+	recordRunSpan(ts, "run-def-1", "coder:x", "", "m",
 		tracestore.RunStatusFailed, "上游 400: model not found", "目标", time.Now())
 
 	spans := readRunSpans(t, root, "def-1")
@@ -127,6 +127,37 @@ func TestRecordRunSpanFailureCarriesError(t *testing.T) {
 	}
 }
 
+// TestRecordRunSpanCarriesAgent 显示名与 agent 身份必须分开落盘。
+//
+// 调用方显式给 --run-label 时 name 是任务名（coder:<任务>），从它推不出 agent；
+// webapp 的「按 Agent」维度只能读 attrs.agent。这个键缺失时整条运行会落进
+// 「(无 Agent)」桶 —— 不是没数据，是写了没读/读了没写。
+func TestRecordRunSpanCarriesAgent(t *testing.T) {
+	ts, root := newTestStore(t)
+	recordRunSpan(ts, "run-ghi-1", "coder:任务名", "ops-rca", "m",
+		tracestore.RunStatusOK, "", "目标", time.Now())
+
+	spans := readRunSpans(t, root, "ghi-1")
+	if len(spans) != 1 {
+		t.Fatalf("期望 1 条 run span, 实得 %d", len(spans))
+	}
+	attrs, _ := spans[0]["attrs"].(map[string]any)
+	if attrs["agent"] != "ops-rca" {
+		t.Fatalf("agent = %v, 期望 ops-rca —— 缺了它页面按 Agent 分组认不出这条运行", attrs["agent"])
+	}
+	if spans[0]["name"] != "coder:任务名" {
+		t.Fatalf("name = %v, 显示名不该被 agent 覆盖", spans[0]["name"])
+	}
+
+	// 空 agent 不写键: 与 model 同一纪律，空串会和"没有 agent"不可分。
+	recordRunSpan(ts, "run-ghi-2", "plain", "", "m", tracestore.RunStatusOK, "", "目标", time.Now())
+	plain := readRunSpans(t, root, "ghi-2")
+	attrs2, _ := plain[0]["attrs"].(map[string]any)
+	if _, has := attrs2["agent"]; has {
+		t.Fatalf("无 agent 的运行不该有 agent 键, 实得 %v", attrs2["agent"])
+	}
+}
+
 // TestRecordRunSpanFailsOpen 底座未装配 / 无 RunID 时**不写孤儿 span**。
 //
 // 与 pkg/agent/run_span.go:50 同一守卫: 空 TraceID 会被 tracestore 归进
@@ -136,12 +167,12 @@ func TestRecordRunSpanFailsOpen(t *testing.T) {
 	start := time.Now()
 
 	// store 为 nil: 不能 panic。
-	recordRunSpan(nil, "run-x-1", "n", "m", tracestore.RunStatusOK, "", "o", start)
+	recordRunSpan(nil, "run-x-1", "n", "", "m", tracestore.RunStatusOK, "", "o", start)
 
 	// runID 为空: 不能写出一个挂不上任何桶的孤儿。
 	ts, root := newTestStore(t)
-	recordRunSpan(ts, "", "n", "m", tracestore.RunStatusOK, "", "o", start)
-	recordRunSpan(ts, "", "", "", "", "", "", start)
+	recordRunSpan(ts, "", "n", "", "m", tracestore.RunStatusOK, "", "o", start)
+	recordRunSpan(ts, "", "", "", "", "", "", "", start)
 
 	files, _ := filepath.Glob(filepath.Join(root, "log", "*.jsonl"))
 	for _, f := range files {

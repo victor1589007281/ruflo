@@ -35,6 +35,7 @@ var (
 
 	// LLM Histograms
 	llmDurationSec           *prometheus.HistogramVec
+	llmTTFTMs                *prometheus.HistogramVec
 	llmInputTokens           *prometheus.HistogramVec
 	llmOutputTokens          *prometheus.HistogramVec
 	llmCacheReadTokens       *prometheus.HistogramVec
@@ -236,6 +237,10 @@ func initPrometheusMetrics() {
 	}, llmLabels)
 
 	llmDurationSec = llmCallCount
+	// 首字耗时用毫秒口径: 典型的 0.3~3s 落在这个分桶里才分得开 (秒桶在 50ms/100ms 处太粗)。
+	llmTTFTMs = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "claude_go", Name: "llm_ttft_ms", Help: "首字耗时分布 (请求发出 → 首个正文/思考增量, 毫秒)", Buckets: defaultMillisecondBuckets(),
+	}, llmLabels)
 	llmInputTokens = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "claude_go", Name: "llm_input_tokens", Help: "输入 token 分布", Buckets: defaultLLMBuckets(),
 	}, llmLabels)
@@ -738,6 +743,8 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 	// LLM histograms
 	case MLLMDurationSec:
 		llmDurationSec.With(fillLabels(llmNeed, labels)).Observe(value)
+	case MLLMTTFTMs:
+		llmTTFTMs.With(fillLabels(llmNeed, labels)).Observe(value)
 	case MLLMInputTokens:
 		llmInputTokens.With(fillLabels(llmNeed, labels)).Observe(value)
 	case MLLMOutputTokens:

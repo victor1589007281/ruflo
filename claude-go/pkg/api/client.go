@@ -66,6 +66,10 @@ type LLMCallRecord struct {
 	Status              string // "success" | "error" | "retry_success"
 	Stream              bool
 	DurationSec         float64
+	// TTFTMs: 请求发出 → 首个正文/思考/工具入参增量的毫秒数（仅流式有意义）。
+	// 与 DurationSec 是两个口径：DurationSec 含准入等待与整段生成，TTFTMs 只量
+	// "第一块可见产出什么时候到"。0 = 没有采集到（非流式 / 一帧内容都没有）。
+	TTFTMs              float64
 	InputTokens         int
 	InputEstimated      bool // input 由 prompt 字符数估算 (兼容网关不回 input_tokens; design/02 §1.4)
 	OutputTokens        int
@@ -1207,6 +1211,11 @@ func (c *Client) StreamMessage(
 		var resp *http.Response
 		effectiveBaseURL := c.BaseURL
 		effectiveAPIKey := c.APIKey
+		// 首字耗时的起点必须贴着 Do()：startTS 早于准入等待(Guard.Acquire)，
+		// 从它算会把"排队等令牌"的时间记成"模型首字慢"。每次尝试重新取值，
+		// ttftSet 保证只认真正收到内容的第一帧（重试前的空流不覆盖它）。
+		var reqSentAt time.Time
+		ttftSet := false
 	streamRetryLoop:
 		for attempt := 0; attempt <= maxRetry; attempt++ {
 			if ctx.Err() != nil {
@@ -1230,6 +1239,7 @@ func (c *Client) StreamMessage(
 			setTraceHeaders(httpReq, ctx) // trace 四元组 (见 trace.go); 未设置时无副作用
 			c.applyExtraHeaders(httpReq)  // 调用方注入的会话头等 (覆盖默认头)
 
+			reqSentAt = time.Now()
 			resp, err = c.Client.Do(httpReq)
 			if err != nil {
 				if attempt < maxRetry {
@@ -1479,6 +1489,14 @@ func (c *Client) StreamMessage(
 			}
 			if debug != nil {
 				debug.addStreamEvent(data)
+			}
+
+			// 首字耗时：一批增量里第一次出现可见产出（正文/思考/工具入参）时结算。
+			// 起点是 reqSentAt(贴着 Do)，不是 startTS(含准入等待)，也不是首帧到达
+			// —— message_start 到第一段内容之间常还隔着一次模型预热。
+			if !ttftSet && !reqSentAt.IsZero() && deltasCarryContent(deltas) {
+				streamRec.TTFTMs = float64(time.Since(reqSentAt).Milliseconds())
+				ttftSet = true
 			}
 
 			for _, delta := range deltas {
@@ -2251,4 +2269,24 @@ func (c *Client) RawComplete(ctx context.Context, contentJSON json.RawMessage, m
 		}
 	}
 	return sb.String(), nil
+}
+
+// deltasCarryContent 判断一批 SSE 增量里是否已经出现"用户屏幕上看得见"的产出：
+// 正文、思考，或工具调用（content_block_start 带 tool_use 就会画出工具卡片）。
+//
+// 刻意**不**把 message_start / message_delta(usage) 算进去：那是流建立的信号，
+// 不是产出。按它们记出来的数是 TTFB，不是首字 —— 两者在上游预热时能差好几秒。
+func deltasCarryContent(deltas []types.StreamDelta) bool {
+	for _, d := range deltas {
+		if d.Delta != nil && (d.Delta.Text != "" || d.Delta.Thinking != "" || d.Delta.PartialJSON != "") {
+			return true
+		}
+		if d.ContentBlock != nil {
+			switch d.ContentBlock.Type {
+			case types.ContentBlockText, types.ContentBlockThinking, types.ContentBlockToolUse:
+				return true
+			}
+		}
+	}
+	return false
 }

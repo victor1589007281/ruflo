@@ -602,6 +602,7 @@ const (
 	MLLMErrorCount            = "llm_error_count"             // 失败数
 	MLLMRetryCount            = "llm_retry_count"             // 重试次数
 	MLLMDurationSec           = "llm_duration_sec"            // 单次耗时(秒)
+	MLLMTTFTMs                = "llm_ttft_ms"                 // 首字耗时(毫秒): 请求发出 → 首个正文/思考增量
 	MLLMInputTokens           = "llm_input_tokens"            // 输入 token
 	MLLMOutputTokens          = "llm_output_tokens"           // 输出 token
 	MLLMCacheReadTokens       = "llm_cache_read_tokens"       // 缓存命中 token
@@ -663,6 +664,7 @@ var MetricType = map[string]MetricKind{
 
 	// LLM 分布 (histogram)
 	MLLMDurationSec:           "histogram",
+	MLLMTTFTMs:                "histogram",
 	MLLMInputTokens:           "histogram",
 	MLLMOutputTokens:          "histogram",
 	MLLMCacheReadTokens:       "histogram",

@@ -1168,7 +1168,7 @@ func runCmd() *cobra.Command {
 				if errKind != "" {
 					status = tracestore.RunStatusFailed
 				}
-				recordRunSpan(eng.TraceStore, runID, name, eng.Config.Model, status, errKind, userPrompt, start)
+				recordRunSpan(eng.TraceStore, runID, name, "", eng.Config.Model, status, errKind, userPrompt, start)
 			}()
 
 			attachBlocks, err := ingestAttachments(flagAttach)
@@ -1306,7 +1306,7 @@ func recordCLISessionRunSpan(ts *tracestore.Store, runID, label string, store *s
 	}
 	// objective 传空: 一次 REPL 会话没有单一任务目标, 拿第一轮输入冒充会让
 	// "这条 run 干了什么"看起来比实际确定。
-	recordRunSpan(ts, runID, name, model, status, errText, "", start)
+	recordRunSpan(ts, runID, name, "", model, status, errText, "", start)
 }
 
 // recordRunSpan 写本次 CLI run 的自述 span (KindRun)。
@@ -1318,7 +1318,7 @@ func recordCLISessionRunSpan(ts *tracestore.Store, runID, label string, store *s
 // fail-open 且零分配退出: store 未装配 (裸调/测试/没有 home 目录) 时直接返回, 与
 // pkg/agent/run_span.go:50「无 trace 的执行不产 run span, 免得写出挂不上任何桶的
 // 孤儿」同一守卫。runID 为空同理 —— 空 TraceID 会被 tracestore 归进 trace-orphan。
-func recordRunSpan(ts *tracestore.Store, runID, name, model, status, errText, objective string, start time.Time) {
+func recordRunSpan(ts *tracestore.Store, runID, name, agent, model, status, errText, objective string, start time.Time) {
 	if ts == nil || runID == "" {
 		return
 	}
@@ -1328,6 +1328,12 @@ func recordRunSpan(ts *tracestore.Store, runID, name, model, status, errText, ob
 		"workflow": tracestore.SessionWorkflowLabel,
 		"status":   status, // "completed" | "failed" —— 页面的 StatusDot 按这两个字面量判色
 		"team":     name,   // 页面按 team 分组, 与 workflow 是两个维度
+	}
+	// agent 身份独立于显示名: 调用方可以用 --run-label 起一个任务名 (如 coder:<任务>),
+	// 此时从 name 推不出 agent。页面「按 Agent」维度优先读这个键, 读不到才回落
+	// `agent:<名>` 标签 (兼容历史数据)。空串不写键 —— 与 model 同一纪律。
+	if agent != "" {
+		attrs["agent"] = agent
 	}
 	// model 为空时不写这个键而不是写空串: 空串与"模型就是空"在读数上不可分
 	// (同 session_trace.go:114)。
@@ -5032,7 +5038,9 @@ func runAsAgent(cmd *cobra.Command, eng *engine.QueryEngine, userPrompt string, 
 		if errKind != "" {
 			status = tracestore.RunStatusFailed
 		}
-		recordRunSpan(eng.TraceStore, runID, name, eng.Config.Model, status, errKind, userPrompt, start)
+		// agent 与显示名分开传: 调用方显式给了 --run-label 时 name 是任务名
+		// (coder:<任务>), 从它推不出 agent; 而这一整个分支就是 --agent 直跑。
+		recordRunSpan(eng.TraceStore, runID, name, spec.Name, eng.Config.Model, status, errKind, userPrompt, start)
 	}()
 
 	// 轨迹页要按 agent 名检索: 调用方没给 --run-label 时自动填, 与 coder 的
