@@ -4,11 +4,13 @@ package search
 //
 // 抓取前先做 URL 校验 (只允许 http/https, 解析 DNS 后拒绝私网/环回/链路本地
 // 地址), 防止 WebFetch 被当成 SSRF 跳板; 响应按 Content-Type 选择 HTML 抽取
-// 或纯文本, 字符集从 header/meta 探测后转 UTF-8, 最终按 maxChars 截断。
+// 或纯文本, 字符集从 header/meta 探测后转 UTF-8。网络层保留规范化全文，
+// prompt 选段、max_content_tokens 和 offset 截断统一在缓存之后执行。
 //
 // HTML 抽取不引第三方 DOM 依赖, 用一个小型容错解析器挑正文根节点, 再转成
 // 带标题/列表/链接的 Markdown; 解析失败时退回原始文本而不是报错。
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,85 +48,122 @@ var resolveIPs = net.LookupIP
 // 注意: 重定向逐跳校验也走同一个入口。
 var urlGuard = validateFetchURL
 
-// Fetch 抓取并提取一个 URL 的正文。
+// Fetch 抓取一个 URL，并缓存规范化全文。
 //
-// 流程: SSRF 校验 -> 直连 F1 -> 失败且配置了代理时用代理再试一次。
-// 只有 GET 幂等请求, 因此重试是安全的。返回值中的 Document.Via 固定
-// 为 "http", 正文经过 readability-lite 提取并按 MaxChars 截断。
+// 网络层仍执行初始 URL 与每跳重定向的 SSRF 校验、5MB 上限和出口降级；
+// prompt 选段、token 预算和 continuation 都在全文缓存之后执行，避免同一页面
+// 因不同问题重复打源。临时故障可复用过期全文，但必须显式标记 stale。
 func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (*FetchResponse, error) {
 	start := time.Now()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, Wrap("", classifyError(err), err)
+	}
 	if m.isClosed() {
 		return nil, Wrap("", ErrUnavailable, errors.New("search manager closed"))
+	}
+	if err := validateFetchRequest(req); err != nil {
+		return nil, err
 	}
 
 	u, err := urlGuard(req.URL)
 	if err != nil {
 		return nil, err
 	}
-	maxChars := req.MaxChars
-	if maxChars <= 0 {
-		maxChars = defaultFetchChars
-	}
-
-	deadline := req.Deadline
-	if deadline.IsZero() {
-		timeout := m.cfg.FetchTimeout
-		if timeout <= 0 {
-			timeout = 8 * time.Second
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	key := fetchCacheKey(u.String())
+	cached, cacheHit, cacheDegraded := m.cachedDocument(ctx, key)
+	if cacheHit {
+		doc, degraded, err := prepareDocument(cached, req)
+		if err != nil {
+			return nil, err
 		}
-		deadline = time.Now().Add(timeout)
-	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
-	defer cancel()
-
-	modes := []Mode{ModeDirect}
-	if m.egress != nil && m.egress.HasProxy() {
-		modes = append(modes, ModeProxy)
+		doc.CacheHit = true
+		return &FetchResponse{Document: doc, Degraded: degraded, ElapsedMS: time.Since(start).Milliseconds()}, nil
 	}
 
-	var lastErr error
-	var doc *Document
-	for i, mode := range modes {
-		if err := ctx.Err(); err != nil {
-			if lastErr == nil {
-				lastErr = Wrap("fetch", classifyError(err), err)
+	result, err, shared := m.fetchFlight.Do(ctx, key, func() (fetchFlightResult, error) {
+		cached, ok, flightDegraded := m.cachedDocument(ctx, key)
+		if ok {
+			return fetchFlightResult{doc: cached, cacheHit: true}, nil
+		}
+		deadline := req.Deadline
+		if deadline.IsZero() {
+			timeout := m.cfg.FetchTimeout
+			if timeout <= 0 {
+				timeout = 8 * time.Second
 			}
-			break
+			deadline = time.Now().Add(timeout)
 		}
-		client := m.egress.Client(mode)
-		m.metrics.Inc("egress_requests_total", map[string]string{
-			"provider": "fetch",
-			"egress":   string(mode),
-		})
-		doc, err = m.fetchWithClient(ctx, client, u, maxChars)
-		if err == nil {
-			if i > 0 {
-				m.metrics.Inc("egress_fallback_total", map[string]string{
-					"from": "direct", "to": "proxy", "reason": "error",
-				})
-			}
-			break
-		}
-		lastErr = err
-		// 输入非法 (SSRF/协议) 不因换出口而改变, 直接结束。
-		if KindOf(err) == ErrInvalid {
-			break
-		}
-	}
+		fctx, cancel := context.WithDeadline(ctx, deadline)
+		defer cancel()
 
-	resp := &FetchResponse{Document: doc, ElapsedMS: time.Since(start).Milliseconds()}
-	if doc == nil {
-		return resp, lastErr
+		modes := []Mode{ModeDirect}
+		if m.egress != nil && m.egress.HasProxy() {
+			modes = append(modes, ModeProxy)
+		}
+		var lastErr error
+		var doc *Document
+		for i, mode := range modes {
+			if err := fctx.Err(); err != nil {
+				if lastErr == nil {
+					lastErr = Wrap("fetch", classifyError(err), err)
+				}
+				break
+			}
+			client := m.egress.Client(mode)
+			m.metrics.Inc("egress_requests_total", map[string]string{"provider": "fetch", "egress": string(mode)})
+			doc, err = m.fetchWithClient(fctx, client, u)
+			if err == nil {
+				if i > 0 {
+					m.metrics.Inc("egress_fallback_total", map[string]string{"from": "direct", "to": "proxy", "reason": "error"})
+				}
+				break
+			}
+			lastErr = err
+			if KindOf(err) == ErrInvalid {
+				break
+			}
+		}
+		if doc == nil {
+			// 只对临时故障使用 stale；SSRF、协议、403 和内容类型错误绝不绕过。
+			switch KindOf(lastErr) {
+			case ErrTimeout, ErrUnavailable, ErrRateLimited:
+				// 网络超时后 fctx 已取消，但 stale 读取是受 Redis 客户端超时
+				// 约束的独立短操作，不能因为原请求超时而失去降级机会。
+				stale, ok, degraded := m.staleDocument(context.WithoutCancel(fctx), key)
+				flightDegraded = append(flightDegraded, degraded...)
+				if ok {
+					stale.Stale = true
+					return fetchFlightResult{
+						doc: stale, cacheHit: true,
+						degraded: append(flightDegraded, "stale_if_error:"+string(KindOf(lastErr))),
+					}, nil
+				}
+			}
+			return fetchFlightResult{}, lastErr
+		}
+		flightDegraded = append(flightDegraded, m.putDocumentCache(fctx, key, doc, m.cfg.CacheTTL)...)
+		m.metrics.Inc("fetch_success_total", map[string]string{"via": doc.Via})
+		return fetchFlightResult{doc: doc, degraded: flightDegraded}, nil
+	})
+	if err != nil {
+		return &FetchResponse{ElapsedMS: time.Since(start).Milliseconds()}, err
 	}
-	m.metrics.Inc("fetch_success_total", map[string]string{"via": doc.Via})
-	return resp, nil
+	doc, degraded, err := prepareDocument(result.doc, req)
+	if err != nil {
+		return nil, err
+	}
+	doc.CacheHit = result.cacheHit || shared
+	degraded = append(degraded, cacheDegraded...)
+	degraded = append(degraded, result.degraded...)
+	return &FetchResponse{Document: doc, Degraded: dedupeStrings(degraded), ElapsedMS: time.Since(start).Milliseconds()}, nil
 }
 
 // fetchWithClient 用指定客户端执行一次抓取与正文提取。
-func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *url.URL, maxChars int) (*Document, error) {
+func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *url.URL) (*Document, error) {
 	c := *client
 	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= maxRedirects {
@@ -139,7 +178,7 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 		return nil, Wrap("fetch", ErrInvalid, err)
 	}
 	req.Header.Set("User-Agent", m.cfg.UserAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.1")
 
 	resp, err := c.Do(req)
 	if err != nil {
@@ -161,6 +200,11 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 	}
 
 	mediaType, params := parseMediaType(resp.Header.Get("Content-Type"))
+	// PDF 必须先于 NUL/字符集处理分流。部分服务器把 PDF 错标为
+	// application/octet-stream，因此同时接受 Content-Type 与文件 magic。
+	if mediaType == "application/pdf" || bytes.HasPrefix(body, []byte("%PDF-")) {
+		return ExtractPDF(ctx, resp.Request.URL.String(), body)
+	}
 	charset := params["charset"]
 	if charset == "" {
 		charset = detectMetaCharset(body)
@@ -185,6 +229,11 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 		}
 		page := extractHTML(text)
 		title, byline, published, markdown = page.Title, page.Byline, page.Published, page.Markdown
+		if needsJSRender(text, markdown) {
+			// 静态响应已经完成逐跳 SSRF 校验；渲染从最终 URL 开始，并沿用
+			// 本次选定的 direct/proxy client，而不是另开一条隐式直连。
+			return m.renderJS(ctx, client, resp.Request.URL.String())
+		}
 	case "text/plain", "text/markdown":
 		markdown = normalizeMarkdown(text)
 		title = firstLine(markdown)
@@ -192,7 +241,7 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 		return nil, Wrap("fetch", ErrUnsupported, fmt.Errorf("unsupported content type %q", mediaType))
 	}
 
-	markdown, truncated := truncateRunes(strings.TrimSpace(markdown), maxChars)
+	markdown = strings.TrimSpace(markdown)
 	doc := &Document{
 		URL:       resp.Request.URL.String(),
 		Title:     title,
@@ -201,7 +250,6 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 		Published: published,
 		FetchedAt: time.Now(),
 		Hash:      hashDocument(markdown),
-		Truncated: truncated,
 		Via:       "http",
 	}
 	return doc, nil
@@ -283,6 +331,9 @@ func statusKind(code int) ErrorKind {
 		return ErrRateLimited
 	case code == http.StatusRequestTimeout || code == http.StatusGatewayTimeout:
 		return ErrTimeout
+	case code >= 400 && code < 500:
+		// 其它 4xx 是永久性的目标/权限/资源错误，不允许用旧缓存伪装本次成功。
+		return ErrInvalid
 	default:
 		return ErrUnavailable
 	}

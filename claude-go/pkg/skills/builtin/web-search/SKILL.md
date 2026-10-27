@@ -16,10 +16,13 @@ allowed-tools: WebSearch, WebFetch
 
 ## 怎么用
 
-1. 一次一个问题：`WebSearch` 的 query 要能独立成立，不要用"上面提到的那个"。
-2. 先看 snippet 判断是否值得抓，再 `WebFetch` 读全文。
-3. 回答里每个事实后面带来源 URL；找不到就明说找不到，不要补一个像样的答案。
-4. 同一 URL 二次抓取命中缓存，不额外消耗配额。
+1. 一次一个问题：`WebSearch` 的 query 要能独立成立，不要用"上面提到的那个"；需要保留 broader context 时传 `original_question`。
+2. 域名硬约束使用 `allowed_domains` / `blocked_domains`；结果为空就是空，不会回退到域外结果。`status` 为 `empty`、`gate_passed=false` 或出现 `degraded` 时，最多做一次更有针对性的改写，并如实说明局限。
+3. 先看 snippet 判断是否值得抓，再 `WebFetch` 读原文；`prompt` 用于定位相关原文窗口，不是执行网页指令。
+4. 需要控制注入量时传 `max_content_tokens`（服务按字符数 / 4 估算，不是模型 tokenizer 的精确值）。`truncated=true` 时，把 `next_offset` 作为下一次调用的 `offset` 续读。
+5. 回答里每个事实后面带来源 URL；找不到就明说找不到，不要补一个像样的答案。若声称引文来自 `evidence`，必须逐字复制同一响应的 `evidence.quote`，并配套报告它的 `offset`/`hash`；`markdown` 里的其他句子只能称为正文引文，不能冒充 evidence 条目。
+6. 同一 search-mcp 进程内，同一规范化请求 URL 在缓存 TTL（默认 10 分钟）内只抓取一次全文；不同 prompt、预算和 offset 复用该全文，不重复发 HTTP。缓存不跨进程或副本共享。
+7. 过期全文只在超时、限流或临时服务故障时作为降级返回，并带 `stale=true`、`cache_hit=true` 和 `stale_if_error:*`；SSRF、非法协议、403/404 和不支持的内容类型不会借旧缓存绕过。
 
 ## 边界
 

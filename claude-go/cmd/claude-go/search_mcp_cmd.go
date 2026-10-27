@@ -42,6 +42,7 @@ func searchMCPServerCmd() *cobra.Command {
   SEARCH_PROXY_URL    出口代理, 例如 http://host:8888
   SEARCH_NO_PROXY     逗号分隔的直连名单
   SEARCH_MAX_TIER     L0..L3, 默认 L2 (L3 付费默认不可达)
+  SEARCH_MCP_MAX_USES 每个 MCP 会话 WebSearch+WebFetch 总调用上限, 默认 0 (不限)
   CLAUDE_GO_DATA_DISABLED=1  关闭数据面 (本命令将报错退出)
 
 Claude Desktop / Cursor 配置:
@@ -51,7 +52,14 @@ Claude Desktop / Cursor 配置:
 			if data == nil {
 				return fmt.Errorf("搜索数据面未装配: 检查 SEARCH_PROXY_URL 是否合法, 或 CLAUDE_GO_DATA_DISABLED 是否被设为 1")
 			}
-			srv := searchmcp.New(data)
+			maxUses, err := searchmcp.MaxUsesFromEnv()
+			if err != nil {
+				return err
+			}
+			srv, err := searchmcp.NewWithMaxUses(data, maxUses)
+			if err != nil {
+				return err
+			}
 			if srv == nil {
 				return fmt.Errorf("搜索数据面不完整 (缺少 search 或 market 注册表)")
 			}

@@ -1,0 +1,74 @@
+# search-redis —— claude-go 检索缓存与共享付费预算专用实例。
+# 只监听 agents 命名空间内 ClusterIP；不要复用 hakit 业务 Redis，也不要暴露 NodePort。
+# AOF 持久化预算账本；noeviction 防止内存压力静默驱逐账本（此时付费调用 fail-closed）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: search-redis-data
+  labels: { app: search-redis }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests: { storage: 1Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-redis
+  labels: { app: search-redis }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: search-redis }
+  template:
+    metadata:
+      labels: { app: search-redis }
+    spec:
+      securityContext: { runAsUser: 999, runAsGroup: 999, fsGroup: 999 }
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - always
+            - --save
+            - ""
+            - --dir
+            - /data
+            - --maxmemory
+            - 256mb
+            - --maxmemory-policy
+            - noeviction
+          ports:
+            - { name: redis, containerPort: 6379 }
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 384Mi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: search-redis-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-redis
+  labels: { app: search-redis }
+spec:
+  type: ClusterIP
+  selector: { app: search-redis }
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }

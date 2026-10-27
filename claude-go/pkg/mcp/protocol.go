@@ -47,18 +47,20 @@ const (
 	HeaderMessageType     = "Mcp-Message-Type"
 	HeaderParamPrefix     = "Mcp-Param-"
 	HeaderBackend         = "X-Claude-Go-Backend"
+	// HeaderSession 兼容 2024/2025 有状态服务及 search-mcp 的可选预算会话。
+	HeaderSession = "Mcp-Session-Id"
 )
 
 // JSON-RPC 2.0 错误码。
 const (
-	ErrorParse                          = -32700
-	ErrorInvalidRequest                 = -32600
-	ErrorMethodNotFound                 = -32601
-	ErrorInvalidParams                  = -32602
-	ErrorInternal                       = -32603
-	ErrorUnsupportedProtocolVersion     = -32002
+	ErrorParse                           = -32700
+	ErrorInvalidRequest                  = -32600
+	ErrorMethodNotFound                  = -32601
+	ErrorInvalidParams                   = -32602
+	ErrorInternal                        = -32603
+	ErrorUnsupportedProtocolVersion      = -32002
 	ErrorMissingRequiredClientCapability = -32003
-	ErrorUnknownTool                    = -32004
+	ErrorUnknownTool                     = -32004
 )
 
 // MetaInfo 从请求 _meta / 请求头提取的协议元数据。
@@ -148,9 +150,9 @@ func WithMetaParams(params map[string]interface{}, version, clientName, clientVe
 // ConsistentHash 一致性哈希环：同一会话键恒映射到同一后端，不同会话键均匀散开。
 // 用虚拟节点稀释热区；后端增减时仅影响相邻节点的映射，具备最小迁移。
 type ConsistentHash struct {
-	ring    []int            // 排序后的哈希值列表
-	lookup  map[int]string   // 哈希值 → 后端
-	virtual int              // 每个物理后端虚拟节点数
+	ring    []int          // 排序后的哈希值列表
+	lookup  map[int]string // 哈希值 → 后端
+	virtual int            // 每个物理后端虚拟节点数
 }
 
 // NewConsistentHash 创建一致性哈希环。virtual<=0 时用默认 128。

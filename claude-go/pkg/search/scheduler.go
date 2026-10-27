@@ -20,6 +20,7 @@ type sourceResult struct {
 	results []Result
 	err     error
 	elapsed time.Duration
+	cost    float64
 }
 
 // scheduleSearch 执行主源 + 对冲源的调度。
@@ -150,6 +151,7 @@ func (m *Manager) callSource(ctx context.Context, p Provider, req SearchRequest)
 	type callOut struct {
 		results []Result
 		err     error
+		cost    float64
 	}
 	done := make(chan callOut, 1)
 	go func() {
@@ -158,8 +160,8 @@ func (m *Manager) callSource(ctx context.Context, p Provider, req SearchRequest)
 				done <- callOut{err: Wrap(name, ErrUnavailable, errPanic{r})}
 			}
 		}()
-		results, err := p.Search(cctx, req)
-		done <- callOut{results: results, err: err}
+		results, cost, err := m.callProviderWithBudget(cctx, p, req)
+		done <- callOut{results: results, cost: cost, err: err}
 	}()
 
 	var out callOut
@@ -179,11 +181,17 @@ func (m *Manager) callSource(ctx context.Context, p Provider, req SearchRequest)
 
 	if out.err != nil {
 		kind := classifyError(out.err)
-		m.quota.recordError(name, kind, time.Now())
-		m.metrics.Inc("provider_errors_total", map[string]string{
-			"provider":    name,
-			"error_class": string(kind),
-		})
+		if isSharedBudgetError(out.err) {
+			m.metrics.Inc("shared_budget_errors_total", map[string]string{
+				"provider": name, "error_class": string(kind),
+			})
+		} else {
+			m.quota.recordError(name, kind, time.Now())
+			m.metrics.Inc("provider_errors_total", map[string]string{
+				"provider":    name,
+				"error_class": string(kind),
+			})
+		}
 		result.err = out.err
 		return result
 	}
@@ -201,6 +209,7 @@ func (m *Manager) callSource(ctx context.Context, p Provider, req SearchRequest)
 	}
 	m.quota.recordSuccess(name)
 	result.results = results
+	result.cost = out.cost
 	return result
 }
 

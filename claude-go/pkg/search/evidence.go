@@ -8,6 +8,7 @@ package search
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -34,7 +35,7 @@ func NewEvidenceLedger() *EvidenceLedger {
 // Add 校验并加入一条逐字证据。
 //
 // quote 必须非空且是 doc.Markdown 的连续子串; 成功时 Offset 指向首次
-// 出现位置, Hash 取文档规范化正文哈希, FetchedAt 取文档抓取时间。
+// 出现位置（以 doc.Offset 为起点的 Unicode rune 索引）, Hash 取文档规范化正文哈希, FetchedAt 取文档抓取时间。
 func (l *EvidenceLedger) Add(doc *Document, quote string) (Evidence, bool) {
 	if l == nil || doc == nil {
 		return Evidence{}, false
@@ -43,10 +44,11 @@ func (l *EvidenceLedger) Add(doc *Document, quote string) (Evidence, bool) {
 	if quote == "" {
 		return Evidence{}, false
 	}
-	offset := strings.Index(doc.Markdown, quote)
-	if offset < 0 {
+	byteOffset := strings.Index(doc.Markdown, quote)
+	if byteOffset < 0 {
 		return Evidence{}, false
 	}
+	offset := doc.Offset + utf8.RuneCountInString(doc.Markdown[:byteOffset])
 	key := doc.URL + "\x00" + quote
 	if _, ok := l.seen[key]; ok {
 		return Evidence{}, false
@@ -103,26 +105,56 @@ func (l *EvidenceLedger) Len() int {
 
 // bestSentence 返回命中关键词最多的完整句子; 无命中返回空串。
 func bestSentence(text string, keywords []string) string {
-	best := ""
-	bestHits := 0
-	for _, span := range sentenceSpans(text) {
-		sentence := text[span.start:span.end]
-		hits := keywordHits(sentence, keywords)
-		if hits == 0 {
-			continue
-		}
-		if hits > bestHits || (hits == bestHits && best == "") {
-			best = sentence
-			bestHits = hits
-		}
-	}
-	if best == "" {
+	quotes := bestSentences(text, keywords, 1)
+	if len(quotes) == 0 {
 		return ""
 	}
-	if utf8.RuneCountInString(best) > maxEvidenceQuoteRunes {
-		best, _ = truncateRunes(best, maxEvidenceQuoteRunes)
+	return quotes[0]
+}
+
+// bestSentences 返回最多 limit 条高分句子。评分时保持原文顺序作为平局依据，
+// 选出后再恢复文档顺序，让 Evidence ID 与 Offset 稳定且易于模型核对。
+func bestSentences(text string, keywords []string, limit int) []string {
+	if limit <= 0 {
+		return nil
 	}
-	return strings.TrimSpace(best)
+	type candidate struct {
+		span sentenceSpan
+		hits int
+	}
+	var candidates []candidate
+	seen := make(map[string]struct{})
+	for _, span := range sentenceSpans(text) {
+		sentence := text[span.start:span.end]
+		if _, duplicate := seen[sentence]; duplicate {
+			continue
+		}
+		seen[sentence] = struct{}{}
+		hits := keywordHits(sentence, keywords)
+		if hits > 0 {
+			candidates = append(candidates, candidate{span: span, hits: hits})
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].hits > candidates[j].hits
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].span.start < candidates[j].span.start
+	})
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		quote := text[candidate.span.start:candidate.span.end]
+		if utf8.RuneCountInString(quote) > maxEvidenceQuoteRunes {
+			quote, _ = truncateRunes(quote, maxEvidenceQuoteRunes)
+		}
+		if quote = strings.TrimSpace(quote); quote != "" {
+			out = append(out, quote)
+		}
+	}
+	return out
 }
 
 // keywordHits 统计句子命中的不同关键词数量。

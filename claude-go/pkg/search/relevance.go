@@ -14,6 +14,7 @@
 package search
 
 import (
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -46,6 +47,71 @@ func FilterRelevant(results []Result, query string) []Result {
 		}
 	}
 	return kept
+}
+
+// rerankResults 在 RRF 后使用原始问题做保守的词面重排。
+//
+// 只有显式提供 OriginalQuestion 才启用，避免改变普通搜索的 provider 排名。
+// 原始问题和搜索式是同一意图的两种表达，分别算覆盖并取较高值；否则中文
+// 原始问题会稀释英文搜索式在英文文档上的有效增益。RRF 仍是基础分。
+func rerankResults(results []Result, req SearchRequest) []Result {
+	if strings.TrimSpace(req.OriginalQuestion) == "" || len(results) < 2 {
+		return results
+	}
+	queryTokens := rerankContentTokens(req.Query)
+	questionTokens := rerankContentTokens(req.OriginalQuestion)
+	if len(queryTokens)+len(questionTokens) == 0 {
+		return results
+	}
+	out := append([]Result(nil), results...)
+	for i := range out {
+		hay := strings.ToLower(out[i].Title + " " + out[i].Snippet + " " + out[i].URL)
+		title := strings.ToLower(out[i].Title)
+		queryCoverage, queryTitle := lexicalCoverage(hay, title, queryTokens)
+		questionCoverage, questionTitle := lexicalCoverage(hay, title, questionTokens)
+		coverage := max(queryCoverage, questionCoverage)
+		titleCoverage := max(queryTitle, questionTitle)
+		out[i].Score *= 1 + 1.5*coverage + 0.5*titleCoverage
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Score != out[j].Score {
+			return out[i].Score > out[j].Score
+		}
+		if out[i].Rank != out[j].Rank {
+			return out[i].Rank < out[j].Rank
+		}
+		return out[i].URL < out[j].URL
+	})
+	for i := range out {
+		out[i].Rank = i + 1
+	}
+	return out
+}
+
+// rerankContentTokens 去掉来源限定词，保留真正的主题词。
+// 否则 "official documentation" 会让官网首页凭标题赢过更具体的控制器页面。
+func rerankContentTokens(text string) map[string]struct{} {
+	tokens := contentTokens(text)
+	for _, qualifier := range []string{"official", "documentation", "docs", "doc"} {
+		delete(tokens, qualifier)
+	}
+	return tokens
+}
+
+func lexicalCoverage(hay, title string, tokens map[string]struct{}) (coverage, titleCoverage float64) {
+	if len(tokens) == 0 {
+		return 0, 0
+	}
+	matched, titleMatched := 0, 0
+	for token := range tokens {
+		if strings.Contains(hay, token) {
+			matched++
+		}
+		if strings.Contains(title, token) {
+			titleMatched++
+		}
+	}
+	return float64(matched) / float64(len(tokens)), float64(titleMatched) / float64(len(tokens))
 }
 
 // contentTokens 抽取查询里的内容词。
@@ -129,7 +195,8 @@ var stopwords = map[string]struct{}{
 	"as": {}, "is": {}, "are": {}, "was": {}, "were": {}, "be": {}, "been": {},
 	"it": {}, "its": {}, "this": {}, "that": {}, "these": {}, "those": {},
 	"what": {}, "how": {}, "which": {}, "who": {}, "when": {}, "where": {},
-	"latest": {}, "new": {}, "news": {}, "update": {}, "updates": {},
+	"according": {},
+	"latest":    {}, "new": {}, "news": {}, "update": {}, "updates": {},
 	"的": {}, "了": {}, "与": {}, "和": {}, "及": {}, "在": {}, "是": {},
 	"有": {}, "对": {}, "为": {}, "从": {}, "到": {}, "中": {},
 	"最新": {}, "什么": {}, "如何": {}, "哪些": {}, "怎么": {},

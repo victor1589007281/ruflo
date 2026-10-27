@@ -10,6 +10,7 @@ package search
 // 这里刻意不读 HTTP_PROXY/HTTPS_PROXY: 宿主环境的代理变量会与"按 provider
 // 钉死出口"互相污染, 出口只认 SEARCH_PROXY_URL。
 import (
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -69,6 +70,20 @@ type Config struct {
 	CacheFreshTTL   time.Duration
 	CacheMaxEntries int
 
+	// RedisURL 非空才启用跨 Manager 缓存。KeyPrefix 必须由同一组副本共享；
+	// StaleTTL 是 fresh TTL 之后额外保留全文的时间，不影响正常命中判据。
+	RedisURL       string
+	RedisKeyPrefix string
+	RedisTimeout   time.Duration
+	RedisStaleTTL  time.Duration
+
+	// SharedBudget* 是独立于 MaxCostUSD 的跨副本付费总量预算。Limit=0
+	// 关闭共享预算；开启后付费源必须经 Redis 原子预占，故障时 fail-closed。
+	// ReservationTTL 只清理未知结局的 reservation 元数据，不提前释放窗口额度。
+	SharedBudgetLimitUSD       float64
+	SharedBudgetWindow         time.Duration
+	SharedBudgetReservationTTL time.Duration
+
 	// Providers 以名字为键。未出现的 provider 使用其构造时的默认值。
 	Providers map[string]ProviderConfig
 }
@@ -83,6 +98,10 @@ type ProviderConfig struct {
 	Tier     Tier
 	Timeout  time.Duration
 	Disabled bool
+
+	// CostEstimateUSD 是每次真实 Search 调用前的预占估算，不是实际成本；
+	// 实际成本由 SearchCostReporter 或 Result.Cost 在完成时结算。
+	CostEstimateUSD float64
 }
 
 // EgressConfig 是出口配置。
@@ -103,16 +122,21 @@ type EgressConfig struct {
 // 付费层默认不可达。
 func DefaultConfig() Config {
 	return Config{
-		MaxTier:         TierL2,
-		MaxCostUSD:      0,
-		DefaultLimit:    8,
-		UserAgent:       "claude-go-search/1.0 (+https://github.com/victor1589007281/ruflo)",
-		SearchTimeout:   4 * time.Second,
-		FetchTimeout:    8 * time.Second,
-		HedgeDelay:      400 * time.Millisecond,
-		CacheTTL:        10 * time.Minute,
-		CacheFreshTTL:   60 * time.Second,
-		CacheMaxEntries: 5000,
+		MaxTier:                    TierL2,
+		MaxCostUSD:                 0,
+		DefaultLimit:               8,
+		UserAgent:                  "claude-go-search/1.0 (+https://github.com/victor1589007281/ruflo)",
+		SearchTimeout:              4 * time.Second,
+		FetchTimeout:               8 * time.Second,
+		HedgeDelay:                 400 * time.Millisecond,
+		CacheTTL:                   10 * time.Minute,
+		CacheFreshTTL:              60 * time.Second,
+		CacheMaxEntries:            5000,
+		RedisKeyPrefix:             defaultRedisKeyPrefix,
+		RedisTimeout:               defaultRedisTimeout,
+		RedisStaleTTL:              defaultRedisStaleTTL,
+		SharedBudgetWindow:         defaultSharedBudgetWindow,
+		SharedBudgetReservationTTL: defaultSharedBudgetReservationTTL,
 		Egress: EgressConfig{
 			Mode:          ModeAuto,
 			ProxyURL:      "",
@@ -135,6 +159,11 @@ func DefaultConfig() Config {
 //	SEARCH_MAX_TIER(L0..L3) / SEARCH_MAX_COST_USD
 //	SEARCH_TIMEOUT / SEARCH_FETCH_TIMEOUT / SEARCH_HEDGE_DELAY
 //	SEARCH_CACHE_TTL / SEARCH_CACHE_ENTRIES
+//	SEARCH_REDIS_URL / SEARCH_REDIS_KEY_PREFIX / SEARCH_REDIS_TIMEOUT
+//	SEARCH_REDIS_STALE_TTL (fresh 过期后额外保留全文，供临时故障降级)
+//	SEARCH_SHARED_BUDGET_LIMIT_USD / SEARCH_SHARED_BUDGET_WINDOW
+//	SEARCH_SHARED_BUDGET_RESERVATION_TTL
+//	SEARCH_PROVIDER_COST_ESTIMATES_USD (例: exa=0.01,tavily=0.005)
 //	PARALLEL_URL / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / JINA_API_KEY
 //	GITHUB_TOKEN (仅兼容旧部署; config.json 的 search.githubToken 优先)
 //
@@ -175,6 +204,19 @@ func LoadConfig() Config {
 			cfg.CacheMaxEntries = n
 		}
 	}
+	cfg.RedisURL = strings.TrimSpace(os.Getenv("SEARCH_REDIS_URL"))
+	if v := strings.TrimSpace(os.Getenv("SEARCH_REDIS_KEY_PREFIX")); v != "" {
+		cfg.RedisKeyPrefix = v
+	}
+	cfg.RedisTimeout = durationEnv("SEARCH_REDIS_TIMEOUT", cfg.RedisTimeout)
+	cfg.RedisStaleTTL = durationEnv("SEARCH_REDIS_STALE_TTL", cfg.RedisStaleTTL)
+	if v := os.Getenv("SEARCH_SHARED_BUDGET_LIMIT_USD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			cfg.SharedBudgetLimitUSD = f
+		}
+	}
+	cfg.SharedBudgetWindow = durationEnv("SEARCH_SHARED_BUDGET_WINDOW", cfg.SharedBudgetWindow)
+	cfg.SharedBudgetReservationTTL = durationEnv("SEARCH_SHARED_BUDGET_RESERVATION_TTL", cfg.SharedBudgetReservationTTL)
 
 	// 常用 provider 的最小配置; 未启用 key 的源由构造器跳过。
 	cfg.Providers["parallel"] = ProviderConfig{
@@ -226,7 +268,27 @@ func LoadConfig() Config {
 		p.APIKey = v
 		cfg.Providers["github"] = p
 	}
+	loadProviderCostEstimates(&cfg, os.Getenv("SEARCH_PROVIDER_COST_ESTIMATES_USD"))
 	return cfg
+}
+
+// loadProviderCostEstimates 只设置预占估算，不改变 provider 的启用状态。
+// 未出现过的自定义源按既有缺省语义视为启用；非法金额忽略并保持零成本。
+func loadProviderCostEstimates(cfg *Config, raw string) {
+	for _, item := range splitList(raw) {
+		name, value, ok := strings.Cut(item, "=")
+		name = strings.TrimSpace(name)
+		cost, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if !ok || name == "" || err != nil || cost < 0 || math.IsNaN(cost) || math.IsInf(cost, 0) {
+			continue
+		}
+		p, exists := cfg.Providers[name]
+		if !exists {
+			p.Enabled = true
+		}
+		p.CostEstimateUSD = cost
+		cfg.Providers[name] = p
+	}
 }
 
 // parseTier 解析 L0..L3; 非法值回落到 L2。

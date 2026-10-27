@@ -175,6 +175,27 @@ func TestMCPJSONSearch(t *testing.T) {
 	}
 }
 
+func TestMCPSearchAddsDomainHints(t *testing.T) {
+	m := &mcpTestServer{
+		t: t, mode: "json", tools: []string{"web_search"},
+		text: `[{"title":"Docs","url":"https://kubernetes.io/docs/home","snippet":"official"}]`,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(m.handler))
+	defer srv.Close()
+	p := newTestMCP(t, srv)
+	if _, err := p.Search(context.Background(), search.SearchRequest{
+		Query: "Kubernetes docs", Limit: 1,
+		AllowedDomains: []string{"kubernetes.io"}, BlockedDomains: []string{"example.com"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.callArgs) != 1 || m.callArgs[0]["query"] != "Kubernetes docs site:kubernetes.io -site:example.com" {
+		t.Fatalf("domain constraints did not reach provider request: %+v", m.callArgs)
+	}
+}
+
 // TestMCPSSEAndArgumentFallback 覆盖 SSE 响应与 numResults 被拒后的参数回退。
 func TestMCPSSEAndArgumentFallback(t *testing.T) {
 	m := &mcpTestServer{

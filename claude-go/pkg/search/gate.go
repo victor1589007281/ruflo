@@ -20,6 +20,7 @@ import (
 // 指标只用于判断"够不够用", 不参与排序; 排序由 RRF 负责。
 type Quality struct {
 	Domains        int     // 独立域名数
+	DomainScoped   bool    // 调用方显式限定 allowed_domains，域名多样性门不适用
 	HasSnippet     bool    // 是否至少有一条片段
 	FreshRatio     float64 // 已发布时间落在时效窗口内的比例
 	LangMatch      float64 // 语言与请求匹配的比例
@@ -41,7 +42,7 @@ type Quality struct {
 // 域名例外: 官方/一手来源占 >=80% 时, 单域名也视为达标。判据不是"域名少就放行"
 // —— 3 条来自同一个博客仍然失败 (见 IsAuthoritativeDomain)。
 func (q Quality) Pass(freshnessRequired bool) bool {
-	return (q.Domains >= 3 || q.AuthoritativeRatio >= 0.8) &&
+	return (q.DomainScoped || q.Domains >= 3 || q.AuthoritativeRatio >= 0.8) &&
 		q.HasSnippet &&
 		q.LangMatch >= 0.6 &&
 		q.DuplicateRatio <= 0.5 &&
@@ -58,7 +59,7 @@ func EvaluateQuality(results []Result, req SearchRequest) Quality {
 
 // evaluateQualityAt 是可注入 now 的实现, 便于测试时效指标。
 func evaluateQualityAt(results []Result, req SearchRequest, now time.Time) Quality {
-	q := Quality{LangMatch: 1}
+	q := Quality{LangMatch: 1, DomainScoped: len(req.AllowedDomains) > 0}
 	if len(results) == 0 {
 		q.LangMatch = 0
 		return q
@@ -286,7 +287,7 @@ func detectLanguage(s string) string {
 // gateReason 返回质量门失败原因, 通过时返回 "pass"。
 func (q Quality) gateReason(freshness bool) string {
 	switch {
-	case q.Domains < 3 && q.AuthoritativeRatio < 0.8:
+	case !q.DomainScoped && q.Domains < 3 && q.AuthoritativeRatio < 0.8:
 		return "domains"
 	case !q.HasSnippet:
 		return "snippet"

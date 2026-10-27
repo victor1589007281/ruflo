@@ -49,7 +49,7 @@ type ServerConfig struct {
 	Command   string            `json:"command,omitempty"`
 	Args      []string          `json:"args,omitempty"`
 	URL       string            `json:"url,omitempty"`
-	URLs      []string          `json:"urls,omitempty"` // 多后端列表（HTTP，优先于 URL）
+	URLs      []string          `json:"urls,omitempty"`      // 多后端列表（HTTP，优先于 URL）
 	StickyKey string            `json:"stickyKey,omitempty"` // 会话粘性键；空则按连接生成
 	Env       map[string]string `json:"env,omitempty"`
 }
@@ -67,10 +67,12 @@ type Connection struct {
 	nextID     atomic.Int64
 
 	// 2026-07-28 无状态协议 + 多后端粘性负载均衡。
-	protocolVersion string            // 协商后的协议版本
-	backends        []string          // HTTP 后端基址列表
-	ring            *ConsistentHash   // 一致性哈希环（会话粘性）
-	stickyKey       string            // 连接级默认粘性键
+	protocolVersion string // 协商后的协议版本
+	sessionID       string // 可选 Mcp-Session-Id；非空时回传并固定签发后端
+	sessionBackend  string
+	backends        []string        // HTTP 后端基址列表
+	ring            *ConsistentHash // 一致性哈希环（会话粘性）
+	stickyKey       string          // 连接级默认粘性键
 
 	// 多后端诊断: 记录最近一次 HTTP 请求实际落到的后端基址与服务端 Pod host
 	// （X-Claude-Go-Backend 响应头）。用于多实例部署下验证会话粘性/负载分布。
@@ -371,8 +373,8 @@ func (conn *Connection) discover(ctx context.Context) error {
 		return err
 	}
 	var d struct {
-		ProtocolVersion    string   `json:"protocolVersion"`
-		SupportedVersions  []string `json:"supportedVersions"`
+		ProtocolVersion   string   `json:"protocolVersion"`
+		SupportedVersions []string `json:"supportedVersions"`
 	}
 	if err := json.Unmarshal(res, &d); err == nil && d.ProtocolVersion != "" {
 		conn.protocolVersion = d.ProtocolVersion
@@ -415,6 +417,10 @@ func (conn *Connection) legacyConnect(ctx context.Context, version string) error
 	resp, err := conn.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("initialize 请求失败: %w", err)
+	}
+	if sessionID := resp.Header.Get(HeaderSession); sessionID != "" {
+		conn.sessionID = sessionID
+		conn.sessionBackend = backend
 	}
 	_ = resp.Body.Close()
 
@@ -492,13 +498,16 @@ func (conn *Connection) sendRequestCtx(ctx context.Context, method string, param
 
 	// HTTP 传输: 会话粘性一致性哈希选后端 → 2026-07-28 无状态端点。
 	if conn.Config.Transport == "http" {
-		sticky := StickyKeyFromContext(ctx)
-		if sticky == "" {
-			sticky = conn.stickyKey
-		}
-		backend := conn.ring.Get(sticky)
+		backend := conn.sessionBackend
 		if backend == "" {
-			backend = conn.backends[0]
+			sticky := StickyKeyFromContext(ctx)
+			if sticky == "" {
+				sticky = conn.stickyKey
+			}
+			backend = conn.ring.Get(sticky)
+			if backend == "" {
+				backend = conn.backends[0]
+			}
 		}
 		return conn.httpRequest(ctx, method, params, backend)
 	}
@@ -592,12 +601,22 @@ func (conn *Connection) httpRequest(ctx context.Context, method string, params i
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set(HeaderProtocolVersion, conn.protocolVersion)
 	req.Header.Set(HeaderMethod, method)
+	if conn.sessionID != "" {
+		req.Header.Set(HeaderSession, conn.sessionID)
+	}
 
 	resp, err := conn.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// 有状态会话只在服务端显式签发时启用；此后固定后端，避免把该 ID
+	// 发给另一个不持有会话状态的实例。无会话头的无状态服务保持原路由。
+	if sessionID := resp.Header.Get(HeaderSession); sessionID != "" {
+		conn.sessionID = sessionID
+		conn.sessionBackend = backend
+	}
 
 	// 多后端诊断: 记录实际落到的后端与 Pod host（供粘性/分布验证）。
 	conn.lastBackend = backend
@@ -658,12 +677,19 @@ func (conn *Connection) sendNotification(method string, params interface{}) erro
 // CallTool 调用 MCP 工具。
 // 对应 TS: services/mcp/client.ts 中的 callMCPToolWithUrlElicitationRetry()
 func (conn *Connection) CallTool(ctx context.Context, name string, arguments json.RawMessage) (string, error) {
+	text, _, err := conn.callTool(ctx, name, arguments)
+	return text, err
+}
+
+// callTool 额外保留远程 isError，供 MCPTool 不丢失失败语义。公开 CallTool
+// 保持原有签名与返回值，避免影响直接调用方。
+func (conn *Connection) callTool(ctx context.Context, name string, arguments json.RawMessage) (string, bool, error) {
 	result, err := conn.sendRequestCtx(ctx, "tools/call", map[string]interface{}{
 		"name":      name,
 		"arguments": json.RawMessage(arguments),
 	})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	var callResult struct {
@@ -674,7 +700,7 @@ func (conn *Connection) CallTool(ctx context.Context, name string, arguments jso
 		IsError bool `json:"isError"`
 	}
 	if err := json.Unmarshal(result, &callResult); err != nil {
-		return string(result), nil
+		return string(result), false, nil
 	}
 
 	var texts []string
@@ -683,7 +709,7 @@ func (conn *Connection) CallTool(ctx context.Context, name string, arguments jso
 			texts = append(texts, c.Text)
 		}
 	}
-	return strings.Join(texts, "\n"), nil
+	return strings.Join(texts, "\n"), callResult.IsError, nil
 }
 
 // Close 关闭连接
@@ -733,7 +759,7 @@ func (t *MCPTool) Name() string {
 }
 
 // Description 直接透传远程工具自带的描述。
-func (t *MCPTool) Description() string          { return t.info.Description }
+func (t *MCPTool) Description() string { return t.info.Description }
 
 // InputSchema 直接透传远程工具的 JSON Schema。
 func (t *MCPTool) InputSchema() json.RawMessage { return t.info.InputSchema }
@@ -765,6 +791,7 @@ func (t *MCPTool) IsReadOnly(_ json.RawMessage) bool {
 	}
 	return false
 }
+
 // IsConcurrencySafe 一律返回 false: 远程工具是否有状态、能否并发, 客户端无从得知。
 func (t *MCPTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 
@@ -779,11 +806,11 @@ func (t *MCPTool) Call(ctx context.Context, input json.RawMessage, toolCtx *tool
 	if key := stickyKeyFromToolCtx(toolCtx); key != "" {
 		ctx = WithStickyKey(ctx, key)
 	}
-	result, err := t.conn.CallTool(ctx, t.info.Name, input)
+	result, remoteError, err := t.conn.callTool(ctx, t.info.Name, input)
 	if err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("MCP 工具调用失败: %v", err), IsError: true}, nil
 	}
-	return &tool.ToolResult{Content: result}, nil
+	return &tool.ToolResult{Content: result, IsError: remoteError}, nil
 }
 
 // stickyKeyFromToolCtx 从工具上下文推导会话粘性键：

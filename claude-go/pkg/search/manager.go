@@ -55,13 +55,18 @@ type ResearchResult struct {
 // 它持有 provider、LRU 缓存、单飞组、配额状态与指标; 同一 Manager
 // 可被并发调用。Close 之后 Search/Fetch 返回 unavailable。
 type Manager struct {
-	cfg       Config
-	egress    *Egress
-	providers []Provider
-	cache     *searchCache
-	flights   *flightGroup
-	quota     *quotaTracker
-	metrics   *Metrics
+	cfg         Config
+	egress      *Egress
+	providers   []Provider
+	cache       *searchCache
+	flights     *flightGroup
+	fetchCache  *documentCache
+	fetchFlight *fetchFlightGroup
+	quota       *quotaTracker
+	metrics     *Metrics
+	shared      *sharedStore
+	budget      *sharedBudget
+	renderer    JSRenderer // nil = 按本次实际 HTTP 出口创建受控 Chromium 渲染器
 
 	mu         sync.Mutex
 	closed     bool
@@ -98,15 +103,34 @@ func NewManager(cfg Config, eg *Egress, providers []Provider) *Manager {
 	if cfg.CacheMaxEntries <= 0 {
 		cfg.CacheMaxEntries = 5000
 	}
+	if cfg.RedisKeyPrefix == "" {
+		cfg.RedisKeyPrefix = defaultRedisKeyPrefix
+	}
+	if cfg.RedisTimeout <= 0 {
+		cfg.RedisTimeout = defaultRedisTimeout
+	}
+	if cfg.RedisStaleTTL <= 0 {
+		cfg.RedisStaleTTL = defaultRedisStaleTTL
+	}
+	if cfg.SharedBudgetWindow <= 0 {
+		cfg.SharedBudgetWindow = defaultSharedBudgetWindow
+	}
+	if cfg.SharedBudgetReservationTTL <= 0 {
+		cfg.SharedBudgetReservationTTL = defaultSharedBudgetReservationTTL
+	}
 
 	m := &Manager{
-		cfg:     cfg,
-		egress:  eg,
-		cache:   newSearchCache(cfg.CacheMaxEntries),
-		flights: &flightGroup{},
-		quota:   newQuotaTracker(),
-		metrics: NewMetrics(),
+		cfg:         cfg,
+		egress:      eg,
+		cache:       newSearchCache(cfg.CacheMaxEntries),
+		flights:     &flightGroup{},
+		fetchCache:  newDocumentCache(cfg.CacheMaxEntries),
+		fetchFlight: &fetchFlightGroup{},
+		quota:       newQuotaTracker(),
+		metrics:     NewMetrics(),
 	}
+	m.shared = newSharedStore(cfg)
+	m.budget = newSharedBudget(cfg, m.shared)
 	if m.egress == nil {
 		fallback, err := NewEgress(EgressConfig{Mode: ModeDirect})
 		if err == nil {
@@ -144,13 +168,23 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 	if m.isClosed() {
 		return nil, Wrap("", ErrUnavailable, errors.New("search manager closed"))
 	}
-	if strings.TrimSpace(req.Query) == "" {
-		return nil, Wrap("", ErrInvalid, errors.New("empty query"))
+	var err error
+	req, err = normalizeSearchRequest(req, m.cfg.DefaultLimit)
+	if err != nil {
+		return nil, err
 	}
 
 	plan := PlanQuery(req.Query)
 	if f := strings.TrimSpace(req.Freshness); f != "" {
 		plan.Freshness = strings.ToLower(f)
+	} else {
+		// 推断时效也必须进入 provider 请求和 EvaluateQuality，不能只影响选源。
+		req.Freshness = plan.Freshness
+	}
+	if language := normalizeLang(req.Language); language != "" {
+		plan.Language = language
+	} else {
+		req.Language = plan.Language
 	}
 
 	candidates, degraded := selectProviders(m.providers, plan, m.cfg, m.egress, m.quota)
@@ -171,19 +205,23 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 	for _, p := range candidates {
 		names = append(names, p.Name())
 	}
-	key := searchCacheKey(req.Query, names, req.Language, plan.Freshness)
+	key := searchCacheKey(req, names, plan.Freshness)
 
-	if cached, ok := m.cache.get(key); ok {
+	var cacheDegraded []string
+	cached, ok, currentDegraded := m.cachedSearch(ctx, key)
+	if ok {
 		cached.CacheHit = true
 		cached.ElapsedMS = time.Since(start).Milliseconds()
-		m.metrics.Inc("cache_hit_total", map[string]string{"cache_type": "search"})
 		return &cached, nil
 	}
+	cacheDegraded = append(cacheDegraded, currentDegraded...)
 
 	resp, err, _ := m.flights.Do(ctx, key, func() (SearchResponse, error) {
-		// 等待期间可能已有别的请求填好缓存, 二次检查避免重复打源。
-		if cached, ok := m.cache.get(key); ok {
-			cached.CacheHit = false
+		// 等待期间可能已有别的 Manager 填好缓存，二次检查避免重复打源/预占。
+		cached, ok, sharedDegraded := m.cachedSearch(ctx, key)
+		cacheDegraded = append(cacheDegraded, sharedDegraded...)
+		if ok {
+			cached.CacheHit = true
 			return cached, nil
 		}
 		return m.executeSearch(ctx, req, plan, candidates, degraded, key)
@@ -191,72 +229,108 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 	if err != nil {
 		return nil, err
 	}
-	resp.CacheHit = false
+	resp = cloneSearchResponse(resp)
+	resp.Degraded = dedupeStrings(append(resp.Degraded, cacheDegraded...))
 	resp.ElapsedMS = time.Since(start).Milliseconds()
 	return &resp, nil
 }
 
 // executeSearch 执行实际调度、融合与质量门, 并写入缓存。
+// 单次调用最多打两个源；质量不足通过响应显式暴露，由上层在自己的预算内重试。
 func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan QueryPlan, candidates []Provider, degraded []string, cacheKey string) (SearchResponse, error) {
-	for _, p := range candidates {
+	scheduled := candidates
+	if len(scheduled) > maxSourceConcurrency {
+		scheduled = scheduled[:maxSourceConcurrency]
+	}
+	for _, p := range scheduled {
 		m.metrics.Inc("egress_requests_total", map[string]string{
 			"provider": p.Name(),
 			"egress":   string(providerPin(p, m.cfg, m.egress)),
 		})
 	}
 
-	outcomes := m.scheduleSearch(ctx, req, candidates)
+	providerReq := req
+	if len(req.AllowedDomains) > 0 || len(req.BlockedDomains) > 0 {
+		// 小 limit 不能让 provider 只返回少量域外候选后就被硬过滤为空。
+		// 适度多取仍在同一次有界请求内完成，最终 Top-K 继续使用原始 limit。
+		const domainFilterMinResults = 10
+		if providerReq.Limit < domainFilterMinResults {
+			providerReq.Limit = domainFilterMinResults
+		}
+	}
+	outcomes := m.scheduleSearch(ctx, providerReq, scheduled)
 	if err := ctx.Err(); err != nil {
 		return SearchResponse{}, Wrap("", classifyError(err), err)
 	}
 
 	var raw []Result
 	var used []string
+	var executionDegraded []string
+	var actualCost float64
 	anySuccess := false
 	for _, o := range outcomes {
 		if o.err != nil {
-			degraded = append(degraded, degradedFor(o.name, o.err))
+			failure := degradedFor(o.name, o.err)
+			degraded = append(degraded, failure)
+			executionDegraded = append(executionDegraded, failure)
 			continue
 		}
 		anySuccess = true
+		actualCost += o.cost
 		used = append(used, o.name)
 		raw = append(raw, o.results...)
 	}
-	for _, p := range candidates {
+	for _, p := range scheduled {
 		m.metrics.Set("provider_quota_remaining", float64(m.quota.remaining(p)), map[string]string{
 			"provider": p.Name(),
 		})
 	}
+	needFresh := freshnessRequired(plan.Freshness)
 
 	if !anySuccess {
 		return SearchResponse{}, Wrap("", ErrNoProvider, errors.New("all providers failed"))
 	}
-	if len(raw) == 0 {
-		// 有源成功但确实零结果: 如实返回空结果, 不伪造。
-		resp := SearchResponse{
-			Providers: used,
-			Degraded:  dedupeStrings(degraded),
-			CostUSD:   0,
+	filteredRaw := filterResultDomains(raw, req)
+	degraded = dedupeStrings(degraded)
+	if len(filteredRaw) == 0 {
+		// 有源成功但零结果 (含域名过滤后为空): 如实返回 empty, 不伪造也不回退。
+		reason := "empty"
+		if len(raw) > 0 && (len(req.AllowedDomains) > 0 || len(req.BlockedDomains) > 0) {
+			reason = "domain_filter"
 		}
-		m.cache.put(cacheKey, resp, m.cacheTTL(plan, req))
+		resp := SearchResponse{
+			Status:     "empty",
+			Results:    []Result{},
+			Providers:  used,
+			Degraded:   degraded,
+			CostUSD:    actualCost,
+			GateReason: reason,
+		}
+		resp = m.putSearchCache(ctx, cacheKey, resp, m.cacheTTL(plan, req))
 		return resp, nil
 	}
 
-	fused := Fuse(raw, providerWeights(candidates, m.cfg))
-	quality := EvaluateQuality(raw, req)
-	needFresh := freshnessRequired(plan.Freshness)
+	fused := Fuse(filteredRaw, providerWeights(candidates, m.cfg))
+	fused = rerankResults(fused, req)
+	if len(fused) > req.Limit {
+		fused = fused[:req.Limit]
+	}
+	quality := EvaluateQuality(filteredRaw, req)
 	passed := quality.Pass(needFresh)
 	m.metrics.Inc("search_gate_result", map[string]string{"result": quality.gateReason(needFresh)})
 
 	resp := SearchResponse{
+		// 未调度源的退避仍留在 Degraded 供运维归因, 但只有本次实际打源
+		// 失败才把可用结果标成 partial; 缓存故障也不改变数据源自身状态。
+		Status:     responseStatus(len(fused), executionDegraded),
 		Results:    fused,
 		Providers:  used,
-		Degraded:   dedupeStrings(degraded),
-		CostUSD:    0, // 零成本约束: 任何情况下都不上报伪造成本
+		Degraded:   degraded,
+		CostUSD:    actualCost,
 		GatePassed: passed,
 		GateReason: quality.gateReason(needFresh),
 	}
-	m.cache.put(cacheKey, resp, m.cacheTTL(plan, req))
+	resp = m.putSearchCache(ctx, cacheKey, resp, m.cacheTTL(plan, req))
 	return resp, nil
 }
 
@@ -455,8 +529,8 @@ loop:
 
 // Close 关闭 Manager。
 //
-// provider 自行实现 Closer 时逐个关闭; 内部创建的兜底出口也会释放。
-// 外部传入的 Egress 由调用方管理, 这里不越权关闭。重复调用安全。
+// provider 自行实现 Closer 时逐个关闭; 内部创建的兜底出口和本 Manager 持有的
+// Redis 连接也会释放。外部传入的 Egress 由调用方管理, 这里不越权关闭。重复调用安全。
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	if m.closed {
@@ -467,6 +541,7 @@ func (m *Manager) Close() error {
 	providers := append([]Provider(nil), m.providers...)
 	owns := m.ownsEgress
 	egress := m.egress
+	shared := m.shared
 	m.mu.Unlock()
 
 	var errs []error
@@ -479,6 +554,11 @@ func (m *Manager) Close() error {
 	}
 	if owns && egress != nil {
 		if err := egress.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if shared != nil {
+		if err := shared.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

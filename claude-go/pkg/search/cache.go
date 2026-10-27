@@ -65,11 +65,7 @@ func (c *searchCache) get(key string) (SearchResponse, bool) {
 		return SearchResponse{}, false
 	}
 	c.ll.MoveToFront(el)
-	resp := item.resp
-	resp.Results = append([]Result(nil), item.resp.Results...)
-	resp.Providers = append([]string(nil), item.resp.Providers...)
-	resp.Degraded = append([]string(nil), item.resp.Degraded...)
-	return resp, true
+	return cloneSearchResponse(item.resp), true
 }
 
 // put 写入缓存并淘汰超限的最久未使用项。
@@ -85,12 +81,12 @@ func (c *searchCache) put(key string, resp SearchResponse, ttl time.Duration) {
 
 	if el, ok := c.items[key]; ok {
 		item := el.Value.(*cacheItem)
-		item.resp = resp
+		item.resp = cloneSearchResponse(resp)
 		item.expires = c.now().Add(ttl)
 		c.ll.MoveToFront(el)
 		return
 	}
-	el := c.ll.PushFront(&cacheItem{key: key, resp: resp, expires: c.now().Add(ttl)})
+	el := c.ll.PushFront(&cacheItem{key: key, resp: cloneSearchResponse(resp), expires: c.now().Add(ttl)})
 	c.items[key] = el
 	for c.ll.Len() > c.max {
 		last := c.ll.Back()
@@ -115,14 +111,17 @@ func (c *searchCache) len() int {
 
 // searchCacheKey 生成查询缓存键。
 //
-// key = 规范化 query + provider 集合 + 语言 + freshness。provider 集合
-// 排序后拼接, 保证不同选择顺序得到同一个 key; 集合不同则视为不同请求,
-// 因为结果质量与来源直接相关。
-func searchCacheKey(query string, providers []string, language, freshness string) string {
+// 规范化身份包含 query、provider 集合、语言、freshness、limit、域名约束与
+// OriginalQuestion。对完整身份做 SHA-256，既保留全部参数，又避免敏感查询
+// 以明文进入本地或 Redis keyspace。provider/域名排序保证顺序不影响身份。
+func searchCacheKey(req SearchRequest, providers []string, freshness string) string {
 	names := append([]string(nil), providers...)
 	sort.Strings(names)
-	q := normalizeQuery(query)
-	lang := normalizeLang(language)
+	allowed := append([]string(nil), req.AllowedDomains...)
+	blocked := append([]string(nil), req.BlockedDomains...)
+	sort.Strings(allowed)
+	sort.Strings(blocked)
+	lang := normalizeLang(req.Language)
 	if lang == "" {
 		lang = "auto"
 	}
@@ -130,7 +129,10 @@ func searchCacheKey(query string, providers []string, language, freshness string
 	if fresh == "" {
 		fresh = "any"
 	}
-	return fmt.Sprintf("s|%s|%s|%s|%s", q, strings.Join(names, ","), lang, fresh)
+	identity := fmt.Sprintf("%s|%s|%s|%s|%d|%s|%s|%s", normalizeQuery(req.Query),
+		strings.Join(names, ","), lang, fresh, req.Limit, strings.Join(allowed, ","),
+		strings.Join(blocked, ","), normalizeQuery(req.OriginalQuestion))
+	return "s|" + cacheDigest(identity)
 }
 
 // normalizeQuery 规范化 query: 去首尾空白、压缩连续空白、转小写。

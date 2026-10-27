@@ -795,6 +795,7 @@ func (p *mcpProvider) Search(ctx context.Context, req search.SearchRequest) (out
 	if query == "" {
 		return nil, search.Wrap(p.name, search.ErrInvalid, errors.New("empty query"))
 	}
+	query = searchQueryWithDomainHints(query, req)
 	ctx, cancel := p.requestContext(ctx, req.Deadline)
 	defer cancel()
 

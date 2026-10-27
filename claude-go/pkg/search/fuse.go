@@ -34,11 +34,12 @@ func CanonicalURL(raw string) string {
 	u.Host = strings.ToLower(u.Host)
 	u.Fragment = ""
 
-	// 过滤 utm_* 与空参数, 其余按键值排序。
+	// 过滤已知追踪参数与空参数, 其余按键值排序。trk/fbclid 等参数只记录
+	// 点击来源，不改变正文；保留它们会把同一篇论文或报道重复塞进结果表。
 	if u.RawQuery != "" {
 		q := u.Query()
 		for key := range q {
-			if strings.HasPrefix(strings.ToLower(key), "utm_") {
+			if isTrackingQueryKey(key) || isRedundantArxivFile(u, key, q[key]) {
 				q.Del(key)
 			}
 		}
@@ -67,6 +68,34 @@ func CanonicalURL(raw string) string {
 		u.Path = ""
 	}
 	return u.String()
+}
+
+// isTrackingQueryKey 只匹配明确的点击/会话追踪键，不按模糊子串删除业务参数。
+func isTrackingQueryKey(key string) bool {
+	key = strings.ToLower(key)
+	if strings.HasPrefix(key, "utm_") {
+		return true
+	}
+	switch key {
+	case "trk", "trkparms", "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "spm", "scm":
+		return true
+	default:
+		return false
+	}
+}
+
+// isRedundantArxivFile 只删除 arXiv abstract 页中与路径 ID 完全相同的 file 值。
+// 其他站点、其他 file 值和 download 等参数都保留，避免把不同业务资源错误合并。
+func isRedundantArxivFile(u *url.URL, key string, values []string) bool {
+	if !strings.EqualFold(key, "file") || len(values) != 1 {
+		return false
+	}
+	host := u.Hostname()
+	if host != "arxiv.org" && host != "www.arxiv.org" {
+		return false
+	}
+	id := strings.TrimPrefix(u.Path, "/abs/")
+	return id != u.Path && id != "" && values[0] == id
 }
 
 // Fuse 用加权 RRF 融合多源结果。

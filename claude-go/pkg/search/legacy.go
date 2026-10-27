@@ -66,7 +66,7 @@ func (l *LegacySearcher) SearchJSON(ctx context.Context, query string) (string, 
 	}{query, resp.Results, resp.Providers, resp.Degraded, resp.CacheHit, resp.GatePassed, resp.GateReason, resp.ElapsedMS, resp.CostUSD})
 }
 
-// SearchRequestJSON 是带参数的检索入口 (语言/时限/域偏好), 供 MCP 工具使用。
+// SearchRequestJSON 是带参数的检索入口 (语言/时限/域名硬过滤), 供 MCP 工具使用。
 func (l *LegacySearcher) SearchRequestJSON(ctx context.Context, req SearchRequest) (string, error) {
 	resp, err := l.m.Search(ctx, req)
 	if err != nil {
@@ -75,27 +75,43 @@ func (l *LegacySearcher) SearchRequestJSON(ctx context.Context, req SearchReques
 	return mustJSON(resp)
 }
 
-// FetchJSON 抓取并提取一个 URL 的正文。
+// FetchJSON 是兼容旧调用方的抓取入口；新工具使用 FetchRequestJSON。
 func (l *LegacySearcher) FetchJSON(ctx context.Context, rawURL string, maxChars int) (string, error) {
-	resp, err := l.m.Fetch(ctx, FetchRequest{URL: rawURL, MaxChars: maxChars})
+	return l.FetchRequestJSON(ctx, FetchRequest{URL: rawURL, MaxChars: maxChars})
+}
+
+// FetchRequestJSON 返回带证据偏移、缓存和 continuation 元数据的抓取结果。
+func (l *LegacySearcher) FetchRequestJSON(ctx context.Context, req FetchRequest) (string, error) {
+	resp, err := l.m.Fetch(ctx, req)
 	if err != nil {
 		return "", err
 	}
+	doc := resp.Document
 	return mustJSON(struct {
-		URL       string    `json:"url"`
-		Title     string    `json:"title,omitempty"`
-		Byline    string    `json:"byline,omitempty"`
-		Published time.Time `json:"published,omitempty"`
-		FetchedAt time.Time `json:"fetched_at"`
-		Markdown  string    `json:"markdown"`
-		Truncated bool      `json:"truncated"`
-		Via       string    `json:"via"`
-		Hash      string    `json:"hash"`
-		Degraded  []string  `json:"degraded,omitempty"`
-		ElapsedMS int64     `json:"elapsed_ms"`
-	}{resp.Document.URL, resp.Document.Title, resp.Document.Byline, resp.Document.Published,
-		resp.Document.FetchedAt, resp.Document.Markdown, resp.Document.Truncated, resp.Document.Via,
-		resp.Document.Hash, resp.Degraded, resp.ElapsedMS})
+		URL                    string     `json:"url"`
+		Title                  string     `json:"title,omitempty"`
+		Byline                 string     `json:"byline,omitempty"`
+		Published              time.Time  `json:"published,omitempty"`
+		FetchedAt              time.Time  `json:"fetched_at"`
+		Markdown               string     `json:"markdown"`
+		Truncated              bool       `json:"truncated"`
+		Via                    string     `json:"via"`
+		Hash                   string     `json:"hash"`
+		Offset                 int        `json:"offset"`
+		NextOffset             int        `json:"next_offset"`
+		TotalChars             int        `json:"total_chars"`
+		EstimatedContentTokens int        `json:"estimated_content_tokens"` // 兼容字段: UTF-8 字节 token 上界
+		TokenCountMethod       string     `json:"token_count_method"`
+		CacheHit               bool       `json:"cache_hit"`
+		Stale                  bool       `json:"stale"`
+		Selection              string     `json:"selection"`
+		Evidence               []Evidence `json:"evidence,omitempty"`
+		Degraded               []string   `json:"degraded,omitempty"`
+		ElapsedMS              int64      `json:"elapsed_ms"`
+	}{doc.URL, doc.Title, doc.Byline, doc.Published, doc.FetchedAt, doc.Markdown,
+		doc.Truncated, doc.Via, doc.Hash, doc.Offset, doc.NextOffset, doc.TotalChars,
+		doc.EstimatedTokens, tokenCountMethod, doc.CacheHit, doc.Stale, doc.Selection, doc.Evidence,
+		resp.Degraded, resp.ElapsedMS})
 }
 
 // ResearchJSON 执行有界研究并返回抽取式答案与逐字证据。

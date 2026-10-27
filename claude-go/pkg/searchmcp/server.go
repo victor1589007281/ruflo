@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -28,10 +29,11 @@ import (
 // ProtocolVersion 与 platformmcp 保持一致。
 const ProtocolVersion = "2024-11-05"
 
-// Server 是无状态的 MCP server, 可并发处理请求。
+// Server 可并发处理请求。传输层会话只承载身份与 max_uses，不改变工具数据面。
 type Server struct {
-	reg   *tool.Registry
-	names []string
+	reg      *tool.Registry
+	names    []string
+	sessions sessionBudget
 }
 
 // New 用进程级数据面构造 server; data 为 nil 时返回 nil (调用方应报配置错误)。
@@ -39,8 +41,18 @@ type Server struct {
 // 只暴露数据面工具, 不暴露文件/Shell 工具: MCP 客户端挂载本服务时拿到的
 // 应当只是"查资料"的能力。
 func New(data *builtin.DataStack) *Server {
+	s, _ := NewWithMaxUses(data, 0)
+	return s
+}
+
+// NewWithMaxUses 构造带服务端机械调用预算的 server。maxUses=0 保持原行为；
+// 该值不进入工具 schema，模型不能在请求里修改。
+func NewWithMaxUses(data *builtin.DataStack, maxUses int) (*Server, error) {
+	if maxUses < 0 {
+		return nil, fmt.Errorf("max_uses must not be negative: %d", maxUses)
+	}
 	if data == nil || data.Search == nil || data.Market == nil {
-		return nil
+		return nil, nil
 	}
 	reg := tool.NewRegistry()
 	reg.Register(builtin.NewWebSearchTool(data.Search))
@@ -50,7 +62,7 @@ func New(data *builtin.DataStack) *Server {
 	for _, t := range reg.All() {
 		names = append(names, t.Name())
 	}
-	return &Server{reg: reg, names: names}
+	return &Server{reg: reg, names: names, sessions: newSessionBudget(maxUses)}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +166,16 @@ func (s *Server) callTool(ctx context.Context, p rpcParams) map[string]any {
 	if len(args) == 0 {
 		args = json.RawMessage(`{}`)
 	}
-	res, err := t.Call(ctx, args, &tool.ToolContext{})
+	sessionID := sessionIDFromContext(ctx)
+	if p.Name == builtin.WebSearchToolName || p.Name == builtin.WebFetchToolName {
+		if err := s.sessions.consume(sessionID); err != nil {
+			return map[string]any{
+				"content": []map[string]any{{"type": "text", "text": err.Error()}},
+				"isError": true,
+			}
+		}
+	}
+	res, err := t.Call(ctx, args, &tool.ToolContext{SessionID: sessionID})
 	if err != nil {
 		return map[string]any{
 			"content": []map[string]any{{"type": "text", "text": err.Error()}},
@@ -169,6 +190,12 @@ func (s *Server) callTool(ctx context.Context, p rpcParams) map[string]any {
 
 // ServeStdio 以换行分隔的 JSON 服务 stdin/stdout, 直到 ctx 取消或 EOF。
 func (s *Server) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) error {
+	sessionID, err := s.sessions.create()
+	if err != nil {
+		return err
+	}
+	defer s.sessions.remove(sessionID)
+	ctx = withSessionID(ctx, sessionID)
 	r := bufio.NewReaderSize(in, 1<<20)
 	w := bufio.NewWriter(out)
 	for {
@@ -209,7 +236,39 @@ func (s *Server) Handler() http.Handler {
 			http.Error(w, "read error", http.StatusBadRequest)
 			return
 		}
-		resp := s.HandleRPC(r.Context(), body)
+		ctx := r.Context()
+		var envelope struct {
+			Method string `json:"method"`
+		}
+		if json.Unmarshal(body, &envelope) == nil {
+			switch envelope.Method {
+			case "initialize", "server/discover":
+				sessionID, serr := s.sessions.create()
+				if serr != nil {
+					http.Error(w, "session creation failed", http.StatusInternalServerError)
+					return
+				}
+				ctx = withSessionID(ctx, sessionID)
+				w.Header().Set(SessionHeader, sessionID)
+			default:
+				sessionID := r.Header.Get(SessionHeader)
+				if s.sessions.enabled() && sessionID == "" {
+					http.Error(w, errSessionRequired.Error(), http.StatusBadRequest)
+					return
+				}
+				if sessionID != "" {
+					if !s.sessions.valid(sessionID) {
+						if s.sessions.enabled() {
+							http.Error(w, errSessionInvalid.Error(), http.StatusNotFound)
+							return
+						}
+					} else {
+						ctx = withSessionID(ctx, sessionID)
+					}
+				}
+			}
+		}
+		resp := s.HandleRPC(ctx, body)
 		if resp == nil {
 			w.WriteHeader(http.StatusAccepted)
 			return

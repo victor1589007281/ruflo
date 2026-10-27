@@ -17,6 +17,7 @@ FROM debian:bookworm-slim
 # 一次 run 里就这么废掉一轮)。apt 的包名是 ripgrep, 二进制叫 rg。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git curl python3 golang-go nodejs openssh-client ripgrep \
+      poppler-utils chromium \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 1000 -M -s /usr/sbin/nologin claude
 # nodejs: IMA 同步适配器 exec node ima_api.cjs (pkg/sync/ima.go)。

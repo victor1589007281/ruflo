@@ -7,16 +7,17 @@
 //     外层权限/编排可单独对 WebFetch 加规则。
 //
 // 算法说明:
-//  1. 校验 URL 必须为 http/https，拒绝 file: 等以避免误用与简单 SSRF 面。
-//  2. 使用 net/http + context 超时发起 GET；限制响应体读取长度，避免内存爆炸。
-//  3. 将 body 按 UTF-8 解码为字符串后截断至 maxWebFetchChars（字符数以 rune 计）。
-//  4. 去除 <script>/<style> 块，再用正则去掉其余标签，空白折叠为单空格，得到近似“可读文本”。
-//     （非完整 HTML 解析器，复杂页面可能残留实体或未闭合标签碎片，属简化实现。）
+//  1. 严格解析 url/prompt/max_content_tokens/offset，并拒绝未知字段。
+//  2. 默认走搜索数据面：逐跳 SSRF 校验、全文缓存、相关原文窗口和 continuation。
+//  3. 旧 fetcher/浏览器/裸 HTTP 只兼容简单抓取；高级参数在不支持时明确报错，
+//     绝不靠回显 prompt 或忽略 offset 伪装成功。
 package builtin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/anthropic/claude-go/pkg/search"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/types"
 )
@@ -34,8 +36,9 @@ const WebFetchToolName = "WebFetch"
 
 // maxWebFetchChars 单次抓取注入上下文的纯文本上限。
 // 50000 字符 (~12.5K token) 对"背景调研"过大: 实测 tech-investigator 多次抓取整页,
-// 每页都是一次 cache-miss 计费, 占团队 token 的 80%+。收紧到 16000 字符 (~4K token),
-// 既够提炼背景信息, 又把抓取成本砍 ~3x。需要全文精读的场景应改用专门的文档读取流程。
+// 每页都是一次 cache-miss 计费, 占团队 token 的 80%+。因此保留 16000 rune 默认上限；
+// 收紧到 16000 字符，避免背景调研反复注入整页。max_content_tokens 是独立的
+// UTF-8 字节上界预算，不再用 chars/4 假定不同语言的真实 token 消耗。
 const maxWebFetchChars = 16000
 
 const webFetchHTTPTimeout = 60 * time.Second
@@ -49,8 +52,10 @@ var (
 
 // webFetchInput 对应 LLM 传入的 JSON。
 type webFetchInput struct {
-	URL    string `json:"url"`
-	Prompt string `json:"prompt,omitempty"`
+	URL              string `json:"url"`
+	Prompt           string `json:"prompt,omitempty"`
+	MaxContentTokens int    `json:"max_content_tokens,omitempty"`
+	Offset           int    `json:"offset,omitempty"`
 }
 
 // BrowserClient 浏览器客户端接口（可选注入，增强抓取能力）。
@@ -94,15 +99,16 @@ func (t *WebFetchTool) SetFetcher(f PageFetcher) {
 // Name 返回工具对外名。
 func (t *WebFetchTool) Name() string { return WebFetchToolName }
 
-// Description 返回给模型看的工具说明 (拉取并简化提取正文, 可带 prompt 附加上下文)。
+// Description 明确 prompt 是选段依据，不是需要在网页上执行的指令。
 func (t *WebFetchTool) Description() string {
-	return `Fetches a URL via HTTP/HTTPS and returns a simplified plain-text extraction of the page (HTML tags stripped, truncated). Optional prompt can supply extra instructions for how to use the fetched content.`
+	return `Fetches an HTTP/HTTPS URL and returns structured JSON with normalized Markdown, full-document hash, verbatim evidence and cache/degradation metadata. prompt selects a relevant contiguous original-text window; it is never executed as an instruction. max_content_tokens limits the returned excerpt using a conservative UTF-8 byte upper bound (not an estimate from another model's tokenizer). estimated_content_tokens reports that upper bound and token_count_method identifies it. offset and next_offset are rune positions for sequential continuation. When citing evidence, copy a quote from the same response whose offset/hash you report; other Markdown sentences are not evidence entries.`
 }
 
-// InputSchema 返回入参 JSON Schema (url 必填且须为绝对 HTTP/HTTPS 地址; prompt 可选)。
+// InputSchema 与真实 FetchRequest 对齐，offset 使用规范化全文的 rune 索引。
 func (t *WebFetchTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
+		"additionalProperties": false,
 		"properties": {
 			"url": {
 				"type": "string",
@@ -110,7 +116,17 @@ func (t *WebFetchTool) InputSchema() json.RawMessage {
 			},
 			"prompt": {
 				"type": "string",
-				"description": "Optional context or instructions related to why this URL is being fetched."
+				"description": "Question or topic used to select a relevant contiguous original-text window; not an instruction to execute."
+			},
+			"max_content_tokens": {
+				"type": "integer",
+				"minimum": 1,
+				"description": "Optional returned-excerpt budget enforced with a conservative UTF-8 byte token upper bound."
+			},
+			"offset": {
+				"type": "integer",
+				"minimum": 0,
+				"description": "Rune offset in the normalized full document; use a previous next_offset for continuation."
 			}
 		},
 		"required": ["url"]
@@ -132,8 +148,20 @@ func (t *WebFetchTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) 
 // Call 执行 HTTP GET、截断与 HTML→文本简化提取。
 func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
 	var in webFetchInput
-	if err := json.Unmarshal(input, &in); err != nil {
-		return &tool.ToolResult{Content: fmt.Sprintf("输入解析错误: %v", err), IsError: true}, nil
+	dec := json.NewDecoder(bytes.NewReader(input))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		return &tool.ToolResult{Content: fmt.Sprintf("WebFetch input error: %v", err), IsError: true}, nil
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return &tool.ToolResult{Content: fmt.Sprintf("WebFetch input error: %v", err), IsError: true}, nil
+	}
+	if in.MaxContentTokens < 0 || in.Offset < 0 {
+		return &tool.ToolResult{Content: "WebFetch input error: max_content_tokens and offset must not be negative", IsError: true}, nil
 	}
 	if strings.TrimSpace(in.URL) == "" {
 		return &tool.ToolResult{Content: "错误: url 不能为空", IsError: true}, nil
@@ -153,11 +181,33 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 	// 也不能按站点切代理, 回退会把一个明确的 blocked/timeout 变成一次
 	// 侥幸成功或一次更慢的失败。
 	if t.fetcher != nil {
+		req := search.FetchRequest{
+			URL: u.String(), Prompt: strings.TrimSpace(in.Prompt), MaxChars: maxWebFetchChars,
+			MaxContentTokens: in.MaxContentTokens, Offset: in.Offset,
+		}
+		if structured, ok := t.fetcher.(interface {
+			FetchRequestJSON(context.Context, search.FetchRequest) (string, error)
+		}); ok {
+			out, ferr := structured.FetchRequestJSON(ctx, req)
+			if ferr != nil {
+				return &tool.ToolResult{Content: fmt.Sprintf("WebFetch error: %v", ferr), IsError: true}, nil
+			}
+			return &tool.ToolResult{Content: out}, nil
+		}
+		if req.Prompt != "" || req.MaxContentTokens != 0 || req.Offset != 0 {
+			return &tool.ToolResult{Content: "WebFetch error: this legacy fetcher does not support prompt selection, token budgets or continuation", IsError: true}, nil
+		}
 		out, ferr := t.fetcher.FetchJSON(ctx, u.String(), maxWebFetchChars)
 		if ferr != nil {
 			return &tool.ToolResult{Content: fmt.Sprintf("WebFetch error: %v", ferr), IsError: true}, nil
 		}
 		return &tool.ToolResult{Content: out}, nil
+	}
+
+	// 浏览器/裸 HTTP 兼容路径没有能力兑现高级契约，明确失败比只回显 prompt
+	// 或忽略 offset 更安全；生产 search-mcp 默认走上面的结构化数据面。
+	if strings.TrimSpace(in.Prompt) != "" || in.MaxContentTokens != 0 || in.Offset != 0 {
+		return &tool.ToolResult{Content: "WebFetch error: prompt selection, token budgets and continuation require the search data plane", IsError: true}, nil
 	}
 
 	// 路由 1: 尝试浏览器抓取 (stealth + JS 渲染 + MediaWiki API 自动路由)
@@ -171,9 +221,6 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 				fmt.Fprintf(&b, "Title: %s\n", bTitle)
 			}
 			b.WriteString("\n")
-			if strings.TrimSpace(in.Prompt) != "" {
-				fmt.Fprintf(&b, "（附加上下文 prompt）\n%s\n\n", strings.TrimSpace(in.Prompt))
-			}
 			b.WriteString(fullText)
 			if utf8.RuneCountInString(bText) > maxWebFetchChars {
 				fmt.Fprintf(&b, "\n\n[已截断: 提取后的纯文本超过 %d 个 Unicode 字符]", maxWebFetchChars)
@@ -201,6 +248,9 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 		return &tool.ToolResult{Content: fmt.Sprintf("请求失败: %v", err), IsError: true}, nil
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &tool.ToolResult{Content: fmt.Sprintf("WebFetch error: HTTP %d", resp.StatusCode), IsError: true}, nil
+	}
 
 	const byteCap = maxWebFetchChars * 4
 	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(byteCap)))
@@ -214,9 +264,6 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "HTTP %d\nURL: %s\n\n", resp.StatusCode, u.String())
-	if strings.TrimSpace(in.Prompt) != "" {
-		fmt.Fprintf(&b, "（附加上下文 prompt）\n%s\n\n", strings.TrimSpace(in.Prompt))
-	}
 	b.WriteString(text)
 
 	if utf8.RuneCountInString(fullText) > maxWebFetchChars {

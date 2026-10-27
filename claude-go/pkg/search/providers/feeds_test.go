@@ -63,6 +63,26 @@ func TestBingRSSSearch(t *testing.T) {
 	}
 }
 
+func TestBingRSSSearchAddsDomainHints(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Query().Get("q"), "news site:news.example -site:ads.example"; got != want {
+			t.Errorf("q=%q, want %q", got, want)
+		}
+		w.Header().Set("Content-Type", "application/rss+xml")
+		fmt.Fprint(w, testRSS)
+	}))
+	defer srv.Close()
+	p, err := newBingRSS(search.DefaultConfig(), search.ProviderConfig{Enabled: true, BaseURL: srv.URL + "/search"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Search(context.Background(), search.SearchRequest{
+		Query: "news", AllowedDomains: []string{"news.example"}, BlockedDomains: []string{"ads.example"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestBingRSSFiltersOffTopic 钉住兜底源的词面过滤。
 //
 // Bing 在长查询上会回完全不同话题的页面; 过滤只应在 bing_rss 这类兜底源

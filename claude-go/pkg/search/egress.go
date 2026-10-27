@@ -42,6 +42,7 @@ const (
 type Egress struct {
 	direct        *http.Client
 	proxy         *http.Client
+	proxyURL      string
 	mode          Mode
 	noProxy       []string
 	probeURL      string
@@ -101,6 +102,7 @@ func NewEgress(cfg EgressConfig) (*Egress, error) {
 		return nil, err
 	}
 	e.proxy = c
+	e.proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	e.healthy.Store(true) // 初始乐观, 探测失败后再摘除
 
 	return e, nil
