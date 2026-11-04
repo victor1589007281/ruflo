@@ -6,6 +6,7 @@
 package harness
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -43,7 +44,7 @@ func drainEvents(t *testing.T, events []types.StreamEvent, clock *drainClock) (*
 	close(ch)
 	res := &TurnResult{}
 	var emitted []TurnEvent
-	drain(ch, func(ev TurnEvent) { emitted = append(emitted, ev) }, res, nil, clock.Now)
+	drain(context.Background(), ch, func(ev TurnEvent) { emitted = append(emitted, ev) }, res, nil, clock.Now, nil, "", "", "")
 	return res, emitted
 }
 

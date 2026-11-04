@@ -64,6 +64,18 @@ type ContentBlock struct {
 	// image / document 类型的媒体源 (Anthropic Messages API 格式)
 	Source *MediaSource `json:"source,omitempty"`
 
+	// Trust / SourceURI 是**仅进程内**的可信度/来源侧信道 (H-F2 不可信内容标记)。
+	//
+	// 它们刻意标记为 json:"-": 不是 Anthropic Messages API 的字段, 绝不能进入
+	// 请求体。工具结果块在进程内被 harness/审核层读取, 用来判断"这段内容来自
+	// 不可信网页, 不得当作指令"; 一旦序列化到上游, 既不符合协议, 也可能把
+	// 内部策略泄露给 provider。
+	//
+	// 空值 = 未标记 (与改造前逐字节相同)。跨 turn 从历史反序列化后这两个值会
+	// 丢失 —— 这是有意的: 它们描述的是"本次抓取", 不是要持久化的内容。
+	Trust     string `json:"-"`
+	SourceURI string `json:"-"`
+
 	// 以下为往返保真载体 (R-H3): 未知 content block / 未知 metadata 必须原样保留,
 	// 不能因为 harness 不认识就丢弃。它们是私有的, 不改变已知块的导出 JSON 形状,
 	// 也不会被 encoding/json 序列化。
@@ -348,8 +360,21 @@ type StreamEvent struct {
 	ToolUseID  string // Kind=ToolStart/ToolDone
 	ToolInput  string // Kind=ToolStart 时的工具输入摘要
 	ToolResult string // Kind=ToolDone 时的工具结果摘要
-	IsThinking bool   // thinking delta (区别于普通文本)
-	Error      error  // Kind=Error 时的错误
+	// ToolResultFull 是工具结果的**完整**内容 (H-F1 证据闭环)。
+	//
+	// 只给**进程内**消费者 (pkg/harness 的 drain → ToolResultSink) 使用, **不得**
+	// 进入 SSE/HTTP 出口: 现有出口只读 ToolResult 摘要, ToolResultFull 不是协议
+	// 字段。留空 = 生产者没有提供全文, 消费方必须退回 ToolResult (旧行为)。
+	//
+	// 摘要字段保留 200B 是为了不改变既有消费方的事件形状与内存口径; 全文单独
+	// 承载, 而不是把 ToolResult 变大 —— 后者会让每个 SSE 事件都带上整页网页。
+	ToolResultFull string
+	// ToolTrust 是结果的信任标签 (如 "untrusted")。空 = 未标记。
+	ToolTrust string
+	// ToolSource 是结果的来源 URI (如抓取 URL)。空 = 未标记。
+	ToolSource string
+	IsThinking bool  // thinking delta (区别于普通文本)
+	Error      error // Kind=Error 时的错误
 }
 
 // ============================================================================

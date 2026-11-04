@@ -293,7 +293,7 @@ func RunToolUse(
 	// "所有声明需要确认的工具都可以不确认就执行" —— 一个装配遗漏被静默地翻译成
 	// 安全边界消失。拒不执行的代价是可见的（模型收到错误、用户来问），放行的代价
 	// 是不可见的。
-	if NeedsConfirmationOf(t) {
+	if NeedsConfirmationFor(t, block.Input) {
 		confirmed := tctx != nil && tctx.Confirmed != nil && tctx.Confirmed.IsConfirmed(toolName, block.Input)
 		if !confirmed {
 			// 错误文案要同时告诉模型两件事: (a) 这不是它的错（不要改参数重试到死）,
@@ -407,11 +407,24 @@ func RunToolUse(
 	}
 	content = compactToolResultContent(toolName, block.Input, content, tctx)
 
+	// trust/source 是**进程内**侧信道 (H-F2): 转写到 tool_result 块的
+	// Trust/SourceURI (json:"-"), 供 harness 与审核层判断"这段内容来自不可信
+	// 来源"。error 结果默认不携带任何信任标签 (空 = 未标记) —— 错误文本是
+	// 工具自己生成的诊断信息, 冒充"可信"没有意义, 冒充"不可信"又会污染策略判断。
+	//
+	// 注意: 这里写的是**没被序列化**的字段。跨 turn 从历史反序列化后标记会丢失,
+	// 因为证据语义属于"本次抓取", 不属于持久化的消息内容。
+	trust, sourceURI := result.Trust, result.SourceURI
+	if result.IsError {
+		trust, sourceURI = "", ""
+	}
 	resultBlocks := []types.ContentBlock{{
 		Type:      types.ContentBlockToolResult,
 		ToolUseID: toolUseID,
 		Content:   content,
 		IsError:   result.IsError,
+		Trust:     trust,
+		SourceURI: sourceURI,
 	}}
 	// 图像附件: 以 image 块追加在同一条 user 消息里 (Anthropic 多模态格式),
 	// tool_result 文本负责说明来源, 视觉模型 (kimi/qwen) 可直接查看图像内容。

@@ -41,6 +41,12 @@ type RunnerOptions struct {
 	// NewRunner 会自动套一层 IdempotentSink（R-H4），所以同一 TurnID 重放不会
 	// 重复落库，重放路径也能命中已完成的助手消息。宿主不需要自己包。
 	Sink TurnSink
+	// ToolResults 是**完整工具结果**的可选落库口 (H-F1)。nil = 不落库，
+	// 与改造前行为一致；ToolResult 的摘要/字节数仍会出现在 TurnResult 里。
+	//
+	// 与 Sink 分开装配，因为证据账本是增强能力：写入失败只进 Degraded，
+	// 不改变 turn 的成败与助手消息的持久化。
+	ToolResults ToolResultSink
 	// Blobs 是附件 blob 存储（R-H5/R-H11）。
 	//
 	// nil 且本轮带附件 ⇒ 附件解析失败，本轮以 ErrKindAttachment 结束。
@@ -390,6 +396,23 @@ type runSnapshot struct {
 	degraded           []string
 	citations          []Citation
 	hooks              []HookRecord
+}
+
+// toolPreviewBytes 是 ToolEvent 输入/结果预览的上限（H-F5）。
+// 与历史 ResultPreview 的 500 字节保持一致；用字节而不是 rune，是为了让
+// 事件的体积上限可预测（事件会进 SSE 与 trace）。
+const toolPreviewBytes = 500
+
+// previewBytes 截取前 n 字节；n <= 0 或内容更短时原样返回。
+//
+// 与旧实现相同的字节切片口径（允许切断 UTF-8 序列）：预览不是正文，消费方
+// 不得把它当作可解析内容；改成 rune 截断会改变既有预览的字节长度，反而让
+// "500B 预览"这条契约变得不可断言。
+func previewBytes(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // appendUnique 追加非空且不重复的原因，保持顺序。
@@ -744,7 +767,11 @@ func (r *Runner) runTurn(ctx context.Context, req TurnRequest, emit func(TurnEve
 	// 非文本块（图片/PDF）由 splitInput 归到 extra，引擎再放回本条消息里。
 	text, extra := splitInput(modelInput)
 
-	drain(r.opts.Engine.SubmitStreamBlocks(runCtx, text, extra), emitEvent, res, gate, r.now)
+	// 完整工具结果经由 drain 交给可选的 ToolResultSink。放在这里（助手消息
+	// 持久化之前）是 H-F1 的顺序要求：证据先落，回复后落；即使随后助手消息
+	// 持久化失败，证据也不会缺。
+	drain(runCtx, r.opts.Engine.SubmitStreamBlocks(runCtx, text, extra), emitEvent, res, gate, r.now,
+		r.opts.ToolResults, res.OwnerID, req.SessionID, req.TurnID)
 
 	// ===== 4. 终态与预算归因 =====
 	terminal := r.opts.Engine.LastTerminal()
@@ -1081,11 +1108,16 @@ func (r *Runner) Cancel(turnID string) error {
 // now 是可注入的时钟; nil 时用 time.Now。只用于 provenance 的执行时刻 (R-H9) ——
 // 它是"这条结论是哪次读取得来的"里的时间那一半, 用真实墙钟而不是零值, 否则
 // 宿主侧按时间排序会把所有工具调用归到同一刻。
-func drain(streamCh <-chan types.StreamEvent, emit func(TurnEvent), res *TurnResult, gate *budgetGate, now func() time.Time) {
+func drain(ctx context.Context, streamCh <-chan types.StreamEvent, emit func(TurnEvent), res *TurnResult, gate *budgetGate, now func() time.Time,
+	sink ToolResultSink, ownerID, sessionID, turnID string) {
 	if now == nil {
 		now = time.Now
 	}
 	var textSB []byte
+	// sinkFailed 保证同一个工具的 sink 失败只记一次 Degraded：一次 turn 里
+	// 同一个工具可能被调用几十次，逐次记会把降级列表刷成噪音，而"证据落库
+	// 坏了"这一事实只需要被宿主知道一次。
+	sinkFailed := make(map[string]bool, 4)
 	// openTools 是尚未闭合的工具调用。ToolStart 时登记, ToolDone 时按
 	// **ToolUseID** 精确配对 (无 ID 时退回按名字配对最早的一条)。
 	//
@@ -1117,7 +1149,11 @@ func drain(streamCh <-chan types.StreamEvent, emit func(TurnEvent), res *TurnRes
 				// 而在 ToolDone 处计数只能事后追认。
 				emit(TurnEvent{Kind: EventDegraded, Note: "budget_exhausted:tool_calls"})
 			}
-			emit(TurnEvent{Kind: EventToolStart, Tool: &ToolEvent{ToolUseID: ev.ToolUseID, Name: ev.ToolName}})
+			emit(TurnEvent{Kind: EventToolStart, Tool: &ToolEvent{
+				ToolUseID:    ev.ToolUseID,
+				Name:         ev.ToolName,
+				InputPreview: previewBytes(ev.ToolInput, toolPreviewBytes),
+			}})
 		case types.StreamEventToolDone:
 			idx := matchOpenTool(openTools, ev.ToolUseID, ev.ToolName)
 			if idx < 0 {
@@ -1129,11 +1165,19 @@ func drain(streamCh <-chan types.StreamEvent, emit func(TurnEvent), res *TurnRes
 			}
 			rec := openTools[idx]
 			rec.IsError = strings.HasPrefix(ev.ToolResult, "[error]")
-			if len(ev.ToolResult) > 500 {
-				rec.ResultPreview = ev.ToolResult[:500]
-			} else {
-				rec.ResultPreview = ev.ToolResult
+			// 全文优先；旧生产者只填 200B 摘要时退回摘要，行为与改造前一致。
+			//
+			// 全文**不**写进 ToolCallRecord（trace 膨胀），只用于预览、字节数
+			// 与 ToolResultSink。
+			full := ev.ToolResultFull
+			if full == "" {
+				full = ev.ToolResult
 			}
+			rec.ResultPreview = previewBytes(full, toolPreviewBytes)
+			rec.ResultBytes = len(full)
+			rec.ResultTruncated = len(full) > toolPreviewBytes
+			rec.Trust = ev.ToolTrust
+			rec.SourceURI = ev.ToolSource
 			// provenance (R-H9): 工具名 + 参数哈希 + 执行时刻。缺这一段的话,
 			// 宿主无法回答"这条结论是哪次读取得来的", 也无法在做证据审计时
 			// 把同一工具的不同调用区分开。
@@ -1148,7 +1192,40 @@ func drain(streamCh <-chan types.StreamEvent, emit func(TurnEvent), res *TurnRes
 			res.ToolCalls = append(res.ToolCalls, *rec)
 			delete(startedAt, rec)
 			openTools = append(openTools[:idx], openTools[idx+1:]...)
-			emit(TurnEvent{Kind: EventToolDone, Tool: &ToolEvent{ToolUseID: ev.ToolUseID, Name: ev.ToolName}})
+
+			// 先把完成事件发给 UI，再落证据：sink 是宿主存储，可能慢；让事件
+			// 等待存储会让"工具已经完成"的可观测性取决于存储可用性。
+			emit(TurnEvent{Kind: EventToolDone, Tool: &ToolEvent{
+				ToolUseID:     ev.ToolUseID,
+				Name:          ev.ToolName,
+				ResultPreview: rec.ResultPreview,
+				Trust:         ev.ToolTrust,
+				SourceURI:     ev.ToolSource,
+			}})
+
+			// H-F1: 完整结果交给宿主。失败**不**让 turn 失败 —— 证据账本是
+			// 增强能力；只记一次 Degraded，供业务层知道"这轮证据没落全"。
+			if sink != nil {
+				srec := ToolResultRecord{
+					OwnerID:    ownerID,
+					SessionID:  sessionID,
+					TurnID:     turnID,
+					ToolUseID:  rec.ToolUseID,
+					Name:       rec.Name,
+					Input:      rec.Input,
+					InputHash:  rec.InputHash,
+					FullResult: full,
+					IsError:    rec.IsError,
+					DurationMS: rec.DurationMS,
+					Trust:      ev.ToolTrust,
+					SourceURI:  ev.ToolSource,
+					ExecutedAt: rec.Provenance.ExecutedAt,
+				}
+				if err := sink.AppendToolResult(ctx, srec); err != nil && !sinkFailed[rec.Name] {
+					sinkFailed[rec.Name] = true
+					res.Degraded = appendUnique(res.Degraded, "tool_result_sink_failed:"+rec.Name)
+				}
+			}
 		case types.StreamEventMessageDone:
 			if ev.Message != nil {
 				res.Blocks = ev.Message.Content

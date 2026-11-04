@@ -193,8 +193,62 @@ type ToolCallRecord struct {
 	// ResultPreview 是结果的短预览（前 500 字节）。完整结果在 transcript 的工具
 	// 消息里，这里只是让业务层不必再翻历史就能渲染"做了什么、返回了什么"。
 	ResultPreview string `json:"resultPreview,omitempty"`
+	// ResultBytes 是**完整结果**的字节数（不是预览长度）。业务层据此判断
+	// "证据有多大"以及预览是否被截断，而不必把全文塞进 trace。
+	ResultBytes int `json:"resultBytes,omitempty"`
+	// ResultTruncated 表示完整结果超过了 ResultPreview 的 500 字节预览窗口。
+	// 注意它**不**表示引擎侧做过裁剪 —— 引擎的裁剪只反映在 ResultBytes 上,
+	// 两者是不同的口径, 不能互相推断。
+	ResultTruncated bool `json:"resultTruncated,omitempty"`
+	// Trust 是结果的信任标签 (H-F2)。"untrusted" = 内容来自外部网页/搜索,
+	// 只能当数据不能当指令; 空 = 未标记 (本地工具)。
+	Trust string `json:"trust,omitempty"`
+	// SourceURI 是结果来源 URI (抓取 URL / search:<query>)。空 = 未标记。
+	SourceURI string `json:"sourceUri,omitempty"`
 	// Provenance 记录来源，便于审计"这个结论是哪次读取得来的"。
 	Provenance Provenance `json:"provenance,omitempty"`
+}
+
+// ToolResultRecord 是一次工具调用的**完整结果**记录 (H-F1 证据闭环)。
+//
+// # 为什么单独成一条记录, 而不是塞进 ToolCallRecord/TurnResult
+//
+// TurnResult 会进 trace、会被序列化、可能被整体缓存/上报。把整页网页塞进去
+// 会让 trace 从 KB 级膨胀到 MB 级, 且正文里的私密数据会跟着观测面走。所以
+// 完整结果只经由宿主实现的 ToolResultSink 落**业务可控**的存储, trace 里
+// 只保留 ResultBytes/ResultPreview 这样的摘要。
+//
+// ToolCallRecord 也刻意**不**含全集: 它进 TurnResult, 同样的膨胀问题。
+type ToolResultRecord struct {
+	// OwnerID/SessionID/TurnID 是归属键。与 ToolSink 的其它记录同源, 用于
+	// 把证据挂回具体的 turn (证据可追溯、幻觉引用防线)。
+	OwnerID   string `json:"ownerId,omitempty"`
+	SessionID string `json:"sessionId"`
+	TurnID    string `json:"turnId"`
+
+	ToolUseID string          `json:"toolUseId,omitempty"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	InputHash string          `json:"inputHash,omitempty"`
+	// FullResult 是工具结果的原文。可能很大; 由宿主决定如何存储。
+	FullResult string `json:"fullResult"`
+	IsError    bool   `json:"isError,omitempty"`
+	DurationMS int64  `json:"durationMs,omitempty"`
+	// Trust/SourceURI 是 H-F2 的不可信标记与来源, 原样来自引擎事件。
+	Trust     string `json:"trust,omitempty"`
+	SourceURI string `json:"sourceUri,omitempty"`
+	// ExecutedAt 是工具开始执行的时刻。
+	ExecutedAt time.Time `json:"executedAt"`
+}
+
+// ToolResultSink 是完整工具结果的可选落库契约 (H-F1)。
+//
+// 与 TurnSink 分开: 不是每个宿主都需要证据账本, 而一旦需要, 写入失败也**不能**
+// 让 turn 失败 (证据是增强能力, 不是回复的硬依赖)。Runner 在助手消息持久化
+// **之前**调用它; 失败只记一条 Degraded ("tool_result_sink_failed:<tool>",
+// 每个工具最多一次), 本轮照常完成。
+type ToolResultSink interface {
+	AppendToolResult(ctx context.Context, rec ToolResultRecord) error
 }
 
 // Provenance 是工具结果的来源信息。
@@ -257,6 +311,16 @@ type ToolEvent struct {
 	ToolUseID string `json:"toolUseId,omitempty"`
 	Name      string `json:"name"`
 	IsError   bool   `json:"isError,omitempty"`
+	// InputPreview / ResultPreview 各是前 500 字节 (H-F5 输入可见性)。
+	//
+	// 为什么预览而不是全文: 事件会进 SSE/trace, 整页网页或大文件输入会让
+	// 每个事件都变成 MB 级。需要全文的消费方走 ToolResultSink (H-F1)。
+	// 空串 = 该阶段没有内容 (如工具开始事件没有结果)。
+	InputPreview  string `json:"inputPreview,omitempty"`
+	ResultPreview string `json:"resultPreview,omitempty"`
+	// Trust/SourceURI 是 H-F2 的不可信标记与来源。空 = 未标记。
+	Trust     string `json:"trust,omitempty"`
+	SourceURI string `json:"sourceUri,omitempty"`
 }
 
 // ============================================================================

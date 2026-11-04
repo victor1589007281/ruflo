@@ -2673,11 +2673,20 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 						// tool_use_id。事件里必须带名字 —— 消费方按 ID 配对时用它
 						// 做交叉校验, 而按名字配对的旧消费方 (XML 回退路径) 少了
 						// 它就一条都配不上。
+						// H-F1/H-F2: 摘要字段保持 200B (既有 SSE 出口只读它),
+						// 全文与信任标记走**新增**字段。ToolResultFull 只给进程内
+						// harness (drain → ToolResultSink), 不进入 SSE/HTTP 出口。
+						// cb.Content 就是引擎手里该 tool_result 块的完整内容 ——
+						// 如果它已被 ResultLimiter/压缩裁剪, 这里拿到的也是裁剪后的
+						// 版本, 与模型实际看到的内容一致 (证据口径必须同源)。
 						streamCh <- types.StreamEvent{
-							Kind:       types.StreamEventToolDone,
-							ToolName:   toolNameForUseID(toolUseBlocks, cb.ToolUseID),
-							ToolUseID:  cb.ToolUseID,
-							ToolResult: summary,
+							Kind:           types.StreamEventToolDone,
+							ToolName:       toolNameForUseID(toolUseBlocks, cb.ToolUseID),
+							ToolUseID:      cb.ToolUseID,
+							ToolResult:     summary,
+							ToolResultFull: cb.Content,
+							ToolTrust:      cb.Trust,
+							ToolSource:     cb.SourceURI,
 						}
 					}
 				}

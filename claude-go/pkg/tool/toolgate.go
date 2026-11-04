@@ -72,6 +72,32 @@ func NeedsConfirmationOf(t Tool) bool {
 	return false
 }
 
+// ToolMetaInputConfirmation 是确认声明的**按入参**变体 (H-F2 出网策略)。
+//
+// 与 ToolMetaConfirmation 的区别: 有些工具是否需要人点头取决于这一次参数,
+// 而不是工具本身。典型例子是 WebFetch —— 白名单域名无需确认, 未知域名必须
+// 确认; 若只能静态声明, 要么把已知域也拖进确认(骚扰), 要么放行未知域(穿透)。
+//
+// 两个接口可以同时实现, 判定取**并集** (任一为 true 就要求确认)。
+type ToolMetaInputConfirmation interface {
+	// NeedsConfirmationFor 表示这一次调用是否需要宿主显式确认。
+	NeedsConfirmationFor(input json.RawMessage) bool
+}
+
+// NeedsConfirmationFor 返回**这一次调用**是否要求确认。
+//
+// 先问按入参的声明, 再回退到工具级声明。未实现任一接口或为 nil 时返回 false
+// (执行闸的默认仍是"不设闸", 理由见 ToolMetaConfirmation 的注释)。
+func NeedsConfirmationFor(t Tool, input json.RawMessage) bool {
+	if t == nil {
+		return false
+	}
+	if c, ok := t.(ToolMetaInputConfirmation); ok && c.NeedsConfirmationFor(input) {
+		return true
+	}
+	return NeedsConfirmationOf(t)
+}
+
 // IdempotentTool 是工具**可选实现**的"本轮内结果可按 (工具, 参数) 复用"声明。
 //
 // # 为什么是工具自己声明，而不是按 IsReadOnly 自动推导

@@ -131,6 +131,17 @@ type ToolResult struct {
 	// Images 可选图像附件 (如 FileRead 读取图片文件)。非空时 RunToolUse 会在 tool_result
 	// 块之后以 image 内容块追加到同一条 user 消息 (Anthropic 多模态格式), 供视觉模型直接查看。
 	Images []types.MediaSource `json:"images,omitempty"`
+
+	// Trust 是结果的信任标签 (H-F2)。约定值:
+	//   - ""          — 未标记 (本地可信工具; 与改造前逐字节相同)
+	//   - "untrusted" — 内容来自外部/不可信来源 (网页、搜索结果), 只能当数据,
+	//                   不能当指令执行。
+	// RunToolUse 会把它转写到 tool_result 内容块的**进程内**侧信道
+	// (types.ContentBlock.Trust, json:"-"), 不进入上游请求体。
+	Trust string
+	// SourceURI 是结果的来源 URI (抓取 URL、搜索 query 等), 用于证据可追溯。
+	// 同样只走进程内侧信道, 不进入请求体。
+	SourceURI string
 }
 
 // ToolCallObservation 是一次工具调用的实际执行观测。Duration 从 RunToolUse

@@ -244,12 +244,12 @@ func BenchmarkHarnessOverhead_DrainStreamEvents(b *testing.B) {
 		// 每个事件都要付的成本，不是夹具噪音。
 		var emitMu sync.Mutex
 		var seq int64
-		drain(ch, func(ev TurnEvent) {
+		drain(context.Background(), ch, func(ev TurnEvent) {
 			emitMu.Lock()
 			seq++
 			ev.Seq = seq
 			emitMu.Unlock()
-		}, res, nil, nil)
+		}, res, nil, nil, nil, "", "", "")
 
 		if seq == 0 {
 			b.Fatal("drain 未发出任何事件")
