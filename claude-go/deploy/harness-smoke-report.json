@@ -1,8 +1,8 @@
 {
   "pass": true,
   "model": "opencode:deepseek-v4.1-flash",
-  "startedAt": "2026-11-04T14:11:47.060520207Z",
-  "durationMs": 7636,
+  "startedAt": "2026-11-04T14:16:02.699148761Z",
+  "durationMs": 7087,
   "checks": [
     {
       "name": "build_engine",
@@ -12,7 +12,7 @@
     {
       "name": "blob_store",
       "pass": true,
-      "detail": "/tmp/harness-smoke-blobs-2979832381"
+      "detail": "/tmp/harness-smoke-blobs-3671204842"
     },
     {
       "name": "live_turn_answer",
@@ -22,12 +22,12 @@
     {
       "name": "live_usage_cost",
       "pass": true,
-      "detail": "usageKnown=true in=650 out=3 costKnown=true cost=0.000653000"
+      "detail": "usageKnown=true in=586 out=3 costKnown=true cost=0.000589000"
     },
     {
       "name": "live_cost_known",
       "pass": true,
-      "detail": "costKnown=true cost=0.000653000（账本已装配）"
+      "detail": "costKnown=true cost=0.000589000（账本已装配）"
     },
     {
       "name": "live_model_route",
