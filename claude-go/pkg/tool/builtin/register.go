@@ -59,6 +59,9 @@ func RegisterBaseToolsWithStore(reg *tool.Registry, store *TaskStore, searcher W
 	// Web tools
 	reg.Register(NewWebFetchTool())
 	reg.Register(NewWebSearchTool(searcher))
+	// 有界研究属于"查资料"能力, 与 WebSearch/WebFetch 同进同出; admin 档是各
+	// 档位的并集, 漏掉这里会让 ToolNameCatalog 判研/分析档的 DeepResearch 是假名。
+	registerDeepResearchTool(reg, searcher)
 	reg.Register(NewKLineTool())
 	reg.Register(NewQuoteTool())
 	// 结构化行情数据面 (时点/复权/多源核价), 与 WebSearch 的叙述性检索分工。

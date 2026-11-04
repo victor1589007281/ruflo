@@ -33,6 +33,9 @@ var toolNameCaps = map[string]agent.Capability{
 	"Bash": agent.CapExec, "Shell": agent.CapExec, // Shell 是 Bash 的旧名 (别名), 两者同维
 	"TaskOutput": agent.CapExec, "TaskStop": agent.CapExec,
 	"WebFetch": agent.CapNet, "WebSearch": agent.CapNet, "FetchKLine": agent.CapNet, "FetchQuote": agent.CapNet,
+	// DeepResearch 与 WebSearch/WebFetch 同维: 只读、无副作用, 但会出网并抓取正文。
+	// 它只注册在 research/analysis/admin, 这三档的 profileCaps 均已含 CapNet。
+	"DeepResearch": agent.CapNet,
 	// market_* 走外部行情源, 与 WebFetch/WebSearch 同维 (CapNet): 只读, 但会出网。
 	"market_snapshot": agent.CapNet, "market_quote": agent.CapNet, "market_history": agent.CapNet,
 	"market_fundamentals": agent.CapNet, "market_filings": agent.CapNet, "market_news": agent.CapNet,

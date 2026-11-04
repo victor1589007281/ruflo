@@ -74,6 +74,10 @@ func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searche
 		todoTool := NewTodoWriteTool()
 		reg.Register(todoTool)
 		registerWebAndInteractionTools(reg, searcher)
+		// 有界研究: 与 WebSearch/WebFetch 同档。DeepResearch 只读且并发安全,
+		// 直接复用同一份 LegacySearcher 底下的 Manager; 未装配数据面时注册的
+		// 实例会在 Call 里明确报 unavailable (见 registerDeepResearchTool)。
+		registerDeepResearchTool(reg, searcher)
 		registerMarketDataTools(reg)
 		reg.Register(NewEnterPlanModeTool())
 		reg.Register(NewExitPlanModeTool())
@@ -96,6 +100,9 @@ func RegisterProfileToolsWithStore(reg *tool.Registry, store *TaskStore, searche
 		registerCodeIntelReadTools(reg) // CodeIntelQuery/Status (只读, 精准定位代替地毯式扫描)
 		reg.Register(NewWebFetchTool())
 		reg.Register(NewWebSearchTool(searcher))
+		// 只读调研档同样需要"取证后再回答"的能力: DeepResearch 不产生新事实,
+		// 只把逐字引用交回来, 与 analysis 档的定位一致。
+		registerDeepResearchTool(reg, searcher)
 		registerMarketDataTools(reg)
 		// 排障取数: 只读、固定采集 SQL、DSN 由运维白名单提供。放在 analysis 档
 		// 是因为它本身就是"只读取证"动作, 不引入写/执行能力。
