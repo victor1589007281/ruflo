@@ -43,6 +43,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/harness"
@@ -491,17 +492,28 @@ func runHarnessSmoke(timeout time.Duration) *smokeReport {
 		}
 	}
 
-	// 出站模型：直连 provider 必须发裸名（带 provider 前缀会被厂商 400）。
-	wantBare := flagModel
-	if i := strings.Index(wantBare, ":"); i >= 0 {
-		wantBare = wantBare[i+1:]
+	// 出站模型由 ResolvedConfig.OutboundModelName 决定，不能一律要求裸名：
+	//   - 直连 provider：裸名（带 provider 前缀会被厂商 400）；
+	//   - 经 CLAUDE_GO_LLM_GATEWAY：完整别名，网关用别名选 provider。
+	// 部署拓扑两种都合法，所以这里以装配后的 APIClient 端点为判据，而不是
+	// 无脑把冒烟里的 flagModel 剥前缀 —— 否则网关拓扑会稳定假红。
+	wantOutbound := flagModel
+	if i := strings.Index(wantOutbound, ":"); i >= 0 {
+		wantOutbound = wantOutbound[i+1:]
+	}
+	routeMode := "直连 provider 发裸名"
+	if gw := modelconfig.GatewayBaseURL(); gw != "" &&
+		strings.TrimRight(eng.APIClient.BaseURL, "/") == gw {
+		wantOutbound = flagModel
+		routeMode = "经 LLM 网关发别名"
 	}
 	routeDetail := "没有出站请求"
 	routeOK := false
 	if len(textReqs) > 0 {
 		sent := textReqs[0].Model
-		routeOK = sent == wantBare
-		routeDetail = fmt.Sprintf("出站 model=%q want=%q path=%s", sent, wantBare, textReqs[0].Path)
+		routeOK = sent == wantOutbound
+		routeDetail = fmt.Sprintf("出站 model=%q want=%q path=%s（%s）",
+			sent, wantOutbound, textReqs[0].Path, routeMode)
 	}
 	// 路由可观测：TurnResult.Model 必须是本轮实际使用的身份（这里等于 flagModel）。
 	if resText != nil && resText.Model != flagModel {
