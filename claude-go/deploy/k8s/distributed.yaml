@@ -43,6 +43,9 @@ spec:
             - name: KIMI_API_KEY
               valueFrom:
                 secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: opencode-api-key, optional: true }
           ports: [{ containerPort: 18081 }]
           readinessProbe:
             httpGet: { path: /healthz, port: 18081 }
@@ -109,6 +112,9 @@ spec:
             - name: KIMI_API_KEY
               valueFrom:
                 secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: opencode-api-key, optional: true }
           ports: [{ containerPort: 18080 }]
           readinessProbe:
             httpGet: { path: /api/health, port: 18080 }
@@ -236,6 +242,11 @@ spec:
             - name: KIMI_API_KEY
               valueFrom:
                 secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+            # worker 直连 provider(非 remote 档)时也需要 provider 凭据；经网关时
+            # 由网关持有 —— 两边都给，避免档位切换时凭据缺失。
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: opencode-api-key, optional: true }
             - name: POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             # 状态目录必须**每个 worker 独立** (FileStore 无跨进程锁), 所以给它自己的

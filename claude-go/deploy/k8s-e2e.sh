@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 用法: bash deploy/k8s-e2e.sh   (需 kind 集群 + 宿主 ~/.claude-go/config/config.json 内有真实 kimi key)
+# 用法: bash deploy/k8s-e2e.sh   (需 kind 集群 + 宿主 ~/.claude-go/config/config.json 内有被测 provider 的真实 key)
+#       CLAUDE_GO_E2E_MODEL=<provider>:<model> 覆盖模型（默认 opencode:deepseek-v4.1-flash）
 # 集群名可用 CLAUDE_GO_E2E_CLUSTER 覆盖。清理: kubectl delete ns claude-go
 # claude-go K8s 真实 LLM 端到端验证
 #
@@ -29,6 +30,14 @@ export PATH="$PATH:$HOME/go/bin"
 REPO=/home/victor/base/git/temp/ruflo/claude-go
 NS=claude-go
 CLUSTER=${CLAUDE_GO_E2E_CLUSTER:-dbk8s-e2e}   # kind 集群名; 独立 namespace, 不碰其它项目
+
+# 集群由 CLUSTER 决定，**不能**依赖 ~/.kube/config 的 current-context。
+# 实测该字段为空时 kubectl 仍会打 discovery 并返回
+# "the server could not find the requested resource"：第 3/4 步的 apply 全部静默失败，
+# 报错却记在 rollout 上（看起来像集群抖动，实际是脚本验了一个不存在的上下文）。
+# 与 harness-smoke-k8s.sh / k8s-e2e-weakmodel.sh 一致：显式 --context。
+KCTX="kind-$CLUSTER"
+kubectl() { command kubectl --context "$KCTX" "$@"; }
 
 # ⚠️ 镜像标签**每轮唯一** —— 这一条是本脚本最重要的正确性前提, 曾静默失效过一整轮:
 #
@@ -129,44 +138,68 @@ docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
   | grep -E '^claude-go:e2e-[0-9]+$' | grep -v ":e2e-$STAMP\$" \
   | xargs -r docker rmi -f >/dev/null 2>&1 || true
 
-step "3/13 创建 namespace / Secret / ConfigMap"
+step "3/13 创建 namespace / Secret"
 kubectl create ns "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-# 真实 kimi key 从宿主配置取，只进 Secret，不写进仓库任何文件
-KEY=$(python3 -c "
-import json;d=json.load(open('$HOME/.claude-go/config/config.json'))
-print(d['providers']['kimi']['apiKey'])")
-[ -n "$KEY" ] || { bad "宿主配置里取不到 kimi apiKey"; exit 1; }
-kubectl -n "$NS" create secret generic claude-go-llm \
-  --from-literal=kimi-api-key="$KEY" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-ok "Secret 已建（key 长度 ${#KEY}，不落盘不入库）"
 
 # 本轮测试用的模型别名。改这里就够了 —— 下面第 6.5 步会**断言真跑的就是它**,
 # 免得配了个不存在的模型而代码静默退回默认模型 (那属于"验的不是被测物")。
-# k3-256k 已用真 API 探过 (POST /v1/messages → HTTP 200), 不是猜的。
-MODEL_ALIAS=${CLAUDE_GO_E2E_MODEL:-kimi:k3-256k}
+# provider 前缀同时决定 baseUrl / Secret 键名 / 覆盖用环境变量名, 三者必须一致:
+# modelconfig 只在 provider 名与 env 前缀对上时才把 <PROVIDER>_API_KEY 注入占位符。
+MODEL_ALIAS=${CLAUDE_GO_E2E_MODEL:-opencode:deepseek-v4.1-flash}
+PROVIDER=${MODEL_ALIAS%%:*}
 MODEL_NAME=${MODEL_ALIAS#*:}   # 送给 API 的模型名 = 别名去掉 provider 前缀
-# ConfigMap 保留占位符 apiKey —— 正是要验证 <PROVIDER>_API_KEY 覆盖生效
-kubectl -n "$NS" create configmap claude-go-config --from-literal=config.json='{
-  "stateDir": "/data/.claude-go",
-  "cwd": "/data",
-  "providers": {
-    "kimi": {
-      "name": "kimi",
-      "baseUrl": "https://api.kimi.com/coding/v1",
-      "apiKey": "PLACEHOLDER_OVERRIDE_VIA_ENV",
-      "models": { "'"$MODEL_ALIAS"'": { "maxTokens": 65536, "contextWindow": 262144, "promptCacheMode": "auto", "maxParallel": 4, "rpm": 60 } }
-    }
-  },
-  "ai": { "modelAlias": "'"$MODEL_ALIAS"'", "maxTurns": 12, "maxTokens": 8192 },
-  "wiki": { "enabled": true, "apiPort": 18080 }
-}' --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-ok "ConfigMap 已建（模型 $MODEL_ALIAS，contextWindow=262144；apiKey 故意留占位符）"
+case "$PROVIDER" in
+  opencode)
+    BASE_URL=https://opencode.ai/zen/go/v1
+    MODEL_CFG='"maxTokens": 8192, "contextWindow": 131072, "promptCacheMode": "on", "maxParallel": 4, "rpm": 60' ;;
+  kimi)
+    BASE_URL=https://api.kimi.com/coding/v1
+    MODEL_CFG='"maxTokens": 65536, "contextWindow": 262144, "promptCacheMode": "auto", "maxParallel": 4, "rpm": 60' ;;
+  *)
+    bad "未知 provider=$PROVIDER（只支持 opencode / kimi）"; exit 1 ;;
+esac
+ENV_NAME=$(printf '%s' "${PROVIDER}_API_KEY" | tr '[:lower:]' '[:upper:]')
+
+# 真实 key 从宿主配置取，只进 Secret，不写进仓库任何文件
+KEY=$(python3 -c "
+import json;d=json.load(open('$HOME/.claude-go/config/config.json'))
+print(d['providers']['$PROVIDER']['apiKey'])")
+[ -n "$KEY" ] || { bad "宿主配置里取不到 $PROVIDER apiKey"; exit 1; }
+kubectl -n "$NS" create secret generic claude-go-llm \
+  --from-literal="$PROVIDER-api-key=$KEY" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+ok "Secret 已建（$PROVIDER-api-key，长度 ${#KEY}，不落盘不入库）"
+
+# ConfigMap 不在这里建 —— 见第 4 步：monolith.yaml **内嵌**了一份 kimi 配置的
+# 同名 ConfigMap，先建再 apply 会被它覆盖（实测 banner 变回 kimi:k3、provider key
+# 覆盖日志消失，而 Pod 仍因唯一镜像标签通过"新鲜"断言）。必须 apply 清单之后再写，
+# 并 rollout restart 让 Pod 重读。
 
 step "4/13 部署单体模式"
 sed -e "s|image: localhost:5000/claude-go:latest|image: $IMG|" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
     "$REPO/deploy/k8s/monolith.yaml" \
   | kubectl apply -f - >/dev/null
+
+# ConfigMap 保留占位符 apiKey —— 正是要验证 <PROVIDER>_API_KEY 覆盖生效。
+# 放在 monolith.yaml 之后：那份清单自带同名 ConfigMap（kimi:k3），会覆盖这里。
+kubectl -n "$NS" create configmap claude-go-config --from-literal=config.json='{
+  "stateDir": "/data/.claude-go",
+  "cwd": "/data",
+  "providers": {
+    "'"$PROVIDER"'": {
+      "name": "'"$PROVIDER"'",
+      "baseUrl": "'"$BASE_URL"'",
+      "apiKey": "PLACEHOLDER_OVERRIDE_VIA_ENV",
+      "models": { "'"$MODEL_ALIAS"'": { '"$MODEL_CFG"' } }
+    }
+  },
+  "ai": { "modelAlias": "'"$MODEL_ALIAS"'", "maxTurns": 12, "maxTokens": 8192 },
+  "wiki": { "enabled": true, "apiPort": 18080 }
+}' --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+ok "ConfigMap 已建（provider=$PROVIDER 模型 $MODEL_ALIAS；apiKey 故意留占位符）"
+
+# 上述 apply 可能已经让旧配置的 Pod 启动了；重启一次，确保新 Pod 读的是本轮配置。
+kubectl -n "$NS" rollout restart deploy/claude-go-monolith >/dev/null 2>&1
 # ⚠️ **显式把三个灰度开关摘掉** —— 否则上一轮第 11 步 `kubectl set env` 加的 env
 # 会**活到这一轮**: `kubectl apply` 只对"自己曾经声明过"的字段做三方合并, 对
 # last-applied 里没有、yaml 里也没有的字段 (正是 set env 加的那些) **一律保留**。
@@ -198,14 +231,14 @@ assert_fresh_pod "$POD" "单体 Pod" || { echo; echo "  通过 $PASSED 项 / 未
 step "5/13 验收①: ConfigMap 真被读取 + 真 key 生效"
 sleep 3
 # ⚠️ **读全量日志, 不用 --tail** —— 这两条断言要找的是**启动首几行**
-# (`[modelconfig] provider "kimi" 的 apiKey 取自环境变量` 落在第 1 行与第 10 行),
+# (`[modelconfig] provider "<provider>" 的 apiKey 取自环境变量` 落在第 1 行与第 10 行),
 # 而 Pod 启动到这里已经能刷出 300+ 行 (28 个技能 / 飞书重连 / 各子系统就绪)。
 # 用 --tail=200 时窗口早已滑过那两行 ⇒ 第一条断言**假红**;
 # 更糟的是第二条 (`grep -qiE '占位|placeholder'`) 会因为"窗口里没有占位字样"而**假绿** ——
 # 一条在错误窗口上做否定断言的检查, 恒真, 属"许愿式测试"。
 LOG=$(kubectl -n "$NS" logs "$POD" 2>/dev/null)
-if grep -q 'apiKey 取自环境变量 KIMI_API_KEY' <<<"$LOG"; then
-  ok "provider key 来自 Secret 注入的环境变量（<PROVIDER>_API_KEY 覆盖生效）"
+if grep -q "apiKey 取自环境变量 $ENV_NAME" <<<"$LOG"; then
+  ok "provider key 来自 Secret 注入的环境变量 $ENV_NAME（<PROVIDER>_API_KEY 覆盖生效）"
 else
   bad "未见 key 覆盖日志 —— ConfigMap 或环境变量覆盖没生效"
 fi
@@ -227,7 +260,7 @@ echo "  /api/workflows 数量 = ${WF:-取不到}"
 # 只声明不断言的话, 配一个不存在的模型时代码可能静默退回默认模型, 而整轮 E2E 照常绿。
 # 这一条查启动横幅; 第 8 步再从 llm.jsonl 的标签查**真正发出去的**模型名, 两头都要对。
 # 横幅打的是 `config.ModelAlias`（main.go:1397 `fmt.Printf("  Model:     %s\n", ...)`),
-# 所以按**子串**匹配模型名而不是写死 `Model: +<名>` —— 后者在打别名 (kimi:k3-256k) 时
+# 所以按**子串**匹配模型名而不是写死 `Model: +<名>` —— 后者在打带 provider 前缀的别名时
 # 会因为中间那段 provider 前缀而不匹配, 给出一条假红。
 BANNER_MODEL=$(grep -m1 -E '^ +Model: +' <<<"$LOG" | sed 's/^ *Model: *//' | tr -d '\r')
 case "${BANNER_MODEL:-}" in
@@ -273,7 +306,7 @@ kubectl -n "$NS" exec "$POD" -- sh -c "ls /data/.claude-go/teams/$T_MONO/ 2>/dev
   | grep -q . && ok "团队目录有产物 ($T_MONO)" || bad "无团队目录或目录为空 ($T_MONO)"
 # —— **真正发给 API 的模型名**（llm.jsonl 的 model 标签）——
 # 这是模型断言的第二头: 启动横幅只说明配置被解析, 而每次调用实际用的模型来自
-# 请求构造那一路。两头都对才叫"这一轮真的在用 k3-256k"。
+# 请求构造那一路。两头都对才叫"这一轮真的在用配置的模型"。
 echo "  — 本轮真实调用的模型分布:"
 kubectl -n "$NS" exec "$POD" -- sh -c 'grep llm_call_count /data/.claude-go/metrics/llm.jsonl 2>/dev/null' \
   | python3 -c "
@@ -347,8 +380,11 @@ if [ -n "$CTLPOD" ] && [ -n "$WPOD" ]; then
   [ -n "$CAPOK" ] \
     && ok "worker 上报 cwd 档位标签 (ws:pvc + wsvol:claude-go-teams)" \
     || bad "worker 未上报档位标签 —— 档位路由没通电（已等 150s）"
-  kubectl -n "$NS" logs "$CTLPOD" --tail=400 2>/dev/null | grep -q 'cwd 档位=pvc' \
-    && ok "控制面已按 pvc 档位派活" || bad "控制面未声明 cwd 档位"
+  # ⚠️ "控制面按 pvc 档位派活" 这条日志由 broker.remoteRuntime.Execute 在**派活时**
+  # 打印（ws.resolve），不是启动时。原先放在 team/run 之前查，等于断言一行还没生成的
+  # 日志 —— 模型慢/阶段多的一轮里必然假红（DeepSeek 那轮复现，kimi 那轮恰好抢在打印
+  # 之后所以假绿）。移到下面网关团队真正派活之后，用全量日志轮询（--tail 会随日志量增长
+  # 滚出窗口）。
   # ⚠️ 变量名**不能**叫 STAMP: 那是顶上那个"每轮唯一标签/团队名"用的全局量,
   # 在这里覆写等于让后续步骤的镜像与团队名判据换了个值 (曾是潜伏的踩坑点)。
   WSPROBE="ws-probe-$RANDOM"
@@ -365,6 +401,17 @@ if [ -n "$CTLPOD" ]; then
     -d '{"workflow":"research","objective":"一句话说明什么是租约(lease)"}' >/dev/null 2>&1
   kubectl -n "$NS" exec "$CTLPOD" -- curl -s -X POST \
     localhost:18080/api/actions/team/run/$T_GW -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1
+  # 派活已发生 ⇒ 现在才可能出现档位声明日志。轮询到它出现为止（最多 60s）。
+  CWDDECL=""
+  for i in $(seq 30); do
+    if kubectl -n "$NS" logs "$CTLPOD" 2>/dev/null | grep -q 'cwd 档位=pvc'; then
+      CWDDECL=1; break
+    fi
+    sleep 2
+  done
+  [ -n "$CWDDECL" ] \
+    && ok "控制面已按 pvc 档位派活" \
+    || bad "控制面未声明 cwd 档位（派活后 60s 内日志里没有 'cwd 档位=pvc'）"
   sleep 240
   # 网关的 access.jsonl 有行 = 流量真的过了网关（CLAUDE_GO_LLM_GATEWAY 生效）
   ACC=$(kubectl -n "$NS" exec "$GWPOD" -- sh -c 'cat /data/.claude-go/llm-gateway/access.jsonl 2>/dev/null | wc -l' 2>/dev/null)

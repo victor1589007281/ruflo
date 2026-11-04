@@ -99,6 +99,9 @@ spec:
             - name: KIMI_API_KEY
               valueFrom:
                 secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: opencode-api-key, optional: true }
             # ── k8s-job runtime ──────────────────────────────────────────────
             - name: CLAUDE_GO_K8SJOB
               value: "1"
@@ -125,7 +128,7 @@ spec:
             # LLM 凭据走 Secret 引用而不是明文 Env: 明文会出现在
             # `kubectl get job -o yaml` 里, 谁能看 Job 谁就拿到了 key。
             - name: CLAUDE_GO_K8SJOB_ENV_SECRET
-              value: "KIMI_API_KEY=claude-go-llm/kimi-api-key"
+              value: "KIMI_API_KEY=claude-go-llm/kimi-api-key,OPENCODE_API_KEY=claude-go-llm/opencode-api-key"
             - name: CLAUDE_GO_K8SJOB_ENV
               value: "CLAUDE_GO_LLM_GATEWAY=http://claude-go-gateway:18081"
             # 同时在飞的 Job 上限。不设上限时一次大扇出会把集群其它工作负载挤掉。

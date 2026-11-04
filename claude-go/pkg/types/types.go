@@ -31,12 +31,12 @@ const (
 type ContentBlockType string
 
 const (
-	ContentBlockText         ContentBlockType = "text"
-	ContentBlockToolUse      ContentBlockType = "tool_use"
-	ContentBlockToolResult   ContentBlockType = "tool_result"
-	ContentBlockThinking     ContentBlockType = "thinking"
-	ContentBlockImage        ContentBlockType = "image"
-	ContentBlockDocument     ContentBlockType = "document"
+	ContentBlockText       ContentBlockType = "text"
+	ContentBlockToolUse    ContentBlockType = "tool_use"
+	ContentBlockToolResult ContentBlockType = "tool_result"
+	ContentBlockThinking   ContentBlockType = "thinking"
+	ContentBlockImage      ContentBlockType = "image"
+	ContentBlockDocument   ContentBlockType = "document"
 )
 
 // ContentBlock 表示消息中的一个内容块。
@@ -63,16 +63,40 @@ type ContentBlock struct {
 
 	// image / document 类型的媒体源 (Anthropic Messages API 格式)
 	Source *MediaSource `json:"source,omitempty"`
+
+	// 以下为往返保真载体 (R-H3): 未知 content block / 未知 metadata 必须原样保留,
+	// 不能因为 harness 不认识就丢弃。它们是私有的, 不改变已知块的导出 JSON 形状,
+	// 也不会被 encoding/json 序列化。
+	//
+	//   raw     — 反序列化时的原始 JSON 字节 (仅对象形态才有);
+	//   unknown — 不认识的字段组成的 JSON 对象 (紧凑序列化), 空表示没有;
+	//   snap    — 反序列化后**已知字段**的 canonical 序列化快照。
+	//
+	// MarshalJSON 用 snap 与当前已知字段的 canonical 序列化比较来检测"是否被改过":
+	// 未改过直接返回 raw (逐字节不变); 改过则输出已知字段的新值, 再把 unknown
+	// 合并回去 (已知字段优先)。全部用 string 承载, 保持 ContentBlock 的可比较性。
+	raw     string
+	unknown string
+	snap    string
 }
 
-// MarshalJSON 定制 thinking 块的出站序列化。
+// contentBlockKnownKeys 列出 ContentBlock 认识的 JSON 字段名。
+// 其余字段一律视为"未知 metadata"并在往返中原样保留。
+func isKnownContentBlockKey(k string) bool {
+	switch k {
+	case "type", "text", "id", "name", "input", "tool_use_id",
+		"content", "is_error", "thinking", "source":
+		return true
+	}
+	return false
+}
+
+// marshalKnownJSON 只序列化已知字段, 不含 raw/unknown 的保真逻辑。
+// MarshalJSON 与 UnmarshalJSON (存快照) 共用它, 保证快照口径与出站口径一致。
 //
-// 背景: 团队 agent 多轮对话会把上一轮 assistant 消息原样重发。当模型产出的
-// thinking 块文本为空时, `Thinking` 字段因 `omitempty` 被省略, 序列化成
-// `{"type":"thinking"}` —— deepseek/kimi 的网关对请求体做 serde 严格反序列化,
-// 缺 `thinking` 字段即报 400 `missing field 'thinking'`。实测空串 `"thinking":""`
-// 两个网关均接受。这里只对 thinking 块强制输出该字段, 其它块类型序列化不变。
-func (c ContentBlock) MarshalJSON() ([]byte, error) {
+// thinking 块的出站形状与历史行为完全一致: 只输出 type + thinking (强制出现,
+// 即使为空串), 见下方 MarshalJSON 的背景说明。
+func (c ContentBlock) marshalKnownJSON() ([]byte, error) {
 	if c.Type == ContentBlockThinking {
 		return json.Marshal(struct {
 			Type     ContentBlockType `json:"type"`
@@ -83,16 +107,61 @@ func (c ContentBlock) MarshalJSON() ([]byte, error) {
 	return json.Marshal(contentBlockAlias(c))
 }
 
-// UnmarshalJSON 容错解析 tool_result.content 的两种形态。
+// MarshalJSON 定制 thinking 块的出站序列化, 并保证未知字段的往返保真。
 //
-// 背景: Anthropic 规范允许 tool_result.content 为 string 或 content block 数组
-// (如 [{"type":"text","text":"..."}])。Claude Code 在长上下文 / 工具返回大段文本
-// 时会发数组形态，而本结构之前将 Content 定义为 string，严格反序列化会在此
-// 触发 `json: cannot unmarshal array into Go struct field ContentBlock`，进而
+// 背景 (thinking): 团队 agent 多轮对话会把上一轮 assistant 消息原样重发。当模型
+// 产出的 thinking 块文本为空时, `Thinking` 字段因 `omitempty` 被省略, 序列化成
+// `{"type":"thinking"}` —— deepseek/kimi 的网关对请求体做 serde 严格反序列化,
+// 缺 `thinking` 字段即报 400 `missing field 'thinking'`。实测空串 `"thinking":""`
+// 两个网关均接受。这里只对 thinking 块强制输出该字段, 其它块类型序列化不变。
+//
+// 背景 (往返保真, R-H3): Anthropic 会不断新增块类型 / 字段 (cache_control、
+// signature、server_tool_use 的自定义字段……)。旧实现把这些字段在反序列化时
+// 直接丢掉, 于是"读进来再发回去"就变成静默的数据丢失。现在:
+//   - 未修改的块: 若已知字段的 canonical 序列化仍等于反序列化时的快照, 直接返回
+//     原始字节, 未知块/未知字段逐字节不变;
+//   - 修改过的块: 已知字段以新值为准, 再把未知字段合并回去 (已知字段优先)。
+func (c ContentBlock) MarshalJSON() ([]byte, error) {
+	known, err := c.marshalKnownJSON()
+	if err != nil {
+		return nil, err
+	}
+	if c.raw != "" && c.snap == string(known) {
+		return []byte(c.raw), nil
+	}
+	if c.unknown == "" {
+		return known, nil
+	}
+	// 已知字段 + 未知字段合并。ContentBlock 的已知字段全是文档化字段, 扫描时
+	// 已从 unknown 中剔除, 因此两边键不重叠; 仍显式让已知字段优先。
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(known, &merged); err != nil {
+		return nil, err
+	}
+	var extra map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(c.unknown), &extra); err != nil {
+		return nil, err
+	}
+	for k, v := range extra {
+		if _, exists := merged[k]; !exists {
+			merged[k] = v
+		}
+	}
+	return json.Marshal(merged)
+}
+
+// UnmarshalJSON 容错解析 tool_result.content 的两种形态, 并捕获往返保真所需的
+// 原始字节 / 未知字段 / 已知字段快照。
+//
+// 背景 (tool_result.content): Anthropic 规范允许 tool_result.content 为 string 或
+// content block 数组 (如 [{"type":"text","text":"..."}])。Claude Code 在长上下文 /
+// 工具返回大段文本时会发数组形态，而本结构之前将 Content 定义为 string，严格反序列化
+// 会在此触发 `json: cannot unmarshal array into Go struct field ContentBlock`，进而
 // 在 openai.go / responses.go 翻译层以 502 抛出并触发 10 次重试风暴。
 // 这里对 content 字段做 string | array 兼容：数组时抽取各块的 text 字段并以
 // 换行拼接，无法识别的块则回退为 JSON 文本，保证翻译层不因形态差异而失败。
 func (c *ContentBlock) UnmarshalJSON(data []byte) error {
+	c.raw, c.unknown, c.snap = "", "", ""
 	type rawBlock struct {
 		Type      ContentBlockType `json:"type"`
 		Text      string           `json:"text"`
@@ -118,21 +187,50 @@ func (c *ContentBlock) UnmarshalJSON(data []byte) error {
 	c.IsError = r.IsError
 	c.Thinking = r.Thinking
 	c.Source = r.Source
-	if len(r.Content) == 0 || string(r.Content) == "null" {
-		c.Content = ""
-		return nil
+	c.Content = decodeToolResultContent(r.Content)
+
+	// 原始字节快照: 只有对象形态的块才需要往返保真 (null 等退化输入保持历史行为)。
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasPrefix(trimmed, "{") {
+		c.raw = trimmed
+		var all map[string]json.RawMessage
+		if err := json.Unmarshal(data, &all); err == nil {
+			unk := make(map[string]json.RawMessage)
+			for k, v := range all {
+				if !isKnownContentBlockKey(k) {
+					unk[k] = v
+				}
+			}
+			if len(unk) > 0 {
+				if b, err := json.Marshal(unk); err == nil {
+					c.unknown = string(b)
+				}
+			}
+		}
+	}
+	// 已知字段的 canonical 快照: 与 marshalKnownJSON 同一口径, 用于检测"是否被改过"。
+	if known, err := c.marshalKnownJSON(); err == nil {
+		c.snap = string(known)
+	}
+	return nil
+}
+
+// decodeToolResultContent 把 tool_result.content 的 string | array | object 形态
+// 归一为 string。行为与旧版 UnmarshalJSON 内联逻辑逐条一致。
+func decodeToolResultContent(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
 	}
 	var s string
-	if err := json.Unmarshal(r.Content, &s); err == nil {
-		c.Content = s
-		return nil
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
 	}
 	var arr []json.RawMessage
-	if err := json.Unmarshal(r.Content, &arr); err == nil {
+	if err := json.Unmarshal(raw, &arr); err == nil {
 		var sb strings.Builder
-		for _, raw := range arr {
+		for _, item := range arr {
 			var es string
-			if err := json.Unmarshal(raw, &es); err == nil {
+			if err := json.Unmarshal(item, &es); err == nil {
 				if sb.Len() > 0 {
 					sb.WriteString("\n")
 				}
@@ -140,7 +238,7 @@ func (c *ContentBlock) UnmarshalJSON(data []byte) error {
 				continue
 			}
 			var obj map[string]interface{}
-			if err := json.Unmarshal(raw, &obj); err == nil {
+			if err := json.Unmarshal(item, &obj); err == nil {
 				if txt, ok := obj["text"].(string); ok && txt != "" {
 					if sb.Len() > 0 {
 						sb.WriteString("\n")
@@ -159,20 +257,17 @@ func (c *ContentBlock) UnmarshalJSON(data []byte) error {
 			if sb.Len() > 0 {
 				sb.WriteString("\n")
 			}
-			sb.WriteString(string(raw))
+			sb.WriteString(string(item))
 		}
-		c.Content = sb.String()
-		return nil
+		return sb.String()
 	}
 	// 其它形态（如 object）回退为 JSON 字符串
 	var anyVal interface{}
-	if err := json.Unmarshal(r.Content, &anyVal); err == nil {
+	if err := json.Unmarshal(raw, &anyVal); err == nil {
 		b, _ := json.Marshal(anyVal)
-		c.Content = string(b)
-		return nil
+		return string(b)
 	}
-	c.Content = string(r.Content)
-	return nil
+	return string(raw)
 }
 
 // MediaSource 图片/文档内容块的数据源。
@@ -195,9 +290,9 @@ type Message struct {
 	Content []ContentBlock `json:"content,omitempty"`
 
 	// 仅 assistant 类型
-	Model   string `json:"model,omitempty"`
+	Model      string `json:"model,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
-	Usage   *Usage `json:"usage,omitempty"`
+	Usage      *Usage `json:"usage,omitempty"`
 
 	// API 错误信息
 	IsApiErrorMessage bool   `json:"isApiErrorMessage,omitempty"`
@@ -207,7 +302,7 @@ type Message struct {
 	IsMeta bool `json:"isMeta,omitempty"`
 
 	// tool_result 关联
-	ToolUseResult        string `json:"toolUseResult,omitempty"`
+	ToolUseResult           string `json:"toolUseResult,omitempty"`
 	SourceToolAssistantUUID string `json:"sourceToolAssistantUUID,omitempty"`
 
 	// compact boundary 标记
@@ -244,10 +339,17 @@ type StreamEvent struct {
 	BlockIndex int      // 当前 content block 索引
 	Message    *Message // Kind=MessageDone 时的完整消息
 	ToolName   string   // Kind=ToolStart/ToolDone
-	ToolInput  string   // Kind=ToolStart 时的工具输入摘要
-	ToolResult string   // Kind=ToolDone 时的工具结果摘要
-	IsThinking bool     // thinking delta (区别于普通文本)
-	Error      error    // Kind=Error 时的错误
+	// ToolUseID 是这次调用的协议 ID (tool_use.id / tool_result.tool_use_id)。
+	//
+	// 存在的理由: 同一轮里模型可以并发调两个同名工具 (两个 Read、两个 Bash),
+	// 只按 ToolName 配对时"开始"与"完成"会错配 —— 表现是耗时记到另一个调用上、
+	// 结果预览张冠李戴。ToolUseID 是协议给的唯一身份, 配对与 provenance 都用它。
+	// 老消费方不看这个字段; 为空时下游须退回按名字配对 (XML 回退路径可能没有 ID)。
+	ToolUseID  string // Kind=ToolStart/ToolDone
+	ToolInput  string // Kind=ToolStart 时的工具输入摘要
+	ToolResult string // Kind=ToolDone 时的工具结果摘要
+	IsThinking bool   // thinking delta (区别于普通文本)
+	Error      error  // Kind=Error 时的错误
 }
 
 // ============================================================================
@@ -314,22 +416,22 @@ type Continue struct {
 // ToolUseContextOptions queryLoop 中工具执行的上下文选项
 // 对应 TS: ToolUseContext.options 字段
 type ToolUseContextOptions struct {
-	Debug              bool              `json:"debug"`
-	MainLoopModel      string            `json:"mainLoopModel"`
-	Verbose            bool              `json:"verbose"`
-	IsNonInteractive   bool              `json:"isNonInteractiveSession"`
-	MCPClients         []MCPConnection   `json:"mcpClients,omitempty"`
-	CustomSystemPrompt string            `json:"customSystemPrompt,omitempty"`
-	AppendSystemPrompt string            `json:"appendSystemPrompt,omitempty"`
+	Debug              bool            `json:"debug"`
+	MainLoopModel      string          `json:"mainLoopModel"`
+	Verbose            bool            `json:"verbose"`
+	IsNonInteractive   bool            `json:"isNonInteractiveSession"`
+	MCPClients         []MCPConnection `json:"mcpClients,omitempty"`
+	CustomSystemPrompt string          `json:"customSystemPrompt,omitempty"`
+	AppendSystemPrompt string          `json:"appendSystemPrompt,omitempty"`
 }
 
 // MCPConnection MCP 服务器连接信息 (客户端视角)
 // 对应 TS: services/mcp/types.ts 中的 MCPServerConnection
 type MCPConnection struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"` // connected, pending, error
-	Transport string `json:"transport"` // stdio, http, sse, ws
-	Command   string `json:"command,omitempty"`
+	Name      string   `json:"name"`
+	Status    string   `json:"status"`    // connected, pending, error
+	Transport string   `json:"transport"` // stdio, http, sse, ws
+	Command   string   `json:"command,omitempty"`
 	Args      []string `json:"args,omitempty"`
 	URL       string   `json:"url,omitempty"`
 }
@@ -343,12 +445,12 @@ type MCPConnection struct {
 type PermissionMode string
 
 const (
-	PermissionModeDefault     PermissionMode = "default"      // 默认: 每次询问
-	PermissionModeAuto        PermissionMode = "auto"         // 自动: 只读放行，写入需确认
-	PermissionModePlan        PermissionMode = "plan"         // 计划: 只读
-	PermissionModeBypass      PermissionMode = "bypass"       // 旁路: 全部允许
-	PermissionModeDontAsk     PermissionMode = "dontAsk"      // 不再询问: 本会询问的调用自动拒绝
-	PermissionModeAcceptEdits PermissionMode = "acceptEdits"  // 自动接受文件类编辑工具
+	PermissionModeDefault     PermissionMode = "default"     // 默认: 每次询问
+	PermissionModeAuto        PermissionMode = "auto"        // 自动: 只读放行，写入需确认
+	PermissionModePlan        PermissionMode = "plan"        // 计划: 只读
+	PermissionModeBypass      PermissionMode = "bypass"      // 旁路: 全部允许
+	PermissionModeDontAsk     PermissionMode = "dontAsk"     // 不再询问: 本会询问的调用自动拒绝
+	PermissionModeAcceptEdits PermissionMode = "acceptEdits" // 自动接受文件类编辑工具
 )
 
 // ValidPermissionMode 报告取值是否是上面定义的某一档。
@@ -537,25 +639,25 @@ type HookConfig struct {
 // HookInput hook 执行时的输入数据
 // 对应 TS: types/hooks.ts 中的各种 HookInput 变体
 type HookInput struct {
-	Event       HookEvent       `json:"event"`
-	SessionID   string          `json:"session_id"`
-	ToolName    string          `json:"tool_name,omitempty"`
-	ToolInput   json.RawMessage `json:"tool_input,omitempty"`
-	ToolResult  string          `json:"tool_result,omitempty"`
-	IsError     bool            `json:"is_error,omitempty"`
-	Messages    []Message       `json:"messages,omitempty"`
-	Transcript  string          `json:"transcript_path,omitempty"`
+	Event      HookEvent       `json:"event"`
+	SessionID  string          `json:"session_id"`
+	ToolName   string          `json:"tool_name,omitempty"`
+	ToolInput  json.RawMessage `json:"tool_input,omitempty"`
+	ToolResult string          `json:"tool_result,omitempty"`
+	IsError    bool            `json:"is_error,omitempty"`
+	Messages   []Message       `json:"messages,omitempty"`
+	Transcript string          `json:"transcript_path,omitempty"`
 
 	// 以下为扩展字段，供新 HookEvent 使用
-	TurnCount   int    `json:"turn_count,omitempty"`
-	Model       string `json:"model,omitempty"`
+	TurnCount    int    `json:"turn_count,omitempty"`
+	Model        string `json:"model,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
-	BackoffMs   int    `json:"backoff_ms,omitempty"`
-	BudgetLevel int    `json:"budget_level,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	Role        string `json:"role,omitempty"`
-	TaskID      string `json:"task_id,omitempty"`
-	Success     bool   `json:"success,omitempty"`
+	BackoffMs    int    `json:"backoff_ms,omitempty"`
+	BudgetLevel  int    `json:"budget_level,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	Role         string `json:"role,omitempty"`
+	TaskID       string `json:"task_id,omitempty"`
+	Success      bool   `json:"success,omitempty"`
 
 	// 流式输出相关字段 (OnChunk / OnTokenStream)
 	ChunkText  string `json:"chunk_text,omitempty"`
@@ -567,8 +669,8 @@ type HookInput struct {
 // 对应 TS: types/hooks.ts 中的 HookJSONOutput
 type HookOutput struct {
 	// 同步 hook 输出
-	Decision    string `json:"decision,omitempty"`    // "block", "approve", "deny"
-	Reason      string `json:"reason,omitempty"`
+	Decision string `json:"decision,omitempty"` // "block", "approve", "deny"
+	Reason   string `json:"reason,omitempty"`
 
 	// 异步 hook 输出
 	ContinueDecision string `json:"continueDecision,omitempty"` // "block"
@@ -584,12 +686,12 @@ type HookOutput struct {
 // CompactionResult 压缩结果
 // 对应 TS: services/compact/compact.ts 中的返回结构
 type CompactionResult struct {
-	SummaryMessages          []Message `json:"summaryMessages"`
-	Attachments              []Message `json:"attachments"`
-	HookResults              []Message `json:"hookResults"`
-	PreCompactTokenCount     int       `json:"preCompactTokenCount"`
-	PostCompactTokenCount    int       `json:"postCompactTokenCount"`
-	TruePostCompactTokenCount int      `json:"truePostCompactTokenCount,omitempty"`
+	SummaryMessages           []Message `json:"summaryMessages"`
+	Attachments               []Message `json:"attachments"`
+	HookResults               []Message `json:"hookResults"`
+	PreCompactTokenCount      int       `json:"preCompactTokenCount"`
+	PostCompactTokenCount     int       `json:"postCompactTokenCount"`
+	TruePostCompactTokenCount int       `json:"truePostCompactTokenCount,omitempty"`
 }
 
 // ============================================================================
@@ -704,13 +806,13 @@ type APITool struct {
 
 // APIResponse API 响应 (非流式)
 type APIResponse struct {
-	ID           string         `json:"id"`
-	Type         string         `json:"type"`
-	Role         string         `json:"role"`
-	Content      []ContentBlock `json:"content"`
-	Model        string         `json:"model"`
-	StopReason   string         `json:"stop_reason"`
-	Usage        *Usage         `json:"usage"`
+	ID         string         `json:"id"`
+	Type       string         `json:"type"`
+	Role       string         `json:"role"`
+	Content    []ContentBlock `json:"content"`
+	Model      string         `json:"model"`
+	StopReason string         `json:"stop_reason"`
+	Usage      *Usage         `json:"usage"`
 }
 
 // StreamDelta SSE 流式增量事件
@@ -733,30 +835,30 @@ type StreamDelta struct {
 
 // DeltaContent SSE delta 的内容
 type DeltaContent struct {
-	Type         string `json:"type"`
-	Text         string `json:"text,omitempty"`
-	PartialJSON  string `json:"partial_json,omitempty"`
-	Thinking     string `json:"thinking,omitempty"`
-	StopReason   string `json:"stop_reason,omitempty"`
+	Type        string `json:"type"`
+	Text        string `json:"text,omitempty"`
+	PartialJSON string `json:"partial_json,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
+	StopReason  string `json:"stop_reason,omitempty"`
 	// signature_delta: 代码签名增量 (用于验证工具调用来源)
-	Signature    string `json:"signature,omitempty"`
+	Signature string `json:"signature,omitempty"`
 }
 
 // ServerToolUseBlock 服务端工具调用 (如 web_search_tool)
 // 对应 TS: content_block 中 type="server_tool_use" 的块
 type ServerToolUseBlock struct {
-	Type      ContentBlockType `json:"type"`
-	ID        string           `json:"id"`
-	Name      string           `json:"name"`
-	Input     json.RawMessage  `json:"input,omitempty"`
-	ServerID  string           `json:"server_id,omitempty"`
+	Type     ContentBlockType `json:"type"`
+	ID       string           `json:"id"`
+	Name     string           `json:"name"`
+	Input    json.RawMessage  `json:"input,omitempty"`
+	ServerID string           `json:"server_id,omitempty"`
 }
 
 // APIError API 错误结构
 // 对应 TS: services/api/errors.ts
 type APIError struct {
-	Type    string `json:"type"`
-	Error   struct {
+	Type  string `json:"type"`
+	Error struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
 	} `json:"error"`

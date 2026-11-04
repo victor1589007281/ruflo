@@ -1,0 +1,69 @@
+# harness 契约层的真集群集成验收 Job（Moqi R-H1/R-H2/R-H4/R-H5/R-H9/R-H11/R-H14/R-H17）。
+#
+# 为什么是 Job 而不是往 monolith 里加 HTTP 接口:
+#   被测对象是 pkg/harness 的进程内契约（TurnSink 时序、幂等、trace、成本账本、
+#   附件解析）。它没有生产 HTTP 调用方 —— 为了一次验收临时开一个公网可调的
+#   run-turn 端点，等于把"测试需求"变成"生产攻击面"。Job 跑完即消失，且必须
+#   用**真实上游**（opencode deepseek-v4.1-flash）才能真正验到 usage/cost 与
+#   前缀缓存计划没有把请求发坏。
+#
+# 用法（由 deploy/harness-smoke-k8s.sh 调用，镜像标签每轮唯一）:
+#   sed "s|IMAGE_PLACEHOLDER|claude-go:harness-$STAMP|" deploy/k8s/harness-smoke-job.yaml | kubectl apply -f -
+#
+# 判定口径: 容器进程 exit 0 才算通过。Job 的 Complete 只说明进程退出了，不说明
+# 各项断言通过了 —— 脚本必须同时断言 succeeded==1，并把 Pod 日志里的 JSON 报告
+# 取回来。把"Job 完成"当成"验收通过"是这一层最容易犯的错。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: claude-go-harness-smoke
+  namespace: claude-go
+  labels:
+    app: claude-go-harness-smoke
+spec:
+  backoffLimit: 0          # 失败不重试: 报告要的是这一次的结果，不是重试后的运气
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: claude-go-harness-smoke
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: Never   # kind 节点用 ctr import 载入，不经过 registry
+          args:
+            - harness-smoke
+            - --model
+            - opencode:deepseek-v4.1-flash
+            - --config
+            - /etc/claude-go/config.json
+            - --out
+            - /tmp/harness-smoke-report.json
+            - --turn-timeout
+            - 240s
+          env:
+            # key 只经 Secret 注入，绝不写进 ConfigMap/镜像。
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: claude-go-llm
+                  key: opencode-api-key
+            - name: CLAUDE_GO_STATE_DIR
+              value: /data/.claude-go
+          ports: []
+          volumeMounts:
+            - name: config
+              mountPath: /etc/claude-go
+            - name: state
+              mountPath: /data
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { cpu: "2", memory: 2Gi }
+      volumes:
+        - name: config
+          configMap:
+            name: claude-go-config
+        - name: state
+          emptyDir: {}

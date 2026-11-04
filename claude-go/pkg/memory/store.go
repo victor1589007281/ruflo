@@ -24,6 +24,16 @@ type FactStore struct {
 	persistDir  string
 	dirty       bool
 
+	// persistMu 串行化 PersistToDisk。
+	//
+	// addLocked 在 importance >= 0.8 时会 `go fs.PersistToDisk()`, 而调用方也会在
+	// 关键时刻同步落盘 —— 两次落盘若交错, 后写的一方可能带着**更旧**的快照, 把
+	// 新数据覆盖回旧版本 (实测 TestFactStore_PersistAndReload 约 1/3 概率丢成 0 条)。
+	persistMu sync.Mutex
+	// gen 每次内存变更自增。落盘写的是快照时刻的 gen; 写完后只有 gen 未变才清脏,
+	// 否则保留脏标记让下一次落盘补上 —— 否则"快照之后又改了"的那部分会被静默丢掉。
+	gen uint64
+
 	// 整合日志
 	consolidationLog []ConsolidationEntry
 }
@@ -39,13 +49,13 @@ type FactConnection struct {
 
 // ConsolidationEntry 整合日志条目
 type ConsolidationEntry struct {
-	ID               string    `json:"id"`
-	CycleDate        time.Time `json:"cycleDate"`
-	FactsInput       int       `json:"factsInput"`
-	FactsMerged      int       `json:"factsMerged"`
-	PatternsFound    int       `json:"patternsFound"`
-	Contradictions   int       `json:"contradictions"`
-	DurationMs       int64     `json:"durationMs"`
+	ID             string    `json:"id"`
+	CycleDate      time.Time `json:"cycleDate"`
+	FactsInput     int       `json:"factsInput"`
+	FactsMerged    int       `json:"factsMerged"`
+	PatternsFound  int       `json:"patternsFound"`
+	Contradictions int       `json:"contradictions"`
+	DurationMs     int64     `json:"durationMs"`
 }
 
 // NewFactStore 创建 L2 事实存储
@@ -88,11 +98,20 @@ func (fs *FactStore) addLocked(fact *MemoryFact) {
 	}
 
 	fs.facts[fact.ID] = fact
-	fs.dirty = true
+	fs.markDirtyLocked()
 
 	if fact.Importance >= 0.8 {
 		go fs.PersistToDisk()
 	}
+}
+
+// markDirtyLocked 标记需要落盘并推进变更代数 (调用方持写锁)。
+//
+// 所有内存变更都必须走这里而不是直接写 fs.dirty: 落盘靠 gen 判断"快照之后有没有
+// 新改动", 漏推进代数会让新改动被当成旧的清掉。
+func (fs *FactStore) markDirtyLocked() {
+	fs.dirty = true
+	fs.gen++
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +235,7 @@ func (fs *FactStore) AddConnection(factIDA, factIDB, relation string, strength f
 		Strength: strength,
 		Created:  time.Now(),
 	})
-	fs.dirty = true
+	fs.markDirtyLocked()
 }
 
 // Retrieve 混合检索: BM25 + 分类衰减 + 近因 + 频次
@@ -332,7 +351,7 @@ func (fs *FactStore) Retrieve(query string, topK int) []*MemoryFact {
 		c.fact.Touch()
 		result[i] = c.fact
 	}
-	fs.dirty = true
+	fs.markDirtyLocked()
 	fs.mu.Unlock()
 
 	return result
@@ -389,7 +408,7 @@ func (fs *FactStore) RunDecayCycle(archiveThreshold float64) (archived int) {
 		}
 	}
 	if archived > 0 {
-		fs.dirty = true
+		fs.markDirtyLocked()
 	}
 	return
 }
@@ -536,15 +555,23 @@ func FormatFactsForPrompt(facts []*MemoryFact) string {
 //	代价与边界：整表全量重写 (无增量), 每次落盘的开销与记忆总量成正比; 写失败只记日志并返回,
 //	      **不清脏** —— 下次仍会重试, 代价是重复的全量序列化。
 //	设计权衡：清脏放在写盘成功之后, 而不是在快照时清 —— 先清脏再写, 一旦写失败这段改动就永久丢了。
+//
+// 并发约束：两次落盘由 persistMu 串行化, 且写完只在 gen 未变时清脏 (见两个字段的注释);
+// 文件写入用 writeFileAtomic, 读者不会读到半截 JSON。
 func (fs *FactStore) PersistToDisk() {
 	if fs.persistDir == "" {
 		return
 	}
+	// 串行化整段快照+写盘: 并发落盘会让旧快照后写, 覆盖掉新数据 (见 persistMu 注释)。
+	fs.persistMu.Lock()
+	defer fs.persistMu.Unlock()
+
 	fs.mu.RLock()
 	if !fs.dirty {
 		fs.mu.RUnlock()
 		return
 	}
+	gen := fs.gen
 	facts := make([]*MemoryFact, 0, len(fs.facts))
 	for _, f := range fs.facts {
 		facts = append(facts, f)
@@ -558,20 +585,56 @@ func (fs *FactStore) PersistToDisk() {
 		log.Printf("[FactStore] 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(filepath.Join(fs.persistDir, "memory_facts.json"), data, 0644); err != nil {
+	if err := writeFileAtomic(filepath.Join(fs.persistDir, "memory_facts.json"), data, 0644); err != nil {
 		log.Printf("[FactStore] 持久化失败: %v", err)
 		return
 	}
 
 	if len(conns) > 0 {
 		connData, _ := json.MarshalIndent(conns, "", "  ")
-		_ = os.WriteFile(filepath.Join(fs.persistDir, "memory_connections.json"), connData, 0644)
+		_ = writeFileAtomic(filepath.Join(fs.persistDir, "memory_connections.json"), connData, 0644)
 	}
 
 	// 清脏放在两次写盘都成功之后: 先清脏再写, 一旦写失败这段改动就永久丢了。
+	// 同时只在 gen 未变时清: 快照之后又发生的变更还没写到盘上, 必须留脏让下一次补。
 	fs.mu.Lock()
-	fs.dirty = false
+	if fs.gen == gen {
+		fs.dirty = false
+	}
 	fs.mu.Unlock()
+}
+
+// writeFileAtomic 先写同目录临时文件再 rename, 保证读者只会看到完整文件。
+//
+// 直接用 os.WriteFile 的两条故障路径都真实发生过: 并发读者 (NewFactStore 的
+// loadFromDisk) 读到半截 JSON → 整批事实解析失败只记一条日志; 进程在写盘中途退出
+// → 磁盘上留下损坏的记忆文件。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// rename 成功后 Remove 会失败 (文件已不在), 失败无害。
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	// Sync 后再 rename: 否则崩溃时可能留下"文件已改名但内容还在页缓存"的空/半文件。
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // loadFromDisk 从 persistDir 载入事实与连接; 已归档或留存度过低的事实不入内存。
@@ -647,13 +710,13 @@ func (fs *FactStore) Stats() FactStoreStats {
 
 // FactStoreStats 统计
 type FactStoreStats struct {
-	TotalFacts       int                        `json:"totalFacts"`
-	ActiveFacts      int                        `json:"activeFacts"`
-	ArchivedFacts    int                        `json:"archivedFacts"`
-	EvergreenFacts   int                        `json:"evergreenFacts"`
-	TotalConnections int                        `json:"totalConnections"`
-	CategoriesCount  map[MemoryCategory]int     `json:"categoriesCount"`
-	AvgRetention     float64                    `json:"avgRetention"`
+	TotalFacts       int                    `json:"totalFacts"`
+	ActiveFacts      int                    `json:"activeFacts"`
+	ArchivedFacts    int                    `json:"archivedFacts"`
+	EvergreenFacts   int                    `json:"evergreenFacts"`
+	TotalConnections int                    `json:"totalConnections"`
+	CategoriesCount  map[MemoryCategory]int `json:"categoriesCount"`
+	AvgRetention     float64                `json:"avgRetention"`
 }
 
 // MetricsRecorder 指标采集接口
@@ -707,4 +770,3 @@ func ComputeAmnesiaRisk(hoursSinceDream float64, pendingSessions int64, avgReten
 	}
 	return risk
 }
-

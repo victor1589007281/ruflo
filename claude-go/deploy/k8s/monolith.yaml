@@ -51,6 +51,11 @@ spec:
             - name: KIMI_API_KEY
               valueFrom:
                 secretKeyRef: { name: claude-go-llm, key: kimi-api-key, optional: true }
+            # provider 名必须与 ConfigMap 里的 providers 键一致，modelconfig 才会
+            # 把 OPENCODE_API_KEY 覆盖到该 provider 的 apiKey 占位符上。
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef: { name: claude-go-llm, key: opencode-api-key, optional: true }
           ports:
             - containerPort: 18080
           volumeMounts:

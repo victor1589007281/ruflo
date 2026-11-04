@@ -304,11 +304,16 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 	// 3. 准备 APITools (经 toolExposed 统一过滤: DisabledTools 黑名单 +
 	// AllowedTools 白名单). DisableTools 时直接置空, 不向模型暴露任何工具描述,
 	// 进一步降低 MiniMax 等模型乱产 XML 工具调用的概率.
+	// 单轮白名单 (R-H9) 在这里同样生效: RunIsolated 不走 queryLoop, 若不在此合并
+	// 就会出现"主循环收窄了、隔离 run 没有"的双口径 —— 而隔离 run 恰恰是子代理
+	// 执行面, 越权风险更高。
+	ov, _ := RunOverridesFromContext(ctx)
+	runAllow := e.Config.ToolAllowlist(ov)
 	var apiTools []types.APITool
 	if !opts.DisableTools && e.Tools != nil {
 		all := e.Tools.APITools()
 		for _, t := range all {
-			if !e.Config.toolExposed(t.Name) {
+			if !e.Config.toolExposedWith(runAllow, t.Name) {
 				continue
 			}
 			apiTools = append(apiTools, t)
@@ -669,7 +674,7 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		// 8a. 黑/白名单闸: RunIsolated 不经 HookChain, 在这里应用与主循环
 		// ToolGateHook 相同的 toolExposed 语义 — 未获准的 tool_use (含 XML 回退
 		// 提取的凭空调用) 替换为错误 tool_result, 绝不执行.
-		gated, deniedResults := gateToolUses(e.Config, toolUseBlocks)
+		gated, deniedResults := gateToolUsesWith(e.Config, runAllow, toolUseBlocks)
 		messages = append(messages, deniedResults...)
 		toolUseBlocks = gated
 		for _, b := range toolUseBlocks {
@@ -692,14 +697,25 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			IsNonInteractive: e.Config.IsNonInteractive,
 			Debug:            e.Config.Debug,
 			Messages:         messages,
-			SessionID:        e.Config.SessionID,   // EnterPlanMode/ExitPlanMode 用会话级 plan flag
-			PlanFileDir:      e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
-			Team:             e.Config.Team,        // 13.7-P1 池个性化身份 (与 queryLoop 同口径)
-			Role:             e.Config.Role,
-			GlobalPerm:       e.PermChecker,
-			WriteClaim:       claim, // H3-4 并发写占用: 本次 run 的写者身份
-			BashMerge:        bashMerge,
-			WriteRoot:        writeRoot,
+			// session 与 owner 同口径 (R-H6): 都走 ctx 优先的解析, 不是各读一处字段。
+			SessionID: e.sessionFrom(ctx), // EnterPlanMode/ExitPlanMode 用会话级 plan flag
+			// owner 与 queryLoop 同口径 (R-H6): 都走 ownerFrom, 不是各读一处字段。
+			OwnerID:     e.ownerFrom(ctx),
+			PlanFileDir: e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
+			Team:        e.Config.Team,        // 13.7-P1 池个性化身份 (与 queryLoop 同口径)
+			Role:        e.Config.Role,
+			GlobalPerm:  e.PermChecker,
+			WriteClaim:  claim, // H3-4 并发写占用: 本次 run 的写者身份
+			BashMerge:   bashMerge,
+			WriteRoot:   writeRoot,
+			// R-H9 闸门接线: RunIsolated 与 queryLoop 必须同源。ov 是 RunIsolated
+			// 入口从本 run 的 ctx 解析的（与主循环同一套 RunOverrides），这里直接
+			// 用它，避免再读一次 ctx 时读到别的 run 的值。
+			//
+			// 注: 不给内置工具默认声明 NeedsConfirmation/Idempotent 的理由见
+			// engine.go 同一段注释 —— 默认声明 + nil checker = 全量停摆。
+			Confirmed:   ov.Confirmation,
+			Idempotency: ov.Idempotency,
 		}
 		// 阶段声明的 hook 在这里**并入**引擎既有的 Runner (见 IsolatedRunOptions.Hooks)。
 		//
@@ -887,8 +903,16 @@ func citationGateNotice(unfetched []string, cited int) types.Message {
 // 对应 tool_result), 获准的原样返回. RunIsolated 不走引擎 HookChain, 这是它的
 // ToolGateHook 等价物.
 func gateToolUses(cfg *Config, blocks []types.ContentBlock) (allowed []types.ContentBlock, denied []types.Message) {
+	return gateToolUsesWith(cfg, cfg.AllowedTools, blocks)
+}
+
+// gateToolUsesWith 是 gateToolUses 的"有效白名单"版本 (Moqi R-H9 的单轮工具档位).
+//
+// allow 必须是已经合并好的有效名单 (见 Config.ToolAllowlist), 不是原始的
+// RunOverrides.AllowedTools —— 合并只做一次, 否则两个真源.
+func gateToolUsesWith(cfg *Config, allow map[string]bool, blocks []types.ContentBlock) (allowed []types.ContentBlock, denied []types.Message) {
 	for _, b := range blocks {
-		if cfg.toolExposed(b.Name) {
+		if cfg.toolExposedWith(allow, b.Name) {
 			allowed = append(allowed, b)
 			continue
 		}

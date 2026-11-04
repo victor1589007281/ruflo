@@ -88,6 +88,41 @@ type AliasedTool interface {
 	Aliases() []string
 }
 
+// ResultLimiter 是工具**可选实现**的结果字节上限声明（Moqi R-H9 的 MaxResultBytes）。
+//
+// # 为什么这个接口在 pkg/tool 而不是 pkg/harness
+//
+// 截断必须发生在**结果组装处**（RunToolUse），而 pkg/tool 不能 import pkg/harness
+// （harness → tool，反向引用会成环）。契约元数据（SideEffect / NeedsConfirmation）
+// 留在 harness 由业务层消费；只有"结果多大算太大"这一项必须在执行侧生效，因为
+// 只有这里能看到原始结果。
+//
+// 两边靠**结构**对接而不是靠 import：harness.ToolMeta 与 ResultLimiter 声明了同名
+// 同签名的方法 `MaxResultBytes() int`，一个实现了 harness.ToolMeta 的工具天然满足
+// 本接口，不需要任何适配代码。改任一方的签名会在这里编译期炸掉（harness 的
+// ToolMetaOf 与本文件的 ResultLimitOf 各有一处类型断言），不会静默失效。
+//
+// # 默认不截断
+//
+// 未实现本接口的工具得到 0（不截断），与改造前逐字节相同。这里**刻意**不设默认
+// 上限：给所有存量工具加一次静默截断，上线后的表现是"某工具偶尔少半截输出"，
+// 而工具本身一行没改 —— 那种缺陷极难归因。上限由声明者给定。
+type ResultLimiter interface {
+	// MaxResultBytes 返回结果字节上限；0 = 不截断。
+	MaxResultBytes() int
+}
+
+// ResultLimitOf 返回工具的字节上限；未实现 ResultLimiter 或为 nil 时返回 0。
+func ResultLimitOf(t Tool) int {
+	if t == nil {
+		return 0
+	}
+	if l, ok := t.(ResultLimiter); ok {
+		return l.MaxResultBytes()
+	}
+	return 0
+}
+
 // ToolResult 工具执行结果。
 // 对应 TS: Tool.ts 中的 ToolResult<T>。
 type ToolResult struct {
@@ -115,18 +150,26 @@ type ToolCallObservation struct {
 // 对应 TS: Tool.ts 中的 ToolUseContext (简化版)。
 // 包含当前工作目录、权限模式、消息历史等运行时信息。
 type ToolContext struct {
-	Cwd                string               `json:"cwd"`
-	PermissionMode     types.PermissionMode `json:"permissionMode"`
-	AbortCh            <-chan struct{}      `json:"-"` // 对应 TS: abortController.signal
-	Messages           []types.Message      `json:"messages,omitempty"`
-	SessionID          string               `json:"sessionId,omitempty"`   // 会话级状态工具 (plan mode) 用
-	PlanFileDir        string               `json:"planFileDir,omitempty"` // 计划文件目录: ExitPlanMode 将计划落盘, 实施阶段可读取
-	MainLoopModel      string               `json:"mainLoopModel,omitempty"`
-	ExecutionModel     string               `json:"executionModel,omitempty"` // 自动路由的快速执行模型 (Path B); 空=未配置
-	AgentID            types.AgentID        `json:"agentId,omitempty"`
-	IsNonInteractive   bool                 `json:"isNonInteractive"`
-	Debug              bool                 `json:"debug"`
-	MaxToolResultChars int                  `json:"maxToolResultChars,omitempty"`
+	Cwd            string               `json:"cwd"`
+	PermissionMode types.PermissionMode `json:"permissionMode"`
+	AbortCh        <-chan struct{}      `json:"-"` // 对应 TS: abortController.signal
+	Messages       []types.Message      `json:"messages,omitempty"`
+	SessionID      string               `json:"sessionId,omitempty"` // 会话级状态工具 (plan mode) 用
+	// OwnerID 是租户/用户身份 (Moqi R-H6)。工具若读写按 owner 隔离的数据
+	// (记忆、会话、附件) 必须用它做命名空间，不能用请求体里的自报字段。
+	//
+	// 来源是 ctx (types.OwnerFromContext)，由 engine 在构造本结构时填入 —— 换句话说
+	// 它是**鉴权结果**的透传，不是模型能影响的值。工具侧校验用
+	// harness.CheckSameOwner，别自己写字符串比较：空 owner 归一会让裸比较把
+	// "都是空" 判成 "隔离成立"。
+	OwnerID            string        `json:"ownerId,omitempty"`
+	PlanFileDir        string        `json:"planFileDir,omitempty"` // 计划文件目录: ExitPlanMode 将计划落盘, 实施阶段可读取
+	MainLoopModel      string        `json:"mainLoopModel,omitempty"`
+	ExecutionModel     string        `json:"executionModel,omitempty"` // 自动路由的快速执行模型 (Path B); 空=未配置
+	AgentID            types.AgentID `json:"agentId,omitempty"`
+	IsNonInteractive   bool          `json:"isNonInteractive"`
+	Debug              bool          `json:"debug"`
+	MaxToolResultChars int           `json:"maxToolResultChars,omitempty"`
 	// WeakResultPostprocess 弱模型 tool_result 确定性后处理 (方案三 L3):
 	// 单行截断 + 超行数保头尾, 在 compactToolResultContent 入口生效。
 	WeakResultPostprocess bool `json:"weakResultPostprocess,omitempty"`
@@ -140,6 +183,18 @@ type ToolContext struct {
 	Role string `json:"role,omitempty"`
 	// GlobalPerm 若非 nil，RunToolUse 会用其 CheckGlobal 合并全局策略与工具自带权限结果
 	GlobalPerm GlobalPermissionChecker `json:"-"`
+	// Confirmed 回答"这一次调用是否已被宿主确认"（Moqi R-H9 的 NeedsConfirmation）。
+	//
+	// 声明了 NeedsConfirmation()==true 的工具在没有确认时会被**拒绝执行**并返回
+	// 错误 tool_result。nil = 没有确认能力，此时声明了 NeedsConfirmation 的工具
+	// 一律被拒 —— 正是 fail-closed 想要的方向（"没有确认机制"不等于"默认批准"）。
+	Confirmed ConfirmationChecker `json:"-"`
+	// Idempotency 是本 run 的结果去重闸（Moqi R-H9 的 IdempotencyKey）。
+	//
+	// 只有同时声明了 Idempotent()==true 的工具才会走它 —— 见 IdempotentTool 注释：
+	// 按 IsReadOnly 自动推导会把"Read → Edit → Read"里的第二次 Read 变成陈旧内容。
+	// nil = 不去重，与改造前逐字节相同。
+	Idempotency *IdempotencyGate `json:"-"`
 	// ObserveToolCall 可选的单次工具完成回调；只用于观测，不改变工具结果。
 	// 并发执行时回调也可能并发，调用方需自行保证写入安全。
 	ObserveToolCall func(ToolCallObservation) `json:"-"`

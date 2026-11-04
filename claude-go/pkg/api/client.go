@@ -61,11 +61,11 @@ type LLMEventFunc func(eventType, detail string)
 
 // LLMCallRecord 单次 LLM 调用的可观测数据, 用于采集 token / 延迟 / 成败。
 type LLMCallRecord struct {
-	Model               string
-	BaseURL             string
-	Status              string // "success" | "error" | "retry_success"
-	Stream              bool
-	DurationSec         float64
+	Model       string
+	BaseURL     string
+	Status      string // "success" | "error" | "retry_success"
+	Stream      bool
+	DurationSec float64
 	// TTFTMs: 请求发出 → 首个正文/思考/工具入参增量的毫秒数（仅流式有意义）。
 	// 与 DurationSec 是两个口径：DurationSec 含准入等待与整段生成，TTFTMs 只量
 	// "第一块可见产出什么时候到"。0 = 没有采集到（非流式 / 一帧内容都没有）。
@@ -84,6 +84,11 @@ type LLMCallRecord struct {
 	Timestamp           time.Time
 
 	// 追踪信息 (由 Client.Tag 或调用方 Context 注入, 支持按业务维度聚合)
+	//
+	// Owner 是租户/用户作用域（R-H6）。来源是 ctx 里的 types.WithOwner —— 与
+	// engine/trace 同源，不另设一份"这次调用属于谁"。空值在采集器侧归一为
+	// "local"（types.OwnerFromContext 本身也会把缺失归一为默认 owner）。
+	Owner    string
 	Source   string // "chat" | "feishu" | "team" | "swarm" | "dashboard" | "vision" | "compact" | ...
 	Purpose  string // 额外标签, 如团队名 / stage 名 / agent 角色
 	Request  string // 粗粒度 HTTP 方法标签 (messages / stream-messages)
@@ -134,6 +139,34 @@ func stampTraceIDs(rec *LLMCallRecord, ids trace.IDs) {
 // LLMMetricsHook 采集 LLM 调用指标的回调 (dashboard 在启动时注入, 避免循环依赖)。
 type LLMMetricsHook func(rec LLMCallRecord)
 
+// CachePlan 是调用方给出的缓存断点计划。零值 = 沿用内置启发式。
+//
+// 为什么需要它 (R-H2): 断点位置决定了哪些前缀能独立成缓存条目, 而"哪一段稳定、
+// 哪一段每轮都变"只有组装 prompt 的一方知道 (harness 的 PromptLayout 就带着这个
+// 分层)。如果 api 层继续自己按"最后一条 + 最近的 assistant"猜一遍, 调用方的布局
+// 就只是**观测**, 永远影响不到真正发出去的请求 —— 观测与行为两套口径, 调参时看到
+// 的命中率变化根本不能归因到布局上。这里把选择权交出去, 同时保留内置启发式作为
+// nil 的兜底: 不传计划的老调用方一个字节都不会变。
+//
+// nil 与空切片的区别是**语义**上的, 不是实现细节:
+//
+//	SystemIndexes == nil      → 用内置 {0, 稳定段末尾}
+//	SystemIndexes == []int{}  → 明确表示"system 上不打任何断点"
+//
+// 把空切片也当成 nil 会让"我要关掉 system 断点"表达不出来, 只能被迫接受默认值。
+type CachePlan struct {
+	// SystemIndexes 是 system 块下标; nil = 内置 {0, 稳定段末尾}。
+	//
+	// 下标按 systemPrompt 切分后的块计 (engine 的分层顺序:
+	// base → memory → task, 最后一块每轮都变, 打在它上面等于每轮换缓存键)。
+	SystemIndexes []int
+	// MessageIndexes 是 messages 下标; nil = 内置 cacheBreakpointIndexes(messages, 2)。
+	//
+	// 断点落在该条消息**最后一个内容块**的末尾 (与 markCacheBreakpointAt 一致),
+	// 因为前缀缓存按块边界切分, 打在块中间没有意义。
+	MessageIndexes []int
+}
+
 // Client Anthropic Messages API 客户端。
 type Client struct {
 	BaseURL string
@@ -155,9 +188,18 @@ type Client struct {
 
 	Client *http.Client
 
-	RetryCount int           // 最大重试次数 (429/5xx), 默认 4
+	RetryCount int           // 最大重试次数 (429/5xx), 默认 4; <0 表示显式禁用
 	RetryBase  time.Duration // 退避基数, 默认 3s
 	RetryMax   time.Duration // 退避上限, 默认 60s
+
+	// RetryStatuses 是显式配置的可重试状态码集合 (见 modelconfig.ModelConfig.RetryStatuses)。
+	// nil/空 = 沿历史默认: 429/503/529/5xx (即 isRetryableStatus), **不含 400**。
+	// 非空时**完全替换**默认集合 —— 这样"只重试 400 和 502"这种策略才表达得出来。
+	//
+	// 为什么与 RetryCount 分开: 次数与"哪些状态值得重试"是两个问题。历史默认不含
+	// 400 是为了保护翻译路径上的既有行为; 而网关透传路径的默认策略另有 400
+	// (见 RetryPolicyFromConfig / DefaultGatewayRetryPolicy)。
+	RetryStatuses []int
 
 	// 首token超时分离 (模型级可配置, 0 = 使用全局默认值)
 	FirstTokenTimeout time.Duration // 首token等待时间, 默认 180s
@@ -194,12 +236,28 @@ type Client struct {
 	FallbackBaseURL string
 	FallbackAPIKey  string
 
+	// onFallback 是回退观测回调 (R-H17, 见 fallback_observe.go)。
+	// nil = 不观测, 热路径只多一次判断。放在 Client 上而不是逐次传参, 是因为
+	// 回退发生在重试循环内部, 调用点没有机会把回调递进去。
+	onFallback func(FallbackInfo)
+
 	// PromptCacheEnabled 启用 Anthropic prompt caching (顶层 cache_control)。
 	// "auto" = 自动检测 (默认，Anthropic 官方 API 启用，其他关闭)
 	// "on"   = 强制启用
 	// "off"  = 强制关闭
 	PromptCacheMode            string
 	promptCacheDisabledByError bool // 因 API 错误自适应关闭
+
+	// CachePlan 是调用方给出的缓存断点计划 (R-H2); nil = 沿用内置启发式。
+	// json:"-" 是刻意的: Client 不是请求体的一部分, 而计划本身也不该被序列化
+	// 到任何地方 (它描述的是"怎么打点", 不是"打在哪里" —— 落盘的是打点结果)。
+	//
+	// 请求级注入 (与 ExtraHeaders 同): 调用方在 SendMessage / StreamMessage 之前
+	// 设置。WithModel / ConfiguredClone 会把它**带过去** —— 这一条不是顺手为之:
+	// engine 的相位路由每个回合都会用 WithModel 造一个临时副本 (ExecutionModel /
+	// FallbackModel), 不传播就会让"执行模型回合"悄悄退回内置启发式。缓存计划的
+	// 失效是无声的 (请求照常成功, 只是命中率变了), 正是本改动要消灭的那类缺陷。
+	CachePlan *CachePlan `json:"-"`
 
 	// ReasoningPlayback 出站回传上一轮推理所用的 OpenAI 字段名。
 	// "" = 不回传; "reasoning" = messages[].reasoning; "reasoning_content" =
@@ -258,6 +316,7 @@ func (c *Client) WithModel(model string) *Client {
 		RetryCount:            c.RetryCount,
 		RetryBase:             c.RetryBase,
 		RetryMax:              c.RetryMax,
+		RetryStatuses:         c.RetryStatuses,
 		OnLLMEvent:            c.OnLLMEvent,
 		OnLLMMetrics:          c.OnLLMMetrics,
 		FallbackModels:        c.FallbackModels,
@@ -271,6 +330,10 @@ func (c *Client) WithModel(model string) *Client {
 		cbThreshold:           c.cbThreshold,
 		fallbackCooldownMin:   c.fallbackCooldownMin,
 		Tag:                   c.Tag + ":" + model,
+		CachePlan:             c.CachePlan,
+		// 观测回调随克隆传播: engine 每轮用 WithModel 造临时副本, 不传播的话
+		// 回退观测在真正执行的副本上静默消失 (请求照常成功, 只是没有回退链)。
+		onFallback: c.onFallback,
 	}
 }
 
@@ -296,6 +359,7 @@ func (c *Client) ConfiguredCloneFull(baseURL, apiKey, model string, fallbackMode
 		RetryCount:            c.RetryCount,
 		RetryBase:             c.RetryBase,
 		RetryMax:              c.RetryMax,
+		RetryStatuses:         c.RetryStatuses,
 		OnLLMEvent:            c.OnLLMEvent,
 		OnLLMMetrics:          c.OnLLMMetrics,
 		PromptCacheMode:       c.PromptCacheMode,
@@ -308,6 +372,12 @@ func (c *Client) ConfiguredCloneFull(baseURL, apiKey, model string, fallbackMode
 		cbThreshold:           c.cbThreshold,
 		fallbackCooldownMin:   c.fallbackCooldownMin,
 		Tag:                   c.Tag,
+		// 计划跨端点克隆也带过去 (与 WithModel 同理): 备用/plan 端点的缓存
+		// 布局应当与主端点一致, 否则同一段 prompt 在两个端点上命中率不同,
+		// 而差异来源是"克隆时漏了一个字段" —— 无从排查。
+		CachePlan: c.CachePlan,
+		// 回退观测同样跨克隆传播 (理由见 WithModel)。
+		onFallback: c.onFallback,
 	}
 	if len(fallbackModels) > 0 {
 		clone.FallbackModels = fallbackModels
@@ -441,9 +511,44 @@ func (c *Client) GetCircuitSnapshot() CircuitSnapshot {
 	}
 }
 
-// isRetryable 判断 HTTP 状态码是否可重试
+// isRetryableStatus 判断 HTTP 状态码是否可重试 —— 这是**历史默认集合**:
+// 429/503/529/5xx, 不含 400。保留为包级函数, 供未配置 RetryStatuses 的 Client 与
+// 既有测试使用。
 func isRetryableStatus(code int) bool {
 	return code == 429 || code == 503 || code == 529 || code >= 500
+}
+
+// retryableStatus 是本次调用实际使用的状态码判断。
+//
+// 配置了 RetryStatuses 时**完全替换**默认集合 (含 400 的配置才能生效);
+// 未配置时逐字节保持历史行为 —— 这是"零值零影响"的底线。
+func (c *Client) retryableStatus(code int) bool {
+	if c != nil && len(c.RetryStatuses) > 0 {
+		for _, s := range c.RetryStatuses {
+			if s == code {
+				return true
+			}
+		}
+		return false
+	}
+	return isRetryableStatus(code)
+}
+
+// maxRetries 返回本次调用允许的额外重试次数。
+//
+// 负数是显式禁用 (模型配置 retryCount:-1 映射而来)。此前 <=0 一律回落 4,
+// 于是"关掉重试"根本表达不出来 —— 配置 0 与不配置是同一个结果。
+func (c *Client) maxRetries() int {
+	if c == nil {
+		return 4
+	}
+	if c.RetryCount < 0 {
+		return 0
+	}
+	if c.RetryCount == 0 {
+		return 4
+	}
+	return c.RetryCount
 }
 
 // shouldEnablePromptCache 判断当前请求是否应启用 prompt caching。
@@ -677,6 +782,251 @@ func buildSystemParam(systemPrompt []string, cacheEnabled bool) interface{} {
 	}
 }
 
+// buildSystemParamPlanned 是流式路径的 system 组装入口, 支持调用方的 CachePlan。
+//
+// 三条分支的优先级刻意写成"计划 > 内置 > 关闭":
+//   - 计划给了 SystemIndexes, 就**只**按计划打点; 不额外补内置的 {0, 稳定段末尾},
+//     否则调用方想"少打一个断点"永远做不到 (内置那两个会自己长回来)。
+//   - 计划是 nil 或 SystemIndexes 为 nil, 原样交回 buildSystemParam —— 零值零影响
+//     就落在这一行上, 不需要调用方做任何开关。
+//   - cacheEnabled 为 false 时计划也不生效: 计划决定的是断点**位置**, 不是是否
+//     启用缓存; 上游不认识 cache_control 时一个都不该发。
+//
+// 注意 SystemIndexes == []int{} (非 nil 空切片) 与 nil 是两种意思: 前者表示
+// "system 侧一个断点都不要", 后者表示"用内置启发式"。这里绝不能把空切片当 nil,
+// 否则调用方没有任何办法关掉 system 断点。
+func buildSystemParamPlanned(systemPrompt []string, cacheEnabled bool, plan *CachePlan) interface{} {
+	if !cacheEnabled || plan == nil || plan.SystemIndexes == nil || len(systemPrompt) == 0 {
+		return buildSystemParam(systemPrompt, cacheEnabled)
+	}
+	blocks := make([]map[string]interface{}, len(systemPrompt))
+	for i, s := range systemPrompt {
+		blocks[i] = map[string]interface{}{
+			"type": "text",
+			"text": s,
+		}
+	}
+	applySystemCachePlan(blocks, plan.SystemIndexes)
+	return blocks
+}
+
+// buildSystemParamNonStream 是 sendMessageDirect 的 system 组装 (原内联代码原样搬出)。
+//
+// 显式抽成函数只为让计划分支能复用同一套块结构; cacheEnabled 的默认形态**逐字节**
+// 保持原样 —— 非流式路径多块时内置只打 block 0 一个断点, 而流式路径打两个
+// (见 markSystemCacheBreakpoint)。两条路径的这个差异是既有的, 不在本次改动里统一:
+// 统一会改变非流式请求的字节, 而本次改动的底线是零值零影响。
+func buildSystemParamNonStream(systemPrompt []string, cacheEnabled bool) interface{} {
+	if len(systemPrompt) == 1 {
+		if cacheEnabled {
+			return []map[string]interface{}{
+				{"type": "text", "text": systemPrompt[0], "cache_control": map[string]string{"type": "ephemeral"}},
+			}
+		}
+		return systemPrompt[0]
+	}
+	if len(systemPrompt) > 1 {
+		blocks := make([]map[string]interface{}, len(systemPrompt))
+		for i, s := range systemPrompt {
+			blocks[i] = map[string]interface{}{
+				"type": "text",
+				"text": s,
+			}
+		}
+		if cacheEnabled {
+			// G1 PromptCache: cache_control 贴在第一个稳定块 (block 0),
+			// 而非最后一个动态块 (memory), 避免动态内容污染缓存键。
+			blocks[0]["cache_control"] = map[string]string{"type": "ephemeral"}
+		}
+		return blocks
+	}
+	return nil
+}
+
+// buildSystemParamNonStreamPlanned 是非流式路径的 system 组装入口, 支持 CachePlan。
+// 判定顺序与 buildSystemParamPlanned 相同 (计划 > 内置 > 关闭)。
+func buildSystemParamNonStreamPlanned(systemPrompt []string, cacheEnabled bool, plan *CachePlan) interface{} {
+	if !cacheEnabled || plan == nil || plan.SystemIndexes == nil || len(systemPrompt) == 0 {
+		return buildSystemParamNonStream(systemPrompt, cacheEnabled)
+	}
+	blocks := make([]map[string]interface{}, len(systemPrompt))
+	for i, s := range systemPrompt {
+		blocks[i] = map[string]interface{}{
+			"type": "text",
+			"text": s,
+		}
+	}
+	applySystemCachePlan(blocks, plan.SystemIndexes)
+	return blocks
+}
+
+// applySystemCachePlan 把断点贴到 blocks 的给定下标上。
+//
+// 这里**不做**边界/重复校验, 直接按下标取: 所有下标在 validateCachePlan 里已经
+// 验过, 漏验会以 panic 的形式当场炸掉, 而不是悄悄少打一个断点。断点少打是无声缺陷
+// (请求成功、缓存收益归零), 用 panic 把它变成有声缺陷是划算的。
+//
+// 已有 cache_control 的块跳过 (与 markSystemCacheBreakpoint 同口径): 上游对同一块
+// 上的重复标记会报错, 而调用方传入的块可能已经带着上游给的标记。
+func applySystemCachePlan(blocks []map[string]interface{}, indexes []int) {
+	for _, idx := range indexes {
+		if _, dup := blocks[idx]["cache_control"]; dup {
+			continue
+		}
+		blocks[idx]["cache_control"] = map[string]string{"type": "ephemeral"}
+	}
+}
+
+// applyMessageCachePlan 按计划在 messages 上打点; MessageIndexes 为 nil 时走内置启发式。
+//
+// 与 system 侧同理: 空切片 = "message 侧一个断点都不打", nil = "用内置"。
+// 下标合法性由调用方先经 validateCachePlan 保证。
+func applyMessageCachePlan(messages []types.APIMessage, plan *CachePlan) {
+	if plan == nil || plan.MessageIndexes == nil {
+		markMessageCacheBreakpoint(messages)
+		return
+	}
+	for _, idx := range plan.MessageIndexes {
+		markCacheBreakpointAt(messages, idx)
+	}
+}
+
+// builtinSystemBreakpointCount 是流式路径内置启发式在给定块数下会打出的断点数。
+//
+// 用于把"计划侧 + 回退侧"的断点总数算准: 只数计划里的下标会漏掉另一侧由内置
+// 补上的断点, 于是超限要到上游 400 才暴露 —— 那正是本改动要避免的。
+//
+// 只适用于流式路径 (markSystemCacheBreakpoint)。非流式路径内置只打 block 0 一个,
+// 见 nonStreamBuiltinSystemBreakpoints —— 两条路径的内置形态本来就不同
+// (见 buildSystemParamNonStream 的注释), 总数计算必须跟着分岔。用同一条公式会
+// 把合法的非流式请求判死。
+func builtinSystemBreakpointCount(sysLen int) int {
+	switch {
+	case sysLen <= 0:
+		return 0
+	case sysLen == 1:
+		return 1
+	default:
+		return 2 // markSystemCacheBreakpoint: {0, 稳定段末尾}
+	}
+}
+
+// nonStreamBuiltinSystemBreakpoints 是非流式路径内置启发式的断点数: 恒为 1。
+//
+// buildSystemParamNonStream 在单块时打 \`{"text":...,"cache_control":...}\`, 多块时只给
+// block 0 贴标记, 两种形态都是 1 个 (sysLen == 0 时是 0)。
+func nonStreamBuiltinSystemBreakpoints(sysLen int) int {
+	if sysLen <= 0 {
+		return 0
+	}
+	return 1
+}
+
+// builtinMessageBreakpointCount 是流式路径内置启发式在给定消息条数下断点数的**上界**。
+//
+// 这里只有条数、看不到 Role, 无法算出 cacheBreakpointIndexes 的精确结果
+// (它要找"最近的 assistant", 没有 assistant 时只出 1 个)。取 min(msgLen,2)
+// 作为上界: 宁可把一个实际只有 1 个断点的回退侧算成 2 而提前报错, 也不让真正
+// 超限的请求漏到上游 —— 后者是整请求 400, 前者只是一条可读的本地错误。
+func builtinMessageBreakpointCount(msgLen int) int {
+	if msgLen <= 0 {
+		return 0
+	}
+	if msgLen < 2 {
+		return msgLen
+	}
+	return 2
+}
+
+// validateCachePlan 在构造请求体**之前**校验调用方给的断点计划。
+//
+// 语义上等价于流式路径的校验 (见 validateCachePlanPath); 保留这个两参数形态是
+// 给不关心路径差异的调用方/测试用的。总数按流式路径算 —— 那是**更大**的一侧
+// (两侧内置都可能打满), 因此在非流式路径上调用它最多只是多报一次错, 不会放过
+// 真正超限的请求。
+func (c *Client) validateCachePlan(msgLen, sysLen int) error {
+	return c.validateCachePlanPath(msgLen, sysLen, true)
+}
+
+// validateCachePlanPath 是带路径参数的校验实现。stream 决定另一侧 (计划为 nil 的
+// 那一侧) 按哪条内置启发式补断点数 —— 流式与非流式打点形态不同, 见
+// builtinSystemBreakpointCount / nonStreamBuiltinSystemBreakpoints。
+//
+// 为什么必须前置失败、且必须是错误而不是跳过:
+//
+//  1. 超上限: Anthropic 最多接受 4 个 cache_control, 超出的表现是**整个请求 400**,
+//     不是静默丢弃。等到上游拒绝时, 调用方只看到一个语义不明的 4xx, 还白付一次
+//     往返; 而"少打几个就好了"这种自行降级又会让人以为计划生效了 —— 两者的共同
+//     问题是调用方无法从结果里看出计划有没有被采纳。
+//  2. 下标非法 (越界/负数/重复): 打点函数对非法下标是静默返回的 (见
+//     markCacheBreakpointAt / markSystemCacheBreakpoint 的 skip 分支)。于是一份
+//     写错下标的计划会"成功"发出, 只是缓存收益为零 —— 没有任何报错、没有任何
+//     指标, 只有月底账单。这类缺陷必须在这里变成显式错误。
+//  3. 重复下标: 上游对同一块上的重复 cache_control 报错; 而且重复本身就说明调用方
+//     的布局计算有 bug (两个位置算成了同一个), 让它过去等于掩盖 bug。
+//
+// 校验与"本次是否启用缓存"无关: 是否发 cache_control 由 shouldEnablePromptCache
+// 决定, 但一份**形状非法**的计划无论启不启用都是调用方的错误。今天碰巧走的是
+// 不支持缓存的端点所以没炸, 明天切到 Anthropic 端点就会炸 —— 那是更难排查的情形。
+//
+// 统计总数时另一侧若为 nil 要按该路径内置启发式的断点数补上 (见 builtin*):
+// 计划只给了 system 3 个、messages 用内置 2 个, 总数是 5 而不是 3。
+func (c *Client) validateCachePlanPath(msgLen, sysLen int, stream bool) error {
+	if c == nil || c.CachePlan == nil {
+		return nil
+	}
+	plan := c.CachePlan
+
+	if err := validateCachePlanIndexes("system", plan.SystemIndexes, sysLen); err != nil {
+		return err
+	}
+	if err := validateCachePlanIndexes("messages", plan.MessageIndexes, msgLen); err != nil {
+		return err
+	}
+
+	sysCount := builtinSystemBreakpointCount(sysLen)
+	msgCount := builtinMessageBreakpointCount(msgLen)
+	if !stream {
+		// 非流式: 内置 system 恒 1 个、消息侧一个都没有 (既有行为, 见
+		// buildSystemParamNonStream 与 sendMessageDirect 的注释)。
+		sysCount = nonStreamBuiltinSystemBreakpoints(sysLen)
+		msgCount = 0
+	}
+	if plan.SystemIndexes != nil {
+		sysCount = len(plan.SystemIndexes)
+	}
+	if plan.MessageIndexes != nil {
+		msgCount = len(plan.MessageIndexes)
+	}
+	if total := sysCount + msgCount; total > MaxCacheBreakpoints {
+		return fmt.Errorf(
+			"api: 缓存断点计划共 %d 个 (system %d + messages %d)，超过 provider 上限 %d：超限会让上游整请求失败，不会静默丢弃多余的断点",
+			total, sysCount, msgCount, MaxCacheBreakpoints)
+	}
+	return nil
+}
+
+// validateCachePlanIndexes 校验一侧的下标集合: 非负、不越界、不重复。
+//
+// 三种错误分别报出来 (而不是合成一句"下标非法"), 因为调用方最需要知道的是
+// **哪一侧、哪几个下标**出了问题 —— 布局是算出来的, 重算时要定位到具体位置。
+func validateCachePlanIndexes(side string, indexes []int, length int) error {
+	seen := make(map[int]struct{}, len(indexes))
+	for i, idx := range indexes {
+		if idx < 0 {
+			return fmt.Errorf("api: 缓存断点计划的 %s[%d] = %d 为负数：负下标不会指向任何内容，打点会被静默跳过，调用方却以为断点已生效", side, i, idx)
+		}
+		if idx >= length {
+			return fmt.Errorf("api: 缓存断点计划的 %s[%d] = %d 越界 (%s 共 %d 个)：越界下标会被静默跳过，调用方却以为断点已生效", side, i, idx, side, length)
+		}
+		if _, dup := seen[idx]; dup {
+			return fmt.Errorf("api: 缓存断点计划的 %s 下标 %d 重复：重复标记会被上游拒绝，且重复本身说明布局计算有 bug", side, idx)
+		}
+		seen[idx] = struct{}{}
+	}
+	return nil
+}
+
 // shouldEnablePromptCache 决定本次请求是否启用 prompt cache: 曾因错误被禁用则恒 false;
 // "on"/"off" 显式生效; auto/空 只在 Anthropic 原生端点启用。
 func (c *Client) shouldEnablePromptCache() bool {
@@ -742,7 +1092,18 @@ func isCacheRelatedError(statusCode int, body string) bool {
 // applyExtraHeaders 把调用方注入的 ExtraHeaders 合并到出站请求头 (覆盖同名默认头,
 // 因此可覆盖 User-Agent 等 Go http 默认值)。nil ExtraHeaders 时为空操作。
 // 每个实际发往上游的 http.Request 构造点都必须调用它 (主路径 + fallback 模型路径)。
+//
+// 这里顺带补 opencode zen/go 的 x-opencode-session: 该上游缺这个头直接 400
+// MissingSessionID。以前只有两个网关 (anthropic-gateway / llmgw) 会补, **直连**
+// 路径 (claude-go run --model opencode:...) 完全没补 —— 因为网关在中间时根本
+// 看不出这个缺口。判据用 BaseURL 主机而不是 provider 名 (Client 没有那个字段);
+// 经网关时 BaseURL 指向网关、这里自然不触发, 由网关负责, 不会重复。
+//
+// 注入位置必须在 ExtraHeaders 之前: 调用方显式给的会话 ID 永远赢。ExtraHeaders
+// 自身不参与 Client 克隆 (见其注释), 所以不能把默认会话头放在那一层 —— 引擎每轮
+// 都会用 WithModel 造副本, 那样 header 会在真正的请求上消失。
 func (c *Client) applyExtraHeaders(httpReq *http.Request) {
+	c.applyOpencodeSessionHeader(httpReq)
 	if len(c.ExtraHeaders) == 0 {
 		return
 	}
@@ -751,6 +1112,26 @@ func (c *Client) applyExtraHeaders(httpReq *http.Request) {
 			httpReq.Header.Set(k, v)
 		}
 	}
+}
+
+// applyOpencodeSessionHeader 给直连 opencode 上游的请求补会话头。
+//
+// seed 取 BaseURL + Model 而不是随机值: 会话 ID 在 opencode 侧同时是提示缓存
+// 的分片键, 每次请求换一个等于把命中率钉死在 0 (见 OpencodeSessionID 注释)。
+// 同一客户端实例的 BaseURL/Model 在一次进程内稳定, 因此同一模型的连续请求
+// 落在同一会话上。ExtraHeaders 里显式给了值时不覆盖。
+func (c *Client) applyOpencodeSessionHeader(httpReq *http.Request) {
+	if c == nil || httpReq == nil {
+		return
+	}
+	if httpReq.Header.Get(OpencodeSessionHeader) != "" {
+		return
+	}
+	if !IsOpenCodeUpstream("", c.BaseURL) {
+		return
+	}
+	httpReq.Header.Set(OpencodeSessionHeader,
+		OpencodeSessionID(nil, "direct\n"+c.BaseURL+"\n"+c.Model))
 }
 
 // retryDelay 计算退避时间 (指数退避 + jitter, 429 用 3x 基数, deadline exceeded 用 DeadlineRetryBase)
@@ -1115,6 +1496,7 @@ func (c *Client) StreamMessage(
 				streamRec.Status = "retry_success"
 			}
 			applyLLMMetricsContext(&streamRec, callMeta)
+			streamRec.Owner = types.OwnerFromContext(ctx)
 			c.emitLLMMetric(streamRec)
 			if debug != nil {
 				debug.finish(c, streamRec, streamErrMsg)
@@ -1129,6 +1511,23 @@ func (c *Client) StreamMessage(
 			streamRec.ErrorKind = "client"
 			streamRec.CircuitBlocked = true
 			errCh <- fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
+			return
+		}
+
+		// 缓存断点计划的前置校验 (R-H2)。
+		//
+		// 必须排在**任何**断点落笔与请求体构造之前, 四个理由:
+		//  1. 超限/非法下标一旦拖到上游, 就是 400 或者"请求成功但缓存零收益";
+		//  2. markMessageCacheBreakpoint / markCacheBreakpointAt 会**就地改写**
+		//     调用方传进来的 messages (改 Content 字节)。先打点再发现计划非法,
+		//     调用方拿回的历史已经被改过一遍, 重试时字节就与第一次不同了;
+		//  3. 本函数在 goroutine 里跑, 早退只需往 errCh 送一条, 不发任何 HTTP;
+		//  4. 排在 Guard.Acquire 之前: 一份写错的计划不该占用限流令牌, 更不该
+		//     在队列里排完才被告知"下标越界"。
+		if err := c.validateCachePlanPath(len(messages), len(systemPrompt), true); err != nil {
+			streamErrMsg = err.Error()
+			streamRec.ErrorKind = "client"
+			errCh <- err
 			return
 		}
 
@@ -1152,11 +1551,14 @@ func (c *Client) StreamMessage(
 		// 是单断点里收益最大的位置。多断点(最多 4 个)留给后续按命中率调优。
 		// 只在 shouldEnablePromptCache() 为真时打 —— 不支持该字段的上游已有
 		// "400 后自适应关闭" 的兜底 (见下方重试分支)。
+		//
+		// 调用方给了 CachePlan.MessageIndexes 时按计划打点 (见 applyMessageCachePlan);
+		// nil 时与改动前一致, 走内置 cacheBreakpointIndexes(messages, 2)。
 		if c.shouldEnablePromptCache() && len(messages) > 0 {
-			markMessageCacheBreakpoint(messages)
+			applyMessageCachePlan(messages, c.CachePlan)
 		}
 
-		system := buildSystemParam(systemPrompt, c.shouldEnablePromptCache())
+		system := buildSystemParamPlanned(systemPrompt, c.shouldEnablePromptCache(), c.CachePlan)
 
 		req := types.APIRequest{
 			Model:     c.effectiveModel(),
@@ -1203,10 +1605,7 @@ func (c *Client) StreamMessage(
 		}
 		debug = c.newPromptDebugCapture("stream_messages", true)
 
-		maxRetry := c.RetryCount
-		if maxRetry <= 0 {
-			maxRetry = 4
-		}
+		maxRetry := c.maxRetries()
 
 		var resp *http.Response
 		effectiveBaseURL := c.BaseURL
@@ -1328,7 +1727,7 @@ func (c *Client) StreamMessage(
 				continue streamRetryLoop
 			}
 
-			if !isRetryableStatus(resp.StatusCode) {
+			if !c.retryableStatus(resp.StatusCode) {
 				streamErrMsg = fmt.Sprintf("API %d: %s", resp.StatusCode, string(respBody))
 				errCh <- fmt.Errorf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 				return
@@ -1347,6 +1746,8 @@ func (c *Client) StreamMessage(
 				}
 				// 智能模型切换: 连续 429 达阈值时切换备用模型
 				if newModel := c.on429OrFallback(); newModel != "" {
+					// 先观测再切换: From 必须是切换前的模型。
+					c.notifyFallback(req.Model, newModel, resp.StatusCode)
 					req.Model = newModel
 					if respReq != nil {
 						respReq.Model = newModel
@@ -1406,6 +1807,9 @@ func (c *Client) StreamMessage(
 					}
 					log.Printf("[api] Stream 主模型失败, 尝试备用模型: %s", fbModel)
 					c.fireEvent("retry", fmt.Sprintf("Stream 切换备用模型 %s", fbModel))
+					// 观测点与真正切换相邻: 夹在日志/事件之后、赋值之前, 保证
+					// From 仍是本次失败所用的模型。
+					c.notifyFallback(req.Model, fbModel, resp.StatusCode)
 					req.Model = fbModel
 					if respReq != nil {
 						respReq.Model = fbModel
@@ -1449,6 +1853,29 @@ func (c *Client) StreamMessage(
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
+		// 收尾判据的两个记分牌 (2026-10-28)。
+		//
+		// 此前这里没有任何"流是否完整"的判断: 非法 JSON 帧被 continue 丢掉,
+		// 断流只是 scanner.Scan() 返回 false, 两种情形都以 err=nil 收场。
+		// 上游于是可以"一个字都没说"而引擎报 completed —— 业务层据此把空回复
+		// 存成正常助手消息。用假上游实测: 0 个事件 / err=nil / completed。
+		//
+		// 判据: 收到过 message_delta(stop_reason) 或 message_stop 才算完成。
+		//
+		// 两者都认，因为协议里它们是**两种不同的正常收尾**：标准 Anthropic 流
+		// 两个都发；而部分网关/翻译层只发 message_stop。只认 message_delta 会把
+		// 后者的正常流判成断流（pkg/llmgw 的既有夹具就是这种形状）。
+		// 真正要抓的是"两个都没来"——那才是截断。
+		sawStopReason := false
+		sawMessageStop := false
+		// malformedFrames 统计 data 行里 JSON 解析失败的帧数。
+		//
+		// 不立刻报错: 个别网关会混入非协议行 (心跳、注释), 单帧失败就中断会
+		// 把可用的流打断。但**一帧都没成功**时必然报错 —— 那说明整个响应不是
+		// SSE 协议, 而不是偶尔多了一行。
+		malformedFrames := 0
+		validFrames := 0
+
 		for scanner.Scan() {
 			line := scanner.Text()
 
@@ -1471,21 +1898,33 @@ func (c *Client) StreamMessage(
 			if oaiTranslator != nil {
 				evs, oerr := oaiTranslator.translate([]byte(data))
 				if oerr != nil {
+					malformedFrames++
 					continue
 				}
 				deltas = evs
 			} else if respTranslator != nil {
 				evs, oerr := respTranslator.translate([]byte(data))
 				if oerr != nil {
+					malformedFrames++
 					continue
 				}
 				deltas = evs
 			} else {
 				var d types.StreamDelta
 				if err := json.Unmarshal([]byte(data), &d); err != nil {
+					malformedFrames++
 					continue
 				}
 				deltas = []types.StreamDelta{d}
+			}
+			validFrames++
+			for _, d := range deltas {
+				if d.Delta != nil && d.Delta.StopReason != "" {
+					sawStopReason = true
+				}
+				if d.Type == "message_stop" {
+					sawMessageStop = true
+				}
 			}
 			if debug != nil {
 				debug.addStreamEvent(data)
@@ -1582,6 +2021,43 @@ func (c *Client) StreamMessage(
 				}
 			}
 		}
+
+		// ===== 流完整性判定 (R-H15 / Q-H7) =====
+		//
+		// 位置必须在翻译器 flush **之后**: flush 是"上游只是没发 usage 尾帧"的
+		// 合法补救, 它补出的 message_delta 足以证明流是完整的。放在 flush 之前
+		// 会把这类正常收尾误判成断流。
+		//
+		// 此前这里没有任何"流是否完整"的判断: 非法 JSON 帧被 continue 丢掉,
+		// 断流只是 scanner.Scan() 返回 false, 两种情形都以 err=nil 收场。上游
+		// 于是可以"一个字都没说"而引擎报 completed —— 业务层据此把空回复存成
+		// 正常助手消息。用假上游实测: 0 个事件 / err=nil / completed。
+		//
+		// ctx 已取消时不算上游故障: 是调用方主动放弃, 引擎那边会报 cancelled。
+		if ctx.Err() == nil {
+			switch {
+			case scanner.Err() != nil:
+				// 读流本身出错 (连接被重置/超时)。断流最典型的形态。
+				streamErrMsg = fmt.Sprintf("读取响应流失败: %v", scanner.Err())
+				streamRec.ErrorKind = "server"
+				errCh <- fmt.Errorf("claude-go: 读取响应流失败: %w", scanner.Err())
+				return
+			case malformedFrames > 0 && validFrames == 0:
+				// 一帧都没解析成功 = 这不是 SSE 协议内容。常见于代理返回了
+				// HTML 错误页、或上游把 JSON 截断了。
+				streamErrMsg = fmt.Sprintf("响应流非法: %d 帧 data 无法解析", malformedFrames)
+				streamRec.ErrorKind = "server"
+				errCh <- fmt.Errorf("claude-go: 响应流非法: %d 帧 data 无法解析 (协议不匹配或响应被截断)", malformedFrames)
+				return
+			case !sawStopReason && !sawMessageStop:
+				// 帧本身合法但流在收口前断了 —— 半截正文。这是最危险的一种:
+				// 内容看起来正常, 只是少了后半句。
+				streamErrMsg = "响应流在 message_delta 之前结束 (断流)"
+				streamRec.ErrorKind = "server"
+				errCh <- fmt.Errorf("claude-go: 响应流在 message_delta 之前结束 (断流), 已完成 %d 帧", validFrames)
+				return
+			}
+		}
 	}()
 
 	return eventCh, errCh
@@ -1636,6 +2112,9 @@ func (c *Client) sendMessageDirect(
 	emit := func(rec LLMCallRecord) {
 		applyLLMMetricsContext(&rec, callMeta)
 		stampTraceIDs(&rec, traceIDs)
+		// owner 与 trace/engine 同源：都从 ctx 读（R-H6）。放在 emit 里而不是
+		// 各返回点，理由与 sinkRecord 相同 —— emit 是记录成型点，另找位置必漏。
+		rec.Owner = types.OwnerFromContext(ctx)
 		debugRec = rec
 		// 把这份记录交给切面链的记录槽 (链为空/未挂槽时是空操作)。放在 emit 里而不是
 		// 各返回点: emit 已经是"这次调用的记录成型点"的单一出口, 另找位置必然漏一条。
@@ -1664,6 +2143,23 @@ func (c *Client) sendMessageDirect(
 		return nil, fmt.Errorf("LLM 熔断器开启: 连续多次失败, 30s 后重试")
 	}
 
+	// 缓存断点计划的前置校验 (R-H2)。与流式路径同口径, 也必须排在 system 组装
+	// 与请求体构造之前: 非法计划不该产生任何可发送的字节, 更不该花一次往返去
+	// 让上游告诉你"断点太多"。同样排在 Guard.Acquire 之前, 不占限流令牌。
+	if err := c.validateCachePlanPath(len(messages), len(systemPrompt), false); err != nil {
+		rec := LLMCallRecord{
+			Status:       "error",
+			Request:      "messages",
+			DurationSec:  0,
+			HTTPStatus:   0,
+			ErrorKind:    "client",
+			ErrorMessage: truncateErr(err.Error(), 256),
+		}
+		debugErr = rec.ErrorMessage
+		emit(rec)
+		return nil, err
+	}
+
 	// 全局准入控制 (RPM 令牌桶 + 并发信号量)
 	var guardRelease func()
 	var guardWaitSec float64
@@ -1674,30 +2170,14 @@ func (c *Client) sendMessageDirect(
 		defer guardRelease()
 	}
 
-	var system interface{}
-	if len(systemPrompt) == 1 {
-		if c.shouldEnablePromptCache() {
-			system = []map[string]interface{}{
-				{"type": "text", "text": systemPrompt[0], "cache_control": map[string]string{"type": "ephemeral"}},
-			}
-		} else {
-			system = systemPrompt[0]
-		}
-	} else if len(systemPrompt) > 1 {
-		blocks := make([]map[string]interface{}, len(systemPrompt))
-		for i, s := range systemPrompt {
-			blocks[i] = map[string]interface{}{
-				"type": "text",
-				"text": s,
-			}
-		}
-		if c.shouldEnablePromptCache() {
-			// G1 PromptCache: cache_control 贴在第一个稳定块 (block 0),
-			// 而非最后一个动态块 (memory), 避免动态内容污染缓存键。
-			blocks[0]["cache_control"] = map[string]string{"type": "ephemeral"}
-		}
-		system = blocks
+	// 非流式路径同样接受 CachePlan (见 buildSystemParamNonStreamPlanned)。
+	// MessageIndexes 为 nil 时**不打消息断点** —— 这是既有行为, 不改: 本路径原本
+	// 就没有消息侧断点 (只有 system), 补上会改变所有非流式请求的字节。
+	// 只有调用方显式给了计划, 才在这里补上消息侧打点。
+	if c.shouldEnablePromptCache() && len(messages) > 0 && c.CachePlan != nil && c.CachePlan.MessageIndexes != nil {
+		applyMessageCachePlan(messages, c.CachePlan)
 	}
+	system := buildSystemParamNonStreamPlanned(systemPrompt, c.shouldEnablePromptCache(), c.CachePlan)
 
 	req := types.APIRequest{
 		Model:     c.effectiveModel(),
@@ -1733,10 +2213,7 @@ func (c *Client) sendMessageDirect(
 	}
 	debug = c.newPromptDebugCapture("messages", false)
 
-	maxRetry := c.RetryCount
-	if maxRetry <= 0 {
-		maxRetry = 4
-	}
+	maxRetry := c.maxRetries()
 
 	var lastErr error
 	var lastStatus int
@@ -1854,16 +2331,27 @@ func (c *Client) sendMessageDirect(
 			return &result, nil
 		}
 
-		// 不可重试的客户端错误 (400/401/403) — 不计入熔断器
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 && !isRetryableStatus(resp.StatusCode) {
-			// 自适应关闭 prompt cache: 如果 400 错误与 cache_control 相关，禁用后重试一次
-			if req.CacheControl != nil && isCacheRelatedError(resp.StatusCode, string(respBody)) {
-				log.Printf("[api] prompt cache 不被支持, 自适应关闭: %s", string(respBody)[:min(len(respBody), 200)])
-				c.promptCacheDisabledByError = true
-				req.CacheControl = nil
-				body, _ = json.Marshal(req)
-				continue // 重试一次
-			}
+		// 自适应关闭 prompt cache 必须**优先于**普通重试 (与流式路径同口径)。
+		//
+		// 顺序理由: 一旦 400 被配置进 RetryStatuses, 若先走重试分支, 就会用同一份
+		// 带 cache_control 的请求体重发 —— 上游会以同样的理由再拒一次, 白白耗掉
+		// 重试次数。先去断点重发才是"自适应"的原意: 缓存是偏好, 可用性才是前提。
+		//
+		// 判据从 req.CacheControl != nil 改为 shouldEnablePromptCache(): 非流式路径
+		// 从不设置顶层 CacheControl (cache_control 打在 system 块上, 见
+		// buildSystemParamNonStream), 旧判据恒为假, 这条兜底其实从未生效过。
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+			c.shouldEnablePromptCache() && isCacheRelatedError(resp.StatusCode, string(respBody)) {
+			log.Printf("[api] prompt cache 不被支持, 自适应关闭: %s", string(respBody)[:min(len(respBody), 200)])
+			c.promptCacheDisabledByError = true
+			req.CacheControl = nil
+			req.System = buildSystemParamNonStreamPlanned(systemPrompt, false, nil)
+			body, _ = json.Marshal(req)
+			continue // 重试一次
+		}
+
+		// 不可重试的客户端错误 (401/403 等) — 不计入熔断器
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 && !c.retryableStatus(resp.StatusCode) {
 			errMsg := fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(respBody))
 			rec := LLMCallRecord{
 				Status:       "error",
@@ -1895,6 +2383,8 @@ func (c *Client) sendMessageDirect(
 			}
 			// 智能模型切换: 连续 429 达阈值时切换备用模型, 用新模型重试
 			if newModel := c.on429OrFallback(); newModel != "" {
+				// 先观测再切换: From 必须是切换前的模型。
+				c.notifyFallback(req.Model, newModel, resp.StatusCode)
 				req.Model = newModel
 				if respReq != nil {
 					respReq.Model = newModel
@@ -1971,6 +2461,9 @@ func (c *Client) sendMessageDirect(
 			log.Printf("[api] 主模型 %s 不可用, 尝试备用模型 %d/%d: %s",
 				c.Model, fi+1, len(c.FallbackModels), fbModel)
 			c.fireEvent("retry", fmt.Sprintf("切换备用模型 %s", fbModel))
+			// 同上: 观测在赋值之前, From 取 req.Model (可能已被 429 智能切换改过),
+			// 而不是 c.Model —— 否则 A→B 之后接着回退时 From 会错记成 A。
+			c.notifyFallback(req.Model, fbModel, lastStatus)
 
 			req.Model = fbModel
 			var fbBody []byte

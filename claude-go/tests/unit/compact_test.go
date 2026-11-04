@@ -9,7 +9,12 @@ import (
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
-// TestMicroCompact 测试微压缩 (截断大输出)
+// TestMicroCompact 测试微压缩 (折叠大输出)
+//
+// 第二个参数是 protectFrom (本轮新增消息的起始下标), 不是阈值 —— 阈值是包级常量
+// compact.MicroCompactThreshold。本测试曾按旧签名 (第二参 = maxResultChars) 调用,
+// 传 50000 后 from=50000 > len(messages)=1, 整段被判定为"保护区"而原样返回,
+// 于是断言必然失败。签名在 f04acc12f 改成 protectFrom 时漏改了这里。
 func TestMicroCompact(t *testing.T) {
 	// 构造一个包含超大 tool_result 的消息
 	largeContent := make([]byte, 60000)
@@ -30,18 +35,53 @@ func TestMicroCompact(t *testing.T) {
 		},
 	}
 
-	result := compact.MicroCompact(messages, 50000)
+	result := compact.MicroCompact(messages, 0)
 
 	if len(result) != 1 {
 		t.Fatalf("期望 1 条消息, 实际 %d", len(result))
 	}
 
 	content := result[0].Content[0].Content
-	if len(content) > 51000 { // 50000 + truncation message
+	if len(content) > compact.MicroCompactKeepBytes+1024 {
 		t.Errorf("微压缩后内容仍过大: %d 字符", len(content))
 	}
-	if !containsSubstr(content, "truncated") {
-		t.Error("截断后应包含 truncated 标记")
+	if !containsSubstr(content, "[tool_result 已折叠]") {
+		t.Errorf("折叠后应包含折叠标记, 实际: %.200s", content)
+	}
+	if !containsSubstr(content, "call_id=test-1") {
+		t.Error("折叠后必须保留 call_id (上游按 id 配对 tool_use/tool_result)")
+	}
+}
+
+// TestMicroCompactProtectsEmittedHistory 钉住 protectFrom 语义:
+// 下标之前的消息一字节都不能动 (前缀缓存按字节比对), 只有 [from, len) 会被折叠。
+func TestMicroCompactProtectsEmittedHistory(t *testing.T) {
+	big := make([]byte, 60000)
+	for i := range big {
+		big[i] = 'B'
+	}
+	messages := []types.Message{
+		{
+			Type: types.MessageTypeUser,
+			Content: []types.ContentBlock{
+				{Type: types.ContentBlockToolResult, ToolUseID: "old-1", Content: string(big)},
+			},
+		},
+		{
+			Type: types.MessageTypeUser,
+			Content: []types.ContentBlock{
+				{Type: types.ContentBlockToolResult, ToolUseID: "new-1", Content: string(big)},
+			},
+		},
+	}
+
+	result := compact.MicroCompact(messages, 1)
+
+	if result[0].Content[0].Content != string(big) {
+		t.Error("protectFrom 之前的历史被改写了 (会让前缀缓存从改写点起全废)")
+	}
+	if result[1].Content[0].Content == string(big) {
+		t.Error("protectFrom 之后的新消息未被折叠")
 	}
 }
 

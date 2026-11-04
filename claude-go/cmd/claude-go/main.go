@@ -363,6 +363,7 @@ func main() {
 	rootCmd.AddCommand(searchMCPServerCmd())   // search/market 数据面 MCP
 	rootCmd.AddCommand(wechatCmd())
 	rootCmd.AddCommand(swarmCmd())
+	rootCmd.AddCommand(harnessSmokeCmd()) // harness 契约层真上游冒烟 (deploy/harness-smoke-k8s.sh)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -2664,15 +2665,24 @@ func llmGatewayCmd() *cobra.Command {
 					}
 					var groups []grp
 					for alias, mc := range p.Models {
+						// 分组键 = 代理 + 重试配置。两者都是模型级设置, 一条 route
+						// 只能承载一份; 只按 Proxy 分组会让同组内后一个模型的重试
+						// 配置悄悄覆盖前一个 (或反过来, 谁都以为自己的配置生效了)。
+						key := fmt.Sprintf("%s\x00%d\x00%d\x00%d\x00%v", mc.Proxy,
+							mc.RetryCount, mc.RetryBaseSec, mc.RetryMaxSec, mc.RetryStatuses)
 						var found *llmgw.Route
 						for i := range groups {
-							if groups[i].key == mc.Proxy {
+							if groups[i].key == key {
 								found = groups[i].rt
 								break
 							}
 						}
 						if found == nil {
-							rt := llmgw.Route{Provider: name, BaseURL: p.BaseURL, APIKey: p.APIKey, Proxy: mc.Proxy}
+							rt := llmgw.Route{
+								Provider: name, BaseURL: p.BaseURL, APIKey: p.APIKey, Proxy: mc.Proxy,
+								RetryCount: mc.RetryCount, RetryBaseSec: mc.RetryBaseSec,
+								RetryMaxSec: mc.RetryMaxSec, RetryStatuses: mc.RetryStatuses,
+							}
 							// 环境变量覆盖 key (K8s Secret 注入形态): <PROVIDER>_API_KEY
 							if env := os.Getenv(strings.ToUpper(name) + "_API_KEY"); env != "" {
 								rt.APIKey = env

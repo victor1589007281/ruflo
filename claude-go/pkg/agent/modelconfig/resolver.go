@@ -196,6 +196,10 @@ func (r *ConfigResolver) resolveAlias(alias string) ResolvedConfig {
 	cfg.FirstTokenTimeoutSec = entry.Params.FirstTokenTimeoutSec
 	cfg.CallTimeoutSec = entry.Params.CallTimeoutSec
 	cfg.DeadlineRetryBaseSec = entry.Params.DeadlineRetryBaseSec
+	cfg.RetryCount = entry.Params.RetryCount
+	cfg.RetryBaseSec = entry.Params.RetryBaseSec
+	cfg.RetryMaxSec = entry.Params.RetryMaxSec
+	cfg.RetryStatuses = entry.Params.RetryStatuses
 
 	return ApplyGatewayOverride(cfg)
 }

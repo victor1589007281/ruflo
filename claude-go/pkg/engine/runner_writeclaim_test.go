@@ -57,7 +57,13 @@ func (p *claimProbe) snapshot() []error {
 
 // claimingTool 只做一件事: 用工具上下文的写占用入口去占 input.path。
 // 调的是 tctx.ClaimWrite —— 与 filewrite.go / fileedit.go 里那一句逐字相同。
-type claimingTool struct{ probe *claimProbe }
+//
+// afterClaim 在占用结果记录之后、工具返回之前调用 (可为 nil), 供用例把"占用仍被持有"
+// 的窗口钉住 —— 两个 run 只在模型请求处对齐是不够的, 见 TestH34_并行写同一文件恰好一个被拒。
+type claimingTool struct {
+	probe      *claimProbe
+	afterClaim func()
+}
 
 func (t claimingTool) Name() string { return "noop_tool" } // 与假上游回的 tool_use 同名
 func (t claimingTool) Description() string {
@@ -83,6 +89,9 @@ func (t claimingTool) Call(_ context.Context, input json.RawMessage, tctx *tool.
 	_ = json.Unmarshal(input, &in)
 	err := tctx.ClaimWrite(in.Path)
 	t.probe.add(err)
+	if t.afterClaim != nil {
+		t.afterClaim()
+	}
 	if err != nil {
 		return &tool.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
@@ -90,7 +99,7 @@ func (t claimingTool) Call(_ context.Context, input json.RawMessage, tctx *tool.
 }
 
 // runClaiming 跑一次"声明要写 path"的隔离 run, 返回该 run 里工具拿到的占用结果。
-func runClaiming(t *testing.T, id RunIdentity, path string, gate *turnGate) []error {
+func runClaiming(t *testing.T, id RunIdentity, path string, gate, claimGate *turnGate) []error {
 	t.Helper()
 	probe := &claimProbe{}
 	up := newStateUpstream(t, 1, "done") // 1 轮工具, 然后收尾
@@ -104,7 +113,11 @@ func runClaiming(t *testing.T, id RunIdentity, path string, gate *turnGate) []er
 	}
 
 	reg := tool.NewRegistry()
-	reg.Register(claimingTool{probe: probe})
+	var afterClaim func()
+	if claimGate != nil {
+		afterClaim = claimGate.wait
+	}
+	reg.Register(claimingTool{probe: probe, afterClaim: afterClaim})
 	_, cfg := stateIdentity()
 	client := &api.Client{
 		BaseURL: up.srv.URL, APIKey: "k", Model: cfg.Model,
@@ -132,6 +145,15 @@ func TestH34_并行写同一文件恰好一个被拒(t *testing.T) {
 	gate := newTurnGate(2)
 	t.Cleanup(gate.release)
 
+	// 第二道闸: 拿到 (或被拒) 占用的那个 run 在 Call 里等到两个都试过才返回。
+	//
+	// 只对齐模型请求是不够的 —— 两个 run 从闸后同时往下走, 先到的那一个完全可能
+	// 占完、执行完、defer Release 掉, 后一个才申请, 于是"双双成功"是**正确实现**
+	// 在这条用例里的合法读数 (全量套件并发跑时实测偶发: 成功=2 冲突=0)。判据要的是
+	// "占用仍被持有时的第二次申请", 所以必须把占用窗口钉住。
+	claimGate := newTurnGate(2)
+	t.Cleanup(claimGate.release)
+
 	ids := []RunIdentity{}
 	for _, stage := range []string{"stage-a", "stage-b"} {
 		id, _ := stateIdentity()
@@ -145,7 +167,7 @@ func TestH34_并行写同一文件恰好一个被拒(t *testing.T) {
 		wg.Add(1)
 		go func(i int, id RunIdentity) {
 			defer wg.Done()
-			all[i] = runClaiming(t, id, path, gate)
+			all[i] = runClaiming(t, id, path, gate, claimGate)
 		}(i, id)
 	}
 	wg.Wait()
@@ -184,7 +206,7 @@ func TestH34_占用不跨run泄漏(t *testing.T) {
 	id, _ := stateIdentity()
 	id.Stage = "shared-file-stage"
 
-	first := runClaiming(t, id, path, nil)
+	first := runClaiming(t, id, path, nil, nil)
 	if len(first) != 1 || first[0] != nil {
 		t.Fatalf("第一个 run 该拿到占用, 实得: %v", first)
 	}
@@ -197,7 +219,7 @@ func TestH34_占用不跨run泄漏(t *testing.T) {
 			"泄漏的后果不是「偶发冲突」, 而是同路径后继任务必被拒", n)
 	}
 
-	second := runClaiming(t, id, path, nil)
+	second := runClaiming(t, id, path, nil, nil)
 	if len(second) != 1 {
 		t.Fatalf("第二个 run 应调用一次工具, 实得 %d 次", len(second))
 	}
@@ -235,7 +257,7 @@ func TestH34_不同文件的两个run都不受阻(t *testing.T) {
 		wg.Add(1)
 		go func(i int, id RunIdentity, path string) {
 			defer wg.Done()
-			all[i] = runClaiming(t, id, path, gate)
+			all[i] = runClaiming(t, id, path, gate, nil)
 		}(i, sp.id, sp.path)
 	}
 	wg.Wait()

@@ -121,6 +121,9 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 		"status":      rec.Status,
 		"source":      firstNonEmptyStr(rec.Source, "unknown"),
 		"request":     firstNonEmptyStr(rec.Request, "messages"),
+		// owner（R-H6）：租户维度必须可聚合，否则"谁把额度烧完了"只能翻日志。
+		// 空值归一到 local，与 types.OwnerFromContext 的默认口径一致。
+		"owner": firstNonEmptyStr(rec.Owner, "local"),
 	}
 	if rec.Purpose != "" {
 		labels["purpose"] = rec.Purpose

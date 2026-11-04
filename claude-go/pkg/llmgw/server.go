@@ -41,6 +41,19 @@ type Route struct {
 	// (如 muse-spark 大陆不可达, 须经东京 tailnet 代理出口), 直连组 Proxy 为空。
 	// main.go 构建路由时同一 provider 按 Proxy 分组, 保证"没配置代理的模型绝不走代理"。
 	Proxy string
+
+	// 网关层重试与退避 (模型级可配置; 语义同 api.RetryPolicyFromConfig):
+	// RetryCount 0 = 网关默认 2 次, -1 = 显式禁用, >0 = 该次数;
+	// RetryBaseSec/RetryMaxSec 0 = 1s/8s; RetryStatuses 空 = 默认集合 (含 400)。
+	//
+	// 为什么放在 Route 而不是只留 Server 级 SetRetryPolicy: 部署里网关读的是
+	// 配置文件, 而 SetRetryPolicy 只有代码调用点 —— 放进 Route 才能让
+	// retryCount/retryStatuses 这类字段真正生效。同一 provider 下重试配置不同的
+	// 模型会在 buildRoutes 里拆成多条 route (与 Proxy 分组同一套做法)。
+	RetryCount    int
+	RetryBaseSec  int
+	RetryMaxSec   int
+	RetryStatuses []int
 }
 
 // AccessRecord 网关访问日志行 (access.jsonl)。
@@ -54,11 +67,14 @@ type AccessRecord struct {
 	InputTokens    int    `json:"input_tokens"`
 	OutputTokens   int    `json:"output_tokens"`
 	InputEstimated bool   `json:"input_estimated,omitempty"` // input 来自请求字节估算 (len/4)
-	RunID          string `json:"run_id,omitempty"`          // X-CG-Run-ID 透传 (trace 四元组)
-	NodeID         string `json:"node_id,omitempty"`         // X-CG-Node-ID
-	TurnID         string `json:"turn_id,omitempty"`         // X-CG-Turn-ID
-	CallID         string `json:"call_id,omitempty"`         // X-CG-Call-ID
-	Err            string `json:"err,omitempty"`
+	// Attempts 是本次请求实际发往上游的次数 (含首次)。>1 表示发生过重试;
+	// 与 Status 合起来才能区分"上游一次就 500"和"重试 2 次后仍 500"。
+	Attempts int    `json:"attempts,omitempty"`
+	RunID    string `json:"run_id,omitempty"`  // X-CG-Run-ID 透传 (trace 四元组)
+	NodeID   string `json:"node_id,omitempty"` // X-CG-Node-ID
+	TurnID   string `json:"turn_id,omitempty"` // X-CG-Turn-ID
+	CallID   string `json:"call_id,omitempty"` // X-CG-Call-ID
+	Err      string `json:"err,omitempty"`
 }
 
 // Server 网关服务。
@@ -72,6 +88,10 @@ type Server struct {
 	proxyClients map[string]*http.Client
 	logMu        sync.Mutex
 	logPath      string
+
+	// retryPolicy 控制写响应前的上游重试 (受 s.mu 保护, 热加载可通过
+	// SetRetryPolicy 替换)。默认 DefaultGatewayRetryPolicy: 含 400, 重试 2 次。
+	retryPolicy api.RetryPolicy
 }
 
 // NewServer 构建网关。defaultProvider 为空时取第一个 route。
@@ -81,6 +101,9 @@ func NewServer(routes []Route, defaultProvider, stateDir string) (*Server, error
 	}
 	s := &Server{
 		routes: routes,
+		// 默认重试策略: 写响应前的 4xx/5xx 重试 (含 400), 额外 2 次。
+		// 旧调用点不传策略也自动获得与 anthropic-gateway 一致的行为。
+		retryPolicy: api.DefaultGatewayRetryPolicy(),
 		// 流式长连接: 不设整体超时, 只设握手/空闲级超时
 		client: &http.Client{Transport: &http.Transport{
 			MaxIdleConnsPerHost:   16,
@@ -111,6 +134,37 @@ func NewServer(routes []Route, defaultProvider, stateDir string) (*Server, error
 		s.logPath = filepath.Join(stateDir, "access.jsonl")
 	}
 	return s, nil
+}
+
+// SetRetryPolicy 替换网关的上游重试策略 (热加载/测试用)。
+//
+// 不放进 NewServer 的签名: 旧调用点遍布部署与测试, 加参数会逼着所有调用方
+// 改一遍, 而默认策略已经覆盖绝大多数场景。
+func (s *Server) SetRetryPolicy(p api.RetryPolicy) {
+	s.mu.Lock()
+	s.retryPolicy = p
+	s.mu.Unlock()
+}
+
+// currentRetryPolicy 取一份策略快照 (可能是热加载替换后的值)。
+func (s *Server) currentRetryPolicy() api.RetryPolicy {
+	s.mu.RLock()
+	p := s.retryPolicy
+	s.mu.RUnlock()
+	return p
+}
+
+// retryPolicyFor 返回本次请求实际使用的策略。
+//
+// 优先级: route 显式配置 > Server 级策略 (SetRetryPolicy / 默认)。
+// route 上一个字段都没配时原样返回 Server 策略 —— 这样 SetRetryPolicy 的
+// 全局关闭 (MaxRetries=0) 不会被 route 的零值悄悄改回默认 2 次。
+func (s *Server) retryPolicyFor(rt *Route) api.RetryPolicy {
+	if rt != nil && (rt.RetryCount != 0 || rt.RetryBaseSec != 0 ||
+		rt.RetryMaxSec != 0 || len(rt.RetryStatuses) != 0) {
+		return api.RetryPolicyFromConfig(rt.RetryCount, rt.RetryBaseSec, rt.RetryMaxSec, rt.RetryStatuses)
+	}
+	return s.currentRetryPolicy()
 }
 
 // Handler 返回 http.Handler (便于测试与挂载)。
@@ -226,6 +280,47 @@ func (s *Server) clientFor(rt *Route) *http.Client {
 	return s.client
 }
 
+// stripProviderPrefix 把请求体里 model 字段的 "provider:" 前缀剥掉, 其余字节不动。
+//
+// # 为什么不能只用 bytes.Replace
+//
+// 常见的快路径是按 `"model":"<alias>"` 做一次字节替换 —— 它要求发布方**不带空格**。
+// 但 JSON 的冒号两侧允许任意空白, 而不同客户端各写各的: Python 的 json.dumps 默认
+// 产出 `"model": "opencode:deepseek-v4.1-flash"` (冒号后一个空格)。快路径匹配不上,
+// 替换**静默不发生**, 于是整个别名被原样发给上游 —— 上游回 "Model is unavailable",
+// 一个看起来像模型下线、实际是本地字符串没替换掉的错误。
+//
+// 这个缺陷在本轮 K8s 集成测试里真实撞到过: 同一份请求体, 紧凑写法 200, 带空格 400。
+// 它不说话、不报错, 只是让上游拒掉一半的客户端。
+//
+// 所以与 cmd/anthropic-gateway.rewriteModelField 采用同一套两级策略: 快路径保原字节
+// (不重排字段顺序、不影响提示缓存的字节前缀), 匹配失败时回退到解析重建。
+func stripProviderPrefix(body []byte, alias, bare string) []byte {
+	// 快路径: 紧凑写法, 保住原始字节顺序 (cache_control 的字节前缀会因重排而失效)。
+	if out := bytes.Replace(body,
+		[]byte(`"model":"`+alias+`"`),
+		[]byte(`"model":"`+bare+`"`), 1); !bytes.Equal(out, body) {
+		return out
+	}
+	// 回退: 解析重建。map 会重排键序, 但"上游收到裸模型名"优先于"字节顺序不变" ——
+	// 前者错是 400, 后者错只是少命中一次缓存。
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		// 解析失败就原样转发: 让上游给出它自己的诊断, 好过在这里造一个假错误。
+		return body
+	}
+	quoted, err := json.Marshal(bare)
+	if err != nil {
+		return body
+	}
+	raw["model"] = json.RawMessage(quoted)
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // handleMessages 处理 Anthropic Messages 协议 (/messages 与 /v1/messages)。
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.handleMessagesWithPath(w, r, "/messages")
@@ -268,32 +363,56 @@ func (s *Server) handleMessagesWithPath(w http.ResponseWriter, r *http.Request, 
 	// 判定: 第一个冒号前段必须 == 已路由的 provider 名, 才是前缀形态。
 	outBody := body
 	if i := strings.IndexByte(probe.Model, ':'); i > 0 && probe.Model[:i] == rt.Provider {
-		bare := probe.Model[i+1:]
-		outBody = bytes.Replace(body,
-			[]byte(`"model":"`+probe.Model+`"`),
-			[]byte(`"model":"`+bare+`"`), 1)
+		outBody = stripProviderPrefix(body, probe.Model, probe.Model[i+1:])
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
-		strings.TrimRight(rt.BaseURL, "/")+upstreamPath, bytes.NewReader(outBody))
-	if err != nil {
-		s.fail(w, &rec, http.StatusBadGateway, "build request: "+err.Error())
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", rt.APIKey)
-	req.Header.Set("Authorization", "Bearer "+rt.APIKey)
-	if v := r.Header.Get("anthropic-version"); v != "" {
-		req.Header.Set("anthropic-version", v)
-	} else {
-		req.Header.Set("anthropic-version", "2023-06-01")
-	}
-	if probe.Stream {
-		req.Header.Set("Accept", "text/event-stream")
+	upstreamURL := strings.TrimRight(rt.BaseURL, "/") + upstreamPath
+	// build 每次重建 request + body reader (http.Request.Body 是一次性的)。
+	// 重试发生在写任何响应头/字节之前 —— 2xx 流一旦开始回传就不再重试。
+	build := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+			upstreamURL, bytes.NewReader(outBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", rt.APIKey)
+		req.Header.Set("Authorization", "Bearer "+rt.APIKey)
+		if v := r.Header.Get("anthropic-version"); v != "" {
+			req.Header.Set("anthropic-version", v)
+		} else {
+			req.Header.Set("anthropic-version", "2023-06-01")
+		}
+		if probe.Stream {
+			req.Header.Set("Accept", "text/event-stream")
+		}
+		// opencode zen/go 上游强制要求 x-opencode-session, 缺失直接 400 MissingSessionID
+		// ("cannot be routed efficiently")。
+		//
+		// 这一行是本轮 K8s 集成测试卡住的**根因**: 部署里 claude-go-gateway 跑的是
+		// `llm-gateway` 子命令 (即本包), 而会话头注入原先只写在 cmd/anthropic-gateway。
+		// 真实链路是 控制面/worker → 本网关 → opencode, 本网关是唯一出站跳, 它不补头
+		// 就没人补 —— 每一次 LLM 调用都 400, 与模型、凭据、推理参数全都无关。
+		//
+		// 同样的错误在 anthropic-gateway 侧也有一份, 所以判定逻辑收进 pkg/api 共用
+		// (见 api.IsOpenCodeUpstream / api.OpencodeSessionID), 不在此处另写一套。
+		if api.IsOpenCodeUpstream(rt.Provider, rt.BaseURL) {
+			req.Header.Set(api.OpencodeSessionHeader, api.OpencodeSessionID(r, rt.Provider))
+		}
+		return req, nil
 	}
 
-	resp, err := s.clientFor(rt).Do(req)
+	resp, attempts, err := api.DoWithRetry(r.Context(), s.clientFor(rt), s.retryPolicyFor(rt), build)
+	rec.Attempts = attempts
 	if err != nil {
+		// 客户端已取消: 只落访问日志, 不再写第二次响应。
+		if r.Context().Err() != nil {
+			rec.Status = 499
+			rec.Err = "canceled: " + err.Error()
+			rec.DurMS = time.Since(start).Milliseconds()
+			s.writeLog(&rec)
+			return
+		}
 		s.fail(w, &rec, http.StatusBadGateway, "upstream: "+err.Error())
 		return
 	}

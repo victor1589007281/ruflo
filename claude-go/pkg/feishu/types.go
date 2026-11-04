@@ -636,6 +636,12 @@ type ProviderModelConfig struct {
 	FirstTokenTimeoutSec int `json:"firstTokenTimeoutSec,omitempty"`
 	CallTimeoutSec       int `json:"callTimeoutSec,omitempty"`
 	DeadlineRetryBaseSec int `json:"deadlineRetryBaseSec,omitempty"`
+	// 网关层重试与退避 (0 = 网关默认; retryCount:-1 = 显式禁用)。
+	// 语义见 modelconfig.ModelConfig.RetryCount / RetryBaseSec / RetryMaxSec / RetryStatuses。
+	RetryCount    int   `json:"retryCount,omitempty"`
+	RetryBaseSec  int   `json:"retryBaseSec,omitempty"`
+	RetryMaxSec   int   `json:"retryMaxSec,omitempty"`
+	RetryStatuses []int `json:"retryStatuses,omitempty"`
 }
 
 // ProviderConfig 单个厂商的 API 连接参数。
@@ -941,6 +947,10 @@ func (jc *JSONConfig) ToModelConfigJSON() modelconfig.ConfigJSON {
 					FirstTokenTimeoutSec: mc.FirstTokenTimeoutSec,
 					CallTimeoutSec:       mc.CallTimeoutSec,
 					DeadlineRetryBaseSec: mc.DeadlineRetryBaseSec,
+					RetryCount:           mc.RetryCount,
+					RetryBaseSec:         mc.RetryBaseSec,
+					RetryMaxSec:          mc.RetryMaxSec,
+					RetryStatuses:        mc.RetryStatuses,
 				}
 			}
 			out.Providers[name] = modelconfig.ProviderConfig{

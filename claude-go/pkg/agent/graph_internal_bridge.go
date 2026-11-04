@@ -80,6 +80,11 @@ func (b *internalHookBridge) Observe(ctx context.Context, ev internal_hook.Event
 			"hook":  ev.Hook,
 			"turn":  ev.TurnCount,
 			"error": ev.Err,
+			// R-H7: 耗时/结果/失败形态。只增字段, 既有键语义不变。
+			"duration_ms": ev.Duration.Milliseconds(),
+			"result":      ev.Result,
+			"panic":       ev.Panic,
+			"timed_out":   ev.TimedOut,
 		},
 	})
 }

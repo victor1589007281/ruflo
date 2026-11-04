@@ -39,7 +39,17 @@ var toolNameCaps = map[string]agent.Capability{
 	"market_macro":     agent.CapNet,
 	"code_intel_query": agent.CapReadIndex, "code_intel_status": agent.CapReadIndex, "code_intel_branch": agent.CapReadIndex,
 	"code_intel_init": agent.CapWriteIndex, "code_intel_update": agent.CapWriteIndex,
-	"EnterPlanMode": agent.CapPlan, "ExitPlanMode": agent.CapPlan,
+	// GitInspect 暴露的是"受 scope 约束的仓库只读视图" (status/diff/log)，目的正是
+	// 让没有 Bash 的只读档位也能看未提交内容。它占 CapReadFS 而不是 CapExec：
+	// 动词与参数由代码固定，模型不能借它执行任意命令。
+	"GitInspect": agent.CapReadFS,
+	// OpsInvestigate 只读取证，采集语句/命令与目标白名单都由代码固定，模型不能
+	// 传任意 SQL/argv，也不落用户可控的写操作。它当前只注册在 analysis/admin，
+	// 但任何非零特权位都会让"analysis ⊆ research"在真实注册表上失真（research
+	// 没有这个工具）。与 StructuredOutput/ToolSearch 同理，归 0: 它不扩大档位的
+	// 能力边界，只提供一个受约束的只读取数面。
+	"OpsInvestigate": 0,
+	"EnterPlanMode":  agent.CapPlan, "ExitPlanMode": agent.CapPlan,
 	"TodoWrite": agent.CapTask, "TaskCreate": agent.CapTask, "TaskGet": agent.CapTask, "TaskUpdate": agent.CapTask, "TaskList": agent.CapTask,
 	"AskUserQuestion": agent.CapInteract,
 	"GenerateImage":   agent.CapMedia, "GenerateGIF": agent.CapMedia, "GenerateVideo": agent.CapMedia,

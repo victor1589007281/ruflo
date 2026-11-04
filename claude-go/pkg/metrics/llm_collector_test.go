@@ -220,3 +220,31 @@ func indexOf(hay []byte, needle string) int {
 	}
 	return -1
 }
+
+// TestLLM采集_owner进标签 —— R-H6：租户维度必须可聚合。
+//
+// 两个方向都钉住：显式 owner 原样进标签；未设置时归一为 local（而不是空串），
+// 否则 Grafana 里会多出一条 owner="" 的序列，与 local 的默认口径分叉。
+func TestLLM采集_owner进标签(t *testing.T) {
+	dir := t.TempDir()
+	c := NewCollector(dir)
+	ts := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+
+	recordLLMCall(c, api.LLMCallRecord{
+		Model: "m", Status: "success", Timestamp: ts, Owner: "tenant-a",
+	})
+	recordLLMCall(c, api.LLMCallRecord{
+		Model: "m", Status: "success", Timestamp: ts,
+	})
+
+	evts := eventsNamed(readLLMEvents(t, dir), MLLMCallCount)
+	if len(evts) != 2 {
+		t.Fatalf("应有 2 条调用样本, 实际 %d", len(evts))
+	}
+	if got := evts[0].Labels["owner"]; got != "tenant-a" {
+		t.Fatalf("显式 owner 应进标签, 实际 %q", got)
+	}
+	if got := evts[1].Labels["owner"]; got != "local" {
+		t.Fatalf("未设置 owner 时应归一为 local, 实际 %q", got)
+	}
+}

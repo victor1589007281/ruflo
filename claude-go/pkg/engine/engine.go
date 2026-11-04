@@ -303,10 +303,16 @@ type Config struct {
 	IsNonInteractive    bool
 	Debug               bool
 	SessionID           string
-	MetricsSource       string // LLM 指标来源: feishu_main / nested_agent / team_stage / cli
-	MetricsPurpose      string // 额外维度: chatID / team / stage / compact 等
-	Workflow            string // Agent Team 工作流名
-	Role                string // Agent 角色名
+	// OwnerID 是租户/用户身份 (Moqi R-H6) 的**部署级默认值**。
+	//
+	// 优先级是 ctx > 本字段 > types.DefaultOwnerID（见 engine/owner.go 的 ownerFrom）。
+	// 单引擎服务单租户时填这里即可；多租户共用引擎必须在 ctx 里传 owner，否则
+	// 所有请求都会归到同一个 owner —— 那不只是统计错，是数据互相可见。
+	OwnerID        string
+	MetricsSource  string // LLM 指标来源: feishu_main / nested_agent / team_stage / cli
+	MetricsPurpose string // 额外维度: chatID / team / stage / compact 等
+	Workflow       string // Agent Team 工作流名
+	Role           string // Agent 角色名
 	// Team 池个性化身份 (13.7-P1): 经 ToolContext.Team 透传给 pool_search/pool_load,
 	// 供 Beta 后验按 (team, role, asset) 记 trial。engine 不 import pkg/agent
 	// (避免 agent↔engine 环), 团队名由装配方显式填入, 不走 RunMetadataFromContext。
@@ -417,11 +423,29 @@ type Config struct {
 // applying DisabledTools (blacklist) and AllowedTools (whitelist, when set).
 // This is the single source of truth mirrored by ToolGateHook at PreToolUse.
 func (c *Config) toolExposed(name string) bool {
+	if c == nil {
+		return true
+	}
+	return c.toolExposedWith(c.AllowedTools, name)
+}
+
+// toolExposedWith 是 toolExposed 的"显式白名单"版本（Moqi R-H9 的单轮工具档位）。
+//
+// allow 是**已经合并好的**有效白名单（见 Config.ToolAllowlist），不是原始的
+// RunOverrides.AllowedTools —— 合并（取交集）只该在 ToolAllowlist 里做一次，
+// 在这里再做一次就等于有两个真源，而两处一旦不同步，判据就取决于谁先执行。
+//
+// 黑名单仍然先判，且**不受 allow 影响**：黑名单来自部署策略，单轮白名单不能
+// 把它绕过（"显式允许一个被禁的工具"不应成立）。
+func (c *Config) toolExposedWith(allow map[string]bool, name string) bool {
+	if c == nil {
+		return true
+	}
 	if c.DisabledTools != nil && c.DisabledTools[name] {
 		return false
 	}
 	// nil = 无白名单; 非 nil (含空集) = 仅名单内放行, 空集拒绝一切。
-	if c.AllowedTools != nil && !c.AllowedTools[name] {
+	if allow != nil && !allow[name] {
 		return false
 	}
 	return true
@@ -1083,8 +1107,32 @@ func (e *QueryEngine) firePhasePostTurn(
 		TurnAborted:     turnAborted,
 	}
 	if _, err := e.HookChain.Execute(internal_hook.PhasePostTurn, postTurnCtx); err != nil {
-		logging.For("engine").Error("PostTurn hook failed", "err", err)
+		// PostTurn 在回复已经产生之后执行，没有"终止本轮"可做；但 Critical 失败
+		// 仍要按 Critical 记日志，别让它在日志里看起来和 advisory 一样。
+		var hookErr *internal_hook.HookError
+		if errors.As(err, &hookErr) {
+			logging.For("engine").Error("PostTurn hook critical 失败", "err", err)
+		} else {
+			logging.For("engine").Error("PostTurn hook failed", "err", err)
+		}
 	}
+}
+
+// hookFailureTerminal 把 Critical hook 的失败转成可区分的终态（Moqi R-H7）。
+//
+// HookChain.Execute 对 Critical 失败返回 *internal_hook.HookError；改造前所有
+// 调用点只记一条日志就继续，于是"安全 gate 失败即拒绝"实际上从未生效 ——
+// 业务层看到的仍是一轮正常完成。这里把 typed error 再翻译成终态，调用点用
+// 第二个返回值判断是否需要直接结束本轮。
+func hookFailureTerminal(err error, phase string) (types.Terminal, bool) {
+	var hookErr *internal_hook.HookError
+	if !errors.As(err, &hookErr) {
+		return types.Terminal{}, false
+	}
+	return types.Terminal{
+		Reason: "hook_failed",
+		Error:  fmt.Errorf("%s: %w", phase, err),
+	}, true
 }
 
 // GetEngineMetrics 返回引擎指标快照 (供 dashboard/telemetry 采集)。
@@ -1361,7 +1409,45 @@ func (e *QueryEngine) injectHookContext(messages []types.Message, hookOut *types
 //	      连续回合的前缀 KV 缓存命中。
 func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, ch chan<- types.Message, streamCh chan<- types.StreamEvent) ([]types.Message, types.Terminal) {
 	turnCount := 0
-	currentModel := e.Config.Model
+	// toolCallsUsed 是本 run 已**执行**的工具调用数（Moqi R-H10 的工具预算口径）。
+	toolCallsUsed := 0
+	// 本轮覆盖（Moqi R-H17 / R-H10）：角色路由与单轮上限由 ctx 传入，不写 Config。
+	// 零值覆盖时下面每一个读取点都退回 Config，与改造前逐字节相同。
+	ov, _ := RunOverridesFromContext(ctx)
+	baseModel := e.Config.Model
+	if ov.Model != "" {
+		baseModel = ov.Model
+	}
+	maxTurns := e.Config.MaxTurns
+	if ov.MaxTurns > 0 {
+		maxTurns = ov.MaxTurns
+	}
+	maxTokens := e.Config.MaxTokens
+	if ov.MaxTokens > 0 {
+		maxTokens = ov.MaxTokens
+	}
+	if ov.Model != "" {
+		// 不允许静默换模型（R-H17）：路由变化必须留痕，否则"抽取走了便宜模型"
+		// 这件事在事后不可查，成本归集也就无从核对。
+		logging.For("engine").Info("本轮模型覆盖生效", "model", ov.Model)
+	}
+	currentModel := baseModel
+
+	// 本轮有效工具白名单 (Moqi R-H9 / TurnPolicy.AllowedTools)。
+	//
+	// 在循环外算一次: 名单在本 run 内不变, 每轮重算既浪费又可能因为 Config 被
+	// 并发改动而出现"前几轮能调、后几轮不能调"的抖动 —— 那种抖动在 trace 里
+	// 看起来像模型行为变化。
+	runAllow := e.Config.ToolAllowlist(ov)
+	// 黑名单或有效白名单任一存在就必须过滤。判据用**存在性**不是 len:
+	// 非 nil 的空集意味着"拒绝一切", 用 len 判会让它走进不过滤的分支。
+	runHasToolFilter := len(e.Config.DisabledTools) > 0 || runAllow != nil
+	if ov.AllowedTools != nil {
+		// 单轮档位生效必须留痕: 否则"这轮为什么没有 Bash"在事后不可查,
+		// 而这类"工具突然少了"的排查成本极高 (看起来像模型不会用工具)。
+		logging.For("engine").Info("本轮工具白名单生效",
+			"requested", len(*ov.AllowedTools), "effective", len(runAllow))
+	}
 
 	// 运行中入站通道 (21.8.12 P5) 的两半之一: 标记"有 loop 可以接注入"。
 	//
@@ -1392,6 +1478,23 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 	consecutiveErrors := 0 // 断路器: 连续错误计数 (ErrClassifier 启用后被绕过)
 	stopReason := ""       // 模型停止原因
 
+	// ephemeralDegraded 累积本 run 内逐轮上下文注入的降级原因 (Moqi R-H1)。
+	//
+	// 用 run 级切片而不是每轮覆盖: 业务层要回答的是"这一轮为什么回复质量下降",
+	// 而第 3 轮降级、第 4 轮正常时, 只看末轮会读出"一切正常"。
+	// 无降级时保持 nil, 不分配。
+	var ephemeralDegraded []string
+	// ephemeralBlocks / ephemeralNote / ephemeralFetched 是本 run 的临时上下文缓存。
+	//
+	// 三者在**第一次**请求前填一次, 之后整个 run 复用。见本文件那次注入点的注释:
+	// 每个用户 turn 只该问 provider 一次 —— 问多次会让同一位置的内容逐轮漂移,
+	// 自己把前缀缓存打掉。
+	var (
+		ephemeralBlocks  []types.ContentBlock
+		ephemeralNote    string
+		ephemeralFetched bool
+	)
+
 	// ==================== Trajectory 轨迹追踪状态 ====================
 	// 仅在 EnableTrajectory 时有效, 末尾统一写入 TrajStore。
 	turnStart := time.Now()
@@ -1411,7 +1514,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 路由例外: 委派工具 (delegate_task/Agent/Task) 的报告需要主模型综合,
 		// 该消费回合回主模型, 不切执行模型 (见 isDelegationResultTurn)。
 		client := e.APIClient
-		turnModel := e.Config.Model
+		turnModel := baseModel
 		if e.Config.ExecutionModel != "" && isToolExecTurn(messages) && !isDelegationResultTurn(messages) {
 			turnModel = e.Config.ExecutionModel
 		}
@@ -1487,6 +1590,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 			preCompactResult, err := e.HookChain.Execute(internal_hook.PhasePreCompact, preCompactCtx)
 			if err != nil {
+				if term, fatal := hookFailureTerminal(err, "PreCompact"); fatal {
+					logging.For("engine").Error("PreCompact hook critical 失败, 终止本轮", "err", err)
+					return messages, term
+				}
 				logging.For("engine").Error("PreCompact hook failed", "err", err)
 			}
 			if preCompactResult != nil {
@@ -1565,6 +1672,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 			preRequestResult, err := e.HookChain.Execute(internal_hook.PhasePreRequest, preRequestCtx)
 			if err != nil {
+				if term, fatal := hookFailureTerminal(err, "PreRequest"); fatal {
+					logging.For("engine").Error("PreRequest hook critical 失败, 终止本轮", "err", err)
+					return messages, term
+				}
 				logging.For("engine").Error("PreRequest hook failed", "err", err)
 			}
 			if preRequestResult != nil {
@@ -1637,6 +1748,48 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			messages = e.injectHookContext(messages, hookOut, "PreRequest")
 		}
 		apiMessages := messagesToAPI(messages, e.HookRunner)
+
+		// 逐轮临时上下文 (Moqi R-H1): **每个用户 turn 恰好一次**, 只进本次请求。
+		//
+		// 作用在 apiMessages 而不是 messages 是本轮改造的全部要害: messages 从头到尾
+		// 没被碰过, 于是"临时块进了 transcript / 进了下一轮历史 / 被压缩摘要"这三件事
+		// 在结构上不可能发生 —— 而不是靠三条返回路径各自记得剥离 (漏一条是静默的)。
+		//
+		// 位置在 messagesToAPI 之后: 后者会合并连续同角色消息并重排 tool_result,
+		// 提前注入会被那两步改写顺序, 于是"临时块在 turn 尾部"这个位置假设不成立。
+		//
+		// ★ 为什么用 ephemeralFor 缓存而不是每轮都问 provider: 一个用户 turn 内部
+		// 会循环多次 (每次工具调用回到这里)。若每次都问, 同一个 turn 的第 2..N 次
+		// 请求里的上下文块会**逐次变化** —— 而它们全都发生在**同一个** user 消息尾部,
+		// 于是缓存断点之后的内容每次都不一样, 前缀缓存被自己打掉。契约要求的是
+		// "每个用户 turn 一次", 不是"每次请求一次"。
+		//
+		// 它排在 sentUpTo 之外: 水位线已经在上面推进到 len(messages), 而临时块不占
+		// messages 的位置, 所以 [0, sentUpTo) 的保护语义不受影响。
+		if !ephemeralFetched {
+			ephemeralFetched = true
+			if eph := EphemeralFromContext(ctx); eph != nil {
+				var ephemeralErr error
+				ephemeralBlocks, ephemeralNote, ephemeralErr = collectEphemeral(ctx, eph, sentUpTo, messages)
+				if ephemeralErr != nil {
+					// critical (R-H1): 业务显式要求失败即拒绝。必须在模型调用前
+					// 终止, 否则"没有证据的回答"会先发出去再报错。
+					return messages, types.Terminal{
+						Reason: "context_critical",
+						Error:  ephemeralErr,
+					}
+				}
+				if ephemeralNote != "" {
+					// 降级只进 trace/日志, 不改变本轮结果: 检索是可选增强,
+					// 它失败不该让用户这一轮收不到回复。
+					logging.For("engine").Warn("逐轮上下文降级", "turn", turnCount, "reason", ephemeralNote)
+					ephemeralDegraded = append(ephemeralDegraded, ephemeralNote)
+				}
+			}
+		}
+		if len(ephemeralBlocks) > 0 {
+			apiMessages = appendEphemeralBlocks(apiMessages, ephemeralBlocks)
+		}
 		allTools := e.Tools.APITools()
 		var apiTools []types.APITool
 		// ★ 白名单这一维的判据是 **!= nil (存在性)**, 不是 len() > 0。
@@ -1652,9 +1805,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 而出站请求走的是这里 (21 个工具照发) —— 装配对账会因为两边读的不是同一段代码
 		// 而报"一致"。黑名单用 len() 无妨 (空黑名单与没有黑名单行为相同), 但为省掉一次
 		// 遍历而把语义判错的收益是负数, 所以两维统一按存在性判。
-		if e.Config.DisabledTools != nil || e.Config.AllowedTools != nil {
+		if runHasToolFilter {
 			for _, t := range allTools {
-				if e.Config.toolExposed(t.Name) {
+				if e.Config.toolExposedWith(runAllow, t.Name) {
 					apiTools = append(apiTools, t)
 				}
 			}
@@ -1682,8 +1835,22 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// trace 四元组 TurnID (design/03 §4.1 E0): 本轮内的 LLM 调用(含重试)共享同一 TurnID。
 		apiCtx = trace.With(apiCtx, trace.IDs{TurnID: fmt.Sprintf("t%d", turnCount)})
 
+		// 单次 run 的出站装饰（R-H2 缓存计划 / R-H17 回退观测）。
+		//
+		// 位置是**到达这里之后、发送之前**的唯一正确点：前面所有 client 派生
+		// （WithModel 相位路由、PlanClient 替换）都已经落定，装饰不会被它们覆盖；
+		// 后面没有别的地方再改 client。装饰是浅副本，不改变共享实例。
+		//
+		// 必须放在 PlanClient 判定之后：plan 客户端是另一个 *api.Client，在本轮
+		// 请求里同样需要带上本轮的计划与观测器。
+		if deco := ClientDecoratorFromContext(ctx); deco != nil {
+			if next := deco(client); next != nil {
+				client = next
+			}
+		}
+
 		apiCallStart := time.Now()
-		eventCh, errCh := client.StreamMessage(apiCtx, apiMessages, systemPrompt, apiTools, e.Config.MaxTokens)
+		eventCh, errCh := client.StreamMessage(apiCtx, apiMessages, systemPrompt, apiTools, maxTokens)
 
 		var assistantBlocks []types.ContentBlock
 		var toolUseBlocks []types.ContentBlock
@@ -1789,6 +1956,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 							streamCh <- types.StreamEvent{
 								Kind:      types.StreamEventToolStart,
 								ToolName:  block.Name,
+								ToolUseID: block.ID,
 								ToolInput: inputSummary,
 							}
 						}
@@ -1920,6 +2088,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				}
 				errorResult, err := e.HookChain.Execute(internal_hook.PhaseOnError, errorCtx)
 				if err != nil {
+					if term, fatal := hookFailureTerminal(err, "OnError"); fatal {
+						logging.For("engine").Error("OnError hook critical 失败, 终止本轮", "err", err)
+						return messages, term
+					}
 					logging.For("engine").Error("OnError hook failed", "err", err)
 				}
 				if errorResult != nil {
@@ -2056,6 +2228,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 			postRequestResult, err := e.HookChain.Execute(internal_hook.PhasePostRequest, postRequestCtx)
 			if err != nil {
+				if term, fatal := hookFailureTerminal(err, "PostRequest"); fatal {
+					logging.For("engine").Error("PostRequest hook critical 失败, 终止本轮", "err", err)
+					return messages, term
+				}
 				logging.For("engine").Error("PostRequest hook failed", "err", err)
 			}
 			if postRequestResult != nil {
@@ -2132,6 +2308,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 			stopResult, err := e.HookChain.Execute(internal_hook.PhaseOnStop, stopCtx)
 			if err != nil {
+				if term, fatal := hookFailureTerminal(err, "OnStop"); fatal {
+					logging.For("engine").Error("OnStop hook critical 失败, 终止本轮", "err", err)
+					return messages, term
+				}
 				logging.For("engine").Error("OnStop hook failed", "err", err)
 			}
 			if stopResult != nil {
@@ -2193,6 +2373,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 			preToolResult, err := e.HookChain.Execute(internal_hook.PhasePreToolUse, preToolCtx)
 			if err != nil {
+				if term, fatal := hookFailureTerminal(err, "PreToolUse"); fatal {
+					logging.For("engine").Error("PreToolUse hook critical 失败, 终止本轮", "err", err)
+					return messages, term
+				}
 				logging.For("engine").Error("PreToolUse hook failed", "err", err)
 			}
 			if preToolResult != nil {
@@ -2222,6 +2406,48 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 				if preToolResult.InjectContinue && len(toolUseBlocks) == 0 {
 					continue
 				}
+			}
+		}
+
+		// 单轮工具档位闸 (Moqi R-H9 / TurnPolicy.AllowedTools)。
+		//
+		// 排在这里的三个理由:
+		//  1. 在 PreToolUse hooks **之后** —— hook 可能增删 tool_use 块 (XML 回退
+		//     提取会凭空造出工具调用), 在之前的闸门管不到它们。
+		//  2. 在工具**执行之前** —— 这是"未授权工具不会被执行"的唯一判据。放在
+		//     执行之后只是事后记账, 副作用已经发生了。
+		//  3. 只在 ov.AllowedTools 非 nil 时跑 —— 单轮没收窄时一个字节都不多做,
+		//     与改造前逐字节相同 (R-H16)。
+		//
+		// 被拒的块必须补一条 error tool_result: transcript 里留下没有结果的
+		// tool_use 会让这段历史之后再也发不出去 (同下方 token 预算那道注释)。
+		if ov.AllowedTools != nil && len(toolUseBlocks) > 0 {
+			kept := make([]types.ContentBlock, 0, len(toolUseBlocks))
+			for _, blk := range toolUseBlocks {
+				if e.Config.toolExposedWith(runAllow, blk.Name) {
+					kept = append(kept, blk)
+					continue
+				}
+				msg := types.Message{
+					Type: types.MessageTypeUser,
+					UUID: internal_hook.GenerateUUID(),
+					Content: []types.ContentBlock{{
+						Type:      types.ContentBlockToolResult,
+						ToolUseID: blk.ID,
+						Content:   fmt.Sprintf("工具 %s 不在本轮允许的工具清单内，已被拒绝。请只使用当前可见的工具。", blk.Name),
+						IsError:   true,
+					}},
+					CreatedAt: time.Now(),
+				}
+				ch <- msg
+				messages = append(messages, msg)
+				logging.For("engine").Warn("工具被单轮白名单拒绝", "tool", blk.Name, "turn", turnCount)
+			}
+			toolUseBlocks = kept
+			if len(toolUseBlocks) == 0 {
+				// 全部被拒: 错误结果已入上下文, 让模型重新选择 —— 与
+				// gateToolUses 在 RunIsolated 里的处理一致。
+				continue
 			}
 		}
 
@@ -2257,7 +2483,7 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 					e.RunBudget.Limit(), e.RunBudget.Spent()),
 			}
 		}
-		if e.Config.MaxTurns > 0 && turnCount > e.Config.MaxTurns {
+		if maxTurns > 0 && turnCount > maxTurns {
 			if e.HookRunner != nil {
 				hookOut := e.HookRunner.ExecuteOnMaxTurnsReachedHooks(messages, turnCount)
 				if hookOut != nil && (hookOut.ContinueDecision == "block" || hookOut.ContinueDecision == "deny") {
@@ -2288,6 +2514,46 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			effectivePerm = types.PermissionModePlan
 		}
 
+		// 工具调用数预算 (Moqi R-H10)。**必须在执行之前判**。
+		//
+		// 与上面 token 预算的区别: 那道闸在**调用之后**检查, 因为 token 只有在拿到
+		// usage 时才知道花了多少。工具调用数是**事前可知**的 —— 这一批要调几个工具
+		// 此刻就写在 toolUseBlocks 里。放在执行之后判等于先把钱花掉再宣布超支。
+		//
+		// 超限时不执行工具, 但**必须**给每个 tool_use 补一条 error 的 tool_result:
+		// transcript 里留下没有结果的 tool_use 会变成任何后续 turn 都发不出去的
+		// 畸形历史 (同下方 token 预算那道注释的论证)。
+		if ov.MaxToolCalls > 0 && toolCallsUsed+len(toolUseBlocks) > ov.MaxToolCalls {
+			for _, blk := range toolUseBlocks {
+				msg := types.Message{
+					Type: types.MessageTypeUser,
+					UUID: internal_hook.GenerateUUID(),
+					Content: []types.ContentBlock{{
+						Type:      types.ContentBlockToolResult,
+						ToolUseID: blk.ID,
+						Content: fmt.Sprintf("⛔ 本 run 的工具调用预算已耗尽 (上限 %d), 该工具未执行。",
+							ov.MaxToolCalls),
+						IsError: true,
+					}},
+					CreatedAt: time.Now(),
+				}
+				ch <- msg
+				messages = append(messages, msg)
+			}
+			logging.For("engine").Warn("工具调用预算耗尽, 终止",
+				"limit", ov.MaxToolCalls, "used", toolCallsUsed,
+				"pending", len(toolUseBlocks), "turn", turnCount)
+			e.firePhasePostTurn(ctx, messages, turnCount, currentModel,
+				internal_hook.RunBudgetExhaustedReason, assistantBlocks, turnToolSigs,
+				turnUserIntent, turnPlanMsgs, turnStart, false)
+			return messages, types.Terminal{
+				Reason: internal_hook.RunBudgetExhaustedReason,
+				Error: fmt.Errorf("tool call budget exhausted: limit=%d used=%d pending=%d",
+					ov.MaxToolCalls, toolCallsUsed, len(toolUseBlocks)),
+			}
+		}
+		toolCallsUsed += len(toolUseBlocks)
+
 		tctx := &tool.ToolContext{
 			Cwd:                e.Config.Cwd,
 			PermissionMode:     effectivePerm,
@@ -2301,12 +2567,33 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			WeakResultPostprocess: e.Config.WeakModel.Enabled && e.Config.WeakModel.ResultPostprocess,
 			// 方案三 L2 护栏: edit/write 写入前语法校验 (与 SchemaRetry 同属 L2 开关)。
 			WeakEditGuard: e.Config.WeakModel.Enabled && e.Config.WeakModel.SchemaRetry,
-			SessionID:     e.Config.SessionID,   // EnterPlanMode/ExitPlanMode 用会话级 plan flag
-			PlanFileDir:   e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
+			// session 与 owner 同口径 (R-H6): 都走 ctx 优先的解析, 因为引擎被多个
+			// session 复用 —— 读 Config.SessionID 会让 plan flag 落到装配时那一个
+			// 会话上, 且不报错。
+			SessionID: e.sessionFrom(ctx), // EnterPlanMode/ExitPlanMode 用会话级 plan flag
+			// owner 从 ctx 解析 (R-H6): 工具据此给按 owner 隔离的数据做命名空间。
+			// 与 trace/metrics 同源, 都走 ownerFrom, 保证"日志里的 owner"与
+			// "工具看到的 owner" 永远是同一个值。
+			OwnerID:     e.ownerFrom(ctx),
+			PlanFileDir: e.Config.PlanFileDir, // ExitPlanMode 将计划落盘供实施阶段读取
 			// 13.7-P1 池个性化身份透传 (team_stage 路径才有值; CLI/主会话为空)。
 			Team:       e.Config.Team,
 			Role:       e.Config.Role,
 			GlobalPerm: e.PermChecker,
+			// R-H9 闸门接线: 从**本 run 的覆盖**取宿主确认与去重闸。
+			//
+			// ov 是 queryLoop 入口用同一个 ctx 解析出来的，所以这三类逐 run 的
+			// 能力（模型/上限/白名单、确认、去重）共用一个来源；分开各读一次 ctx
+			// 会在将来某次重构里出现"白名单生效了、确认没生效"的半通电状态。
+			//
+			// 刻意不给任何内置工具（Bash/Write/…）加 NeedsConfirmation() 或
+			// Idempotent() 声明: orchestration 对"声明了需确认但 Confirmed==nil"
+			// 的处置是**拒绝执行**，给存量工具加默认声明会让所有尚未配置 checker
+			// 的部署在上线瞬间全部拒执行 —— 这是把安全加固做成停摆。真正的闸门
+			// 由业务工具自己声明后生效；未声明时这里的两项为 nil，行为与改造前
+			// 逐字节相同（R-H16）。
+			Confirmed:   ov.Confirmation,
+			Idempotency: ov.Idempotency,
 		}
 
 		toolExecStart := time.Now()
@@ -2359,6 +2646,10 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			}
 			postToolResult, err := e.HookChain.Execute(internal_hook.PhasePostToolUse, postToolCtx)
 			if err != nil {
+				if term, fatal := hookFailureTerminal(err, "PostToolUse"); fatal {
+					logging.For("engine").Error("PostToolUse hook critical 失败, 终止本轮", "err", err)
+					return messages, term
+				}
 				logging.For("engine").Error("PostToolUse hook failed", "err", err)
 			}
 			if postToolResult != nil {
@@ -2378,8 +2669,14 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 						if len(summary) > 200 {
 							summary = summary[:200] + "..."
 						}
+						// ToolName 从 tool_use 块反查: tool_result 块自己只有
+						// tool_use_id。事件里必须带名字 —— 消费方按 ID 配对时用它
+						// 做交叉校验, 而按名字配对的旧消费方 (XML 回退路径) 少了
+						// 它就一条都配不上。
 						streamCh <- types.StreamEvent{
 							Kind:       types.StreamEventToolDone,
+							ToolName:   toolNameForUseID(toolUseBlocks, cb.ToolUseID),
+							ToolUseID:  cb.ToolUseID,
 							ToolResult: summary,
 						}
 					}
@@ -2392,6 +2689,24 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 			e.HookRunner.ExecutePostTurnHooks(messages, turnCount)
 		}
 	}
+}
+
+// toolNameForUseID 由 tool_use_id 反查工具名。
+//
+// 存在的理由: tool_result 块本身只带 tool_use_id (协议如此)，而 StreamEventToolDone
+// 的消费方 (harness 的 drain、SSE 出口) 需要名字。拿不到就返回空串 ——
+// 不猜、不填 "unknown": 消费方看到空串会退回按 ID 配对 (正确路径)，而
+// 填一个假名字会让它按名字配对到错误的调用上。
+func toolNameForUseID(blocks []types.ContentBlock, id string) string {
+	if id == "" {
+		return ""
+	}
+	for _, b := range blocks {
+		if b.ID == id {
+			return b.Name
+		}
+	}
+	return ""
 }
 
 // filterDynamicMaskedTools 方案三 L4 动态掩码 (使用感知渐进披露)。

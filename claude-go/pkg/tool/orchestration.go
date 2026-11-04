@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -244,6 +245,66 @@ func RunToolUse(
 		return makeErrorResult(fmt.Sprintf("未知工具: %s", toolName))
 	}
 
+	// owner 一致性闸 (Moqi R-H6): ctx 里的身份必须与 ToolContext.OwnerID 相同。
+	//
+	// # 这道闸防的是什么
+	//
+	// R-H6 要求"工具不能读取其他 owner 的数据"。owner 一路从鉴权结果流到
+	// ctx 再到 tctx, 中间只要有一处用**请求体里的自报字段**填了 tctx, 工具就会
+	// 拿着 A 的身份去查 B 的数据 —— 而每个工具各自判断"我该用哪个 owner"是
+	// 靠不住的 (总有人写 tctx.OwnerID, 也总有人写 ctx)。
+	//
+	// 所以判据放在**唯一入口**: 两处的值不等就拒绝执行。不是告警、不是降级 ——
+	// 越权访问没有"部分正确"的形态。
+	//
+	// # 为什么用 types 而不是 harness.CheckSameOwner
+	//
+	// pkg/tool 不能 import pkg/harness (harness → tool, 会成环)。两边的归一规则
+	// 同源 (types.NormalizeOwner / types.DefaultOwnerID), 所以这里裸比较是安全的:
+	// 空 owner 与 " " 都已经被归一成 "local", 不会出现"两个空串恒等"的假绿灯。
+	if tctx != nil {
+		want := types.NormalizeOwner(tctx.OwnerID)
+		got := types.OwnerFromContext(ctx)
+		if want != got {
+			// 故意不回显两个 owner 的具体值之外的东西: 这条消息可能进 transcript,
+			// 而 transcript 是用户可见的。owner 标识本身是必需的诊断信息, 但
+			// 不附带任何数据内容。
+			return makeErrorResult(fmt.Sprintf(
+				"owner 越权: 工具上下文的 owner 与当前请求不一致 (tool=%s), 已拒绝执行", toolName))
+		}
+	}
+
+	// 确认闸（R-H9）: 声明了 NeedsConfirmation 的工具在**没有确认**时拒绝执行。
+	//
+	// # 为什么这道闸必须在执行点，且先于权限闸
+	//
+	// R-H9 的验收原话是"需要确认的写工具在无确认时返回拒绝"。权限闸（下面那段）
+	// 回答的是"这个权限模式下允不允许"，而 NeedsConfirmation 回答的是"这个工具
+	// 自己说它需要人点头"。两者是不同的判据：一个部署可以跑在 acceptEdits 模式
+	// 下（权限闸全放行），同时某个工具仍然要求显式确认（比如删库、转账）。
+	//
+	// 顺序上必须在权限闸**之前**：acceptEdits/bypassPermissions 下权限闸会放行，
+	// 若确认闸排在它后面就永远跑不到 —— 那时"声明了需要确认"变成一句空话，而
+	// 工具作者以为自己加了护栏。
+	//
+	// # nil Confirmed = 拒绝
+	//
+	// 这是 fail-closed 的方向。反过来（nil = 放行）会让"忘了装配确认检查器"变成
+	// "所有声明需要确认的工具都可以不确认就执行" —— 一个装配遗漏被静默地翻译成
+	// 安全边界消失。拒不执行的代价是可见的（模型收到错误、用户来问），放行的代价
+	// 是不可见的。
+	if NeedsConfirmationOf(t) {
+		confirmed := tctx != nil && tctx.Confirmed != nil && tctx.Confirmed.IsConfirmed(toolName, block.Input)
+		if !confirmed {
+			// 错误文案要同时告诉模型两件事: (a) 这不是它的错（不要改参数重试到死）,
+			// (b) 需要人做什么。只说"被拒绝"会让模型把它当成可修复的参数问题，
+			// 于是换个写法再试一遍 —— 而它无论怎么改写都不会被放行。
+			return makeErrorResult(fmt.Sprintf(
+				"需要确认: 工具 %s 声明了执行前需用户确认，本次调用未获确认，已拒绝执行。"+
+					"请不要改写参数重试，等待用户确认后再调用。", toolName))
+		}
+	}
+
 	// Pre-tool-use hooks
 	var preHookContext string
 	if hookRunner != nil {
@@ -299,10 +360,35 @@ func RunToolUse(
 		// allow — 继续执行
 	}
 
-	// 执行工具
-	result, err := t.Call(ctx, block.Input, tctx)
+	// 执行工具: 超时闸（R-H9 Timeout）与幂等闸（R-H9 IdempotencyKey）都在这一层。
+	//
+	// 两闸的顺序是**先去重再超时**：命中缓存时连定时器都不用起。反过来（先起定时器
+	// 再查缓存）会给每次命中都白付一个 context.WithTimeout，而且超时判定会作用在
+	// 一次什么都没做的调用上。
+	//
+	// 去重只对**声明了 Idempotent()** 的工具生效，且只缓存成功结果 —— 两条理由见
+	// IdempotentTool 与 IdempotencyGate 的类型注释。未声明时 heat 为零。
+	callFn := func(callCtx context.Context) (*ToolResult, error) {
+		return t.Call(callCtx, block.Input, tctx)
+	}
+	var result *ToolResult
+	var err error
+	if tctx != nil && tctx.Idempotency != nil && IdempotentOf(t) {
+		key := types.IdempotencyKey(toolName, block.Input)
+		result, _, err = tctx.Idempotency.Do(ctx, key, func() (*ToolResult, error) {
+			return callWithTimeout(ctx, TimeoutOf(t), callFn)
+		})
+	} else {
+		result, err = callWithTimeout(ctx, TimeoutOf(t), callFn)
+	}
 	if err != nil {
 		content := fmt.Sprintf("工具执行错误: %v", err)
+		if errors.Is(err, ErrToolTimedOut) {
+			// 超时单独给一句可执行的建议：模型看到"执行错误"会原样重试，而重试一个
+			// 已经超时的调用通常还是会超时。让它收窄参数（少读几行、少扫一个目录）
+			// 才是能改变结果的动作。
+			content = fmt.Sprintf("工具执行超时: %v。请收窄本次调用的范围后重试（例如减少行数/缩小查询范围），不要原样重试。", err)
+		}
 		if hookRunner != nil {
 			_ = hookRunner.RunPostToolUseHooks(toolName, block.Input, content, true)
 			_ = hookRunner.RunPostToolUseFailureHooks(toolName, block.Input, content)
@@ -315,7 +401,7 @@ func RunToolUse(
 		_ = hookRunner.RunPostToolUseHooks(toolName, block.Input, result.Content, result.IsError)
 	}
 
-	content := result.Content
+	content := applyResultByteLimit(toolName, block.Input, result.Content, tctx, ResultLimitOf(t))
 	if preHookContext != "" {
 		content = preHookContext + "\n\n" + content
 	}

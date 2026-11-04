@@ -28,7 +28,10 @@ package internal_hook
 //
 // 无观测者时的开销 = 每次 HookChain.Execute 一次 ctx.Value 查找, 零分配。
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Event 一条内置 hook 事件 (映射到总线的 Scope × Phase)。
 //
@@ -46,6 +49,17 @@ type Event struct {
 	Err string
 	// TurnCount 第几轮 (HookContext.TurnCount 原样透传), 供图层对齐 turn。
 	TurnCount int
+
+	// 以下字段与 HookTrace 同源 (R-H7): Event 只在 hook 介入时报, 但介入的那一次
+	// 同样需要耗时/结果/失败形态。只增不改既有键语义。
+	// Duration 本次 hook 执行耗时。
+	Duration time.Duration
+	// Result HookResult 的归纳标签 (见 hookResultSummary), 不含用户正文。
+	Result string
+	// Panic 本次 hook 是否 panic 并被 recover。
+	Panic bool
+	// TimedOut 本次 hook 是否因 per-hook timeout 被中止。
+	TimedOut bool
 }
 
 // Observer 内置 hook 事件的观测者。**没有返回值**: 见文件头第 1 点。
@@ -74,6 +88,56 @@ func ObserverFrom(ctx context.Context) Observer {
 	return obs
 }
 
+// ---------------------------------------------------------------------------
+// HookTrace 观测面 (R-H7)
+// ---------------------------------------------------------------------------
+//
+// 与上面的 Event 是**两条并列的观测通道**, 各自回答不同的问题:
+//
+//	Event     —— "这一轮有没有被 hook 干预" (只在介入时报; 供图层计数/告警)
+//	HookTrace —— "每个 hook 跑了没有、跑了多久、结果是什么" (每个 hook 都报;
+//	             供 trace 落库与事后 RCA)
+//
+// 同样用 ctx 携带而不是 HookChain 字段: trace 是 per-request 的。两个并发 run
+// 共用一个 HookChain 时, 字段方案必然串台; ctx 不会。
+
+type hookTraceObserverKey struct{}
+
+// WithHookTraceObserver 把 trace 观测者放进 ctx。
+//
+// 与 WithObserver 一样, 由装配方在起 run 时注入一次, ctx 一路流到 HookChain。
+// 观测者必须并发安全 (见 HookTraceObserver)。
+func WithHookTraceObserver(ctx context.Context, obs HookTraceObserver) context.Context {
+	if obs == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, hookTraceObserverKey{}, obs)
+}
+
+// HookTraceObserverFrom 取出 ctx 中的 trace 观测者 (没有则返回 nil)。
+func HookTraceObserverFrom(ctx context.Context) HookTraceObserver {
+	if ctx == nil {
+		return nil
+	}
+	obs, _ := ctx.Value(hookTraceObserverKey{}).(HookTraceObserver)
+	return obs
+}
+
+// deliverHookTrace 同步投递一条 trace, 并吞掉观测者自身的 panic。
+//
+// 三个性质:
+//  1. 同步、在原 goroutine (调用方是 HookChain.Execute) —— 不另起 goroutine,
+//     否则 100 次超时就会留下 100 个待调度 goroutine;
+//  2. 在 executeIsolated 返回**之后**投递, 因此不可能影响 per-hook 超时判定;
+//  3. 观测者 panic 不得改变本轮结果 —— 观测是观测。
+func deliverHookTrace(ctx context.Context, obs HookTraceObserver, tr HookTrace) {
+	if obs == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	obs.ObserveHookTrace(ctx, tr)
+}
+
 // scopeOf phase → 总线作用域。
 //
 // 只有两档: 工具相关的 phase 归 tool, 其余归 turn。不给每个 phase 单独造一个
@@ -89,15 +153,26 @@ func scopeOf(p InternalHookPhase) string {
 }
 
 // emit 向 ctx 中的观测者投递一条事件 (观测者为 nil 时是空操作)。
-func emit(ctx *HookContext, obs Observer, phase InternalHookPhase, hookName, errText string) {
+//
+// 仍然**只在 hook 介入时**调用 (成功且返回非 nil HookResult, 或失败)。耗时/结果/
+// 失败形态从 out 原样带出 —— 这些字段是 R-H7 新增的, 既有键语义不变。
+func emit(ctx *HookContext, obs Observer, out HookOutcome, result string) {
 	if obs == nil {
 		return
 	}
+	errText := ""
+	if out.Err != nil {
+		errText = out.Err.Error()
+	}
 	obs.Observe(ctx.Ctx, Event{
-		Scope:     scopeOf(phase),
-		Phase:     phase.String(),
-		Hook:      hookName,
+		Scope:     scopeOf(out.Phase),
+		Phase:     out.Phase.String(),
+		Hook:      out.Name,
 		Err:       errText,
 		TurnCount: ctx.TurnCount,
+		Duration:  out.Duration,
+		Result:    result,
+		Panic:     out.Panic != nil,
+		TimedOut:  out.TimedOut,
 	})
 }

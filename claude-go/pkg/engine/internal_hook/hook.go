@@ -196,9 +196,11 @@ type BaseInternalHook struct {
 }
 
 // Name 返回 hook 名 (取嵌入时填的 Name_)。
-func (h *BaseInternalHook) Name() string                { return h.Name_ }
+func (h *BaseInternalHook) Name() string { return h.Name_ }
+
 // Priority 返回优先级, 同 phase 内值小者先执行。
-func (h *BaseInternalHook) Priority() int               { return h.Priority_ }
+func (h *BaseInternalHook) Priority() int { return h.Priority_ }
+
 // Phases 返回该 hook 要挂载的全部执行阶段。
 func (h *BaseInternalHook) Phases() []InternalHookPhase { return h.Phases_ }
 
@@ -209,6 +211,9 @@ func (h *BaseInternalHook) Phases() []InternalHookPhase { return h.Phases_ }
 // HookChain 按阶段管理 InternalHook，负责排序和执行合并。
 type HookChain struct {
 	hooks map[InternalHookPhase][]InternalHook
+	// observers 接收每次 hook 执行的观测结果（见 hookpolicy.go）。
+	// 注册发生在构造期，运行期只读遍历，不加锁。
+	observers []HookObserver
 }
 
 // NewHookChain 创建空的 HookChain。
@@ -216,12 +221,25 @@ func NewHookChain() *HookChain {
 	return &HookChain{hooks: make(map[InternalHookPhase][]InternalHook)}
 }
 
+// AddObserver 注册一个 hook 执行观察者。必须在开始使用链之前调用。
+func (c *HookChain) AddObserver(o HookObserver) {
+	if c == nil || o == nil {
+		return
+	}
+	c.observers = append(c.observers, o)
+}
+
 // Register 注册一个内置 Hook。
 // 同一 phase 按 Priority 升序排序（值越小越先执行）。
+//
+// 用 SliceStable 而不是 Slice: 同 Priority 的 hook 必须保持**注册顺序**。
+// sort.Slice 不保证相等元素的相对次序, 而 R-H7 要求"重复运行顺序一致" ——
+// 顺序不稳定会让同一份配置在两次运行里产生不同的合并结果 (例如两个同优先级的
+// 提示词注入 hook, 谁覆盖谁随机), 这种缺陷只在长跑里偶发, 极难定位。
 func (c *HookChain) Register(hook InternalHook) {
 	for _, phase := range hook.Phases() {
 		c.hooks[phase] = append(c.hooks[phase], hook)
-		sort.Slice(c.hooks[phase], func(i, j int) bool {
+		sort.SliceStable(c.hooks[phase], func(i, j int) bool {
 			return c.hooks[phase][i].Priority() < c.hooks[phase][j].Priority()
 		})
 	}
@@ -253,11 +271,13 @@ func (c *HookChain) Register(hook InternalHook) {
 //	      累积类 (AppendMsgs/StreamEvents) 只进 result、不进局部变量 —— 追加不该
 //	      被后续 hook 当成已生效的输入; 截断类 (ReturnTerminal/SkipRemaining)
 //	      必须**立即 break**, 继续执行会绕过显式的终止意图。
-//	代价与边界：O(该 phase 的 hook 数), 每 turn 触发 11 次的最热路径; ObserverFrom
-//	      只在进循环前查一次, 无观测者时 emit 退化为零分配空操作。任一 hook 返回
-//	      error 会**中断整条链**并向上抛 (其余 hook 不再执行)。
+//	代价与边界：O(该 phase 的 hook 数), 每 turn 触发 11 次的最热路径; ObserverFrom /
+//	      HookTraceObserverFrom 只在进循环前查一次, 无观测者时投递退化为零分配空操作。
+//	      Critical hook 返回 error 会**中断整条链**并向上抛 (其余 hook 记 Skipped);
+//	      Advisory hook 失败/超时/panic 只记录, 链继续 (见 hookpolicy.go)。
 //	设计权衡：链内不做并发 (hook 之间有顺序依赖, 如 Compact 必须在 PromptCache 之前),
-//	      也不做 hook 级超时 —— 单个 hook 卡住会卡住整个 turn, 由各 hook 自己保证轻量。
+//	      但每个 hook 有独立的可选超时与 panic 隔离 —— 业务增强 hook 卡住/崩溃
+//	      不能拖垮整轮。
 func (c *HookChain) Execute(phase InternalHookPhase, ctx *HookContext) (*HookResult, error) {
 	hooks := c.hooks[phase]
 	if len(hooks) == 0 {
@@ -272,22 +292,48 @@ func (c *HookChain) Execute(phase InternalHookPhase, ctx *HookContext) (*HookRes
 	// 每次 Execute 只查一次 ctx —— 这是每 turn 触发 11 次的最热路径, 逐 hook 查
 	// 会把一次 map 查找变成 N 次。无观测者时后续 emit 全是空操作 (零分配)。
 	obs := ObserverFrom(ctx.Ctx)
+	// trace 观测者同样只查一次, 且**从原始请求 ctx 取** (不是 executeIsolated
+	// 为单个 hook 造的 timeout child; 后者是 hctx 的浅拷贝, 不写回 hctx)。
+	traceObs := HookTraceObserverFrom(ctx.Ctx)
 
-	for _, hook := range hooks {
+	for i, hook := range hooks {
 		ctx.Messages = messages
 		ctx.SystemPrompt = systemPrompt
 
-		r, err := hook.Execute(ctx)
-		if err != nil {
-			// 报错事件先发再返回: 链在这里中断, 不发的话图层只看得到"这一轮少了点
-			// 什么", 看不到是谁断的。
-			emit(ctx, obs, phase, hook.Name(), err.Error())
-			return nil, fmt.Errorf("internal hook %s: %w", hook.Name(), err)
+		// 每个 hook 独立执行: 自带 panic recovery 与可选超时。未实现 HookPolicy
+		// 的 hook 得到 Criticality=Critical、Timeout=0 —— 与改造前行为完全一致。
+		r, out := executeIsolated(hook, phase, ctx)
+		for _, o := range c.observers {
+			o.OnHookOutcome(out)
+		}
+		// R-H7: 每个 hook 都投 trace, 无论是否介入。必须在返回 error 之前投递 ——
+		// critical 失败是最需要证据的路径, 不能因为"先 return 再记"而丢掉。
+		traceLabel := hookTraceResult(out, r)
+		deliverHookTrace(ctx.Ctx, traceObs, out.trace(traceLabel))
+		if out.Err != nil || out.Panic != nil {
+			emit(ctx, obs, out, traceLabel)
+			if !out.allowsContinue() {
+				// Critical 失败照旧中断整轮。这是所有存量 hook 的路径,
+				// 也是"安全 gate 失败即拒绝"需要的语义。后续 hook 不是不存在,
+				// 而是被跳过了 —— 补 Skipped trace, 让"少跑了哪些"也可查。
+				traceSkippedHooks(ctx.Ctx, traceObs, hooks[i+1:], phase)
+				return nil, &HookError{
+					Hook:        hook.Name(),
+					Phase:       phase,
+					Criticality: out.Criticality,
+					TimedOut:    out.TimedOut,
+					Panic:       out.Panic,
+					Err:         out.Err,
+				}
+			}
+			// Advisory 失败: 已经 emit 过错误事件, 链继续 —— 业务增强失败不该
+			// 让用户这一轮无法回复。
+			continue
 		}
 		if r == nil {
 			continue // 没介入就没事件: 见 bus.go 文件头第 3 点
 		}
-		emit(ctx, obs, phase, hook.Name(), "")
+		emit(ctx, obs, out, traceLabel)
 
 		if result == nil {
 			result = &HookResult{}
@@ -328,9 +374,11 @@ func (c *HookChain) Execute(phase InternalHookPhase, ctx *HookContext) (*HookRes
 		}
 		if r.ReturnTerminal != nil {
 			result.ReturnTerminal = r.ReturnTerminal
+			traceSkippedHooks(ctx.Ctx, traceObs, hooks[i+1:], phase)
 			break
 		}
 		if r.SkipRemaining {
+			traceSkippedHooks(ctx.Ctx, traceObs, hooks[i+1:], phase)
 			break
 		}
 	}

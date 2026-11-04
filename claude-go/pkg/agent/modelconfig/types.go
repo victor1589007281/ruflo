@@ -67,6 +67,22 @@ type ModelConfig struct {
 	FirstTokenTimeoutSec int `json:"firstTokenTimeoutSec,omitempty"` // 首token等待时间(秒)
 	CallTimeoutSec       int `json:"callTimeoutSec,omitempty"`       // 单次agent调用总时间(秒)
 	DeadlineRetryBaseSec int `json:"deadlineRetryBaseSec,omitempty"` // deadline exceeded退避基数(秒)
+
+	// 网关层重试与退避 (模型级可配置)。
+	//
+	// RetryCount 是**额外**重试次数:
+	//	  0  = 用网关默认 (透传路径 2 次; 翻译路径沿用 api.Client 历史默认 4 次)
+	//	  -1 = 显式禁用 (这个"禁用"必须能表达出来 —— 0 与不配置同为默认值)
+	//	  >0 = 该次数
+	RetryCount int `json:"retryCount,omitempty"`
+	// RetryBaseSec / RetryMaxSec 是退避基数与上限 (秒); 0 = 默认 (1s / 8s)。
+	// 网关透传路径使用这两个值; 翻译路径只在 >0 时覆盖 api.Client 的 3s/60s。
+	RetryBaseSec int `json:"retryBaseSec,omitempty"`
+	RetryMaxSec  int `json:"retryMaxSec,omitempty"`
+	// RetryStatuses 是可重试的 HTTP 状态码集合; nil/空 = 默认集合。
+	// 透传路径默认含 400 (用户要求); 翻译路径的 api.Client 历史默认不含 400,
+	// 因此"让 400 也重试"需要在这里显式列出来。
+	RetryStatuses []int `json:"retryStatuses,omitempty"`
 }
 
 // GlobalConfig 全局默认配置。
@@ -182,6 +198,13 @@ type ResolvedConfig struct {
 	FirstTokenTimeoutSec int // 首token等待时间(秒)
 	CallTimeoutSec       int // 单次agent调用总时间(秒)
 	DeadlineRetryBaseSec int // deadline exceeded退避基数(秒)
+
+	// 网关层重试与退避 (模型级可配置; 语义见 ModelConfig.RetryCount 等字段)。
+	// RetryCount: 0=网关默认, -1=显式禁用, >0=额外重试次数。
+	RetryCount    int
+	RetryBaseSec  int
+	RetryMaxSec   int
+	RetryStatuses []int
 
 	// ViaGateway 表示 BaseURL 已被 ApplyGatewayOverride 改指 LLM 网关
 	// (即进程设了 CLAUDE_GO_LLM_GATEWAY)。它决定 OutboundModelName 发别名还是裸名。

@@ -315,6 +315,34 @@ func buildClient(rc modelconfig.ResolvedConfig) *api.Client {
 	c.Protocol = rc.Protocol
 	c.ReasoningPlayback = rc.ReasoningPlayback
 	c.SetProxy(rc.Proxy)
+
+	// 重试配置 (模型级可配置, 与透传路径同一套默认值)。
+	//
+	// 这里**不能**沿用 api.Client 的历史默认 (4 次 / 3s / 60s, 不含 400):
+	// 用户明确要求"网关的大模型出错后不要直接失败, 包括 400"。同一个网关的
+	// 三条路径 (anthropic 透传 / OpenAI 格式透传 / 协议翻译) 必须给出同一份
+	// 默认语义, 否则同一个 400 在加不加 protocol 之间表现不同, 这种差异没人
+	// 能解释。所以统一走 api.RetryPolicyFromConfig:
+	//
+	//	retryCount    0 → 网关默认 2 次; -1 → 显式禁用; >0 → 该次数
+	//	retryBaseSec  0 → 1s;  retryMaxSec 0 → 8s
+	//	retryStatuses 空 → 默认集合 (含 400)
+	//
+	// -1 翻译成 api.Client 的负数语义 (<0 ⇒ 0 次尝试重试)。
+	rp := api.RetryPolicyFromConfig(rc.RetryCount, rc.RetryBaseSec, rc.RetryMaxSec, rc.RetryStatuses)
+	if rc.RetryCount < 0 {
+		c.RetryCount = -1
+	} else {
+		c.RetryCount = rp.MaxRetries
+	}
+	c.RetryBase = rp.Base
+	c.RetryMax = rp.Max
+	if len(rc.RetryStatuses) > 0 {
+		c.RetryStatuses = append([]int(nil), rc.RetryStatuses...)
+	} else {
+		c.RetryStatuses = api.DefaultGatewayRetryStatuses()
+	}
+
 	c.Tag = "anthropic-gateway"
 	return c
 }
@@ -503,22 +531,6 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 	upstream := baseURL + "/messages"
 
 	forwardBody := rewriteModelField(body, rc.ProviderName)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, strings.NewReader(string(forwardBody)))
-	if err != nil {
-		writeError(w, 502, "upstream_error", err.Error())
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", rc.APIKey)
-	req.Header.Set("Authorization", "Bearer "+rc.APIKey)
-	req.Header.Set("User-Agent", "anthropic-gateway/"+gatewayVersion)
-	if v := r.Header.Get("anthropic-version"); v != "" {
-		req.Header.Set("anthropic-version", v)
-	}
-	// opencode zen/go 原生 /v1/messages 同样强制要求 x-opencode-session (缺失 → 400)。
-	if isOpenCodeUpstream(rc) {
-		req.Header.Set("x-opencode-session", opencodeSessionID(r, ""))
-	}
 
 	// 模型级代理: 复用与翻译路径相同的代理语义 (http://host:port)。
 	client := &http.Client{Timeout: 10 * time.Minute}
@@ -530,12 +542,40 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 		}
 	}
 
-	resp, err := client.Do(req)
+	// 重试必须发生在**写任何响应头/字节之前**: 一旦开始回传 2xx 流就不能再重试。
+	// build 每次重建 request + body reader —— http.Request 的 Body 是一次性的。
+	policy := api.RetryPolicyFromConfig(rc.RetryCount, rc.RetryBaseSec, rc.RetryMaxSec, rc.RetryStatuses)
+	build := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(forwardBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", rc.APIKey)
+		req.Header.Set("Authorization", "Bearer "+rc.APIKey)
+		req.Header.Set("User-Agent", "anthropic-gateway/"+gatewayVersion)
+		if v := r.Header.Get("anthropic-version"); v != "" {
+			req.Header.Set("anthropic-version", v)
+		}
+		// opencode zen/go 原生 /v1/messages 同样强制要求 x-opencode-session (缺失 → 400)。
+		if isOpenCodeUpstream(rc) {
+			req.Header.Set("x-opencode-session", opencodeSessionID(r, ""))
+		}
+		return req, nil
+	}
+	resp, attempts, err := api.DoWithRetry(r.Context(), client, policy, build)
 	if err != nil {
+		// ctx 取消: 客户端已经放弃, 不能再写第二次响应 (写了也无人接收, 且会
+		// 在测试里表现为"取消后仍有一份 502 body")。
+		if r.Context().Err() != nil {
+			log.Printf("[anthropic-gateway] passthrough 已取消 (attempts=%d): %v", attempts, err)
+			return
+		}
 		writeError(w, 502, "upstream_error", err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	log.Printf("[anthropic-gateway] passthrough 最终 status=%d attempts=%d", resp.StatusCode, attempts)
 
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
@@ -617,19 +657,7 @@ func (g *gateway) proxyOpenAIFormat(w http.ResponseWriter, r *http.Request, upst
 
 	upstream := strings.TrimRight(rc.BaseURL, "/") + upstreamPath
 	forwardBody := rewriteModelField(body, rc.ProviderName)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(forwardBody))
-	if err != nil {
-		writeError(w, 502, "upstream_error", err.Error())
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", rc.APIKey)
-	req.Header.Set("Authorization", "Bearer "+rc.APIKey)
-	req.Header.Set("User-Agent", "anthropic-gateway/"+gatewayVersion)
-	// opencode zen/go 上游强制 x-opencode-session (缺失 → 400 MissingSessionID)。
-	if isOpenCodeUpstream(rc) {
-		req.Header.Set("x-opencode-session", opencodeSessionID(r, ""))
-	}
+
 	// omen-alpha 等隐藏推理模型首 token 可达 7+ 分钟: 用 --upstream-timeout (默认 30min),
 	// 不能用 proxyPassthrough 那样的 10min 短超时 (会中途 502 context deadline exceeded)。
 	client := &http.Client{Timeout: *upstreamTimeout}
@@ -640,12 +668,35 @@ func (g *gateway) proxyOpenAIFormat(w http.ResponseWriter, r *http.Request, upst
 			client.Transport = tr
 		}
 	}
-	resp, err := client.Do(req)
+
+	// 与 proxyPassthrough 同一套重试: 写响应之前完成, build 每次重建 request。
+	policy := api.RetryPolicyFromConfig(rc.RetryCount, rc.RetryBaseSec, rc.RetryMaxSec, rc.RetryStatuses)
+	build := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(forwardBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", rc.APIKey)
+		req.Header.Set("Authorization", "Bearer "+rc.APIKey)
+		req.Header.Set("User-Agent", "anthropic-gateway/"+gatewayVersion)
+		// opencode zen/go 上游强制 x-opencode-session (缺失 → 400 MissingSessionID)。
+		if isOpenCodeUpstream(rc) {
+			req.Header.Set("x-opencode-session", opencodeSessionID(r, ""))
+		}
+		return req, nil
+	}
+	resp, attempts, err := api.DoWithRetry(r.Context(), client, policy, build)
 	if err != nil {
+		if r.Context().Err() != nil {
+			log.Printf("[anthropic-gateway] openai-passthrough 已取消 (attempts=%d): %v", attempts, err)
+			return
+		}
 		writeError(w, 502, "upstream_error", err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	log.Printf("[anthropic-gateway] openai-passthrough 最终 status=%d attempts=%d", resp.StatusCode, attempts)
 
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
@@ -709,17 +760,16 @@ const claudeSessionHeader = "X-Claude-Code-Session-Id"
 const sessionKeyAliasMax = 4096
 
 // isOpenCodeUpstream 判断该 ResolvedConfig 是否指向 opencode zen/go 上游。
-// 判定依据: provider 名为 "opencode", 或 baseUrl 主机是 opencode.ai (含子域)。
+//
+// 判据已收进 api.IsOpenCodeUpstream (两个网关共用一份, 见该函数注释)。
+//
+// 这里必须传 rc.Provider —— **不是 rc.ProviderName**。后者装的是模型名
+// (如 "deepseek-v4.1-flash"), provider 名在同结构的 Provider 字段里。原先传错字段
+// 让这个判据恒为假, 三个注入点一段代码都没执行过: 探针实测 baseURL 明明就是
+// opencode.ai, isOpenCodeUpstream 却返回 false。这类"注入了但从未命中"的缺陷
+// 不会报错、不会 panic, 只会让下游 400 —— 修它必须靠显式观测判据的返回值。
 func isOpenCodeUpstream(rc modelconfig.ResolvedConfig) bool {
-	if strings.EqualFold(strings.TrimSpace(rc.ProviderName), "opencode") {
-		return true
-	}
-	u, err := neturl.Parse(strings.TrimSpace(rc.BaseURL))
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(u.Hostname())
-	return host == "opencode.ai" || strings.HasSuffix(host, ".opencode.ai")
+	return api.IsOpenCodeUpstream(rc.Provider, rc.BaseURL)
 }
 
 // opencodeSessionID 取本次入站请求对应的 opencode 会话 ID。

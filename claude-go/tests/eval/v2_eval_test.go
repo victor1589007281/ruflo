@@ -1408,6 +1408,10 @@ func testMemoryV2Persist(t *testing.T, report *WikiEvalReport) {
 
 	// 21.1 创建带持久化的存储
 	store := memory.NewTieredStoreWithPersist(tmpDir)
+	// Add 对高权重记忆起后台落盘 goroutine; 不 join 就会与 t.TempDir() 清理竞态
+	// (实测偶发 "TempDir RemoveAll cleanup: directory not empty")。与 pkg/memory
+	// 自己的测试同一写法。
+	t.Cleanup(store.WaitPersist)
 	if store != nil {
 		score += 2
 		t.Log("✓ NewTieredStoreWithPersist 创建成功")
@@ -1454,6 +1458,8 @@ func testMemoryV2TeamWrite(t *testing.T, report *WikiEvalReport) {
 
 	tmpDir := t.TempDir()
 	store := memory.NewTieredStoreWithPersist(tmpDir)
+	// 同上: 等 Add 触发的后台落盘结束再让 t.TempDir() 清理。
+	t.Cleanup(store.WaitPersist)
 
 	// 22.1 创建 MemoryWriter 适配器并写入
 	type testWriter struct{ store *memory.TieredStore }
