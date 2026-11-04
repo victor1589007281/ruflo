@@ -51,6 +51,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/permissions"
 	"github.com/anthropic/claude-go/pkg/prompt"
 	"github.com/anthropic/claude-go/pkg/tool"
+	"github.com/anthropic/claude-go/pkg/tool/builtin"
 	"github.com/anthropic/claude-go/pkg/types"
 	"github.com/spf13/cobra"
 )
@@ -691,6 +692,22 @@ func runHarnessSmoke(timeout time.Duration) *smokeReport {
 	gateOK, gateDetail := runHarnessGateCheck()
 	rep.add("r_h9_gate_overrides", gateOK, gateDetail)
 
+	// -----------------------------------------------------------------
+	// 7) H-F1/H-F2/H-F5：完整工具结果落库、信任标记、输入预览
+	// -----------------------------------------------------------------
+	evOK, evDetail := runHarnessToolEvidenceCheck()
+	rep.add("hf1_tool_result_evidence", evOK, evDetail)
+
+	// H-F4：DeepResearch 必须真实出现在需要检索的档位里。这里只验"注册"，
+	// 联网研究本身由单测（fake runner）与真实使用验收，不在冒烟里烧配额。
+	researchNames := builtin.ToolNameCatalog(builtin.ToolProfileResearch)
+	analysisNames := builtin.ToolNameCatalog(builtin.ToolProfileAnalysis)
+	deepOK := containsStr(researchNames, builtin.DeepResearchToolName) &&
+		containsStr(analysisNames, builtin.DeepResearchToolName)
+	rep.add("hf4_deepresearch_profile", deepOK,
+		fmt.Sprintf("research=%v analysis=%v", containsStr(researchNames, builtin.DeepResearchToolName),
+			containsStr(analysisNames, builtin.DeepResearchToolName)))
+
 	return rep
 }
 
@@ -789,6 +806,196 @@ func runHarnessGateCheck() (bool, string) {
 	ok := err == nil && calls == 1 && confirmed && idem && fm.CallCount() >= 2
 	return ok, fmt.Sprintf("toolCalls=%d confirmed=%v idempotency=%v modelCalls=%d err=%v",
 		calls, confirmed, idem, fm.CallCount(), err)
+}
+
+// ===========================================================================
+// H-F1/H-F2/H-F5：工具证据闭环的确定性验收
+// ===========================================================================
+
+// evidenceProbeTool 返回一段超过 500B 的结果，并声明自己来自不可信网页。
+// 它同时钉住三件事：全文能到达 ToolResultSink、Trust/SourceURI 不被丢掉、
+// 预览不超过 500B。
+type evidenceProbeTool struct{ full string }
+
+func (t *evidenceProbeTool) Name() string        { return "smoke_evidence_probe" }
+func (t *evidenceProbeTool) Description() string { return "H-F1 证据闭环探针" }
+func (t *evidenceProbeTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}}}`)
+}
+func (t *evidenceProbeTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+func (t *evidenceProbeTool) IsReadOnly(_ json.RawMessage) bool        { return true }
+func (t *evidenceProbeTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) *types.PermissionResult {
+	return nil
+}
+func (t *evidenceProbeTool) Call(_ context.Context, _ json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
+	return &tool.ToolResult{
+		Content:   t.full,
+		Trust:     "untrusted",
+		SourceURI: "https://example.com/evidence",
+	}, nil
+}
+
+type evidenceSink struct {
+	mu   sync.Mutex
+	recs []harness.ToolResultRecord
+}
+
+func (s *evidenceSink) AppendToolResult(_ context.Context, rec harness.ToolResultRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recs = append(s.recs, rec)
+	return nil
+}
+
+func (s *evidenceSink) snapshot() []harness.ToolResultRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]harness.ToolResultRecord, len(s.recs))
+	copy(out, s.recs)
+	return out
+}
+
+// runHarnessToolEvidenceCheck 用假上游确定性地触发一次工具调用，再从
+// ToolResultSink / TurnResult / 流式事件三个出口交叉核对。
+//
+// 为什么不用真模型：让真模型"恰好调用探针"不可靠，失败时也无法区分是
+// 证据链没通还是模型没选工具。这里模型的唯一职责是回放脚本。
+func runHarnessToolEvidenceCheck() (bool, string) {
+	// 671B：超过 500B 预览窗口，才能同时断言 ResultTruncated 与阈值。
+	full := "EVIDENCE_HEAD_" + strings.Repeat("0123456789abcdef", 40) + "EVIDENCE_TAIL_END"
+
+	fm := harnesstest.New(
+		harnesstest.ToolCall("smoke_evidence_probe", "tu_evidence", `{"q":"probe"}`),
+		harnesstest.Text("证据已记录"),
+	)
+	srv := httptest.NewServer(fm.Handler())
+	defer srv.Close()
+
+	reg := tool.NewRegistry()
+	reg.Register(&evidenceProbeTool{full: full})
+
+	client := &api.Client{
+		BaseURL: srv.URL, APIKey: "k", Model: "m", Client: srv.Client(), RetryCount: 0,
+	}
+	promptDir, err := os.MkdirTemp("", "harness-smoke-prompt-*")
+	if err != nil {
+		return false, "临时目录创建失败: " + err.Error()
+	}
+	defer os.RemoveAll(promptDir)
+	promptMgr := prompt.NewManager(promptDir)
+	promptMgr.OverridePrompt = "你是执行者"
+	eng := engine.NewQueryEngine(&engine.Config{Model: "m", MaxTurns: 4},
+		client, reg, hooks.NewRunner(nil, ""),
+		permissions.NewChecker(types.PermissionModeAcceptEdits), nil, promptMgr)
+
+	sink := &evidenceSink{}
+	var (
+		evMu   sync.Mutex
+		events []harness.TurnEvent
+	)
+	r := harness.NewRunner(harness.RunnerOptions{
+		Engine:      eng,
+		ToolResults: sink,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, err := r.RunTurn(ctx, harness.TurnRequest{
+		SessionID: "evidence-session",
+		TurnID:    "evidence-turn",
+		OwnerID:   "evidence-owner",
+		Input:     []types.ContentBlock{{Type: types.ContentBlockText, Text: "调用证据探针"}},
+	}, func(ev harness.TurnEvent) {
+		evMu.Lock()
+		events = append(events, ev)
+		evMu.Unlock()
+	})
+
+	recs := sink.snapshot()
+	var startTool, doneTool *harness.ToolEvent
+	evMu.Lock()
+	for _, ev := range events {
+		if ev.Tool == nil {
+			continue
+		}
+		switch ev.Kind {
+		case harness.EventToolStart:
+			startTool = ev.Tool
+		case harness.EventToolDone:
+			doneTool = ev.Tool
+		}
+	}
+	evMu.Unlock()
+
+	recOK := len(recs) == 1 &&
+		recs[0].FullResult == full &&
+		recs[0].Trust == "untrusted" &&
+		recs[0].SourceURI == "https://example.com/evidence" &&
+		recs[0].OwnerID == "evidence-owner" &&
+		recs[0].SessionID == "evidence-session" &&
+		recs[0].TurnID == "evidence-turn" &&
+		strings.Contains(string(recs[0].Input), "probe")
+
+	callOK := res != nil && len(res.ToolCalls) == 1 &&
+		res.ToolCalls[0].ResultBytes == len(full) &&
+		res.ToolCalls[0].ResultTruncated &&
+		len(res.ToolCalls[0].ResultPreview) == 500 &&
+		res.ToolCalls[0].Trust == "untrusted" &&
+		res.ToolCalls[0].SourceURI == "https://example.com/evidence"
+
+	eventOK := startTool != nil && doneTool != nil &&
+		strings.Contains(startTool.InputPreview, "probe") && len(startTool.InputPreview) <= 500 &&
+		len(doneTool.ResultPreview) == 500 &&
+		doneTool.Trust == "untrusted" &&
+		doneTool.SourceURI == "https://example.com/evidence"
+
+	ok := err == nil && recOK && callOK && eventOK
+	detail := fmt.Sprintf("err=%v sinkRecords=%d fullMatch=%v trust=%q source=%q callBytes=%d callTrunc=%v previewLen=%d eventTrust=%q startInput=%q",
+		err, len(recs), recOK,
+		recsField(recs, func(r harness.ToolResultRecord) string { return r.Trust }),
+		recsField(recs, func(r harness.ToolResultRecord) string { return r.SourceURI }),
+		callResultBytes(res), callResultTruncated(res), callPreviewLen(res),
+		toolTrust(doneTool), toolInput(startTool))
+	return ok, detail
+}
+
+func recsField(recs []harness.ToolResultRecord, f func(harness.ToolResultRecord) string) string {
+	if len(recs) == 0 {
+		return ""
+	}
+	return f(recs[0])
+}
+
+func callResultBytes(r *harness.TurnResult) int {
+	if r == nil || len(r.ToolCalls) == 0 {
+		return -1
+	}
+	return r.ToolCalls[0].ResultBytes
+}
+
+func callResultTruncated(r *harness.TurnResult) bool {
+	return r != nil && len(r.ToolCalls) > 0 && r.ToolCalls[0].ResultTruncated
+}
+
+func callPreviewLen(r *harness.TurnResult) int {
+	if r == nil || len(r.ToolCalls) == 0 {
+		return -1
+	}
+	return len(r.ToolCalls[0].ResultPreview)
+}
+
+func toolTrust(t *harness.ToolEvent) string {
+	if t == nil {
+		return ""
+	}
+	return t.Trust
+}
+
+func toolInput(t *harness.ToolEvent) string {
+	if t == nil {
+		return ""
+	}
+	return t.InputPreview
 }
 
 // ===========================================================================

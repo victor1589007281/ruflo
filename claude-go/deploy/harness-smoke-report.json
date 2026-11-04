@@ -1,1 +1,83 @@
-{"pass":true,"model":"opencode:deepseek-v4.1-flash","startedAt":"2026-10-28T15:14:53.33498281Z","durationMs":9795,"checks":[{"name":"build_engine","pass":true,"detail":"provider/client 装配完成（model=opencode:deepseek-v4.1-flash）"},{"name":"blob_store","pass":true,"detail":"/tmp/harness-smoke-blobs-2500891611"},{"name":"live_turn_answer","pass":true,"detail":"text=\"集成通过\" err=\u003cnil\u003e requests=1"},{"name":"live_usage_cost","pass":true,"detail":"usageKnown=true in=45 out=3 costKnown=true cost=0.004400000"},{"name":"live_cost_known","pass":true,"detail":"costKnown=true cost=0.004400000（账本已装配）"},{"name":"live_model_route","pass":true,"detail":"出站 model=\"deepseek-v4.1-flash\" want=\"deepseek-v4.1-flash\" path=/zen/go/v1/messages"},{"name":"r_h2_cache_plan_on_wire","pass":true,"detail":"planned=[1] systemSegments=2 全部命中且 block0 无断点"},{"name":"r_h11_running_before_model","pass":true,"detail":"请求发出时 states=1 running=true terminalAlready=false"},{"name":"r_h1_context_pruned","pass":true,"detail":"kept=[keep] dropped=[drop] tokens=60 known=true trace=\"retrieval:2\" bodyKeep=true bodyDrop=false degraded=[context_budget_pruned]"},{"name":"r_h4_replay_no_second_call","pass":true,"detail":"secondCalls=0 textEqual=true persisted=true degraded=[turn_replayed] assists=1"},{"name":"r_h5_text_attachment","pass":true,"detail":"err=\u003cnil\u003e nonceInRequest=true userAttachments=1 nonceInTranscript=false text=\"ATTACH_NONCE_7K2\""},{"name":"r_h11_image_rejected","pass":true,"detail":"errKind=\"modality\" requests=0 err=modality: harness: 模型不支持该模态: 模型 opencode:deepseek-v4.1-flash 不接受 image 附件（dot.png）"},{"name":"r_h9_gate_overrides","pass":true,"detail":"toolCalls=1 confirmed=true idempotency=true modelCalls=2 err=\u003cnil\u003e"}]}
+{
+  "pass": true,
+  "model": "opencode:deepseek-v4.1-flash",
+  "startedAt": "2026-11-04T10:03:25.321334058+08:00",
+  "durationMs": 45815,
+  "checks": [
+    {
+      "name": "build_engine",
+      "pass": true,
+      "detail": "provider/client 装配完成（model=opencode:deepseek-v4.1-flash）"
+    },
+    {
+      "name": "blob_store",
+      "pass": true,
+      "detail": "/tmp/harness-smoke-blobs-1882000259"
+    },
+    {
+      "name": "live_turn_answer",
+      "pass": true,
+      "detail": "text=\"集成通过\" err=\u003cnil\u003e requests=1"
+    },
+    {
+      "name": "live_usage_cost",
+      "pass": true,
+      "detail": "usageKnown=true in=900 out=3 costKnown=true cost=0.000903000"
+    },
+    {
+      "name": "live_cost_known",
+      "pass": true,
+      "detail": "costKnown=true cost=0.000903000（账本已装配）"
+    },
+    {
+      "name": "live_model_route",
+      "pass": true,
+      "detail": "出站 model=\"deepseek-v4.1-flash\" want=\"deepseek-v4.1-flash\" path=/zen/go/v1/messages"
+    },
+    {
+      "name": "r_h2_cache_plan_on_wire",
+      "pass": true,
+      "detail": "planned=[1] systemSegments=3 全部命中且 block0 无断点"
+    },
+    {
+      "name": "r_h11_running_before_model",
+      "pass": true,
+      "detail": "请求发出时 states=1 running=true terminalAlready=false"
+    },
+    {
+      "name": "r_h1_context_pruned",
+      "pass": true,
+      "detail": "kept=[keep] dropped=[drop] tokens=60 known=true trace=\"retrieval:2\" bodyKeep=true bodyDrop=false degraded=[context_budget_pruned]"
+    },
+    {
+      "name": "r_h4_replay_no_second_call",
+      "pass": true,
+      "detail": "secondCalls=0 textEqual=true persisted=true degraded=[turn_replayed] assists=1"
+    },
+    {
+      "name": "r_h5_text_attachment",
+      "pass": true,
+      "detail": "err=\u003cnil\u003e nonceInRequest=true userAttachments=1 nonceInTranscript=false text=\"ATTACH_NONCE_7K2\""
+    },
+    {
+      "name": "r_h11_image_rejected",
+      "pass": true,
+      "detail": "errKind=\"modality\" requests=0 err=modality: harness: 模型不支持该模态: 模型 opencode:deepseek-v4.1-flash 不接受 image 附件（dot.png）"
+    },
+    {
+      "name": "r_h9_gate_overrides",
+      "pass": true,
+      "detail": "toolCalls=1 confirmed=true idempotency=true modelCalls=2 err=\u003cnil\u003e"
+    },
+    {
+      "name": "hf1_tool_result_evidence",
+      "pass": true,
+      "detail": "err=\u003cnil\u003e sinkRecords=1 fullMatch=true trust=\"untrusted\" source=\"https://example.com/evidence\" callBytes=671 callTrunc=true previewLen=500 eventTrust=\"untrusted\" startInput=\"{\\\"q\\\":\\\"probe\\\"}\""
+    },
+    {
+      "name": "hf4_deepresearch_profile",
+      "pass": true,
+      "detail": "research=true analysis=true"
+    }
+  ]
+}
