@@ -1,8 +1,8 @@
 {
   "pass": true,
   "model": "opencode:deepseek-v4.1-flash",
-  "startedAt": "2026-11-04T10:03:25.321334058+08:00",
-  "durationMs": 45815,
+  "startedAt": "2026-11-04T14:11:47.060520207Z",
+  "durationMs": 7636,
   "checks": [
     {
       "name": "build_engine",
@@ -12,7 +12,7 @@
     {
       "name": "blob_store",
       "pass": true,
-      "detail": "/tmp/harness-smoke-blobs-1882000259"
+      "detail": "/tmp/harness-smoke-blobs-2979832381"
     },
     {
       "name": "live_turn_answer",
@@ -22,17 +22,17 @@
     {
       "name": "live_usage_cost",
       "pass": true,
-      "detail": "usageKnown=true in=900 out=3 costKnown=true cost=0.000903000"
+      "detail": "usageKnown=true in=650 out=3 costKnown=true cost=0.000653000"
     },
     {
       "name": "live_cost_known",
       "pass": true,
-      "detail": "costKnown=true cost=0.000903000（账本已装配）"
+      "detail": "costKnown=true cost=0.000653000（账本已装配）"
     },
     {
       "name": "live_model_route",
       "pass": true,
-      "detail": "出站 model=\"deepseek-v4.1-flash\" want=\"deepseek-v4.1-flash\" path=/zen/go/v1/messages"
+      "detail": "出站 model=\"opencode:deepseek-v4.1-flash\" want=\"opencode:deepseek-v4.1-flash\" path=/messages（经 LLM 网关发别名）"
     },
     {
       "name": "r_h2_cache_plan_on_wire",
