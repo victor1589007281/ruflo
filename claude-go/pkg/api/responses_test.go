@@ -212,3 +212,70 @@ func TestResponsesStreamTranslator(t *testing.T) {
 		t.Fatalf("post-complete ping should be dropped, got %v err=%v", deltas, err)
 	}
 }
+
+// TestAnthropicToResponsesCarriesImage 图片块必须落成 input_image item, 且
+// "先文后图"的块序在 input 数组里保持 —— input 按时间序解释, 折成同一条消息
+// 会让模型先看到图后看到字, 与 Anthropic 侧不一致。
+func TestAnthropicToResponsesCarriesImage(t *testing.T) {
+	req := types.APIRequest{
+		Model: "grok-4.6",
+		Messages: []types.APIMessage{
+			{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"先看字"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aVBORw0KGgo="}},{"type":"text","text":"再看图后的话"}]`)},
+		},
+	}
+	rreq, err := anthropicToResponses(req, false)
+	if err != nil {
+		t.Fatalf("anthropicToResponses: %v", err)
+	}
+	// 期望 3 个 item: user-text("先看字") → user-input_image → user-text("再看图后的话")
+	if len(rreq.Input) != 3 {
+		t.Fatalf("want 3 input items, got %d: %s", len(rreq.Input), rawItems(t, rreq))
+	}
+	if !strings.Contains(string(rreq.Input[0].Raw), `"input_text"`) || !strings.Contains(string(rreq.Input[0].Raw), "先看字") {
+		t.Fatalf("item0 应是先文: %s", rreq.Input[0].Raw)
+	}
+	if !strings.Contains(string(rreq.Input[1].Raw), `"input_image"`) || !strings.Contains(string(rreq.Input[1].Raw), "data:image/png;base64,aVBORw0KGgo=") {
+		t.Fatalf("item1 应是 data URL 图片: %s", rreq.Input[1].Raw)
+	}
+	if !strings.Contains(string(rreq.Input[2].Raw), "再看图后的话") {
+		t.Fatalf("item2 应是图后的文: %s", rreq.Input[2].Raw)
+	}
+}
+
+// TestAnthropicToResponsesRejectsDocument user 消息带 document (PDF) 块必须响错误,
+// 不能静默丢弃 —— 静默丢 = 用户以为模型读了文件, 那是数据质量事故。
+func TestAnthropicToResponsesRejectsDocument(t *testing.T) {
+	req := types.APIRequest{
+		Model: "grok-4.6",
+		Messages: []types.APIMessage{
+			{Role: "user", Content: json.RawMessage(`[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"QUJD"}},{"type":"text","text":"读这个 PDF"}]`)},
+		},
+	}
+	_, err := anthropicToResponses(req, false)
+	if err == nil {
+		t.Fatal("document 块必须被拒, 不能静默丢弃")
+	}
+	if !strings.Contains(err.Error(), "document") {
+		t.Fatalf("错误应点名块类型: %v", err)
+	}
+}
+
+// TestAnthropicToResponsesDropsUnknownAssistantBlocks assistant 历史里的未知块
+// (redacted_thinking 等, 经 R-H3 保真进入翻译器) 保持旧行为丢弃 —— 那里没有
+// 待保护的用户意图, 报错只会让本来能续跑的会话 400。
+func TestAnthropicToResponsesDropsUnknownAssistantBlocks(t *testing.T) {
+	req := types.APIRequest{
+		Model: "grok-4.6",
+		Messages: []types.APIMessage{
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"redacted_thinking","data":"AAAA"},{"type":"text","text":"ok"}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"继续"}]`)},
+		},
+	}
+	rreq, err := anthropicToResponses(req, false)
+	if err != nil {
+		t.Fatalf("assistant 未知块不该报错: %v", err)
+	}
+	if len(rreq.Input) != 2 {
+		t.Fatalf("want assistant-text + user-text 两个 item, got %d: %s", len(rreq.Input), rawItems(t, rreq))
+	}
+}

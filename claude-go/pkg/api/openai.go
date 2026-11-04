@@ -245,6 +245,12 @@ func userBlocksToOpenAI(blocks []types.ContentBlock) ([]openAIMessage, error) {
 			}
 		case types.ContentBlockThinking:
 			// OpenAI 无 thinking 块, 丢弃
+		default:
+			// user 消息带翻译器承载不了的块 (典型: PDF document 块) —— 响错误而非
+			// 静默丢弃: 静默丢 = 用户以为模型看到了文件, 那是数据质量事故。
+			// (assistant 路径不加这道: 历史里的 redacted_thinking 等未知块要靠
+			// 静默丢弃保持旧行为, 报错只会让本来能续跑的会话 400。)
+			return nil, fmt.Errorf("openai: user 消息含 chat/completions 协议不支持的块类型 %q (PDF/文件请用 anthropic 协议模型)", b.Type)
 		}
 	}
 	if len(parts) > 0 {

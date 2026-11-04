@@ -347,6 +347,40 @@ func buildClient(rc modelconfig.ResolvedConfig) *api.Client {
 	return c
 }
 
+// validateBlockSupport 检查 user 消息的块类型能否被目标协议承载, 不能则返回带
+// 模型名/协议/块类型的错误。这是"不静默丢块"契约的网关侧实现:
+//
+//   - 透传 (anthropic 协议) 不做校验 —— 块原样到达上游, 上游的支持与否是事实
+//     本身, 它的 400 是真实信号;
+//   - openai 翻译: text/image/tool_result 可承载, document (PDF) 等其余类型拒绝;
+//   - openai-responses 翻译: 同上 (image 经 input_image 承载, 见 pkg/api/responses.go)。
+//
+// 静默丢弃的代价是"用户以为模型看到了文件, 实际没有" —— 数据质量事故,
+// 必须在这里变成一条写进日志、返回给客户端的明确错误。
+func validateBlockSupport(messages []types.APIMessage, protocol, alias string) error {
+	if protocol == "" || protocol == "anthropic" {
+		return nil
+	}
+	for _, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		var blocks []types.ContentBlock
+		if err := json.Unmarshal(m.Content, &blocks); err != nil {
+			continue // 纯字符串 content 没有块, 无从校验
+		}
+		for _, b := range blocks {
+			switch b.Type {
+			case types.ContentBlockText, types.ContentBlockImage, types.ContentBlockToolResult:
+				// 两种翻译协议都能承载
+			default:
+				return fmt.Errorf("模型 %s (%s 协议) 不支持 %q 内容块 —— PDF/文件类输入请改用 anthropic 协议模型 (如 claude-haiku-5-5)", alias, protoName(protocol), b.Type)
+			}
+		}
+	}
+	return nil
+}
+
 // handleMessages Anthropic /v1/messages 入口: 解析模型 (未声明则按会话回退) 后按协议分派。
 //
 // 算法解读：
@@ -410,6 +444,14 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := buildClient(rc)
+	// 翻译分派前的块承载预校验: 翻译器 (pkg/api) 自身对承载不了的 user 块也会响
+	// 错误, 但那里报不出**解析后的模型名与协议**, 且流式路径的错误文本到不了
+	// claude CLI (streamMessages 只补 message_stop)。在这里统一 400, 信息带着
+	// 模型与协议, stream/non-stream 走同一条拒绝路径, 响应头未写、随时可 400。
+	if err := validateBlockSupport(req.Messages, rc.Protocol, rc.Alias); err != nil {
+		writeError(w, 400, "unsupported_block", err.Error())
+		return
+	}
 	// NewClient 默认把 http.Client.Timeout 设为 5min (300s), 会先于上面 ctx 上限
 	// 误掐长推理 (omen 可达 7+ min 才首 token); 归一到 --upstream-timeout。
 	// WithToolChoiceAny 只是 Client 值拷贝、共享同一个 *http.Client 指针, 此覆盖在克隆后仍生效。

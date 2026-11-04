@@ -829,3 +829,20 @@ func TestBuildOpenAIRequestReadsClientField(t *testing.T) {
 		t.Fatalf("默认 client 漏出推理: %s", body2)
 	}
 }
+
+// TestUserBlocksToOpenAIRejectsDocument user 消息带 document (PDF) 块必须响错误。
+// chat/completions 协议没有文档部件, 改造前的静默丢弃意味着"用户以为模型看了
+// 文件" —— 这是数据质量事故, 不是可容忍的退化。
+func TestUserBlocksToOpenAIRejectsDocument(t *testing.T) {
+	blocks := []types.ContentBlock{
+		{Type: types.ContentBlockDocument, Source: &types.MediaSource{Type: "base64", MediaType: "application/pdf", Data: "QUJD"}},
+		{Type: types.ContentBlockText, Text: "读这个 PDF"},
+	}
+	_, err := userBlocksToOpenAI(blocks)
+	if err == nil {
+		t.Fatal("document 块必须被拒, 不能静默丢弃")
+	}
+	if !strings.Contains(err.Error(), "document") {
+		t.Fatalf("错误应点名块类型: %v", err)
+	}
+}

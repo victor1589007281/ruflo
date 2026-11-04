@@ -79,6 +79,17 @@ func responsesUserText(text string) responsesInputItem {
 	})
 }
 
+// responsesUserImage 用户图片消息 item (input_image, data URL 或 http URL)。
+//
+// input_image 只出现在 role:"user" 的 content 数组里 —— 助理历史没有图片块,
+// 构造时不需要角色分支。
+func responsesUserImage(url string) responsesInputItem {
+	return responsesItem(map[string]interface{}{
+		"role":    "user",
+		"content": []map[string]interface{}{{"type": "input_image", "image_url": url}},
+	})
+}
+
 // responsesAssistantText 助手文本消息 item (多轮回填)。
 func responsesAssistantText(text string) responsesInputItem {
 	return responsesItem(map[string]interface{}{
@@ -158,6 +169,15 @@ func anthropicToResponses(req types.APIRequest, stream bool) (*responsesRequest,
 	return rreq, nil
 }
 
+// responsesTextItem 把已攒的文本 parts 按角色落成一条 message item。
+// role != "assistant" 的一律按 user 文本 (与旧 switch 的 default 行为一致)。
+func responsesTextItem(role string, parts []string) responsesInputItem {
+	if role == "assistant" {
+		return responsesAssistantText(strings.Join(parts, "\n"))
+	}
+	return responsesUserText(strings.Join(parts, "\n"))
+}
+
 // anthropicMessageToResponses 翻译单条 Anthropic 消息为 0..N 个 input items。
 func anthropicMessageToResponses(msg types.APIMessage) ([]responsesInputItem, error) {
 	var blocks []types.ContentBlock
@@ -186,19 +206,38 @@ func anthropicMessageToResponses(msg types.APIMessage) ([]responsesInputItem, er
 			toolCalls = append(toolCalls, responsesFunctionCall(b.ID, b.Name, normalizeJSONArgs(string(b.Input))))
 		case types.ContentBlockThinking:
 			// Responses 无 thinking 块, 丢弃
+		case types.ContentBlockImage:
+			// 视觉输入: base64 → data URL, 与 openai.go 的 image_url 翻译同形。
+			// input 数组按时间序解释, 已攒的文本必须先落成独立 item 再排图片,
+			// 否则先文后图的块序会被折成"图+文同一条消息", 与 Anthropic 侧不一致。
+			if b.Source != nil {
+				url := b.Source.URL
+				if b.Source.Type == "base64" && b.Source.Data != "" {
+					url = "data:" + b.Source.MediaType + ";base64," + b.Source.Data
+				}
+				if url != "" {
+					if len(parts) > 0 {
+						out = append(out, responsesTextItem(msg.Role, parts))
+						parts = nil
+					}
+					out = append(out, responsesUserImage(url))
+				}
+			}
+		default:
+			// user 消息带翻译器承载不了的块 (典型: PDF document 块) —— 必须响错误
+			// 而不是静默丢弃: 用户以为模型看到了文件, 实际没有, 那是数据质量事故。
+			// assistant 历史里的未知块 (redacted_thinking 等, 经 R-H3 保真进入这里)
+			// 保持旧行为丢弃 —— 那里没有待保护的用户意图, 报错只会让本来能续跑的
+			// 会话 400。
+			if msg.Role == "user" {
+				return nil, fmt.Errorf("responses: user 消息含协议不支持的块类型 %q (PDF/文件请用 anthropic 协议模型)", b.Type)
+			}
 		}
 	}
 	// 同一条 assistant 消息内保持对话时序: 文本先于工具调用。
 	// (Responses API 的 input 按时间序解释, 倒序会破坏多轮工具循环的因果链。)
 	if len(parts) > 0 {
-		switch msg.Role {
-		case "assistant":
-			out = append(out, responsesAssistantText(strings.Join(parts, "\n")))
-		case "user":
-			out = append(out, responsesUserText(strings.Join(parts, "\n")))
-		default: // tool / system / 其它一律按 user 文本
-			out = append(out, responsesUserText(strings.Join(parts, "\n")))
-		}
+		out = append(out, responsesTextItem(msg.Role, parts))
 	}
 	out = append(out, toolCalls...)
 	return out, nil
