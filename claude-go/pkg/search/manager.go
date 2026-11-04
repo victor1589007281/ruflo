@@ -288,7 +288,14 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 	needFresh := freshnessRequired(plan.Freshness)
 
 	if !anySuccess {
-		return SearchResponse{}, Wrap("", ErrNoProvider, errors.New("all providers failed"))
+		// 只回 "all providers failed" 会让上层无法区分「网络整体不可达」
+		// 与「选中的两个源恰好都超时」。把逐源原因带出去，调用方才能决定
+		// 是换源、重试还是如实告诉用户检索不可用。
+		detail := strings.Join(dedupeStrings(degraded), "; ")
+		if detail == "" {
+			detail = "no provider returned a response"
+		}
+		return SearchResponse{}, Wrap("", ErrNoProvider, errors.New("all providers failed: "+detail))
 	}
 	filteredRaw := filterResultDomains(raw, req)
 	degraded = dedupeStrings(degraded)
