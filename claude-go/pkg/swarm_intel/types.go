@@ -19,7 +19,7 @@ import (
 type PredictionDomain struct {
 	Question    string   `json:"question"`
 	Horizon     string   `json:"horizon"`      // short / medium / long
-	OutcomeType string   `json:"outcome_type"`  // binary / categorical / numeric / scenario
+	OutcomeType string   `json:"outcome_type"` // binary / categorical / numeric / scenario
 	Outcomes    []string `json:"outcomes"`
 	Context     string   `json:"context"`
 	Constraints []string `json:"constraints,omitempty"`
@@ -90,7 +90,7 @@ type PheromoneTrail struct {
 
 // SimulationConfig 场景模拟配置。
 type SimulationConfig struct {
-	Mode      string   `json:"mode"`      // social / game / montecarlo
+	Mode      string   `json:"mode"` // social / game / montecarlo
 	Agents    int      `json:"agents"`
 	Rounds    int      `json:"rounds"`
 	Scenarios []string `json:"scenarios"`
@@ -102,12 +102,12 @@ type SimulationConfig struct {
 
 // SimulationResult 模拟结果。
 type SimulationResult struct {
-	Mode       string                `json:"mode"`
-	Rounds     int                   `json:"rounds"`
-	Scenarios  []ScenarioOutcome     `json:"scenarios"`
-	Emergent   []string              `json:"emergent_behaviors,omitempty"`
-	Summary    string                `json:"summary"`
-	CreatedAt  time.Time             `json:"created_at"`
+	Mode      string            `json:"mode"`
+	Rounds    int               `json:"rounds"`
+	Scenarios []ScenarioOutcome `json:"scenarios"`
+	Emergent  []string          `json:"emergent_behaviors,omitempty"`
+	Summary   string            `json:"summary"`
+	CreatedAt time.Time         `json:"created_at"`
 
 	// Phase 2 (social kernel): 可选的立场轨迹与指标曲线,
 	// 仅 kernel 模式产出; 其他模式留空, 旧消费者不受影响。
@@ -117,9 +117,9 @@ type SimulationResult struct {
 
 // ScenarioOutcome 单个场景分支的结果。
 type ScenarioOutcome struct {
-	Name        string  `json:"name"`
-	Probability float64 `json:"probability"`
-	Description string  `json:"description"`
+	Name        string   `json:"name"`
+	Probability float64  `json:"probability"`
+	Description string   `json:"description"`
 	KeyEvents   []string `json:"key_events,omitempty"`
 }
 
