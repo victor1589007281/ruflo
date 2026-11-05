@@ -6394,6 +6394,14 @@ func swarmCmd() *cobra.Command {
 		}
 		eng.APIClient.Tag = "swarm"
 		siCfg := swarmintel.DefaultConfig()
+		// v3 Phase 0: SWARM_STORE=agentdb 时切 agentDB 后端 (env 注入由 deploy 清单负责);
+		// 缺省/未知值回落 JSONL (DefaultConfig 默认), 与 newSwarmStore 的解析逻辑一致。
+		if v := strings.TrimSpace(os.Getenv("SWARM_STORE")); v != "" {
+			siCfg.StoreBackend = v
+		}
+		if v := strings.TrimSpace(os.Getenv("AGENTDB_URL")); v != "" {
+			siCfg.AgentDBURL = v
+		}
 		siCfg.Notify = func(_, msg string) {
 			if jsonOut {
 				fmt.Fprintln(os.Stderr, msg)
