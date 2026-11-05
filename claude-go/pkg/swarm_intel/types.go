@@ -38,16 +38,17 @@ type AgentPrediction struct {
 
 // FusedPrediction 融合后的最终预测。
 type FusedPrediction struct {
-	Question    string                `json:"question"`
-	Outcomes    []OutcomePrediction   `json:"outcomes"`
-	Consensus   float64               `json:"consensus"`    // 0-1 共识度
-	BrierScore  float64               `json:"brier_score"`  // 校准分数
-	Rounds      int                   `json:"rounds"`
-	Method      string                `json:"method"`
-	Summary     string                `json:"summary"`
-	Agents      []AgentPrediction     `json:"agents"`
-	PheromoneState map[string]float64 `json:"pheromone_state,omitempty"`
-	CreatedAt   time.Time             `json:"created_at"`
+	Question       string              `json:"question"`
+	Outcomes       []OutcomePrediction `json:"outcomes"`
+	Consensus      float64             `json:"consensus"`   // 0-1 共识度
+	BrierScore     float64             `json:"brier_score"` // 校准分数
+	Rounds         int                 `json:"rounds"`
+	Method         string              `json:"method"`
+	Summary        string              `json:"summary"`
+	Agents         []AgentPrediction   `json:"agents"`
+	Extremization  float64             `json:"extremization,omitempty"` // E2/E4: judge 给出的极端化强度 0~0.3 (实际生效值, 校准不足时为 0)
+	PheromoneState map[string]float64  `json:"pheromone_state,omitempty"`
+	CreatedAt      time.Time           `json:"created_at"`
 }
 
 // OutcomePrediction 单个结果的融合概率。

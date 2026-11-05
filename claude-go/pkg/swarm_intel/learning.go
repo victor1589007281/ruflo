@@ -126,8 +126,8 @@ type LearningState struct {
 	BanditAlphas    map[string]float64 `json:"bandit_alphas"`
 	BanditBetas     map[string]float64 `json:"bandit_betas"`
 	TrustScores     map[string]float64 `json:"trust_scores"`
-	Resolutions     int                `json:"resolutions"`   // 累计已反馈胜选次数
-	MeanBrier       float64            `json:"mean_brier"`    // 滑动平均 Brier (可观测)
+	Resolutions     int                `json:"resolutions"` // 累计已反馈胜选次数
+	MeanBrier       float64            `json:"mean_brier"`  // 滑动平均 Brier (可观测)
 	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
@@ -192,12 +192,105 @@ func (e *Engine) saveLearning() {
 //	      10%; 信任更新步长上限 (pa−0.5)×0.2 即每次 ±0.1, 刻意压制单本漂移。
 //	设计权衡：不做外部真值校准, 而是"自一致性校准" —— 放弃与客观真值对齐, 换取对"群体越
 //	      决断 CI 越窄"这一自洽信号的利用 (见上文)。
+//
+// E1 之后 RecordOutcome 与 RegisterResolution 共用 appendResolvedRecord/applyOutcomeLearning
+// 两个核心, 区别只在预测来源 (调用方持对象 vs 按 predID 找回)。
 func (e *Engine) RecordOutcome(pred *FusedPrediction, actualOutcome string) float64 {
 	if pred == nil || actualOutcome == "" {
 		return 0
 	}
 	brier := ComputeBrierScore(pred, actualOutcome)
+	e.appendResolvedRecord(pred, actualOutcome, brier)
+	e.applyOutcomeLearning(pred, actualOutcome, brier)
+	return brier
+}
 
+// RegisterResolution E1 导出的回填钩子: 供 webapp/aiops 等外部方在拿到真实结局后
+// 按预测 ID 核销 —— 学习闭环默认接通的对外入口。
+//
+// 流程: pending 内存表命中 → 直接核销; 未命中 (引擎重启) → 从存储按 ID 找回未决记录重建;
+// 写历史优先走后端可选接口原地标记已决 (predictionResolver), 不支持的骨架后端退回
+// 追加 resolved 记录的兼容路径; 随后 conformal/信任/路由/meanBrier 全部照常更新并持久化。
+// 返回本次 Brier 分数; predID 未知、已决或 actualOutcome 为空时返回 0。
+func (e *Engine) RegisterResolution(predID, actualOutcome string) float64 {
+	if predID == "" || actualOutcome == "" {
+		return 0
+	}
+	pred := e.takePending(predID)
+	if pred == nil {
+		pred = e.reconstructPending(predID)
+	}
+	if pred == nil {
+		return 0 // 未知或已核销的 predID: 静默跳过, 外部重试/乱序调用均安全
+	}
+
+	brier := ComputeBrierScore(pred, actualOutcome)
+	resolvedInPlace := false
+	if e.store != nil {
+		if r, ok := e.store.(predictionResolver); ok {
+			if err := r.ResolvePrediction(predID, actualOutcome, brier, time.Now()); err == nil {
+				resolvedInPlace = true
+				e.storeResolvedReasoning(pred, actualOutcome, brier)
+			}
+		}
+	}
+	if !resolvedInPlace {
+		e.appendResolvedRecord(pred, actualOutcome, brier)
+	}
+	e.applyOutcomeLearning(pred, actualOutcome, brier)
+	return brier
+}
+
+// appendResolvedRecord #5: 追加一条 resolved 预测记录 (兼容路径; 已随 Agents 持久化,
+// 未来 FindSimilar/RegisterResolution 都能拿到完整的各分析师预测)。
+func (e *Engine) appendResolvedRecord(pred *FusedPrediction, actualOutcome string, brier float64) {
+	if e.store == nil {
+		return
+	}
+	now := time.Now()
+	if err := e.store.AppendPrediction(&PredictionRecord{
+		ID:          "resolved-" + now.Format("20060102150405.000"),
+		Question:    pred.Question,
+		Outcomes:    pred.Outcomes,
+		Consensus:   pred.Consensus,
+		BrierScore:  brier,
+		Rounds:      pred.Rounds,
+		Agents:      pred.Agents,
+		ActualLabel: actualOutcome,
+		Resolved:    true,
+		CreatedAt:   now,
+		ResolvedAt:  &now,
+	}); err != nil {
+		log.Printf("[swarm_intel] WARN 已决记录持久化失败: %v", err)
+	}
+	e.storeResolvedReasoning(pred, actualOutcome, brier)
+}
+
+// storeResolvedReasoning #5 的推理库半边: 押中结局且给出推理的 agent 的真实分入库
+// (供未来 SearchReasonings 拿到已校准先验)。
+func (e *Engine) storeResolvedReasoning(pred *FusedPrediction, actualOutcome string, brier float64) {
+	if e.store == nil {
+		return
+	}
+	for _, a := range pred.Agents {
+		if a.Rationale != "" && a.Predictions[actualOutcome] >= 0.4 {
+			if err := e.store.StoreReasoning(&ReasoningEntry{
+				Question:   pred.Question,
+				Reasoning:  a.Rationale,
+				BrierScore: brier,
+				Confidence: a.Confidence,
+				CreatedAt:  time.Now(),
+			}); err != nil {
+				log.Printf("[swarm_intel] WARN 推理路径持久化失败: %v", err)
+			}
+		}
+	}
+}
+
+// applyOutcomeLearning #6/#7 学习核心 (RecordOutcome 与 RegisterResolution 共用):
+// nonconformity(=1−P(actual)) 喂保形, 按各 agent 是否押中更新信任/路由,
+// EWMA 维护 meanBrier, 最后持久化全量学习状态。
+func (e *Engine) applyOutcomeLearning(pred *FusedPrediction, actualOutcome string, brier float64) {
 	// #6: nonconformity = 1 − P(actual) 喂保形校准历史
 	pActual := 0.0
 	for _, o := range pred.Outcomes {
@@ -215,39 +308,6 @@ func (e *Engine) RecordOutcome(pred *FusedPrediction, actualOutcome string) floa
 		e.banditRouter.Update(a.AgentID, pa >= 0.4)
 	}
 
-	// #5: 记录真实 Brier 到预测历史 + 推理库 (供未来 FindSimilar 拿到已校准先验)
-	if e.store != nil {
-		now := time.Now()
-		if err := e.store.AppendPrediction(&PredictionRecord{
-			ID:          "resolved-" + now.Format("20060102150405.000"),
-			Question:    pred.Question,
-			Outcomes:    pred.Outcomes,
-			Consensus:   pred.Consensus,
-			BrierScore:  brier,
-			Rounds:      pred.Rounds,
-			Agents:      pred.Agents,
-			ActualLabel: actualOutcome,
-			Resolved:    true,
-			CreatedAt:   now,
-			ResolvedAt:  &now,
-		}); err != nil {
-			log.Printf("[swarm_intel] WARN 已决记录持久化失败: %v", err)
-		}
-		for _, a := range pred.Agents {
-			if a.Rationale != "" && a.Predictions[actualOutcome] >= 0.4 {
-				if err := e.store.StoreReasoning(&ReasoningEntry{
-					Question:   pred.Question,
-					Reasoning:  a.Rationale,
-					BrierScore: brier,
-					Confidence: a.Confidence,
-					CreatedAt:  time.Now(),
-				}); err != nil {
-					log.Printf("[swarm_intel] WARN 推理路径持久化失败: %v", err)
-				}
-			}
-		}
-	}
-
 	// 滑动平均 Brier (可观测)
 	e.resolutions++
 	if e.resolutions == 1 {
@@ -257,5 +317,4 @@ func (e *Engine) RecordOutcome(pred *FusedPrediction, actualOutcome string) floa
 	}
 
 	e.saveLearning()
-	return brier
 }

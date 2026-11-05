@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -44,6 +46,11 @@ type Engine struct {
 	// 写侧由 RecordOutcome/RegisterResolution 触发, 从不调用的共享域 (aiops) 零积累、零回归。
 	resolutions int
 	meanBrier   float64
+
+	// E1: 未决预测登记表 (predID → 融合结果), 供 RegisterResolution 按 ID 回填真实结局。
+	// webapp/aiops 路径预测入库时登记, 外部拿到结局后调 RegisterResolution 核销。
+	pendingMu sync.Mutex
+	pending   map[string]*FusedPrediction
 
 	maxDebateRounds int
 	numAnalysts     int
@@ -122,6 +129,7 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 		maxDebateRounds: cfg.MaxDebateRounds,
 		numAnalysts:     cfg.NumAnalysts,
 		numScouts:       cfg.NumScouts,
+		pending:         make(map[string]*FusedPrediction),
 	}
 	e.loadLearning() // E1: 启动无条件恢复跨会话学习状态 (保形/信任/路由); 缺失则安全跳过
 	return e
@@ -272,14 +280,16 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 		}
 	}
 
-	// Phase 4: Debate (M7 门控 + M10 预算控制)
+	// Phase 4: Debate (M7 门控 + M10 预算控制; E5: 限 1 轮)
 	debateRound := 0
 	shouldDebate := e.debateGate.ShouldDebate(predictions)
 	if !shouldDebate {
 		e.notify(chatID, "⚡ Phase 4/7: 辩论门控 — 预测已高度一致, 跳过辩论 (节省 ~6x token)")
 	} else {
 		debateCtx, debateCancel := tb.PhaseContext(ctx, "debate")
-		for debateRound < e.maxDebateRounds {
+		// E5: debate 限 1 轮 —— 多轮辩论的收益递减且 token 线性增长, 省下的预算给 AUQ 分流重算。
+		debateLimit := min(e.maxDebateRounds, 1)
+		for debateRound < debateLimit {
 			if debateCtx.Err() != nil || tb.Expired() {
 				break
 			}
@@ -313,9 +323,31 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 		debateCancel()
 	}
 
-	// Phase 5: Fuse (标准融合)
+	// E5: AUQ 分流 —— 辩论后分布熵仍 > 0.6 的 agent 用更详细的 prompt 重跑一次 (替换而非叠加)。
+	predictions, auqCount := e.auqRerun(ctx, domain, evidence, predictions)
+	extraLLMCalls := auqCount
+
+	// E2: 判别型角色 —— redteam 挑逻辑漏洞, judge 汇总评审并给出 extremization 强度。
+	critique := e.runCritique(ctx, domain, predictions)
+	extraLLMCalls += 2 // redteam + judge
+	if len(critique.Flaws) > 0 || critique.Extremization > 0 {
+		e.notify(chatID, fmt.Sprintf("⚔️ 判别评审: redteam 漏洞 %d 条, judge extremization=%.2f %s",
+			len(critique.Flaws), critique.Extremization, critique.JudgeNote))
+	}
+
+	// Phase 5: Fuse (E3: confidence × 信任分的在线权重; 无信任时与 v2 逐字节一致)
 	e.notify(chatID, "🔮 Phase 5/7: 贝叶斯融合...")
-	result := e.fuser.Fuse(*domain, predictions)
+	result := e.fuser.FuseWithTrust(*domain, predictions, e.byzantineFuser.SnapshotTrust())
+
+	// E4: extremization —— judge 强度把融合概率推离 0.5; 校准数据不足 (<10 resolutions) 时强制为 0。
+	ext := e.resolveExtremization(critique.Extremization)
+	result.Extremization = ext
+	if ext > 0 {
+		for i := range result.Outcomes {
+			result.Outcomes[i].Probability = extremizeProb(result.Outcomes[i].Probability, ext)
+		}
+		e.notify(chatID, fmt.Sprintf("  📈 extremization=%.2f, 概率已推离 0.5", ext))
+	}
 
 	// Phase 6: Byzantine Trim (M7 拜占庭容错; #7: 有学习信任时剔除低信任 agent, 无信任时同 TrimmedFuse)
 	e.notify(chatID, "🛡️ Phase 6/7: 拜占庭容错校验...")
@@ -358,26 +390,26 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	// M9: 记录可观测性指标
 	if e.metrics != nil {
 		rm := RunMetrics{
-			RunID:              fmt.Sprintf("pred-%d", startTime.UnixMilli()),
-			Type:               "predict",
-			Question:           result.Question,
-			StartTime:          startTime,
-			EndTime:            time.Now(),
-			TotalLatencyMs:     time.Since(startTime).Milliseconds(),
-			LLMCallCount:       llmCallCount + e.numAnalysts + e.numScouts + debateRound*len(predictions),
-			Consensus:          result.Consensus,
-			BrierScore:         result.BrierScore,
-			Divergence:         e.boids.MeasureDivergence(predictions),
-			DebateRounds:       debateRound,
-			DebateSkipped:      !shouldDebate,
-			DTITriggered:       e.dtiController.ShouldTrigger(predictions),
-			AgentCount:         len(predictions),
-			UniqueHypotheses:   len(result.Outcomes),
-			SimilarPairs:       len(similar),
-			DiversityScore:     ComputeDiversityScore(predictions),
-			PheromoneTrails:    len(result.PheromoneState),
-			AvgConfidence:      avgConfidence(predictions),
-			ConfidenceCI:       confSet.Width,
+			RunID:            fmt.Sprintf("pred-%d", startTime.UnixMilli()),
+			Type:             "predict",
+			Question:         result.Question,
+			StartTime:        startTime,
+			EndTime:          time.Now(),
+			TotalLatencyMs:   time.Since(startTime).Milliseconds(),
+			LLMCallCount:     llmCallCount + e.numAnalysts + e.numScouts + debateRound*len(predictions) + extraLLMCalls,
+			Consensus:        result.Consensus,
+			BrierScore:       result.BrierScore,
+			Divergence:       e.boids.MeasureDivergence(predictions),
+			DebateRounds:     debateRound,
+			DebateSkipped:    !shouldDebate,
+			DTITriggered:     e.dtiController.ShouldTrigger(predictions),
+			AgentCount:       len(predictions),
+			UniqueHypotheses: len(result.Outcomes),
+			SimilarPairs:     len(similar),
+			DiversityScore:   ComputeDiversityScore(predictions),
+			PheromoneTrails:  len(result.PheromoneState),
+			AvgConfidence:    avgConfidence(predictions),
+			ConfidenceCI:     confSet.Width,
 			PhaseTiming: map[string]int64{
 				"decompose": time.Since(phaseStart).Milliseconds(),
 			},
@@ -424,17 +456,20 @@ func (e *Engine) persistResults(domain *PredictionDomain, result *FusedPredictio
 	}
 
 	rec := &PredictionRecord{
-		ID:        fmt.Sprintf("pred-%d", time.Now().UnixMilli()),
-		Question:  result.Question,
-		Outcomes:  result.Outcomes,
-		Consensus: result.Consensus,
+		ID:         fmt.Sprintf("pred-%d", time.Now().UnixMilli()),
+		Question:   result.Question,
+		Outcomes:   result.Outcomes,
+		Consensus:  result.Consensus,
 		BrierScore: result.BrierScore,
-		Rounds:    result.Rounds,
-		Agents:    predictions, // 供 RegisterResolution 跨重启回填信任/路由
-		CreatedAt: time.Now(),
+		Rounds:     result.Rounds,
+		Agents:     predictions, // 供 RegisterResolution 跨重启回填信任/路由
+		CreatedAt:  time.Now(),
 	}
 	if err := e.store.AppendPrediction(rec); err != nil {
 		log.Printf("[swarm_intel] WARN 预测历史持久化失败: %v", err)
+	} else {
+		// E1: 登记未决预测, 外部 (webapp/aiops) 拿到真实结局后调 RegisterResolution(predID, 结局) 核销。
+		e.registerPending(rec.ID, result)
 	}
 
 	for _, p := range predictions {
@@ -741,6 +776,150 @@ func (e *Engine) debateRound(ctx context.Context, domain *PredictionDomain, evid
 	return updated, nil
 }
 
+// auqRerun E5 AUQ 分流: 辩论结束后, 预测分布归一化熵仍 > 0.6 的 agent 视为"嘴上收敛、
+// 心里犹疑", 用一次"不确定性清点"的详细 prompt 重跑 —— **替换**其原预测而非新增 agent,
+// 因此总 LLM 调用数不增 (重算替换而非叠加; 且 debate 已限 1 轮, 省出的预算正好覆盖)。
+// 返回更新后的预测集与重算调用数 (供指标统计); 无高熵 agent 或全部重算失败时原样返回。
+func (e *Engine) auqRerun(ctx context.Context, domain *PredictionDomain, evidence []string, predictions []AgentPrediction) ([]AgentPrediction, int) {
+	var targets []AgentPrediction
+	for _, p := range predictions {
+		if agentEntropy(p, domain.Outcomes) > 0.6 {
+			targets = append(targets, p)
+		}
+	}
+	if len(targets) == 0 {
+		return predictions, 0
+	}
+	e.notify("", fmt.Sprintf("🔄 AUQ 分流: %d 个高熵 agent 重算 (熵>0.6)", len(targets)))
+
+	// M10: 并行化 —— 各 agent 重算互相独立
+	evidenceStr := e.cc.CompressEvidence(evidence, 1500)
+	branches := make(map[string]BranchFunc)
+	for _, p := range targets {
+		p := p
+		branches[p.AgentID] = func(branchCtx context.Context) (string, error) {
+			myRationale := e.cc.TruncateField(p.Rationale, 100)
+			prompt := fmt.Sprintf(`你是 %s。你的上一轮预测在各结果间过于分散 (归一化熵 %.2f > 0.6),
+说明你有未言明的顾虑。请做一次"不确定性清点":
+
+1. 先列出你犹豫的具体因素, 以及每个因素若成立会把概率推向哪个结果;
+2. 评估各因素的可能性;
+3. 然后给出**更决断**的修订预测 (允许保留不确定性, 但分布必须反映你清点后的真实判断)。
+
+问题: %s
+可能结果: %v
+已知证据:
+%s
+你的上一轮预测: %v (置信度: %.0f%%)
+你的上一轮推理: %s
+
+输出严格JSON (不要markdown代码块):
+{
+  "predictions": {%s},
+  "confidence": 0.7,
+  "rationale": "100字以内: 清点过程 + 修订理由",
+  "evidence": ["你重点依据的证据"]
+}`, p.AgentRole, agentEntropy(p, domain.Outcomes), domain.Question, domain.Outcomes,
+				evidenceStr, p.Predictions, p.Confidence*100, myRationale,
+				buildOutcomeTemplate(domain.Outcomes))
+
+			return e.llm.SimpleComplete(branchCtx,
+				fmt.Sprintf("你是%s。做不确定性清点并给出修订预测。只输出JSON。", p.AgentRole), prompt)
+		}
+	}
+
+	cfg := DefaultFanOutConfig()
+	cfg.MaxConcurrency = 3
+	results := FanOutCollect(ctx, cfg, branches)
+
+	// 替换原预测; 重算失败的 agent 保留上一轮结果 (降级, 不阻塞)。
+	updated := make([]AgentPrediction, len(predictions))
+	copy(updated, predictions)
+	rerunCount := 0
+	for _, r := range results {
+		if r.Error != nil {
+			continue
+		}
+		for i := range updated {
+			if updated[i].AgentID == r.ID {
+				newPred := parseAgentPrediction(r.Value, r.ID, updated[i].AgentRole, domain.Outcomes)
+				newPred.Round = updated[i].Round + 1
+				updated[i] = newPred
+				rerunCount++
+				break
+			}
+		}
+	}
+	return updated, rerunCount
+}
+
+// resolveExtremization E4 门控: judge 给的强度先 clamp 到 [0, 0.3],
+// 校准数据不足 (<10 次已决反馈) 时**强制为 0** —— cold-start 阶段 conformal 还在用
+// 保守默认半宽, 此时把概率推极端只会放大未校准的偏差。
+func (e *Engine) resolveExtremization(judgeExt float64) float64 {
+	if e.resolutions < 10 {
+		return 0
+	}
+	return math.Max(0, math.Min(0.3, judgeExt))
+}
+
+// ── E1: 未决预测登记表 ──
+
+// pendingCap 未决登记表上限: webapp 长期不回填时防内存膨胀, 超限淘汰任意一条未决。
+const pendingCap = 512
+
+// pendingLookupLimit reconstructPending 从存储回捞时的扫描上限 (够覆盖任何合理场景)。
+const pendingLookupLimit = 500
+
+// registerPending 登记未决预测, 供 RegisterResolution 按 predID 回填真实结局。
+func (e *Engine) registerPending(predID string, pred *FusedPrediction) {
+	if predID == "" || pred == nil {
+		return
+	}
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	if len(e.pending) >= pendingCap {
+		for k := range e.pending { // map 序随机, 淘汰任意一条最早的未决即可
+			delete(e.pending, k)
+			break
+		}
+	}
+	e.pending[predID] = pred
+}
+
+// takePending 取出并摘除未决预测; 未命中返回 nil。
+func (e *Engine) takePending(predID string) *FusedPrediction {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	p := e.pending[predID]
+	delete(e.pending, predID)
+	return p
+}
+
+// reconstructPending 跨重启兜底: 引擎重启后 pending 已失, 从存储按 ID 找回未决记录
+// 并重建 FusedPrediction (Agents 已随 PredictionRecord 持久化, 信任/路由可正常更新)。
+func (e *Engine) reconstructPending(predID string) *FusedPrediction {
+	if e.store == nil {
+		return nil
+	}
+	recs, err := e.store.RecentPredictions(pendingLookupLimit)
+	if err != nil {
+		return nil
+	}
+	for _, rec := range recs {
+		if rec.ID == predID && !rec.Resolved {
+			return &FusedPrediction{
+				Question:  rec.Question,
+				Outcomes:  rec.Outcomes,
+				Consensus: rec.Consensus,
+				Rounds:    rec.Rounds,
+				Agents:    rec.Agents,
+			}
+		}
+	}
+	return nil
+}
+
 // generateSummary 生成可读的预测总结。
 func (e *Engine) generateSummary(ctx context.Context, domain *PredictionDomain, result *FusedPrediction) (string, error) {
 	var outcomeSummary strings.Builder
@@ -787,6 +966,9 @@ func (e *Engine) formatResult(result *FusedPrediction) string {
 	sb.WriteString(fmt.Sprintf("║ 共识度: %.0f%%  辩论轮数: %d  分析师: %d\n",
 		result.Consensus*100, result.Rounds, len(result.Agents)))
 	sb.WriteString(fmt.Sprintf("║ 融合方法: %s\n", result.Method))
+	if result.Extremization > 0 {
+		sb.WriteString(fmt.Sprintf("║ 极端化强度 (judge): %.2f\n", result.Extremization))
+	}
 
 	if result.Summary != "" {
 		sb.WriteString("╠──────────────────────────────────────────────╣\n")

@@ -71,12 +71,12 @@ type predictionResolver interface {
 // 的同名本地定义与 TODO 已随合并删除。内核现有的 jsonlSimEventRecorder 继续可用,
 // 长期统一走 SwarmStore.AppendSimEvent/SimEvents。
 type SimEvent struct {
-	RunID     string          `json:"run_id"`                 // 模拟运行 ID
-	Round     int             `json:"round"`                  // 事件所在轮次 (系统事件为 0)
-	Type      string          `json:"type"`                   // stance | emergence | action | ...
-	AgentID   string          `json:"agent_id,omitempty"`     // 产生事件的 agent (系统事件留空)
-	Payload   json.RawMessage `json:"payload"`                // 结构化事件负载
-	CreatedAt time.Time       `json:"created_at,omitempty"`   // 存储层写入时补戳
+	RunID     string          `json:"run_id"`               // 模拟运行 ID
+	Round     int             `json:"round"`                // 事件所在轮次 (系统事件为 0)
+	Type      string          `json:"type"`                 // stance | emergence | action | ...
+	AgentID   string          `json:"agent_id,omitempty"`   // 产生事件的 agent (系统事件留空)
+	Payload   json.RawMessage `json:"payload"`              // 结构化事件负载
+	CreatedAt time.Time       `json:"created_at,omitempty"` // 存储层写入时补戳
 }
 
 // ── JSONL 后端 (默认, v2 行为保留) ──

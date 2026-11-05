@@ -100,17 +100,17 @@ type PredictionHistory struct {
 
 // PredictionRecord 一条历史预测记录。
 type PredictionRecord struct {
-	ID          string            `json:"id"`
-	Question    string            `json:"question"`
+	ID          string              `json:"id"`
+	Question    string              `json:"question"`
 	Outcomes    []OutcomePrediction `json:"outcomes"`
-	Consensus   float64           `json:"consensus"`
-	BrierScore  float64           `json:"brier_score"`
-	Rounds      int               `json:"rounds"`
-	Agents      []AgentPrediction `json:"agents,omitempty"` // 各分析师预测 (供跨重启回填信任/路由)
-	ActualLabel string            `json:"actual_label,omitempty"`
-	Resolved    bool              `json:"resolved"`
-	CreatedAt   time.Time         `json:"created_at"`
-	ResolvedAt  *time.Time        `json:"resolved_at,omitempty"`
+	Consensus   float64             `json:"consensus"`
+	BrierScore  float64             `json:"brier_score"`
+	Rounds      int                 `json:"rounds"`
+	Agents      []AgentPrediction   `json:"agents,omitempty"` // 各分析师预测 (供跨重启回填信任/路由)
+	ActualLabel string              `json:"actual_label,omitempty"`
+	Resolved    bool                `json:"resolved"`
+	CreatedAt   time.Time           `json:"created_at"`
+	ResolvedAt  *time.Time          `json:"resolved_at,omitempty"`
 }
 
 // NewPredictionHistory 创建预测历史存储。
