@@ -272,6 +272,62 @@ func suiteResolvePrediction(t *testing.T, s SwarmStore) {
 	}
 }
 
+// TestAgentDBStoreNamespaceIsolation A7: 不同 namespace 的桶完全隔离。
+// ns1 写入的数据不能被 ns2 读到; 桶名前缀不同。
+func TestAgentDBStoreNamespaceIsolation(t *testing.T) {
+	url := newAgentDBTestServer(t)
+
+	// ns1 写入
+	t.Setenv("AGENTDB_NAMESPACE", "ns1")
+	s1, err := NewAgentDBStore(url)
+	if err != nil {
+		t.Fatalf("ns1 NewAgentDBStore: %v", err)
+	}
+	if err := s1.AppendPrediction(&PredictionRecord{ID: "ns1-p1", Question: "ns1 问题", CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("ns1 AppendPrediction: %v", err)
+	}
+	if err := s1.SaveLearning(&LearningState{Resolutions: 1, MeanBrier: 0.1}); err != nil {
+		t.Fatalf("ns1 SaveLearning: %v", err)
+	}
+
+	// ns2 看不到 ns1 数据
+	t.Setenv("AGENTDB_NAMESPACE", "ns2")
+	s2, err := NewAgentDBStore(url)
+	if err != nil {
+		t.Fatalf("ns2 NewAgentDBStore: %v", err)
+	}
+	preds, err := s2.RecentPredictions(10)
+	if err != nil || len(preds) != 0 {
+		t.Fatalf("ns2 不应看到 ns1 的预测, 实际 %d err=%v", len(preds), err)
+	}
+	st, err := s2.LoadLearning()
+	if err != nil || st != nil {
+		t.Fatalf("ns2 不应看到 ns1 的学习状态, 实际 %+v err=%v", st, err)
+	}
+
+	// ns1 仍能看到自己的数据
+	t.Setenv("AGENTDB_NAMESPACE", "ns1")
+	s1Again, err := NewAgentDBStore(url)
+	if err != nil {
+		t.Fatalf("ns1 re-open: %v", err)
+	}
+	preds1, err := s1Again.RecentPredictions(10)
+	if err != nil || len(preds1) != 1 || preds1[0].ID != "ns1-p1" {
+		t.Fatalf("ns1 重开应能看到自己的预测, 实际 %v err=%v", preds1, err)
+	}
+
+	// 默认 ns (空) 与 ns1 也不互通
+	t.Setenv("AGENTDB_NAMESPACE", "")
+	sDef, err := NewAgentDBStore(url)
+	if err != nil {
+		t.Fatalf("default NewAgentDBStore: %v", err)
+	}
+	predsDef, err := sDef.RecentPredictions(10)
+	if err != nil || len(predsDef) != 0 {
+		t.Fatalf("default ns 不应看到 ns1 数据, 实际 %d err=%v", len(predsDef), err)
+	}
+}
+
 func idsOf(recs []*PredictionRecord) []string {
 	ids := make([]string, len(recs))
 	for i, r := range recs {

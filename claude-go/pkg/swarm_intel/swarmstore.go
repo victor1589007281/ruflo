@@ -360,6 +360,9 @@ func (s *JSONLStore) ResolvePrediction(id, actual string, brier float64, resolve
 //   - 模拟事件: Log bucket 逐条追加, 读全量后按 runID 过滤;
 //   - 预测历史/推理库: Log bucket 逐条追加 + Memory 向量桶双写 (Filtered ANN)。
 //
+// A7 命名空间硬隔离: 桶名加 namespace 前缀 (`<ns>_swarm_intel_*`)。空 ns 用
+// `default`。多 ns 部署 (env AGENTDB_NAMESPACE=swarm) 互不污染。
+//
 // Filtered ANN (v3 Phase 1):
 //   - 写入: AppendPrediction/StoreReasoning 同步写 log 桶 (v2 兼容) + Memory 向量桶
 //     (Filtered ANN 索引); 向量桶写失败仅 warn, 主写路径 (log 桶) 不回滚。
@@ -371,43 +374,66 @@ type AgentDBStore struct {
 	sem *agentdbsemantic.Client // Filtered ANN: Memory 端点客户端
 
 	baseURL string
+	ns      string // A7 命名空间前缀 (空 = "default")
+	bkt     agentDBBuckets
+}
+
+// agentDBBuckets 按 ns 前缀构造的实际桶名 (A7 硬隔离)。
+type agentDBBuckets struct {
+	trails   string
+	learning string
+	predict  string
+	reason   string
+	sim      string
+}
+
+// newAgentDBBuckets 由 ns 构造五类桶名; ns 为空时回落 "default"。
+func newAgentDBBuckets(ns string) agentDBBuckets {
+	if ns == "" {
+		ns = "default"
+	}
+	return agentDBBuckets{
+		trails:   ns + "_swarm_intel_trails",
+		learning: ns + "_swarm_intel_learning",
+		predict:  ns + "_swarm_intel_predictions",
+		reason:   ns + "_swarm_intel_reasonings",
+		sim:      ns + "_swarm_intel_sim_events",
+	}
 }
 
 // 编译期断言: AgentDBStore 满足接口。
 var _ SwarmStore = (*AgentDBStore)(nil)
 
-// agentDB 桶名 (单引擎全局共享, 集群内多进程经 serve 串行化, 服从 first-committer-wins)。
-const (
-	adbBucketTrails   = "swarm_intel_trails"   // 信素快照 (KV)
-	adbBucketLearning = "swarm_intel_learning" // 学习状态 (KV)
-	adbLogPredictions = "swarm_intel_predictions"
-	adbLogReasonings  = "swarm_intel_reasonings"
-	adbLogSimEvents   = "swarm_intel_sim_events"
-)
-
 // NewAgentDBStore 创建 agentDB 后端; 构造时做一次可达性探针 (KV.Keys),
 // 失败返回错误 —— 调用方 (NewEngine) 负责回退 JSONL 并告警, 不 crash。
+//
+// A7: namespace 从 env AGENTDB_NAMESPACE 读取 (Config.AgentDBNamespace 留作后续显式传参口)。
+// 同一 ns 内多进程共享桶 (serve 串行化); 不同 ns 完全隔离 (桶名前缀不同)。
 func NewAgentDBStore(baseURL string) (*AgentDBStore, error) {
+	ns := strings.TrimSpace(os.Getenv("AGENTDB_NAMESPACE"))
+	bkt := newAgentDBBuckets(ns)
 	cli := agentdbclient.New(baseURL)
-	if _, err := cli.KV(adbBucketLearning).Keys(); err != nil {
+	if _, err := cli.KV(bkt.learning).Keys(); err != nil {
 		return nil, fmt.Errorf("agentDB 不可达 (%s): %w", baseURL, err)
 	}
 	return &AgentDBStore{
 		cli:     cli,
 		sem:     agentdbsemantic.New(baseURL),
 		baseURL: baseURL,
+		ns:      ns,
+		bkt:     bkt,
 	}, nil
 }
 
 // SaveTrails 把领域信素快照整存到 KV (batch 写)。
 func (s *AgentDBStore) SaveTrails(domain string, trails []*PheromoneTrail) error {
-	return s.cli.KV(adbBucketTrails).Put(safeDomainKey(domain), trails)
+	return s.cli.KV(s.bkt.trails).Put(safeDomainKey(domain), trails)
 }
 
 // LoadTrails 读取领域信素快照; 键不存在返回空。
 func (s *AgentDBStore) LoadTrails(domain string) ([]*PheromoneTrail, error) {
 	var trails []*PheromoneTrail
-	ok, err := s.cli.KV(adbBucketTrails).Get(safeDomainKey(domain), &trails)
+	ok, err := s.cli.KV(s.bkt.trails).Get(safeDomainKey(domain), &trails)
 	if err != nil || !ok {
 		return nil, err
 	}
@@ -417,7 +443,7 @@ func (s *AgentDBStore) LoadTrails(domain string) ([]*PheromoneTrail, error) {
 // AppendPrediction 追加一条预测记录 (log 桶 + Memory 向量桶双写)。
 // Memory 写失败仅 warn 不回滚 (向量检索是增强, 主存储是 log 桶)。
 func (s *AgentDBStore) AppendPrediction(rec *PredictionRecord) error {
-	if err := s.cli.Log(adbLogPredictions).Append(rec); err != nil {
+	if err := s.cli.Log(s.bkt.predict).Append(rec); err != nil {
 		return err
 	}
 	s.indexPredictionMemory(rec)
@@ -463,7 +489,7 @@ func (s *AgentDBStore) RecentPredictions(n int) ([]*PredictionRecord, error) {
 // readAllPredictions 拉取预测日志全部记录; 桶不存在按空处理 (追加型后端的常态)。
 func (s *AgentDBStore) readAllPredictions() ([]*PredictionRecord, error) {
 	var all []*PredictionRecord
-	err := s.cli.Log(adbLogPredictions).ReadAll(func(line []byte) error {
+	err := s.cli.Log(s.bkt.predict).ReadAll(func(line []byte) error {
 		var rec PredictionRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
 			return nil // 跳过坏行, 与 JSONL 后端宽容语义一致
@@ -543,7 +569,7 @@ func (s *AgentDBStore) findPredictionByID(id string) *PredictionRecord {
 
 // StoreReasoning 存储一条推理路径 (log 桶 + Memory 向量桶双写)。
 func (s *AgentDBStore) StoreReasoning(entry *ReasoningEntry) error {
-	if err := s.cli.Log(adbLogReasonings).Append(entry); err != nil {
+	if err := s.cli.Log(s.bkt.reason).Append(entry); err != nil {
 		return err
 	}
 	s.indexReasoningMemory(entry)
@@ -590,7 +616,7 @@ func (s *AgentDBStore) SearchReasonings(query string, limit int) ([]*ReasoningEn
 	}
 	// 向量未命中或失败: 回退关键词重叠 (P0 行为)
 	var all []*ReasoningEntry
-	err = s.cli.Log(adbLogReasonings).ReadAll(func(line []byte) error {
+	err = s.cli.Log(s.bkt.reason).ReadAll(func(line []byte) error {
 		var entry ReasoningEntry
 		if err := json.Unmarshal(line, &entry); err != nil {
 			return nil
@@ -634,7 +660,7 @@ func (s *AgentDBStore) findReasoningByQuestion(question string) *ReasoningEntry 
 		return nil
 	}
 	var found *ReasoningEntry
-	_ = s.cli.Log(adbLogReasonings).ReadAll(func(line []byte) error {
+	_ = s.cli.Log(s.bkt.reason).ReadAll(func(line []byte) error {
 		var entry ReasoningEntry
 		if err := json.Unmarshal(line, &entry); err != nil {
 			return nil
@@ -649,13 +675,13 @@ func (s *AgentDBStore) findReasoningByQuestion(question string) *ReasoningEntry 
 
 // SaveLearning 全量快照学习状态到 KV。
 func (s *AgentDBStore) SaveLearning(st *LearningState) error {
-	return s.cli.KV(adbBucketLearning).Put("state", st)
+	return s.cli.KV(s.bkt.learning).Put("state", st)
 }
 
 // LoadLearning 读回学习状态; 键不存在返回 (nil, nil)。
 func (s *AgentDBStore) LoadLearning() (*LearningState, error) {
 	var st LearningState
-	ok, err := s.cli.KV(adbBucketLearning).Get("state", &st)
+	ok, err := s.cli.KV(s.bkt.learning).Get("state", &st)
 	if err != nil || !ok {
 		return nil, err
 	}
@@ -667,13 +693,13 @@ func (s *AgentDBStore) AppendSimEvent(ev *SimEvent) error {
 	if ev.CreatedAt.IsZero() {
 		ev.CreatedAt = time.Now()
 	}
-	return s.cli.Log(adbLogSimEvents).Append(ev)
+	return s.cli.Log(s.bkt.sim).Append(ev)
 }
 
 // SimEvents 读全量事件后按 runID 过滤。
 func (s *AgentDBStore) SimEvents(runID string) ([]*SimEvent, error) {
 	var events []*SimEvent
-	err := s.cli.Log(adbLogSimEvents).ReadAll(func(line []byte) error {
+	err := s.cli.Log(s.bkt.sim).ReadAll(func(line []byte) error {
 		var ev SimEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
 			return nil
