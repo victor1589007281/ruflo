@@ -11,14 +11,12 @@ package swarm_intel
 //   - #7 信任/路由: 按各 agent 是否押中胜选结局更新 trust/bandit, 并**持久化 + 消费**
 //        (TrustWeightedTrimmedFuse 在有学习信任时剔除低信任 agent; 无信任时与 TrimmedFuse 完全一致)。
 //
-// **隔离**: 只有传入独立 DataDir 的调用方(novel-v3 用 …/swarm_intel/novel)才会写/读 learning_state.json;
-// 共享 DataDir 的 aiops 从不调 RecordOutcome → trustScores 恒空 → TrustWeightedTrimmedFuse 退化为
-// TrimmedFuse, Predict 输出逐字节不变。
+// **隔离**: 写侧只由 RecordOutcome/RegisterResolution 触发 —— 共享 DataDir 的 aiops 从不调用
+// → trustScores 恒空 → TrustWeightedTrimmedFuse 退化为 TrimmedFuse, Predict 输出逐字节不变;
+// 读侧 (loadLearning) 启动时无条件执行, 有历史就恢复, 没有就跳过。
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
+	"log"
 	"time"
 )
 
@@ -120,7 +118,7 @@ func (bf *ByzantineFuser) TrustWeightedTrimmedFuse(predictions []AgentPrediction
 	return bf.TrimmedFuse(kept) // 复用既有算法 (它自行加锁)
 }
 
-// ── Engine 级学习状态持久化 ──
+// ── Engine 级学习状态持久化 (v3 Phase 0 起经 SwarmStore, 后端可插拔) ──
 
 // LearningState 跨会话学习状态 (保形分数 + 路由 + 信任 + Brier 历史)。
 type LearningState struct {
@@ -133,27 +131,14 @@ type LearningState struct {
 	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
-// learningStatePath 返回学习状态的落盘路径; dataDir 为空 (未隔离/共享 DataDir 的 Engine) 时返回空串,
-// 调用方据此跳过读写 —— 这是"共享路径零回归"的开关。
-func (e *Engine) learningStatePath() string {
-	if e.dataDir == "" {
-		return ""
-	}
-	return filepath.Join(e.dataDir, "learning", "learning_state.json")
-}
-
-// loadLearning 在 NewEngine 后恢复持久化的学习状态 (容错: 缺失/损坏则跳过)。
+// loadLearning 在 NewEngine 后恢复持久化的学习状态 (E1: 无条件执行, 不再要求独立 DataDir;
+// store 为 nil 或后端无历史时安全跳过)。
 func (e *Engine) loadLearning() {
-	p := e.learningStatePath()
-	if p == "" {
+	if e.store == nil {
 		return
 	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return
-	}
-	var st LearningState
-	if json.Unmarshal(data, &st) != nil {
+	st, err := e.store.LoadLearning()
+	if err != nil || st == nil {
 		return
 	}
 	if len(st.ConformalScores) > 0 {
@@ -169,13 +154,9 @@ func (e *Engine) loadLearning() {
 	e.meanBrier = st.MeanBrier
 }
 
-// saveLearning 持久化当前学习状态 (原子写)。
+// saveLearning 持久化当前学习状态 (经 SwarmStore; 后端写失败仅告警, 不阻塞预测主流程)。
 func (e *Engine) saveLearning() {
-	p := e.learningStatePath()
-	if p == "" {
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+	if e.store == nil {
 		return
 	}
 	alphas, betas := e.banditRouter.Snapshot()
@@ -188,13 +169,8 @@ func (e *Engine) saveLearning() {
 		MeanBrier:       e.meanBrier,
 		UpdatedAt:       time.Now(),
 	}
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := p + ".tmp"
-	if os.WriteFile(tmp, data, 0644) == nil {
-		os.Rename(tmp, p)
+	if err := e.store.SaveLearning(&st); err != nil {
+		log.Printf("[swarm_intel] WARN 学习状态持久化失败: %v", err)
 	}
 }
 
@@ -240,31 +216,34 @@ func (e *Engine) RecordOutcome(pred *FusedPrediction, actualOutcome string) floa
 	}
 
 	// #5: 记录真实 Brier 到预测历史 + 推理库 (供未来 FindSimilar 拿到已校准先验)
-	if e.predHistory != nil {
+	if e.store != nil {
 		now := time.Now()
-		e.predHistory.Append(&PredictionRecord{
+		if err := e.store.AppendPrediction(&PredictionRecord{
 			ID:          "resolved-" + now.Format("20060102150405.000"),
 			Question:    pred.Question,
 			Outcomes:    pred.Outcomes,
 			Consensus:   pred.Consensus,
 			BrierScore:  brier,
 			Rounds:      pred.Rounds,
+			Agents:      pred.Agents,
 			ActualLabel: actualOutcome,
 			Resolved:    true,
 			CreatedAt:   now,
 			ResolvedAt:  &now,
-		})
-	}
-	if e.reasoningBank != nil {
+		}); err != nil {
+			log.Printf("[swarm_intel] WARN 已决记录持久化失败: %v", err)
+		}
 		for _, a := range pred.Agents {
 			if a.Rationale != "" && a.Predictions[actualOutcome] >= 0.4 {
-				e.reasoningBank.Store(&ReasoningEntry{
+				if err := e.store.StoreReasoning(&ReasoningEntry{
 					Question:   pred.Question,
 					Reasoning:  a.Rationale,
 					BrierScore: brier,
 					Confidence: a.Confidence,
 					CreatedAt:  time.Now(),
-				})
+				}); err != nil {
+					log.Printf("[swarm_intel] WARN 推理路径持久化失败: %v", err)
+				}
 			}
 		}
 	}

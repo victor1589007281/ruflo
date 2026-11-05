@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,11 +25,11 @@ type Engine struct {
 	cc *ContextCompressor // 上下文压缩
 	rc *ResilientCaller   // 弹性调用 (重试/熔断)
 
-	// M6: 持久化 + 历史学习
-	pheromoneStore *PheromoneStore
-	predHistory    *PredictionHistory
-	reasoningBank  *ReasoningBank
-	dtiController  *DTIController
+	// v3 Phase 0: 统一持久化接口 (JSONL 默认; agentDB 可选, 不可达时回退 JSONL)
+	store SwarmStore
+
+	// M6: DTI 控制器 (持久化三件套已并入 store)
+	dtiController *DTIController
 
 	// M7: 在线校准 + 市场 + 路由
 	conformal      *ConformalCalibrator
@@ -39,8 +40,8 @@ type Engine struct {
 	// M9: 可观测性
 	metrics *MetricsCollector
 
-	// 跨会话学习 (design/08 §2 #5/#6/#7) — 仅当 dataDir 独立时生效
-	dataDir     string
+	// 跨会话学习 (design/08 §2 #5/#6/#7) — loadLearning 启动时无条件恢复;
+	// 写侧由 RecordOutcome/RegisterResolution 触发, 从不调用的共享域 (aiops) 零积累、零回归。
 	resolutions int
 	meanBrier   float64
 
@@ -60,6 +61,8 @@ type Config struct {
 	DTIThreshold    float64 // DTI 触发阈值 (默认 0.7)
 	TrimRatio       float64 // 拜占庭修剪比例 (默认 0.2)
 	DebateEntropy   float64 // 辩论门控熵阈值 (默认 0.7)
+	StoreBackend    string  // v3 Phase 0: 持久化后端 "jsonl"|"agentdb" (默认 "jsonl")
+	AgentDBURL      string  // v3 Phase 0: agentDB serve 地址; 空则读 CLAUDE_GO_AGENTDB_URL
 }
 
 // DefaultConfig 默认配置。
@@ -74,6 +77,7 @@ func DefaultConfig() Config {
 		DTIThreshold:    0.7,
 		TrimRatio:       0.2,
 		DebateEntropy:   0.7,
+		StoreBackend:    "jsonl",
 	}
 }
 
@@ -84,10 +88,8 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 	}
 	boids := NewBoidsCoordinator(cfg.Boids)
 
-	// M6 组件 — 持久化 (容错: 初始化失败不阻塞引擎)
-	phStore, _ := NewPheromoneStore(cfg.DataDir)
-	predHist, _ := NewPredictionHistory(cfg.DataDir)
-	rBank, _ := NewReasoningBank(cfg.DataDir)
+	// v3 Phase 0: 按配置组装持久化后端 (agentDB 不可达回退 JSONL, 不 crash)
+	store := newSwarmStore(cfg)
 
 	// M7 组件 — 在线校准 + 路由
 	bandit := NewBanditRouter()
@@ -110,22 +112,46 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 		notify:          cfg.Notify,
 		cc:              cc,
 		rc:              rc,
-		pheromoneStore:  phStore,
-		predHistory:     predHist,
-		reasoningBank:   rBank,
+		store:           store,
 		dtiController:   NewDTIController(cfg.DTIThreshold),
 		conformal:       NewConformalCalibrator(0.05),
 		debateGate:      NewDebateGate(cfg.DebateEntropy),
 		byzantineFuser:  NewByzantineFuser(cfg.TrimRatio),
 		banditRouter:    bandit,
 		metrics:         NewMetricsCollector(cfg.DataDir),
-		dataDir:         cfg.DataDir,
 		maxDebateRounds: cfg.MaxDebateRounds,
 		numAnalysts:     cfg.NumAnalysts,
 		numScouts:       cfg.NumScouts,
 	}
-	e.loadLearning() // 恢复跨会话学习状态 (保形/信任/路由); 缺失则安全跳过
+	e.loadLearning() // E1: 启动无条件恢复跨会话学习状态 (保形/信任/路由); 缺失则安全跳过
 	return e
+}
+
+// newSwarmStore 按 Config.StoreBackend 组装持久化后端。
+//
+// 选择逻辑: "agentdb" → NewAgentDBStore (构造内含可达性探针); 失败或地址缺失 →
+// 打 warn 日志回退 JSONL, **不 crash**。任何其它值 (含空) 走 JSONL 默认后端。
+// JSONL 初始化失败 (几乎只可能是 MkdirAll 权限问题) 也仅告警, 引擎降级为无持久化。
+func newSwarmStore(cfg Config) SwarmStore {
+	if cfg.StoreBackend == "agentdb" {
+		url := strings.TrimSpace(cfg.AgentDBURL)
+		if url == "" {
+			url = strings.TrimSpace(os.Getenv("CLAUDE_GO_AGENTDB_URL"))
+		}
+		if url == "" {
+			log.Printf("[swarm_intel] WARN StoreBackend=agentdb 但未配置 AgentDBURL/CLAUDE_GO_AGENTDB_URL, 回退 jsonl")
+		} else if s, err := NewAgentDBStore(url); err == nil {
+			return s
+		} else {
+			log.Printf("[swarm_intel] WARN agentDB 不可达, 回退 jsonl: %v", err)
+		}
+	}
+	s, err := NewJSONLStore(cfg.DataDir)
+	if err != nil {
+		log.Printf("[swarm_intel] WARN JSONL 存储初始化失败, 持久化降级为无操作: %v", err)
+		return nil
+	}
+	return s
 }
 
 // Predict 执行完整的群体智能预测流水线 (M1-M7, M10 可靠性增强)。
@@ -162,8 +188,8 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 
 	// M6: 检索历史推理路径 (M10: 截断防膨胀)
 	var priorReasoning string
-	if e.reasoningBank != nil {
-		if entries, err := e.reasoningBank.FindSimilar(objective, 3); err == nil && len(entries) > 0 {
+	if e.store != nil {
+		if entries, err := e.store.SearchReasonings(objective, 3); err == nil && len(entries) > 0 {
 			var parts []string
 			for _, entry := range entries {
 				reasoning := e.cc.TruncateField(entry.Reasoning, 150)
@@ -187,8 +213,8 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	e.notify(chatID, fmt.Sprintf("  问题: %s\n  类型: %s\n  结果空间: %v", domain.Question, domain.OutcomeType, domain.Outcomes))
 
 	// M6: 加载历史信素先验
-	if e.pheromoneStore != nil {
-		if trails, err := e.pheromoneStore.Load(domain.OutcomeType); err == nil && len(trails) > 0 {
+	if e.store != nil {
+		if trails, err := e.store.LoadTrails(domain.OutcomeType); err == nil && len(trails) > 0 {
 			for _, t := range trails {
 				e.pheromones.Deposit(t.HypothesisID, t.Hypothesis, t.Strength*0.5, t.Evidence)
 			}
@@ -390,34 +416,37 @@ func (e *Engine) GetComparisonReport() *ComparisonReport {
 
 // persistResults M6 持久化预测结果、信素和推理路径。
 func (e *Engine) persistResults(domain *PredictionDomain, result *FusedPrediction, predictions []AgentPrediction) {
-	if e.pheromoneStore != nil {
-		trails := e.pheromones.TopTrails(20)
-		e.pheromoneStore.Save(domain.OutcomeType, trails)
+	if e.store == nil {
+		return
+	}
+	if err := e.store.SaveTrails(domain.OutcomeType, e.pheromones.TopTrails(20)); err != nil {
+		log.Printf("[swarm_intel] WARN 信素持久化失败: %v", err)
 	}
 
-	if e.predHistory != nil {
-		rec := &PredictionRecord{
-			ID:        fmt.Sprintf("pred-%d", time.Now().UnixMilli()),
-			Question:  result.Question,
-			Outcomes:  result.Outcomes,
-			Consensus: result.Consensus,
-			BrierScore: result.BrierScore,
-			Rounds:    result.Rounds,
-			CreatedAt: time.Now(),
-		}
-		e.predHistory.Append(rec)
+	rec := &PredictionRecord{
+		ID:        fmt.Sprintf("pred-%d", time.Now().UnixMilli()),
+		Question:  result.Question,
+		Outcomes:  result.Outcomes,
+		Consensus: result.Consensus,
+		BrierScore: result.BrierScore,
+		Rounds:    result.Rounds,
+		Agents:    predictions, // 供 RegisterResolution 跨重启回填信任/路由
+		CreatedAt: time.Now(),
+	}
+	if err := e.store.AppendPrediction(rec); err != nil {
+		log.Printf("[swarm_intel] WARN 预测历史持久化失败: %v", err)
 	}
 
-	if e.reasoningBank != nil {
-		for _, p := range predictions {
-			if p.Confidence > 0.6 && p.Rationale != "" {
-				e.reasoningBank.Store(&ReasoningEntry{
-					Question:   result.Question,
-					Reasoning:  p.Rationale,
-					BrierScore: result.BrierScore,
-					Confidence: p.Confidence,
-					CreatedAt:  time.Now(),
-				})
+	for _, p := range predictions {
+		if p.Confidence > 0.6 && p.Rationale != "" {
+			if err := e.store.StoreReasoning(&ReasoningEntry{
+				Question:   result.Question,
+				Reasoning:  p.Rationale,
+				BrierScore: result.BrierScore,
+				Confidence: p.Confidence,
+				CreatedAt:  time.Now(),
+			}); err != nil {
+				log.Printf("[swarm_intel] WARN 推理路径持久化失败: %v", err)
 			}
 		}
 	}
@@ -425,10 +454,10 @@ func (e *Engine) persistResults(domain *PredictionDomain, result *FusedPredictio
 
 // GetHistory 获取最近 N 条预测历史。
 func (e *Engine) GetHistory(n int) ([]*PredictionRecord, error) {
-	if e.predHistory == nil {
-		return nil, fmt.Errorf("prediction history not initialized")
+	if e.store == nil {
+		return nil, fmt.Errorf("store not initialized")
 	}
-	return e.predHistory.Recent(n)
+	return e.store.RecentPredictions(n)
 }
 
 // Simulate 执行场景模拟。
