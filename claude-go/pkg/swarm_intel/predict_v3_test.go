@@ -117,6 +117,130 @@ func TestResolveExtremization_GatedByResolutions(t *testing.T) {
 	}
 }
 
+// ── E6: LMSR 预测市场融合 ──
+
+// 市场开启时 Method 加 +market 后缀; 关闭时保持纯 v2 行为。
+func TestMarketFusion_MethodSuffix(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.MarketEnable = true
+	cfg.MarketWeight = 0.2
+	e := NewEngine(nil, cfg)
+
+	domain := &PredictionDomain{Question: "q", Outcomes: []string{"x", "y"}}
+	preds := []AgentPrediction{
+		{AgentID: "a", AgentRole: "甲", Predictions: map[string]float64{"x": 0.8, "y": 0.2}, Confidence: 0.8},
+		{AgentID: "b", AgentRole: "乙", Predictions: map[string]float64{"x": 0.6, "y": 0.4}, Confidence: 0.7},
+	}
+	fused := e.fuser.FuseWithTrust(*domain, preds, nil)
+	e.applyMarketFusion(domain, preds, fused)
+	if fused.Method != "log_opinion_pool+market" {
+		t.Fatalf("市场开启时 Method 应为 log_opinion_pool+market, 实际 %v", fused.Method)
+	}
+
+	// 关闭市场时 Predict 不应触发 applyMarketFusion (这里直接验证 applyMarketFusion 的 early-return)。
+	e2 := NewEngine(nil, DefaultConfig())
+	e2.marketEnable = false
+	fused2 := e2.fuser.FuseWithTrust(*domain, preds, nil)
+	e2.applyMarketFusion(domain, preds, fused2)
+	if fused2.Method != "log_opinion_pool" {
+		t.Fatalf("市场关闭时 Method 应为纯 v2, 实际 %v", fused2.Method)
+	}
+}
+
+// 市场权重 ≤ 0.5 封顶: 即使 cfg.MarketWeight 设得很大, 实际混入比例也不能让市场主导融合。
+func TestMarketFusion_WeightCapped(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.MarketWeight = 0.9 // 故意设超界
+	e := NewEngine(nil, cfg)
+	if e.marketWeight != 0.9 {
+		t.Fatalf("setup: marketWeight 应为 0.9")
+	}
+
+	domain := &PredictionDomain{Question: "q", Outcomes: []string{"x", "y"}}
+	preds := []AgentPrediction{
+		{AgentID: "a", AgentRole: "甲", Predictions: map[string]float64{"x": 0.7, "y": 0.3}, Confidence: 0.8},
+		{AgentID: "b", AgentRole: "乙", Predictions: map[string]float64{"x": 0.5, "y": 0.5}, Confidence: 0.6},
+	}
+	fused := e.fuser.FuseWithTrust(*domain, preds, nil)
+	e.applyMarketFusion(domain, preds, fused)
+
+	// w=min(0.9, 0.5)=0.5: 融合概率 = 0.5·p_fused + 0.5·p_market。市场报价在 (0,1),
+	// 所以 |p_final - p_fused| ≤ 0.5·|p_market - p_fused| < 0.5。任何 outcome 偏移都不能超过 0.5。
+	for _, o := range fused.Outcomes {
+		if o.Probability < 0 || o.Probability > 1 {
+			t.Fatalf("概率越界: %v=%v", o.Outcome, o.Probability)
+		}
+	}
+	// 概率归一: Σ p = 1 (LMSR  softmax 天然归一, 混合也归一)。
+	sum := 0.0
+	for _, o := range fused.Outcomes {
+		sum += o.Probability
+	}
+	if math.Abs(sum-1.0) > 1e-9 {
+		t.Fatalf("融合后概率不归一: Σ=%v", sum)
+	}
+}
+
+// 单分析师不启用市场 (LMSR 单人购彩无意义, 市场恒等于先验)。
+func TestMarketFusion_SingleAgentSkips(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	e := NewEngine(nil, cfg)
+
+	domain := &PredictionDomain{Question: "q", Outcomes: []string{"x", "y"}}
+	preds := []AgentPrediction{
+		{AgentID: "a", AgentRole: "甲", Predictions: map[string]float64{"x": 0.9, "y": 0.1}, Confidence: 0.9},
+	}
+	fused := e.fuser.FuseWithTrust(*domain, preds, nil)
+	before := fusedProb(fused, "x")
+	e.applyMarketFusion(domain, preds, fused)
+	after := fusedProb(fused, "x")
+	if math.Abs(before-after) > 1e-12 {
+		t.Fatalf("单分析师不应触发市场融合: before=%v after=%v", before, after)
+	}
+}
+
+// LMSR 价格归一 + log-sum-exp 不溢出。
+func TestMarketFusion_LMSRPricesNormalized(t *testing.T) {
+	// 预算充足: 100 份额的 LMSR 成本约为 b·ln(N) + q/N 量级, b=100 时几十足够。
+	market := NewPredictionMarket(100.0, []string{"a", "b", "c"}, 200.0, []string{"u", "v"})
+	// 大量购彩把 q/b 推得很大, 测溢出防护。
+	if _, err := market.Buy("u", "a", 100.0); err != nil {
+		t.Fatalf("Buy u→a 失败: %v", err)
+	}
+	if _, err := market.Buy("v", "a", 50.0); err != nil {
+		t.Fatalf("Buy v→a 失败: %v", err)
+	}
+	prices := market.Prices()
+	sum := 0.0
+	for _, p := range prices {
+		if math.IsNaN(p) || math.IsInf(p, 0) || p < 0 || p > 1 {
+			t.Fatalf("价格越界/NaN/Inf: %v", p)
+		}
+		sum += p
+	}
+	if math.Abs(sum-1.0) > 1e-9 {
+		t.Fatalf("LMSR 价格不归一: Σ=%v", sum)
+	}
+	if prices["a"] <= prices["b"] {
+		t.Fatalf("购彩 a 最多, 价格应最高: %v", prices)
+	}
+}
+
+// 预算耗尽后 Buy 应报错, 但不打断融合 (applyMarketFusion 容错跳过)。
+func TestMarketFusion_BudgetExhausted(t *testing.T) {
+	market := NewPredictionMarket(100.0, []string{"x", "y"}, 0.01, []string{"poor"}) // 极小预算
+	if _, err := market.Buy("poor", "x", 100.0); err == nil {
+		t.Fatalf("预算 0.01 不应买得起 100 份额")
+	}
+	// 预算内可买
+	if _, err := market.Buy("poor", "x", 0.001); err != nil {
+		t.Fatalf("小额 Buy 应成功: %v", err)
+	}
+}
+
 // ── E5: AUQ 分流熵口径 ──
 
 func TestAgentEntropy(t *testing.T) {

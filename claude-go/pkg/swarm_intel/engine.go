@@ -39,6 +39,10 @@ type Engine struct {
 	byzantineFuser *ByzantineFuser
 	banditRouter   *BanditRouter
 
+	// E6: LMSR 预测市场 (诊断 5 接线)。每次 Predict 重建 (无状态), 分析师按其预测概率购彩,
+	// 市场价格作为第 (N+1) 个"虚拟分析师"参与融合, 权重上限由 cfg.MarketWeight 封顶。
+	market *PredictionMarket
+
 	// M9: 可观测性
 	metrics *MetricsCollector
 
@@ -55,6 +59,11 @@ type Engine struct {
 	maxDebateRounds int
 	numAnalysts     int
 	numScouts       int
+
+	// E6: 预测市场配置 (从 Config 透传, applyMarketFusion 用)
+	marketEnable bool
+	marketWeight float64
+	marketBudget float64
 }
 
 // Config 引擎配置。
@@ -70,6 +79,10 @@ type Config struct {
 	DebateEntropy   float64 // 辩论门控熵阈值 (默认 0.7)
 	StoreBackend    string  // v3 Phase 0: 持久化后端 "jsonl"|"agentdb" (默认 "jsonl")
 	AgentDBURL      string  // v3 Phase 0: agentDB serve 地址; 空则读 CLAUDE_GO_AGENTDB_URL
+	// E6: LMSR 预测市场接线 (诊断 5 — 把已实现未接线的 PredictionMarket 纳入融合)。
+	MarketEnable bool    // 是否让市场作为虚拟分析师参与融合 (默认 true; false=纯 v2 行为)
+	MarketWeight float64 // 市场融合权重上限 [0,1] (默认 0.2, 风险登记册缓解: 防价格操纵主导融合)
+	MarketBudget float64 // 每个分析师的 LMSR 购彩预算 (默认 1.0)
 }
 
 // DefaultConfig 默认配置。
@@ -85,6 +98,9 @@ func DefaultConfig() Config {
 		TrimRatio:       0.2,
 		DebateEntropy:   0.7,
 		StoreBackend:    "jsonl",
+		MarketEnable:    true,
+		MarketWeight:    0.2,
+		MarketBudget:    1.0,
 	}
 }
 
@@ -130,6 +146,9 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 		numAnalysts:     cfg.NumAnalysts,
 		numScouts:       cfg.NumScouts,
 		pending:         make(map[string]*FusedPrediction),
+		marketEnable:    cfg.MarketEnable,
+		marketWeight:    cfg.MarketWeight,
+		marketBudget:    cfg.MarketBudget,
 	}
 	e.loadLearning() // E1: 启动无条件恢复跨会话学习状态 (保形/信任/路由); 缺失则安全跳过
 	return e
@@ -339,6 +358,12 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	e.notify(chatID, "🔮 Phase 5/7: 贝叶斯融合...")
 	result := e.fuser.FuseWithTrust(*domain, predictions, e.byzantineFuser.SnapshotTrust())
 
+	// E6: LMSR 预测市场 —— 分析师按其预测概率购彩, 市场价格作为第 (N+1) 个"虚拟分析师"
+	// 以 marketWeight 上限权重并入融合分布。市场权重由 cfg.MarketWeight 封顶, 防价格操纵主导融合。
+	if e.marketEnable && len(predictions) > 0 && len(result.Outcomes) > 0 {
+		e.applyMarketFusion(domain, predictions, result)
+	}
+
 	// E4: extremization —— judge 强度把融合概率推离 0.5; 校准数据不足 (<10 resolutions) 时强制为 0。
 	ext := e.resolveExtremization(critique.Extremization)
 	result.Extremization = ext
@@ -419,6 +444,65 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 
 	e.notify(chatID, e.formatResult(result))
 	return result, nil
+}
+
+// applyMarketFusion E6: LMSR 预测市场融合。
+//
+// 原理：每次 Predict 新建一个 LMSR 市场 (流动性 b=100, 每分析师预算 marketBudget)。
+// 每位分析师按"其预测概率 × 预算"购彩其最看好的 outcome; 随后 LMSR 价格 softmax(q/b)
+// 即为市场隐含的共识概率分布。该分布作为第 (N+1) 个"虚拟分析师"以 marketWeight 权重
+// 并入融合结果: p_final = (1-w)·p_fused + w·p_market, w = min(marketWeight, 0.5)。
+//
+// 关键不变量：
+//   - w 必须 ≤ 0.5: 市场价格受分析师购彩顺序影响 (先到先得), 不能让市场主导融合,
+//     否则就等于丢弃 confidence × 信任分的 E3 权重 (风险登记册: 防价格操纵)。
+//   - 仅当 ≥2 个分析师才启用市场: 单人预测时购彩无意义, 市场恒等于先验 1/N。
+//   - 市场无状态: Predict 之间不保留份额, 防跨问题串扰。
+//   - Buy 失败 (预算不足/未知 agent) 仅跳过该分析师, 不打断融合。
+func (e *Engine) applyMarketFusion(domain *PredictionDomain, predictions []AgentPrediction, result *FusedPrediction) {
+	if !e.marketEnable {
+		return
+	}
+	if len(predictions) < 2 {
+		return
+	}
+	agentIDs := make([]string, 0, len(predictions))
+	for _, p := range predictions {
+		agentIDs = append(agentIDs, p.AgentID)
+	}
+	market := NewPredictionMarket(100.0, domain.Outcomes, e.marketBudget, agentIDs)
+
+	// 每位分析师按其最看好的 outcome 购彩; 购彩量 = 预测概率 × 预算 (信念越强购越多)。
+	for _, p := range predictions {
+		bestOutcome := ""
+		bestProb := -1.0
+		for _, o := range domain.Outcomes {
+			if prob, ok := p.Predictions[o]; ok && prob > bestProb {
+				bestProb = prob
+				bestOutcome = o
+			}
+		}
+		if bestOutcome == "" || bestProb <= 0 {
+			continue
+		}
+		amount := bestProb * e.marketBudget
+		if _, err := market.Buy(p.AgentID, bestOutcome, amount); err != nil {
+			log.Printf("[swarm_intel] WARN 市场购彩失败 agent=%s outcome=%s: %v", p.AgentID, bestOutcome, err)
+		}
+	}
+
+	marketPrices := market.Prices()
+	w := math.Min(e.marketWeight, 0.5)
+	for i := range result.Outcomes {
+		mp, ok := marketPrices[result.Outcomes[i].Outcome]
+		if !ok {
+			continue
+		}
+		result.Outcomes[i].Probability = (1-w)*result.Outcomes[i].Probability + w*mp
+	}
+	if w > 0 {
+		result.Method = "log_opinion_pool+market"
+	}
 }
 
 // avgConfidence 各 Agent 自报置信度的算术平均; 无预测时返回 0 (用于指标口径)。
