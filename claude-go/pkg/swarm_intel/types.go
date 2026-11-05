@@ -94,6 +94,9 @@ type SimulationConfig struct {
 	Rounds    int      `json:"rounds"`
 	Scenarios []string `json:"scenarios"`
 	StopCond  string   `json:"stop_condition,omitempty"`
+	// Phase 2: social 模拟深度 — "kernel"(默认) 走结构化轮次内核,
+	// "fast" 保留旧的单 prompt 讲故事模式作为回退。
+	Detail string `json:"detail,omitempty"`
 }
 
 // SimulationResult 模拟结果。
@@ -104,6 +107,11 @@ type SimulationResult struct {
 	Emergent   []string              `json:"emergent_behaviors,omitempty"`
 	Summary    string                `json:"summary"`
 	CreatedAt  time.Time             `json:"created_at"`
+
+	// Phase 2 (social kernel): 可选的立场轨迹与指标曲线,
+	// 仅 kernel 模式产出; 其他模式留空, 旧消费者不受影响。
+	Trajectory   map[string][]float64 `json:"trajectory,omitempty"`    // agentID → 每轮立场
+	MetricCurves map[string][]float64 `json:"metric_curves,omitempty"` // variance/entropy/clustering → 每轮值
 }
 
 // ScenarioOutcome 单个场景分支的结果。

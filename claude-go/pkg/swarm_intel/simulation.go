@@ -17,6 +17,9 @@ type Simulator struct {
 	llm    LLMClient
 	notify NotifyFunc
 	cc     *ContextCompressor // M10: 上下文压缩
+
+	// Phase 2: social 内核的 SimEvent 记录器 (JSONL 兜底; W1 swarmstore 落地后替换)。
+	simEvents SimEventRecorder
 }
 
 // NewSimulator 创建场景模拟器。
@@ -26,6 +29,9 @@ func NewSimulator(llm LLMClient, notify NotifyFunc) *Simulator {
 	}
 	return &Simulator{llm: llm, notify: notify, cc: DefaultContextCompressor()}
 }
+
+// SetSimEventRecorder 挂接 SimEvent 记录器 (由 Engine 注入; 未挂接时 social 内核不落盘)。
+func (s *Simulator) SetSimEventRecorder(r SimEventRecorder) { s.simEvents = r }
 
 // Simulate 执行场景模拟。
 // 支持 9 种模式:
@@ -63,8 +69,29 @@ func (s *Simulator) Simulate(ctx context.Context, chatID string, objective strin
 	}
 }
 
-// socialSimulation 多 Agent 社会模拟 (M10 v2: 单 prompt 模式, 从 5 次→1 次 LLM 调用)。
+// socialSimulation 多 Agent 社会模拟。
+// Phase 2: 默认走结构化轮次内核 (spawn→FJ轮次→计算涌现→报告);
+// cfg.Detail == "fast" 时保留旧的单 prompt 讲故事模式作为回退。
 func (s *Simulator) socialSimulation(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
+	if cfg.Detail != "fast" {
+		kcfg := DefaultSocialKernelConfig()
+		if cfg.Agents > 0 {
+			kcfg.NumAgents = cfg.Agents
+		}
+		if cfg.Rounds > 0 {
+			kcfg.Rounds = cfg.Rounds
+		}
+		s.notify(chatID, fmt.Sprintf("🌐 社会模拟启动: %d 个 Agent, %d 轮 (结构化内核)", kcfg.NumAgents, kcfg.Rounds))
+		k := NewSocialKernel(s.llm, s.notify, kcfg)
+		k.SetRecorder(s.simEvents)
+		return k.Run(ctx, chatID, objective)
+	}
+	return s.socialSimulationFast(ctx, chatID, objective, cfg)
+}
+
+// socialSimulationFast 单 prompt 社会模拟 (M10 v2, 从 5 次→1 次 LLM 调用)。
+// Phase 2 起仅作为 cfg.Detail == "fast" 的回退模式保留。
+func (s *Simulator) socialSimulationFast(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
 	s.notify(chatID, fmt.Sprintf("🌐 社会模拟启动: %d 个 Agent, %d 轮 (单 prompt)", cfg.Agents, cfg.Rounds))
 
 	prompt := fmt.Sprintf(`你是社会模拟引擎。执行完整的多 Agent 社会模拟。
