@@ -279,3 +279,42 @@ func idsOf(recs []*PredictionRecord) []string {
 	}
 	return ids
 }
+
+// TestAgentDBStoreFilteredANN 验证 Filtered ANN 语义检索的容错与回退:
+//   - 写入端: AppendPrediction/StoreReasoning 即使 Memory 向量桶不可达 (本测试 server
+//     未装配 Memory 后端) 也应成功 (主写路径是 log 桶, 向量写失败仅 warn)。
+//   - 检索端: Memory.SearchMemory 失败时应自动回退到关键词重叠 (P0 行为),
+//     保证向量桶冷启动/不可达时仍可工作。
+func TestAgentDBStoreFilteredANN(t *testing.T) {
+	s, err := NewAgentDBStore(newAgentDBTestServer(t))
+	if err != nil {
+		t.Fatalf("NewAgentDBStore: %v", err)
+	}
+
+	// 写入: 不因向量桶未装配而失败
+	rec := &PredictionRecord{ID: "ann-1", Question: "向量检索是否会替代关键词匹配", CreatedAt: time.Now()}
+	if err := s.AppendPrediction(rec); err != nil {
+		t.Fatalf("AppendPrediction 不应因 Memory 不可达而失败: %v", err)
+	}
+	entry := &ReasoningEntry{Question: "语义嵌入的维度选择", Reasoning: "r-ann", Confidence: 0.8, CreatedAt: time.Now()}
+	if err := s.StoreReasoning(entry); err != nil {
+		t.Fatalf("StoreReasoning 不应因 Memory 不可达而失败: %v", err)
+	}
+
+	// 检索: 关键词回退仍工作 (Memory 不可达, SearchMemory 报错 → 走原路径)
+	hits, err := s.FindSimilar("向量 检索 嵌入", 5)
+	if err != nil {
+		t.Fatalf("FindSimilar 应能容错回退: %v", err)
+	}
+	if len(hits) == 0 || hits[0].ID != "ann-1" {
+		t.Fatalf("回退应命中 ann-1, 实际 %v", idsOf(hits))
+	}
+
+	rhits, err := s.SearchReasonings("语义 嵌入", 5)
+	if err != nil {
+		t.Fatalf("SearchReasonings 应能容错回退: %v", err)
+	}
+	if len(rhits) == 0 || rhits[0].Reasoning != "r-ann" {
+		t.Fatalf("回退应命中 r-ann, 实际 %+v", rhits)
+	}
+}

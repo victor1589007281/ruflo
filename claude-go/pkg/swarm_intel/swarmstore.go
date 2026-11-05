@@ -11,10 +11,13 @@ package swarm_intel
 // ReasoningEntry) 被原样复用, 不重造数据结构。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -355,14 +358,17 @@ func (s *JSONLStore) ResolvePrediction(id, actual string, brier float64, resolve
 //   - 信素: KV bucket, key=domain (快照整存整取, 即 batch 语义);
 //   - 学习状态: KV bucket, key="state" (全量快照);
 //   - 模拟事件: Log bucket 逐条追加, 读全量后按 runID 过滤;
-//   - 预测历史/推理库: Log bucket 逐条追加。
+//   - 预测历史/推理库: Log bucket 逐条追加 + Memory 向量桶双写 (Filtered ANN)。
 //
-// TODO(v3): FindSimilar/SearchReasonings 的 Filtered ANN 向量化 —— 骨架阶段沿用
-// 关键词回退 (与 JSONL 同路径), 升级时走 pkg/agentdbsemantic 的 Memory/Retrieve 端点,
-// 接口签名不变, 调用方零改动。
+// Filtered ANN (v3 Phase 1):
+//   - 写入: AppendPrediction/StoreReasoning 同步写 log 桶 (v2 兼容) + Memory 向量桶
+//     (Filtered ANN 索引); 向量桶写失败仅 warn, 主写路径 (log 桶) 不回滚。
+//   - 检索: FindSimilar/SearchReasonings 优先走 Memory.SearchMemory 向量化命中,
+//     向量端点不可达或零命中时回退关键词重叠 (与 P0 行为一致)。
+//   - 接口签名不变, 调用方零改动。
 type AgentDBStore struct {
 	cli *agentdbclient.Client
-	sem *agentdbsemantic.Client // P0 预留: Filtered ANN 接入点 (当前未使用)
+	sem *agentdbsemantic.Client // Filtered ANN: Memory 端点客户端
 
 	baseURL string
 }
@@ -408,9 +414,38 @@ func (s *AgentDBStore) LoadTrails(domain string) ([]*PheromoneTrail, error) {
 	return trails, nil
 }
 
-// AppendPrediction 追加一条预测记录 (history 逐条 append)。
+// AppendPrediction 追加一条预测记录 (log 桶 + Memory 向量桶双写)。
+// Memory 写失败仅 warn 不回滚 (向量检索是增强, 主存储是 log 桶)。
 func (s *AgentDBStore) AppendPrediction(rec *PredictionRecord) error {
-	return s.cli.Log(adbLogPredictions).Append(rec)
+	if err := s.cli.Log(adbLogPredictions).Append(rec); err != nil {
+		return err
+	}
+	s.indexPredictionMemory(rec)
+	return nil
+}
+
+// indexPredictionMemory 把预测记录索引进 Memory 向量桶 (Filtered ANN 写入侧)。
+// 向量桶索引失败仅 warn: 检索侧会自动回退到关键词重叠, 不影响主存储。
+func (s *AgentDBStore) indexPredictionMemory(rec *PredictionRecord) {
+	if s.sem == nil || rec == nil || rec.Question == "" {
+		return
+	}
+	content := rec.Question
+	if len(rec.Outcomes) > 0 {
+		outcomes := make([]string, 0, len(rec.Outcomes))
+		for _, o := range rec.Outcomes {
+			outcomes = append(outcomes, o.Outcome)
+		}
+		content = rec.Question + " | " + strings.Join(outcomes, " / ")
+	}
+	if _, err := s.sem.StoreMemory(context.Background(), agentdbsemantic.Memory{
+		Content:   content,
+		Type:      agentdbsemantic.MemorySemantic,
+		SessionID: rec.ID,
+		Tags:      []string{"swarm_predict", rec.ID},
+	}); err != nil {
+		log.Printf("[swarm_intel] WARN Memory 向量索引失败 (prediction %s): %v", rec.ID, err)
+	}
 }
 
 // RecentPredictions 读全量日志后取末尾 N 条 (追加序即时间序)。
@@ -451,9 +486,29 @@ type scoredReasoning struct {
 	score float64
 }
 
-// FindSimilar 关键词重叠检索相似历史预测。
-// TODO(v3 Filtered ANN): 走 s.sem 的 Memory/Retrieve 向量化检索替换本回退实现。
+// FindSimilar 语义向量检索相似历史预测 (Filtered ANN)。
+// 优先走 Memory.SearchMemory 向量化命中 (服务端嵌入 question+outcomes); 不可达或
+// 零命中时回退关键词重叠 (与 P0 行为一致, 保证向量桶冷启动时仍可工作)。
 func (s *AgentDBStore) FindSimilar(question string, limit int) ([]*PredictionRecord, error) {
+	// 先取向量命中 (limit*2 留余量给后续重排/过滤)
+	hits, err := s.sem.SearchMemory(context.Background(), question, limit*2, 0)
+	if err == nil && len(hits) > 0 {
+		// 按 score 排序取 top-N
+		sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
+		var result []*PredictionRecord
+		for i, h := range hits {
+			if limit > 0 && i >= limit {
+				break
+			}
+			if rec := s.findPredictionByID(h.ID); rec != nil {
+				result = append(result, rec)
+			}
+		}
+		if len(result) > 0 {
+			return result, nil
+		}
+	}
+	// 向量未命中或失败: 回退关键词重叠 (P0 行为)
 	all, err := s.readAllPredictions()
 	if err != nil {
 		return nil, err
@@ -468,16 +523,74 @@ func (s *AgentDBStore) FindSimilar(question string, limit int) ([]*PredictionRec
 	return topPredictions(candidates, limit), nil
 }
 
-// StoreReasoning 存储一条推理路径。
-func (s *AgentDBStore) StoreReasoning(entry *ReasoningEntry) error {
-	return s.cli.Log(adbLogReasonings).Append(entry)
+// findPredictionByID 在 log 桶中按 ID 精确匹配 (Memory 命中 → 完整记录)。
+// 找不到返回 nil (向量桶和 log 桶可能有短暂不一致, 容忍)。
+func (s *AgentDBStore) findPredictionByID(id string) *PredictionRecord {
+	if id == "" {
+		return nil
+	}
+	all, err := s.readAllPredictions()
+	if err != nil {
+		return nil
+	}
+	for _, rec := range all {
+		if rec.ID == id {
+			return rec
+		}
+	}
+	return nil
 }
 
-// SearchReasonings 关键词重叠检索相似推理路径。
-// TODO(v3 Filtered ANN): 走 s.sem 的 Memory/Retrieve 向量化检索替换本回退实现。
+// StoreReasoning 存储一条推理路径 (log 桶 + Memory 向量桶双写)。
+func (s *AgentDBStore) StoreReasoning(entry *ReasoningEntry) error {
+	if err := s.cli.Log(adbLogReasonings).Append(entry); err != nil {
+		return err
+	}
+	s.indexReasoningMemory(entry)
+	return nil
+}
+
+// indexReasoningMemory 把推理路径索引进 Memory 向量桶 (Filtered ANN 写入侧)。
+func (s *AgentDBStore) indexReasoningMemory(entry *ReasoningEntry) {
+	if s.sem == nil || entry == nil || entry.Question == "" {
+		return
+	}
+	content := entry.Question
+	if entry.Reasoning != "" {
+		content = entry.Question + " | " + entry.Reasoning
+	}
+	if _, err := s.sem.StoreMemory(context.Background(), agentdbsemantic.Memory{
+		Content:   content,
+		Type:      agentdbsemantic.MemorySemantic,
+		SessionID: entry.Question, // 用 question 做去重键 (同一问题重复推理会覆盖)
+		Tags:      []string{"swarm_reasoning", entry.Question},
+	}); err != nil {
+		log.Printf("[swarm_intel] WARN Memory 向量索引失败 (reasoning): %v", err)
+	}
+}
+
+// SearchReasonings 语义向量检索相似推理路径 (Filtered ANN)。
+// 优先走 Memory.SearchMemory; 不可达或零命中时回退关键词重叠 (与 P0 行为一致)。
 func (s *AgentDBStore) SearchReasonings(query string, limit int) ([]*ReasoningEntry, error) {
+	hits, err := s.sem.SearchMemory(context.Background(), query, limit*2, 0)
+	if err == nil && len(hits) > 0 {
+		sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
+		var result []*ReasoningEntry
+		for i, h := range hits {
+			if limit > 0 && i >= limit {
+				break
+			}
+			if entry := s.findReasoningByQuestion(h.ID); entry != nil {
+				result = append(result, entry)
+			}
+		}
+		if len(result) > 0 {
+			return result, nil
+		}
+	}
+	// 向量未命中或失败: 回退关键词重叠 (P0 行为)
 	var all []*ReasoningEntry
-	err := s.cli.Log(adbLogReasonings).ReadAll(func(line []byte) error {
+	err = s.cli.Log(adbLogReasonings).ReadAll(func(line []byte) error {
 		var entry ReasoningEntry
 		if err := json.Unmarshal(line, &entry); err != nil {
 			return nil
@@ -513,6 +626,25 @@ func (s *AgentDBStore) SearchReasonings(query string, limit int) ([]*ReasoningEn
 		result = append(result, c.entry)
 	}
 	return result, nil
+}
+
+// findReasoningByQuestion 在 log 桶中按 question 精确匹配 (Memory 命中 → 完整记录)。
+func (s *AgentDBStore) findReasoningByQuestion(question string) *ReasoningEntry {
+	if question == "" {
+		return nil
+	}
+	var found *ReasoningEntry
+	_ = s.cli.Log(adbLogReasonings).ReadAll(func(line []byte) error {
+		var entry ReasoningEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return nil
+		}
+		if entry.Question == question {
+			found = &entry
+		}
+		return nil
+	})
+	return found
 }
 
 // SaveLearning 全量快照学习状态到 KV。
