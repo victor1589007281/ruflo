@@ -23,7 +23,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: gateway
-          image: claude-go:agents-20260912-233823
+          image: claude-go:agents-swarmv3-20261105-1103
           imagePullPolicy: Never
           # anthropic-gateway (协议翻译/透传, omen 长推理 30min + x-opencode-session
           # 注入) + pathfix (18081→18085, 兼容老客户端 /messages 路径改写)。
@@ -73,7 +73,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: control
-          image: claude-go:agents-20260912-233823
+          image: claude-go:agents-swarmv3-20261105-1103
           imagePullPolicy: Never
           args:
             - "serve"
@@ -177,12 +177,14 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: dashboard
-          image: claude-go:agents-20260912-233823
+          image: claude-go:agents-swarmv3-20261105-1103
           imagePullPolicy: Never
           args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open", "--config", "/etc/claude-go/config.json"]
           env:
             - name: CLAUDE_GO_BOT_API_URL
               value: "http://claude-go-control:18080"
+            # Jev 决策流水从 agentdb 读, 缺了 /api/jev/stats 只回报错 (2026-11-05 实测)
+            - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
             - { name: HOME, value: "/tmp" }
           ports: [{ containerPort: 7777 }]
           readinessProbe:
@@ -231,7 +233,7 @@ spec:
         - name: init-state-dir
           # 不用 busybox: kind 节点无外网, docker.io 拉不动 (agents9 实测 ImagePullBackOff)。
           # agents9 基于 debian-slim 自带 sh+chown, 直接复用镜像内已有能力。
-          image: claude-go:agents-20260912-233823
+          image: claude-go:agents-swarmv3-20261105-1103
           imagePullPolicy: Never
           # 显式 root: 否则继承 pod 级 runAsUser 1000, chown 反向被拒 (agents9 实测 Init:Error)。
           securityContext: { runAsUser: 0, runAsGroup: 0 }
@@ -243,7 +245,7 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
       containers:
         - name: worker
-          image: claude-go:agents-20260912-233823
+          image: claude-go:agents-swarmv3-20261105-1103
           imagePullPolicy: Never
           command: ["/usr/local/bin/claude-go-worker"]
           args:
@@ -265,6 +267,10 @@ spec:
             - { name: CLAUDE_GO_STATESTORE_BACKEND, value: "dual" }
             - { name: CLAUDE_GO_STATESTORE_READ, value: "fallback" }
             - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
+            # swarm v3: 群体智能存储走 agentDB (SWARM_STORE=agentdb; jsonl=降级开关)
+            - { name: SWARM_STORE, value: "agentdb" }
+            - { name: AGENTDB_URL, value: "http://agentdb:9090" }
+            - { name: AGENTDB_NAMESPACE, value: "swarm" }
             - name: POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             # 状态目录每 worker 独立 (FileStore 无跨进程锁), 卷为 hostPath 常驻卷 +
@@ -311,7 +317,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: mcp
-          image: claude-go:agents-20260912-233823
+          image: claude-go:agents-swarmv3-20261105-1103
           imagePullPolicy: Never
           args: ["codeintel-mcp-server", "--transport", "http", "--addr", "0.0.0.0:29234", "--config", "/etc/claude-go/config.json"]
           env:

@@ -20,9 +20,9 @@ spec:
         fsGroup: 1000
       containers:
         - name: agentdb
-          image: agentdb:v11-1786870167
+          image: agentdb:agents-swarmv3-20261105-1103
           imagePullPolicy: Never
-          args: ["serve", "-data", "/data", "-addr", "0.0.0.0:9090"]
+          args: ["serve", "-data", "/data", "-addr", "0.0.0.0:9090", "--allow-insecure"]
           ports:
             - { containerPort: 9090 }
           readinessProbe:
