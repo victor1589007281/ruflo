@@ -673,13 +673,39 @@ func (s *AgentDBStore) findReasoningByQuestion(question string) *ReasoningEntry 
 	return found
 }
 
-// SaveLearning 全量快照学习状态到 KV。
+// SaveLearning 全量快照学习状态到 KV + 追加版本链 (A3 as-of)。
+// KV 写失败返回错误 (主路径); 链写失败仅 warn (增强路径)。
 func (s *AgentDBStore) SaveLearning(st *LearningState) error {
-	return s.cli.KV(s.bkt.learning).Put("state", st)
+	if err := s.cli.KV(s.bkt.learning).Put("state", st); err != nil {
+		return err
+	}
+	// A3: 同时写 vkv 链, 让 as-of 查询能回溯历史学习状态。
+	raw, err := json.Marshal(st)
+	if err == nil {
+		if _, err := s.cli.VersionedKV(s.bkt.learning + "/state").Put(raw); err != nil {
+			log.Printf("[swarm_intel] WARN 学习状态版本链写失败: %v", err)
+		}
+	}
+	return nil
 }
 
 // LoadLearning 读回学习状态; 键不存在返回 (nil, nil)。
+// A3: 默认读最新 (asOf=0); 需要历史版本时调 LoadLearningAsOf。
 func (s *AgentDBStore) LoadLearning() (*LearningState, error) {
+	return s.LoadLearningAsOf(0)
+}
+
+// LoadLearningAsOf A3: 读 as-of 时刻的学习状态。asOfUnixNano=0 等价最新。
+// 优先走 vkv 链 (有版本信息); 链未命中回退普通 KV (v2 兼容, PUT /v1/kv 写入的初始数据)。
+func (s *AgentDBStore) LoadLearningAsOf(asOfUnixNano int64) (*LearningState, error) {
+	entry, err := s.cli.VersionedKV(s.bkt.learning + "/state").Get(asOfUnixNano)
+	if err == nil && entry != nil {
+		var st LearningState
+		if err := json.Unmarshal(entry.Value, &st); err == nil {
+			return &st, nil
+		}
+	}
+	// vkv 未命中 (早期写入没有链): 回退普通 KV
 	var st LearningState
 	ok, err := s.cli.KV(s.bkt.learning).Get("state", &st)
 	if err != nil || !ok {
