@@ -17,7 +17,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -697,8 +696,8 @@ func (s *AgentDBStore) FindSimilar(question string, limit int) ([]*PredictionRec
 	// 窗口过窄会把真正同类的命中挤出 —— 服务端有 tag filter 后再收紧)
 	hits, err := s.sem.SearchMemory(context.Background(), question, limit*4, 0)
 	if err == nil && len(hits) > 0 {
-		// 按 score 排序取 top-N
-		sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
+		// 服务端已按混合 relevance 降序返回, 不得本地重排:
+		// MemoryHit.Score 是余弦**距离** (越小越相似), 按它降序等于最差优先。
 		var result []*PredictionRecord
 		for i, h := range hits {
 			if limit > 0 && i >= limit {
@@ -779,7 +778,6 @@ func (s *AgentDBStore) indexReasoningMemory(entry *ReasoningEntry) {
 func (s *AgentDBStore) SearchReasonings(query string, limit int) ([]*ReasoningEntry, error) {
 	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0)
 	if err == nil && len(hits) > 0 {
-		sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
 		var result []*ReasoningEntry
 		for i, h := range hits {
 			if limit > 0 && i >= limit {
@@ -961,7 +959,6 @@ func (s *AgentDBStore) indexReflectionMemory(rec *ReflectionRecord) {
 func (s *AgentDBStore) SearchReflections(query string, limit int) ([]*ReflectionRecord, error) {
 	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0)
 	if err == nil && len(hits) > 0 {
-		sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
 		byID, err := s.readAllReflectionsByID()
 		if err == nil {
 			var result []*ReflectionRecord
@@ -1064,7 +1061,6 @@ func (s *AgentDBStore) FindTrails(query string, limit int) ([]*PheromoneTrail, e
 	}
 	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0)
 	if err == nil && len(hits) > 0 {
-		sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
 		var result []*PheromoneTrail
 		for i, h := range hits {
 			if limit > 0 && i >= limit {
