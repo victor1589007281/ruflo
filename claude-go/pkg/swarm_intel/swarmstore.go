@@ -594,6 +594,7 @@ func (s *AgentDBStore) indexTrailMemory(domain string, trails []*PheromoneTrail)
 			content = t.Hypothesis + " | " + strings.Join(t.Evidence, " / ")
 		}
 		if _, err := s.sem.StoreMemory(context.Background(), agentdbsemantic.Memory{
+			ID:        t.HypothesisID, // MemoryHit.ID 返回记录 ID, 用作向量命中→信素重联键
 			Content:   content,
 			Type:      agentdbsemantic.MemorySemantic,
 			SessionID: t.HypothesisID,
@@ -639,6 +640,7 @@ func (s *AgentDBStore) indexPredictionMemory(rec *PredictionRecord) {
 		content = rec.Question + " | " + strings.Join(outcomes, " / ")
 	}
 	if _, err := s.sem.StoreMemory(context.Background(), agentdbsemantic.Memory{
+		ID:        rec.ID, // MemoryHit.ID 返回记录 ID, 用作向量命中→预测记录重联键
 		Content:   content,
 		Type:      agentdbsemantic.MemorySemantic,
 		SessionID: rec.ID,
@@ -762,9 +764,10 @@ func (s *AgentDBStore) indexReasoningMemory(entry *ReasoningEntry) {
 		content = entry.Question + " | " + entry.Reasoning
 	}
 	if _, err := s.sem.StoreMemory(context.Background(), agentdbsemantic.Memory{
+		ID:        entry.Question, // 用 question 做 ID=去重键 (重复推理覆盖) + 向量命中重联键
 		Content:   content,
 		Type:      agentdbsemantic.MemorySemantic,
-		SessionID: entry.Question, // 用 question 做去重键 (同一问题重复推理会覆盖)
+		SessionID: entry.Question,
 		Tags:      []string{"swarm_reasoning", entry.Question},
 	}); err != nil {
 		log.Printf("[swarm_intel] WARN Memory 向量索引失败 (reasoning): %v", err)
@@ -942,6 +945,7 @@ func (s *AgentDBStore) indexReflectionMemory(rec *ReflectionRecord) {
 		return
 	}
 	if _, err := s.sem.StoreMemory(context.Background(), agentdbsemantic.Memory{
+		ID:        rec.ID, // MemoryHit.ID 返回记录 ID, 用作向量命中→反思记录重联键
 		Content:   rec.Question + " | " + rec.Lesson,
 		Type:      agentdbsemantic.MemorySemantic,
 		SessionID: rec.ID,
