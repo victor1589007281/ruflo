@@ -573,6 +573,7 @@ func (e *Engine) persistResults(domain *PredictionDomain, result *FusedPredictio
 		log.Printf("[swarm_intel] WARN 预测历史持久化失败: %v", err)
 	} else {
 		// E1: 登记未决预测, 外部 (webapp/aiops) 拿到真实结局后调 RegisterResolution(predID, 结局) 核销。
+		result.ID = rec.ID // 结果 JSON 带 ID, 外部 (webapp/aiops) 才能按 ID 回填核销
 		e.registerPending(rec.ID, result)
 	}
 

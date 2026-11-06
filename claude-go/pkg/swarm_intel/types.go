@@ -38,6 +38,7 @@ type AgentPrediction struct {
 
 // FusedPrediction 融合后的最终预测。
 type FusedPrediction struct {
+	ID             string              `json:"id,omitempty"` // persistResults 落库时盖 pred-<unixms>, 供外部按 ID 核销 (RegisterResolution)
 	Question       string              `json:"question"`
 	Outcomes       []OutcomePrediction `json:"outcomes"`
 	Consensus      float64             `json:"consensus"`   // 0-1 共识度

@@ -6497,12 +6497,23 @@ func swarmCmd() *cobra.Command {
 	simulateCmd.Flags().IntVar(&simRounds, "rounds", 3, "模拟轮数")
 
 	var histN int
+	// 离线引擎: 不 buildEngine (不调 LLM), 但存储后端遵循 SWARM_STORE/AGENTDB_URL env,
+	// 与 predict 路径同一个库 —— history/resolve 看到的就是 predict 写的那一份。
+	newSwarmOfflineEngine := func() *swarmintel.Engine {
+		siCfg := swarmintel.DefaultConfig()
+		if v := strings.TrimSpace(os.Getenv("SWARM_STORE")); v != "" {
+			siCfg.StoreBackend = v
+		}
+		if v := strings.TrimSpace(os.Getenv("AGENTDB_URL")); v != "" {
+			siCfg.AgentDBURL = v
+		}
+		return swarmintel.NewEngine(noopSwarmLLM{}, siCfg)
+	}
 	historyCmd := &cobra.Command{
 		Use:   "history",
 		Short: "查看最近的预测历史 (离线, 不调用 LLM)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			siCfg := swarmintel.DefaultConfig()
-			si := swarmintel.NewEngine(noopSwarmLLM{}, siCfg)
+			si := newSwarmOfflineEngine()
 			records, err := si.GetHistory(histN)
 			if err != nil {
 				return fmt.Errorf("读取历史失败: %w", err)
@@ -6522,8 +6533,30 @@ func swarmCmd() *cobra.Command {
 	}
 	historyCmd.Flags().IntVar(&histN, "n", 20, "返回条数")
 
+	// E1 学习闭环回填: webapp/aiops 拿到真实结局后按预测 ID 核销。
+	// 例: claude-go swarm resolve pred-1730889600000 "会退化" --json
+	resolveCmd := &cobra.Command{
+		Use:   "resolve <predID> <实际结局>",
+		Short: "登记预测的实际结局, 驱动跨会话学习 (离线, 不调用 LLM)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			si := newSwarmOfflineEngine()
+			brier := si.RegisterResolution(args[0], args[1])
+			if jsonOut {
+				return emitJSON(map[string]any{"pred_id": args[0], "actual_outcome": args[1], "brier": brier})
+			}
+			if brier == 0 {
+				fmt.Println("未核销: predID 未知、已核销或结局为空 (静默跳过, 可安全重试)")
+				return nil
+			}
+			fmt.Printf("已核销 %s → %s (Brier %.3f)\n", args[0], args[1], brier)
+			return nil
+		},
+	}
+
 	cmd.AddCommand(predictCmd)
 	cmd.AddCommand(simulateCmd)
 	cmd.AddCommand(historyCmd)
+	cmd.AddCommand(resolveCmd)
 	return cmd
 }
