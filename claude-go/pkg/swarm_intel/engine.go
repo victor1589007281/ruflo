@@ -1001,11 +1001,21 @@ func (e *Engine) takePending(predID string) *FusedPrediction {
 	return p
 }
 
+// resolvedMarker 核销标记查询接口: agentDB 骨架用 KV sidecar 判已决,
+// JSONL 用原地改写的 Resolved 字段 (RecentPredictions 返回时已经是最新状态)。
+type resolvedMarker interface {
+	isResolved(id string) bool
+}
+
 // reconstructPending 跨重启兜底: 引擎重启后 pending 已失, 从存储按 ID 找回未决记录
 // 并重建 FusedPrediction (Agents 已随 PredictionRecord 持久化, 信任/路由可正常更新)。
+// 幂等守卫: 追加型后端 (agentDB) 用 KV sidecar 判已决, 防止重复核销双重学习污染。
 func (e *Engine) reconstructPending(predID string) *FusedPrediction {
 	if e.store == nil {
 		return nil
+	}
+	if rm, ok := e.store.(resolvedMarker); ok && rm.isResolved(predID) {
+		return nil // 已核销 (sidecar 标记), 静默跳过
 	}
 	recs, err := e.store.RecentPredictions(pendingLookupLimit)
 	if err != nil {
@@ -1014,6 +1024,7 @@ func (e *Engine) reconstructPending(predID string) *FusedPrediction {
 	for _, rec := range recs {
 		if rec.ID == predID && !rec.Resolved {
 			return &FusedPrediction{
+				ID:        rec.ID, // 传递原 ID: appendResolvedRecord 据此原地标记已决 (幂等守卫)
 				Question:  rec.Question,
 				Outcomes:  rec.Outcomes,
 				Consensus: rec.Consensus,

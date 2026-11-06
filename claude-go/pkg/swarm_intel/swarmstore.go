@@ -1130,11 +1130,23 @@ func (s *AgentDBStore) loadAllTrailsByID() (map[string]*PheromoneTrail, error) {
 	return byHID, nil
 }
 
-// ResolvePrediction agentDB 骨架未实现: 日志桶追加型, 无原地改写端点。
-// 返回错误让调用方退回"追加一条 resolved 记录"的兼容路径。
-// TODO(v3): 若 serve 增加日志桶 rewrite/CAS 端点, 在此实现原地回填。
+// ResolvePrediction agentDB 实现: 预测日志桶是追加型, 无法原地改写。
+// 改用 KV sidecar 桶 (swarm_intel_resolved) 按 predID 存核销标记;
+// reconstructPending 查日志后先看 sidecar, 已决即跳过 — 幂等守卫。
 func (s *AgentDBStore) ResolvePrediction(id, actual string, brier float64, resolvedAt time.Time) error {
-	return fmt.Errorf("agentdb: ResolvePrediction 未实现 (追加型日志桶), 请走追加 resolved 记录路径")
+	mark := map[string]any{
+		"actual_outcome": actual,
+		"brier":          brier,
+		"resolved_at":    resolvedAt.UTC().Format(time.RFC3339),
+	}
+	return s.cli.KV(s.bkt.predict + "_resolved").Put(id, mark)
+}
+
+// isResolved 查 KV sidecar: 该预测是否已核销 (幂等守卫, reconstructPending 用)。
+func (s *AgentDBStore) isResolved(id string) bool {
+	var mark map[string]any
+	found, err := s.cli.KV(s.bkt.predict + "_resolved").Get(id, &mark)
+	return err == nil && found
 }
 
 // isNotFoundErr 判定 agentdbclient 错误是否为 404 (桶/键不存在的唯一可识别特征)。

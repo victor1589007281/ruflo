@@ -261,6 +261,8 @@ func (e *Engine) appendReflection(pred *FusedPrediction, actualOutcome string, b
 
 // appendResolvedRecord #5: 追加一条 resolved 预测记录 (兼容路径; 已随 Agents 持久化,
 // 未来 FindSimilar/RegisterResolution 都能拿到完整的各分析师预测)。
+// 幂等关键: 追加后必须原地标记原记录为已决 — 否则 reconstructPending 会再次
+// 找到同一条 "未决" 记录, 重复核销造成双重学习污染 (meanBrier/信任被刷两次)。
 func (e *Engine) appendResolvedRecord(pred *FusedPrediction, actualOutcome string, brier float64) {
 	if e.store == nil {
 		return
@@ -280,6 +282,15 @@ func (e *Engine) appendResolvedRecord(pred *FusedPrediction, actualOutcome strin
 		ResolvedAt:  &now,
 	}); err != nil {
 		log.Printf("[swarm_intel] WARN 已决记录持久化失败: %v", err)
+	}
+	// 原地标记原 pending 记录为已决 (agentDB 骨架的 ResolvePrediction 返回未实现,
+	// JSONL store 则真正改写 history.jsonl); 失败仅告警 — 主存储 (resolved 记录) 已落。
+	if pred.ID != "" {
+		if r, ok := e.store.(predictionResolver); ok {
+			if err := r.ResolvePrediction(pred.ID, actualOutcome, brier, now); err != nil {
+				log.Printf("[swarm_intel] WARN 原记录标记已决失败 (idempotency guard): %v", err)
+			}
+		}
 	}
 	e.storeResolvedReasoning(pred, actualOutcome, brier)
 }

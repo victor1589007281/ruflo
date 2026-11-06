@@ -244,11 +244,17 @@ func suiteResolvePrediction(t *testing.T, s SwarmStore) {
 	if !ok {
 		t.Skip("后端未实现 predictionResolver, 跳过原地回填用例")
 	}
-	// AgentDBStore 骨架: 追加型日志桶无原地改写端点, 必须显式报"未实现",
-	// 调用方 (Engine.RegisterResolution) 据此退回"追加 resolved 记录"路径。
-	if _, isAdb := s.(*AgentDBStore); isAdb {
-		if err := r.ResolvePrediction("pending-1", "结局A", 0.25, time.Now()); err == nil {
-			t.Fatalf("agentDB 骨架的 ResolvePrediction 应返回未实现错误")
+	// AgentDBStore: ResolvePrediction 走 KV sidecar (非原地改写日志桶)。
+	// 验证: 写入 sidecar 后 isResolved 返回 true; 未核销的 ID 返回 false。
+	if adb, isAdb := s.(*AgentDBStore); isAdb {
+		if err := r.ResolvePrediction("pending-1", "结局A", 0.25, time.Now()); err != nil {
+			t.Fatalf("agentDB ResolvePrediction (KV sidecar): %v", err)
+		}
+		if !adb.isResolved("pending-1") {
+			t.Fatal("isResolved 应返回 true (sidecar 已标记)")
+		}
+		if adb.isResolved("never-resolved") {
+			t.Fatal("isResolved 对未核销 ID 应返回 false")
 		}
 		return
 	}
