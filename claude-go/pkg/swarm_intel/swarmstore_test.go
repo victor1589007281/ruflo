@@ -33,7 +33,7 @@ func newAgentDBTestServer(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.New(server.Backends{Store: st, Leases: lm})
+	srv := server.New(server.Backends{Store: st, Leases: lm, KV: kvDB})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	t.Cleanup(func() { kvDB.Close() })
@@ -89,6 +89,8 @@ func runSwarmStoreSuite(t *testing.T, s SwarmStore) {
 	t.Run("LearningRoundTrip", func(t *testing.T) { suiteLearning(t, s) })
 	t.Run("SimEventsFilterByRun", func(t *testing.T) { suiteSimEvents(t, s) })
 	t.Run("ResolvePrediction", func(t *testing.T) { suiteResolvePrediction(t, s) })
+	t.Run("ReflectionsRoundTrip", func(t *testing.T) { suiteReflections(t, s) })
+	t.Run("FindTrailsNearDomain", func(t *testing.T) { suiteFindTrails(t, s) })
 }
 
 func suiteTrails(t *testing.T, s SwarmStore) {
@@ -413,5 +415,68 @@ func TestAgentDBStoreFilteredANN(t *testing.T) {
 	}
 	if len(rhits) == 0 || rhits[0].Reasoning != "r-ann" {
 		t.Fatalf("回退应命中 r-ann, 实际 %+v", rhits)
+	}
+}
+
+// suiteReflections W1 Phase 3 跨会话反思: 追加 → 关键词命中往返。
+// AgentDB 后端走 A6 事件流 (newAgentDBTestServer 已装配 KV), JSONL 走 reflections.jsonl;
+// 测试 server 无 Memory 后端, SearchReflections 自动走关键词回退路径 —— 与生产
+// 向量桶冷启动时的行为一致。
+func suiteReflections(t *testing.T, s SwarmStore) {
+	rec := &ReflectionRecord{
+		ID:        "refl-test-1",
+		Domain:    "binary/unknown",
+		Question:  "数据库主库切换会不会丢数据",
+		TopPick:   "不会丢数据",
+		TopProb:   0.82,
+		Actual:    "丢了 3 条 binlog",
+		Brier:     0.67,
+		Lesson:    "预测偏差: 高估「不会丢数据」(P=0.82), 低估「丢了 3 条 binlog」(实给 P=0.05)。",
+		CreatedAt: time.Now(),
+	}
+	if err := s.AppendReflection(rec); err != nil {
+		t.Fatalf("AppendReflection: %v", err)
+	}
+	hits, err := s.SearchReflections("数据库 切换 丢数据", 5)
+	if err != nil {
+		t.Fatalf("SearchReflections: %v", err)
+	}
+	if len(hits) == 0 || hits[0].ID != "refl-test-1" {
+		t.Fatalf("应命中 refl-test-1, 实际 %+v", hits)
+	}
+	// 无关查询: 空集不是错误
+	none, err := s.SearchReflections("完全无关的量子烹饪问题", 5)
+	if err != nil || len(none) != 0 {
+		t.Fatalf("无关查询应空集, 实际 %v err=%v", none, err)
+	}
+}
+
+// suiteFindTrails 信素语义化: 近似域先验检索 —— 问题措辞与域内假设不完全相同,
+// 靠关键词重叠 (向量桶的 P0 回退) 跨域命中。
+func suiteFindTrails(t *testing.T, s SwarmStore) {
+	trails := []*PheromoneTrail{
+		{HypothesisID: "h-nd1", Hypothesis: "数据库性能在索引重建期间会退化", Strength: 0.85, LastUpdate: time.Now()},
+		{HypothesisID: "h-nd2", Hypothesis: "缓存命中率下降与突刺流量正相关", Strength: 0.4, LastUpdate: time.Now()},
+	}
+	if err := s.SaveTrails("categorical", trails); err != nil {
+		t.Fatalf("SaveTrails: %v", err)
+	}
+	// 查询词与假设措辞不同但语义接近 (近似域)
+	hits, err := s.FindTrails("数据库 性能 监控 退化", 5)
+	if err != nil {
+		t.Fatalf("FindTrails: %v", err)
+	}
+	if len(hits) == 0 || hits[0].HypothesisID != "h-nd1" {
+		t.Fatalf("应优先命中 h-nd1, 实际 %+v", hits)
+	}
+	// 精确域 LoadTrails 不受影响 (旧语义保留)
+	exact, err := s.LoadTrails("categorical")
+	if err != nil || len(exact) != 2 {
+		t.Fatalf("LoadTrails 应仍返回 2 条精确域信素, 实际 %d err=%v", len(exact), err)
+	}
+	// 无关查询空集
+	none, err := s.FindTrails("月球背面奶酪产量", 5)
+	if err != nil || len(none) != 0 {
+		t.Fatalf("无关查询应空集, 实际 %v err=%v", none, err)
 	}
 }

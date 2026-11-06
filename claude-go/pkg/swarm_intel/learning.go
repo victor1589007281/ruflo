@@ -202,6 +202,7 @@ func (e *Engine) RecordOutcome(pred *FusedPrediction, actualOutcome string) floa
 	brier := ComputeBrierScore(pred, actualOutcome)
 	e.appendResolvedRecord(pred, actualOutcome, brier)
 	e.applyOutcomeLearning(pred, actualOutcome, brier)
+	e.appendReflection(pred, actualOutcome, brier)
 	return brier
 }
 
@@ -238,7 +239,24 @@ func (e *Engine) RegisterResolution(predID, actualOutcome string) float64 {
 		e.appendResolvedRecord(pred, actualOutcome, brier)
 	}
 	e.applyOutcomeLearning(pred, actualOutcome, brier)
+	e.appendReflection(pred, actualOutcome, brier)
 	return brier
+}
+
+// appendReflection W1 Phase 3 跨会话反思: 结局入库时同步写一条结构化反思
+// (A6 事件流 + 向量桶), Predict 的 Scout 阶段据此检索"同域历史反思"注入先验。
+// 仅 warn 不回滚: 反思是增强路径, 学习闭环的主存储 (已决记录+学习状态) 已先落。
+func (e *Engine) appendReflection(pred *FusedPrediction, actualOutcome string, brier float64) {
+	if e.store == nil {
+		return
+	}
+	rec := composeReflection(pred, actualOutcome, brier, time.Now())
+	if rec == nil {
+		return
+	}
+	if err := e.store.AppendReflection(rec); err != nil {
+		log.Printf("[swarm_intel] WARN 反思持久化失败: %v", err)
+	}
 }
 
 // appendResolvedRecord #5: 追加一条 resolved 预测记录 (兼容路径; 已随 Agents 持久化,

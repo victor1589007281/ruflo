@@ -58,6 +58,15 @@ type SwarmStore interface {
 	// 模拟事件
 	AppendSimEvent(ev *SimEvent) error
 	SimEvents(runID string) ([]*SimEvent, error)
+
+	// 跨会话反思 (W1 Phase 3, tau2 式): RecordOutcome/RegisterResolution 落结构化反思,
+	// Predict 检索同域历史反思注入先验 (向量优先, 关键词回退, 同 Filtered ANN 哲学)。
+	AppendReflection(rec *ReflectionRecord) error
+	SearchReflections(query string, limit int) ([]*ReflectionRecord, error)
+
+	// 信素语义化 (W1 Phase 3): 跨域近似先验检索 —— 不再要求 domain 精确相等,
+	// 按问题语义找历史上"近似域"的高强度信素 (向量优先, 关键词回退)。
+	FindTrails(query string, limit int) ([]*PheromoneTrail, error)
 }
 
 // predictionResolver 可选接口: 后端支持按 ID 原地回填"已决结局"时实现。
@@ -304,6 +313,7 @@ func (s *JSONLStore) SimEvents(runID string) ([]*SimEvent, error) {
 // ResolvePrediction 按 ID 原地回填已决结局: 重写 history.jsonl 中匹配的记录
 // (标 Resolved/ActualLabel/BrierScore/ResolvedAt)。找不到 ID 返回错误。
 func (s *JSONLStore) ResolvePrediction(id, actual string, brier float64, resolvedAt time.Time) error {
+
 	s.history.mu.Lock()
 	defer s.history.mu.Unlock()
 	data, err := os.ReadFile(s.history.file)
@@ -350,8 +360,139 @@ func (s *JSONLStore) ResolvePrediction(id, actual string, brier float64, resolve
 	return os.Rename(tmp, s.history.file)
 }
 
-// ── agentDB 后端 (集群骨架) ──
+// ── JSONL 后端: W1 Phase 3 (跨会话反思 + 信素语义化) ──
 
+// reflectionsPath 跨会话反思日志路径 (与 reasoning_bank/learning_state 同目录布局)。
+func (s *JSONLStore) reflectionsPath() string {
+	return filepath.Join(s.dir, "learning", "reflections.jsonl")
+}
+
+// AppendReflection 追加一条结构化反思 (append-only, 与预测历史同哲学)。
+func (s *JSONLStore) AppendReflection(rec *ReflectionRecord) error {
+	s.learningMu.Lock()
+	defer s.learningMu.Unlock()
+	p := s.reflectionsPath()
+	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return json.NewEncoder(f).Encode(rec)
+}
+
+// SearchReflections 关键词重叠检索历史反思 (打分区 = Question + Lesson)。
+func (s *JSONLStore) SearchReflections(query string, limit int) ([]*ReflectionRecord, error) {
+	s.learningMu.Lock()
+	defer s.learningMu.Unlock()
+	data, err := os.ReadFile(s.reflectionsPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	words := strings.Fields(strings.ToLower(query))
+	type scored struct {
+		rec   *ReflectionRecord
+		score float64
+	}
+	var candidates []scored
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec ReflectionRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		text := strings.ToLower(rec.Question + " " + rec.Lesson)
+		if score := keywordScore(words, text); score > 0.3 {
+			candidates = append(candidates, scored{rec: &rec, score: score})
+		}
+	}
+	for i := 0; i < len(candidates); i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].score > candidates[i].score {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+	var result []*ReflectionRecord
+	for i, c := range candidates {
+		if limit > 0 && i >= limit {
+			break
+		}
+		result = append(result, c.rec)
+	}
+	return result, nil
+}
+
+// FindTrails 跨域关键词检索信素先验: 扫描全部域文件, 按 Hypothesis+Evidence
+// 与问题的重叠率打分, 返回 top-N (近似域先验的 P0 形态; 向量版见 AgentDBStore)。
+func (s *JSONLStore) FindTrails(query string, limit int) ([]*PheromoneTrail, error) {
+	entries, err := os.ReadDir(s.trails.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	words := strings.Fields(strings.ToLower(query))
+	type scored struct {
+		trail *PheromoneTrail
+		score float64
+	}
+	var candidates []scored
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.trails.dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		seen := make(map[string]bool) // 域文件内同一 HypothesisID 只计最后一次
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var t PheromoneTrail
+			if err := json.Unmarshal([]byte(line), &t); err != nil {
+				continue
+			}
+			if seen[t.HypothesisID] {
+				continue
+			}
+			seen[t.HypothesisID] = true
+			text := strings.ToLower(t.Hypothesis + " " + strings.Join(t.Evidence, " "))
+			if score := keywordScore(words, text); score > 0.3 {
+				candidates = append(candidates, scored{trail: &t, score: score})
+			}
+		}
+	}
+	for i := 0; i < len(candidates); i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].score > candidates[i].score {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+	var result []*PheromoneTrail
+	for i, c := range candidates {
+		if limit > 0 && i >= limit {
+			break
+		}
+		result = append(result, c.trail)
+	}
+	return result, nil
+}
+
+// ── agentDB 后端 (集群骨架) ──
 // AgentDBStore 基于 agentDB serve (HTTP 数据面) 的 SwarmStore 实现。
 //
 // 键值映射策略 (P0):
@@ -380,11 +521,12 @@ type AgentDBStore struct {
 
 // agentDBBuckets 按 ns 前缀构造的实际桶名 (A7 硬隔离)。
 type agentDBBuckets struct {
-	trails   string
-	learning string
-	predict  string
-	reason   string
-	sim      string
+	trails      string
+	learning    string
+	predict     string
+	reason      string
+	sim         string
+	reflections string // A6 事件流名 (非 agentstore 桶, 同样吃 ns 前缀做隔离)
 }
 
 // newAgentDBBuckets 由 ns 构造五类桶名; ns 为空时回落 "default"。
@@ -393,11 +535,12 @@ func newAgentDBBuckets(ns string) agentDBBuckets {
 		ns = "default"
 	}
 	return agentDBBuckets{
-		trails:   ns + "_swarm_intel_trails",
-		learning: ns + "_swarm_intel_learning",
-		predict:  ns + "_swarm_intel_predictions",
-		reason:   ns + "_swarm_intel_reasonings",
-		sim:      ns + "_swarm_intel_sim_events",
+		trails:      ns + "_swarm_intel_trails",
+		learning:    ns + "_swarm_intel_learning",
+		predict:     ns + "_swarm_intel_predictions",
+		reason:      ns + "_swarm_intel_reasonings",
+		sim:         ns + "_swarm_intel_sim_events",
+		reflections: ns + "_swarm_intel_reflections",
 	}
 }
 
@@ -425,9 +568,40 @@ func NewAgentDBStore(baseURL string) (*AgentDBStore, error) {
 	}, nil
 }
 
-// SaveTrails 把领域信素快照整存到 KV (batch 写)。
+// SaveTrails 把领域信素快照整存到 KV (batch 写) + Memory 向量桶双写 (信素语义化)。
+// 向量索引失败仅 warn: FindTrails 会自动回退跨域关键词扫描, 不影响主存储。
 func (s *AgentDBStore) SaveTrails(domain string, trails []*PheromoneTrail) error {
-	return s.cli.KV(s.bkt.trails).Put(safeDomainKey(domain), trails)
+	if err := s.cli.KV(s.bkt.trails).Put(safeDomainKey(domain), trails); err != nil {
+		return err
+	}
+	s.indexTrailMemory(domain, trails)
+	return nil
+}
+
+// indexTrailMemory 把信素假设逐条索引进 Memory 向量桶 (信素语义化写入侧)。
+// SessionID = HypothesisID (跨域唯一, 用作向量命中 → 信素记录的重联键);
+// Tags 带域键, 供未来 serve 侧 tag-filter 检索预留 (当前客户端命中后重联)。
+func (s *AgentDBStore) indexTrailMemory(domain string, trails []*PheromoneTrail) {
+	if s.sem == nil {
+		return
+	}
+	for _, t := range trails {
+		if t == nil || t.Hypothesis == "" {
+			continue
+		}
+		content := t.Hypothesis
+		if len(t.Evidence) > 0 {
+			content = t.Hypothesis + " | " + strings.Join(t.Evidence, " / ")
+		}
+		if _, err := s.sem.StoreMemory(context.Background(), agentdbsemantic.Memory{
+			Content:   content,
+			Type:      agentdbsemantic.MemorySemantic,
+			SessionID: t.HypothesisID,
+			Tags:      []string{"swarm_trail", safeDomainKey(domain), t.HypothesisID},
+		}); err != nil {
+			log.Printf("[swarm_intel] WARN Memory 向量索引失败 (trail %s): %v", t.HypothesisID, err)
+		}
+	}
 }
 
 // LoadTrails 读取领域信素快照; 键不存在返回空。
@@ -742,6 +916,217 @@ func (s *AgentDBStore) SimEvents(runID string) ([]*SimEvent, error) {
 		return nil, err
 	}
 	return events, nil
+}
+
+// ── AgentDB 后端: W1 Phase 3 (跨会话反思 + 信素语义化) ──
+
+// AppendReflection 追加一条结构化反思: A6 事件流 (主存储, append-only) +
+// Memory 向量桶双写 (语义检索增强, 失败仅 warn)。
+func (s *AgentDBStore) AppendReflection(rec *ReflectionRecord) error {
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if _, err := s.cli.EventLog(s.bkt.reflections).Append(raw); err != nil {
+		return err
+	}
+	s.indexReflectionMemory(rec)
+	return nil
+}
+
+// indexReflectionMemory 把反思索引进 Memory 向量桶 (检索侧用 SessionID=rec.ID 重联)。
+func (s *AgentDBStore) indexReflectionMemory(rec *ReflectionRecord) {
+	if s.sem == nil || rec == nil || rec.Question == "" {
+		return
+	}
+	if _, err := s.sem.StoreMemory(context.Background(), agentdbsemantic.Memory{
+		Content:   rec.Question + " | " + rec.Lesson,
+		Type:      agentdbsemantic.MemorySemantic,
+		SessionID: rec.ID,
+		Tags:      []string{"swarm_reflection", rec.Domain, rec.ID},
+	}); err != nil {
+		log.Printf("[swarm_intel] WARN Memory 向量索引失败 (reflection %s): %v", rec.ID, err)
+	}
+}
+
+// SearchReflections 语义向量检索同域历史反思 (Filtered ANN 同款回退哲学):
+// 优先 SearchMemory 命中 → 用 rec.ID 重联事件流里的完整记录; 不可达或零命中
+// 时回退全量事件流的关键词重叠打分。
+func (s *AgentDBStore) SearchReflections(query string, limit int) ([]*ReflectionRecord, error) {
+	hits, err := s.sem.SearchMemory(context.Background(), query, limit*2, 0)
+	if err == nil && len(hits) > 0 {
+		sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
+		byID, err := s.readAllReflectionsByID()
+		if err == nil {
+			var result []*ReflectionRecord
+			for i, h := range hits {
+				if limit > 0 && i >= limit {
+					break
+				}
+				if rec := byID[h.ID]; rec != nil {
+					result = append(result, rec)
+				}
+			}
+			if len(result) > 0 {
+				return result, nil
+			}
+		}
+		// 向量命中但重联失败 (事件流缺记录): 继续走关键词回退, 不静默丢检索能力。
+	}
+	// 回退: 全量事件流关键词打分 (P0 行为, 向量桶冷启动/不可达时仍可工作)。
+	all, err := s.readAllReflections()
+	if err != nil {
+		return nil, err
+	}
+	words := strings.Fields(strings.ToLower(query))
+	type scored struct {
+		rec   *ReflectionRecord
+		score float64
+	}
+	var candidates []scored
+	for _, rec := range all {
+		text := strings.ToLower(rec.Question + " " + rec.Lesson)
+		if score := keywordScore(words, text); score > 0.3 {
+			candidates = append(candidates, scored{rec: rec, score: score})
+		}
+	}
+	for i := 0; i < len(candidates); i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].score > candidates[i].score {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+	var result []*ReflectionRecord
+	for i, c := range candidates {
+		if limit > 0 && i >= limit {
+			break
+		}
+		result = append(result, c.rec)
+	}
+	return result, nil
+}
+
+// readAllReflections 游标循环拉全量反思事件 (A6 每次最多 1000 条, 循环续读)。
+// 反思体量小 (每本预测一条), 全量拉取是刻意的简单性取舍。
+func (s *AgentDBStore) readAllReflections() ([]*ReflectionRecord, error) {
+	el := s.cli.EventLog(s.bkt.reflections)
+	var all []*ReflectionRecord
+	since := int64(0)
+	for i := 0; i < 100; i++ { // 10 万条硬护栏, 超过说明该上分页消费
+		events, next, err := el.Read(since, 1000)
+		if err != nil {
+			if isNotFoundErr(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		for _, e := range events {
+			var rec ReflectionRecord
+			if err := json.Unmarshal(e.Payload, &rec); err == nil {
+				all = append(all, &rec)
+			}
+		}
+		if len(events) == 0 {
+			return all, nil
+		}
+		since = next
+	}
+	return all, fmt.Errorf("reflections stream exceeds 100k events, cursor loop aborted")
+}
+
+// readAllReflectionsByID 读全量反思并按 ID 建索引 (向量命中 → 完整记录重联)。
+func (s *AgentDBStore) readAllReflectionsByID() (map[string]*ReflectionRecord, error) {
+	all, err := s.readAllReflections()
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]*ReflectionRecord, len(all))
+	for _, rec := range all {
+		byID[rec.ID] = rec
+	}
+	return byID, nil
+}
+
+// FindTrails 跨域近似信素先验检索 (信素语义化检索侧):
+// 优先 SearchMemory 向量命中 → 按 HypothesisID 重联各域快照; 不可达或零命中
+// 时回退全域快照的关键词重叠打分。
+func (s *AgentDBStore) FindTrails(query string, limit int) ([]*PheromoneTrail, error) {
+	byHID, err := s.loadAllTrailsByID()
+	if err != nil {
+		return nil, err
+	}
+	hits, err := s.sem.SearchMemory(context.Background(), query, limit*2, 0)
+	if err == nil && len(hits) > 0 {
+		sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
+		var result []*PheromoneTrail
+		for i, h := range hits {
+			if limit > 0 && i >= limit {
+				break
+			}
+			if t := byHID[h.ID]; t != nil {
+				result = append(result, t)
+			}
+		}
+		if len(result) > 0 {
+			return result, nil
+		}
+	}
+	// 回退: 全域关键词打分 (P0 行为)。
+	words := strings.Fields(strings.ToLower(query))
+	type scored struct {
+		trail *PheromoneTrail
+		score float64
+	}
+	var candidates []scored
+	for _, t := range byHID {
+		text := strings.ToLower(t.Hypothesis + " " + strings.Join(t.Evidence, " "))
+		if score := keywordScore(words, text); score > 0.3 {
+			candidates = append(candidates, scored{trail: t, score: score})
+		}
+	}
+	for i := 0; i < len(candidates); i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].score > candidates[i].score {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+	var result []*PheromoneTrail
+	for i, c := range candidates {
+		if limit > 0 && i >= limit {
+			break
+		}
+		result = append(result, c.trail)
+	}
+	return result, nil
+}
+
+// loadAllTrailsByID 列出信素 KV 桶全部域键, 加载所有快照, 按 HypothesisID 建索引。
+// 信素体量小 (每域数十条), 全量加载是刻意的简单性取舍; 域数膨胀后再引入
+// 向量桶直出重构 (MemoryHit 已带 Content, 可免重联)。
+func (s *AgentDBStore) loadAllTrailsByID() (map[string]*PheromoneTrail, error) {
+	keys, err := s.cli.KV(s.bkt.trails).Keys()
+	if err != nil {
+		if isNotFoundErr(err) {
+			return map[string]*PheromoneTrail{}, nil
+		}
+		return nil, err
+	}
+	byHID := make(map[string]*PheromoneTrail)
+	for _, key := range keys {
+		var trails []*PheromoneTrail
+		ok, err := s.cli.KV(s.bkt.trails).Get(key, &trails)
+		if err != nil || !ok {
+			continue
+		}
+		for _, t := range trails {
+			if t != nil {
+				byHID[t.HypothesisID] = t
+			}
+		}
+	}
+	return byHID, nil
 }
 
 // ResolvePrediction agentDB 骨架未实现: 日志桶追加型, 无原地改写端点。

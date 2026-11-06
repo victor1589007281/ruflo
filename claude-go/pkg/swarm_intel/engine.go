@@ -260,6 +260,26 @@ func (e *Engine) Predict(ctx context.Context, chatID, objective string) (*FusedP
 	if priorReasoning != "" {
 		evidence = append(evidence, "历史推理参考:\n"+priorReasoning)
 	}
+	// W1 Phase 3: 跨会话反思 + 近似域信素先验注入 (Scout 阶段可查同域历史反思)。
+	// 检索失败静默跳过 —— 冷启动无历史时新预测不受影响。
+	if e.store != nil {
+		if reflections, err := e.store.SearchReflections(domain.Question, 2); err == nil && len(reflections) > 0 {
+			var parts []string
+			for _, r := range reflections {
+				parts = append(parts, fmt.Sprintf("- (Brier %.2f) %s → %s", r.Brier, r.Question, r.Lesson))
+			}
+			evidence = append(evidence, "历史同域反思:\n"+strings.Join(parts, "\n"))
+			e.notify(chatID, fmt.Sprintf("  🪞 注入 %d 条历史反思", len(reflections)))
+		}
+		if trails, err := e.store.FindTrails(domain.Question, 3); err == nil && len(trails) > 0 {
+			var parts []string
+			for _, t := range trails {
+				parts = append(parts, fmt.Sprintf("- %s (强度 %.2f)", t.Hypothesis, t.Strength))
+			}
+			evidence = append(evidence, "近似域信素先验:\n"+strings.Join(parts, "\n"))
+			e.notify(chatID, fmt.Sprintf("  🐜 注入 %d 条近似域信素", len(trails)))
+		}
+	}
 	e.notify(chatID, fmt.Sprintf("  搜集到 %d 条证据", len(evidence)))
 
 	// Phase 3: Predict (独立预测 — M10: 并行化)
