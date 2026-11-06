@@ -691,10 +691,9 @@ type scoredReasoning struct {
 // 优先走 Memory.SearchMemory 向量化命中 (服务端嵌入 question+outcomes); 不可达或
 // 零命中时回退关键词重叠 (与 P0 行为一致, 保证向量桶冷启动时仍可工作)。
 func (s *AgentDBStore) FindSimilar(question string, limit int) ([]*PredictionRecord, error) {
-	// 先取向量命中 (limit*4 留余量: Memory 桶是全局混部,
-	// 预测/推理/信素/反思共用, 非本类命中重联时为 nil 仍占窗口位,
-	// 窗口过窄会把真正同类的命中挤出 —— 服务端有 tag filter 后再收紧)
-	hits, err := s.sem.SearchMemory(context.Background(), question, limit*4, 0)
+	// tag filter 把候选收敛到本类型 (swarm_predict), 重联余量只需覆盖
+	// 旧数据 (4092bf057 之前写入的 md5-ID 记录重联为 nil 仍占窗口位)。
+	hits, err := s.sem.SearchMemory(context.Background(), question, limit*4, 0, "swarm_predict")
 	if err == nil && len(hits) > 0 {
 		// 服务端已按混合 relevance 降序返回, 不得本地重排:
 		// MemoryHit.Score 是余弦**距离** (越小越相似), 按它降序等于最差优先。
@@ -776,7 +775,7 @@ func (s *AgentDBStore) indexReasoningMemory(entry *ReasoningEntry) {
 // SearchReasonings 语义向量检索相似推理路径 (Filtered ANN)。
 // 优先走 Memory.SearchMemory; 不可达或零命中时回退关键词重叠 (与 P0 行为一致)。
 func (s *AgentDBStore) SearchReasonings(query string, limit int) ([]*ReasoningEntry, error) {
-	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0)
+	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0, "swarm_reasoning")
 	if err == nil && len(hits) > 0 {
 		var result []*ReasoningEntry
 		for i, h := range hits {
@@ -957,7 +956,7 @@ func (s *AgentDBStore) indexReflectionMemory(rec *ReflectionRecord) {
 // 优先 SearchMemory 命中 → 用 rec.ID 重联事件流里的完整记录; 不可达或零命中
 // 时回退全量事件流的关键词重叠打分。
 func (s *AgentDBStore) SearchReflections(query string, limit int) ([]*ReflectionRecord, error) {
-	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0)
+	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0, "swarm_reflection")
 	if err == nil && len(hits) > 0 {
 		byID, err := s.readAllReflectionsByID()
 		if err == nil {
@@ -1059,7 +1058,7 @@ func (s *AgentDBStore) FindTrails(query string, limit int) ([]*PheromoneTrail, e
 	if err != nil {
 		return nil, err
 	}
-	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0)
+	hits, err := s.sem.SearchMemory(context.Background(), query, limit*4, 0, "swarm_trail")
 	if err == nil && len(hits) > 0 {
 		var result []*PheromoneTrail
 		for i, h := range hits {

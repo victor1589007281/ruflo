@@ -10,6 +10,7 @@ package swarm_intel
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -21,7 +22,8 @@ import (
 // newVectorProxyServer 把请求反代到真实 agentDB 测试 server, 但拦截
 // /v1/memory/search 返回固定命中 (id=cannedID)。cannedID 必须是调用方
 // 已写入记录的业务键, 重联成功则向量路径应返回该记录。
-func newVectorProxyServer(t *testing.T, cannedID string) string {
+// wantTag 非空时额外校验请求体 tags 携带了该类型标签 (A4 深化契约)。
+func newVectorProxyServer(t *testing.T, cannedID, wantTag string) string {
 	t.Helper()
 	realURL := newAgentDBTestServer(t)
 	target, err := url.Parse(realURL)
@@ -31,6 +33,20 @@ func newVectorProxyServer(t *testing.T, cannedID string) string {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/memory/search" {
+			body, _ := io.ReadAll(r.Body)
+			var req struct {
+				Tags []string `json:"tags"`
+			}
+			_ = json.Unmarshal(body, &req)
+			found := false
+			for _, tg := range req.Tags {
+				if tg == wantTag {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("memory/search 请求 tags=%v 缺类型标签 %q", req.Tags, wantTag)
+			}
 			out := map[string]any{"results": []map[string]any{
 				{"id": cannedID, "content": "canned vector hit", "score": 0.91},
 			}}
@@ -45,7 +61,7 @@ func newVectorProxyServer(t *testing.T, cannedID string) string {
 }
 
 func TestAgentDBStoreVectorRejoinPredictions(t *testing.T) {
-	url := newVectorProxyServer(t, "rej-p1")
+	url := newVectorProxyServer(t, "rej-p1", "swarm_predict")
 	s, err := NewAgentDBStore(url)
 	if err != nil {
 		t.Fatalf("NewAgentDBStore: %v", err)
@@ -63,7 +79,7 @@ func TestAgentDBStoreVectorRejoinPredictions(t *testing.T) {
 }
 
 func TestAgentDBStoreVectorRejoinReflections(t *testing.T) {
-	url := newVectorProxyServer(t, "rej-r1")
+	url := newVectorProxyServer(t, "rej-r1", "swarm_reflection")
 	s, err := NewAgentDBStore(url)
 	if err != nil {
 		t.Fatalf("NewAgentDBStore: %v", err)
@@ -83,7 +99,7 @@ func TestAgentDBStoreVectorRejoinReflections(t *testing.T) {
 }
 
 func TestAgentDBStoreVectorRejoinTrails(t *testing.T) {
-	url := newVectorProxyServer(t, "rej-h1")
+	url := newVectorProxyServer(t, "rej-h1", "swarm_trail")
 	s, err := NewAgentDBStore(url)
 	if err != nil {
 		t.Fatalf("NewAgentDBStore: %v", err)

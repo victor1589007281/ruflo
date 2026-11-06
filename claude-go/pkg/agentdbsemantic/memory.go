@@ -54,20 +54,24 @@ func (c *Client) StoreMemory(ctx context.Context, m Memory) (string, error) {
 
 // SearchMemory 按文本检索记忆 (POST /v1/memory/search, query_text 由 serve 端嵌入)。
 // decayLambda > 0 时按时间衰减融合进排序 (R4-3), 冷记忆权重随时间指数下降。
-func (c *Client) SearchMemory(ctx context.Context, query string, topK int, decayLambda float64) ([]MemoryHit, error) {
+// tags 非空时只召回带任一匹配标签的记忆 (服务端候选阶段过滤, 不占 topK 名额);
+// 混部桶多类型共库时用它保证本类型的检索配额。
+func (c *Client) SearchMemory(ctx context.Context, query string, topK int, decayLambda float64, tags ...string) ([]MemoryHit, error) {
 	return c.search(ctx, memorySearchReq{
 		QueryText: query,
 		TopK:      topK,
 		Decay:     decayLambda,
+		Tags:      tags,
 	})
 }
 
 // SearchMemoryVec 按向量检索记忆 (query 由调用方提供, 需与写入同一向量空间)。
-func (c *Client) SearchMemoryVec(ctx context.Context, query []float32, topK int, decayLambda float64) ([]MemoryHit, error) {
+func (c *Client) SearchMemoryVec(ctx context.Context, query []float32, topK int, decayLambda float64, tags ...string) ([]MemoryHit, error) {
 	return c.search(ctx, memorySearchReq{
 		Query: query,
 		TopK:  topK,
 		Decay: decayLambda,
+		Tags:  tags,
 	})
 }
 
@@ -76,6 +80,7 @@ type memorySearchReq struct {
 	QueryText string    `json:"query_text,omitempty"`
 	TopK      int       `json:"top_k"`
 	Decay     float64   `json:"decay,omitempty"`
+	Tags      []string  `json:"tags,omitempty"`
 }
 
 // search 提交检索请求 (文本或向量) 并解出命中列表, 是 SearchMemory / SearchMemoryVec 的公共实现。
