@@ -6455,7 +6455,7 @@ func swarmCmd() *cobra.Command {
 		},
 	}
 
-	var simMode string
+	var simMode, simDetail string
 	var simAgents, simRounds int
 	simulateCmd := &cobra.Command{
 		Use:   "simulate <场景目标>",
@@ -6468,7 +6468,7 @@ func swarmCmd() *cobra.Command {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
 			defer cancel()
-			cfg := swarmintel.SimulationConfig{Mode: simMode, Agents: simAgents, Rounds: simRounds}
+			cfg := swarmintel.SimulationConfig{Mode: simMode, Agents: simAgents, Rounds: simRounds, Detail: simDetail}
 			result, err := si.Simulate(ctx, "cli", strings.Join(args, " "), cfg)
 			if err != nil {
 				return fmt.Errorf("模拟失败: %w", err)
@@ -6493,6 +6493,7 @@ func swarmCmd() *cobra.Command {
 		},
 	}
 	simulateCmd.Flags().StringVar(&simMode, "mode", "social", "模拟模式: social|game|montecarlo|crisis|org|creative|market|policy|tech")
+	simulateCmd.Flags().StringVar(&simDetail, "detail", "kernel", "引擎档位: kernel=结构化轮次内核 (默认, 8种模式) | fast=单prompt叙事")
 	simulateCmd.Flags().IntVar(&simAgents, "agents", 5, "模拟 Agent 数量")
 	simulateCmd.Flags().IntVar(&simRounds, "rounds", 3, "模拟轮数")
 

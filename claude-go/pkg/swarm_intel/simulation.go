@@ -34,24 +34,31 @@ func NewSimulator(llm LLMClient, notify NotifyFunc) *Simulator {
 func (s *Simulator) SetSimEventRecorder(r SimEventRecorder) { s.simEvents = r }
 
 // Simulate 执行场景模拟。
-// 支持 9 种模式:
-//   - social: 社会模拟
-//   - game: 博弈论
-//   - montecarlo: 蒙特卡洛场景树
-//   - crisis: 危机推演 (新)
-//   - org: 组织/团队动力学 (新)
-//   - creative: 创意涌现 (新)
-//   - market: 市场竞争模拟 (新)
-//   - policy: 政策推演 (新)
-//   - tech: 技术演进推演 (新)
+// 两种引擎, 由 cfg.Detail 选择 (空值默认 kernel):
+//   - kernel (默认): 结构化轮次内核 — spawn → FJ 立场轮次 → 计算涌现检测 → 报告,
+//     适用于 social/game/crisis/org/creative/market/policy/tech 八种模式
+//     (同一套 FJ 数学, modeProfile 只做语言层调味); 产出 trajectory/metric_curves/kernel_detail。
+//   - fast: 各模式的旧单 prompt 叙事, 一次 LLM 调用讲完整个故事 (无过程明细)。
+// montecarlo 不受 Detail 影响: 世界线并行 FanOut 本身就是结构化推演。
 func (s *Simulator) Simulate(ctx context.Context, chatID string, objective string, cfg SimulationConfig) (*SimulationResult, error) {
 	switch cfg.Mode {
-	case "social":
-		return s.socialSimulation(ctx, chatID, objective, cfg)
-	case "game":
-		return s.gameSimulation(ctx, chatID, objective, cfg)
 	case "montecarlo":
 		return s.monteCarloSimulation(ctx, chatID, objective, cfg)
+	case "social", "game", "crisis", "org", "creative", "market", "policy", "tech":
+		if cfg.Detail == "fast" {
+			return s.legacySimulation(ctx, chatID, objective, cfg)
+		}
+		return s.kernelSimulation(ctx, chatID, objective, cfg)
+	default:
+		return s.monteCarloSimulation(ctx, chatID, objective, cfg)
+	}
+}
+
+// legacySimulation Detail=="fast" 时各模式的旧单 prompt 叙事入口。
+func (s *Simulator) legacySimulation(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
+	switch cfg.Mode {
+	case "game":
+		return s.gameSimulation(ctx, chatID, objective, cfg)
 	case "crisis":
 		return s.crisisSimulation(ctx, chatID, objective, cfg)
 	case "org":
@@ -64,29 +71,25 @@ func (s *Simulator) Simulate(ctx context.Context, chatID string, objective strin
 		return s.policySimulation(ctx, chatID, objective, cfg)
 	case "tech":
 		return s.techSimulation(ctx, chatID, objective, cfg)
-	default:
-		return s.monteCarloSimulation(ctx, chatID, objective, cfg)
+	default: // social
+		return s.socialSimulationFast(ctx, chatID, objective, cfg)
 	}
 }
 
-// socialSimulation 多 Agent 社会模拟。
-// Phase 2: 默认走结构化轮次内核 (spawn→FJ轮次→计算涌现→报告);
-// cfg.Detail == "fast" 时保留旧的单 prompt 讲故事模式作为回退。
-func (s *Simulator) socialSimulation(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
-	if cfg.Detail != "fast" {
-		kcfg := DefaultSocialKernelConfig()
-		if cfg.Agents > 0 {
-			kcfg.NumAgents = cfg.Agents
-		}
-		if cfg.Rounds > 0 {
-			kcfg.Rounds = cfg.Rounds
-		}
-		s.notify(chatID, fmt.Sprintf("🌐 社会模拟启动: %d 个 Agent, %d 轮 (结构化内核)", kcfg.NumAgents, kcfg.Rounds))
-		k := NewSocialKernel(s.llm, s.notify, kcfg)
-		k.SetRecorder(s.simEvents)
-		return k.Run(ctx, chatID, objective)
+// kernelSimulation 结构化轮次内核入口 (八种模式共用, modeProfile 调味)。
+func (s *Simulator) kernelSimulation(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
+	kcfg := DefaultSocialKernelConfig()
+	kcfg.Mode = cfg.Mode
+	if cfg.Agents > 0 {
+		kcfg.NumAgents = cfg.Agents
 	}
-	return s.socialSimulationFast(ctx, chatID, objective, cfg)
+	if cfg.Rounds > 0 {
+		kcfg.Rounds = cfg.Rounds
+	}
+	s.notify(chatID, fmt.Sprintf("🌐 %s 模拟启动: %d 个 Agent, %d 轮 (结构化内核)", cfg.Mode, kcfg.NumAgents, kcfg.Rounds))
+	k := NewSocialKernel(s.llm, s.notify, kcfg)
+	k.SetRecorder(s.simEvents)
+	return k.Run(ctx, chatID, objective)
 }
 
 // socialSimulationFast 单 prompt 社会模拟 (M10 v2, 从 5 次→1 次 LLM 调用)。

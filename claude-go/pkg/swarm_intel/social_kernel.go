@@ -73,6 +73,7 @@ type SocialAgent struct {
 
 // SocialKernelConfig 内核参数。
 type SocialKernelConfig struct {
+	Mode string // 模拟模式 (social/game/crisis/org/creative/market/policy/tech), 决定 prompt 措辞与立场语义
 	NumAgents   int     // agent 数, 默认 6
 	Rounds      int     // 轮数, 默认 6
 	HistoryK    int     // 每轮输入携带的最近环境消息条数, 默认 10
@@ -86,11 +87,76 @@ type SocialKernelConfig struct {
 // DefaultSocialKernelConfig 返回 6 agent × 6 轮的保守默认 (约 38 次 LLM 调用)。
 func DefaultSocialKernelConfig() SocialKernelConfig {
 	return SocialKernelConfig{
+		Mode:        "social",
 		NumAgents:   6,
 		Rounds:      6,
 		HistoryK:    10,
 		MaxConcur:   3,
 		DefaultStub: 0.3,
+	}
+}
+
+// modeProfile 模式档案: 同一套 FJ 轮次内核在不同模拟模式下的措辞与立场语义。
+// 数学 (FJ 更新/指标/涌现判据) 与模式无关, 只有语言层按模式调味。
+type modeProfile struct {
+	StanceLabel string // 立场数值的含义, 如 "对议题的支持度"
+	AgentNoun   string // agent 的称呼, 如 "社会角色"
+	SceneNoun   string // 模拟对象的称呼, 如 "议题"
+	AnalystRole string // report 润色时的分析员角色
+	SpawnExtra  string // spawn prompt 的附加设计要求
+}
+
+// kernelModeProfile 按模式取档案; 未知模式回退 social。
+func kernelModeProfile(mode string) modeProfile {
+	switch mode {
+	case "org":
+		return modeProfile{
+			StanceLabel: "对组织变革的支持度", AgentNoun: "组织成员", SceneNoun: "组织情境",
+			AnalystRole: "组织动力学报告分析员",
+			SpawnExtra:  "成员应覆盖不同部门/职级/资历, 立场分歧来自利益位置而非抽象态度",
+		}
+	case "game":
+		return modeProfile{
+			StanceLabel: "对合作策略的偏好", AgentNoun: "博弈方", SceneNoun: "博弈情境",
+			AnalystRole: "博弈推演报告分析员",
+			SpawnExtra:  "各方利益诉求必须真实冲突, 立场代表其策略倾向",
+		}
+	case "crisis":
+		return modeProfile{
+			StanceLabel: "对危机严重度的判断", AgentNoun: "危机相关方", SceneNoun: "危机情境",
+			AnalystRole: "危机推演报告分析员",
+			SpawnExtra:  "相关方覆盖决策者/媒体/公众/对手方/盟友, 判断分歧来自信息与立场差异",
+		}
+	case "market":
+		return modeProfile{
+			StanceLabel: "对价格走向的预期", AgentNoun: "市场参与者", SceneNoun: "市场情境",
+			AnalystRole: "市场竞争报告分析员",
+			SpawnExtra:  "参与者覆盖不同份额/成本结构/策略类型, 预期分歧来自仓位差异",
+		}
+	case "policy":
+		return modeProfile{
+			StanceLabel: "对政策效果的态度", AgentNoun: "利益相关方", SceneNoun: "政策情境",
+			AnalystRole: "政策推演报告分析员",
+			SpawnExtra:  "相关方覆盖受益方/受损方/执行方/中立观察者, 态度分歧来自利益分配",
+		}
+	case "tech":
+		return modeProfile{
+			StanceLabel: "对技术路线前景的判断", AgentNoun: "技术阵营代表", SceneNoun: "技术演进情境",
+			AnalystRole: "技术演进报告分析员",
+			SpawnExtra:  "阵营覆盖不同技术路线及其生态位, 判断分歧来自押注差异",
+		}
+	case "creative":
+		return modeProfile{
+			StanceLabel: "对创意方向的偏好", AgentNoun: "创意视角人格", SceneNoun: "创意命题",
+			AnalystRole: "创意涌现报告分析员",
+			SpawnExtra:  "视角人格应来自不同学科/经验/审美 (如工程师/艺术家/商人/用户), 偏好分歧来自世界观",
+		}
+	default: // social
+		return modeProfile{
+			StanceLabel: "对议题的支持度", AgentNoun: "社会角色", SceneNoun: "议题",
+			AnalystRole: "社会模拟报告分析员",
+			SpawnExtra:  "角色身份/性格/立场要有真实分歧, 不要挤在中间",
+		}
 	}
 }
 
@@ -131,6 +197,7 @@ type SocialKernel struct {
 	recorder SimEventRecorder
 
 	cfg       SocialKernelConfig
+	profile   modeProfile
 	objective string
 	runID     string
 
@@ -138,6 +205,11 @@ type SocialKernel struct {
 	env     []envMessage
 	metrics []roundMetrics
 	events  []SimEvent
+
+	// 过程明细快照 (供 KernelDetail): spawn 实际 prompt / 轮内模板 / spawn 后初始终立场
+	spawnPrompt   string
+	roundTemplate string
+	initialStance map[string]float64
 
 	// emergentKinds 记录已触发的涌现类型, 避免同一类型每轮重复上报。
 	emergent     []string
@@ -149,12 +221,17 @@ func NewSocialKernel(llm LLMClient, notify NotifyFunc, cfg SocialKernelConfig) *
 	if notify == nil {
 		notify = func(_, _ string) {}
 	}
+	if cfg.Mode == "" {
+		cfg.Mode = "social"
+	}
 	return &SocialKernel{
-		llm:          llm,
-		notify:       notify,
-		cfg:          cfg,
-		runID:        fmt.Sprintf("social-%d", time.Now().UnixNano()),
-		emergentKind: make(map[string]bool),
+		llm:           llm,
+		notify:        notify,
+		cfg:           cfg,
+		profile:       kernelModeProfile(cfg.Mode),
+		runID:         fmt.Sprintf("%s-%d", cfg.Mode, time.Now().UnixNano()),
+		emergentKind:  make(map[string]bool),
+		initialStance: make(map[string]float64),
 	}
 }
 
@@ -165,10 +242,14 @@ func (k *SocialKernel) SetRecorder(r SimEventRecorder) { k.recorder = r }
 func (k *SocialKernel) Events() []SimEvent { return k.events }
 
 // Run 执行完整模拟: spawn → rounds×(决策+FJ更新+detect) → report。
+// spawn 后快照初始终立场, 供 KernelDetail 展示每个 agent 的立场变化幅度。
 func (k *SocialKernel) Run(ctx context.Context, chatID, objective string) (*SimulationResult, error) {
 	k.objective = objective
 	if err := k.spawn(ctx); err != nil {
-		return nil, fmt.Errorf("social 内核 spawn 失败: %w", err)
+		return nil, fmt.Errorf("%s 内核 spawn 失败: %w", k.cfg.Mode, err)
+	}
+	for _, a := range k.agents {
+		k.initialStance[a.ID] = a.Stance
 	}
 	for r := 1; r <= k.cfg.Rounds; r++ {
 		actions, err := k.runRound(ctx, r)
@@ -182,24 +263,30 @@ func (k *SocialKernel) Run(ctx context.Context, chatID, objective string) (*Simu
 }
 
 // spawn 一次 LLM 调用生成全部 agent。
+// prompt 按模式档案调味: 立场数值的语义/角色称呼/附加设计要求随 mode 变化,
+// 输出 schema (name/profile/stance/stubbornness) 全模式统一。
 func (k *SocialKernel) spawn(ctx context.Context) error {
 	n := k.cfg.NumAgents
-	prompt := fmt.Sprintf(`你是社会模拟角色生成器。围绕议题生成 %d 个立场、身份、性格各异的 Agent。
+	p := k.profile
+	prompt := fmt.Sprintf(`你是%s模拟角色生成器。围绕%s生成 %d 个立场、身份、性格各异的 %s。
 
-议题: %s
+%s: %s
 
 要求:
-1. stance 为 -1..1 的显式数值 (负=反对, 正=支持), 立场应有真实分歧, 不要挤在中间
+1. stance 为 -1..1 的显式数值, 语义是"%s" (负=反向/悲观/反对, 正=正向/乐观/支持), 立场应有真实分歧, 不要挤在中间
 2. stubbornness 为 0..1 (0.3 左右为普通, 0.7 以上为顽固)
 3. profile 一句话写清身份和性格 (<=60字)
+4. %s
 
 输出严格JSON数组 (不要markdown代码块, 不要其他文字):
-[{"name":"称呼","profile":"身份+性格","stance":0.6,"stubbornness":0.3}]`, n, k.objective)
+[{"name":"称呼","profile":"身份+性格","stance":0.6,"stubbornness":0.3}]`,
+		p.AgentNoun, p.SceneNoun, n, p.AgentNoun, p.SceneNoun, k.objective, p.StanceLabel, p.SpawnExtra)
 
-	resp, err := k.llm.SimpleComplete(ctx, "你是社会模拟角色生成器。只输出JSON数组。", prompt)
+	resp, err := k.llm.SimpleComplete(ctx, fmt.Sprintf("你是%s生成器。只输出JSON数组。", p.AgentNoun), prompt)
 	if err != nil {
 		return err
 	}
+	k.spawnPrompt = prompt // 过程明细: 实际发出的 spawn prompt
 	parsed := ParseJSON[[]socialSpawnAgent](resp)
 	if !parsed.OK || len(parsed.Value) == 0 {
 		return fmt.Errorf("spawn 解析失败: %s", truncate(resp, 120))
@@ -281,11 +368,14 @@ func (k *SocialKernel) runRound(ctx context.Context, round int) (map[string]*Soc
 }
 
 // roundPrompt 组装单个 agent 的轮内输入: profile + stance + 最近环境消息 + 邻居立场快照。
+// 动态段 (身份/当前立场/邻居/环境消息) 每轮每 agent 不同; 静态模板段只记录一次,
+// 供 KernelDetail 展示"轮内 prompt 是怎么设计的"。
 func (k *SocialKernel) roundPrompt(a *SocialAgent, round int) string {
+	p := k.profile
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "议题: %s\n", k.objective)
+	fmt.Fprintf(&sb, "%s: %s\n", p.SceneNoun, k.objective)
 	fmt.Fprintf(&sb, "你是: %s (%s)\n", a.Name, a.Profile)
-	fmt.Fprintf(&sb, "你当前的立场: %.2f (-1反对 .. +1支持), 固执度 %.2f\n", a.Stance, a.Stubbornness)
+	fmt.Fprintf(&sb, "你当前的立场: %.2f (%s, -1反向 .. +1正向), 固执度 %.2f\n", a.Stance, p.StanceLabel, a.Stubbornness)
 	fmt.Fprintf(&sb, "第 %d/%d 轮。邻居立场快照:\n", round, k.cfg.Rounds)
 	for _, b := range k.agents {
 		if b.ID == a.ID {
@@ -303,6 +393,13 @@ func (k *SocialKernel) roundPrompt(a *SocialAgent, round int) string {
 content <=200字 (speak/interview 必填, 其他可空),
 stance_delta 为本轮立场增量 (-0.2..0.2)。
 输出严格JSON: {"action":"speak","content":"...","stance_delta":0.1}`)
+	if k.roundTemplate == "" {
+		// 模板段 = 静态结构说明 + 决策 schema (动态数值字段以占位符标注)
+		k.roundTemplate = "<场景>: <模拟目标>\n你是: <name> (<profile>)\n" +
+			"你当前的立场: <stance> (" + p.StanceLabel + ", -1反向 .. +1正向), 固执度 <stubbornness>\n" +
+			"第 <r>/<rounds> 轮。邻居立场快照:\n- <邻居name>: <邻居stance> × (N-1)\n" +
+			"[最近环境消息: 上轮的 speak 发言, 最多 HistoryK 条]\n" + sb.String()[strings.LastIndex(sb.String(), "决策:"):]
+	}
 	return sb.String()
 }
 
@@ -513,16 +610,16 @@ func (k *SocialKernel) report(ctx context.Context, chatID string) *SimulationRes
 	var summary string
 	briefJSON, _ := json.Marshal(briefs)
 	emergentJSON, _ := json.Marshal(k.emergent)
-	prompt := fmt.Sprintf(`你是社会模拟报告分析员。基于以下最终立场聚类与涌现证据, 为每个聚类命名一个演化终局场景。
+	prompt := fmt.Sprintf(`你是%s。基于以下最终立场聚类与涌现证据, 为每个聚类命名一个演化终局场景。
 
-议题: %s
+%s: %s
 最终立场聚类: %s
 检测到的涌现 (带指标证据): %s
 
 要求: 每个场景的概率与规模必须服从聚类数据, 不要另编; description 150字以内。
 输出严格JSON: {"scenarios":[{"name":"场景名","description":"150字内","key_events":["事件1","事件2"]}],"summary":"300字以内综合分析"}`,
-		k.objective, briefJSON, emergentJSON)
-	if resp, err := k.llm.SimpleComplete(ctx, "你是社会模拟报告分析员。只输出JSON。", prompt); err == nil {
+		k.profile.AnalystRole, k.profile.SceneNoun, k.objective, briefJSON, emergentJSON)
+	if resp, err := k.llm.SimpleComplete(ctx, fmt.Sprintf("你是%s。只输出JSON。", k.profile.AnalystRole), prompt); err == nil {
 		type reportJSON struct {
 			Scenarios []struct {
 				Name        string   `json:"name"`
@@ -546,8 +643,8 @@ func (k *SocialKernel) report(ctx context.Context, chatID string) *SimulationRes
 		scenarios = fallbackScenarios
 	}
 	if summary == "" {
-		summary = fmt.Sprintf("social 内核模拟 %d agent × %d 轮: 终局形成 %d 个立场簇, 检测到 %d 类涌现。",
-			len(k.agents), k.cfg.Rounds, len(clusters), len(k.emergent))
+		summary = fmt.Sprintf("%s 内核模拟 %d agent × %d 轮: 终局形成 %d 个立场簇, 检测到 %d 类涌现。",
+			k.cfg.Mode, len(k.agents), k.cfg.Rounds, len(clusters), len(k.emergent))
 	}
 
 	trajectory := make(map[string][]float64, len(k.agents))
@@ -576,9 +673,9 @@ func (k *SocialKernel) report(ctx context.Context, chatID string) *SimulationRes
 		curves["clustering"] = append(curves["clustering"], m.Clustering)
 	}
 
-	k.notify(chatID, fmt.Sprintf("🌐 social 内核完成: %d 簇, 涌现 %d 类", len(clusters), len(k.emergent)))
+	k.notify(chatID, fmt.Sprintf("🌐 %s 内核完成: %d 簇, 涌现 %d 类", k.cfg.Mode, len(clusters), len(k.emergent)))
 	return &SimulationResult{
-		Mode:         "social",
+		Mode:         k.cfg.Mode,
 		Rounds:       k.cfg.Rounds,
 		Scenarios:    scenarios,
 		Emergent:     k.emergent,
@@ -586,6 +683,73 @@ func (k *SocialKernel) report(ctx context.Context, chatID string) *SimulationRes
 		CreatedAt:    time.Now(),
 		Trajectory:   trajectory,
 		MetricCurves: curves,
+		KernelDetail: k.kernelDetail(),
+	}
+}
+
+// kernelDetail 汇总过程明细: 参数 + prompt 设计 + agent 档案 + 逐轮事件。
+// agent 名称查表用, 事件 payload 按 Type 解到对应字段。
+func (k *SocialKernel) kernelDetail() *KernelDetail {
+	nameOf := map[string]string{}
+	for _, a := range k.agents {
+		nameOf[a.ID] = a.Name
+	}
+	events := make([]KernelEvent, 0, len(k.events))
+	for _, ev := range k.events {
+		ke := KernelEvent{Round: ev.Round, Type: ev.Type, AgentID: ev.AgentID, Name: nameOf[ev.AgentID]}
+		switch ev.Type {
+		case "action":
+			var p struct {
+				Action      string  `json:"action"`
+				Content     string  `json:"content"`
+				StanceDelta float64 `json:"stance_delta"`
+			}
+			if json.Unmarshal(ev.Payload, &p) == nil {
+				ke.Action, ke.Content, ke.StanceDelta = p.Action, p.Content, p.StanceDelta
+			}
+		case "stance":
+			var p struct {
+				Stance float64 `json:"stance"`
+			}
+			if json.Unmarshal(ev.Payload, &p) == nil {
+				ke.Stance = p.Stance
+			}
+		case "emergence":
+			var p struct {
+				Kind     string `json:"kind"`
+				Evidence string `json:"evidence"`
+			}
+			if json.Unmarshal(ev.Payload, &p) == nil {
+				ke.Kind, ke.Evidence = p.Kind, p.Evidence
+			}
+		}
+		events = append(events, ke)
+	}
+	designs := make([]KernelAgentDesign, 0, len(k.agents))
+	for _, a := range k.agents {
+		designs = append(designs, KernelAgentDesign{
+			ID:            a.ID,
+			Name:          a.Name,
+			Profile:       a.Profile,
+			InitialStance: k.initialStance[a.ID],
+			FinalStance:   a.Stance,
+			Stubbornness:  a.Stubbornness,
+		})
+	}
+	return &KernelDetail{
+		Cfg: KernelCfgView{
+			NumAgents:   k.cfg.NumAgents,
+			Rounds:      k.cfg.Rounds,
+			HistoryK:    k.cfg.HistoryK,
+			MaxConcur:   k.cfg.MaxConcur,
+			DefaultStub: k.cfg.DefaultStub,
+		},
+		Prompts: KernelPrompts{
+			Spawn:         k.spawnPrompt,
+			RoundTemplate: k.roundTemplate,
+		},
+		Agents: designs,
+		Events: events,
 	}
 }
 

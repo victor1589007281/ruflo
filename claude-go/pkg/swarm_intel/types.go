@@ -96,8 +96,9 @@ type SimulationConfig struct {
 	Rounds    int      `json:"rounds"`
 	Scenarios []string `json:"scenarios"`
 	StopCond  string   `json:"stop_condition,omitempty"`
-	// Phase 2: social 模拟深度 — "kernel"(默认) 走结构化轮次内核,
-	// "fast" 保留旧的单 prompt 讲故事模式作为回退。
+	// Detail 引擎档位: "kernel"(默认) 走结构化轮次内核
+	// (social/game/crisis/org/creative/market/policy/tech 八种模式);
+	// "fast" 各模式旧的单 prompt 叙事回退。montecarlo 忽略此字段。
 	Detail string `json:"detail,omitempty"`
 }
 
@@ -114,6 +115,64 @@ type SimulationResult struct {
 	// 仅 kernel 模式产出; 其他模式留空, 旧消费者不受影响。
 	Trajectory   map[string][]float64 `json:"trajectory,omitempty"`    // agentID → 每轮立场
 	MetricCurves map[string][]float64 `json:"metric_curves,omitempty"` // variance/entropy/clustering → 每轮值
+
+	// KernelDetail 结构化内核运行过程明细 (仅 detail=kernel 产出):
+	// agent 设计 (spawn 画像+初末立场)、逐轮事件 (action/stance/emergence)、
+	// prompt 设计与内核参数。前端"过程明细"页的数据源。
+	KernelDetail *KernelDetail `json:"kernel_detail,omitempty"`
+}
+
+// KernelDetail 结构化轮次内核的运行过程明细。
+type KernelDetail struct {
+	Cfg     KernelCfgView       `json:"cfg"`      // 内核参数 (收敛判据相关的可调项)
+	Prompts KernelPrompts       `json:"prompts"`  // prompt 设计 (实际发出的 spawn + 轮内模板)
+	Agents  []KernelAgentDesign `json:"agents"`   // spawn 生成的 agent 画像 + 初末立场
+	Events  []KernelEvent       `json:"events"`   // 逐轮事件: action → FJ更新(stance) → 涌现检测
+}
+
+// KernelCfgView 内核参数快照。
+type KernelCfgView struct {
+	NumAgents   int     `json:"num_agents"`
+	Rounds      int     `json:"rounds"`
+	HistoryK    int     `json:"history_k"`    // 每轮携带的最近环境消息条数
+	MaxConcur   int     `json:"max_concur"`   // 轮内 LLM 并发
+	DefaultStub float64 `json:"default_stub"` // spawn 未给 stubbornness 时的默认固执度
+}
+
+// KernelPrompts prompt 设计快照: spawn 是实际发出的完整 prompt (含议题),
+// round_template 是轮内决策 prompt 的静态模板段 (动态部分=身份/立场/邻居/环境消息)。
+type KernelPrompts struct {
+	Spawn         string `json:"spawn"`
+	RoundTemplate string `json:"round_template"`
+}
+
+// KernelAgentDesign 单个 agent 的设计档案: spawn 时 LLM 生成的画像 + 数值属性,
+// 以及模拟结束后的最终立场 (轨迹图的单 agent 文字版)。
+type KernelAgentDesign struct {
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	Profile       string  `json:"profile"`        // 身份+性格一句话
+	InitialStance float64 `json:"initial_stance"` // spawn 时的立场
+	FinalStance   float64 `json:"final_stance"`   // 全部轮次后的立场
+	Stubbornness  float64 `json:"stubbornness"`   // 固执度 0..1 (FJ 模型 stub 参数)
+}
+
+// KernelEvent 内核单条事件。Type=action (agent 决策) / stance (FJ 更新后立场) /
+// emergence (涌现检测触发)。字段按 Type 取用:
+//   - action:    AgentID/Name/Action/Content/StanceDelta
+//   - stance:    AgentID/Stance (更新后的新立场)
+//   - emergence: Kind/Evidence (带前后指标的判定证据)
+type KernelEvent struct {
+	Round       int     `json:"round"`
+	Type        string  `json:"type"`
+	AgentID     string  `json:"agent_id,omitempty"`
+	Name        string  `json:"name,omitempty"`
+	Action      string  `json:"action,omitempty"`
+	Content     string  `json:"content,omitempty"`
+	StanceDelta float64 `json:"stance_delta,omitempty"`
+	Stance      float64 `json:"stance,omitempty"`
+	Kind        string  `json:"kind,omitempty"`
+	Evidence    string  `json:"evidence,omitempty"`
 }
 
 // ScenarioOutcome 单个场景分支的结果。
