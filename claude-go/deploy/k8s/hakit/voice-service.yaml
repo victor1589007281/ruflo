@@ -1,0 +1,64 @@
+# gf-voice: 通用 ASR 服务 (2026-11-08, agents ns)
+#
+# 为什么 hostNetwork: 让 Pod 直接持有端口 38795, Pod 重建/升级端口不变 —— 这是
+# "Pod 重建后外部调用不变"的解。注意 hostNetwork 的"host"是 kind 节点容器的网络
+# 命名空间 (172.18.0.9), 不是宿主机: 宿主机回环/tailscale 网卡够不着, 也没有
+# NodePort→宿主机发布这回事 (6443 之外的端口映射 kind 创建后不能补)。
+#
+# 所以完整入口 = 本 Deployment + deploy/voice/host-forwarder.py
+# (systemd 用户单元 gf-voice-fwd.service, 监听宿主机 0.0.0.0:38795):
+#   客户端只记 127.0.0.1:38795 (本机后端) / 100.111.70.76:38795 (tailnet, 手机可达)
+#   转发器每 5s 重解析 kind 节点 IP —— Pod 重建无感; kind 重建节点 IP 漂移也自动跟,
+#   外部调用地址在任何重建场景下都不变。
+#
+# 端口占用注意: hostNetwork + hostPort 与 kind 节点 netns 绑定, 宿主机同端口被转发器
+# 占用, 两者在不同 netns 不冲突。单副本是设计使然: 936M 参数常驻, 串行推理,
+# 短句亚秒级 (实测 4.5s 音频 219ms)。
+# VOICE_TOKEN 由 out-of-band Secret 注入 (git 里不放密钥):
+#   kubectl -n agents create secret generic voice-service-token --from-literal=token=<rand>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voice-service
+  namespace: agents
+  labels: { app: voice-service }
+spec:
+  replicas: 1
+  # hostPort 单副本必须 Recreate: RollingUpdate 会先起新 Pod 再杀旧的, 新旧抢同一个
+  # 宿主机端口死锁 (Pending "port is already allocated"), Recreate 先杀后起, 端口无缝交接
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: voice-service }
+  template:
+    metadata:
+      labels: { app: voice-service }
+    spec:
+      hostNetwork: true
+      # hostNetwork 下默认 DNS 配置会失效, 显式声明保持集群内解析能力 (备未来
+      # 集群内消费方; 当前服务本身不依赖任何集群内域名)
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: voice
+          image: voice-service:0.1.0
+          imagePullPolicy: Never
+          ports: [{ containerPort: 38795, hostPort: 38795 }]
+          env:
+            - { name: VOICE_MODEL, value: iic/SenseVoiceSmall }
+            - name: VOICE_TOKEN
+              valueFrom:
+                secretKeyRef: { name: voice-service-token, key: token }
+            # 容器 limit 给 4 核, torch 线程数钉 4, 避免默认按宿主机核数(16)开线程
+            # 在 cgroup 限核下互相踩踏 (threads慢18x 的教训同族)
+            - { name: OMP_NUM_THREADS, value: "4" }
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "4", memory: 6Gi }
+          # 模型加载 (936M 参数 + torch 初始化) 在弱核上可能要 1-2min:
+          # startupProbe 只看进程活没活 (/healthz 永远 200), readiness 才等模型就绪
+          startupProbe:
+            httpGet: { path: /healthz, port: 38795 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: 38795 }
+            periodSeconds: 5
