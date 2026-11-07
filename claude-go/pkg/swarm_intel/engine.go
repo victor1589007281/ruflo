@@ -150,6 +150,12 @@ func NewEngine(llm LLMClient, cfg Config) *Engine {
 		marketWeight:    cfg.MarketWeight,
 		marketBudget:    cfg.MarketBudget,
 	}
+	// ③ 结构化内核事件/拓扑持久化: 把 SwarmStore 注入 Simulator (它同时满足
+	// SimEventRecorder 与 TopologyStore 接口)。注入后内核每轮事件与 sim_{runID}_adj
+	// 邻接桶都会落 agentDB (JSONL 后端也实现两接口, 行为等价落本地)。
+	if rec, ok := store.(SimEventRecorder); ok {
+		e.simulator.SetSimEventRecorder(rec)
+	}
 	e.loadLearning() // E1: 启动无条件恢复跨会话学习状态 (保形/信任/路由); 缺失则安全跳过
 	return e
 }
@@ -603,6 +609,11 @@ func (e *Engine) GetHistory(n int) ([]*PredictionRecord, error) {
 // Simulate 执行场景模拟。
 func (e *Engine) Simulate(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
 	return e.simulator.Simulate(ctx, chatID, objective, cfg)
+}
+
+// EvalBatch ② 回溯评测: 批量事件跑模拟并对照实际结局 (CLI sim-eval 的入口)。
+func (e *Engine) EvalBatch(ctx context.Context, events []EvalEvent, cfg SimulationConfig) *Scorecard {
+	return e.simulator.EvalBatch(ctx, events, cfg)
 }
 
 // decompose 将自由文本目标分解为结构化预测域。

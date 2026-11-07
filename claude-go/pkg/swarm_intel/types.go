@@ -100,6 +100,14 @@ type SimulationConfig struct {
 	// (social/game/crisis/org/creative/market/policy/tech 八种模式);
 	// "fast" 各模式旧的单 prompt 叙事回退。montecarlo 忽略此字段。
 	Detail string `json:"detail,omitempty"`
+	// 结构化内核扩展参数 (Detail=kernel 时生效, 零值走内核保守默认):
+	// Topology=ring/smallworld 用环格/小世界影响图替代完全图;
+	// Rewire 每轮后按立场同质性重连; MemoryRounds 把邻居立场史带入轮内 prompt;
+	// Epsilon/EntropyDelta/MinRounds 是自适应终止判据。
+	Topology     string  `json:"topology,omitempty"`
+	Rewire       bool    `json:"rewire,omitempty"`
+	MemoryRounds int     `json:"memory_rounds,omitempty"`
+	Epsilon      float64 `json:"epsilon,omitempty"`
 }
 
 // SimulationResult 模拟结果。
@@ -124,10 +132,31 @@ type SimulationResult struct {
 
 // KernelDetail 结构化轮次内核的运行过程明细。
 type KernelDetail struct {
-	Cfg     KernelCfgView       `json:"cfg"`      // 内核参数 (收敛判据相关的可调项)
-	Prompts KernelPrompts       `json:"prompts"`  // prompt 设计 (实际发出的 spawn + 轮内模板)
-	Agents  []KernelAgentDesign `json:"agents"`   // spawn 生成的 agent 画像 + 初末立场
-	Events  []KernelEvent       `json:"events"`   // 逐轮事件: action → FJ更新(stance) → 涌现检测
+	Cfg     KernelCfgView       `json:"cfg"`     // 内核参数 (收敛判据相关的可调项)
+	Prompts KernelPrompts       `json:"prompts"` // prompt 设计 (实际发出的 spawn + 轮内模板)
+	Agents  []KernelAgentDesign `json:"agents"`  // spawn 生成的 agent 画像 + 初末立场
+	Events  []KernelEvent       `json:"events"`  // 逐轮事件: action → FJ更新(stance) → 涌现检测
+	// 自适应终止: 实际跑的轮数与停止原因 (budget=跑满预算帽才停, 其余=提前收敛)。
+	StopReason string `json:"stop_reason,omitempty"`
+	RoundsRun  int    `json:"rounds_run,omitempty"`
+	// 网络拓扑: 影响图的边集 (full=完全图; ring/smallworld=环格/小世界; Rewire 后有重连事件)。
+	Topology *KernelTopology `json:"topology,omitempty"`
+}
+
+// KernelTopology 一次模拟的影响图快照。边权重=基础拓扑权重×提及加成,
+// rewire=true 时边集随轮次演化 (rewire 事件见 Events)。
+type KernelTopology struct {
+	Type   string       `json:"type"`        // full | ring | smallworld
+	K      int          `json:"k,omitempty"` // 环格邻接度数
+	Rewire bool         `json:"rewire,omitempty"`
+	Edges  []KernelEdge `json:"edges"` // 终态 (含初态+全部重连后的) 边集
+}
+
+// KernelEdge 单条影响边。
+type KernelEdge struct {
+	From   string  `json:"from"`
+	To     string  `json:"to"`
+	Weight float64 `json:"weight"`
 }
 
 // KernelCfgView 内核参数快照。
@@ -137,6 +166,16 @@ type KernelCfgView struct {
 	HistoryK    int     `json:"history_k"`    // 每轮携带的最近环境消息条数
 	MaxConcur   int     `json:"max_concur"`   // 轮内 LLM 并发
 	DefaultStub float64 `json:"default_stub"` // spawn 未给 stubbornness 时的默认固执度
+	// 自适应终止判据 (①): 全员 |Δstance| < Epsilon ⇒ converged;
+	// 熵变化 < EntropyDelta 连续 2 轮 ⇒ entropy_plateau; 都不满足跑满 Rounds ⇒ budget。
+	Epsilon      float64 `json:"epsilon,omitempty"`
+	EntropyDelta float64 `json:"entropy_delta,omitempty"`
+	MinRounds    int     `json:"min_rounds,omitempty"`
+	// 拓扑与记忆 (③)
+	Topology     string `json:"topology,omitempty"`      // full | ring | smallworld
+	TopoK        int    `json:"topo_k,omitempty"`        // 环格度数
+	Rewire       bool   `json:"rewire,omitempty"`        // 每轮后同质性重连
+	MemoryRounds int    `json:"memory_rounds,omitempty"` // 邻居立场历史带入轮内 prompt 的轮数
 }
 
 // KernelPrompts prompt 设计快照: spawn 是实际发出的完整 prompt (含议题),

@@ -39,6 +39,7 @@ func (s *Simulator) SetSimEventRecorder(r SimEventRecorder) { s.simEvents = r }
 //     适用于 social/game/crisis/org/creative/market/policy/tech 八种模式
 //     (同一套 FJ 数学, modeProfile 只做语言层调味); 产出 trajectory/metric_curves/kernel_detail。
 //   - fast: 各模式的旧单 prompt 叙事, 一次 LLM 调用讲完整个故事 (无过程明细)。
+//
 // montecarlo 不受 Detail 影响: 世界线并行 FanOut 本身就是结构化推演。
 func (s *Simulator) Simulate(ctx context.Context, chatID string, objective string, cfg SimulationConfig) (*SimulationResult, error) {
 	switch cfg.Mode {
@@ -77,18 +78,17 @@ func (s *Simulator) legacySimulation(ctx context.Context, chatID, objective stri
 }
 
 // kernelSimulation 结构化轮次内核入口 (八种模式共用, modeProfile 调味)。
+// ①②③ 扩展参数 (epsilon/topology/rewire/memory_rounds) 经 withOverrides 落到内核默认上。
 func (s *Simulator) kernelSimulation(ctx context.Context, chatID, objective string, cfg SimulationConfig) (*SimulationResult, error) {
-	kcfg := DefaultSocialKernelConfig()
+	kcfg := DefaultSocialKernelConfig().withOverrides(cfg)
 	kcfg.Mode = cfg.Mode
-	if cfg.Agents > 0 {
-		kcfg.NumAgents = cfg.Agents
-	}
-	if cfg.Rounds > 0 {
-		kcfg.Rounds = cfg.Rounds
-	}
-	s.notify(chatID, fmt.Sprintf("🌐 %s 模拟启动: %d 个 Agent, %d 轮 (结构化内核)", cfg.Mode, kcfg.NumAgents, kcfg.Rounds))
+	s.notify(chatID, fmt.Sprintf("🌐 %s 模拟启动: %d 个 Agent, ≤%d 轮 · 拓扑 %s (结构化内核)",
+		cfg.Mode, kcfg.NumAgents, kcfg.Rounds, kcfg.Topology))
 	k := NewSocialKernel(s.llm, s.notify, kcfg)
 	k.SetRecorder(s.simEvents)
+	if ts, ok := s.simEvents.(TopologyStore); ok {
+		k.SetTopologyStore(ts) // ③ AgentDB 后端在时落 sim_{runID}_adj 桶
+	}
 	return k.Run(ctx, chatID, objective)
 }
 

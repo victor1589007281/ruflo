@@ -73,27 +73,73 @@ type SocialAgent struct {
 
 // SocialKernelConfig 内核参数。
 type SocialKernelConfig struct {
-	Mode string // 模拟模式 (social/game/crisis/org/creative/market/policy/tech), 决定 prompt 措辞与立场语义
+	Mode        string  // 模拟模式 (social/game/crisis/org/creative/market/policy/tech), 决定 prompt 措辞与立场语义
 	NumAgents   int     // agent 数, 默认 6
-	Rounds      int     // 轮数, 默认 6
+	Rounds      int     // 轮数预算帽, 默认 6 (自适应终止可能提前收敛)
 	HistoryK    int     // 每轮输入携带的最近环境消息条数, 默认 10
 	MaxConcur   int     // 轮内 LLM 并发, 默认 3
 	DefaultStub float64 // spawn 未给 stubbornness 时的默认值 0.3
+	// 自适应终止 (①): 跑满 MinRounds 后, 全员 |Δstance| < Epsilon ⇒ 收敛;
+	// 群体熵变化 < EntropyDelta 连续 2 轮 ⇒ 平台期; 都不满足 ⇒ 跑满 Rounds (budget)。
+	// FJ 理论收敛是渐近的, 固定轮次只是预算帽 —— 提前收敛既省 LLM 调用又不丢信息。
+	Epsilon      float64 // 默认 0.03
+	EntropyDelta float64 // 默认 0.02
+	MinRounds    int     // 默认 2
+	// 网络拓扑 (③): 影响图结构。full=完全图 (v1 行为); ring=环格每节点连 ±K 个邻居;
+	// smallworld=环格+10% 随机重连。邻居集决定 FJ 拉力的来源, 是极化/回音室的结构性来源。
+	Topology string // 默认 full
+	TopoK    int    // 环格度数, 默认 2
+	// Rewire 每轮更新后按立场同质性重连: 断开最远的邻居, 连上最近的非邻居 (echo chamber 动力学)。
+	Rewire bool
+	// MemoryRounds 轮内 prompt 携带每个邻居最近 N 轮的立场轨迹 (而非只给当前值), 默认 3; 0=关闭。
+	MemoryRounds int
 	// ShuffleStances > 0 时, spawn 后用该 seed 随机打乱立场分配 (S3 对抗对照开关,
 	// 仅测试使用): 用于验证涌现来自真实立场动力学而非 prompt 固定叙事。
 	ShuffleStances int64
 }
 
-// DefaultSocialKernelConfig 返回 6 agent × 6 轮的保守默认 (约 38 次 LLM 调用)。
+// DefaultSocialKernelConfig 返回保守默认: 6 agent × 6 轮预算帽, 完全图拓扑。
 func DefaultSocialKernelConfig() SocialKernelConfig {
 	return SocialKernelConfig{
-		Mode:        "social",
-		NumAgents:   6,
-		Rounds:      6,
-		HistoryK:    10,
-		MaxConcur:   3,
-		DefaultStub: 0.3,
+		Mode:         "social",
+		NumAgents:    6,
+		Rounds:       6,
+		HistoryK:     10,
+		MaxConcur:    3,
+		DefaultStub:  0.3,
+		Epsilon:      0.03,
+		EntropyDelta: 0.02,
+		MinRounds:    2,
+		Topology:     "full",
+		TopoK:        2,
+		MemoryRounds: 3,
 	}
+}
+
+// cfgOrDefaults 把 SimulationConfig 的零值覆盖到内核默认上 (webapp/CLI 只传想改的项)。
+func (c SocialKernelConfig) withOverrides(cfg SimulationConfig) SocialKernelConfig {
+	if cfg.Agents > 0 {
+		c.NumAgents = cfg.Agents
+	}
+	if cfg.Rounds > 0 {
+		c.Rounds = cfg.Rounds
+	}
+	if cfg.Topology != "" {
+		c.Topology = cfg.Topology
+	}
+	if cfg.Rewire {
+		c.Rewire = true
+	}
+	if cfg.MemoryRounds > 0 {
+		c.MemoryRounds = cfg.MemoryRounds
+	}
+	if cfg.Epsilon > 0 {
+		c.Epsilon = cfg.Epsilon
+	}
+	if c.Mode == "" {
+		c.Mode = "social"
+	}
+	return c
 }
 
 // modeProfile 模式档案: 同一套 FJ 轮次内核在不同模拟模式下的措辞与立场语义。
@@ -214,6 +260,22 @@ type SocialKernel struct {
 	// emergentKinds 记录已触发的涌现类型, 避免同一类型每轮重复上报。
 	emergent     []string
 	emergentKind map[string]bool
+
+	// ③ 网络拓扑: adjacency[a][b]=a 受 b 影响的基础权重 (0=无边)。
+	// full 拓扑下所有人互为邻居 (等价 v1 行为); ring/smallworld 限制 FJ 拉力来源。
+	adjacency map[string]map[string]float64
+	// ③ 邻居立场记忆: stanceHistory[agentID] 每轮更新后的立场 (末位=当前),
+	// roundPrompt 取最近 MemoryRounds 轮给 agent 看邻居的轨迹而非单点值。
+	stanceHistory map[string][]float64
+	// ① 自适应终止: 上一轮 |Δstance| < Epsilon 的 agent 本轮跳过 LLM 调用
+	// (FJ 项仍然生效), 节省 token 且不动收敛结果。
+	frozen map[string]bool
+	// ① 停止原因: converged(全员收敛) / entropy_plateau(熵平台期) / budget(跑满预算)。
+	stopReason string
+	// ① 自适应终止: 实际跑的轮数 (报告与 KernelDetail 用它, 不是预算帽)。
+	roundsRun int
+	// ③ 可选拓扑持久化 (nil=跳过): 每轮把邻接表写进 sim_{runID}_adj 桶。
+	topoStore TopologyStore
 }
 
 // NewSocialKernel 创建 social 轮次内核。
@@ -224,6 +286,24 @@ func NewSocialKernel(llm LLMClient, notify NotifyFunc, cfg SocialKernelConfig) *
 	if cfg.Mode == "" {
 		cfg.Mode = "social"
 	}
+	if cfg.Epsilon <= 0 {
+		cfg.Epsilon = 0.03
+	}
+	if cfg.EntropyDelta <= 0 {
+		cfg.EntropyDelta = 0.02
+	}
+	if cfg.MinRounds <= 0 {
+		cfg.MinRounds = 2
+	}
+	if cfg.Topology == "" {
+		cfg.Topology = "full"
+	}
+	if cfg.TopoK <= 0 {
+		cfg.TopoK = 2
+	}
+	if cfg.MemoryRounds < 0 {
+		cfg.MemoryRounds = 0
+	}
 	return &SocialKernel{
 		llm:           llm,
 		notify:        notify,
@@ -232,8 +312,19 @@ func NewSocialKernel(llm LLMClient, notify NotifyFunc, cfg SocialKernelConfig) *
 		runID:         fmt.Sprintf("%s-%d", cfg.Mode, time.Now().UnixNano()),
 		emergentKind:  make(map[string]bool),
 		initialStance: make(map[string]float64),
+		stanceHistory: make(map[string][]float64),
+		frozen:        make(map[string]bool),
 	}
 }
+
+// TopologyStore 邻接表持久化接口 (③): 由 Engine 注入 AgentDBStore 实现,
+// 每桶一次模拟, key="{from}·{to}", value=权重 —— agentDB KV 原语零改动复用。
+type TopologyStore interface {
+	PutTopologyEdge(ctx context.Context, runID, from, to string, weight float64) error
+}
+
+// SetTopologyStore 挂接邻接表持久化 (可选, nil 则不落库, 内存邻接照常工作)。
+func (k *SocialKernel) SetTopologyStore(s TopologyStore) { k.topoStore = s }
 
 // SetRecorder 挂接 SimEvent 记录器 (Engine 注入 JSONLStore/AgentDBStore 或兜底实现)。
 func (k *SocialKernel) SetRecorder(r SimEventRecorder) { k.recorder = r }
@@ -241,7 +332,10 @@ func (k *SocialKernel) SetRecorder(r SimEventRecorder) { k.recorder = r }
 // Events 返回本次运行产生的全部 SimEvent (测试与 JSONL 兜底之外的观测口)。
 func (k *SocialKernel) Events() []SimEvent { return k.events }
 
-// Run 执行完整模拟: spawn → rounds×(决策+FJ更新+detect) → report。
+// Run 执行完整模拟: spawn → initTopology → rounds×(决策+FJ更新+detect[+rewire]) → report。
+// ① 自适应终止: 跑满 MinRounds 后, 全员 |Δstance|<Epsilon ⇒ converged;
+// 群体熵变化 <EntropyDelta 连续 2 轮 ⇒ entropy_plateau; 否则跑满 Rounds ⇒ budget。
+// 提前停轮的 agent 本轮已冻结 (跳过 LLM, FJ 项仍生效), 不丢收敛信息还省调用。
 // spawn 后快照初始终立场, 供 KernelDetail 展示每个 agent 的立场变化幅度。
 func (k *SocialKernel) Run(ctx context.Context, chatID, objective string) (*SimulationResult, error) {
 	k.objective = objective
@@ -250,15 +344,48 @@ func (k *SocialKernel) Run(ctx context.Context, chatID, objective string) (*Simu
 	}
 	for _, a := range k.agents {
 		k.initialStance[a.ID] = a.Stance
+		k.stanceHistory[a.ID] = []float64{a.Stance}
 	}
+	k.initTopology(ctx)
+
+	roundsRun := 0
+	prevEntropy := -1.0
+	plateauStreak := 0
+	k.stopReason = "budget"
 	for r := 1; r <= k.cfg.Rounds; r++ {
 		actions, err := k.runRound(ctx, r)
 		if err != nil {
 			return nil, err
 		}
-		k.updateStances(r, actions)
+		maxDelta := k.updateStances(r, actions)
 		k.detect(r)
+		if k.cfg.Rewire {
+			k.rewire(r)
+		}
+		roundsRun = r
+
+		if r < k.cfg.MinRounds {
+			continue
+		}
+		// converged: 本轮所有 agent (含原本冻结的) 立场变动都 < Epsilon。
+		if maxDelta < k.cfg.Epsilon {
+			k.stopReason = "converged"
+			break
+		}
+		// entropy_plateau: 熵变化连续 2 轮 < EntropyDelta (第一个 MinRounds 轮不判)。
+		m := k.metrics[len(k.metrics)-1]
+		if prevEntropy >= 0 && math.Abs(m.Entropy-prevEntropy) < k.cfg.EntropyDelta {
+			plateauStreak++
+			if plateauStreak >= 2 {
+				k.stopReason = "entropy_plateau"
+				break
+			}
+		} else {
+			plateauStreak = 0
+		}
+		prevEntropy = m.Entropy
 	}
+	k.roundsRun = roundsRun
 	return k.report(ctx, chatID), nil
 }
 
@@ -324,9 +451,14 @@ func (k *SocialKernel) spawn(ctx context.Context) error {
 
 // runRound 并行收集每个 agent 的决策 (speak/listen/interview/adopt + delta)。
 // 复用 FanOutCollect, MaxConcurrency=3; 单 agent 失败降级为 listen。
+// ① 上一轮已冻结 (|Δstance|<Epsilon) 的 agent 跳过 LLM 调用, 复用 listen 零增量,
+// FJ 拉力仍会在 updateStances 生效 —— 收敛后不再花 token 问"你还变吗"。
 func (k *SocialKernel) runRound(ctx context.Context, round int) (map[string]*SocialRoundAction, error) {
 	branches := make(map[string]BranchFunc)
 	for _, a := range k.agents {
+		if k.frozen[a.ID] {
+			continue
+		}
 		a := a
 		branches[a.ID] = func(bctx context.Context) (string, error) {
 			return k.llm.SimpleComplete(bctx, "你是社会模拟中的单个 Agent。只输出JSON。", k.roundPrompt(a, round))
@@ -354,6 +486,12 @@ func (k *SocialKernel) runRound(ctx context.Context, round int) (map[string]*Soc
 		})
 		k.emit(SimEvent{RunID: k.runID, Round: round, Type: "action", AgentID: r.ID, Payload: payload})
 	}
+	// 冻结 agent 不发 action 事件 (没跑 LLM, 没有可记录的决策)。
+	for _, a := range k.agents {
+		if k.frozen[a.ID] {
+			actions[a.ID] = &SocialRoundAction{Action: "listen"}
+		}
+	}
 
 	// speak 进环境 (interview 是私聊不进环境), 环境只保留最近 HistoryK 条。
 	for _, a := range k.agents {
@@ -367,7 +505,10 @@ func (k *SocialKernel) runRound(ctx context.Context, round int) (map[string]*Soc
 	return actions, nil
 }
 
-// roundPrompt 组装单个 agent 的轮内输入: profile + stance + 最近环境消息 + 邻居立场快照。
+// roundPrompt 组装单个 agent 的轮内输入: profile + stance + 最近环境消息 + 邻居立场。
+// ③ 邻居集由 adjacency 限定 (full=全员, ring/smallworld=各有向边), 只见邻居不见全图;
+// MemoryRounds>0 时邻居给最近 N 轮轨迹趋势 (升/降/平) 而非单点值 ——
+// "他三天前反对、昨天沉默、今天中立" 比 "他现在 0.1" 更能驱动立场调整。
 // 动态段 (身份/当前立场/邻居/环境消息) 每轮每 agent 不同; 静态模板段只记录一次,
 // 供 KernelDetail 展示"轮内 prompt 是怎么设计的"。
 func (k *SocialKernel) roundPrompt(a *SocialAgent, round int) string {
@@ -376,12 +517,16 @@ func (k *SocialKernel) roundPrompt(a *SocialAgent, round int) string {
 	fmt.Fprintf(&sb, "%s: %s\n", p.SceneNoun, k.objective)
 	fmt.Fprintf(&sb, "你是: %s (%s)\n", a.Name, a.Profile)
 	fmt.Fprintf(&sb, "你当前的立场: %.2f (%s, -1反向 .. +1正向), 固执度 %.2f\n", a.Stance, p.StanceLabel, a.Stubbornness)
-	fmt.Fprintf(&sb, "第 %d/%d 轮。邻居立场快照:\n", round, k.cfg.Rounds)
+	fmt.Fprintf(&sb, "第 %d/%d 轮。邻居立场:\n", round, k.cfg.Rounds)
 	for _, b := range k.agents {
-		if b.ID == a.ID {
-			continue
+		if b.ID == a.ID || k.adjacency[a.ID][b.ID] <= 0 {
+			continue // ③ 非邻居不可见 (full 拓扑下即全员可见, 行为同 v1)
 		}
-		fmt.Fprintf(&sb, "- %s: %.2f\n", b.Name, b.Stance)
+		if k.cfg.MemoryRounds > 0 {
+			fmt.Fprintf(&sb, "- %s: %.2f (近%d轮%s)\n", b.Name, b.Stance, k.cfg.MemoryRounds, k.trajectoryTrend(b.ID))
+		} else {
+			fmt.Fprintf(&sb, "- %s: %.2f\n", b.Name, b.Stance)
+		}
 	}
 	if len(k.env) > 0 {
 		sb.WriteString("最近环境消息:\n")
@@ -395,39 +540,190 @@ stance_delta 为本轮立场增量 (-0.2..0.2)。
 输出严格JSON: {"action":"speak","content":"...","stance_delta":0.1}`)
 	if k.roundTemplate == "" {
 		// 模板段 = 静态结构说明 + 决策 schema (动态数值字段以占位符标注)
+		neighborLine := "- <邻居name>: <邻居stance> × 拓扑邻居数 (full=全员)\n"
+		if k.cfg.MemoryRounds > 0 {
+			neighborLine = "- <邻居name>: <邻居stance> (近N轮升/降/平) × 拓扑邻居数\n"
+		}
 		k.roundTemplate = "<场景>: <模拟目标>\n你是: <name> (<profile>)\n" +
 			"你当前的立场: <stance> (" + p.StanceLabel + ", -1反向 .. +1正向), 固执度 <stubbornness>\n" +
-			"第 <r>/<rounds> 轮。邻居立场快照:\n- <邻居name>: <邻居stance> × (N-1)\n" +
+			"第 <r>/<rounds> 轮。邻居立场:\n" + neighborLine +
 			"[最近环境消息: 上轮的 speak 发言, 最多 HistoryK 条]\n" + sb.String()[strings.LastIndex(sb.String(), "决策:"):]
 	}
 	return sb.String()
+}
+
+// trajectoryTrend ③ 邻居立场轨迹趋势: 取最近 MemoryRounds 轮, 首尾差 >=0.05 判升/降, 否则平。
+func (k *SocialKernel) trajectoryTrend(agentID string) string {
+	h := k.stanceHistory[agentID]
+	n := k.cfg.MemoryRounds
+	if len(h) < 2 || n <= 0 {
+		return "平"
+	}
+	start := len(h) - n
+	if start < 0 {
+		start = 0
+	}
+	d := h[len(h)-1] - h[start]
+	switch {
+	case d >= 0.05:
+		return "升"
+	case d <= -0.05:
+		return "降"
+	default:
+		return "平"
+	}
+}
+
+// initTopology ③ spawn 后构建影响图 adjacency。
+// full=完全图 (v1 行为, 每人受其他所有人影响); ring=环格, i 连 i±1..±K (N<=2K 时退化为完全图);
+// smallworld=Watts-Strogatz: 先环格再随机重连 10% 的边 (rand 无种子, 每次模拟不同)。
+// 有向语义: adjacency[a][b]>0 表示 "a 受 b 影响" (信息流入 a)。
+func (k *SocialKernel) initTopology(ctx context.Context) {
+	n := len(k.agents)
+	k.adjacency = make(map[string]map[string]float64, n)
+	addEdge := func(from, to string) {
+		if from == to {
+			return
+		}
+		if k.adjacency[from] == nil {
+			k.adjacency[from] = make(map[string]float64)
+		}
+		k.adjacency[from][to] = 1.0
+	}
+	switch k.cfg.Topology {
+	case "ring", "smallworld":
+		K := k.cfg.TopoK
+		for i, a := range k.agents {
+			for d := 1; d <= K; d++ {
+				addEdge(a.ID, k.agents[(i+d)%n].ID)
+				addEdge(a.ID, k.agents[(i-d+n)%n].ID)
+			}
+		}
+		if k.cfg.Topology == "smallworld" {
+			// WS 重连: 10% 有向边换随机目标 (保持出度, 改变入度分布 → 枢纽节点)。
+			ids := make([]string, 0, n)
+			for _, a := range k.agents {
+				ids = append(ids, a.ID)
+			}
+			for from, tos := range k.adjacency {
+				for to := range tos {
+					if rand.Float64() < 0.1 {
+						delete(k.adjacency[from], to)
+						addEdge(from, ids[rand.Intn(n)])
+					}
+				}
+			}
+		}
+	default: // full
+		for _, a := range k.agents {
+			for _, b := range k.agents {
+				addEdge(a.ID, b.ID)
+			}
+		}
+	}
+	k.persistTopology(ctx)
+}
+
+// rewire ③ 每轮 detect 后按立场同质性重连 (echo chamber 动力学):
+// 每个 agent 断开立场差最大的邻居, 接上立场差最小的非邻居 (若存在)。
+// 只改入边来源, 发出 Type=rewire 事件供过程明细观测网络演化。
+func (k *SocialKernel) rewire(round int) {
+	nameOf := make(map[string]string, len(k.agents))
+	for _, x := range k.agents {
+		nameOf[x.ID] = x.Name
+	}
+	for _, a := range k.agents {
+		var farthest string
+		farthestD := -1.0
+		for to := range k.adjacency[a.ID] {
+			var b *SocialAgent
+			for _, x := range k.agents {
+				if x.ID == to {
+					b = x
+					break
+				}
+			}
+			if b == nil {
+				continue
+			}
+			if d := math.Abs(a.Stance - b.Stance); d > farthestD {
+				farthestD, farthest = d, to
+			}
+		}
+		var closest string
+		closestD := 2.0
+		for _, b := range k.agents {
+			if b.ID == a.ID || k.adjacency[a.ID][b.ID] > 0 {
+				continue
+			}
+			if d := math.Abs(a.Stance - b.Stance); d < closestD {
+				closestD, closest = d, b.ID
+			}
+		}
+		if farthest != "" && closest != "" {
+			delete(k.adjacency[a.ID], farthest)
+			k.adjacency[a.ID][closest] = 1.0
+			payload, _ := json.Marshal(map[string]string{
+				"kind":     "rewire",
+				"evidence": fmt.Sprintf("断开 %s (Δ=%.2f) 改连 %s (Δ=%.2f)", nameOf[farthest], farthestD, nameOf[closest], closestD),
+			})
+			k.emit(SimEvent{RunID: k.runID, Round: round, Type: "rewire", AgentID: a.ID, Payload: payload})
+		}
+	}
+	k.persistTopology(context.Background())
+}
+
+// persistTopology 把当前邻接表落 TopologyStore (best-effort, 失败不阻断模拟)。
+func (k *SocialKernel) persistTopology(ctx context.Context) {
+	if k.topoStore == nil {
+		return
+	}
+	for from, tos := range k.adjacency {
+		for to, w := range tos {
+			_ = k.topoStore.PutTopologyEdge(ctx, k.runID, from, to, w)
+		}
+	}
 }
 
 // updateStances FJ 模型立场更新:
 //
 //	stance_a(t+1) = clamp(stub_a·stance_a(t) + (1-stub_a)·Σ w_ab·stance_b(t) + delta_a)
 //
-// 其中 w_ab 按最近一轮发言中 b 被提及次数归一化 (提及越多权重越高),
-// 无人被提及时退化为对其他 agent 的均匀权重。
-func (k *SocialKernel) updateStances(round int, actions map[string]*SocialRoundAction) {
+// ③ 邻居集由 adjacency 限定 (full=全员, ring/smallworld=各有向边),
+// 边权重 = 基础拓扑权重 × (1 + 最近一轮提及加成), 邻居内归一化。
+// 无边/无提及时该 agent 本轮只受自身 stub 与 delta 影响 (孤岛行为)。
+// 返回本轮 max|Δstance| 并刷新 frozen 集 (①自适应终止的依据, 也是省 LLM 的开关)。
+func (k *SocialKernel) updateStances(round int, actions map[string]*SocialRoundAction) float64 {
 	mentions := k.roundMentions()
+	maxDelta := 0.0
+	k.frozen = make(map[string]bool, len(k.agents))
 	for _, a := range k.agents {
+		prev := a.Stance
 		act := actions[a.ID]
 		var pull float64
 		var wsum float64
-		for _, b := range k.agents {
-			if b.ID == a.ID {
+		// ③ 拓扑限定邻居: 只累加有边的 b (full 拓扑即全员)。
+		for bID, baseW := range k.adjacency[a.ID] {
+			var b *SocialAgent
+			for _, x := range k.agents {
+				if x.ID == bID {
+					b = x
+					break
+				}
+			}
+			if b == nil {
 				continue
 			}
-			w := mentions[a.ID][b.ID]
+			w := baseW * (1 + mentions[a.ID][b.ID])
 			pull += w * b.Stance
 			wsum += w
 		}
 		var neighborMean float64
-		if wsum > 0 {
+		switch {
+		case wsum > 0:
 			neighborMean = pull / wsum
-		} else if len(k.agents) > 1 {
-			// 无提及: 均匀权重
+		case len(k.agents) > 1 && k.cfg.Topology == "full":
+			// full 拓扑无提及退化: 均匀权重 (保持 v1 行为)。
 			var s float64
 			for _, b := range k.agents {
 				if b.ID != a.ID {
@@ -435,7 +731,8 @@ func (k *SocialKernel) updateStances(round int, actions map[string]*SocialRoundA
 				}
 			}
 			neighborMean = s / float64(len(k.agents)-1)
-		} else {
+		default:
+			// 拓扑邻居都没有 (孤岛/尚无发言): 只守自己的立场。
 			neighborMean = a.Stance
 		}
 		next := a.Stubbornness*a.Stance + (1-a.Stubbornness)*neighborMean
@@ -443,11 +740,20 @@ func (k *SocialKernel) updateStances(round int, actions map[string]*SocialRoundA
 			next += act.StanceDelta
 		}
 		a.Stance = clampStance(next)
+		// ① 记录本轮 |Δ| 与冻结标记。
+		if d := math.Abs(a.Stance - prev); d > maxDelta {
+			maxDelta = d
+		}
+		if math.Abs(a.Stance-prev) < k.cfg.Epsilon {
+			k.frozen[a.ID] = true
+		}
+		k.stanceHistory[a.ID] = append(k.stanceHistory[a.ID], a.Stance)
 
 		payload, _ := json.Marshal(map[string]any{"stance": a.Stance, "stubbornness": a.Stubbornness})
 		k.emit(SimEvent{RunID: k.runID, Round: round, Type: "stance", AgentID: a.ID, Payload: payload})
 	}
 	k.metrics = append(k.metrics, k.computeMetrics())
+	return maxDelta
 }
 
 // roundMentions 统计最近一轮各 agent 发言内容中对其他 agent 的提及次数。
@@ -643,8 +949,8 @@ func (k *SocialKernel) report(ctx context.Context, chatID string) *SimulationRes
 		scenarios = fallbackScenarios
 	}
 	if summary == "" {
-		summary = fmt.Sprintf("%s 内核模拟 %d agent × %d 轮: 终局形成 %d 个立场簇, 检测到 %d 类涌现。",
-			k.cfg.Mode, len(k.agents), k.cfg.Rounds, len(clusters), len(k.emergent))
+		summary = fmt.Sprintf("%s 内核模拟 %d agent × %d/%d 轮 (%s): 终局形成 %d 个立场簇, 检测到 %d 类涌现。",
+			k.cfg.Mode, len(k.agents), k.roundsRun, k.cfg.Rounds, k.stopReason, len(clusters), len(k.emergent))
 	}
 
 	trajectory := make(map[string][]float64, len(k.agents))
@@ -673,10 +979,11 @@ func (k *SocialKernel) report(ctx context.Context, chatID string) *SimulationRes
 		curves["clustering"] = append(curves["clustering"], m.Clustering)
 	}
 
-	k.notify(chatID, fmt.Sprintf("🌐 %s 内核完成: %d 簇, 涌现 %d 类", k.cfg.Mode, len(clusters), len(k.emergent)))
+	k.notify(chatID, fmt.Sprintf("🌐 %s 内核完成: %d 簇, 涌现 %d 类, %d/%d 轮 (%s)",
+		k.cfg.Mode, len(clusters), len(k.emergent), k.roundsRun, k.cfg.Rounds, k.stopReason))
 	return &SimulationResult{
 		Mode:         k.cfg.Mode,
-		Rounds:       k.cfg.Rounds,
+		Rounds:       k.roundsRun, // ① 实际跑的轮数 (预算帽在 kernel_detail.cfg.rounds)
 		Scenarios:    scenarios,
 		Emergent:     k.emergent,
 		Summary:      summary,
@@ -722,6 +1029,14 @@ func (k *SocialKernel) kernelDetail() *KernelDetail {
 			if json.Unmarshal(ev.Payload, &p) == nil {
 				ke.Kind, ke.Evidence = p.Kind, p.Evidence
 			}
+		case "rewire": // ③ 同质性重连事件: Content 记录断谁连谁, 网络演化可复现。
+			var p struct {
+				Kind     string `json:"kind"`
+				Evidence string `json:"evidence"`
+			}
+			if json.Unmarshal(ev.Payload, &p) == nil {
+				ke.Kind, ke.Evidence = p.Kind, p.Evidence
+			}
 		}
 		events = append(events, ke)
 	}
@@ -738,19 +1053,50 @@ func (k *SocialKernel) kernelDetail() *KernelDetail {
 	}
 	return &KernelDetail{
 		Cfg: KernelCfgView{
-			NumAgents:   k.cfg.NumAgents,
-			Rounds:      k.cfg.Rounds,
-			HistoryK:    k.cfg.HistoryK,
-			MaxConcur:   k.cfg.MaxConcur,
-			DefaultStub: k.cfg.DefaultStub,
+			NumAgents:    k.cfg.NumAgents,
+			Rounds:       k.cfg.Rounds,
+			HistoryK:     k.cfg.HistoryK,
+			MaxConcur:    k.cfg.MaxConcur,
+			DefaultStub:  k.cfg.DefaultStub,
+			Epsilon:      k.cfg.Epsilon,
+			EntropyDelta: k.cfg.EntropyDelta,
+			MinRounds:    k.cfg.MinRounds,
+			Topology:     k.cfg.Topology,
+			TopoK:        k.cfg.TopoK,
+			Rewire:       k.cfg.Rewire,
+			MemoryRounds: k.cfg.MemoryRounds,
 		},
 		Prompts: KernelPrompts{
 			Spawn:         k.spawnPrompt,
 			RoundTemplate: k.roundTemplate,
 		},
-		Agents: designs,
-		Events: events,
+		Agents:     designs,
+		Events:     events,
+		StopReason: k.stopReason,
+		RoundsRun:  k.roundsRun,
+		Topology:   k.topologySnapshot(),
 	}
+}
+
+// topologySnapshot ③ 把终态邻接表导出为 KernelTopology 边集 (过程明细的网络快照)。
+// initTopology 保证 adjacency 非 nil; full/ring/smallworld 终态边集都在其中 (含 rewire 演化)。
+func (k *SocialKernel) topologySnapshot() *KernelTopology {
+	if k.adjacency == nil {
+		return nil
+	}
+	snap := &KernelTopology{Type: k.cfg.Topology, K: k.cfg.TopoK, Rewire: k.cfg.Rewire}
+	for from, tos := range k.adjacency {
+		for to, w := range tos {
+			snap.Edges = append(snap.Edges, KernelEdge{From: from, To: to, Weight: w})
+		}
+	}
+	sort.Slice(snap.Edges, func(i, j int) bool {
+		if snap.Edges[i].From != snap.Edges[j].From {
+			return snap.Edges[i].From < snap.Edges[j].From
+		}
+		return snap.Edges[i].To < snap.Edges[j].To
+	})
+	return snap
 }
 
 // emit 写 SimEvent: 内存留档 + 挂接的 recorder (JSONL 兜底或注入的 SwarmStore)。

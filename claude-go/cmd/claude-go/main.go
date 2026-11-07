@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -6455,8 +6456,10 @@ func swarmCmd() *cobra.Command {
 		},
 	}
 
-	var simMode, simDetail string
-	var simAgents, simRounds int
+	var simMode, simDetail, simTopology string
+	var simAgents, simRounds, simMemoryRounds int
+	var simRewire bool
+	var simEpsilon float64
 	simulateCmd := &cobra.Command{
 		Use:   "simulate <场景目标>",
 		Short: "多Agent场景模拟与涌现行为检测",
@@ -6468,7 +6471,10 @@ func swarmCmd() *cobra.Command {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
 			defer cancel()
-			cfg := swarmintel.SimulationConfig{Mode: simMode, Agents: simAgents, Rounds: simRounds, Detail: simDetail}
+			cfg := swarmintel.SimulationConfig{
+				Mode: simMode, Agents: simAgents, Rounds: simRounds, Detail: simDetail,
+				Topology: simTopology, Rewire: simRewire, MemoryRounds: simMemoryRounds, Epsilon: simEpsilon,
+			}
 			result, err := si.Simulate(ctx, "cli", strings.Join(args, " "), cfg)
 			if err != nil {
 				return fmt.Errorf("模拟失败: %w", err)
@@ -6486,6 +6492,11 @@ func swarmCmd() *cobra.Command {
 					fmt.Printf("  🌊 %s\n", e)
 				}
 			}
+			if result.KernelDetail != nil {
+				fmt.Printf("\n内核: %d/%d 轮 (%s) · 拓扑 %s\n",
+					result.KernelDetail.RoundsRun, result.KernelDetail.Cfg.Rounds, result.KernelDetail.StopReason,
+					result.KernelDetail.Cfg.Topology)
+			}
 			if result.Summary != "" {
 				fmt.Printf("\n%s\n", result.Summary)
 			}
@@ -6495,7 +6506,11 @@ func swarmCmd() *cobra.Command {
 	simulateCmd.Flags().StringVar(&simMode, "mode", "social", "模拟模式: social|game|montecarlo|crisis|org|creative|market|policy|tech")
 	simulateCmd.Flags().StringVar(&simDetail, "detail", "kernel", "引擎档位: kernel=结构化轮次内核 (默认, 8种模式) | fast=单prompt叙事")
 	simulateCmd.Flags().IntVar(&simAgents, "agents", 5, "模拟 Agent 数量")
-	simulateCmd.Flags().IntVar(&simRounds, "rounds", 3, "模拟轮数")
+	simulateCmd.Flags().IntVar(&simRounds, "rounds", 3, "模拟轮数预算帽 (自适应终止可能提前收敛)")
+	simulateCmd.Flags().StringVar(&simTopology, "topology", "", "影响图拓扑: full=完全图(默认) | ring=环格 | smallworld=小世界")
+	simulateCmd.Flags().BoolVar(&simRewire, "rewire", false, "每轮后按立场同质性重连 (echo chamber 动力学)")
+	simulateCmd.Flags().IntVar(&simMemoryRounds, "memory-rounds", 0, "轮内 prompt 携带邻居最近 N 轮立场轨迹 (默认 3, 0=关闭)")
+	simulateCmd.Flags().Float64Var(&simEpsilon, "epsilon", 0, "自适应收敛阈值 |Δstance|, 默认 0.03")
 
 	var histN int
 	// 离线引擎: 不 buildEngine (不调 LLM), 但存储后端遵循 SWARM_STORE/AGENTDB_URL env,
@@ -6555,8 +6570,91 @@ func swarmCmd() *cobra.Command {
 		},
 	}
 
+	// ② 回溯评测 harness: 批量事件 × 内核模拟, 用实际结局校验群体预测力。
+	// 输入: --batch <file|-> (JSON 数组, - = stdin) 或 --demo (内置 4 事件样例)。
+	// 例: claude-go swarm sim-eval --demo --json
+	//     echo '[{"id":"e1","objective":"...","actual_stance":0.6}]' | claude-go swarm sim-eval --batch - --json
+	var evalBatch, evalMode, evalTopology string
+	var evalAgents, evalRounds int
+	var evalDemo bool
+	simEvalCmd := &cobra.Command{
+		Use:   "sim-eval",
+		Short: "回溯评测: 用真实事件结局校验模拟的预测命中率 (backtest harness)",
+		Long: `对一批带实际结局的事件跑社会模拟, 把 plurality 立场簇当成群体预测:
+hit = sign(plurality) == sign(actual) 且 |plurality| >= 0.1。
+输出 Scorecard (命中率 + 平均距离), 是 M5 "比基线好" 的验收工具。`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var events []swarmintel.EvalEvent
+			switch {
+			case evalDemo:
+				events = []swarmintel.EvalEvent{
+					{ID: "demo-eviction", Objective: "某大城市推出严格租客保护法案, 一年后房东大规模退出租赁市场了吗?", ActualStance: 0.4},
+					{ID: "demo-remote", Objective: "某科技公司强制全员回办公室, 六个月后核心工程师流失加剧了吗?", ActualStance: 0.5},
+					{ID: "demo-rate", Objective: "央行连续加息后, 下一年房价显著下跌了吗?", ActualStance: -0.5},
+					{ID: "demo-union", Objective: "某游戏公司成立工会后, 一年内项目交付效率明显下降了吗?", ActualStance: 0.1},
+				}
+			case evalBatch != "":
+				var raw []byte
+				var err error
+				if evalBatch == "-" {
+					raw, err = io.ReadAll(os.Stdin)
+				} else {
+					raw, err = os.ReadFile(evalBatch)
+				}
+				if err != nil {
+					return fmt.Errorf("读取评测集失败: %w", err)
+				}
+				if err := json.Unmarshal(raw, &events); err != nil {
+					return fmt.Errorf("评测集解析失败 (期望 JSON 数组 [{id,objective,actual_stance}]): %w", err)
+				}
+			default:
+				return fmt.Errorf("请指定 --batch <file|-> 或 --demo")
+			}
+			if len(events) == 0 {
+				return fmt.Errorf("评测集为空")
+			}
+			si, err := newSwarmEngine()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
+			defer cancel()
+			cfg := swarmintel.SimulationConfig{
+				Mode: evalMode, Agents: evalAgents, Rounds: evalRounds,
+				Topology: evalTopology, Detail: "kernel",
+			}
+			sc := si.EvalBatch(ctx, events, cfg)
+			if jsonOut {
+				return emitJSON(sc)
+			}
+			fmt.Println(sc.Describe())
+			for _, r := range sc.Results {
+				mark := "✗"
+				if r.Hit {
+					mark = "✓"
+				}
+				line := fmt.Sprintf("  %s %-16s 群体 %.2f vs 实际 %.2f (距离 %.2f)", mark, r.ID, r.PluralityMean, r.ActualStance, r.Margin)
+				if r.StopReason != "" {
+					line += fmt.Sprintf(" · %d轮 %s", r.RoundsRun, r.StopReason)
+				}
+				if r.Error != "" {
+					line += " · 错误: " + r.Error
+				}
+				fmt.Println(line)
+			}
+			return nil
+		},
+	}
+	simEvalCmd.Flags().StringVar(&evalBatch, "batch", "", "评测集 JSON 文件路径, - = stdin: [{\"id\",\"objective\",\"actual_stance\"}]")
+	simEvalCmd.Flags().BoolVar(&evalDemo, "demo", false, "跑内置 4 事件演示评测集")
+	simEvalCmd.Flags().StringVar(&evalMode, "mode", "social", "模拟模式 (同 simulate --mode)")
+	simEvalCmd.Flags().IntVar(&evalAgents, "agents", 5, "每事件模拟 Agent 数量")
+	simEvalCmd.Flags().IntVar(&evalRounds, "rounds", 3, "每事件轮数预算帽")
+	simEvalCmd.Flags().StringVar(&evalTopology, "topology", "", "影响图拓扑 (同 simulate --topology)")
+
 	cmd.AddCommand(predictCmd)
 	cmd.AddCommand(simulateCmd)
+	cmd.AddCommand(simEvalCmd)
 	cmd.AddCommand(historyCmd)
 	cmd.AddCommand(resolveCmd)
 	return cmd

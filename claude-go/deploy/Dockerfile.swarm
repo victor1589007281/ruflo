@@ -1,0 +1,2 @@
+FROM claude-go:agents-swarmv3-20261106-2336
+COPY claude-go-linux /usr/local/bin/claude-go

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,13 +104,16 @@ func TestSocialKernel_SixBySix(t *testing.T) {
 	if fake.reportCalls != 1 {
 		t.Fatalf("report 应恰好 1 次 LLM 调用, 实际 %d", fake.reportCalls)
 	}
-	// 6 轮 × 6 agent = 36 次轮内调用 (+ 容许 FanOut 超时降级, 这里 fake 不会失败)
-	if fake.roundCalls != 36 {
-		t.Fatalf("轮内调用应 36 次, 实际 %d", fake.roundCalls)
-	}
 
-	if res.Mode != "social" || res.Rounds != 6 {
+	if res.Mode != "social" || res.Rounds <= 0 || res.Rounds > 6 {
 		t.Fatalf("结果元信息不对: %+v", res)
+	}
+	roundsRun := res.Rounds // ① 自适应终止后 = 实际跑的轮数 (≤ 预算帽 6)
+	if res.KernelDetail == nil || res.KernelDetail.RoundsRun != roundsRun {
+		t.Fatalf("kernel_detail.rounds_run 应与结果一致: %+v", res.KernelDetail)
+	}
+	if res.KernelDetail.StopReason == "" {
+		t.Fatalf("kernel_detail.stop_reason 不应为空")
 	}
 	if len(res.Scenarios) == 0 {
 		t.Fatalf("scenarios 不应为空")
@@ -119,22 +123,29 @@ func TestSocialKernel_SixBySix(t *testing.T) {
 			t.Fatalf("scenario 缺 name: %+v", sc)
 		}
 	}
-	// 轨迹: 每个 agent 6 个 stance 点
+	// ① 提前收敛是默认预期: 强固执度 agent 首轮 |Δ|<ε 即冻结, 后续轮跳过 LLM。
+	// fake LLM 永不失败, 所以轮内调用数必 < 6×6=36 (除非全跑满, 那也是合法 budget)。
+	if fake.roundCalls > 36 {
+		t.Fatalf("轮内调用不应超过 36, 实际 %d", fake.roundCalls)
+	}
+	t.Logf("自适应终止: %d/%d 轮 (%s), LLM 轮内调用 %d 次 (满预算 36)",
+		roundsRun, res.KernelDetail.Cfg.Rounds, res.KernelDetail.StopReason, fake.roundCalls)
+	// 轨迹: 每个 agent roundsRun 个 stance 点 (每轮全员 FJ 更新, 冻结只跳过 LLM)
 	if len(res.Trajectory) != 6 {
 		t.Fatalf("轨迹应覆盖 6 个 agent, 实际 %d", len(res.Trajectory))
 	}
 	for id, tr := range res.Trajectory {
-		if len(tr) != 6 {
-			t.Fatalf("agent %s 轨迹应有 6 轮, 实际 %d", id, len(tr))
+		if len(tr) != roundsRun {
+			t.Fatalf("agent %s 轨迹应有 %d 轮, 实际 %d", id, roundsRun, len(tr))
 		}
 	}
 	for name, curve := range res.MetricCurves {
-		if len(curve) != 6 {
-			t.Fatalf("指标曲线 %s 应有 6 轮, 实际 %d", name, len(curve))
+		if len(curve) != roundsRun {
+			t.Fatalf("指标曲线 %s 应有 %d 轮, 实际 %d", name, roundsRun, len(curve))
 		}
 	}
 
-	// SimEvent 落盘验证: JSONL 兜底写入 stance/action/emergence 三类
+	// SimEvent 落盘验证: JSONL 兜底写入 stance/action 两类
 	raw, err := os.ReadFile(filepath.Join(dir, "events", "social.jsonl"))
 	if err != nil {
 		t.Fatalf("读取 JSONL 失败: %v", err)
@@ -150,11 +161,12 @@ func TestSocialKernel_SixBySix(t *testing.T) {
 			t.Fatalf("SimEvent 缺 run_id")
 		}
 	}
-	if kinds["stance"] != 36 {
-		t.Fatalf("stance 事件应 36 条, 实际 %d", kinds["stance"])
+	if kinds["stance"] != 6*roundsRun {
+		t.Fatalf("stance 事件应 %d 条, 实际 %d", 6*roundsRun, kinds["stance"])
 	}
-	if kinds["action"] != 36 {
-		t.Fatalf("action 事件应 36 条, 实际 %d", kinds["action"])
+	// ① 冻结 agent 不发 action 事件 ⇒ action 数 == 实际 LLM 轮内调用数。
+	if kinds["action"] != fake.roundCalls {
+		t.Fatalf("action 事件应等于轮内调用数 %d, 实际 %d", fake.roundCalls, kinds["action"])
 	}
 
 	// 实测输出样本 (验收清单第 3 项): 打印轨迹 + 指标曲线 + 涌现
@@ -228,27 +240,95 @@ func TestSocialKernel_S3_ShuffleKillsPolarization(t *testing.T) {
 		res1.Emergent, res2.Emergent)
 }
 
-// TestSocialKernel_MentionWeights 提及权重: 发言提及谁, FJ 更新就向谁多靠。
+// TestSocialKernel_MentionWeights 提及权重: ③ 全拓扑下提及是加成 —
+// 基础权重来自邻接边, 被提及者额外 ×(1+n)。A1 提及乙 (+0.9) 而不提丙 (-0.9):
+// 加成使 A1 净向乙靠 (对照组无人被提及, 两极拉力抵消归零)。
 func TestSocialKernel_MentionWeights(t *testing.T) {
-	k := NewSocialKernel(&fakeSocialLLM{}, nil, DefaultSocialKernelConfig())
-	k.agents = []*SocialAgent{
-		{ID: "A1", Name: "甲", Profile: "p", Stance: 0.0, Stubbornness: 0.3},
-		{ID: "A2", Name: "乙", Profile: "p", Stance: 0.9, Stubbornness: 0.3},
-		{ID: "A3", Name: "丙", Profile: "p", Stance: -0.9, Stubbornness: 0.3},
+	setup := func() *SocialKernel {
+		k := NewSocialKernel(&fakeSocialLLM{}, nil, DefaultSocialKernelConfig())
+		k.agents = []*SocialAgent{
+			{ID: "A1", Name: "甲", Profile: "p", Stance: 0.0, Stubbornness: 0.3},
+			{ID: "A2", Name: "乙", Profile: "p", Stance: 0.9, Stubbornness: 0.3},
+			{ID: "A3", Name: "丙", Profile: "p", Stance: -0.9, Stubbornness: 0.3},
+		}
+		for _, a := range k.agents {
+			k.stanceHistory[a.ID] = []float64{a.Stance}
+		}
+		k.initTopology(context.Background())
+		return k
 	}
+
+	// 对照: 无人被提及 → 乙丙拉力抵消, A1 不动 (Fj stub 项保持 0)。
+	ctrl := setup()
+	ctrl.updateStances(1, map[string]*SocialRoundAction{
+		"A1": {Action: "listen"}, "A2": {Action: "listen"}, "A3": {Action: "listen"},
+	})
+	if math.Abs(ctrl.agents[0].Stance) > 1e-9 {
+		t.Fatalf("对照组 A1 应不动, 实际 %.3f", ctrl.agents[0].Stance)
+	}
+
+	// 实验: A1 发言只提乙 → 加成使 A1 向 +0.9 净移动。
+	k := setup()
 	k.env = []envMessage{{Round: 1, AgentID: "A1", Name: "甲", Content: "我赞同乙的看法"}}
-	actions := map[string]*SocialRoundAction{
+	k.updateStances(1, map[string]*SocialRoundAction{
 		"A1": {Action: "speak", Content: "我赞同乙的看法"},
 		"A2": {Action: "listen"},
 		"A3": {Action: "listen"},
-	}
-	k.updateStances(1, actions)
-	// A1 只提及乙 → 权重全在乙 → A1 应向 +0.9 靠, 而不是向 -0.9
+	})
 	if k.agents[0].Stance <= 0 {
-		t.Fatalf("A1 应向被提及的乙 (+0.9) 靠拢, 实际 stance=%.3f", k.agents[0].Stance)
+		t.Fatalf("A1 应向被提及的乙 (+0.9) 净靠拢, 实际 stance=%.3f", k.agents[0].Stance)
 	}
-	if k.agents[0].Stance < 0.5 {
-		t.Fatalf("A1 靠拢不足 (权重应几乎全部在乙): stance=%.3f", k.agents[0].Stance)
+	// 加成强度: 乙权重=1×2=2, 丙=1 → neighborMean=(2×0.9-0.9)/3=0.3 → A1=0.7×0.3=0.21。
+	if math.Abs(k.agents[0].Stance-0.21) > 1e-9 {
+		t.Fatalf("A1 立场应=0.21 (拓扑基础×提及加成的解析值), 实际 %.3f", k.agents[0].Stance)
+	}
+}
+
+// TestSocialKernel_Topology ③ 拓扑限定邻居: ring 下 A1 只见环上邻居,
+// 非邻居的极端立场不进 FJ 拉力; full 下全员可见 (v1 等价)。
+func TestSocialKernel_Topology(t *testing.T) {
+	build := func(topo string) *SocialKernel {
+		cfg := DefaultSocialKernelConfig()
+		cfg.Topology = topo
+		cfg.TopoK = 1 // N=4 时 K=2 会退化为完全图 (±1,±2 覆盖全部), K=1 才是 4-环
+		k := NewSocialKernel(&fakeSocialLLM{}, nil, cfg)
+		k.agents = []*SocialAgent{
+			{ID: "A1", Name: "甲", Profile: "p", Stance: 0.0, Stubbornness: 0.3},
+			{ID: "A2", Name: "乙", Profile: "p", Stance: 0.9, Stubbornness: 0.3},
+			{ID: "A3", Name: "丙", Profile: "p", Stance: -0.9, Stubbornness: 0.3},
+			{ID: "A4", Name: "丁", Profile: "p", Stance: 0.9, Stubbornness: 0.3},
+		}
+		for _, a := range k.agents {
+			k.stanceHistory[a.ID] = []float64{a.Stance}
+		}
+		k.initTopology(context.Background())
+		return k
+	}
+
+	// full: A1 受乙(+0.9)/丙(-0.9)/丁(+0.9) 均匀拉 → 均值 +0.3 → A1 = 0.7×0.3 = 0.21。
+	full := build("full")
+	full.updateStances(1, map[string]*SocialRoundAction{
+		"A1": {Action: "listen"}, "A2": {Action: "listen"}, "A3": {Action: "listen"}, "A4": {Action: "listen"},
+	})
+	if math.Abs(full.agents[0].Stance-0.21) > 1e-9 {
+		t.Fatalf("full 拓扑 A1 应=0.21, 实际 %.3f", full.agents[0].Stance)
+	}
+
+	// ring K=1 (N=4): A1 的邻居=±1 → A2, A4 (都 +0.9), 不见丙(-0.9) → 均值 +0.9 → A1 = 0.63。
+	ring := build("ring")
+	ring.updateStances(1, map[string]*SocialRoundAction{
+		"A1": {Action: "listen"}, "A2": {Action: "listen"}, "A3": {Action: "listen"}, "A4": {Action: "listen"},
+	})
+	if math.Abs(ring.agents[0].Stance-0.63) > 1e-9 {
+		t.Fatalf("ring 拓扑 A1 应=0.63 (只看环上邻居), 实际 %.3f", ring.agents[0].Stance)
+	}
+	// 快照: ring 4 节点 K=1 → 每个节点 2 出边 = 8 边。
+	snap := ring.topologySnapshot()
+	if snap == nil || len(snap.Edges) != 8 {
+		t.Fatalf("ring 快照应 8 边, 实际 %v", snap)
+	}
+	if snap.Type != "ring" || snap.K != 1 {
+		t.Fatalf("快照类型/度数不对: %+v", snap)
 	}
 }
 

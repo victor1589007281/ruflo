@@ -920,6 +920,39 @@ func (s *AgentDBStore) SimEvents(runID string) ([]*SimEvent, error) {
 	return events, nil
 }
 
+// ── ③ 拓扑持久化: sim_{runID}_adj 每桶一次模拟 ──
+//
+// 真原语复用: agentDB 服务器零改动 —— 每跑一次内核建一个独立 KV 桶
+// (bucket 即命名空间, 天然按 run 隔离), key="{from}·{to}" 存权重。
+// 读取: cli.KV(bucket).Keys() 列全键 (GET /v1/store/{bucket}/keys),
+// 解析 key 即还原有向边集; 适合事后审计"这轮模拟里谁影响了谁"。
+// 重连边会覆盖同 key (Put 语义), 桶里留的是终态 —— 演化过程看 rewire 事件流。
+
+// 编译期断言: AgentDBStore 满足内核的 TopologyStore 接口。
+var _ TopologyStore = (*AgentDBStore)(nil)
+
+// topoBucket 每 run 一个邻接桶: {ns}_sim_{runID}_adj (runID 已含模式+时间戳)。
+func (s *AgentDBStore) topoBucket(runID string) string {
+	ns := s.ns
+	if ns == "" {
+		ns = "default"
+	}
+	// runID 里的 '-' 在桶名里合法; 防意外字符 (理论不会进来)。
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, runID)
+	return ns + "_sim_" + safe + "_adj"
+}
+
+// PutTopologyEdge 写一条有向影响边 (覆盖语义, 重连后同 key 更新权重)。
+func (s *AgentDBStore) PutTopologyEdge(_ context.Context, runID, from, to string, weight float64) error {
+	return s.cli.KV(s.topoBucket(runID)).Put(from+"·"+to, weight)
+}
+
 // ── AgentDB 后端: W1 Phase 3 (跨会话反思 + 信素语义化) ──
 
 // AppendReflection 追加一条结构化反思: A6 事件流 (主存储, append-only) +
@@ -1139,13 +1172,13 @@ func (s *AgentDBStore) ResolvePrediction(id, actual string, brier float64, resol
 		"brier":          brier,
 		"resolved_at":    resolvedAt.UTC().Format(time.RFC3339),
 	}
-	return s.cli.KV(s.bkt.predict + "_resolved").Put(id, mark)
+	return s.cli.KV(s.bkt.predict+"_resolved").Put(id, mark)
 }
 
 // isResolved 查 KV sidecar: 该预测是否已核销 (幂等守卫, reconstructPending 用)。
 func (s *AgentDBStore) isResolved(id string) bool {
 	var mark map[string]any
-	found, err := s.cli.KV(s.bkt.predict + "_resolved").Get(id, &mark)
+	found, err := s.cli.KV(s.bkt.predict+"_resolved").Get(id, &mark)
 	return err == nil && found
 }
 
