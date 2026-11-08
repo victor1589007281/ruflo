@@ -1,4 +1,5 @@
-# gf-voice: 通用 ASR 服务 (2026-11-08, agents ns)
+# gf-voice: 通用语音服务 (2026-11-08, agents ns): 一次性 ASR + 流式 ASR(silero-vad)
+# + 本地 TTS (CosyVoice2 SFT), 消费方走宿主机转发器的 127.0.0.1:38795 / 100.111.70.76:38795
 #
 # 为什么 hostNetwork: 让 Pod 直接持有端口 38795, Pod 重建/升级端口不变 —— 这是
 # "Pod 重建后外部调用不变"的解。注意 hostNetwork 的"host"是 kind 节点容器的网络
@@ -39,7 +40,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: voice
-          image: voice-service:0.1.0
+          image: voice-service:0.2.0
           imagePullPolicy: Never
           ports: [{ containerPort: 38795, hostPort: 38795 }]
           env:
@@ -47,12 +48,13 @@ spec:
             - name: VOICE_TOKEN
               valueFrom:
                 secretKeyRef: { name: voice-service-token, key: token }
-            # 容器 limit 给 4 核, torch 线程数钉 4, 避免默认按宿主机核数(16)开线程
-            # 在 cgroup 限核下互相踩踏 (threads慢18x 的教训同族)
-            - { name: OMP_NUM_THREADS, value: "4" }
+            # 容器 limit 给 6 核, torch 线程数钉 6 (ASR+TTS 双模型常驻, CosyVoice2
+            # CPU 合成是重活), 避免默认按宿主机核数(16)开线程在 cgroup 限核下互相踩踏
+            - { name: OMP_NUM_THREADS, value: "6" }
           resources:
-            requests: { cpu: "1", memory: 2Gi }
-            limits: { cpu: "4", memory: 6Gi }
+            # 内存: SenseVoiceSmall ~1.5G + CosyVoice2 ~2.5G + torch 开销, 给 10G 余量
+            requests: { cpu: "2", memory: 3Gi }
+            limits: { cpu: "6", memory: 10Gi }
           # 模型加载 (936M 参数 + torch 初始化) 在弱核上可能要 1-2min:
           # startupProbe 只看进程活没活 (/healthz 永远 200), readiness 才等模型就绪
           startupProbe:
