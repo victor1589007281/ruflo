@@ -200,7 +200,7 @@ func defaultMillisecondBuckets() []float64 {
 func initPrometheusMetrics() {
 	promReg = prometheus.NewRegistry()
 
-	llmLabels := []string{"model", "model_alias", "status", "source", "purpose", "workflow", "role", "stop_reason", "error_kind", "http_status", "stream"}
+	llmLabels := []string{"model", "model_alias", "status", "source", "purpose", "workflow", "role", "stop_reason", "error_kind", "http_status", "stream", "owner", "app"}
 	teamLabels := []string{"team", "stage", "role", "workflow"}
 	dreamLabels := []string{"trigger_source", "consolidator_result"}
 	memLabels := []string{"memory_type"}
@@ -705,7 +705,7 @@ func recordPromMetric(module, name string, value float64, labels map[string]stri
 		return pl
 	}
 
-	llmNeed := []string{"model", "model_alias", "status", "source", "purpose", "workflow", "role", "stop_reason", "error_kind", "http_status", "stream"}
+	llmNeed := []string{"model", "model_alias", "status", "source", "purpose", "workflow", "role", "stop_reason", "error_kind", "http_status", "stream", "owner", "app"}
 	llmComponentNeed := append([]string{}, llmNeed...)
 	llmComponentNeed = append(llmComponentNeed, "component")
 	teamNeed := []string{"team", "stage", "role", "workflow"}
