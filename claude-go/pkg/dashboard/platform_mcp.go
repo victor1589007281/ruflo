@@ -21,6 +21,7 @@ package dashboard
 // "忘了接线所以永远不可用"。未注入时 (只读 :7777 dashboard) 任务类工具如实报错。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/platformmcp"
+	"github.com/anthropic/claude-go/pkg/types"
 )
 
 // PlatformMCPPath 是平台 MCP server 的 HTTP 端点路径。
@@ -153,7 +155,11 @@ func (b platformMCPBackend) Tasks() (any, error) {
 // 注意：幂等键由 TaskService 从 team|workflow|objective 派生, 因此**同参数重复提交
 // 会被判为同一次运行**而不是排两个队; 想真正再跑一遍必须改动 objective。
 // team 必填且要过 safeName: 它同时是运行身份 (落盘目录名) 与幂等键的一半。
-func (b platformMCPBackend) SubmitTask(spec platformmcp.TaskSubmit) (any, error) {
+//
+// 来源身份 (app) 的优先级：ctx  stamping（HTTP 中间件按注册表 token 或 X-App-Id 头写入）
+// > body 自报字段（spec.App，一律包 claimed: 形态，见 pkg/types/app.go）。理由与 owner
+// 的"自报不等于身份"相同：没有凭据背书的自报值只能观测、不能信任。
+func (b platformMCPBackend) SubmitTask(ctx context.Context, spec platformmcp.TaskSubmit) (any, error) {
 	ts := taskService()
 	if ts == nil {
 		return nil, fmt.Errorf("%w: 本进程未注入 TaskService —— 请直连 :18080 "+
@@ -166,12 +172,20 @@ func (b platformMCPBackend) SubmitTask(spec platformmcp.TaskSubmit) (any, error)
 	if !safeName(team) {
 		return nil, fmt.Errorf("非法团队名 %q", team)
 	}
+	app := types.AppFromContext(ctx)
+	if app == types.DefaultAppID && strings.TrimSpace(spec.App) != "" {
+		app = types.ClaimedApp(spec.App)
+	}
+	appRef := types.AppRefFromContext(ctx)
+	if appRef == "" {
+		appRef = spec.AppRef
+	}
 	rec, err := ts.Submit(agent.TaskSpec{
 		Team:      team,
 		Workflow:  strings.TrimSpace(spec.Workflow),
 		Objective: strings.TrimSpace(spec.Objective),
 		Language:  strings.TrimSpace(spec.Language),
-	}, agent.SubmitOpts{Source: "platform-mcp"})
+	}, agent.SubmitOpts{Source: "platform-mcp", App: app, AppRef: appRef})
 	if err != nil {
 		return nil, err
 	}

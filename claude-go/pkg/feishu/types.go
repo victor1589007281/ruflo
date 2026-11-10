@@ -228,6 +228,9 @@ type WikiConfig struct {
 	// APISecret API 鉴权密钥 (Bearer token)。
 	// 为空 = 不鉴权 (fail-open, 兼容 8+ 下游平台的历史调用), 详见 pkg/httpauth。
 	APISecret string
+	// APIApps APP 凭据注册表 (token → appId), 与 JSON 的 wiki.apiApps 对应。
+	// 登记 token 的调用方请求会被鉴权放行，且来源被背书成登记的 appId。
+	APIApps []AppCredentialSection
 	// APIHost HTTP API 监听地址的 host 部分。空 = 绑全部网卡 (历史行为,
 	// 局域网与 tailscale 均可访问)。想收回本机请设 "127.0.0.1"。
 	// 注意本端口不只承载 /wiki/*, dashboard 的 /api/* 与 cluster 的
@@ -575,6 +578,16 @@ type WikiSection struct {
 	APIPort       int      `json:"apiPort,omitempty"`
 	APISecret     string   `json:"apiSecret,omitempty"`
 	APIHost       string   `json:"apiHost,omitempty"`
+	// APIApps 是 APP 凭据注册表 (token → appId)。登记的 token 既放行鉴权又把
+	// 请求来源背书成该 appId (verified)；未登记的 X-App-Id 自报头一律记
+	// claimed:<id>。见 pkg/httpauth.AppEntry 与 pkg/types/app.go。
+	APIApps []AppCredentialSection `json:"apiApps,omitempty"`
+}
+
+// AppCredentialSection 一条 APP 凭据 (JSON 形态，与 pkg/httpauth.AppEntry 同构)。
+type AppCredentialSection struct {
+	App   string `json:"app"`
+	Token string `json:"token"`
 }
 
 // SkillsSection 技能配置段
@@ -1130,6 +1143,11 @@ func (jc *JSONConfig) ApplyToBot(bc *BotConfig) {
 		}
 		if jc.Wiki.APISecret != "" {
 			bc.Wiki.APISecret = jc.Wiki.APISecret
+		}
+		if len(jc.Wiki.APIApps) > 0 {
+			// 拷贝而不是共用底层数组: JSON 解析出的切片后续可能被复用/改写，
+			// 运行态配置持独立副本，注册表内容不被外部意外改动。
+			bc.Wiki.APIApps = append([]AppCredentialSection(nil), jc.Wiki.APIApps...)
 		}
 		if jc.Wiki.APIHost != "" {
 			bc.Wiki.APIHost = jc.Wiki.APIHost

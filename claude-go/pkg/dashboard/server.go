@@ -60,6 +60,10 @@ type Config struct {
 	// Secret 本 dashboard 自身 /api/* 的鉴权 token。空 = 不鉴权 (fail-open),
 	// 详见 pkg/httpauth 的包注释。
 	Secret string
+	// Apps APP 凭据注册表 (token → appId)，与 Secret 一起交给 httpauth.Middleware：
+	// 登记 token 的调用方放行且 ctx 被背书成对应 appId（verified），
+	// 未登记的 X-App-Id 自报头一律 claimed:<id>。nil = 纯未知来源观测。
+	Apps []httpauth.AppEntry
 	// LLMComplete LLM 文本补全回调 (供 LLM 生成工作流编排/skill); nil 时返回 503。
 	// 由主进程(feishu bot)注入其 LLM 客户端。
 	LLMComplete func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
@@ -244,7 +248,7 @@ func (s *Server) ListenAndServe() error {
 	httpauth.WarnIfExposed("dashboard", ln.Addr().String(), s.cfg.Secret)
 	// 用 panic-recovery 包装 handler, 防止任意 handler panic 导致进程崩溃;
 	// 鉴权在 recovery 之外, 使未授权请求不进入任何业务 handler。
-	s.server.Handler = httpauth.Middleware(httpauth.Config{Secret: s.cfg.Secret})(
+	s.server.Handler = httpauth.Middleware(httpauth.Config{Secret: s.cfg.Secret, Apps: s.cfg.Apps})(
 		recoverMiddleware{handler: s.mux})
 	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err

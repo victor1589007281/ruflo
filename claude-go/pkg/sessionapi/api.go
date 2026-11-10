@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
+	"github.com/anthropic/claude-go/pkg/types"
 )
 
 // Spec 一个会话的身份声明。
@@ -75,6 +76,15 @@ type Spec struct {
 	// 什么都没有的工具箱 (装配自报只在日志里, HTTP 调用方永远看不到)。
 	// 考场/巡检这类由平台驱动的会话必须钉档, 不允许按消息内容漂移。
 	ToolProfile string `json:"toolProfile,omitempty"`
+
+	// App / AppRef 是本会话的调用方来源标识。**持久化进 Spec** 是关键：
+	// 消息 run 的 ctx 刻意脱离请求 ctx（Background + cancel，见 postMessage），
+	// 运行期能读到的唯一稳定载体就是这里。HTTP 创建时由中间件 stamping 写入
+	// 生效值（verified/claimed），直接 Ensure 的内部创建方（pkg/feishu）应显式
+	// 置 internal:<module>；空 = 该会话来源未知（旧档案兼容）。
+	// 形态约定见 pkg/types/app.go。
+	App    string `json:"app,omitempty"`
+	AppRef string `json:"appRef,omitempty"`
 }
 
 // ToolsAllow 是构造"只允许这些工具"的白名单的便捷写法。
@@ -238,6 +248,29 @@ type Run struct {
 // 会把它吃光。淘汰按 StartedAt 从旧到新。
 const maxRetainedRuns = 200
 
+// effectiveApp 合并 ctx stamping 与请求体自报字段：ctx 有身份（verified 或
+// claimed: 头）就以 ctx 为准；ctx 是 unknown 且 body 自报了，包成 claimed: 形态
+// 采用。全部为空返回 types.DefaultAppID —— Spec.App 持久化后永不为空，
+// 旧档案读出来才是空串（等效 unknown）。
+func effectiveApp(ctx context.Context, bodyApp string) string {
+	if app := types.AppFromContext(ctx); app != types.DefaultAppID {
+		return app
+	}
+	if strings.TrimSpace(bodyApp) != "" {
+		return types.ClaimedApp(bodyApp)
+	}
+	return types.DefaultAppID
+}
+
+// effectiveRef 合并 ctx 与 body 的参考号：ctx 有值以 ctx 为准，否则用 body 值。
+// 参考号是调用方自由文本，原样透传不归一。
+func effectiveRef(ctx context.Context, bodyRef string) string {
+	if ref := types.AppRefFromContext(ctx); ref != "" {
+		return ref
+	}
+	return bodyRef
+}
+
 // Server 会话 HTTP 面的处理器。
 type Server struct {
 	host func() Host
@@ -297,6 +330,11 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "id 不能为空")
 			return
 		}
+		// 来源身份：ctx stamping（中间件按注册表 token / X-App-Id 头写入）优先；
+		// 请求体自报字段只在 ctx 无身份时采用，且一律包 claimed: 形态 ——
+		// 与 platformmcp.SubmitTask / pkg/types.app 的"自报不等于身份"同一原则。
+		sp.App = effectiveApp(r.Context(), sp.App)
+		sp.AppRef = effectiveRef(r.Context(), sp.AppRef)
 		if err := h.Ensure(sp); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -439,7 +477,8 @@ func (s *Server) handleSessionItem(w http.ResponseWriter, r *http.Request) {
 //	设计权衡：异步 + runId 而不是同步长连接, 让慢 run 不占用调用方的连接预算; 代价是调用方
 //	      要多一次轮询或订阅。
 func (s *Server) postMessage(w http.ResponseWriter, r *http.Request, h Host, id string) {
-	if _, err := h.Get(id); err != nil {
+	sp, err := h.Get(id)
+	if err != nil {
 		s.writeHostErr(w, err)
 		return
 	}
@@ -485,6 +524,11 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request, h Host, id 
 	// context.Background() —— HTTP 层没有任何手段让一个跑飞的 run 停下来,
 	// 只能干等它自己结束 (或把会话删了, 连同历史一起)。
 	ctx, cancel := context.WithCancel(context.Background())
+	// 来源身份 stamping: run ctx 脱离了请求 ctx，唯一的稳定载体是持久化在
+	// Spec 里的 App/AppRef（创建会话时由中间件/调用方写入）。不在这里盖，
+	// 运行期的 LLM 记账与 trace 会整段退回 unknown。
+	ctx = types.WithApp(ctx, sp.App)
+	ctx = types.WithAppRef(ctx, sp.AppRef)
 	run.cancel = cancel
 
 	go func() {

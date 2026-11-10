@@ -137,7 +137,7 @@ func (b *Bridge) SubmitSync(source string) (*claudesync.Job, error) {
 		Kind:      Kind,
 		Objective: objectivePrefix + source,
 		Params:    map[string]any{ParamSource: source},
-	}, agent.SubmitOpts{Source: "sync"})
+	}, agent.SubmitOpts{Source: "sync", App: "internal:sync"})
 	if err != nil {
 		return nil, err
 	}

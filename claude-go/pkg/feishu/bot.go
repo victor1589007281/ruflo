@@ -35,6 +35,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/dynmcp"
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/hotreload"
+	"github.com/anthropic/claude-go/pkg/httpauth"
 	"github.com/anthropic/claude-go/pkg/llmgw"
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/mcp"
@@ -869,6 +870,14 @@ func NewBot(config *BotConfig) (*Bot, error) {
 			wikiAPI := wiki.NewAPIServer(bot.wikiEngine, config.Wiki.APISecret)
 			wikiAPI.SetBindHost(config.Wiki.APIHost)
 			wikiAPI.SetScheduler(bot.syncScheduler)
+			// APP 凭据注册表 → 来源 stamping。Start 之前必须完成（同 SetSyncSubmitter 的理由）。
+			if len(config.Wiki.APIApps) > 0 {
+				entries := make([]httpauth.AppEntry, 0, len(config.Wiki.APIApps))
+				for _, e := range config.Wiki.APIApps {
+					entries = append(entries, httpauth.AppEntry{App: e.App, Token: e.Token})
+				}
+				wikiAPI.SetApps(entries)
+			}
 			// design/02 §3.5: /sync/* 端点路径与响应形态不变, 执行体改提交 TaskService。
 			// 必须在 Start 之前设置 —— 之后再设会留一个"已在听但还走老路"的窗口。
 			if config.Wiki.SyncTaskSubmitter != nil {

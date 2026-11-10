@@ -57,6 +57,7 @@ import (
 
 	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/statestore"
+	"github.com/anthropic/claude-go/pkg/types"
 )
 
 // ErrStateConflict 乐观并发冲突: 更新携带的期望修订号与档案当前修订号不符
@@ -129,7 +130,9 @@ const (
 type SubmitOpts struct {
 	IdempotencyKey string            // 显式幂等键; 空 = 由 spec 派生
 	IdemScope      IdemScope         // 归并范围; 空 = IdemScopeActive
-	Source         string            // 来源标记: dashboard / cron / feishu / api
+	Source         string            // 来源标记: dashboard / cron / feishu / api (入口通道)
+	App            string            // 调用方 APP 标识 (studyforge/claimed:moqi/internal:cron); 空 = unknown
+	AppRef         string            // 调用方业务参考号 (如指挥台工单号), 原样透传
 	ActionID       string            // 若由动作队列消费而来, 记录动作 ID (可追溯)
 	Meta           map[string]string // 自由标签
 }
@@ -153,7 +156,15 @@ type TaskRecord struct {
 	Revision    int64             `json:"revision,omitempty"`
 	IdemKey     string            `json:"idemKey"`
 	IdemScope   IdemScope         `json:"idemScope"`
+	// Source 是入口通道 (dashboard / platform-mcp / sync), 回答"请求从哪个
+	// 接线拓扑进来"。App 是调用方 APP 维度，回答"哪个外部应用发起了调用"，
+	// 与 Source 正交：同一通道 (platform-mcp) 上跑着多个 APP，靠 Source 分不开。
+	// 形态约定见 pkg/types/app.go：纯 id = 凭据背书，claimed: 前缀 = 自报未背书，
+	// unknown = 未携带。旧档案无此字段，读出来是空串（等效 unknown，不归一以
+	// 保持落盘逐字节稳定）。
 	Source      string            `json:"source,omitempty"`
+	App         string            `json:"app,omitempty"`
+	AppRef      string            `json:"appRef,omitempty"`
 	ActionID    string            `json:"actionId,omitempty"`
 	Attempts    int               `json:"attempts"` // 启动次数 (首跑 + Resume + Refine)
 	SubmittedAt time.Time         `json:"submittedAt"`
@@ -179,7 +190,8 @@ type TaskFilter struct {
 	States []TaskState
 	Team   string
 	Source string
-	Limit  int // <=0 不限
+	App    string // 精确匹配 rec.App; "claimed:" 前缀值按原样匹配（信任级别可见）
+	Limit  int    // <=0 不限
 }
 
 // TaskService 任务机制抽象 (design/01 §4.12)。
@@ -495,6 +507,8 @@ func (s *FileQueueTaskService) Submit(spec TaskSpec, opts SubmitOpts) (TaskRecor
 		IdemKey:     key,
 		IdemScope:   scope,
 		Source:      opts.Source,
+		App:         types.NormalizeApp(opts.App),
+		AppRef:      opts.AppRef,
 		ActionID:    opts.ActionID,
 		SubmittedAt: time.Now(),
 		Meta:        opts.Meta,
@@ -589,6 +603,9 @@ func (s *FileQueueTaskService) List(f TaskFilter) []TaskRecord {
 			continue
 		}
 		if f.Source != "" && rec.Source != f.Source {
+			continue
+		}
+		if f.App != "" && rec.App != f.App {
 			continue
 		}
 		out = append(out, rec)
@@ -717,6 +734,11 @@ func (s *FileQueueTaskService) launchRunner(rec TaskRecord) {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	// 运行期身份 stamping: run ctx 刻意脱离请求 ctx (Background)，任务档案里的
+	// app/appRef 是它唯一稳定的来源载体 —— 不从这里盖，异步跑起来之后 LLM 记账、
+	// trace、metrics 全部退回 unknown，本次提交带来的身份就丢了。
+	ctx = types.WithApp(ctx, rec.App)
+	ctx = types.WithAppRef(ctx, rec.AppRef)
 	s.mu.Lock()
 	s.cancels[rec.ID] = cancel
 	delete(s.desired, rec.ID)
@@ -1136,6 +1158,10 @@ type ActionRecord struct {
 	Status    string         `json:"status"`
 	Requested string         `json:"requested"`
 	Source    string         `json:"source,omitempty"`
+	// App / AppRef 随动作一起落盘：动作写入方（HTTP 入口，ctx 里有 stamping）与
+	// 消费方（异步队列）是两个时刻，不落在动作上，消费时 ctx 早已不是请求 ctx。
+	App       string         `json:"app,omitempty"`
+	AppRef    string         `json:"appRef,omitempty"`
 	Payload   map[string]any `json:"payload,omitempty"`
 
 	ConsumedAt string `json:"consumedAt,omitempty"`
@@ -1320,6 +1346,8 @@ func (s *FileQueueTaskService) handleAction(ctx context.Context, act ActionRecor
 			IdempotencyKey: "action:" + act.ID,
 			IdemScope:      IdemScopeForever,
 			Source:         firstNonEmptyStr(act.Source, "dashboard"),
+			App:            act.App,
+			AppRef:         act.AppRef,
 			ActionID:       act.ID,
 		})
 		if err != nil {
@@ -1431,6 +1459,8 @@ func (s *FileQueueTaskService) refineLatestForTeam(team, feedback, fromNode stri
 		}, SubmitOpts{Source: "dashboard"})
 		return err
 	}
+	// 精修继承原任务的来源身份：它是同一条业务流的延续，app 维度不能把
+	// 第一次提交记给 studyforge、精修补丁记成 unknown。
 	return s.Refine(list[0].ID, feedback, fromNode)
 }
 

@@ -124,6 +124,10 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 		// owner（R-H6）：租户维度必须可聚合，否则"谁把额度烧完了"只能翻日志。
 		// 空值归一到 local，与 types.OwnerFromContext 的默认口径一致。
 		"owner": firstNonEmptyStr(rec.Owner, "local"),
+		// app（APP 来源维度）：与 owner 正交 —— owner 答"哪个租户"，app 答"哪个
+		// 上层应用(webapp/interviewforge/…)经这条通道调用"。空值归一到 unknown，
+		// 与 types.DefaultAppID 的默认口径一致；未迁移的调用方因此天然可聚合。
+		"app": firstNonEmptyStr(rec.App, "unknown"),
 	}
 	if rec.Purpose != "" {
 		labels["purpose"] = rec.Purpose

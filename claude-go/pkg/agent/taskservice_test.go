@@ -408,6 +408,66 @@ func TestRecordsSurviveNewInstance(t *testing.T) {
 	}
 }
 
+// TestSubmitRecordsAppAndFilterByApp 断言 APP 来源维度的完整闭环:
+// ①Submit 把 opts.App 归一后落进档案 (含 unknown 默认); ②List 按 TaskFilter.App
+// 精确匹配 (claimed: 前缀值按原样匹配, 信任级别可见); ③档案经 statestore 持久化
+// 后新实例仍读到同一个 app —— 消费方 (launchRunner / /api/sessions spec) 在另一个
+// 时刻读到的就是这里写下的值, 不能丢。
+func TestSubmitRecordsAppAndFilterByApp(t *testing.T) {
+	dir := t.TempDir()
+	store := statestore.NewFileStore(dir)
+	runner := newInstantRunner()
+	svc := NewFileQueueTaskService(TaskServiceOptions{Store: store, Runner: runner, PollInterval: 10 * time.Millisecond})
+
+	// ① 已验证来源 (注册表 token → 纯 appId) —— 这里直接模拟 stamping 后的值。
+	verified, err := svc.Submit(TaskSpec{Team: "g", Workflow: "w", Objective: "o1"}, SubmitOpts{App: "webapp"})
+	if err != nil {
+		t.Fatalf("Submit verified: %v", err)
+	}
+	// 自报来源 (无 token, 中间件降级成 claimed:<id>)。
+	claimed, err := svc.Submit(TaskSpec{Team: "g", Workflow: "w", Objective: "o2"}, SubmitOpts{App: "claimed:moqi"})
+	if err != nil {
+		t.Fatalf("Submit claimed: %v", err)
+	}
+	// 未携带 → 归一成 unknown (与 types.DefaultAppID 同口径)。
+	anon, err := svc.Submit(TaskSpec{Team: "g", Workflow: "w", Objective: "o3"}, SubmitOpts{})
+	if err != nil {
+		t.Fatalf("Submit anon: %v", err)
+	}
+	for _, id := range []string{verified.ID, claimed.ID, anon.ID} {
+		if _, err := svc.Wait(context.Background(), id); err != nil {
+			t.Fatalf("Wait %s: %v", id, err)
+		}
+	}
+
+	// ② TaskFilter.App 精确匹配, claimed: 值按原样匹配。
+	cases := []struct {
+		app  string
+		want int
+	}{
+		{"webapp", 1},
+		{"claimed:moqi", 1},
+		{"moqi", 0}, // 不带前缀不匹配 claimed:moqi —— 信任级别必须可见, 不许模糊等价
+		{"unknown", 1},
+		{"", 3}, // 不过滤 = 全量
+	}
+	for _, c := range cases {
+		if got := len(svc.List(TaskFilter{App: c.app})); got != c.want {
+			t.Fatalf("List(App=%q) = %d, want %d", c.app, got, c.want)
+		}
+	}
+
+	// ③ 新实例从 statestore 重读, app 字段不丢。
+	svc2 := NewFileQueueTaskService(TaskServiceOptions{Store: statestore.NewFileStore(dir), PollInterval: 10 * time.Millisecond})
+	got, ok := svc2.Get(verified.ID)
+	if !ok || got.App != "webapp" {
+		t.Fatalf("持久化后 app 丢失: ok=%v app=%q", ok, got.App)
+	}
+	if got, ok := svc2.Get(anon.ID); !ok || got.App != "unknown" {
+		t.Fatalf("持久化后 unknown 默认丢失: ok=%v app=%q", ok, got.App)
+	}
+}
+
 // TestFlattenBucketNoCollisionAndValid 断言 bucket 扁平化: ①消毒后仍是 statestore 合法名
 // (读写真能往返, 而不是退化成 badBucketKV); ②"a/b" 与 "a-b" 不会被消毒成同一个桶。
 func TestFlattenBucketNoCollisionAndValid(t *testing.T) {

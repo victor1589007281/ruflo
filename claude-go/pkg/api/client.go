@@ -89,6 +89,10 @@ type LLMCallRecord struct {
 	// engine/trace 同源，不另设一份"这次调用属于谁"。空值在采集器侧归一为
 	// "local"（types.OwnerFromContext 本身也会把缺失归一为默认 owner）。
 	Owner    string
+	// App 是调用方 APP 来源标识（studyforge / claimed:moqi / internal:cron /
+	// unknown），与 Owner 正交：owner 答"为谁服务"，app 答"谁调进来"。
+	// 同源从 ctx 读（types.AppFromContext），缺失归一 "unknown"（pkg/types/app.go）。
+	App      string
 	Source   string // "chat" | "feishu" | "team" | "swarm" | "dashboard" | "vision" | "compact" | ...
 	Purpose  string // 额外标签, 如团队名 / stage 名 / agent 角色
 	Request  string // 粗粒度 HTTP 方法标签 (messages / stream-messages)
@@ -1497,6 +1501,7 @@ func (c *Client) StreamMessage(
 			}
 			applyLLMMetricsContext(&streamRec, callMeta)
 			streamRec.Owner = types.OwnerFromContext(ctx)
+			streamRec.App = types.AppFromContext(ctx)
 			c.emitLLMMetric(streamRec)
 			if debug != nil {
 				debug.finish(c, streamRec, streamErrMsg)
@@ -2115,6 +2120,7 @@ func (c *Client) sendMessageDirect(
 		// owner 与 trace/engine 同源：都从 ctx 读（R-H6）。放在 emit 里而不是
 		// 各返回点，理由与 sinkRecord 相同 —— emit 是记录成型点，另找位置必漏。
 		rec.Owner = types.OwnerFromContext(ctx)
+		rec.App = types.AppFromContext(ctx)
 		debugRec = rec
 		// 把这份记录交给切面链的记录槽 (链为空/未挂槽时是空操作)。放在 emit 里而不是
 		// 各返回点: emit 已经是"这次调用的记录成型点"的单一出口, 另找位置必然漏一条。

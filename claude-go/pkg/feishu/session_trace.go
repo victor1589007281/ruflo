@@ -3,11 +3,13 @@ package feishu
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/engine/internal_hook"
 	"github.com/anthropic/claude-go/pkg/evolution/tracestore"
 	"github.com/anthropic/claude-go/pkg/trace"
+	"github.com/anthropic/claude-go/pkg/types"
 )
 
 // session_trace.go — 让**会话路径**的运行也落进 `trace-run-*` 桶。
@@ -79,6 +81,20 @@ func (sm *SessionManager) beginSessionRun(ctx context.Context, session *Session)
 		ctx = context.Background()
 	}
 
+	// 来源身份 stamping（须在 trace.With 之前，trace 的 App 维度从 ctx 读）：
+	//  1. ctx 已有 app（sessionapi postMessage 从持久化 Spec 盖过）→ 保持；
+	//  2. 会话 Spec 带 App（HTTP 创建的外部 APP 会话）→ 从 Spec 盖；
+	//  3. 都没有 → internal:feishu。纯飞书会话不是外部 APP 发起，但"未知"桶里
+	//     混着内部流量会让维度报废，显式 internal: 前缀让分组依然干净。
+	if !types.HasApp(ctx) {
+		if spec, ok := sm.specFor(session.ChatID); ok && strings.TrimSpace(spec.App) != "" {
+			ctx = types.WithApp(ctx, spec.App)
+			ctx = types.WithAppRef(ctx, spec.AppRef)
+		} else {
+			ctx = types.WithApp(ctx, "internal:feishu")
+		}
+	}
+
 	// 占位已分配的 runID 优先 —— 它必须与 HTTP 面回给调用方的轮询键**逐字节相同**,
 	// 否则拿到 runId 去 ReadRun 会读空, 而"读不到"与"没采集"在读数上一模一样。
 	// 没有占位 (飞书路径、cron 路径) 才现编一个。
@@ -90,12 +106,14 @@ func (sm *SessionManager) beginSessionRun(ctx context.Context, session *Session)
 	// TraceStore 未装配: ctx 照常注入 (占位还得释放), 只是不写 run Span。
 	// 与 hook_trace.go:28 "store 为 nil 时 hook 不注册" 同向: 没接轨迹就不假装接了。
 	if sm.traceStore == nil {
-		ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: session.ChatID})
+		ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: session.ChatID,
+			App: types.AppFromContext(ctx), AppRef: types.AppRefFromContext(ctx)})
 		return ctx, func(string, string) { session.releaseReserved() }
 	}
 	// SessionID 一并注入: 它与 RunID 是两个不同的键 (见文件头), 出站请求头按
 	// SessionID 分片, 同一会话的多轮因此共享同一份前缀缓存。
-	ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: session.ChatID})
+	ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: session.ChatID,
+		App: types.AppFromContext(ctx), AppRef: types.AppRefFromContext(ctx)})
 
 	start := time.Now()
 	return ctx, func(status string, errText string) {

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/types"
 )
 
 // =====================================================================
@@ -1338,6 +1339,10 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		"target":    target,
 		"status":    "pending",
 		"requested": time.Now().Format(time.RFC3339),
+		// 来源 APP 随动作落盘：动作的消费方在异步队列里跑，那时请求 ctx 早不在了，
+		// 不落盘 app，消费时任务档案就退回 unknown（同 ActionRecord.App 的理由）。
+		"app":    types.AppFromContext(r.Context()),
+		"appRef": types.AppRefFromContext(r.Context()),
 		"source":    "dashboard",
 	}
 	if payload != nil {

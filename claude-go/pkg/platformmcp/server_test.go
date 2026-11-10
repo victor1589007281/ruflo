@@ -2,6 +2,7 @@ package platformmcp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 type fakeBackend struct {
 	calls     []string
 	submitted TaskSubmit
+	submitCtx context.Context
 	failWith  error
 }
 
@@ -43,9 +45,10 @@ func (f *fakeBackend) Tasks() (any, error) {
 	f.note("Tasks")
 	return []string{"t1"}, f.failWith
 }
-func (f *fakeBackend) SubmitTask(spec TaskSubmit) (any, error) {
+func (f *fakeBackend) SubmitTask(ctx context.Context, spec TaskSubmit) (any, error) {
 	f.note("SubmitTask")
 	f.submitted = spec
+	f.submitCtx = ctx
 	if f.failWith != nil {
 		return nil, f.failWith
 	}

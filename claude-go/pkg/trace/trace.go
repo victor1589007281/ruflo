@@ -57,6 +57,15 @@ type IDs struct {
 	// 空 = 本次运行不属任何工单 / 不属于某个实例 (交互式使用), 是正常状态而非缺失。
 	TicketID   string `json:"ticket_id,omitempty"`
 	InstanceID string `json:"instance_id,omitempty"`
+
+	// App / AppRef 是**调用方来源**索引维度，与上面所有粒度正交：
+	// 它们回答"这次运行业务上是谁发起的"（nav 的哪个 APP / 内部哪个模块），
+	// 运维现场的高频问法之一。形态约定见 pkg/types/app.go（纯 id = 凭据背书，
+	// claimed: 前缀 = 自报，unknown = 未携带）。本包刻意零依赖所以不 import
+	// types —— 值由调用侧（teams/graph/feishu 起跑点）从 ctx 读出后注入。
+	// 空 = 起跑点没 stamping（旧路径），读数等效 unknown。
+	App    string `json:"app,omitempty"`
+	AppRef string `json:"app_ref,omitempty"`
 }
 
 // HasOpsIndex reports 是否带了运维索引维度。
@@ -97,6 +106,12 @@ func With(ctx context.Context, ids IDs) context.Context {
 	}
 	if ids.InstanceID != "" {
 		cur.InstanceID = ids.InstanceID
+	}
+	if ids.App != "" {
+		cur.App = ids.App
+	}
+	if ids.AppRef != "" {
+		cur.AppRef = ids.AppRef
 	}
 	return context.WithValue(ctx, ctxKey{}, cur)
 }

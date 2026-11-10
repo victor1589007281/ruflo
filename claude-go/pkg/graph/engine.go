@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/trace"
+	"github.com/anthropic/claude-go/pkg/types"
 )
 
 // 图运行状态常量 (RunStatus*) 与"设计 8 态 vs 图层 6 态"的逐条对账见 runstatus.go。
@@ -266,7 +267,8 @@ func (e *Engine) Run(ctx context.Context, spec GraphSpec, opts RunOpts) (RunResu
 	if runID == "" {
 		runID = trace.NewRunID(spec.Name)
 	}
-	ctx = trace.With(ctx, trace.IDs{RunID: runID})
+	ctx = trace.With(ctx, trace.IDs{RunID: runID,
+		App: types.AppFromContext(ctx), AppRef: types.AppRefFromContext(ctx)})
 
 	// —— journal 记账: Append 出错不中断执行, 累积到返回 error (语义7) ——
 	var (

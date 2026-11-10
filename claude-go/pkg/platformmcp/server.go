@@ -25,6 +25,7 @@ package platformmcp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,10 +49,20 @@ type TaskSubmit struct {
 	Workflow  string `json:"workflow,omitempty"`
 	Objective string `json:"objective"`
 	Language  string `json:"language,omitempty"`
+	// App / AppRef 是 body 级的来源自报，服务于**无法设置 HTTP 头**的 MCP 客户端。
+	// 信任级别低于 header：ctx 里已有 stamping 结果（verified/claimed）时以 ctx 为准，
+	// 只有 ctx 是 unknown 时才采用这里的值，且一律包成 claimed: 形态 ——
+	// 与 pkg/types/app.go 的"自报不等于身份"同一原则。
+	App    string `json:"app,omitempty"`
+	AppRef string `json:"appRef,omitempty"`
 }
 
 // Backend 是平台能力的提供方, 由 pkg/dashboard 实现 (它持有 Provider 与
 // 注入的 TaskService)。
+//
+// SubmitTask 带 ctx: 任务来源身份 (app) 由 HTTP 中间件 stamping 进 ctx，
+// 协议层必须把它透传给 Backend —— stdio 形态没有 HTTP 头，ctx 为空时 Backend
+// 退回 body 自报字段（claimed: 形态，信任级别见 pkg/types/app.go）。
 type Backend interface {
 	Teams() (any, error)
 	Team(name string) (any, error)
@@ -59,7 +70,7 @@ type Backend interface {
 	Skills() (any, error)
 	Tools() (any, error)
 	Tasks() (any, error)
-	SubmitTask(spec TaskSubmit) (any, error)
+	SubmitTask(ctx context.Context, spec TaskSubmit) (any, error)
 	TaskStatus(id string) (any, error)
 }
 
@@ -176,7 +187,9 @@ func (s *Server) Tools() []Tool {
 				`"team":{"type":"string","description":"团队名 (运行身份)"},` +
 				`"workflow":{"type":"string","description":"工作流名; 团队已存在时可省"},` +
 				`"objective":{"type":"string","description":"目标描述"},` +
-				`"language":{"type":"string","description":"编程语言 (影响编译门禁)"}` +
+				`"language":{"type":"string","description":"编程语言 (影响编译门禁)"},` +
+				`"app":{"type":"string","description":"调用方 APP 标识 (如 studyforge); 仅在无法设置 X-App-Id 头时使用, 记为 claimed: 形态"},` +
+				`"appRef":{"type":"string","description":"调用方业务参考号 (如工单号), 原样透传"}` +
 				`},"required":["team","objective"]}`),
 		},
 		{
@@ -191,9 +204,18 @@ func (s *Server) Tools() []Tool {
 // 分发
 // ---------------------------------------------------------------------------
 
-// HandleRPC 处理一条 JSON-RPC 报文。
+// HandleRPC 处理一条 JSON-RPC 报文 (无 ctx 形态: 来源身份 = unknown)。
 // 第二个返回值为 false 表示这是通知 (无 id), 不应回响应。
+//
+// 传输层接线纪律: HTTP 形态必须调 HandleRPCContext 并传 r.Context() —— app 身份
+// 由鉴权中间件 stamping 进 ctx，走这里（Background）等于把来源维度整个丢掉；
+// 本方法只为兼容存量调用方与 stdio 形态保留。
 func (s *Server) HandleRPC(raw []byte) ([]byte, bool) {
+	return s.HandleRPCContext(context.Background(), raw)
+}
+
+// HandleRPCContext 带 ctx 处理一条 JSON-RPC 报文。
+func (s *Server) HandleRPCContext(ctx context.Context, raw []byte) ([]byte, bool) {
 	var req rpcRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: nil,
@@ -222,7 +244,7 @@ func (s *Server) HandleRPC(raw []byte) ([]byte, bool) {
 		if isNotification {
 			return nil, false
 		}
-		return s.handleToolsCall(req), true
+		return s.handleToolsCall(ctx, req), true
 	default:
 		if isNotification {
 			return nil, false
@@ -244,7 +266,7 @@ func (s *Server) HandleRPC(raw []byte) ([]byte, bool) {
 //	代价与边界：arguments 原样透传给工具, 不做 schema 预校验 (由工具自己解)。
 //	设计权衡：失败原因进 content 而非 error —— 调用方 (agent) 需要把失败原因读进上下文
 //	      才能自我纠正, 而 JSON-RPC error 通常不进入模型上下文。
-func (s *Server) handleToolsCall(req rpcRequest) []byte {
+func (s *Server) handleToolsCall(ctx context.Context, req rpcRequest) []byte {
 	var params struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -253,7 +275,7 @@ func (s *Server) handleToolsCall(req rpcRequest) []byte {
 		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: req.ID,
 			Error: &rpcError{Code: -32602, Message: "Invalid params", Data: err.Error()}})
 	}
-	data, err := s.execute(params.Name, params.Arguments)
+	data, err := s.execute(ctx, params.Name, params.Arguments)
 	if errors.Is(err, errToolNotFound) {
 		return marshalResponse(rpcResponse{JSONRPC: "2.0", ID: req.ID,
 			Error: &rpcError{Code: -32601, Message: "Tool not found", Data: params.Name}})
@@ -273,7 +295,8 @@ func (s *Server) handleToolsCall(req rpcRequest) []byte {
 var errToolNotFound = errors.New("tool not found")
 
 // execute 按工具名分派到 Backend 的对应方法, 并把结果序列化成 JSON 文本。
-func (s *Server) execute(name string, args json.RawMessage) (string, error) {
+// ctx 向 Backend 透传 (当前只有 SubmitTask 消费它，拿 app 来源身份)。
+func (s *Server) execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	if s.be == nil {
 		switch name {
 		case ToolTeamsList, ToolTeamGet, ToolWorkflowsList, ToolSkillsList,
@@ -316,7 +339,7 @@ func (s *Server) execute(name string, args json.RawMessage) (string, error) {
 		if strings.TrimSpace(in.Team) == "" {
 			return "", errors.New("team 必填 (团队名 = 运行身份)")
 		}
-		return jsonOf(s.be.SubmitTask(in))
+		return jsonOf(s.be.SubmitTask(ctx, in))
 	case ToolTaskStatus:
 		var in struct {
 			ID string `json:"id"`
@@ -399,7 +422,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]json.RawMessage, 0, len(batch))
 		for _, one := range batch {
-			if resp, ok := s.HandleRPC(one); ok {
+			if resp, ok := s.HandleRPCContext(r.Context(), one); ok {
 				out = append(out, resp)
 			}
 		}
@@ -411,7 +434,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSONStatus(w, http.StatusOK, b)
 		return
 	}
-	resp, ok := s.HandleRPC(body)
+	resp, ok := s.HandleRPCContext(r.Context(), body)
 	if !ok {
 		w.WriteHeader(http.StatusAccepted)
 		return

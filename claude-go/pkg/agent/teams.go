@@ -934,7 +934,8 @@ func (ptm *ProductionTeamManager) beginRun(ctx context.Context, team *Production
 	ctx, endSpan := logging.WithSpan(ctx, "team."+team.Name+".execute")
 	// trace 四元组 RunID (design/03 §4.1 E0): 复用 logging traceID 作后缀,
 	// llm.jsonl 的 RunID 可直接 join 结构化日志; 下游 stage/engine 逐层补 NodeID/TurnID。
-	ctx = trace.With(ctx, trace.IDs{RunID: fmt.Sprintf("run-%s-%s", team.Name, logging.TraceID(ctx))})
+	ctx = trace.With(ctx, trace.IDs{RunID: fmt.Sprintf("run-%s-%s", team.Name, logging.TraceID(ctx)),
+		App: types.AppFromContext(ctx), AppRef: types.AppRefFromContext(ctx)})
 	// 记住本轮 RunID: 运行后才发生的奖励 (用户评分 / 精修负信号) 只能靠它归因。
 	team.mu.Lock()
 	team.LastRunID = trace.From(ctx).RunID

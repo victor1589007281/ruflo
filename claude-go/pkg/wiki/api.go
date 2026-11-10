@@ -28,6 +28,10 @@ type APIServer struct {
 	mux       *http.ServeMux
 	server    *http.Server
 	scheduler *sync.Scheduler
+	// apps 是 APP 凭据注册表 (token → appId)。登记 token 的调用方鉴权放行且
+	// 请求 ctx 被背书成对应 appId；未登记的 X-App-Id 自报头记 claimed:<id>。
+	// 由 SetApps 注入（NewAPIServer 签名冻结，避免 8+ 下游的构造点连锁改动）。
+	apps []httpauth.AppEntry
 	// submitter 非 nil 时 /sync/ima|weread 的执行体走 TaskService，
 	// 而**不再**经 scheduler.RunNow 起进程内 goroutine（见 SetSyncSubmitter）。
 	submitter sync.TaskSubmitter
@@ -98,6 +102,10 @@ func (s *APIServer) HandleFunc(pattern string, h func(http.ResponseWriter, *http
 // 空字符串沿用历史行为：绑全部网卡，局域网与 tailscale 均可访问。
 func (s *APIServer) SetBindHost(host string) { s.host = host }
 
+// SetApps 注入 APP 凭据注册表。必须在 Start 之前调用 —— 注册表在 Start
+// 装配中间件时读取一次，之后改动不生效（与 secret 同一生效时机）。
+func (s *APIServer) SetApps(apps []httpauth.AppEntry) { s.apps = apps }
+
 // Start 启动 HTTP 服务（非阻塞）。
 //
 // 鉴权在 Handler 层统一施加，覆盖挂在同一 mux 上的全部路由（含 dashboard
@@ -105,7 +113,7 @@ func (s *APIServer) SetBindHost(host string) { s.host = host }
 // 结果这两组都漏了——高度不对。secret 为空时中间件是恒等包装，行为完全中性。
 func (s *APIServer) Start(port int) error {
 	addr := fmt.Sprintf("%s:%d", s.host, port)
-	handler := httpauth.Middleware(httpauth.Config{Secret: s.secret})(s.mux)
+	handler := httpauth.Middleware(httpauth.Config{Secret: s.secret, Apps: s.apps})(s.mux)
 	s.server = &http.Server{
 		Addr:    addr,
 		Handler: handler,
