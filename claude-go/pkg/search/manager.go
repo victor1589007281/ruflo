@@ -175,6 +175,13 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 	}
 
 	plan := PlanQuery(req.Query)
+	// 生态品牌词推导的域名限定 (微信/头条生态文章): 调用方显式传了
+	// allowed_domains 时以调用方为准, 否则套用规划结果。providers 会把它
+	// 翻成 site: 提示改善召回, 融合前仍由 Manager 对返回 URL 做硬过滤,
+	// 单域名结果自动豁免域名多样性门 (见 gate.go DomainScoped)。
+	if len(req.AllowedDomains) == 0 && len(plan.ScopedDomains) > 0 {
+		req.AllowedDomains = plan.ScopedDomains
+	}
 	if f := strings.TrimSpace(req.Freshness); f != "" {
 		plan.Freshness = strings.ToLower(f)
 	} else {
@@ -438,7 +445,10 @@ loop:
 				Query:     sq,
 				Language:  plan.Language,
 				Freshness: plan.Freshness,
-				Deadline:  deadline,
+				// 研究问题命中生态品牌词时, 整条研究的子查询都限定到该生态,
+				// 即使子查询切分后丢了品牌词 (调用方未显式指定时 Manager 才会套用)。
+				AllowedDomains: plan.ScopedDomains,
+				Deadline:       deadline,
 			})
 			if err != nil {
 				lastErr = err

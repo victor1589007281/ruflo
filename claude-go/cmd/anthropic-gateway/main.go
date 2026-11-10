@@ -128,6 +128,12 @@ func main() {
 	mux.HandleFunc("/v1/responses", gw.handleResponses)
 	mux.HandleFunc("/responses", gw.handleResponses)
 	mux.HandleFunc("/v1/models", gw.handleModels)
+	// 供应商余额/额度查询: webapp 模型选择页的 Kimi/DeepSeek 页签显示账户额度。
+	// 只支持直连 provider (kimi→/me 档案, deepseek→/user/balance 余额); 聚合上游
+	// (opencode) 的额度由 webapp 自己走 /v1/usage, 不经这里。密钥只存在本网关
+	// config, 所以查询也必须从这里转发, webapp 拿不到原始 apiKey。
+	mux.HandleFunc("/v1/usage", gw.handleUsage)
+	mux.HandleFunc("/usage", gw.handleUsage)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
@@ -778,6 +784,156 @@ func (g *gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+// ─── 供应商额度查询 (webapp 模型选择页 Kimi/DeepSeek 页签的数据源) ─────────────
+//
+// GET /v1/usage?provider=kimi|deepseek
+//
+// 为什么放在网关: apiKey 只存在本网关的 config.json (webapp 后端不持有直连厂商
+// 密钥), 查询必须从持有密钥的一侧转发。响应归一化成统一信封, 上游差异
+// (Moonshot 的 profile 制 vs DeepSeek 的 balance_infos 制) 在这一层吸收,
+// webapp 只认 balances / profile 两个可选槽位。
+//
+// 已知边界 (实测 2026-11-07, api.kimi.com/coding/v1):
+//   - Kimi coding 订阅**没有**额度/余额 API —— /usage /quota /balance 全部 404,
+//     只有 /me 账户档案 (昵称/等级)。订阅剩余额度只能去 kimi.com 控制台看,
+//     这里如实返回 profile + note, 不编造数字。
+//   - DeepSeek 有 /user/balance (在 API 根, 不在 /anthropic 子路径下)。
+var usageCache = struct {
+	sync.Mutex
+	entries map[string]usageCacheEntry
+}{entries: map[string]usageCacheEntry{}}
+
+type usageCacheEntry struct {
+	at   time.Time
+	body []byte
+}
+
+// usageUpstreamURL 按 provider 名推导上游额度端点。返回空串表示该 provider
+// 没有已知的额度端点 —— 调用方回显式报错, 而不是瞎猜一个 URL 打过去。
+func usageUpstreamURL(p *modelconfig.ProviderConfig) (url, kind string) {
+	base := strings.TrimRight(p.BaseURL, "/")
+	switch p.Name {
+	case "deepseek":
+		// baseURL 是 anthropic 兼容子路径 (…/anthropic), 余额接口在 API 根。
+		root := strings.TrimSuffix(base, "/anthropic")
+		return root + "/user/balance", "balances"
+	case "kimi":
+		// Moonshot coding API: 只有账户档案, 没有额度接口 (实测)。
+		return base + "/me", "profile"
+	}
+	return "", ""
+}
+
+func (g *gateway) handleUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("provider"))
+	if name == "" {
+		writePlainJSON(w, 400, map[string]any{"ok": false, "error": "缺少 provider 参数 (kimi|deepseek)"})
+		return
+	}
+
+	usageCache.Lock()
+	if e, ok := usageCache.entries[name]; ok && time.Since(e.at) < 60*time.Second {
+		usageCache.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Usage-Cache", "hit")
+		w.Write(e.body)
+		return
+	}
+	usageCache.Unlock()
+
+	p := g.registry.GetProvider(name)
+	if p == nil || p.APIKey == "" {
+		writePlainJSON(w, 404, map[string]any{"ok": false, "provider": name, "error": "provider 未在 config 中声明或无 apiKey"})
+		return
+	}
+	upstream, kind := usageUpstreamURL(p)
+	if upstream == "" {
+		writePlainJSON(w, 400, map[string]any{"ok": false, "provider": name, "error": "provider " + name + " 没有已知的额度查询端点"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream, nil)
+	if err != nil {
+		writePlainJSON(w, 502, map[string]any{"ok": false, "provider": name, "error": err.Error()})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("User-Agent", "anthropic-gateway/"+gatewayVersion)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		writePlainJSON(w, 502, map[string]any{"ok": false, "provider": name, "error": "上游查询失败: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	out := map[string]any{"provider": name, "ok": resp.StatusCode == 200, "fetched_at": time.Now().Format(time.RFC3339)}
+	var up map[string]any
+	if jerr := json.Unmarshal(raw, &up); jerr != nil {
+		out["ok"] = false
+		out["error"] = fmt.Sprintf("上游 %d 且响应非 JSON", resp.StatusCode)
+	} else if resp.StatusCode != 200 {
+		if e, _ := up["error"].(map[string]any); e != nil {
+			out["error"] = fmt.Sprintf("上游 %d: %v", resp.StatusCode, e["message"])
+		} else {
+			out["error"] = fmt.Sprintf("上游 %d", resp.StatusCode)
+		}
+	} else {
+		switch kind {
+		case "balances":
+			// DeepSeek: {balance_infos:[{currency,total_balance,granted_balance,topped_up_balance}]}
+			var balances []map[string]any
+			if infos, _ := up["balance_infos"].([]any); infos != nil {
+				for _, it := range infos {
+					m, _ := it.(map[string]any)
+					if m == nil {
+						continue
+					}
+					balances = append(balances, map[string]any{
+						"currency":     m["currency"],
+						"total":        m["total_balance"],
+						"granted":      m["granted_balance"],
+						"topped_up":    m["topped_up_balance"],
+						"is_available": up["is_available"],
+					})
+				}
+			}
+			out["balances"] = balances
+		case "profile":
+			// Moonshot /me: 订阅额度官方未提供 API, 如实给档案 + 说明。
+			out["profile"] = map[string]any{
+				"nickname":        up["nickname"],
+				"user_level_name": up["user_level_name"],
+				"user_level":      up["user_level"],
+				"region":          up["region"],
+			}
+			out["note"] = "Kimi 订阅额度官方未提供查询 API, 剩余量见 kimi.com 控制台"
+		}
+	}
+	body, _ := json.Marshal(out)
+	usageCache.Lock()
+	if len(usageCache.entries) > 64 {
+		usageCache.entries = map[string]usageCacheEntry{}
+	}
+	usageCache.entries[name] = usageCacheEntry{at: time.Now(), body: body}
+	usageCache.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
+}
+
+// writePlainJSON 写非 Anthropic 错误信封的普通 JSON 响应 (管理/查询类端点用)。
+func writePlainJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
 }
 
 // ---- helpers ----

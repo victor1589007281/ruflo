@@ -36,6 +36,11 @@ type QueryPlan struct {
 	Freshness  string // any | day | week | month | year
 	SubQueries []string
 	SiteHints  []string
+	// ScopedDomains 是从生态品牌词推导出的域名限定 (如微信公众号 -> mp.weixin.qq.com)。
+	// 它只表达"查询在找某个内容生态的文章"; Manager 在调用方未显式指定
+	// AllowedDomains 时把它套进请求, providers 据此追加 site: 提示, 融合前
+	// 仍由 Manager 做硬过滤。显式 allowed_domains 始终优先于推导值。
+	ScopedDomains []string
 }
 
 // maxSourceConcurrency 是单次检索最多同时查询的源数。
@@ -46,6 +51,22 @@ var subQuerySplitter = regexp.MustCompile(`(?i)\s+(?:vs\.?|versus)\s+|\s*(?:对�
 
 // kYearPattern 匹配 19xx/20xx 年份。
 var yearPattern = regexp.MustCompile(`\b(?:19|20)\d{2}\b`)
+
+// ecosystemRegistry 把明确的生态品牌词映射到其公开文章域名。
+//
+// 命中后检索自动限定到该生态的域名 (调用方显式 allowed_domains 优先), 走
+// 通用源的索引与 site: 提示, 而不是抓取生态自己的搜索页: 搜狗微信搜索与
+// 头条搜索的 robots.txt 都禁止搜索路径, 且前者结果链接受签名保护、后者
+// 详情页是 JS 挑战, 均不适合无人值守生产抓取 (2026-11 实测结论)。
+// 匹配保持保守 —— 必须是连续的品牌词, 避免把"今日(的)头条新闻"这类
+// 普通说法误判成"今日头条"app 生态。
+var ecosystemRegistry = []struct {
+	tokens []string
+	domain string
+}{
+	{[]string{"微信公众号", "微信文章", "公众号文章", "mp.weixin.qq.com"}, "mp.weixin.qq.com"},
+	{[]string{"今日头条", "头条号", "头条文章", "toutiao.com"}, "toutiao.com"},
+}
 
 // PlanQuery 用规则生成查询计划, 全程不调用模型。
 //
@@ -62,17 +83,33 @@ func PlanQuery(query string) QueryPlan {
 	}
 	lower := strings.ToLower(raw)
 
+	// 生态品牌词检测要先于新闻/时效分支: "今日头条" 里包含 "今日", 直接进
+	// 新闻分支会强制 week 级新鲜度, 而生态文章常常不是本周发布的, 质量门
+	// 会因此恒报 fresh。把命中的品牌词从后续时效探测串里剥掉 —— 既消除
+	// 品牌词自身的误触发, 又保留 "今日头条最新文章" 里真正的 "最新"。
+	probe := lower
+	for _, eco := range ecosystemRegistry {
+		for _, token := range eco.tokens {
+			if strings.Contains(probe, token) {
+				plan.ScopedDomains = append(plan.ScopedDomains, eco.domain)
+				plan.SiteHints = append(plan.SiteHints, "site:"+eco.domain)
+				probe = strings.ReplaceAll(probe, token, " ")
+				break
+			}
+		}
+	}
+
 	// switch 的分支顺序就是优先级: 代码/学术信号优先于新闻。例如
 	// "postgres 18 release notes" 同时含年份与发布词, 若不先判文档, 会被
 	// 当成新闻并强制 week 级新鲜度, 质量门反而因文档日期旧而恒不过。
 	switch {
 	case containsAny(lower, "github", "golang", "error:", "panic:", "stackoverflow", "源代码", "源码"):
 		plan.Intent = IntentCode
-		plan.SiteHints = []string{"site:github.com", "site:stackoverflow.com"}
+		plan.SiteHints = append(plan.SiteHints, "site:github.com", "site:stackoverflow.com")
 	case containsAny(lower, "论文", "paper", "arxiv", "survey", "文献", "crossref", "pubmed"):
 		plan.Intent = IntentAcademic
-		plan.SiteHints = []string{"site:arxiv.org", "site:openalex.org"}
-	case containsAny(lower, "今天", "今日", "最新", "发布", "新闻", "news", "刚刚"):
+		plan.SiteHints = append(plan.SiteHints, "site:arxiv.org", "site:openalex.org")
+	case containsAny(probe, "今天", "今日", "最新", "发布", "新闻", "news", "刚刚"):
 		// 注意不含 "release": "postgres 18 release notes" 是查文档, 不是要上周新闻。
 		// 把它当新闻会强制 week 级新鲜度, 质量门因文档日期旧而恒不过。
 		plan.Intent = IntentNews

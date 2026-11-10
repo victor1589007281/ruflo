@@ -6,7 +6,10 @@
 // 必须排在兜底源前面。
 package search
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func indexOf(order []string, name string) int {
 	for i, n := range order {
@@ -41,5 +44,59 @@ func TestZhFactualHasNoPhantomProviders(t *testing.T) {
 	iw := indexOf(order, "wikipedia")
 	if ia < 0 || ia > iw {
 		t.Fatalf("中文事实类应先试 exa_anon 再退 wikipedia: %v", order)
+	}
+}
+
+// TestEcosystemTokensScopeDomains 钉住生态品牌词推导:
+// 搜狗微信 / 头条搜索的 robots 禁止抓取, 生产上走通用源 + 域名限定
+// (2026-11 实测 exa_anon 对 mp.weixin.qq.com / toutiao.com 召回有效),
+// 所以"微信/头条生态文章"类查询必须由规划层自动限定域名。
+func TestEcosystemTokensScopeDomains(t *testing.T) {
+	cases := []struct {
+		query string
+		want  []string
+	}{
+		{"人工智能 微信公众号文章", []string{"mp.weixin.qq.com"}},
+		{"微信文章 大模型", []string{"mp.weixin.qq.com"}},
+		{"公众号文章 推荐", []string{"mp.weixin.qq.com"}},
+		{"site:mp.weixin.qq.com 机器学习", []string{"mp.weixin.qq.com"}},
+		{"今日头条 开源项目", []string{"toutiao.com"}},
+		{"头条号 测评", []string{"toutiao.com"}},
+		{"头条文章 总结", []string{"toutiao.com"}},
+		{"对比微信公众号和头条号", []string{"mp.weixin.qq.com", "toutiao.com"}},
+	}
+	for _, tc := range cases {
+		plan := PlanQuery(tc.query)
+		if strings.Join(plan.ScopedDomains, ",") != strings.Join(tc.want, ",") {
+			t.Fatalf("query %q: ScopedDomains=%v, want %v", tc.query, plan.ScopedDomains, tc.want)
+		}
+	}
+}
+
+// TestEcosystemBrandDoesNotTriggerNewsFreshness 是误触发回归:
+// "今日头条" 里的 "今日" 不能再把生态查询推进 news+week 时效分支
+// (week 新鲜度会让几个月前的生态文章过不了质量门的 fresh 判据);
+// 而真正的时效词 ("最新") 与普通 "今日" 说法必须照旧生效。
+func TestEcosystemBrandDoesNotTriggerNewsFreshness(t *testing.T) {
+	eco := PlanQuery("人工智能 今日头条文章")
+	if eco.Intent == IntentNews || eco.Freshness != "any" {
+		t.Fatalf("品牌词误触发新闻时效: intent=%s freshness=%s", eco.Intent, eco.Freshness)
+	}
+	fresh := PlanQuery("今日头条最新文章")
+	if fresh.Intent != IntentNews || fresh.Freshness != "week" {
+		t.Fatalf("真实时效词应照旧触发 news+week: intent=%s freshness=%s", fresh.Intent, fresh.Freshness)
+	}
+	if got := PlanQuery("今天有什么新闻").Freshness; got != "week" {
+		t.Fatalf("普通今日说法应照旧触发 week, got %s", got)
+	}
+}
+
+// TestNonEcosystemQueriesStayUnscoped 防止限定范围蔓延:
+// 不含品牌词的普通查询绝不能被加上域名限定。
+func TestNonEcosystemQueriesStayUnscoped(t *testing.T) {
+	for _, q := range []string{"今天有什么新闻", "kubernetes 1.34 release date 2025", "golang panic: nil map", "苹果公司"} {
+		if plan := PlanQuery(q); len(plan.ScopedDomains) != 0 {
+			t.Fatalf("query %q 不应有域名限定, got %v", q, plan.ScopedDomains)
+		}
 	}
 }

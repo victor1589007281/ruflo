@@ -713,6 +713,48 @@ func TestPlanQuerySignals(t *testing.T) {
 	}
 }
 
+// TestSearchAppliesEcosystemDomainScoping 钉住规划层到数据面的接线:
+// 查询含生态品牌词且调用方未显式指定 allowed_domains 时, Manager 必须把
+// 推导域名套进请求 (provider 据此追加 site: 提示), 并对返回 URL 硬过滤;
+// 显式 allowed_domains 始终优先, 不被推导值覆盖。
+func TestSearchAppliesEcosystemDomainScoping(t *testing.T) {
+	var seen []SearchRequest
+	p := newFake("p", TierL0, func(_ context.Context, req SearchRequest) ([]Result, error) {
+		seen = append(seen, req)
+		return []Result{
+			{URL: "https://mp.weixin.qq.com/s/abc", Title: "in", Snippet: "s"},
+			{URL: "https://a.example.com/a", Title: "out", Snippet: "s"},
+		}, nil
+	})
+	m := NewManager(DefaultConfig(), testEgress(t), []Provider{p})
+	defer m.Close()
+
+	resp, err := m.Search(context.Background(), SearchRequest{Query: "人工智能 微信公众号文章"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) == 0 || strings.Join(seen[0].AllowedDomains, ",") != "mp.weixin.qq.com" {
+		t.Fatalf("provider request missing derived domains: %+v", seen)
+	}
+	if len(resp.Results) != 1 || !strings.Contains(resp.Results[0].URL, "mp.weixin.qq.com") {
+		t.Fatalf("ecosystem scope not enforced on results: %+v", resp.Results)
+	}
+
+	// 显式 allowed_domains 优先于品牌词推导。
+	resp, err = m.Search(context.Background(), SearchRequest{
+		Query: "人工智能 微信公众号文章", AllowedDomains: []string{"example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) < 2 || strings.Join(seen[1].AllowedDomains, ",") != "example.com" {
+		t.Fatalf("explicit domains must win over derived: %+v", seen)
+	}
+	if len(resp.Results) != 1 || !strings.Contains(resp.Results[0].URL, "a.example.com") {
+		t.Fatalf("explicit scope not enforced: %+v", resp.Results)
+	}
+}
+
 func TestCacheTTLSelection(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.CacheTTL = 10 * time.Minute
