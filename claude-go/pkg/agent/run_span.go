@@ -73,6 +73,12 @@ func (ptm *ProductionTeamManager) writeRunSpan(ctx context.Context, team *Produc
 		"stages":        stages,
 		"stages_failed": failed,
 	}
+	// APP 来源维度: trace.IDs.App 随 ctx 一路带下来 (httpauth stamping →
+	// TaskRecord → run ctx), webapp 轨迹页按它分组/过滤。空则不写, 免得 attrs
+	// 里出现无意义的空串键。
+	if app := trace.From(ctx).App; app != "" {
+		attrs["app"] = app
+	}
 	if errText != "" {
 		attrs["error"] = truncateResult(errText, 500)
 	}
