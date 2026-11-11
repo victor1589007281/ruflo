@@ -38,6 +38,7 @@ import (
 	"github.com/anthropic/claude-go/pkg/api"
 	"github.com/anthropic/claude-go/pkg/feishu"
 	"github.com/anthropic/claude-go/pkg/hotreload"
+	"github.com/anthropic/claude-go/pkg/httpauth"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -136,11 +137,37 @@ func main() {
 	mux.HandleFunc("/usage", gw.handleUsage)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 
-	srv := &http.Server{Addr: *addr, Handler: mux}
+	// APP 来源标识 (与 :18080 同一套信任级)。直接请求本网关的客户端 (moqi/
+	// askforge/studyforge 经 18989 或 18081) 大多没有注册表 token, 自报头记成
+	// claimed:<id>; claude-go 内部客户端转发时会带已验证的 ctx, 这里不再降级。
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(stampAppContext(r)))
+	})
+
+	srv := &http.Server{Addr: *addr, Handler: handler}
 	log.Printf("[anthropic-gateway] 监听 %s (config=%s, default-prefix=%s)", *addr, orDefault(*configPath, "auto-discover"), tryPrefix)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("网关退出: %v", err)
 	}
+}
+
+// stampAppContext 在请求 ctx 上打 app/appRef 标记。优先级:
+// ① ctx 里已有 (claude-go 内部客户端转发的已验证身份) → 原样保留;
+// ② X-App-Id 头 → claimed:<id> (自报, 无 token 背书);
+// ③ 无 → unknown。
+// 注册表 token 鉴权不在本网关做 (它是纯 LLM 翻译层, 没有 wiki.apiApps 概念);
+// verified 身份只能来自 claude-go 内部转发, 那里已经验过。
+func stampAppContext(r *http.Request) context.Context {
+	if types.HasApp(r.Context()) {
+		return r.Context()
+	}
+	app := types.DefaultAppID
+	if hdr := strings.TrimSpace(r.Header.Get(httpauth.AppHeader)); hdr != "" {
+		app = types.ClaimedApp(hdr)
+	}
+	ctx := types.WithApp(r.Context(), app)
+	ctx = types.WithAppRef(ctx, strings.TrimSpace(r.Header.Get(httpauth.AppRefHeader)))
+	return ctx
 }
 
 type gateway struct {
@@ -488,6 +515,8 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// 翻译路径单次调用的硬上限用 --upstream-timeout (默认 30min)。omen-alpha 等
 	// 隐藏推理模型先烧数万 reasoning token 才吐正文, 原来 10min 的 ctx 会误掐 (502)。
+	// 把请求 ctx 带过来: app 维度要靠它透传 (types.WithApp 打在 r.Context) 上,
+	// 与上游 LLMCallRecord 的 stamping 同源 (pkg/api/client.go 的 streamRec.App / rec.App)。
 	ctx, cancel := context.WithTimeout(r.Context(), *upstreamTimeout)
 	defer cancel()
 
@@ -608,6 +637,15 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 		// opencode zen/go 原生 /v1/messages 同样强制要求 x-opencode-session (缺失 → 400)。
 		if isOpenCodeUpstream(rc) {
 			req.Header.Set("x-opencode-session", opencodeSessionID(r, ""))
+		}
+		// APP 来源标识透传: 直挂本网关的客户端 (moqi/askforge 经 18989) 在
+		// stampAppContext 里被打上 claimed:<id>, 原样转给上游让 api 层同样能
+		// 读到 (上游若是 claude-go 内部客户端路径, ctx 里已是 verified 身份)。
+		if v := types.AppFromContext(r.Context()); v != "" && v != types.DefaultAppID {
+			req.Header.Set(httpauth.AppHeader, v)
+		}
+		if v := types.AppRefFromContext(r.Context()); v != "" {
+			req.Header.Set(httpauth.AppRefHeader, v)
 		}
 		return req, nil
 	}
