@@ -134,6 +134,12 @@ func (sm *SessionManager) beginSessionRun(ctx context.Context, session *Session)
 		if session.Engine != nil {
 			attrs["model"] = session.Engine.Config.Model
 		}
+		// APP 来源维度: 与 run_span.go 同一口径 —— 上面 trace.With 已把 App 放进
+		// ctx, 这里从 ctx 读回写进 attrs, webapp 轨迹页才能按 APP 分组/过滤。
+		// 空则不写, 免得 attrs 里出现无意义的空串键。
+		if app := trace.From(ctx).App; app != "" {
+			attrs["app"] = app
+		}
 		if errText != "" {
 			attrs["error"] = truncateResult(errText, 500)
 		}
