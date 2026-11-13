@@ -458,7 +458,7 @@ func RegisterTeamCommands(r *Registry) {
 			}
 			if strings.TrimSpace(args) == "" {
 				fmt.Println("用法: /simulate <场景目标> [--mode MODE]")
-				fmt.Println("模式: social|game|montecarlo|crisis|org|creative|market|policy|tech")
+				fmt.Println("模式: social|game|montecarlo|crisis|org|creative|market|policy|tech|rumor|health|consumer|team|education|climate")
 				fmt.Println("示例: /simulate 如果OpenAI开源所有模型会怎样?")
 				fmt.Println("      /simulate 中美AI竞赛的未来走向 --mode game")
 				fmt.Println("      /simulate 全球芯片供应中断 --mode crisis")

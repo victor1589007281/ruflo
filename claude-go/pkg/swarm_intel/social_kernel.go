@@ -197,6 +197,42 @@ func kernelModeProfile(mode string) modeProfile {
 			AnalystRole: "创意涌现报告分析员",
 			SpawnExtra:  "视角人格应来自不同学科/经验/审美 (如工程师/艺术家/商人/用户), 偏好分歧来自世界观",
 		}
+	case "rumor":
+		return modeProfile{
+			StanceLabel: "对信息真实性的相信度", AgentNoun: "信息受众", SceneNoun: "传言情境",
+			AnalystRole: "信息传播报告分析员",
+			SpawnExtra:  "受众覆盖不同信息渠道依赖度/媒介素养/既有立场, 相信度分歧来自信源信任差异",
+		}
+	case "health":
+		return modeProfile{
+			StanceLabel: "对防护行为的依从意愿", AgentNoun: "公众个体", SceneNoun: "公共健康情境",
+			AnalystRole: "公共健康行为报告分析员",
+			SpawnExtra:  "个体覆盖不同年龄/职业/健康观念/风险感知, 依从分歧来自风险收益判断差异",
+		}
+	case "consumer":
+		return modeProfile{
+			StanceLabel: "对产品的接受度", AgentNoun: "消费者画像", SceneNoun: "消费情境",
+			AnalystRole: "消费行为报告分析员",
+			SpawnExtra:  "消费者覆盖不同预算/品类经验/品牌忠诚度/尝鲜倾向, 接受分歧来自使用场景差异",
+		}
+	case "team":
+		return modeProfile{
+			StanceLabel: "对方案的倾向", AgentNoun: "团队成员", SceneNoun: "团队决策情境",
+			AnalystRole: "团队动力学报告分析员",
+			SpawnExtra:  "成员覆盖不同专业背景/职级/风险偏好/发言风格, 倾向分歧来自立场与信息差",
+		}
+	case "education":
+		return modeProfile{
+			StanceLabel: "对新做法的采纳意愿", AgentNoun: "学生与教育者", SceneNoun: "教育情境",
+			AnalystRole: "教育生态报告分析员",
+			SpawnExtra:  "角色覆盖不同学段/成绩层次/家庭背景/教师视角, 采纳分歧来自同伴压力与效用判断",
+		}
+	case "climate":
+		return modeProfile{
+			StanceLabel: "对环保行为的认同度", AgentNoun: "社区居民", SceneNoun: "环保行为情境",
+			AnalystRole: "环保行为报告分析员",
+			SpawnExtra:  "居民覆盖不同收入/年龄/居住形态/环保意识, 认同分歧来自便利性与成本感知",
+		}
 	default: // social
 		return modeProfile{
 			StanceLabel: "对议题的支持度", AgentNoun: "社会角色", SceneNoun: "议题",

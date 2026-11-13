@@ -45,7 +45,8 @@ func (s *Simulator) Simulate(ctx context.Context, chatID string, objective strin
 	switch cfg.Mode {
 	case "montecarlo":
 		return s.monteCarloSimulation(ctx, chatID, objective, cfg)
-	case "social", "game", "crisis", "org", "creative", "market", "policy", "tech":
+	case "social", "game", "crisis", "org", "creative", "market", "policy", "tech",
+		"rumor", "health", "consumer", "team", "education", "climate":
 		if cfg.Detail == "fast" {
 			return s.legacySimulation(ctx, chatID, objective, cfg)
 		}
@@ -520,6 +521,12 @@ func ListSimulationModes() []SimModeInfo {
 		{Mode: "market", Name: "市场竞争", Emoji: "📈", Desc: "多方市场竞争动态和演化"},
 		{Mode: "policy", Name: "政策推演", Emoji: "🏛️", Desc: "政策多阶效应和意外后果"},
 		{Mode: "tech", Name: "技术演进", Emoji: "🔬", Desc: "技术路线竞争/融合/颠覆"},
+		{Mode: "rumor", Name: "谣言辟谣", Emoji: "📢", Desc: "信息真伪信念的传播与反转"},
+		{Mode: "health", Name: "公共健康", Emoji: "🩺", Desc: "疫苗/防护等行为依从性演化"},
+		{Mode: "consumer", Name: "消费口碑", Emoji: "🛍️", Desc: "新品接受/种草拔草/品牌社群"},
+		{Mode: "team", Name: "团队决策", Emoji: "👥", Desc: "小组拍板/从众/责任分散"},
+		{Mode: "education", Name: "教育同伴", Emoji: "🎓", Desc: "课堂/校园同伴效应与流行"},
+		{Mode: "climate", Name: "环保行为", Emoji: "🌱", Desc: "垃圾分类/低碳等社区行为改变"},
 	}
 }
 

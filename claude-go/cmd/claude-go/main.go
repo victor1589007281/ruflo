@@ -6503,7 +6503,7 @@ func swarmCmd() *cobra.Command {
 			return nil
 		},
 	}
-	simulateCmd.Flags().StringVar(&simMode, "mode", "social", "模拟模式: social|game|montecarlo|crisis|org|creative|market|policy|tech")
+	simulateCmd.Flags().StringVar(&simMode, "mode", "social", "模拟模式: social|game|montecarlo|crisis|org|creative|market|policy|tech|rumor|health|consumer|team|education|climate")
 	simulateCmd.Flags().StringVar(&simDetail, "detail", "kernel", "引擎档位: kernel=结构化轮次内核 (默认, 8种模式) | fast=单prompt叙事")
 	simulateCmd.Flags().IntVar(&simAgents, "agents", 5, "模拟 Agent 数量")
 	simulateCmd.Flags().IntVar(&simRounds, "rounds", 3, "模拟轮数预算帽 (自适应终止可能提前收敛)")
@@ -6652,9 +6652,49 @@ hit = sign(plurality) == sign(actual) 且 |plurality| >= 0.1。
 	simEvalCmd.Flags().IntVar(&evalRounds, "rounds", 3, "每事件轮数预算帽")
 	simEvalCmd.Flags().StringVar(&evalTopology, "topology", "", "影响图拓扑 (同 simulate --topology)")
 
+	// 场景识别 (一键模式路由器): 一次 LLM 调用判定 predict/simulate + 1~3 个模拟模式。
+	// webapp 一键页与 AskForge SwarmSimulate 工具都经它路由; LLM 失败时关键词兜底, 不硬失败。
+	// 例: claude-go swarm classify "某市地铁涨价后通勤客流会怎么变化" --json
+	classifyCmd := &cobra.Command{
+		Use:   "classify <问题或场景>",
+		Short: "场景识别: 自动选择 预测/模拟 + 模拟模式",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			si, err := newSwarmEngine()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
+			defer cancel()
+			cls := si.ClassifyObjective(ctx, args[0])
+			if jsonOut {
+				return emitJSON(cls)
+			}
+			kindLabel := "🌐 模拟"
+			if cls.Kind == "predict" {
+				kindLabel = "🔮 预测"
+			}
+			modes := make([]string, 0, len(cls.Modes))
+			for i, m := range cls.Modes {
+				arrow := " → "
+				if i == 0 {
+					arrow = ""
+				}
+				modes = append(modes, fmt.Sprintf("%s%s%s (%.2f)", arrow, m.Emoji, m.Name, m.Score))
+			}
+			fb := ""
+			if cls.Fallback {
+				fb = "  [识别降级: 关键词兜底]"
+			}
+			fmt.Printf("%s · %s%s\n  理由: %s\n", kindLabel, strings.Join(modes, ""), fb, cls.Reason)
+			return nil
+		},
+	}
+
 	cmd.AddCommand(predictCmd)
 	cmd.AddCommand(simulateCmd)
 	cmd.AddCommand(simEvalCmd)
+	cmd.AddCommand(classifyCmd)
 	cmd.AddCommand(historyCmd)
 	cmd.AddCommand(resolveCmd)
 	return cmd
