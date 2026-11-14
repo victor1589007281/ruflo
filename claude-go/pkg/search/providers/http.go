@@ -99,6 +99,13 @@ type base struct {
 
 	fails     atomic.Int32
 	openUntil atomic.Int64
+
+	// minInterval 是同一源两次请求之间的最小间隔。专业数据源（arXiv、巨潮、
+	// World Bank）都写明了调用频率要求；把节流放在 base 上，保证无论上层
+	// 并发多少条查询，单源的出站节奏都由这里串行化，而不是靠调用方自觉。
+	minInterval time.Duration
+	paceMu      sync.Mutex
+	nextAt      time.Time
 }
 
 // newBase 按配置归一化出共享字段。pc 的零值字段回落到源自身默认值。
@@ -191,6 +198,42 @@ func (b *base) client() *http.Client {
 		return b.eg.Client(b.mode)
 	}
 	return fallbackClient()
+}
+
+// setMinInterval 设置单源最小请求间隔；<=0 表示不节流。
+//
+// 只在构造期调用一次，之后只读，避免每条查询都加锁判断。
+func (b *base) setMinInterval(d time.Duration) {
+	b.minInterval = d
+}
+
+// pace 按最小间隔串行化同一源的请求。
+//
+// 先占用时间槽再等待，而不是先睡后占：并发调用会各自拿到递增的 nextAt，
+// 不会同时醒来一起出站。等待期间尊重 ctx，超时直接返回。
+func (b *base) pace(ctx context.Context) error {
+	if b.minInterval <= 0 {
+		return nil
+	}
+	b.paceMu.Lock()
+	now := time.Now()
+	wait := time.Until(b.nextAt)
+	if wait < 0 {
+		wait = 0
+	}
+	b.nextAt = now.Add(wait + b.minInterval)
+	b.paceMu.Unlock()
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // requestContext 按请求 Deadline 或配置超时派生子 context。

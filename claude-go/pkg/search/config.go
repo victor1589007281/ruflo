@@ -96,6 +96,15 @@ type Config struct {
 	// 连续 14 次全部成功。固定按"理想质量"排序会让产品侧反复打到限流源。
 	// 空值保持原有行为, 不影响既有调用方。
 	ProviderPriority []string
+
+	// IntentPriority 按意图覆盖源顺序, 键为 "intent" 或 "intent:lang"
+	// (如 "academic:zh", "data", "news")。查找顺序:
+	// "intent:lang" -> "intent" -> ProviderPriority -> 内置偏好表。
+	//
+	// 为什么不只用一个全局列表: 专业数据源(世界银行/巨潮/DOAJ)只在特定意图
+	// 下该排第一, 全局覆盖会让它们污染日常事实查询; 而把排序逻辑全塞进
+	// pkg/search 又会让产品无法按自己的额度情况调整。按意图分层是两者的折中。
+	IntentPriority map[string][]string
 }
 
 // ProviderConfig 是单源配置。

@@ -26,6 +26,11 @@ const (
 	IntentCode         Intent = "code"
 	IntentNews         Intent = "news"
 	IntentLocal        Intent = "local"
+	// IntentData 是统计 / 年报 / 行业报告类查询。它和 news 的区别在于:
+	// news 要最新几天的报道, data 要的是可核对的口径与原文, 来源也完全不同
+	// (统计机构、上市公司披露、国际组织文档)。共用一套源顺序会让两类查询
+	// 互相挤掉对方最好的源。
+	IntentData Intent = "data"
 )
 
 // QueryPlan 是零模型调用的查询规划结果, 对应设计文档 §5.1。
@@ -109,6 +114,11 @@ func PlanQuery(query string) QueryPlan {
 	case containsAny(lower, "论文", "paper", "arxiv", "survey", "文献", "crossref", "pubmed"):
 		plan.Intent = IntentAcademic
 		plan.SiteHints = append(plan.SiteHints, "site:arxiv.org", "site:openalex.org")
+	case isDataQuery(probe):
+		// 放在新闻之前: 「2024 年统计公报」带年份, 但用户要的是统计口径,
+		// 不是本周新闻; 若被年份分支判成 news, 会强制 week 级新鲜度,
+		// 反而把年度公报判成不新鲜。
+		plan.Intent = IntentData
 	case containsAny(probe, "今天", "今日", "最新", "发布", "新闻", "news", "刚刚"):
 		// 注意不含 "release": "postgres 18 release notes" 是查文档, 不是要上周新闻。
 		// 把它当新闻会强制 week 级新鲜度, 质量门因文档日期旧而恒不过。
@@ -175,6 +185,38 @@ func tooShortSubQuery(p string) bool {
 	}
 	r, _ := utf8.DecodeRuneInString(p)
 	return !(r < utf8.RuneSelf && (unicode.IsLetter(r) || unicode.IsDigit(r)))
+}
+
+// dataSignalRe 匹配英文统计/年报信号。
+//
+// 用词边界而不是子串: "gdpr" 里含 "gdp", "capital" 里含 "cpi" 之类的
+// 误判会让普通技术查询被路由到统计源。
+var dataSignalRe = regexp.MustCompile(`(?i)\b(gdp|cpi|ppi|pmi|statistics?|statistical|census|unemployment|labor force|employment rate|inflation|annual report|industry report|market size|data ?set|world bank|imf|oecd)\b`)
+
+// dataSignalZH 是中文统计/年报信号。
+//
+// 刻意不含单独的「数据」: 「数据库」「数据结构」「大数据」都会命中, 把大量
+// 技术查询误判成统计查询。只收不会有歧义的词组。
+var dataSignalZH = []string{
+	"统计", "年鉴", "年报", "财报", "行业报告", "研究报告", "市场规模",
+	"就业率", "失业率", "人口普查", "居民消费价格", "增加值", "进出口",
+	"人均可支配", "国民经济", "社会消费品零售", "固定资产投资",
+	"采购经理指数", "统计公报",
+	// 上市公司披露的完整说法。「年报」不是「年度报告」的子串（年度|报告），
+	// 只收「年报」会让「2025 年年度报告」被年份分支判成 news，进而错过
+	// 巨潮这个一手的公告检索源。
+	"年度报告", "半年度报告", "季度报告", "招股说明书", "招股书",
+	"业绩预告", "业绩快报", "营业收入", "营收", "净利润",
+}
+
+// isDataQuery 判断查询是否在找统计口径 / 年报 / 行业报告。
+func isDataQuery(lower string) bool {
+	for _, s := range dataSignalZH {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return dataSignalRe.MatchString(lower)
 }
 
 // containsAny 判断 s 是否包含任意一个子串。
@@ -278,7 +320,11 @@ func providerPin(p Provider, cfg Config, eg *Egress) Mode {
 // 偏好表只是排序提示, 不硬性排除: 表外源仍会按 tier/权重参与。
 func sortProviders(candidates []Provider, plan QueryPlan, cfg Config) {
 	order := preferenceOrder(plan.Intent, plan.Language)
-	if len(cfg.ProviderPriority) > 0 {
+	if custom, ok := intentPriority(cfg.IntentPriority, plan); ok {
+		// 意图级覆盖优先于全局覆盖: 统计/学术查询需要把专业源排到通用源前面,
+		// 而全局列表是按日常事实查询的额度情况调的。
+		order = custom
+	} else if len(cfg.ProviderPriority) > 0 {
 		// 调用方显式给了优先级就以它为准: 产品侧知道自己的检索负载与各源
 		// 的免费额度, 固定偏好表无法覆盖。表外源仍在候选里, 只是排在后面。
 		order = cfg.ProviderPriority
@@ -309,6 +355,23 @@ func sortProviders(candidates []Provider, plan QueryPlan, cfg Config) {
 	})
 }
 
+// intentPriority 查找意图级源顺序。
+//
+// 先找 "intent:lang"（如 "data:zh"），再找 "intent"。两者都没有时返回
+// false，由调用方回落到全局 ProviderPriority 或内置偏好表。
+func intentPriority(m map[string][]string, plan QueryPlan) ([]string, bool) {
+	if len(m) == 0 {
+		return nil, false
+	}
+	if v, ok := m[string(plan.Intent)+":"+normalizeLang(plan.Language)]; ok && len(v) > 0 {
+		return v, true
+	}
+	if v, ok := m[string(plan.Intent)]; ok && len(v) > 0 {
+		return v, true
+	}
+	return nil, false
+}
+
 // preferenceOrder 返回意图相关的源偏好顺序。
 func preferenceOrder(intent Intent, language string) []string {
 	zh := normalizeLang(language) == "zh"
@@ -316,7 +379,19 @@ func preferenceOrder(intent Intent, language string) []string {
 	case IntentCode:
 		return []string{"exa", "parallel", "github", "stackexchange", "exa_anon", "tavily", "bing_rss"}
 	case IntentAcademic:
-		return []string{"exa", "parallel", "openalex", "crossref", "pubmed", "arxiv", "exa_anon", "tavily"}
+		return []string{"exa", "parallel", "openalex", "crossref", "pubmed", "arxiv", "doaj", "datacite", "exa_anon", "tavily"}
+	case IntentData:
+		// 中文先巨潮（A 股年报首发平台），英文先世界银行（国别/行业一手报告）。
+		// 两类都保留 exa_anon 作对冲：专业库只覆盖结构化材料，统计口径的
+		// 解读往往还在新闻/分析页里。
+		if zh {
+			return []string{"cninfo", "exa_anon", "worldbank", "datacite", "doaj", "parallel", "zenodo"}
+		}
+		// 专业库排第一，但通用源必须先于第二个专业库：World Bank 的 qterm
+		// 是严格 AND，长查询常返回 0；DataCite 的 best-match 则会给出噪声
+		// 很大的 DOI。只调度前两位时，把 exa_anon 放在 second 才能保证
+		// 「专业库空手而归」的那一轮仍有可读材料。
+		return []string{"worldbank", "exa_anon", "datacite", "zenodo", "doaj", "cninfo", "parallel"}
 	case IntentNews:
 		// exa_anon 必须排在 bing_rss 前面: 只调度前 2 个源, parallel 被限流
 		// (实测 6 个任务并发时 quota_exhausted) 后, 旧顺序会让 bing_rss +
