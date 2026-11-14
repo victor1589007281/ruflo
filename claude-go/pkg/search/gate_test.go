@@ -93,3 +93,52 @@ func TestIsAuthoritativeDomain(t *testing.T) {
 		}
 	}
 }
+
+// TestQualityGateProfessionalDomains 钉住数据库/AI 调研的两类真实误判：
+// ClickHouse 的 changelog 全在 clickhouse.com，ICLR 论文全在
+// proceedings.iclr.cc / iclr.cc。它们都是官方一手页，不能因为域名集中
+// 被判 domains 不达标；非官方博客仍必须失败。
+func TestQualityGateProfessionalDomains(t *testing.T) {
+	now := time.Now()
+	mk := func(urls ...string) []Result {
+		out := make([]Result, 0, len(urls))
+		for _, u := range urls {
+			out = append(out, Result{URL: u, Snippet: "x", Lang: "en", Published: now.Add(-time.Hour)})
+		}
+		return out
+	}
+	req := SearchRequest{Language: "en", Freshness: "any"}
+
+	cases := map[string][]Result{
+		"clickhouse": mk(
+			"https://clickhouse.com/docs/resources/changelogs/oss/2025",
+			"https://clickhouse.com/blog/clickhouse-2025-roundup",
+			"https://clickhouse.com/docs/en/whats-new",
+		),
+		"iclr": mk(
+			"https://proceedings.iclr.cc/paper_files/paper/2025/hash/a-Abstract-Conference.html",
+			"https://iclr.cc/virtual/2025/social/37580",
+			"https://openreview.net/forum?id=abc123",
+		),
+		"postgresql": mk(
+			"https://www.postgresql.org/docs/current/release-18.html",
+			"https://www.postgresql.org/about/press/presskit18/en",
+			"https://www.postgresql.org/docs/current/release-18-notes.html",
+		),
+	}
+	for name, results := range cases {
+		q := evaluateQualityAt(results, req, now)
+		if !q.Pass(false) || q.gateReason(false) != "pass" {
+			t.Errorf("%s: 官方单域名应通过: %+v reason=%s", name, q, q.gateReason(false))
+		}
+	}
+
+	blog := evaluateQualityAt(mk(
+		"https://random-blog.example/clickhouse",
+		"https://random-blog.example/postgres",
+		"https://random-blog.example/iclr",
+	), req, now)
+	if blog.Pass(false) || blog.gateReason(false) != "domains" {
+		t.Errorf("非官方单域名不应通过: %+v reason=%s", blog, blog.gateReason(false))
+	}
+}

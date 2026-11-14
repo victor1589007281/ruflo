@@ -379,7 +379,9 @@ func preferenceOrder(intent Intent, language string) []string {
 	case IntentCode:
 		return []string{"exa", "parallel", "github", "stackexchange", "exa_anon", "tavily", "bing_rss"}
 	case IntentAcademic:
-		return []string{"exa", "parallel", "openalex", "crossref", "pubmed", "arxiv", "doaj", "datacite", "exa_anon", "tavily"}
+		// openreview 紧跟 arxiv：两者互补——arxiv 覆盖预印本，openreview
+		// 覆盖会议投稿，且其索引含 DBLP 整库（DBLP 站点本身被 Anubis 挡住）。
+		return []string{"exa", "parallel", "openalex", "crossref", "pubmed", "arxiv", "openreview", "doaj", "datacite", "exa_anon", "tavily"}
 	case IntentData:
 		// 中文先巨潮（A 股年报首发平台），英文先世界银行（国别/行业一手报告）。
 		// 两类都保留 exa_anon 作对冲：专业库只覆盖结构化材料，统计口径的

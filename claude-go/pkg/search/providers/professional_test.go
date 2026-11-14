@@ -335,3 +335,121 @@ func TestBasePaceHonorsContext(t *testing.T) {
 		t.Fatalf("pace 未响应取消: %v", elapsed)
 	}
 }
+
+// TestOpenReviewProviderParse 钉住 OpenReview API v2 的三件事：
+// (1) content 是 {"value":...} 包装，必须拆开；(2) 会议投稿给 forum 页，
+// DBLP 记录给出版商链接；(3) 无摘要的 DBLP 记录仍保留会议名与作者。
+func TestOpenReviewProviderParse(t *testing.T) {
+	var gotTerm, gotSource, gotLimit string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotTerm, gotSource, gotLimit = q.Get("term"), q.Get("source"), q.Get("limit")
+		fmt.Fprint(w, `{"notes":[
+			{"id":"abc123","forum":"abc123","domain":"ICLR.cc/2025/Conference","pdate":1740000000000,
+			 "content":{"title":{"value":"A Database Index for Agents"},
+			            "abstract":{"value":"We study <b>indexes</b> for agents."},
+			            "venue":{"value":"ICLR 2025"},
+			            "authors":{"value":["Ada L","Bob"]}}},
+			{"id":"P1","forum":"P1","domain":"DBLP.org","pdate":1704067200000,
+			 "content":{"title":{"value":"Vector Database Survey"},
+			            "venue":{"value":"SIGMOD 2024"},
+			            "html":{"value":"http://doi.org/10.1/x"},
+			            "authors":{"value":["C"]}}},
+			{"id":"P2","forum":"P2","domain":"DBLP.org","content":{"title":{"value":""}}},
+			{"id":"P3","forum":"P3","domain":"OpenReview.net/Public_Article","pdate":1710000000000,
+			 "content":{"title":{"value":"Learned Index on Public Article"},
+			            "venue":{"value":"Public Article"},
+			            "authors":{"value":[{"fullname":"Mingyue Li","username":"~Mingyue_Li1"},{"fullname":"Chunfu Jia"}]}}}
+		]}`)
+	}))
+	defer srv.Close()
+
+	cfg := search.DefaultConfig()
+	p, err := newOpenReview(cfg, search.ProviderConfig{Enabled: true, BaseURL: srv.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := p.Search(context.Background(), search.SearchRequest{Query: "agents", Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTerm != "agents" || gotSource != "forum" || gotLimit != "3" {
+		t.Errorf("params = %q/%q/%q", gotTerm, gotSource, gotLimit)
+	}
+	if len(res) != 3 {
+		t.Fatalf("got %d results, want 3（空标题应丢弃）: %+v", len(res), res)
+	}
+	if res[0].URL != "https://openreview.net/forum?id=abc123" {
+		t.Errorf("conference url = %q", res[0].URL)
+	}
+	if res[0].Title != "A Database Index for Agents" {
+		t.Errorf("title 未拆 .value: %q", res[0].Title)
+	}
+	if !strings.Contains(res[0].Snippet, "Ada L, Bob") || !strings.Contains(res[0].Snippet, "ICLR 2025") {
+		t.Errorf("snippet 缺作者/会议: %q", res[0].Snippet)
+	}
+	if strings.Contains(res[0].Snippet, "<b>") {
+		t.Errorf("snippet 未去标签: %q", res[0].Snippet)
+	}
+	if res[0].Published.Year() != 2025 || res[0].Lang != "en" {
+		t.Errorf("published/lang = %v/%q", res[0].Published, res[0].Lang)
+	}
+	if res[1].URL != "https://doi.org/10.1/x" {
+		t.Errorf("dblp url = %q（应走出版商 html 并升级 https）", res[1].URL)
+	}
+	if !strings.Contains(res[1].Snippet, "SIGMOD 2024") {
+		t.Errorf("dblp snippet 缺会议: %q", res[1].Snippet)
+	}
+	// Public_Article 的作者是对象数组；只声明 []string 会让整页解码失败。
+	if !strings.Contains(res[2].Snippet, "Mingyue Li") || !strings.Contains(res[2].Snippet, "Chunfu Jia") {
+		t.Errorf("对象形状的作者未被解出: %q", res[2].Snippet)
+	}
+	if res[2].URL != "https://openreview.net/forum?id=P3" {
+		t.Errorf("public article url = %q", res[2].URL)
+	}
+}
+
+// TestOpenReviewRerankBeatsBagOfWords 钉住真实响应里的噪声：
+// "large language model agents" 的第一条是仅命中 language 的 Romansh 论文。
+// 重排后标题覆盖 4 个查询词的论文应排到前面；零分结果保留为尾部，
+// 因为 DBLP 记录可能只在会议名里命中。
+func TestOpenReviewRerankBeatsBagOfWords(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"notes":[
+			{"id":"noise","forum":"noise","domain":"ICLR.cc/2026/Conference","pdate":1770000000000,
+			 "content":{"title":{"value":"Robust Language Identification for Romansh Varieties"},
+			            "abstract":{"value":"We compare language identification systems."},
+			            "venue":{"value":"ICLR 2026"}}},
+			{"id":"good","forum":"good","domain":"ICLR.cc/2026/Conference","pdate":1770000000000,
+			 "content":{"title":{"value":"Verified Decoding for Small Language Model Agents"},
+			            "abstract":{"value":"Agents built on large language models."},
+			            "venue":{"value":"ICLR 2026"}}},
+			{"id":"venueonly","forum":"venueonly","domain":"DBLP.org","pdate":1700000000000,
+			 "content":{"title":{"value":"Unrelated Systems Paper"},
+			            "venue":{"value":"Large Language Model Agents Workshop"},
+			            "html":{"value":"https://doi.org/10.1/v"}}}
+		]}`)
+	}))
+	defer srv.Close()
+
+	cfg := search.DefaultConfig()
+	p, err := newOpenReview(cfg, search.ProviderConfig{Enabled: true, BaseURL: srv.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := p.Search(context.Background(), search.SearchRequest{
+		Query: "large language model agents", Limit: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 3 {
+		t.Fatalf("got %d results, want 3（零分结果不应被删）", len(res))
+	}
+	if res[0].URL != "https://openreview.net/forum?id=good" {
+		t.Errorf("重排后第一条 = %q, want good", res[0].URL)
+	}
+	if res[2].URL != "https://openreview.net/forum?id=noise" {
+		t.Errorf("噪声应沉底: %v", []string{res[0].URL, res[1].URL, res[2].URL})
+	}
+}

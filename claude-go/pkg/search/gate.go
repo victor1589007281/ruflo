@@ -194,6 +194,84 @@ var authoritativeHosts = map[string]struct{}{
 	"szse.cn":       {},
 	"hkex.com.hk":   {},
 	"cninfo.com.cn": {},
+	// 开放获取的会议/期刊与论文库: proceedings、摘要页就是原文或唯一落地页。
+	// 数据库/AI 学术查询常只命中一两个会议域名, 不列入会把正确结果判成
+	// domains 不达标。
+	"usenix.org":            {},
+	"vldb.org":              {},
+	"sigmod.org":            {},
+	"cidrdb.org":            {},
+	"openproceedings.org":   {},
+	"dagstuhl.de":           {},
+	"dl.acm.org":            {},
+	"ieeexplore.ieee.org":   {},
+	"jmlr.org":              {},
+	"proceedings.mlr.press": {},
+	"openreview.net":        {},
+	"neurips.cc":            {},
+	"iclr.cc":               {},
+	"icml.cc":               {},
+	"aclweb.org":            {},
+	"aaai.org":              {},
+	"ijcai.org":             {},
+	"thecvf.com":            {},
+	"arxiv.org":             {},
+	"jos.org.cn":            {},
+	"ccf.org.cn":            {},
+	// 数据库产品官方文档/发布说明: 功能矩阵、版本变更的一手来源。
+	"postgresql.org":    {},
+	"mysql.com":         {},
+	"mongodb.com":       {},
+	"redis.io":          {},
+	"elastic.co":        {},
+	"clickhouse.com":    {},
+	"snowflake.com":     {},
+	"databricks.com":    {},
+	"pingcap.com":       {},
+	"oceanbase.com":     {},
+	"opengauss.org":     {},
+	"starrocks.io":      {},
+	"milvus.io":         {},
+	"qdrant.tech":       {},
+	"weaviate.io":       {},
+	"neo4j.com":         {},
+	"cockroachlabs.com": {},
+	"yugabyte.com":      {},
+	"couchbase.com":     {},
+	"scylladb.com":      {},
+	"questdb.io":        {},
+	"timescale.com":     {},
+	"influxdata.com":    {},
+	"arangodb.com":      {},
+	"singlestore.com":   {},
+	"transwarp.io":      {},
+	"kingbase.com.cn":   {},
+	"dameng.com":        {},
+	"aliyun.com":        {},
+	"huawei.com":        {},
+	"aws.amazon.com":    {},
+	"cloudflare.com":    {},
+	// AI 厂商官方模型目录/文档/定价页。
+	"openrouter.ai":   {},
+	"mistral.ai":      {},
+	"cohere.com":      {},
+	"nvidia.com":      {},
+	"deepseek.com":    {},
+	"moonshot.cn":     {},
+	"bigmodel.cn":     {},
+	"volcengine.com":  {},
+	"qwen.ai":         {},
+	"minimax.io":      {},
+	"together.ai":     {},
+	"fireworks.ai":    {},
+	"groq.com":        {},
+	"cerebras.ai":     {},
+	"perplexity.ai":   {},
+	"blog.google":     {},
+	"anthropic.com":   {},
+	"openai.com":      {},
+	"deepmind.google": {},
+	"ai.meta.com":     {},
 }
 
 // IsAuthoritativeDomain 判断 host 是否属于官方/一手来源。
@@ -212,6 +290,16 @@ func IsAuthoritativeDomain(host string) bool {
 	}
 	if _, ok := authoritativeHosts[host]; ok {
 		return true
+	}
+	// 子域视为同源: proceedings.iclr.cc / docs.clickhouse.com 与主域同属
+	// 会议或厂商官方，不能因为多了一层子域就退回非权威。按 label 边界逐级
+	// 去掉前缀，避免 "notexample.com" 这类拼接域名误命中。
+	for h := host; strings.Contains(h, "."); {
+		i := strings.IndexByte(h, '.')
+		h = h[i+1:]
+		if _, ok := authoritativeHosts[h]; ok {
+			return true
+		}
 	}
 	if strings.HasPrefix(host, "investor.") || strings.HasPrefix(host, "ir.") ||
 		strings.Contains(host, ".investor.") || strings.Contains(host, ".ir.") {

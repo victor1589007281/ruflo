@@ -34,12 +34,13 @@ var registry = map[string]providerCtor{
 	"pypi":          newPyPI,
 
 	// 专业公开数据源（免 key）。都只做检索，不做抓取；频率由 base.pace 控制。
-	"worldbank": newWorldBank, // 世界银行文档与年报
-	"datacite":  newDataCite,  // 研究数据集 / 机构报告 DOI
-	"zenodo":    newZenodo,    // CERN 开放获取记录
-	"doaj":      newDOAJ,      // 开放获取期刊
-	"arxiv":     newArxiv,     // 预印本
-	"cninfo":    newCNInfo,    // 巨潮资讯：A 股年报与公告
+	"worldbank":  newWorldBank,  // 世界银行文档与年报
+	"datacite":   newDataCite,   // 研究数据集 / 机构报告 DOI
+	"zenodo":     newZenodo,     // CERN 开放获取记录
+	"doaj":       newDOAJ,       // 开放获取期刊
+	"arxiv":      newArxiv,      // 预印本
+	"openreview": newOpenReview, // 会议投稿（含 DBLP 索引）
+	"cninfo":     newCNInfo,     // 巨潮资讯：A 股年报与公告
 }
 
 // requiresAPIKey 列出没有 key 就不应构造的付费源。

@@ -274,6 +274,7 @@ func LoadConfig() Config {
 		"github":        1.0,
 		"stackexchange": 1.0,
 		"openalex":      1.0,
+		"openreview":    1.0,
 		"crossref":      1.0,
 		"pubmed":        1.0,
 		"hn":            0.7,

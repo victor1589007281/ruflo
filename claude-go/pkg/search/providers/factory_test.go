@@ -67,6 +67,7 @@ func TestProviderDefaults(t *testing.T) {
 		{"github", newGitHub, search.ModeDirect, search.TierL2, 1.0},
 		{"stackexchange", newStackExchange, search.ModeDirect, search.TierL2, 1.0},
 		{"openalex", newOpenAlex, search.ModeDirect, search.TierL2, 1.0},
+		{"openreview", newOpenReview, search.ModeDirect, search.TierL2, 1.0},
 		{"crossref", newCrossref, search.ModeDirect, search.TierL2, 1.0},
 		{"pubmed", newPubMed, search.ModeDirect, search.TierL2, 1.0},
 		{"hn", newHN, search.ModeDirect, search.TierL2, 0.7},
