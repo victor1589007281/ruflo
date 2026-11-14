@@ -100,3 +100,33 @@ func TestNonEcosystemQueriesStayUnscoped(t *testing.T) {
 		}
 	}
 }
+
+// TestProviderPriorityOverridesIntentOrder 钉住调用方覆盖开关:
+// 产品侧一次取证会连发 15+ 条检索, Parallel 免费层第 3 次就限流,
+// 固定偏好表会把主源永远钉在限流源上。显式优先级必须生效, 且表外源
+// 不能被排除。
+func TestProviderPriorityOverridesIntentOrder(t *testing.T) {
+	probe := newFake("exa_anon", TierL0, nil)
+	other := newFake("parallel", TierL0, nil)
+	third := newFake("so_html", TierL2, nil)
+	cfg := DefaultConfig()
+	cfg.ProviderPriority = []string{"exa_anon", "so_html"}
+	got, _ := selectProviders([]Provider{probe, other, third}, PlanQuery("中文 查询"), cfg, nil, nil)
+	if len(got) != 3 {
+		t.Fatalf("表外源被排除: %v", namesOf(got))
+	}
+	if got[0].Name() != "exa_anon" || got[1].Name() != "so_html" {
+		t.Fatalf("自定义优先级未生效: %v", namesOf(got))
+	}
+	if got[2].Name() != "parallel" {
+		t.Fatalf("表外源应排在最后: %v", namesOf(got))
+	}
+}
+
+func namesOf(ps []Provider) []string {
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, p.Name())
+	}
+	return out
+}

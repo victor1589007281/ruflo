@@ -86,6 +86,16 @@ type Config struct {
 
 	// Providers 以名字为键。未出现的 provider 使用其构造时的默认值。
 	Providers map[string]ProviderConfig
+
+	// ProviderPriority 是调用方自定义的源优先级（按名字，越靠前越先调度）。
+	//
+	// 非空时覆盖按意图/语言推导的偏好表；表外源仍按 tier/权重参与排序，
+	// 不会被排除。给调用方这个开关的原因是: 不同产品的检索负载差异很大
+	// (一次取证会连发 15+ 条查询), 而匿名源的免费额度差异也很大——
+	// 2026-11-14 实测 Parallel 免费层在第 3 次调用即触发限流, Exa 匿名源
+	// 连续 14 次全部成功。固定按"理想质量"排序会让产品侧反复打到限流源。
+	// 空值保持原有行为, 不影响既有调用方。
+	ProviderPriority []string
 }
 
 // ProviderConfig 是单源配置。

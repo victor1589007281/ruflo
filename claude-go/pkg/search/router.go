@@ -278,6 +278,11 @@ func providerPin(p Provider, cfg Config, eg *Egress) Mode {
 // 偏好表只是排序提示, 不硬性排除: 表外源仍会按 tier/权重参与。
 func sortProviders(candidates []Provider, plan QueryPlan, cfg Config) {
 	order := preferenceOrder(plan.Intent, plan.Language)
+	if len(cfg.ProviderPriority) > 0 {
+		// 调用方显式给了优先级就以它为准: 产品侧知道自己的检索负载与各源
+		// 的免费额度, 固定偏好表无法覆盖。表外源仍在候选里, 只是排在后面。
+		order = cfg.ProviderPriority
+	}
 	index := make(map[string]int, len(order))
 	for i, name := range order {
 		index[name] = i
