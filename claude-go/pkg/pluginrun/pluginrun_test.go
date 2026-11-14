@@ -245,3 +245,47 @@ func TestExpandAllSorted(t *testing.T) {
 		t.Errorf("nil Set 的 ExpandAll 必须是 nil")
 	}
 }
+
+// TestRuntimeDeclarationIsMachineConsumed 钉住 runtime 不是展示字段:
+// external 必须能被判定, 认不出的取值必须被改写并点名 (静默按 builtin 处理
+// 会让"以为只注册、实际装进全局 agents 目录"无从发现)。
+func TestRuntimeDeclarationIsMachineConsumed(t *testing.T) {
+	cases := []struct {
+		decl     string // PLUGIN.md 里 runtime: 的原文; "" = 不声明
+		want     string
+		external bool
+		problem  string // 期望 Problems 里包含的子串; "" = 不该有问题
+	}{
+		{decl: "", want: "", external: false},
+		{decl: "builtin", want: "builtin", external: false},
+		{decl: "external", want: "external", external: true},
+		{decl: " External ", want: "External", external: true}, // frontmatter 去掉外围空格; 判定按 EqualFold
+		{decl: "extern", want: "builtin", problem: `"extern" 不认识`},
+	}
+	for _, c := range cases {
+		root := t.TempDir()
+		line := ""
+		if c.decl != "" {
+			line = "runtime: " + c.decl + "\n"
+		}
+		writeFile(t, filepath.Join(root, "plugins", "demo", "PLUGIN.md"),
+			"---\nkind: plugin\nname: demo\ndescription: 演示\n"+line+"---\n正文\n")
+		b, err := Expand(loadPluginSet(t, root), "demo")
+		if err != nil {
+			t.Fatalf("decl=%q Expand: %v", c.decl, err)
+		}
+		if b.Runtime != c.want {
+			t.Errorf("decl=%q Runtime=%q, want %q", c.decl, b.Runtime, c.want)
+		}
+		if got := b.ExternalRuntime(); got != c.external {
+			t.Errorf("decl=%q ExternalRuntime()=%v, want %v", c.decl, got, c.external)
+		}
+		joined := strings.Join(b.Problems, " | ")
+		if c.problem == "" && len(b.Problems) != 0 {
+			t.Errorf("decl=%q 不该有 Problems: %v", c.decl, b.Problems)
+		}
+		if c.problem != "" && !strings.Contains(joined, c.problem) {
+			t.Errorf("decl=%q Problems=%v, 期望包含 %q", c.decl, b.Problems, c.problem)
+		}
+	}
+}

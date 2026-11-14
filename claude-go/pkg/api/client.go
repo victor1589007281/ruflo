@@ -88,7 +88,7 @@ type LLMCallRecord struct {
 	// Owner 是租户/用户作用域（R-H6）。来源是 ctx 里的 types.WithOwner —— 与
 	// engine/trace 同源，不另设一份"这次调用属于谁"。空值在采集器侧归一为
 	// "local"（types.OwnerFromContext 本身也会把缺失归一为默认 owner）。
-	Owner    string
+	Owner string
 	// App 是调用方 APP 来源标识（studyforge / claimed:moqi / internal:cron /
 	// unknown），与 Owner 正交：owner 答"为谁服务"，app 答"谁调进来"。
 	// 同源从 ctx 读（types.AppFromContext），缺失归一 "unknown"（pkg/types/app.go）。
@@ -211,9 +211,14 @@ type Client struct {
 	DeadlineRetryBase time.Duration // deadline exceeded 退避基数, 默认 10s
 
 	// ExtraHeaders 附加到每次出站 HTTP 请求的自定义头 (与默认头重名时覆盖默认值)。
-	// 请求级注入: 调用方在 SendMessage / StreamMessage 之前设置, 不参与 Client 克隆。
 	// 用途: anthropic-gateway 等协议网关按入站会话注入 x-opencode-session /
-	// User-Agent (opencode zen/go 上游缺失会话头会拒 400 MissingSessionID)。
+	// User-Agent (opencode zen/go 上游缺失会话头会拒 400 MissingSessionID);
+	// 业务应用用它带 X-App-Id 来源标识。
+	//
+	// WithModel / ConfiguredClone 会**复制**这份头 (见 cloneHeader)。这一条
+	// 不是顺手为之: engine 的相位路由与 harness 的角色路由每轮都会用
+	// WithModel 造临时副本, 不传播的话调用方在装配期设置的头会在真正发出
+	// 请求的那一份上静默消失 —— 请求照常成功, 只是网关看到的是 unknown。
 	ExtraHeaders http.Header
 
 	OnLLMEvent   LLMEventFunc    // 事件回调 (可选, 注入飞书通知)
@@ -334,6 +339,7 @@ func (c *Client) WithModel(model string) *Client {
 		cbThreshold:           c.cbThreshold,
 		fallbackCooldownMin:   c.fallbackCooldownMin,
 		Tag:                   c.Tag + ":" + model,
+		ExtraHeaders:          cloneHeader(c.ExtraHeaders),
 		CachePlan:             c.CachePlan,
 		// 观测回调随克隆传播: engine 每轮用 WithModel 造临时副本, 不传播的话
 		// 回退观测在真正执行的副本上静默消失 (请求照常成功, 只是没有回退链)。
@@ -376,6 +382,7 @@ func (c *Client) ConfiguredCloneFull(baseURL, apiKey, model string, fallbackMode
 		cbThreshold:           c.cbThreshold,
 		fallbackCooldownMin:   c.fallbackCooldownMin,
 		Tag:                   c.Tag,
+		ExtraHeaders:          cloneHeader(c.ExtraHeaders),
 		// 计划跨端点克隆也带过去 (与 WithModel 同理): 备用/plan 端点的缓存
 		// 布局应当与主端点一致, 否则同一段 prompt 在两个端点上命中率不同,
 		// 而差异来源是"克隆时漏了一个字段" —— 无从排查。
@@ -1106,6 +1113,21 @@ func isCacheRelatedError(statusCode int, body string) bool {
 // 注入位置必须在 ExtraHeaders 之前: 调用方显式给的会话 ID 永远赢。ExtraHeaders
 // 自身不参与 Client 克隆 (见其注释), 所以不能把默认会话头放在那一层 —— 引擎每轮
 // 都会用 WithModel 造副本, 那样 header 会在真正的请求上消失。
+// cloneHeader 深拷贝出站自定义头。
+//
+// 克隆体与原件各持一份 map: 引擎每轮都会克隆, 共用 map 会让某个克隆体
+// 后续 Set 的请求级头悄悄泄漏到其它并发回合。
+func cloneHeader(h http.Header) http.Header {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(http.Header, len(h))
+	for k, vs := range h {
+		out[k] = append([]string(nil), vs...)
+	}
+	return out
+}
+
 func (c *Client) applyExtraHeaders(httpReq *http.Request) {
 	c.applyOpencodeSessionHeader(httpReq)
 	if len(c.ExtraHeaders) == 0 {

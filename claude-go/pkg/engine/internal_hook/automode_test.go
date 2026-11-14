@@ -11,7 +11,7 @@ import (
 )
 
 func newAutoModeHook(mode string, setPlan func(on bool), consult AdvisorConsultFn, autoAdvisor bool) *AutoModeHook {
-	return NewAutoModeHook(true, mode, nil, autoAdvisor, consult, setPlan, "", NewEngineMetrics())
+	return NewAutoModeHook(true, mode, nil, autoAdvisor, consult, setPlan, "", nil, NewEngineMetrics())
 }
 
 func userMsg(text string) types.Message {
@@ -189,5 +189,46 @@ func TestAutoMode_PlaceholderSkipped(t *testing.T) {
 	}
 	if res != nil || len(planCalls) != 0 {
 		t.Fatalf("占位符消息不应触发: res=%+v plan=%v", res, planCalls)
+	}
+}
+
+// VC 考场死锁回归 (2026-11-12): 会话工具白名单不含 ExitPlanMode 时, 自动规划
+// 是"引导模型调一个它看不见的工具", 整个 tool loop 只读空转、run 零交付。
+// 守卫为 false 的会话必须完全不进自动规划: 不置 flag、不注 hint、按普通任务跑。
+func TestAutoMode_NoExitToolSkipsPlanEntirely(t *testing.T) {
+	var planCalls []bool
+	h := newAutoModeHook("heuristic", func(on bool) { planCalls = append(planCalls, on) }, nil, false)
+	h.CanAutoPlan = func() bool { return false }
+
+	res, err := h.Execute(preReqCtx([]types.Message{userMsg("帮我设计并实现一个多文件功能，并且需要数据库迁移，同时要补充测试。")}, 0))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res != nil {
+		t.Fatalf("无出口会话不应注入规划引导: %+v", res)
+	}
+	if len(planCalls) != 0 {
+		t.Fatalf("无出口会话不应置 plan flag: %v", planCalls)
+	}
+	if h.Metrics.AutoPlanSkippedNoExit.Load() != 1 {
+		t.Fatalf("AutoPlanSkippedNoExit 应为 1, got %d", h.Metrics.AutoPlanSkippedNoExit.Load())
+	}
+	if h.Metrics.AutoPlanEntered.Load() != 0 {
+		t.Fatalf("AutoPlanEntered 应为 0, got %d", h.Metrics.AutoPlanEntered.Load())
+	}
+}
+
+// 守卫为 true (或 nil) 时保持旧行为: 复杂任务照常进规划。
+func TestAutoMode_ExitAvailableEntersPlan(t *testing.T) {
+	var planCalls []bool
+	h := newAutoModeHook("heuristic", func(on bool) { planCalls = append(planCalls, on) }, nil, false)
+	h.CanAutoPlan = func() bool { return true }
+
+	res, err := h.Execute(preReqCtx([]types.Message{userMsg("帮我设计并实现一个多文件功能，并且需要数据库迁移，同时要补充测试。")}, 0))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res == nil || len(planCalls) != 1 || !planCalls[0] {
+		t.Fatalf("有出口会话应照常进规划: res=%v planCalls=%v", res != nil, planCalls)
 	}
 }

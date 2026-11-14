@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/anthropic/claude-go/pkg/asset"
@@ -65,16 +67,19 @@ type pluginCountsDTO struct {
 // *asset.Asset (含正文), 列表接口全带出去会把"给我二十个插件的概览"变成
 // "把这台机器上所有资产文件正文发一遍"。
 type pluginDTO struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	Version     string          `json:"version,omitempty"`
-	Status      string          `json:"status,omitempty"`
-	Source      string          `json:"source,omitempty"`     // state | project | user | builtin
-	SourcePath  string          `json:"sourcePath,omitempty"` // PLUGIN.md (或平铺 .md) 的实际路径
-	DirForm     bool            `json:"dirForm"`              // true = 目录形式包; false = 平铺单文件
-	Counts      pluginCountsDTO `json:"counts"`
-	Problems    []string        `json:"problems"` // 展开问题; 空也必须是 [] 不是 null
-	Editable    bool            `json:"editable"` // 是否本机 state 根下的那一份 (前端据此显示删除按钮)
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Version     string `json:"version,omitempty"`
+	Status      string `json:"status,omitempty"`
+	// Runtime 成员运行时形态: builtin = claude-go 安装进标准 state 根;
+	// external = 由所属应用消费, claude-go 只注册/索引 (不物化)。
+	Runtime    string          `json:"runtime,omitempty"`
+	Source     string          `json:"source,omitempty"`     // state | project | user | builtin
+	SourcePath string          `json:"sourcePath,omitempty"` // PLUGIN.md (或平铺 .md) 的实际路径
+	DirForm    bool            `json:"dirForm"`              // true = 目录形式包; false = 平铺单文件
+	Counts     pluginCountsDTO `json:"counts"`
+	Problems   []string        `json:"problems"` // 展开问题; 空也必须是 [] 不是 null
+	Editable   bool            `json:"editable"` // 是否本机 state 根下的那一份 (前端据此显示删除按钮)
 }
 
 // pluginDetailDTO GET /api/plugins/:name 的插件对象: pluginDTO + 正文 + 成员清单。
@@ -83,6 +88,9 @@ type pluginDetailDTO struct {
 	pluginDTO
 	Body    string           `json:"body"`
 	Members pluginMembersDTO `json:"members"`
+	// RuntimeAttributes 插件清单自身的运行时口径 (声明值 vs 缺省值)。只放详情:
+	// 列表接口不该为一个 20 个包的概览带上二十份属性表。
+	RuntimeAttributes []runtimeAttrDTO `json:"runtimeAttributes,omitempty"`
 }
 
 // pluginMembersDTO 成员清单。每类必须是 [] 不是 null (同 pluginDTO.Problems)。
@@ -94,17 +102,72 @@ type pluginMembersDTO struct {
 	Workflows []pluginMemberDTO `json:"workflows"`
 }
 
-// pluginMemberDTO 成员的摘要条目。成员详情 (正文/frontmatter) 不在这里出 —
-// 它们各自有 /api/agents /api/skills 的详情入口, 这里只回答"这个包里有谁"。
+// pluginMemberDTO 成员的摘要条目。默认只出 name/description —— 成员正文
+// (agent/skill/hook/tool 的 md 全文, workflow 的 JSON 全文) 只有在调用方显式
+// 带 ?full=1 时才随条目返回 (见 handlePluginDetail): 列表抽屉只看摘要不必付这份
+// 字节, 前端点开某个成员时才拉全量。
 type pluginMemberDTO struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	// Body 成员文件全文 (?full=1 时才有)。workflow 是 JSON 文本 —— 前端据此渲染
+	// 可折叠的结构化视图; agent/skill/hook/tool 是 frontmatter+正文的 markdown。
+	Body string `json:"body,omitempty"`
+
+	// ---- 运行时声明 (成员 md 的 frontmatter, 装载时已解析) ----
+	//
+	// 为什么必须结构化返回: 注册进 claude-go 的是**运行时资产**, 不是提示词投影。
+	// frontmatter 在 Body 里根本看不到 (asset 装载时已剥离), 只回 name/description/
+	// body 的话, "这个 agent 用哪个模型、给不给工具、几轮上限" 就只剩磁盘上人眼可
+	// 读 —— dashboard 与后续评测想按字段查都查不到。键名与 pkg/agentbind 的装配
+	// 口径一致 (model / tool-profile / permission-mode / max-turns / tools /
+	// disallowed-tools / skills / hooks), 不另造一套名字。
+	//
+	// 全部 omitempty: 没声明的键不出现在 JSON 里, 而不是返回一堆空串 —— 空串在
+	// 下游会被当成"声明为空", 与"没声明"混成一件事。
+	Status          string   `json:"status,omitempty"`
+	Model           string   `json:"model,omitempty"`
+	ToolProfile     string   `json:"toolProfile,omitempty"`
+	PermissionMode  string   `json:"permissionMode,omitempty"`
+	MaxTurns        int      `json:"maxTurns,omitempty"`
+	Skills          []string `json:"skills,omitempty"`
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
+	// Hooks 是 hook 绑定的原始条目 (如 "PostTurn:command:…")。agent 与 hook 两种
+	// 成员用的都是 frontmatter 的 hooks 键, 因此共用这一个字段。
+	Hooks []string `json:"hooks,omitempty"`
+	// Steps 是声明式 workflow 的步骤序列 (steps:)。claude-go 自己不执行它 ——
+	// 所属应用按这份顺序入队 —— 但它是工作流的运行时契约, 必须在注册面上可见。
+	Steps []string `json:"steps,omitempty"`
+	// Tools 是工具白名单。nil = 没写这个键 (跟随调用方基线);
+	// 非 nil 的空切片 = 显式 `tools: []` (fail-closed, 一个工具都不给)。
+	// 用指针就是为了让这两种语义在 JSON 里也不可混淆 (见 asset.MetaListSet)。
+	Tools *[]string `json:"tools,omitempty"`
+
+	// ---- 其余运行时字段: 此前只在 body/frontmatter 里, 页面上看不到 ----
+	//
+	// Kind 成员种类 (agent/skill/hook/tool/workflow), 前端据此选运行时口径表。
+	Kind    string `json:"kind,omitempty"`
+	Version string `json:"version,omitempty"`
+	// 技能专有 (pkg/skills.parseFrontmatter)。
+	WhenToUse      string   `json:"whenToUse,omitempty"`
+	AllowedTools   []string `json:"allowedTools,omitempty"`
+	Paths          []string `json:"paths,omitempty"`
+	ModelInvocable *bool    `json:"modelInvocable,omitempty"`
+	UserInvocable  *bool    `json:"userInvocable,omitempty"`
+	// workflow 专有 (运行时 pipeline JSON 的顶层字段)。
+	Mode        string   `json:"mode,omitempty"`
+	Stages      []string `json:"stages,omitempty"`
+	QualityGate string   `json:"qualityGate,omitempty"`
+	Rounds      int      `json:"rounds,omitempty"`
+	// RuntimeAttributes 逐键的声明/缺省对账 —— 页面的「运行时口径」小窗直接渲染它。
+	// 由服务端给出而不是前端手拼: 缺省值是运行时行为, 前端抄一份就会随引擎漂移。
+	RuntimeAttributes []runtimeAttrDTO `json:"runtimeAttributes,omitempty"`
 }
 
 // pluginDTOFromBundle 把展开结果投影成对外表示。
 func (s *Server) pluginDTOFromBundle(b *pluginrun.Bundle) pluginDTO {
 	d := pluginDTO{
 		Name:     b.Name,
+		Runtime:  b.Runtime,
 		Problems: append([]string{}, b.Problems...),
 	}
 	if b.Plugin != nil {
@@ -197,12 +260,21 @@ func (s *Server) pluginAssetList() []pluginDTO {
 
 // pluginCreateInput 新建/覆盖一个插件包。Scaffold 可空: 带骨架时成员文件随清单
 // 一并落盘 (AI 生成 → 审核 → 保存的闭环), 不带则只写清单 PLUGIN.md。
+// Members 是**精确内容**通道 (机器注册用): key = bundle 内相对路径
+// (agents/x.md | skills/<n>/SKILL.md | workflows/x.json|.md | hooks/x.md)，value = 文件
+// 全文。与 Scaffold 二选一 (同请求都给了优先 Members 且重名即报错) —— Scaffold 的
+// frontmatter 只有 name/description 两键，装不了带 tools:/tool-profile: 等完整
+// frontmatter 的 agent 资产; 系统托管插件 (如 interviewforge) 需要逐字节保真。
 type pluginCreateInput struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Body        string          `json:"body"`
-	Version     string          `json:"version,omitempty"`
-	Scaffold    *pluginScaffold `json:"scaffold,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Body        string `json:"body"`
+	Version     string `json:"version,omitempty"`
+	// Runtime 成员运行时形态: 空/builtin = 物化进标准 state 根;
+	// external = 成员由所属应用消费, 只注册/索引 (不物化)。
+	Runtime  string            `json:"runtime,omitempty"`
+	Scaffold *pluginScaffold   `json:"scaffold,omitempty"`
+	Members  map[string]string `json:"members,omitempty"`
 }
 
 // handlePluginCreate POST /api/plugins → 写 <stateDir>/plugins/<名>/PLUGIN.md。
@@ -228,6 +300,14 @@ func (s *Server) handlePluginCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("body 不能为空 (它就是 PLUGIN.md 的正文)"))
 		return
 	}
+	in.Runtime = strings.ToLower(strings.TrimSpace(in.Runtime))
+	switch in.Runtime {
+	case "", "builtin", "external":
+	default:
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"runtime 只接受 builtin | external（空 = builtin），收到 %q", in.Runtime))
+		return
+	}
 
 	md := buildPluginMarkdown(in)
 	dir := filepath.Join(s.pluginAssetRoot(), in.Name)
@@ -244,6 +324,11 @@ func (s *Server) handlePluginCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	explicit, err := buildExplicitMemberFiles(dir, in.Members)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -252,7 +337,7 @@ func (s *Server) handlePluginCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	for _, m := range members {
+	for _, m := range append(members, explicit...) {
 		if err := os.MkdirAll(filepath.Dir(m.path), 0o755); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -283,10 +368,37 @@ func (s *Server) handlePluginCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("写入成功但展开失败: %w", err))
 		return
 	}
+	// runtime: external 的插件由所属应用消费成员，claude-go 只注册与索引。
+	// 仍然回读一份展开结果 (成员计数/问题照常可见), 但绝不物化: 把这些
+	// 提示词模板装进全局 agents/ 会扩大每个请求的 subagent/权限面。
+	if b.ExternalRuntime() {
+		d := s.pluginDTOFromBundle(b)
+		d.Description = back.Description
+		d.Version = back.Version
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"plugin": d,
+			"materialized": materializeReport{
+				Installed: []string{},
+				Skipped:   []string{"runtime: external —— 成员由所属应用消费，claude-go 不物化"},
+			},
+		})
+		return
+	}
+	// 服务端插件接线的落点: 把成员物化进标准 state 根 (agents/workflows/skills)。
+	// 这一步让"POST /api/plugins"从「存了个包」变成「能力已上线」—— 团队阶段的
+	// agent/prompt/skills 解析读的全是物化后的标准位置，热路径零改动。
+	mat, matErr := s.materializePlugin(b)
+	if matErr != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"plugin": s.pluginDTOFromBundle(b), "description": back.Description, "version": back.Version,
+			"materialized": mat, "warn": fmt.Sprintf("成员物化失败: %v", matErr),
+		})
+		return
+	}
 	d := s.pluginDTOFromBundle(b)
 	d.Description = back.Description
 	d.Version = back.Version
-	writeJSON(w, http.StatusOK, map[string]interface{}{"plugin": d})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"plugin": d, "materialized": mat})
 }
 
 // scaffoldFile 一个待落盘的成员文件 (先验后写: 全部构建并解析通过前, 一个都不写)。
@@ -403,6 +515,10 @@ func (s *Server) handlePluginDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// full=1: 成员条目携带文件全文 (正文在资产装载时已读入内存, 这里只是不丢)。
+	// 默认不带 —— 详情抽屉的摘要视图不应为一个 12 工作流的大包付几百 KB。
+	full := r.URL.Query().Get("full") == "1"
+
 	// 与列表读**同一份**索引 —— 分开取的话会出现"列表里有它、点进去 404"的自相矛盾。
 	cat := s.agentCatalog()
 	a := cat.Get(asset.KindPlugin, name)
@@ -434,27 +550,98 @@ func (s *Server) handlePluginDetail(w http.ResponseWriter, r *http.Request) {
 			d.Body = b.Plugin.Body
 		}
 		d.Members = pluginMembersDTO{
-			Agents:    pluginMemberList(b.Agents),
-			Skills:    pluginMemberList(b.Skills),
-			Hooks:     pluginMemberList(b.Hooks),
-			Tools:     pluginMemberList(b.Tools),
-			Workflows: pluginMemberList(b.Workflows),
+			Agents:    pluginMemberList(b.Agents, full),
+			Skills:    pluginMemberList(b.Skills, full),
+			Hooks:     pluginMemberList(b.Hooks, full),
+			Tools:     pluginMemberList(b.Tools, full),
+			Workflows: pluginMemberList(b.Workflows, full),
 		}
 	}
+	// 插件清单自身的运行时口径 (runtime / status / version / commands / mcp)。
+	d.RuntimeAttributes = pluginRuntimeAttrs(a, d.DirForm)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"plugin": d})
 }
 
 // pluginMemberList 投影成员摘要; 恒返回非 nil 切片 (nil 序列化成 null, 前端
 // list.map 当场白页 —— 本仓反复出现过的形态)。
-func pluginMemberList(assets []*asset.Asset) []pluginMemberDTO {
+func pluginMemberList(assets []*asset.Asset, full bool) []pluginMemberDTO {
 	out := make([]pluginMemberDTO, 0, len(assets))
 	for _, a := range assets {
 		if a == nil {
 			continue
 		}
-		out = append(out, pluginMemberDTO{Name: a.Name, Description: a.Description})
+		m := pluginMemberDTO{Name: a.Name, Description: a.Description}
+		m.fillRuntime(a)
+		if full {
+			m.Body = a.Body
+		}
+		out = append(out, m)
 	}
 	return out
+}
+
+// fillRuntime 把成员声明里的运行时键投影进 DTO。
+//
+// 取键一律走 asset 的 Meta/MetaListSet, 不自己解析 frontmatter: 六种资产各自的
+// 键集合与解析规则只能有一份 (asset + agentbind), dashboard 只是读者。非法值
+// (max-turns 写成 "abc"/0) 这里选择**不投影**而不是照样输出: agentbind 会把
+// 非法值整条作废, 若 API 还把它当声明展示, 装配面与注册面就会各说各话。
+func (m *pluginMemberDTO) fillRuntime(a *asset.Asset) {
+	if a == nil {
+		return
+	}
+	m.Kind = string(a.Kind)
+	m.Version = a.Version
+	m.Status = a.Status
+	m.Model = strings.TrimSpace(a.Meta("model"))
+	m.ToolProfile = strings.TrimSpace(a.Meta("tool-profile"))
+	m.PermissionMode = strings.TrimSpace(a.Meta("permission-mode"))
+	if raw := strings.TrimSpace(a.Meta("max-turns")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			m.MaxTurns = n
+		}
+	}
+	// 存在性必须保留: `tools: []` 是 fail-closed 的显式空名单, 与"没写 tools"
+	// 语义相反。MetaListSet 是唯一能区分二者的入口。
+	if tools, ok := a.MetaListSet("tools"); ok {
+		if tools == nil {
+			tools = []string{}
+		}
+		m.Tools = &tools
+	}
+	m.Skills = a.MetaList("skills")
+	m.DisallowedTools = a.MetaList("disallowed-tools")
+	m.Hooks = a.MetaList("hooks")
+	m.Steps = a.MetaList("steps")
+
+	// 技能/工作流成员此前只有通用字段, 各自的可调项全在 frontmatter/JSON 正文里
+	// (body 的 frontmatter 已被资产层剥掉) —— 不结构化返回, 页面上就只剩提示词。
+	if a.Kind == asset.KindSkill {
+		m.WhenToUse = strings.TrimSpace(a.Meta("when-to-use"))
+		m.AllowedTools = a.MetaList("allowed-tools")
+		m.Paths = a.MetaList("paths")
+		if raw := strings.TrimSpace(a.Meta("model-invocable")); raw != "" {
+			b := asset.ParseBool(raw)
+			m.ModelInvocable = &b
+		}
+		if raw := strings.TrimSpace(a.Meta("user-invocable")); raw != "" {
+			b := asset.ParseBool(raw)
+			m.UserInvocable = &b
+		}
+	}
+	if a.Kind == asset.KindWorkflow {
+		if d := parseWFJSON(a.Body); d != nil {
+			m.Mode = d.Mode
+			m.QualityGate = d.QualityGate
+			m.Rounds = d.Rounds
+			m.Stages = make([]string, 0, len(d.Stages))
+			for _, s := range d.Stages {
+				m.Stages = append(m.Stages, s.Name)
+			}
+		}
+	}
+
+	m.RuntimeAttributes = runtimeAttrsFor(a.Kind, a)
 }
 
 // handlePluginDelete DELETE /api/plugins/{name}: 只删 state 根下的那一份。
@@ -477,6 +664,10 @@ func (s *Server) handlePluginDelete(w http.ResponseWriter, name string) {
 		writeError(w, http.StatusForbidden, fmt.Errorf("path traversal blocked"))
 		return
 	}
+
+	// 先回收物化成员 (与安装对称): 仍等于我们写入哈希的才删，被用户改过的
+	// 留在盘上归用户所有。bundle 目录随后整体移除。
+	dem, _ := s.dematerializePlugin(name)
 
 	deleted := false
 	if st, err := os.Stat(dir); err == nil && st.IsDir() {
@@ -510,7 +701,71 @@ func (s *Server) handlePluginDelete(w http.ResponseWriter, name string) {
 	if s.cfg.ReloadAgents != nil {
 		s.cfg.ReloadAgents()
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "deleted": name, "scope": "state"})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "deleted": name, "scope": "state", "dematerialized": dem})
+}
+
+// buildExplicitMemberFiles 精确内容通道 (机器注册用): 调用方给出 bundle 内相对路径
+// → 文件全文，原样落盘。与 Scaffold 的差别 = frontmatter 保真: agent 的
+// tools:/tool-profile:/max-turns: 等旋钮原样保留，不经 fm() 的两键重建。
+//
+// 校验纪律与 buildScaffoldFiles 相同 (先验后写、任一失败整体 400):
+//   - 路径白名单: 只允许 agents/ skills/ workflows/ hooks/ tools/ 五类成员目录，
+//     禁 ".."、绝对路径、空段 —— 这些 key 最终拼进 pluginAssetRoot 之下的落点，
+//     越界即路径穿越;
+//   - 扩展名: agents/hooks 只认 .md，workflows 认 .json (运行时定义) 与 .md
+//     (声明式成员, 由所属应用消费), skills 只认 SKILL.md;
+//   - 每个文件按其 kind 用 asset.ParseContent 预解析一遍，坏文件整体拒写。
+func buildExplicitMemberFiles(dir string, members map[string]string) ([]scaffoldFile, error) {
+	if len(members) == 0 {
+		return nil, nil
+	}
+	type rule struct {
+		prefix string
+		suffix string // 空 = 任意; 非空 = 必须以它结尾
+		kind   asset.Kind
+	}
+	rules := []rule{
+		{prefix: "agents/", suffix: ".md", kind: asset.KindAgent},
+		{prefix: "skills/", suffix: "SKILL.md", kind: asset.KindSkill},
+		{prefix: "workflows/", suffix: ".json", kind: asset.KindWorkflow},
+		{prefix: "workflows/", suffix: ".md", kind: asset.KindWorkflow},
+		{prefix: "hooks/", suffix: ".md", kind: asset.KindHook},
+		{prefix: "tools/", suffix: ".md", kind: asset.KindTool},
+	}
+	keys := make([]string, 0, len(members))
+	for k := range members {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	files := make([]scaffoldFile, 0, len(keys))
+	for _, rel := range keys {
+		if strings.Contains(rel, "..") || strings.HasPrefix(rel, "/") || filepath.IsAbs(rel) {
+			return nil, fmt.Errorf("members 路径 %q 非法 (禁绝对路径与 '..')", rel)
+		}
+		var matched *rule
+		for i := range rules {
+			if strings.HasPrefix(rel, rules[i].prefix) && (rules[i].suffix == "" || strings.HasSuffix(rel, rules[i].suffix)) {
+				matched = &rules[i]
+				break
+			}
+		}
+		if matched == nil {
+			return nil, fmt.Errorf("members 路径 %q 不在五类成员目录内或扩展名不符 (agents/*.md | skills/*/SKILL.md | workflows/*.json|*.md | hooks/*.md | tools/*.md)", rel)
+		}
+		// 空段 ("agents//x.md") 与 PLUGIN.md 冒名
+		clean := filepath.ToSlash(filepath.Clean(rel))
+		if clean != rel || strings.HasSuffix(rel, "/") {
+			return nil, fmt.Errorf("members 路径 %q 含空段或非规范形式", rel)
+		}
+		content := members[rel]
+		p := filepath.Join(dir, rel)
+		if _, err := asset.ParseContent(content, p, "state", matched.kind); err != nil {
+			return nil, fmt.Errorf("members %s 解析失败: %w", rel, err)
+		}
+		files = append(files, scaffoldFile{p, content})
+	}
+	return files, nil
 }
 
 // buildPluginMarkdown 把入参渲染成一份 PLUGIN.md。
@@ -529,6 +784,10 @@ func buildPluginMarkdown(in pluginCreateInput) string {
 	b.WriteString("status: active\n")
 	if v := strings.TrimSpace(in.Version); v != "" {
 		b.WriteString("version: " + oneLine(v) + "\n")
+	}
+	// 只在显式声明时写: 不写 = builtin, 与存量插件逐字节兼容。
+	if r := strings.TrimSpace(in.Runtime); r != "" {
+		b.WriteString("runtime: " + oneLine(r) + "\n")
 	}
 	b.WriteString("---\n\n")
 	b.WriteString(strings.TrimSpace(in.Body))

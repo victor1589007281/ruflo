@@ -57,6 +57,10 @@ type EngineMetrics struct {
 	ComplexityChecks atomic.Int64
 	// AutoPlanEntered 自动开启规划模式次数
 	AutoPlanEntered atomic.Int64
+	// AutoPlanSkippedNoExit 因会话无规划出口 (工具白名单不含 ExitPlanMode)
+	// 而**放弃**自动规划的次数。进了规划模式就出不来 = 整轮只读空转死锁,
+	// 这类会话直接按普通任务跑 (VC 考场 2026-11-12 实测触发)。
+	AutoPlanSkippedNoExit atomic.Int64
 	// AutoAdvisorInjected 自动咨询 advisor 并注入建议次数
 	AutoAdvisorInjected atomic.Int64
 
@@ -259,6 +263,7 @@ func (m *EngineMetrics) Snapshot() map[string]any {
 		"stop_suggestions_honored":  m.StopSuggestionsHonored.Load(),
 		"complexity_checks":         m.ComplexityChecks.Load(),
 		"auto_plan_entered":         m.AutoPlanEntered.Load(),
+		"auto_plan_skipped_no_exit": m.AutoPlanSkippedNoExit.Load(),
 		"auto_advisor_injected":     m.AutoAdvisorInjected.Load(),
 		"traj_success":              m.TrajSuccessRecorded.Load(),
 		"traj_fail":                 m.TrajFailRecorded.Load(),

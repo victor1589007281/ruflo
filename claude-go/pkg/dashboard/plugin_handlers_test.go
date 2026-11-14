@@ -450,3 +450,416 @@ func TestPluginCreateScaffoldRejectedAtomically(t *testing.T) {
 		})
 	}
 }
+
+// TestPluginDetailFullFlag 守住 ?full=1 的线契约: 默认详情只给摘要 (body 为空),
+// full=1 时每个成员带文件全文 (workflow 是 JSON 文本, 前端据此渲染折叠树),
+// 且两种形态下 name/description 都不变 —— full 是**增量**开关, 不是另一份表示。
+func TestPluginDetailFullFlag(t *testing.T) {
+	s, state := newAgentServer(t)
+	prev := agent.AgentCatalog()
+	defer agent.SetAgentCatalog(prev)
+	agent.SetAgentCatalog(asset.NewSet())
+
+	body := `{"name":"full-kit","description":"全文包","body":"# Full","scaffold":{` +
+		`"agents":[{"name":"looker","description":"查看","body":"你是查看 agent。\n\n只读。"}],` +
+		`"skills":[{"name":"guide","description":"指南","body":"步骤一。步骤二。"}]}}`
+	rec := do(t, s, http.MethodPost, "/api/plugins", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("创建失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	agent.SetAgentCatalog(asset.LoadStandard(asset.LoadRoots{State: state}))
+
+	// 默认形态: 摘要 only —— 判据落在**成员条目**的 body 上 (detail 顶层有自己的
+	// PLUGIN.md 正文 body 字段, 全文匹配会误伤)。
+	rec = do(t, s, http.MethodGet, "/api/plugins/full-kit", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("详情失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	var brief struct {
+		Plugin pluginDetailDTO `json:"plugin"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &brief); err != nil {
+		t.Fatalf("默认详情形状不对: %v", err)
+	}
+	if brief.Plugin.Members.Agents[0].Body != "" || brief.Plugin.Members.Skills[0].Body != "" {
+		t.Errorf("默认详情成员带了正文 (full 开关失效): %+v", brief.Plugin.Members.Agents[0])
+	}
+
+	// full=1: 正文随条目返回, 且是**成员文件**的内容而不是别的什么。
+	rec = do(t, s, http.MethodGet, "/api/plugins/full-kit?full=1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("full 详情失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	var detail struct {
+		Plugin pluginDetailDTO `json:"plugin"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("full 详情形状不对: %v", err)
+	}
+	if len(detail.Plugin.Members.Agents) != 1 || len(detail.Plugin.Members.Skills) != 1 {
+		t.Fatalf("members 数量不对: %+v", detail.Plugin.Members)
+	}
+	if !strings.Contains(detail.Plugin.Members.Agents[0].Body, "你是查看 agent") {
+		t.Errorf("agent 正文没随 full=1 返回: %q", detail.Plugin.Members.Agents[0].Body)
+	}
+	if detail.Plugin.Members.Agents[0].Name != "looker" || detail.Plugin.Members.Agents[0].Description != "查看" {
+		t.Errorf("full=1 下摘要字段变了: %+v", detail.Plugin.Members.Agents[0])
+	}
+}
+
+// TestPluginExternalRuntimeRegistersWithoutMaterializing 是 runtime: external 的核心判据。
+//
+// 判据不是"返回 200": 而是 ① 成员文件进了插件包目录 (注册是真的);
+// ② 标准 state 根下**没有**多出 agents/workflows (没有物化); ③ 完整运行时
+// frontmatter 原样落盘 (不是只剩提示词的投影); ④ 详情能按展开器口径看到成员。
+func TestPluginExternalRuntimeRegistersWithoutMaterializing(t *testing.T) {
+	s, state := newAgentServer(t)
+	prev := agent.AgentCatalog()
+	defer agent.SetAgentCatalog(prev)
+	agent.SetAgentCatalog(asset.NewSet())
+
+	agentBody := "---\nkind: agent\nname: companion\ndescription: 人格\nstatus: active\n" +
+		"model: opencode:deepseek-v4.1-flash\ntool-profile: analysis\npermission-mode: default\n" +
+		"max-turns: 4\ntools: []\n---\n\n你是默契。\n"
+	hookBody := "---\nkind: hook\nname: turn-audit\ndescription: 审计\n" +
+		"hooks:\n  - PostTurn:command:./audit.sh\n---\n\n只写元数据。\n"
+	wfBody := "---\nkind: workflow\nname: nightly-memory\ndescription: 夜间步骤\n" +
+		"steps:\n  - summarize\n  - reflect\n---\n\n步骤正文。\n"
+
+	payload, err := json.Marshal(pluginCreateInput{
+		Name: "moqi-companion", Description: "Moqi 的 AI 资产", Body: "# Moqi\n\n运行时资产。",
+		Version: "1.1.0", Runtime: "external",
+		Members: map[string]string{
+			"agents/companion.md":         agentBody,
+			"hooks/turn-audit.md":         hookBody,
+			"workflows/nightly-memory.md": wfBody,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, s, http.MethodPost, "/api/plugins", string(payload))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("创建失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Plugin       pluginDTO         `json:"plugin"`
+		Materialized materializeReport `json:"materialized"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("响应形状不对: %v (%s)", err, rec.Body.String())
+	}
+	if created.Plugin.Runtime != "external" {
+		t.Errorf("runtime = %q, 期望 external", created.Plugin.Runtime)
+	}
+	if len(created.Materialized.Installed) != 0 {
+		t.Errorf("external 插件不应物化任何成员, 实际装了 %v", created.Materialized.Installed)
+	}
+	if len(created.Materialized.Skipped) == 0 || !strings.Contains(strings.Join(created.Materialized.Skipped, " "), "external") {
+		t.Errorf("物化报告没有说明为什么跳过: %v", created.Materialized.Skipped)
+	}
+
+	// ① 注册是真的: 三个成员都在插件包里, 且运行时字段逐字节保留。
+	for _, rel := range []string{"agents/companion.md", "hooks/turn-audit.md", "workflows/nightly-memory.md"} {
+		if _, err := os.Stat(filepath.Join(state, "plugins", "moqi-companion", filepath.FromSlash(rel))); err != nil {
+			t.Errorf("成员 %s 没落进插件包: %v", rel, err)
+		}
+	}
+	gotAgent, err := os.ReadFile(filepath.Join(state, "plugins", "moqi-companion", "agents", "companion.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"model:", "tool-profile:", "permission-mode:", "max-turns:", "tools: []"} {
+		if !strings.Contains(string(gotAgent), key) {
+			t.Errorf("运行时声明 %q 在落盘后丢了:\n%s", key, gotAgent)
+		}
+	}
+
+	// ② 没有物化: 标准 state 根下不该出现这些东西。
+	for _, p := range []string{
+		filepath.Join(state, "agents", "companion.md"),
+		filepath.Join(state, "hooks", "turn-audit.md"),
+		filepath.Join(state, "workflows", "nightly-memory.md"),
+	} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("external 插件把 %s 物化进了标准 state 根 (err=%v)", p, err)
+		}
+	}
+
+	// ③ 详情按展开器口径可见 (成员现读磁盘, 不依赖进程内物化)。
+	agent.SetAgentCatalog(asset.LoadStandard(asset.LoadRoots{State: state}))
+	rec = do(t, s, http.MethodGet, "/api/plugins/moqi-companion?full=1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("详情失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	var detail struct {
+		Plugin pluginDetailDTO `json:"plugin"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("详情形状不对: %v", err)
+	}
+	if detail.Plugin.Runtime != "external" {
+		t.Errorf("详情 runtime = %q, 期望 external", detail.Plugin.Runtime)
+	}
+	c := detail.Plugin.Counts
+	if c.Agents != 1 || c.Hooks != 1 || c.Workflows != 1 {
+		t.Errorf("成员计数不对: %+v", c)
+	}
+	if len(detail.Plugin.Members.Workflows) != 1 || !strings.Contains(detail.Plugin.Members.Workflows[0].Body, "步骤正文") {
+		t.Errorf("workflows/*.md 没被展开: %+v", detail.Plugin.Members.Workflows)
+	}
+}
+
+// TestPluginBuiltinSkipsMarkdownWorkflowMaterialization: builtin 插件里的
+// workflows/*.md 是声明式成员 (由所属应用读), 不能拷进运行时 workflows/
+// 目录 —— 那里只认 JSON 定义, 拷进去热注册必然失败。
+func TestPluginBuiltinSkipsMarkdownWorkflowMaterialization(t *testing.T) {
+	s, state := newAgentServer(t)
+	prev := agent.AgentCatalog()
+	defer agent.SetAgentCatalog(prev)
+	agent.SetAgentCatalog(asset.NewSet())
+
+	wfBody := "---\nkind: workflow\nname: nightly\nsteps:\n  - summarize\n---\n\n正文。\n"
+	payload, err := json.Marshal(pluginCreateInput{
+		Name: "decl-only", Description: "声明式工作流", Body: "# Decl\n\n只有声明。",
+		Members: map[string]string{"workflows/nightly.md": wfBody},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, s, http.MethodPost, "/api/plugins", string(payload))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("创建失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Materialized materializeReport `json:"materialized"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("响应形状不对: %v", err)
+	}
+	if len(created.Materialized.Installed) != 0 {
+		t.Errorf("声明式 workflow 不该被物化, 实际装了 %v", created.Materialized.Installed)
+	}
+	joined := strings.Join(created.Materialized.Skipped, " ")
+	if !strings.Contains(joined, ".md") || !strings.Contains(joined, "声明式") {
+		t.Errorf("跳过原因没写清楚: %v", created.Materialized.Skipped)
+	}
+	if _, err := os.Stat(filepath.Join(state, "workflows", "nightly.md")); !os.IsNotExist(err) {
+		t.Errorf("workflows/nightly.md 被拷进了运行时目录 (err=%v)", err)
+	}
+}
+
+// TestPluginMemberRuntimeFieldsAreRegistered: 注册面必须给出**完整运行时信息**,
+// 而不只是提示词。判据是详情接口的成员条目里能按字段读到 model / tool-profile /
+// permission-mode / max-turns / tools / steps / hooks。
+//
+// 重点守两条容易被"顺手抹平"的语义:
+//   - `tools: []` 必须序列化成 `"tools":[]` (fail-closed 的显式空名单);
+//   - 没写 tools 的成员必须**没有** tools 键, 而不是给个空数组 —— 前者跟基线,
+//     后者拒绝一切工具, 两者在运行时相反。
+func TestPluginMemberRuntimeFieldsAreRegistered(t *testing.T) {
+	s, state := newAgentServer(t)
+	prev := agent.AgentCatalog()
+	defer agent.SetAgentCatalog(prev)
+	agent.SetAgentCatalog(asset.NewSet())
+
+	full := "---\nkind: agent\nname: companion\ndescription: 人格\nstatus: active\n" +
+		"model: opencode:deepseek-v4.1-flash\ntool-profile: analysis\npermission-mode: default\n" +
+		"max-turns: 4\ntools: []\nskills:\n  - commit\n---\n\n你是默契。\n"
+	plain := "---\nkind: agent\nname: plain\ndescription: 只有提示词\n---\n\n正文。\n"
+	hookBody := "---\nkind: hook\nname: turn-audit\ndescription: 审计\n" +
+		"hooks:\n  - PostTurn:command:./audit.sh\n---\n\n只写元数据。\n"
+	wfBody := "---\nkind: workflow\nname: nightly-memory\ndescription: 夜间步骤\n" +
+		"steps:\n  - summarize\n  - reflect\n---\n\n正文。\n"
+
+	payload, err := json.Marshal(pluginCreateInput{
+		Name: "runtime-ish", Description: "运行时声明", Body: "# Runtime\n\n完整性。",
+		Runtime: "external",
+		Members: map[string]string{
+			"agents/companion.md":         full,
+			"agents/plain.md":             plain,
+			"hooks/turn-audit.md":         hookBody,
+			"workflows/nightly-memory.md": wfBody,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, s, http.MethodPost, "/api/plugins", string(payload)); rec.Code != http.StatusOK {
+		t.Fatalf("创建失败 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	agent.SetAgentCatalog(asset.LoadStandard(asset.LoadRoots{State: state}))
+	rec := do(t, s, http.MethodGet, "/api/plugins/runtime-ish", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("详情失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	var detail struct {
+		Plugin pluginDetailDTO `json:"plugin"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("详情形状不对: %v", err)
+	}
+
+	byName := func(list []pluginMemberDTO, name string) (pluginMemberDTO, bool) {
+		for _, m := range list {
+			if m.Name == name {
+				return m, true
+			}
+		}
+		return pluginMemberDTO{}, false
+	}
+
+	got, ok := byName(detail.Plugin.Members.Agents, "companion")
+	if !ok {
+		t.Fatalf("companion 不在成员里: %+v", detail.Plugin.Members.Agents)
+	}
+	if got.Status != "active" || got.Model != "opencode:deepseek-v4.1-flash" ||
+		got.ToolProfile != "analysis" || got.PermissionMode != "default" || got.MaxTurns != 4 {
+		t.Errorf("运行时字段没登记全: %+v", got)
+	}
+	if got.Tools == nil || len(*got.Tools) != 0 {
+		t.Errorf("tools: [] 应登记为显式空名单, 实际 %v", got.Tools)
+	}
+	if len(got.Skills) != 1 || got.Skills[0] != "commit" {
+		t.Errorf("skills 没登记: %v", got.Skills)
+	}
+
+	if plainM, ok := byName(detail.Plugin.Members.Agents, "plain"); !ok {
+		t.Fatal("plain 不在成员里")
+	} else if plainM.Tools != nil {
+		t.Errorf("没写 tools 的成员不该有 tools 字段 (nil 才是「跟基线」), 实际 %v", *plainM.Tools)
+	}
+
+	if h, ok := byName(detail.Plugin.Members.Hooks, "turn-audit"); !ok {
+		t.Fatal("turn-audit 不在成员里")
+	} else if len(h.Hooks) != 1 || !strings.Contains(h.Hooks[0], "PostTurn") {
+		t.Errorf("hook 绑定没登记: %v", h.Hooks)
+	}
+
+	if w, ok := byName(detail.Plugin.Members.Workflows, "nightly-memory"); !ok {
+		t.Fatal("nightly-memory 不在成员里")
+	} else if strings.Join(w.Steps, ",") != "summarize,reflect" {
+		t.Errorf("workflow steps 没登记: %v", w.Steps)
+	}
+
+	// 序列化层的存在性: `[]` 必须在, 没声明时整个键不在。两者混淆就是运行时语义
+	// 被吞掉, 而字段值本身看不出来。
+	raw := rec.Body.String()
+	if !strings.Contains(raw, `"tools":[]`) {
+		t.Errorf("显式空名单没有序列化成 \"tools\":[]:\n%s", raw)
+	}
+}
+
+// TestRuntimeAttributesReportDeclaredAndDefaults: 页面要能回答"没写这个键时会发生什么"。
+// 判据是详情接口为每个成员给出 runtimeAttributes, 且:
+//   - 没写 max-turns ⇒ isSet=false 且 default 里点明引擎兜底轮数 (不是空白);
+//   - 写成非法 tool-profile ⇒ level=warn (非法不让它看起来正常);
+//   - JSON pipeline workflow ⇒ form=pipeline 且 stages 有值;
+//   - 插件自身 ⇒ runtime 有缺省口径 (builtin)。
+//
+// 这些缺省值是**运行时行为**, 只存在于引擎代码里; 页面自己拼一份就会漂移, 所以
+// 必须由服务端统一投影。
+func TestRuntimeAttributesReportDeclaredAndDefaults(t *testing.T) {
+	s, state := newAgentServer(t)
+	prev := agent.AgentCatalog()
+	defer agent.SetAgentCatalog(prev)
+	agent.SetAgentCatalog(asset.NewSet())
+
+	bare := "---\nkind: agent\nname: bare\ndescription: 只有提示词\n---\n\n正文。\n"
+	badProfile := "---\nkind: agent\nname: bad-profile\ndescription: 拼错档位\n" +
+		"tool-profile: codign\n---\n\n正文。\n"
+	wfJSON := `{"name":"dev-pipeline","description":"运行时管线","mode":"pipeline",` +
+		`"stages":[{"name":"plan"},{"name":"implement","dependsOn":["plan"]}]}`
+
+	payload, err := json.Marshal(pluginCreateInput{
+		Name: "runtime-attrs", Description: "运行时口径", Body: "# Attrs\n", Runtime: "external",
+		Members: map[string]string{
+			"agents/bare.md":              bare,
+			"agents/bad-profile.md":       badProfile,
+			"workflows/dev-pipeline.json": wfJSON,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, s, http.MethodPost, "/api/plugins", string(payload)); rec.Code != http.StatusOK {
+		t.Fatalf("创建失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	agent.SetAgentCatalog(asset.LoadStandard(asset.LoadRoots{State: state}))
+
+	rec := do(t, s, http.MethodGet, "/api/plugins/runtime-attrs", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("详情失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	var detail struct {
+		Plugin pluginDetailDTO `json:"plugin"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("详情形状不对: %v", err)
+	}
+
+	attr := func(attrs []runtimeAttrDTO, key string) (runtimeAttrDTO, bool) {
+		for _, a := range attrs {
+			if a.Key == key {
+				return a, true
+			}
+		}
+		return runtimeAttrDTO{}, false
+	}
+	findAgent := func(name string) pluginMemberDTO {
+		for _, m := range detail.Plugin.Members.Agents {
+			if m.Name == name {
+				return m
+			}
+		}
+		t.Fatalf("agent %s 不在成员里", name)
+		return pluginMemberDTO{}
+	}
+
+	bareM := findAgent("bare")
+	if len(bareM.RuntimeAttributes) == 0 {
+		t.Fatal("agent 没有 runtimeAttributes: 页面又只能靠猜缺省值")
+	}
+	mt, ok := attr(bareM.RuntimeAttributes, "max-turns")
+	if !ok || mt.IsSet || mt.Declared != "" {
+		t.Errorf("没写 max-turns 应登记为未声明: %+v", mt)
+	}
+	if !strings.Contains(mt.Default, "30") || !strings.Contains(mt.Effective, "30") {
+		t.Errorf("max-turns 缺省值必须点明引擎兜底 30 轮, 实际 default=%q effective=%q", mt.Default, mt.Effective)
+	}
+	perm, _ := attr(bareM.RuntimeAttributes, "permission-mode")
+	if !strings.Contains(perm.Default, "default") {
+		t.Errorf("permission-mode 缺省值应写明 default(每次询问), 实际 %q", perm.Default)
+	}
+
+	badM := findAgent("bad-profile")
+	tp, ok := attr(badM.RuntimeAttributes, "tool-profile")
+	if !ok || tp.Level != "warn" {
+		t.Errorf("非法 tool-profile 必须标 warn, 否则页面看起来一切正常: %+v", tp)
+	}
+	if !strings.Contains(tp.Effective, "作废") {
+		t.Errorf("非法 tool-profile 的生效值应说明整条作废, 实际 %q", tp.Effective)
+	}
+
+	var wf pluginMemberDTO
+	for _, m := range detail.Plugin.Members.Workflows {
+		if m.Name == "dev-pipeline" {
+			wf = m
+		}
+	}
+	if wf.Name == "" {
+		t.Fatalf("JSON workflow 没被登记: %+v", detail.Plugin.Members.Workflows)
+	}
+	if form, ok := attr(wf.RuntimeAttributes, "form"); !ok || !strings.Contains(form.Effective, "claude-go") {
+		t.Errorf("JSON workflow 应标成 claude-go 运行时管线: %+v", form)
+	}
+	if stages, ok := attr(wf.RuntimeAttributes, "stages"); !ok || !strings.Contains(stages.Effective, "2") {
+		t.Errorf("stages 应给出阶段数, 实际 %+v", stages)
+	}
+
+	rt, ok := attr(detail.Plugin.RuntimeAttributes, "runtime")
+	if !ok || !strings.Contains(rt.Default, "builtin") {
+		t.Errorf("插件 runtime 缺省口径缺失: %+v", rt)
+	}
+}

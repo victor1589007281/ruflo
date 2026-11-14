@@ -170,6 +170,15 @@ func stampAppContext(r *http.Request) context.Context {
 	return ctx
 }
 
+// gatewayAppLabel 把 ctx 上的 APP 标识渲染成日志字段, 空值归一到 unknown ——
+// 与 types.DefaultAppID 同一口径, 但**不**把未携带头伪装成某个具体 APP。
+func gatewayAppLabel(r *http.Request) string {
+	if r == nil {
+		return "unknown"
+	}
+	return orDefault(strings.TrimSpace(types.AppFromContext(r.Context())), "unknown")
+}
+
 type gateway struct {
 	registry  *modelconfig.ProviderRegistry
 	resolver  *modelconfig.ConfigResolver
@@ -463,8 +472,12 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	} else {
 		g.rememberGood(sessionKey(r), rc.Alias)
 	}
-	log.Printf("[anthropic-gateway] model=%s resolved=%s protocol=%s proxy=%s stream=%v messages=%d tools=%d",
-		req.Model, rc.ProviderName, protoName(rc.Protocol), rc.Proxy, req.Stream, len(req.Messages), len(req.Tools))
+	// app= 是本网关**唯一**可事后核对的 APP 归因证据: 翻译层不做鉴权, 自报头在这里
+	// 落成 claimed:<id> 后只写进 ctx 再转给上游 —— 不印出来的话, "这个 APP 的请求到底
+	// 带没带标签"在日志里完全不可见 (上游 opencode 会把未知头丢掉)。纯 id 表示身份
+	// 由 ctx 背书 (claude-go 内部转发), claimed: 表示仅自报头, unknown 表示没带。
+	log.Printf("[anthropic-gateway] app=%s model=%s resolved=%s protocol=%s proxy=%s stream=%v messages=%d tools=%d",
+		gatewayAppLabel(r), req.Model, rc.ProviderName, protoName(rc.Protocol), rc.Proxy, req.Stream, len(req.Messages), len(req.Tools))
 
 	// anthropic 协议模型 → 原样透传 (保真, 避免重编码丢 metadata/tool_choice/stop_sequences 等)。
 	if rc.Protocol == "" || rc.Protocol == "anthropic" {

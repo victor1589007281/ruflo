@@ -79,6 +79,9 @@ type agentAssetDTO struct {
 	SourcePath  string   `json:"sourcePath,omitempty"` // 只对 state 来源给出 (可编辑的那一份)
 	Active      bool     `json:"active"`
 	HasTools    bool     `json:"hasTools,omitempty"` // tools 这个键**写没写**: 写了空列表 = fail-closed 拒一切工具
+	// RuntimeAttributes 逐键的声明/缺省对账。与插件成员同一份实现
+	// (plugin_runtime_attrs.go) —— 同一个 agent 在两处页面必须给出同一套口径。
+	RuntimeAttributes []runtimeAttrDTO `json:"runtimeAttributes,omitempty"`
 }
 
 // dtoFromAsset 把 asset.Asset 转成前端用的 DTO; sourcePath 只在 state 来源时非空。
@@ -106,6 +109,7 @@ func dtoFromAsset(a *asset.Asset, sourcePath string) agentAssetDTO {
 		d.HasTools = true
 		d.Tools = tools
 	}
+	d.RuntimeAttributes = runtimeAttrsFor(asset.KindAgent, a)
 	return d
 }
 
@@ -121,20 +125,21 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 // agentAssetList 返回 agent 资产列表。
 //
 // ★ 取哪一份索引: **进程里有运行时就取运行时的那份, 没有就现扫一次**。
-//   优先级不能反 —— 进程内有 agent.AgentCatalog() 时 (飞书主进程 :18080), 它才是
-//   权威: 面板与运行时查的是同一张表, "面板说这个 agent 在、运行说找不到"这类分叉
-//   在结构上不存在。
 //
-//   但独立 dashboard (dashboard run, :7777) 里这个单例**永远是 nil** —— 全仓只有
-//   两处 SetAgentCatalog (CLI 的 --agent 路径 / pkg/feishu), 都不在独立 dashboard
-//   进程里。此时若直接返回空列表, 表现是: 创建接口 200、文件也确实写进了
-//   <stateDir>/agents/, 而**紧接着的列表刷新是空的** —— 用户看到的是"建完就没了",
-//   会得出"创建失败了"这个错误结论 (实测撞到过)。
+//	优先级不能反 —— 进程内有 agent.AgentCatalog() 时 (飞书主进程 :18080), 它才是
+//	权威: 面板与运行时查的是同一张表, "面板说这个 agent 在、运行说找不到"这类分叉
+//	在结构上不存在。
 //
-//   所以 nil 时退化成现扫。这时进程内不存在"运行时那一份"可供分叉, 而**新起一个
-//   claude-go 进程读到的正是这次现扫的结果** —— 现扫反而比"空"更接近真值。
-//   代价是每次请求扫一遍目录, 与同包的 freshSkillRegistry (capability_handlers.go)
-//   是同一个取舍。
+//	但独立 dashboard (dashboard run, :7777) 里这个单例**永远是 nil** —— 全仓只有
+//	两处 SetAgentCatalog (CLI 的 --agent 路径 / pkg/feishu), 都不在独立 dashboard
+//	进程里。此时若直接返回空列表, 表现是: 创建接口 200、文件也确实写进了
+//	<stateDir>/agents/, 而**紧接着的列表刷新是空的** —— 用户看到的是"建完就没了",
+//	会得出"创建失败了"这个错误结论 (实测撞到过)。
+//
+//	所以 nil 时退化成现扫。这时进程内不存在"运行时那一份"可供分叉, 而**新起一个
+//	claude-go 进程读到的正是这次现扫的结果** —— 现扫反而比"空"更接近真值。
+//	代价是每次请求扫一遍目录, 与同包的 freshSkillRegistry (capability_handlers.go)
+//	是同一个取舍。
 func (s *Server) agentAssetList() []agentAssetDTO {
 	cat := s.agentCatalog()
 	names := cat.Names(asset.KindAgent)
@@ -175,16 +180,16 @@ func (s *Server) agentCatalog() *asset.Set {
 // 用一个零值去表示两件事, 会让"我要一个没有工具的 agent"这一诉求静默退化成
 // "跟随基线, 什么工具都有"。
 type agentCreateInput struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Body        string   `json:"body"`
-	Model       string   `json:"model,omitempty"`
-	MaxTurns    *int     `json:"maxTurns,omitempty"`
-	ToolProfile string   `json:"toolProfile,omitempty"`
-	PermMode    string   `json:"permissionMode,omitempty"`
-	Skills      []string `json:"skills,omitempty"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	Body        string    `json:"body"`
+	Model       string    `json:"model,omitempty"`
+	MaxTurns    *int      `json:"maxTurns,omitempty"`
+	ToolProfile string    `json:"toolProfile,omitempty"`
+	PermMode    string    `json:"permissionMode,omitempty"`
+	Skills      []string  `json:"skills,omitempty"`
 	Tools       *[]string `json:"tools,omitempty"`
-	Disallowed  []string `json:"disallowedTools,omitempty"`
+	Disallowed  []string  `json:"disallowedTools,omitempty"`
 }
 
 // handleAgentCreate 处理 POST /api/agents: 校验入参 → 生成 Markdown → 先解析验一遍 → 落盘 → 回读。

@@ -451,6 +451,30 @@ func (c *Config) toolExposedWith(allow map[string]bool, name string) bool {
 	return true
 }
 
+// planExitExposed 报告"本会话模型能否看到 ExitPlanMode" — 规划模式 (自动进入或
+// 模型 EnterPlanMode 进入) 的出口判据。allow 传**合并后的**有效白名单
+// (Config.ToolAllowlist(ov)); 黑名单优先 — 被 DisabledTools 显式禁用同样不构成出口。
+//
+// 为什么需要它: 规划引导文案要求模型"方案就绪后调用 ExitPlanMode 提交计划"。若
+// 会话工具白名单不含 ExitPlanMode, 模型永远出不去 — 单条 user 消息内整个 tool
+// loop 只读空转, run 零交付 (VC 考场 2026-11-12 deepseek-v4.1-flash 实测死锁:
+// 引导注入 → Bash 被 Plan 档拦 → 模型报告"没有 ExitPlanMode 工具"→ 束手待毙)。
+// 白名单语义是"这个会话只允许这些工具", 引擎绝不允许自己走进一个需要
+// 第 7 个工具才能出来的状态。
+func (c *Config) planExitExposed(allow map[string]bool) bool {
+	return c.toolExposedWith(allow, builtin.ExitPlanModeToolName)
+}
+
+// canAutoPlanMode 是 AutoModeHook 的出口可达性守卫 (见 automode.go 包注释)。
+// 用 Config 级白名单判定; 单轮档位 (RunOverrides.AllowedTools) 进一步收窄的
+// 情形由 queryLoop 内 planExitExposed(runAllow) 的逐轮兜底接住。
+func (e *QueryEngine) canAutoPlanMode() bool {
+	if e == nil || e.Config == nil {
+		return true
+	}
+	return e.Config.planExitExposed(e.Config.AllowedTools)
+}
+
 // ToolConstraintSource 是"已编译的约束"的最小读接口, 由 pkg/agent.ConstraintSet
 // **结构性**满足 (design/01 §4.6 单一真源)。
 //
@@ -962,6 +986,7 @@ func (e *QueryEngine) registerInternalHooks() {
 		e.Config.AdvisorConsultFn,
 		e.Config.PlanModeSetter,
 		e.Config.PlanFileDir,
+		e.canAutoPlanMode, // 出口守卫: 白名单无 ExitPlanMode 的会话不进自动规划
 		e.Metrics,
 	); h != nil {
 		e.HookChain.Register(h)
@@ -2511,7 +2536,20 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		// 动态 Plan Mode 联动: LLM 调用 EnterPlanMode → 自动切换只读
 		effectivePerm := e.Config.PermissionMode
 		if e.Config.DynamicPlanCheck != nil && e.Config.DynamicPlanCheck() {
-			effectivePerm = types.PermissionModePlan
+			if e.Config.planExitExposed(runAllow) {
+				effectivePerm = types.PermissionModePlan
+			} else {
+				// 无出口死锁兜底: plan flag 已置位 (自动规划/旧全局接口/白名单热改
+				// 都可能), 但本轮有效白名单不含 ExitPlanMode — 模型出不来。忽略
+				// 规划档并**清 flag 自愈**: 不清的话 flag 每轮都真, 每轮都被忽略,
+				// 而"你正处于规划模式"的引导已注进上下文, 状态谎言持续整场。
+				// 清完 DynamicPlanCheck 下一轮即返回 false, 本分支不会重复触发。
+				if e.Config.PlanModeSetter != nil {
+					e.Config.PlanModeSetter(false)
+				}
+				logging.For("engine").Warn("plan flag 置位但 ExitPlanMode 不在有效工具白名单, 忽略规划档并清除 flag (无出口死锁防护)",
+					"session", e.sessionFrom(ctx))
+			}
 		}
 
 		// 工具调用数预算 (Moqi R-H10)。**必须在执行之前判**。

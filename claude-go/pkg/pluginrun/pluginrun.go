@@ -29,6 +29,7 @@ package pluginrun
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -52,6 +53,15 @@ type Bundle struct {
 	Hooks     []*asset.Asset
 	Tools     []*asset.Asset
 	Workflows []*asset.Asset
+	// Runtime 是 PLUGIN.md 声明的运行时形态:
+	//
+	//	"" / "builtin"  成员由 claude-go 自己安装进标准 state 根 (默认)
+	//	"external"      成员由所属应用消费, claude-go 只注册/索引, 不物化
+	//
+	// 这不是展示字段: 服务端创建插件时据此决定走不走 materializePlugin。
+	// 不认识的取值会在 Problems 里点名并按 builtin 处理 —— 拼错的 runtime
+	// 若被静默忽略, "以为只注册、实际装进了全局 agents 目录"将无从发现。
+	Runtime string
 	// Problems 展开问题 (逐条人话, 含子目录前缀)。收集品而不是 error:
 	// 一个子目录里坏了一个文件, 其余成员仍该可用, 但坏的那个必须能被说出来
 	// (与 asset.Problem 同一条纪律)。
@@ -91,7 +101,17 @@ func Expand(set *asset.Set, name string) (*Bundle, error) {
 		return nil, fmt.Errorf("pluginrun: 找不到插件 %q: 资产目录里没有这个 KindPlugin 资产 (现有 %d 个: %s)",
 			name, len(known), strings.Join(known, ", "))
 	}
-	b := &Bundle{Plugin: a, Name: a.Name, Dir: bundleDirOf(a)}
+	b := &Bundle{Plugin: a, Name: a.Name, Dir: bundleDirOf(a), Runtime: strings.TrimSpace(a.Meta("runtime"))}
+	switch strings.ToLower(b.Runtime) {
+	case "", "builtin":
+		// 默认形态: 成员由 claude-go 安装进标准 state 根。
+	case "external":
+		// 由所属应用消费; 服务端创建路径会跳过物化。
+	default:
+		b.Problems = append(b.Problems, fmt.Sprintf(
+			"PLUGIN.md runtime 值 %q 不认识 (可用: builtin | external); 已按 builtin 处理", b.Runtime))
+		b.Runtime = "builtin"
+	}
 	if b.Dir == "" {
 		b.Problems = append(b.Problems,
 			"扁平形式的插件 (单文件 "+filepath.Base(a.SourcePath)+"): 没有 bundle 目录, "+
@@ -105,6 +125,34 @@ func Expand(set *asset.Set, name string) (*Bundle, error) {
 			// "plugin:<name>" —— 成员资产的出处 (SourcePath 的上级目录) 与归属
 			// (哪个插件) 是两件事, 后者只能靠 Source 留住。
 			asset.LoadDir(sub, "plugin:"+b.Name, m.kind, tmp)
+			// workflows 的第二形态: 扁平 *.json。资产层的 LoadDir 只认 .md
+			// (扁平) 或 <n>/WORKFLOW.md (目录), 而运行时 workflow 注册表的
+			// 磁盘格式恰恰是 <stateDir>/workflows/*.json —— 插件成员按运行时
+			// 格式带 workflow 时不能被资产层的 .md 偏见丢掉。这里按运行时口径
+			// 补扫 .json, 构造成同形 *asset.Asset (口径仍只有 pluginrun 一份)。
+			if m.kind == asset.KindWorkflow {
+				entries, rerr := os.ReadDir(sub)
+				if rerr == nil {
+					for _, e := range entries {
+						if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".json") {
+							continue
+						}
+						full := filepath.Join(sub, e.Name())
+						raw, rerr := os.ReadFile(full)
+						if rerr != nil {
+							b.Problems = append(b.Problems, "workflows/: 读取 "+e.Name()+" 失败: "+rerr.Error())
+							continue
+						}
+						tmp.Add(&asset.Asset{
+							Kind:       asset.KindWorkflow,
+							Name:       strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())),
+							Body:       string(raw),
+							Source:     "plugin:" + b.Name,
+							SourcePath: full,
+						})
+					}
+				}
+			}
 			for _, p := range tmp.Problems() {
 				b.Problems = append(b.Problems, m.sub+"/: "+p.Error())
 			}
@@ -171,6 +219,14 @@ func (b *Bundle) HookConfigs() (configs []types.HookConfig, problems []string) {
 		}
 	}
 	return configs, problems
+}
+
+// ExternalRuntime 报告插件是否声明 runtime: external。
+//
+// 判据只看展开后的 Runtime 字段 (Expand 已归一非法值), 调用方不要再自己
+// 读 PLUGIN.md —— 两份判据会在"清单改了但没重扫"时给出相反结论。
+func (b *Bundle) ExternalRuntime() bool {
+	return b != nil && strings.EqualFold(strings.TrimSpace(b.Runtime), "external")
 }
 
 // Counts 返回 {"agents":n,"skills":n,"hooks":n,"tools":n,"workflows":n}。

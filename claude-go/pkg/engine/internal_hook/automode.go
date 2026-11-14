@@ -19,6 +19,14 @@
 //
 // 防死锁: 模型即使不调 ExitPlanMode, 下一条用户消息 TurnCount==0 时 hook 也会重置,
 // 不会永久锁只读。
+//
+// 但还有第二种死锁形态 (VC 考场 2026-11-12 实测): 会话工具白名单不含 ExitPlanMode
+// (装配方只放行 Read/Bash/... 这类业务工具) 时, 模型**根本看不见**出口工具 —
+// 引导文案要求调一个 toolExposed 挡掉的工具, 单条 user 消息内整个 tool loop
+// 全部空转, run 以零交付收尾, "下一条消息重置"永远等不到。因此自动规划有
+// 一道出口可达性守卫 (CanAutoPlan): 白名单不含 ExitPlanMode 的会话不进自动规划,
+// 按普通任务跑。模型主动调 EnterPlanMode 的路径不受影响 — 那个工具同样不在
+// 白名单里, 模型想进也进不去, 出口判据天然一致。
 package internal_hook
 
 import (
@@ -54,6 +62,12 @@ type AutoModeHook struct {
 	AdvisorConsult AdvisorConsultFn
 	// SetPlanMode 写会话级 plan flag 的回调 (装配方注入, 绑定到 builtin planSessions)。
 	SetPlanMode func(on bool)
+	// CanAutoPlan 出口可达性守卫: 返回 false 时本 hook 不开启自动规划 (不置 flag、
+	// 不注引导), 复杂任务按普通任务跑。装配方通常绑定
+	// Config.planExitExposed(Config.AllowedTools) — 白名单不含 ExitPlanMode 的会话
+	// 进了规划模式就出不来, 引导文案等于让模型调一个它看不见的工具 (见包注释
+	// 第二种死锁)。nil = 不限制 (CLI 等无白名单形态保持旧行为)。
+	CanAutoPlan func() bool
 	// PlanFileDir 计划文件目录。非空时提醒模型 ExitPlanMode 会把计划落盘, 实施阶段先读取。
 	PlanFileDir string
 	// Metrics 引擎级指标 (可 nil)。
@@ -64,8 +78,10 @@ type AutoModeHook struct {
 }
 
 // NewAutoModeHook 构造 AutoModeHook。Enabled 为 false 时返回 nil (不注册)。
+// canAutoPlan 出口可达性守卫 (nil = 不限制), 见 AutoModeHook.CanAutoPlan 注释。
 func NewAutoModeHook(enabled bool, mode string, llmClassify func(ctx context.Context, text string) (bool, string, error),
-	autoAdvisor bool, consult AdvisorConsultFn, setPlanMode func(on bool), planFileDir string, metrics *EngineMetrics) *AutoModeHook {
+	autoAdvisor bool, consult AdvisorConsultFn, setPlanMode func(on bool), planFileDir string,
+	canAutoPlan func() bool, metrics *EngineMetrics) *AutoModeHook {
 	if !enabled {
 		return nil
 	}
@@ -76,6 +92,7 @@ func NewAutoModeHook(enabled bool, mode string, llmClassify func(ctx context.Con
 		AutoAdvisor:    autoAdvisor,
 		AdvisorConsult: consult,
 		SetPlanMode:    setPlanMode,
+		CanAutoPlan:    canAutoPlan,
 		PlanFileDir:    planFileDir,
 		Metrics:        metrics,
 	}
@@ -124,6 +141,15 @@ func (h *AutoModeHook) Execute(ctx *HookContext) (*HookResult, error) {
 		h.Metrics.ComplexityChecks.Add(1)
 	}
 	if !verdict.Complex {
+		return nil, nil
+	}
+
+	// 出口可达性守卫: 白名单不含 ExitPlanMode 的会话不进自动规划 — 进了模型也
+	// 出不来, 单条消息内的整个 tool loop 只读空转 (见包注释第二种死锁)。
+	if h.CanAutoPlan != nil && !h.CanAutoPlan() {
+		if h.Metrics != nil {
+			h.Metrics.AutoPlanSkippedNoExit.Add(1)
+		}
 		return nil, nil
 	}
 

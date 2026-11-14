@@ -77,3 +77,29 @@ func TestGateToolUses_WhitelistEnforcedInIsolatedPath(t *testing.T) {
 		}
 	}
 }
+
+// planExitExposed 无出口死锁判据 (VC 考场 2026-11-12 回归):
+// 白名单不含 ExitPlanMode → false (会话进了规划出不来); 无白名单/含 ExitPlanMode →
+// true; 黑名单显式禁用 ExitPlanMode → false (黑名单优先, 同样不构成出口)。
+func TestConfig_planExitExposed(t *testing.T) {
+	cases := []struct {
+		name    string
+		allow   map[string]bool
+		deny    map[string]bool
+		want    bool
+	}{
+		{"无白名单=出口可见", nil, nil, true},
+		{"白名单含ExitPlanMode", map[string]bool{"Read": true, "ExitPlanMode": true}, nil, true},
+		{"VC考场形态: 白名单只含业务工具", map[string]bool{"Read": true, "Write": true, "Bash": true, "Glob": true, "Grep": true}, nil, false},
+		{"空白名单(拒绝一切)", map[string]bool{}, nil, false},
+		{"黑名单禁用ExitPlanMode", map[string]bool{"ExitPlanMode": true}, map[string]bool{"ExitPlanMode": true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{AllowedTools: tc.allow, DisabledTools: tc.deny}
+			if got := c.planExitExposed(c.AllowedTools); got != tc.want {
+				t.Fatalf("planExitExposed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
