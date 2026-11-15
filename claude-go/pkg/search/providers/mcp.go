@@ -755,16 +755,16 @@ type mcpProvider struct {
 
 // newParallel 构造 Parallel 匿名 MCP 源 (无鉴权, 直连)。
 func newParallel(cfg search.Config, pc search.ProviderConfig, eg *search.Egress) (search.Provider, error) {
-	return newMCPProvider("parallel", cfg, pc, eg, "https://search.parallel.ai/mcp", 1.0)
+	return newMCPProvider("parallel", cfg, pc, eg, "https://search.parallel.ai/mcp", search.TierL0, 1.0)
 }
 
 // newExa 构造 Exa 匿名 MCP 源 (无鉴权, 直连)。
 func newExa(cfg search.Config, pc search.ProviderConfig, eg *search.Egress) (search.Provider, error) {
-	return newMCPProvider("exa_anon", cfg, pc, eg, "https://mcp.exa.ai/mcp", 0.9)
+	return newMCPProvider("exa_anon", cfg, pc, eg, "https://mcp.exa.ai/mcp", search.TierL0, 0.9)
 }
 
 // newMCPProvider 构造 MCP 搜索源。
-func newMCPProvider(name string, cfg search.Config, pc search.ProviderConfig, eg *search.Egress, defURL string, defWeight float64) (search.Provider, error) {
+func newMCPProvider(name string, cfg search.Config, pc search.ProviderConfig, eg *search.Egress, defURL string, defTier search.Tier, defWeight float64) (search.Provider, error) {
 	raw := pc.BaseURL
 	if strings.TrimSpace(raw) == "" {
 		raw = defURL
@@ -773,7 +773,7 @@ func newMCPProvider(name string, cfg search.Config, pc search.ProviderConfig, eg
 	if err != nil {
 		return nil, err
 	}
-	b := newBase(name, cfg, pc, eg, search.ModeDirect, search.TierL0, defWeight)
+	b := newBase(name, cfg, pc, eg, search.ModeDirect, defTier, defWeight)
 	b.kinds = search.KindSet(search.KindSearch)
 	return &mcpProvider{
 		base: b,

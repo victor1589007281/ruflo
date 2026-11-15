@@ -210,15 +210,37 @@ func (e *Egress) browserOptions(client *http.Client) (BrowserRenderOptions, erro
 	return opts, nil
 }
 
+// renderJS 渲染一个 URL: 注入的渲染器 > 本地 Chromium > 远程渲染兜底。
+//
+// 本地渲染失败的 "环境型" 原因 (无浏览器/超时/挑战页/代理形态不支持) 都
+// 值得用远程渲染再试一次 —— 远程走的是 HTTP 出口, 与浏览器限制正交, 且
+// 与本地同一口径: 不绕过挑战, 只执行 JS 取最终 DOM (见 remote_render.go)。
+// URL 被 urlGuard 拒绝 (ErrInvalid) 不兜底: 远程侧同样会拒。
 func (m *Manager) renderJS(ctx context.Context, client *http.Client, rawURL string) (*Document, error) {
 	if m.renderer != nil {
 		return m.renderer.Render(ctx, rawURL)
 	}
+	var lastErr error
 	opts, err := m.egress.browserOptions(client)
 	if err != nil {
-		return nil, err
+		lastErr = err
+	} else {
+		doc, rerr := NewBrowserRenderer(opts).Render(ctx, rawURL)
+		if rerr == nil {
+			return doc, nil
+		}
+		lastErr = rerr
 	}
-	return NewBrowserRenderer(opts).Render(ctx, rawURL)
+	if m.cfg.RemoteRender.Enabled && remoteRenderEligible(lastErr) {
+		rr := NewFirecrawlRenderer(m.cfg.RemoteRender, m.firecrawlRenderClient())
+		doc, rerr := rr.Render(ctx, rawURL)
+		if rerr == nil {
+			m.metrics.Inc("render_fallback_total", map[string]string{"from": "chromedp", "to": remoteRenderVia})
+			return doc, nil
+		}
+		lastErr = rerr
+	}
+	return nil, lastErr
 }
 
 func findRenderChrome(configured string) (string, error) {

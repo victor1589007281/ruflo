@@ -80,6 +80,7 @@ func TestIsAuthoritativeDomain(t *testing.T) {
 		"https://ecb.europa.eu/press":             true,
 		"https://www.who.int/news":                true,
 		"https://pbc.gov.cn/goutongjiaoliu":       true,
+		"https://www.gov.cn/zhengce/zhengceku/":   true, // apex 去 www. 后是 gov.cn, 后缀判据不覆盖
 		"https://opentelemetry.io/docs":           true,
 		"https://investor.nvidia.com/":            true,
 		"https://ir.byd.com/":                     true,

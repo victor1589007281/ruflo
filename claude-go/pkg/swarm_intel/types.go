@@ -108,6 +108,9 @@ type SimulationConfig struct {
 	Rewire       bool    `json:"rewire,omitempty"`
 	MemoryRounds int     `json:"memory_rounds,omitempty"`
 	Epsilon      float64 `json:"epsilon,omitempty"`
+	// MinRounds 是"判收敛前至少跑几轮"。默认 2 对 6~8 个 agent 太宽松:
+	// 两轮偶然的小波动就会被判成 converged, 一键模式因此用 3。
+	MinRounds int `json:"min_rounds,omitempty"`
 }
 
 // SimulationResult 模拟结果。

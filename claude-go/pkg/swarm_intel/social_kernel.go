@@ -136,6 +136,9 @@ func (c SocialKernelConfig) withOverrides(cfg SimulationConfig) SocialKernelConf
 	if cfg.Epsilon > 0 {
 		c.Epsilon = cfg.Epsilon
 	}
+	if cfg.MinRounds > 0 {
+		c.MinRounds = cfg.MinRounds
+	}
 	if c.Mode == "" {
 		c.Mode = "social"
 	}

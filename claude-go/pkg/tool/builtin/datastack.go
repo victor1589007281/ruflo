@@ -55,15 +55,19 @@ func buildDataStack() *DataStack {
 	}
 	eg.Start()
 
-	manager := search.NewManager(scfg, eg, searchproviders.Default(scfg, eg))
+	searchProviders := searchproviders.Default(scfg, eg)
+	manager := search.NewManager(scfg, eg, searchProviders)
+	// 写出"本进程实际生效的源配置"快照 (providers.json), 供 webapp 的检索面板
+	// 展示现在到底在用哪些源。只写配置事实, 不写密钥。
+	search.WriteEffectiveSources(scfg, searchProviders)
 
 	mcfg := market.LoadConfig()
 	client := func(mode string) *http.Client { return eg.Client(search.Mode(mode)) }
-	providers := append(marketcn.Providers(mcfg, client), marketglobal.Providers(mcfg, client)...)
+	marketProviders := append(marketcn.Providers(mcfg, client), marketglobal.Providers(mcfg, client)...)
 
 	return &DataStack{
 		Search: search.NewLegacySearcher(manager),
-		Market: market.NewRegistry(mcfg, providers...),
+		Market: market.NewRegistry(mcfg, marketProviders...),
 		egress: eg,
 	}
 }

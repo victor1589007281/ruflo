@@ -205,7 +205,9 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 		"tier":   tier,
 	})
 	if len(candidates) == 0 {
-		return nil, Wrap("", ErrNoProvider, errors.New("no search provider available"))
+		err := Wrap("", ErrNoProvider, errors.New("no search provider available"))
+		m.recordSearch(plan, req, nil, err, time.Since(start), nil)
+		return nil, err
 	}
 
 	names := make([]string, 0, len(candidates))
@@ -219,6 +221,7 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 	if ok {
 		cached.CacheHit = true
 		cached.ElapsedMS = time.Since(start).Milliseconds()
+		m.recordSearch(plan, req, &cached, nil, time.Since(start), nil)
 		return &cached, nil
 	}
 	cacheDegraded = append(cacheDegraded, currentDegraded...)
@@ -245,6 +248,8 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 // executeSearch 执行实际调度、融合与质量门, 并写入缓存。
 // 单次调用最多打两个源；质量不足通过响应显式暴露，由上层在自己的预算内重试。
 func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan QueryPlan, candidates []Provider, degraded []string, cacheKey string) (SearchResponse, error) {
+	start := time.Now()
+	perProvider := map[string]int64{}
 	scheduled := candidates
 	if len(scheduled) > maxSourceConcurrency {
 		scheduled = scheduled[:maxSourceConcurrency]
@@ -276,6 +281,7 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 	var actualCost float64
 	anySuccess := false
 	for _, o := range outcomes {
+		perProvider[o.name] = o.elapsed.Milliseconds()
 		if o.err != nil {
 			failure := degradedFor(o.name, o.err)
 			degraded = append(degraded, failure)
@@ -302,7 +308,9 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 		if detail == "" {
 			detail = "no provider returned a response"
 		}
-		return SearchResponse{}, Wrap("", ErrNoProvider, errors.New("all providers failed: "+detail))
+		errAll := Wrap("", ErrNoProvider, errors.New("all providers failed: "+detail))
+		m.recordSearch(plan, req, nil, errAll, time.Since(start), perProvider)
+		return SearchResponse{}, errAll
 	}
 	filteredRaw := filterResultDomains(raw, req)
 	degraded = dedupeStrings(degraded)
@@ -321,6 +329,7 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 			GateReason: reason,
 		}
 		resp = m.putSearchCache(ctx, cacheKey, resp, m.cacheTTL(plan, req))
+		m.recordSearch(plan, req, &resp, nil, time.Since(start), perProvider)
 		return resp, nil
 	}
 
@@ -345,7 +354,76 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 		GateReason: quality.gateReason(needFresh),
 	}
 	resp = m.putSearchCache(ctx, cacheKey, resp, m.cacheTTL(plan, req))
+	m.recordSearch(plan, req, &resp, nil, time.Since(start), perProvider)
 	return resp, nil
+}
+
+// recordSearch 写一条检索使用记录。
+//
+// 记录是**纯增强**: 这里不返回错误、不改响应, 写盘失败只在 telemetry 里报一次。
+// 面板的"优化方向"全部来自这些逐条现场 (缓存命中/门原因/慢源/零结果查询)。
+func (m *Manager) recordSearch(plan QueryPlan, req SearchRequest, resp *SearchResponse, err error, latency time.Duration, perProvider map[string]int64) {
+	rec := Record{
+		Kind:       "search",
+		Query:      req.Query,
+		Intent:     string(plan.Intent),
+		Lang:       plan.Language,
+		Freshness:  plan.Freshness,
+		LatencyMS:  latency.Milliseconds(),
+		ProviderMS: perProvider,
+	}
+	if err != nil {
+		rec.Status = "error"
+		rec.Error = err.Error()
+	} else if resp != nil {
+		rec.Status = resp.Status
+		rec.CacheHit = resp.CacheHit
+		rec.GatePassed = resp.GatePassed
+		rec.GateReason = resp.GateReason
+		rec.Providers = resp.Providers
+		rec.Failed = resp.Degraded
+		rec.Results = len(resp.Results)
+		rec.CostUSD = resp.CostUSD
+		rec.TopDomains = topDomains(resp.Results, 3)
+		rec.Domains = countDomains(resp.Results)
+	}
+	recordUsage(rec)
+}
+
+// recordFetch 写一条抓取使用记录 (成功/失败/缓存命中都算一次使用)。
+func (m *Manager) recordFetch(req FetchRequest, resp *FetchResponse, err error, latency time.Duration) {
+	rec := Record{Kind: "fetch", URL: req.URL, LatencyMS: latency.Milliseconds()}
+	if err != nil {
+		rec.Status = "error"
+		rec.Error = err.Error()
+	} else if resp != nil && resp.Document != nil {
+		rec.Status = "success"
+		rec.CacheHit = resp.Document.CacheHit
+		rec.Bytes = resp.Document.TotalChars
+		rec.Results = len(resp.Document.Evidence)
+		rec.Failed = resp.Degraded
+		rec.Lang = resp.Document.Via
+	} else if resp != nil {
+		rec.Status = "empty"
+		rec.Failed = resp.Degraded
+	}
+	recordUsage(rec)
+}
+
+// recordResearch 写一条研究使用记录 (编排层: 轮数/停止原因/证据数)。
+func (m *Manager) recordResearch(question string, res *ResearchResult, err error, latency time.Duration) {
+	rec := Record{Kind: "research", Query: question, LatencyMS: latency.Milliseconds()}
+	if err != nil {
+		rec.Status = "error"
+		rec.Error = err.Error()
+	} else if res != nil {
+		rec.Status = "success"
+		rec.StopReason = res.StopReason
+		rec.Rounds = res.Rounds
+		rec.Results = len(res.Results)
+		rec.Evidence = len(res.Evidence)
+	}
+	recordUsage(rec)
 }
 
 // cacheTTL 选择查询缓存 TTL。
@@ -372,7 +450,11 @@ func (m *Manager) cacheTTL(plan QueryPlan, req SearchRequest) time.Duration {
 // 流程: 规则拆 1–3 条子查询 -> 搜索 -> 按 RRF 顺序抓取前 N 条 ->
 // 从正文抽取逐字证据 -> 拼接抽取式摘要。停止条件全部在代码里判定,
 // StopReason 只会是 budget / saturated / done / timeout。
-func (m *Manager) Research(ctx context.Context, question string, opts ResearchOptions) (*ResearchResult, error) {
+func (m *Manager) Research(ctx context.Context, question string, opts ResearchOptions) (out *ResearchResult, err error) {
+	start := time.Now()
+	// 研究是"多次检索+抓取"的编排, 它自己的记录只保留编排层事实
+	// (轮数/停止原因/证据数); 每条子查询/抓取另有自己的记录。
+	defer func() { m.recordResearch(question, out, err, time.Since(start)) }()
 	if ctx == nil {
 		ctx = context.Background()
 	}

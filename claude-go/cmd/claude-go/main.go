@@ -2518,8 +2518,9 @@ func evoCmd() *cobra.Command {
 	}
 	cmd.AddCommand(auditCmd, promoteCmd, rollbackCmd,
 		evoReplayCmd(resolveStateDir), evoGepaStepCmd(resolveStateDir),
-		evoGepaLoopCmd(resolveStateDir), // 方案三 L5: 回放打分 + GEPA 完整版单步/多轮
-		evoDistillCmd())                 // 方案三数据通道: T1 示例/T5 分布/T6 修复模式挖掘
+		evoGepaLoopCmd(resolveStateDir),   // 方案三 L5: 回放打分 + GEPA 完整版单步/多轮
+		evoDistillCmd(),                   // 方案三数据通道: T1 示例/T5 分布/T6 修复模式挖掘
+		evoExperienceCmd(resolveStateDir)) // 共享经验库: agentDB 导入/统计/压实
 	return cmd
 }
 
@@ -6457,7 +6458,7 @@ func swarmCmd() *cobra.Command {
 	}
 
 	var simMode, simDetail, simTopology string
-	var simAgents, simRounds, simMemoryRounds int
+	var simAgents, simRounds, simMemoryRounds, simMinRounds int
 	var simRewire bool
 	var simEpsilon float64
 	simulateCmd := &cobra.Command{
@@ -6473,7 +6474,8 @@ func swarmCmd() *cobra.Command {
 			defer cancel()
 			cfg := swarmintel.SimulationConfig{
 				Mode: simMode, Agents: simAgents, Rounds: simRounds, Detail: simDetail,
-				Topology: simTopology, Rewire: simRewire, MemoryRounds: simMemoryRounds, Epsilon: simEpsilon,
+				Topology: simTopology, Rewire: simRewire, MemoryRounds: simMemoryRounds,
+				Epsilon: simEpsilon, MinRounds: simMinRounds,
 			}
 			result, err := si.Simulate(ctx, "cli", strings.Join(args, " "), cfg)
 			if err != nil {
@@ -6511,6 +6513,7 @@ func swarmCmd() *cobra.Command {
 	simulateCmd.Flags().BoolVar(&simRewire, "rewire", false, "每轮后按立场同质性重连 (echo chamber 动力学)")
 	simulateCmd.Flags().IntVar(&simMemoryRounds, "memory-rounds", 0, "轮内 prompt 携带邻居最近 N 轮立场轨迹 (默认 3, 0=关闭)")
 	simulateCmd.Flags().Float64Var(&simEpsilon, "epsilon", 0, "自适应收敛阈值 |Δstance|, 默认 0.03")
+	simulateCmd.Flags().IntVar(&simMinRounds, "min-rounds", 0, "判收敛前至少跑几轮 (默认 2; 一键模式用 3, 防止两轮偶然波动被判成收敛)")
 
 	var histN int
 	// 离线引擎: 不 buildEngine (不调 LLM), 但存储后端遵循 SWARM_STORE/AGENTDB_URL env,
@@ -6687,6 +6690,19 @@ hit = sign(plurality) == sign(actual) 且 |plurality| >= 0.1。
 				fb = "  [识别降级: 关键词兜底]"
 			}
 			fmt.Printf("%s · %s%s\n  理由: %s\n", kindLabel, strings.Join(modes, ""), fb, cls.Reason)
+			if p := cls.Plan; p != nil {
+				if cls.Kind == "predict" {
+					fmt.Printf("  运行参数: 走辩论-融合链路 (拓扑不适用)\n")
+				} else {
+					rewire := ""
+					if p.Rewire {
+						rewire = " + 同质性重连"
+					}
+					fmt.Printf("  运行参数: %d agent · 轮次帽 %d (≥%d 轮后按收敛提前停) · 拓扑 %s%s · 记忆 %d 轮\n",
+						p.Agents, p.Rounds, p.MinRounds, p.Topology, rewire, p.MemoryRounds)
+				}
+				fmt.Printf("  参数依据: %s\n", p.Why)
+			}
 			return nil
 		},
 	}

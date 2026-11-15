@@ -194,6 +194,11 @@ var authoritativeHosts = map[string]struct{}{
 	"szse.cn":       {},
 	"hkex.com.hk":   {},
 	"cninfo.com.cn": {},
+	// 中国政府网: 国务院政策文件库的一手域名。必须显式列出来 —— 它去掉 www.
+	// 之后就是 apex "gov.cn", 而 ".gov.cn" 后缀判据要求点号在前 (子域如
+	// pbc.gov.cn 命中, apex 本身不命中), 漏了会被判成非权威, 政策查询只有
+	// 一两条时整轮 gate=domains 不过。
+	"gov.cn": {},
 	// 开放获取的会议/期刊与论文库: proceedings、摘要页就是原文或唯一落地页。
 	// 数据库/AI 学术查询常只命中一两个会议域名, 不列入会把正确结果判成
 	// domains 不达标。

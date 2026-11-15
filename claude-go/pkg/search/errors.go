@@ -4,8 +4,9 @@ package search
 //
 // provider 的原始错误形态各异 (HTTP 状态、超时、挑战页、JSON 解析失败),
 // 调度器只关心"该重试、该熔断还是该降级", 因此统一收敛成 ErrorKind:
-// timeout / rate_limited / blocked / unavailable / invalid_input / unsupported /
-// no_provider。KindOf 用 errors.As 穿透 Wrap 包装, 不依赖错误字符串匹配。
+// timeout / rate_limited / blocked / unavailable / not_found / invalid_input /
+// unsupported / no_provider。KindOf 用 errors.As 穿透 Wrap 包装, 不依赖错误
+// 字符串匹配。
 import (
 	"errors"
 	"fmt"
@@ -19,6 +20,10 @@ const (
 	ErrRateLimited ErrorKind = "rate_limited"
 	ErrBlocked     ErrorKind = "blocked"
 	ErrUnavailable ErrorKind = "unavailable"
+	// ErrNotFound 是目标资源已死 (404/410)。与 ErrInvalid 分开: 后者是
+	// 请求本身非法 (SSRF/协议/参数校验), 绝不可换个出口重试; 前者值得回退
+	// 归档快照 (Wayback), 但不配用旧缓存伪装成功。
+	ErrNotFound    ErrorKind = "not_found"
 	ErrInvalid     ErrorKind = "invalid_input"
 	ErrUnsupported ErrorKind = "unsupported"
 	ErrNoProvider  ErrorKind = "no_provider"

@@ -629,38 +629,125 @@ func matchField(field string, value, min, max int) bool {
 
 // --- 持久化 ---
 
-// persist 把任务表以 JSON 落盘到 dataDir/cron_jobs.json; dataDir 为空或序列化失败
-// 时静默跳过 (持久化是增强项, 不该让调度本身失败)。
+// persist 把任务表以 JSON 落盘到 dataDir/cron_jobs.json。
+//
+// 必须**原子**落盘。以前是裸 os.WriteFile: 它先截断再写, 进程在这两步之间被杀
+// (Recreate 部署 / 节点回收 / OOM) 就留下一个 0 字节文件; 下次启动 load 解析
+// 失败又被静默吞掉, 调度器变成空表 —— 界面上定时任务"凭空消失", 盘上还看不出
+// 任何异常 (2026-11-02 线上发生过: 06:xx 任务跑完落盘时赶上重启, 两个同步任务
+// 就这样没了)。临时文件 + rename 之后, 任何时刻读到的都是完整的旧版或新版。
 func (cs *CronScheduler) persist() {
 	if cs.dataDir == "" {
 		return
 	}
-	os.MkdirAll(cs.dataDir, 0755)
-	data, err := json.MarshalIndent(cs.jobs, "", "  ")
-	if err != nil {
+	if err := os.MkdirAll(cs.dataDir, 0755); err != nil {
+		log.Printf("[Cron] 建持久化目录失败 %s: %v (本次不落盘)", cs.dataDir, err)
 		return
 	}
-	_ = os.WriteFile(filepath.Join(cs.dataDir, "cron_jobs.json"), data, 0644)
+	data, err := json.MarshalIndent(cs.jobs, "", "  ")
+	if err != nil {
+		log.Printf("[Cron] 序列化任务表失败, 本次不落盘: %v", err)
+		return
+	}
+	file := filepath.Join(cs.dataDir, "cron_jobs.json")
+	tmp, err := os.CreateTemp(cs.dataDir, ".cron_jobs-*.tmp")
+	if err != nil {
+		log.Printf("[Cron] 创建临时文件失败: %v (本次不落盘)", err)
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // rename 成功后它已不在; 失败路径靠这里清掉
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		log.Printf("[Cron] 写临时文件失败: %v (本次不落盘)", err)
+		return
+	}
+	// fsync 再 rename: 否则崩溃后可能出现"名字换了内容还没落"的空文件。
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		log.Printf("[Cron] 临时文件 fsync 失败: %v (本次不落盘)", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		log.Printf("[Cron] 关闭临时文件失败: %v (本次不落盘)", err)
+		return
+	}
+	_ = os.Chmod(tmpName, 0644) // CreateTemp 建的是 0600
+	keepPreviousGood(file)
+	if err := os.Rename(tmpName, file); err != nil {
+		log.Printf("[Cron] 原子替换 %s 失败: %v", file, err)
+	}
+}
+
+// keepPreviousGood 把盘上当前的完好副本留成 cron_jobs.json.bak。
+//
+// 只有"能解析成任务表"的才留: 拿一个坏文件当回滚目标等于没备份。
+func keepPreviousGood(file string) {
+	data, err := os.ReadFile(file)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	var jobs map[string]*CronJob
+	if json.Unmarshal(data, &jobs) != nil || jobs == nil {
+		return
+	}
+	_ = os.WriteFile(file+".bak", data, 0644)
 }
 
 // load 从 dataDir/cron_jobs.json 恢复任务表, 并把 nextID 推进到已有 id 的最大序号之后。
 //
 // 不推进 nextID 的话, 重启后 AddJob 会从 cron-1 重新发号, 直接覆盖掉恢复出来的同名任务。
+//
+// 坏文件**不静默吞**: 空文件/解析失败时留一份 .corrupt-<ts> 作证据, 并尝试用
+// .bak 回滚 —— 否则表现就是"任务全没了, 日志里一句解释都没有"。
 func (cs *CronScheduler) load() {
 	if cs.dataDir == "" {
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(cs.dataDir, "cron_jobs.json"))
+	file := filepath.Join(cs.dataDir, "cron_jobs.json")
+	data, err := os.ReadFile(file)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[Cron] 读任务表 %s 失败: %v", file, err)
+		}
 		return
 	}
 	var jobs map[string]*CronJob
-	if json.Unmarshal(data, &jobs) == nil && jobs != nil {
-		cs.jobs = jobs
-		for _, j := range jobs {
-			if id := extractCronID(j.ID); id > cs.nextID {
-				cs.nextID = id
-			}
+	parseErr := json.Unmarshal(data, &jobs)
+	if parseErr == nil && jobs != nil {
+		cs.adoptJobs(jobs)
+		return
+	}
+
+	bad := fmt.Sprintf("%s.corrupt-%d", file, time.Now().Unix())
+	if len(data) == 0 {
+		log.Printf("[Cron] 任务表 %s 是空文件 (多半是上次落盘被截断); 已另存 %s, 尝试用 .bak 恢复", file, bad)
+	} else {
+		log.Printf("[Cron] 任务表 %s 解析失败: %v; 已另存 %s, 尝试用 .bak 恢复", file, parseErr, bad)
+	}
+	_ = os.WriteFile(bad, data, 0644)
+
+	bak, berr := os.ReadFile(file + ".bak")
+	if berr != nil {
+		log.Printf("[Cron] 没有可用的 %s.bak: %v", file, berr)
+		return
+	}
+	var recovered map[string]*CronJob
+	if json.Unmarshal(bak, &recovered) != nil || len(recovered) == 0 {
+		log.Printf("[Cron] %s.bak 也不可用, 调度器以空任务表启动", file)
+		return
+	}
+	cs.adoptJobs(recovered)
+	log.Printf("[Cron] 已从 %s.bak 恢复 %d 个任务, 并回写任务表", file, len(recovered))
+	cs.persist() // 让盘上立刻回到完好状态, 下次启动不再走恢复路径
+}
+
+// adoptJobs 接管一份任务表, 并把 nextID 推到已有 id 之后 (见 load 的说明)。
+func (cs *CronScheduler) adoptJobs(jobs map[string]*CronJob) {
+	cs.jobs = jobs
+	for _, j := range jobs {
+		if id := extractCronID(j.ID); id > cs.nextID {
+			cs.nextID = id
 		}
 	}
 }

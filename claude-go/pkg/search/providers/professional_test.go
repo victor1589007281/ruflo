@@ -87,6 +87,20 @@ func TestProfessionalProvidersParse(t *testing.T) {
 		fmt.Fprint(w, `{"announcements":[{"secCode":"600000","secName":"浦发银行","announcementTitle":"2025 年年度<em>报告</em>","announcementTime":1767225600000,"adjunctUrl":"finalpage/2026-01-01/1.PDF","announcementId":"123","orgId":"g1"}]}`)
 	})
 
+	mux.HandleFunc("/gov", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("t") != "zhengcelibrary_gw" || q.Get("n") != "2" {
+			t.Errorf("gov params: %v", q)
+		}
+		if q.Get("searchfield") != "title" {
+			t.Errorf("gov 首次检索应按标题: %v", q)
+		}
+		fmt.Fprint(w, `{"code":200,"msg":"操作成功","data":null,"searchVO":{"totalCount":3,"listVO":[
+			{"title":"国务院关于深入实施“<em>人工智能</em>+”行动的意见","url":"https://www.gov.cn/zhengce/zhengceku/202508/content_7037862.htm","pubtimeStr":"2025.08.26","pcode":"国发〔2025〕11号","summary":"各省、自治区、直辖市人民政府，<em>国务院</em>各部委："},
+			{"title":"国务院办公厅关于&lt;试验&gt;的通知","url":"https://www.gov.cn/zhengce/zhengceku/202601/content_1.htm","pubtimeStr":"2026.01.02","pcode":"国办发〔2026〕1号","summary":"摘要"}
+		]}}`)
+	})
+
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -206,6 +220,94 @@ func TestProfessionalProvidersParse(t *testing.T) {
 			t.Errorf("lang/published = %q/%v", res[0].Lang, res[0].Published)
 		}
 	})
+
+	t.Run("gov", func(t *testing.T) {
+		p := mk(newGov, "/gov")
+		res, err := p.Search(context.Background(), search.SearchRequest{Query: "人工智能", Limit: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 2 {
+			t.Fatalf("got %d results: %+v", len(res), res)
+		}
+		if res[0].Title != "国务院关于深入实施“人工智能+”行动的意见" {
+			t.Errorf("title = %q (em tag not stripped?)", res[0].Title)
+		}
+		if res[0].URL != "https://www.gov.cn/zhengce/zhengceku/202508/content_7037862.htm" {
+			t.Errorf("url = %q", res[0].URL)
+		}
+		// 发文字号是政策文件的版本标识，必须在摘要最前面，模型据此核对效力。
+		if !strings.HasPrefix(res[0].Snippet, "国发〔2025〕11号：") {
+			t.Errorf("发文字号缺失: %q", res[0].Snippet)
+		}
+		if strings.Contains(res[0].Snippet, "<em>") {
+			t.Errorf("snippet 未清理高亮标签: %q", res[0].Snippet)
+		}
+		if res[0].Published.Format("2006-01-02") != "2025-08-26" {
+			t.Errorf("published = %v", res[0].Published)
+		}
+		if res[0].Lang != "zh" {
+			t.Errorf("lang = %q", res[0].Lang)
+		}
+	})
+}
+
+// TestGovLaddersOnEmpty 钉住政策库的三级检索阶梯：
+// 标题(原查询) → 标题(去掉「办法/规划」等通用词) → 全文(兜底)。
+// 站点标题检索是按词严格 AND，实测 "数据安全 管理办法" = 0 而 "数据安全" = 1，
+// 所以中间这一级不是可有可无的优化，而是命中的主要来源。
+func TestGovLaddersOnEmpty(t *testing.T) {
+	var calls int
+	var fields, queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		q := r.URL.Query()
+		fields = append(fields, q.Get("searchfield"))
+		queries = append(queries, q.Get("q"))
+		if q.Get("searchfield") == "title" && q.Get("q") == "数据安全 管理办法" {
+			fmt.Fprint(w, `{"code":1001,"msg":"抱歉，没有找到相关结果","data":[],"searchVO":null}`)
+			return
+		}
+		if q.Get("searchfield") == "title" {
+			// 去掉「管理办法」后只剩实体词，命中条例原文。
+			fmt.Fprint(w, `{"code":200,"searchVO":{"totalCount":1,"listVO":[{"title":"网络数据安全管理条例","url":"https://www.gov.cn/zhengce/x.htm","pubtimeStr":"2024-09-30","pcode":"国令第790号"}]}}`)
+			return
+		}
+		fmt.Fprint(w, `{"code":200,"searchVO":{"totalCount":1,"listVO":[{"title":"全文兜底结果","url":"https://www.gov.cn/zhengce/y.htm","pubtimeStr":"2024-05-11","pcode":"国发〔2024〕9号"}]}}`)
+	}))
+	defer srv.Close()
+
+	cfg := search.DefaultConfig()
+	p, err := newGov(cfg, search.ProviderConfig{Enabled: true, BaseURL: srv.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := p.Search(context.Background(), search.SearchRequest{Query: "数据安全 管理办法", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Title != "网络数据安全管理条例" {
+		t.Fatalf("第二级（去通用词）未生效: %+v", res)
+	}
+	if !strings.HasPrefix(res[0].Snippet, "国令第790号：") {
+		t.Errorf("发文字号缺失: %q", res[0].Snippet)
+	}
+	if res[0].Published.Format("2006-01-02") != "2024-09-30" {
+		t.Errorf("published = %v", res[0].Published)
+	}
+	// 「管理办法」只去掉「办法」，「管理」是条例标题里真实存在的词，保留。
+	if calls != 2 || fields[1] != "title" || queries[1] != "数据安全 管理" {
+		t.Fatalf("调用序列 = %d %v %v, want [title:数据安全 管理办法, title:数据安全 管理]", calls, fields, queries)
+	}
+
+	// 单词查询空结果不应再打第二、三次（省请求；站点本来就没有）。
+	calls = 0
+	if _, err := p.Search(context.Background(), search.SearchRequest{Query: "量子隐形传态xyz", Limit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("单词空结果打了 %d 次, want 1", calls)
+	}
 }
 
 // TestWorldBankDropsYearOnEmpty 钉住 WDS 的严格 AND 兜底：

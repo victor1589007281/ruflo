@@ -14,6 +14,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/anthropic/claude-go/pkg/search/techdocs"
 )
 
 // Intent 是查询意图, 决定源顺序与时延偏好。
@@ -31,6 +33,24 @@ const (
 	// (统计机构、上市公司披露、国际组织文档)。共用一套源顺序会让两类查询
 	// 互相挤掉对方最好的源。
 	IntentData Intent = "data"
+	// IntentPolicy 是政策法规 / 政府公告类查询。与 data 的区别: data 要的是
+	// 统计口径与年报数字 (统计机构、上市公司披露), policy 要的是**文件原文**
+	// (国务院/部委的国发、国办发、部令), 后者只有 gov 这个源能一手给出,
+	// 用 data 的源顺序会让它排在第 3 位以后 —— 而单次检索只调度前 2 个源。
+	IntentPolicy Intent = "policy"
+	// IntentTech 是"某个具体技术产品/组件的用法与原理"类查询: 查询里出现了
+	// 目录里登记的产品名 (postgres/ceph/k8s/...) 或明确的组信号 (数据库事务/
+	// 内核调度/负载均衡)。这类查询的第一手材料是官方文档, 先把 techdocs 排到
+	// 第一位, 再用问答/通用源对冲。
+	//
+	// 它必须晚于 academic/policy/data 判定: "postgres 论文" 要的是论文,
+	// "数据库市场规模" 要的是统计口径, 都不能被文档源顶掉。
+	IntentTech Intent = "tech"
+	// IntentCulture 是中文图书/影视/剧集类查询 (豆瓣/书评/影评/ISBN/出版社)。
+	// 这类查询的第一手材料是豆瓣条目 (评分/简介/出版信息), 通用网页源只能给
+	// 二手影评; 但信号必须保守 —— "评分" 等泛词不收, 避免把"信用评分""接口
+	// 评分标准"这类技术/金融查询路由到条目库。
+	IntentCulture Intent = "culture"
 )
 
 // QueryPlan 是零模型调用的查询规划结果, 对应设计文档 §5.1。
@@ -73,6 +93,12 @@ var ecosystemRegistry = []struct {
 	{[]string{"今日头条", "头条号", "头条文章", "toutiao.com"}, "toutiao.com"},
 }
 
+// cultureSignalZH 是中文图书/影视类信号。
+//
+// 刻意只收"条目库专有"的词: 「评分」「电影」「书」单独出现都有大量非文化
+// 语境 (信用评分/电影化叙事/数据库), 只有和豆瓣强绑定的词才不可能误判。
+var cultureSignalZH = []string{"豆瓣", "书评", "影评", "isbn", "出版社", "书单", "影单", "藏书"}
+
 // PlanQuery 用规则生成查询计划, 全程不调用模型。
 //
 // 规则有意保持保守: 只在信号明确时改意图/时效, 剩余复杂 query 由 L3
@@ -114,11 +140,31 @@ func PlanQuery(query string) QueryPlan {
 	case containsAny(lower, "论文", "paper", "arxiv", "survey", "文献", "crossref", "pubmed"):
 		plan.Intent = IntentAcademic
 		plan.SiteHints = append(plan.SiteHints, "site:arxiv.org", "site:openalex.org")
+	case containsAny(lower, cultureSignalZH...):
+		// 放在 policy/data 之前: 「出版社管理办法」这类组合极罕见, 而
+		// 「ISBN 查询」不该被 policy 的「办法/规定」或 data 的「统计」分支截走。
+		// 也放在 news 之前: 「2024 豆瓣高分电影」带年份, 判成 news 会强制
+		// week 级新鲜度, 老片条目全被判成不新鲜。
+		plan.Intent = IntentCulture
+	case isPolicyQuery(probe):
+		// 放在 data 之前: 「数据安全管理办法」「新能源汽车补贴政策」都含 data
+		// 信号里的词, 但它们要的是文件原文而不是统计数字; 判成 data 会让
+		// cninfo(上市公司公告) 顶上来, 拿回一堆年报。
+		plan.Intent = IntentPolicy
 	case isDataQuery(probe):
 		// 放在新闻之前: 「2024 年统计公报」带年份, 但用户要的是统计口径,
 		// 不是本周新闻; 若被年份分支判成 news, 会强制 week 级新鲜度,
 		// 反而把年度公报判成不新鲜。
 		plan.Intent = IntentData
+	case techdocs.MatchQuery(raw).Matched():
+		// 放在新闻/年份之前: 「postgres 18 release notes」带年份与发布词, 但
+		// 要的是官方文档而不是本周新闻, 判成 news 会强制 week 新鲜度, 质量门
+		// 反而因文档日期旧而恒不过。带年份的版本查询仍保留 year 级时效偏好
+		// (不是 week): 用户确实在意这一年的版本, 但不需要本周的报道。
+		plan.Intent = IntentTech
+		if yearPattern.MatchString(lower) {
+			plan.Freshness = "year"
+		}
 	case containsAny(probe, "今天", "今日", "最新", "发布", "新闻", "news", "刚刚"):
 		// 注意不含 "release": "postgres 18 release notes" 是查文档, 不是要上周新闻。
 		// 把它当新闻会强制 week 级新鲜度, 质量门因文档日期旧而恒不过。
@@ -217,6 +263,30 @@ func isDataQuery(lower string) bool {
 		}
 	}
 	return dataSignalRe.MatchString(lower)
+}
+
+// policySignalRe 匹配英文政策/监管信号。用词边界, 避免 "policyholder" 之类误判。
+var policySignalRe = regexp.MustCompile(`(?i)\b(policy|policies|regulation|regulatory|statute|decree|ordinance|ministry|executive order|government notice|white paper)\b`)
+
+// policySignalZH 是中文政策法规信号。
+//
+// 只收"这份文件叫什么"的词, 不收「规定」「意见」「通知」这类在技术语境里
+// 也常用的单字词 (如「接口规范规定」「GitHub 通知」), 否则大量普通查询会
+// 被路由到政府源, 白白浪费一次检索名额。
+var policySignalZH = []string{
+	"政策", "法规", "条例", "管理办法", "暂行办法", "实施细则", "指导意见",
+	"实施意见", "国务院", "部委", "政府", "补贴", "监管", "行政许可",
+	"行政处罚", "审批", "规划", "红头文件", "政策文件", "发文",
+}
+
+// isPolicyQuery 判断查询是否在找政策文件/政府公告原文。
+func isPolicyQuery(lower string) bool {
+	for _, s := range policySignalZH {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return policySignalRe.MatchString(lower)
 }
 
 // containsAny 判断 s 是否包含任意一个子串。
@@ -394,12 +464,45 @@ func preferenceOrder(intent Intent, language string) []string {
 		// 很大的 DOI。只调度前两位时，把 exa_anon 放在 second 才能保证
 		// 「专业库空手而归」的那一轮仍有可读材料。
 		return []string{"worldbank", "exa_anon", "datacite", "zenodo", "doaj", "cninfo", "parallel"}
+	case IntentPolicy:
+		// 中文政策查询: gov (国务院政策文件库) 是一手文件, cninfo 只在
+		// 「上市公司 + 政策影响」这类问句里当补充; exa_anon 留在第二位做对冲,
+		// 因为政策解读与地方落地细则常在新闻/门户页里, 文件库只收中央文件。
+		// 英文政策查询 gov.cn 帮不上 (只有中文文件), 交给世界银行/IMF 类材料。
+		if zh {
+			return []string{"gov", "exa_anon", "cninfo", "worldbank", "datacite", "parallel"}
+		}
+		return []string{"worldbank", "exa_anon", "datacite", "gov", "cninfo", "parallel"}
+	case IntentTech:
+		// techdocs 排第一: 它只对命中的产品域名检索, 空手时也只是少一条召回,
+		// 不会像通用源那样给出跑题页面。第二位按语言分工: 英文技术问题
+		// Stack Overflow 的报错/用法命中率最高; 中文技术问题 SO 覆盖差,
+		// 换 exa_anon 做语义对冲。generic 源留在第三位, 覆盖官方文档没写的
+		// 迁移踩坑与版本兼容问题。
+		if zh {
+			return []string{"techdocs", "exa_anon", "stackexchange", "parallel", "exa", "tavily", "github", "bing_rss"}
+		}
+		return []string{"techdocs", "stackexchange", "parallel", "exa", "exa_anon", "tavily", "github", "bing_rss"}
 	case IntentNews:
 		// exa_anon 必须排在 bing_rss 前面: 只调度前 2 个源, parallel 被限流
 		// (实测 6 个任务并发时 quota_exhausted) 后, 旧顺序会让 bing_rss +
 		// gnews 顶上来 —— 前者噪声大, 后者只回跳转链, 整轮调研就废了。
 		// exa_anon 免 key、直连可用, 实测中文时效查询召回质量接近 parallel。
-		return []string{"parallel", "exa_anon", "tavily", "bing_rss", "gnews", "exa"}
+		// gdelt 垫后: 100+ 语言的小时级新闻监测, 专门补非英语与跨境报道,
+		// 官方限 1 次/5 秒 (构造器已内置同间隔节流), 不适合顶在前两位硬吃并发。
+		// weibo 在 gdelt 前: 中文实时舆论/热搜是新闻意图的高价值补充
+		// (m.weibo.cn 匿名搜索实测可用), 但匿名频控无配额文档, 同样不占
+		// 前两位。
+		return []string{"parallel", "exa_anon", "tavily", "bing_rss", "gnews", "weibo", "gdelt", "exa"}
+	case IntentCulture:
+		// 中文图书/影视查询: 豆瓣条目 (评分/年份/作者) 是一手材料, 排第一;
+		// 通用源做对冲, 覆盖条目库没有的 (新书/小众独立出版)。英文查询同样
+		// 把 douban 留在候选里 —— 中文条目的评分与简介对英文用户也有用,
+		// 只是不让它占用前两个调度位。
+		if zh {
+			return []string{"douban", "exa_anon", "parallel", "bing_rss"}
+		}
+		return []string{"exa_anon", "parallel", "douban", "bing_rss"}
 	}
 	// bing_rss 排最后: 它只是"兜底中的兜底", 长查询会回完全不同话题的页面
 	// (实测有 Yandex/影视站/直播站)。主源 quota_exhausted 时, 百科与新闻源

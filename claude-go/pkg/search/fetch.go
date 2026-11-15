@@ -53,8 +53,11 @@ var urlGuard = validateFetchURL
 // 网络层仍执行初始 URL 与每跳重定向的 SSRF 校验、5MB 上限和出口降级；
 // prompt 选段、token 预算和 continuation 都在全文缓存之后执行，避免同一页面
 // 因不同问题重复打源。临时故障可复用过期全文，但必须显式标记 stale。
-func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (*FetchResponse, error) {
+func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (resp *FetchResponse, err error) {
 	start := time.Now()
+	// 使用记录挂在出口处: 所有 return (缓存命中/失败/成功) 都会走这里,
+	// 不存在"某个分支忘了记"的分叉。
+	defer func() { m.recordFetch(req, resp, err, time.Since(start)) }()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -123,8 +126,22 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (*FetchResponse, 
 				break
 			}
 			lastErr = err
-			if KindOf(err) == ErrInvalid {
+			// ErrInvalid 是请求本身非法 (SSRF/协议), ErrNotFound 是资源
+			// 已死 —— 换出口重试都没有意义, 交给后面的归档/降级分支。
+			if k := KindOf(err); k == ErrInvalid || k == ErrNotFound {
 				break
+			}
+		}
+		if doc == nil && m.cfg.WaybackFallback && waybackRetryable(lastErr) {
+			// 原站已死/超时/拒爬时回退 Wayback 最近快照: 深网检索里大量
+			// 一手材料只在归档里还活着 (旧公告/下线文档/被墙页面)。快照
+			// 内容按原 URL 缓存进同一 key, 后续命中不再打归档。
+			if wdoc, werr := m.fetchWayback(fctx, u, modes); werr == nil {
+				doc = wdoc
+				flightDegraded = append(flightDegraded, "wayback_fallback:"+string(KindOf(lastErr)))
+				m.metrics.Inc("fetch_wayback_fallback_total", map[string]string{"kind": string(KindOf(lastErr))})
+			} else {
+				flightDegraded = append(flightDegraded, "wayback_fallback_failed:"+string(KindOf(werr)))
 			}
 		}
 		if doc == nil {
@@ -162,6 +179,29 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (*FetchResponse, 
 	return &FetchResponse{Document: doc, Degraded: dedupeStrings(degraded), ElapsedMS: time.Since(start).Milliseconds()}, nil
 }
 
+// BrowserStyleUA 是发送给"拒爬虫 UA 但匿名直读公开内容"站点的浏览器形态
+// UA —— 与 providers 包 douban/weibo 同一口径: 保留 claude-go-search 身份
+// 标识, 不伪装成真实浏览器, 不做轮换。使用方两处:
+//   - fetch 侧 browserUAHosts 命中的域名 (目前只有公众号文章域);
+//   - providers 包构造期钉给对应源。
+const BrowserStyleUA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 claude-go-search/1.0"
+
+// browserUAHosts 列出抓取时必须用浏览器形态 UA 的域名。这些站对爬虫 UA
+// 直接拒绝 (公众号文章 2026-11-15 实测: 爬虫 UA 拿不到正文, 匿名桌面 UA
+// 可直读 25k 字全文), 但内容本身匿名公开、无挑战页 —— 不是反爬绕过。
+var browserUAHosts = map[string]bool{
+	"mp.weixin.qq.com": true,
+}
+
+// fetchUserAgent 按目标 host 选择 UA。命中 browserUAHosts 用浏览器形态,
+// 其余保持 cfg 里配置的诚实爬虫 UA (带项目地址)。
+func fetchUserAgent(cfgUserAgent, host string) string {
+	if browserUAHosts[host] {
+		return BrowserStyleUA
+	}
+	return cfgUserAgent
+}
+
 // fetchWithClient 用指定客户端执行一次抓取与正文提取。
 func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *url.URL) (*Document, error) {
 	c := *client
@@ -177,7 +217,7 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 	if err != nil {
 		return nil, Wrap("fetch", ErrInvalid, err)
 	}
-	req.Header.Set("User-Agent", m.cfg.UserAgent)
+	req.Header.Set("User-Agent", fetchUserAgent(m.cfg.UserAgent, u.Hostname()))
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.1")
 
 	resp, err := c.Do(req)
@@ -331,6 +371,10 @@ func statusKind(code int) ErrorKind {
 		return ErrRateLimited
 	case code == http.StatusRequestTimeout || code == http.StatusGatewayTimeout:
 		return ErrTimeout
+	case code == http.StatusNotFound || code == http.StatusGone:
+		// 资源已死 (不是请求非法): 不配用旧缓存伪装成功, 但值得回退
+		// Wayback 归档快照 —— 与 SSRF/协议类的 ErrInvalid 区分开。
+		return ErrNotFound
 	case code >= 400 && code < 500:
 		// 其它 4xx 是永久性的目标/权限/资源错误，不允许用旧缓存伪装本次成功。
 		return ErrInvalid
@@ -1462,4 +1506,68 @@ func parsePublished(raw string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+// waybackRetryable 判断哪类原站失败值得回退归档。
+//
+// 除 ErrInvalid (SSRF/协议校验, 归档侧同样会拒) 与 ErrUnsupported (内容
+// 类型不支持, 归档里的同一 URL 还是同一类型) 外都回退: 404/410 (页面已死,
+// 归档是唯一活口)、5xx/超时 (原站故障)、403/429 (拒爬 —— 读快照不等于
+// 绕过反爬, 快照是公开归档的既往公开内容)。
+func waybackRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch KindOf(err) {
+	case ErrInvalid, ErrUnsupported:
+		return false
+	}
+	return true
+}
+
+// waybackBase 是 Wayback Machine 的抓取前缀; "2" 取最近快照, "id_" 修饰
+// 要求返回未改写的原始响应 (不归一化链接/不注入归档工具条)。
+const waybackBase = "https://web.archive.org/web/2id_/"
+
+// waybackSnapshotURL 把原 URL 改写成 Wayback 最近快照地址。var (而非内部
+// 直连) 以便测试把归档端点指向 httptest, 与 urlGuard 的同包覆写惯例一致。
+var waybackSnapshotURL = func(u *url.URL) (*url.URL, error) {
+	return url.Parse(waybackBase + u.String())
+}
+
+// fetchWayback 经 Wayback Machine 抓原 URL 的最近快照。
+//
+// 逐出口模式重试 (与原抓取同一 modes 序列), 成功时把文档归回**原 URL**
+// (缓存 key 从一开始就基于原 URL, 这样后续命中不再走归档), Via 标记
+// wayback 让面板/质量门能看出这不是原站实时内容。快照不存在时 archive
+// 返回 404, 与原站失败同向合并为 unavailable。
+func (m *Manager) fetchWayback(ctx context.Context, u *url.URL, modes []Mode) (*Document, error) {
+	snapshot, err := waybackSnapshotURL(u)
+	if err != nil {
+		return nil, Wrap("wayback", ErrInvalid, err)
+	}
+	var lastErr error
+	for _, mode := range modes {
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = Wrap("wayback", classifyError(err), err)
+			}
+			break
+		}
+		doc, err := m.fetchWithClient(ctx, m.egress.Client(mode), snapshot)
+		if err != nil {
+			lastErr = err
+			if k := KindOf(err); k == ErrInvalid || k == ErrNotFound {
+				break
+			}
+			continue
+		}
+		doc.URL = u.String()
+		doc.Via = "wayback"
+		return doc, nil
+	}
+	if lastErr == nil {
+		lastErr = Wrap("wayback", ErrUnavailable, errors.New("no egress mode attempted"))
+	}
+	return nil, lastErr
 }

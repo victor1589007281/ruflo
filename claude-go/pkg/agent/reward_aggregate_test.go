@@ -223,20 +223,31 @@ func TestAggregateRewardsRobustness(t *testing.T) {
 // TestScoredFeedbackEquivalence 加权分路径在端点上与旧二值路径完全等价 (向后兼容),
 // 中间分给出部分信用。这是"保持旧调用方不破"的核心断言。
 func TestScoredFeedbackEquivalence(t *testing.T) {
+	// 引擎可能已合并共享经验库 (CLAUDE_GO_EXPERIENCE_STORE=agentdb 时本机 200 条),
+	// 种子经验不在下标 0 —— 断言一律按 ID 取 (见 findExperience)。
 	newEngine := func() *EvolutionEngine {
 		ee := NewEvolutionEngine(t.TempDir(), nil)
 		ee.experiences = append(ee.experiences, &Experience{ID: "e1", Quality: 0.5})
 		return ee
+	}
+	seed := func(t *testing.T, ee *EvolutionEngine) *Experience {
+		t.Helper()
+		exp := findExperience(ee, "e1")
+		if exp == nil {
+			t.Fatalf("种子经验 e1 丢失")
+		}
+		return exp
 	}
 
 	// 成功: 二值 true ≡ score +1
 	a, b := newEngine(), newEngine()
 	a.RecordFeedback("e1", true)
 	b.RecordFeedbackScored("e1", 1.0)
-	if !nearly(a.experiences[0].Quality, b.experiences[0].Quality) {
-		t.Errorf("success=true 应等价于 score=+1: %v vs %v", a.experiences[0].Quality, b.experiences[0].Quality)
+	ae, be := seed(t, a), seed(t, b)
+	if !nearly(ae.Quality, be.Quality) {
+		t.Errorf("success=true 应等价于 score=+1: %v vs %v", ae.Quality, be.Quality)
 	}
-	if a.experiences[0].SuccessCount != 1 || b.experiences[0].SuccessCount != 1 {
+	if ae.SuccessCount != 1 || be.SuccessCount != 1 {
 		t.Error("正分应计入 SuccessCount")
 	}
 
@@ -244,26 +255,27 @@ func TestScoredFeedbackEquivalence(t *testing.T) {
 	c, d := newEngine(), newEngine()
 	c.RecordFeedback("e1", false)
 	d.RecordFeedbackScored("e1", -1.0)
-	if !nearly(c.experiences[0].Quality, d.experiences[0].Quality) {
-		t.Errorf("success=false 应等价于 score=-1: %v vs %v", c.experiences[0].Quality, d.experiences[0].Quality)
+	ce, de := seed(t, c), seed(t, d)
+	if !nearly(ce.Quality, de.Quality) {
+		t.Errorf("success=false 应等价于 score=-1: %v vs %v", ce.Quality, de.Quality)
 	}
-	if c.experiences[0].SuccessCount != 0 || d.experiences[0].SuccessCount != 0 {
+	if ce.SuccessCount != 0 || de.SuccessCount != 0 {
 		t.Error("负分不应计入 SuccessCount")
 	}
-	if c.experiences[0].Quality >= 0.5 {
-		t.Errorf("失败应压低质量, got %v", c.experiences[0].Quality)
+	if ce.Quality >= 0.5 {
+		t.Errorf("失败应压低质量, got %v", ce.Quality)
 	}
 
 	// 中间分: 0.6 的质量提升应严格介于失败与满分之间
 	e := newEngine()
 	e.RecordFeedbackScored("e1", 0.6)
-	if !(e.experiences[0].Quality > c.experiences[0].Quality && e.experiences[0].Quality < a.experiences[0].Quality) {
-		t.Errorf("中间分应给部分信用: fail=%v mid=%v ok=%v",
-			c.experiences[0].Quality, e.experiences[0].Quality, a.experiences[0].Quality)
+	ee := seed(t, e)
+	if !(ee.Quality > ce.Quality && ee.Quality < ae.Quality) {
+		t.Errorf("中间分应给部分信用: fail=%v mid=%v ok=%v", ce.Quality, ee.Quality, ae.Quality)
 	}
 	// UsageCount 计数不受分值影响
-	if e.experiences[0].UsageCount != 1 {
-		t.Errorf("UsageCount 应为 1, got %d", e.experiences[0].UsageCount)
+	if ee.UsageCount != 1 {
+		t.Errorf("UsageCount 应为 1, got %d", ee.UsageCount)
 	}
 }
 
@@ -310,9 +322,12 @@ func TestRecordInjectionScoredKeepsScore(t *testing.T) {
 	if ee.injections[1].Success || !nearly(ee.injections[1].Score, -1) {
 		t.Errorf("二值 false 应记为 Score=-1 Success=false, got %+v", ee.injections[1])
 	}
-	if ee.experiences[0].InjectionCount != 2 || ee.experiences[0].InjectionSuccess != 1 {
-		t.Errorf("注入统计错: count=%d success=%d",
-			ee.experiences[0].InjectionCount, ee.experiences[0].InjectionSuccess)
+	exp := findExperience(ee, "e1")
+	if exp == nil {
+		t.Fatalf("种子经验 e1 丢失")
+	}
+	if exp.InjectionCount != 2 || exp.InjectionSuccess != 1 {
+		t.Errorf("注入统计错: count=%d success=%d", exp.InjectionCount, exp.InjectionSuccess)
 	}
 }
 

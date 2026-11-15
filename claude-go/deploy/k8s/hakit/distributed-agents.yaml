@@ -23,7 +23,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: gateway
-          image: claude-go:agents-autoclass-20261113-1348
+          image: claude-go:agents-20261114-1152
           imagePullPolicy: Never
           # anthropic-gateway (协议翻译/透传, omen 长推理 30min + x-opencode-session
           # 注入) + pathfix (18081→18085, 兼容老客户端 /messages 路径改写)。
@@ -36,6 +36,9 @@ spec:
             - "python3 /usr/local/bin/pathfix.py >>/tmp/pathfix.log 2>&1 & exec /usr/local/bin/anthropic-gateway --addr 127.0.0.1:18085 --config /etc/claude-go/config.json --default-prefix opencode --upstream-timeout 30m"
           env:
             - { name: HOME, value: "/tmp" }
+            - { name: SEARCH_STATE_DIR, value: "/mnt/data/claude-go/search" }
+            # Jev 决策层：pod 内 127.0.0.1 不是宿主，改走 kind 网桥网关。
+            - { name: CLAUDE_GO_DECISION_URL, value: "http://172.18.0.1:11435" }
           ports: [{ containerPort: 18081 }]
           readinessProbe:
             httpGet: { path: /healthz, port: 18081 }
@@ -73,7 +76,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: control
-          image: claude-go:agents-autoclass-20261113-1348
+          image: claude-go:agents-20261114-2350
           imagePullPolicy: Never
           args:
             - "serve"
@@ -97,7 +100,12 @@ spec:
             - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
             - { name: CLAUDE_GO_TOOLS_POOL, value: "1" }
             - { name: HOME, value: "/tmp" }
+            - { name: SEARCH_STATE_DIR, value: "/mnt/data/claude-go/search" }
             - { name: GIT_SSH_COMMAND, value: "ssh -i /home/victor/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/home/victor/.ssh/known_hosts" }
+            - { name: CLAUDE_GO_DECISION_URL, value: "http://172.18.0.1:11435" }
+            # 经验库共享存储：一条经验一个 key，rollout 不再清零、多副本合并。
+            - { name: CLAUDE_GO_EXPERIENCE_STORE, value: "agentdb" }
+            - { name: CLAUDE_GO_EXPERIENCE_BUCKET, value: "claude-go-experience" }
           ports: [{ containerPort: 18080 }]
           readinessProbe:
             httpGet: { path: /api/health, port: 18080 }
@@ -128,10 +136,20 @@ spec:
             path: /mnt/data/claude-go/workspace
             type: DirectoryOrCreate
 
+        # knowledge 与下面的 ima-skill 同一条教训: hostPath 在节点文件系统上解析,
+        # 宿主 /home/victor 在 kind 节点里是个空壳 —— 2026-11-15 实测节点上
+        # /home/victor/base/git/gitee/knowledge 是 root:root 空目录 (DirectoryOrCreate
+        # 建的), 容器内不可写, 于是 cron "IMA 笔记同步" 报
+        # "创建 raw 目录失败: mkdir raw: permission denied" (sync.knowledgeRepo 为空
+        # 时路径退化成相对 cwd; 补上绝对路径后仍会因空壳目录失败)。
+        # 数据实际放在 state 卷 (节点与宿主同一份设备) 的 knowledge/ 下,
+        # 宿主侧 /home/victor/base/git/gitee/knowledge 是指向它的符号链接,
+        # 因此 mountPath 仍保持原路径, 配置 (wiki.repos / sync.knowledgeRepo) 不用改。
+        # 恢复节点 bind 的方案见 claude-go-hakit-net.sh (需 root)。
         - name: knowledge
           hostPath:
-            path: /home/victor/base/git/gitee/knowledge
-            type: DirectoryOrCreate
+            path: /mnt/data/claude-go/knowledge
+            type: Directory
         # ima-skill 的 hostPath **不能**写 /home/victor/.claude/skills/ima-skill:
         # hostPath 是在 kubelet 所在节点的文件系统上解析的, 而 kind 节点自己的
         # /home/victor 与宿主那份同名目录互不相干 (2026-10-10 实测: 节点上这个目录
@@ -177,7 +195,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: dashboard
-          image: claude-go:agents-autoclass-20261113-1348
+          image: claude-go:agents-20261114-2350
           imagePullPolicy: Never
           args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open", "--config", "/etc/claude-go/config.json"]
           env:
@@ -186,6 +204,13 @@ spec:
             # Jev 决策流水从 agentdb 读, 缺了 /api/jev/stats 只回报错 (2026-11-05 实测)
             - { name: CLAUDE_GO_AGENTDB_URL, value: "http://agentdb:9090" }
             - { name: HOME, value: "/tmp" }
+            - { name: SEARCH_STATE_DIR, value: "/mnt/data/claude-go/search" }
+            # 群体智能/经验的只读展示同样走 agentDB
+            - { name: SWARM_STORE, value: "agentdb" }
+            - { name: AGENTDB_URL, value: "http://agentdb:9090" }
+            - { name: AGENTDB_NAMESPACE, value: "swarm" }
+            - { name: CLAUDE_GO_EXPERIENCE_STORE, value: "agentdb" }
+            - { name: CLAUDE_GO_EXPERIENCE_BUCKET, value: "claude-go-experience" }
           ports: [{ containerPort: 7777 }]
           readinessProbe:
             httpGet: { path: /api/health, port: 7777 }
@@ -233,7 +258,8 @@ spec:
         - name: init-state-dir
           # 不用 busybox: kind 节点无外网, docker.io 拉不动 (agents9 实测 ImagePullBackOff)。
           # agents9 基于 debian-slim 自带 sh+chown, 直接复用镜像内已有能力。
-          image: claude-go:agents-autoclass-20261113-1348
+          # 只跑 mkdir/chown，不跟随主容器升级（跟随会平白多一次 init 镜像变更）。
+          image: claude-go:agents-20261114-110955
           imagePullPolicy: Never
           # 显式 root: 否则继承 pod 级 runAsUser 1000, chown 反向被拒 (agents9 实测 Init:Error)。
           securityContext: { runAsUser: 0, runAsGroup: 0 }
@@ -245,7 +271,7 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
       containers:
         - name: worker
-          image: claude-go:agents-autoclass-20261113-1348
+          image: claude-go:agents-20261114-2350
           imagePullPolicy: Never
           command: ["/usr/local/bin/claude-go-worker"]
           args:
@@ -279,7 +305,12 @@ spec:
             - name: CLAUDE_GO_STATE_DIR
               value: "/data/.claude-go"
             - { name: HOME, value: "/tmp" }
+            - { name: SEARCH_STATE_DIR, value: "/mnt/data/claude-go/search" }
             - { name: CLAUDE_GO_TOOLS_POOL, value: "1" }
+            - { name: CLAUDE_GO_DECISION_URL, value: "http://172.18.0.1:11435" }
+            # 经验库共享存储：worker 状态卷按 pod 名隔离，只有共享库能跨 rollout 累积。
+            - { name: CLAUDE_GO_EXPERIENCE_STORE, value: "agentdb" }
+            - { name: CLAUDE_GO_EXPERIENCE_BUCKET, value: "claude-go-experience" }
           volumeMounts:
             - { name: config, mountPath: /etc/claude-go }
             - { name: state, mountPath: /data, subPathExpr: "$(POD_NAME)" }
@@ -317,11 +348,13 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: mcp
-          image: claude-go:agents-autoclass-20261113-1348
+          image: claude-go:agents-20261114-1152
           imagePullPolicy: Never
           args: ["codeintel-mcp-server", "--transport", "http", "--addr", "0.0.0.0:29234", "--config", "/etc/claude-go/config.json"]
           env:
             - { name: HOME, value: "/tmp" }
+            - { name: SEARCH_STATE_DIR, value: "/mnt/data/claude-go/search" }
+            - { name: CLAUDE_GO_DECISION_URL, value: "http://172.18.0.1:11435" }
           ports: [{ containerPort: 29234 }]
           resources:
             limits: { cpu: "4", memory: 8Gi }

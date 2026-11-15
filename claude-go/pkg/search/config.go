@@ -105,6 +105,27 @@ type Config struct {
 	// 下该排第一, 全局覆盖会让它们污染日常事实查询; 而把排序逻辑全塞进
 	// pkg/search 又会让产品无法按自己的额度情况调整。按意图分层是两者的折中。
 	IntentPriority map[string][]string
+
+	// RemoteRender 是远程 JS 渲染兜底 (Firecrawl MCP keyless/带 key)。
+	// 本地 Chromium 渲染失败 (无浏览器/超时/挑战页) 时按配置尝试。
+	RemoteRender RemoteRenderConfig
+
+	// WaybackFallback 允许 Fetch 在原站 4xx/5xx/超时时回退到
+	// Wayback Machine 最近快照 (web.archive.org 需出口可达, 默认关闭)。
+	WaybackFallback bool
+}
+
+// RemoteRenderConfig 配置远程渲染服务 (当前实现为 Firecrawl MCP 端点)。
+//
+// Enabled=false 时完全关闭; APIKey 为空走 keyless 档 (有服务端日额度,
+// 超额返回 429, 由渲染链路的调用方按 unavailable 处理)。Endpoint 默认
+// Firecrawl 托管 MCP; 也可指向自托管 firecrawl-mcp 或其它实现了同形
+// tools/call 协议的端点。
+type RemoteRenderConfig struct {
+	Enabled  bool
+	Endpoint string
+	APIKey   string
+	Timeout  time.Duration
 }
 
 // ProviderConfig 是单源配置。
@@ -185,6 +206,8 @@ func DefaultConfig() Config {
 //	SEARCH_PROVIDER_COST_ESTIMATES_USD (例: exa=0.01,tavily=0.005)
 //	PARALLEL_URL / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / JINA_API_KEY
 //	GITHUB_TOKEN (仅兼容旧部署; config.json 的 search.githubToken 优先)
+//	SEARCH_REMOTE_RENDER(1 开启) / SEARCH_REMOTE_RENDER_URL / SEARCH_REMOTE_RENDER_TIMEOUT
+//	SEARCH_WAYBACK_FALLBACK(1 开启)
 //
 // 本服务不读取 HTTP_PROXY/HTTPS_PROXY, 避免与宿主环境互相污染。
 func LoadConfig() Config {
@@ -270,9 +293,16 @@ func LoadConfig() Config {
 
 	// 领域直连源: 全部免 key, 只在其擅长的意图上被路由选中 (见 router.go)。
 	// 端点与权重由各构造函数内置, 这里只负责启用。
+	//
+	// 专业公开库 (arxiv/doaj/datacite/zenodo/worldbank/cninfo) 也在这张表里:
+	// router.go 的意图计划早就点名要用它们, 但**不登记就构造不出来** ——
+	// 计划里的名字会被静默跳过, 表现为"学术/数据/公告类问题永远只有通用网页结果"。
+	// 权重与各 provider 内置默认值保持一致 (worldbank 1.1 / zenodo 0.9), 否则
+	// newBase 会被这里的 0 值/偏低值覆盖, 面板显示的权重也不是实际生效值。
 	for name, weight := range map[string]float64{
 		"github":        1.0,
 		"stackexchange": 1.0,
+		"techdocs":      1.0,
 		"openalex":      1.0,
 		"openreview":    1.0,
 		"crossref":      1.0,
@@ -280,6 +310,16 @@ func LoadConfig() Config {
 		"hn":            0.7,
 		"npm":           1.0,
 		"pypi":          1.0,
+		"arxiv":         1.0,
+		"doaj":          1.0,
+		"datacite":      1.0,
+		"zenodo":        0.9,
+		"worldbank":     1.1,
+		"cninfo":        1.0,
+		"gov":           1.1,
+		"gdelt":         0.7,
+		"douban":        0.6,
+		"weibo":         0.6,
 	} {
 		cfg.Providers[name] = ProviderConfig{Enabled: true, Egress: ModeDirect, Weight: weight, Tier: TierL2}
 	}
@@ -289,8 +329,29 @@ func LoadConfig() Config {
 		cfg.Providers["github"] = p
 	}
 	loadProviderCostEstimates(&cfg, os.Getenv("SEARCH_PROVIDER_COST_ESTIMATES_USD"))
+
+	// 反爬/归档渠道: 默认全关, 按需以环境变量开启 (见 remote_render.go /
+	// fetch.go 顶部说明各自的适用面与出口要求)。
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("SEARCH_REMOTE_RENDER"))); v == "1" || v == "true" || v == "on" {
+		cfg.RemoteRender.Enabled = true
+	}
+	cfg.RemoteRender.Endpoint = envOr("SEARCH_REMOTE_RENDER_URL", "https://mcp.firecrawl.dev/v2/mcp")
+	cfg.RemoteRender.APIKey = os.Getenv("FIRECRAWL_API_KEY") // 空 = keyless 档
+	cfg.RemoteRender.Timeout = durationEnv("SEARCH_REMOTE_RENDER_TIMEOUT", 30*time.Second)
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("SEARCH_WAYBACK_FALLBACK"))); v == "1" || v == "true" || v == "on" {
+		cfg.WaybackFallback = true
+	}
+
+	// 面板的源覆盖 (启用/停用/权重/顺序) 在**进程启动时**合并一次: 见 sources.go
+	// 顶部关于"为什么不做热更新"的说明。
+	applySourcesFile(&cfg)
+	// 使用记录: 目录不可用时自动降级为不记录, 不影响检索。
+	InitTelemetry()
 	return cfg
 }
+
+// SourcesSnapshotPath 供装配层日志/诊断使用, 返回生效快照文件路径。
+func SourcesSnapshotPath() string { return EffectiveSourcesPath() }
 
 // loadProviderCostEstimates 只设置预占估算，不改变 provider 的启用状态。
 // 未出现过的自定义源按既有缺省语义视为启用；非法金额忽略并保持零成本。

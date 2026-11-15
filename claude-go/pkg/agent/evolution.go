@@ -166,6 +166,15 @@ type EvolutionEngine struct {
 	mu           sync.RWMutex
 	nextID       int
 
+	// 共享经验库（agentDB /v1/store）。nil = 只用本地 experiences.json。
+	// persisted 记录"已经和远端一致"的条目 ID→内容指纹，persist 只推差异。
+	// persistMu 串行化持久化：mu 是读写锁，persist 只持读锁，但会写 persisted/
+	// lastCompact 这两个普通字段，必须再有一把独占锁。锁序固定 persistMu → mu。
+	store       ExperienceStore
+	persisted   map[string]string
+	lastCompact time.Time
+	persistMu   sync.Mutex
+
 	// V2 统计缓存
 	totalSelections int     // UCB 全局选择计数
 	totalDistilled  int     // 历史提炼总数 (用于 survival_rate)
@@ -475,8 +484,10 @@ func readTailLines(path string, maxBytes int64) [][]byte {
 // NewEvolutionEngine 创建进化引擎。
 func NewEvolutionEngine(dataDir string, llm LLMClient) *EvolutionEngine {
 	ee := &EvolutionEngine{
-		llm:     llm,
-		dataDir: dataDir,
+		llm:       llm,
+		dataDir:   dataDir,
+		store:     newExperienceStoreFromEnv(),
+		persisted: make(map[string]string),
 	}
 	ee.load()
 	ee.migrateV2Fields()
@@ -1562,9 +1573,9 @@ func (ee *EvolutionEngine) RecordBatchFeedbackScored(expIDs []string, score floa
 // Consolidate 整理经验库 (V2: MinHash+LSH去重 + 生命周期状态机 + 晋升/淘汰)。
 func (ee *EvolutionEngine) Consolidate() {
 	ee.mu.Lock()
-	defer ee.mu.Unlock()
 
 	if len(ee.experiences) == 0 {
+		ee.mu.Unlock()
 		return
 	}
 
@@ -1688,9 +1699,13 @@ func (ee *EvolutionEngine) Consolidate() {
 	}
 
 	ee.experiences = deduped
-	ee.persistExperiences()
-
 	after := len(ee.experiences)
+	ee.mu.Unlock()
+
+	// 持久化会走网络，放在释放写锁之后；锁序固定 persistMu → mu。
+	ee.persistExperiences()
+	ee.maybeCompact()
+
 	if before != after {
 		log.Printf("[Evolution] 整理: %d → %d 条经验 (剪枝 %d)", before, after, before-after)
 	}
@@ -1698,17 +1713,118 @@ func (ee *EvolutionEngine) Consolidate() {
 
 // --- 持久化 ---
 
-// persistExperiences 把经验库整体覆盖写到 <dataDir>/experiences.json; dataDir 为空时不做任何事。
+// persistExperiences 持久化经验库（可被任意 goroutine 并发调用）。
+// 先拿 persistMu 再拿读锁，与 Consolidate 的锁序一致（persistMu → mu）。
 func (ee *EvolutionEngine) persistExperiences() {
+	ee.persistMu.Lock()
+	defer ee.persistMu.Unlock()
+	ee.mu.RLock()
+	defer ee.mu.RUnlock()
+	ee.persistExperiencesLocked()
+}
+
+// persistExperiencesLocked 持久化经验库，调用方必须已持有 persistMu 与 ee.mu（读锁或写锁）。
+//
+// 本地 experiences.json 只是缓存/离线兜底；配置了共享存储时，真正的持久化是按 ID
+// 把差异推给 agentDB：
+//   - 新增/内容变化的条目 → upsert
+//   - persisted 里有、当前内存里没有的条目 → 写墓碑（而不是物理删，防止旧缓存复活）
+//   - 内容没变的条目 → 一条写入都不发
+//
+// 网络失败 fail-open：本地文件照写，persisted 不推进，下一轮整理时重试。
+func (ee *EvolutionEngine) persistExperiencesLocked() {
+	ee.writeExperiencesFile()
+	if ee.store == nil {
+		return
+	}
+
+	current := make(map[string]string, len(ee.experiences))
+	upserts := make([]*Experience, 0, len(ee.experiences))
+	for _, e := range ee.experiences {
+		if e == nil || e.ID == "" {
+			continue
+		}
+		fp := ExperienceFingerprint(e)
+		current[e.ID] = fp
+		if prev, ok := ee.persisted[e.ID]; !ok || prev != fp {
+			upserts = append(upserts, e)
+		}
+	}
+	var tombstones []ExperienceTombstone
+	for id := range ee.persisted {
+		if _, ok := current[id]; !ok {
+			tombstones = append(tombstones, ExperienceTombstone{ID: id, UpdatedAt: time.Now().UTC()})
+		}
+	}
+	if len(upserts) == 0 && len(tombstones) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	res, err := ee.store.Sync(ctx, upserts, tombstones)
+	if err != nil {
+		log.Printf("[Evolution] 经验库同步失败 (fail-open, 本地 %d 条, 待重试): %v", len(ee.experiences), err)
+		return
+	}
+	for _, e := range upserts {
+		ee.persisted[e.ID] = ExperienceFingerprint(e)
+	}
+	for _, t := range tombstones {
+		delete(ee.persisted, t.ID)
+	}
+	log.Printf("[Evolution] 经验库同步: 写 %d / 墓碑 %d / 跳过 %d (共 %d 条)", res.Written, res.Deleted, res.Skipped, len(ee.experiences))
+}
+
+// writeExperiencesFile 原子写本地缓存（tmp + rename），避免进程被杀时留下半个 JSON。
+func (ee *EvolutionEngine) writeExperiencesFile() {
 	if ee.dataDir == "" {
 		return
 	}
-	os.MkdirAll(ee.dataDir, 0755)
+	if err := os.MkdirAll(ee.dataDir, 0755); err != nil {
+		return
+	}
 	data, err := json.MarshalIndent(ee.experiences, "", "  ")
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(ee.dataDir, "experiences.json"), data, 0644)
+	tmp := filepath.Join(ee.dataDir, "experiences.json.tmp")
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		log.Printf("[Evolution] 写本地经验缓存失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, filepath.Join(ee.dataDir, "experiences.json")); err != nil {
+		log.Printf("[Evolution] 替换本地经验缓存失败: %v", err)
+		_ = os.Remove(tmp)
+	}
+}
+
+// maybeCompact 24h 内最多触发一次墓碑清理。lastCompact 由 persistMu 保护。
+func (ee *EvolutionEngine) maybeCompact() {
+	ee.persistMu.Lock()
+	if ee.store == nil {
+		ee.persistMu.Unlock()
+		return
+	}
+	if !ee.lastCompact.IsZero() && time.Since(ee.lastCompact) < 24*time.Hour {
+		ee.persistMu.Unlock()
+		return
+	}
+	ee.lastCompact = time.Now()
+	store := ee.store
+	ee.persistMu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		n, err := store.Compact(ctx, TombstoneTTLFromEnv())
+		if err != nil {
+			log.Printf("[Evolution] 经验库压实失败 (fail-open): %v", err)
+			return
+		}
+		if n > 0 {
+			log.Printf("[Evolution] 经验库压实: 清理 %d 条过期墓碑", n)
+		}
+	}()
 }
 
 // persistTrajectories 把轨迹整体覆盖写到 <dataDir>/trajectories.json; dataDir 为空时不做任何事。
@@ -1724,25 +1840,63 @@ func (ee *EvolutionEngine) persistTrajectories() {
 	_ = os.WriteFile(filepath.Join(ee.dataDir, "trajectories.json"), data, 0644)
 }
 
-// load 从 dataDir 依次读回 experiences / trajectories / injections 三份 JSON。
+// load 从 dataDir 依次读回 experiences / trajectories / injections 三份 JSON，
+// 再与共享经验库（若启用）做一次合并。
 //
 // 注意：任一份读取或解析失败都静默跳过 (保持该字段的零值), 不做任何提示 ——
 // 落盘损坏时引擎会以「空经验库」继续跑, 从外部看只是进化效果消失而不是报错。
 func (ee *EvolutionEngine) load() {
-	if ee.dataDir == "" {
-		return
+	if ee.dataDir != "" {
+		if data, err := os.ReadFile(filepath.Join(ee.dataDir, "experiences.json")); err == nil {
+			_ = json.Unmarshal(data, &ee.experiences)
+		}
+		if data, err := os.ReadFile(filepath.Join(ee.dataDir, "trajectories.json")); err == nil {
+			_ = json.Unmarshal(data, &ee.trajectories)
+		}
+		// V2: 加载注入记录
+		if data, err := os.ReadFile(filepath.Join(ee.dataDir, "injections.json")); err == nil {
+			_ = json.Unmarshal(data, &ee.injections)
+		}
 	}
 
-	if data, err := os.ReadFile(filepath.Join(ee.dataDir, "experiences.json")); err == nil {
-		_ = json.Unmarshal(data, &ee.experiences)
+	if ee.store != nil {
+		ee.loadSharedExperiences()
 	}
-	if data, err := os.ReadFile(filepath.Join(ee.dataDir, "trajectories.json")); err == nil {
-		_ = json.Unmarshal(data, &ee.trajectories)
+}
+
+// loadSharedExperiences 把本地缓存与 agentDB 合并：
+//   - 同 ID 取版本较新者；远端墓碑删除本地陈旧条目；
+//   - 本地更新/本地独有的条目回推 agentDB；
+//   - 合并结果写回本地缓存，作为离线兜底。
+//
+// agentDB 不可用时保持本地经验继续服务（fail-open），不阻塞启动。
+func (ee *EvolutionEngine) loadSharedExperiences() {
+	local := ee.experiences
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	snap, err := ee.store.Load(ctx)
+	if err != nil {
+		log.Printf("[Evolution] 共享经验库不可用 (fail-open, 继续用本地 %d 条): %v", len(local), err)
+		return
 	}
-	// V2: 加载注入记录
-	if data, err := os.ReadFile(filepath.Join(ee.dataDir, "injections.json")); err == nil {
-		_ = json.Unmarshal(data, &ee.injections)
+	merged, push, synced := mergeExperienceState(local, snap)
+	ee.experiences = merged
+	ee.persisted = synced
+	if len(push) > 0 {
+		res, err := ee.store.Sync(ctx, push, nil)
+		if err != nil {
+			log.Printf("[Evolution] 本地经验回推失败 (fail-open, 下轮整理时重试): %v", err)
+		} else {
+			for _, e := range push {
+				ee.persisted[e.ID] = ExperienceFingerprint(e)
+			}
+			log.Printf("[Evolution] 本地经验回推 agentDB: 写 %d / 跳过 %d", res.Written, res.Skipped)
+		}
 	}
+	ee.writeExperiencesFile()
+	log.Printf("[Evolution] 共享经验库合并: 本地 %d + agentDB %d (墓碑 %d) → %d 条",
+		len(local), snap.LiveCount(), snap.TombstoneCount(), len(merged))
 }
 
 // Stats 统计信息。

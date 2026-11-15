@@ -29,6 +29,9 @@ type Classification struct {
 	Modes    []ModeMatch `json:"modes"`              // 1~3 个, 首个为主模式
 	Reason   string      `json:"reason"`             // 一句话中文理由 (展示给用户)
 	Fallback bool        `json:"fallback,omitempty"` // true = LLM 不可用, 走了关键词兜底
+	// Plan 是"怎么跑"的建议 (轮次预算帽/拓扑/重连/记忆/agent 数), 见 plan.go。
+	// 与 Modes 分开: 模式回答"模拟什么", Plan 回答"跑多深、谁影响谁"。
+	Plan *RunPlan `json:"plan,omitempty"`
 }
 
 // Primary 主模式 (第一个); 空目录兜底 social。
@@ -60,7 +63,19 @@ var modeHints = map[string]string{
 }
 
 // ClassifyObjective 场景识别: 输入用户问题, 输出路由建议。永不返回 error — 失败时兜底。
+//
+// 返回值同时带**运行参数建议** (Plan): 识别只决定"用什么模式", 一键模式还需要
+// 知道"跑多深、谁影响谁"。两件事都放在这一次调用里返回, 调用方 (webapp 一键页、
+// AskForge 工具) 不用各自维护一张模式→参数表。
 func (e *Engine) ClassifyObjective(ctx context.Context, objective string) *Classification {
+	c := e.classifyOnce(ctx, objective)
+	c.Plan = planFor(c.Kind, c.Primary(), objective)
+	return c
+}
+
+// classifyOnce 只做 kind/modes 判定; Plan 由 ClassifyObjective 统一补上,
+// 这样三条返回路径 (成功 / 解析失败 / LLM 失败) 都不会漏掉 Plan。
+func (e *Engine) classifyOnce(ctx context.Context, objective string) *Classification {
 	c := &Classification{Kind: "simulate", Reason: "默认路由"}
 	resp, err := e.llm.SimpleComplete(ctx,
 		"你是群体智能场景路由器。只输出严格 JSON, 不要输出任何其他文字。", classifyPrompt(objective))

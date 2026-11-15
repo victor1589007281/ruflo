@@ -315,7 +315,7 @@ func TestFetchStaleIfErrorDoesNotBypassPermanentFailures(t *testing.T) {
 	}{
 		{name: "temporary 503", status: http.StatusServiceUnavailable, wantStale: true},
 		{name: "forbidden", status: http.StatusForbidden, wantKind: ErrBlocked},
-		{name: "not found", status: http.StatusNotFound, wantKind: ErrInvalid},
+		{name: "not found", status: http.StatusNotFound, wantKind: ErrNotFound},
 		{name: "unsupported", status: http.StatusOK, contentType: "application/zip", wantKind: ErrUnsupported},
 		{name: "corrupt pdf", status: http.StatusOK, contentType: "application/pdf", wantKind: ErrInvalid},
 	}
