@@ -365,6 +365,7 @@ func main() {
 	rootCmd.AddCommand(wechatCmd())
 	rootCmd.AddCommand(swarmCmd())
 	rootCmd.AddCommand(harnessSmokeCmd()) // harness 契约层真上游冒烟 (deploy/harness-smoke-k8s.sh)
+	rootCmd.AddCommand(harnessEvoCmd())   // HarnessPro 论文进化逻辑 (固定 DAG 工作流)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

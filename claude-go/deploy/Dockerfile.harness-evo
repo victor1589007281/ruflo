@@ -1,0 +1,3 @@
+FROM claude-go:agents-20261114-2350
+COPY claude-go-linux /usr/local/bin/claude-go
+COPY claude-go-worker-linux /usr/local/bin/claude-go-worker
