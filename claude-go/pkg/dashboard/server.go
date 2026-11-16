@@ -324,6 +324,10 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	// v1.1 扩展
 	mux.HandleFunc("/api/workflows", s.handleWorkflows)
 	mux.HandleFunc("/api/workflows/generate", s.handleWorkflowGenerate) // LLM 生成编排 (更具体, 优先于下面)
+	// HarnessPro 进化运行控制面 (webapp 工作流轮询消费; 非团队运行时,
+	// 故不走 /api/teams 协议)。/runs 精确前缀优先于 /runs/ 前缀。
+	mux.HandleFunc("/api/harness-evo/runs", s.handleHarnessEvoRuns)
+	mux.HandleFunc("/api/harness-evo/runs/", s.handleHarnessEvoRun)
 	mux.HandleFunc("/api/roles", s.handleRoles)                         // 角色富信息 (DAG 节点面板 / Agents 展示页; 无 names 则列全部)
 	// agent **资产**的查看与创建。与上面那行是**两层不同的东西**: /api/roles 只列角色
 	// 注册表 (93 个内置人格, 只读), 这组管的是 <stateDir>/agents/*.md —— 优先级更高、

@@ -188,6 +188,7 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"manager-lab-rehearsal-npc":    managerLabRehearsalNPCWorkflow,
 	"manager-lab-rehearsal-critic": managerLabRehearsalCriticWorkflow,
 	"manager-lab-simulation-v2":    managerLabSimulationV2Workflow,
+	"harness-evo":                  harnessEvoWorkflow, // 目录元数据; 真实执行 = 专用进化引擎 (dashboard /api/harness-evo/runs)
 }
 
 // BuiltinWorkflowNames 列出全部内置工作流名 (排序)。

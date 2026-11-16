@@ -68,6 +68,10 @@ var dashboardContract = []apiEndpoint{
 	{Pattern: "/api/workflows", Probe: "/api/workflows"},
 	{Pattern: "/api/workflows/generate", Probe: "/api/workflows/generate"},
 	{Pattern: "/api/workflows/", Probe: "/api/workflows/novel-v2", Prefix: true},
+	// HarnessPro 进化运行控制面 (非团队运行时; webapp 工作流轮询消费)。
+	// team/create + workflow=harness-evo 在 handleAction 就地转译进这套端点。
+	{Pattern: "/api/harness-evo/runs", Probe: "/api/harness-evo/runs"},
+	{Pattern: "/api/harness-evo/runs/", Probe: "/api/harness-evo/runs/evo-x", Prefix: true},
 	{Pattern: "/api/roles", Probe: "/api/roles"},
 	// agent **资产** (stateDir/agents/*.md) 的查看与创建。与上面的 /api/roles 是两层
 	// 不同的东西: 角色表是 93 个内置人格的只读视图, 这里管的是优先级更高、可声明

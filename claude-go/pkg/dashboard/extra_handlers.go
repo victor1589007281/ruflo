@@ -1204,6 +1204,9 @@ type actionResp struct {
 	Message  string `json:"message,omitempty"`
 	Hint     string `json:"hint,omitempty"`
 	ActionID string `json:"actionId,omitempty"`
+	// RunID 仅 harness-evo 转译路径回填: 进化运行的 id (webapp 据此把
+	// workflow_runs.team_name 记成 harness-evo:<runId> 并走进化轮询)。
+	RunID string `json:"runId,omitempty"`
 	// Consumed/TaskID/Status 是消费方回填的真凭实据 (design/01 §4.12)。
 	// 历史上本接口一律回 "动作已排队, 等待 claude-go 主进程消费", 而全仓根本没有
 	// 消费方 —— 那是假承诺。现在: 有消费方就回真实结果, 没有就明说没有。
@@ -1272,6 +1275,84 @@ func actionSinkOwns(kind, action string) bool {
 	return false
 }
 
+// handleHarnessEvoActionCreate team/create + workflow=harness-evo 的就地转译:
+// 不起团队, 直接触发 pkg/harnesspro 进化运行 (见 harness_evo_handlers.go)。
+// 参数优先级: payload 显式键 > objective 里的 JSON > 冒烟默认
+// (epochs=1 k=2 train=4 model=opencode:deepseek-v4.1-flash —— e2e 实测档)。
+func (s *Server) handleHarnessEvoActionCreate(w http.ResponseWriter, payload map[string]interface{}) {
+	params := harnessEvoParams{
+		Model:       "opencode:deepseek-v4.1-flash",
+		Epochs:      1,
+		K:           2,
+		TrainN:      4,
+		TimeoutMin:  45,
+		MaxParallel: 4,
+	}
+	num := func(key string, dst *int) {
+		if v, ok := payload[key]; ok {
+			switch t := v.(type) {
+			case float64:
+				*dst = int(t)
+			case string:
+				if n, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+					*dst = n
+				}
+			}
+		}
+	}
+	num("epochs", &params.Epochs)
+	num("k", &params.K)
+	num("train", &params.TrainN)
+	num("timeout_min", &params.TimeoutMin)
+	num("max_parallel", &params.MaxParallel)
+	if v, _ := payload["model"].(string); strings.TrimSpace(v) != "" {
+		params.Model = strings.TrimSpace(v)
+	}
+	if v, _ := payload["tiers"].(string); strings.TrimSpace(v) != "" {
+		params.Tiers = strings.TrimSpace(v)
+	}
+	if v, ok := payload["resume"].(bool); ok {
+		params.Resume = v
+	}
+	// objective 为 JSON 对象时, 显式键缺的从这里补 (不覆盖已显式给出的)。
+	if obj, _ := payload["objective"].(string); strings.HasPrefix(strings.TrimSpace(obj), "{") {
+		var overlay map[string]interface{}
+		if json.Unmarshal([]byte(obj), &overlay) == nil {
+			if params.Epochs == 1 {
+				num2 := func(key string, dst *int) {
+					if v, ok := overlay[key]; ok {
+						if f, ok := v.(float64); ok {
+							*dst = int(f)
+						}
+					}
+				}
+				num2("epochs", &params.Epochs)
+				num2("k", &params.K)
+				num2("train", &params.TrainN)
+				if params.Model == "opencode:deepseek-v4.1-flash" {
+					if m, ok := overlay["model"].(string); ok && strings.TrimSpace(m) != "" {
+						params.Model = strings.TrimSpace(m)
+					}
+				}
+			}
+		}
+	}
+
+	mgr := sharedHarnessEvoManager(s.cfg.StateDir)
+	run, err := mgr.start(params)
+	if err != nil {
+		writeError(w, http.StatusConflict, fmt.Errorf("%v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, actionResp{
+		OK:      true,
+		Message: fmt.Sprintf("harness-evo 进化运行已启动 (%s)", run.ID),
+		Hint: fmt.Sprintf("epochs=%d k=%d train=%d model=%s workdir=%s",
+			run.Params.Epochs, run.Params.K, run.Params.TrainN, run.Params.Model, run.Workdir),
+		RunID: run.ID,
+	})
+}
+
 // drainQueuedAction 让消费方立刻消费一轮, 并回读该动作文件拿到真实结果。
 //
 // 为什么回读文件而不是信 ConsumeActions 的统计: 统计是聚合值, 同一轮可能消费了别人
@@ -1328,6 +1409,17 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 		if body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024)); err == nil && len(body) > 0 {
 			_ = json.Unmarshal(body, &payload)
+		}
+	}
+
+	// harness-evo 是**专用进化引擎运行时** (pkg/harnesspro 编排器 + pkg/graph DAG),
+	// 不是 agent 团队舞台 —— workflow=harness-evo 的 team.create 在这里就地转译成
+	// 进化运行触发, 绝不落团队队列 (否则消费方会按装饰性 stages 起一个假进化团队)。
+	// webapp 因此与普通工作流共用一条 team/create 触发路径, 从 runId 认出进化运行。
+	if kind == "team" && action == "create" {
+		if wf, _ := payload["workflow"].(string); wf == "harness-evo" {
+			s.handleHarnessEvoActionCreate(w, payload)
+			return
 		}
 	}
 
