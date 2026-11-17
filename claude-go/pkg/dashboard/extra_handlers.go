@@ -1314,6 +1314,18 @@ func (s *Server) handleHarnessEvoActionCreate(w http.ResponseWriter, payload map
 	if v, ok := payload["resume"].(bool); ok {
 		params.Resume = v
 	}
+	// 自定义任务池 / 基座 harness (webapp 表单 JSON 模式携带; 数组经 JSON round-trip 解析)。
+	if v, ok := payload["pool"]; ok && v != nil {
+		pool, err := parseHarnessEvoPool(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		params.Pool = pool
+	}
+	if v, _ := payload["h0"].(string); strings.TrimSpace(v) != "" {
+		params.H0 = strings.TrimSpace(v)
+	}
 	// objective 为 JSON 对象时, 显式键缺的从这里补 (不覆盖已显式给出的)。
 	if obj, _ := payload["objective"].(string); strings.HasPrefix(strings.TrimSpace(obj), "{") {
 		var overlay map[string]interface{}
@@ -1334,6 +1346,22 @@ func (s *Server) handleHarnessEvoActionCreate(w http.ResponseWriter, payload map
 						params.Model = strings.TrimSpace(m)
 					}
 				}
+			}
+		}
+		// pool/h0: 显式 payload 键未给才从 objective JSON 补 (不受默认档守卫影响)。
+		if params.Pool == nil {
+			if v, ok := overlay["pool"]; ok && v != nil {
+				pool, err := parseHarnessEvoPool(v)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, err)
+					return
+				}
+				params.Pool = pool
+			}
+		}
+		if params.H0 == "" {
+			if h, ok := overlay["h0"].(string); ok && strings.TrimSpace(h) != "" {
+				params.H0 = strings.TrimSpace(h)
 			}
 		}
 	}

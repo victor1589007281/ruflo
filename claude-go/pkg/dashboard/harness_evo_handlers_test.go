@@ -165,3 +165,40 @@ func TestHarnessEvoListFiles(t *testing.T) {
 		}
 	}
 }
+
+// TestParseHarnessEvoPool 自定义任务池解析: 合法数组 round-trip 成 Task,
+// 缺 id/prompt/重复 id/少于 2 题全部拒绝。
+func TestParseHarnessEvoPool(t *testing.T) {
+	good := []any{
+		map[string]any{"id": "t1", "category": "text", "difficulty": 0.3, "prompt": "做题一"},
+		map[string]any{"id": "t2", "prompt": "做题二"},
+	}
+	pool, err := parseHarnessEvoPool(good)
+	if err != nil || len(pool) != 2 || pool[0].ID != "t1" || pool[1].Prompt != "做题二" {
+		t.Fatalf("合法 pool 应解析成功, got pool=%+v err=%v", pool, err)
+	}
+	if pool[0].Difficulty != 0.3 {
+		t.Fatalf("difficulty 应保留, got %v", pool[0].Difficulty)
+	}
+
+	bad := []any{
+		map[string]any{"prompt": "缺 id"},
+		map[string]any{"id": "t1", "prompt": "p"},
+	}
+	if _, err := parseHarnessEvoPool(bad); err == nil {
+		t.Fatal("缺 id 的题应被拒绝")
+	}
+	if _, err := parseHarnessEvoPool(good[:1]); err == nil {
+		t.Fatal("少于 2 题应被拒绝 (训练/验证切不开)")
+	}
+	dup := []any{
+		map[string]any{"id": "t1", "prompt": "a"},
+		map[string]any{"id": "t1", "prompt": "b"},
+	}
+	if _, err := parseHarnessEvoPool(dup); err == nil {
+		t.Fatal("重复 id 应被拒绝")
+	}
+	if err := validateHarnessEvoPool(nil); err != nil {
+		t.Fatalf("nil pool = 内置池, 不应报错: %v", err)
+	}
+}

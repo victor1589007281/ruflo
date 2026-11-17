@@ -71,7 +71,7 @@ func harnessEvoTasksCmd() *cobra.Command {
 // harnessEvoRunCmd 跑一次完整进化。
 func harnessEvoRunCmd() *cobra.Command {
 	var epochs, k, trainN, timeoutMin, maxPar int
-	var workdir, tiersArg string
+	var workdir, tiersArg, poolFile, h0File string
 	var jsonOut, resume bool
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -85,6 +85,22 @@ func harnessEvoRunCmd() *cobra.Command {
 			cfg := harnesspro.Config{
 				Epochs: epochs, K: k, TrainN: trainN,
 				Workdir: workdir, Resume: resume, MaxParallel: maxPar,
+			}
+			if poolFile != "" {
+				pool, err := loadPoolFile(poolFile)
+				if err != nil {
+					return err
+				}
+				cfg.Pool = pool
+				notify(fmt.Sprintf("自定义任务池: %d 题 (%s)", len(pool), poolFile))
+			}
+			if h0File != "" {
+				b, err := os.ReadFile(h0File)
+				if err != nil {
+					return fmt.Errorf("读 h0 文件失败: %w", err)
+				}
+				cfg.H0 = string(b)
+				notify(fmt.Sprintf("自定义 h0: %s (%d 字)", h0File, len(cfg.H0)))
 			}
 			if tiersArg != "" {
 				tiers, err := parseTiers(tiersArg)
@@ -123,6 +139,8 @@ func harnessEvoRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&workdir, "workdir", "", "运行目录 (git 工作区+journal+报告; 默认 ~/.claude-go/harnesspro/<ts>)")
 	cmd.Flags().StringVar(&tiersArg, "tiers", "", "三档权重, 形如 lite:1,3|medium:1,1|heavy:3,1")
 	cmd.Flags().BoolVar(&resume, "resume", false, "从 journal 续跑 (已完成节点吃缓存)")
+	cmd.Flags().StringVar(&poolFile, "pool", "", "自定义任务池 JSON 文件 ([{id,category,difficulty,prompt,...}...]; 空 = 内置 12 题)")
+	cmd.Flags().StringVar(&h0File, "h0", "", "自定义基座 harness 指令文件 (空 = 内置 H0)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "结构化 JSON 输出 (stdout 仅 JSON)")
 	return cmd
 }
@@ -187,4 +205,34 @@ func complementTaskIDs(pool []harnesspro.Task, train []harnesspro.Task) []string
 		}
 	}
 	return out
+}
+
+// loadPoolFile 读自定义任务池 JSON 文件。结构与内置池同构 (见 harnesspro.Task);
+// 校验复用 dashboard 侧同款规则: 至少 2 题、id 唯一、prompt 非空。
+func loadPoolFile(path string) ([]harnesspro.Task, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读任务池文件失败: %w", err)
+	}
+	var pool []harnesspro.Task
+	if err := json.Unmarshal(b, &pool); err != nil {
+		return nil, fmt.Errorf("任务池 JSON 结构错误 (应为 [{\"id\":...,\"prompt\":...}...]): %w", err)
+	}
+	if len(pool) < 2 {
+		return nil, fmt.Errorf("任务池至少 2 题 (训练/验证需要切分), got %d", len(pool))
+	}
+	seen := map[string]bool{}
+	for i, t := range pool {
+		if strings.TrimSpace(t.ID) == "" {
+			return nil, fmt.Errorf("pool[%d] 缺 id", i)
+		}
+		if seen[t.ID] {
+			return nil, fmt.Errorf("pool 题 id 重复: %q", t.ID)
+		}
+		seen[t.ID] = true
+		if strings.TrimSpace(t.Prompt) == "" {
+			return nil, fmt.Errorf("pool[%d] (%s) 缺 prompt —— 任务描述是契约的唯一来源", i, t.ID)
+		}
+	}
+	return pool, nil
 }

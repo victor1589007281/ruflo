@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,7 @@ type Config struct {
 	K           int          // 训练集 rollout 重跑次数 (论文 k=3)
 	TrainN      int          // 训练集规模 (论文 10 题)
 	Pool        []Task       // 任务池 (nil = DefaultPool)
+	H0          string       // 基座 harness 指令 (空 = 内置 H0Instructions)
 	Tiers       []TierWeight // 三档权重 (nil = DefaultTiers)
 	Workdir     string       // 运行目录 (git 工作区 + journal + 报告); 空 = 内存态 (测试)
 	Resume      bool         // 从 journal 续跑
@@ -121,7 +123,11 @@ func (o *Orchestrator) Run(ctx context.Context, notify func(string)) (*Evolution
 	o.notify(notify, "选题: 训练 %d 题 (%v), 验证 %d 题 (%v)", len(trainIDs), trainIDs, len(validIDs), validIDs)
 
 	// —— 阶段 0.2: 注册 h0 ——
-	h0 := Harness{ID: "h0", Instructions: H0Instructions(), Origin: "h0", Epoch: 0}
+	h0Instr := cfg.H0
+	if strings.TrimSpace(h0Instr) == "" {
+		h0Instr = H0Instructions()
+	}
+	h0 := Harness{ID: "h0", Instructions: h0Instr, Origin: "h0", Epoch: 0}
 	o.store.RegisterHarness(h0)
 	if err := o.commitHarnessFile(h0, "h0 baseline harness"); err != nil {
 		o.notify(notify, "h0 落盘失败 (继续): %v", err)

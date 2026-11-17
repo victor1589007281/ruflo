@@ -44,14 +44,16 @@ import (
 
 // harnessEvoParams 一次进化运行的可调参数 (全部可选, 零值 = 默认值)。
 type harnessEvoParams struct {
-	Model       string `json:"model,omitempty"`        // 模型别名 (如 opencode:deepseek-v4.1-flash); 空 = 配置默认
-	Epochs      int    `json:"epochs,omitempty"`       // 进化轮次 T (默认 2; 论文 3-4)
-	K           int    `json:"k,omitempty"`            // 训练集 rollout 重跑次数 (默认 3)
-	TrainN      int    `json:"train,omitempty"`        // 训练集规模 (默认 10)
-	TimeoutMin  int    `json:"timeout_min,omitempty"`  // 总超时分钟 (默认 60)
-	MaxParallel int    `json:"max_parallel,omitempty"` // 图内并发上限 (默认 6)
-	Tiers       string `json:"tiers,omitempty"`        // 三档权重 lite:1,3|medium:1,1|heavy:3,1
-	Resume      bool   `json:"resume,omitempty"`       // 从 journal 续跑
+	Model       string            `json:"model,omitempty"`        // 模型别名 (如 opencode:deepseek-v4.1-flash); 空 = 配置默认
+	Epochs      int               `json:"epochs,omitempty"`       // 进化轮次 T (默认 2; 论文 3-4)
+	K           int               `json:"k,omitempty"`            // 训练集 rollout 重跑次数 (默认 3)
+	TrainN      int               `json:"train,omitempty"`        // 训练集规模 (默认 10)
+	TimeoutMin  int               `json:"timeout_min,omitempty"`  // 总超时分钟 (默认 60)
+	MaxParallel int               `json:"max_parallel,omitempty"` // 图内并发上限 (默认 6)
+	Tiers       string            `json:"tiers,omitempty"`        // 三档权重 lite:1,3|medium:1,1|heavy:3,1
+	Resume      bool              `json:"resume,omitempty"`       // 从 journal 续跑
+	Pool        []harnesspro.Task `json:"pool,omitempty"`         // 自定义任务池 (空 = 内置 12 题)
+	H0          string            `json:"h0,omitempty"`           // 自定义基座 harness 指令 (空 = 内置)
 }
 
 // normalize 缺省补齐 (与 CLI 旗标默认一致; webapp 触发时传冒烟档)。
@@ -218,6 +220,9 @@ func (m *harnessEvoManager) start(params harnessEvoParams) (*harnessEvoRun, erro
 		return nil, fmt.Errorf("已有进化运行进行中 (%s, stage=%s), 请等待完成或先停止", act.ID, act.Stage)
 	}
 	params = params.normalize()
+	if err := validateHarnessEvoPool(params.Pool); err != nil {
+		return nil, err
+	}
 	id := fmt.Sprintf("evo-%d-%04d", time.Now().Unix(), time.Now().Nanosecond()%10000)
 	workdir := filepath.Join(m.root, id, "wd")
 	r := &harnessEvoRun{
@@ -266,6 +271,12 @@ func (m *harnessEvoManager) run(ctx context.Context, r *harnessEvoRun) {
 	cfg := harnesspro.Config{
 		Epochs: r.Params.Epochs, K: r.Params.K, TrainN: r.Params.TrainN,
 		Workdir: r.Workdir, Resume: r.Params.Resume, MaxParallel: r.Params.MaxParallel,
+	}
+	if len(r.Params.Pool) > 0 {
+		cfg.Pool = r.Params.Pool
+	}
+	if strings.TrimSpace(r.Params.H0) != "" {
+		cfg.H0 = r.Params.H0
 	}
 	if r.Params.Tiers != "" {
 		tiers, err := parseHarnessEvoTiers(r.Params.Tiers)
@@ -455,6 +466,48 @@ func harnessEvoClientFromResolved(resolved modelconfig.ResolvedConfig) *api.Clie
 	c.Guard = api.NewRateLimitGuard(guardCfg)
 	c.Tag = "harness-evo"
 	return c
+}
+
+// parseHarnessEvoPool 把 JSON 解码出的任意值 (webapp payload / objective 里的
+// pool 数组) round-trip 成任务池。结构不合法给可读的 400 而不是静默忽略。
+func parseHarnessEvoPool(v any) ([]harnesspro.Task, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("pool 序列化失败: %v", err)
+	}
+	var pool []harnesspro.Task
+	if err := json.Unmarshal(b, &pool); err != nil {
+		return nil, fmt.Errorf("pool 结构错误 (应为 [{id,category,difficulty,prompt,...}...]): %v", err)
+	}
+	if err := validateHarnessEvoPool(pool); err != nil {
+		return nil, err
+	}
+	return pool, nil
+}
+
+// validateHarnessEvoPool 自定义任务池校验 (webapp JSON 表单 / 直连 API 都可能喂进来):
+// 每题必须有 id+prompt, id 唯一, 规模至少 2 题 (否则训练/验证切不开)。
+func validateHarnessEvoPool(pool []harnesspro.Task) error {
+	if len(pool) == 0 {
+		return nil // 空 = 用内置池
+	}
+	if len(pool) < 2 {
+		return fmt.Errorf("自定义任务池至少 2 题 (训练/验证需要切分), got %d", len(pool))
+	}
+	seen := map[string]bool{}
+	for i, t := range pool {
+		if strings.TrimSpace(t.ID) == "" {
+			return fmt.Errorf("pool[%d] 缺 id", i)
+		}
+		if seen[t.ID] {
+			return fmt.Errorf("pool 题 id 重复: %q", t.ID)
+		}
+		seen[t.ID] = true
+		if strings.TrimSpace(t.Prompt) == "" {
+			return fmt.Errorf("pool[%d] (%s) 缺 prompt —— 任务描述是契约的唯一来源", i, t.ID)
+		}
+	}
+	return nil
 }
 
 // parseHarnessEvoTiers 解析三档权重 (形如 lite:1,3|medium:1,1|heavy:3,1)。
