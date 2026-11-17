@@ -6,6 +6,8 @@ package dashboard
 //	GET  /api/harness-evo/runs              列出运行 (新→旧)
 //	GET  /api/harness-evo/runs/{id}         运行详情 (状态/进度/事件流/报告)
 //	POST /api/harness-evo/runs/{id}/stop    停止运行 (取消 ctx)
+//	GET  /api/harness-evo/runs/{id}/files            产物清单 (workdir 文件树 + git log)
+//	GET  /api/harness-evo/runs/{id}/files?path=<rel> 单个产物内容 (文本直出/二进制 base64)
 //
 // 运行在本进程 (control :18080) 内**进程内**执行 pkg/harnesspro 编排器 ——
 // 与 `claude-go harness-evo run` CLI 同一引擎, 但事件流/进度/报告经本控制面
@@ -20,10 +22,12 @@ package dashboard
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -547,9 +551,159 @@ func (s *Server) handleHarnessEvoRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "events": fresh, "status": run.Status})
 		return
 	}
+	if len(parts) == 2 && parts[1] == "files" {
+		// 产物直查: workdir 文件树 / 单文件内容。webapp 详情页"进化产物"面板的数据源。
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("GET required"))
+			return
+		}
+		s.handleHarnessEvoFiles(w, r, run)
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("GET required"))
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+// ─── 产物直查 ──────────────────────────────────────────────────────────────────
+
+// harnessEvoFileEntry 产物清单里的一条 (workdir 内相对路径)。
+type harnessEvoFileEntry struct {
+	Path string `json:"path"`         // 相对 workdir 的路径 (POSIX 分隔)
+	Size int64  `json:"size"`         // 字节数
+	Bin  bool   `json:"binary,omitempty"` // 首 8KB 含 NUL → 前端不内联渲染
+}
+
+// handleHarnessEvoFiles GET /api/harness-evo/runs/{id}/files[?path=<rel>]。
+// 不带 path: 递归列 workdir 文件 (跳过 .git 内部) + git log --oneline;
+// 带 path: 返回单个文件内容 (≤512KB, 文本/ base64)。
+func (s *Server) handleHarnessEvoFiles(w http.ResponseWriter, r *http.Request, run *harnessEvoRun) {
+	rel := r.URL.Query().Get("path")
+	if rel != "" {
+		s.writeHarnessEvoFileContent(w, run, rel)
+		return
+	}
+
+	entries, err := harnessEvoListFiles(run.Workdir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":       run.ID,
+		"workdir":  run.Workdir,
+		"files":    entries,
+		"git_log":  harnessEvoGitLog(run.Workdir),
+	})
+}
+
+// harnessEvoSafeJoin workdir 内的路径拼接 + 越界防护 (拒绝绝对路径与 .. 逃逸)。
+func harnessEvoSafeJoin(workdir, rel string) (string, error) {
+	if strings.ContainsRune(rel, '\\') || strings.HasPrefix(rel, "/") {
+		return "", fmt.Errorf("非法路径: %q", rel)
+	}
+	full := filepath.Join(workdir, filepath.Clean(rel))
+	if full != workdir && !strings.HasPrefix(full, workdir+string(os.PathSeparator)) {
+		return "", fmt.Errorf("路径越界: %q", rel)
+	}
+	return full, nil
+}
+
+// harnessEvoIsBinary 首 8KB 含 NUL 即视为二进制 (journal.jsonl 等都是文本)。
+func harnessEvoIsBinary(b []byte) bool {
+	const sniff = 8192
+	if len(b) > sniff {
+		b = b[:sniff]
+	}
+	return strings.IndexByte(string(b), 0) >= 0
+}
+
+// harnessEvoListFiles 递归列 workdir 文件 (跳过 .git 内部), 按路径排序, 封顶 500。
+func harnessEvoListFiles(workdir string) ([]harnessEvoFileEntry, error) {
+	var out []harnessEvoFileEntry
+	err := filepath.WalkDir(workdir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // 权限/瞬删的文件跳过, 不让单点失败拖垮整单
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(workdir, path)
+		if err != nil {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		full, err := os.ReadFile(path) // 产物都小 (report.json ~8K, journal ~120K), 直接嗅探
+		bin := err == nil && harnessEvoIsBinary(full)
+		out = append(out, harnessEvoFileEntry{
+			Path: filepath.ToSlash(rel),
+			Size: info.Size(),
+			Bin:  bin,
+		})
+		if len(out) >= 500 {
+			return fmt.Errorf("stop")
+		}
+		return nil
+	})
+	if err != nil && err.Error() != "stop" {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
+}
+
+// harnessEvoGitLog workdir 的候选提交历史 (每候选一个 commit 是论文形态的核心产物)。
+func harnessEvoGitLog(workdir string) string {
+	if _, err := os.Stat(filepath.Join(workdir, ".git")); err != nil {
+		return ""
+	}
+	out, err := exec.Command("git", "-C", workdir, "log", "--oneline", "--decorate", "-n", "50").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+// writeHarnessEvoFileContent 单文件内容: ≤512KB, 文本直出 / 二进制 base64。
+func (s *Server) writeHarnessEvoFileContent(w http.ResponseWriter, run *harnessEvoRun, rel string) {
+	full, err := harnessEvoSafeJoin(run.Workdir, rel)
+	if err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	info, err := os.Stat(full)
+	if err != nil || info.IsDir() {
+		writeError(w, http.StatusNotFound, fmt.Errorf("产物不存在: %q", rel))
+		return
+	}
+	const cap = 512 * 1024
+	b, err := os.ReadFile(full)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	truncated := false
+	if len(b) > cap {
+		b = b[:cap]
+		truncated = true
+	}
+	resp := map[string]any{
+		"path": rel, "size": info.Size(), "truncated": truncated,
+	}
+	if harnessEvoIsBinary(b) {
+		resp["encoding"] = "base64"
+		resp["content"] = base64.StdEncoding.EncodeToString(b)
+	} else {
+		resp["encoding"] = "text"
+		resp["content"] = string(b)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

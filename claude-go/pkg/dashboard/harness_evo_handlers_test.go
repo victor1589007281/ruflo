@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -88,5 +89,79 @@ func TestHarnessEvoManagerLoadMarksInterruptedRuns(t *testing.T) {
 	}
 	if m.runs["evo-old-done"].Status != "completed" {
 		t.Fatalf("completed 运行不应被改写, got %q", m.runs["evo-old-done"].Status)
+	}
+}
+
+// TestHarnessEvoSafeJoin 产物路径越界防护: .. 逃逸 / 绝对路径 / 反斜杠全拒,
+// workdir 内的正常相对路径放行。
+func TestHarnessEvoSafeJoin(t *testing.T) {
+	wd := filepath.Join(t.TempDir(), "wd")
+	cases := []struct {
+		rel  string
+		want bool // true = 放行
+	}{
+		{"report.json", true},
+		{"harnesses/h0/instructions.md", true},
+		{"journal/epoch-1/journal.jsonl", true},
+		{"../status.json", false},
+		{"harnesses/../../status.json", false},
+		{"/etc/passwd", false},
+		{"..", false},
+		{`..\status.json`, false},
+	}
+	for _, c := range cases {
+		full, err := harnessEvoSafeJoin(wd, c.rel)
+		if c.want {
+			if err != nil {
+				t.Fatalf("%q 应放行, got %v", c.rel, err)
+			}
+			if !strings.HasPrefix(full, wd+string(os.PathSeparator)) {
+				t.Fatalf("%q 拼出越界路径 %q", c.rel, full)
+			}
+		} else if err == nil {
+			t.Fatalf("%q 应被拒绝, got %q", c.rel, full)
+		}
+	}
+}
+
+// TestHarnessEvoListFiles 产物清单: 递归列出 workdir 文件, .git 内部跳过,
+// 结果按路径排序。
+func TestHarnessEvoListFiles(t *testing.T) {
+	wd := t.TempDir()
+	mk := func(rel, body string) {
+		t.Helper()
+		p := filepath.Join(wd, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("report.json", "{}")
+	mk("harnesses/h0/instructions.md", "# h0")
+	mk("journal/epoch-1/journal.jsonl", "{}\n")
+	mk(".git/refs/heads/main", "fake-git-internal")
+	mk(".gitignore", "wd")
+
+	entries, err := harnessEvoListFiles(wd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, e := range entries {
+		paths = append(paths, e.Path)
+	}
+	joined := strings.Join(paths, ",")
+	if strings.Contains(joined, ".git/") {
+		t.Fatalf(".git 内部文件不应出现: %v", paths)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("应列出 4 个文件 (.git 内部被跳过), got %d: %v", len(entries), paths)
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i-1].Path >= entries[i].Path {
+			t.Fatalf("清单未按路径排序: %v", paths)
+		}
 	}
 }
