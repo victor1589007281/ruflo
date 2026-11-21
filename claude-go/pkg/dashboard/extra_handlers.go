@@ -37,6 +37,24 @@ type workflowStageDTO struct {
 	// 在编辑表单里显示, PUT 回它才能保住 —— 只做单向会让"打开编辑器 → 保存"这条
 	// 最普通的动作把工具声明静默抹掉, 而用户在界面上看不到任何差别。
 	Tools *agent.StageTools `json:"tools,omitempty"`
+
+	// ─── 运行时设置 (21.11.21): 与 StageDef 同名字段逐字对应, 详情面板据此渲染 ───
+	//
+	// 为什么现在才补: StageDef 早已支持 Model/Hooks/Skills/Kind/Deterministic,
+	// 但这份 DTO 一直不搬 —— 工作流详情页因此只能显示 name/role/prompt, "这个阶段
+	// 用哪个模型、挂了哪些 hook"在看板上完全不可见。CREATE/UPDATE 路径解码的
+	// 是 agent.WorkflowDef 本体 (这些字段一直在), 所以只需补 GET 方向即可双向。
+
+	// Model 本阶段的模型覆盖 (空=按 plan/agent 层级解析)。
+	Model string `json:"model,omitempty"`
+	// Hooks 本阶段额外挂的 hook 声明 (<event>:<type>:<target>[:<if>])。
+	Hooks []string `json:"hooks,omitempty"`
+	// Skills 本阶段额外声明的技能名。
+	Skills []string `json:"skills,omitempty"`
+	// Kind 强制节点形态 ""|"agent"|"gate"|"map"|"reduce"。
+	Kind string `json:"kind,omitempty"`
+	// Deterministic 本节点为纯代码判定 (gate 走确定性分支, 零 LLM)。
+	Deterministic bool `json:"deterministic,omitempty"`
 }
 
 type workflowDefDTO struct {
@@ -536,6 +554,13 @@ func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
 			DependsOn: append([]string(nil), st.DependsOn...),
 			Parallel:  st.Parallel,
 			Tools:     cloneStageTools(st.Tools), // 深拷贝: StageTools 里有指针与切片
+			// 运行时设置: 切片深拷贝, 理由与 cloneStageTools 相同 (DTO 与注册表共享
+			// 底层数组时, 调用方就地修改会改坏注册表里的定义)。
+			Model:         st.Model,
+			Hooks:         append([]string(nil), st.Hooks...),
+			Skills:        append([]string(nil), st.Skills...),
+			Kind:          st.Kind,
+			Deterministic: st.Deterministic,
 		})
 	}
 	return dto
@@ -1455,6 +1480,14 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	if kind == "team" && action == "create" {
 		if wf, _ := payload["workflow"].(string); wf == "harness-evo" {
 			s.handleHarnessEvoActionCreate(w, payload)
+			return
+		}
+		// repo-cartographer 的真实运行时是 webapp 后端在**宿主侧** spawn 资产
+		// bin/run_agent.py (k8s pod 摸不到宿主只读 checkout), 不存在于 dashboard
+		// 进程内。这里拒落团队队列 —— 否则会按装饰性 stages (gate 节点) 起一个
+		// 假制图团队, 而且图执行器的 gate 根本没有"执行外部命令"的能力。
+		if wf, _ := payload["workflow"].(string); wf == "repo-cartographer" {
+			writeError(w, http.StatusConflict, fmt.Errorf("repo-cartographer 由 webapp 宿主侧专用运行时执行 (POST /api/workflows/run), 不经团队队列"))
 			return
 		}
 	}
