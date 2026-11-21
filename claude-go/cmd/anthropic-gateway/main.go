@@ -60,6 +60,18 @@ func resolveWatchPath(p string) string {
 // 会误掐 (502 context deadline exceeded)。per-model max_tokens 仍自限生成长度。
 var upstreamTimeout = flag.Duration("upstream-timeout", 30*time.Minute, "翻译路径单次上游调用上限 (omen 长推理需 >10min)")
 
+// firstByteTimeout 流式透传等待上游**首字节**的上限 (从收到请求算起, 含等响应头)。
+// 上游沉默超过它时, 网关在写任何响应头/字节之前回 504 upstream_first_byte_timeout,
+// 让 claude 自己重试或报错 —— 而不是把请求无限挂在那里, 逼会话看门狗从"本地无活动"
+// 去猜是不是卡死 (2026-11-18 13:37 的 deepseek-v4.1-flash 事故就是后者: 上游 3m35s
+// 无任何字节, 看门狗探活无本地证据 → SIGKILL, 用户只看到 code=null)。
+//
+// 只在 passthrough 流式路径生效; **不要**加到 proxyOpenAIFormat: omen-alpha 等长
+// 推理模型首 token 可达 7min+, 那条路径由 --upstream-timeout 兜底。
+// 模型级 firstTokenTimeoutSec 优先 (与 claude-go CLI 的 Client.FirstTokenTimeout 同口径)。
+// 0 = 关闭。
+var firstByteTimeout = flag.Duration("first-byte-timeout", 150*time.Second, "流式透传等待上游首字节上限 (0=关闭; 模型级 firstTokenTimeoutSec 优先)")
+
 // main 解析旗标、加载 config 并起热加载监视器, 构建模型解析器后注册全部路由并监听。
 // 每条路由都同时注册 /v1/* 与裸路径: 部署里的 pathfix 只改写其中一部分, 直挂本进程的
 // 实例 (无 pathfix) 靠裸注册兜底, 否则会裸 404。
@@ -613,6 +625,52 @@ func (g *gateway) streamMessages(ctx context.Context, w http.ResponseWriter, cli
 	}
 }
 
+// requestWantsStream 只看入站请求体的 stream 字段。解析失败按非流式处理 ——
+// 非流式没有"首字节"语义 (客户端要整包), 由 http.Client.Timeout 兜底。
+func requestWantsStream(body []byte) bool {
+	var probe struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &probe) == nil && probe.Stream
+}
+
+// firstByteBudget 本次请求的首字节预算。模型级 firstTokenTimeoutSec 优先, 否则用
+// 旗标默认值; 非正值表示关闭 (返回 0)。
+func firstByteBudget(rc modelconfig.ResolvedConfig) time.Duration {
+	if rc.FirstTokenTimeoutSec > 0 {
+		return time.Duration(rc.FirstTokenTimeoutSec) * time.Second
+	}
+	if *firstByteTimeout <= 0 {
+		return 0
+	}
+	return *firstByteTimeout
+}
+
+// readFirstChunk 在 budget 内读到第一块响应体 (或 EOF)。Read 本身不响应 timer,
+// 所以读放独立 goroutine; 超时先关 body 再返回 —— 关闭会让阻塞的 Read 立刻出错,
+// goroutine 把结果投进带缓冲的 channel 后退出, 不泄漏。buf 只在成功分支被读取,
+// channel 接收提供 happens-before, 无数据竞争。
+func readFirstChunk(body io.ReadCloser, buf []byte, budget time.Duration) (n int, err error, timedOut bool) {
+	type chunk struct {
+		n   int
+		err error
+	}
+	ch := make(chan chunk, 1)
+	go func() {
+		n, err := body.Read(buf)
+		ch <- chunk{n, err}
+	}()
+	t := time.NewTimer(budget)
+	defer t.Stop()
+	select {
+	case c := <-ch:
+		return c.n, c.err, false
+	case <-t.C:
+		_ = body.Close()
+		return 0, nil, true
+	}
+}
+
 // proxyPassthrough anthropic 协议模型原样转发上游 /v1/messages, 响应逐字节回传
 // (流式/非流式都保持上游原样, 不重编码)。唯一改写: model 字段剥掉 provider 前缀
 // (opencode 上游只认裸 ID, "opencode:minimax-m3" 会被拒 401 ModelError)。
@@ -632,11 +690,27 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 		}
 	}
 
+	// 首字节闸门 (仅流式, 见 firstByteTimeout 注释): 从收到请求开始计时, 跑在
+	// 一个可取消子 ctx 上 —— 预算耗尽就取消上游请求, DoWithRetry 立刻收尾。
+	streaming := requestWantsStream(body)
+	budget := firstByteBudget(rc)
+	started := time.Now()
+	ctx := r.Context()
+	var (
+		cancelWake context.CancelFunc
+		fbTimer    *time.Timer
+	)
+	if streaming && budget > 0 {
+		ctx, cancelWake = context.WithCancel(r.Context())
+		defer cancelWake()
+		fbTimer = time.AfterFunc(budget, cancelWake)
+	}
+
 	// 重试必须发生在**写任何响应头/字节之前**: 一旦开始回传 2xx 流就不能再重试。
 	// build 每次重建 request + body reader —— http.Request 的 Body 是一次性的。
 	policy := api.RetryPolicyFromConfig(rc.RetryCount, rc.RetryBaseSec, rc.RetryMaxSec, rc.RetryStatuses)
 	build := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(forwardBody))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream, bytes.NewReader(forwardBody))
 		if err != nil {
 			return nil, err
 		}
@@ -662,12 +736,27 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 		}
 		return req, nil
 	}
-	resp, attempts, err := api.DoWithRetry(r.Context(), client, policy, build)
+
+	resp, attempts, err := api.DoWithRetry(ctx, client, policy, build)
+	fbExpired := false
+	if fbTimer != nil && !fbTimer.Stop() {
+		// 定时器已触发 (或正在触发): 头还没到就已超预算, 视为首字节超时。
+		fbExpired = true
+	}
 	if err != nil {
 		// ctx 取消: 客户端已经放弃, 不能再写第二次响应 (写了也无人接收, 且会
 		// 在测试里表现为"取消后仍有一份 502 body")。
 		if r.Context().Err() != nil {
 			log.Printf("[anthropic-gateway] passthrough 已取消 (attempts=%d): %v", attempts, err)
+			return
+		}
+		// 首字节预算耗尽 (我们的 cancelWake 触发的 ctx 取消) → 504 + 明确的错误帧,
+		// 与真正的上游故障 (502) 区分开: 前者可重试, 后者才是链路坏了。
+		if fbExpired || ctx.Err() != nil {
+			log.Printf("[anthropic-gateway] passthrough 首字节超时 (预算=%s, attempts=%d): upstream=%s model=%s",
+				budget, attempts, upstream, rc.ProviderName)
+			writeError(w, http.StatusGatewayTimeout, "upstream_first_byte_timeout",
+				fmt.Sprintf("上游 %s 在 %s 内未返回任何字节 (model=%s)；可重试", upstream, budget, rc.ProviderName))
 			return
 		}
 		writeError(w, 502, "upstream_error", err.Error())
@@ -676,15 +765,56 @@ func (g *gateway) proxyPassthrough(w http.ResponseWriter, r *http.Request, body 
 	defer resp.Body.Close()
 	log.Printf("[anthropic-gateway] passthrough 最终 status=%d attempts=%d", resp.StatusCode, attempts)
 
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 16*1024)
+
+	// 首块必须在写响应头之前拿到: 一旦写了 200, 超时只能表现成"流被掐断", claude
+	// 侧看到的是异常结束而不是一条可重试的错误。预算按**总时长**算 (等头 + 等首块),
+	// 否则两段各给一份预算, 实际沉默上限翻倍。
+	var pending []byte
+	var pendingErr error
+	if streaming && budget > 0 && resp.StatusCode < 400 {
+		remaining := budget - time.Since(started)
+		if fbExpired || remaining <= 0 {
+			log.Printf("[anthropic-gateway] passthrough 首字节超时 (预算=%s, 头已到但无正文, attempts=%d): upstream=%s model=%s",
+				budget, attempts, upstream, rc.ProviderName)
+			writeError(w, http.StatusGatewayTimeout, "upstream_first_byte_timeout",
+				fmt.Sprintf("上游 %s 在 %s 内未返回响应正文 (model=%s)；可重试", upstream, budget, rc.ProviderName))
+			return
+		}
+		n, rerr, timedOut := readFirstChunk(resp.Body, buf, remaining)
+		if timedOut {
+			log.Printf("[anthropic-gateway] passthrough 首字节超时 (预算=%s, attempts=%d): upstream=%s model=%s",
+				budget, attempts, upstream, rc.ProviderName)
+			writeError(w, http.StatusGatewayTimeout, "upstream_first_byte_timeout",
+				fmt.Sprintf("上游 %s 在 %s 内未返回响应正文 (model=%s)；可重试", upstream, budget, rc.ProviderName))
+			return
+		}
+		pending, pendingErr = append([]byte(nil), buf[:n]...), rerr
+	}
+
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		io.Copy(w, resp.Body)
 		return
 	}
+	if len(pending) > 0 {
+		if _, werr := w.Write(pending); werr != nil {
+			log.Printf("[anthropic-gateway] passthrough 回传写入失败: %v", werr)
+			return
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	if pendingErr != nil {
+		if pendingErr != io.EOF {
+			log.Printf("[anthropic-gateway] passthrough 首块读取失败: %v", pendingErr)
+		}
+		return
+	}
 	// 流式回传: 逐块写 + flush, 保证 SSE 增量到达 claude CLI (整块 io.Copy 会让客户端等完整响应)。
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 16*1024)
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {

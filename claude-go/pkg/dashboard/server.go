@@ -328,7 +328,11 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	// 故不走 /api/teams 协议)。/runs 精确前缀优先于 /runs/ 前缀。
 	mux.HandleFunc("/api/harness-evo/runs", s.handleHarnessEvoRuns)
 	mux.HandleFunc("/api/harness-evo/runs/", s.handleHarnessEvoRun)
-	mux.HandleFunc("/api/roles", s.handleRoles)                         // 角色富信息 (DAG 节点面板 / Agents 展示页; 无 names 则列全部)
+	mux.HandleFunc("/api/harness-evo/tasksets", s.handleHarnessEvoTaskSets)
+	mux.HandleFunc("/api/harness-evo/tasksets/", s.handleHarnessEvoTaskSet)
+	mux.HandleFunc("/api/harness-evo/versions", s.handleHarnessEvoVersions)
+	mux.HandleFunc("/api/harness-evo/versions/", s.handleHarnessEvoVersion)
+	mux.HandleFunc("/api/roles", s.handleRoles) // 角色富信息 (DAG 节点面板 / Agents 展示页; 无 names 则列全部)
 	// agent **资产**的查看与创建。与上面那行是**两层不同的东西**: /api/roles 只列角色
 	// 注册表 (93 个内置人格, 只读), 这组管的是 <stateDir>/agents/*.md —— 优先级更高、
 	// 可声明字段更多的那一层。见 agent_handlers.go 的包注释。
@@ -358,7 +362,7 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	mux.HandleFunc("/api/logs/stream", s.handleLogsStream)
 	mux.HandleFunc("/api/logs/tail", s.handleLogsTail)
 	mux.HandleFunc("/api/hivemind", s.handleHiveMind)
-	mux.HandleFunc("/api/jev/stats", s.handleJevStats) // Jev 决策层可观测聚合 (agentDB decision JSONL)
+	mux.HandleFunc("/api/jev/stats", s.handleJevStats)     // Jev 决策层可观测聚合 (agentDB decision JSONL)
 	mux.HandleFunc("/api/timeseries/", s.handleTimeSeries) // /api/timeseries/:module/:metric
 	mux.HandleFunc("/api/actions/", s.handleAction)        // /api/actions/{kind}/{target}
 	mux.HandleFunc("/api/dreaming/diagnosis", s.handleDreamingDiagnosis)

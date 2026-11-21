@@ -104,21 +104,29 @@ type Harness struct {
 	ParentID     string `json:"parent_id,omitempty"`
 	Origin       string `json:"origin"` // "h0" | "epoch{e}:{parent}:{Ix}"
 	Epoch        int    `json:"epoch"`
+	// VersionID 唯一标识一次运行里的谱系节点; ContentID 只由指令内容决定,
+	// 用来跨运行认出"同一份指令"。二者必须一起进轨迹, 单看候选 ID 会跨 run 重名。
+	VersionID string `json:"version_id"`
+	ContentID string `json:"content_id"`
+	RunID     string `json:"run_id,omitempty"`
 }
 
 // RolloutResult 一次 "harness × 任务" 执行的机械统计 (论文 4.1: 不经过 LLM)。
 type RolloutResult struct {
-	CandidateID string  `json:"candidate_id"`
-	TaskID      string  `json:"task_id"`
-	K           int     `json:"k"`         // 第几次重跑
-	Pass        bool    `json:"pass"`      // 10 条冻结测试全过才算 pass (论文判据)
-	PassFrac    float64 `json:"pass_frac"` // 通过比例 (地板/帕累托用)
-	TokensIn    int     `json:"tokens_in"`
-	TokensOut   int     `json:"tokens_out"`
-	LatencyMS   int64   `json:"latency_ms"`
-	Output      string  `json:"output,omitempty"` // 截断存储, 供诊断引用
-	InfraError  bool    `json:"infra_error"`      // true = 无效样本 (不进入任何统计)
-	Error       string  `json:"error,omitempty"`
+	CandidateID string   `json:"candidate_id"`
+	VersionID   string   `json:"version_id"`
+	ContentID   string   `json:"content_id"`
+	TaskID      string   `json:"task_id"`
+	K           int      `json:"k"`                      // 第几次重跑
+	Pass        bool     `json:"pass"`                   // 冻结测试全过才算 pass (论文判据)
+	PassFrac    float64  `json:"pass_frac"`              // 通过比例 (地板/帕累托用)
+	FailedTests []string `json:"failed_tests,omitempty"` // test_id + 机械失败原因, 诊断与 journal 共用
+	TokensIn    int      `json:"tokens_in"`
+	TokensOut   int      `json:"tokens_out"`
+	LatencyMS   int64    `json:"latency_ms"`
+	Output      string   `json:"output,omitempty"` // 截断存储, 供诊断引用
+	InfraError  bool     `json:"infra_error"`      // true = 无效样本 (不进入任何统计)
+	Error       string   `json:"error,omitempty"`
 }
 
 // CandidateMetrics 一个候选在训练集上的汇总指标 (3 次 rollout 取均值)。
@@ -132,24 +140,32 @@ type CandidateMetrics struct {
 
 // EvalResult 验证集评测结果 (每候选每任务 1 次, 论文 Stage 3)。
 type EvalResult struct {
-	CandidateID string  `json:"candidate_id"`
-	TaskID      string  `json:"task_id"`
-	Pass        bool    `json:"pass"`
-	PassFrac    float64 `json:"pass_frac"`
-	TokensIn    int     `json:"tokens_in"`
-	TokensOut   int     `json:"tokens_out"`
-	LatencyMS   int64   `json:"latency_ms"`
-	InfraError  bool    `json:"infra_error"`
-	Error       string  `json:"error,omitempty"`
+	CandidateID string   `json:"candidate_id"`
+	VersionID   string   `json:"version_id"`
+	ContentID   string   `json:"content_id"`
+	TaskID      string   `json:"task_id"`
+	Pass        bool     `json:"pass"`
+	PassFrac    float64  `json:"pass_frac"`
+	FailedTests []string `json:"failed_tests,omitempty"`
+	TokensIn    int      `json:"tokens_in"`
+	TokensOut   int      `json:"tokens_out"`
+	LatencyMS   int64    `json:"latency_ms"`
+	Output      string   `json:"output,omitempty"`
+	InfraError  bool     `json:"infra_error"`
+	Error       string   `json:"error,omitempty"`
 }
 
-// CandidateEval 一个候选的验证集汇总 (选点输入)。
+// CandidateEval 一个候选的验证集汇总 (选点输入)。Details 保留每题与每条
+// 失败断言, 使报告能解释聚合分数, 而不是只留下无法复核的 pass_rate。
 type CandidateEval struct {
-	CandidateID string  `json:"candidate_id"`
-	PassRate    float64 `json:"pass_rate"` // 验证集 pass 比例 (非 infra_error 样本)
-	PassFrac    float64 `json:"pass_frac"` // 平均每题测试通过比例 (比 PassRate 更细粒度)
-	CostTokens  int64   `json:"cost_tokens"`
-	NEval       int     `json:"n_eval"`
+	CandidateID string       `json:"candidate_id"`
+	VersionID   string       `json:"version_id"`
+	ContentID   string       `json:"content_id"`
+	PassRate    float64      `json:"pass_rate"` // 验证集 pass 比例 (非 infra_error 样本)
+	PassFrac    float64      `json:"pass_frac"` // 平均每题测试通过比例 (比 PassRate 更细粒度)
+	CostTokens  int64        `json:"cost_tokens"`
+	NEval       int          `json:"n_eval"`
+	Details     []EvalResult `json:"details,omitempty"`
 }
 
 // TierWeight 三档选点权重 (论文 4.3; (α,β)=(1,3),(1,1),(3,1) 起步做敏感性检查)。
@@ -173,16 +189,18 @@ type SelectedSurvivor struct {
 	Tier        string  `json:"tier"`
 	J           float64 `json:"j"`
 	CandidateID string  `json:"candidate_id"`
+	VersionID   string  `json:"version_id"`
 }
 
 // SelectionReport 一轮选点的完整输出 (select 节点产出, orchestrator 据此组下一轮)。
 type SelectionReport struct {
 	Epoch     int                `json:"epoch"`
 	Floor     float64            `json:"floor"`
-	Evals     []CandidateEval    `json:"evals"`     // 全部候选的验证集指标 (含未晋级)
-	Frontier  []string           `json:"frontier"`  // 帕累托前沿上的候选 id
-	Filtered  []string           `json:"filtered"`  // 地板过滤出局的候选 id
-	Survivors []SelectedSurvivor `json:"survivors"` // 三档选点 (前沿重合时 <3)
+	Evals     []CandidateEval    `json:"evals"`              // 全部候选的验证集指标 (含未晋级)
+	Frontier  []string           `json:"frontier"`           // 帕累托前沿上的候选 id
+	Filtered  []string           `json:"filtered"`           // 地板过滤出局的候选 id
+	Survivors []SelectedSurvivor `json:"survivors"`          // 三档选点 (前沿重合时 <3)
+	Fallback  bool               `json:"fallback,omitempty"` // true = 全灭后的工程兜底, 不是正常晋级
 }
 
 // evalAssert 执行一条断言。输出清洗: 去首尾空白后判定。

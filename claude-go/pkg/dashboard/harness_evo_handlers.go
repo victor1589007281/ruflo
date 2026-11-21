@@ -52,7 +52,8 @@ type harnessEvoParams struct {
 	MaxParallel int               `json:"max_parallel,omitempty"` // 图内并发上限 (默认 6)
 	Tiers       string            `json:"tiers,omitempty"`        // 三档权重 lite:1,3|medium:1,1|heavy:3,1
 	Resume      bool              `json:"resume,omitempty"`       // 从 journal 续跑
-	Pool        []harnesspro.Task `json:"pool,omitempty"`         // 自定义任务池 (空 = 内置 12 题)
+	Pool        []harnesspro.Task `json:"pool,omitempty"`         // 自定义任务池 (空 = 内置 12 题; 与 taskset 互斥)
+	TaskSet     string            `json:"taskset,omitempty"`      // 已注册任务集 name[@version]
 	H0          string            `json:"h0,omitempty"`           // 自定义基座 harness 指令 (空 = 内置)
 }
 
@@ -93,6 +94,7 @@ type harnessEvoRun struct {
 	Progress    int                         `json:"progress"`
 	Events      []harnessEvoEvent           `json:"events"`
 	Report      *harnesspro.EvolutionReport `json:"report,omitempty"`
+	TaskSet     harnesspro.TaskSetRef       `json:"task_set"`
 	Error       string                      `json:"error,omitempty"`
 	Workdir     string                      `json:"workdir"`
 	StartedAt   int64                       `json:"started_at"`
@@ -169,6 +171,14 @@ func sharedHarnessEvoManager(stateDir string) *harnessEvoManager {
 	return evoMgr
 }
 
+func (m *harnessEvoManager) taskSetDir() string {
+	return filepath.Join(filepath.Dir(m.root), "tasksets")
+}
+
+func (m *harnessEvoManager) versionDir() string {
+	return filepath.Join(filepath.Dir(m.root), "versions")
+}
+
 // statusPath 运行的落盘状态文件。
 func (m *harnessEvoManager) statusPath(id string) string {
 	return filepath.Join(m.root, id, "status.json")
@@ -220,6 +230,19 @@ func (m *harnessEvoManager) start(params harnessEvoParams) (*harnessEvoRun, erro
 		return nil, fmt.Errorf("已有进化运行进行中 (%s, stage=%s), 请等待完成或先停止", act.ID, act.Stage)
 	}
 	params = params.normalize()
+	var taskSetRef harnesspro.TaskSetRef
+	if strings.TrimSpace(params.TaskSet) != "" {
+		if len(params.Pool) > 0 {
+			return nil, fmt.Errorf("taskset 与 pool 互斥, 请选择一种任务来源")
+		}
+		set, err := harnesspro.NewTaskSetStore(m.taskSetDir()).Get(params.TaskSet)
+		if err != nil {
+			return nil, err
+		}
+		params.Pool = set.Tasks
+		params.TaskSet = set.Name + "@" + set.Version
+		taskSetRef = set.Ref()
+	}
 	if err := validateHarnessEvoPool(params.Pool); err != nil {
 		return nil, err
 	}
@@ -232,6 +255,7 @@ func (m *harnessEvoManager) start(params harnessEvoParams) (*harnessEvoRun, erro
 		Stage:     "初始化",
 		Progress:  2,
 		Workdir:   workdir,
+		TaskSet:   taskSetRef,
 		StartedAt: time.Now().Unix(),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(params.TimeoutMin)*time.Minute)
@@ -269,8 +293,9 @@ func (m *harnessEvoManager) run(ctx context.Context, r *harnessEvoRun) {
 		return
 	}
 	cfg := harnesspro.Config{
-		Epochs: r.Params.Epochs, K: r.Params.K, TrainN: r.Params.TrainN,
-		Workdir: r.Workdir, Resume: r.Params.Resume, MaxParallel: r.Params.MaxParallel,
+		RunID: r.ID, Epochs: r.Params.Epochs, K: r.Params.K, TrainN: r.Params.TrainN,
+		Workdir: r.Workdir, VersionDir: m.versionDir(), TaskSet: r.TaskSet,
+		Resume: r.Params.Resume, MaxParallel: r.Params.MaxParallel,
 	}
 	if len(r.Params.Pool) > 0 {
 		cfg.Pool = r.Params.Pool
@@ -491,23 +516,7 @@ func validateHarnessEvoPool(pool []harnesspro.Task) error {
 	if len(pool) == 0 {
 		return nil // 空 = 用内置池
 	}
-	if len(pool) < 2 {
-		return fmt.Errorf("自定义任务池至少 2 题 (训练/验证需要切分), got %d", len(pool))
-	}
-	seen := map[string]bool{}
-	for i, t := range pool {
-		if strings.TrimSpace(t.ID) == "" {
-			return fmt.Errorf("pool[%d] 缺 id", i)
-		}
-		if seen[t.ID] {
-			return fmt.Errorf("pool 题 id 重复: %q", t.ID)
-		}
-		seen[t.ID] = true
-		if strings.TrimSpace(t.Prompt) == "" {
-			return fmt.Errorf("pool[%d] (%s) 缺 prompt —— 任务描述是契约的唯一来源", i, t.ID)
-		}
-	}
-	return nil
+	return harnesspro.ValidateTaskPool(pool)
 }
 
 // parseHarnessEvoTiers 解析三档权重 (形如 lite:1,3|medium:1,1|heavy:3,1)。
@@ -624,8 +633,8 @@ func (s *Server) handleHarnessEvoRun(w http.ResponseWriter, r *http.Request) {
 
 // harnessEvoFileEntry 产物清单里的一条 (workdir 内相对路径)。
 type harnessEvoFileEntry struct {
-	Path string `json:"path"`         // 相对 workdir 的路径 (POSIX 分隔)
-	Size int64  `json:"size"`         // 字节数
+	Path string `json:"path"`             // 相对 workdir 的路径 (POSIX 分隔)
+	Size int64  `json:"size"`             // 字节数
 	Bin  bool   `json:"binary,omitempty"` // 首 8KB 含 NUL → 前端不内联渲染
 }
 
@@ -645,10 +654,10 @@ func (s *Server) handleHarnessEvoFiles(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":       run.ID,
-		"workdir":  run.Workdir,
-		"files":    entries,
-		"git_log":  harnessEvoGitLog(run.Workdir),
+		"id":      run.ID,
+		"workdir": run.Workdir,
+		"files":   entries,
+		"git_log": harnessEvoGitLog(run.Workdir),
 	})
 }
 

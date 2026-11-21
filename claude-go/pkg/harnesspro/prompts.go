@@ -79,7 +79,8 @@ const sysAnalyzer = `你是轨迹诊断专家。下面是同一候选 harness �
 // buildAnalyzerUser 诊断的 user 载荷: 3 次 rollout 的轨迹 + 指标。
 func buildAnalyzerUser(h Harness, m CandidateMetrics, rollouts []RolloutResult) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "【候选 harness】%s (epoch %d, parent=%s)\n\n", h.ID, h.Epoch, h.ParentID)
+	fmt.Fprintf(&sb, "【候选 harness】%s (version=%s, content=%s, epoch %d, parent=%s)\n\n",
+		h.ID, h.VersionID, h.ContentID, h.Epoch, h.ParentID)
 	fmt.Fprintf(&sb, "【harness 指令全文】\n%s\n\n", h.Instructions)
 	fmt.Fprintf(&sb, "【机械指标】pass_rate=%.2f cost_tokens=%d n_rollouts=%d\n\n",
 		m.PassRate, m.CostTokens, m.NRollouts)
@@ -93,6 +94,12 @@ func buildAnalyzerUser(h Harness, m CandidateMetrics, rollouts []RolloutResult) 
 		for _, r := range rs {
 			fmt.Fprintf(&sb, "-- rollout#%d pass=%v pass_frac=%.2f tokens=%d/%d latency=%dms\n",
 				r.K, r.Pass, r.PassFrac, r.TokensIn, r.TokensOut, r.LatencyMS)
+			if len(r.FailedTests) > 0 {
+				fmt.Fprintf(&sb, "failed_assertions:\n")
+				for _, failure := range r.FailedTests {
+					fmt.Fprintf(&sb, "  - %s\n", failure)
+				}
+			}
 			if r.Error != "" {
 				fmt.Fprintf(&sb, "error: %s\n", r.Error)
 			}
@@ -117,6 +124,10 @@ var plannerGoal = map[string]string{
 const sysPlanner = `你是 harness 改进规划师。你拿到: 完整 harness 实现、结构化诊断、机械指标、以及其他候选的代码 Diff 与诊断摘要。你产出一份聚焦的改进计划。
 
 【通用约束 (逐条遵守)】
+- **任务契约不可覆盖**: 任务描述与其公开文件是字段名、JSON schema、输出格式和验收契约的唯一来源。
+  harness 只能帮助执行体遵守这些契约, 不得用训练样本里的临时写法覆盖、改名、增删任务自带字段,
+  更不得把 suggestions/recommendations 之类的单题字段固化成所有任务的全局 schema。
+- 若 harness 与任务描述冲突, 计划必须让 harness 明确服从任务描述; 不允许反向要求任务适配 harness。
 - 计划不提供任何固定阈值、档位分类 —— 所有机制必须从证据推导。
 - 可参考其他候选的机制, 但整段照抄不行。
 - 计划区分"预期节省"与"实测结果": 质量是否保住、成本是否真降, 由固定的外部评判说了算, 不是你这份计划说了算。
@@ -145,6 +156,9 @@ func buildPlannerUser(h Harness, instrID string, zJSON string, m CandidateMetric
 const sysEditor = `你是 harness 编辑。拿到一份改进计划, 把计划落地为一份完整可执行的新 harness 指令。
 
 【纪律】
+- **任务契约优先**: 任务描述及公开文件是字段名、JSON schema、输出格式与验收要求的唯一来源。
+  新 harness 不得覆盖或替换任务自带契约, 不得把某道训练题的字段名/结构硬编码成全局输出模板;
+  只能写"读取并逐项服从当前任务契约"这类可泛化机制。发现旧指令冲突时必须移除冲突。
 - 改动必须是计划声明的内容, 不做计划外顺手优化。
 - 输出是**完整的替换版 harness 指令全文** (system prompt 形态), 不是 diff 也不是建议。
 - 保持指令自洽: 它可以独立作为 system prompt 使用。

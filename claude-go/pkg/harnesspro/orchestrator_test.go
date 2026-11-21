@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -111,7 +112,7 @@ func extractBetween(s, start, end string) string {
 
 // TestOrchestratorEndToEnd 桩驱动完整进化: 机制全链路走通。
 func TestOrchestratorEndToEnd(t *testing.T) {
-	cfg := Config{Epochs: 2, K: 2, TrainN: 4, Pool: DefaultPool()}
+	cfg := Config{Epochs: 2, K: 2, TrainN: 4, Pool: DefaultPool(), VersionDir: filepath.Join(t.TempDir(), "versions")}
 	orch, err := NewOrchestrator(cfg, newStubLLM())
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -182,6 +183,39 @@ func TestOrchestratorEndToEnd(t *testing.T) {
 	if len(report.TrainIDs) != 4 {
 		t.Fatalf("train ids = %v", report.TrainIDs)
 	}
+	if report.TaskSet.Name == "" || report.TaskSet.Hash == "" || report.FloorEval == nil {
+		t.Fatalf("报告缺任务集/地板明细: taskset=%+v floor_eval=%v", report.TaskSet, report.FloorEval != nil)
+	}
+	registry, err := NewVersionRegistry(cfg.VersionDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions, err := registry.List(report.RunID, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != len(report.Harnesses) {
+		t.Fatalf("登记版本 %d 与报告 harness %d 不一致", len(versions), len(report.Harnesses))
+	}
+	var sawFloor, sawTrain, sawEval bool
+	for _, v := range versions {
+		if v.VersionID == "" || v.ContentID == "" || v.RunID != report.RunID || v.TaskSet.Hash != report.TaskSet.Hash {
+			t.Fatalf("版本坐标不完整: %+v", v)
+		}
+		for _, obs := range v.Observations {
+			switch obs.Phase {
+			case "floor":
+				sawFloor = true
+			case "train_rollout":
+				sawTrain = true
+			case "eval":
+				sawEval = true
+			}
+		}
+	}
+	if !sawFloor || !sawTrain || !sawEval {
+		t.Fatalf("版本观测缺阶段: floor=%v train=%v eval=%v", sawFloor, sawTrain, sawEval)
+	}
 }
 
 // TestTestSynthFrozenOnce 冻结语义: 重复 FreezeTests 拒绝。
@@ -241,6 +275,40 @@ func TestSelectionMath(t *testing.T) {
 	}
 	if heavy != "a" {
 		t.Fatalf("heavy 应选 a (性能最高), got %s", heavy)
+	}
+	if rep.Fallback {
+		t.Fatal("存在过地板候选时不应标记全灭兜底")
+	}
+}
+
+func TestSelectionFallbackMarked(t *testing.T) {
+	r := &Runner{Floor: 0.8, Tiers: DefaultTiers(), Epoch: 1}
+	evals := []CandidateEval{
+		{CandidateID: "a", VersionID: "hv-a", PassRate: 0.4, CostTokens: 100},
+		{CandidateID: "b", VersionID: "hv-b", PassRate: 0.6, CostTokens: 40},
+	}
+	shards := []graph.ShardResult{
+		{Status: "completed", Output: mustJSON(evals[0])},
+		{Status: "completed", Output: mustJSON(evals[1])},
+	}
+	res := r.runSelect(context.Background(), graph.NodeInput{Shards: shards})
+	if res.Status != "completed" {
+		t.Fatalf("select failed: %s", res.Err)
+	}
+	var rep SelectionReport
+	if err := json.Unmarshal([]byte(res.Output), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Fallback || len(rep.Filtered) != 2 || len(rep.Frontier) != 1 || rep.Frontier[0] != "b" {
+		t.Fatalf("全灭必须显式标记，且只把兜底最佳者放入后续选点: %+v", rep)
+	}
+	if len(rep.Survivors) != 3 {
+		t.Fatalf("工程兜底仍应保留三档选点: %+v", rep.Survivors)
+	}
+	for _, s := range rep.Survivors {
+		if s.CandidateID != "b" || s.VersionID != "hv-b" {
+			t.Fatalf("兜底应保留 pass 最高候选及其版本: %+v", s)
+		}
 	}
 }
 

@@ -31,8 +31,12 @@ type Runner struct {
 	LLM       LLM
 	Store     *Store
 	Workdir   string // git 工作区根 (空 = 不落盘不提交, 供离线测试)
-	Epoch     int    // 当前轮次 (edit 生成 origin 标号)
-	K         int    // 训练集 rollout 重跑次数 (论文 k=3)
+	RunID     string // 跨运行版本坐标的命名空间
+	Model     string
+	TaskSet   TaskSetRef
+	Registry  *VersionRegistry
+	Epoch     int // 当前轮次 (edit 生成 origin 标号)
+	K         int // 训练集 rollout 重跑次数 (论文 k=3)
 	Floor     float64
 	Tiers     []TierWeight
 	TrainIDs  []string // 训练集 (冻结测试卷覆盖)
@@ -243,7 +247,10 @@ func (r *Runner) runRolloutsShard(ctx context.Context, node graph.NodeSpec, in g
 		if ctx.Err() != nil {
 			return graph.NodeResult{Status: graph.NodeStatusFailed, Err: "rollout 取消: " + ctx.Err().Error()}
 		}
-		rr := RolloutResult{CandidateID: sh.C, TaskID: sh.T, K: i + 1}
+		rr := RolloutResult{
+			CandidateID: sh.C, VersionID: h.VersionID, ContentID: h.ContentID,
+			TaskID: sh.T, K: i + 1,
+		}
 		start := nowUnixMS()
 		out, usage, err := r.LLM.Complete(ctx, h.Instructions, t.Prompt)
 		rr.LatencyMS = nowUnixMS() - start
@@ -256,9 +263,10 @@ func (r *Runner) runRolloutsShard(ctx context.Context, node graph.NodeSpec, in g
 			results = append(results, rr)
 			continue
 		}
-		passed, _ := RunTests(out, tests)
+		passed, failed := RunTests(out, tests)
 		rr.PassFrac = float64(passed) / float64(len(tests))
 		rr.Pass = passed == len(tests)
+		rr.FailedTests = failed
 		rr.Output = Truncate(out, 1500)
 		results = append(results, rr)
 	}
@@ -307,9 +315,27 @@ func metricsFor(candidateID string, all []RolloutResult) CandidateMetrics {
 	return m
 }
 
+// rolloutPassFrac 训练轨迹的断言级通过率 (只计有效样本)。
+func rolloutPassFrac(candidateID string, all []RolloutResult) float64 {
+	var n int
+	var frac float64
+	for _, rr := range all {
+		if rr.CandidateID == candidateID && !rr.InfraError {
+			n++
+			frac += rr.PassFrac
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return frac / float64(n)
+}
+
 // diagnosis 诊断文档 (analyze 节点产出; candidate_id 由 runner 注入保证)。
 type diagnosis struct {
 	CandidateID string `json:"candidate_id"`
+	VersionID   string `json:"version_id"`
+	ContentID   string `json:"content_id"`
 	Problems    []struct {
 		Problem    string `json:"problem"`
 		ImpactPass string `json:"impact_pass"`
@@ -340,6 +366,9 @@ func (r *Runner) runAnalyzeShard(ctx context.Context, in graph.NodeInput) graph.
 		return graph.NodeResult{Status: graph.NodeStatusFailed, Err: "候选 " + candID + " 无 rollout 记录"}
 	}
 	m := metricsFor(candID, all)
+	if err := r.Registry.ObserveRollout(h, r.Epoch, m, rolloutPassFrac(candID, all)); err != nil {
+		return graph.NodeResult{Status: graph.NodeStatusFailed, Err: "训练版本观测登记失败: " + err.Error()}
+	}
 	text, usage, err := r.LLM.Complete(ctx, sysAnalyzer, buildAnalyzerUser(h, m, mine))
 	if err != nil {
 		return graph.NodeResult{Status: graph.NodeStatusFailed, Err: "诊断 LLM 调用失败: " + err.Error()}
@@ -353,6 +382,7 @@ func (r *Runner) runAnalyzeShard(ctx context.Context, in graph.NodeInput) graph.
 		return graph.NodeResult{Status: graph.NodeStatusFailed, Err: "诊断 JSON 解析失败: " + err.Error()}
 	}
 	d.CandidateID = candID
+	d.VersionID, d.ContentID = h.VersionID, h.ContentID
 	return graph.NodeResult{Status: graph.NodeStatusCompleted,
 		Output: mustJSON(d), Tokens: r.charge(usage)}
 }
@@ -367,8 +397,10 @@ type planDoc struct {
 		EPass     string `json:"expected_pass_effect"`
 		ECost     string `json:"expected_cost_effect"`
 	} `json:"changes"`
-	ParentID      string `json:"parent_id"`
-	ParentHarness string `json:"parent_harness"`
+	ParentID        string `json:"parent_id"`
+	ParentVersionID string `json:"parent_version_id"`
+	ContentID       string `json:"content_id"`
+	ParentHarness   string `json:"parent_harness"`
 }
 
 // runPlanShard 出案分片: 一个候选 × 3 份侧重不同的指令 (I1成本/I2平衡/I3性能)。
@@ -407,6 +439,7 @@ func (r *Runner) runPlanShard(ctx context.Context, in graph.NodeInput) graph.Nod
 		if p.ParentID == "" {
 			p.ParentID = candID
 		}
+		p.ParentVersionID, p.ContentID = h.VersionID, h.ContentID
 		p.PlanID = fmt.Sprintf("%s-%s", candID, instrID)
 		plans = append(plans, p)
 	}
@@ -518,6 +551,17 @@ func (r *Runner) editOne(ctx context.Context, p planDoc, planJSON string) (Harne
 		ParentID: p.ParentID, Epoch: r.Epoch,
 		Origin: fmt.Sprintf("epoch%d:%s:%s", r.Epoch, p.ParentID, planInstr(p.PlanID)),
 	}
+	h, err = IdentifyHarness(h, r.RunID)
+	if err != nil {
+		return Harness{}, usage, err
+	}
+	parentVersionID := ""
+	if parent, found := r.Store.Harness(p.ParentID); found {
+		parentVersionID = parent.VersionID
+	}
+	if err := r.Registry.Register(h, r.Model, r.TaskSet, parentVersionID); err != nil {
+		return Harness{}, usage, fmt.Errorf("登记 harness 版本失败: %w", err)
+	}
 	r.Store.RegisterHarness(h)
 	if err := r.commitHarness(h, out.CommitMessage); err != nil {
 		// git 失败不毁掉候选 (store 已注册), 但要在产出里留痕。
@@ -561,7 +605,10 @@ func (r *Runner) commitHarness(h Harness, msg string) error {
 	if err := os.WriteFile(filepath.Join(dir, "instructions.md"), []byte(h.Instructions), 0o644); err != nil {
 		return err
 	}
-	meta := map[string]any{"id": h.ID, "parent_id": h.ParentID, "origin": h.Origin, "epoch": h.Epoch}
+	meta := map[string]any{
+		"id": h.ID, "parent_id": h.ParentID, "origin": h.Origin, "epoch": h.Epoch,
+		"version_id": h.VersionID, "content_id": h.ContentID, "run_id": h.RunID,
+	}
 	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(mustJSON(meta)), 0o644); err != nil {
 		return err
 	}
@@ -614,7 +661,7 @@ func (r *Runner) runEvalShard(ctx context.Context, in graph.NodeInput) graph.Nod
 
 // evalOne 评测一套 harness (验证集每任务 1 次, 机械统计).
 func (r *Runner) evalOne(ctx context.Context, h Harness) (CandidateEval, Usage, error) {
-	ev := CandidateEval{CandidateID: h.ID}
+	ev := CandidateEval{CandidateID: h.ID, VersionID: h.VersionID, ContentID: h.ContentID}
 	var pass, n int
 	var frac float64
 	var usage Usage
@@ -630,20 +677,30 @@ func (r *Runner) evalOne(ctx context.Context, h Harness) (CandidateEval, Usage, 
 		if len(tests) == 0 {
 			return ev, usage, fmt.Errorf("验证任务 %s 无冻结测试卷", tid)
 		}
+		detail := EvalResult{CandidateID: h.ID, VersionID: h.VersionID, ContentID: h.ContentID, TaskID: tid}
 		start := nowUnixMS()
 		out, u, err := r.LLM.Complete(ctx, h.Instructions, t.Prompt)
-		_ = nowUnixMS() - start // 时延只记录不进目标 (论文 4.1)
+		detail.LatencyMS = nowUnixMS() - start
+		detail.TokensIn, detail.TokensOut = u.Input, u.Output
 		usage.Input += u.Input
 		usage.Output += u.Output
 		if err != nil {
-			continue // infra_error: 无效样本, 不计入 (论文判定语义)
+			detail.InfraError = true
+			detail.Error = err.Error()
+			ev.Details = append(ev.Details, detail)
+			continue // infra_error: 无效样本, 不计入通过率 (论文判定语义)
 		}
-		passed, _ := RunTests(out, tests)
-		if passed == len(tests) {
+		passed, failed := RunTests(out, tests)
+		detail.Pass = passed == len(tests)
+		detail.PassFrac = float64(passed) / float64(len(tests))
+		detail.FailedTests = failed
+		detail.Output = Truncate(out, 1500)
+		if detail.Pass {
 			pass++
 		}
 		n++
-		frac += float64(passed) / float64(len(tests))
+		frac += detail.PassFrac
+		ev.Details = append(ev.Details, detail)
 	}
 	ev.NEval = n
 	if n > 0 {
@@ -695,7 +752,9 @@ func (r *Runner) runSelect(_ context.Context, in graph.NodeInput) graph.NodeResu
 		}
 	}
 	// 全灭时保留 pass 最高者, 避免进化死锁 (论文未规定的工程兜底, 报告里留痕)。
+	fallback := false
 	if len(filtered) == 0 {
+		fallback = true
 		best := evals[0]
 		for _, ev := range evals[1:] {
 			if ev.PassRate > best.PassRate {
@@ -769,14 +828,14 @@ func (r *Runner) runSelect(_ context.Context, in graph.NodeInput) graph.NodeResu
 		}
 		if found {
 			survivors = append(survivors, SelectedSurvivor{
-				Tier: tw.Tier, J: bestJ, CandidateID: bestEv.CandidateID,
+				Tier: tw.Tier, J: bestJ, CandidateID: bestEv.CandidateID, VersionID: bestEv.VersionID,
 			})
 		}
 	}
 	report := SelectionReport{
 		Epoch: r.Epoch, Floor: r.Floor,
 		Evals: evals, Frontier: frontierIDs, Filtered: filteredOut,
-		Survivors: survivors,
+		Survivors: survivors, Fallback: fallback,
 	}
 	r.notify("epoch %d 选点: 前沿=%v 晋级=%v", r.Epoch, frontierIDs, survivorIDs(survivors))
 	return graph.NodeResult{Status: graph.NodeStatusCompleted, Output: mustJSON(report)}

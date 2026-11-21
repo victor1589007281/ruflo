@@ -1326,6 +1326,9 @@ func (s *Server) handleHarnessEvoActionCreate(w http.ResponseWriter, payload map
 	if v, _ := payload["h0"].(string); strings.TrimSpace(v) != "" {
 		params.H0 = strings.TrimSpace(v)
 	}
+	if v, _ := payload["taskset"].(string); strings.TrimSpace(v) != "" {
+		params.TaskSet = strings.TrimSpace(v)
+	}
 	// objective 为 JSON 对象时, 显式键缺的从这里补 (不覆盖已显式给出的)。
 	if obj, _ := payload["objective"].(string); strings.HasPrefix(strings.TrimSpace(obj), "{") {
 		var overlay map[string]interface{}
@@ -1362,6 +1365,11 @@ func (s *Server) handleHarnessEvoActionCreate(w http.ResponseWriter, payload map
 		if params.H0 == "" {
 			if h, ok := overlay["h0"].(string); ok && strings.TrimSpace(h) != "" {
 				params.H0 = strings.TrimSpace(h)
+			}
+		}
+		if params.TaskSet == "" {
+			if ts, ok := overlay["taskset"].(string); ok && strings.TrimSpace(ts) != "" {
+				params.TaskSet = strings.TrimSpace(ts)
 			}
 		}
 	}
@@ -1463,7 +1471,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		// 不落盘 app，消费时任务档案就退回 unknown（同 ActionRecord.App 的理由）。
 		"app":    types.AppFromContext(r.Context()),
 		"appRef": types.AppRefFromContext(r.Context()),
-		"source":    "dashboard",
+		"source": "dashboard",
 	}
 	if payload != nil {
 		rec["payload"] = payload

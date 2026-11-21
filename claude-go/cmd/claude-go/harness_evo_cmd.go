@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,104 @@ LLM 只在 出卷/诊断/出案/动刀 四个节点内部出现。`,
 	}
 	cmd.AddCommand(harnessEvoRunCmd())
 	cmd.AddCommand(harnessEvoTasksCmd())
+	cmd.AddCommand(harnessEvoTaskSetCmd())
+	return cmd
+}
+
+func defaultHarnessEvoStateDir(parts ...string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(append([]string{home, ".claude-go", "harnesspro"}, parts...)...)
+}
+
+// harnessEvoTaskSetCmd 校验/注册/查看真实任务集目录, 全程离线零 LLM。
+func harnessEvoTaskSetCmd() *cobra.Command {
+	var dir string
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "taskset",
+		Short: "校验、注册和查看版本化任务集 (taskset.json + tasks)",
+	}
+	cmd.PersistentFlags().StringVar(&dir, "dir", defaultHarnessEvoStateDir("tasksets"), "任务集注册目录")
+	cmd.PersistentFlags().BoolVar(&jsonOut, "json", false, "JSON 输出")
+	printSet := func(set harnesspro.TaskSet, full bool) error {
+		if !full {
+			set.Tasks = nil
+		}
+		if jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetEscapeHTML(false)
+			return enc.Encode(set)
+		}
+		fmt.Printf("%s@%s  %d 题  %s\n", set.Name, set.Version, set.TaskCount, set.Hash)
+		if set.Description != "" {
+			fmt.Printf("  %s\n", set.Description)
+		}
+		if full {
+			for _, t := range set.Tasks {
+				fmt.Printf("  %-28s cat=%-10s diff=%.2f\n", t.ID, t.Category, t.Difficulty)
+			}
+		}
+		return nil
+	}
+	validate := &cobra.Command{
+		Use: "validate <目录|taskset.json>", Args: cobra.ExactArgs(1),
+		Short: "校验任务集并计算内容 hash (不注册)",
+		RunE: func(_ *cobra.Command, args []string) error {
+			set, err := harnesspro.LoadTaskSet(args[0])
+			if err != nil {
+				return err
+			}
+			return printSet(set, true)
+		},
+	}
+	importCmd := &cobra.Command{
+		Use: "import <目录|taskset.json>", Args: cobra.ExactArgs(1),
+		Short: "注册不可变 name@version 任务集",
+		RunE: func(_ *cobra.Command, args []string) error {
+			set, err := harnesspro.LoadTaskSet(args[0])
+			if err != nil {
+				return err
+			}
+			if err := harnesspro.NewTaskSetStore(dir).Register(set); err != nil {
+				return err
+			}
+			return printSet(set, false)
+		},
+	}
+	list := &cobra.Command{
+		Use: "list", Args: cobra.NoArgs, Short: "列出已注册任务集",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			sets, err := harnesspro.NewTaskSetStore(dir).List()
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetEscapeHTML(false)
+				return enc.Encode(map[string]any{"tasksets": sets})
+			}
+			for _, set := range sets {
+				if err := printSet(set, false); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	show := &cobra.Command{
+		Use: "show <name[@version]>", Args: cobra.ExactArgs(1), Short: "查看已注册任务集与任务",
+		RunE: func(_ *cobra.Command, args []string) error {
+			set, err := harnesspro.NewTaskSetStore(dir).Get(args[0])
+			if err != nil {
+				return err
+			}
+			return printSet(set, true)
+		},
+	}
+	cmd.AddCommand(validate, importCmd, list, show)
 	return cmd
 }
 
@@ -72,6 +171,7 @@ func harnessEvoTasksCmd() *cobra.Command {
 func harnessEvoRunCmd() *cobra.Command {
 	var epochs, k, trainN, timeoutMin, maxPar int
 	var workdir, tiersArg, poolFile, h0File string
+	var taskSetRef, taskSetDir, versionDir, runID string
 	var jsonOut, resume bool
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -83,8 +183,19 @@ func harnessEvoRunCmd() *cobra.Command {
 				return err
 			}
 			cfg := harnesspro.Config{
-				Epochs: epochs, K: k, TrainN: trainN,
-				Workdir: workdir, Resume: resume, MaxParallel: maxPar,
+				RunID: runID, Epochs: epochs, K: k, TrainN: trainN,
+				Workdir: workdir, VersionDir: versionDir, Resume: resume, MaxParallel: maxPar,
+			}
+			if taskSetRef != "" && poolFile != "" {
+				return fmt.Errorf("--taskset 与 --pool 互斥, 请选择一种任务来源")
+			}
+			if taskSetRef != "" {
+				set, err := harnesspro.NewTaskSetStore(taskSetDir).Get(taskSetRef)
+				if err != nil {
+					return err
+				}
+				cfg.Pool, cfg.TaskSet = set.Tasks, set.Ref()
+				notify(fmt.Sprintf("注册任务集: %s@%s (%d 题, %s)", set.Name, set.Version, set.TaskCount, set.Hash))
 			}
 			if poolFile != "" {
 				pool, err := loadPoolFile(poolFile)
@@ -140,6 +251,10 @@ func harnessEvoRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tiersArg, "tiers", "", "三档权重, 形如 lite:1,3|medium:1,1|heavy:3,1")
 	cmd.Flags().BoolVar(&resume, "resume", false, "从 journal 续跑 (已完成节点吃缓存)")
 	cmd.Flags().StringVar(&poolFile, "pool", "", "自定义任务池 JSON 文件 ([{id,category,difficulty,prompt,...}...]; 空 = 内置 12 题)")
+	cmd.Flags().StringVar(&taskSetRef, "taskset", "", "已注册任务集 name[@version] (与 --pool 互斥)")
+	cmd.Flags().StringVar(&taskSetDir, "taskset-dir", defaultHarnessEvoStateDir("tasksets"), "任务集注册目录")
+	cmd.Flags().StringVar(&versionDir, "version-dir", defaultHarnessEvoStateDir("versions"), "跨运行 harness 版本仓库")
+	cmd.Flags().StringVar(&runID, "run-id", "", "运行 ID (版本谱系命名空间; 默认自动生成)")
 	cmd.Flags().StringVar(&h0File, "h0", "", "自定义基座 harness 指令文件 (空 = 内置 H0)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "结构化 JSON 输出 (stdout 仅 JSON)")
 	return cmd
@@ -218,21 +333,8 @@ func loadPoolFile(path string) ([]harnesspro.Task, error) {
 	if err := json.Unmarshal(b, &pool); err != nil {
 		return nil, fmt.Errorf("任务池 JSON 结构错误 (应为 [{\"id\":...,\"prompt\":...}...]): %w", err)
 	}
-	if len(pool) < 2 {
-		return nil, fmt.Errorf("任务池至少 2 题 (训练/验证需要切分), got %d", len(pool))
-	}
-	seen := map[string]bool{}
-	for i, t := range pool {
-		if strings.TrimSpace(t.ID) == "" {
-			return nil, fmt.Errorf("pool[%d] 缺 id", i)
-		}
-		if seen[t.ID] {
-			return nil, fmt.Errorf("pool 题 id 重复: %q", t.ID)
-		}
-		seen[t.ID] = true
-		if strings.TrimSpace(t.Prompt) == "" {
-			return nil, fmt.Errorf("pool[%d] (%s) 缺 prompt —— 任务描述是契约的唯一来源", i, t.ID)
-		}
+	if err := harnesspro.ValidateTaskPool(pool); err != nil {
+		return nil, err
 	}
 	return pool, nil
 }

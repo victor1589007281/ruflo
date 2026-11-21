@@ -27,19 +27,25 @@ import (
 
 // Config 一次进化运行的配置。
 type Config struct {
+	RunID       string       // 外部运行 ID (dashboard 注入 evo-*; 空 = 自动生成)
 	Epochs      int          // 进化轮次 T (论文 TB2/SWE-Pro: 3; ProgramBench: 4)
 	K           int          // 训练集 rollout 重跑次数 (论文 k=3)
 	TrainN      int          // 训练集规模 (论文 10 题)
 	Pool        []Task       // 任务池 (nil = DefaultPool)
+	TaskSet     TaskSetRef   // 任务集身份; hash 始终由 Pool 重算
 	H0          string       // 基座 harness 指令 (空 = 内置 H0Instructions)
 	Tiers       []TierWeight // 三档权重 (nil = DefaultTiers)
 	Workdir     string       // 运行目录 (git 工作区 + journal + 报告); 空 = 内存态 (测试)
+	VersionDir  string       // 跨运行版本仓库; 空 = 不持久化版本 (单元测试)
 	Resume      bool         // 从 journal 续跑
 	MaxParallel int          // 图并发上限 (0 = 图默认 6)
 }
 
 // withDefaults 缺省补齐。
 func (c Config) withDefaults() Config {
+	if c.RunID == "" {
+		c.RunID = fmt.Sprintf("harnesspro-%d", time.Now().UnixNano())
+	}
 	if c.Epochs <= 0 {
 		c.Epochs = 2 // 冒烟默认 2 轮 (论文 3-4; 一轮进化已能验证机制)
 	}
@@ -51,7 +57,14 @@ func (c Config) withDefaults() Config {
 	}
 	if len(c.Pool) == 0 {
 		c.Pool = DefaultPool()
+		if c.TaskSet.Name == "" {
+			c.TaskSet.Name, c.TaskSet.Version = "builtin", "v1"
+		}
 	}
+	if c.TaskSet.Name == "" {
+		c.TaskSet.Name, c.TaskSet.Version = "inline", "content"
+	}
+	c.TaskSet = IdentifyTaskSet(c.TaskSet.Name, c.TaskSet.Version, c.Pool)
 	if len(c.Tiers) == 0 {
 		c.Tiers = DefaultTiers()
 	}
@@ -66,6 +79,7 @@ type EpochSummary struct {
 	Filtered  []string           `json:"filtered"`
 	Survivors []SelectedSurvivor `json:"survivors"`
 	Evals     []CandidateEval    `json:"evals"`
+	Fallback  bool               `json:"fallback,omitempty"`
 	Tokens    int64              `json:"tokens"`
 }
 
@@ -73,11 +87,13 @@ type EpochSummary struct {
 type EvolutionReport struct {
 	RunID       string             `json:"run_id"`
 	Model       string             `json:"model"`
+	TaskSet     TaskSetRef         `json:"task_set"`
 	StartedAt   int64              `json:"started_at"`
 	DurationS   float64            `json:"duration_s"`
 	TrainIDs    []string           `json:"train_ids"`
 	ValidIDs    []string           `json:"valid_ids"`
 	Floor       float64            `json:"floor"`
+	FloorEval   *CandidateEval     `json:"floor_eval,omitempty"`
 	Epochs      []EpochSummary     `json:"epochs"`
 	Final       []SelectedSurvivor `json:"final"`
 	Harnesses   []Harness          `json:"harnesses"`
@@ -87,10 +103,11 @@ type EvolutionReport struct {
 
 // Orchestrator 进化编排器。
 type Orchestrator struct {
-	cfg    Config
-	llm    LLM
-	store  *Store
-	tokens atomic.Int64 // 进化总开销 (token), runner 累加
+	cfg      Config
+	llm      LLM
+	store    *Store
+	registry *VersionRegistry
+	tokens   atomic.Int64 // 进化总开销 (token), runner 累加
 }
 
 // NewOrchestrator 构造编排器。
@@ -99,7 +116,14 @@ func NewOrchestrator(cfg Config, llm LLM) (*Orchestrator, error) {
 	if llm == nil {
 		return nil, fmt.Errorf("harnesspro: LLM 未注入")
 	}
-	return &Orchestrator{cfg: cfg, llm: llm, store: NewStore(cfg.Pool)}, nil
+	if err := ValidateTaskPool(cfg.Pool); err != nil {
+		return nil, err
+	}
+	registry, err := NewVersionRegistry(cfg.VersionDir)
+	if err != nil {
+		return nil, err
+	}
+	return &Orchestrator{cfg: cfg, llm: llm, store: NewStore(cfg.Pool), registry: registry}, nil
 }
 
 // notify 透传进度 (调用方注入)。
@@ -128,6 +152,13 @@ func (o *Orchestrator) Run(ctx context.Context, notify func(string)) (*Evolution
 		h0Instr = H0Instructions()
 	}
 	h0 := Harness{ID: "h0", Instructions: h0Instr, Origin: "h0", Epoch: 0}
+	h0, err := IdentifyHarness(h0, cfg.RunID)
+	if err != nil {
+		return nil, err
+	}
+	if err := o.registry.Register(h0, o.llm.Model(), cfg.TaskSet, ""); err != nil {
+		return nil, fmt.Errorf("登记 h0 版本失败: %w", err)
+	}
 	o.store.RegisterHarness(h0)
 	if err := o.commitHarnessFile(h0, "h0 baseline harness"); err != nil {
 		o.notify(notify, "h0 落盘失败 (继续): %v", err)
@@ -139,18 +170,23 @@ func (o *Orchestrator) Run(ctx context.Context, notify func(string)) (*Evolution
 	}
 
 	// —— 阶段 0.4: 定地板 (h0 在验证集, 固定测试, 每任务 1 次) ——
-	floor, err := o.evalPassRate(ctx, h0.ID, validIDs)
+	floorEval, err := o.evalPassRate(ctx, h0.ID, validIDs)
 	if err != nil {
 		return nil, fmt.Errorf("地板评测失败: %w", err)
+	}
+	floor := floorEval.PassRate
+	if err := o.registry.ObserveEval(cfg.RunID, 0, "floor", floorEval, false, false, nil); err != nil {
+		return nil, fmt.Errorf("登记地板版本观测失败: %w", err)
 	}
 	o.notify(notify, "地板 floor=%.2f (h0 验证集通过率)", floor)
 
 	// —— 进化主循环 ——
 	report := &EvolutionReport{
-		RunID:     fmt.Sprintf("harnesspro-%d", started.Unix()),
+		RunID:     cfg.RunID,
 		Model:     o.llm.Model(),
+		TaskSet:   cfg.TaskSet,
 		StartedAt: started.Unix(), TrainIDs: trainIDs, ValidIDs: validIDs,
-		Floor: floor, Workdir: cfg.Workdir,
+		Floor: floor, FloorEval: &floorEval, Workdir: cfg.Workdir,
 	}
 	survivors := []string{h0.ID}
 	for epoch := 1; epoch <= cfg.Epochs; epoch++ {
@@ -158,10 +194,13 @@ func (o *Orchestrator) Run(ctx context.Context, notify func(string)) (*Evolution
 		if err != nil {
 			return report, fmt.Errorf("epoch %d 失败: %w", epoch, err)
 		}
+		if err := o.recordSelectionObservations(epoch, selectReport); err != nil {
+			return report, fmt.Errorf("epoch %d 版本观测登记失败: %w", epoch, err)
+		}
 		sel := make([]SelectedSurvivor, len(selectReport.Survivors))
 		copy(sel, selectReport.Survivors)
 		report.Epochs = append(report.Epochs, EpochSummary{
-			Epoch: epoch, Status: "completed",
+			Epoch: epoch, Status: "completed", Fallback: selectReport.Fallback,
 			Frontier: selectReport.Frontier, Filtered: selectReport.Filtered,
 			Survivors: sel, Evals: selectReport.Evals,
 			Tokens: toks,
@@ -191,12 +230,39 @@ func (o *Orchestrator) Run(ctx context.Context, notify func(string)) (*Evolution
 	return report, nil
 }
 
+// recordSelectionObservations 把验证指标与选点身份一起写入版本仓库。
+func (o *Orchestrator) recordSelectionObservations(epoch int, sel *SelectionReport) error {
+	if o.registry == nil {
+		return nil
+	}
+	frontier := map[string]bool{}
+	for _, id := range sel.Frontier {
+		frontier[id] = true
+	}
+	filtered := map[string]bool{}
+	for _, id := range sel.Filtered {
+		filtered[id] = true
+	}
+	tiers := map[string][]string{}
+	for _, s := range sel.Survivors {
+		tiers[s.CandidateID] = append(tiers[s.CandidateID], s.Tier)
+	}
+	for _, ev := range sel.Evals {
+		if err := o.registry.ObserveEval(o.cfg.RunID, epoch, "eval", ev,
+			frontier[ev.CandidateID], filtered[ev.CandidateID], tiers[ev.CandidateID], sel.Fallback); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // runTestSynthGraph 出卷期: 一张两节点 DAG (并行出卷 → 冻结自检), 覆盖给定任务集
 // (调用方传全池; 训练集是 DPP 选出的子集, 验证集用于地板 —— 全池都要卷)。
 func (o *Orchestrator) runTestSynthGraph(ctx context.Context, tasks []Task, notify func(string)) error {
 	spec := BuildTestSynthGraph(tasks)
 	r := &Runner{
 		LLM: o.llm, Store: o.store, Workdir: o.cfg.Workdir,
+		RunID: o.cfg.RunID, Model: o.llm.Model(), TaskSet: o.cfg.TaskSet, Registry: o.registry,
 		TrainIDs: taskIDs(tasks), Notify: notify, TokenSink: &o.tokens,
 	}
 	eng := o.engine(r, "testsynth")
@@ -219,13 +285,14 @@ func (o *Orchestrator) runEpoch(ctx context.Context, epoch int, survivors, train
 	spec := BuildEpochGraph(epoch)
 	r := &Runner{
 		LLM: o.llm, Store: o.store, Workdir: o.cfg.Workdir,
+		RunID: o.cfg.RunID, Model: o.llm.Model(), TaskSet: o.cfg.TaskSet, Registry: o.registry,
 		Epoch: epoch, K: o.cfg.K, Floor: floor, Tiers: o.cfg.Tiers,
 		TrainIDs: trainIDs, ValidIDs: validIDs, Notify: notify, TokenSink: &o.tokens,
 	}
 	eng := o.engine(r, fmt.Sprintf("epoch-%d", epoch))
 	before := o.tokens.Load()
 	res, err := eng.Run(ctx, spec, graph.RunOpts{
-		RunID:     fmt.Sprintf("%s-epoch-%d", "harnesspro", epoch),
+		RunID:     fmt.Sprintf("%s-epoch-%d", o.cfg.RunID, epoch),
 		Objective: fmt.Sprintf("harness 进化第 %d 轮", epoch),
 		Params:    EpochParams(survivors, mustTasks(o.store, trainIDs)),
 		Resume:    o.cfg.Resume,
@@ -259,11 +326,12 @@ func (o *Orchestrator) engine(r *Runner, name string) *graph.Engine {
 // evalPassRate 在验证集上评测一个候选的通过率 (地板与基线用)。
 // 判定语义: 任务无冻结卷 = 该任务出卷失败, 是**评测前提缺失**而非
 // "infra_error 不计入" —— 静默跳过会让地板建立在残缺验证集上.
-func (o *Orchestrator) evalPassRate(ctx context.Context, harnessID string, validIDs []string) (float64, error) {
+func (o *Orchestrator) evalPassRate(ctx context.Context, harnessID string, validIDs []string) (CandidateEval, error) {
 	h, ok := o.store.Harness(harnessID)
 	if !ok {
-		return 0, fmt.Errorf("未知候选 %s", harnessID)
+		return CandidateEval{}, fmt.Errorf("未知候选 %s", harnessID)
 	}
+	ev := CandidateEval{CandidateID: h.ID, VersionID: h.VersionID, ContentID: h.ContentID}
 	var missing []string
 	for _, tid := range validIDs {
 		if len(o.store.Tests(tid)) == 0 {
@@ -271,33 +339,51 @@ func (o *Orchestrator) evalPassRate(ctx context.Context, harnessID string, valid
 		}
 	}
 	if len(missing) > 0 {
-		return 0, fmt.Errorf("验证集缺冻结测试卷: %v", missing)
+		return ev, fmt.Errorf("验证集缺冻结测试卷: %v", missing)
 	}
 	var pass, n int
+	var frac float64
 	for _, tid := range validIDs {
 		t, ok := o.store.Task(tid)
 		if !ok {
-			return 0, fmt.Errorf("未知任务 %s", tid)
+			return ev, fmt.Errorf("未知任务 %s", tid)
 		}
 		tests := o.store.Tests(tid)
 		if len(tests) == 0 {
-			return 0, fmt.Errorf("任务 %s 无冻结测试卷", tid)
+			return ev, fmt.Errorf("任务 %s 无冻结测试卷", tid)
 		}
+		detail := EvalResult{CandidateID: h.ID, VersionID: h.VersionID, ContentID: h.ContentID, TaskID: tid}
+		start := nowUnixMS()
 		out, usage, err := o.llm.Complete(ctx, h.Instructions, t.Prompt)
+		detail.LatencyMS = nowUnixMS() - start
+		detail.TokensIn, detail.TokensOut = usage.Input, usage.Output
+		ev.CostTokens += usage.Total()
 		o.tokens.Add(usage.Total())
 		if err != nil {
-			continue // infra_error 不计入
+			detail.InfraError = true
+			detail.Error = err.Error()
+			ev.Details = append(ev.Details, detail)
+			continue // infra_error 不计入通过率
 		}
-		passed, _ := RunTests(out, tests)
-		if passed == len(tests) {
+		passed, failed := RunTests(out, tests)
+		detail.Pass = passed == len(tests)
+		detail.PassFrac = float64(passed) / float64(len(tests))
+		detail.FailedTests = failed
+		detail.Output = Truncate(out, 1500)
+		ev.Details = append(ev.Details, detail)
+		if detail.Pass {
 			pass++
 		}
 		n++
+		frac += detail.PassFrac
 	}
 	if n == 0 {
-		return 0, fmt.Errorf("验证集全部 infra_error, 无法定地板")
+		return ev, fmt.Errorf("验证集全部 infra_error, 无法定地板")
 	}
-	return float64(pass) / float64(n), nil
+	ev.NEval = n
+	ev.PassRate = float64(pass) / float64(n)
+	ev.PassFrac = frac / float64(n)
+	return ev, nil
 }
 
 // initWorkdir 初始化运行目录与 git。

@@ -198,6 +198,8 @@ var (
 	flagComplexityMode   string // --complexity-mode heuristic|llm|hybrid
 	flagAllowedTools     string // --allowed-tools t1,t2 (whitelist; non-empty = only these)
 	flagOutputFormat     string // --output-format text|json
+	flagEventFormat      string // --event-format text|ndjson (ndjson: stdout 只出 NDJSON 运行事件行, 见 run_events.go)
+	flagRunID            string // --run-id <id> 调用方传入的 run 身份 (缺省内部发号 run-<sid>-<n>)
 	// agentDB 语义增强面 (规划 14.1.4.3): --agentdb-url <serve 地址> 装配
 	// AgentDBSemanticInjectHook, 使真实引擎经 serve /v1/memory|retrieve|files
 	// 跨源检索并注入 system prompt。nil = 不装配 (默认)。
@@ -338,6 +340,8 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagComplexityMode, "complexity-mode", "", "复杂度判定模式: heuristic|llm|hybrid (空=读配置, 默认 heuristic)")
 	rootCmd.PersistentFlags().StringVar(&flagAllowedTools, "allowed-tools", "", "工具白名单 (逗号分隔); 非空时仅这些工具可见且可执行, 其余硬拒 (用于受限托管 agent)")
 	rootCmd.PersistentFlags().StringVar(&flagOutputFormat, "output-format", "text", "输出格式: text (默认) | json (final/is_error/error_kind/session_id 顶层 envelope, 供程序化调用; token 用量见 metrics JSONL)")
+	rootCmd.PersistentFlags().StringVar(&flagEventFormat, "event-format", "text", "运行事件输出格式: text (默认, 原行为) | ndjson (stdout 只出一行一个 JSON 的运行事件 started/session/heartbeat/progress/result, 启动横幅与普通日志改走 stderr; result 事件取代 --output-format json 的 envelope)")
+	rootCmd.PersistentFlags().StringVar(&flagRunID, "run-id", "", "本次 run 的身份 ID, 原样写进每条 NDJSON 事件的 run_id 字段 (缺省内部生成 run-<sid>-<n>, 无会话 store 时 run-anon-<unixnano>)")
 	rootCmd.PersistentFlags().StringVar(&flagAgentDBURL, "agentdb-url", "", "agentDB serve 地址 (如 http://127.0.0.1:8787); 设置后装配层2语义增强注入 (AgentDBSemanticInjectHook)")
 	rootCmd.PersistentFlags().IntVar(&flagAgentDBTopK, "agentdb-topk", 5, "agentDB 每源检索条数")
 	rootCmd.PersistentFlags().IntVar(&flagAgentDBBudget, "agentdb-budget", 600, "agentDB 注入上下文 token 预算")
@@ -835,7 +839,14 @@ func runCmd() *cobra.Command {
 		Example: `  claude-go run "你的问题"
   claude-go run "/go trading-v2 分析英伟达"
   claude-go run "/team create trading-v2 分析英伟达" --permission-mode bypass`,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (retErr error) {
+			// --event-format 值校验放在最前面: 非法值必须在任何副作用之前失败退出
+			// (与未知 flag 走 cobra 非零退出同理, 调度方依赖非零退出识别坏调用)。
+			if flagEventFormat != "text" && flagEventFormat != "ndjson" {
+				return fmt.Errorf("未知 --event-format: %q (支持 text|ndjson)", flagEventFormat)
+			}
+			ndjsonMode := flagEventFormat == "ndjson"
+
 			eng, err := buildEngine()
 			if err != nil {
 				return err
@@ -886,7 +897,7 @@ func runCmd() *cobra.Command {
 				commands.RegisterBuiltins(cmdRegistry)
 
 				siCfg := swarmintel.DefaultConfig()
-				siCfg.Notify = func(_, msg string) { fmt.Println(msg) }
+				siCfg.Notify = func(_, msg string) { runInfoln(msg) }
 				siEngine := swarmintel.NewEngine(eng.APIClient, siCfg)
 
 				agentFactory := func(ctx context.Context, role, systemPrompt string) (agent.AgentRunner, error) {
@@ -987,12 +998,12 @@ func runCmd() *cobra.Command {
 				if wfDir := filepath.Join(tasksStateDir, "workflows"); wfDir != "" {
 					rep := agent.LoadWorkflowsFromDirReport(wfDir, runRoles)
 					if rep.Loaded > 0 || rep.Failed > 0 || len(rep.Deferred) > 0 {
-						fmt.Printf("[run] 自定义工作流加载: %s\n", rep.Summary(wfDir))
+						runInfof("[run] 自定义工作流加载: %s\n", rep.Summary(wfDir))
 						for _, d := range rep.Details {
-							fmt.Printf("[run][workflow][fail] %s\n", d)
+							runInfof("[run][workflow][fail] %s\n", d)
 						}
 						for _, d := range rep.Deferred {
-							fmt.Printf("[run][workflow][degraded] %s\n", d)
+							runInfof("[run][workflow][degraded] %s\n", d)
 						}
 					}
 				}
@@ -1006,11 +1017,11 @@ func runCmd() *cobra.Command {
 				// 需要完整读数时走 `claude-go doctor`。
 				for _, is := range agent.AuditBuiltinWorkflows(runRoles) {
 					if is.Hard != "" {
-						fmt.Printf("[run][workflow][builtin][fail] %s: %s\n", is.Name, is.Hard)
+						runInfof("[run][workflow][builtin][fail] %s: %s\n", is.Name, is.Hard)
 						continue
 					}
 					for _, w := range is.Warnings {
-						fmt.Printf("[run][workflow][builtin][degraded] %s: %s\n", is.Name, w)
+						runInfof("[run][workflow][builtin][degraded] %s: %s\n", is.Name, w)
 					}
 				}
 				// 进化引擎: headless run 路径与飞书路径同构装配 (design/03 §1.2 开环1 修复)。
@@ -1053,7 +1064,7 @@ func runCmd() *cobra.Command {
 					Cwd:     cwd,
 					Factory: agentFactory,
 					Pool:    agentPool,
-					Notify:  func(_, msg string) { fmt.Println(msg) },
+					Notify:  func(_, msg string) { runInfoln(msg) },
 					LLM:     eng.APIClient,
 					// 与上面那次装载**同一个实例** (21.8.12 W1): 装载工作流用的是哪张
 					// 角色表, 执行时就该是哪张。两处各建一份 (哪怕参数相同) 也会在
@@ -1074,7 +1085,7 @@ func runCmd() *cobra.Command {
 				// 资产索引 (21.8.12 P0/P1): 六种资产按标准布局装载一次, 装进进程级索引。
 				// 这是 Agent 工具的 subagent_type 能被查表 (P5) 的前提 —— 没有索引,
 				// 清单为空、查表恒 miss, 模型填什么名字都只会走角色名子串猜测。
-				fmt.Printf("[run] 资产装载: %s\n", loadAssetCatalog(cwd, tasksStateDir))
+				runInfof("[run] 资产装载: %s\n", loadAssetCatalog(cwd, tasksStateDir))
 				// 与 runAsAgent 同理: 上一行重建了进程级目录, --plugin 合并进去的
 				// 插件 agents 要重新合并进这份新目录的副本, 否则团队路径查不到它们。
 				if cliPlugins != nil {
@@ -1095,7 +1106,7 @@ func runCmd() *cobra.Command {
 				if c := cmdRegistry.Find(cmdName); c != nil {
 					return c.Execute(cmdArgs, cmdCtx)
 				}
-				fmt.Printf("未知命令: %s\n", cmdName)
+				runInfof("未知命令: %s\n", cmdName)
 				return nil
 			}
 
@@ -1130,11 +1141,21 @@ func runCmd() *cobra.Command {
 			//
 			// store 为 nil (没有 home 目录等) 时跳过: 没有 session id 就没有可辨的桶名,
 			// 硬编一个会造出"看起来属于某个会话"的假归属。
-			runID := ""
+			// runID 解析顺序 (契约): --run-id > 内部 run-<sid>-<n> > run-anon-<unixnano>。
+			// 最后的匿名号**只在 ndjson 模式发**: 事件行必须有 run_id 可填; text/json
+			// 模式保持原行为 (无 store 时 runID 为空 → 不写 run span) —— 无 store 时
+			// 硬编一个会造出"看着有归属、其实归属错了"的假记录 (与下方注释同一纪律)。
+			runID := strings.TrimSpace(flagRunID)
+			switch {
+			case runID != "":
+				// 调用方显式给的 run 身份; 有 store 时一并挂进 trace ctx (下方统一挂)。
+			case store != nil:
+				runID = fmt.Sprintf("run-%s-%d", store.SessionID(), runTraceSeq.Add(1))
+			case ndjsonMode:
+				runID = fmt.Sprintf("run-anon-%d", time.Now().UnixNano())
+			}
 			if store != nil {
-				sid := store.SessionID()
-				runID = fmt.Sprintf("run-%s-%d", sid, runTraceSeq.Add(1))
-				ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: sid})
+				ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: store.SessionID()})
 			}
 
 			// run span 的挂点。**位置就是全部要害**: defer 是唯一"无论从哪条 return
@@ -1174,6 +1195,38 @@ func runCmd() *cobra.Command {
 				recordRunSpan(eng.TraceStore, runID, name, "", eng.Config.Model, status, errKind, userPrompt, start)
 			}()
 
+			// ── NDJSON 运行事件 (deck §8 P2 真实过程与心跳, 契约见 run_events.go) ──
+			// emitter 在 runID 确定后发 started (seq=1) 与 session (seq=2), 再起心跳
+			// 监督 goroutine —— 契约要求 started/session 排在任何 heartbeat 之前。
+			// result 发射收敛到 RunE 唯一出口: 正常路径在末尾显式发 (先停心跳, 保证
+			// result 是最后一个事件), 任何提前 return 由下面的 defer 补发 is_error 的
+			// result —— 消费方永远能拿到终态。best-of-N 的多次 attempt 共用这一个
+			// emitter, result 天然只发最后一次 attempt 的结论。
+			// final/sessionID 提前到这里声明, 是为了让这个 defer 能捕获它们
+			// (与上面 errKind 提前声明同一纪律)。
+			var ev *runEventEmitter
+			var final string
+			var sessionID string
+			if ndjsonMode {
+				ev = newRunEventEmitter(os.Stdout, runID, strings.TrimSpace(flagRunLabel))
+				if store != nil {
+					sessionID = store.SessionID()
+					ev.emit("session", map[string]any{"session_id": sessionID})
+				}
+				ev.startHeartbeat()
+				defer func() {
+					ev.stopHeartbeat()
+					if ev.resultWasSent() {
+						return
+					}
+					kind := errKind
+					if retErr != nil && kind == "" {
+						kind = "run_error"
+					}
+					ev.emitResult(runResultEventData(final, sessionID, kind))
+				}()
+			}
+
 			attachBlocks, err := ingestAttachments(flagAttach)
 			if err != nil {
 				return err
@@ -1190,7 +1243,6 @@ func runCmd() *cobra.Command {
 				}
 			}
 			// errKind 已提前到上面的 run span 挂点处声明 (deferred 闭包要捕获它)。
-			var final string
 			verifyPassed := false
 			for attempt := 1; ; attempt++ {
 				if attempt > 1 {
@@ -1201,8 +1253,17 @@ func runCmd() *cobra.Command {
 				}
 				wmlInjectExperience(eng, userPrompt) // L7 注入半环 (每次尝试一致)
 				streamCh := eng.SubmitStreamBlocks(ctx, userPrompt, attachBlocks)
+				// progress 挂钩: ndjson 模式下把工具进度转发成 progress 事件;
+				// 非 ndjson 传 nil, consumeStreamEvents 行为与改造前逐字节一致。
+				var progressHook func(kind string, data map[string]any)
+				if ndjsonMode {
+					progressHook = func(kind string, data map[string]any) {
+						ev.emit(kind, data)
+					}
+				}
+				// ndjson 与 json 一样走 quiet (不往 stdout 印 token —— stdout 只许 NDJSON 行)。
 				var ek string
-				final, ek = consumeStreamEvents(streamCh, jsonMode)
+				final, ek = consumeStreamEvents(streamCh, jsonMode || ndjsonMode, progressHook)
 				errKind = ek
 				if flagVerify == "" || errKind != "" {
 					break
@@ -1220,8 +1281,7 @@ func runCmd() *cobra.Command {
 			if flagVerify != "" {
 				log.Printf("[best-of] 验收结论: passed=%v (attempts=%d)", verifyPassed, attempts)
 			}
-			sessionID := ""
-			if store != nil {
+			if sessionID == "" && store != nil {
 				sessionID = store.SessionID()
 			}
 			// 第七章缺口修复: CLI 单查询 Dreaming 触发 (此前仅团队收尾/飞书会话触发,
@@ -1260,6 +1320,17 @@ func runCmd() *cobra.Command {
 				cliAssembly.SessionID = sessionID
 				cliAssembly.TicketID = runTraceIDs.TicketID
 				cliAssembly.InstanceID = runTraceIDs.InstanceID
+			}
+			if ndjsonMode {
+				// 先停心跳再发 result —— result 必须是最后一个事件。
+				// final/errKind 与上方 envelope 完全同源 (同一变量、同一 sanitize)。
+				ev.stopHeartbeat()
+				ev.emitResult(runResultEventData(final, sessionID, errKind))
+				// 契约: ndjson 模式下退出码与 is_error 一致 (is_error=true ⇒ 非零退出)。
+				if errKind != "" {
+					return fmt.Errorf("run error: %s", errKind)
+				}
+				return nil
 			}
 			if jsonMode {
 				return emitRunEnvelope(final, sessionID, errKind, cliAssembly, cliAssemblyReconcile)
@@ -5062,6 +5133,29 @@ func runAsAgent(cmd *cobra.Command, eng *engine.QueryEngine, userPrompt string, 
 		flagRunLabel = "agent:" + spec.Name
 	}
 
+	// ── NDJSON 运行事件 (与 run 默认路径同一协议, 契约见 run_events.go) ──
+	// started 的 label 用上面刚落定的 flagRunLabel (显式 --run-label 或
+	// "agent:<名>"); session/result 的数据源与 --output-format json 的信封同源。
+	// 放在这里 (store/ctx 就绪、label 落定之后, Execute 之前) 是因为这段没有提前
+	// return: started 之后的出口都经过下面的终态处理, result 天然只发一次。
+	ndjsonMode := flagEventFormat == "ndjson"
+	var ev *runEventEmitter
+	if ndjsonMode {
+		if rid := strings.TrimSpace(flagRunID); rid != "" {
+			runID = rid
+			ctx = trace.With(ctx, trace.IDs{RunID: runID, SessionID: sessionID})
+		} else if runID == "" {
+			// 无 store 且未显式给号: 事件行必须有 run_id 可填 (ndjson 才发的匿名号)。
+			runID = fmt.Sprintf("run-anon-%d", time.Now().UnixNano())
+		}
+		ev = newRunEventEmitter(os.Stdout, runID, strings.TrimSpace(flagRunLabel))
+		if sessionID != "" {
+			ev.emit("session", map[string]any{"session_id": sessionID})
+		}
+		ev.startHeartbeat()
+		defer ev.stopHeartbeat()
+	}
+
 	// 印的是**实际生效**的回合上限, 不是 agent 的声明值。
 	//
 	// ★ 这里曾经印 spec.MaxTurns, 那是个会说谎的读数: 一个 agent 没声明 maxTurns
@@ -5113,6 +5207,17 @@ func runAsAgent(cmd *cobra.Command, eng *engine.QueryEngine, userPrompt string, 
 		}
 	}
 
+	if ndjsonMode {
+		// 先停心跳再发 result —— result 必须是最后一个事件。
+		ev.stopHeartbeat()
+		ev.emitResult(runResultEventData(final, sessionID, errKind))
+		// 契约: ndjson 模式下退出码与 is_error 一致 —— runErr 非零本来就走
+		// 非零退出, 原样返回即可 (errKind 只在 runErr 非空时置位, 二者同源)。
+		if runErr != nil {
+			return runErr
+		}
+		return nil
+	}
 	if flagOutputFormat == "json" {
 		// 用默认路径同一个信封 —— 调试台按 final/is_error/error_kind/session_id
 		// 四个字段解析, 两条路径的信封形状必须一致, 否则前端要写两套解析。
@@ -5569,13 +5674,18 @@ func (r *cliAgentRunner) Execute(ctx context.Context, userPrompt string) (string
 
 // printStreamEvents 消费 StreamEvent 通道，实现 token-by-token 实时输出。
 func printStreamEvents(ch <-chan types.StreamEvent) {
-	consumeStreamEvents(ch, false)
+	consumeStreamEvents(ch, false, nil)
 }
 
 // consumeStreamEvents 消费 StreamEvent 通道。quiet=false 时 token-by-token 实时
 // 输出 (原 printStreamEvents 行为); quiet=true 时不打印, 仅累积最终 (非 thinking)
 // 文本与错误分类, 供 --output-format json 的 envelope 使用。
-func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool) (finalText, errKind string) {
+//
+// hook 是可选的运行事件挂钩 (nil 安全; 传 nil 时行为与改造前逐字节一致):
+// StreamEventToolStart/ToolDone 时以 hook("progress", {...}) 上报工具进度,
+// 供 --event-format ndjson 的 progress 事件消费。hook 在流式消费循环内同步调用,
+// 实现必须轻量 (emitter.emit 持锁写一行, 不阻塞消费)。
+func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool, hook func(kind string, data map[string]any)) (finalText, errKind string) {
 	inThinking := false
 	hasOutput := false
 	var final strings.Builder
@@ -5610,10 +5720,22 @@ func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool) (finalText, er
 				inThinking = false
 			}
 		case types.StreamEventToolStart:
+			if hook != nil {
+				hook("progress", map[string]any{
+					"phase": "tool",
+					"text":  runProgressText(ev.ToolName, ev.ToolInput),
+				})
+			}
 			if flagDebug && !quiet {
 				fmt.Printf("\n[调用工具: %s]\n", ev.ToolName)
 			}
 		case types.StreamEventToolDone:
+			if hook != nil {
+				hook("progress", map[string]any{
+					"phase": "tool",
+					"text":  runProgressText(ev.ToolName, ev.ToolResult),
+				})
+			}
 			if flagDebug && !quiet {
 				result := ev.ToolResult
 				if len(result) > 200 {
