@@ -67,6 +67,9 @@ var dashboardContract = []apiEndpoint{
 	// v1.1 编排/角色/意图/能力
 	{Pattern: "/api/workflows", Probe: "/api/workflows"},
 	{Pattern: "/api/workflows/generate", Probe: "/api/workflows/generate"},
+	// 阶段/图字段的运行时能力清单 (只读; webapp 设置页据此判断哪些字段会生效)。
+	// 必须排在前缀路由之前由 mux 精确匹配, 否则会被当成工作流名。
+	{Pattern: "/api/workflows/runtime-capabilities", Probe: "/api/workflows/runtime-capabilities"},
 	{Pattern: "/api/workflows/", Probe: "/api/workflows/novel-v2", Prefix: true},
 	// HarnessPro 进化运行控制面 (非团队运行时; webapp 工作流轮询消费)。
 	// team/create + workflow=harness-evo 在 handleAction 就地转译进这套端点。

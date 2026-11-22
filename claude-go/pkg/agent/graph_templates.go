@@ -305,6 +305,37 @@ func ModeGraphTemplateEquivalence(mode string) (string, bool) {
 	return "", false
 }
 
+// GraphEngineEnabled 是 graphEngineEnabled 的导出只读视图。
+//
+// dashboard 的运行时能力端点必须与执行分发口读**同一个判据**。若 dashboard 自己再写
+// 一遍 os.Getenv("CLAUDE_GO_GRAPH_ENGINE"), 两边迟早漂移: 面板会在灰度开关打开后
+// 继续告诉用户"这些字段不生效", 而那是比不展示更坏的错误信息。
+func GraphEngineEnabled() bool { return graphEngineEnabled() }
+
+// KnownModes 返回 claude-go 当前认识的 mode 集合 (模板表 ∪ 专属内核表 ∪ 未做表)。
+//
+// 供 dashboard 的运行时能力端点枚举。三张表都是包内实现细节, 让 dashboard 抄一份
+// mode 清单必然漂移; 由包里导出才能保证"新增 mode 忘了表态"先被守护测试抓到。
+// graph 不在前三张表里 (它本身就是直译路径, 不走灰度模板分发), 由调用方按需补充。
+func KnownModes() []string {
+	seen := make(map[string]bool, len(modeGraphTemplates)+len(modeGraphNativeKernel)+len(modeGraphNotTemplated))
+	for m := range modeGraphTemplates {
+		seen[m] = true
+	}
+	for m := range modeGraphNativeKernel {
+		seen[m] = true
+	}
+	for m := range modeGraphNotTemplated {
+		seen[m] = true
+	}
+	modes := make([]string, 0, len(seen))
+	for m := range seen {
+		modes = append(modes, m)
+	}
+	sort.Strings(modes)
+	return modes
+}
+
 // identityTemplateStages 恒等模板: 阶段序列就是工作流声明的 Stages。
 // 用于那些"执行器本身就是 DependsOn 拓扑执行"的 mode (pipeline) 以及
 // "执行器是转调 pipeline 的空壳"的 mode (fanout / adversarial)。

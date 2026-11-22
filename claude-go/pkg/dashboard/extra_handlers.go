@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/graph"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -55,6 +57,25 @@ type workflowStageDTO struct {
 	Kind string `json:"kind,omitempty"`
 	// Deterministic 本节点为纯代码判定 (gate 走确定性分支, 零 LLM)。
 	Deterministic bool `json:"deterministic,omitempty"`
+
+	// ─── 图执行字段 (21.11.21): 与 agent.StageDef 逐字同名/同 JSON 键 ───
+	//
+	// 这些字段只经 GET 方向暴露是否够用? 够 —— CREATE/UPDATE 解码的是
+	// agent.WorkflowDef 本体, StageDef 的 tag 决定写方向, DTO 只决定读方向。
+	// 但读方向少一个字段, 设置页就会把"用户看不到的现有声明"当成"未声明"并在保存时
+	// 抹掉它 (与 Tools 那条注释是同一个事故形态), 所以必须逐个搬全。
+	//
+	// 嵌套类型的 JSON 键由 pkg/graph / pkg/agent 的 tag 自带: retry.max_retries、
+	// loop.max_iterations、placement.affinity_key、groups[].maxIterations 都**不是**
+	// camelCase。这里直接复用类型而不是抄一份 DTO, 就是为了不让两边 tag 漂移。
+	Condition             string               `json:"condition,omitempty"`
+	EdgeConditions        map[string]string    `json:"edgeConditions,omitempty"`
+	Retry                 *graph.RetryPolicy   `json:"retry,omitempty"`
+	TimeoutSec            int                  `json:"timeoutSec,omitempty"`
+	Loop                  *graph.LoopPolicy    `json:"loop,omitempty"`
+	MaxTurns              int                  `json:"maxTurns,omitempty"`
+	Placement             *graph.PlacementSpec `json:"placement,omitempty"`
+	AllowUnregisteredRole bool                 `json:"allowUnregisteredRole,omitempty"`
 }
 
 type workflowDefDTO struct {
@@ -71,6 +92,11 @@ type workflowDefDTO struct {
 	// 客户端改写时要把它原样回传, 拿不到它就永远只能走"不知道覆盖了谁"的那条路。
 	// 内置工作流没有版本概念, 这一栏为空 (omitempty), 与"动态工作流 r1" 区分得开。
 	Revision int64 `json:"revision,omitempty"`
+
+	// Graph 工作流级图策略 (maxParallel/defaultRetry/maxTotalNodes/groups)。
+	// 与 StageDef 的图字段一样是"读方向必须搬全"的一项: 否则设置页打开一份带
+	// loop-group 的工作流, 会把 groups 显示成未声明并在保存时删掉它。
+	Graph *agent.WorkflowGraphPolicy `json:"graph,omitempty"`
 }
 
 // handleWorkflows: GET 列出所有工作流(内置+动态); POST 注册一个动态工作流。
@@ -518,6 +544,62 @@ func (s *Server) handleWorkflow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toWorkflowDTO(wf))
 }
 
+// ─── 运行时能力端点: 让设置页问服务端"这个字段在当前模式下会不会生效" ───
+//
+// 为什么不把生效范围写死在前端: 非 graph 模式在 CLAUDE_GO_GRAPH_ENGINE 打开且该 mode
+// 有已验证等价的图模板时**也会**走 executeGraph (workflow.go 的灰度分发口)。前端若
+// 硬编码"graph 字段只在 mode=graph 生效", 灰度一开它就变成假话, 而且没有任何报错。
+// 这里的判据全部来自 agent 包 (GraphEngineEnabled / ModeHasGraphTemplate), 与执行端
+// 是同一份。
+
+type workflowRuntimeModeCapability struct {
+	HasGraphTemplate bool   `json:"hasGraphTemplate"`
+	Equivalence      string `json:"equivalence,omitempty"`
+}
+
+type workflowRuntimeCapabilitiesDTO struct {
+	GraphEngineEnabled bool                                     `json:"graphEngineEnabled"`
+	Modes              map[string]workflowRuntimeModeCapability `json:"modes"`
+	Version            string                                   `json:"version,omitempty"`
+}
+
+// handleWorkflowRuntimeCapabilities GET /api/workflows/runtime-capabilities (只读)。
+func (s *Server) handleWorkflowRuntimeCapabilities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
+		return
+	}
+	modes := make(map[string]workflowRuntimeModeCapability, 16)
+	for _, mode := range agent.KnownModes() {
+		eq, _ := agent.ModeGraphTemplateEquivalence(mode)
+		modes[mode] = workflowRuntimeModeCapability{
+			HasGraphTemplate: agent.ModeHasGraphTemplate(mode),
+			Equivalence:      eq,
+		}
+	}
+	// graph 模式本身不在三张表里 (它就是直译路径, 不经过模板灰度分发)。
+	// 单独补上并写明: hasGraphTemplate=false 是事实, 但它不表示"图字段不生效"。
+	modes["graph"] = workflowRuntimeModeCapability{
+		HasGraphTemplate: false,
+		Equivalence:      "mode=graph 直接走 executeGraph 直译, 图字段无条件生效, 不依赖模板或灰度开关。",
+	}
+	writeJSON(w, http.StatusOK, workflowRuntimeCapabilitiesDTO{
+		GraphEngineEnabled: agent.GraphEngineEnabled(),
+		Modes:              modes,
+		Version:            buildVersion(),
+	})
+}
+
+// buildVersion 取构建信息里的主模块版本; -buildvcs 关闭或本地构建时返回空 (omitempty)。
+func buildVersion() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if v := strings.TrimSpace(bi.Main.Version); v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return ""
+}
+
 // handleWorkflowDelete DELETE /api/workflows/{name}: 删除一个动态工作流 (内置不可删) + 删除落盘文件。
 func (s *Server) handleWorkflowDelete(w http.ResponseWriter, r *http.Request, name string) {
 	if err := agent.UnregisterWorkflow(name); err != nil {
@@ -540,6 +622,7 @@ func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
 	dto := workflowDefDTO{
 		Name: wf.Name, Description: wf.Description, Mode: wf.Mode, Rounds: wf.Rounds,
 		Custom: wf.Custom, ProducesCode: wf.ProducesCode, QualityGate: wf.QualityGate,
+		Graph: cloneWorkflowGraphPolicy(wf.Graph), // 深拷贝: Groups/Terminator.Params 是引用类型
 	}
 	// Revision 走 agent.RevisionOf 而不是 wf.Revision: 内置工作流从工厂出来时
 	// Revision 恒为 0 (它们没有版本), 而 0 在上面的 DTO 里被 omitempty 吃掉 —— 这正好
@@ -561,6 +644,17 @@ func toWorkflowDTO(wf *agent.WorkflowDef) workflowDefDTO {
 			Skills:        append([]string(nil), st.Skills...),
 			Kind:          st.Kind,
 			Deterministic: st.Deterministic,
+
+			// 图执行字段: 指针/字典都必须深拷贝, 理由与 cloneStageTools 一致
+			// (响应序列化后的就地修改不得反噬注册表)。
+			Condition:             st.Condition,
+			EdgeConditions:        cloneStringMap(st.EdgeConditions),
+			Retry:                 cloneRetryPolicy(st.Retry),
+			TimeoutSec:            st.TimeoutSec,
+			Loop:                  cloneLoopPolicy(st.Loop),
+			MaxTurns:              st.MaxTurns,
+			Placement:             clonePlacementSpec(st.Placement),
+			AllowUnregisteredRole: st.AllowUnregisteredRole,
 		})
 	}
 	return dto
@@ -590,6 +684,91 @@ func cloneStageTools(st *agent.StageTools) *agent.StageTools {
 		out.Deny = append([]string(nil), st.Deny...)
 	}
 	return out
+}
+
+// cloneStringSlice 保留 nil / 空非 nil 的区别。
+//
+// append([]string(nil), emptyNonNil...) 会退回 nil —— 对 DependsOn 之类无所谓,
+// 但对"显式空"有语义的字段 (如 Placement.Require) 会把两种状态抹成一种。
+func cloneStringSlice(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string{}, in...)
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// cloneRetryPolicy 值拷贝即可: RetryPolicy 只有两个标量。
+func cloneRetryPolicy(p *graph.RetryPolicy) *graph.RetryPolicy {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	return &cp
+}
+
+// cloneLoopPolicy 深拷贝 Terminator (它自己带 map 参数)。
+func cloneLoopPolicy(p *graph.LoopPolicy) *graph.LoopPolicy {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	cp.Terminator = cloneTerminatorSpec(p.Terminator)
+	return &cp
+}
+
+func cloneTerminatorSpec(t *graph.TerminatorSpec) *graph.TerminatorSpec {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	if t.Params != nil {
+		cp.Params = make(map[string]string, len(t.Params))
+		for k, v := range t.Params {
+			cp.Params[k] = v
+		}
+	}
+	return &cp
+}
+
+func clonePlacementSpec(p *graph.PlacementSpec) *graph.PlacementSpec {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	cp.Require = cloneStringSlice(p.Require)
+	return &cp
+}
+
+// cloneWorkflowGraphPolicy 深拷贝工作流级图策略。
+//
+// Groups 是切片, 每个元素的 Members 是切片、Terminator 带 map —— 与 cloneStageTools
+// 同一条理由: 外层切片 copy 只能隔离"增删元素", 隔离不了元素内部的共享引用。
+func cloneWorkflowGraphPolicy(g *agent.WorkflowGraphPolicy) *agent.WorkflowGraphPolicy {
+	if g == nil {
+		return nil
+	}
+	cp := *g
+	cp.DefaultRetry = cloneRetryPolicy(g.DefaultRetry)
+	if g.Groups != nil {
+		cp.Groups = make([]agent.StageGroupOverride, len(g.Groups))
+		for i := range g.Groups {
+			cp.Groups[i] = g.Groups[i]
+			cp.Groups[i].Members = cloneStringSlice(g.Groups[i].Members)
+			cp.Groups[i].Terminator = cloneTerminatorSpec(g.Groups[i].Terminator)
+		}
+	}
+	return &cp
 }
 
 // =====================================================================

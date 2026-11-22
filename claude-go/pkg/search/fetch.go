@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	stdhtml "html"
@@ -277,6 +278,21 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 	case "text/plain", "text/markdown":
 		markdown = normalizeMarkdown(text)
 		title = firstLine(markdown)
+	case "application/atom+xml", "application/rss+xml", "application/rdf+xml",
+		"text/xml", "application/xml":
+		// 学术站点大量用 feed 输出列表 (arXiv listing、期刊 TOC、会议通知),
+		// 之前落在 default 被判 unsupported。feed 结构化成标题+条目链接清单,
+		// 比裸 XML 文本对检索/阅读都更有用。
+		feed, ferr := parseFeedXML(text)
+		if ferr != nil || (feed.title() == "" && len(feed.items()) == 0) {
+			return nil, Wrap("fetch", ErrUnsupported, fmt.Errorf("unparseable feed %q", mediaType))
+		}
+		title = feed.title()
+		items := feed.items()
+		markdown = feedMarkdown(items)
+		if len(items) > 0 && !items[0].published().IsZero() {
+			published = items[0].published()
+		}
 	default:
 		return nil, Wrap("fetch", ErrUnsupported, fmt.Errorf("unsupported content type %q", mediaType))
 	}
@@ -1417,6 +1433,120 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// feedDoc/feedEntry 以 union 结构同时兼容 Atom (feed/entry) 与 RSS
+// (rss/channel/item) —— 两者字段名不同但语义一一对应, 一次解码全取。
+type feedDoc struct {
+	Title   string     `xml:"title"`
+	Entries []feedEntry `xml:"entry"`
+	Channel struct {
+		Title string      `xml:"title"`
+		Items []feedEntry `xml:"item"`
+	} `xml:"channel"`
+}
+
+// feedEntry 是一条 Atom entry 或 RSS item。Summary/Content/Desc 三选一,
+// 谁非空用谁; 时间字段同理 (Atom 用 published/updated, RSS 用 pubDate)。
+type feedEntry struct {
+	Title   string `xml:"title"`
+	Link    struct {
+		Href string `xml:"href,attr"` // Atom: <link href="..."/>
+		Text string `xml:",chardata"` // RSS: <link>http://...</link>
+	} `xml:"link"`
+	Summary   string `xml:"summary"`
+	Content   string `xml:"content"`
+	Desc      string `xml:"description"`
+	Published string `xml:"published"`
+	Updated   string `xml:"updated"`
+	PubDate   string `xml:"pubDate"`
+}
+
+// published 返回条目时间 (按 Atom→RSS 字段序取第一个能解析的)。
+func (e feedEntry) published() time.Time {
+	return parseFeedTime(firstNonEmpty(e.Published, e.Updated, e.PubDate))
+}
+
+// feedLink 返回条目链接 (Atom 属性优先, RSS 文本兜底)。
+func (e feedEntry) link() string {
+	return strings.TrimSpace(firstNonEmpty(e.Link.Href, e.Link.Text))
+}
+
+func (d *feedDoc) title() string {
+	return strings.TrimSpace(firstNonEmpty(d.Title, d.Channel.Title))
+}
+
+// items 返回条目列表 (Atom 的 entry 或 RSS channel 的 item)。
+func (d *feedDoc) items() []feedEntry {
+	if len(d.Entries) > 0 {
+		return d.Entries
+	}
+	return d.Channel.Items
+}
+
+// parseFeedTime 尝试常见 feed 日期格式; 全部失败返回零值 (调用方降级展示原文)。
+func parseFeedTime(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+		time.RFC1123Z, // RSS pubDate: Mon, 02 Jan 2006 15:04:05 -0700
+		time.RFC1123,
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// parseFeedXML 解码 Atom/RSS feed, 容忍未知扩展标签 (encoding/xml 跳过)。
+func parseFeedXML(raw string) (*feedDoc, error) {
+	var doc feedDoc
+	if err := xml.Unmarshal([]byte(raw), &doc); err != nil {
+		return nil, err
+	}
+	return &doc, nil
+}
+
+// feedMarkdown 把 feed 条目渲染成清单式 Markdown: 每条 = 链接标题 + 日期 +
+// 摘要正文 (摘要是 HTML 片段, 走 extractHTML 转纯文本)。没有可展示内容的
+// 条目直接跳过, 全空时返回空串由调用方判 unsupported。
+func feedMarkdown(items []feedEntry) string {
+	var sb strings.Builder
+	for _, it := range items {
+		title := strings.TrimSpace(it.Title)
+		link := it.link()
+		if title == "" && link == "" {
+			continue
+		}
+		head := title
+		if head == "" {
+			head = link
+		}
+		if link != "" && title != "" {
+			head = "[" + title + "](" + link + ")"
+		}
+		sb.WriteString("- ")
+		sb.WriteString(head)
+		if t := it.published(); !t.IsZero() {
+			sb.WriteString(" — ")
+			sb.WriteString(t.Format("2006-01-02"))
+		}
+		if body := strings.TrimSpace(firstNonEmpty(it.Summary, it.Content, it.Desc)); body != "" {
+			if md := strings.TrimSpace(extractHTML(body).Markdown); md != "" {
+				sb.WriteString("\n  ")
+				sb.WriteString(strings.ReplaceAll(md, "\n", "\n  "))
+			}
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 // parseJSONLD 解析一段 JSON-LD, 递归寻找 headline/author/datePublished。

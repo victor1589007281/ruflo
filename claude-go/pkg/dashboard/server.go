@@ -324,6 +324,9 @@ func (s *Server) registerRoutesOn(mux *http.ServeMux) {
 	// v1.1 扩展
 	mux.HandleFunc("/api/workflows", s.handleWorkflows)
 	mux.HandleFunc("/api/workflows/generate", s.handleWorkflowGenerate) // LLM 生成编排 (更具体, 优先于下面)
+	// 运行时能力 (只读): 静态精确路径必须优先于 /api/workflows/ 的 {name} 通配,
+	// 否则 "runtime-capabilities" 会被当成一个工作流名去查表并返回 404。
+	mux.HandleFunc("/api/workflows/runtime-capabilities", s.handleWorkflowRuntimeCapabilities)
 	// HarnessPro 进化运行控制面 (webapp 工作流轮询消费; 非团队运行时,
 	// 故不走 /api/teams 协议)。/runs 精确前缀优先于 /runs/ 前缀。
 	mux.HandleFunc("/api/harness-evo/runs", s.handleHarnessEvoRuns)
