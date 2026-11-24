@@ -370,6 +370,13 @@ func (w *Worker) execute(parent context.Context, task *cluster.Task) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	// 节点声明回填 ctx: 生产 factory 在**创建时**从 ctx 读 tool_profile/max_turns。
+	// 工具名单独立恢复: 只声明 deny 或显式空 allow 时 Hints 也可能全空, 不能让它
+	// 当“没有阶段工具声明”处理。安全边界宁可在未声明时多带一个空结构。
+	ctx = agent.WithStageTools(ctx, &agent.StageTools{
+		Profile: st.ToolProfile,
+		Allow:   cloneStringsPtr(st.ToolAllow),
+		Deny:    append([]string(nil), st.ToolDeny...),
+	})
 	if h := st.Hints(); h != (agent.NodeExecHints{}) {
 		ctx = agent.WithNodeExecHints(ctx, h)
 	}

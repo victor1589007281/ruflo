@@ -66,6 +66,7 @@ func TestSessionPassthrough_会话身份穿过任务边界(t *testing.T) {
 }
 
 func TestModelAliasPassthrough_队列与执行上下文都不丢(t *testing.T) {
+	t.Setenv("CLAUDE_GO_LLM_GATEWAY", "")
 	const alias = "opencode:hungerg-free"
 	payload, err := EncodeStageTask(StageTask{
 		RunID: "r", NodeID: "n", Role: "coder", UserPrompt: "x", ModelAlias: alias,
@@ -94,6 +95,59 @@ func TestModelAliasPassthrough_队列与执行上下文都不丢(t *testing.T) {
 	got := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig)
 	if got.Alias != alias || got.APIKey != "worker-key" {
 		t.Fatalf("worker 未用本地目录还原模型配置: alias=%q", got.Alias)
+	}
+}
+
+// 工具名单与 model_alias 同属阶段执行声明: 丢了不报错, 只会让远程节点拿到
+// 更宽的工具面。这里钉住 JSON 形态、nil/空集区别和到 RuntimeNodeTask 的搬运。
+func TestStageToolsPassthrough_精确名单穿过队列边界(t *testing.T) {
+	allow := []string{"Read", "Write", "code_intel_query"}
+	deny := []string{"Bash"}
+	payload, err := EncodeStageTask(StageTask{
+		RunID: "r", NodeID: "n", Role: "poster-intake", UserPrompt: "x",
+		ToolProfile: agent.ProfileCoding, ToolAllow: &allow, ToolDeny: deny,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(payload) || !strings.Contains(string(payload), `"tool_allow":["Read","Write","code_intel_query"]`) ||
+		!strings.Contains(string(payload), `"tool_deny":["Bash"]`) {
+		t.Fatalf("队列载荷缺少精确工具名单: %s", payload)
+	}
+	st, err := DecodeStageTask(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := st.ToRuntimeTask()
+	if rt.ToolAllow == nil || len(*rt.ToolAllow) != 3 || (*rt.ToolAllow)[2] != "code_intel_query" ||
+		len(rt.ToolDeny) != 1 || rt.ToolDeny[0] != "Bash" {
+		t.Fatalf("ToRuntimeTask 丢了工具名单: %+v", rt)
+	}
+	(*rt.ToolAllow)[0] = "Bash"
+	if (*st.ToolAllow)[0] != "Read" {
+		t.Fatal("ToRuntimeTask 与载荷共享了白名单底层数组")
+	}
+
+	emptyPayload, err := EncodeStageTask(StageTask{
+		RunID: "r", NodeID: "n", Role: "poster", UserPrompt: "x", ToolAllow: &[]string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := DecodeStageTask(emptyPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.ToolAllow == nil || len(*empty.ToolAllow) != 0 {
+		t.Fatalf("显式空白名单必须保留为非 nil 空集: %+v", empty.ToolAllow)
+	}
+
+	old, err := DecodeStageTask(json.RawMessage(`{"run_id":"r","node_id":"n","role":"coder","user_prompt":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.ToolAllow != nil || len(old.ToolDeny) != 0 {
+		t.Fatal("老载荷不该凭空生成工具名单")
 	}
 }
 

@@ -293,11 +293,14 @@ func TestWorker_跨进程取消真的停下来(t *testing.T) {
 // 模型选择必须穿过真实控制面队列, 并在 worker 侧用**本地目录**还原进创建 ctx。
 // 只测 EncodeStageTask 不够: broker、PullFor、execute 三处都可能把字段吃掉。
 func TestWorker_模型别名穿过队列并由本地目录还原(t *testing.T) {
+	// 本机 shell 可能把全局出站改指网关。测试固定成无覆盖, 才能断言 worker 确实
+	// 用了注册表里的 provider 地址, 而不是测出宿主机环境。
+	t.Setenv("CLAUDE_GO_LLM_GATEWAY", "")
 	const alias = "opencode:hungerg-free"
 	registry := modelconfig.NewProviderRegistry()
 	registry.RegisterProvider(modelconfig.ProviderConfig{
 		Name: "opencode", BaseURL: "https://models.example.test/v1", APIKey: "worker-key",
-		Models: map[string]modelconfig.ModelConfig{alias: {}},
+		Models: map[string]modelconfig.ModelConfig{"opencode:hungerg-free": {}},
 	})
 	resolver := modelconfig.NewConfigResolver(registry, modelconfig.GlobalConfig{}, nil)
 	registry.RegisterProvider(modelconfig.ProviderConfig{
@@ -382,6 +385,56 @@ func TestWorker_未知或缺失模型解析器拒绝执行(t *testing.T) {
 			}
 			if called {
 				t.Fatal("模型校验失败后仍执行了任务")
+			}
+		})
+	}
+}
+
+// 精确工具名单必须走完整控制面队列。只测 JSON 搬运挡不住 runtimeRunner 没填字段、
+// broker 没转发或 worker 没回填 ctx —— 这三处断链都表现为“任务成功但工具面变宽”。
+func TestWorker_精确工具名单穿过队列并在worker恢复(t *testing.T) {
+	allowCases := []struct {
+		name  string
+		allow *[]string
+	}{
+		{"白名单", &[]string{"Read", "Write", "code_intel_status", "code_intel_query"}},
+		{"显式空名单", &[]string{}},
+	}
+	for _, c := range allowCases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			tc := newTestControl(t, controlOpts{})
+			remote := tc.brk.Runtime("w1", agent.RuntimeCaps{Bash: true})
+			reg := agent.NewRuntimeRegistry()
+			reg.Register(remote, 0)
+			createCtx := agent.WithStageTools(context.Background(), &agent.StageTools{
+				Profile: agent.ProfileCoding, Allow: c.allow, Deny: []string{"Bash"},
+			})
+			runner, err := RuntimeFactory(reg, &agent.Placement{}, nil)(createCtx, "poster-intake", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			seen := make(chan *agent.StageTools, 1)
+			rt := echoRuntime("local-w1", agent.RuntimeCaps{Bash: true},
+				func(ctx context.Context, _, _ string) (string, error) {
+					seen <- agent.StageToolsFromContext(ctx)
+					return "ok", nil
+				})
+			tc.startWorker(t, Options{Name: "w1", Runtime: rt})
+
+			if _, err := runner.Execute(context.Background(), "干活"); err != nil {
+				t.Fatal(err)
+			}
+			got := <-seen
+			if got == nil || got.Allow == nil || len(*got.Allow) != len(*c.allow) ||
+				len(got.Deny) != 1 || got.Deny[0] != "Bash" {
+				t.Fatalf("worker 侧工具名单丢失: %+v", got)
+			}
+			for i := range *c.allow {
+				if (*got.Allow)[i] != (*c.allow)[i] {
+					t.Fatalf("worker 侧白名单漂移: 期望 %v, 实得 %v", *c.allow, *got.Allow)
+				}
 			}
 		})
 	}

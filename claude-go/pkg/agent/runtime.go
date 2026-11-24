@@ -110,7 +110,11 @@ type RuntimeNodeTask struct {
 	UserPrompt   string
 	Workspace    string // 团队 cwd; 空 = runtime 自行决定
 	ToolProfile  string // 显式工具画像 (取代角色名子串推断)
-	MaxTurns     int
+	// ToolAllow 是本阶段精确声明的工具白名单。nil = 未声明; 非 nil 空集 = 拒绝一切。
+	// 只传名单, 不传约束集: worker 侧必须把它与本地会话/治理约束重新求交集。
+	ToolAllow *[]string
+	ToolDeny  []string
+	MaxTurns  int
 	// ModelAlias 是本阶段最终选中的模型目录别名, 不含密钥。空 = 沿用运行时默认。
 	// 控制面只传别名, worker 用自己的热加载模型目录解析出完整连接配置: 既让选择
 	// 跨进程不丢失, 又不把 ResolvedConfig 里的 API key 写进队列载荷。
@@ -383,6 +387,15 @@ func cancelKey(runID, nodeID string) string { return runID + "/" + nodeID }
 //	设计权衡：panic 被 recover 成一条 NodeEventFailed 事件而不是向上抛 —— 单个节点的
 //	      runner panic 不该带走整个进程; 代价是 panic 现场被压成一行错误串。
 func (l *localRuntime) Execute(ctx context.Context, task RuntimeNodeTask) (<-chan NodeEvent, error) {
+	if task.ToolAllow != nil || len(task.ToolDeny) > 0 {
+		st := StageToolsFromContext(ctx)
+		if st == nil {
+			st = &StageTools{}
+		}
+		ctx = WithStageTools(ctx, &StageTools{
+			Profile: st.Profile, Allow: task.ToolAllow, Deny: task.ToolDeny,
+		})
+	}
 	if alias := strings.TrimSpace(task.ModelAlias); alias != "" {
 		mc, ok := ctx.Value(ModelConfigKey{}).(modelconfig.ResolvedConfig)
 		if !ok || strings.TrimSpace(mc.Alias) != alias || mc.ProviderName == "" {

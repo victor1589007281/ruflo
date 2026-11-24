@@ -68,7 +68,7 @@ func WorkerCap(name string) string { return CapWorkerPrefix + name }
 // StageTask 一个 stage 任务的自包含载荷 (cluster.Task.Payload 的 JSON 编码)。
 //
 // **自包含**是 design/02 §3.3 的关键约束: 远程 worker 不该靠读本机状态目录来
-// 猜这个节点要干什么。所以 role/prompt/工具画像/轮数上限全部随任务下发。
+// 猜这个节点要干什么。所以 role/prompt/工具画像/精确工具名单/轮数上限全部随任务下发。
 //
 // ⚠️ 诚实边界: 系统提示词目前仍由 worker 侧按 role 组装 —— 既有
 // `CreateAgentFunc` 契约就是 `(ctx, role, systemPrompt)` 且生产调用方传的
@@ -87,7 +87,11 @@ type StageTask struct {
 	UserPrompt   string `json:"user_prompt"`
 	Workspace    string `json:"workspace,omitempty"`    // 需要的团队 cwd; 空=worker 自行决定
 	ToolProfile  string `json:"tool_profile,omitempty"` // 显式工具画像 (取代角色名子串推断)
-	MaxTurns     int    `json:"max_turns,omitempty"`
+	// ToolAllow/ToolDeny 是阶段声明的精确工具名单。指针保留 nil/空集区别;
+	// worker 侧恢复成 StageTools, 再与本地治理约束求交集, 绝不把控制面的宽名单当放行证。
+	ToolAllow *[]string `json:"tool_allow,omitempty"`
+	ToolDeny  []string  `json:"tool_deny,omitempty"`
+	MaxTurns  int       `json:"max_turns,omitempty"`
 	// ModelAlias 是控制面最终选中的模型目录别名。只传别名, 不传含密钥的
 	// ResolvedConfig; worker 用本地热加载目录严格解析后注入 ModelConfigKey。
 	ModelAlias string   `json:"model_alias,omitempty"`
@@ -149,9 +153,19 @@ func (st StageTask) ToRuntimeTask() agent.RuntimeNodeTask {
 		UserPrompt:   st.UserPrompt,
 		Workspace:    st.Workspace,
 		ToolProfile:  st.ToolProfile,
+		ToolAllow:    cloneStringsPtr(st.ToolAllow),
+		ToolDeny:     append([]string(nil), st.ToolDeny...),
 		MaxTurns:     st.MaxTurns,
 		ModelAlias:   st.ModelAlias,
 	}
+}
+
+func cloneStringsPtr(in *[]string) *[]string {
+	if in == nil {
+		return nil
+	}
+	out := append([]string{}, (*in)...)
+	return &out
 }
 
 // Hints 把任务里的节点声明还原成 ctx 里的 NodeExecHints。

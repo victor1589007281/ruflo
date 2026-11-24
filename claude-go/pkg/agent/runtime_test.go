@@ -223,7 +223,40 @@ func TestLocalRuntime_收编AgentRunner(t *testing.T) {
 	}
 }
 
+func TestLocalRuntime_任务工具名单回填创建上下文(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		allow *[]string
+	}{
+		{"白名单", &[]string{"Read", "code_intel_query"}},
+		{"显式空名单", &[]string{}},
+	} {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			var got *StageTools
+			rt := NewLocalRuntime("local-tools", RuntimeCaps{}, func(ctx context.Context, _, _ string) (AgentRunner, error) {
+				got = StageToolsFromContext(ctx)
+				return &rtRunner{out: "ok"}, nil
+			})
+			ch, err := rt.Execute(context.Background(), RuntimeNodeTask{
+				RunID: "r", NodeID: "n", Role: "coder", UserPrompt: "x",
+				ToolProfile: ProfileCoding, ToolAllow: c.allow, ToolDeny: []string{"Bash"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := CollectRuntimeOutput(ch); err != nil {
+				t.Fatal(err)
+			}
+			if got == nil || got.Allow == nil || len(*got.Allow) != len(*c.allow) || len(got.Deny) != 1 || got.Deny[0] != "Bash" {
+				t.Fatalf("任务级工具名单未回填创建 ctx: %+v", got)
+			}
+		})
+	}
+}
+
 func TestLocalRuntime_任务模型别名回填创建上下文(t *testing.T) {
+	t.Setenv("CLAUDE_GO_LLM_GATEWAY", "")
 	registry := modelconfig.NewProviderRegistry()
 	registry.RegisterProvider(modelconfig.ProviderConfig{
 		Name: "opencode", BaseURL: "https://models.example.test/v1", APIKey: "test-key",

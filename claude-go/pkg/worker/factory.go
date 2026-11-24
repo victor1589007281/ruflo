@@ -71,6 +71,15 @@ func RuntimeFactory(reg agent.RuntimeRegistry, def *agent.Placement, ws *Workspa
 		if mc, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok {
 			modelAlias = strings.TrimSpace(mc.Alias)
 		}
+		var toolAllow *[]string
+		var toolDeny []string
+		if st := agent.StageToolsFromContext(ctx); st != nil {
+			if st.Allow != nil {
+				allow := append([]string{}, (*st.Allow)...)
+				toolAllow = &allow
+			}
+			toolDeny = append([]string(nil), st.Deny...)
+		}
 		// 创建时捕获: Execute 时的 ctx 已被 runAgent 换过 (见
 		// feishu/session.go:1035 同款注释), 那时 hints/trace/model 都拿不到。
 		return &runtimeRunner{
@@ -81,6 +90,8 @@ func RuntimeFactory(reg agent.RuntimeRegistry, def *agent.Placement, ws *Workspa
 			ids:          trace.From(ctx),
 			meta:         agent.RunMetadataFromContext(ctx),
 			modelAlias:   modelAlias,
+			toolAllow:    toolAllow,
+			toolDeny:     toolDeny,
 			def:          def,
 			ws:           ws,
 		}, nil
@@ -96,6 +107,8 @@ type runtimeRunner struct {
 	ids          trace.IDs
 	meta         agent.RunMetadata
 	modelAlias   string
+	toolAllow    *[]string
+	toolDeny     []string
 	def          *agent.Placement
 	ws           *WorkspacePolicy
 }
@@ -200,6 +213,8 @@ func (r *runtimeRunner) Execute(ctx context.Context, userPrompt string) (string,
 		SystemPrompt: r.systemPrompt,
 		UserPrompt:   userPrompt,
 		ToolProfile:  r.hints.ToolProfile,
+		ToolAllow:    cloneStringsPtr(r.toolAllow),
+		ToolDeny:     append([]string(nil), r.toolDeny...),
 		MaxTurns:     r.hints.MaxTurns,
 		ModelAlias:   r.modelAlias,
 		Placement:    p,
@@ -211,14 +226,21 @@ func (r *runtimeRunner) Execute(ctx context.Context, userPrompt string) (string,
 		task.Workspace = strings.TrimSpace(r.meta.Cwd)
 	}
 
-	// hints/trace 回填 ctx: 命中**本地** runtime 时, 它会把这个 ctx 直接交给宿主
-	// factory, 而宿主 factory 是从 ctx 读 tool_profile / max_turns 的。不回填就等于
-	// 接上 runtime 层之后把节点声明丢了 (远程路径靠任务字段传, 不受影响)。
+	// hints/trace/工具名单回填 ctx: 命中本地 runtime 时, 它会把 ctx 直接交给宿主
+	// factory, 而宿主 factory 是从 ctx 读 tool_profile / max_turns / tools 的。
+	// 不回填就等于接上 runtime 层之后把节点声明丢了 (远程路径靠任务字段传)。
 	if r.hints != (agent.NodeExecHints{}) {
 		ctx = agent.WithNodeExecHints(ctx, r.hints)
 	}
 	if ids.RunID != "" || ids.NodeID != "" {
 		ctx = trace.With(ctx, ids)
+	}
+	// 名单是安全边界, 不能只在 worker 侧恢复: 命中本地 runtime 时 ctx 会直接交给
+	// 宿主 factory。命中远程 runtime 时由 StageTask 携带, 两边都必须看到同一份声明。
+	if r.toolAllow != nil || len(r.toolDeny) > 0 {
+		ctx = agent.WithStageTools(ctx, &agent.StageTools{
+			Profile: r.hints.ToolProfile, Allow: r.toolAllow, Deny: r.toolDeny,
+		})
 	}
 
 	ch, err := rt.Execute(ctx, task)

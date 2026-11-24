@@ -19,6 +19,7 @@ type recordRuntime struct {
 	err   error
 	tasks []agent.RuntimeNodeTask
 	hints []agent.NodeExecHints
+	tools []*agent.StageTools
 	ids   []trace.IDs
 	cfgs  []modelconfig.ResolvedConfig
 }
@@ -29,6 +30,7 @@ func (r *recordRuntime) Cancel(string, string) error     { return nil }
 func (r *recordRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask) (<-chan agent.NodeEvent, error) {
 	r.tasks = append(r.tasks, task)
 	r.hints = append(r.hints, agent.NodeExecHintsFromContext(ctx))
+	r.tools = append(r.tools, agent.StageToolsFromContext(ctx))
 	r.ids = append(r.ids, trace.From(ctx))
 	r.cfgs = append(r.cfgs, recordModelConfig(ctx))
 	ch := make(chan agent.NodeEvent, 2)
@@ -69,6 +71,50 @@ func TestRuntimeFactory_模型别名创建时捕获并下传(t *testing.T) {
 	}
 	if len(rec.cfgs) != 1 || rec.cfgs[0].Alias != "" {
 		t.Fatalf("RuntimeNodeTask.ModelAlias 不能冒充 ResolvedConfig: %+v", rec.cfgs)
+	}
+}
+
+// 精确工具名单必须跨 runtime 边界保留, 且显式空白名单不能被 JSON/传输吞掉。
+// 否则只声明 profile 的远程阶段会拿到整个 coding 工具面, 连带拿到 Bash 和索引写工具。
+func TestRuntimeFactory_工具名单创建时捕获并回填ctx(t *testing.T) {
+	rec := &recordRuntime{name: "remote-w1", caps: agent.RuntimeCaps{Bash: true}, out: "ok"}
+	reg := agent.NewRuntimeRegistry()
+	reg.Register(rec, 0)
+	allow := []string{"Read", "Write", "code_intel_query"}
+	deny := []string{"Bash"}
+	ctx := agent.WithStageTools(context.Background(), &agent.StageTools{
+		Profile: agent.ProfileCoding, Allow: &allow, Deny: deny,
+	})
+	runner, err := RuntimeFactory(reg, &agent.Placement{}, nil)(ctx, "poster-intake", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Execute(context.Background(), "干活"); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.tools[0]; got == nil || got.Allow == nil || len(*got.Allow) != 3 ||
+		(*got.Allow)[0] != "Read" || len(got.Deny) != 1 || got.Deny[0] != "Bash" {
+		t.Fatalf("工具名单未回填 ctx: %+v", got)
+	}
+
+	// 修改创建时的切片不应串改 runner 已捕获的声明。
+	allow[0] = "Bash"
+	deny[0] = "Read"
+	if (*rec.tools[0].Allow)[0] != "Read" || rec.tools[0].Deny[0] != "Bash" {
+		t.Fatal("runner 与调用方共享了工具名单底层数组")
+	}
+
+	empty := []string{}
+	runner2, err := RuntimeFactory(reg, nil, nil)(
+		agent.WithStageTools(context.Background(), &agent.StageTools{Allow: &empty}), "poster", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner2.Execute(context.Background(), "x"); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.tools[1]; got == nil || got.Allow == nil || len(*got.Allow) != 0 {
+		t.Fatalf("显式空白名单被吞掉: %+v", got)
 	}
 }
 
@@ -133,6 +179,9 @@ func TestRuntimeFactory_节点声明与trace下传(t *testing.T) {
 	// 本地 runtime 是从 **ctx** 读声明的 (宿主 factory 的既有契约), 所以 ctx 也必须回填。
 	if rec.hints[0].ToolProfile != "coding" || rec.hints[0].MaxTurns != 42 {
 		t.Errorf("hints 未回填 ctx: %+v", rec.hints[0])
+	}
+	if got := rec.tasks[0]; got.ToolAllow != nil || len(got.ToolDeny) != 0 {
+		t.Errorf("未声明工具名单时不该凭空生成: allow=%v deny=%v", got.ToolAllow, got.ToolDeny)
 	}
 	if rec.ids[0].RunID != "run-x" || rec.ids[0].NodeID != "impl" {
 		t.Errorf("trace 未回填 ctx: %+v", rec.ids[0])
