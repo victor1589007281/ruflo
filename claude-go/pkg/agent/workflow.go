@@ -2459,9 +2459,15 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 			// creative-planner / html-developer / art-director / media-producer):
 			// 必须补上 stage 的具体任务, 否则 agent 收不到目标, 只会自我介绍并反向索要需求 (历史 bug)。
 			task := substituteStagePlaceholders(stage.Prompt, objective, prevOutput.String(), prevResults)
-			if strings.TrimSpace(task) == "" {
-				// stage 自身也没有任务模板 (如 final-delivery): 注入显式任务块。
-				task = buildExplicitTaskBlock(objective, prevOutput.String())
+			// stage.Prompt 非空不等于它承载了目标。任务块本身也必须检查 ——
+			// 海报这类动态工作流的内联 Prompt 往往只有操作说明, 没有 {objective};
+			// 只看 task 是否为空会让 BRIEF 路径静默消失, agent 随后反向索要需求。
+			if strings.TrimSpace(objective) == "" || !strings.Contains(task, objective) {
+				if strings.TrimSpace(task) == "" {
+					task = buildExplicitTaskBlock(objective, prevOutput.String())
+				} else {
+					task += "\n\n" + buildExplicitTaskBlock(objective, prevOutput.String())
+				}
 			}
 			return merged + "\n\n---\n\n" + task + extra
 		}
@@ -2469,6 +2475,15 @@ func buildStagePromptWithRoles(stage StageDef, objective string, prevResults map
 
 	// 降级: 使用 StageDef 中的内联 Prompt
 	prompt := substituteStagePlaceholders(stage.Prompt, objective, prevOutput.String(), prevResults)
+	// 角色表缺失也必须保住目标。非空但无 {objective} 的 inline Prompt 与
+	// persona-only 角色是同一个漏目标形状, 不能只在有角色的分支兜底。
+	if strings.TrimSpace(objective) != "" && !strings.Contains(prompt, objective) {
+		if strings.TrimSpace(prompt) == "" {
+			prompt = buildExplicitTaskBlock(objective, prevOutput.String())
+		} else {
+			prompt += "\n\n" + buildExplicitTaskBlock(objective, prevOutput.String())
+		}
+	}
 	return prompt + extra
 }
 
