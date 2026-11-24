@@ -36,8 +36,18 @@ type ModelConfig struct {
 	// 或 "openai-responses"(/v1/responses)。模型级配置 —— 如 opencode:mimo-v2.5 的
 	// tool_use 必须走 OpenAI 协议 (opencode Anthropic→OpenAI 转换层丢 name 字段返回 400),
 	// opencode:muse-spark-1.2-contributor 走 OpenAI Responses API, 其余 opencode 模型走 Anthropic。
-	Protocol      string `json:"protocol,omitempty"`
-	ContextWindow int    `json:"contextWindow,omitempty"` // 上下文窗口长度
+	Protocol string `json:"protocol,omitempty"`
+	// UpstreamBaseURL 覆盖该模型的出站根地址 (含 /v1 之类路径, 不带尾斜杠)。
+	//
+	// 只对非对话协议有意义: 聚合上游把不同 wire 放在不同 base 下 ——
+	// opencode 的对话在 /zen/go/v1, 决策(systemone)在 /inference/go/systemone/v1,
+	// 向量(embeddings)在 /inference/go/openai/v1。provider 级 baseUrl 只有一个,
+	// 而这几类模型共用同一个 provider/凭据, 所以"这一个模型发到哪"必须能在
+	// 模型级改指; 留空 = 沿用 provider.baseUrl (行为与改造前相同)。
+	//
+	// 网关据此拼 /embeddings 与 /systemone, 见 cmd/anthropic-gateway。
+	UpstreamBaseURL string `json:"upstreamBaseUrl,omitempty"`
+	ContextWindow   int    `json:"contextWindow,omitempty"` // 上下文窗口长度
 	// ReasoningPlayback 出站回传上一轮推理的字段名 —— 只对 protocol:"openai" 有意义。
 	//
 	//    ""                    = 不回传 (默认, 与改造前逐字节相同)
@@ -184,7 +194,9 @@ type ResolvedConfig struct {
 	MaxTokens       int
 	MaxTurns        int
 	PromptCacheMode string
-	Protocol        string // "anthropic"(默认) | "openai" | "openai-responses"; 见 ModelConfig.Protocol
+	Protocol        string // "anthropic"(默认) | "openai" | "openai-responses" | "embeddings" | "systemone"; 见 ModelConfig.Protocol
+	// UpstreamBaseURL 模型级出站根地址覆盖 (非对话协议用); 空 = 用 BaseURL。见 ModelConfig.UpstreamBaseURL。
+	UpstreamBaseURL string
 	// ReasoningPlayback 出站回传推理用的 OpenAI 字段名; 见 ModelConfig.ReasoningPlayback。
 	// "" = 不回传。指向 api.Client.ReasoningPlayback。
 	ReasoningPlayback string

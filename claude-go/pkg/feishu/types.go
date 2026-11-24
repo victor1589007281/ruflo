@@ -629,8 +629,13 @@ type ProviderModelConfig struct {
 	PromptCacheMode string `json:"promptCacheMode,omitempty"`
 	ContextWindow   int    `json:"contextWindow,omitempty"`
 	// Protocol 出站协议: ""(默认 anthropic /messages) | "openai" (/chat/completions)
-	// | "openai-responses" (/v1/responses, opencode 对 muse-spark 等 Meta 模型推荐)。
+	// | "openai-responses" (/v1/responses, opencode 对 muse-spark 等 Meta 模型推荐)
+	// | "embeddings" (向量) | "systemone" (决策, 概率输出)。
 	Protocol string `json:"protocol,omitempty"`
+	// UpstreamBaseURL 模型级出站根地址覆盖。聚合上游把不同 wire 分在不同 base 下
+	// (opencode: 对话 /zen/go/v1、决策 /inference/go/systemone/v1、向量 /inference/go/openai/v1),
+	// 而 provider 只有一个 baseUrl。留空 = 用 provider.baseUrl。见 modelconfig.ModelConfig。
+	UpstreamBaseURL string `json:"upstreamBaseUrl,omitempty"`
 	// ReasoningPlayback 出站回传上一轮推理的 OpenAI 字段名; 只对 protocol:"openai"
 	// 有意义 (""=不回传, "reasoning", "reasoning_content")。
 	// 与 Protocol 一样是模型级开关: DeepSeek 拒绝在请求里回传 reasoning_content,
@@ -952,6 +957,7 @@ func (jc *JSONConfig) ToModelConfigJSON() modelconfig.ConfigJSON {
 					PromptCacheMode:      mc.PromptCacheMode,
 					ContextWindow:        mc.ContextWindow,
 					Protocol:             mc.Protocol,
+					UpstreamBaseURL:      mc.UpstreamBaseURL,
 					ReasoningPlayback:    mc.ReasoningPlayback,
 					Proxy:                mc.Proxy,
 					RPM:                  mc.RPM,

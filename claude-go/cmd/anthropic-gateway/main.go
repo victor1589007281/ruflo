@@ -124,6 +124,21 @@ func main() {
 			return modelconfig.ReloadFromConfig(jc.ToModelConfigJSON(), registry, resolver)
 		})
 
+	handler := newGatewayHandler(gw)
+
+	srv := &http.Server{Addr: *addr, Handler: handler}
+	log.Printf("[anthropic-gateway] 监听 %s (config=%s, default-prefix=%s)", *addr, orDefault(*configPath, "auto-discover"), tryPrefix)
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatalf("网关退出: %v", err)
+	}
+}
+
+// newGatewayHandler 组装完整路由表 (含 APP 来源标识中间层)。
+//
+// 抽成函数是为了让路由表本身可测: 只测 handler 函数的话, "路由注册漏了/拼错了"
+// 这类缺陷测不出来 —— 而它恰恰是这套网关历史上出现过的形状 (/chat/completions
+// 与 /messages 都曾裸 404, 代码看着完全正常)。
+func newGatewayHandler(gw *gateway) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages", gw.handleMessages)
 	// 裸 /messages: claude-go 内部客户端 (api.Client endpointPath) 向 {网关}/messages
@@ -140,6 +155,16 @@ func main() {
 	mux.HandleFunc("/chat/completions", gw.handleChatCompletions)
 	mux.HandleFunc("/v1/responses", gw.handleResponses)
 	mux.HandleFunc("/responses", gw.handleResponses)
+	// 非对话 wire 形状 (见 nonchat.go): 向量与决策。上游把这两类放在独立 base 下,
+	// 模型条目用 protocol=embeddings|systemone + upstreamBaseUrl 声明。
+	// 裸路径与 /v1 前缀都注册 —— 与其余路由同一条理由 (pathfix 只改写一部分)。
+	mux.HandleFunc("/v1/embeddings", gw.handleEmbeddings)
+	mux.HandleFunc("/embeddings", gw.handleEmbeddings)
+	mux.HandleFunc("/v1/systemone", gw.handleSystemOne)
+	mux.HandleFunc("/systemone", gw.handleSystemOne)
+	// /decide 是 systemone 的语义别名 (它做的事就是"给一组问题要概率")。
+	mux.HandleFunc("/v1/decide", gw.handleSystemOne)
+	mux.HandleFunc("/decide", gw.handleSystemOne)
 	mux.HandleFunc("/v1/models", gw.handleModels)
 	// 供应商余额/额度查询: webapp 模型选择页的 Kimi/DeepSeek 页签显示账户额度。
 	// 只支持直连 provider (kimi→/me 档案, deepseek→/user/balance 余额); 聚合上游
@@ -152,15 +177,9 @@ func main() {
 	// APP 来源标识 (与 :18080 同一套信任级)。直接请求本网关的客户端 (moqi/
 	// askforge/studyforge 经 18989 或 18081) 大多没有注册表 token, 自报头记成
 	// claimed:<id>; claude-go 内部客户端转发时会带已验证的 ctx, 这里不再降级。
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mux.ServeHTTP(w, r.WithContext(stampAppContext(r)))
 	})
-
-	srv := &http.Server{Addr: *addr, Handler: handler}
-	log.Printf("[anthropic-gateway] 监听 %s (config=%s, default-prefix=%s)", *addr, orDefault(*configPath, "auto-discover"), tryPrefix)
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("网关退出: %v", err)
-	}
 }
 
 // stampAppContext 在请求 ctx 上打 app/appRef 标记。优先级:
@@ -490,6 +509,11 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// 由 ctx 背书 (claude-go 内部转发), claimed: 表示仅自报头, unknown 表示没带。
 	log.Printf("[anthropic-gateway] app=%s model=%s resolved=%s protocol=%s proxy=%s stream=%v messages=%d tools=%d",
 		gatewayAppLabel(r), req.Model, rc.ProviderName, protoName(rc.Protocol), rc.Proxy, req.Stream, len(req.Messages), len(req.Tools))
+
+	// 向量/决策模型不在对话面上: 按翻译路径发出去只会换来一个与原因无关的上游错误。
+	if rejectNonChatProtocol(w, rc) {
+		return
+	}
 
 	// anthropic 协议模型 → 原样透传 (保真, 避免重编码丢 metadata/tool_choice/stop_sequences 等)。
 	if rc.Protocol == "" || rc.Protocol == "anthropic" {
@@ -883,6 +907,11 @@ func (g *gateway) proxyOpenAIFormat(w http.ResponseWriter, r *http.Request, upst
 	}
 	log.Printf("[anthropic-gateway] openai-passthrough model=%s resolved=%s path=%s",
 		probe.Model, rc.ProviderName, upstreamPath)
+
+	// 同 handleMessages: embeddings/systemone 模型不能从对话形状的入口发出去。
+	if rejectNonChatProtocol(w, rc) {
+		return
+	}
 
 	upstream := strings.TrimRight(rc.BaseURL, "/") + upstreamPath
 	forwardBody := rewriteModelField(body, rc.ProviderName)

@@ -15,8 +15,12 @@ FROM debian:bookworm-slim
 # ripgrep: Grep 工具是 exec rg 的实现, 镜像里没有就直接 "exec: rg: executable not
 # found in $PATH" —— 模型每次想搜索都白烧一个 turn (实测 if-question-expand 的
 # 一次 run 里就这么废掉一轮)。apt 的包名是 ripgrep, 二进制叫 rg。
+# python3-pil: 海报流水线的确定性体检器 poster-metrics.mjs 用 python3+PIL 读像素
+# (墨迹占比/四周留白/空白带)。镜像只有 python3 时它会**降级为只读尺寸**并在输出里
+# 写明「像素项没有测」—— 工作流照样能过, 所以缺这个包不会报错, 只会让目检悄悄变弱
+# (2026-11-25 在 worker 里实测 ModuleNotFoundError: No module named 'PIL')。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git curl python3 golang-go nodejs openssh-client ripgrep \
+      ca-certificates git curl python3 python3-pil golang-go nodejs openssh-client ripgrep \
       poppler-utils chromium \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 1000 -M -s /usr/sbin/nologin claude

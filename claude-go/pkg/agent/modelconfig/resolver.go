@@ -187,6 +187,7 @@ func (r *ConfigResolver) resolveAlias(alias string) ResolvedConfig {
 	cfg.MaxTurns = entry.Params.MaxTurns
 	cfg.PromptCacheMode = entry.Params.PromptCacheMode
 	cfg.Protocol = entry.Params.Protocol
+	cfg.UpstreamBaseURL = entry.Params.UpstreamBaseURL
 	cfg.ReasoningPlayback = entry.Params.ReasoningPlayback
 	cfg.ContextWindow = entry.Params.ContextWindow
 	cfg.Proxy = entry.Params.Proxy

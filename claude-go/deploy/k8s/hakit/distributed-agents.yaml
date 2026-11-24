@@ -23,7 +23,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: gateway
-          image: claude-go:agents-20261114-1152
+          image: claude-go:agents-20261125-0048
           imagePullPolicy: Never
           # anthropic-gateway (协议翻译/透传, omen 长推理 30min + x-opencode-session
           # 注入) + pathfix (18081→18085, 兼容老客户端 /messages 路径改写)。
@@ -76,7 +76,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: control
-          image: claude-go:agents-20261114-2350
+          image: claude-go:agents-20261125-0048
           imagePullPolicy: Never
           args:
             - "serve"
@@ -117,6 +117,7 @@ spec:
             - { name: teams, mountPath: /workspace }
             - { name: teams-visible, mountPath: /home/victor/.claude-go/teams }
             - { name: knowledge, mountPath: /home/victor/base/git/gitee/knowledge }
+            - { name: code-git, mountPath: /home/victor/base/git }
             - { name: ima-skill, mountPath: /home/victor/.claude/skills/ima-skill, readOnly: true }
             - { name: ssh, mountPath: /home/victor/.ssh, readOnly: true }
       volumes:
@@ -163,6 +164,16 @@ spec:
           hostPath:
             path: /mnt/data/claude-go/skills/ima-skill
             type: Directory
+        # 宿主代码目录（外部仓库都在 /home/victor/base/git）。
+        # 源必须是 /mnt/data 下的 bind：hostPath 在 kind 节点里解析，而节点容器的
+        # /home/victor 是另一份空壳（实测只有 kubelet 建的空目录）。宿主侧由
+        # claude-go-code-bind.service（Before=docker.service）在开机时把
+        # /home/victor/base/git bind 到 /mnt/data/claude-go/code/git。
+        # mountPath 仍写原路径 —— 容器里看到的路径与宿主逐字一致，代码/配置零改动。
+        - name: code-git
+          hostPath:
+            path: /mnt/data/claude-go/code/git
+            type: Directory
         - name: ssh
           hostPath:
             path: /home/victor/.ssh
@@ -195,7 +206,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: dashboard
-          image: claude-go:agents-20261114-2350
+          image: claude-go:agents-20261125-0048
           imagePullPolicy: Never
           args: ["dashboard", "run", "--addr", "0.0.0.0:7777", "--no-open", "--config", "/etc/claude-go/config.json"]
           env:
@@ -271,7 +282,7 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
       containers:
         - name: worker
-          image: claude-go:agents-20261114-2350
+          image: claude-go:agents-20261125-0048
           imagePullPolicy: Never
           command: ["/usr/local/bin/claude-go-worker"]
           args:
@@ -308,6 +319,10 @@ spec:
             - { name: SEARCH_STATE_DIR, value: "/mnt/data/claude-go/search" }
             - { name: CLAUDE_GO_TOOLS_POOL, value: "1" }
             - { name: CLAUDE_GO_DECISION_URL, value: "http://172.18.0.1:11435" }
+            # 宿主上的 DiagramForge（海报流水线 poster-kit 的默认是 127.0.0.1:4900，
+            # 在 Pod 里指向 Pod 自己）。走 selector-less Service + EndpointSlice
+            # 指向宿主在 docker 网桥上的 172.18.0.1，Pod 侧不出现裸 IP。
+            - { name: DF_BASE, value: "http://diagramforge:4900" }
             # 经验库共享存储：worker 状态卷按 pod 名隔离，只有共享库能跨 rollout 累积。
             - { name: CLAUDE_GO_EXPERIENCE_STORE, value: "agentdb" }
             - { name: CLAUDE_GO_EXPERIENCE_BUCKET, value: "claude-go-experience" }
@@ -316,6 +331,7 @@ spec:
             - { name: state, mountPath: /data, subPathExpr: "$(POD_NAME)" }
             - { name: teams, mountPath: /workspace }
             - { name: teams-visible, mountPath: /home/victor/.claude-go/teams }
+            - { name: code-git, mountPath: /home/victor/base/git }
       volumes:
         - name: config
           configMap: { name: agents-config-worker }
@@ -331,6 +347,11 @@ spec:
           hostPath:
             path: /home/victor/.claude-go/teams
             type: DirectoryOrCreate
+        # 与 control 同一个源：宿主代码树（见上面 code-git 的注释）。
+        - name: code-git
+          hostPath:
+            path: /mnt/data/claude-go/code/git
+            type: Directory
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -348,7 +369,7 @@ spec:
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
       containers:
         - name: mcp
-          image: claude-go:agents-20261114-1152
+          image: claude-go:agents-20261125-0048
           imagePullPolicy: Never
           args: ["codeintel-mcp-server", "--transport", "http", "--addr", "0.0.0.0:29234", "--config", "/etc/claude-go/config.json"]
           env:
@@ -380,3 +401,63 @@ spec:
   ports:
     - { name: http, port: 29234, targetPort: 29234, nodePort: 31234 }
   type: NodePort
+---
+# ---------------------------------------------------------------- 集群外服务入口
+# 宿主上跑着两个 Pod 需要用的服务：DiagramForge (:4900) 与 codeintel MCP (:9235)。
+# Pod 里的 127.0.0.1 是 Pod 自己，所以必须经「集群内名字 → 宿主地址」这一跳。
+#
+# 做法是 selector-less Service + 手写 EndpointSlice（v1.36 起 v1 Endpoints 已弃用，
+# 且要靠 mirroring 才转成 Slice；直接写 Slice 少一层）。名字进 DNS：
+#   diagramforge.agents.svc.cluster.local:4900
+#   codeintel-mcp.agents.svc.cluster.local:9235
+# 地址 172.18.0.1 = 宿主在 docker 网桥上的地址（kind 节点容器在 br-5c8304a9cc21 上）；
+# 宿主 ufw 默认 deny incoming，已按既有 ollama 先例放行 172.18.0.0/16 与 10.244.0.0/24
+# 访问这两个端口（见 `ufw status` 里带 "kind" 注释的规则）。
+# 注意：Service 不带 selector —— 带了就会去匹配 Pod，而这没有 Pod 可匹配。
+apiVersion: v1
+kind: Service
+metadata:
+  name: diagramforge
+  namespace: agents
+spec:
+  ports:
+    - { name: http, port: 4900, targetPort: 4900 }
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: diagramforge-host
+  namespace: agents
+  labels:
+    kubernetes.io/service-name: diagramforge
+    endpointslice.kubernetes.io/managed-by: manual
+addressType: IPv4
+ports:
+  - { name: http, port: 4900, protocol: TCP }
+endpoints:
+  - addresses: ["172.18.0.1"]
+    conditions: { ready: true }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeintel-mcp
+  namespace: agents
+spec:
+  ports:
+    - { name: http, port: 9235, targetPort: 9235 }
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: codeintel-mcp-host
+  namespace: agents
+  labels:
+    kubernetes.io/service-name: codeintel-mcp
+    endpointslice.kubernetes.io/managed-by: manual
+addressType: IPv4
+ports:
+  - { name: http, port: 9235, protocol: TCP }
+endpoints:
+  - addresses: ["172.18.0.1"]
+    conditions: { ready: true }
