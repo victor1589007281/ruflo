@@ -1913,6 +1913,18 @@ func (we *WorkflowExecutor) runGraphSpec(
 		return results, vErr
 	}
 	if !verdict.Deliver {
+		// failed 的通用文案是稳定的对外契约 (graph_run_status.go), 不能整体替换。
+		// 但执行器手里已有每个节点的原始错误; 全部节点失败时把它带上, 否则
+		// "模型别名拼错"在团队层只剩"无节点完成", 既难排查也会触发不必要的重试。
+		failed := make([]string, 0, len(results))
+		for _, sr := range results {
+			if sr.Status == TaskFailed && strings.TrimSpace(sr.Error) != "" {
+				failed = append(failed, fmt.Sprintf("%s: %s", sr.Name, sr.Error))
+			}
+		}
+		if len(failed) > 0 && len(failed) == len(results) {
+			return results, fmt.Errorf("%s: %s", verdict.Reason, strings.Join(failed, "; "))
+		}
 		return results, fmt.Errorf("%s", verdict.Reason)
 	}
 	logging.Event(ctx, "graph.run.finish", "team", team.Name, "status", rr.Status)

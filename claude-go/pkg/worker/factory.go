@@ -40,6 +40,7 @@ import (
 	"strings"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/trace"
 )
 
@@ -66,8 +67,12 @@ func RuntimeFactory(reg agent.RuntimeRegistry, def *agent.Placement, ws *Workspa
 		if ctx == nil {
 			ctx = context.Background()
 		}
+		modelAlias := ""
+		if mc, ok := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig); ok {
+			modelAlias = strings.TrimSpace(mc.Alias)
+		}
 		// 创建时捕获: Execute 时的 ctx 已被 runAgent 换过 (见
-		// feishu/session.go:1035 同款注释), 那时 hints/trace 拿不到。
+		// feishu/session.go:1035 同款注释), 那时 hints/trace/model 都拿不到。
 		return &runtimeRunner{
 			reg:          reg,
 			role:         role,
@@ -75,6 +80,7 @@ func RuntimeFactory(reg agent.RuntimeRegistry, def *agent.Placement, ws *Workspa
 			hints:        agent.NodeExecHintsFromContext(ctx),
 			ids:          trace.From(ctx),
 			meta:         agent.RunMetadataFromContext(ctx),
+			modelAlias:   modelAlias,
 			def:          def,
 			ws:           ws,
 		}, nil
@@ -89,6 +95,7 @@ type runtimeRunner struct {
 	hints        agent.NodeExecHints
 	ids          trace.IDs
 	meta         agent.RunMetadata
+	modelAlias   string
 	def          *agent.Placement
 	ws           *WorkspacePolicy
 }
@@ -194,6 +201,7 @@ func (r *runtimeRunner) Execute(ctx context.Context, userPrompt string) (string,
 		UserPrompt:   userPrompt,
 		ToolProfile:  r.hints.ToolProfile,
 		MaxTurns:     r.hints.MaxTurns,
+		ModelAlias:   r.modelAlias,
 		Placement:    p,
 	}
 	// cwd 档位启用时才声明工作区 (未启用 ⇒ 字段留空 ⇒ worker 侧走原来那条判定)。

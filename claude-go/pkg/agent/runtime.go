@@ -29,6 +29,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 )
 
 // RuntimeCaps 一个 runtime 能提供的能力。
@@ -109,7 +111,11 @@ type RuntimeNodeTask struct {
 	Workspace    string // 团队 cwd; 空 = runtime 自行决定
 	ToolProfile  string // 显式工具画像 (取代角色名子串推断)
 	MaxTurns     int
-	Placement    *Placement
+	// ModelAlias 是本阶段最终选中的模型目录别名, 不含密钥。空 = 沿用运行时默认。
+	// 控制面只传别名, worker 用自己的热加载模型目录解析出完整连接配置: 既让选择
+	// 跨进程不丢失, 又不把 ResolvedConfig 里的 API key 写进队列载荷。
+	ModelAlias string
+	Placement  *Placement
 }
 
 // AgentRuntime 一个可执行节点任务的运行时。
@@ -326,6 +332,10 @@ type localRuntime struct {
 	name    string
 	caps    RuntimeCaps
 	factory CreateAgentFunc
+	// resolver 只在调用方直接把 RuntimeNodeTask.ModelAlias 交给本地 runtime 时
+	// 使用。worker 路径会先在 worker.execute 里解析好并放进 ctx; 两路都要求严格
+	// 解析已注册别名, 绝不能因缺 resolver 或拼写错误静默退回默认模型。
+	resolver *modelconfig.ConfigResolver
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc // "runID/nodeID" → cancel
@@ -334,20 +344,30 @@ type localRuntime struct {
 // NewLocalRuntime 用 CreateAgentFunc 构造一个本地 runtime。
 // name 建议以 "local-" 打头以便 Placement 的 Prefer:"local" 生效。
 func NewLocalRuntime(name string, caps RuntimeCaps, factory CreateAgentFunc) AgentRuntime {
+	return NewLocalRuntimeWithModelResolver(name, caps, factory, nil)
+}
+
+// NewLocalRuntimeWithModelResolver 装配能严格解析任务级 ModelAlias 的本地 runtime。
+// resolver 空时仍支持既有调用; 但收到非空 ModelAlias 会显式失败, 不猜别名、不回落。
+func NewLocalRuntimeWithModelResolver(name string, caps RuntimeCaps, factory CreateAgentFunc,
+	resolver *modelconfig.ConfigResolver) AgentRuntime {
 	if factory == nil {
 		return nil
 	}
-	return &localRuntime{name: name, caps: caps, factory: factory, cancels: map[string]context.CancelFunc{}}
+	return &localRuntime{
+		name: name, caps: caps, factory: factory, resolver: resolver,
+		cancels: map[string]context.CancelFunc{},
+	}
 }
 
 // Name 返回注册名 (约定以 "local-" 打头, 使 Prefer:"local" 生效)。
-func (l *localRuntime) Name() string              { return l.name }
+func (l *localRuntime) Name() string { return l.name }
 
 // Capabilities 返回构造时声明的能力集。
 func (l *localRuntime) Capabilities() RuntimeCaps { return l.caps }
 
 // cancelKey 拼出取消表的键: "runID/nodeID"。
-func cancelKey(runID, nodeID string) string       { return runID + "/" + nodeID }
+func cancelKey(runID, nodeID string) string { return runID + "/" + nodeID }
 
 // Execute 把一次节点任务交给 CreateAgentFunc 造出的 runner 执行, 并把结果包成事件流。
 //
@@ -363,6 +383,19 @@ func cancelKey(runID, nodeID string) string       { return runID + "/" + nodeID 
 //	设计权衡：panic 被 recover 成一条 NodeEventFailed 事件而不是向上抛 —— 单个节点的
 //	      runner panic 不该带走整个进程; 代价是 panic 现场被压成一行错误串。
 func (l *localRuntime) Execute(ctx context.Context, task RuntimeNodeTask) (<-chan NodeEvent, error) {
+	if alias := strings.TrimSpace(task.ModelAlias); alias != "" {
+		mc, ok := ctx.Value(ModelConfigKey{}).(modelconfig.ResolvedConfig)
+		if !ok || strings.TrimSpace(mc.Alias) != alias || mc.ProviderName == "" {
+			if l.resolver == nil {
+				return nil, fmt.Errorf("%s: 任务声明模型别名 %q, 但本地 runtime 未装配模型解析器", l.name, alias)
+			}
+			mc = l.resolver.ResolveRegisteredAlias(alias)
+			if mc.ProviderName == "" {
+				return nil, fmt.Errorf("%s: 任务声明的模型别名 %q 未在本地模型目录注册", l.name, alias)
+			}
+			ctx = context.WithValue(ctx, ModelConfigKey{}, mc)
+		}
+	}
 	runner, err := l.factory(ctx, task.Role, task.SystemPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("%s: 造 runner 失败: %w", l.name, err)

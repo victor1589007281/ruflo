@@ -33,7 +33,9 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/cluster"
+	"github.com/anthropic/claude-go/pkg/logging"
 	"github.com/anthropic/claude-go/pkg/tool"
 	"github.com/anthropic/claude-go/pkg/trace"
 )
@@ -59,6 +61,10 @@ type Options struct {
 	Name string
 	// Runtime 必填: 真执行体。生产传 agent.NewLocalRuntime(...)。
 	Runtime agent.AgentRuntime
+	// ModelResolver 任务显式声明 model_alias 时使用。必须是 Bot 持有的同一个
+	// ConfigResolver, 这样模型目录热加载对在途任务也生效。空 resolver 收到
+	// 非空 model_alias 时拒绝执行, 绝不退回 worker 默认模型。
+	ModelResolver *modelconfig.ConfigResolver
 	// ExtraCaps 额外能力标签 (与 Runtime.Capabilities() 的投影合并)。
 	// 用于声明 Runtime 结构体表达不了的本地资源, 如 mcp:playwright / cli:golangci-lint。
 	ExtraCaps []string
@@ -371,6 +377,23 @@ func (w *Worker) execute(parent context.Context, task *cluster.Task) {
 	// run/node 对齐, 否则远程节点的 token 账是孤儿。
 	if st.RunID != "" || st.NodeID != "" || st.SessionID != "" {
 		ctx = trace.With(ctx, trace.IDs{RunID: st.RunID, NodeID: st.NodeID, SessionID: st.SessionID})
+	}
+	// 阶段模型选择跨进程复原点。SessionManager.CreateAgentRunner 在**创建时**
+	// 读 ModelConfigKey, 所以必须在 Runtime.Execute 之前注入。严格解析失败就
+	// 回报任务失败, 不让它悄悄跑成 worker 的全局默认模型。
+	if alias := strings.TrimSpace(st.ModelAlias); alias != "" {
+		if w.opt.ModelResolver == nil {
+			w.reportFail(task.ID, fmt.Sprintf("任务声明模型别名 %q, 但 worker 未装配模型解析器", alias))
+			return
+		}
+		mc := w.opt.ModelResolver.ResolveRegisteredAlias(alias)
+		if mc.ProviderName == "" {
+			w.reportFail(task.ID, fmt.Sprintf("任务声明的模型别名 %q 未在 worker 模型目录注册", alias))
+			return
+		}
+		ctx = context.WithValue(ctx, agent.ModelConfigKey{}, mc)
+		logging.Event(ctx, "worker.model_restored",
+			"task", task.ID, "alias", alias, "model", mc.ProviderName)
 	}
 
 	rtTask := st.ToRuntimeTask()

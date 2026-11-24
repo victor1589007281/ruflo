@@ -188,7 +188,7 @@ var workflowRegistry = map[string]func() *WorkflowDef{
 	"manager-lab-rehearsal-npc":    managerLabRehearsalNPCWorkflow,
 	"manager-lab-rehearsal-critic": managerLabRehearsalCriticWorkflow,
 	"manager-lab-simulation-v2":    managerLabSimulationV2Workflow,
-	"harness-evo":                  harnessEvoWorkflow, // 目录元数据; 真实执行 = 专用进化引擎 (dashboard /api/harness-evo/runs)
+	"harness-evo":                  harnessEvoWorkflow,       // 目录元数据; 真实执行 = 专用进化引擎 (dashboard /api/harness-evo/runs)
 	"repo-cartographer":            repoCartographerWorkflow, // 目录元数据; 真实执行 = webapp 宿主侧 spawn bin/run_agent.py
 }
 
@@ -2138,22 +2138,26 @@ func (we *WorkflowExecutor) runAgent(ctx context.Context, role, prompt string, t
 	// executorForNode 为什么要包一层 factory 而不是直接写 ctx 的同一条理由。
 	if we.planCfgResolver != nil {
 		resolved := we.planCfgResolver.Resolve(team.Workflow, role)
-		if decl := StageDeclFromContext(ctx); decl.Model != "" {
-			if mc := we.planCfgResolver.ResolveAlias(decl.Model); mc.ProviderName != "" {
+		if decl := StageDeclFromContext(ctx); strings.TrimSpace(decl.Model) != "" {
+			alias := strings.TrimSpace(decl.Model)
+			mc := we.planCfgResolver.ResolveRegisteredAlias(alias)
+			if mc.ProviderName != "" {
 				// 别名解析出来的这一份**完整**取代 plan 解析的那一份: 别名一旦指向
 				// 另一个厂商, baseURL/apiKey/protocol 跟着换 —— 只换模型名会把请求
 				// 带着别人的模型名发到默认端点去 (与 session.go 里 spec.ModelAlias
 				// 的处置逐字同一条)。
 				resolved = mc
 				logging.Event(ctx, "stage.model_declared",
-					"stage", stageFrom(ctx), "alias", decl.Model, "model", mc.ProviderName)
+					"stage", stageFrom(ctx), "alias", alias, "model", mc.ProviderName)
 			} else {
-				// 解析不出来时**保留原配置并留痕**, 不静默按原模型跑 ——
-				// "声明的模型没生效"与"没声明"在读数上完全一样, 只有这条日志能把
-				// 它们分开 (与 resolveToolProfile 的 deprecation 痕迹同一口径)。
-				logging.Event(ctx, "stage.model_declared_unresolved",
-					"stage", stageFrom(ctx), "alias", decl.Model,
-					"reason", "别名解析不出 provider (可能未在 providers 段注册)")
+				// 显式声明是硬约束, 不是"尽力试试": 未知别名会让 runAgent 在造 runner
+				// 之前失败。ResolveAlias 会猜 provider:model, 因此这里必须用严格解析,
+				// 否则拼错一个字母也会静默跑成另一个模型。
+				return StageResult{
+					Role: role, Status: TaskFailed,
+					Error:     fmt.Sprintf("阶段 %s 声明的模型别名 %q 未在模型目录注册", stageFrom(ctx), alias),
+					StartedAt: start, Duration: time.Since(start).String(),
+				}
 			}
 		}
 		stageCtx = context.WithValue(stageCtx, ModelConfigKey{}, resolved)

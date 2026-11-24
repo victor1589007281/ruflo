@@ -149,6 +149,25 @@ func (r *ConfigResolver) Resolve(planName, role string) ResolvedConfig {
 	return ApplyGatewayOverride(resolved)
 }
 
+// ResolveRegisteredAlias 将**已注册**的单个 alias 解析为 ResolvedConfig (不含 fallback)。
+//
+// ResolveAlias 刻意保留未知 alias 的 provider:model 猜测能力, 供 gateway 冷会话等
+// 兼容路径使用。阶段模型声明不是兼容路径: 用户写错一个字母时, 猜测出来的
+// ProviderName 非空会让它看起来"解析成功", 最终静默改用别的模型。这里要求目录里
+// 确实存在该 alias, 不存在就返回零值, 调用方必须 fail-closed。
+func (r *ConfigResolver) ResolveRegisteredAlias(alias string) ResolvedConfig {
+	alias = strings.TrimSpace(alias)
+	if r == nil || alias == "" {
+		return ResolvedConfig{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.registry == nil || r.registry.GetModel(alias) == nil {
+		return ResolvedConfig{}
+	}
+	return r.resolveAlias(alias)
+}
+
 // ResolveAlias 将任意单个 alias 解析为 ResolvedConfig (不含 fallback)。
 // 供 advisor 等需要在 plan/role 体系之外解析独立模型的场景使用。
 func (r *ConfigResolver) ResolveAlias(alias string) ResolvedConfig {

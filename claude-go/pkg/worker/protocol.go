@@ -76,21 +76,24 @@ func WorkerCap(name string) string { return CapWorkerPrefix + name }
 // role skills + 环境段拼出。设计稿承诺的"skill 正文随任务下发/内容寻址"属
 // SkillStore 中心化 (design/02 R2), 未实现。这里如实透传拿到的 systemPrompt。
 type StageTask struct {
-	RunID        string   `json:"run_id,omitempty"`
-	NodeID       string   `json:"node_id,omitempty"`
+	RunID  string `json:"run_id,omitempty"`
+	NodeID string `json:"node_id,omitempty"`
 	// SessionID 跨 run 稳定的会话身份, 见 pkg/trace.IDs。它不参与 RunID 的推导,
 	// 只决定对端出站请求的 X-Claude-Code-Session-Id (上游提示缓存分片键)。
 	// 缺省省略: 老控制面不带这个字段, 新 worker 解出来是空串, 退回按 RunID 分片。
-	SessionID    string   `json:"session_id,omitempty"`
-	Role         string   `json:"role"`
-	SystemPrompt string   `json:"system_prompt,omitempty"`
-	UserPrompt   string   `json:"user_prompt"`
-	Workspace    string   `json:"workspace,omitempty"`    // 需要的团队 cwd; 空=worker 自行决定
-	ToolProfile  string   `json:"tool_profile,omitempty"` // 显式工具画像 (取代角色名子串推断)
-	MaxTurns     int      `json:"max_turns,omitempty"`
-	NodeKind     string   `json:"node_kind,omitempty"` // 节点形态 (agent/gate/...), 供 worker 侧 hints
-	Iteration    int      `json:"iteration,omitempty"` // loop 轮次 (0 起)
-	Require      []string `json:"require,omitempty"`   // 硬约束回显, 供 worker 自检
+	SessionID    string `json:"session_id,omitempty"`
+	Role         string `json:"role"`
+	SystemPrompt string `json:"system_prompt,omitempty"`
+	UserPrompt   string `json:"user_prompt"`
+	Workspace    string `json:"workspace,omitempty"`    // 需要的团队 cwd; 空=worker 自行决定
+	ToolProfile  string `json:"tool_profile,omitempty"` // 显式工具画像 (取代角色名子串推断)
+	MaxTurns     int    `json:"max_turns,omitempty"`
+	// ModelAlias 是控制面最终选中的模型目录别名。只传别名, 不传含密钥的
+	// ResolvedConfig; worker 用本地热加载目录严格解析后注入 ModelConfigKey。
+	ModelAlias string   `json:"model_alias,omitempty"`
+	NodeKind   string   `json:"node_kind,omitempty"` // 节点形态 (agent/gate/...), 供 worker 侧 hints
+	Iteration  int      `json:"iteration,omitempty"` // loop 轮次 (0 起)
+	Require    []string `json:"require,omitempty"`   // 硬约束回显, 供 worker 自检
 
 	// ── cwd 档位 (design/02 §3.3, 见 workspace.go) ────────────────────────────
 	// 全空 = 控制面未配置 WorkspacePolicy ⇒ worker 走原来那条判定, 行为不变。
@@ -147,6 +150,7 @@ func (st StageTask) ToRuntimeTask() agent.RuntimeNodeTask {
 		Workspace:    st.Workspace,
 		ToolProfile:  st.ToolProfile,
 		MaxTurns:     st.MaxTurns,
+		ModelAlias:   st.ModelAlias,
 	}
 }
 

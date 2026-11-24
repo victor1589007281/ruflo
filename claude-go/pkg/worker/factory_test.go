@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	"github.com/anthropic/claude-go/pkg/trace"
 )
 
@@ -19,6 +20,7 @@ type recordRuntime struct {
 	tasks []agent.RuntimeNodeTask
 	hints []agent.NodeExecHints
 	ids   []trace.IDs
+	cfgs  []modelconfig.ResolvedConfig
 }
 
 func (r *recordRuntime) Name() string                    { return r.name }
@@ -28,6 +30,7 @@ func (r *recordRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 	r.tasks = append(r.tasks, task)
 	r.hints = append(r.hints, agent.NodeExecHintsFromContext(ctx))
 	r.ids = append(r.ids, trace.From(ctx))
+	r.cfgs = append(r.cfgs, recordModelConfig(ctx))
 	ch := make(chan agent.NodeEvent, 2)
 	if r.err != nil {
 		ch <- agent.NodeEvent{Kind: agent.NodeEventFailed, Err: r.err.Error()}
@@ -36,6 +39,37 @@ func (r *recordRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 	}
 	close(ch)
 	return ch, nil
+}
+
+// recordModelConfig 只取断言需要的非敏感字段, 不在失败输出里打印完整配置。
+func recordModelConfig(ctx context.Context) modelconfig.ResolvedConfig {
+	mc, _ := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig)
+	mc.APIKey = ""
+	mc.FallbackAPIKey = ""
+	return mc
+}
+
+func TestRuntimeFactory_模型别名创建时捕获并下传(t *testing.T) {
+	rec := &recordRuntime{name: "remote-w1", caps: agent.RuntimeCaps{}, out: "ok"}
+	reg := agent.NewRuntimeRegistry()
+	reg.Register(rec, 0)
+	createCtx := context.WithValue(context.Background(), agent.ModelConfigKey{}, modelconfig.ResolvedConfig{
+		Alias: "opencode:hungerg-free", ProviderName: "hungerg-free",
+	})
+	runner, err := RuntimeFactory(reg, nil, nil)(createCtx, "coder", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 执行 ctx 是干净的: 模型选择必须像 hints 一样在创建时捕获。
+	if _, err := runner.Execute(context.Background(), "干活"); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.tasks[0].ModelAlias; got != "opencode:hungerg-free" {
+		t.Fatalf("模型别名未下传: %q", got)
+	}
+	if len(rec.cfgs) != 1 || rec.cfgs[0].Alias != "" {
+		t.Fatalf("RuntimeNodeTask.ModelAlias 不能冒充 ResolvedConfig: %+v", rec.cfgs)
+	}
 }
 
 // 放置求解失败必须失败, 不许回落到"随便找个能跑的"——声明了 gpu/browser 的节点

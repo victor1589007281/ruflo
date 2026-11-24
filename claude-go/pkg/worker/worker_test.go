@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 )
 
 // 构造守卫: 缺控制面/名字/执行体的 worker 不许被造出来 —— 那种 worker 只会安静地
@@ -287,6 +288,103 @@ func TestWorker_跨进程取消真的停下来(t *testing.T) {
 		t.Fatal("取消指令未在 3s 内经 keepalive 投递到 worker (跨进程 Cancel 断链)")
 	}
 	_ = drain(t, ch, 3*time.Second)
+}
+
+// 模型选择必须穿过真实控制面队列, 并在 worker 侧用**本地目录**还原进创建 ctx。
+// 只测 EncodeStageTask 不够: broker、PullFor、execute 三处都可能把字段吃掉。
+func TestWorker_模型别名穿过队列并由本地目录还原(t *testing.T) {
+	const alias = "opencode:hungerg-free"
+	registry := modelconfig.NewProviderRegistry()
+	registry.RegisterProvider(modelconfig.ProviderConfig{
+		Name: "opencode", BaseURL: "https://models.example.test/v1", APIKey: "worker-key",
+		Models: map[string]modelconfig.ModelConfig{alias: {}},
+	})
+	resolver := modelconfig.NewConfigResolver(registry, modelconfig.GlobalConfig{}, nil)
+	registry.RegisterProvider(modelconfig.ProviderConfig{
+		Name: "control", BaseURL: "https://control.example.test/v1", APIKey: "control-must-not-cross",
+		Models: map[string]modelconfig.ModelConfig{"control:default": {}},
+	})
+
+	tc := newTestControl(t, controlOpts{})
+	remote := tc.brk.Runtime("w1", agent.RuntimeCaps{})
+	created := make(chan modelconfig.ResolvedConfig, 1)
+	rt := agent.NewLocalRuntimeWithModelResolver("local-w1", agent.RuntimeCaps{},
+		func(ctx context.Context, _, _ string) (agent.AgentRunner, error) {
+			mc, _ := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig)
+			created <- mc
+			return runnerFunc(func(context.Context, string) (string, error) { return "ok", nil }), nil
+		}, resolver)
+	tc.startWorker(t, Options{Name: "w1", Runtime: rt, ModelResolver: resolver})
+
+	ch, err := remote.Execute(context.Background(), agent.RuntimeNodeTask{
+		RunID: "r", NodeID: "n", Role: "coder", UserPrompt: "x", ModelAlias: alias,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	term := terminal(t, drain(t, ch, 5*time.Second))
+	if term.Kind != agent.NodeEventDone {
+		t.Fatalf("队列→worker 执行失败: kind=%s err=%q", term.Kind, term.Err)
+	}
+	mc := <-created
+	if mc.Alias != alias || mc.APIKey != "worker-key" || mc.BaseURL != "https://models.example.test/v1" {
+		t.Fatalf("worker 未用本地目录还原阶段模型: alias=%q url=%q key=%q", mc.Alias, mc.BaseURL, mc.APIKey)
+	}
+}
+
+// 未知别名与缺解析器都必须让任务失败, 不能悄悄跑成 worker 默认模型。
+func TestWorker_未知或缺失模型解析器拒绝执行(t *testing.T) {
+	const alias = "opencode:not-registered"
+	payload, err := EncodeStageTask(StageTask{
+		RunID: "r", NodeID: "n", Role: "coder", UserPrompt: "x", ModelAlias: alias,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name     string
+		resolver *modelconfig.ConfigResolver
+		want     string
+	}{
+		{"缺解析器", nil, "未装配模型解析器"},
+		{"未知别名", modelconfig.NewConfigResolver(modelconfig.NewProviderRegistry(), modelconfig.GlobalConfig{}, nil), "未在 worker 模型目录注册"},
+	} {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			tc := newTestControl(t, controlOpts{})
+			called := false
+			rt := echoRuntime("local-w1", agent.RuntimeCaps{}, func(context.Context, string, string) (string, error) {
+				called = true
+				return "不该执行", nil
+			})
+			w, err := New(Options{
+				Control: tc.srv.URL, Name: "w1", Runtime: rt, ModelResolver: c.resolver,
+				Logf: func(string, ...any) {},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := tc.q.Enqueue(clusterTask("t-model", payload, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			task, _, err := tc.q.PullFor("w1", nil, w.Caps())
+			if err != nil || task == nil {
+				t.Fatalf("PullFor: task=%v err=%v", task, err)
+			}
+			w.execute(context.Background(), task)
+			got, err := tc.q.Get(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != "failed" || !strings.Contains(got.Err, c.want) {
+				t.Fatalf("期望模型失败 %q, 实得 status=%s err=%q", c.want, got.Status, got.Err)
+			}
+			if called {
+				t.Fatal("模型校验失败后仍执行了任务")
+			}
+		})
+	}
 }
 
 // silentRuntime 关通道但不给终态事件的坏执行体。

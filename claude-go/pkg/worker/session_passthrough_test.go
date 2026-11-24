@@ -3,8 +3,11 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
+	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 	cgtrace "github.com/anthropic/claude-go/pkg/trace"
 )
 
@@ -59,6 +62,38 @@ func TestSessionPassthrough_会话身份穿过任务边界(t *testing.T) {
 	// 顶掉了奖励归因就错账, 而账错得静悄悄。
 	if ids.RunID != "run-team-1" {
 		t.Fatalf("RunID 被会话身份挤掉了: %q", ids.RunID)
+	}
+}
+
+func TestModelAliasPassthrough_队列与执行上下文都不丢(t *testing.T) {
+	const alias = "opencode:hungerg-free"
+	payload, err := EncodeStageTask(StageTask{
+		RunID: "r", NodeID: "n", Role: "coder", UserPrompt: "x", ModelAlias: alias,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(payload) || !strings.Contains(string(payload), `"model_alias":"opencode:hungerg-free"`) {
+		t.Fatalf("队列载荷缺少 model_alias: %s", payload)
+	}
+	st, err := DecodeStageTask(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ToRuntimeTask().ModelAlias != alias {
+		t.Fatalf("ToRuntimeTask 丢了模型别名: %+v", st.ToRuntimeTask())
+	}
+
+	registry := modelconfig.NewProviderRegistry()
+	registry.RegisterProvider(modelconfig.ProviderConfig{
+		Name: "opencode", BaseURL: "https://models.example.test/v1", APIKey: "worker-key",
+		Models: map[string]modelconfig.ModelConfig{alias: {}},
+	})
+	w := &Worker{opt: Options{ModelResolver: modelconfig.NewConfigResolver(registry, modelconfig.GlobalConfig{}, nil)}}
+	ctx := context.WithValue(context.Background(), agent.ModelConfigKey{}, w.opt.ModelResolver.ResolveRegisteredAlias(alias))
+	got := ctx.Value(agent.ModelConfigKey{}).(modelconfig.ResolvedConfig)
+	if got.Alias != alias || got.APIKey != "worker-key" {
+		t.Fatalf("worker 未用本地目录还原模型配置: alias=%q", got.Alias)
 	}
 }
 

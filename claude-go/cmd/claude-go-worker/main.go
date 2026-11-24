@@ -203,6 +203,7 @@ func rootCmd() *cobra.Command {
 				Control:           control,
 				Name:              name,
 				Runtime:           rt,
+				ModelResolver:     bot.AgentModelResolver(),
 				ExtraCaps:         extraCaps,
 				Workspace:         workspace,
 				WorkspaceMode:     mode,

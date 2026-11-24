@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
 )
 
 // rtRunner 本测试专用的 AgentRunner 桩（不复用 graph_adapter_test 的
@@ -218,6 +220,51 @@ func TestLocalRuntime_收编AgentRunner(t *testing.T) {
 	// 通道已关闭：再读应立即返回零值
 	if _, ok := <-ch; ok {
 		t.Error("事件通道未关闭 —— 会泄漏生产侧 goroutine")
+	}
+}
+
+func TestLocalRuntime_任务模型别名回填创建上下文(t *testing.T) {
+	registry := modelconfig.NewProviderRegistry()
+	registry.RegisterProvider(modelconfig.ProviderConfig{
+		Name: "opencode", BaseURL: "https://models.example.test/v1", APIKey: "test-key",
+		Models: map[string]modelconfig.ModelConfig{"opencode:hungerg-free": {}},
+	})
+	resolver := modelconfig.NewConfigResolver(registry, modelconfig.GlobalConfig{}, nil)
+	var got modelconfig.ResolvedConfig
+	rt := NewLocalRuntimeWithModelResolver("local-model", RuntimeCaps{}, func(ctx context.Context, _, _ string) (AgentRunner, error) {
+		got, _ = ctx.Value(ModelConfigKey{}).(modelconfig.ResolvedConfig)
+		return &rtRunner{out: "ok"}, nil
+	}, resolver)
+	ch, err := rt.Execute(context.Background(), RuntimeNodeTask{
+		RunID: "r", NodeID: "n", Role: "coder", UserPrompt: "x",
+		ModelAlias: "opencode:hungerg-free",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CollectRuntimeOutput(ch); err != nil {
+		t.Fatal(err)
+	}
+	if got.Alias != "opencode:hungerg-free" {
+		t.Fatalf("任务级模型别名未回填创建 ctx: %+v", got)
+	}
+}
+
+func TestLocalRuntime_任务模型别名缺少解析器必须失败(t *testing.T) {
+	calls := 0
+	rt := NewLocalRuntime("local-model", RuntimeCaps{}, func(context.Context, string, string) (AgentRunner, error) {
+		calls++
+		return &rtRunner{out: "ok"}, nil
+	})
+	ch, err := rt.Execute(context.Background(), RuntimeNodeTask{
+		RunID: "r", NodeID: "n", Role: "coder", UserPrompt: "x",
+		ModelAlias: "opencode:hungerg-free",
+	})
+	if err == nil || !strings.Contains(err.Error(), "未装配模型解析器") {
+		t.Fatalf("任务模型别名无解析器时必须失败, 实得 ch=%v err=%v", ch, err)
+	}
+	if calls != 0 {
+		t.Fatalf("失败前仍创建了 %d 个 runner", calls)
 	}
 }
 

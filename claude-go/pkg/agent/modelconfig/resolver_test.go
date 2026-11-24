@@ -170,6 +170,35 @@ func TestConfigResolver_UnknownAlias(t *testing.T) {
 	}
 }
 
+func TestConfigResolver_ResolveRegisteredAlias严格且保留兼容解析(t *testing.T) {
+	r := buildTestRegistry()
+	resolver := NewConfigResolver(r, GlobalConfig{}, nil)
+
+	got := resolver.ResolveRegisteredAlias("dashscope:qwen3.6-plus")
+	if got.ProviderName != "qwen3.6-plus" || got.BaseURL != "https://dashscope.example.com/v1" {
+		t.Fatalf("已注册别名解析错: %+v", got)
+	}
+	for _, alias := range []string{"", "opencode:not-registered", "not-an-alias"} {
+		if got := resolver.ResolveRegisteredAlias(alias); got.ProviderName != "" {
+			t.Errorf("未注册别名 %q 应返回零值, 实得 %+v", alias, got)
+		}
+		if alias == "" {
+			if got := resolver.ResolveAlias(alias); got.ProviderName != "" {
+				t.Errorf("空别名应返回零值, 实得 %+v", got)
+			}
+			continue
+		}
+		// 兼容入口仍然猜得出来, 两条路径的语义不能混。
+		if got := resolver.ResolveAlias(alias); got.ProviderName == "" {
+			t.Errorf("ResolveAlias 的兼容行为被改坏了: %q", alias)
+		}
+	}
+	var nilResolver *ConfigResolver
+	if got := nilResolver.ResolveRegisteredAlias("dashscope:qwen3.6-plus"); got.ProviderName != "" {
+		t.Fatalf("nil resolver 应返回零值: %+v", got)
+	}
+}
+
 func TestConfigResolver_DynamicUpdate(t *testing.T) {
 	r := buildTestRegistry()
 	resolver := NewConfigResolver(r, GlobalConfig{

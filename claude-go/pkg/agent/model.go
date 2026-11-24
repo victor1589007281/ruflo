@@ -122,6 +122,17 @@ func (r *PlanConfigResolver) ResolveAlias(alias string) modelconfig.ResolvedConf
 	return r.modelResolver.ResolveAlias(strings.TrimSpace(alias))
 }
 
+// ResolveRegisteredAlias 只接受模型目录里确实注册的别名。
+//
+// 阶段显式声明走这条严格路径: ResolveAlias 对未知别名也会猜出 provider/model,
+// 因而"返回值非空"不能证明声明生效。未知别名必须让阶段失败, 不能退回默认模型。
+func (r *PlanConfigResolver) ResolveRegisteredAlias(alias string) modelconfig.ResolvedConfig {
+	if r == nil || r.modelResolver == nil || strings.TrimSpace(alias) == "" {
+		return modelconfig.ResolvedConfig{}
+	}
+	return r.modelResolver.ResolveRegisteredAlias(strings.TrimSpace(alias))
+}
+
 // Registry 返回内部的 ProviderRegistry。
 func (r *PlanConfigResolver) Registry() *modelconfig.ProviderRegistry {
 	if r.modelResolver != nil {

@@ -545,7 +545,7 @@ func (r *remoteRuntime) Execute(ctx context.Context, task agent.RuntimeNodeTask)
 		RunID: task.RunID, NodeID: task.NodeID, SessionID: task.SessionID, Role: task.Role,
 		SystemPrompt: task.SystemPrompt, UserPrompt: task.UserPrompt,
 		Workspace: task.Workspace, ToolProfile: task.ToolProfile,
-		MaxTurns: task.MaxTurns, Require: require,
+		MaxTurns: task.MaxTurns, ModelAlias: strings.TrimSpace(task.ModelAlias), Require: require,
 	}
 	wsReq.apply(&st)
 

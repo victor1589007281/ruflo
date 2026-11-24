@@ -4,7 +4,7 @@ package feishu
 // (design/02 §3.3 L3)。
 //
 // 单独一个文件而不是往 bot.go 里加: bot.go 是 2000+ 行的装配中心, 多个改动方向
-// 同时在动它; 这里只有两个只读访问器, 放新文件零冲突。
+// 同时在动它; 这里只有几个只读访问器, 放新文件零冲突。
 //
 // 为什么 worker 需要经 Bot 拿工厂: §3.3 列的 worker 职责 (pkg/engine 的
 // QueryEngine loop + pkg/prompt 的系统提示词组装 + pkg/skills + pkg/tool 四档
@@ -12,7 +12,19 @@ package feishu
 // 而 `SessionManager.CreateAgentRunner` 就是它们的唯一出口。worker 复用它 =
 // "远程执行与本地执行是同一条执行路径"; 自己再拼一套只会得到第二种行为。
 
-import "github.com/anthropic/claude-go/pkg/agent"
+import (
+	"github.com/anthropic/claude-go/pkg/agent"
+	"github.com/anthropic/claude-go/pkg/agent/modelconfig"
+)
+
+// AgentModelResolver 返回 Bot 持有的**实时**模型解析器。ReloadModelConfig 会
+// 原地更新它, 因此 worker 持续用这一份就能继承热加载, 不会拿到启动时快照。
+func (b *Bot) AgentModelResolver() *modelconfig.ConfigResolver {
+	if b == nil {
+		return nil
+	}
+	return b.modelResolver
+}
 
 // AgentFactory 返回 agent 执行工厂 (即 SessionManager.CreateAgentRunner)。
 // Bot 未装配会话管理器时返回 nil, 调用方据此拒绝启动 (不要静默降级)。

@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -628,6 +629,57 @@ func TestGraphOverrideToolProfileAndMaxTurns(t *testing.T) {
 	}
 	if gotTurns.Load() != 7 {
 		t.Errorf("MaxTurns 未覆盖到 ResolvedConfig: %d", gotTurns.Load())
+	}
+}
+
+// 阶段显式模型必须是硬约束: 已注册别名完整覆盖 plan 默认, 拼错的别名直接让
+// 阶段失败。只看 ResolveAlias().ProviderName 非空无法区分这两种情况。
+func TestGraphStageModelRegisteredOverrideAndUnknownFailure(t *testing.T) {
+	registry := modelconfig.NewProviderRegistry()
+	registry.RegisterProvider(modelconfig.ProviderConfig{
+		Name: "opencode", BaseURL: "https://models.example.test/v1", APIKey: "test-key",
+		Models: map[string]modelconfig.ModelConfig{
+			"opencode:poster-model":  {},
+			"opencode:default-model": {},
+		},
+	})
+	resolver := NewPlanConfigResolver(modelconfig.NewConfigResolver(registry,
+		modelconfig.GlobalConfig{DefaultModelAlias: "opencode:default-model"}, nil))
+	wf := &WorkflowDef{Name: "stage-model-test", Mode: "graph", Stages: []StageDef{
+		{Name: "poster", Agent: "writer", Model: "opencode:poster-model", Prompt: "画 {objective}",
+			Retry: &graph.RetryPolicy{MaxRetries: 0}},
+	}}
+	var gotAlias atomic.Value
+	we := &WorkflowExecutor{
+		planCfgResolver: resolver,
+		notify:          func(_, _ string) {},
+		factory: func(ctx context.Context, role, _ string) (AgentRunner, error) {
+			mc, _ := ctx.Value(ModelConfigKey{}).(modelconfig.ResolvedConfig)
+			gotAlias.Store(mc.Alias)
+			return &progStageRunner{role: role, fn: func(_ context.Context, r, _ string) (string, error) {
+				return stubStageOutput(r), nil
+			}}, nil
+		},
+	}
+	if _, err := we.executeGraph(context.Background(), wf, "目标", newStubTeam(t, "model")); err != nil {
+		t.Fatalf("已注册阶段模型应生效: %v", err)
+	}
+	if got, _ := gotAlias.Load().(string); got != "opencode:poster-model" {
+		t.Fatalf("阶段模型未覆盖默认: %q", got)
+	}
+
+	wf.Stages[0].Model = "opencode:poster-modle"
+	calls := 0
+	we.factory = func(context.Context, string, string) (AgentRunner, error) {
+		calls++
+		return nil, errors.New("未知模型不该造 runner")
+	}
+	if _, err := we.executeGraph(context.Background(), wf, "目标", newStubTeam(t, "bad-model")); err == nil ||
+		!strings.Contains(err.Error(), "未在模型目录注册") {
+		t.Fatalf("未知阶段模型必须失败, 实得 err=%v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("未知模型仍造了 %d 次 runner", calls)
 	}
 }
 
