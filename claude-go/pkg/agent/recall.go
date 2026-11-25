@@ -16,9 +16,10 @@
 //     这是"快路径管时机、慢路径管内容"的省 token 关键。
 //
 // 配置（env，与 statestore 的 CLAUDE_GO_* 约定一致）：
-//   CLAUDE_GO_DECISION_URL     Ollaya 端点，默认 http://127.0.0.1:11435
-//   CLAUDE_GO_DECISION_RECALL  "1" 启用 Jev 精判生效；其它值 = 双跑（只判不动）
-//   CLAUDE_GO_AGENTDB_URL      agentDB serve 地址（复用既有 env），空则不写流水
+//
+//	CLAUDE_GO_DECISION_URL     Ollaya 端点，默认 http://127.0.0.1:11435
+//	CLAUDE_GO_DECISION_RECALL  "1" 启用 Jev 精判生效；其它值 = 双跑（只判不动）
+//	CLAUDE_GO_AGENTDB_URL      agentDB serve 地址（复用既有 env），空则不写流水
 package agent
 
 import (
@@ -35,6 +36,19 @@ import (
 // 经验库上限 200 条；粗筛到 ~8 个候选远在决策模型 255 选项上限内，
 // 也给 Jev 留出了"从略多于 topK 的集合里挑"的判断空间。
 const recallCandidateCap = 8
+
+// 决策模型在本机是 CPU 推理（snap:2b），单发 1.5–2.1s，2 并发 p50 ~4s。
+// 旧代码用 5s 超时 + decision.Client 默认 2 次重试 → 最坏 3×5s+退避 ≈ 15.6s，
+// 且双跑观察仍同步阻塞主路径。这里区分两种模式：
+//   - 生效模式（Enabled）：同步等待，8s 上限、单次尝试，超时 fail-open；
+//   - 双跑模式（观察）：异步执行，15s 上限、单次尝试，永不阻塞检索。
+const (
+	recallEnabledTimeout  = 8 * time.Second
+	recallObserverTimeout = 15 * time.Second
+	// recallObserverConcurrency 限制后台观察并发，避免决策模型排队反压
+	// quality gate 的 jeb:4b 调用（同机 CPU）。满载时直接丢弃本次观察。
+	recallObserverConcurrency = 2
+)
 
 // recallConfig 是 P0 召回精判的运行配置，从 env 读取。
 type recallConfig struct {
@@ -139,7 +153,13 @@ func (ee *EvolutionEngine) jevRefineRecall(
 		return ids
 	}()
 
-	client := &decision.Client{BaseURL: cfg.DecisionURL, Timeout: 5 * time.Second}
+	// MaxRetries: -1 关闭决策客户端的默认 2 次重试。重试只会把一次超时放大成
+	// 3 次串行超时（旧路径 5s×3≈15.6s），对本机 CPU 决策模型没有收益。
+	timeout := recallEnabledTimeout
+	if !cfg.Enabled {
+		timeout = recallObserverTimeout
+	}
+	client := &decision.Client{BaseURL: cfg.DecisionURL, Timeout: timeout, MaxRetries: -1}
 	state := fmt.Sprintf("任务目标: %s\n角色: %s", objective, role)
 	qs := []decision.Question{{
 		ID:           "recall_experience",

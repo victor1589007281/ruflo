@@ -1385,14 +1385,15 @@ func (ee *EvolutionEngine) retrieveForDecision(ctx context.Context, role, object
 
 	// P0 召回精判：决策模型从候选里挑该注入的。
 	final := bm25TopK
-	if picked, judged := ee.jevRefineRecall(ctx, role, objective, bm25Ranked, topK, cfg); judged {
-		if cfg.Enabled {
+	if cfg.Enabled {
+		// 生效模式：主路径必须等 Jev 的结果（8s 上限、单次尝试）。
+		if picked, judged := ee.jevRefineRecall(ctx, role, objective, bm25Ranked, topK, cfg); judged {
 			final = picked
-		} else {
-			// 双跑模式：显式记一条对照流水（BM25 选了什么 vs Jev 选了什么），
-			// 供攒数据后 ConformalCalibrator 标定。fail-open，不影响返回。
-			ee.logRecallDual(context.Background(), cfg, role, objective, topK, bm25TopK, picked)
 		}
+	} else {
+		// 双跑模式：Jev 只判不动，且必须在后台执行。旧的同步双跑会让每次检索
+		// 都等 CPU 决策模型 1.5–15.6s，而结果根本不参与返回。
+		ee.observeRecallAsync(cfg, role, objective, topK, bm25Ranked)
 	}
 
 	// 命中计数：对最终实际返回的经验累加（保持原有行为语义）。
@@ -1403,6 +1404,48 @@ func (ee *EvolutionEngine) retrieveForDecision(ctx context.Context, role, object
 	}
 	ee.totalSelections += len(final)
 	return final
+}
+
+// recallObserverSlots 限制后台双跑观察的并发数。槽满时直接跳过本次观察：
+// 观察数据可以丢，检索延迟不能因此抖动。
+var recallObserverSlots = make(chan struct{}, recallObserverConcurrency)
+
+// observeRecallAsync 在后台执行一次 Jev 双跑观察，立即返回。
+//
+// 调用方持有 ee.mu.RLock()，goroutine 会在锁释放后运行，因此必须先把候选
+// 拷成快照（Experience 含 Tags/MinHashSig 两个切片，需深拷贝）。
+func (ee *EvolutionEngine) observeRecallAsync(cfg recallConfig, role, objective string, topK int, ranked []*Experience) {
+	if len(ranked) == 0 {
+		return
+	}
+	select {
+	case recallObserverSlots <- struct{}{}:
+	default:
+		return // 决策模型已满载：丢弃本次观察，不排队。
+	}
+
+	snapshot := make([]Experience, len(ranked))
+	ptrs := make([]*Experience, len(ranked))
+	for i, e := range ranked {
+		snapshot[i] = *e
+		snapshot[i].Tags = append([]string(nil), e.Tags...)
+		snapshot[i].MinHashSig = append([]uint64(nil), e.MinHashSig...)
+		ptrs[i] = &snapshot[i]
+	}
+	bm25 := ptrs
+	if len(bm25) > topK {
+		bm25 = bm25[:topK]
+	}
+
+	go func() {
+		defer func() { <-recallObserverSlots }()
+		picked, judged := ee.jevRefineRecall(context.Background(), role, objective, ptrs, topK, cfg)
+		if !judged {
+			return
+		}
+		// 双跑对照流水：BM25 选了什么 vs Jev 选了什么，供 ConformalCalibrator 标定。
+		ee.logRecallDual(context.Background(), cfg, role, objective, topK, bm25, picked)
+	}()
 }
 
 // logRecallDual 在双跑模式下把 BM25 与 Jev 的选择对照写进 agentDB 流水。
