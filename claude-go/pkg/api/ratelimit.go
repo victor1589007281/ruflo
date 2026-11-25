@@ -3,9 +3,9 @@
 // 解决: 多 Agent 并发场景下 LLM API 限流导致团队编排停止工作。
 //
 // 架构 (三层防护):
-//   1. RPM 令牌桶: 控制每分钟请求速率, 避免触发 429-Throttling.RateQuota
-//   2. 并发信号量: 限制同时在途请求数, 避免触发 429-Throttling.BurstRate
-//   3. AIMD 自适应: 遇到 429 时倍减并发; 成功时加性增加
+//  1. RPM 令牌桶: 控制每分钟请求速率, 避免触发 429-Throttling.RateQuota
+//  2. 并发信号量: 限制同时在途请求数, 避免触发 429-Throttling.BurstRate
+//  3. AIMD 自适应: 遇到 429 时倍减并发; 成功时加性增加
 //
 // 参考:
 //   - OpenAI Rate Limits: x-ratelimit-* headers
@@ -182,8 +182,10 @@ func (g *RateLimitGuard) On429(retryAfterSec float64) {
 		if pause < 5*time.Second {
 			pause = 5 * time.Second
 		}
-		if pause > 120*time.Second {
-			pause = 120 * time.Second
+		// 同一个上限: 上游用"日配额重置"级别的 Retry-After 回话时,
+		// 全局暂停也不能跟着睡十几小时, 否则所有模型请求一起被拖死。
+		if pause > MaxHonorRetryAfter {
+			pause = MaxHonorRetryAfter
 		}
 	}
 	until := time.Now().Add(pause)
@@ -266,7 +268,7 @@ type GuardSnapshot struct {
 	HardMin     int32 `json:"hardMin"`     // 并发硬下限
 
 	// RPM 令牌桶
-	RPMCapacity float64 `json:"rpmCapacity"` // 令牌桶容量 (每分钟请求)
+	RPMCapacity  float64 `json:"rpmCapacity"`  // 令牌桶容量 (每分钟请求)
 	RPMAvailable float64 `json:"rpmAvailable"` // 当前可用令牌
 
 	// 全局退避
@@ -456,19 +458,38 @@ func ParseRetryAfter(resp *http.Response, body []byte) float64 {
 	return -1
 }
 
+// MaxHonorRetryAfter 是上游 Retry-After 的信任上限。
+//
+// opencode 免费模型额度耗尽时会返回 17 小时以上的 Retry-After (实测 62860s,
+// 约等于当日配额重置)。原样睡会把一次限流放大成"整段 agent 调用必然超时",
+// 而实际的 RPM 桶几十秒就回补 —— 上限之外的部分不再等待。
+const MaxHonorRetryAfter = 30 * time.Second
+
+// HonorRetryAfter 把秒级 Retry-After 收敛到可等待范围 (<=0 表示上游没给建议)。
+func HonorRetryAfter(retryAfterSec float64) time.Duration {
+	if retryAfterSec <= 0 {
+		return 0
+	}
+	d := time.Duration(retryAfterSec * float64(time.Second))
+	if d > MaxHonorRetryAfter {
+		d = MaxHonorRetryAfter
+	}
+	return d
+}
+
 // ── 429 错误分类 (DashScope 特有) ──
 
 // RateLimitKind 限流类型
 type RateLimitKind int
 
 const (
-	RateLimitUnknown    RateLimitKind = iota
-	RateLimitRPM                      // RateQuota: RPM/RPS 超限 → 降速
-	RateLimitBurst                    // BurstRate: 突发过快 → 平滑
-	RateLimitTPM                      // AllocationQuota: TPM/TPS 超限 → 降速+缩上下文
-	RateLimitConcurrency              // 并发数限制 (如 coding.dashscope "concurrency allocated quota")
-	RateLimitBilling                  // 计费问题 → 不重试
-	RateLimitOverloaded               // 503/529 服务过载 → 长退避
+	RateLimitUnknown     RateLimitKind = iota
+	RateLimitRPM                       // RateQuota: RPM/RPS 超限 → 降速
+	RateLimitBurst                     // BurstRate: 突发过快 → 平滑
+	RateLimitTPM                       // AllocationQuota: TPM/TPS 超限 → 降速+缩上下文
+	RateLimitConcurrency               // 并发数限制 (如 coding.dashscope "concurrency allocated quota")
+	RateLimitBilling                   // 计费问题 → 不重试
+	RateLimitOverloaded                // 503/529 服务过载 → 长退避
 )
 
 // Classify429 根据错误内容分类限流类型

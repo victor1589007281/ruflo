@@ -1801,8 +1801,8 @@ func (c *Client) StreamMessage(
 			// 可重试: 429 / 503 / 529 / 5xx
 			if attempt < maxRetry {
 				delay := c.retryDelay(attempt, resp.StatusCode, nil)
-				if retryAfterSec > 0 {
-					raDelay := time.Duration(retryAfterSec*1000)*time.Millisecond + time.Duration(rand.Float64()*2000)*time.Millisecond
+				if raDelay := HonorRetryAfter(retryAfterSec); raDelay > 0 {
+					raDelay += time.Duration(rand.Float64()*2000) * time.Millisecond
 					if raDelay > delay {
 						delay = raDelay
 					}
@@ -2439,11 +2439,9 @@ func (c *Client) sendMessageDirect(
 
 		if attempt < maxRetry {
 			delay := c.retryDelay(attempt, resp.StatusCode, nil)
-			// 优先使用 Retry-After
-			if retryAfterSec > 0 {
-				raDelay := time.Duration(retryAfterSec*1000) * time.Millisecond
-				jitter := time.Duration(rand.Float64()*2000) * time.Millisecond
-				raDelay += jitter
+			// 优先使用 Retry-After (经 HonorRetryAfter 收敛上限, 见 ratelimit.go)
+			if raDelay := HonorRetryAfter(retryAfterSec); raDelay > 0 {
+				raDelay += time.Duration(rand.Float64()*2000) * time.Millisecond
 				if raDelay > delay {
 					delay = raDelay
 				}
