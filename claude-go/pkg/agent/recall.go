@@ -135,6 +135,14 @@ func (ee *EvolutionEngine) jevRefineRecall(
 		rec.Extra["reason"] = "no_candidates"
 		return nil, false
 	}
+	// 决策服务的 Choice 问题要求选项字典至少 2 项：只有 1 个候选时请求会被
+	// 422 拒绝（recall_experience.choice.criteria: at least 2 items），而且单选项
+	// 本来就没有"选哪条"的判断空间。直接按 BM25 回退，省掉一次必然失败的调用。
+	if len(candidates) < 2 {
+		rec.FellBack = true
+		rec.Extra["reason"] = "too_few_candidates"
+		return nil, false
+	}
 
 	// 构造 Choice 问题：每个候选一个选项，描述用 Symptom+Tags。
 	options := make(map[string]string, len(candidates))

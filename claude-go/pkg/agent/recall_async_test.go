@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -58,6 +59,15 @@ func seedRecallExperiences(ee *EvolutionEngine) {
 			Symptom: "frontend sees stale dist", Tags: []string{"webapp", "build"},
 			UpdatedAt: time.Now(),
 		},
+		// 第三条是同一查询下的弱相关候选：决策服务的 Choice 至少需要 2 个选项，
+		// 只有一条命中时调用会 422，测试也就测不到"是否发了决策请求"。
+		// 措辞刻意与 exp-redo 保持低重合，避免被 Jaccard 去重合并。
+		{
+			ID: "exp-mysql-restart", Role: "coder", Category: "error", Lifecycle: "active",
+			Quality: 0.6, Content: "MySQL crash recovery redo log replay on restart",
+			Symptom: "redo log replay after restart", Tags: []string{"mysql", "crash"},
+			UpdatedAt: time.Now(),
+		},
 	}
 }
 
@@ -110,6 +120,26 @@ func TestEnabledRecallUsesSingleAttempt(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(attempts); n != 1 {
 		t.Fatalf("decision attempts = %d, want 1 (retries disabled)", n)
+	}
+}
+
+// TestSingleCandidateSkipsDecision: 决策服务的 Choice 问题要求选项字典至少 2 项，
+// 单候选请求会被 422 拒绝。客户端应在发请求前回退，不产生一次必然失败的调用。
+func TestSingleCandidateSkipsDecision(t *testing.T) {
+	ts, attempts, _, _ := slowDecisionServer(t, 10*time.Millisecond)
+	t.Setenv("CLAUDE_GO_DECISION_RECALL", "1")
+	t.Setenv("CLAUDE_GO_AGENTDB_URL", "")
+	t.Setenv("CLAUDE_GO_DECISION_URL", ts.URL)
+
+	ee := NewEvolutionEngine(t.TempDir(), nil)
+	cfg := recallConfigFromEnv()
+	cands := []*Experience{{ID: "exp-only", Role: "coder", Content: "only candidate"}}
+	picked, judged := ee.jevRefineRecall(context.Background(), "coder", "goal", cands, 3, cfg)
+	if judged || picked != nil {
+		t.Fatalf("single candidate should fall back, got judged=%v picked=%v", judged, picked)
+	}
+	if n := atomic.LoadInt32(attempts); n != 0 {
+		t.Fatalf("decision attempts = %d, want 0 (request would be rejected with 422)", n)
 	}
 }
 
