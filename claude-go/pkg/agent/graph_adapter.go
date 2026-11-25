@@ -1017,6 +1017,12 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 		// 于是"每个分片都要 browser"只需在 map 节点上声明一次。
 		Placement: PlacementFromSpec(node.Agent.Placement),
 	})
+	// 阶段声明的 timeoutSec 必须真的约束**单次 agent 调用** —— 但补齐点不在这一层:
+	// 引擎 execNode 已经按 NodeSpec.TimeoutSec 给 ctx 叠了 deadline (pkg/graph/engine.go
+	// "语义3")。真正把声明压回去的是更里层的 executeStageWithRetry: 它按角色名再套
+	// 一层 10 分钟, 自定义角色名 (poster-*) 一律落默认值。修法在 workflow.go 的
+	// stageAttemptTimeout —— 声明在那里作为下限生效; 这里只负责把 node.TimeoutSec
+	// 搬进 StageDef (见下面字面量)。
 
 	// gate 节点差异化执行 (design/01 §4.1): 门禁节点输出 score, 供条件边
 	// `score >= 75` 路由; 不是普通 agent。
@@ -1040,18 +1046,27 @@ func (r *stageNodeRunner) RunNode(ctx context.Context, node graph.NodeSpec, in g
 	// 漏一个的表现是"那条声明在 graph 路径上进得来、到不了 executeStage" ——
 	// 不报错, 只是静默不起作用, 而 pipeline 路径上它是对的。
 	//
-	// 图能力九项**不在**这里搬运: 它们的作用域是引擎 (NodeSpec 上的 Loop/Retry/
-	// TimeoutSec/Map/... 与 EdgeSpec.Condition), 引擎自己会读, 不必回到 StageDef。
+	// 图能力九项**不在这里搬运**: 它们的作用域是引擎 (NodeSpec 上的 Loop/Retry/
+	// Map/... 与 EdgeSpec.Condition), 引擎自己会读, 不必回到 StageDef。
 	// 唯一要回来的正是"交给宿主 agent 的那几个能力维度"。
+	// **TimeoutSec 是例外**: 引擎读它只是给节点套总预算, 而单次 agent 调用还会在
+	// executeStageWithRetry 里被角色超时再包一层; 不把声明带下去, 声明就只在大
+	// 不管用的那一层生效 (见下面 StageDef 字面量里的注释)。
 	stage := StageDef{
-		Name:      node.ID,
-		Agent:     node.Agent.Role,
-		Prompt:    node.Agent.Prompt,
-		DependsOn: prevDepsWithDynamic(r.deps, node.ID, in.PrevOutputs),
-		Tools:     stageToolsFromAgentSpec(node.Agent),
-		Model:     node.Agent.Model,
-		Hooks:     node.Agent.Hooks,
-		Skills:    node.Agent.Skills,
+		Name:  node.ID,
+		Agent: node.Agent.Role,
+		// TimeoutSec 必须搬回来: 内层 executeStageWithRetry 会用
+		// computeStageTimeout(role) 再套一层 ctx deadline, 而那张表只认
+		// coder/tester/researcher 等内建角色名 —— 工作流自定义角色 (poster-*)
+		// 一律落到默认 10 分钟。不搬这一项, 引擎算好的 1800s 节点预算会被
+		// 内层 600s 抢先截断 (WithTimeout 取更早的 deadline)。
+		TimeoutSec: node.TimeoutSec,
+		Prompt:     node.Agent.Prompt,
+		DependsOn:  prevDepsWithDynamic(r.deps, node.ID, in.PrevOutputs),
+		Tools:      stageToolsFromAgentSpec(node.Agent),
+		Model:      node.Agent.Model,
+		Hooks:      node.Agent.Hooks,
+		Skills:     node.Agent.Skills,
 	}
 	// —— 图特有的执行上下文 (回灌 / 分片 / 待聚合分片) ——
 	var extraCtx strings.Builder

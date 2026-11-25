@@ -1470,14 +1470,7 @@ func (we *WorkflowExecutor) executeStageWithRetry(ctx context.Context, stage Sta
 
 		// 动态超时: 根据角色和尝试次数调整
 		// 限流时增加超时预算, 给 RateLimitGuard 足够的等待时间
-		timeout := we.computeStageTimeout(stage.Agent, attempt)
-		if rateLimitAttempt > 0 {
-			// 限流时增加 50% 超时预算, 让 API client 的 RateLimitGuard 有机会等待
-			timeout = time.Duration(float64(timeout) * 1.5)
-			if timeout > 45*time.Minute {
-				timeout = 45 * time.Minute
-			}
-		}
+		timeout := stageAttemptTimeout(we, stage.Agent, attempt, stage.TimeoutSec, rateLimitAttempt > 0)
 		stageCtx, stageCancel := context.WithTimeout(ctx, timeout)
 
 		attemptLabel := fmt.Sprintf("%d", attempt+1)
@@ -1964,6 +1957,33 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// stageAttemptTimeout 是单次阶段尝试的墙钟预算: 角色超时 (含重试放大) 与限流放宽
+// 之后, 再拿阶段**显式声明**的 timeoutSec 兜底取大。
+//
+// 为什么声明必须是下限而不是"仅供参考": computeStageTimeout 的角色表只有
+// coder/tester/researcher 这几个内建名, 工作流自定义角色 (poster-logic-auditor
+// 之类) 一律落到默认 10 分钟。声明 1800s 的审计阶段就这样在 600s 被 context
+// 掐断, 报告只写了骨架; 而外层 (图引擎的节点预算) 给的更宽预算永远到不了 agent
+// —— context.WithTimeout 取的是更早的那个 deadline。2026-11-25 的 poster 批
+// 实测发生: logic-audit / adversarial 的发现全部丢失, 裁决只能对着空报告下 FAIL。
+//
+// 放宽只做"取大", 不设新的硬顶: 声明值本就由工作流作者给出, 再叠一层上限会让
+// 声明的语义再次失真。
+func stageAttemptTimeout(we *WorkflowExecutor, role string, attempt, declaredSec int, rateLimited bool) time.Duration {
+	timeout := we.computeStageTimeout(role, attempt)
+	if rateLimited {
+		// 限流时增加 50% 超时预算, 让 API client 的 RateLimitGuard 有机会等待
+		timeout = time.Duration(float64(timeout) * 1.5)
+		if timeout > 45*time.Minute {
+			timeout = 45 * time.Minute
+		}
+	}
+	if declared := time.Duration(declaredSec) * time.Second; declared > timeout {
+		timeout = declared
+	}
+	return timeout
 }
 
 // computeStageTimeout 按角色给阶段基础超时 (coder 25min / tester 15min / 调研架构 6min ...),

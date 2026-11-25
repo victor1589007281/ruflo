@@ -537,6 +537,11 @@ func (c *Coordinator) executeStageWithRetry(
 				stageTimeoutForRole = stageTimeoutForRun
 			}
 		}
+		// 阶段显式声明的 timeoutSec 同样是**下限**: 角色超时表只认内建角色名,
+		// 自定义角色的声明若在这里被压回 10 分钟, 那份声明就永远到不了 agent。
+		if declared := time.Duration(stage.TimeoutSec) * time.Second; declared > stageTimeoutForRole {
+			stageTimeoutForRole = declared
+		}
 		stageCtx, stageCancel := context.WithTimeout(ctx, stageTimeoutForRole)
 		// 标记外层重试驱动: 内层 WorkflowExecutor.executeStageWithRetry 见此标记
 		// 退化为单次尝试, 消除 Coordinator(maxRetries) × 内层(3+限流) 的嵌套放大
