@@ -1989,6 +1989,25 @@ func (c *Client) StreamMessage(
 					if delta.Usage.InputTokens > 0 {
 						streamRec.InputTokens = delta.Usage.InputTokens
 					}
+					// ★ 缓存字段必须在这里也抄一遍。Anthropic 线格式里
+					// `message_start.message.usage` 常常是**全零骨架**
+					// （实测 opencode/deepseek 网关: input_tokens=0、
+					// cache_read_input_tokens=0），真实用量只出现在末帧
+					// `message_delta.usage` 里。上面那个分支读的是
+					// message_start，所以照它写就等于永远记 0。
+					//
+					// 后果不是"少两列好看的数字"：本地 llm:call:complete 的
+					// CacheReadTokens 恒为 0 时，任何基于它做的判断都会得出
+					// "缓存没用上、每次都按全价重发"——实测恰恰相反
+					// （同一 1630 token 请求第二次是 94 fresh + 1536 cached）。
+					// 于是最该省的地方被当成没问题，而 input 侧的真实成本
+					// 被放大一个数量级。
+					if delta.Usage.CacheReadInputTokens > 0 {
+						streamRec.CacheReadTokens = delta.Usage.CacheReadInputTokens
+					}
+					if delta.Usage.CacheCreationInputTokens > 0 {
+						streamRec.CacheCreationTokens = delta.Usage.CacheCreationInputTokens
+					}
 				}
 				if delta.Delta != nil && delta.Delta.StopReason != "" {
 					streamRec.StopReason = delta.Delta.StopReason
@@ -2036,6 +2055,14 @@ func (c *Client) StreamMessage(
 					}
 					if delta.Usage.InputTokens > 0 {
 						streamRec.InputTokens = delta.Usage.InputTokens
+					}
+					// 同理(见上方 message_delta 分支): 翻译器补发的 usage 尾帧
+					// 才是缓存命中数的唯一来源, 不抄就恒为 0。
+					if delta.Usage.CacheReadInputTokens > 0 {
+						streamRec.CacheReadTokens = delta.Usage.CacheReadInputTokens
+					}
+					if delta.Usage.CacheCreationInputTokens > 0 {
+						streamRec.CacheCreationTokens = delta.Usage.CacheCreationInputTokens
 					}
 				}
 				if delta.Delta != nil && delta.Delta.StopReason != "" {
