@@ -36,8 +36,12 @@ type BuildProgress struct {
 // NavigateQuery 符号导航查询。
 type NavigateQuery struct {
 	Symbol string `json:"symbol"`
-	Depth  int    `json:"depth,omitempty"`
-	Shard  string `json:"shard,omitempty"`
+	// FilePath 只用于同名符号消歧（gitnexus context -f），**不是**"按文件出大纲"。
+	// 过去这个字段在工具入参里有、在引擎里没有，导致 agent 传了 file_path 却完全
+	// 不生效，返回的仍是全局前 10 个同名定义。
+	FilePath string `json:"file_path,omitempty"`
+	Depth    int    `json:"depth,omitempty"`
+	Shard    string `json:"shard,omitempty"`
 }
 
 // ImpactQuery 影响分析查询。

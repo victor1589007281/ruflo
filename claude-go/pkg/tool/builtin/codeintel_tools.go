@@ -202,6 +202,16 @@ func (t *CodeIntelStatusTool) Call(ctx context.Context, input json.RawMessage, _
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
 
+	// 本进程没有 gitnexus（典型：worker Pod 镜像）时转发到远端 codeintel 服务，
+	// 否则 status 只会在本地报 "gitnexus CLI not found"，把"Pod 无 CLI"误报成"未索引"。
+	if _, terr := codeintel.DiscoverTools(); terr != nil {
+		text, isErr, rerr := codeintel.RemoteToolCall("code_intel_status", map[string]interface{}{"repo_path": in.RepoPath}, 0)
+		if rerr != nil {
+			return &tool.ToolResult{Content: fmt.Sprintf("status error: %v (local: %v)", rerr, terr), IsError: true}, nil
+		}
+		return &tool.ToolResult{Content: text, IsError: isErr}, nil
+	}
+
 	engine := codeintel.NewEngine(in.RepoPath)
 	qr, err := engine.Status("main")
 	if err != nil {
@@ -289,6 +299,22 @@ func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ 
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &tool.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
+	// 空目标不是"没找到"：find_refs 会退化成全仓 `rg -w ''`（agentDB 实测 21100 行），
+	// navigate/explain 会走 native_fallback 给无关定义。在分派前直接报参数错。
+	if err := codeintel.ValidateQueryTarget(in.QueryType, in.Symbol, in.FilePath, in.TargetSymbol); err != nil {
+		return &tool.ToolResult{Content: fmt.Sprintf("query error: %v", err), IsError: true}, nil
+	}
+	// 本进程缺 gitnexus 时转发到远端（见 remote_client.go 的注释）：参数由结构体
+	// 序列化，避免"手搓 JSON-RPC 把 symbol 拼成 query"这一类错。
+	if _, terr := codeintel.DiscoverTools(); terr != nil {
+		var args map[string]interface{}
+		_ = json.Unmarshal(input, &args)
+		text, isErr, rerr := codeintel.RemoteToolCall("code_intel_query", args, 0)
+		if rerr != nil {
+			return &tool.ToolResult{Content: fmt.Sprintf("query error: %v (local: %v)", rerr, terr), IsError: true}, nil
+		}
+		return &tool.ToolResult{Content: text, IsError: isErr}, nil
+	}
 
 	engine := codeintel.NewEngine(in.RepoPath)
 	var qr *codeintel.QueryResult
@@ -296,11 +322,11 @@ func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ 
 
 	switch in.QueryType {
 	case "navigate":
-		qr, err = engine.Navigate("main", codeintel.NavigateQuery{Symbol: in.Symbol, Depth: in.Depth, Shard: in.Shard})
+		qr, err = engine.Navigate("main", codeintel.NavigateQuery{Symbol: in.Symbol, FilePath: in.FilePath, Depth: in.Depth, Shard: in.Shard})
 	case "impact":
 		qr, err = engine.Impact("main", codeintel.ImpactQuery{FilePath: in.FilePath, Depth: in.Depth})
 	case "find_refs":
-		qr, err = engine.FindRefs("main", codeintel.NavigateQuery{Symbol: in.Symbol, Shard: in.Shard})
+		qr, err = engine.FindRefs("main", codeintel.NavigateQuery{Symbol: in.Symbol, FilePath: in.FilePath, Shard: in.Shard})
 	case "communities":
 		qr, err = engine.Communities("main", codeintel.CommunityQuery{Shard: in.Shard, TopN: in.TopN})
 	case "god_nodes":

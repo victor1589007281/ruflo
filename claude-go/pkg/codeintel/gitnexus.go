@@ -112,7 +112,7 @@ func (g *GitNexus) Query(q string) (*QueryResult, error) {
 		return nil, err
 	}
 	start := time.Now()
-	stdout, stderr, err := runTool(g.RepoPath, paths.NodePath, paths.GitNexusPath, "query", q)
+	stdout, stderr, err := runTool(g.RepoPath, paths.NodePath, paths.GitNexusPath, "query", q, "--repo", g.RepoPath)
 	combined := append(stderr, '\n')
 	combined = append(combined, stdout...)
 	if err != nil {
@@ -122,13 +122,33 @@ func (g *GitNexus) Query(q string) (*QueryResult, error) {
 }
 
 // Context 执行 gitnexus context <name>。
+//
+// ★ 必须带 --repo：全局注册表里有多台仓库（本机 47 个）时，不带 --repo 的
+// `context` 会直接抛 "Multiple repositories indexed. Specify which one with the
+// "repo" parameter." 并以非零码退出 —— 而 Engine 把非零码当成 "gitnexus miss"，
+// 静默降级到 Native 的 `rg` 文本搜索。症状是每次查询都 engine=native_*，
+// 看起来"查到了"（文本命中），实际上**调用的图一次都没用上**。
+// --repo 接受绝对路径（local-backend.resolveRepoFromCache 的 looksLikePath 分支），
+// 所以这里不需要先把路径映射成显示名。
 func (g *GitNexus) Context(name string) (*QueryResult, error) {
+	return g.ContextWithFile(name, "")
+}
+
+// ContextWithFile 同 Context，但在同名符号跨文件歧义时用 -f 指定文件。
+// 注意：gitnexus 的 -f 是"消歧义"而不是"按文件列大纲" —— 它只会挑该文件里的那个
+// 同名符号，不会返回整份文件的结构。
+func (g *GitNexus) ContextWithFile(name, filePath string) (*QueryResult, error) {
 	paths, err := g.ensurePaths()
 	if err != nil {
 		return nil, err
 	}
 	start := time.Now()
-	stdout, stderr, err := runTool(g.RepoPath, paths.NodePath, paths.GitNexusPath, "context", name)
+	args := []string{"context", name, "--repo", g.RepoPath}
+	if filePath != "" {
+		args = append(args, "-f", filePath)
+	}
+	argv := append([]string{paths.GitNexusPath}, args...)
+	stdout, stderr, err := runTool(g.RepoPath, paths.NodePath, argv...)
 	combined := append(stderr, '\n')
 	combined = append(combined, stdout...)
 	if err != nil {
@@ -144,7 +164,7 @@ func (g *GitNexus) Impact(target string) (*QueryResult, error) {
 		return nil, err
 	}
 	start := time.Now()
-	stdout, stderr, err := runTool(g.RepoPath, paths.NodePath, paths.GitNexusPath, "impact", target)
+	stdout, stderr, err := runTool(g.RepoPath, paths.NodePath, paths.GitNexusPath, "impact", target, "--repo", g.RepoPath)
 	combined := append(stderr, '\n')
 	combined = append(combined, stdout...)
 	if err != nil {
@@ -160,7 +180,7 @@ func (g *GitNexus) DetectChanges() (*QueryResult, error) {
 		return nil, err
 	}
 	start := time.Now()
-	stdout, stderr, err := runTool(g.RepoPath, paths.NodePath, paths.GitNexusPath, "detect-changes")
+	stdout, stderr, err := runTool(g.RepoPath, paths.NodePath, paths.GitNexusPath, "detect-changes", "--repo", g.RepoPath)
 	combined := append(stderr, '\n')
 	combined = append(combined, stdout...)
 	if err != nil {
@@ -245,12 +265,12 @@ func (g *GitNexus) IsIndexed() bool {
 
 // Navigate 符号导航（alias to Context）。
 func (g *GitNexus) Navigate(branchName string, q NavigateQuery) (*QueryResult, error) {
-	return g.Context(q.Symbol)
+	return g.ContextWithFile(q.Symbol, q.FilePath)
 }
 
 // FindRefs 符号引用（alias to Context）。
 func (g *GitNexus) FindRefs(branchName string, q NavigateQuery) (*QueryResult, error) {
-	return g.Context(q.Symbol)
+	return g.ContextWithFile(q.Symbol, q.FilePath)
 }
 
 // CrossShard 跨片查询（alias to Query）。

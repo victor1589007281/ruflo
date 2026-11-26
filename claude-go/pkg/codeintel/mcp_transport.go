@@ -828,6 +828,12 @@ func (s *MCPServerV2) toolQuery(args json.RawMessage) (string, bool) {
 	if err := json.Unmarshal(args, &in); err != nil {
 		return fmt.Sprintf("parse error: %v", err), true
 	}
+	// 空目标必须在这里拒绝：否则 find_refs 会退化成 `rg -w ''` 返回全仓 21100 行，
+	// navigate/explain 会走 native_fallback 给出与查询词无关的定义。调用方把一个
+	// 拼错的参数名（query vs symbol）当成了"查到了"。
+	if err := ValidateQueryTarget(in.QueryType, in.Symbol, in.FilePath, in.TargetSymbol); err != nil {
+		return fmt.Sprintf("query error: %v", err), true
+	}
 
 	engine := NewEngine(in.RepoPath)
 	var qr *QueryResult
@@ -835,11 +841,11 @@ func (s *MCPServerV2) toolQuery(args json.RawMessage) (string, bool) {
 
 	switch in.QueryType {
 	case "navigate":
-		qr, err = engine.Navigate("main", NavigateQuery{Symbol: in.Symbol, Depth: in.Depth, Shard: in.Shard})
+		qr, err = engine.Navigate("main", NavigateQuery{Symbol: in.Symbol, FilePath: in.FilePath, Depth: in.Depth, Shard: in.Shard})
 	case "impact":
 		qr, err = engine.Impact("main", ImpactQuery{FilePath: in.FilePath, Depth: in.Depth})
 	case "find_refs":
-		qr, err = engine.FindRefs("main", NavigateQuery{Symbol: in.Symbol, Shard: in.Shard})
+		qr, err = engine.FindRefs("main", NavigateQuery{Symbol: in.Symbol, FilePath: in.FilePath, Shard: in.Shard})
 	case "communities":
 		qr, err = engine.Communities("main", CommunityQuery{Shard: in.Shard, TopN: in.TopN})
 	case "god_nodes":

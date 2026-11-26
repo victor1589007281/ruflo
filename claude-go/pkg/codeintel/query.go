@@ -9,10 +9,49 @@ package codeintel
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// ErrEmptyQueryTarget 表示结构性查询缺少目标（symbol；impact 用 file_path）。
+//
+// 为什么必须报错而不是"查不到"：空目标会一路走到 Native 兜底，变成
+// `rg -w '' <repo>` —— 它匹配**全仓每一行**。实测 agentDB 的 `find_refs` 带空
+// symbol 返回 `count: 21100`、首条是 `deploy/build-and-load.sh:1` 的 shebang，
+// 与查询意图零关系。调用方（模型）拿到的是一个"成功"的超大结果集，会把噪声
+// 当结论写进报告；而参数拼错（例如 JSON 里写成 `query` 而不是 `symbol`）本该
+// 立刻可见。空目标属于**参数错**，不是**没找到**。
+var ErrEmptyQueryTarget = errors.New("codeintel: empty query target (need symbol; impact needs file_path)")
+
+// requireQueryTarget 校验结构性查询的目标非空，并把查询类型带进错误文本。
+func requireQueryTarget(queryType, field, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%w: query_type=%s missing %s", ErrEmptyQueryTarget, queryType, field)
+	}
+	return nil
+}
+
+// ValidateQueryTarget 按 query_type 校验必填目标（symbol / file_path / target_symbol）。
+//
+// 两个 MCP 入口（内置工具的 Call 与 HTTP JSON-RPC 的 toolQuery）都在分派前调它 ——
+// 它们各自把 `symbol` 解成不同字段名，靠引擎层守只能拿到"已进兜底"的错。
+// 不需要目标的类型（communities / god_nodes / surprises）直通。
+func ValidateQueryTarget(queryType, symbol, filePath, targetSymbol string) error {
+	switch queryType {
+	case "navigate", "find_refs", "cross_shard", "query", "explain":
+		return requireQueryTarget(queryType, "symbol", symbol)
+	case "impact":
+		return requireQueryTarget(queryType, "file_path", filePath)
+	case "path":
+		if err := requireQueryTarget(queryType, "symbol", symbol); err != nil {
+			return err
+		}
+		return requireQueryTarget(queryType, "target_symbol", targetSymbol)
+	}
+	return nil
+}
 
 // Engine 查询路由器。
 type Engine struct {
@@ -63,6 +102,10 @@ func (e *Engine) SetImplicitFeedbackCollector(collector *ImplicitFeedbackCollect
 // Navigate 符号导航 → GitNexus context → Native 兜底。
 func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, error) {
 	start := time.Now()
+	if err := requireQueryTarget("navigate", "symbol", q.Symbol); err != nil {
+		e.recordQuery("navigate", "gitnexus", nil, err, false, time.Since(start).Milliseconds())
+		return nil, err
+	}
 	qr, err := e.GitNexus.Navigate(branchName, q)
 	fallback := false
 	if err != nil || isEmptyResult(qr) {
@@ -79,6 +122,10 @@ func (e *Engine) Navigate(branchName string, q NavigateQuery) (*QueryResult, err
 // Impact 影响分析 → GitNexus impact → Native 兜底。
 func (e *Engine) Impact(branchName string, q ImpactQuery) (*QueryResult, error) {
 	start := time.Now()
+	if err := requireQueryTarget("impact", "file_path", q.FilePath); err != nil {
+		e.recordQuery("impact", "gitnexus", nil, err, false, time.Since(start).Milliseconds())
+		return nil, err
+	}
 	qr, err := e.GitNexus.ImpactQuery(branchName, q)
 	fallback := false
 	if err != nil || isEmptyResult(qr) {
@@ -95,6 +142,10 @@ func (e *Engine) Impact(branchName string, q ImpactQuery) (*QueryResult, error) 
 // FindRefs 符号引用 → GitNexus context → Native 兜底。
 func (e *Engine) FindRefs(branchName string, q NavigateQuery) (*QueryResult, error) {
 	start := time.Now()
+	if err := requireQueryTarget("find_refs", "symbol", q.Symbol); err != nil {
+		e.recordQuery("find_refs", "gitnexus", nil, err, false, time.Since(start).Milliseconds())
+		return nil, err
+	}
 	qr, err := e.GitNexus.FindRefs(branchName, q)
 	fallback := false
 	if err != nil || isEmptyResult(qr) {
@@ -127,6 +178,14 @@ func (e *Engine) GodNodes(branchName, shardName string, topN int) (*QueryResult,
 // Path 最短路径 → Graphify path。
 func (e *Engine) Path(branchName string, src, dst string) (*QueryResult, error) {
 	start := time.Now()
+	if err := requireQueryTarget("path", "symbol", src); err != nil {
+		e.recordQuery("path", "graphify", nil, err, false, time.Since(start).Milliseconds())
+		return nil, err
+	}
+	if err := requireQueryTarget("path", "target_symbol", dst); err != nil {
+		e.recordQuery("path", "graphify", nil, err, false, time.Since(start).Milliseconds())
+		return nil, err
+	}
 	qr, err := e.Graphify.Path(src, dst)
 	e.recordQuery("path", "graphify", qr, err, false, time.Since(start).Milliseconds())
 	return qr, err
@@ -143,6 +202,10 @@ func (e *Engine) Surprises(branchName, shardName string, topN int) (*QueryResult
 // CrossShard 跨片查询 → GitNexus query → Native 兜底。
 func (e *Engine) CrossShard(branchName string, q CrossShardQuery) (*QueryResult, error) {
 	start := time.Now()
+	if err := requireQueryTarget("cross_shard", "symbol", q.Symbol); err != nil {
+		e.recordQuery("cross_shard", "gitnexus", nil, err, false, time.Since(start).Milliseconds())
+		return nil, err
+	}
 	qr, err := e.GitNexus.CrossShard(branchName, q)
 	fallback := false
 	if err != nil || isEmptyResult(qr) || isGitNexusMiss(qr) {

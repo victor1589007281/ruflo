@@ -35,6 +35,9 @@ func NewNativeEngine(repoPath string) *NativeEngine {
 // FindDefinitions 查找符号的所有定义位置（支持多种语言模式）。
 func (e *NativeEngine) FindDefinitions(symbol string, maxResults int) (*QueryResult, error) {
 	start := time.Now()
+	if err := requireQueryTarget("navigate", "symbol", symbol); err != nil {
+		return nil, err
+	}
 	if maxResults <= 0 {
 		maxResults = 20
 	}
@@ -92,6 +95,11 @@ func (e *NativeEngine) FindDefinitions(symbol string, maxResults int) (*QueryRes
 // FindReferences 查找符号的文本引用（rg -w）。
 func (e *NativeEngine) FindReferences(symbol string, maxResults int) (*QueryResult, error) {
 	start := time.Now()
+	// 空 symbol 会变成 `rg -w ''`，匹配全仓每一行（agentDB 实测 21100 条）。
+	// 这一层也守一次，因为 Native 是公开方法，绕过 Engine 直接调用的路径同样会中招。
+	if err := requireQueryTarget("find_refs", "symbol", symbol); err != nil {
+		return nil, err
+	}
 	if maxResults <= 0 {
 		maxResults = 50
 	}
@@ -162,6 +170,9 @@ func (e *NativeEngine) ReadSnippet(filePath string, line int, contextLines int) 
 // FallbackSearch 兜底搜索：先找定义，再读附近行，再找引用。
 func (e *NativeEngine) FallbackSearch(symbol string) (*QueryResult, error) {
 	start := time.Now()
+	if err := requireQueryTarget("fallback", "symbol", symbol); err != nil {
+		return nil, err
+	}
 
 	// 1. 找定义
 	defs, _ := e.FindDefinitions(symbol, 10)
