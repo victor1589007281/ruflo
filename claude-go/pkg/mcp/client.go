@@ -100,6 +100,11 @@ type ToolInfo struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"inputSchema"`
+	// Annotations 是 MCP 协议的工具注解 (2025-03 规范)。只消费 readOnlyHint:
+	// 服务端比客户端的名字启发式更懂自己的工具是不是只读。
+	Annotations *struct {
+		ReadOnlyHint bool `json:"readOnlyHint"`
+	} `json:"annotations,omitempty"`
 }
 
 // jsonrpcRequest JSON-RPC 2.0 请求
@@ -764,20 +769,29 @@ func (t *MCPTool) Description() string { return t.info.Description }
 // InputSchema 直接透传远程工具的 JSON Schema。
 func (t *MCPTool) InputSchema() json.RawMessage { return t.info.InputSchema }
 
-// IsReadOnly 由**工具名启发式**推断是否只读 (MCP 协议本身不携带这个信息)。
+// IsReadOnly 优先读服务端声明的 readOnlyHint 注解 (MCP 2025-03 规范),
+// 没有注解时退回**工具名启发式**推断。
 //
 // 算法解读：
 //
-//	原理：MCP 的 tool 描述里没有"是否写"的字段, 所以只能按名字猜: 前缀命中
-//		read/get/list/search/... 或后缀命中 _list/_get/... 即判定为只读。
+//	原理：服务端在 tools/list 里带 annotations.readOnlyHint 时直接采信 —— 服务端
+//		比客户端更懂自己的工具; 没带注解再按名字猜: 前缀命中 read/get/list/search/...
+//		或后缀命中 _list/_get/... 即判定为只读。
 //	关键不变量：这是个**只影响权限提示、不影响实际执行**的保守判据 —— 判错只读会让
 //		写工具被当成只读而少一次确认, 所以它**宁可不判**: 默认返回 false (当写工具处理),
-//		只有名字明确像读时才放行。
-//	代价与边界：纯字符串匹配, 不解析 schema、不看服务端能力声明。名字叫 "fetch_and_delete"
+//		只有服务端明说或名字明确像读时才放行。注解只认 readOnlyHint=true, 显式 false
+//		与缺席同义 (都回落启发式), 因为启发式猜"像读"的误判方向与注解 false 一致时
+//		没有额外信息。
+//	代价与边界：启发式是纯字符串匹配, 不解析 schema。名字叫 "fetch_and_delete"
 //		这类复合动词会误判为只读 —— 这是已知的边界, 不是 bug。
-//	设计权衡：不做参数级分析 (那要理解每个工具的语义), 用一条廉价的命名约定换取
-//		绝大多数标准 MCP 服务器上的正确率。
+//	设计权衡：不做参数级分析 (那要理解每个工具的语义), 用"协议注解 + 一条廉价的
+//		命名约定"换取绝大多数标准 MCP 服务器上的正确率。真实案例: webapp 内置浏览器
+//		的 browser_open/browser_get_text 名字不带读前缀, 纯启发式全判写, Plan 模式的
+//		只读 agent (行研官) 被整面拦截 —— 注解是正解。
 func (t *MCPTool) IsReadOnly(_ json.RawMessage) bool {
+	if t.info.Annotations != nil && t.info.Annotations.ReadOnlyHint {
+		return true
+	}
 	lower := strings.ToLower(t.info.Name)
 	for _, prefix := range []string{"read", "get", "list", "search", "query", "fetch", "describe", "show", "status", "info", "check", "view"} {
 		if strings.HasPrefix(lower, prefix) {
