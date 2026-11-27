@@ -114,6 +114,65 @@ func TestFetchParsesRSSFeed(t *testing.T) {
 	}
 }
 
+// TestFetchParsesSitemapXML 钉住 sitemap (urlset/sitemapindex) 的清单化抽取 ——
+// 事故背景 (2026-11-26): 模型抓 doris/duckdb 的 sitemap.xml 发现站点页面,
+// 两次撞 "unparseable feed"。sitemap 不是 feed, 但每条 loc 都是站点声明
+// 真实存在的 URL, 渲染成链接清单可直接引导后续抓取。
+func TestFetchParsesSitemapXML(t *testing.T) {
+	allowAnyFetchURL(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		switch r.URL.Path {
+		case "/sitemap.xml":
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.org/blog/hubspot-doris</loc><lastmod>2026-11-20</lastmod></url>
+  <url><loc>https://example.org/blog/doris-4-0</loc></url>
+</urlset>`)
+		case "/sitemap_index.xml":
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://example.org/sitemap-posts.xml</loc><lastmod>2026-11-27T08:00:00Z</lastmod></sitemap>
+</sitemapindex>`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	m := NewManager(DefaultConfig(), testEgress(t), nil)
+	defer m.Close()
+
+	doc, err := m.Fetch(context.Background(), FetchRequest{URL: srv.URL + "/sitemap.xml"})
+	if err != nil {
+		t.Fatalf("Fetch urlset: %v", err)
+	}
+	if !strings.Contains(doc.Document.Title, "2 URLs") {
+		t.Errorf("title 应含条目数: %q", doc.Document.Title)
+	}
+	if !strings.Contains(doc.Document.Markdown, "[https://example.org/blog/hubspot-doris](https://example.org/blog/hubspot-doris) — 2026-11-20") {
+		t.Errorf("markdown 缺带 lastmod 的条目:\n%s", doc.Document.Markdown)
+	}
+	if !strings.Contains(doc.Document.Markdown, "[https://example.org/blog/doris-4-0](https://example.org/blog/doris-4-0)") {
+		t.Errorf("markdown 缺无 lastmod 条目:\n%s", doc.Document.Markdown)
+	}
+	// lastmod 不得污染文档 published (很多站点全量刷成当天, 语义不可靠)。
+	if !doc.Document.Published.IsZero() {
+		t.Errorf("sitemap 不应设 published, got %v", doc.Document.Published)
+	}
+
+	doc2, err := m.Fetch(context.Background(), FetchRequest{URL: srv.URL + "/sitemap_index.xml"})
+	if err != nil {
+		t.Fatalf("Fetch sitemapindex: %v", err)
+	}
+	if !strings.Contains(doc2.Document.Markdown, "子 sitemap 清单") {
+		t.Errorf("sitemapindex 应有引导语:\n%s", doc2.Document.Markdown)
+	}
+	if !strings.Contains(doc2.Document.Markdown, "https://example.org/sitemap-posts.xml") {
+		t.Errorf("markdown 缺子 sitemap:\n%s", doc2.Document.Markdown)
+	}
+}
+
 // TestFetchRejectsNonFeedXML 钉住非 feed XML 仍判 unsupported ——
 // 数据 API 的 XML 不应被误当 feed 硬抽。
 func TestFetchRejectsNonFeedXML(t *testing.T) {

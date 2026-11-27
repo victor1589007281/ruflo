@@ -289,14 +289,22 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 		// 之前落在 default 被判 unsupported。feed 结构化成标题+条目链接清单,
 		// 比裸 XML 文本对检索/阅读都更有用。
 		feed, ferr := parseFeedXML(text)
-		if ferr != nil || (feed.title() == "" && len(feed.items()) == 0) {
+		if ferr == nil && (feed.title() != "" || len(feed.items()) > 0) {
+			title = feed.title()
+			items := feed.items()
+			markdown = feedMarkdown(items)
+			if len(items) > 0 && !items[0].published().IsZero() {
+				published = items[0].published()
+			}
+		} else if sm, serr := parseSitemapXML(text); serr == nil && len(sm.entries()) > 0 {
+			// 不是 feed 还可能是 sitemap: 模型抓 sitemap 是为了发现站点页面
+			// (博客归档/文档目录), 渲染成可顺藤抓取的链接清单, 比一句
+			// unsupported 更能引导下一步 (2026-11-26 实测 doris/duckdb
+			// sitemap.xml 两次撞 "unparseable feed")。
+			title = fmt.Sprintf("Sitemap %s (%d URLs)", u.Host, len(sm.entries()))
+			markdown = sitemapMarkdown(sm)
+		} else {
 			return nil, Wrap("fetch", ErrUnsupported, fmt.Errorf("unparseable feed %q", mediaType))
-		}
-		title = feed.title()
-		items := feed.items()
-		markdown = feedMarkdown(items)
-		if len(items) > 0 && !items[0].published().IsZero() {
-			published = items[0].published()
 		}
 	case "application/json":
 		// REST API 响应 (api.github.com 的 releases/commits 等) 是查版本与
@@ -1586,6 +1594,78 @@ func feedMarkdown(items []feedEntry) string {
 			}
 		}
 		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// maxSitemapEntries 限制渲染进文档的 sitemap 条目数: 全量 sitemap 可达数万条,
+// 保留头部 (站点一般按栏目/更新聚簇排序, 头部对"发现页面"最有用), 截断注明总数。
+const maxSitemapEntries = 200
+
+// sitemapDoc 同时兼容 <urlset> (页面清单) 与 <sitemapindex> (子 sitemap 清单),
+// 两者 entry 结构相同 (loc + lastmod), 一次解码全取; 命名空间前缀由
+// encoding/xml 按本地名匹配, 不用显式处理。
+type sitemapDoc struct {
+	URLs []sitemapEntry `xml:"url"`
+	Subs []sitemapEntry `xml:"sitemap"`
+}
+
+// sitemapEntry 是 urlset 里的一条 <url> 或 sitemapindex 里的一条 <sitemap>。
+type sitemapEntry struct {
+	Loc     string `xml:"loc"`
+	LastMod string `xml:"lastmod"`
+}
+
+// entries 返回清单条目 (urlset 的 url 优先, 空则取 sitemapindex 的 sitemap)。
+func (d *sitemapDoc) entries() []sitemapEntry {
+	if len(d.URLs) > 0 {
+		return d.URLs
+	}
+	return d.Subs
+}
+
+// parseSitemapXML 解码 sitemap, 容忍未知扩展标签 (同 parseFeedXML)。
+func parseSitemapXML(raw string) (*sitemapDoc, error) {
+	var doc sitemapDoc
+	if err := xml.Unmarshal([]byte(raw), &doc); err != nil {
+		return nil, err
+	}
+	return &doc, nil
+}
+
+// sitemapMarkdown 把 sitemap 渲染成链接清单: 每条 loc 都是站点声明真实存在的
+// URL, 模型可顺藤抓取 (这些链接经 seen-URL 登记后, 后续 WebFetch 不会触发
+// 臆造提示); lastmod 原样附上帮助挑选。lastmod 不设为文档 published ——
+// 很多站点全量刷成当天, 语义不可靠。
+func sitemapMarkdown(doc *sitemapDoc) string {
+	entries := doc.entries()
+	var sb strings.Builder
+	if len(doc.URLs) == 0 && len(doc.Subs) > 0 {
+		sb.WriteString("子 sitemap 清单 (逐条抓取可继续发现页面):\n\n")
+	}
+	shown := entries
+	truncated := len(shown) > maxSitemapEntries
+	if truncated {
+		shown = shown[:maxSitemapEntries]
+	}
+	for _, e := range shown {
+		loc := strings.TrimSpace(e.Loc)
+		if loc == "" {
+			continue
+		}
+		sb.WriteString("- [")
+		sb.WriteString(loc)
+		sb.WriteString("](")
+		sb.WriteString(loc)
+		sb.WriteString(")")
+		if lm := strings.TrimSpace(e.LastMod); lm != "" {
+			sb.WriteString(" — ")
+			sb.WriteString(lm)
+		}
+		sb.WriteString("\n")
+	}
+	if truncated {
+		fmt.Fprintf(&sb, "\n[已截断: 共 %d 条, 仅列前 %d 条]", len(entries), maxSitemapEntries)
 	}
 	return sb.String()
 }
