@@ -222,7 +222,7 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 		cached.CacheHit = true
 		cached.ElapsedMS = time.Since(start).Milliseconds()
 		m.recordSearch(plan, req, &cached, nil, time.Since(start), nil)
-		return &cached, nil
+		return m.widenIfFreshFailed(ctx, req, plan, &cached, start)
 	}
 	cacheDegraded = append(cacheDegraded, currentDegraded...)
 
@@ -242,7 +242,53 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) (*SearchRespons
 	resp = cloneSearchResponse(resp)
 	resp.Degraded = dedupeStrings(append(resp.Degraded, cacheDegraded...))
 	resp.ElapsedMS = time.Since(start).Milliseconds()
-	return &resp, nil
+	return m.widenIfFreshFailed(ctx, req, plan, &resp, start)
+}
+
+// widenIfFreshFailed 在 fresh 门失败时自动把窗口放宽一档 (day→week→month)
+// 重检一次, 返回放宽后的响应并标注 FreshnessWidened。
+//
+// 为什么必须自动化: "fresh → 放宽一档重试" 先写进静态规则、又加进错误现场
+// 的 gate_hint, 弱模型 (deepseek-v4.1-flash) 的遵从仍是概率性的 —— 2026-11-27
+// 实测三份日报 26 次检索 14 次挂 fresh, 大半是论文查询误用 week。模型本来就
+// 会在约一半的情况下手动换 month 重搜, 自动化后 provider 成本基本持平, 但
+// 红灯与行为不确定性消失。month 不触发 fresh 门 (freshnessRequired 只认
+// day/week), 所以递归深度天然有界: day 最多 day→week→month 两级。
+func (m *Manager) widenIfFreshFailed(ctx context.Context, req SearchRequest, plan QueryPlan, resp *SearchResponse, start time.Time) (*SearchResponse, error) {
+	if resp == nil || resp.GateReason != "fresh" || !freshnessRequired(plan.Freshness) {
+		return resp, nil
+	}
+	widened := widenFreshness(plan.Freshness)
+	m.metrics.Inc("search_fresh_widened_total", map[string]string{"from": plan.Freshness, "to": widened})
+	req2 := req
+	req2.Freshness = widened
+	req2.widenedFrom = plan.Freshness
+	resp2, err := m.Search(ctx, req2)
+	if err != nil || resp2 == nil {
+		// 放宽重检本身失败 (网络/配额): 不丢原始结果, 返回带 gate_hint 的原响应。
+		return resp, nil
+	}
+	// 链式放宽 (day→week 又失败→month) 时把链路拼全: "day→week→month"。
+	if resp2.FreshnessWidened != "" {
+		resp2.FreshnessWidened = plan.Freshness + "→" + resp2.FreshnessWidened
+	} else {
+		resp2.FreshnessWidened = plan.Freshness + "→" + widened
+	}
+	// 两轮的成本与降级都是本次调用的真实开销, 合并进返回响应 (遥测里两轮
+	// 各自有独立记录, 靠 widenedFrom 关联)。
+	resp2.CostUSD += resp.CostUSD
+	resp2.Degraded = dedupeStrings(append(resp2.Degraded, resp.Degraded...))
+	resp2.ElapsedMS = time.Since(start).Milliseconds()
+	return resp2, nil
+}
+
+// widenFreshness 返回下一档更宽的时效窗口; fresh 门只对 day/week 生效,
+// 所以只需处理这两档。
+func widenFreshness(freshness string) string {
+	if strings.EqualFold(strings.TrimSpace(freshness), "day") {
+		return "week"
+	}
+	return "month"
 }
 
 // executeSearch 执行实际调度、融合与质量门, 并写入缓存。
@@ -345,13 +391,18 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 	resp := SearchResponse{
 		// 未调度源的退避仍留在 Degraded 供运维归因, 但只有本次实际打源
 		// 失败才把可用结果标成 partial; 缓存故障也不改变数据源自身状态。
-		Status:     responseStatus(len(fused), executionDegraded),
-		Results:    fused,
-		Providers:  used,
-		Degraded:   degraded,
-		CostUSD:    actualCost,
-		GatePassed: passed,
-		GateReason: quality.gateReason(needFresh),
+		Status:       responseStatus(len(fused), executionDegraded),
+		Results:      fused,
+		Providers:    used,
+		Degraded:     degraded,
+		CostUSD:      actualCost,
+		GatePassed:   passed,
+		GateReason:   quality.gateReason(needFresh),
+		DatedResults: quality.DatedResults,
+	}
+	// 时效门失败时在错误现场给模型可执行的下一步 (见 freshGateHint 注释)。
+	if resp.GateReason == "fresh" {
+		resp.GateHint = freshGateHint(quality, plan.Freshness, time.Now())
 	}
 	resp = m.putSearchCache(ctx, cacheKey, resp, m.cacheTTL(plan, req))
 	m.recordSearch(plan, req, &resp, nil, time.Since(start), perProvider)
@@ -364,13 +415,14 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 // 面板的"优化方向"全部来自这些逐条现场 (缓存命中/门原因/慢源/零结果查询)。
 func (m *Manager) recordSearch(plan QueryPlan, req SearchRequest, resp *SearchResponse, err error, latency time.Duration, perProvider map[string]int64) {
 	rec := Record{
-		Kind:       "search",
-		Query:      req.Query,
-		Intent:     string(plan.Intent),
-		Lang:       plan.Language,
-		Freshness:  plan.Freshness,
-		LatencyMS:  latency.Milliseconds(),
-		ProviderMS: perProvider,
+		Kind:        "search",
+		Query:       req.Query,
+		Intent:      string(plan.Intent),
+		Lang:        plan.Language,
+		Freshness:   plan.Freshness,
+		WidenedFrom: req.widenedFrom,
+		LatencyMS:   latency.Milliseconds(),
+		ProviderMS:  perProvider,
 	}
 	if err != nil {
 		rec.Status = "error"
@@ -380,6 +432,7 @@ func (m *Manager) recordSearch(plan QueryPlan, req SearchRequest, resp *SearchRe
 		rec.CacheHit = resp.CacheHit
 		rec.GatePassed = resp.GatePassed
 		rec.GateReason = resp.GateReason
+		rec.Dated = resp.DatedResults
 		rec.Providers = resp.Providers
 		rec.Failed = resp.Degraded
 		rec.Results = len(resp.Results)

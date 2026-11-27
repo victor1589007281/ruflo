@@ -368,8 +368,18 @@ func listenRenderRequests(ctx context.Context, state *renderState) {
 					return
 				}
 				if _, err := guardRenderURL(state.guard, ev.Request.URL); err != nil {
-					state.fail(Wrap("chromedp", KindOf(err),
-						fmt.Errorf("request %s: %w", requestLabel(ev.Request.URL), err)))
+					// 两类拒绝分开处置:
+					//  - http(s) 被 guard 拒 (SSRF: 私网/环回/元数据地址) —— 页面
+					//    在探测内网, 整页判死 (TestBrowserRendererBlocksPrivateSubresource
+					//    钉住这个姿态);
+					//  - 非 http(s) scheme 的子资源 (data:font、blob:worker 等页面
+					//    内联内容) —— 根本不发出网络请求, 拦掉这一条即可; 判死整页
+					//    是误伤 (z.ai 博客 2026-11-26 两次抓取失败的根因)。
+					// 主文档导航无论哪类都判死。
+					if ev.ResourceType == network.ResourceTypeDocument || approvedRequestScheme(ev.Request.URL) {
+						state.fail(Wrap("chromedp", KindOf(err),
+							fmt.Errorf("request %s: %w", requestLabel(ev.Request.URL), err)))
+					}
 					_ = cdpfetch.FailRequest(ev.RequestID, network.ErrorReasonBlockedByClient).Do(requestCtx)
 					return
 				}
@@ -378,7 +388,9 @@ func listenRenderRequests(ctx context.Context, state *renderState) {
 				}
 			})
 		case *network.EventRequestWillBeSent:
-			if ev.Request != nil && !approvedRequestScheme(ev.Request.URL) {
+			// 与 paused 处理器同一口径: 非 http(s) 的子资源 (data:/blob:) 由
+			// blockUnsafeSchemes 拦掉即可, 只有主文档导航才判整页失败。
+			if ev.Request != nil && ev.Type == network.ResourceTypeDocument && !approvedRequestScheme(ev.Request.URL) {
 				raw := ev.Request.URL
 				state.spawn(func() { state.check(raw) })
 			}

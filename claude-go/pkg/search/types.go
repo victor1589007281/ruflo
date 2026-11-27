@@ -68,6 +68,9 @@ type SearchRequest struct {
 	AllowedDomains   []string // Manager 硬过滤, 包含子域名
 	BlockedDomains   []string // Manager 硬过滤, 优先于 AllowedDomains
 	Deadline         time.Time
+	// widenedFrom 是包内标记: 本次请求是 fresh 门失败后的自动放宽重检, 值是
+	// 原始窗口 ("day"/"week")。只用于遥测归因, 不影响检索行为。
+	widenedFrom string
 }
 
 // Result 是单条检索结果。
@@ -158,6 +161,16 @@ type SearchResponse struct {
 	// GateReason 是质量门的失败维度 (domains/snippet/lang/duplicate/fresh);
 	// 通过时为 "pass"。只暴露判据, 不暴露内部指标值。
 	GateReason string `json:"gate_reason"`
+	// DatedResults 是带发布时间的结果条数 (融合前原始结果)。fresh 门只在这批
+	// 样本上判定; 无日期的结果算"无法验证", 不再计为不新鲜。
+	DatedResults int `json:"dated_results,omitempty"`
+	// GateHint 是门失败时给模型的下一步指令 (目前只有 fresh 门生成)。静态的
+	// "按 gate_reason 行动" 规则实测无人跟进, 错误现场的提示才会被执行。
+	GateHint string `json:"gate_hint,omitempty"`
+	// FreshnessWidened 非空表示请求窗口 (day/week) 没过 fresh 门, Manager 已
+	// 自动放宽一档重检 (如 "week→month"), 本响应是放宽后的结果。模型应优先
+	// 采用原窗口内的条目, 并把放宽事实写进缺口报告。
+	FreshnessWidened string `json:"freshness_widened,omitempty"`
 }
 
 // FetchResponse 是 Manager 抓取结果。

@@ -58,6 +58,13 @@ type Record struct {
 	CacheHit   bool   `json:"cacheHit,omitempty"`
 	GatePassed bool   `json:"gatePassed"`
 	GateReason string `json:"gateReason,omitempty"`
+	// Dated 是本次结果里带发布时间的条数。fresh 门只在有日期的样本上判定,
+	// 这个数与 Results 的差就是"无法验证时效"的部分 —— 面板据此区分
+	// "结果真的旧" 与 "provider 没给日期"。
+	Dated int `json:"dated,omitempty"`
+	// WidenedFrom 非空表示本条记录是 fresh 门失败后的自动放宽重检, 值是原始
+	// 窗口 ("day"/"week")。面板据此把成对的 fail→pass 记录归因到同一动作。
+	WidenedFrom string `json:"widenedFrom,omitempty"`
 
 	Providers  []string         `json:"providers,omitempty"`  // 本次真正返回结果的源
 	Failed     []string         `json:"failed,omitempty"`     // 降级/失败摘要 (含退避中的源)

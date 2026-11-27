@@ -241,6 +241,11 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 	}
 
 	mediaType, params := parseMediaType(resp.Header.Get("Content-Type"))
+	// application/*+json (hal+json / ld+json / vnd.github+json ...) 与裸 JSON
+	// 同等对待, 走同一个代码块分支。
+	if strings.HasSuffix(mediaType, "+json") {
+		mediaType = "application/json"
+	}
 	// PDF 必须先于 NUL/字符集处理分流。部分服务器把 PDF 错标为
 	// application/octet-stream，因此同时接受 Content-Type 与文件 magic。
 	if mediaType == "application/pdf" || bytes.HasPrefix(body, []byte("%PDF-")) {
@@ -293,6 +298,12 @@ func (m *Manager) fetchWithClient(ctx context.Context, client *http.Client, u *u
 		if len(items) > 0 && !items[0].published().IsZero() {
 			published = items[0].published()
 		}
+	case "application/json":
+		// REST API 响应 (api.github.com 的 releases/commits 等) 是查版本与
+		// 元数据的一手来源, 之前落在 default 判 unsupported —— agent 只能
+		// 绕路猜 HTML 页, 猜错就是一次臆造 URL 404。JSON 不做正文提取,
+		// 规整后包进代码块; 体量超上限的部分截断。
+		markdown = jsonMarkdown(text)
 	default:
 		return nil, Wrap("fetch", ErrUnsupported, fmt.Errorf("unsupported content type %q", mediaType))
 	}
@@ -1438,7 +1449,7 @@ func firstNonEmpty(vals ...string) string {
 // feedDoc/feedEntry 以 union 结构同时兼容 Atom (feed/entry) 与 RSS
 // (rss/channel/item) —— 两者字段名不同但语义一一对应, 一次解码全取。
 type feedDoc struct {
-	Title   string     `xml:"title"`
+	Title   string      `xml:"title"`
 	Entries []feedEntry `xml:"entry"`
 	Channel struct {
 		Title string      `xml:"title"`
@@ -1449,8 +1460,8 @@ type feedDoc struct {
 // feedEntry 是一条 Atom entry 或 RSS item。Summary/Content/Desc 三选一,
 // 谁非空用谁; 时间字段同理 (Atom 用 published/updated, RSS 用 pubDate)。
 type feedEntry struct {
-	Title   string `xml:"title"`
-	Link    struct {
+	Title string `xml:"title"`
+	Link  struct {
 		Href string `xml:"href,attr"` // Atom: <link href="..."/>
 		Text string `xml:",chardata"` // RSS: <link>http://...</link>
 	} `xml:"link"`
@@ -1512,6 +1523,36 @@ func parseFeedXML(raw string) (*feedDoc, error) {
 		return nil, err
 	}
 	return &doc, nil
+}
+
+// maxJSONDocChars 限制包进文档的 JSON 文本量: API 响应可能整包 MB 级,
+// 全量进 markdown 会撑爆全文缓存与下游摘录窗口。
+const maxJSONDocChars = 200_000
+
+// jsonMarkdown 把 JSON 响应渲染成文档正文: 能解析就重新缩进 (便于阅读与
+// 摘录窗口定位), 不能解析 (JSONP/ndjson) 保留原文; 超上限截断并在代码块
+// 外注明。
+func jsonMarkdown(text string) string {
+	trimmed := strings.TrimSpace(text)
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, []byte(trimmed), "", "  "); err == nil && buf.Len() <= maxJSONDocChars {
+		trimmed = buf.String()
+	}
+	truncated := false
+	if len(trimmed) > maxJSONDocChars {
+		trimmed = trimmed[:maxJSONDocChars]
+		truncated = true
+	}
+	var sb strings.Builder
+	sb.WriteString("```json\n")
+	sb.WriteString(trimmed)
+	sb.WriteString("\n```")
+	if truncated {
+		sb.WriteString("\n\n[JSON 已截断: 原始响应超过 ")
+		sb.WriteString(strconv.Itoa(maxJSONDocChars))
+		sb.WriteString(" 字符]")
+	}
+	return sb.String()
 }
 
 // feedMarkdown 把 feed 条目渲染成清单式 Markdown: 每条 = 链接标题 + 日期 +

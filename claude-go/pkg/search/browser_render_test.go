@@ -356,3 +356,29 @@ func (g *recordingRenderGuard) urls() []string {
 	defer g.mu.Unlock()
 	return append([]string(nil), g.seen...)
 }
+
+// TestBrowserRendererToleratesInlineDataSubresource 钉住与
+// TestBrowserRendererBlocksPrivateSubresource 相对的另一臂 (2026-11-26):
+// 页面内联的 data: 子资源 (字体/图片/脚本) 不发出网络请求, 必须只拦该请求,
+// 不能把整页渲染判死 —— z.ai 博客因一个 data:font/woff2 两次抓取失败的根因。
+// SSRF 姿态不变: http(s) 私网子资源仍然整页拒 (见上一个测试)。
+func TestBrowserRendererToleratesInlineDataSubresource(t *testing.T) {
+	requireRenderChrome(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		// 与 z.ai 博客同形: 正文 + data: 内联字体/脚本。
+		_, _ = fmt.Fprint(w, `<html><head><style>@font-face{font-family:x;src:url(data:font/woff2;base64,d09GMgABAAAAAA==)}</style></head>`+
+			`<body><main>Article body survives inline data resources.</main>`+
+			`<script src="data:text/javascript,window.__x=1"></script></body></html>`)
+	}))
+	defer srv.Close()
+	guard := recordingGuardFor(srv.URL)
+	renderer := NewBrowserRenderer(BrowserRenderOptions{Timeout: 10 * time.Second, Settle: 50 * time.Millisecond, Guard: guard.check})
+	doc, err := renderer.Render(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("data: 子资源不应判死整页: %v", err)
+	}
+	if !strings.Contains(doc.Markdown, "Article body survives") {
+		t.Fatalf("正文应被提取: %q", doc.Markdown)
+	}
+}

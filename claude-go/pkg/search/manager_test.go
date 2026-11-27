@@ -1091,3 +1091,81 @@ func TestPlanQueryVersionQueriesAreNotWeeklyNews(t *testing.T) {
 		t.Errorf("新闻 freshness = %s, want week", got)
 	}
 }
+
+// fresh 门失败后的自动放宽 (widenIfFreshFailed): 弱模型对 "放宽一档重试"
+// 的静态规则与 gate_hint 遵从都是概率性的 (2026-11-27 实测 26 次检索 14 次
+// 挂 fresh), 所以放宽必须内建。钉住三件事:
+//  1. week 失败自动以 month 重检, 响应标注 FreshnessWidened, 结果取放宽后的;
+//  2. day 失败会链式放宽到 month, 链路标注拼全 ("day→week→month");
+//  3. 没挂 fresh 的检索绝不重检 (不白烧 provider 配额)。
+func TestSearchFreshAutoWiden(t *testing.T) {
+	allowAnyFetchURL(t)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	fresh := time.Now().Add(-time.Hour)
+	mkResults := func(published time.Time) []Result {
+		out := make([]Result, 0, 5)
+		for i := 0; i < 5; i++ {
+			out = append(out, Result{
+				URL:       fmt.Sprintf("https://d%d.example.com/post", i),
+				Title:     "database paper",
+				Snippet:   "storage engine research",
+				Published: published,
+			})
+		}
+		return out
+	}
+
+	// 臂 1: week 全旧 → 自动 month 重检。
+	var gotFresh []string
+	p := newFake("ok", TierL0, func(_ context.Context, req SearchRequest) ([]Result, error) {
+		gotFresh = append(gotFresh, req.Freshness)
+		return mkResults(old), nil
+	})
+	cfg := DefaultConfig()
+	cfg.HedgeDelay = 0
+	m := NewManager(cfg, testEgress(t), []Provider{p})
+	defer m.Close()
+
+	resp, err := m.Search(context.Background(), SearchRequest{Query: "database storage engine paper", Freshness: "week"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if resp.FreshnessWidened != "week→month" {
+		t.Errorf("FreshnessWidened = %q, want week→month", resp.FreshnessWidened)
+	}
+	if !resp.GatePassed {
+		t.Errorf("放宽到 month 后 fresh 门不适用, 应通过: %+v", resp)
+	}
+	if len(gotFresh) != 2 || gotFresh[0] != "week" || gotFresh[1] != "month" {
+		t.Errorf("provider 应以 week,month 各调一次: %v", gotFresh)
+	}
+
+	// 臂 2: day 全旧 → 链式放宽两级。
+	gotFresh = nil
+	resp2, err := m.Search(context.Background(), SearchRequest{Query: "query optimizer paper", Freshness: "day"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if resp2.FreshnessWidened != "day→week→month" {
+		t.Errorf("链式放宽标注 = %q, want day→week→month", resp2.FreshnessWidened)
+	}
+	if len(gotFresh) != 3 || gotFresh[2] != "month" {
+		t.Errorf("day 应打三轮 (day,week,month): %v", gotFresh)
+	}
+
+	// 臂 3: 结果新鲜 → 不重检。
+	gotFresh = nil
+	p2 := newFake("ok2", TierL0, func(_ context.Context, req SearchRequest) ([]Result, error) {
+		gotFresh = append(gotFresh, req.Freshness)
+		return mkResults(fresh), nil
+	})
+	m2 := NewManager(cfg, testEgress(t), []Provider{p2})
+	defer m2.Close()
+	resp3, err := m2.Search(context.Background(), SearchRequest{Query: "fresh news today", Freshness: "day"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if resp3.FreshnessWidened != "" || len(gotFresh) != 1 {
+		t.Errorf("新鲜结果不应触发放宽: widened=%q calls=%v", resp3.FreshnessWidened, gotFresh)
+	}
+}

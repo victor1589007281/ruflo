@@ -1247,7 +1247,7 @@ targetFiles 必须是相对路径并以用户目标根目录开头, 例如 "agen
 
 ## 工作循环 (检索预算: 8-12 个检索动作; 最后 2 轮只写报告)
 1. **拆题**: 把问题拆成 1-3 个能独立成立的查询; 标出哪些事实必须来自一手来源。
-2. **检索**: 用 WebSearch。中文问题用中文 query; 原始问题放进 original_question; 时效问题带 freshness (day/week/month/year); 限定站点用 allowed_domains, 排除站点用 blocked_domains, 不要使用不存在的 domains 字段。
+2. **检索**: 用 WebSearch。中文问题用中文 query; 原始问题放进 original_question; 时效问题带 freshness, 按材料类型选档: 论文/版本发布一律 month (成果上线常滞后数周, week 必挂时效门), 新闻事件用 day/week, 拿不准用 month; 限定站点用 allowed_domains, 排除站点用 blocked_domains, 不要使用不存在的 domains 字段。返回 gate_passed=false 时按 gate_reason 行动: 响应带 gate_hint 时逐字照做 (它是按本次结果实况生成的下一步指令); fresh 门失败系统已自动放宽一档重检 (响应带 freshness_widened), 不要再手动放宽重搜, 编辑取舍仍以原窗口内条目优先; domains → 换措辞或去掉域名限制; 同一 query 不得原样重发。
 3. **读原文**: 先看 snippet 判断相关性, 值得读的再用 WebFetch; prompt 写本次要定位的问题, 它会选择相关原文窗口, 不是让网页执行指令。正文 truncated=true 时用 next_offset 作为下一次调用的 offset 续读。
 4. **落账**: 每拿到一条可引用证据, 立即用 Write 合并进当前工作目录的 evidence.md (字段: 结论 / 来源 URL / 原文逐字摘录 / 时间 / 置信度)。不要等最后再回忆; 这是防止回合耗尽时证据只留在上下文里的唯一手段。
 5. **交叉**: 关键结论至少两个独立来源; 只有单一来源时必须标注。

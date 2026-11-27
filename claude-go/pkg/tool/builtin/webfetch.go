@@ -148,7 +148,7 @@ func (t *WebFetchTool) CheckPermissions(_ json.RawMessage, _ *tool.ToolContext) 
 }
 
 // Call 执行 HTTP GET、截断与 HTML→文本简化提取。
-func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.ToolContext) (*tool.ToolResult, error) {
+func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, tctx *tool.ToolContext) (*tool.ToolResult, error) {
 	var in webFetchInput
 	dec := json.NewDecoder(bytes.NewReader(input))
 	dec.DisallowUnknownFields()
@@ -206,7 +206,12 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 		}); ok {
 			out, ferr := structured.FetchRequestJSON(ctx, req)
 			if ferr != nil {
-				return &tool.ToolResult{Content: fmt.Sprintf("WebFetch error: %v", ferr), IsError: true}, nil
+				return &tool.ToolResult{Content: t.withUnseenHint(tctx, u, ferr), IsError: true}, nil
+			}
+			// 成功页里的链接 (feed 条目、正文内链) 也算"见过的 URL",
+			// 之后顺藤摸瓜抓取它们不会触发臆造提示。
+			if tctx != nil {
+				recordSeenURLsFromText(tctx.SessionID, out)
 			}
 			return untrustedFetchResult(u.String(), out), nil
 		}
@@ -287,6 +292,20 @@ func (t *WebFetchTool) Call(ctx context.Context, input json.RawMessage, _ *tool.
 	}
 
 	return untrustedFetchResult(u.String(), b.String()), nil
+}
+
+// withUnseenHint 在 404 且该 URL 从未在本会话的搜索结果/已抓取页面里出现过时,
+// 给错误附上"可能是臆造地址"的提示。软约束: 不改变错误性质, 不拒绝执行 ——
+// 确实存在合法的先见链接后抓取场景, 选择权留给模型。
+func (t *WebFetchTool) withUnseenHint(tctx *tool.ToolContext, u *url.URL, ferr error) string {
+	msg := fmt.Sprintf("WebFetch error: %v", ferr)
+	if search.KindOf(ferr) != search.ErrNotFound || tctx == nil {
+		return msg
+	}
+	if seenURL(tctx.SessionID, u.String()) {
+		return msg
+	}
+	return msg + "\n\n提示: 该 URL 未出现在本会话任何 WebSearch 结果或已抓取页面中, 很可能是凭记忆拼出的地址 (版本号/日期路径尤其容易猜错)。请改用搜索结果里的真实链接, 或先用 WebSearch 定位正确页面再抓取; 不要再次猜测相似地址。"
 }
 
 // untrustedFetchResult 给成功抓取的结果打上不可信标签与来源 URI (H-F2)。

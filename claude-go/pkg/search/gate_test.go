@@ -1,6 +1,8 @@
 package search
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -141,5 +143,126 @@ func TestQualityGateProfessionalDomains(t *testing.T) {
 	), req, now)
 	if blog.Pass(false) || blog.gateReason(false) != "domains" {
 		t.Errorf("非官方单域名不应通过: %+v reason=%s", blog, blog.gateReason(false))
+	}
+}
+
+// TestQualityGateUndatedResults 钉住时效门的"无日期≠过期"口径 (2026-11-26)。
+//
+// 事故背景: MCP 系 provider (parallel/exa) 常不返回 published, 旧口径把
+// 无日期一律计为不新鲜, freshness=week 的学术查询约 2/3 挂在 fresh 上,
+// 而结果本身有 10 条可用 —— 红灯全是口径误报, 淹没了真问题。
+//
+// 三个臂:
+//  1. 全部无日期 → 时效门不适用, 通过 (dated=0 < minDatedForFreshGate);
+//  2. 有日期样本不足 (2 条过期 + 其余无日期) → 样本太小不判, 通过;
+//  3. 有日期样本足够且确实过期 (3 条全旧) → 仍然必须挂 fresh。
+func TestQualityGateUndatedResults(t *testing.T) {
+	now := time.Now()
+	// 每条独立域名, 避免域名多样性门 (<3) 先于时效门触发。
+	mkDated := func(n int, age time.Duration) []Result {
+		out := make([]Result, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, Result{
+				URL: fmt.Sprintf("https://d%d.example.com/post", i), Snippet: "x", Lang: "en",
+				Published: now.Add(-age),
+			})
+		}
+		return out
+	}
+	mkUndated := func(n int) []Result {
+		out := make([]Result, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, Result{
+				URL: fmt.Sprintf("https://u%d.example.com/post", i), Snippet: "x", Lang: "en",
+			})
+		}
+		return out
+	}
+	req := SearchRequest{Language: "en", Freshness: "week"}
+
+	// 臂 1: 全部无日期。
+	allUndated := evaluateQualityAt(mkUndated(8), req, now)
+	if allUndated.DatedResults != 0 {
+		t.Fatalf("DatedResults = %d, want 0", allUndated.DatedResults)
+	}
+	if !allUndated.Pass(true) || allUndated.gateReason(true) != "pass" {
+		t.Errorf("全部无日期不应挂 fresh: %+v reason=%s", allUndated, allUndated.gateReason(true))
+	}
+
+	// 臂 2: 2 条过期 + 6 条无日期 —— 有日期样本 < 3, 门不判。
+	sparse := evaluateQualityAt(append(mkDated(2, 90*24*time.Hour), mkUndated(6)...), req, now)
+	if sparse.DatedResults != 2 {
+		t.Fatalf("DatedResults = %d, want 2", sparse.DatedResults)
+	}
+	if !sparse.Pass(true) || sparse.gateReason(true) != "pass" {
+		t.Errorf("有日期样本不足时不应挂 fresh: %+v reason=%s", sparse, sparse.gateReason(true))
+	}
+
+	// 臂 3: 3 条有日期且全过期 —— 真旧, 必须挂 fresh。
+	stale := evaluateQualityAt(append(mkDated(3, 90*24*time.Hour), mkUndated(5)...), req, now)
+	if stale.DatedResults != 3 {
+		t.Fatalf("DatedResults = %d, want 3", stale.DatedResults)
+	}
+	if stale.Pass(true) || stale.gateReason(true) != "fresh" {
+		t.Errorf("有日期样本足够且全过期必须挂 fresh: %+v reason=%s", stale, stale.gateReason(true))
+	}
+	// 同一批结果不要求时效时应通过。
+	if !stale.Pass(false) {
+		t.Errorf("不要求时效时过期结果应通过: %+v", stale)
+	}
+
+	// 臂 4: 分母口径 —— 4 条有日期 2 条新鲜, FreshRatio = 2/4 = 0.5 (不是 2/10)。
+	mixed := evaluateQualityAt(append(
+		append(mkDated(2, time.Hour), mkDated(2, 90*24*time.Hour)...), mkUndated(6)...), req, now)
+	if mixed.DatedResults != 4 || mixed.FreshRatio != 0.5 {
+		t.Errorf("FreshRatio 分母应只算有日期条数: dated=%d ratio=%v", mixed.DatedResults, mixed.FreshRatio)
+	}
+	if !mixed.Pass(true) {
+		t.Errorf("2/4 新鲜 (0.5 >= 0.3) 应通过: %+v", mixed)
+	}
+}
+
+// freshGateHint 是时效门失败时随响应返回的"下一步指令"。钉住三件事:
+//  1. 提示必须带上实况数字 (dated/fresh/最新一篇的天数), 否则模型无法判断;
+//  2. week 失败时建议放宽到 month, day 失败时放宽到 week (只升一档);
+//  3. 必须给"窗口内无新增也是结论"的退路, 避免模型无条件重搜烧配额。
+func TestFreshGateHint(t *testing.T) {
+	now := time.Now()
+	mk := func(n int, age time.Duration, prefix string) []Result {
+		out := make([]Result, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, Result{
+				URL: fmt.Sprintf("https://%s%d.example.com/post", prefix, i), Snippet: "x", Lang: "en",
+				Published: now.Add(-age),
+			})
+		}
+		return out
+	}
+	req := SearchRequest{Language: "en", Freshness: "week"}
+	// 9 条 12 天前 + 1 条 2 天前: dated=10, fresh=1 (0.1 < 0.3) → fresh 门挂。
+	results := append(mk(9, 12*24*time.Hour, "old"), mk(1, 2*24*time.Hour, "new")...)
+	q := evaluateQualityAt(results, req, now)
+	if q.gateReason(true) != "fresh" {
+		t.Fatalf("前置: 应挂 fresh, got %s (%+v)", q.gateReason(true), q)
+	}
+	if q.FreshResults != 1 || q.NewestPublished.IsZero() {
+		t.Fatalf("FreshResults/NewestPublished 未填充: %+v", q)
+	}
+	hint := freshGateHint(q, "week", now)
+	for _, want := range []string{"10 条有日期", "仅 1 条", "7 天", "freshness=month", "数据缺口"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("week 提示缺少 %q: %s", want, hint)
+		}
+	}
+
+	// day 失败只放宽一档到 week, 不跳到 month。
+	reqDay := SearchRequest{Language: "en", Freshness: "day"}
+	qd := evaluateQualityAt(append(mk(3, 48*time.Hour, "old"), mk(1, time.Hour, "new")...), reqDay, now)
+	if qd.gateReason(true) != "fresh" {
+		t.Fatalf("前置: day 应挂 fresh, got %s", qd.gateReason(true))
+	}
+	hintDay := freshGateHint(qd, "day", now)
+	if !strings.Contains(hintDay, "freshness=week") || strings.Contains(hintDay, "freshness=month") {
+		t.Errorf("day 提示应只放宽一档到 week: %s", hintDay)
 	}
 }

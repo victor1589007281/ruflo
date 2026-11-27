@@ -9,6 +9,7 @@ package search
 // 门禁失败不会让 Search 报错, 只把 passed/reason 放进响应, 由调用方决定
 // 是否降级或继续检索。
 import (
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -19,13 +20,16 @@ import (
 //
 // 指标只用于判断"够不够用", 不参与排序; 排序由 RRF 负责。
 type Quality struct {
-	Domains        int     // 独立域名数
-	DomainScoped   bool    // 调用方显式限定 allowed_domains，域名多样性门不适用
-	HasSnippet     bool    // 是否至少有一条片段
-	FreshRatio     float64 // 已发布时间落在时效窗口内的比例
-	LangMatch      float64 // 语言与请求匹配的比例
-	Consensus      float64 // 被两个以上 provider 同时命中的 URL 比例
-	DuplicateRatio float64 // 重复 canonical URL 的比例
+	Domains         int       // 独立域名数
+	DomainScoped    bool      // 调用方显式限定 allowed_domains，域名多样性门不适用
+	HasSnippet      bool      // 是否至少有一条片段
+	FreshRatio      float64   // 已发布时间落在时效窗口内的比例 (分母是有日期的条数)
+	DatedResults    int       // 带发布时间的结果条数; FreshRatio 的分母
+	FreshResults    int       // 有日期且落在时效窗口内的条数; freshGateHint 的分子
+	NewestPublished time.Time // 有日期结果中最新的一篇; 零值表示没有任何日期
+	LangMatch       float64   // 语言与请求匹配的比例
+	Consensus       float64   // 被两个以上 provider 同时命中的 URL 比例
+	DuplicateRatio  float64   // 重复 canonical URL 的比例
 	// AuthoritativeRatio 结果中来自官方/一手域名的比例。
 	//
 	// 只用于域名多样性那一条的例外: 官方文档/监管/统计站点本身就只有一两个
@@ -41,13 +45,26 @@ type Quality struct {
 //
 // 域名例外: 官方/一手来源占 >=80% 时, 单域名也视为达标。判据不是"域名少就放行"
 // —— 3 条来自同一个博客仍然失败 (见 IsAuthoritativeDomain)。
+//
+// 时效例外: 无日期的结果**无法证明过期**, 不等于不新鲜。FreshRatio 的分母只算
+// 有日期的条数; 有日期的结果不足 minDatedForFreshGate 条时, 时效门直接不适用
+// (判不了就不判)。此前无日期一律计为不新鲜, 而 MCP 系 provider (parallel/exa)
+// 经常不返回 published —— freshness=week 的学术查询 2026-11 月有 ~2/3 因此
+// 挂在 fresh 上, 结果本身却有 10 条可用, 红灯全是口径误报。
 func (q Quality) Pass(freshnessRequired bool) bool {
+	freshOK := !freshnessRequired ||
+		q.DatedResults < minDatedForFreshGate ||
+		q.FreshRatio >= 0.3
 	return (q.DomainScoped || q.Domains >= 3 || q.AuthoritativeRatio >= 0.8) &&
 		q.HasSnippet &&
 		q.LangMatch >= 0.6 &&
 		q.DuplicateRatio <= 0.5 &&
-		(q.FreshRatio >= 0.3 || !freshnessRequired)
+		freshOK
 }
+
+// minDatedForFreshGate 是时效门生效所需的最少有日期条数。低于它时样本太小,
+// "新鲜比例"没有统计意义, 门不判 (而不是判不过)。
+const minDatedForFreshGate = 3
 
 // EvaluateQuality 按请求计算质量指标。
 //
@@ -95,8 +112,14 @@ func evaluateQualityAt(results []Result, req SearchRequest, now time.Time) Quali
 		if strings.TrimSpace(r.Snippet) != "" {
 			q.HasSnippet = true
 		}
-		if !r.Published.IsZero() && !r.Published.Before(now.Add(-window)) {
-			fresh++
+		if !r.Published.IsZero() {
+			q.DatedResults++
+			if r.Published.After(q.NewestPublished) {
+				q.NewestPublished = r.Published
+			}
+			if !r.Published.Before(now.Add(-window)) {
+				fresh++
+			}
 		}
 		if languageMatches(r, req.Language) {
 			langMatch++
@@ -104,10 +127,14 @@ func evaluateQualityAt(results []Result, req SearchRequest, now time.Time) Quali
 	}
 
 	q.Domains = len(domains)
-	// 以下四个比例都以"原始结果条数"为分母; DuplicateRatio 等价于
-	// 1 - 唯一 canonical URL 数/总条数, 因此 0.5 表示一半是重复。
+	q.FreshResults = fresh
+	// AuthoritativeRatio/LangMatch/DuplicateRatio 以"原始结果条数"为分母;
+	// DuplicateRatio 等价于 1 - 唯一 canonical URL 数/总条数, 0.5 表示一半是重复。
+	// FreshRatio 例外: 分母只算有日期的条数 —— 无日期是"无法判断", 不是"过期"。
 	q.AuthoritativeRatio = float64(authoritative) / float64(len(results))
-	q.FreshRatio = float64(fresh) / float64(len(results))
+	if q.DatedResults > 0 {
+		q.FreshRatio = float64(fresh) / float64(q.DatedResults)
+	}
 	q.LangMatch = float64(langMatch) / float64(len(results))
 	q.DuplicateRatio = float64(len(results)-len(canonicalCount)) / float64(len(results))
 
@@ -378,6 +405,9 @@ func detectLanguage(s string) string {
 }
 
 // gateReason 返回质量门失败原因, 通过时返回 "pass"。
+//
+// "fresh" 只在有日期样本足够 (>= minDatedForFreshGate) 且其中新鲜比例不足时
+// 给出 —— 它现在的语义是"可验证的结果确实过期", 不再是"无法验证新鲜"。
 func (q Quality) gateReason(freshness bool) string {
 	switch {
 	case !q.DomainScoped && q.Domains < 3 && q.AuthoritativeRatio < 0.8:
@@ -388,9 +418,33 @@ func (q Quality) gateReason(freshness bool) string {
 		return "lang"
 	case q.DuplicateRatio > 0.5:
 		return "duplicate"
-	case freshness && q.FreshRatio < 0.3:
+	case freshness && q.DatedResults >= minDatedForFreshGate && q.FreshRatio < 0.3:
 		return "fresh"
 	default:
 		return "pass"
 	}
+}
+
+// freshGateHint 在时效门失败时生成给模型的下一步指令, 随响应的 gate_hint 字段
+// 返回。
+//
+// 为什么放在响应里而不是工具描述: "fresh → 放宽一档重试" 的静态规则写进
+// WebSearch description 与 agent 定义后, 2026-11-26 两轮实测跟进次数为 0 ——
+// 静态文案没人看, 但错误发生当下的提示模型几乎必执行 (与 WebFetch 404 臆造
+// 提示同一模式)。提示给两个互斥动作, 让模型按查询意图二选一, 而不是无条件
+// 重试浪费配额。
+func freshGateHint(q Quality, freshness string, now time.Time) string {
+	f := strings.ToLower(strings.TrimSpace(freshness))
+	windowLabel := "7 天"
+	widenTo := "month"
+	if f == "day" {
+		windowLabel = "24 小时"
+		widenTo = "week"
+	}
+	ageDays := 0
+	if !q.NewestPublished.IsZero() {
+		ageDays = int(now.Sub(q.NewestPublished).Hours() / 24)
+	}
+	return fmt.Sprintf("时效门未过: %d 条有日期结果中仅 %d 条发布于最近 %s 内 (最新一篇约 %d 天前), 未达 30%% 新鲜线。下一步二选一: ① 若查的是论文/版本发布等低频材料, 用相同 query、freshness=%s 重新调用 WebSearch 一次; ② 若确实只要最近 %s 的动态, 「窗口内无新增」本身就是有效结论, 写入数据缺口即可, 不要原样重搜。",
+		q.DatedResults, q.FreshResults, windowLabel, ageDays, widenTo, windowLabel)
 }
