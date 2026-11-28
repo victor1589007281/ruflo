@@ -107,7 +107,9 @@ func (dw *DirWatcher) startOnce0() error {
 			continue
 		}
 		for _, sub := range subs {
-			if !sub.IsDir() {
+			// 软链技能目录与 LoadFromDirs 同一口径: 否则启动时装载了它,
+			// 却收不到它内部 SKILL.md 的变更事件 (热刷新对它静默失效)。
+			if !sub.IsDir() && !isDirSymlink(d.Path, sub) {
 				continue
 			}
 			p := filepath.Join(d.Path, sub.Name())

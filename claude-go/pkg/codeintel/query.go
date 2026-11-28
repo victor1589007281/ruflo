@@ -40,7 +40,7 @@ func requireQueryTarget(queryType, field, value string) error {
 // 不需要目标的类型（communities / god_nodes / surprises）直通。
 func ValidateQueryTarget(queryType, symbol, filePath, targetSymbol string) error {
 	switch queryType {
-	case "navigate", "find_refs", "cross_shard", "query", "explain":
+	case "navigate", "find_refs", "cross_shard", "query", "explain", "semantic":
 		return requireQueryTarget(queryType, "symbol", symbol)
 	case "impact":
 		return requireQueryTarget(queryType, "file_path", filePath)
@@ -55,6 +55,7 @@ func ValidateQueryTarget(queryType, symbol, filePath, targetSymbol string) error
 
 // Engine 查询路由器。
 type Engine struct {
+	repoPath       string
 	GitNexus       *GitNexus
 	Graphify       *Graphify
 	GraphifyNoLLM  *GraphifyNoLLM
@@ -72,6 +73,7 @@ type Engine struct {
 // NewEngine 创建查询路由器。
 func NewEngine(repoPath string) *Engine {
 	return &Engine{
+		repoPath:      repoPath,
 		GitNexus:      NewGitNexus(repoPath),
 		Graphify:      NewGraphify(repoPath),
 		GraphifyNoLLM: NewGraphifyNoLLM(repoPath),

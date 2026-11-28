@@ -259,7 +259,7 @@ func (t *CodeIntelQueryTool) InputSchema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"repo_path": {"type": "string", "description": "Absolute path to the indexed repository."},
-			"query_type": {"type": "string", "enum": ["navigate", "impact", "find_refs", "communities", "god_nodes", "path", "surprises", "cross_shard", "query", "explain"], "description": "Query type."},
+			"query_type": {"type": "string", "enum": ["navigate", "impact", "find_refs", "communities", "god_nodes", "path", "surprises", "cross_shard", "query", "explain", "semantic"], "description": "Query type. semantic: natural-language symbol search; symbol carries the query text; hits are candidates, not evidence."},
 			"shard": {"type": "string"},
 			"symbol": {"type": "string"},
 			"file_path": {"type": "string"},
@@ -365,6 +365,9 @@ func (t *CodeIntelQueryTool) Call(ctx context.Context, input json.RawMessage, _ 
 	case "explain":
 		gf := codeintel.NewGraphify(in.RepoPath)
 		qr, err = gf.Explain(in.Symbol)
+	case "semantic":
+		// symbol 字段承载自然语言查询；候选非证据，命中须回图查询/源码核实。
+		qr, err = engine.SemanticSearch(in.Symbol, in.TopN)
 	default:
 		return &tool.ToolResult{Content: fmt.Sprintf("unknown query_type: %s", in.QueryType), IsError: true}, nil
 	}

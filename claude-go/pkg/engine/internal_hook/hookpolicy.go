@@ -126,6 +126,9 @@ func hookResultSummary(r *HookResult) string {
 	switch {
 	case r.ReturnTerminal != nil:
 		return "return_terminal"
+	case len(r.EvictedTools) > 0:
+		// 驱逐比"注入了消息"更强：它改的是工具集本身，消费方要能单独看见。
+		return "tools_evicted"
 	case r.SkipRemaining:
 		return "skip_remaining"
 	case r.Messages != nil || len(r.AppendMsgs) > 0:

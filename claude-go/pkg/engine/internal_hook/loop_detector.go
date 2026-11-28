@@ -39,8 +39,22 @@ type LoopDetector struct {
 	Window    int // 滑动窗口长度 (默认 8)
 	Threshold int // 连续相同签名次数阈值 (默认 3)
 
+	// EvictAfter 是"工具驱逐"的阈值: 同一工具累计触发 looped 达到这个次数,
+	// 就把该工具从**模型可见的工具集**里摘掉 (IterationGuard 在线干预)。
+	// 0 = 不驱逐 (只保留原先的"拦这次调用 + 给建议"行为)。
+	//
+	// 为什么在"拦调用"之外还要驱逐: 拦一次只是让模型看见一条 error 结果, 它完全
+	// 可以换个参数继续磨同一个工具 —— 观测上就是 token 照烧、进展为零。把工具从
+	// 绑定集里拿掉是唯一能**强制换路**的手段 (设计文档 §3.9 优化杠杆)。
+	EvictAfter int
+
 	// 输入级循环检测
 	history []callSignature
+
+	// 每工具累计触发次数 → 驱逐判据
+	triggers map[string]int
+	// evicted 已被驱逐的工具名 (本引擎生命周期内不再回到可见集)
+	evicted map[string]bool
 
 	// 产出级检测配置
 	Cwd string // 工作目录, 用于解析相对路径
@@ -79,8 +93,11 @@ func NewLoopDetector() *LoopDetector {
 	return &LoopDetector{
 		Window:            8,
 		Threshold:         3,
+		EvictAfter:        2,
 		fileEdits:         make(map[string][]fileEditRecord),
 		errorFingerprints: make(map[string]int),
+		triggers:          make(map[string]int),
+		evicted:           make(map[string]bool),
 	}
 }
 
@@ -137,7 +154,65 @@ func (d *LoopDetector) Observe(tool string, input []byte) (looped bool, suggesti
 		threshold, first.Tool,
 	)
 	d.triggerCount++
+
+	// IterationGuard: 同一工具累计触发到 EvictAfter 次 → 从可见工具集摘掉。
+	// 计数按工具而不是按签名: 换了参数继续磨同一个工具同样是"没换路",
+	// 而拦调用只挡得住**完全相同**的那一个签名。
+	if d.triggers == nil {
+		d.triggers = make(map[string]int)
+	}
+	d.triggers[first.Tool]++
+	if d.evicted == nil {
+		d.evicted = make(map[string]bool)
+	}
+	if d.EvictAfter > 0 && !d.evicted[first.Tool] && d.triggers[first.Tool] >= d.EvictAfter {
+		d.evicted[first.Tool] = true
+	}
+	// 已驱逐的工具**每次**都带这段说明（不是只在驱逐那一刻）：滑窗里一旦攒够
+	// 同签名，之后每次调用都会命中循环 —— 少了这段，模型看到的就只是"这次被
+	// 拒了"，会继续重试。
+	if d.evicted[first.Tool] {
+		suggestion += fmt.Sprintf(
+			"\n\n`%s` 已连续 %d 次陷入循环, **已从你的可用工具集中临时移除**, 本次运行内不会再出现。"+
+				"请改用其他工具或路径完成任务; 若确实无路可走, 直接说明卡点。",
+			first.Tool, d.triggers[first.Tool],
+		)
+	}
 	return true, suggestion
+}
+
+// IsEvicted 报告某工具是否已被驱逐 (从模型可见工具集移除)。
+func (d *LoopDetector) IsEvicted(tool string) bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.evicted[tool]
+}
+
+// EvictedTools 返回已驱逐的工具名 (无序快照, 调用方自行排序)。
+func (d *LoopDetector) EvictedTools() []string {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]string, 0, len(d.evicted))
+	for name := range d.evicted {
+		out = append(out, name)
+	}
+	return out
+}
+
+// TriggerCountFor 返回某工具的累计触发次数 (驱动驱逐的计数器)。
+func (d *LoopDetector) TriggerCountFor(tool string) int {
+	if d == nil {
+		return 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.triggers[tool]
 }
 
 // TriggerCount 返回累计触发次数 (输入级 + 产出级)。

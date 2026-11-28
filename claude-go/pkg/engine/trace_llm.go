@@ -60,9 +60,17 @@ type llmCallSpan struct {
 	Handoff bool
 }
 
-// writeLLMCallSpan 写一条 llm_call Span。TraceStore 未装配时是零成本 no-op。
+// writeLLMCallSpan 写一条 llm_call Span。TraceStore 未装配时是零成本 no-op
+// (但 run 级用量聚合照记 —— 见下)。
 func (e *QueryEngine) writeLLMCallSpan(ctx context.Context, in llmCallSpan) {
-	if e == nil || e.TraceStore == nil {
+	if e == nil {
+		return
+	}
+	// run 级用量聚合 (P1, ndjson result 的 usage 段) 必须在 TraceStore 守卫**之前**:
+	// 没有轨迹底座的 run 同样要出 usage 段 —— 评测的宿主二进制恰恰可能不开
+	// TraceStore, 把聚合放在守卫之后就等于"越需要它的环境越没有它"。
+	e.noteRunUsage(in.Usage)
+	if e.TraceStore == nil {
 		return
 	}
 	ids := trace.From(ctx)

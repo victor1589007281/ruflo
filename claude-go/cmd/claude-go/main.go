@@ -200,6 +200,7 @@ var (
 	flagOutputFormat     string // --output-format text|json
 	flagEventFormat      string // --event-format text|ndjson (ndjson: stdout 只出 NDJSON 运行事件行, 见 run_events.go)
 	flagRunID            string // --run-id <id> 调用方传入的 run 身份 (缺省内部发号 run-<sid>-<n>)
+	flagNoInject         bool   // --no-inject 禁记忆/召回注入 (评测对照组, P1; 见 engine.Config.DisableMemoryInject)
 	// agentDB 语义增强面 (规划 14.1.4.3): --agentdb-url <serve 地址> 装配
 	// AgentDBSemanticInjectHook, 使真实引擎经 serve /v1/memory|retrieve|files
 	// 跨源检索并注入 system prompt。nil = 不装配 (默认)。
@@ -342,6 +343,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagOutputFormat, "output-format", "text", "输出格式: text (默认) | json (final/is_error/error_kind/session_id 顶层 envelope, 供程序化调用; token 用量见 metrics JSONL)")
 	rootCmd.PersistentFlags().StringVar(&flagEventFormat, "event-format", "text", "运行事件输出格式: text (默认, 原行为) | ndjson (stdout 只出一行一个 JSON 的运行事件 started/session/heartbeat/progress/result, 启动横幅与普通日志改走 stderr; result 事件取代 --output-format json 的 envelope)")
 	rootCmd.PersistentFlags().StringVar(&flagRunID, "run-id", "", "本次 run 的身份 ID, 原样写进每条 NDJSON 事件的 run_id 字段 (缺省内部生成 run-<sid>-<n>, 无会话 store 时 run-anon-<unixnano>)")
+	rootCmd.PersistentFlags().BoolVar(&flagNoInject, "no-inject", false, "禁记忆/召回注入 (MemoryInject + agentDB 语义注入 + 经验卡注入全关) —— 评测对照组用: 上下文组装 A/B 的对照组必须真的没有注入, 靠'记忆库恰好为空'是假对照")
 	rootCmd.PersistentFlags().StringVar(&flagAgentDBURL, "agentdb-url", "", "agentDB serve 地址 (如 http://127.0.0.1:8787); 设置后装配层2语义增强注入 (AgentDBSemanticInjectHook)")
 	rootCmd.PersistentFlags().IntVar(&flagAgentDBTopK, "agentdb-topk", 5, "agentDB 每源检索条数")
 	rootCmd.PersistentFlags().IntVar(&flagAgentDBBudget, "agentdb-budget", 600, "agentDB 注入上下文 token 预算")
@@ -1104,9 +1106,35 @@ func runCmd() *cobra.Command {
 
 				cmdName, cmdArgs := commands.ParseSlashCommand(userPrompt)
 				if c := cmdRegistry.Find(cmdName); c != nil {
-					return c.Execute(cmdArgs, cmdCtx)
+					// json 模式必须在这条提前 return 的分支上自己发信封: 正常路径的
+					// 信封发射点 (下方 emitRunEnvelope) 在 slash 分发之后, 走不到 ——
+					// 此前 --output-format json 的调用方在 /go 等工作流命令上永远
+					// 拿不到信封 (webapp 评测的 workflow 用例即报 no_envelope)。
+					// 命令的"最终答复"经 FinalSink 汇出; 没装汇的命令 (如 /help)
+					// final 为空串, 信封如实携带, 不伪造内容。
+					slashJSON := flagOutputFormat == "json"
+					var slashFinal string
+					if slashJSON {
+						cmdCtx.FinalSink = func(s string) { slashFinal = s }
+					}
+					err := c.Execute(cmdArgs, cmdCtx)
+					if slashJSON {
+						errKind := ""
+						if err != nil {
+							errKind = "command_error"
+						}
+						if eerr := emitRunEnvelope(slashFinal, "", errKind, nil, nil); eerr != nil {
+							return eerr
+						}
+					}
+					return err
 				}
 				runInfof("未知命令: %s\n", cmdName)
+				if flagOutputFormat == "json" {
+					// 未知命令也要给信封: 静默空 stdout 会让调用方把"命令名打错"
+					// 误读成"运行没产出"。
+					return emitRunEnvelope("", "", "unknown_command", nil, nil)
+				}
 				return nil
 			}
 
@@ -1214,6 +1242,10 @@ func runCmd() *cobra.Command {
 					ev.emit("session", map[string]any{"session_id": sessionID})
 				}
 				ev.startHeartbeat()
+				// P1 hook 可见性: 内置 hook 链的执行 trace 桥接成 progress(phase:"hook")
+				// 事件。观测者是 per-request 的 (挂 ctx, 不挂引擎 —— 挂引擎会让并发
+				// run 串台, 见 engine/hooktrace.go 文件头)。
+				ctx = engine.WithHookTraceObserver(ctx, newHookTraceBridge(ev))
 				defer func() {
 					ev.stopHeartbeat()
 					if ev.resultWasSent() {
@@ -1223,7 +1255,7 @@ func runCmd() *cobra.Command {
 					if retErr != nil && kind == "" {
 						kind = "run_error"
 					}
-					ev.emitResult(runResultEventData(final, sessionID, kind))
+					ev.emitResult(attachRunUsage(runResultEventData(final, sessionID, kind), eng))
 				}()
 			}
 
@@ -1324,8 +1356,10 @@ func runCmd() *cobra.Command {
 			if ndjsonMode {
 				// 先停心跳再发 result —— result 必须是最后一个事件。
 				// final/errKind 与上方 envelope 完全同源 (同一变量、同一 sanitize)。
+				// usage 段 (P1) 取**最后一次 attempt** 的引擎 —— best-of-N 重建引擎
+				// 后旧引擎的账随旧会话作废, 与 final 的口径一致。
 				ev.stopHeartbeat()
-				ev.emitResult(runResultEventData(final, sessionID, errKind))
+				ev.emitResult(attachRunUsage(runResultEventData(final, sessionID, errKind), eng))
 				// 契约: ndjson 模式下退出码与 is_error 一致 (is_error=true ⇒ 非零退出)。
 				if errKind != "" {
 					return fmt.Errorf("run error: %s", errKind)
@@ -1437,7 +1471,9 @@ func recordRunSpan(ts *tracestore.Store, runID, name, agent, model, status, errT
 // wmlInjectExperience L7 注入半环: 弱模型模式下按任务文本检索经验卡注入 system prompt。
 // 检索是确定性关键词重合 (learners.RetrieveExperience), 不多花一次模型调用。
 func wmlInjectExperience(eng *engine.QueryEngine, userPrompt string) {
-	if eng == nil || !eng.Config.WeakModel.Enabled {
+	// DisableMemoryInject (--no-inject): 经验卡注入也是召回注入的一种 —— 对照组
+	// 要禁就禁全套, 留一半的对照组比没有对照组更糟 (差异归因会算错对象)。
+	if eng == nil || eng.Config.DisableMemoryInject || !eng.Config.WeakModel.Enabled {
 		return
 	}
 	jsonCfgL, _, _ := loadRuntimeJSONConfig()
@@ -4575,6 +4611,11 @@ func buildEngine() (*engine.QueryEngine, error) {
 		log.Printf("[Skills] 热刷新未启用 (%v), 手动 /skill reload 仍可用", err)
 	}
 
+	// --no-inject (P1 评测对照组): 必须在 RefreshHooks **之前**落进 Config ——
+	// registerInternalHooks 按当时的 Config 决定注不注册 MemoryInject /
+	// AgentDBSemanticInject, 之后改字段不会补票 (与下面前沿组件同一时序纪律)。
+	eng.Config.DisableMemoryInject = flagNoInject
+
 	// 组件是在 NewQueryEngine **之后**赋的, 必须重建一次 HookChain。
 	// 带 nil 守卫的 hook (MemoryInject 要 MemoryStore/FactStore、TraceCapture 要
 	// TraceStore) 在构造时这些字段还是 nil, 不补这一次就静默缺席——而下游平台
@@ -5153,6 +5194,9 @@ func runAsAgent(cmd *cobra.Command, eng *engine.QueryEngine, userPrompt string, 
 			ev.emit("session", map[string]any{"session_id": sessionID})
 		}
 		ev.startHeartbeat()
+		// P1 hook 可见性: 与默认路径同一个桥 (agent 路径的 RunIsolated 同样过
+		// 内置 hook 链, trace 观测者挂 ctx 即到)。
+		ctx = engine.WithHookTraceObserver(ctx, newHookTraceBridge(ev))
 		defer ev.stopHeartbeat()
 	}
 
@@ -5210,7 +5254,7 @@ func runAsAgent(cmd *cobra.Command, eng *engine.QueryEngine, userPrompt string, 
 	if ndjsonMode {
 		// 先停心跳再发 result —— result 必须是最后一个事件。
 		ev.stopHeartbeat()
-		ev.emitResult(runResultEventData(final, sessionID, errKind))
+		ev.emitResult(attachRunUsage(runResultEventData(final, sessionID, errKind), eng))
 		// 契约: ndjson 模式下退出码与 is_error 一致 —— runErr 非零本来就走
 		// 非零退出, 原样返回即可 (errKind 只在 runErr 非空时置位, 二者同源)。
 		if runErr != nil {
@@ -5682,17 +5726,37 @@ func printStreamEvents(ch <-chan types.StreamEvent) {
 // 文本与错误分类, 供 --output-format json 的 envelope 使用。
 //
 // hook 是可选的运行事件挂钩 (nil 安全; 传 nil 时行为与改造前逐字节一致):
-// StreamEventToolStart/ToolDone 时以 hook("progress", {...}) 上报工具进度,
-// 供 --event-format ndjson 的 progress 事件消费。hook 在流式消费循环内同步调用,
-// 实现必须轻量 (emitter.emit 持锁写一行, 不阻塞消费)。
+//   - StreamEventToolStart/ToolDone 时以 hook("progress", {...}) 上报工具进度
+//     (P1 起 data 带 tool/tool_use_id/args_hash/result_bytes, 全部无原文);
+//   - thinking 块完成时上报 phase:"thinking" 摘要 (≤200 字符, 纪律同工具摘要;
+//     quiet 模式下 thinking 本来整条丢弃, 只有 hook 非 nil 才累积摘要);
+//   供 --event-format ndjson 的 progress 事件消费。hook 在流式消费循环内同步调用,
+//   实现必须轻量 (emitter.emit 持锁写一行, 不阻塞消费)。
 func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool, hook func(kind string, data map[string]any)) (finalText, errKind string) {
 	inThinking := false
 	hasOutput := false
 	var final strings.Builder
+	// thinkingSummary 累积当前 thinking 块的摘要素材 (P1)。只在 hook 非 nil 时
+	// 累积, 且封顶 256 字节 —— 摘要只要前 200 字符, 长思考的剩余部分没有意义,
+	// 不封顶等于把整段思考留在内存里。
+	var thinkingSummary strings.Builder
+	flushThinking := func() {
+		if hook == nil || thinkingSummary.Len() == 0 {
+			return
+		}
+		hook("progress", map[string]any{
+			"phase": "thinking",
+			"text":  runProgressText("", thinkingSummary.String()),
+		})
+		thinkingSummary.Reset()
+	}
 	for ev := range ch {
 		switch ev.Kind {
 		case types.StreamEventDelta:
 			if ev.IsThinking {
+				if hook != nil && thinkingSummary.Len() < 256 {
+					thinkingSummary.WriteString(ev.DeltaText)
+				}
 				if flagFinalOnly || quiet {
 					continue // --final-only / json: thinking 过程不输出
 				}
@@ -5715,26 +5779,52 @@ func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool, hook func(kind
 			}
 			hasOutput = true
 		case types.StreamEventBlockDone:
+			// thinking 块完成 → 发摘要事件 (P1)。BlockDone 对每个块都发, 用
+			// "有没有累积到 thinking" 当闸门 —— 文本块的 BlockDone 到来时
+			// thinkingSummary 是空的, 自然不发。
+			flushThinking()
 			if inThinking && !quiet {
 				fmt.Print("\033[0m")
 				inThinking = false
 			}
 		case types.StreamEventToolStart:
 			if hook != nil {
-				hook("progress", map[string]any{
+				data := map[string]any{
 					"phase": "tool",
 					"text":  runProgressText(ev.ToolName, ev.ToolInput),
-				})
+				}
+				// P1 扩展字段: 名字/协议 ID 单列 (消费方不再从 text 首词猜名字),
+				// args_hash 是"两次调用是否同一个"的等值判据 (无原文)。
+				if ev.ToolName != "" {
+					data["tool"] = ev.ToolName
+				}
+				if ev.ToolUseID != "" {
+					data["tool_use_id"] = ev.ToolUseID
+				}
+				if ev.ToolArgsHash != "" {
+					data["args_hash"] = ev.ToolArgsHash
+				}
+				hook("progress", data)
 			}
 			if flagDebug && !quiet {
 				fmt.Printf("\n[调用工具: %s]\n", ev.ToolName)
 			}
 		case types.StreamEventToolDone:
 			if hook != nil {
-				hook("progress", map[string]any{
+				data := map[string]any{
 					"phase": "tool",
 					"text":  runProgressText(ev.ToolName, ev.ToolResult),
-				})
+				}
+				if ev.ToolName != "" {
+					data["tool"] = ev.ToolName
+				}
+				if ev.ToolUseID != "" {
+					data["tool_use_id"] = ev.ToolUseID
+				}
+				// result_bytes 恒发 (0 也是真实读数: 空结果就是 0 字节) ——
+				// 它与 args_hash 配对区分卡死 (同参同果) 与轮询 (同参果在变)。
+				data["result_bytes"] = ev.ToolResultBytes
+				hook("progress", data)
 			}
 			if flagDebug && !quiet {
 				result := ev.ToolResult
@@ -5754,6 +5844,9 @@ func consumeStreamEvents(ch <-chan types.StreamEvent, quiet bool, hook func(kind
 			}
 		}
 	}
+	// 流断在 thinking 块中间 (错误/截断) 时 BlockDone 不会来 —— 收尾补发,
+	// 摘要丢了比晚到更糟 (混乱思考分析要的正是异常 run 的思考)。
+	flushThinking()
 	if hasOutput && !quiet {
 		fmt.Println()
 	}
@@ -6001,9 +6094,34 @@ type engineDeps struct {
 	traceStore *tracestore.Store
 }
 
+// mcpConnectTimeout 是单个 MCP server 的握手预算 (initialize → initialized → tools/list)。
+//
+// 为什么必须有: connectMCP 的调用方传的是 context.Background(), 而 connectStdio 全程
+// 继承这个 ctx 起子进程 —— 一个**哑掉的** server (npx 拉包卡住、stdio 前半死不回
+// initialize) 会把 buildEngine 永久挂住, 卡在事件发射器创建之前, 于是整个 run 一条
+// 输出都没有, 看起来像"claude-go 死了"。MCP 是可选依赖, 可选依赖坏掉必须降级,
+// 不能连坐主流程 (同"首字节超时"与看门狗的纪律)。
+//
+// 默认 20s 是 npx 冷启动 + 拉包的量级; 用 CLAUDE_GO_MCP_CONNECT_TIMEOUT 覆盖
+// (Go duration 语法), 设成 0 或负数 = 关掉超时 (退回旧行为, 调试握手用)。
+const defaultMCPConnectTimeout = 20 * time.Second
+
+func mcpConnectTimeout() time.Duration {
+	v := os.Getenv("CLAUDE_GO_MCP_CONNECT_TIMEOUT")
+	if v == "" {
+		return defaultMCPConnectTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "CLAUDE_GO_MCP_CONNECT_TIMEOUT=%q 解析失败, 用默认 %s\n", v, defaultMCPConnectTimeout)
+		return defaultMCPConnectTimeout
+	}
+	return d
+}
+
 // connectMCP 按 MCP 配置文件的 mcpServers 段逐个建立连接, 返回成功的连接列表。
 //
-// 单个 server 连接失败只告警并跳过, 不让整次启动失败; path 为空直接返回 (nil, nil) ——
+// 单个 server 连接失败/超时只告警并跳过, 不让整次启动失败; path 为空直接返回 (nil, nil) ——
 // "没配 MCP"是常态而非错误。
 func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
 	if path == "" {
@@ -6013,6 +6131,7 @@ func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
 	if err != nil {
 		return nil, err
 	}
+	budget := mcpConnectTimeout()
 	mcpClient := mcp.NewClient()
 	var out []*mcp.Connection
 	for _, cfg := range cfgs {
@@ -6020,7 +6139,7 @@ func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
 			fmt.Fprintf(os.Stderr, "skip MCP server %q: empty command\n", cfg.Name)
 			continue
 		}
-		conn, err := mcpClient.Connect(ctx, cfg)
+		conn, err := connectMCPOne(ctx, mcpClient, cfg, budget)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "MCP %q: %v\n", cfg.Name, err)
 			continue
@@ -6028,6 +6147,25 @@ func connectMCP(ctx context.Context, path string) ([]*mcp.Connection, error) {
 		out = append(out, conn)
 	}
 	return out, nil
+}
+
+// connectMCPOne 给单个 server 的握手套上独立预算。budget<=0 = 不限时。
+func connectMCPOne(ctx context.Context, c *mcp.Client, cfg mcp.ServerConfig, budget time.Duration) (*mcp.Connection, error) {
+	if budget <= 0 {
+		return c.Connect(ctx, cfg)
+	}
+	cctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	conn, err := c.Connect(cctx, cfg)
+	if err != nil {
+		// 超时是最常见也最难自诊的一类: 文案里点明"握手超时"与怎么放宽,
+		// 否则用户只看到一句 stdio 连接失败。
+		if cctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("握手超时 %s (initialize 无应答); 该 server 已跳过, 不影响本次运行。放宽: CLAUDE_GO_MCP_CONNECT_TIMEOUT=60s", budget)
+		}
+		return nil, err
+	}
+	return conn, nil
 }
 
 // ==================== P5: subagent_type 的资产查表 (21.8.12) ====================

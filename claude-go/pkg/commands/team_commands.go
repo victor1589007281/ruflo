@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/agent"
 	"github.com/anthropic/claude-go/pkg/swarm_intel"
 )
 
@@ -268,7 +269,10 @@ func RegisterTeamCommands(r *Registry) {
 			team, err := ctx.TeamMgr.CreateTeamWithUniquePrefix("go-"+workflow, workflow, objective, "cli")
 			if err != nil {
 				fmt.Printf("[创建失败: %v]\n", err)
-				return nil
+				// 人读打印之外再返回 error: 交互 REPL 忽略返回值 (行为不变),
+				// CLI run 路径拿它定退出码与信封 is_error —— 此前这里 return nil,
+				// 创建失败与跑成功在程序化调用方眼里长得一模一样。
+				return fmt.Errorf("创建团队失败: %w", err)
 			}
 			teamName := team.Name
 			if lang != "" {
@@ -292,11 +296,25 @@ func RegisterTeamCommands(r *Registry) {
 
 			if err := ctx.TeamMgr.RunTeam(teamName, objective); err != nil {
 				fmt.Printf("[启动失败: %v]\n", err)
-				return nil
+				return fmt.Errorf("启动团队失败: %w", err)
 			}
 			if ctx.WaitSync {
 				team.WaitDone()
 				fmt.Printf("\n✅ 团队 %s 执行完毕 (状态: %s)\n", team.Name, team.Status)
+				// 程序化输出契约: 团队报告就是工作流的"最终答复", 交给 FinalSink
+				// 由 run 主流程发信封。报告缺失时给一句诚实的状态说明, 不假装有产出。
+				if ctx.FinalSink != nil {
+					content, _ := ctx.TeamMgr.GetTeamReport(team.Name)
+					if content == "" {
+						content = fmt.Sprintf("团队 %s 执行完毕 (状态: %s)，REPORT.md 缺失", team.Name, team.Status)
+					}
+					ctx.FinalSink(content)
+				}
+				// 失败/被停的团队必须让退出码与信封 is_error 说话, 不能只靠
+				// 人读那行 ✅ (它的措辞此前不看状态)。
+				if team.Status == agent.TeamStatusFailed || team.Status == agent.TeamStatusStopped {
+					return fmt.Errorf("团队 %s 未成功: %s", team.Name, team.Status)
+				}
 			}
 			return nil
 		},

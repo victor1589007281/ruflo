@@ -10,12 +10,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/anthropic/claude-go/pkg/engine"
 	"github.com/anthropic/claude-go/pkg/types"
 )
 
@@ -278,5 +280,167 @@ func TestRunEventsConsumeStreamNilHookSafe(t *testing.T) {
 	final, errKind := consumeStreamEvents(ch, true, nil)
 	if final != "x" || errKind != "" {
 		t.Fatalf("final/errKind = %q/%q, 想要 x/空", final, errKind)
+	}
+}
+
+// TestRunEventsConsumeStreamP1Fields: P1 扩展字段 —— tool/tool_use_id/args_hash
+// 进 ToolStart 的 data, tool/tool_use_id/result_bytes 进 ToolDone 的 data。
+// 这些是循环检测区分"卡死"与"轮询"的全部素材, 缺一个下游就退化回猜。
+func TestRunEventsConsumeStreamP1Fields(t *testing.T) {
+	ch := make(chan types.StreamEvent, 2)
+	ch <- types.StreamEvent{
+		Kind: types.StreamEventToolStart, ToolName: "Bash", ToolUseID: "tu_1",
+		ToolInput: "ls", ToolArgsHash: "abcd1234",
+	}
+	ch <- types.StreamEvent{
+		Kind: types.StreamEventToolDone, ToolName: "Bash", ToolUseID: "tu_1",
+		ToolResult: "ok", ToolResultBytes: 12345,
+	}
+	close(ch)
+
+	var datas []map[string]any
+	consumeStreamEvents(ch, true, func(kind string, data map[string]any) {
+		datas = append(datas, data)
+	})
+	if len(datas) != 2 {
+		t.Fatalf("事件数 = %d, 想要 2", len(datas))
+	}
+	start, done := datas[0], datas[1]
+	if start["tool"] != "Bash" || start["tool_use_id"] != "tu_1" || start["args_hash"] != "abcd1234" {
+		t.Fatalf("ToolStart data 缺 P1 字段: %v", start)
+	}
+	if _, has := start["result_bytes"]; has {
+		t.Fatalf("ToolStart 不该带 result_bytes: %v", start)
+	}
+	if done["tool"] != "Bash" || done["tool_use_id"] != "tu_1" {
+		t.Fatalf("ToolDone data 缺配对字段: %v", done)
+	}
+	if rb, ok := done["result_bytes"].(int); !ok || rb != 12345 {
+		t.Fatalf("result_bytes = %v, 想要 12345", done["result_bytes"])
+	}
+	if _, has := done["args_hash"]; has {
+		t.Fatalf("ToolDone 不该带 args_hash: %v", done)
+	}
+}
+
+// TestRunEventsConsumeStreamThinking: thinking 块完成 → phase:"thinking" 摘要事件,
+// ≤200 字符纪律; 流断在 thinking 中间 (无 BlockDone) 时收尾补发。
+func TestRunEventsConsumeStreamThinking(t *testing.T) {
+	ch := make(chan types.StreamEvent, 8)
+	ch <- types.StreamEvent{Kind: types.StreamEventDelta, IsThinking: true, DeltaText: strings.Repeat("想", 300)}
+	ch <- types.StreamEvent{Kind: types.StreamEventBlockDone}
+	ch <- types.StreamEvent{Kind: types.StreamEventDelta, DeltaText: "正文"}
+	ch <- types.StreamEvent{Kind: types.StreamEventBlockDone} // 文本块: 不该再发 thinking
+	close(ch)
+
+	var datas []map[string]any
+	final, _ := consumeStreamEvents(ch, true, func(kind string, data map[string]any) {
+		datas = append(datas, data)
+	})
+	if final != "正文" {
+		t.Fatalf("final = %q, 想要 正文 (thinking 不进 final)", final)
+	}
+	if len(datas) != 1 {
+		t.Fatalf("thinking 事件数 = %d, 想要 1 (文本块的 BlockDone 不该触发): %v", len(datas), datas)
+	}
+	if datas[0]["phase"] != "thinking" {
+		t.Fatalf("phase = %v, 想要 thinking", datas[0]["phase"])
+	}
+	text, _ := datas[0]["text"].(string)
+	if !strings.HasPrefix(text, "想想想") || len([]rune(text)) > 204 {
+		t.Fatalf("thinking 摘要形状错 (前缀/截断): %q (runes=%d)", text, len([]rune(text)))
+	}
+
+	// 断流补发: 没有 BlockDone 也要在收尾发出。
+	ch2 := make(chan types.StreamEvent, 2)
+	ch2 <- types.StreamEvent{Kind: types.StreamEventDelta, IsThinking: true, DeltaText: "半截思考"}
+	close(ch2)
+	var datas2 []map[string]any
+	consumeStreamEvents(ch2, true, func(kind string, data map[string]any) {
+		datas2 = append(datas2, data)
+	})
+	if len(datas2) != 1 || datas2[0]["phase"] != "thinking" || datas2[0]["text"] != "半截思考" {
+		t.Fatalf("断流补发失败: %v", datas2)
+	}
+}
+
+// TestRunEventsThinkingNilHookNoAccumulate: hook=nil 时 thinking 不累积不上报 ——
+// 非 ndjson 路径的内存口径与改造前一致。
+func TestRunEventsThinkingNilHookNoAccumulate(t *testing.T) {
+	ch := make(chan types.StreamEvent, 3)
+	ch <- types.StreamEvent{Kind: types.StreamEventDelta, IsThinking: true, DeltaText: "x"}
+	ch <- types.StreamEvent{Kind: types.StreamEventBlockDone}
+	ch <- types.StreamEvent{Kind: types.StreamEventDelta, DeltaText: "y"}
+	close(ch)
+	final, _ := consumeStreamEvents(ch, true, nil)
+	if final != "y" {
+		t.Fatalf("final = %q, 想要 y", final)
+	}
+}
+
+// TestHookTraceBridgeFilter: 只放行"做了事"的 hook —— Skipped 与 no_op 是噪音,
+// 全量上报会把事件流淹掉 (PreRequest 段每轮跑十几个 hook)。
+func TestHookTraceBridgeFilter(t *testing.T) {
+	var buf strings.Builder
+	ev := newRunEventEmitter(&buf, "run-test", "")
+	bridge := newHookTraceBridge(ev)
+	if bridge == nil {
+		t.Fatal("ev 非 nil 时 bridge 不该是 nil")
+	}
+	if newHookTraceBridge(nil) != nil {
+		t.Fatal("ev 为 nil 时 bridge 必须是 nil (WithHookTraceObserver 对 nil 原样返回)")
+	}
+
+	ctx := context.Background()
+	// 噪音三类: no_op / skipped / 空 result —— 都不该出事件。
+	bridge.ObserveHookTrace(ctx, engine.HookTrace{Name: "MessageFilter", Result: "no_op"})
+	bridge.ObserveHookTrace(ctx, engine.HookTrace{Name: "PromptCache", Skipped: true, Result: "skipped"})
+	bridge.ObserveHookTrace(ctx, engine.HookTrace{Name: "Metrics"})
+	// 信号三类: 做了事 / 出错 / 超时 —— 都该出事件。
+	bridge.ObserveHookTrace(ctx, engine.HookTrace{Name: "MemoryInject", Result: "messages_injected", Duration: 5 * time.Millisecond})
+	bridge.ObserveHookTrace(ctx, engine.HookTrace{Name: "LoopDetector", Err: strings.Repeat("e", 300)})
+	bridge.ObserveHookTrace(ctx, engine.HookTrace{Name: "Slow", TimedOut: true})
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	// emitter 构造时已发一条 started, 之后应恰好 3 条 hook 事件。
+	if len(lines) != 1+3 {
+		t.Fatalf("事件行数 = %d, 想要 4 (started + 3 hook): %v", len(lines), lines)
+	}
+	var hookEvents []map[string]any
+	for _, ln := range lines[1:] {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(ln), &m); err != nil {
+			t.Fatalf("事件行不是 JSON: %v", err)
+		}
+		data, _ := m["data"].(map[string]any)
+		if m["type"] != "progress" || data["phase"] != "hook" {
+			t.Fatalf("事件形状错: %v", m)
+		}
+		hookEvents = append(hookEvents, data)
+	}
+	if hookEvents[0]["hook"] != "MemoryInject" || hookEvents[0]["result"] != "messages_injected" || hookEvents[0]["duration_ms"].(float64) != 5 {
+		t.Fatalf("MemoryInject 事件字段错: %v", hookEvents[0])
+	}
+	errText, _ := hookEvents[1]["error"].(string)
+	if hookEvents[1]["hook"] != "LoopDetector" || len([]rune(errText)) > 124 {
+		t.Fatalf("错误事件字段/截断错: %v", hookEvents[1])
+	}
+	if hookEvents[2]["timed_out"] != true {
+		t.Fatalf("超时事件缺 timed_out: %v", hookEvents[2])
+	}
+}
+
+// TestAttachRunUsage: 有数据才给, 没有就省略 (契约同 usage/cost_cny 的既有纪律)。
+func TestAttachRunUsage(t *testing.T) {
+	// nil 引擎: 原样返回, 不加键。
+	data := attachRunUsage(map[string]any{"final": "x"}, nil)
+	if _, has := data["usage"]; has {
+		t.Fatalf("nil 引擎不该有 usage: %v", data)
+	}
+	// 零调用引擎: 同样省略 (全零段会冒充"没花钱")。
+	eng := &engine.QueryEngine{}
+	data = attachRunUsage(map[string]any{"final": "x"}, eng)
+	if _, has := data["usage"]; has {
+		t.Fatalf("零调用不该有 usage: %v", data)
 	}
 }

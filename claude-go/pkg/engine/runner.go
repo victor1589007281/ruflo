@@ -318,6 +318,9 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 			}
 			apiTools = append(apiTools, t)
 		}
+		// IterationGuard 在主循环与隔离 run 两处装配点都要生效, 否则子代理
+		// 会因为"没走 queryLoop"而拿到被驱逐的工具 —— 双口径。
+		apiTools = e.filterEvictedTools(apiTools)
 	}
 
 	// 4. 循环
@@ -533,7 +536,11 @@ func (e *QueryEngine) RunIsolated(ctx context.Context, userPrompt string, opts I
 		// llm_call Span (design/03 §4.1 E1 第 4 种 Kind)。团队/stage 路径的绝大多数
 		// LLM 流量走这里, 所以这一处比 queryLoop 那处更要紧。写在错误返回**之前**:
 		// 失败的调用也是轨迹 (§1.3 要求能还原完整 prompt→response 链, 含失败)。
-		if e.TraceStore != nil {
+		//
+		// 外层不再包 `if e.TraceStore != nil` —— writeLLMCallSpan 自己守 TraceStore,
+		// 而 P1 的 run 级用量聚合 (noteRunUsage) 在守卫之前、必须无条件跑到:
+		// 外层再守一次会让"没开轨迹底座的 run"静默丢掉 usage 段。
+		{
 			var usage *types.Usage
 			var stop string
 			if resp != nil {

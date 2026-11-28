@@ -175,27 +175,7 @@ func (r *Registry) FormatShortListingForDir(limit int, dir string) string {
 		}
 	}
 	r.sortForListing(filtered) // 13.7-P2 L1 配给: 与 FormatShortListing 同一排序语义
-	// 复用原渲染: 临时换 skills 视图太侵入, 这里直接按同格式渲染。
-	if len(filtered) == 0 {
-		return ""
-	}
-	if limit <= 0 {
-		limit = len(filtered)
-	}
-	var sb strings.Builder
-	sb.WriteString("<available_skills summary=\"short\">\n")
-	usedDesc := 0
-	for i, sk := range filtered {
-		line := "- " + sk.Name
-		if i < limit && usedDesc < shortListingDescBudget && sk.Description != "" {
-			desc := truncateRunes(sk.Description, 140)
-			if usedDesc+len([]rune(desc)) <= shortListingDescBudget {
-				line += ": " + desc
-				usedDesc += len([]rune(desc))
-			}
-		}
-		sb.WriteString(line + "\n")
-	}
-	sb.WriteString("</available_skills>\n")
-	return sb.String()
+	// 与全量清单**同一个渲染器**: 此前这里自己拼一遍循环, 结果漏掉了末尾那句
+	// "Use the Skill tool ..." —— 模型看得到清单却不知道要用 Skill 工具去加载它。
+	return renderShortListing(filtered, limit)
 }

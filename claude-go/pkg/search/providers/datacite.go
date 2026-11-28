@@ -57,7 +57,7 @@ func (p *dataCiteProvider) Search(ctx context.Context, req search.SearchRequest)
 	limit := p.limitOf(req.Limit)
 
 	target := withQuery(p.endpoint, url.Values{
-		"query":     {query},
+		"query":      {query},
 		"page[size]": {strconv.Itoa(limit)},
 	})
 	var payload struct {

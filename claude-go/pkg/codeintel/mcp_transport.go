@@ -573,8 +573,8 @@ func (s *MCPServerV2) toolsList() []mcpTool {
 		},
 		{
 			Name:        "code_intel_query",
-			Description: "Query the code intelligence graph via GitNexus or Graphify CLI. Query types: navigate, impact, find_refs, path, explain, communities, god_nodes, surprises, cross_shard.",
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"repo_path":{"type":"string","description":"Absolute path to the indexed repository."},"query_type":{"type":"string","enum":["navigate","impact","find_refs","communities","god_nodes","path","surprises","cross_shard","query","explain"],"description":"Query type."},"shard":{"type":"string"},"symbol":{"type":"string"},"file_path":{"type":"string"},"depth":{"type":"integer"},"top_n":{"type":"integer"},"target_shard":{"type":"string"},"target_symbol":{"type":"string"}},"required":["repo_path","query_type"]}`),
+			Description: "Query the code intelligence graph via GitNexus or Graphify CLI. Query types: navigate, impact, find_refs, path, explain, communities, god_nodes, surprises, cross_shard, semantic.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"repo_path":{"type":"string","description":"Absolute path to the indexed repository."},"query_type":{"type":"string","enum":["navigate","impact","find_refs","communities","god_nodes","path","surprises","cross_shard","query","explain","semantic"],"description":"Query type. semantic: natural-language symbol search (symbol field carries the query text); returns candidates that must be verified via navigate/find_refs before use as evidence."},"shard":{"type":"string"},"symbol":{"type":"string"},"file_path":{"type":"string"},"depth":{"type":"integer"},"top_n":{"type":"integer"},"target_shard":{"type":"string"},"target_symbol":{"type":"string"}},"required":["repo_path","query_type"]}`),
 		},
 		{
 			Name:        "code_intel_branch",
@@ -872,6 +872,9 @@ func (s *MCPServerV2) toolQuery(args json.RawMessage) (string, bool) {
 	case "explain":
 		gf := NewGraphify(in.RepoPath)
 		qr, err = gf.Explain(in.Symbol)
+	case "semantic":
+		// symbol 字段承载自然语言查询；top_n 复用现有入参。
+		qr, err = engine.SemanticSearch(in.Symbol, in.TopN)
 	default:
 		return fmt.Sprintf("unknown query_type: %s", in.QueryType), true
 	}

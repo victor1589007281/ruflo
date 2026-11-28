@@ -18,11 +18,20 @@ package main
 //   - heartbeat 由监督 goroutine 每 20s 一发 (env CLAUDE_GO_EVENT_HEARTBEAT_SEC
 //     可覆盖), 与流上有没有 token 无关。
 //   - progress 只携带工具名 + ≤200 字符截断摘要, 绝不携带完整工具参数
-//     (参数里可能有密钥)。
+//     (参数里可能有密钥)。P1 起 data 按 phase 扩展 (全部可选, 老消费方不受影响):
+//     phase:"tool"  —— 工具调用: tool / tool_use_id / args_hash (归一化入参
+//     sha256-8, 等值判据不带原文) / result_bytes (结果完整字节数, 整数);
+//     phase:"hook"  —— 内置 hook 执行: hook / hook_phase / result / duration_ms
+//     (/ error / panic / timed_out), 只报"做了事"的 hook (见 hookTraceBridge);
+//     phase:"thinking" —— 思考块摘要: text ≤200 字符, 纪律同工具摘要。
+//   - result 的 data 在 P1 起可带 usage 段 (进程内 run 级用量聚合:
+//     calls/usage_reported/input/output/cache_read/cache_creation),
+//     与 llm.jsonl 的进程外账本互为对账; 没有数据时整段省略。
 //   - 未开启 ndjson 时本文件的协议部分完全不生效; text/json 模式行为逐字节不变
 //     (唯二被 ndjson 模式改道的普通信息行走 runInfof/runInfoln)。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,6 +40,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropic/claude-go/pkg/engine"
 )
 
 // runEventDefaultHeartbeatSec 是心跳默认间隔 (契约常数 20s)。
@@ -203,6 +214,97 @@ func runProgressText(name, summary string) string {
 		return summary
 	}
 	return name + " " + summary
+}
+
+// attachRunUsage 把 run 级 LLM 用量聚合 (P1) 并进 result 事件的 data。
+// eng 为 nil 或一次调用都没记到 (RunUsageSnapshot ok=false) 时原样返回 ——
+// 按契约「有真实数据才给, 没有就省略」, 不发全零段冒充"没花钱"。
+//
+// 这是进程内账本, 与 llm.jsonl 的进程外账本互为冗余校验 (P1 验收: 对账
+// 差异 >5% 告警)。两个账本刻意独立采集, 对账才有意义。
+func attachRunUsage(data map[string]any, eng *engine.QueryEngine) map[string]any {
+	u, ok := eng.RunUsageSnapshot()
+	if !ok {
+		return data
+	}
+	data["usage"] = map[string]any{
+		"calls":                       u.Calls,
+		"usage_reported":              u.UsageReported,
+		"input_tokens":                u.InputTokens,
+		"output_tokens":               u.OutputTokens,
+		"cache_read_input_tokens":     u.CacheReadInputTokens,
+		"cache_creation_input_tokens": u.CacheCreationInputTokens,
+	}
+	return data
+}
+
+// hookTraceBridge 把引擎内置 hook 链的执行 trace (engine.HookTraceObserver)
+// 桥接成 ndjson 的 progress(phase:"hook") 事件 (P1: hook 可见性)。
+//
+// # 过滤纪律: 只报"做了事"的 hook
+//
+// PreRequest 段的 hook 每轮都跑 (MessageFilter/PromptCache/Metrics...), 全量上报
+// 会把事件流淹成噪音。只放行三类: ① Result 非 no_op (注入了消息/改了 prompt/
+// 终止了 run —— 记忆注入、循环检测、压缩都落在这类); ② 出错/panic/超时;
+// ③ (Skipped 一律不报 —— 被跳过是前序 hook 的决定, 前序那条自己会报。)
+//
+// # 泄漏面
+//
+// HookTrace 本身只含类别标签不含用户正文 (见 hookpolicy.go 的 hookResultSummary
+// 注释); Err/Panic 文本截断到 120 字符 —— 它们是运维错误信息, 不是用户数据,
+// 但截断防的是 hook 把输入片段拼进错误串的意外。
+type hookTraceBridge struct {
+	ev *runEventEmitter
+}
+
+// newHookTraceBridge 返回可挂进 ctx 的观测者; ev 为 nil 时返回 nil
+// (WithHookTraceObserver 对 nil 观测者原样返回 ctx)。
+func newHookTraceBridge(ev *runEventEmitter) engine.HookTraceObserver {
+	if ev == nil {
+		return nil
+	}
+	return &hookTraceBridge{ev: ev}
+}
+
+// ObserveHookTrace 实现 engine.HookTraceObserver。必须轻且绝不 panic
+// (调用方虽会 recover, 但 panic 会丢掉这条 trace)。
+func (b *hookTraceBridge) ObserveHookTrace(_ context.Context, tr engine.HookTrace) {
+	if tr.Skipped {
+		return
+	}
+	notable := tr.Result != "" && tr.Result != "no_op"
+	if !notable && tr.Err == "" && tr.Panic == "" && !tr.TimedOut {
+		return
+	}
+	data := map[string]any{
+		"phase":       "hook",
+		"hook":        tr.Name,
+		"hook_phase":  tr.Phase.String(),
+		"duration_ms": tr.Duration.Milliseconds(),
+	}
+	if tr.Result != "" {
+		data["result"] = tr.Result
+	}
+	if tr.Err != "" {
+		data["error"] = truncateRunEventText(tr.Err, 120)
+	}
+	if tr.Panic != "" {
+		data["panic"] = truncateRunEventText(tr.Panic, 120)
+	}
+	if tr.TimedOut {
+		data["timed_out"] = true
+	}
+	b.ev.emit("progress", data)
+}
+
+// truncateRunEventText 按字符截断 (不是字节 —— 错误串里中文常见, 字节截断
+// 会劈开多字节字符, 消费方拿到非法 UTF-8)。
+func truncateRunEventText(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "..."
 }
 
 // runInfof/runInfoln 把 run 命令路径上的普通信息行写到 stdout;

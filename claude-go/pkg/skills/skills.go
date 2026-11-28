@@ -190,7 +190,7 @@ func (r *Registry) LoadFromDirs(dirs []string, source string) int {
 			continue
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() {
+			if !entry.IsDir() && !isDirSymlink(dir, entry) {
 				continue
 			}
 			skillPath := filepath.Join(dir, entry.Name(), "SKILL.md")
@@ -214,6 +214,22 @@ func (r *Registry) LoadFromDirs(dirs []string, source string) int {
 		r.mu.Unlock()
 	}
 	return loaded
+}
+
+// isDirSymlink 判定一个目录项是不是指向目录的软链。
+//
+// os.ReadDir 的 DirEntry.IsDir 走 lstat: 软链一律报 false, 于是"用软链挂进技能目录"
+// 的技能被静默丢掉 —— 而丢掉的后果不是报错, 是 Skill 工具对它根本不存在、模型清单里
+// 也没有它。实测 (2026-11-28): ~/.claude/skills/weread-skills 就是一条指向
+// ~/.agents/skills/weread-skills 的软链, 路由基准里 8 条微信读书用例全部必错,
+// 排查时账本还报 skill_listing_chars=0 (那是另一个 bug), 两个假象叠在一起。
+// 只做一级 stat, 不递归: 技能目录只有 <dir>/<skill>/SKILL.md 这一种形状。
+func isDirSymlink(parent string, entry os.DirEntry) bool {
+	if entry.Type()&os.ModeSymlink == 0 {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(parent, entry.Name()))
+	return err == nil && info.IsDir()
 }
 
 // LoadDefaults 加载默认技能目录。
@@ -551,28 +567,51 @@ func renderShortListing(skills []*Skill, limit int) string {
 	if len(skills) == 0 {
 		return ""
 	}
-	if limit <= 0 {
+	if limit <= 0 || limit > len(skills) {
 		limit = len(skills)
+	}
+	// 描述预算**按技能数均分**, 不按顺序先用先得。
+	//
+	// 旧做法是从第一个技能起顺序消耗 2400 rune, 于是字母表靠后的技能永远只剩名字:
+	// 实测 43 个技能时 weread-skills / technical-diagrams / openmontage 的描述全被
+	// 挤掉, 而它们恰恰是最需要靠描述来路由的一类 (名字本身不说明用途)。
+	// 均分让每个技能都拿到有信息量的份额; 份额上限仍是 140 (超过就不是"清单"了)。
+	per := shortListingDescBudget / limit
+	if per > 140 {
+		per = 140
+	}
+	if per < minShortDescRunes {
+		per = minShortDescRunes
 	}
 
 	var sb strings.Builder
 	sb.WriteString("<available_skills summary=\"short\">\n")
-	usedDesc := 0
 	for i, s := range skills {
 		line := "- " + s.Name
-		// 名称恒写出; 描述受 limit 与剩余预算双重约束
-		if i < limit && usedDesc < shortListingDescBudget && s.Description != "" {
-			desc := truncateRunes(s.Description, 140)
-			if usedDesc+len([]rune(desc)) <= shortListingDescBudget {
+		if i < limit && s.Description != "" {
+			// 描述必须是单行: 块标量 (description: |) 解析出来带换行,
+			// 直接拼进去会把"一行一个技能"的格式撑散, 模型读到的是半截条目。
+			desc := truncateRunes(oneLine(s.Description), per)
+			if desc != "" {
 				line += ": " + desc
-				usedDesc += len([]rune(desc))
 			}
 		}
 		sb.WriteString(line + "\n")
 	}
+	// 这一行是"怎么用清单"的唯一说明。ForDir 变体此前自己拼渲染, 把这一行漏了 ——
+	// 模型看得到一串技能名, 却没有任何指令告诉它要用 Skill 工具去加载。
 	sb.WriteString("Use the Skill tool with a skill name to load its full instructions.\n")
 	sb.WriteString("</available_skills>\n")
 	return sb.String()
+}
+
+// minShortDescRunes 是均分后允许的最小描述份额。技能数多到把预算摊薄时宁可轻微
+// 超预算, 也不要退化成"只有名字" —— 名字往往不足以承载路由信号。
+const minShortDescRunes = 48
+
+// oneLine 把任意描述压成单行 (连续空白 → 单个空格)。
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // ParseSkillFile 解析 SKILL.md 文件。

@@ -360,6 +360,20 @@ type StreamEvent struct {
 	ToolUseID  string // Kind=ToolStart/ToolDone
 	ToolInput  string // Kind=ToolStart 时的工具输入摘要
 	ToolResult string // Kind=ToolDone 时的工具结果摘要
+	// ToolArgsHash 是工具入参的归一化短哈希 (canonical JSON 的 sha256 前 8 hex,
+	// 见 pkg/engine/args_hash.go)。Kind=ToolStart 时携带。
+	//
+	// 存在的理由: ndjson progress 事件只带 ≤200 字符摘要 (参数里可能有密钥,
+	// 绝不带原文), 消费方于是分不清"同一个调用反复发"与"不同调用恰好摘要前缀
+	// 相同"。哈希是**等值判据**而不是内容: 两次调用 args_hash 相同 ⟺ 归一化后
+	// 入参逐字节相同, 循环检测据此把"卡死"与"合法轮询"分开, 全程不接触原文。
+	ToolArgsHash string
+	// ToolResultBytes 是工具结果的**完整**字节数 (int, 无内容)。Kind=ToolDone 时携带。
+	//
+	// 与 ToolArgsHash 配对使用: 同 args_hash + result_bytes 不变 = 卡死,
+	// 同 args_hash + result_bytes 变化 = 轮询 (结果在变, 调用是合法的)。
+	// 整数字节数没有泄漏面 —— 它回答"结果多大", 不回答"结果是什么"。
+	ToolResultBytes int
 	// ToolResultFull 是工具结果的**完整**内容 (H-F1 证据闭环)。
 	//
 	// 只给**进程内**消费者 (pkg/harness 的 drain → ToolResultSink) 使用, **不得**

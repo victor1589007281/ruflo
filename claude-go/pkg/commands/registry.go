@@ -43,6 +43,12 @@ type CommandContext struct {
 	Cwd          string
 	OnClear      func()
 	OnExit       func()
+	// FinalSink 程序化输出汇 (design/09 §8 结构化 IO 契约): run 主流程在 json 模式下
+	// 装上它, slash 命令把"最终答复"交给它, 由主流程统一发 run envelope —— 此前
+	// slash 分支在信封发射点之前就 return, --output-format json 的调用方
+	// (webapp 评测的 workflow 用例) 在 /go 上永远拿不到信封, 只能报 no_envelope。
+	// nil (交互 REPL) 时命令只做人读打印, 行为与改造前逐字节一致。
+	FinalSink func(final string)
 }
 
 // Registry 命令注册表。

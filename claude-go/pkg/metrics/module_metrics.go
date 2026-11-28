@@ -45,6 +45,16 @@ type MetricEvent struct {
 	// 这与 dashboard 那边奖励聚合早就在用的 `(run_id, team)` 二元组口径一致
 	// (run_feedback.go: "AggregateRewards 按 (run_id, team) 过滤")。
 	Team string `json:"team,omitempty"`
+	// NodeID / TurnID 是 trace 四元组的下两层 (design/03 §4.1 E0)。
+	//
+	// 与 RunID/Team 同一条纪律: **只进 JSONL 事件, 不进 Prometheus 标签**。
+	// turn 比 run 更细, 做成标签的基数问题只会更严重 ("一个 run 每个回合一个新值")。
+	// 进事件则让 llm.jsonl 自己就能回答"这一轮花了多少 token"——此前只能拿
+	// access.jsonl 的逐调用四元组反查, 而评测系统读的是 llm.jsonl。
+	//
+	// 空值 omitempty: 非引擎路径 (压缩/视觉等) 没有回合概念, 字段不出现。
+	NodeID string `json:"node_id,omitempty"`
+	TurnID string `json:"turn_id,omitempty"`
 }
 
 // ModuleSummary 单模块指标摘要 (供 AI 分析)。
@@ -152,7 +162,17 @@ func (c *Collector) RecordRunTeam(module, name string, value float64, runID, tea
 // 一个字不动) 也没有基数问题。这也是 MetricEvent.RunID 从一开始就与 Labels
 // 分开的原因 (RecordRun 就是这么用的)。
 func (c *Collector) RecordRunAtTime(module, name string, value float64, runID string, labels map[string]string, ts time.Time) {
-	c.record(MetricEvent{Timestamp: ts, Module: module, Name: name, Value: value, Labels: labels, RunID: runID})
+	c.RecordTraceAtTime(module, name, value, runID, "", "", labels, ts)
+}
+
+// RecordTraceAtTime 记录带完整 trace 定位键 (run/node/turn) 与指定时间戳的指标值。
+//
+// 与 RecordRunAtTime 同一纪律 (三键都只进 JSONL, 不进 Prometheus 标签), 只是把
+// node/turn 也带上。调用方是 llm 采集器: 一次 LLM 调用的全部指标必须带同一组定位键,
+// 否则按 turn 过滤时会**静默漏掉**个别事件 (熔断/提示词构成那几条曾真实漏过 run_id)。
+func (c *Collector) RecordTraceAtTime(module, name string, value float64, runID, nodeID, turnID string, labels map[string]string, ts time.Time) {
+	c.record(MetricEvent{Timestamp: ts, Module: module, Name: name, Value: value, Labels: labels,
+		RunID: runID, NodeID: nodeID, TurnID: turnID})
 }
 
 // record 三个 Record*AtTime/Run 变体的**唯一**落地实现。

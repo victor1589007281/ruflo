@@ -110,7 +110,25 @@ func (h *LoopDetectorInputHook) Execute(ctx *HookContext) (*HookResult, error) {
 	var appendMsgs []types.Message
 	var looped bool
 
+	// 驱逐发生在本轮 Observe 里（LoopDetector 自己记账），这里只对比前后差异，
+	// 好让 hook trace 打出一个 "tools_evicted" 标签。
+	evictedBefore := map[string]bool{}
+	for _, t := range h.detector.EvictedTools() {
+		evictedBefore[t] = true
+	}
+
 	for _, blk := range ctx.ToolUseBlocks {
+		// 已驱逐的工具：模型可能仍凭记忆硬调（工具描述已不在请求里，但历史
+		// 消息里还有）。这里也挡住 —— 驱逐若只改广告面不改执行面，模型多试
+		// 两次就绕回去了，等于没驱逐。
+		if h.detector.IsEvicted(blk.Name) {
+			looped = true
+			appendMsgs = append(appendMsgs, evictionNote(blk.ID, blk.Name))
+			if h.metrics != nil {
+				h.metrics.ToolLoopsSuppressed.Add(1)
+			}
+			continue
+		}
 		if isLooped, suggestion := h.detector.Observe(blk.Name, []byte(blk.Input)); isLooped {
 			looped = true
 			noteMsg := types.Message{
@@ -144,12 +162,35 @@ func (h *LoopDetectorInputHook) Execute(ctx *HookContext) (*HookResult, error) {
 		ToolUseBlocks: allowed,
 		AppendMsgs:    appendMsgs,
 	}
+	for _, t := range h.detector.EvictedTools() {
+		if !evictedBefore[t] {
+			result.EvictedTools = append(result.EvictedTools, t)
+		}
+	}
 	if looped && len(allowed) == 0 {
 		// 全部被拦截时，跳过后续同 phase hooks 并注入 continue 进入下一轮
 		result.SkipRemaining = true
 		result.InjectContinue = true
 	}
 	return result, nil
+}
+
+// evictionNote 是对已驱逐工具调用的固定回执。文案要同时说清三件事：
+// 工具为什么没了（不是坏了）、本次运行内不会回来（别重试）、该怎么继续。
+func evictionNote(toolUseID, tool string) types.Message {
+	return types.Message{
+		Type: types.MessageTypeUser,
+		UUID: GenerateUUID(),
+		Content: []types.ContentBlock{{
+			Type:      types.ContentBlockToolResult,
+			ToolUseID: toolUseID,
+			Content: fmt.Sprintf(
+				"`%s` 因连续陷入循环, 已从本次运行的工具集中移除, 本次运行内不会再恢复 —— 重试同样参数没有意义。"+
+					"请改用其他工具或完全不同的路径; 若确实无法继续, 直接说明卡点并给出当前已有结论。", tool),
+			IsError: true,
+		}},
+		CreatedAt: time.Now(),
+	}
 }
 
 // ============================================================================

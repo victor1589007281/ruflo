@@ -357,9 +357,9 @@ func TestStateDirEnvOverride(t *testing.T) {
 	}
 }
 
-func boolPtr(v bool) *bool          { return &v }
-func floatPtr(v float64) *float64   { return &v }
-func strPtr(v string) *string       { return &v }
+func boolPtr(v bool) *bool        { return &v }
+func floatPtr(v float64) *float64 { return &v }
+func strPtr(v string) *string     { return &v }
 
 // 测试二进制默认不许碰真实状态目录: 否则一次 go test 就会把假查询写进
 // 用户面板里, 看起来像是"今天的真实使用记录"。

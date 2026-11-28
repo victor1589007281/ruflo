@@ -166,13 +166,13 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 		ts = time.Now()
 	}
 
-	// rec 落 JSONL 时带上 run_id (design/03 §1.3 E0 验收项「llm.jsonl 可按 run_id
-	// 聚合」)。**只进事件不进标签** —— run_id 是无界基数, 做成 Prometheus 标签会把
-	// llm_* 炸成每次运行一条时间序列, 理由详见 RecordRunAtTime 的注释。
-	// rec.RunID 为空 (非团队路径 / 上游未注入) 时 omitempty 生效, llm.jsonl 逐字节
-	// 与改造前一致。
+	// rec 落 JSONL 时带上 trace 定位键 run/node/turn (design/03 §1.3 E0 验收项
+	// 「llm.jsonl 可按 run_id 聚合」+ P2「turn_id 填充」)。**只进事件不进标签** ——
+	// 三键都是无界基数, 做成 Prometheus 标签会把 llm_* 炸成每次运行/每回合一条
+	// 时间序列, 理由详见 RecordTraceAtTime 的注释。
+	// 字段全为空时 omitempty 生效, 非引擎路径的 llm.jsonl 行与改造前逐字节一致。
 	rt := func(name string, value float64) {
-		c.RecordRunAtTime("llm", name, value, rec.RunID, labels, ts)
+		c.RecordTraceAtTime("llm", name, value, rec.RunID, rec.NodeID, rec.TurnID, labels, ts)
 	}
 
 	rt(MLLMCallCount, 1)
@@ -246,7 +246,7 @@ func recordLLMCall(c *Collector, rec api.LLMCallRecord) {
 		// 这一条用的是另一份 labels, 所以走不了上面的 rt 闭包; run_id 仍要带上 ——
 		// 一次调用的事件里有的带 run_id 有的不带, 比全都不带更难排障 (按 run_id 过滤
 		// 会**静默漏掉**恰好是熔断那几条, 而那几条正是最该被查到的)。
-		c.RecordRunAtTime("llm", MLLMCircuitOpenGauge, 1, rec.RunID, blockedLabels, ts)
+		c.RecordTraceAtTime("llm", MLLMCircuitOpenGauge, 1, rec.RunID, rec.NodeID, rec.TurnID, blockedLabels, ts)
 	}
 }
 
@@ -278,8 +278,8 @@ func recordPromptComponentMetrics(c *Collector, rec api.LLMCallRecord, labels ma
 		componentLabels["component"] = part.name
 		// 同带 run_id: 提示词构成是"这次运行为什么烧了这么多 token"的直接证据,
 		// 恰恰是最需要按 run_id 归因的一路 (design/03 §1.3)。
-		c.RecordRunAtTime("llm", MLLMPromptComponentChars, float64(part.value), rec.RunID, componentLabels, ts)
-		c.RecordRunAtTime("llm", MLLMPromptComponentTokens, float64(part.value)/4.0, rec.RunID, componentLabels, ts)
+		c.RecordTraceAtTime("llm", MLLMPromptComponentChars, float64(part.value), rec.RunID, rec.NodeID, rec.TurnID, componentLabels, ts)
+		c.RecordTraceAtTime("llm", MLLMPromptComponentTokens, float64(part.value)/4.0, rec.RunID, rec.NodeID, rec.TurnID, componentLabels, ts)
 	}
 
 	// F10 表面定价: 启发式分量 (上面两条) 只回答"构成大概长什么样", 回答不了
@@ -301,7 +301,7 @@ func recordPromptComponentMetrics(c *Collector, rec api.LLMCallRecord, labels ma
 			for _, node := range meas.Surfaces {
 				sl := copyLabels(surfaceLabels)
 				sl["component"] = node.Component
-				c.RecordRunAtTime("llm", MLLMPromptSurfaceTokens, float64(node.Tokens), rec.RunID, sl, ts)
+				c.RecordTraceAtTime("llm", MLLMPromptSurfaceTokens, float64(node.Tokens), rec.RunID, rec.NodeID, rec.TurnID, sl, ts)
 			}
 		}
 	}

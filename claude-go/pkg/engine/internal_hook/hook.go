@@ -174,6 +174,11 @@ type HookResult struct {
 
 	// Backoff 非致命错误后的退避时间（OnError phase）
 	Backoff time.Duration
+
+	// EvictedTools 本次执行中新被驱逐出工具集的工具名（IterationGuard）。
+	// 只用于让 hook trace / ndjson 能看见"驱逐发生了"这个事实 —— 排列组合
+	// 本身留在 LoopDetector 里，不经由 HookResult 传递。
+	EvictedTools []string
 }
 
 // ============================================================================

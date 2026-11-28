@@ -128,13 +128,17 @@ func messageTextForLedger(messages []types.Message) string {
 //	      截断的 prompt 本身就是异常, 把它的体量记满比记 0 更容易在观测里暴露问题。
 //	设计权衡：不做真正的 XML 解析 —— 这段文本是拼出来的 (可能被截断、可能嵌套不合法),
 //	      严格解析会在这些情况下抛错, 而账本是观测路径, 必须永不失败。
+//
+// ★ 开标签**可以带属性**。技能清单走精简渲染, 开标签是
+// `<available_skills summary="short">`; 只认字面量 `<available_skills>` 的话,
+// CLI 路径上 skill_listing_chars 恒为 0 —— 技能明明已注入, 账本却报"没有技能清单",
+// 排查时会把"模型没选 Skill"误读成"清单根本没下发"(2026-11-28 实际踩到)。
 func countXMLBlocks(text, tag string) int {
-	open := "<" + tag + ">"
 	close := "</" + tag + ">"
 	total := 0
 	search := text
 	for {
-		start := strings.Index(search, open)
+		start := findOpenTag(search, tag)
 		if start < 0 {
 			return total
 		}
@@ -147,6 +151,29 @@ func countXMLBlocks(text, tag string) int {
 		end += len(close)
 		total += end
 		search = rest[end:]
+	}
+}
+
+// findOpenTag 找 `<tag>` 或 `<tag attr="...">` 的起始下标, 没有则 -1。
+// `<tagfoo>` 不算 (tag 名后必须是 '>', 空白或自闭合的 '/')。
+func findOpenTag(text, tag string) int {
+	prefix := "<" + tag
+	off := 0
+	for {
+		i := strings.Index(text[off:], prefix)
+		if i < 0 {
+			return -1
+		}
+		i += off
+		next := i + len(prefix)
+		if next >= len(text) {
+			return i // 极端: 标签在末尾且没有闭合符, 交给调用方的"闭标签缺失"分支
+		}
+		switch text[next] {
+		case '>', '/', ' ', '\t', '\r', '\n':
+			return i
+		}
+		off = next
 	}
 }
 

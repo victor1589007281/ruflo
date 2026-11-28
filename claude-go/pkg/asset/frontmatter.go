@@ -113,8 +113,9 @@ func SplitFrontmatter(content string) Frontmatter {
 
 	// curList 当前正在累积的多行列表键; 遇到任何新键行就清空。
 	curList := ""
-	for _, line := range strings.Split(block, "\n") {
-		line = strings.TrimSpace(line)
+	lines := strings.Split(block, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -139,10 +140,108 @@ func SplitFrontmatter(content string) Frontmatter {
 			curList = key // 空值 = 后面跟 `- item` 续行
 			continue
 		}
+		// YAML 块标量 (`key: |` / `key: >`, 允许 -/+ chomping): 值在缩进续行里。
+		//
+		// 不认它的代价是**静默的**: description 变成字面量 "|" 或 ">"。
+		// 实测 (2026-11-28) ~/.claude/skills 里 agent-reach/ima-skill 都这么写,
+		// 清单里就出现 "- agent-reach: >" —— 描述正是技能路由的唯一信号,
+		// 等于这两个技能对模型不可路由。
+		if isBlockScalarHeader(val) {
+			body, next := collectBlockScalar(lines, i+1)
+			fm.Values[key] = foldBlockScalar(body, val)
+			curList = ""
+			i = next - 1
+			continue
+		}
 		curList = ""
 		fm.Values[key] = val
 	}
 	return fm
+}
+
+// isBlockScalarHeader 判定 `key:` 后面的值是不是块标量头 (`|` / `>`, 可带 chomping)。
+func isBlockScalarHeader(val string) bool {
+	switch strings.TrimSpace(val) {
+	case "|", "|-", "|+", ">", ">-", ">+":
+		return true
+	}
+	return false
+}
+
+// collectBlockScalar 从 lines[start:] 收集块标量的缩进续行, 返回去掉块缩进后的
+// 行 (空行保留为空串) 与块的结束下标 (第一条非缩进非空行)。
+//
+// 缩进宽度取**第一条非空行**的前导空格数 (YAML 的自动探测规则)。
+func collectBlockScalar(lines []string, start int) ([]string, int) {
+	indent := -1
+	end := start
+	for end < len(lines) {
+		raw := lines[end]
+		if strings.TrimSpace(raw) == "" {
+			end++ // 空行属于块内, 等看到下一条内容行再定缩进
+			continue
+		}
+		lead := len(raw) - len(strings.TrimLeft(raw, " \t"))
+		if lead == 0 {
+			break // 非缩进行: 块结束
+		}
+		if indent < 0 {
+			indent = lead
+		}
+		end++
+	}
+	if indent < 0 {
+		// 全是空行/没有内容: 返回空块, 但指针仍要越过这些行。
+		return nil, end
+	}
+	out := make([]string, 0, end-start)
+	for _, raw := range lines[start:end] {
+		if strings.TrimSpace(raw) == "" {
+			out = append(out, "")
+			continue
+		}
+		// 缩进不足的行 (比首行浅但仍有缩进) 按可用宽度切, 不 panic。
+		cut := indent
+		if len(raw) < cut {
+			cut = len(raw)
+		}
+		out = append(out, strings.TrimRight(raw[cut:], " \t"))
+	}
+	return out, end
+}
+
+// foldBlockScalar 按 YAML 语义把块内容折成字符串:
+//
+//	| (literal) 保留换行;  > (folded) 相邻行用空格连接, 空行表示段落分隔。
+//
+// 尾部换行一律去掉: 消费方是 description 这类单值字段, 尾部空白没有语义,
+// 而把它带进清单会把"一行一个技能"的格式撑开。
+func foldBlockScalar(lines []string, header string) string {
+	header = strings.TrimSpace(header)
+	if strings.HasPrefix(header, "|") {
+		return strings.TrimRight(strings.Join(lines, "\n"), "\n")
+	}
+	// folded
+	var sb strings.Builder
+	blank := false
+	wrote := false
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) == "" {
+			blank = true
+			continue
+		}
+		if wrote {
+			if blank {
+				sb.WriteString("\n")
+			} else {
+				sb.WriteString(" ")
+			}
+		}
+		sb.WriteString(strings.TrimSpace(ln))
+		wrote = true
+		blank = false
+	}
+	return sb.String()
 }
 
 // ParseInlineList 解析行内列表写法, 兼容三种在野形态: `A, B` / `[A, B]` / `A B`。

@@ -111,6 +111,13 @@ type QueryEngine struct {
 	CumulativeUsage types.Usage // 本会话累积 token 消耗
 	ContextBudget   int         // 上下文窗口大小 (tokens, 默认 200000)
 
+	// runUsageMu/runUsage 是 run 级 LLM 用量聚合 (P1, ndjson result 的 usage 段)。
+	// 累加点在 writeLLMCallSpan (唯一收口), 与 CumulativeUsage 口径独立 ——
+	// 它是进程内账本, 与 llm.jsonl 的进程外账本互为对账 (P1 验收: 差异 >5% 告警)。
+	// 持锁是因为 RunIsolated 可被并发 stage 共用引擎。方法与口径见 run_usage.go。
+	runUsageMu sync.Mutex
+	runUsage   RunUsage
+
 	// HookChain 内置 Hook 执行链，将 queryLoop 中所有硬编码功能点解耦为 InternalHook。
 	HookChain *internal_hook.HookChain
 
@@ -362,11 +369,27 @@ type Config struct {
 	// 运行期翻转走 SetMemoryIndexMode (配置热加载调用), 不要直接改这个字段:
 	// 它只在 registerInternalHooks 读一次, 改了要下次重建链才生效。
 	MemoryIndexMode *bool
+
+	// DisableMemoryInject 禁注入开关 (P1, CLI --no-inject): 跳过 MemoryInjectHook
+	// 与 AgentDBSemanticInjectHook 的注册, 本 run 不做任何记忆/召回注入。
+	//
+	// 用途是评测对照组: "上下文组装有没有用" 这个问题的 A/B, 对照组必须真的
+	// 没有注入 —— 靠"记忆库恰好是空的"当对照是假对照 (库随时间变化, 两组不可比)。
+	// 只影响注册 (registerInternalHooks 读一次), 不影响记忆**写入**侧。
+	DisableMemoryInject bool
 	// EnableBudget 启用 Token 预算分级降级 (G2)。
 	// 到 Red/Critical 会对旧 tool_result 做摘要压缩, 可能影响老消息可回溯性。
 	EnableBudget bool
 	// EnableLoopDetector 启用工具循环检测 (G3)。
 	EnableLoopDetector bool
+	// DisableToolEviction 关掉 IterationGuard 的工具驱逐 (默认开)。
+	//
+	// 驱逐 = 同一工具累计陷入循环 EvictAfter 次后, 把它从**模型可见的工具集**里摘掉
+	// (见 internal_hook.LoopDetector.EvictAfter)。默认开的理由: 触发前提本就是
+	// "同一个工具连续多次同参调用且毫无新信息", 到那一步拦住单次调用已经证明不够
+	// (模型会换参数继续磨), 拿掉工具是唯一能强制换路的手段。
+	// 关掉它退回 P2 行为: 只拦调用、给建议, 工具始终可见。
+	DisableToolEviction bool
 	// EnableErrorClassifier 启用错误族隔离 budget (G4)。
 	// 启用后替代原 consecutiveErrors 计数, 各族独立预算。
 	EnableErrorClassifier bool
@@ -725,6 +748,42 @@ func (e *QueryEngine) HiddenTools() []string {
 	return out
 }
 
+// filterEvictedTools 摘掉被 IterationGuard 驱逐的工具。
+//
+// 三条边界, 每条都是为了不把"干预"变成"事故":
+//  1. 没开循环检测 / 关了驱逐 → 原样返回 (零成本, 零语义变化)。
+//  2. 驱逐后一个工具都不剩 → 放弃驱逐并告警: 模型没有工具时既完不成任务也不会
+//     主动收口, 只会空转到 max-turns; 留着工具至少还有出路。
+//  3. 每次装配都重取快照 —— 驱逐发生在轮次之间 (PreToolUse), 缓存会漏掉最新状态。
+func (e *QueryEngine) filterEvictedTools(tools []types.APITool) []types.APITool {
+	if e == nil || e.Config.DisableToolEviction || e.LoopDet == nil || len(tools) == 0 {
+		return tools
+	}
+	evicted := e.LoopDet.EvictedTools()
+	if len(evicted) == 0 {
+		return tools
+	}
+	gone := make(map[string]bool, len(evicted))
+	for _, n := range evicted {
+		gone[n] = true
+	}
+	out := make([]types.APITool, 0, len(tools))
+	for _, t := range tools {
+		if gone[t.Name] {
+			continue
+		}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		logging.For("engine").Warn("IterationGuard 放弃驱逐: 摘掉后无工具可用", "evicted", evicted)
+		return tools
+	}
+	if len(out) != len(tools) {
+		logging.Event(context.Background(), "engine.tools_evicted", "evicted", evicted, "remaining", len(out))
+	}
+	return out
+}
+
 // InternalHookPhases 返回内置 Hook 链上每个相位已注册的 hook 名 (含空相位)。
 // 引擎未构造 HookChain / 链为 nil 时返回 nil。
 func (e *QueryEngine) InternalHookPhases() map[string][]string {
@@ -992,7 +1051,10 @@ func (e *QueryEngine) registerInternalHooks() {
 		e.HookChain.Register(h)
 	}
 	e.HookChain.Register(internal_hook.NewMessageMetricsHook(e.Metrics))
-	if e.MemoryStore != nil || e.FactStore != nil {
+	// DisableMemoryInject (--no-inject): 评测对照组禁记忆/召回注入 —— 整个
+	// if 体跳过, 连 memHook 句柄都不留 (热改路径 SetMemoryIndexMode 对 nil 句柄
+	// 本就 no-op, 见 SetMemoryIndexMode 的守卫)。
+	if !e.Config.DisableMemoryInject && (e.MemoryStore != nil || e.FactStore != nil) {
 		memHook := internal_hook.NewMemoryInjectHook(e.MemoryStore, e.FactStore)
 		// 检索遥测 (mem_retrieval_count_l1/l2 + mem_injection_chars)。落点取全局
 		// LLM 采集器: 它由进程启动时按 stateDir 初始化, 与 llm.jsonl 同目录, 于是
@@ -1013,7 +1075,7 @@ func (e *QueryEngine) registerInternalHooks() {
 		e.memHook = memHook // 热加载路径要能 Set, 见 SetMemoryIndexMode
 		e.HookChain.Register(memHook)
 	}
-	if e.Config.AgentDBSemantic != nil {
+	if !e.Config.DisableMemoryInject && e.Config.AgentDBSemantic != nil {
 		topK, budget, reserve := e.Config.SemanticTopK, e.Config.SemanticTokenBudget, e.Config.SemanticReserve
 		if topK <= 0 {
 			topK = 5
@@ -1844,6 +1906,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 		if e.Config.WeakModel.Enabled && e.Config.WeakModel.ToolMasking {
 			apiTools = filterDynamicMaskedTools(apiTools, messages)
 		}
+		// IterationGuard: 已驱逐的工具不再广告给模型 (执行面由
+		// LoopDetectorInputHook 同步挡住, 两面对齐才算真驱逐)。
+		apiTools = e.filterEvictedTools(apiTools)
 		// 13.7-P0 统一池 (§13.7.2「注册不懒、广告懒」): 池内未加载资产移出广告面
 		// (基础工具+包装三件+已加载面保留); 执行面不拦 —— 未加载资产仍可直调,
 		// 结果不变 (平滑迁移: reg.pool 为 nil 时原样返回)。
@@ -1983,6 +2048,9 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 								ToolName:  block.Name,
 								ToolUseID: block.ID,
 								ToolInput: inputSummary,
+								// P1: 归一化入参短哈希 —— 消费方 (ndjson progress)
+								// 拿它做"两次调用是否同一个"的等值判据, 不接触原文。
+								ToolArgsHash: canonicalArgsHash8(block.Input),
 							}
 						}
 					case types.ContentBlockThinking:
@@ -2723,8 +2791,11 @@ func (e *QueryEngine) queryLoop(ctx context.Context, messages []types.Message, c
 							ToolUseID:      cb.ToolUseID,
 							ToolResult:     summary,
 							ToolResultFull: cb.Content,
-							ToolTrust:      cb.Trust,
-							ToolSource:     cb.SourceURI,
+							// P1: 结果完整字节数 (整数, 无内容) —— 与 args_hash 配对
+							// 区分"卡死"(同参同果) 与"轮询"(同参果在变)。
+							ToolResultBytes: len(cb.Content),
+							ToolTrust:       cb.Trust,
+							ToolSource:      cb.SourceURI,
 						}
 					}
 				}

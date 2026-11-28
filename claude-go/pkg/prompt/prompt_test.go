@@ -81,3 +81,30 @@ func Test系统提示_开关默认关(t *testing.T) {
 		t.Fatal("NewManager 的默认值必须是 false: 漏配的场景应当退化成时间无关")
 	}
 }
+
+// 自定义 systemPrompt 只换人设, 不吞能力目录。
+// 事故背景 (2026-11-28): 全局 config.json 设了 systemPrompt, CLI 路径的 system
+// 只剩那一段 —— 技能清单从未下发, Skill 工具对模型来说"存在但无名可调"。
+func Test系统提示_自定义提示仍带技能清单(t *testing.T) {
+	m := NewManager("/tmp")
+	m.CustomPrompt = "你是某个业务助手。"
+	m.SkillListing = "<available_skills summary=\"short\">\n- weread-skills: 微信读书\n</available_skills>"
+	segs := m.BuildEffectiveSystemPrompt(tool.NewRegistry())
+	joined := strings.Join(segs, "\n")
+	if !strings.Contains(joined, "available_skills") || !strings.Contains(joined, "weread-skills") {
+		t.Fatalf("自定义提示下技能清单丢失, 模型将永远不知道技能名:\n%s", joined)
+	}
+	// 人设段仍必须在最前 (前缀缓存布局: 静态在前)。
+	if segs[0] != m.CustomPrompt {
+		t.Fatalf("自定义提示应保持第一段, got %q", segs[0])
+	}
+}
+
+// 没有清单时不多出空段。
+func Test系统提示_自定义提示无技能清单不追加空段(t *testing.T) {
+	m := NewManager("/tmp")
+	m.CustomPrompt = "只有人设。"
+	if segs := m.BuildEffectiveSystemPrompt(tool.NewRegistry()); len(segs) != 1 {
+		t.Fatalf("没有清单/追加提示时应只有 1 段, got %d: %#v", len(segs), segs)
+	}
+}

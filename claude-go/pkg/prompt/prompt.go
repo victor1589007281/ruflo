@@ -116,6 +116,15 @@ func (m *Manager) BuildEffectiveSystemPrompt(tools *tool.Registry) []string {
 		if mcpGuidance != "" {
 			result = append(result, mcpGuidance)
 		}
+		// 技能清单与 MCP 引导同类: 它是**能力目录**, 不是人设。自定义 systemPrompt
+		// 换掉的是"它是谁", 不该顺手把"它能调什么"一起换没 —— 模型不知道技能名,
+		// Skill 工具就永远调不出来 (工具已注册, 只是没人知道该叫什么)。
+		// 实测 (2026-11-28): 全局 config.json 配了 365 字符的 systemPrompt, CLI 路径的
+		// system 便只剩这一段, 6 个用户级技能从未进入任何一次请求, Skill 路由基准
+		// 100% 必错 —— 而日志、工具面、装配自报看起来全都正常。
+		if m.SkillListing != "" {
+			result = append(result, m.SkillListing)
+		}
 		if m.AppendPrompt != "" {
 			result = append(result, m.AppendPrompt)
 		}

@@ -180,6 +180,14 @@ func TestLLM采集_runID进事件但不进标签(t *testing.T) {
 		if v, ok := e.Labels["run_id"]; ok {
 			t.Fatalf("run_id 绝不能进标签 (无界基数), 事件 %s 上出现了 run_id=%q", e.Name, v)
 		}
+		// node/turn 也必须真的进事件: 只断言"不进标签"会让"根本没写"也通过,
+		// 而 P2 的验收口径正是 llm.jsonl 自带回合定位键。
+		if e.NodeID != "writer" {
+			t.Fatalf("事件 %s 的 node_id 应为 writer, got %q", e.Name, e.NodeID)
+		}
+		if e.TurnID != "t1" {
+			t.Fatalf("事件 %s 的 turn_id 应为 t1, got %q", e.Name, e.TurnID)
+		}
 		// node/turn/call 同理: 它们比 run_id 更细, 进标签更糟。
 		for _, k := range []string{"node_id", "turn_id", "call_id"} {
 			if _, ok := e.Labels[k]; ok {
@@ -201,6 +209,12 @@ func TestLLM采集_runID进事件但不进标签(t *testing.T) {
 	}
 	if idx := indexOf(raw, "run_id"); idx >= 0 {
 		t.Fatalf("run_id 为空时不该出现 run_id 字段 (omitempty), 实际: %s", raw)
+	}
+	// node/turn 同理: 非引擎路径没有回合概念, 不该冒出空字段。
+	for _, k := range []string{"node_id", "turn_id"} {
+		if idx := indexOf(raw, k); idx >= 0 {
+			t.Fatalf("%s 为空时不该出现该字段 (omitempty), 实际: %s", k, raw)
+		}
 	}
 }
 
