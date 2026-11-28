@@ -316,30 +316,56 @@ func (m *Manager) executeSearch(ctx context.Context, req SearchRequest, plan Que
 			providerReq.Limit = domainFilterMinResults
 		}
 	}
-	outcomes := m.scheduleSearch(ctx, providerReq, scheduled)
-	if err := ctx.Err(); err != nil {
-		return SearchResponse{}, Wrap("", classifyError(err), err)
-	}
-
 	var raw []Result
 	var used []string
 	var executionDegraded []string
 	var actualCost float64
 	anySuccess := false
-	for _, o := range outcomes {
-		perProvider[o.name] = o.elapsed.Milliseconds()
-		if o.err != nil {
-			failure := degradedFor(o.name, o.err)
-			degraded = append(degraded, failure)
-			executionDegraded = append(executionDegraded, failure)
-			continue
+	applyOutcomes := func(outcomes []sourceResult) {
+		for _, o := range outcomes {
+			perProvider[o.name] = o.elapsed.Milliseconds()
+			if o.err != nil {
+				failure := degradedFor(o.name, o.err)
+				degraded = append(degraded, failure)
+				executionDegraded = append(executionDegraded, failure)
+				continue
+			}
+			anySuccess = true
+			actualCost += o.cost
+			used = append(used, o.name)
+			raw = append(raw, o.results...)
 		}
-		anySuccess = true
-		actualCost += o.cost
-		used = append(used, o.name)
-		raw = append(raw, o.results...)
 	}
-	for _, p := range scheduled {
+
+	attempted := append([]Provider(nil), scheduled...)
+	outcomes := m.scheduleSearch(ctx, providerReq, attempted)
+	if err := ctx.Err(); err != nil {
+		return SearchResponse{}, Wrap("", classifyError(err), err)
+	}
+	applyOutcomes(outcomes)
+
+	// 首批全灭时换下一批候选再试一次。主源和对冲源同时被限流/额度耗尽/拒爬时,
+	// 直接回 "all providers failed" 会把一次本来可用的检索变成硬失败 (2026-11-28
+	// 09:01 的 no_provider 就是 exa_anon + parallel 同时额度耗尽)。重试同两个源
+	// 没有意义 —— 它们已进冷却/熔断 —— 所以只换 candidates 里排在后面的源。
+	if !anySuccess && len(candidates) > len(attempted) && retryableTotalFailure(outcomes) {
+		next := candidates[len(attempted):]
+		if len(next) > maxSourceConcurrency {
+			next = next[:maxSourceConcurrency]
+		}
+		for _, p := range next {
+			m.metrics.Inc("egress_requests_total", map[string]string{
+				"provider": p.Name(),
+				"egress":   string(providerPin(p, m.cfg, m.egress)),
+			})
+		}
+		attempted = append(attempted, next...)
+		applyOutcomes(m.scheduleSearch(ctx, providerReq, next))
+		if err := ctx.Err(); err != nil {
+			return SearchResponse{}, Wrap("", classifyError(err), err)
+		}
+	}
+	for _, p := range attempted {
 		m.metrics.Set("provider_quota_remaining", float64(m.quota.remaining(p)), map[string]string{
 			"provider": p.Name(),
 		})

@@ -120,6 +120,19 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (resp *FetchRespo
 			client := m.egress.Client(mode)
 			m.metrics.Inc("egress_requests_total", map[string]string{"provider": "fetch", "egress": string(mode)})
 			doc, err = m.fetchWithClient(fctx, client, u)
+			// arXiv 2026 起把列表页从 YYMM 改成 YYYY-MM (/list/cs.CL/2611 现在
+			// 404, /list/cs.CL/2026-11 才是有效地址)。模型和旧链接仍会给出旧格式,
+			// 只在 404 时按这一种形状修一次, 不做通用 URL 猜测。
+			if err != nil && KindOf(err) == ErrNotFound {
+				if fixed, ok := repairArxivListURL(u); ok {
+					if rdoc, rerr := m.fetchWithClient(fctx, client, fixed); rerr == nil {
+						rdoc.URL = fixed.String()
+						doc, err = rdoc, nil
+						flightDegraded = append(flightDegraded, "url_repaired:arxiv_list")
+						m.metrics.Inc("fetch_url_repaired_total", map[string]string{"kind": "arxiv_list"})
+					}
+				}
+			}
 			if err == nil {
 				if i > 0 {
 					m.metrics.Inc("egress_fallback_total", map[string]string{"from": "direct", "to": "proxy", "reason": "error"})
@@ -1759,6 +1772,42 @@ func parsePublished(raw string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// repairArxivListURL 把 arXiv 旧格式的列表页 (/list/<cat>/<YYMM>) 改写成
+// 现行的 YYYY-MM 格式。
+//
+// 只在 host=arxiv.org、路径恰好是 list/<cat>/<4 位数字> 时生效; 月份不合法
+// (00/13+) 不猜。返回值 ok=false 表示"不是这个形状", 调用方保持原样。
+func repairArxivListURL(u *url.URL) (*url.URL, bool) {
+	if u == nil {
+		return nil, false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "arxiv.org" && host != "www.arxiv.org" {
+		return nil, false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "list" || parts[1] == "" {
+		return nil, false
+	}
+	ym := parts[2]
+	if len(ym) != 4 {
+		return nil, false
+	}
+	for _, c := range ym {
+		if c < '0' || c > '9' {
+			return nil, false
+		}
+	}
+	mm := ym[2:]
+	if mm < "01" || mm > "12" {
+		return nil, false
+	}
+	fixed := *u
+	fixed.Path = "/list/" + parts[1] + "/20" + ym[:2] + "-" + mm
+	fixed.RawPath = ""
+	return &fixed, true
+}
+
 // waybackRetryable 判断哪类原站失败值得回退归档。
 //
 // 除 ErrInvalid (SSRF/协议校验, 归档侧同样会拒) 与 ErrUnsupported (内容
@@ -1775,6 +1824,10 @@ func waybackRetryable(err error) bool {
 	}
 	return true
 }
+
+// minWaybackChars 是归档快照可用的最小正文字数。低于它的快照没有任何研究
+// 价值 (占位页/反爬页/跳转页), 宁可报失败也不当成功返回。
+const minWaybackChars = 64
 
 // waybackBase 是 Wayback Machine 的抓取前缀; "2" 取最近快照, "id_" 修饰
 // 要求返回未改写的原始响应 (不归一化链接/不注入归档工具条)。
@@ -1811,6 +1864,14 @@ func (m *Manager) fetchWayback(ctx context.Context, u *url.URL, modes []Mode) (*
 			if k := KindOf(err); k == ErrInvalid || k == ErrNotFound {
 				break
 			}
+			continue
+		}
+		// 归档快照本身也可能是反爬/占位页 (实测 Reddit 的 "快照" 只有 6 字节),
+		// 当成成功返回会让上层以为拿到了正文。太薄的快照按不可用处理 —— 与
+		// "归档里没有这篇" 同向, 调用方会看到 wayback_fallback_failed 并如实
+		// 报抓取失败, 而不是拿 6 字节去写报告。
+		if n := len([]rune(strings.TrimSpace(doc.Markdown))); n < minWaybackChars {
+			lastErr = Wrap("wayback", ErrUnavailable, fmt.Errorf("snapshot too thin: %d chars", n))
 			continue
 		}
 		doc.URL = u.String()

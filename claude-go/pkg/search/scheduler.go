@@ -235,6 +235,28 @@ func classifyError(err error) ErrorKind {
 //
 // 超时与限流有独立标签, 其它统一 provider_error; 都带 provider 名,
 // 便于日志定位且不影响其它源。
+// retryableTotalFailure 判断"整批源都失败"是否值得换下一批候选重试。
+//
+// 只认"这个源现在不可用、换一个可能行"的类别: 限流/额度耗尽、5xx/不可达、
+// 拒爬。超时往往意味着整体网络已经在恶化, 再等一轮只会把延迟翻倍; 请求非法
+// 和资源不存在换源也没用。空批次不触发重试。
+func retryableTotalFailure(outcomes []sourceResult) bool {
+	if len(outcomes) == 0 {
+		return false
+	}
+	for _, o := range outcomes {
+		if o.err == nil {
+			return false
+		}
+		switch classifyError(o.err) {
+		case ErrRateLimited, ErrUnavailable, ErrBlocked:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func degradedFor(name string, err error) string {
 	switch classifyError(err) {
 	case ErrTimeout:

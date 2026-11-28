@@ -36,6 +36,14 @@ type Quality struct {
 	// 域名, 要求 >=3 个独立域名会把"8 条全部来自 opentelemetry.io"判成不达标。
 	// 它不降低片段/语言/重复/时效的门槛 —— 那几项与"来源是否权威"无关。
 	AuthoritativeRatio float64
+	// PlatformRatio 结果中来自大型 UGC/社区平台 (Reddit/知乎/小红书/掘金...) 的比例。
+	//
+	// 也只用于域名多样性那一条, 但与 AuthoritativeRatio 分开: 社区内容不是
+	// "官方一手", 不能混进权威比例; 而同一平台内部作者成千上万, 全部来自
+	// reddit.com 并不等于回声室。用户点名站点的查询 (「Reddit 上怎么评价」
+	// 「微信读书上的书评」) 天然只命中一个域名, 2026-11-28 这类查询占域名门
+	// 失败的绝大多数。
+	PlatformRatio float64
 }
 
 // Pass 判断质量是否达标。
@@ -55,7 +63,7 @@ func (q Quality) Pass(freshnessRequired bool) bool {
 	freshOK := !freshnessRequired ||
 		q.DatedResults < minDatedForFreshGate ||
 		q.FreshRatio >= 0.3
-	return (q.DomainScoped || q.Domains >= 3 || q.AuthoritativeRatio >= 0.8) &&
+	return (q.DomainScoped || q.Domains >= 3 || q.AuthoritativeRatio >= 0.8 || q.PlatformRatio >= 0.8) &&
 		q.HasSnippet &&
 		q.LangMatch >= 0.6 &&
 		q.DuplicateRatio <= 0.5 &&
@@ -89,6 +97,7 @@ func evaluateQualityAt(results []Result, req SearchRequest, now time.Time) Quali
 	var fresh int
 	var langMatch int
 	var authoritative int
+	var platform int
 
 	for _, r := range results {
 		host := canonicalHost(r.URL)
@@ -96,6 +105,9 @@ func evaluateQualityAt(results []Result, req SearchRequest, now time.Time) Quali
 			domains[host] = struct{}{}
 			if IsAuthoritativeDomain(host) {
 				authoritative++
+			}
+			if IsPlatformDomain(host) {
+				platform++
 			}
 		}
 		canon := CanonicalURL(r.URL)
@@ -132,6 +144,7 @@ func evaluateQualityAt(results []Result, req SearchRequest, now time.Time) Quali
 	// DuplicateRatio 等价于 1 - 唯一 canonical URL 数/总条数, 0.5 表示一半是重复。
 	// FreshRatio 例外: 分母只算有日期的条数 —— 无日期是"无法判断", 不是"过期"。
 	q.AuthoritativeRatio = float64(authoritative) / float64(len(results))
+	q.PlatformRatio = float64(platform) / float64(len(results))
 	if q.DatedResults > 0 {
 		q.FreshRatio = float64(fresh) / float64(q.DatedResults)
 	}
@@ -312,11 +325,7 @@ var authoritativeHosts = map[string]struct{}{
 // 公司投资者关系子域 (investor./ir.) 视为一手来源 —— 财报原文就在那里, 域名
 // 列表无法穷举所有公司。
 func IsAuthoritativeDomain(host string) bool {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if strings.Contains(host, "://") {
-		host = canonicalHost(host)
-	}
-	host = strings.TrimPrefix(host, "www.")
+	host = normalizeDomainHost(host)
 	if host == "" {
 		return false
 	}
@@ -339,6 +348,71 @@ func IsAuthoritativeDomain(host string) bool {
 	}
 	for _, suffix := range authoritativeSuffixes {
 		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeDomainHost 把小写/去空白/去 www./必要时从 URL 取 host 的口径统一,
+// 供权威域名与平台域名两张表共用。
+func normalizeDomainHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if strings.Contains(host, "://") {
+		host = canonicalHost(host)
+	}
+	return strings.TrimPrefix(host, "www.")
+}
+
+// platformHosts 是"同域不等于同源"的大型 UGC/社区平台。
+//
+// 这些站点的内容由大量独立作者产生, 全部结果来自一个域名不代表回声室, 因此
+// 域名多样性门对它放行 (见 Quality.PlatformRatio)。它们**不是**权威一手来源,
+// 不能进 authoritativeHosts —— 否则会把社区传言当成官方口径。
+var platformHosts = map[string]struct{}{
+	// 综合社区 / UGC
+	"reddit.com":           {},
+	"zhihu.com":            {},
+	"xiaohongshu.com":      {},
+	"douban.com":           {},
+	"weibo.com":            {},
+	"tieba.baidu.com":      {},
+	"v2ex.com":             {},
+	"news.ycombinator.com": {},
+	"smzdm.com":            {},
+	"bilibili.com":         {},
+	"youtube.com":          {},
+	"twitter.com":          {},
+	"x.com":                {},
+	// 技术社区 / 多人博客平台
+	"juejin.cn":         {},
+	"segmentfault.com":  {},
+	"stackoverflow.com": {},
+	"stackexchange.com": {},
+	"github.com":        {},
+	"medium.com":        {},
+	"dev.to":            {},
+	"substack.com":      {},
+	// 阅读 / 书评
+	"weread.qq.com": {},
+	"goodreads.com": {},
+}
+
+// IsPlatformDomain 判断 host 是否属于大型 UGC/社区平台。子域视为同平台
+// (old.reddit.com / gist.github.com), 按 label 边界逐级去掉前缀, 与
+// IsAuthoritativeDomain 同一套写法, 避免 "notreddit.com" 这类拼接域名误命中。
+func IsPlatformDomain(host string) bool {
+	host = normalizeDomainHost(host)
+	if host == "" {
+		return false
+	}
+	if _, ok := platformHosts[host]; ok {
+		return true
+	}
+	for h := host; strings.Contains(h, "."); {
+		i := strings.IndexByte(h, '.')
+		h = h[i+1:]
+		if _, ok := platformHosts[h]; ok {
 			return true
 		}
 	}
@@ -410,7 +484,7 @@ func detectLanguage(s string) string {
 // 给出 —— 它现在的语义是"可验证的结果确实过期", 不再是"无法验证新鲜"。
 func (q Quality) gateReason(freshness bool) string {
 	switch {
-	case !q.DomainScoped && q.Domains < 3 && q.AuthoritativeRatio < 0.8:
+	case !q.DomainScoped && q.Domains < 3 && q.AuthoritativeRatio < 0.8 && q.PlatformRatio < 0.8:
 		return "domains"
 	case !q.HasSnippet:
 		return "snippet"

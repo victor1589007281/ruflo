@@ -82,7 +82,12 @@ func waybackFixture(t *testing.T) (string, *atomic.Int32) {
 	archive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		archiveHits.Add(1)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, `<html><head><title>Archived</title></head><body><article><p>归档里的既往公开内容。</p></article></body></html>`)
+		fmt.Fprint(w, `<html><head><title>Archived</title></head><body><article>
+			<p>归档里的既往公开内容。</p>
+			<p>这一段足够长, 用来证明快照正文超过最小可用长度, 不会被当成占位页丢弃。
+			归档页通常是完整的旧文存档, 正文往往有几百字; 只有反爬占位页才会短到
+			无法使用, 那种快照必须按抓取失败处理, 不能拿几个字节去支撑结论。</p>
+		</article></body></html>`)
 	}))
 	t.Cleanup(archive.Close)
 	withWaybackSnapshot(t, archive.URL+"/web/2id_/")
@@ -131,6 +136,34 @@ func TestFetchFallsBackToWaybackOnDeadPage(t *testing.T) {
 	}
 	if archiveHits.Load() != 1 {
 		t.Errorf("archive hits = %d, want 1", archiveHits.Load())
+	}
+}
+
+// TestFetchRejectsThinWaybackSnapshot 钉住 6 字节的"快照"不算成功。
+//
+// 实测 Reddit 的归档快照只返回几个字节 (反爬占位页), 旧实现把它当成功返回,
+// 于是研究链路以为拿到了正文。太薄的快照按不可用处理, 抓取如实报错。
+func TestFetchRejectsThinWaybackSnapshot(t *testing.T) {
+	allowAnyFetchURL(t)
+	archive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<html><body>gone</body></html>`)
+	}))
+	t.Cleanup(archive.Close)
+	withWaybackSnapshot(t, archive.URL+"/web/2id_/")
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(origin.Close)
+
+	cfg := DefaultConfig()
+	cfg.WaybackFallback = true
+	m := NewManager(cfg, testEgress(t), nil)
+	defer m.Close()
+
+	if _, err := m.Fetch(context.Background(), FetchRequest{URL: origin.URL + "/dead"}); err == nil {
+		t.Fatal("thin wayback snapshot must not be reported as success")
 	}
 }
 

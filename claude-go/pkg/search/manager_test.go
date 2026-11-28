@@ -1169,3 +1169,61 @@ func TestSearchFreshAutoWiden(t *testing.T) {
 		t.Errorf("新鲜结果不应触发放宽: widened=%q calls=%v", resp3.FreshnessWidened, gotFresh)
 	}
 }
+
+// TestRetryableTotalFailure 钉住"换下一批候选"的触发条件: 只有限流/不可达/
+// 拒爬这类"换源可能行"的失败才重试; 超时意味着整体网络在恶化, 换源只会把
+// 延迟翻倍, 不重试。
+func TestRetryableTotalFailure(t *testing.T) {
+	fail := func(k ErrorKind) sourceResult {
+		return sourceResult{name: "p", err: Wrap("p", k, errors.New("x"))}
+	}
+	cases := []struct {
+		name string
+		in   []sourceResult
+		want bool
+	}{
+		{"empty", nil, false},
+		{"all rate limited", []sourceResult{fail(ErrRateLimited), fail(ErrRateLimited)}, true},
+		{"unavailable + blocked", []sourceResult{fail(ErrUnavailable), fail(ErrBlocked)}, true},
+		{"one success", []sourceResult{fail(ErrRateLimited), {name: "ok"}}, false},
+		{"one timeout", []sourceResult{fail(ErrRateLimited), fail(ErrTimeout)}, false},
+		{"not found", []sourceResult{fail(ErrNotFound)}, false},
+		{"invalid input", []sourceResult{fail(ErrInvalid)}, false},
+	}
+	for _, c := range cases {
+		if got := retryableTotalFailure(c.in); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestSearchFallsBackToNextCandidatesWhenScheduledFail 钉住首批全灭后的换源重试。
+//
+// 2026-11-28 09:01 的真实失败: 主源+对冲源同时额度耗尽, 旧实现直接返回
+// no_provider, 尽管候选里还有健康源。现在应换下一批候选再试一次。
+func TestSearchFallsBackToNextCandidatesWhenScheduledFail(t *testing.T) {
+	limited := func(name string) *fakeProvider {
+		return newFake(name, TierL0, func(context.Context, SearchRequest) ([]Result, error) {
+			return nil, Wrap(name, ErrRateLimited, errors.New("quota"))
+		})
+	}
+	ok := newFake("c", TierL0, func(context.Context, SearchRequest) ([]Result, error) {
+		return []Result{{URL: "https://c.com/1", Title: "c", Snippet: "ok"}}, nil
+	})
+
+	cfg := DefaultConfig()
+	cfg.HedgeDelay = 0
+	m := NewManager(cfg, testEgress(t), []Provider{limited("a"), limited("b"), ok})
+	defer m.Close()
+
+	resp, err := m.Search(context.Background(), SearchRequest{Query: "test"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Provider != "c" {
+		t.Fatalf("unexpected results: %+v", resp.Results)
+	}
+	if ok.callCount() != 1 {
+		t.Fatalf("fallback provider calls = %d, want 1", ok.callCount())
+	}
+}

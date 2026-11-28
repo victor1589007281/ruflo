@@ -1,6 +1,7 @@
 package search
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -49,6 +50,41 @@ func TestExtractHTMLSkipsNoise(t *testing.T) {
 	for _, noise := range []string{"alert(1)", "导航", "页脚"} {
 		if strings.Contains(page.Markdown, noise) {
 			t.Fatalf("噪声 %q 未剔除: %q", noise, page.Markdown)
+		}
+	}
+}
+
+// TestRepairArxivListURL 钉住 arXiv 列表页的 YYMM → YYYY-MM 改写。
+//
+// 2026-11-28 实测: /list/cs.CL/2611 返回 404, /list/cs.CL/2026-11 才是有效地址。
+// 模型与旧链接仍会给旧格式，所以只在 404 时按这一种形状修一次；其它路径不动。
+func TestRepairArxivListURL(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"https://arxiv.org/list/cs.CL/2611", "https://arxiv.org/list/cs.CL/2026-11", true},
+		{"https://www.arxiv.org/list/cs.CL/2611", "https://www.arxiv.org/list/cs.CL/2026-11", true},
+		{"https://arxiv.org/list/cs.CL/2611?skip=0&show=25", "https://arxiv.org/list/cs.CL/2026-11?skip=0&show=25", true},
+		{"https://arxiv.org/list/cs.CL/2026-11", "", false},
+		{"https://arxiv.org/list/cs.CL/2613", "", false},
+		{"https://arxiv.org/list/cs.CL/recent", "", false},
+		{"https://arxiv.org/abs/2611.00001", "", false},
+		{"https://example.com/list/cs.CL/2611", "", false},
+	}
+	for _, c := range cases {
+		u, err := url.Parse(c.in)
+		if err != nil {
+			t.Fatalf("parse %q: %v", c.in, err)
+		}
+		got, ok := repairArxivListURL(u)
+		if ok != c.ok {
+			t.Errorf("%s: ok = %v, want %v", c.in, ok, c.ok)
+			continue
+		}
+		if ok && got.String() != c.want {
+			t.Errorf("%s: got %q, want %q", c.in, got.String(), c.want)
 		}
 	}
 }

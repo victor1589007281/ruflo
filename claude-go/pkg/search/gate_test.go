@@ -146,6 +146,55 @@ func TestQualityGateProfessionalDomains(t *testing.T) {
 	}
 }
 
+// TestQualityGatePlatformSingleDomain 钉住 UGC 平台的单域名例外。
+//
+// 事故背景 (2026-11-28): 「Reddit 上开发者对 Claude Code 的真实评价」
+// 「微信读书上的书评」这类用户点名站点的查询, 结果天然只来自一个域名,
+// 域名多样性门却判 domains 不过。平台内部作者成千上万, 单域名不等于回声室;
+// 但它不是权威一手来源, 所以单独用 PlatformRatio, 不混进 AuthoritativeRatio。
+// 普通博客单域名仍然必须失败 (见 TestQualityGateProfessionalDomains)。
+func TestQualityGatePlatformSingleDomain(t *testing.T) {
+	now := time.Now()
+	mk := func(urls ...string) []Result {
+		out := make([]Result, 0, len(urls))
+		for _, u := range urls {
+			out = append(out, Result{URL: u, Snippet: "x", Lang: "en", Published: now.Add(-time.Hour)})
+		}
+		return out
+	}
+	req := SearchRequest{Language: "en", Freshness: "any"}
+
+	reddit := evaluateQualityAt(mk(
+		"https://www.reddit.com/r/ClaudeAI/comments/1wz0n3w/after_going_the_full_hype_cycle",
+		"https://www.reddit.com/r/ExperiencedDevs/comments/1u231do/what_makes_claude_code",
+		"https://old.reddit.com/r/ClaudeAI/comments/1vvo1a5/devs_who_actually_use_claude_code",
+	), req, now)
+	if !reddit.Pass(false) || reddit.gateReason(false) != "pass" {
+		t.Errorf("reddit 单平台应通过: %+v reason=%s", reddit, reddit.gateReason(false))
+	}
+	if reddit.AuthoritativeRatio >= 0.8 {
+		t.Errorf("社区平台不能计入权威比例: %+v", reddit)
+	}
+
+	weread := evaluateQualityAt(mk(
+		"https://weread.qq.com/web/bookDetail/abc",
+		"https://weread.qq.com/web/bookDetail/def",
+	), req, now)
+	if !weread.Pass(false) || weread.PlatformRatio < 0.8 {
+		t.Errorf("微信读书单域名应通过: %+v ratio=%v", weread, weread.PlatformRatio)
+	}
+
+	// 普通博客单域名不受平台例外影响。
+	blog := evaluateQualityAt(mk(
+		"https://random-blog.example/clickhouse",
+		"https://random-blog.example/postgres",
+		"https://random-blog.example/iclr",
+	), req, now)
+	if blog.Pass(false) || blog.gateReason(false) != "domains" {
+		t.Errorf("非平台单域名不应通过: %+v reason=%s", blog, blog.gateReason(false))
+	}
+}
+
 // TestQualityGateUndatedResults 钉住时效门的"无日期≠过期"口径 (2026-11-26)。
 //
 // 事故背景: MCP 系 provider (parallel/exa) 常不返回 published, 旧口径把
