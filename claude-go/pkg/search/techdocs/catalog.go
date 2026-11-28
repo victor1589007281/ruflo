@@ -50,12 +50,17 @@ var GroupNames = map[Group]string{
 // Aliases 用于从 query 里识别"用户在问这个产品", 英文按词边界匹配,
 // 中文按子串匹配。Aliases 里不要放 "es"/"os"/"ai" 这类两字母通用词 ——
 // 它们会把普通查询误判成技术查询。
+//
+// Lang 是该站正文的主要语言 ("zh" / "en")。留空表示语言中立 (官方文档站
+// 通常有多语言版本)。目前只有组兜底用它: 兜底是按目录顺序取前几个站, 不做
+// 语言约束会把英文查询指到中文站 (见 MatchQueryLang)。
 type Site struct {
 	Name    string   `json:"name"`
 	Group   Group    `json:"group"`
 	Docs    string   `json:"url"`
 	Domains []string `json:"domains"`
 	Aliases []string `json:"-"`
+	Lang    string   `json:"lang,omitempty"`
 }
 
 // Sites 是全部收录站点。组内顺序就是兜底时的优先级: 核心站放前面。
@@ -265,13 +270,13 @@ var Sites = []Site{
 		Aliases: []string{"lwn", "lwn.net"}},
 	{Name: "Phoronix", Group: GroupCommunity, Docs: "https://www.phoronix.com/", Domains: []string{"phoronix.com"},
 		Aliases: []string{"phoronix"}},
-	{Name: "InfoQ 中文", Group: GroupCommunity, Docs: "https://www.infoq.cn/", Domains: []string{"infoq.cn"},
+	{Name: "InfoQ 中文", Group: GroupCommunity, Lang: "zh", Docs: "https://www.infoq.cn/", Domains: []string{"infoq.cn"},
 		Aliases: []string{"infoq", "infoq 中文"}},
-	{Name: "掘金", Group: GroupCommunity, Docs: "https://juejin.cn/", Domains: []string{"juejin.cn"},
+	{Name: "掘金", Group: GroupCommunity, Lang: "zh", Docs: "https://juejin.cn/", Domains: []string{"juejin.cn"},
 		Aliases: []string{"掘金", "juejin"}},
-	{Name: "博客园", Group: GroupCommunity, Docs: "https://www.cnblogs.com/", Domains: []string{"cnblogs.com"},
+	{Name: "博客园", Group: GroupCommunity, Lang: "zh", Docs: "https://www.cnblogs.com/", Domains: []string{"cnblogs.com"},
 		Aliases: []string{"博客园", "cnblogs"}},
-	{Name: "美团技术团队", Group: GroupCommunity, Docs: "https://tech.meituan.com/", Domains: []string{"tech.meituan.com"},
+	{Name: "美团技术团队", Group: GroupCommunity, Lang: "zh", Docs: "https://tech.meituan.com/", Domains: []string{"tech.meituan.com"},
 		Aliases: []string{"美团技术", "美团技术团队", "meituan tech"}},
 	{Name: "Netflix TechBlog", Group: GroupCommunity, Docs: "https://netflixtechblog.com/", Domains: []string{"netflixtechblog.com"},
 		Aliases: []string{"netflix techblog", "netflix engineering"}},

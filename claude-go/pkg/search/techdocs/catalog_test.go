@@ -145,6 +145,64 @@ func TestGroupNamesCoverSites(t *testing.T) {
 	}
 }
 
+// TestMatchQueryLangFallback 钉住组兜底的语言取向。
+//
+// 事故背景 (2026-11-28): 英文查询 "... engineering blog November 2026" 命中
+// GroupCommunity 的 "engineering blog", 兜底按目录顺序取 4 个站, 其中 InfoQ
+// 中文与掘金吃掉两个名额, Exa 严格按 site: 返回 → 英文问题拿到 10 条中文转载,
+// 域名数 2, 质量门判 domains 不过。
+//
+// 三个臂:
+//  1. 英文查询的兜底名单里不能出现标了 zh 的站;
+//  2. 中文查询的兜底仍然先拿中文站 (不能为了修英文把中文查询弄坏);
+//  3. 用户在 query 里点名站点时, 语言不参与判断 (那是用户自己的选择)。
+func TestMatchQueryLangFallback(t *testing.T) {
+	zhDomains := map[string]bool{}
+	for _, s := range Sites {
+		if s.Lang != "zh" {
+			continue
+		}
+		for _, d := range s.Domains {
+			zhDomains[d] = true
+		}
+	}
+	if len(zhDomains) == 0 {
+		t.Fatal("前置: 目录里应有标了 Lang=zh 的站")
+	}
+
+	const q = "context engineering agent harness engineering blog November 2026"
+	en := MatchQueryLang(q, "en")
+	if !en.Matched() {
+		t.Fatalf("英文社区查询应命中组兜底: %+v", en)
+	}
+	for _, d := range en.Domains {
+		if zhDomains[d] {
+			t.Errorf("英文查询的兜底名单不该包含中文站 %q: %v", d, en.Domains)
+		}
+	}
+
+	zh := MatchQueryLang("架构设计 工程实践 踩坑复盘", "zh")
+	if !zh.Matched() {
+		t.Fatalf("中文社区查询应命中组兜底: %+v", zh)
+	}
+	var firstZh bool
+	for _, d := range zh.Domains {
+		if zhDomains[d] {
+			firstZh = true
+			break
+		}
+	}
+	if !firstZh {
+		t.Errorf("中文查询应优先拿中文站: %v", zh.Domains)
+	}
+
+	// 显式点名: 英文 lang 下问掘金, 别名命中优先于语言取向。
+	named := MatchQueryLang("juejin 上关于 agent harness 的文章", "en")
+	if !contains(named.Domains, "juejin.cn") {
+		t.Errorf("点名站点不应被语言过滤掉: %v", named.Domains)
+	}
+}
+
 // contains 判断字符串切片是否含目标值。
 func contains(list []string, want string) bool {
 	for _, v := range list {

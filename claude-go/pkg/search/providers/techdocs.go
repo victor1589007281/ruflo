@@ -52,7 +52,8 @@ func (p *techDocsProvider) Search(ctx context.Context, req search.SearchRequest)
 		return p.mcpProvider.Search(ctx, req)
 	}
 
-	m := techdocs.MatchQuery(req.Query)
+	// 带上查询语言: 组兜底不能把英文问题指向中文社区站 (见 MatchQueryLang)。
+	m := techdocs.MatchQueryLang(req.Query, req.Language)
 	if !m.Matched() {
 		return nil, nil
 	}

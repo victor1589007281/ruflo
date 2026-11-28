@@ -89,8 +89,22 @@ var groupSignals = map[Group][]string{
 	},
 }
 
-// MatchQuery 把 query 映射到目录域名。
+// MatchQuery 把 query 映射到目录域名 (不限语言)。
 func MatchQuery(query string) Match {
+	return MatchQueryLang(query, "")
+}
+
+// MatchQueryLang 同 MatchQuery, 但组兜底时按查询语言选站。
+//
+// 事故背景 (2026-11-28): 英文查询 "context engineering agent harness
+// engineering blog November 2026" 命中 GroupCommunity 的组信号 "engineering
+// blog", 兜底按目录顺序取前 4 个社区站 —— 第 3、4 个恰好是 InfoQ 中文与掘金。
+// Exa 严格按 site: 返回, 于是英文问题拿到 10 条中文转载, 域名数只有 2, 质量门
+// 判 domains 不过。门是对的, 错的是把英文查询指向中文站。
+//
+// 只影响组兜底: 用户在 query 里显式点名站点 (别名命中) 时语言不参与判断 ——
+// 那是用户自己的选择。
+func MatchQueryLang(query, lang string) Match {
 	q := strings.ToLower(strings.TrimSpace(query))
 	if q == "" {
 		return Match{}
@@ -130,7 +144,7 @@ func MatchQuery(query string) Match {
 	if !ok {
 		return Match{}
 	}
-	return buildMatch(fallbackSites(group), true, group)
+	return buildMatch(fallbackSites(group, lang), true, group)
 }
 
 // siteHit 是产品别名匹配的中间结果。
@@ -161,15 +175,34 @@ func buildMatch(sites []Site, fallback bool, group Group) Match {
 }
 
 // fallbackSites 返回某组的前 N 个站点 (组内顺序即优先级)。
-func fallbackSites(g Group) []Site {
-	out := make([]Site, 0, MaxFallbackSites)
+//
+// lang 非空时按语言排序而不是删站: 同语言的站优先, 语言中立的站 (官方多语言
+// 文档站) 次之, 明确是另一种语言的站最后。英文查询因此不会被中文社区占掉
+// 兜底名额, 中文查询也仍然先拿中文站; 两种情况都不会因为语言过滤而变空。
+func fallbackSites(g Group, lang string) []Site {
+	exact := make([]Site, 0, MaxFallbackSites)
+	neutral := make([]Site, 0, MaxFallbackSites)
+	mismatched := make([]Site, 0, MaxFallbackSites)
 	for _, s := range Sites {
 		if s.Group != g {
 			continue
 		}
-		out = append(out, s)
-		if len(out) >= MaxFallbackSites {
-			break
+		switch {
+		case lang == "" || s.Lang == "":
+			neutral = append(neutral, s)
+		case s.Lang == lang:
+			exact = append(exact, s)
+		default:
+			mismatched = append(mismatched, s)
+		}
+	}
+	out := make([]Site, 0, MaxFallbackSites)
+	for _, bucket := range [][]Site{exact, neutral, mismatched} {
+		for _, s := range bucket {
+			out = append(out, s)
+			if len(out) >= MaxFallbackSites {
+				return out
+			}
 		}
 	}
 	return out
